@@ -612,7 +612,10 @@ impl Rseq {
         }
 
         // 在临界区内，检查是否需要重启
-        let event_mask = pcb.rseq_state().fetch_clear_event_mask();
+        let event_mask = {
+            let rseq_state = pcb.rseq_state();
+            rseq_state.fetch_clear_event_mask()
+        };
         let cs_flags = RseqCsFlags::from_bits_truncate(rseq_cs.flags);
 
         if !Self::need_restart(access, cs_flags, event_mask)? {
@@ -688,9 +691,15 @@ impl Rseq {
     pub fn on_signal<F: RseqTrapFrame>(frame: &mut F) {
         use crate::arch::ipc::signal::Signal;
         let pcb = ProcessManager::current_pcb();
-        let registered = pcb.rseq_state().is_registered();
+        let registered = {
+            let rseq_state = pcb.rseq_state();
+            rseq_state.is_registered()
+        };
         if registered {
-            pcb.rseq_state().set_event(RseqEventMask::SIGNAL);
+            {
+                let rseq_state = pcb.rseq_state();
+                rseq_state.set_event(RseqEventMask::SIGNAL);
+            }
             if Self::handle_notify_resume(Some(frame)).is_err() {
                 let _ = crate::ipc::kill::send_signal_to_pcb(pcb.clone(), Signal::SIGSEGV);
             }

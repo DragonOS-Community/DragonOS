@@ -296,10 +296,6 @@ pub fn timekeeper() -> &'static Timekeeper {
     return r;
 }
 
-pub fn timekeeping_is_initialized() -> bool {
-    unsafe { __TIMEKEEPER.is_some() }
-}
-
 pub fn timekeeper_init() {
     unsafe { __TIMEKEEPER = Some(Timekeeper::new()) };
 }

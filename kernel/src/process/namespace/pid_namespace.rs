@@ -35,6 +35,7 @@ pub struct PidNamespace {
 
 pub struct InnerPidNamespace {
     dead: bool,
+    last_pid: RawPid,
     ida: IdAllocator,
     /// PID到进程的映射表
     pid_map: HashMap<RawPid, Arc<Pid>>,
@@ -73,6 +74,7 @@ impl PidNamespace {
             processes_created: AtomicU64::new(0),
             inner: SpinLock::new(InnerPidNamespace {
                 dead: false,
+                last_pid: RawPid(0),
                 child_reaper: None,
                 ida: IdAllocator::new(1, usize::MAX).unwrap(),
                 pid_map: HashMap::new(),
@@ -100,6 +102,10 @@ impl PidNamespace {
 
     pub fn processes_created(&self) -> u64 {
         self.processes_created.load(Ordering::Relaxed)
+    }
+
+    pub fn last_pid(&self) -> RawPid {
+        self.inner().last_pid
     }
 
     pub fn release_pid_in_ns(&self, raw_pid: RawPid) {
@@ -161,6 +167,7 @@ impl PidNamespace {
             inner: SpinLock::new(InnerPidNamespace {
                 child_reaper: None,
                 dead: false,
+                last_pid: RawPid(0),
                 ida: IdAllocator::new(1, usize::MAX).unwrap(),
                 pid_map: HashMap::new(),
                 children: Vec::new(),
@@ -206,6 +213,7 @@ impl InnerPidNamespace {
         let raw_pid = self.ida.alloc().ok_or(SystemError::ENOMEM)?;
         let raw_pid = RawPid(raw_pid);
         self.pid_map.insert(raw_pid, pid);
+        self.last_pid = raw_pid;
         Ok(raw_pid)
     }
 

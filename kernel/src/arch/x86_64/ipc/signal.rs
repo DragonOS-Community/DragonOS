@@ -690,9 +690,12 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     if sigaction.is_none() {
         return;
     }
-    *got_signal = true;
-
     let mut sigaction = sigaction.unwrap();
+    *got_signal = match sigaction.action() {
+        SigactionType::SaHandler(SaHandlerType::Customized(_)) => true,
+        SigactionType::SaSigaction(_) => true,
+        _ => false,
+    };
 
     // 注意！由于handle_signal里面可能会退出进程，
     // 因此这里需要检查清楚：上面所有的锁、arc指针都被释放了。否则会产生资源泄露的问题！

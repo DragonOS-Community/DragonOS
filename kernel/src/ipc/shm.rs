@@ -222,7 +222,7 @@ impl ShmManager {
 
     pub fn shm_info(&self, user_buf: *const u8, from_user: bool) -> Result<usize, SystemError> {
         // 已使用id数量
-        let used_ids = self.id2shm.len().to_i32().unwrap();
+        let used_ids = self.id2shm.len().to_i32().ok_or(SystemError::EOVERFLOW)?;
         // 共享内存总和
         let shm_tot = self.id2shm.iter().fold(0, |acc, (_, kernel_shm)| {
             acc + PageFrameCount::from_bytes(page_align_up(kernel_shm.shm_size))
@@ -250,23 +250,28 @@ impl ShmManager {
     ) -> Result<usize, SystemError> {
         let kernel_shm = self.id2shm.get(&id).ok_or(SystemError::EINVAL)?;
         let kern_ipc_perm = &kernel_shm.kern_ipc_perm;
-        let key = kern_ipc_perm.key.data().to_i32().unwrap();
+        let key = kern_ipc_perm
+            .key
+            .data()
+            .to_i32()
+            .ok_or(SystemError::EOVERFLOW)?;
         let mode = kern_ipc_perm.mode.bits();
 
-        let shm_perm = PosixIpcPerm::new(
-            key,
-            kern_ipc_perm.uid as u32,
-            kern_ipc_perm.gid as u32,
-            kern_ipc_perm.cuid as u32,
-            kern_ipc_perm.cgid as u32,
-            mode,
-        );
+        let shm_perm = PosixIpcPerm::try_from(kern_ipc_perm)?;
         let shm_segsz = kernel_shm.shm_size;
         let shm_atime = kernel_shm.shm_atim.tv_sec;
         let shm_dtime = kernel_shm.shm_dtim.tv_sec;
         let shm_ctime = kernel_shm.shm_ctim.tv_sec;
-        let shm_cpid = kernel_shm.shm_cprid.data().to_u32().unwrap();
-        let shm_lpid = kernel_shm.shm_lprid.data().to_u32().unwrap();
+        let shm_cpid = kernel_shm
+            .shm_cprid
+            .data()
+            .to_u32()
+            .ok_or(SystemError::EOVERFLOW)?;
+        let shm_lpid = kernel_shm
+            .shm_lprid
+            .data()
+            .to_u32()
+            .ok_or(SystemError::EOVERFLOW)?;
         let shm_map_count = kernel_shm.map_count();
         let shm_id_ds = PosixShmIdDs {
             shm_perm,
@@ -666,10 +671,18 @@ pub struct PosixIpcPerm {
     _unused2: usize,
 }
 
-impl From<&KernIpcPerm> for PosixIpcPerm {
-    fn from(kern_ipc_perm: &KernIpcPerm) -> Self {
-        PosixIpcPerm {
-            key: kern_ipc_perm.key.data().to_i32().unwrap(),
+impl TryFrom<&KernIpcPerm> for PosixIpcPerm {
+    type Error = SystemError;
+
+    fn try_from(kern_ipc_perm: &KernIpcPerm) -> Result<Self, Self::Error> {
+        let key = kern_ipc_perm
+            .key
+            .data()
+            .to_i32()
+            .ok_or(SystemError::EOVERFLOW)?;
+
+        Ok(PosixIpcPerm {
+            key,
             uid: kern_ipc_perm.uid as u32,
             gid: kern_ipc_perm.gid as u32,
             cuid: kern_ipc_perm.cuid as u32,
@@ -679,7 +692,7 @@ impl From<&KernIpcPerm> for PosixIpcPerm {
             _pad1: 0,
             _unused1: 0,
             _unused2: 0,
-        }
+        })
     }
 }
 

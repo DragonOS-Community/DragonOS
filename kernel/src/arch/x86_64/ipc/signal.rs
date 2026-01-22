@@ -783,14 +783,15 @@ impl SignalArch for X86_64SignalArch {
         frame.ucontext.restore_to_trapframe(trap_frame);
 
         // 3. 恢复 FP 状态（包含安全性检查）
-        if let Some(kernel_fp) = frame.restore_fpstate() {
+        let restored_fp = frame.restore_fpstate();
+        let cr2 = frame.ucontext.uc_mcontext.cr2 as usize;
+        if let Some(kernel_fp) = restored_fp {
             let pcb = ProcessManager::current_pcb();
             let mut archinfo_guard = pcb.arch_info_irqsave();
             *archinfo_guard.fp_state_mut() = Some(kernel_fp);
             archinfo_guard.restore_fp_state();
-
-            // 恢复 cr2
-            *archinfo_guard.cr2_mut() = frame.ucontext.uc_mcontext.cr2 as usize;
+            // 恢复 cr2（避免持锁访问用户内存）
+            *archinfo_guard.cr2_mut() = cr2;
         } else {
             error!("sys_rt_sigreturn: failed to restore fpstate");
         }

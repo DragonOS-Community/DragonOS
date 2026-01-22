@@ -677,7 +677,8 @@ impl Rseq {
     /// 在抢占/调度切换时调用
     #[inline]
     pub fn on_preempt(pcb: &ProcessControlBlock) {
-        if pcb.rseq_state().is_registered() {
+        let registered = pcb.rseq_state().is_registered();
+        if registered {
             pcb.rseq_state().set_event(RseqEventMask::PREEMPT);
             pcb.flags().insert(ProcessFlags::NEED_RSEQ);
         }
@@ -687,7 +688,8 @@ impl Rseq {
     pub fn on_signal<F: RseqTrapFrame>(frame: &mut F) {
         use crate::arch::ipc::signal::Signal;
         let pcb = ProcessManager::current_pcb();
-        if pcb.rseq_state().is_registered() {
+        let registered = pcb.rseq_state().is_registered();
+        if registered {
             pcb.rseq_state().set_event(RseqEventMask::SIGNAL);
             if Self::handle_notify_resume(Some(frame)).is_err() {
                 let _ = crate::ipc::kill::send_signal_to_pcb(pcb.clone(), Signal::SIGSEGV);
@@ -699,7 +701,8 @@ impl Rseq {
     #[inline]
     #[allow(dead_code)]
     pub fn on_migrate(pcb: &ProcessControlBlock) {
-        if pcb.rseq_state().is_registered() {
+        let registered = pcb.rseq_state().is_registered();
+        if registered {
             pcb.rseq_state().set_event(RseqEventMask::MIGRATE);
             pcb.flags().insert(ProcessFlags::NEED_RSEQ);
         }

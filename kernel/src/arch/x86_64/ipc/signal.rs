@@ -690,12 +690,8 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     if sigaction.is_none() {
         return;
     }
+    *got_signal = true;
     let mut sigaction = sigaction.unwrap();
-    *got_signal = match sigaction.action() {
-        SigactionType::SaHandler(SaHandlerType::Customized(_)) => true,
-        SigactionType::SaSigaction(_) => true,
-        _ => false,
-    };
 
     // 注意！由于handle_signal里面可能会退出进程，
     // 因此这里需要检查清楚：上面所有的锁、arc指针都被释放了。否则会产生资源泄露的问题！
@@ -838,12 +834,10 @@ fn handle_signal(
                     }
                 }
                 SystemError::ERESTART_RESTARTBLOCK => {
-                    // 为了让带 SA_RESTART 的时序（例如 clock_nanosleep 相对睡眠）也能自动重启，
-                    // 当 SA_RESTART 设置时，按 ERESTARTSYS 的语义处理；否则返回 EINTR。
                     if !sigaction.flags().contains(SigFlags::SA_RESTART) {
                         frame.rax = SystemError::EINTR.to_posix_errno() as i64 as u64;
                     } else {
-                        frame.rax = frame.errcode;
+                        frame.rax = SYS_RESTART_SYSCALL as u64;
                         frame.rip -= 2;
                     }
                 }

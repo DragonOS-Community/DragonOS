@@ -2,14 +2,16 @@ use crate::{
     arch::mm::LockedFrameAllocator,
     libs::align::page_align_up,
     mm::{
-        PhysAddr, allocator::page_frame::{FrameAllocator, PageFrameCount, PhysPageFrame}, page::{PageFlags, PageType, page_manager_lock}
+        allocator::page_frame::{FrameAllocator, PageFrameCount, PhysPageFrame},
+        page::{page_manager_lock, PageFlags, PageType},
+        PhysAddr,
     },
-    process::{ProcessManager, RawPid, cred::Cred},
+    process::{cred::Cred, ProcessManager, RawPid},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
     time::PosixTimeSpec,
 };
-use core::fmt;
 use alloc::sync::Arc;
+use core::fmt;
 use hashbrown::HashMap;
 use ida::IdAllocator;
 use num::ToPrimitive;
@@ -176,7 +178,8 @@ impl ShmManager {
 
         // 创建共享内存段信息结构体
         let current_cred = ProcessManager::current_pcb().cred();
-        let kern_ipc_perm = KernIpcPerm::new_with_cred(shm_id, key, current_cred, shmflg & ShmFlags::PERM_MASK);
+        let kern_ipc_perm =
+            KernIpcPerm::new_with_cred(shm_id, key, current_cred, shmflg & ShmFlags::PERM_MASK);
         let shm_kernel = KernelShm::new(kern_ipc_perm, paddr, size);
 
         // 更新共享内存管理器相关映射表

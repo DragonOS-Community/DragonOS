@@ -933,31 +933,29 @@ fn setup_frame(
     // 获取栈帧的可变引用（唯一需要 unsafe 的地方）
     let frame = unsafe { &mut *frame_ptr };
 
-    // 1. 获取 cr2 值
+    // 1. 读取 arch 信息并生成用户态数据（避免持锁访问用户内存）
     let pcb = ProcessManager::current_pcb();
     let mut archinfo_guard = pcb.arch_info_irqsave();
     let cr2 = *archinfo_guard.cr2_mut() as u64;
+    let user_ucontext = UserUContext::from_trapframe(trap_frame, oldset, cr2);
 
-    // 2. 创建 ucontext
-    frame.ucontext = UserUContext::from_trapframe(trap_frame, oldset, cr2);
-
-    // 3. 保存 FP 状态
-    // 先从硬件保存当前 FP 状态到 PCB
+    // 2. 保存 FP 状态到 PCB，并准备用户态 XSAVE 数据
     archinfo_guard.save_fp_state();
-
-    // 将 FP 状态转换并保存到用户栈（包含完整的 XSAVE 状态，支持 AVX）
-    if let Some(kernel_fp) = archinfo_guard.fp_state() {
-        *frame.fpstate_mut() = UserXState::from_kernel_fpstate(kernel_fp);
-    }
-
-    // 设置 fpstate 指针指向栈帧内的 fpstate
-    frame.setup_fpstate_pointer();
+    let user_fpstate =
+        (*archinfo_guard.fp_state()).map(|kernel_fp| UserXState::from_kernel_fpstate(&kernel_fp));
 
     // 根据 Linux 语义，加载干净的 FP 状态到硬件
     // 这样信号处理函数在标准的 FP 环境中执行
     archinfo_guard.clear_fp_state();
-
     drop(archinfo_guard);
+
+    // 3. 写入用户栈（可能触发缺页，必须在释放锁后进行）
+    frame.ucontext = user_ucontext;
+    if let Some(fpstate) = user_fpstate {
+        *frame.fpstate_mut() = fpstate;
+    }
+    // 设置 fpstate 指针指向栈帧内的 fpstate
+    frame.setup_fpstate_pointer();
 
     // 4. 复制 siginfo
     info.copy_posix_siginfo_to_user(&mut frame.siginfo as *mut PosixSigInfo)

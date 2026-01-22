@@ -21,7 +21,7 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::VirtAddr,
-    process::{ProcessFlags, ProcessManager},
+    process::ProcessManager,
     syscall::user_access::UserBufferWriter,
 };
 
@@ -1691,10 +1691,6 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                 }
 
                 if ProcessManager::current_pcb().has_pending_signal_fast() {
-                    ProcessManager::current_pcb()
-                        .flags()
-                        .insert(ProcessFlags::HAS_PENDING_SIGNAL);
-
                     ret = Err(SystemError::ERESTARTSYS);
                     break;
                 }
@@ -1774,10 +1770,6 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         let mut offset = 0;
         loop {
             if pcb.has_pending_signal_fast() {
-                ProcessManager::current_pcb()
-                    .flags()
-                    .insert(ProcessFlags::HAS_PENDING_SIGNAL);
-
                 return Err(SystemError::ERESTARTSYS);
             }
             if core.flags().contains(TtyFlag::HUPPED)

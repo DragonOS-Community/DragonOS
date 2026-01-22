@@ -889,6 +889,8 @@ pub fn set_sigprocmask(how: SigHow, set: SigSet) -> Result<SigSet, SystemError> 
         }
     }
 
+    res_set.remove(Signal::SIGKILL.into());
+    res_set.remove(Signal::SIGSTOP.into());
     __set_current_blocked(&res_set);
     Ok(oset)
 }

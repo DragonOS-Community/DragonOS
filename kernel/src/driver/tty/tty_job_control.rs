@@ -7,7 +7,7 @@ use crate::{
     process::{
         cred::CAPFlags,
         pid::{Pid, PidType},
-        ProcessControlBlock, ProcessFlags, ProcessManager, ProcessSignalInfo, RawPid,
+        ProcessControlBlock, ProcessManager, ProcessSignalInfo, RawPid,
     },
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
@@ -85,9 +85,6 @@ impl TtyJobCtrlManager {
                 return Err(SystemError::EIO);
             } else {
                 crate::ipc::kill::send_signal_to_pgid(&pgid, sig)?;
-                ProcessManager::current_pcb()
-                    .flags()
-                    .insert(ProcessFlags::HAS_PENDING_SIGNAL);
                 log::debug!(
                     "job_ctrl_ioctl: kill. pgid: {}, tty_pgid: {:?}",
                     pgid.pid_vnr().data(),

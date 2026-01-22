@@ -35,10 +35,9 @@ use crate::{
         vfs::{file::FileDescriptorVec, FileType, IndexNode},
     },
     ipc::{
-        kill::send_signal_to_pcb,
         sighand::SigHand,
         signal::RestartBlock,
-        signal_types::{SigInfo, SigPending, SignalFlags},
+        signal_types::{SigCode, SigInfo, SigPending, SigType, SignalFlags},
     },
     libs::{
         align::AlignedBox,
@@ -729,6 +728,26 @@ impl ProcessManager {
             //    仿照 Linux zap_other_threads 的语义，这里仅负责投递 SIGKILL，
             //    实际退出在各线程上下文中完成。
             {
+                let send_sigkill_thread = |task: Arc<ProcessControlBlock>| {
+                    if task.flags().contains(ProcessFlags::EXITING) {
+                        return;
+                    }
+                    let mut info = SigInfo::new(
+                        Signal::SIGKILL,
+                        0,
+                        SigCode::Kernel,
+                        SigType::Kill {
+                            pid: RawPid::new(0),
+                            uid: 0,
+                        },
+                    );
+                    let _ = Signal::SIGKILL.send_signal_info_to_pcb(
+                        Some(&mut info),
+                        task,
+                        PidType::PID,
+                    );
+                };
+
                 // 统一从线程组组长的 ThreadInfo 中获取完整的线程列表，
                 // 避免从非组长线程看到的 group_tasks 为空导致遗漏。
                 let leader = {
@@ -745,7 +764,7 @@ impl ProcessManager {
                 if !Arc::ptr_eq(&leader, &current_pcb)
                     && !leader.flags().contains(ProcessFlags::EXITING)
                 {
-                    let _ = send_signal_to_pcb(leader.clone(), Signal::SIGKILL);
+                    send_sigkill_thread(leader.clone());
                 }
 
                 // 再遍历组长维护的 group_tasks，向其他线程发送 SIGKILL
@@ -758,7 +777,7 @@ impl ProcessManager {
                         if task.flags().contains(ProcessFlags::EXITING) {
                             continue;
                         }
-                        let _ = send_signal_to_pcb(task.clone(), Signal::SIGKILL);
+                        send_sigkill_thread(task);
                     }
                 }
             }

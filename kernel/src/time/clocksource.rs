@@ -965,9 +965,11 @@ pub fn clocksource_watchdog_kthread() -> i32 {
 pub fn clocksource_reset_watchdog() {
     let list_guard = WATCHDOG_LIST.lock_irqsave();
     for ele in list_guard.iter() {
-        ele.clocksource_data()
-            .flags
-            .remove(ClocksourceFlags::CLOCK_SOURCE_WATCHDOG);
+        let mut data = ele.clocksource_data();
+        data.flags.remove(ClocksourceFlags::CLOCK_SOURCE_WATCHDOG);
+        data.watchdog_last = CycleNum::new(0);
+        data.cs_last = CycleNum::new(0);
+        let _ = ele.update_clocksource_data(data);
     }
 }
 

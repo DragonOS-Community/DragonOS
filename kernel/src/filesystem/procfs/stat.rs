@@ -10,7 +10,8 @@ use crate::{
     },
     libs::mutex::MutexGuard,
     process::{pid::PidType, ProcessManager, ProcessState},
-    smp::cpu::smp_cpu_manager,
+    sched::cputime::{kcpustat_cpu, ns_to_clock_t, CpuUsageStat, NR_CPU_STATS},
+    smp::cpu::{smp_cpu_manager, ProcessorId},
 };
 use alloc::{borrow::ToOwned, format, sync::Arc, sync::Weak, vec::Vec};
 use system_error::SystemError;
@@ -29,19 +30,57 @@ impl StatFileOps {
 
     fn generate_stat_content() -> Vec<u8> {
         let mut data: Vec<u8> = Vec::new();
-        let cpu_fields = "0 0 0 0 0 0 0 0 0 0";
 
-        data.append(&mut format!("cpu {}\n", cpu_fields).as_bytes().to_owned());
+        // 获取 CPU 数量
+        let cpu_count = smp_cpu_manager().present_cpus_count() as usize;
+        let cpu_count = if cpu_count == 0 { 1 } else { cpu_count };
 
-        let mut cpu_count = smp_cpu_manager().present_cpus_count() as usize;
-        if cpu_count == 0 {
-            cpu_count = 1;
-        }
+        // 汇总所有 CPU 的统计
+        let mut total_stats = [0u64; NR_CPU_STATS];
         for cpu_id in 0..cpu_count {
+            let stat = kcpustat_cpu(ProcessorId::new(cpu_id as u32));
+            let snapshot = stat.snapshot();
+            for i in 0..NR_CPU_STATS {
+                total_stats[i] += snapshot[i];
+            }
+        }
+
+        // 输出总 CPU 行（8 个字段：user nice system idle iowait irq softirq steal）
+        data.append(
+            &mut format!(
+                "cpu {} {} {} {} {} {} {} {}\n",
+                ns_to_clock_t(total_stats[CpuUsageStat::User as usize]),
+                ns_to_clock_t(total_stats[CpuUsageStat::Nice as usize]),
+                ns_to_clock_t(total_stats[CpuUsageStat::System as usize]),
+                ns_to_clock_t(total_stats[CpuUsageStat::Idle as usize]),
+                ns_to_clock_t(total_stats[CpuUsageStat::IoWait as usize]),
+                ns_to_clock_t(total_stats[CpuUsageStat::Irq as usize]),
+                ns_to_clock_t(total_stats[CpuUsageStat::Softirq as usize]),
+                ns_to_clock_t(total_stats[CpuUsageStat::Steal as usize]),
+            )
+            .as_bytes()
+            .to_owned(),
+        );
+
+        // 输出每个 CPU 的统计行
+        for cpu_id in 0..cpu_count {
+            let stat = kcpustat_cpu(ProcessorId::new(cpu_id as u32));
+            let snapshot = stat.snapshot();
             data.append(
-                &mut format!("cpu{} {}\n", cpu_id, cpu_fields)
-                    .as_bytes()
-                    .to_owned(),
+                &mut format!(
+                    "cpu{} {} {} {} {} {} {} {} {}\n",
+                    cpu_id,
+                    ns_to_clock_t(snapshot[CpuUsageStat::User as usize]),
+                    ns_to_clock_t(snapshot[CpuUsageStat::Nice as usize]),
+                    ns_to_clock_t(snapshot[CpuUsageStat::System as usize]),
+                    ns_to_clock_t(snapshot[CpuUsageStat::Idle as usize]),
+                    ns_to_clock_t(snapshot[CpuUsageStat::IoWait as usize]),
+                    ns_to_clock_t(snapshot[CpuUsageStat::Irq as usize]),
+                    ns_to_clock_t(snapshot[CpuUsageStat::Softirq as usize]),
+                    ns_to_clock_t(snapshot[CpuUsageStat::Steal as usize]),
+                )
+                .as_bytes()
+                .to_owned(),
             );
         }
 

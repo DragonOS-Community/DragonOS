@@ -189,7 +189,7 @@ impl Socket for TcpSocket {
                         continue; // Data available now, retry recv
                     }
                     // Wait for EPOLLIN. The poll thread's notify() updates pollee after polling.
-                    self.wait_queue.wait_event_interruptible_timeout(
+                    self.wait_queue.wait_event_io_interruptible_timeout(
                         || {
                             let events = EP::from_bits_truncate(
                                 self.pollee.load(core::sync::atomic::Ordering::SeqCst) as u32,
@@ -256,7 +256,7 @@ impl Socket for TcpSocket {
             }
 
             // 等待可写或超时/信号。
-            self.wait_queue.wait_event_interruptible_timeout(
+            self.wait_queue.wait_event_io_interruptible_timeout(
                 || {
                     let events = EP::from_bits_truncate(
                         self.pollee.load(core::sync::atomic::Ordering::SeqCst) as u32,

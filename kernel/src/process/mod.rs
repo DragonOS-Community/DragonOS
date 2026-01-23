@@ -1015,6 +1015,8 @@ bitflags! {
         const FORKNOEXEC = 1 << 11;
         /// 进程需要在返回用户态前处理 rseq
         const NEED_RSEQ = 1 << 12;
+        /// 进程正在等待 IO 操作完成（用于 iowait 统计）
+        const IN_IOWAIT = 1 << 13;
     }
 }
 
@@ -2420,6 +2422,10 @@ impl ProcessSchedulerInfo {
 
     pub fn policy(&self) -> crate::sched::SchedPolicy {
         return *self.sched_policy.read_irqsave();
+    }
+
+    pub fn prio_data(&self) -> RwLockReadGuard<'_, PrioData> {
+        return self.prio_data.read_irqsave();
     }
 }
 

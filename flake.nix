@@ -104,8 +104,11 @@
                 echo "==> Step 1: Building kernel with make kernel..."
                 ${pkgs.gnumake}/bin/make kernel
 
-                echo "==> Step 2: Building rootfs..."
-                exec ${pkgs.nix}/bin/nix run .#rootfs-${target} -- ${startPkg}/bin/dragonos-run "$@"
+                echo "==> Step 2: Building rootfs (re-evaluating userland packages)..."
+                ${pkgs.nix}/bin/nix build .#rootfs-${target}
+
+                echo "==> Step 3: Starting DragonOS..."
+                exec ${startPkg}/bin/dragonos-run "$@"
               '';
             in
             {

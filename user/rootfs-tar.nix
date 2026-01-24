@@ -7,7 +7,7 @@ let
   sys-config = pkgs.runCommand "sysconfig" {
     src = ./sysconfig;
   } ''
-    mkdir -p $out
+    mkdir -p $out $out/root
     cp -r $src/* $out/
   '';
 

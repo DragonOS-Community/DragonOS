@@ -1,0 +1,22 @@
+name = "call_2333"
+version = "0.1.0"
+description = "一个用来测试系统调用2333的程序"
+
+build-once = false
+install-once = false
+
+target-arch = ["x86_64"]
+
+[task-source]
+type = "build-from-source"
+source = "local"
+source-path = "user/apps/call_2333"
+
+[build]
+build-command = "make install"
+
+[install]
+in-dragonos-path = "/bin"
+
+[clean]
+clean-command = "make clean"

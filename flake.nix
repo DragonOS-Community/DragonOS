@@ -96,8 +96,8 @@
                   ;
               };
 
-              # 一键化构建启动脚本
-              runApp = pkgs.writeScriptBin "dragonos-run-${target}" ''
+              # 一键化构建启动脚本 (yolo: You Only Live Once - 一条命令跑通全部)
+              runApp = pkgs.writeScriptBin "dragonos-yolo" ''
                 #!${pkgs.runtimeShell}
                 set -e
 
@@ -105,18 +105,15 @@
                 ${pkgs.gnumake}/bin/make kernel
 
                 echo "==> Step 2: Building rootfs..."
-                ${rootfsPkg}/bin/dragonos-rootfs
-
-                echo "==> Step 3: Starting DragonOS..."
-                exec ${startPkg}/bin/dragonos-run "$@"
+                exec ${pkgs.nix}/bin/nix run .#rootfs-${target} -- ${startPkg}/bin/dragonos-run "$@"
               '';
             in
             {
               apps = {
-                # run-${target}: 一键化构建启动命令 (make kernel + rootfs + start)
-                "run-${target}" = {
+                # yolo-${target}: 一键化构建启动命令 (make kernel + rootfs + start)
+                "yolo-${target}" = {
                   type = "app";
-                  program = "${runApp}/bin/dragonos-run-${target}";
+                  program = "${runApp}/bin/dragonos-yolo";
                   meta.description = "一键化构建并启动DragonOS (${target})";
                 };
                 # start-${target} 的产物只是一个shell脚本，因此启动相关的参数，直接在上面修改即可，
@@ -136,6 +133,7 @@
                 };
               };
               packages = {
+                "yolo-${target}" = runApp;
                 "start-${target}" = startPkg;
                 "rootfs-${target}" = rootfsPkg;
               };
@@ -195,11 +193,15 @@
             # Shell启动脚本
             shellHook = ''
               echo "欢迎进入 DragonOS Nix 开发环境!"
+              echo ""
               echo "要运行 DragonOS，请构建内核、rootfs，再QEMU运行"
-              echo "  一键运行:    nix run .#run-x86_64"
+              echo ""
+              echo "  一键运行:    nix run .#yolo-x86_64"
+              echo "  快速启动:    nix shell .#start-x86_64，然后 dragonos-run"
               echo "  构建内核:    make kernel"
               echo "  构建 rootfs: nix run .#rootfs-x86_64"
               echo "  QEMU 运行:   nix run .#start-x86_64"
+              echo ""
               echo "  文档：       https://docs.dragonos.org.cn/"
             '';
           };

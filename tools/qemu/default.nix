@@ -43,9 +43,7 @@ let
         "qemu.log"
 
         # Boot Order
-        "-boot"
-        "order=d"
-
+        "-boot order=d"
         "-rtc"
         "clock=host,base=localtime"
         # Trace events

@@ -1,5 +1,5 @@
 use core::fmt::Debug;
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::libs::rwlock::RwLock;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
@@ -237,9 +237,75 @@ impl ProcessControlBlock {
     /// 强制设置当前进程的raw_pid
     /// 注意：这个函数应该在创建进程时调用，不能在运行时随意调用
     pub(super) unsafe fn force_set_raw_pid(&self, pid: RawPid) {
-        let self_mut = self as *const Self as *mut Self;
-        (*self_mut).pid = pid;
+        self.pid.store(pid, Ordering::Release);
     }
+
+    pub(super) fn exchange_tid_with(
+        self: &Arc<Self>,
+        other: &Arc<ProcessControlBlock>,
+    ) -> Result<(), SystemError> {
+        if Arc::ptr_eq(self, other) {
+            return Err(SystemError::EINVAL);
+        }
+
+        let (first_task, second_task) = order_pcbs(self, other);
+        let mut first_link = first_task.pid_links[PidType::PID as usize].pid.write();
+        let mut second_link = second_task.pid_links[PidType::PID as usize].pid.write();
+
+        let mut first_thread_pid = first_task.thread_pid.write();
+        let mut second_thread_pid = second_task.thread_pid.write();
+
+        let first_pid = first_thread_pid.clone().ok_or(SystemError::EINVAL)?;
+        let second_pid = second_thread_pid.clone().ok_or(SystemError::EINVAL)?;
+        if Arc::ptr_eq(&first_pid, &second_pid) {
+            return Err(SystemError::EINVAL);
+        }
+
+        let (first_pid_lock, second_pid_lock) = order_pids(&first_pid, &second_pid);
+        let mut first_tasks = first_pid_lock.tasks[PidType::PID as usize].lock();
+        let mut second_tasks = second_pid_lock.tasks[PidType::PID as usize].lock();
+
+        replace_task_in_pid_tasks(&mut first_tasks, first_task, second_task)?;
+        replace_task_in_pid_tasks(&mut second_tasks, second_task, first_task)?;
+
+        core::mem::swap(&mut *first_link, &mut *second_link);
+        core::mem::swap(&mut *first_thread_pid, &mut *second_thread_pid);
+
+        Ok(())
+    }
+}
+
+fn order_pcbs<'a>(
+    left: &'a Arc<ProcessControlBlock>,
+    right: &'a Arc<ProcessControlBlock>,
+) -> (&'a Arc<ProcessControlBlock>, &'a Arc<ProcessControlBlock>) {
+    if (Arc::as_ptr(left) as usize) <= (Arc::as_ptr(right) as usize) {
+        (left, right)
+    } else {
+        (right, left)
+    }
+}
+
+fn order_pids<'a>(left: &'a Arc<Pid>, right: &'a Arc<Pid>) -> (&'a Arc<Pid>, &'a Arc<Pid>) {
+    if (Arc::as_ptr(left) as usize) <= (Arc::as_ptr(right) as usize) {
+        (left, right)
+    } else {
+        (right, left)
+    }
+}
+
+fn replace_task_in_pid_tasks(
+    tasks: &mut [Weak<ProcessControlBlock>],
+    old_task: &Arc<ProcessControlBlock>,
+    new_task: &Arc<ProcessControlBlock>,
+) -> Result<(), SystemError> {
+    for weak in tasks.iter_mut() {
+        if Weak::ptr_eq(weak, &old_task.self_ref) {
+            *weak = Arc::downgrade(new_task);
+            return Ok(());
+        }
+    }
+    Err(SystemError::ESRCH)
 }
 
 /// 连接任务和PID的桥梁结构体

@@ -1,7 +1,6 @@
 use core::ffi::c_int;
 
 use crate::{
-    arch::ipc::signal::Signal,
     filesystem::epoll::{event_poll::EventPoll, EPollCtlOption, EPollEvent, EPollEventType},
     ipc::signal::{restore_saved_sigmask_unless, RestartBlock, RestartBlockData, RestartFn},
     libs::wait_queue::{TimeoutWaker, Waiter},
@@ -238,11 +237,10 @@ fn poll_wait_timeout_only(timeout: Option<Instant>) -> Result<usize, SystemError
     }
 
     loop {
-        // 检查是否有待处理的信号
+        // 检查是否有未被掩码屏蔽的待处理信号
+        // ppoll 应该只被未被屏蔽的信号中断，被屏蔽的信号应保持 pending 状态
         let current_pcb = ProcessManager::current_pcb();
-        if current_pcb.has_pending_signal_fast()
-            && Signal::signal_pending_state(true, false, &current_pcb)
-        {
+        if current_pcb.has_pending_signal_fast() && current_pcb.has_pending_not_masked_signal() {
             return Err(SystemError::ERESTARTNOHAND);
         }
 
@@ -297,11 +295,9 @@ fn poll_wait_timeout_only(timeout: Option<Instant>) -> Result<usize, SystemError
         }
         wait_res?;
 
-        // 检查是否因信号而醒来
+        // 检查是否因未被掩码屏蔽的信号而醒来
         let current_pcb = ProcessManager::current_pcb();
-        if current_pcb.has_pending_signal_fast()
-            && Signal::signal_pending_state(true, false, &current_pcb)
-        {
+        if current_pcb.has_pending_signal_fast() && current_pcb.has_pending_not_masked_signal() {
             return Err(SystemError::ERESTARTNOHAND);
         }
 
@@ -387,11 +383,13 @@ pub fn poll_select_finish(
         }
     }
 
-    // 将ERESTARTSYS和ERESTARTNOHAND转换为EINTR
+    // 将ERESTARTSYS、ERESTARTNOHAND和ERESTART_RESTARTBLOCK转换为EINTR
     // 这些错误码表示系统调用被信号中断，应该返回EINTR给用户态
     if matches!(
         result,
-        Err(SystemError::ERESTARTNOHAND) | Err(SystemError::ERESTARTSYS)
+        Err(SystemError::ERESTARTNOHAND)
+            | Err(SystemError::ERESTARTSYS)
+            | Err(SystemError::ERESTART_RESTARTBLOCK)
     ) {
         result = result.map_err(|_| SystemError::EINTR);
     }

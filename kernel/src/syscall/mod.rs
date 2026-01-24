@@ -13,10 +13,11 @@ use table::{syscall_table, syscall_table_init};
 
 use crate::arch::interrupt::TrapFrame;
 
-use self::{misc::SysInfo, user_access::UserBufferWriter};
+use self::user_access::UserBufferWriter;
 
 pub mod misc;
 mod sys_getrandom;
+mod sys_sysinfo;
 pub mod table;
 pub mod user_access;
 pub mod user_buffer;
@@ -82,7 +83,7 @@ impl Syscall {
         if let Some(handler) = syscall_table().get(syscall_num) {
             // 使用以下代码可以打印系统调用号和参数，方便调试
 
-            // let show = ProcessManager::current_pid().data() >= 12;
+            // let show = ProcessManager::current_pid().data() > 13;
             let show = false;
             if show {
                 log::debug!(
@@ -134,11 +135,6 @@ impl Syscall {
 
                 let user_buf = user_buffer_writer.buffer(0)?;
                 Self::do_syslog(syslog_action_type, user_buf, len)
-            }
-
-            SYS_SYSINFO => {
-                let info = args[0] as *mut SysInfo;
-                Self::sysinfo(info)
             }
 
             SYS_FSYNC => {

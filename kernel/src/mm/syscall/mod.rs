@@ -186,7 +186,7 @@ impl From<ProtFlags> for VmFlags {
 
 impl From<ShmFlags> for VmFlags {
     fn from(shm_flags: ShmFlags) -> Self {
-        let mut vm_flags = VmFlags::VM_NONE;
+        let mut vm_flags = VmFlags::VM_SHARED | VmFlags::VM_MAYSHARE;
 
         if shm_flags.contains(ShmFlags::SHM_RDONLY) {
             vm_flags |= VmFlags::VM_READ;

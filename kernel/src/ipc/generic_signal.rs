@@ -12,6 +12,7 @@ use crate::{
     process::{ProcessFlags, ProcessManager},
     sched::{schedule, SchedMode},
 };
+use alloc::sync::Arc;
 
 /// 信号处理的栈的栈指针的最小对齐
 #[allow(dead_code)]
@@ -406,6 +407,17 @@ bitflags! {
 
 /// 信号默认处理函数——终止进程
 fn sig_terminate(sig: Signal) {
+    if sig == Signal::SIGKILL {
+        let current = ProcessManager::current_pcb();
+        let sighand = current.sighand();
+        if sighand.flags_contains(SignalFlags::GROUP_EXEC) {
+            if let Some(exec_task) = sighand.group_exec_task() {
+                if !Arc::ptr_eq(&exec_task, &current) {
+                    ProcessManager::exit(sig as usize);
+                }
+            }
+        }
+    }
     let code = ProcessManager::current_pcb()
         .sighand()
         .group_exit_code_if_set();

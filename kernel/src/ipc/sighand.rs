@@ -1,6 +1,6 @@
 use core::{fmt::Debug, sync::atomic::compiler_fence};
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 
 use alloc::vec::Vec;
 use system_error::SystemError;
@@ -11,6 +11,7 @@ use crate::{
         OriginCode, SaHandlerType, SigCode, SigInfo, SigPending, SigactionType, SignalFlags,
     },
     libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+    libs::wait_queue::WaitQueue,
     process::{
         pid::{Pid, PidType},
         ProcessControlBlock, ProcessManager,
@@ -21,6 +22,7 @@ use super::signal_types::Sigaction;
 
 pub struct SigHand {
     inner: RwLock<InnerSigHand>,
+    group_exec_wait_queue: WaitQueue,
 }
 
 impl Debug for SigHand {
@@ -37,6 +39,10 @@ pub struct InnerSigHand {
     /// 线程组退出码（仿照 Linux 的 signal_struct::group_exit_code）
     /// 仅当 flags 中包含 GROUP_EXIT 时才有效
     pub group_exit_code: usize,
+    /// 线程组 exec（de-thread）当前执行者
+    pub group_exec_task: Option<Weak<ProcessControlBlock>>,
+    /// 线程组 exec（de-thread）等待计数（仿照 Linux 的 signal_struct::notify_count）
+    pub group_exec_notify_count: isize,
     pub pids: [Option<Arc<Pid>>; PidType::PIDTYPE_MAX],
     /// 在 sighand 上维护的引用计数（与 Linux 一致的布局位置）
     pub cnt: i64,
@@ -46,6 +52,7 @@ impl SigHand {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             inner: RwLock::new(InnerSigHand::default()),
+            group_exec_wait_queue: WaitQueue::default(),
         })
     }
 
@@ -55,6 +62,40 @@ impl SigHand {
 
     fn inner_mut(&self) -> RwLockWriteGuard<'_, InnerSigHand> {
         self.inner.write_irqsave()
+    }
+
+    pub fn inner_read(&self) -> RwLockReadGuard<'_, InnerSigHand> {
+        self.inner()
+    }
+
+    fn group_exec_wait_queue(&self) -> &WaitQueue {
+        &self.group_exec_wait_queue
+    }
+
+    pub fn wait_group_exec_event_interruptible<F, B>(
+        &self,
+        cond: F,
+        before_sleep: Option<B>,
+    ) -> Result<(), SystemError>
+    where
+        F: FnMut() -> bool,
+        B: FnMut(),
+    {
+        self.group_exec_wait_queue()
+            .wait_event_interruptible(cond, before_sleep)
+    }
+
+    pub fn wait_group_exec_event_killable<F, B>(
+        &self,
+        cond: F,
+        before_sleep: Option<B>,
+    ) -> Result<(), SystemError>
+    where
+        F: FnMut() -> bool,
+        B: FnMut(),
+    {
+        self.group_exec_wait_queue()
+            .wait_event_killable(cond, before_sleep)
     }
 
     pub fn reset_handlers(&self) {
@@ -182,6 +223,91 @@ impl SigHand {
         g.flags.remove(flag);
     }
 
+    /// 尝试开始线程组 exec（去线程化）流程。
+    ///
+    /// - 若已经有 GROUP_EXIT 或 GROUP_EXEC 在进行中，则返回 EAGAIN。
+    /// - 否则设置 GROUP_EXEC 并返回 Ok。
+    pub fn try_start_group_exec(&self) -> Result<(), SystemError> {
+        let mut g = self.inner_mut();
+        if g.flags.contains(SignalFlags::GROUP_EXIT) || g.flags.contains(SignalFlags::GROUP_EXEC) {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        g.flags.insert(SignalFlags::GROUP_EXEC);
+        Ok(())
+    }
+
+    /// 在与 GROUP_EXEC/GROUP_EXIT 相同的锁下，设置 exec 标志并记录执行者。
+    pub fn start_group_exec(&self, task: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
+        let mut g = self.inner_mut();
+        if g.flags.contains(SignalFlags::GROUP_EXIT) || g.flags.contains(SignalFlags::GROUP_EXEC) {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        g.flags.insert(SignalFlags::GROUP_EXEC);
+        g.group_exec_task = Some(Arc::downgrade(task));
+        g.group_exec_notify_count = 0;
+        Ok(())
+    }
+
+    /// 结束线程组 exec 状态。
+    pub fn finish_group_exec(&self) {
+        let mut g = self.inner_mut();
+        g.flags.remove(SignalFlags::GROUP_EXEC);
+        g.group_exec_task = None;
+        g.group_exec_notify_count = 0;
+        drop(g);
+        self.group_exec_wait_queue().wakeup_all(None);
+    }
+
+    /// 记录当前 exec 线程（去线程化执行者）。
+    pub fn set_group_exec_task(&self, task: &Arc<ProcessControlBlock>) {
+        let mut g = self.inner_mut();
+        g.group_exec_task = Some(Arc::downgrade(task));
+    }
+
+    /// 在与 GROUP_EXEC/GROUP_EXIT 相同的锁下执行关键区，避免并发插入线程组。
+    pub fn with_group_exec_check<F, R>(&self, f: F) -> Result<R, SystemError>
+    where
+        F: FnOnce() -> R,
+    {
+        let g = self.inner_mut();
+        if g.flags.contains(SignalFlags::GROUP_EXIT) || g.flags.contains(SignalFlags::GROUP_EXEC) {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        let ret = f();
+        drop(g);
+        Ok(ret)
+    }
+
+    /// 获取当前 exec 线程（去线程化执行者）。
+    pub fn group_exec_task(&self) -> Option<Arc<ProcessControlBlock>> {
+        self.inner().group_exec_task.as_ref()?.upgrade()
+    }
+
+    pub fn group_exec_notify_count(&self) -> isize {
+        self.inner().group_exec_notify_count
+    }
+
+    pub fn set_group_exec_notify_count(&self, count: isize) {
+        let mut g = self.inner_mut();
+        g.group_exec_notify_count = count;
+    }
+
+    pub fn dec_group_exec_notify_count_and_wake(&self) {
+        let mut g = self.inner_mut();
+        if g.group_exec_notify_count > 0 {
+            g.group_exec_notify_count -= 1;
+            if g.group_exec_notify_count == 0 {
+                drop(g);
+                self.group_exec_wait_queue().wakeup_all(None);
+                return;
+            }
+        }
+    }
+
+    pub fn wake_group_exec_waiters(&self) {
+        self.group_exec_wait_queue().wakeup_all(None);
+    }
+
     /// 若当前线程组已经处于 group-exit 状态，则返回统一的退出码；否则返回 None
     pub fn group_exit_code_if_set(&self) -> Option<usize> {
         let g = self.inner();
@@ -234,6 +360,8 @@ impl Default for InnerSigHand {
             shared_pending: SigPending::default(),
             flags: SignalFlags::empty(),
             group_exit_code: 0,
+            group_exec_task: None,
+            group_exec_notify_count: 0,
             cnt: 0,
         }
     }

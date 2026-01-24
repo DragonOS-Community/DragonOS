@@ -9,7 +9,7 @@
     "hash": "d8667f36cbfe9d9f532737a3fbe39f2d"
   },
   "en:kernel/process_management/index.rst": {
-    "hash": "b200476562e580ee97d8a3ffe19d5605"
+    "hash": "cbea45a3be872849398ff07a02fe3d57"
   },
   "en:kernel/libs/unified-init.md": {
     "hash": "28374260f0134386d53392156d749733"
@@ -162,13 +162,13 @@
     "hash": "f449acec9b9ad36c4a75e8594d38e44d"
   },
   "en:kernel/filesystem/overview.md": {
-    "hash": "44499f7673a0c68c53b12882258b9f5c"
+    "hash": "296d560c67fbc0e14c695efe46a415f7"
   },
   "en:kernel/boot/bootloader.md": {
     "hash": "e6f65060560663ca2ce4d56d750332d8"
   },
   "en:kernel/ipc/signal.md": {
-    "hash": "abe911dac525b44fe083752a1e6bbdc7"
+    "hash": "4a03545456558732d762dddd3ad82560"
   },
   "en:kernel/locking/mutex.md": {
     "hash": "db7dc3202e78810c3a90bcf9808557f5"
@@ -370,5 +370,8 @@
   },
   "en:kernel/interrupt/tasklet.md": {
     "hash": "254da75179ebb9f39cd9b562486fb122"
+  },
+  "en:kernel/process_management/de_thread.md": {
+    "hash": "d5d9c9a4d491398ecc0a45118e4e92da"
   }
 }

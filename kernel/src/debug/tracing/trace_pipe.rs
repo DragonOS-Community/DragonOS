@@ -3,7 +3,6 @@ use crate::filesystem::kernfs::{KernFSInodeArgs, KernInodeType};
 use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::vfs::PollStatus;
 use crate::libs::wait_queue::WaitQueue;
-use crate::process::{ProcessFlags, ProcessManager};
 use crate::tracepoint::{TraceEntryParser, TracePipeOps};
 use alloc::string::String;
 use core::fmt::Debug;
@@ -131,13 +130,7 @@ impl KernFSCallback for TracePipeCallBack {
             // Release the lock before waiting
             drop(trace_raw_pipe);
             // wait for new data
-            let r = wq_wait_event_interruptible!(TracePipeCallBackWaitQueue, self.readable(), {});
-            if r.is_err() {
-                ProcessManager::current_pcb()
-                    .flags()
-                    .insert(ProcessFlags::HAS_PENDING_SIGNAL);
-                return Err(SystemError::ERESTARTSYS);
-            }
+            wq_wait_event_interruptible!(TracePipeCallBackWaitQueue, self.readable(), {})?;
             // todo!(wq_wait_event_interruptible may has a bug)
         };
         Ok(read_len)

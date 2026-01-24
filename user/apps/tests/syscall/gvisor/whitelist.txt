@@ -25,7 +25,7 @@ sync_test
 ioctl_test
 stat_test
 statfs_test
-#chmod_test
+chmod_test
 #chown_test
 chdir_test
 fchdir_test
@@ -98,6 +98,9 @@ raw_socket_test
 raw_socket_icmp_test
 raw_socket_hdrincl_test
 tcp_socket_test
+socket_ip_tcp_generic_loopback_test
+socket_ip_tcp_loopback_non_blocking_test
+socket_ip_tcp_loopback_test
 
 # 信号处理测试
 sigaction_test
@@ -123,4 +126,4 @@ clock_gettime_test
 setgid_test
 uidgid_test
 partitial_bad_buffer_test
-
+sysinfo_test

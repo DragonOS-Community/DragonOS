@@ -1,16 +1,13 @@
 /// 引入Module
-use crate::driver::{
-    base::{
-        device::{
-            device_number::{DeviceNumber, Major},
-            DevName, Device, DeviceError, IdTable, BLOCKDEVS,
-        },
-        map::{
-            DeviceStruct, DEV_MAJOR_DYN_END, DEV_MAJOR_DYN_EXT_END, DEV_MAJOR_DYN_EXT_START,
-            DEV_MAJOR_HASH_SIZE, DEV_MAJOR_MAX,
-        },
+use crate::driver::base::{
+    device::{
+        device_number::{DeviceNumber, Major},
+        DevName, Device, DeviceError, IdTable, BLOCKDEVS,
     },
-    block::cache::{cached_block_device::BlockCache, BlockCacheError, BLOCK_SIZE},
+    map::{
+        DeviceStruct, DEV_MAJOR_DYN_END, DEV_MAJOR_DYN_EXT_END, DEV_MAJOR_DYN_EXT_START,
+        DEV_MAJOR_HASH_SIZE, DEV_MAJOR_MAX,
+    },
 };
 
 use alloc::{sync::Arc, vec::Vec};
@@ -293,7 +290,11 @@ pub trait BlockDevice: Device {
         count: usize,
         buf: &mut [u8],
     ) -> Result<usize, SystemError> {
-        self.cache_read(lba_id_start, count, buf)
+        let bio = self.submit_bio_read(lba_id_start, count)?;
+        let data = bio.wait()?;
+        let copy_len = core::cmp::min(buf.len(), data.len());
+        buf[..copy_len].copy_from_slice(&data[..copy_len]);
+        Ok(copy_len)
     }
 
     /// # 函数的功能
@@ -304,50 +305,9 @@ pub trait BlockDevice: Device {
         count: usize,
         buf: &[u8],
     ) -> Result<usize, SystemError> {
-        self.cache_write(lba_id_start, count, buf)
-    }
-
-    /// # 函数的功能
-    /// 其功能对外而言和read_at函数完全一致，但是加入blockcache的功能
-    fn cache_read(
-        &self,
-        lba_id_start: BlockId,
-        count: usize,
-        buf: &mut [u8],
-    ) -> Result<usize, SystemError> {
-        let cache_response = BlockCache::read(lba_id_start, count, buf);
-        if let Err(e) = cache_response {
-            match e {
-                BlockCacheError::StaticParameterError => {
-                    BlockCache::init();
-                    let ans = self.read_at_sync(lba_id_start, count, buf)?;
-                    return Ok(ans);
-                }
-                BlockCacheError::BlockFaultError(fail_vec) => {
-                    let ans = self.read_at_sync(lba_id_start, count, buf)?;
-                    let _ = BlockCache::insert(fail_vec, buf);
-                    return Ok(ans);
-                }
-                _ => {
-                    let ans = self.read_at_sync(lba_id_start, count, buf)?;
-                    return Ok(ans);
-                }
-            }
-        } else {
-            return Ok(count * BLOCK_SIZE);
-        }
-    }
-
-    /// # 函数功能
-    /// 其功能对外而言和write_at函数完全一致，但是加入blockcache的功能
-    fn cache_write(
-        &self,
-        lba_id_start: BlockId,
-        count: usize,
-        buf: &[u8],
-    ) -> Result<usize, SystemError> {
-        let _cache_response = BlockCache::immediate_write(lba_id_start, count, buf);
-        self.write_at_sync(lba_id_start, count, buf)
+        let bio = self.submit_bio_write(lba_id_start, count, buf)?;
+        let _ = bio.wait()?;
+        Ok(core::cmp::min(buf.len(), count * LBA_SIZE))
     }
 
     fn write_at_bytes(&self, offset: usize, len: usize, buf: &[u8]) -> Result<usize, SystemError> {

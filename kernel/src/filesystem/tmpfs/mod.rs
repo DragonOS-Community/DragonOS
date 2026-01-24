@@ -2,7 +2,7 @@ use core::any::Any;
 use core::intrinsics::unlikely;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::filesystem::page_cache::PageCache;
+use crate::filesystem::page_cache::{PageCache, PageCacheBackend};
 use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::{FileSystemMakerData, FSMAKER};
 use crate::libs::rwsem::RwSem;
@@ -45,6 +45,45 @@ const TMPFS_BLOCK_SIZE: u64 = 4096;
 
 const TMPFS_DEFAULT_MIN_SIZE_BYTES: usize = 16 * 1024 * 1024; // 16MiB
 const TMPFS_DEFAULT_MAX_SIZE_BYTES: usize = 4 * 1024 * 1024 * 1024; // 4GiB
+
+#[derive(Debug)]
+struct TmpfsPageCacheBackend {
+    inode: Weak<dyn IndexNode>,
+}
+
+impl TmpfsPageCacheBackend {
+    fn new(inode: Weak<dyn IndexNode>) -> Self {
+        Self { inode }
+    }
+}
+
+impl PageCacheBackend for TmpfsPageCacheBackend {
+    fn read_page(&self, _index: usize, _buf: &mut [u8]) -> Result<usize, SystemError> {
+        Ok(0)
+    }
+
+    fn write_page(&self, _index: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        Ok(buf.len())
+    }
+
+    fn npages(&self) -> usize {
+        let inode = match self.inode.upgrade() {
+            Some(inode) => inode,
+            None => return 0,
+        };
+        match inode.metadata() {
+            Ok(metadata) => {
+                let size = metadata.size.max(0) as usize;
+                if size == 0 {
+                    0
+                } else {
+                    (size + MMArch::PAGE_SIZE - 1) >> MMArch::PAGE_SHIFT
+                }
+            }
+            Err(_) => 0,
+        }
+    }
+}
 
 fn tmpfs_move_entry_between_dirs(
     src_dir: &mut TmpfsInode,
@@ -488,35 +527,25 @@ impl IndexNode for LockedTmpfsInode {
         }
 
         let mut items: Vec<ReadItem> = Vec::new();
-        {
-            let mut page_cache_guard = page_cache.lock();
-            for page_index in start_page_index..=end_page_index {
-                let page_start = page_index * MMArch::PAGE_SIZE;
-                let page_end = page_start + MMArch::PAGE_SIZE;
+        for page_index in start_page_index..=end_page_index {
+            let page_start = page_index * MMArch::PAGE_SIZE;
+            let page_end = page_start + MMArch::PAGE_SIZE;
 
-                let read_start = core::cmp::max(offset, page_start);
-                let read_end = core::cmp::min(offset + read_len, page_end);
-                let page_read_len = read_end.saturating_sub(read_start);
-                if page_read_len == 0 {
-                    continue;
-                }
-
-                // tmpfs: 缺页即创建零页
-                let page = if let Some(page) = page_cache_guard.get_page(page_index) {
-                    page
-                } else {
-                    page_cache_guard.create_zero_pages(page_index, 1)?;
-                    page_cache_guard
-                        .get_page(page_index)
-                        .ok_or(SystemError::EIO)?
-                };
-
-                items.push(ReadItem {
-                    page,
-                    page_offset: read_start - page_start,
-                    sub_len: page_read_len,
-                });
+            let read_start = core::cmp::max(offset, page_start);
+            let read_end = core::cmp::min(offset + read_len, page_end);
+            let page_read_len = read_end.saturating_sub(read_start);
+            if page_read_len == 0 {
+                continue;
             }
+
+            // tmpfs: 缺页即创建零页
+            let page = page_cache.manager().commit_overwrite(page_index)?;
+
+            items.push(ReadItem {
+                page,
+                page_offset: read_start - page_start,
+                sub_len: page_read_len,
+            });
         }
 
         let mut dst_off = 0usize;
@@ -587,39 +616,31 @@ impl IndexNode for LockedTmpfsInode {
         // 两阶段写入：同样避免在持有 page_cache 锁时触碰用户缓冲区（SelfRead）。
         struct WriteItem {
             page: Arc<Page>,
+            page_index: usize,
             page_offset: usize,
             sub_len: usize,
         }
 
         let mut items: Vec<WriteItem> = Vec::new();
-        {
-            let mut page_cache_guard = page_cache.lock();
-            for page_index in start_page_index..=end_page_index {
-                let page_start = page_index * MMArch::PAGE_SIZE;
-                let page_end = page_start + MMArch::PAGE_SIZE;
+        for page_index in start_page_index..=end_page_index {
+            let page_start = page_index * MMArch::PAGE_SIZE;
+            let page_end = page_start + MMArch::PAGE_SIZE;
 
-                let write_start = core::cmp::max(offset, page_start);
-                let write_end = core::cmp::min(offset + len, page_end);
-                let page_write_len = write_end.saturating_sub(write_start);
-                if page_write_len == 0 {
-                    continue;
-                }
-
-                let page = if let Some(page) = page_cache_guard.get_page(page_index) {
-                    page
-                } else {
-                    page_cache_guard.create_zero_pages(page_index, 1)?;
-                    page_cache_guard
-                        .get_page(page_index)
-                        .ok_or(SystemError::EIO)?
-                };
-
-                items.push(WriteItem {
-                    page,
-                    page_offset: write_start - page_start,
-                    sub_len: page_write_len,
-                });
+            let write_start = core::cmp::max(offset, page_start);
+            let write_end = core::cmp::min(offset + len, page_end);
+            let page_write_len = write_end.saturating_sub(write_start);
+            if page_write_len == 0 {
+                continue;
             }
+
+            let page = page_cache.manager().commit_overwrite(page_index)?;
+
+            items.push(WriteItem {
+                page,
+                page_index,
+                page_offset: write_start - page_start,
+                sub_len: page_write_len,
+            });
         }
 
         let mut src_off = 0usize;
@@ -638,6 +659,7 @@ impl IndexNode for LockedTmpfsInode {
                     .copy_from_slice(&buf[src_off..src_off + it.sub_len]);
             }
             page_guard.add_flags(crate::mm::page::PageFlags::PG_DIRTY);
+            page_cache.manager().update_page(it.page_index)?;
             src_off += it.sub_len;
         }
 
@@ -761,8 +783,15 @@ impl IndexNode for LockedTmpfsInode {
         // 目前 VFS 使用 read_at/write_at 来读写 symlink 内容（readlink/symlink 语义），
         // 因此 symlink 也必须有 page_cache 后端，否则会在 write_at/read_at 返回 EIO。
         if file_type == FileType::File || file_type == FileType::SymLink {
-            let pc = PageCache::new(Some(Arc::downgrade(&result) as Weak<dyn IndexNode>));
+            let backend = Arc::new(TmpfsPageCacheBackend::new(
+                Arc::downgrade(&result) as Weak<dyn IndexNode>
+            ));
+            let pc = PageCache::new(
+                Some(Arc::downgrade(&result) as Weak<dyn IndexNode>),
+                Some(backend),
+            );
             pc.set_unevictable(true);
+            pc.set_shmem(true);
             result.0.lock().page_cache = Some(pc);
         }
 
@@ -1056,7 +1085,7 @@ impl IndexNode for LockedTmpfsInode {
         &self,
         filename: &str,
         mode: InodeMode,
-        _dev_t: DeviceNumber,
+        dev_t: DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let mut inode = self.0.lock();
         if inode.metadata.file_type != FileType::Dir {
@@ -1071,6 +1100,17 @@ impl IndexNode for LockedTmpfsInode {
         }
 
         let filename = DName::from(filename);
+
+        // 确定文件类型
+        let file_type = if mode.contains(InodeMode::S_IFIFO) {
+            FileType::Pipe
+        } else if mode.contains(InodeMode::S_IFCHR) {
+            FileType::CharDevice
+        } else if mode.contains(InodeMode::S_IFBLK) {
+            FileType::BlockDevice
+        } else {
+            FileType::File
+        };
 
         let nod = Arc::new(LockedTmpfsInode(Mutex::new(TmpfsInode {
             parent: inode.self_ref.clone(),
@@ -1087,12 +1127,12 @@ impl IndexNode for LockedTmpfsInode {
                 mtime: PosixTimeSpec::default(),
                 ctime: PosixTimeSpec::default(),
                 btime: PosixTimeSpec::default(),
-                file_type: FileType::Pipe,
+                file_type,
                 mode,
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
-                raw_dev: DeviceNumber::default(),
+                raw_dev: dev_t,
                 flags: InodeFlags::empty(),
             },
             fs: inode.fs.clone(),
@@ -1102,13 +1142,11 @@ impl IndexNode for LockedTmpfsInode {
 
         nod.0.lock().self_ref = Arc::downgrade(&nod);
 
+        // 对于 FIFO，需要创建实际的 pipe inode
         if mode.contains(InodeMode::S_IFIFO) {
-            nod.0.lock().metadata.file_type = FileType::Pipe;
             let pipe_inode = LockedPipeInode::new();
             pipe_inode.set_fifo();
             nod.0.lock().special_node = Some(SpecialNodeData::Pipe(pipe_inode));
-        } else if mode.contains(InodeMode::S_IFBLK) || mode.contains(InodeMode::S_IFCHR) {
-            return Err(SystemError::ENOSYS);
         }
 
         inode.children.insert(filename, nod.clone());

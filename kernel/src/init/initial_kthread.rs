@@ -127,10 +127,14 @@ fn switch_to_user() -> ! {
     let mut proc_init_info = ProcInitInfo::new("");
     // 设置默认环境变量
     proc_init_info.envs.push(CString::new("HOME=/").unwrap());
-    proc_init_info.envs.push(CString::new("TERM=linux").unwrap());
+    proc_init_info
+        .envs
+        .push(CString::new("TERM=linux").unwrap());
     proc_init_info.args = kenrel_cmdline_param_manager().init_proc_args();
     // 命令行管理器提供的环境变量会追加到默认环境变量之后
-    proc_init_info.envs.extend(kenrel_cmdline_param_manager().init_proc_envs());
+    proc_init_info
+        .envs
+        .extend(kenrel_cmdline_param_manager().init_proc_envs());
 
     let mut trap_frame = TrapFrame::new();
 

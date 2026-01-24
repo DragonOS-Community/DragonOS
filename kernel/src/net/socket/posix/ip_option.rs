@@ -13,6 +13,8 @@ pub enum IpOption {
     MTU_DISCOVER = 10,
     RECVTTL = 12,
     RECVTOS = 13,
+    MULTICAST_TTL = 33,
+    MULTICAST_LOOP = 34,
 }
 
 impl TryFrom<u32> for IpOption {

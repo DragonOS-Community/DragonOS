@@ -83,7 +83,12 @@ impl TcpSocket {
             inner::Inner::Listening(listening) => {
                 let (socket, point) = listening.accept().map(|(stream, remote)| {
                     (
-                        TcpSocket::new_established(stream, self.is_nonblock(), self.netns()),
+                        TcpSocket::new_established(
+                            stream,
+                            self.is_nonblock(),
+                            self.netns(),
+                            self.ip_version,
+                        ),
                         remote,
                     )
                 })?;
@@ -229,10 +234,7 @@ impl TcpSocket {
         let inner = write_state.take().expect("Tcp inner::Inner is None");
         let (replace, result) = match inner {
             inner::Inner::Connecting(conn) => conn.into_result(),
-            inner::Inner::Established(es) => {
-                log::warn!("TODO: check new established");
-                (inner::Inner::Established(es), Ok(()))
-            } // TODO check established
+            inner::Inner::Established(es) => (inner::Inner::Established(es), Ok(())), // TODO check established
             inner::Inner::SelfConnected(sc) => (inner::Inner::SelfConnected(sc), Ok(())),
             _ => {
                 log::warn!("TODO: connecting socket error options");
@@ -459,7 +461,21 @@ impl TcpSocket {
                 let local_port = es.get_name().port;
                 let iface = es.iface().clone();
                 let me: alloc::sync::Weak<dyn InetSocket> = self.self_ref.clone();
-                es.close();
+                let linger_abort = self
+                    .linger_onoff()
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                    != 0
+                    && self
+                        .linger_linger()
+                        .load(core::sync::atomic::Ordering::Relaxed)
+                        == 0;
+                let unread = es.with(|socket| socket.recv_queue());
+                if linger_abort || unread > 0 {
+                    es.with_mut(|socket| socket.abort());
+                    es.iface().poll();
+                } else {
+                    es.close();
+                }
                 iface.common().defer_tcp_close(handle, local_port, me);
                 writer.replace(inner::Inner::Established(es));
             }
@@ -503,7 +519,8 @@ impl TcpSocket {
                 writer.replace(inner::Inner::Closed(closed));
             }
         };
-
+        drop(writer);
+        self.notify();
         Ok(())
     }
 }

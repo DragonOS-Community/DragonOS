@@ -63,6 +63,8 @@ fn do_execve_internal(
 
     let mut param = ExecParam::new(file, address_space.clone(), ExecParamFlags::EXEC);
 
+    param.begin_new_exec().map_err(SystemError::from)?;
+
     // 预先设置args，以便shebang处理时可以访问原始参数
     param.init_info_mut().args = argv.clone();
     param.init_info_mut().envs = envp.clone();

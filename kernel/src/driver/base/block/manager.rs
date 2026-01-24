@@ -16,7 +16,7 @@ use crate::{
         vfs::{utils::DName, IndexNode},
     },
     init::initcall::INITCALL_POSTCORE,
-    libs::spinlock::{SpinLock, SpinLockGuard},
+    libs::mutex::{Mutex, MutexGuard},
 };
 
 use super::{
@@ -41,7 +41,7 @@ pub fn block_dev_manager_init() -> Result<(), SystemError> {
 
 /// 磁盘设备管理器
 pub struct BlockDevManager {
-    inner: SpinLock<InnerBlockDevManager>,
+    inner: Mutex<InnerBlockDevManager>,
 }
 
 struct InnerBlockDevManager {
@@ -52,14 +52,14 @@ struct InnerBlockDevManager {
 impl BlockDevManager {
     pub fn new() -> Self {
         BlockDevManager {
-            inner: SpinLock::new(InnerBlockDevManager {
+            inner: Mutex::new(InnerBlockDevManager {
                 disks: HashMap::new(),
                 minors: HashMap::new(),
             }),
         }
     }
 
-    fn inner(&self) -> SpinLockGuard<'_, InnerBlockDevManager> {
+    fn inner(&self) -> MutexGuard<'_, InnerBlockDevManager> {
         self.inner.lock()
     }
 
@@ -306,7 +306,7 @@ pub struct BlockDevMeta {
     pub devname: DevName,
     pub major: Major,
     pub base_minor: u32,
-    inner: SpinLock<InnerBlockDevMeta>,
+    inner: Mutex<InnerBlockDevMeta>,
 }
 
 pub struct InnerBlockDevMeta {
@@ -320,14 +320,14 @@ impl BlockDevMeta {
             devname,
             major,
             base_minor: block_dev_manager().next_minor(major),
-            inner: SpinLock::new(InnerBlockDevMeta {
+            inner: Mutex::new(InnerBlockDevMeta {
                 gendisks: GenDiskMap::new(),
                 dev_idx: 0, // 默认索引为0
             }),
         }
     }
 
-    pub(crate) fn inner(&self) -> SpinLockGuard<'_, InnerBlockDevMeta> {
+    pub(crate) fn inner(&self) -> MutexGuard<'_, InnerBlockDevMeta> {
         self.inner.lock()
     }
 }

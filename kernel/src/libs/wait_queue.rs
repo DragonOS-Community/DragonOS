@@ -27,7 +27,7 @@ use crate::{
     exception::InterruptArch,
     libs::mutex::MutexGuard,
     process::{ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
-    sched::{schedule, SchedMode},
+    sched::{io_schedule, schedule, SchedMode},
     time::{
         timer::{next_n_us_timer_jiffies, Timer},
         Duration, Instant,
@@ -35,6 +35,13 @@ use crate::{
 };
 
 use super::spinlock::{SpinLock, SpinLockGuard};
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum WaitSignalMode {
+    Uninterruptible,
+    Interruptible,
+    Killable,
+}
 
 #[derive(Debug)]
 struct InnerWaitQueue {
@@ -115,8 +122,32 @@ impl WaitQueue {
     where
         F: FnMut() -> Option<R>,
     {
-        self.wait_until_impl(cond, false, None, None::<fn()>)
-            .unwrap()
+        self.wait_until_impl(
+            cond,
+            WaitSignalMode::Uninterruptible,
+            None,
+            None::<fn()>,
+            false,
+        )
+        .unwrap()
+    }
+
+    /// 等待 IO 操作完成（不可中断）
+    ///
+    /// 与 wait_until 类似，但会正确标记进程在等待 IO，用于 iowait 统计
+    #[track_caller]
+    pub fn wait_until_io<F, R>(&self, cond: F) -> R
+    where
+        F: FnMut() -> Option<R>,
+    {
+        self.wait_until_impl(
+            cond,
+            WaitSignalMode::Uninterruptible,
+            None,
+            None::<fn()>,
+            true,
+        )
+        .unwrap()
     }
 
     /// Waits until condition returns `Some(R)` (interruptible by signals).
@@ -127,7 +158,38 @@ impl WaitQueue {
     where
         F: FnMut() -> Option<R>,
     {
-        self.wait_until_impl(cond, true, None, None::<fn()>)
+        self.wait_until_impl(
+            cond,
+            WaitSignalMode::Interruptible,
+            None,
+            None::<fn()>,
+            false,
+        )
+    }
+
+    /// 等待 IO 操作完成（可被信号中断）
+    ///
+    /// 与 wait_until_interruptible 类似，但会正确标记进程在等待 IO
+    #[track_caller]
+    pub fn wait_until_io_interruptible<F, R>(&self, cond: F) -> Result<R, SystemError>
+    where
+        F: FnMut() -> Option<R>,
+    {
+        self.wait_until_impl(
+            cond,
+            WaitSignalMode::Interruptible,
+            None,
+            None::<fn()>,
+            true,
+        )
+    }
+
+    #[track_caller]
+    pub fn wait_until_killable<F, R>(&self, cond: F) -> Result<R, SystemError>
+    where
+        F: FnMut() -> Option<R>,
+    {
+        self.wait_until_impl(cond, WaitSignalMode::Killable, None, None::<fn()>, false)
     }
 
     /// Waits until condition returns `Some(R)` with timeout (interruptible).
@@ -141,7 +203,13 @@ impl WaitQueue {
     where
         F: FnMut() -> Option<R>,
     {
-        self.wait_until_impl(cond, true, Some(timeout), None::<fn()>)
+        self.wait_until_impl(
+            cond,
+            WaitSignalMode::Interruptible,
+            Some(timeout),
+            None::<fn()>,
+            false,
+        )
     }
 
     /// Core implementation for all wait_until variants.
@@ -153,9 +221,10 @@ impl WaitQueue {
     fn wait_until_impl<F, R, B>(
         &self,
         mut cond: F,
-        interruptible: bool,
+        mode: WaitSignalMode,
         timeout: Option<Duration>,
         mut before_sleep: Option<B>,
+        is_io: bool,
     ) -> Result<R, SystemError>
     where
         F: FnMut() -> Option<R>,
@@ -220,10 +289,16 @@ impl WaitQueue {
                 return Ok(res);
             }
 
-            // Check for pending signals (interruptible mode)
-            if interruptible
-                && Signal::signal_pending_state(true, false, &ProcessManager::current_pcb())
-            {
+            let has_pending = match mode {
+                WaitSignalMode::Uninterruptible => false,
+                WaitSignalMode::Interruptible => {
+                    Signal::signal_pending_state(true, false, &ProcessManager::current_pcb())
+                }
+                WaitSignalMode::Killable => {
+                    Signal::signal_pending_state(false, true, &ProcessManager::current_pcb())
+                }
+            };
+            if has_pending {
                 self.remove_waker(&waker);
                 return cancel_or_timeout(&mut cond, &waker, SystemError::ERESTARTSYS);
             }
@@ -254,7 +329,13 @@ impl WaitQueue {
             };
 
             // Wait to be woken
-            let wait_result = waiter.wait(interruptible);
+            let wait_result = match (mode, is_io) {
+                (WaitSignalMode::Uninterruptible, false) => waiter.wait(false),
+                (WaitSignalMode::Uninterruptible, true) => waiter.wait_io(false),
+                (WaitSignalMode::Interruptible, false) => waiter.wait(true),
+                (WaitSignalMode::Interruptible, true) => waiter.wait_io(true),
+                (WaitSignalMode::Killable, _) => waiter.wait_killable(),
+            };
 
             // Timer cleanup
             let was_timeout = timer.as_ref().map(|t| t.timeout()).unwrap_or(false);
@@ -293,9 +374,50 @@ impl WaitQueue {
     {
         self.wait_until_impl(
             || if cond() { Some(()) } else { None },
-            true,
+            WaitSignalMode::Interruptible,
             None,
             before_sleep,
+            false,
+        )
+    }
+
+    /// 可中断等待 IO 操作完成；正确标记为 IO 等待以用于 iowait 统计
+    ///
+    /// 用于块设备 IO、网络 IO 等场景。会设置 IN_IOWAIT 标志，使得 CPU 空闲时间
+    /// 能够正确区分 iowait 和 pure idle。
+    pub fn wait_event_io_interruptible<F, B>(
+        &self,
+        mut cond: F,
+        before_sleep: Option<B>,
+    ) -> Result<(), SystemError>
+    where
+        F: FnMut() -> bool,
+        B: FnMut(),
+    {
+        self.wait_until_impl(
+            || if cond() { Some(()) } else { None },
+            WaitSignalMode::Interruptible,
+            None,
+            before_sleep,
+            true,
+        )
+    }
+
+    pub fn wait_event_killable<F, B>(
+        &self,
+        mut cond: F,
+        before_sleep: Option<B>,
+    ) -> Result<(), SystemError>
+    where
+        F: FnMut() -> bool,
+        B: FnMut(),
+    {
+        self.wait_until_impl(
+            || if cond() { Some(()) } else { None },
+            WaitSignalMode::Killable,
+            None,
+            before_sleep,
+            false,
         )
     }
 
@@ -311,9 +433,10 @@ impl WaitQueue {
     {
         self.wait_until_impl(
             || if cond() { Some(()) } else { None },
-            false,
+            WaitSignalMode::Uninterruptible,
             None,
             before_sleep,
+            false,
         )
     }
 
@@ -331,9 +454,30 @@ impl WaitQueue {
     {
         self.wait_until_impl(
             || if cond() { Some(()) } else { None },
-            true,
+            WaitSignalMode::Interruptible,
             timeout,
             None::<fn()>,
+            false,
+        )
+    }
+
+    /// 可中断等待 IO 操作完成，支持可选超时
+    ///
+    /// 用于块设备、网络 socket 等 IO 操作。正确标记为 IO 等待以用于 iowait 统计。
+    pub fn wait_event_io_interruptible_timeout<F>(
+        &self,
+        mut cond: F,
+        timeout: Option<Duration>,
+    ) -> Result<(), SystemError>
+    where
+        F: FnMut() -> bool,
+    {
+        self.wait_until_impl(
+            || if cond() { Some(()) } else { None },
+            WaitSignalMode::Interruptible,
+            timeout,
+            None::<fn()>,
+            true,
         )
     }
 
@@ -351,9 +495,10 @@ impl WaitQueue {
     {
         self.wait_until_impl(
             || if cond() { Some(()) } else { None },
-            false,
+            WaitSignalMode::Uninterruptible,
             timeout,
             None::<fn()>,
+            false,
         )
     }
 
@@ -372,9 +517,10 @@ impl WaitQueue {
     {
         self.wait_until_impl(
             || if cond() { Some(()) } else { None },
-            true,
+            WaitSignalMode::Interruptible,
             timeout,
             before_sleep,
+            false,
         )
     }
 
@@ -532,6 +678,14 @@ impl Waiter {
         block_current(self, interruptible)
     }
 
+    pub fn wait_io(&self, interruptible: bool) -> Result<(), SystemError> {
+        block_current_io(self, interruptible)
+    }
+
+    pub fn wait_killable(&self) -> Result<(), SystemError> {
+        block_current_killable(self)
+    }
+
     pub fn waker(&self) -> Arc<Waker> {
         self.waker.clone()
     }
@@ -666,6 +820,18 @@ fn before_sleep_check(max_preempt: usize) {
 
 /// 统一封装"标记阻塞 + 调度 + 信号检查"，避免各调用点重复逻辑
 fn block_current(waiter: &Waiter, interruptible: bool) -> Result<(), SystemError> {
+    block_current_impl(waiter, interruptible, false)
+}
+
+fn block_current_io(waiter: &Waiter, interruptible: bool) -> Result<(), SystemError> {
+    block_current_impl(waiter, interruptible, true)
+}
+
+fn block_current_impl(
+    waiter: &Waiter,
+    interruptible: bool,
+    is_io: bool,
+) -> Result<(), SystemError> {
     loop {
         // 快路径：被提前唤醒
         if waiter.waker.consume_notification() {
@@ -700,11 +866,56 @@ fn block_current(waiter: &Waiter, interruptible: bool) -> Result<(), SystemError
         }
         drop(irq_guard);
 
-        schedule(SchedMode::SM_NONE);
+        // 根据是否是 IO 等待选择不同的调度函数
+        if is_io {
+            io_schedule();
+        } else {
+            schedule(SchedMode::SM_NONE);
+        }
 
         if interruptible
             && Signal::signal_pending_state(true, false, &ProcessManager::current_pcb())
         {
+            return Err(SystemError::ERESTARTSYS);
+        }
+    }
+}
+
+fn block_current_killable(waiter: &Waiter) -> Result<(), SystemError> {
+    loop {
+        if waiter.waker.consume_notification() {
+            return Ok(());
+        }
+
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+
+        match waiter.waker.prepare_sleep() {
+            WakerSleepState::Notified | WakerSleepState::Closed => {
+                drop(irq_guard);
+                return Ok(());
+            }
+            WakerSleepState::Sleeping => {}
+        }
+
+        ProcessManager::mark_sleep(true)?;
+
+        if waiter.waker.consume_notification() {
+            let pcb = ProcessManager::current_pcb();
+            let mut writer = pcb.sched_info().inner_lock_write_irqsave();
+            if matches!(writer.state(), ProcessState::Blocked(_)) {
+                writer.set_state(ProcessState::Runnable);
+                writer.set_wakeup();
+            }
+            pcb.flags().remove(ProcessFlags::NEED_SCHEDULE);
+            drop(writer);
+            drop(irq_guard);
+            return Ok(());
+        }
+        drop(irq_guard);
+
+        schedule(SchedMode::SM_NONE);
+
+        if Signal::signal_pending_state(false, true, &ProcessManager::current_pcb()) {
             return Err(SystemError::ERESTARTSYS);
         }
     }

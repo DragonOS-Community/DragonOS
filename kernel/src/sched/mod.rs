@@ -6,6 +6,7 @@ pub mod fifo;
 #[cfg(feature = "fifo_demo")]
 pub mod fifo_demo;
 pub mod idle;
+pub mod loadavg;
 pub mod pelt;
 pub mod prio;
 pub mod syscall;
@@ -55,11 +56,6 @@ static mut CPU_IRQ_TIME: Option<Vec<&'static mut IrqTime>> = None;
 
 // 这里虽然rq是percpu的，但是在负载均衡的时候需要修改对端cpu的rq，所以仍需加锁
 static CPU_RUNQUEUE: Lazy<PerCpuVar<Arc<CpuRunQueue>>> = PerCpuVar::define_lazy();
-
-/// 用于记录系统中所有 CPU 的可执行进程数量的总和。
-static CALCULATE_LOAD_TASKS: AtomicUsize = AtomicUsize::new(0);
-
-const LOAD_FREQ: usize = HZ as usize * 5 + 1;
 
 pub const SCHED_FIXEDPOINT_SHIFT: u64 = 10;
 #[allow(dead_code)]
@@ -313,9 +309,12 @@ pub struct CpuRunQueue {
     /// 被阻塞的任务数量
     nr_uninterruptible: usize,
 
+    /// 因 IO 阻塞而睡眠的任务数量（用于区分 iowait）
+    nr_iowait: AtomicUsize,
+
     /// 记录上次更新负载时间
-    cala_load_update: usize,
-    cala_load_active: usize,
+    calc_load_update: u64,
+    calc_load_active: isize,
 
     /// CFS调度器
     cfs: Arc<CfsRunQueue>,
@@ -351,8 +350,9 @@ impl CpuRunQueue {
             next_balance: 0,
             nr_running: 0,
             nr_uninterruptible: 0,
-            cala_load_update: (clock() + (5 * HZ + 1)) as usize,
-            cala_load_active: 0,
+            nr_iowait: AtomicUsize::new(0),
+            calc_load_update: clock() + (5 * HZ + 1),
+            calc_load_active: 0,
             cfs: Arc::new(CfsRunQueue::new()),
             fifo: fifo::FifoRunQueue::new(),
             clock_pelt: 0,
@@ -460,6 +460,11 @@ impl CpuRunQueue {
 
     /// 启用一个任务，将加入队列
     pub fn activate_task(&mut self, pcb: &Arc<ProcessControlBlock>, mut flags: EnqueueFlag) {
+        // 如果进程之前因 IO 等待而睡眠，现在被唤醒，减少 nr_iowait 计数
+        if pcb.flags().contains(ProcessFlags::IN_IOWAIT) {
+            self.nr_iowait.fetch_sub(1, Ordering::Relaxed);
+        }
+
         if *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Migrating {
             flags |= EnqueueFlag::ENQUEUE_MIGRATED;
         }
@@ -501,6 +506,23 @@ impl CpuRunQueue {
 
     /// 禁用一个任务，将离开队列
     pub fn deactivate_task(&mut self, pcb: Arc<ProcessControlBlock>, flags: DequeueFlag) {
+        if flags.contains(DequeueFlag::DEQUEUE_SLEEP)
+            && matches!(
+                pcb.sched_info().inner_lock_read_irqsave().state(),
+                ProcessState::Blocked(false)
+            )
+        {
+            self.nr_uninterruptible += 1;
+            loadavg::inc_nr_uninterruptible(1);
+        }
+
+        // 如果进程因 IO 等待而睡眠，增加 nr_iowait 计数
+        if flags.contains(DequeueFlag::DEQUEUE_SLEEP)
+            && pcb.flags().contains(ProcessFlags::IN_IOWAIT)
+        {
+            self.nr_iowait.fetch_add(1, Ordering::Relaxed);
+        }
+
         *pcb.sched_info().on_rq.lock_irqsave() =
             if flags.intersects(DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_STOPPED) {
                 OnRq::None
@@ -514,6 +536,12 @@ impl CpuRunQueue {
     #[inline]
     pub fn cfs_rq(&self) -> Arc<CfsRunQueue> {
         self.cfs.clone()
+    }
+
+    /// 获取因 IO 阻塞而睡眠的任务数量
+    #[inline]
+    pub fn nr_iowait(&self) -> usize {
+        self.nr_iowait.load(Ordering::Relaxed)
     }
 
     /// 更新rq时钟
@@ -570,40 +598,15 @@ impl CpuRunQueue {
         // todo: pelt?
     }
 
-    /// 计算当前进程中的可执行数量
-    fn calculate_load_fold_active(&mut self, adjust: usize) -> usize {
-        let mut nr_active = self.nr_running - adjust;
-        nr_active += self.nr_uninterruptible;
-        let mut delta = 0;
-
-        if nr_active != self.cala_load_active {
-            delta = nr_active - self.cala_load_active;
-            self.cala_load_active = nr_active;
-        }
-
-        delta
-    }
-
-    /// ## tick计算全局负载
     pub fn calculate_global_load_tick(&mut self) {
-        if clock() < self.cala_load_update as u64 {
-            // 如果当前时间在上次更新时间之前，则直接返回
-            return;
-        }
-
-        let delta = self.calculate_load_fold_active(0);
-
-        if delta != 0 {
-            CALCULATE_LOAD_TASKS.fetch_add(delta, Ordering::SeqCst);
-        }
-
-        self.cala_load_update += LOAD_FREQ;
+        loadavg::calc_global_load_tick(self);
     }
 
     pub fn add_nr_running(&mut self, nr_running: usize) {
         let prev = self.nr_running;
 
         self.nr_running = prev + nr_running;
+        loadavg::inc_nr_running(nr_running);
         if prev < 2 && self.nr_running >= 2 && !self.overload {
             self.overload = true;
         }
@@ -611,6 +614,14 @@ impl CpuRunQueue {
 
     pub fn sub_nr_running(&mut self, count: usize) {
         self.nr_running -= count;
+        loadavg::dec_nr_running(count);
+    }
+
+    pub fn dec_nr_uninterruptible(&mut self) {
+        if self.nr_uninterruptible > 0 {
+            self.nr_uninterruptible -= 1;
+            loadavg::dec_nr_uninterruptible(1);
+        }
     }
 
     /// 在运行idle？
@@ -840,6 +851,24 @@ pub fn schedule(sched_mod: SchedMode) {
     __schedule(sched_mod);
 }
 
+/// IO 调度函数：标记当前进程正在等待 IO 并触发调度
+///
+/// 此函数用于在进程因 IO 操作而需要睡眠时调用，它会：
+/// 1. 设置 IN_IOWAIT 标志，表示进程正在等待 IO
+/// 2. 调用 schedule() 触发调度
+/// 3. 进程被唤醒后自动清除 IN_IOWAIT 标志
+///
+/// 这样可以正确统计 iowait 时间，区分 CPU 空闲是因为等待 IO 还是纯粹空闲
+pub fn io_schedule() {
+    let current = ProcessManager::current_pcb();
+    // 设置 IO 等待标志
+    current.flags().insert(ProcessFlags::IN_IOWAIT);
+    // 调用普通调度
+    schedule(SchedMode::SM_NONE);
+    // 被唤醒后清除 IO 等待标志
+    current.flags().remove(ProcessFlags::IN_IOWAIT);
+}
+
 /// ## 执行调度
 /// 此函数与schedule的区别为，该函数不会检查preempt_count
 /// 适用于时钟中断等场景
@@ -1016,6 +1045,9 @@ pub fn sched_init() {
 
         CPU_RUNQUEUE.init(PerCpuVar::new(cpu_runqueue).unwrap());
     };
+
+    // 初始化 per-CPU CPU 时间统计
+    cputime::init_kernel_cpu_stat();
 }
 
 #[inline]

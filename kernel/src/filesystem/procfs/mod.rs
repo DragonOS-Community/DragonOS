@@ -15,6 +15,7 @@ mod cpuinfo;
 pub mod klog;
 pub mod kmsg;
 mod kmsg_file;
+mod loadavg;
 mod meminfo;
 mod mounts;
 mod net;
@@ -29,6 +30,7 @@ mod thread_self;
 mod utils;
 mod version;
 mod version_signature;
+mod vmstat;
 
 // 重新导出 ProcFS
 pub use root::ProcFS;

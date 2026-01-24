@@ -17,12 +17,16 @@ use lru::LruCache;
 use crate::{
     arch::{interrupt::ipi::send_ipi, mm::LockedFrameAllocator, MMArch},
     exception::ipi::{IpiKind, IpiTarget},
-    filesystem::{page_cache::PageCache, vfs::FilePrivateData},
+    filesystem::{
+        page_cache::{list_page_caches, PageCache},
+        vfs::FilePrivateData,
+    },
     init::initcall::INITCALL_CORE,
     libs::{
         mutex::{Mutex, MutexGuard},
-        rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
+        rwsem::{RwSem, RwSemReadGuard, RwSemUpgradeableGuard, RwSemWriteGuard},
     },
+    mm::page_cache_stats as pc_stats,
     process::{ProcessControlBlock, ProcessManager},
     time::{sleep::nanosleep, PosixTimeSpec},
 };
@@ -347,6 +351,11 @@ impl PageReclaimer {
                 if guard.flags().contains(PageFlags::PG_DIRTY) {
                     // 先回写脏页
                     Self::page_writeback(&mut guard, true);
+                    if guard.flags().contains(PageFlags::PG_DIRTY) {
+                        drop(guard);
+                        page_reclaimer_lock().insert_page(paddr, &page);
+                        continue;
+                    }
                 }
 
                 // 删除页面：顺序为 page_cache -> page_manager，避免原有的 reclaimer 锁参与死锁
@@ -354,11 +363,30 @@ impl PageReclaimer {
                 // FileMapInfo 内保存 Weak<PageCache> 以避免 PageCache <-> Page 的强引用环。
                 // 如果此时 PageCache 已被释放（upgrade 失败），说明其 pages 映射也已销毁，无需再 remove。
                 if let Some(page_cache) = info.page_cache.upgrade() {
-                    page_cache.lock().remove_page(page_index);
+                    if !page_cache.is_page_ready(page_index) {
+                        drop(guard);
+                        page_reclaimer_lock().insert_page(paddr, &page);
+                        continue;
+                    }
+                    let _ = page_cache.manager().remove_page(page_index);
                 }
                 page_manager_lock().remove_page(&paddr);
             }
         }
+    }
+
+    /// Drop clean pagecache pages only, matching Linux drop_caches semantics.
+    pub fn drop_pagecache(clean_only: bool) -> usize {
+        if !clean_only {
+            return 0;
+        }
+
+        let mut dropped = 0;
+        for cache in list_page_caches() {
+            dropped += cache.drop_clean_pages();
+        }
+
+        dropped
     }
 
     /// 唤醒页面回收线程
@@ -393,6 +421,7 @@ impl PageReclaimer {
         };
         let paddr = guard.phys_address();
         let inode = page_cache.inode().clone().unwrap().upgrade().unwrap();
+        let backend = page_cache.backend();
 
         for vma in guard.vma_set() {
             let address_space = vma.lock().address_space().and_then(|x| x.upgrade());
@@ -419,31 +448,56 @@ impl PageReclaimer {
             }
         }
 
+        let page_start = page_index * MMArch::PAGE_SIZE;
         let len = if let Ok(metadata) = inode.metadata() {
-            let size = metadata.size as usize;
-            size.saturating_sub(page_index * MMArch::PAGE_SIZE)
+            let file_size = metadata.size.max(0) as usize;
+            if file_size <= page_start {
+                0
+            } else {
+                core::cmp::min(MMArch::PAGE_SIZE, file_size - page_start)
+            }
         } else {
             MMArch::PAGE_SIZE
         };
 
         if len > 0 {
-            inode
-                .write_direct(
-                    page_index * MMArch::PAGE_SIZE,
+            page_cache.mark_page_writeback(page_index);
+            guard.remove_flags(PageFlags::PG_DIRTY);
+            let data = unsafe {
+                core::slice::from_raw_parts(
+                    MMArch::phys_2_virt(paddr).unwrap().data() as *const u8,
                     len,
-                    unsafe {
-                        core::slice::from_raw_parts(
-                            MMArch::phys_2_virt(paddr).unwrap().data() as *mut u8,
-                            len,
-                        )
-                    },
+                )
+            };
+            let r = if let Some(backend) = backend {
+                backend.write_page(page_index, data)
+            } else {
+                inode.write_direct(
+                    page_start,
+                    len,
+                    data,
                     Mutex::new(FilePrivateData::Unused).lock(),
                 )
-                .unwrap();
+            };
+            if let Err(e) = r {
+                log::error!(
+                    "page writeback failed: offset={}, len={}, err={:?}",
+                    page_start,
+                    len,
+                    e
+                );
+                guard.add_flags(PageFlags::PG_ERROR);
+                page_cache.mark_page_error(page_index);
+                return;
+            }
         }
 
-        // 清除标记
-        guard.remove_flags(PageFlags::PG_DIRTY);
+        guard.remove_flags(PageFlags::PG_ERROR);
+        if guard.flags().contains(PageFlags::PG_DIRTY) {
+            page_cache.mark_page_dirty(page_index);
+        } else {
+            page_cache.mark_page_uptodate(page_index);
+        }
     }
 
     /// lru脏页刷新
@@ -554,6 +608,10 @@ impl Page {
         self.inner.read()
     }
 
+    pub fn upread(&self) -> RwSemUpgradeableGuard<'_, InnerPage> {
+        self.inner.upread()
+    }
+
     pub fn write(&self) -> RwSemWriteGuard<'_, InnerPage> {
         self.inner.write()
     }
@@ -584,12 +642,24 @@ impl InnerPage {
 
     /// 将vma加入anon_vma
     pub fn insert_vma(&mut self, vma: Arc<LockedVMA>) {
+        let was_mapped = self.map_count() > 0;
         self.vma_set.insert(vma);
+        if !was_mapped && matches!(self.page_type, PageType::File(_)) {
+            pc_stats::inc_file_mapped();
+        }
     }
 
     /// 将vma从anon_vma中删去
     pub fn remove_vma(&mut self, vma: &LockedVMA) {
-        self.vma_set.remove(vma);
+        let was_mapped = self.map_count() > 0;
+        let removed = self.vma_set.remove(vma);
+        if removed
+            && was_mapped
+            && self.map_count() == 0
+            && matches!(self.page_type, PageType::File(_))
+        {
+            pc_stats::dec_file_mapped();
+        }
     }
 
     /// 判断当前物理页是否能被回

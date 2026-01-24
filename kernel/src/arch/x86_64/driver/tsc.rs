@@ -35,6 +35,10 @@ impl TSCManager {
             return Err(SystemError::ENODEV);
         }
 
+        if Self::cpu_khz() != 0 && Self::tsc_khz() != 0 {
+            return Ok(());
+        }
+
         if unsafe { TSC_KHZ == 0 } {
             if let Err(e) = Self::determine_cpu_tsc_frequency(false) {
                 error!("Failed to determine CPU TSC frequency: {:?}", e);
@@ -384,6 +388,14 @@ impl TSCManager {
         unsafe {
             TSC_KHZ = khz;
         }
+    }
+
+    pub(crate) fn set_khz_from_kvm(khz: u64) {
+        if khz == 0 {
+            return;
+        }
+        Self::set_cpu_khz(khz);
+        Self::set_tsc_khz(khz);
     }
 }
 

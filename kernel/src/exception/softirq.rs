@@ -299,6 +299,6 @@ pub fn do_softirq() {
     fence(Ordering::SeqCst);
     IrqTime::irqtime_start();
     softirq_vectors().do_softirq();
-    IrqTime::irqtime_account_irq(ProcessManager::current_pcb());
+    IrqTime::irqtime_account_irq(ProcessManager::current_pcb(), false);
     fence(Ordering::SeqCst);
 }

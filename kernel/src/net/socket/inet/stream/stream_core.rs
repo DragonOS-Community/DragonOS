@@ -2,7 +2,6 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize};
-use system_error::SystemError;
 
 use crate::filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId};
 use crate::libs::mutex::Mutex;
@@ -21,9 +20,9 @@ type EP = crate::filesystem::epoll::EPollEventType;
 
 #[derive(Debug)]
 pub struct TcpSocketOptions {
-    /// SO_SNDTIMEO (microseconds). 0 means "no timeout".
+    /// SO_SNDTIMEO (microseconds). u64::MAX means "no timeout".
     pub(crate) send_timeout_us: AtomicU64,
-    /// SO_RCVTIMEO (microseconds). 0 means "no timeout".
+    /// SO_RCVTIMEO (microseconds). u64::MAX means "no timeout".
     pub(crate) recv_timeout_us: AtomicU64,
 
     /// TCP_INQ: whether to report inq bytes via recvmsg cmsg.
@@ -35,6 +34,8 @@ pub struct TcpSocketOptions {
 
     pub(crate) send_buf_size: AtomicUsize,
     pub(crate) recv_buf_size: AtomicUsize,
+    /// SO_RCVLOWAT
+    pub(crate) rcvlowat: AtomicI32,
 
     /// TCP_MAXSEG
     pub(crate) tcp_max_seg: AtomicUsize,
@@ -49,19 +50,48 @@ pub struct TcpSocketOptions {
 
     /// SO_ATTACH_FILTER: whether a filter is attached.
     pub(crate) so_filter_attached: AtomicBool,
+    /// SO_REUSEADDR
+    pub(crate) so_reuseaddr: AtomicBool,
+    /// SO_BROADCAST
+    pub(crate) so_broadcast: AtomicBool,
+    /// SO_PASSCRED
+    pub(crate) so_passcred: AtomicBool,
+    /// SO_NO_CHECK
+    pub(crate) so_no_check: AtomicBool,
     /// TCP_CORK
     pub(crate) tcp_cork: AtomicBool,
     /// TCP_QUICKACK
     pub(crate) tcp_quickack: AtomicBool,
     /// SO_KEEPALIVE
     pub(crate) so_keepalive: AtomicBool,
+
+    /// TCP_KEEPIDLE (seconds)
+    pub(crate) tcp_keepidle_secs: AtomicI32,
+    /// TCP_KEEPINTVL (seconds)
+    pub(crate) tcp_keepintvl_secs: AtomicI32,
+    /// TCP_KEEPCNT
+    pub(crate) tcp_keepcnt: AtomicI32,
+
+    /// SO_LINGER
+    pub(crate) linger_onoff: AtomicI32,
+    pub(crate) linger_linger: AtomicI32,
+
+    /// IP_MULTICAST_TTL
+    pub(crate) ip_multicast_ttl: AtomicI32,
+    /// IP_MULTICAST_LOOP
+    pub(crate) ip_multicast_loop: AtomicBool,
+
+    /// SO_OOBINLINE
+    pub(crate) so_oobinline: AtomicBool,
+    /// TCP_LINGER2 (seconds; 0 means default)
+    pub(crate) tcp_linger2_secs: AtomicI32,
 }
 
 impl TcpSocketOptions {
     fn new() -> Self {
         Self {
-            send_timeout_us: AtomicU64::new(0),
-            recv_timeout_us: AtomicU64::new(0),
+            send_timeout_us: AtomicU64::new(u64::MAX),
+            recv_timeout_us: AtomicU64::new(u64::MAX),
 
             tcp_inq_enabled: AtomicBool::new(false),
             so_timestamp_enabled: AtomicBool::new(false),
@@ -69,6 +99,7 @@ impl TcpSocketOptions {
             ip_mtu_discover: core::sync::atomic::AtomicI32::new(1),
             send_buf_size: AtomicUsize::new(inner::DEFAULT_TX_BUF_SIZE),
             recv_buf_size: AtomicUsize::new(inner::DEFAULT_RX_BUF_SIZE),
+            rcvlowat: AtomicI32::new(1),
 
             tcp_max_seg: AtomicUsize::new(constants::DEFAULT_TCP_MSS), // Default MSS
             tcp_defer_accept: AtomicI32::new(0),
@@ -76,9 +107,26 @@ impl TcpSocketOptions {
             tcp_window_clamp: AtomicUsize::new(0),
             tcp_user_timeout: AtomicI32::new(0),
             so_filter_attached: AtomicBool::new(false),
+            so_reuseaddr: AtomicBool::new(false),
+            so_broadcast: AtomicBool::new(false),
+            so_passcred: AtomicBool::new(false),
+            so_no_check: AtomicBool::new(false),
             tcp_cork: AtomicBool::new(false),
             tcp_quickack: AtomicBool::new(true),
             so_keepalive: AtomicBool::new(false),
+
+            tcp_keepidle_secs: AtomicI32::new(2 * 60 * 60),
+            tcp_keepintvl_secs: AtomicI32::new(75),
+            tcp_keepcnt: AtomicI32::new(9),
+
+            linger_onoff: AtomicI32::new(0),
+            linger_linger: AtomicI32::new(0),
+
+            so_oobinline: AtomicBool::new(false),
+            tcp_linger2_secs: AtomicI32::new(0),
+
+            ip_multicast_ttl: AtomicI32::new(constants::IP_MULTICAST_TTL_DEFAULT),
+            ip_multicast_loop: AtomicBool::new(constants::IP_MULTICAST_LOOP_DEFAULT),
         }
     }
 }
@@ -102,7 +150,10 @@ pub struct TcpSocket {
     pub(crate) fasync_items: FAsyncItems,
     pub(crate) options: TcpSocketOptions,
     pub(crate) cork_buf: Mutex<Vec<u8>>,
+    pub(crate) cork_flush_in_progress: AtomicBool,
+    pub(crate) cork_timer_active: AtomicBool,
     pub(crate) recv_shutdown: ShutdownRecvTracker,
+    pub(crate) ip_version: smoltcp::wire::IpVersion,
 }
 
 impl TcpSocket {
@@ -111,6 +162,7 @@ impl TcpSocket {
         nonblock: bool,
         netns: Arc<NetNamespace>,
         pollee_bits: usize,
+        ip_version: smoltcp::wire::IpVersion,
         me: &Weak<Self>,
     ) -> Self {
         Self {
@@ -128,7 +180,10 @@ impl TcpSocket {
             fasync_items: FAsyncItems::default(),
             options: TcpSocketOptions::new(),
             cork_buf: Mutex::new(Vec::new()),
+            cork_flush_in_progress: AtomicBool::new(false),
+            cork_timer_active: AtomicBool::new(false),
             recv_shutdown: ShutdownRecvTracker::new(),
+            ip_version,
         }
     }
 
@@ -140,6 +195,7 @@ impl TcpSocket {
                 nonblock,
                 netns,
                 0,
+                ver,
                 me,
             )
         })
@@ -149,6 +205,7 @@ impl TcpSocket {
         inner: inner::Established,
         nonblock: bool,
         netns: Arc<NetNamespace>,
+        ip_version: smoltcp::wire::IpVersion,
     ) -> Arc<Self> {
         Arc::new_cyclic(|me| {
             Self::new_common(
@@ -156,6 +213,7 @@ impl TcpSocket {
                 nonblock,
                 netns,
                 (EP::EPOLLIN.bits() | EP::EPOLLOUT.bits()) as usize,
+                ip_version,
                 me,
             )
         })
@@ -263,6 +321,26 @@ impl TcpSocket {
     }
 
     #[inline]
+    pub(crate) fn so_reuseaddr(&self) -> &AtomicBool {
+        &self.options.so_reuseaddr
+    }
+
+    #[inline]
+    pub(crate) fn so_broadcast(&self) -> &AtomicBool {
+        &self.options.so_broadcast
+    }
+
+    #[inline]
+    pub(crate) fn so_passcred(&self) -> &AtomicBool {
+        &self.options.so_passcred
+    }
+
+    #[inline]
+    pub(crate) fn so_no_check(&self) -> &AtomicBool {
+        &self.options.so_no_check
+    }
+
+    #[inline]
     pub(crate) fn tcp_quickack_enabled(&self) -> &AtomicBool {
         &self.options.tcp_quickack
     }
@@ -270,6 +348,51 @@ impl TcpSocket {
     #[inline]
     pub(crate) fn so_keepalive_enabled(&self) -> &AtomicBool {
         &self.options.so_keepalive
+    }
+
+    #[inline]
+    pub(crate) fn tcp_keepidle_secs(&self) -> &AtomicI32 {
+        &self.options.tcp_keepidle_secs
+    }
+
+    #[inline]
+    pub(crate) fn tcp_keepintvl_secs(&self) -> &AtomicI32 {
+        &self.options.tcp_keepintvl_secs
+    }
+
+    #[inline]
+    pub(crate) fn tcp_keepcnt(&self) -> &AtomicI32 {
+        &self.options.tcp_keepcnt
+    }
+
+    #[inline]
+    pub(crate) fn linger_onoff(&self) -> &AtomicI32 {
+        &self.options.linger_onoff
+    }
+
+    #[inline]
+    pub(crate) fn linger_linger(&self) -> &AtomicI32 {
+        &self.options.linger_linger
+    }
+
+    #[inline]
+    pub(crate) fn ip_multicast_ttl(&self) -> &AtomicI32 {
+        &self.options.ip_multicast_ttl
+    }
+
+    #[inline]
+    pub(crate) fn ip_multicast_loop(&self) -> &AtomicBool {
+        &self.options.ip_multicast_loop
+    }
+
+    #[inline]
+    pub(crate) fn so_oobinline_enabled(&self) -> &AtomicBool {
+        &self.options.so_oobinline
+    }
+
+    #[inline]
+    pub(crate) fn tcp_linger2_secs(&self) -> &AtomicI32 {
+        &self.options.tcp_linger2_secs
     }
 
     #[inline]
@@ -341,27 +464,6 @@ impl TcpSocket {
         }
     }
 
-    /// Runs a function with mutable access to the Established inner socket.
-    /// Returns EINVAL if the socket is not in Established state.
-    pub(crate) fn with_inner_established<R>(
-        &self,
-        f: impl FnOnce(&inner::Established) -> R,
-    ) -> Result<R, SystemError> {
-        let mut writer = self.inner.write();
-        let inner = writer.take().expect("Tcp inner::Inner is None");
-        match inner {
-            inner::Inner::Established(established) => {
-                let result = f(&established);
-                writer.replace(inner::Inner::Established(established));
-                Ok(result)
-            }
-            other => {
-                writer.replace(other);
-                Err(SystemError::EINVAL)
-            }
-        }
-    }
-
     #[inline]
     fn shutdown_bits(&self) -> crate::net::socket::common::ShutdownBit {
         crate::net::socket::common::ShutdownBit::from_bits_truncate(
@@ -385,7 +487,7 @@ impl TcpSocket {
         let us = self
             .send_timeout_us()
             .load(core::sync::atomic::Ordering::Relaxed);
-        if us == 0 {
+        if us == u64::MAX {
             None
         } else {
             Some(crate::time::Duration::from_micros(us))
@@ -396,7 +498,7 @@ impl TcpSocket {
         let us = self
             .recv_timeout_us()
             .load(core::sync::atomic::Ordering::Relaxed);
-        if us == 0 {
+        if us == u64::MAX {
             None
         } else {
             Some(crate::time::Duration::from_micros(us))

@@ -1,8 +1,9 @@
 # /etc/inittab
-::sysinit:busybox sh /etc/init.d/rcS      # 系统初始化脚本
+::sysinit:busybox sh /etc/init.d/rcS  # 系统初始化脚本
 
-::askfirst:-/bin/busybox sh --login
+::askfirst:/bin/login -f root
 
+# ::askfirst:-/bin/busybox sh --login
 
 # /etc/inittab - 根据源码弄出来的默认inittab
 # https://code.dragonos.org.cn/xref/busybox-1.35.0/init/init.c#679

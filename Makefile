@@ -5,6 +5,9 @@ include env.mk
 export ROOT_PATH=$(shell pwd)
 export VMSTATE_DIR=$(ROOT_PATH)/bin/vmstate
 
+# 检测是否在 Nix 环境中
+IN_NIX_ENV := $(USING_DRAGONOS_NIX_ENV)
+
 SUBDIRS = kernel user tools build-scripts
 
 
@@ -80,7 +83,15 @@ kernel: check_arch
 
 .PHONY: user
 user: check_arch
+ifeq ($(IN_NIX_ENV),1)
+	@echo "⚠️  警告: 在 Nix 环境中使用 'make user' 已被弃用"
+	@echo "   请使用: nix run .#rootfs-$(ARCH)"
+	@echo ""
+	@echo "   正在执行 nix run .#rootfs-$(ARCH)..."
+	nix run .#rootfs-$(ARCH)
+else
 	$(MAKE) -C ./user all ARCH=$(ARCH) || (sh -c "echo 用户程序编译失败" && exit 1)
+endif
 
 .PHONY: clean
 clean:
@@ -147,19 +158,46 @@ rootfs: check_nix
 
 # 写入磁盘镜像
 write_diskimage: check_arch
+ifeq ($(IN_NIX_ENV),1)
+	@echo "⚠️  警告: 在 Nix 环境中使用 'make write_diskimage' 已被弃用"
+	@echo "   请使用: nix run .#rootfs-$(ARCH)"
+	@echo ""
+	@echo "   正在执行 nix run .#rootfs-$(ARCH)..."
+	nix run .#rootfs-$(ARCH)
+else
 	@echo "write_diskimage arch=$(ARCH)"
 	bash -c "export ARCH=$(ARCH); cd tools && $(GRUB_PREPARE_CMD) && sudo DADK=$(DADK) $(GRUB_SKIP_ENV) ARCH=$(ARCH) bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=legacy && cd .."
+endif
 
 # 写入磁盘镜像(uefi)
 write_diskimage-uefi: check_arch
 	bash -c "export ARCH=$(ARCH); cd tools && $(GRUB_PREPARE_CMD) && sudo DADK=$(DADK) $(GRUB_SKIP_ENV) ARCH=$(ARCH) bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=uefi && cd .."
 # 不编译，直接启动QEMU
 qemu: check_arch
+ifeq ($(IN_NIX_ENV),1)
+	@echo "ℹ️  在 Nix 环境中启动 QEMU"
+	@echo "   使用默认配置 (BIOS=legacy, Display=window)"
+	@echo ""
+	@echo "   如需其他配置，请使用:"
+	@echo "     - UEFI: nix run .#start-x86_64-uefi"
+	@echo "     - VNC:  nix run .#start-x86_64 -- -display vnc"
+	@echo ""
+	nix run .#start-$(ARCH)
+else
 	sh -c "cd tools && bash run-qemu.sh --bios=legacy --display=window && cd .."
+endif
 
 # 不编译，直接启动QEMU,不显示图像
 qemu-nographic: check_arch
+ifeq ($(IN_NIX_ENV),1)
+	@echo "ℹ️  在 Nix 环境中启动 QEMU (nographic 模式)"
+	@echo "   注意: nix run .#start-$(ARCH) 默认使用图形模式"
+	@echo "   如需 nographic 模式，请直接使用传统 make 命令"
+	@echo ""
+	nix run .#start-$(ARCH) -- -nographic
+else
 	sh -c "cd tools && bash run-qemu.sh --bios=legacy --display=nographic && cd .."
+endif
 
 # 不编译，直接启动QEMU(UEFI)
 qemu-uefi: check_arch
@@ -207,11 +245,18 @@ run-vnc: check_arch
 	$(MAKE) qemu-vnc
 
 run-nographic: check_arch
+ifeq ($(IN_NIX_ENV),1)
+	@echo "⚠️  警告: 在 Nix 环境中使用 'make run-nographic' 已被弃用"
+	@echo "   请使用: nix run .#yolo-$(ARCH)"
+	@echo ""
+	@echo "   正在执行 nix run .#yolo-$(ARCH)..."
+	nix run .#yolo-$(ARCH)
+else
 	$(MAKE) all -j $(NPROCS)
 	SKIP_GRUB=1 $(MAKE) write_diskimage || exit 1
 	# $(MAKE) rootfs
 	$(MAKE) qemu-nographic
-
+endif
 # 在docker中编译，并启动QEMU
 run-docker: check_arch
 	@echo "使用docker构建并运行"

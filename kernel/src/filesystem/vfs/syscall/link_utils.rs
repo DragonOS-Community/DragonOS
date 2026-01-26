@@ -31,9 +31,9 @@ pub fn do_linkat(
     }
     // TODO AT_EMPTY_PATH标志启用时，进行调用者CAP_DAC_READ_SEARCH或相似的检查
     let symlink_times = if flags.contains(AtFlags::AT_SYMLINK_FOLLOW) {
-        0_usize
-    } else {
         VFS_MAX_FOLLOW_SYMLINK_TIMES
+    } else {
+        0_usize
     };
     let pcb = ProcessManager::current_pcb();
 

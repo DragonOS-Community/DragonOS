@@ -191,8 +191,7 @@ endif
 qemu-nographic: check_arch
 ifeq ($(IN_NIX_ENV),1)
 	@echo "ℹ️  在 Nix 环境中启动 QEMU (nographic 模式)"
-	@echo "   注意: nix run .#start-$(ARCH) 默认使用图形模式"
-	@echo "   如需 nographic 模式，请直接使用传统 make 命令"
+	@echo "   注意: nix run .#start-$(ARCH) 默认使用非图形模式"
 	@echo ""
 	nix run .#start-$(ARCH) -- -nographic
 else

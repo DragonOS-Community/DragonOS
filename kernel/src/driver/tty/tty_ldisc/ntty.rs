@@ -1078,7 +1078,7 @@ impl NTtyData {
 
         self.read_tail += count;
 
-        if found {
+        let ret_value = if found {
             if !self.pushing {
                 self.line_start = self.read_tail;
             } else {
@@ -1086,11 +1086,21 @@ impl NTtyData {
             }
 
             // todo: 审计？
-            return Ok(false);
-        }
+            Ok(false)
+        } else {
+            // 没有找到eol
+            // 如果nr已经被完全消耗（变为0），说明本次读取请求已经满足
+            // 即使缓冲区中还有更多数据（包括同一行的后续数据），
+            // 也应该返回false，让调用方返回已读取的字节数
+            // 下次调用时会继续读取下一批数据
+            if *nr == 0 {
+                Ok(false)
+            } else {
+                Ok(self.read_tail != canon_head)
+            }
+        };
 
-        // 这里是表示没有找到eol,根据是否还有数据可读返回
-        Ok(self.read_tail != canon_head)
+        ret_value
     }
 
     /// ## 根据终端的模式和输入缓冲区中的数据量，判断是否可读字符

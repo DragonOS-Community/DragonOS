@@ -312,8 +312,8 @@ impl IndexNode for TtyDevice {
         let mut offset = 0;
         let mut cookie = false;
         loop {
-            let mut size = if len > buf.len() { buf.len() } else { len };
-            size = ld.read(tty.clone(), buf, size, &mut cookie, offset, flags)?;
+            let mut size = (len - offset).min(buf.len() - offset);
+            size = ld.read(tty.clone(), &mut buf[offset..], size, &mut cookie, 0, flags)?;
             // 没有更多数据
             if size == 0 {
                 break;

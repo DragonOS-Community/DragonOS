@@ -10,7 +10,7 @@ use crate::{
     net::{
         posix::MsgHdr,
         socket::{
-            common::EPollItems,
+            common::{parse_timeval_opt, write_timeval_opt, EPollItems},
             endpoint::Endpoint,
             unix::{
                 stream::inner::{get_backlog, Backlog},
@@ -193,67 +193,6 @@ impl UnixStreamSocket {
         let mut raw = [0u8; 4];
         raw.copy_from_slice(&optval[..4]);
         Ok(i32::from_ne_bytes(raw))
-    }
-
-    fn parse_timeval_opt(optval: &[u8]) -> Result<Option<Duration>, SystemError> {
-        // Accept both 64-bit and 32-bit timeval layouts.
-        if optval.len() >= 16 {
-            let mut sec_raw = [0u8; 8];
-            let mut usec_raw = [0u8; 8];
-            sec_raw.copy_from_slice(&optval[..8]);
-            usec_raw.copy_from_slice(&optval[8..16]);
-            let sec = i64::from_ne_bytes(sec_raw);
-            let usec = i64::from_ne_bytes(usec_raw);
-            if !(0..1_000_000).contains(&usec) {
-                return Err(SystemError::EDOM);
-            }
-            if sec < 0 {
-                return Ok(Some(Duration::from_micros(0)));
-            }
-            if sec == 0 && usec == 0 {
-                return Ok(None);
-            }
-            let total_us = (sec as u64)
-                .saturating_mul(1_000_000)
-                .saturating_add(usec as u64);
-            return Ok(Some(Duration::from_micros(total_us)));
-        }
-
-        if optval.len() >= 12 {
-            let mut sec_raw = [0u8; 8];
-            let mut usec_raw = [0u8; 4];
-            sec_raw.copy_from_slice(&optval[..8]);
-            usec_raw.copy_from_slice(&optval[8..12]);
-            let sec = i64::from_ne_bytes(sec_raw);
-            let usec = i32::from_ne_bytes(usec_raw) as i64;
-            if !(0..1_000_000).contains(&usec) {
-                return Err(SystemError::EDOM);
-            }
-            if sec < 0 {
-                return Ok(Some(Duration::from_micros(0)));
-            }
-            if sec == 0 && usec == 0 {
-                return Ok(None);
-            }
-            let total_us = (sec as u64)
-                .saturating_mul(1_000_000)
-                .saturating_add(usec as u64);
-            return Ok(Some(Duration::from_micros(total_us)));
-        }
-
-        Err(SystemError::EINVAL)
-    }
-
-    fn write_timeval(value: &mut [u8], us: u64) -> Result<usize, SystemError> {
-        if value.len() < 16 {
-            return Err(SystemError::EINVAL);
-        }
-        let us = if us == u64::MAX { 0 } else { us };
-        let sec = (us / 1_000_000) as i64;
-        let usec = (us % 1_000_000) as i64;
-        value[..8].copy_from_slice(&sec.to_ne_bytes());
-        value[8..16].copy_from_slice(&usec.to_ne_bytes());
-        Ok(16)
     }
 
     fn effective_sockbuf(requested: usize) -> usize {
@@ -679,13 +618,13 @@ impl Socket for UnixStreamSocket {
                 Ok(())
             }
             crate::net::socket::PSO::SNDTIMEO_OLD | crate::net::socket::PSO::SNDTIMEO_NEW => {
-                let d = Self::parse_timeval_opt(optval)?;
+                let d = parse_timeval_opt(optval)?;
                 let us = d.map(|v| v.total_micros()).unwrap_or(u64::MAX);
                 self.send_timeout_us.store(us, Ordering::SeqCst);
                 Ok(())
             }
             crate::net::socket::PSO::RCVTIMEO_OLD | crate::net::socket::PSO::RCVTIMEO_NEW => {
-                let d = Self::parse_timeval_opt(optval)?;
+                let d = parse_timeval_opt(optval)?;
                 let us = d.map(|v| v.total_micros()).unwrap_or(u64::MAX);
                 self.recv_timeout_us.store(us, Ordering::SeqCst);
                 Ok(())
@@ -1358,10 +1297,14 @@ impl Socket for UnixStreamSocket {
                 Ok(4)
             }
             crate::net::socket::PSO::SNDTIMEO_OLD | crate::net::socket::PSO::SNDTIMEO_NEW => {
-                Self::write_timeval(value, self.send_timeout_us.load(Ordering::Relaxed))
+                let us = self.send_timeout_us.load(Ordering::Relaxed);
+                let us = if us == u64::MAX { 0 } else { us };
+                write_timeval_opt(value, us)
             }
             crate::net::socket::PSO::RCVTIMEO_OLD | crate::net::socket::PSO::RCVTIMEO_NEW => {
-                Self::write_timeval(value, self.recv_timeout_us.load(Ordering::Relaxed))
+                let us = self.recv_timeout_us.load(Ordering::Relaxed);
+                let us = if us == u64::MAX { 0 } else { us };
+                write_timeval_opt(value, us)
             }
             crate::net::socket::PSO::RCVLOWAT => {
                 if value.len() < 4 {

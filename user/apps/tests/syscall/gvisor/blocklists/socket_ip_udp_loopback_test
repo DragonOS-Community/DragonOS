@@ -1,0 +1,3 @@
+# 这两个都是因为缺少 SYS_SENDMMSG
+AllUDPSockets/AllSocketPairTest.BasicSendmmsg/*
+AllUDPSockets/AllSocketPairTest.SendmmsgIsLimitedByMAXIOV/*

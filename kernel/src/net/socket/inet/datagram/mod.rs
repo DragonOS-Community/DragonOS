@@ -1,4 +1,4 @@
-use inner::{UdpInner, UnboundUdp, DEFAULT_RX_BUF_SIZE, DEFAULT_TX_BUF_SIZE, MIN_BUF_SIZE};
+use inner::{UdpInner, UnboundUdp};
 use smoltcp;
 use system_error::SystemError;
 
@@ -6,23 +6,53 @@ use crate::filesystem::epoll::event_poll::EventPoll;
 use crate::filesystem::epoll::EPollEventType;
 use crate::filesystem::vfs::iov::IoVecs;
 use crate::filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId};
-use crate::libs::byte_parser;
+use crate::libs::mutex::Mutex;
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::posix::SockAddr;
 use crate::net::socket::common::{EPollItems, ShutdownBit};
-use crate::net::socket::{AddressFamily, Socket, PMSG, PSO, PSOCK, PSOL};
+use crate::net::socket::unix::utils::CmsgBuffer;
+use crate::net::socket::{IpOption, PIPV6};
+use crate::net::socket::{Socket, PMSG, PSO, PSOL};
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
 use crate::{libs::rwsem::RwSem, net::socket::endpoint::Endpoint};
+use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use smoltcp::wire::{IpAddress::*, IpEndpoint, IpListenEndpoint, IpVersion};
 
 use super::{InetSocket, UNSPECIFIED_LOCAL_ENDPOINT_V4, UNSPECIFIED_LOCAL_ENDPOINT_V6};
 
+mod option;
+
 pub mod inner;
 
 type EP = crate::filesystem::epoll::EPollEventType;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct SockExtendedErr {
+    ee_errno: u32,
+    ee_origin: u8,
+    ee_type: u8,
+    ee_code: u8,
+    ee_pad: u8,
+    ee_info: u32,
+    ee_data: u32,
+}
+
+const SO_EE_ORIGIN_LOCAL: u8 = 1;
+const ICMP_ECHOREPLY: u8 = 0;
+const ICMP_NET_UNREACH: u8 = 0;
+
+#[derive(Clone, Debug)]
+struct UdpErrQueueEntry {
+    err: SockExtendedErr,
+    offender: IpEndpoint,
+    cmsg_level: i32,
+    cmsg_type: i32,
+    addr_len: usize,
+}
 
 // Udp Socket 负责提供状态切换接口、执行状态切换
 #[cast_to([sync] Socket)]
@@ -44,6 +74,43 @@ pub struct UdpSocket {
     recv_buf_size: AtomicUsize,
     /// SO_RCVLOWAT
     rcvlowat: AtomicI32,
+    /// SO_REUSEADDR
+    so_reuseaddr: AtomicBool,
+    /// SO_REUSEPORT
+    so_reuseport: AtomicBool,
+    /// SO_KEEPALIVE
+    so_keepalive: AtomicBool,
+    /// SO_BROADCAST
+    so_broadcast: AtomicBool,
+    /// SO_PASSCRED
+    so_passcred: AtomicBool,
+    /// IP_RECVTOS
+    recv_tos: AtomicBool,
+    /// IPV6_RECVTCLASS
+    recv_tclass: AtomicBool,
+    /// IP_RECVERR
+    recv_err_v4: AtomicBool,
+    /// IPV6_RECVERR
+    recv_err_v6: AtomicBool,
+    /// IP_MULTICAST_TTL (stored as int)
+    ip_multicast_ttl: AtomicI32,
+    /// IP_MULTICAST_LOOP
+    ip_multicast_loop: AtomicBool,
+    /// IP_PKTINFO
+    recv_pktinfo_v4: AtomicBool,
+    /// IP_RECVORIGDSTADDR (aka IP_ORIGDSTADDR)
+    recv_origdstaddr_v4: AtomicBool,
+    /// IPV6_RECVORIGDSTADDR
+    recv_origdstaddr_v6: AtomicBool,
+    /// Error queue for MSG_ERRQUEUE
+    errqueue: Mutex<VecDeque<UdpErrQueueEntry>>,
+    /// SO_LINGER
+    linger_onoff: AtomicI32,
+    linger_linger: AtomicI32,
+    /// SO_SNDTIMEO (microseconds). u64::MAX means "no timeout".
+    send_timeout_us: AtomicU64,
+    /// SO_RCVTIMEO (microseconds). u64::MAX means "no timeout".
+    recv_timeout_us: AtomicU64,
     /// SO_NO_CHECK: disable UDP checksum (0=off, 1=on)
     ///
     /// NOTE: This is currently a stub implementation. The value can be set/get via
@@ -78,6 +145,25 @@ impl UdpSocket {
             send_buf_size: AtomicUsize::new(0), // 0 means use default
             recv_buf_size: AtomicUsize::new(0), // 0 means use default
             rcvlowat: AtomicI32::new(1),
+            so_reuseaddr: AtomicBool::new(false),
+            so_reuseport: AtomicBool::new(false),
+            so_keepalive: AtomicBool::new(false),
+            so_broadcast: AtomicBool::new(false),
+            so_passcred: AtomicBool::new(false),
+            recv_tos: AtomicBool::new(false),
+            recv_tclass: AtomicBool::new(false),
+            recv_err_v4: AtomicBool::new(false),
+            recv_err_v6: AtomicBool::new(false),
+            ip_multicast_ttl: AtomicI32::new(1),
+            ip_multicast_loop: AtomicBool::new(true),
+            recv_pktinfo_v4: AtomicBool::new(false),
+            recv_origdstaddr_v4: AtomicBool::new(false),
+            recv_origdstaddr_v6: AtomicBool::new(false),
+            errqueue: Mutex::new(VecDeque::new()),
+            linger_onoff: AtomicI32::new(0),
+            linger_linger: AtomicI32::new(0),
+            send_timeout_us: AtomicU64::new(u64::MAX),
+            recv_timeout_us: AtomicU64::new(u64::MAX),
             no_check: AtomicBool::new(false), // checksums enabled by default
             ip_version: version,
         })
@@ -85,6 +171,17 @@ impl UdpSocket {
 
     pub fn is_nonblock(&self) -> bool {
         self.nonblock.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn recv_timeout(&self) -> Option<crate::time::Duration> {
+        let us = self
+            .recv_timeout_us
+            .load(core::sync::atomic::Ordering::Relaxed);
+        if us == u64::MAX {
+            None
+        } else {
+            Some(crate::time::Duration::from_micros(us))
+        }
     }
 
     pub fn do_bind(&self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
@@ -280,7 +377,7 @@ impl UdpSocket {
         &self,
         buf: &mut [u8],
         peek: bool,
-    ) -> Result<(usize, smoltcp::wire::IpEndpoint), SystemError> {
+    ) -> Result<(usize, smoltcp::wire::IpEndpoint, usize), SystemError> {
         match self.inner.read().as_ref().ok_or(SystemError::EBADF)? {
             UdpInner::Bound(bound) => bound.try_recv(buf, peek),
             // UDP is connectionless - unbound socket just has no data yet
@@ -307,6 +404,37 @@ impl UdpSocket {
         let shutdown_bits = self.shutdown.load(Ordering::Acquire);
         let write_shutdown = (shutdown_bits & 0x02) != 0;
         can_write || write_shutdown
+    }
+
+    #[inline]
+    fn recv_return_len(copy_len: usize, orig_len: usize, flags: PMSG) -> usize {
+        if flags.contains(PMSG::TRUNC) {
+            orig_len
+        } else {
+            copy_len
+        }
+    }
+
+    fn enqueue_errqueue(
+        &self,
+        err: SockExtendedErr,
+        offender: IpEndpoint,
+        cmsg_level: i32,
+        cmsg_type: i32,
+        addr_len: usize,
+    ) {
+        let mut q = self.errqueue.lock();
+        q.push_back(UdpErrQueueEntry {
+            err,
+            offender,
+            cmsg_level,
+            cmsg_type,
+            addr_len,
+        });
+    }
+
+    fn pop_errqueue(&self) -> Option<UdpErrQueueEntry> {
+        self.errqueue.lock().pop_front()
     }
 
     pub fn try_send(
@@ -360,6 +488,43 @@ impl UdpSocket {
         // Poll AFTER releasing the lock to avoid deadlock
         // when socket sends to itself on loopback
         iface.poll();
+
+        if let Err(SystemError::EMSGSIZE) = result {
+            if self.ip_version == IpVersion::Ipv6 && self.recv_err_v6.load(Ordering::Acquire) {
+                let mut offender = to.or_else(|| match self.inner.read().as_ref() {
+                    Some(UdpInner::Bound(bound)) => bound.remote_endpoint().ok(),
+                    _ => None,
+                });
+                if let Some(mut off) = offender.take() {
+                    if off.addr.is_unspecified() {
+                        off.addr = smoltcp::wire::IpAddress::v4(127, 0, 0, 1);
+                    }
+                    let mut ee = SystemError::EMSGSIZE.to_posix_errno();
+                    if ee < 0 {
+                        ee = -ee;
+                    }
+                    let err = SockExtendedErr {
+                        ee_errno: ee as u32,
+                        ee_origin: SO_EE_ORIGIN_LOCAL,
+                        ee_type: ICMP_ECHOREPLY,
+                        ee_code: ICMP_NET_UNREACH,
+                        ee_pad: 0,
+                        ee_info: buf.len() as u32,
+                        ee_data: 0,
+                    };
+                    let addr_len = SockAddr::from(Endpoint::Ip(off)).len().unwrap_or(0) as usize;
+                    if addr_len != 0 {
+                        self.enqueue_errqueue(
+                            err,
+                            off,
+                            PSOL::IPV6 as i32,
+                            PIPV6::RECVERR as i32,
+                            addr_len,
+                        );
+                    }
+                }
+            }
+        }
 
         result
     }
@@ -583,7 +748,9 @@ impl Socket for UdpSocket {
             if is_recv_shutdown && matches!(result, Err(SystemError::EAGAIN_OR_EWOULDBLOCK)) {
                 return Ok(0);
             }
-            return result.map(|(len, _)| len);
+            return result.map(|(copy_len, _endpoint, orig_len)| {
+                Self::recv_return_len(copy_len, orig_len, flags)
+            });
         } else {
             loop {
                 // Re-check shutdown state inside the loop
@@ -591,15 +758,18 @@ impl Socket for UdpSocket {
                 let is_recv_shutdown = shutdown_bits & 0x01 != 0;
 
                 match self.try_recv(buffer, peek) {
-                    Ok((len, _endpoint)) => {
-                        return Ok(len);
+                    Ok((copy_len, _endpoint, orig_len)) => {
+                        return Ok(Self::recv_return_len(copy_len, orig_len, flags));
                     }
                     Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
                         // If shutdown and no data available, return EOF
                         if is_recv_shutdown {
                             return Ok(0);
                         }
-                        wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
+                        self.wait_queue.wait_event_io_interruptible_timeout(
+                            || self.can_recv(),
+                            self.recv_timeout(),
+                        )?;
                     }
                     Err(e) => return Err(e),
                 }
@@ -622,7 +792,12 @@ impl Socket for UdpSocket {
             let result = self.try_recv(buffer, peek);
             // For non-blocking sockets, always return EAGAIN when no data
             // Even after shutdown, don't convert to EOF
-            result.map(|(len, endpoint)| (len, Endpoint::Ip(endpoint)))
+            result.map(|(copy_len, endpoint, orig_len)| {
+                (
+                    Self::recv_return_len(copy_len, orig_len, flags),
+                    Endpoint::Ip(endpoint),
+                )
+            })
         } else {
             loop {
                 // Re-check shutdown state inside the loop
@@ -630,8 +805,11 @@ impl Socket for UdpSocket {
                 let is_recv_shutdown = shutdown_bits & 0x01 != 0;
 
                 match self.try_recv(buffer, peek) {
-                    Ok((len, endpoint)) => {
-                        return Ok((len, Endpoint::Ip(endpoint)));
+                    Ok((copy_len, endpoint, orig_len)) => {
+                        return Ok((
+                            Self::recv_return_len(copy_len, orig_len, flags),
+                            Endpoint::Ip(endpoint),
+                        ));
                     }
                     Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
                         // If shutdown and no data available, return EOF
@@ -644,7 +822,10 @@ impl Socket for UdpSocket {
                             }
                             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                         }
-                        wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
+                        self.wait_queue.wait_event_io_interruptible_timeout(
+                            || self.can_recv(),
+                            self.recv_timeout(),
+                        )?;
                         // log::debug!("UdpSocket::recv_from: wake up");
                     }
                     Err(e) => return Err(e),
@@ -695,86 +876,24 @@ impl Socket for UdpSocket {
     }
 
     fn set_option(&self, level: PSOL, name: usize, val: &[u8]) -> Result<(), SystemError> {
-        if level == PSOL::SOCKET {
-            let opt = PSO::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
-            match opt {
-                PSO::SNDBUF => {
-                    // Set send buffer size
-                    if val.len() < core::mem::size_of::<u32>() {
-                        return Err(SystemError::EINVAL);
-                    }
-                    let requested = u32::from_ne_bytes([val[0], val[1], val[2], val[3]]) as usize;
-                    // Enforce minimum buffer size
-                    let size = if requested < MIN_BUF_SIZE {
-                        MIN_BUF_SIZE
-                    } else {
-                        requested
-                    };
-                    self.send_buf_size.store(size, Ordering::Release);
-                    // log::debug!(
-                    //     "UDP setsockopt SO_SNDBUF: requested={}, actual={}",
-                    //     requested,
-                    //     size
-                    // );
-
-                    // If socket is already bound, we need to recreate it with new buffer size
-                    self.recreate_socket_if_bound()?;
-                    return Ok(());
-                }
-                PSO::RCVBUF => {
-                    // Set receive buffer size
-                    if val.len() < core::mem::size_of::<u32>() {
-                        return Err(SystemError::EINVAL);
-                    }
-                    let requested = u32::from_ne_bytes([val[0], val[1], val[2], val[3]]) as usize;
-                    // Enforce minimum buffer size
-                    let size = if requested < MIN_BUF_SIZE {
-                        MIN_BUF_SIZE
-                    } else {
-                        requested
-                    };
-                    self.recv_buf_size.store(size, Ordering::Release);
-                    // log::debug!(
-                    //     "UDP setsockopt SO_RCVBUF: requested={}, actual={}",
-                    //     requested,
-                    //     size
-                    // );
-
-                    // If socket is already bound, we need to recreate it with new buffer size
-                    self.recreate_socket_if_bound()?;
-                    return Ok(());
-                }
-                PSO::RCVLOWAT => {
-                    let mut v = byte_parser::read_i32(val)?;
-                    if v < 0 {
-                        v = i32::MAX;
-                    } else if v == 0 {
-                        v = 1;
-                    }
-                    self.rcvlowat.store(v, Ordering::Relaxed);
-                    return Ok(());
-                }
-                PSO::NO_CHECK => {
-                    // Set SO_NO_CHECK: disable/enable UDP checksum verification
-                    // NOTE: This is a stub implementation - see field comment for details.
-                    // The value is stored but does not affect actual checksum behavior.
-                    if val.len() < core::mem::size_of::<i32>() {
-                        return Err(SystemError::EINVAL);
-                    }
-                    let value = i32::from_ne_bytes([val[0], val[1], val[2], val[3]]);
-                    self.no_check.store(value != 0, Ordering::Release);
-                    // log::debug!(
-                    //     "UDP setsockopt SO_NO_CHECK: {} (stub - no actual effect)",
-                    //     value != 0
-                    // );
-                    return Ok(());
-                }
-                _ => {
-                    return Err(SystemError::ENOPROTOOPT);
-                }
+        match level {
+            PSOL::SOCKET => {
+                let opt = PSO::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
+                self.set_socket_option(opt, val)
             }
+            PSOL::IP => {
+                let opt = IpOption::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
+                self.set_ip_option(opt, val)
+            }
+            PSOL::IPV6 => {
+                if self.ip_version != IpVersion::Ipv6 {
+                    return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+                }
+                let opt = PIPV6::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
+                self.set_ipv6_option(opt, val)
+            }
+            _ => Err(SystemError::ENOPROTOOPT),
         }
-        Err(SystemError::ENOPROTOOPT)
     }
 
     fn option(&self, level: PSOL, name: usize, value: &mut [u8]) -> Result<usize, SystemError> {
@@ -784,99 +903,24 @@ impl Socket for UdpSocket {
         //     name,
         //     value.len()
         // );
-        if level == PSOL::SOCKET {
-            let opt = PSO::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
-            // log::debug!("UDP getsockopt: parsed option {:?}", opt);
-            match opt {
-                PSO::TYPE => {
-                    if value.len() < core::mem::size_of::<i32>() {
-                        return Err(SystemError::EINVAL);
-                    }
-                    let v = PSOCK::Datagram as i32;
-                    value[..4].copy_from_slice(&v.to_ne_bytes());
-                    return Ok(core::mem::size_of::<i32>());
-                }
-                PSO::DOMAIN => {
-                    if value.len() < core::mem::size_of::<i32>() {
-                        return Err(SystemError::EINVAL);
-                    }
-                    let domain = match self.ip_version {
-                        IpVersion::Ipv6 => AddressFamily::INet6,
-                        IpVersion::Ipv4 => AddressFamily::INet,
-                    };
-                    let v = domain as i32;
-                    value[..4].copy_from_slice(&v.to_ne_bytes());
-                    return Ok(core::mem::size_of::<i32>());
-                }
-                PSO::PROTOCOL => {
-                    if value.len() < core::mem::size_of::<i32>() {
-                        return Err(SystemError::EINVAL);
-                    }
-                    let v = PSOL::UDP as i32;
-                    value[..4].copy_from_slice(&v.to_ne_bytes());
-                    return Ok(core::mem::size_of::<i32>());
-                }
-                PSO::SNDBUF => {
-                    if value.len() < core::mem::size_of::<u32>() {
-                        return Err(SystemError::EINVAL);
-                    }
-                    let size = self.send_buf_size.load(Ordering::Acquire);
-                    // Linux doubles the value when returning it
-                    // If 0 (not set), return default size
-                    let actual_size = if size == 0 {
-                        DEFAULT_TX_BUF_SIZE * 2
-                    } else {
-                        size * 2
-                    };
-                    let bytes = (actual_size as u32).to_ne_bytes();
-                    value[0..4].copy_from_slice(&bytes);
-                    return Ok(core::mem::size_of::<u32>());
-                }
-                PSO::RCVBUF => {
-                    if value.len() < core::mem::size_of::<u32>() {
-                        return Err(SystemError::EINVAL);
-                    }
-                    let size = self.recv_buf_size.load(Ordering::Acquire);
-                    // Linux doubles the value when returning it
-                    // If 0 (not set), return default size
-                    let actual_size = if size == 0 {
-                        DEFAULT_RX_BUF_SIZE * 2
-                    } else {
-                        size * 2
-                    };
-                    // log::debug!(
-                    //     "UDP getsockopt SO_RCVBUF: size={}, returning={}",
-                    //     size,
-                    //     actual_size
-                    // );
-                    let bytes = (actual_size as u32).to_ne_bytes();
-                    value[0..4].copy_from_slice(&bytes);
-                    return Ok(core::mem::size_of::<u32>());
-                }
-                PSO::RCVLOWAT => {
-                    if value.len() < core::mem::size_of::<i32>() {
-                        return Err(SystemError::EINVAL);
-                    }
-                    let v = self.rcvlowat.load(Ordering::Relaxed);
-                    value[..4].copy_from_slice(&v.to_ne_bytes());
-                    return Ok(core::mem::size_of::<i32>());
-                }
-                PSO::NO_CHECK => {
-                    if value.len() < core::mem::size_of::<i32>() {
-                        return Err(SystemError::EINVAL);
-                    }
-                    let no_check = self.no_check.load(Ordering::Acquire);
-                    let val = if no_check { 1i32 } else { 0i32 };
-                    let bytes = val.to_ne_bytes();
-                    value[0..4].copy_from_slice(&bytes);
-                    return Ok(core::mem::size_of::<i32>());
-                }
-                _ => {
-                    return Err(SystemError::ENOPROTOOPT);
-                }
+        match level {
+            PSOL::SOCKET => {
+                let opt = PSO::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
+                self.get_socket_option(opt, value)
             }
+            PSOL::IP => {
+                let opt = IpOption::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
+                self.get_ip_option(opt, value)
+            }
+            PSOL::IPV6 => {
+                if self.ip_version != IpVersion::Ipv6 {
+                    return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+                }
+                let opt = PIPV6::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
+                self.get_ipv6_option(opt, value)
+            }
+            _ => Err(SystemError::ENOPROTOOPT),
         }
-        Err(SystemError::ENOPROTOOPT)
     }
 
     fn remote_endpoint(&self) -> Result<Endpoint, SystemError> {
@@ -947,19 +991,95 @@ impl Socket for UdpSocket {
         //     flags
         // );
 
-        // Check for MSG_ERRQUEUE - we don't support error queues yet
+        // Handle MSG_ERRQUEUE for socket error queue
         if flags.contains(PMSG::ERRQUEUE) {
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            let entry = self
+                .pop_errqueue()
+                .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+
+            // Write offender address if requested
+            let offender_ep = Endpoint::Ip(entry.offender);
+            msg.msg_namelen = offender_ep.write_to_user_msghdr(msg.msg_name, msg.msg_namelen)?;
+
+            // Prepare control message: sock_extended_err + offender sockaddr
+            let err_bytes = unsafe {
+                core::slice::from_raw_parts(
+                    (&entry.err as *const SockExtendedErr) as *const u8,
+                    core::mem::size_of::<SockExtendedErr>(),
+                )
+            };
+            let sockaddr = SockAddr::from(offender_ep);
+            let sockaddr_bytes = unsafe {
+                core::slice::from_raw_parts(
+                    (&sockaddr as *const SockAddr) as *const u8,
+                    entry.addr_len,
+                )
+            };
+
+            let mut data = alloc::vec::Vec::with_capacity(err_bytes.len() + sockaddr_bytes.len());
+            data.extend_from_slice(err_bytes);
+            data.extend_from_slice(sockaddr_bytes);
+
+            msg.msg_flags = PMSG::ERRQUEUE.bits() as i32;
+            let mut write_off = 0usize;
+            let mut cmsg_buf = CmsgBuffer {
+                ptr: msg.msg_control,
+                len: msg.msg_controllen,
+                write_off: &mut write_off,
+            };
+            cmsg_buf.put(
+                &mut msg.msg_flags,
+                entry.cmsg_level,
+                entry.cmsg_type,
+                data.len(),
+                &data,
+            )?;
+            msg.msg_controllen = write_off;
+
+            return Ok(0);
         }
 
         // Validate and create iovecs
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
         let mut buf = iovs.new_buf(true);
-
-        // log::debug!("recv_msg: created buffer of {} bytes", buf.len());
+        let buf_cap = buf.len();
 
         // Receive data from socket
-        let (recv_size, src_endpoint) = self.recv_from(&mut buf, flags, None)?;
+        let (copy_len, src_endpoint, orig_len) = {
+            let peek = flags.contains(PMSG::PEEK);
+            if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
+                let (copy_len, endpoint, orig_len) = self.try_recv(&mut buf, peek)?;
+                (copy_len, Endpoint::Ip(endpoint), orig_len)
+            } else {
+                loop {
+                    // Re-check shutdown state inside the loop
+                    let shutdown_bits = self.shutdown.load(Ordering::Acquire);
+                    let is_recv_shutdown = shutdown_bits & 0x01 != 0;
+
+                    match self.try_recv(&mut buf, peek) {
+                        Ok((copy_len, endpoint, orig_len)) => {
+                            break (copy_len, Endpoint::Ip(endpoint), orig_len);
+                        }
+                        Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                            // If shutdown and no data available, return EOF
+                            if is_recv_shutdown {
+                                if let Some(UdpInner::Bound(bound)) = self.inner.read().as_ref() {
+                                    if let Ok(remote) = bound.remote_endpoint() {
+                                        break (0, Endpoint::Ip(remote), 0);
+                                    }
+                                }
+                                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                            }
+                            self.wait_queue.wait_event_io_interruptible_timeout(
+                                || self.can_recv(),
+                                self.recv_timeout(),
+                            )?;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        };
 
         // log::debug!(
         //     "recv_msg: received {} bytes from {:?}",
@@ -968,7 +1088,7 @@ impl Socket for UdpSocket {
         // );
 
         // Scatter received data to user iovecs
-        iovs.scatter(&buf[..recv_size])?;
+        iovs.scatter(&buf[..copy_len])?;
 
         // Write source address if requested
         if !msg.msg_name.is_null() {
@@ -991,9 +1111,12 @@ impl Socket for UdpSocket {
         // No control messages for now
         msg.msg_controllen = 0;
         msg.msg_flags = 0;
+        if orig_len > buf_cap {
+            msg.msg_flags |= PMSG::TRUNC.bits() as i32;
+        }
 
         // log::debug!("recv_msg: returning {} bytes", recv_size);
-        Ok(recv_size)
+        Ok(Self::recv_return_len(copy_len, orig_len, flags))
     }
 
     fn send_msg(&self, msg: &crate::net::posix::MsgHdr, flags: PMSG) -> Result<usize, SystemError> {
@@ -1069,33 +1192,5 @@ impl InetSocket for UdpSocket {
         // Notify epoll/poll watchers about socket state changes
         let pollflag = self.check_io_event();
         let _ = EventPoll::wakeup_epoll(self.epoll_items().as_ref(), pollflag);
-    }
-}
-
-bitflags! {
-    pub struct UdpSocketOptions: u32 {
-        const ZERO = 0;        /* No UDP options */
-        const UDP_CORK = 1;         /* Never send partially complete segments */
-        const UDP_ENCAP = 100;      /* Set the socket to accept encapsulated packets */
-        const UDP_NO_CHECK6_TX = 101; /* Disable sending checksum for UDP6X */
-        const UDP_NO_CHECK6_RX = 102; /* Disable accepting checksum for UDP6 */
-        const UDP_SEGMENT = 103;    /* Set GSO segmentation size */
-        const UDP_GRO = 104;        /* This socket can receive UDP GRO packets */
-
-        const UDPLITE_SEND_CSCOV = 10; /* sender partial coverage (as sent)      */
-        const UDPLITE_RECV_CSCOV = 11; /* receiver partial coverage (threshold ) */
-    }
-}
-
-bitflags! {
-    pub struct UdpEncapTypes: u8 {
-        const ZERO = 0;
-        const ESPINUDP_NON_IKE = 1;     // draft-ietf-ipsec-nat-t-ike-00/01
-        const ESPINUDP = 2;             // draft-ietf-ipsec-udp-encaps-06
-        const L2TPINUDP = 3;            // rfc2661
-        const GTP0 = 4;                 // GSM TS 09.60
-        const GTP1U = 5;                // 3GPP TS 29.060
-        const RXRPC = 6;
-        const ESPINTCP = 7;             // Yikes, this is really xfrm encap types.
     }
 }

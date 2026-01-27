@@ -17,7 +17,6 @@ pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
 pub const DEFAULT_RX_BUF_SIZE: usize = 128 * 1024; // 128 KB
 pub const DEFAULT_TX_BUF_SIZE: usize = 128 * 1024; // 128 KB
                                                    // Minimum buffer size (Linux uses 256 bytes minimum)
-pub const MIN_BUF_SIZE: usize = 256;
 
 #[derive(Debug)]
 pub struct UnboundUdp {
@@ -234,7 +233,7 @@ impl BoundUdp {
         &self,
         buf: &mut [u8],
         peek: bool,
-    ) -> Result<(usize, smoltcp::wire::IpEndpoint), SystemError> {
+    ) -> Result<(usize, smoltcp::wire::IpEndpoint, usize), SystemError> {
         let remote = *self.remote.lock();
 
         self.with_mut_socket(|socket| {
@@ -272,7 +271,7 @@ impl BoundUdp {
                                 // Special case: zero-length buffer
                                 if buf.is_empty() {
                                     // log::debug!("try_recv: zero-length buffer in connected mode, returning 0 bytes");
-                                    return Ok((0, expected_remote));
+                                    return Ok((0, expected_remote, payload.len()));
                                 }
 
                                 if peek {
@@ -280,7 +279,7 @@ impl BoundUdp {
                                     let copy_len = core::cmp::min(buf.len(), payload.len());
                                     buf[..copy_len].copy_from_slice(&payload[..copy_len]);
                                     // log::debug!("try_recv: peek succeeded, size={}", copy_len);
-                                    return Ok((copy_len, expected_remote));
+                                    return Ok((copy_len, expected_remote, payload.len()));
                                 } else {
                                     // Receive the packet
                                     let (recv_buf, _metadata) =
@@ -288,7 +287,7 @@ impl BoundUdp {
                                     let length = core::cmp::min(buf.len(), recv_buf.len());
                                     buf[..length].copy_from_slice(&recv_buf[..length]);
                                     debug_assert_eq!(expected_remote, _metadata.endpoint);
-                                    return Ok((length, expected_remote));
+                                    return Ok((length, expected_remote, recv_buf.len()));
                                 }
                             } else {
                                 // just drop the packet
@@ -310,9 +309,9 @@ impl BoundUdp {
                 if buf.is_empty() {
                     if socket.can_recv() {
                         // Peek to get the source endpoint without consuming data
-                        if let Ok((_payload, metadata)) = socket.peek() {
+                        if let Ok((payload, metadata)) = socket.peek() {
                             // log::debug!("try_recv: zero-length buffer with data available, returning 0 bytes from {:?}", metadata.endpoint);
-                            return Ok((0, metadata.endpoint));
+                            return Ok((0, metadata.endpoint, payload.len()));
                         }
                     }
                     // log::debug!("try_recv: zero-length buffer with no data, returning EAGAIN");
@@ -326,7 +325,7 @@ impl BoundUdp {
                             let copy_len = core::cmp::min(buf.len(), payload.len());
                             buf[..copy_len].copy_from_slice(&payload[..copy_len]);
                             // log::debug!("try_recv: unconnected peek succeeded, size={}", copy_len);
-                            return Ok((copy_len, metadata.endpoint));
+                            return Ok((copy_len, metadata.endpoint, payload.len()));
                         }
                     } else {
                         // Receive the packet                       // Receive the packet
@@ -334,7 +333,7 @@ impl BoundUdp {
                             socket.recv().map_err(|_| SystemError::ENOBUFS)?;
                         let length = core::cmp::min(buf.len(), recv_buf.len());
                         buf[..length].copy_from_slice(&recv_buf[..length]);
-                        return Ok((length, metadata.endpoint));
+                        return Ok((length, metadata.endpoint, recv_buf.len()));
                     }
                 }
                 // log::debug!("try_recv: unconnected recv failed, returning EAGAIN");
@@ -371,6 +370,10 @@ impl BoundUdp {
         // );
 
         self.with_mut_socket(|socket| {
+            let max_payload = socket.payload_send_capacity();
+            if buf.len() > max_payload || buf.len() > u16::MAX as usize {
+                return Err(SystemError::EMSGSIZE);
+            }
             if socket.can_send() {
                 match socket.send_slice(buf, remote) {
                     Ok(_) => {

@@ -11,10 +11,10 @@ use super::info;
 use super::inner;
 
 use crate::libs::byte_parser;
-use crate::net::socket::{common::ShutdownBit, AddressFamily, IpOption, PSO, PSOCK, PSOL};
+use crate::net::socket::common::{parse_timeval_opt, write_timeval_opt, ShutdownBit};
+use crate::net::socket::{AddressFamily, IpOption, PSO, PSOCK, PSOL};
 use crate::process::cred::CAPFlags;
 use crate::process::ProcessManager;
-use crate::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive)]
 pub enum Options {
@@ -175,19 +175,6 @@ impl super::TcpSocket {
         Ok(8)
     }
 
-    /// Helper to write a timeval (two i64 fields) to an option buffer.
-    #[inline]
-    fn write_timeval_opt(value: &mut [u8], micros: u64) -> Result<usize, SystemError> {
-        if value.len() < 16 {
-            return Err(SystemError::EINVAL);
-        }
-        let sec = (micros / 1_000_000) as i64;
-        let usec = (micros % 1_000_000) as i64;
-        value[..8].copy_from_slice(&sec.to_ne_bytes());
-        value[8..16].copy_from_slice(&usec.to_ne_bytes());
-        Ok(16)
-    }
-
     /// Helper to read an atomic usize value and write as u32 to an option buffer.
     #[inline]
     fn write_atomic_usize_as_u32(
@@ -235,68 +222,18 @@ impl super::TcpSocket {
         requested.saturating_mul(2).max(min)
     }
 
-    /// Parses a timeval value for socket timeout options.
-    pub(super) fn parse_timeval_opt(optval: &[u8]) -> Result<Option<Duration>, SystemError> {
-        // Accept both 64-bit and 32-bit timeval layouts.
-        if optval.len() >= 16 {
-            let mut sec_raw = [0u8; 8];
-            let mut usec_raw = [0u8; 8];
-            sec_raw.copy_from_slice(&optval[..8]);
-            usec_raw.copy_from_slice(&optval[8..16]);
-            let sec = i64::from_ne_bytes(sec_raw);
-            let usec = i64::from_ne_bytes(usec_raw);
-            if !(0..1_000_000).contains(&usec) {
-                return Err(SystemError::EDOM);
-            }
-            if sec < 0 {
-                return Ok(Some(Duration::from_micros(0)));
-            }
-            if sec == 0 && usec == 0 {
-                return Ok(None);
-            }
-            let total_us = (sec as u64)
-                .saturating_mul(1_000_000)
-                .saturating_add(usec as u64);
-            return Ok(Some(Duration::from_micros(total_us)));
-        }
-
-        if optval.len() >= 12 {
-            let mut sec_raw = [0u8; 8];
-            let mut usec_raw = [0u8; 4];
-            sec_raw.copy_from_slice(&optval[..8]);
-            usec_raw.copy_from_slice(&optval[8..12]);
-            let sec = i64::from_ne_bytes(sec_raw);
-            let usec = i32::from_ne_bytes(usec_raw) as i64;
-            if !(0..1_000_000).contains(&usec) {
-                return Err(SystemError::EDOM);
-            }
-            if sec < 0 {
-                return Ok(Some(Duration::from_micros(0)));
-            }
-            if sec == 0 && usec == 0 {
-                return Ok(None);
-            }
-            let total_us = (sec as u64)
-                .saturating_mul(1_000_000)
-                .saturating_add(usec as u64);
-            return Ok(Some(Duration::from_micros(total_us)));
-        }
-
-        Err(SystemError::EINVAL)
-    }
-
     /// Sets a SOL_SOCKET option.
     pub(super) fn set_socket_option(&self, opt: PSO, val: &[u8]) -> Result<(), SystemError> {
         match opt {
             PSO::SNDTIMEO_OLD | PSO::SNDTIMEO_NEW => {
-                let d = Self::parse_timeval_opt(val)?;
+                let d = parse_timeval_opt(val)?;
                 let us = d.map(|v| v.total_micros()).unwrap_or(u64::MAX);
                 self.send_timeout_us()
                     .store(us, core::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
             PSO::RCVTIMEO_OLD | PSO::RCVTIMEO_NEW => {
-                let d = Self::parse_timeval_opt(val)?;
+                let d = parse_timeval_opt(val)?;
                 let us = d.map(|v| v.total_micros()).unwrap_or(u64::MAX);
                 self.recv_timeout_us()
                     .store(us, core::sync::atomic::Ordering::Relaxed);
@@ -622,14 +559,14 @@ impl super::TcpSocket {
                     .send_timeout_us()
                     .load(core::sync::atomic::Ordering::Relaxed);
                 let us = if us == u64::MAX { 0 } else { us };
-                Self::write_timeval_opt(value, us)
+                write_timeval_opt(value, us)
             }
             PSO::RCVTIMEO_OLD | PSO::RCVTIMEO_NEW => {
                 let us = self
                     .recv_timeout_us()
                     .load(core::sync::atomic::Ordering::Relaxed);
                 let us = if us == u64::MAX { 0 } else { us };
-                Self::write_timeval_opt(value, us)
+                write_timeval_opt(value, us)
             }
             PSO::RCVLOWAT => {
                 let v = self

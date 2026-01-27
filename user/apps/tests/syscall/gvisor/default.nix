@@ -38,14 +38,38 @@ let
     '';
   };
 
-  # 2. Prepare the test data, scripts, and patched binaries
-  # This derivation handles downloading, extracting, and patching the tests.
-  tests = pkgs.stdenv.mkDerivation {
-    pname = "gvisor-tests-data";
+  # 2. Extract and patch test binaries
+  # This derivation handles downloading, extracting, and patching the test binaries.
+  # Separated from scripts so that whitelist/blocklist changes don't trigger repatching.
+  testBinaries = pkgs.stdenv.mkDerivation {
+    pname = "gvisor-tests-binaries";
     version = "0.1.0";
 
-    # Use sourceByRegex to only depend on relevant files.
-    # This prevents rebuilds when files in ./runner change.
+    src = testsArchive;
+
+    nativeBuildInputs = [ pkgs.autoPatchelfHook ];
+
+    buildInputs = [ pkgs.stdenv.cc.cc.lib ];
+
+    sourceRoot = ".";
+
+    installPhase = ''
+      mkdir -p $out/${installDir}/tests
+      cp -r * $out/${installDir}/tests/
+
+      runHook preInstall
+      find $out/${installDir}/tests -type f -name '*_test' -exec chmod 755 {} \; || true
+      runHook postInstall
+    '';
+  };
+
+  # 3. Prepare test scripts and configuration files
+  # This derivation contains frequently modified files (whitelist, blocklists, scripts).
+  # Changes here won't trigger binary repatching.
+  testScripts = pkgs.stdenv.mkDerivation {
+    pname = "gvisor-tests-scripts";
+    version = "0.1.0";
+
     src = lib.sourceByRegex ./. [
       "^whitelist\.txt$"
       "^blocklists"
@@ -53,30 +77,18 @@ let
       "^run_tests\.sh$"
     ];
 
-    nativeBuildInputs = [ pkgs.autoPatchelfHook ];
-
-    buildInputs = [ pkgs.stdenv.cc.cc.lib ];
-
     installPhase = ''
       mkdir -p $out/${installDir}
 
       install -m644 whitelist.txt $out/${installDir}/
       cp -r blocklists $out/${installDir}/
       install -m755 run_tests.sh $out/${installDir}/
-
-      # Bundle tests archive for offline systems
-      mkdir -p $out/${installDir}/tests
-      tar -xf ${testsArchive} -C $out/${installDir}/tests --strip-components=1
-
-      runHook preInstall
-      find $out/${installDir}/tests -type f -name '*_test' -exec install -m755 {} $out/${installDir}/tests \; || true
-      runHook postInstall
     '';
   };
 
 in pkgs.symlinkJoin {
   name = "gvisor-tests";
-  paths = [ runner tests ];
+  paths = [ runner testBinaries testScripts ];
   meta = with lib; {
     description = "gVisor syscall test runner and scripts";
     platforms = platforms.linux;

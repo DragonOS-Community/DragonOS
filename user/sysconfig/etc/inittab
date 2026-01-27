@@ -1,7 +1,7 @@
 # /etc/inittab
 ::sysinit:busybox sh /etc/init.d/rcS  # 系统初始化脚本
 
-::askfirst:/bin/login -f root
+::askfirst:/bin/busybox login -f root
 
 # ::askfirst:-/bin/busybox sh --login
 

@@ -200,7 +200,6 @@
               echo "要运行 DragonOS，请构建内核、rootfs，再QEMU运行"
               echo ""
               echo "  一键运行:    nix run .#yolo-x86_64"
-              echo "  快速启动:    nix shell .#start-x86_64，然后 dragonos-run"
               echo "  构建内核:    make kernel"
               echo "  构建 rootfs: nix run .#rootfs-x86_64"
               echo "  QEMU 运行:   nix run .#start-x86_64"

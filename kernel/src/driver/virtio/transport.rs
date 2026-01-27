@@ -5,6 +5,7 @@ use virtio_drivers::transport::Transport;
 use crate::{
     driver::{
         base::device::DeviceId,
+        pci::pci_irq::IrqType,
         pci::{
             pci::{PciDeviceStructure, PciError},
             pci_irq::{IrqCommonMsg, IrqSpecificMsg, PciInterrupt, PciIrqError, PciIrqMsg, IRQ},
@@ -30,13 +31,26 @@ impl VirtIOTransport {
         }
     }
 
+    pub fn irq_is_msix(&self) -> bool {
+        match self {
+            VirtIOTransport::Pci(transport) => {
+                matches!(
+                    *transport.pci_device().irq_type.read(),
+                    IrqType::Msix { .. }
+                )
+            }
+            VirtIOTransport::Mmio(_) => false,
+        }
+    }
+
     /// 设置中断
     pub fn setup_irq(&self, dev_id: Arc<DeviceId>) -> Result<(), PciError> {
         if let VirtIOTransport::Pci(transport) = self {
             let standard_device = transport.pci_device().as_standard_device().unwrap();
-            standard_device
+            let _irq_type = standard_device
                 .irq_init(IRQ::PCI_IRQ_MSIX | IRQ::PCI_IRQ_MSI)
                 .ok_or(PciError::PciIrqError(PciIrqError::IrqNotInited))?;
+
             // 中断相关信息
             let msg = PciIrqMsg {
                 irq_common_message: IrqCommonMsg::init_from(

@@ -250,12 +250,12 @@ impl ShmManager {
     ) -> Result<usize, SystemError> {
         let kernel_shm = self.id2shm.get(&id).ok_or(SystemError::EINVAL)?;
         let kern_ipc_perm = &kernel_shm.kern_ipc_perm;
-        let key = kern_ipc_perm
+        let _key = kern_ipc_perm
             .key
             .data()
             .to_i32()
             .ok_or(SystemError::EOVERFLOW)?;
-        let mode = kern_ipc_perm.mode.bits();
+        let _mode = kern_ipc_perm.mode.bits();
 
         let shm_perm = PosixIpcPerm::try_from(kern_ipc_perm)?;
         let shm_segsz = kernel_shm.shm_size;

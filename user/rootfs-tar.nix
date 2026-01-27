@@ -28,7 +28,7 @@ let
         src = ./sysconfig;
       }
       ''
-        mkdir -p $out
+        mkdir -p $out $out/root
         cp -r $src/* $out/
       '';
 

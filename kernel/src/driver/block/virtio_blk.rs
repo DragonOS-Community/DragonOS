@@ -361,6 +361,7 @@ impl VirtIOBlkDevice {
 
         let devname = virtioblk_manager().alloc_id()?;
         let irq = Some(transport.irq());
+        let irq_is_msix = transport.irq_is_msix();
         let device_inner = VirtIOBlk::<HalImpl, VirtIOTransport>::new(transport);
         if let Err(e) = device_inner {
             error!("VirtIOBlkDevice '{dev_id:?}' create failed: {:?}", e);
@@ -386,6 +387,7 @@ impl VirtIOBlkDevice {
                 device_common: DeviceCommonData::default(),
                 kobject_common: KObjectCommonData::default(),
                 irq,
+                irq_is_msix,
                 bio_queue: Some(bio_queue.clone()),
                 bio_token_map: Some(bio_token_map.clone()),
                 io_thread_pcb: None, // 稍后初始化
@@ -600,9 +602,9 @@ struct InnerVirtIOBlkDevice {
     device_common: DeviceCommonData,
     kobject_common: KObjectCommonData,
     irq: Option<IrqNumber>,
-    // 异步IO支持（阶段2新增）
+    irq_is_msix: bool,
     bio_queue: Option<Arc<BioQueue>>,
-    bio_token_map: Option<Arc<BioTokenMap>>, // 阶段3将使用
+    bio_token_map: Option<Arc<BioTokenMap>>,
     io_thread_pcb: Option<Arc<ProcessControlBlock>>,
     completion_tasklet: Option<Arc<BioCompletionTasklet>>,
 }
@@ -623,7 +625,12 @@ impl VirtIODevice for VirtIOBlkDevice {
         _irq: crate::exception::IrqNumber,
     ) -> Result<IrqReturn, system_error::SystemError> {
         let mut inner = self.inner();
-        if !inner.device_inner.ack_interrupt() {
+        let acked = inner.device_inner.ack_interrupt();
+        if !acked && !inner.irq_is_msix {
+            log::debug!(
+                "VirtIOBlkDevice '{:?}' ack_interrupt not set",
+                self.dev_id.id()
+            );
             return Ok(crate::exception::irqdesc::IrqReturn::NotHandled);
         }
         let tasklet = inner.completion_tasklet.clone();

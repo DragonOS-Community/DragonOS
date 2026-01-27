@@ -85,7 +85,7 @@ pub fn do_kernel_rt_sigtimedwait(
     // 应用新掩码（内部会自动保存旧掩码到 saved_sigmask ，用于后续恢复）
     set_user_sigmask(&mut new_blocked);
     // 必须重新计算 pending，因为 blocked 变了，可能某些 pending 信号现在变得可见了
-    pcb.recalc_sigpending(None);
+    pcb.recalc_sigpending();
 
     // 计算超时时间
     let deadline = if uts.is_null() {
@@ -130,7 +130,7 @@ pub fn do_kernel_rt_sigtimedwait(
         }
 
         // 第四步：检查是否有其他未屏蔽的待处理信号打断，若被其他信号唤醒了，必须返回 EINTR 让内核去处理那个信号
-        pcb.recalc_sigpending(None);
+        pcb.recalc_sigpending();
         if pcb.has_pending_signal_fast() {
             drop(preempt_guard);
             restore_saved_sigmask();
@@ -174,8 +174,9 @@ fn try_dequeue_signal(awaited: &SigSet) -> Option<(Signal, SigInfo)> {
     let ignore_mask = !*awaited;
     if let (sig, Some(info)) = pending.dequeue_signal(&ignore_mask) {
         if sig != Signal::INVALID {
+            drop(siginfo_guard);
             // 消费信号后及时刷新 HAS_PENDING_SIGNAL 状态，避免后续等待路径误判
-            pcb.recalc_sigpending(Some(&siginfo_guard));
+            pcb.recalc_sigpending();
             return Some((sig, info));
         }
     }
@@ -188,7 +189,7 @@ fn try_dequeue_signal(awaited: &SigSet) -> Option<(Signal, SigInfo)> {
     if sig != Signal::INVALID {
         if let Some(info) = info {
             // 同步刷新 pending 标志，确保后续可中断等待依据最新状态
-            pcb.recalc_sigpending(None);
+            pcb.recalc_sigpending();
             return Some((sig, info));
         }
     }

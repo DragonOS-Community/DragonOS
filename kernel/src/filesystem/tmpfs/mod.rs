@@ -1092,7 +1092,7 @@ impl IndexNode for LockedTmpfsInode {
         &self,
         filename: &str,
         mode: InodeMode,
-        _dev_t: DeviceNumber,
+        dev_t: DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let mut inode = self.0.lock();
         if inode.metadata.file_type != FileType::Dir {
@@ -1107,6 +1107,17 @@ impl IndexNode for LockedTmpfsInode {
         }
 
         let filename = DName::from(filename);
+
+        // 确定文件类型
+        let file_type = if mode.contains(InodeMode::S_IFIFO) {
+            FileType::Pipe
+        } else if mode.contains(InodeMode::S_IFCHR) {
+            FileType::CharDevice
+        } else if mode.contains(InodeMode::S_IFBLK) {
+            FileType::BlockDevice
+        } else {
+            FileType::File
+        };
 
         let nod = Arc::new(LockedTmpfsInode(Mutex::new(TmpfsInode {
             parent: inode.self_ref.clone(),
@@ -1123,12 +1134,12 @@ impl IndexNode for LockedTmpfsInode {
                 mtime: PosixTimeSpec::default(),
                 ctime: PosixTimeSpec::default(),
                 btime: PosixTimeSpec::default(),
-                file_type: FileType::Pipe,
+                file_type,
                 mode,
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
-                raw_dev: DeviceNumber::default(),
+                raw_dev: dev_t,
                 flags: InodeFlags::empty(),
             },
             fs: inode.fs.clone(),
@@ -1138,13 +1149,11 @@ impl IndexNode for LockedTmpfsInode {
 
         nod.0.lock().self_ref = Arc::downgrade(&nod);
 
+        // 对于 FIFO，需要创建实际的 pipe inode
         if mode.contains(InodeMode::S_IFIFO) {
-            nod.0.lock().metadata.file_type = FileType::Pipe;
             let pipe_inode = LockedPipeInode::new();
             pipe_inode.set_fifo();
             nod.0.lock().special_node = Some(SpecialNodeData::Pipe(pipe_inode));
-        } else if mode.contains(InodeMode::S_IFBLK) || mode.contains(InodeMode::S_IFCHR) {
-            return Err(SystemError::ENOSYS);
         }
 
         inode.children.insert(filename, nod.clone());

@@ -1,16 +1,16 @@
 use crate::{
     arch::mm::LockedFrameAllocator,
-    filesystem::vfs::InodeMode,
     libs::align::page_align_up,
     mm::{
         allocator::page_frame::{FrameAllocator, PageFrameCount, PhysPageFrame},
         page::{page_manager_lock, PageFlags, PageType},
         PhysAddr,
     },
-    process::{ProcessManager, RawPid},
+    process::{cred::Cred, ProcessManager, RawPid},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
     time::PosixTimeSpec,
 };
+use alloc::sync::Arc;
 use core::fmt;
 use hashbrown::HashMap;
 use ida::IdAllocator;
@@ -25,6 +25,7 @@ int_like!(ShmKey, usize);
 
 bitflags! {
     pub struct ShmFlags:u32{
+        const PERM_MASK = 0o777;
         const SHM_RDONLY = 0o10000;
         const SHM_RND = 0o20000;
         const SHM_REMAP = 0o40000;
@@ -42,7 +43,7 @@ bitflags! {
 /// 管理共享内存段信息的操作码
 #[derive(Eq, Clone, Copy)]
 pub enum ShmCtlCmd {
-    /// 删除共享内存段
+    /// 标记删除共享内存段（只有在映射计数为0时才真正删除）
     IpcRmid = 0,
     /// 设置KernIpcPerm选项
     IpcSet = 1,
@@ -154,11 +155,19 @@ impl ShmManager {
             return Err(SystemError::EINVAL);
         }
 
-        let id = self.id_allocator.alloc().expect("No more id to allocate.");
+        let id = self.id_allocator.alloc().ok_or(SystemError::ENOSPC)?;
+        // TODO: 实现 IPC 序列号机制以防止 ID 重用攻击
+        // 参考 Linux ipc_idr_alloc():
+        // - 跟踪 last_idx，检测 idx 回绕时递增 seq
+        // - 构建最终 ID: (seq << SEQ_SHIFT) | idx
+        // - 在获取对象时验证 seq (ipc_checkid)
+        //
+        // 具体实现方式见 (https://github.com/DragonOS-Community/DragonOS/issues/1678)
         let shm_id = ShmId::new(id);
 
         // 分配共享内存页面
-        let page_count = PageFrameCount::from_bytes(page_align_up(size)).unwrap();
+        let page_count =
+            PageFrameCount::from_bytes(page_align_up(size)).ok_or(SystemError::EINVAL)?;
         // 创建共享内存page，并添加到PAGE_MANAGER中
         let mut page_manager_guard = page_manager_lock();
         let (paddr, _page) = page_manager_guard.create_pages(
@@ -168,22 +177,15 @@ impl ShmManager {
             page_count,
         )?;
 
-        // 创建共享内存信息结构体
-        let kern_ipc_perm = KernIpcPerm {
-            id: shm_id,
-            key,
-            uid: 0,
-            gid: 0,
-            _cuid: 0,
-            _cgid: 0,
-            mode: shmflg & ShmFlags::from_bits_truncate(InodeMode::S_IRWXUGO.bits()),
-            _seq: 0,
-        };
+        // 创建共享内存段信息结构体
+        let current_cred = ProcessManager::current_pcb().cred();
+        let kern_ipc_perm =
+            KernIpcPerm::new_with_cred(shm_id, key, current_cred, shmflg & ShmFlags::PERM_MASK);
         let shm_kernel = KernelShm::new(kern_ipc_perm, paddr, size);
 
-        // 将key、id及其对应KernelShm添加到表中
-        self.id2shm.insert(shm_id, shm_kernel);
+        // 更新共享内存管理器相关映射表
         self.key2id.insert(key, shm_id);
+        self.id2shm.insert(shm_id, shm_kernel);
 
         return Ok(shm_id.data());
     }
@@ -220,7 +222,7 @@ impl ShmManager {
 
     pub fn shm_info(&self, user_buf: *const u8, from_user: bool) -> Result<usize, SystemError> {
         // 已使用id数量
-        let used_ids = self.id2shm.len().to_i32().unwrap();
+        let used_ids = self.id2shm.len().to_i32().ok_or(SystemError::EOVERFLOW)?;
         // 共享内存总和
         let shm_tot = self.id2shm.iter().fold(0, |acc, (_, kernel_shm)| {
             acc + PageFrameCount::from_bytes(page_align_up(kernel_shm.shm_size))
@@ -247,16 +249,29 @@ impl ShmManager {
         from_user: bool,
     ) -> Result<usize, SystemError> {
         let kernel_shm = self.id2shm.get(&id).ok_or(SystemError::EINVAL)?;
-        let key = kernel_shm.kern_ipc_perm.key.data().to_i32().unwrap();
-        let mode = kernel_shm.kern_ipc_perm.mode.bits();
+        let kern_ipc_perm = &kernel_shm.kern_ipc_perm;
+        let _key = kern_ipc_perm
+            .key
+            .data()
+            .to_i32()
+            .ok_or(SystemError::EOVERFLOW)?;
+        let _mode = kern_ipc_perm.mode.bits();
 
-        let shm_perm = PosixIpcPerm::new(key, 0, 0, 0, 0, mode);
+        let shm_perm = PosixIpcPerm::try_from(kern_ipc_perm)?;
         let shm_segsz = kernel_shm.shm_size;
-        let shm_atime = kernel_shm.shm_atim.total_nanos();
-        let shm_dtime = kernel_shm.shm_dtim.total_nanos();
-        let shm_ctime = kernel_shm.shm_ctim.total_nanos();
-        let shm_cpid = kernel_shm.shm_cprid.data().to_u32().unwrap();
-        let shm_lpid = kernel_shm.shm_lprid.data().to_u32().unwrap();
+        let shm_atime = kernel_shm.shm_atim.tv_sec;
+        let shm_dtime = kernel_shm.shm_dtim.tv_sec;
+        let shm_ctime = kernel_shm.shm_ctim.tv_sec;
+        let shm_cpid = kernel_shm
+            .shm_cprid
+            .data()
+            .to_u32()
+            .ok_or(SystemError::EOVERFLOW)?;
+        let shm_lpid = kernel_shm
+            .shm_lprid
+            .data()
+            .to_u32()
+            .ok_or(SystemError::EOVERFLOW)?;
         let shm_map_count = kernel_shm.map_count();
         let shm_id_ds = PosixShmIdDs {
             shm_perm,
@@ -310,7 +325,8 @@ impl ShmManager {
         kernel_shm.set_mode(ShmFlags::SHM_DEST, true);
 
         let mut cur_phys = PhysPageFrame::new(kernel_shm.shm_start_paddr);
-        let count = PageFrameCount::from_bytes(page_align_up(kernel_shm.shm_size)).unwrap();
+        let count = PageFrameCount::from_bytes(page_align_up(kernel_shm.shm_size))
+            .ok_or(SystemError::EINVAL)?;
         let key = kernel_shm.kern_ipc_perm.key;
         let id = kernel_shm.kern_ipc_perm.id;
         let map_count = kernel_shm.map_count();
@@ -320,7 +336,8 @@ impl ShmManager {
             // 设置共享内存物理页当映射计数等于0时可被回收
             // TODO 后续需要加入到lru中
             for _ in 0..count.data() {
-                let page = page_manager_guard.get_unwrap(&cur_phys.phys_address());
+                let paddr = cur_phys.phys_address();
+                let page = page_manager_guard.get(&paddr).ok_or(SystemError::EFAULT)?;
                 page.write().remove_flags(PageFlags::PG_UNEVICTABLE);
 
                 cur_phys = cur_phys.next();
@@ -362,26 +379,26 @@ impl ShmManager {
         return Ok(0);
     }
 }
-/// 共享内存信息
+/// 共享内存段信息
 #[derive(Debug)]
 pub struct KernelShm {
     /// 权限信息
     kern_ipc_perm: KernIpcPerm,
-    /// 共享内存起始物理地址
+    /// 共享内存段起始物理地址
     shm_start_paddr: PhysAddr,
-    /// 共享内存大小(bytes)，注意是用户指定的大小（未经过页面对齐）
+    /// 共享内存段大小(bytes)，注意是用户指定的大小（未经过页面对齐）
     shm_size: usize,
     /// 映射计数
     map_count: usize,
-    /// 最后一次连接的时间
+    /// 最后一次 attach 的时间
     shm_atim: PosixTimeSpec,
-    /// 最后一次断开连接的时间
+    /// 最后一次 detach 的时间
     shm_dtim: PosixTimeSpec,
     /// 最后一次更改信息的时间
     shm_ctim: PosixTimeSpec,
     /// 创建者进程id
     shm_cprid: RawPid,
-    /// 最后操作者进程id
+    /// 最后操作者进程id (这里的操作者是指最后一次 attach 或 detach 操作的进程，创建共享内存段的进程不算操作者)
     shm_lprid: RawPid,
 }
 
@@ -397,7 +414,7 @@ impl KernelShm {
             shm_dtim: PosixTimeSpec::new(0, 0),
             shm_ctim: PosixTimeSpec::now(),
             shm_cprid,
-            shm_lprid: shm_cprid,
+            shm_lprid: RawPid::new(0), // 初始值为0，表示尚未有进程对这个共享内存段执行 attach 或 detach 操作，对齐 Linux 行为
         }
     }
 
@@ -409,18 +426,18 @@ impl KernelShm {
         self.shm_size
     }
 
-    /// 更新最后连接时间
+    /// 更新最后 attach 时间
     pub fn update_atim(&mut self) {
-        // 更新最后一次连接时间
+        // 更新最后一次 attach 时间
         self.shm_atim = PosixTimeSpec::now();
 
         // 更新最后操作当前共享内存的进程ID
         self.shm_lprid = ProcessManager::current_pid();
     }
 
-    /// 更新最后断开连接时间
+    /// 更新最后 detach 时间
     pub fn update_dtim(&mut self) {
-        // 更新最后一次断开连接时间
+        // 更新最后一次 detach 时间
         self.shm_dtim = PosixTimeSpec::now();
 
         // 更新最后操作当前共享内存的进程ID
@@ -441,7 +458,9 @@ impl KernelShm {
     pub fn copy_from(&mut self, shm_id_ds: PosixShmIdDs) {
         self.kern_ipc_perm.uid = shm_id_ds.uid() as usize;
         self.kern_ipc_perm.gid = shm_id_ds.gid() as usize;
-        self.kern_ipc_perm.mode = ShmFlags::from_bits_truncate(shm_id_ds.mode());
+        let perm_bits = ShmFlags::from_bits_truncate(shm_id_ds.mode()) & ShmFlags::PERM_MASK;
+        self.kern_ipc_perm.mode.remove(ShmFlags::PERM_MASK);
+        self.kern_ipc_perm.mode.insert(perm_bits);
         self.update_ctim();
     }
 
@@ -469,24 +488,41 @@ impl KernelShm {
     }
 }
 
-/// 共享内存权限信息
+/// 共享内存段权限信息
 #[derive(Debug)]
 pub struct KernIpcPerm {
-    /// 共享内存id
+    /// 共享内存段id
     id: ShmId,
-    /// 共享内存键值，由创建共享内存用户指定
+    /// 共享内存段键值，由创建共享内存用户指定
     key: ShmKey,
-    /// 共享内存拥有者用户id
+    /// 共享内存段拥有者用户id
     uid: usize,
-    /// 共享内存拥有者所在组id
+    /// 共享内存段拥有者所在组id
     gid: usize,
-    /// 共享内存创建者用户id
-    _cuid: usize,
-    /// 共享内存创建者所在组id
-    _cgid: usize,
-    /// 共享内存区权限模式
+    /// 共享内存段创建者用户id
+    cuid: usize,
+    /// 共享内存段创建者所在组id
+    cgid: usize,
+    /// 共享内存段权限模式
     mode: ShmFlags,
-    _seq: usize,
+    /// 序列号：用于在 ShmId 被重用的时候进行区分
+    /// TODO: 目前尚未实现该机制，默认为0，具体实现方式见 (https://github.com/DragonOS-Community/DragonOS/issues/1678)
+    seq: usize,
+}
+
+impl KernIpcPerm {
+    pub fn new_with_cred(id: ShmId, key: ShmKey, cred: Arc<Cred>, mode: ShmFlags) -> Self {
+        KernIpcPerm {
+            id,
+            key,
+            uid: cred.uid.data(),
+            gid: cred.gid.data(),
+            cuid: cred.uid.data(),
+            cgid: cred.gid.data(),
+            mode,
+            seq: 0,
+        }
+    }
 }
 
 /// 共享内存元信息，符合POSIX标准
@@ -580,11 +616,11 @@ impl PosixShmInfo {
 pub struct PosixShmIdDs {
     /// 共享内存段权限
     shm_perm: PosixIpcPerm,
-    /// 共享内存大小(bytes)
+    /// 共享内存段大小(bytes)
     shm_segsz: usize,
-    /// 最后一次连接的时间
+    /// 最后一次 attach 的时间
     shm_atime: i64,
-    /// 最后一次断开连接的时间
+    /// 最后一次 detach 的时间
     shm_dtime: i64,
     /// 最后一次更改信息的时间
     shm_ctime: i64,
@@ -635,19 +671,27 @@ pub struct PosixIpcPerm {
     _unused2: usize,
 }
 
-impl PosixIpcPerm {
-    pub fn new(key: i32, uid: u32, gid: u32, cuid: u32, cgid: u32, mode: u32) -> Self {
-        PosixIpcPerm {
+impl TryFrom<&KernIpcPerm> for PosixIpcPerm {
+    type Error = SystemError;
+
+    fn try_from(kern_ipc_perm: &KernIpcPerm) -> Result<Self, Self::Error> {
+        let key = kern_ipc_perm
+            .key
+            .data()
+            .to_i32()
+            .ok_or(SystemError::EOVERFLOW)?;
+
+        Ok(PosixIpcPerm {
             key,
-            uid,
-            gid,
-            cuid,
-            cgid,
-            mode,
-            seq: 0,
+            uid: kern_ipc_perm.uid as u32,
+            gid: kern_ipc_perm.gid as u32,
+            cuid: kern_ipc_perm.cuid as u32,
+            cgid: kern_ipc_perm.cgid as u32,
+            mode: kern_ipc_perm.mode.bits(),
+            seq: kern_ipc_perm.seq as i32,
             _pad1: 0,
             _unused1: 0,
             _unused2: 0,
-        }
+        })
     }
 }

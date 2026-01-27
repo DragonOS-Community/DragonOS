@@ -15,6 +15,7 @@ mod cpuinfo;
 pub mod klog;
 pub mod kmsg;
 mod kmsg_file;
+mod loadavg;
 mod meminfo;
 mod mounts;
 mod net;

@@ -165,11 +165,9 @@ impl SignalFdInode {
 
     fn dequeue_one(&self) -> Option<Signal> {
         let pcb = ProcessManager::current_pcb();
-        let mut siginfo = pcb.sig_info_mut();
         let mask = self.state.lock().mask;
         let ignore_mask = mask.complement();
-        let (sig, _info) = siginfo.dequeue_signal(&ignore_mask, &pcb);
-        drop(siginfo);
+        let (sig, _info) = pcb.dequeue_pending_signal(&ignore_mask);
         if sig == Signal::INVALID {
             None
         } else {

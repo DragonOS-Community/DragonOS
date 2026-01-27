@@ -120,10 +120,7 @@ fn may_linkat(old_inode: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
 }
 
 /// 判断硬链接源是否"安全"
-fn safe_hardlink_source(
-    metadata: &Metadata,
-    cred: &Arc<Cred>,
-) -> Result<bool, SystemError> {
+fn safe_hardlink_source(metadata: &Metadata, cred: &Arc<Cred>) -> Result<bool, SystemError> {
     let mode = metadata.mode;
     let file_type = metadata.file_type;
 

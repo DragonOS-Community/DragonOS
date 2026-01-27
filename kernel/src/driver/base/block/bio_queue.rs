@@ -60,6 +60,6 @@ impl BioQueue {
     /// Worker等待新请求（正确标记为 IO 等待）
     pub fn wait_for_work(&self) -> Result<(), system_error::SystemError> {
         self.wait_queue
-            .wait_event_io_interruptible(|| !self.is_empty(), None::<fn()>)
+            .wait_event_interruptible(|| !self.is_empty(), None::<fn()>)
     }
 }

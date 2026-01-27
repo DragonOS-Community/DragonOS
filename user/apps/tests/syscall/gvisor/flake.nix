@@ -9,7 +9,13 @@
     };
   };
 
-  outputs = { self, nixpkgs, fenix, flake-utils }:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      fenix,
+      flake-utils,
+    }:
     let
       pkgs = import nixpkgs { inherit system; };
       installDir = "share/gvisor-tests";

@@ -5,11 +5,11 @@
   kernel,
   testOpt,
   debug ? false,
-  vmstateDir ? null
+  vmstateDir ? null,
 }:
 
 let
-  qemuFirmware = pkgs.callPackage ./qemu-firmware.nix {};
+  qemuFirmware = pkgs.callPackage ./qemu-firmware.nix { };
 
   baseConfig = {
     nographic = true;
@@ -26,45 +26,80 @@ let
 
   # 3. 参数生成器 (Nix List -> Nix List)
   # 注意：网络配置中的端口现在使用 $HOST_PORT 变量，在运行时动态替换
-  mkQemuArgs = { arch, isNographic }:
+  mkQemuArgs =
+    { arch, isNographic }:
     let
       baseArgs = [
-        "-m" baseConfig.memory
-        "-smp" "${baseConfig.cores},cores=${baseConfig.cores},threads=1,sockets=1"
-        "-object" "memory-backend-file,size=${baseConfig.memory},id=${baseConfig.shmId},mem-path=/dev/shm/${baseConfig.shmId},share=on"
+        "-m"
+        baseConfig.memory
+        "-smp"
+        "${baseConfig.cores},cores=${baseConfig.cores},threads=1,sockets=1"
+        "-object"
+        "memory-backend-file,size=${baseConfig.memory},id=${baseConfig.shmId},mem-path=/dev/shm/${baseConfig.shmId},share=on"
         "-usb"
-        "-device" "qemu-xhci,id=xhci,p2=8,p3=4"
-        "-D" "qemu.log"
+        "-device"
+        "qemu-xhci,id=xhci,p2=8,p3=4"
+        "-D"
+        "qemu.log"
 
         # Boot Order
-        "-boot" "order=d"
-
-        "-rtc" "clock=host,base=localtime"
+        "-boot"
+        "order=d"
+        "-rtc"
+        "clock=host,base=localtime"
         # Trace events
-        "-d" "cpu_reset,guest_errors,trace:virtio*,trace:e1000e_rx*,trace:e1000e_tx*,trace:e1000e_irq*"
-        "-trace" "fw_cfg*"
-      ] ++ lib.optionals debug [
+        "-d"
+        "cpu_reset,guest_errors,trace:virtio*,trace:e1000e_rx*,trace:e1000e_tx*,trace:e1000e_irq*"
+        "-trace"
+        "fw_cfg*"
+      ]
+      ++ lib.optionals debug [
         # GDB Stub
-        "-s" "-S"
+        "-s"
+        "-S"
       ];
-      nographicArgs = lib.optionals isNographic ([
-        "--nographic"
-        "-serial" "chardev:mux"
-        "-monitor" "chardev:mux"
-        "-chardev" "stdio,id=mux,mux=on,signal=off,logfile=serial_opt.txt"
-      ] ++ (if arch == "riscv64" then [
-        "-device" "virtio-serial-device" "-device" "virtconsole,chardev=mux"
-      ] else [
-        "-device" "virtio-serial" "-device" "virtconsole,chardev=mux"
-      ]));
+      nographicArgs = lib.optionals isNographic (
+        [
+          "--nographic"
+          "-serial"
+          "chardev:mux"
+          "-monitor"
+          "chardev:mux"
+          "-chardev"
+          "stdio,id=mux,mux=on,signal=off,logfile=serial_opt.txt"
+        ]
+        ++ (
+          if arch == "riscv64" then
+            [
+              "-device"
+              "virtio-serial-device"
+              "-device"
+              "virtconsole,chardev=mux"
+            ]
+          else
+            [
+              "-device"
+              "virtio-serial"
+              "-device"
+              "virtconsole,chardev=mux"
+            ]
+        )
+      );
       kernelCmdlinePart = if isNographic then "console=/dev/hvc0" else "";
-    in {
+    in
+    {
       flags = baseArgs ++ nographicArgs;
       cmdlineExtra = kernelCmdlinePart;
     };
 
   # 4. 运行脚本生成器
-  mkRunScript = { name, arch, isNographic, qemuBin }:
+  mkRunScript =
+    {
+      name,
+      arch,
+      isNographic,
+      qemuBin,
+    }:
     let
       qemuConfig = mkQemuArgs { inherit arch isNographic; };
       qemuFlagsStr = lib.escapeShellArgs qemuConfig.flags;
@@ -72,41 +107,63 @@ let
       initProgram = if arch == "riscv64" then "/bin/riscv_rust_init" else "/bin/busybox init";
 
       # Define static parts of arguments using Nix lists
-      commonArchArgs = if arch == "x86_64" then [
-        "-machine" "q35,memory-backend=${baseConfig.shmId}"
-        "-cpu" "IvyBridge,apic,x2apic,+fpu,check,+vmx,"
-      ] else [
-        "-cpu" "sifive-u54"
-      ];
+      commonArchArgs =
+        if arch == "x86_64" then
+          [
+            "-machine"
+            "q35,memory-backend=${baseConfig.shmId}"
+            "-cpu"
+            "IvyBridge,apic,x2apic,+fpu,check,+vmx,"
+          ]
+        else
+          [
+            "-cpu"
+            "sifive-u54"
+          ];
 
       kernelPath = if arch == "x86_64" then kernel else "${riscv-uboot}/u-boot.bin";
 
-      diskArgs = if arch == "x86_64" then [
-        "-device" "virtio-blk-pci,drive=disk"
-        "-device" "pci-bridge,chassis_nr=1,id=pci.1"
-        "-device" "pcie-root-port"
-        "-drive" "id=disk,file=${diskPath},if=none"
-      ] else [
-        "-device" "virtio-blk-device,drive=disk"
-        "-drive" "id=disk,file=${diskPath},if=none"
-      ];
+      diskArgs =
+        if arch == "x86_64" then
+          [
+            "-device"
+            "virtio-blk-pci,drive=disk"
+            "-device"
+            "pci-bridge,chassis_nr=1,id=pci.1"
+            "-device"
+            "pcie-root-port"
+            "-drive"
+            "id=disk,file=${diskPath},if=none"
+          ]
+        else
+          [
+            "-device"
+            "virtio-blk-device,drive=disk"
+            "-drive"
+            "id=disk,file=${diskPath},if=none"
+          ];
 
       # Generate bash code for dynamic parts
-      archSpecificBash = if arch == "x86_64" then ''
-        if [ "$ACCEL" == "kvm" ]; then
-            ARCH_FLAGS+=( "-machine" "accel=kvm" "-enable-kvm" )
+      archSpecificBash =
+        if arch == "x86_64" then
+          ''
+            if [ "$ACCEL" == "kvm" ]; then
+                ARCH_FLAGS+=( "-machine" "accel=kvm" "-enable-kvm" )
+            else
+                ARCH_FLAGS+=( "-machine" "accel=tcg" )
+            fi
+          ''
         else
-            ARCH_FLAGS+=( "-machine" "accel=tcg" )
-        fi
-      '' else ''
-        ARCH_FLAGS+=( "-machine" "virt,accel=$ACCEL,memory-backend=${baseConfig.shmId}" )
-      '';
+          ''
+            ARCH_FLAGS+=( "-machine" "virt,accel=$ACCEL,memory-backend=${baseConfig.shmId}" )
+          '';
 
       # VM 状态目录配置
       vmstateDirStr = if vmstateDir != null then vmstateDir else "";
       hasVmstateDir = vmstateDir != null;
 
-    in pkgs.writeScriptBin name ''
+    in
+    pkgs.writeScriptBin name ''
       #!${pkgs.runtimeShell}
 
       if [ ! -d "bin" ]; then echo "Error: Please run from project root (bin/ missing)."; exit 1; fi
@@ -131,11 +188,16 @@ let
       ACCEL="tcg"
       if [ -e /dev/kvm ] && [ -w /dev/kvm ]; then ACCEL="kvm"; fi
 
-      ${if hasVmstateDir then ''
-      VMSTATE_DIR="${vmstateDirStr}"
-      mkdir -p "$VMSTATE_DIR"
-      echo "$HOST_PORT" > "$VMSTATE_DIR/port"
-      '' else ""}
+      ${
+        if hasVmstateDir then
+          ''
+            VMSTATE_DIR="${vmstateDirStr}"
+            mkdir -p "$VMSTATE_DIR"
+            echo "$HOST_PORT" > "$VMSTATE_DIR/port"
+          ''
+        else
+          ""
+      }
 
       cleanup() {
         sudo rm -f /dev/shm/${baseConfig.shmId}
@@ -174,20 +236,29 @@ let
 
       # --- 3. 执行 ---
       ${qemuBin} --version
-      
+
       # 使用 exec 方式启动 QEMU，保持交互能力并记录 PID
       # 参考 tools/run-qemu.sh 的 launch_qemu 函数实现
-      ${if hasVmstateDir then ''
-      sudo bash -c 'pidfile="$1"; shift; echo $$ > "$pidfile"; exec "$@"' bash "$VMSTATE_DIR/pid" ${qemuBin} ${qemuFlagsStr} "''${NET_ARGS[@]}" -L ${qemuFirmware} "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "$@"
-      '' else ''
-      sudo ${qemuBin} ${qemuFlagsStr} "''${NET_ARGS[@]}" -L ${qemuFirmware} "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "$@"
-      ''}
+      ${
+        if hasVmstateDir then
+          ''
+            sudo bash -c 'pidfile="$1"; shift; echo $$ > "$pidfile"; exec "$@"' bash "$VMSTATE_DIR/pid" ${qemuBin} ${qemuFlagsStr} "''${NET_ARGS[@]}" -L ${qemuFirmware} "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "$@"
+          ''
+        else
+          ''
+            sudo ${qemuBin} ${qemuFlagsStr} "''${NET_ARGS[@]}" -L ${qemuFirmware} "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "$@"
+          ''
+      }
     '';
 
-  script = lib.genAttrs [ "x86_64" "riscv64" ] (arch: mkRunScript {
-    name = "dragonos-run";
-    inherit arch;
-    isNographic = if arch == "riscv64" then true else baseConfig.nographic;
-    qemuBin = "${pkgs.qemu_kvm}/bin/qemu-system-${arch}";
-  });
-in script
+  script = lib.genAttrs [ "x86_64" "riscv64" ] (
+    arch:
+    mkRunScript {
+      name = "dragonos-run";
+      inherit arch;
+      isNographic = if arch == "riscv64" then true else baseConfig.nographic;
+      qemuBin = "${pkgs.qemu_kvm}/bin/qemu-system-${arch}";
+    }
+  );
+in
+script

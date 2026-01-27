@@ -230,7 +230,7 @@ let
         ${loopWrite}
       fi
 
-      mv "$TEMP_IMG" "${diskPath}"
+      mv -f "$TEMP_IMG" "${diskPath}"
 
       IMG_SIZE=$(du -h "${diskPath}" | cut -f1)
       echo "  ✓ disk image created ($IMG_SIZE)"

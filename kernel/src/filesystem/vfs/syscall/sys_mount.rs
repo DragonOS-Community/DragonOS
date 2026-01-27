@@ -232,8 +232,8 @@ fn path_mount(
     if flags.intersection(MountFlags::REMOUNT | MountFlags::BIND)
         == (MountFlags::REMOUNT | MountFlags::BIND)
     {
-        log::warn!("todo: reconfigure mnt");
-        return Err(SystemError::ENOSYS);
+        // MS_REMOUNT | MS_BIND: 修改已存在挂载的标志，不创建新挂载
+        return do_reconfigure_mnt(target_inode, mnt_flags);
     }
 
     if flags.contains(MountFlags::REMOUNT) {
@@ -256,6 +256,62 @@ fn path_mount(
 
     // 创建新的挂载
     return do_new_mount(source, target_inode, filesystemtype, data, mnt_flags).map(|_| ());
+}
+
+/// 处理 MS_REMOUNT | MS_BIND 情况
+///
+/// 这用于修改已存在挂载的挂载标志（如只读状态），而不改变挂载本身。
+/// 参考 Linux 的 do_reconfigure_mnt 实现。
+fn do_reconfigure_mnt(
+    target_inode: Arc<dyn IndexNode>,
+    new_flags: MountFlags,
+) -> Result<(), SystemError> {
+    use crate::filesystem::vfs::mount::MountFSInode;
+
+    log::debug!("[do_reconfigure_mnt] new_flags={:?}", new_flags);
+
+    // 获取目标 inode 对应的 MountFS
+    let mount_fs = if let Some(mountfs_inode) = target_inode.as_any_ref().downcast_ref::<MountFSInode>() {
+        mountfs_inode.mount_fs().clone()
+    } else {
+        // 如果不是 MountFSInode，尝试通过文件系统查找
+        let mnt_ns = ProcessManager::current_mntns();
+        let inode_fs = target_inode.fs();
+
+        // 尝试通过文件系统查找对应的 MountFS
+        if let Some(mount_fs) = mnt_ns.mount_list().find_mount_by_fs(&inode_fs) {
+            mount_fs
+        } else {
+            // 作为最后的尝试，通过文件系统名称匹配
+            let mount_list = mnt_ns.mount_list().clone_inner();
+            let mut found = None;
+            for (_path, mnt_fs) in mount_list.iter() {
+                if mnt_fs.fs_type() == inode_fs.name() {
+                    found = Some(mnt_fs.clone());
+                    break;
+                }
+            }
+            found.ok_or(SystemError::EINVAL)?
+        }
+    };
+
+    // 修改挂载标志
+    // 注意：我们保留一些不应该被修改的标志（如 propagation 相关的）
+    let current_flags = mount_fs.mount_flags();
+
+    // 保留 propagation 标志（SHARED, PRIVATE, SLAVE, UNBINDABLE）
+    let propagation_flags = MountFlags::SHARED | MountFlags::PRIVATE | MountFlags::SLAVE | MountFlags::UNBINDABLE;
+    let current_prop = current_flags & propagation_flags;
+
+    // 合并新的标志和保留的 propagation 标志
+    let merged_flags = new_flags | current_prop;
+
+    log::debug!("[do_reconfigure_mnt] current_flags={:?}, new_flags={:?}, merged_flags={:?}",
+                current_flags, new_flags, merged_flags);
+
+    mount_fs.set_mount_flags(merged_flags);
+
+    Ok(())
 }
 
 fn do_new_mount(

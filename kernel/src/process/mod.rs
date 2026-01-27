@@ -1024,6 +1024,10 @@ pub struct ProcessControlBlock {
     /// prctl(PR_SET/GET_NO_NEW_PRIVS) 状态：线程级（task）语义。
     no_new_privs: AtomicBool,
 
+    /// prctl(PR_SET/GET_KEEPCAPS) 状态：线程级（task）语义。
+    /// 当为 true 时，进程改变 UID/GID 后会保留 capabilities。
+    keepcaps: AtomicBool,
+
     /// prctl(PR_SET/GET_DUMPABLE) 状态。
     /// Linux: 0=SUID_DUMP_DISABLE, 1=SUID_DUMP_USER；2(SUID_DUMP_ROOT) 不允许通过 PR_SET_DUMPABLE 设置。
     dumpable: AtomicU8,
@@ -1181,6 +1185,7 @@ impl ProcessControlBlock {
                 pdeath_signal: AtomicSignal::new(Signal::INVALID),
 
                 no_new_privs: AtomicBool::new(false),
+                keepcaps: AtomicBool::new(false),
                 // 默认设置为 SUID_DUMP_USER(=1)，满足 gVisor 的 SetGetDumpability 预期。
                 dumpable: AtomicU8::new(1),
                 parent_pcb: RwLock::new(ppcb.clone()),
@@ -1429,6 +1434,16 @@ impl ProcessControlBlock {
         if value {
             self.no_new_privs.store(true, Ordering::SeqCst);
         }
+    }
+
+    #[inline(always)]
+    pub fn keepcaps(&self) -> bool {
+        self.keepcaps.load(Ordering::SeqCst)
+    }
+
+    #[inline(always)]
+    pub fn set_keepcaps(&self, value: bool) {
+        self.keepcaps.store(value, Ordering::SeqCst);
     }
 
     #[inline(always)]

@@ -103,12 +103,67 @@ pub fn do_umount2(
         base
     };
 
+    log::info!("[umount2] target='{}', path='{}'", target, path);
+
+    // 特殊处理：如果是卸载当前目录 "."
+    // 需要检查是否是 pivot_root 后的情况，此时需要卸载旧的根挂载点
+    if target == "." {
+        let mnt_ns = ProcessManager::current_mntns();
+
+        // 首先检查是否有旧的根挂载点（pivot_root 保存的）
+        if let Some(old_root_mntfs) = mnt_ns.old_root_mntfs() {
+            log::info!("[umount2] found old_root_mntfs={:?}", old_root_mntfs.mount_id());
+
+            // 直接调用 MountFS::umount()，它会处理所有必要的清理工作
+            // 包括从挂载列表中移除
+            log::info!("[umount2] trying to umount old_root_mntfs directly");
+            old_root_mntfs.umount()?;
+
+            // 清除旧的根挂载点记录
+            ProcessManager::current_mntns().clear_old_root_mntfs();
+            return Ok(old_root_mntfs);
+        }
+
+        // 如果没有旧的根挂载点，尝试常规方法
+        log::info!("[umount2] no old_root_mntfs, trying normal umount");
+        let cwd = work;
+        log::info!("[umount2] cwd inode_id={:?}", cwd.metadata()?.inode_id);
+
+        // 尝试通过 inode_id 在挂载点列表中查找
+        if let Some(mount_path) = mnt_ns.mount_list().get_mount_path_by_ino(cwd.metadata()?.inode_id) {
+            log::info!("[umount2] found mount path by inode: {:?}", mount_path);
+            let result = mnt_ns.remove_mount(mount_path.as_str());
+            if let Some(fs) = result {
+                fs.umount()?;
+                return Ok(fs);
+            }
+        }
+
+        // 如果通过 inode_id 找不到，尝试通过文件系统查找
+        let cwd_fs = cwd.fs();
+        if let Some(mount_fs) = mnt_ns.mount_list().find_mount_by_fs(&cwd_fs) {
+            log::info!("[umount2] found mount_fs by fs: {:?}", mount_fs.mount_id());
+            // 通过 mount_fs 反向查找挂载路径
+            if let Some(mount_path) = mnt_ns.mount_list().get_mount_path_by_mountfs(&mount_fs) {
+                log::info!("[umount2] found mount path by mount_fs: {:?}", mount_path);
+                let result = mnt_ns.remove_mount(mount_path.as_str());
+                if let Some(fs) = result {
+                    fs.umount()?;
+                    return Ok(fs);
+                }
+            }
+        }
+
+        log::error!("[umount2] cannot find mount for current directory");
+    }
+
     let result = ProcessManager::current_mntns().remove_mount(&path);
     if let Some(fs) = result {
         // Todo: 占用检测
         fs.umount()?;
         return Ok(fs);
     }
+    log::error!("[umount2] remove_mount failed for path='{}'", path);
     return Err(SystemError::EINVAL);
 }
 

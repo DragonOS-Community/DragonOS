@@ -2,8 +2,10 @@ use alloc::string::ToString;
 use core::{cmp, ffi::c_int, mem};
 use num_traits::FromPrimitive;
 
-use alloc::{borrow::ToOwned, string::String, vec::Vec};
+use alloc::{borrow::ToOwned, string::String, sync::{Arc, Weak}, vec::Vec};
 use system_error::SystemError;
+
+use crate::process::cred::Cred;
 
 use crate::{
     arch::{interrupt::TrapFrame, ipc::signal::Signal, syscall::nr::SYS_PRCTL},
@@ -19,12 +21,16 @@ const TASK_COMM_LEN: usize = 16;
 #[derive(Debug, Clone, Copy, PartialEq, FromPrimitive)]
 #[repr(usize)]
 enum PrctlOption {
-    GetDumpable = 3,
-    SetDumpable = 4,
     SetPDeathSig = 1,
     GetPDeathSig = 2,
+    GetDumpable = 3,
+    SetDumpable = 4,
+    SetKeepCaps = 8,
+    GetKeepCaps = 9,
     SetName = 15,
     GetName = 16,
+    CapBsetRead = 23,
+    CapBsetDrop = 24,
 
     SetMm = 35,
 
@@ -78,6 +84,20 @@ impl Syscall for SysPrctl {
                     }
                     _ => Err(SystemError::EINVAL),
                 }
+            }
+            PrctlOption::SetKeepCaps => {
+                // Linux: arg2 非 0 表示置位，0 表示清除。
+                let v = arg2 as isize;
+                let enable = v != 0;
+                current.set_keepcaps(enable);
+                Ok(0)
+            }
+            PrctlOption::GetKeepCaps => {
+                // Linux: 返回 1 表示置位，0 表示未置位。
+                let value: c_int = if current.keepcaps() { 1 } else { 0 };
+                // 注意：根据 prctl 的语义，返回值应该直接返回，而不是写入用户空间。
+                // PR_GET_KEEPCAPS 的返回值就是当前状态，不需要额外的参数。
+                Ok(value as usize)
             }
             PrctlOption::SetPDeathSig => {
                 let signal = parse_pdeathsig(arg2)?;
@@ -148,6 +168,52 @@ impl Syscall for SysPrctl {
                 let is_subreaper = thread_group_leader.sig_info_irqsave().is_child_subreaper();
                 let value: c_int = if is_subreaper { 1 } else { 0 };
                 writer.copy_one_to_user(&value, 0)?;
+                Ok(0)
+            }
+
+            PrctlOption::CapBsetRead => {
+                // PR_CAPBSET_READ: 检查某个 capability 是否在 bounding set 中
+                // arg2 是 capability 的编号
+                use crate::process::cred::CAPFlags;
+                let cap_bit = 1usize << arg2;
+                let cap_flag = CAPFlags::from_bits(cap_bit as u64).unwrap_or(CAPFlags::CAP_EMPTY_SET);
+                let cred = current.cred();
+                let has_cap = cred.cap_bset.contains(cap_flag);
+                Ok(if has_cap { 1 } else { 0 })
+            }
+            PrctlOption::CapBsetDrop => {
+                // PR_CAPBSET_DROP: 从 bounding set 中删除某个 capability
+                // arg2 是 capability 的编号
+                use crate::process::cred::CAPFlags;
+                let cap_bit = 1usize << arg2;
+                let cap_flag = CAPFlags::from_bits(cap_bit as u64).unwrap_or(CAPFlags::CAP_EMPTY_SET);
+
+                // 获取当前 cred，克隆并修改 cap_bset，然后设置回去
+                let old_cred = current.cred();
+                let new_bset = old_cred.cap_bset & !cap_flag;
+
+                // 创建新的 cred
+                let new_cred = Arc::new(Cred {
+                    self_ref: Weak::new(),
+                    uid: old_cred.uid,
+                    gid: old_cred.gid,
+                    suid: old_cred.suid,
+                    sgid: old_cred.sgid,
+                    euid: old_cred.euid,
+                    egid: old_cred.egid,
+                    groups: old_cred.groups.clone(),
+                    fsuid: old_cred.fsuid,
+                    fsgid: old_cred.fsgid,
+                    cap_inheritable: old_cred.cap_inheritable,
+                    cap_permitted: old_cred.cap_permitted,
+                    cap_effective: old_cred.cap_effective,
+                    cap_bset: new_bset,
+                    cap_ambient: old_cred.cap_ambient,
+                    group_info: old_cred.group_info.clone(),
+                    user_ns: old_cred.user_ns.clone(),
+                });
+
+                current.set_cred(new_cred)?;
                 Ok(0)
             }
 

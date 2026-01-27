@@ -45,6 +45,8 @@ pub struct MntNamespace {
     _user_ns: Arc<UserNamespace>,
     root_mountfs: Arc<MountFS>,
     inner: SpinLock<InnerMntNamespace>,
+    // 旧的根挂载点，用于 pivot_root 后的 umount
+    old_root_mntfs: SpinLock<Option<Arc<MountFS>>>,
 }
 
 pub struct InnerMntNamespace {
@@ -80,6 +82,7 @@ impl MntNamespace {
                 mount_list,
                 _dead: false,
             }),
+            old_root_mntfs: SpinLock::new(None),
         });
 
         ramfs.set_namespace(Arc::downgrade(&result));
@@ -97,10 +100,17 @@ impl MntNamespace {
         let inner_guard = self.inner.lock();
         let ptr = self as *const Self as *mut Self;
         let self_mut = (ptr).as_mut().unwrap();
+
+        // 保存旧的根挂载点，以便后续可能需要卸载它
+        let old_root = self_mut.root_mountfs.clone();
         self_mut.root_mountfs = new_root.clone();
         let (path, _, _) = inner_guard.mount_list.get_mount_point("/").unwrap();
 
         inner_guard.mount_list.insert(None, path, new_root);
+
+        // 将旧的根挂载点保存到一个特殊位置（使用特殊路径）
+        // 这样 umount2 可以通过这个路径找到并卸载它
+        *self_mut.old_root_mntfs.lock() = Some(old_root);
 
         // update mount list ino
     }
@@ -118,6 +128,7 @@ impl MntNamespace {
                 _dead: false,
                 mount_list: MountList::new(),
             }),
+            old_root_mntfs: SpinLock::new(None),
         });
 
         new_root.set_namespace(Arc::downgrade(&result));
@@ -280,6 +291,21 @@ impl MntNamespace {
 
     pub fn mount_list(&self) -> Arc<MountList> {
         self.inner.lock().mount_list.clone()
+    }
+
+    /// 获取旧的根挂载点（用于 pivot_root 后的 umount）
+    pub fn old_root_mntfs(&self) -> Option<Arc<MountFS>> {
+        self.old_root_mntfs.lock().clone()
+    }
+
+    /// 设置旧的根挂载点（用于 pivot_root）
+    pub fn set_old_root_mntfs(&self, old_root: Arc<MountFS>) {
+        *self.old_root_mntfs.lock() = Some(old_root);
+    }
+
+    /// 清除旧的根挂载点
+    pub fn clear_old_root_mntfs(&self) {
+        *self.old_root_mntfs.lock() = None;
     }
 
     pub fn remove_mount(&self, mount_path: &str) -> Option<Arc<MountFS>> {

@@ -26,3 +26,5 @@ compile_commands.json
 *.cpio.xz
 *.cpio*
 .direnv/
+
+busybox/

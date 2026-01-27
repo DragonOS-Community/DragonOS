@@ -1,8 +1,10 @@
 mod epoll_items;
 mod shutdown;
+mod timeval;
 
 pub use epoll_items::EPollItems;
 pub use shutdown::ShutdownBit;
+pub use timeval::{parse_timeval_opt, write_timeval_opt};
 
 // /// @brief 在trait Socket的metadata函数中返回该结构体供外部使用
 // #[derive(Debug, Clone)]

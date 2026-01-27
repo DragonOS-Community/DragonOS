@@ -11,10 +11,15 @@ pub enum IpOption {
     HDRINCL = 3,
     PKTINFO = 8,
     MTU_DISCOVER = 10,
+    RECVERR = 11,
     RECVTTL = 12,
     RECVTOS = 13,
+    ORIGDSTADDR = 20,
     MULTICAST_TTL = 33,
     MULTICAST_LOOP = 34,
+    ADD_MEMBERSHIP = 35,
+    DROP_MEMBERSHIP = 36,
+    RECVERR_RFC4884 = 26,
 }
 
 impl TryFrom<u32> for IpOption {

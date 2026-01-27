@@ -311,18 +311,24 @@ impl IndexNode for TtyDevice {
         let ld = tty.ldisc();
         let mut offset = 0;
         let mut cookie = false;
+
+        // 边界检查：防止整数下溢
+        if len > buf.len() {
+            return Err(SystemError::EINVAL);
+        }
+
         loop {
             let mut size = (len - offset).min(buf.len() - offset);
             size = ld.read(tty.clone(), &mut buf[offset..], size, &mut cookie, 0, flags)?;
-            // 没有更多数据
+            // 本次迭代未读取到数据，可能是EOF或暂时无数据可读
             if size == 0 {
                 break;
             }
 
             offset += size;
 
-            // 缓冲区写满
-            if offset >= len {
+            // 已满足读取请求或缓冲区已满
+            if offset >= len || offset >= buf.len() {
                 break;
             }
 

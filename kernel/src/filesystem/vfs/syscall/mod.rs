@@ -19,6 +19,7 @@ mod sys_eventfd;
 mod sys_eventfd2;
 mod sys_faccessat;
 mod sys_faccessat2;
+mod sys_fallocate;
 mod sys_fchdir;
 mod sys_fchmod;
 mod sys_fchmodat;

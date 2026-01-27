@@ -1078,19 +1078,23 @@ impl NTtyData {
 
         self.read_tail += count;
 
+        // 当找到EOL时，表示一行已读取完成
         if found {
             if !self.pushing {
                 self.line_start = self.read_tail;
             } else {
                 self.pushing = false;
             }
-
             // todo: 审计？
             return Ok(false);
         }
 
-        // 这里是表示没有找到eol,根据是否还有数据可读返回
-        Ok(self.read_tail != canon_head)
+        // 未找到EOL
+        // 如果nr已被完全消耗（变为0），说明用户请求的读取长度已满足
+        // 即使缓冲区中还有更多数据（包括同一行的后续数据），
+        // 也应该返回false，让调用方返回已读取的字节数
+        // 下次调用时会继续读取下一批数据
+        return Ok(*nr > 0 && self.read_tail != canon_head);
     }
 
     /// ## 根据终端的模式和输入缓冲区中的数据量，判断是否可读字符

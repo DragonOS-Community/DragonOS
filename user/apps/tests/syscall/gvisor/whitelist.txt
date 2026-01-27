@@ -81,6 +81,7 @@ bind_test
 #listen_test
 socket_test
 udp_socket_test
+socket_ip_udp_loopback_test
 
 # unix socket相关的测试
 socket_unix_dgram_local_test

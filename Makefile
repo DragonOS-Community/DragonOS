@@ -176,11 +176,10 @@ write_diskimage-uefi: check_arch
 qemu: check_arch
 ifeq ($(IN_NIX_ENV),1)
 	@echo "ℹ️  在 Nix 环境中启动 QEMU"
-	@echo "   使用默认配置 (BIOS=legacy, Display=window)"
+	@echo "   使用默认配置无图形化启动 (-nographic)"
 	@echo ""
-	@echo "   如需其他配置，请使用:"
-	@echo "     - UEFI: nix run .#start-x86_64-uefi"
-	@echo "     - VNC:  nix run .#start-x86_64 -- -display vnc"
+	@echo "   其他配置尚未在 nix qemu run script 实现"
+	@echo "   需要自行指定 flag"
 	@echo ""
 	nix run .#start-$(ARCH)
 else

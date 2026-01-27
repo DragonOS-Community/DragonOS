@@ -156,6 +156,15 @@ impl PidDirOps {
 }
 
 impl DirOps for PidDirOps {
+    fn owner(&self) -> Option<(usize, usize)> {
+        let pcb = ProcessManager::find(self.pid)?;
+        if pcb.is_kthread() {
+            return Some((0, 0));
+        }
+        let cred = pcb.cred();
+        Some((cred.euid.data(), cred.egid.data()))
+    }
+
     fn lookup_child(
         &self,
         dir: &ProcDir<Self>,

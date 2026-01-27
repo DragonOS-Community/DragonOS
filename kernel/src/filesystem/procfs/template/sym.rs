@@ -118,6 +118,11 @@ pub trait SymOps: Sync + Send + Sized + Debug {
     fn dynamic_inode_id(&self) -> Option<InodeId> {
         None
     }
+
+    /// 返回动态 owner（用于 /proc/<pid> 等需要实时 UID/GID 的场景）
+    fn owner(&self) -> Option<(usize, usize)> {
+        None
+    }
 }
 
 /// 为 ProcSym 实现 IndexNode trait
@@ -130,6 +135,11 @@ impl<S: SymOps + 'static> IndexNode for ProcSym<S> {
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
         let mut metadata = self.common.metadata()?;
+
+        if let Some((uid, gid)) = self.inner.owner() {
+            metadata.uid = uid;
+            metadata.gid = gid;
+        }
 
         // 如果 inner 提供了动态 inode ID（如命名空间文件），使用它
         if let Some(dynamic_id) = self.inner.dynamic_inode_id() {

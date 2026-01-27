@@ -105,6 +105,11 @@ pub trait FileOps: Sync + Send + Sized + Debug {
     ) -> Result<usize, SystemError> {
         Err(SystemError::EPERM)
     }
+
+    /// 返回动态 owner（用于 /proc/<pid> 等需要实时 UID/GID 的场景）
+    fn owner(&self) -> Option<(usize, usize)> {
+        None
+    }
 }
 
 /// 为 ProcFile 实现 IndexNode trait
@@ -113,8 +118,16 @@ pub trait FileOps: Sync + Send + Sized + Debug {
 impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
     fn fs(&self) -> Arc<dyn FileSystem>;
     fn as_any_ref(&self) -> &dyn core::any::Any;
-    fn metadata(&self) -> Result<Metadata, SystemError>;
     fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError>;
+
+    fn metadata(&self) -> Result<Metadata, SystemError> {
+        let mut metadata = self.common.metadata()?;
+        if let Some((uid, gid)) = self.inner.owner() {
+            metadata.uid = uid;
+            metadata.gid = gid;
+        }
+        Ok(metadata)
+    }
 
     fn read_at(
         &self,

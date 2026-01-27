@@ -64,6 +64,8 @@ impl MeminfoFileOps {
                 .as_bytes()
                 .to_owned(),
         );
+        data.append(&mut format!("SwapTotal:\t{} kB\n", 0u64).as_bytes().to_owned());
+        data.append(&mut format!("SwapFree:\t{} kB\n", 0u64).as_bytes().to_owned());
         data.append(
             &mut format!("Dirty:\t\t{} kB\n", stats.file_dirty * page_kb)
                 .as_bytes()

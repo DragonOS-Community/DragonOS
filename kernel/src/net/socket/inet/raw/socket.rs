@@ -1,4 +1,5 @@
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use smoltcp::wire::{IpAddress, IpProtocol, IpVersion};
 use system_error::SystemError;
@@ -82,6 +83,9 @@ impl RawSocket {
             ip_version,
             protocol,
             loopback_rx: crate::libs::mutex::Mutex::new(super::loopback::LoopbackRxQueue::default()),
+            ip_multicast_ifindex: core::sync::atomic::AtomicI32::new(0),
+            ip_multicast_addr: core::sync::atomic::AtomicU32::new(0),
+            ip_multicast_groups: crate::libs::mutex::Mutex::new(Vec::new()),
         });
 
         // Linux 语义：raw socket 未 bind 也应能被 poll/epoll 正确唤醒。

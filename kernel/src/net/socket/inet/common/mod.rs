@@ -3,6 +3,8 @@ use alloc::sync::Arc;
 
 pub mod port;
 pub use port::PortManager;
+pub mod multicast;
+pub use multicast::{apply_ipv4_membership, apply_ipv4_multicast_if, Ipv4MulticastMembership};
 use system_error::SystemError;
 
 #[allow(dead_code)]

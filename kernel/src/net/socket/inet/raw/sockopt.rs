@@ -8,6 +8,7 @@ use super::constants::{
 };
 use super::options::DEFAULT_IP_TTL;
 use super::{Icmp6Filter, RawSocket};
+use crate::net::socket::inet::common::{apply_ipv4_membership, apply_ipv4_multicast_if};
 use crate::net::socket::{IpOption, IFNAMSIZ, PIPV6, PRAW, PSO};
 
 fn sock_buf_u32_from_opt(val: &[u8]) -> Result<u32, SystemError> {
@@ -185,6 +186,16 @@ impl RawSocket {
                 let len = core::cmp::min(value.len(), 4);
                 value[..len].copy_from_slice(&v.to_ne_bytes()[..len]);
                 Ok(len)
+            }
+            Ok(IpOption::MULTICAST_IF) => {
+                if value.len() < 4 {
+                    return Err(SystemError::EINVAL);
+                }
+                let v = self
+                    .ip_multicast_addr
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                value[..4].copy_from_slice(&v.to_ne_bytes());
+                Ok(4)
             }
             _ => Err(SystemError::ENOPROTOOPT),
         }
@@ -406,6 +417,16 @@ impl RawSocket {
                 let enable = val.first().copied().unwrap_or(0) != 0;
                 self.options.write().recv_tos = enable;
                 Ok(())
+            }
+            Ok(IpOption::MULTICAST_IF) => apply_ipv4_multicast_if(
+                &self.netns,
+                val,
+                &self.ip_multicast_ifindex,
+                &self.ip_multicast_addr,
+            ),
+            Ok(IpOption::ADD_MEMBERSHIP) | Ok(IpOption::DROP_MEMBERSHIP) => {
+                let opt = IpOption::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
+                apply_ipv4_membership(&self.netns, opt, val, &self.ip_multicast_groups)
             }
             _ => Ok(()),
         }

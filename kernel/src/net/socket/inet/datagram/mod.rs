@@ -18,7 +18,10 @@ use crate::process::ProcessManager;
 use crate::{libs::rwsem::RwSem, net::socket::endpoint::Endpoint};
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use alloc::vec::Vec;
+use core::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 use smoltcp::wire::{IpAddress::*, IpEndpoint, IpListenEndpoint, IpVersion};
 
 use super::{InetSocket, UNSPECIFIED_LOCAL_ENDPOINT_V4, UNSPECIFIED_LOCAL_ENDPOINT_V6};
@@ -96,6 +99,12 @@ pub struct UdpSocket {
     ip_multicast_ttl: AtomicI32,
     /// IP_MULTICAST_LOOP
     ip_multicast_loop: AtomicBool,
+    /// IP_MULTICAST_IF: interface index
+    ip_multicast_ifindex: AtomicI32,
+    /// IP_MULTICAST_IF: interface address (network byte order)
+    ip_multicast_addr: AtomicU32,
+    /// IP_ADD_MEMBERSHIP/IP_DROP_MEMBERSHIP state (best-effort, no actual IGMP)
+    ip_multicast_groups: Mutex<Vec<crate::net::socket::inet::common::Ipv4MulticastMembership>>,
     /// IP_PKTINFO
     recv_pktinfo_v4: AtomicBool,
     /// IP_RECVORIGDSTADDR (aka IP_ORIGDSTADDR)
@@ -156,6 +165,9 @@ impl UdpSocket {
             recv_err_v6: AtomicBool::new(false),
             ip_multicast_ttl: AtomicI32::new(1),
             ip_multicast_loop: AtomicBool::new(true),
+            ip_multicast_ifindex: AtomicI32::new(0),
+            ip_multicast_addr: AtomicU32::new(0),
+            ip_multicast_groups: Mutex::new(Vec::new()),
             recv_pktinfo_v4: AtomicBool::new(false),
             recv_origdstaddr_v4: AtomicBool::new(false),
             recv_origdstaddr_v6: AtomicBool::new(false),

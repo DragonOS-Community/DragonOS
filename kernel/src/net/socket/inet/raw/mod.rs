@@ -3,7 +3,8 @@
 //! 提供 IP 层原始套接字支持，用于 ping、traceroute 等工具
 
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicBool, AtomicUsize};
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize};
 
 use smoltcp::wire::{IpProtocol, IpVersion};
 
@@ -76,4 +77,11 @@ pub struct RawSocket {
 
     /// 回环快速路径：用于保留 TOS/TCLASS 等字段且实现 SO_RCVBUF 行为。
     loopback_rx: Mutex<LoopbackRxQueue>,
+
+    /// IP_MULTICAST_IF: interface index
+    ip_multicast_ifindex: AtomicI32,
+    /// IP_MULTICAST_IF: interface address (network byte order)
+    ip_multicast_addr: AtomicU32,
+    /// IP_ADD_MEMBERSHIP/IP_DROP_MEMBERSHIP state (best-effort, no actual IGMP)
+    ip_multicast_groups: Mutex<Vec<crate::net::socket::inet::common::Ipv4MulticastMembership>>,
 }

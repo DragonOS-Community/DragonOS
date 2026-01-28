@@ -15,6 +15,7 @@ pub enum IpOption {
     RECVTTL = 12,
     RECVTOS = 13,
     ORIGDSTADDR = 20,
+    MULTICAST_IF = 32,
     MULTICAST_TTL = 33,
     MULTICAST_LOOP = 34,
     ADD_MEMBERSHIP = 35,

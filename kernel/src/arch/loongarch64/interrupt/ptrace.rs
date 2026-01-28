@@ -2,7 +2,6 @@
 ///
 /// 参考 Linux 6.6.21: arch/loongarch/include/uapi/asm/ptrace.h
 /// https://code.dragonos.org.cn/xref/linux-6.6.21/arch/loongarch/include/uapi/asm/ptrace.h#30
-
 use super::TrapFrame;
 
 /// Linux 兼容的用户寄存器结构体 (LoongArch64)

@@ -2,7 +2,6 @@
 ///
 /// 参考 Linux 6.6.21: arch/x86/include/asm/user_64.h
 /// https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/include/asm/user_64.h#69
-
 use super::TrapFrame;
 
 /// Linux 兼容的用户寄存器结构体 (x86_64)

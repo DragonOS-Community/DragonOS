@@ -73,39 +73,98 @@ where
 /// 从 tracee 的用户空间读取数据（安全版本）
 ///
 /// 使用物理地址翻译避免页表切换，不关闭中断。
-/// 参考 process_vm_readv 的实现方式。
-fn ptrace_peek_data(tracee: &Arc<ProcessControlBlock>, addr: usize) -> Result<isize, SystemError> {
+fn ptrace_peek_data(
+    tracee: &Arc<ProcessControlBlock>,
+    addr: usize,
+    data: usize,
+) -> Result<isize, SystemError> {
     let tracee_vm = tracee.basic().user_vm().ok_or(SystemError::ESRCH)?;
     let tracee_vm_guard = tracee_vm.read();
 
-    let tracee_addr = VirtAddr::new(addr);
+    // 尝试读取 sizeof(unsigned long) 字节（通常是 8 字节）
+    const WORD_SIZE: usize = core::mem::size_of::<u64>();
 
     // 检查地址是否在 tracee 的地址空间中
+    let tracee_addr = VirtAddr::new(addr);
     if tracee_vm_guard.mappings.contains(tracee_addr).is_none() {
         return Err(SystemError::EIO);
     }
 
-    // 计算页内偏移
-    let page_offset = addr & (MMArch::PAGE_SIZE - 1);
+    // 尝试直接读取，使用异常表保护
+    let mut value: u64 = 0;
 
-    // 翻译 tracee 的虚拟地址为物理地址
-    let tracee_phys = match tracee_vm_guard.user_mapper.utable.translate(tracee_addr) {
-        Some((phys_frame, _)) => PhysAddr::new(phys_frame.data() + page_offset),
-        None => return Err(SystemError::EIO),
-    };
+    // 处理可能的跨页边界访问
+    let page_offset = addr & (MMArch::PAGE_SIZE - 1);
+    let bytes_to_end = MMArch::PAGE_SIZE - page_offset;
+
+    unsafe {
+        if bytes_to_end >= WORD_SIZE {
+            // 单页访问，一次性读取
+            let tracee_phys = match tracee_vm_guard.user_mapper.utable.translate(tracee_addr) {
+                Some((phys_frame, _)) => PhysAddr::new(phys_frame.data() + page_offset),
+                None => return Err(SystemError::EIO),
+            };
+
+            let kernel_virt = MMArch::phys_2_virt(tracee_phys).ok_or(SystemError::EIO)?;
+            let src_ptr = kernel_virt.data() as *const u8;
+            let dst_ptr = &mut value as *mut u64 as *mut u8;
+
+            let result = MMArch::copy_with_exception_table(dst_ptr, src_ptr, WORD_SIZE);
+            if result != 0 {
+                return Err(SystemError::EIO);
+            }
+        } else {
+            // 跨页访问，需要分两次读取
+            // 第一页：bytes_to_end 字节
+            let tracee_phys1 = match tracee_vm_guard.user_mapper.utable.translate(tracee_addr) {
+                Some((phys_frame, _)) => PhysAddr::new(phys_frame.data() + page_offset),
+                None => return Err(SystemError::EIO),
+            };
+            let kernel_virt1 = MMArch::phys_2_virt(tracee_phys1).ok_or(SystemError::EIO)?;
+            let src_ptr1 = kernel_virt1.data() as *const u8;
+            let dst_ptr = &mut value as *mut u64 as *mut u8;
+
+            let result1 = MMArch::copy_with_exception_table(dst_ptr, src_ptr1, bytes_to_end);
+            if result1 != 0 {
+                return Err(SystemError::EIO);
+            }
+
+            // 第二页：WORD_SIZE - bytes_to_end 字节
+            let tracee_addr2 = VirtAddr::new(addr + bytes_to_end);
+            if tracee_vm_guard.mappings.contains(tracee_addr2).is_none() {
+                return Err(SystemError::EIO);
+            }
+
+            let tracee_phys2 = match tracee_vm_guard.user_mapper.utable.translate(tracee_addr2) {
+                Some((phys_frame, _)) => PhysAddr::new(phys_frame.data()),
+                None => return Err(SystemError::EIO),
+            };
+            let kernel_virt2 = MMArch::phys_2_virt(tracee_phys2).ok_or(SystemError::EIO)?;
+            let src_ptr2 = kernel_virt2.data() as *const u8;
+            let dst_ptr2 = (dst_ptr as usize + bytes_to_end) as *mut u8;
+
+            let result2 =
+                MMArch::copy_with_exception_table(dst_ptr2, src_ptr2, WORD_SIZE - bytes_to_end);
+            if result2 != 0 {
+                return Err(SystemError::EIO);
+            }
+        }
+    }
+
     drop(tracee_vm_guard);
 
-    // 使用异常表保护的拷贝
-    let mut value: u64 = 0;
+    // 使用 put_user 将读取的值写入 data 参数指向的用户空间地址
+    // data 参数是一个指向 unsigned long 的用户空间指针
+    //
+    // 注意：需要使用异常表保护的拷贝，因为用户空间地址可能不可访问
     unsafe {
-        // 将物理地址映射为内核虚拟地址
-        let kernel_virt = MMArch::phys_2_virt(tracee_phys).ok_or(SystemError::EIO)?;
+        let user_dst = data as *mut u8;
+        let src = &value as *const u64 as *const u8;
 
-        let src_ptr = kernel_virt.data() as *const u8;
-        let dst_ptr = &mut value as *mut u64 as *mut u8;
-        let result = MMArch::copy_with_exception_table(dst_ptr, src_ptr, 8);
+        // 使用异常表保护的拷贝函数写入用户空间
+        let result = MMArch::copy_with_exception_table(user_dst, src, WORD_SIZE);
         if result != 0 {
-            return Err(SystemError::EIO);
+            return Err(SystemError::EFAULT);
         }
     }
 
@@ -115,7 +174,6 @@ fn ptrace_peek_data(tracee: &Arc<ProcessControlBlock>, addr: usize) -> Result<is
 /// 向 tracee 的用户空间写入数据（安全版本）
 ///
 /// 使用物理地址翻译避免页表切换，不关闭中断。
-/// 参考 process_vm_writev 的实现方式。
 fn ptrace_poke_data(
     tracee: &Arc<ProcessControlBlock>,
     addr: usize,
@@ -124,34 +182,72 @@ fn ptrace_poke_data(
     let tracee_vm = tracee.basic().user_vm().ok_or(SystemError::ESRCH)?;
     let tracee_vm_guard = tracee_vm.read();
 
-    let tracee_addr = VirtAddr::new(addr);
+    // 尝试写入 sizeof(unsigned long) 字节（通常是 8 字节）
+    const WORD_SIZE: usize = core::mem::size_of::<u64>();
 
     // 检查地址是否在 tracee 的地址空间中
+    let tracee_addr = VirtAddr::new(addr);
     if tracee_vm_guard.mappings.contains(tracee_addr).is_none() {
         return Err(SystemError::EIO);
     }
 
-    // 计算页内偏移
-    let page_offset = addr & (MMArch::PAGE_SIZE - 1);
-
-    // 翻译 tracee 的虚拟地址为物理地址
-    let tracee_phys = match tracee_vm_guard.user_mapper.utable.translate(tracee_addr) {
-        Some((phys_frame, _)) => PhysAddr::new(phys_frame.data() + page_offset),
-        None => return Err(SystemError::EIO),
-    };
-    drop(tracee_vm_guard);
-
-    // 使用异常表保护的拷贝
     let value: u64 = data as u64;
-    unsafe {
-        // 将物理地址映射为内核虚拟地址
-        let kernel_virt = MMArch::phys_2_virt(tracee_phys).ok_or(SystemError::EIO)?;
 
-        let src_ptr = &value as *const u64 as *const u8;
-        let dst_ptr = kernel_virt.data() as *mut u8;
-        let result = MMArch::copy_with_exception_table(dst_ptr, src_ptr, 8);
-        if result != 0 {
-            return Err(SystemError::EIO);
+    // 处理可能的跨页边界访问
+    let page_offset = addr & (MMArch::PAGE_SIZE - 1);
+    let bytes_to_end = MMArch::PAGE_SIZE - page_offset;
+
+    unsafe {
+        if bytes_to_end >= WORD_SIZE {
+            // 单页访问，一次性写入
+            let tracee_phys = match tracee_vm_guard.user_mapper.utable.translate(tracee_addr) {
+                Some((phys_frame, _)) => PhysAddr::new(phys_frame.data() + page_offset),
+                None => return Err(SystemError::EIO),
+            };
+
+            let kernel_virt = MMArch::phys_2_virt(tracee_phys).ok_or(SystemError::EIO)?;
+            let src_ptr = &value as *const u64 as *const u8;
+            let dst_ptr = kernel_virt.data() as *mut u8;
+
+            let result = MMArch::copy_with_exception_table(dst_ptr, src_ptr, WORD_SIZE);
+            if result != 0 {
+                return Err(SystemError::EIO);
+            }
+        } else {
+            // 跨页访问，需要分两次写入
+            // 第一页：bytes_to_end 字节
+            let tracee_phys1 = match tracee_vm_guard.user_mapper.utable.translate(tracee_addr) {
+                Some((phys_frame, _)) => PhysAddr::new(phys_frame.data() + page_offset),
+                None => return Err(SystemError::EIO),
+            };
+            let kernel_virt1 = MMArch::phys_2_virt(tracee_phys1).ok_or(SystemError::EIO)?;
+            let src_ptr = &value as *const u64 as *const u8;
+            let dst_ptr1 = kernel_virt1.data() as *mut u8;
+
+            let result1 = MMArch::copy_with_exception_table(dst_ptr1, src_ptr, bytes_to_end);
+            if result1 != 0 {
+                return Err(SystemError::EIO);
+            }
+
+            // 第二页：WORD_SIZE - bytes_to_end 字节
+            let tracee_addr2 = VirtAddr::new(addr + bytes_to_end);
+            if tracee_vm_guard.mappings.contains(tracee_addr2).is_none() {
+                return Err(SystemError::EIO);
+            }
+
+            let tracee_phys2 = match tracee_vm_guard.user_mapper.utable.translate(tracee_addr2) {
+                Some((phys_frame, _)) => PhysAddr::new(phys_frame.data()),
+                None => return Err(SystemError::EIO),
+            };
+            let kernel_virt2 = MMArch::phys_2_virt(tracee_phys2).ok_or(SystemError::EIO)?;
+            let src_ptr2 = (src_ptr as usize + bytes_to_end) as *const u8;
+            let dst_ptr2 = kernel_virt2.data() as *mut u8;
+
+            let result2 =
+                MMArch::copy_with_exception_table(dst_ptr2, src_ptr2, WORD_SIZE - bytes_to_end);
+            if result2 != 0 {
+                return Err(SystemError::EIO);
+            }
         }
     }
 
@@ -288,8 +384,9 @@ impl SysPtrace {
     fn handle_peek_data(
         tracee: &Arc<ProcessControlBlock>,
         addr: usize,
+        data: usize,
     ) -> Result<isize, SystemError> {
-        ptrace_peek_data(tracee, addr)
+        ptrace_peek_data(tracee, addr, data)
     }
 
     /// 处理 PTRACE_POKEDATA 请求（写入进程内存）
@@ -474,7 +571,7 @@ impl Syscall for SysPtrace {
 
         let result: isize = match request {
             // 读取进程内存
-            PtraceRequest::Peekdata => Self::handle_peek_data(&tracee, addr)?,
+            PtraceRequest::Peekdata => Self::handle_peek_data(&tracee, addr, data)?,
             // 读取用户寄存器
             PtraceRequest::Peekuser => Self::handle_peek_user(&tracee, addr)?,
             // 写入进程内存

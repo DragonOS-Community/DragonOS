@@ -5,7 +5,6 @@ PtraceTest.SIGKILLDoesNotCauseSignalDeliveryStop
 PtraceTest.PtraceKill
 PtraceTest.GetRegSet
 PtraceTest.ChangeRegSetInOptSyscall
-PtraceTest.AttachingConvertsGroupStopToPtraceStop
 PtraceTest.ExitWhenParentIsNotTracer_Syscall_TraceVfork_TraceVforkDone
 PtraceTest.Int3
 PtraceTest.Sysemu_PokeUser

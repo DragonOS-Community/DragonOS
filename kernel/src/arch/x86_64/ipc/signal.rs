@@ -1,5 +1,9 @@
-use core::sync::atomic::{compiler_fence, Ordering};
-use core::{ffi::c_void, mem::size_of};
+use core::{
+    ffi::c_void,
+    intrinsics::unlikely,
+    mem::size_of,
+    sync::atomic::{compiler_fence, Ordering},
+};
 
 use defer::defer;
 use log::error;
@@ -11,15 +15,15 @@ pub use crate::ipc::generic_signal::GenericSigSet as SigSet;
 pub use crate::ipc::generic_signal::GenericSigStackFlags as SigStackFlags;
 pub use crate::ipc::generic_signal::GenericSignal as Signal;
 
-use crate::process::{ptrace::ptrace_signal, rseq::Rseq, ProcessFlags};
 use crate::{
     arch::{
         fpu::FpState,
         interrupt::TrapFrame,
         process::table::{USER_CS, USER_DS},
         syscall::nr::SYS_RESTART_SYSCALL,
-        MMArch,
+        CurrentIrqArch, MMArch,
     },
+    exception::InterruptArch,
     ipc::{
         signal::{restore_saved_sigmask, set_current_blocked},
         signal_types::{
@@ -27,7 +31,7 @@ use crate::{
         },
     },
     mm::MemoryManagementArch,
-    process::ProcessManager,
+    process::{ptrace::ptrace_signal, rseq::Rseq, ProcessFlags, ProcessManager},
     syscall::user_access::UserBufferWriter,
 };
 
@@ -591,7 +595,6 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     let pcb = ProcessManager::current_pcb();
 
     let siginfo = pcb.try_siginfo_irqsave(5);
-
     if unlikely(siginfo.is_none()) {
         pcb.recalc_sigpending();
         return;
@@ -609,155 +612,123 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
         return;
     }
 
-    let mut sig_number: Signal;
     let mut sig: Signal;
     let mut info: Option<SigInfo>;
-
-    // 主循环：使用 relock 机制重新获取锁
-    // 对应 Linux: kernel/signal.c:2683 relock:
-    'relock: loop {
-        // 阻塞式获取写锁（对应 Linux 的 spin_lock_irq）
-        let mut siginfo_mut_guard = pcb.sig_info_mut();
-
-        // 获取当前最新的信号阻塞掩码
-        // 对应 Linux: kernel/signal.c:2681 &current->blocked
-        // 注意：每次 relock 后都重新获取，确保使用最新数据
-        // （处理 ptrace 可能修改 blocked 的情况）
-        let sig_block = *siginfo_mut_guard.sig_blocked();
-
-        // 内层循环：循环直到取出一个有效的、需要处理的信号，或者队列为空
-        // 对应 Linux: kernel/signal.c:2722 for (;;)
-        loop {
-            // Dequeue 信号
-            // 对应 Linux: kernel/signal.c:2769-2773
-            (sig, info) = siginfo_mut_guard.dequeue_signal(&sig_block, &pcb);
-
-            // 如果没有更多信号，返回
-            // 对应 Linux: kernel/signal.c:2775-2776 if (!signr) break;
-            if sig == Signal::INVALID {
-                drop(siginfo_mut_guard);
-                return;
-            }
-
-            // 只要进程处于 PTRACED 状态，都必须先通知 Tracer
-            let is_ptraced = pcb.flags().contains(ProcessFlags::PTRACED);
-            if is_ptraced {
-                // 保存 oldset
-                let _oldset = *siginfo_mut_guard.sig_blocked();
-
-                // 释放锁，因为 ptrace_signal 可能会睡眠
-                drop(siginfo_mut_guard);
-
-                // 调用 ptrace_signal（中断已经开启）
-                let result = ptrace_signal(&pcb, sig, &mut info);
-
-                // 重新获取锁以继续处理（对应 Linux 的 goto relock）
-                match result {
-                    Some(new_sig) => {
-                        // tracer 注入了新信号，继续处理
-                        sig = new_sig;
-                        // 重新获取锁并继续处理这个信号
-                        siginfo_mut_guard = pcb.sig_info_mut();
-                        // 继续处理这个信号，不执行 continue
-                    }
-                    None => {
-                        // tracer 忽略了信号，继续下一个信号
-                        continue 'relock;
-                    }
+    let mut sa: Sigaction;
+    drop(siginfo_read_guard);
+    loop {
+        // Dequeue 信号
+        (sig, info) = {
+            let res = {
+                let mut siginfo_mut_guard = pcb.sig_info_mut();
+                // 获取当前最新的信号阻塞掩码（处理 ptrace 可能修改 blocked 的情况）
+                let sig_block = *siginfo_mut_guard.sig_blocked();
+                let res = siginfo_mut_guard
+                    .sig_pending_mut()
+                    .dequeue_signal(&sig_block);
+                // 如果没有更多信号，重新计算 sigpending 并返回
+                if res.0 != Signal::INVALID {
+                    res
+                } else {
+                    drop(siginfo_mut_guard);
+                    pcb.sighand().shared_pending_dequeue(&sig_block)
                 }
+            };
+            pcb.recalc_sigpending();
+            res
+        };
+
+        if sig == Signal::INVALID {
+            break;
+        }
+
+        // 只要进程处于 PTRACED 状态，都必须先通知 Tracer
+        if pcb.flags().contains(ProcessFlags::PTRACED) {
+            let result = ptrace_signal(&pcb, sig, &mut info);
+            match result {
+                Some(new_sig) => {
+                    sig = new_sig; // tracer 注入了新信号，继续处理
+                }
+                None => continue, // tracer 忽略了信号，继续寻找下一个信号
             }
+        }
 
-            // 获取 sigaction
-            let sa = pcb.sighand().handler(sig).unwrap();
+        // 这类信号不进入用户态 Handler，直接在内核处理
+        if sig.kernel_only() {
+            CurrentIrqArch::interrupt_enable();
+            sig.handle_default();
+            // 如果是 SIGSTOP 唤醒后 continue 检查新信号
+            continue;
+        }
 
-            // 检查 handler 类型
-            match sa.action() {
-                SigactionType::SaHandler(action_type) => match action_type {
-                    SaHandlerType::Error => {
-                        error!("Trying to handle a Sigerror on Process:{:?}", pcb.raw_pid());
-                        return;
-                    }
-                    // SIG_IGN: 忽略信号，继续下一个
-                    SaHandlerType::Ignore => {
+        // 未注册处理器时使用默认处理
+        if let Some(sigaction) = pcb.sighand().handler(sig) {
+            sa = sigaction;
+        } else {
+            if sig.kernel_ignore() {
+                continue;
+            }
+            sa = Sigaction::default();
+        }
+
+        // Init 进程保护
+        if pcb.sighand().flags_contains(SignalFlags::UNKILLABLE) && !sa.action().is_customized() {
+            continue; // Init 忽略非自定义处理的信号
+        }
+
+        // 检查 handler 类型
+        match sa.action() {
+            SigactionType::SaHandler(action_type) => match action_type {
+                SaHandlerType::Error => {
+                    error!("Trying to handle a Sigerror on Process:{:?}", pcb.raw_pid());
+                    return;
+                }
+                SaHandlerType::Ignore => continue,
+                SaHandlerType::Default => {
+                    if sig.kernel_ignore() {
                         continue;
                     }
-                    // 自定义处理器
-                    // 对应 Linux: kernel/signal.c:2792-2799
-                    SaHandlerType::Customized(_) => {
-                        // 检查 SA_RESETHAND 标志（对应 Linux 的 SA_ONESHOT）
-                        // 对应 Linux: kernel/signal.c:2796-2797
-                        // Linux 在持有 sighand->siglock 时重置 handler
-                        //
-                        // 严格按照 Linux 6.6.21 语义：必须在释放锁之前重置 Handler
-                        // 以防止竞态条件导致信号被多次排队
-                        if sa.flags().contains(SigFlags::SA_RESETHAND) {
-                            // 在持锁状态下重置 Handler
-                            // 对应 Linux: kernel/signal.c:2797 ka->sa.sa_handler = SIG_DFL;
-                            pcb.sighand().set_handler(sig, Sigaction::default());
-                        }
-
-                        // 保存 oldset，释放锁
-                        let oldset = *siginfo_mut_guard.sig_blocked();
-                        drop(siginfo_mut_guard);
-
-                        // 调用 handle_signal 设置信号帧
-                        let mut sigaction = sa.clone();
-                        let res: Result<i32, SystemError> =
-                            handle_signal(sig, &mut sigaction, &info.unwrap(), &oldset, frame);
-
-                        // 更新 got_signal 状态
-                        if res.is_ok() {
-                            *got_signal = true;
-                        }
-
-                        compiler_fence(Ordering::SeqCst);
-                        if let Err(e) = res {
-                            if e != SystemError::EFAULT {
-                                error!(
-                                    "Error occurred when handling signal: {}, pid={:?}, errcode={:?}",
-                                    sig as i32,
-                                    ProcessManager::current_pcb().raw_pid(),
-                                    &e
-                                );
-                            }
-                        }
-                        return;
+                    if sig.kernel_stop() {
+                        sig.handle_default(); // 进程在此处挂起
+                        continue; // 被 SIGCONT 唤醒后重新检查
                     }
-                    // SIG_DFL: 默认处理
-                    SaHandlerType::Default => {
-                        // 检查信号的默认行为类型
-                        // 1. kernel_ignore: 默认忽略
-                        if sig.kernel_ignore() {
-                            continue;
-                        }
-                        // 2. Init 进程保护机制
-                        if pcb
-                            .sighand()
-                            .flags_contains(SignalFlags::UNKILLABLE)
-                            && !sig.kernel_only()
-                        {
-                            continue;
-                        }
-                        // 3. kernel_stop: 默认停止进程
-                        if sig.kernel_stop() {
-                            // 释放锁，因为 do_signal_stop 可能会睡眠
-                            drop(siginfo_mut_guard);
-                            // 执行停止操作（进程睡眠，直到被 SIGCONT 唤醒）
-                            sig.handle_default();
-                            // 唤醒后，跳回 relock 继续检查是否有其他积累的信号
-                            continue 'relock;
-                        }
-                        // 4. 其他信号：终止进程（可能带 coredump）
-                        drop(siginfo_mut_guard);
-                        // kernel_only 信号或其他终止类信号，使用默认处理
-                        sig.handle_default();
-                        return;
-                    }
-                },
-                SigactionType::SaSigaction(_) => {
-                    // SA_SIGINFO 风格的处理器（待实现）
-                    todo!("SA_SIGINFO not implemented yet");
+                    // 其余默认动作
+                    sig.handle_default();
+                    return;
                 }
+                // 自定义处理器
+                SaHandlerType::Customized(_) => {
+                    // 检查 SA_RESETHAND 标志（对应 Linux 的 SA_ONESHOT）
+                    if sa.flags().contains(SigFlags::SA_RESETHAND) {
+                        pcb.sighand().set_handler(sig, Sigaction::default());
+                    }
+                    // 保存 oldset，释放锁
+                    let oldset = { *pcb.sig_info_mut().sig_blocked() };
+                    // 调用 handle_signal 设置信号帧
+                    let mut sigaction = sa;
+                    let res = handle_signal(sig, &mut sigaction, &info.unwrap(), &oldset, frame);
+                    // 更新 got_signal 状态
+                    if res.is_ok() {
+                        *got_signal = true;
+                    }
+
+                    compiler_fence(Ordering::SeqCst);
+                    if let Err(e) = res {
+                        if e != SystemError::EFAULT {
+                            error!(
+                                "Error occurred when handling signal: {}, pid={:?}, errcode={:?}",
+                                sig as i32,
+                                ProcessManager::current_pcb().raw_pid(),
+                                &e
+                            );
+                        }
+                    }
+                    return;
+                }
+            },
+            SigactionType::SaSigaction(_) => {
+                // SA_SIGINFO 风格的处理器（待实现）
+                todo!("SA_SIGINFO not implemented yet");
             }
         }
     }

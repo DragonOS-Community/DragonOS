@@ -2,8 +2,8 @@ pub mod entry;
 mod handle;
 pub mod ipi;
 pub mod msi;
-pub mod trap;
 pub mod ptrace;
+pub mod trap;
 
 use core::any::Any;
 use core::{

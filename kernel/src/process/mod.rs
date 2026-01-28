@@ -36,7 +36,7 @@ use crate::{
     ipc::{
         sighand::SigHand,
         signal::{signal_wake_up, RestartBlock},
-        signal_types::{SigCode, SigInfo, SigPending, SigType, SignalFlags},
+        signal_types::{OriginCode, SigCode, SigInfo, SigPending, SigType, SignalFlags},
     },
     libs::{
         align::AlignedBox,
@@ -286,7 +286,7 @@ impl ProcessManager {
     }
 
     /// 唤醒一个进程
-    /// 参考 Linux 6.6.21 的 try_to_wake_up，支持唤醒 Blocked 和 TracedStopped 状态的进程
+    /// 参考 Linux 的 try_to_wake_up，支持唤醒 Blocked 和 TracedStopped 状态的进程
     pub fn wakeup(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let state = pcb.sched_info().inner_lock_read_irqsave().state();
@@ -641,7 +641,7 @@ impl ProcessManager {
         }
 
         // 注意：不再在 exit() 中调用 ptrace_stop
-        // 按照 Linux 6.6.21 的语义：
+        // 按照 Linux 的语义：
         // 1. 被 ptrace 的进程在收到信号时会调用 ptrace_stop（通过 ptrace_signal）
         // 2. tracer 可以通过 waitpid 查看进程状态
         // 3. 当进程退出时，应该直接退出，不需要再次调用 ptrace_stop
@@ -780,7 +780,7 @@ impl ProcessManager {
                     let mut info = SigInfo::new(
                         Signal::SIGKILL,
                         0,
-                        SigCode::Kernel,
+                        SigCode::Origin(OriginCode::Kernel),
                         SigType::Kill {
                             pid: RawPid::new(0),
                             uid: 0,
@@ -1072,31 +1072,31 @@ bitflags! {
         /// 进程当前由ptrace跟踪
         const PTRACED = 1 << 15;
         /// ptrace 正在停止（用于 attach/stop 的同步）
-        const TRAPPING = 1 << 13;
+        const TRAPPING = 1 << 16;
         /// 跟踪器已发出PTRACE_SYSCALL请求
-        const TRACE_SYSCALL = 1 << 16;
+        const TRACE_SYSCALL = 1 << 17;
         /// 跟踪器已发出PTRACE_SINGLESTEP请求
-        const TRACE_SINGLESTEP = 1 << 17;
+        const TRACE_SINGLESTEP = 1 << 18;
         /// 跟踪器设置了TRACE_EXIT选项
-        const TRACE_EXIT = 1 << 18;
+        const TRACE_EXIT = 1 << 19;
         /// 跟踪器设置了TRACE_FORK/CLONE选项
-        const TRACE_FORK = 1 << 19;
+        const TRACE_FORK = 1 << 20;
         /// 跟踪器设置了TRACE_VFORK选项
-        const TRACE_VFORK = 1 << 20;
+        const TRACE_VFORK = 1 << 21;
         /// 跟踪器设置了TRACE_EXEC选项
-        const TRACE_EXEC = 1 << 21;
+        const TRACE_EXEC = 1 << 22;
         /// 系统调用正在中断点（入口或出口）
-        const SYSCALL_INTERRUPT = 1 << 22;
+        const SYSCALL_INTERRUPT = 1 << 23;
         /// 进程通过 PTRACE_SEIZE 被附加（而非 PTRACE_ATTACH）
-        /// 按照 Linux 6.6.21 语义：SEIZED 进程不会收到 Legacy SIGTRAP
-        const PT_SEIZED = 1 << 23;
+        /// SEIZED 进程不会收到 Legacy SIGTRAP
+        const PT_SEIZED = 1 << 24;
     }
 }
 
 impl ProcessFlags {
     /// 获取需要在系统调用返回到用户态前处理的工作标志
     ///
-    /// 按照 Linux 6.6.21 的 _TIF_WORK_MASK 语义：
+    /// _TIF_WORK_MASK 语义：
     /// - TIF_SIGPENDING (HAS_PENDING_SIGNAL): 有待处理的信号
     /// - TIF_NEED_RESCHED (NEED_SCHEDULE): 需要调度
     /// - TIF_NOTIFY_RESUME (NEED_RSEQ): 需要处理 rseq

@@ -56,10 +56,9 @@ macro_rules! syscall_return {
             debug!("syscall return:pid={:?},ret= {:?}\n", pid, ret as isize);
         }
 
-        // 无条件调用统一的退出处理函数，由它来检查和处理所有工作
-        unsafe { crate::exception::entry::syscall_exit_to_user_mode($regs) };
-
-        // 返回到汇编层，汇编代码将执行 iret/sysret 返回用户态
+        unsafe {
+            CurrentIrqArch::interrupt_disable();
+        }
         return;
     }};
 }
@@ -102,11 +101,7 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
         // TODO: 处理注入信号
     }
 
-    // 按照 Linux 6.6.21 kernel/entry/common.c:78 的模式：
-    // /* Either of the above might have changed the syscall number */
-    // syscall = syscall_get_nr(current, regs);
-    //
-    // 关键：必须在 ptrace_stop 返回**之后**重新读取系统调用号和参数！
+    // 关键：必须在 ptrace_stop 返回之后重新读取系统调用号和参数！
     // 因为 tracer 可能在我们睡眠时修改了寄存器。
     let syscall_num = frame.rax as usize;
     let args = [

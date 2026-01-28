@@ -1,6 +1,6 @@
 use ::kprobe::ProbeArgs;
 use alloc::{sync::Arc, vec::Vec};
-use core::{intrinsics::unlikely, mem::MaybeUninit};
+use core::{intrinsics::unlikely, mem::offset_of};
 use system_error::SystemError;
 
 use crate::{
@@ -15,7 +15,8 @@ use crate::{
     process::{
         cred, pid::PidType, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState, RawPid,
     },
-    sched::{schedule, EnqueueFlag, SchedMode, WakeupFlags},
+    sched::{cpu_rq, schedule, EnqueueFlag, SchedMode, WakeupFlags},
+    smp::core::smp_get_processor_id,
 };
 
 /// ptrace 系统调用的请求类型
@@ -103,7 +104,12 @@ pub union PtraceSyscallInfoData {
     pub entry: PtraceSyscallInfoEntry,
     pub exit: PtraceSyscallInfoExit,
     pub seccomp: PtraceSyscallInfoSeccomp,
-    _uninit: MaybeUninit<[u8; 64]>,
+}
+
+impl Default for PtraceSyscallInfoData {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
 }
 
 #[repr(C)]
@@ -116,6 +122,60 @@ pub struct PtraceSyscallInfo {
     pub stack_pointer: u64,
     /// The union containing event-specific data.
     pub data: PtraceSyscallInfoData,
+}
+
+impl Default for PtraceSyscallInfo {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
+
+impl PtraceSyscallInfo {
+    /// 最底层的构造函数，传入原始数值
+    pub fn new(arch: u32, ip: u64, sp: u64) -> Self {
+        Self {
+            op: PtraceSyscallInfoOp::None,
+            pad: [0; 3],
+            arch,
+            instruction_pointer: ip,
+            stack_pointer: sp,
+            data: PtraceSyscallInfoData::default(),
+        }
+    }
+
+    /// 从 Context 直接构建
+    pub fn from_context(ctx: &kprobe::KProbeContext) -> Self {
+        Self::new(
+            kprobe::syscall_get_arch(),
+            kprobe::instruction_pointer(ctx),
+            kprobe::user_stack_pointer(ctx),
+        )
+    }
+
+    /// 将当前 Info 转换为 Entry 状态，并填充参数
+    pub fn with_entry(mut self, nr: u64, args: [u64; 6]) -> Self {
+        self.op = PtraceSyscallInfoOp::Entry;
+        self.data.entry = PtraceSyscallInfoEntry { nr, args };
+        self
+    }
+
+    /// 将当前 Info 转换为 Exit 状态，并填充返回值
+    pub fn with_exit(mut self, rval: i64, is_error: bool) -> Self {
+        self.op = PtraceSyscallInfoOp::Exit;
+        self.data.exit = PtraceSyscallInfoExit {
+            rval,
+            is_error: is_error as u8,
+        };
+        self
+    }
+
+    /// 将当前 Info 转换为 Seccomp 状态
+    #[allow(dead_code)]
+    pub fn with_seccomp(mut self, nr: u64, args: [u64; 6], ret_data: u32) -> Self {
+        self.op = PtraceSyscallInfoOp::Seccomp;
+        self.data.seccomp = PtraceSyscallInfoSeccomp { nr, args, ret_data };
+        self
+    }
 }
 
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
@@ -144,7 +204,7 @@ pub struct PtraceState {
     /// tracer 注入的信号（在 ptrace_stop 返回后要处理的信号）
     injected_signal: Signal,
     /// 最后一次 ptrace 停止时的 siginfo（供 PTRACE_GETSIGINFO 读取）
-    last_siginfo: Option<crate::ipc::signal_types::SigInfo>,
+    last_siginfo: Option<SigInfo>,
 }
 
 impl Default for PtraceState {
@@ -204,12 +264,12 @@ impl PtraceState {
     }
 
     /// 获取 last_siginfo（供 PTRACE_GETSIGINFO 使用）
-    pub fn last_siginfo(&self) -> Option<crate::ipc::signal_types::SigInfo> {
-        self.last_siginfo.clone()
+    pub fn last_siginfo(&self) -> Option<SigInfo> {
+        self.last_siginfo
     }
 
     /// 设置 last_siginfo
-    pub fn set_last_siginfo(&mut self, info: crate::ipc::signal_types::SigInfo) {
+    pub fn set_last_siginfo(&mut self, info: SigInfo) {
         self.last_siginfo = Some(info);
     }
 
@@ -551,7 +611,7 @@ impl ProcessControlBlock {
 
         // 通知跟踪器
         if let Some(tracer) = self.parent_pcb() {
-            self.notify_tracer(&tracer, why);
+            self.notify_tracer(&tracer, why, exit_code);
         }
 
         // 清除 TRAPPING 标志，表示已经完成停止准备工作
@@ -576,10 +636,9 @@ impl ProcessControlBlock {
         result
     }
 
-    fn notify_tracer(&self, tracer: &Arc<ProcessControlBlock>, why: ChldCode) {
+    fn notify_tracer(&self, tracer: &Arc<ProcessControlBlock>, why: ChldCode, stop_code: usize) {
         let status = match why {
-            ChldCode::Stopped => self.exit_code().unwrap_or(0) as i32 & 0x7f,
-            ChldCode::Trapped => self.exit_code().unwrap_or(0) as i32 & 0x7f,
+            ChldCode::Stopped | ChldCode::Trapped => (stop_code & 0x7f) as i32,
             _ => Signal::SIGCONT as i32,
         };
 
@@ -714,10 +773,10 @@ impl ProcessControlBlock {
 
                     // 加入运行队列，确保进程能被调度
                     if let Some(strong_ref) = self.self_ref.upgrade() {
-                        let rq = crate::sched::cpu_rq(
+                        let rq = cpu_rq(
                             self.sched_info()
                                 .on_cpu()
-                                .unwrap_or(crate::smp::core::smp_get_processor_id())
+                                .unwrap_or(smp_get_processor_id())
                                 .data() as usize,
                         );
                         let (rq, _guard) = rq.self_lock();
@@ -793,8 +852,6 @@ impl ProcessControlBlock {
     }
 
     /// 处理PTRACE_SEIZE请求
-    ///
-    /// 按照 Linux 6.6.21 的实现：
     /// - PTRACE_SEIZE 是 PTRACE_ATTACH 的现代替代品
     /// - 不会发送 SIGSTOP 给 tracee
     /// - 设置 PT_SEIZED 标志，影响后续行为（如 Legacy Exec SIGTRAP）
@@ -884,10 +941,10 @@ impl ProcessControlBlock {
         drop(sched_info);
 
         // 加入调度队列
-        let rq = crate::sched::cpu_rq(
+        let rq = cpu_rq(
             self.sched_info()
                 .on_cpu()
-                .unwrap_or(crate::smp::core::smp_get_processor_id())
+                .unwrap_or(smp_get_processor_id())
                 .data() as usize,
         );
         let (rq, _guard) = rq.self_lock();
@@ -1005,42 +1062,30 @@ impl ProcessControlBlock {
         // let trap_frame = self.task_context();
         let trap_frame = TrapFrame::new();
         let ctx = kprobe::KProbeContext::from(&trap_frame);
-        let mut info = PtraceSyscallInfo {
-            op: PtraceSyscallInfoOp::None,
-            pad: [0; 3],
-            arch: kprobe::syscall_get_arch(),
-            instruction_pointer: kprobe::instruction_pointer(&ctx),
-            stack_pointer: kprobe::user_stack_pointer(&ctx),
-            data: PtraceSyscallInfoData {
-                _uninit: MaybeUninit::uninit(),
-            },
-        };
+        let base_info = PtraceSyscallInfo::from_context(&ctx);
 
         let ptrace_state = self.ptrace_state.lock();
-        let actual_size = match ptrace_state.stop_reason {
+        let (info, actual_size) = match ptrace_state.stop_reason {
             PtraceStopReason::SyscallEntry => {
-                info.op = PtraceSyscallInfoOp::Entry;
                 let mut args = [0u64; 6];
                 kprobe::syscall_get_arguments(&ctx, &mut args);
-                info.data.entry = PtraceSyscallInfoEntry {
-                    nr: kprobe::syscall_get_nr(&ctx),
-                    args,
-                };
-                core::mem::size_of::<PtraceSyscallInfo>()
+                let nr = kprobe::syscall_get_nr(&ctx);
+                (
+                    base_info.with_entry(nr, args),
+                    offset_of!(PtraceSyscallInfo, data) + size_of::<PtraceSyscallInfoEntry>(),
+                )
             }
             PtraceStopReason::SyscallExit => {
-                info.op = PtraceSyscallInfoOp::Exit;
                 let rval = kprobe::syscall_get_return_value(&ctx);
                 let is_error = rval >= -4095; // MAX_ERRNO
-                info.data.exit = PtraceSyscallInfoExit {
-                    rval,
-                    is_error: is_error as u8,
-                };
-                core::mem::size_of::<PtraceSyscallInfo>()
+                (
+                    base_info.with_exit(rval, is_error),
+                    offset_of!(PtraceSyscallInfo, data) + size_of::<PtraceSyscallInfoExit>(),
+                )
             }
             _ => {
                 // 如果因为其他原因停止，只返回通用头部信息的大小
-                core::mem::offset_of!(PtraceSyscallInfo, data)
+                (base_info, offset_of!(PtraceSyscallInfo, data))
             }
         };
         drop(ptrace_state);
@@ -1056,7 +1101,6 @@ impl ProcessControlBlock {
         }
 
         // 无论拷贝多少，都返回内核准备好的完整数据大小
-        // 注意：当前返回的大小是正确的，但数据内容是空的（因为使用TrapFrame::new()）
         Ok(actual_size as isize)
     }
 

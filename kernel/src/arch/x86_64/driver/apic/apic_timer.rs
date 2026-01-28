@@ -1,9 +1,15 @@
 use core::cell::RefCell;
+use core::hint::spin_loop;
 use core::sync::atomic::{fence, Ordering};
 
-use crate::arch::driver::tsc::TSCManager;
+use crate::arch::driver::{
+    hpet::{hpet_instance, is_hpet_enabled},
+    tsc::TSCManager,
+};
 use crate::arch::interrupt::TrapFrame;
+use crate::driver::acpi::pmtmr::{acpi_pm_read_early, ACPI_PM_MASK, PMTMR_TICKS_PER_SEC};
 use crate::driver::base::device::DeviceId;
+use crate::driver::clocksource::acpi_pm::PMTMR_IO_PORT;
 use crate::exception::irqdata::{IrqHandlerData, IrqLineStatus};
 use crate::exception::irqdesc::{
     irq_desc_manager, IrqDesc, IrqFlowHandler, IrqHandleFlags, IrqHandler, IrqReturn,
@@ -29,6 +35,7 @@ use super::xapic::XApicOffset;
 use super::{CurrentApic, LVTRegister, LocalAPIC, LVT};
 
 pub const APIC_TIMER_IRQ_NUM: IrqNumber = IrqNumber::new(151);
+const APIC_CALIBRATE_MS: u64 = 10;
 
 static mut LOCAL_APIC_TIMERS: [RefCell<LocalApicTimer>; PerCpu::MAX_CPU_NUM as usize] =
     [const { RefCell::new(LocalApicTimer::new()) }; PerCpu::MAX_CPU_NUM as usize];
@@ -108,9 +115,12 @@ fn init_bsp_apic_timer() {
     debug!("init_bsp_apic_timer");
     assert!(smp_get_processor_id().data() == 0);
     let mut local_apic_timer = local_apic_timer_instance_mut(ProcessorId::new(0));
+    let initial_count = local_apic_timer
+        .calibrate_initial_count()
+        .unwrap_or_else(LocalApicTimer::periodic_default_initial_count);
     local_apic_timer.init(
         LocalApicTimerMode::Periodic,
-        LocalApicTimer::periodic_default_initial_count(),
+        initial_count,
         LocalApicTimer::DIVISOR as u32,
     );
     debug!("init_bsp_apic_timer done");
@@ -122,9 +132,12 @@ fn init_ap_apic_timer() {
     assert!(cpu_id.data() != 0);
 
     let mut local_apic_timer = local_apic_timer_instance_mut(cpu_id);
+    let initial_count = local_apic_timer
+        .calibrate_initial_count()
+        .unwrap_or_else(LocalApicTimer::periodic_default_initial_count);
     local_apic_timer.init(
         LocalApicTimerMode::Periodic,
-        LocalApicTimer::periodic_default_initial_count(),
+        initial_count,
         LocalApicTimer::DIVISOR as u32,
     );
     debug!("init_ap_apic_timer done");
@@ -208,6 +221,57 @@ impl LocalApicTimer {
         return count;
     }
 
+    fn calibrate_initial_count(&mut self) -> Option<u64> {
+        self.stop_current();
+        self.set_divisor(Self::DIVISOR as u32);
+        self.set_initial_cnt(u32::MAX as u64);
+        self.set_lvt_masked(LocalApicTimerMode::Periodic);
+        self.start_current();
+
+        if is_hpet_enabled() {
+            let period_fs = hpet_instance().period();
+            if period_fs == 0 {
+                return None;
+            }
+            let start = hpet_instance().main_counter_value();
+            let target_ticks = (APIC_CALIBRATE_MS * 1_000_000u64 * 1_000_000u64) / period_fs;
+            while (hpet_instance().main_counter_value() - start) < target_ticks {
+                spin_loop();
+            }
+        } else if PMTMR_IO_PORT.load(Ordering::SeqCst) != 0 {
+            let start = acpi_pm_read_early() as u64;
+            let target_ticks = PMTMR_TICKS_PER_SEC * APIC_CALIBRATE_MS / 1000;
+            while ((acpi_pm_read_early() as u64).wrapping_sub(start) & ACPI_PM_MASK) < target_ticks
+            {
+                spin_loop();
+            }
+        } else {
+            let start = TSCManager::cpu_khz();
+            if start == 0 {
+                return None;
+            }
+            let tsc_start = unsafe { x86::time::rdtsc() };
+            let mut tsc_now = tsc_start;
+            let target = start * APIC_CALIBRATE_MS;
+            while (tsc_now - tsc_start) < target {
+                tsc_now = unsafe { x86::time::rdtsc() };
+            }
+        }
+
+        let cur = CurrentApic.read_timer_current_count() as u64;
+        self.stop_current();
+
+        let elapsed = (u32::MAX as u64).saturating_sub(cur);
+        if elapsed == 0 {
+            return None;
+        }
+
+        let apic_khz = elapsed / APIC_CALIBRATE_MS;
+        // apic_khz already accounts for the programmed divider.
+        let initial_count = apic_khz * Self::INTERVAL_MS;
+        Some(initial_count)
+    }
+
     /// Init this manager.
     ///
     /// At this time, it does nothing.
@@ -266,6 +330,10 @@ impl LocalApicTimer {
         CurrentApic.set_lvt(lvt);
     }
 
+    fn set_lvt_masked(&mut self, mode: LocalApicTimerMode) {
+        self.setup_lvt(APIC_TIMER_IRQ_NUM.data() as u8, true, mode);
+    }
+
     /// 检查是否支持TSC-Deadline
     ///
     /// 此函数调用cpuid，请避免多次调用此函数。
@@ -306,11 +374,25 @@ impl TryFrom<u8> for LocalApicTimerMode {
 
 impl CurrentApic {
     fn set_timer_divisor(&self, divisor: u32) {
+        let div_conf = match divisor {
+            1 => 0b1011,
+            2 => 0b0000,
+            4 => 0b0001,
+            8 => 0b0010,
+            16 => 0b0011,
+            32 => 0b1000,
+            64 => 0b1001,
+            128 => 0b1010,
+            _ => 0b1011,
+        };
         if self.x2apic_enabled() {
-            unsafe { wrmsr(IA32_X2APIC_DIV_CONF, divisor.into()) };
+            unsafe { wrmsr(IA32_X2APIC_DIV_CONF, div_conf.into()) };
         } else {
             unsafe {
-                self.write_xapic_register(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_CLKDIV, divisor)
+                self.write_xapic_register(
+                    XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_CLKDIV,
+                    div_conf,
+                )
             };
         }
     }

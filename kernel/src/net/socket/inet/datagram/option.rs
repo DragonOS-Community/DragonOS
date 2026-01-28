@@ -11,6 +11,7 @@ use super::inner::{DEFAULT_RX_BUF_SIZE, DEFAULT_TX_BUF_SIZE};
 use super::UdpSocket;
 use crate::libs::byte_parser;
 use crate::net::socket::common::{parse_timeval_opt, write_timeval_opt};
+use crate::net::socket::inet::common::{apply_ipv4_membership, apply_ipv4_multicast_if};
 use crate::net::socket::{AddressFamily, IpOption, PIPV6, PSO, PSOCK, PSOL};
 use crate::process::cred::CAPFlags;
 use crate::process::ProcessManager;
@@ -407,6 +408,12 @@ impl UdpSocket {
                 self.ip_multicast_loop.store(on, Ordering::Relaxed);
                 Ok(())
             }
+            IpOption::MULTICAST_IF => apply_ipv4_multicast_if(
+                &self.netns,
+                val,
+                &self.ip_multicast_ifindex,
+                &self.ip_multicast_addr,
+            ),
             IpOption::PKTINFO => {
                 if val.len() < core::mem::size_of::<i32>() {
                     return Err(SystemError::EINVAL);
@@ -424,17 +431,7 @@ impl UdpSocket {
                 Ok(())
             }
             IpOption::ADD_MEMBERSHIP | IpOption::DROP_MEMBERSHIP => {
-                // Validate input size and require a non-zero multicast address.
-                // Full multicast join/leave is not implemented yet.
-                let mreq_len = 8usize; // struct ip_mreq: 2 * in_addr (4 bytes each)
-                if val.len() < mreq_len {
-                    return Err(SystemError::EINVAL);
-                }
-                let multi = u32::from_ne_bytes([val[0], val[1], val[2], val[3]]);
-                if multi == 0 {
-                    return Err(SystemError::EINVAL);
-                }
-                Err(SystemError::ENOPROTOOPT)
+                apply_ipv4_membership(&self.netns, opt, val, &self.ip_multicast_groups)
             }
             _ => Err(SystemError::ENOPROTOOPT),
         }
@@ -473,6 +470,7 @@ impl UdpSocket {
                     0i32
                 }
             }
+            IpOption::MULTICAST_IF => self.ip_multicast_addr.load(Ordering::Relaxed) as i32,
             IpOption::PKTINFO => {
                 if self.recv_pktinfo_v4.load(Ordering::Relaxed) {
                     1i32

@@ -44,6 +44,21 @@ impl TcpSocket {
             Some(inner::Inner::Established(established)) => {
                 established.update_io_events(&self.pollee);
 
+                // If SHUT_WR was requested while there were pending TX bytes, send FIN once
+                // the TX queue drains to preserve Linux-like semantics.
+                if self.is_send_shutdown()
+                    && self
+                        .send_fin_deferred
+                        .load(core::sync::atomic::Ordering::Relaxed)
+                {
+                    let pending = established.with(|socket| socket.send_queue());
+                    if pending == 0 {
+                        established.with_mut(|socket| socket.close());
+                        self.send_fin_deferred
+                            .store(false, core::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+
                 // If SHUT_WR, set EPOLLOUT so send() wakes up and returns EPIPE.
                 if self.is_send_shutdown() {
                     self.pollee.fetch_or(

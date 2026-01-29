@@ -77,7 +77,11 @@ fn generate_linux_proc_stat_line(
     // 尽量填真实值；拿不到的先填 0
     let pgrp: usize = 0;
     let session: usize = 0;
-    let tty_nr: i32 = 0;
+    let tty_nr: i32 = pcb
+        .sig_info_irqsave()
+        .tty()
+        .map(|tty| tty.core().device_number().new_encode_dev() as i32)
+        .unwrap_or(0);
     let tpgid: i32 = 0;
     let flags: u64 = 0;
     let minflt: u64 = 0;

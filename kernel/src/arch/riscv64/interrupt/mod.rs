@@ -14,6 +14,7 @@ use super::cpu::STACK_ALIGN;
 pub(super) mod entry;
 mod handle;
 pub mod ipi;
+pub mod ptrace;
 
 pub struct RiscV64InterruptArch;
 
@@ -198,3 +199,5 @@ impl crate::process::rseq::RseqTrapFrame for TrapFrame {
         self.epc = ip;
     }
 }
+
+pub use ptrace::UserRegsStruct;

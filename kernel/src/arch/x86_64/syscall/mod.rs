@@ -1,15 +1,15 @@
 use crate::{
     arch::{
-        ipc::signal::X86_64SignalArch,
+        ipc::signal::{Signal, X86_64SignalArch},
         syscall::nr::{SYS_ARCH_PRCTL, SYS_RT_SIGRETURN},
         CurrentIrqArch,
     },
     exception::InterruptArch,
-    ipc::signal_types::SignalArch,
+    ipc::signal_types::{ChldCode, SignalArch},
     libs::align::SafeForZero,
     mm::VirtAddr,
-    process::ProcessManager,
-    syscall::{Syscall, SYS_SCHED},
+    process::{ptrace::PtraceStopReason, ProcessFlags, ProcessManager},
+    syscall::Syscall,
 };
 use log::debug;
 use system_error::SystemError;
@@ -65,20 +65,45 @@ macro_rules! syscall_return {
 
 #[no_mangle]
 pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
-    // 系统调用进入时，把系统调用号存入errcode字段，以便在syscall_handler退出后，仍能获取到系统调用号
-    frame.errcode = frame.rax;
-    let syscall_num = frame.rax as usize;
-    // 防止sys_sched由于超时无法退出导致的死锁
-    if syscall_num == SYS_SCHED {
-        unsafe {
-            CurrentIrqArch::interrupt_disable();
-        }
-    } else {
-        unsafe {
-            CurrentIrqArch::interrupt_enable();
-        }
+    // 系统调用进入时，把系统调用号存入 orig_rax 字段
+    // 用于恢复被 ptrace 修改的系统调用号
+    // frame.orig_rax = frame.rax;
+
+    // 系统调用进入时，始终开中断
+    unsafe {
+        CurrentIrqArch::interrupt_enable();
+    };
+
+    mfence();
+    let pid = ProcessManager::current_pcb().raw_pid();
+    let show = false;
+    if show {
+        debug!("syscall: pid: {:?}, num={:?}\n", pid, frame.rax as usize);
     }
 
+    let pcb = ProcessManager::current_pcb();
+
+    // 注意：必须同时检查 PTRACED 和 TRACE_SYSCALL 标志
+    let needs_syscall_trace = pcb.flags().contains(ProcessFlags::TRACE_SYSCALL);
+    if needs_syscall_trace {
+        // 设置停止原因
+        pcb.ptrace_state_mut().stop_reason = PtraceStopReason::SyscallEntry;
+        // 构造 syscall entry 的 exit_code: 0x80 | SIGTRAP
+        // 0x80 表示 PTRACE_SYSCALL_TRACE (PT_TRACESYSGOOD)
+        let exit_code = 0x80 | Signal::SIGTRAP as usize;
+
+        // 同步调用 ptrace_stop，阻塞直到 tracer 唤醒
+        // 这与 Linux 6.6.21 的 ptrace_report_syscall_entry() 行为一致
+        let _signr = pcb.ptrace_stop(exit_code, ChldCode::Trapped, None);
+
+        // ptrace_stop 返回后，检查 tracer 是否注入了信号
+        // 如果有致命信号，需要立即处理
+        // TODO: 处理注入信号
+    }
+
+    // 关键：必须在 ptrace_stop 返回之后重新读取系统调用号和参数！
+    // 因为 tracer 可能在我们睡眠时修改了寄存器。
+    let syscall_num = frame.rax as usize;
     let args = [
         frame.rdi as usize,
         frame.rsi as usize,
@@ -87,18 +112,9 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
         frame.r8 as usize,
         frame.r9 as usize,
     ];
-    mfence();
-    let pid = ProcessManager::current_pcb().raw_pid();
-    let show = false;
-    // let show = if syscall_num != SYS_SCHED && pid.data() >= 9{
-    //     true
-    // } else {
-    //     false
-    // };
 
-    if show {
-        debug!("syscall: pid: {:?}, num={:?}\n", pid, syscall_num);
-    }
+    // 保存系统调用入口信息（用于 PTRACE_GETSIGINFO）
+    pcb.on_syscall_entry(syscall_num, &args);
 
     // Arch specific syscall
     match syscall_num {
@@ -120,8 +136,34 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
         _ => {}
     }
     let mut syscall_handle = || -> u64 {
-        Syscall::catch_handle(syscall_num, &args, frame)
-            .unwrap_or_else(|e| e.to_posix_errno() as usize) as u64
+        let pcb = ProcessManager::current_pcb();
+        let result = Syscall::catch_handle(syscall_num, &args, frame)
+            .unwrap_or_else(|e| e.to_posix_errno() as usize) as u64;
+
+        // 先将结果写入 frame.rax，这样 tracer 可以通过 PTRACE_POKEUSER 修改返回值
+        frame.rax = result;
+
+        // 按照 Linux 6.6.21 的同步 ptrace 模型处理系统调用出口
+        // 在 syscall_exit_work() 中调用 ptrace_report_syscall_exit()
+        if pcb.flags().contains(ProcessFlags::TRACE_SYSCALL) {
+            // 设置停止原因
+            pcb.ptrace_state_mut().stop_reason = PtraceStopReason::SyscallExit;
+
+            // 构造 syscall exit 的 exit_code: 0x80 | SIGTRAP
+            let exit_code = 0x80 | Signal::SIGTRAP as usize;
+
+            // 同步调用 ptrace_stop，阻塞直到 tracer 唤醒
+            // 这与 Linux 6.6.21 的 ptrace_report_syscall_exit() 行为一致
+            let _signr =
+                pcb.ptrace_stop(exit_code, crate::ipc::signal_types::ChldCode::Trapped, None);
+
+            // ptrace_stop 返回后，tracer 可能修改了 frame.rax
+            // 必须返回 frame.rax 而不是原始 result
+            // TODO: 处理注入信号
+        }
+
+        // 返回 frame.rax，包含 tracer 可能的修改
+        frame.rax
     };
     syscall_return!(syscall_handle(), frame, show);
 }

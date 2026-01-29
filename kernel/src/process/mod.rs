@@ -1,3 +1,9 @@
+use alloc::{
+    ffi::CString,
+    string::{String, ToString},
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use core::{
     fmt,
     hash::Hash,
@@ -6,13 +12,6 @@ use core::{
     mem::ManuallyDrop,
     str::FromStr,
     sync::atomic::{compiler_fence, fence, AtomicBool, AtomicU8, AtomicUsize, Ordering},
-};
-
-use alloc::{
-    ffi::CString,
-    string::{String, ToString},
-    sync::{Arc, Weak},
-    vec::Vec,
 };
 use cred::INIT_CRED;
 use hashbrown::HashMap;
@@ -36,8 +35,8 @@ use crate::{
     },
     ipc::{
         sighand::SigHand,
-        signal::RestartBlock,
-        signal_types::{SigCode, SigInfo, SigPending, SigType, SignalFlags},
+        signal::{signal_wake_up, RestartBlock},
+        signal_types::{OriginCode, SigCode, SigInfo, SigPending, SigType, SignalFlags},
     },
     libs::{
         align::AlignedBox,
@@ -57,7 +56,10 @@ use crate::{
         ucontext::AddressSpace,
         PhysAddr, VirtAddr,
     },
-    process::resource::{RLimit64, RLimitID},
+    process::{
+        ptrace::PtraceState,
+        resource::{RLimit64, RLimitID},
+    },
     sched::{
         DequeueFlag, EnqueueFlag, OnRq, SchedMode, WakeupFlags, __schedule, completion::Completion,
         cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO,
@@ -89,6 +91,7 @@ pub mod pid;
 pub mod posix_timer;
 pub mod preempt;
 pub mod process_group;
+pub mod ptrace;
 pub mod resource;
 pub mod rseq;
 pub mod session;
@@ -283,47 +286,60 @@ impl ProcessManager {
     }
 
     /// 唤醒一个进程
+    /// 参考 Linux 的 try_to_wake_up，支持唤醒 Blocked 和 TracedStopped 状态的进程
     pub fn wakeup(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let state = pcb.sched_info().inner_lock_read_irqsave().state();
         let was_uninterruptible = matches!(state, ProcessState::Blocked(false));
-        if state.is_blocked() {
-            let mut writer = pcb.sched_info().inner_lock_write_irqsave();
-            let state = writer.state();
-            if state.is_blocked() {
-                writer.set_state(ProcessState::Runnable);
-                writer.set_wakeup();
 
-                // avoid deadlock
-                drop(writer);
+        // 类似 Linux 的 try_to_wake_up，检查任务状态并决定是否唤醒
+        // 支持 Blocked 和 TracedStopped 状态
+        let should_wake = state.is_blocked() || matches!(state, ProcessState::TracedStopped(_));
 
-                let rq =
-                    cpu_rq(pcb.sched_info().on_cpu().unwrap_or(current_cpu_id()).data() as usize);
-
-                let (rq, _guard) = rq.self_lock();
-                rq.update_rq_clock();
-                if was_uninterruptible {
-                    rq.dec_nr_uninterruptible();
-                }
-                rq.activate_task(
-                    pcb,
-                    EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK,
-                );
-
-                rq.check_preempt_currnet(pcb, WakeupFlags::empty());
-
-                // sched_enqueue(pcb.clone(), true);
-                return Ok(());
-            } else if state.is_exited() {
+        if !should_wake {
+            if state.is_exited() {
                 return Err(SystemError::EINVAL);
-            } else {
-                return Ok(());
             }
-        } else if state.is_exited() {
-            return Err(SystemError::EINVAL);
-        } else {
             return Ok(());
         }
+
+        let mut writer = pcb.sched_info().inner_lock_write_irqsave();
+        let current_state = writer.state();
+
+        // 双重检查，防止状态在获取锁之后改变
+        let is_target_state =
+            current_state.is_blocked() || matches!(current_state, ProcessState::TracedStopped(_));
+
+        if !is_target_state {
+            drop(writer);
+            if current_state.is_exited() {
+                return Err(SystemError::EINVAL);
+            }
+            return Ok(());
+        }
+
+        // 将状态改为 Runnable（对应 Linux 的 TASK_RUNNING）
+        writer.set_state(ProcessState::Runnable);
+        writer.set_wakeup();
+
+        // avoid deadlock
+        drop(writer);
+
+        let rq = cpu_rq(pcb.sched_info().on_cpu().unwrap_or(current_cpu_id()).data() as usize);
+
+        let (rq, _guard) = rq.self_lock();
+        rq.update_rq_clock();
+        if was_uninterruptible {
+            rq.dec_nr_uninterruptible();
+        }
+        rq.activate_task(
+            pcb,
+            EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK,
+        );
+
+        rq.check_preempt_currnet(pcb, WakeupFlags::empty());
+
+        return Ok(());
     }
 
     #[allow(dead_code)]
@@ -387,10 +403,10 @@ impl ProcessManager {
     pub fn wakeup_stop(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let state = pcb.sched_info().inner_lock_read_irqsave().state();
-        if let ProcessState::Stopped = state {
+        if let ProcessState::Stopped(_) = state {
             let mut writer = pcb.sched_info().inner_lock_write_irqsave();
             let state = writer.state();
-            if let ProcessState::Stopped = state {
+            if let ProcessState::Stopped(_) = state {
                 writer.set_state(ProcessState::Runnable);
                 // Stopped -> Runnable：必须清理 sleep 标志，否则调度器可能把该任务当作“睡眠出队”处理。
                 writer.set_wakeup();
@@ -431,7 +447,7 @@ impl ProcessManager {
     ///
     /// 注意：该函数用于对“目标进程”进行停止标记，不要求在目标进程上下文调用。
     /// 与 `mark_stop`（仅当前进程）相对应。
-    pub fn stop_task(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
+    pub fn stop_task(pcb: &Arc<ProcessControlBlock>, sig: Signal) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let mut writer = pcb.sched_info().inner_lock_write_irqsave();
         let state = writer.state();
@@ -441,7 +457,7 @@ impl ProcessManager {
 
         // Stopped 的任务不应继续留在 runqueue 中，否则仍可能被选中运行。
         let on_rq = *pcb.sched_info().on_rq.lock_irqsave();
-        writer.set_state(ProcessState::Stopped);
+        writer.set_state(ProcessState::Stopped(sig.into()));
         // stop 后不应再被视为“睡眠任务”，避免后续调度错误地做 DEQUEUE_SLEEP。
         writer.set_wakeup();
         pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
@@ -495,7 +511,7 @@ impl ProcessManager {
     ///
     /// - 进入当前函数之前，不能持有sched_info的锁
     /// - 进入当前函数之前，必须关闭中断
-    pub fn mark_stop() -> Result<(), SystemError> {
+    pub fn mark_stop(sig: Signal) -> Result<(), SystemError> {
         assert!(
             !CurrentIrqArch::is_irq_enabled(),
             "interrupt must be disabled before enter ProcessManager::mark_stop()"
@@ -504,7 +520,7 @@ impl ProcessManager {
         let pcb = ProcessManager::current_pcb();
         let mut writer = pcb.sched_info().inner_lock_write_irqsave();
         if !matches!(writer.state(), ProcessState::Exited(_)) {
-            writer.set_state(ProcessState::Stopped);
+            writer.set_state(ProcessState::Stopped(sig.into()));
             pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
             drop(writer);
 
@@ -537,9 +553,11 @@ impl ProcessManager {
         // 让INIT进程收养所有子进程
         if current.raw_pid() != RawPid(1) {
             unsafe {
-                current
-                    .adopt_childen()
-                    .unwrap_or_else(|e| panic!("adopte_childen failed: error: {e:?}"))
+                if let Err(e) = current.adopt_childen() {
+                    // Log error but don't panic - allow exit to continue
+                    // Init will inherit orphaned children
+                    log::error!("adopt_children failed during exit: {:?}. Children will be inherited by init.", e);
+                }
             };
             // 在通知父进程之前，先标记为 Zombie，保证 wait 可见
             current.set_exit_state_zombie();
@@ -549,30 +567,39 @@ impl ProcessManager {
             }
             let parent_pcb = r.unwrap();
 
-            // 检查子进程的exit_signal，只有在有效时才发送信号
-            let exit_signal = current.exit_signal.load(Ordering::SeqCst);
-            if exit_signal != Signal::INVALID {
-                let r = crate::ipc::kill::send_signal_to_pcb(parent_pcb.clone(), exit_signal);
-                if let Err(e) = r {
-                    warn!(
-                        "failed to send kill signal to {:?}'s parent pcb {:?}: {:?}",
-                        current.raw_pid(),
-                        parent_pcb.raw_pid(),
-                        e
-                    );
+            // 如果进程被 ptrace，忽略 exit_signal，总是发送 SIGCHLD
+            let is_ptraced = current.flags().contains(ProcessFlags::PTRACED);
+            let signal_to_send = if is_ptraced {
+                Signal::SIGCHLD
+            } else {
+                let exit_signal = current.exit_signal.load(Ordering::SeqCst);
+                if exit_signal == Signal::INVALID {
+                    Signal::SIGCHLD
+                } else {
+                    exit_signal
                 }
+            };
+
+            // 发送信号
+            let r = crate::ipc::kill::send_signal_to_pcb(parent_pcb.clone(), signal_to_send);
+            if let Err(e) = r {
+                warn!(
+                    "failed to send kill signal to {:?}'s parent pcb {:?}: {:?}",
+                    current.raw_pid(),
+                    parent_pcb.raw_pid(),
+                    e
+                );
             }
 
-            // 无论exit_signal是什么值，都要唤醒父进程的wait_queue
-            // 因为父进程可能使用__WALL选项等待任何类型的子进程（包括exit_signal=0的clone子进程）
-            // 根据Linux语义，exit_signal只决定发送什么信号，不决定是否唤醒父进程
+            // 要唤醒父进程的wait_queue，因为父进程可能使用__WALL选项等待任何类型的子进程
             parent_pcb
                 .wait_queue
                 .wakeup_all(Some(ProcessState::Blocked(true)));
 
-            // 根据 Linux wait 语义，线程组中的任何线程都可以等待同一线程组中任何线程创建的子进程。
-            // 由于子进程被添加到线程组 leader 的 children 列表中，
-            // 因此还需要唤醒线程组 leader 的 wait_queue（如果 leader 不是 parent_pcb 本身）。
+            // 唤醒父进程
+            parent_pcb.wake_up_process();
+
+            // 唤醒线程组 leader 的 wait_queue
             let parent_group_leader = {
                 let ti = parent_pcb.thread.read_irqsave();
                 ti.group_leader()
@@ -582,6 +609,7 @@ impl ProcessManager {
                     leader
                         .wait_queue
                         .wakeup_all(Some(ProcessState::Blocked(true)));
+                    leader.wake_up_process();
                 }
             }
             // todo: 这里还需要根据线程组的信息，决定信号的发送
@@ -611,6 +639,19 @@ impl ProcessManager {
                 spin_loop();
             }
         }
+
+        // 注意：不再在 exit() 中调用 ptrace_stop
+        // 按照 Linux 的语义：
+        // 1. 被 ptrace 的进程在收到信号时会调用 ptrace_stop（通过 ptrace_signal）
+        // 2. tracer 可以通过 waitpid 查看进程状态
+        // 3. 当进程退出时，应该直接退出，不需要再次调用 ptrace_stop
+        // 4. 这样 tracer 可以通过 waitpid(WEXITED) 回收进程
+        //
+        // 如果在 exit() 中调用 ptrace_stop，会导致：
+        // - tracer 无法通过 waitpid 回收子进程（因为子进程在 TracedStopped 状态）
+        // - tracer 收到 ESRCH 错误并退出
+        // - 子进程永远等待，形成死锁
+
         drop(current_pcb);
 
         // 关中断
@@ -739,7 +780,7 @@ impl ProcessManager {
                     let mut info = SigInfo::new(
                         Signal::SIGKILL,
                         0,
-                        SigCode::Kernel,
+                        SigCode::Origin(OriginCode::Kernel),
                         SigType::Kill {
                             pid: RawPid::new(0),
                             uid: 0,
@@ -805,6 +846,10 @@ impl ProcessManager {
     pub(super) unsafe fn release(pid: RawPid) {
         let pcb = ProcessManager::find(pid);
         if let Some(ref pcb) = pcb {
+            // 立即执行 exit_signal，清理 PID 等资源
+            // 确保 waitid 之后的调用能立即感知到进程已彻底消失（特别是 PID namespace 清理）
+            pcb.__exit_signal();
+
             // 从父进程的 children 列表中移除
             if let Some(parent) = pcb.real_parent_pcb() {
                 let parent_ns = parent.active_pid_ns();
@@ -852,7 +897,6 @@ impl ProcessManager {
     /// ## 参数
     ///
     /// - `pcb` : 进程的pcb
-    #[allow(dead_code)]
     pub fn kick(pcb: &Arc<ProcessControlBlock>) {
         ProcessManager::current_pcb().preempt_disable();
         let cpu_id = pcb.sched_info().on_cpu();
@@ -921,7 +965,9 @@ pub enum ProcessState {
     /// - 如果该bool为false,那么，这个进程必须被显式的唤醒，才能重新进入Runnable状态。
     Blocked(bool),
     /// 进程被信号终止
-    Stopped,
+    Stopped(usize),
+    /// 用于ptrace跟踪停止的状态 (TASK_TRACED)，携带退出码
+    TracedStopped(usize),
     /// 进程已经退出，usize表示进程的退出码
     Exited(usize),
 }
@@ -944,7 +990,6 @@ impl ExitState {
     }
 }
 
-#[allow(dead_code)]
 impl ProcessState {
     #[inline(always)]
     pub fn is_runnable(&self) -> bool {
@@ -967,19 +1012,24 @@ impl ProcessState {
         return matches!(self, ProcessState::Exited(_));
     }
 
-    /// Returns `true` if the process state is [`Stopped`].
+    /// Returns `true` if the process state is [`Stopped`] or [`TracedStopped`].
     ///
     /// [`Stopped`]: ProcessState::Stopped
+    /// [`TracedStopped`]: ProcessState::TracedStopped
     #[inline(always)]
     pub fn is_stopped(&self) -> bool {
-        matches!(self, ProcessState::Stopped)
+        matches!(
+            self,
+            ProcessState::Stopped(_) | ProcessState::TracedStopped(_)
+        )
     }
 
-    /// Returns exit code if the process state is [`Exited`].
+    /// Returns exit code if the process state is [`Exited`] or [`TracedStopped`].
     #[inline(always)]
     pub fn exit_code(&self) -> Option<usize> {
         match self {
             ProcessState::Exited(code) => Some(*code),
+            ProcessState::TracedStopped(code) => Some(*code),
             _ => None,
         }
     }
@@ -1017,11 +1067,51 @@ bitflags! {
         const NEED_RSEQ = 1 << 12;
         /// 进程正在等待 IO 操作完成（用于 iowait 统计）
         const IN_IOWAIT = 1 << 13;
+        /// 进程当前停止
+        const STOPPED = 1 << 14;
+        /// 进程当前由ptrace跟踪
+        const PTRACED = 1 << 15;
+        /// ptrace 正在停止（用于 attach/stop 的同步）
+        const TRAPPING = 1 << 16;
+        /// 跟踪器已发出PTRACE_SYSCALL请求
+        const TRACE_SYSCALL = 1 << 17;
+        /// 跟踪器已发出PTRACE_SINGLESTEP请求
+        const TRACE_SINGLESTEP = 1 << 18;
+        /// 跟踪器设置了TRACE_EXIT选项
+        const TRACE_EXIT = 1 << 19;
+        /// 跟踪器设置了TRACE_FORK/CLONE选项
+        const TRACE_FORK = 1 << 20;
+        /// 跟踪器设置了TRACE_VFORK选项
+        const TRACE_VFORK = 1 << 21;
+        /// 跟踪器设置了TRACE_EXEC选项
+        const TRACE_EXEC = 1 << 22;
+        /// 系统调用正在中断点（入口或出口）
+        const SYSCALL_INTERRUPT = 1 << 23;
+        /// 进程通过 PTRACE_SEIZE 被附加（而非 PTRACE_ATTACH）
+        /// SEIZED 进程不会收到 Legacy SIGTRAP
+        const PT_SEIZED = 1 << 24;
     }
 }
 
 impl ProcessFlags {
+    /// 获取需要在系统调用返回到用户态前处理的工作标志
+    ///
+    /// _TIF_WORK_MASK 语义：
+    /// - TIF_SIGPENDING (HAS_PENDING_SIGNAL): 有待处理的信号
+    /// - TIF_NEED_RESCHED (NEED_SCHEDULE): 需要调度
+    /// - TIF_NOTIFY_RESUME (NEED_RSEQ): 需要处理 rseq
     pub const fn exit_to_user_mode_work(&self) -> Self {
+        Self::from_bits_truncate(
+            self.bits
+                & (Self::HAS_PENDING_SIGNAL.bits | Self::NEED_SCHEDULE.bits | Self::NEED_RSEQ.bits),
+        )
+    }
+
+    /// 获取需要在中断返回到用户态前处理的工作标志
+    ///
+    /// 中断返回路径不需要检查 NEED_SCHEDULE，因为调度在其他地方处理
+    #[allow(dead_code)]
+    pub const fn exit_to_user_mode_work_irq(&self) -> Self {
         Self::from_bits_truncate(self.bits & (Self::HAS_PENDING_SIGNAL.bits | Self::NEED_RSEQ.bits))
     }
 
@@ -1061,6 +1151,15 @@ pub struct ProcessItimers {
     pub prof: CpuItimer,             // 用于 ITIMER_PROF
 }
 
+#[derive(Debug, Default)]
+#[allow(dead_code)]
+pub struct SyscallInfo {
+    /// 系统调用入口信息（系统调用号、参数、返回值）
+    syscall_num: usize,
+    args: [usize; 6],
+    result: isize,
+}
+
 #[derive(Debug)]
 pub struct ProcessControlBlock {
     /// 当前进程的pid
@@ -1098,7 +1197,6 @@ pub struct ProcessControlBlock {
     sig_altstack: RwLock<SigStackArch>,
     /// 退出状态（Running/Zombie/Dead）
     exit_state: AtomicU8,
-
     /// 退出信号S
     exit_signal: AtomicSignal,
     /// 父进程退出时要发送给当前进程的信号（PR_SET_PDEATHSIG）
@@ -1159,6 +1257,11 @@ pub struct ProcessControlBlock {
     cmdline: RwLock<Vec<u8>>,
     /// 资源限制（rlimit）数组
     rlimits: RwLock<[RLimit64; RLimitID::Nlimits as usize]>,
+
+    /// ptrace跟踪状态
+    ptrace_state: SpinLock<PtraceState>,
+    /// 被ptrace跟踪的进程列表（跟踪器跟踪了哪些进程）
+    ptraced_list: RwLock<Vec<RawPid>>,
 }
 
 impl ProcessControlBlock {
@@ -1238,6 +1341,7 @@ impl ProcessControlBlock {
         let ppcb: Weak<ProcessControlBlock> = ProcessManager::find_task_by_vpid(ppid)
             .map(|p| Arc::downgrade(&p))
             .unwrap_or_default();
+        let ptrace_state = SpinLock::new(PtraceState::default());
 
         // 使用 Arc::new_cyclic 避免在栈上创建巨大的结构体
         let pcb = Arc::new_cyclic(|weak| {
@@ -1287,6 +1391,8 @@ impl ProcessControlBlock {
                 executable_path: RwLock::new(name),
                 cmdline: RwLock::new(Vec::new()),
                 rlimits: RwLock::new(Self::default_rlimits()),
+                ptrace_state,
+                ptraced_list: RwLock::new(Vec::new()),
             };
 
             pcb.sig_info.write().set_tty(tty);
@@ -1712,17 +1818,47 @@ impl ProcessControlBlock {
 
     /// 当前进程退出时,让初始进程收养所有子进程
     unsafe fn adopt_childen(&self) -> Result<(), SystemError> {
-        // 取出并清空 children 列表，避免后续 wait/reparent 出现重复。
-        let child_pids: Vec<RawPid> = {
-            let mut children_guard = self.children.write();
-            core::mem::take(&mut *children_guard)
+        // 取出 children 列表（但不清空，我们会选择性地保留 ptraced 子进程）
+        let all_child_pids: Vec<RawPid> = {
+            let children_guard = self.children.read();
+            children_guard.clone()
         };
 
-        if child_pids.is_empty() {
+        if all_child_pids.is_empty() {
             return Ok(());
         }
 
-        self.notify_parent_exit_for_children(&child_pids);
+        // 按照 Linux 6.6.21 的 ptrace 语义：
+        // 如果子进程正在被当前进程 ptrace，则不要转移它
+        // tracer 需要能够 wait 这个子进程，即使子进程已经退出
+        let mut ptraced_children: Vec<RawPid> = Vec::new();
+        let mut children_to_adopt: Vec<RawPid> = Vec::new();
+
+        for pid in all_child_pids.iter().copied() {
+            if let Some(child) = ProcessManager::find_task_by_vpid(pid) {
+                // 检查子进程是否被当前进程 ptrace
+                if let Some(child_parent) = child.parent_pcb() {
+                    if Arc::ptr_eq(&child_parent, &self.self_ref.upgrade().unwrap()) {
+                        // 子进程的 parent_pcb 指向当前进程，说明是被 ptrace 的
+                        // 不转移这个子进程
+                        ptraced_children.push(pid);
+                        continue;
+                    }
+                }
+                children_to_adopt.push(pid);
+            }
+        }
+
+        // 只清空并转移非 ptraced 的子进程
+        if !children_to_adopt.is_empty() {
+            let mut children_guard = self.children.write();
+            children_guard.retain(|pid| !children_to_adopt.contains(pid));
+        } else {
+            // 所有子进程都是 ptraced 的，不需要转移任何子进程
+            return Ok(());
+        }
+
+        self.notify_parent_exit_for_children(&children_to_adopt);
 
         let init_pcb = ProcessManager::find_task_by_vpid(RawPid(1)).ok_or(SystemError::ECHILD)?;
 
@@ -1737,7 +1873,7 @@ impl ProcessControlBlock {
                 let parent_init =
                     ProcessManager::find_task_by_pid_ns(RawPid(1), &parent_pcb.active_pid_ns());
                 if let Some(parent_init) = parent_init {
-                    for pid in child_pids.iter().copied() {
+                    for pid in children_to_adopt.iter().copied() {
                         if let Some(child) = ProcessManager::find_task_by_vpid(pid) {
                             *child.parent_pcb.write_irqsave() = Arc::downgrade(&parent_init);
                             *child.real_parent_pcb.write_irqsave() = Arc::downgrade(&parent_init);
@@ -1759,7 +1895,7 @@ impl ProcessControlBlock {
             return Ok(());
         }
 
-        // 常规情况：优先 reparent 到“最近祖先 subreaper”，否则 reparent 到 init。
+        // 常规情况：优先 reparent 到"最近祖先 subreaper"，否则 reparent 到 init。
         let mut reaper: Arc<ProcessControlBlock> = init_pcb.clone();
         let mut cursor = self.parent_pcb();
         while let Some(p) = cursor {
@@ -1781,7 +1917,7 @@ impl ProcessControlBlock {
             cursor = leader.parent_pcb();
         }
 
-        for pid in child_pids.iter().copied() {
+        for pid in children_to_adopt.iter().copied() {
             if let Some(child) = ProcessManager::find_task_by_vpid(pid) {
                 *child.parent_pcb.write_irqsave() = Arc::downgrade(&reaper);
                 *child.real_parent_pcb.write_irqsave() = Arc::downgrade(&reaper);
@@ -1861,6 +1997,21 @@ impl ProcessControlBlock {
     #[inline]
     pub fn rseq_state_mut(&self) -> RwLockWriteGuard<'_, rseq::RseqState> {
         self.rseq_state.write_irqsave()
+    }
+
+    /// 获取 ptrace 状态的可变引用
+    #[inline]
+    pub fn ptrace_state_mut(&self) -> SpinLockGuard<'_, PtraceState> {
+        self.ptrace_state.lock()
+    }
+
+    /// 唤醒进程（用于子进程退出时唤醒父进程）
+    ///
+    /// 当子进程退出时，需要唤醒父进程，即使父进程不在 wait() 中睡眠
+    /// 例如：父进程可能在 nanosleep 中，被 SIGCHLD 唤醒后应该处理信号
+    #[inline]
+    pub fn wake_up_process(&self) {
+        signal_wake_up(self.self_ref.upgrade().unwrap(), false);
     }
 
     pub fn try_siginfo_mut(&self, times: u8) -> Option<RwLockWriteGuard<'_, ProcessSignalInfo>> {

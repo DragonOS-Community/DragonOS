@@ -83,3 +83,43 @@ impl From<&TrapFrame> for KProbeContext {
         }
     }
 }
+
+// RISC-V 64-bit 架构标识 (EM_RISCV = 243, 64-bit)
+const AUDIT_ARCH_RISCV64: u32 = 0xC000_00F3;
+
+/// 获取当前架构标识
+pub fn syscall_get_arch() -> u32 {
+    AUDIT_ARCH_RISCV64
+}
+
+/// 从 KProbeContext 获取指令指针 (pc)
+pub fn instruction_pointer(ctx: &KProbeContext) -> u64 {
+    ctx.pc as u64
+}
+
+/// 从 KProbeContext 获取用户栈指针 (sp)
+pub fn user_stack_pointer(ctx: &KProbeContext) -> u64 {
+    ctx.sp as u64
+}
+
+/// 从 KProbeContext 获取系统调用号 (a7)
+/// RISC-V 使用 a7 寄存器传递系统调用号
+pub fn syscall_get_nr(ctx: &KProbeContext) -> u64 {
+    ctx.a7 as u64
+}
+
+/// 从 KProbeContext 获取系统调用返回值 (a0)
+pub fn syscall_get_return_value(ctx: &KProbeContext) -> i64 {
+    ctx.a0 as i64
+}
+
+/// 从 KProbeContext 获取系统调用的前 6 个参数
+/// RISC-V 使用 a0-a5 寄存器传递系统调用参数
+pub fn syscall_get_arguments(ctx: &KProbeContext, args: &mut [u64; 6]) {
+    args[0] = ctx.a0 as u64;
+    args[1] = ctx.a1 as u64;
+    args[2] = ctx.a2 as u64;
+    args[3] = ctx.a3 as u64;
+    args[4] = ctx.a4 as u64;
+    args[5] = ctx.a5 as u64;
+}

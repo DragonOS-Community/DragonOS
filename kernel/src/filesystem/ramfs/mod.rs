@@ -375,7 +375,7 @@ impl IndexNode for LockedRamFSInode {
     fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
         let other: &LockedRamFSInode = other
             .downcast_ref::<LockedRamFSInode>()
-            .ok_or(SystemError::EPERM)?;
+            .ok_or(SystemError::EINVAL)?;
         let name = DName::from(name);
         let mut inode: MutexGuard<RamFSInode> = self.0.lock();
         let mut other_locked: MutexGuard<RamFSInode> = other.0.lock();

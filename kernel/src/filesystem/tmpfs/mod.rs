@@ -803,9 +803,10 @@ impl IndexNode for LockedTmpfsInode {
     }
 
     fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
+        // downcast 用于获取类型特定功能（跨文件系统检查已在 VFS 层完成）
         let other: &LockedTmpfsInode = other
             .downcast_ref::<LockedTmpfsInode>()
-            .ok_or(SystemError::EPERM)?;
+            .ok_or(SystemError::EINVAL)?;
         let name = DName::from(name);
         let mut inode: MutexGuard<TmpfsInode> = self.0.lock();
         let mut other_locked: MutexGuard<TmpfsInode> = other.0.lock();
@@ -854,7 +855,11 @@ impl IndexNode for LockedTmpfsInode {
         drop(deleted_inode);
 
         let mut deleted_guard = to_delete.0.lock();
-        deleted_guard.metadata.nlinks -= 1;
+        deleted_guard.metadata.nlinks = deleted_guard
+            .metadata
+            .nlinks
+            .checked_sub(1)
+            .expect("tempfs nlinks underflow: filesystem corruption detected");
 
         let should_free = deleted_guard.metadata.nlinks == 0;
         drop(deleted_guard);

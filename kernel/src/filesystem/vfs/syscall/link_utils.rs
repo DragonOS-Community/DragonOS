@@ -29,7 +29,8 @@ pub fn do_linkat(
     new: &str,
     flags: AtFlags,
 ) -> Result<usize, SystemError> {
-    if new.ends_with('/') {
+    // new 路径不能为空（只有 old 支持 AT_EMPTY_PATH）
+    if new.is_empty() || new.ends_with('/') {
         return Err(SystemError::ENOENT);
     }
 
@@ -37,7 +38,16 @@ pub fn do_linkat(
     if !(AtFlags::AT_EMPTY_PATH | AtFlags::AT_SYMLINK_FOLLOW).contains(flags) {
         return Err(SystemError::EINVAL);
     }
-    // TODO AT_EMPTY_PATH标志启用时，进行调用者CAP_DAC_READ_SEARCH或相似的检查
+
+    // AT_EMPTY_PATH 需要调用者具有 CAP_DAC_READ_SEARCH 能力
+    // 参考 Linux: "To use null names we require CAP_DAC_READ_SEARCH"
+    if flags.contains(AtFlags::AT_EMPTY_PATH) {
+        let pcb = ProcessManager::current_pcb();
+        if !pcb.cred().has_capability(CAPFlags::CAP_DAC_READ_SEARCH) {
+            return Err(SystemError::ENOENT);
+        }
+    }
+
     let follow_last_symlink = flags.contains(AtFlags::AT_SYMLINK_FOLLOW);
     let pcb = ProcessManager::current_pcb();
 
@@ -65,7 +75,7 @@ pub fn do_linkat(
     };
 
     // old_inode为目录时返回EPERM
-    if old_inode.metadata().unwrap().file_type == FileType::Dir {
+    if old_inode.metadata()?.file_type == FileType::Dir {
         return Err(SystemError::EPERM);
     }
     // 硬链接安全检查
@@ -77,7 +87,14 @@ pub fn do_linkat(
     let new_parent = new_begin_inode
         .lookup_follow_symlink(new_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
-    // 被调用者利用downcast_ref判断两inode是否为同一文件系统
+    // 跨文件系统检查：类似 Linux 的 "if (dir->i_sb != inode->i_sb) return -EXDEV;"
+    // 通过比较文件系统指针地址判断是否为同一文件系统实例
+    let new_parent_fs = new_parent.fs();
+    let old_inode_fs = old_inode.fs();
+    if !Arc::ptr_eq(&new_parent_fs, &old_inode_fs) {
+        return Err(SystemError::EXDEV);
+    }
+
     return new_parent.link(new_name, &old_inode).map(|_| 0);
 }
 
@@ -120,6 +137,28 @@ fn may_linkat(old_inode: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
 }
 
 /// 判断硬链接源是否"安全"
+///
+/// 这是 protected_hardlinks 安全机制的核心检查函数。
+/// 为了防止通过硬链接攻击获取提升的权限，只有满足所有安全条件的文件才允许被硬链接。
+///
+/// 返回 false 如果满足以下任一条件：
+/// - inode 不是普通文件（特殊文件如 FIFO、设备、符号链接等）
+/// - inode 有 setuid 位
+/// - inode 有 setgid 位且 group-exec 位（可执行的 setgid 文件）
+/// - 调用者对文件没有读写权限
+///
+/// 否则返回 true。
+///
+/// ## 参数
+///
+/// - `metadata`: 源 inode 的元数据
+/// - `cred`: 当前进程的凭证
+///
+/// ## 返回值
+///
+/// - `Ok(true)`: 硬链接源安全，允许创建硬链接
+/// - `Ok(false)`: 硬链接源不安全，不允许创建硬链接
+/// - `Err(SystemError::EACCES)`: 权限检查失败
 fn safe_hardlink_source(metadata: &Metadata, cred: &Arc<Cred>) -> Result<bool, SystemError> {
     let mode = metadata.mode;
     let file_type = metadata.file_type;

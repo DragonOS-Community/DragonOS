@@ -852,11 +852,18 @@ impl IndexNode for LockedTmpfsInode {
             .ok_or(SystemError::EIO)?;
 
         drop(deleted_inode);
-        to_delete.0.lock().metadata.nlinks -= 1;
+
+        let mut deleted_guard = to_delete.0.lock();
+        deleted_guard.metadata.nlinks -= 1;
+
+        let should_free = deleted_guard.metadata.nlinks == 0;
+        drop(deleted_guard);
+
         inode.children.remove(&name);
 
-        // 减少文件系统使用的大小
-        tmpfs.decrease_size(file_size);
+        if should_free {
+            tmpfs.decrease_size(file_size);
+        }
 
         Ok(())
     }

@@ -97,7 +97,7 @@ impl Cred {
 
     /// 检查当前进程是否以 inode 所有者的身份运行
     #[inline]
-    fn is_owner(&self, metadata: &Metadata) -> bool {
+    pub fn is_owner(&self, metadata: &Metadata) -> bool {
         self.fsuid.data() == metadata.uid
     }
 

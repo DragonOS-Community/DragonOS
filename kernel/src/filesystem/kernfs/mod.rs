@@ -208,7 +208,7 @@ impl IndexNode for KernFSInode {
 
     fn link(&self, _name: &str, _other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
         // 应当通过kernfs的其它方法来操作文件，而不能从用户态直接调用此方法。
-        return Err(SystemError::ENOSYS);
+        return Err(SystemError::EROFS);
     }
 
     fn unlink(&self, _name: &str) -> Result<(), SystemError> {

@@ -191,7 +191,7 @@ impl Syscall for SysPivotRootHandle {
         let mnt_ns = ProcessManager::current_mntns();
 
         // 1. 保存旧的根 MountFS（用于后续设置当前目录）
-        let old_root_mntfs = mnt_ns.root_mntfs().clone();
+        let _old_root_mntfs = mnt_ns.root_mntfs().clone();
         let old_root_inode = mnt_ns.root_inode();
 
         // log::info!(

@@ -334,7 +334,7 @@ fn do_new_mount(
     data: Option<String>,
     mount_flags: MountFlags,
 ) -> Result<Arc<MountFS>, SystemError> {
-    let target_path = target_inode
+    let _target_path = target_inode
         .absolute_path()
         .unwrap_or_else(|_| "?".to_string());
     let fs_type_str = filesystemtype.ok_or(SystemError::EINVAL)?;
@@ -447,7 +447,7 @@ fn do_bind_mount(
 
     // Get the source's filesystem
     let source_fs = source_inode.fs();
-    let source_path_res = source_inode
+    let _source_path_res = source_inode
         .absolute_path()
         .unwrap_or_else(|_| source_path.clone());
 

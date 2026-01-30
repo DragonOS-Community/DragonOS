@@ -307,10 +307,7 @@ impl IndexNode for LockedExt4Inode {
             .clone()
             .downcast_arc::<LockedExt4Inode>()
             .ok_or(SystemError::EINVAL)?;
-        let other = other
-            .downcast_ref::<LockedExt4Inode>()
-            .ok_or(SystemError::EPERM)?;
-        let other_inode_num = other.0.lock().inner_inode_num;
+        let other_inode_num = other_arc.0.lock().inner_inode_num;
 
         let my_attr = ext4.getattr(inode_num)?;
         let other_attr = ext4.getattr(other_inode_num)?;

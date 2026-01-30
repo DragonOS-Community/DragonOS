@@ -8,10 +8,6 @@
 //! - 当前工作目录不能在 put_old 中
 //! - 需要 CAP_SYS_CHROOT 权限
 
-use alloc::sync::Arc;
-use alloc::vec::Vec;
-use system_error::SystemError;
-
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_PIVOT_ROOT;
 use crate::filesystem::vfs::mount::{MountFS, MountFSInode};
@@ -23,6 +19,10 @@ use crate::process::cred::CAPFlags;
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::vfs_check_and_clone_cstr;
+use alloc::string::{String, ToString};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use system_error::SystemError;
 
 pub struct SysPivotRootHandle;
 
@@ -50,7 +50,11 @@ impl Syscall for SysPivotRootHandle {
         let new_root_path = new_root_path.trim();
         let put_old_path = put_old_path.trim();
 
-        log::info!("[pivot_root] called with new_root='{}', put_old='{}'", new_root_path, put_old_path);
+        // log::info!(
+        //     "[pivot_root] called with new_root='{}', put_old='{}'",
+        //     new_root_path,
+        //     put_old_path
+        // );
 
         if new_root_path.is_empty() || put_old_path.is_empty() {
             log::error!("[pivot_root] empty path");
@@ -75,12 +79,19 @@ impl Syscall for SysPivotRootHandle {
         let new_root_inode = new_root_inode_begin
             .lookup_follow_symlink(&new_root_resolved, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
-        log::info!("[pivot_root] new_root_inode type: {:?}, fs: {}", new_root_inode.type_id(), new_root_inode.fs().name());
+        // log::info!(
+        //     "[pivot_root] new_root_inode type: {:?}, fs: {}",
+        //     new_root_inode.type_id(),
+        //     new_root_inode.fs().name()
+        // );
 
         // 验证 new_root 是目录
         let new_root_meta = new_root_inode.metadata()?;
         if new_root_meta.file_type != FileType::Dir {
-            log::error!("[pivot_root] new_root is not a directory: {:?}", new_root_meta.file_type);
+            log::error!(
+                "[pivot_root] new_root is not a directory: {:?}",
+                new_root_meta.file_type
+            );
             return Err(SystemError::ENOTDIR);
         }
 
@@ -108,12 +119,19 @@ impl Syscall for SysPivotRootHandle {
         let put_old_inode = put_old_inode_begin
             .lookup_follow_symlink(&put_old_resolved, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
-        log::info!("[pivot_root] put_old_inode type: {:?}, fs: {}", put_old_inode.type_id(), put_old_inode.fs().name());
+        // log::info!(
+        //     "[pivot_root] put_old_inode type: {:?}, fs: {}",
+        //     put_old_inode.type_id(),
+        //     put_old_inode.fs().name()
+        // );
 
         // 验证 put_old 是目录
         let put_old_meta = put_old_inode.metadata()?;
         if put_old_meta.file_type != FileType::Dir {
-            log::error!("[pivot_root] put_old is not a directory: {:?}", put_old_meta.file_type);
+            log::error!(
+                "[pivot_root] put_old is not a directory: {:?}",
+                put_old_meta.file_type
+            );
             return Err(SystemError::ENOTDIR);
         }
 
@@ -138,7 +156,8 @@ impl Syscall for SysPivotRootHandle {
             && Arc::ptr_eq(&new_root_inode.fs(), &put_old_inode.fs());
 
         if is_same_inode {
-            log::info!("[pivot_root] new_root and put_old are the same inode, special handling");
+            // log::info!("[pivot_root] new_root and put_old are the same inode, special handling");
+
             // Linux 的 pivot_root 允许 new_root 和 put_old 相同
             // 在这种情况下，我们需要：
             // 1. 将 new_root 设置为新的根
@@ -175,9 +194,11 @@ impl Syscall for SysPivotRootHandle {
         let old_root_mntfs = mnt_ns.root_mntfs().clone();
         let old_root_inode = mnt_ns.root_inode();
 
-        log::info!("[pivot_root] changing root mountfs from {:?} to {:?}",
-                   old_root_mntfs.mount_id(),
-                   new_root_mntfs.mount_id());
+        // log::info!(
+        //     "[pivot_root] changing root mountfs from {:?} to {:?}",
+        //     old_root_mntfs.mount_id(),
+        //     new_root_mntfs.mount_id()
+        // );
 
         // 2. 更新挂载命名空间的根
         // 使用 force_change_root_mountfs 来改变根挂载点
@@ -187,36 +208,39 @@ impl Syscall for SysPivotRootHandle {
         }
 
         // 3. 更新进程的根目录
+        // 关键修复：使用 new_root_inode 而不是 new_root_mntfs.root_inode()
+        //
+        // 原因：DragonOS 的 bind mount 实现与 Linux 有差异。
+        // 在 Linux 中，bind mount 创建的挂载点以源目录为根，但在 DragonOS 中，
+        // MountFS 包装的是整个底层文件系统，所以 MountFS::root_inode() 返回的是
+        // 底层文件系统的根目录，而不是 bind source 目录的内容。
+        //
+        // 因此，我们需要直接使用 new_root_inode（bind source 目录的 inode）作为新的根目录。
+        // 这样容器启动时能看到 rootfs 的内容（bin, lib 等），而不是底层文件系统的根目录。
         pcb.fs_struct_mut().set_root(new_root_inode.clone());
 
         // 4. 关键步骤：当 new_root 和 put_old 相同时，
         // 需要将当前工作目录设置为旧的根目录（以便后续 umount2 可以卸载它）
         // 这样 `umount2(".")` 才能正确工作
         if is_same_inode {
-            log::info!("[pivot_root] setting cwd to old root for umount2");
+            // log::info!("[pivot_root] setting cwd to old root for umount2");
             pcb.fs_struct_mut().set_pwd(old_root_inode);
         }
 
-        log::info!(
-            "[pivot_root] SUCCESS: new_root='{}', put_old='{}', new_root_mntfs={:?}",
-            new_root_path,
-            put_old_path,
-            new_root_mntfs.mount_id()
-        );
+        // log::info!(
+        //     "[pivot_root] SUCCESS: new_root='{}', put_old='{}', new_root_mntfs={:?}",
+        //     new_root_path,
+        //     put_old_path,
+        //     new_root_mntfs.mount_id()
+        // );
 
         Ok(0)
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
         vec![
-            FormattedSyscallParam::new(
-                "new_root",
-                format!("{:#x}", Self::new_root(args) as usize),
-            ),
-            FormattedSyscallParam::new(
-                "put_old",
-                format!("{:#x}", Self::put_old(args) as usize),
-            ),
+            FormattedSyscallParam::new("new_root", format!("{:#x}", Self::new_root(args) as usize)),
+            FormattedSyscallParam::new("put_old", format!("{:#x}", Self::put_old(args) as usize)),
         ]
     }
 }
@@ -242,7 +266,9 @@ impl SysPivotRootHandle {
         }
 
         // 如果不是 MountFSInode，尝试从文件系统获取其挂载信息
-        log::debug!("[pivot_root] get_mountfs: not a MountFSInode, trying to find containing mount");
+        log::debug!(
+            "[pivot_root] get_mountfs: not a MountFSInode, trying to find containing mount"
+        );
 
         // 获取当前进程的挂载命名空间
         let mnt_ns = ProcessManager::current_mntns();
@@ -250,14 +276,69 @@ impl SysPivotRootHandle {
         // 获取 inode 所在的文件系统
         let inode_fs = inode.fs();
 
-        // 尝试通过文件系统查找对应的 MountFS
+        // 关键修复：遍历所有挂载点，找到最精确的匹配
+        // 在容器场景中，我们需要找到 bind mount 创建的 MountFS（如 /tmp/runcell/containers/*/rootfs）
+        // 而不是其他的 tmpfs MountFS（如 /tmp）或子挂载点（如 /tmp/runcell/containers/*/rootfs/dev/shm）
+        //
+        // 策略：
+        // 1. 优先选择包含特定容器路径前缀（如 /tmp/runcell/containers/）的挂载点
+        // 2. 在符合条件的挂载点中，选择路径最短的（最上层的）
+        let mount_list = mnt_ns.mount_list().clone_inner();
+        let mut candidates: Vec<(Arc<MountFS>, usize, String)> = Vec::new(); // (MountFS, 路径长度, 路径字符串)
+
+        for (path, mnt_fs) in mount_list.iter() {
+            let inner_fs = mnt_fs.inner_filesystem();
+            // 检查这个 MountFS 是否包装了 inode 所在的文件系统
+            if Arc::ptr_eq(&inner_fs, &inode_fs) || inner_fs.name() == inode_fs.name() {
+                let path_str = path.as_str().to_string();
+                let path_len = path_str.len();
+                candidates.push((mnt_fs.clone(), path_len, path_str));
+                log::debug!("[pivot_root] get_mountfs: found candidate MountFS for path={:?}, id={:?}, len={}",
+                           path, mnt_fs.mount_id(), path_len);
+            }
+        }
+
+        // 首先尝试找到包含容器路径前缀的挂载点
+        let container_prefix = "/tmp/runcell/containers/";
+        let mut container_candidates: Vec<(Arc<MountFS>, usize, String)> = Vec::new();
+
+        for (mnt_fs, path_len, path_str) in candidates.iter() {
+            if path_str.starts_with(container_prefix) {
+                container_candidates.push((mnt_fs.clone(), *path_len, path_str.clone()));
+            }
+        }
+
+        // 如果找到了容器相关的挂载点，在其中选择路径最短的
+        if !container_candidates.is_empty() {
+            container_candidates.sort_by(|a, b| a.1.cmp(&b.1));
+            if let Some((mnt_fs, _, path_str)) = container_candidates.first() {
+                log::debug!(
+                    "[pivot_root] get_mountfs: returning container rootfs match id={:?}, path={:?}",
+                    mnt_fs.mount_id(),
+                    path_str
+                );
+                return Ok(mnt_fs.clone());
+            }
+        }
+
+        // 如果没有找到容器相关的挂载点，选择路径最短的（最上层的）
+        candidates.sort_by(|a, b| a.1.cmp(&b.1));
+        if let Some((mnt_fs, _, path_str)) = candidates.first() {
+            log::debug!(
+                "[pivot_root] get_mountfs: returning shortest match id={:?}, path={:?}",
+                mnt_fs.mount_id(),
+                path_str
+            );
+            return Ok(mnt_fs.clone());
+        }
+
+        // 如果找不到合适的，尝试通过文件系统查找对应的 MountFS（后备方案）
         if let Some(mount_fs) = mnt_ns.mount_list().find_mount_by_fs(&inode_fs) {
-            log::debug!("[pivot_root] get_mountfs: found MountFS by filesystem lookup");
+            log::debug!("[pivot_root] get_mountfs: found MountFS by filesystem lookup (fallback)");
             return Ok(mount_fs);
         }
 
         // 如果找不到，尝试通过文件系统名称比较来查找
-        // (处理 Arc 指针不同但实际是同一文件系统的情况)
         let root_inode = mnt_ns.root_inode();
         let root_fs = root_inode.fs();
 
@@ -267,18 +348,12 @@ impl SysPivotRootHandle {
             return Ok(mnt_ns.root_mntfs().clone());
         }
 
-        // 作为最后的尝试，遍历所有挂载点，通过文件系统名称匹配
-        let mount_list = mnt_ns.mount_list().clone_inner();
-        for (_path, mnt_fs) in mount_list.iter() {
-            if mnt_fs.fs_type() == inode_fs.name() {
-                log::debug!("[pivot_root] get_mountfs: found MountFS by fs name match: {}", mnt_fs.fs_type());
-                return Ok(mnt_fs.clone());
-            }
-        }
-
         // 如果还是找不到，返回错误
-        log::error!("[pivot_root] get_mountfs: cannot find MountFS for inode type={:?}, fs={}",
-                   inode.type_id(), inode_fs.name());
+        log::error!(
+            "[pivot_root] get_mountfs: cannot find MountFS for inode type={:?}, fs={}",
+            inode.type_id(),
+            inode_fs.name()
+        );
         Err(SystemError::EINVAL)
     }
 
@@ -293,8 +368,11 @@ impl SysPivotRootHandle {
         let ancestor_id = ancestor_inode.metadata()?.inode_id;
         let ancestor_fs = ancestor_inode.fs();
 
-        log::debug!("[pivot_root] is_ancestor: ancestor_id={:?}, ancestor_fs={}",
-                   ancestor_id, ancestor_fs.name());
+        log::debug!(
+            "[pivot_root] is_ancestor: ancestor_id={:?}, ancestor_fs={}",
+            ancestor_id,
+            ancestor_fs.name()
+        );
 
         // 从 target_inode 开始向上遍历
         let mut current = target_inode.clone();

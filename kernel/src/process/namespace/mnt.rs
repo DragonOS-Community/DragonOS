@@ -165,9 +165,11 @@ impl MntNamespace {
             // Return the current mount namespace if CLONE_NEWNS is not set
             return Ok(self.self_ref.upgrade().unwrap());
         }
+        // log::info!("[copy_mnt_ns] Creating new mount namespace, copying from current ns");
         let inner = self.inner.lock();
 
         let old_root_mntfs = self.root_mntfs().clone();
+        // log::info!("[copy_mnt_ns] old_root: fs_type={}, fs={}", old_root_mntfs.fs_type(), old_root_mntfs.name());
         let mut queue: Vec<MountFSCopyInfo> = Vec::new();
 
         // 由于root mntfs比较特殊，因此单独复制。
@@ -199,6 +201,7 @@ impl MntNamespace {
             }
         }
         // 将root mntfs下的所有挂载点复制到新的mntns中
+        // log::info!("[copy_mnt_ns] old_root has {} mountpoints", old_root_mntfs.mountpoints().len());
         for (ino, mfs) in old_root_mntfs.mountpoints().iter() {
             let mount_path = inner
                 .mount_list
@@ -211,6 +214,13 @@ impl MntNamespace {
                     );
                 })
                 .unwrap();
+            // log::info!(
+            //     "[copy_mnt_ns] copying mount: ino={:?}, path={:?}, fs={}, fs_type={}",
+            //     ino,
+            //     mount_path,
+            //     mfs.name(),
+            //     mfs.fs_type()
+            // );
 
             queue.push(MountFSCopyInfo {
                 old_mount_fs: mfs.clone(),

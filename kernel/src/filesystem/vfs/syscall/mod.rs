@@ -11,7 +11,6 @@ mod readlink_at;
 mod rename_utils;
 mod sys_chdir;
 mod sys_chroot;
-mod sys_pivot_root;
 mod sys_close;
 mod sys_dup;
 mod sys_dup3;
@@ -36,6 +35,7 @@ mod sys_lseek;
 mod sys_mkdirat;
 pub mod sys_mknodat;
 mod sys_openat;
+mod sys_pivot_root;
 #[cfg(target_arch = "x86_64")]
 mod sys_poll;
 mod sys_ppoll;

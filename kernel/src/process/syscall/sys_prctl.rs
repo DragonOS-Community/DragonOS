@@ -2,7 +2,12 @@ use alloc::string::ToString;
 use core::{cmp, ffi::c_int, mem};
 use num_traits::FromPrimitive;
 
-use alloc::{borrow::ToOwned, string::String, sync::{Arc, Weak}, vec::Vec};
+use alloc::{
+    borrow::ToOwned,
+    string::String,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use system_error::SystemError;
 
 use crate::process::cred::Cred;
@@ -176,7 +181,8 @@ impl Syscall for SysPrctl {
                 // arg2 是 capability 的编号
                 use crate::process::cred::CAPFlags;
                 let cap_bit = 1usize << arg2;
-                let cap_flag = CAPFlags::from_bits(cap_bit as u64).unwrap_or(CAPFlags::CAP_EMPTY_SET);
+                let cap_flag =
+                    CAPFlags::from_bits(cap_bit as u64).unwrap_or(CAPFlags::CAP_EMPTY_SET);
                 let cred = current.cred();
                 let has_cap = cred.cap_bset.contains(cap_flag);
                 Ok(if has_cap { 1 } else { 0 })
@@ -186,7 +192,8 @@ impl Syscall for SysPrctl {
                 // arg2 是 capability 的编号
                 use crate::process::cred::CAPFlags;
                 let cap_bit = 1usize << arg2;
-                let cap_flag = CAPFlags::from_bits(cap_bit as u64).unwrap_or(CAPFlags::CAP_EMPTY_SET);
+                let cap_flag =
+                    CAPFlags::from_bits(cap_bit as u64).unwrap_or(CAPFlags::CAP_EMPTY_SET);
 
                 // 获取当前 cred，克隆并修改 cap_bset，然后设置回去
                 let old_cred = current.cred();

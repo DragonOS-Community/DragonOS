@@ -237,6 +237,13 @@ pub struct MountFS {
     mount_id: MountId,
 
     mount_flags: MountFlags,
+
+    /// 对于bind mount，存储bind target目录的inode。
+    /// 当这个MountFS被用作根文件系统时，root_inode() 应该返回这个inode，
+    /// 而不是inner_filesystem的root。
+    /// 这是为了支持container场景：bind mount /tmp/xxx/rootfs 后，
+    /// pivot_root到这个mount时，看到的应该是rootfs的内容，而不是底层tmpfs的根。
+    bind_target_root: RwSem<Option<Arc<MountFSInode>>>,
 }
 
 impl Debug for MountFS {
@@ -290,6 +297,7 @@ impl MountFS {
             propagation,
             mount_id: MountId::alloc(),
             mount_flags,
+            bind_target_root: RwSem::new(None),
         });
 
         if let Some(mnt_ns) = mnt_ns {
@@ -312,6 +320,7 @@ impl MountFS {
             propagation: new_propagation,
             mount_id: MountId::alloc(),
             mount_flags: self.mount_flags,
+            bind_target_root: RwSem::new(None),
         });
 
         return mountfs;
@@ -362,6 +371,19 @@ impl MountFS {
         self.namespace.init(namespace);
     }
 
+    /// 设置 bind mount 的 target 目录 inode。
+    ///
+    /// 当 bind mount 被用作根文件系统时（例如容器场景），
+    /// root_inode() 应该返回这个 inode，而不是底层文件系统的根。
+    pub fn set_bind_target_root(&self, target_root: Arc<MountFSInode>) {
+        *self.bind_target_root.write() = Some(target_root);
+    }
+
+    /// 获取 bind mount 的 target 目录 inode（如果设置了）
+    pub fn bind_target_root(&self) -> Option<Arc<MountFSInode>> {
+        self.bind_target_root.read().clone()
+    }
+
     pub fn fs_type(&self) -> &str {
         self.inner_filesystem.name()
     }
@@ -393,6 +415,15 @@ impl MountFS {
 
     /// @brief 获取挂载点的文件系统的root inode
     pub fn mountpoint_root_inode(&self) -> Arc<MountFSInode> {
+        // 如果设置了 bind_target_root（用于 bind mount 场景），
+        // 则返回 bind target 目录，而不是底层文件系统的根。
+        // 这对于容器场景很关键：bind mount /tmp/xxx/rootfs 后，
+        // 作为根文件系统时应该看到 rootfs 的内容。
+        if let Some(bind_target) = self.bind_target_root() {
+            return bind_target;
+        }
+
+        // 默认行为：返回底层文件系统的根
         return Arc::new_cyclic(|self_ref| MountFSInode {
             inner_inode: self.inner_filesystem.root_inode(),
             mount_fs: self.self_ref.upgrade().unwrap(),
@@ -443,13 +474,19 @@ impl MountFS {
         // 不是当前根，说明是 pivot_root 后的旧根，可以卸载
         // 这种情况下，我们只需要清理挂载列表中的记录
         // 不需要调用 do_umount（因为没有父挂载点）
-        log::debug!("[MountFS::umount] unmounting old root mount id={:?}", self.mount_id());
+        // log::debug!(
+        //     "[MountFS::umount] unmounting old root mount id={:?}",
+        //     self.mount_id()
+        // );
 
         // 从当前 namespace 的挂载列表中移除
         // 首先需要找到这个挂载的路径
         let mount_list = current_ns.mount_list();
         if let Some(mount_path) = mount_list.get_mount_path_by_mountfs(&self.self_ref()) {
-            log::debug!("[MountFS::umount] removing old root from mount list: {:?}", mount_path);
+            // log::debug!(
+            //     "[MountFS::umount] removing old root from mount list: {:?}",
+            //     mount_path
+            // );
             current_ns.remove_mount(mount_path.as_str());
         }
 
@@ -675,6 +712,19 @@ impl MountFSInode {
     pub fn clone_with_new_mount_fs(&self, mount_fs: Arc<MountFS>) -> Arc<MountFSInode> {
         Arc::new_cyclic(|self_ref| MountFSInode {
             inner_inode: self.inner_inode.clone(),
+            mount_fs,
+            self_ref: self_ref.clone(),
+        })
+    }
+
+    /// 创建一个新的 MountFSInode
+    ///
+    /// # 参数
+    /// - inner_inode: 底层文件系统的 inode
+    /// - mount_fs: 所属的 MountFS
+    pub fn new(inner_inode: Arc<dyn IndexNode>, mount_fs: Arc<MountFS>) -> Arc<MountFSInode> {
+        Arc::new_cyclic(|self_ref| MountFSInode {
+            inner_inode,
             mount_fs,
             self_ref: self_ref.clone(),
         })

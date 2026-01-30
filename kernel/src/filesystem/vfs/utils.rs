@@ -57,7 +57,9 @@ pub fn user_path_at(
 
     // 绝对路径：从进程 root 开始
     if path.as_bytes()[0] == b'/' {
-        return Ok((pcb.fs_struct().root(), ret_path));
+        let root = pcb.fs_struct().root();
+        // log::debug!("[user_path_at] absolute path '{}', root fs={}", path, root.fs().name());
+        return Ok((root, ret_path));
     }
 
     // 相对路径：dirfd 优先，否则用 cwd

@@ -2,6 +2,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use smoltcp::iface::MulticastError;
 use smoltcp::wire::{IpAddress, Ipv4Address};
 use system_error::SystemError;
 
@@ -81,6 +82,41 @@ pub fn find_iface_by_ipv4(netns: &Arc<NetNamespace>, addr_be: u32) -> Option<Arc
             None
         }
     })
+}
+
+/// Drop all IPv4 multicast memberships for a socket on close.
+/// This is a best-effort cleanup; missing ifaces are ignored.
+pub fn drop_ipv4_memberships(
+    netns: &Arc<NetNamespace>,
+    groups: &Mutex<Vec<Ipv4MulticastMembership>>,
+) {
+    let entries = {
+        let mut guard = groups.lock();
+        core::mem::take(&mut *guard)
+    };
+
+    let mut seen: Vec<(u32, i32)> = Vec::new();
+    for entry in entries {
+        if entry.ifindex <= 0 {
+            continue;
+        }
+        if seen
+            .iter()
+            .any(|(multi, ifindex)| *multi == entry.multiaddr && *ifindex == entry.ifindex)
+        {
+            continue;
+        }
+        seen.push((entry.multiaddr, entry.ifindex));
+
+        if let Some(iface) = find_iface_by_ifindex(netns, entry.ifindex) {
+            let bytes = entry.multiaddr.to_ne_bytes();
+            let multi = Ipv4Address::new(bytes[0], bytes[1], bytes[2], bytes[3]);
+            let _ = iface
+                .smol_iface()
+                .lock()
+                .leave_multicast_group(IpAddress::Ipv4(multi));
+        }
+    }
 }
 
 pub fn choose_default_ipv4_iface(netns: &Arc<NetNamespace>) -> Option<Arc<dyn Iface>> {
@@ -182,42 +218,89 @@ pub fn apply_ipv4_membership(
         });
     }
 
-    let resolved_ifindex = iface.unwrap().nic_id() as i32;
-    let mut groups = groups.lock();
+    let iface = iface.unwrap();
+    let resolved_ifindex = iface.nic_id() as i32;
+
+    // Convert multicast address to smoltcp format
+    let multi_bytes = multi.to_ne_bytes();
+    let multi_ipv4 = Ipv4Address::new(
+        multi_bytes[0],
+        multi_bytes[1],
+        multi_bytes[2],
+        multi_bytes[3],
+    );
+
     match opt {
         IpOption::ADD_MEMBERSHIP => {
-            if groups
-                .iter()
-                .any(|g| g.multiaddr == multi && g.ifindex == resolved_ifindex)
             {
-                return Err(SystemError::EADDRINUSE);
+                let mut groups = groups.lock();
+                if groups
+                    .iter()
+                    .any(|g| g.multiaddr == multi && g.ifindex == resolved_ifindex)
+                {
+                    return Err(SystemError::EADDRINUSE);
+                }
+                groups.push(Ipv4MulticastMembership {
+                    multiaddr: multi,
+                    ifindex: resolved_ifindex,
+                    ifaddr,
+                });
             }
-            groups.push(Ipv4MulticastMembership {
-                multiaddr: multi,
-                ifindex: resolved_ifindex,
-                ifaddr,
-            });
+
+            let join_result = {
+                let mut smol_iface = iface.smol_iface().lock();
+                smol_iface.join_multicast_group(IpAddress::Ipv4(multi_ipv4))
+            };
+            if let Err(e) = join_result {
+                {
+                    let mut groups = groups.lock();
+                    groups.retain(|g| !(g.multiaddr == multi && g.ifindex == resolved_ifindex));
+                }
+                return Err(match e {
+                    MulticastError::GroupTableFull => SystemError::ENOBUFS,
+                    MulticastError::Unaddressable => SystemError::EINVAL,
+                });
+            }
+
             Ok(())
         }
         IpOption::DROP_MEMBERSHIP => {
-            let pos = groups.iter().position(|g| {
-                if g.multiaddr != multi {
-                    return false;
+            let (did_remove, still_joined) = {
+                let mut groups = groups.lock();
+                let pos = groups.iter().position(|g| {
+                    if g.multiaddr != multi {
+                        return false;
+                    }
+                    if ifindex != 0 {
+                        return g.ifindex == resolved_ifindex;
+                    }
+                    if ifaddr != 0 {
+                        return g.ifaddr == ifaddr;
+                    }
+                    true
+                });
+                if let Some(idx) = pos {
+                    groups.swap_remove(idx);
+                    let still_joined = groups
+                        .iter()
+                        .any(|g| g.multiaddr == multi && g.ifindex == resolved_ifindex);
+                    (true, still_joined)
+                } else {
+                    (false, false)
                 }
-                if ifindex != 0 {
-                    return g.ifindex == resolved_ifindex;
-                }
-                if ifaddr != 0 {
-                    return g.ifaddr == ifaddr;
-                }
-                true
-            });
-            if let Some(idx) = pos {
-                groups.swap_remove(idx);
-                Ok(())
-            } else {
-                Err(SystemError::EADDRNOTAVAIL)
+            };
+
+            if !did_remove {
+                return Err(SystemError::EADDRNOTAVAIL);
             }
+
+            if !still_joined {
+                let _ = iface
+                    .smol_iface()
+                    .lock()
+                    .leave_multicast_group(IpAddress::Ipv4(multi_ipv4));
+            }
+            Ok(())
         }
         _ => Err(SystemError::ENOPROTOOPT),
     }

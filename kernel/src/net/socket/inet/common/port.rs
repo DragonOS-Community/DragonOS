@@ -34,25 +34,29 @@ impl PortManager {
     /// @brief 自动分配一个相对应协议中未被使用的PORT，如果动态端口均已被占用，返回错误码 EADDRINUSE
     pub fn get_ephemeral_port(&self, socket_type: Types) -> Result<u16, SystemError> {
         // TODO: selects non-conflict high port
-
-        static mut EPHEMERAL_PORT: u16 = 0;
-        unsafe {
-            if EPHEMERAL_PORT == 0 {
-                EPHEMERAL_PORT = (49152 + rand() % (65536 - 49152)) as u16;
-            }
-        }
+        static EPHEMERAL_PORT: core::sync::atomic::AtomicU16 =
+            core::sync::atomic::AtomicU16::new(0);
+        let initial = (49152 + rand() % (65536 - 49152)) as u16;
+        let _ = EPHEMERAL_PORT.compare_exchange(
+            0,
+            initial,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Relaxed,
+        );
 
         let mut remaining = 65536 - 49152; // 剩余尝试分配端口次数
-        let mut port: u16;
         while remaining > 0 {
-            unsafe {
-                if EPHEMERAL_PORT == 65535 {
-                    EPHEMERAL_PORT = 49152;
-                } else {
-                    EPHEMERAL_PORT += 1;
-                }
-                port = EPHEMERAL_PORT;
+            let old = EPHEMERAL_PORT
+                .fetch_update(
+                    core::sync::atomic::Ordering::AcqRel,
+                    core::sync::atomic::Ordering::Relaxed,
+                    |cur| Some(if cur == 65535 { 49152 } else { cur + 1 }),
+                )
+                .unwrap_or_else(|cur| cur);
+            if old == 0 {
+                continue;
             }
+            let port = if old == 65535 { 49152 } else { old + 1 };
 
             // 使用 ListenTable 检查端口是否被占用
             match socket_type {

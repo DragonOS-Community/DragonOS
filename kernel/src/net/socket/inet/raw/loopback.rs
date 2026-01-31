@@ -48,6 +48,18 @@ pub(super) fn register_raw_socket(sock: &Arc<RawSocket>) {
     entry.retain(|w| w.upgrade().is_some());
 }
 
+pub(super) fn unregister_raw_socket(sock: &Arc<RawSocket>) {
+    let netns_id = sock.netns.ns_common().nsid.data();
+    let mut reg = RAW_SOCKET_REGISTRY.write();
+    let Some(entry) = reg.get_mut(&netns_id) else {
+        return;
+    };
+    entry.retain(|w| w.upgrade().map(|s| !Arc::ptr_eq(&s, sock)).unwrap_or(false));
+    if entry.is_empty() {
+        reg.remove(&netns_id);
+    }
+}
+
 fn raw_sockets_in_netns(netns: &Arc<NetNamespace>) -> Vec<Arc<RawSocket>> {
     let netns_id = netns.ns_common().nsid.data();
 

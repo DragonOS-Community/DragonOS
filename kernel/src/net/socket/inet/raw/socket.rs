@@ -13,7 +13,7 @@ use crate::process::ProcessManager;
 
 use super::constants::ICMPV6_CHECKSUM_OFFSET;
 use super::inner::{RawInner, UnboundRaw};
-use super::loopback::register_raw_socket;
+use super::loopback::{register_raw_socket, unregister_raw_socket};
 use super::options::RawSocketOptions;
 use super::RawSocket;
 
@@ -271,6 +271,9 @@ impl RawSocket {
     }
 
     pub fn close(&self) {
+        if let Some(me) = self.self_ref.upgrade() {
+            unregister_raw_socket(&me);
+        }
         let mut inner = self.inner.write();
         match &mut *inner {
             Some(RawInner::Bound(bound)) => {

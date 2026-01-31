@@ -274,10 +274,20 @@ impl RawSocket {
         let mut inner = self.inner.write();
         match &mut *inner {
             Some(RawInner::Bound(bound)) => {
+                bound
+                    .inner()
+                    .iface()
+                    .common()
+                    .unbind_socket(self.self_ref.upgrade().unwrap());
                 bound.close();
                 inner.take();
             }
             Some(RawInner::Wildcard(bound)) => {
+                bound
+                    .inner()
+                    .iface()
+                    .common()
+                    .unbind_socket(self.self_ref.upgrade().unwrap());
                 bound.close();
                 inner.take();
             }

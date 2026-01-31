@@ -130,6 +130,20 @@ impl BoundInner {
         &self.iface
     }
 
+    pub fn move_udp_to_iface(&mut self, iface: Arc<dyn Iface>) -> Result<(), SystemError> {
+        if Arc::ptr_eq(&self.iface, &iface) {
+            return Ok(());
+        }
+        let socket = self.iface.sockets().lock().remove(self.handle);
+        let smoltcp::socket::Socket::Udp(socket) = socket else {
+            return Err(SystemError::EINVAL);
+        };
+        let handle = iface.sockets().lock().add(socket);
+        self.iface = iface;
+        self.handle = handle;
+        Ok(())
+    }
+
     #[inline]
     pub fn handle(&self) -> smoltcp::iface::SocketHandle {
         self.handle
@@ -153,6 +167,14 @@ pub fn get_iface_to_bind(
     ip_addr: &smoltcp::wire::IpAddress,
     netns: Arc<NetNamespace>,
 ) -> Option<Arc<dyn Iface>> {
+    // For multicast or broadcast addresses, use the default interface or first available
+    // Linux allows binding to these addresses for filtering purposes
+    if ip_addr.is_multicast() || ip_addr.is_broadcast() {
+        return netns
+            .default_iface()
+            .or_else(|| netns.device_list().values().next().cloned());
+    }
+
     netns
         .device_list()
         .iter()

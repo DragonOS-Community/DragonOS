@@ -40,6 +40,8 @@ pub use constants::{SOCK_MIN_RCVBUF, SOCK_MIN_SNDBUF, SYSCTL_RMEM_MAX, SYSCTL_WM
 #[allow(unused_imports)]
 pub use options::{Icmp6Filter, IcmpFilter, RawSocketOptions};
 
+pub(crate) use loopback::deliver_udp_loopback_packet;
+
 /// InetRawSocket - AF_INET/AF_INET6 SOCK_RAW 实现
 ///
 /// 提供 IP 层原始套接字功能，支持：

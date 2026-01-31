@@ -2,7 +2,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
-use smoltcp::wire::{IpAddress, IpProtocol, IpVersion};
+use smoltcp::wire::{IpAddress, IpProtocol, IpVersion, UdpPacket};
 
 use crate::libs::rwsem::RwSem;
 use crate::process::namespace::net_namespace::NetNamespace;
@@ -46,6 +46,18 @@ pub(super) fn register_raw_socket(sock: &Arc<RawSocket>) {
     entry.push(Arc::downgrade(sock));
     // 轻量清理：避免条目无限增长。
     entry.retain(|w| w.upgrade().is_some());
+}
+
+pub(super) fn unregister_raw_socket(sock: &Arc<RawSocket>) {
+    let netns_id = sock.netns.ns_common().nsid.data();
+    let mut reg = RAW_SOCKET_REGISTRY.write();
+    let Some(entry) = reg.get_mut(&netns_id) else {
+        return;
+    };
+    entry.retain(|w| w.upgrade().map(|s| !Arc::ptr_eq(&s, sock)).unwrap_or(false));
+    if entry.is_empty() {
+        reg.remove(&netns_id);
+    }
 }
 
 fn raw_sockets_in_netns(netns: &Arc<NetNamespace>) -> Vec<Arc<RawSocket>> {
@@ -368,4 +380,70 @@ pub(super) fn loopback_rx_mem_cost(pkt_len: usize) -> usize {
     // 由于 DragonOS 不复用 Linux 的 skb，这里用常见的合计开销近似（约 576B）。
     let aligned = (pkt_len + (SKB_DATA_ALIGN - 1)) & !(SKB_DATA_ALIGN - 1);
     aligned.saturating_add(SKB_OVERHEAD)
+}
+
+/// UDP loopback: 为 raw socket 构建并投递完整 IP 包。
+pub(crate) fn deliver_udp_loopback_packet(
+    netns: &Arc<NetNamespace>,
+    ip_version: IpVersion,
+    mut src: IpAddress,
+    dst: IpAddress,
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+) {
+    // 确保地址与 IP 版本一致。
+    let addr_ok = matches!(
+        (ip_version, src, dst),
+        (IpVersion::Ipv4, IpAddress::Ipv4(_), IpAddress::Ipv4(_))
+            | (IpVersion::Ipv6, IpAddress::Ipv6(_), IpAddress::Ipv6(_))
+    );
+    if !addr_ok {
+        return;
+    }
+
+    // 若源地址未指定且目标为 loopback，按 Linux 行为使用 loopback 作为源地址。
+    if src.is_unspecified() && is_loopback_addr(dst) {
+        src = match ip_version {
+            IpVersion::Ipv4 => IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(127, 0, 0, 1)),
+            IpVersion::Ipv6 => {
+                IpAddress::Ipv6(smoltcp::wire::Ipv6Address::new(0, 0, 0, 0, 0, 0, 0, 1))
+            }
+        };
+    }
+
+    // 构造 UDP 负载（含 UDP 头）。
+    const UDP_HEADER_LEN: usize = 8;
+    let udp_len = UDP_HEADER_LEN.saturating_add(payload.len());
+    if udp_len > u16::MAX as usize {
+        return;
+    }
+    let mut udp_bytes = vec![0u8; udp_len];
+    let mut udp = UdpPacket::new_unchecked(&mut udp_bytes);
+    udp.set_src_port(src_port);
+    udp.set_dst_port(dst_port);
+    udp.set_len(udp_len as u16);
+    udp.payload_mut().copy_from_slice(payload);
+    udp.fill_checksum(&src, &dst);
+
+    let params = IpPacketParams {
+        payload: &udp_bytes,
+        src,
+        dst,
+        protocol: IpProtocol::Udp,
+        ttl: DEFAULT_IP_TTL,
+        tos: 0,
+        ipv6_checksum: -1,
+    };
+
+    if let Ok(packet) = build_ip_packet(ip_version, &params) {
+        let ctx = LoopbackDeliverContext {
+            packet: &packet,
+            dest: dst,
+            ip_version,
+            protocol: IpProtocol::Udp,
+            netns,
+        };
+        deliver_loopback_packet(&ctx);
+    }
 }

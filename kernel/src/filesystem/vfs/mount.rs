@@ -780,7 +780,17 @@ impl IndexNode for MountFSInode {
     }
 
     fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
-        return self.inner_inode.link(name, other);
+        // 文件系统实现期望 `other` 是同一具体文件系统的 inode（例如 LockedExt4Inode）。当启用 VFS 挂载包装时，
+        // `other` 通常是 `MountFSInode`，这会导致文件系统层面的向下转换失败并错误地返回 EINVAL。
+        //
+        // 因此在委托之前，我们需要解包挂载包装器（与 move_to 相同）。
+        let other_inner: Arc<dyn IndexNode> = other
+            .clone()
+            .downcast_arc::<MountFSInode>()
+            .map(|mnt| mnt.inner_inode.clone())
+            .unwrap_or_else(|| other.clone());
+
+        return self.inner_inode.link(name, &other_inner);
     }
 
     /// @brief 在挂载文件系统中删除文件/文件夹

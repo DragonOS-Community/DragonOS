@@ -2,11 +2,12 @@ use crate::{
     filesystem::{
         page_cache::{AsyncPageCacheBackend, PageCache},
         vfs::{
-            self, utils::DName, vcore::generate_inode_id, FilePrivateData, IndexNode, InodeFlags,
-            InodeId, InodeMode,
+            self, syscall::RenameFlags, utils::DName, vcore::generate_inode_id, FilePrivateData,
+            IndexNode, InodeFlags, InodeId, InodeMode,
         },
     },
     libs::{casting::DowncastArc, mutex::Mutex, mutex::MutexGuard},
+    mm::truncate::truncate_inode_pages,
     time::PosixTimeSpec,
 };
 use alloc::{
@@ -67,12 +68,15 @@ impl IndexNode for LockedExt4Inode {
         let mut guard = self.0.lock();
         // another_ext4的高4位是文件类型，低12位是权限
         let file_mode = InodeMode::from(file_type).union(mode);
+        let file_mode = another_ext4::InodeMode::from_bits_truncate(file_mode.bits() as u16);
         let ext4 = &guard.concret_fs().fs;
-        let id = ext4.create(
-            guard.inner_inode_num,
-            name,
-            another_ext4::InodeMode::from_bits_truncate(file_mode.bits() as u16),
-        )?;
+        // 目录需要调用 mkdir（会创建 "." 和 ".." 并更新父目录链接数）
+        // 其他类型调用 create
+        let id = if file_type == vfs::FileType::Dir {
+            ext4.mkdir(guard.inner_inode_num, name, file_mode)?
+        } else {
+            ext4.create(guard.inner_inode_num, name, file_mode)?
+        };
         let dname = DName::from(name);
         // 通过self_ref获取Arc<Self>，然后转换为Arc<dyn IndexNode>
         let self_arc = guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
@@ -502,6 +506,103 @@ impl IndexNode for LockedExt4Inode {
         ext4.setxattr(inode_num, name, value)?;
 
         Ok(0)
+    }
+
+    fn move_to(
+        &self,
+        old_name: &str,
+        target: &Arc<dyn IndexNode>,
+        new_name: &str,
+        flags: RenameFlags,
+    ) -> Result<(), SystemError> {
+        // 目标必须是 LockedExt4Inode（同一文件系统）
+        let target_locked = target
+            .clone()
+            .downcast_arc::<LockedExt4Inode>()
+            .ok_or(SystemError::EINVAL)?;
+
+        // 获取源目录信息（避免长时间持锁）
+        let (ext4_fs, src_inode_num) = {
+            let src_guard = self.0.lock();
+            (src_guard.concret_fs(), src_guard.inner_inode_num)
+        };
+        let ext4 = &ext4_fs.fs;
+
+        let target_inode_num = target_locked.0.lock().inner_inode_num;
+
+        // 快速路径：同目录同名 = 无操作
+        if src_inode_num == target_inode_num && old_name == new_name {
+            return Ok(());
+        }
+
+        // 先获取源文件信息，用于后续类型检查
+        let src_child_id = ext4.lookup(src_inode_num, old_name)?;
+        let src_attr = ext4.getattr(src_child_id)?;
+
+        // 检查目标是否已存在
+        if let Ok(dst_child_id) = ext4.lookup(target_inode_num, new_name) {
+            if flags.contains(RenameFlags::NOREPLACE) {
+                return Err(SystemError::EEXIST);
+            }
+
+            // Linux 语义：若目标存在，先删除它
+            // 需要检查类型兼容性
+            let dst_attr = ext4.getattr(dst_child_id)?;
+
+            // POSIX rename 类型兼容性检查：
+            // - 不能用目录覆盖非目录
+            // - 不能用非目录覆盖目录
+            if src_attr.ftype == FileType::Directory {
+                if dst_attr.ftype != FileType::Directory {
+                    return Err(SystemError::ENOTDIR);
+                }
+                // 目标目录必须为空（只允许 . 和 ..）
+                // 过滤掉 "." 和 ".."，检查是否还有其他条目
+                let entries = ext4.listdir(dst_child_id)?;
+                let has_real_entries = entries.iter().any(|e| e.name() != "." && e.name() != "..");
+                if has_real_entries {
+                    return Err(SystemError::ENOTEMPTY);
+                }
+                ext4.rmdir(target_inode_num, new_name)?;
+            } else {
+                if dst_attr.ftype == FileType::Directory {
+                    return Err(SystemError::EISDIR);
+                }
+                // 在删除被覆盖的文件之前，清理其 page cache
+                // 避免后台 writeback 时发现 page_cache 已 drop 的警告
+                if let Ok(dst_inode) = target_locked.find(new_name) {
+                    if let Some(page_cache) = dst_inode.page_cache() {
+                        truncate_inode_pages(page_cache, 0);
+                    }
+                }
+                ext4.unlink(target_inode_num, new_name)?;
+            }
+
+            // 同时从 children 缓存中移除（如果存在）
+            target_locked
+                .0
+                .lock()
+                .children
+                .remove(&DName::from(new_name));
+        }
+
+        // 在底层 ext4 文件系统中执行重命名
+        ext4.rename(src_inode_num, old_name, target_inode_num, new_name)?;
+
+        // 更新 children 缓存：从源目录移除，添加到目标目录
+        let old_dname = DName::from(old_name);
+        let new_dname = DName::from(new_name);
+
+        // 从源目录缓存中移除
+        let moved_child = self.0.lock().children.remove(&old_dname);
+
+        // 如果缓存中有该子项，更新其 dname 并插入目标目录缓存
+        if let Some(child) = moved_child {
+            child.0.lock().dname = new_dname.clone();
+            target_locked.0.lock().children.insert(new_dname, child);
+        }
+
+        Ok(())
     }
 }
 

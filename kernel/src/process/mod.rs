@@ -518,12 +518,26 @@ impl ProcessManager {
     fn exit_notify() {
         let current = ProcessManager::current_pcb();
         let sighand = current.sighand();
+        let exec_task = if sighand.flags_contains(SignalFlags::GROUP_EXEC) {
+            sighand.group_exec_task()
+        } else {
+            None
+        };
+        let is_mt_exec_leader = current.is_thread_group_leader()
+            && exec_task
+                .as_ref()
+                .map(|t| !Arc::ptr_eq(t, &current))
+                .unwrap_or(false);
         if sighand.flags_contains(SignalFlags::GROUP_EXEC) {
-            let exec_task = sighand.group_exec_task();
             if let Some(exec_task) = exec_task.as_ref() {
                 if !Arc::ptr_eq(exec_task, &current) {
-                    sighand.dec_group_exec_notify_count_and_wake();
-                    sighand.wake_group_exec_waiters();
+                    let notify_count = sighand.group_exec_notify_count();
+                    if notify_count < 0 {
+                        // mt-exec: exec 线程正在等待 leader 退出
+                        sighand.wake_group_exec_waiters();
+                    } else {
+                        sighand.dec_group_exec_notify_count_and_wake();
+                    }
                 }
             }
             let should_clear = exec_task
@@ -533,6 +547,11 @@ impl ProcessManager {
             if should_clear {
                 sighand.finish_group_exec();
             }
+        }
+        // mt-exec: leader 退出时只标记 zombie，避免触发普通退出通知/收养
+        if is_mt_exec_leader {
+            current.set_exit_state_zombie();
+            return;
         }
         // 让INIT进程收养所有子进程
         if current.raw_pid() != RawPid(1) {
@@ -1017,6 +1036,8 @@ bitflags! {
         const NEED_RSEQ = 1 << 12;
         /// 进程正在等待 IO 操作完成（用于 iowait 统计）
         const IN_IOWAIT = 1 << 13;
+        /// 线程组 exec 期间延迟 PID/TGID/PGID/SID 的 unhash
+        const DEFER_UNHASH = 1 << 14;
     }
 }
 

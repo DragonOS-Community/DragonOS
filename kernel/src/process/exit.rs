@@ -12,7 +12,8 @@ use crate::{
 };
 
 use super::{
-    abi::WaitOption, resource::RUsage, ProcessControlBlock, ProcessManager, ProcessState, RawPid,
+    abi::WaitOption, resource::RUsage, ProcessControlBlock, ProcessFlags, ProcessManager,
+    ProcessState, RawPid,
 };
 
 /// 将内核中保存的 wstatus（已经按 wait4 语义左移过的编码值）
@@ -35,6 +36,24 @@ fn reap_blocked_by_group_exec(child_pcb: &Arc<ProcessControlBlock>) -> bool {
         .as_ref()
         .map(|t| !Arc::ptr_eq(t, child_pcb))
         .unwrap_or(true)
+}
+
+/// mt-exec: 非执行线程的组长在退出时，延迟 PID/TGID/PGID/SID 的 unhash
+/// 以避免 de_thread 交换 TID/raw_pid 时出现 ESRCH。
+fn should_defer_unhash_for_group_exec(pcb: &ProcessControlBlock, group_dead: bool) -> bool {
+    if !group_dead {
+        return false;
+    }
+    let sighand = pcb.sighand();
+    if !sighand.flags_contains(SignalFlags::GROUP_EXEC) {
+        return false;
+    }
+    let exec_task = sighand.group_exec_task();
+    let this = pcb.self_ref.upgrade();
+    match (exec_task, this) {
+        (Some(exec_task), Some(this)) => !Arc::ptr_eq(&exec_task, &this),
+        _ => false,
+    }
 }
 
 /// 检查子进程的 exit_signal 是否与等待选项匹配
@@ -1027,11 +1046,15 @@ impl ProcessControlBlock {
 
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/exit.c#123
     fn __unhash_process(&self, group_dead: bool) {
-        self.detach_pid(PidType::PID);
-        if group_dead {
-            self.detach_pid(PidType::TGID);
-            self.detach_pid(PidType::PGID);
-            self.detach_pid(PidType::SID);
+        if should_defer_unhash_for_group_exec(self, group_dead) {
+            self.flags().insert(ProcessFlags::DEFER_UNHASH);
+        } else {
+            self.detach_pid(PidType::PID);
+            if group_dead {
+                self.detach_pid(PidType::TGID);
+                self.detach_pid(PidType::PGID);
+                self.detach_pid(PidType::SID);
+            }
         }
 
         // 从线程组中移除
@@ -1041,6 +1064,20 @@ impl ProcessControlBlock {
                 .threads_write_irqsave()
                 .group_tasks
                 .retain(|pcb| !Weak::ptr_eq(pcb, &self.self_ref));
+        }
+    }
+
+    /// 在 de_thread 完成 PID/TID 交换后，补做延迟的 unhash。
+    pub(super) fn finish_deferred_unhash_for_exec(&self) {
+        if !self.flags().contains(ProcessFlags::DEFER_UNHASH) {
+            return;
+        }
+        self.flags().remove(ProcessFlags::DEFER_UNHASH);
+        self.detach_pid(PidType::PID);
+        if self.is_thread_group_leader() {
+            self.detach_pid(PidType::TGID);
+            self.detach_pid(PidType::PGID);
+            self.detach_pid(PidType::SID);
         }
     }
 }

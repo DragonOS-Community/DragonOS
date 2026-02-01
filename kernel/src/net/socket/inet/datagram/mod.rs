@@ -1153,6 +1153,16 @@ impl UdpSocket {
         }
     }
 
+    pub fn has_ipv4_multicast_membership(&self, multiaddr: u32, ifindex: i32) -> bool {
+        if ifindex <= 0 {
+            return false;
+        }
+        let groups = self.ip_multicast_groups.lock();
+        groups
+            .iter()
+            .any(|g| g.multiaddr == multiaddr && g.ifindex == ifindex)
+    }
+
     /// Check if multicast loopback is enabled for this socket
     pub fn is_multicast_loopback_enabled(&self) -> bool {
         self.ip_multicast_loop.load(Ordering::Relaxed)

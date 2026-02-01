@@ -100,8 +100,21 @@ pub fn deliver_multicast_all(
     if candidates.is_empty() {
         return 0;
     }
+    let multiaddr = match dest.addr {
+        IpAddress::Ipv4(addr) => {
+            let octets = addr.octets();
+            u32::from_ne_bytes(octets)
+        }
+        _ => return 0,
+    };
     let mut delivered = 0;
     for cand in candidates {
+        if !cand
+            .socket
+            .has_ipv4_multicast_membership(multiaddr, ifindex)
+        {
+            continue;
+        }
         if cand
             .socket
             .inject_loopback_packet(src, dest.addr, dest.port, ifindex, payload)

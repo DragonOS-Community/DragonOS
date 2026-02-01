@@ -139,12 +139,12 @@ impl Attribute for AttrStart {
     }
 
     fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let memmapd = kobj.downcast_arc::<MemmapDesc>().unwrap();
+        let memmapd = kobj
+            .downcast_arc::<MemmapDesc>()
+            .ok_or(SystemError::EINVAL)?;
         let start = memmapd.inner().start;
         let start_string = format!("0x{:x}\n", start);
-        let bytes = start_string.as_bytes();
-        buf[..bytes.len()].copy_from_slice(bytes);
-        Ok(bytes.len())
+        sysfs_emit_str(buf, &start_string)
     }
 }
 
@@ -165,12 +165,12 @@ impl Attribute for AttrEnd {
     }
 
     fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let memmapd = kobj.downcast_arc::<MemmapDesc>().unwrap();
+        let memmapd = kobj
+            .downcast_arc::<MemmapDesc>()
+            .ok_or(SystemError::EINVAL)?;
         let end = memmapd.inner().end;
         let end_string = format!("0x{:x}\n", end);
-        let bytes = end_string.as_bytes();
-        buf[..bytes.len()].copy_from_slice(bytes);
-        Ok(bytes.len())
+        sysfs_emit_str(buf, &end_string)
     }
 }
 
@@ -191,27 +191,14 @@ impl Attribute for AttrType {
     }
 
     fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let memmapd = kobj.downcast_arc::<MemmapDesc>().unwrap();
+        let memmapd = kobj
+            .downcast_arc::<MemmapDesc>()
+            .ok_or(SystemError::EINVAL)?;
         let mt = memmapd.inner().memtype;
         match mt {
-            1 => {
-                let type_string = "System RAM\n".to_string();
-                let bytes = type_string.as_bytes();
-                buf[..bytes.len()].copy_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            2 => {
-                let type_string = "Reserved\n".to_string();
-                let bytes = type_string.as_bytes();
-                buf[..bytes.len()].copy_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            3 => {
-                let type_string = "ACPI Tables\n".to_string();
-                let bytes = type_string.as_bytes();
-                buf[..bytes.len()].copy_from_slice(bytes);
-                Ok(bytes.len())
-            }
+            1 => sysfs_emit_str(buf, "System RAM\n"),
+            2 => sysfs_emit_str(buf, "Reserved\n"),
+            3 => sysfs_emit_str(buf, "ACPI Tables\n"),
             _ => {
                 log::error!("Unknown memmap type!");
                 Err(SystemError::EINVAL)

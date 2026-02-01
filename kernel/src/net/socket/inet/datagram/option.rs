@@ -431,7 +431,49 @@ impl UdpSocket {
                 Ok(())
             }
             IpOption::ADD_MEMBERSHIP | IpOption::DROP_MEMBERSHIP => {
-                apply_ipv4_membership(&self.netns, opt, val, &self.ip_multicast_groups)
+                // First, apply the membership at the interface level
+                apply_ipv4_membership(&self.netns, opt, val, &self.ip_multicast_groups)?;
+
+                // Then, register/unregister with multicast loopback registry
+                use super::multicast_loopback::multicast_registry;
+                use crate::net::socket::inet::common::multicast::parse_mreqn_for_membership;
+
+                if let Ok((multiaddr, ifaddr, ifindex)) = parse_mreqn_for_membership(val) {
+                    // Determine the interface index
+                    let resolved_ifindex = if ifindex != 0 {
+                        ifindex
+                    } else if ifaddr != 0 {
+                        // Find interface by address
+                        use crate::net::socket::inet::common::multicast::find_iface_by_ipv4;
+                        find_iface_by_ipv4(&self.netns, ifaddr)
+                            .map(|iface| iface.nic_id() as i32)
+                            .unwrap_or(0)
+                    } else {
+                        // Use default interface
+                        use crate::net::socket::inet::common::multicast::choose_default_ipv4_iface;
+                        choose_default_ipv4_iface(&self.netns)
+                            .map(|iface| iface.nic_id() as i32)
+                            .unwrap_or(0)
+                    };
+
+                    if resolved_ifindex != 0 {
+                        if opt == IpOption::ADD_MEMBERSHIP {
+                            multicast_registry().register(
+                                self.self_ref.clone(),
+                                multiaddr,
+                                resolved_ifindex,
+                            );
+                        } else {
+                            multicast_registry().unregister(
+                                &self.self_ref,
+                                multiaddr,
+                                resolved_ifindex,
+                            );
+                        }
+                    }
+                }
+
+                Ok(())
             }
             _ => Err(SystemError::ENOPROTOOPT),
         }

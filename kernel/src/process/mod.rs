@@ -535,7 +535,7 @@ impl ProcessManager {
                     if notify_count < 0 {
                         // mt-exec: exec 线程正在等待 leader 退出
                         sighand.wake_group_exec_waiters();
-                    } else {
+                    } else if !current.is_thread_group_leader() {
                         sighand.dec_group_exec_notify_count_and_wake();
                     }
                 }

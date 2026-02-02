@@ -116,9 +116,25 @@ impl PortManager {
 
     #[inline]
     pub fn bind_ephemeral_port(&self, socket_type: Types) -> Result<u16, SystemError> {
-        let port = self.get_ephemeral_port(socket_type)?;
-        self.bind_port(socket_type, port)?;
-        return Ok(port);
+        let (min, max) = Self::local_port_range();
+        let range = (max - min) as u32 + 1;
+        if range == 0 {
+            return Err(SystemError::EINVAL);
+        }
+        let mut remaining = range;
+        while remaining > 0 {
+            let port = self.get_ephemeral_port(socket_type)?;
+            match self.bind_port(socket_type, port) {
+                Ok(()) => return Ok(port),
+                Err(SystemError::EADDRINUSE) => {
+                    // Race: another thread grabbed the port after we checked.
+                    remaining -= 1;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(SystemError::EADDRINUSE)
     }
 
     /// UDP: 绑定随机端口（支持 reuseaddr/reuseport 规则）
@@ -129,9 +145,25 @@ impl PortManager {
         reuseport: bool,
         bind_id: usize,
     ) -> Result<u16, SystemError> {
-        let port = self.get_ephemeral_port(Types::Udp)?;
-        self.bind_udp_port(port, addr, reuseaddr, reuseport, bind_id)?;
-        Ok(port)
+        let (min, max) = Self::local_port_range();
+        let range = (max - min) as u32 + 1;
+        if range == 0 {
+            return Err(SystemError::EINVAL);
+        }
+        let mut remaining = range;
+        while remaining > 0 {
+            let port = self.get_ephemeral_port(Types::Udp)?;
+            match self.bind_udp_port(port, addr, reuseaddr, reuseport, bind_id) {
+                Ok(()) => return Ok(port),
+                Err(SystemError::EADDRINUSE) => {
+                    // Race: another thread grabbed the port after we checked.
+                    remaining -= 1;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(SystemError::EADDRINUSE)
     }
 
     /// @brief 检测给定端口是否已被占用，如果未被占用则在 TCP 对应的表中记录

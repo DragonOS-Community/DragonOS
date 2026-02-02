@@ -1,5 +1,5 @@
 use crate::{
-    arch::{interrupt::TrapFrame, ipc::signal::Signal, CurrentSignalArch},
+    arch::{interrupt::TrapFrame, CurrentSignalArch},
     ipc::signal_types::SignalArch,
     process::{rseq::Rseq, ProcessFlags, ProcessManager},
 };
@@ -40,12 +40,8 @@ unsafe fn exit_to_user_mode_loop(frame: &mut TrapFrame, mut process_flags_work: 
     while !process_flags_work.exit_to_user_mode_work().is_empty() {
         // 优先处理 rseq，因为信号递送会保存 trapframe 到 sigframe
         // rseq 的 IP fixup 必须在信号递送之前完成
-        if process_flags_work.contains(ProcessFlags::NEED_RSEQ)
-            && Rseq::handle_notify_resume(Some(frame)).is_err()
-        {
-            // rseq 处理失败，发送 SIGSEGV
-            let pcb = ProcessManager::current_pcb();
-            let _ = crate::ipc::kill::send_signal_to_pcb(pcb, Signal::SIGSEGV);
+        if process_flags_work.contains(ProcessFlags::NEED_RSEQ) {
+            let _ = Rseq::handle_notify_resume(Some(frame));
         }
 
         if process_flags_work.contains(ProcessFlags::HAS_PENDING_SIGNAL) {

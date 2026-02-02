@@ -1,10 +1,17 @@
 use crate::{
-    driver::base::device::device_number::DeviceNumber, filesystem::{
+    driver::base::device::device_number::DeviceNumber,
+    filesystem::{
         page_cache::{AsyncPageCacheBackend, PageCache},
         vfs::{
-            self, FilePrivateData, IndexNode, InodeFlags, InodeId, InodeMode, utils::DName, vcore::generate_inode_id
+            self, utils::DName, vcore::generate_inode_id, FilePrivateData, IndexNode, InodeFlags,
+            InodeId, InodeMode,
         },
-    }, libs::{casting::DowncastArc, mutex::{Mutex, MutexGuard}}, time::PosixTimeSpec
+    },
+    libs::{
+        casting::DowncastArc,
+        mutex::{Mutex, MutexGuard},
+    },
+    time::PosixTimeSpec,
 };
 use alloc::{
     collections::BTreeMap,

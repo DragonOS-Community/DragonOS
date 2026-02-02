@@ -1,17 +1,8 @@
-use crate::arch::mm::kernel_page_flags;
-
 use crate::arch::MMArch;
-
-use crate::mm::kernel_mapper::KernelMapper;
-use crate::mm::page::EntryFlags;
-use crate::mm::{
-    allocator::page_frame::{
-        allocate_page_frames, deallocate_page_frames, PageFrameCount, PhysPageFrame,
-    },
-    MemoryManagementArch, PhysAddr, VirtAddr,
-};
+use crate::mm::dma::{dma_alloc_pages_raw, dma_dealloc_pages_raw, DmaAllocOptions, DmaDirection};
+use crate::mm::{MemoryManagementArch, PhysAddr, VirtAddr};
 use core::ptr::NonNull;
-use virtio_drivers::{BufferDirection, Hal, PAGE_SIZE};
+use virtio_drivers::{BufferDirection, Hal};
 
 pub struct HalImpl;
 unsafe impl Hal for HalImpl {
@@ -22,31 +13,17 @@ unsafe impl Hal for HalImpl {
         pages: usize,
         _direction: BufferDirection,
     ) -> (virtio_drivers::PhysAddr, NonNull<u8>) {
-        let page_num = PageFrameCount::new(
-            (pages * PAGE_SIZE)
-                .div_ceil(MMArch::PAGE_SIZE)
-                .next_power_of_two(),
-        );
-        unsafe {
-            let (paddr, count) =
-                allocate_page_frames(page_num).expect("VirtIO Impl: alloc page failed");
-            let virt = MMArch::phys_2_virt(paddr).unwrap();
-            // 清空这块区域，防止出现脏数据
-            core::ptr::write_bytes(virt.data() as *mut u8, 0, count.data() * MMArch::PAGE_SIZE);
-
-            let dma_flags: EntryFlags<MMArch> = EntryFlags::mmio_flags();
-
-            let mut kernel_mapper = KernelMapper::lock();
-            let kernel_mapper = kernel_mapper.as_mut().unwrap();
-            let flusher = kernel_mapper
-                .remap(virt, dma_flags)
-                .expect("VirtIO Impl: remap failed");
-            flusher.flush();
-            return (
-                paddr.data(),
-                NonNull::new(MMArch::phys_2_virt(paddr).unwrap().data() as _).unwrap(),
-            );
-        }
+        let direction = match _direction {
+            BufferDirection::DriverToDevice => DmaDirection::ToDevice,
+            BufferDirection::DeviceToDriver => DmaDirection::FromDevice,
+            _ => DmaDirection::Bidirectional,
+        };
+        let options = DmaAllocOptions {
+            direction,
+            use_pool: false,
+            ..Default::default()
+        };
+        dma_alloc_pages_raw(pages, options)
     }
     /// @brief 释放用于DMA的内存页
     /// @param paddr 起始物理地址 pages 页数（4k一页）
@@ -56,25 +33,7 @@ unsafe impl Hal for HalImpl {
         vaddr: NonNull<u8>,
         pages: usize,
     ) -> i32 {
-        let page_count = PageFrameCount::new(
-            (pages * PAGE_SIZE)
-                .div_ceil(MMArch::PAGE_SIZE)
-                .next_power_of_two(),
-        );
-
-        // 恢复页面属性
-        let vaddr = VirtAddr::new(vaddr.as_ptr() as usize);
-        let mut kernel_mapper = KernelMapper::lock();
-        let kernel_mapper = kernel_mapper.as_mut().unwrap();
-        let flusher = kernel_mapper
-            .remap(vaddr, kernel_page_flags(vaddr))
-            .expect("VirtIO Impl: remap failed");
-        flusher.flush();
-
-        unsafe {
-            deallocate_page_frames(PhysPageFrame::new(PhysAddr::new(paddr)), page_count);
-        }
-        return 0;
+        dma_dealloc_pages_raw(paddr, vaddr, pages)
     }
     /// @brief mmio物理地址转换为虚拟地址，不需要使用
     /// @param paddr 起始物理地址

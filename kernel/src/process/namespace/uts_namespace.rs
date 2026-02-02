@@ -1,7 +1,5 @@
 use core::ops::Deref;
 
-use alloc::string::{String, ToString};
-
 use alloc::sync::{Arc, Weak};
 
 use cfg_if::cfg_if;
@@ -38,12 +36,12 @@ impl From<&NewUtsName> for PosixNewUtsName {
     fn from(new_name: &NewUtsName) -> Self {
         let mut result = PosixNewUtsName::zeroed();
 
-        copy_string_to_array(&new_name.sys_name, &mut result.sysname);
-        copy_string_to_array(&new_name.node_name, &mut result.nodename);
-        copy_string_to_array(&new_name.release, &mut result.release);
-        copy_string_to_array(&new_name.version, &mut result.version);
-        copy_string_to_array(&new_name.machine, &mut result.machine);
-        copy_string_to_array(&new_name.domain_name, &mut result.domainname);
+        result.sysname = new_name.sys_name;
+        result.nodename = new_name.node_name;
+        result.release = new_name.release;
+        result.version = new_name.version;
+        result.machine = new_name.machine;
+        result.domainname = new_name.domain_name;
 
         result
     }
@@ -63,39 +61,52 @@ impl PosixNewUtsName {
 }
 
 #[inline(never)]
-fn copy_string_to_array(src: &str, dst: &mut [u8; 65]) {
-    let bytes = src.as_bytes();
-    let len = bytes.len().min(64);
-    dst[0..len].copy_from_slice(&bytes[0..len]);
-    dst[len] = 0;
+fn copy_bytes_to_array(src: &[u8], dst: &mut [u8; 65]) {
+    dst.fill(0);
+    let len = src.len().min(64);
+    dst[0..len].copy_from_slice(&src[0..len]);
 }
 
 #[derive(Clone)]
 pub struct NewUtsName {
-    sys_name: String,
-    node_name: String,
-    release: String,
-    version: String,
-    machine: String,
-    domain_name: String,
+    sys_name: [u8; NewUtsName::MAXLEN],
+    node_name: [u8; NewUtsName::MAXLEN],
+    release: [u8; NewUtsName::MAXLEN],
+    version: [u8; NewUtsName::MAXLEN],
+    machine: [u8; NewUtsName::MAXLEN],
+    domain_name: [u8; NewUtsName::MAXLEN],
 }
 
 impl NewUtsName {
     pub const MAXLEN: usize = 65;
-    fn validate_str(s: &str) -> bool {
-        s.len() < Self::MAXLEN
+    fn validate_len(len: usize) -> bool {
+        len < Self::MAXLEN
     }
 }
 
 impl Default for NewUtsName {
     fn default() -> Self {
+        let mut sys_name = [0; NewUtsName::MAXLEN];
+        let mut node_name = [0; NewUtsName::MAXLEN];
+        let mut release = [0; NewUtsName::MAXLEN];
+        let mut version = [0; NewUtsName::MAXLEN];
+        let mut machine = [0; NewUtsName::MAXLEN];
+        let mut domain_name = [0; NewUtsName::MAXLEN];
+
+        copy_bytes_to_array(UtsNamespace::UTS_SYSNAME.as_bytes(), &mut sys_name);
+        copy_bytes_to_array(UtsNamespace::UTS_NODENAME.as_bytes(), &mut node_name);
+        copy_bytes_to_array(UtsNamespace::UTS_RELEASE.as_bytes(), &mut release);
+        copy_bytes_to_array(UtsNamespace::UTS_VERSION.as_bytes(), &mut version);
+        copy_bytes_to_array(UtsNamespace::UTS_MACHINE.as_bytes(), &mut machine);
+        copy_bytes_to_array(UtsNamespace::UTS_DOMAINNAME.as_bytes(), &mut domain_name);
+
         Self {
-            sys_name: UtsNamespace::UTS_SYSNAME.to_string(),
-            node_name: UtsNamespace::UTS_NODENAME.to_string(),
-            release: UtsNamespace::UTS_RELEASE.to_string(),
-            version: UtsNamespace::UTS_VERSION.to_string(),
-            machine: UtsNamespace::UTS_MACHINE.to_string(),
-            domain_name: UtsNamespace::UTS_DOMAINNAME.to_string(),
+            sys_name,
+            node_name,
+            release,
+            version,
+            machine,
+            domain_name,
         }
     }
 }
@@ -172,9 +183,9 @@ impl UtsNamespace {
         }
     }
 
-    pub fn set_hostname(&self, hostname: &str) -> Result<(), SystemError> {
+    pub fn set_hostname(&self, hostname: &[u8]) -> Result<(), SystemError> {
         // 验证长度
-        if !NewUtsName::validate_str(hostname) {
+        if !NewUtsName::validate_len(hostname.len()) {
             return Err(SystemError::ENAMETOOLONG);
         }
 
@@ -183,15 +194,14 @@ impl UtsNamespace {
         if !self.check_uts_modify_permission() {
             return Err(SystemError::EPERM);
         }
-        let s = hostname.to_string();
         let mut utsname = self.utsname.lock();
-        utsname.node_name = s;
+        copy_bytes_to_array(hostname, &mut utsname.node_name);
         Ok(())
     }
 
-    pub fn set_domainname(&self, domainname: &str) -> Result<(), SystemError> {
+    pub fn set_domainname(&self, domainname: &[u8]) -> Result<(), SystemError> {
         // 验证长度
-        if !NewUtsName::validate_str(domainname) {
+        if !NewUtsName::validate_len(domainname.len()) {
             return Err(SystemError::ENAMETOOLONG);
         }
 
@@ -200,9 +210,8 @@ impl UtsNamespace {
         if !self.check_uts_modify_permission() {
             return Err(SystemError::EPERM);
         }
-        let s = domainname.to_string();
         let mut utsname = self.utsname.lock();
-        utsname.domain_name = s;
+        copy_bytes_to_array(domainname, &mut utsname.domain_name);
         Ok(())
     }
 

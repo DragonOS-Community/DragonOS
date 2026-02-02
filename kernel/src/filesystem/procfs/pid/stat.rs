@@ -2,6 +2,8 @@
 //!
 //! 以单行格式返回进程的状态信息，兼容 Linux procfs 格式
 
+use core::sync::atomic::Ordering;
+
 use crate::libs::mutex::MutexGuard;
 use crate::{
     arch::MMArch,
@@ -14,6 +16,7 @@ use crate::{
     },
     mm::MemoryManagementArch,
     process::{pid::PidType, ProcessControlBlock, ProcessManager, ProcessState, RawPid},
+    sched::{cputime::ns_to_clock_t, prio::PrioUtil},
 };
 use alloc::{
     format,
@@ -74,19 +77,31 @@ fn generate_linux_proc_stat_line(
     // 尽量填真实值；拿不到的先填 0
     let pgrp: usize = 0;
     let session: usize = 0;
-    let tty_nr: i32 = 0;
+    let tty_nr: i32 = pcb
+        .sig_info_irqsave()
+        .tty()
+        .map(|tty| tty.core().device_number().new_encode_dev() as i32)
+        .unwrap_or(0);
     let tpgid: i32 = 0;
     let flags: u64 = 0;
     let minflt: u64 = 0;
     let cminflt: u64 = 0;
     let majflt: u64 = 0;
     let cmajflt: u64 = 0;
-    let utime: u64 = 0;
-    let stime: u64 = 0;
+
+    // === 读取真实的 CPU 时间 ===
+    let cpu_time = pcb.cputime();
+    let utime = ns_to_clock_t(cpu_time.utime.load(Ordering::Relaxed));
+    let stime = ns_to_clock_t(cpu_time.stime.load(Ordering::Relaxed));
+
     let cutime: i64 = 0;
     let cstime: i64 = 0;
-    let priority: i64 = 0;
-    let nice: i64 = 0;
+
+    // === 读取真实的 priority 和 nice 值 ===
+    let prio_data = pcb.sched_info().prio_data();
+    let priority: i64 = prio_data.prio as i64;
+    let nice: i64 = PrioUtil::prio_to_nice(prio_data.static_prio) as i64;
+    drop(prio_data);
 
     // 线程组中的线程数量
     let num_threads: i64 = pcb
@@ -94,6 +109,8 @@ fn generate_linux_proc_stat_line(
         .map(|tgid_pid| tgid_pid.tasks_iter(PidType::TGID).count() as i64)
         .unwrap_or(1);
     let itrealvalue: i64 = 0;
+
+    // starttime: 进程启动时间（暂时为 0，需要 PCB 添加 start_time 字段）
     let starttime: u64 = 0;
 
     // vsize: bytes, rss: pages
@@ -108,10 +125,17 @@ fn generate_linux_proc_stat_line(
         })
         .unwrap_or((0, 0));
 
+    // processor: 进程最后运行的 CPU ID
+    let processor: i32 = pcb
+        .sched_info()
+        .on_cpu()
+        .map(|cpu| cpu.data() as i32)
+        .unwrap_or(0);
+
     format!(
         "{pid} ({comm}) {state_ch} {ppid} {pgrp} {session} {tty_nr} {tpgid} {flags} \
 {minflt} {cminflt} {majflt} {cmajflt} {utime} {stime} {cutime} {cstime} {priority} {nice} \
-{num_threads} {itrealvalue} {starttime} {vsize_bytes} {rss_pages} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+{num_threads} {itrealvalue} {starttime} {vsize_bytes} {rss_pages} 0 0 0 0 0 0 0 0 0 0 0 0 0 {processor} 0 0 0 0 0\n",
         pid = pid.data(),
         ppid = ppid.data(),
     )

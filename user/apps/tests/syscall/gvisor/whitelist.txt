@@ -46,6 +46,7 @@ pselect_test
 epoll_test
 splice_test
 deleted_test
+link_test
 
 # 进程相关测试
 fork_test
@@ -82,6 +83,8 @@ bind_test
 #listen_test
 socket_test
 udp_socket_test
+socket_ip_udp_loopback_test
+socket_ip_udp_loopback_non_blocking_test
 
 # unix socket相关的测试
 socket_unix_dgram_local_test
@@ -99,6 +102,10 @@ raw_socket_icmp_test
 raw_socket_hdrincl_test
 tcp_socket_test
 socket_ip_tcp_generic_loopback_test
+socket_ip_tcp_loopback_non_blocking_test
+socket_ip_tcp_loopback_test
+socket_ip_tcp_udp_generic_loopback_test
+socket_ipv4_datagram_based_socket_unbound_loopback_test
 
 # 信号处理测试
 sigaction_test

@@ -594,6 +594,7 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     let siginfo = pcb.try_siginfo_irqsave(5);
 
     if unlikely(siginfo.is_none()) {
+        pcb.recalc_sigpending();
         return;
     }
 
@@ -604,6 +605,8 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     let shared_pending = pcb.sighand().shared_pending_signal().bits();
     if (thread_pending == 0 && shared_pending == 0) || !frame.is_from_user() {
         // 若没有正在等待处理的信号，或者将要返回到的是内核态，则返回
+        drop(siginfo_read_guard);
+        pcb.recalc_sigpending();
         return;
     }
 
@@ -613,15 +616,8 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     let sig_block: SigSet = *siginfo_read_guard.sig_blocked();
     drop(siginfo_read_guard);
 
-    // x86_64 上不再需要 sig_struct 自旋锁
-    let siginfo_mut = pcb.try_siginfo_mut(5);
-    if unlikely(siginfo_mut.is_none()) {
-        return;
-    }
-
-    let mut siginfo_mut_guard = siginfo_mut.unwrap();
     loop {
-        (sig_number, info) = siginfo_mut_guard.dequeue_signal(&sig_block, &pcb);
+        (sig_number, info) = pcb.dequeue_pending_signal(&sig_block);
 
         // 如果信号非法，则直接返回
         if sig_number == Signal::INVALID {
@@ -636,8 +632,7 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
             //     pcb.raw_pid()
             // );
             // 释放锁，按常规路径在本线程上下文执行默认处理
-            let _oldset = *siginfo_mut_guard.sig_blocked();
-            drop(siginfo_mut_guard);
+            let _oldset = sig_block;
             drop(pcb);
             CurrentIrqArch::interrupt_enable();
             sig_number.handle_default();
@@ -686,9 +681,7 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
         }
     }
 
-    let oldset = *siginfo_mut_guard.sig_blocked();
-    //避免死锁
-    drop(siginfo_mut_guard);
+    let oldset = sig_block;
     // no sig_struct guard to drop
     drop(pcb);
     // 做完上面的检查后，开中断
@@ -872,7 +865,9 @@ fn setup_frame(
 ) -> Result<i32, SystemError> {
     // 在设置信号栈帧之前，先处理 rseq
     // 参考 Linux: https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kernel/signal.c#211
-    Rseq::on_signal(trap_frame);
+    if Rseq::on_signal(trap_frame).is_err() {
+        return Err(SystemError::EFAULT);
+    }
 
     let ret_code_ptr: *mut c_void;
     let handler_addr: usize;
@@ -940,31 +935,29 @@ fn setup_frame(
     // 获取栈帧的可变引用（唯一需要 unsafe 的地方）
     let frame = unsafe { &mut *frame_ptr };
 
-    // 1. 获取 cr2 值
+    // 1. 读取 arch 信息并生成用户态数据（避免持锁访问用户内存）
     let pcb = ProcessManager::current_pcb();
     let mut archinfo_guard = pcb.arch_info_irqsave();
     let cr2 = *archinfo_guard.cr2_mut() as u64;
+    let user_ucontext = UserUContext::from_trapframe(trap_frame, oldset, cr2);
 
-    // 2. 创建 ucontext
-    frame.ucontext = UserUContext::from_trapframe(trap_frame, oldset, cr2);
-
-    // 3. 保存 FP 状态
-    // 先从硬件保存当前 FP 状态到 PCB
+    // 2. 保存 FP 状态到 PCB，并准备用户态 XSAVE 数据
     archinfo_guard.save_fp_state();
-
-    // 将 FP 状态转换并保存到用户栈（包含完整的 XSAVE 状态，支持 AVX）
-    if let Some(kernel_fp) = archinfo_guard.fp_state() {
-        *frame.fpstate_mut() = UserXState::from_kernel_fpstate(kernel_fp);
-    }
-
-    // 设置 fpstate 指针指向栈帧内的 fpstate
-    frame.setup_fpstate_pointer();
+    let user_fpstate =
+        (*archinfo_guard.fp_state()).map(|kernel_fp| UserXState::from_kernel_fpstate(&kernel_fp));
 
     // 根据 Linux 语义，加载干净的 FP 状态到硬件
     // 这样信号处理函数在标准的 FP 环境中执行
     archinfo_guard.clear_fp_state();
-
     drop(archinfo_guard);
+
+    // 3. 写入用户栈（可能触发缺页，必须在释放锁后进行）
+    frame.ucontext = user_ucontext;
+    if let Some(fpstate) = user_fpstate {
+        *frame.fpstate_mut() = fpstate;
+    }
+    // 设置 fpstate 指针指向栈帧内的 fpstate
+    frame.setup_fpstate_pointer();
 
     // 4. 复制 siginfo
     info.copy_posix_siginfo_to_user(&mut frame.siginfo as *mut PosixSigInfo)

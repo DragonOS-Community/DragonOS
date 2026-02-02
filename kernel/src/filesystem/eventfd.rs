@@ -10,7 +10,7 @@ use crate::filesystem::{
 use crate::libs::mutex::{Mutex, MutexGuard};
 use crate::libs::wait_queue::WaitQueue;
 use crate::mm::MemoryManagementArch;
-use crate::process::{ProcessFlags, ProcessManager};
+use crate::process::ProcessManager;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -218,14 +218,7 @@ impl IndexNode for EventFdInode {
                 return Err(SystemError::ERESTARTSYS);
             }
 
-            let r = wq_wait_event_interruptible!(self.wait_queue, self.readable(), {});
-            if r.is_err() {
-                ProcessManager::current_pcb()
-                    .flags()
-                    .insert(ProcessFlags::HAS_PENDING_SIGNAL);
-
-                return Err(SystemError::ERESTARTSYS);
-            }
+            wq_wait_event_interruptible!(self.wait_queue, self.readable(), {})?;
 
             lock_efd = self.eventfd.lock();
         }

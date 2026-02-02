@@ -6,7 +6,6 @@ use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::process::ProcessManager;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use log::warn;
 use system_error::SystemError;
 
 use super::namespace::pid_namespace::PidNamespace;
@@ -265,8 +264,14 @@ impl ProcessControlBlock {
         let mut first_tasks = first_pid_lock.tasks[PidType::PID as usize].lock();
         let mut second_tasks = second_pid_lock.tasks[PidType::PID as usize].lock();
 
-        replace_task_in_pid_tasks(&mut first_tasks, first_task, second_task)?;
-        replace_task_in_pid_tasks(&mut second_tasks, second_task, first_task)?;
+        let (first_task_for_pid, second_task_for_pid) = if Arc::ptr_eq(first_pid_lock, &first_pid) {
+            (first_task, second_task)
+        } else {
+            (second_task, first_task)
+        };
+
+        replace_task_in_pid_tasks(&mut first_tasks, first_task_for_pid, second_task_for_pid)?;
+        replace_task_in_pid_tasks(&mut second_tasks, second_task_for_pid, first_task_for_pid)?;
 
         core::mem::swap(&mut *first_link, &mut *second_link);
         core::mem::swap(&mut *first_thread_pid, &mut *second_thread_pid);
@@ -425,7 +430,7 @@ pub(super) fn free_pid(pid: Arc<Pid>) {
             None => {
                 // PID numbers 已经被释放过了,这可能发生在进程被多次detach的场景
                 // 虽然理论上不应该发生,但为了防御性编程,我们在这里直接返回
-                warn!(
+                log::warn!(
                     "PID numbers at level {} already freed, skipping remaining levels",
                     level
                 );

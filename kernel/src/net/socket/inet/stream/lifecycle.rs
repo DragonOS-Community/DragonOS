@@ -83,7 +83,12 @@ impl TcpSocket {
             inner::Inner::Listening(listening) => {
                 let (socket, point) = listening.accept().map(|(stream, remote)| {
                     (
-                        TcpSocket::new_established(stream, self.is_nonblock(), self.netns()),
+                        TcpSocket::new_established(
+                            stream,
+                            self.is_nonblock(),
+                            self.netns(),
+                            self.ip_version,
+                        ),
                         remote,
                     )
                 })?;
@@ -283,11 +288,16 @@ impl TcpSocket {
                 }
 
                 if how.contains(ShutdownBit::SHUT_WR) {
-                    if self
+                    let pending = established.with(|socket| socket.send_queue());
+                    if pending > 0 {
+                        // Defer FIN until all queued data has been sent.
+                        self.send_fin_deferred
+                            .store(true, core::sync::atomic::Ordering::Relaxed);
+                    } else if self
                         .send_fin_deferred
                         .load(core::sync::atomic::Ordering::Relaxed)
                     {
-                        // FIN will be sent once cork-buffered bytes are flushed.
+                        // FIN will be sent once deferred bytes are fully flushed.
                     } else {
                         established.with_mut(|socket| socket.close());
                     }
@@ -514,7 +524,8 @@ impl TcpSocket {
                 writer.replace(inner::Inner::Closed(closed));
             }
         };
-
+        drop(writer);
+        self.notify();
         Ok(())
     }
 }

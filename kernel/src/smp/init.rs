@@ -25,5 +25,7 @@ pub fn smp_ap_start_stage2() -> ! {
 #[inline(never)]
 fn do_ap_start_stage2() {
     info!("Successfully started AP {}", smp_get_processor_id().data());
+    #[cfg(target_arch = "x86_64")]
+    crate::driver::clocksource::kvm_clock::kvmclock_init_secondary();
     arch_syscall_init().expect("AP core failed to initialize syscall");
 }

@@ -6,6 +6,7 @@ use crate::{
     libs::wait_queue::{TimeoutWaker, Waiter},
     process::ProcessManager,
     syscall::user_access::UserBufferWriter,
+    syscall::user_buffer::UserBuffer,
     time::{
         syscall::PosixTimeval,
         timer::{next_n_us_timer_jiffies, Timer},
@@ -15,14 +16,75 @@ use crate::{
 
 use super::vfs::file::{File, FileFlags};
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use system_error::SystemError;
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct PollFd {
     pub fd: c_int,
     pub events: u16,
     pub revents: u16,
+}
+
+#[inline]
+fn pollfd_revents_offset() -> usize {
+    let base = core::ptr::null::<PollFd>();
+    unsafe { core::ptr::addr_of!((*base).revents) as usize - base as usize }
+}
+
+pub(crate) fn read_pollfds_from_user(
+    user_buf: &mut UserBuffer<'_>,
+    nfds: usize,
+) -> Result<Vec<PollFd>, SystemError> {
+    let elem_size = core::mem::size_of::<PollFd>();
+    let total_len = nfds.checked_mul(elem_size).ok_or(SystemError::EINVAL)?;
+    if user_buf.len() < total_len {
+        return Err(SystemError::EFAULT);
+    }
+
+    let mut poll_fds = vec![
+        PollFd {
+            fd: 0,
+            events: 0,
+            revents: 0
+        };
+        nfds
+    ];
+    let dst_bytes =
+        unsafe { core::slice::from_raw_parts_mut(poll_fds.as_mut_ptr() as *mut u8, total_len) };
+    let copied = user_buf.read_from_user(0, dst_bytes)?;
+    if copied != total_len {
+        return Err(SystemError::EFAULT);
+    }
+    Ok(poll_fds)
+}
+
+pub(crate) fn write_pollfds_revents_to_user(
+    user_buf: &mut UserBuffer<'_>,
+    poll_fds: &[PollFd],
+) -> Result<(), SystemError> {
+    let elem_size = core::mem::size_of::<PollFd>();
+    let total_len = poll_fds
+        .len()
+        .checked_mul(elem_size)
+        .ok_or(SystemError::EINVAL)?;
+    if user_buf.len() < total_len {
+        return Err(SystemError::EFAULT);
+    }
+    let revents_off = pollfd_revents_offset();
+    for (i, pollfd) in poll_fds.iter().enumerate() {
+        let off = i
+            .checked_mul(elem_size)
+            .and_then(|v| v.checked_add(revents_off))
+            .ok_or(SystemError::EINVAL)?;
+        let bytes = pollfd.revents.to_ne_bytes();
+        let written = user_buf.write_to_user(off, &bytes)?;
+        if written != bytes.len() {
+            return Err(SystemError::EFAULT);
+        }
+    }
+    Ok(())
 }
 
 struct PollAdapter<'a> {
@@ -492,7 +554,12 @@ impl RestartFn for RestartFnPoll {
 
             let mut poll_fds_writer =
                 UserBufferWriter::new(d.pollfd_ptr.as_ptr::<PollFd>(), len, true)?;
-            let mut r = do_sys_poll(poll_fds_writer.buffer(0)?, d.timeout_instant);
+            let mut user_buf = poll_fds_writer.buffer_protected(0)?;
+            let mut poll_fds = read_pollfds_from_user(&mut user_buf, d.nfds as usize)?;
+            let mut r = do_sys_poll(&mut poll_fds, d.timeout_instant);
+            if let Err(e) = write_pollfds_revents_to_user(&mut user_buf, &poll_fds) {
+                r = Err(e);
+            }
             if let Err(SystemError::ERESTARTNOHAND) = r {
                 let restart_block = RestartBlock::new(&RestartFnPoll, data.clone());
                 r = ProcessManager::current_pcb().set_restart_fn(Some(restart_block));

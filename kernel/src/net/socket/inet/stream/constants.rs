@@ -40,13 +40,18 @@ pub const IP_MULTICAST_LOOP_DEFAULT: bool = true;
 
 // ========== Socket缓冲区常量 - 参考Linux内核 include/net/sock.h ==========
 
-/// 最小socket缓冲区基本单位（用于SO_SNDBUF/SO_RCVBUF的clamp下限）
+/// 最小socket缓冲区基本单位（用于部分旧逻辑/保守下限）
 /// 来自Linux内核: include/net/sock.h:2565 (TCP_SKB_MIN_TRUESIZE)
+#[allow(dead_code)]
 pub const SOCK_MIN_BUFFER: usize = 2048;
 
 /// Minimum receive buffer size.
-/// 来自Linux内核: include/net/sock.h:2565 (TCP_SKB_MIN_TRUESIZE)
-pub const SOCK_MIN_RCVBUF: usize = SOCK_MIN_BUFFER;
+/// 来自Linux内核: include/net/sock.h:2565 (SOCK_MIN_RCVBUF)
+pub const SOCK_MIN_RCVBUF: usize = 2304;
+
+/// Minimum send buffer size.
+/// 来自Linux内核: include/net/sock.h:2565 (SOCK_MIN_SNDBUF)
+pub const SOCK_MIN_SNDBUF: usize = 4608;
 
 /// 最大socket缓冲区大小（用于SO_SNDBUF/SO_RCVBUF的clamp上限）
 pub const MAX_SOCKET_BUFFER: usize = 10 * 1024 * 1024;

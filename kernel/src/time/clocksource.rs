@@ -29,6 +29,7 @@ use crate::{
 
 use super::{
     jiffies::clocksource_default_clock,
+    timekeeping,
     timer::{clock, Timer, TimerFunction},
     NSEC_PER_SEC, NSEC_PER_USEC,
 };
@@ -1002,11 +1003,17 @@ pub fn clocksource_select() {
             info!("Switching to the clocksource {:?}\n", best_name);
             drop(cur_clocksource);
             CUR_CLOCKSOURCE.lock().replace(best.clone());
+            if timekeeping::timekeeping_is_initialized() {
+                timekeeping::timekeeper().timekeeper_setup_internals(best.clone());
+            }
             // TODO 通知timerkeeping 切换了时间源
         }
     } else {
         // 当前时钟源为空
         CUR_CLOCKSOURCE.lock().replace(best.clone());
+        if timekeeping::timekeeping_is_initialized() {
+            timekeeping::timekeeper().timekeeper_setup_internals(best.clone());
+        }
     }
     debug!("clocksource_select finish, CUR_CLOCKSOURCE = {best:?}");
 }
@@ -1014,8 +1021,12 @@ pub fn clocksource_select() {
 /// # clocksource模块加载完成
 pub fn clocksource_boot_finish() {
     let mut cur_clocksource = CUR_CLOCKSOURCE.lock();
-    cur_clocksource.replace(clocksource_default_clock());
+    if cur_clocksource.is_none() {
+        cur_clocksource.replace(clocksource_default_clock());
+    }
     FINISHED_BOOTING.store(true, Ordering::Relaxed);
+    drop(cur_clocksource);
+    clocksource_select();
     // 清除不稳定的时钟源
     __clocksource_watchdog_kthread();
     debug!("clocksource_boot_finish");

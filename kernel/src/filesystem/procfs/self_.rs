@@ -30,9 +30,12 @@ impl SelfSymOps {
 
 impl SymOps for SelfSymOps {
     fn read_link(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
-        // 返回当前进程的 PID
-        let current_pid = ProcessManager::current_pid().data();
-        let pid_bytes = current_pid.to_string();
+        // 返回当前线程组的 TGID（与 Linux /proc/self 语义一致）
+        let current_pcb = ProcessManager::current_pcb();
+        let tgid = current_pcb
+            .task_tgid_vnr()
+            .unwrap_or_else(ProcessManager::current_pid);
+        let pid_bytes = tgid.data().to_string();
         let len = pid_bytes.len().min(buf.len());
         buf[..len].copy_from_slice(&pid_bytes.as_bytes()[..len]);
         Ok(len)

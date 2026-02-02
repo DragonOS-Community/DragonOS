@@ -2,7 +2,8 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::ipc::signal::SigSet;
 use crate::arch::syscall::nr::SYS_PPOLL;
 use crate::filesystem::poll::{
-    do_sys_poll, poll_select_finish, poll_select_set_timeout, PollFd, PollTimeType,
+    do_sys_poll, poll_select_finish, poll_select_set_timeout, read_pollfds_from_user,
+    write_pollfds_revents_to_user, PollFd, PollTimeType,
 };
 use crate::ipc::signal::set_user_sigmask;
 use crate::mm::VirtAddr;
@@ -190,8 +191,13 @@ pub fn do_ppoll(
         use crate::syscall::user_access::UserBufferWriter;
         let mut poll_fds_writer =
             UserBufferWriter::new(pollfd_ptr.as_ptr::<PollFd>(), pollfds_len, true)?;
-        let poll_fds = poll_fds_writer.buffer(0)?;
-        do_sys_poll(poll_fds, timeout_ts)
+        let mut user_buf = poll_fds_writer.buffer_protected(0)?;
+        let mut poll_fds = read_pollfds_from_user(&mut user_buf, nfds as usize)?;
+        let mut r = do_sys_poll(&mut poll_fds, timeout_ts);
+        if let Err(e) = write_pollfds_revents_to_user(&mut user_buf, &poll_fds) {
+            r = Err(e);
+        }
+        r
     };
 
     return poll_select_finish(timeout_ts, timespec_ptr, PollTimeType::TimeSpec, r);

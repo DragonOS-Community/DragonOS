@@ -9,10 +9,10 @@ use crate::{
         posix::MsgHdr,
         socket::{
             self,
-            common::EPollItems,
+            common::{parse_timeval_opt, write_timeval_opt, EPollItems},
             endpoint::Endpoint,
             unix::{UnixEndpoint, UnixEndpointBound},
-            Socket, PMSG, PSOL,
+            AddressFamily, Socket, PMSG, PSOCK, PSOL,
         },
     },
 };
@@ -21,7 +21,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use hashbrown::HashMap;
 use system_error::SystemError;
 
@@ -269,6 +269,7 @@ pub struct UnixDatagramSocket {
     sndbuf: AtomicUsize,
     snd_used: AtomicUsize,
     rcvbuf: AtomicUsize,
+    rcvlowat: AtomicI32,
     send_timeout_us: AtomicU64,
     recv_timeout_us: AtomicU64,
     self_weak: Weak<UnixDatagramSocket>,
@@ -303,8 +304,9 @@ impl UnixDatagramSocket {
             sndbuf: AtomicUsize::new(Self::DEFAULT_BUF_SIZE),
             snd_used: AtomicUsize::new(0),
             rcvbuf: AtomicUsize::new(Self::DEFAULT_BUF_SIZE),
-            send_timeout_us: AtomicU64::new(0),
-            recv_timeout_us: AtomicU64::new(0),
+            rcvlowat: AtomicI32::new(1),
+            send_timeout_us: AtomicU64::new(u64::MAX),
+            recv_timeout_us: AtomicU64::new(u64::MAX),
             self_weak: weak.clone(),
 
             passcred: AtomicBool::new(false),
@@ -371,7 +373,7 @@ impl UnixDatagramSocket {
 
     fn send_timeout(&self) -> Option<Duration> {
         let us = self.send_timeout_us.load(Ordering::Relaxed);
-        if us == 0 {
+        if us == u64::MAX {
             None
         } else {
             Some(Duration::from_micros(us))
@@ -380,7 +382,7 @@ impl UnixDatagramSocket {
 
     fn recv_timeout(&self) -> Option<Duration> {
         let us = self.recv_timeout_us.load(Ordering::Relaxed);
-        if us == 0 {
+        if us == u64::MAX {
             None
         } else {
             Some(Duration::from_micros(us))
@@ -396,53 +398,13 @@ impl UnixDatagramSocket {
         Ok(u32::from_ne_bytes(raw))
     }
 
-    fn parse_timeval_opt(optval: &[u8]) -> Result<Duration, SystemError> {
-        // Linux struct timeval: { long tv_sec; long tv_usec; }
-        // 兼容 32/64 位长度差异：优先按 8+8 解析，其次按 8+4。
-        if optval.len() >= 16 {
-            let mut sec_raw = [0u8; 8];
-            let mut usec_raw = [0u8; 8];
-            sec_raw.copy_from_slice(&optval[..8]);
-            usec_raw.copy_from_slice(&optval[8..16]);
-            let sec = i64::from_ne_bytes(sec_raw);
-            let usec = i64::from_ne_bytes(usec_raw);
-            if sec < 0 || !(0..1_000_000).contains(&usec) {
-                return Err(SystemError::EINVAL);
-            }
-            let total_us = (sec as u64)
-                .saturating_mul(1_000_000)
-                .saturating_add(usec as u64);
-            return Ok(Duration::from_micros(total_us));
-        }
-
-        if optval.len() >= 12 {
-            let mut sec_raw = [0u8; 8];
-            let mut usec_raw = [0u8; 4];
-            sec_raw.copy_from_slice(&optval[..8]);
-            usec_raw.copy_from_slice(&optval[8..12]);
-            let sec = i64::from_ne_bytes(sec_raw);
-            let usec = i32::from_ne_bytes(usec_raw) as i64;
-            if sec < 0 || !(0..1_000_000).contains(&usec) {
-                return Err(SystemError::EINVAL);
-            }
-            let total_us = (sec as u64)
-                .saturating_mul(1_000_000)
-                .saturating_add(usec as u64);
-            return Ok(Duration::from_micros(total_us));
-        }
-
-        Err(SystemError::EINVAL)
-    }
-
-    fn write_timeval(value: &mut [u8], us: u64) -> Result<usize, SystemError> {
-        if value.len() < 16 {
+    fn parse_i32_opt(optval: &[u8]) -> Result<i32, SystemError> {
+        if optval.len() < core::mem::size_of::<i32>() {
             return Err(SystemError::EINVAL);
         }
-        let sec = (us / 1_000_000) as i64;
-        let usec = (us % 1_000_000) as i64;
-        value[..8].copy_from_slice(&sec.to_ne_bytes());
-        value[8..16].copy_from_slice(&usec.to_ne_bytes());
-        Ok(16)
+        let mut raw = [0u8; 4];
+        raw.copy_from_slice(&optval[..4]);
+        Ok(i32::from_ne_bytes(raw))
     }
 
     fn effective_sockbuf(requested: usize) -> usize {
@@ -745,15 +707,25 @@ impl Socket for UnixDatagramSocket {
                 Ok(())
             }
             crate::net::socket::PSO::SNDTIMEO_OLD | crate::net::socket::PSO::SNDTIMEO_NEW => {
-                let d = Self::parse_timeval_opt(optval)?;
-                self.send_timeout_us
-                    .store(d.total_micros(), Ordering::SeqCst);
+                let d = parse_timeval_opt(optval)?;
+                let us = d.map(|v| v.total_micros()).unwrap_or(u64::MAX);
+                self.send_timeout_us.store(us, Ordering::SeqCst);
                 Ok(())
             }
             crate::net::socket::PSO::RCVTIMEO_OLD | crate::net::socket::PSO::RCVTIMEO_NEW => {
-                let d = Self::parse_timeval_opt(optval)?;
-                self.recv_timeout_us
-                    .store(d.total_micros(), Ordering::SeqCst);
+                let d = parse_timeval_opt(optval)?;
+                let us = d.map(|v| v.total_micros()).unwrap_or(u64::MAX);
+                self.recv_timeout_us.store(us, Ordering::SeqCst);
+                Ok(())
+            }
+            crate::net::socket::PSO::RCVLOWAT => {
+                let mut v = Self::parse_i32_opt(optval)?;
+                if v < 0 {
+                    v = i32::MAX;
+                } else if v == 0 {
+                    v = 1;
+                }
+                self.rcvlowat.store(v, Ordering::SeqCst);
                 Ok(())
             }
             crate::net::socket::PSO::PASSCRED => {
@@ -1270,6 +1242,30 @@ impl Socket for UnixDatagramSocket {
         let opt =
             crate::net::socket::PSO::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
         match opt {
+            crate::net::socket::PSO::TYPE => {
+                if value.len() < 4 {
+                    return Err(SystemError::EINVAL);
+                }
+                let v = PSOCK::Datagram as i32;
+                value[..4].copy_from_slice(&v.to_ne_bytes());
+                Ok(4)
+            }
+            crate::net::socket::PSO::DOMAIN => {
+                if value.len() < 4 {
+                    return Err(SystemError::EINVAL);
+                }
+                let v = AddressFamily::Unix as i32;
+                value[..4].copy_from_slice(&v.to_ne_bytes());
+                Ok(4)
+            }
+            crate::net::socket::PSO::PROTOCOL => {
+                if value.len() < 4 {
+                    return Err(SystemError::EINVAL);
+                }
+                let v: i32 = 0;
+                value[..4].copy_from_slice(&v.to_ne_bytes());
+                Ok(4)
+            }
             crate::net::socket::PSO::SNDBUF => {
                 if value.len() < 4 {
                     return Err(SystemError::EINVAL);
@@ -1287,10 +1283,22 @@ impl Socket for UnixDatagramSocket {
                 Ok(4)
             }
             crate::net::socket::PSO::SNDTIMEO_OLD | crate::net::socket::PSO::SNDTIMEO_NEW => {
-                Self::write_timeval(value, self.send_timeout_us.load(Ordering::Relaxed))
+                let us = self.send_timeout_us.load(Ordering::Relaxed);
+                let us = if us == u64::MAX { 0 } else { us };
+                write_timeval_opt(value, us)
             }
             crate::net::socket::PSO::RCVTIMEO_OLD | crate::net::socket::PSO::RCVTIMEO_NEW => {
-                Self::write_timeval(value, self.recv_timeout_us.load(Ordering::Relaxed))
+                let us = self.recv_timeout_us.load(Ordering::Relaxed);
+                let us = if us == u64::MAX { 0 } else { us };
+                write_timeval_opt(value, us)
+            }
+            crate::net::socket::PSO::RCVLOWAT => {
+                if value.len() < 4 {
+                    return Err(SystemError::EINVAL);
+                }
+                let v = self.rcvlowat.load(Ordering::Relaxed);
+                value[..4].copy_from_slice(&v.to_ne_bytes());
+                Ok(4)
             }
             crate::net::socket::PSO::PASSCRED => {
                 if value.len() < 4 {

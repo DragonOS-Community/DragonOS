@@ -480,6 +480,23 @@ impl CurrentApic {
         }
     }
 
+    pub(self) unsafe fn read_xapic_register(&self, reg: XApicOffset) -> u32 {
+        if let Some(xapic) = current_xapic_instance().borrow_mut().as_mut() {
+            return xapic.read(reg);
+        }
+        0
+    }
+
+    pub(super) fn read_timer_current_count(&self) -> u32 {
+        let reg = XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_CURRENT_COUNT_REG as u32;
+        if self.x2apic_enabled() {
+            return unsafe { rdmsr(APIC_BASE_MSR + (reg >> 4)) as u32 };
+        }
+        unsafe {
+            self.read_xapic_register(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_CURRENT_COUNT_REG)
+        }
+    }
+
     /// 屏蔽类8259A芯片
     unsafe fn mask8259a(&self) {
         CurrentPortIOArch::out8(0x21, 0xff);

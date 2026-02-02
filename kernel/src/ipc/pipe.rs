@@ -15,7 +15,7 @@ use crate::{
     ipc::signal::send_kernel_signal_to_current,
     libs::{spinlock::SpinLock, wait_queue::WaitQueue},
     mm::MemoryManagementArch,
-    process::{ProcessFlags, ProcessManager, ProcessState},
+    process::ProcessState,
     syscall::user_access::UserBufferWriter,
     time::PosixTimeSpec,
 };
@@ -658,13 +658,7 @@ impl LockedPipeInode {
                     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                 }
                 drop(guard);
-                let r = wq_wait_event_interruptible!(self.read_wait_queue, self.readable(), {});
-                if r.is_err() {
-                    ProcessManager::current_pcb()
-                        .flags()
-                        .insert(ProcessFlags::HAS_PENDING_SIGNAL);
-                    return Err(SystemError::ERESTARTSYS);
-                }
+                wq_wait_event_interruptible!(self.read_wait_queue, self.readable(), {})?;
                 continue;
             }
 
@@ -673,13 +667,7 @@ impl LockedPipeInode {
                     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                 }
                 drop(guard);
-                let r = wq_wait_event_interruptible!(self.read_wait_queue, self.readable(), {});
-                if r.is_err() {
-                    ProcessManager::current_pcb()
-                        .flags()
-                        .insert(ProcessFlags::HAS_PENDING_SIGNAL);
-                    return Err(SystemError::ERESTARTSYS);
-                }
+                wq_wait_event_interruptible!(self.read_wait_queue, self.readable(), {})?;
                 continue;
             }
 
@@ -756,8 +744,7 @@ impl LockedPipeInode {
             if nonblock {
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
-            wq_wait_event_interruptible!(self.read_wait_queue, self.readable(), {})
-                .map_err(|_| SystemError::ERESTARTSYS)?;
+            wq_wait_event_interruptible!(self.read_wait_queue, self.readable(), {})?;
         }
     }
 
@@ -778,8 +765,7 @@ impl LockedPipeInode {
             if nonblock {
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
-            wq_wait_event_interruptible!(self.write_wait_queue, self.writeable(), {})
-                .map_err(|_| SystemError::ERESTARTSYS)?;
+            wq_wait_event_interruptible!(self.write_wait_queue, self.writeable(), {})?;
         }
     }
 
@@ -1110,13 +1096,7 @@ impl IndexNode for LockedPipeInode {
             }
 
             drop(inner_guard);
-            let r = wq_wait_event_interruptible!(self.read_wait_queue, self.readable(), {});
-            if r.is_err() {
-                ProcessManager::current_pcb()
-                    .flags()
-                    .insert(ProcessFlags::HAS_PENDING_SIGNAL);
-                return Err(SystemError::ERESTARTSYS);
-            }
+            wq_wait_event_interruptible!(self.read_wait_queue, self.readable(), {})?;
 
             inner_guard = self.inner.lock();
         }

@@ -791,6 +791,7 @@ impl IndexNode for LockedTmpfsInode {
                 Some(backend),
             );
             pc.set_unevictable(true);
+            pc.set_shmem(true);
             result.0.lock().page_cache = Some(pc);
         }
 
@@ -802,9 +803,10 @@ impl IndexNode for LockedTmpfsInode {
     }
 
     fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
+        // downcast 用于获取类型特定功能（跨文件系统检查已在 VFS 层完成）
         let other: &LockedTmpfsInode = other
             .downcast_ref::<LockedTmpfsInode>()
-            .ok_or(SystemError::EPERM)?;
+            .ok_or(SystemError::EINVAL)?;
         let name = DName::from(name);
         let mut inode: MutexGuard<TmpfsInode> = self.0.lock();
         let mut other_locked: MutexGuard<TmpfsInode> = other.0.lock();
@@ -851,11 +853,22 @@ impl IndexNode for LockedTmpfsInode {
             .ok_or(SystemError::EIO)?;
 
         drop(deleted_inode);
-        to_delete.0.lock().metadata.nlinks -= 1;
+
+        let mut deleted_guard = to_delete.0.lock();
+        deleted_guard.metadata.nlinks = deleted_guard
+            .metadata
+            .nlinks
+            .checked_sub(1)
+            .expect("tempfs nlinks underflow: filesystem corruption detected");
+
+        let should_free = deleted_guard.metadata.nlinks == 0;
+        drop(deleted_guard);
+
         inode.children.remove(&name);
 
-        // 减少文件系统使用的大小
-        tmpfs.decrease_size(file_size);
+        if should_free {
+            tmpfs.decrease_size(file_size);
+        }
 
         Ok(())
     }
@@ -1084,7 +1097,7 @@ impl IndexNode for LockedTmpfsInode {
         &self,
         filename: &str,
         mode: InodeMode,
-        _dev_t: DeviceNumber,
+        dev_t: DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let mut inode = self.0.lock();
         if inode.metadata.file_type != FileType::Dir {
@@ -1099,6 +1112,17 @@ impl IndexNode for LockedTmpfsInode {
         }
 
         let filename = DName::from(filename);
+
+        // 确定文件类型
+        let file_type = if mode.contains(InodeMode::S_IFIFO) {
+            FileType::Pipe
+        } else if mode.contains(InodeMode::S_IFCHR) {
+            FileType::CharDevice
+        } else if mode.contains(InodeMode::S_IFBLK) {
+            FileType::BlockDevice
+        } else {
+            FileType::File
+        };
 
         let nod = Arc::new(LockedTmpfsInode(Mutex::new(TmpfsInode {
             parent: inode.self_ref.clone(),
@@ -1115,12 +1139,12 @@ impl IndexNode for LockedTmpfsInode {
                 mtime: PosixTimeSpec::default(),
                 ctime: PosixTimeSpec::default(),
                 btime: PosixTimeSpec::default(),
-                file_type: FileType::Pipe,
+                file_type,
                 mode,
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
-                raw_dev: DeviceNumber::default(),
+                raw_dev: dev_t,
                 flags: InodeFlags::empty(),
             },
             fs: inode.fs.clone(),
@@ -1130,13 +1154,11 @@ impl IndexNode for LockedTmpfsInode {
 
         nod.0.lock().self_ref = Arc::downgrade(&nod);
 
+        // 对于 FIFO，需要创建实际的 pipe inode
         if mode.contains(InodeMode::S_IFIFO) {
-            nod.0.lock().metadata.file_type = FileType::Pipe;
             let pipe_inode = LockedPipeInode::new();
             pipe_inode.set_fifo();
             nod.0.lock().special_node = Some(SpecialNodeData::Pipe(pipe_inode));
-        } else if mode.contains(InodeMode::S_IFBLK) || mode.contains(InodeMode::S_IFCHR) {
-            return Err(SystemError::ENOSYS);
         }
 
         inode.children.insert(filename, nod.clone());

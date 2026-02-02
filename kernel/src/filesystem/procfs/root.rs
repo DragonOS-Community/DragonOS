@@ -8,6 +8,7 @@ use crate::{
             cmdline::CmdlineFileOps,
             cpuinfo::CpuInfoFileOps,
             kmsg_file::KmsgFileOps,
+            loadavg::LoadavgFileOps,
             meminfo::MeminfoFileOps,
             mounts::MountsFileOps,
             net::NetDirOps,
@@ -22,6 +23,7 @@ use crate::{
             thread_self::ThreadSelfDirOps,
             version::VersionFileOps,
             version_signature::VersionSignatureFileOps,
+            vmstat::VmstatFileOps,
             Builder, PROCFS_BLOCK_SIZE, PROCFS_MAX_NAMELEN,
         },
         vfs::{FileSystemMakerData, IndexNode, InodeMode, FSMAKER},
@@ -61,6 +63,7 @@ impl RootDirOps {
         ("cmdline", CmdlineFileOps::new_inode),
         ("cpuinfo", CpuInfoFileOps::new_inode),
         ("kmsg", KmsgFileOps::new_inode),
+        ("loadavg", LoadavgFileOps::new_inode),
         ("meminfo", MeminfoFileOps::new_inode),
         ("mounts", MountsFileOps::new_inode),
         ("net", NetDirOps::new_inode),
@@ -70,6 +73,7 @@ impl RootDirOps {
         ("thread-self", ThreadSelfDirOps::new_inode),
         ("version", VersionFileOps::new_inode),
         ("version_signature", VersionSignatureFileOps::new_inode),
+        ("vmstat", VmstatFileOps::new_inode),
     ];
 }
 

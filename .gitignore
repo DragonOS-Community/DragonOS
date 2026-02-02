@@ -6,7 +6,7 @@ DragonOS.iso
 /tmp/
 kernel/kernel
 .DS_Store
-
+result/
 *.o
 *.a
 *.s

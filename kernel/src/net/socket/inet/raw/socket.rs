@@ -1,4 +1,5 @@
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use smoltcp::wire::{IpAddress, IpProtocol, IpVersion};
 use system_error::SystemError;
@@ -12,7 +13,7 @@ use crate::process::ProcessManager;
 
 use super::constants::ICMPV6_CHECKSUM_OFFSET;
 use super::inner::{RawInner, UnboundRaw};
-use super::loopback::register_raw_socket;
+use super::loopback::{register_raw_socket, unregister_raw_socket};
 use super::options::RawSocketOptions;
 use super::RawSocket;
 
@@ -82,6 +83,9 @@ impl RawSocket {
             ip_version,
             protocol,
             loopback_rx: crate::libs::mutex::Mutex::new(super::loopback::LoopbackRxQueue::default()),
+            ip_multicast_ifindex: core::sync::atomic::AtomicI32::new(0),
+            ip_multicast_addr: core::sync::atomic::AtomicU32::new(0),
+            ip_multicast_groups: crate::libs::mutex::Mutex::new(Vec::new()),
         });
 
         // Linux 语义：raw socket 未 bind 也应能被 poll/epoll 正确唤醒。
@@ -267,13 +271,26 @@ impl RawSocket {
     }
 
     pub fn close(&self) {
+        if let Some(me) = self.self_ref.upgrade() {
+            unregister_raw_socket(&me);
+        }
         let mut inner = self.inner.write();
         match &mut *inner {
             Some(RawInner::Bound(bound)) => {
+                bound
+                    .inner()
+                    .iface()
+                    .common()
+                    .unbind_socket(self.self_ref.upgrade().unwrap());
                 bound.close();
                 inner.take();
             }
             Some(RawInner::Wildcard(bound)) => {
+                bound
+                    .inner()
+                    .iface()
+                    .common()
+                    .unbind_socket(self.self_ref.upgrade().unwrap());
                 bound.close();
                 inner.take();
             }

@@ -1,6 +1,9 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_POLL;
-use crate::filesystem::poll::{do_sys_poll, poll_select_set_timeout, PollFd, RestartFnPoll};
+use crate::filesystem::poll::{
+    do_sys_poll, poll_select_set_timeout, read_pollfds_from_user, write_pollfds_revents_to_user,
+    PollFd, RestartFnPoll,
+};
 use crate::ipc::signal::{RestartBlock, RestartBlockData};
 use crate::mm::VirtAddr;
 use crate::process::resource::RLimitID;
@@ -133,7 +136,12 @@ pub fn do_poll(pollfd_ptr: usize, nfds: u32, timeout_ms: i32) -> Result<usize, S
     }
 
     let mut poll_fds_writer = UserBufferWriter::new(pollfd_ptr.as_ptr::<PollFd>(), len, true)?;
-    let mut r = do_sys_poll(poll_fds_writer.buffer(0)?, timeout);
+    let mut user_buf = poll_fds_writer.buffer_protected(0)?;
+    let mut poll_fds = read_pollfds_from_user(&mut user_buf, nfds as usize)?;
+    let mut r = do_sys_poll(&mut poll_fds, timeout);
+    if let Err(e) = write_pollfds_revents_to_user(&mut user_buf, &poll_fds) {
+        r = Err(e);
+    }
     if let Err(SystemError::ERESTARTNOHAND) = r {
         let restart_block_data = RestartBlockData::new_poll(pollfd_ptr, nfds, timeout);
         let restart_block = RestartBlock::new(&RestartFnPoll, restart_block_data);

@@ -200,8 +200,14 @@ impl DmaAllocator {
     ) -> DmaBuffer {
         let pool_pages = self.pool_pages_for(page_count.data(), options.use_pool);
         let raw = if let Some(pages) = pool_pages {
-            self.take_from_pool(pages)
-                .unwrap_or_else(|| self.alloc_raw(page_count, &options))
+            if let Some(raw) = self.take_from_pool(pages) {
+                if options.zeroed {
+                    self.zero_raw(&raw);
+                }
+                raw
+            } else {
+                self.alloc_raw(page_count, &options)
+            }
         } else {
             self.alloc_raw(page_count, &options)
         };
@@ -241,6 +247,16 @@ impl DmaAllocator {
             paddr,
             vaddr: NonNull::new(virt.data() as *mut u8).unwrap(),
             page_count: count,
+        }
+    }
+
+    fn zero_raw(&self, alloc: &DmaRawAllocation) {
+        unsafe {
+            core::ptr::write_bytes(
+                alloc.vaddr.as_ptr(),
+                0,
+                alloc.page_count.data() * MMArch::PAGE_SIZE,
+            );
         }
     }
 

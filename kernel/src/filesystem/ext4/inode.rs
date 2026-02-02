@@ -1,13 +1,10 @@
 use crate::{
-    filesystem::{
+    driver::base::device::device_number::DeviceNumber, filesystem::{
         page_cache::{AsyncPageCacheBackend, PageCache},
         vfs::{
-            self, utils::DName, vcore::generate_inode_id, FilePrivateData, IndexNode, InodeFlags,
-            InodeId, InodeMode,
+            self, FilePrivateData, IndexNode, InodeFlags, InodeId, InodeMode, utils::DName, vcore::generate_inode_id
         },
-    },
-    libs::{casting::DowncastArc, mutex::Mutex, mutex::MutexGuard},
-    time::PosixTimeSpec,
+    }, libs::{casting::DowncastArc, mutex::{Mutex, MutexGuard}}, time::PosixTimeSpec
 };
 use alloc::{
     collections::BTreeMap,
@@ -502,6 +499,58 @@ impl IndexNode for LockedExt4Inode {
         ext4.setxattr(inode_num, name, value)?;
 
         Ok(0)
+    }
+
+    fn mknod(
+        &self,
+        filename: &str,
+        mode: InodeMode,
+        dev_t: DeviceNumber,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        if mode.contains(InodeMode::S_IFREG) {
+            return self.create(filename, vfs::FileType::File, mode);
+        }
+
+        // 字符设备/块设备需要存储设备号，但 another_ext4 crate 暂不支持
+        // TODO: 修改 another_ext4 使用 i_block[0:1] 存储 dev_t（Linux ext4 标准做法）
+        if mode.contains(InodeMode::S_IFCHR) || mode.contains(InodeMode::S_IFBLK) {
+            log::error!(
+                "ext4::mknod: device nodes not supported (filename='{}', dev={}:{})",
+                filename,
+                dev_t.major().data(),
+                dev_t.minor()
+            );
+            return Err(SystemError::ENOSYS);
+        }
+
+        let mut guard = self.0.lock();
+        let ext4 = &guard.concret_fs().fs;
+        let inode_num = guard.inner_inode_num;
+
+        // 确保当前 inode 是目录
+        if ext4.getattr(inode_num)?.ftype != FileType::Directory {
+            return Err(SystemError::ENOTDIR);
+        }
+
+        // VFS InodeMode(u32) → another_ext4 InodeMode(u16)
+        // 位布局兼容（标准 POSIX 格式），直接截断
+        let file_mode = another_ext4::InodeMode::from_bits_truncate(mode.bits() as u16);
+
+        // 在磁盘上创建 inode 并链接到父目录
+        let id = ext4.create(inode_num, filename, file_mode)?;
+
+        // 包装为 VFS inode 并缓存
+        let dname = DName::from(filename);
+        let self_arc = guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+        let inode = LockedExt4Inode::new(
+            id,
+            guard.fs_ptr.clone(),
+            dname.clone(),
+            Some(Arc::downgrade(&self_arc)),
+        );
+        guard.children.insert(dname, inode.clone());
+        drop(guard);
+        Ok(inode as Arc<dyn IndexNode>)
     }
 }
 

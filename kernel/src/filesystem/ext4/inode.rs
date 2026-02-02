@@ -515,7 +515,7 @@ impl IndexNode for LockedExt4Inode {
         new_name: &str,
         flags: RenameFlags,
     ) -> Result<(), SystemError> {
-        // 目标必须是 LockedExt4Inode（同一文件系统）
+        // TODO
         let target_locked = target
             .clone()
             .downcast_arc::<LockedExt4Inode>()
@@ -543,66 +543,99 @@ impl IndexNode for LockedExt4Inode {
         let src_child_id = ext4.lookup(src_inode_num, old_name)?;
         let src_attr = ext4.getattr(src_child_id)?;
 
-        // 检查目标是否已存在，若存在需要先删除
-        let dst_exists = if let Ok(dst_child_id) = ext4.lookup(target_inode_num, new_name) {
-            if flags.contains(RenameFlags::NOREPLACE) {
-                return Err(SystemError::EEXIST);
-            }
-
-            let dst_attr = ext4.getattr(dst_child_id)?;
-
-            // POSIX rename 类型兼容性检查
-            if src_attr.ftype == FileType::Directory {
-                if dst_attr.ftype != FileType::Directory {
-                    return Err(SystemError::ENOTDIR);
+        // 检查目标是否已存在，若存在需要先移到临时名称（以便失败时回滚）
+        let backup_name: Option<alloc::string::String> =
+            if let Ok(dst_child_id) = ext4.lookup(target_inode_num, new_name) {
+                if flags.contains(RenameFlags::NOREPLACE) {
+                    return Err(SystemError::EEXIST);
                 }
-                // 目标目录必须为空
-                let entries = ext4.listdir(dst_child_id)?;
-                let has_real_entries = entries.iter().any(|e| e.name() != "." && e.name() != "..");
-                if has_real_entries {
-                    return Err(SystemError::ENOTEMPTY);
-                }
-                ext4.rmdir(target_inode_num, new_name)?;
-            } else {
-                if dst_attr.ftype == FileType::Directory {
+
+                let dst_attr = ext4.getattr(dst_child_id)?;
+
+                // POSIX rename 类型兼容性检查
+                if src_attr.ftype == FileType::Directory {
+                    if dst_attr.ftype != FileType::Directory {
+                        return Err(SystemError::ENOTDIR);
+                    }
+                    // 目标目录必须为空
+                    let entries = ext4.listdir(dst_child_id)?;
+                    let has_real_entries =
+                        entries.iter().any(|e| e.name() != "." && e.name() != "..");
+                    if has_real_entries {
+                        return Err(SystemError::ENOTEMPTY);
+                    }
+                } else if dst_attr.ftype == FileType::Directory {
                     return Err(SystemError::EISDIR);
                 }
-                // 在删除前清理 page cache
-                match target_locked.find(new_name) {
-                    Ok(dst_inode) => {
-                        if let Some(page_cache) = dst_inode.page_cache() {
-                            truncate_inode_pages(page_cache, 0);
+
+                // 在移走前清理 page cache
+                if dst_attr.ftype != FileType::Directory {
+                    match target_locked.find(new_name) {
+                        Ok(dst_inode) => {
+                            if let Some(page_cache) = dst_inode.page_cache() {
+                                truncate_inode_pages(page_cache, 0);
+                            }
+                        }
+                        Err(SystemError::ENOENT) => {
+                            // 文件不在缓存中，无需清理 page cache
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "move_to: unexpected error finding '{}' for page cache cleanup: {:?}",
+                                new_name,
+                                e
+                            );
+                            return Err(e);
                         }
                     }
-                    Err(SystemError::ENOENT) => {
-                        // 文件不在缓存中，无需清理 page cache
-                    }
-                    Err(e) => {
-                        // 其他错误（如 EIO、ENOMEM）不应静默忽略
-                        log::error!(
-                            "move_to: unexpected error finding '{}' for page cache cleanup: {:?}",
-                            new_name,
-                            e
-                        );
-                        return Err(e);
-                    }
                 }
-                ext4.unlink(target_inode_num, new_name)?;
-            }
-            true
-        } else {
-            false
-        };
+
+                // 生成临时备份名称，将目标移到临时位置
+                let tmp_name = alloc::format!(".rename_backup_{}", dst_child_id);
+                ext4.rename(target_inode_num, new_name, target_inode_num, &tmp_name)?;
+                Some(tmp_name)
+            } else {
+                None
+            };
 
         // 执行底层 ext4 重命名
-        ext4.rename(src_inode_num, old_name, target_inode_num, new_name)?;
+        let rename_result = ext4.rename(src_inode_num, old_name, target_inode_num, new_name);
+
+        // 处理备份文件
+        if let Some(ref tmp_name) = backup_name {
+            if rename_result.is_ok() {
+                // rename 成功，删除备份（忽略删除错误，rename 已完成）
+                if let Ok(backup_id) = ext4.lookup(target_inode_num, tmp_name) {
+                    if let Ok(backup_attr) = ext4.getattr(backup_id) {
+                        if backup_attr.ftype == FileType::Directory {
+                            let _ = ext4.rmdir(target_inode_num, tmp_name);
+                        } else {
+                            let _ = ext4.unlink(target_inode_num, tmp_name);
+                        }
+                    }
+                }
+            } else {
+                // rename 失败，恢复备份到原名
+                if let Err(restore_err) =
+                    ext4.rename(target_inode_num, tmp_name, target_inode_num, new_name)
+                {
+                    log::error!(
+                        "move_to: failed to restore backup '{}' to '{}': {:?}",
+                        tmp_name,
+                        new_name,
+                        restore_err
+                    );
+                }
+            }
+        }
+        rename_result?;
 
         // ========== 阶段2: 缓存更新（需要按顺序持有锁）==========
         // 锁排序：按 inode_num 顺序获取锁，避免死锁
 
         if src_inode_num == target_inode_num {
             let mut dir_guard = self.0.lock();
-            if dst_exists {
+            if backup_name.is_some() {
                 dir_guard.children.remove(&new_dname);
             }
             if let Some(child) = dir_guard.children.remove(&old_dname) {
@@ -620,7 +653,7 @@ impl IndexNode for LockedExt4Inode {
             };
 
             // 如果目标位置有被覆盖的条目，从缓存中移除
-            if dst_exists {
+            if backup_name.is_some() {
                 dst_guard.children.remove(&new_dname);
             }
 

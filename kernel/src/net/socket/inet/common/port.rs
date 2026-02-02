@@ -1,5 +1,5 @@
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU16, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU16, Ordering};
 use hashbrown::HashMap;
 use smoltcp::wire::IpAddress;
 use system_error::SystemError;
@@ -31,35 +31,15 @@ impl Default for PortManager {
     }
 }
 
-const DEFAULT_LOCAL_PORT_RANGE: u32 = (32768u32 << 16) | 60999u32;
-static LOCAL_PORT_RANGE: AtomicU32 = AtomicU32::new(DEFAULT_LOCAL_PORT_RANGE);
-
-fn unpack_range(value: u32) -> (u16, u16) {
-    ((value >> 16) as u16, (value & 0xffff) as u16)
-}
+pub const DEFAULT_LOCAL_PORT_RANGE: u32 = (32768u32 << 16) | 60999u32;
 
 impl PortManager {
     pub fn local_port_range() -> (u16, u16) {
-        unpack_range(LOCAL_PORT_RANGE.load(Ordering::Relaxed))
+        ProcessManager::current_netns().local_port_range()
     }
 
     pub fn set_local_port_range(min: u16, max: u16) -> Result<(), SystemError> {
-        if min == 0 || max == 0 || min > max {
-            return Err(SystemError::EINVAL);
-        }
-        let new_value = ((min as u32) << 16) | (max as u32);
-        loop {
-            let old_value = LOCAL_PORT_RANGE.load(Ordering::Relaxed);
-            if old_value == new_value {
-                return Ok(());
-            }
-            if LOCAL_PORT_RANGE
-                .compare_exchange(old_value, new_value, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                return Ok(());
-            }
-        }
+        ProcessManager::current_netns().set_local_port_range(min, max)
     }
 
     /// @brief 自动分配一个相对应协议中未被使用的PORT，如果动态端口均已被占用，返回错误码 EADDRINUSE

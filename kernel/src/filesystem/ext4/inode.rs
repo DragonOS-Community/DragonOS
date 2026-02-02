@@ -627,9 +627,9 @@ impl IndexNode for LockedExt4Inode {
 
             // 从源目录缓存移除，添加到目标目录缓存
             // 保存 child 引用以便后续更新，避免 drop 后重新查找的竞态
-            let child_to_update = src_guard.children.remove(&old_dname).map(|child| {
+            let child_to_update = src_guard.children.remove(&old_dname).inspect(|child| {
                 dst_guard.children.insert(new_dname.clone(), child.clone());
-                child
+                // child
             });
             drop(src_guard);
             drop(dst_guard);

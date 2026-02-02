@@ -1,9 +1,7 @@
-use core::slice::SlicePattern;
-
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
-use crate::{libs::spinlock::SpinLock, sched::completion::Completion};
+use crate::{libs::spinlock::SpinLock, mm::dma::DmaBuffer, sched::completion::Completion};
 
 use super::block_device::{BlockId, LBA_SIZE};
 
@@ -32,7 +30,7 @@ struct InnerBioRequest {
     bio_type: BioType,
     lba_start: BlockId,
     count: usize,
-    buffer: Box<[u8]>, // 预分配缓冲区，todo: 引入页面整理之后，要加Pin来固定地址
+    buffer: DmaBuffer,
     state: BioState,
     completion: Arc<Completion>,
     result: Option<Result<usize, SystemError>>,
@@ -46,7 +44,7 @@ type BioCompleteCallback = Box<dyn Fn(Result<usize, SystemError>) + Send + Sync>
 impl BioRequest {
     /// 创建一个读请求
     pub fn new_read(lba_start: BlockId, count: usize) -> Arc<Self> {
-        let buffer = vec![0u8; count * LBA_SIZE].into_boxed_slice();
+        let buffer = DmaBuffer::alloc_bytes(count * LBA_SIZE, Default::default());
         Arc::new(Self {
             inner: SpinLock::new(InnerBioRequest {
                 bio_type: BioType::Read,
@@ -64,9 +62,9 @@ impl BioRequest {
 
     /// 创建一个写请求
     pub fn new_write(lba_start: BlockId, count: usize, data: &[u8]) -> Arc<Self> {
-        let mut buffer = vec![0u8; count * LBA_SIZE].into_boxed_slice();
+        let mut buffer = DmaBuffer::alloc_bytes(count * LBA_SIZE, Default::default());
         let copy_len = data.len().min(buffer.len());
-        buffer[..copy_len].copy_from_slice(&data[..copy_len]);
+        buffer.as_mut_slice()[..copy_len].copy_from_slice(&data[..copy_len]);
 
         Arc::new(Self {
             inner: SpinLock::new(InnerBioRequest {
@@ -97,7 +95,7 @@ impl BioRequest {
     /// 获取缓冲区的可变引用（仅用于提交时）
     pub fn buffer_mut(&self) -> *mut [u8] {
         let mut inner = self.inner.lock_irqsave();
-        inner.buffer.as_mut() as *mut [u8]
+        inner.buffer.as_mut_slice() as *mut [u8]
     }
 
     /// 获取缓冲区的不可变引用
@@ -110,7 +108,7 @@ impl BioRequest {
     pub fn write_buffer(&self, data: &[u8]) {
         let mut inner = self.inner.lock_irqsave();
         let copy_len = data.len().min(inner.buffer.len());
-        inner.buffer[..copy_len].copy_from_slice(&data[..copy_len]);
+        inner.buffer.as_mut_slice()[..copy_len].copy_from_slice(&data[..copy_len]);
     }
 
     /// 获取BIO类型

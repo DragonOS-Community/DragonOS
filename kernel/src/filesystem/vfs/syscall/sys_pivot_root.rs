@@ -24,6 +24,12 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use system_error::SystemError;
 
+/// is_ancestor() 遍历父目录的最大深度
+///
+/// 用于防止在文件系统损坏或存在循环引用时出现无限循环。
+/// 1000 层对于正常使用场景来说绰绰有余（Linux 默认的链接数限制也远低于此）。
+const MAX_ANCESTOR_TRAVERSAL_DEPTH: u32 = 1000;
+
 pub struct SysPivotRootHandle;
 
 impl Syscall for SysPivotRootHandle {
@@ -277,12 +283,12 @@ impl SysPivotRootHandle {
         let inode_fs = inode.fs();
 
         // 关键修复：遍历所有挂载点，找到最精确的匹配
-        // 在容器场景中，我们需要找到 bind mount 创建的 MountFS（如 /tmp/runcell/containers/*/rootfs）
-        // 而不是其他的 tmpfs MountFS（如 /tmp）或子挂载点（如 /tmp/runcell/containers/*/rootfs/dev/shm）
+        // 在容器场景中，我们需要找到 bind mount 创建的 MountFS
         //
         // 策略：
-        // 1. 优先选择包含特定容器路径前缀（如 /tmp/runcell/containers/）的挂载点
-        // 2. 在符合条件的挂载点中，选择路径最短的（最上层的）
+        // 1. 优先选择设置了 bind_target_root 的 MountFS（这是 bind mount 的标记）
+        // 2. 在设置了 bind_target_root 的挂载点中，选择路径最短的（最上层的）
+        // 3. 如果没有找到，则选择路径最短的（最上层的）作为后备
         let mount_list = mnt_ns.mount_list().clone_inner();
         let mut candidates: Vec<(Arc<MountFS>, usize, String)> = Vec::new(); // (MountFS, 路径长度, 路径字符串)
 
@@ -298,22 +304,27 @@ impl SysPivotRootHandle {
             }
         }
 
-        // 首先尝试找到包含容器路径前缀的挂载点
-        let container_prefix = "/tmp/runcell/containers/";
-        let mut container_candidates: Vec<(Arc<MountFS>, usize, String)> = Vec::new();
+        // 首先尝试找到设置了 bind_target_root 的挂载点
+        // 这些是 bind mount 创建的，适合用作容器的根文件系统
+        let mut bind_mount_candidates: Vec<(Arc<MountFS>, usize, String)> = Vec::new();
 
         for (mnt_fs, path_len, path_str) in candidates.iter() {
-            if path_str.starts_with(container_prefix) {
-                container_candidates.push((mnt_fs.clone(), *path_len, path_str.clone()));
+            if mnt_fs.bind_target_root().is_some() {
+                bind_mount_candidates.push((mnt_fs.clone(), *path_len, path_str.clone()));
+                log::debug!(
+                    "[pivot_root] get_mountfs: found bind mount candidate id={:?}, path={:?}",
+                    mnt_fs.mount_id(),
+                    path_str
+                );
             }
         }
 
-        // 如果找到了容器相关的挂载点，在其中选择路径最短的
-        if !container_candidates.is_empty() {
-            container_candidates.sort_by(|a, b| a.1.cmp(&b.1));
-            if let Some((mnt_fs, _, path_str)) = container_candidates.first() {
+        // 如果找到了设置了 bind_target_root 的挂载点，在其中选择路径最短的
+        if !bind_mount_candidates.is_empty() {
+            bind_mount_candidates.sort_by(|a, b| a.1.cmp(&b.1));
+            if let Some((mnt_fs, _, path_str)) = bind_mount_candidates.first() {
                 log::debug!(
-                    "[pivot_root] get_mountfs: returning container rootfs match id={:?}, path={:?}",
+                    "[pivot_root] get_mountfs: returning bind mount match id={:?}, path={:?}",
                     mnt_fs.mount_id(),
                     path_str
                 );
@@ -321,7 +332,7 @@ impl SysPivotRootHandle {
             }
         }
 
-        // 如果没有找到容器相关的挂载点，选择路径最短的（最上层的）
+        // 如果没有找到 bind mount，选择路径最短的（最上层的）作为后备
         candidates.sort_by(|a, b| a.1.cmp(&b.1));
         if let Some((mnt_fs, _, path_str)) = candidates.first() {
             log::debug!(
@@ -377,8 +388,8 @@ impl SysPivotRootHandle {
         // 从 target_inode 开始向上遍历
         let mut current = target_inode.clone();
 
-        // 最多向上遍历 1000 层，防止循环
-        for i in 0..1000 {
+        // 最多向上遍历 MAX_ANCESTOR_TRAVERSAL_DEPTH 层，防止循环引用
+        for i in 0..MAX_ANCESTOR_TRAVERSAL_DEPTH {
             let current_meta = current.metadata()?;
 
             // 检查是否到达 ancestor

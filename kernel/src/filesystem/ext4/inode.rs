@@ -575,11 +575,17 @@ impl IndexNode for LockedExt4Inode {
                             truncate_inode_pages(page_cache, 0);
                         }
                     }
+                    Err(SystemError::ENOENT) => {
+                        // 文件不在缓存中，无需清理 page cache
+                    }
                     Err(e) => {
-                        log::warn!(
-                            "move_to: failed to find '{}' for page cache cleanup: {:?}, proceeding anyway",
-                            new_name, e
+                        // 其他错误（如 EIO、ENOMEM）不应静默忽略
+                        log::error!(
+                            "move_to: unexpected error finding '{}' for page cache cleanup: {:?}",
+                            new_name,
+                            e
                         );
+                        return Err(e);
                     }
                 }
                 ext4.unlink(target_inode_num, new_name)?;
@@ -620,12 +626,18 @@ impl IndexNode for LockedExt4Inode {
             }
 
             // 从源目录缓存移除，添加到目标目录缓存
-            if let Some(child) = src_guard.children.remove(&old_dname) {
+            // 保存 child 引用以便后续更新，避免 drop 后重新查找的竞态
+            let child_to_update = src_guard.children.remove(&old_dname).map(|child| {
+                dst_guard.children.insert(new_dname.clone(), child.clone());
+                child
+            });
+            drop(src_guard);
+            drop(dst_guard);
+
+            if let Some(child) = child_to_update {
                 let mut child_guard = child.0.lock();
                 child_guard.dname = new_dname.clone();
                 child_guard.parent = Arc::downgrade(&target_locked);
-                drop(child_guard);
-                dst_guard.children.insert(new_dname.clone(), child);
             }
         }
         Ok(())
@@ -639,7 +651,6 @@ impl IndexNode for LockedExt4Inode {
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 普通文件走 create 路径（避免持锁重入死锁）
         if mode.contains(InodeMode::S_IFREG) {
-            drop(self.0.lock()); // 确保不持锁
             return self.create(filename, vfs::FileType::File, mode);
         }
 

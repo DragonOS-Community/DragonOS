@@ -647,11 +647,22 @@ impl IndexNode for LockedExt4Inode {
         &self,
         filename: &str,
         mode: InodeMode,
-        _dev_t: DeviceNumber,
+        dev_t: DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        // 普通文件走 create 路径（避免持锁重入死锁）
         if mode.contains(InodeMode::S_IFREG) {
             return self.create(filename, vfs::FileType::File, mode);
+        }
+
+        // 字符设备/块设备需要存储设备号，但 another_ext4 crate 暂不支持
+        // TODO: 修改 another_ext4 使用 i_block[0:1] 存储 dev_t（Linux ext4 标准做法）
+        if mode.contains(InodeMode::S_IFCHR) || mode.contains(InodeMode::S_IFBLK) {
+            log::error!(
+                "ext4::mknod: device nodes not supported (filename='{}', dev={}:{})",
+                filename,
+                dev_t.major().data(),
+                dev_t.minor()
+            );
+            return Err(SystemError::ENOSYS);
         }
 
         let mut guard = self.0.lock();

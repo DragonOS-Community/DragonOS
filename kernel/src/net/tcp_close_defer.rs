@@ -13,9 +13,7 @@ use alloc::sync::Weak;
 use alloc::vec::Vec;
 
 use crate::libs::mutex::Mutex;
-use crate::net::socket::inet::common::PortManager;
 use crate::net::socket::inet::InetSocket;
-use crate::net::socket::inet::Types;
 
 #[derive(Debug, Clone)]
 struct ClosingTcpSocket {
@@ -62,11 +60,7 @@ impl TcpCloseDefer {
     ///
     /// 重要：
     /// - 锁顺序必须保持为：`SocketSet` -> `TcpCloseDefer::closing`，避免与 close 路径反转。
-    pub fn reap_closed(
-        &self,
-        sockets: &mut smoltcp::iface::SocketSet<'static>,
-        port_manager: &PortManager,
-    ) {
+    pub fn reap_closed(&self, sockets: &mut smoltcp::iface::SocketSet<'static>) {
         let mut closing = self.closing.lock();
         if closing.is_empty() {
             return;
@@ -75,7 +69,7 @@ impl TcpCloseDefer {
         while i < closing.len() {
             let ClosingTcpSocket {
                 handle,
-                local_port,
+                local_port: _local_port,
                 ref sock,
             } = closing[i];
             let state = sockets.get::<smoltcp::socket::tcp::Socket>(handle).state();
@@ -88,7 +82,6 @@ impl TcpCloseDefer {
                     continue;
                 }
                 sockets.remove(handle);
-                port_manager.unbind_port(Types::Tcp, local_port);
                 closing.swap_remove(i);
                 continue;
             }

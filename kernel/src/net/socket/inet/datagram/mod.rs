@@ -110,6 +110,8 @@ pub struct UdpSocket {
     ip_multicast_ttl: AtomicI32,
     /// IP_MULTICAST_LOOP
     ip_multicast_loop: AtomicBool,
+    /// IP_MULTICAST_ALL
+    ip_multicast_all: AtomicBool,
     /// IP_MULTICAST_IF: interface index
     ip_multicast_ifindex: AtomicI32,
     /// IP_MULTICAST_IF: interface address (network byte order)
@@ -190,6 +192,7 @@ impl UdpSocket {
             recv_err_v6: AtomicBool::new(false),
             ip_multicast_ttl: AtomicI32::new(1),
             ip_multicast_loop: AtomicBool::new(true),
+            ip_multicast_all: AtomicBool::new(true),
             ip_multicast_ifindex: AtomicI32::new(0),
             ip_multicast_addr: AtomicU32::new(0),
             ip_multicast_groups: Mutex::new(Vec::new()),

@@ -290,6 +290,7 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         // );
 
         let mut kill_list: Vec<Arc<ProcessControlBlock>> = Vec::new();
+        let mut leader_in_kill_list = false;
         if !Arc::ptr_eq(&leader, &current)
             && !leader.flags().contains(ProcessFlags::EXITING)
             && !leader.is_exited()
@@ -297,6 +298,7 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
             && !leader.is_dead()
         {
             kill_list.push(leader.clone());
+            leader_in_kill_list = true;
         }
         {
             let ti = leader.threads_read_irqsave();
@@ -317,40 +319,24 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
             }
         }
 
-        sighand.set_group_exec_notify_count(kill_list.len() as isize);
-
-        for task in kill_list.iter() {
-            task.exit_signal.store(Signal::INVALID, Ordering::SeqCst);
+        let mut notify_count = kill_list.len() as isize;
+        // 非 leader exec：notify_count 不包含 leader 本身
+        if !Arc::ptr_eq(&leader, &current) && leader_in_kill_list {
+            notify_count -= 1;
         }
+        sighand.set_group_exec_notify_count(notify_count);
 
         for task in kill_list {
             let _ = Signal::SIGKILL.send_signal_info_to_pcb(None, task, PidType::PID);
         }
 
+        // 先等待除 leader 外的线程退出（notify_count == 0）
         let wait_res = sighand.wait_group_exec_event_killable(
             || {
                 if Signal::fatal_signal_pending(&current) {
                     return true;
                 }
-                let mut siblings_alive = false;
-                {
-                    let ti = leader.threads_read_irqsave();
-                    for weak in &ti.group_tasks {
-                        if let Some(task) = weak.upgrade() {
-                            if Arc::ptr_eq(&task, &current) {
-                                continue;
-                            }
-                            if !task.is_exited() && !task.is_dead() && !task.is_zombie() {
-                                siblings_alive = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                let leader_ready =
-                    Arc::ptr_eq(&leader, &current) || leader.is_zombie() || leader.is_dead();
-                !siblings_alive && leader_ready
+                sighand.group_exec_notify_count() == 0
             },
             None::<fn()>,
         );
@@ -360,6 +346,23 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
 
         // 非 leader exec：等待 leader 进入 zombie 后再交换 tid/raw_pid
         if !Arc::ptr_eq(&leader, &current) {
+            // 标记等待 leader 退出（notify_count < 0），由 exit_notify 唤醒
+            if !leader.is_zombie() && !leader.is_dead() {
+                sighand.set_group_exec_notify_count(-1);
+                let wait_res = sighand.wait_group_exec_event_killable(
+                    || {
+                        if Signal::fatal_signal_pending(&current) {
+                            return true;
+                        }
+                        leader.is_zombie() || leader.is_dead()
+                    },
+                    None::<fn()>,
+                );
+                if wait_res.is_err() || Signal::fatal_signal_pending(&current) {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
+            }
+
             ProcessManager::exchange_tid_and_raw_pids(&current, &leader)?;
 
             current.exit_signal.store(Signal::SIGCHLD, Ordering::SeqCst);
@@ -405,6 +408,9 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
             *current.fork_parent_pcb.write() = current.self_ref.clone();
 
             // log::info!("de_thread: reparented current to old leader's parent");
+
+            // 补做旧 leader 在退出阶段延迟的 PID/TGID/PGID/SID unhash
+            leader.finish_deferred_unhash_for_exec();
 
             // 旧 leader 应由 exec 线程回收，避免父进程在交换前/后提前回收
             if leader.is_zombie() {

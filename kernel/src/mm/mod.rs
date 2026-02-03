@@ -21,6 +21,7 @@ use self::{
 };
 
 pub mod allocator;
+pub mod dma;
 pub mod early_ioremap;
 pub mod fault;
 pub mod ident_map;

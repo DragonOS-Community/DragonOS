@@ -405,9 +405,9 @@ pub trait BlockDevice: Device {
             Ok(()) => Ok(bio),
             Err(SystemError::ENOSYS) => {
                 log::debug!("BlockDevice submit_bio_read ENOSYS, falling back to sync read");
-                let mut buf = vec![0; count * LBA_SIZE];
-                self.read_at_sync(lba_start, count, &mut buf)?;
-                bio.write_buffer(&buf);
+                let buf_ptr = bio.buffer_mut();
+                let buf = unsafe { &mut *buf_ptr };
+                self.read_at_sync(lba_start, count, &mut buf[..count * LBA_SIZE])?;
                 bio.complete(Ok(count * LBA_SIZE));
                 Ok(bio)
             }
@@ -426,7 +426,9 @@ pub trait BlockDevice: Device {
         match self.submit_bio(bio.clone()) {
             Ok(()) => Ok(bio),
             Err(SystemError::ENOSYS) => {
-                self.write_at_sync(lba_start, count, data)?;
+                let buf_ptr = bio.buffer();
+                let buf = unsafe { &*buf_ptr };
+                self.write_at_sync(lba_start, count, &buf[..count * LBA_SIZE])?;
                 bio.complete(Ok(count * LBA_SIZE));
                 Ok(bio)
             }

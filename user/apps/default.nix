@@ -57,7 +57,11 @@ let
   );
 in
 [
-  static.busybox
+  (static.busybox.override {
+    extraConfig = ''
+      CONFIG_FEATURE_DEFAULT_PASSWD_ALGO "sha512"
+    '';
+  })
   static.curl
   static.dropbear
   cross.glibc

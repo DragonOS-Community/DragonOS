@@ -23,10 +23,10 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
+use core::sync::atomic::AtomicU32;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use hashbrown::HashMap;
 use system_error::SystemError;
-use core::sync::atomic::AtomicU32;
 use unified_init::macros::unified_init;
 
 lazy_static! {
@@ -139,7 +139,9 @@ impl NetNamespace {
             netlink_socket_table: NetlinkSocketTable::default(),
             netlink_kernel_socket: RwLock::new(generate_supported_netlink_kernel_sockets()),
             unix_abstract_table: unix_abstract_table.clone(),
-            local_port_range: AtomicU32::new(crate::net::socket::inet::common::port::DEFAULT_LOCAL_PORT_RANGE),
+            local_port_range: AtomicU32::new(
+                crate::net::socket::inet::common::port::DEFAULT_LOCAL_PORT_RANGE,
+            ),
         });
 
         // Self::create_polling_thread(netns.clone(), "netns_root".to_string());
@@ -172,7 +174,9 @@ impl NetNamespace {
             netlink_socket_table: NetlinkSocketTable::default(),
             netlink_kernel_socket: RwLock::new(generate_supported_netlink_kernel_sockets()),
             unix_abstract_table: unix_abstract_table.clone(),
-            local_port_range: AtomicU32::new(crate::net::socket::inet::common::port::DEFAULT_LOCAL_PORT_RANGE),
+            local_port_range: AtomicU32::new(
+                crate::net::socket::inet::common::port::DEFAULT_LOCAL_PORT_RANGE,
+            ),
         });
 
         // Linux 语义：每个 netns 都需要一个可被唤醒的轮询线程来推进协议栈。

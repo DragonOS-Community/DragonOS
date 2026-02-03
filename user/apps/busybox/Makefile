@@ -37,6 +37,7 @@ $(bin): $(busybox_dir)
 	echo "CONFIG_FEATURE_STATIC=y" >> .config && \
 	echo "CONFIG_STATIC_LIBGCC=y" >> .config && \
 	echo "CONFIG_ASH=y" >> .config && \
+	echo "CONFIG_FEATURE_DEFAULT_PASSWD_ALGO=\"sha512\"" >> .config && \
 	echo "CONFIG_ASH_READ_PROFILE=y" >> .config
 
 

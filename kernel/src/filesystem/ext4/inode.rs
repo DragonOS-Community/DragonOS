@@ -539,10 +539,9 @@ impl IndexNode for LockedExt4Inode {
         }
 
         // NOREPLACE check (VFS layer responsibility - ext4 lib doesn't know about flags)
-        if flags.contains(RenameFlags::NOREPLACE) {
-            if ext4.lookup(target_inode_num, new_name).is_ok() {
-                return Err(SystemError::EEXIST);
-            }
+        if flags.contains(RenameFlags::NOREPLACE) && ext4.lookup(target_inode_num, new_name).is_ok()
+        {
+            return Err(SystemError::EEXIST);
         }
 
         // Check if target exists (for cache update and page cache cleanup)
@@ -574,7 +573,6 @@ impl IndexNode for LockedExt4Inode {
 }
 
 impl LockedExt4Inode {
-
     /// 更新 rename 后的缓存
     fn update_rename_cache(
         &self,

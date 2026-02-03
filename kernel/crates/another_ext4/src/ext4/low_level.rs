@@ -423,13 +423,17 @@ impl Ext4 {
         new_parent: InodeId,
         new_name: &str,
     ) -> Result<()> {
-        // 1. Validate source parent directory
+        // 1. 验证源父目录
         let mut parent_ref = self.read_inode(parent);
         if !parent_ref.inode.is_dir() {
-            return_error!(ErrCode::ENOTDIR, "Inode {} is not a directory", parent_ref.id);
+            return_error!(
+                ErrCode::ENOTDIR,
+                "Inode {} is not a directory",
+                parent_ref.id
+            );
         }
 
-        // 2. Validate target parent directory (only read if different)
+        // 2. 验证目标父目录（仅在跨目录时读取）
         let mut new_parent_ref = if parent == new_parent {
             None
         } else {
@@ -440,24 +444,26 @@ impl Ext4 {
             Some(np)
         };
 
-        // 3. Find source inode
+        // 3. 查找源 inode
         let child_id = self.dir_find_entry(&parent_ref, name)?;
         let mut child = self.read_inode(child_id);
         let child_is_dir = child.inode.is_dir();
         let child_file_type = child.inode.file_type();
 
-        // 3b. Circular directory move detection
-        // Prevent moving a directory into its own subdirectory
+        // 3b. 循环检测：防止把目录移到自己的子目录下
         if child_is_dir && parent != new_parent {
             let mut cur = new_parent;
             loop {
                 if cur == child_id {
-                    return_error!(ErrCode::EINVAL, "Cannot move directory into its own subdirectory");
+                    return_error!(
+                        ErrCode::EINVAL,
+                        "Cannot move directory into its own subdirectory"
+                    );
                 }
                 if cur == EXT4_ROOT_INO {
                     break;
                 }
-                // Walk up via ".." entries
+                // 通过 ".." 向上遍历
                 let cur_inode = self.read_inode(cur);
                 match self.dir_find_entry(&cur_inode, "..") {
                     Ok(parent_id) if parent_id != cur => cur = parent_id,
@@ -466,54 +472,77 @@ impl Ext4 {
             }
         }
 
-        // 4. Check if target exists
+        // 4. 检查目标是否存在
         let target_dir_ref = new_parent_ref.as_ref().unwrap_or(&parent_ref);
         let existing = self.dir_find_entry(target_dir_ref, new_name).ok();
 
         match existing {
             Some(existing_id) if existing_id == child_id => {
-                // Case A: Source and target are the same inode (hardlink or same name)
-                // POSIX: no-op, return success
+                // 情况 A：源和目标是同一个 inode（硬链接或同名）
+                // POSIX 语义：无操作，返回成功
                 return Ok(());
             }
             Some(existing_id) => {
-                // Case B: Target exists and is different inode -> atomic replace
+                // 情况 B：目标存在且是不同 inode → 原子替换
                 let mut existing_inode = self.read_inode(existing_id);
                 let existing_is_dir = existing_inode.inode.is_dir();
 
-                // 4b-1. Type compatibility check
+                // 4b-1. 类型兼容性检查
                 match (child_is_dir, existing_is_dir) {
                     (true, false) => {
-                        return_error!(ErrCode::ENOTDIR, "Cannot replace non-directory with directory");
+                        return_error!(
+                            ErrCode::ENOTDIR,
+                            "Cannot replace non-directory with directory"
+                        );
                     }
                     (false, true) => {
-                        return_error!(ErrCode::EISDIR, "Cannot replace directory with non-directory");
+                        return_error!(
+                            ErrCode::EISDIR,
+                            "Cannot replace directory with non-directory"
+                        );
                     }
                     (true, true) => {
-                        // Directory replacing directory: target must be empty
-                        if !self.dir_is_empty(&existing_inode)?  {
+                        // 目录替换目录：目标必须为空
+                        if !self.dir_is_empty(&existing_inode)? {
                             return_error!(ErrCode::ENOTEMPTY, "Target directory is not empty");
                         }
                     }
                     (false, false) => {
-                        // File replacing file: OK
+                        // 文件替换文件：OK
                     }
                 }
 
-                // 4b-2. Atomic replace: modify target dir entry in place to point to source inode
-                // This is the core atomic operation: target entry never "disappears"
-                let target_dir_mut = new_parent_ref.as_mut().unwrap_or(&mut parent_ref);
-                self.dir_replace_entry(target_dir_mut, new_name, child_id, child_file_type)?;
+                // 4b-2. 原子替换：原地修改目标目录项，指向源 inode
+                // 这是原子操作的核心：目标目录项从未"消失"
+                let target_dir = new_parent_ref.as_mut().unwrap_or(&mut parent_ref);
+                self.dir_replace_entry(target_dir, new_name, child_id, child_file_type)?;
 
-                // 4b-3. Handle replaced inode's link count
+                // 4b-3. 处理被替换 inode 的 link count
+                //
+                // 目录的 link count 语义：
+                // - 父目录的 link count 包含每个子目录 ".." 指向它的引用
+                // - 当用 dir_a 替换 dir_b 时：
+                //   * dir_b 的 ".." 被移除 → 父目录失去一个 ".." 引用 (-1)
+                //   * dir_a 的 ".." 仍指向其原父目录（在 4b-5 处理）
+                //
+                // 同目录情况 (parent == new_parent)：
+                //   - dir_a 的 ".." 原本就指向父目录，无需更改
+                //   - 只需为 dir_b 的 ".." 移除递减：净 -1 ✓
+                //
+                // 跨目录情况 (parent != new_parent)：
+                //   - dir_b 的 ".." 移除：目标父目录 -1（此处）
+                //   - dir_a 的 ".." 更新：源父目录 -1，目标父目录 +1（在 4b-5）
+                //   - 目标父目录净变化：-1 + 1 = 0 ✓
                 if existing_is_dir {
-                    // Directory: need to handle ".." link count
-                    // The replaced directory's ".." points to target_dir, need to decrement
                     self.dir_remove_entry(&existing_inode, "..")?;
-                    target_dir_mut.inode.set_link_count(target_dir_mut.inode.link_count() - 1);
-                    self.write_inode_with_csum(target_dir_mut);
+                    target_dir
+                        .inode
+                        .set_link_count(target_dir.inode.link_count() - 1);
+                    self.write_inode_with_csum(target_dir);
                 }
-                // Decrement replaced inode's link count (may trigger free)
+
+                // 递减被替换 inode 的 link count（可能触发释放）
+                // 目录最小 link count 为 2（父目录条目 + 自己的 "."），所以 <=2 表示无其他硬链接
                 let existing_link_cnt = existing_inode.inode.link_count();
                 if existing_link_cnt <= 1 || (existing_is_dir && existing_link_cnt <= 2) {
                     self.free_inode(&mut existing_inode)?;
@@ -522,28 +551,35 @@ impl Ext4 {
                     self.write_inode_with_csum(&mut existing_inode);
                 }
 
-                // 4b-4. Remove source directory entry
+                // 4b-4. 删除源目录项
                 self.dir_remove_entry(&parent_ref, name)?;
 
-                // 4b-5. Handle source inode's parent link count for directory moves
+                // 4b-5. 跨目录移动时，处理源目录的 ".." 指向
                 if child_is_dir && parent != new_parent {
-                    // Cross-directory move: update child's ".." to point to new parent
+                    // 更新被移动目录的 ".." 指向新父目录
                     self.dir_replace_entry(&child, "..", new_parent, FileType::Directory)?;
-                    // Source parent loses ".." reference
-                    parent_ref.inode.set_link_count(parent_ref.inode.link_count() - 1);
+
+                    // 源父目录失去 ".." 引用
+                    parent_ref
+                        .inode
+                        .set_link_count(parent_ref.inode.link_count() - 1);
                     self.write_inode_with_csum(&mut parent_ref);
-                    // Target parent gains ".." reference
-                    let target_dir_mut = new_parent_ref.as_mut().unwrap();
-                    target_dir_mut.inode.set_link_count(target_dir_mut.inode.link_count() + 1);
-                    self.write_inode_with_csum(target_dir_mut);
+
+                    // 目标父目录获得 ".." 引用
+                    // 注意：当 parent != new_parent 时，new_parent_ref 必定是 Some(...)
+                    let new_parent_dir = new_parent_ref.as_mut().unwrap();
+                    new_parent_dir
+                        .inode
+                        .set_link_count(new_parent_dir.inode.link_count() + 1);
+                    self.write_inode_with_csum(new_parent_dir);
                 }
-                // File's link count unchanged (just moved name/location)
+                // 文件的 link count 不变（只是换了名字/位置）
             }
             None => {
-                // Case C: Target doesn't exist -> simple rename
-                // Unlink from source
+                // 情况 C：目标不存在 → 简单重命名
+                // 从源 unlink
                 self.unlink_inode(&mut parent_ref, &mut child, name, false)?;
-                // Link to target
+                // link 到目标
                 match new_parent_ref.as_mut() {
                     Some(np) => self.link_inode(np, &mut child, new_name)?,
                     None => self.link_inode(&mut parent_ref, &mut child, new_name)?,

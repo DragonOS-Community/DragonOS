@@ -533,116 +533,47 @@ impl IndexNode for LockedExt4Inode {
         let old_dname = DName::from(old_name);
         let new_dname = DName::from(new_name);
 
-        // 同目录同名，无操作
+        // Same directory, same name -> no-op
         if src_inode_num == target_inode_num && old_dname == new_dname {
             return Ok(());
         }
 
-        // 预检查
-        let check = Self::may_move(ext4, src_inode_num, old_name, target_inode_num, new_name, flags)?;
-
-        // POSIX: 如果源和目标是同一个 inode，是无操作
-        if check.same_inode {
-            return Ok(());
-        }
-
-        let had_dst = check.dst.is_some();
-
-        // 如果目标存在，先删除它
-        if let Some((_dst_id, is_dir)) = check.dst {
-            if is_dir {
-                ext4.rmdir(target_inode_num, new_name)?;
-            } else {
-                // 文件：先清理 page cache
-                if let Ok(inode) = target_locked.find(new_name) {
-                    if let Some(pc) = inode.page_cache() {
-                        truncate_inode_pages(pc, 0);
-                    }
-                }
-                ext4.unlink(target_inode_num, new_name)?;
+        // NOREPLACE check (VFS layer responsibility - ext4 lib doesn't know about flags)
+        if flags.contains(RenameFlags::NOREPLACE) {
+            if ext4.lookup(target_inode_num, new_name).is_ok() {
+                return Err(SystemError::EEXIST);
             }
         }
 
-        // 执行 rename
+        // Check if target exists (for cache update and page cache cleanup)
+        let had_dst = ext4.lookup(target_inode_num, new_name).is_ok();
+
+        // Clear target's page cache if it exists and is a file
+        if had_dst {
+            if let Ok(target_inode) = target_locked.find(new_name) {
+                if let Some(pc) = target_inode.page_cache() {
+                    truncate_inode_pages(pc, 0);
+                }
+            }
+        }
+
+        // ext4 library now correctly handles atomic replace
         ext4.rename(src_inode_num, old_name, target_inode_num, new_name)?;
 
-        // 更新缓存
+        // Update cache
         self.update_rename_cache(
-            &target_locked, src_inode_num, target_inode_num,
-            &old_dname, &new_dname, had_dst,
+            &target_locked,
+            src_inode_num,
+            target_inode_num,
+            &old_dname,
+            &new_dname,
+            had_dst,
         );
         Ok(())
     }
 }
 
-/// rename 预检查结果
-struct MoveCheck {
-    dst: Option<(u32, bool)>, // (inode_id, is_dir)
-    same_inode: bool,
-}
-
 impl LockedExt4Inode {
-    /// 检查 rename 操作是否允许
-    fn may_move(
-        ext4: &another_ext4::Ext4,
-        src_dir: u32,
-        src_name: &str,
-        dst_dir: u32,
-        dst_name: &str,
-        flags: RenameFlags,
-    ) -> Result<MoveCheck, SystemError> {
-        let src_id = ext4.lookup(src_dir, src_name)?;
-        let src_attr = ext4.getattr(src_id)?;
-
-        // 循环检测：不能把目录移到自己的子目录下
-        if src_attr.ftype == FileType::Directory && src_dir != dst_dir {
-            let mut cur = dst_dir;
-            loop {
-                if cur == src_id {
-                    return Err(SystemError::EINVAL);
-                }
-                if cur == another_ext4::EXT4_ROOT_INO {
-                    break;
-                }
-                match ext4.lookup(cur, "..") {
-                    Ok(p) if p != cur => cur = p,
-                    _ => break,
-                }
-            }
-        }
-
-        // 检查目标
-        let dst = if let Ok(dst_id) = ext4.lookup(dst_dir, dst_name) {
-            if src_id == dst_id {
-                return Ok(MoveCheck { dst: None, same_inode: true });
-            }
-            if flags.contains(RenameFlags::NOREPLACE) {
-                return Err(SystemError::EEXIST);
-            }
-
-            let dst_attr = ext4.getattr(dst_id)?;
-            let src_is_dir = src_attr.ftype == FileType::Directory;
-            let dst_is_dir = dst_attr.ftype == FileType::Directory;
-
-            // POSIX 类型兼容性
-            match (src_is_dir, dst_is_dir) {
-                (true, false) => return Err(SystemError::ENOTDIR),
-                (false, true) => return Err(SystemError::EISDIR),
-                (true, true) => {
-                    let entries = ext4.listdir(dst_id)?;
-                    if entries.iter().any(|e| e.name() != "." && e.name() != "..") {
-                        return Err(SystemError::ENOTEMPTY);
-                    }
-                }
-                _ => {}
-            }
-            Some((dst_id, dst_is_dir))
-        } else {
-            None
-        };
-
-        Ok(MoveCheck { dst, same_inode: false })
-    }
 
     /// 更新 rename 后的缓存
     fn update_rename_cache(

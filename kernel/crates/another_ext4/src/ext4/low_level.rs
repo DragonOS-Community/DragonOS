@@ -392,20 +392,29 @@ impl Ext4 {
         self.unlink_inode(&mut parent, &mut child, name, true)
     }
 
-    /// Move a file.
+    /// Rename a directory entry, with POSIX-compliant atomic replace semantics.
+    ///
+    /// # POSIX Semantics
+    /// - If `new_name` doesn't exist: simple rename
+    /// - If `new_name` exists and is the same inode as source: no-op, return Ok
+    /// - If `new_name` exists and is different inode: **atomically replace** it
+    /// - Directory can only replace empty directory
+    /// - Type compatibility: file<->file, dir<->dir (no cross-type replace)
     ///
     /// # Params
     ///
-    /// * `parent` - the inode of the directory to move from
+    /// * `parent` - the inode of the source directory
     /// * `name` - the name of the file to move
     /// * `new_parent` - the inode of the directory to move to
     /// * `new_name` - the new name of the file
     ///
     /// # Error
     ///
-    /// * `ENOTDIR` - `parent` or `new_parent` is not a directory
+    /// * `ENOTDIR` - `parent` or `new_parent` is not a directory, or dir replacing non-dir
     /// * `ENOENT` - `name` does not exist in `parent`
-    /// * `EEXIST` - `new_parent/new_name` already exists
+    /// * `EISDIR` - non-dir replacing dir
+    /// * `ENOTEMPTY` - target directory is not empty
+    /// * `EINVAL` - would create a directory cycle (moving dir into its own subdirectory)
     /// * `ENOSPC` - no space left on device
     pub fn rename(
         &self,
@@ -414,13 +423,13 @@ impl Ext4 {
         new_parent: InodeId,
         new_name: &str,
     ) -> Result<()> {
-        // Check parent
+        // 1. Validate source parent directory
         let mut parent_ref = self.read_inode(parent);
         if !parent_ref.inode.is_dir() {
             return_error!(ErrCode::ENOTDIR, "Inode {} is not a directory", parent_ref.id);
         }
 
-        // Check new parent (only create new ref if different directory)
+        // 2. Validate target parent directory (only read if different)
         let mut new_parent_ref = if parent == new_parent {
             None
         } else {
@@ -431,26 +440,118 @@ impl Ext4 {
             Some(np)
         };
 
-        // Check child existence
+        // 3. Find source inode
         let child_id = self.dir_find_entry(&parent_ref, name)?;
         let mut child = self.read_inode(child_id);
+        let child_is_dir = child.inode.is_dir();
+        let child_file_type = child.inode.file_type();
 
-        // Check name conflict
-        {
-            let check_dir = new_parent_ref.as_ref().unwrap_or(&parent_ref);
-            if self.dir_find_entry(check_dir, new_name).is_ok() {
-                return_error!(ErrCode::EEXIST, "Dest name {} already exists", new_name);
+        // 3b. Circular directory move detection
+        // Prevent moving a directory into its own subdirectory
+        if child_is_dir && parent != new_parent {
+            let mut cur = new_parent;
+            loop {
+                if cur == child_id {
+                    return_error!(ErrCode::EINVAL, "Cannot move directory into its own subdirectory");
+                }
+                if cur == EXT4_ROOT_INO {
+                    break;
+                }
+                // Walk up via ".." entries
+                let cur_inode = self.read_inode(cur);
+                match self.dir_find_entry(&cur_inode, "..") {
+                    Ok(parent_id) if parent_id != cur => cur = parent_id,
+                    _ => break,
+                }
             }
         }
 
-        // Move: unlink from source
-        self.unlink_inode(&mut parent_ref, &mut child, name, false)?;
+        // 4. Check if target exists
+        let target_dir_ref = new_parent_ref.as_ref().unwrap_or(&parent_ref);
+        let existing = self.dir_find_entry(target_dir_ref, new_name).ok();
 
-        // Move: link to target (reuse parent_ref if same directory)
-        match new_parent_ref.as_mut() {
-            Some(np) => self.link_inode(np, &mut child, new_name),
-            None => self.link_inode(&mut parent_ref, &mut child, new_name),
+        match existing {
+            Some(existing_id) if existing_id == child_id => {
+                // Case A: Source and target are the same inode (hardlink or same name)
+                // POSIX: no-op, return success
+                return Ok(());
+            }
+            Some(existing_id) => {
+                // Case B: Target exists and is different inode -> atomic replace
+                let mut existing_inode = self.read_inode(existing_id);
+                let existing_is_dir = existing_inode.inode.is_dir();
+
+                // 4b-1. Type compatibility check
+                match (child_is_dir, existing_is_dir) {
+                    (true, false) => {
+                        return_error!(ErrCode::ENOTDIR, "Cannot replace non-directory with directory");
+                    }
+                    (false, true) => {
+                        return_error!(ErrCode::EISDIR, "Cannot replace directory with non-directory");
+                    }
+                    (true, true) => {
+                        // Directory replacing directory: target must be empty
+                        if !self.dir_is_empty(&existing_inode)?  {
+                            return_error!(ErrCode::ENOTEMPTY, "Target directory is not empty");
+                        }
+                    }
+                    (false, false) => {
+                        // File replacing file: OK
+                    }
+                }
+
+                // 4b-2. Atomic replace: modify target dir entry in place to point to source inode
+                // This is the core atomic operation: target entry never "disappears"
+                let target_dir_mut = new_parent_ref.as_mut().unwrap_or(&mut parent_ref);
+                self.dir_replace_entry(target_dir_mut, new_name, child_id, child_file_type)?;
+
+                // 4b-3. Handle replaced inode's link count
+                if existing_is_dir {
+                    // Directory: need to handle ".." link count
+                    // The replaced directory's ".." points to target_dir, need to decrement
+                    self.dir_remove_entry(&existing_inode, "..")?;
+                    target_dir_mut.inode.set_link_count(target_dir_mut.inode.link_count() - 1);
+                    self.write_inode_with_csum(target_dir_mut);
+                }
+                // Decrement replaced inode's link count (may trigger free)
+                let existing_link_cnt = existing_inode.inode.link_count();
+                if existing_link_cnt <= 1 || (existing_is_dir && existing_link_cnt <= 2) {
+                    self.free_inode(&mut existing_inode)?;
+                } else {
+                    existing_inode.inode.set_link_count(existing_link_cnt - 1);
+                    self.write_inode_with_csum(&mut existing_inode);
+                }
+
+                // 4b-4. Remove source directory entry
+                self.dir_remove_entry(&parent_ref, name)?;
+
+                // 4b-5. Handle source inode's parent link count for directory moves
+                if child_is_dir && parent != new_parent {
+                    // Cross-directory move: update child's ".." to point to new parent
+                    self.dir_replace_entry(&child, "..", new_parent, FileType::Directory)?;
+                    // Source parent loses ".." reference
+                    parent_ref.inode.set_link_count(parent_ref.inode.link_count() - 1);
+                    self.write_inode_with_csum(&mut parent_ref);
+                    // Target parent gains ".." reference
+                    let target_dir_mut = new_parent_ref.as_mut().unwrap();
+                    target_dir_mut.inode.set_link_count(target_dir_mut.inode.link_count() + 1);
+                    self.write_inode_with_csum(target_dir_mut);
+                }
+                // File's link count unchanged (just moved name/location)
+            }
+            None => {
+                // Case C: Target doesn't exist -> simple rename
+                // Unlink from source
+                self.unlink_inode(&mut parent_ref, &mut child, name, false)?;
+                // Link to target
+                match new_parent_ref.as_mut() {
+                    Some(np) => self.link_inode(np, &mut child, new_name)?,
+                    None => self.link_inode(&mut parent_ref, &mut child, new_name)?,
+                }
+            }
         }
+
+        Ok(())
     }
 
     /// Create a directory. This function will not check name conflict,

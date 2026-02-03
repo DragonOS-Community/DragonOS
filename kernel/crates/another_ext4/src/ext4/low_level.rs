@@ -415,29 +415,42 @@ impl Ext4 {
         new_name: &str,
     ) -> Result<()> {
         // Check parent
-        let mut parent = self.read_inode(parent);
-        if !parent.inode.is_dir() {
-            return_error!(ErrCode::ENOTDIR, "Inode {} is not a directory", parent.id);
+        let mut parent_ref = self.read_inode(parent);
+        if !parent_ref.inode.is_dir() {
+            return_error!(ErrCode::ENOTDIR, "Inode {} is not a directory", parent_ref.id);
         }
-        // Check new parent
-        let mut new_parent = self.read_inode(new_parent);
-        if !new_parent.inode.is_dir() {
-            return_error!(
-                ErrCode::ENOTDIR,
-                "Inode {} is not a directory",
-                new_parent.id
-            );
-        }
+
+        // Check new parent (only create new ref if different directory)
+        let mut new_parent_ref = if parent == new_parent {
+            None
+        } else {
+            let np = self.read_inode(new_parent);
+            if !np.inode.is_dir() {
+                return_error!(ErrCode::ENOTDIR, "Inode {} is not a directory", np.id);
+            }
+            Some(np)
+        };
+
         // Check child existence
-        let child_id = self.dir_find_entry(&parent, name)?;
+        let child_id = self.dir_find_entry(&parent_ref, name)?;
         let mut child = self.read_inode(child_id);
+
         // Check name conflict
-        if self.dir_find_entry(&new_parent, new_name).is_ok() {
-            return_error!(ErrCode::EEXIST, "Dest name {} already exists", new_name);
+        {
+            let check_dir = new_parent_ref.as_ref().unwrap_or(&parent_ref);
+            if self.dir_find_entry(check_dir, new_name).is_ok() {
+                return_error!(ErrCode::EEXIST, "Dest name {} already exists", new_name);
+            }
         }
-        // Move
-        self.unlink_inode(&mut parent, &mut child, name, false)?;
-        self.link_inode(&mut new_parent, &mut child, new_name)
+
+        // Move: unlink from source
+        self.unlink_inode(&mut parent_ref, &mut child, name, false)?;
+
+        // Move: link to target (reuse parent_ref if same directory)
+        match new_parent_ref.as_mut() {
+            Some(np) => self.link_inode(np, &mut child, new_name),
+            None => self.link_inode(&mut parent_ref, &mut child, new_name),
+        }
     }
 
     /// Create a directory. This function will not check name conflict,

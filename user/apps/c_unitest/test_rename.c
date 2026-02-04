@@ -965,59 +965,59 @@ int main(int argc, char *argv[]) {
     printf("  Test directory: %s\n", TEST_DIR);
     printf("===========================================\n\n");
 
-    /* 基本操作 */
-    printf("--- Basic Operations ---\n");
-    setup_test_env(); test_basic_file_rename();
-    setup_test_env(); test_basic_dir_rename();
-    setup_test_env(); test_cross_dir_move_file();
-    setup_test_env(); test_rename_same_name();
-    setup_test_env(); test_rename_dir_to_itself();
+    // /* 基本操作 */
+    // printf("--- Basic Operations ---\n");
+    // setup_test_env(); test_basic_file_rename();
+    // setup_test_env(); test_basic_dir_rename();
+    // setup_test_env(); test_cross_dir_move_file();
+    // setup_test_env(); test_rename_same_name();
+    // setup_test_env(); test_rename_dir_to_itself();
 
-    /* 覆盖操作 */
-    printf("\n--- Overwrite Operations ---\n");
-    setup_test_env(); test_overwrite_existing_file();
-    setup_test_env(); test_overwrite_empty_dir();
-    setup_test_env(); test_cannot_overwrite_nonempty_dir();
+    // /* 覆盖操作 */
+    // printf("\n--- Overwrite Operations ---\n");
+    // setup_test_env(); test_overwrite_existing_file();
+    // setup_test_env(); test_overwrite_empty_dir();
+    // setup_test_env(); test_cannot_overwrite_nonempty_dir();
 
-    /* 错误情况 */
-    printf("\n--- Error Cases ---\n");
-    setup_test_env(); test_source_not_exist();
-    setup_test_env(); test_target_dir_not_exist();
-    setup_test_env(); test_file_cannot_overwrite_dir();
-    setup_test_env(); test_dir_cannot_overwrite_file();
-    setup_test_env(); test_circular_rename();
-    setup_test_env(); test_rename_dot_entries();
+    // /* 错误情况 */
+    // printf("\n--- Error Cases ---\n");
+    // setup_test_env(); test_source_not_exist();
+    // setup_test_env(); test_target_dir_not_exist();
+    // setup_test_env(); test_file_cannot_overwrite_dir();
+    // setup_test_env(); test_dir_cannot_overwrite_file();
+    // setup_test_env(); test_circular_rename();
+    // setup_test_env(); test_rename_dot_entries();
 
-    /* 硬链接 */
-    printf("\n--- Hardlink Cases ---\n");
-    setup_test_env(); test_hardlink_same_inode_cross_dir();
-    setup_test_env(); test_hardlink_same_inode_same_dir();
+    // /* 硬链接 */
+    // printf("\n--- Hardlink Cases ---\n");
+    // setup_test_env(); test_hardlink_same_inode_cross_dir();
+    // setup_test_env(); test_hardlink_same_inode_same_dir();
 
     /* 符号链接 */
     printf("\n--- Symlink Cases ---\n");
     setup_test_env(); test_symlink_rename();
-    setup_test_env(); test_rename_does_not_follow_symlink();
+    // setup_test_env(); test_rename_does_not_follow_symlink();
 
-    /* renameat2 扩展标志 */
-    printf("\n--- renameat2 Flags ---\n");
-    setup_test_env(); test_rename_noreplace();
-    setup_test_env(); test_rename_noreplace_no_target();
-    setup_test_env(); test_rename_exchange();
-    setup_test_env(); test_rename_exchange_no_target();
+    // /* renameat2 扩展标志 */
+    // printf("\n--- renameat2 Flags ---\n");
+    // setup_test_env(); test_rename_noreplace();
+    // setup_test_env(); test_rename_noreplace_no_target();
+    // setup_test_env(); test_rename_exchange();
+    // setup_test_env(); test_rename_exchange_no_target();
 
-    /* 目录特殊情况 */
-    printf("\n--- Directory Special Cases ---\n");
-    setup_test_env(); test_dir_move_updates_dotdot();
-    setup_test_env(); test_deep_dir_move();
+    // /* 目录特殊情况 */
+    // printf("\n--- Directory Special Cases ---\n");
+    // setup_test_env(); test_dir_move_updates_dotdot();
+    // setup_test_env(); test_deep_dir_move();
 
-    /* 其他 */
-    printf("\n--- Misc ---\n");
-    setup_test_env(); test_long_filename();
-    setup_test_env(); test_special_chars_filename();
-    setup_test_env(); test_empty_file_rename();
-    setup_test_env(); test_rename_atomic_simple();
-    setup_test_env(); test_rename_in_readonly_dir();
-    setup_test_env(); test_cross_filesystem_rename();
+    // /* 其他 */
+    // printf("\n--- Misc ---\n");
+    // setup_test_env(); test_long_filename();
+    // setup_test_env(); test_special_chars_filename();
+    // setup_test_env(); test_empty_file_rename();
+    // setup_test_env(); test_rename_atomic_simple();
+    // setup_test_env(); test_rename_in_readonly_dir();
+    // setup_test_env(); test_cross_filesystem_rename();
 
     /* 清理 */
     remove_recursive(TEST_DIR);

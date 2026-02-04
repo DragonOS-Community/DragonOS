@@ -4,7 +4,7 @@ use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_MOUNT},
     filesystem::vfs::{
         fcntl::AtFlags,
-        mount::{is_mountpoint_root, MountFlags},
+        mount::{is_mountpoint_root, MountFSInode, MountFlags},
         produce_fs,
         utils::user_path_at,
         FileType, IndexNode, InodeId, MountFS, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
@@ -22,10 +22,10 @@ use crate::{
     },
 };
 use alloc::string::String;
+use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use system_error::SystemError;
-
 /// #挂载文件系统
 ///
 /// 用于挂载文件系统,目前仅支持ramfs挂载
@@ -162,6 +162,13 @@ pub fn do_mount(
     data: Option<String>,
     mount_flags: MountFlags,
 ) -> Result<(), SystemError> {
+    // log::info!(
+    //     "[do_mount] source={:?}, target={:?}, filesystemtype={:?}, flags={:?}",
+    //     source,
+    //     target,
+    //     filesystemtype,
+    //     mount_flags
+    // );
     let (current_node, rest_path) = user_path_at(
         &ProcessManager::current_pcb(),
         AtFlags::AT_FDCWD.bits(),
@@ -232,8 +239,8 @@ fn path_mount(
     if flags.intersection(MountFlags::REMOUNT | MountFlags::BIND)
         == (MountFlags::REMOUNT | MountFlags::BIND)
     {
-        log::warn!("todo: reconfigure mnt");
-        return Err(SystemError::ENOSYS);
+        // MS_REMOUNT | MS_BIND: 修改已存在挂载的标志，不创建新挂载
+        return do_reconfigure_mnt(target_inode, mnt_flags);
     }
 
     if flags.contains(MountFlags::REMOUNT) {
@@ -258,6 +265,68 @@ fn path_mount(
     return do_new_mount(source, target_inode, filesystemtype, data, mnt_flags).map(|_| ());
 }
 
+/// 处理 MS_REMOUNT | MS_BIND 情况
+///
+/// 这用于修改已存在挂载的挂载标志（如只读状态），而不改变挂载本身。
+/// 参考 Linux 的 do_reconfigure_mnt 实现。
+fn do_reconfigure_mnt(
+    target_inode: Arc<dyn IndexNode>,
+    new_flags: MountFlags,
+) -> Result<(), SystemError> {
+    use crate::filesystem::vfs::mount::MountFSInode;
+
+    log::debug!("[do_reconfigure_mnt] new_flags={:?}", new_flags);
+
+    // 获取目标 inode 对应的 MountFS
+    let mount_fs =
+        if let Some(mountfs_inode) = target_inode.as_any_ref().downcast_ref::<MountFSInode>() {
+            mountfs_inode.mount_fs().clone()
+        } else {
+            // 如果不是 MountFSInode，尝试通过文件系统查找
+            let mnt_ns = ProcessManager::current_mntns();
+            let inode_fs = target_inode.fs();
+
+            // 尝试通过文件系统查找对应的 MountFS
+            if let Some(mount_fs) = mnt_ns.mount_list().find_mount_by_fs(&inode_fs) {
+                mount_fs
+            } else {
+                // 作为最后的尝试，通过文件系统名称匹配
+                let mount_list = mnt_ns.mount_list().clone_inner();
+                let mut found = None;
+                for (_path, mnt_fs) in mount_list.iter() {
+                    if mnt_fs.fs_type() == inode_fs.name() {
+                        found = Some(mnt_fs.clone());
+                        break;
+                    }
+                }
+                found.ok_or(SystemError::EINVAL)?
+            }
+        };
+
+    // 修改挂载标志
+    // 注意：我们保留一些不应该被修改的标志（如 propagation 相关的）
+    let current_flags = mount_fs.mount_flags();
+
+    // 保留 propagation 标志（SHARED, PRIVATE, SLAVE, UNBINDABLE）
+    let propagation_flags =
+        MountFlags::SHARED | MountFlags::PRIVATE | MountFlags::SLAVE | MountFlags::UNBINDABLE;
+    let current_prop = current_flags & propagation_flags;
+
+    // 合并新的标志和保留的 propagation 标志
+    let merged_flags = new_flags | current_prop;
+
+    log::debug!(
+        "[do_reconfigure_mnt] current_flags={:?}, new_flags={:?}, merged_flags={:?}",
+        current_flags,
+        new_flags,
+        merged_flags
+    );
+
+    mount_fs.set_mount_flags(merged_flags);
+
+    Ok(())
+}
+
 fn do_new_mount(
     source: Option<String>,
     mut target_inode: Arc<dyn IndexNode>,
@@ -265,8 +334,18 @@ fn do_new_mount(
     data: Option<String>,
     mount_flags: MountFlags,
 ) -> Result<Arc<MountFS>, SystemError> {
+    let _target_path = target_inode
+        .absolute_path()
+        .unwrap_or_else(|_| "?".to_string());
     let fs_type_str = filesystemtype.ok_or(SystemError::EINVAL)?;
     let source = source.ok_or(SystemError::EINVAL)?;
+    // log::info!(
+    //     "[do_new_mount] source={}, fs_type={}, target={}, flags={:?}",
+    //     source,
+    //     fs_type_str,
+    //     target_path,
+    //     mount_flags
+    // );
     let fs = produce_fs(&fs_type_str, data.as_deref(), &source).inspect_err(|e| {
         log::error!("Failed to produce filesystem: {:?}", e);
     })?;
@@ -346,8 +425,17 @@ fn do_bind_mount(
         AtFlags::AT_FDCWD.bits(),
         &source_path,
     )?;
+    log::debug!(
+        "[do_bind_mount] current_node fs={}, rest_path={}",
+        current_node.fs().name(),
+        rest_path
+    );
     let source_inode =
         current_node.lookup_follow_symlink(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    log::debug!(
+        "[do_bind_mount] source_inode fs={}",
+        source_inode.fs().name()
+    );
 
     // Both source and target must be directories
     if source_inode.metadata()?.file_type != FileType::Dir {
@@ -359,6 +447,9 @@ fn do_bind_mount(
 
     // Get the source's filesystem
     let source_fs = source_inode.fs();
+    let _source_path_res = source_inode
+        .absolute_path()
+        .unwrap_or_else(|_| source_path.clone());
 
     // Check if source is on a MountFS
     let source_mfs = source_fs.clone().downcast_arc::<MountFS>();
@@ -377,11 +468,57 @@ fn do_bind_mount(
     // Get the inner filesystem for mounting
     let inner_fs = source_mfs
         .map(|mfs| mfs.inner_filesystem())
-        .unwrap_or(source_fs);
+        .unwrap_or(source_fs.clone());
 
     // Use the target_inode.mount() method which handles all the mounting logic
     // This properly creates a new MountFS and registers it
+    // log::info!(
+    //     "[do_bind_mount] source_path={:?}, source_fs={}, target_path={:?}",
+    //     source_path_res,
+    //     source_fs.name(),
+    //     target_inode
+    //         .absolute_path()
+    //         .unwrap_or_else(|_| "?".to_string())
+    // );
     let target_mfs = target_inode.mount(inner_fs, MountFlags::empty())?;
+    // log::info!(
+    //     "[do_bind_mount] created MountFS id={:?}, fs={}",
+    //     target_mfs.mount_id(),
+    //     target_mfs.fs_type()
+    // );
+
+    // 设置 bind_target_root
+    // DragonOS 的 bind mount 与 Linux 有差异：
+    // - Linux: bind mount 创建的挂载以 bind target 目录为根
+    // - DragonOS: bind mount 包装整个底层文件系统，MountFS::root_inode() 返回底层文件系统的根
+    //
+    // 为了支持容器场景，我们需要告诉 MountFS：当这个 mount 被用作根文件系统时，
+    // 应该返回 bind target 目录的内容，而不是底层文件系统的根。
+    //
+    // 我们创建一个 MountFSInode 来包装 source_inode（bind target 目录），
+    // 并将其设置为 target_mfs 的 bind_target_root。
+    let bind_target_root_inode = MountFSInode::new(source_inode.clone(), target_mfs.clone());
+    target_mfs.set_bind_target_root(bind_target_root_inode);
+    // log::info!(
+    //     "[do_bind_mount] set bind_target_root for MountFS id={:?}",
+    //     target_mfs.mount_id()
+    // );
+
+    // 特殊处理：如果 bind 挂载到 "/"，需要更新 namespace 的根
+    let target_path = target_inode
+        .absolute_path()
+        .unwrap_or_else(|_| "?".to_string());
+    if target_path == "/" {
+        // log::info!("[do_bind_mount] binding to root, updating namespace root");
+        let mnt_ns = ProcessManager::current_mntns();
+        unsafe {
+            // 这会替换 namespace 的根挂载点
+            mnt_ns.force_change_root_mountfs(target_mfs.clone());
+        }
+        // 同时更新当前进程的根目录
+        let pcb = ProcessManager::current_pcb();
+        pcb.fs_struct_mut().set_root(mnt_ns.root_inode());
+    }
 
     // If MS_REC is set, recursively bind all submounts from source to target
     if flags.contains(MountFlags::REC) {

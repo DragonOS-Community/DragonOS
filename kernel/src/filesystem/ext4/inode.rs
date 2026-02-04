@@ -544,6 +544,22 @@ impl IndexNode for LockedExt4Inode {
             return Err(SystemError::EEXIST);
         }
 
+        // RENAME_EXCHANGE: 原子交换两个文件/目录
+        if flags.contains(RenameFlags::EXCHANGE) {
+            // VFS 层已验证目标存在，直接调用 exchange
+            ext4.rename_exchange(src_inode_num, old_name, target_inode_num, new_name)?;
+
+            // 更新缓存：交换两个条目
+            self.update_exchange_cache(
+                &target_locked,
+                src_inode_num,
+                target_inode_num,
+                &old_dname,
+                &new_dname,
+            );
+            return Ok(());
+        }
+
         // Check if target exists (for cache update and page cache cleanup)
         let had_dst = ext4.lookup(target_inode_num, new_name).is_ok();
 
@@ -611,6 +627,76 @@ impl LockedExt4Inode {
                 let mut child_guard = child.0.lock();
                 child_guard.dname = new_dname.clone();
                 child_guard.parent = Arc::downgrade(target);
+            }
+        }
+    }
+
+    /// 更新 exchange 后的缓存：交换两个条目
+    fn update_exchange_cache(
+        &self,
+        target: &Arc<LockedExt4Inode>,
+        src_dir: u32,
+        dst_dir: u32,
+        old_dname: &DName,
+        new_dname: &DName,
+    ) {
+        if src_dir == dst_dir {
+            // 同目录交换
+            let mut guard = self.0.lock();
+            let old_child = guard.children.remove(old_dname);
+            let new_child = guard.children.remove(new_dname);
+
+            if let Some(child) = old_child {
+                child.0.lock().dname = new_dname.clone();
+                guard.children.insert(new_dname.clone(), child);
+            }
+            if let Some(child) = new_child {
+                child.0.lock().dname = old_dname.clone();
+                guard.children.insert(old_dname.clone(), child);
+            }
+        } else {
+            // 跨目录交换
+            let (mut src_guard, mut dst_guard) = if src_dir < dst_dir {
+                (self.0.lock(), target.0.lock())
+            } else {
+                let d = target.0.lock();
+                let s = self.0.lock();
+                (s, d)
+            };
+
+            let old_child = src_guard.children.remove(old_dname);
+            let new_child = dst_guard.children.remove(new_dname);
+
+            // old_child 移到 target 目录
+            if let Some(child) = old_child {
+                dst_guard.children.insert(new_dname.clone(), child.clone());
+                drop(src_guard);
+                drop(dst_guard);
+
+                let mut child_guard = child.0.lock();
+                child_guard.dname = new_dname.clone();
+                child_guard.parent = Arc::downgrade(target);
+                drop(child_guard);
+
+                // 重新获取锁处理 new_child
+                if let Some(new_c) = new_child {
+                    let mut src_guard = self.0.lock();
+                    src_guard.children.insert(old_dname.clone(), new_c.clone());
+                    drop(src_guard);
+
+                    let mut new_c_guard = new_c.0.lock();
+                    new_c_guard.dname = old_dname.clone();
+                    new_c_guard.parent = self.0.lock().self_ref.clone();
+                }
+            } else if let Some(new_c) = new_child {
+                // 只有 new_child 在缓存中
+                src_guard.children.insert(old_dname.clone(), new_c.clone());
+                drop(src_guard);
+                drop(dst_guard);
+
+                let mut new_c_guard = new_c.0.lock();
+                new_c_guard.dname = old_dname.clone();
+                new_c_guard.parent = self.0.lock().self_ref.clone();
             }
         }
     }

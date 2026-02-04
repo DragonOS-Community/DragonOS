@@ -64,8 +64,23 @@ pub fn do_renameat2(
     }
 
     let flags = RenameFlags::from_bits_truncate(flags);
+
+    // 标志互斥性检查（Linux 语义：EXCHANGE 与 NOREPLACE/WHITEOUT 互斥）
+    if flags.contains(RenameFlags::EXCHANGE)
+        && (flags.contains(RenameFlags::NOREPLACE) || flags.contains(RenameFlags::WHITEOUT))
+    {
+        return Err(SystemError::EINVAL);
+    }
+
     if flags.contains(RenameFlags::NOREPLACE) && (new_filename == "." || new_filename == "..") {
         return Err(SystemError::EEXIST);
+    }
+
+    // RENAME_EXCHANGE: 目标必须存在
+    if flags.contains(RenameFlags::EXCHANGE) {
+        if new_parent_inode.find(new_filename).is_err() {
+            return Err(SystemError::ENOENT);
+        }
     }
 
     if old_filename == "." || old_filename == ".." || new_filename == "." || new_filename == ".." {

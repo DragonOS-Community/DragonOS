@@ -392,6 +392,62 @@ impl Ext4 {
         self.unlink_inode(&mut parent, &mut child, name, true)
     }
 
+    /// Helper: Read and validate parent directories for rename operations.
+    ///
+    /// Returns (parent_ref, Option<new_parent_ref>). If parent == new_parent,
+    /// the second element is None to avoid double-locking the same inode.
+    fn read_rename_dirs(
+        &self,
+        parent: InodeId,
+        new_parent: InodeId,
+    ) -> Result<(InodeRef, Option<InodeRef>)> {
+        let parent_ref = self.read_inode(parent);
+        if !parent_ref.inode.is_dir() {
+            return_error!(
+                ErrCode::ENOTDIR,
+                "Inode {} is not a directory",
+                parent_ref.id
+            );
+        }
+
+        let new_parent_ref = if parent == new_parent {
+            None
+        } else {
+            let np = self.read_inode(new_parent);
+            if !np.inode.is_dir() {
+                return_error!(ErrCode::ENOTDIR, "Inode {} is not a directory", np.id);
+            }
+            Some(np)
+        };
+
+        Ok((parent_ref, new_parent_ref))
+    }
+
+    /// Helper: Check if `target_dir` is a descendant of `dir_inode`.
+    ///
+    /// Used to prevent directory cycles in rename operations.
+    /// Returns EINVAL if moving a directory into its own subdirectory.
+    fn check_ancestor_cycle(&self, dir_inode: InodeId, target_dir: InodeId) -> Result<()> {
+        let mut cur = target_dir;
+        loop {
+            if cur == dir_inode {
+                return_error!(
+                    ErrCode::EINVAL,
+                    "Cannot move directory into its own subdirectory"
+                );
+            }
+            if cur == EXT4_ROOT_INO {
+                break;
+            }
+            let cur_inode = self.read_inode(cur);
+            match self.dir_find_entry(&cur_inode, "..") {
+                Ok(parent_id) if parent_id != cur => cur = parent_id,
+                _ => break,
+            }
+        }
+        Ok(())
+    }
+
     /// Rename a directory entry, with POSIX-compliant atomic replace semantics.
     ///
     /// # POSIX Semantics
@@ -423,53 +479,18 @@ impl Ext4 {
         new_parent: InodeId,
         new_name: &str,
     ) -> Result<()> {
-        // 1. 验证源父目录
-        let mut parent_ref = self.read_inode(parent);
-        if !parent_ref.inode.is_dir() {
-            return_error!(
-                ErrCode::ENOTDIR,
-                "Inode {} is not a directory",
-                parent_ref.id
-            );
-        }
+        // 1. 验证父目录
+        let (mut parent_ref, mut new_parent_ref) = self.read_rename_dirs(parent, new_parent)?;
 
-        // 2. 验证目标父目录（仅在跨目录时读取）
-        let mut new_parent_ref = if parent == new_parent {
-            None
-        } else {
-            let np = self.read_inode(new_parent);
-            if !np.inode.is_dir() {
-                return_error!(ErrCode::ENOTDIR, "Inode {} is not a directory", np.id);
-            }
-            Some(np)
-        };
-
-        // 3. 查找源 inode
+        // 2. 查找源 inode
         let child_id = self.dir_find_entry(&parent_ref, name)?;
         let mut child = self.read_inode(child_id);
         let child_is_dir = child.inode.is_dir();
         let child_file_type = child.inode.file_type();
 
-        // 3b. 循环检测：防止把目录移到自己的子目录下
+        // 3. 循环检测：防止把目录移到自己的子目录下
         if child_is_dir && parent != new_parent {
-            let mut cur = new_parent;
-            loop {
-                if cur == child_id {
-                    return_error!(
-                        ErrCode::EINVAL,
-                        "Cannot move directory into its own subdirectory"
-                    );
-                }
-                if cur == EXT4_ROOT_INO {
-                    break;
-                }
-                // 通过 ".." 向上遍历
-                let cur_inode = self.read_inode(cur);
-                match self.dir_find_entry(&cur_inode, "..") {
-                    Ok(parent_id) if parent_id != cur => cur = parent_id,
-                    _ => break,
-                }
-            }
+            self.check_ancestor_cycle(child_id, new_parent)?;
         }
 
         // 4. 检查目标是否存在
@@ -584,6 +605,97 @@ impl Ext4 {
                     Some(np) => self.link_inode(np, &mut child, new_name)?,
                     None => self.link_inode(&mut parent_ref, &mut child, new_name)?,
                 }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Atomically exchange two directory entries (RENAME_EXCHANGE semantics).
+    ///
+    /// Both entries must exist. The operation swaps their inode references
+    /// in place using `dir_replace_entry`, so directory entries never "disappear".
+    ///
+    /// # Params
+    ///
+    /// * `parent` - inode of the directory containing `name`
+    /// * `name` - name of the first entry
+    /// * `new_parent` - inode of the directory containing `new_name`
+    /// * `new_name` - name of the second entry
+    ///
+    /// # Error
+    ///
+    /// * `ENOTDIR` - `parent` or `new_parent` is not a directory
+    /// * `ENOENT` - `name` or `new_name` does not exist
+    /// * `EINVAL` - would create a directory cycle
+    pub fn rename_exchange(
+        &self,
+        parent: InodeId,
+        name: &str,
+        new_parent: InodeId,
+        new_name: &str,
+    ) -> Result<()> {
+        // 1. 验证父目录
+        let (mut parent_ref, mut new_parent_ref) = self.read_rename_dirs(parent, new_parent)?;
+
+        // 2. 查找两个 inode
+        let old_id = self.dir_find_entry(&parent_ref, name)?;
+        let old_inode = self.read_inode(old_id);
+        let old_is_dir = old_inode.inode.is_dir();
+        let old_type = old_inode.inode.file_type();
+
+        let target_dir_ref = new_parent_ref.as_ref().unwrap_or(&parent_ref);
+        let new_id = self.dir_find_entry(target_dir_ref, new_name)?;
+        let new_inode = self.read_inode(new_id);
+        let new_is_dir = new_inode.inode.is_dir();
+        let new_type = new_inode.inode.file_type();
+
+        // 3. 同一 inode → 无操作
+        if old_id == new_id {
+            return Ok(());
+        }
+
+        // 4. 循环检测（仅跨目录时需要，exchange 需要检查双向）
+        if parent != new_parent {
+            if old_is_dir {
+                self.check_ancestor_cycle(old_id, new_parent)?;
+            }
+            if new_is_dir {
+                self.check_ancestor_cycle(new_id, parent)?;
+            }
+        }
+
+        // 5. 原子交换：原地替换目录项的 inode 引用
+        if parent == new_parent {
+            self.dir_replace_entry(&parent_ref, name, new_id, new_type)?;
+            self.dir_replace_entry(&parent_ref, new_name, old_id, old_type)?;
+        } else {
+            self.dir_replace_entry(&parent_ref, name, new_id, new_type)?;
+            let new_parent_dir = new_parent_ref.as_ref().unwrap();
+            self.dir_replace_entry(new_parent_dir, new_name, old_id, old_type)?;
+        }
+
+        // 6. 跨目录时更新目录的 ".." 指向和父目录 link_count
+        if parent != new_parent {
+            if old_is_dir {
+                self.dir_replace_entry(&old_inode, "..", new_parent, FileType::Directory)?;
+                parent_ref
+                    .inode
+                    .set_link_count(parent_ref.inode.link_count() - 1);
+                self.write_inode_with_csum(&mut parent_ref);
+                let np = new_parent_ref.as_mut().unwrap();
+                np.inode.set_link_count(np.inode.link_count() + 1);
+                self.write_inode_with_csum(np);
+            }
+            if new_is_dir {
+                self.dir_replace_entry(&new_inode, "..", parent, FileType::Directory)?;
+                let np = new_parent_ref.as_mut().unwrap();
+                np.inode.set_link_count(np.inode.link_count() - 1);
+                self.write_inode_with_csum(np);
+                parent_ref
+                    .inode
+                    .set_link_count(parent_ref.inode.link_count() + 1);
+                self.write_inode_with_csum(&mut parent_ref);
             }
         }
 

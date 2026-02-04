@@ -69,7 +69,7 @@ impl TSCManager {
             todo!("detect TSC and CPU frequency by cpuid or msr or pit");
         } else {
             // 使用pit来测量TSC和CPU总线的频率
-            Self::set_cpu_khz(Self::calibrate_cpu_by_pit_hpet_ptimer()?);
+            Self::set_cpu_khz(Self::calibrate_cpu_by_pit_hpet_pmtimer()?);
         }
 
         // 认为非0的TSC频率是可靠的，并且使用它来检查CPU总线的频率
@@ -103,8 +103,8 @@ impl TSCManager {
 
     /// 测量CPU总线的频率
     ///
-    /// 使用pit、hpet、ptimer来测量CPU总线的频率
-    fn calibrate_cpu_by_pit_hpet_ptimer() -> Result<u64, SystemError> {
+    /// 使用pit、hpet、pmtimer来测量CPU总线的频率
+    fn calibrate_cpu_by_pit_hpet_pmtimer() -> Result<u64, SystemError> {
         let hpet = is_hpet_enabled();
         log_for_hpet(hpet);
 

@@ -111,10 +111,7 @@ pub fn drop_ipv4_memberships(
         if let Some(iface) = find_iface_by_ifindex(netns, entry.ifindex) {
             let bytes = entry.multiaddr.to_ne_bytes();
             let multi = Ipv4Address::new(bytes[0], bytes[1], bytes[2], bytes[3]);
-            let _ = iface
-                .smol_iface()
-                .lock()
-                .leave_multicast_group(IpAddress::Ipv4(multi));
+            iface.common().ipv4_multicast_leave_ref(multi);
         }
     }
 }
@@ -247,10 +244,7 @@ pub fn apply_ipv4_membership(
                 });
             }
 
-            let join_result = {
-                let mut smol_iface = iface.smol_iface().lock();
-                smol_iface.join_multicast_group(IpAddress::Ipv4(multi_ipv4))
-            };
+            let join_result = iface.common().ipv4_multicast_join_ref(multi_ipv4);
             if let Err(e) = join_result {
                 {
                     let mut groups = groups.lock();
@@ -265,7 +259,7 @@ pub fn apply_ipv4_membership(
             Ok(())
         }
         IpOption::DROP_MEMBERSHIP => {
-            let (did_remove, still_joined) = {
+            let did_remove = {
                 let mut groups = groups.lock();
                 let pos = groups.iter().position(|g| {
                     if g.multiaddr != multi {
@@ -281,12 +275,9 @@ pub fn apply_ipv4_membership(
                 });
                 if let Some(idx) = pos {
                     groups.swap_remove(idx);
-                    let still_joined = groups
-                        .iter()
-                        .any(|g| g.multiaddr == multi && g.ifindex == resolved_ifindex);
-                    (true, still_joined)
+                    true
                 } else {
-                    (false, false)
+                    false
                 }
             };
 
@@ -294,12 +285,7 @@ pub fn apply_ipv4_membership(
                 return Err(SystemError::EADDRNOTAVAIL);
             }
 
-            if !still_joined {
-                let _ = iface
-                    .smol_iface()
-                    .lock()
-                    .leave_multicast_group(IpAddress::Ipv4(multi_ipv4));
-            }
+            iface.common().ipv4_multicast_leave_ref(multi_ipv4);
             Ok(())
         }
         _ => Err(SystemError::ENOPROTOOPT),

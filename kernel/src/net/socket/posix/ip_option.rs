@@ -20,6 +20,7 @@ pub enum IpOption {
     MULTICAST_LOOP = 34,
     ADD_MEMBERSHIP = 35,
     DROP_MEMBERSHIP = 36,
+    MULTICAST_ALL = 49,
     RECVERR_RFC4884 = 26,
 }
 

@@ -23,6 +23,7 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
+use core::sync::atomic::AtomicU32;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use hashbrown::HashMap;
 use system_error::SystemError;
@@ -90,6 +91,8 @@ pub struct NetNamespace {
 
     /// AF_UNIX abstract namespace table (scoped to this netns).
     unix_abstract_table: Arc<UnixAbstractTable>,
+    /// Per-netns IPv4 ephemeral port range (ip_local_port_range)
+    local_port_range: AtomicU32,
 }
 
 #[derive(Debug)]
@@ -136,6 +139,9 @@ impl NetNamespace {
             netlink_socket_table: NetlinkSocketTable::default(),
             netlink_kernel_socket: RwLock::new(generate_supported_netlink_kernel_sockets()),
             unix_abstract_table: unix_abstract_table.clone(),
+            local_port_range: AtomicU32::new(
+                crate::net::socket::inet::common::port::DEFAULT_LOCAL_PORT_RANGE,
+            ),
         });
 
         // Self::create_polling_thread(netns.clone(), "netns_root".to_string());
@@ -168,6 +174,9 @@ impl NetNamespace {
             netlink_socket_table: NetlinkSocketTable::default(),
             netlink_kernel_socket: RwLock::new(generate_supported_netlink_kernel_sockets()),
             unix_abstract_table: unix_abstract_table.clone(),
+            local_port_range: AtomicU32::new(
+                crate::net::socket::inet::common::port::DEFAULT_LOCAL_PORT_RANGE,
+            ),
         });
 
         // Linux 语义：每个 netns 都需要一个可被唤醒的轮询线程来推进协议栈。
@@ -197,6 +206,32 @@ impl NetNamespace {
 
     pub fn device_list(&self) -> RwSemReadGuard<'_, BTreeMap<usize, Arc<dyn Iface>>> {
         self.device_list.read()
+    }
+
+    #[inline]
+    pub fn local_port_range(&self) -> (u16, u16) {
+        let value = self.local_port_range.load(Ordering::Relaxed);
+        ((value >> 16) as u16, (value & 0xffff) as u16)
+    }
+
+    pub fn set_local_port_range(&self, min: u16, max: u16) -> Result<(), SystemError> {
+        if min == 0 || max == 0 || min > max {
+            return Err(SystemError::EINVAL);
+        }
+        let new_value = ((min as u32) << 16) | (max as u32);
+        loop {
+            let old_value = self.local_port_range.load(Ordering::Relaxed);
+            if old_value == new_value {
+                return Ok(());
+            }
+            if self
+                .local_port_range
+                .compare_exchange(old_value, new_value, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
     }
 
     pub fn inner(&self) -> RwLockReadGuard<'_, InnerNetNamespace> {

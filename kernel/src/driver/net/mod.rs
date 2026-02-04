@@ -246,6 +246,7 @@ pub struct IfaceCommon {
     tcp_close_defer: crate::net::tcp_close_defer::TcpCloseDefer,
     /// TCP listener/backlog 语义辅助（Linux-like 丢 SYN 等）。
     tcp_listener_backlog: crate::net::tcp_listener_backlog::TcpListenerBacklog,
+    ipv4_multicast_refcnt: Mutex<Vec<(smoltcp::wire::Ipv4Address, usize)>>,
 }
 
 impl fmt::Debug for IfaceCommon {
@@ -284,6 +285,7 @@ impl IfaceCommon {
             packet_sockets: RwLock::new(Vec::new()),
             tcp_close_defer: crate::net::tcp_close_defer::TcpCloseDefer::new(),
             tcp_listener_backlog: crate::net::tcp_listener_backlog::TcpListenerBacklog::new(),
+            ipv4_multicast_refcnt: Mutex::new(Vec::new()),
         }
     }
 
@@ -296,6 +298,38 @@ impl IfaceCommon {
     /// Unregister an active TCP listener port on this iface.
     pub fn unregister_tcp_listen_port(&self, port: u16) {
         self.tcp_listener_backlog.unregister_tcp_listen_port(port);
+    }
+
+    pub fn ipv4_multicast_join_ref(
+        &self,
+        group: smoltcp::wire::Ipv4Address,
+    ) -> Result<(), smoltcp::iface::MulticastError> {
+        let mut guard = self.ipv4_multicast_refcnt.lock();
+        if let Some((_, ref mut cnt)) = guard.iter_mut().find(|(g, _)| *g == group) {
+            *cnt = cnt.saturating_add(1);
+            return Ok(());
+        }
+        self.smol_iface
+            .lock()
+            .join_multicast_group(smoltcp::wire::IpAddress::Ipv4(group))?;
+        guard.push((group, 1));
+        Ok(())
+    }
+
+    pub fn ipv4_multicast_leave_ref(&self, group: smoltcp::wire::Ipv4Address) {
+        let mut guard = self.ipv4_multicast_refcnt.lock();
+        let Some(pos) = guard.iter().position(|(g, _)| *g == group) else {
+            return;
+        };
+        if guard[pos].1 > 1 {
+            guard[pos].1 -= 1;
+            return;
+        }
+        guard.swap_remove(pos);
+        let _ = self
+            .smol_iface
+            .lock()
+            .leave_multicast_group(smoltcp::wire::IpAddress::Ipv4(group));
     }
 
     /// 驱动收包入口使用的通用丢包策略（避免驱动理解 L4 语义）。
@@ -350,8 +384,7 @@ impl IfaceCommon {
 
         // Reclaim TCP sockets that have fully closed.
         // Lock order: sockets -> tcp_close_defer (matches close path, which may touch sockets then defer close).
-        self.tcp_close_defer
-            .reap_closed(&mut sockets, &self.port_manager);
+        self.tcp_close_defer.reap_closed(&mut sockets);
 
         // drop sockets here to avoid deadlock
         drop(interface);

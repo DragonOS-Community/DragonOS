@@ -327,7 +327,10 @@ impl Connecting {
                 Inner::Connecting(self),
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
             ),
-            ConnectResult::Connected => (Inner::Established(Established::new(self.inner)), Ok(())),
+            ConnectResult::Connected => (
+                Inner::Established(Established::new(self.inner, true)),
+                Ok(()),
+            ),
             ConnectResult::Refused | ConnectResult::RefusedConsumed => {
                 // unbind port
                 self.inner
@@ -362,7 +365,7 @@ impl Connecting {
     /// that the underlying socket is actually in the ESTABLISHED state.
     /// The caller must ensure that the socket handshake has completed successfully.
     pub unsafe fn into_established(self) -> Established {
-        Established::new(self.inner)
+        Established::new(self.inner, true)
     }
 
     /// Returns `true` when `conn_result` becomes ready, which indicates that the caller should
@@ -585,7 +588,7 @@ impl Listening {
         // TODO is smoltcp socket swappable?
         core::mem::swap(&mut new_listen, connected);
 
-        return Ok((Established::new(new_listen), remote_endpoint));
+        return Ok((Established::new(new_listen, false), remote_endpoint));
     }
 
     pub fn update_io_events(&self, pollee: &AtomicUsize) {
@@ -645,10 +648,11 @@ pub struct Established {
     inner: socket::inet::BoundInner,
     local: smoltcp::wire::IpEndpoint,
     peer: smoltcp::wire::IpEndpoint,
+    owns_port: bool,
 }
 
 impl Established {
-    pub fn new(inner: socket::inet::BoundInner) -> Self {
+    pub fn new(inner: socket::inet::BoundInner, owns_port: bool) -> Self {
         let local = inner
             .with::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.local_endpoint())
             .unwrap_or(smoltcp::wire::IpEndpoint::new(
@@ -661,7 +665,12 @@ impl Established {
                 smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::UNSPECIFIED),
                 0,
             ));
-        Self { inner, local, peer }
+        Self {
+            inner,
+            local,
+            peer,
+            owns_port,
+        }
     }
 
     pub fn with_mut<R, F: FnMut(&mut smoltcp::socket::tcp::Socket<'static>) -> R>(
@@ -681,6 +690,10 @@ impl Established {
 
     pub fn handle(&self) -> smoltcp::iface::SocketHandle {
         self.inner.handle()
+    }
+
+    pub fn owns_port(&self) -> bool {
+        self.owns_port
     }
 
     pub fn close(&self) {

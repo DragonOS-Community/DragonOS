@@ -583,7 +583,7 @@ impl Rseq {
 
         // 更新 cpu_id 等字段
         let cpu_id = current_cpu_id().data() as u32;
-        if let Err(e) = unsafe { access.update_cpu_node_id(cpu_id, 0, 0) } {
+        if let Err(_e) = unsafe { access.update_cpu_node_id(cpu_id, 0, 0) } {
             // log::debug!("rseq update_cpu_node_id failed: {:?}", e);
             Self::disable_current_rseq_after_fault(&pcb);
             let _ = crate::ipc::signal::send_kernel_signal_to_current(

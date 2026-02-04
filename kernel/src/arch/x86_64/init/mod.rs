@@ -3,7 +3,7 @@ use core::{
     sync::atomic::{compiler_fence, Ordering},
 };
 
-use log::debug;
+use log::{debug, info};
 use system_error::SystemError;
 use x86::dtables::DescriptorTablePointer;
 
@@ -110,14 +110,17 @@ pub fn setup_arch() -> Result<(), SystemError> {
 #[inline(never)]
 pub fn setup_arch_post() -> Result<(), SystemError> {
     let kvmclock_ok = kvm_clock::kvmclock_init();
-
+    info!("Initializing clocksource hardware...");
     let ret = hpet_init();
     if ret.is_ok() {
+        info!("HPET detected, enabling HPET");
         hpet_instance().hpet_enable().expect("hpet enable failed");
     } else if !kvmclock_ok {
+        info!("HPET unavailable, falling back to ACPI PM Timer");
         init_acpi_pm_clocksource().expect("acpi_pm_timer inits failed");
     }
     TSCManager::init().expect("tsc init failed");
+    info!("Clocksource hardware initialization complete");
 
     return Ok(());
 }

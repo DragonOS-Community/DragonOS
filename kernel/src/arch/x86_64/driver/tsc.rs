@@ -10,8 +10,10 @@ use core::{
 };
 use log::{debug, error, info, warn};
 use system_error::SystemError;
+use x86::cpuid::{cpuid, CpuIdResult};
 
 use super::hpet::{hpet_instance, is_hpet_enabled};
+use crate::driver::clocksource::tsc::init_tsc_clocksource;
 
 #[derive(Debug)]
 pub struct TSCManager;
@@ -24,10 +26,10 @@ impl TSCManager {
 
     /// 初始化TSC
     ///
-    /// 目前由于未支持acpi pm timer, 因此调用该函数时，HPET应当完成初始化，否则将无法校准TSC
     ///
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/tsc.c#1511
     pub fn init() -> Result<(), SystemError> {
+        info!("Initializing TSC...");
         let cpuid = x86::cpuid::CpuId::new();
         let feat = cpuid.get_feature_info().ok_or(SystemError::ENODEV)?;
         if !feat.has_tsc() {
@@ -35,7 +37,10 @@ impl TSCManager {
             return Err(SystemError::ENODEV);
         }
 
+        // tsc 频率和 cpu 频率都被提前确定，可能是通过 kvm-clock 提供的 pvclock 共享宿主机的 tsc_khz 和 cpu_khz 得到的
         if Self::cpu_khz() != 0 && Self::tsc_khz() != 0 {
+            info!("TSC frequency has been determined before TSCManager Init");
+            info!("TSC_KHZ and CPU_KHZ may have been provided by PartialVirtualClock (aka pvclock) in kvm-clock");
             return Ok(());
         }
 
@@ -47,9 +52,32 @@ impl TSCManager {
             }
         }
 
-        // todo: register TSC as clock source and deal with unstable clock source
+        if !Self::has_invariant_tsc() {
+            warn!("TSC is not invariant, skip TSC clocksource registration");
+            return Ok(());
+        }
+
+        init_tsc_clocksource().map_err(|e| {
+            error!("Failed to register TSC clocksource: {:?}", e);
+            e
+        })?;
 
         return Ok(());
+    }
+
+    /// 检查平台是否支持不受频率与电源状态影响的稳定 TSC
+    fn has_invariant_tsc() -> bool {
+        // 查询 Extend CPUID leaf 的元数据。
+        let max_ext: CpuIdResult = cpuid!(0x8000_0000);
+
+        // 检查是否支持 Extend CPUID leaf 0x8000_0007。
+        if max_ext.eax < 0x8000_0007 {
+            return false;
+        }
+
+        // 获取并检查 Extend CPUID leaf 0x8000_0007 的 EDX 寄存器的第 8 位（Invariant TSC 标志）。
+        let ext: CpuIdResult = cpuid!(0x8000_0007);
+        (ext.edx & (1 << 8)) != 0
     }
 
     /// 获取TSC和CPU总线的频率

@@ -97,16 +97,24 @@ static int verify_node(const char *path, mode_t expected_type, dev_t expected_de
     struct stat st;
 
     if (stat(path, &st) != 0) {
+        printf("    [DEBUG] stat failed: %s\n", strerror(errno));
         return -1;
     }
 
+    printf("    [DEBUG] stat: mode=0%o, type=0%o (expect 0%o), rdev=%u:%u (expect %u:%u)\n",
+           st.st_mode, st.st_mode & S_IFMT, expected_type,
+           major(st.st_rdev), minor(st.st_rdev),
+           major(expected_dev), minor(expected_dev));
+
     if ((st.st_mode & S_IFMT) != expected_type) {
+        printf("    [DEBUG] type mismatch!\n");
         return -2;
     }
 
     /* For device nodes, verify device number */
     if (expected_type == S_IFCHR || expected_type == S_IFBLK) {
         if (st.st_rdev != expected_dev) {
+            printf("    [DEBUG] rdev mismatch!\n");
             return -3;
         }
     }
@@ -142,6 +150,8 @@ static void test_chardev_null(void)
     dev_t dev = makedev(1, 3);
     int ret;
 
+    printf("    [DEBUG] mknod(%s, S_IFCHR|0666, dev=%u:%u [raw=0x%lx])\n",
+           path, major(dev), minor(dev), (unsigned long)dev);
     ret = mknod(path, S_IFCHR | 0666, dev);
     if (ret != 0) {
         if (errno == EPERM || errno == EACCES) {
@@ -171,6 +181,8 @@ static void test_chardev_zero(void)
     dev_t dev = makedev(1, 5);
     int ret;
 
+    printf("    [DEBUG] mknod(%s, S_IFCHR|0666, dev=%u:%u [raw=0x%lx])\n",
+           path, major(dev), minor(dev), (unsigned long)dev);
     ret = mknod(path, S_IFCHR | 0666, dev);
     if (ret != 0) {
         if (errno == EPERM || errno == EACCES) {
@@ -260,6 +272,8 @@ static void test_blkdev_sda(void)
     dev_t dev = makedev(8, 0);
     int ret;
 
+    printf("    [DEBUG] mknod(%s, S_IFBLK|0660, dev=%u:%u [raw=0x%lx])\n",
+           path, major(dev), minor(dev), (unsigned long)dev);
     ret = mknod(path, S_IFBLK | 0660, dev);
     if (ret != 0) {
         if (errno == EPERM || errno == EACCES) {
@@ -406,7 +420,9 @@ static void test_fifo_basic(void)
     const char *path = TEST_DIR "/fifo_basic";
     int ret;
 
+    printf("    [DEBUG] mknod(%s, S_IFIFO|0666, 0)\n", path);
     ret = mknod(path, S_IFIFO | 0666, 0);
+    printf("    [DEBUG] mknod returned %d (errno=%d: %s)\n", ret, errno, strerror(errno));
     if (ret != 0) {
         char buf[128];
         snprintf(buf, sizeof(buf), "mknod failed: %s", strerror(errno));
@@ -485,6 +501,7 @@ static void test_fifo_io(void)
     int ret;
     pid_t pid;
 
+    printf("    [DEBUG] Creating FIFO for I/O test...\n");
     ret = mknod(path, S_IFIFO | 0666, 0);
     if (ret != 0) {
         char buf[128];
@@ -492,6 +509,7 @@ static void test_fifo_io(void)
         TEST_FAIL("fifo_io", buf);
         return;
     }
+    printf("    [DEBUG] FIFO created, forking...\n");
 
     pid = fork();
     if (pid < 0) {
@@ -501,18 +519,26 @@ static void test_fifo_io(void)
 
     if (pid == 0) {
         /* Child: write to FIFO */
+        printf("    [DEBUG] Child: opening FIFO for writing...\n");
         int fd = open(path, O_WRONLY);
+        printf("    [DEBUG] Child: open returned fd=%d\n", fd);
         if (fd >= 0) {
+            printf("    [DEBUG] Child: writing...\n");
             write(fd, "test", 4);
             close(fd);
+            printf("    [DEBUG] Child: done\n");
         }
         _exit(0);
     } else {
         /* Parent: read from FIFO */
         char buf[16] = {0};
+        printf("    [DEBUG] Parent: opening FIFO for reading...\n");
         int fd = open(path, O_RDONLY);
+        printf("    [DEBUG] Parent: open returned fd=%d\n", fd);
         if (fd >= 0) {
+            printf("    [DEBUG] Parent: reading...\n");
             ssize_t n = read(fd, buf, sizeof(buf) - 1);
+            printf("    [DEBUG] Parent: read returned %zd\n", n);
             close(fd);
 
             int status;

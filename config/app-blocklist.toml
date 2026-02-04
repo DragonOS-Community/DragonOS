@@ -67,5 +67,7 @@ blocked_apps = [
     { name = "NovaShell", reason = "工具链版本有问题，应为nightly-2025-8-10" },
     { name = "test_ebpf_new", reason = "2025.11.17,aya上游发版有问题，导致ci过不了，暂时禁用" },
     { name = "test_ebpf_tp", reason = "2025.11.17,aya上游发版有问题，导致ci过不了，暂时禁用" },
+    { name = "runcell", reason = "依赖项依赖github，可能网络问题导致编不过" },
+
 ]
 

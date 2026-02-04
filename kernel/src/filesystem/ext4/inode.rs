@@ -361,6 +361,19 @@ impl IndexNode for LockedExt4Inode {
         };
         let attr = fs.fs.getattr(inode_num)?;
         let raw_dev = fs.raw_dev;
+
+        // Calculate rdev for device nodes
+        let dev_id = if matches!(attr.ftype, FileType::CharacterDev | FileType::BlockDev) {
+            let (major, minor) = attr.rdev;
+            DeviceNumber::new(
+                crate::driver::base::device::device_number::Major::new(major),
+                minor,
+            )
+            .data() as usize
+        } else {
+            0
+        };
+
         Ok(vfs::Metadata {
             inode_id: vfs_inode_id,
             size: attr.size as i64,
@@ -376,7 +389,7 @@ impl IndexNode for LockedExt4Inode {
             nlinks: attr.links as usize,
             uid: attr.uid as usize,
             gid: attr.gid as usize,
-            dev_id: 0,
+            dev_id,
             raw_dev,
         })
     }
@@ -518,35 +531,33 @@ impl IndexNode for LockedExt4Inode {
             return self.create(filename, vfs::FileType::File, mode);
         }
 
-        // 字符设备/块设备需要存储设备号，但 another_ext4 crate 暂不支持
-        // TODO: 修改 another_ext4 使用 i_block[0:1] 存储 dev_t（Linux ext4 标准做法）
-        if mode.contains(InodeMode::S_IFCHR) || mode.contains(InodeMode::S_IFBLK) {
-            log::error!(
-                "ext4::mknod: device nodes not supported (filename='{}', dev={}:{})",
-                filename,
-                dev_t.major().data(),
-                dev_t.minor()
-            );
-            return Err(SystemError::ENOSYS);
-        }
-
         let mut guard = self.0.lock();
         let ext4 = &guard.concret_fs().fs;
         let inode_num = guard.inner_inode_num;
 
-        // 确保当前 inode 是目录
         if ext4.getattr(inode_num)?.ftype != FileType::Directory {
             return Err(SystemError::ENOTDIR);
         }
 
         // VFS InodeMode(u32) → another_ext4 InodeMode(u16)
-        // 位布局兼容（标准 POSIX 格式），直接截断
         let file_mode = another_ext4::InodeMode::from_bits_truncate(mode.bits() as u16);
 
-        // 在磁盘上创建 inode 并链接到父目录
-        let id = ext4.create(inode_num, filename, file_mode)?;
+        // Create inode based on file type
+        let id = if mode.contains(InodeMode::S_IFCHR) || mode.contains(InodeMode::S_IFBLK) {
+            // Character/block device: use mknod to store device number in i_block
+            ext4.mknod(
+                inode_num,
+                filename,
+                file_mode,
+                dev_t.major().data(),
+                dev_t.minor(),
+            )?
+        } else {
+            // FIFO, Socket, etc.: use regular create (no device number needed)
+            ext4.create(inode_num, filename, file_mode)?
+        };
 
-        // 包装为 VFS inode 并缓存
+        // Wrap as VFS inode and cache
         let dname = DName::from(filename);
         let self_arc = guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
         let inode = LockedExt4Inode::new(

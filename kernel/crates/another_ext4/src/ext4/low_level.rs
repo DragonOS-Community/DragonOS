@@ -58,6 +58,14 @@ impl Ext4 {
         if inode.inode.link_count() == 0 {
             return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
         }
+
+        // Get device number for device nodes
+        let rdev = if inode.inode.is_device() {
+            inode.inode.device()
+        } else {
+            (0, 0)
+        };
+
         Ok(FileAttr {
             ino: id,
             size: inode.inode.size(),
@@ -71,6 +79,7 @@ impl Ext4 {
             links: inode.inode.link_count(),
             uid: inode.inode.uid(),
             gid: inode.inode.gid(),
+            rdev,
         })
     }
 
@@ -150,6 +159,57 @@ impl Ext4 {
         let mut child = self.create_inode(mode)?;
         self.link_inode(&mut parent, &mut child, name)?;
         // Create file handler
+        Ok(child.id)
+    }
+
+    /// Create a device node (character or block device).
+    ///
+    /// Unlike `create()`, this function:
+    /// - Does NOT initialize the extent tree
+    /// - Stores the device number in i_block[0..1] (Linux ext4 standard)
+    ///
+    /// # Params
+    ///
+    /// * `parent` - parent directory inode id
+    /// * `name` - device node name
+    /// * `mode` - file type (must include CHARDEV or BLOCKDEV) and permissions
+    /// * `major` - major device number
+    /// * `minor` - minor device number
+    ///
+    /// # Return
+    ///
+    /// `Ok(inode)` - Inode id of the new device node
+    ///
+    /// # Error
+    ///
+    /// * `ENOTDIR` - `parent` is not a directory
+    /// * `ENOSPC` - No space left on device
+    pub fn mknod(
+        &self,
+        parent: InodeId,
+        name: &str,
+        mode: InodeMode,
+        major: u32,
+        minor: u32,
+    ) -> Result<InodeId> {
+        let mut parent_ref = self.read_inode(parent);
+
+        // Can only create in a directory
+        if !parent_ref.inode.is_dir() {
+            return_error!(
+                ErrCode::ENOTDIR,
+                "Inode {} is not a directory",
+                parent_ref.id
+            );
+        }
+
+        // Create device inode (uses create_device_inode which sets device number)
+        let mut child = self.create_device_inode(mode, major, minor)?;
+
+        // Link to parent directory
+        self.link_inode(&mut parent_ref, &mut child, name)?;
+
+        trace!("mknod {} ({}:{}) -> inode {}", name, major, minor, child.id);
         Ok(child.id)
     }
 

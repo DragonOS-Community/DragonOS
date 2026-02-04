@@ -140,15 +140,13 @@ impl NetnsPoller {
     }
 
     fn stop(&self) {
-        let mut guard = self.thread.write();
-        let pcb = guard.take();
+        let pcb = self.thread.write().take();
         if let Some(pcb) = pcb {
-            if pcb.raw_pid() == ProcessManager::current_pcb().raw_pid() {
-                *guard = Some(pcb);
-                return;
-            }
-            drop(guard);
-            // 唤醒等待中的 poll 线程，确保其能看到 should_stop 标志
+            // 唤醒等待中的 poll 线程，确保其能看到 should_stop 标志。
+            //
+            // 重要：stop 可能由 poller 线程自身触发（例如 poller 线程释放最后一个 netns Arc，
+            // 进入 NetNamespace::drop）。此时也必须设置 pending 并唤醒/自唤醒，避免在 timeout=None
+            // 的 wait_event 上永久睡眠。
             self.poll_pending.store(true, Ordering::Release);
             self.wait_queue.wake_all();
             let _ = KernelThreadMechanism::request_stop(&pcb);
@@ -444,11 +442,6 @@ impl NamespaceOps for NetNamespace {
 
 impl Drop for NetNamespace {
     fn drop(&mut self) {
-        if let Some(pcb) = self.poller.thread.read().as_ref() {
-            if pcb.raw_pid() == ProcessManager::current_pcb().raw_pid() {
-                return;
-            }
-        }
         self.poller.stop();
     }
 }

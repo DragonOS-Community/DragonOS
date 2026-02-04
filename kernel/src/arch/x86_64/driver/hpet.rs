@@ -57,7 +57,7 @@ pub fn hpet_instance() -> &'static Hpet {
 #[inline(always)]
 pub fn is_hpet_enabled() -> bool {
     if unsafe { HPET_INSTANCE.as_ref().is_some() } {
-        return unsafe { HPET_INSTANCE.as_ref().unwrap().enabled() };
+        return unsafe { HPET_INSTANCE.as_ref().unwrap().is_enabled() };
     }
     return false;
 }
@@ -230,7 +230,7 @@ impl Hpet {
         }
     }
 
-    pub fn enabled(&self) -> bool {
+    pub fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::SeqCst)
     }
 

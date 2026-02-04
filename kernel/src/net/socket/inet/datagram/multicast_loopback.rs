@@ -8,6 +8,7 @@ use alloc::sync::Weak;
 use alloc::vec::Vec;
 
 use crate::libs::rwsem::RwSem;
+use crate::process::namespace::NamespaceOps;
 
 use super::UdpSocket;
 
@@ -16,6 +17,8 @@ use super::UdpSocket;
 struct MulticastMember {
     /// Weak reference to the socket
     socket: Weak<UdpSocket>,
+    /// Network namespace id
+    netns_id: usize,
     /// Multicast group address (in network byte order for IPv4)
     multiaddr: u32,
     /// Interface index where the group was joined
@@ -36,14 +39,22 @@ impl MulticastLoopbackRegistry {
 
     /// Register a socket as a member of a multicast group
     pub fn register(&self, socket: Weak<UdpSocket>, multiaddr: u32, ifindex: i32) {
+        let netns_id = match socket.upgrade() {
+            Some(sock) => sock.netns().ns_common().nsid.data(),
+            None => return,
+        };
         let mut members = self.members.write();
         // Check if already registered
         let exists = members.iter().any(|m| {
-            m.multiaddr == multiaddr && m.ifindex == ifindex && m.socket.as_ptr() == socket.as_ptr()
+            m.multiaddr == multiaddr
+                && m.ifindex == ifindex
+                && m.netns_id == netns_id
+                && m.socket.as_ptr() == socket.as_ptr()
         });
         if !exists {
             members.push(MulticastMember {
                 socket,
+                netns_id,
                 multiaddr,
                 ifindex,
             });
@@ -66,11 +77,14 @@ impl MulticastLoopbackRegistry {
         members.retain(|m| m.socket.as_ptr() != socket.as_ptr());
     }
 
-    pub fn has_membership(&self, multiaddr: u32, ifindex: i32) -> bool {
+    pub fn has_membership(&self, netns_id: usize, multiaddr: u32, ifindex: i32) -> bool {
         let members = self.members.read();
-        members
-            .iter()
-            .any(|m| m.multiaddr == multiaddr && m.ifindex == ifindex)
+        members.iter().any(|m| {
+            m.netns_id == netns_id
+                && m.multiaddr == multiaddr
+                && m.ifindex == ifindex
+                && m.socket.strong_count() > 0
+        })
     }
 }
 

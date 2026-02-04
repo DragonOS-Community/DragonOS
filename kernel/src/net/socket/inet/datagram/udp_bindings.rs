@@ -109,9 +109,11 @@ pub fn deliver_multicast_all(
     };
     let mut delivered = 0;
     for cand in candidates {
-        if !cand
-            .socket
-            .has_ipv4_multicast_membership(multiaddr, ifindex)
+        let multicast_all = cand.socket.ip_multicast_all.load(Ordering::Relaxed);
+        if !multicast_all
+            && !cand
+                .socket
+                .has_ipv4_multicast_membership(multiaddr, ifindex)
         {
             continue;
         }

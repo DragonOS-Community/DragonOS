@@ -15,6 +15,7 @@ use crate::net::socket::unix::utils::CmsgBuffer;
 use crate::net::socket::{AddressFamily, Socket, PMSG, PSO, PSOL};
 use crate::net::socket::{IpOption, PIPV6};
 use crate::process::namespace::net_namespace::NetNamespace;
+use crate::process::namespace::NamespaceOps;
 use crate::process::ProcessManager;
 use crate::{libs::rwsem::RwSem, net::socket::endpoint::Endpoint};
 use alloc::collections::VecDeque;
@@ -110,6 +111,8 @@ pub struct UdpSocket {
     ip_multicast_ttl: AtomicI32,
     /// IP_MULTICAST_LOOP
     ip_multicast_loop: AtomicBool,
+    /// IP_MULTICAST_ALL
+    ip_multicast_all: AtomicBool,
     /// IP_MULTICAST_IF: interface index
     ip_multicast_ifindex: AtomicI32,
     /// IP_MULTICAST_IF: interface address (network byte order)
@@ -190,6 +193,7 @@ impl UdpSocket {
             recv_err_v6: AtomicBool::new(false),
             ip_multicast_ttl: AtomicI32::new(1),
             ip_multicast_loop: AtomicBool::new(true),
+            ip_multicast_all: AtomicBool::new(true),
             ip_multicast_ifindex: AtomicI32::new(0),
             ip_multicast_addr: AtomicU32::new(0),
             ip_multicast_groups: Mutex::new(Vec::new()),
@@ -940,9 +944,11 @@ impl UdpSocket {
                         let octets = addr.octets();
                         let multiaddr = u32::from_ne_bytes(octets);
                         let ifindex = mcast_ifindex.max(ifindex);
-                        if multicast_loopback::multicast_registry()
-                            .has_membership(multiaddr, ifindex)
-                        {
+                        if multicast_loopback::multicast_registry().has_membership(
+                            self.netns.ns_common().nsid.data(),
+                            multiaddr,
+                            ifindex,
+                        ) {
                             udp_bindings::deliver_multicast_all(
                                 &self.netns,
                                 dest,
@@ -1045,9 +1051,11 @@ impl UdpSocket {
                         let multiaddr = u32::from_ne_bytes(octets);
                         let ifindex = self.get_multicast_ifindex();
 
-                        if multicast_loopback::multicast_registry()
-                            .has_membership(multiaddr, ifindex)
-                        {
+                        if multicast_loopback::multicast_registry().has_membership(
+                            self.netns.ns_common().nsid.data(),
+                            multiaddr,
+                            ifindex,
+                        ) {
                             udp_bindings::deliver_multicast_all(
                                 &self.netns,
                                 dest,

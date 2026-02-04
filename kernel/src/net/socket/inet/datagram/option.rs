@@ -408,6 +408,18 @@ impl UdpSocket {
                 self.ip_multicast_loop.store(on, Ordering::Relaxed);
                 Ok(())
             }
+            IpOption::MULTICAST_ALL => {
+                let v = if val.len() == 1 {
+                    val[0] as i32
+                } else if val.len() >= core::mem::size_of::<i32>() {
+                    i32::from_ne_bytes([val[0], val[1], val[2], val[3]])
+                } else {
+                    return Err(SystemError::EINVAL);
+                };
+                let on = v != 0;
+                self.ip_multicast_all.store(on, Ordering::Relaxed);
+                Ok(())
+            }
             IpOption::MULTICAST_IF => apply_ipv4_multicast_if(
                 &self.netns,
                 val,
@@ -507,6 +519,13 @@ impl UdpSocket {
             IpOption::MULTICAST_TTL => self.ip_multicast_ttl.load(Ordering::Relaxed),
             IpOption::MULTICAST_LOOP => {
                 if self.ip_multicast_loop.load(Ordering::Relaxed) {
+                    1i32
+                } else {
+                    0i32
+                }
+            }
+            IpOption::MULTICAST_ALL => {
+                if self.ip_multicast_all.load(Ordering::Relaxed) {
                     1i32
                 } else {
                     0i32

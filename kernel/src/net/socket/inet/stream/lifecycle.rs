@@ -1,5 +1,6 @@
 use crate::net::socket::common::ShutdownBit;
 use crate::net::socket::inet::InetSocket;
+use crate::net::socket::inet::Types;
 use alloc::sync::Arc;
 use system_error::SystemError;
 
@@ -457,6 +458,9 @@ impl TcpSocket {
                     let iface = conn.iface().clone();
                     let me: alloc::sync::Weak<dyn InetSocket> = self.self_ref.clone();
                     conn.close();
+                    if conn.owns_port() {
+                        iface.port_manager().unbind_port(Types::Tcp, local_port);
+                    }
                     iface.common().defer_tcp_close(handle, local_port, me);
                     writer.replace(inner::Inner::Established(conn));
                 }
@@ -481,6 +485,9 @@ impl TcpSocket {
                 } else {
                     es.close();
                 }
+                if es.owns_port() {
+                    iface.port_manager().unbind_port(Types::Tcp, local_port);
+                }
                 iface.common().defer_tcp_close(handle, local_port, me);
                 writer.replace(inner::Inner::Established(es));
             }
@@ -490,7 +497,10 @@ impl TcpSocket {
                     smoltcp::wire::IpAddress::Ipv6(_) => smoltcp::wire::IpVersion::Ipv6,
                     _ => smoltcp::wire::IpVersion::Ipv4,
                 };
+                let port = sc.get_name().port;
+                let iface = sc.iface().clone();
                 sc.release();
+                iface.port_manager().unbind_port(Types::Tcp, port);
                 writer.replace(inner::Inner::Closed(inner::Closed::new(ver)));
             }
             inner::Inner::Listening(mut ls) => {

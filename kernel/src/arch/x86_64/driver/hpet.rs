@@ -37,6 +37,18 @@ const HPET_CFG_LEGACY: u64 = 0x002;
 
 static mut HPET_INSTANCE: Option<Hpet> = None;
 
+pub fn hpet_init() -> Result<(), SystemError> {
+    let hpet_info =
+        HpetInfo::new(acpi_manager().tables().unwrap()).map_err(|_| SystemError::ENODEV)?;
+
+    let hpet_instance = Hpet::new(hpet_info)?;
+    unsafe {
+        HPET_INSTANCE = Some(hpet_instance);
+    }
+
+    return Ok(());
+}
+
 #[inline(always)]
 pub fn hpet_instance() -> &'static Hpet {
     unsafe { HPET_INSTANCE.as_ref().unwrap() }
@@ -134,11 +146,6 @@ impl Hpet {
         return Ok(hpet);
     }
 
-    pub fn enabled(&self) -> bool {
-        self.enabled.load(Ordering::SeqCst)
-    }
-
-    /// 使能HPET
     pub fn hpet_enable(&self) -> Result<(), SystemError> {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
@@ -195,62 +202,36 @@ impl Hpet {
         return Ok(());
     }
 
-    fn inner(&self) -> RwLockReadGuard<'_, InnerHpet> {
-        self.inner.read()
-    }
-
-    fn inner_mut(&self) -> RwLockWriteGuard<'_, InnerHpet> {
-        self.inner.write()
-    }
-
-    #[allow(dead_code)]
-    fn timer(&self, index: u8) -> Option<(RwLockReadGuard<'_, InnerHpet>, &HpetTimerRegisters)> {
-        let inner = self.inner();
-        if index >= self.info.hpet_number {
-            return None;
+    pub fn hpet_disable(&self) {
+        debug!("HPET disable");
+        if !is_hpet_enabled() {
+            return;
         }
-        let timer_regs = unsafe {
-            inner
-                .timer_registers_ptr
-                .as_ptr()
-                .add(index as usize)
-                .as_ref()
-                .unwrap()
-        };
-        return Some((inner, timer_regs));
-    }
 
-    #[allow(clippy::mut_from_ref)]
-    unsafe fn timer_mut(
-        &self,
-        index: u8,
-    ) -> Option<(RwLockWriteGuard<'_, InnerHpet>, &mut HpetTimerRegisters)> {
-        let inner = self.inner_mut();
-        if index >= self.info.hpet_number {
-            return None;
+        // 恢复启动时的配置
+        let mut cfg = self.boot_cfg;
+        cfg &= !HPET_CFG_ENABLE;
+        let (_, regs) = unsafe { self.hpet_regs_mut() };
+        unsafe { regs.write_general_config(cfg) };
+
+        // 恢复各个定时器启动时的配置
+        for i in 0..self.info.hpet_number {
+            let (inner_guard, timer_reg) = unsafe { self.timer_mut(i).unwrap() };
+            unsafe {
+                timer_reg.write_config(inner_guard.timer_boot_cfg[i as usize]);
+            }
+            drop(inner_guard);
         }
-        let timer_regs = unsafe {
-            inner
-                .timer_registers_ptr
-                .as_ptr()
-                .add(index as usize)
-                .as_mut()
-                .unwrap()
-        };
-        return Some((inner, timer_regs));
+
+        // 如果HPET在启动时已经启用了，重新启用它
+        if (self.boot_cfg & HPET_CFG_ENABLE) != 0 {
+            let (_, regs) = unsafe { self.hpet_regs_mut() };
+            unsafe { regs.write_general_config(self.boot_cfg) };
+        }
     }
 
-    unsafe fn hpet_regs(&self) -> (RwLockReadGuard<'_, InnerHpet>, &HpetRegisters) {
-        let inner = self.inner();
-        let regs = unsafe { inner.registers_ptr.as_ref() };
-        return (inner, regs);
-    }
-
-    #[allow(clippy::mut_from_ref)]
-    unsafe fn hpet_regs_mut(&self) -> (RwLockWriteGuard<'_, InnerHpet>, &mut HpetRegisters) {
-        let mut inner = self.inner_mut();
-        let regs = unsafe { inner.registers_ptr.as_mut() };
-        return (inner, regs);
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::SeqCst)
     }
 
     pub fn main_counter_value(&self) -> u64 {
@@ -336,46 +317,63 @@ impl Hpet {
         unsafe { regs.write_general_config(cfg) };
     }
 
-    /// 关闭hpet
-    pub fn hpet_disable(&self) {
-        debug!("HPET disable");
-        if !is_hpet_enabled() {
-            return;
-        }
-
-        // 恢复启动时的配置
-        let mut cfg = self.boot_cfg;
-        cfg &= !HPET_CFG_ENABLE;
-        let (_, regs) = unsafe { self.hpet_regs_mut() };
-        unsafe { regs.write_general_config(cfg) };
-
-        // 恢复各个定时器启动时的配置
-        for i in 0..self.info.hpet_number {
-            let (inner_guard, timer_reg) = unsafe { self.timer_mut(i).unwrap() };
-            unsafe {
-                timer_reg.write_config(inner_guard.timer_boot_cfg[i as usize]);
-            }
-            drop(inner_guard);
-        }
-
-        // 如果HPET在启动时已经启用了，重新启用它
-        if (self.boot_cfg & HPET_CFG_ENABLE) != 0 {
-            let (_, regs) = unsafe { self.hpet_regs_mut() };
-            unsafe { regs.write_general_config(self.boot_cfg) };
-        }
-    }
-}
-
-pub fn hpet_init() -> Result<(), SystemError> {
-    let hpet_info =
-        HpetInfo::new(acpi_manager().tables().unwrap()).map_err(|_| SystemError::ENODEV)?;
-
-    let hpet_instance = Hpet::new(hpet_info)?;
-    unsafe {
-        HPET_INSTANCE = Some(hpet_instance);
+    fn inner(&self) -> RwLockReadGuard<'_, InnerHpet> {
+        self.inner.read()
     }
 
-    return Ok(());
+    fn inner_mut(&self) -> RwLockWriteGuard<'_, InnerHpet> {
+        self.inner.write()
+    }
+
+    #[allow(dead_code)]
+    fn timer(&self, index: u8) -> Option<(RwLockReadGuard<'_, InnerHpet>, &HpetTimerRegisters)> {
+        let inner = self.inner();
+        if index >= self.info.hpet_number {
+            return None;
+        }
+        let timer_regs = unsafe {
+            inner
+                .timer_registers_ptr
+                .as_ptr()
+                .add(index as usize)
+                .as_ref()
+                .unwrap()
+        };
+        return Some((inner, timer_regs));
+    }
+
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn timer_mut(
+        &self,
+        index: u8,
+    ) -> Option<(RwLockWriteGuard<'_, InnerHpet>, &mut HpetTimerRegisters)> {
+        let inner = self.inner_mut();
+        if index >= self.info.hpet_number {
+            return None;
+        }
+        let timer_regs = unsafe {
+            inner
+                .timer_registers_ptr
+                .as_ptr()
+                .add(index as usize)
+                .as_mut()
+                .unwrap()
+        };
+        return Some((inner, timer_regs));
+    }
+
+    unsafe fn hpet_regs(&self) -> (RwLockReadGuard<'_, InnerHpet>, &HpetRegisters) {
+        let inner = self.inner();
+        let regs = unsafe { inner.registers_ptr.as_ref() };
+        return (inner, regs);
+    }
+
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn hpet_regs_mut(&self) -> (RwLockWriteGuard<'_, InnerHpet>, &mut HpetRegisters) {
+        let mut inner = self.inner_mut();
+        let regs = unsafe { inner.registers_ptr.as_mut() };
+        return (inner, regs);
+    }
 }
 
 #[derive(Debug)]

@@ -30,7 +30,8 @@ impl Syscall for SysMknodHandle {
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let path = Self::path(args);
         let mode_val = Self::mode(args) as u32;
-        let dev = DeviceNumber::from(Self::dev(args) as u32);
+        // Decode Linux dev_t format (from userspace makedev)
+        let dev = DeviceNumber::from_linux_dev_t(Self::dev(args) as u32);
 
         let path = vfs_check_and_clone_cstr(path, Some(MAX_PATHLEN))?
             .into_string()

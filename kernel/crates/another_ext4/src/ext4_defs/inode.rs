@@ -562,11 +562,11 @@ mod tests {
         fn test_old_encode_decode_roundtrip() {
             let test_cases = [
                 (0, 0),
-                (1, 3),    // /dev/null
-                (1, 5),    // /dev/zero
-                (4, 0),    // /dev/tty0
-                (8, 0),    // /dev/sda
-                (8, 1),    // /dev/sda1
+                (1, 3),     // /dev/null
+                (1, 5),     // /dev/zero
+                (4, 0),     // /dev/tty0
+                (8, 0),     // /dev/sda
+                (8, 1),     // /dev/sda1
                 (255, 255), // max
             ];
 
@@ -597,11 +597,11 @@ mod tests {
         fn test_new_encode_decode_roundtrip() {
             let test_cases = [
                 (0, 0),
-                (1, 256),       // minor exceeds old format
-                (256, 0),       // major exceeds old format
-                (256, 256),     // both exceed
-                (8, 65536),     // large minor
-                (259, 65536),   // virtio-blk style
+                (1, 256),        // minor exceeds old format
+                (256, 0),        // major exceeds old format
+                (256, 256),      // both exceed
+                (8, 65536),      // large minor
+                (259, 65536),    // virtio-blk style
                 (4095, 1048575), // near max (12-bit major, 20-bit minor)
             ];
 
@@ -773,15 +773,15 @@ mod tests {
             let mut inode = create_test_inode();
 
             let test_cases = [
-                (1, 3),         // /dev/null (old format)
-                (1, 5),         // /dev/zero (old format)
-                (4, 64),        // /dev/ttyS0 (old format)
-                (8, 0),         // /dev/sda (old format)
-                (8, 16),        // /dev/sdb (old format)
-                (8, 256),       // minor > 255 (new format)
-                (254, 0),       // virtio-blk (old format)
-                (259, 0),       // nvme (new format, major > 255)
-                (259, 65536),   // nvme with large minor (new format)
+                (1, 3),       // /dev/null (old format)
+                (1, 5),       // /dev/zero (old format)
+                (4, 64),      // /dev/ttyS0 (old format)
+                (8, 0),       // /dev/sda (old format)
+                (8, 16),      // /dev/sdb (old format)
+                (8, 256),     // minor > 255 (new format)
+                (254, 0),     // virtio-blk (old format)
+                (259, 0),     // nvme (new format, major > 255)
+                (259, 65536), // nvme with large minor (new format)
             ];
 
             for (major, minor) in test_cases {

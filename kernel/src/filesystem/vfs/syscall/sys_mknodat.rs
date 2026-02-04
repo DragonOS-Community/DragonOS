@@ -29,7 +29,8 @@ impl Syscall for SysMknodatHandle {
         let dirfd = Self::dirfd(args);
         let path = Self::path(args);
         let mode_val = Self::mode(args);
-        let dev = DeviceNumber::from(Self::dev(args));
+        // Decode Linux dev_t format (from userspace makedev)
+        let dev = DeviceNumber::from_linux_dev_t(Self::dev(args));
         let path = vfs_check_and_clone_cstr(path, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;

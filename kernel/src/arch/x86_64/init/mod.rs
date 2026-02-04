@@ -109,6 +109,11 @@ pub fn setup_arch() -> Result<(), SystemError> {
 /// 架构相关的初始化（在IDLE的最后一个阶段）
 #[inline(never)]
 pub fn setup_arch_post() -> Result<(), SystemError> {
+    // ============= 初始化时钟源硬件 =============
+    // 1.先尝试初始化 kvm-clock（如果在 KVM 虚拟机中运行且 kvm-clock 可用的话）
+    // 2.再尝试初始化 HPET（如果硬件支持的话）
+    // 3.如果 kvm-clock 和 HPET 都不可用，则回退到 ACPI PM Timer
+    // 4.最后初始化 TSC 管理器 （既可以通过 kvm-clock 提供的 pvclock 确定 TSC 频率，也可以通过其他方法确定 TSC 频率）
     let kvmclock_ok = kvm_clock::kvmclock_init();
     info!("Initializing clocksource hardware...");
     let ret = hpet_init();

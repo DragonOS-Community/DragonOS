@@ -77,10 +77,8 @@ pub fn do_renameat2(
     }
 
     // RENAME_EXCHANGE: 目标必须存在
-    if flags.contains(RenameFlags::EXCHANGE) {
-        if new_parent_inode.find(new_filename).is_err() {
-            return Err(SystemError::ENOENT);
-        }
+    if flags.contains(RenameFlags::EXCHANGE) && new_parent_inode.find(new_filename).is_err() {
+        return Err(SystemError::ENOENT);
     }
 
     if old_filename == "." || old_filename == ".." || new_filename == "." || new_filename == ".." {

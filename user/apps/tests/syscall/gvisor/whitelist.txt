@@ -45,6 +45,7 @@ select_test
 pselect_test
 epoll_test
 splice_test
+deleted_test
 link_test
 
 # 进程相关测试

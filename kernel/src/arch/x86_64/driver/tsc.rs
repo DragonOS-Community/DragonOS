@@ -37,13 +37,6 @@ impl TSCManager {
             return Err(SystemError::ENODEV);
         }
 
-        // tsc 频率和 cpu 频率都被提前确定，可能是通过 kvm-clock 提供的 pvclock 共享宿主机的 tsc_khz 和 cpu_khz 得到的
-        if Self::cpu_khz() != 0 && Self::tsc_khz() != 0 {
-            info!("TSC frequency has been determined before TSCManager Init");
-            info!("TSC_KHZ and CPU_KHZ may have been provided by PartialVirtualClock (aka pvclock) in kvm-clock");
-            return Ok(());
-        }
-
         if unsafe { TSC_KHZ == 0 } {
             if let Err(e) = Self::determine_cpu_tsc_frequency(false) {
                 error!("Failed to determine CPU TSC frequency: {:?}", e);

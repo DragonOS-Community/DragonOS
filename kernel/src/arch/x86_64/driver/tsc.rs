@@ -32,7 +32,6 @@ impl TSCManager {
     ///
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/tsc.c#1511
     pub fn init() -> Result<(), SystemError> {
-        info!("Initializing TSC...");
         let cpuid = x86::cpuid::CpuId::new();
         let feat = cpuid.get_feature_info().ok_or(SystemError::ENODEV)?;
         if !feat.has_tsc() {

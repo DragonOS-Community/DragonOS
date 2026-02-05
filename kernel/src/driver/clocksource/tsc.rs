@@ -106,7 +106,6 @@ pub fn init_tsc_clocksource() -> Result<(), SystemError> {
 
     let tsc_cs = tsc as Arc<dyn Clocksource>;
     tsc_cs.register(1000, tsc_khz as u32)?;
-    info!("TSC clocksource registered ({} kHz)", tsc_khz);
 
     Ok(())
 }

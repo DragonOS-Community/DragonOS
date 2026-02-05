@@ -115,17 +115,13 @@ pub fn setup_arch_post() -> Result<(), SystemError> {
     // 3.如果 kvm-clock 和 HPET 都不可用，则回退到 ACPI PM Timer
     // 4.最后初始化 TSC 管理器 （既可以通过 kvm-clock 提供的 pvclock 确定 TSC 频率，也可以通过其他方法确定 TSC 频率）
     let kvmclock_ok = kvm_clock::kvmclock_init();
-    info!("Initializing clocksource hardware...");
     let ret = hpet_init();
     if ret.is_ok() {
-        info!("HPET detected, enabling HPET");
         hpet_instance().hpet_enable().expect("hpet enable failed");
     } else if !kvmclock_ok {
-        info!("HPET unavailable, falling back to ACPI PM Timer");
         init_acpi_pm_clocksource().expect("acpi_pm_timer inits failed");
     }
     TSCManager::init().expect("tsc init failed");
-    info!("Clocksource hardware initialization complete");
 
     return Ok(());
 }

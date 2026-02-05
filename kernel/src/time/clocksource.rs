@@ -1014,34 +1014,22 @@ pub fn clocksource_select() {
         }
     }
     if should_update_timekeeper && timekeeping::timekeeping_is_initialized() {
-        info!(
-            "Updating timekeeper with clocksource {:?}",
-            best.clocksource_data().name
-        );
         timekeeping::timekeeper().timekeeper_setup_internals(best.clone());
-        info!(
-            "Timekeeper updated with clocksource {:?}",
-            best.clocksource_data().name
-        );
     }
     debug!("clocksource_select finish, CUR_CLOCKSOURCE = {best:?}");
 }
 
 /// # clocksource模块加载完成
 pub fn clocksource_boot_finish() {
-    info!("clocksource_boot_finish start");
     let mut cur_clocksource = CUR_CLOCKSOURCE.lock();
     if cur_clocksource.is_none() {
         cur_clocksource.replace(clocksource_default_clock());
     }
     FINISHED_BOOTING.store(true, Ordering::Relaxed);
     drop(cur_clocksource);
-    info!("clocksource_boot_finish selecting clocksource");
     clocksource_select();
     // 清除不稳定的时钟源
-    info!("clocksource_boot_finish watchdog cleanup");
     __clocksource_watchdog_kthread();
-    info!("clocksource_boot_finish done");
     debug!("clocksource_boot_finish");
 }
 

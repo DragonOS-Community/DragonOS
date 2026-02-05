@@ -589,6 +589,11 @@ impl ProcessManager {
                 .wait_queue
                 .wakeup_all(Some(ProcessState::Blocked(true)));
 
+            // kthread 退出时显式唤醒 kthreadd，使其回收 zombie
+            if current.is_kthread() {
+                let _ = ProcessManager::wakeup(&parent_pcb);
+            }
+
             // 根据 Linux wait 语义，线程组中的任何线程都可以等待同一线程组中任何线程创建的子进程。
             // 由于子进程被添加到线程组 leader 的 children 列表中，
             // 因此还需要唤醒线程组 leader 的 wait_queue（如果 leader 不是 parent_pcb 本身）。
@@ -1213,7 +1218,7 @@ impl ProcessControlBlock {
     ///
     /// 若进程是内核进程则返回true 否则返回false
     pub fn is_kthread(&self) -> bool {
-        return matches!(self.flags(), &mut ProcessFlags::KTHREAD);
+        self.flags().contains(ProcessFlags::KTHREAD)
     }
 
     #[inline(never)]

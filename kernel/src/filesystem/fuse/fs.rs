@@ -1,13 +1,18 @@
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{
+    collections::BTreeMap,
+    string::String,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 
 use system_error::SystemError;
 
 use crate::{
     filesystem::vfs::{
-        vcore::generate_inode_id, FileSystem, FileSystemMakerData, FileType, FsInfo, IndexNode,
-        InodeFlags, InodeMode, Magic, Metadata, MountableFileSystem, SuperBlock, FSMAKER,
+        FileSystem, FileSystemMakerData, FileType, FsInfo, IndexNode, InodeFlags, InodeId,
+        InodeMode, Magic, Metadata, MountableFileSystem, SuperBlock, FSMAKER,
     },
-    libs::mutex::{Mutex, MutexGuard},
+    libs::mutex::Mutex,
     process::ProcessManager,
     register_mountable_fs,
     time::PosixTimeSpec,
@@ -15,7 +20,7 @@ use crate::{
 
 use linkme::distributed_slice;
 
-use super::conn::FuseConn;
+use super::{conn::FuseConn, inode::FuseNode, protocol::FUSE_ROOT_ID};
 
 #[derive(Debug)]
 pub struct FuseMountData {
@@ -34,9 +39,10 @@ impl FileSystemMakerData for FuseMountData {
 
 #[derive(Debug)]
 pub struct FuseFS {
-    root: Arc<FuseRootInode>,
+    root: Arc<FuseNode>,
     super_block: SuperBlock,
     conn: Arc<FuseConn>,
+    nodes: Mutex<BTreeMap<u64, Weak<FuseNode>>>,
     #[allow(dead_code)]
     owner_uid: u32,
     #[allow(dead_code)]
@@ -88,6 +94,42 @@ impl FuseFS {
 
         Ok((fd, rootmode, user_id, group_id))
     }
+
+    pub fn root_node(&self) -> Arc<FuseNode> {
+        self.root.clone()
+    }
+
+    pub fn get_or_create_node(
+        self: &Arc<Self>,
+        nodeid: u64,
+        parent_nodeid: u64,
+        cached: Option<Metadata>,
+    ) -> Arc<FuseNode> {
+        if nodeid == FUSE_ROOT_ID {
+            return self.root.clone();
+        }
+
+        let mut nodes = self.nodes.lock();
+        if let Some(w) = nodes.get(&nodeid) {
+            if let Some(n) = w.upgrade() {
+                n.set_parent_nodeid(parent_nodeid);
+                if let Some(md) = cached {
+                    n.set_cached_metadata(md);
+                }
+                return n;
+            }
+        }
+
+        let n = FuseNode::new(
+            Arc::downgrade(self),
+            self.conn.clone(),
+            nodeid,
+            parent_nodeid,
+            cached,
+        );
+        nodes.insert(nodeid, Arc::downgrade(&n));
+        n
+    }
 }
 
 impl MountableFileSystem for FuseFS {
@@ -137,7 +179,7 @@ impl MountableFileSystem for FuseFS {
 
         let root_md = Metadata {
             dev_id: 0,
-            inode_id: generate_inode_id(),
+            inode_id: InodeId::new(FUSE_ROOT_ID as usize),
             size: 0,
             blk_size: 0,
             blocks: 0,
@@ -156,19 +198,19 @@ impl MountableFileSystem for FuseFS {
 
         let conn = mount_data.conn.clone();
 
-        let fs = Arc::new_cyclic(|weak_fs| {
-            let root = Arc::new_cyclic(|weak_root| FuseRootInode {
-                self_ref: weak_root.clone(),
-                fs: weak_fs.clone(),
-                metadata: Mutex::new(root_md),
-            });
-            FuseFS {
-                root,
-                super_block,
-                conn: conn.clone(),
-                owner_uid: mount_data.user_id,
-                owner_gid: mount_data.group_id,
-            }
+        let fs = Arc::new_cyclic(|weak_fs| FuseFS {
+            root: FuseNode::new(
+                weak_fs.clone(),
+                conn.clone(),
+                FUSE_ROOT_ID,
+                FUSE_ROOT_ID,
+                Some(root_md),
+            ),
+            super_block,
+            conn: conn.clone(),
+            nodes: Mutex::new(BTreeMap::new()),
+            owner_uid: mount_data.user_id,
+            owner_gid: mount_data.group_id,
         });
 
         conn.enqueue_init()?;
@@ -200,85 +242,5 @@ impl FileSystem for FuseFS {
 
     fn super_block(&self) -> SuperBlock {
         self.super_block.clone()
-    }
-}
-
-#[derive(Debug)]
-pub struct FuseRootInode {
-    self_ref: alloc::sync::Weak<FuseRootInode>,
-    fs: alloc::sync::Weak<FuseFS>,
-    metadata: Mutex<Metadata>,
-}
-
-impl IndexNode for FuseRootInode {
-    fn as_any_ref(&self) -> &dyn core::any::Any {
-        self
-    }
-
-    fn open(
-        &self,
-        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
-        _flags: &crate::filesystem::vfs::file::FileFlags,
-    ) -> Result<(), SystemError> {
-        Ok(())
-    }
-
-    fn close(
-        &self,
-        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
-    ) -> Result<(), SystemError> {
-        Ok(())
-    }
-
-    fn read_at(
-        &self,
-        _offset: usize,
-        _len: usize,
-        _buf: &mut [u8],
-        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::EISDIR)
-    }
-
-    fn write_at(
-        &self,
-        _offset: usize,
-        _len: usize,
-        _buf: &[u8],
-        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::EISDIR)
-    }
-
-    fn metadata(&self) -> Result<Metadata, SystemError> {
-        Ok(self.metadata.lock().clone())
-    }
-
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
-        *self.metadata.lock() = metadata.clone();
-        Ok(())
-    }
-
-    fn fs(&self) -> Arc<dyn FileSystem> {
-        self.fs.upgrade().unwrap()
-    }
-
-    fn list(&self) -> Result<Vec<String>, SystemError> {
-        Ok(Vec::new())
-    }
-
-    fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
-        match name {
-            "." | ".." => Ok(self.self_ref.upgrade().ok_or(SystemError::ENOENT)?),
-            _ => Err(SystemError::ENOENT),
-        }
-    }
-
-    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
-        Ok(self.self_ref.upgrade().ok_or(SystemError::ENOENT)?)
-    }
-
-    fn absolute_path(&self) -> Result<String, SystemError> {
-        Ok(String::from("/"))
     }
 }

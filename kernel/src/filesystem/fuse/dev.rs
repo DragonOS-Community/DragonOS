@@ -220,12 +220,8 @@ impl IndexNode for LockedFuseDevInode {
     }
 
     fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
-        self.0
-            .lock()
-            .parent
-            .upgrade()
-            .map(|p| p as Arc<dyn IndexNode>)
-            .ok_or(SystemError::ENOENT)
+        let parent = self.0.lock().parent.upgrade().ok_or(SystemError::ENOENT)?;
+        Ok(parent)
     }
 
     fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {

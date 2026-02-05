@@ -14,7 +14,36 @@ pub const FUSE_MIN_READ_BUFFER: usize = 8192;
 
 pub const FUSE_ROOT_ID: u64 = 1;
 
+// Opcodes (subset)
+pub const FUSE_LOOKUP: u32 = 1;
+pub const FUSE_FORGET: u32 = 2; // no reply
+pub const FUSE_GETATTR: u32 = 3;
+pub const FUSE_SETATTR: u32 = 4;
+pub const FUSE_MKNOD: u32 = 8;
+pub const FUSE_MKDIR: u32 = 9;
+pub const FUSE_UNLINK: u32 = 10;
+pub const FUSE_RMDIR: u32 = 11;
+pub const FUSE_RENAME: u32 = 12;
+pub const FUSE_OPEN: u32 = 14;
+pub const FUSE_READ: u32 = 15;
+pub const FUSE_WRITE: u32 = 16;
+pub const FUSE_RELEASE: u32 = 18;
 pub const FUSE_INIT: u32 = 26;
+pub const FUSE_OPENDIR: u32 = 27;
+pub const FUSE_READDIR: u32 = 28;
+pub const FUSE_RELEASEDIR: u32 = 29;
+
+// getattr/setattr valid bits (subset)
+pub const FATTR_MODE: u32 = 1 << 0;
+pub const FATTR_UID: u32 = 1 << 1;
+pub const FATTR_GID: u32 = 1 << 2;
+pub const FATTR_SIZE: u32 = 1 << 3;
+pub const FATTR_ATIME: u32 = 1 << 4;
+pub const FATTR_MTIME: u32 = 1 << 5;
+pub const FATTR_FH: u32 = 1 << 6;
+pub const FATTR_ATIME_NOW: u32 = 1 << 7;
+pub const FATTR_MTIME_NOW: u32 = 1 << 8;
+pub const FATTR_CTIME: u32 = 1 << 10;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -64,6 +93,164 @@ pub struct FuseInitOut {
     pub map_alignment: u16,
     pub flags2: u32,
     pub unused: [u32; 7],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseAttr {
+    pub ino: u64,
+    pub size: u64,
+    pub blocks: u64,
+    pub atime: u64,
+    pub mtime: u64,
+    pub ctime: u64,
+    pub atimensec: u32,
+    pub mtimensec: u32,
+    pub ctimensec: u32,
+    pub mode: u32,
+    pub nlink: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub rdev: u32,
+    pub blksize: u32,
+    pub flags: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseEntryOut {
+    pub nodeid: u64,
+    pub generation: u64,
+    pub entry_valid: u64,
+    pub attr_valid: u64,
+    pub entry_valid_nsec: u32,
+    pub attr_valid_nsec: u32,
+    pub attr: FuseAttr,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseGetattrIn {
+    pub getattr_flags: u32,
+    pub dummy: u32,
+    pub fh: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseAttrOut {
+    pub attr_valid: u64,
+    pub attr_valid_nsec: u32,
+    pub dummy: u32,
+    pub attr: FuseAttr,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseOpenIn {
+    pub flags: u32,
+    pub open_flags: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseOpenOut {
+    pub fh: u64,
+    pub open_flags: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseReadIn {
+    pub fh: u64,
+    pub offset: u64,
+    pub size: u32,
+    pub read_flags: u32,
+    pub lock_owner: u64,
+    pub flags: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseWriteIn {
+    pub fh: u64,
+    pub offset: u64,
+    pub size: u32,
+    pub write_flags: u32,
+    pub lock_owner: u64,
+    pub flags: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseWriteOut {
+    pub size: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseReleaseIn {
+    pub fh: u64,
+    pub flags: u32,
+    pub release_flags: u32,
+    pub lock_owner: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseMknodIn {
+    pub mode: u32,
+    pub rdev: u32,
+    pub umask: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseMkdirIn {
+    pub mode: u32,
+    pub umask: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseRenameIn {
+    pub newdir: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseSetattrIn {
+    pub valid: u32,
+    pub padding: u32,
+    pub fh: u64,
+    pub size: u64,
+    pub lock_owner: u64,
+    pub atime: u64,
+    pub mtime: u64,
+    pub ctime: u64,
+    pub atimensec: u32,
+    pub mtimensec: u32,
+    pub ctimensec: u32,
+    pub mode: u32,
+    pub unused4: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub unused5: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseDirent {
+    pub ino: u64,
+    pub off: u64,
+    pub namelen: u32,
+    pub typ: u32,
+    // name follows
 }
 
 pub fn fuse_pack_struct<T: Copy>(v: &T) -> &[u8] {

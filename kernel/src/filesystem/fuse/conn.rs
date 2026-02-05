@@ -1,10 +1,7 @@
-use alloc::{
-    collections::{BTreeMap, VecDeque},
-    sync::Arc,
-    vec::Vec,
-};
+use alloc::{collections::BTreeMap, collections::VecDeque, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use num_traits::FromPrimitive;
 use system_error::SystemError;
 
 use crate::{
@@ -12,6 +9,7 @@ use crate::{
         event_poll::EventPoll, event_poll::LockedEPItemLinkedList, EPollEventType, EPollItem,
     },
     libs::{mutex::Mutex, wait_queue::WaitQueue},
+    process::ProcessManager,
 };
 
 use super::protocol::{
@@ -19,16 +17,47 @@ use super::protocol::{
     FUSE_INIT, FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FuseReqKind {
-    Init,
+#[derive(Debug)]
+pub struct FuseRequest {
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Debug)]
-pub struct FuseRequest {
-    pub unique: u64,
-    pub kind: FuseReqKind,
-    pub bytes: Vec<u8>,
+pub struct FusePendingState {
+    opcode: u32,
+    response: Mutex<Option<Result<Vec<u8>, SystemError>>>,
+    wait: WaitQueue,
+}
+
+impl FusePendingState {
+    pub fn new(opcode: u32) -> Self {
+        Self {
+            opcode,
+            response: Mutex::new(None),
+            wait: WaitQueue::default(),
+        }
+    }
+
+    pub fn complete(&self, v: Result<Vec<u8>, SystemError>) {
+        let mut guard = self.response.lock();
+        if guard.is_some() {
+            // Duplicate replies are ignored (Linux does similarly).
+            return;
+        }
+        *guard = Some(v);
+        drop(guard);
+        self.wait.wakeup(None);
+    }
+
+    pub fn wait_complete(&self) -> Result<Vec<u8>, SystemError> {
+        match self
+            .wait
+            .wait_until_interruptible(|| self.response.lock().take())?
+        {
+            Some(v) => v,
+            None => Err(SystemError::EIO),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -37,7 +66,7 @@ struct FuseConnInner {
     mounted: bool,
     initialized: bool,
     pending: VecDeque<Arc<FuseRequest>>,
-    processing: BTreeMap<u64, FuseReqKind>,
+    processing: BTreeMap<u64, Arc<FusePendingState>>,
 }
 
 /// FUSE connection object (roughly equivalent to Linux `struct fuse_conn`).
@@ -46,6 +75,7 @@ pub struct FuseConn {
     inner: Mutex<FuseConnInner>,
     next_unique: AtomicU64,
     read_wait: WaitQueue,
+    init_wait: WaitQueue,
     epitems: LockedEPItemLinkedList,
 }
 
@@ -62,6 +92,7 @@ impl FuseConn {
             // Use non-zero unique, keep even IDs for "ordinary" requests as Linux does.
             next_unique: AtomicU64::new(2),
             read_wait: WaitQueue::default(),
+            init_wait: WaitQueue::default(),
             epitems: LockedEPItemLinkedList::default(),
         })
     }
@@ -91,63 +122,36 @@ impl FuseConn {
         self.next_unique.fetch_add(2, Ordering::Relaxed)
     }
 
-    pub fn enqueue_init(&self) -> Result<(), SystemError> {
-        let unique = self.alloc_unique();
-
-        let hdr = FuseInHeader {
-            len: (core::mem::size_of::<FuseInHeader>() + core::mem::size_of::<FuseInitIn>()) as u32,
-            opcode: FUSE_INIT,
-            unique,
-            nodeid: 0,
-            uid: 0,
-            gid: 0,
-            pid: 0,
-            total_extlen: 0,
-            padding: 0,
-        };
-
-        let init_in = FuseInitIn {
-            major: FUSE_KERNEL_VERSION,
-            minor: FUSE_KERNEL_MINOR_VERSION,
-            max_readahead: 0,
-            flags: 0,
-            flags2: 0,
-            unused: [0; 11],
-        };
-
-        let mut bytes = Vec::with_capacity(hdr.len as usize);
-        bytes.extend_from_slice(fuse_pack_struct(&hdr));
-        bytes.extend_from_slice(fuse_pack_struct(&init_in));
-
-        let req = Arc::new(FuseRequest {
-            unique,
-            kind: FuseReqKind::Init,
-            bytes,
-        });
-
-        {
-            let mut g = self.inner.lock();
-            if !g.connected {
-                return Err(SystemError::ENOTCONN);
-            }
-            g.pending.push_back(req.clone());
-            g.processing.insert(unique, FuseReqKind::Init);
+    fn wait_initialized(&self) -> Result<(), SystemError> {
+        if self.is_initialized() {
+            return Ok(());
         }
-
-        self.read_wait.wakeup(None);
-        let _ = EventPoll::wakeup_epoll(
-            &self.epitems,
-            EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
-        );
-        Ok(())
+        self.init_wait.wait_until_interruptible(|| {
+            let g = self.inner.lock();
+            if !g.connected {
+                return Some(Err(SystemError::ENOTCONN));
+            }
+            if g.initialized {
+                return Some(Ok(()));
+            }
+            None
+        })?
     }
 
     pub fn abort(&self) {
-        {
+        let processing: Vec<Arc<FusePendingState>> = {
             let mut g = self.inner.lock();
             g.connected = false;
+            g.pending.clear();
+            let processing = g.processing.values().cloned().collect();
+            g.processing.clear();
+            processing
+        };
+        for p in processing {
+            p.complete(Err(SystemError::ENOTCONN));
         }
         self.read_wait.wakeup(None);
+        self.init_wait.wakeup(None);
         let _ = EventPoll::wakeup_epoll(
             &self.epitems,
             EPollEventType::EPOLLERR | EPollEventType::EPOLLHUP,
@@ -222,6 +226,77 @@ impl FuseConn {
         Ok(req.bytes.len())
     }
 
+    pub fn enqueue_init(&self) -> Result<(), SystemError> {
+        let init_in = FuseInitIn {
+            major: FUSE_KERNEL_VERSION,
+            minor: FUSE_KERNEL_MINOR_VERSION,
+            max_readahead: 0,
+            flags: 0,
+            flags2: 0,
+            unused: [0; 11],
+        };
+        self.enqueue_request(FUSE_INIT, 0, fuse_pack_struct(&init_in))
+            .map(|_| ())
+    }
+
+    pub fn request(&self, opcode: u32, nodeid: u64, payload: &[u8]) -> Result<Vec<u8>, SystemError> {
+        if opcode != FUSE_INIT {
+            self.wait_initialized()?;
+        }
+        self.enqueue_request(opcode, nodeid, payload)?.wait_complete()
+    }
+
+    fn enqueue_request(
+        &self,
+        opcode: u32,
+        nodeid: u64,
+        payload: &[u8],
+    ) -> Result<Arc<FusePendingState>, SystemError> {
+        let unique = self.alloc_unique();
+
+        let pcb = ProcessManager::current_pcb();
+        let cred = pcb.cred();
+        let pid = pcb
+            .task_tgid_vnr()
+            .map(|p| p.data() as u32)
+            .unwrap_or(0);
+
+        let hdr = FuseInHeader {
+            len: (core::mem::size_of::<FuseInHeader>() + payload.len()) as u32,
+            opcode,
+            unique,
+            nodeid,
+            uid: cred.fsuid.data() as u32,
+            gid: cred.fsgid.data() as u32,
+            pid,
+            total_extlen: 0,
+            padding: 0,
+        };
+
+        let mut bytes = Vec::with_capacity(hdr.len as usize);
+        bytes.extend_from_slice(fuse_pack_struct(&hdr));
+        bytes.extend_from_slice(payload);
+
+        let req = Arc::new(FuseRequest { bytes });
+        let pending_state = Arc::new(FusePendingState::new(opcode));
+
+        {
+            let mut g = self.inner.lock();
+            if !g.connected {
+                return Err(SystemError::ENOTCONN);
+            }
+            g.pending.push_back(req);
+            g.processing.insert(unique, pending_state.clone());
+        }
+
+        self.read_wait.wakeup(None);
+        let _ = EventPoll::wakeup_epoll(
+            &self.epitems,
+            EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
+        );
+        Ok(pending_state)
+    }
+
     pub fn write_reply(&self, data: &[u8]) -> Result<usize, SystemError> {
         if data.len() < core::mem::size_of::<FuseOutHeader>() {
             return Err(SystemError::EINVAL);
@@ -232,47 +307,50 @@ impl FuseConn {
             return Err(SystemError::EINVAL);
         }
 
-        let kind = {
+        let pending = {
             let mut g = self.inner.lock();
             if !g.connected {
                 return Err(SystemError::ENOTCONN);
             }
-            match g.processing.remove(&out_hdr.unique) {
-                Some(k) => k,
-                None => return Err(SystemError::EINVAL),
-            }
+            g.processing.remove(&out_hdr.unique)
+                .ok_or(SystemError::EINVAL)?
         };
 
-        if out_hdr.error != 0 {
-            // Any init-stage error aborts the connection.
-            self.abort();
-            return Err(SystemError::EINVAL);
-        }
+        let payload = &data[core::mem::size_of::<FuseOutHeader>()..];
+        let error = out_hdr.error;
 
-        match kind {
-            FuseReqKind::Init => {
-                let payload = &data[core::mem::size_of::<FuseOutHeader>()..];
-                let init_out: FuseInitOut = fuse_read_struct(payload)?;
-                if init_out.major != FUSE_KERNEL_VERSION {
-                    self.abort();
-                    return Err(SystemError::EINVAL);
-                }
-
-                // Negotiate minor version: use the smaller one.
-                let negotiated_minor = core::cmp::min(init_out.minor, FUSE_KERNEL_MINOR_VERSION);
-
-                let mut g = self.inner.lock();
-                if !g.connected {
-                    return Err(SystemError::ENOTCONN);
-                }
-                g.initialized = true;
-                drop(g);
-
-                // For now we only record "initialized"; other negotiated values can be added later.
-                let _ = negotiated_minor;
+        if error != 0 {
+            // Negative errno from userspace.
+            let errno = -error;
+            let e = SystemError::from_i32(errno).unwrap_or(SystemError::EIO);
+            pending.complete(Err(e));
+            if pending.opcode == FUSE_INIT {
+                self.abort();
             }
+            return Ok(data.len());
         }
 
+        if pending.opcode == FUSE_INIT {
+            let init_out: FuseInitOut = fuse_read_struct(payload)?;
+            if init_out.major != FUSE_KERNEL_VERSION {
+                pending.complete(Err(SystemError::EINVAL));
+                self.abort();
+                return Ok(data.len());
+            }
+
+            // Negotiate minor version: use the smaller one.
+            let _negotiated_minor = core::cmp::min(init_out.minor, FUSE_KERNEL_MINOR_VERSION);
+
+            {
+                let mut g = self.inner.lock();
+                if g.connected {
+                    g.initialized = true;
+                }
+            }
+            self.init_wait.wakeup(None);
+        }
+
+        pending.complete(Ok(payload.to_vec()));
         Ok(data.len())
     }
 }

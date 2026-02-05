@@ -47,6 +47,7 @@ int main(void) {
 
     char opts[256];
     snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    FUSE_TEST_LOG("step: mount start");
     if (mount("none", mp, "fuse", 0, opts) != 0) {
         printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
         stop = 1;
@@ -54,6 +55,7 @@ int main(void) {
         pthread_join(th, NULL);
         return 1;
     }
+    FUSE_TEST_LOG("step: mount ok");
 
     /* wait init */
     for (int i = 0; i < 100; i++) {
@@ -69,8 +71,10 @@ int main(void) {
         pthread_join(th, NULL);
         return 1;
     }
+    FUSE_TEST_LOG("step: init ok");
 
     /* readdir */
+    FUSE_TEST_LOG("step: opendir start");
     DIR *d = opendir(mp);
     if (!d) {
         printf("[FAIL] opendir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
@@ -80,6 +84,7 @@ int main(void) {
         pthread_join(th, NULL);
         return 1;
     }
+    FUSE_TEST_LOG("step: readdir loop start");
     int found = 0;
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
@@ -88,6 +93,7 @@ int main(void) {
             break;
         }
     }
+    FUSE_TEST_LOG("step: readdir loop end");
     closedir(d);
     if (!found) {
         printf("[FAIL] readdir: hello.txt not found\n");
@@ -103,6 +109,7 @@ int main(void) {
     snprintf(p, sizeof(p), "%s/hello.txt", mp);
 
     struct stat st;
+    FUSE_TEST_LOG("step: stat start");
     if (stat(p, &st) != 0) {
         printf("[FAIL] stat(%s): %s (errno=%d)\n", p, strerror(errno), errno);
         umount(mp);
@@ -111,6 +118,7 @@ int main(void) {
         pthread_join(th, NULL);
         return 1;
     }
+    FUSE_TEST_LOG("step: stat ok");
     if (!S_ISREG(st.st_mode)) {
         printf("[FAIL] stat: expected regular file\n");
         umount(mp);
@@ -121,6 +129,7 @@ int main(void) {
     }
 
     char buf[128];
+    FUSE_TEST_LOG("step: read start");
     int n = read_all(p, buf, sizeof(buf) - 1);
     if (n < 0) {
         printf("[FAIL] read(%s): %s (errno=%d)\n", p, strerror(errno), errno);
@@ -130,6 +139,7 @@ int main(void) {
         pthread_join(th, NULL);
         return 1;
     }
+    FUSE_TEST_LOG("step: read ok");
     buf[n] = '\0';
     if (strcmp(buf, "hello from fuse\n") != 0) {
         printf("[FAIL] content mismatch: got='%s'\n", buf);
@@ -140,12 +150,14 @@ int main(void) {
         return 1;
     }
 
+    FUSE_TEST_LOG("step: umount start");
     umount(mp);
+    FUSE_TEST_LOG("step: umount ok");
     rmdir(mp);
+    FUSE_TEST_LOG("step: rmdir ok");
     stop = 1;
     close(fd);
     pthread_join(th, NULL);
     printf("[PASS] fuse_phase_c\n");
     return 0;
 }
-

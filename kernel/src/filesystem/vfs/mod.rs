@@ -1310,6 +1310,10 @@ pub trait FileSystem: Any + Sync + Send + Debug {
 
     fn super_block(&self) -> SuperBlock;
 
+    /// Called after a filesystem is successfully unmounted.
+    /// Default is no-op.
+    fn on_umount(&self) {}
+
     unsafe fn fault(&self, _pfm: &mut PageFaultMessage) -> VmFaultReason {
         VmFaultReason::VM_FAULT_SIGBUS
     }

@@ -8,7 +8,10 @@ use crate::{
     filesystem::epoll::{
         event_poll::EventPoll, event_poll::LockedEPItemLinkedList, EPollEventType, EPollItem,
     },
-    libs::{mutex::Mutex, wait_queue::WaitQueue},
+    libs::{
+        mutex::Mutex,
+        wait_queue::{WaitQueue, Waiter},
+    },
     process::ProcessManager,
 };
 
@@ -50,12 +53,30 @@ impl FusePendingState {
     }
 
     pub fn wait_complete(&self) -> Result<Vec<u8>, SystemError> {
-        match self
-            .wait
-            .wait_until_interruptible(|| self.response.lock().take())?
-        {
-            Some(v) => v,
-            None => Err(SystemError::EIO),
+        // Avoid TOCTOU between response update and wait queue registration.
+        if let Some(res) = self.response.lock().take() {
+            return res;
+        }
+        loop {
+            let mut guard = self.response.lock();
+            if let Some(res) = guard.take() {
+                return res;
+            }
+
+            let (waiter, waker) = Waiter::new_pair();
+            self.wait.register_waker(waker.clone())?;
+
+            // Re-check under the same lock after registering.
+            if let Some(res) = guard.take() {
+                self.wait.remove_waker(&waker);
+                return res;
+            }
+            drop(guard);
+
+            if let Err(e) = waiter.wait(true) {
+                self.wait.remove_waker(&waker);
+                return Err(e);
+            }
         }
     }
 }
@@ -126,16 +147,34 @@ impl FuseConn {
         if self.is_initialized() {
             return Ok(());
         }
-        self.init_wait.wait_until_interruptible(|| {
-            let g = self.inner.lock();
+        // Bind condition checks to inner lock and register waker before releasing it.
+        loop {
+            let mut g = self.inner.lock();
             if !g.connected {
-                return Some(Err(SystemError::ENOTCONN));
+                return Err(SystemError::ENOTCONN);
             }
             if g.initialized {
-                return Some(Ok(()));
+                return Ok(());
             }
-            None
-        })?
+
+            let (waiter, waker) = Waiter::new_pair();
+            self.init_wait.register_waker(waker.clone())?;
+
+            if !g.connected {
+                self.init_wait.remove_waker(&waker);
+                return Err(SystemError::ENOTCONN);
+            }
+            if g.initialized {
+                self.init_wait.remove_waker(&waker);
+                return Ok(());
+            }
+            drop(g);
+
+            if let Err(e) = waiter.wait(true) {
+                self.init_wait.remove_waker(&waker);
+                return Err(e);
+            }
+        }
     }
 
     pub fn abort(&self) {
@@ -204,13 +243,33 @@ impl FuseConn {
                 .pop_front()
                 .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?
         } else {
-            self.read_wait.wait_until_interruptible(|| {
+            loop {
                 let mut g = self.inner.lock();
                 if !g.connected {
-                    return Some(Err(SystemError::ENOTCONN));
+                    return Err(SystemError::ENOTCONN);
                 }
-                g.pending.pop_front().map(Ok)
-            })??
+                if let Some(req) = g.pending.pop_front() {
+                    break req;
+                }
+
+                let (waiter, waker) = Waiter::new_pair();
+                self.read_wait.register_waker(waker.clone())?;
+
+                if !g.connected {
+                    self.read_wait.remove_waker(&waker);
+                    return Err(SystemError::ENOTCONN);
+                }
+                if let Some(req) = g.pending.pop_front() {
+                    self.read_wait.remove_waker(&waker);
+                    break req;
+                }
+                drop(g);
+
+                if let Err(e) = waiter.wait(true) {
+                    self.read_wait.remove_waker(&waker);
+                    return Err(e);
+                }
+            }
         };
 
         if out.len() < req.bytes.len() {

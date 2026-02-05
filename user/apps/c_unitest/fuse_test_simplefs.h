@@ -23,12 +23,35 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#define FUSE_TEST_LOG_PREFIX "[fuse-test] "
+
+static inline int fuse_test_log_enabled(void) {
+    static int inited = 0;
+    static int enabled = 0;
+    if (!inited) {
+        const char *v = getenv("FUSE_TEST_LOG");
+        enabled = (v && v[0] && strcmp(v, "0") != 0);
+        inited = 1;
+    }
+    return enabled;
+}
+
+#define FUSE_TEST_LOG(fmt, ...)                                                       \
+    do {                                                                               \
+        if (fuse_test_log_enabled()) {                                                 \
+            fprintf(stderr, FUSE_TEST_LOG_PREFIX fmt "\n", ##__VA_ARGS__);             \
+        }                                                                              \
+    } while (0)
+
 #ifndef DT_DIR
 #define DT_DIR 4
 #endif
 #ifndef DT_REG
 #define DT_REG 8
 #endif
+
+/* Keep test buffers off small thread stacks. */
+#define FUSE_TEST_BUF_SIZE (64 * 1024)
 
 /* Opcodes (subset) */
 #ifndef FUSE_LOOKUP
@@ -388,17 +411,27 @@ static inline int fuse_write_reply(int fd, uint64_t unique, int32_t err_neg,
     out.error = err_neg;
     out.unique = unique;
 
-    unsigned char buf[65536];
-    if (sizeof(out) + payload_len > sizeof(buf)) {
+    size_t total = sizeof(out) + payload_len;
+    if (total > FUSE_TEST_BUF_SIZE) {
         errno = E2BIG;
+        return -1;
+    }
+    unsigned char *buf = malloc(total);
+    if (!buf) {
+        errno = ENOMEM;
         return -1;
     }
     memcpy(buf, &out, sizeof(out));
     if (payload_len) {
         memcpy(buf + sizeof(out), payload, payload_len);
     }
-    ssize_t wn = write(fd, buf, sizeof(out) + payload_len);
-    if (wn != (ssize_t)(sizeof(out) + payload_len)) {
+    ssize_t wn = write(fd, buf, total);
+    free(buf);
+    if (wn == (ssize_t)total) {
+        FUSE_TEST_LOG("reply unique=%llu err=%d len=%zu",
+                      (unsigned long long)unique, (int)err_neg, total);
+    }
+    if (wn != (ssize_t)total) {
         return -1;
     }
     return 0;
@@ -419,6 +452,9 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
     const struct fuse_in_header *h = (const struct fuse_in_header *)req;
     const unsigned char *payload = req + sizeof(*h);
     size_t payload_len = n - sizeof(*h);
+    FUSE_TEST_LOG("handle opcode=%u unique=%llu nodeid=%llu len=%u payload=%zu",
+                  h->opcode, (unsigned long long)h->unique, (unsigned long long)h->nodeid,
+                  h->len, payload_len);
 
     switch (h->opcode) {
     case FUSE_INIT: {
@@ -515,7 +551,10 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
 
         /* offset is an entry index: 0=".", 1="..", then children */
         uint64_t idx = in->offset;
-        unsigned char outbuf[65536];
+        unsigned char *outbuf = malloc(FUSE_TEST_BUF_SIZE);
+        if (!outbuf) {
+            return fuse_write_reply(a->fd, h->unique, -ENOMEM, NULL, 0);
+        }
         size_t outlen = 0;
 
         const char *fixed_names[2] = {".", ".."};
@@ -523,7 +562,7 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
             const char *nm = fixed_names[idx];
             size_t nmlen = strlen(nm);
             size_t reclen = fuse_dirent_rec_len(nmlen);
-            if (outlen + reclen > sizeof(outbuf))
+            if (outlen + reclen > FUSE_TEST_BUF_SIZE)
                 break;
             struct fuse_dirent de;
             memset(&de, 0, sizeof(de));
@@ -554,7 +593,7 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
 
             size_t nmlen = strlen(c->name);
             size_t reclen = fuse_dirent_rec_len(nmlen);
-            if (outlen + reclen > sizeof(outbuf))
+            if (outlen + reclen > FUSE_TEST_BUF_SIZE)
                 break;
             struct fuse_dirent de;
             memset(&de, 0, sizeof(de));
@@ -570,7 +609,9 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
             cur++;
         }
 
-        return fuse_write_reply(a->fd, h->unique, 0, outbuf, outlen);
+        int ret = fuse_write_reply(a->fd, h->unique, 0, outbuf, outlen);
+        free(outbuf);
+        return ret;
     }
     case FUSE_RELEASE:
     case FUSE_RELEASEDIR:
@@ -746,13 +787,18 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
 
 static inline void *fuse_daemon_thread(void *arg) {
     struct fuse_daemon_args *a = (struct fuse_daemon_args *)arg;
-    unsigned char buf[65536];
+    unsigned char *buf = malloc(FUSE_TEST_BUF_SIZE);
+    if (!buf) {
+        return NULL;
+    }
 
     simplefs_init(&a->fs);
 
     while (!*a->stop) {
-        ssize_t n = read(a->fd, buf, sizeof(buf));
+        FUSE_TEST_LOG("daemon read start");
+        ssize_t n = read(a->fd, buf, FUSE_TEST_BUF_SIZE);
         if (n < 0) {
+            FUSE_TEST_LOG("daemon read error n=%zd errno=%d", n, errno);
             if (errno == EINTR)
                 continue;
             if (errno == ENOTCONN)
@@ -760,14 +806,18 @@ static inline void *fuse_daemon_thread(void *arg) {
             continue;
         }
         if (n == 0) {
+            FUSE_TEST_LOG("daemon read EOF");
             break;
         }
+        FUSE_TEST_LOG("daemon read n=%zd", n);
         struct fuse_in_header *h = (struct fuse_in_header *)buf;
         if ((size_t)n != h->len) {
+            FUSE_TEST_LOG("daemon short read n=%zd hdr.len=%u", n, h->len);
             continue;
         }
         (void)fuse_handle_one(a, buf, (size_t)n);
     }
+    free(buf);
     return NULL;
 }
 
@@ -781,4 +831,3 @@ static inline int ensure_dir(const char *path) {
     }
     return mkdir(path, 0755);
 }
-

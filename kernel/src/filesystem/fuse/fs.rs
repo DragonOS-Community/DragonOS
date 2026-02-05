@@ -1,8 +1,6 @@
 use alloc::{
     collections::BTreeMap,
-    string::String,
     sync::{Arc, Weak},
-    vec::Vec,
 };
 
 use system_error::SystemError;
@@ -242,5 +240,10 @@ impl FileSystem for FuseFS {
 
     fn super_block(&self) -> SuperBlock {
         self.super_block.clone()
+    }
+
+    fn on_umount(&self) {
+        // Abort pending/blocked requests to wake daemon thread on unmount.
+        self.conn.abort();
     }
 }

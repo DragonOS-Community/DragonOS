@@ -414,6 +414,9 @@ impl MountFS {
 
         self.self_mountpoint.write().take();
 
+        // Notify the filesystem that it has been unmounted.
+        self.inner_filesystem.on_umount();
+
         return r;
     }
 }

@@ -105,7 +105,7 @@ impl FuseNode {
         Metadata {
             dev_id: 0,
             inode_id,
-            size: attr.size as usize,
+            size: attr.size as i64,
             blk_size: attr.blksize as usize,
             blocks: attr.blocks as usize,
             atime: PosixTimeSpec::new(attr.atime as i64, attr.atimensec as i64),

@@ -159,15 +159,18 @@ impl IndexNode for LockedFuseDevInode {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
         }
-        let FilePrivateData::FuseDev(p) = &*data else {
-            return Err(SystemError::EINVAL);
+        let (conn_any, nonblock) = {
+            let FilePrivateData::FuseDev(p) = &*data else {
+                return Err(SystemError::EINVAL);
+            };
+            (p.conn.clone(), p.nonblock)
         };
-        let conn = p
-            .conn
-            .clone()
+        // Drop private_data lock before potentially blocking in read_request().
+        drop(data);
+        let conn = conn_any
             .downcast::<FuseConn>()
             .map_err(|_| SystemError::EINVAL)?;
-        conn.read_request(p.nonblock, &mut buf[..len])
+        conn.read_request(nonblock, &mut buf[..len])
     }
 
     fn write_at(
@@ -180,12 +183,15 @@ impl IndexNode for LockedFuseDevInode {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
         }
-        let FilePrivateData::FuseDev(p) = &*data else {
-            return Err(SystemError::EINVAL);
+        let conn_any = {
+            let FilePrivateData::FuseDev(p) = &*data else {
+                return Err(SystemError::EINVAL);
+            };
+            p.conn.clone()
         };
-        let conn = p
-            .conn
-            .clone()
+        // Drop private_data lock before potentially blocking in write_reply().
+        drop(data);
+        let conn = conn_any
             .downcast::<FuseConn>()
             .map_err(|_| SystemError::EINVAL)?;
         conn.write_reply(&buf[..len])

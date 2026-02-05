@@ -3,6 +3,7 @@
 //! 提供类似 Linux 的 /proc/sys 接口，支持动态配置内核参数
 
 mod kernel;
+mod net;
 mod vm;
 
 use crate::filesystem::{
@@ -14,6 +15,7 @@ use alloc::{
     sync::{Arc, Weak},
 };
 use kernel::KernelDirOps;
+use net::NetDirOps;
 use system_error::SystemError;
 use vm::VmDirOps;
 
@@ -58,6 +60,16 @@ impl DirOps for SysDirOps {
             cached_children.insert(name.to_string(), inode.clone());
             return Ok(inode);
         }
+        if name == "net" {
+            let mut cached_children = dir.cached_children().write();
+            if let Some(child) = cached_children.get(name) {
+                return Ok(child.clone());
+            }
+
+            let inode = NetDirOps::new_inode(dir.self_ref_weak().clone());
+            cached_children.insert(name.to_string(), inode.clone());
+            return Ok(inode);
+        }
 
         Err(SystemError::ENOENT)
     }
@@ -70,5 +82,8 @@ impl DirOps for SysDirOps {
         cached_children
             .entry("vm".to_string())
             .or_insert_with(|| VmDirOps::new_inode(dir.self_ref_weak().clone()));
+        cached_children
+            .entry("net".to_string())
+            .or_insert_with(|| NetDirOps::new_inode(dir.self_ref_weak().clone()));
     }
 }

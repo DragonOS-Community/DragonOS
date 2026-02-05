@@ -312,7 +312,7 @@ impl NTtyData {
             }
 
             if likely(flag == 1) {
-                self.read_buf[self.read_head] = buf[c_offset];
+                self.read_buf[ntty_buf_mask(self.read_head)] = buf[c_offset];
                 c_offset += 1;
                 self.read_head += 1;
             } else {

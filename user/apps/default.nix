@@ -57,13 +57,18 @@ let
   );
 in
 [
-  static.busybox
+  (static.busybox.override {
+    extraConfig = ''
+      CONFIG_FEATURE_DEFAULT_PASSWD_ALGO "sha512"
+    '';
+  })
   static.curl
   static.dropbear
   cross.glibc
 
-  # Simple C utility
-  (static.callPackage ./about { })
+  # Simple C utilities
+  (static.callPackage ./about {})
+  (static.callPackage ./c_unitest {})
 
 ]
 ++ lib.optionals (target == "x86_64" && testOpt.syscall.enable) [

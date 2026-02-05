@@ -75,12 +75,15 @@ impl IndexNode for LockedExt4Inode {
         let mut guard = self.0.lock();
         // another_ext4的高4位是文件类型，低12位是权限
         let file_mode = InodeMode::from(file_type).union(mode);
+        let file_mode = another_ext4::InodeMode::from_bits_truncate(file_mode.bits() as u16);
         let ext4 = &guard.concret_fs().fs;
-        let id = ext4.create(
-            guard.inner_inode_num,
-            name,
-            another_ext4::InodeMode::from_bits_truncate(file_mode.bits() as u16),
-        )?;
+
+        let id = if file_type == vfs::FileType::Dir {
+            ext4.mkdir(guard.inner_inode_num, name, file_mode)?
+        } else {
+            ext4.create(guard.inner_inode_num, name, file_mode)?
+        };
+
         let dname = DName::from(name);
         // 通过self_ref获取Arc<Self>，然后转换为Arc<dyn IndexNode>
         let self_arc = guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?;

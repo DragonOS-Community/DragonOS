@@ -45,6 +45,7 @@ select_test
 pselect_test
 epoll_test
 splice_test
+deleted_test
 link_test
 
 # 进程相关测试
@@ -105,6 +106,8 @@ socket_ip_tcp_loopback_non_blocking_test
 socket_ip_tcp_loopback_test
 socket_ip_tcp_udp_generic_loopback_test
 socket_ipv4_datagram_based_socket_unbound_loopback_test
+socket_ipv4_udp_unbound_loopback_test
+socket_ipv4_udp_unbound_loopback_nogotsan_test
 
 # 信号处理测试
 sigaction_test

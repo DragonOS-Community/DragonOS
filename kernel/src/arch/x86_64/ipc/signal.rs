@@ -865,7 +865,9 @@ fn setup_frame(
 ) -> Result<i32, SystemError> {
     // 在设置信号栈帧之前，先处理 rseq
     // 参考 Linux: https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kernel/signal.c#211
-    Rseq::on_signal(trap_frame);
+    if Rseq::on_signal(trap_frame).is_err() {
+        return Err(SystemError::EFAULT);
+    }
 
     let ret_code_ptr: *mut c_void;
     let handler_addr: usize;

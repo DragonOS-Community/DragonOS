@@ -572,20 +572,36 @@ impl Rseq {
         // 如果有 frame，执行 IP 修正
         if let Some(frame) = frame {
             if let Err(e) = Self::ip_fixup(frame, &access, sig, user_end, &pcb) {
-                log::error!("rseq ip_fixup failed: {:?}", e);
+                log::debug!("rseq ip_fixup failed: {:?}", e);
+                Self::disable_current_rseq_after_fault(&pcb);
+                let _ = crate::ipc::signal::send_kernel_signal_to_current(
+                    crate::arch::ipc::signal::Signal::SIGSEGV,
+                );
                 return Err(());
             }
         }
 
         // 更新 cpu_id 等字段
         let cpu_id = current_cpu_id().data() as u32;
-        if let Err(e) = unsafe { access.update_cpu_node_id(cpu_id, 0, 0) } {
-            log::error!("rseq update_cpu_node_id failed: {:?}", e);
+        if let Err(_e) = unsafe { access.update_cpu_node_id(cpu_id, 0, 0) } {
+            // log::debug!("rseq update_cpu_node_id failed: {:?}", e);
+            Self::disable_current_rseq_after_fault(&pcb);
+            let _ = crate::ipc::signal::send_kernel_signal_to_current(
+                crate::arch::ipc::signal::Signal::SIGSEGV,
+            );
             return Err(());
         }
 
         pcb.flags().remove(ProcessFlags::NEED_RSEQ);
         Ok(())
+    }
+
+    fn disable_current_rseq_after_fault(pcb: &ProcessControlBlock) {
+        let mut rseq_state = pcb.rseq_state_mut();
+        rseq_state.registration = None;
+        rseq_state.event_mask.store(0, Ordering::SeqCst);
+        drop(rseq_state);
+        pcb.flags().remove(ProcessFlags::NEED_RSEQ);
     }
 
     /// 执行 IP 修正
@@ -684,15 +700,13 @@ impl Rseq {
     }
 
     /// 在信号递送时调用
-    pub fn on_signal<F: RseqTrapFrame>(frame: &mut F) {
-        use crate::arch::ipc::signal::Signal;
+    pub fn on_signal<F: RseqTrapFrame>(frame: &mut F) -> Result<(), ()> {
         let pcb = ProcessManager::current_pcb();
         if pcb.rseq_state().is_registered() {
             pcb.rseq_state().set_event(RseqEventMask::SIGNAL);
-            if Self::handle_notify_resume(Some(frame)).is_err() {
-                let _ = crate::ipc::kill::send_signal_to_pcb(pcb.clone(), Signal::SIGSEGV);
-            }
+            return Self::handle_notify_resume(Some(frame));
         }
+        Ok(())
     }
 
     /// 在 CPU 迁移时调用

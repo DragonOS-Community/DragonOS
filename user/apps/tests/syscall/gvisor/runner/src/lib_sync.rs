@@ -4,6 +4,7 @@ use std::{
     collections::HashSet,
     fs::{self, File},
     io::{BufRead, BufReader, Write},
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -368,6 +369,19 @@ impl TestRunner {
         let mut cmd = Command::new(&test_path);
         if !blocked_subtests.is_empty() {
             cmd.arg(format!("--gtest_filter=-{}", blocked_subtests.join(":")));
+        }
+        // Run each test binary in a fresh network namespace to avoid sysctl leakage.
+        let name_lc = test_name.to_ascii_lowercase();
+        if name_lc.contains("socket") || name_lc.contains("net") {
+            unsafe {
+                cmd.pre_exec(|| {
+                    let ret = libc::unshare(libc::CLONE_NEWNET);
+                    if ret != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
         }
 
         let status = cmd

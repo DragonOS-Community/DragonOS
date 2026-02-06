@@ -150,23 +150,15 @@ pub enum KernelThreadCreateStatus {
 #[allow(dead_code)]
 impl KernelThreadCreateInfo {
     pub fn new(func: KernelThreadClosure, name: String) -> Arc<Self> {
-        let result = Arc::new(Self {
+        Arc::new_cyclic(|weak_self| Self {
             closure: SpinLock::new(Some(Box::new(func))),
             name,
             created: AtomicKernelThreadCreateStatus::new(KernelThreadCreateStatus::NotCreated),
             result_pcb: SpinLock::new(None),
             has_unsafe_arc_instance: AtomicBool::new(false),
-            self_ref: Weak::new(),
+            self_ref: weak_self.clone(),
             to_mark_sleep: AtomicBool::new(true),
-        });
-        let tmp = result.clone();
-        unsafe {
-            let tmp = Arc::into_raw(tmp) as *mut Self;
-            (*tmp).self_ref = Arc::downgrade(&result);
-            Arc::from_raw(tmp);
-        }
-
-        return result;
+        })
     }
 
     /// 创建者调用这函数，等待创建完成后，获取创建结果

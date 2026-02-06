@@ -9,8 +9,8 @@ use core::{
     intrinsics::unlikely,
 };
 use log::{debug, error, info, warn};
+use raw_cpuid::CpuId;
 use system_error::SystemError;
-use x86::cpuid::{cpuid, CpuIdResult};
 
 use super::hpet::{hpet_instance, is_hpet_enabled};
 use crate::driver::clocksource::tsc::init_tsc_clocksource;
@@ -32,7 +32,7 @@ impl TSCManager {
     ///
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/tsc.c#1511
     pub fn init() -> Result<(), SystemError> {
-        let cpuid = x86::cpuid::CpuId::new();
+        let cpuid = CpuId::new();
         let feat = cpuid.get_feature_info().ok_or(SystemError::ENODEV)?;
         if !feat.has_tsc() {
             error!("TSC is not available");
@@ -65,17 +65,9 @@ impl TSCManager {
 
     /// 检查平台是否支持不受频率与电源状态影响的稳定 TSC
     fn has_invariant_tsc() -> bool {
-        // 查询 Extend CPUID leaf 的元数据。
-        let max_ext: CpuIdResult = cpuid!(0x8000_0000);
-
-        // 检查是否支持 Extend CPUID leaf 0x8000_0007。
-        if max_ext.eax < 0x8000_0007 {
-            return false;
-        }
-
-        // 获取并检查 Extend CPUID leaf 0x8000_0007 的 EDX 寄存器的第 8 位（Invariant TSC 标志）。
-        let ext: CpuIdResult = cpuid!(0x8000_0007);
-        (ext.edx & (1 << 8)) != 0
+        CpuId::new()
+            .get_advanced_power_mgmt_info()
+            .is_some_and(|apm| apm.has_invariant_tsc())
     }
 
     /// 通过其他硬件时钟源测量 TSC 频率放入 CPU_KHZ 中，然后利用其设置 TSC_KHZ。

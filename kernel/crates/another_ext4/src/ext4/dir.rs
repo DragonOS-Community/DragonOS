@@ -95,7 +95,7 @@ impl Ext4 {
         let mut iblock: LBlockId = 0;
         while iblock < total_blocks {
             // Get the parent physical block id
-            let fblock = self.extent_query(dir, iblock).unwrap();
+            let fblock = self.extent_query(dir, iblock)?;
             // Load the block from disk
             let mut dir_block = DirBlock::new(self.read_block(fblock));
             // Try removing the entry
@@ -137,5 +137,54 @@ impl Ext4 {
             iblock += 1;
         }
         entries
+    }
+
+    /// Replace a directory entry's inode in place.
+    /// Used for atomic rename when target exists (equivalent to Linux ext4_setent).
+    pub(super) fn dir_replace_entry(
+        &self,
+        dir: &InodeRef,
+        name: &str,
+        new_inode: InodeId,
+        new_type: FileType,
+    ) -> Result<()> {
+        trace!(
+            "Dir replace entry: dir {}, name {}, new_inode {}",
+            dir.id,
+            name,
+            new_inode
+        );
+        let total_blocks = dir.inode.fs_block_count() as u32;
+        let mut iblock: LBlockId = 0;
+        while iblock < total_blocks {
+            let fblock = self.extent_query(dir, iblock)?;
+            let mut dir_block = DirBlock::new(self.read_block(fblock));
+            if dir_block.replace(name, new_inode, new_type) {
+                dir_block.set_checksum(
+                    &self.read_super_block().uuid(),
+                    dir.id,
+                    dir.inode.generation(),
+                );
+                self.write_block(dir_block.block());
+                return Ok(());
+            }
+            iblock += 1;
+        }
+        return_error!(
+            ErrCode::ENOENT,
+            "Directory entry not found for replace: dir {}, name {}",
+            dir.id,
+            name
+        );
+    }
+
+    /// Check if a directory is empty (only contains "." and "..")
+    pub(super) fn dir_is_empty(&self, dir: &InodeRef) -> Result<bool> {
+        let entries = self.dir_list_entries(dir);
+        let res = entries.iter().all(|e| {
+            let name = e.name();
+            name == "." || name == ".."
+        });
+        Ok(res)
     }
 }

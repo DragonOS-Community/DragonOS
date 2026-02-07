@@ -116,6 +116,11 @@ impl DirEntry {
         self.file_type = file_type;
     }
 
+    /// Set the inode number (for atomic rename)
+    pub fn set_inode(&mut self, inode: InodeId) {
+        self.inode = inode;
+    }
+
     /// Get the required size to save a directory entry, 4-byte aligned
     pub fn required_size(name_len: usize) -> usize {
         // u32 + u16 + u8 + Ext4DirEnInner + name -> align to 4
@@ -249,6 +254,34 @@ impl DirBlock {
             if !de.unused() && de.compare_name(name) {
                 // Mark the target entry as unused
                 de.set_unused();
+                self.0.write_offset_as(offset, &de);
+                return true;
+            }
+            offset += de.rec_len as usize;
+        }
+        false
+    }
+
+    /// Replace the inode of an existing directory entry in place.
+    /// This is the key operation for atomic rename when target exists.
+    ///
+    /// # Arguments
+    /// * `name` - the name of the entry to replace
+    /// * `new_inode` - the new inode number to point to
+    /// * `new_type` - the new file type
+    ///
+    /// # Returns
+    /// * `true` if entry found and replaced
+    /// * `false` if entry not found
+    pub fn replace(&mut self, name: &str, new_inode: InodeId, new_type: FileType) -> bool {
+        let mut offset = 0;
+        while offset < BLOCK_SIZE {
+            let mut de: DirEntry = self.0.read_offset_as(offset);
+            if !de.unused() && de.compare_name(name) {
+                // In-place modification: only change inode and file_type
+                // rec_len and name remain unchanged
+                de.set_inode(new_inode);
+                de.set_type(new_type);
                 self.0.write_offset_as(offset, &de);
                 return true;
             }

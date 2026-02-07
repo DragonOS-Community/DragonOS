@@ -995,25 +995,26 @@ pub fn clocksource_select() {
         }
     }
     // 对比当前的时钟源和记录到最好的时钟源的精度
-    if CUR_CLOCKSOURCE.lock().as_ref().is_some() {
-        // 当前时钟源不为空
-        let cur_clocksource = CUR_CLOCKSOURCE.lock().as_ref().unwrap().clone();
-        let best_name = &best.clocksource_data().name;
-        if cur_clocksource.clocksource_data().name.ne(best_name) {
-            info!("Switching to the clocksource {:?}\n", best_name);
-            drop(cur_clocksource);
-            CUR_CLOCKSOURCE.lock().replace(best.clone());
-            if timekeeping::timekeeping_is_initialized() {
-                timekeeping::timekeeper().timekeeper_setup_internals(best.clone());
+    let mut should_update_timekeeper = false;
+    {
+        let mut cur_guard = CUR_CLOCKSOURCE.lock();
+        if cur_guard.as_ref().is_some() {
+            // 当前时钟源不为空
+            let cur_clocksource = cur_guard.as_ref().unwrap().clone();
+            let best_name = &best.clocksource_data().name;
+            if cur_clocksource.clocksource_data().name.ne(best_name) {
+                info!("Switching to the clocksource {:?}\n", best_name);
+                cur_guard.replace(best.clone());
+                should_update_timekeeper = true;
             }
-            // TODO 通知timerkeeping 切换了时间源
+        } else {
+            // 当前时钟源为空
+            cur_guard.replace(best.clone());
+            should_update_timekeeper = true;
         }
-    } else {
-        // 当前时钟源为空
-        CUR_CLOCKSOURCE.lock().replace(best.clone());
-        if timekeeping::timekeeping_is_initialized() {
-            timekeeping::timekeeper().timekeeper_setup_internals(best.clone());
-        }
+    }
+    if should_update_timekeeper && timekeeping::timekeeping_is_initialized() {
+        timekeeping::timekeeper().timekeeper_setup_internals(best.clone());
     }
     debug!("clocksource_select finish, CUR_CLOCKSOURCE = {best:?}");
 }

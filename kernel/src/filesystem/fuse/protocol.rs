@@ -27,6 +27,7 @@ pub const FUSE_RENAME: u32 = 12;
 pub const FUSE_OPEN: u32 = 14;
 pub const FUSE_READ: u32 = 15;
 pub const FUSE_WRITE: u32 = 16;
+pub const FUSE_STATFS: u32 = 17;
 pub const FUSE_RELEASE: u32 = 18;
 pub const FUSE_INIT: u32 = 26;
 pub const FUSE_OPENDIR: u32 = 27;
@@ -189,6 +190,27 @@ pub struct FuseWriteIn {
 pub struct FuseWriteOut {
     pub size: u32,
     pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseKstatfs {
+    pub blocks: u64,
+    pub bfree: u64,
+    pub bavail: u64,
+    pub files: u64,
+    pub ffree: u64,
+    pub bsize: u32,
+    pub namelen: u32,
+    pub frsize: u32,
+    pub padding: u32,
+    pub spare: [u32; 6],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseStatfsOut {
+    pub st: FuseKstatfs,
 }
 
 #[repr(C)]

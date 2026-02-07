@@ -17,10 +17,13 @@ use crate::{
         },
     },
     libs::mutex::{Mutex, MutexGuard},
+    process::ProcessManager,
+    syscall::user_access::UserBufferReader,
     time::PosixTimeSpec,
 };
 
 use super::conn::FuseConn;
+const FUSE_DEV_IOC_CLONE: u32 = 0x8004_4600; // _IOR('F', 0, uint32_t)
 
 #[derive(Debug)]
 pub struct FuseDevInode {
@@ -143,7 +146,7 @@ impl IndexNode for LockedFuseDevInode {
     fn close(&self, data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         if let FilePrivateData::FuseDev(p) = &*data {
             if let Ok(conn) = p.conn.clone().downcast::<FuseConn>() {
-                conn.abort();
+                conn.dev_release();
             }
         }
         Ok(())
@@ -236,11 +239,57 @@ impl IndexNode for LockedFuseDevInode {
 
     fn ioctl(
         &self,
-        _cmd: u32,
-        _data: usize,
-        _private_data: &FilePrivateData,
+        cmd: u32,
+        data: usize,
+        mut private_data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        Err(SystemError::ENOTTY)
+        match cmd {
+            FUSE_DEV_IOC_CLONE => {
+                if data == 0 {
+                    return Err(SystemError::EFAULT);
+                }
+
+                let reader =
+                    UserBufferReader::new(data as *const u32, core::mem::size_of::<u32>(), true)?;
+                let oldfd = reader.buffer_protected(0)?.read_one::<u32>(0)? as i32;
+
+                let old_file = ProcessManager::current_pcb()
+                    .fd_table()
+                    .read()
+                    .get_file_by_fd(oldfd)
+                    .ok_or(SystemError::EINVAL)?;
+
+                let old_conn = {
+                    let guard = old_file.private_data.lock();
+                    let FilePrivateData::FuseDev(p) = &*guard else {
+                        return Err(SystemError::EINVAL);
+                    };
+                    p.conn.clone()
+                };
+
+                let FilePrivateData::FuseDev(p) = &mut *private_data else {
+                    return Err(SystemError::EINVAL);
+                };
+                let old_fc = old_conn
+                    .clone()
+                    .downcast::<FuseConn>()
+                    .map_err(|_| SystemError::EINVAL)?;
+
+                // If this fd already points to the same connection, this is a no-op.
+                if let Ok(cur_fc) = p.conn.clone().downcast::<FuseConn>() {
+                    if Arc::ptr_eq(&cur_fc, &old_fc) {
+                        return Ok(0);
+                    }
+                    cur_fc.dev_release();
+                }
+
+                old_fc.dev_acquire();
+                p.conn = old_conn;
+
+                Ok(0)
+            }
+            _ => Err(SystemError::ENOTTY),
+        }
     }
 
     fn absolute_path(&self) -> Result<String, SystemError> {

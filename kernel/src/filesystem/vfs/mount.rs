@@ -1097,6 +1097,21 @@ impl FileSystem for MountFS {
         sb
     }
 
+    fn statfs(&self, inode: &Arc<dyn IndexNode>) -> Result<SuperBlock, SystemError> {
+        let inner_inode = inode
+            .as_any_ref()
+            .downcast_ref::<MountFSInode>()
+            .map(|mnt| mnt.inner_inode.clone())
+            .unwrap_or_else(|| inode.clone());
+        let mut sb = self.inner_filesystem.statfs(&inner_inode)?;
+        sb.flags = self.mount_flags.bits() as u64;
+        Ok(sb)
+    }
+
+    fn permission_policy(&self) -> crate::filesystem::vfs::FsPermissionPolicy {
+        self.inner_filesystem.permission_policy()
+    }
+
     unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
         self.inner_filesystem.fault(pfm)
     }

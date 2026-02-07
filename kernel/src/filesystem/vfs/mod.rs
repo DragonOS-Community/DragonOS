@@ -992,9 +992,6 @@ impl dyn IndexNode {
         let process_root_inode = ProcessManager::current_pcb().fs_struct().root();
         let trailing_slash = path.ends_with('/');
 
-        // 获取当前进程的凭证（用于路径遍历的权限检查）
-        let cred = ProcessManager::current_pcb().cred();
-
         // 处理绝对路径
         // result: 上一个被找到的inode
         // rest_path: 还没有查找的路径
@@ -1013,9 +1010,9 @@ impl dyn IndexNode {
             }
 
             // 检查当前目录的执行权限（搜索权限）
-            // 这确保了进程有权限遍历到此目录
+            // 这确保了进程有权限遍历到此目录（对 Remote 权限模型的 FS，该检查会被绕过）
             let metadata = result.metadata()?;
-            cred.inode_permission(&metadata, PermissionMask::MAY_EXEC.bits())?;
+            permission::check_inode_permission(&result, &metadata, PermissionMask::MAY_EXEC)?;
 
             let name;
             // 寻找“/”
@@ -1286,6 +1283,18 @@ bitflags! {
     }
 }
 
+/// Filesystem-level permission checking policy used by VFS.
+///
+/// - `Dac`: VFS performs Unix DAC permission checks (mode/uid/gid) locally.
+/// - `Remote`: VFS bypasses local DAC checks and lets the filesystem/server decide.
+///   For Linux FUSE remote model, execute permission is still checked locally for
+///   regular files; see `vfs::permission::check_inode_permission()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FsPermissionPolicy {
+    Dac,
+    Remote,
+}
+
 /// @brief 所有文件系统都应该实现的trait
 pub trait FileSystem: Any + Sync + Send + Debug {
     /// @brief 获取当前文件系统的root inode的指针
@@ -1309,6 +1318,20 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     fn name(&self) -> &str;
 
     fn super_block(&self) -> SuperBlock;
+
+    /// @brief 获取文件系统统计信息（statfs）
+    ///
+    /// 默认实现直接返回 super_block。需要自定义 statfs 行为的文件系统可覆写此方法。
+    fn statfs(&self, _inode: &Arc<dyn IndexNode>) -> Result<SuperBlock, SystemError> {
+        Ok(self.super_block())
+    }
+
+    /// VFS permission checking policy for this filesystem instance.
+    ///
+    /// Default is `Dac` (local Unix DAC checks).
+    fn permission_policy(&self) -> FsPermissionPolicy {
+        FsPermissionPolicy::Dac
+    }
 
     /// Called after a filesystem is successfully unmounted.
     /// Default is no-op.

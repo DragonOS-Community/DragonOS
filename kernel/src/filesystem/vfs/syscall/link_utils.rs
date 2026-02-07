@@ -1,3 +1,4 @@
+use crate::filesystem::vfs::permission::PermissionMask;
 use crate::filesystem::vfs::syscall::AtFlags;
 use crate::filesystem::vfs::utils::rsplit_path;
 use crate::filesystem::vfs::utils::user_path_at;
@@ -8,9 +9,9 @@ use crate::filesystem::vfs::Metadata;
 use crate::filesystem::vfs::SystemError;
 use crate::filesystem::vfs::VFS_MAX_FOLLOW_SYMLINK_TIMES;
 use crate::process::cred::CAPFlags;
-use crate::process::cred::Cred;
 use crate::process::ProcessManager;
 use alloc::sync::Arc;
+
 /// **创建硬连接的系统调用**
 ///    
 /// ## 参数
@@ -129,7 +130,7 @@ fn may_linkat(old_inode: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
     }
 
     // 检查是否是"安全的"硬链接源
-    if !safe_hardlink_source(&metadata, &cred)? {
+    if !safe_hardlink_source(old_inode, &metadata)? {
         return Err(SystemError::EPERM);
     }
 
@@ -159,7 +160,10 @@ fn may_linkat(old_inode: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
 /// - `Ok(true)`: 硬链接源安全，允许创建硬链接
 /// - `Ok(false)`: 硬链接源不安全，不允许创建硬链接
 /// - `Err(SystemError::EACCES)`: 权限检查失败
-fn safe_hardlink_source(metadata: &Metadata, cred: &Arc<Cred>) -> Result<bool, SystemError> {
+fn safe_hardlink_source(
+    old_inode: &Arc<dyn IndexNode>,
+    metadata: &Metadata,
+) -> Result<bool, SystemError> {
     let mode = metadata.mode;
     let file_type = metadata.file_type;
 
@@ -178,10 +182,14 @@ fn safe_hardlink_source(metadata: &Metadata, cred: &Arc<Cred>) -> Result<bool, S
         return Ok(false);
     }
 
-    // 4. 调用者必须有读写权限
-    use crate::filesystem::vfs::PermissionMask;
-    let need_perm = PermissionMask::MAY_READ.bits() | PermissionMask::MAY_WRITE.bits();
-    if cred.inode_permission(metadata, need_perm).is_err() {
+    // 4. 调用者必须有读写权限（对 Remote 权限模型的 FS，该检查会被绕过）
+    if crate::filesystem::vfs::permission::check_inode_permission(
+        old_inode,
+        metadata,
+        PermissionMask::MAY_READ | PermissionMask::MAY_WRITE,
+    )
+    .is_err()
+    {
         return Ok(false);
     }
 

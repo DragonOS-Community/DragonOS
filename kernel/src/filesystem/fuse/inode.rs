@@ -10,9 +10,9 @@ use system_error::SystemError;
 use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::{
-        file::{FuseDirPrivateData, FuseFilePrivateData, FileFlags},
+        file::{FileFlags, FuseDirPrivateData, FuseFilePrivateData},
         syscall::RenameFlags,
-        FilePrivateData, FileSystem, FileType, InodeFlags, InodeId, InodeMode, IndexNode, Metadata,
+        FilePrivateData, FileSystem, FileType, IndexNode, InodeFlags, InodeId, InodeMode, Metadata,
     },
     libs::mutex::{Mutex, MutexGuard},
     time::PosixTimeSpec,
@@ -23,11 +23,11 @@ use super::{
     fs::FuseFS,
     protocol::{
         fuse_pack_struct, fuse_read_struct, FuseAttr, FuseAttrOut, FuseDirent, FuseEntryOut,
-        FuseGetattrIn, FuseMkdirIn, FuseMknodIn, FuseOpenIn, FuseOpenOut, FuseReadIn, FuseReleaseIn,
-        FuseRenameIn, FuseSetattrIn, FuseWriteIn, FuseWriteOut, FATTR_GID, FATTR_MODE, FATTR_SIZE,
-        FATTR_UID, FUSE_GETATTR, FUSE_LOOKUP, FUSE_MKDIR, FUSE_MKNOD, FUSE_OPEN, FUSE_OPENDIR,
-        FUSE_READ, FUSE_READDIR, FUSE_RELEASE, FUSE_RELEASEDIR, FUSE_RENAME, FUSE_RMDIR,
-        FUSE_SETATTR, FUSE_UNLINK, FUSE_WRITE,
+        FuseGetattrIn, FuseMkdirIn, FuseMknodIn, FuseOpenIn, FuseOpenOut, FuseReadIn,
+        FuseReleaseIn, FuseRenameIn, FuseSetattrIn, FuseWriteIn, FuseWriteOut, FATTR_GID,
+        FATTR_MODE, FATTR_SIZE, FATTR_UID, FUSE_GETATTR, FUSE_LOOKUP, FUSE_MKDIR, FUSE_MKNOD,
+        FUSE_OPEN, FUSE_OPENDIR, FUSE_READ, FUSE_READDIR, FUSE_RELEASE, FUSE_RELEASEDIR,
+        FUSE_RENAME, FUSE_RMDIR, FUSE_SETATTR, FUSE_UNLINK, FUSE_WRITE,
     },
 };
 
@@ -128,9 +128,9 @@ impl FuseNode {
             dummy: 0,
             fh: 0,
         };
-        let payload = self
-            .conn()
-            .request(FUSE_GETATTR, self.nodeid, fuse_pack_struct(&getattr_in))?;
+        let payload =
+            self.conn()
+                .request(FUSE_GETATTR, self.nodeid, fuse_pack_struct(&getattr_in))?;
         let out: FuseAttrOut = fuse_read_struct(&payload)?;
         let md = Self::attr_to_metadata(&out.attr);
         *self.cached_metadata.lock() = Some(md.clone());
@@ -138,6 +138,7 @@ impl FuseNode {
     }
 
     fn cached_or_fetch_metadata(&self) -> Result<Metadata, SystemError> {
+        self.conn.check_allow_current_process()?;
         if let Some(m) = self.cached_metadata.lock().clone() {
             return Ok(m);
         }
@@ -215,11 +216,15 @@ impl IndexNode for FuseNode {
         self
     }
 
-    fn open(&self, mut data: MutexGuard<FilePrivateData>, flags: &FileFlags) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        mut data: MutexGuard<FilePrivateData>,
+        flags: &FileFlags,
+    ) -> Result<(), SystemError> {
         let md = self.cached_or_fetch_metadata()?;
         match md.file_type {
-            FileType::Dir => self.open_common(FUSE_OPENDIR, &mut *data, flags),
-            FileType::File => self.open_common(FUSE_OPEN, &mut *data, flags),
+            FileType::Dir => self.open_common(FUSE_OPENDIR, &mut data, flags),
+            FileType::File => self.open_common(FUSE_OPEN, &mut data, flags),
             _ => Err(SystemError::EINVAL),
         }
     }
@@ -391,9 +396,9 @@ impl IndexNode for FuseNode {
                 flags: 0,
                 padding: 0,
             };
-            let payload = self
-                .conn()
-                .request(FUSE_READDIR, self.nodeid, fuse_pack_struct(&read_in))?;
+            let payload =
+                self.conn()
+                    .request(FUSE_READDIR, self.nodeid, fuse_pack_struct(&read_in))?;
             if payload.is_empty() {
                 break;
             }
@@ -482,9 +487,7 @@ impl IndexNode for FuseNode {
                 payload_in.extend_from_slice(fuse_pack_struct(&inarg));
                 payload_in.extend_from_slice(name.as_bytes());
                 payload_in.push(0);
-                let payload = self
-                    .conn()
-                    .request(FUSE_MKDIR, self.nodeid, &payload_in)?;
+                let payload = self.conn().request(FUSE_MKDIR, self.nodeid, &payload_in)?;
                 let entry: FuseEntryOut = fuse_read_struct(&payload)?;
                 let md = Self::attr_to_metadata(&entry.attr);
                 let fs = self.fs.upgrade().ok_or(SystemError::ENOENT)?;
@@ -501,9 +504,7 @@ impl IndexNode for FuseNode {
                 payload_in.extend_from_slice(fuse_pack_struct(&inarg));
                 payload_in.extend_from_slice(name.as_bytes());
                 payload_in.push(0);
-                let payload = self
-                    .conn()
-                    .request(FUSE_MKNOD, self.nodeid, &payload_in)?;
+                let payload = self.conn().request(FUSE_MKNOD, self.nodeid, &payload_in)?;
                 let entry: FuseEntryOut = fuse_read_struct(&payload)?;
                 let md = Self::attr_to_metadata(&entry.attr);
                 let fs = self.fs.upgrade().ok_or(SystemError::ENOENT)?;

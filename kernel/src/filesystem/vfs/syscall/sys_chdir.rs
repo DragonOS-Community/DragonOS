@@ -6,6 +6,7 @@ use alloc::{string::String, vec::Vec};
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_CHDIR;
+use crate::filesystem::vfs::permission::PermissionMask;
 use crate::filesystem::vfs::utils::user_path_at;
 use crate::filesystem::vfs::{fcntl::AtFlags, FileType, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES};
 use crate::process::ProcessManager;
@@ -68,43 +69,45 @@ impl Syscall for SysChdirHandle {
         let inode =
             inode_begin.lookup_follow_symlink(&remain_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
         let metadata = inode.metadata()?;
-
-        let cred = ProcessManager::current_pcb().cred();
-        cred.check_chdir_permission(&metadata)?;
-
-        if metadata.file_type == FileType::Dir {
-            // 维护一个“用户可见”的 cwd 字符串（用于 getcwd 的快速路径）
-            // 注意：路径解析不再依赖该字符串，避免 chroot 后出现语义偏差。
-            let mut new_path = String::from("");
-            let cwd = match path.as_bytes()[0] {
-                b'/' => String::from("/"),
-                _ => proc.basic().cwd(),
-            };
-            let mut cwd_vec: Vec<_> = cwd.split('/').filter(|&x| !x.is_empty()).collect();
-            let path_split = path.split('/').filter(|&x| !x.is_empty());
-            for seg in path_split {
-                if seg == ".." {
-                    cwd_vec.pop();
-                } else if seg == "." {
-                    // 当前目录
-                } else {
-                    cwd_vec.push(seg);
-                }
-            }
-            for seg in cwd_vec {
-                new_path.push('/');
-                new_path.push_str(seg);
-            }
-            if new_path.is_empty() {
-                new_path = String::from("/");
-            }
-
-            proc.basic_mut().set_cwd(new_path);
-            proc.fs_struct_mut().set_pwd(inode);
-            return Ok(0);
-        } else {
+        if metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
+
+        crate::filesystem::vfs::permission::check_inode_permission(
+            &inode,
+            &metadata,
+            PermissionMask::MAY_EXEC | PermissionMask::MAY_CHDIR,
+        )?;
+
+        // 维护一个“用户可见”的 cwd 字符串（用于 getcwd 的快速路径）
+        // 注意：路径解析不再依赖该字符串，避免 chroot 后出现语义偏差。
+        let mut new_path = String::from("");
+        let cwd = match path.as_bytes()[0] {
+            b'/' => String::from("/"),
+            _ => proc.basic().cwd(),
+        };
+        let mut cwd_vec: Vec<_> = cwd.split('/').filter(|&x| !x.is_empty()).collect();
+        let path_split = path.split('/').filter(|&x| !x.is_empty());
+        for seg in path_split {
+            if seg == ".." {
+                cwd_vec.pop();
+            } else if seg == "." {
+                // 当前目录
+            } else {
+                cwd_vec.push(seg);
+            }
+        }
+        for seg in cwd_vec {
+            new_path.push('/');
+            new_path.push_str(seg);
+        }
+        if new_path.is_empty() {
+            new_path = String::from("/");
+        }
+
+        proc.basic_mut().set_cwd(new_path);
+        proc.fs_struct_mut().set_pwd(inode);
+        Ok(0)
     }
 
     /// Formats the syscall parameters for display/debug purposes

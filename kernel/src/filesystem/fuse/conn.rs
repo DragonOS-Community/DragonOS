@@ -1,5 +1,5 @@
 use alloc::{collections::BTreeMap, collections::VecDeque, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use num_traits::FromPrimitive;
 use system_error::SystemError;
@@ -14,6 +14,8 @@ use crate::{
     },
     process::ProcessManager,
 };
+
+use crate::process::cred::CAPFlags;
 
 use super::protocol::{
     fuse_pack_struct, fuse_read_struct, FuseInHeader, FuseInitIn, FuseInitOut, FuseOutHeader,
@@ -86,6 +88,9 @@ struct FuseConnInner {
     connected: bool,
     mounted: bool,
     initialized: bool,
+    owner_uid: u32,
+    owner_gid: u32,
+    allow_other: bool,
     pending: VecDeque<Arc<FuseRequest>>,
     processing: BTreeMap<u64, Arc<FusePendingState>>,
 }
@@ -95,6 +100,7 @@ struct FuseConnInner {
 pub struct FuseConn {
     inner: Mutex<FuseConnInner>,
     next_unique: AtomicU64,
+    dev_count: AtomicUsize,
     read_wait: WaitQueue,
     init_wait: WaitQueue,
     epitems: LockedEPItemLinkedList,
@@ -107,17 +113,22 @@ impl FuseConn {
                 connected: true,
                 mounted: false,
                 initialized: false,
+                owner_uid: 0,
+                owner_gid: 0,
+                allow_other: false,
                 pending: VecDeque::new(),
                 processing: BTreeMap::new(),
             }),
             // Use non-zero unique, keep even IDs for "ordinary" requests as Linux does.
             next_unique: AtomicU64::new(2),
+            dev_count: AtomicUsize::new(1),
             read_wait: WaitQueue::default(),
             init_wait: WaitQueue::default(),
             epitems: LockedEPItemLinkedList::default(),
         })
     }
 
+    #[allow(dead_code)]
     pub fn is_mounted(&self) -> bool {
         self.inner.lock().mounted
     }
@@ -139,8 +150,49 @@ impl FuseConn {
         self.inner.lock().initialized
     }
 
+    pub fn configure_mount(&self, owner_uid: u32, owner_gid: u32, allow_other: bool) {
+        let mut g = self.inner.lock();
+        g.owner_uid = owner_uid;
+        g.owner_gid = owner_gid;
+        g.allow_other = allow_other;
+    }
+
     fn alloc_unique(&self) -> u64 {
         self.next_unique.fetch_add(2, Ordering::Relaxed)
+    }
+
+    fn allow_current_process(&self, cred: &crate::process::cred::Cred) -> bool {
+        let g = self.inner.lock();
+
+        if !g.mounted {
+            return true;
+        }
+
+        if g.allow_other {
+            return true;
+        }
+
+        // Linux: allow sysadmin to bypass allow_other restrictions (configurable).
+        if cred.has_capability(CAPFlags::CAP_SYS_ADMIN) {
+            return true;
+        }
+
+        let owner_uid = g.owner_uid as usize;
+        let owner_gid = g.owner_gid as usize;
+        cred.uid.data() == owner_uid
+            && cred.euid.data() == owner_uid
+            && cred.suid.data() == owner_uid
+            && cred.gid.data() == owner_gid
+            && cred.egid.data() == owner_gid
+            && cred.sgid.data() == owner_gid
+    }
+
+    pub fn check_allow_current_process(&self) -> Result<(), SystemError> {
+        let cred = ProcessManager::current_pcb().cred();
+        if !self.allow_current_process(&cred) {
+            return Err(SystemError::EACCES);
+        }
+        Ok(())
     }
 
     fn wait_initialized(&self) -> Result<(), SystemError> {
@@ -149,7 +201,7 @@ impl FuseConn {
         }
         // Bind condition checks to inner lock and register waker before releasing it.
         loop {
-            let mut g = self.inner.lock();
+            let g = self.inner.lock();
             if !g.connected {
                 return Err(SystemError::ENOTCONN);
             }
@@ -195,6 +247,19 @@ impl FuseConn {
             &self.epitems,
             EPollEventType::EPOLLERR | EPollEventType::EPOLLHUP,
         );
+    }
+
+    /// Acquire a new `/dev/fuse` file handle reference to this connection.
+    pub fn dev_acquire(&self) {
+        self.dev_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Release a `/dev/fuse` file handle reference. When the last handle is closed,
+    /// abort the connection (Linux: daemon exits).
+    pub fn dev_release(&self) {
+        if self.dev_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.abort();
+        }
     }
 
     pub fn poll_mask(&self, have_pending: bool) -> EPollEventType {
@@ -298,11 +363,21 @@ impl FuseConn {
             .map(|_| ())
     }
 
-    pub fn request(&self, opcode: u32, nodeid: u64, payload: &[u8]) -> Result<Vec<u8>, SystemError> {
+    pub fn request(
+        &self,
+        opcode: u32,
+        nodeid: u64,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, SystemError> {
         if opcode != FUSE_INIT {
+            let cred = ProcessManager::current_pcb().cred();
+            if !self.allow_current_process(&cred) {
+                return Err(SystemError::EACCES);
+            }
             self.wait_initialized()?;
         }
-        self.enqueue_request(opcode, nodeid, payload)?.wait_complete()
+        self.enqueue_request(opcode, nodeid, payload)?
+            .wait_complete()
     }
 
     fn enqueue_request(
@@ -315,10 +390,10 @@ impl FuseConn {
 
         let pcb = ProcessManager::current_pcb();
         let cred = pcb.cred();
-        let pid = pcb
-            .task_tgid_vnr()
-            .map(|p| p.data() as u32)
-            .unwrap_or(0);
+        if !self.allow_current_process(&cred) {
+            return Err(SystemError::EACCES);
+        }
+        let pid = pcb.task_tgid_vnr().map(|p| p.data() as u32).unwrap_or(0);
 
         let hdr = FuseInHeader {
             len: (core::mem::size_of::<FuseInHeader>() + payload.len()) as u32,
@@ -371,7 +446,8 @@ impl FuseConn {
             if !g.connected {
                 return Err(SystemError::ENOTCONN);
             }
-            g.processing.remove(&out_hdr.unique)
+            g.processing
+                .remove(&out_hdr.unique)
                 .ok_or(SystemError::EINVAL)?
         };
 

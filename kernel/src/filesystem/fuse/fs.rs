@@ -18,7 +18,11 @@ use crate::{
 
 use linkme::distributed_slice;
 
-use super::{conn::FuseConn, inode::FuseNode, protocol::FUSE_ROOT_ID};
+use super::{
+    conn::FuseConn,
+    inode::FuseNode,
+    protocol::{fuse_read_struct, FuseStatfsOut, FUSE_ROOT_ID, FUSE_STATFS},
+};
 
 #[derive(Debug)]
 pub struct FuseMountData {
@@ -26,6 +30,8 @@ pub struct FuseMountData {
     pub rootmode: u32,
     pub user_id: u32,
     pub group_id: u32,
+    pub default_permissions: bool,
+    pub allow_other: bool,
     pub conn: Arc<FuseConn>,
 }
 
@@ -41,18 +47,22 @@ pub struct FuseFS {
     super_block: SuperBlock,
     conn: Arc<FuseConn>,
     nodes: Mutex<BTreeMap<u64, Weak<FuseNode>>>,
-    #[allow(dead_code)]
     owner_uid: u32,
-    #[allow(dead_code)]
     owner_gid: u32,
+    default_permissions: bool,
+    allow_other: bool,
 }
 
 impl FuseFS {
-    fn parse_mount_options(raw: Option<&str>) -> Result<(i32, u32, u32, u32), SystemError> {
+    fn parse_mount_options(
+        raw: Option<&str>,
+    ) -> Result<(i32, u32, u32, u32, bool, bool), SystemError> {
         let mut fd: Option<i32> = None;
         let mut rootmode: Option<u32> = None;
         let mut user_id: Option<u32> = None;
         let mut group_id: Option<u32> = None;
+        let mut default_permissions = false;
+        let mut allow_other = false;
 
         let s = raw.unwrap_or("");
         for part in s.split(',') {
@@ -78,6 +88,12 @@ impl FuseFS {
                 "group_id" => {
                     group_id = Some(v.parse::<u32>().map_err(|_| SystemError::EINVAL)?);
                 }
+                "default_permissions" => {
+                    default_permissions = v.is_empty() || v != "0";
+                }
+                "allow_other" => {
+                    allow_other = v.is_empty() || v != "0";
+                }
                 _ => {}
             }
         }
@@ -90,7 +106,14 @@ impl FuseFS {
         // Default root mode: directory 0755 (with type bit).
         let rootmode = rootmode.unwrap_or(0o040755);
 
-        Ok((fd, rootmode, user_id, group_id))
+        Ok((
+            fd,
+            rootmode,
+            user_id,
+            group_id,
+            default_permissions,
+            allow_other,
+        ))
     }
 
     pub fn root_node(&self) -> Arc<FuseNode> {
@@ -135,7 +158,8 @@ impl MountableFileSystem for FuseFS {
         raw_data: Option<&str>,
         _source: &str,
     ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
-        let (fd, rootmode, user_id, group_id) = Self::parse_mount_options(raw_data)?;
+        let (fd, rootmode, user_id, group_id, default_permissions, allow_other) =
+            Self::parse_mount_options(raw_data)?;
 
         let file = ProcessManager::current_pcb()
             .fd_table()
@@ -155,6 +179,7 @@ impl MountableFileSystem for FuseFS {
             }
         };
 
+        conn.configure_mount(user_id, group_id, allow_other);
         conn.mark_mounted()?;
 
         Ok(Some(Arc::new(FuseMountData {
@@ -162,6 +187,8 @@ impl MountableFileSystem for FuseFS {
             rootmode,
             user_id,
             group_id,
+            default_permissions,
+            allow_other,
             conn,
         })))
     }
@@ -209,6 +236,8 @@ impl MountableFileSystem for FuseFS {
             nodes: Mutex::new(BTreeMap::new()),
             owner_uid: mount_data.user_id,
             owner_gid: mount_data.group_id,
+            default_permissions: mount_data.default_permissions,
+            allow_other: mount_data.allow_other,
         });
 
         conn.enqueue_init()?;
@@ -240,6 +269,47 @@ impl FileSystem for FuseFS {
 
     fn super_block(&self) -> SuperBlock {
         self.super_block.clone()
+    }
+
+    fn statfs(&self, inode: &Arc<dyn IndexNode>) -> Result<SuperBlock, SystemError> {
+        match self.conn.check_allow_current_process() {
+            Ok(()) => {}
+            Err(SystemError::EACCES) => {
+                let mut sb = self.super_block.clone();
+                sb.magic = Magic::FUSE_MAGIC;
+                return Ok(sb);
+            }
+            Err(e) => return Err(e),
+        }
+
+        let nodeid = inode
+            .as_any_ref()
+            .downcast_ref::<FuseNode>()
+            .map(|n| n.nodeid())
+            .unwrap_or(FUSE_ROOT_ID);
+
+        let payload = self.conn.request(FUSE_STATFS, nodeid, &[])?;
+        let out: FuseStatfsOut = fuse_read_struct(&payload)?;
+
+        let mut sb = self.super_block.clone();
+        sb.magic = Magic::FUSE_MAGIC;
+        sb.blocks = out.st.blocks;
+        sb.bfree = out.st.bfree;
+        sb.bavail = out.st.bavail;
+        sb.files = out.st.files;
+        sb.ffree = out.st.ffree;
+        sb.bsize = out.st.bsize as u64;
+        sb.namelen = out.st.namelen as u64;
+        sb.frsize = out.st.frsize as u64;
+        Ok(sb)
+    }
+
+    fn permission_policy(&self) -> crate::filesystem::vfs::FsPermissionPolicy {
+        if self.default_permissions {
+            crate::filesystem::vfs::FsPermissionPolicy::Dac
+        } else {
+            crate::filesystem::vfs::FsPermissionPolicy::Remote
+        }
     }
 
     fn on_umount(&self) {

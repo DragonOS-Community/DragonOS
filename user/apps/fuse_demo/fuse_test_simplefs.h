@@ -365,7 +365,7 @@ static inline void simplefs_init(struct simplefs *fs) {
     memcpy(fs->nodes[1].data, msg, fs->nodes[1].size);
 
     fs->next_nodeid = 3;
-    fs->next_ino = 3; 
+    fs->next_ino = 3;
 }
 
 static inline struct simplefs_node *simplefs_find_node(struct simplefs *fs, uint64_t nodeid) {
@@ -384,18 +384,18 @@ static inline struct simplefs_node *simplefs_find_child(struct simplefs *fs, uin
             continue;
         if (fs->nodes[i].parent != parent)
             continue;
-        if (strcmp(fs->nodes[i].name, name) == 0) {
+        if (strcmp(fs->nodes[i].name, name) == 0)
             return &fs->nodes[i];
-        }
     }
     return NULL;
 }
 
 static inline int simplefs_has_children(struct simplefs *fs, uint64_t parent) {
     for (int i = 0; i < SIMPLEFS_MAX_NODES; i++) {
-        if (fs->nodes[i].used && fs->nodes[i].parent == parent) {
+        if (!fs->nodes[i].used)
+            continue;
+        if (fs->nodes[i].parent == parent)
             return 1;
-        }
     }
     return 0;
 }
@@ -403,11 +403,12 @@ static inline int simplefs_has_children(struct simplefs *fs, uint64_t parent) {
 static inline struct simplefs_node *simplefs_alloc(struct simplefs *fs) {
     for (int i = 0; i < SIMPLEFS_MAX_NODES; i++) {
         if (!fs->nodes[i].used) {
-            memset(&fs->nodes[i], 0, sizeof(fs->nodes[i]));
-            fs->nodes[i].used = 1;
-            fs->nodes[i].nodeid = fs->next_nodeid++;
-            fs->nodes[i].ino = fs->next_ino++;
-            return &fs->nodes[i];
+            struct simplefs_node *n = &fs->nodes[i];
+            memset(n, 0, sizeof(*n));
+            n->used = 1;
+            n->nodeid = fs->next_nodeid++;
+            n->ino = fs->next_ino++;
+            return n;
         }
     }
     return NULL;
@@ -417,26 +418,23 @@ static inline void simplefs_fill_attr(const struct simplefs_node *n, struct fuse
     memset(a, 0, sizeof(*a));
     a->ino = n->ino;
     a->size = n->size;
-    a->blocks = 0;
+    a->blocks = (n->size + 511) / 512;
     a->mode = n->mode;
     a->nlink = n->is_dir ? 2 : 1;
-    a->uid = 0;
-    a->gid = 0;
+    a->uid = getuid();
+    a->gid = getgid();
     a->blksize = 4096;
 }
 
-static inline int fuse_write_reply(int fd, uint64_t unique, int32_t err_neg,
-                                   const void *payload, size_t payload_len) {
+static inline int fuse_write_reply(int fd, uint64_t unique, int err_neg, const void *payload,
+                                   size_t payload_len) {
     struct fuse_out_header out;
-    out.len = sizeof(out) + payload_len;
+    memset(&out, 0, sizeof(out));
+    out.len = sizeof(out) + (uint32_t)payload_len;
     out.error = err_neg;
     out.unique = unique;
 
     size_t total = sizeof(out) + payload_len;
-    if (total > FUSE_TEST_BUF_SIZE) {
-        errno = E2BIG;
-        return -1;
-    }
     unsigned char *buf = malloc(total);
     if (!buf) {
         errno = ENOMEM;
@@ -784,20 +782,30 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         const struct fuse_rename_in *in = (const struct fuse_rename_in *)payload;
         const char *names = (const char *)(payload + sizeof(*in));
         size_t names_len = payload_len - sizeof(*in);
-        if (names[names_len - 1] != '\0') {
-            return -1;
-        }
+
+        /* oldname\0newname\0 */
         const char *oldname = names;
-        const char *newname = oldname + strlen(oldname) + 1;
-        if (newname >= names + names_len) {
+        size_t oldlen = strnlen(oldname, names_len);
+        if (oldlen == names_len)
             return -1;
-        }
+        const char *newname = names + oldlen + 1;
+        size_t remain = names_len - oldlen - 1;
+        if (remain == 0)
+            return -1;
+        size_t newlen = strnlen(newname, remain);
+        if (newlen == remain)
+            return -1;
+
         struct simplefs_node *src = simplefs_find_child(&a->fs, h->nodeid, oldname);
         if (!src) {
             return fuse_write_reply(a->fd, h->unique, -ENOENT, NULL, 0);
         }
         if (simplefs_find_child(&a->fs, in->newdir, newname)) {
             return fuse_write_reply(a->fd, h->unique, -EEXIST, NULL, 0);
+        }
+        struct simplefs_node *dst_parent = simplefs_find_node(&a->fs, in->newdir);
+        if (!dst_parent || !dst_parent->is_dir) {
+            return fuse_write_reply(a->fd, h->unique, -ENOTDIR, NULL, 0);
         }
         src->parent = in->newdir;
         strncpy(src->name, newname, sizeof(src->name) - 1);

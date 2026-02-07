@@ -63,8 +63,11 @@ impl Syscall for SysChrootHandle {
             return Err(SystemError::ENOTDIR);
         }
 
-        // 目录搜索权限（execute）
-        cred.inode_permission(&meta, PermissionMask::MAY_EXEC.bits())?;
+        crate::filesystem::vfs::permission::check_inode_permission(
+            &target,
+            &meta,
+            PermissionMask::MAY_EXEC,
+        )?;
 
         // 更新进程 fs root；不改变 cwd（Linux 行为）
         pcb.fs_struct_mut().set_root(target);

@@ -7,8 +7,12 @@ use super::Metadata;
 use crate::{
     filesystem::vfs::{FileType, InodeMode},
     process::cred::{CAPFlags, Cred},
+    process::ProcessManager,
 };
+use alloc::sync::Arc;
 use system_error::SystemError;
+
+use super::{FsPermissionPolicy, IndexNode};
 
 bitflags! {
     pub struct PermissionMask: u32 {
@@ -28,6 +32,35 @@ bitflags! {
         const MAY_CHDIR = 0x40;
 
         const MAY_RWX = Self::MAY_READ.bits + Self::MAY_WRITE.bits + Self::MAY_EXEC.bits;
+    }
+}
+
+/// VFS permission check wrapper that respects per-filesystem policy.
+///
+/// This is the single entry point that should be used by VFS/pathwalk/syscalls
+/// when deciding whether to apply local Unix DAC checks.
+///
+/// Linux FUSE remote permission model:
+/// - Without `default_permissions`, the kernel bypasses most DAC checks and
+///   lets the userspace daemon decide.
+/// - Execute permission is still checked locally for regular files.
+pub fn check_inode_permission(
+    inode: &Arc<dyn IndexNode>,
+    metadata: &Metadata,
+    mask: PermissionMask,
+) -> Result<(), SystemError> {
+    let cred = ProcessManager::current_pcb().cred();
+    match inode.fs().permission_policy() {
+        FsPermissionPolicy::Dac => cred.inode_permission(metadata, mask.bits()),
+        FsPermissionPolicy::Remote => {
+            if mask.contains(PermissionMask::MAY_EXEC)
+                && metadata.file_type == FileType::File
+                && (metadata.mode.bits() & InodeMode::S_IXUGO.bits()) == 0
+            {
+                return Err(SystemError::EACCES);
+            }
+            Ok(())
+        }
     }
 }
 

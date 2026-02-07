@@ -85,20 +85,18 @@ pub fn do_renameat2(
     // 非空目录覆盖应由具体文件系统在 move_to/rename 实现中返回 ENOTEMPTY。
 
     // 权限检查：根据 Linux 语义，rename 需要对源父目录和目标父目录都拥有写+搜索权限
-    let cred = pcb.cred();
-
-    // 检查源父目录的写+搜索权限（需要删除旧目录项）
     let old_parent_metadata = old_parent_inode.metadata()?;
-    cred.inode_permission(
+    crate::filesystem::vfs::permission::check_inode_permission(
+        &old_parent_inode,
         &old_parent_metadata,
-        (PermissionMask::MAY_WRITE | PermissionMask::MAY_EXEC).bits(),
+        PermissionMask::MAY_WRITE | PermissionMask::MAY_EXEC,
     )?;
 
-    // 检查目标父目录的写+搜索权限（需要创建新目录项）
     let new_parent_metadata = new_parent_inode.metadata()?;
-    cred.inode_permission(
+    crate::filesystem::vfs::permission::check_inode_permission(
+        &new_parent_inode,
         &new_parent_metadata,
-        (PermissionMask::MAY_WRITE | PermissionMask::MAY_EXEC).bits(),
+        PermissionMask::MAY_WRITE | PermissionMask::MAY_EXEC,
     )?;
 
     old_parent_inode.move_to(old_filename, &new_parent_inode, new_filename, flags)?;

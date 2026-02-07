@@ -29,17 +29,33 @@ impl Syscall for SysMknodatHandle {
         let dirfd = Self::dirfd(args);
         let path = Self::path(args);
         let mode_val = Self::mode(args);
-        let dev = DeviceNumber::from(Self::dev(args));
+        // Decode Linux dev_t format (from userspace makedev)
+        let dev = DeviceNumber::from_linux_dev_t(Self::dev(args));
         let path = vfs_check_and_clone_cstr(path, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
 
-        let mode: InodeMode = if mode_val == 0 {
+        // 解析 mode：提取文件类型和权限位
+        // "Zero file type is equivalent to type S_IFREG." - mknod(2)
+        let file_type_bits = mode_val & InodeMode::S_IFMT.bits();
+        let perm_bits = mode_val & !InodeMode::S_IFMT.bits();
+
+        let file_type = if file_type_bits == 0 {
             InodeMode::S_IFREG
         } else {
-            InodeMode::from_bits(mode_val).ok_or(SystemError::EINVAL)?
+            InodeMode::from_bits(file_type_bits).ok_or(SystemError::EINVAL)?
         };
+
+        // 应用 umask 到权限位
+        // "In the absence of a default ACL, the permissions of the created node
+        //  are (mode & ~umask)." - mknod(2)
         let pcb = ProcessManager::current_pcb();
+        let umask = pcb.fs_struct().umask();
+        let masked_perm = InodeMode::from_bits_truncate(perm_bits) & !umask;
+
+        // 组合文件类型和 umask 后的权限
+        let mode = file_type | masked_perm;
+
         let (mut current_inode, ret_path) = user_path_at(&pcb, dirfd, &path)?;
         let (name, parent) = rsplit_path(&ret_path);
         if let Some(parent) = parent {
@@ -49,7 +65,15 @@ impl Syscall for SysMknodatHandle {
         if name.is_empty() && dirfd != AtFlags::AT_FDCWD.bits() {
             return Err(SystemError::ENOENT);
         }
-        // 在解析出的起始 inode 上进行 mknod（IndexNode::mknod 应负责对路径的进一步解析/校验）
+
+        if current_inode
+            .lookup_follow_symlink(name, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+            .is_ok()
+        {
+            return Err(SystemError::EEXIST);
+        }
+
+        // 在解析出的父目录上进行 mknod
         current_inode.mknod(name, mode, dev)?;
 
         Ok(0)

@@ -90,6 +90,7 @@ impl Ext4FileSystem {
                     vfs_inode_id: generate_inode_id(),
                     parent: self_ref.clone(),
                     self_ref: self_ref.clone(),
+                    special_node: None,
                 }))
             });
 

@@ -26,6 +26,42 @@ impl Ext4 {
         Ok(inode_ref)
     }
 
+    /// Create a device inode (character or block device).
+    ///
+    /// Unlike `create_inode()`, this function:
+    /// - Does NOT initialize the extent tree
+    /// - Stores the device number in i_block[0..1] (Linux ext4 standard)
+    #[inline(never)]
+    pub(super) fn create_device_inode(
+        &self,
+        mode: InodeMode,
+        major: u32,
+        minor: u32,
+    ) -> Result<InodeRef> {
+        // Device nodes are never directories
+        let id = self.alloc_inode(false)?;
+
+        // Initialize the inode
+        let mut inode = Box::new(Inode::default());
+        inode.set_mode(mode);
+
+        // Key difference: set device number instead of extent tree
+        inode.set_device(major, minor);
+
+        let mut inode_ref = InodeRef::new(id, inode);
+
+        // Sync the inode to disk
+        self.write_inode_with_csum(&mut inode_ref);
+
+        trace!(
+            "Alloc device inode {} ({}:{}) ok",
+            inode_ref.id,
+            major,
+            minor
+        );
+        Ok(inode_ref)
+    }
+
     /// Create(initialize) the root inode of the file system
     #[inline(never)]
     pub(super) fn create_root_inode(&self) -> Result<InodeRef> {

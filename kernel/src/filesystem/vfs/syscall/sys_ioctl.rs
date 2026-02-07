@@ -92,7 +92,7 @@ impl Syscall for SysIoctlHandle {
                 // 其他命令转发给inode处理
                 let r = file
                     .inode()
-                    .ioctl(cmd, data, &file.private_data.lock())
+                    .ioctl(cmd, data, file.private_data.lock())
                     .map_err(|e| {
                         // 将内部错误码 ENOIOCTLCMD 转换为用户空间错误码 ENOTTY
                         if e == SystemError::ENOIOCTLCMD {

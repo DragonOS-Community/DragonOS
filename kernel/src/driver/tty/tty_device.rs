@@ -445,12 +445,20 @@ impl IndexNode for TtyDevice {
         Ok(())
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize, data: &FilePrivateData) -> Result<usize, SystemError> {
-        let (tty, _) = if let FilePrivateData::Tty(tty_priv) = data {
+    fn ioctl(
+        &self,
+        cmd: u32,
+        arg: usize,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        let (tty, _) = if let FilePrivateData::Tty(tty_priv) = &*data {
             (tty_priv.tty(), tty_priv.flags)
         } else {
             return Err(SystemError::EIO);
         };
+
+        // Drop the lock early: tty ioctl paths may block.
+        drop(data);
 
         match cmd {
             TtyIoctlCmd::TIOCSETD

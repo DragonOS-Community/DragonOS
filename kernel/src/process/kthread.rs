@@ -412,6 +412,32 @@ impl KernelThreadMechanism {
         }
     }
 
+    /// 请求一个内核线程退出（不等待其真正退出）
+    #[allow(dead_code)]
+    pub fn request_stop(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
+        if !pcb.flags().contains(ProcessFlags::KTHREAD) {
+            panic!("Cannt stop a non-kthread process");
+        }
+
+        let mut worker_private = pcb.worker_private();
+        assert!(
+            worker_private.is_some(),
+            "kthread request_stop: worker_private is none, pid: {:?}",
+            pcb.raw_pid()
+        );
+        worker_private
+            .as_mut()
+            .unwrap()
+            .kernel_thread_mut()
+            .expect("Error type of worker private")
+            .flags
+            .insert(KernelThreadFlags::SHOULD_STOP);
+
+        drop(worker_private);
+        ProcessManager::wakeup(pcb).ok();
+        Ok(())
+    }
+
     /// 判断一个内核线程是否应当停止
     ///
     /// ## 参数
@@ -458,6 +484,7 @@ impl KernelThreadMechanism {
         }
         // 设置为kthread
         current_pcb.flags().insert(ProcessFlags::KTHREAD);
+        let kthreadd_pcb = current_pcb.clone();
         drop(current_pcb);
 
         loop {
@@ -478,10 +505,34 @@ impl KernelThreadMechanism {
             }
             drop(list);
 
+            Self::reap_zombie_kthreads(&kthreadd_pcb);
+
             let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
             ProcessManager::mark_sleep(true).ok();
             drop(irq_guard);
             schedule(SchedMode::SM_NONE);
+        }
+    }
+
+    fn reap_zombie_kthreads(current_pcb: &Arc<ProcessControlBlock>) {
+        let child_pids = {
+            let guard = current_pcb.children_read_irqsave();
+            guard.clone()
+        };
+
+        for pid in child_pids {
+            let Some(task) = ProcessManager::find_task_by_vpid(pid) else {
+                continue;
+            };
+            if !task.is_kthread() || !task.is_zombie() {
+                continue;
+            }
+            if task.try_mark_dead_from_zombie() {
+                unsafe {
+                    ProcessManager::release(task.raw_pid());
+                }
+            }
+            drop(task);
         }
     }
 }

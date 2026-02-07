@@ -618,7 +618,7 @@ impl IndexNode for LockedDevFSInode {
         &self,
         _cmd: u32,
         _data: usize,
-        _private_data: &FilePrivateData,
+        _private_data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }

@@ -880,7 +880,7 @@ impl IndexNode for MountFSInode {
         &self,
         cmd: u32,
         data: usize,
-        private_data: &FilePrivateData,
+        private_data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         return self.inner_inode.ioctl(cmd, data, private_data);
     }

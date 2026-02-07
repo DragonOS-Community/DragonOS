@@ -236,7 +236,12 @@ impl IndexNode for PerfEventInode {
         Ok(())
     }
 
-    fn ioctl(&self, cmd: u32, data: usize, _private_data: &FilePrivateData) -> Result<usize> {
+    fn ioctl(
+        &self,
+        cmd: u32,
+        data: usize,
+        _private_data: MutexGuard<FilePrivateData>,
+    ) -> Result<usize> {
         let req = PerfEventIoc::from_u32(cmd).ok_or(SystemError::EINVAL)?;
         info!("perf_event_ioctl: request: {:?}, arg: {}", req, data);
         match req {

@@ -50,6 +50,9 @@ static inline int fuse_test_log_enabled(void) {
 #ifndef DT_REG
 #define DT_REG 8
 #endif
+#ifndef DT_LNK
+#define DT_LNK 10
+#endif
 
 /* Keep test buffers off small thread stacks. */
 #define FUSE_TEST_BUF_SIZE (64 * 1024)
@@ -67,6 +70,12 @@ static inline int fuse_test_log_enabled(void) {
 #ifndef FUSE_SETATTR
 #define FUSE_SETATTR 4
 #endif
+#ifndef FUSE_READLINK
+#define FUSE_READLINK 5
+#endif
+#ifndef FUSE_SYMLINK
+#define FUSE_SYMLINK 6
+#endif
 #ifndef FUSE_MKNOD
 #define FUSE_MKNOD 8
 #endif
@@ -81,6 +90,9 @@ static inline int fuse_test_log_enabled(void) {
 #endif
 #ifndef FUSE_RENAME
 #define FUSE_RENAME 12
+#endif
+#ifndef FUSE_LINK
+#define FUSE_LINK 13
 #endif
 #ifndef FUSE_OPEN
 #define FUSE_OPEN 14
@@ -97,6 +109,12 @@ static inline int fuse_test_log_enabled(void) {
 #ifndef FUSE_RELEASE
 #define FUSE_RELEASE 18
 #endif
+#ifndef FUSE_FSYNC
+#define FUSE_FSYNC 20
+#endif
+#ifndef FUSE_FLUSH
+#define FUSE_FLUSH 25
+#endif
 #ifndef FUSE_INIT
 #define FUSE_INIT 26
 #endif
@@ -109,8 +127,26 @@ static inline int fuse_test_log_enabled(void) {
 #ifndef FUSE_RELEASEDIR
 #define FUSE_RELEASEDIR 29
 #endif
+#ifndef FUSE_FSYNCDIR
+#define FUSE_FSYNCDIR 30
+#endif
+#ifndef FUSE_ACCESS
+#define FUSE_ACCESS 34
+#endif
+#ifndef FUSE_CREATE
+#define FUSE_CREATE 35
+#endif
+#ifndef FUSE_INTERRUPT
+#define FUSE_INTERRUPT 36
+#endif
 #ifndef FUSE_DESTROY
 #define FUSE_DESTROY 38
+#endif
+#ifndef FUSE_READDIRPLUS
+#define FUSE_READDIRPLUS 44
+#endif
+#ifndef FUSE_RENAME2
+#define FUSE_RENAME2 45
 #endif
 
 #ifndef FUSE_MIN_READ_BUFFER
@@ -123,6 +159,35 @@ static inline int fuse_test_log_enabled(void) {
 #endif
 #ifndef FUSE_MAX_PAGES
 #define FUSE_MAX_PAGES (1u << 22)
+#endif
+#ifndef FUSE_DO_READDIRPLUS
+#define FUSE_DO_READDIRPLUS (1u << 13)
+#endif
+#ifndef FUSE_READDIRPLUS_AUTO
+#define FUSE_READDIRPLUS_AUTO (1u << 14)
+#endif
+#ifndef FUSE_NO_OPEN_SUPPORT
+#define FUSE_NO_OPEN_SUPPORT (1u << 17)
+#endif
+#ifndef FUSE_NO_OPENDIR_SUPPORT
+#define FUSE_NO_OPENDIR_SUPPORT (1u << 24)
+#endif
+#ifndef FUSE_FSYNC_FDATASYNC
+#define FUSE_FSYNC_FDATASYNC (1u << 0)
+#endif
+
+#ifndef FUSE_NOTIFY_INVAL_INODE
+#define FUSE_NOTIFY_INVAL_INODE 2
+#endif
+
+#ifndef RENAME_NOREPLACE
+#define RENAME_NOREPLACE (1u << 0)
+#endif
+#ifndef RENAME_EXCHANGE
+#define RENAME_EXCHANGE (1u << 1)
+#endif
+#ifndef RENAME_WHITEOUT
+#define RENAME_WHITEOUT (1u << 2)
 #endif
 
 /* setattr valid bits (subset) */
@@ -214,6 +279,10 @@ struct fuse_forget_in {
     uint64_t nlookup;
 };
 
+struct fuse_interrupt_in {
+    uint64_t unique;
+};
+
 struct fuse_getattr_in {
     uint32_t getattr_flags;
     uint32_t dummy;
@@ -229,6 +298,13 @@ struct fuse_attr_out {
 
 struct fuse_open_in {
     uint32_t flags;
+    uint32_t open_flags;
+};
+
+struct fuse_create_in {
+    uint32_t flags;
+    uint32_t mode;
+    uint32_t umask;
     uint32_t open_flags;
 };
 
@@ -287,6 +363,24 @@ struct fuse_release_in {
     uint64_t lock_owner;
 };
 
+struct fuse_flush_in {
+    uint64_t fh;
+    uint32_t unused;
+    uint32_t padding;
+    uint64_t lock_owner;
+};
+
+struct fuse_fsync_in {
+    uint64_t fh;
+    uint32_t fsync_flags;
+    uint32_t padding;
+};
+
+struct fuse_access_in {
+    uint32_t mask;
+    uint32_t padding;
+};
+
 struct fuse_mknod_in {
     uint32_t mode;
     uint32_t rdev;
@@ -301,6 +395,16 @@ struct fuse_mkdir_in {
 
 struct fuse_rename_in {
     uint64_t newdir;
+};
+
+struct fuse_rename2_in {
+    uint64_t newdir;
+    uint32_t flags;
+    uint32_t padding;
+};
+
+struct fuse_link_in {
+    uint64_t oldnodeid;
 };
 
 struct fuse_setattr_in {
@@ -330,8 +434,25 @@ struct fuse_dirent {
     /* char name[]; */
 };
 
+struct fuse_direntplus {
+    struct fuse_entry_out entry_out;
+    struct fuse_dirent dirent;
+    /* char name[]; */
+};
+
+struct fuse_notify_inval_inode_out {
+    uint64_t ino;
+    int64_t off;
+    int64_t len;
+};
+
 static inline size_t fuse_dirent_rec_len(size_t namelen) {
     size_t unaligned = sizeof(struct fuse_dirent) + namelen;
+    return (unaligned + 8 - 1) & ~(size_t)(8 - 1);
+}
+
+static inline size_t fuse_direntplus_rec_len(size_t namelen) {
+    size_t unaligned = sizeof(struct fuse_direntplus) + namelen;
     return (unaligned + 8 - 1) & ~(size_t)(8 - 1);
 }
 
@@ -347,6 +468,7 @@ struct simplefs_node {
     uint64_t ino;
     uint64_t parent;
     int is_dir;
+    int is_symlink;
     uint32_t mode; /* includes type bits */
     char name[SIMPLEFS_NAME_MAX];
     unsigned char data[SIMPLEFS_DATA_MAX];
@@ -370,6 +492,7 @@ static inline void simplefs_init(struct simplefs *fs) {
     fs->nodes[0].ino = 1;
     fs->nodes[0].parent = 1;
     fs->nodes[0].is_dir = 1;
+    fs->nodes[0].is_symlink = 0;
     fs->nodes[0].mode = 0040755;
     strcpy(fs->nodes[0].name, "");
     fs->nodes[0].size = 0;
@@ -380,6 +503,7 @@ static inline void simplefs_init(struct simplefs *fs) {
     fs->nodes[1].ino = 2;
     fs->nodes[1].parent = 1;
     fs->nodes[1].is_dir = 0;
+    fs->nodes[1].is_symlink = 0;
     fs->nodes[1].mode = 0100644;
     strcpy(fs->nodes[1].name, "hello.txt");
     const char *msg = "hello from fuse\n";
@@ -388,6 +512,14 @@ static inline void simplefs_init(struct simplefs *fs) {
 
     fs->next_nodeid = 3;
     fs->next_ino = 3;
+}
+
+static inline int simplefs_mode_is_dir(uint32_t mode) {
+    return (mode & 0170000u) == 0040000u;
+}
+
+static inline int simplefs_mode_is_symlink(uint32_t mode) {
+    return (mode & 0170000u) == 0120000u;
 }
 
 static inline struct simplefs_node *simplefs_find_node(struct simplefs *fs, uint64_t nodeid) {
@@ -442,7 +574,7 @@ static inline void simplefs_fill_attr(const struct simplefs_node *n, struct fuse
     a->size = n->size;
     a->blocks = (n->size + 511) / 512;
     a->mode = n->mode;
-    a->nlink = n->is_dir ? 2 : 1;
+    a->nlink = simplefs_mode_is_dir(n->mode) ? 2 : 1;
     a->uid = getuid();
     a->gid = getgid();
     a->blksize = 4096;
@@ -493,8 +625,108 @@ struct fuse_daemon_args {
     volatile uint32_t *init_in_flags;
     volatile uint32_t *init_in_flags2;
     volatile uint32_t *init_in_max_readahead;
+    volatile uint32_t *access_count;
+    volatile uint32_t *flush_count;
+    volatile uint32_t *fsync_count;
+    volatile uint32_t *fsyncdir_count;
+    volatile uint32_t *create_count;
+    volatile uint32_t *rename2_count;
+    volatile uint32_t *open_count;
+    volatile uint32_t *opendir_count;
+    volatile uint32_t *release_count;
+    volatile uint32_t *releasedir_count;
+    volatile uint32_t *readdirplus_count;
+    volatile uint32_t *interrupt_count;
+    volatile uint64_t *blocked_read_unique;
+    volatile uint64_t *last_interrupt_target;
+    uint32_t access_deny_mask;
+    uint32_t init_out_flags_override;
+    int force_open_enosys;
+    int force_opendir_enosys;
+    int block_read_until_interrupt;
     struct simplefs fs;
 };
+
+static inline int simplefs_node_is_dir(const struct simplefs_node *n) {
+    return n && (n->is_dir || simplefs_mode_is_dir(n->mode));
+}
+
+static inline int simplefs_node_is_symlink(const struct simplefs_node *n) {
+    return n && (n->is_symlink || simplefs_mode_is_symlink(n->mode));
+}
+
+static inline uint32_t simplefs_dirent_type(const struct simplefs_node *n) {
+    if (simplefs_node_is_dir(n)) {
+        return DT_DIR;
+    }
+    if (simplefs_node_is_symlink(n)) {
+        return DT_LNK;
+    }
+    return DT_REG;
+}
+
+static inline int simplefs_fill_entry_reply(struct fuse_daemon_args *a, const struct fuse_in_header *h,
+                                            const struct simplefs_node *node) {
+    struct fuse_entry_out out;
+    memset(&out, 0, sizeof(out));
+    out.nodeid = node->nodeid;
+    simplefs_fill_attr(node, &out.attr);
+    return fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out));
+}
+
+static inline int simplefs_parse_two_names(const unsigned char *payload, size_t payload_len,
+                                           size_t fixed_len, const char **oldname_out,
+                                           const char **newname_out) {
+    if (payload_len < fixed_len + 3) {
+        return -1;
+    }
+    const char *names = (const char *)(payload + fixed_len);
+    size_t names_len = payload_len - fixed_len;
+    const char *oldname = names;
+    size_t oldlen = strnlen(oldname, names_len);
+    if (oldlen == names_len) {
+        return -1;
+    }
+    const char *newname = names + oldlen + 1;
+    size_t remain = names_len - oldlen - 1;
+    if (remain == 0) {
+        return -1;
+    }
+    size_t newlen = strnlen(newname, remain);
+    if (newlen == remain) {
+        return -1;
+    }
+    *oldname_out = oldname;
+    *newname_out = newname;
+    return 0;
+}
+
+static inline int simplefs_do_rename(struct fuse_daemon_args *a, const struct fuse_in_header *h,
+                                     uint64_t newdir, uint32_t flags, const char *oldname,
+                                     const char *newname) {
+    if ((flags & (RENAME_EXCHANGE | RENAME_WHITEOUT)) != 0) {
+        return fuse_write_reply(a->fd, h->unique, -EINVAL, NULL, 0);
+    }
+    struct simplefs_node *src = simplefs_find_child(&a->fs, h->nodeid, oldname);
+    if (!src) {
+        return fuse_write_reply(a->fd, h->unique, -ENOENT, NULL, 0);
+    }
+    struct simplefs_node *dst_parent = simplefs_find_node(&a->fs, newdir);
+    if (!dst_parent || !simplefs_node_is_dir(dst_parent)) {
+        return fuse_write_reply(a->fd, h->unique, -ENOTDIR, NULL, 0);
+    }
+    struct simplefs_node *dst = simplefs_find_child(&a->fs, newdir, newname);
+    if (dst) {
+        if (flags & RENAME_NOREPLACE) {
+            return fuse_write_reply(a->fd, h->unique, -EEXIST, NULL, 0);
+        }
+        return fuse_write_reply(a->fd, h->unique, -EEXIST, NULL, 0);
+    }
+    src->parent = newdir;
+    strncpy(src->name, newname, sizeof(src->name) - 1);
+    src->name[sizeof(src->name) - 1] = '\0';
+    return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
+}
 
 static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned char *req, size_t n) {
     if (n < sizeof(struct fuse_in_header)) {
@@ -524,7 +756,11 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         memset(&out, 0, sizeof(out));
         out.major = 7;
         out.minor = 39;
-        out.flags = FUSE_INIT_EXT | FUSE_MAX_PAGES;
+        uint32_t init_flags = a->init_out_flags_override;
+        if (init_flags == 0) {
+            init_flags = FUSE_INIT_EXT | FUSE_MAX_PAGES;
+        }
+        out.flags = init_flags;
         out.flags2 = 0;
         out.max_write = 4096;
         out.max_pages = 32;
@@ -550,7 +786,7 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
             return -1;
         }
         struct simplefs_node *parent = simplefs_find_node(&a->fs, h->nodeid);
-        if (!parent || !parent->is_dir) {
+        if (!parent || !simplefs_node_is_dir(parent)) {
             return fuse_write_reply(a->fd, h->unique, -ENOENT, NULL, 0);
         }
         struct simplefs_node *child = simplefs_find_child(&a->fs, h->nodeid, name);
@@ -580,10 +816,22 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (!node) {
             return fuse_write_reply(a->fd, h->unique, -ENOENT, NULL, 0);
         }
-        if (h->opcode == FUSE_OPENDIR && !node->is_dir) {
+        if (h->opcode == FUSE_OPEN && a->open_count) {
+            (*a->open_count)++;
+        }
+        if (h->opcode == FUSE_OPENDIR && a->opendir_count) {
+            (*a->opendir_count)++;
+        }
+        if (h->opcode == FUSE_OPEN && a->force_open_enosys) {
+            return fuse_write_reply(a->fd, h->unique, -ENOSYS, NULL, 0);
+        }
+        if (h->opcode == FUSE_OPENDIR && a->force_opendir_enosys) {
+            return fuse_write_reply(a->fd, h->unique, -ENOSYS, NULL, 0);
+        }
+        if (h->opcode == FUSE_OPENDIR && !simplefs_node_is_dir(node)) {
             return fuse_write_reply(a->fd, h->unique, -ENOTDIR, NULL, 0);
         }
-        if (h->opcode == FUSE_OPEN && node->is_dir) {
+        if (h->opcode == FUSE_OPEN && simplefs_node_is_dir(node)) {
             return fuse_write_reply(a->fd, h->unique, -EISDIR, NULL, 0);
         }
         struct fuse_open_out out;
@@ -591,14 +839,30 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         out.fh = node->nodeid;
         return fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out));
     }
+    case FUSE_READLINK: {
+        struct simplefs_node *node = simplefs_find_node(&a->fs, h->nodeid);
+        if (!node) {
+            return fuse_write_reply(a->fd, h->unique, -ENOENT, NULL, 0);
+        }
+        if (!simplefs_node_is_symlink(node)) {
+            return fuse_write_reply(a->fd, h->unique, -EINVAL, NULL, 0);
+        }
+        return fuse_write_reply(a->fd, h->unique, 0, node->data, node->size);
+    }
     case FUSE_READ: {
         if (payload_len < sizeof(struct fuse_read_in)) {
             return -1;
         }
         const struct fuse_read_in *in = (const struct fuse_read_in *)payload;
         struct simplefs_node *node = simplefs_find_node(&a->fs, h->nodeid);
-        if (!node || node->is_dir) {
+        if (!node || simplefs_node_is_dir(node) || simplefs_node_is_symlink(node)) {
             return fuse_write_reply(a->fd, h->unique, -EINVAL, NULL, 0);
+        }
+        if (a->block_read_until_interrupt > 0) {
+            if (a->blocked_read_unique && *a->blocked_read_unique == 0) {
+                *a->blocked_read_unique = h->unique;
+            }
+            usleep((useconds_t)a->block_read_until_interrupt * 1000);
         }
         if (in->offset >= node->size) {
             return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
@@ -610,14 +874,19 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         }
         return fuse_write_reply(a->fd, h->unique, 0, node->data + in->offset, to_copy);
     }
-    case FUSE_READDIR: {
+    case FUSE_READDIR:
+    case FUSE_READDIRPLUS: {
         if (payload_len < sizeof(struct fuse_read_in)) {
             return -1;
         }
         const struct fuse_read_in *in = (const struct fuse_read_in *)payload;
         (void)in;
+        int is_plus = (h->opcode == FUSE_READDIRPLUS);
+        if (is_plus && a->readdirplus_count) {
+            (*a->readdirplus_count)++;
+        }
         struct simplefs_node *node = simplefs_find_node(&a->fs, h->nodeid);
-        if (!node || !node->is_dir) {
+        if (!node || !simplefs_node_is_dir(node)) {
             return fuse_write_reply(a->fd, h->unique, -ENOTDIR, NULL, 0);
         }
 
@@ -633,17 +902,30 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         for (; idx < 2; idx++) {
             const char *nm = fixed_names[idx];
             size_t nmlen = strlen(nm);
-            size_t reclen = fuse_dirent_rec_len(nmlen);
+            size_t reclen = is_plus ? fuse_direntplus_rec_len(nmlen) : fuse_dirent_rec_len(nmlen);
             if (outlen + reclen > FUSE_TEST_BUF_SIZE)
                 break;
-            struct fuse_dirent de;
-            memset(&de, 0, sizeof(de));
-            de.ino = 1;
-            de.off = idx + 1;
-            de.namelen = (uint32_t)nmlen;
-            de.type = DT_DIR;
-            memcpy(outbuf + outlen, &de, sizeof(de));
-            memcpy(outbuf + outlen + sizeof(de), nm, nmlen);
+            if (is_plus) {
+                struct fuse_direntplus dp;
+                memset(&dp, 0, sizeof(dp));
+                dp.entry_out.nodeid = 1;
+                simplefs_fill_attr(&a->fs.nodes[0], &dp.entry_out.attr);
+                dp.dirent.ino = 1;
+                dp.dirent.off = idx + 1;
+                dp.dirent.namelen = (uint32_t)nmlen;
+                dp.dirent.type = DT_DIR;
+                memcpy(outbuf + outlen, &dp, sizeof(dp));
+                memcpy(outbuf + outlen + sizeof(dp), nm, nmlen);
+            } else {
+                struct fuse_dirent de;
+                memset(&de, 0, sizeof(de));
+                de.ino = 1;
+                de.off = idx + 1;
+                de.namelen = (uint32_t)nmlen;
+                de.type = DT_DIR;
+                memcpy(outbuf + outlen, &de, sizeof(de));
+                memcpy(outbuf + outlen + sizeof(de), nm, nmlen);
+            }
             outlen += reclen;
         }
 
@@ -664,17 +946,30 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
             }
 
             size_t nmlen = strlen(c->name);
-            size_t reclen = fuse_dirent_rec_len(nmlen);
+            size_t reclen = is_plus ? fuse_direntplus_rec_len(nmlen) : fuse_dirent_rec_len(nmlen);
             if (outlen + reclen > FUSE_TEST_BUF_SIZE)
                 break;
-            struct fuse_dirent de;
-            memset(&de, 0, sizeof(de));
-            de.ino = c->ino;
-            de.off = child_base + 1;
-            de.namelen = (uint32_t)nmlen;
-            de.type = c->is_dir ? DT_DIR : DT_REG;
-            memcpy(outbuf + outlen, &de, sizeof(de));
-            memcpy(outbuf + outlen + sizeof(de), c->name, nmlen);
+            if (is_plus) {
+                struct fuse_direntplus dp;
+                memset(&dp, 0, sizeof(dp));
+                dp.entry_out.nodeid = c->nodeid;
+                simplefs_fill_attr(c, &dp.entry_out.attr);
+                dp.dirent.ino = c->ino;
+                dp.dirent.off = child_base + 1;
+                dp.dirent.namelen = (uint32_t)nmlen;
+                dp.dirent.type = simplefs_dirent_type(c);
+                memcpy(outbuf + outlen, &dp, sizeof(dp));
+                memcpy(outbuf + outlen + sizeof(dp), c->name, nmlen);
+            } else {
+                struct fuse_dirent de;
+                memset(&de, 0, sizeof(de));
+                de.ino = c->ino;
+                de.off = child_base + 1;
+                de.namelen = (uint32_t)nmlen;
+                de.type = simplefs_dirent_type(c);
+                memcpy(outbuf + outlen, &de, sizeof(de));
+                memcpy(outbuf + outlen + sizeof(de), c->name, nmlen);
+            }
             outlen += reclen;
 
             child_base++;
@@ -711,8 +1006,56 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         return fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out));
     }
     case FUSE_RELEASE:
-    case FUSE_RELEASEDIR:
+        if (a->release_count) {
+            (*a->release_count)++;
+        }
         return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
+    case FUSE_RELEASEDIR:
+        if (a->releasedir_count) {
+            (*a->releasedir_count)++;
+        }
+        return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
+    case FUSE_INTERRUPT: {
+        if (payload_len < sizeof(struct fuse_interrupt_in)) {
+            return -1;
+        }
+        const struct fuse_interrupt_in *in = (const struct fuse_interrupt_in *)payload;
+        if (a->interrupt_count) {
+            (*a->interrupt_count)++;
+        }
+        if (a->last_interrupt_target) {
+            *a->last_interrupt_target = in->unique;
+        }
+        return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
+    }
+    case FUSE_FLUSH:
+        if (a->flush_count) {
+            (*a->flush_count)++;
+        }
+        return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
+    case FUSE_FSYNC:
+        if (a->fsync_count) {
+            (*a->fsync_count)++;
+        }
+        return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
+    case FUSE_FSYNCDIR:
+        if (a->fsyncdir_count) {
+            (*a->fsyncdir_count)++;
+        }
+        return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
+    case FUSE_ACCESS: {
+        if (payload_len < sizeof(struct fuse_access_in)) {
+            return -1;
+        }
+        const struct fuse_access_in *in = (const struct fuse_access_in *)payload;
+        if (a->access_count) {
+            (*a->access_count)++;
+        }
+        if ((in->mask & a->access_deny_mask) != 0) {
+            return fuse_write_reply(a->fd, h->unique, -EACCES, NULL, 0);
+        }
+        return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
+    }
     case FUSE_DESTROY:
         if (a->destroy_count)
             (*a->destroy_count)++;
@@ -733,7 +1076,7 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
             return -1;
         }
         struct simplefs_node *node = simplefs_find_node(&a->fs, h->nodeid);
-        if (!node || node->is_dir) {
+        if (!node || simplefs_node_is_dir(node) || simplefs_node_is_symlink(node)) {
             return fuse_write_reply(a->fd, h->unique, -EINVAL, NULL, 0);
         }
         if (in->offset >= SIMPLEFS_DATA_MAX) {
@@ -751,6 +1094,132 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         memset(&out, 0, sizeof(out));
         out.size = (uint32_t)to_copy;
         return fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out));
+    }
+    case FUSE_CREATE: {
+        if (!a->enable_write_ops) {
+            return fuse_write_reply(a->fd, h->unique, -ENOSYS, NULL, 0);
+        }
+        if (payload_len < sizeof(struct fuse_create_in) + 1) {
+            return -1;
+        }
+        const struct fuse_create_in *in = (const struct fuse_create_in *)payload;
+        const char *name = (const char *)(payload + sizeof(*in));
+        if (name[payload_len - sizeof(*in) - 1] != '\0') {
+            return -1;
+        }
+        if (a->create_count) {
+            (*a->create_count)++;
+        }
+        struct simplefs_node *p = simplefs_find_node(&a->fs, h->nodeid);
+        if (!p || !simplefs_node_is_dir(p)) {
+            return fuse_write_reply(a->fd, h->unique, -ENOTDIR, NULL, 0);
+        }
+        if (simplefs_find_child(&a->fs, h->nodeid, name)) {
+            return fuse_write_reply(a->fd, h->unique, -EEXIST, NULL, 0);
+        }
+        struct simplefs_node *nnode = simplefs_alloc(&a->fs);
+        if (!nnode) {
+            return fuse_write_reply(a->fd, h->unique, -ENOSPC, NULL, 0);
+        }
+        nnode->parent = h->nodeid;
+        nnode->is_dir = 0;
+        nnode->is_symlink = 0;
+        nnode->mode = in->mode;
+        strncpy(nnode->name, name, sizeof(nnode->name) - 1);
+        nnode->name[sizeof(nnode->name) - 1] = '\0';
+        nnode->size = 0;
+
+        struct {
+            struct fuse_entry_out entry;
+            struct fuse_open_out open_out;
+        } out;
+        memset(&out, 0, sizeof(out));
+        out.entry.nodeid = nnode->nodeid;
+        simplefs_fill_attr(nnode, &out.entry.attr);
+        out.open_out.fh = nnode->nodeid;
+        return fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out));
+    }
+    case FUSE_SYMLINK: {
+        if (!a->enable_write_ops) {
+            return fuse_write_reply(a->fd, h->unique, -ENOSYS, NULL, 0);
+        }
+        const char *target = (const char *)payload;
+        size_t target_len = strnlen(target, payload_len);
+        if (target_len == payload_len) {
+            return -1;
+        }
+        const char *name = target + target_len + 1;
+        size_t remain = payload_len - target_len - 1;
+        if (remain == 0) {
+            return -1;
+        }
+        size_t name_len = strnlen(name, remain);
+        if (name_len == remain) {
+            return -1;
+        }
+        struct simplefs_node *p = simplefs_find_node(&a->fs, h->nodeid);
+        if (!p || !simplefs_node_is_dir(p)) {
+            return fuse_write_reply(a->fd, h->unique, -ENOTDIR, NULL, 0);
+        }
+        if (simplefs_find_child(&a->fs, h->nodeid, name)) {
+            return fuse_write_reply(a->fd, h->unique, -EEXIST, NULL, 0);
+        }
+        struct simplefs_node *nnode = simplefs_alloc(&a->fs);
+        if (!nnode) {
+            return fuse_write_reply(a->fd, h->unique, -ENOSPC, NULL, 0);
+        }
+        nnode->parent = h->nodeid;
+        nnode->is_dir = 0;
+        nnode->is_symlink = 1;
+        nnode->mode = 0120777;
+        strncpy(nnode->name, name, sizeof(nnode->name) - 1);
+        nnode->name[sizeof(nnode->name) - 1] = '\0';
+        nnode->size = (target_len < SIMPLEFS_DATA_MAX) ? target_len : SIMPLEFS_DATA_MAX;
+        memcpy(nnode->data, target, nnode->size);
+        return simplefs_fill_entry_reply(a, h, nnode);
+    }
+    case FUSE_LINK: {
+        if (!a->enable_write_ops) {
+            return fuse_write_reply(a->fd, h->unique, -ENOSYS, NULL, 0);
+        }
+        if (payload_len < sizeof(struct fuse_link_in) + 1) {
+            return -1;
+        }
+        const struct fuse_link_in *in = (const struct fuse_link_in *)payload;
+        const char *name = (const char *)(payload + sizeof(*in));
+        if (name[payload_len - sizeof(*in) - 1] != '\0') {
+            return -1;
+        }
+        struct simplefs_node *src = simplefs_find_node(&a->fs, in->oldnodeid);
+        if (!src) {
+            return fuse_write_reply(a->fd, h->unique, -ENOENT, NULL, 0);
+        }
+        if (simplefs_node_is_dir(src)) {
+            return fuse_write_reply(a->fd, h->unique, -EPERM, NULL, 0);
+        }
+        struct simplefs_node *dst_parent = simplefs_find_node(&a->fs, h->nodeid);
+        if (!dst_parent || !simplefs_node_is_dir(dst_parent)) {
+            return fuse_write_reply(a->fd, h->unique, -ENOTDIR, NULL, 0);
+        }
+        if (simplefs_find_child(&a->fs, h->nodeid, name)) {
+            return fuse_write_reply(a->fd, h->unique, -EEXIST, NULL, 0);
+        }
+        struct simplefs_node *nnode = simplefs_alloc(&a->fs);
+        if (!nnode) {
+            return fuse_write_reply(a->fd, h->unique, -ENOSPC, NULL, 0);
+        }
+        nnode->parent = h->nodeid;
+        nnode->is_dir = 0;
+        nnode->is_symlink = src->is_symlink;
+        nnode->mode = src->mode;
+        strncpy(nnode->name, name, sizeof(nnode->name) - 1);
+        nnode->name[sizeof(nnode->name) - 1] = '\0';
+        nnode->size = src->size;
+        if (nnode->size > SIMPLEFS_DATA_MAX) {
+            nnode->size = SIMPLEFS_DATA_MAX;
+        }
+        memcpy(nnode->data, src->data, nnode->size);
+        return simplefs_fill_entry_reply(a, h, nnode);
     }
     case FUSE_MKDIR:
     case FUSE_MKNOD: {
@@ -781,7 +1250,7 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
             return fuse_write_reply(a->fd, h->unique, -EEXIST, NULL, 0);
         }
         struct simplefs_node *p = simplefs_find_node(&a->fs, h->nodeid);
-        if (!p || !p->is_dir) {
+        if (!p || !simplefs_node_is_dir(p)) {
             return fuse_write_reply(a->fd, h->unique, -ENOTDIR, NULL, 0);
         }
         struct simplefs_node *nnode = simplefs_alloc(&a->fs);
@@ -790,15 +1259,13 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         }
         nnode->parent = h->nodeid;
         nnode->is_dir = is_dir;
+        nnode->is_symlink = 0;
         nnode->mode = mode;
         strncpy(nnode->name, name, sizeof(nnode->name) - 1);
+        nnode->name[sizeof(nnode->name) - 1] = '\0';
         nnode->size = 0;
 
-        struct fuse_entry_out out;
-        memset(&out, 0, sizeof(out));
-        out.nodeid = nnode->nodeid;
-        simplefs_fill_attr(nnode, &out.attr);
-        return fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out));
+        return simplefs_fill_entry_reply(a, h, nnode);
     }
     case FUSE_UNLINK:
     case FUSE_RMDIR: {
@@ -814,14 +1281,14 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
             return fuse_write_reply(a->fd, h->unique, -ENOENT, NULL, 0);
         }
         if (h->opcode == FUSE_RMDIR) {
-            if (!child->is_dir) {
+            if (!simplefs_node_is_dir(child)) {
                 return fuse_write_reply(a->fd, h->unique, -ENOTDIR, NULL, 0);
             }
             if (simplefs_has_children(&a->fs, child->nodeid)) {
                 return fuse_write_reply(a->fd, h->unique, -ENOTEMPTY, NULL, 0);
             }
         } else {
-            if (child->is_dir) {
+            if (simplefs_node_is_dir(child)) {
                 return fuse_write_reply(a->fd, h->unique, -EISDIR, NULL, 0);
             }
         }
@@ -832,40 +1299,28 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (!a->enable_write_ops) {
             return fuse_write_reply(a->fd, h->unique, -ENOSYS, NULL, 0);
         }
-        if (payload_len < sizeof(struct fuse_rename_in) + 3) {
-            return -1;
-        }
         const struct fuse_rename_in *in = (const struct fuse_rename_in *)payload;
-        const char *names = (const char *)(payload + sizeof(*in));
-        size_t names_len = payload_len - sizeof(*in);
-
-        /* oldname\0newname\0 */
-        const char *oldname = names;
-        size_t oldlen = strnlen(oldname, names_len);
-        if (oldlen == names_len)
+        const char *oldname = NULL;
+        const char *newname = NULL;
+        if (simplefs_parse_two_names(payload, payload_len, sizeof(*in), &oldname, &newname) != 0) {
             return -1;
-        const char *newname = names + oldlen + 1;
-        size_t remain = names_len - oldlen - 1;
-        if (remain == 0)
+        }
+        return simplefs_do_rename(a, h, in->newdir, 0, oldname, newname);
+    }
+    case FUSE_RENAME2: {
+        if (!a->enable_write_ops) {
+            return fuse_write_reply(a->fd, h->unique, -ENOSYS, NULL, 0);
+        }
+        const struct fuse_rename2_in *in = (const struct fuse_rename2_in *)payload;
+        const char *oldname = NULL;
+        const char *newname = NULL;
+        if (simplefs_parse_two_names(payload, payload_len, sizeof(*in), &oldname, &newname) != 0) {
             return -1;
-        size_t newlen = strnlen(newname, remain);
-        if (newlen == remain)
-            return -1;
-
-        struct simplefs_node *src = simplefs_find_child(&a->fs, h->nodeid, oldname);
-        if (!src) {
-            return fuse_write_reply(a->fd, h->unique, -ENOENT, NULL, 0);
         }
-        if (simplefs_find_child(&a->fs, in->newdir, newname)) {
-            return fuse_write_reply(a->fd, h->unique, -EEXIST, NULL, 0);
+        if (a->rename2_count) {
+            (*a->rename2_count)++;
         }
-        struct simplefs_node *dst_parent = simplefs_find_node(&a->fs, in->newdir);
-        if (!dst_parent || !dst_parent->is_dir) {
-            return fuse_write_reply(a->fd, h->unique, -ENOTDIR, NULL, 0);
-        }
-        src->parent = in->newdir;
-        strncpy(src->name, newname, sizeof(src->name) - 1);
-        return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
+        return simplefs_do_rename(a, h, in->newdir, in->flags, oldname, newname);
     }
     case FUSE_SETATTR: {
         if (!a->enable_write_ops) {
@@ -878,6 +1333,9 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         struct simplefs_node *node = simplefs_find_node(&a->fs, h->nodeid);
         if (!node) {
             return fuse_write_reply(a->fd, h->unique, -ENOENT, NULL, 0);
+        }
+        if (simplefs_node_is_dir(node) || simplefs_node_is_symlink(node)) {
+            return fuse_write_reply(a->fd, h->unique, -EINVAL, NULL, 0);
         }
         if (in->valid & FATTR_SIZE) {
             if (in->size > SIMPLEFS_DATA_MAX) {

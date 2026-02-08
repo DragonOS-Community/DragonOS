@@ -173,7 +173,10 @@ impl IndexNode for LockedFuseDevInode {
         let conn = conn_any
             .downcast::<FuseConn>()
             .map_err(|_| SystemError::EINVAL)?;
-        conn.read_request(nonblock, &mut buf[..len])
+        match conn.read_request(nonblock, &mut buf[..len]) {
+            Err(SystemError::ENOTCONN) => Err(SystemError::ENODEV),
+            x => x,
+        }
     }
 
     fn write_at(
@@ -197,7 +200,10 @@ impl IndexNode for LockedFuseDevInode {
         let conn = conn_any
             .downcast::<FuseConn>()
             .map_err(|_| SystemError::EINVAL)?;
-        conn.write_reply(&buf[..len])
+        match conn.write_reply(&buf[..len]) {
+            Err(SystemError::ENOTCONN) => Err(SystemError::ENOENT),
+            x => x,
+        }
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {

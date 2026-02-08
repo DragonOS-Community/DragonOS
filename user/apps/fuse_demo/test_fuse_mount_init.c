@@ -84,8 +84,8 @@ static int do_init_handshake(int fd) {
     init_out.minor = 39;
     init_out.flags = FUSE_INIT_EXT | FUSE_MAX_PAGES;
     init_out.flags2 = 0;
-    init_out.max_write = 4096;
-    init_out.max_pages = 32;
+    init_out.max_write = 1024 * 1024;
+    init_out.max_pages = 256;
 
     unsigned char reply[sizeof(out_hdr) + sizeof(init_out)];
     memcpy(reply, &out_hdr, sizeof(out_hdr));

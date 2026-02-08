@@ -543,6 +543,15 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
+    /// @brief 在当前目录下创建符号链接（name -> target）
+    fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let inode = self.create_with_data(name, FileType::SymLink, InodeMode::S_IRWXUGO, 0)?;
+        let bytes = target.as_bytes();
+        let len = bytes.len();
+        inode.write_at(0, len, bytes, Mutex::new(FilePrivateData::Unused).lock())?;
+        Ok(inode)
+    }
+
     /// @brief 在当前目录下，创建一个名为Name的硬链接，指向另一个IndexNode
     ///
     /// @param name 硬链接的名称
@@ -589,6 +598,11 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
         return Err(SystemError::ENOSYS);
+    }
+
+    /// @brief 专用于 remote 权限模型下 access(2) 的检查
+    fn check_access(&self, _mask: PermissionMask) -> Result<(), SystemError> {
+        Err(SystemError::ENOSYS)
     }
 
     /// @brief 寻找一个名为Name的inode
@@ -762,6 +776,21 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn sync(&self) -> Result<(), SystemError> {
         // todo：完善元数据的同步
         self.datasync()
+    }
+
+    /// @brief 基于打开文件上下文执行同步（可使用文件句柄等私有信息）
+    ///
+    /// 默认实现回退到 inode 级 `sync/datasync`。
+    fn sync_file(
+        &self,
+        datasync: bool,
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        if datasync {
+            self.datasync()
+        } else {
+            self.sync()
+        }
     }
 
     /// @brief 仅同步数据到磁盘（不包括元数据）
@@ -1522,7 +1551,13 @@ pub fn produce_fs(
     data: Option<&str>,
     source: &str,
 ) -> Result<Arc<dyn FileSystem>, SystemError> {
-    match FSMAKER.iter().find(|&m| m.name == filesystem) {
+    let canonical_filesystem = if filesystem.starts_with("fuse.") {
+        "fuse"
+    } else {
+        filesystem
+    };
+
+    match FSMAKER.iter().find(|&m| m.name == canonical_filesystem) {
         Some(maker) => {
             let mount_data = (maker.builder)(data, source)?;
             let mount_data_ref = mount_data.as_ref().map(|arc| arc.as_ref());

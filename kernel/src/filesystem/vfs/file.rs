@@ -153,6 +153,7 @@ pub struct FuseFilePrivateData {
     pub conn: Arc<dyn Any + Send + Sync>,
     pub fh: u64,
     pub open_flags: u32,
+    pub no_open: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +161,7 @@ pub struct FuseDirPrivateData {
     pub conn: Arc<dyn Any + Send + Sync>,
     pub fh: u64,
     pub open_flags: u32,
+    pub no_open: bool,
 }
 
 impl Default for FilePrivateData {
@@ -512,10 +514,10 @@ impl File {
         if need_data_sync || inode_sync {
             if need_metadata_sync || inode_sync {
                 // O_SYNC 或 S_SYNC: 完整同步（数据 + 元数据）
-                self.inode.sync()?;
+                self.inode.sync_file(false, self.private_data.lock())?;
             } else {
                 // O_DSYNC: 仅数据同步
-                self.inode.datasync()?;
+                self.inode.sync_file(true, self.private_data.lock())?;
             }
         }
         Ok(())

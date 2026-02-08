@@ -8,7 +8,7 @@ use super::{
     syscall::{OpenHow, OpenHowResolve},
     utils::{rsplit_path, should_remove_sgid_on_chown, user_path_at},
     vcore::{check_parent_dir_permission_inode, resolve_parent_inode},
-    FileType, IndexNode, InodeMode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    FileType, FsPermissionPolicy, IndexNode, InodeMode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 use crate::{filesystem::vfs::syscall::UtimensFlags, process::cred::Kgid};
 use crate::{
@@ -67,9 +67,34 @@ pub(super) fn do_faccessat(
     let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
 
     // 如果找不到文件，则返回错误码ENOENT
-    let _inode = inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    let inode = inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    if mode.bits() == 0 {
+        return Ok(0);
+    }
 
-    // todo: 接着完善（可以借鉴linux 6.1.9的do_faccessat）
+    let mut mask = PermissionMask::empty();
+    if mode.contains(InodeMode::S_IROTH) {
+        mask |= PermissionMask::MAY_READ;
+    }
+    if mode.contains(InodeMode::S_IWOTH) {
+        mask |= PermissionMask::MAY_WRITE;
+    }
+    if mode.contains(InodeMode::S_IXOTH) {
+        mask |= PermissionMask::MAY_EXEC;
+    }
+
+    let metadata = inode.metadata()?;
+    match inode.fs().permission_policy() {
+        FsPermissionPolicy::Dac => {
+            super::permission::check_inode_permission(&inode, &metadata, mask)?;
+        }
+        FsPermissionPolicy::Remote => match inode.check_access(mask) {
+            Ok(()) => {}
+            Err(SystemError::ENOSYS) => {}
+            Err(e) => return Err(e),
+        },
+    }
+
     return Ok(0);
 }
 

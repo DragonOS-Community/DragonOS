@@ -657,6 +657,14 @@ impl IndexNode for MountFSInode {
         return self.inner_inode.sync();
     }
 
+    fn sync_file(
+        &self,
+        datasync: bool,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        self.inner_inode.sync_file(datasync, data)
+    }
+
     fn fadvise(
         &self,
         file: &Arc<super::file::File>,
@@ -796,6 +804,15 @@ impl IndexNode for MountFSInode {
         return self.inner_inode.link(name, &other_inner);
     }
 
+    fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let inner_inode = self.inner_inode.symlink(name, target)?;
+        Ok(Arc::new_cyclic(|self_ref| MountFSInode {
+            inner_inode,
+            mount_fs: self.mount_fs.clone(),
+            self_ref: self_ref.clone(),
+        }))
+    }
+
     /// @brief 在挂载文件系统中删除文件/文件夹
     #[inline]
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
@@ -846,6 +863,13 @@ impl IndexNode for MountFSInode {
         return self
             .inner_inode
             .move_to(old_name, &target_inner, new_name, flags);
+    }
+
+    fn check_access(
+        &self,
+        mask: crate::filesystem::vfs::permission::PermissionMask,
+    ) -> Result<(), SystemError> {
+        self.inner_inode.check_access(mask)
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {

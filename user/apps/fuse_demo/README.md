@@ -77,6 +77,10 @@ fuse_demo /mnt/fuse --threads 4
 - `test_fuse_clone`：`FUSE_DEV_IOC_CLONE` 基础路径
 - `test_fuse_permissions`：`allow_other/default_permissions` 语义
 - `test_fuse_p1_lifecycle`：`FORGET/DESTROY` 生命周期语义
+- `test_fuse_p2_ops`：`ACCESS/CREATE/SYMLINK/READLINK/LINK/RENAME2/FLUSH/FSYNC/FSYNCDIR`
+- `test_fuse_p3_interrupt`：信号中断触发 `FUSE_INTERRUPT` 语义
+- `test_fuse_p3_noopen_readdirplus_notify`：`NO_OPEN/NO_OPENDIR/READDIRPLUS/notify(unique=0)`
+- `test_fuse_p4_subtype_mount`：`mount(..., "fuse.<subtype>", ...)` 兼容路径
 
 ## 权限语义备注（对应 Phase E）
 

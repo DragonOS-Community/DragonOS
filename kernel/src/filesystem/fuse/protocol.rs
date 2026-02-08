@@ -19,21 +19,32 @@ pub const FUSE_LOOKUP: u32 = 1;
 pub const FUSE_FORGET: u32 = 2; // no reply
 pub const FUSE_GETATTR: u32 = 3;
 pub const FUSE_SETATTR: u32 = 4;
+pub const FUSE_READLINK: u32 = 5;
+pub const FUSE_SYMLINK: u32 = 6;
 pub const FUSE_MKNOD: u32 = 8;
 pub const FUSE_MKDIR: u32 = 9;
 pub const FUSE_UNLINK: u32 = 10;
 pub const FUSE_RMDIR: u32 = 11;
 pub const FUSE_RENAME: u32 = 12;
+pub const FUSE_LINK: u32 = 13;
 pub const FUSE_OPEN: u32 = 14;
 pub const FUSE_READ: u32 = 15;
 pub const FUSE_WRITE: u32 = 16;
 pub const FUSE_STATFS: u32 = 17;
 pub const FUSE_RELEASE: u32 = 18;
+pub const FUSE_FSYNC: u32 = 20;
+pub const FUSE_FLUSH: u32 = 25;
 pub const FUSE_INIT: u32 = 26;
 pub const FUSE_OPENDIR: u32 = 27;
 pub const FUSE_READDIR: u32 = 28;
 pub const FUSE_RELEASEDIR: u32 = 29;
+pub const FUSE_FSYNCDIR: u32 = 30;
+pub const FUSE_ACCESS: u32 = 34;
+pub const FUSE_CREATE: u32 = 35;
+pub const FUSE_INTERRUPT: u32 = 36;
 pub const FUSE_DESTROY: u32 = 38; // no reply
+pub const FUSE_READDIRPLUS: u32 = 44;
+pub const FUSE_RENAME2: u32 = 45;
 
 // INIT flags (subset)
 pub const FUSE_ASYNC_READ: u64 = 1 << 0;
@@ -43,6 +54,8 @@ pub const FUSE_EXPORT_SUPPORT: u64 = 1 << 4;
 pub const FUSE_BIG_WRITES: u64 = 1 << 5;
 pub const FUSE_DONT_MASK: u64 = 1 << 6;
 pub const FUSE_AUTO_INVAL_DATA: u64 = 1 << 12;
+pub const FUSE_DO_READDIRPLUS: u64 = 1 << 13;
+pub const FUSE_READDIRPLUS_AUTO: u64 = 1 << 14;
 pub const FUSE_ASYNC_DIO: u64 = 1 << 15;
 pub const FUSE_WRITEBACK_CACHE: u64 = 1 << 16;
 pub const FUSE_NO_OPEN_SUPPORT: u64 = 1 << 17;
@@ -69,6 +82,14 @@ pub const FATTR_ATIME_NOW: u32 = 1 << 7;
 #[allow(dead_code)]
 pub const FATTR_MTIME_NOW: u32 = 1 << 8;
 pub const FATTR_CTIME: u32 = 1 << 10;
+
+pub const FUSE_FSYNC_FDATASYNC: u32 = 1 << 0;
+pub const FUSE_NOTIFY_POLL: i32 = 1;
+pub const FUSE_NOTIFY_INVAL_INODE: i32 = 2;
+pub const FUSE_NOTIFY_INVAL_ENTRY: i32 = 3;
+pub const FUSE_NOTIFY_STORE: i32 = 4;
+pub const FUSE_NOTIFY_RETRIEVE: i32 = 5;
+pub const FUSE_NOTIFY_DELETE: i32 = 6;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -157,6 +178,12 @@ pub struct FuseEntryOut {
 #[derive(Debug, Clone, Copy)]
 pub struct FuseForgetIn {
     pub nlookup: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseInterruptIn {
+    pub unique: u64,
 }
 
 #[repr(C)]
@@ -276,6 +303,20 @@ pub struct FuseRenameIn {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
+pub struct FuseRename2In {
+    pub newdir: u64,
+    pub flags: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseLinkIn {
+    pub oldnodeid: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
 pub struct FuseSetattrIn {
     pub valid: u32,
     pub padding: u32,
@@ -303,6 +344,47 @@ pub struct FuseDirent {
     pub namelen: u32,
     pub typ: u32,
     // name follows
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseDirentPlus {
+    pub entry_out: FuseEntryOut,
+    pub dirent: FuseDirent,
+    // name follows
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseCreateIn {
+    pub flags: u32,
+    pub mode: u32,
+    pub umask: u32,
+    pub open_flags: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseFlushIn {
+    pub fh: u64,
+    pub unused: u32,
+    pub padding: u32,
+    pub lock_owner: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseFsyncIn {
+    pub fh: u64,
+    pub fsync_flags: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseAccessIn {
+    pub mask: u32,
+    pub padding: u32,
 }
 
 pub fn fuse_pack_struct<T: Copy>(v: &T) -> &[u8] {

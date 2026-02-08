@@ -5,6 +5,7 @@ use num_traits::FromPrimitive;
 use system_error::SystemError;
 
 use crate::{
+    arch::MMArch,
     filesystem::epoll::{
         event_poll::EventPoll, event_poll::LockedEPItemLinkedList, EPollEventType, EPollItem,
     },
@@ -12,6 +13,7 @@ use crate::{
         mutex::Mutex,
         wait_queue::{WaitQueue, Waiter},
     },
+    mm::MemoryManagementArch,
     process::ProcessManager,
 };
 
@@ -19,12 +21,14 @@ use crate::process::cred::CAPFlags;
 
 use super::protocol::{
     fuse_pack_struct, fuse_read_struct, FuseForgetIn, FuseInHeader, FuseInitIn, FuseInitOut,
-    FuseOutHeader, FuseWriteIn, FUSE_ABORT_ERROR, FUSE_ASYNC_DIO, FUSE_ASYNC_READ,
+    FuseInterruptIn, FuseOutHeader, FuseWriteIn, FUSE_ABORT_ERROR, FUSE_ASYNC_DIO, FUSE_ASYNC_READ,
     FUSE_ATOMIC_O_TRUNC, FUSE_AUTO_INVAL_DATA, FUSE_BIG_WRITES, FUSE_DESTROY, FUSE_DONT_MASK,
-    FUSE_EXPLICIT_INVAL_DATA, FUSE_EXPORT_SUPPORT, FUSE_FORGET, FUSE_HANDLE_KILLPRIV, FUSE_INIT,
-    FUSE_INIT_EXT, FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION, FUSE_MAX_PAGES,
-    FUSE_MIN_READ_BUFFER, FUSE_NO_OPENDIR_SUPPORT, FUSE_NO_OPEN_SUPPORT, FUSE_PARALLEL_DIROPS,
-    FUSE_POSIX_ACL, FUSE_POSIX_LOCKS, FUSE_WRITEBACK_CACHE,
+    FUSE_DO_READDIRPLUS, FUSE_EXPLICIT_INVAL_DATA, FUSE_EXPORT_SUPPORT, FUSE_FLUSH, FUSE_FORGET,
+    FUSE_HANDLE_KILLPRIV, FUSE_INIT, FUSE_INIT_EXT, FUSE_INTERRUPT, FUSE_KERNEL_MINOR_VERSION,
+    FUSE_KERNEL_VERSION, FUSE_LOOKUP, FUSE_MAX_PAGES, FUSE_MIN_READ_BUFFER, FUSE_NOTIFY_DELETE,
+    FUSE_NOTIFY_INVAL_ENTRY, FUSE_NOTIFY_INVAL_INODE, FUSE_NOTIFY_POLL, FUSE_NOTIFY_RETRIEVE,
+    FUSE_NOTIFY_STORE, FUSE_NO_OPENDIR_SUPPORT, FUSE_NO_OPEN_SUPPORT, FUSE_PARALLEL_DIROPS,
+    FUSE_POSIX_ACL, FUSE_POSIX_LOCKS, FUSE_READDIRPLUS_AUTO, FUSE_WRITEBACK_CACHE,
 };
 
 #[derive(Debug)]
@@ -34,18 +38,24 @@ pub struct FuseRequest {
 
 #[derive(Debug)]
 pub struct FusePendingState {
+    unique: u64,
     opcode: u32,
     response: Mutex<Option<Result<Vec<u8>, SystemError>>>,
     wait: WaitQueue,
 }
 
 impl FusePendingState {
-    pub fn new(opcode: u32) -> Self {
+    pub fn new(unique: u64, opcode: u32) -> Self {
         Self {
+            unique,
             opcode,
             response: Mutex::new(None),
             wait: WaitQueue::default(),
         }
+    }
+
+    pub fn unique(&self) -> u64 {
+        self.unique
     }
 
     pub fn complete(&self, v: Result<Vec<u8>, SystemError>) {
@@ -121,6 +131,9 @@ struct FuseConnInner {
     owner_gid: u32,
     allow_other: bool,
     init: FuseInitNegotiated,
+    no_open: bool,
+    no_opendir: bool,
+    no_readdirplus: bool,
     pending: VecDeque<Arc<FuseRequest>>,
     processing: BTreeMap<u64, Arc<FusePendingState>>,
 }
@@ -137,6 +150,9 @@ pub struct FuseConn {
 }
 
 impl FuseConn {
+    // Keep this in sync with `sys_read.rs` userspace chunking size.
+    const USER_READ_CHUNK: usize = 64 * 1024;
+
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(FuseConnInner {
@@ -147,6 +163,9 @@ impl FuseConn {
                 owner_gid: 0,
                 allow_other: false,
                 init: FuseInitNegotiated::default(),
+                no_open: false,
+                no_opendir: false,
+                no_readdirplus: false,
                 pending: VecDeque::new(),
                 processing: BTreeMap::new(),
             }),
@@ -186,6 +205,47 @@ impl FuseConn {
         g.owner_uid = owner_uid;
         g.owner_gid = owner_gid;
         g.allow_other = allow_other;
+    }
+
+    fn has_init_flag(&self, flag: u64) -> bool {
+        let g = self.inner.lock();
+        (g.init.flags & flag) != 0
+    }
+
+    pub fn should_skip_open(&self, opcode: u32) -> bool {
+        let g = self.inner.lock();
+        match opcode {
+            super::protocol::FUSE_OPEN => g.no_open,
+            super::protocol::FUSE_OPENDIR => g.no_opendir,
+            _ => false,
+        }
+    }
+
+    pub fn open_enosys_is_supported(&self, opcode: u32) -> bool {
+        match opcode {
+            super::protocol::FUSE_OPEN => self.has_init_flag(FUSE_NO_OPEN_SUPPORT),
+            super::protocol::FUSE_OPENDIR => self.has_init_flag(FUSE_NO_OPENDIR_SUPPORT),
+            _ => false,
+        }
+    }
+
+    pub fn mark_no_open(&self, opcode: u32) {
+        let mut g = self.inner.lock();
+        match opcode {
+            super::protocol::FUSE_OPEN => g.no_open = true,
+            super::protocol::FUSE_OPENDIR => g.no_opendir = true,
+            _ => {}
+        }
+    }
+
+    pub fn use_readdirplus(&self) -> bool {
+        let g = self.inner.lock();
+        !g.no_readdirplus && (g.init.flags & FUSE_DO_READDIRPLUS) != 0
+    }
+
+    pub fn disable_readdirplus(&self) {
+        let mut g = self.inner.lock();
+        g.no_readdirplus = true;
     }
 
     fn alloc_unique(&self) -> u64 {
@@ -329,6 +389,22 @@ impl FuseConn {
         self.enqueue_noreply(FUSE_FORGET, nodeid, fuse_pack_struct(&inarg))
     }
 
+    fn queue_interrupt(&self, unique: u64) -> Result<(), SystemError> {
+        if unique == 0 {
+            return Ok(());
+        }
+        let can_send = {
+            let g = self.inner.lock();
+            g.connected && g.mounted && g.initialized
+        };
+        if !can_send {
+            return Ok(());
+        }
+        let inarg = FuseInterruptIn { unique };
+        let _ = self.enqueue_request(FUSE_INTERRUPT, 0, fuse_pack_struct(&inarg))?;
+        Ok(())
+    }
+
     /// Acquire a new `/dev/fuse` file handle reference to this connection.
     pub fn dev_acquire(&self) {
         self.dev_count.fetch_add(1, Ordering::Relaxed);
@@ -381,6 +457,15 @@ impl FuseConn {
             FUSE_MIN_READ_BUFFER,
             core::mem::size_of::<FuseInHeader>() + core::mem::size_of::<FuseWriteIn>() + max_write,
         )
+    }
+
+    fn max_write_cap_for_user_read_chunk() -> usize {
+        let overhead = core::mem::size_of::<FuseInHeader>() + core::mem::size_of::<FuseWriteIn>();
+        if Self::USER_READ_CHUNK <= overhead {
+            4096
+        } else {
+            Self::USER_READ_CHUNK - overhead
+        }
     }
 
     fn min_read_buffer(&self) -> usize {
@@ -467,6 +552,8 @@ impl FuseConn {
             | FUSE_BIG_WRITES
             | FUSE_DONT_MASK
             | FUSE_AUTO_INVAL_DATA
+            | FUSE_DO_READDIRPLUS
+            | FUSE_READDIRPLUS_AUTO
             | FUSE_ASYNC_DIO
             | FUSE_WRITEBACK_CACHE
             | FUSE_NO_OPEN_SUPPORT
@@ -507,8 +594,16 @@ impl FuseConn {
             }
             self.wait_initialized()?;
         }
-        self.enqueue_request(opcode, nodeid, payload)?
-            .wait_complete()
+        let pending = self.enqueue_request(opcode, nodeid, payload)?;
+        match pending.wait_complete() {
+            Err(SystemError::EINTR) | Err(SystemError::ERESTARTSYS) => {
+                if opcode != FUSE_INTERRUPT {
+                    let _ = self.queue_interrupt(pending.unique());
+                }
+                Err(SystemError::EINTR)
+            }
+            x => x,
+        }
     }
 
     fn enqueue_noreply(&self, opcode: u32, nodeid: u64, payload: &[u8]) -> Result<(), SystemError> {
@@ -578,7 +673,7 @@ impl FuseConn {
         bytes.extend_from_slice(payload);
 
         let req = Arc::new(FuseRequest { bytes });
-        let pending_state = Arc::new(FusePendingState::new(opcode));
+        let pending_state = Arc::new(FusePendingState::new(unique, opcode));
 
         {
             let mut g = self.inner.lock();
@@ -607,14 +702,20 @@ impl FuseConn {
             return Err(SystemError::EINVAL);
         }
 
+        if out_hdr.unique == 0 {
+            let payload = &data[core::mem::size_of::<FuseOutHeader>()..];
+            self.handle_notify(out_hdr.error, payload)?;
+            return Ok(data.len());
+        }
+
         let pending = {
             let mut g = self.inner.lock();
             if !g.connected {
-                return Err(SystemError::ENOTCONN);
+                return Err(SystemError::ENOENT);
             }
             g.processing
                 .remove(&out_hdr.unique)
-                .ok_or(SystemError::EINVAL)?
+                .ok_or(SystemError::ENOENT)?
         };
 
         let payload = &data[core::mem::size_of::<FuseOutHeader>()..];
@@ -624,6 +725,21 @@ impl FuseConn {
             // Negative errno from userspace.
             let errno = -error;
             let e = SystemError::from_i32(errno).unwrap_or(SystemError::EIO);
+            if Self::is_expected_reply_error(pending.opcode, errno) {
+                log::trace!(
+                    "fuse: reply error opcode={} unique={} errno={}",
+                    pending.opcode,
+                    out_hdr.unique,
+                    errno
+                );
+            } else {
+                log::warn!(
+                    "fuse: reply error opcode={} unique={} errno={}",
+                    pending.opcode,
+                    out_hdr.unique,
+                    errno
+                );
+            }
             pending.complete(Err(e));
             if pending.opcode == FUSE_INIT {
                 self.abort();
@@ -652,12 +768,27 @@ impl FuseConn {
                 negotiated_flags |= (init_out.flags2 as u64) << 32;
             }
             let negotiated_minor = core::cmp::min(init_out.minor, FUSE_KERNEL_MINOR_VERSION);
-            let negotiated_max_pages =
+            let negotiated_max_pages_raw =
                 if (negotiated_flags & FUSE_MAX_PAGES) != 0 && init_out.max_pages != 0 {
                     init_out.max_pages
                 } else {
                     1
                 };
+            let negotiated_max_write = core::cmp::max(4096usize, init_out.max_write as usize);
+            let max_write_cap = Self::max_write_cap_for_user_read_chunk();
+            let capped_max_write = core::cmp::min(negotiated_max_write, max_write_cap);
+            if capped_max_write < negotiated_max_write {
+                log::trace!(
+                    "fuse: cap negotiated max_write from {} to {} due user read chunk limit",
+                    negotiated_max_write,
+                    capped_max_write
+                );
+            }
+            let pages_from_write = core::cmp::max(
+                1usize,
+                capped_max_write.div_ceil(MMArch::PAGE_SIZE),
+            ) as u16;
+            let negotiated_max_pages = core::cmp::min(negotiated_max_pages_raw, pages_from_write);
 
             {
                 let mut g = self.inner.lock();
@@ -666,7 +797,7 @@ impl FuseConn {
                     g.init = FuseInitNegotiated {
                         minor: negotiated_minor,
                         max_readahead: init_out.max_readahead,
-                        max_write: core::cmp::max(4096, init_out.max_write),
+                        max_write: capped_max_write as u32,
                         time_gran: init_out.time_gran,
                         max_pages: negotiated_max_pages,
                         flags: negotiated_flags,
@@ -680,6 +811,33 @@ impl FuseConn {
         Ok(data.len())
     }
 
+    fn handle_notify(&self, code: i32, payload: &[u8]) -> Result<(), SystemError> {
+        if code <= 0 {
+            return Err(SystemError::EINVAL);
+        }
+        match code {
+            FUSE_NOTIFY_POLL
+            | FUSE_NOTIFY_INVAL_INODE
+            | FUSE_NOTIFY_INVAL_ENTRY
+            | FUSE_NOTIFY_STORE
+            | FUSE_NOTIFY_RETRIEVE
+            | FUSE_NOTIFY_DELETE => {
+                log::debug!("fuse: notify code={} len={}", code, payload.len());
+                Ok(())
+            }
+            _ => Err(SystemError::EINVAL),
+        }
+    }
+
+    fn is_expected_reply_error(opcode: u32, errno: i32) -> bool {
+        matches!(
+            (opcode, SystemError::from_i32(errno)),
+            (FUSE_LOOKUP, Some(SystemError::ENOENT))
+                | (FUSE_FLUSH, Some(SystemError::ENOSYS))
+                | (FUSE_INTERRUPT, Some(SystemError::EAGAIN_OR_EWOULDBLOCK))
+        )
+    }
+
     #[allow(dead_code)]
     pub fn negotiated_state(&self) -> (u32, u32, u32, u32, u16, u64) {
         let g = self.inner.lock();
@@ -691,5 +849,10 @@ impl FuseConn {
             g.init.max_pages,
             g.init.flags,
         )
+    }
+
+    pub fn max_write(&self) -> usize {
+        let g = self.inner.lock();
+        core::cmp::max(4096usize, g.init.max_write as usize)
     }
 }

@@ -2,7 +2,7 @@ use alloc::{
     string::ToString,
     sync::{Arc, Weak},
 };
-use log::{info, warn};
+use log::warn;
 use system_error::SystemError;
 
 use crate::{
@@ -16,6 +16,7 @@ use crate::{
 
 pub static mut CLOCKSOURCE_TSC: Option<Arc<TscClocksource>> = None;
 
+#[allow(dead_code)]
 pub fn clocksource_tsc() -> Arc<TscClocksource> {
     unsafe { CLOCKSOURCE_TSC.as_ref().unwrap().clone() }
 }

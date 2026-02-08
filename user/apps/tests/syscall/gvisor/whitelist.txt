@@ -16,6 +16,7 @@ pause_test
 chroot_test
 creat_test
 dup_test
+fuse_test
 write_test
 mkdir_test
 mknod_test

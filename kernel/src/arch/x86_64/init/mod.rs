@@ -3,7 +3,7 @@ use core::{
     sync::atomic::{compiler_fence, Ordering},
 };
 
-use log::{debug, info};
+use log::debug;
 use system_error::SystemError;
 use x86::dtables::DescriptorTablePointer;
 

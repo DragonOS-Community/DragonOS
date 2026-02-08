@@ -25,7 +25,9 @@ impl Syscall for SysFstatfsHandle {
             .get_file_by_fd(fd)
             .ok_or(SystemError::EBADF)?;
         drop(fd_table_guard);
-        let statfs = PosixStatfs::from(file.inode().fs().super_block());
+        let inode = file.inode();
+        let sb = inode.fs().statfs(&inode)?;
+        let statfs = PosixStatfs::from(sb);
         writer.copy_one_to_user(&statfs, 0)?;
         return Ok(0);
     }

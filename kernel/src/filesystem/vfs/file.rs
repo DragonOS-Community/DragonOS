@@ -1,4 +1,5 @@
 use core::{
+    any::Any,
     fmt,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
@@ -126,8 +127,39 @@ pub enum FilePrivateData {
     Namespace(NamespaceFilePrivateData),
     /// Socket file created by socket syscalls (not by VFS open(2)).
     SocketCreate,
+    /// /dev/fuse file private data (stores an opaque connection object).
+    FuseDev(FuseDevPrivateData),
+    /// FUSE regular file private data (stores fh/open flags).
+    FuseFile(FuseFilePrivateData),
+    /// FUSE directory private data (stores fh/open flags).
+    FuseDir(FuseDirPrivateData),
     /// 不需要文件私有信息
     Unused,
+}
+
+/// Private data for `/dev/fuse`.
+///
+/// Note: to avoid cyclic dependencies between `vfs` and `filesystem::fuse`,
+/// the connection object is stored as an opaque `Arc<dyn Any + Send + Sync>`,
+/// and is downcasted by the FUSE implementation as needed.
+#[derive(Debug, Clone)]
+pub struct FuseDevPrivateData {
+    pub conn: Arc<dyn Any + Send + Sync>,
+    pub nonblock: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct FuseFilePrivateData {
+    pub conn: Arc<dyn Any + Send + Sync>,
+    pub fh: u64,
+    pub open_flags: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct FuseDirPrivateData {
+    pub conn: Arc<dyn Any + Send + Sync>,
+    pub fh: u64,
+    pub open_flags: u32,
 }
 
 impl Default for FilePrivateData {

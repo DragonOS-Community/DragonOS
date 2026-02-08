@@ -414,6 +414,9 @@ impl MountFS {
 
         self.self_mountpoint.write().take();
 
+        // Notify the filesystem that it has been unmounted.
+        self.inner_filesystem.on_umount();
+
         return r;
     }
 }
@@ -1092,6 +1095,21 @@ impl FileSystem for MountFS {
         let mut sb = self.inner_filesystem.super_block();
         sb.flags = self.mount_flags.bits() as u64;
         sb
+    }
+
+    fn statfs(&self, inode: &Arc<dyn IndexNode>) -> Result<SuperBlock, SystemError> {
+        let inner_inode = inode
+            .as_any_ref()
+            .downcast_ref::<MountFSInode>()
+            .map(|mnt| mnt.inner_inode.clone())
+            .unwrap_or_else(|| inode.clone());
+        let mut sb = self.inner_filesystem.statfs(&inner_inode)?;
+        sb.flags = self.mount_flags.bits() as u64;
+        Ok(sb)
+    }
+
+    fn permission_policy(&self) -> crate::filesystem::vfs::FsPermissionPolicy {
+        self.inner_filesystem.permission_policy()
     }
 
     unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {

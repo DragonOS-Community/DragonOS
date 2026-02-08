@@ -148,6 +148,7 @@ impl DevFS {
 
     /// @brief 注册系统内部自带的设备
     fn register_bultinin_device(&self) {
+        use crate::filesystem::fuse::dev::LockedFuseDevInode;
         use null_dev::LockedNullInode;
         use random_dev::LockedRandomInode;
         use zero_dev::LockedZeroInode;
@@ -161,6 +162,9 @@ impl DevFS {
         dev_root
             .add_dev("random", LockedRandomInode::new())
             .expect("DevFS: Failed to register /dev/random");
+        dev_root
+            .add_dev("fuse", LockedFuseDevInode::new())
+            .expect("DevFS: Failed to register /dev/fuse");
     }
 
     /// @brief 在devfs内注册设备

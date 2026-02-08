@@ -1,16 +1,9 @@
 /**
  * @file test_fuse_dev.c
- * @brief Phase A unit test: /dev/fuse basic semantics (open/read nonblock)
+ * @brief Phase P0 unit test: /dev/fuse read buffer and nonblock semantics.
  */
 
-#define _GNU_SOURCE
-
-#include <errno.h>
-#include <fcntl.h>
-#include <poll.h>
-#include <stdio.h>
-#include <string.h>
-#include <unistd.h>
+#include "fuse_test_simplefs.h"
 
 static int test_nonblock_read_empty(void) {
     int fd = open("/dev/fuse", O_RDWR | O_NONBLOCK);
@@ -19,10 +12,27 @@ static int test_nonblock_read_empty(void) {
         return -1;
     }
 
-    unsigned char buf[256];
-    ssize_t n = read(fd, buf, sizeof(buf));
+    unsigned char small[FUSE_MIN_READ_BUFFER / 2];
+    ssize_t n = read(fd, small, sizeof(small));
+    if (n != -1 || errno != EINVAL) {
+        printf("[FAIL] nonblock read with small buffer: n=%zd errno=%d (%s)\n", n, errno,
+               strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    unsigned char *big = malloc(FUSE_TEST_BUF_SIZE);
+    if (!big) {
+        printf("[FAIL] malloc big buffer failed\n");
+        close(fd);
+        return -1;
+    }
+    memset(big, 0, FUSE_TEST_BUF_SIZE);
+
+    n = read(fd, big, FUSE_TEST_BUF_SIZE);
     if (n != -1 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
         printf("[FAIL] nonblock read empty: n=%zd errno=%d (%s)\n", n, errno, strerror(errno));
+        free(big);
         close(fd);
         return -1;
     }
@@ -34,10 +44,12 @@ static int test_nonblock_read_empty(void) {
     if (pr != 0) {
         printf("[FAIL] poll empty expected timeout: pr=%d revents=%x errno=%d (%s)\n",
                pr, pfd.revents, errno, strerror(errno));
+        free(big);
         close(fd);
         return -1;
     }
 
+    free(big);
     close(fd);
     printf("[PASS] nonblock_read_empty\n");
     return 0;
@@ -49,4 +61,3 @@ int main(void) {
     }
     return 0;
 }
-

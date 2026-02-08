@@ -94,6 +94,7 @@ int main(int argc, char **argv) {
     master_args.stop = &stop;
     master_args.init_done = &init_done;
     master_args.enable_write_ops = enable_write_ops;
+    master_args.stop_on_destroy = 1;
 
     pthread_t *ths = calloc((size_t)threads, sizeof(pthread_t));
     struct fuse_daemon_args *args = calloc((size_t)threads, sizeof(struct fuse_daemon_args));
@@ -158,6 +159,7 @@ int main(int argc, char **argv) {
         args[i].stop = &stop;
         args[i].init_done = &init_done;
         args[i].enable_write_ops = enable_write_ops;
+        args[i].stop_on_destroy = 1;
         if (pthread_create(&ths[i], NULL, fuse_daemon_thread, &args[i]) != 0) {
             perror("pthread_create(clone)");
             close(fd);

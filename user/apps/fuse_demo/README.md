@@ -66,9 +66,20 @@ fuse_demo /mnt/fuse --threads 4
 
 如果内核尚未支持 `FUSE_DEV_IOC_CLONE`，`--threads > 1` 会在 clone 阶段失败并提前退出（或只跑单线程，取决于当时实现）。
 
+## 内置测试程序
+
+`user/apps/fuse_demo` 目录下同时提供了 FUSE 相关回归测试二进制：
+
+- `test_fuse_dev`：`/dev/fuse` 缓冲区与 nonblock 语义
+- `test_fuse_mount_init`：`mount + INIT` 协商与同 fd 重复挂载拒绝
+- `test_fuse_phase_c`：`ls/stat/cat` 读路径
+- `test_fuse_phase_d`：创建/写入/重命名/删除路径
+- `test_fuse_clone`：`FUSE_DEV_IOC_CLONE` 基础路径
+- `test_fuse_permissions`：`allow_other/default_permissions` 语义
+- `test_fuse_p1_lifecycle`：`FORGET/DESTROY` 生命周期语义
+
 ## 权限语义备注（对应 Phase E）
 
 - 未指定 `--allow-other`：内核会限制“非挂载者允许的进程”调用到该 FUSE 挂载（更安全，类似 Linux 默认行为）。
 - 未指定 `--default-permissions`：内核会绕过大部分本地 DAC 权限检查（remote model），把权限决策交给用户态 daemon。
   - 本 demo daemon **不做权限拒绝**，因此 remote model 下通常会更“宽松”。
-

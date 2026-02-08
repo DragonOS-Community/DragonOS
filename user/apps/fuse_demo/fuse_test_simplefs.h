@@ -58,6 +58,9 @@ static inline int fuse_test_log_enabled(void) {
 #ifndef FUSE_LOOKUP
 #define FUSE_LOOKUP 1
 #endif
+#ifndef FUSE_FORGET
+#define FUSE_FORGET 2
+#endif
 #ifndef FUSE_GETATTR
 #define FUSE_GETATTR 3
 #endif
@@ -105,6 +108,21 @@ static inline int fuse_test_log_enabled(void) {
 #endif
 #ifndef FUSE_RELEASEDIR
 #define FUSE_RELEASEDIR 29
+#endif
+#ifndef FUSE_DESTROY
+#define FUSE_DESTROY 38
+#endif
+
+#ifndef FUSE_MIN_READ_BUFFER
+#define FUSE_MIN_READ_BUFFER 8192
+#endif
+
+/* INIT flags (subset) */
+#ifndef FUSE_INIT_EXT
+#define FUSE_INIT_EXT (1u << 30)
+#endif
+#ifndef FUSE_MAX_PAGES
+#define FUSE_MAX_PAGES (1u << 22)
 #endif
 
 /* setattr valid bits (subset) */
@@ -190,6 +208,10 @@ struct fuse_entry_out {
     uint32_t entry_valid_nsec;
     uint32_t attr_valid_nsec;
     struct fuse_attr attr;
+};
+
+struct fuse_forget_in {
+    uint64_t nlookup;
 };
 
 struct fuse_getattr_in {
@@ -462,8 +484,15 @@ struct fuse_daemon_args {
     volatile int *init_done;
     int enable_write_ops;
     int exit_after_init;
+    int stop_on_destroy;
     uint32_t root_mode_override;
     uint32_t hello_mode_override;
+    volatile uint32_t *forget_count;
+    volatile uint64_t *forget_nlookup_sum;
+    volatile uint32_t *destroy_count;
+    volatile uint32_t *init_in_flags;
+    volatile uint32_t *init_in_flags2;
+    volatile uint32_t *init_in_max_readahead;
     struct simplefs fs;
 };
 
@@ -483,15 +512,36 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (payload_len < sizeof(struct fuse_init_in)) {
             return -1;
         }
+        const struct fuse_init_in *in = (const struct fuse_init_in *)payload;
+        if (a->init_in_flags)
+            *a->init_in_flags = in->flags;
+        if (a->init_in_flags2)
+            *a->init_in_flags2 = in->flags2;
+        if (a->init_in_max_readahead)
+            *a->init_in_max_readahead = in->max_readahead;
+
         struct fuse_init_out out;
         memset(&out, 0, sizeof(out));
         out.major = 7;
         out.minor = 39;
+        out.flags = FUSE_INIT_EXT | FUSE_MAX_PAGES;
+        out.flags2 = 0;
         out.max_write = 4096;
+        out.max_pages = 32;
         if (fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out)) != 0) {
             return -1;
         }
         *a->init_done = 1;
+        return 0;
+    }
+    case FUSE_FORGET: {
+        if (payload_len < sizeof(struct fuse_forget_in))
+            return -1;
+        const struct fuse_forget_in *in = (const struct fuse_forget_in *)payload;
+        if (a->forget_count)
+            (*a->forget_count)++;
+        if (a->forget_nlookup_sum)
+            (*a->forget_nlookup_sum) += in->nlookup;
         return 0;
     }
     case FUSE_LOOKUP: {
@@ -663,6 +713,12 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
     case FUSE_RELEASE:
     case FUSE_RELEASEDIR:
         return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
+    case FUSE_DESTROY:
+        if (a->destroy_count)
+            (*a->destroy_count)++;
+        if (a->stop_on_destroy && a->stop)
+            *a->stop = 1;
+        return 0;
     case FUSE_WRITE: {
         if (!a->enable_write_ops) {
             return fuse_write_reply(a->fd, h->unique, -ENOSYS, NULL, 0);

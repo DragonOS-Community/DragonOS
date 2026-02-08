@@ -1,6 +1,7 @@
 use alloc::{
     collections::BTreeMap,
     sync::{Arc, Weak},
+    vec::Vec,
 };
 
 use system_error::SystemError;
@@ -26,12 +27,10 @@ use super::{
 
 #[derive(Debug)]
 pub struct FuseMountData {
-    pub fd: i32,
     pub rootmode: u32,
     pub user_id: u32,
     pub group_id: u32,
     pub default_permissions: bool,
-    pub allow_other: bool,
     pub conn: Arc<FuseConn>,
 }
 
@@ -47,10 +46,7 @@ pub struct FuseFS {
     super_block: SuperBlock,
     conn: Arc<FuseConn>,
     nodes: Mutex<BTreeMap<u64, Weak<FuseNode>>>,
-    owner_uid: u32,
-    owner_gid: u32,
     default_permissions: bool,
-    allow_other: bool,
 }
 
 impl FuseFS {
@@ -183,12 +179,10 @@ impl MountableFileSystem for FuseFS {
         conn.mark_mounted()?;
 
         Ok(Some(Arc::new(FuseMountData {
-            fd,
             rootmode,
             user_id,
             group_id,
             default_permissions,
-            allow_other,
             conn,
         })))
     }
@@ -234,10 +228,7 @@ impl MountableFileSystem for FuseFS {
             super_block,
             conn: conn.clone(),
             nodes: Mutex::new(BTreeMap::new()),
-            owner_uid: mount_data.user_id,
-            owner_gid: mount_data.group_id,
             default_permissions: mount_data.default_permissions,
-            allow_other: mount_data.allow_other,
         });
 
         conn.enqueue_init()?;
@@ -313,7 +304,13 @@ impl FileSystem for FuseFS {
     }
 
     fn on_umount(&self) {
-        // Abort pending/blocked requests to wake daemon thread on unmount.
-        self.conn.abort();
+        let live_nodes: Vec<Arc<FuseNode>> = {
+            let nodes = self.nodes.lock();
+            nodes.values().filter_map(|w| w.upgrade()).collect()
+        };
+        for node in live_nodes {
+            node.flush_forget();
+        }
+        self.conn.on_umount();
     }
 }

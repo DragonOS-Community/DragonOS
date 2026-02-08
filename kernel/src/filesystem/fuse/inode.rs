@@ -4,9 +4,11 @@ use alloc::{
     vec::Vec,
 };
 use core::mem::size_of;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use system_error::SystemError;
 
+use crate::time::timekeep::ktime_get_real_ns;
 use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::{
@@ -24,10 +26,11 @@ use super::{
     protocol::{
         fuse_pack_struct, fuse_read_struct, FuseAttr, FuseAttrOut, FuseDirent, FuseEntryOut,
         FuseGetattrIn, FuseMkdirIn, FuseMknodIn, FuseOpenIn, FuseOpenOut, FuseReadIn,
-        FuseReleaseIn, FuseRenameIn, FuseSetattrIn, FuseWriteIn, FuseWriteOut, FATTR_GID,
-        FATTR_MODE, FATTR_SIZE, FATTR_UID, FUSE_GETATTR, FUSE_LOOKUP, FUSE_MKDIR, FUSE_MKNOD,
-        FUSE_OPEN, FUSE_OPENDIR, FUSE_READ, FUSE_READDIR, FUSE_RELEASE, FUSE_RELEASEDIR,
-        FUSE_RENAME, FUSE_RMDIR, FUSE_SETATTR, FUSE_UNLINK, FUSE_WRITE,
+        FuseReleaseIn, FuseRenameIn, FuseSetattrIn, FuseWriteIn, FuseWriteOut, FATTR_ATIME,
+        FATTR_CTIME, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_SIZE, FATTR_UID, FUSE_GETATTR,
+        FUSE_LOOKUP, FUSE_MKDIR, FUSE_MKNOD, FUSE_OPEN, FUSE_OPENDIR, FUSE_READ, FUSE_READDIR,
+        FUSE_RELEASE, FUSE_RELEASEDIR, FUSE_RENAME, FUSE_RMDIR, FUSE_ROOT_ID, FUSE_SETATTR,
+        FUSE_UNLINK, FUSE_WRITE,
     },
 };
 
@@ -38,6 +41,8 @@ pub struct FuseNode {
     nodeid: u64,
     parent_nodeid: Mutex<u64>,
     cached_metadata: Mutex<Option<Metadata>>,
+    cached_metadata_deadline_ns: AtomicU64,
+    lookup_count: AtomicU64,
 }
 
 impl FuseNode {
@@ -48,12 +53,15 @@ impl FuseNode {
         parent_nodeid: u64,
         cached: Option<Metadata>,
     ) -> Arc<Self> {
+        let has_cached = cached.is_some();
         Arc::new(Self {
             fs,
             conn,
             nodeid,
             parent_nodeid: Mutex::new(parent_nodeid),
             cached_metadata: Mutex::new(cached),
+            cached_metadata_deadline_ns: AtomicU64::new(if has_cached { u64::MAX } else { 0 }),
+            lookup_count: AtomicU64::new(0),
         })
     }
 
@@ -67,6 +75,46 @@ impl FuseNode {
 
     pub fn set_cached_metadata(&self, md: Metadata) {
         *self.cached_metadata.lock() = Some(md);
+        self.cached_metadata_deadline_ns
+            .store(u64::MAX, Ordering::Relaxed);
+    }
+
+    pub fn set_cached_metadata_with_valid(&self, md: Metadata, valid: u64, valid_nsec: u32) {
+        *self.cached_metadata.lock() = Some(md);
+        self.cached_metadata_deadline_ns
+            .store(Self::cache_deadline(valid, valid_nsec), Ordering::Relaxed);
+    }
+
+    pub fn inc_lookup(&self, count: u64) {
+        if self.nodeid == FUSE_ROOT_ID || count == 0 {
+            return;
+        }
+        self.lookup_count.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn flush_forget(&self) {
+        if self.nodeid == FUSE_ROOT_ID {
+            return;
+        }
+        let nlookup = self.lookup_count.swap(0, Ordering::Relaxed);
+        if nlookup == 0 {
+            return;
+        }
+        let _ = self.conn.queue_forget(self.nodeid, nlookup);
+    }
+
+    fn now_ns() -> u64 {
+        ktime_get_real_ns().max(0) as u64
+    }
+
+    fn cache_deadline(valid: u64, valid_nsec: u32) -> u64 {
+        if valid == 0 && valid_nsec == 0 {
+            return 0;
+        }
+        let delta_ns = valid
+            .saturating_mul(1_000_000_000)
+            .saturating_add(valid_nsec as u64);
+        Self::now_ns().saturating_add(delta_ns)
     }
 
     fn conn(&self) -> &Arc<FuseConn> {
@@ -133,14 +181,17 @@ impl FuseNode {
                 .request(FUSE_GETATTR, self.nodeid, fuse_pack_struct(&getattr_in))?;
         let out: FuseAttrOut = fuse_read_struct(&payload)?;
         let md = Self::attr_to_metadata(&out.attr);
-        *self.cached_metadata.lock() = Some(md.clone());
+        self.set_cached_metadata_with_valid(md.clone(), out.attr_valid, out.attr_valid_nsec);
         Ok(md)
     }
 
     fn cached_or_fetch_metadata(&self) -> Result<Metadata, SystemError> {
         self.conn.check_allow_current_process()?;
         if let Some(m) = self.cached_metadata.lock().clone() {
-            return Ok(m);
+            let deadline = self.cached_metadata_deadline_ns.load(Ordering::Relaxed);
+            if deadline == u64::MAX || (deadline != 0 && Self::now_ns() < deadline) {
+                return Ok(m);
+            }
         }
         self.fetch_attr()
     }
@@ -304,12 +355,32 @@ impl IndexNode for FuseNode {
     }
 
     fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
-        // Minimal setattr: mode/uid/gid/size
+        let old = self.cached_or_fetch_metadata()?;
         let mut valid = 0u32;
-        valid |= FATTR_MODE;
-        valid |= FATTR_UID;
-        valid |= FATTR_GID;
-        valid |= FATTR_SIZE;
+        if metadata.mode != old.mode {
+            valid |= FATTR_MODE;
+        }
+        if metadata.uid != old.uid {
+            valid |= FATTR_UID;
+        }
+        if metadata.gid != old.gid {
+            valid |= FATTR_GID;
+        }
+        if metadata.size != old.size {
+            valid |= FATTR_SIZE;
+        }
+        if metadata.atime != old.atime {
+            valid |= FATTR_ATIME;
+        }
+        if metadata.mtime != old.mtime {
+            valid |= FATTR_MTIME;
+        }
+        if metadata.ctime != old.ctime {
+            valid |= FATTR_CTIME;
+        }
+        if valid == 0 {
+            return Ok(());
+        }
 
         let inarg = FuseSetattrIn {
             valid,
@@ -317,12 +388,12 @@ impl IndexNode for FuseNode {
             fh: 0,
             size: metadata.size as u64,
             lock_owner: 0,
-            atime: 0,
-            mtime: 0,
-            ctime: 0,
-            atimensec: 0,
-            mtimensec: 0,
-            ctimensec: 0,
+            atime: metadata.atime.tv_sec as u64,
+            mtime: metadata.mtime.tv_sec as u64,
+            ctime: metadata.ctime.tv_sec as u64,
+            atimensec: metadata.atime.tv_nsec as u32,
+            mtimensec: metadata.mtime.tv_nsec as u32,
+            ctimensec: metadata.ctime.tv_nsec as u32,
             mode: metadata.mode.bits(),
             unused4: 0,
             uid: metadata.uid as u32,
@@ -334,7 +405,7 @@ impl IndexNode for FuseNode {
             .request(FUSE_SETATTR, self.nodeid, fuse_pack_struct(&inarg))?;
         let out: FuseAttrOut = fuse_read_struct(&payload)?;
         let md = Self::attr_to_metadata(&out.attr);
-        *self.cached_metadata.lock() = Some(md);
+        self.set_cached_metadata_with_valid(md, out.attr_valid, out.attr_valid_nsec);
         Ok(())
     }
 
@@ -362,7 +433,7 @@ impl IndexNode for FuseNode {
             .request(FUSE_SETATTR, self.nodeid, fuse_pack_struct(&inarg))?;
         let out: FuseAttrOut = fuse_read_struct(&payload)?;
         let md = Self::attr_to_metadata(&out.attr);
-        *self.cached_metadata.lock() = Some(md);
+        self.set_cached_metadata_with_valid(md, out.attr_valid, out.attr_valid_nsec);
         Ok(())
     }
 
@@ -456,6 +527,12 @@ impl IndexNode for FuseNode {
 
         let fs = self.fs.upgrade().ok_or(SystemError::ENOENT)?;
         let child = fs.get_or_create_node(entry.nodeid, self.nodeid, Some(md));
+        child.inc_lookup(1);
+        child.set_cached_metadata_with_valid(
+            Self::attr_to_metadata(&entry.attr),
+            entry.attr_valid,
+            entry.attr_valid_nsec,
+        );
         Ok(child)
     }
 
@@ -491,7 +568,14 @@ impl IndexNode for FuseNode {
                 let entry: FuseEntryOut = fuse_read_struct(&payload)?;
                 let md = Self::attr_to_metadata(&entry.attr);
                 let fs = self.fs.upgrade().ok_or(SystemError::ENOENT)?;
-                Ok(fs.get_or_create_node(entry.nodeid, self.nodeid, Some(md)))
+                let child = fs.get_or_create_node(entry.nodeid, self.nodeid, Some(md));
+                child.inc_lookup(1);
+                child.set_cached_metadata_with_valid(
+                    Self::attr_to_metadata(&entry.attr),
+                    entry.attr_valid,
+                    entry.attr_valid_nsec,
+                );
+                Ok(child)
             }
             FileType::File => {
                 let inarg = FuseMknodIn {
@@ -508,7 +592,14 @@ impl IndexNode for FuseNode {
                 let entry: FuseEntryOut = fuse_read_struct(&payload)?;
                 let md = Self::attr_to_metadata(&entry.attr);
                 let fs = self.fs.upgrade().ok_or(SystemError::ENOENT)?;
-                Ok(fs.get_or_create_node(entry.nodeid, self.nodeid, Some(md)))
+                let child = fs.get_or_create_node(entry.nodeid, self.nodeid, Some(md));
+                child.inc_lookup(1);
+                child.set_cached_metadata_with_valid(
+                    Self::attr_to_metadata(&entry.attr),
+                    entry.attr_valid,
+                    entry.attr_valid_nsec,
+                );
+                Ok(child)
             }
             _ => Err(SystemError::ENOSYS),
         }
@@ -554,5 +645,11 @@ impl IndexNode for FuseNode {
 
     fn absolute_path(&self) -> Result<String, SystemError> {
         Ok(format!("fuse:{}", self.nodeid))
+    }
+}
+
+impl Drop for FuseNode {
+    fn drop(&mut self) {
+        self.flush_forget();
     }
 }

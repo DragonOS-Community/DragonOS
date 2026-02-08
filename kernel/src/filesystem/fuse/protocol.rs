@@ -33,6 +33,27 @@ pub const FUSE_INIT: u32 = 26;
 pub const FUSE_OPENDIR: u32 = 27;
 pub const FUSE_READDIR: u32 = 28;
 pub const FUSE_RELEASEDIR: u32 = 29;
+pub const FUSE_DESTROY: u32 = 38; // no reply
+
+// INIT flags (subset)
+pub const FUSE_ASYNC_READ: u64 = 1 << 0;
+pub const FUSE_POSIX_LOCKS: u64 = 1 << 1;
+pub const FUSE_ATOMIC_O_TRUNC: u64 = 1 << 3;
+pub const FUSE_EXPORT_SUPPORT: u64 = 1 << 4;
+pub const FUSE_BIG_WRITES: u64 = 1 << 5;
+pub const FUSE_DONT_MASK: u64 = 1 << 6;
+pub const FUSE_AUTO_INVAL_DATA: u64 = 1 << 12;
+pub const FUSE_ASYNC_DIO: u64 = 1 << 15;
+pub const FUSE_WRITEBACK_CACHE: u64 = 1 << 16;
+pub const FUSE_NO_OPEN_SUPPORT: u64 = 1 << 17;
+pub const FUSE_PARALLEL_DIROPS: u64 = 1 << 18;
+pub const FUSE_HANDLE_KILLPRIV: u64 = 1 << 19;
+pub const FUSE_POSIX_ACL: u64 = 1 << 20;
+pub const FUSE_ABORT_ERROR: u64 = 1 << 21;
+pub const FUSE_MAX_PAGES: u64 = 1 << 22;
+pub const FUSE_NO_OPENDIR_SUPPORT: u64 = 1 << 24;
+pub const FUSE_EXPLICIT_INVAL_DATA: u64 = 1 << 25;
+pub const FUSE_INIT_EXT: u64 = 1 << 30;
 
 // getattr/setattr valid bits (subset)
 pub const FATTR_MODE: u32 = 1 << 0;
@@ -41,8 +62,11 @@ pub const FATTR_GID: u32 = 1 << 2;
 pub const FATTR_SIZE: u32 = 1 << 3;
 pub const FATTR_ATIME: u32 = 1 << 4;
 pub const FATTR_MTIME: u32 = 1 << 5;
+#[allow(dead_code)]
 pub const FATTR_FH: u32 = 1 << 6;
+#[allow(dead_code)]
 pub const FATTR_ATIME_NOW: u32 = 1 << 7;
+#[allow(dead_code)]
 pub const FATTR_MTIME_NOW: u32 = 1 << 8;
 pub const FATTR_CTIME: u32 = 1 << 10;
 
@@ -127,6 +151,12 @@ pub struct FuseEntryOut {
     pub entry_valid_nsec: u32,
     pub attr_valid_nsec: u32,
     pub attr: FuseAttr,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseForgetIn {
+    pub nlookup: u64,
 }
 
 #[repr(C)]

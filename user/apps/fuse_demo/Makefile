@@ -8,13 +8,13 @@ endif
 CC=$(CROSS_COMPILE)gcc
 CFLAGS := -Wall -O2 -static -lpthread
 
-SRCS := fuse_demo.c
+SRCS := $(wildcard *.c)
 BINS := $(SRCS:.c=)
 
 all: $(BINS)
 	@echo "bins: $(BINS)"
 
-%: %.c fuse_test_simplefs.h
+%: %.c $(wildcard *.h)
 	$(CC) $(CFLAGS) $< -o $@
 
 install: all

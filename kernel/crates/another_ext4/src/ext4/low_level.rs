@@ -555,7 +555,6 @@ impl Ext4 {
                 //   - dir_a 的 ".." 更新：源父目录 -1，目标父目录 +1（在 4b-5）
                 //   - 目标父目录净变化：-1 + 1 = 0 ✓
                 if existing_is_dir {
-                    self.dir_remove_entry(&existing_inode, "..")?;
                     target_dir
                         .inode
                         .set_link_count(target_dir.inode.link_count() - 1);
@@ -572,10 +571,7 @@ impl Ext4 {
                     self.write_inode_with_csum(&mut existing_inode);
                 }
 
-                // 4b-4. 删除源目录项
-                self.dir_remove_entry(&parent_ref, name)?;
-
-                // 4b-5. 跨目录移动时，处理源目录的 ".." 指向
+                // 4b-4. 跨目录移动时，处理源目录的 ".." 指向
                 if child_is_dir && parent != new_parent {
                     // 更新被移动目录的 ".." 指向新父目录
                     self.dir_replace_entry(&child, "..", new_parent, FileType::Directory)?;

@@ -131,6 +131,31 @@ impl Ext4 {
         Ok(())
     }
 
+    /// Link a newly created inode into `parent`.
+    ///
+    /// If linking fails, this function frees the newly allocated inode to avoid leaks.
+    fn link_new_inode_or_free(
+        &self,
+        parent: &mut InodeRef,
+        child: &mut InodeRef,
+        name: &str,
+    ) -> Result<()> {
+        if let Err(link_err) = self.link_inode(parent, child, name) {
+            if let Err(cleanup_err) = self.free_inode(child) {
+                trace!(
+                    "link failed for new inode {} (name {}), cleanup failed: {:?}; original link error: {:?}",
+                    child.id,
+                    name,
+                    cleanup_err,
+                    link_err
+                );
+                return Err(cleanup_err);
+            }
+            return Err(link_err);
+        }
+        Ok(())
+    }
+
     /// Create a file. This function will not check the existence of
     /// the file, call `lookup` to check beforehand.
     ///
@@ -157,7 +182,7 @@ impl Ext4 {
         }
         // Create child inode and link it to parent directory
         let mut child = self.create_inode(mode)?;
-        self.link_inode(&mut parent, &mut child, name)?;
+        self.link_new_inode_or_free(&mut parent, &mut child, name)?;
         // Create file handler
         Ok(child.id)
     }
@@ -207,7 +232,7 @@ impl Ext4 {
         let mut child = self.create_device_inode(mode, major, minor)?;
 
         // Link to parent directory
-        self.link_inode(&mut parent_ref, &mut child, name)?;
+        self.link_new_inode_or_free(&mut parent_ref, &mut child, name)?;
 
         trace!("mknod {} ({}:{}) -> inode {}", name, major, minor, child.id);
         Ok(child.id)

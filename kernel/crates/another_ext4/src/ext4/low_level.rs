@@ -484,7 +484,7 @@ impl Ext4 {
 
         // 2. 查找源 inode
         let child_id = self.dir_find_entry(&parent_ref, name)?;
-        let mut child = self.read_inode(child_id);
+        let child = self.read_inode(child_id);
         let child_is_dir = child.inode.is_dir();
         let child_file_type = child.inode.file_type();
 
@@ -555,7 +555,7 @@ impl Ext4 {
                 }
 
                 // 4b-4. 删除源目录项，避免 rename 覆盖后源路径仍可见
-                self.dir_remove_entry(&mut parent_ref, name)?;
+                self.dir_remove_entry(&parent_ref, name)?;
 
                 // 4b-5. 递减被替换 inode 的 link count（可能触发释放）
                 // 目录最小 link count 为 2（父目录条目 + 自己的 "."），所以 <=2 表示无其他硬链接
@@ -595,20 +595,15 @@ impl Ext4 {
 
                 // C-1. 在目标父目录添加新条目（先 add）
                 let target_dir = new_parent_ref.as_mut().unwrap_or(&mut parent_ref);
-                self.dir_add_entry(target_dir, &mut child, new_name)?;
+                self.dir_add_entry(target_dir, &child, new_name)?;
 
                 // C-2. 从源父目录删除旧条目（后 delete）
-                self.dir_remove_entry(&mut parent_ref, name)?;
+                self.dir_remove_entry(&parent_ref, name)?;
 
                 // C-3. 目录跨目录移动时，原子更新 ".." 并调整 link count
                 if child_is_dir && parent != new_parent {
                     // ".." 原地替换：旧父 → 新父，单次 I/O，无中间态
-                    self.dir_replace_entry(
-                        &child,
-                        "..",
-                        new_parent,
-                        FileType::Directory,
-                    )?;
+                    self.dir_replace_entry(&child, "..", new_parent, FileType::Directory)?;
 
                     // 源父目录失去 ".." 引用
                     parent_ref

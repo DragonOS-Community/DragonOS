@@ -254,38 +254,51 @@ EOF
 }
 
 ####################################################################################
-# 安装 Nix 包管理器
+# 安装 Nix 包管理器（含镜像配置、trusted-users、实验特性、自动 GC 及完成提示）
 ####################################################################################
 install_nix()
 {
+	# 配置 Nix 镜像
+	setup_nix_mirror
+
 	if [ -n "$(which nix)" ]; then
 		echo "Nix 已经安装在您的系统上。"
-		return 0
-	fi
+	else
+		echo "正在安装 Nix 包管理器..."
+		set -o pipefail
+		if ! curl -fsSL "$NIX_INSTALLER_URL" | sh -s -- $NIX_INSTALLER_ARGS; then
+			echo "镜像下载失败，尝试官方地址..."
+			if ! curl -fsSL "$NIX_INSTALLER_FALLBACK_URL" | sh -s -- $NIX_INSTALLER_ARGS; then
+				echo "Nix 安装脚本下载失败！"
+				set +o pipefail
+				exit 1
+			fi
+		fi
+		set +o pipefail
 
-	echo "正在安装 Nix 包管理器..."
-	set -o pipefail
-	if ! curl -fsSL "$NIX_INSTALLER_URL" | sh -s -- $NIX_INSTALLER_ARGS; then
-		echo "镜像下载失败，尝试官方地址..."
-		if ! curl -fsSL "$NIX_INSTALLER_FALLBACK_URL" | sh -s -- $NIX_INSTALLER_ARGS; then
-			echo "Nix 安装脚本下载失败！"
-			set +o pipefail
+		if [ $? -ne 0 ]; then
+			echo "Nix 安装失败！"
 			exit 1
 		fi
-	fi
-	set +o pipefail
 
-	if [ $? -ne 0 ]; then
-		echo "Nix 安装失败！"
-		exit 1
+		echo "Nix 安装成功！"
+
+		# Source nix environment
+		if [ -f "/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh" ]; then
+			. /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+		fi
 	fi
 
-	echo "Nix 安装成功！"
+	# 配置 trusted-users
+	configure_nix_trusted_user
 
-	# Source nix environment
-	if [ -f "/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh" ]; then
-		. /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
-	fi
+	# 配置 Nix 实验特性
+	configure_nix_features
+
+	# 配置 Nix 自动 GC
+	configure_nix_auto_gc
+
+	congratulations_nix
 }
 
 ####################################################################################
@@ -305,7 +318,7 @@ ask_install_mode()
 	echo ""
 	echo "请选择安装模式:"
 	echo "  1) nix    - 仅安装 Nix，使用 nix develop 进入开发环境 (推荐)"
-	echo "  2) legacy - 安装 Nix 后继续安装传统依赖 (完整安装)"
+	echo "  2) legacy - 不安装 Nix，仅安装传统依赖 (完整安装)"
 	echo ""
 	printf "请输入选项 (1/2) [默认: 1]: "
 	read mode_choice
@@ -621,7 +634,7 @@ while true; do
 		"--help")
 			echo "--no-docker(not install docker): 该参数表示执行该脚本的过程中不单独安装docker."
 			echo "--nix: 仅安装 Nix，使用 nix develop 进入开发环境."
-			echo "--legacy: 安装 Nix 后继续安装传统依赖 (完整安装)."
+			echo "--legacy: 不安装 Nix，仅安装传统依赖 (完整安装)."
 			exit 0
 		;;
 		*)
@@ -637,28 +650,13 @@ banner 			# 开始横幅
 # 询问安装模式
 ask_install_mode
 
-# 配置 Nix 镜像
-setup_nix_mirror
-
-# 安装 Nix
-install_nix
-
-# 配置 trusted-users
-configure_nix_trusted_user
-
-# 配置 Nix 实验特性
-configure_nix_features
-
-# 配置 Nix 自动 GC
-configure_nix_auto_gc
-
-# 如果是 nix 模式，直接结束
+# 仅在 nix 模式下安装并配置 Nix；legacy 模式不安装 Nix
 if [ "$INSTALL_MODE" = "nix" ]; then
-	congratulations_nix
+	install_nix
 	exit 0
 fi
 
-# 以下是 legacy 模式的安装流程
+# 以下是 legacy 模式的安装流程（不安装 Nix，仅安装传统依赖）
 echo "继续安装传统依赖..."
 
 if [ "Darwin" == "$(uname -s)" ]; then

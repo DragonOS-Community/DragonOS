@@ -535,33 +535,29 @@ impl Ext4 {
 
                 // 4b-2. 原子替换：原地修改目标目录项，指向源 inode
                 // 这是原子操作的核心：目标目录项从未"消失"
-                let target_dir = new_parent_ref.as_mut().unwrap_or(&mut parent_ref);
-                self.dir_replace_entry(target_dir, new_name, child_id, child_file_type)?;
+                {
+                    let target_dir = new_parent_ref.as_mut().unwrap_or(&mut parent_ref);
+                    self.dir_replace_entry(target_dir, new_name, child_id, child_file_type)?;
 
-                // 4b-3. 处理被替换 inode 的 link count
-                //
-                // 目录的 link count 语义：
-                // - 父目录的 link count 包含每个子目录 ".." 指向它的引用
-                // - 当用 dir_a 替换 dir_b 时：
-                //   * dir_b 的 ".." 被移除 → 父目录失去一个 ".." 引用 (-1)
-                //   * dir_a 的 ".." 仍指向其原父目录（在 4b-5 处理）
-                //
-                // 同目录情况 (parent == new_parent)：
-                //   - dir_a 的 ".." 原本就指向父目录，无需更改
-                //   - 只需为 dir_b 的 ".." 移除递减：净 -1 ✓
-                //
-                // 跨目录情况 (parent != new_parent)：
-                //   - dir_b 的 ".." 移除：目标父目录 -1（此处）
-                //   - dir_a 的 ".." 更新：源父目录 -1，目标父目录 +1（在 4b-5）
-                //   - 目标父目录净变化：-1 + 1 = 0 ✓
-                if existing_is_dir {
-                    target_dir
-                        .inode
-                        .set_link_count(target_dir.inode.link_count() - 1);
-                    self.write_inode_with_csum(target_dir);
+                    // 4b-3. 处理被替换目录的父目录 link count
+                    //
+                    // 被替换目录的 ".." 不主动删除（对齐 Linux ext4_rename）：
+                    // Linux 使用 clear_nlink(new.inode) 标记被替换目录待释放，
+                    // 从不触碰其内部的 ".." 条目。".." 随 free_inode 释放数据块自然消失。
+                    //
+                    // 父目录 link count 仍需递减：被替换目录的 ".." 引用逻辑上失效。
+                    if existing_is_dir {
+                        target_dir
+                            .inode
+                            .set_link_count(target_dir.inode.link_count() - 1);
+                        self.write_inode_with_csum(target_dir);
+                    }
                 }
 
-                // 递减被替换 inode 的 link count（可能触发释放）
+                // 4b-4. 删除源目录项，避免 rename 覆盖后源路径仍可见
+                self.dir_remove_entry(&mut parent_ref, name)?;
+
+                // 4b-5. 递减被替换 inode 的 link count（可能触发释放）
                 // 目录最小 link count 为 2（父目录条目 + 自己的 "."），所以 <=2 表示无其他硬链接
                 let existing_link_cnt = existing_inode.inode.link_count();
                 if existing_link_cnt <= 1 || (existing_is_dir && existing_link_cnt <= 2) {
@@ -571,18 +567,16 @@ impl Ext4 {
                     self.write_inode_with_csum(&mut existing_inode);
                 }
 
-                // 4b-4. 跨目录移动时，处理源目录的 ".." 指向
+                // 4b-6. 跨目录移动时，处理源目录的 ".." 指向
                 if child_is_dir && parent != new_parent {
                     // 更新被移动目录的 ".." 指向新父目录
                     self.dir_replace_entry(&child, "..", new_parent, FileType::Directory)?;
 
-                    // 源父目录失去 ".." 引用
                     parent_ref
                         .inode
                         .set_link_count(parent_ref.inode.link_count() - 1);
                     self.write_inode_with_csum(&mut parent_ref);
 
-                    // 目标父目录获得 ".." 引用
                     // 注意：当 parent != new_parent 时，new_parent_ref 必定是 Some(...)
                     let new_parent_dir = new_parent_ref.as_mut().unwrap();
                     new_parent_dir
@@ -594,13 +588,43 @@ impl Ext4 {
             }
             None => {
                 // 情况 C：目标不存在 → 简单重命名
-                // 从源 unlink
-                self.unlink_inode(&mut parent_ref, &mut child, name, false)?;
-                // link 到目标
-                match new_parent_ref.as_mut() {
-                    Some(np) => self.link_inode(np, &mut child, new_name)?,
-                    None => self.link_inode(&mut parent_ref, &mut child, new_name)?,
+                // TODO
+                // 若加上失败回滚，则在回滚失败时更混乱
+                // 不回滚则可能多一个硬链接
+                // *实现 journal 事务才是最正确的解决方法*
+
+                // C-1. 在目标父目录添加新条目（先 add）
+                let target_dir = new_parent_ref.as_mut().unwrap_or(&mut parent_ref);
+                self.dir_add_entry(target_dir, &mut child, new_name)?;
+
+                // C-2. 从源父目录删除旧条目（后 delete）
+                self.dir_remove_entry(&mut parent_ref, name)?;
+
+                // C-3. 目录跨目录移动时，原子更新 ".." 并调整 link count
+                if child_is_dir && parent != new_parent {
+                    // ".." 原地替换：旧父 → 新父，单次 I/O，无中间态
+                    self.dir_replace_entry(
+                        &child,
+                        "..",
+                        new_parent,
+                        FileType::Directory,
+                    )?;
+
+                    // 源父目录失去 ".." 引用
+                    parent_ref
+                        .inode
+                        .set_link_count(parent_ref.inode.link_count() - 1);
+                    self.write_inode_with_csum(&mut parent_ref);
+
+                    // 目标父目录获得 ".." 引用
+                    let new_parent_dir = new_parent_ref.as_mut().unwrap();
+                    new_parent_dir
+                        .inode
+                        .set_link_count(new_parent_dir.inode.link_count() + 1);
+                    self.write_inode_with_csum(new_parent_dir);
                 }
+                // 文件：无 ".."，nlink 不变（只换了名字/位置）
+                // 目录同目录：".." 已指向正确的父，link count 不变
             }
         }
 

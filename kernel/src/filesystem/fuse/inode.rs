@@ -49,6 +49,8 @@ pub struct FuseNode {
 }
 
 impl FuseNode {
+    const FUSE_DIRENT_ALIGN: usize = 8;
+
     pub fn new(
         fs: Weak<FuseFS>,
         conn: Arc<FuseConn>,
@@ -178,6 +180,90 @@ impl FuseNode {
             _ => return Err(SystemError::EINVAL),
         };
         Ok(())
+    }
+
+    fn align_dirent_record_len(base_len: usize) -> usize {
+        (base_len + Self::FUSE_DIRENT_ALIGN - 1) & !(Self::FUSE_DIRENT_ALIGN - 1)
+    }
+
+    fn cache_child_from_entry(&self, entry: &FuseEntryOut) {
+        if entry.nodeid == 0 {
+            return;
+        }
+        if let Some(fs) = self.fs.upgrade() {
+            let md = Self::attr_to_metadata(&entry.attr);
+            let child = fs.get_or_create_node(entry.nodeid, self.nodeid, Some(md.clone()));
+            child.inc_lookup(1);
+            child.set_cached_metadata_with_valid(md, entry.attr_valid, entry.attr_valid_nsec);
+        }
+    }
+
+    fn parse_readdirplus_payload(
+        &self,
+        payload: &[u8],
+        names: &mut Vec<String>,
+        mut last_off: u64,
+    ) -> Result<u64, SystemError> {
+        let mut pos: usize = 0;
+        while pos + size_of::<FuseDirentPlus>() <= payload.len() {
+            let plus: FuseDirentPlus = fuse_read_struct(&payload[pos..])?;
+            let dirent = plus.dirent;
+            let name_start = pos + size_of::<FuseDirentPlus>();
+            let name_end = name_start + dirent.namelen as usize;
+            if name_end > payload.len() {
+                break;
+            }
+
+            let name_bytes = &payload[name_start..name_end];
+            if let Ok(name) = core::str::from_utf8(name_bytes) {
+                if !name.is_empty() && name != "." && name != ".." {
+                    names.push(name.to_string());
+                    self.cache_child_from_entry(&plus.entry_out);
+                }
+            }
+
+            last_off = dirent.off;
+            let rec_len = Self::align_dirent_record_len(
+                size_of::<FuseDirentPlus>() + dirent.namelen as usize,
+            );
+            if rec_len == 0 {
+                break;
+            }
+            pos = pos.saturating_add(rec_len);
+        }
+        Ok(last_off)
+    }
+
+    fn parse_readdir_payload(
+        payload: &[u8],
+        names: &mut Vec<String>,
+        mut last_off: u64,
+    ) -> Result<u64, SystemError> {
+        let mut pos: usize = 0;
+        while pos + size_of::<FuseDirent>() <= payload.len() {
+            let dirent: FuseDirent = fuse_read_struct(&payload[pos..])?;
+            let name_start = pos + size_of::<FuseDirent>();
+            let name_end = name_start + dirent.namelen as usize;
+            if name_end > payload.len() {
+                break;
+            }
+
+            let name_bytes = &payload[name_start..name_end];
+            if let Ok(name) = core::str::from_utf8(name_bytes) {
+                if !name.is_empty() && name != "." && name != ".." {
+                    names.push(name.to_string());
+                }
+            }
+
+            last_off = dirent.off;
+            let rec_len =
+                Self::align_dirent_record_len(size_of::<FuseDirent>() + dirent.namelen as usize);
+            if rec_len == 0 {
+                break;
+            }
+            pos = pos.saturating_add(rec_len);
+        }
+        Ok(last_off)
     }
 
     fn attr_to_metadata(attr: &FuseAttr) -> Metadata {
@@ -680,71 +766,11 @@ impl IndexNode for FuseNode {
                 break;
             }
 
-            let mut pos: usize = 0;
             let mut last_off: u64 = offset;
             if use_readdirplus {
-                while pos + size_of::<FuseDirentPlus>() <= payload.len() {
-                    let plus: FuseDirentPlus = fuse_read_struct(&payload[pos..])?;
-                    let dirent = plus.dirent;
-                    let name_start = pos + size_of::<FuseDirentPlus>();
-                    let name_end = name_start + dirent.namelen as usize;
-                    if name_end > payload.len() {
-                        break;
-                    }
-                    let name_bytes = &payload[name_start..name_end];
-                    if let Ok(name) = core::str::from_utf8(name_bytes) {
-                        if !name.is_empty() && name != "." && name != ".." {
-                            names.push(name.to_string());
-                            if plus.entry_out.nodeid != 0 {
-                                if let Some(fs) = self.fs.upgrade() {
-                                    let md = Self::attr_to_metadata(&plus.entry_out.attr);
-                                    let child = fs.get_or_create_node(
-                                        plus.entry_out.nodeid,
-                                        self.nodeid,
-                                        Some(md),
-                                    );
-                                    child.inc_lookup(1);
-                                    child.set_cached_metadata_with_valid(
-                                        Self::attr_to_metadata(&plus.entry_out.attr),
-                                        plus.entry_out.attr_valid,
-                                        plus.entry_out.attr_valid_nsec,
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    last_off = dirent.off;
-                    let rec_len_unaligned = size_of::<FuseDirentPlus>() + dirent.namelen as usize;
-                    let rec_len = (rec_len_unaligned + 8 - 1) & !(8 - 1);
-                    if rec_len == 0 {
-                        break;
-                    }
-                    pos = pos.saturating_add(rec_len);
-                }
+                last_off = self.parse_readdirplus_payload(&payload, &mut names, last_off)?;
             } else {
-                while pos + size_of::<FuseDirent>() <= payload.len() {
-                    let dirent: FuseDirent = fuse_read_struct(&payload[pos..])?;
-                    let name_start = pos + size_of::<FuseDirent>();
-                    let name_end = name_start + dirent.namelen as usize;
-                    if name_end > payload.len() {
-                        break;
-                    }
-                    let name_bytes = &payload[name_start..name_end];
-                    if let Ok(name) = core::str::from_utf8(name_bytes) {
-                        if !name.is_empty() && name != "." && name != ".." {
-                            names.push(name.to_string());
-                        }
-                    }
-
-                    last_off = dirent.off;
-                    let rec_len_unaligned = size_of::<FuseDirent>() + dirent.namelen as usize;
-                    let rec_len = (rec_len_unaligned + 8 - 1) & !(8 - 1);
-                    if rec_len == 0 {
-                        break;
-                    }
-                    pos = pos.saturating_add(rec_len);
-                }
+                last_off = Self::parse_readdir_payload(&payload, &mut names, last_off)?;
             }
 
             if last_off == offset {

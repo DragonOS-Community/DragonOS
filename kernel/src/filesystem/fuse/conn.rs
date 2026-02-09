@@ -480,6 +480,46 @@ impl FuseConn {
         Self::calc_min_read_buffer(g.init.max_write as usize)
     }
 
+    fn pop_pending_nonblock(&self) -> Result<Arc<FuseRequest>, SystemError> {
+        let mut g = self.inner.lock();
+        if !g.connected {
+            return Err(SystemError::ENOTCONN);
+        }
+        g.pending
+            .pop_front()
+            .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)
+    }
+
+    fn pop_pending_blocking(&self) -> Result<Arc<FuseRequest>, SystemError> {
+        loop {
+            let mut g = self.inner.lock();
+            if !g.connected {
+                return Err(SystemError::ENOTCONN);
+            }
+            if let Some(req) = g.pending.pop_front() {
+                return Ok(req);
+            }
+
+            let (waiter, waker) = Waiter::new_pair();
+            self.read_wait.register_waker(waker.clone())?;
+
+            if !g.connected {
+                self.read_wait.remove_waker(&waker);
+                return Err(SystemError::ENOTCONN);
+            }
+            if let Some(req) = g.pending.pop_front() {
+                self.read_wait.remove_waker(&waker);
+                return Ok(req);
+            }
+            drop(g);
+
+            if let Err(e) = waiter.wait(true) {
+                self.read_wait.remove_waker(&waker);
+                return Err(e);
+            }
+        }
+    }
+
     pub fn read_request(&self, nonblock: bool, out: &mut [u8]) -> Result<usize, SystemError> {
         // Linux: require a sane minimum read buffer for all reads.
         let min_read = self.min_read_buffer();
@@ -495,41 +535,9 @@ impl FuseConn {
 
         // Linux: if O_NONBLOCK and no pending request, return EAGAIN.
         let req = if nonblock {
-            let mut g = self.inner.lock();
-            if !g.connected {
-                return Err(SystemError::ENOTCONN);
-            }
-            g.pending
-                .pop_front()
-                .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?
+            self.pop_pending_nonblock()?
         } else {
-            loop {
-                let mut g = self.inner.lock();
-                if !g.connected {
-                    return Err(SystemError::ENOTCONN);
-                }
-                if let Some(req) = g.pending.pop_front() {
-                    break req;
-                }
-
-                let (waiter, waker) = Waiter::new_pair();
-                self.read_wait.register_waker(waker.clone())?;
-
-                if !g.connected {
-                    self.read_wait.remove_waker(&waker);
-                    return Err(SystemError::ENOTCONN);
-                }
-                if let Some(req) = g.pending.pop_front() {
-                    self.read_wait.remove_waker(&waker);
-                    break req;
-                }
-                drop(g);
-
-                if let Err(e) = waiter.wait(true) {
-                    self.read_wait.remove_waker(&waker);
-                    return Err(e);
-                }
-            }
+            self.pop_pending_blocking()?
         };
 
         if out.len() < req.bytes.len() {

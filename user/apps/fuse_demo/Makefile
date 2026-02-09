@@ -20,6 +20,7 @@ all: $(BINS)
 install: all
 	@echo "Installing binaries to $(DADK_CURRENT_BUILD_DIR)/"
 	mv $(BINS) $(DADK_CURRENT_BUILD_DIR)/
+	cp run_all_test_fuse.sh $(DADK_CURRENT_BUILD_DIR)/
 
 clean:
 	rm -f $(BINS)

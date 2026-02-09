@@ -51,6 +51,22 @@ pub struct FuseFS {
 }
 
 impl FuseFS {
+    fn parse_opt_u32_decimal(v: &str) -> Result<u32, SystemError> {
+        v.parse::<u32>().map_err(|_| SystemError::EINVAL)
+    }
+
+    fn parse_opt_i32_decimal(v: &str) -> Result<i32, SystemError> {
+        v.parse::<i32>().map_err(|_| SystemError::EINVAL)
+    }
+
+    fn parse_opt_u32_octal(v: &str) -> Result<u32, SystemError> {
+        u32::from_str_radix(v, 8).map_err(|_| SystemError::EINVAL)
+    }
+
+    fn parse_opt_bool_switch(v: &str) -> bool {
+        v.is_empty() || v != "0"
+    }
+
     fn parse_mount_options(
         raw: Option<&str>,
     ) -> Result<(i32, u32, u32, u32, bool, bool), SystemError> {
@@ -73,23 +89,23 @@ impl FuseFS {
             };
             match k {
                 "fd" => {
-                    fd = Some(v.parse::<i32>().map_err(|_| SystemError::EINVAL)?);
+                    fd = Some(Self::parse_opt_i32_decimal(v)?);
                 }
                 "rootmode" => {
                     // Linux expects octal representation.
-                    rootmode = Some(u32::from_str_radix(v, 8).map_err(|_| SystemError::EINVAL)?);
+                    rootmode = Some(Self::parse_opt_u32_octal(v)?);
                 }
                 "user_id" => {
-                    user_id = Some(v.parse::<u32>().map_err(|_| SystemError::EINVAL)?);
+                    user_id = Some(Self::parse_opt_u32_decimal(v)?);
                 }
                 "group_id" => {
-                    group_id = Some(v.parse::<u32>().map_err(|_| SystemError::EINVAL)?);
+                    group_id = Some(Self::parse_opt_u32_decimal(v)?);
                 }
                 "default_permissions" => {
-                    default_permissions = v.is_empty() || v != "0";
+                    default_permissions = Self::parse_opt_bool_switch(v);
                 }
                 "allow_other" => {
-                    allow_other = v.is_empty() || v != "0";
+                    allow_other = Self::parse_opt_bool_switch(v);
                 }
                 _ => {}
             }
@@ -167,11 +183,9 @@ impl MountableFileSystem for FuseFS {
         let conn = {
             let pdata = file.private_data.lock();
             match &*pdata {
-                crate::filesystem::vfs::FilePrivateData::Fuse(FuseFilePrivateData::Dev(p)) => p
-                    .conn
-                    .clone()
-                    .downcast::<FuseConn>()
-                    .map_err(|_| SystemError::EINVAL)?,
+                crate::filesystem::vfs::FilePrivateData::Fuse(FuseFilePrivateData::Dev(p)) => {
+                    p.conn_ref()?
+                }
                 _ => return Err(SystemError::EINVAL),
             }
         };

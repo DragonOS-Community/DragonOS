@@ -31,6 +31,30 @@ use super::protocol::{
     FUSE_POSIX_ACL, FUSE_POSIX_LOCKS, FUSE_READDIRPLUS_AUTO, FUSE_WRITEBACK_CACHE,
 };
 
+fn wait_with_recheck<T, F>(waitq: &WaitQueue, mut check: F) -> Result<T, SystemError>
+where
+    F: FnMut() -> Result<Option<T>, SystemError>,
+{
+    if let Some(v) = check()? {
+        return Ok(v);
+    }
+
+    loop {
+        let (waiter, waker) = Waiter::new_pair();
+        waitq.register_waker(waker.clone())?;
+
+        if let Some(v) = check()? {
+            waitq.remove_waker(&waker);
+            return Ok(v);
+        }
+
+        if let Err(e) = waiter.wait(true) {
+            waitq.remove_waker(&waker);
+            return Err(e);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct FuseRequest {
     pub bytes: Vec<u8>,
@@ -77,31 +101,13 @@ impl FusePendingState {
     }
 
     pub fn wait_complete(&self) -> Result<Vec<u8>, SystemError> {
-        // Avoid TOCTOU between response update and wait queue registration.
-        if let Some(res) = self.response.lock().take() {
-            return res;
-        }
-        loop {
+        wait_with_recheck(&self.wait, || {
             let mut guard = self.response.lock();
             if let Some(res) = guard.take() {
-                return res;
+                return Ok(Some(res));
             }
-
-            let (waiter, waker) = Waiter::new_pair();
-            self.wait.register_waker(waker.clone())?;
-
-            // Re-check under the same lock after registering.
-            if let Some(res) = guard.take() {
-                self.wait.remove_waker(&waker);
-                return res;
-            }
-            drop(guard);
-
-            if let Err(e) = waiter.wait(true) {
-                self.wait.remove_waker(&waker);
-                return Err(e);
-            }
-        }
+            Ok(None)
+        })?
     }
 }
 
@@ -294,37 +300,16 @@ impl FuseConn {
     }
 
     fn wait_initialized(&self) -> Result<(), SystemError> {
-        if self.is_initialized() {
-            return Ok(());
-        }
-        // Bind condition checks to inner lock and register waker before releasing it.
-        loop {
+        wait_with_recheck(&self.init_wait, || {
             let g = self.inner.lock();
             if !g.connected {
                 return Err(SystemError::ENOTCONN);
             }
             if g.initialized {
-                return Ok(());
+                return Ok(Some(()));
             }
-
-            let (waiter, waker) = Waiter::new_pair();
-            self.init_wait.register_waker(waker.clone())?;
-
-            if !g.connected {
-                self.init_wait.remove_waker(&waker);
-                return Err(SystemError::ENOTCONN);
-            }
-            if g.initialized {
-                self.init_wait.remove_waker(&waker);
-                return Ok(());
-            }
-            drop(g);
-
-            if let Err(e) = waiter.wait(true) {
-                self.init_wait.remove_waker(&waker);
-                return Err(e);
-            }
-        }
+            Ok(None)
+        })
     }
 
     pub fn abort(&self) {
@@ -491,33 +476,16 @@ impl FuseConn {
     }
 
     fn pop_pending_blocking(&self) -> Result<Arc<FuseRequest>, SystemError> {
-        loop {
+        wait_with_recheck(&self.read_wait, || {
             let mut g = self.inner.lock();
             if !g.connected {
                 return Err(SystemError::ENOTCONN);
             }
             if let Some(req) = g.pending.pop_front() {
-                return Ok(req);
+                return Ok(Some(req));
             }
-
-            let (waiter, waker) = Waiter::new_pair();
-            self.read_wait.register_waker(waker.clone())?;
-
-            if !g.connected {
-                self.read_wait.remove_waker(&waker);
-                return Err(SystemError::ENOTCONN);
-            }
-            if let Some(req) = g.pending.pop_front() {
-                self.read_wait.remove_waker(&waker);
-                return Ok(req);
-            }
-            drop(g);
-
-            if let Err(e) = waiter.wait(true) {
-                self.read_wait.remove_waker(&waker);
-                return Err(e);
-            }
-        }
+            Ok(None)
+        })
     }
 
     pub fn read_request(&self, nonblock: bool, out: &mut [u8]) -> Result<usize, SystemError> {

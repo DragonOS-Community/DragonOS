@@ -12,10 +12,8 @@ use crate::time::timekeep::ktime_get_real_ns;
 use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::{
-        file::{FileFlags, FuseDirPrivateData, FuseFilePrivateData},
-        permission::PermissionMask,
-        syscall::RenameFlags,
-        FilePrivateData, FileSystem, FileType, IndexNode, InodeFlags, InodeId, InodeMode, Metadata,
+        file::FileFlags, permission::PermissionMask, syscall::RenameFlags, FilePrivateData,
+        FileSystem, FileType, IndexNode, InodeFlags, InodeId, InodeMode, Metadata,
     },
     libs::mutex::{Mutex, MutexGuard},
     time::PosixTimeSpec,
@@ -24,6 +22,7 @@ use crate::{
 use super::{
     conn::FuseConn,
     fs::FuseFS,
+    private_data::{FuseFilePrivateData, FuseOpenPrivateData},
     protocol::{
         fuse_pack_struct, fuse_read_struct, FuseAccessIn, FuseAttr, FuseAttrOut, FuseCreateIn,
         FuseDirent, FuseDirentPlus, FuseEntryOut, FuseFlushIn, FuseFsyncIn, FuseGetattrIn,
@@ -211,21 +210,21 @@ impl FuseNode {
             let conn_any: Arc<dyn core::any::Any + Send + Sync> = self.conn.clone();
             match opcode {
                 FUSE_OPEN => {
-                    *data = FilePrivateData::FuseFile(FuseFilePrivateData {
+                    *data = FilePrivateData::Fuse(FuseFilePrivateData::File(FuseOpenPrivateData {
                         conn: conn_any,
                         fh: 0,
                         open_flags: flags.bits(),
                         no_open: true,
-                    });
+                    }));
                     return Ok(());
                 }
                 FUSE_OPENDIR => {
-                    *data = FilePrivateData::FuseDir(FuseDirPrivateData {
+                    *data = FilePrivateData::Fuse(FuseFilePrivateData::Dir(FuseOpenPrivateData {
                         conn: conn_any,
                         fh: 0,
                         open_flags: flags.bits(),
                         no_open: true,
-                    });
+                    }));
                     return Ok(());
                 }
                 _ => return Err(SystemError::EINVAL),
@@ -246,21 +245,23 @@ impl FuseNode {
                 let conn_any: Arc<dyn core::any::Any + Send + Sync> = self.conn.clone();
                 match opcode {
                     FUSE_OPEN => {
-                        *data = FilePrivateData::FuseFile(FuseFilePrivateData {
-                            conn: conn_any,
-                            fh: 0,
-                            open_flags: open_in.flags,
-                            no_open: true,
-                        });
+                        *data =
+                            FilePrivateData::Fuse(FuseFilePrivateData::File(FuseOpenPrivateData {
+                                conn: conn_any,
+                                fh: 0,
+                                open_flags: open_in.flags,
+                                no_open: true,
+                            }));
                         return Ok(());
                     }
                     FUSE_OPENDIR => {
-                        *data = FilePrivateData::FuseDir(FuseDirPrivateData {
-                            conn: conn_any,
-                            fh: 0,
-                            open_flags: open_in.flags,
-                            no_open: true,
-                        });
+                        *data =
+                            FilePrivateData::Fuse(FuseFilePrivateData::Dir(FuseOpenPrivateData {
+                                conn: conn_any,
+                                fh: 0,
+                                open_flags: open_in.flags,
+                                no_open: true,
+                            }));
                         return Ok(());
                     }
                     _ => return Err(SystemError::EINVAL),
@@ -273,20 +274,20 @@ impl FuseNode {
         let conn_any: Arc<dyn core::any::Any + Send + Sync> = self.conn.clone();
         match opcode {
             FUSE_OPEN => {
-                *data = FilePrivateData::FuseFile(FuseFilePrivateData {
+                *data = FilePrivateData::Fuse(FuseFilePrivateData::File(FuseOpenPrivateData {
                     conn: conn_any,
                     fh: out.fh,
                     open_flags: open_in.flags,
                     no_open: false,
-                });
+                }));
             }
             FUSE_OPENDIR => {
-                *data = FilePrivateData::FuseDir(FuseDirPrivateData {
+                *data = FilePrivateData::Fuse(FuseFilePrivateData::Dir(FuseOpenPrivateData {
                     conn: conn_any,
                     fh: out.fh,
                     open_flags: open_in.flags,
                     no_open: false,
-                });
+                }));
             }
             _ => return Err(SystemError::EINVAL),
         }
@@ -346,8 +347,8 @@ impl FuseNode {
         data: &FilePrivateData,
     ) -> Result<(), SystemError> {
         let (opcode, fh, no_open) = match data {
-            FilePrivateData::FuseFile(p) => (FUSE_FSYNC, p.fh, p.no_open),
-            FilePrivateData::FuseDir(p) => (FUSE_FSYNCDIR, p.fh, p.no_open),
+            FilePrivateData::Fuse(FuseFilePrivateData::File(p)) => (FUSE_FSYNC, p.fh, p.no_open),
+            FilePrivateData::Fuse(FuseFilePrivateData::Dir(p)) => (FUSE_FSYNCDIR, p.fh, p.no_open),
             _ => return self.fsync_common(datasync),
         };
 
@@ -415,7 +416,7 @@ impl IndexNode for FuseNode {
 
     fn close(&self, data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         match &*data {
-            FilePrivateData::FuseFile(p) => {
+            FilePrivateData::Fuse(FuseFilePrivateData::File(p)) => {
                 if p.no_open {
                     return Ok(());
                 }
@@ -430,7 +431,7 @@ impl IndexNode for FuseNode {
                     .request(FUSE_FLUSH, self.nodeid, fuse_pack_struct(&flush_in));
                 self.release_common(FUSE_RELEASE, p.fh, p.open_flags)
             }
-            FilePrivateData::FuseDir(p) => {
+            FilePrivateData::Fuse(FuseFilePrivateData::Dir(p)) => {
                 if p.no_open {
                     Ok(())
                 } else {
@@ -462,7 +463,7 @@ impl IndexNode for FuseNode {
             return Ok(n);
         }
         self.ensure_regular()?;
-        let FilePrivateData::FuseFile(p) = &*data else {
+        let FilePrivateData::Fuse(FuseFilePrivateData::File(p)) = &*data else {
             return Err(SystemError::EBADF);
         };
         let read_in = FuseReadIn {
@@ -493,7 +494,7 @@ impl IndexNode for FuseNode {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
         }
-        let FilePrivateData::FuseFile(p) = &*data else {
+        let FilePrivateData::Fuse(FuseFilePrivateData::File(p)) = &*data else {
             return Err(SystemError::EBADF);
         };
         let max_write = self.conn().max_write();
@@ -654,7 +655,7 @@ impl IndexNode for FuseNode {
         let mut pdata = FilePrivateData::Unused;
         let flags = FileFlags::O_RDONLY;
         self.open_common(FUSE_OPENDIR, &mut pdata, &flags)?;
-        let FilePrivateData::FuseDir(dir_p) = &pdata else {
+        let FilePrivateData::Fuse(FuseFilePrivateData::Dir(dir_p)) = &pdata else {
             return Err(SystemError::EINVAL);
         };
         let fh = dir_p.fh;

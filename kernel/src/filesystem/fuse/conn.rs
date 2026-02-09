@@ -784,10 +784,8 @@ impl FuseConn {
                     capped_max_write
                 );
             }
-            let pages_from_write = core::cmp::max(
-                1usize,
-                capped_max_write.div_ceil(MMArch::PAGE_SIZE),
-            ) as u16;
+            let pages_from_write =
+                core::cmp::max(1usize, capped_max_write.div_ceil(MMArch::PAGE_SIZE)) as u16;
             let negotiated_max_pages = core::cmp::min(negotiated_max_pages_raw, pages_from_write);
 
             {

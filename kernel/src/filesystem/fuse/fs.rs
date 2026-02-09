@@ -22,6 +22,7 @@ use linkme::distributed_slice;
 use super::{
     conn::FuseConn,
     inode::FuseNode,
+    private_data::FuseFilePrivateData,
     protocol::{fuse_read_struct, FuseStatfsOut, FUSE_ROOT_ID, FUSE_STATFS},
 };
 
@@ -166,7 +167,7 @@ impl MountableFileSystem for FuseFS {
         let conn = {
             let pdata = file.private_data.lock();
             match &*pdata {
-                crate::filesystem::vfs::FilePrivateData::FuseDev(p) => p
+                crate::filesystem::vfs::FilePrivateData::Fuse(FuseFilePrivateData::Dev(p)) => p
                     .conn
                     .clone()
                     .downcast::<FuseConn>()

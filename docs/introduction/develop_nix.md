@@ -11,6 +11,21 @@ nix 的引入使得 DragonOS 的开发环境不再依赖手动维护的 `bootstr
 - 如果你想体验 nix 带来的声明式管理，又不想更改发行版，尝试 home-manager 并在其上配置启用 flakes、direnv
 - 否则可以直接以 nix standalone 的方式安装 flakes，或者每次输入命令时添加 `--experimental-features 'nix-command flakes'`
 
+## 国内镜像加速（推荐）
+
+如果你在国内且没有全局代理，首次拉取依赖可能很慢甚至失败。本仓库已在 `flake.nix` 内置国内镜像配置，使用 `nix develop / nix run` 时会自动生效。
+
+若仍然不生效，建议在用户级配置中追加以下内容（不会覆盖你已有配置）：
+
+```shell
+mkdir -p ~/.config/nix
+cat >> ~/.config/nix/nix.conf <<'EOF'
+# DragonOS Nix mirror (CN)
+extra-substituters = https://mirrors.tuna.tsinghua.edu.cn/nix-channels/store https://mirrors.ustc.edu.cn/nix-channels/store
+extra-trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+EOF
+```
+
 ## 克隆仓库
 
 DragonOS 现在在多个托管平台上都有仓库镜像
@@ -26,7 +41,7 @@ cd DragonOS
 ## 激活内核编译环境
 
 ```shell
-nix develop ./tools/nix-dev-shell 
+nix develop
 ```
 
 如果你配置了 `direnv`，首次进入仓库目录会提示需要执行 `direnv allow`，相当于自动进入了 `nix develop` 环境。

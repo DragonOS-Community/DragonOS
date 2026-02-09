@@ -6,10 +6,11 @@
   testOpt,
   debug ? false,
   vmstateDir ? null,
+  preferSystemQemu ? false,
 }:
 
 let
-  qemuFirmware = pkgs.callPackage ./qemu-firmware.nix { };
+  qemuFirmware = if preferSystemQemu then null else pkgs.callPackage ./qemu-firmware.nix { };
 
   baseConfig = {
     nographic = true;
@@ -161,12 +162,20 @@ let
       # VM 状态目录配置
       vmstateDirStr = if vmstateDir != null then vmstateDir else "";
       hasVmstateDir = vmstateDir != null;
+      preferSystemQemuStr = if preferSystemQemu then "true" else "false";
 
     in
     pkgs.writeScriptBin name ''
       #!${pkgs.runtimeShell}
 
       if [ ! -d "bin" ]; then echo "Error: Please run from project root (bin/ missing)."; exit 1; fi
+
+      if [ "${preferSystemQemuStr}" = "true" ]; then
+        if ! command -v "${qemuBin}" >/dev/null 2>&1; then
+          echo "Error: 系统未找到 ${qemuBin}，请安装 QEMU 或改用 nix 提供的 start 目标。"
+          exit 1
+        fi
+      fi
 
       # 端口查找函数：从指定端口开始查找可用端口
       find_available_port() {
@@ -242,11 +251,15 @@ let
       ${
         if hasVmstateDir then
           ''
-            sudo bash -c 'pidfile="$1"; shift; echo $$ > "$pidfile"; exec "$@"' bash "$VMSTATE_DIR/pid" ${qemuBin} ${qemuFlagsStr} "''${NET_ARGS[@]}" -L ${qemuFirmware} "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "$@"
+            sudo bash -c 'pidfile="$1"; shift; echo $$ > "$pidfile"; exec "$@"' bash "$VMSTATE_DIR/pid" ${qemuBin} ${qemuFlagsStr} "''${NET_ARGS[@]}" ${
+              if qemuFirmware != null then "-L ${qemuFirmware}" else ""
+            } "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "$@"
           ''
         else
           ''
-            sudo ${qemuBin} ${qemuFlagsStr} "''${NET_ARGS[@]}" -L ${qemuFirmware} "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "$@"
+            sudo ${qemuBin} ${qemuFlagsStr} "''${NET_ARGS[@]}" ${
+              if qemuFirmware != null then "-L ${qemuFirmware}" else ""
+            } "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "$@"
           ''
       }
     '';
@@ -257,7 +270,11 @@ let
       name = "dragonos-run";
       inherit arch;
       isNographic = if arch == "riscv64" then true else baseConfig.nographic;
-      qemuBin = "${pkgs.qemu_kvm}/bin/qemu-system-${arch}";
+      qemuBin =
+        if preferSystemQemu then
+          "qemu-system-${arch}"
+        else
+          "${pkgs.qemu_kvm}/bin/qemu-system-${arch}";
     }
   );
 in

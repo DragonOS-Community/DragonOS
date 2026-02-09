@@ -20,6 +20,7 @@ cppcheck.xml
 compile_commands.json
 /logs/
 *.log
+.nix-gc-root
 
 # initram
 *.cpio

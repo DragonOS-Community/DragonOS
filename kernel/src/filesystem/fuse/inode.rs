@@ -125,10 +125,59 @@ impl FuseNode {
     }
 
     fn request_name(&self, opcode: u32, nodeid: u64, name: &str) -> Result<Vec<u8>, SystemError> {
+        let payload = Self::pack_name_payload(name);
+        self.conn().request(opcode, nodeid, &payload)
+    }
+
+    fn pack_name_payload(name: &str) -> Vec<u8> {
         let mut payload = Vec::with_capacity(name.len() + 1);
         payload.extend_from_slice(name.as_bytes());
         payload.push(0);
-        self.conn().request(opcode, nodeid, &payload)
+        payload
+    }
+
+    fn pack_struct_and_name_payload<T: Copy>(inarg: &T, name: &str) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(size_of::<T>() + name.len() + 1);
+        payload.extend_from_slice(fuse_pack_struct(inarg));
+        payload.extend_from_slice(name.as_bytes());
+        payload.push(0);
+        payload
+    }
+
+    fn pack_two_names_payload(first: &str, second: &str) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(first.len() + second.len() + 2);
+        payload.extend_from_slice(first.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(second.as_bytes());
+        payload.push(0);
+        payload
+    }
+
+    fn set_open_private_data(
+        &self,
+        data: &mut FilePrivateData,
+        opcode: u32,
+        fh: u64,
+        open_flags: u32,
+        no_open: bool,
+    ) -> Result<(), SystemError> {
+        let conn_any: Arc<dyn core::any::Any + Send + Sync> = self.conn.clone();
+        *data = match opcode {
+            FUSE_OPEN => FilePrivateData::Fuse(FuseFilePrivateData::File(FuseOpenPrivateData {
+                conn: conn_any,
+                fh,
+                open_flags,
+                no_open,
+            })),
+            FUSE_OPENDIR => FilePrivateData::Fuse(FuseFilePrivateData::Dir(FuseOpenPrivateData {
+                conn: conn_any,
+                fh,
+                open_flags,
+                no_open,
+            })),
+            _ => return Err(SystemError::EINVAL),
+        };
+        Ok(())
     }
 
     fn attr_to_metadata(attr: &FuseAttr) -> Metadata {
@@ -207,28 +256,7 @@ impl FuseNode {
         flags: &FileFlags,
     ) -> Result<(), SystemError> {
         if self.conn.should_skip_open(opcode) {
-            let conn_any: Arc<dyn core::any::Any + Send + Sync> = self.conn.clone();
-            match opcode {
-                FUSE_OPEN => {
-                    *data = FilePrivateData::Fuse(FuseFilePrivateData::File(FuseOpenPrivateData {
-                        conn: conn_any,
-                        fh: 0,
-                        open_flags: flags.bits(),
-                        no_open: true,
-                    }));
-                    return Ok(());
-                }
-                FUSE_OPENDIR => {
-                    *data = FilePrivateData::Fuse(FuseFilePrivateData::Dir(FuseOpenPrivateData {
-                        conn: conn_any,
-                        fh: 0,
-                        open_flags: flags.bits(),
-                        no_open: true,
-                    }));
-                    return Ok(());
-                }
-                _ => return Err(SystemError::EINVAL),
-            }
+            return self.set_open_private_data(data, opcode, 0, flags.bits(), true);
         }
 
         let open_in = FuseOpenIn {
@@ -242,56 +270,12 @@ impl FuseNode {
             Ok(v) => v,
             Err(SystemError::ENOSYS) if self.conn.open_enosys_is_supported(opcode) => {
                 self.conn.mark_no_open(opcode);
-                let conn_any: Arc<dyn core::any::Any + Send + Sync> = self.conn.clone();
-                match opcode {
-                    FUSE_OPEN => {
-                        *data =
-                            FilePrivateData::Fuse(FuseFilePrivateData::File(FuseOpenPrivateData {
-                                conn: conn_any,
-                                fh: 0,
-                                open_flags: open_in.flags,
-                                no_open: true,
-                            }));
-                        return Ok(());
-                    }
-                    FUSE_OPENDIR => {
-                        *data =
-                            FilePrivateData::Fuse(FuseFilePrivateData::Dir(FuseOpenPrivateData {
-                                conn: conn_any,
-                                fh: 0,
-                                open_flags: open_in.flags,
-                                no_open: true,
-                            }));
-                        return Ok(());
-                    }
-                    _ => return Err(SystemError::EINVAL),
-                }
+                return self.set_open_private_data(data, opcode, 0, open_in.flags, true);
             }
             Err(e) => return Err(e),
         };
         let out: FuseOpenOut = fuse_read_struct(&payload)?;
-
-        let conn_any: Arc<dyn core::any::Any + Send + Sync> = self.conn.clone();
-        match opcode {
-            FUSE_OPEN => {
-                *data = FilePrivateData::Fuse(FuseFilePrivateData::File(FuseOpenPrivateData {
-                    conn: conn_any,
-                    fh: out.fh,
-                    open_flags: open_in.flags,
-                    no_open: false,
-                }));
-            }
-            FUSE_OPENDIR => {
-                *data = FilePrivateData::Fuse(FuseFilePrivateData::Dir(FuseOpenPrivateData {
-                    conn: conn_any,
-                    fh: out.fh,
-                    open_flags: open_in.flags,
-                    no_open: false,
-                }));
-            }
-            _ => return Err(SystemError::EINVAL),
-        }
-        Ok(())
+        self.set_open_private_data(data, opcode, out.fh, open_in.flags, false)
     }
 
     fn release_common(&self, opcode: u32, fh: u64, open_flags: u32) -> Result<(), SystemError> {
@@ -828,10 +812,7 @@ impl IndexNode for FuseNode {
             umask: 0,
             open_flags: 0,
         };
-        let mut payload_in = Vec::with_capacity(size_of::<FuseCreateIn>() + name.len() + 1);
-        payload_in.extend_from_slice(fuse_pack_struct(&inarg));
-        payload_in.extend_from_slice(name.as_bytes());
-        payload_in.push(0);
+        let payload_in = Self::pack_struct_and_name_payload(&inarg, name);
 
         let payload = match self.conn().request(FUSE_CREATE, self.nodeid, &payload_in) {
             Ok(v) => v,
@@ -857,10 +838,7 @@ impl IndexNode for FuseNode {
                     mode: (InodeMode::S_IFDIR | mode).bits(),
                     umask: 0,
                 };
-                let mut payload_in = Vec::with_capacity(size_of::<FuseMkdirIn>() + name.len() + 1);
-                payload_in.extend_from_slice(fuse_pack_struct(&inarg));
-                payload_in.extend_from_slice(name.as_bytes());
-                payload_in.push(0);
+                let payload_in = Self::pack_struct_and_name_payload(&inarg, name);
                 let payload = self.conn().request(FUSE_MKDIR, self.nodeid, &payload_in)?;
                 let entry: FuseEntryOut = fuse_read_struct(&payload)?;
                 self.create_node_from_entry(&entry)
@@ -872,10 +850,7 @@ impl IndexNode for FuseNode {
                     umask: 0,
                     padding: 0,
                 };
-                let mut payload_in = Vec::with_capacity(size_of::<FuseMknodIn>() + name.len() + 1);
-                payload_in.extend_from_slice(fuse_pack_struct(&inarg));
-                payload_in.extend_from_slice(name.as_bytes());
-                payload_in.push(0);
+                let payload_in = Self::pack_struct_and_name_payload(&inarg, name);
                 let payload = self.conn().request(FUSE_MKNOD, self.nodeid, &payload_in)?;
                 let entry: FuseEntryOut = fuse_read_struct(&payload)?;
                 self.create_node_from_entry(&entry)
@@ -897,11 +872,7 @@ impl IndexNode for FuseNode {
 
     fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
         self.ensure_dir()?;
-        let mut payload_in = Vec::with_capacity(target.len() + name.len() + 2);
-        payload_in.extend_from_slice(target.as_bytes());
-        payload_in.push(0);
-        payload_in.extend_from_slice(name.as_bytes());
-        payload_in.push(0);
+        let payload_in = Self::pack_two_names_payload(target, name);
         let payload = self
             .conn()
             .request(FUSE_SYMLINK, self.nodeid, &payload_in)?;
@@ -918,10 +889,7 @@ impl IndexNode for FuseNode {
         let inarg = FuseLinkIn {
             oldnodeid: target.nodeid,
         };
-        let mut payload_in = Vec::with_capacity(size_of::<FuseLinkIn>() + name.len() + 1);
-        payload_in.extend_from_slice(fuse_pack_struct(&inarg));
-        payload_in.extend_from_slice(name.as_bytes());
-        payload_in.push(0);
+        let payload_in = Self::pack_struct_and_name_payload(&inarg, name);
         let payload = self.conn().request(FUSE_LINK, self.nodeid, &payload_in)?;
         let _entry: FuseEntryOut = fuse_read_struct(&payload)?;
         Ok(())

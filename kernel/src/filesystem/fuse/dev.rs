@@ -85,11 +85,7 @@ impl PollableInode for LockedFuseDevInode {
         let FilePrivateData::Fuse(FuseFilePrivateData::Dev(p)) = private_data else {
             return Err(SystemError::EINVAL);
         };
-        let conn = p
-            .conn
-            .clone()
-            .downcast::<FuseConn>()
-            .map_err(|_| SystemError::EINVAL)?;
+        let conn = p.conn_ref()?;
         Ok(conn.poll().bits() as usize)
     }
 
@@ -101,11 +97,7 @@ impl PollableInode for LockedFuseDevInode {
         let FilePrivateData::Fuse(FuseFilePrivateData::Dev(p)) = private_data else {
             return Err(SystemError::EINVAL);
         };
-        let conn = p
-            .conn
-            .clone()
-            .downcast::<FuseConn>()
-            .map_err(|_| SystemError::EINVAL)?;
+        let conn = p.conn_ref()?;
         conn.add_epitem(epitem)
     }
 
@@ -117,11 +109,7 @@ impl PollableInode for LockedFuseDevInode {
         let FilePrivateData::Fuse(FuseFilePrivateData::Dev(p)) = private_data else {
             return Err(SystemError::EINVAL);
         };
-        let conn = p
-            .conn
-            .clone()
-            .downcast::<FuseConn>()
-            .map_err(|_| SystemError::EINVAL)?;
+        let conn = p.conn_ref()?;
         conn.remove_epitem(epitem)
     }
 }
@@ -148,7 +136,7 @@ impl IndexNode for LockedFuseDevInode {
 
     fn close(&self, data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         if let FilePrivateData::Fuse(FuseFilePrivateData::Dev(p)) = &*data {
-            if let Ok(conn) = p.conn.clone().downcast::<FuseConn>() {
+            if let Ok(conn) = p.conn_ref() {
                 conn.dev_release();
             }
         }
@@ -270,7 +258,10 @@ impl IndexNode for LockedFuseDevInode {
 
                 let old_conn = {
                     let guard = old_file.private_data.lock();
-                    let FilePrivateData::Fuse(FuseFilePrivateData::Dev(p)) = &*guard else {
+                    let FilePrivateData::Fuse(fuse_data) = &*guard else {
+                        return Err(SystemError::EINVAL);
+                    };
+                    let FuseFilePrivateData::Dev(p) = fuse_data else {
                         return Err(SystemError::EINVAL);
                     };
                     p.conn.clone()

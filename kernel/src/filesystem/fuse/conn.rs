@@ -36,6 +36,13 @@ pub struct FuseRequest {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FuseRequestCred {
+    uid: u32,
+    gid: u32,
+    pid: u32,
+}
+
 #[derive(Debug)]
 pub struct FusePendingState {
     unique: u64,
@@ -608,36 +615,18 @@ impl FuseConn {
 
     fn enqueue_noreply(&self, opcode: u32, nodeid: u64, payload: &[u8]) -> Result<(), SystemError> {
         let unique = self.alloc_unique();
-        let hdr = FuseInHeader {
-            len: (core::mem::size_of::<FuseInHeader>() + payload.len()) as u32,
-            opcode,
+        let req = self.build_request(
             unique,
+            opcode,
             nodeid,
-            uid: 0,
-            gid: 0,
-            pid: 0,
-            total_extlen: 0,
-            padding: 0,
-        };
-
-        let mut bytes = Vec::with_capacity(hdr.len as usize);
-        bytes.extend_from_slice(fuse_pack_struct(&hdr));
-        bytes.extend_from_slice(payload);
-        let req = Arc::new(FuseRequest { bytes });
-
-        {
-            let mut g = self.inner.lock();
-            if !g.connected {
-                return Err(SystemError::ENOTCONN);
-            }
-            g.pending.push_back(req);
-        }
-
-        self.read_wait.wakeup(None);
-        let _ = EventPoll::wakeup_epoll(
-            &self.epitems,
-            EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
+            payload,
+            FuseRequestCred {
+                uid: 0,
+                gid: 0,
+                pid: 0,
+            },
         );
+        self.push_request(req, None, unique)?;
         Ok(())
     }
 
@@ -655,15 +644,38 @@ impl FuseConn {
             return Err(SystemError::EACCES);
         }
         let pid = pcb.task_tgid_vnr().map(|p| p.data() as u32).unwrap_or(0);
+        let pending_state = Arc::new(FusePendingState::new(unique, opcode));
+        let req = self.build_request(
+            unique,
+            opcode,
+            nodeid,
+            payload,
+            FuseRequestCred {
+                uid: cred.fsuid.data() as u32,
+                gid: cred.fsgid.data() as u32,
+                pid,
+            },
+        );
+        self.push_request(req, Some(pending_state.clone()), unique)?;
+        Ok(pending_state)
+    }
 
+    fn build_request(
+        &self,
+        unique: u64,
+        opcode: u32,
+        nodeid: u64,
+        payload: &[u8],
+        req_cred: FuseRequestCred,
+    ) -> Arc<FuseRequest> {
         let hdr = FuseInHeader {
             len: (core::mem::size_of::<FuseInHeader>() + payload.len()) as u32,
             opcode,
             unique,
             nodeid,
-            uid: cred.fsuid.data() as u32,
-            gid: cred.fsgid.data() as u32,
-            pid,
+            uid: req_cred.uid,
+            gid: req_cred.gid,
+            pid: req_cred.pid,
             total_extlen: 0,
             padding: 0,
         };
@@ -671,17 +683,24 @@ impl FuseConn {
         let mut bytes = Vec::with_capacity(hdr.len as usize);
         bytes.extend_from_slice(fuse_pack_struct(&hdr));
         bytes.extend_from_slice(payload);
+        Arc::new(FuseRequest { bytes })
+    }
 
-        let req = Arc::new(FuseRequest { bytes });
-        let pending_state = Arc::new(FusePendingState::new(unique, opcode));
-
+    fn push_request(
+        &self,
+        req: Arc<FuseRequest>,
+        pending_state: Option<Arc<FusePendingState>>,
+        unique: u64,
+    ) -> Result<(), SystemError> {
         {
             let mut g = self.inner.lock();
             if !g.connected {
                 return Err(SystemError::ENOTCONN);
             }
             g.pending.push_back(req);
-            g.processing.insert(unique, pending_state.clone());
+            if let Some(pending) = pending_state {
+                g.processing.insert(unique, pending);
+            }
         }
 
         self.read_wait.wakeup(None);
@@ -689,7 +708,7 @@ impl FuseConn {
             &self.epitems,
             EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
         );
-        Ok(pending_state)
+        Ok(())
     }
 
     pub fn write_reply(&self, data: &[u8]) -> Result<usize, SystemError> {

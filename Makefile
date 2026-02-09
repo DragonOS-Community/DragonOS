@@ -34,6 +34,9 @@ FMT_CHECK?=0
 
 # 是否跳过grub自动安装。CI环境或纯nographic运行可以设置为1以节省时间。
 SKIP_GRUB ?= 0
+# RootFS manifest name under config/rootfs-manifests/
+ROOTFS_MANIFEST ?= default
+export ROOTFS_MANIFEST
 # CI环境默认跳过
 ifneq ($(CI),)
 SKIP_GRUB := 1
@@ -53,7 +56,7 @@ else
 	FMT_CHECK=
 endif
 
-# Check if ARCH matches the arch field in dadk-manifest.toml
+# Check if ARCH matches the arch field in rootfs manifest
 check_arch:
 	@bash tools/check_arch.sh
 
@@ -74,15 +77,20 @@ check_nix:
 .PHONY: all
 all: kernel user
 
+.PHONY: prepare_rootfs_manifest
+prepare_rootfs_manifest:
+	@echo "Resolving rootfs manifest: $(ROOTFS_MANIFEST)"
+	@ROOT_PATH=$(ROOT_PATH) ARCH=$(ARCH) ROOTFS_MANIFEST=$(ROOTFS_MANIFEST) bash tools/rootfs_manifest_resolve.sh
+
 
 .PHONY: kernel
-kernel: check_arch
+kernel: prepare_rootfs_manifest
 	mkdir -p bin/kernel/
 
 	$(MAKE) -C ./kernel all ARCH=$(ARCH) || (sh -c "echo 内核编译失败" && exit 1)
 
 .PHONY: user
-user: check_arch
+user: prepare_rootfs_manifest
 ifeq ($(IN_NIX_ENV),1)
 	@echo "⚠️  警告: 在 Nix 环境中使用 'make user' 已被弃用"
 	@echo "   请使用: nix run .#rootfs-$(ARCH)"
@@ -157,7 +165,7 @@ rootfs: check_nix
 	nix run .#rootfs-x86_64
 
 # 写入磁盘镜像
-write_diskimage: check_arch
+write_diskimage: prepare_rootfs_manifest
 ifeq ($(IN_NIX_ENV),1)
 	@echo "⚠️  警告: 在 Nix 环境中使用 'make write_diskimage' 已被弃用"
 	@echo "   请使用: nix run .#rootfs-$(ARCH)"
@@ -166,12 +174,12 @@ ifeq ($(IN_NIX_ENV),1)
 	nix run .#rootfs-$(ARCH)
 else
 	@echo "write_diskimage arch=$(ARCH)"
-	bash -c "export ARCH=$(ARCH); cd tools && $(GRUB_PREPARE_CMD) && sudo DADK=$(DADK) $(GRUB_SKIP_ENV) ARCH=$(ARCH) bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=legacy && cd .."
+	bash -c "export ARCH=$(ARCH); export ROOTFS_MANIFEST=$(ROOTFS_MANIFEST); cd tools && $(GRUB_PREPARE_CMD) && sudo DADK=$(DADK) $(GRUB_SKIP_ENV) ARCH=$(ARCH) ROOTFS_MANIFEST=$(ROOTFS_MANIFEST) bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=legacy && cd .."
 endif
 
 # 写入磁盘镜像(uefi)
-write_diskimage-uefi: check_arch
-	bash -c "export ARCH=$(ARCH); cd tools && $(GRUB_PREPARE_CMD) && sudo DADK=$(DADK) $(GRUB_SKIP_ENV) ARCH=$(ARCH) bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=uefi && cd .."
+write_diskimage-uefi: prepare_rootfs_manifest
+	bash -c "export ARCH=$(ARCH); export ROOTFS_MANIFEST=$(ROOTFS_MANIFEST); cd tools && $(GRUB_PREPARE_CMD) && sudo DADK=$(DADK) $(GRUB_SKIP_ENV) ARCH=$(ARCH) ROOTFS_MANIFEST=$(ROOTFS_MANIFEST) bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=uefi && cd .."
 # 不编译，直接启动QEMU
 qemu: check_arch
 ifeq ($(IN_NIX_ENV),1)
@@ -208,41 +216,41 @@ qemu-uefi-vnc: check_arch
 	sh -c "cd tools && bash run-qemu.sh --bios=uefi --display=vnc && cd .."
 
 # 编译并写入磁盘镜像
-build: check_arch
+build: prepare_rootfs_manifest
 	$(MAKE) all -j $(NPROCS)
 	$(MAKE) write_diskimage || exit 1
 
 # 在docker中编译，并写入磁盘镜像
-docker: check_arch
+docker: prepare_rootfs_manifest
 	@echo "使用docker构建"
 	sudo bash tools/build_in_docker.sh || exit 1
 	$(MAKE) write_diskimage || exit 1
 
 # uefi方式启动
-run-uefi: check_arch
+run-uefi: prepare_rootfs_manifest
 	$(MAKE) all -j $(NPROCS)
 	$(MAKE) write_diskimage-uefi || exit 1
 	$(MAKE) qemu-uefi
 
 # 编译并启动QEMU
-run: check_arch
+run: prepare_rootfs_manifest
 	$(MAKE) all -j $(NPROCS)
 	$(MAKE) write_diskimage || exit 1
 	$(MAKE) qemu
 
 # uefi方式启动，使用VNC Display作为图像输出
-run-uefi-vnc: check_arch
+run-uefi-vnc: prepare_rootfs_manifest
 	$(MAKE) all -j $(NPROCS)
 	$(MAKE) write_diskimage-uefi || exit 1
 	$(MAKE) qemu-uefi-vnc
 
 # 编译并启动QEMU，使用VNC Display作为图像输出
-run-vnc: check_arch
+run-vnc: prepare_rootfs_manifest
 	$(MAKE) all -j $(NPROCS)
 	$(MAKE) write_diskimage || exit 1
 	$(MAKE) qemu-vnc
 
-run-nographic: check_arch
+run-nographic: prepare_rootfs_manifest
 ifeq ($(IN_NIX_ENV),1)
 	@echo "⚠️  警告: 在 Nix 环境中使用 'make run-nographic' 已被弃用"
 	@echo "   请使用: nix run .#yolo-$(ARCH)"
@@ -256,13 +264,13 @@ else
 	$(MAKE) qemu-nographic
 endif
 # 在docker中编译，并启动QEMU
-run-docker: check_arch
+run-docker: prepare_rootfs_manifest
 	@echo "使用docker构建并运行"
 	sudo bash tools/build_in_docker.sh || exit 1
 	$(MAKE) write_diskimage || exit 1
 	$(MAKE) qemu
 
-test-syscall: check_arch
+test-syscall: prepare_rootfs_manifest
 	@echo "构建运行并执行syscall测试"
 	bash user/apps/tests/syscall/gvisor/toggle_compile_gvisor.sh enable
 	$(MAKE) all -j $(NPROCS)
@@ -337,6 +345,7 @@ help:
 	@echo ""
 	@echo "环境变量:"
 	@echo "  DISK_SAVE_MODE=1     - 启用磁盘节省模式，在写入磁盘镜像前清理构建缓存"
+	@echo "  ROOTFS_MANIFEST=name - 选择 config/rootfs-manifests 下的清单（默认 default）"
 	@echo ""
 	@echo "  make update-submodules - 更新子模块"
 	@echo "  make update-submodules-by-mirror - 从镜像更新子模块"

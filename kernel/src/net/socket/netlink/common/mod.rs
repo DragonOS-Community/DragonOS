@@ -1,19 +1,22 @@
 use crate::{
     filesystem::{
         epoll::EPollEventType,
-        vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId},
+        vfs::{fasync::FAsyncItems, iov::IoVecs, vcore::generate_inode_id, InodeId},
     },
     libs::{rwsem::RwSem, wait_queue::WaitQueue},
-    net::socket::{
-        common::{parse_timeval_opt, write_timeval_opt},
-        endpoint::Endpoint,
-        netlink::{
-            addr::{multicast::GroupIdSet, NetlinkSocketAddr},
-            common::{bound::BoundNetlink, unbound::UnboundNetlink},
-            table::SupportedNetlinkProtocol,
+    net::{
+        posix::SockAddr,
+        socket::{
+            common::{parse_timeval_opt, write_timeval_opt},
+            endpoint::Endpoint,
+            netlink::{
+                addr::{multicast::GroupIdSet, NetlinkSocketAddr},
+                common::{bound::BoundNetlink, unbound::UnboundNetlink},
+                table::SupportedNetlinkProtocol,
+            },
+            utils::datagram_common::{select_remote_and_bind, Bound, Inner},
+            AddressFamily, Socket, PMSG, PSO, PSOCK, PSOL,
         },
-        utils::datagram_common::{select_remote_and_bind, Bound, Inner},
-        AddressFamily, Socket, PMSG, PSO, PSOCK, PSOL,
     },
     process::{namespace::net_namespace::NetNamespace, ProcessManager},
 };
@@ -88,15 +91,52 @@ where
         &self,
         buf: &mut [u8],
         flags: crate::net::socket::PMSG,
-    ) -> Result<(usize, Endpoint), SystemError> {
-        let (recv_bytes, endpoint) = self
-            .inner
-            .read()
-            .try_recv(buf, flags)
-            .map(|(recv_bytes, remote_endpoint)| (recv_bytes, remote_endpoint.into()))?;
+    ) -> Result<(usize, usize, Endpoint), SystemError> {
+        let (recv_bytes, orig_len, endpoint) = self.inner.read().try_recv(buf, flags).map(
+            |(recv_bytes, orig_len, remote_endpoint)| {
+                (recv_bytes, orig_len, remote_endpoint.into())
+            },
+        )?;
         // todo self.pollee.invalidate();
 
-        Ok((recv_bytes, endpoint))
+        Ok((recv_bytes, orig_len, endpoint))
+    }
+
+    #[inline]
+    fn recv_return_len(copy_len: usize, orig_len: usize, flags: PMSG) -> usize {
+        if flags.contains(PMSG::TRUNC) {
+            orig_len
+        } else {
+            copy_len
+        }
+    }
+
+    fn recv_from_inner(
+        &self,
+        buffer: &mut [u8],
+        flags: crate::net::socket::PMSG,
+        address: Option<crate::net::socket::endpoint::Endpoint>,
+    ) -> Result<(usize, usize, crate::net::socket::endpoint::Endpoint), system_error::SystemError>
+    {
+        if let Some(addr) = address {
+            let endpoint = addr.try_into()?;
+            self.inner
+                .write()
+                .connect(&endpoint, self.wait_queue.clone(), self.netns())?;
+        }
+
+        if self.is_nonblocking() || flags.contains(PMSG::DONTWAIT) {
+            self.try_recv(buffer, flags)
+        } else {
+            loop {
+                match self.try_recv(buffer, flags) {
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                        let _ = wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {});
+                    }
+                    result => break result,
+                }
+            }
+        }
     }
 
     /// 判断当前的netlink是否可以接收数据
@@ -168,24 +208,8 @@ where
         flags: crate::net::socket::PMSG,
         address: Option<crate::net::socket::endpoint::Endpoint>,
     ) -> Result<(usize, crate::net::socket::endpoint::Endpoint), system_error::SystemError> {
-        // log::info!("NetlinkSocket recv_from called");
-        if let Some(addr) = address {
-            self.connect(addr)?;
-        }
-
-        return if self.is_nonblocking() || flags.contains(PMSG::DONTWAIT) {
-            self.try_recv(buffer, flags)
-        } else {
-            loop {
-                match self.try_recv(buffer, flags) {
-                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                        let _ = wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {});
-                    }
-                    result => break result,
-                }
-            }
-        };
-        // self.try_recv(buffer, flags)
+        let (copy_len, orig_len, endpoint) = self.recv_from_inner(buffer, flags, address)?;
+        Ok((Self::recv_return_len(copy_len, orig_len, flags), endpoint))
     }
 
     fn check_io_event(&self) -> crate::filesystem::epoll::EPollEventType {
@@ -211,10 +235,28 @@ where
 
     fn recv_msg(
         &self,
-        _msg: &mut crate::net::posix::MsgHdr,
-        _flags: PMSG,
+        msg: &mut crate::net::posix::MsgHdr,
+        flags: PMSG,
     ) -> Result<usize, SystemError> {
-        todo!("implement recv_msg for netlink socket");
+        let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
+        let mut buf = iovs.new_buf(true);
+
+        let (copy_len, orig_len, endpoint) = self.recv_from_inner(&mut buf, flags, None)?;
+        iovs.scatter(&buf[..copy_len])?;
+
+        if !msg.msg_name.is_null() {
+            let actual_len = endpoint.write_to_user_msghdr(msg.msg_name, msg.msg_namelen)?;
+            msg.msg_namelen = actual_len;
+        } else {
+            msg.msg_namelen = 0;
+        }
+
+        msg.msg_controllen = 0;
+        msg.msg_flags = 0;
+        if orig_len > copy_len {
+            msg.msg_flags |= PMSG::TRUNC.bits() as i32;
+        }
+        Ok(Self::recv_return_len(copy_len, orig_len, flags))
     }
 
     fn send(&self, buffer: &[u8], flags: PMSG) -> Result<usize, SystemError> {
@@ -266,12 +308,16 @@ where
         }
     }
 
-    fn send_msg(
-        &self,
-        _msg: &crate::net::posix::MsgHdr,
-        _flags: PMSG,
-    ) -> Result<usize, SystemError> {
-        todo!("implement send_msg for netlink socket");
+    fn send_msg(&self, msg: &crate::net::posix::MsgHdr, flags: PMSG) -> Result<usize, SystemError> {
+        let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, false)? };
+        let data = iovs.gather()?;
+
+        if msg.msg_name.is_null() || msg.msg_namelen == 0 {
+            self.send(&data, flags)
+        } else {
+            let endpoint = SockAddr::to_endpoint(msg.msg_name as *const SockAddr, msg.msg_namelen)?;
+            self.send_to(&data, flags, endpoint)
+        }
     }
 
     fn set_option(&self, level: PSOL, name: usize, val: &[u8]) -> Result<(), SystemError> {

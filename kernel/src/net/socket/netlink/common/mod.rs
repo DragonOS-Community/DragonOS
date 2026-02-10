@@ -5,6 +5,7 @@ use crate::{
     },
     libs::{rwsem::RwSem, wait_queue::WaitQueue},
     net::socket::{
+        common::{parse_timeval_opt, write_timeval_opt},
         endpoint::Endpoint,
         netlink::{
             addr::{multicast::GroupIdSet, NetlinkSocketAddr},
@@ -12,12 +13,12 @@ use crate::{
             table::SupportedNetlinkProtocol,
         },
         utils::datagram_common::{select_remote_and_bind, Bound, Inner},
-        Socket, PMSG,
+        AddressFamily, Socket, PMSG, PSO, PSOCK, PSOL,
     },
     process::{namespace::net_namespace::NetNamespace, ProcessManager},
 };
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, AtomicUsize};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use system_error::SystemError;
 
 pub(super) mod bound;
@@ -30,6 +31,10 @@ pub struct NetlinkSocket<P: SupportedNetlinkProtocol> {
     is_nonblocking: AtomicBool,
     wait_queue: Arc<WaitQueue>,
     netns: Arc<NetNamespace>,
+    socket_type: PSOCK,
+    protocol: u32,
+    send_timeout_us: AtomicU64,
+    recv_timeout_us: AtomicU64,
     fasync_items: FAsyncItems,
     inode_id: InodeId,
     open_files: AtomicUsize,
@@ -39,13 +44,17 @@ impl<P: SupportedNetlinkProtocol> NetlinkSocket<P>
 where
     BoundNetlink<P::Message>: Bound<Endpoint = NetlinkSocketAddr>,
 {
-    pub fn new(is_nonblocking: bool) -> Arc<Self> {
+    pub fn new(is_nonblocking: bool, socket_type: PSOCK, protocol: u32) -> Arc<Self> {
         let unbound = UnboundNetlink::new();
         Arc::new(Self {
             inner: RwSem::new(Inner::Unbound(unbound)),
             is_nonblocking: AtomicBool::new(is_nonblocking),
             wait_queue: Arc::new(WaitQueue::default()),
             netns: ProcessManager::current_netns(),
+            socket_type,
+            protocol,
+            send_timeout_us: AtomicU64::new(u64::MAX),
+            recv_timeout_us: AtomicU64::new(u64::MAX),
             fasync_items: FAsyncItems::default(),
             inode_id: generate_inode_id(),
             open_files: AtomicUsize::new(0),
@@ -212,12 +221,80 @@ where
         self.try_send(buffer, None, flags)
     }
 
+    fn option(&self, level: PSOL, name: usize, value: &mut [u8]) -> Result<usize, SystemError> {
+        if !matches!(level, PSOL::SOCKET) {
+            return Err(SystemError::ENOPROTOOPT);
+        }
+
+        let opt = PSO::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
+        match opt {
+            PSO::TYPE => {
+                if value.len() < core::mem::size_of::<i32>() {
+                    return Err(SystemError::EINVAL);
+                }
+                let v = self.socket_type as i32;
+                value[..4].copy_from_slice(&v.to_ne_bytes());
+                Ok(4)
+            }
+            PSO::DOMAIN => {
+                if value.len() < core::mem::size_of::<i32>() {
+                    return Err(SystemError::EINVAL);
+                }
+                let v = AddressFamily::Netlink as i32;
+                value[..4].copy_from_slice(&v.to_ne_bytes());
+                Ok(4)
+            }
+            PSO::PROTOCOL => {
+                if value.len() < core::mem::size_of::<i32>() {
+                    return Err(SystemError::EINVAL);
+                }
+                let v = self.protocol as i32;
+                value[..4].copy_from_slice(&v.to_ne_bytes());
+                Ok(4)
+            }
+            PSO::SNDTIMEO_OLD | PSO::SNDTIMEO_NEW => {
+                let us = self.send_timeout_us.load(Ordering::Relaxed);
+                let us = if us == u64::MAX { 0 } else { us };
+                write_timeval_opt(value, us)
+            }
+            PSO::RCVTIMEO_OLD | PSO::RCVTIMEO_NEW => {
+                let us = self.recv_timeout_us.load(Ordering::Relaxed);
+                let us = if us == u64::MAX { 0 } else { us };
+                write_timeval_opt(value, us)
+            }
+            _ => Err(SystemError::ENOPROTOOPT),
+        }
+    }
+
     fn send_msg(
         &self,
         _msg: &crate::net::posix::MsgHdr,
         _flags: PMSG,
     ) -> Result<usize, SystemError> {
         todo!("implement send_msg for netlink socket");
+    }
+
+    fn set_option(&self, level: PSOL, name: usize, val: &[u8]) -> Result<(), SystemError> {
+        if !matches!(level, PSOL::SOCKET) {
+            return Err(SystemError::ENOPROTOOPT);
+        }
+
+        let opt = PSO::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
+        match opt {
+            PSO::SNDTIMEO_OLD | PSO::SNDTIMEO_NEW => {
+                let d = parse_timeval_opt(val)?;
+                let us = d.map(|v| v.total_micros()).unwrap_or(u64::MAX);
+                self.send_timeout_us.store(us, Ordering::Relaxed);
+                Ok(())
+            }
+            PSO::RCVTIMEO_OLD | PSO::RCVTIMEO_NEW => {
+                let d = parse_timeval_opt(val)?;
+                let us = d.map(|v| v.total_micros()).unwrap_or(u64::MAX);
+                self.recv_timeout_us.store(us, Ordering::Relaxed);
+                Ok(())
+            }
+            _ => Err(SystemError::ENOPROTOOPT),
+        }
     }
 
     fn do_close(&self) -> Result<(), SystemError> {
@@ -242,11 +319,12 @@ where
     }
 
     fn remote_endpoint(&self) -> Result<Endpoint, SystemError> {
-        if let Some(addr) = self.inner.read().peer_addr() {
-            Ok(addr.into())
-        } else {
-            Err(SystemError::ENOTCONN)
-        }
+        let peer = self
+            .inner
+            .read()
+            .peer_addr()
+            .unwrap_or(NetlinkSocketAddr::new_unspecified());
+        Ok(peer.into())
     }
 
     fn socket_inode_id(&self) -> InodeId {
@@ -256,14 +334,12 @@ where
 
 impl<P: SupportedNetlinkProtocol> NetlinkSocket<P> {
     pub fn is_nonblocking(&self) -> bool {
-        self.is_nonblocking
-            .load(core::sync::atomic::Ordering::Relaxed)
+        self.is_nonblocking.load(Ordering::Relaxed)
     }
 
     #[allow(unused)]
     pub fn set_nonblocking(&self, nonblocking: bool) {
-        self.is_nonblocking
-            .store(nonblocking, core::sync::atomic::Ordering::Relaxed);
+        self.is_nonblocking.store(nonblocking, Ordering::Relaxed);
     }
 }
 

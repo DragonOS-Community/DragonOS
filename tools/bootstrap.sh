@@ -690,7 +690,7 @@ fi
 rustInstall
 
 # 安装dadk
-cargo +nightly install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v0.6.0 || exit 1
+cargo +nightly install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v0.6.1 || exit 1
 
 bashpath=$(cd `dirname $0`; pwd)
 

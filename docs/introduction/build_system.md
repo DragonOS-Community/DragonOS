@@ -257,6 +257,8 @@ make run-docker
 (_build_system_command)=
 ## 6.编译命令讲解
 
+**关于如何配置 RootFS（`ROOTFS_MANIFEST`、base 镜像、包集合切换），请先阅读：{ref}`DADK RootFS Manifest 配置（非 Nix） <_dadk_rootfs_manifest>`**
+
 - 本地编译，不运行: `make all -j 您的CPU核心数`
 - 本地编译，并写入磁盘镜像，不运行: `make build`
 - 本地编译，写入磁盘镜像，并在QEMU中运行: `make run`

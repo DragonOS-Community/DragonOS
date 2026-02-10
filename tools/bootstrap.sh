@@ -107,7 +107,7 @@ ask_install_mode()
 	echo ""
 	echo "请选择安装模式:"
 	echo "  1) nix    - 仅安装 Nix，使用 nix develop 进入开发环境 (推荐)"
-	echo "  2) legacy - 安装 Nix 后继续安装传统依赖 (完整安装)"
+	echo "  2) legacy - 不安装 Nix，仅安装传统依赖 (完整安装)"
 	echo ""
 	printf "请输入选项 (1/2) [默认: 1]: "
 	read mode_choice
@@ -143,7 +143,7 @@ install_ubuntu_debian_pkg()
         lsb-release \
         llvm-dev libclang-dev clang gcc-multilib \
         gcc build-essential fdisk dosfstools dnsmasq bridge-utils iptables libssl-dev pkg-config \
-		python3-sphinx make git
+		python3-sphinx make git meson ninja-build
 	# 必须分开安装，否则会出现错误
 	sudo "$1" install ${APT_FLAG} -y \
 		gcc-riscv64-unknown-elf gcc-riscv64-linux-gnu linux-libc-dev-riscv64-cross gdb-multiarch
@@ -186,7 +186,7 @@ gentoo()
     echo "正在更新包管理器的列表..."
     sudo "${pkgman}" --sync
     echo "正在安装所需的包..."
-    sudo "${pkgman}"  net-misc/curl net-misc/wget net-misc/bridge-utils net-dns/dnsmasq sys-apps/diffutils dev-util/pkgconf sys-apps/which app-arch/unzip sys-apps/util-linux sys-fs/dosfstools sys-devel/gcc dev-build/make sys-devel/flex sys-apps/texinfo dev-libs/gmp dev-libs/mpfr app-emulation/qemu dev-libs/mpc dev-libs/openssl
+    sudo "${pkgman}"  net-misc/curl net-misc/wget net-misc/bridge-utils net-dns/dnsmasq sys-apps/diffutils dev-util/pkgconf sys-apps/which app-arch/unzip sys-apps/util-linux sys-fs/dosfstools sys-devel/gcc dev-build/make sys-devel/flex sys-apps/texinfo dev-libs/gmp dev-libs/mpfr app-emulation/qemu dev-libs/mpc dev-libs/openssl dev-util/meson dev-util/ninja
 }
 
 install_archlinux_pkg()
@@ -200,7 +200,7 @@ install_archlinux_pkg()
 	curl wget bridge-utils dnsmasq \
         diffutils pkgconf which unzip util-linux dosfstools \
         gcc make flex texinfo gmp mpfr qemu-base \
-        libmpc openssl
+        libmpc openssl meson ninja
 
 }
 
@@ -240,6 +240,9 @@ install_centos_pkg()
 
 	echo "安装dnsmasq"
 	sudo dnf install -y dnsmasq
+
+	echo "正在安装 Meson 和 Ninja..."
+	sudo dnf install -y meson ninja-build
 }
 
 install_osx_pkg()
@@ -250,7 +253,13 @@ install_osx_pkg()
 
 freebsd()
 {
-    echo "Checking QEMU installation on FreeBSD..."
+    echo "Checking QEMU and Meson installation on FreeBSD..."
+
+    # 检查并安装 Meson 和 Ninja
+    if ! pkg info -q meson; then
+        echo "Meson is not installed. Installing via pkg..."
+        sudo pkg update && sudo pkg install -y meson ninja-build
+    fi
 
     # 检查 QEMU 是否已安装
     if pkg info -q qemu; then
@@ -414,7 +423,7 @@ while true; do
 		"--help")
 			echo "--no-docker(not install docker): 该参数表示执行该脚本的过程中不单独安装docker."
 			echo "--nix: 仅安装 Nix，使用 nix develop 进入开发环境."
-			echo "--legacy: 安装 Nix 后继续安装传统依赖 (完整安装)."
+			echo "--legacy: 不安装 Nix，仅安装传统依赖 (完整安装)."
 			exit 0
 		;;
 		*)
@@ -430,17 +439,15 @@ banner 			# 开始横幅
 # 询问安装模式
 ask_install_mode
 
-# 安装 Nix
-install_nix
-
 # 如果是 nix 模式，直接结束
 if [ "$INSTALL_MODE" = "nix" ]; then
+	install_nix
 	congratulations_nix
 	exit 0
 fi
 
 # 以下是 legacy 模式的安装流程
-echo "继续安装传统依赖..."
+echo "安装传统依赖..."
 
 if [ "Darwin" == "$(uname -s)" ]; then
 	install_osx_pkg "$emulator" || exit 1
@@ -478,7 +485,7 @@ fi
 rustInstall
 
 # 安装dadk
-cargo +nightly install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v0.5.1 || exit 1
+cargo +nightly install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v0.6.0 || exit 1
 
 bashpath=$(cd `dirname $0`; pwd)
 

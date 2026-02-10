@@ -11,14 +11,14 @@ jobs:
     name: Format check ${{ matrix.arch }}
     runs-on: ubuntu-latest
     continue-on-error: true
-    container: dragonos/dragonos-dev:v1.19
+    container: dragonos/dragonos-dev:v1.21
 
     strategy:
       matrix:
         arch: [x86_64, riscv64, loongarch64]
 
     steps:
-      - run: echo "Running in dragonos/dragonos-dev:v1.19"
+      - run: echo "Running in dragonos/dragonos-dev:v1.21"
       - uses: actions/checkout@v3
 
       - name: Change source
@@ -33,21 +33,20 @@ jobs:
         run: |
           printf "\n" >> kernel/src/include/bindings/bindings.rs
           printf "\n" >> kernel/src/init/version_info.rs
-          sed -i 's/arch = ".*"/arch = "${{ matrix.arch }}"/' dadk-manifest.toml
           FMT_CHECK=1 make fmt
 
   kernel-static-test:
     name: Kernel static test ${{ matrix.arch }}
     runs-on: ubuntu-latest
     continue-on-error: true
-    container: dragonos/dragonos-dev:v1.19
+    container: dragonos/dragonos-dev:v1.21
 
     strategy:
       matrix:
         arch: [x86_64, riscv64, loongarch64]
 
     steps:
-      - run: echo "Running in dragonos/dragonos-dev:v1.19"
+      - run: echo "Running in dragonos/dragonos-dev:v1.21"
 
       - uses: actions/checkout@v3
 
@@ -65,7 +64,7 @@ jobs:
   build:
     name: Build ${{ matrix.arch }}
     runs-on: ubuntu-latest
-    container: dragonos/dragonos-dev:v1.19
+    container: dragonos/dragonos-dev:v1.21
     continue-on-error: true
     strategy:
       matrix:
@@ -82,7 +81,7 @@ jobs:
             checkout_params: {}
 
     steps:
-      - run: echo "Running in dragonos/dragonos-dev:v1.19"
+      - run: echo "Running in dragonos/dragonos-dev:v1.21"
 
       - uses: actions/checkout@v3
         with: ${{ matrix.checkout_params }}
@@ -104,5 +103,4 @@ jobs:
           if [[ "$ARCH" == "x86_64" ]]; then
             export DragonOS_GCC=$HOME/opt/dragonos-gcc/gcc-x86_64-unknown-none/bin
           fi
-          sed -i 's/arch = ".*"/arch = "${{ env.ARCH }}"/' dadk-manifest.toml
           make ${{ matrix.make_target }} -j $(nproc)

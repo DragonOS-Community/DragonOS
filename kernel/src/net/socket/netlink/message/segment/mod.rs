@@ -73,11 +73,19 @@ pub trait SegmentBody: Sized + Clone + Copy {
             return Err(SystemError::EINVAL);
         }
 
-        let c_type_bytes = &buf[..size_of::<Self::CType>()];
+        let ctype_size = size_of::<Self::CType>();
+        if total_len < ctype_size || buf.len() < ctype_size {
+            return Err(SystemError::EINVAL);
+        }
+
+        let c_type_bytes = &buf[..ctype_size];
         let c_type = unsafe { *(c_type_bytes.as_ptr() as *const Self::CType) };
         // log::info!("c_type: {:?}", c_type);
 
         let total_len_with_padding = Self::total_len_with_padding();
+        if total_len < total_len_with_padding {
+            return Err(SystemError::EINVAL);
+        }
 
         let Ok(body) = c_type.try_into() else {
             return Err(SystemError::EINVAL);

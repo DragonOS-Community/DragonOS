@@ -11,8 +11,23 @@ use crate::net::socket::netlink::{
         },
         ProtocolSegment,
     },
-    route::message::segment::{addr::AddrSegment, link::LinkSegment, route::RouteSegment},
+    route::message::{
+        attr::{addr::AddrAttr, link::LinkAttr, route::RouteAttr},
+        segment::{
+            addr::{AddrMessageFlags, AddrSegment, AddrSegmentBody, CIfaddrMsg, RtScope},
+            link::{CIfinfoMsg, LinkMessageFlags, LinkSegment, LinkSegmentBody},
+            route::{
+                CRtMsg, RouteFlags, RouteProtocol, RouteScope, RouteSegment, RouteSegmentBody,
+                RouteTable, RouteType,
+            },
+        },
+    },
 };
+use crate::{
+    driver::net::types::{InterfaceFlags, InterfaceType},
+    net::socket::AddressFamily,
+};
+use alloc::vec::Vec;
 use system_error::SystemError;
 
 #[derive(Debug)]
@@ -72,7 +87,12 @@ impl ProtocolSegment for RouteNlSegment {
         }
 
         let header = unsafe { *(buf.as_ptr() as *const CMsgSegHdr) };
-        let payload_buf = &buf[header_size..];
+        let segment_len = header.len as usize;
+        if segment_len < header_size || buf.len() < segment_len {
+            return Err(SystemError::EINVAL);
+        }
+        let payload_len = segment_len - header_size;
+        let payload_buf = &buf[header_size..segment_len];
 
         let segment = match CSegmentType::try_from(header.type_)? {
             CSegmentType::NEWADDR => {
@@ -82,13 +102,25 @@ impl ProtocolSegment for RouteNlSegment {
                 RouteNlSegment::DelAddr(AddrSegment::read_from_buf(header, payload_buf)?)
             }
             CSegmentType::GETADDR => {
-                RouteNlSegment::GetAddr(AddrSegment::read_from_buf(header, payload_buf)?)
+                if payload_len < size_of::<CIfaddrMsg>() {
+                    RouteNlSegment::GetAddr(read_short_getaddr_segment(header, payload_buf)?)
+                } else {
+                    RouteNlSegment::GetAddr(AddrSegment::read_from_buf(header, payload_buf)?)
+                }
             }
             CSegmentType::GETROUTE => {
-                RouteNlSegment::GetRoute(RouteSegment::read_from_buf(header, payload_buf)?)
+                if payload_len < size_of::<CRtMsg>() {
+                    RouteNlSegment::GetRoute(read_short_getroute_segment(header, payload_buf)?)
+                } else {
+                    RouteNlSegment::GetRoute(RouteSegment::read_from_buf(header, payload_buf)?)
+                }
             }
             CSegmentType::GETLINK => {
-                RouteNlSegment::GetLink(LinkSegment::read_from_buf(header, payload_buf)?)
+                if payload_len < size_of::<CIfinfoMsg>() {
+                    RouteNlSegment::GetLink(read_short_getlink_segment(header, payload_buf)?)
+                } else {
+                    RouteNlSegment::GetLink(LinkSegment::read_from_buf(header, payload_buf)?)
+                }
             }
             _ => return Err(SystemError::EINVAL),
         };
@@ -118,4 +150,65 @@ impl ProtocolSegment for RouteNlSegment {
     fn protocol(&self) -> crate::net::socket::netlink::table::StandardNetlinkProtocol {
         crate::net::socket::netlink::table::StandardNetlinkProtocol::ROUTE
     }
+}
+
+fn read_short_getlink_segment(
+    header: CMsgSegHdr,
+    payload: &[u8],
+) -> Result<LinkSegment, SystemError> {
+    let family = read_rtgen_family(payload)?;
+    let body = LinkSegmentBody {
+        family,
+        type_: InterfaceType::NETROM,
+        index: None,
+        flags: InterfaceFlags::empty(),
+        change: LinkMessageFlags::empty(),
+        pad: None,
+    };
+    let mut segment = LinkSegment::new(header, body, Vec::<LinkAttr>::new());
+    segment.header_mut().len = header.len;
+    Ok(segment)
+}
+
+fn read_short_getaddr_segment(
+    header: CMsgSegHdr,
+    payload: &[u8],
+) -> Result<AddrSegment, SystemError> {
+    let family = read_rtgen_family(payload)?;
+    let body = AddrSegmentBody {
+        family: family as i32,
+        prefix_len: 0,
+        flags: AddrMessageFlags::empty(),
+        scope: RtScope::UNIVERSE,
+        index: None,
+    };
+    let mut segment = AddrSegment::new(header, body, Vec::<AddrAttr>::new());
+    segment.header_mut().len = header.len;
+    Ok(segment)
+}
+
+fn read_short_getroute_segment(
+    header: CMsgSegHdr,
+    payload: &[u8],
+) -> Result<RouteSegment, SystemError> {
+    let family = read_rtgen_family(payload)?;
+    let body = RouteSegmentBody {
+        family,
+        dst_len: 0,
+        src_len: 0,
+        tos: 0,
+        table: RouteTable::Unspec,
+        protocol: RouteProtocol::Unspec,
+        scope: RouteScope::Universe,
+        type_: RouteType::Unspec,
+        flags: RouteFlags::empty(),
+    };
+    let mut segment = RouteSegment::new(header, body, Vec::<RouteAttr>::new());
+    segment.header_mut().len = header.len;
+    Ok(segment)
+}
+
+fn read_rtgen_family(payload: &[u8]) -> Result<AddressFamily, SystemError> {
+    let family = payload.first().copied().ok_or(SystemError::EINVAL)?;
+    AddressFamily::try_from(family as u16).map_err(|_| SystemError::EINVAL)
 }

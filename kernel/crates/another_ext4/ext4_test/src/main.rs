@@ -4,6 +4,7 @@ use simple_logger::SimpleLogger;
 use std::sync::Arc;
 
 mod block_file;
+mod rename_exchange_test;
 
 const ROOT_INO: u32 = EXT4_ROOT_INO;
 
@@ -146,4 +147,6 @@ fn main() {
     println!("remove file test done");
     xattr_test(&mut ext4);
     println!("xattr test done");
+    rename_exchange_test::rename_exchange_test(&mut ext4);
+    println!("rename_exchange test done");
 }

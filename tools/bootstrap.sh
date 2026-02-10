@@ -261,7 +261,7 @@ install_nix()
 	# 配置 Nix 镜像
 	setup_nix_mirror
 
-	if [ -n "$(which nix)" ]; then
+	if command -v nix >/dev/null 2>&1; then
 		echo "Nix 已经安装在您的系统上。"
 	else
 		echo "正在安装 Nix 包管理器..."
@@ -275,11 +275,6 @@ install_nix()
 			fi
 		fi
 		set +o pipefail
-
-		if [ $? -ne 0 ]; then
-			echo "Nix 安装失败！"
-			exit 1
-		fi
 
 		echo "Nix 安装成功！"
 

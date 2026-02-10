@@ -5,7 +5,7 @@ DADK ?= dadk
 
 DADK_VERSION=$(shell dadk -V | awk 'END {print $$2}')
 # 最小的DADK版本
-MIN_DADK_VERSION = 0.6.0
+MIN_DADK_VERSION = 0.6.1
 DADK_CACHE_DIR = $(ROOT_PATH)/bin/dadk_cache
 # 统一使用由 tools/rootfs_manifest_resolve.sh 生成的 manifest
 DADK_MANIFEST_FILE ?= $(ROOT_PATH)/dadk-manifest.generated.toml

@@ -64,13 +64,14 @@ impl datagram_common::Bound for BoundNetlink<KobjectUeventMessage> {
         &self,
         writer: &mut [u8],
         flags: PMSG,
-    ) -> Result<(usize, Self::Endpoint), SystemError> {
+    ) -> Result<(usize, usize, Self::Endpoint), SystemError> {
         let mut receive_queue = self.receive_queue.0.lock();
         let Some(message) = receive_queue.front() else {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         };
 
-        let copied = writer.len().min(message.as_bytes().len());
+        let orig_len = message.as_bytes().len();
+        let copied = writer.len().min(orig_len);
         if copied > 0 {
             writer[..copied].copy_from_slice(&message.as_bytes()[..copied]);
         }
@@ -79,7 +80,7 @@ impl datagram_common::Bound for BoundNetlink<KobjectUeventMessage> {
             receive_queue.pop_front();
         }
 
-        Ok((copied, NetlinkSocketAddr::new_unspecified()))
+        Ok((copied, orig_len, NetlinkSocketAddr::new_unspecified()))
     }
 
     fn check_io_events(&self) -> EPollEventType {

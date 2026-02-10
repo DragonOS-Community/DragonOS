@@ -76,7 +76,7 @@ fn add_addr(request_segment: &AddrSegment, netns: Arc<NetNamespace>) -> Result<(
     let flags = NewRequestFlags::from_bits_truncate(request_segment.header().flags);
 
     let mut exists = false;
-    let mut pushed = true;
+    let mut pushed = false;
 
     iface.smol_iface().lock().update_ip_addrs(|ip_addrs| {
         exists = ip_addrs.contains(&cidr);
@@ -89,8 +89,8 @@ fn add_addr(request_segment: &AddrSegment, netns: Arc<NetNamespace>) -> Result<(
                 IpAddress::Ipv6(_) => ip_addrs.len(),
             };
 
-            if ip_addrs.insert(insert_index, cidr).is_err() {
-                pushed = false;
+            if ip_addrs.insert(insert_index, cidr).is_ok() {
+                pushed = true;
             }
         }
     });
@@ -102,12 +102,13 @@ fn add_addr(request_segment: &AddrSegment, netns: Arc<NetNamespace>) -> Result<(
         return Err(SystemError::EEXIST);
     }
 
-    if flags.contains(NewRequestFlags::REPLACE) {
-        return Err(SystemError::ENOENT);
-    }
-
     if !pushed {
         return Err(SystemError::ENOSPC);
+    }
+
+    if let Err(err) = add_local_route(&iface, cidr) {
+        rollback_added_addr(&iface, cidr);
+        return Err(err);
     }
 
     sync_router_ip_addrs(&iface);
@@ -132,6 +133,7 @@ fn del_addr(request_segment: &AddrSegment, netns: Arc<NetNamespace>) -> Result<(
         return Err(SystemError::EADDRNOTAVAIL);
     }
 
+    remove_local_route(&iface, cidr);
     sync_router_ip_addrs(&iface);
 
     Ok(())
@@ -248,4 +250,65 @@ fn sync_router_ip_addrs(iface: &Arc<dyn Iface>) {
     let mut router_ip_addrs = iface.router_common().ip_addrs.write();
     router_ip_addrs.clear();
     router_ip_addrs.extend_from_slice(&smol_ip_addrs);
+}
+
+fn add_local_route(iface: &Arc<dyn Iface>, cidr: IpCidr) -> Result<(), SystemError> {
+    let mut pushed = false;
+    let via_router = cidr.address();
+
+    iface.smol_iface().lock().routes_mut().update(|routes| {
+        let exists = routes
+            .iter()
+            .any(|route| is_same_local_route(route, cidr, via_router));
+        if exists {
+            pushed = true;
+            return;
+        }
+
+        pushed = routes
+            .push(smoltcp::iface::Route {
+                cidr,
+                via_router,
+                preferred_until: None,
+                expires_at: None,
+            })
+            .is_ok();
+    });
+
+    if !pushed {
+        log::warn!(
+            "netlink add_addr: route table full while adding local route {} via {}",
+            cidr,
+            via_router
+        );
+        return Err(SystemError::ENOSPC);
+    }
+
+    Ok(())
+}
+
+fn remove_local_route(iface: &Arc<dyn Iface>, cidr: IpCidr) {
+    let via_router = cidr.address();
+    iface.smol_iface().lock().routes_mut().update(|routes| {
+        if let Some(index) = routes
+            .iter()
+            .position(|route| is_same_local_route(route, cidr, via_router))
+        {
+            routes.remove(index);
+        }
+    });
+}
+
+fn rollback_added_addr(iface: &Arc<dyn Iface>, cidr: IpCidr) {
+    iface.smol_iface().lock().update_ip_addrs(|ip_addrs| {
+        if let Some(index) = ip_addrs.iter().position(|configured| *configured == cidr) {
+            ip_addrs.remove(index);
+        }
+    });
+    sync_router_ip_addrs(iface);
+}
+
+#[inline]
+fn is_same_local_route(route: &smoltcp::iface::Route, cidr: IpCidr, via_router: IpAddress) -> bool {
+    route.cidr == cidr && route.via_router == via_router
 }

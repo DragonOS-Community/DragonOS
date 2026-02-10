@@ -110,6 +110,8 @@ socket_ipv4_udp_unbound_loopback_test
 socket_ipv4_udp_unbound_loopback_nogotsan_test
 socket_netlink_test
 socket_ip_unbound_netlink_test
+socket_ipv4_udp_unbound_loopback_netlink_test
+socket_ipv6_udp_unbound_loopback_netlink_test
 
 # 信号处理测试
 sigaction_test

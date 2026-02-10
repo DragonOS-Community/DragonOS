@@ -1,4 +1,4 @@
-FROM dragonos/dragonos-dev:v1.20
+FROM dragonos/dragonos-dev:v1.21
 
 # 设置环境变量
 ENV TZ=Asia/Shanghai

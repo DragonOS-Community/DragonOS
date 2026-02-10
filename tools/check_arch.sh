@@ -2,7 +2,7 @@
 
 BASE_PATH=$(pwd)
 # 定义错误信息
-ARCH_MISMATCH_ERROR="Error: ARCH in env.mk does not match arch in dadk-manifest.toml"
+ARCH_MISMATCH_ERROR="Error: ARCH in env.mk does not match arch in rootfs manifest"
 
 if [ -z "$ARCH" ]; then
     echo "Error: ARCH environment variable is not set." >&2
@@ -27,11 +27,36 @@ fi
 echo "Checking $CHECK_PATH"
 
 
-# 读取dadk-manifest.toml文件中的arch字段
-DADK_ARCH=$(grep -oP '(?<=arch = ")[^"]+' $CHECK_PATH/dadk-manifest.toml)
+ROOTFS_MANIFEST=${ROOTFS_MANIFEST:=default}
+ROOTFS_MANIFEST_PATH="${CHECK_PATH}/config/rootfs-manifests/${ROOTFS_MANIFEST}.toml"
+
+if [ ! -f "${ROOTFS_MANIFEST_PATH}" ]; then
+    echo "Error: rootfs manifest not found: ${ROOTFS_MANIFEST_PATH}" >&2
+    exit 1
+fi
+
+MANIFEST_ARCH_RAW=$(awk '
+    BEGIN { in_meta = 0 }
+    /^\[metadata\]/ { in_meta = 1; next }
+    /^\[/ { in_meta = 0 }
+    in_meta && /^[[:space:]]*arch[[:space:]]*=/ {
+        line = $0
+        sub(/^[^=]*=[[:space:]]*/, "", line)
+        gsub(/"/, "", line)
+        gsub(/[[:space:]]/, "", line)
+        print line
+        exit
+    }
+' "${ROOTFS_MANIFEST_PATH}")
+
+if [ -z "$MANIFEST_ARCH_RAW" ] || [ "$MANIFEST_ARCH_RAW" = "*" ]; then
+    MANIFEST_ARCH="$ARCH"
+else
+    MANIFEST_ARCH="$MANIFEST_ARCH_RAW"
+fi
 
 # 检查arch字段是否为x86_64
-if [ "$ARCH" != $DADK_ARCH ]; then
+if [ "$ARCH" != "$MANIFEST_ARCH" ]; then
     echo "$ARCH_MISMATCH_ERROR" >&2
     exit 1
 else

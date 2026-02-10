@@ -17,7 +17,7 @@ jobs:
     name: Build slab_stress (host)
     runs-on: ubuntu-latest
     container:
-      image: dragonos/dragonos-dev:v1.20
+      image: dragonos/dragonos-dev:v1.21
       options: --privileged -v /dev:/dev
     steps:
       - name: Checkout DragonOS code
@@ -46,7 +46,7 @@ jobs:
         size: [64, 128, 255, 256]
         seed: [1, 2, 3]
     container:
-      image: dragonos/dragonos-dev:v1.20
+      image: dragonos/dragonos-dev:v1.21
       options: --privileged -v /dev:/dev
     steps:
       - name: Checkout DragonOS code

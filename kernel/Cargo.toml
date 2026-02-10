@@ -74,6 +74,8 @@ smoltcp = { version = "=0.12.0", git = "https://git.mirrors.dragonos.org.cn/Drag
     "medium-ip",
     "log",
     "multicast",
+    "iface-max-addr-count-8",
+    "iface-max-route-count-8",
     "iface-max-multicast-group-count-8"
 ] }
 syscall_table_macros = { path = "crates/syscall_table_macros" }

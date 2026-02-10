@@ -657,7 +657,7 @@ if [ "$INSTALL_MODE" = "nix" ]; then
 fi
 
 # 以下是 legacy 模式的安装流程（不安装 Nix，仅安装传统依赖）
-echo "继续安装传统依赖..."
+echo "安装传统依赖..."
 
 if [ "Darwin" == "$(uname -s)" ]; then
 	install_osx_pkg "$emulator" || exit 1
@@ -695,7 +695,7 @@ fi
 rustInstall
 
 # 安装dadk
-cargo +nightly install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v0.5.1 || exit 1
+cargo +nightly install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v0.6.0 || exit 1
 
 bashpath=$(cd `dirname $0`; pwd)
 

@@ -20,6 +20,7 @@ pub enum RouteNlSegment {
     NewLink(LinkSegment),
     GetLink(LinkSegment),
     NewAddr(AddrSegment),
+    DelAddr(AddrSegment),
     GetAddr(AddrSegment),
     Done(DoneSegment),
     Error(ErrorSegment),
@@ -34,9 +35,9 @@ impl ProtocolSegment for RouteNlSegment {
             RouteNlSegment::NewRoute(route_segment)
             | RouteNlSegment::DelRoute(route_segment)
             | RouteNlSegment::GetRoute(route_segment) => route_segment.header(),
-            RouteNlSegment::NewAddr(addr_segment) | RouteNlSegment::GetAddr(addr_segment) => {
-                addr_segment.header()
-            }
+            RouteNlSegment::NewAddr(addr_segment)
+            | RouteNlSegment::DelAddr(addr_segment)
+            | RouteNlSegment::GetAddr(addr_segment) => addr_segment.header(),
             RouteNlSegment::NewLink(link_segment) | RouteNlSegment::GetLink(link_segment) => {
                 link_segment.header()
             }
@@ -52,9 +53,9 @@ impl ProtocolSegment for RouteNlSegment {
             RouteNlSegment::NewRoute(route_segment)
             | RouteNlSegment::DelRoute(route_segment)
             | RouteNlSegment::GetRoute(route_segment) => route_segment.header_mut(),
-            RouteNlSegment::NewAddr(addr_segment) | RouteNlSegment::GetAddr(addr_segment) => {
-                addr_segment.header_mut()
-            }
+            RouteNlSegment::NewAddr(addr_segment)
+            | RouteNlSegment::DelAddr(addr_segment)
+            | RouteNlSegment::GetAddr(addr_segment) => addr_segment.header_mut(),
             RouteNlSegment::NewLink(link_segment) | RouteNlSegment::GetLink(link_segment) => {
                 link_segment.header_mut()
             }
@@ -74,6 +75,12 @@ impl ProtocolSegment for RouteNlSegment {
         let payload_buf = &buf[header_size..];
 
         let segment = match CSegmentType::try_from(header.type_)? {
+            CSegmentType::NEWADDR => {
+                RouteNlSegment::NewAddr(AddrSegment::read_from_buf(header, payload_buf)?)
+            }
+            CSegmentType::DELADDR => {
+                RouteNlSegment::DelAddr(AddrSegment::read_from_buf(header, payload_buf)?)
+            }
             CSegmentType::GETADDR => {
                 RouteNlSegment::GetAddr(AddrSegment::read_from_buf(header, payload_buf)?)
             }
@@ -92,7 +99,9 @@ impl ProtocolSegment for RouteNlSegment {
     fn write_to(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
         // log::info!("RouteNlSegment write_to");
         let copied = match self {
-            RouteNlSegment::NewAddr(addr_segment) => addr_segment.write_to_buf(buf)?,
+            RouteNlSegment::NewAddr(addr_segment) | RouteNlSegment::DelAddr(addr_segment) => {
+                addr_segment.write_to_buf(buf)?
+            }
             RouteNlSegment::NewRoute(route_segment) => route_segment.write_to_buf(buf)?,
             RouteNlSegment::NewLink(link_segment) => link_segment.write_to_buf(buf)?,
             RouteNlSegment::Done(done_segment) => done_segment.write_to_buf(buf)?,

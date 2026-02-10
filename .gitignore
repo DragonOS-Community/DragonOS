@@ -21,6 +21,8 @@ compile_commands.json
 /logs/
 *.log
 .nix-gc-root
+dadk-manifest.generated.toml
+config/rootfs.generated.toml
 
 # initram
 *.cpio

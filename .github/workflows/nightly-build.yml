@@ -20,7 +20,7 @@ jobs:
     env:
       HOME: /root
     container:
-      image: dragonos/dragonos-dev:v1.20
+      image: dragonos/dragonos-dev:v1.21
       options: --privileged -v /dev:/dev
     steps:
       - name: Checkout DragonOS code

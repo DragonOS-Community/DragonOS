@@ -276,7 +276,7 @@ test-syscall: prepare_rootfs_manifest
 	$(MAKE) all -j $(NPROCS)
 	@if [ "$(DISK_SAVE_MODE)" = "1" ]; then \
 		echo "磁盘节省模式启用，正在清理用户程序构建缓存..."; \
-		$(DADK) user clean --level in-src; \
+		$(DADK) -f $(ROOT_PATH)/dadk-manifest.generated.toml user clean --level in-src -w $(ROOT_PATH); \
 	fi
 	SKIP_GRUB=1 $(MAKE) write_diskimage || exit 1
 	$(MAKE) qemu-nographic AUTO_TEST=syscall SYSCALL_TEST_DIR=/opt/tests/gvisor &

@@ -47,7 +47,13 @@ toml_get() {
     fi
 }
 
-manifest_arch="$(toml_get "metadata" "arch" "${ARCH}")"
+manifest_arch_raw="$(toml_get "metadata" "arch" "")"
+if [ -z "${manifest_arch_raw}" ] || [ "${manifest_arch_raw}" = "*" ]; then
+    # Missing or wildcard arch means "follow current ARCH".
+    manifest_arch="${ARCH}"
+else
+    manifest_arch="${manifest_arch_raw}"
+fi
 fs_type="$(toml_get "rootfs" "fs_type" "fat32")"
 size="$(toml_get "rootfs" "size" "2G")"
 partition="$(toml_get "rootfs" "partition" "mbr")"
@@ -56,7 +62,7 @@ pull_policy="$(toml_get "base" "pull_policy" "if-not-present")"
 user_config_dir="$(toml_get "user" "config_dir" "user/dadk/config")"
 
 if [ "${manifest_arch}" != "${ARCH}" ]; then
-    echo "Error: ARCH mismatch, env ARCH=${ARCH}, rootfs manifest arch=${manifest_arch}" >&2
+    echo "Error: ARCH mismatch, env ARCH=${ARCH}, rootfs manifest arch=${manifest_arch_raw}" >&2
     exit 1
 fi
 

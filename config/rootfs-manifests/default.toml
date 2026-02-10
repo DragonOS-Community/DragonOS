@@ -1,6 +1,6 @@
 [metadata]
 name = "default"
-arch = "x86_64"
+arch = "*"
 
 [rootfs]
 fs_type = "fat32"

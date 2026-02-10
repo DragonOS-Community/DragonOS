@@ -35,7 +35,7 @@ if [ ! -f "${ROOTFS_MANIFEST_PATH}" ]; then
     exit 1
 fi
 
-DADK_ARCH=$(awk '
+MANIFEST_ARCH_RAW=$(awk '
     BEGIN { in_meta = 0 }
     /^\[metadata\]/ { in_meta = 1; next }
     /^\[/ { in_meta = 0 }
@@ -49,13 +49,14 @@ DADK_ARCH=$(awk '
     }
 ' "${ROOTFS_MANIFEST_PATH}")
 
-if [ -z "$DADK_ARCH" ]; then
-    echo "Error: Failed to parse arch from manifest." >&2
-    exit 1
+if [ -z "$MANIFEST_ARCH_RAW" ] || [ "$MANIFEST_ARCH_RAW" = "*" ]; then
+    MANIFEST_ARCH="$ARCH"
+else
+    MANIFEST_ARCH="$MANIFEST_ARCH_RAW"
 fi
 
 # 检查arch字段是否为x86_64
-if [ "$ARCH" != $DADK_ARCH ]; then
+if [ "$ARCH" != "$MANIFEST_ARCH" ]; then
     echo "$ARCH_MISMATCH_ERROR" >&2
     exit 1
 else

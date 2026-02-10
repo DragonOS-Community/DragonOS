@@ -51,12 +51,11 @@ impl datagram_common::Bound for BoundNetlink<RouteNlMessage> {
                 return Err(e);
             }
             Err(e) => {
-                // 传播错误，静默处理
                 log::warn!(
                     "netlink_send: failed to read netlink message from buffer: {:?}",
                     e
                 );
-                return Ok(sum_lens);
+                return Err(e);
             }
         };
 

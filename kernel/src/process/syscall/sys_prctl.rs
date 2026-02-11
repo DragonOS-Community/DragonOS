@@ -2,15 +2,10 @@ use alloc::string::ToString;
 use core::{cmp, ffi::c_int, mem};
 use num_traits::FromPrimitive;
 
-use alloc::{
-    borrow::ToOwned,
-    string::String,
-    sync::{Arc, Weak},
-    vec::Vec,
-};
+use alloc::{borrow::ToOwned, string::String, vec::Vec};
 use system_error::SystemError;
 
-use crate::process::cred::Cred;
+use crate::process::cred::{CAPFlags, Cred};
 
 use crate::{
     arch::{interrupt::TrapFrame, ipc::signal::Signal, syscall::nr::SYS_PRCTL},
@@ -22,6 +17,25 @@ use crate::{
 };
 
 const TASK_COMM_LEN: usize = 16;
+
+/// Linux 定义了 41 个 capability (索引 0-40)
+const CAP_LAST_CAP: usize = 40;
+
+/// 将 capability 索引转换为 CAPFlags
+///
+/// # 参数
+/// - `idx`: capability 索引 (0-40)
+///
+/// # 返回
+/// - 成功返回对应的 CAPFlags
+/// - 失败返回 EINVAL (索引超出范围)
+fn capability_from_index(idx: usize) -> Result<CAPFlags, SystemError> {
+    if idx > CAP_LAST_CAP {
+        return Err(SystemError::EINVAL);
+    }
+    let cap_bit = 1u64 << idx;
+    CAPFlags::from_bits(cap_bit).ok_or(SystemError::EINVAL)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, FromPrimitive)]
 #[repr(usize)]
@@ -178,47 +192,34 @@ impl Syscall for SysPrctl {
 
             PrctlOption::CapBsetRead => {
                 // PR_CAPBSET_READ: 检查某个 capability 是否在 bounding set 中
-                // arg2 是 capability 的编号
-                use crate::process::cred::CAPFlags;
-                let cap_bit = 1usize << arg2;
-                let cap_flag =
-                    CAPFlags::from_bits(cap_bit as u64).unwrap_or(CAPFlags::CAP_EMPTY_SET);
+                // arg2 是 capability 的编号 (0-40)
+                let cap_flag = capability_from_index(arg2)?;
                 let cred = current.cred();
                 let has_cap = cred.cap_bset.contains(cap_flag);
                 Ok(if has_cap { 1 } else { 0 })
             }
             PrctlOption::CapBsetDrop => {
                 // PR_CAPBSET_DROP: 从 bounding set 中删除某个 capability
-                // arg2 是 capability 的编号
-                use crate::process::cred::CAPFlags;
-                let cap_bit = 1usize << arg2;
-                let cap_flag =
-                    CAPFlags::from_bits(cap_bit as u64).unwrap_or(CAPFlags::CAP_EMPTY_SET);
+                // arg2 是 capability 的编号 (0-40)
+                // 需要 CAP_SETPCAP 权限
+                let cap_flag = capability_from_index(arg2)?;
 
-                // 获取当前 cred，克隆并修改 cap_bset，然后设置回去
                 let old_cred = current.cred();
-                let new_bset = old_cred.cap_bset & !cap_flag;
+                // Linux: PR_CAPBSET_DROP 需要 CAP_SETPCAP 权限
+                if !old_cred.has_capability(CAPFlags::CAP_SETPCAP) {
+                    return Err(SystemError::EPERM);
+                }
 
-                // 创建新的 cred
-                let new_cred = Arc::new(Cred {
-                    self_ref: Weak::new(),
-                    uid: old_cred.uid,
-                    gid: old_cred.gid,
-                    suid: old_cred.suid,
-                    sgid: old_cred.sgid,
-                    euid: old_cred.euid,
-                    egid: old_cred.egid,
-                    groups: old_cred.groups.clone(),
-                    fsuid: old_cred.fsuid,
-                    fsgid: old_cred.fsgid,
-                    cap_inheritable: old_cred.cap_inheritable,
-                    cap_permitted: old_cred.cap_permitted,
-                    cap_effective: old_cred.cap_effective,
-                    cap_bset: new_bset,
-                    cap_ambient: old_cred.cap_ambient,
-                    group_info: old_cred.group_info.clone(),
-                    user_ns: old_cred.user_ns.clone(),
-                });
+                // 检查 capability 是否已在 bounding set 中
+                if !old_cred.cap_bset.contains(cap_flag) {
+                    // 已经不在 bounding set 中，直接返回成功
+                    return Ok(0);
+                }
+
+                // 使用 Clone trait 简化代码
+                let mut new_cred = old_cred.as_ref().clone();
+                new_cred.cap_bset.remove(cap_flag);
+                let new_cred = Cred::new_arc(new_cred);
 
                 current.set_cred(new_cred)?;
                 Ok(0)

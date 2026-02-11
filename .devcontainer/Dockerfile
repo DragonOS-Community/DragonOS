@@ -1,4 +1,4 @@
-FROM ubuntu:jammy
+FROM dragonos/dragonos-dev:v1.21
 
 # 设置环境变量
 ENV TZ=Asia/Shanghai
@@ -12,20 +12,12 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 RUN apt update && \
     apt install --no-install-recommends -y \
     ca-certificates curl gnupg wget sudo apt-utils && \
-    groupadd -g 1000 dragonos && \
+    (getent group 1000 >/dev/null || groupadd -g 1000 dragonos) && \
     useradd -m -u 1000 -g 1000 -s /bin/bash dragonos && \
     echo "dragonos ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
 # 设置工作目录
 USER dragonos
-WORKDIR /tmp
-
-COPY ../tools/*.sh ./
-
-RUN bash bootstrap.sh --default --ci && \
-    sudo apt autoremove -q -y && \
-    sudo apt clean -q -y && \
-    sudo rm -rf /tmp/*
 
 WORKDIR /home/dragonos
 

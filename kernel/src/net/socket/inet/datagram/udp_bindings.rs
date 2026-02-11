@@ -127,6 +127,29 @@ pub fn deliver_multicast_all(
     delivered
 }
 
+pub fn deliver_broadcast_all(
+    netns: &Arc<NetNamespace>,
+    dest: IpEndpoint,
+    src: IpEndpoint,
+    ifindex: i32,
+    payload: &[u8],
+) -> usize {
+    let candidates = match_udp_bindings(netns, dest.addr, dest.port);
+    if candidates.is_empty() {
+        return 0;
+    }
+    let mut delivered = 0;
+    for cand in candidates {
+        if cand
+            .socket
+            .inject_loopback_packet(src, dest.addr, dest.port, ifindex, payload)
+        {
+            delivered += 1;
+        }
+    }
+    delivered
+}
+
 fn match_udp_bindings(
     netns: &Arc<NetNamespace>,
     dest_addr: IpAddress,

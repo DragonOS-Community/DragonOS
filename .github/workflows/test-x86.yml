@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     container:
-      image: dragonos/dragonos-dev:v1.19
+      image: dragonos/dragonos-dev:v1.21
       options: --privileged -v /dev:/dev
     steps:
       - name: Checkout DragonOS code

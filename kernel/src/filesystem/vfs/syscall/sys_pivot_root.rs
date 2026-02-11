@@ -7,28 +7,22 @@
 //! - new_root 和 put_old 都必须是目录
 //! - 当前工作目录不能在 put_old 中
 //! - 需要 CAP_SYS_CHROOT 权限
-
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_PIVOT_ROOT;
 use crate::filesystem::vfs::mount::{MountFS, MountFSInode};
 use crate::filesystem::vfs::permission::PermissionMask;
 use crate::filesystem::vfs::{
-    utils::user_path_at, FileType, IndexNode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    utils::{is_ancestor_limited, user_path_at},
+    FileType, IndexNode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 use crate::process::cred::CAPFlags;
+use crate::process::namespace::mnt::MntNamespace;
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::vfs_check_and_clone_cstr;
-use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use system_error::SystemError;
-
-/// is_ancestor() 遍历父目录的最大深度
-///
-/// 用于防止在文件系统损坏或存在循环引用时出现无限循环。
-/// 1000 层对于正常使用场景来说绰绰有余（Linux 默认的链接数限制也远低于此）。
-const MAX_ANCESTOR_TRAVERSAL_DEPTH: u32 = 1000;
 
 pub struct SysPivotRootHandle;
 
@@ -174,7 +168,7 @@ impl Syscall for SysPivotRootHandle {
             return Err(SystemError::EINVAL);
         } else {
             // 验证 put_old 是 new_root 的后代（即 put_old 在 new_root 之下）
-            let is_descendant = Self::is_ancestor(&new_root_inode, &put_old_inode)?;
+            let is_descendant = is_ancestor_limited(&new_root_inode, &put_old_inode)?;
             if !is_descendant {
                 log::error!("[pivot_root] put_old is not a descendant of new_root");
                 return Err(SystemError::EINVAL);
@@ -185,7 +179,7 @@ impl Syscall for SysPivotRootHandle {
         // 只有当 new_root 和 put_old 不同时才需要检查
         if !is_same_inode {
             let cwd = pcb.fs_struct().pwd();
-            let cwd_in_putold = Self::is_ancestor(&put_old_inode, &cwd)?;
+            let cwd_in_putold = is_ancestor_limited(&put_old_inode, &cwd)?;
             if cwd_in_putold {
                 log::error!("[pivot_root] current working directory is inside put_old");
                 return Err(SystemError::EBUSY);
@@ -261,105 +255,42 @@ impl SysPivotRootHandle {
     }
 
     /// 获取 inode 对应的 MountFS
-    /// 如果 inode 不是 MountFSInode，尝试通过其他方式获取其所在的 MountFS
+    ///
+    /// 如果 inode 是 MountFSInode，直接返回其所在的 MountFS。
+    /// 否则，通过挂载命名空间查找匹配的 MountFS。
+    ///
+    /// 查找策略（按优先级排序）：
+    /// 1. 直接从 MountFSInode 获取
+    /// 2. 查找设置了 bind_target_root 的 MountFS（bind mount 标记）
+    /// 3. 通过文件系统指针查找
+    /// 4. 通过文件系统名称查找（后备方案）
     fn get_mountfs(inode: &Arc<dyn IndexNode>) -> Result<Arc<MountFS>, SystemError> {
-        log::debug!("[pivot_root] get_mountfs: inode type={:?}", inode.type_id());
-
-        // 尝试将 inode 转换为 MountFSInode
+        // 1. 尝试直接从 MountFSInode 获取
         if let Some(mountfs_inode) = inode.as_any_ref().downcast_ref::<MountFSInode>() {
-            log::debug!("[pivot_root] get_mountfs: found MountFSInode");
             return Ok(mountfs_inode.mount_fs().clone());
         }
 
-        // 如果不是 MountFSInode，尝试从文件系统获取其挂载信息
-        log::debug!(
-            "[pivot_root] get_mountfs: not a MountFSInode, trying to find containing mount"
-        );
-
-        // 获取当前进程的挂载命名空间
         let mnt_ns = ProcessManager::current_mntns();
-
-        // 获取 inode 所在的文件系统
         let inode_fs = inode.fs();
 
-        // 关键修复：遍历所有挂载点，找到最精确的匹配
-        // 在容器场景中，我们需要找到 bind mount 创建的 MountFS
-        //
-        // 策略：
-        // 1. 优先选择设置了 bind_target_root 的 MountFS（这是 bind mount 的标记）
-        // 2. 在设置了 bind_target_root 的挂载点中，选择路径最短的（最上层的）
-        // 3. 如果没有找到，则选择路径最短的（最上层的）作为后备
-        let mount_list = mnt_ns.mount_list().clone_inner();
-        let mut candidates: Vec<(Arc<MountFS>, usize, String)> = Vec::new(); // (MountFS, 路径长度, 路径字符串)
-
-        for (path, mnt_fs) in mount_list.iter() {
-            let inner_fs = mnt_fs.inner_filesystem();
-            // 检查这个 MountFS 是否包装了 inode 所在的文件系统
-            if Arc::ptr_eq(&inner_fs, &inode_fs) || inner_fs.name() == inode_fs.name() {
-                let path_str = path.as_str().to_string();
-                let path_len = path_str.len();
-                candidates.push((mnt_fs.clone(), path_len, path_str));
-                log::debug!("[pivot_root] get_mountfs: found candidate MountFS for path={:?}, id={:?}, len={}",
-                           path, mnt_fs.mount_id(), path_len);
-            }
-        }
-
-        // 首先尝试找到设置了 bind_target_root 的挂载点
-        // 这些是 bind mount 创建的，适合用作容器的根文件系统
-        let mut bind_mount_candidates: Vec<(Arc<MountFS>, usize, String)> = Vec::new();
-
-        for (mnt_fs, path_len, path_str) in candidates.iter() {
-            if mnt_fs.bind_target_root().is_some() {
-                bind_mount_candidates.push((mnt_fs.clone(), *path_len, path_str.clone()));
-                log::debug!(
-                    "[pivot_root] get_mountfs: found bind mount candidate id={:?}, path={:?}",
-                    mnt_fs.mount_id(),
-                    path_str
-                );
-            }
-        }
-
-        // 如果找到了设置了 bind_target_root 的挂载点，在其中选择路径最短的
-        if !bind_mount_candidates.is_empty() {
-            bind_mount_candidates.sort_by(|a, b| a.1.cmp(&b.1));
-            if let Some((mnt_fs, _, path_str)) = bind_mount_candidates.first() {
-                log::debug!(
-                    "[pivot_root] get_mountfs: returning bind mount match id={:?}, path={:?}",
-                    mnt_fs.mount_id(),
-                    path_str
-                );
-                return Ok(mnt_fs.clone());
-            }
-        }
-
-        // 如果没有找到 bind mount，选择路径最短的（最上层的）作为后备
-        candidates.sort_by(|a, b| a.1.cmp(&b.1));
-        if let Some((mnt_fs, _, path_str)) = candidates.first() {
-            log::debug!(
-                "[pivot_root] get_mountfs: returning shortest match id={:?}, path={:?}",
-                mnt_fs.mount_id(),
-                path_str
-            );
-            return Ok(mnt_fs.clone());
-        }
-
-        // 如果找不到合适的，尝试通过文件系统查找对应的 MountFS（后备方案）
-        if let Some(mount_fs) = mnt_ns.mount_list().find_mount_by_fs(&inode_fs) {
-            log::debug!("[pivot_root] get_mountfs: found MountFS by filesystem lookup (fallback)");
+        // 2. 查找 bind mount 候选
+        if let Some(mount_fs) = Self::find_bind_mount(&mnt_ns, &inode_fs) {
             return Ok(mount_fs);
         }
 
-        // 如果找不到，尝试通过文件系统名称比较来查找
-        let root_inode = mnt_ns.root_inode();
-        let root_fs = root_inode.fs();
+        // 3. 通过文件系统指针查找
+        if let Some(mount_fs) = mnt_ns.mount_list().find_mount_by_fs(&inode_fs) {
+            log::debug!("[pivot_root] get_mountfs: found MountFS by filesystem lookup");
+            return Ok(mount_fs);
+        }
 
-        // 如果 inode 的文件系统和根文件系统类型相同（名称相同）
+        // 4. 通过文件系统名称查找（后备方案）
+        let root_fs = mnt_ns.root_inode().fs();
         if inode_fs.name() == root_fs.name() {
             log::debug!("[pivot_root] get_mountfs: fs name matches root, returning root_mntfs");
             return Ok(mnt_ns.root_mntfs().clone());
         }
 
-        // 如果还是找不到，返回错误
         log::error!(
             "[pivot_root] get_mountfs: cannot find MountFS for inode type={:?}, fs={}",
             inode.type_id(),
@@ -368,60 +299,45 @@ impl SysPivotRootHandle {
         Err(SystemError::EINVAL)
     }
 
-    /// 检查 target_inode 是否是 ancestor_inode 的后代
+    /// 查找 bind mount 创建的 MountFS
     ///
-    /// 通过向上遍历 target_inode 的父目录链，检查是否能到达 ancestor_inode
-    fn is_ancestor(
-        ancestor_inode: &Arc<dyn IndexNode>,
-        target_inode: &Arc<dyn IndexNode>,
-    ) -> Result<bool, SystemError> {
-        // 获取 ancestor 的 inode id
-        let ancestor_id = ancestor_inode.metadata()?.inode_id;
-        let ancestor_fs = ancestor_inode.fs();
+    /// 在挂载列表中查找包装了指定文件系统且设置了 bind_target_root 的 MountFS。
+    /// 如果有多个候选，选择路径最短的（最上层的）。
+    fn find_bind_mount(
+        mnt_ns: &Arc<MntNamespace>,
+        inode_fs: &Arc<dyn crate::filesystem::vfs::FileSystem>,
+    ) -> Option<Arc<MountFS>> {
+        let mount_list = mnt_ns.mount_list().clone_inner();
+        let mut bind_mount_candidates: Vec<(Arc<MountFS>, usize)> = Vec::new();
 
-        log::debug!(
-            "[pivot_root] is_ancestor: ancestor_id={:?}, ancestor_fs={}",
-            ancestor_id,
-            ancestor_fs.name()
-        );
-
-        // 从 target_inode 开始向上遍历
-        let mut current = target_inode.clone();
-
-        // 最多向上遍历 MAX_ANCESTOR_TRAVERSAL_DEPTH 层，防止循环引用
-        for i in 0..MAX_ANCESTOR_TRAVERSAL_DEPTH {
-            let current_meta = current.metadata()?;
-
-            // 检查是否到达 ancestor
-            if current_meta.inode_id == ancestor_id && Arc::ptr_eq(&current.fs(), &ancestor_fs) {
-                // 找到了 ancestor，说明 target 是 ancestor 的后代
-                log::debug!("[pivot_root] is_ancestor: found ancestor after {} steps", i);
-                return Ok(true);
-            }
-
-            // 尝试向上移动到父目录
-            match current.parent() {
-                Ok(parent) => {
-                    // 如果 parent 就是 current 本身，说明已经到达根目录
-                    if Arc::ptr_eq(&parent, &current) {
-                        log::debug!("[pivot_root] is_ancestor: reached root (parent==self)");
-                        break;
-                    }
-                    current = parent;
-                }
-                Err(e) => {
-                    // 没有父目录了，到达根目录
-                    log::debug!("[pivot_root] is_ancestor: no parent, err={:?}", e);
-                    break;
-                }
+        for (path, mnt_fs) in mount_list.iter() {
+            let inner_fs = mnt_fs.inner_filesystem();
+            // 检查是否匹配文件系统且设置了 bind_target_root
+            if (Arc::ptr_eq(&inner_fs, inode_fs) || inner_fs.name() == inode_fs.name())
+                && mnt_fs.bind_target_root().is_some()
+            {
+                let path_len = path.as_str().len();
+                bind_mount_candidates.push((mnt_fs.clone(), path_len));
+                log::debug!(
+                    "[pivot_root] find_bind_mount: candidate id={:?}, path={:?}",
+                    mnt_fs.mount_id(),
+                    path.as_str()
+                );
             }
         }
 
-        // 最后再检查一次根目录是否是 ancestor
-        let root_meta = current.metadata()?;
-        let result = root_meta.inode_id == ancestor_id && Arc::ptr_eq(&current.fs(), &ancestor_fs);
-        log::debug!("[pivot_root] is_ancestor: final check result={}", result);
-        Ok(result)
+        // 选择路径最短的（最上层的）
+        if !bind_mount_candidates.is_empty() {
+            bind_mount_candidates.sort_by(|a, b| a.1.cmp(&b.1));
+            let (mnt_fs, _) = bind_mount_candidates.into_iter().next()?;
+            log::debug!(
+                "[pivot_root] find_bind_mount: returning id={:?}",
+                mnt_fs.mount_id()
+            );
+            return Some(mnt_fs);
+        }
+
+        None
     }
 }
 

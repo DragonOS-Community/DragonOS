@@ -234,7 +234,7 @@
     "hash": "bb2435e3905e8e71eca8f6a583e31d94"
   },
   "en:introduction/build_system.md": {
-    "hash": "6c0478fc622ece44830badf5afb17ec4"
+    "hash": "eae93d905cd74db14b0e034afc07363c"
   },
   "en:community/ChangeLog/V0.1.x/V0.1.4.md": {
     "hash": "5720af929320997f8824bcdfd3a17bdd"
@@ -333,7 +333,7 @@
     "hash": "b7ea769ce2562ccbcb27df019ff98cc1"
   },
   "en:userland/rootfs/index.rst": {
-    "hash": "bb1f31a04781ace700c8123bdbf2a36c"
+    "hash": "e91edb5ab11bdee2975a37a248d97adf"
   },
   "en:userland/rootfs/add-your-own-app.md": {
     "hash": "0eafcc92a06fb0bb0bea58617318f1aa"
@@ -342,7 +342,7 @@
     "hash": "898241ba5edc255c7fb035d1d5ff9ad1"
   },
   "en:introduction/develop_nix.md": {
-    "hash": "bb11827644ae0b8e835b9fa557465967"
+    "hash": "9250c605b765168f1ff962d425f60844"
   },
   "en:dev-skills/nix-skills.md": {
     "hash": "ce15afc55be2502588220eef9b39b637"
@@ -373,5 +373,8 @@
   },
   "en:kernel/process_management/de_thread.md": {
     "hash": "d5d9c9a4d491398ecc0a45118e4e92da"
+  },
+  "en:userland/rootfs/dadk-rootfs-manifest.md": {
+    "hash": "a35f61f1e5070812411a8ddb2e449b11"
   }
 }

@@ -148,7 +148,7 @@ impl IndexNode for LockedVcpuInode {
         &self,
         cmd: u32,
         data: usize,
-        _private_data: &FilePrivateData,
+        _private_data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         match cmd {
             0xdeadbeef => {

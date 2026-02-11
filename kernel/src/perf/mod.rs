@@ -236,7 +236,12 @@ impl IndexNode for PerfEventInode {
         Ok(())
     }
 
-    fn ioctl(&self, cmd: u32, data: usize, _private_data: &FilePrivateData) -> Result<usize> {
+    fn ioctl(
+        &self,
+        cmd: u32,
+        data: usize,
+        _private_data: MutexGuard<FilePrivateData>,
+    ) -> Result<usize> {
         let req = PerfEventIoc::from_u32(cmd).ok_or(SystemError::EINVAL)?;
         info!("perf_event_ioctl: request: {:?}, arg: {}", req, data);
         match req {
@@ -367,6 +372,7 @@ pub fn perf_event_open(
     } else {
         FileFlags::O_RDWR
     };
+    let cloexec = file_mode.contains(FileFlags::O_CLOEXEC);
 
     let event: Box<dyn PerfEventOps> = match args.type_ {
         // Kprobe
@@ -404,7 +410,10 @@ pub fn perf_event_open(
     }
     let file = File::new(perf_event, file_mode)?;
     let fd_table = ProcessManager::current_pcb().fd_table();
-    let fd = fd_table.write().alloc_fd(file, None).map(|x| x as usize)?;
+    let fd = fd_table
+        .write()
+        .alloc_fd(file, None, cloexec)
+        .map(|x| x as usize)?;
     Ok(fd)
 }
 

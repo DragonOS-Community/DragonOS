@@ -112,6 +112,6 @@ pub(super) fn do_socket(
     ProcessManager::current_pcb()
         .fd_table()
         .write()
-        .alloc_fd(file, None)
+        .alloc_fd(file, None, is_close_on_exec)
         .map(|x| x as usize)
 }

@@ -39,12 +39,14 @@ pwritev2_test
 utimes_test
 truncate_test
 fadvise_test
+flock_test
 open_test
 open_create_test
 select_test
 pselect_test
 epoll_test
 splice_test
+deleted_test
 link_test
 
 # 进程相关测试
@@ -107,6 +109,10 @@ socket_ip_tcp_udp_generic_loopback_test
 socket_ipv4_datagram_based_socket_unbound_loopback_test
 socket_ipv4_udp_unbound_loopback_test
 socket_ipv4_udp_unbound_loopback_nogotsan_test
+socket_netlink_test
+socket_ip_unbound_netlink_test
+socket_ipv4_udp_unbound_loopback_netlink_test
+socket_ipv6_udp_unbound_loopback_netlink_test
 
 # 信号处理测试
 sigaction_test

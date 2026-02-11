@@ -522,6 +522,12 @@ impl Drop for MountFS {
 }
 
 impl MountFSInode {
+    /// 返回被挂载包装器包裹的底层 inode。
+    #[inline]
+    pub(super) fn underlying_inode(&self) -> Arc<dyn IndexNode> {
+        self.inner_inode.clone()
+    }
+
     /// 获取当前 inode 所在的 MountFS
     pub fn mount_fs(&self) -> &Arc<MountFS> {
         &self.mount_fs
@@ -992,7 +998,7 @@ impl IndexNode for MountFSInode {
         &self,
         cmd: u32,
         data: usize,
-        private_data: &FilePrivateData,
+        private_data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         return self.inner_inode.ioctl(cmd, data, private_data);
     }

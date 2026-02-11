@@ -66,8 +66,9 @@ in
   static.dropbear
   cross.glibc
 
-  # Simple C utility
-  (static.callPackage ./about { })
+  # Simple C utilities
+  (static.callPackage ./about {})
+  (static.callPackage ./c_unitest {})
 
 ]
 ++ lib.optionals (target == "x86_64" && testOpt.syscall.enable) [

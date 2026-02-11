@@ -2,6 +2,7 @@ pub mod append_lock;
 pub mod fasync;
 pub mod fcntl;
 pub mod file;
+pub mod flock;
 pub mod iov;
 pub mod mount;
 pub mod open;
@@ -11,8 +12,8 @@ pub mod syscall;
 pub mod utils;
 pub mod vcore;
 
-use ::core::{any::Any, fmt::Debug, fmt::Display, sync::atomic::AtomicUsize};
 use alloc::{string::String, sync::Arc, vec::Vec};
+use core::{any::Any, fmt::Debug, fmt::Display, sync::atomic::AtomicUsize};
 use derive_builder::Builder;
 use intertrait::CastFromSync;
 use mount::MountFlags;
@@ -637,9 +638,9 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         &self,
         _cmd: u32,
         _data: usize,
-        _private_data: &FilePrivateData,
+        _private_data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        // 若文件系统没有实现此方法，则返回“不支持”
+        // 若文件系统没有实现此方法，则返回"不支持"
         return Err(SystemError::ENOSYS);
     }
 

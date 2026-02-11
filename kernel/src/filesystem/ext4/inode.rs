@@ -1,12 +1,18 @@
 use crate::{
+    driver::base::device::device_number::DeviceNumber,
     filesystem::{
         page_cache::{AsyncPageCacheBackend, PageCache},
         vfs::{
-            self, utils::DName, vcore::generate_inode_id, FilePrivateData, IndexNode, InodeFlags,
-            InodeId, InodeMode,
+            self, syscall::RenameFlags, utils::DName, vcore::generate_inode_id, FilePrivateData,
+            IndexNode, InodeFlags, InodeId, InodeMode, SpecialNodeData,
         },
     },
-    libs::{casting::DowncastArc, mutex::Mutex, mutex::MutexGuard},
+    ipc::pipe::LockedPipeInode,
+    libs::{
+        casting::DowncastArc,
+        mutex::{Mutex, MutexGuard},
+    },
+    mm::truncate::truncate_inode_pages,
     time::PosixTimeSpec,
 };
 use alloc::{
@@ -40,6 +46,9 @@ pub struct Ext4Inode {
 
     // 指向自身的Weak指针，用于获取Arc<Self>
     pub(super) self_ref: Weak<LockedExt4Inode>,
+
+    // 特殊节点数据（用于 FIFO 的 pipe inode）
+    pub(super) special_node: Option<SpecialNodeData>,
 }
 
 #[derive(Debug)]
@@ -359,7 +368,21 @@ impl IndexNode for LockedExt4Inode {
             )
         };
         let attr = fs.fs.getattr(inode_num)?;
-        let raw_dev = fs.raw_dev;
+
+        // dev_id: filesystem device number (st_dev)
+        let dev_id = fs.raw_dev.data() as usize;
+
+        // raw_dev: device node's rdev (st_rdev), only for char/block devices
+        let raw_dev = if matches!(attr.ftype, FileType::CharacterDev | FileType::BlockDev) {
+            let (major, minor) = attr.rdev;
+            DeviceNumber::new(
+                crate::driver::base::device::device_number::Major::new(major),
+                minor,
+            )
+        } else {
+            DeviceNumber::default()
+        };
+
         Ok(vfs::Metadata {
             inode_id: vfs_inode_id,
             size: attr.size as i64,
@@ -375,7 +398,7 @@ impl IndexNode for LockedExt4Inode {
             nlinks: attr.links as usize,
             uid: attr.uid as usize,
             gid: attr.gid as usize,
-            dev_id: 0,
+            dev_id,
             raw_dev,
         })
     }
@@ -506,9 +529,251 @@ impl IndexNode for LockedExt4Inode {
 
         Ok(0)
     }
+
+    fn mknod(
+        &self,
+        filename: &str,
+        mode: InodeMode,
+        dev_t: DeviceNumber,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        if mode.contains(InodeMode::S_IFREG) {
+            return self.create(filename, vfs::FileType::File, mode);
+        }
+
+        let mut guard = self.0.lock();
+        let ext4 = &guard.concret_fs().fs;
+        let inode_num = guard.inner_inode_num;
+
+        if ext4.getattr(inode_num)?.ftype != FileType::Directory {
+            return Err(SystemError::ENOTDIR);
+        }
+
+        // VFS InodeMode(u32) → another_ext4 InodeMode(u16)
+        let file_mode = another_ext4::InodeMode::from_bits_truncate(mode.bits() as u16);
+
+        // Create inode based on file type
+        let id = if mode.contains(InodeMode::S_IFCHR) || mode.contains(InodeMode::S_IFBLK) {
+            // Character/block device: use mknod to store device number in i_block
+            ext4.mknod(
+                inode_num,
+                filename,
+                file_mode,
+                dev_t.major().data(),
+                dev_t.minor(),
+            )?
+        } else {
+            // FIFO, Socket, etc.: use regular create (no device number needed)
+            ext4.create(inode_num, filename, file_mode)?
+        };
+
+        // Wrap as VFS inode and cache
+        let dname = DName::from(filename);
+        let self_arc = guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+        let inode = LockedExt4Inode::new(
+            id,
+            guard.fs_ptr.clone(),
+            dname.clone(),
+            Some(Arc::downgrade(&self_arc)),
+        );
+        guard.children.insert(dname, inode.clone());
+        drop(guard);
+        Ok(inode as Arc<dyn IndexNode>)
+    }
+
+    fn special_node(&self) -> Option<SpecialNodeData> {
+        self.0.lock().special_node.clone()
+    }
+
+    fn move_to(
+        &self,
+        old_name: &str,
+        target: &Arc<dyn IndexNode>,
+        new_name: &str,
+        flags: RenameFlags,
+    ) -> Result<(), SystemError> {
+        let target_locked = target
+            .clone()
+            .downcast_arc::<LockedExt4Inode>()
+            .ok_or(SystemError::EXDEV)?;
+
+        let (ext4_fs, src_inode_num) = {
+            let guard = self.0.lock();
+            (guard.concret_fs(), guard.inner_inode_num)
+        };
+        let ext4 = &ext4_fs.fs;
+        let target_inode_num = target_locked.0.lock().inner_inode_num;
+
+        let old_dname = DName::from(old_name);
+        let new_dname = DName::from(new_name);
+
+        // Same directory, same name -> no-op
+        if src_inode_num == target_inode_num && old_dname == new_dname {
+            return Ok(());
+        }
+
+        // NOREPLACE check (VFS layer responsibility - ext4 lib doesn't know about flags)
+        if flags.contains(RenameFlags::NOREPLACE) && ext4.lookup(target_inode_num, new_name).is_ok()
+        {
+            return Err(SystemError::EEXIST);
+        }
+
+        // RENAME_EXCHANGE: 原子交换两个文件/目录
+        if flags.contains(RenameFlags::EXCHANGE) {
+            // VFS 层已验证目标存在，直接调用 exchange
+            ext4.rename_exchange(src_inode_num, old_name, target_inode_num, new_name)?;
+
+            // 更新缓存：交换两个条目
+            self.update_exchange_cache(
+                &target_locked,
+                src_inode_num,
+                target_inode_num,
+                &old_dname,
+                &new_dname,
+            );
+            return Ok(());
+        }
+
+        // Check if target exists (for cache update and page cache cleanup)
+        let had_dst = ext4.lookup(target_inode_num, new_name).is_ok();
+
+        // Clear target's page cache if it exists and is a file
+        if had_dst {
+            if let Ok(target_inode) = target_locked.find(new_name) {
+                if let Some(pc) = target_inode.page_cache() {
+                    truncate_inode_pages(pc, 0);
+                }
+            }
+        }
+
+        // ext4 library now correctly handles atomic replace
+        ext4.rename(src_inode_num, old_name, target_inode_num, new_name)?;
+
+        // Update cache
+        self.update_rename_cache(
+            &target_locked,
+            src_inode_num,
+            target_inode_num,
+            &old_dname,
+            &new_dname,
+            had_dst,
+        );
+        Ok(())
+    }
 }
 
 impl LockedExt4Inode {
+    /// 更新 rename 后的缓存
+    fn update_rename_cache(
+        &self,
+        target: &Arc<LockedExt4Inode>,
+        src_dir: u32,
+        dst_dir: u32,
+        old_dname: &DName,
+        new_dname: &DName,
+        had_dst: bool,
+    ) {
+        if src_dir == dst_dir {
+            let mut guard = self.0.lock();
+            if had_dst {
+                guard.children.remove(new_dname);
+            }
+            if let Some(child) = guard.children.remove(old_dname) {
+                child.0.lock().dname = new_dname.clone();
+                guard.children.insert(new_dname.clone(), child);
+            }
+        } else {
+            let (mut src_guard, mut dst_guard) = if src_dir < dst_dir {
+                (self.0.lock(), target.0.lock())
+            } else {
+                let d = target.0.lock();
+                let s = self.0.lock();
+                (s, d)
+            };
+
+            if had_dst {
+                dst_guard.children.remove(new_dname);
+            }
+            if let Some(child) = src_guard.children.remove(old_dname) {
+                dst_guard.children.insert(new_dname.clone(), child.clone());
+                drop(src_guard);
+                drop(dst_guard);
+                let mut child_guard = child.0.lock();
+                child_guard.dname = new_dname.clone();
+                child_guard.parent = Arc::downgrade(target);
+            }
+        }
+    }
+
+    /// 更新 exchange 后的缓存：交换两个条目
+    fn update_exchange_cache(
+        &self,
+        target: &Arc<LockedExt4Inode>,
+        src_dir: u32,
+        dst_dir: u32,
+        old_dname: &DName,
+        new_dname: &DName,
+    ) {
+        if src_dir == dst_dir {
+            // 同目录交换
+            let mut guard = self.0.lock();
+            let old_child = guard.children.remove(old_dname);
+            let new_child = guard.children.remove(new_dname);
+
+            if let Some(child) = old_child {
+                child.0.lock().dname = new_dname.clone();
+                guard.children.insert(new_dname.clone(), child);
+            }
+            if let Some(child) = new_child {
+                child.0.lock().dname = old_dname.clone();
+                guard.children.insert(old_dname.clone(), child);
+            }
+        } else {
+            // 跨目录交换
+            let (mut src_guard, mut dst_guard) = if src_dir < dst_dir {
+                (self.0.lock(), target.0.lock())
+            } else {
+                let d = target.0.lock();
+                let s = self.0.lock();
+                (s, d)
+            };
+
+            let old_child = src_guard.children.remove(old_dname);
+            let new_child = dst_guard.children.remove(new_dname);
+
+            // old_child 移到 target 目录
+            if let Some(child) = old_child {
+                dst_guard.children.insert(new_dname.clone(), child.clone());
+                drop(src_guard);
+                drop(dst_guard);
+
+                let mut child_guard = child.0.lock();
+                child_guard.dname = new_dname.clone();
+                child_guard.parent = Arc::downgrade(target);
+                drop(child_guard);
+
+                // 重新获取锁处理 new_child
+                if let Some(new_c) = new_child {
+                    let mut src_guard = self.0.lock();
+                    src_guard.children.insert(old_dname.clone(), new_c.clone());
+                    drop(src_guard);
+
+                    let mut new_c_guard = new_c.0.lock();
+                    new_c_guard.dname = old_dname.clone();
+                    new_c_guard.parent = self.0.lock().self_ref.clone();
+                }
+            } else if let Some(new_c) = new_child {
+                // 只有 new_child 在缓存中
+                src_guard.children.insert(old_dname.clone(), new_c.clone());
+                drop(src_guard);
+                drop(dst_guard);
+
+                let mut new_c_guard = new_c.0.lock();
+                new_c_guard.dname = old_dname.clone();
+                new_c_guard.parent = self.0.lock().self_ref.clone();
+            }
+        }
+    }
+
     pub fn new(
         inode_num: u32,
         fs_ptr: Weak<super::filesystem::Ext4FileSystem>,
@@ -516,7 +781,12 @@ impl LockedExt4Inode {
         parent: Option<Weak<LockedExt4Inode>>,
     ) -> Arc<Self> {
         let inode = Arc::new({
-            LockedExt4Inode(Mutex::new(Ext4Inode::new(inode_num, fs_ptr, dname, parent)))
+            LockedExt4Inode(Mutex::new(Ext4Inode::new(
+                inode_num,
+                fs_ptr.clone(),
+                dname,
+                parent,
+            )))
         });
         let mut guard = inode.0.lock();
 
@@ -531,6 +801,17 @@ impl LockedExt4Inode {
             Some(backend),
         );
         guard.page_cache = Some(page_cache);
+
+        // 对于 FIFO，创建 pipe inode
+        if let Some(fs) = fs_ptr.upgrade() {
+            if let Ok(attr) = fs.fs.getattr(inode_num) {
+                if attr.ftype == FileType::Fifo {
+                    let pipe_inode = LockedPipeInode::new();
+                    pipe_inode.set_fifo();
+                    guard.special_node = Some(SpecialNodeData::Pipe(pipe_inode));
+                }
+            }
+        }
 
         drop(guard);
         return inode;
@@ -575,6 +856,7 @@ impl Ext4Inode {
             vfs_inode_id: generate_inode_id(),
             parent: parent.unwrap_or_default(),
             self_ref: Weak::new(), // 将在LockedExt4Inode::new()中设置
+            special_node: None,
         }
     }
 }

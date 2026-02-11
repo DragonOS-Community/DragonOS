@@ -111,15 +111,12 @@ impl SysFcntlHandle {
                 return Err(SystemError::EMFILE);
             }
             FcntlCommand::GetFd => {
-                // Get file descriptor flags.
+                // Get file descriptor flags (close_on_exec is per-fd).
                 let binding = ProcessManager::current_pcb().fd_table();
                 let fd_table_guard = binding.read();
 
-                if let Some(file) = fd_table_guard.get_file_by_fd(fd) {
-                    // drop guard 以避免无法调度的问题
-                    drop(fd_table_guard);
-
-                    if file.close_on_exec() {
+                if fd_table_guard.get_file_by_fd(fd).is_some() {
+                    if fd_table_guard.get_cloexec(fd) {
                         return Ok(FD_CLOEXEC as usize);
                     } else {
                         return Ok(0);
@@ -128,19 +125,13 @@ impl SysFcntlHandle {
                 return Err(SystemError::EBADF);
             }
             FcntlCommand::SetFd => {
-                // Set file descriptor flags.
+                // Set file descriptor flags (close_on_exec is per-fd).
                 let binding = ProcessManager::current_pcb().fd_table();
-                let fd_table_guard = binding.write();
+                let mut fd_table_guard = binding.write();
 
-                if let Some(file) = fd_table_guard.get_file_by_fd(fd) {
-                    // drop guard 以避免无法调度的问题
-                    drop(fd_table_guard);
+                if fd_table_guard.get_file_by_fd(fd).is_some() {
                     let arg = arg as u32;
-                    if arg & FD_CLOEXEC != 0 {
-                        file.set_close_on_exec(true);
-                    } else {
-                        file.set_close_on_exec(false);
-                    }
+                    fd_table_guard.set_cloexec(fd, arg & FD_CLOEXEC != 0);
                     return Ok(0);
                 }
                 return Err(SystemError::EBADF);

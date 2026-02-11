@@ -589,6 +589,11 @@ impl ProcessManager {
                 .wait_queue
                 .wakeup_all(Some(ProcessState::Blocked(true)));
 
+            // kthread 退出时显式唤醒 kthreadd，使其回收 zombie
+            if current.is_kthread() {
+                let _ = ProcessManager::wakeup(&parent_pcb);
+            }
+
             // 根据 Linux wait 语义，线程组中的任何线程都可以等待同一线程组中任何线程创建的子进程。
             // 由于子进程被添加到线程组 leader 的 children 列表中，
             // 因此还需要唤醒线程组 leader 的 wait_queue（如果 leader 不是 parent_pcb 本身）。
@@ -678,16 +683,6 @@ impl ProcessManager {
                 vd.complete_all();
             }
 
-            // clear_child_tid/robust_list 可能触发用户态缺页，必须在调度实体 deactive 前完成
-            let rq = cpu_rq(smp_get_processor_id().data() as usize);
-            let (rq, guard) = rq.self_lock();
-            rq.deactivate_task(
-                pcb.clone(),
-                DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
-            );
-            drop(guard);
-
-            unsafe { pcb.basic_mut().set_user_vm(None) };
             pcb.exit_files();
             // TODO 由于未实现进程组，tty记录的前台进程组等于当前进程，故退出前要置空
             // 后续相关逻辑需要在SYS_EXIT_GROUP系统调用中实现
@@ -704,6 +699,19 @@ impl ProcessManager {
             pcb.sched_info
                 .inner_lock_write_irqsave()
                 .set_state(ProcessState::Exited(exit_code));
+
+            let rq = cpu_rq(smp_get_processor_id().data() as usize);
+            let (rq, guard) = rq.self_lock();
+            rq.update_rq_clock();
+            rq.deactivate_task(
+                pcb.clone(),
+                DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
+            );
+            drop(guard);
+
+            // 注意：exit_files() 可能会触发阻塞（例如关闭 FUSE fd 需要等待 daemon 回复），
+            // 因此不能在它之前清空 user_vm，否则后续调度切换会遇到 user_vm==None 的普通进程并崩溃。
+            unsafe { pcb.basic_mut().set_user_vm(None) };
 
             drop(pcb);
 
@@ -1213,7 +1221,7 @@ impl ProcessControlBlock {
     ///
     /// 若进程是内核进程则返回true 否则返回false
     pub fn is_kthread(&self) -> bool {
-        return matches!(self.flags(), &mut ProcessFlags::KTHREAD);
+        self.flags().contains(ProcessFlags::KTHREAD)
     }
 
     #[inline(never)]

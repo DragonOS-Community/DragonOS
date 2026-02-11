@@ -1,16 +1,15 @@
-//! System call handler for opening files.
+//! System call handler for stat.
 
 use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_STAT;
-use crate::filesystem::vfs::file::FileFlags;
-use crate::filesystem::vfs::syscall::newfstat::do_newfstat;
-use crate::filesystem::vfs::syscall::sys_close::do_close;
-use crate::filesystem::vfs::InodeMode;
+use crate::filesystem::vfs::fcntl::AtFlags;
+use crate::filesystem::vfs::stat::do_newfstatat;
+use crate::filesystem::vfs::MAX_PATHLEN;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
-use defer::defer;
+use crate::syscall::user_access::vfs_check_and_clone_cstr;
 
 use alloc::vec::Vec;
 
@@ -23,22 +22,21 @@ impl Syscall for SysStatHandle {
     }
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        let path = Self::path(args);
+        let path_ptr = Self::path(args);
         let usr_kstat = Self::usr_kstat(args);
 
-        let fd = super::open_utils::do_open(
-            path,
-            FileFlags::O_RDONLY.bits(),
-            InodeMode::empty().bits(),
-        )?;
+        if usr_kstat == 0 {
+            return Err(SystemError::EFAULT);
+        }
 
-        defer!({
-            do_close(fd as i32).ok();
-        });
+        let path = vfs_check_and_clone_cstr(path_ptr, Some(MAX_PATHLEN))?;
+        let path_str = path.to_str().map_err(|_| SystemError::EINVAL)?;
 
-        do_newfstat(fd as i32, usr_kstat)?;
+        // stat(2) 等价于 newfstatat(AT_FDCWD, path, buf, 0)
+        // 与 lstat 不同，stat 会跟随符号链接，所以 flags = 0
+        do_newfstatat(AtFlags::AT_FDCWD.bits(), path_str, usr_kstat, 0)?;
 
-        return Ok(0);
+        Ok(0)
     }
 
     /// Formats the syscall arguments for display/debugging purposes.

@@ -55,7 +55,7 @@ log_skipped = true
 #
 # 5. **配置文件路径**：
 #    - 默认路径：config/app-blocklist.toml
-#    - 可在 dadk-manifest.toml 中通过 app-blocklist-config 字段自定义路径
+#    - 可在生成后的 dadk-manifest.generated.toml 中通过 app-blocklist-config 字段指定路径
 #
 # 6. **字段说明**：
 #    - name：应用程序名称或匹配模式（必需）
@@ -68,4 +68,3 @@ blocked_apps = [
     { name = "test_ebpf_new", reason = "2025.11.17,aya上游发版有问题，导致ci过不了，暂时禁用" },
     { name = "test_ebpf_tp", reason = "2025.11.17,aya上游发版有问题，导致ci过不了，暂时禁用" },
 ]
-

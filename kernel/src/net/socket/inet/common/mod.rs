@@ -1,4 +1,6 @@
-use crate::{net::Iface, process::namespace::net_namespace::NetNamespace};
+use crate::{
+    driver::net::types::InterfaceFlags, net::Iface, process::namespace::net_namespace::NetNamespace,
+};
 use alloc::sync::Arc;
 
 pub mod port;
@@ -52,7 +54,8 @@ impl BoundInner {
                 netns,
             });
         } else {
-            let iface = get_iface_to_bind(address, netns.clone()).ok_or(SystemError::ENODEV)?;
+            let iface = get_iface_to_bind(address, netns.clone())
+                .ok_or_else(|| bind_addr_not_found_error(address, &netns))?;
             // log::debug!(
             //     "BoundInner::bind: binding to iface {} for address {:?}",
             //     iface.iface_name(),
@@ -97,7 +100,7 @@ impl BoundInner {
     where
         T: smoltcp::socket::AnySocket<'static>,
     {
-        let (iface, address) = get_ephemeral_iface(&remote, netns.clone());
+        let (iface, address) = get_ephemeral_iface(&remote, netns.clone())?;
         // let bound_port = iface.port_manager().bind_ephemeral_port(socket_type)?;
         let handle = iface.sockets().lock().add(socket);
         // let endpoint = smoltcp::wire::IpEndpoint::new(local_addr, bound_port);
@@ -167,51 +170,169 @@ pub fn get_iface_to_bind(
     ip_addr: &smoltcp::wire::IpAddress,
     netns: Arc<NetNamespace>,
 ) -> Option<Arc<dyn Iface>> {
-    // For multicast or broadcast addresses, use the default interface or first available
-    // Linux allows binding to these addresses for filtering purposes
+    let device_list = netns.device_list();
+
+    // Subnet-directed broadcast should prefer the iface whose configured subnet matches.
+    if let smoltcp::wire::IpAddress::Ipv4(target_broadcast) = ip_addr {
+        if target_broadcast.is_broadcast() {
+            if let Some(iface) = device_list.iter().find_map(|(_, iface)| {
+                iface_matches_directed_broadcast(iface, *target_broadcast).then(|| iface.clone())
+            }) {
+                return Some(iface);
+            }
+        }
+    }
+
+    // For multicast/broadcast fallback, use default or first iface.
     if ip_addr.is_multicast() || ip_addr.is_broadcast() {
         return netns
             .default_iface()
-            .or_else(|| netns.device_list().values().next().cloned());
+            .or_else(|| device_list.values().next().cloned());
     }
 
-    netns
-        .device_list()
+    if let Some(iface) = device_list
         .iter()
         .find(|(_, iface)| iface.smol_iface().lock().has_ip_addr(*ip_addr))
         .map(|(_, iface)| iface.clone())
+    {
+        return Some(iface);
+    }
+
+    // Linux-like loopback behavior for IPv4: lo considers the whole configured subnet local.
+    if let smoltcp::wire::IpAddress::Ipv4(v4_addr) = ip_addr {
+        return device_list.iter().find_map(|(_, iface)| {
+            loopback_iface_contains_v4(iface, *v4_addr).then(|| iface.clone())
+        });
+    }
+
+    None
+}
+
+#[inline]
+fn iface_matches_directed_broadcast(
+    iface: &Arc<dyn Iface>,
+    target_broadcast: smoltcp::wire::Ipv4Address,
+) -> bool {
+    let smol_iface = iface.smol_iface().lock();
+    smol_iface.ip_addrs().iter().any(|cidr| match cidr {
+        smoltcp::wire::IpCidr::Ipv4(v4_cidr) => {
+            v4_cidr.broadcast().is_some_and(|b| b == target_broadcast)
+        }
+        _ => false,
+    })
+}
+
+#[inline]
+fn loopback_iface_contains_v4(iface: &Arc<dyn Iface>, v4_addr: smoltcp::wire::Ipv4Address) -> bool {
+    if !iface.flags().contains(InterfaceFlags::LOOPBACK) {
+        return false;
+    }
+    let smol_iface = iface.smol_iface().lock();
+    smol_iface.ip_addrs().iter().any(|cidr| match cidr {
+        smoltcp::wire::IpCidr::Ipv4(v4_cidr) => v4_cidr.contains_addr(&v4_addr),
+        _ => false,
+    })
 }
 
 /// Get a suitable iface to deal with sendto/connect request if the socket is not bound to an iface.
-/// If the remote address is the same as that of some iface, we will use the iface.
-/// Otherwise, we will use a default interface.
+/// Linux-like behavior: for implicit bind on connect/sendto, the stack must be able to select a
+/// valid local source address for the given remote destination.
 fn get_ephemeral_iface(
     remote_ip_addr: &smoltcp::wire::IpAddress,
     netns: Arc<NetNamespace>,
-) -> (Arc<dyn Iface>, smoltcp::wire::IpAddress) {
-    get_iface_to_bind(remote_ip_addr, netns.clone())
-        .map(|iface| (iface, *remote_ip_addr))
-        .or({
-            let ifaces = netns.device_list();
-            ifaces.iter().find_map(|(_, iface)| {
-                iface
-                    .smol_iface()
-                    .lock()
-                    .ip_addrs()
-                    .iter()
-                    .find(|cidr| cidr.contains_addr(remote_ip_addr))
-                    .map(|cidr| (iface.clone(), cidr.address()))
-            })
-        })
-        .or({
-            netns.device_list().values().next().map(|iface| {
-                (
-                    iface.clone(),
-                    iface.smol_iface().lock().ip_addrs()[0].address(),
-                )
-            })
-        })
-        .expect("No network interface")
+) -> Result<(Arc<dyn Iface>, smoltcp::wire::IpAddress), SystemError> {
+    let default_iface = netns.default_iface();
+    let no_source_error = no_source_addr_error(remote_ip_addr);
+    let loopback_dst = is_loopback_destination(remote_ip_addr);
+
+    if let Some(iface) = get_iface_to_bind(remote_ip_addr, netns.clone()) {
+        if !loopback_dst || iface.flags().contains(InterfaceFlags::LOOPBACK) {
+            if let Some(local_addr) = pick_configured_source_addr(&iface, remote_ip_addr) {
+                return Ok((iface, local_addr));
+            }
+        }
+    }
+
+    if let Some(iface) = default_iface {
+        if !loopback_dst || iface.flags().contains(InterfaceFlags::LOOPBACK) {
+            if let Some(local_addr) = pick_configured_source_addr(&iface, remote_ip_addr) {
+                return Ok((iface, local_addr));
+            }
+        }
+    }
+
+    for (_, iface) in netns.device_list().iter() {
+        if loopback_dst && !iface.flags().contains(InterfaceFlags::LOOPBACK) {
+            continue;
+        }
+
+        if let Some(local_addr) = pick_configured_source_addr(iface, remote_ip_addr) {
+            return Ok((iface.clone(), local_addr));
+        }
+    }
+
+    if netns.device_list().is_empty() {
+        return Err(SystemError::ENODEV);
+    }
+
+    Err(no_source_error)
+}
+
+fn no_source_addr_error(remote_ip_addr: &smoltcp::wire::IpAddress) -> SystemError {
+    match remote_ip_addr {
+        smoltcp::wire::IpAddress::Ipv4(_) => SystemError::ENETUNREACH,
+        smoltcp::wire::IpAddress::Ipv6(_) => SystemError::EADDRNOTAVAIL,
+    }
+}
+
+fn pick_configured_source_addr(
+    iface: &Arc<dyn Iface>,
+    remote_ip_addr: &smoltcp::wire::IpAddress,
+) -> Option<smoltcp::wire::IpAddress> {
+    let smol_iface = iface.smol_iface().lock();
+
+    if remote_ip_addr.is_unspecified() {
+        return smol_iface.ip_addrs().iter().find_map(|cidr| {
+            let addr = cidr.address();
+            match (remote_ip_addr, addr) {
+                (smoltcp::wire::IpAddress::Ipv4(_), smoltcp::wire::IpAddress::Ipv4(_))
+                | (smoltcp::wire::IpAddress::Ipv6(_), smoltcp::wire::IpAddress::Ipv6(_)) => {
+                    Some(addr)
+                }
+                _ => None,
+            }
+        });
+    }
+
+    let selected = smol_iface.get_source_address(remote_ip_addr);
+    let selected_is_configured = selected
+        .as_ref()
+        .map(|addr| smol_iface.has_ip_addr(*addr))
+        .unwrap_or(false);
+
+    selected.filter(|_| selected_is_configured)
+}
+
+fn is_loopback_destination(remote_ip_addr: &smoltcp::wire::IpAddress) -> bool {
+    match remote_ip_addr {
+        smoltcp::wire::IpAddress::Ipv4(addr) => addr.is_loopback(),
+        smoltcp::wire::IpAddress::Ipv6(addr) => addr.is_loopback(),
+    }
+}
+
+fn bind_addr_not_found_error(
+    addr: &smoltcp::wire::IpAddress,
+    netns: &Arc<NetNamespace>,
+) -> SystemError {
+    if netns.device_list().is_empty() {
+        return SystemError::ENODEV;
+    }
+
+    match addr {
+        smoltcp::wire::IpAddress::Ipv4(_) | smoltcp::wire::IpAddress::Ipv6(_) => {
+            SystemError::EADDRNOTAVAIL
+        }
+    }
 }
 
 /// Select a suitable network interface for binding to an unspecified address.

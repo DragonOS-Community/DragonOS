@@ -18,7 +18,7 @@ use crate::{
             FileType, IndexNode, InodeFlags, InodeMode, Metadata,
         },
     },
-    libs::spinlock::SpinLock,
+    libs::{mutex::MutexGuard, spinlock::SpinLock},
     mm::MemoryManagementArch,
     process::ProcessManager,
     syscall::user_access::{UserBufferReader, UserBufferWriter},
@@ -152,7 +152,7 @@ impl IndexNode for LockedKvmInode {
         &self,
         cmd: u32,
         arg: usize,
-        _private_data: &crate::filesystem::vfs::FilePrivateData,
+        _private_data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         match cmd {
             Self::KVM_CREATE_VM => {
@@ -233,7 +233,7 @@ impl KvmInstance {
 impl IndexNode for KvmInstance {
     fn open(
         &self,
-        _data: crate::libs::mutex::MutexGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
         _mode: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
@@ -244,7 +244,7 @@ impl IndexNode for KvmInstance {
         &self,
         cmd: u32,
         arg: usize,
-        _private_data: &crate::filesystem::vfs::FilePrivateData,
+        _private_data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         debug!("kvm instance ioctl cmd {cmd:x}");
         match cmd {
@@ -284,7 +284,7 @@ impl IndexNode for KvmInstance {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: crate::libs::mutex::MutexGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         todo!()
     }
@@ -294,7 +294,7 @@ impl IndexNode for KvmInstance {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: crate::libs::mutex::MutexGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         todo!()
     }
@@ -317,7 +317,7 @@ impl IndexNode for KvmInstance {
 
     fn close(
         &self,
-        _data: crate::libs::mutex::MutexGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<(), SystemError> {
         Ok(())
     }
@@ -365,7 +365,7 @@ impl KvmVcpuDev {
 impl IndexNode for KvmVcpuDev {
     fn open(
         &self,
-        _data: crate::libs::mutex::MutexGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
@@ -373,7 +373,7 @@ impl IndexNode for KvmVcpuDev {
 
     fn close(
         &self,
-        _data: crate::libs::mutex::MutexGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<(), SystemError> {
         Ok(())
     }
@@ -382,7 +382,7 @@ impl IndexNode for KvmVcpuDev {
         &self,
         cmd: u32,
         arg: usize,
-        _private_data: &crate::filesystem::vfs::FilePrivateData,
+        _private_data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         match cmd {
             Self::KVM_RUN => {

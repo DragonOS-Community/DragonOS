@@ -302,7 +302,7 @@ impl IndexNode for GenDisk {
         &self,
         cmd: u32,
         data: usize,
-        private_data: &crate::filesystem::vfs::FilePrivateData,
+        private_data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let bdev = self.block_device();
         if let Some(loop_dev) = BlockDevice::as_any_ref(&*bdev).downcast_ref::<LoopDevice>() {

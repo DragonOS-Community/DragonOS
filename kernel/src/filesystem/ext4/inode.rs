@@ -3,8 +3,8 @@ use crate::{
     filesystem::{
         page_cache::{AsyncPageCacheBackend, PageCache},
         vfs::{
-            self, utils::DName, vcore::generate_inode_id, FilePrivateData, IndexNode, InodeFlags,
-            InodeId, InodeMode, SpecialNodeData,
+            self, syscall::RenameFlags, utils::DName, vcore::generate_inode_id, FilePrivateData,
+            IndexNode, InodeFlags, InodeId, InodeMode, SpecialNodeData,
         },
     },
     ipc::pipe::LockedPipeInode,
@@ -12,6 +12,7 @@ use crate::{
         casting::DowncastArc,
         mutex::{Mutex, MutexGuard},
     },
+    mm::truncate::truncate_inode_pages,
     time::PosixTimeSpec,
 };
 use alloc::{
@@ -582,9 +583,197 @@ impl IndexNode for LockedExt4Inode {
     fn special_node(&self) -> Option<SpecialNodeData> {
         self.0.lock().special_node.clone()
     }
+
+    fn move_to(
+        &self,
+        old_name: &str,
+        target: &Arc<dyn IndexNode>,
+        new_name: &str,
+        flags: RenameFlags,
+    ) -> Result<(), SystemError> {
+        let target_locked = target
+            .clone()
+            .downcast_arc::<LockedExt4Inode>()
+            .ok_or(SystemError::EXDEV)?;
+
+        let (ext4_fs, src_inode_num) = {
+            let guard = self.0.lock();
+            (guard.concret_fs(), guard.inner_inode_num)
+        };
+        let ext4 = &ext4_fs.fs;
+        let target_inode_num = target_locked.0.lock().inner_inode_num;
+
+        let old_dname = DName::from(old_name);
+        let new_dname = DName::from(new_name);
+
+        // Same directory, same name -> no-op
+        if src_inode_num == target_inode_num && old_dname == new_dname {
+            return Ok(());
+        }
+
+        // NOREPLACE check (VFS layer responsibility - ext4 lib doesn't know about flags)
+        if flags.contains(RenameFlags::NOREPLACE) && ext4.lookup(target_inode_num, new_name).is_ok()
+        {
+            return Err(SystemError::EEXIST);
+        }
+
+        // RENAME_EXCHANGE: 原子交换两个文件/目录
+        if flags.contains(RenameFlags::EXCHANGE) {
+            // VFS 层已验证目标存在，直接调用 exchange
+            ext4.rename_exchange(src_inode_num, old_name, target_inode_num, new_name)?;
+
+            // 更新缓存：交换两个条目
+            self.update_exchange_cache(
+                &target_locked,
+                src_inode_num,
+                target_inode_num,
+                &old_dname,
+                &new_dname,
+            );
+            return Ok(());
+        }
+
+        // Check if target exists (for cache update and page cache cleanup)
+        let had_dst = ext4.lookup(target_inode_num, new_name).is_ok();
+
+        // Clear target's page cache if it exists and is a file
+        if had_dst {
+            if let Ok(target_inode) = target_locked.find(new_name) {
+                if let Some(pc) = target_inode.page_cache() {
+                    truncate_inode_pages(pc, 0);
+                }
+            }
+        }
+
+        // ext4 library now correctly handles atomic replace
+        ext4.rename(src_inode_num, old_name, target_inode_num, new_name)?;
+
+        // Update cache
+        self.update_rename_cache(
+            &target_locked,
+            src_inode_num,
+            target_inode_num,
+            &old_dname,
+            &new_dname,
+            had_dst,
+        );
+        Ok(())
+    }
 }
 
 impl LockedExt4Inode {
+    /// 更新 rename 后的缓存
+    fn update_rename_cache(
+        &self,
+        target: &Arc<LockedExt4Inode>,
+        src_dir: u32,
+        dst_dir: u32,
+        old_dname: &DName,
+        new_dname: &DName,
+        had_dst: bool,
+    ) {
+        if src_dir == dst_dir {
+            let mut guard = self.0.lock();
+            if had_dst {
+                guard.children.remove(new_dname);
+            }
+            if let Some(child) = guard.children.remove(old_dname) {
+                child.0.lock().dname = new_dname.clone();
+                guard.children.insert(new_dname.clone(), child);
+            }
+        } else {
+            let (mut src_guard, mut dst_guard) = if src_dir < dst_dir {
+                (self.0.lock(), target.0.lock())
+            } else {
+                let d = target.0.lock();
+                let s = self.0.lock();
+                (s, d)
+            };
+
+            if had_dst {
+                dst_guard.children.remove(new_dname);
+            }
+            if let Some(child) = src_guard.children.remove(old_dname) {
+                dst_guard.children.insert(new_dname.clone(), child.clone());
+                drop(src_guard);
+                drop(dst_guard);
+                let mut child_guard = child.0.lock();
+                child_guard.dname = new_dname.clone();
+                child_guard.parent = Arc::downgrade(target);
+            }
+        }
+    }
+
+    /// 更新 exchange 后的缓存：交换两个条目
+    fn update_exchange_cache(
+        &self,
+        target: &Arc<LockedExt4Inode>,
+        src_dir: u32,
+        dst_dir: u32,
+        old_dname: &DName,
+        new_dname: &DName,
+    ) {
+        if src_dir == dst_dir {
+            // 同目录交换
+            let mut guard = self.0.lock();
+            let old_child = guard.children.remove(old_dname);
+            let new_child = guard.children.remove(new_dname);
+
+            if let Some(child) = old_child {
+                child.0.lock().dname = new_dname.clone();
+                guard.children.insert(new_dname.clone(), child);
+            }
+            if let Some(child) = new_child {
+                child.0.lock().dname = old_dname.clone();
+                guard.children.insert(old_dname.clone(), child);
+            }
+        } else {
+            // 跨目录交换
+            let (mut src_guard, mut dst_guard) = if src_dir < dst_dir {
+                (self.0.lock(), target.0.lock())
+            } else {
+                let d = target.0.lock();
+                let s = self.0.lock();
+                (s, d)
+            };
+
+            let old_child = src_guard.children.remove(old_dname);
+            let new_child = dst_guard.children.remove(new_dname);
+
+            // old_child 移到 target 目录
+            if let Some(child) = old_child {
+                dst_guard.children.insert(new_dname.clone(), child.clone());
+                drop(src_guard);
+                drop(dst_guard);
+
+                let mut child_guard = child.0.lock();
+                child_guard.dname = new_dname.clone();
+                child_guard.parent = Arc::downgrade(target);
+                drop(child_guard);
+
+                // 重新获取锁处理 new_child
+                if let Some(new_c) = new_child {
+                    let mut src_guard = self.0.lock();
+                    src_guard.children.insert(old_dname.clone(), new_c.clone());
+                    drop(src_guard);
+
+                    let mut new_c_guard = new_c.0.lock();
+                    new_c_guard.dname = old_dname.clone();
+                    new_c_guard.parent = self.0.lock().self_ref.clone();
+                }
+            } else if let Some(new_c) = new_child {
+                // 只有 new_child 在缓存中
+                src_guard.children.insert(old_dname.clone(), new_c.clone());
+                drop(src_guard);
+                drop(dst_guard);
+
+                let mut new_c_guard = new_c.0.lock();
+                new_c_guard.dname = old_dname.clone();
+                new_c_guard.parent = self.0.lock().self_ref.clone();
+            }
+        }
+    }
+
     pub fn new(
         inode_num: u32,
         fs_ptr: Weak<super::filesystem::Ext4FileSystem>,

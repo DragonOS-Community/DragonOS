@@ -1,0 +1,15 @@
+[metadata]
+name = "default"
+arch = "*"
+
+[rootfs]
+fs_type = "fat32"
+size = "2G"
+partition = "mbr"
+
+[base]
+image = ""
+pull_policy = "if-not-present"
+
+[user]
+config_dir = "user/dadk/config/sets/default"

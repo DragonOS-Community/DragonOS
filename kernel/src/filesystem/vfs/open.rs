@@ -362,12 +362,13 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
         inode.resize(0)?;
     }
     let file: File = File::new(inode, how.o_flags)?;
+    let cloexec = how.o_flags.contains(FileFlags::O_CLOEXEC);
 
     // 把文件对象存入pcb
     let r = ProcessManager::current_pcb()
         .fd_table()
         .write()
-        .alloc_fd(file, None)
+        .alloc_fd(file, None, cloexec)
         .map(|fd| fd as usize);
 
     return r;

@@ -97,7 +97,7 @@ impl EventPoll {
         let fd_table = current_pcb.fd_table();
         let mut fd_table_guard = fd_table.write();
 
-        let fd = fd_table_guard.alloc_fd(ep_file, None)?;
+        let fd = fd_table_guard.alloc_fd(ep_file, None, false)?;
 
         Ok(fd as usize)
     }

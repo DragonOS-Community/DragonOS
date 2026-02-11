@@ -1,6 +1,2 @@
-# 暂时不支持该测例，因为/proc/stat不支持
-LseekTest.ProcStatTwice
-# 暂时不支持该测例，目前dup与linux的行为不一致，目前实现为直接克隆了一个新的文件结构体给新的fd，导致lseek的偏移量不一致
-LseekTest.EtcPasswdDup
 # 未找到Seek_Hole的支持
 LseekTest.SeekDataAndSeekHole

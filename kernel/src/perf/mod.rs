@@ -409,7 +409,10 @@ pub fn perf_event_open(
     }
     let file = File::new(perf_event, file_mode)?;
     let fd_table = ProcessManager::current_pcb().fd_table();
-    let fd = fd_table.write().alloc_fd(file, None).map(|x| x as usize)?;
+    let fd = fd_table
+        .write()
+        .alloc_fd(file, None, false)
+        .map(|x| x as usize)?;
     Ok(fd)
 }
 

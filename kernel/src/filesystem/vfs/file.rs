@@ -1,6 +1,6 @@
 use core::{
     fmt,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use alloc::{string::String, sync::Arc, vec::Vec};
@@ -395,8 +395,6 @@ pub struct File {
     pub private_data: Mutex<FilePrivateData>,
     /// 文件的凭证
     cred: Arc<Cred>,
-    /// 文件描述符标志：是否在execve时关闭
-    close_on_exec: AtomicBool,
     /// owner
     pid: Mutex<Option<Arc<ProcessControlBlock>>>,
     /// 预读状态
@@ -564,7 +562,8 @@ impl File {
             flags.insert(FileFlags::O_APPEND);
         }
 
-        let close_on_exec = flags.contains(FileFlags::O_CLOEXEC);
+        // O_CLOEXEC 是 per-fd 属性，由 alloc_fd/alloc_fd_arc 的 cloexec 参数控制，
+        // 不存储在 File.flags 中。
         flags.remove(FileFlags::O_CLOEXEC);
 
         let mut mode = FileMode::open_fmode(flags);
@@ -612,7 +611,6 @@ impl File {
             readdir_subdirs_name: Mutex::new(Vec::default()),
             private_data,
             cred: ProcessManager::current_pcb().cred(),
-            close_on_exec: AtomicBool::new(close_on_exec),
             pid: Mutex::new(None),
             ra_state: Mutex::new(FileReadaheadState::new()),
         };
@@ -1140,7 +1138,6 @@ impl File {
             readdir_subdirs_name: Mutex::new(self.readdir_subdirs_name.lock().clone()),
             private_data: Mutex::new(self.private_data.lock().clone()),
             cred: self.cred.clone(),
-            close_on_exec: AtomicBool::new(self.close_on_exec.load(Ordering::SeqCst)),
             pid: Mutex::new(None),
             ra_state: Mutex::new(self.ra_state.lock().clone()),
         };
@@ -1209,18 +1206,6 @@ impl File {
     #[inline]
     pub fn mode(&self) -> FileMode {
         return *self.mode.read();
-    }
-
-    /// 获取文件是否在execve时关闭
-    #[inline]
-    pub fn close_on_exec(&self) -> bool {
-        return self.close_on_exec.load(Ordering::SeqCst);
-    }
-
-    /// 设置文件是否在execve时关闭
-    #[inline]
-    pub fn set_close_on_exec(&self, close_on_exec: bool) {
-        self.close_on_exec.store(close_on_exec, Ordering::SeqCst);
     }
 
     pub fn set_flags(&self, mut new_flags: FileFlags) -> Result<(), SystemError> {
@@ -1393,6 +1378,8 @@ impl Drop for File {
 pub struct FileDescriptorVec {
     /// 当前进程打开的文件描述符
     fds: Vec<Option<Arc<File>>>,
+    /// per-fd 的 close_on_exec 标志（与 fds 并行，对应 Linux fdtable.close_on_exec 位图）
+    cloexec: Vec<bool>,
     /// 下一个可能空闲的文件描述符号（用于优化分配，避免O(n²)扫描）
     /// 类似于 Linux 的 fd_next_fd
     next_fd: usize,
@@ -1413,9 +1400,13 @@ impl FileDescriptorVec {
         let mut data = Vec::with_capacity(FileDescriptorVec::INITIAL_CAPACITY);
         data.resize(FileDescriptorVec::INITIAL_CAPACITY, None);
 
+        let mut cloexec = Vec::with_capacity(FileDescriptorVec::INITIAL_CAPACITY);
+        cloexec.resize(FileDescriptorVec::INITIAL_CAPACITY, false);
+
         // 初始化文件描述符数组结构体
         return FileDescriptorVec {
             fds: data,
+            cloexec,
             next_fd: 0,
         };
     }
@@ -1431,6 +1422,7 @@ impl FileDescriptorVec {
         for i in 0..self.fds.len() {
             if let Some(file) = &self.fds[i] {
                 res.fds[i] = Some(file.clone());
+                res.cloexec[i] = self.cloexec[i];
             }
         }
         // 复制 next_fd 以保持相同的分配状态
@@ -1460,12 +1452,13 @@ impl FileDescriptorVec {
 
         let current_len = self.fds.len();
         if new_capacity > current_len {
-            // 扩容：扩展向量并填充None
+            // 扩容：扩展向量并填充None/false
             // 使用 try_reserve 先检查内存分配是否可能成功
             if self.fds.try_reserve(new_capacity - current_len).is_err() {
                 return Err(SystemError::ENOMEM);
             }
             self.fds.resize(new_capacity, None);
+            self.cloexec.resize(new_capacity, false);
         } else if new_capacity < current_len {
             // 缩容：允许，但不能丢弃仍在使用的高位fd。
             // 若高位fd仍在使用，将缩容目标提升到 (最高已用fd + 1)。
@@ -1473,6 +1466,7 @@ impl FileDescriptorVec {
             let target = core::cmp::max(new_capacity, floor);
             if target < current_len {
                 self.fds.truncate(target);
+                self.cloexec.truncate(target);
                 // 确保 next_fd 不超过新的容量
                 if self.next_fd > target {
                     self.next_fd = target;
@@ -1509,12 +1503,36 @@ impl FileDescriptorVec {
     ///
     /// - `file` 要存放的文件对象
     /// - `fd` 如果为Some(i32)，表示指定要申请这个文件描述符，如果这个文件描述符已经被使用，那么返回EBADF
+    /// - `cloexec` 是否设置 close_on_exec 标志（per-fd 属性）
     ///
     /// ## 返回值
     ///
     /// - `Ok(i32)` 申请成功，返回申请到的文件描述符
     /// - `Err(SystemError)` 申请失败，返回错误码，并且，file对象将被drop掉
-    pub fn alloc_fd(&mut self, file: File, fd: Option<i32>) -> Result<i32, SystemError> {
+    pub fn alloc_fd(
+        &mut self,
+        file: File,
+        fd: Option<i32>,
+        cloexec: bool,
+    ) -> Result<i32, SystemError> {
+        self.alloc_fd_arc(Arc::new(file), fd, cloexec)
+    }
+
+    /// 申请文件描述符，并把已有的 Arc<File> 存入其中。
+    ///
+    /// 用于 dup/dup2/dup3 等需要多个 fd 共享同一个 open file description 的场景。
+    ///
+    /// ## 参数
+    ///
+    /// - `file` 要存放的文件对象（Arc 引用）
+    /// - `fd` 如果为Some(i32)，表示指定要申请这个文件描述符
+    /// - `cloexec` 是否设置 close_on_exec 标志（per-fd 属性）
+    pub fn alloc_fd_arc(
+        &mut self,
+        file: Arc<File>,
+        fd: Option<i32>,
+        cloexec: bool,
+    ) -> Result<i32, SystemError> {
         // 获取RLIMIT_NOFILE限制
         let nofile_limit = crate::process::ProcessManager::current_pcb()
             .get_rlimit(crate::process::resource::RLimitID::Nofile)
@@ -1533,7 +1551,8 @@ impl FileDescriptorVec {
 
             let x = &mut self.fds[new_fd as usize];
             if x.is_none() {
-                *x = Some(Arc::new(file));
+                *x = Some(file);
+                self.cloexec[new_fd as usize] = cloexec;
                 // 更新 next_fd：如果分配的是 next_fd 位置，则推进到下一个
                 if new_fd as usize == self.next_fd {
                     self.next_fd = new_fd as usize + 1;
@@ -1550,7 +1569,8 @@ impl FileDescriptorVec {
             // 从 next_fd 开始查找空位
             for i in self.next_fd..max_search {
                 if self.fds[i].is_none() {
-                    self.fds[i] = Some(Arc::new(file));
+                    self.fds[i] = Some(file);
+                    self.cloexec[i] = cloexec;
                     // 更新 next_fd 为下一个位置
                     self.next_fd = i + 1;
                     return Ok(i as i32);
@@ -1570,7 +1590,8 @@ impl FileDescriptorVec {
 
                 // 扩容后，第一个新位置就是空的
                 let new_fd = current_len;
-                self.fds[new_fd] = Some(Arc::new(file));
+                self.fds[new_fd] = Some(file);
+                self.cloexec[new_fd] = cloexec;
                 // 更新 next_fd
                 self.next_fd = new_fd + 1;
                 return Ok(new_fd as i32);
@@ -1640,6 +1661,8 @@ impl FileDescriptorVec {
 
         // 把文件描述符数组对应位置设置为空
         let file = self.fds[fd as usize].take().unwrap();
+        // 清除 per-fd close_on_exec 标志
+        self.cloexec[fd as usize] = false;
 
         // 更新 next_fd：如果释放的fd比当前next_fd小，则更新next_fd
         // 这确保下次分配时可以复用较小的fd号，符合POSIX语义
@@ -1656,19 +1679,34 @@ impl FileDescriptorVec {
         return FileDescriptorIterator::new(self);
     }
 
+    /// 获取指定 fd 的 close_on_exec 标志
+    #[inline]
+    pub fn get_cloexec(&self, fd: i32) -> bool {
+        if !self.validate_fd(fd) {
+            return false;
+        }
+        self.cloexec[fd as usize]
+    }
+
+    /// 设置指定 fd 的 close_on_exec 标志
+    #[inline]
+    pub fn set_cloexec(&mut self, fd: i32, val: bool) {
+        if self.validate_fd(fd) {
+            self.cloexec[fd as usize] = val;
+        }
+    }
+
+    /// 在 execve 时关闭所有设置了 close_on_exec 的文件描述符
     pub fn close_on_exec(&mut self) {
         for i in 0..self.fds.len() {
-            if let Some(file) = &self.fds[i] {
-                let to_drop = file.close_on_exec();
-                if to_drop {
-                    if let Err(r) = self.drop_fd(i as i32) {
-                        error!(
-                            "Failed to close file: pid = {:?}, fd = {}, error = {:?}",
-                            ProcessManager::current_pcb().raw_pid(),
-                            i,
-                            r
-                        );
-                    }
+            if self.fds[i].is_some() && self.cloexec[i] {
+                if let Err(r) = self.drop_fd(i as i32) {
+                    error!(
+                        "Failed to close file: pid = {:?}, fd = {}, error = {:?}",
+                        ProcessManager::current_pcb().raw_pid(),
+                        i,
+                        r
+                    );
                 }
             }
         }

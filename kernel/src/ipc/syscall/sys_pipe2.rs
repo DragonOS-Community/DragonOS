@@ -38,14 +38,11 @@ pub(super) fn do_kernel_pipe2(fd: *mut i32, flags: FileFlags) -> Result<usize, S
         FileFlags::O_WRONLY | (flags & (FileFlags::O_NONBLOCK | FileFlags::O_DIRECT)),
     )?;
 
-    if flags.contains(FileFlags::O_CLOEXEC) {
-        read_file.set_close_on_exec(true);
-        write_file.set_close_on_exec(true);
-    }
+    let cloexec = flags.contains(FileFlags::O_CLOEXEC);
     let fd_table_ptr = ProcessManager::current_pcb().fd_table();
     let mut fd_table_guard = fd_table_ptr.write();
-    let read_fd = fd_table_guard.alloc_fd(read_file, None)?;
-    let write_fd = fd_table_guard.alloc_fd(write_file, None)?;
+    let read_fd = fd_table_guard.alloc_fd(read_file, None, cloexec)?;
+    let write_fd = fd_table_guard.alloc_fd(write_file, None, cloexec)?;
 
     drop(fd_table_guard);
 

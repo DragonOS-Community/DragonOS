@@ -122,6 +122,9 @@ pub fn bpf_prog_load(attr: &bpf_attr) -> Result<usize> {
     let fd_table = ProcessManager::current_pcb().fd_table();
     let prog = BpfProgVerifier::new(prog, log_info.log_level, &mut []).verify(&fd_table)?;
     let file = File::new(Arc::new(prog), FileFlags::O_RDWR)?;
-    let fd = fd_table.write().alloc_fd(file, None).map(|x| x as usize)?;
+    let fd = fd_table
+        .write()
+        .alloc_fd(file, None, false)
+        .map(|x| x as usize)?;
     Ok(fd)
 }

@@ -372,6 +372,7 @@ pub fn perf_event_open(
     } else {
         FileFlags::O_RDWR
     };
+    let cloexec = file_mode.contains(FileFlags::O_CLOEXEC);
 
     let event: Box<dyn PerfEventOps> = match args.type_ {
         // Kprobe
@@ -409,7 +410,10 @@ pub fn perf_event_open(
     }
     let file = File::new(perf_event, file_mode)?;
     let fd_table = ProcessManager::current_pcb().fd_table();
-    let fd = fd_table.write().alloc_fd(file, None).map(|x| x as usize)?;
+    let fd = fd_table
+        .write()
+        .alloc_fd(file, None, cloexec)
+        .map(|x| x as usize)?;
     Ok(fd)
 }
 

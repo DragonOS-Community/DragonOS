@@ -1026,8 +1026,7 @@ impl Socket for UnixDatagramSocket {
                 let mut fd_table = fd_table_binding.write();
                 for file in rights.iter().take(fit) {
                     let new_file = file.as_ref().try_clone().ok_or(SystemError::EINVAL)?;
-                    new_file.set_close_on_exec(cloexec);
-                    let new_fd = fd_table.alloc_fd(new_file, None)?;
+                    let new_fd = fd_table.alloc_fd(new_file, None, cloexec)?;
                     received_fds.push(new_fd);
                 }
             }

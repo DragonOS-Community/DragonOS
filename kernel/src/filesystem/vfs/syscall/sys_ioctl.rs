@@ -71,12 +71,11 @@ impl Syscall for SysIoctlHandle {
             FIONBIO => {
                 return Self::handle_fionbio(&file, data);
             }
-            FIONCLEX => {
-                file.set_close_on_exec(false);
-                return Ok(0);
-            }
-            FIOCLEX => {
-                file.set_close_on_exec(true);
+            FIONCLEX | FIOCLEX => {
+                // close_on_exec 是 per-fd 属性，需要通过 fd 表设置
+                let binding = ProcessManager::current_pcb().fd_table();
+                let mut fd_table_guard = binding.write();
+                fd_table_guard.set_cloexec(fd as i32, cmd == FIOCLEX);
                 return Ok(0);
             }
             FIOASYNC => {

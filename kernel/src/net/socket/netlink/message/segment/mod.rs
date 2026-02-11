@@ -74,12 +74,16 @@ pub trait SegmentBody: Sized + Clone + Copy {
         }
 
         let ctype_size = size_of::<Self::CType>();
-        if total_len < ctype_size || buf.len() < ctype_size {
+        if total_len < ctype_size {
             return Err(SystemError::EINVAL);
         }
 
         let c_type_bytes = &buf[..ctype_size];
-        let c_type = unsafe { *(c_type_bytes.as_ptr() as *const Self::CType) };
+        // SAFETY:
+        // - `c_type_bytes` has at least `size_of::<Self::CType>()` bytes (checked above).
+        // - Netlink payload memory may be unaligned, so use `read_unaligned`.
+        let c_type =
+            unsafe { core::ptr::read_unaligned(c_type_bytes.as_ptr() as *const Self::CType) };
         // log::info!("c_type: {:?}", c_type);
 
         let total_len_with_padding = Self::total_len_with_padding();

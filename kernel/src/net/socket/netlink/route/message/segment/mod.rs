@@ -86,7 +86,10 @@ impl ProtocolSegment for RouteNlSegment {
             return Err(SystemError::EINVAL);
         }
 
-        let header = unsafe { *(buf.as_ptr() as *const CMsgSegHdr) };
+        // SAFETY:
+        // - `buf` has at least `size_of::<CMsgSegHdr>()` bytes (checked above).
+        // - Netlink input buffer alignment is not guaranteed, so use `read_unaligned`.
+        let header = unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const CMsgSegHdr) };
         let segment_len = header.len as usize;
         if segment_len < header_size || buf.len() < segment_len {
             return Err(SystemError::EINVAL);

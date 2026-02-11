@@ -39,6 +39,7 @@ pwritev2_test
 utimes_test
 truncate_test
 fadvise_test
+flock_test
 open_test
 open_create_test
 select_test

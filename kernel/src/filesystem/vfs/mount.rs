@@ -428,6 +428,12 @@ impl Drop for MountFS {
 }
 
 impl MountFSInode {
+    /// 返回被挂载包装器包裹的底层 inode。
+    #[inline]
+    pub(super) fn underlying_inode(&self) -> Arc<dyn IndexNode> {
+        self.inner_inode.clone()
+    }
+
     /// @brief 用Arc指针包裹MountFSInode对象。
     /// 本函数的主要功能为，初始化MountFSInode对象中的自引用Weak指针
     /// 本函数只应在构造器中被调用

@@ -92,12 +92,13 @@ impl EventPoll {
     /// - 成功则返回Ok(fd)，否则返回Err
     pub fn create_epoll(flags: FileFlags) -> Result<usize, SystemError> {
         let ep_file = Self::create_epoll_file(flags)?;
+        let cloexec = flags.contains(FileFlags::O_CLOEXEC);
 
         let current_pcb = ProcessManager::current_pcb();
         let fd_table = current_pcb.fd_table();
         let mut fd_table_guard = fd_table.write();
 
-        let fd = fd_table_guard.alloc_fd(ep_file, None, false)?;
+        let fd = fd_table_guard.alloc_fd(ep_file, None, cloexec)?;
 
         Ok(fd as usize)
     }

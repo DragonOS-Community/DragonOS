@@ -1457,6 +1457,13 @@ impl FileDescriptorVec {
             if self.fds.try_reserve(new_capacity - current_len).is_err() {
                 return Err(SystemError::ENOMEM);
             }
+            if self
+                .cloexec
+                .try_reserve(new_capacity - current_len)
+                .is_err()
+            {
+                return Err(SystemError::ENOMEM);
+            }
             self.fds.resize(new_capacity, None);
             self.cloexec.resize(new_capacity, false);
         } else if new_capacity < current_len {

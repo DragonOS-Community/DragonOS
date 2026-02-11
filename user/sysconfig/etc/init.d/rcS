@@ -14,4 +14,6 @@ mount -t tmpfs tmpfs /tmp || /bin/busybox mount -t tmpfs tmpfs /tmp
 # 根据环境变量AUTO_TEST决定是否进行自动测试
 if [ "$AUTO_TEST" = "syscall" ]; then
     /bin/busybox sh $SYSCALL_TEST_DIR/run_tests.sh
+elif [ "$AUTO_TEST" = "dunit" ]; then
+    /bin/busybox sh $DUNITEST_DIR/run_tests.sh
 fi

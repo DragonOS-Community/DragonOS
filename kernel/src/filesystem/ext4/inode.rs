@@ -1,11 +1,13 @@
 use crate::{
+    driver::base::device::device_number::DeviceNumber,
     filesystem::{
         page_cache::{AsyncPageCacheBackend, PageCache},
         vfs::{
             self, syscall::RenameFlags, utils::DName, vcore::generate_inode_id, FilePrivateData,
-            IndexNode, InodeFlags, InodeId, InodeMode,
+            IndexNode, InodeFlags, InodeId, InodeMode, SpecialNodeData,
         },
     },
+    ipc::pipe::LockedPipeInode,
     libs::{
         casting::DowncastArc,
         mutex::{Mutex, MutexGuard},
@@ -44,6 +46,9 @@ pub struct Ext4Inode {
 
     // 指向自身的Weak指针，用于获取Arc<Self>
     pub(super) self_ref: Weak<LockedExt4Inode>,
+
+    // 特殊节点数据（用于 FIFO 的 pipe inode）
+    pub(super) special_node: Option<SpecialNodeData>,
 }
 
 #[derive(Debug)]
@@ -363,7 +368,21 @@ impl IndexNode for LockedExt4Inode {
             )
         };
         let attr = fs.fs.getattr(inode_num)?;
-        let raw_dev = fs.raw_dev;
+
+        // dev_id: filesystem device number (st_dev)
+        let dev_id = fs.raw_dev.data() as usize;
+
+        // raw_dev: device node's rdev (st_rdev), only for char/block devices
+        let raw_dev = if matches!(attr.ftype, FileType::CharacterDev | FileType::BlockDev) {
+            let (major, minor) = attr.rdev;
+            DeviceNumber::new(
+                crate::driver::base::device::device_number::Major::new(major),
+                minor,
+            )
+        } else {
+            DeviceNumber::default()
+        };
+
         Ok(vfs::Metadata {
             inode_id: vfs_inode_id,
             size: attr.size as i64,
@@ -379,7 +398,7 @@ impl IndexNode for LockedExt4Inode {
             nlinks: attr.links as usize,
             uid: attr.uid as usize,
             gid: attr.gid as usize,
-            dev_id: 0,
+            dev_id,
             raw_dev,
         })
     }
@@ -509,6 +528,60 @@ impl IndexNode for LockedExt4Inode {
         ext4.setxattr(inode_num, name, value)?;
 
         Ok(0)
+    }
+
+    fn mknod(
+        &self,
+        filename: &str,
+        mode: InodeMode,
+        dev_t: DeviceNumber,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        if mode.contains(InodeMode::S_IFREG) {
+            return self.create(filename, vfs::FileType::File, mode);
+        }
+
+        let mut guard = self.0.lock();
+        let ext4 = &guard.concret_fs().fs;
+        let inode_num = guard.inner_inode_num;
+
+        if ext4.getattr(inode_num)?.ftype != FileType::Directory {
+            return Err(SystemError::ENOTDIR);
+        }
+
+        // VFS InodeMode(u32) → another_ext4 InodeMode(u16)
+        let file_mode = another_ext4::InodeMode::from_bits_truncate(mode.bits() as u16);
+
+        // Create inode based on file type
+        let id = if mode.contains(InodeMode::S_IFCHR) || mode.contains(InodeMode::S_IFBLK) {
+            // Character/block device: use mknod to store device number in i_block
+            ext4.mknod(
+                inode_num,
+                filename,
+                file_mode,
+                dev_t.major().data(),
+                dev_t.minor(),
+            )?
+        } else {
+            // FIFO, Socket, etc.: use regular create (no device number needed)
+            ext4.create(inode_num, filename, file_mode)?
+        };
+
+        // Wrap as VFS inode and cache
+        let dname = DName::from(filename);
+        let self_arc = guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+        let inode = LockedExt4Inode::new(
+            id,
+            guard.fs_ptr.clone(),
+            dname.clone(),
+            Some(Arc::downgrade(&self_arc)),
+        );
+        guard.children.insert(dname, inode.clone());
+        drop(guard);
+        Ok(inode as Arc<dyn IndexNode>)
+    }
+
+    fn special_node(&self) -> Option<SpecialNodeData> {
+        self.0.lock().special_node.clone()
     }
 
     fn move_to(
@@ -708,7 +781,12 @@ impl LockedExt4Inode {
         parent: Option<Weak<LockedExt4Inode>>,
     ) -> Arc<Self> {
         let inode = Arc::new({
-            LockedExt4Inode(Mutex::new(Ext4Inode::new(inode_num, fs_ptr, dname, parent)))
+            LockedExt4Inode(Mutex::new(Ext4Inode::new(
+                inode_num,
+                fs_ptr.clone(),
+                dname,
+                parent,
+            )))
         });
         let mut guard = inode.0.lock();
 
@@ -723,6 +801,17 @@ impl LockedExt4Inode {
             Some(backend),
         );
         guard.page_cache = Some(page_cache);
+
+        // 对于 FIFO，创建 pipe inode
+        if let Some(fs) = fs_ptr.upgrade() {
+            if let Ok(attr) = fs.fs.getattr(inode_num) {
+                if attr.ftype == FileType::Fifo {
+                    let pipe_inode = LockedPipeInode::new();
+                    pipe_inode.set_fifo();
+                    guard.special_node = Some(SpecialNodeData::Pipe(pipe_inode));
+                }
+            }
+        }
 
         drop(guard);
         return inode;
@@ -767,6 +856,7 @@ impl Ext4Inode {
             vfs_inode_id: generate_inode_id(),
             parent: parent.unwrap_or_default(),
             self_ref: Weak::new(), // 将在LockedExt4Inode::new()中设置
+            special_node: None,
         }
     }
 }

@@ -26,6 +26,7 @@ mod sys_fchmodat;
 mod sys_fchown;
 mod sys_fchownat;
 mod sys_fcntl;
+mod sys_flock;
 mod sys_fstatfs;
 mod sys_ftruncate;
 mod sys_getcwd;

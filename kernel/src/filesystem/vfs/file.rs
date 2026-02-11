@@ -46,6 +46,12 @@ use crate::{
 use crate::filesystem::vfs::InodeMode;
 
 const MAX_LFS_FILESIZE: i64 = i64::MAX;
+static NEXT_OPEN_FILE_ID: AtomicUsize = AtomicUsize::new(1);
+
+#[inline]
+fn alloc_open_file_id() -> usize {
+    NEXT_OPEN_FILE_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 #[derive(Clone, Copy, Debug)]
 enum OffsetUpdate {
@@ -381,6 +387,8 @@ impl FileMode {
 /// @brief 抽象文件结构体
 #[derive(Debug)]
 pub struct File {
+    /// 唯一 open file description id，用于 flock owner 标识。
+    open_file_id: usize,
     inode: Arc<dyn IndexNode>,
     /// 对于文件，表示字节偏移量；对于文件夹，表示当前操作的子目录项偏移量
     offset: AtomicUsize,
@@ -603,6 +611,7 @@ impl File {
         }
 
         let f = File {
+            open_file_id: alloc_open_file_id(),
             inode,
             offset: AtomicUsize::new(0),
             flags: RwSem::new(flags),
@@ -1130,6 +1139,7 @@ impl File {
     /// @return Option<File> 克隆后的文件结构体。如果克隆失败，返回None
     pub fn try_clone(&self) -> Option<File> {
         let res = Self {
+            open_file_id: alloc_open_file_id(),
             inode: self.inode.clone(),
             offset: AtomicUsize::new(self.offset.load(Ordering::SeqCst)),
             flags: RwSem::new(self.flags()),
@@ -1158,6 +1168,11 @@ impl File {
     #[inline]
     pub fn file_type(&self) -> FileType {
         return self.file_type;
+    }
+
+    #[inline]
+    pub fn open_file_id(&self) -> usize {
+        self.open_file_id
     }
 
     /// 获取当前文件偏移（等价于用户态的 file position）。
@@ -1360,6 +1375,7 @@ impl File {
 
 impl Drop for File {
     fn drop(&mut self) {
+        super::flock::release_all_for_file(self);
         let r: Result<(), SystemError> = self.inode.close(self.private_data.lock());
         // 打印错误信息
         if r.is_err() {

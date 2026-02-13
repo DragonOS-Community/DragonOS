@@ -1,0 +1,54 @@
+Cyrus SASL for Debian
+---------------------
+
+SASL is the Simple Authentication and Security Layer, a method for adding
+authentication support to connection-based protocols. This is the Debian
+package of Cyrus SASL, which is an implementation of SASL by Carnegie Mellon
+University.
+
+The package stays as close as possible to the upstream version, but some
+changes have been introduced to fix known issues and to better integrate
+the software with the Debian system. For example, some command line utilities
+have been renamed with a "sasl" prefix, in order to avoid naming collisions.
+The software has been split into several packages, so a system administrator
+can choose what functionality to install and what to leave out.
+
+IMPORTANT:
+You MUST install one of the libsasl2-modules* packages for SASL to work with
+server programs. Otherwise server software like Postfix and Cyrus IMAPd will
+not allow any users to log in, and other SASL apps will malfunction in weird
+ways. If you do not intend to use SASL on your server, then the
+libsasl2-modules* packages are not necessary for you.
+
+SASL automatically logs debug information to syslog's auth.debug facility.
+This is not something that can be disabled through a configuration option to
+libsasl2-2 itself.  The default syslog configurations in Debian result in these
+messages going to /var/log/syslog and /var/log/auth.log.  If you wish to send
+the SASL debug messages elsewhere, you can add a line like this:
+
+    auth.debug /var/log/auth.debug
+
+To throw the messages away:
+
+    auth.debug /dev/null
+
+SASL uses /dev/urandom, which doesn't block when the system runs out of
+entropy. However, when the system does run out of entropy, the random numbers
+that /dev/urandom emits are slightly less cryptographically secure. If you are
+concerned about this, then please turn to the kernel documentation or other
+sources to determine what this means in your case. Usually, /dev/urandom is
+just fine for the vast majority of cases. If you want to use /dev/random for
+whatever reason, you have to recompile the packages. (Change --with-devrandom
+in debian/rules.)
+
+Use dpkg-statoverride to change the permission and the ownership of the
+saslauthd socket /var/run/saslauthd and the sasldb user database /etc/sasldb2.
+For more information on saslauthd, see README.Debian.gz in the sasl2-bin
+package.
+
+Also see the following RFC
+documents, which are currently not distributed with the Debian packages:
+
+  rfc1321.txt rfc1939.txt rfc2104.txt rfc2195.txt rfc2222.txt
+  rfc2243.txt rfc2245.txt rfc2289.txt rfc2444.txt rfc2595.txt
+  rfc2831.txt rfc2945.txt rfc3174.txt

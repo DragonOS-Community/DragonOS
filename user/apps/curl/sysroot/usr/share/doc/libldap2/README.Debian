@@ -1,0 +1,22 @@
+Notes about Debian's libldap2 package
+-------------------------------------
+
+It has been reported that using libnss-ldap can cause a failure to 
+unmount /usr on system shutdown. The reason is that the nss module
+uses libldap from /usr and is used by the shell in the system 
+scripts executed on shutdown/reboot. 
+
+More precisely bash uses the getpwuid function to get the data of
+the current user which pulls in the nss modules which includes
+the ldap libraries if you are using that module. 
+
+Possible solutions to this problem are:
+
+a) use another shell that does not utilize getpwuid for getting info
+   about the current user (take dash for example).
+b) make sure that the nsswitch.conf is replaced by a version which does
+   not mention ldap before the system is shut down (and have a startup
+   script that installs the "full" version of that file).
+c) move the libraries to /lib (not recommended).
+
+ -- Torsten Landschoff <torsten@debian.org>  Mon, 30 Sep 2002 11:06:22 +0200

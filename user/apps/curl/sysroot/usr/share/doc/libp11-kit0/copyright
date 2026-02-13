@@ -1,0 +1,493 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: p11-kit
+Source: https://p11-glue.github.io/p11-glue/p11-kit.html
+
+Files: *
+Copyright: 2012-2023, Red Hat Inc.
+License: BSD-3-clause
+
+Files: build/*
+Copyright: 1996-2022, Free Software Foundation, Inc.
+License: FSFULLR
+
+Files: build/litter/*
+Copyright: 1996-2021, Free Software Foundation, Inc.
+License: GPL-2+ with Autoconf-data exception
+
+Files: build/litter/config.guess
+ build/litter/config.sub
+Copyright: 1992-2022, Free Software Foundation, Inc.
+License: GPL-3+ with Autoconf-data exception
+
+Files: build/litter/config.rpath
+Copyright: 1996-2022, Free Software Foundation, Inc.
+License: FSFULLR
+
+Files: build/litter/install-sh
+Copyright: 1994, X Consortium
+License: X11
+
+Files: build/m4/gettext.m4
+ build/m4/intlmacosx.m4
+ build/m4/po.m4
+ build/m4/progtest.m4
+Copyright: 1995-2022, Free Software Foundation, Inc.
+License: BSD-3-clause
+
+Files: build/m4/iconv.m4
+ build/m4/ltversion.m4
+Copyright: 2000-2002, 2004, 2007-2022, Free Software Foundation
+License: FSFULLR
+
+Files: build/m4/libtool.m4
+ build/m4/ltsugar.m4
+Copyright: 1996-2001, 2003-2019, 2021, 2022, Free Software Foundation, Inc.
+License: FSFULLR
+
+Files: build/m4/ltoptions.m4
+ build/m4/lt~obsolete.m4
+Copyright: 2004, 2005, 2007-2009, 2011-2019, 2021, 2022, Free Software Foundation, Inc.
+License: FSFULLR
+
+Files: build/m4/nls.m4
+Copyright: 1995-2003, 2005, 2006, 2008-2014, 2016, 2019-2022, Free Software Foundation, Inc.
+License: BSD-3-clause
+
+Files: common/array.c
+ common/array.h
+ common/compat.c
+ common/compat.h
+ common/debug.c
+ common/debug.h
+ common/test-array.c
+ common/test-dict.c
+ common/tool.c
+Copyright: 2011, Collabora Ltd.
+License: BSD-3-clause
+
+Files: common/attrs.c
+ common/attrs.h
+ common/constants.h
+Copyright: 2012, Redhat Inc.
+ 2011, Collabora Ltd.
+License: BSD-3-clause
+
+Files: common/base64.c
+ common/base64.h
+Copyright: 1996, 1998, Internet Software Consortium.
+License: ISC
+
+Files: common/buffer.c
+Copyright: 2013, Red Hat Inc.
+ 2007, 2012, Stefan Walter
+License: BSD-3-clause
+
+Files: common/buffer.h
+Copyright: 2012-2023, Red Hat Inc.
+ 2007, 2008, 2012, Stefan Walter
+License: BSD-3-clause
+
+Files: common/constants.c
+Copyright: 2013, Redhat Inc.
+License: BSD-3-clause
+
+Files: common/dict.c
+ common/dict.h
+Copyright: 2011, Collabora Ltd.
+ 2004, 2005, Stefan Walter
+License: BSD-3-clause
+
+Files: common/hash.c
+Copyright: 2004, 2005, 2007, 2011, Internet Systems Consortium, Inc. ("ISC")
+ 2000, 2001, 2003, Internet Software Consortium.
+License: ISC
+
+Files: common/hex.c
+ common/hex.h
+ common/url.c
+ common/url.h
+Copyright: 2013, 2018, 2019, 2023, Red Hat Inc.
+ 2011, Collabora Ltd.
+License: BSD-3-clause
+
+Files: common/init.h
+ common/library.c
+ common/message.c
+Copyright: 2012, Stef Walter
+ 2011, Collabora Ltd
+License: BSD-3-clause
+
+Files: common/lexer.c
+ common/lexer.h
+ common/path.c
+Copyright: 2013, 2021-2023, Red Hat Inc.
+ 2011, Collabora Ltd.
+ 2005, 2008, Stefan Walter
+License: BSD-3-clause
+
+Files: common/library.h
+ common/message.h
+Copyright: 2011, Collabora Ltd
+License: BSD-3-clause
+
+Files: common/mock.c
+Copyright: 2021-2023, Red Hat, Inc.
+ 2011, Collabora Ltd.
+License: BSD-3-clause
+
+Files: common/pkcs11.h
+Copyright: 2017, 2021-2023, Red Hat, Inc.
+ 2006, Andreas Jellinghaus
+ 2006, 2007, g10 Code GmbH
+License: customFSFULLRWD
+
+Files: common/readpassphrase.c
+Copyright: 2000-2002, 2007, 2010, Todd C. Miller <Todd.Miller@courtesan.com>
+License: ISC
+
+Files: common/runtime.c
+ common/runtime.h
+ common/test-runtime.c
+Copyright: 2012-2023, Red Hat Inc
+License: BSD-3-clause
+
+Files: common/unix-peer.c
+Copyright: 2013, Nikos Mavrogiannopoulos
+License: BSD-3-clause
+
+Files: common/vsock.c
+ common/vsock.h
+Copyright: 2020, Amazon.com, Inc. or its affiliates.
+License: BSD-3-clause
+
+Files: debian/*
+Copyright: 2011-2023, Andreas Metzler <ametzler@debian.org>
+ 2011, Chris Coulson <chris.coulson@canonical.com>
+License: BSD-3-clause
+
+Files: fuzz/*
+Copyright: 2016, Google Inc.
+License: Apache-2.0
+
+Files: fuzz/main.c
+Copyright: 2017, Nikos Mavrogiannopoulos
+License: LGPL-2.1+
+
+Files: p11-kit/*
+Copyright: 2011, Collabora Ltd.
+License: BSD-3-clause
+
+Files: p11-kit/add-profile.c
+ p11-kit/client.c
+ p11-kit/client.h
+ p11-kit/delete-object.c
+ p11-kit/delete-profile.c
+ p11-kit/deprecated.h
+ p11-kit/docs.h
+ p11-kit/export-object.c
+ p11-kit/filter.c
+ p11-kit/filter.h
+ p11-kit/generate-keypair.c
+ p11-kit/import-object.c
+ p11-kit/iter.c
+ p11-kit/list-mechanisms.c
+ p11-kit/list-objects.c
+ p11-kit/list-profiles.c
+ p11-kit/log.h
+ p11-kit/mock-module-ep11.c
+ p11-kit/mock-module-ep12.c
+ p11-kit/mock-module-ep9.c
+ p11-kit/modules.h
+ p11-kit/print-config.c
+ p11-kit/proxy.h
+ p11-kit/remote.c
+ p11-kit/remote.h
+ p11-kit/server.c
+ p11-kit/test-iter.c
+ p11-kit/test-util.c
+ p11-kit/tty.c
+ p11-kit/tty.h
+Copyright: 2012-2023, Red Hat Inc.
+License: BSD-3-clause
+
+Files: p11-kit/client-init.c
+ p11-kit/proxy-init.c
+ p11-kit/util.c
+Copyright: 2012, Stef Walter
+ 2011, Collabora Ltd
+License: BSD-3-clause
+
+Files: p11-kit/conf.c
+ p11-kit/conf.h
+Copyright: 2011, Collabora Ltd.
+ 2004, 2005, Stefan Walter
+License: BSD-3-clause
+
+Files: p11-kit/frob-setuid.c
+ p11-kit/test-filter.c
+ p11-kit/test-log.c
+ p11-kit/test-log3.c
+ p11-kit/test-managed.c
+ p11-kit/test-modules.c
+ p11-kit/test-proxy.c
+ p11-kit/test-proxy3.c
+ p11-kit/test-server.c
+Copyright: 2012-2023, Red Hat Inc
+License: BSD-3-clause
+
+Files: p11-kit/iter.gnu.c
+ p11-kit/iter.h
+ p11-kit/pkcs11.h
+ p11-kit/virtual.h
+Copyright: 2012, 2013, 2016, Red Hat, Inc
+License: BSD-3-clause
+
+Files: p11-kit/list-tokens.c
+Copyright: 2023, Red Hat, Inc.
+License: BSD-3-clause
+
+Files: p11-kit/log.c
+ p11-kit/rpc-client.c
+ p11-kit/rpc-message.c
+ p11-kit/rpc-message.h
+ p11-kit/rpc-server.c
+ p11-kit/rpc-transport.c
+ p11-kit/test-mock.c
+ p11-kit/test-rpc-message.c
+ p11-kit/test-rpc.c
+ p11-kit/test-transport-base.c
+ p11-kit/test-transport.c
+ p11-kit/test-transport3.c
+ p11-kit/test-virtual.c
+ p11-kit/virtual.c
+Copyright: 2012-2023, Red Hat Inc.
+ 2007, 2008, 2012, Stefan Walter
+License: BSD-3-clause
+
+Files: p11-kit/mock-module-ep.c
+ p11-kit/mock-module-ep2.c
+ p11-kit/mock-module-ep3.c
+ p11-kit/mock-module-ep4.c
+ p11-kit/mock-module-v3-ep2.c
+ p11-kit/rpc.h
+ p11-kit/test-progname.c
+Copyright: 2012, 2013, Stefan Walter
+License: BSD-3-clause
+
+Files: p11-kit/mock-module-ep10.c
+ p11-kit/mock-module-ep5.c
+ p11-kit/mock-module-ep6.c
+ p11-kit/mock-module-ep7.c
+ p11-kit/mock-module-ep8.c
+ p11-kit/mock-module-v3-ep.c
+Copyright: 2018-2023, Red Hat, Inc.
+ 2012, Stefan Walter
+License: BSD-3-clause
+
+Files: p11-kit/modules.c
+Copyright: 2017-2023, Red Hat, Inc.
+ 2011, Collabora Ltd.
+ 2008, Stefan Walter
+License: BSD-3-clause
+
+Files: p11-kit/proxy.c
+Copyright: 2013, 2021-2023, Red Hat Inc.
+ 2011, Collabora Ltd.
+ 2005, 2008, Stefan Walter
+License: BSD-3-clause
+
+Files: p11-kit/test-deprecated.c
+Copyright: 2012, Red Hat Inc
+ 2011, Collabora Ltd.
+License: BSD-3-clause
+
+Files: po/*
+Copyright: 2001-2017, Free Software Foundation, Inc.
+License: customFSFUL
+
+Files: po/hu.po
+Copyright: 2012, 2014, 2022
+License: BSD-3-clause
+
+Files: po/remove-potcdate.sin
+Copyright: 2002, Free Software Foundation, Inc.
+License: FSFAP
+
+Files: trust/check-format.c
+Copyright: 2012-2023, Red Hat Inc
+License: BSD-3-clause
+
+Files: trust/digest.c
+Copyright: 2004, 2005, 2007, 2011, Internet Systems Consortium, Inc. ("ISC")
+ 2000, 2001, 2003, Internet Software Consortium.
+License: ISC
+
+Files: trust/test-bundle.c
+ trust/test-cer.c
+ trust/test-enumerate.c
+ trust/test-openssl.c
+ trust/trust.c
+Copyright: 2011, Collabora Ltd.
+License: BSD-3-clause
+
+Files: trust/test-edk2.c
+ trust/test-jks.c
+Copyright: 2013, 2018, 2019, 2023, Red Hat Inc.
+ 2011, Collabora Ltd.
+License: BSD-3-clause
+
+License: Apache-2.0
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+     http://www.apache.org/licenses/LICENSE-2.0
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS"BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+ On Debian systems, the complete text of the Apache License,
+ Version 2.0 can be found in '/usr/share/common-licenses/Apache-2.0'.
+
+License: BSD-3-clause
+ The BSD License
+ .
+ Redistribution and use in source and binary forms, with or without
+ modification, are permitted provided that the following conditions are
+ met:
+ .
+   * Redistributions of source code must retain the above copyright
+     notice, this list of conditions and the following disclaimer.
+ .
+   * Redistributions in binary form must reproduce the above copyright
+     notice, this list of conditions and the following disclaimer in the
+     documentation and/or other materials provided with the distribution.
+ .
+   * Neither the name of the copyright holder nor the names of its
+     contributors may be used to endorse or promote products derived from
+     this software without specific prior written permission.
+ .
+ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+ IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+ PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
+ CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+ EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+ PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+ PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+ LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+License: FSFAP
+ Copying and distribution of this file, with or without modification,
+ are permitted in any medium without royalty provided the copyright
+ notice and this notice are preserved.  This file is offered as-is,
+ without any warranty.
+
+License: FSFULLR
+ This file is free software; the Free Software Foundation gives
+ unlimited permission to copy and/or distribute it, with or without
+ modifications, as long as this notice is preserved.
+
+License: GPL-2+ with Autoconf-data exception
+ This program is free software; you can redistribute it and/or modify
+ it under the terms of the GNU General Public License as published by
+ the Free Software Foundation; either version 2, or (at your option)
+ any later version.
+ .
+ This program is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU General Public License for more details.
+ .
+ You should have received a copy of the GNU General Public License
+ along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ .
+ As a special exception to the GNU General Public License, if you
+ distribute this file as part of a program that contains a
+ configuration script generated by Autoconf, you may include it under
+ the same distribution terms that you use for the rest of that program.
+
+License: GPL-3+ with Autoconf-data exception
+ This file is free software; you can redistribute it and/or modify it
+ under the terms of the GNU General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+ .
+ This program is distributed in the hope that it will be useful, but
+ WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ General Public License for more details.
+ .
+ You should have received a copy of the GNU General Public License
+ along with this program; if not, see <https://www.gnu.org/licenses/>.
+ .
+ As a special exception to the GNU General Public License, if you
+ distribute this file as part of a program that contains a
+ configuration script generated by Autoconf, you may include it under
+ the same distribution terms that you use for the rest of that
+ program.  This Exception is an additional permission under section 7
+ of the GNU General Public License, version 3 ("GPLv3").
+
+License: ISC
+ The ISC License
+ .
+ Copyright (c) 2023 by the copyright holder
+ .
+ Permission to use, copy, modify, and/or distribute this software for any
+ purpose with or without fee is hereby granted, provided that the above
+ copyright notice and this permission notice appear in all copies.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+License: LGPL-2.1+
+ This program is free software; you can redistribute it and/or modify it
+ under the terms of the GNU Lesser General Public License as published by the
+ Free Software Foundation; version 2.1 of the License, or (at
+ your option) any later version.
+ On Debian systems, the complete text of version 2.1 of the GNU Lesser
+ General Public License can be found in '/usr/share/common-licenses/LGPL-2.1'.
+
+License: X11
+ Permission is hereby granted, free of charge, to any person obtaining a copy
+ of this software and associated documentation files (the "Software"), to
+ deal in the Software without restriction, including without limitation the
+ rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ sell copies of the Software, and to permit persons to whom the Software is
+ furnished to do so, subject to the following conditions:
+ .
+ The above copyright notice and this permission notice shall be included in
+ all copies or substantial portions of the Software.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+ X CONSORTIUM BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
+ AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNEC-
+ TION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ .
+ Except as contained in this notice, the name of the X Consortium shall not
+ be used in advertising or otherwise to promote the sale, use or other deal-
+ ings in this Software without prior written authorization from the X Consor-
+ tium.
+
+License: customFSFUL
+ This file is free software; the Free Software Foundation gives
+ unlimited permission to use, copy, distribute, and modify it.
+
+License: customFSFULLRWD
+ This file is free software; as a special exception the author gives
+ unlimited permission to copy and/or distribute it, with or without
+ modifications, as long as this notice is preserved.
+ .
+ This file is distributed in the hope that it will be useful, but
+ WITHOUT ANY WARRANTY, to the extent permitted by law; without even
+ the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
+ PURPOSE.

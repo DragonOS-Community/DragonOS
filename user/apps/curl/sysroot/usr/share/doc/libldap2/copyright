@@ -1,0 +1,1502 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: OpenLDAP
+Source: https://openldap.org/
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 1998-2013 Kurt D. Zeilenga.
+           Portions Copyright 1998-2006 Net Boolean Incorporated.
+           Portions Copyright 2001-2006 IBM Corporation.
+           Portions Copyright 1999-2008 Howard Y.H. Chu.
+           Portions Copyright 1999-2008 Symas Corporation.
+           Portions Copyright 1998-2003 Hallvard B. Furuseth.
+           Portions Copyright 2007-2011 Gavin Henry.
+           Portions Copyright 2007-2011 Suretec Systems Ltd.
+           Portions Copyright (c) 1992-1996 Regents of the University of Michigan.
+License: OpenLDAP-2.8
+Comment:
+ Redistribution and use in source and binary forms, with or without
+ modification, are permitted only as authorized by the OpenLDAP
+ Public License.
+ .
+ A copy of this license is available in the file LICENSE in the
+ top-level directory of the distribution or, alternatively, at
+ <http://www.OpenLDAP.org/license.html>.
+ .
+ OpenLDAP is a registered trademark of the OpenLDAP Foundation.
+ .
+ Individual files and/or contributed packages may be copyright by
+ other parties and/or subject to additional restrictions.
+ .
+ This work is derived from the University of Michigan LDAP v3.3
+ distribution.  Information concerning this software is available
+ at <http://www.umich.edu/~dirsvcs/ldap/ldap.html>.
+ .
+ This work also contains materials derived from public sources.
+ .
+ Additional information about OpenLDAP can be obtained at
+ <http://www.openldap.org/>.
+Files-Excluded: doc/drafts/*
+                doc/rfc/*
+                servers/slapd/schema/collective.schema
+                servers/slapd/schema/corba.schema
+                servers/slapd/schema/core.ldif
+                servers/slapd/schema/core.schema
+                servers/slapd/schema/cosine.schema
+                servers/slapd/schema/duaconf.schema
+                servers/slapd/schema/inetorgperson.schema
+                servers/slapd/schema/java.schema
+                servers/slapd/schema/namedobject.schema
+                servers/slapd/schema/pmi.schema
+
+Files: *
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           All rights reserved.
+License: OpenLDAP-2.8
+
+Files: aclocal.m4
+Copyright: Copyright (C) 1996-2018 Free Software Foundation, Inc.
+           Copyright © 2004 Scott James Remnant <scott@netsplit.com>.
+           Copyright © 2012-2015 Dan Nicholson <dbn.lists@gmail.com>
+License: FSF-unlimited and GPL-2+ with Autoconf exception
+
+Files: contrib/ldapc++/*
+Copyright: Copyright 2000-2022 The OpenLDAP Foundation.
+License: OpenLDAP-2.8
+
+Files: build/config.guess
+       build/config.sub
+       contrib/ldapc++/config.guess
+       contrib/ldapc++/config.sub
+Copyright: Copyright 1992-2020 Free Software Foundation, Inc.
+License: GPL-3+ with Autoconf exception
+
+Files: build/libtool.m4
+Copyright: Copyright (C) 1996-2001, 2003-2015 Free Software Foundation, Inc.
+License: FSF-unlimited
+
+Files: build/ltmain.sh
+       contrib/ldapc++/ltmain.sh
+Copyright: Copyright (C) 1996-2015 Free Software Foundation, Inc.
+           Copyright (C) 2004-2015 Free Software Foundation, Inc.
+           Copyright (C) 2010-2015 Free Software Foundation, Inc.
+License: GPL-2+ with Libtool exception and GPL-3+ with Libtool exception and GPL-3+
+
+Files: build/lt~obsolete.m4
+       build/ltoptions.m4
+       build/ltsugar.m4
+       build/ltversion.m4
+Copyright: Copyright (C) 2004-2005, 2007, 2009, 2011-2015 Free Software Foundation, Inc.
+License: FSF-unlimited
+
+Files: build/missing
+       contrib/ldapc++/missing
+Copyright: Copyright (C) 1996-2014 Free Software Foundation, Inc.
+License: GPL-2+ with Autoconf exception
+
+Files: build/shtool
+Copyright: Copyright (c) 1994-2008 Ralf S. Engelschall <rse@engelschall.com>
+License: GPL-2+
+Comment:
+ NOTICE: Given that you include this file verbatim into your own
+ source tree, you are justified in saying that it remains separate
+ from your package, and that this way you are simply just using GNU
+ shtool. So, in this situation, there is no requirement that your
+ package itself is licensed under the GNU General Public License in
+ order to take advantage of GNU shtool.
+
+Files: clients/tools/common.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 2003 Kurt D. Zeilenga.
+           Portions Copyright 2003 IBM Corporation.
+License: OpenLDAP-2.8
+
+Files: clients/tools/ldapcompare.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 1998-2003 Kurt D. Zeilenga.
+           Portions Copyright 1998-2001 Net Boolean Incorporated.
+           Portions Copyright (c) 1992-1996 Regents of the University of Michigan.
+           Portions Copyright 2002, F5 Networks, Inc, All rights reserved.
+License: OpenLDAP-2.8 and UMich and F5
+
+Files: clients/tools/ldapdelete.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 1998-2003 Kurt D. Zeilenga.
+           Portions Copyright (c) 1992-1996 Regents of the University of Michigan.
+License: OpenLDAP-2.8 and UMich
+
+Files: clients/tools/ldapexop.c
+Copyright: Copyright 2005-2022 The OpenLDAP Foundation.
+License: OpenLDAP-2.8
+
+Files: clients/tools/ldapmodify.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 2006 Howard Chu.
+           Portions Copyright 1998-2003 Kurt D. Zeilenga.
+           Portions Copyright 1998-2001 Net Boolean Incorporated.
+           Portions Copyright 2001-2003 IBM Corporation.
+           Portions Copyright (c) 1992-1996 Regents of the University of Michigan.
+License: OpenLDAP-2.8 and UMich
+
+Files: clients/tools/ldapmodrdn.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 1998-2003 Kurt D. Zeilenga.
+           Portions Copyright 1998-2001 Net Boolean Incorporated.
+           Portions Copyright 2001-2003 IBM Corporation.
+           Portions Copyright 1999, Juan C. Gomez.
+           Portions Copyright (c) 1992-1996 Regents of the University of Michigan.
+License: OpenLDAP-2.8 and JCG and UMich
+
+Files: clients/tools/ldappasswd.c
+       clients/tools/ldapsearch.c
+       clients/tools/ldapwhoami.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 1998-2003 Kurt D. Zeilenga.
+           Portions Copyright 1998-2001 Net Boolean Incorporated.
+           Portions Copyright 2001-2003 IBM Corporation.
+           Portions Copyright (c) 1992-1996 Regents of the University of Michigan.
+License: OpenLDAP-2.8 and UMich
+
+Files: clients/tools/ldapurl.c
+Copyright: Copyright 2008-2022 The OpenLDAP Foundation.
+           Portions Copyright 2008 Pierangelo Masarati, SysNet
+           Portions Copyright (c) 1992-1996 Regents of the University of Michigan.
+License: OpenLDAP-2.8 and UMich
+
+Files: clients/tools/ldapvc.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 2010 Kurt D. Zeilenga.
+           Portions Copyright (c) 1992-1996 Regents of the University of Michigan.
+License: OpenLDAP-2.8 and UMich
+
+Files: configure
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Copyright (C) 1992-1996, 1998-2012 Free Software Foundation, Inc.
+           Copyright (C) 2012 Free Software Foundation, Inc.
+           Copyright (C) 2014 Free Software Foundation, Inc.
+License: OpenLDAP-2.8 and FSF-unlimited and GPL-2+ with Libtool exception
+
+Files: contrib/ldapc++/aclocal.m4
+Copyright: Copyright (C) 1996-2017 Free Software Foundation, Inc.
+           Copyright (C) 1996-2001, 2003-2015 Free Software Foundation, Inc.
+           Copyright (C) 2014 Free Software Foundation, Inc.
+License: FSF-unlimited and GPL-2+ with Libtool exception
+
+Files: contrib/ldapc++/configure
+Copyright: Copyright 2000-2022 The OpenLDAP Foundation.
+           Copyright (C) 1992-1996, 1998-2012 Free Software Foundation, Inc.
+           Copyright (C) 2012 Free Software Foundation, Inc.
+           Copyright (C) 2014 Free Software Foundation, Inc.
+License: OpenLDAP-2.8 and FSF-unlimited and GPL-2+ with Libtool exception
+
+Files: contrib/ldapc++/depcomp
+Copyright: Copyright (C) 1999, 2000, 2003, 2004, 2005 Free Software Foundation, Inc.
+License: GPL-2+ with Autoconf exception
+
+Files: contrib/ldapc++/examples/Makefile.in
+       contrib/ldapc++/Makefile.in
+Copyright: Copyright (C) 1994, 1995, 1996, 1997, 1998, 1999, 2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009  Free Software Foundation, Inc.
+           Copyright 2003-2022 The OpenLDAP Foundation.
+License: FSF-unlimited and OpenLDAP-2.8
+
+Files: contrib/ldapc++/install-sh
+Copyright: Copyright (C) 1994 X Consortium
+License: MIT-XC
+Comment:
+ FSF changes to this file are in the public domain.
+
+Files: contrib/ldaptcl/configure
+Copyright: Copyright (C) 1992-1996, 1998-2012 Free Software Foundation, Inc.
+License: FSF-unlimited
+
+Files: contrib/ldaptcl/ldaperr.tcl
+       contrib/ldaptcl/ldap.n
+       contrib/ldaptcl/Makefile.in
+       contrib/ldaptcl/man.macros
+       contrib/ldaptcl/neoXldap.c
+       contrib/ldaptcl/pkgIndex.tcl.in
+       contrib/ldaptcl/tclAppInit.c
+       contrib/ldaptcl/tkAppInit.c
+Copyright: Copyright (c) 1998-1999 NeoSoft, Inc.
+           All Rights Reserved.
+License: NeoSoft-permissive
+ This software may be used, modified, copied, distributed, and sold,
+ in both source and binary form provided that these copyrights are
+ retained and their terms are followed.
+ .
+ Under no circumstances are the authors or NeoSoft Inc. responsible
+ for the proper functioning of this software, nor do the authors
+ assume any liability for damages incurred with its use.
+ .
+ Redistribution and use in source and binary forms are permitted
+ provided that this notice is preserved and that due credit is given
+ to NeoSoft, Inc.
+ .
+ NeoSoft, Inc. may not be used to endorse or promote products derived
+ from this software without specific prior written permission. This
+ software is provided ``as is'' without express or implied warranty.
+ .
+ Requests for permission may be sent to NeoSoft Inc, 1770 St. James Place,
+ Suite 500, Houston, TX, 77056.
+
+Files: contrib/slapd-modules/acl/gssacl.c
+Copyright: Copyright 2011 PADL Software Pty Ltd.
+License: OpenLDAP-2.8
+
+Files: contrib/slapd-modules/addpartial/*
+Copyright: Copyright 2004-2022 The OpenLDAP Foundation.
+           Portions Copyright (C) 2004 Virginia Tech, David Hawes.
+License: OpenLDAP-2.8
+
+Files: contrib/slapd-modules/adremap/*
+Copyright: Copyright 2015 Howard Chu <hyc@symas.com>.
+License: OpenLDAP-2.8
+
+Files: contrib/slapd-modules/autogroup/*
+Copyright: Copyright 2007-2022 The OpenLDAP Foundation.
+           Portions Copyright 2007 Michał Szulczyński.
+           Portions Copyright 2009 Howard Chu.
+License: OpenLDAP-2.8
+
+Files: contrib/slapd-modules/cloak/cloak.c
+Copyright: Copyright 2008-2022 The OpenLDAP Foundation.
+           Portions Copyright 2008 Emmanuel Dreyfus
+License: OpenLDAP-2.8
+
+Files: contrib/slapd-modules/comp_match/*
+Copyright: Copyright 2004 Sang Seok Lim, IBM . All rights reserved.
+License: OpenLDAP-2.8
+
+Files: contrib/slapd-modules/datamorph/Makefile
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Copyright 2017 Ondřej Kuzník, Symas Corp. All Rights Reserved.
+License: OpenLDAP-2.8
+
+Files: contrib/slapd-modules/datamorph/slapo-datamorph.5
+Copyright: Copyright 2016-2017 Symas Corp. All Rights Reserved.
+License: OpenLDAP-2.8
+
+Files: contrib/slapd-modules/lastbind/*
+Copyright: Copyright 2009 Jonathan Clarke <jonathan@phillipoux.net>.
+License: OpenLDAP-2.8
+
+Files: contrib/slapd-modules/nops/*
+Copyright: Copyright 2008-2022 The OpenLDAP Foundation.
+           Copyright 2008 Emmanuel Dreyfus.
+License: OpenLDAP-2.8
+
+Files: contrib/slapd-modules/nssov/*
+       libraries/libldap/tavl.c
+       libraries/liblmdb/mdb_load.c
+       libraries/liblmdb/mtest6.c
+       libraries/liblmdb/midl.h
+       libraries/liblmdb/mdb_copy.1
+       libraries/liblmdb/mdb_stat.c
+       libraries/liblmdb/mtest3.c
+       libraries/liblmdb/intro.doc
+       libraries/liblmdb/mdb_copy.c
+       libraries/liblmdb/mdb_dump.c
+       libraries/liblmdb/midl.c
+       libraries/liblmdb/mtest4.c
+       libraries/liblmdb/sample-bdb.txt
+       libraries/liblmdb/mdb_load.1
+       libraries/liblmdb/mdb_stat.1
+       libraries/liblmdb/sample-mdb.txt
+       libraries/liblmdb/mtest5.c
+       libraries/liblmdb/mtest2.c
+       libraries/liblmdb/mtest.c
+       libraries/liblmdb/mdb_dump.1
+Copyright: Copyright 2008-2022 The OpenLDAP Foundation.
+           Portions Copyright 2004-2022 by Howard Chu, Symas Corp.
+License: OpenLDAP-2.8
+
+Files: contrib/slapd-modules/nssov/nssov.*
+       contrib/slapd-modules/nssov/pam.c
+Copyright: Copyright 2008-2022 The OpenLDAP Foundation.
+           Portions Copyright 2008 by Howard Chu, Symas Corp.
+           Portions Copyright 2013 by Ted C. Cheng, Symas Corp.
+License: OpenLDAP-2.8
+
+Files: contrib/slapd-modules/nssov/nss-pam-ldapd/attrs.h
+       contrib/slapd-modules/nssov/nss-pam-ldapd/README
+       contrib/slapd-modules/nssov/nss-pam-ldapd/tio.c
+       contrib/slapd-modules/nssov/nss-pam-ldapd/tio.h
+Copyright: Copyright (C) 2007, 2008, 2012 Arthur de Jong
+License: OpenLDAP-2.8
+
+Files: contrib/slapd-modules/nssov/nss-pam-ldapd/nslcd.h
+       contrib/slapd-modules/nssov/nss-pam-ldapd/nslcd-prot.h
+Copyright: Copyright (C) 2006 West Consulting
+           Copyright (C) 2006, 2007, 2009, 2010, 2011, 2012, 2013, 2014 Arthur de Jong
+License: OpenLDAP-2.8
+
+Files: contrib/slapd-modules/passwd/totp/*
+Copyright: Copyright 2015-2022 The OpenLDAP Foundation.
+           Portions Copyright 2015 by Howard Chu, Symas Corp.
+License: OpenLDAP-2.8
+
+Files: contrib/slapd-modules/passwd/sha2/*
+Copyright: Copyright 2009-2022 The OpenLDAP Foundation.
+License: OpenLDAP-2.8
+
+Files: contrib/slapd-modules/passwd/sha2/sha2.*
+Copyright: Copyright (c) 2000-2001, Aaron D. Gifford
+License: BSD-3-clause
+
+Files: contrib/slapd-modules/passwd/kerberos.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Copyright (c) 1997, 1998, 1999 Kungliga Tekniska H\xf6gskolan
+           (Royal Institute of Technology, Stockholm, Sweden).
+           Copyright (c) 1989 Regents of the University of California.
+License: OpenLDAP-2.8 and BSD-3-clause
+
+Files: contrib/slapd-modules/passwd/apr1.c
+Copyright: Copyright 2011 Devin J. Pohly
+           Portions Copyright 2011 Howard Chu
+           Poul-Henning Kamp <phk@FreeBSD.ORG>
+License: OpenLDAP-2.8 and Beerware
+
+Files: contrib/slapd-modules/passwd/apr1-*.pl
+Copyright: (C) 2011 Devin J. Pohly
+License: public-domain
+
+Files: contrib/slapd-modules/proxyOld/*
+Copyright: Copyright 2005-2022 The OpenLDAP Foundation.
+           Portions Copyright 2005 by Howard Chu, Symas Corp.
+License: OpenLDAP-2.8
+
+Files: contrib/slapd-modules/rbac/slapo-rbac.5
+Copyright: Copyright 1999-2021 SYMAS Corporation All Rights Reserved.
+License: OpenLDAP-2.8
+
+Files: contrib/slapd-modules/samba4/*
+       libraries/libldap/stctrl.c
+       libraries/librewrite/Makefile.in
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 2008 Pierangelo Masarati.
+License: OpenLDAP-2.8
+
+Files: contrib/slapd-modules/samba4/Makefile
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Copyright 2004 Howard Chu, Symas Corp. All Rights Reserved.
+License: OpenLDAP-2.8
+
+Files: contrib/slapd-modules/smbk5pwd/smbk5pwd.c
+       contrib/slapd-modules/smbk5pwd/Makefile
+Copyright: Copyright 2004-2022 The OpenLDAP Foundation.
+           Portions Copyright 2004-2005 by Howard Chu, Symas Corp.
+License: OpenLDAP-2.8
+
+Files: contrib/slapd-modules/variant/*
+Copyright: Copyright 2016-2021 Symas Corporation.
+License: OpenLDAP-2.8
+
+Files: contrib/slapd-modules/variant/tests/*
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+License: OpenLDAP-2.8
+
+Files: contrib/slapd-tools/*
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 2004 Hallvard B. Furuseth.
+License: OpenLDAP-2.8
+
+Files: contrib/slapi-plugins/addrdnvalues/*
+Copyright: Copyright 2003-2022 The OpenLDAP Foundation.
+           Copyright 2003-2004 PADL Software Pty Ltd.
+License: OpenLDAP-2.8
+
+Files: doc/man/man5/slapo-remoteauth.5
+Copyright: Copyright 2004-2022 The OpenLDAP Foundation.
+           Portions Copyright 2004-2017 Howard Chu, Symas Corporation.
+           Portions Copyright 2017-2021 Ondřej Kuzník, Symas Corporation.
+           Portions Copyright 2004 Hewlett-Packard Company
+License: OpenLDAP-2.8
+
+Files: doc/man/man5/slapo-rwm.5
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation, All Rights Reserved.
+           Copyright 2004, Pierangelo Masarati, All rights reserved. <ando@sys-net.it>
+License: OpenLDAP-2.8
+
+Files: doc/man/man5/slapd-asyncmeta.5
+Copyright: Copyright 2016-2022 The OpenLDAP Foundation.
+           Portions Copyright 2016 Symas Corporation.
+License: OpenLDAP-2.8
+
+Files: doc/man/man5/slapo-otp.5
+Copyright: Copyright 2015-2022 The OpenLDAP Foundation.
+           Portions Copyright 2015 by Howard Chu, Symas Corp. All rights reserved.
+           Portions Copyright 2018 by Ondřej Kuzník, Symas Corp. All rights reserved.
+License: OpenLDAP-2.8
+
+Files: doc/man/man5/slapd-meta.5
+       doc/man/man5/slapo-pcache.5
+       doc/man/man5/slapo-retcode.5
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation, All Rights Reserved.
+           Copyright 2001, Pierangelo Masarati, All rights reserved. <ando@sys-net.it>
+License: OpenLDAP-2.8
+
+Files: doc/man/man5/slapo-autoca.5
+Copyright: Copyright 2009-2022 The OpenLDAP Foundation All Rights Reserved.
+           Copyright 2009-2018 Howard Chu All Rights Reserved.
+License: OpenLDAP-2.8
+
+Files: doc/man/man5/slapo-constraint.5
+Copyright: Copyright 2005-2006 Hewlett-Packard Company
+           Copyright 2006-2022 The OpenLDAP Foundation All Rights Reserved.
+License: OpenLDAP-2.8
+
+Files: doc/man/man5/slapo-sssvlv.5
+Copyright: Copyright 2009-2022 The OpenLDAP Foundation All Rights Reserved.
+           Copyright 2009 Symas Corporation All Rights Reserved.
+License: OpenLDAP-2.8
+
+Files: doc/man/man1/ldapexop.1
+Copyright: Copyright 2009 Peter Marschall
+License: OpenLDAP-2.8
+
+Files: include/ldap_queue.h
+Copyright: Copyright 2001-2022 The OpenLDAP Foundation.
+           Copyright (c) 1991, 1993 The Regents of the University of California.  All rights reserved.
+License: OpenLDAP-2.8 and BSD-4-clause-California
+
+Files: include/slapi-plugin.h
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 1997,2002,2003 IBM Corporation.
+License: OpenLDAP-2.8
+
+Files: include/rewrite.h
+Copyright: Copyright 2000-2022 The OpenLDAP Foundation.
+           Portions Copyright 2000-2003 Pierangelo Masarati.
+License: OpenLDAP-2.8
+
+Files: include/ldap_utf8.h
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Copyright (C) 2000 Novell, Inc. All Rights Reserved.
+License: OpenLDAP-2.8
+
+Files: include/sysexits-compat.h
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright (c) 1987 Regents of the University of California.
+License: OpenLDAP-2.8 and BSD-3-clause-variant
+
+Files: include/lutil_meter.h
+Copyright: Copyright (c) 2009 by Emily Backes, Symas Corp.
+License: OpenLDAP-2.8
+
+Files: include/ldap_avl.h
+       include/ldap.h
+       include/ldap_defaults.h
+       include/ldif.h
+       include/ldap_log.h
+       include/lber.h
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright (c) 1993 Regents of the University of Michigan.
+License: OpenLDAP-2.8 and UMich
+
+Files: libraries/liblutil/getopt.c
+       libraries/liblutil/hash.c
+       libraries/liblutil/entropy.c
+       libraries/libldap/apitest.c
+       libraries/libldap/fetch.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 1998-2003 Kurt D. Zeilenga.
+License: OpenLDAP-2.8
+
+Files: libraries/liblutil/meter.c
+Copyright: Copyright (c) 2009 by Emily Backes, Symas Corp.
+License: OpenLDAP-2.8
+
+Files: libraries/liblutil/base64.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 1998-2003 Kurt D. Zeilenga.
+           Portions Copyright 1995 IBM Corporation.
+           Copyright (c) 1996, 1998 by Internet Software Consortium.
+License: OpenLDAP-2.8 and Expat-ISC
+
+Files: libraries/liblutil/detach.c
+       libraries/libldap/testtavl.c
+       libraries/libldap/filter.c
+       libraries/libldap/search.c
+       libraries/libldap/open.c
+       libraries/libldap/add.c
+       libraries/libldap/avl.c
+       libraries/libldap/abandon.c
+       libraries/libldap/sbind.c
+       libraries/libldap/getentry.c
+       libraries/libldap/url.c
+       libraries/libldap/sort.c
+       libraries/libldap/getvalues.c
+       libraries/libldap/delete.c
+       libraries/libldap/testavl.c
+       libraries/libldap/ldifutil.c
+       libraries/libldap/bind.c
+       libraries/libldap/compare.c
+       libraries/libldap/getattr.c
+       libraries/libldap/unbind.c
+       libraries/libldap/free.c
+       libraries/libldap/lbase64.c
+       libraries/libldap/getdn.c
+       libraries/liblber/io.c
+       libraries/liblber/lber-int.h
+       libraries/liblber/bprint.c
+       libraries/liblber/idtest.c
+       libraries/liblber/decode.c
+       libraries/liblber/dtest.c
+       libraries/liblber/encode.c
+       libraries/liblber/etest.c
+       libraries/libldap/addentry.c
+       libraries/libldap/ldif.c
+       libraries/libldap/ldap-int.h
+       libraries/libldap/modify.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Copyright (c) 1990, 1994 Regents of the University of Michigan.
+License: OpenLDAP-2.8 and UMich
+
+Files: libraries/liblutil/getpass.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 1998-2003 Kurt D. Zeilenga.
+           Portions Copyright 2009 Howard Chu.
+           Portions Copyright (c) 1992, 1993  Regents of the University of Michigan.
+License: OpenLDAP-2.8 and UMich
+
+Files: libraries/liblutil/uuid.c
+Copyright: Copyright 2000-2022 The OpenLDAP Foundation.
+           Portions Copyright 2000-2003 Kurt D. Zeilenga.
+License: OpenLDAP-2.8
+
+Files: libraries/liblunicode/ucdata/MUTTUCData.txt
+       libraries/liblunicode/ucdata/ucpgba.h
+       libraries/liblunicode/ucdata/ucdata.h
+       libraries/liblunicode/ucdata/ucdata.c
+       libraries/liblunicode/ucdata/ucpgba.c
+       libraries/liblunicode/ucdata/ucgendat.c
+       libraries/liblunicode/ure/README
+       libraries/liblunicode/ure/urestubs.c
+       libraries/liblunicode/ure/ure.c
+       libraries/liblunicode/ure/ure.h
+       libraries/liblunicode/utbm/utbm.h
+       libraries/liblunicode/utbm/utbmstub.c
+       libraries/liblunicode/utbm/utbm.c
+       libraries/liblunicode/utbm/README
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Copyright 1997-2001 Computing Research Labs
+License: OpenLDAP-2.8 and Expat-UNM
+
+Files: libraries/libldap/pagectrl.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Copyright 2006 Hans Leidekker
+License: OpenLDAP-2.8
+
+Files: libraries/libldap/utf-8-conv.c
+       libraries/libldap/result.c
+       libraries/libldap/vlvctrl.c
+       libraries/libldap/controls.c
+       libraries/libldap/sortctrl.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright (C) 1999, 2000 Novell, Inc. All Rights Reserved.
+License: OpenLDAP-2.8
+
+Files: libraries/libldap/deref.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 2008 Pierangelo Masarati.
+License: OpenLDAP-2.8
+
+Files: libraries/libldap/modrdn.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright (c) 1990 Regents of the University of Michigan.
+           Copyright 1999, Juan C. Gomez, All rights reserved.
+License: OpenLDAP-2.8 and Expat
+
+Files: libraries/libldap/os-local.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright (c) 1995 Regents of the University of Michigan.
+           Portions (C) Copyright PADL Software Pty Ltd. 1999
+License: OpenLDAP-2.8 and Expat
+
+Files: libraries/libldap/msctrl.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 2018 Howard Chu.
+License: OpenLDAP-2.8
+
+Files: libraries/libldap/dds.c
+Copyright: Copyright 2005-2022 The OpenLDAP Foundation.
+           Portions Copyright 2005-2006 SysNet s.n.c.
+License: OpenLDAP-2.8
+
+Files: libraries/libldap/os-ip.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 1999 Lars Uffmann.
+           Portions Copyright (c) 1995 Regents of the University of Michigan.
+License: OpenLDAP-2.8
+
+Files: libraries/libldap/ppolicy.c
+Copyright: Copyright 2004-2022 The OpenLDAP Foundation.
+           Portions Copyright 2004 Hewlett-Packard Company.
+           Portions Copyright 2004 Howard Chu, Symas Corp.
+License: OpenLDAP-2.8
+
+Files: libraries/libldap/rq.c
+Copyright: Copyright 2003-2022 The OpenLDAP Foundation.
+           Portions Copyright 2003 IBM Corporation.
+License: OpenLDAP-2.8
+
+Files: libraries/libldap/request.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright (c) 1995 Regents of the University of Michigan.
+           Copyright (C) 1999, 2000 Novell, Inc. All Rights Reserved.
+License: OpenLDAP-2.8
+
+Files: libraries/libldap/account_usability.c
+Copyright: Copyright 2004-2022 The OpenLDAP Foundation.
+           Portions Copyright 2004 Hewlett-Packard Company.
+           Portions Copyright 2004 Howard Chu, Symas Corp.
+License: OpenLDAP-2.8
+
+Files: libraries/libldap/util-int.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 1998 A. Hartgers.
+License: OpenLDAP-2.8
+
+Files: libraries/liblmdb/mdb.c
+       libraries/liblmdb/lmdb.h
+Copyright: Copyright 2011-2021 Howard Chu, Symas Corp.
+           Copyright (c) 2009, 2010 Martin Hedenfalk <martin@bzero.se>
+License: OpenLDAP-2.8 and Expat
+
+Files: servers/slapd/back-asyncmeta/Makefile.in
+       servers/slapd/back-asyncmeta/search.c
+       servers/slapd/back-asyncmeta/init.c
+       servers/slapd/back-asyncmeta/message_queue.c
+       servers/slapd/back-asyncmeta/modrdn.c
+       servers/slapd/back-asyncmeta/add.c
+       servers/slapd/back-asyncmeta/config.c
+       servers/slapd/back-asyncmeta/back-asyncmeta.h
+       servers/slapd/back-asyncmeta/conn.c
+       servers/slapd/back-asyncmeta/delete.c
+       servers/slapd/back-asyncmeta/bind.c
+       servers/slapd/back-asyncmeta/candidates.c
+       servers/slapd/back-asyncmeta/compare.c
+       servers/slapd/back-asyncmeta/dncache.c
+       servers/slapd/back-asyncmeta/proto-asyncmeta.h
+       servers/slapd/back-asyncmeta/modify.c
+       servers/slapd/back-asyncmeta/meta_result.c
+Copyright: Copyright 2016-2022 The OpenLDAP Foundation.
+           Copyright 2016 Symas Corporation.
+           All rights reserved.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/back-asyncmeta/map.c
+Copyright: Copyright 2016-2022 The OpenLDAP Foundation.
+           Copyright 2016 Symas Corporation.
+           Copyright 1999, Howard Chu <hyc@highlandsun.com>
+           All rights reserved.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/back-dnssrv/Makefile.in
+       servers/slapd/back-dnssrv/search.c
+       servers/slapd/back-dnssrv/init.c
+       servers/slapd/back-dnssrv/config.c
+       servers/slapd/back-dnssrv/referral.c
+       servers/slapd/back-dnssrv/bind.c
+       servers/slapd/back-dnssrv/compare.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Copyright 1998-2003 Kurt D. Zeilenga.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/back-ldap/monitor.c
+       servers/slapd/back-ldap/search.c
+       servers/slapd/back-ldap/init.c
+       servers/slapd/back-ldap/modrdn.c
+       servers/slapd/back-ldap/add.c
+       servers/slapd/back-ldap/back-ldap.h
+       servers/slapd/back-ldap/config.c
+       servers/slapd/back-ldap/delete.c
+       servers/slapd/back-ldap/bind.c
+       servers/slapd/back-ldap/compare.c
+       servers/slapd/back-ldap/unbind.c
+       servers/slapd/back-ldap/modify.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 1999-2003 Howard Chu.
+           Portions Copyright 2000-2003 Pierangelo Masarati.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/back-ldap/chain.c
+       servers/slapd/back-ldap/distproc.c
+       servers/slapd/back-ldap/pbind.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 1999-2003 Howard Chu.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/back-meta/search.c
+       servers/slapd/back-meta/init.c
+       servers/slapd/back-meta/suffixmassage.c
+       servers/slapd/back-meta/modrdn.c
+       servers/slapd/back-meta/add.c
+       servers/slapd/back-meta/config.c
+       servers/slapd/back-meta/conn.c
+       servers/slapd/back-meta/delete.c
+       servers/slapd/back-meta/bind.c
+       servers/slapd/back-meta/candidates.c
+       servers/slapd/back-meta/map.c
+       servers/slapd/back-meta/proto-meta.h
+       servers/slapd/back-meta/compare.c
+       servers/slapd/back-meta/dncache.c
+       servers/slapd/back-meta/back-meta.h
+       servers/slapd/back-meta/unbind.c
+       servers/slapd/back-meta/modify.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 2001-2003 Pierangelo Masarati.
+           Portions Copyright 1999-2003 Howard Chu.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/back-monitor/time.c
+       servers/slapd/back-monitor/search.c
+       servers/slapd/back-monitor/proto-back-monitor.h
+       servers/slapd/back-monitor/init.c
+       servers/slapd/back-monitor/backend.c
+       servers/slapd/back-monitor/conn.c
+       servers/slapd/back-monitor/overlay.c
+       servers/slapd/back-monitor/cache.c
+       servers/slapd/back-monitor/back-monitor.h
+       servers/slapd/back-monitor/log.c
+       servers/slapd/back-monitor/sent.c
+       servers/slapd/back-monitor/bind.c
+       servers/slapd/back-monitor/rww.c
+       servers/slapd/back-monitor/operational.c
+       servers/slapd/back-monitor/database.c
+       servers/slapd/back-monitor/compare.c
+       servers/slapd/back-monitor/listener.c
+       servers/slapd/back-monitor/thread.c
+       servers/slapd/back-monitor/entry.c
+       servers/slapd/back-monitor/operation.c
+       servers/slapd/back-monitor/modify.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 2001-2003 Pierangelo Masarati.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/back-passwd/search.c
+       servers/slapd/back-passwd/config.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright (c) 1995 Regents of the University of Michigan.
+License: OpenLDAP-2.8 and UMich
+
+Files: servers/slapd/back-perl/close.c
+       servers/slapd/back-perl/search.c
+       servers/slapd/back-perl/init.c
+       servers/slapd/back-perl/proto-perl.h
+       servers/slapd/back-perl/modrdn.c
+       servers/slapd/back-perl/add.c
+       servers/slapd/back-perl/config.c
+       servers/slapd/back-perl/delete.c
+       servers/slapd/back-perl/bind.c
+       servers/slapd/back-perl/compare.c
+       servers/slapd/back-perl/perl_back.h
+       servers/slapd/back-perl/modify.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 1999 John C. Quillan.
+           Portions Copyright 2002 myinternet Limited.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/back-perl/Makefile.in
+       servers/slapd/back-perl/SampleLDAP.pm
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 1999 John C. Quillan.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/back-relay/init.c
+       servers/slapd/back-relay/back-relay.h
+       servers/slapd/back-relay/op.c
+       servers/slapd/back-relay/proto-back-relay.h
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 2004 Pierangelo Masarati.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/back-sql/entry-id.c
+       servers/slapd/back-sql/search.c
+       servers/slapd/back-sql/back-sql.h
+       servers/slapd/back-sql/add.c
+       servers/slapd/back-sql/config.c
+       servers/slapd/back-sql/sql-wrap.c
+       servers/slapd/back-sql/schema-map.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 1999 Dmitry Kovalev.
+           Portions Copyright 2002 Pierangelo Masarati.
+           Portions Copyright 2004 Mark Adamson.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/back-sql/rdbms_depend/*
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 2002 Pierangelo Masarati.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/back-sql/rdbms_depend/timesten/dnreverse/Makefile
+       servers/slapd/back-sql/rdbms_depend/timesten/dnreverse/dnreverse.cpp
+Copyright: 1997-2022 The OpenLDAP Foundation.
+           (c) Copyright 1996-1998, TimesTen Performance Software.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/back-sql/init.c
+       servers/slapd/back-sql/modrdn.c
+       servers/slapd/back-sql/api.c
+       servers/slapd/back-sql/delete.c
+       servers/slapd/back-sql/bind.c
+       servers/slapd/back-sql/operational.c
+       servers/slapd/back-sql/compare.c
+       servers/slapd/back-sql/proto-sql.h
+       servers/slapd/back-sql/util.c
+       servers/slapd/back-sql/modify.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 1999 Dmitry Kovalev.
+           Portions Copyright 2002 Pierangelo Masarati.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/abandon.c
+       servers/slapd/aci.c
+       servers/slapd/acl.c
+       servers/slapd/aclparse.c
+       servers/slapd/add.c
+       servers/slapd/attr.c
+       servers/slapd/ava.c
+       servers/slapd/backend.c
+       servers/slapd/bind.c
+       servers/slapd/ch_malloc.c
+       servers/slapd/compare.c
+       servers/slapd/config.c
+       servers/slapd/connection.c
+       servers/slapd/delete.c
+       servers/slapd/dn.c
+       servers/slapd/entry.c
+       servers/slapd/filter.c
+       servers/slapd/filterentry.c
+       servers/slapd/frontend.c
+       servers/slapd/init.c
+       servers/slapd/lock.c
+       servers/slapd/main.c
+       servers/slapd/modify.c
+       servers/slapd/mods.c
+       servers/slapd/operation.c
+       servers/slapd/phonetic.c
+       servers/slapd/proto-slap.h
+       servers/slapd/result.c
+       servers/slapd/slap.h
+       servers/slapd/value.c
+       servers/slapd/search.c
+       servers/slapd/str2filter.c
+       servers/slapd/unbind.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright (c) 1995 Regents of the University of Michigan.
+License: OpenLDAP-2.8 and UMich
+
+Files: servers/slapd/daemon.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 2007 by Howard Chu, Symas Corporation.
+           Portions Copyright (c) 1995 Regents of the University of Michigan.
+License: OpenLDAP-2.8 and UMich
+
+Files: servers/slapd/syncrepl.c
+Copyright: Copyright 2003-2022 The OpenLDAP Foundation.
+           Portions Copyright 2003 by IBM Corporation.
+           Portions Copyright 2003-2008 by Howard Chu, Symas Corporation.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/modrdn.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 1999, Juan C. Gomez, All rights reserved.
+           Portions Copyright (c) 1995 Regents of the University of Michigan.
+License: OpenLDAP-2.8 and UMich
+
+Files: servers/slapd/saslauthz.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 2000 Mark Adamson, Carnegie Mellon.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/slapacl.c
+       servers/slapd/slapadd.c
+       servers/slapd/slapauth.c
+       servers/slapd/slapcat.c
+       servers/slapd/slapcommon.c
+       servers/slapd/slapmodify.c
+       servers/slapd/slapschema.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 1998-2003 Kurt D. Zeilenga.
+           Portions Copyright 2003 IBM Corporation.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/slapindex.c
+       servers/slapd/slappasswd.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 1998-2003 Kurt D. Zeilenga.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/slapdn.c
+       servers/slapd/slaptest.c
+Copyright: Copyright 2004-2022 The OpenLDAP Foundation.
+           Portions Copyright 2004 Pierangelo Masarati.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/user.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 1999 PM Lashley.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/component.c
+       servers/slapd/component.h
+       servers/slapd/ctxcsn.c
+       servers/slapd/ldapsync.c
+       servers/slapd/zn_malloc.c
+Copyright: Copyright 2003-2022 The OpenLDAP Foundation.
+           Portions Copyright 2003 by IBM Corporation.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/syslog.c
+Copyright: Copyright (c) 1983, 1988, 1993 The Regents of the University of California.  All rights reserved.
+License: BSD-3-clause-California
+
+Files: servers/slapd/overlays/dynlist.c
+Copyright: Copyright 2003-2022 The OpenLDAP Foundation.
+           Portions Copyright 2004-2005 Pierangelo Masarati.
+           Portions Copyright 2008 Emmanuel Dreyfus.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/overlays/sssvlv.c
+       servers/slapd/overlays/translucent.c
+       servers/slapd/overlays/auditlog.c
+       servers/slapd/overlays/homedir.c
+       servers/slapd/overlays/accesslog.c
+       servers/slapd/overlays/refint.c
+       servers/slapd/overlays/valsort.c
+       servers/slapd/overlays/unique.c
+Copyright: Copyright 2004-2022 The OpenLDAP Foundation.
+           Portions Copyright 2004,2006-2007 Symas Corporation.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/overlays/rwmdn.c
+       servers/slapd/overlays/rwmmap.c
+       servers/slapd/overlays/rwm.c
+       servers/slapd/overlays/rwm.h
+       servers/slapd/overlays/rwmconf.c
+Copyright: Copyright 1999-2022 The OpenLDAP Foundation.
+           Portions Copyright 1999-2003 Howard Chu.
+           Portions Copyright 2000-2003 Pierangelo Masarati.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/overlays/deref.c
+       servers/slapd/overlays/memberof.c
+       servers/slapd/overlays/retcode.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 2005-2008 Pierangelo Masarati.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/overlays/remoteauth.c
+Copyright: Copyright 2004-2022 The OpenLDAP Foundation.
+           Portions Copyright 2017-2021 Ondřej Kuzník, Symas Corporation.
+           Portions Copyright 2004-2017 Howard Chu, Symas Corporation.
+           Portions Copyright 2004 Hewlett-Packard Company.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/overlays/constraint.c
+Copyright: Copyright 2003-2004 Hewlett-Packard Company
+           Copyright 2007 Emmanuel Dreyfus
+License: OpenLDAP-2.8
+
+Files: servers/slapd/overlays/pcache.c
+Copyright: Copyright 2003-2022 The OpenLDAP Foundation.
+           Copyright 2003 IBM Corporation.
+           Copyright 2003-2009 Symas Corporation.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/overlays/dyngroup.c
+       servers/slapd/overlays/collect.c
+       servers/slapd/overlays/overlays.c
+       servers/slapd/overlays/autoca.c
+Copyright: Copyright 2003-2022 The OpenLDAP Foundation.
+           Copyright 2003-2018 by Howard Chu.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/overlays/otp.c
+Copyright: Copyright 2015-2022 The OpenLDAP Foundation.
+           Portions Copyright 2015 by Howard Chu, Symas Corp.
+           Portions Copyright 2016-2017 by Michael Ströder <michael@stroeder.com>
+           Portions Copyright 2018 by Ondřej Kuzník, Symas Corp.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/overlays/dds.c
+Copyright: Copyright 2005-2022 The OpenLDAP Foundation.
+           Portions Copyright 2005-2006 SysNet s.n.c.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/overlays/ppolicy.c
+Copyright: Copyright 2004-2022 The OpenLDAP Foundation.
+           Copyright 2004-2005 Howard Chu, Symas Corporation.
+           Copyright 2004 Hewlett-Packard Company.
+License: OpenLDAP-2.8
+
+Files: servers/slapd/slapi/Makefile.in
+       servers/slapd/slapi/plugin.c
+       servers/slapd/slapi/printmsg.c
+       servers/slapd/slapi/slapi_pblock.c
+       servers/slapd/slapi/proto-slapi.h
+       servers/slapd/slapi/slapi_ext.c
+       servers/slapd/slapi/slapi.h
+       servers/slapd/slapi/slapi_utils.c
+       servers/slapd/slapi/slapi_ops.c
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright IBM Corp. 1997,2002,2003
+License: OpenLDAP-2.8
+
+
+
+
+
+
+
+Files: tests/scripts/test057-memberof-refint
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Portions Copyright 2008 Red Hat, Inc.
+           All rights reserved.
+License: OpenLDAP-2.8
+
+Files: tests/scripts/test080-hotp
+       tests/scripts/test082-remoteauth
+       tests/scripts/test081-totp
+       tests/scripts/test081-totp.py
+Copyright: Copyright 1998-2022 The OpenLDAP Foundation.
+           Copyright 2016-2021 Ondřej Kuzník, Symas Corp.
+           All rights reserved.
+License: OpenLDAP-2.8
+
+Files: debian/*
+Copyright: Bastian Blank <waldi@debian.org>
+           Ben Collins <bcollins@debian.org>
+           Giuseppe Iuculano <iuculano@debian.org>
+           Helmut Grohne <helmut@subdivi.de>
+           Jelmer Vernooij <jelmer@debian.org>
+           Matthijs Möhlmann <matthijs@cacholong.nl>
+           Michael Gilbert <mgilbert@debian.org>
+           Nico Golde <nion@debian.org>
+           Petter Reinholdtsen <pere@debian.org>
+           Roland Bauerschmidt <rb@debian.org>
+           Russ Allbery <rra@debian.org>
+           Ryan Tandy <ryan@nardis.ca>
+           Sergio Durigan Junior <sergiodj@debian.org>
+           Stephen Frost <sfrost@debian.org>
+           Steve Langasek <vorlon@debian.org>
+           Thijs Kinkhorst <thijs@debian.org>
+           Timo Aaltonen <tjaalton@debian.org>
+           Torsten Landschoff <torsten@debian.org>
+           Wichert Akkerman <wakkerma@debian.org>
+           Canonical Ltd
+License: OpenLDAP-2.8
+
+License: F5
+ This software is not subject to any license of F5 Networks.
+ This is free software; you can redistribute and use it
+ under the same terms as OpenLDAP itself.
+
+License: FSF-unlimited
+ This file is free software; the Free Software Foundation
+ gives unlimited permission to copy and/or distribute it,
+ with or without modifications, as long as this notice is preserved.
+ .
+ This program is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY, to the extent permitted by law; without
+ even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+ PARTICULAR PURPOSE.
+
+License: GPL-2+
+ This program is free software; you can redistribute it and/or modify
+ it under the terms of the GNU General Public License as published by
+ the Free Software Foundation; either version 2 of the License, or
+ (at your option) any later version.
+ .
+ This program is distributed in the hope that it will be useful
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+ General Public License for more details.
+ .
+ On Debian systems, the complete text of the GNU General Public License
+ version 2 can be found in the file `/usr/share/common-licenses/GPL-2'.
+
+License: GPL-2+ with Autoconf exception
+ This program is free software; you can redistribute it and/or modify
+ it under the terms of the GNU General Public License as published by
+ the Free Software Foundation; either version 2, or (at your option)
+ any later version.
+ .
+ This program is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU General Public License for more details.
+ .
+ You should have received a copy of the GNU General Public License
+ along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ .
+ As a special exception to the GNU General Public License, if you
+ distribute this file as part of a program that contains a
+ configuration script generated by Autoconf, you may include it under
+ the same distribution terms that you use for the rest of that program.
+ .
+ On Debian systems, the complete text of the GNU General Public License
+ version 2 can be found in the file `/usr/share/common-licenses/GPL-2'.
+
+License: GPL-2+ with Libtool exception
+ GNU Libtool is free software; you can redistribute it and/or modify
+ it under the terms of the GNU General Public License as published by
+ the Free Software Foundation; either version 2 of the License, or
+ (at your option) any later version.
+ .
+ As a special exception to the GNU General Public License,
+ if you distribute this file as part of a program or library that
+ is built using GNU Libtool, you may include this file under the
+ same distribution terms that you use for the rest of that program.
+ .
+ GNU Libtool is distributed in the hope that it will be useful, but
+ WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ General Public License for more details.
+ .
+ On Debian systems, the complete text of the GNU General Public License
+ version 2 can be found in the file `/usr/share/common-licenses/GPL-2'.
+
+License: GPL-3+
+ This program is free software: you can redistribute it and/or modify
+ it under the terms of the GNU General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+ .
+ This program is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU General Public License for more details.
+ .
+ On Debian systems, the complete text of the GNU General Public License
+ version 3 can be found in the file `/usr/share/common-licenses/GPL-3'.
+
+License: GPL-3+ with Autoconf exception
+ This file is free software; you can redistribute it and/or modify it
+ under the terms of the GNU General Public License as published by
+ the Free Software Foundation; either version 3 of the License, or
+ (at your option) any later version.
+ .
+ This program is distributed in the hope that it will be useful, but
+ WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ General Public License for more details.
+ .
+ You should have received a copy of the GNU General Public License
+ along with this program; if not, see <https://www.gnu.org/licenses/>.
+ .
+ As a special exception to the GNU General Public License, if you
+ distribute this file as part of a program that contains a
+ configuration script generated by Autoconf, you may include it under
+ the same distribution terms that you use for the rest of that
+ program.  This Exception is an additional permission under section
+ of the GNU General Public License, version 3 ("GPLv3").
+ .
+ On Debian systems, the complete text of the GNU General Public License
+ version 3 can be found in the file `/usr/share/common-licenses/GPL-3'.
+
+License: GPL-3+ with Libtool exception
+ This program is free software; you can redistribute it and/or modify
+ it under the terms of the GNU General Public License as published by
+ the Free Software Foundation; either version 3 of the License, or
+ (at your option) any later version.
+ .
+ As a special exception to the GNU General Public License, if you distribute
+ this file as part of a program or library that is built using GNU Libtool,
+ you may include this file under the same distribution terms that you use
+ for the rest of that program.
+ .
+ This program is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNES FOR A PARTICULAR PURPOSE. See the GNU
+ General Public License for more details.
+ .
+ On Debian systems, the complete text of the GNU General Public License
+ version 3 can be found in the file `/usr/share/common-licenses/GPL-3'.
+
+License: JCG
+ This software is not subject to any license of Silicon Graphics
+ Inc. or Purdue University.
+ .
+ Redistribution and use in source and binary forms are permitted
+ without restriction or fee of any kind as long as this notice
+ is preserved.
+Comment:
+ The following is additional information from Juan C. Gomez on how
+ this license is to be interpreted:
+ .
+ Local-Date: Fri, 06 Jun 2003 13:18:52 -0400
+ Date: Fri, 6 Jun 2003 10:18:52 -0700
+ From: Juan Gomez <juang@us.ibm.com>
+ To: Stephen Frost <sfrost@debian.org>
+ X-Mailer: Lotus Notes Release 5.0.2a (Intl) 23 November 1999
+ Subject: Re: Juan C. Gomez license in OpenLDAP Source
+ .
+ Stephen,
+ .
+ "There is no restriction on modifications and derived works" on the work I
+ did for the openldap server as long as this is consistent with the openldap
+ license. Please forward this email to Kurt so he does the appropriate
+ changes to the files to reflect this.
+ .
+ Regards, Juan
+
+License: MIT-XC
+ Permission is hereby granted, free of charge, to any person obtaining a copy
+ of this software and associated documentation files (the "Software"), to
+ deal in the Software without restriction, including without limitation the
+ rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ sell copies of the Software, and to permit persons to whom the Software is
+ furnished to do so, subject to the following conditions:
+ .
+ The above copyright notice and this permission notice shall be included in
+ all copies or substantial portions of the Software.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+ X CONSORTIUM BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
+ AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNEC-
+ TION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ .
+ Except as contained in this notice, the name of the X Consortium shall not
+ be used in advertising or otherwise to promote the sale, use or other deal-
+ ings in this Software without prior written authorization from the X Consor-
+ tium.
+
+License: OpenLDAP-2.8
+ The OpenLDAP Public License
+ Version 2.8, 17 August 2003
+ .
+ Redistribution and use of this software and associated documentation
+ ("Software"), with or without modification, are permitted provided
+ that the following conditions are met:
+ .
+ 1. Redistributions in source form must retain copyright statements
+ and notices,
+ .
+ 2. Redistributions in binary form must reproduce applicable copyright
+ statements and notices, this list of conditions, and the following
+ disclaimer in the documentation and/or other materials provided
+ with the distribution, and
+ .
+ 3. Redistributions must contain a verbatim copy of this document.
+ .
+ The OpenLDAP Foundation may revise this license from time to time.
+ Each revision is distinguished by a version number.  You may use
+ this Software under terms of this license revision or under the
+ terms of any subsequent revision of the license.
+ .
+ THIS SOFTWARE IS PROVIDED BY THE OPENLDAP FOUNDATION AND ITS
+ CONTRIBUTORS ``AS IS'' AND ANY EXPRESSED OR IMPLIED WARRANTIES,
+ INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY
+ AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT
+ SHALL THE OPENLDAP FOUNDATION, ITS CONTRIBUTORS, OR THE AUTHOR(S)
+ OR OWNER(S) OF THE SOFTWARE BE LIABLE FOR ANY DIRECT, INDIRECT,
+ INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+ BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+ ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ POSSIBILITY OF SUCH DAMAGE.
+ .
+ The names of the authors and copyright holders must not be used in
+ advertising or otherwise to promote the sale, use or other dealing
+ in this Software without specific, written prior permission.  Title
+ to copyright in this Software shall at all times remain with copyright
+ holders.
+ .
+ OpenLDAP is a registered trademark of the OpenLDAP Foundation.
+ .
+ Copyright 1999-2003 The OpenLDAP Foundation, Redwood City,
+ California, USA.  All Rights Reserved.  Permission to copy and
+ distribute verbatim copies of this document is granted.
+
+License: UMich
+ Redistribution and use in source and binary forms are permitted
+ provided that this notice is preserved and that due credit is given
+ to the University of Michigan at Ann Arbor.  The name of the
+ University may not be used to endorse or promote products derived
+ from this software without specific prior written permission.  This
+ software is provided ``as is'' without express or implied warranty.
+Comment:
+ After discussing this license with the OpenLDAP Foundation we received
+ clarification on it:
+ .
+ To: Stephen Frost <sfrost@snowman.net>
+ Subject: Re: OpenLDAP Licenseing issues
+ From: "Kurt D. Zeilenga" <Kurt@OpenLDAP.org>
+ Date: Wed, 28 May 2003 10:55:44 -0700
+ Cc: Steve Langasek <vorlon@netexpress.net>,debian-legal@lists.debian.org, openldap-devel@OpenLDAP.org
+ In-reply-to: <20030528162613.GB8524@ns.snowman.net>
+ Message-id: <5.2.0.9.0.20030528094229.02924780@127.0.0.1>
+ Old-return-path: <Kurt@OpenLDAP.org>
+ .
+ Steven,
+ .
+ The OpenLDAP Foundation believes it the Regents' statement grants a
+ license to redistribute derived works and is confident that the University,
+ who is quite aware of our actions (as they actively participate in them),
+ does not consider our actions to infringe on their rights.  You are
+ welcomed to your opinions. I suggest, however, that before you rely
+ on your or other people's opinions (including ours), that you consult
+ with a lawyer familiar with applicable law and the particulars of your
+ situation.
+ .
+ The Foundation sees no reason for it to expend its limited resources
+ seeking clarifications which it believes are unnecessary.  You are,
+ of course, welcomed to expend time and energy seeking clarifications
+ you think are necessary.  I suggest you contact University's general
+ counsel office (http://www.umich.edu/~vpgc/).
+ .
+ Regards, Kurt
+
+License: Beerware
+ <phk@FreeBSD.ORG> wrote this file. As long as you retain this notice you
+ can do whatever you want with this stuff. If we meet some day, and you think
+ this stuff is worth it, you can buy me a beer in return Poul-Henning Kamp
+
+License: BSD-3-clause-variant
+ Redistribution and use in source and binary forms are permitted
+ provided that the above copyright notice and this paragraph are
+ duplicated in all such forms and that any documentation,
+ advertising materials, and other materials related to such
+ distribution and use acknowledge that the software was developed
+ by the University of California, Berkeley.  The name of the
+ University may not be used to endorse or promote products derived
+ from this software without specific prior written permission.
+ THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR
+ IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
+ WARRANTIES OF MERCHANTIBILITY AND FITNESS FOR A PARTICULAR PURPOSE.
+
+License: Expat-ISC
+ Permission to use, copy, modify, and distribute this software for any
+ purpose with or without fee is hereby granted, provided that the above
+ copyright notice and this permission notice appear in all copies.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS" AND INTERNET SOFTWARE CONSORTIUM DISCLAIMS
+ ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES
+ OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL INTERNET SOFTWARE
+ CONSORTIUM BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL
+ DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR
+ PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS
+ ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS
+ SOFTWARE.
+
+License: Expat-UNM
+ Permission is hereby granted, free of charge, to any person obtaining a
+ copy of this software and associated documentation files (the "Software"),
+ to deal in the Software without restriction, including without limitation
+ the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ and/or sell copies of the Software, and to permit persons to whom the
+ Software is furnished to do so, subject to the following conditions:
+ .
+ The above copyright notice and this permission notice shall be included in
+ all copies or substantial portions of the Software.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ THE COMPUTING RESEARCH LAB OR NEW MEXICO STATE UNIVERSITY BE LIABLE FOR ANY
+ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT
+ OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+ THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+License: Expat
+ Permission is hereby granted, free of charge, to any person obtaining
+ a copy of this software and associated documentation files (the
+ "Software"), to deal in the Software without restriction, including
+ without limitation the rights to use, copy, modify, merge, publish,
+ distribute, sublicense, and/or sell copies of the Software, and to
+ permit persons to whom the Software is furnished to do so, subject to
+ the following conditions:
+ .
+ The above copyright notice and this permission notice shall be
+ included in all copies or substantial portions of the Software.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+ LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+License: BSD-3-clause-California
+ Redistribution and use in source and binary forms, with or without
+ modification, are permitted provided that the following conditions
+ are met:
+ 1. Redistributions of source code must retain the above copyright
+    notice, this list of conditions and the following disclaimer.
+ 2. Redistributions in binary form must reproduce the above copyright
+    notice, this list of conditions and the following disclaimer in the
+    documentation and/or other materials provided with the distribution.
+ 3. Neither the name of the University nor the names of its contributors
+    may be used to endorse or promote products derived from this software
+    without specific prior written permission.
+ .
+ THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+ ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+ FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ SUCH DAMAGE.
+
+License: BSD-4-clause-California
+ Redistribution and use in source and binary forms, with or without
+ modification, are permitted provided that the following conditions
+ are met:
+ 1. Redistributions of source code must retain the above copyright
+    notice, this list of conditions and the following disclaimer.
+ 2. Redistributions in binary form must reproduce the above copyright
+    notice, this list of conditions and the following disclaimer in the
+    documentation and/or other materials provided with the distribution.
+ 3. All advertising materials mentioning features or use of this software
+    must display the following acknowledgement:
+        This product includes software developed by the University of
+        California, Berkeley and its contributors.
+ 4. Neither the name of the University nor the names of its contributors
+    may be used to endorse or promote products derived from this software
+    without specific prior written permission.
+ .
+ THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+ ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+ FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ SUCH DAMAGE.
+
+License: BSD-3-clause
+ Redistribution and use in source and binary forms, with or without
+ modification, are permitted provided that the following conditions
+ are met:
+ 1. Redistributions of source code must retain the above copyright
+    notice, this list of conditions and the following disclaimer.
+ 2. Redistributions in binary form must reproduce the above copyright
+    notice, this list of conditions and the following disclaimer in the
+    documentation and/or other materials provided with the distribution.
+ 3. Neither the name of the copyright holder nor the names of contributors
+    may be used to endorse or promote products derived from this software
+    without specific prior written permission.
+ . 
+ THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTOR(S) ``AS IS'' AND
+ ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTOR(S) BE LIABLE
+ FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ SUCH DAMAGE.

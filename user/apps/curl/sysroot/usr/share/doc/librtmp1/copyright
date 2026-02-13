@@ -1,0 +1,71 @@
+This work was packaged for Debian by:
+
+    Reinhard Tartler <siretart@tauware.de> on Sun, 30 May 2010 17:07:16 +0200
+
+It was downloaded from http://rtmpdump.mplayerhq.hu/
+
+Upstream Authors and Copyright:
+
+RTMP Dump
+(C) 2009 Andrej Stepanchuk
+(C) 2009-2011 Howard Chu
+(C) 2010 2a665470ced7adb7156fcef47f8199a6371c117b8a79e399a2771e0b36384090
+
+
+License of the programs in the rtmpdump package:
+
+    rtmpdump - small dumper for media content streamed over the RTMP protocol
+    Copyright (C) 2009 Andrej Stepanchuk
+    Copyright (C) 2009-2010 Howard Chu
+
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License along
+    with this program; if not, write to the Free Software Foundation, Inc.,
+    51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+
+License of the librtmp library (included in the librtmp-dev package and in the
+librmtp/ subdirectory in the  source tree):
+
+        Copyright (C) 2005-2008 Team XBMC
+        http://www.xbmc.org
+        Copyright (C) 2008-2009 Andrej Stepanchuk
+        Copyright (C) 2009-2010 Howard Chu
+
+
+    librtmp is free software; you can redistribute it and/or modify
+    it under the terms of the GNU Lesser General Public License as
+    published by the Free Software Foundation; either version 2.1,
+    or (at your option) any later version.
+
+    librtmp is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU Lesser General Public License
+    along with librtmp see the file COPYING.  If not, write to
+    the Free Software Foundation, Inc., 51 Franklin St, Fifth Floor, Boston,
+    MA 02110-1301, USA.
+    http://www.gnu.org/copyleft/lgpl.html
+
+
+The Debian packaging is:
+
+    Copyright (C) 2010 Reinhard Tartler <siretart@tauware.de>
+
+and is licensed under the GNU Lesser General Public License.
+
+
+On Debian GNU/Linux systems, the complete text of the GNU General Public
+License can be found in `/usr/share/common-licenses/GPL-2' and the text of the
+GNU Lesser General Public License is in `/usr/share/common-licenses/LGPL-2.1'.

@@ -26,11 +26,10 @@ impl Syscall for SysDupHandle {
             .get_file_by_fd(oldfd)
             .ok_or(SystemError::EBADF)?;
 
-        let new_file = old_file.try_clone().ok_or(SystemError::EBADF)?;
-        // dup默认非cloexec
-        new_file.set_close_on_exec(false);
-        // 申请文件描述符，并把文件对象存入其中
-        let res = fd_table_guard.alloc_fd(new_file, None).map(|x| x as usize);
+        // dup 共享同一个 open file description（Arc<File>），cloexec 默认 false
+        let res = fd_table_guard
+            .alloc_fd_arc(old_file, None, false)
+            .map(|x| x as usize);
         return res;
     }
 

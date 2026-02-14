@@ -178,7 +178,7 @@ impl Vm {
         let fd = ProcessManager::current_pcb()
             .fd_table()
             .write()
-            .alloc_fd(file, None)?;
+            .alloc_fd(file, None, false)?;
 
         Ok(fd as usize)
     }

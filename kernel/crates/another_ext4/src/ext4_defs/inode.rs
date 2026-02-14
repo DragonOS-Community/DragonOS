@@ -396,6 +396,55 @@ impl Inode {
         self.set_flags(Self::FLAG_EXTENTS);
         self.extent_root_mut().init(0, 0);
     }
+
+    /// Check if this inode is a device node (character or block device).
+    pub fn is_device(&self) -> bool {
+        matches!(
+            self.file_type(),
+            FileType::CharacterDev | FileType::BlockDev
+        )
+    }
+
+    /// Get device number (major, minor) for character/block device nodes.
+    ///
+    /// Linux ext4 stores device numbers in i_block[0..1]:
+    /// - If i_block[0] != 0: old format, decode from i_block[0]
+    /// - If i_block[0] == 0: new format, decode from i_block[1]
+    pub fn device(&self) -> (u32, u32) {
+        let block0 =
+            u32::from_le_bytes([self.block[0], self.block[1], self.block[2], self.block[3]]);
+        let block1 =
+            u32::from_le_bytes([self.block[4], self.block[5], self.block[6], self.block[7]]);
+
+        if block0 != 0 {
+            device::old_decode_dev(block0)
+        } else {
+            device::new_decode_dev(block1)
+        }
+    }
+
+    /// Set device number (major, minor) for character/block device nodes.
+    ///
+    /// This stores the device number in i_block[0..1] using Linux ext4 format:
+    /// - Old format if major < 256 && minor < 256
+    /// - New format otherwise
+    ///
+    /// Note: This should only be called for device inodes, and extent_init()
+    /// should NOT be called for device inodes.
+    pub fn set_device(&mut self, major: u32, minor: u32) {
+        // Clear i_block area
+        self.block.fill(0);
+
+        if device::old_valid_dev(major, minor) {
+            // Old format: store in i_block[0]
+            let encoded = device::old_encode_dev(major, minor);
+            self.block[0..4].copy_from_slice(&encoded.to_le_bytes());
+        } else {
+            // New format: i_block[0] = 0, store in i_block[1]
+            let encoded = device::new_encode_dev(major, minor);
+            self.block[4..8].copy_from_slice(&encoded.to_le_bytes());
+        }
+    }
 }
 
 /// A combination of an `Inode` and its id
@@ -438,4 +487,455 @@ pub struct FileAttr {
     pub links: u16,
     pub uid: u32,
     pub gid: u32,
+    /// Device number (major, minor) for character/block devices.
+    /// Only meaningful when ftype is CharacterDev or BlockDev.
+    pub rdev: (u32, u32),
+}
+
+/// Device number encoding/decoding utilities compatible with Linux ext4.
+///
+/// Linux ext4 stores device numbers in i_block[0..1]:
+/// - Old format: i_block[0] contains encoded dev (major < 256 && minor < 256)
+/// - New format: i_block[0] = 0, i_block[1] contains encoded dev
+pub mod device {
+    /// Check if device number fits in old format (major < 256 && minor < 256).
+    #[inline]
+    pub const fn old_valid_dev(major: u32, minor: u32) -> bool {
+        major < 256 && minor < 256
+    }
+
+    /// Encode device number in old format (16-bit).
+    /// Layout: [major(8-bit)][minor(8-bit)]
+    #[inline]
+    pub const fn old_encode_dev(major: u32, minor: u32) -> u32 {
+        ((major & 0xff) << 8) | (minor & 0xff)
+    }
+
+    /// Decode device number from old format.
+    #[inline]
+    pub const fn old_decode_dev(dev: u32) -> (u32, u32) {
+        let major = (dev >> 8) & 0xff;
+        let minor = dev & 0xff;
+        (major, minor)
+    }
+
+    /// Encode device number in new format (32-bit).
+    /// Layout: [minor_lo(8-bit)][major(12-bit)][minor_hi(12-bit)]
+    #[inline]
+    pub const fn new_encode_dev(major: u32, minor: u32) -> u32 {
+        (minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)
+    }
+
+    /// Decode device number from new format.
+    #[inline]
+    pub const fn new_decode_dev(dev: u32) -> (u32, u32) {
+        let major = (dev & 0xfff00) >> 8;
+        let minor = (dev & 0xff) | ((dev >> 12) & 0xfff00);
+        (major, minor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ==================== device module tests ====================
+
+    mod device_encoding {
+        use super::device::*;
+
+        #[test]
+        fn test_old_valid_dev_boundary() {
+            // Valid old format
+            assert!(old_valid_dev(0, 0));
+            assert!(old_valid_dev(1, 3)); // /dev/null
+            assert!(old_valid_dev(255, 255)); // max old format
+
+            // Invalid old format
+            assert!(!old_valid_dev(256, 0));
+            assert!(!old_valid_dev(0, 256));
+            assert!(!old_valid_dev(256, 256));
+            assert!(!old_valid_dev(1000, 1000));
+        }
+
+        #[test]
+        fn test_old_encode_decode_roundtrip() {
+            let test_cases = [
+                (0, 0),
+                (1, 3),     // /dev/null
+                (1, 5),     // /dev/zero
+                (4, 0),     // /dev/tty0
+                (8, 0),     // /dev/sda
+                (8, 1),     // /dev/sda1
+                (255, 255), // max
+            ];
+
+            for (major, minor) in test_cases {
+                let encoded = old_encode_dev(major, minor);
+                let (dec_major, dec_minor) = old_decode_dev(encoded);
+                assert_eq!(
+                    (dec_major, dec_minor),
+                    (major, minor),
+                    "old format roundtrip failed for ({}, {})",
+                    major,
+                    minor
+                );
+            }
+        }
+
+        #[test]
+        fn test_old_encode_known_values() {
+            // /dev/null: major=1, minor=3 -> 0x0103
+            assert_eq!(old_encode_dev(1, 3), 0x0103);
+            // /dev/zero: major=1, minor=5 -> 0x0105
+            assert_eq!(old_encode_dev(1, 5), 0x0105);
+            // /dev/sda: major=8, minor=0 -> 0x0800
+            assert_eq!(old_encode_dev(8, 0), 0x0800);
+        }
+
+        #[test]
+        fn test_new_encode_decode_roundtrip() {
+            let test_cases = [
+                (0, 0),
+                (1, 256),        // minor exceeds old format
+                (256, 0),        // major exceeds old format
+                (256, 256),      // both exceed
+                (8, 65536),      // large minor
+                (259, 65536),    // virtio-blk style
+                (4095, 1048575), // near max (12-bit major, 20-bit minor)
+            ];
+
+            for (major, minor) in test_cases {
+                let encoded = new_encode_dev(major, minor);
+                let (dec_major, dec_minor) = new_decode_dev(encoded);
+                assert_eq!(
+                    (dec_major, dec_minor),
+                    (major, minor),
+                    "new format roundtrip failed for ({}, {})",
+                    major,
+                    minor
+                );
+            }
+        }
+
+        #[test]
+        fn test_new_format_also_works_for_small_values() {
+            // New format should also correctly handle small values
+            let test_cases = [(1, 3), (8, 0), (255, 255)];
+
+            for (major, minor) in test_cases {
+                let encoded = new_encode_dev(major, minor);
+                let (dec_major, dec_minor) = new_decode_dev(encoded);
+                assert_eq!((dec_major, dec_minor), (major, minor));
+            }
+        }
+
+        #[test]
+        fn test_format_discrimination() {
+            // When old_valid_dev returns true, old format should be used
+            // When old_valid_dev returns false, new format should be used
+            // This tests the format selection logic
+
+            // Small device: should use old format
+            let (major, minor) = (1, 3);
+            assert!(old_valid_dev(major, minor));
+
+            // Large device: must use new format
+            let (major, minor) = (8, 256);
+            assert!(!old_valid_dev(major, minor));
+        }
+    }
+
+    // ==================== Inode device methods tests ====================
+
+    mod inode_device {
+        use super::*;
+
+        fn create_test_inode() -> Inode {
+            Inode::default()
+        }
+
+        #[test]
+        fn test_is_device() {
+            let mut inode = create_test_inode();
+
+            // Regular file
+            inode.set_mode(InodeMode::FILE | InodeMode::ALL_RW);
+            assert!(!inode.is_device());
+
+            // Directory
+            inode.set_mode(InodeMode::DIRECTORY | InodeMode::ALL_RWX);
+            assert!(!inode.is_device());
+
+            // Character device
+            inode.set_mode(InodeMode::CHARDEV | InodeMode::ALL_RW);
+            assert!(inode.is_device());
+
+            // Block device
+            inode.set_mode(InodeMode::BLOCKDEV | InodeMode::ALL_RW);
+            assert!(inode.is_device());
+
+            // FIFO
+            inode.set_mode(InodeMode::FIFO | InodeMode::ALL_RW);
+            assert!(!inode.is_device());
+
+            // Socket
+            inode.set_mode(InodeMode::SOCKET | InodeMode::ALL_RW);
+            assert!(!inode.is_device());
+
+            // Symlink
+            inode.set_mode(InodeMode::SOFTLINK | InodeMode::ALL_RWX);
+            assert!(!inode.is_device());
+        }
+
+        #[test]
+        fn test_set_device_old_format() {
+            let mut inode = create_test_inode();
+
+            // /dev/null: major=1, minor=3
+            inode.set_device(1, 3);
+
+            // Verify i_block[0] is non-zero (old format)
+            let block0 = u32::from_le_bytes([
+                inode.block[0],
+                inode.block[1],
+                inode.block[2],
+                inode.block[3],
+            ]);
+            assert_ne!(block0, 0, "Old format should have non-zero i_block[0]");
+
+            // Verify i_block[1] is zero
+            let block1 = u32::from_le_bytes([
+                inode.block[4],
+                inode.block[5],
+                inode.block[6],
+                inode.block[7],
+            ]);
+            assert_eq!(block1, 0, "Old format should have zero i_block[1]");
+
+            // Verify roundtrip
+            let (major, minor) = inode.device();
+            assert_eq!((major, minor), (1, 3));
+        }
+
+        #[test]
+        fn test_set_device_new_format() {
+            let mut inode = create_test_inode();
+
+            // Device with minor=256 (exceeds old format)
+            inode.set_device(8, 256);
+
+            // Verify i_block[0] is zero (new format marker)
+            let block0 = u32::from_le_bytes([
+                inode.block[0],
+                inode.block[1],
+                inode.block[2],
+                inode.block[3],
+            ]);
+            assert_eq!(block0, 0, "New format should have zero i_block[0]");
+
+            // Verify i_block[1] is non-zero
+            let block1 = u32::from_le_bytes([
+                inode.block[4],
+                inode.block[5],
+                inode.block[6],
+                inode.block[7],
+            ]);
+            assert_ne!(block1, 0, "New format should have non-zero i_block[1]");
+
+            // Verify roundtrip
+            let (major, minor) = inode.device();
+            assert_eq!((major, minor), (8, 256));
+        }
+
+        #[test]
+        fn test_set_device_clears_block() {
+            let mut inode = create_test_inode();
+
+            // Fill block with garbage
+            inode.block.fill(0xff);
+
+            // Set device
+            inode.set_device(1, 3);
+
+            // Verify rest of block is cleared
+            for i in 8..60 {
+                assert_eq!(
+                    inode.block[i], 0,
+                    "block[{}] should be cleared after set_device",
+                    i
+                );
+            }
+        }
+
+        #[test]
+        fn test_device_roundtrip_various() {
+            let mut inode = create_test_inode();
+
+            let test_cases = [
+                (1, 3),       // /dev/null (old format)
+                (1, 5),       // /dev/zero (old format)
+                (4, 64),      // /dev/ttyS0 (old format)
+                (8, 0),       // /dev/sda (old format)
+                (8, 16),      // /dev/sdb (old format)
+                (8, 256),     // minor > 255 (new format)
+                (254, 0),     // virtio-blk (old format)
+                (259, 0),     // nvme (new format, major > 255)
+                (259, 65536), // nvme with large minor (new format)
+            ];
+
+            for (major, minor) in test_cases {
+                inode.set_device(major, minor);
+                let (got_major, got_minor) = inode.device();
+                assert_eq!(
+                    (got_major, got_minor),
+                    (major, minor),
+                    "Device roundtrip failed for ({}, {})",
+                    major,
+                    minor
+                );
+            }
+        }
+
+        #[test]
+        fn test_device_vs_extent_exclusivity() {
+            let mut inode = create_test_inode();
+
+            // Set as device
+            inode.set_device(1, 3);
+            let device_before = inode.device();
+
+            // Now initialize extent (this would corrupt device data!)
+            // This test documents the expected behavior: don't call extent_init on device inodes
+            inode.extent_init();
+
+            // After extent_init, device() will return garbage
+            // This is expected - device inodes should never have extent_init called
+            let device_after = inode.device();
+
+            // The values will differ, demonstrating mutual exclusivity
+            // In real usage, we must ensure device inodes never call extent_init
+            assert_ne!(
+                device_before, device_after,
+                "extent_init should corrupt device data (this is expected)"
+            );
+        }
+    }
+
+    // ==================== FileAttr tests ====================
+
+    mod file_attr {
+        use super::*;
+
+        #[test]
+        fn test_file_attr_rdev_field() {
+            let attr = FileAttr {
+                ino: 123,
+                size: 0,
+                atime: 0,
+                mtime: 0,
+                ctime: 0,
+                crtime: 0,
+                blocks: 0,
+                ftype: FileType::CharacterDev,
+                perm: InodeMode::ALL_RW,
+                links: 1,
+                uid: 0,
+                gid: 0,
+                rdev: (1, 3), // /dev/null
+            };
+
+            assert_eq!(attr.rdev, (1, 3));
+            assert_eq!(attr.ftype, FileType::CharacterDev);
+        }
+
+        #[test]
+        fn test_file_attr_rdev_default_for_regular() {
+            let attr = FileAttr {
+                ino: 456,
+                size: 1024,
+                atime: 0,
+                mtime: 0,
+                ctime: 0,
+                crtime: 0,
+                blocks: 2,
+                ftype: FileType::RegularFile,
+                perm: InodeMode::ALL_RW,
+                links: 1,
+                uid: 0,
+                gid: 0,
+                rdev: (0, 0), // Not a device
+            };
+
+            assert_eq!(attr.rdev, (0, 0));
+            assert_eq!(attr.ftype, FileType::RegularFile);
+        }
+    }
+
+    // ==================== Linux compatibility tests ====================
+
+    mod linux_compat {
+        use super::device::*;
+
+        /// Test values known from Linux systems
+        #[test]
+        fn test_linux_known_devices() {
+            // These are actual device numbers from a typical Linux system
+            let devices = [
+                ("null", 1, 3),
+                ("zero", 1, 5),
+                ("full", 1, 7),
+                ("random", 1, 8),
+                ("urandom", 1, 9),
+                ("tty", 5, 0),
+                ("console", 5, 1),
+                ("sda", 8, 0),
+                ("sda1", 8, 1),
+                ("sdb", 8, 16),
+                ("loop0", 7, 0),
+                ("loop1", 7, 1),
+            ];
+
+            for (name, major, minor) in devices {
+                // All these fit in old format
+                assert!(
+                    old_valid_dev(major, minor),
+                    "{} should fit in old format",
+                    name
+                );
+
+                // Roundtrip test
+                let encoded = old_encode_dev(major, minor);
+                let (dec_maj, dec_min) = old_decode_dev(encoded);
+                assert_eq!(
+                    (dec_maj, dec_min),
+                    (major, minor),
+                    "Roundtrip failed for {}",
+                    name
+                );
+            }
+        }
+
+        /// Test encoding matches Linux kernel's new_encode_dev
+        #[test]
+        fn test_new_encode_matches_linux() {
+            // Linux kernel: (minor & 0xff) | (major << 8) | ((minor & ~0xff) << 12)
+            // Test with known values
+
+            // major=1, minor=256
+            // Linux: (256 & 0xff) | (1 << 8) | ((256 & ~0xff) << 12)
+            //      = 0 | 0x100 | (0x100 << 12)
+            //      = 0x100 | 0x100000
+            //      = 0x100100
+            let encoded = new_encode_dev(1, 256);
+            assert_eq!(encoded, 0x100100);
+
+            // major=259, minor=0
+            // Linux: (0 & 0xff) | (259 << 8) | ((0 & ~0xff) << 12)
+            //      = 0 | 0x10300 | 0
+            //      = 0x10300
+            let encoded = new_encode_dev(259, 0);
+            assert_eq!(encoded, 0x10300);
+        }
+    }
 }

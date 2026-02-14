@@ -27,6 +27,14 @@ INSTALL_MODE=""
 export RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER:-https://rsproxy.cn}
 export RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT:-https://rsproxy.cn/rustup}
 export RUST_VERSION="${RUST_VERSION:-nightly-2025-08-10}"
+export NIX_MIRROR=${NIX_MIRROR:-}
+export NIX_INSTALLER_URL=${NIX_INSTALLER_URL:-https://mirrors.tuna.tsinghua.edu.cn/nix/latest/install}
+export NIX_INSTALLER_FALLBACK_URL=${NIX_INSTALLER_FALLBACK_URL:-https://nixos.org/nix/install}
+export NIX_INSTALLER_ARGS=${NIX_INSTALLER_ARGS:---daemon}
+export NIX_TRUSTED_USER=${NIX_TRUSTED_USER:-}
+export NIX_AUTO_GC=${NIX_AUTO_GC:-}
+export NIX_MIN_FREE=${NIX_MIN_FREE:-5G}
+export NIX_MAX_FREE=${NIX_MAX_FREE:-10G}
 
 banner()
 {
@@ -59,35 +67,233 @@ congratulations_nix()
 	echo "|   请[关闭]当前终端, 并[重新打开]一个终端 |"
 	echo "|   然后通过以下命令进入开发环境:          |"
 	echo "|                                          |"
-	echo "|   nix develop ./tools/nix-dev-shell      |"
+	echo "|   nix develop                            |"
 	echo "|                                          |"
 	echo "|------------------------------------------|"
 }
 
 ####################################################################################
-# 安装 Nix 包管理器
+# 配置 Nix 国内镜像源 (可选)
 ####################################################################################
-install_nix()
+setup_nix_mirror()
 {
-	if [ -n "$(which nix)" ]; then
-		echo "Nix 已经安装在您的系统上。"
+	if [ "$CI_INSTALL" = "true" ]; then
 		return 0
 	fi
 
-	echo "正在安装 Nix 包管理器..."
-	curl -fsSL https://install.determinate.systems/nix | sh -s -- install
-
-	if [ $? -ne 0 ]; then
-		echo "Nix 安装失败！"
-		exit 1
+	local enable_mirror=""
+	if [ -n "$NIX_MIRROR" ]; then
+		if echo "$NIX_MIRROR" | grep -Eiq "^(0|false|no)$"; then
+			enable_mirror=""
+		else
+			enable_mirror="true"
+		fi
+	else
+		echo ""
+		echo "是否启用国内 Nix 镜像源（清华/中科大）？"
+		echo "若你在国内且没有全局代理，强烈推荐开启。"
+		printf "(y/N): "
+		read mirror_choice
+		if echo "$mirror_choice" | grep -iq "^y" ;then
+			enable_mirror="true"
+		fi
 	fi
 
-	echo "Nix 安装成功！"
+	if [ "$enable_mirror" = "true" ]; then
+		local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/nix"
+		local config_file="${config_dir}/nix.conf"
+		mkdir -p "$config_dir"
 
-	# Source nix environment
-	if [ -f "/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh" ]; then
-		. /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+		if ! grep -q "DragonOS Nix mirror" "$config_file" 2>/dev/null; then
+			cat >> "$config_file" <<'EOF'
+# DragonOS Nix mirror (CN)
+substituters = https://mirrors.tuna.tsinghua.edu.cn/nix-channels/store https://mirrors.ustc.edu.cn/nix-channels/store https://cache.nixos.org/
+trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+EOF
+			echo "已写入 Nix 镜像配置: $config_file"
+		else
+			echo "已检测到 Nix 镜像配置，跳过写入。"
+		fi
 	fi
+}
+
+####################################################################################
+# 启用 Nix 实验特性（nix-command + flakes）
+####################################################################################
+configure_nix_features()
+{
+	local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/nix"
+	local config_file="${config_dir}/nix.conf"
+	mkdir -p "$config_dir"
+
+	if ! grep -q "experimental-features" "$config_file" 2>/dev/null; then
+		cat >> "$config_file" <<'EOF'
+# DragonOS Nix features
+experimental-features = nix-command flakes
+EOF
+		echo "已写入 Nix 实验特性配置: $config_file"
+	else
+		echo "已检测到 Nix 实验特性配置，跳过写入。"
+	fi
+}
+
+####################################################################################
+# 将当前用户加入 Nix trusted-users（需要 sudo）
+####################################################################################
+configure_nix_trusted_user()
+{
+	if [ "$CI_INSTALL" = "true" ]; then
+		return 0
+	fi
+
+	local enable_trust=""
+	if [ -n "$NIX_TRUSTED_USER" ]; then
+		if echo "$NIX_TRUSTED_USER" | grep -Eiq "^(0|false|no)$"; then
+			enable_trust=""
+		else
+			enable_trust="true"
+		fi
+	else
+		echo ""
+		echo "是否将当前用户加入 Nix trusted-users？"
+		echo "否则会忽略 extra-substituters 等受限配置。"
+		printf "(y/N): "
+		read trust_choice
+		if echo "$trust_choice" | grep -iq "^y" ;then
+			enable_trust="true"
+		fi
+	fi
+
+	if [ "$enable_trust" = "true" ]; then
+		local sys_conf="/etc/nix/nix.conf"
+		if ! grep -q "DragonOS Nix trusted users" "$sys_conf" 2>/dev/null; then
+			sudo sh -c "printf '%s\n' '# DragonOS Nix trusted users' 'trusted-users = root $USER' >> \"$sys_conf\""
+			echo "已写入 trusted-users: $sys_conf"
+		else
+			echo "已检测到 trusted-users 配置，跳过写入。"
+		fi
+		# 尝试重启 nix-daemon（若尚未安装则忽略失败）
+		if command -v systemctl >/dev/null 2>&1; then
+			sudo systemctl restart nix-daemon 2>/dev/null || true
+		fi
+	fi
+}
+
+####################################################################################
+# 配置 Nix 自动 GC（磁盘空间低于阈值时自动清理）
+####################################################################################
+configure_nix_auto_gc()
+{
+	if [ "$CI_INSTALL" = "true" ]; then
+		return 0
+	fi
+
+	local enable_auto_gc=""
+	if [ -n "$NIX_AUTO_GC" ]; then
+		if echo "$NIX_AUTO_GC" | grep -Eiq "^(0|false|no)$"; then
+			enable_auto_gc=""
+		else
+			enable_auto_gc="true"
+		fi
+	else
+		echo ""
+		echo "是否启用 Nix 自动 GC？（磁盘空间不足时自动清理旧构建）"
+		echo "默认阈值: min-free=${NIX_MIN_FREE}, max-free=${NIX_MAX_FREE}"
+		printf "(y/N): "
+		read auto_gc_choice
+		if echo "$auto_gc_choice" | grep -iq "^y" ;then
+			enable_auto_gc="true"
+		fi
+	fi
+
+	if [ "$enable_auto_gc" = "true" ]; then
+		local min_free="${NIX_MIN_FREE}"
+		local max_free="${NIX_MAX_FREE}"
+		# 将 GiB/MiB 形式转换为 Nix 可接受的 G/M
+		case "$min_free" in
+			*GiB) min_free="${min_free%GiB}G" ;;
+			*MiB) min_free="${min_free%MiB}M" ;;
+		esac
+		case "$max_free" in
+			*GiB) max_free="${max_free%GiB}G" ;;
+			*MiB) max_free="${max_free%MiB}M" ;;
+		esac
+
+		local sys_conf="/etc/nix/nix.conf"
+		local user_conf="${XDG_CONFIG_HOME:-$HOME/.config}/nix/nix.conf"
+		local target_conf=""
+
+		if [ -w "$sys_conf" ] || sudo -n true 2>/dev/null; then
+			target_conf="$sys_conf"
+			sudo sh -c "mkdir -p \"$(dirname "$sys_conf")\""
+			if sudo sh -c "grep -q 'DragonOS Nix auto gc' \"$sys_conf\" 2>/dev/null"; then
+				sudo sed -i "s/^min-free.*/min-free = ${min_free}/" "$sys_conf"
+				sudo sed -i "s/^max-free.*/max-free = ${max_free}/" "$sys_conf"
+				echo "已更新 Nix 自动 GC 配置: $sys_conf"
+			else
+				sudo sh -c "printf '%s\n' '# DragonOS Nix auto gc' 'min-free = $min_free' 'max-free = $max_free' >> \"$sys_conf\""
+				echo "已写入 Nix 自动 GC 配置: $sys_conf"
+			fi
+		else
+			mkdir -p "$(dirname "$user_conf")"
+			target_conf="$user_conf"
+			if grep -q "DragonOS Nix auto gc" "$user_conf" 2>/dev/null; then
+				sed -i "s/^min-free.*/min-free = ${min_free}/" "$user_conf"
+				sed -i "s/^max-free.*/max-free = ${max_free}/" "$user_conf"
+				echo "已更新 Nix 自动 GC 配置: $user_conf"
+			else
+				cat >> "$user_conf" <<EOF
+# DragonOS Nix auto gc
+min-free = $min_free
+max-free = $max_free
+EOF
+				echo "已写入 Nix 自动 GC 配置: $user_conf"
+			fi
+		fi
+	fi
+}
+
+####################################################################################
+# 安装 Nix 包管理器（含镜像配置、trusted-users、实验特性、自动 GC 及完成提示）
+####################################################################################
+install_nix()
+{
+	# 配置 Nix 镜像
+	setup_nix_mirror
+
+	if command -v nix >/dev/null 2>&1; then
+		echo "Nix 已经安装在您的系统上。"
+	else
+		echo "正在安装 Nix 包管理器..."
+		set -o pipefail
+		if ! curl -fsSL "$NIX_INSTALLER_URL" | sh -s -- $NIX_INSTALLER_ARGS; then
+			echo "镜像下载失败，尝试官方地址..."
+			if ! curl -fsSL "$NIX_INSTALLER_FALLBACK_URL" | sh -s -- $NIX_INSTALLER_ARGS; then
+				echo "Nix 安装脚本下载失败！"
+				set +o pipefail
+				exit 1
+			fi
+		fi
+		set +o pipefail
+
+		echo "Nix 安装成功！"
+
+		# Source nix environment
+		if [ -f "/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh" ]; then
+			. /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+		fi
+	fi
+
+	# 配置 trusted-users
+	configure_nix_trusted_user
+
+	# 配置 Nix 实验特性
+	configure_nix_features
+
+	# 配置 Nix 自动 GC
+	configure_nix_auto_gc
+
+	congratulations_nix
 }
 
 ####################################################################################
@@ -439,14 +645,13 @@ banner 			# 开始横幅
 # 询问安装模式
 ask_install_mode
 
-# 如果是 nix 模式，直接结束
+# 仅在 nix 模式下安装并配置 Nix；legacy 模式不安装 Nix
 if [ "$INSTALL_MODE" = "nix" ]; then
 	install_nix
-	congratulations_nix
 	exit 0
 fi
 
-# 以下是 legacy 模式的安装流程
+# 以下是 legacy 模式的安装流程（不安装 Nix，仅安装传统依赖）
 echo "安装传统依赖..."
 
 if [ "Darwin" == "$(uname -s)" ]; then
@@ -485,7 +690,7 @@ fi
 rustInstall
 
 # 安装dadk
-cargo +nightly install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v0.6.0 || exit 1
+cargo +nightly install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v0.6.1 --locked || exit 1
 
 bashpath=$(cd `dirname $0`; pwd)
 

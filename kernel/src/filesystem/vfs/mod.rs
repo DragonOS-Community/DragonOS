@@ -2,6 +2,7 @@ pub mod append_lock;
 pub mod fasync;
 pub mod fcntl;
 pub mod file;
+pub mod flock;
 pub mod iov;
 pub mod mount;
 pub mod open;
@@ -11,8 +12,8 @@ pub mod syscall;
 pub mod utils;
 pub mod vcore;
 
-use ::core::{any::Any, fmt::Debug, fmt::Display, sync::atomic::AtomicUsize};
 use alloc::{string::String, sync::Arc, vec::Vec};
+use core::{any::Any, fmt::Debug, fmt::Display, sync::atomic::AtomicUsize};
 use derive_builder::Builder;
 use intertrait::CastFromSync;
 use mount::MountFlags;

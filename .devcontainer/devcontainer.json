@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/devcontainers/spec/refs/heads/main/schemas/devContainer.schema.json",
   "name": "DragonOS Dev Container",
-  "image": "docker.cnb.cool/dragonos-community/dragonos/dragonos-devcontainer:v1.19",
+  "image": "docker.cnb.cool/dragonos-community/dragonos/dragonos-devcontainer:v1.22",
   "features": {
     "ghcr.io/devcontainers/features/common-utils:2": {
       "installZsh": "false",

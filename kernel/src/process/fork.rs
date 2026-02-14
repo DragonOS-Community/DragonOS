@@ -725,7 +725,7 @@ impl ProcessManager {
             let r = current_pcb
                 .fd_table()
                 .write()
-                .alloc_fd(file, None)
+                .alloc_fd(file, None, true)
                 .map(|fd| fd as usize);
 
             let mut writer = UserBufferWriter::new(

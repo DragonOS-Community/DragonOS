@@ -16,7 +16,7 @@ MESON ?= meson
 LIBFUSE_VERSION ?= 3.18.1
 LIBFUSE_NAME := fuse-$(LIBFUSE_VERSION)
 LIBFUSE_URL_PRIMARY ?= https://github.com/libfuse/libfuse/releases/download/fuse-$(LIBFUSE_VERSION)/$(LIBFUSE_NAME).tar.gz
-LIBFUSE_URL_MIRROR ?= https://mirrors.edge.kernel.org/pub/linux/kernel/people/mszeredi/fuse/$(LIBFUSE_NAME).tar.gz
+LIBFUSE_URL_MIRROR ?= https://git.mirrors.dragonos.org.cn/DragonOS-Community/libfuse/archive/fuse-$(LIBFUSE_VERSION).tar.gz
 
 LIBFUSE_CACHE_DIR := $(CURDIR)/.cache
 LIBFUSE_ARCHIVE ?= $(LIBFUSE_CACHE_DIR)/$(LIBFUSE_NAME).tar.gz

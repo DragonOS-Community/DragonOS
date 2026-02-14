@@ -1,0 +1,4 @@
+# dunitest whitelist
+# 格式: 相对于 bin/ 的用例名（去除可执行文件的 _test 后缀）
+demo/gtest_demo
+normal/capability

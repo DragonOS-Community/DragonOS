@@ -63,7 +63,7 @@
     "hash": "52dd12d566da2003602ee21c4a3d007f"
   },
   "en:kernel/ktest/index.rst": {
-    "hash": "d9f0d9b2df4f1ce9d7f0da23639afafb"
+    "hash": "1adde2246ad2b63fd8d2916ce9772075"
   },
   "en:kernel/filesystem/vfs/api.md": {
     "hash": "1b0b3fe0cc2918cc2c53a5af392a96ff"
@@ -376,5 +376,8 @@
   },
   "en:userland/rootfs/dadk-rootfs-manifest.md": {
     "hash": "a35f61f1e5070812411a8ddb2e449b11"
+  },
+  "en:kernel/ktest/dunitest.rst": {
+    "hash": "a0a5f36d07f61772ca43b9625b0a448e"
   }
 }

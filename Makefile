@@ -288,6 +288,22 @@ test-syscall: prepare_rootfs_manifest
 		exit $$status; \
 	}
 
+test-dunit: prepare_rootfs_manifest
+	@echo "构建运行并执行dunitest测试"
+	$(MAKE) all -j $(NPROCS)
+	@if [ "$(DISK_SAVE_MODE)" = "1" ]; then \
+		echo "磁盘节省模式启用，正在清理用户程序构建缓存..."; \
+		$(DADK) -f $(ROOT_PATH)/dadk-manifest.generated.toml user clean --level in-src -w $(ROOT_PATH); \
+	fi
+	SKIP_GRUB=1 $(MAKE) write_diskimage || exit 1
+	$(MAKE) qemu-nographic AUTO_TEST=dunit DUNITEST_DIR=/opt/tests/dunitest &
+	sleep 5
+	@bash user/apps/tests/dunitest/monitor_test_results.sh
+
+test-dunit-local:
+	@echo "构建并执行 dunitest 本地测试"
+	$(MAKE) -C user/apps/tests/dunitest test-local -j $(NPROCS)
+
 fmt: check_arch
 	@echo "格式化代码"
 	FMT_CHECK=$(FMT_CHECK) $(MAKE) fmt -C kernel
@@ -342,6 +358,9 @@ help:
 	@echo "  make clean-docs       - 清理文档"
 	@echo "  make test-syscall     - 构建运行并执行syscall测试"
 	@echo "                         - 可通过DISK_SAVE_MODE=1启用磁盘节省模式"
+	@echo "  make test-dunit       - 构建运行并执行dunitest测试"
+	@echo "                         - 可通过DISK_SAVE_MODE=1启用磁盘节省模式"
+	@echo "  make test-dunit-local - 本地运行 dunitest 测例"
 	@echo ""
 	@echo "环境变量:"
 	@echo "  DISK_SAVE_MODE=1     - 启用磁盘节省模式，在写入磁盘镜像前清理构建缓存"

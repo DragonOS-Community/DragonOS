@@ -400,24 +400,18 @@ impl MountFS {
     /// # Errors
     /// 如果当前文件系统是根文件系统，那么将会返回`EINVAL`
     pub fn umount(&self) -> Result<Arc<MountFS>, SystemError> {
-        // Unregister from peer group before unmounting
-        let propagation = self.propagation();
-        if propagation.is_shared() {
-            let group_id = propagation.peer_group_id();
-            unregister_peer(group_id, &self.self_ref());
-        }
-
-        let r = self
+        let result = self
             .self_mountpoint()
             .ok_or(SystemError::EINVAL)?
             .do_umount();
 
-        self.self_mountpoint.write().take();
+        // Only clear mountpoint state and notify filesystem after successful detach.
+        if result.is_ok() {
+            self.self_mountpoint.write().take();
+            self.inner_filesystem.on_umount();
+        }
 
-        // Notify the filesystem that it has been unmounted.
-        self.inner_filesystem.on_umount();
-
-        return r;
+        return result;
     }
 }
 
@@ -539,21 +533,14 @@ impl MountFSInode {
 
         let mountpoint_id = self.inner_inode.metadata()?.inode_id;
 
-        // Get the child mount that will be unmounted
+        // Detach first. Follow-up bookkeeping (peer registry and propagation)
+        // must not run if detach itself failed.
         let child_mount = self
             .mount_fs
             .mountpoints
             .lock()
-            .get(&mountpoint_id)
-            .cloned();
-
-        if let Some(ref child) = child_mount {
-            // Unregister from peer group if shared
-            let child_prop = child.propagation();
-            if child_prop.is_shared() {
-                unregister_peer(child_prop.peer_group_id(), child);
-            }
-        }
+            .remove(&mountpoint_id)
+            .ok_or(SystemError::ENOENT)?;
 
         // Propagate umount to peers and slaves of the parent mount
         let parent_prop = self.mount_fs.propagation();
@@ -563,13 +550,13 @@ impl MountFSInode {
             }
         }
 
-        // Remove the mount
-        return self
-            .mount_fs
-            .mountpoints
-            .lock()
-            .remove(&mountpoint_id)
-            .ok_or(SystemError::ENOENT);
+        // Remove detached mount from peer registry if needed.
+        let child_prop = child_mount.propagation();
+        if child_prop.is_shared() {
+            unregister_peer(child_prop.peer_group_id(), &child_mount);
+        }
+
+        return Ok(child_mount);
     }
 
     #[inline(never)]

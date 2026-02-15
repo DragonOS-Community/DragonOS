@@ -8,7 +8,7 @@
 #include "fuse_gtest_common.h"
 
 #ifndef FUSE_DEV_IOC_CLONE
-#define FUSE_DEV_IOC_CLONE 0x80044600
+#define FUSE_DEV_IOC_CLONE 0x8004e500
 #endif
 
 static int ext_test_p2_ops() {

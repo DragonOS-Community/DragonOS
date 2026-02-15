@@ -26,7 +26,7 @@ use super::{
     conn::FuseConn,
     private_data::{FuseDevPrivateData, FuseFilePrivateData},
 };
-const FUSE_DEV_IOC_CLONE: u32 = 0x8004_4600; // _IOR('F', 0, uint32_t)
+const FUSE_DEV_IOC_CLONE: u32 = 0x8004_e500; // _IOR(229, 0, uint32_t)
 
 #[derive(Debug)]
 pub struct FuseDevInode {

@@ -15,7 +15,7 @@
 #include <sys/ioctl.h>
  
 #ifndef FUSE_DEV_IOC_CLONE
-#define FUSE_DEV_IOC_CLONE 0x80044600 /* _IOR('F', 0, uint32_t) */
+#define FUSE_DEV_IOC_CLONE 0x8004e500 /* _IOR(229, 0, uint32_t) */
 #endif
 
 static volatile int g_stop = 0;

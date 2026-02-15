@@ -20,7 +20,7 @@ RESULTS_DIR = results
 BIN_DIR = bin
 
 # 要编译的测试套件目录列表（suites/ 下的子目录名）
-SUITES = demo normal
+SUITES = demo normal fuse
 
 GTEST_ROOT = third_party/googletest
 GTEST_REPO = https://git.mirrors.dragonos.org.cn/DragonOS-Community/googletest

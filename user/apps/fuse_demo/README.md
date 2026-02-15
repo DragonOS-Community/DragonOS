@@ -66,21 +66,12 @@ fuse_demo /mnt/fuse --threads 4
 
 如果内核尚未支持 `FUSE_DEV_IOC_CLONE`，`--threads > 1` 会在 clone 阶段失败并提前退出（或只跑单线程，取决于当时实现）。
 
-## 内置测试程序
+## 测试入口迁移说明
 
-`user/apps/fuse_demo` 目录下同时提供了 FUSE 相关回归测试二进制：
+FUSE 回归测试已统一迁移到 `dunitest` 的 `suites/fuse/` 下，按以下两个 gtest 二进制维护：
 
-- `test_fuse_dev`：`/dev/fuse` 缓冲区与 nonblock 语义
-- `test_fuse_mount_init`：`mount + INIT` 协商与同 fd 重复挂载拒绝
-- `test_fuse_phase_c`：`ls/stat/cat` 读路径
-- `test_fuse_phase_d`：创建/写入/重命名/删除路径
-- `test_fuse_clone`：`FUSE_DEV_IOC_CLONE` 基础路径
-- `test_fuse_permissions`：`allow_other/default_permissions` 语义
-- `test_fuse_p1_lifecycle`：`FORGET/DESTROY` 生命周期语义
-- `test_fuse_p2_ops`：`ACCESS/CREATE/SYMLINK/READLINK/LINK/RENAME2/FLUSH/FSYNC/FSYNCDIR`
-- `test_fuse_p3_interrupt`：信号中断触发 `FUSE_INTERRUPT` 语义
-- `test_fuse_p3_noopen_readdirplus_notify`：`NO_OPEN/NO_OPENDIR/READDIRPLUS/notify(unique=0)`
-- `test_fuse_p4_subtype_mount`：`mount(..., "fuse.<subtype>", ...)` 兼容路径
+- `fuse/fuse_core`
+- `fuse/fuse_extended`
 
 ## 权限语义备注（对应 Phase E）
 

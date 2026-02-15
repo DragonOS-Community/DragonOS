@@ -31,6 +31,7 @@ pub struct FuseMountData {
     pub rootmode: u32,
     pub user_id: u32,
     pub group_id: u32,
+    pub allow_other: bool,
     pub default_permissions: bool,
     pub conn: Arc<FuseConn>,
 }
@@ -190,13 +191,11 @@ impl MountableFileSystem for FuseFS {
             }
         };
 
-        conn.configure_mount(user_id, group_id, allow_other);
-        conn.mark_mounted()?;
-
         Ok(Some(Arc::new(FuseMountData {
             rootmode,
             user_id,
             group_id,
+            allow_other,
             default_permissions,
             conn,
         })))
@@ -231,6 +230,12 @@ impl MountableFileSystem for FuseFS {
         };
 
         let conn = mount_data.conn.clone();
+        conn.mark_mounted()?;
+        conn.configure_mount(
+            mount_data.user_id,
+            mount_data.group_id,
+            mount_data.allow_other,
+        );
 
         let fs = Arc::new_cyclic(|weak_fs| FuseFS {
             root: FuseNode::new(
@@ -246,7 +251,10 @@ impl MountableFileSystem for FuseFS {
             default_permissions: mount_data.default_permissions,
         });
 
-        conn.enqueue_init()?;
+        if let Err(e) = conn.enqueue_init() {
+            conn.rollback_mount_setup();
+            return Err(e);
+        }
         Ok(fs)
     }
 }

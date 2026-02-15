@@ -209,6 +209,13 @@ impl FuseConn {
         Ok(())
     }
 
+    /// Roll back a mount reservation when mount setup fails before
+    /// the filesystem is actually attached to the mount tree.
+    pub fn rollback_mount_setup(&self) {
+        let mut g = self.inner.lock();
+        g.mounted = false;
+    }
+
     pub fn is_initialized(&self) -> bool {
         self.inner.lock().initialized
     }

@@ -21,6 +21,7 @@ use crate::{
     },
     filesystem::{
         epoll::{event_poll::EPollPrivateData, EPollItem},
+        fuse::private_data::FuseFilePrivateData,
         procfs::ProcfsFilePrivateData,
         vfs::FilldirContext,
     },
@@ -132,6 +133,8 @@ pub enum FilePrivateData {
     Namespace(NamespaceFilePrivateData),
     /// Socket file created by socket syscalls (not by VFS open(2)).
     SocketCreate,
+    /// FUSE file private data.
+    Fuse(FuseFilePrivateData),
     /// 不需要文件私有信息
     Unused,
 }
@@ -486,10 +489,10 @@ impl File {
         if need_data_sync || inode_sync {
             if need_metadata_sync || inode_sync {
                 // O_SYNC 或 S_SYNC: 完整同步（数据 + 元数据）
-                self.inode.sync()?;
+                self.inode.sync_file(false, self.private_data.lock())?;
             } else {
                 // O_DSYNC: 仅数据同步
-                self.inode.datasync()?;
+                self.inode.sync_file(true, self.private_data.lock())?;
             }
         }
         Ok(())

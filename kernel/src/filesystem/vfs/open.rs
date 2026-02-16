@@ -7,8 +7,8 @@ use super::{
     permission::PermissionMask,
     syscall::{OpenHow, OpenHowResolve},
     utils::{rsplit_path, should_remove_sgid_on_chown, user_path_at},
-    vcore::{check_parent_dir_permission, resolve_parent_inode},
-    FileType, IndexNode, InodeMode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    vcore::{check_parent_dir_permission_inode, resolve_parent_inode},
+    FileType, FsPermissionPolicy, IndexNode, InodeMode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 use crate::{filesystem::vfs::syscall::UtimensFlags, process::cred::Kgid};
 use crate::{
@@ -67,9 +67,34 @@ pub(super) fn do_faccessat(
     let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
 
     // 如果找不到文件，则返回错误码ENOENT
-    let _inode = inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    let inode = inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    if mode.bits() == 0 {
+        return Ok(0);
+    }
 
-    // todo: 接着完善（可以借鉴linux 6.1.9的do_faccessat）
+    let mut mask = PermissionMask::empty();
+    if mode.contains(InodeMode::S_IROTH) {
+        mask |= PermissionMask::MAY_READ;
+    }
+    if mode.contains(InodeMode::S_IWOTH) {
+        mask |= PermissionMask::MAY_WRITE;
+    }
+    if mode.contains(InodeMode::S_IXOTH) {
+        mask |= PermissionMask::MAY_EXEC;
+    }
+
+    let metadata = inode.metadata()?;
+    match inode.fs().permission_policy() {
+        FsPermissionPolicy::Dac => {
+            super::permission::check_inode_permission(&inode, &metadata, mask)?;
+        }
+        FsPermissionPolicy::Remote => match inode.check_access(mask) {
+            Ok(()) => {}
+            Err(SystemError::ENOSYS) => {}
+            Err(e) => return Err(e),
+        },
+    }
+
     return Ok(0);
 }
 
@@ -265,7 +290,7 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
                     return Err(SystemError::ENOTDIR);
                 }
                 // Linux 语义：创建文件需要对父目录拥有 W+X（写+搜索）权限
-                check_parent_dir_permission(&parent_md)?;
+                check_parent_dir_permission_inode(&parent_inode, &parent_md)?;
 
                 // 计算创建 mode：应用 umask，遵循 open/creat 语义
                 let pcb = ProcessManager::current_pcb();
@@ -344,8 +369,7 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
             need.insert(PermissionMask::MAY_WRITE);
         }
         if !need.is_empty() {
-            let cred = ProcessManager::current_pcb().cred();
-            cred.inode_permission(&metadata, need.bits())?;
+            super::permission::check_inode_permission(&inode, &metadata, need)?;
         }
     }
 
@@ -403,12 +427,8 @@ pub fn do_open_execat(dirfd: i32, path: &str) -> Result<Arc<File>, SystemError> 
         return Err(SystemError::EACCES);
     }
 
-    // 检查执行权限
-    let cred = ProcessManager::current_pcb().cred();
-    cred.inode_permission(&metadata, PermissionMask::MAY_EXEC.bits())?;
-
-    // 同时需要读权限（用于读取ELF内容）
-    cred.inode_permission(&metadata, PermissionMask::MAY_READ.bits())?;
+    super::permission::check_inode_permission(&inode, &metadata, PermissionMask::MAY_EXEC)?;
+    super::permission::check_inode_permission(&inode, &metadata, PermissionMask::MAY_READ)?;
 
     // 创建File对象，使用O_RDONLY | O_CLOEXEC
     let file = File::new(inode, FileFlags::O_RDONLY | FileFlags::O_CLOEXEC)?;

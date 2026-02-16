@@ -296,12 +296,15 @@ pub fn do_mkdir_at(
         return Err(SystemError::ENOTDIR);
     }
     let pcb = ProcessManager::current_pcb();
-    let cred = pcb.cred();
 
     // Linux 语义：目录执行权限控制能否遍历（查找子项）
     // 先检查执行权限，再检查文件是否存在，最后检查写权限
     // 顺序很重要：无执行权限 → EACCES；有执行权限且已存在 → EEXIST；有执行权限无写权限 → EACCES
-    cred.inode_permission(&parent_md, PermissionMask::MAY_EXEC.bits())?;
+    crate::filesystem::vfs::permission::check_inode_permission(
+        &current_inode,
+        &parent_md,
+        PermissionMask::MAY_EXEC,
+    )?;
 
     // 已确认有执行权限，可以查找子项
     if current_inode.find(name).is_ok() {
@@ -309,7 +312,11 @@ pub fn do_mkdir_at(
     }
 
     // 创建目录还需要对父目录拥有写权限
-    cred.inode_permission(&parent_md, PermissionMask::MAY_WRITE.bits())?;
+    crate::filesystem::vfs::permission::check_inode_permission(
+        &current_inode,
+        &parent_md,
+        PermissionMask::MAY_WRITE,
+    )?;
 
     let mut final_mode_bits = mode.bits() & InodeMode::S_IRWXUGO.bits();
     if (parent_md.mode.bits() & InodeMode::S_ISGID.bits()) != 0 {
@@ -345,15 +352,15 @@ pub(super) fn resolve_parent_inode(
     }
 }
 
-/// 检查父目录权限（写+执行权限）
-///
-/// Linux 语义：删除/创建文件/目录需要对父目录拥有 W+X（写+执行）权限
-/// 注意：权限检查必须在 find 之前进行，否则当文件不存在时会返回 ENOENT 而不是 EACCES
-pub(super) fn check_parent_dir_permission(parent_md: &super::Metadata) -> Result<(), SystemError> {
-    let cred = ProcessManager::current_pcb().cred();
-    cred.inode_permission(
+/// 检查父目录权限（写+执行权限），并尊重文件系统权限策略（如 FUSE remote 模型）。
+pub(super) fn check_parent_dir_permission_inode(
+    parent_inode: &Arc<dyn IndexNode>,
+    parent_md: &super::Metadata,
+) -> Result<(), SystemError> {
+    crate::filesystem::vfs::permission::check_inode_permission(
+        parent_inode,
         parent_md,
-        (PermissionMask::MAY_WRITE | PermissionMask::MAY_EXEC).bits(),
+        PermissionMask::MAY_WRITE | PermissionMask::MAY_EXEC,
     )
 }
 
@@ -386,7 +393,7 @@ pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
 
     // Linux 语义：删除目录需要对父目录拥有 W+X（写+搜索）权限
     // 注意：权限检查必须在 find 之前进行，否则当目录不存在时会返回 ENOENT 而不是 EACCES
-    check_parent_dir_permission(&parent_md)?;
+    check_parent_dir_permission_inode(&parent_inode, &parent_md)?;
 
     // 在目标点为symlink时也返回ENOTDIR
     let target_inode = parent_inode.find(filename)?;
@@ -424,7 +431,7 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
 
     // Linux 语义：删除文件需要对父目录拥有 W+X（写+搜索）权限
     // 注意：权限检查必须在 find 之前进行，否则当文件不存在时会返回 ENOENT 而不是 EACCES
-    check_parent_dir_permission(&parent_md)?;
+    check_parent_dir_permission_inode(&parent_inode, &parent_md)?;
 
     // Linux 语义：unlink(2)/unlinkat(2) 删除目录项本身，不跟随最后一个符号链接。
     // 我们已解析到父目录，因此这里必须用 find() 直接取目录项对应 inode，

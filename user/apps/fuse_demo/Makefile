@@ -12,10 +12,8 @@ SRCS := $(wildcard *.c)
 BINS := $(SRCS:.c=)
 
 all: $(BINS)
-# 	@echo "src: $(SRCS)"
 	@echo "bins: $(BINS)"
 
-# 依赖同目录下所有 .h，任意头文件变更都会触发重编
 %: %.c $(wildcard *.h)
 	$(CC) $(CFLAGS) $< -o $@
 

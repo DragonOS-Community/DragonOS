@@ -60,7 +60,7 @@
     "hash": "5d21aad4640544ad49348d3cd2e8a386"
   },
   "en:kernel/filesystem/index.rst": {
-    "hash": "52dd12d566da2003602ee21c4a3d007f"
+    "hash": "a732adec7c8ab12c3ca317c351ef673c"
   },
   "en:kernel/ktest/index.rst": {
     "hash": "1adde2246ad2b63fd8d2916ce9772075"
@@ -379,5 +379,8 @@
   },
   "en:kernel/ktest/dunitest.rst": {
     "hash": "a0a5f36d07f61772ca43b9625b0a448e"
+  },
+  "en:kernel/filesystem/fuse.md": {
+    "hash": "00061bdbcbf1be7230dfdc619e3a25f1"
   }
 }

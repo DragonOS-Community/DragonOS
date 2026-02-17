@@ -232,7 +232,7 @@ impl SysFcntlHandle {
 
                 let owner_pid = ProcessManager::current_pcb().raw_tgid().data() as i32;
                 let blocking = cmd == FcntlCommand::SetLockWait;
-                set_posix_lock(&file, owner_id, owner_pid, &flock, blocking)?;
+                let flock = set_posix_lock(&file, owner_id, owner_pid, &flock, blocking)?;
 
                 // Linux 语义：检测 close/fcntl 并发竞态。
                 // 如果加锁成功后发现 fd 已不再指向同一 file，需要回滚刚加的锁并返回 EBADF。

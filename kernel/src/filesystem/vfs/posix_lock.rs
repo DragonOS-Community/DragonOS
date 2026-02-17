@@ -499,14 +499,15 @@ impl PosixLockManager {
         owner_pid: i32,
         flock: &PosixFlock,
         blocking: bool,
-    ) -> Result<(), SystemError> {
+    ) -> Result<PosixFlock, SystemError> {
         let req = parse_flock_to_range(file.as_ref(), flock, true)?;
+        let normalized = parsed_range_to_flock(flock, req);
         Self::check_fmode_for_setlk(file.as_ref(), req.req_type)?;
         let key = Self::key_from_file(file.as_ref());
 
         let entry = if matches!(req.req_type, PosixLockRequestType::Unlock) {
             let Some(entry) = self.get_entry(&key) else {
-                return Ok(());
+                return Ok(normalized);
             };
             entry
         } else {
@@ -527,7 +528,7 @@ impl PosixLockManager {
         }
 
         self.try_cleanup_entry(&key, &entry);
-        Ok(())
+        Ok(normalized)
     }
 
     pub fn release_owner_for_file(&self, file: &Arc<File>, owner_id: usize) {
@@ -603,6 +604,19 @@ fn parse_flock_to_range(
     })
 }
 
+#[inline]
+fn parsed_range_to_flock(flock: &PosixFlock, req: ParsedRangeLock) -> PosixFlock {
+    let mut normalized = *flock;
+    normalized.l_whence = SEEK_SET as i16;
+    normalized.l_start = req.start;
+    normalized.l_len = if req.end == i64::MAX {
+        0
+    } else {
+        req.end - req.start + 1
+    };
+    normalized
+}
+
 static POSIX_LOCK_MANAGER: Lazy<PosixLockManager> = Lazy::new();
 
 pub fn init_posix_lock_manager() {
@@ -627,7 +641,7 @@ pub fn set_posix_lock(
     owner_pid: i32,
     flock: &PosixFlock,
     blocking: bool,
-) -> Result<(), SystemError> {
+) -> Result<PosixFlock, SystemError> {
     POSIX_LOCK_MANAGER
         .get()
         .set_lock(file, owner_id, owner_pid, flock, blocking)

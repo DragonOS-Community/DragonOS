@@ -41,8 +41,14 @@ pub fn rename_exchange_test(ext4: &mut Ext4) {
     let new_file_b = ext4
         .generic_lookup(exchange_dir, "file_b")
         .expect("lookup file_b failed");
-    assert_eq!(new_file_a, file_b, "file_a should point to old file_b inode");
-    assert_eq!(new_file_b, file_a, "file_b should point to old file_a inode");
+    assert_eq!(
+        new_file_a, file_b,
+        "file_a should point to old file_b inode"
+    );
+    assert_eq!(
+        new_file_b, file_a,
+        "file_b should point to old file_a inode"
+    );
 
     // Test 2: Cross-directory file exchange
     let file_in_a = ext4

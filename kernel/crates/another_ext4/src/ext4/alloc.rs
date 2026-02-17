@@ -20,7 +20,7 @@ impl Ext4 {
         let mut inode_ref = InodeRef::new(id, inode);
 
         // Sync the inode to disk
-        self.write_inode_with_csum(&mut inode_ref);
+        self.write_inode_with_csum(&mut inode_ref)?;
 
         trace!("Alloc inode {} ok", inode_ref.id);
         Ok(inode_ref)
@@ -51,7 +51,7 @@ impl Ext4 {
         let mut inode_ref = InodeRef::new(id, inode);
 
         // Sync the inode to disk
-        self.write_inode_with_csum(&mut inode_ref);
+        self.write_inode_with_csum(&mut inode_ref)?;
 
         trace!(
             "Alloc device inode {} ({}:{}) ok",
@@ -80,27 +80,27 @@ impl Ext4 {
         self.dir_add_entry(&mut root, &root_self, "..")?;
         root.inode.set_link_count(2);
 
-        self.write_inode_with_csum(&mut root);
+        self.write_inode_with_csum(&mut root)?;
         Ok(root)
     }
 
     /// Free an allocated inode and all data blocks allocated for it
     pub(super) fn free_inode(&self, inode: &mut InodeRef) -> Result<()> {
         // Free the data blocks allocated for the inode
-        let pblocks = self.extent_all_data_blocks(inode);
+        let pblocks = self.extent_all_data_blocks(inode)?;
         for pblock in pblocks {
             // Deallocate the block
             self.dealloc_block(inode, pblock)?;
             // Clear the block content
-            self.write_block(&Block::new(pblock, Box::new([0; BLOCK_SIZE])));
+            self.write_block(&Block::new(pblock, Box::new([0; BLOCK_SIZE])))?;
         }
         // Free extent tree
-        let pblocks = self.extent_all_tree_blocks(inode);
+        let pblocks = self.extent_all_tree_blocks(inode)?;
         for pblock in pblocks {
             // Deallocate the block
             self.dealloc_block(inode, pblock)?;
             // Clear the block content
-            self.write_block(&Block::new(pblock, Box::new([0; BLOCK_SIZE])));
+            self.write_block(&Block::new(pblock, Box::new([0; BLOCK_SIZE])))?;
         }
         // Free xattr block
         let xattr_block = inode.inode.xattr_block();
@@ -108,7 +108,7 @@ impl Ext4 {
             // Deallocate the block
             self.dealloc_block(inode, xattr_block)?;
             // Clear the block content
-            self.write_block(&Block::new(xattr_block, Box::new([0; BLOCK_SIZE])));
+            self.write_block(&Block::new(xattr_block, Box::new([0; BLOCK_SIZE])))?;
         }
         // Deallocate the inode
         self.dealloc_inode(inode)?;
@@ -134,25 +134,25 @@ impl Ext4 {
         let fblock = self.extent_query_or_create(inode, iblock, 1)?;
         // Update block count
         inode.inode.set_fs_block_count(iblock as u64 + 1);
-        self.write_inode_with_csum(inode);
+        self.write_inode_with_csum(inode)?;
 
         Ok((iblock, fblock))
     }
 
     /// Allocate a new physical block for an inode, return the physical block number
     pub(super) fn alloc_block(&self, inode: &mut InodeRef) -> Result<PBlockId> {
-        let mut sb = self.read_super_block();
+        let mut sb = self.read_super_block()?;
 
         // Calc block group id
         let inodes_per_group = sb.inodes_per_group();
         let bgid = ((inode.id - 1) / inodes_per_group) as BlockGroupId;
 
         // Load block group descriptor
-        let mut bg = self.read_block_group(bgid);
+        let mut bg = self.read_block_group(bgid)?;
 
         // Load block bitmap
         let bitmap_block_id = bg.desc.block_bitmap_block();
-        let mut bitmap_block = self.read_block(bitmap_block_id);
+        let mut bitmap_block = self.read_block(bitmap_block_id)?;
         let mut bitmap = Bitmap::new(&mut *bitmap_block.data, 8 * BLOCK_SIZE);
 
         // Find the first free block
@@ -165,16 +165,16 @@ impl Ext4 {
             ))? as PBlockId;
         // Set block group checksum
         bg.desc.set_block_bitmap_csum(&sb.uuid(), &bitmap);
-        self.write_block(&bitmap_block);
+        self.write_block(&bitmap_block)?;
 
         // Update block group counters
         bg.desc
             .set_free_blocks_count(bg.desc.get_free_blocks_count() - 1);
-        self.write_block_group_with_csum(&mut bg);
+        self.write_block_group_with_csum(&mut bg)?;
 
         // Update superblock counters
         sb.set_free_blocks_count(sb.free_blocks_count() - 1);
-        self.write_super_block(&sb);
+        self.write_super_block(&sb)?;
 
         trace!("Alloc block {} ok", fblock);
         Ok(fblock)
@@ -182,18 +182,18 @@ impl Ext4 {
 
     /// Deallocate a physical block allocated for an inode
     pub(super) fn dealloc_block(&self, inode: &mut InodeRef, pblock: PBlockId) -> Result<()> {
-        let mut sb = self.read_super_block();
+        let mut sb = self.read_super_block()?;
 
         // Calc block group id
         let inodes_per_group = sb.inodes_per_group();
         let bgid = ((inode.id - 1) / inodes_per_group) as BlockGroupId;
 
         // Load block group descriptor
-        let mut bg = self.read_block_group(bgid);
+        let mut bg = self.read_block_group(bgid)?;
 
         // Load block bitmap
         let bitmap_block_id = bg.desc.block_bitmap_block();
-        let mut bitmap_block = self.read_block(bitmap_block_id);
+        let mut bitmap_block = self.read_block(bitmap_block_id)?;
         let mut bitmap = Bitmap::new(&mut *bitmap_block.data, 8 * BLOCK_SIZE);
 
         // Free the block
@@ -203,16 +203,16 @@ impl Ext4 {
         bitmap.clear_bit(pblock as usize);
         // Set block group checksum
         bg.desc.set_block_bitmap_csum(&sb.uuid(), &bitmap);
-        self.write_block(&bitmap_block);
+        self.write_block(&bitmap_block)?;
 
         // Update block group counters
         bg.desc
             .set_free_blocks_count(bg.desc.get_free_blocks_count() + 1);
-        self.write_block_group_with_csum(&mut bg);
+        self.write_block_group_with_csum(&mut bg)?;
 
         // Update superblock counters
         sb.set_free_blocks_count(sb.free_blocks_count() + 1);
-        self.write_super_block(&sb);
+        self.write_super_block(&sb)?;
 
         trace!("Free block {} ok", pblock);
         Ok(())
@@ -220,13 +220,13 @@ impl Ext4 {
 
     /// Allocate a new inode, returning the inode number.
     fn alloc_inode(&self, is_dir: bool) -> Result<InodeId> {
-        let mut sb = self.read_super_block();
+        let mut sb = self.read_super_block()?;
         let bg_count = sb.block_group_count();
 
         let mut bgid = 0;
         while bgid <= bg_count {
             // Load block group descriptor
-            let mut bg = self.read_block_group(bgid);
+            let mut bg = self.read_block_group(bgid)?;
             // If there are no free inodes in this block group, try the next one
             if bg.desc.free_inodes_count() == 0 {
                 bgid += 1;
@@ -234,7 +234,7 @@ impl Ext4 {
             }
             // Load inode bitmap
             let bitmap_block_id = bg.desc.inode_bitmap_block();
-            let mut bitmap_block = self.read_block(bitmap_block_id);
+            let mut bitmap_block = self.read_block(bitmap_block_id)?;
             let inode_count = sb.inode_count_in_group(bgid) as usize;
             let mut bitmap = Bitmap::new(&mut *bitmap_block.data, inode_count);
 
@@ -249,7 +249,7 @@ impl Ext4 {
                     ))? as u32;
             // Update bitmap in disk
             bg.desc.set_inode_bitmap_csum(&sb.uuid(), &bitmap);
-            self.write_block(&bitmap_block);
+            self.write_block(&bitmap_block)?;
 
             // Modify block group counters
             bg.desc
@@ -263,11 +263,11 @@ impl Ext4 {
                 unused = inode_count as u32 - (idx_in_bg + 1);
                 bg.desc.set_itable_unused(unused);
             }
-            self.write_block_group_with_csum(&mut bg);
+            self.write_block_group_with_csum(&mut bg)?;
 
             // Update superblock counters
             sb.set_free_inodes_count(sb.free_inodes_count() - 1);
-            self.write_super_block(&sb);
+            self.write_super_block(&sb)?;
 
             // Compute the absolute i-node number
             let inodes_per_group = sb.inodes_per_group();
@@ -280,17 +280,17 @@ impl Ext4 {
 
     /// Free an inode
     fn dealloc_inode(&self, inode_ref: &mut InodeRef) -> Result<()> {
-        let mut sb = self.read_super_block();
+        let mut sb = self.read_super_block()?;
 
         // Calc block group id and index in block group
         let inodes_per_group = sb.inodes_per_group();
         let bgid = ((inode_ref.id - 1) / inodes_per_group) as BlockGroupId;
         let idx_in_bg = (inode_ref.id - 1) % inodes_per_group;
         // Load block group descriptor
-        let mut bg = self.read_block_group(bgid);
+        let mut bg = self.read_block_group(bgid)?;
         // Load inode bitmap
         let bitmap_block_id = bg.desc.inode_bitmap_block();
-        let mut bitmap_block = self.read_block(bitmap_block_id);
+        let mut bitmap_block = self.read_block(bitmap_block_id)?;
         let inode_count = sb.inode_count_in_group(bgid) as usize;
         let mut bitmap = Bitmap::new(&mut *bitmap_block.data, inode_count);
 
@@ -306,7 +306,7 @@ impl Ext4 {
         bitmap.clear_bit(idx_in_bg as usize);
         // Update bitmap in disk
         bg.desc.set_inode_bitmap_csum(&sb.uuid(), &bitmap);
-        self.write_block(&bitmap_block);
+        self.write_block(&bitmap_block)?;
 
         // Update block group counters
         bg.desc
@@ -315,15 +315,15 @@ impl Ext4 {
             bg.desc.set_used_dirs_count(bg.desc.used_dirs_count() - 1);
         }
         bg.desc.set_itable_unused(bg.desc.itable_unused() + 1);
-        self.write_block_group_with_csum(&mut bg);
+        self.write_block_group_with_csum(&mut bg)?;
 
         // Update superblock counters
         sb.set_free_inodes_count(sb.free_inodes_count() + 1);
-        self.write_super_block(&sb);
+        self.write_super_block(&sb)?;
 
         // Clear inode content
         inode_ref.inode = Box::new(Inode::default());
-        self.write_inode_with_csum(inode_ref);
+        self.write_inode_with_csum(inode_ref)?;
 
         Ok(())
     }

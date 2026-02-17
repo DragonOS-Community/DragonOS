@@ -3,6 +3,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -10,6 +12,8 @@
 #include <string>
 
 namespace {
+
+std::string g_program_path;
 
 struct TempFile {
     std::string path;
@@ -80,6 +84,50 @@ void write_or_die(int fd, const void* buf, size_t len, int exit_code) {
     if (n != static_cast<ssize_t>(len)) {
         _exit(exit_code);
     }
+}
+
+int maybe_run_exec_lock_helper(int argc, char** argv) {
+    if (argc < 2 || strcmp(argv[1], "--fcntl-exec-helper") != 0) {
+        return -1;
+    }
+    if (argc < 4) {
+        return 200;
+    }
+
+    const char* path = argv[2];
+    int fd = atoi(argv[3]);
+
+    int err = set_lock_errno(fd, F_SETLK, F_UNLCK, SEEK_SET, 0, 0);
+    if (err != 0) {
+        return 201;
+    }
+
+    pid_t checker = fork();
+    if (checker < 0) {
+        return 202;
+    }
+    if (checker == 0) {
+        int cfd = open(path, O_RDWR);
+        if (cfd < 0) {
+            _exit(1);
+        }
+        int e = set_lock_errno(cfd, F_SETLK, F_WRLCK, SEEK_SET, 0, 16);
+        close(cfd);
+        if (e != 0) {
+            _exit(2);
+        }
+        _exit(0);
+    }
+
+    int status = 0;
+    if (waitpid(checker, &status, 0) != checker) {
+        return 203;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        return 204;
+    }
+
+    return 0;
 }
 
 }  // namespace
@@ -710,7 +758,46 @@ TEST(FcntlLock, ForkChildCloseMustNotReleaseParentPosixLock) {
     unlink(tf.path.c_str());
 }
 
+TEST(FcntlLock, ExecvePreservesPosixLockOwner) {
+    auto tf = make_temp_file();
+    ASSERT_GE(tf.fd, 0);
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        if (set_lock_errno(tf.fd, F_SETLK, F_WRLCK, SEEK_SET, 0, 16) != 0) {
+            _exit(1);
+        }
+
+        char fd_arg[32] = {};
+        snprintf(fd_arg, sizeof(fd_arg), "%d", tf.fd);
+
+        char* const av[] = {
+            const_cast<char*>(g_program_path.c_str()),
+            const_cast<char*>("--fcntl-exec-helper"),
+            const_cast<char*>(tf.path.c_str()),
+            fd_arg,
+            nullptr,
+        };
+        execv(g_program_path.c_str(), av);
+        _exit(2);
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0));
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+
+    close(tf.fd);
+    unlink(tf.path.c_str());
+}
+
 int main(int argc, char** argv) {
+    int helper_rc = maybe_run_exec_lock_helper(argc, argv);
+    if (helper_rc >= 0) {
+        return helper_rc;
+    }
+    g_program_path = argv[0];
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }

@@ -1468,6 +1468,11 @@ impl FileDescriptorVec {
 
     /// @brief 克隆一个文件描述符数组
     ///
+    /// 语义对齐 Linux dup_fd/new files_struct：
+    /// - 复制 fd 与 cloexec 状态
+    /// - 分配新的 record-lock owner（POSIX 锁 owner 绑定 files table）
+    ///   因此 fork 出来的新进程不会与父进程共享 POSIX record lock owner。
+    ///
     /// @return FileDescriptorVec 克隆后的文件描述符数组
     pub fn clone(&self) -> FileDescriptorVec {
         let mut res = FileDescriptorVec::new();

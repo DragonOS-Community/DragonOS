@@ -396,25 +396,35 @@ impl PosixLockManager {
             // remove the edge immediately and retry acquisition without sleeping.
             {
                 let state = entry.state.lock();
-                if state
+                let conflict_after_edge = state
                     .first_conflict(owner_id, req_type, req.start, req.end)
-                    .is_none()
-                {
-                    drop(state);
-                    self.wait_graph.lock().remove_edge(owner_id, conflict_owner);
-                    continue;
+                    .map(|c| c.owner_id);
+                drop(state);
+
+                match conflict_after_edge {
+                    None => {
+                        self.wait_graph.lock().remove_edge(owner_id, conflict_owner);
+                        continue;
+                    }
+                    Some(new_conflict_owner) if new_conflict_owner != conflict_owner => {
+                        // Blocker changed before sleeping. Rebuild edge in next loop
+                        // so deadlock detection is checked against the new blocker.
+                        self.wait_graph.lock().remove_edge(owner_id, conflict_owner);
+                        continue;
+                    }
+                    Some(_) => {}
                 }
             }
 
             let wait_result = entry.waitq.wait_until_interruptible(|| {
                 let state = entry.state.lock();
-                if state
-                    .first_conflict(owner_id, req_type, req.start, req.end)
-                    .is_some()
-                {
-                    None
-                } else {
-                    Some(())
+                match state.first_conflict(owner_id, req_type, req.start, req.end) {
+                    None => Some(()),
+                    Some(conflict) if conflict.owner_id != conflict_owner => {
+                        // Current blocker changed; wake and re-evaluate wait graph edge.
+                        Some(())
+                    }
+                    Some(_) => None,
                 }
             });
             self.wait_graph.lock().remove_edge(owner_id, conflict_owner);

@@ -576,6 +576,256 @@ TEST(FcntlLock, SetlkwInterruptedBySignal) {
     unlink(tf.path.c_str());
 }
 
+TEST(FcntlLock, SetlkwWaitGraphTracksBlockerChanges) {
+    auto tf = make_temp_file();
+    ASSERT_GE(tf.fd, 0);
+    close(tf.fd);
+
+    int a_ready[2] = {-1, -1};
+    int a_go[2] = {-1, -1};
+    int a_started[2] = {-1, -1};
+    int a_res[2] = {-1, -1};
+    int b_ready[2] = {-1, -1};
+    int b_cmd[2] = {-1, -1};
+    int b_unlocked[2] = {-1, -1};
+    int b_res[2] = {-1, -1};
+    int c_ready[2] = {-1, -1};
+    int c_release[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(a_ready));
+    ASSERT_EQ(0, pipe(a_go));
+    ASSERT_EQ(0, pipe(a_started));
+    ASSERT_EQ(0, pipe(a_res));
+    ASSERT_EQ(0, pipe(b_ready));
+    ASSERT_EQ(0, pipe(b_cmd));
+    ASSERT_EQ(0, pipe(b_unlocked));
+    ASSERT_EQ(0, pipe(b_res));
+    ASSERT_EQ(0, pipe(c_ready));
+    ASSERT_EQ(0, pipe(c_release));
+
+    pid_t a = fork();
+    ASSERT_GE(a, 0);
+    if (a == 0) {
+        close(a_ready[0]);
+        close(a_go[1]);
+        close(a_started[0]);
+        close(a_res[0]);
+        close(b_ready[0]);
+        close(b_ready[1]);
+        close(b_cmd[0]);
+        close(b_cmd[1]);
+        close(b_unlocked[0]);
+        close(b_unlocked[1]);
+        close(b_res[0]);
+        close(b_res[1]);
+        close(c_ready[0]);
+        close(c_ready[1]);
+        close(c_release[0]);
+        close(c_release[1]);
+
+        int fd = open(tf.path.c_str(), O_RDWR);
+        if (fd < 0) {
+            _exit(1);
+        }
+        if (set_lock_errno(fd, F_SETLK, F_WRLCK, SEEK_SET, 0, 11) != 0) {
+            _exit(2);
+        }
+
+        char r = 'R';
+        write_or_die(a_ready[1], &r, 1, 3);
+
+        char go = 0;
+        if (read(a_go[0], &go, 1) != 1) {
+            _exit(4);
+        }
+
+        char started = 'S';
+        write_or_die(a_started[1], &started, 1, 5);
+
+        int err = set_lock_errno(fd, F_SETLKW, F_WRLCK, SEEK_SET, 20, 10);
+        write_or_die(a_res[1], &err, sizeof(err), 6);
+
+        set_lock_errno(fd, F_SETLK, F_UNLCK, SEEK_SET, 0, 0);
+        close(fd);
+        _exit(0);
+    }
+
+    pid_t b = fork();
+    ASSERT_GE(b, 0);
+    if (b == 0) {
+        close(b_ready[0]);
+        close(b_cmd[1]);
+        close(b_unlocked[0]);
+        close(b_res[0]);
+        close(a_ready[0]);
+        close(a_ready[1]);
+        close(a_go[0]);
+        close(a_go[1]);
+        close(a_started[0]);
+        close(a_started[1]);
+        close(a_res[0]);
+        close(a_res[1]);
+        close(c_ready[0]);
+        close(c_ready[1]);
+        close(c_release[0]);
+        close(c_release[1]);
+
+        struct sigaction sa = {};
+        sa.sa_handler = [](int) {};
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;
+        if (sigaction(SIGUSR1, &sa, nullptr) != 0) {
+            _exit(1);
+        }
+        if (sigaction(SIGALRM, &sa, nullptr) != 0) {
+            _exit(1);
+        }
+
+        int fd = open(tf.path.c_str(), O_RDWR);
+        if (fd < 0) {
+            _exit(2);
+        }
+        if (set_lock_errno(fd, F_SETLK, F_WRLCK, SEEK_SET, 20, 5) != 0) {
+            _exit(3);
+        }
+
+        char r = 'R';
+        write_or_die(b_ready[1], &r, 1, 4);
+
+        char cmd = 0;
+        if (read(b_cmd[0], &cmd, 1) != 1 || cmd != 'U') {
+            _exit(5);
+        }
+        if (set_lock_errno(fd, F_SETLK, F_UNLCK, SEEK_SET, 20, 5) != 0) {
+            _exit(6);
+        }
+        char u = 'U';
+        write_or_die(b_unlocked[1], &u, 1, 7);
+
+        if (read(b_cmd[0], &cmd, 1) != 1 || cmd != 'W') {
+            _exit(8);
+        }
+
+        alarm(3);
+        int err = set_lock_errno(fd, F_SETLKW, F_WRLCK, SEEK_SET, 0, 11);
+        write_or_die(b_res[1], &err, sizeof(err), 9);
+
+        close(fd);
+        _exit(0);
+    }
+
+    pid_t c = fork();
+    ASSERT_GE(c, 0);
+    if (c == 0) {
+        close(c_ready[0]);
+        close(c_release[1]);
+        close(a_ready[0]);
+        close(a_ready[1]);
+        close(a_go[0]);
+        close(a_go[1]);
+        close(a_started[0]);
+        close(a_started[1]);
+        close(a_res[0]);
+        close(a_res[1]);
+        close(b_ready[0]);
+        close(b_ready[1]);
+        close(b_cmd[0]);
+        close(b_cmd[1]);
+        close(b_unlocked[0]);
+        close(b_unlocked[1]);
+        close(b_res[0]);
+        close(b_res[1]);
+
+        int fd = open(tf.path.c_str(), O_RDWR);
+        if (fd < 0) {
+            _exit(1);
+        }
+        if (set_lock_errno(fd, F_SETLK, F_WRLCK, SEEK_SET, 25, 5) != 0) {
+            _exit(2);
+        }
+
+        char r = 'R';
+        write_or_die(c_ready[1], &r, 1, 3);
+
+        char rel = 0;
+        if (read(c_release[0], &rel, 1) != 1) {
+            _exit(4);
+        }
+        set_lock_errno(fd, F_SETLK, F_UNLCK, SEEK_SET, 25, 5);
+        close(fd);
+        _exit(0);
+    }
+
+    close(a_ready[1]);
+    close(a_go[0]);
+    close(a_started[1]);
+    close(a_res[1]);
+    close(b_ready[1]);
+    close(b_cmd[0]);
+    close(b_unlocked[1]);
+    close(b_res[1]);
+    close(c_ready[1]);
+    close(c_release[0]);
+
+    char ch = 0;
+    ASSERT_EQ(1, read(a_ready[0], &ch, 1));
+    ASSERT_EQ('R', ch);
+    ASSERT_EQ(1, read(b_ready[0], &ch, 1));
+    ASSERT_EQ('R', ch);
+    ASSERT_EQ(1, read(c_ready[0], &ch, 1));
+    ASSERT_EQ('R', ch);
+
+    char go = 'G';
+    ASSERT_EQ(1, write(a_go[1], &go, 1));
+    ASSERT_EQ(1, read(a_started[0], &ch, 1));
+    ASSERT_EQ('S', ch);
+    usleep(100 * 1000);
+
+    char cmd = 'U';
+    ASSERT_EQ(1, write(b_cmd[1], &cmd, 1));
+    ASSERT_EQ(1, read(b_unlocked[0], &ch, 1));
+    ASSERT_EQ('U', ch);
+
+    cmd = 'W';
+    ASSERT_EQ(1, write(b_cmd[1], &cmd, 1));
+    usleep(50 * 1000);
+    kill(b, SIGUSR1);
+
+    int b_err = 0;
+    ASSERT_EQ(static_cast<ssize_t>(sizeof(b_err)), read(b_res[0], &b_err, sizeof(b_err)));
+    EXPECT_NE(EDEADLK, b_err);
+    EXPECT_EQ(EINTR, b_err);
+
+    char rel = 'R';
+    ASSERT_EQ(1, write(c_release[1], &rel, 1));
+
+    int a_err = 0;
+    ASSERT_EQ(static_cast<ssize_t>(sizeof(a_err)), read(a_res[0], &a_err, sizeof(a_err)));
+    EXPECT_EQ(0, a_err);
+
+    int st = 0;
+    ASSERT_EQ(a, waitpid(a, &st, 0));
+    ASSERT_TRUE(WIFEXITED(st));
+    EXPECT_EQ(0, WEXITSTATUS(st));
+    ASSERT_EQ(b, waitpid(b, &st, 0));
+    ASSERT_TRUE(WIFEXITED(st));
+    EXPECT_EQ(0, WEXITSTATUS(st));
+    ASSERT_EQ(c, waitpid(c, &st, 0));
+    ASSERT_TRUE(WIFEXITED(st));
+    EXPECT_EQ(0, WEXITSTATUS(st));
+
+    close(a_ready[0]);
+    close(a_go[1]);
+    close(a_started[0]);
+    close(a_res[0]);
+    close(b_ready[0]);
+    close(b_cmd[1]);
+    close(b_unlocked[0]);
+    close(b_res[0]);
+    close(c_ready[0]);
+    close(c_release[1]);
+    unlink(tf.path.c_str());
+}
+
 TEST(FcntlLock, CloseOtherFdUnblocksSetlkwWaiter) {
     auto tf = make_temp_file();
     ASSERT_GE(tf.fd, 0);

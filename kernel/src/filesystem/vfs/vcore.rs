@@ -55,6 +55,7 @@ pub fn generate_inode_id() -> InodeId {
 pub fn vfs_init() -> Result<(), SystemError> {
     // Initialize global append lock manager before any file write path uses it.
     super::append_lock::init_append_lock_manager();
+    super::posix_lock::init_posix_lock_manager();
     super::flock::init_flock_manager();
 
     mnt_namespace_init();

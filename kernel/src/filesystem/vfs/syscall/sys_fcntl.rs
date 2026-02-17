@@ -6,14 +6,17 @@ use crate::process::RawPid;
 use crate::{
     arch::interrupt::TrapFrame,
     filesystem::vfs::{
-        fcntl::{FcntlCommand, FD_CLOEXEC},
+        fcntl::{FcntlCommand, PosixFlock, FD_CLOEXEC, F_UNLCK},
         file::FileFlags,
+        posix_lock::{get_posix_lock, set_posix_lock},
         syscall::dup2::{do_dup2, do_dup3},
     },
     process::ProcessManager,
     syscall::table::{FormattedSyscallParam, Syscall},
+    syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 use alloc::vec::Vec;
+use core::mem::size_of;
 use log::warn;
 use num_traits::FromPrimitive;
 use system_error::SystemError;
@@ -193,6 +196,61 @@ impl SysFcntlHandle {
                 }
 
                 return Err(SystemError::EBADF);
+            }
+            FcntlCommand::GetLock => {
+                let binding = ProcessManager::current_pcb().fd_table();
+                let fd_table_guard = binding.read();
+                let file = fd_table_guard
+                    .get_file_by_fd(fd)
+                    .ok_or(SystemError::EBADF)?;
+                let owner_id = fd_table_guard.lock_owner_id();
+                drop(fd_table_guard);
+
+                let reader =
+                    UserBufferReader::new(arg as *const PosixFlock, size_of::<PosixFlock>(), true)?;
+                let mut flock = reader.buffer_protected(0)?.read_one::<PosixFlock>(0)?;
+
+                get_posix_lock(&file, owner_id, &mut flock)?;
+
+                let mut writer =
+                    UserBufferWriter::new(arg as *mut PosixFlock, size_of::<PosixFlock>(), true)?;
+                writer.buffer_protected(0)?.write_one(0, &flock)?;
+                Ok(0)
+            }
+            FcntlCommand::SetLock | FcntlCommand::SetLockWait => {
+                let binding = ProcessManager::current_pcb().fd_table();
+                let fd_table_guard = binding.read();
+                let file = fd_table_guard
+                    .get_file_by_fd(fd)
+                    .ok_or(SystemError::EBADF)?;
+                let owner_id = fd_table_guard.lock_owner_id();
+                drop(fd_table_guard);
+
+                let reader =
+                    UserBufferReader::new(arg as *const PosixFlock, size_of::<PosixFlock>(), true)?;
+                let flock = reader.buffer_protected(0)?.read_one::<PosixFlock>(0)?;
+
+                let owner_pid = ProcessManager::current_pcb().raw_tgid().data() as i32;
+                let blocking = cmd == FcntlCommand::SetLockWait;
+                set_posix_lock(&file, owner_id, owner_pid, &flock, blocking)?;
+
+                // Linux 语义：检测 close/fcntl 并发竞态。
+                // 如果加锁成功后发现 fd 已不再指向同一 file，需要回滚刚加的锁并返回 EBADF。
+                if flock.l_type != F_UNLCK {
+                    let binding = ProcessManager::current_pcb().fd_table();
+                    let fd_table_guard = binding.read();
+                    let same_file = fd_table_guard
+                        .get_file_by_fd(fd)
+                        .is_some_and(|f| alloc::sync::Arc::ptr_eq(&f, &file));
+                    drop(fd_table_guard);
+                    if !same_file {
+                        let mut unlock = flock;
+                        unlock.l_type = F_UNLCK;
+                        let _ = set_posix_lock(&file, owner_id, owner_pid, &unlock, false);
+                        return Err(SystemError::EBADF);
+                    }
+                }
+                Ok(0)
             }
             FcntlCommand::SetOwn => {
                 // arg 作为 pid_t（有符号整数）处理

@@ -1,6 +1,5 @@
 use alloc::boxed::Box;
 use kdepends::another_ext4;
-use system_error::SystemError;
 
 use crate::driver::base::block::block_device::LBA_SIZE;
 use crate::driver::base::block::gendisk::GenDisk;
@@ -28,7 +27,10 @@ impl another_ext4::BlockDevice for GenDisk {
     // - convert the ext4 block id to gendisk block id
     // - read the block from gendisk
     // - return the block
-    fn read_block(&self, block_id: u64) -> another_ext4::Block {
+    fn read_block(
+        &self,
+        block_id: u64,
+    ) -> core::result::Result<another_ext4::Block, another_ext4::Ext4Error> {
         let mut buf: Box<[u8; 4096]> = vec![0u8; another_ext4::BLOCK_SIZE]
             .into_boxed_slice()
             .try_into()
@@ -39,20 +41,22 @@ impl another_ext4::BlockDevice for GenDisk {
             .read_at(lba_id_start, block_count, &mut *buf)
             .map_err(|e| {
                 log::error!("Ext4BlkDevice '{:?}' read_block failed: {:?}", block_id, e);
-                SystemError::EIO
-            })
-            .unwrap();
-        another_ext4::Block::new(block_id, buf)
+                another_ext4::Ext4Error::new(another_ext4::ErrCode::EIO)
+            })?;
+        Ok(another_ext4::Block::new(block_id, buf))
     }
 
-    fn write_block(&self, block: &another_ext4::Block) {
+    fn write_block(
+        &self,
+        block: &another_ext4::Block,
+    ) -> core::result::Result<(), another_ext4::Ext4Error> {
         let (_, lba_id_start, block_count) = self.convert_from_ext4_blkid(block.id);
         self.block_device()
             .write_at(lba_id_start, block_count, &*block.data)
             .map_err(|e| {
                 log::error!("Ext4BlkDevice '{:?}' write_block failed: {:?}", block.id, e);
-                SystemError::EIO
-            })
-            .unwrap();
+                another_ext4::Ext4Error::new(another_ext4::ErrCode::EIO)
+            })?;
+        Ok(())
     }
 }

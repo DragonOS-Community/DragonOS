@@ -7,6 +7,7 @@ pub mod iov;
 pub mod mount;
 pub mod open;
 pub mod permission;
+pub mod posix_lock;
 pub mod stat;
 pub mod syscall;
 pub mod utils;

@@ -2235,6 +2235,14 @@ impl ProcessBasicInfo {
         return self.fd_table.clone();
     }
 
+    #[inline]
+    pub fn fd_table_is_shared(&self) -> bool {
+        self.fd_table
+            .as_ref()
+            .map(|t| Arc::strong_count(t) > 1)
+            .unwrap_or(false)
+    }
+
     pub fn set_fd_table(
         &mut self,
         fd_table: Option<Arc<RwSem<FileDescriptorVec>>>,

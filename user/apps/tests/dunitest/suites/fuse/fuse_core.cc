@@ -274,6 +274,31 @@ static int core_test_phase_c_read_path() {
         return -1;
     }
 
+    // 回归覆盖：重复 open/read/close，若 close 路径存在锁反转，容易在这里卡住。
+    for (int i = 0; i < 32; i++) {
+        n = fuseg_read_file(p, buf, sizeof(buf) - 1);
+        if (n < 0) {
+            printf("[FAIL] repeated read(%s) iter=%d: %s (errno=%d)\n", p, i, strerror(errno),
+                   errno);
+            umount(mp);
+            stop = 1;
+            close(fd);
+            pthread_join(th, NULL);
+            rmdir(mp);
+            return -1;
+        }
+        buf[n] = '\0';
+        if (strcmp(buf, "hello from fuse\n") != 0) {
+            printf("[FAIL] repeated content mismatch iter=%d got='%s'\n", i, buf);
+            umount(mp);
+            stop = 1;
+            close(fd);
+            pthread_join(th, NULL);
+            rmdir(mp);
+            return -1;
+        }
+    }
+
     umount(mp);
     rmdir(mp);
     stop = 1;

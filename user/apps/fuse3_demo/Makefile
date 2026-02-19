@@ -15,13 +15,14 @@ MESON ?= meson
 
 LIBFUSE_VERSION ?= 3.18.1
 LIBFUSE_NAME := fuse-$(LIBFUSE_VERSION)
-LIBFUSE_URL_PRIMARY ?= https://github.com/libfuse/libfuse/releases/download/fuse-$(LIBFUSE_VERSION)/$(LIBFUSE_NAME).tar.gz
-LIBFUSE_URL_MIRROR ?= https://git.mirrors.dragonos.org.cn/DragonOS-Community/libfuse/archive/fuse-$(LIBFUSE_VERSION).tar.gz
+LIBFUSE_URL_PRIMARY ?= https://git.mirrors.dragonos.org.cn/DragonOS-Community/libfuse/archive/fuse-$(LIBFUSE_VERSION).tar.gz
+LIBFUSE_URL_MIRROR ?= https://github.com/libfuse/libfuse/releases/download/fuse-$(LIBFUSE_VERSION)/$(LIBFUSE_NAME).tar.gz
 
 LIBFUSE_CACHE_DIR := $(CURDIR)/.cache
 LIBFUSE_ARCHIVE ?= $(LIBFUSE_CACHE_DIR)/$(LIBFUSE_NAME).tar.gz
 LIBFUSE_SRC_ROOT := $(CURDIR)/.build/libfuse-src
 LIBFUSE_SRC_DIR := $(LIBFUSE_SRC_ROOT)/$(LIBFUSE_NAME)
+LIBFUSE_SRC_ALT_DIR := $(LIBFUSE_SRC_ROOT)/libfuse
 LIBFUSE_BUILD_DIR := $(CURDIR)/.build/libfuse-build-$(ARCH)
 LIBFUSE_PREFIX := $(CURDIR)/.build/libfuse-install-$(ARCH)
 LIBFUSE_PC_DIR := $(LIBFUSE_PREFIX)/lib/pkgconfig
@@ -58,13 +59,33 @@ $(LIBFUSE_ARCHIVE):
 
 $(LIBFUSE_SRC_DIR): $(LIBFUSE_ARCHIVE)
 	@mkdir -p $(LIBFUSE_SRC_ROOT)
-	@rm -rf "$(LIBFUSE_SRC_DIR)"
+	@rm -rf "$(LIBFUSE_SRC_DIR)" "$(LIBFUSE_SRC_ALT_DIR)"
 	@tar -xzf "$(LIBFUSE_ARCHIVE)" -C "$(LIBFUSE_SRC_ROOT)"
+	@if [ ! -f "$(LIBFUSE_SRC_DIR)/meson.build" ] && [ -f "$(LIBFUSE_SRC_ALT_DIR)/meson.build" ]; then \
+		mv "$(LIBFUSE_SRC_ALT_DIR)" "$(LIBFUSE_SRC_DIR)"; \
+	fi
+	@test -f "$(LIBFUSE_SRC_DIR)/meson.build" || ( \
+		echo "error: libfuse source tree missing meson.build in $(LIBFUSE_SRC_DIR)"; \
+		exit 1 \
+	)
 
-$(LIBFUSE_STAMP): $(LIBFUSE_SRC_DIR)
+$(LIBFUSE_STAMP): $(LIBFUSE_ARCHIVE)
 	@command -v "$(MESON)" >/dev/null 2>&1 || (echo "error: meson not found" && exit 1)
 	@command -v ninja >/dev/null 2>&1 || (echo "error: ninja not found" && exit 1)
 	@command -v "$(PKG_CONFIG)" >/dev/null 2>&1 || (echo "error: pkg-config not found" && exit 1)
+	@if [ ! -f "$(LIBFUSE_SRC_DIR)/meson.build" ]; then \
+		echo "[libfuse] source tree missing or stale, re-extracting..."; \
+		mkdir -p "$(LIBFUSE_SRC_ROOT)"; \
+		rm -rf "$(LIBFUSE_SRC_DIR)" "$(LIBFUSE_SRC_ALT_DIR)"; \
+		tar -xzf "$(LIBFUSE_ARCHIVE)" -C "$(LIBFUSE_SRC_ROOT)"; \
+		if [ ! -f "$(LIBFUSE_SRC_DIR)/meson.build" ] && [ -f "$(LIBFUSE_SRC_ALT_DIR)/meson.build" ]; then \
+			mv "$(LIBFUSE_SRC_ALT_DIR)" "$(LIBFUSE_SRC_DIR)"; \
+		fi; \
+	fi
+	@test -f "$(LIBFUSE_SRC_DIR)/meson.build" || ( \
+		echo "error: libfuse source tree missing meson.build in $(LIBFUSE_SRC_DIR)"; \
+		exit 1 \
+	)
 	@rm -rf "$(LIBFUSE_BUILD_DIR)" "$(LIBFUSE_PREFIX)"
 	@mkdir -p "$(LIBFUSE_BUILD_DIR)" "$(LIBFUSE_PREFIX)"
 	@CC="$(CC)" AR="$(AR)" RANLIB="$(RANLIB)" STRIP="$(STRIP)" \

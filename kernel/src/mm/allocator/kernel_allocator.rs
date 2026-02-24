@@ -90,7 +90,12 @@ impl LocalAlloc for KernelAllocator {
         } else {
             let mut guard = SLABALLOCATOR.lock_irqsave();
             if let Some(ref mut slab) = *guard {
-                return slab.allocate(layout);
+                let ptr = slab.allocate(layout);
+                drop(guard);
+                if !ptr.is_null() {
+                    core::ptr::write_bytes(ptr, 0, layout.size());
+                }
+                return ptr;
             }
             return core::ptr::null_mut();
         }

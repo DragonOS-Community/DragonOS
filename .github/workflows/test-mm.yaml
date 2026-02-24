@@ -4,8 +4,16 @@ on:
   workflow_dispatch:
   push:
     branches: ["master", "feat-*", "fix-*"]
+    paths:
+      - "kernel/src/mm/**"
+      - "kernel/src/arch/**/mm/**"
+      - "kernel/crates/rust-slabmalloc/**"
   pull_request:
     branches: ["master", "feat-*", "fix-*"]
+    paths:
+      - "kernel/src/mm/**"
+      - "kernel/src/arch/**/mm/**"
+      - "kernel/crates/rust-slabmalloc/**"
 
 env:
   HOME: /root
@@ -84,5 +92,3 @@ jobs:
               --max-live 4096 \
               --size "${SLAB_STRESS_SIZE}" \
               --seed "${SLAB_STRESS_SEED}"
-
-

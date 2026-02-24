@@ -26,7 +26,7 @@ INSTALL_MODE=""
 
 export RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER:-https://rsproxy.cn}
 export RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT:-https://rsproxy.cn/rustup}
-export RUST_VERSION="${RUST_VERSION:-nightly-2025-08-10}"
+export RUST_VERSION="${RUST_VERSION:-nightly-2026-02-24}"
 export NIX_MIRROR=${NIX_MIRROR:-}
 export NIX_INSTALLER_URL=${NIX_INSTALLER_URL:-https://mirrors.tuna.tsinghua.edu.cn/nix/latest/install}
 export NIX_INSTALLER_FALLBACK_URL=${NIX_INSTALLER_FALLBACK_URL:-https://nixos.org/nix/install}

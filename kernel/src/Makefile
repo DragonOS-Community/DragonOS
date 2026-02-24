@@ -44,7 +44,7 @@ kernel_subdirs := debug
 ifeq ($(USING_DRAGONOS_NIX_ENV),1)
 TOOLCHAIN ?=
 else
-TOOLCHAIN ?= +nightly-2025-08-10
+TOOLCHAIN ?= +nightly-2026-02-24
 endif
 
 kernel_rust:

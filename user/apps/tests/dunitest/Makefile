@@ -4,7 +4,7 @@ else
 INSTALL_DIR = ./install
 endif
 
-TOOLCHAIN = +nightly-2025-08-10-x86_64-unknown-linux-gnu
+TOOLCHAIN = +nightly-2026-02-24-x86_64-unknown-linux-gnu
 RUSTFLAGS +=
 ifeq ($(ARCH), x86_64)
 	export RUST_TARGET = x86_64-unknown-linux-musl

@@ -130,18 +130,13 @@ impl X86KvmArch {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 #[allow(dead_code)]
 pub enum KvmIrqChipMode {
+    #[default]
     None,
     Kernel,
     Split,
-}
-
-impl Default for KvmIrqChipMode {
-    fn default() -> Self {
-        Self::None
-    }
 }
 #[allow(dead_code)]
 pub trait KvmInitFunc {

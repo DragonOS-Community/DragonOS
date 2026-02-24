@@ -1121,8 +1121,9 @@ dependencies = [
 
 [[package]]
 name = "printf-compat"
-version = "0.2.1"
-source = "git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/printf-compat?rev=626801cb5f#626801cb5f640d7b9eead4d4eb72140eb703ed50"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f6774deba7b969f90614d67c65be0e0c1232d4078332800d6e68a15ecc8a4f3"
 dependencies = [
  "bitflags 2.9.1",
  "itertools",
@@ -2267,7 +2268,7 @@ dependencies = [
 [[package]]
 name = "xarray"
 version = "0.1.0"
-source = "git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/xarray?rev=de93b57c34#de93b57c34011899d79758b3bfa767b04316b107"
+source = "git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/xarray?rev=5113ad0ea0#5113ad0ea01e92a24e4017d4abe3ac10e9262afb"
 dependencies = [
  "smallvec",
 ]

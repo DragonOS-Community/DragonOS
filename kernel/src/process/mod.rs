@@ -2714,8 +2714,8 @@ impl KernelStack {
 
 impl Drop for KernelStack {
     fn drop(&mut self) {
-        if self.stack.is_some() {
-            let ptr = self.stack.as_ref().unwrap().as_ptr() as *const *const ProcessControlBlock;
+        if let Some(stack) = &self.stack {
+            let ptr = stack.as_ptr() as *const *const ProcessControlBlock;
             if unsafe { !(*ptr).is_null() } {
                 let pcb_ptr: Weak<ProcessControlBlock> = unsafe { Weak::from_raw(*ptr) };
                 drop(pcb_ptr);

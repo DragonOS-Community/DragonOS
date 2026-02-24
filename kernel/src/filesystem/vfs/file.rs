@@ -1414,12 +1414,12 @@ impl Drop for File {
         super::flock::release_all_for_file(self);
         let r: Result<(), SystemError> = self.inode.close(self.private_data.lock());
         // 打印错误信息
-        if r.is_err() {
+        if let Err(e) = r {
             error!(
                 "pid: {:?} failed to close file: {:?}, errno={:?}",
                 ProcessManager::current_pcb().raw_pid(),
                 self,
-                r.as_ref().unwrap_err()
+                e
             );
         }
     }

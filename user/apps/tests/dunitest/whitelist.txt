@@ -3,5 +3,6 @@
 demo/gtest_demo
 normal/capability
 normal/fcntl_lock
+normal/epoll_timeout_budget
 fuse/fuse_core
 fuse/fuse_extended

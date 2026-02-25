@@ -262,10 +262,7 @@ impl IndexNode for GenDisk {
         let blocks = range.lba_end.saturating_sub(range.lba_start);
         let size_in_bytes = blocks.saturating_mul(LBA_SIZE);
 
-        meta.size = match i64::try_from(size_in_bytes) {
-            Ok(val) => val,
-            Err(_) => i64::MAX,
-        };
+        meta.size = i64::try_from(size_in_bytes).unwrap_or(i64::MAX);
         meta.blocks = blocks;
         meta.blk_size = LBA_SIZE;
         Ok(meta)

@@ -10,9 +10,7 @@ use crate::driver::pci::root::pci_root_0;
 
 use crate::exception::IrqNumber;
 
-use crate::libs::volatile::{
-    volread, volwrite, ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly,
-};
+use crate::libs::volatile::{ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly};
 use crate::mm::VirtAddr;
 
 use alloc::sync::Arc;

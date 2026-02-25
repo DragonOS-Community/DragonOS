@@ -583,12 +583,6 @@ impl Device for VirtioInterface {
 
 impl VirtIONicDeviceInner {
     pub fn new(driver_net: VirtIONet<HalImpl, VirtIOTransport, 2>) -> Self {
-        let mut iface_config = iface::Config::new(wire::HardwareAddress::Ethernet(
-            wire::EthernetAddress(driver_net.mac_address()),
-        ));
-
-        iface_config.random_seed = rand() as u64;
-
         let inner = Arc::new(SpinLock::new(VirtIoNetImpl::new(driver_net)));
         let result = VirtIONicDeviceInner {
             inner,

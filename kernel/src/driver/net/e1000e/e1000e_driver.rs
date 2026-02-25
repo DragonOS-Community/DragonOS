@@ -173,12 +173,6 @@ impl phy::TxToken for E1000ETxToken {
 impl E1000EDriver {
     #[allow(clippy::arc_with_non_send_sync)]
     pub fn new(device: E1000EDevice) -> Self {
-        let mut iface_config = smoltcp::iface::Config::new(HardwareAddress::Ethernet(
-            smoltcp::wire::EthernetAddress(device.mac_address()),
-        ));
-
-        iface_config.random_seed = rand() as u64;
-
         let inner: Arc<SpinLock<E1000EDevice>> = Arc::new(SpinLock::new(device));
         let result = E1000EDriver {
             inner,

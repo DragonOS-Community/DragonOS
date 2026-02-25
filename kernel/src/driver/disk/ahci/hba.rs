@@ -1,5 +1,5 @@
 //! 文件说明: 实现了 AHCI 中的控制器 HBA 的相关行为
-use core::{intrinsics::size_of, ptr};
+use core::{mem::size_of, ptr};
 
 use core::sync::atomic::compiler_fence;
 

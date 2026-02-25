@@ -5,6 +5,8 @@ use num_traits::FromPrimitive;
 use alloc::{borrow::ToOwned, string::String, vec::Vec};
 use system_error::SystemError;
 
+use crate::process::cred::{CAPFlags, Cred};
+
 use crate::{
     arch::{interrupt::TrapFrame, ipc::signal::Signal, syscall::nr::SYS_PRCTL},
     process::ProcessManager,
@@ -16,15 +18,38 @@ use crate::{
 
 const TASK_COMM_LEN: usize = 16;
 
+/// Linux 定义了 41 个 capability (索引 0-40)
+const CAP_LAST_CAP: usize = 40;
+
+/// 将 capability 索引转换为 CAPFlags
+///
+/// # 参数
+/// - `idx`: capability 索引 (0-40)
+///
+/// # 返回
+/// - 成功返回对应的 CAPFlags
+/// - 失败返回 EINVAL (索引超出范围)
+fn capability_from_index(idx: usize) -> Result<CAPFlags, SystemError> {
+    if idx > CAP_LAST_CAP {
+        return Err(SystemError::EINVAL);
+    }
+    let cap_bit = 1u64 << idx;
+    CAPFlags::from_bits(cap_bit).ok_or(SystemError::EINVAL)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, FromPrimitive)]
 #[repr(usize)]
 enum PrctlOption {
-    GetDumpable = 3,
-    SetDumpable = 4,
     SetPDeathSig = 1,
     GetPDeathSig = 2,
+    GetDumpable = 3,
+    SetDumpable = 4,
+    SetKeepCaps = 8,
+    GetKeepCaps = 9,
     SetName = 15,
     GetName = 16,
+    CapBsetRead = 23,
+    CapBsetDrop = 24,
 
     SetMm = 35,
 
@@ -78,6 +103,20 @@ impl Syscall for SysPrctl {
                     }
                     _ => Err(SystemError::EINVAL),
                 }
+            }
+            PrctlOption::SetKeepCaps => {
+                // Linux: arg2 非 0 表示置位，0 表示清除。
+                let v = arg2 as isize;
+                let enable = v != 0;
+                current.set_keepcaps(enable);
+                Ok(0)
+            }
+            PrctlOption::GetKeepCaps => {
+                // Linux: 返回 1 表示置位，0 表示未置位。
+                let value: c_int = if current.keepcaps() { 1 } else { 0 };
+                // 注意：根据 prctl 的语义，返回值应该直接返回，而不是写入用户空间。
+                // PR_GET_KEEPCAPS 的返回值就是当前状态，不需要额外的参数。
+                Ok(value as usize)
             }
             PrctlOption::SetPDeathSig => {
                 let signal = parse_pdeathsig(arg2)?;
@@ -148,6 +187,41 @@ impl Syscall for SysPrctl {
                 let is_subreaper = thread_group_leader.sig_info_irqsave().is_child_subreaper();
                 let value: c_int = if is_subreaper { 1 } else { 0 };
                 writer.copy_one_to_user(&value, 0)?;
+                Ok(0)
+            }
+
+            PrctlOption::CapBsetRead => {
+                // PR_CAPBSET_READ: 检查某个 capability 是否在 bounding set 中
+                // arg2 是 capability 的编号 (0-40)
+                let cap_flag = capability_from_index(arg2)?;
+                let cred = current.cred();
+                let has_cap = cred.cap_bset.contains(cap_flag);
+                Ok(if has_cap { 1 } else { 0 })
+            }
+            PrctlOption::CapBsetDrop => {
+                // PR_CAPBSET_DROP: 从 bounding set 中删除某个 capability
+                // arg2 是 capability 的编号 (0-40)
+                // 需要 CAP_SETPCAP 权限
+                let cap_flag = capability_from_index(arg2)?;
+
+                let old_cred = current.cred();
+                // Linux: PR_CAPBSET_DROP 需要 CAP_SETPCAP 权限
+                if !old_cred.has_capability(CAPFlags::CAP_SETPCAP) {
+                    return Err(SystemError::EPERM);
+                }
+
+                // 检查 capability 是否已在 bounding set 中
+                if !old_cred.cap_bset.contains(cap_flag) {
+                    // 已经不在 bounding set 中，直接返回成功
+                    return Ok(0);
+                }
+
+                // 使用 Clone trait 简化代码
+                let mut new_cred = old_cred.as_ref().clone();
+                new_cred.cap_bset.remove(cap_flag);
+                let new_cred = Cred::new_arc(new_cred);
+
+                current.set_cred(new_cred)?;
                 Ok(0)
             }
 

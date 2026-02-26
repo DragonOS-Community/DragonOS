@@ -5,6 +5,9 @@
   kernel,
   testOpt,
   debug ? false,
+  enableVsock ? true,
+  vsockGuestCid ? 3,
+  vsockDeviceModel ? "vhost-vsock-pci-non-transitional",
   vmstateDir ? null,
   preferSystemQemu ? false,
 }:
@@ -163,6 +166,9 @@ let
       vmstateDirStr = if vmstateDir != null then vmstateDir else "";
       hasVmstateDir = vmstateDir != null;
       preferSystemQemuStr = if preferSystemQemu then "true" else "false";
+      enableVsockStr = if enableVsock then "true" else "false";
+      vsockGuestCidStr = builtins.toString vsockGuestCid;
+      vsockDeviceModelStr = vsockDeviceModel;
 
     in
     pkgs.writeScriptBin name ''
@@ -196,6 +202,23 @@ let
 
       ACCEL="tcg"
       if [ -e /dev/kvm ] && [ -w /dev/kvm ]; then ACCEL="kvm"; fi
+
+      VSOCK_ARGS=()
+      # vhost-vsock 只在 x86_64 路径启用，并依赖宿主机 /dev/vhost-vsock。
+      if [ "${enableVsockStr}" = "true" ]; then
+        if [ "${arch}" != "x86_64" ]; then
+          echo "[WARN] vsock enabled but unsupported arch (${arch}); skip"
+        elif [ "${vsockGuestCidStr}" = "2" ]; then
+          echo "[WARN] vsock guest CID must not be 2 (host CID); skip"
+        elif [ ! -e /dev/vhost-vsock ]; then
+          echo "[WARN] /dev/vhost-vsock not found; skip vsock device"
+        else
+          VSOCK_ARGS=( "-device" "${vsockDeviceModelStr},guest-cid=${vsockGuestCidStr}" )
+          echo "[INFO] enable vsock device: ${vsockDeviceModelStr},guest-cid=${vsockGuestCidStr}"
+        fi
+      else
+        echo "[INFO] vsock disabled by nix config (enableVsock=false)"
+      fi
 
       ${
         if hasVmstateDir then
@@ -239,6 +262,7 @@ let
       echo -e "Boot Args: ''${BOOT_ARGS[*]}"
       echo -e "Disk Args: ''${DISK_ARGS[*]}"
       echo -e "Net Args: ''${NET_ARGS[*]}"
+      echo -e "Vsock Args: ''${VSOCK_ARGS[*]}"
       echo -e "Host Port: $HOST_PORT"
       echo -e "=================================================================="
       echo ""
@@ -253,13 +277,13 @@ let
           ''
             sudo bash -c 'pidfile="$1"; shift; echo $$ > "$pidfile"; exec "$@"' bash "$VMSTATE_DIR/pid" ${qemuBin} ${qemuFlagsStr} "''${NET_ARGS[@]}" ${
               if qemuFirmware != null then "-L ${qemuFirmware}" else ""
-            } "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "$@"
+            } "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "''${VSOCK_ARGS[@]}" "$@"
           ''
         else
           ''
             sudo ${qemuBin} ${qemuFlagsStr} "''${NET_ARGS[@]}" ${
               if qemuFirmware != null then "-L ${qemuFirmware}" else ""
-            } "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "$@"
+            } "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "''${VSOCK_ARGS[@]}" "$@"
           ''
       }
     '';

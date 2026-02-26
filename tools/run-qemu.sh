@@ -143,7 +143,19 @@ QEMU_ACCEL_ARGS=()
 QEMU_DEVICE_ARGS=()
 QEMU_DISPLAY_ARGS=()
 QEMU_ARGS=()
-# QEMU_ARGUMENT+=" -S "
+
+# vsock 固定配置（按需直接修改脚本）：
+# - QEMU_ENABLE_VSOCK=1: 默认启用
+# - QEMU_VSOCK_GUEST_CID: guest CID（不能与 host CID=2 冲突）
+QEMU_ENABLE_VSOCK=1
+QEMU_VSOCK_GUEST_CID=3
+QEMU_ATTACH_VSOCK=0
+# 推荐 non-transitional 模型，PCI device id 对应 0x1053 (VSOCK)。
+QEMU_VSOCK_DEVICE_MODEL="vhost-vsock-pci-non-transitional"
+# GDB调试支持：
+# - QEMU_GDB_WAIT=1: QEMU 启动后立即暂停CPU（等同 -S），等待 GDB/monitor 手动继续
+# - QEMU_GDB_WAIT=0: 默认不暂停
+QEMU_GDB_WAIT=1
 
 if [ -f "${QEMU_EXT4_DISK_IMAGE}" ]; then
   QEMU_DRIVE_ARGS+=(-drive "id=ext4disk,file=${QEMU_EXT4_DISK_IMAGE},if=none,format=raw")
@@ -212,6 +224,20 @@ if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
     fi
     if [ -f "${QEMU_FAT_DISK_IMAGE}" ]; then
       QEMU_DEVICE_DISK_ARGS+=(-device virtio-blk-pci,drive=fatdisk)
+    fi
+
+    # 可选启用 vsock 设备（默认关闭）。
+    if [ "${QEMU_ENABLE_VSOCK}" = "1" ]; then
+      if [ "${QEMU_VSOCK_GUEST_CID}" = "2" ]; then
+        echo "[WARN] guest CID=2 conflicts with host CID=2; skip vhost-vsock-pci"
+      elif [ ! -e /dev/vhost-vsock ]; then
+        echo "[WARN] /dev/vhost-vsock not found; skip vsock device"
+        echo "[WARN] Hint: sudo modprobe vhost_vsock"
+      else
+        QEMU_ATTACH_VSOCK=1
+      fi
+    else
+      echo "[INFO] vsock disabled by script config (QEMU_ENABLE_VSOCK=0)"
     fi
 
 elif [ ${ARCH} == "riscv64" ]; then
@@ -332,6 +358,11 @@ QEMU_DEVICE_ARGS+=(
   -usb
   -device "qemu-xhci,id=xhci,p2=8,p3=4"
 ) 
+
+if [ "${QEMU_ATTACH_VSOCK}" = "1" ]; then
+  QEMU_DEVICE_ARGS+=(-device "${QEMU_VSOCK_DEVICE_MODEL},guest-cid=${QEMU_VSOCK_GUEST_CID}")
+  echo "[INFO] enable vsock device: ${QEMU_VSOCK_DEVICE_MODEL},guest-cid=${QEMU_VSOCK_GUEST_CID}"
+fi
 # E1000E
 # QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -netdev user,id=hostnet0,hostfwd=tcp::12580-:12580 -net nic,model=e1000e,netdev=hostnet0,id=net0 -netdev user,id=hostnet1,hostfwd=tcp::12581-:12581 -device virtio-net-pci,vectors=5,netdev=hostnet1,id=net1 -usb -device qemu-xhci,id=xhci,p2=8,p3=4 " 
 

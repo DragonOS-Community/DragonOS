@@ -102,6 +102,13 @@
             target:
             let
               diskPath = "${buildDir}/disk-image-${target}.img";
+              # vsock 固定配置（nix run .#start-* / .#yolo-* 生效）：
+              # - guestCid 不能为 2（host CID）
+              vsockConfig = {
+                enable = true;
+                guestCid = 3;
+                deviceModel = "vhost-vsock-pci-non-transitional";
+              };
               qemuScripts = import ./tools/qemu/default.nix {
                 inherit
                   lib
@@ -114,6 +121,9 @@
                 kernel = "${buildDir}/kernel/kernel.elf"; # TODO: make it a drv 用nix构建内核，避免指定相对目录
                 # -s -S
                 debug = false;
+                enableVsock = vsockConfig.enable;
+                vsockGuestCid = vsockConfig.guestCid;
+                vsockDeviceModel = vsockConfig.deviceModel;
                 # 启用 VM 状态管理，与 make qemu 行为保持一致
                 vmstateDir = "${buildDir}/vmstate";
               };
@@ -129,6 +139,9 @@
                 kernel = "${buildDir}/kernel/kernel.elf"; # TODO: make it a drv 用nix构建内核，避免指定相对目录
                 # -s -S
                 debug = false;
+                enableVsock = vsockConfig.enable;
+                vsockGuestCid = vsockConfig.guestCid;
+                vsockDeviceModel = vsockConfig.deviceModel;
                 # 启用 VM 状态管理，与 make qemu 行为保持一致
                 vmstateDir = "${buildDir}/vmstate";
                 # 优先使用系统 QEMU，避免 Nix 下载 QEMU 依赖

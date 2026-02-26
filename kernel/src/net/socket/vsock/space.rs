@@ -1,3 +1,4 @@
+use alloc::collections::btree_map::Entry;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -67,8 +68,8 @@ impl VsockSpace {
                 guard.next_ephemeral = EPHEMERAL_PORT_MIN;
             }
 
-            if !guard.port_refs.contains_key(&port) {
-                guard.port_refs.insert(port, 1);
+            if let Entry::Vacant(entry) = guard.port_refs.entry(port) {
+                entry.insert(1);
                 return Ok(port);
             }
         }
@@ -91,11 +92,13 @@ impl VsockSpace {
 
         let mut guard = self.inner.lock();
         // 显式 bind(port) 需要独占该端口。
-        if guard.port_refs.contains_key(&port) {
-            return Err(SystemError::EADDRINUSE);
+        match guard.port_refs.entry(port) {
+            Entry::Vacant(entry) => {
+                entry.insert(1);
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(SystemError::EADDRINUSE),
         }
-        guard.port_refs.insert(port, 1);
-        Ok(())
     }
 
     /// 增加端口引用计数（共享持有）。

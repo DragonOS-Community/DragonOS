@@ -36,7 +36,10 @@ fn virtio_probe() -> Result<(), SystemError> {
 #[allow(dead_code)]
 fn virtio_probe_pci() {
     let virtio_list = virtio_device_search();
-    log::info!("virtio_probe_pci: found {} virtio pci candidates", virtio_list.len());
+    log::info!(
+        "virtio_probe_pci: found {} virtio pci candidates",
+        virtio_list.len()
+    );
     for virtio_device in virtio_list {
         let bdf: String = virtio_device.common_header.bus_device_function.into();
         let dev_id = DeviceId::new(None, Some(bdf)).unwrap();

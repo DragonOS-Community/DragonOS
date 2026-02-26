@@ -19,8 +19,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use system_error::SystemError;
 
 use crate::libs::wait_queue::WaitQueue;
+use crate::net::socket::{Socket, PSOCK};
 use crate::process::kthread::{KernelThreadClosure, KernelThreadMechanism};
-use crate::net::socket::{PSOCK, Socket};
 use crate::process::namespace::net_namespace::INIT_NET_NAMESPACE;
 use crate::process::ProcessManager;
 use crate::time::Duration;
@@ -35,8 +35,8 @@ pub use global::global_vsock_space;
 pub use space::VsockSpace;
 #[allow(unused_imports)]
 pub use transport::{
-    mark_transport_failed, register_transport, transport_local_cid, transport_ready, VsockTransport,
-    VsockTransportEvent,
+    mark_transport_failed, register_transport, transport_local_cid, transport_ready,
+    VsockTransport, VsockTransportEvent,
 };
 
 const VSOCK_EVENT_WORKER_IDLE_SLEEP: Duration = Duration::from_millis(1);
@@ -53,8 +53,8 @@ static VSOCK_EVENT_WORKER_SLEEP_QUEUE: WaitQueue = WaitQueue::default();
 /// # 行为
 /// - 通过 `WaitQueue` 的超时等待实现退避
 fn vsock_event_worker_sleep(timeout: Duration) {
-    let _ = VSOCK_EVENT_WORKER_SLEEP_QUEUE
-        .wait_event_uninterruptible_timeout(|| false, Some(timeout));
+    let _ =
+        VSOCK_EVENT_WORKER_SLEEP_QUEUE.wait_event_uninterruptible_timeout(|| false, Some(timeout));
 }
 
 /// vsock transport 事件轮询线程主循环。

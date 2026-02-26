@@ -1,8 +1,8 @@
-use alloc::collections::BTreeMap;
 use crate::arch::MMArch;
 use crate::libs::spinlock::SpinLock;
 use crate::mm::dma::{dma_alloc_pages_raw, dma_dealloc_pages_raw, DmaAllocOptions, DmaDirection};
 use crate::mm::{MemoryManagementArch, PhysAddr, VirtAddr};
+use alloc::collections::BTreeMap;
 use core::cmp;
 use core::ptr::NonNull;
 use virtio_drivers::{BufferDirection, Hal};
@@ -97,9 +97,13 @@ unsafe impl Hal for HalImpl {
             core::ptr::copy_nonoverlapping(buf_ptr as *const u8, bounce_vaddr.as_ptr(), buf_len);
         }
 
-        SHARED_BOUNCE_BUFFERS
-            .lock_irqsave()
-            .insert(paddr, SharedBounceBuffer { vaddr: bounce_vaddr, pages });
+        SHARED_BOUNCE_BUFFERS.lock_irqsave().insert(
+            paddr,
+            SharedBounceBuffer {
+                vaddr: bounce_vaddr,
+                pages,
+            },
+        );
         paddr
     }
     /// @brief 停止共享

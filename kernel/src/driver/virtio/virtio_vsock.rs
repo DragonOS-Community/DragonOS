@@ -10,8 +10,8 @@ use virtio_drivers::Error as VirtioError;
 
 use crate::driver::base::device::{Device, DeviceId};
 use crate::driver::virtio::transport::VirtIOTransport;
-use crate::driver::virtio::virtio_impl::HalImpl;
 use crate::driver::virtio::virtio_drivers_error_to_system_error;
+use crate::driver::virtio::virtio_impl::HalImpl;
 use crate::libs::mutex::Mutex;
 use crate::net::socket::vsock::addr::VsockEndpoint;
 use crate::net::socket::vsock::transport::{VsockTransport, VsockTransportEvent};
@@ -145,17 +145,19 @@ impl VsockTransport for VirtioVsockTransport {
     fn poll_events(&self) -> Result<Vec<VsockTransportEvent>, SystemError> {
         let mut manager = self.manager.lock();
         let mut events = Vec::new();
-        loop {
-            let Some(event) = manager.0.poll().map_err(map_vsock_error)? else {
-                break;
-            };
-
+        while let Some(event) = manager.0.poll().map_err(map_vsock_error)? {
             let Some(local) = Self::event_addr_to_endpoint(event.destination) else {
-                log::warn!("drop vsock event with invalid destination cid={}", event.destination.cid);
+                log::warn!(
+                    "drop vsock event with invalid destination cid={}",
+                    event.destination.cid
+                );
                 continue;
             };
             let Some(peer) = Self::event_addr_to_endpoint(event.source) else {
-                log::warn!("drop vsock event with invalid source cid={}", event.source.cid);
+                log::warn!(
+                    "drop vsock event with invalid source cid={}",
+                    event.source.cid
+                );
                 continue;
             };
 

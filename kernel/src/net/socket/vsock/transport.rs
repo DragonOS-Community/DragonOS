@@ -167,13 +167,12 @@ pub trait VsockTransport: Send + Sync {
 }
 
 lazy_static! {
-    static ref GLOBAL_VSOCK_TRANSPORT: RwLock<GlobalVsockTransport> = RwLock::new(
-        GlobalVsockTransport {
+    static ref GLOBAL_VSOCK_TRANSPORT: RwLock<GlobalVsockTransport> =
+        RwLock::new(GlobalVsockTransport {
             backend: None,
             state: VsockTransportState::Unavailable,
             last_error: None,
-        }
-    );
+        });
 }
 
 fn ready_backend() -> Result<Arc<dyn VsockTransport>, SystemError> {

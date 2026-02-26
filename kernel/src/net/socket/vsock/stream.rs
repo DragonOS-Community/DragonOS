@@ -20,14 +20,12 @@ use crate::net::socket::common::{EPollItems, ShutdownBit};
 use crate::net::socket::endpoint::Endpoint;
 use crate::net::socket::{RecvFromAddrBehavior, Socket, PMSG, PSO, PSOL};
 
-use super::addr::{
-    ConnectionId, VsockEndpoint, VMADDR_CID_ANY, VMADDR_CID_LOCAL, VMADDR_PORT_ANY,
-};
+use super::addr::{ConnectionId, VsockEndpoint, VMADDR_CID_ANY, VMADDR_CID_LOCAL, VMADDR_PORT_ANY};
 use super::global::global_vsock_space;
 use super::space::VsockSpace;
 use super::transport::{
-    transport_connect, transport_listen, transport_local_cid, transport_reset, transport_send,
-    transport_ready, transport_shutdown, transport_unlisten, VsockTransportEvent,
+    transport_connect, transport_listen, transport_local_cid, transport_ready, transport_reset,
+    transport_send, transport_shutdown, transport_unlisten, VsockTransportEvent,
 };
 
 type EP = crate::filesystem::epoll::EPollEventType;
@@ -326,7 +324,8 @@ impl VsockStreamSocket {
             return Err(error);
         }
 
-        if inner.peer_send_shutdown || inner.peer_closed || inner.state == VsockStreamState::Closed {
+        if inner.peer_send_shutdown || inner.peer_closed || inner.state == VsockStreamState::Closed
+        {
             return Ok(0);
         }
 
@@ -380,12 +379,10 @@ impl VsockStreamSocket {
         match inner.state {
             VsockStreamState::Connected => Ok(()),
             VsockStreamState::Connecting => Err(SystemError::EINPROGRESS),
-            VsockStreamState::Bound => Err(
-                inner
-                    .pending_error
-                    .clone()
-                    .unwrap_or(SystemError::ECONNREFUSED),
-            ),
+            VsockStreamState::Bound => Err(inner
+                .pending_error
+                .clone()
+                .unwrap_or(SystemError::ECONNREFUSED)),
             VsockStreamState::Init | VsockStreamState::Listening => Err(SystemError::EINVAL),
             VsockStreamState::Closed => Err(SystemError::EBADF),
         }
@@ -522,7 +519,10 @@ impl VsockStreamSocket {
     /// - 将子连接压入监听者的 accept 队列
     fn connect_local(&self, local: VsockEndpoint, peer: VsockEndpoint) -> Result<(), SystemError> {
         // 本地连接不经过 transport，直接在内核内完成握手。
-        let listener = self.space.find_listener(peer).ok_or(SystemError::ECONNREFUSED)?;
+        let listener = self
+            .space
+            .find_listener(peer)
+            .ok_or(SystemError::ECONNREFUSED)?;
         let client = self.self_ref.upgrade().ok_or(SystemError::ECONNRESET)?;
 
         let accepted = VsockStreamSocket::new(false)?;
@@ -530,7 +530,10 @@ impl VsockStreamSocket {
         self.space.retain_port(peer.port)?;
 
         // 注意方向性：服务端和客户端会登记两条镜像连接键。
-        let server_connection_id = ConnectionId { local: peer, peer: local };
+        let server_connection_id = ConnectionId {
+            local: peer,
+            peer: local,
+        };
         let client_connection_id = ConnectionId { local, peer };
 
         {
@@ -900,7 +903,11 @@ impl Socket for VsockStreamSocket {
             loop {
                 match self.connect_status() {
                     Err(SystemError::EINPROGRESS) => {
-                        wq_wait_event_interruptible!(self.wait_queue, self.can_complete_connect(), {})?;
+                        wq_wait_event_interruptible!(
+                            self.wait_queue,
+                            self.can_complete_connect(),
+                            {}
+                        )?;
                     }
                     result => return result,
                 }
@@ -960,17 +967,17 @@ impl Socket for VsockStreamSocket {
     /// - 仅 `Bound` 或 `Listening` 状态可调用
     /// - 会在 `VsockSpace` 中注册监听者
     fn listen(&self, backlog: usize) -> Result<(), SystemError> {
-        let effective_backlog = backlog.max(1).min(SOMAXCONN);
+        let effective_backlog = backlog.clamp(1, SOMAXCONN);
         let local = {
             let inner = self.inner.lock();
-            if inner.state != VsockStreamState::Bound && inner.state != VsockStreamState::Listening {
+            if inner.state != VsockStreamState::Bound && inner.state != VsockStreamState::Listening
+            {
                 return Err(SystemError::EINVAL);
             }
             inner.local.ok_or(SystemError::EINVAL)?
         };
 
-        self.space
-            .register_listener(local, self.self_ref.clone())?;
+        self.space.register_listener(local, self.self_ref.clone())?;
 
         let mut inner = self.inner.lock();
         if inner.state != VsockStreamState::Bound && inner.state != VsockStreamState::Listening {
@@ -1027,7 +1034,11 @@ impl Socket for VsockStreamSocket {
     }
 
     /// `recvmsg` 实现：先聚合读取，再 scatter 回用户 iovec。
-    fn recv_msg(&self, msg: &mut crate::net::posix::MsgHdr, flags: PMSG) -> Result<usize, SystemError> {
+    fn recv_msg(
+        &self,
+        msg: &mut crate::net::posix::MsgHdr,
+        flags: PMSG,
+    ) -> Result<usize, SystemError> {
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
         let total = iovs.total_len();
         let mut tmp = vec![0u8; total];
@@ -1104,7 +1115,12 @@ impl Socket for VsockStreamSocket {
     }
 
     /// `sendto` 对 stream 语义直接复用 `send`。
-    fn send_to(&self, buffer: &[u8], flags: PMSG, _address: Endpoint) -> Result<usize, SystemError> {
+    fn send_to(
+        &self,
+        buffer: &[u8],
+        flags: PMSG,
+        _address: Endpoint,
+    ) -> Result<usize, SystemError> {
         self.send(buffer, flags)
     }
 
@@ -1150,12 +1166,7 @@ impl Socket for VsockStreamSocket {
         }
 
         if let (Some(local), Some(peer)) = (local, peer) {
-            let _ = transport_shutdown(
-                local,
-                peer,
-                how.is_send_shutdown(),
-                how.is_recv_shutdown(),
-            );
+            let _ = transport_shutdown(local, peer, how.is_send_shutdown(), how.is_recv_shutdown());
         }
 
         self.notify_io();
@@ -1195,7 +1206,11 @@ impl Socket for VsockStreamSocket {
                     PSO::ERROR => {
                         // Linux SO_ERROR: 返回正 errno，并在读取后清除错误状态。
                         let mut inner = self.inner.lock();
-                        let err = inner.pending_error.take().map(|e| -e.to_posix_errno()).unwrap_or(0);
+                        let err = inner
+                            .pending_error
+                            .take()
+                            .map(|e| -e.to_posix_errno())
+                            .unwrap_or(0);
                         write_i32_opt(value, err)
                     }
                     _ => Err(SystemError::ENOPROTOOPT),

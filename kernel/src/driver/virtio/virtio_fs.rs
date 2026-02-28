@@ -47,7 +47,6 @@ struct VirtioFsInstanceState {
 pub struct VirtioFsInstance {
     tag: String,
     num_request_queues: u32,
-    request_queue_index: u16,
     dev_id: Arc<DeviceId>,
     state: SpinLock<VirtioFsInstanceState>,
 }
@@ -62,7 +61,6 @@ impl VirtioFsInstance {
         Self {
             tag,
             num_request_queues,
-            request_queue_index: VIRTIO_FS_REQUEST_QUEUE_BASE,
             dev_id,
             state: SpinLock::new(VirtioFsInstanceState {
                 transport: Some(VirtioFsTransportHolder(transport)),
@@ -83,14 +81,24 @@ impl VirtioFsInstance {
         self.num_request_queues
     }
 
-    pub fn request_queue_index(&self) -> u16 {
-        self.request_queue_index
+    pub fn hiprio_queue_index(&self) -> u16 {
+        0
     }
 
-    pub fn request_queue_index_valid(&self) -> bool {
-        let base = VIRTIO_FS_REQUEST_QUEUE_BASE as u32;
-        let idx = self.request_queue_index as u32;
-        idx >= base && idx < (base + self.num_request_queues)
+    pub fn request_queue_count(&self) -> usize {
+        self.num_request_queues as usize
+    }
+
+    pub fn request_queue_index_by_slot(&self, slot: usize) -> Option<u16> {
+        if slot >= self.request_queue_count() {
+            return None;
+        }
+        VIRTIO_FS_REQUEST_QUEUE_BASE
+            .checked_add(slot as u16)
+            .filter(|idx| {
+                (*idx as usize)
+                    < (VIRTIO_FS_REQUEST_QUEUE_BASE as usize + self.request_queue_count())
+            })
     }
 
     pub fn take_transport_for_session(&self) -> Result<VirtIOTransport, SystemError> {

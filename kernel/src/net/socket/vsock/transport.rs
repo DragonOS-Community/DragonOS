@@ -1,5 +1,6 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::libs::rwlock::RwLock;
 use system_error::SystemError;
@@ -9,45 +10,34 @@ use super::addr::VsockEndpoint;
 /// transport 层上报到 vsock 语义层的事件集合。
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
-pub enum VsockTransportEvent {
+pub struct VsockTransportEvent {
+    pub local: VsockEndpoint,
+    pub peer: VsockEndpoint,
+    pub kind: VsockTransportEventKind,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub enum VsockTransportEventKind {
     /// 对端发起连接请求（对应 virtio REQUEST）。
-    Request {
-        local: VsockEndpoint,
-        peer: VsockEndpoint,
-    },
+    Request,
     /// 对端确认连接建立（对应 virtio RESPONSE）。
-    Response {
-        local: VsockEndpoint,
-        peer: VsockEndpoint,
-    },
+    Response,
     /// 对端发送数据（对应 virtio RW）。
-    Rw {
-        local: VsockEndpoint,
-        peer: VsockEndpoint,
-        data: Vec<u8>,
-    },
+    Rw { data: Vec<u8> },
     /// 对端半关闭/全关闭（对应 virtio SHUTDOWN）。
     Shutdown {
-        local: VsockEndpoint,
-        peer: VsockEndpoint,
+        /// 对端关闭发送方向：本端可读到 EOF。
         send_shutdown: bool,
+        /// 对端关闭接收方向：本端发送应返回 EPIPE。
         recv_shutdown: bool,
     },
     /// 对端复位连接（对应 virtio RST）。
-    Rst {
-        local: VsockEndpoint,
-        peer: VsockEndpoint,
-    },
+    Rst,
     /// 对端更新 credit。
-    CreditUpdate {
-        local: VsockEndpoint,
-        peer: VsockEndpoint,
-    },
+    CreditUpdate,
     /// 对端请求 credit 更新。
-    CreditRequest {
-        local: VsockEndpoint,
-        peer: VsockEndpoint,
-    },
+    CreditRequest,
 }
 
 /// 全局传输后端可用性状态。
@@ -61,10 +51,15 @@ pub enum VsockTransportState {
     Failed,
 }
 
-struct GlobalVsockTransport {
-    backend: Option<Arc<dyn VsockTransport>>,
-    state: VsockTransportState,
-    last_error: Option<SystemError>,
+enum GlobalVsockTransport {
+    Unavailable,
+    Ready {
+        backend: Arc<dyn VsockTransport>,
+    },
+    Failed {
+        backend: Option<Arc<dyn VsockTransport>>,
+        error: SystemError,
+    },
 }
 
 /// 非本地（跨 CID）vsock 流量的传输后端抽象。
@@ -168,25 +163,16 @@ pub trait VsockTransport: Send + Sync {
 
 lazy_static! {
     static ref GLOBAL_VSOCK_TRANSPORT: RwLock<GlobalVsockTransport> =
-        RwLock::new(GlobalVsockTransport {
-            backend: None,
-            state: VsockTransportState::Unavailable,
-            last_error: None,
-        });
+        RwLock::new(GlobalVsockTransport::Unavailable);
 }
+static LOCAL_CID_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
 
 fn ready_backend() -> Result<Arc<dyn VsockTransport>, SystemError> {
     let guard = GLOBAL_VSOCK_TRANSPORT.read();
-    if guard.state != VsockTransportState::Ready {
-        return Err(SystemError::ENODEV);
+    match &*guard {
+        GlobalVsockTransport::Ready { backend } if backend.is_ready() => Ok(backend.clone()),
+        _ => Err(SystemError::ENODEV),
     }
-
-    let backend = guard.backend.as_ref().ok_or(SystemError::ENODEV)?;
-    if !backend.is_ready() {
-        return Err(SystemError::ENODEV);
-    }
-
-    Ok(backend.clone())
 }
 
 #[allow(dead_code)]
@@ -196,9 +182,8 @@ fn ready_backend() -> Result<Arc<dyn VsockTransport>, SystemError> {
 /// - `transport`: 传输后端对象
 pub fn register_transport(transport: Arc<dyn VsockTransport>) {
     let mut guard = GLOBAL_VSOCK_TRANSPORT.write();
-    guard.backend = Some(transport);
-    guard.state = VsockTransportState::Ready;
-    guard.last_error = None;
+    *guard = GlobalVsockTransport::Ready { backend: transport };
+    LOCAL_CID_FALLBACK_LOGGED.store(false, Ordering::Release);
 }
 
 /// 将 transport 状态迁移为 `Failed`。
@@ -208,12 +193,18 @@ pub fn register_transport(transport: Arc<dyn VsockTransport>) {
 /// - `false`: 已处于 `Failed`
 pub fn mark_transport_failed(error: SystemError) -> bool {
     let mut guard = GLOBAL_VSOCK_TRANSPORT.write();
-    if guard.state == VsockTransportState::Failed {
+    if matches!(&*guard, GlobalVsockTransport::Failed { .. }) {
         return false;
     }
 
-    guard.state = VsockTransportState::Failed;
-    guard.last_error = Some(error);
+    let backend = match &*guard {
+        GlobalVsockTransport::Ready { backend } => Some(backend.clone()),
+        GlobalVsockTransport::Unavailable => None,
+        GlobalVsockTransport::Failed { backend, .. } => backend.clone(),
+    };
+
+    *guard = GlobalVsockTransport::Failed { backend, error };
+    LOCAL_CID_FALLBACK_LOGGED.store(false, Ordering::Release);
     true
 }
 
@@ -221,21 +212,27 @@ pub fn mark_transport_failed(error: SystemError) -> bool {
 #[allow(dead_code)]
 pub fn mark_transport_unavailable() {
     let mut guard = GLOBAL_VSOCK_TRANSPORT.write();
-    guard.backend = None;
-    guard.state = VsockTransportState::Unavailable;
-    guard.last_error = None;
+    *guard = GlobalVsockTransport::Unavailable;
+    LOCAL_CID_FALLBACK_LOGGED.store(false, Ordering::Release);
 }
 
 /// 获取当前 transport 状态。
 #[allow(dead_code)]
 pub fn transport_state() -> VsockTransportState {
-    GLOBAL_VSOCK_TRANSPORT.read().state
+    match &*GLOBAL_VSOCK_TRANSPORT.read() {
+        GlobalVsockTransport::Unavailable => VsockTransportState::Unavailable,
+        GlobalVsockTransport::Ready { .. } => VsockTransportState::Ready,
+        GlobalVsockTransport::Failed { .. } => VsockTransportState::Failed,
+    }
 }
 
 /// 获取最近一次 transport 失败错误码（若有）。
 #[allow(dead_code)]
 pub fn transport_last_error() -> Option<SystemError> {
-    GLOBAL_VSOCK_TRANSPORT.read().last_error.clone()
+    match &*GLOBAL_VSOCK_TRANSPORT.read() {
+        GlobalVsockTransport::Failed { error, .. } => Some(error.clone()),
+        _ => None,
+    }
 }
 
 #[allow(dead_code)]
@@ -254,9 +251,19 @@ pub fn transport_ready() -> bool {
 /// - 已注册后端时返回 `transport.local_cid()`
 /// - 未注册时回退到 `VMADDR_CID_LOCAL`
 pub fn transport_local_cid() -> u32 {
-    ready_backend()
-        .map(|transport| transport.local_cid())
-        .unwrap_or(super::addr::VMADDR_CID_LOCAL)
+    if let Ok(transport) = ready_backend() {
+        LOCAL_CID_FALLBACK_LOGGED.store(false, Ordering::Release);
+        return transport.local_cid();
+    }
+
+    if LOCAL_CID_FALLBACK_LOGGED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        log::warn!("vsock: no ready transport, fallback local cid to VMADDR_CID_LOCAL");
+    }
+
+    super::addr::VMADDR_CID_LOCAL
 }
 
 /// 调用传输后端建立远端连接。

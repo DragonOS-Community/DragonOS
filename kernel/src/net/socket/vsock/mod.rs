@@ -39,8 +39,8 @@ pub use transport::{
     VsockTransport, VsockTransportEvent,
 };
 
-const VSOCK_EVENT_WORKER_IDLE_SLEEP: Duration = Duration::from_millis(1);
-const VSOCK_EVENT_WORKER_ERROR_SLEEP: Duration = Duration::from_millis(10);
+// 当前仍是轮询模型。短期将空闲退避提高到 10ms，后续应迁移到中断驱动。
+const VSOCK_EVENT_WORKER_IDLE_SLEEP: Duration = Duration::from_millis(10);
 
 static VSOCK_EVENT_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
 static VSOCK_EVENT_WORKER_SLEEP_QUEUE: WaitQueue = WaitQueue::default();
@@ -84,19 +84,20 @@ fn vsock_event_worker() -> i32 {
                 if mark_transport_failed(SystemError::ENODEV) {
                     stream::handle_transport_fatal_error(SystemError::ENODEV);
                 }
-                // 设备暂不可用时退避，避免空转。
-                vsock_event_worker_sleep(VSOCK_EVENT_WORKER_ERROR_SLEEP);
+                log::warn!("vsock event worker exiting: transport unavailable");
+                break;
             }
             Err(error) => {
                 log::warn!("vsock event worker poll failed: {:?}", error);
                 if mark_transport_failed(error.clone()) {
                     stream::handle_transport_fatal_error(error.clone());
                 }
-                vsock_event_worker_sleep(VSOCK_EVENT_WORKER_ERROR_SLEEP);
+                break;
             }
         }
     }
 
+    VSOCK_EVENT_WORKER_STARTED.store(false, Ordering::Release);
     0
 }
 

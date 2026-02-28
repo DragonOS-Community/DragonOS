@@ -14,14 +14,17 @@ use crate::driver::virtio::virtio_drivers_error_to_system_error;
 use crate::driver::virtio::virtio_impl::HalImpl;
 use crate::libs::mutex::Mutex;
 use crate::net::socket::vsock::addr::VsockEndpoint;
-use crate::net::socket::vsock::transport::{VsockTransport, VsockTransportEvent};
+use crate::net::socket::vsock::transport::{
+    VsockTransport, VsockTransportEvent, VsockTransportEventKind,
+};
 use crate::net::socket::vsock::{ensure_transport_event_worker_started, register_transport};
 
 struct UnsafeVsockManager(VsockConnectionManager<HalImpl, VirtIOTransport>);
 
 // SAFETY: `VsockConnectionManager` 在 `virtio_drivers` 中没有实现 `Send`，
 // 但本驱动保证它只会在 `VirtioVsockTransport::manager` 这把互斥锁保护下访问，
-// 不会发生并发可变访问。
+// 不会发生并发可变访问。且 `Mutex<T>: Sync where T: Send`，因此
+// `Mutex<UnsafeVsockManager>` 可在线程间共享。
 unsafe impl Send for UnsafeVsockManager {}
 
 struct VirtioVsockTransport {
@@ -163,38 +166,75 @@ impl VsockTransport for VirtioVsockTransport {
 
             match event.event_type {
                 VsockEventType::ConnectionRequest => {
-                    events.push(VsockTransportEvent::Request { local, peer });
+                    events.push(VsockTransportEvent {
+                        local,
+                        peer,
+                        kind: VsockTransportEventKind::Request,
+                    });
                 }
                 VsockEventType::Connected => {
-                    events.push(VsockTransportEvent::Response { local, peer });
+                    events.push(VsockTransportEvent {
+                        local,
+                        peer,
+                        kind: VsockTransportEventKind::Response,
+                    });
                 }
                 VsockEventType::Disconnected { reason } => match reason {
                     DisconnectReason::Reset => {
-                        events.push(VsockTransportEvent::Rst { local, peer });
-                    }
-                    DisconnectReason::Shutdown => {
-                        events.push(VsockTransportEvent::Shutdown {
+                        events.push(VsockTransportEvent {
                             local,
                             peer,
-                            send_shutdown: true,
-                            recv_shutdown: true,
+                            kind: VsockTransportEventKind::Rst,
+                        });
+                    }
+                    DisconnectReason::Shutdown => {
+                        events.push(VsockTransportEvent {
+                            local,
+                            peer,
+                            kind: VsockTransportEventKind::Shutdown {
+                                send_shutdown: true,
+                                recv_shutdown: true,
+                            },
                         });
                     }
                 },
                 VsockEventType::Received { length } => {
                     let mut data = vec![0u8; length];
-                    let read_len = manager
+                    match manager
                         .0
                         .recv(Self::endpoint_to_vsock_addr(peer), local.port, &mut data)
-                        .map_err(map_vsock_error)?;
-                    data.truncate(read_len);
-                    events.push(VsockTransportEvent::Rw { local, peer, data });
+                    {
+                        Ok(read_len) => {
+                            data.truncate(read_len);
+                            events.push(VsockTransportEvent {
+                                local,
+                                peer,
+                                kind: VsockTransportEventKind::Rw { data },
+                            });
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                "vsock: recv failed for {:?}->{:?}: {:?}, skipping event",
+                                peer,
+                                local,
+                                map_vsock_error(error)
+                            );
+                        }
+                    }
                 }
                 VsockEventType::CreditRequest => {
-                    events.push(VsockTransportEvent::CreditRequest { local, peer });
+                    events.push(VsockTransportEvent {
+                        local,
+                        peer,
+                        kind: VsockTransportEventKind::CreditRequest,
+                    });
                 }
                 VsockEventType::CreditUpdate => {
-                    events.push(VsockTransportEvent::CreditUpdate { local, peer });
+                    events.push(VsockTransportEvent {
+                        local,
+                        peer,
+                        kind: VsockTransportEventKind::CreditUpdate,
+                    });
                 }
             }
         }
@@ -252,7 +292,7 @@ fn map_vsock_error(error: VirtioError) -> SystemError {
 /// # 行为
 /// - 创建 `VirtIOSocket` 并读取 `guest_cid`
 /// - 注册全局 `VsockTransport` 后端
-/// - 启动一次性 vsock 事件轮询线程
+/// - 启动 vsock 事件轮询线程（若未启动）
 pub fn virtio_vsock(
     transport: VirtIOTransport,
     dev_id: Arc<DeviceId>,

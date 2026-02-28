@@ -26,6 +26,7 @@ use super::space::VsockSpace;
 use super::transport::{
     transport_connect, transport_listen, transport_local_cid, transport_ready, transport_reset,
     transport_send, transport_shutdown, transport_unlisten, VsockTransportEvent,
+    VsockTransportEventKind,
 };
 
 type EP = crate::filesystem::epoll::EPollEventType;
@@ -103,6 +104,33 @@ impl Default for VsockStreamInner {
             pending_error: None,
             remote_writable: true,
             port_ref_held: false,
+        }
+    }
+}
+
+impl VsockStreamInner {
+    #[inline]
+    fn assert_state_invariants(&self) {
+        match self.state {
+            VsockStreamState::Init => {
+                debug_assert!(self.local.is_none());
+                debug_assert!(self.peer.is_none());
+                debug_assert!(self.connection_id.is_none());
+            }
+            VsockStreamState::Bound | VsockStreamState::Listening => {
+                debug_assert!(self.local.is_some());
+                debug_assert!(self.connection_id.is_none());
+            }
+            VsockStreamState::Connecting => {
+                debug_assert!(self.local.is_some());
+                debug_assert!(self.peer.is_some());
+            }
+            VsockStreamState::Connected => {
+                debug_assert!(self.local.is_some());
+                debug_assert!(self.peer.is_some());
+                debug_assert!(self.connection_id.is_some());
+            }
+            VsockStreamState::Closed => {}
         }
     }
 }
@@ -249,11 +277,6 @@ impl VsockStreamSocket {
             return false;
         }
 
-        // 本地回环连接没有远端 credit 限制。
-        if inner.peer_socket.is_some() {
-            return true;
-        }
-
         // 远端连接按 transport 状态 + 最近可写提示进行门控，避免可写假阳性。
         if let (Some(local), Some(peer)) = (inner.local, inner.peer) {
             if peer.cid != local.cid {
@@ -261,17 +284,13 @@ impl VsockStreamSocket {
             }
         }
 
-        true
+        inner.remote_writable
     }
 
     /// 更新远端连接可写提示。
     fn set_remote_writable_hint(&self, writable: bool, notify: bool) {
         let changed = {
             let mut inner = self.inner.lock();
-            if inner.peer_socket.is_some() {
-                return;
-            }
-
             let changed = inner.remote_writable != writable;
             inner.remote_writable = writable;
             changed
@@ -314,13 +333,22 @@ impl VsockStreamSocket {
                 }
             }
 
+            let mut wake_peer_writer = None;
             if !peek {
                 inner.recv_buf.drain(..n);
+                if n > 0 {
+                    wake_peer_writer = inner.peer_socket.as_ref().and_then(|weak| weak.upgrade());
+                }
+            }
+            drop(inner);
+            if let Some(peer) = wake_peer_writer {
+                // 本地回环路径中，接收端消费数据后需唤醒对端可能阻塞的发送者。
+                peer.on_transport_credit_progress();
             }
             return Ok(n);
         }
 
-        if let Some(error) = inner.pending_error.clone() {
+        if let Some(error) = inner.pending_error.take() {
             return Err(error);
         }
 
@@ -341,23 +369,36 @@ impl VsockStreamSocket {
     /// - 成功返回写入字节数
     /// - 若接收方向关闭或 socket 已关闭，返回 `EPIPE`
     fn enqueue_recv_data(&self, buffer: &[u8]) -> Result<usize, SystemError> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+
         let mut inner = self.inner.lock();
         if inner.recv_shutdown || inner.state == VsockStreamState::Closed {
             return Err(SystemError::EPIPE);
         }
 
-        inner.recv_buf.extend(buffer.iter().copied());
+        let available = DEFAULT_RECV_BUF_SIZE.saturating_sub(inner.recv_buf.len());
+        if available == 0 {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+
+        let to_copy = min(buffer.len(), available);
+        inner.recv_buf.extend(buffer[..to_copy].iter().copied());
         drop(inner);
         self.notify_io();
-        Ok(buffer.len())
+        Ok(to_copy)
     }
 
     /// 判断 recv 阻塞等待条件是否满足。
     fn can_recv(&self) -> bool {
         let inner = self.inner.lock();
+        // 故意不检查 recv_shutdown：本端 SHUT_RD 由 try_recv_once 直接返回 EOF，
+        // 不应把 recv_shutdown 本身当作“有数据可读”事件。
         !inner.recv_buf.is_empty()
             || inner.peer_send_shutdown
             || inner.peer_closed
+            || inner.state == VsockStreamState::Closed
             || inner.pending_error.is_some()
     }
 
@@ -365,6 +406,16 @@ impl VsockStreamSocket {
     fn can_accept(&self) -> bool {
         let inner = self.inner.lock();
         inner.state == VsockStreamState::Listening && !inner.pending_accept.is_empty()
+    }
+
+    /// 判断 send 阻塞等待是否应结束（可发送或应立即失败）。
+    fn can_send(&self) -> bool {
+        let inner = self.inner.lock();
+        Self::can_send_locked(&inner)
+            || inner.state != VsockStreamState::Connected
+            || inner.pending_error.is_some()
+            || inner.peer_closed
+            || inner.send_shutdown
     }
 
     /// 判断 connect 阻塞等待条件是否满足。
@@ -395,49 +446,60 @@ impl VsockStreamSocket {
             inner.state = VsockStreamState::Bound;
             inner.peer = None;
             inner.connection_id = None;
+            inner.peer_socket = None;
+            inner.remote_writable = false;
             inner.pending_error = Some(error);
+            inner.assert_state_invariants();
         }
     }
 
-    /// 确保在 connect 前已拥有本地端点。
+    /// 执行 connect 前的状态准备。
+    ///
+    /// # 参数
+    /// - `peer`: 目标对端地址
     ///
     /// # 返回
-    /// - 已绑定时直接返回当前本地端点
-    /// - 未绑定时自动分配临时端口并进入 `Bound`
+    /// - 成功时返回本地端点
     ///
     /// # 行为
     /// - 对不合法状态返回对应错误（如 `EISCONN`/`EALREADY`/`EBADF`）
-    fn ensure_local_bound_for_connect(&self) -> Result<VsockEndpoint, SystemError> {
-        {
-            let inner = self.inner.lock();
-            match inner.state {
-                VsockStreamState::Connected => return Err(SystemError::EISCONN),
-                VsockStreamState::Connecting => return Err(SystemError::EALREADY),
-                VsockStreamState::Listening => return Err(SystemError::EINVAL),
-                VsockStreamState::Closed => return Err(SystemError::EBADF),
-                _ => {}
-            }
-
-            if let Some(local) = inner.local {
-                return Ok(local);
-            }
+    /// - 若尚未绑定，则自动分配临时端口
+    /// - 成功后状态迁移为 `Connecting`
+    fn prepare_connect(&self, peer: VsockEndpoint) -> Result<VsockEndpoint, SystemError> {
+        let mut inner = self.inner.lock();
+        match inner.state {
+            VsockStreamState::Connected => return Err(SystemError::EISCONN),
+            VsockStreamState::Connecting => return Err(SystemError::EALREADY),
+            VsockStreamState::Listening => return Err(SystemError::EINVAL),
+            VsockStreamState::Closed => return Err(SystemError::EBADF),
+            VsockStreamState::Bound | VsockStreamState::Init => {}
         }
 
-        // connect 前按 Linux 语义自动绑定一个临时端口。
-        let local = VsockEndpoint {
-            cid: Self::local_cid(),
-            port: self.space.alloc_ephemeral_port()?,
+        let local = if let Some(local) = inner.local {
+            local
+        } else {
+            let local = VsockEndpoint {
+                cid: Self::local_cid(),
+                port: self.space.alloc_ephemeral_port()?,
+            };
+            inner.local = Some(local);
+            inner.port_ref_held = true;
+            inner.state = VsockStreamState::Bound;
+            local
         };
 
-        let mut inner = self.inner.lock();
-        if inner.state != VsockStreamState::Init {
-            self.space.release_port(local.port);
-            return Err(SystemError::EINVAL);
-        }
-
-        inner.local = Some(local);
-        inner.port_ref_held = true;
-        inner.state = VsockStreamState::Bound;
+        inner.state = VsockStreamState::Connecting;
+        inner.peer = Some(peer);
+        inner.connection_id = None;
+        inner.peer_socket = None;
+        inner.recv_buf.clear();
+        inner.pending_error = None;
+        inner.peer_closed = false;
+        inner.peer_send_shutdown = false;
+        inner.send_shutdown = false;
+        inner.recv_shutdown = false;
+        inner.remote_writable = true;
+        inner.assert_state_invariants();
 
         Ok(local)
     }
@@ -470,6 +532,15 @@ impl VsockStreamSocket {
     fn on_peer_send_shutdown(&self) {
         let mut inner = self.inner.lock();
         inner.peer_send_shutdown = true;
+        drop(inner);
+        self.notify_io();
+    }
+
+    /// 处理“对端接收方向关闭”事件。
+    fn on_peer_recv_shutdown(&self) {
+        let mut inner = self.inner.lock();
+        inner.send_shutdown = true;
+        inner.remote_writable = false;
         drop(inner);
         self.notify_io();
     }
@@ -507,6 +578,94 @@ impl VsockStreamSocket {
         self.set_remote_writable_hint(true, false);
     }
 
+    /// 处理 transport RESPONSE 事件并完成连接状态迁移。
+    fn on_transport_response(&self, peer: VsockEndpoint, connection_id: ConnectionId) -> bool {
+        let updated = {
+            let mut inner = self.inner.lock();
+            if inner.state == VsockStreamState::Connecting {
+                inner.state = VsockStreamState::Connected;
+                inner.peer = Some(peer);
+                inner.connection_id = Some(connection_id);
+                inner.peer_closed = false;
+                inner.peer_send_shutdown = false;
+                inner.pending_error = None;
+                inner.send_shutdown = false;
+                inner.recv_shutdown = false;
+                inner.remote_writable = true;
+                inner.assert_state_invariants();
+                true
+            } else {
+                false
+            }
+        };
+        if updated {
+            self.notify_io();
+        }
+        updated
+    }
+
+    /// 处理 transport DATA 事件。
+    fn on_transport_data(&self, local: VsockEndpoint, peer: VsockEndpoint, data: &[u8]) {
+        self.on_transport_credit_progress_quiet();
+        match self.enqueue_recv_data(data) {
+            Ok(written) => {
+                if written != data.len() {
+                    log::warn!(
+                        "vsock: dropped {} bytes for {:?}->{:?} (recv buffer full)",
+                        data.len() - written,
+                        peer,
+                        local
+                    );
+                }
+            }
+            Err(error) => {
+                log::warn!(
+                    "vsock: dropped {} bytes for {:?}->{:?}: {:?}",
+                    data.len(),
+                    peer,
+                    local,
+                    error
+                );
+            }
+        }
+    }
+
+    /// 处理 transport SHUTDOWN 事件。
+    fn on_transport_shutdown(&self, send_shutdown: bool, recv_shutdown: bool) {
+        if send_shutdown {
+            self.on_peer_send_shutdown();
+        }
+        if recv_shutdown {
+            if send_shutdown {
+                self.on_peer_closed();
+            } else {
+                self.on_peer_recv_shutdown();
+            }
+        }
+    }
+
+    /// 处理连接阶段的 transport RESET 事件。
+    fn on_transport_connect_reset(&self, error: SystemError) -> bool {
+        let updated = {
+            let mut inner = self.inner.lock();
+            if inner.state == VsockStreamState::Connecting {
+                inner.state = VsockStreamState::Bound;
+                inner.peer = None;
+                inner.connection_id = None;
+                inner.peer_socket = None;
+                inner.pending_error = Some(error);
+                inner.assert_state_invariants();
+                true
+            } else {
+                false
+            }
+        };
+        if updated {
+            self.notify_io();
+        }
+        updated
+    }
+
     /// 处理同 CID 的本地连接建立。
     ///
     /// # 参数
@@ -530,11 +689,8 @@ impl VsockStreamSocket {
         self.space.retain_port(peer.port)?;
 
         // 注意方向性：服务端和客户端会登记两条镜像连接键。
-        let server_connection_id = ConnectionId {
-            local: peer,
-            peer: local,
-        };
-        let client_connection_id = ConnectionId { local, peer };
+        let client_connection_id = ConnectionId::new(local, peer);
+        let server_connection_id = client_connection_id.mirror();
 
         {
             let mut accepted_inner = accepted.inner.lock();
@@ -546,6 +702,7 @@ impl VsockStreamSocket {
             accepted_inner.pending_error = None;
             accepted_inner.remote_writable = true;
             accepted_inner.port_ref_held = true;
+            accepted_inner.assert_state_invariants();
         }
 
         {
@@ -560,6 +717,7 @@ impl VsockStreamSocket {
             client_inner.recv_shutdown = false;
             client_inner.pending_error = None;
             client_inner.remote_writable = true;
+            client_inner.assert_state_invariants();
         }
 
         self.space
@@ -578,6 +736,7 @@ impl VsockStreamSocket {
                 client_inner.peer = None;
                 client_inner.peer_socket = None;
                 client_inner.connection_id = None;
+                client_inner.assert_state_invariants();
             }
             return Err(error);
         }
@@ -598,6 +757,71 @@ impl VsockStreamSocket {
     fn connect_remote(&self, local: VsockEndpoint, peer: VsockEndpoint) -> Result<(), SystemError> {
         // 远端路径完全交由 transport 后端处理。
         transport_connect(local, peer)
+    }
+
+    /// 尝试执行一次发送。
+    fn try_send_once(&self, buffer: &[u8]) -> Result<usize, SystemError> {
+        let (local, peer, peer_socket) = {
+            let mut inner = self.inner.lock();
+            if inner.state != VsockStreamState::Connected {
+                return Err(SystemError::ENOTCONN);
+            }
+            if let Some(error) = inner.pending_error.take() {
+                return Err(error);
+            }
+            if inner.peer_closed {
+                return Err(SystemError::EPIPE);
+            }
+            if inner.send_shutdown {
+                return Err(SystemError::EPIPE);
+            }
+            (
+                inner.local.ok_or(SystemError::ENOTCONN)?,
+                inner.peer.ok_or(SystemError::ENOTCONN)?,
+                inner.peer_socket.clone(),
+            )
+        };
+
+        // 本地回环快路径：直接写对端 recv 缓冲区。
+        if let Some(peer_socket) = peer_socket {
+            if let Some(peer_socket) = peer_socket.upgrade() {
+                return match peer_socket.enqueue_recv_data(buffer) {
+                    Ok(written) => {
+                        self.set_remote_writable_hint(written == buffer.len(), false);
+                        Ok(written)
+                    }
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                        self.set_remote_writable_hint(false, false);
+                        Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+                    }
+                    Err(error) => Err(error),
+                };
+            }
+
+            self.on_peer_closed();
+            return Err(SystemError::EPIPE);
+        }
+
+        // 远端路径：委托 transport。
+        match transport_send(local, peer, buffer) {
+            Ok(n) => {
+                self.set_remote_writable_hint(true, false);
+                Ok(n)
+            }
+            Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                self.set_remote_writable_hint(false, false);
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+            }
+            Err(SystemError::ECONNRESET) => {
+                self.on_peer_reset(SystemError::ECONNRESET);
+                Err(SystemError::ECONNRESET)
+            }
+            Err(SystemError::ENODEV) => {
+                self.on_peer_reset(SystemError::ENODEV);
+                Err(SystemError::ENODEV)
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -719,24 +943,23 @@ impl Socket for VsockStreamSocket {
             return Err(SystemError::EAFNOSUPPORT);
         };
 
+        let mut inner = self.inner.lock();
+        if inner.state != VsockStreamState::Init || inner.local.is_some() {
+            return Err(SystemError::EINVAL);
+        }
+
         let mut endpoint = Self::normalize_bind_endpoint(endpoint)?;
-        let port = if endpoint.port == VMADDR_PORT_ANY {
+        endpoint.port = if endpoint.port == VMADDR_PORT_ANY {
             self.space.alloc_ephemeral_port()?
         } else {
             self.space.reserve_port(endpoint.port)?;
             endpoint.port
         };
-        endpoint.port = port;
-
-        let mut inner = self.inner.lock();
-        if inner.state != VsockStreamState::Init || inner.local.is_some() {
-            self.space.release_port(port);
-            return Err(SystemError::EINVAL);
-        }
 
         inner.local = Some(endpoint);
         inner.port_ref_held = true;
         inner.state = VsockStreamState::Bound;
+        inner.assert_state_invariants();
         Ok(())
     }
 
@@ -796,7 +1019,9 @@ impl Socket for VsockStreamSocket {
             self.space.unregister_connecting(local);
             if was_listener {
                 self.space.unregister_listener(local);
-                let _ = transport_unlisten(local);
+                if let Err(error) = transport_unlisten(local) {
+                    log::warn!("vsock close: failed to unlisten {:?}: {:?}", local, error);
+                }
             }
             if release_port {
                 self.space.release_port(local.port);
@@ -812,13 +1037,33 @@ impl Socket for VsockStreamSocket {
                 match close_state {
                     // 连接尚未完成时主动发送 RST，避免对端半连接残留。
                     VsockStreamState::Connecting => {
-                        let _ = transport_reset(local, peer);
+                        if let Err(error) = transport_reset(local, peer) {
+                            log::warn!(
+                                "vsock close: failed to reset connecting {:?}->{:?}: {:?}",
+                                local,
+                                peer,
+                                error
+                            );
+                        }
                     }
                     // 已连接远端 close：优先 SHUTDOWN，失败时回退 RST。
                     VsockStreamState::Connected if !peer_was_closed => {
                         if let Err(error) = transport_shutdown(local, peer, true, true) {
                             if error != SystemError::ENODEV {
-                                let _ = transport_reset(local, peer);
+                                log::warn!(
+                                    "vsock close: shutdown failed for {:?}->{:?}: {:?}, try reset",
+                                    local,
+                                    peer,
+                                    error
+                                );
+                                if let Err(reset_error) = transport_reset(local, peer) {
+                                    log::warn!(
+                                        "vsock close: reset fallback failed for {:?}->{:?}: {:?}",
+                                        local,
+                                        peer,
+                                        reset_error
+                                    );
+                                }
                             }
                         }
                     }
@@ -829,7 +1074,9 @@ impl Socket for VsockStreamSocket {
 
         // 监听 socket 关闭时，尚未被 accept 的子连接需要一起关闭。
         for pending in pending_accept {
-            let _ = pending.do_close();
+            if let Err(error) = pending.do_close() {
+                log::warn!("vsock close: pending child close failed: {:?}", error);
+            }
         }
 
         // 通知本地对端连接已关闭，触发其 EOF/HUP 可见性。
@@ -861,23 +1108,7 @@ impl Socket for VsockStreamSocket {
         }
 
         let peer = Self::normalize_connect_peer(endpoint)?;
-        let local = self.ensure_local_bound_for_connect()?;
-        {
-            let mut inner = self.inner.lock();
-            if inner.state == VsockStreamState::Connected {
-                return Err(SystemError::EISCONN);
-            }
-            if inner.state == VsockStreamState::Connecting {
-                return Err(SystemError::EALREADY);
-            }
-            if inner.state != VsockStreamState::Bound {
-                return Err(SystemError::EINVAL);
-            }
-            inner.state = VsockStreamState::Connecting;
-            inner.peer = Some(peer);
-            inner.pending_error = None;
-            inner.remote_writable = true;
-        }
+        let local = self.prepare_connect(peer)?;
 
         // 同 CID 本地直连仍是同步完成路径。
         if peer.cid == Self::local_cid() {
@@ -968,30 +1199,37 @@ impl Socket for VsockStreamSocket {
     /// - 会在 `VsockSpace` 中注册监听者
     fn listen(&self, backlog: usize) -> Result<(), SystemError> {
         let effective_backlog = backlog.clamp(1, SOMAXCONN);
-        let local = {
-            let inner = self.inner.lock();
+        let (local, previous_state) = {
+            let mut inner = self.inner.lock();
             if inner.state != VsockStreamState::Bound && inner.state != VsockStreamState::Listening
             {
                 return Err(SystemError::EINVAL);
             }
-            inner.local.ok_or(SystemError::EINVAL)?
+            let local = inner.local.ok_or(SystemError::EINVAL)?;
+            self.space.register_listener(local, self.self_ref.clone())?;
+            let previous_state = inner.state;
+            inner.backlog = effective_backlog;
+            inner.state = VsockStreamState::Listening;
+            inner.assert_state_invariants();
+            (local, previous_state)
         };
-
-        self.space.register_listener(local, self.self_ref.clone())?;
-
-        let mut inner = self.inner.lock();
-        if inner.state != VsockStreamState::Bound && inner.state != VsockStreamState::Listening {
-            return Err(SystemError::EINVAL);
-        }
-
-        inner.backlog = effective_backlog;
-        inner.state = VsockStreamState::Listening;
 
         // 远端连接请求由 transport 层驱动，监听端口需要同步到后端。
         if let Err(error) = transport_listen(local) {
             if error != SystemError::ENODEV {
+                if previous_state == VsockStreamState::Bound {
+                    self.space.unregister_listener(local);
+                    let mut inner = self.inner.lock();
+                    if inner.state == VsockStreamState::Listening && inner.local == Some(local) {
+                        inner.state = VsockStreamState::Bound;
+                        inner.assert_state_invariants();
+                    }
+                }
                 return Err(error);
             }
+            log::warn!(
+                "vsock listen: no transport backend, only local connections will be accepted"
+            );
         }
         Ok(())
     }
@@ -1040,7 +1278,7 @@ impl Socket for VsockStreamSocket {
         flags: PMSG,
     ) -> Result<usize, SystemError> {
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
-        let total = iovs.total_len();
+        let total = min(iovs.total_len(), DEFAULT_RECV_BUF_SIZE);
         let mut tmp = vec![0u8; total];
         let n = self.recv(&mut tmp, flags)?;
         let written = iovs.scatter(&tmp[..n])?;
@@ -1058,52 +1296,15 @@ impl Socket for VsockStreamSocket {
     /// - 本地回环连接优先走内核内直投路径
     /// - 远端连接走 transport 后端发送
     /// - 未连接返回 `ENOTCONN`，发送方向关闭返回 `EPIPE`
-    fn send(&self, buffer: &[u8], _flags: PMSG) -> Result<usize, SystemError> {
-        let (local, peer, peer_socket) = {
-            let inner = self.inner.lock();
-            if inner.state != VsockStreamState::Connected {
-                return Err(SystemError::ENOTCONN);
+    fn send(&self, buffer: &[u8], flags: PMSG) -> Result<usize, SystemError> {
+        let nonblock = self.is_nonblock() || flags.contains(PMSG::DONTWAIT);
+        loop {
+            match self.try_send_once(buffer) {
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if !nonblock => {
+                    wq_wait_event_interruptible!(self.wait_queue, self.can_send(), {})?;
+                }
+                result => return result,
             }
-            if let Some(error) = inner.pending_error.clone() {
-                return Err(error);
-            }
-            if inner.peer_closed {
-                return Err(SystemError::EPIPE);
-            }
-            if inner.send_shutdown {
-                return Err(SystemError::EPIPE);
-            }
-            (
-                inner.local.ok_or(SystemError::ENOTCONN)?,
-                inner.peer.ok_or(SystemError::ENOTCONN)?,
-                inner.peer_socket.clone(),
-            )
-        };
-
-        // 本地回环快路径：直接写对端 recv 缓冲区。
-        if let Some(peer_socket) = peer_socket.and_then(|weak| weak.upgrade()) {
-            return peer_socket.enqueue_recv_data(buffer);
-        }
-
-        // 远端路径：委托 transport。
-        match transport_send(local, peer, buffer) {
-            Ok(n) => {
-                self.set_remote_writable_hint(true, false);
-                Ok(n)
-            }
-            Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                self.set_remote_writable_hint(false, false);
-                Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
-            }
-            Err(SystemError::ECONNRESET) => {
-                self.on_peer_reset(SystemError::ECONNRESET);
-                Err(SystemError::ECONNRESET)
-            }
-            Err(SystemError::ENODEV) => {
-                self.on_peer_reset(SystemError::ENODEV);
-                Err(SystemError::ENODEV)
-            }
-            Err(error) => Err(error),
         }
     }
 
@@ -1134,7 +1335,7 @@ impl Socket for VsockStreamSocket {
     /// - 远端连接会尝试通知 transport
     /// - 监听 socket 调用时按 Linux 语义直接成功返回
     fn shutdown(&self, how: ShutdownBit) -> Result<(), SystemError> {
-        let (local, peer, peer_socket, notify_peer_send_shutdown) = {
+        let (local, peer, peer_socket, notify_peer_send_shutdown, notify_peer_recv_shutdown) = {
             let mut inner = self.inner.lock();
             match inner.state {
                 VsockStreamState::Connected | VsockStreamState::Closed => {}
@@ -1155,13 +1356,17 @@ impl Socket for VsockStreamSocket {
                 inner.peer,
                 inner.peer_socket.clone(),
                 how.is_send_shutdown(),
+                how.is_recv_shutdown(),
             )
         };
 
-        // 本地对端：发送方向关闭需传播为对端可见 EOF 语义。
-        if notify_peer_send_shutdown {
-            if let Some(peer_socket) = peer_socket.and_then(|weak| weak.upgrade()) {
+        if let Some(peer_socket) = peer_socket.and_then(|weak| weak.upgrade()) {
+            // 本地对端：发送方向关闭需传播为对端可见 EOF 语义。
+            if notify_peer_send_shutdown {
                 peer_socket.on_peer_send_shutdown();
+            }
+            if notify_peer_recv_shutdown {
+                peer_socket.on_peer_recv_shutdown();
             }
         }
 
@@ -1229,11 +1434,11 @@ impl Socket for VsockStreamSocket {
     /// - `_val`: 输入值
     ///
     /// # 行为
-    /// - `PSOL::VSOCK` 当前按“已处理”返回成功
+    /// - `PSOL::VSOCK` 当前返回 `ENOPROTOOPT`
     /// - 其他层级返回 `ENOSYS`
     fn set_option(&self, level: PSOL, _name: usize, _val: &[u8]) -> Result<(), SystemError> {
         if level == PSOL::VSOCK {
-            return Ok(());
+            return Err(SystemError::ENOPROTOOPT);
         }
 
         Err(SystemError::ENOSYS)
@@ -1282,7 +1487,7 @@ fn handle_transport_request_event(local: VsockEndpoint, peer: VsockEndpoint) {
         return;
     }
 
-    let connection_id = ConnectionId { local, peer };
+    let connection_id = ConnectionId::new(local, peer);
     {
         let mut child_inner = child.inner.lock();
         child_inner.state = VsockStreamState::Connected;
@@ -1292,6 +1497,7 @@ fn handle_transport_request_event(local: VsockEndpoint, peer: VsockEndpoint) {
         child_inner.pending_error = None;
         child_inner.remote_writable = true;
         child_inner.port_ref_held = true;
+        child_inner.assert_state_invariants();
     }
     space.register_connected(connection_id, Arc::downgrade(&child));
 
@@ -1319,7 +1525,7 @@ fn handle_transport_request_event(local: VsockEndpoint, peer: VsockEndpoint) {
 /// - 更新全局连接表并触发 I/O 唤醒
 fn handle_transport_response_event(local: VsockEndpoint, peer: VsockEndpoint) {
     let space = global_vsock_space();
-    let connection_id = ConnectionId { local, peer };
+    let connection_id = ConnectionId::new(local, peer);
     if let Some(socket) = space.find_connected(connection_id) {
         socket.on_transport_credit_progress_quiet();
         socket.notify_io();
@@ -1327,25 +1533,26 @@ fn handle_transport_response_event(local: VsockEndpoint, peer: VsockEndpoint) {
     }
 
     if let Some(socket) = space.find_connecting(local) {
-        {
-            let mut inner = socket.inner.lock();
-            if inner.state == VsockStreamState::Connecting {
-                inner.state = VsockStreamState::Connected;
-                inner.peer = Some(peer);
-                inner.connection_id = Some(connection_id);
-                inner.peer_closed = false;
-                inner.peer_send_shutdown = false;
-                inner.pending_error = None;
-                inner.send_shutdown = false;
-                inner.recv_shutdown = false;
-                inner.remote_writable = true;
-            } else {
-                return;
-            }
+        if !socket.on_transport_response(peer, connection_id) {
+            return;
         }
         space.unregister_connecting(local);
         space.register_connected(connection_id, Arc::downgrade(&socket));
-        socket.notify_io();
+        return;
+    }
+
+    log::warn!(
+        "vsock: received orphan response for {:?}->{:?}, reset peer",
+        peer,
+        local
+    );
+    if let Err(error) = transport_reset(local, peer) {
+        log::warn!(
+            "vsock: failed to reset orphan response {:?}->{:?}: {:?}",
+            peer,
+            local,
+            error
+        );
     }
 }
 
@@ -1360,10 +1567,19 @@ fn handle_transport_response_event(local: VsockEndpoint, peer: VsockEndpoint) {
 /// - 将数据写入对应连接的接收缓冲区
 fn handle_transport_data_event(local: VsockEndpoint, peer: VsockEndpoint, data: Vec<u8>) {
     let space = global_vsock_space();
-    let connection_id = ConnectionId { local, peer };
-    if let Some(socket) = space.find_connected(connection_id) {
-        socket.on_transport_credit_progress_quiet();
-        let _ = socket.enqueue_recv_data(&data);
+    let connection_id = ConnectionId::new(local, peer);
+    match space.find_connected(connection_id) {
+        Some(socket) => {
+            socket.on_transport_data(local, peer, &data);
+        }
+        None => {
+            log::warn!(
+                "vsock: received {} bytes for unknown connection {:?}->{:?}, dropped",
+                data.len(),
+                peer,
+                local
+            );
+        }
     }
 }
 
@@ -1384,14 +1600,9 @@ fn handle_transport_shutdown_event(
     recv_shutdown: bool,
 ) {
     let space = global_vsock_space();
-    let connection_id = ConnectionId { local, peer };
+    let connection_id = ConnectionId::new(local, peer);
     if let Some(socket) = space.find_connected(connection_id) {
-        if send_shutdown {
-            socket.on_peer_send_shutdown();
-        }
-        if recv_shutdown {
-            socket.on_peer_closed();
-        }
+        socket.on_transport_shutdown(send_shutdown, recv_shutdown);
     }
 }
 
@@ -1406,7 +1617,7 @@ fn handle_transport_shutdown_event(
 /// - 若为连接中套接字，回滚到 `Bound`
 fn handle_transport_reset_event(local: VsockEndpoint, peer: VsockEndpoint) {
     let space = global_vsock_space();
-    let connection_id = ConnectionId { local, peer };
+    let connection_id = ConnectionId::new(local, peer);
     if let Some(socket) = space.find_connected(connection_id) {
         space.unregister_connected(connection_id);
         socket.on_peer_reset(SystemError::ECONNRESET);
@@ -1414,23 +1625,16 @@ fn handle_transport_reset_event(local: VsockEndpoint, peer: VsockEndpoint) {
     }
 
     if let Some(socket) = space.find_connecting(local) {
-        {
-            let mut inner = socket.inner.lock();
-            if inner.state == VsockStreamState::Connecting {
-                inner.state = VsockStreamState::Bound;
-                inner.peer = None;
-                inner.connection_id = None;
-                inner.pending_error = Some(SystemError::ECONNRESET);
-            }
+        if socket.on_transport_connect_reset(SystemError::ECONNRESET) {
+            space.unregister_connecting(local);
         }
-        space.unregister_connecting(local);
-        socket.notify_io();
     }
 }
 
+/// 处理 transport 层上报的 credit 更新事件。
 fn handle_transport_credit_event(local: VsockEndpoint, peer: VsockEndpoint) {
     let space = global_vsock_space();
-    let connection_id = ConnectionId { local, peer };
+    let connection_id = ConnectionId::new(local, peer);
     if let Some(socket) = space.find_connected(connection_id) {
         socket.on_transport_credit_progress();
     }
@@ -1446,29 +1650,28 @@ fn handle_transport_credit_event(local: VsockEndpoint, peer: VsockEndpoint) {
 /// - `CreditRequest/CreditUpdate` 会推进发送可写状态并唤醒等待者
 pub(super) fn dispatch_transport_events(events: Vec<VsockTransportEvent>) {
     for event in events {
-        match event {
-            VsockTransportEvent::Request { local, peer } => {
+        let local = event.local;
+        let peer = event.peer;
+        match event.kind {
+            VsockTransportEventKind::Request => {
                 handle_transport_request_event(local, peer);
             }
-            VsockTransportEvent::Response { local, peer } => {
+            VsockTransportEventKind::Response => {
                 handle_transport_response_event(local, peer);
             }
-            VsockTransportEvent::Rw { local, peer, data } => {
+            VsockTransportEventKind::Rw { data } => {
                 handle_transport_data_event(local, peer, data);
             }
-            VsockTransportEvent::Shutdown {
-                local,
-                peer,
+            VsockTransportEventKind::Shutdown {
                 send_shutdown,
                 recv_shutdown,
             } => {
                 handle_transport_shutdown_event(local, peer, send_shutdown, recv_shutdown);
             }
-            VsockTransportEvent::Rst { local, peer } => {
+            VsockTransportEventKind::Rst => {
                 handle_transport_reset_event(local, peer);
             }
-            VsockTransportEvent::CreditUpdate { local, peer }
-            | VsockTransportEvent::CreditRequest { local, peer } => {
+            VsockTransportEventKind::CreditUpdate | VsockTransportEventKind::CreditRequest => {
                 // 对端 credit 变化可能使 send 从 EAGAIN 恢复为可写，需要唤醒 poll/epoll。
                 handle_transport_credit_event(local, peer);
             }
@@ -1495,8 +1698,10 @@ pub(super) fn handle_transport_fatal_error(error: SystemError) {
                 inner.state = VsockStreamState::Bound;
                 inner.peer = None;
                 inner.connection_id = None;
+                inner.peer_socket = None;
                 inner.pending_error = Some(error.clone());
                 inner.remote_writable = false;
+                inner.assert_state_invariants();
             }
         }
         socket.notify_io();

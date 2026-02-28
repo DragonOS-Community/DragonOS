@@ -28,6 +28,21 @@ pub struct ConnectionId {
     pub peer: VsockEndpoint,
 }
 
+impl ConnectionId {
+    /// 构造一个有方向的连接键。
+    pub const fn new(local: VsockEndpoint, peer: VsockEndpoint) -> Self {
+        Self { local, peer }
+    }
+
+    /// 返回镜像方向的连接键。
+    pub const fn mirror(&self) -> Self {
+        Self {
+            local: self.peer,
+            peer: self.local,
+        }
+    }
+}
+
 /// 虚拟机监控器（Hypervisor）保留 CID。
 #[allow(dead_code)]
 pub const VMADDR_CID_HYPERVISOR: u32 = 0;

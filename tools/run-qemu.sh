@@ -155,7 +155,7 @@ QEMU_VSOCK_DEVICE_MODEL="vhost-vsock-pci-non-transitional"
 # GDB调试支持：
 # - QEMU_GDB_WAIT=1: QEMU 启动后立即暂停CPU（等同 -S），等待 GDB/monitor 手动继续
 # - QEMU_GDB_WAIT=0: 默认不暂停
-QEMU_GDB_WAIT=1
+QEMU_GDB_WAIT=0
 
 if [ -f "${QEMU_EXT4_DISK_IMAGE}" ]; then
   QEMU_DRIVE_ARGS+=(-drive "id=ext4disk,file=${QEMU_EXT4_DISK_IMAGE},if=none,format=raw")

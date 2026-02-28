@@ -116,8 +116,13 @@ impl VsockSpace {
 
         let mut guard = self.inner.lock();
         // 共享持有端口，例如 accept 子连接继承监听端口。
-        *guard.port_refs.entry(port).or_insert(0) += 1;
-        Ok(())
+        match guard.port_refs.get_mut(&port) {
+            Some(ref_count) => {
+                *ref_count += 1;
+                Ok(())
+            }
+            None => Err(SystemError::EINVAL),
+        }
     }
 
     /// 释放一次端口引用计数。

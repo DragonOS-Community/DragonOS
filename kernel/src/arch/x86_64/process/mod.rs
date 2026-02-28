@@ -234,6 +234,16 @@ impl ArchPCBInfo {
         self.gsbase
     }
 
+    /// 获取 FS 段选择器的值
+    pub fn fs(&self) -> u16 {
+        self.fs.bits()
+    }
+
+    /// 获取 GS 段选择器的值
+    pub fn gs(&self) -> u16 {
+        self.gs.bits()
+    }
+
     pub fn cr2_mut(&mut self) -> &mut usize {
         &mut self.cr2
     }

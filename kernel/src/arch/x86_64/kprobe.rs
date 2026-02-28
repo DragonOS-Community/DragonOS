@@ -63,3 +63,41 @@ impl From<&TrapFrame> for KProbeContext {
         }
     }
 }
+
+const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
+
+/// 获取当前架构标识
+pub fn syscall_get_arch() -> u32 {
+    AUDIT_ARCH_X86_64
+}
+
+/// 从 KProbeContext 获取指令指针 (rip)
+pub fn instruction_pointer(ctx: &KProbeContext) -> u64 {
+    ctx.rip
+}
+
+/// 从 KProbeContext 获取用户栈指针 (rsp)
+pub fn user_stack_pointer(ctx: &KProbeContext) -> u64 {
+    ctx.rsp
+}
+
+/// 从 KProbeContext 获取系统调用号 (rax)
+pub fn syscall_get_nr(ctx: &KProbeContext) -> u64 {
+    ctx.rax
+}
+
+/// 从 KProbeContext 获取系统调用返回值 (rax)
+pub fn syscall_get_return_value(ctx: &KProbeContext) -> i64 {
+    ctx.rax as i64
+}
+
+/// 从 KProbeContext 获取系统调用的前 6 个参数
+/// (遵循 x86_64 System V ABI)
+pub fn syscall_get_arguments(ctx: &KProbeContext, args: &mut [u64; 6]) {
+    args[0] = ctx.rdi;
+    args[1] = ctx.rsi;
+    args[2] = ctx.rdx;
+    args[3] = ctx.r10;
+    args[4] = ctx.r8;
+    args[5] = ctx.r9;
+}

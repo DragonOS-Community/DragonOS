@@ -10,8 +10,9 @@ use system_error::SystemError;
 
 use crate::{
     arch::ipc::signal::{SigSet, Signal},
+    ipc::kill::send_signal_to_pcb,
     ipc::signal_types::{
-        SigCode, SigInfo, SigType, SigactionType, SignalFlags, SIG_KERNEL_IGNORE_MASK,
+        OriginCode, SigCode, SigInfo, SigType, SigactionType, SignalFlags, SIG_KERNEL_IGNORE_MASK,
         SIG_KERNEL_ONLY_MASK, SIG_KERNEL_STOP_MASK,
     },
     libs::rwlock::RwLockWriteGuard,
@@ -37,7 +38,7 @@ pub fn send_kernel_signal_to_current(sig: Signal) -> Result<(), SystemError> {
     let mut info = SigInfo::new(
         sig,
         0,
-        SigCode::Kernel,
+        SigCode::Origin(OriginCode::Kernel),
         SigType::Kill {
             pid: RawPid::new(0),
             uid: 0,
@@ -162,13 +163,13 @@ impl Signal {
         // signal的信息为空
 
         if let Some(ref siginfo) = info {
-            force_send = matches!(siginfo.sig_code(), SigCode::Kernel);
+            force_send = matches!(siginfo.sig_code(), SigCode::Origin(OriginCode::Kernel));
         } else {
             // todo: 判断signal是否来自于一个祖先进程的namespace，如果是，则强制发送信号
             //详见 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/signal.c?r=&mo=32170&fi=1220#1226
         }
 
-        let prepare_result = self.prepare_sianal(pcb.clone(), force_send);
+        let prepare_result = self.prepare_signal(pcb.clone(), force_send);
         if !prepare_result {
             return Ok(0);
         }
@@ -207,7 +208,7 @@ impl Signal {
                     SigInfo::new(
                         *self,
                         0,
-                        SigCode::User,
+                        SigCode::Origin(OriginCode::User),
                         SigType::Kill {
                             pid: sender_pid,
                             uid: sender_uid,
@@ -285,9 +286,6 @@ impl Signal {
         // ===== 寻找需要wakeup的目标进程 =====
         // 备注：由于当前没有进程组的概念，每个进程只有1个对应的线程，因此不需要通知进程组内的每个进程。
         //      todo: 当引入进程组的概念后，需要完善这里，使得它能寻找一个目标进程来唤醒，接着执行信号处理的操作。
-
-        // let _signal = pcb.sig_struct();
-
         let target_pcb: Option<Arc<ProcessControlBlock>>;
 
         // 根据信号类型选择添加到线程级 pending 还是进程级 shared_pending
@@ -313,7 +311,19 @@ impl Signal {
         crate::ipc::signalfd::notify_signalfd_for_pcb(&pcb, *self);
         // 判断目标进程是否应该被唤醒以立即处理该信号
         let wants_signal = self.wants_signal(pcb.clone());
-        if wants_signal {
+
+        // 对于被 ptrace 的进程，如果收到 SIGSTOP 信号，需要特殊处理
+        let is_ptrace_sigstop =
+            pcb.flags().contains(ProcessFlags::PTRACED) && *self == Signal::SIGSTOP;
+
+        let should_wake = if is_ptrace_sigstop {
+            // 对于 ptrace 进程的 SIGSTOP，总是需要唤醒
+            true
+        } else {
+            wants_signal
+        };
+
+        if should_wake {
             target_pcb = Some(pcb.clone());
         } else if pt == PidType::PID {
             /*
@@ -447,10 +457,10 @@ impl Signal {
         }
         drop(sig_info);
 
-        // TODO: ptrace 拦截被忽略的信号
-        // if pcb.flags().contains(ProcessFlags::PTRACED) && *self != Signal::SIGKILL {
-        //     return false;
-        // }
+        // ptrace 拦截被忽略的信号
+        if pcb.flags().contains(ProcessFlags::PTRACED) && *self != Signal::SIGKILL {
+            return false;
+        }
 
         Self::sig_task_ignored(self, pcb, force)
     }
@@ -468,7 +478,7 @@ impl Signal {
     /// - `true` 能够发送信号
     ///
     /// - `false` 不能发送信号
-    fn prepare_sianal(&self, pcb: Arc<ProcessControlBlock>, _force: bool) -> bool {
+    fn prepare_signal(&self, pcb: Arc<ProcessControlBlock>, _force: bool) -> bool {
         // 统一从线程组组长的 ThreadInfo 中获取完整线程列表。
         // 注意：当前 sighand 共享在 CLONE_THREAD 线程组内，因此标志位操作仍然只需要对共享 sighand 做一次。
         let thread_group_leader = {
@@ -498,6 +508,20 @@ impl Signal {
         let flush: SigSet;
         if !(self.into_sigset() & SIG_KERNEL_STOP_MASK).is_empty() {
             flush = Signal::SIGCONT.into_sigset();
+
+            // 对于 ptrace 进程，SIGSTOP 应该在 do_signal 中由 ptrace_signal 处理
+            if pcb.flags().contains(ProcessFlags::PTRACED) {
+                // 只清理 SIGCONT，不执行停止操作
+                thread_group_leader
+                    .sighand()
+                    .shared_pending_flush_by_mask(&flush);
+                for_each_thread_in_group(&mut |t| {
+                    t.sig_info_mut().sig_pending_mut().flush_by_mask(&flush);
+                });
+                return !self.sig_ignored(&pcb, _force);
+            }
+
+            // 非ptrace进程的正常SIGSTOP处理：立即停止并通知父进程
             // Stop 类信号：清理 SIGCONT（共享 + 各线程私有 pending）
             thread_group_leader
                 .sighand()
@@ -516,12 +540,15 @@ impl Signal {
 
             // 线程组 stop：对组内所有线程置为 Stopped，保证 SIGSTOP 对整个线程组生效。
             for_each_thread_in_group(&mut |t| {
-                let _ = ProcessManager::stop_task(t);
+                let _ = ProcessManager::stop_task(t, *self);
             });
 
             if let Some(parent) = pcb.parent_pcb() {
-                let _ = crate::ipc::kill::send_signal_to_pcb(parent.clone(), Signal::SIGCHLD);
+                let _ = send_signal_to_pcb(parent.clone(), Signal::SIGCHLD);
                 parent.wake_all_waiters();
+            } else if let Some(real_parent) = pcb.real_parent_pcb() {
+                let _ = send_signal_to_pcb(real_parent.clone(), Signal::SIGCHLD);
+                real_parent.wake_all_waiters();
             }
             // 唤醒等待在该子进程/线程上的等待者
             thread_group_leader.wake_all_waiters();
@@ -530,7 +557,7 @@ impl Signal {
             });
 
             // SIGSTOP 是 kernel-only stop 信号：其效果是把线程组置为 stopped 并通知父进程，
-            // 不应作为“可传递到用户态”的 pending 信号继续入队。
+            // 不应作为"可传递到用户态"的 pending 信号继续入队。
             // 否则在 SIGCONT 后可能错误地以 EINTR/ERESTART* 形式打断正在执行的系统调用（gVisor sigstop_test 即依赖这一点）。
             if *self == Signal::SIGSTOP {
                 return false;
@@ -574,8 +601,11 @@ impl Signal {
                     .sighand()
                     .flags_remove(SignalFlags::STOP_STOPPED);
                 if let Some(parent) = pcb.parent_pcb() {
-                    let _ = crate::ipc::kill::send_signal_to_pcb(parent.clone(), Signal::SIGCHLD);
+                    let _ = send_signal_to_pcb(parent.clone(), Signal::SIGCHLD);
                     parent.wake_all_waiters();
+                } else if let Some(real_parent) = pcb.real_parent_pcb() {
+                    let _ = send_signal_to_pcb(real_parent.clone(), Signal::SIGCHLD);
+                    real_parent.wake_all_waiters();
                 }
                 // 唤醒等待在该子进程上的等待者
                 thread_group_leader.wake_all_waiters();
@@ -602,7 +632,7 @@ impl Signal {
 /// - `_guard` 信号结构体锁守卫，来保证信号结构体已上锁
 /// - `fatal` 表明这个信号是不是致命的(会导致进程退出)
 #[inline]
-fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
+pub fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
     // 如果是 fatal 的话就唤醒 stop 和 block 的进程来响应，因为唤醒后就会终止
     // 如果不是 fatal 的就只唤醒 stop 的进程来响应
     // debug!("signal_wake_up");

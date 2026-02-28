@@ -6,6 +6,7 @@ use core::ffi::c_int;
 use crate::arch::interrupt::TrapFrame;
 use crate::process::cred::CAPFlags;
 use crate::process::pid::Pid;
+use crate::process::pid::PidType;
 use crate::process::ProcessControlBlock;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
@@ -93,7 +94,7 @@ impl PidConverter {
 /// - SIGCONT can be sent to any process in the same session
 ///
 /// 参考: https://man7.org/linux/man-pages/man2/kill.2.html
-pub fn check_signal_permission_pcb_with_sig(
+pub fn check_kill_permission(
     target: &Arc<ProcessControlBlock>,
     sig: Option<Signal>,
 ) -> Result<(), SystemError> {
@@ -111,11 +112,12 @@ pub fn check_signal_permission_pcb_with_sig(
         return Ok(());
     }
 
+    // 凭证检查 (kill_ok_by_cred)
     // Check if sender's UID matches target's UID or saved UID
-    if current_cred.euid == target_cred.uid
-        || current_cred.euid == target_cred.suid
-        || current_cred.uid == target_cred.uid
+    if current_cred.euid == target_cred.suid
+        || current_cred.euid == target_cred.uid
         || current_cred.uid == target_cred.suid
+        || current_cred.uid == target_cred.uid
     {
         return Ok(());
     }
@@ -141,7 +143,7 @@ pub fn check_signal_permission_pcb_with_sig(
 /// Check if the current process has permission to send a signal to the target process.
 /// (不带信号参数的兼容版本)
 pub fn check_signal_permission_pcb(target: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
-    check_signal_permission_pcb_with_sig(target, None)
+    check_kill_permission(target, None)
 }
 
 /// Check if the current process has permission to send a signal to the target process.
@@ -170,10 +172,40 @@ fn handle_null_signal(converter: &PidConverter) -> Result<usize, SystemError> {
             Ok(0)
         }
         PidConverter::Pgid(pgid) => {
-            // For process groups, verify the group exists
-            // A more complete implementation could check all processes in the group
-            pgid.as_ref().ok_or(SystemError::ESRCH)?;
-            Ok(0)
+            // For process groups, verify the group exists and has at least one living process
+            let pg = pgid.as_ref().ok_or(SystemError::ESRCH)?;
+            // 检查进程组中是否有存活的进程
+            let tasks: Vec<Arc<ProcessControlBlock>> = pg.tasks_iter(PidType::PGID).collect();
+            if tasks.is_empty() {
+                return Err(SystemError::ESRCH);
+            }
+
+            let mut any_success = false;
+            let mut last_err = SystemError::ESRCH; // 默认为 ESRCH，处理全员退出的情况
+            for pcb in tasks {
+                // 如果进程已退出（僵尸），在 kill(0) 语义下通常视为不存在，跳过
+                if pcb.is_exited() {
+                    continue;
+                }
+                // 检查权限！
+                match check_signal_permission_pcb(&pcb) {
+                    Ok(_) => {
+                        // 只要有一个进程通过检查，整体就算成功
+                        any_success = true;
+                    }
+                    Err(e) => {
+                        last_err = e;
+                    }
+                }
+            }
+            if any_success {
+                Ok(0)
+            } else {
+                // 如果没有一个成功：
+                // 1. 可能是因为所有进程都是僵尸 (last_err 初始值 ESRCH)
+                // 2. 可能是因为所有活进程都无权发送 (last_err 被更新为 EPERM)
+                Err(last_err)
+            }
         }
         PidConverter::All => {
             // Signal 0 to all processes: just verify the syscall is valid

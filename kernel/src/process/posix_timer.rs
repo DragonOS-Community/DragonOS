@@ -14,7 +14,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::ipc::signal::Signal,
-    ipc::signal_types::{PosixSigval, SigCode, SigInfo, SigType},
+    ipc::signal_types::{OriginCode, PosixSigval, SigCode, SigInfo, SigType},
     process::{pid::PidType, ProcessControlBlock, ProcessFlags, ProcessManager, RawPid},
     time::{
         jiffies::NSEC_PER_JIFFY,
@@ -445,7 +445,7 @@ impl TimerFunction for PosixTimerHelper {
                         let info = SigInfo::new(
                             signo,
                             0,
-                            SigCode::Timer,
+                            SigCode::Origin(OriginCode::Timer),
                             SigType::PosixTimer {
                                 timerid: self.timerid,
                                 overrun,

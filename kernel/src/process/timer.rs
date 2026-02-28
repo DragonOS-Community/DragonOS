@@ -4,7 +4,10 @@ use crate::process::CurrentIrqArch;
 use crate::process::RawPid;
 use crate::process::SigInfo;
 use crate::time::timer::{clock, Jiffies, Timer, TimerFunction};
-use crate::{arch::ipc::signal::Signal, ipc::signal_types::SigCode};
+use crate::{
+    arch::ipc::signal::Signal,
+    ipc::signal_types::{OriginCode, SigCode},
+};
 use alloc::{boxed::Box, sync::Arc};
 use core::sync::atomic::compiler_fence;
 use core::time::Duration;
@@ -130,7 +133,12 @@ impl TimerFunction for AlarmTimerFunc {
     fn run(&mut self) -> Result<(), SystemError> {
         let sig = Signal::SIGALRM;
         // 初始化signal info
-        let mut info = SigInfo::new(sig, 0, SigCode::Timer, SigType::Alarm(self.pid));
+        let mut info = SigInfo::new(
+            sig,
+            0,
+            SigCode::Origin(OriginCode::Timer),
+            SigType::Alarm(self.pid),
+        );
 
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };

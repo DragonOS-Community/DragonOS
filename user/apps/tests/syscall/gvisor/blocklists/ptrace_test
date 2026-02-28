@@ -1,0 +1,16 @@
+PtraceTest.AttachParent_PeekData_PokeData_SignalSuppression
+PtraceTest.GetSigMask
+PtraceTest.GetSiginfo_SetSiginfo_SignalInjection
+PtraceTest.SIGKILLDoesNotCauseSignalDeliveryStop
+PtraceTest.PtraceKill
+PtraceTest.GetRegSet
+PtraceTest.ChangeRegSetInOptSyscall
+PtraceTest.ExitWhenParentIsNotTracer_Syscall_TraceVfork_TraceVforkDone
+PtraceTest.Int3
+PtraceTest.Sysemu_PokeUser
+PtraceTest.85
+PtraceTest.Seize_Interrupt_Listen
+PtraceTest.Interrupt_Listen_RequireSeize
+PtraceTest.SeizeSetOptions
+PtraceTest.SingleStep
+*PtraceExecveTest.Execve_GetRegs_PeekUser_SIGKILL_TraceClone_TraceExit*

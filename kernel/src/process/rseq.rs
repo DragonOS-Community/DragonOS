@@ -17,9 +17,11 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use system_error::SystemError;
 
 use crate::{
-    arch::cpu::current_cpu_id,
-    mm::VirtAddr,
+    arch::{cpu::current_cpu_id, ipc::signal::Signal, MMArch},
+    ipc::kill::send_signal_to_pcb,
+    mm::{MemoryManagementArch, VirtAddr},
     process::{ProcessControlBlock, ProcessFlags, ProcessManager},
+    syscall::user_access::{copy_from_user_protected, copy_to_user_protected},
 };
 
 // ============================================================================
@@ -205,7 +207,7 @@ impl UserRseqAccess {
     /// 读取 u32 值
     unsafe fn read_u32(&self, offset: usize) -> Result<u32, RseqError> {
         let mut bytes = [0u8; 4];
-        crate::syscall::user_access::copy_from_user_protected(&mut bytes, self.base + offset)
+        copy_from_user_protected(&mut bytes, self.base + offset)
             .map_err(|_| RseqError::UserAccessFault)?;
         Ok(u32::from_ne_bytes(bytes))
     }
@@ -213,28 +215,22 @@ impl UserRseqAccess {
     /// 读取 u64 值
     unsafe fn read_u64(&self, offset: usize) -> Result<u64, RseqError> {
         let mut bytes = [0u8; 8];
-        crate::syscall::user_access::copy_from_user_protected(&mut bytes, self.base + offset)
+        copy_from_user_protected(&mut bytes, self.base + offset)
             .map_err(|_| RseqError::UserAccessFault)?;
         Ok(u64::from_ne_bytes(bytes))
     }
 
     /// 写入 u32 值
     unsafe fn write_u32(&self, offset: usize, value: u32) -> Result<(), RseqError> {
-        crate::syscall::user_access::copy_to_user_protected(
-            self.base + offset,
-            &value.to_ne_bytes(),
-        )
-        .map_err(|_| RseqError::UserAccessFault)?;
+        copy_to_user_protected(self.base + offset, &value.to_ne_bytes())
+            .map_err(|_| RseqError::UserAccessFault)?;
         Ok(())
     }
 
     /// 写入 u64 值
     unsafe fn write_u64(&self, offset: usize, value: u64) -> Result<(), RseqError> {
-        crate::syscall::user_access::copy_to_user_protected(
-            self.base + offset,
-            &value.to_ne_bytes(),
-        )
-        .map_err(|_| RseqError::UserAccessFault)?;
+        copy_to_user_protected(self.base + offset, &value.to_ne_bytes())
+            .map_err(|_| RseqError::UserAccessFault)?;
         Ok(())
     }
 
@@ -271,7 +267,7 @@ impl UserRseqAccess {
         }
         let sig_addr = VirtAddr::new((rseq_cs.abort_ip - 4) as usize);
         let mut sig_bytes = [0u8; 4];
-        crate::syscall::user_access::copy_from_user_protected(&mut sig_bytes, sig_addr)
+        copy_from_user_protected(&mut sig_bytes, sig_addr)
             .map_err(|_| RseqError::UserAccessFault)?;
         let read_sig = u32::from_ne_bytes(sig_bytes);
 
@@ -451,8 +447,6 @@ impl Rseq {
         rseq_len: u32,
         sig: u32,
     ) -> Result<usize, SystemError> {
-        use crate::{arch::MMArch, mm::MemoryManagementArch};
-
         let mut rseq_state = pcb.rseq_state_mut();
 
         // 检查是否已注册
@@ -546,8 +540,6 @@ impl Rseq {
     ///
     /// 在返回用户态前调用，执行 IP 修正和 cpu_id 更新
     pub fn handle_notify_resume<F: RseqTrapFrame>(frame: Option<&mut F>) -> Result<(), ()> {
-        use crate::{arch::MMArch, mm::MemoryManagementArch};
-
         let pcb = ProcessManager::current_pcb();
 
         // 如果进程正在退出，直接返回

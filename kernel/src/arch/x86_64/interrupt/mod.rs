@@ -1,7 +1,8 @@
-pub(super) mod entry;
+pub mod entry;
 mod handle;
 pub mod ipi;
 pub mod msi;
+pub mod ptrace;
 pub mod trap;
 
 use core::any::Any;
@@ -253,3 +254,5 @@ impl crate::process::rseq::RseqTrapFrame for TrapFrame {
         self.rip = ip as u64;
     }
 }
+
+pub use ptrace::UserRegsStruct;

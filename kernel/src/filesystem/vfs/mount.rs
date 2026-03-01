@@ -411,6 +411,10 @@ impl MountFS {
         self.self_mountpoint.read().as_ref().cloned()
     }
 
+    pub fn set_self_mountpoint(&self, mountpoint: Arc<MountFSInode>) {
+        self.self_mountpoint.write().replace(mountpoint);
+    }
+
     /// @brief 用Arc指针包裹MountFS对象。
     /// 本函数的主要功能为，初始化MountFS对象中的自引用Weak指针
     /// 本函数只应在构造器中被调用
@@ -1480,18 +1484,12 @@ impl MountList {
     /// 用于 pivot_root 等场景，需要从底层 inode 找到其所在的 MountFS
     pub fn find_mount_by_fs(&self, fs: &Arc<dyn FileSystem>) -> Option<Arc<MountFS>> {
         let inner = self.inner.read();
-        // 遍历所有挂载点，找到文件系统相同的 MountFS
+        // 遍历所有挂载点，按文件系统对象身份（Arc 指针）精确匹配。
+        // 不能按 fs.name() 模糊匹配，否则同类型多挂载（如多个 tmpfs）会误选。
         for (_path, stack) in inner.mounts.iter() {
             if let Some(record) = stack.last() {
-                // 比较 Arc 指针是否相同
                 let inner_fs = record.fs.inner_filesystem();
-                // 首先尝试直接比较 Arc 指针
                 if Arc::ptr_eq(&inner_fs, fs) {
-                    return Some(record.fs.clone());
-                }
-                // 如果指针不同但文件系统类型相同，也返回
-                // (处理 bind mount 等情况)
-                if inner_fs.name() == fs.name() {
                     return Some(record.fs.clone());
                 }
             }

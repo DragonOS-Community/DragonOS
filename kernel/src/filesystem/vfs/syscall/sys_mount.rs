@@ -290,16 +290,7 @@ fn do_reconfigure_mnt(
             if let Some(mount_fs) = mnt_ns.mount_list().find_mount_by_fs(&inode_fs) {
                 mount_fs
             } else {
-                // 作为最后的尝试，通过文件系统名称匹配
-                let mount_list = mnt_ns.mount_list().clone_inner();
-                let mut found = None;
-                for (_path, mnt_fs) in mount_list.iter() {
-                    if mnt_fs.fs_type() == inode_fs.name() {
-                        found = Some(mnt_fs.clone());
-                        break;
-                    }
-                }
-                found.ok_or(SystemError::EINVAL)?
+                return Err(SystemError::EINVAL);
             }
         };
 

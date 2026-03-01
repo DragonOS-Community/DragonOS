@@ -9,7 +9,7 @@
 //! - 需要 CAP_SYS_CHROOT 权限
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_PIVOT_ROOT;
-use crate::filesystem::vfs::mount::{MountFS, MountFSInode};
+use crate::filesystem::vfs::mount::{MountFS, MountFSInode, MountPath};
 use crate::filesystem::vfs::permission::PermissionMask;
 use crate::filesystem::vfs::{
     utils::{is_ancestor_limited, user_path_at},
@@ -20,6 +20,7 @@ use crate::process::namespace::mnt::MntNamespace;
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::vfs_check_and_clone_cstr;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use system_error::SystemError;
@@ -190,9 +191,24 @@ impl Syscall for SysPivotRootHandle {
         // 获取当前进程的挂载命名空间
         let mnt_ns = ProcessManager::current_mntns();
 
-        // 1. 保存旧的根 MountFS（用于后续设置当前目录）
-        let _old_root_mntfs = mnt_ns.root_mntfs().clone();
+        // 1. 保存旧的根 MountFS（用于后续挂到 put_old）
+        let old_root_mntfs = mnt_ns.root_mntfs().clone();
         let old_root_inode = mnt_ns.root_inode();
+        let post_pivot_put_old_path = if !is_same_inode {
+            Some(Self::compute_post_pivot_put_old_path(
+                &new_root_inode,
+                &put_old_inode,
+            )?)
+        } else {
+            None
+        };
+
+        // 1.1 将旧根挂到 new_root 下的 put_old（Linux pivot_root 核心语义）
+        if !is_same_inode {
+            let put_old_mountpoint = Self::make_mountpoint_inode(&put_old_inode, &new_root_mntfs);
+            new_root_mntfs.add_mount(put_old_meta.inode_id, old_root_mntfs.clone())?;
+            old_root_mntfs.set_self_mountpoint(put_old_mountpoint);
+        }
 
         // log::info!(
         //     "[pivot_root] changing root mountfs from {:?} to {:?}",
@@ -207,7 +223,26 @@ impl Syscall for SysPivotRootHandle {
             mnt_ns.force_change_root_mountfs(new_root_mntfs.clone());
         }
 
-        // 3. 更新进程的根目录
+        // 3. 将旧根登记到 put_old 路径，便于按路径可见和后续 umount2(put_old)
+        if let Some(put_old_mount_path) = post_pivot_put_old_path {
+            mnt_ns.add_mount(
+                Some(put_old_meta.inode_id),
+                Arc::new(MountPath::from(put_old_mount_path.as_str())),
+                old_root_mntfs,
+            )?;
+        }
+
+        // 4. 更新同一挂载命名空间内所有任务的根目录和当前目录
+        Self::reset_tasks_fs_for_namespace(&mnt_ns, &new_root_inode);
+
+        // 5. 兼容 new_root == put_old 特例：调用任务 cwd 指向旧根，便于 umount2(".")
+        //
+        // 这一步必须放在批量同步之后，否则会被覆盖掉。
+        if is_same_inode {
+            pcb.fs_struct_mut().set_pwd(old_root_inode);
+        }
+
+        // 6. 更新进程的根目录
         // 关键修复：使用 new_root_inode 而不是 new_root_mntfs.root_inode()
         //
         // 原因：DragonOS 的 bind mount 实现与 Linux 有差异。
@@ -218,14 +253,6 @@ impl Syscall for SysPivotRootHandle {
         // 因此，我们需要直接使用 new_root_inode（bind source 目录的 inode）作为新的根目录。
         // 这样容器启动时能看到 rootfs 的内容（bin, lib 等），而不是底层文件系统的根目录。
         pcb.fs_struct_mut().set_root(new_root_inode.clone());
-
-        // 4. 关键步骤：当 new_root 和 put_old 相同时，
-        // 需要将当前工作目录设置为旧的根目录（以便后续 umount2 可以卸载它）
-        // 这样 `umount2(".")` 才能正确工作
-        if is_same_inode {
-            // log::info!("[pivot_root] setting cwd to old root for umount2");
-            pcb.fs_struct_mut().set_pwd(old_root_inode);
-        }
 
         // log::info!(
         //     "[pivot_root] SUCCESS: new_root='{}', put_old='{}', new_root_mntfs={:?}",
@@ -263,7 +290,6 @@ impl SysPivotRootHandle {
     /// 1. 直接从 MountFSInode 获取
     /// 2. 查找设置了 bind_target_root 的 MountFS（bind mount 标记）
     /// 3. 通过文件系统指针查找
-    /// 4. 通过文件系统名称查找（后备方案）
     fn get_mountfs(inode: &Arc<dyn IndexNode>) -> Result<Arc<MountFS>, SystemError> {
         // 1. 尝试直接从 MountFSInode 获取
         if let Some(mountfs_inode) = inode.as_any_ref().downcast_ref::<MountFSInode>() {
@@ -282,13 +308,6 @@ impl SysPivotRootHandle {
         if let Some(mount_fs) = mnt_ns.mount_list().find_mount_by_fs(&inode_fs) {
             log::debug!("[pivot_root] get_mountfs: found MountFS by filesystem lookup");
             return Ok(mount_fs);
-        }
-
-        // 4. 通过文件系统名称查找（后备方案）
-        let root_fs = mnt_ns.root_inode().fs();
-        if inode_fs.name() == root_fs.name() {
-            log::debug!("[pivot_root] get_mountfs: fs name matches root, returning root_mntfs");
-            return Ok(mnt_ns.root_mntfs().clone());
         }
 
         log::error!(
@@ -312,10 +331,8 @@ impl SysPivotRootHandle {
 
         for (path, mnt_fs) in mount_list.iter() {
             let inner_fs = mnt_fs.inner_filesystem();
-            // 检查是否匹配文件系统且设置了 bind_target_root
-            if (Arc::ptr_eq(&inner_fs, inode_fs) || inner_fs.name() == inode_fs.name())
-                && mnt_fs.bind_target_root().is_some()
-            {
+            // 按文件系统对象身份匹配，避免同类型多挂载时误选
+            if Arc::ptr_eq(&inner_fs, inode_fs) && mnt_fs.bind_target_root().is_some() {
                 let path_len = path.as_str().len();
                 bind_mount_candidates.push((mnt_fs.clone(), path_len));
                 log::debug!(
@@ -328,7 +345,7 @@ impl SysPivotRootHandle {
 
         // 选择路径最短的（最上层的）
         if !bind_mount_candidates.is_empty() {
-            bind_mount_candidates.sort_by(|a, b| a.1.cmp(&b.1));
+            bind_mount_candidates.sort_by_key(|a| a.1);
             let (mnt_fs, _) = bind_mount_candidates.into_iter().next()?;
             log::debug!(
                 "[pivot_root] find_bind_mount: returning id={:?}",
@@ -338,6 +355,53 @@ impl SysPivotRootHandle {
         }
 
         None
+    }
+
+    fn make_mountpoint_inode(
+        put_old_inode: &Arc<dyn IndexNode>,
+        new_root_mntfs: &Arc<MountFS>,
+    ) -> Arc<MountFSInode> {
+        if let Some(mountfs_inode) = put_old_inode.as_any_ref().downcast_ref::<MountFSInode>() {
+            return mountfs_inode.clone_with_new_mount_fs(new_root_mntfs.clone());
+        }
+        MountFSInode::new(put_old_inode.clone(), new_root_mntfs.clone())
+    }
+
+    fn compute_post_pivot_put_old_path(
+        new_root_inode: &Arc<dyn IndexNode>,
+        put_old_inode: &Arc<dyn IndexNode>,
+    ) -> Result<String, SystemError> {
+        let new_root_abs = new_root_inode.absolute_path()?;
+        let put_old_abs = put_old_inode.absolute_path()?;
+        if new_root_abs == "/" {
+            return Ok(put_old_abs);
+        }
+        let remain = put_old_abs
+            .strip_prefix(new_root_abs.as_str())
+            .ok_or(SystemError::EINVAL)?;
+
+        if !remain.is_empty() && !remain.starts_with('/') {
+            return Err(SystemError::EINVAL);
+        }
+
+        if remain.is_empty() {
+            return Ok(String::from("/"));
+        }
+
+        Ok(String::from(remain))
+    }
+
+    fn reset_tasks_fs_for_namespace(mnt_ns: &Arc<MntNamespace>, new_root: &Arc<dyn IndexNode>) {
+        for pid in ProcessManager::get_all_processes() {
+            if let Some(task) = ProcessManager::find(pid) {
+                let task_mnt_ns = task.nsproxy().mnt_namespace().clone();
+                if Arc::ptr_eq(&task_mnt_ns, mnt_ns) {
+                    let fs = task.fs_struct();
+                    fs.set_root(new_root.clone());
+                    fs.set_pwd(new_root.clone());
+                }
+            }
+        }
     }
 }
 

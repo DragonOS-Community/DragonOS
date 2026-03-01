@@ -2,7 +2,7 @@ pub(super) mod datagram_common;
 
 use crate::net::socket::{
     self, inet::syscall::create_inet_socket, netlink::create_netlink_socket, packet::PacketSocket,
-    unix::create_unix_socket, Socket,
+    unix::create_unix_socket, vsock::create_vsock_socket, Socket,
 };
 use alloc::sync::Arc;
 use smoltcp::wire::{IpAddress, IpVersion};
@@ -128,6 +128,7 @@ pub fn create_socket(
             let eth_protocol = (protocol as u16).to_be();
             PacketSocket::new(socket_type, eth_protocol, is_nonblock)?
         }
+        AF::Vsock => create_vsock_socket(socket_type, protocol, is_nonblock)?,
         _ => {
             log::warn!("unsupport address family");
             return Err(SystemError::EAFNOSUPPORT);

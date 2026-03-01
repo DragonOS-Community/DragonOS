@@ -49,6 +49,7 @@ use super::socket::{
 };
 use crate::net::socket::netlink::addr::{multicast::GroupIdSet, NetlinkSocketAddr};
 use crate::net::socket::unix::UnixEndpoint;
+use crate::net::socket::vsock::addr::VsockEndpoint;
 use crate::syscall::user_access::UserBufferReader;
 use alloc::string::ToString;
 use alloc::vec::Vec;
@@ -107,6 +108,26 @@ pub struct SockAddrNl {
     pub nl_groups: u32,
 }
 
+/// struct sockaddr_vm for AF_VSOCK.
+///
+/// Linux layout:
+/// - svm_family: sa_family_t
+/// - svm_reserved1: unsigned short
+/// - svm_port: unsigned int
+/// - svm_cid: unsigned int
+/// - svm_flags: u8
+/// - svm_zero: u8[3]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SockAddrVm {
+    pub svm_family: u16,
+    pub svm_reserved1: u16,
+    pub svm_port: u32,
+    pub svm_cid: u32,
+    pub svm_flags: u8,
+    pub svm_zero: [u8; 3],
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct SockAddrPlaceholder {
@@ -123,6 +144,7 @@ pub union SockAddr {
     pub addr_un: SockAddrUn,
     pub addr_ll: SockAddrLl,
     pub addr_nl: SockAddrNl,
+    pub addr_vm: SockAddrVm,
     pub addr_ph: SockAddrPlaceholder,
 }
 
@@ -198,6 +220,21 @@ impl From<NetlinkSocketAddr> for SockAddr {
     }
 }
 
+impl From<VsockEndpoint> for SockAddr {
+    fn from(value: VsockEndpoint) -> Self {
+        SockAddr {
+            addr_vm: SockAddrVm {
+                svm_family: AddressFamily::Vsock as u16,
+                svm_reserved1: 0,
+                svm_port: value.port,
+                svm_cid: value.cid,
+                svm_flags: 0,
+                svm_zero: [0; 3],
+            },
+        }
+    }
+}
+
 impl From<LinkLayerEndpoint> for SockAddr {
     fn from(value: LinkLayerEndpoint) -> Self {
         SockAddr {
@@ -227,6 +264,7 @@ impl From<Endpoint> for SockAddr {
             Endpoint::Ip(endpoint) => Self::from(endpoint),
             Endpoint::Unix(unix_endpoint) => Self::from(unix_endpoint),
             Endpoint::Netlink(netlink_addr) => Self::from(netlink_addr),
+            Endpoint::Vsock(vsock_endpoint) => Self::from(vsock_endpoint),
         }
     }
 }
@@ -417,6 +455,26 @@ impl SockAddr {
                     halen: addr_ll.sll_halen,
                 }))
             }
+            AddressFamily::Vsock => {
+                if len < size_of::<SockAddrVm>() as u32 {
+                    log::error!(
+                        "len {} < sizeof(sockaddr_vm) {}",
+                        len,
+                        size_of::<SockAddrVm>()
+                    );
+                    return Err(SystemError::EINVAL);
+                }
+
+                let addr_vm = reader.buffer_protected(0)?.read_one::<SockAddrVm>(0)?;
+                // 当前仅支持 flags=0，避免静默接受未实现行为。
+                if addr_vm.svm_flags != 0 {
+                    return Err(SystemError::EINVAL);
+                }
+                Ok(Endpoint::Vsock(VsockEndpoint {
+                    cid: addr_vm.svm_cid,
+                    port: addr_vm.svm_port,
+                }))
+            }
             _ => {
                 log::warn!("not support address family {:?}", family);
                 return Err(SystemError::EINVAL);
@@ -432,6 +490,7 @@ impl SockAddr {
             AddressFamily::Packet => Ok(core::mem::size_of::<SockAddrLl>()),
             AddressFamily::Netlink => Ok(core::mem::size_of::<SockAddrNl>()),
             AddressFamily::Unix => Ok(core::mem::size_of::<SockAddrUn>()),
+            AddressFamily::Vsock => Ok(core::mem::size_of::<SockAddrVm>()),
             _ => Err(SystemError::EINVAL),
         }
         .map(|x| x as u32)

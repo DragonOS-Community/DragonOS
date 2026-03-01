@@ -1,5 +1,6 @@
 use super::mmio::virtio_probe_mmio;
 use super::transport_pci::PciTransport;
+use super::virtio_fs::virtio_fs;
 use super::virtio_impl::HalImpl;
 use crate::driver::base::device::bus::Bus;
 use crate::driver::base::device::{Device, DeviceId};
@@ -76,6 +77,7 @@ pub(super) fn virtio_device_init(
             warn!("Not support virtio_input device for now");
         }
         DeviceType::Network => virtio_net(transport, dev_id, dev_parent),
+        DeviceType::FileSystem => virtio_fs(transport, dev_id, dev_parent),
         t => {
             warn!("Unrecognized virtio device: {:?}", t);
         }
@@ -102,7 +104,8 @@ fn virtio_device_search() -> Vec<Arc<PciDeviceStructureGeneralDevice>> {
         let standard_device = device.as_standard_device().unwrap();
         let header = &standard_device.common_header;
         // log::info!("header: {:?}", header);
-        if header.device_id >= 0x1000 && header.device_id <= 0x103F {
+        // 支持 transitional(0x1000..=0x103f) 与 modern(0x1040..=0x107f) virtio PCI 设备。
+        if header.device_id >= 0x1000 && header.device_id <= 0x107F {
             virtio_list.push(standard_device);
         }
     }

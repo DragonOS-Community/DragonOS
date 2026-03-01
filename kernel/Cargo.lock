@@ -1815,7 +1815,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "virtio-drivers"
 version = "0.7.2"
-source = "git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/virtio-drivers?rev=415ab38ff9#415ab38ff99f3c8e150269c04f65d684ba9d1365"
+source = "git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/virtio-drivers?rev=755e305#755e3053cd8856279e44abd0ecca4d6eef3aec93"
 dependencies = [
  "bitflags 2.9.1",
  "log",

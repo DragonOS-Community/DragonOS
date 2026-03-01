@@ -147,6 +147,7 @@ struct FuseConnInner {
     no_open: bool,
     no_opendir: bool,
     no_readdirplus: bool,
+    max_write_cap: usize,
     pending: VecDeque<Arc<FuseRequest>>,
     processing: BTreeMap<u64, Arc<FusePendingState>>,
 }
@@ -165,8 +166,23 @@ pub struct FuseConn {
 impl FuseConn {
     // Keep this in sync with `sys_read.rs` userspace chunking size.
     const USER_READ_CHUNK: usize = 64 * 1024;
+    const MIN_MAX_WRITE: usize = 4096;
 
     pub fn new() -> Arc<Self> {
+        Self::new_with_max_write_cap(Self::max_write_cap_for_user_read_chunk())
+    }
+
+    pub fn new_for_virtiofs(max_message_size: usize) -> Arc<Self> {
+        let overhead = core::mem::size_of::<FuseInHeader>() + core::mem::size_of::<FuseWriteIn>();
+        let cap = if max_message_size > overhead {
+            core::cmp::max(Self::MIN_MAX_WRITE, max_message_size - overhead)
+        } else {
+            Self::MIN_MAX_WRITE
+        };
+        Self::new_with_max_write_cap(cap)
+    }
+
+    fn new_with_max_write_cap(max_write_cap: usize) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(FuseConnInner {
                 connected: true,
@@ -179,6 +195,7 @@ impl FuseConn {
                 no_open: false,
                 no_opendir: false,
                 no_readdirplus: false,
+                max_write_cap,
                 pending: VecDeque::new(),
                 processing: BTreeMap::new(),
             }),
@@ -194,6 +211,14 @@ impl FuseConn {
     #[allow(dead_code)]
     pub fn is_mounted(&self) -> bool {
         self.inner.lock().mounted
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.inner.lock().connected
+    }
+
+    pub fn has_pending_requests(&self) -> bool {
+        !self.inner.lock().pending.is_empty()
     }
 
     pub fn mark_mounted(&self) -> Result<(), SystemError> {
@@ -461,10 +486,15 @@ impl FuseConn {
     fn max_write_cap_for_user_read_chunk() -> usize {
         let overhead = core::mem::size_of::<FuseInHeader>() + core::mem::size_of::<FuseWriteIn>();
         if Self::USER_READ_CHUNK <= overhead {
-            4096
+            Self::MIN_MAX_WRITE
         } else {
             Self::USER_READ_CHUNK - overhead
         }
+    }
+
+    fn max_write_cap(&self) -> usize {
+        let g = self.inner.lock();
+        core::cmp::max(Self::MIN_MAX_WRITE, g.max_write_cap)
     }
 
     fn min_read_buffer(&self) -> usize {
@@ -777,11 +807,11 @@ impl FuseConn {
                     1
                 };
             let negotiated_max_write = core::cmp::max(4096usize, init_out.max_write as usize);
-            let max_write_cap = Self::max_write_cap_for_user_read_chunk();
+            let max_write_cap = self.max_write_cap();
             let capped_max_write = core::cmp::min(negotiated_max_write, max_write_cap);
             if capped_max_write < negotiated_max_write {
                 log::trace!(
-                    "fuse: cap negotiated max_write from {} to {} due user read chunk limit",
+                    "fuse: cap negotiated max_write from {} to {} due backend read buffer limit",
                     negotiated_max_write,
                     capped_max_write
                 );

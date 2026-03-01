@@ -13,6 +13,7 @@ pub mod transport_mmio;
 pub mod transport_pci;
 #[allow(clippy::module_inception)]
 pub mod virtio;
+pub mod virtio_fs;
 pub mod virtio_impl;
 
 /// virtio 设备厂商ID

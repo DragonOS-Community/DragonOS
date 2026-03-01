@@ -205,6 +205,16 @@ else
 	sh -c "cd tools && bash run-qemu.sh --bios=legacy --display=nographic && cd .."
 endif
 
+# 启动virtiofsd（用于virtiofs功能验证）
+.PHONY: virtiofsd
+virtiofsd:
+	sh -c "cd tools/virtiofs && bash start_virtiofsd.sh && cd ../.."
+
+# 不编译，直接以nographic方式启动QEMU，并启用virtiofs设备
+.PHONY: qemu-virtiofs-nographic
+qemu-virtiofs-nographic: check_arch
+	sh -c "cd tools && DRAGONOS_VIRTIOFS_ENABLE=1 bash run-qemu.sh --bios=legacy --display=nographic && cd .."
+
 # 不编译，直接启动QEMU(UEFI)
 qemu-uefi: check_arch
 	sh -c "cd tools && bash run-qemu.sh --bios=uefi --display=window && cd .."
@@ -339,7 +349,9 @@ help:
 	@echo ""
 	@echo "运行:"
 	@echo "  make qemu             - 不编译，直接从已有的磁盘镜像启动运行"
+	@echo "  make qemu-virtiofs-nographic - 不编译，以nographic方式启动并启用virtiofs设备"
 	@echo "  make qemu-uefi        - 不编译，直接从已有的磁盘镜像以UEFI启动运行"
+	@echo "  make virtiofsd        - 启动virtiofsd（读取tools/virtiofs/env.sh）"
 	@echo ""
 	@echo ""
 	@echo "注: 对于上述的run, run-uefi, qemu, qemu-uefi命令可以在命令后加上-vnc后缀,来通过vnc连接到DragonOS, 默认会在5900端口运行vnc服务器。如：make run-vnc "

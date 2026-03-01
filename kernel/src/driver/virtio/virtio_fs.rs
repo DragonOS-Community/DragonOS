@@ -11,7 +11,7 @@ use virtio_drivers::transport::Transport;
 
 use crate::{
     driver::base::device::{Device, DeviceId},
-    libs::spinlock::SpinLock,
+    libs::{spinlock::SpinLock, wait_queue::WaitQueue},
 };
 
 use super::transport::VirtIOTransport;
@@ -41,6 +41,9 @@ unsafe impl Send for VirtioFsTransportHolder {}
 struct VirtioFsInstanceState {
     transport: Option<VirtioFsTransportHolder>,
     session_active: bool,
+    active_session_id: u64,
+    released_session_id: u64,
+    next_session_id: u64,
 }
 
 #[derive(Debug)]
@@ -49,6 +52,7 @@ pub struct VirtioFsInstance {
     num_request_queues: u32,
     dev_id: Arc<DeviceId>,
     state: SpinLock<VirtioFsInstanceState>,
+    session_wait: WaitQueue,
 }
 
 impl VirtioFsInstance {
@@ -65,7 +69,11 @@ impl VirtioFsInstance {
             state: SpinLock::new(VirtioFsInstanceState {
                 transport: Some(VirtioFsTransportHolder(transport)),
                 session_active: false,
+                active_session_id: 0,
+                released_session_id: 0,
+                next_session_id: 1,
             }),
+            session_wait: WaitQueue::default(),
         }
     }
 
@@ -101,21 +109,39 @@ impl VirtioFsInstance {
             })
     }
 
-    pub fn take_transport_for_session(&self) -> Result<VirtIOTransport, SystemError> {
+    pub fn take_transport_for_session(&self) -> Result<(VirtIOTransport, u64), SystemError> {
         let mut state = self.state.lock_irqsave();
         if state.session_active {
             return Err(SystemError::EBUSY);
         }
 
         let transport = state.transport.take().ok_or(SystemError::EBUSY)?.0;
+        let session_id = state.next_session_id;
+        state.next_session_id = state.next_session_id.wrapping_add(1);
+        state.active_session_id = session_id;
         state.session_active = true;
-        Ok(transport)
+        Ok((transport, session_id))
     }
 
     pub fn put_transport_after_session(&self, transport: VirtIOTransport) {
         let mut state = self.state.lock_irqsave();
         state.transport = Some(VirtioFsTransportHolder(transport));
+        state.released_session_id = state.active_session_id;
+        state.active_session_id = 0;
         state.session_active = false;
+        drop(state);
+        self.session_wait.wakeup(None);
+    }
+
+    pub fn wait_session_released(&self, session_id: u64) {
+        self.session_wait.wait_until(|| {
+            let state = self.state.lock_irqsave();
+            if state.released_session_id == session_id && state.transport.is_some() {
+                Some(())
+            } else {
+                None
+            }
+        });
     }
 }
 

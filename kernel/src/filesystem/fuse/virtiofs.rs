@@ -393,7 +393,21 @@ impl VirtioFsBridgeContext {
 
         match self.conn.write_reply(&rsp_buf[..used_len]) {
             Ok(_) | Err(SystemError::ENOENT) => {}
-            Err(e) => return Err(e),
+            Err(e) => {
+                // Linux virtio-fs always ends a completed request from the used ring.
+                // Keep that behavior here: fail this unique instead of exiting bridge loop.
+                let unique = inflight.pending.unique;
+                let completion_err = if e == SystemError::EINVAL {
+                    SystemError::EIO
+                } else {
+                    e.clone()
+                };
+                warn!(
+                    "virtiofs bridge: write_reply failed unique={} opcode={} err={:?}, complete with {:?}",
+                    unique, inflight.pending.opcode, e, completion_err
+                );
+                self.complete_request_with_error(unique, completion_err);
+            }
         }
         Ok(true)
     }
@@ -527,8 +541,8 @@ fn virtiofs_bridge_thread_entry(arg: usize) -> i32 {
     result.map(|_| 0).unwrap_or_else(|e| e.to_posix_errno())
 }
 
-fn start_bridge(instance: Arc<VirtioFsInstance>, conn: Arc<FuseConn>) -> Result<(), SystemError> {
-    let mut transport = instance.take_transport_for_session()?;
+fn start_bridge(instance: Arc<VirtioFsInstance>, conn: Arc<FuseConn>) -> Result<u64, SystemError> {
+    let (mut transport, session_id) = instance.take_transport_for_session()?;
     if instance.request_queue_count() == 0 {
         warn!(
             "virtiofs bridge: no request queues: tag='{}' dev={:?}",
@@ -552,6 +566,18 @@ fn start_bridge(instance: Arc<VirtioFsInstance>, conn: Arc<FuseConn>) -> Result<
     transport.write_driver_features(0);
     transport
         .set_status(DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER | DeviceStatus::FEATURES_OK);
+    let status = transport.get_status();
+    if !status.contains(DeviceStatus::FEATURES_OK) {
+        warn!(
+            "virtiofs bridge: device rejected features tag='{}' dev={:?} status={:?}",
+            instance.tag(),
+            instance.dev_id(),
+            status
+        );
+        transport.set_status(DeviceStatus::FAILED);
+        instance.put_transport_after_session(transport);
+        return Err(SystemError::ENODEV);
+    }
     transport.set_guest_page_size(PAGE_SIZE as u32);
 
     let hiprio_vq = match VirtQueue::<HalImpl, { VIRTIOFS_REQ_QUEUE_SIZE }>::new(
@@ -625,7 +651,7 @@ fn start_bridge(instance: Arc<VirtioFsInstance>, conn: Arc<FuseConn>) -> Result<
         return Err(SystemError::ENOMEM);
     }
 
-    Ok(())
+    Ok(session_id)
 }
 
 #[derive(Debug)]
@@ -649,6 +675,8 @@ impl FileSystemMakerData for VirtioFsMountData {
 #[derive(Debug)]
 struct VirtioFsFs {
     inner: Arc<dyn FileSystem>,
+    instance: Arc<VirtioFsInstance>,
+    session_id: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -768,6 +796,7 @@ impl FileSystem for VirtioFsFs {
 
     fn on_umount(&self) {
         self.inner.on_umount();
+        self.instance.wait_session_released(self.session_id);
     }
 }
 
@@ -824,12 +853,19 @@ impl MountableFileSystem for VirtioFsFs {
             &fuse_mount_data as &dyn FileSystemMakerData,
         ))?;
 
-        if let Err(e) = start_bridge(md.instance.clone(), md.conn.clone()) {
-            inner.on_umount();
-            return Err(e);
-        }
+        let session_id = match start_bridge(md.instance.clone(), md.conn.clone()) {
+            Ok(id) => id,
+            Err(e) => {
+                inner.on_umount();
+                return Err(e);
+            }
+        };
 
-        Ok(Arc::new(VirtioFsFs { inner }))
+        Ok(Arc::new(VirtioFsFs {
+            inner,
+            instance: md.instance.clone(),
+            session_id,
+        }))
     }
 }
 

@@ -146,8 +146,11 @@ fn read_config(transport: &VirtIOTransport) -> Result<(String, u32), SystemError
     let tag = core::str::from_utf8(&tag_raw[..tag_len])
         .map_err(|_| SystemError::EINVAL)?
         .to_string();
-    let nrqs =
-        u32::from_le(unsafe { ptr::read_volatile(base.add(VIRTIO_FS_TAG_LEN) as *const u32) });
+    let mut nrqs_raw = [0u8; core::mem::size_of::<u32>()];
+    for (i, b) in nrqs_raw.iter_mut().enumerate() {
+        *b = unsafe { ptr::read_volatile(base.add(VIRTIO_FS_TAG_LEN + i)) };
+    }
+    let nrqs = u32::from_le_bytes(nrqs_raw);
     if nrqs == 0 {
         return Err(SystemError::EINVAL);
     }

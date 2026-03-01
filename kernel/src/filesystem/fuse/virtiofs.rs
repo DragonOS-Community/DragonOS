@@ -139,6 +139,36 @@ impl VirtioFsBridgeContext {
         }
     }
 
+    fn take_inflight(&mut self, kind: QueueKind, token: u16) -> Result<InflightReq, SystemError> {
+        match kind {
+            QueueKind::Hiprio => self.hiprio_inflight.remove(&token).ok_or(SystemError::EIO),
+            QueueKind::Request(slot) => self
+                .request_inflight
+                .get_mut(slot)
+                .ok_or(SystemError::EINVAL)?
+                .remove(&token)
+                .ok_or(SystemError::EIO),
+        }
+    }
+
+    fn put_back_inflight(
+        &mut self,
+        kind: QueueKind,
+        token: u16,
+        inflight: InflightReq,
+    ) -> Result<(), SystemError> {
+        let replaced = match kind {
+            QueueKind::Hiprio => self.hiprio_inflight.insert(token, inflight),
+            QueueKind::Request(slot) => self
+                .request_inflight
+                .get_mut(slot)
+                .ok_or(SystemError::EINVAL)?
+                .insert(token, inflight),
+        };
+        debug_assert!(replaced.is_none());
+        Ok(())
+    }
+
     fn complete_request_with_errno(conn: &Arc<FuseConn>, unique: u64, errno: i32) {
         if unique == 0 {
             return;
@@ -307,31 +337,20 @@ impl VirtioFsBridgeContext {
             }
         };
 
-        let mut inflight = match kind {
-            QueueKind::Hiprio => self
-                .hiprio_inflight
-                .remove(&token)
-                .ok_or(SystemError::EIO)?,
-            QueueKind::Request(slot) => self
-                .request_inflight
-                .get_mut(slot)
-                .ok_or(SystemError::EINVAL)?
-                .remove(&token)
-                .ok_or(SystemError::EIO)?,
-        };
+        let mut inflight = self.take_inflight(kind, token)?;
 
-        let used_len = match kind {
+        let used_len_res = match kind {
             QueueKind::Hiprio => {
                 let queue = self.hiprio_vq.as_mut().ok_or(SystemError::EIO)?;
                 let inputs = [inflight.pending.req.as_slice()];
                 if let Some(rsp_buf) = inflight.rsp.as_mut() {
                     let mut outputs = [rsp_buf.as_mut_slice()];
                     unsafe { queue.pop_used(token, &inputs, &mut outputs) }
-                        .map_err(virtio_drivers_error_to_system_error)? as usize
+                        .map_err(virtio_drivers_error_to_system_error)
                 } else {
                     let mut outputs: [&mut [u8]; 0] = [];
                     unsafe { queue.pop_used(token, &inputs, &mut outputs) }
-                        .map_err(virtio_drivers_error_to_system_error)? as usize
+                        .map_err(virtio_drivers_error_to_system_error)
                 }
             }
             QueueKind::Request(slot) => {
@@ -340,12 +359,25 @@ impl VirtioFsBridgeContext {
                 if let Some(rsp_buf) = inflight.rsp.as_mut() {
                     let mut outputs = [rsp_buf.as_mut_slice()];
                     unsafe { queue.pop_used(token, &inputs, &mut outputs) }
-                        .map_err(virtio_drivers_error_to_system_error)? as usize
+                        .map_err(virtio_drivers_error_to_system_error)
                 } else {
                     let mut outputs: [&mut [u8]; 0] = [];
                     unsafe { queue.pop_used(token, &inputs, &mut outputs) }
-                        .map_err(virtio_drivers_error_to_system_error)? as usize
+                        .map_err(virtio_drivers_error_to_system_error)
                 }
+            }
+        };
+
+        let used_len = match used_len_res {
+            Ok(v) => v as usize,
+            Err(e) => {
+                let unique = inflight.pending.unique;
+                self.put_back_inflight(kind, token, inflight)?;
+                warn!(
+                    "virtiofs bridge: pop_used failed unique={} token={} queue={:?} err={:?}",
+                    unique, token, kind, e
+                );
+                return Err(e);
             }
         };
 

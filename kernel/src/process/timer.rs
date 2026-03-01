@@ -1,12 +1,9 @@
-use crate::exception::InterruptArch;
-use crate::ipc::signal_types::SigType;
-use crate::process::CurrentIrqArch;
-use crate::process::RawPid;
-use crate::process::SigInfo;
-use crate::time::timer::{clock, Jiffies, Timer, TimerFunction};
 use crate::{
     arch::ipc::signal::Signal,
-    ipc::signal_types::{OriginCode, SigCode},
+    exception::InterruptArch,
+    ipc::signal_types::{OriginCode, SigCode, SigType},
+    process::{CurrentIrqArch, RawPid, SigInfo},
+    time::timer::{clock, Jiffies, Timer, TimerFunction},
 };
 use alloc::{boxed::Box, sync::Arc};
 use core::sync::atomic::compiler_fence;

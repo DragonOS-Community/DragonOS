@@ -67,9 +67,9 @@ macro_rules! syscall_return {
 
 #[no_mangle]
 pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
-    // 系统调用进入时，把系统调用号存入 orig_rax 字段
-    // 用于恢复被 ptrace 修改的系统调用号
-    // frame.orig_rax = frame.rax;
+    // 系统调用进入时，把系统调用号存入 errcode 字段（即 orig_rax）。
+    // tracer 可能通过 PTRACE_SETREGS 修改 orig_ax（= errcode）来改变将要执行的系统调用号。
+    frame.errcode = frame.rax;
 
     // 系统调用进入时，始终开中断
     unsafe {
@@ -103,9 +103,8 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
         // TODO: 处理注入信号
     }
 
-    // 关键：必须在 ptrace_stop 返回之后重新读取系统调用号和参数！
-    // 因为 tracer 可能在我们睡眠时修改了寄存器。
-    let syscall_num = frame.rax as usize;
+    // 必须在 ptrace_stop 返回之后重新读取系统调用号和参数，因为 tracer 可能通过 PTRACE_SETREGS 修改了 orig_rax (= errcode)
+    let syscall_num = frame.errcode as usize;
     let args = [
         frame.rdi as usize,
         frame.rsi as usize,

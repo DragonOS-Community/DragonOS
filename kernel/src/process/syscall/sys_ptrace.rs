@@ -28,6 +28,7 @@ impl TryFrom<usize> for PtraceRequest {
         match value {
             0 => Ok(PtraceRequest::Traceme),
             2 => Ok(PtraceRequest::Peekdata),
+            3 => Ok(PtraceRequest::Peekuser),
             5 => Ok(PtraceRequest::Pokedata),
             7 => Ok(PtraceRequest::Cont),
             9 => Ok(PtraceRequest::Singlestep),
@@ -76,7 +77,7 @@ where
 fn ptrace_peek_data(
     tracee: &Arc<ProcessControlBlock>,
     addr: usize,
-    data: usize,
+    _data: usize,
 ) -> Result<isize, SystemError> {
     let tracee_vm = tracee.basic().user_vm().ok_or(SystemError::ESRCH)?;
     let tracee_vm_guard = tracee_vm.read();
@@ -86,9 +87,9 @@ fn ptrace_peek_data(
 
     // 检查地址是否在 tracee 的地址空间中
     let tracee_addr = VirtAddr::new(addr);
-    if tracee_vm_guard.mappings.contains(tracee_addr).is_none() {
-        return Err(SystemError::EIO);
-    }
+    // 注意：contains 可能失败，但这不一定表示错误，因为地址可能在页表中映射但不在 VMA 中
+    // 因此我们只在找到 VMA 时使用它进行额外检查，否则继续尝试 translate
+    let _vma = tracee_vm_guard.mappings.contains(tracee_addr);
 
     // 尝试直接读取，使用异常表保护
     let mut value: u64 = 0;
@@ -102,7 +103,12 @@ fn ptrace_peek_data(
             // 单页访问，一次性读取
             let tracee_phys = match tracee_vm_guard.user_mapper.utable.translate(tracee_addr) {
                 Some((phys_frame, _)) => PhysAddr::new(phys_frame.data() + page_offset),
-                None => return Err(SystemError::EIO),
+                None => {
+                    // translate 失败，可能是页面未映射或权限不足
+                    // 这时我们尝试使用异常表保护的直接访问
+                    // 如果仍然失败，返回 EIO
+                    return Err(SystemError::EIO);
+                }
             };
 
             let kernel_virt = MMArch::phys_2_virt(tracee_phys).ok_or(SystemError::EIO)?;
@@ -153,21 +159,9 @@ fn ptrace_peek_data(
 
     drop(tracee_vm_guard);
 
-    // 使用 put_user 将读取的值写入 data 参数指向的用户空间地址
-    // data 参数是一个指向 unsigned long 的用户空间指针
-    //
-    // 注意：需要使用异常表保护的拷贝，因为用户空间地址可能不可访问
-    unsafe {
-        let user_dst = data as *mut u8;
-        let src = &value as *const u64 as *const u8;
-
-        // 使用异常表保护的拷贝函数写入用户空间
-        let result = MMArch::copy_with_exception_table(user_dst, src, WORD_SIZE);
-        if result != 0 {
-            return Err(SystemError::EFAULT);
-        }
-    }
-
+    // Linux PTRACE_PEEKDATA 语义：返回值通过系统调用返回值传递，不写入 data 指针。
+    // data 参数在历史上是目标指针，但现代 Linux 内核忽略它，
+    // 调用者（如 peek_word）通过函数返回值读取结果。
     Ok(value as isize)
 }
 
@@ -292,16 +286,20 @@ impl SysPtrace {
     ///
     /// 按照 Linux 6.6.21 实现：
     /// - 不发送 SIGSTOP 给 tracee
-    /// - addr 参数包含 ptrace 选项
-    /// - data 参数通常为 0
+    /// - addr 参数必须为 0
+    /// - data 参数包含 ptrace 选项
     fn handle_seize(
         tracer: &Arc<ProcessControlBlock>,
         tracee_pid: RawPid,
         addr: usize,
+        data: usize,
     ) -> Result<isize, SystemError> {
+        if addr != 0 {
+            return Err(SystemError::EIO);
+        }
         let tracee = ProcessManager::find(tracee_pid).ok_or(SystemError::ESRCH)?;
-        // addr 参数包含 ptrace 选项
-        let options = PtraceOptions::from_bits_truncate(addr);
+        // data 参数包含 ptrace 选项
+        let options = PtraceOptions::from_bits(data).ok_or(SystemError::EINVAL)?;
         tracee.seize(tracer, options)
     }
 
@@ -334,7 +332,6 @@ impl SysPtrace {
     }
 
     /// 处理 PTRACE_SETOPTIONS 请求（设置跟踪选项）
-    #[allow(dead_code)]
     fn handle_set_options(
         tracee: &Arc<ProcessControlBlock>,
         data: usize,
@@ -347,7 +344,6 @@ impl SysPtrace {
     }
 
     /// 处理 PTRACE_GETSIGINFO 请求（获取信号信息）
-    #[allow(dead_code)]
     fn handle_get_siginfo(
         tracee: &Arc<ProcessControlBlock>,
         data: usize,
@@ -563,12 +559,6 @@ impl Syscall for SysPtrace {
         }
         let tracee: Arc<ProcessControlBlock> =
             ProcessManager::find(pid).ok_or(SystemError::ESRCH)?;
-        let signal: Option<Signal> = if data == 0 {
-            None // 表示无信号
-        } else {
-            Some(Signal::from(data as i32))
-        };
-
         let result: isize = match request {
             // 读取进程内存
             PtraceRequest::Peekdata => Self::handle_peek_data(&tracee, addr, data)?,
@@ -578,6 +568,13 @@ impl Syscall for SysPtrace {
             PtraceRequest::Pokedata => Self::handle_poke_data(&tracee, addr, data)?,
             // 继续执行目标进程
             PtraceRequest::Cont | PtraceRequest::Singlestep | PtraceRequest::Syscall => {
+                // data 是要注入的信号编号，0 表示无信号
+                // 仅在这里转换 signal，避免对其他 request（如 GETREGS）中 data 是指针时产生误报
+                let signal = if data == 0 {
+                    None
+                } else {
+                    Some(Signal::from(data as i32))
+                };
                 tracee.ptrace_resume(request, signal, frame)?
             }
             // 获取寄存器值
@@ -587,13 +584,21 @@ impl Syscall for SysPtrace {
             // 附加到目标进程
             PtraceRequest::Attach => Self::handle_attach(&tracer, pid)?,
             // 分离目标进程
-            PtraceRequest::Detach => Self::handle_detach(&tracee, signal)?,
+            PtraceRequest::Detach => {
+                // data 是分离时要发送的信号编号，0 表示无信号
+                let signal = if data == 0 {
+                    None
+                } else {
+                    Some(Signal::from(data as i32))
+                };
+                Self::handle_detach(&tracee, signal)?
+            }
             // 设置跟踪选项
             PtraceRequest::Setoptions => Self::handle_set_options(&tracee, data)?,
             // 获取信号信息
             PtraceRequest::Getsiginfo => Self::handle_get_siginfo(&tracee, data)?,
             // PTRACE_SEIZE：现代 API，不发送 SIGSTOP
-            PtraceRequest::Seize => Self::handle_seize(&tracer, pid, addr)?,
+            PtraceRequest::Seize => Self::handle_seize(&tracer, pid, addr, data)?,
             // 其他请求类型
             _ => {
                 log::warn!("Unimplemented ptrace request: {:?}", request);

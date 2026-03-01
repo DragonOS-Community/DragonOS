@@ -685,8 +685,10 @@ impl ProcessManager {
                 *pcb.real_parent_pcb.write_irqsave() =
                     current_pcb.real_parent_pcb.read_irqsave().clone();
             } else {
-                *pcb.parent_pcb.write_irqsave() = Arc::downgrade(&current_leader);
-                *pcb.real_parent_pcb.write_irqsave() = Arc::downgrade(&current_leader);
+                // 对于普通 fork（非 CLONE_THREAD|CLONE_PARENT），
+                // 子进程的 parent 应该指向实际调用 fork 的线程（current），而不是线程组组长。
+                *pcb.parent_pcb.write_irqsave() = Arc::downgrade(current_pcb);
+                *pcb.real_parent_pcb.write_irqsave() = Arc::downgrade(current_pcb);
             }
             pcb.exit_signal
                 .store(clone_args.exit_signal, Ordering::SeqCst);

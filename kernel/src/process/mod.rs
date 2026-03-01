@@ -57,7 +57,7 @@ use crate::{
         PhysAddr, VirtAddr,
     },
     process::{
-        ptrace::PtraceState,
+        ptrace::{PtraceEvent, PtraceState},
         resource::{RLimit64, RLimitID},
     },
     sched::{
@@ -723,6 +723,9 @@ impl ProcessManager {
             if let Some(vd) = vfork_done {
                 vd.complete_all();
             }
+
+            // ptrace 退出事件通知
+            pcb.ptrace_event(PtraceEvent::Exit, exit_code);
 
             pcb.exit_files();
             // TODO 由于未实现进程组，tty记录的前台进程组等于当前进程，故退出前要置空

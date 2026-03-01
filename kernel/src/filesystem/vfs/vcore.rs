@@ -31,11 +31,12 @@ use super::{
 };
 
 /// 当没有指定根文件系统时，尝试的根文件系统列表
-const ROOTFS_TRY_LIST: [&str; 5] = [
+const ROOTFS_TRY_LIST: [&str; 6] = [
     "/dev/sda1",
     "/dev/sda",
     "/dev/vda1",
     "/dev/vda",
+    "/dev/pmem0",
     "/dev/sdio1",
 ];
 kernel_cmdline_param_kv!(ROOTFS_PATH_PARAM, root, "");
@@ -90,6 +91,7 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
         old_mntfs.propagation(),
         Some(&current_mntns),
         old_mntfs.mount_flags(),
+        old_mntfs.mount_source(),
     );
 
     // 获取新的根文件系统的根节点的引用

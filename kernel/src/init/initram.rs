@@ -104,6 +104,7 @@ pub fn initramfs_init() -> Result<(), SystemError> {
         MountPropagation::new_private(),
         None,
         MountFlags::empty(),
+        None,
     );
     let root_inode = mount_fs.root_inode();
     unsafe {

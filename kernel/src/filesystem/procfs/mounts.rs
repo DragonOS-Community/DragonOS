@@ -59,26 +59,13 @@ fn generate_mounts_like_content(fmt: MountsFormat) -> String {
     for (mp, mfs) in mounts {
         let mut line = String::new();
         let fs_type = mfs.fs_type();
-        let source = match fs_type {
+        let source = mfs.mount_source().unwrap_or_else(|| match fs_type {
             // 特殊文件系统，直接显示文件系统名称
             "devfs" | "devpts" | "sysfs" | "procfs" | "tmpfs" | "ramfs" | "rootfs" | "debugfs"
             | "configfs" => fs_type.to_string(),
-            // 其他文件系统，尝试显示挂载设备名称
-            _ => {
-                if let Some(s) = mfs.self_mountpoint() {
-                    // 尝试从挂载点获取设备名称
-                    if let Some(device_name) = s.dname().ok().map(|d| d.to_string()) {
-                        device_name
-                    } else {
-                        // 如果获取不到设备名称，使用绝对路径
-                        s.absolute_path().unwrap_or("unknown".to_string())
-                    }
-                } else {
-                    // 没有挂载点信息，使用文件系统类型
-                    fs_type.to_string()
-                }
-            }
-        };
+            // 其他文件系统：source 元数据缺失时回退为 fs type，避免错误显示挂载点名
+            _ => fs_type.to_string(),
+        });
 
         // 过滤/改写 mountpoint（chroot 后应只暴露 root 下的挂载点，并重写为 chroot 视角）
         let mut mountpoint = mp.as_str().to_string();

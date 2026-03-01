@@ -169,8 +169,9 @@ impl BootCallbacks for PvhBootCallback {
 
             for _ in 0..start_info.memmap_entries {
                 let entry = unsafe { *ep };
+                let e820_type = E820Type::from(entry.type_);
 
-                let t = match E820Type::from(entry.type_) {
+                let t = match e820_type {
                     E820Type::Ram => 1,
                     E820Type::Reserved => 2,
                     E820Type::Acpi => 3,

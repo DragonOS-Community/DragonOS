@@ -1,11 +1,11 @@
 use crate::{
-    exception::InterruptArch,
-    process::{RawPid,SigInfo,CurrentIrqArch},
     arch::ipc::signal::Signal,
-    time::timer::{clock, Jiffies, Timer, TimerFunction},
+    exception::InterruptArch,
     ipc::signal_types::{OriginCode, SigCode, SigType},
+    process::{pid::PidType, CurrentIrqArch, ProcessControlBlock, RawPid, SigInfo},
+    time::timer::{clock, Jiffies, Timer, TimerFunction},
 };
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{boxed::Box, sync::Arc, sync::Weak};
 use core::sync::atomic::compiler_fence;
 use core::time::Duration;
 use system_error::SystemError;
@@ -49,21 +49,20 @@ impl AlarmTimer {
     }
 
     /// # 初始化目标进程的alarm定时器
-    ///  
+    ///
     /// 创建一个闹钟结构体并启动闹钟
     ///
     /// ## 函数参数
     ///
-    /// pid：发送消息的目标进程的pid
+    /// pcb：发送信号的目标进程
     ///
     /// second：设置alarm触发的秒数
     ///
     /// ### 函数返回值
     ///
     /// AlarmTimer结构体
-    pub fn alarm_timer_init(pid: RawPid, second: u64) -> AlarmTimer {
-        //初始化Timerfunc
-        let timerfunc = AlarmTimerFunc::new(pid);
+    pub fn alarm_timer_init(pcb: Arc<ProcessControlBlock>, second: u64) -> AlarmTimer {
+        let timerfunc = AlarmTimerFunc::new(pcb);
         let alarmtimer = AlarmTimer::new(timerfunc, second);
         alarmtimer.activate();
         alarmtimer
@@ -99,48 +98,43 @@ impl AlarmTimer {
     }
 }
 
-/// # 闹钟TimerFuntion结构体
+/// # 闹钟TimerFunction结构体
 ///
 /// ## 结构成员
 ///
-/// pid：发送消息的目标进程的pid
+/// target_pcb：发送信号的目标进程（弱引用，进程退出后自动失效）
 #[derive(Debug)]
 pub struct AlarmTimerFunc {
-    pid: RawPid,
+    target_pcb: Weak<ProcessControlBlock>,
 }
 
 impl AlarmTimerFunc {
-    pub fn new(pid: RawPid) -> Box<AlarmTimerFunc> {
-        return Box::new(AlarmTimerFunc { pid });
+    pub fn new(pcb: Arc<ProcessControlBlock>) -> Box<AlarmTimerFunc> {
+        Box::new(AlarmTimerFunc {
+            target_pcb: Arc::downgrade(&pcb),
+        })
     }
 }
 
 impl TimerFunction for AlarmTimerFunc {
     /// # 闹钟触发函数
-    ///  
-    /// 闹钟触发时，向目标进程发送一个SIGALRM信号
     ///
-    /// ## 函数参数
-    ///
-    /// expired_second：设置alarm触发的秒数
-    ///
-    /// ### 函数返回值
-    ///
-    /// Ok(()): 发送成功
+    /// 闹钟触发时，向目标进程发送一个SIGALRM信号。
+    /// 如果目标进程已退出（弱引用升级失败），则静默返回。
     fn run(&mut self) -> Result<(), SystemError> {
+        let pcb = match self.target_pcb.upgrade() {
+            Some(pcb) => pcb,
+            None => return Ok(()), // 进程已退出，无需发送信号
+        };
+
+        let pid = pcb.raw_pid();
         let sig = Signal::SIGALRM;
-        // 初始化signal info
-        let mut info = SigInfo::new(
-            sig,
-            0,
-            SigCode::Origin(OriginCode::Timer),
-            SigType::Alarm(self.pid),
-        );
+        let mut info = SigInfo::new(sig, 0, SigCode::Timer, SigType::Alarm(pid));
 
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let _retval = sig
-            .send_signal_info(Some(&mut info), self.pid)
+            .send_signal_info_to_pcb(Some(&mut info), pcb, PidType::PID)
             .map(|x| x as usize)?;
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         drop(irq_guard);

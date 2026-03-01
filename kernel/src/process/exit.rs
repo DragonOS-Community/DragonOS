@@ -224,23 +224,31 @@ pub fn kernel_waitid(
 
 /// 检查子进程是否可以被当前线程等待
 ///
-/// 1. 只有 child->parent 指向当前线程或线程组时，才有资格等待。
-/// 2. 如果子进程被 Ptrace，其 parent 指向 Tracer。此时只有 Tracer 能等待，原始父进程不能等待。
+/// 根据 Linux wait 语义：
+/// - 默认情况下，线程组中的任何线程都可以等待同一线程组中任何线程 fork 的子进程
+/// - 如果指定了 __WNOTHREAD，则只能等待当前线程自己创建的子进程
 fn is_eligible_child(child_pcb: &Arc<ProcessControlBlock>, options: WaitOption) -> bool {
     let current = ProcessManager::current_pcb();
-
-    // 获取子进程当前的parent父进程
-    let child_parent = match child_pcb.parent_pcb() {
-        Some(p) => p,
-        None => return false,
-    };
+    let current_tgid = current.tgid;
 
     if options.contains(WaitOption::WNOTHREAD) {
-        // __WNOTHREAD: 请求者必须是子进程的直接 parent
-        Arc::ptr_eq(&child_parent, &current)
+        // 带 __WNOTHREAD：只能等待当前线程自己创建的子进程
+        let fork_parent = match child_pcb.fork_parent_pcb() {
+            Some(p) => p,
+            None => return false,
+        };
+        Arc::ptr_eq(&fork_parent, &current)
     } else {
-        // 默认情况 (WEXITED 等): 只要子进程的 parent 属于当前线程组，就可以等待。
-        child_parent.tgid == current.tgid
+        // 获取子进程的 real_parent
+        let child_parent = match child_pcb.real_parent_pcb() {
+            Some(p) => p,
+            None => {
+                return false;
+            }
+        };
+        // 默认情况：线程组中的任何线程都可以等待同一线程组中任何线程创建的子进程
+        // 检查子进程的 real_parent 的 tgid 是否与当前线程的 tgid 相同
+        child_parent.tgid == current_tgid
     }
 }
 

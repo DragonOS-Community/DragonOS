@@ -2,10 +2,9 @@ use system_error::SystemError;
 
 use crate::{
     filesystem::vfs::{
-        file::{File, FileFlags},
-        utils::user_path_at,
-        FileType, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        utils::user_path_at, FilePrivateData, FileType, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
+    libs::mutex::Mutex,
     process::ProcessManager,
     syscall::user_access::{check_and_clone_cstr, UserBufferWriter},
 };
@@ -31,9 +30,12 @@ pub fn do_readlink_at(
 
     let ubuf = user_buf.buffer::<u8>(0).unwrap();
 
-    let file = File::new(inode, FileFlags::O_RDONLY)?;
-
-    let len = file.read(buf_size, ubuf)?;
+    let len = inode.read_at(
+        0,
+        buf_size,
+        ubuf,
+        Mutex::new(FilePrivateData::Unused).lock(),
+    )?;
 
     return Ok(len);
 }

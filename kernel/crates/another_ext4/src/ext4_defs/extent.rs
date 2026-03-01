@@ -57,6 +57,11 @@ impl ExtentHeader {
         self.entries_count
     }
 
+    /// Check extent header magic number.
+    pub fn check_magic(&self) -> bool {
+        self.magic == Self::EXTENT_MAGIC
+    }
+
     /// 设置extent header的条目数
     pub fn set_entries_count(&mut self, count: u16) {
         self.entries_count = count;
@@ -314,6 +319,9 @@ impl<'a> ExtentNode<'a> {
     /// should be inserted.
     pub fn search_extent_index(&self, lblock: LBlockId) -> core::result::Result<usize, usize> {
         // debug!("Search extent index: {}", lblock);
+        if self.header().entries_count == 0 {
+            return Err(0);
+        }
         let mut i = 0;
         while i < self.header().entries_count as usize {
             let extent_index = self.extent_index_at(i);
@@ -323,8 +331,11 @@ impl<'a> ExtentNode<'a> {
             i += 1;
         }
 
-        // debug!("Search res: {:?}", res);
-        Ok(i - 1)
+        if i == 0 {
+            Err(0)
+        } else {
+            Ok(i - 1)
+        }
     }
 
     pub fn print(&self) {
@@ -562,5 +573,27 @@ impl<'a> ExtentNodeMut<'a> {
         }
         // Return the right half
         Err(split)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extent_header_magic_check_works() {
+        let mut header = ExtentHeader::new(0, 0, 0, 0);
+        assert!(header.check_magic());
+        header.magic = 0;
+        assert!(!header.check_magic());
+    }
+
+    #[test]
+    fn search_extent_index_empty_node_returns_err_zero() {
+        let mut raw = [0u8; 60];
+        let mut node_mut = ExtentNodeMut::from_bytes(&mut raw);
+        node_mut.init(1, 0);
+        let node = ExtentNode::from_bytes(&raw);
+        assert_eq!(node.search_extent_index(0), Err(0));
     }
 }

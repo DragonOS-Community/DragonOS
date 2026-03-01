@@ -18,11 +18,11 @@ impl Ext4 {
             // Link child/".."
             self.dir_add_entry(child, parent, "..")?;
             parent.inode.set_link_count(parent.inode.link_count() + 1);
-            self.write_inode_with_csum(parent);
+            self.write_inode_with_csum(parent)?;
         }
         // Link parent/child
         child.inode.set_link_count(child_link_count + 1);
-        self.write_inode_with_csum(child);
+        self.write_inode_with_csum(child)?;
         Ok(())
     }
 
@@ -42,14 +42,14 @@ impl Ext4 {
         let child_link_cnt = child.inode.link_count();
         if child.inode.is_dir() {
             parent.inode.set_link_count(parent.inode.link_count() - 1);
-            self.write_inode_with_csum(parent);
+            self.write_inode_with_csum(parent)?;
         }
         if free && ((child.inode.is_dir() && child_link_cnt <= 2) || child_link_cnt <= 1) {
             // Remove file or directory
             return self.free_inode(child);
         }
         child.inode.set_link_count(child_link_cnt - 1);
-        self.write_inode_with_csum(child);
+        self.write_inode_with_csum(child)?;
         Ok(())
     }
 }

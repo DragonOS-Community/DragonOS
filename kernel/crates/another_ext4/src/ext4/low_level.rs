@@ -54,7 +54,7 @@ impl Ext4 {
     ///
     /// `EINVAL` if the inode is invalid (link count == 0).
     pub fn getattr(&self, id: InodeId) -> Result<FileAttr> {
-        let inode = self.read_inode(id);
+        let inode = self.read_inode(id)?;
         if inode.inode.link_count() == 0 {
             return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
         }
@@ -94,7 +94,7 @@ impl Ext4 {
     ///
     /// `EINVAL` if the inode is invalid (mode == 0).
     pub fn setattr(&self, id: InodeId, attr: SetAttr) -> Result<()> {
-        let mut inode = self.read_inode(id);
+        let mut inode = self.read_inode(id)?;
         if inode.inode.mode().bits() == 0 {
             return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
         }
@@ -127,7 +127,7 @@ impl Ext4 {
         if let Some(crtime) = attr.crtime {
             inode.inode.set_crtime(crtime);
         }
-        self.write_inode_with_csum(&mut inode);
+        self.write_inode_with_csum(&mut inode)?;
         Ok(())
     }
 
@@ -175,7 +175,7 @@ impl Ext4 {
     /// * `ENOTDIR` - `parent` is not a directory
     /// * `ENOSPC` - No space left on device
     pub fn create(&self, parent: InodeId, name: &str, mode: InodeMode) -> Result<InodeId> {
-        let mut parent = self.read_inode(parent);
+        let mut parent = self.read_inode(parent)?;
         // Can only create a file in a directory
         if !parent.inode.is_dir() {
             return_error!(ErrCode::ENOTDIR, "Inode {} is not a directory", parent.id);
@@ -217,7 +217,7 @@ impl Ext4 {
         major: u32,
         minor: u32,
     ) -> Result<InodeId> {
-        let mut parent_ref = self.read_inode(parent);
+        let mut parent_ref = self.read_inode(parent)?;
 
         // Can only create in a directory
         if !parent_ref.inode.is_dir() {
@@ -256,7 +256,7 @@ impl Ext4 {
     /// * `EISDIR` - `file` is not a regular file
     pub fn read(&self, file: InodeId, offset: usize, buf: &mut [u8]) -> Result<usize> {
         // Get the inode of the file
-        let file = self.read_inode(file);
+        let file = self.read_inode(file)?;
         if !file.inode.is_file() {
             return_error!(ErrCode::EISDIR, "Inode {} is not a file", file.id);
         }
@@ -277,8 +277,8 @@ impl Ext4 {
         // Read first block
         if misaligned > 0 {
             let read_len = min(BLOCK_SIZE - misaligned, read_size);
-            let fblock = self.extent_query(&file, start_iblock).unwrap();
-            let block = self.read_block(fblock);
+            let fblock = self.extent_query(&file, start_iblock)?;
+            let block = self.read_block(fblock)?;
             // Copy data from block to the user buffer
             buf[cursor..cursor + read_len].copy_from_slice(block.read_offset(misaligned, read_len));
             cursor += read_len;
@@ -290,7 +290,7 @@ impl Ext4 {
             match self.extent_query(&file, iblock) {
                 Ok(fblock) => {
                     // normal
-                    let block = self.read_block(fblock);
+                    let block = self.read_block(fblock)?;
                     buf[cursor..cursor + read_len].copy_from_slice(block.read_offset(0, read_len));
                 }
                 Err(_) => {
@@ -311,7 +311,7 @@ impl Ext4 {
     /// - For fast symlink (length <= 60), content is stored in inode.i_block (here inode.block[60])
     /// - For non-fast symlink, content is stored in data blocks, reusing extent read path
     pub fn readlink(&self, inode_id: InodeId, offset: usize, buf: &mut [u8]) -> Result<usize> {
-        let inode_ref = self.read_inode(inode_id);
+        let inode_ref = self.read_inode(inode_id)?;
         if !inode_ref.inode.is_softlink() {
             return_error!(ErrCode::EINVAL, "Inode {} is not a symlink", inode_id);
         }
@@ -341,8 +341,8 @@ impl Ext4 {
         let mut iblock = start_iblock;
         if misaligned > 0 {
             let read_len = min(BLOCK_SIZE - misaligned, read_size);
-            let fblock = self.extent_query(&inode_ref, start_iblock).unwrap();
-            let block = self.read_block(fblock);
+            let fblock = self.extent_query(&inode_ref, start_iblock)?;
+            let block = self.read_block(fblock)?;
             buf[cursor..cursor + read_len].copy_from_slice(block.read_offset(misaligned, read_len));
             cursor += read_len;
             iblock += 1;
@@ -351,7 +351,7 @@ impl Ext4 {
             let read_len = min(BLOCK_SIZE, read_size - cursor);
             match self.extent_query(&inode_ref, iblock) {
                 Ok(fblock) => {
-                    let block = self.read_block(fblock);
+                    let block = self.read_block(fblock)?;
                     buf[cursor..cursor + read_len].copy_from_slice(block.read_offset(0, read_len));
                 }
                 Err(_) => {
@@ -384,7 +384,7 @@ impl Ext4 {
     /// * `ENOSPC` - no space left on device
     pub fn write(&self, file: InodeId, offset: usize, data: &[u8]) -> Result<usize> {
         // Get the inode of the file
-        let mut file = self.read_inode(file);
+        let mut file = self.read_inode(file)?;
         if !file.inode.is_file() {
             return_error!(ErrCode::EISDIR, "Inode {} is not a file", file.id);
         }
@@ -406,19 +406,19 @@ impl Ext4 {
             let block_offset = (offset + cursor) % BLOCK_SIZE;
             let write_len = min(BLOCK_SIZE - block_offset, write_size - cursor);
             let fblock = self.extent_query(&file, iblock)?;
-            let mut block = self.read_block(fblock);
+            let mut block = self.read_block(fblock)?;
             block.write_offset(
                 (offset + cursor) % BLOCK_SIZE,
                 &data[cursor..cursor + write_len],
             );
-            self.write_block(&block);
+            self.write_block(&block)?;
             cursor += write_len;
             iblock += 1;
         }
         if offset + cursor > file.inode.size() as usize {
             file.inode.set_size((offset + cursor) as u64);
         }
-        self.write_inode_with_csum(&mut file);
+        self.write_inode_with_csum(&mut file)?;
 
         Ok(cursor)
     }
@@ -436,12 +436,12 @@ impl Ext4 {
     /// * `ENOTDIR` - `parent` is not a directory
     /// * `ENOSPC` - no space left on device
     pub fn link(&self, child: InodeId, parent: InodeId, name: &str) -> Result<()> {
-        let mut parent = self.read_inode(parent);
+        let mut parent = self.read_inode(parent)?;
         // Can only link to a directory
         if !parent.inode.is_dir() {
             return_error!(ErrCode::ENOTDIR, "Inode {} is not a directory", parent.id);
         }
-        let mut child = self.read_inode(child);
+        let mut child = self.read_inode(child)?;
         // Cannot link a directory
         if child.inode.is_dir() {
             return_error!(ErrCode::EISDIR, "Cannot link a directory");
@@ -463,14 +463,14 @@ impl Ext4 {
     /// * `ENOENT` - `name` does not exist in `parent`
     /// * `EISDIR` - `parent/name` is a directory
     pub fn unlink(&self, parent: InodeId, name: &str) -> Result<()> {
-        let mut parent = self.read_inode(parent);
+        let mut parent = self.read_inode(parent)?;
         // Can only unlink from a directory
         if !parent.inode.is_dir() {
             return_error!(ErrCode::ENOTDIR, "Inode {} is not a directory", parent.id);
         }
         // Cannot unlink directory
         let child_id = self.dir_find_entry(&parent, name)?;
-        let mut child = self.read_inode(child_id);
+        let mut child = self.read_inode(child_id)?;
         if child.inode.is_dir() {
             return_error!(ErrCode::EISDIR, "Cannot unlink a directory");
         }
@@ -486,7 +486,7 @@ impl Ext4 {
         parent: InodeId,
         new_parent: InodeId,
     ) -> Result<(InodeRef, Option<InodeRef>)> {
-        let parent_ref = self.read_inode(parent);
+        let parent_ref = self.read_inode(parent)?;
         if !parent_ref.inode.is_dir() {
             return_error!(
                 ErrCode::ENOTDIR,
@@ -498,7 +498,7 @@ impl Ext4 {
         let new_parent_ref = if parent == new_parent {
             None
         } else {
-            let np = self.read_inode(new_parent);
+            let np = self.read_inode(new_parent)?;
             if !np.inode.is_dir() {
                 return_error!(ErrCode::ENOTDIR, "Inode {} is not a directory", np.id);
             }
@@ -524,7 +524,7 @@ impl Ext4 {
             if cur == EXT4_ROOT_INO {
                 break;
             }
-            let cur_inode = self.read_inode(cur);
+            let cur_inode = self.read_inode(cur)?;
             match self.dir_find_entry(&cur_inode, "..") {
                 Ok(parent_id) if parent_id != cur => cur = parent_id,
                 _ => break,
@@ -569,7 +569,7 @@ impl Ext4 {
 
         // 2. 查找源 inode
         let child_id = self.dir_find_entry(&parent_ref, name)?;
-        let child = self.read_inode(child_id);
+        let child = self.read_inode(child_id)?;
         let child_is_dir = child.inode.is_dir();
         let child_file_type = child.inode.file_type();
 
@@ -590,7 +590,7 @@ impl Ext4 {
             }
             Some(existing_id) => {
                 // 情况 B：目标存在且是不同 inode → 原子替换
-                let mut existing_inode = self.read_inode(existing_id);
+                let mut existing_inode = self.read_inode(existing_id)?;
                 let existing_is_dir = existing_inode.inode.is_dir();
 
                 // 4b-1. 类型兼容性检查
@@ -635,7 +635,7 @@ impl Ext4 {
                         target_dir
                             .inode
                             .set_link_count(target_dir.inode.link_count() - 1);
-                        self.write_inode_with_csum(target_dir);
+                        self.write_inode_with_csum(target_dir)?;
                     }
                 }
 
@@ -649,7 +649,7 @@ impl Ext4 {
                     self.free_inode(&mut existing_inode)?;
                 } else {
                     existing_inode.inode.set_link_count(existing_link_cnt - 1);
-                    self.write_inode_with_csum(&mut existing_inode);
+                    self.write_inode_with_csum(&mut existing_inode)?;
                 }
 
                 // 4b-6. 跨目录移动时，处理源目录的 ".." 指向
@@ -660,14 +660,17 @@ impl Ext4 {
                     parent_ref
                         .inode
                         .set_link_count(parent_ref.inode.link_count() - 1);
-                    self.write_inode_with_csum(&mut parent_ref);
+                    self.write_inode_with_csum(&mut parent_ref)?;
 
                     // 注意：当 parent != new_parent 时，new_parent_ref 必定是 Some(...)
-                    let new_parent_dir = new_parent_ref.as_mut().unwrap();
+                    let new_parent_dir = new_parent_ref.as_mut().ok_or(format_error!(
+                        ErrCode::EINVAL,
+                        "rename: missing new parent reference for directory move"
+                    ))?;
                     new_parent_dir
                         .inode
                         .set_link_count(new_parent_dir.inode.link_count() + 1);
-                    self.write_inode_with_csum(new_parent_dir);
+                    self.write_inode_with_csum(new_parent_dir)?;
                 }
                 // 文件的 link count 不变（只是换了名字/位置）
             }
@@ -694,14 +697,17 @@ impl Ext4 {
                     parent_ref
                         .inode
                         .set_link_count(parent_ref.inode.link_count() - 1);
-                    self.write_inode_with_csum(&mut parent_ref);
+                    self.write_inode_with_csum(&mut parent_ref)?;
 
                     // 目标父目录获得 ".." 引用
-                    let new_parent_dir = new_parent_ref.as_mut().unwrap();
+                    let new_parent_dir = new_parent_ref.as_mut().ok_or(format_error!(
+                        ErrCode::EINVAL,
+                        "rename: missing new parent reference for directory move"
+                    ))?;
                     new_parent_dir
                         .inode
                         .set_link_count(new_parent_dir.inode.link_count() + 1);
-                    self.write_inode_with_csum(new_parent_dir);
+                    self.write_inode_with_csum(new_parent_dir)?;
                 }
                 // 文件：无 ".."，nlink 不变（只换了名字/位置）
                 // 目录同目录：".." 已指向正确的父，link count 不变
@@ -740,13 +746,13 @@ impl Ext4 {
 
         // 2. 查找两个 inode
         let old_id = self.dir_find_entry(&parent_ref, name)?;
-        let old_inode = self.read_inode(old_id);
+        let old_inode = self.read_inode(old_id)?;
         let old_is_dir = old_inode.inode.is_dir();
         let old_type = old_inode.inode.file_type();
 
         let target_dir_ref = new_parent_ref.as_ref().unwrap_or(&parent_ref);
         let new_id = self.dir_find_entry(target_dir_ref, new_name)?;
-        let new_inode = self.read_inode(new_id);
+        let new_inode = self.read_inode(new_id)?;
         let new_is_dir = new_inode.inode.is_dir();
         let new_type = new_inode.inode.file_type();
 
@@ -771,7 +777,10 @@ impl Ext4 {
             self.dir_replace_entry(&parent_ref, new_name, old_id, old_type)?;
         } else {
             self.dir_replace_entry(&parent_ref, name, new_id, new_type)?;
-            let new_parent_dir = new_parent_ref.as_ref().unwrap();
+            let new_parent_dir = new_parent_ref.as_ref().ok_or(format_error!(
+                ErrCode::EINVAL,
+                "rename_exchange: missing new parent reference for cross-dir exchange"
+            ))?;
             self.dir_replace_entry(new_parent_dir, new_name, old_id, old_type)?;
         }
 
@@ -782,20 +791,26 @@ impl Ext4 {
                 parent_ref
                     .inode
                     .set_link_count(parent_ref.inode.link_count() - 1);
-                self.write_inode_with_csum(&mut parent_ref);
-                let np = new_parent_ref.as_mut().unwrap();
+                self.write_inode_with_csum(&mut parent_ref)?;
+                let np = new_parent_ref.as_mut().ok_or(format_error!(
+                    ErrCode::EINVAL,
+                    "rename_exchange: missing new parent reference for old_dir update"
+                ))?;
                 np.inode.set_link_count(np.inode.link_count() + 1);
-                self.write_inode_with_csum(np);
+                self.write_inode_with_csum(np)?;
             }
             if new_is_dir {
                 self.dir_replace_entry(&new_inode, "..", parent, FileType::Directory)?;
-                let np = new_parent_ref.as_mut().unwrap();
+                let np = new_parent_ref.as_mut().ok_or(format_error!(
+                    ErrCode::EINVAL,
+                    "rename_exchange: missing new parent reference for new_dir update"
+                ))?;
                 np.inode.set_link_count(np.inode.link_count() - 1);
-                self.write_inode_with_csum(np);
+                self.write_inode_with_csum(np)?;
                 parent_ref
                     .inode
                     .set_link_count(parent_ref.inode.link_count() + 1);
-                self.write_inode_with_csum(&mut parent_ref);
+                self.write_inode_with_csum(&mut parent_ref)?;
             }
         }
 
@@ -820,7 +835,7 @@ impl Ext4 {
     /// * `ENOTDIR` - `parent` is not a directory
     /// * `ENOSPC` - no space left on device
     pub fn mkdir(&self, parent: InodeId, name: &str, mode: InodeMode) -> Result<InodeId> {
-        let mut parent = self.read_inode(parent);
+        let mut parent = self.read_inode(parent)?;
         // Can only create a directory in a directory
         if !parent.inode.is_dir() {
             return_error!(ErrCode::ENOTDIR, "Inode {} is not a directory", parent.id);
@@ -853,7 +868,7 @@ impl Ext4 {
     /// * `ENOTDIR` - `parent` is not a directory
     /// * `ENOENT` - `name` does not exist in `parent`
     pub fn lookup(&self, parent: InodeId, name: &str) -> Result<InodeId> {
-        let parent = self.read_inode(parent);
+        let parent = self.read_inode(parent)?;
         // Can only lookup in a directory
         if !parent.inode.is_dir() {
             return_error!(ErrCode::ENOTDIR, "Inode {} is not a directory", parent.id);
@@ -875,12 +890,12 @@ impl Ext4 {
     ///
     /// `ENOTDIR` - `inode` is not a directory
     pub fn listdir(&self, inode: InodeId) -> Result<Vec<DirEntry>> {
-        let inode_ref = self.read_inode(inode);
+        let inode_ref = self.read_inode(inode)?;
         // Can only list a directory
         if inode_ref.inode.file_type() != FileType::Directory {
             return_error!(ErrCode::ENOTDIR, "Inode {} is not a directory", inode);
         }
-        Ok(self.dir_list_entries(&inode_ref))
+        self.dir_list_entries(&inode_ref)
     }
 
     /// Remove an empty directory.
@@ -896,18 +911,18 @@ impl Ext4 {
     /// * `ENOENT` - `name` does not exist in `parent`
     /// * `ENOTEMPTY` - `child` is not empty
     pub fn rmdir(&self, parent: InodeId, name: &str) -> Result<()> {
-        let mut parent = self.read_inode(parent);
+        let mut parent = self.read_inode(parent)?;
         // Can only remove a directory in a directory
         if !parent.inode.is_dir() {
             return_error!(ErrCode::ENOTDIR, "Inode {} is not a directory", parent.id);
         }
-        let mut child = self.read_inode(self.dir_find_entry(&parent, name)?);
+        let mut child = self.read_inode(self.dir_find_entry(&parent, name)?)?;
         // Child must be a directory
         if !child.inode.is_dir() {
             return_error!(ErrCode::ENOTDIR, "Inode {} is not a directory", child.id);
         }
         // Child must be empty
-        if self.dir_list_entries(&child).len() > 2 {
+        if self.dir_list_entries(&child)?.len() > 2 {
             return_error!(ErrCode::ENOTEMPTY, "Directory {} is not empty", child.id);
         }
         // Remove directory entry
@@ -929,12 +944,12 @@ impl Ext4 {
     ///
     /// `ENODATA` - the attribute does not exist
     pub fn getxattr(&self, inode: InodeId, name: &str) -> Result<Vec<u8>> {
-        let inode_ref = self.read_inode(inode);
+        let inode_ref = self.read_inode(inode)?;
         let xattr_block_id = inode_ref.inode.xattr_block();
         if xattr_block_id == 0 {
             return_error!(ErrCode::ENODATA, "Xattr {} does not exist", name);
         }
-        let xattr_block = XattrBlock::new(self.read_block(xattr_block_id));
+        let xattr_block = XattrBlock::new(self.read_block(xattr_block_id)?);
         match xattr_block.get(name) {
             Some(value) => Ok(value.to_owned()),
             None => Err(format_error!(
@@ -958,20 +973,20 @@ impl Ext4 {
     ///
     /// `ENOSPC` - xattr block does not have enough space
     pub fn setxattr(&self, inode: InodeId, name: &str, value: &[u8]) -> Result<()> {
-        let mut inode_ref = self.read_inode(inode);
+        let mut inode_ref = self.read_inode(inode)?;
         let xattr_block_id = inode_ref.inode.xattr_block();
         if xattr_block_id == 0 {
             // lazy allocate xattr block
             let pblock = self.alloc_block(&mut inode_ref)?;
             inode_ref.inode.set_xattr_block(pblock);
-            self.write_inode_with_csum(&mut inode_ref);
+            self.write_inode_with_csum(&mut inode_ref)?;
         }
-        let mut xattr_block = XattrBlock::new(self.read_block(inode_ref.inode.xattr_block()));
+        let mut xattr_block = XattrBlock::new(self.read_block(inode_ref.inode.xattr_block())?);
         if xattr_block_id == 0 {
             xattr_block.init();
         }
         if xattr_block.insert(name, value) {
-            self.write_block(&xattr_block.block());
+            self.write_block(&xattr_block.block())?;
             Ok(())
         } else {
             return_error!(
@@ -993,14 +1008,14 @@ impl Ext4 {
     ///
     /// `ENODATA` - the attribute does not exist
     pub fn removexattr(&self, inode: InodeId, name: &str) -> Result<()> {
-        let inode_ref = self.read_inode(inode);
+        let inode_ref = self.read_inode(inode)?;
         let xattr_block_id = inode_ref.inode.xattr_block();
         if xattr_block_id == 0 {
             return_error!(ErrCode::ENODATA, "Xattr {} does not exist", name);
         }
-        let mut xattr_block = XattrBlock::new(self.read_block(xattr_block_id));
+        let mut xattr_block = XattrBlock::new(self.read_block(xattr_block_id)?);
         if xattr_block.remove(name) {
-            self.write_block(&xattr_block.block());
+            self.write_block(&xattr_block.block())?;
             Ok(())
         } else {
             return_error!(ErrCode::ENODATA, "Xattr {} does not exist", name);
@@ -1017,12 +1032,12 @@ impl Ext4 {
     ///
     /// A list of extended attributes of the file.
     pub fn listxattr(&self, inode: InodeId) -> Result<Vec<String>> {
-        let inode_ref = self.read_inode(inode);
+        let inode_ref = self.read_inode(inode)?;
         let xattr_block_id = inode_ref.inode.xattr_block();
         if xattr_block_id == 0 {
             return Ok(Vec::new());
         }
-        let xattr_block = XattrBlock::new(self.read_block(xattr_block_id));
+        let xattr_block = XattrBlock::new(self.read_block(xattr_block_id)?);
         Ok(xattr_block.list())
     }
 }

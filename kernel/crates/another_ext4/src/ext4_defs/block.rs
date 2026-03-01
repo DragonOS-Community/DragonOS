@@ -77,7 +77,7 @@ impl Block {
 /// Common interface for block devices.
 pub trait BlockDevice: Send + Sync + Any {
     /// Read a block from disk.
-    fn read_block(&self, block_id: PBlockId) -> Block;
+    fn read_block(&self, block_id: PBlockId) -> Result<Block>;
     /// Write a block to disk.
-    fn write_block(&self, block: &Block);
+    fn write_block(&self, block: &Block) -> Result<()>;
 }

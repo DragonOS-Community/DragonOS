@@ -1,3 +1,5 @@
+#![allow(function_casts_as_integer)]
+
 use log::{error, trace, warn};
 use system_error::SystemError;
 

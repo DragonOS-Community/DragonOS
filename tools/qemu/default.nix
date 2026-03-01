@@ -271,10 +271,7 @@ let
       inherit arch;
       isNographic = if arch == "riscv64" then true else baseConfig.nographic;
       qemuBin =
-        if preferSystemQemu then
-          "qemu-system-${arch}"
-        else
-          "${pkgs.qemu_kvm}/bin/qemu-system-${arch}";
+        if preferSystemQemu then "qemu-system-${arch}" else "${pkgs.qemu_kvm}/bin/qemu-system-${arch}";
     }
   );
 in

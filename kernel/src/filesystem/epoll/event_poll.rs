@@ -11,7 +11,7 @@ use crate::{
     process::ProcessManager,
     time::{
         timer::{next_n_us_timer_jiffies, Timer},
-        PosixTimeSpec,
+        Duration, Instant, PosixTimeSpec,
     },
 };
 use core::{
@@ -356,10 +356,15 @@ impl EventPoll {
             let epoll_guard = epoll.0.lock();
 
             let mut timeout = false;
+            let mut deadline: Option<Instant> = None;
             if let Some(timespec) = timespec {
                 if !(timespec.tv_sec > 0 || timespec.tv_nsec > 0) {
                     // 非阻塞情况
                     timeout = true;
+                } else {
+                    let timeout_us =
+                        (timespec.tv_sec * 1_000_000 + timespec.tv_nsec / 1_000) as u64;
+                    deadline = Some(Instant::now() + Duration::from_micros(timeout_us));
                 }
             } else if timespec.is_none() {
                 // 非阻塞情况
@@ -394,6 +399,12 @@ impl EventPoll {
                 // 如果超时
                 if timeout {
                     return Ok(0);
+                }
+
+                if let Some(deadline) = deadline {
+                    if Instant::now() >= deadline {
+                        return Ok(0);
+                    }
                 }
 
                 // 自旋等待一段时间
@@ -434,11 +445,20 @@ impl EventPoll {
 
                 // 注册定时器：用 waker.wake() 来触发 waiter 退出等待（而不是仅唤醒 PCB）
                 let mut timer = None;
-                if let Some(timespec) = timespec {
-                    let us = (timespec.tv_sec * 1_000_000 + timespec.tv_nsec / 1_000) as u64;
-                    let jiffies = next_n_us_timer_jiffies(us);
-                    let inner: Arc<Timer> = Timer::new(TimeoutWaker::new(waker.clone()), jiffies);
-                    timer = Some(inner);
+                if let Some(deadline) = deadline {
+                    let remain = deadline.saturating_sub(Instant::now());
+                    if remain == Duration::ZERO {
+                        timeout = true;
+                    } else {
+                        let jiffies = next_n_us_timer_jiffies(remain.total_micros());
+                        let inner: Arc<Timer> =
+                            Timer::new(TimeoutWaker::new(waker.clone()), jiffies);
+                        timer = Some(inner);
+                    }
+                }
+
+                if timeout {
+                    return Ok(0);
                 }
                 {
                     let guard = epoll.0.lock();

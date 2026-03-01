@@ -347,7 +347,7 @@ fn do_new_mount(
     //     mount_flags
     // );
     let fs = produce_fs(&fs_type_str, data.as_deref(), &source).inspect_err(|e| {
-        log::error!("Failed to produce filesystem: {:?}", e);
+        log::warn!("Failed to produce filesystem: {:?}", e);
     })?;
 
     // 若目标是挂载点根，则尝试在其父目录挂载，避免 EBUSY 并与 Linux 叠加语义接近

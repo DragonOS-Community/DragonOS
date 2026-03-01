@@ -7,6 +7,7 @@ pub mod iov;
 pub mod mount;
 pub mod open;
 pub mod permission;
+pub mod posix_lock;
 pub mod stat;
 pub mod syscall;
 pub mod utils;
@@ -544,6 +545,15 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
+    /// @brief 在当前目录下创建符号链接（name -> target）
+    fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let inode = self.create_with_data(name, FileType::SymLink, InodeMode::S_IRWXUGO, 0)?;
+        let bytes = target.as_bytes();
+        let len = bytes.len();
+        inode.write_at(0, len, bytes, Mutex::new(FilePrivateData::Unused).lock())?;
+        Ok(inode)
+    }
+
     /// @brief 在当前目录下，创建一个名为Name的硬链接，指向另一个IndexNode
     ///
     /// @param name 硬链接的名称
@@ -590,6 +600,11 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
         return Err(SystemError::ENOSYS);
+    }
+
+    /// @brief 专用于 remote 权限模型下 access(2) 的检查
+    fn check_access(&self, _mask: PermissionMask) -> Result<(), SystemError> {
+        Err(SystemError::ENOSYS)
     }
 
     /// @brief 寻找一个名为Name的inode
@@ -763,6 +778,21 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn sync(&self) -> Result<(), SystemError> {
         // todo：完善元数据的同步
         self.datasync()
+    }
+
+    /// @brief 基于打开文件上下文执行同步（可使用文件句柄等私有信息）
+    ///
+    /// 默认实现回退到 inode 级 `sync/datasync`。
+    fn sync_file(
+        &self,
+        datasync: bool,
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        if datasync {
+            self.datasync()
+        } else {
+            self.sync()
+        }
     }
 
     /// @brief 仅同步数据到磁盘（不包括元数据）
@@ -993,9 +1023,6 @@ impl dyn IndexNode {
         let process_root_inode = ProcessManager::current_pcb().fs_struct().root();
         let trailing_slash = path.ends_with('/');
 
-        // 获取当前进程的凭证（用于路径遍历的权限检查）
-        let cred = ProcessManager::current_pcb().cred();
-
         // 处理绝对路径
         // result: 上一个被找到的inode
         // rest_path: 还没有查找的路径
@@ -1014,9 +1041,9 @@ impl dyn IndexNode {
             }
 
             // 检查当前目录的执行权限（搜索权限）
-            // 这确保了进程有权限遍历到此目录
+            // 这确保了进程有权限遍历到此目录（对 Remote 权限模型的 FS，该检查会被绕过）
             let metadata = result.metadata()?;
-            cred.inode_permission(&metadata, PermissionMask::MAY_EXEC.bits())?;
+            permission::check_inode_permission(&result, &metadata, PermissionMask::MAY_EXEC)?;
 
             let name;
             // 寻找“/”
@@ -1275,6 +1302,7 @@ bitflags! {
         const DEVFS_MAGIC = 0x1373;
         const FAT_MAGIC =  0xf2f52011;
         const EXT4_MAGIC = 0xef53;
+        const FUSE_MAGIC = 0x65735546;
         const TMPFS_MAGIC = 0x01021994;
         const KER_MAGIC = 0x3153464b;
         const PROC_MAGIC = 0x9fa0;
@@ -1284,6 +1312,18 @@ bitflags! {
         const PIPEFS_MAGIC = 0x50495045;
         const EVENTFD_MAGIC = 0x45564446; // "EVDF" in ASCII
     }
+}
+
+/// Filesystem-level permission checking policy used by VFS.
+///
+/// - `Dac`: VFS performs Unix DAC permission checks (mode/uid/gid) locally.
+/// - `Remote`: VFS bypasses local DAC checks and lets the filesystem/server decide.
+///   For Linux FUSE remote model, execute permission is still checked locally for
+///   regular files; see `vfs::permission::check_inode_permission()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FsPermissionPolicy {
+    Dac,
+    Remote,
 }
 
 /// @brief 所有文件系统都应该实现的trait
@@ -1309,6 +1349,24 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     fn name(&self) -> &str;
 
     fn super_block(&self) -> SuperBlock;
+
+    /// @brief 获取文件系统统计信息（statfs）
+    ///
+    /// 默认实现直接返回 super_block。需要自定义 statfs 行为的文件系统可覆写此方法。
+    fn statfs(&self, _inode: &Arc<dyn IndexNode>) -> Result<SuperBlock, SystemError> {
+        Ok(self.super_block())
+    }
+
+    /// VFS permission checking policy for this filesystem instance.
+    ///
+    /// Default is `Dac` (local Unix DAC checks).
+    fn permission_policy(&self) -> FsPermissionPolicy {
+        FsPermissionPolicy::Dac
+    }
+
+    /// Called after a filesystem is successfully unmounted.
+    /// Default is no-op.
+    fn on_umount(&self) {}
 
     unsafe fn fault(&self, _pfm: &mut PageFaultMessage) -> VmFaultReason {
         VmFaultReason::VM_FAULT_SIGBUS
@@ -1495,7 +1553,13 @@ pub fn produce_fs(
     data: Option<&str>,
     source: &str,
 ) -> Result<Arc<dyn FileSystem>, SystemError> {
-    match FSMAKER.iter().find(|&m| m.name == filesystem) {
+    let canonical_filesystem = if filesystem.starts_with("fuse.") {
+        "fuse"
+    } else {
+        filesystem
+    };
+
+    match FSMAKER.iter().find(|&m| m.name == canonical_filesystem) {
         Some(maker) => {
             let mount_data = (maker.builder)(data, source)?;
             let mount_data_ref = mount_data.as_ref().map(|arc| arc.as_ref());

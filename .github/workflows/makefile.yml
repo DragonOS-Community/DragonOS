@@ -7,18 +7,35 @@ on:
     branches: ["master", "feat-*", "fix-*"]
 
 jobs:
+  changes:
+    name: Detect kernel changes
+    runs-on: ubuntu-latest
+    outputs:
+      kernel_changed: ${{ steps.filter.outputs.kernel }}
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - name: Check changed paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            kernel:
+              - 'kernel/**'
+
   format-check:
     name: Format check ${{ matrix.arch }}
     runs-on: ubuntu-latest
     continue-on-error: true
-    container: dragonos/dragonos-dev:v1.22
+    container: dragonos/dragonos-dev:v1.23
 
     strategy:
       matrix:
         arch: [x86_64, riscv64, loongarch64]
 
     steps:
-      - run: echo "Running in dragonos/dragonos-dev:v1.22"
+      - run: echo "Running in dragonos/dragonos-dev:v1.23"
       - uses: actions/checkout@v3
 
       - name: Change source
@@ -37,16 +54,18 @@ jobs:
 
   kernel-static-test:
     name: Kernel static test ${{ matrix.arch }}
+    needs: changes
+    if: needs.changes.outputs.kernel_changed == 'true'
     runs-on: ubuntu-latest
     continue-on-error: true
-    container: dragonos/dragonos-dev:v1.22
+    container: dragonos/dragonos-dev:v1.23
 
     strategy:
       matrix:
         arch: [x86_64, riscv64, loongarch64]
 
     steps:
-      - run: echo "Running in dragonos/dragonos-dev:v1.22"
+      - run: echo "Running in dragonos/dragonos-dev:v1.23"
 
       - uses: actions/checkout@v3
 
@@ -64,7 +83,7 @@ jobs:
   build:
     name: Build ${{ matrix.arch }}
     runs-on: ubuntu-latest
-    container: dragonos/dragonos-dev:v1.22
+    container: dragonos/dragonos-dev:v1.23
     continue-on-error: true
     strategy:
       matrix:
@@ -81,7 +100,7 @@ jobs:
             checkout_params: {}
 
     steps:
-      - run: echo "Running in dragonos/dragonos-dev:v1.22"
+      - run: echo "Running in dragonos/dragonos-dev:v1.23"
 
       - uses: actions/checkout@v3
         with: ${{ matrix.checkout_params }}

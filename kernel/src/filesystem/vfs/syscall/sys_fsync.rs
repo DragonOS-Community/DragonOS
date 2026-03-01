@@ -29,8 +29,7 @@ impl Syscall for SysFsyncHandle {
             .get_file_by_fd(fd)
             .ok_or(system_error::SystemError::EBADF)?;
         drop(fd_table_guard);
-        let inode = file.inode();
-        inode.sync()?;
+        file.inode().sync_file(false, file.private_data.lock())?;
         Ok(0)
     }
 

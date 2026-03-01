@@ -37,10 +37,11 @@ pub mod eth_protocol {
 }
 
 /// 数据包类型
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum PacketType {
     /// 发往本机的包
+    #[default]
     Host = 0,
     /// 广播包
     Broadcast = 1,
@@ -52,12 +53,6 @@ pub enum PacketType {
     Outgoing = 4,
     /// 环回包
     Loopback = 5,
-}
-
-impl Default for PacketType {
-    fn default() -> Self {
-        Self::Host
-    }
 }
 
 /// AF_PACKET socket 类型

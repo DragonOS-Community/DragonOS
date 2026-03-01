@@ -52,9 +52,11 @@ impl Syscall for SysTruncateHandle {
             .lookup_follow_symlink(remain_path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
         let md = target.metadata()?;
-        // DAC write permission check
-        let cred = ProcessManager::current_pcb().cred();
-        cred.inode_permission(&md, PermissionMask::MAY_WRITE.bits())?;
+        crate::filesystem::vfs::permission::check_inode_permission(
+            &target,
+            &md,
+            PermissionMask::MAY_WRITE,
+        )?;
 
         // RLIMIT_FSIZE enforcement for regular files
         if md.file_type == FileType::File {

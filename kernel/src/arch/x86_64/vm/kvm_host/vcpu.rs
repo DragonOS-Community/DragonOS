@@ -458,7 +458,8 @@ impl X86VcpuArch {
                 todo!()
             }
             msr::APIC_BASE => {
-                todo!()
+                self.apic_base = data;
+                return;
             }
             // APIC_BASE_MSR ... APIC_BASE_MSR + 0xff
             0x800..=0x8ff => {
@@ -1290,16 +1291,12 @@ impl VirtCpu {
         mmu_reset_needed: &mut bool,
         update_pdptrs: bool,
     ) -> Result<(), SystemError> {
-        let mut apic_base_msr = MsrData::default();
-
         if !self.is_valid_segment_regs(sregs) {
             return Err(SystemError::EINVAL);
         }
 
-        apic_base_msr.data = sregs.apic_base;
-        apic_base_msr.host_initiated = true;
-
-        // TODO: kvm_set_apic_base
+        // 与 Linux KVM 一样，sregs.apic_base 走 MSR 写路径更新状态。
+        self.set_msr(msr::APIC_BASE, sregs.apic_base, true)?;
 
         if self.arch.guest_state_protected {
             return Ok(());

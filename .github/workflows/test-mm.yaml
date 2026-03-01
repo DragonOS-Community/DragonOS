@@ -4,8 +4,16 @@ on:
   workflow_dispatch:
   push:
     branches: ["master", "feat-*", "fix-*"]
+    paths:
+      - "kernel/src/mm/**"
+      - "kernel/src/arch/**/mm/**"
+      - "kernel/crates/rust-slabmalloc/**"
   pull_request:
     branches: ["master", "feat-*", "fix-*"]
+    paths:
+      - "kernel/src/mm/**"
+      - "kernel/src/arch/**/mm/**"
+      - "kernel/crates/rust-slabmalloc/**"
 
 env:
   HOME: /root
@@ -17,7 +25,7 @@ jobs:
     name: Build slab_stress (host)
     runs-on: ubuntu-latest
     container:
-      image: dragonos/dragonos-dev:v1.22
+      image: dragonos/dragonos-dev:v1.23
       options: --privileged -v /dev:/dev
     steps:
       - name: Checkout DragonOS code
@@ -46,7 +54,7 @@ jobs:
         size: [64, 128, 255, 256]
         seed: [1, 2, 3]
     container:
-      image: dragonos/dragonos-dev:v1.22
+      image: dragonos/dragonos-dev:v1.23
       options: --privileged -v /dev:/dev
     steps:
       - name: Checkout DragonOS code
@@ -84,5 +92,3 @@ jobs:
               --max-live 4096 \
               --size "${SLAB_STRESS_SIZE}" \
               --seed "${SLAB_STRESS_SEED}"
-
-

@@ -2235,6 +2235,14 @@ impl ProcessBasicInfo {
         return self.fd_table.clone();
     }
 
+    #[inline]
+    pub fn fd_table_is_shared(&self) -> bool {
+        self.fd_table
+            .as_ref()
+            .map(|t| Arc::strong_count(t) > 1)
+            .unwrap_or(false)
+    }
+
     pub fn set_fd_table(
         &mut self,
         fd_table: Option<Arc<RwSem<FileDescriptorVec>>>,
@@ -2706,8 +2714,8 @@ impl KernelStack {
 
 impl Drop for KernelStack {
     fn drop(&mut self) {
-        if self.stack.is_some() {
-            let ptr = self.stack.as_ref().unwrap().as_ptr() as *const *const ProcessControlBlock;
+        if let Some(stack) = &self.stack {
+            let ptr = stack.as_ptr() as *const *const ProcessControlBlock;
             if unsafe { !(*ptr).is_null() } {
                 let pcb_ptr: Weak<ProcessControlBlock> = unsafe { Weak::from_raw(*ptr) };
                 drop(pcb_ptr);

@@ -8,8 +8,8 @@ use log::error;
 use system_error::SystemError;
 
 use super::{
-    append_lock::with_inode_append_lock, utils::should_remove_sgid, FileType, IndexNode, InodeId,
-    Metadata, SpecialNodeData,
+    append_lock::with_inode_append_lock, mount::MountFSInode, utils::should_remove_sgid, FileType,
+    IndexNode, InodeId, Metadata, SpecialNodeData,
 };
 use crate::{arch::ipc::signal::Signal, filesystem::vfs::InodeFlags, process::pid::PidPrivateData};
 use crate::{
@@ -21,11 +21,12 @@ use crate::{
     },
     filesystem::{
         epoll::{event_poll::EPollPrivateData, EPollItem},
+        fuse::private_data::FuseFilePrivateData,
         procfs::ProcfsFilePrivateData,
         vfs::FilldirContext,
     },
     ipc::{kill::send_signal_to_pid, pipe::PipeFsPrivateData},
-    libs::{mutex::Mutex, rwsem::RwSem},
+    libs::{casting::DowncastArc, mutex::Mutex, rwsem::RwSem},
     mm::{
         page::PageFlags,
         readahead::{page_cache_async_readahead, page_cache_sync_readahead, FileReadaheadState},
@@ -47,10 +48,25 @@ use crate::filesystem::vfs::InodeMode;
 
 const MAX_LFS_FILESIZE: i64 = i64::MAX;
 static NEXT_OPEN_FILE_ID: AtomicUsize = AtomicUsize::new(1);
+static NEXT_LOCK_OWNER_ID: AtomicUsize = AtomicUsize::new(1);
 
 #[inline]
 fn alloc_open_file_id() -> usize {
     NEXT_OPEN_FILE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+#[inline]
+fn alloc_lock_owner_id() -> usize {
+    NEXT_LOCK_OWNER_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn canonical_inode_for_posix_lock(mut inode: Arc<dyn IndexNode>) -> Arc<dyn IndexNode> {
+    loop {
+        match inode.clone().downcast_arc::<MountFSInode>() {
+            Some(mnt_inode) => inode = mnt_inode.underlying_inode(),
+            None => return inode,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -132,6 +148,8 @@ pub enum FilePrivateData {
     Namespace(NamespaceFilePrivateData),
     /// Socket file created by socket syscalls (not by VFS open(2)).
     SocketCreate,
+    /// FUSE file private data.
+    Fuse(FuseFilePrivateData),
     /// 不需要文件私有信息
     Unused,
 }
@@ -405,6 +423,9 @@ pub struct File {
     cred: Arc<Cred>,
     /// owner
     pid: Mutex<Option<Arc<ProcessControlBlock>>>,
+    /// Stable key for POSIX record locks. Cached at open time to avoid metadata fetch
+    /// in close/drop_fd path (which can deadlock with user-space FUSE daemon).
+    posix_lock_key: (usize, InodeId),
     /// 预读状态
     ra_state: Mutex<FileReadaheadState>,
 }
@@ -486,10 +507,10 @@ impl File {
         if need_data_sync || inode_sync {
             if need_metadata_sync || inode_sync {
                 // O_SYNC 或 S_SYNC: 完整同步（数据 + 元数据）
-                self.inode.sync()?;
+                self.inode.sync_file(false, self.private_data.lock())?;
             } else {
                 // O_DSYNC: 仅数据同步
-                self.inode.datasync()?;
+                self.inode.sync_file(true, self.private_data.lock())?;
             }
         }
         Ok(())
@@ -570,6 +591,14 @@ impl File {
             flags.insert(FileFlags::O_APPEND);
         }
 
+        let canonical_inode = canonical_inode_for_posix_lock(inode.clone());
+        let posix_lock_key = if Arc::ptr_eq(&canonical_inode, &inode) {
+            (metadata.dev_id, metadata.inode_id)
+        } else {
+            let lock_md = canonical_inode.metadata()?;
+            (lock_md.dev_id, lock_md.inode_id)
+        };
+
         // O_CLOEXEC 是 per-fd 属性，由 alloc_fd/alloc_fd_arc 的 cloexec 参数控制，
         // 不存储在 File.flags 中。
         flags.remove(FileFlags::O_CLOEXEC);
@@ -621,6 +650,7 @@ impl File {
             private_data,
             cred: ProcessManager::current_pcb().cred(),
             pid: Mutex::new(None),
+            posix_lock_key,
             ra_state: Mutex::new(FileReadaheadState::new()),
         };
 
@@ -1149,6 +1179,7 @@ impl File {
             private_data: Mutex::new(self.private_data.lock().clone()),
             cred: self.cred.clone(),
             pid: Mutex::new(None),
+            posix_lock_key: self.posix_lock_key,
             ra_state: Mutex::new(self.ra_state.lock().clone()),
         };
         // 调用inode的open方法，让inode知道有新的文件打开了这个inode
@@ -1173,6 +1204,11 @@ impl File {
     #[inline]
     pub fn open_file_id(&self) -> usize {
         self.open_file_id
+    }
+
+    #[inline]
+    pub fn posix_lock_key(&self) -> (usize, InodeId) {
+        self.posix_lock_key
     }
 
     /// 获取当前文件偏移（等价于用户态的 file position）。
@@ -1378,12 +1414,12 @@ impl Drop for File {
         super::flock::release_all_for_file(self);
         let r: Result<(), SystemError> = self.inode.close(self.private_data.lock());
         // 打印错误信息
-        if r.is_err() {
+        if let Err(e) = r {
             error!(
                 "pid: {:?} failed to close file: {:?}, errno={:?}",
                 ProcessManager::current_pcb().raw_pid(),
                 self,
-                r.as_ref().unwrap_err()
+                e
             );
         }
     }
@@ -1396,6 +1432,8 @@ pub struct FileDescriptorVec {
     fds: Vec<Option<Arc<File>>>,
     /// per-fd 的 close_on_exec 标志（与 fds 并行，对应 Linux fdtable.close_on_exec 位图）
     cloexec: Vec<bool>,
+    /// POSIX record lock owner id，对齐 Linux current->files 语义。
+    lock_owner_id: usize,
     /// 下一个可能空闲的文件描述符号（用于优化分配，避免O(n²)扫描）
     /// 类似于 Linux 的 fd_next_fd
     next_fd: usize,
@@ -1423,11 +1461,17 @@ impl FileDescriptorVec {
         return FileDescriptorVec {
             fds: data,
             cloexec,
+            lock_owner_id: alloc_lock_owner_id(),
             next_fd: 0,
         };
     }
 
     /// @brief 克隆一个文件描述符数组
+    ///
+    /// 语义对齐 Linux dup_fd/new files_struct：
+    /// - 复制 fd 与 cloexec 状态
+    /// - 分配新的 record-lock owner（POSIX 锁 owner 绑定 files table）
+    ///   因此 fork 出来的新进程不会与父进程共享 POSIX record lock owner。
     ///
     /// @return FileDescriptorVec 克隆后的文件描述符数组
     pub fn clone(&self) -> FileDescriptorVec {
@@ -1443,6 +1487,8 @@ impl FileDescriptorVec {
         }
         // 复制 next_fd 以保持相同的分配状态
         res.next_fd = self.next_fd;
+        // 新 fd table 必须拥有新的 record-lock owner（对齐 Linux 新 files_struct）。
+        res.lock_owner_id = alloc_lock_owner_id();
         return res;
     }
 
@@ -1684,6 +1730,7 @@ impl FileDescriptorVec {
 
         // 把文件描述符数组对应位置设置为空
         let file = self.fds[fd as usize].take().unwrap();
+        super::posix_lock::release_posix_for_file_owner(&file, self.lock_owner_id);
         // 清除 per-fd close_on_exec 标志
         self.cloexec[fd as usize] = false;
 
@@ -1719,6 +1766,11 @@ impl FileDescriptorVec {
         }
     }
 
+    #[inline]
+    pub fn lock_owner_id(&self) -> usize {
+        self.lock_owner_id
+    }
+
     /// 在 execve 时关闭所有设置了 close_on_exec 的文件描述符
     pub fn close_on_exec(&mut self) {
         for i in 0..self.fds.len() {
@@ -1732,6 +1784,14 @@ impl FileDescriptorVec {
                     );
                 }
             }
+        }
+    }
+}
+
+impl Drop for FileDescriptorVec {
+    fn drop(&mut self) {
+        for file in self.fds.iter().filter_map(|f| f.as_ref()) {
+            super::posix_lock::release_posix_for_file_owner(file, self.lock_owner_id);
         }
     }
 }

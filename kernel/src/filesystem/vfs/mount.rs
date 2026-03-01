@@ -635,21 +635,14 @@ impl MountFSInode {
 
         let mountpoint_id = self.inner_inode.metadata()?.inode_id;
 
-        // Get the child mount that will be unmounted
+        // Detach first. Follow-up bookkeeping (peer registry and propagation)
+        // must not run if detach itself failed.
         let child_mount = self
             .mount_fs
             .mountpoints
             .lock()
-            .get(&mountpoint_id)
-            .cloned();
-
-        if let Some(ref child) = child_mount {
-            // Unregister from peer group if shared
-            let child_prop = child.propagation();
-            if child_prop.is_shared() {
-                unregister_peer(child_prop.peer_group_id(), child);
-            }
-        }
+            .remove(&mountpoint_id)
+            .ok_or(SystemError::ENOENT)?;
 
         // Propagate umount to peers and slaves of the parent mount
         let parent_prop = self.mount_fs.propagation();
@@ -659,13 +652,13 @@ impl MountFSInode {
             }
         }
 
-        // Remove the mount
-        return self
-            .mount_fs
-            .mountpoints
-            .lock()
-            .remove(&mountpoint_id)
-            .ok_or(SystemError::ENOENT);
+        // Remove detached mount from peer registry if needed.
+        let child_prop = child_mount.propagation();
+        if child_prop.is_shared() {
+            unregister_peer(child_prop.peer_group_id(), &child_mount);
+        }
+
+        return Ok(child_mount);
     }
 
     #[inline(never)]
@@ -770,6 +763,14 @@ impl IndexNode for MountFSInode {
 
     fn sync(&self) -> Result<(), SystemError> {
         return self.inner_inode.sync();
+    }
+
+    fn sync_file(
+        &self,
+        datasync: bool,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        self.inner_inode.sync_file(datasync, data)
     }
 
     fn fadvise(
@@ -911,6 +912,15 @@ impl IndexNode for MountFSInode {
         return self.inner_inode.link(name, &other_inner);
     }
 
+    fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let inner_inode = self.inner_inode.symlink(name, target)?;
+        Ok(Arc::new_cyclic(|self_ref| MountFSInode {
+            inner_inode,
+            mount_fs: self.mount_fs.clone(),
+            self_ref: self_ref.clone(),
+        }))
+    }
+
     /// @brief 在挂载文件系统中删除文件/文件夹
     #[inline]
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
@@ -961,6 +971,13 @@ impl IndexNode for MountFSInode {
         return self
             .inner_inode
             .move_to(old_name, &target_inner, new_name, flags);
+    }
+
+    fn check_access(
+        &self,
+        mask: crate::filesystem::vfs::permission::PermissionMask,
+    ) -> Result<(), SystemError> {
+        self.inner_inode.check_access(mask)
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
@@ -1210,6 +1227,21 @@ impl FileSystem for MountFS {
         let mut sb = self.inner_filesystem.super_block();
         sb.flags = self.mount_flags.bits() as u64;
         sb
+    }
+
+    fn statfs(&self, inode: &Arc<dyn IndexNode>) -> Result<SuperBlock, SystemError> {
+        let inner_inode = inode
+            .as_any_ref()
+            .downcast_ref::<MountFSInode>()
+            .map(|mnt| mnt.inner_inode.clone())
+            .unwrap_or_else(|| inode.clone());
+        let mut sb = self.inner_filesystem.statfs(&inner_inode)?;
+        sb.flags = self.mount_flags.bits() as u64;
+        Ok(sb)
+    }
+
+    fn permission_policy(&self) -> crate::filesystem::vfs::FsPermissionPolicy {
+        self.inner_filesystem.permission_policy()
     }
 
     unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {

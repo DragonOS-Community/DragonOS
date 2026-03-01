@@ -90,7 +90,7 @@ kprobe = { path = "crates/kprobe" }
 lru = "0.12.3"
 
 rbpf = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/rbpf", rev = "f31e471a29", default-features = false }
-printf-compat = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/printf-compat", rev = "626801cb5f", default-features = false }
+printf-compat = { version = "=0.3.1", default-features = false }
 
 static-keys = { version = "=0.7" }
 

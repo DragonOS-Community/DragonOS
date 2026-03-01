@@ -99,6 +99,11 @@ impl ProcessPosixTimers {
         self.timers.get_mut(&timerid).ok_or(SystemError::EINVAL)
     }
 
+    /// 返回所有 timer ID 的迭代器
+    pub fn timer_ids(&self) -> impl Iterator<Item = i32> + '_ {
+        self.timers.keys().copied()
+    }
+
     fn alloc_id(&mut self) -> i32 {
         // Linux timer_t 在用户态通常是 int；这里用递增 id，跳过 0。
         let mut id = self.next_id;

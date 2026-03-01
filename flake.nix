@@ -66,15 +66,34 @@
               null
             else
               builtins.elemAt rust-channel-match 2;
-          rust-components = rust-toolchain-toml.toolchain.components or [ ];
+          rust-components-from-toml = rust-toolchain-toml.toolchain.components or [ ];
+          rust-required-components = [
+            "cargo"
+            "rustc"
+            "rust-std"
+          ];
+          rust-missing-required = builtins.filter (
+            component: !(builtins.elem component rust-components-from-toml)
+          ) rust-required-components;
+          rust-components-effective = lib.unique (rust-components-from-toml ++ rust-required-components);
+          rust-components-selected =
+            if rust-missing-required == [ ] then
+              rust-components-effective
+            else
+              builtins.trace "Warning: kernel/rust-toolchain.toml is missing required Rust components: ${lib.concatStringsSep ", " rust-missing-required}. DragonOS Nix build will auto-add them. Recommended: add them to kernel/rust-toolchain.toml to keep one explicit source of truth." rust-components-effective;
           rust-dist-root = "https://rsproxy.cn/dist";
           rust-toolchain-base = fenix.packages.${system}.toolchainOf {
             root = rust-dist-root;
             channel = rust-channel;
             date = rust-date;
-            sha256 = "sha256-3JA9u08FrvsLdi5dGIsUeQZq3Tpn9RvWdkLus2+5cHs=";
+            # Fixed-output hash for Rust channel metadata.
+            # Update this when rust-toolchain channel/date changes:
+            # 1) run nix develop / nix run
+            # 2) copy the "got: sha256-..." from mismatch error to this field
+            # 3) re-run nix develop and verify rustc/cargo come from rust-toolchain-wrapped/bin
+            sha256 = "sha256-ggvRZZFjlAlrZVjqul/f/UpU5CEhDbdKZU0OCR8Uzbc=";
           };
-          rust-toolchain-raw = rust-toolchain-base.withComponents rust-components;
+          rust-toolchain-raw = rust-toolchain-base.withComponents rust-components-selected;
           rust-toolchain = pkgs.symlinkJoin {
             name = "rust-toolchain-wrapped";
             paths = [ rust-toolchain-raw ];
@@ -169,6 +188,8 @@
               runApp = pkgs.writeScriptBin "dragonos-yolo" ''
                 #!${pkgs.runtimeShell}
                 set -e
+                export USING_DRAGONOS_NIX_ENV=1
+                export PATH=${rust-toolchain}/bin:$PATH
 
                 echo "==> Step 1: Building kernel with make kernel..."
                 ${pkgs.gnumake}/bin/make kernel
@@ -273,6 +294,7 @@
 
             # Shell启动脚本
             shellHook = ''
+              export PATH=${rust-toolchain}/bin:$PATH
               # 自动创建 GC root，避免 nix store gc 清理开发环境
               if [ -z "''${DRAGONOS_NIX_GC_ROOT:-}" ]; then
                 if [ ! -e ".nix-gc-root" ]; then
@@ -282,8 +304,14 @@
               fi
               echo "欢迎进入 DragonOS Nix 开发环境!"
               echo ""
+              echo "  Rust toolchain:"
+              echo "    rustc: $(rustc -V)"
+              echo "    cargo: $(cargo -V)"
+              echo "    path : ${rust-toolchain}/bin (prepended)"
+              echo ""
               echo "要运行 DragonOS，请构建内核、rootfs，再QEMU运行"
               echo ""
+              echo "  以下命令都会沿用当前 shell 的 Rust/Cargo 工具链："
               echo "  一键运行:    nix run .#yolo-x86_64"
               echo "  构建内核:    make kernel"
               echo "  构建 rootfs: nix run .#rootfs-x86_64"

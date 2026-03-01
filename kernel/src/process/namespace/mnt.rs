@@ -45,6 +45,8 @@ pub struct MntNamespace {
     _user_ns: Arc<UserNamespace>,
     root_mountfs: Arc<MountFS>,
     inner: SpinLock<InnerMntNamespace>,
+    // 旧的根挂载点，用于 pivot_root 后的 umount
+    old_root_mntfs: SpinLock<Option<Arc<MountFS>>>,
 }
 
 pub struct InnerMntNamespace {
@@ -80,6 +82,7 @@ impl MntNamespace {
                 mount_list,
                 _dead: false,
             }),
+            old_root_mntfs: SpinLock::new(None),
         });
 
         ramfs.set_namespace(Arc::downgrade(&result));
@@ -90,19 +93,56 @@ impl MntNamespace {
         return result;
     }
 
-    /// 强制替换本MountNamespace的根挂载文件系统
+    /// 强制替换本 MountNamespace 的根挂载文件系统
     ///
-    /// 本方法仅供dragonos初始化时使用
+    /// 此方法用于 `pivot_root` 系统调用，将当前进程的根文件系统切换到新的挂载点。
+    /// 它会更新命名空间的根挂载点、挂载列表，并保存旧的根挂载点以便后续卸载。
+    ///
+    /// # Safety
+    ///
+    /// 此函数使用 unsafe 代码来修改 `MntNamespace` 的不可变字段。
+    /// 这样做是安全的，原因如下：
+    ///
+    /// 1. **并发安全**：调用者必须持有 `self.inner.lock()`，这确保了不会有多个线程
+    ///    同时修改同一个命名空间的状态。
+    ///
+    /// 2. **不变量维护**：
+    ///    - `root_mountfs` 被更新为新的挂载点
+    ///    - 挂载列表中的 "/" 路径也被更新为指向新的挂载点
+    ///    - 旧的根挂载点被保存到 `old_root_mntfs` 中
+    ///      这些修改保持了一致性：命名空间始终有一个有效的根挂载点。
+    ///
+    /// 3. **内存安全**：
+    ///    - `new_root` 是一个 `Arc<MountFS>`，使用引用计数确保内存安全
+    ///    - `old_root` 被 clone 并保存，不会被提前释放
+    ///    - 所有 `Arc` 的 clone 操作都是原子且线程安全的
+    ///
+    /// 4. **可见性**：由于 `inner` 锁的存在，所有修改对其他线程是可见的。
+    ///
+    /// # 调用时机
+    ///
+    /// 此函数应该在持有挂载命名空间锁的情况下调用，并且只在 `pivot_root` 系统调用
+    /// 或类似的初始化场景中使用。
+    ///
+    /// # 注意
+    ///
+    /// 本方法需要被标记为 unsafe，因为它绕过了 Rust 的借用检查规则。
+    /// 调用者必须确保上述安全条件得到满足。
     pub unsafe fn force_change_root_mountfs(&self, new_root: Arc<MountFS>) {
         let inner_guard = self.inner.lock();
         let ptr = self as *const Self as *mut Self;
         let self_mut = (ptr).as_mut().unwrap();
+
+        // 保存旧的根挂载点，以便后续可能需要卸载它
+        let old_root = self_mut.root_mountfs.clone();
         self_mut.root_mountfs = new_root.clone();
         let (path, _, _) = inner_guard.mount_list.get_mount_point("/").unwrap();
 
         inner_guard.mount_list.insert(None, path, new_root);
 
-        // update mount list ino
+        // 将旧的根挂载点保存到一个特殊位置（使用特殊路径）
+        // 这样 umount2 可以通过这个路径找到并卸载它
+        *self_mut.old_root_mntfs.lock() = Some(old_root);
     }
 
     fn copy_with_mountfs(&self, new_root: Arc<MountFS>, _user_ns: Arc<UserNamespace>) -> Arc<Self> {
@@ -118,6 +158,7 @@ impl MntNamespace {
                 _dead: false,
                 mount_list: MountList::new(),
             }),
+            old_root_mntfs: SpinLock::new(None),
         });
 
         new_root.set_namespace(Arc::downgrade(&result));
@@ -154,9 +195,11 @@ impl MntNamespace {
             // Return the current mount namespace if CLONE_NEWNS is not set
             return Ok(self.self_ref.upgrade().unwrap());
         }
+        // log::info!("[copy_mnt_ns] Creating new mount namespace, copying from current ns");
         let inner = self.inner.lock();
 
         let old_root_mntfs = self.root_mntfs().clone();
+        // log::info!("[copy_mnt_ns] old_root: fs_type={}, fs={}", old_root_mntfs.fs_type(), old_root_mntfs.name());
         let mut queue: Vec<MountFSCopyInfo> = Vec::new();
 
         // 由于root mntfs比较特殊，因此单独复制。
@@ -188,6 +231,7 @@ impl MntNamespace {
             }
         }
         // 将root mntfs下的所有挂载点复制到新的mntns中
+        // log::info!("[copy_mnt_ns] old_root has {} mountpoints", old_root_mntfs.mountpoints().len());
         for (ino, mfs) in old_root_mntfs.mountpoints().iter() {
             let mount_path = inner
                 .mount_list
@@ -200,6 +244,13 @@ impl MntNamespace {
                     );
                 })
                 .unwrap();
+            // log::info!(
+            //     "[copy_mnt_ns] copying mount: ino={:?}, path={:?}, fs={}, fs_type={}",
+            //     ino,
+            //     mount_path,
+            //     mfs.name(),
+            //     mfs.fs_type()
+            // );
 
             queue.push(MountFSCopyInfo {
                 old_mount_fs: mfs.clone(),
@@ -280,6 +331,21 @@ impl MntNamespace {
 
     pub fn mount_list(&self) -> Arc<MountList> {
         self.inner.lock().mount_list.clone()
+    }
+
+    /// 获取旧的根挂载点（用于 pivot_root 后的 umount）
+    pub fn old_root_mntfs(&self) -> Option<Arc<MountFS>> {
+        self.old_root_mntfs.lock().clone()
+    }
+
+    /// 设置旧的根挂载点（用于 pivot_root）
+    pub fn set_old_root_mntfs(&self, old_root: Arc<MountFS>) {
+        *self.old_root_mntfs.lock() = Some(old_root);
+    }
+
+    /// 清除旧的根挂载点
+    pub fn clear_old_root_mntfs(&self) {
+        *self.old_root_mntfs.lock() = None;
     }
 
     pub fn remove_mount(&self, mount_path: &str) -> Option<Arc<MountFS>> {

@@ -57,7 +57,9 @@ pub fn user_path_at(
 
     // 绝对路径：从进程 root 开始
     if path.as_bytes()[0] == b'/' {
-        return Ok((pcb.fs_struct().root(), ret_path));
+        let root = pcb.fs_struct().root();
+        // log::debug!("[user_path_at] absolute path '{}', root fs={}", path, root.fs().name());
+        return Ok((root, ret_path));
     }
 
     // 相对路径：dirfd 优先，否则用 cwd
@@ -81,6 +83,25 @@ pub fn user_path_at(
     Ok((pcb.pwd_inode(), ret_path))
 }
 
+/// 检查 ancestor 是否是 node 的祖先节点
+///
+/// 通过向上遍历 node 的父目录链，检查是否能到达 ancestor。
+/// 这用于验证一个目录是否在另一个目录之下（如 pivot_root 中检查 put_old 是否在 new_root 之下）。
+///
+/// # 参数
+///
+/// - `ancestor`: 可能的祖先节点
+/// - `node`: 要检查的节点
+///
+/// # 返回值
+///
+/// 如果 ancestor 是 node 的祖先（包括 ancestor == node 的情况），返回 true；否则返回 false。
+///
+/// # 注意
+///
+/// - 此函数通过 inode ID 和文件系统指针进行比较
+/// - 检查会在到达根目录或发生错误时停止
+/// - 不检查跨文件系统的边界（即需要同时在同一文件系统中）
 pub fn is_ancestor(ancestor: &Arc<dyn IndexNode>, node: &Arc<dyn IndexNode>) -> bool {
     let ancestor_id = match ancestor.metadata() {
         Ok(m) => m.inode_id,
@@ -94,7 +115,8 @@ pub fn is_ancestor(ancestor: &Arc<dyn IndexNode>, node: &Arc<dyn IndexNode>) -> 
             Err(_) => break,
         };
 
-        if cur_id == ancestor_id {
+        // 同时检查 inode ID 和文件系统指针，确保是同一个文件系统中的同一个 inode
+        if cur_id == ancestor_id && Arc::ptr_eq(&current.fs(), &ancestor.fs()) {
             return true;
         }
 
@@ -108,6 +130,7 @@ pub fn is_ancestor(ancestor: &Arc<dyn IndexNode>, node: &Arc<dyn IndexNode>) -> 
             Err(_) => break,
         };
 
+        // 如果父节点的 inode ID 和当前节点相同，说明已经到达根目录
         if parent_id == cur_id {
             break;
         }
@@ -115,6 +138,72 @@ pub fn is_ancestor(ancestor: &Arc<dyn IndexNode>, node: &Arc<dyn IndexNode>) -> 
     }
 
     false
+}
+
+/// is_ancestor() 遍历父目录的最大深度
+///
+/// 用于防止在文件系统损坏或存在循环引用时出现无限循环。
+/// 1000 层对于正常使用场景来说绰绰有余（Linux 默认的链接数限制也远低于此）。
+pub const MAX_ANCESTOR_TRAVERSAL_DEPTH: u32 = 1000;
+
+/// 检查 ancestor 是否是 node 的祖先节点（带深度限制的版本）
+///
+/// 与 is_ancestor() 类似，但增加最大遍历深度限制以防止潜在的无限循环。
+/// 返回 Result 类型，可以传递错误信息。
+///
+/// # 参数
+///
+/// - `ancestor`: 可能的祖先节点
+/// - `node`: 要检查的节点
+///
+/// # 返回值
+///
+/// - `Ok(true)`: ancestor 是 node 的祖先
+/// - `Ok(false)`: ancestor 不是 node 的祖先
+/// - `Err(SystemError)`: 遍历过程中发生错误
+///
+/// # 注意
+///
+/// 此函数会限制遍历深度为 MAX_ANCESTOR_TRAVERSAL_DEPTH 层。
+/// 如果超过此深度仍未找到祖先，将返回 Ok(false)。
+pub fn is_ancestor_limited(
+    ancestor: &Arc<dyn IndexNode>,
+    node: &Arc<dyn IndexNode>,
+) -> Result<bool, SystemError> {
+    let ancestor_meta = ancestor.metadata()?;
+    let ancestor_id = ancestor_meta.inode_id;
+    let ancestor_fs = ancestor.fs();
+
+    let mut current = node.clone();
+
+    // 最多向上遍历 MAX_ANCESTOR_TRAVERSAL_DEPTH 层，防止循环引用
+    for _i in 0..MAX_ANCESTOR_TRAVERSAL_DEPTH {
+        let current_meta = current.metadata()?;
+
+        // 检查是否到达 ancestor（同时检查 inode ID 和文件系统）
+        if current_meta.inode_id == ancestor_id && Arc::ptr_eq(&current.fs(), &ancestor_fs) {
+            return Ok(true);
+        }
+
+        // 尝试向上移动到父目录
+        match current.parent() {
+            Ok(parent) => {
+                // 如果 parent 就是 current 本身，说明已经到达根目录
+                if Arc::ptr_eq(&parent, &current) {
+                    break;
+                }
+                current = parent;
+            }
+            Err(_) => {
+                // 没有父目录了，到达根目录
+                break;
+            }
+        }
+    }
+
+    // 最后再检查一次根目录是否是 ancestor
+    let root_meta = current.metadata()?;
+    Ok(root_meta.inode_id == ancestor_id && Arc::ptr_eq(&current.fs(), &ancestor_fs))
 }
 
 /// Directory Name

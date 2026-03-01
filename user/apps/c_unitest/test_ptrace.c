@@ -25,28 +25,32 @@ Original heap value: 0x66ccff
 Modified heap value: 0xee0000
 */
 
-#include <stdint.h>
 #include <errno.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ptrace.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 // 根据CPU架构定义系统调用号位置
-#if defined(__x86_64__) || defined(_M_X64)
-#define ORIG_RAX 15 // ORIG_RAX在user_regs_struct中的偏移
-
-#elif defined(__aarch64__) || defined(_M_ARM64)
-#define ORIG_RAX 8 // ARM64上系统调用号在regs[8]
-
+#if defined(__x86_64__)
+#define REG_SYSCALL_NR         orig_rax
+#define REG_DATA_PASS          r14
+#define ARCH_SET_PASS_REG(val) asm volatile("mov %0, %%r14" : : "r"(val))
+#elif defined(__aarch64__)
+#define REG_SYSCALL_NR         regs[8]
+#define REG_DATA_PASS          regs[19]
+#define ARCH_SET_PASS_REG(val) asm volatile("mov x19, %0" : : "r"(val))
 #elif defined(__riscv) || defined(__riscv__)
-#define ORIG_RAX 0 // RISC-V上系统调用号在a7寄存器
-
+#define REG_SYSCALL_NR         a7
+#define REG_DATA_PASS          s1
+#define ARCH_SET_PASS_REG(val) asm volatile("mv s1, %0" : : "r"(val))
 #else
 #error "Unsupported architecture for PTRACE_SYSCALL test"
 #endif
@@ -59,7 +63,30 @@ Modified heap value: 0xee0000
         }                                                                                                              \
     } while (0)
 
-void sigcont_handler(int sig) {
+static long peek_word(pid_t pid, const void* addr) {
+    errno = 0;
+    long data = ptrace(PTRACE_PEEKDATA, pid, addr, 0);
+    if (data == -1 && errno != 0) {
+        fprintf(stderr, "ptrace(PEEKDATA, %p) failed: %s\n", addr, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+    return data;
+}
+
+static void poke_word(pid_t pid, void* addr, void* data) {
+    if (ptrace(PTRACE_POKEDATA, pid, addr, data) == -1) {
+        fprintf(stderr, "ptrace(POKEDATA, %p) failed: %s\n", addr, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+}
+
+static long read_syscall_nr(pid_t pid) {
+    struct user_regs_struct regs;
+    CHK_SYSCALL(ptrace(PTRACE_GETREGS, pid, NULL, &regs));
+    return regs.REG_SYSCALL_NR;
+}
+
+static void sigcont_handler(int sig) {
     printf("target received %d (%s)\n", sig, strsignal(sig));
     exit(EXIT_SUCCESS);
 }
@@ -160,8 +187,8 @@ void test_syscall_tracing() {
         CHK_SYSCALL(ptrace(PTRACE_TRACEME, 0, NULL, NULL));
         // 触发系统调用
         raise(SIGSTOP);
-        printf("Child calling getpid()\n");
-        getpid();
+        syscall(SYS_getpid);
+        printf("Child called getpid()\n");
         exit(EXIT_SUCCESS);
     } else {
         // 等待子进程第一次停止
@@ -172,20 +199,25 @@ void test_syscall_tracing() {
             printf("Child did not stop as expected (status=%d)\n", status);
             return;
         }
-        printf("Child initial stop by signal %d\n", WSTOPSIG(status));
+        printf("Child initial stop by signal %d (%s)\n", WSTOPSIG(status), strsignal(WSTOPSIG(status)));
+        const long expected_syscall = __NR_getpid;
         // 启用系统调用跟踪
         CHK_SYSCALL(ptrace(PTRACE_SYSCALL, child, NULL, NULL));
+        // CHK_SYSCALL(ptrace(PTRACE_SETOPTIONS, child, NULL, (void*)PTRACE_O_TRACESYSGOOD));
         // 等待系统调用入口事件
         CHK_SYSCALL(waitpid(child, &status, 0));
 
         if (WIFSTOPPED(status)) {
-            printf("Syscall entry detected\n");
+            long nr_entry = read_syscall_nr(child);
+            printf("Syscall entry detected: nr=%ld%s\n", nr_entry, nr_entry == expected_syscall ? "" : " (unexpected)");
             // 继续执行
             CHK_SYSCALL(ptrace(PTRACE_SYSCALL, child, NULL, NULL));
             // 等待系统调用出口事件
             CHK_SYSCALL(waitpid(child, &status, 0));
             if (WIFSTOPPED(status)) {
-                printf("Syscall exit detected\n");
+                long nr_exit = read_syscall_nr(child);
+                printf(
+                    "Syscall exit detected: nr=%ld%s\n", nr_exit, nr_exit == expected_syscall ? "" : " (unexpected)");
             }
         }
 
@@ -204,7 +236,7 @@ void test_peek_data() {
     printf("=== Testing PTRACE_PEEKDATA ===\n");
     pid_t child = fork();
     if (child == 0) {
-        const char* message = "PTRACE_PEEKDATA_testing";
+        static const char* message = "PTRACE_PEEKDATA_testing";
         long* heap_data = (long*)malloc(sizeof(long));
         *heap_data = 0x66CCFF;
         // 直接写入共享内存结构
@@ -212,12 +244,12 @@ void test_peek_data() {
             const char* msg;
             long* heap;
         } addr_info = {message, heap_data};
-        asm volatile("mov %0, %%r14" : : "r"(&addr_info));
         printf("Child:  msg_addr=%p, heap_addr=%p, heap_val=%#lx\n", addr_info.msg, addr_info.heap, *addr_info.heap);
         CHK_SYSCALL(ptrace(PTRACE_TRACEME, 0, NULL, NULL));
-        raise(SIGSTOP); // 父进程检查点
-        pause();
-        exit(EXIT_SUCCESS); // 不会执行
+        ARCH_SET_PASS_REG(&addr_info); // 将结构体地址放入寄存器供父进程读取
+        raise(SIGSTOP);                // 父进程检查点
+        free(heap_data);
+        exit(EXIT_SUCCESS); // 不会执行到这里
 
     } else {
         int status;
@@ -225,51 +257,30 @@ void test_peek_data() {
         CHK_SYSCALL(waitpid(child, &status, 0));
         if (WIFSTOPPED(status)) {
             CHK_SYSCALL(ptrace(PTRACE_GETREGS, child, NULL, &regs));
-            uintptr_t addr_info_addr = regs.r14;
+            uintptr_t addr_info_addr = regs.REG_DATA_PASS;
             struct {
                 const char* msg;
                 long* heap;
             } addr_info;
             for (size_t i = 0; i < sizeof(addr_info) / sizeof(long); ++i) {
                 long* dest = ((long*)&addr_info) + i;
-                *dest = ptrace(PTRACE_PEEKDATA, child, (void*)(addr_info_addr + i * sizeof(long)), 0);
+                *dest = peek_word(child, (void*)(addr_info_addr + i * sizeof(long)));
             }
             uintptr_t msg_addr = (uintptr_t)addr_info.msg;
             uintptr_t heap_addr = (uintptr_t)addr_info.heap;
             printf("Parent: msg_addr=%#lx, heap_addr=%#lx\n", msg_addr, heap_addr);
-            printf("Read message: ");
-            int bytes_printed = 0;
-            for (const char* p = (const char*)msg_addr;; p++) {
-                long data = ptrace(PTRACE_PEEKDATA, child, p, 0);
-                if (data == -1) {
-                    perror("Error reading char");
-                    break;
-                }
-                char c = (char)(data & 0xFF);
-                if (c == '\0') {
-                    break;
-                }
-                if (++bytes_printed > 128) {
-                    printf("... (truncated)");
-                    break;
-                }
-                if (c >= ' ' && c <= '~') { // 可打印字符
-                    putchar(c);
-                } else if (c == '\n') { // 特殊字符转义
-                    fputs("\\n", stdout);
-                } else if (c == '\t') {
-                    fputs("\\t", stdout);
-                } else { // 不可打印字符
-                    printf("\\x%02x", (unsigned char)c);
-                }
+            char buf[32] = {0};
+            for (int i = 0; i < 4; i++) {
+                long word = peek_word(child, (void*)(msg_addr + i * sizeof(long)));
+                memcpy(buf + i * sizeof(long), &word, sizeof(long));
             }
-            printf("\n");
+            printf("Read message: %s\n", buf);
 
             // 读取并修改堆内存
-            long heap_value = ptrace(PTRACE_PEEKDATA, child, (void*)heap_addr, 0);
+            long heap_value = peek_word(child, (void*)heap_addr);
             printf("Original heap value: %#lx\n", heap_value);
-            ptrace(PTRACE_POKEDATA, child, (void*)heap_addr, (void*)0xEE0000);
-            long new_value = ptrace(PTRACE_PEEKDATA, child, (void*)heap_addr, 0);
+            poke_word(child, (void*)heap_addr, (void*)0xEE0000);
+            long new_value = peek_word(child, (void*)heap_addr);
             printf("Modified heap value: %#lx\n", new_value);
         }
         // 结束子进程

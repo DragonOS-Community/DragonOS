@@ -1,0 +1,27 @@
+[package]
+name = "mineru-mcp-dragonos"
+version = "0.1.0"
+edition = "2021"
+description = "no"
+authors = [ "yuming <mingjiangyu1@qq.com>" ]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bytes = "1.10.1"
+reqwest = { version = "0.12.12", default-features = false, features = ["json", "rustls-tls"] }
+rmcp = { version = "0.14.0", features = ["transport-io"] }
+schemars = "1.2.0"
+serde = { version = "1.0.226", features = ["derive"] }
+serde_json = "1.0.145"
+thiserror = "1.0.69"
+tokio = { version = "1.47.1", features = ["fs", "macros", "rt-multi-thread", "time"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+uuid = { version = "1.18.1", features = ["v4"] }
+walkdir = "2.5.0"
+zip = "0.6.6"
+
+[dev-dependencies]
+tempfile = "3.23.0"
+wiremock = "0.6.5"

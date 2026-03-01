@@ -135,6 +135,20 @@ fn do_execve_internal(
             // 清除 rseq 状态（execve 后需要重新注册）
             crate::process::rseq::rseq_execve(&pcb);
 
+            // 参考 Linux 6.6.21: fs/exec.c:flush_old_exec() -> exit_it_signals()
+            // 清理所有 itimers，防止 exec 后继续收到 SIGALRM 等定时器信号
+            // 这对于 fork 后 exec 的场景尤其重要，因为子进程不应继承父进程的定时器
+            {
+                let mut itimers = pcb.itimers_irqsave();
+                // 取消 ITIMER_REAL 定时器（会发送 SIGALRM）
+                if let Some(real_timer) = itimers.real.take() {
+                    real_timer.timer.cancel();
+                }
+                // virt 和 prof 是 CPU 定时器，重置它们
+                itimers.virt = Default::default();
+                itimers.prof = Default::default();
+            }
+
             Syscall::arch_do_execve(regs, &param, &result, user_sp, argv_ptr)
         }
 

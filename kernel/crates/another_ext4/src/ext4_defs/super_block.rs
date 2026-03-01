@@ -141,6 +141,11 @@ impl SuperBlock {
         self.block_count_lo as u64 | ((self.block_count_hi as u64) << 32)
     }
 
+    /// Number of reserved blocks for privileged users.
+    pub fn reserved_blocks_count(&self) -> u64 {
+        self.reserved_block_count_lo as u64 | ((self.reserved_blocks_count_hi as u64) << 32)
+    }
+
     /// The number of blocks in each block group.
     #[allow(unused)]
     pub fn blocks_per_group(&self) -> u32 {
@@ -188,6 +193,25 @@ impl SuperBlock {
 
     pub fn free_blocks_count(&self) -> u64 {
         self.free_block_count_lo as u64 | ((self.free_blocks_count_hi as u64) << 32).to_le()
+    }
+
+    /// Ext4 metadata overhead stored in superblock, unit: clusters.
+    pub fn overhead_clusters(&self) -> u32 {
+        self.overhead_clusters
+    }
+
+    /// Filesystem block size in bytes.
+    pub fn block_size(&self) -> u64 {
+        1024u64 << self.log_block_size
+    }
+
+    /// Convert cluster count to block count.
+    pub fn clusters_to_blocks(&self, clusters: u64) -> u64 {
+        if self.log_cluster_size <= self.log_block_size {
+            clusters
+        } else {
+            clusters << (self.log_cluster_size - self.log_block_size)
+        }
     }
 
     pub fn set_free_blocks_count(&mut self, free_blocks: u64) {

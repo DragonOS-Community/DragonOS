@@ -99,6 +99,13 @@ QEMU_DISK_IMAGE="../bin/${DISK_NAME}"
 QEMU_EXT4_DISK_IMAGE="../bin/${EXT4_DISK_NAME}"
 QEMU_FAT_DISK_IMAGE="../bin/${FAT_DISK_NAME}"
 QEMU_MEMORY="2G"
+PMEM_IMAGE_PATH="${PMEM_IMAGE_PATH:-}"
+PMEM_SIZE="${PMEM_SIZE:-}"
+QEMU_ENABLE_PMEM="${QEMU_ENABLE_PMEM:-false}"
+QEMU_NVDIMM_SLOTS="${QEMU_NVDIMM_SLOTS:-4}"
+QEMU_NVDIMM_MAXMEM="${QEMU_NVDIMM_MAXMEM:-4G}"
+PMEM_ENABLED=false
+PMEM_QEMU_ARGS=()
 
 # 检查必要的环境变量
 if [ -z "${ROOT_PATH}" ]; then
@@ -106,10 +113,83 @@ if [ -z "${ROOT_PATH}" ]; then
     echo "[错误] 请通过 Makefile 运行本脚本 (make qemu, make run 等)"
     exit 1
 fi
+PMEM_IMAGE_PATH="${PMEM_IMAGE_PATH:-${ROOT_PATH}/bin/pmem.img}"
 
 # 状态文件目录（优先使用环境变量，否则使用默认值）
 VMSTATE_DIR="${VMSTATE_DIR:-${ROOT_PATH}/bin/vmstate}"
 mkdir -p "${VMSTATE_DIR}"
+
+is_truthy() {
+    case "${1}" in
+        1|y|Y|yes|YES|true|TRUE|on|ON) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+detect_file_size_bytes() {
+    if size=$(stat -c%s "$1" 2>/dev/null); then
+        echo "${size}"
+        return 0
+    fi
+    if size=$(stat -f%z "$1" 2>/dev/null); then
+        echo "${size}"
+        return 0
+    fi
+    return 1
+}
+
+setup_pmem_support() {
+    PMEM_ENABLED=false
+    PMEM_QEMU_ARGS=()
+
+    if ! is_truthy "${QEMU_ENABLE_PMEM}"; then
+        return 0
+    fi
+
+    if [ "${ARCH}" != "x86_64" ]; then
+        echo "[QEMU] 错误: PMEM/NVDIMM 目前仅支持 ARCH=x86_64 (当前: ${ARCH})"
+        exit 1
+    fi
+
+    if [ ! -f "${PMEM_IMAGE_PATH}" ]; then
+        echo "[QEMU] 错误: PMEM镜像不存在: ${PMEM_IMAGE_PATH}"
+        echo "[QEMU] 请先准备只读ext4镜像文件，再启动QEMU。"
+        exit 1
+    fi
+
+    if [ ! -r "${PMEM_IMAGE_PATH}" ]; then
+        echo "[QEMU] 错误: PMEM镜像不可读: ${PMEM_IMAGE_PATH}"
+        exit 1
+    fi
+
+    case "${QEMU_NVDIMM_SLOTS}" in
+        ''|*[!0-9]*|0)
+            echo "[QEMU] 错误: QEMU_NVDIMM_SLOTS 必须是正整数 (当前: ${QEMU_NVDIMM_SLOTS})"
+            exit 1
+            ;;
+    esac
+
+    if [ -z "${QEMU_NVDIMM_MAXMEM}" ]; then
+        echo "[QEMU] 错误: QEMU_NVDIMM_MAXMEM 不能为空"
+        exit 1
+    fi
+
+    if [ -z "${PMEM_SIZE}" ]; then
+        PMEM_SIZE=$(detect_file_size_bytes "${PMEM_IMAGE_PATH}") || {
+            echo "[QEMU] 错误: 无法自动获取PMEM镜像大小，请显式设置 PMEM_SIZE"
+            exit 1
+        }
+    fi
+
+    PMEM_ENABLED=true
+    PMEM_QEMU_ARGS=(
+        -object "memory-backend-file,id=pmem0,mem-path=${PMEM_IMAGE_PATH},size=${PMEM_SIZE},share=on,readonly=on"
+        -device "nvdimm,id=nv0,memdev=pmem0,unarmed=on"
+    )
+    echo "[QEMU] PMEM已启用: image=${PMEM_IMAGE_PATH}, size=${PMEM_SIZE}, slots=${QEMU_NVDIMM_SLOTS}, maxmem=${QEMU_NVDIMM_MAXMEM}"
+}
+
+setup_pmem_support
 
 # 分配可用端口的函数
 find_free_port() {
@@ -175,23 +255,24 @@ VIRTIO_BLK_DEVICE=true
 
 # 如果qemu_accel不为空
 if [ -n "${qemu_accel}" ]; then
-    QEMU_ACCEL_ARGS=(-machine "accel=${qemu_accel}")
   if [ "${qemu_accel}" == "kvm" ]; then
     QEMU_ACCEL_ARGS+=(-enable-kvm)
   fi
 fi
 
 if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
-    # 根据加速方式设置机器参数
-    # 仅在KVM加速时禁用HPET，以使用KVM clock作为时钟源
-    # 非KVM加速（如TCG）时保留HPET，因为kvm-clock不可用
-    if [ "${qemu_accel}" == "kvm" ]; then
-        # KVM加速：禁用HPET，使用kvm-clock（性能更好且延迟更低）
-        QEMU_MACHINE_ARGS=(-machine "q35,hpet=off")
-    else
-        # 非KVM加速
-        QEMU_MACHINE_ARGS=(-machine q35)
+    qemu_machine="q35"
+    if [ -n "${qemu_accel}" ]; then
+        qemu_machine+=",accel=${qemu_accel}"
     fi
+    # KVM加速时禁用HPET，使用kvm-clock（性能更好且延迟更低）
+    if [ "${qemu_accel}" == "kvm" ]; then
+        qemu_machine+=",hpet=off"
+    fi
+    if [ "${PMEM_ENABLED}" == "true" ]; then
+        qemu_machine+=",nvdimm=on"
+    fi
+    QEMU_MACHINE_ARGS=(-machine "${qemu_machine}")
     # 根据加速方式选择CPU型号：KVM使用host，TCG使用IvyBridge
     cpu_model=$([ "${qemu_accel}" == "kvm" ] && echo "host" || echo "IvyBridge")
     if [ -n "${allflags}" ]; then
@@ -332,12 +413,20 @@ QEMU_DEVICE_ARGS+=(
   -usb
   -device "qemu-xhci,id=xhci,p2=8,p3=4"
 ) 
+
+QEMU_DEVICE_ARGS+=("${PMEM_QEMU_ARGS[@]}")
 # E1000E
 # QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -netdev user,id=hostnet0,hostfwd=tcp::12580-:12580 -net nic,model=e1000e,netdev=hostnet0,id=net0 -netdev user,id=hostnet1,hostfwd=tcp::12581-:12581 -device virtio-net-pci,vectors=5,netdev=hostnet1,id=net1 -usb -device qemu-xhci,id=xhci,p2=8,p3=4 " 
 
 
+if [ "${PMEM_ENABLED}" == "true" ]; then
+  QEMU_MEMORY_ARG="${QEMU_MEMORY},slots=${QEMU_NVDIMM_SLOTS},maxmem=${QEMU_NVDIMM_MAXMEM}"
+else
+  QEMU_MEMORY_ARG="${QEMU_MEMORY}"
+fi
+
 QEMU_ARGS+=(
-  -m "${QEMU_MEMORY}"
+  -m "${QEMU_MEMORY_ARG}"
   -smp "${QEMU_SMP}"
   -boot order=d
 )

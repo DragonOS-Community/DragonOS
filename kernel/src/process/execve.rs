@@ -8,6 +8,7 @@ use crate::process::exec::{
     load_binary_file_with_context, ExecContext, ExecParam, ExecParamFlags, LoadBinaryResult,
 };
 use crate::process::ProcessManager;
+use crate::process::ptrace::PtraceEvent;
 use crate::syscall::Syscall;
 use crate::{libs::rand::rand_bytes, mm::ucontext::AddressSpace};
 
@@ -134,6 +135,24 @@ fn do_execve_internal(
 
             // 清除 rseq 状态（execve 后需要重新注册）
             crate::process::rseq::rseq_execve(&pcb);
+
+            // 参考 Linux 6.6.21: fs/exec.c:flush_old_exec() -> exit_it_signals()
+            // 清理所有 itimers，防止 exec 后继续收到 SIGALRM 等定时器信号
+            // 这对于 fork 后 exec 的场景尤其重要，因为子进程不应继承父进程的定时器
+            {
+                let mut itimers = pcb.itimers_irqsave();
+                // 取消 ITIMER_REAL 定时器（会发送 SIGALRM）
+                if let Some(real_timer) = itimers.real.take() {
+                    real_timer.timer.cancel();
+                }
+                // virt 和 prof 是 CPU 定时器，重置它们
+                itimers.virt = Default::default();
+                itimers.prof = Default::default();
+            }
+
+            // 参考 Linux 6.6.21: fs/exec.c:load_elf_binary() -> setup_new_exec() -> ptrace_event()
+            // 在 execve 成功后，发送 ptrace exec 事件（如果需要）
+            pcb.ptrace_event(PtraceEvent::Exec, 0);
 
             Syscall::arch_do_execve(regs, &param, &result, user_sp, argv_ptr)
         }

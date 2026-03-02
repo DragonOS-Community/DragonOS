@@ -54,7 +54,8 @@ impl From<&TrapFrame> for KProbeContext {
             rdx: trap_frame.rdx,
             rsi: trap_frame.rsi,
             rdi: trap_frame.rdi,
-            orig_rax: 0,
+            // errcode 在系统调用上下文中存储原始系统调用号（orig_rax）
+            orig_rax: trap_frame.errcode,
             rip: trap_frame.rip,
             cs: trap_frame.cs,
             eflags: trap_frame.rflags,
@@ -81,9 +82,11 @@ pub fn user_stack_pointer(ctx: &KProbeContext) -> u64 {
     ctx.rsp
 }
 
-/// 从 KProbeContext 获取系统调用号 (rax)
+/// 从 KProbeContext 获取系统调用号 (orig_rax)
+/// 参考 Linux 6.6.21: arch/x86/include/asm/syscall.h
+/// - static inline long syscall_get_nr(struct task_struct *task, struct pt_regs *regs) 返回 regs->orig_ax
 pub fn syscall_get_nr(ctx: &KProbeContext) -> u64 {
-    ctx.rax
+    ctx.orig_rax
 }
 
 /// 从 KProbeContext 获取系统调用返回值 (rax)

@@ -649,7 +649,35 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
                 Some(new_sig) => {
                     sig = new_sig; // tracer 注入了新信号，继续处理
                 }
-                None => continue, // tracer 忽略了信号，继续寻找下一个信号
+                None => {
+                    // tracer 忽略了信号（注入了 0）
+                    // 在继续寻找下一个信号之前，检查是否有系统调用需要重启
+                    // 这处理了 ptrace 在系统调用重启期间停止 tracee 的情况
+                    if unsafe { frame.syscall_nr() }.is_some() {
+                        if let Some(syscall_err) = unsafe { frame.syscall_error() } {
+                            match syscall_err {
+                                SystemError::ERESTARTSYS | SystemError::ERESTARTNOHAND |
+                                SystemError::ERESTARTNOINTR => {
+                                    // 这些错误码需要重启系统调用，即使没有信号要处理
+                                    // 设置 got_signal = false 让 try_restart_syscall 处理
+                                    // 但先检查是否应该返回 EINTR（对于 ERESTARTNOHAND）
+                                    if matches!(syscall_err, SystemError::ERESTARTNOHAND) {
+                                        // ERESTARTNOHAND 应该返回 EINTR
+                                        frame.rax = SystemError::EINTR.to_posix_errno() as i64 as u64;
+                                        return;
+                                    }
+                                }
+                                SystemError::ERESTART_RESTARTBLOCK => {
+                                    // ERESTART_RESTARTBLOCK 应该返回 EINTR
+                                    frame.rax = SystemError::EINTR.to_posix_errno() as i64 as u64;
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    continue; // 继续寻找下一个信号
+                }
             }
         }
 
@@ -753,18 +781,20 @@ fn try_restart_syscall(frame: &mut TrapFrame) {
     let mut restart = false;
     match syscall_err {
         SystemError::ERESTARTSYS | SystemError::ERESTARTNOHAND | SystemError::ERESTARTNOINTR => {
+            // 恢复系统调用号到 rax，并回退 RIP 以重新执行系统调用
             frame.rax = frame.errcode;
             frame.rip -= 2;
             restart = true;
         }
         SystemError::ERESTART_RESTARTBLOCK => {
+            // 使用特殊的 restart_syscall 系统调用
             frame.rax = SYS_RESTART_SYSCALL as u64;
             frame.rip -= 2;
             restart = true;
         }
         _ => {}
     }
-    log::debug!("try restart syscall: {:?}", restart);
+    log::debug!("try restart syscall: {:?}, nr={}, rip=0x{:x}", restart, frame.errcode, frame.rip);
 }
 
 pub struct X86_64SignalArch;
@@ -846,9 +876,11 @@ fn handle_signal(
         if let Some(syscall_err) = unsafe { frame.syscall_error() } {
             match syscall_err {
                 SystemError::ERESTARTNOHAND => {
+                    // ERESTARTNOHAND 总是返回 EINTR，不检查 SA_RESTART
                     frame.rax = SystemError::EINTR.to_posix_errno() as i64 as u64;
                 }
                 SystemError::ERESTARTSYS => {
+                    // ERESTARTSYS：如果没有 SA_RESTART，返回 EINTR；否则重启系统调用
                     if !sigaction.flags().contains(SigFlags::SA_RESTART) {
                         frame.rax = SystemError::EINTR.to_posix_errno() as i64 as u64;
                     } else {
@@ -857,16 +889,12 @@ fn handle_signal(
                     }
                 }
                 SystemError::ERESTART_RESTARTBLOCK => {
-                    // 为了让带 SA_RESTART 的时序（例如 clock_nanosleep 相对睡眠）也能自动重启，
-                    // 当 SA_RESTART 设置时，按 ERESTARTSYS 的语义处理；否则返回 EINTR。
-                    if !sigaction.flags().contains(SigFlags::SA_RESTART) {
-                        frame.rax = SystemError::EINTR.to_posix_errno() as i64 as u64;
-                    } else {
-                        frame.rax = frame.errcode;
-                        frame.rip -= 2;
-                    }
+                    // ERESTART_RESTARTBLOCK 总是返回 EINTR，不检查 SA_RESTART
+                    // （使用 restart_syscall 的情况需要用户空间处理）
+                    frame.rax = SystemError::EINTR.to_posix_errno() as i64 as u64;
                 }
                 SystemError::ERESTARTNOINTR => {
+                    // ERESTARTNOINTR 总是重启系统调用
                     frame.rax = frame.errcode;
                     frame.rip -= 2;
                 }

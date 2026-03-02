@@ -333,37 +333,19 @@ pub fn ptrace_signal(
     // 如果追踪者注入了不同于原始信号的新信号，更新 siginfo
     if injected_signal != original_signal {
         if let Some(info_ref) = info {
-            // 如果获取失败，保持原有的 siginfo
-            if let Some(tracer) = pcb_clone.tracer().and_then(ProcessManager::find) {
-                *info_ref = SigInfo::new(
-                    injected_signal,
-                    0,
-                    SigCode::Origin(OriginCode::User),
-                    SigType::Kill {
-                        pid: tracer.raw_pid(),
-                        uid: tracer.cred().uid.data() as u32,
-                    },
-                );
-            }
-            // 如果获取 tracer 失败，info 保持原样，这不是致命错误
+            // 严格对标 Linux: 重新初始化 siginfo，来源固定为 SI_USER
+            // 获取当前父进程 (在 ptrace 期间通常是 tracer)
+            let parent = pcb_clone.parent_pcb();
+            let pid = parent.as_ref().map_or(RawPid::new(0), |p| p.raw_pid());
+            let uid = parent.as_ref().map_or(0, |p| p.cred().uid.data() as u32);
+            // 相当于 Linux 的 clear_siginfo + 填充 SI_USER 字段
+            *info_ref = SigInfo::new(
+                injected_signal,
+                0, // errno
+                SigCode::Origin(OriginCode::User), // 映射到 SI_USER
+                SigType::Kill { pid, uid },
+            );
         }
-    }
-
-    // 特殊处理 SIGCONT：需要清除挂起的停止信号，但仍然要唤醒进程并传递给用户空间处理
-    if injected_signal == Signal::SIGCONT {
-        // 清除任何挂起的停止信号（如 SIGSTOP, SIGTSTP 等）
-        let mut sig_info = pcb_clone.sig_info.write();
-        let pending = sig_info.sig_pending_mut().signal_mut();
-        for stop_sig in [
-            Signal::SIGSTOP,
-            Signal::SIGTSTP,
-            Signal::SIGTTIN,
-            Signal::SIGTTOU,
-        ] {
-            pending.remove(stop_sig.into());
-        }
-        drop(sig_info);
-        return Some(injected_signal);
     }
 
     // 检查新信号是否被当前进程的信号掩码阻塞
@@ -372,10 +354,11 @@ pub fn ptrace_signal(
         *guard.sig_blocked()
     };
 
-    if sig_set.contains(injected_signal.into()) {
+    let has_fatal_pending = Signal::fatal_signal_pending(&pcb_clone);
+    if sig_set.contains(injected_signal.into()) || has_fatal_pending {
         // 如果信号被阻塞了，则尝试重新入队
         match injected_signal.send_signal_info_to_pcb(info.as_mut(), pcb_clone, PidType::PID) {
-            Ok(_) => return None, // 成功入队
+            Ok(_) => return None, // 成功入队，返回 None 表示当前不处理
             Err(e) => {
                 // 严重错误：无法保留被阻塞的信号。
                 log::error!(
@@ -552,7 +535,8 @@ impl ProcessControlBlock {
                         sig.send_signal_info_to_pcb(Some(&mut info), strong_ref, PidType::PID)
                     {
                         log::error!(
-                            "ptrace_event: failed to send legacy SIGTRAP for exec: {:?}",
+                            "ptrace_event: failed to send legacy SIGTRAP for exec (pid={:?}): {:?}. Tracer may hang waiting.",
+                            self.raw_pid(),
                             e
                         );
                     }
@@ -773,12 +757,18 @@ impl ProcessControlBlock {
 
                     // 加入运行队列，确保进程能被调度
                     if let Some(strong_ref) = self.self_ref.upgrade() {
-                        let rq = cpu_rq(
-                            self.sched_info()
-                                .on_cpu()
-                                .unwrap_or(smp_get_processor_id())
-                                .data() as usize,
-                        );
+                        let cpu_id = self
+                            .sched_info()
+                            .on_cpu()
+                            .unwrap_or_else(|| {
+                                log::warn!(
+                                    "ptrace_attach: invalid CPU info for pid={:?}, using current CPU",
+                                    self.raw_pid()
+                                );
+                                smp_get_processor_id()
+                            })
+                            .data() as usize;
+                        let rq = cpu_rq(cpu_id);
                         let (rq, _guard) = rq.self_lock();
                         rq.update_rq_clock();
                         rq.activate_task(
@@ -918,6 +908,7 @@ impl ProcessControlBlock {
             }
         };
 
+        // 设置注入信号
         let mut ptrace_state = self.ptrace_state.lock();
         ptrace_state.injected_signal = data_signal;
         drop(ptrace_state);
@@ -941,12 +932,18 @@ impl ProcessControlBlock {
         drop(sched_info);
 
         // 加入调度队列
-        let rq = cpu_rq(
-            self.sched_info()
-                .on_cpu()
-                .unwrap_or(smp_get_processor_id())
-                .data() as usize,
-        );
+        let cpu_id = self
+            .sched_info()
+            .on_cpu()
+            .unwrap_or_else(|| {
+                log::warn!(
+                    "ptrace_wake_up: invalid CPU info for pid={:?}, using current CPU",
+                    self.raw_pid()
+                );
+                smp_get_processor_id()
+            })
+            .data() as usize;
+        let rq = cpu_rq(cpu_id);
         let (rq, _guard) = rq.self_lock();
         rq.update_rq_clock();
         let strong_ref = self.self_ref.upgrade().ok_or(SystemError::ESRCH)?;

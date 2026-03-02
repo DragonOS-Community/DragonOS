@@ -46,6 +46,7 @@ unsafe impl SafeForZero for X86_64GSData {}
 extern "C" {
     fn syscall_int();
     fn syscall_64();
+    fn syscall_exit_to_user_mode(frame: &mut TrapFrame);
 }
 
 macro_rules! syscall_return {
@@ -58,8 +59,9 @@ macro_rules! syscall_return {
             debug!("syscall return:pid={:?},ret= {:?}\n", pid, ret as isize);
         }
 
+        // 调用统一的退出路径来处理信号和系统调用重启
         unsafe {
-            CurrentIrqArch::interrupt_disable();
+            syscall_exit_to_user_mode($regs);
         }
         return;
     }};

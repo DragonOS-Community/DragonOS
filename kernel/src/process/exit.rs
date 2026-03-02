@@ -489,7 +489,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 // 从 ProcessState::Stopped 中提取实际的停止信号号
                                 // 注意：提取纯信号号（去掉 0x80 位），用于 stopsig
                                 let actual_sig = if let ProcessState::Stopped(sig) = state {
-                                    (sig & 0x7f) as i32  // 去掉 0x80 位，只保留信号号
+                                    (sig & 0x7f) as i32 // 去掉 0x80 位，只保留信号号
                                 } else {
                                     Signal::SIGSTOP as i32
                                 };
@@ -526,16 +526,17 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 // 这是 ptrace 专用的停止状态，总是报告给 tracer
                                 // 提取纯信号号（去掉 0x80 位）
                                 let actual_sig = if let ProcessState::TracedStopped(sig) = state {
-                                    (sig & 0x7f) as i32  // 去掉 0x80 位，只保留信号号
+                                    (sig & 0x7f) as i32 // 去掉 0x80 位，只保留信号号
                                 } else {
                                     Signal::SIGSTOP as i32
                                 };
                                 // 检查是否有 PTRACE_SYSCALL 事件（0x80 位）
-                                let has_ptrace_syscall = if let ProcessState::TracedStopped(sig) = state {
-                                    (sig & 0x80) != 0
-                                } else {
-                                    false
-                                };
+                                let has_ptrace_syscall =
+                                    if let ProcessState::TracedStopped(sig) = state {
+                                        (sig & 0x80) != 0
+                                    } else {
+                                        false
+                                    };
                                 kwo.no_task_error = None;
                                 // ret_info.status 使用纯信号号（不含 0x80 位）
                                 kwo.ret_info = Some(WaitIdInfo {
@@ -906,7 +907,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 // 从 ProcessState::Stopped 中提取实际的停止信号号
                                 // 注意：提取纯信号号（去掉 0x80 位），用于 stopsig
                                 let actual_sig = if let ProcessState::Stopped(sig) = state {
-                                    (sig & 0x7f) as i32  // 去掉 0x80 位，只保留信号号
+                                    (sig & 0x7f) as i32 // 去掉 0x80 位，只保留信号号
                                 } else {
                                     Signal::SIGSTOP as i32
                                 };

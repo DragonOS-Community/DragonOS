@@ -1,18 +1,18 @@
-use crate::arch::CurrentIrqArch;
-use crate::exception::InterruptArch;
-use crate::filesystem::vfs::fcntl::AtFlags;
-use crate::filesystem::vfs::file::File;
-use crate::filesystem::vfs::open::do_open_execat;
-use crate::libs::rwsem::RwSem;
-use crate::process::exec::{
-    load_binary_file_with_context, ExecContext, ExecParam, ExecParamFlags, LoadBinaryResult,
+use crate::{
+    arch::{interrupt::TrapFrame, CurrentIrqArch},
+    exception::InterruptArch,
+    filesystem::vfs::{fcntl::AtFlags, file::File, open::do_open_execat},
+    libs::{rand::rand_bytes, rwsem::RwSem},
+    mm::ucontext::AddressSpace,
+    process::{
+        exec::{
+            load_binary_file_with_context, ExecContext, ExecParam, ExecParamFlags, LoadBinaryResult,
+        },
+        ptrace::PtraceEvent,
+        ProcessManager,
+    },
+    syscall::Syscall,
 };
-use crate::process::ProcessManager;
-use crate::process::ptrace::PtraceEvent;
-use crate::syscall::Syscall;
-use crate::{libs::rand::rand_bytes, mm::ucontext::AddressSpace};
-
-use crate::arch::interrupt::TrapFrame;
 use alloc::{ffi::CString, sync::Arc, vec::Vec};
 use system_error::SystemError;
 

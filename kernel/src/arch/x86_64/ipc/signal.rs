@@ -656,14 +656,16 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
                     if unsafe { frame.syscall_nr() }.is_some() {
                         if let Some(syscall_err) = unsafe { frame.syscall_error() } {
                             match syscall_err {
-                                SystemError::ERESTARTSYS | SystemError::ERESTARTNOHAND |
-                                SystemError::ERESTARTNOINTR => {
+                                SystemError::ERESTARTSYS
+                                | SystemError::ERESTARTNOHAND
+                                | SystemError::ERESTARTNOINTR => {
                                     // 这些错误码需要重启系统调用，即使没有信号要处理
                                     // 设置 got_signal = false 让 try_restart_syscall 处理
                                     // 但先检查是否应该返回 EINTR（对于 ERESTARTNOHAND）
                                     if matches!(syscall_err, SystemError::ERESTARTNOHAND) {
                                         // ERESTARTNOHAND 应该返回 EINTR
-                                        frame.rax = SystemError::EINTR.to_posix_errno() as i64 as u64;
+                                        frame.rax =
+                                            SystemError::EINTR.to_posix_errno() as i64 as u64;
                                         return;
                                     }
                                 }
@@ -794,7 +796,12 @@ fn try_restart_syscall(frame: &mut TrapFrame) {
         }
         _ => {}
     }
-    log::debug!("try restart syscall: {:?}, nr={}, rip=0x{:x}", restart, frame.errcode, frame.rip);
+    log::debug!(
+        "try restart syscall: {:?}, nr={}, rip=0x{:x}",
+        restart,
+        frame.errcode,
+        frame.rip
+    );
 }
 
 pub struct X86_64SignalArch;

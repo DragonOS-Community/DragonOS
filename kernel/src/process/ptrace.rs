@@ -342,7 +342,7 @@ pub fn ptrace_signal(
             *info_ref = SigInfo::new(
                 injected_signal,
                 0, // errno
-                SigCode::Origin(OriginCode::User), // 映射到 SI_USER
+                SigCode::Origin(OriginCode::User),
                 SigType::Kill { pid, uid },
             );
         }

@@ -112,6 +112,7 @@ impl VsockTransport for VirtioVsockTransport {
         peer: VsockEndpoint,
         buffer: &[u8],
     ) -> Result<usize, SystemError> {
+        // virtio-drivers send() 是原子的：要么所有字节都进入队列，要么返回错误。
         let mut manager = self.manager.lock();
         manager
             .0

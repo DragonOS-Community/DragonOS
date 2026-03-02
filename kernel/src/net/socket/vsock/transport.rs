@@ -176,14 +176,22 @@ fn ready_backend() -> Result<Arc<dyn VsockTransport>, SystemError> {
 }
 
 #[allow(dead_code)]
-/// 注册（或覆盖）全局传输后端。
+/// 注册全局传输后端。
 ///
 /// # 参数
 /// - `transport`: 传输后端对象
-pub fn register_transport(transport: Arc<dyn VsockTransport>) {
+///
+/// # 返回
+/// - `Ok(())`: 注册成功
+/// - `Err(EEXIST)`: 已存在已注册后端，拒绝重复注册
+pub fn register_transport(transport: Arc<dyn VsockTransport>) -> Result<(), SystemError> {
     let mut guard = GLOBAL_VSOCK_TRANSPORT.write();
+    if matches!(&*guard, GlobalVsockTransport::Ready { .. }) {
+        return Err(SystemError::EEXIST);
+    }
     *guard = GlobalVsockTransport::Ready { backend: transport };
     LOCAL_CID_FALLBACK_LOGGED.store(false, Ordering::Release);
+    Ok(())
 }
 
 /// 将 transport 状态迁移为 `Failed`。

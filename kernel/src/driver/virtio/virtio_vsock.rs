@@ -330,7 +330,15 @@ pub fn virtio_vsock(
         dev_id.id(),
         guest_cid
     );
-    register_transport(transport as Arc<dyn VsockTransport>);
+    if let Err(err) = register_transport(transport as Arc<dyn VsockTransport>) {
+        log::warn!(
+            "virtio-vsock transport registration rejected for device {:?}, guest_cid={}: {:?}",
+            dev_id.id(),
+            guest_cid,
+            err
+        );
+        return;
+    }
     ensure_transport_event_worker_started();
     log::info!(
         "virtio-vsock transport registered for device {:?}, guest_cid={}",

@@ -858,6 +858,10 @@ impl Socket for VsockStreamSocket {
             }
             return events;
         }
+        
+        if inner.peer_send_shutdown || inner.recv_shutdown {
+            events.insert(EP::EPOLLRDHUP);
+        }
 
         if !inner.recv_buf.is_empty() || inner.peer_send_shutdown || inner.peer_closed {
             events.insert(EP::EPOLLIN | EP::EPOLLRDNORM);
@@ -1247,7 +1251,7 @@ impl Socket for VsockStreamSocket {
         if buffer.is_empty() {
             return Ok(0);
         }
-        
+
         let nonblock = self.is_nonblock() || flags.contains(PMSG::DONTWAIT);
         let peek = flags.contains(PMSG::PEEK);
 
@@ -1337,13 +1341,13 @@ impl Socket for VsockStreamSocket {
     /// # 行为
     /// - 本地连接会向对端传播发送方向关闭事件
     /// - 远端连接会尝试通知 transport
-    /// - 监听 socket 调用时按 Linux 语义直接成功返回
+    /// - 监听 socket（未连接）返回 `ENOTCONN`
     fn shutdown(&self, how: ShutdownBit) -> Result<(), SystemError> {
         let (local, peer, peer_socket, notify_peer_send_shutdown, notify_peer_recv_shutdown) = {
             let mut inner = self.inner.lock();
             match inner.state {
                 VsockStreamState::Connected | VsockStreamState::Closed => {}
-                VsockStreamState::Listening => return Ok(()),
+                VsockStreamState::Listening => return Err(SystemError::ENOTCONN),
                 _ => return Err(SystemError::ENOTCONN),
             }
 

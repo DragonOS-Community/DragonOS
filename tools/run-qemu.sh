@@ -145,7 +145,7 @@ QEMU_DISPLAY_ARGS=()
 QEMU_ARGS=()
 
 # vsock 固定配置（按需直接修改脚本）：
-# - QEMU_ENABLE_VSOCK=1: 默认启用
+# - QEMU_ENABLE_VSOCK=1: 默认启用，条件不满足时自动降级跳过
 # - QEMU_VSOCK_GUEST_CID: guest CID（不能与 host CID=2 冲突）
 QEMU_ENABLE_VSOCK=1
 QEMU_VSOCK_GUEST_CID=3
@@ -226,13 +226,17 @@ if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
       QEMU_DEVICE_DISK_ARGS+=(-device virtio-blk-pci,drive=fatdisk)
     fi
 
-    # 可选启用 vsock 设备（默认关闭）。
+    # 默认启用 vsock；若宿主环境不满足条件则降级为跳过该设备。
     if [ "${QEMU_ENABLE_VSOCK}" = "1" ]; then
-      if [ "${QEMU_VSOCK_GUEST_CID}" = "2" ]; then
+      if [ "${ARCH}" != "x86_64" ]; then
+        echo "[WARN] vsock enabled but unsupported arch (${ARCH}); skip vsock device"
+      elif [ "${QEMU_VSOCK_GUEST_CID}" = "2" ]; then
         echo "[WARN] guest CID=2 conflicts with host CID=2; skip vhost-vsock-pci"
       elif [ ! -e /dev/vhost-vsock ]; then
         echo "[WARN] /dev/vhost-vsock not found; skip vsock device"
         echo "[WARN] Hint: sudo modprobe vhost_vsock"
+      elif ! "${QEMU}" -device help 2>/dev/null | grep -q "${QEMU_VSOCK_DEVICE_MODEL}"; then
+        echo "[WARN] QEMU device model '${QEMU_VSOCK_DEVICE_MODEL}' not supported; skip vsock device"
       else
         QEMU_ATTACH_VSOCK=1
       fi

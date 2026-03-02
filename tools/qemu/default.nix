@@ -204,7 +204,7 @@ let
       if [ -e /dev/kvm ] && [ -w /dev/kvm ]; then ACCEL="kvm"; fi
 
       VSOCK_ARGS=()
-      # vhost-vsock 只在 x86_64 路径启用，并依赖宿主机 /dev/vhost-vsock。
+      # 默认启用 vsock；若条件不满足则自动降级为跳过该设备。
       if [ "${enableVsockStr}" = "true" ]; then
         if [ "${arch}" != "x86_64" ]; then
           echo "[WARN] vsock enabled but unsupported arch (${arch}); skip"
@@ -212,6 +212,9 @@ let
           echo "[WARN] vsock guest CID must not be 2 (host CID); skip"
         elif [ ! -e /dev/vhost-vsock ]; then
           echo "[WARN] /dev/vhost-vsock not found; skip vsock device"
+          echo "[WARN] Hint: sudo modprobe vhost_vsock"
+        elif ! ${qemuBin} -device help 2>/dev/null | grep -q "${vsockDeviceModelStr}"; then
+          echo "[WARN] QEMU device model '${vsockDeviceModelStr}' not supported; skip vsock device"
         else
           VSOCK_ARGS=( "-device" "${vsockDeviceModelStr},guest-cid=${vsockGuestCidStr}" )
           echo "[INFO] enable vsock device: ${vsockDeviceModelStr},guest-cid=${vsockGuestCidStr}"

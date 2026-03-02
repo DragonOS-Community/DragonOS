@@ -63,8 +63,6 @@ struct NfitSpaRange {
 #[derive(Debug, Clone, Copy)]
 struct NfitMemMapRange {
     range_index: u16,
-    address: u64,
-    region_size: u64,
     flags: u16,
 }
 
@@ -233,25 +231,12 @@ fn collect_pmem_regions_from_nfit() -> Vec<(crate::mm::PhysAddr, usize)> {
                     offset = end;
                     continue;
                 };
-                let Some(region_size) = read_u64_le(entry, 16) else {
-                    offset = end;
-                    continue;
-                };
-                let Some(address) = read_u64_le(entry, 32) else {
-                    offset = end;
-                    continue;
-                };
                 let Some(flags) = read_u16_le(entry, 44) else {
                     offset = end;
                     continue;
                 };
 
-                memmap_ranges.push(NfitMemMapRange {
-                    range_index,
-                    address,
-                    region_size,
-                    flags,
-                });
+                memmap_ranges.push(NfitMemMapRange { range_index, flags });
             }
             _ => {}
         }
@@ -279,15 +264,9 @@ fn collect_pmem_regions_from_nfit() -> Vec<(crate::mm::PhysAddr, usize)> {
             selected_raw.push((spa.address, spa.length));
         }
     } else if !memmap_ranges.is_empty() {
-        for memdev in &memmap_ranges {
-            if memdev.region_size == 0 {
-                continue;
-            }
-            if (memdev.flags & ACPI_NFIT_MEM_MAP_FAILED) != 0 {
-                continue;
-            }
-            selected_raw.push((memdev.address, memdev.region_size));
-        }
+        // Align Linux NFIT semantics: memory-map entries alone are not enough
+        // to prove persistence. Only SPA ranges with PMEM GUID can back /dev/pmem*.
+        log::warn!("NFIT has memory-map entries but no PMEM SPA; skip PMEM registration");
     }
 
     let mut regions: Vec<(PhysAddr, usize)> = Vec::new();

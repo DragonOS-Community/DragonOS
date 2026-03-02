@@ -36,19 +36,19 @@ fn virtio_probe() -> Result<(), SystemError> {
 #[allow(dead_code)]
 fn virtio_probe_pci() {
     let virtio_list = virtio_device_search();
-    log::info!(
+    log::debug!(
         "virtio_probe_pci: found {} virtio pci candidates",
         virtio_list.len()
     );
     for virtio_device in virtio_list {
         let bdf: String = virtio_device.common_header.bus_device_function.into();
         let dev_id = DeviceId::new(None, Some(bdf)).unwrap();
-        // log::info!("virtio device id: probe {:?}", dev_id.id());
+        // log::debug!("virtio device id: probe {:?}", dev_id.id());
         match PciTransport::new::<HalImpl>(virtio_device.clone(), dev_id.clone()) {
             Ok(mut transport) => {
                 let device_type = transport.device_type();
                 let features = transport.read_device_features();
-                log::info!(
+                log::debug!(
                     "virtio_probe_pci: detected bdf={:?} type={:?} features={:#018x}",
                     dev_id.id(),
                     device_type,
@@ -79,7 +79,7 @@ pub(super) fn virtio_device_init(
     dev_id: Arc<DeviceId>,
     dev_parent: Option<Arc<dyn Device>>,
 ) {
-    log::info!(
+    log::debug!(
         "virtio_device_init: bdf={:?} type={:?}",
         dev_id.id(),
         transport.device_type()
@@ -128,14 +128,14 @@ fn virtio_device_search() -> Vec<Arc<PciDeviceStructureGeneralDevice>> {
     for device in result {
         let standard_device = device.as_standard_device().unwrap();
         let header = &standard_device.common_header;
-        log::info!(
+        log::debug!(
             "virtio_device_search: candidate vendor={:#06x} device={:#06x} bdf={}",
             header.vendor_id,
             header.device_id,
             Into::<String>::into(header.bus_device_function)
         );
         if is_virtio_pci_device_id(header.device_id) {
-            log::info!(
+            log::debug!(
                 "virtio_device_search: accepted virtio pci device id={:#06x}",
                 header.device_id
             );

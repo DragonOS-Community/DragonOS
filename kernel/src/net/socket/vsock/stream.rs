@@ -405,7 +405,7 @@ impl VsockStreamSocket {
     /// 判断 accept 阻塞等待条件是否满足。
     fn can_accept(&self) -> bool {
         let inner = self.inner.lock();
-        inner.state == VsockStreamState::Listening && !inner.pending_accept.is_empty()
+        inner.state != VsockStreamState::Listening || !inner.pending_accept.is_empty()
     }
 
     /// 判断 send 阻塞等待是否应结束（可发送或应立即失败）。

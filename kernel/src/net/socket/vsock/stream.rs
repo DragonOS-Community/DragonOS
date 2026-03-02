@@ -1244,6 +1244,10 @@ impl Socket for VsockStreamSocket {
     /// - 非阻塞模式下无数据立即返回 `EAGAIN_OR_EWOULDBLOCK`
     /// - 阻塞模式下等待直到 `can_recv()` 为真
     fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        
         let nonblock = self.is_nonblock() || flags.contains(PMSG::DONTWAIT);
         let peek = flags.contains(PMSG::PEEK);
 

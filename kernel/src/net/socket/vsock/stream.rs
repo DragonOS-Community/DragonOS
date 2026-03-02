@@ -858,7 +858,7 @@ impl Socket for VsockStreamSocket {
             }
             return events;
         }
-        
+
         if inner.peer_send_shutdown || inner.recv_shutdown {
             events.insert(EP::EPOLLRDHUP);
         }

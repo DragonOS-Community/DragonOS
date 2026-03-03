@@ -166,11 +166,13 @@ impl BootCallbacks for PvhBootCallback {
                 MMArch::phys_2_virt(PhysAddr::new(start_info.memmap_paddr as usize)).unwrap()
             }
             .data() as *const HvmMemmapTableEntry;
+            let total_entries = start_info.memmap_entries as usize;
 
-            for _ in 0..start_info.memmap_entries {
+            for (imported, _) in (0..start_info.memmap_entries).enumerate() {
                 let entry = unsafe { *ep };
+                let e820_type = E820Type::from(entry.type_);
 
-                let t = match E820Type::from(entry.type_) {
+                let t = match e820_type {
                     E820Type::Ram => 1,
                     E820Type::Reserved => 2,
                     E820Type::Acpi => 3,
@@ -182,10 +184,17 @@ impl BootCallbacks for PvhBootCallback {
                     E820Type::ReservedKern => 128,
                 };
 
-                boot_params()
-                    .write_irqsave()
-                    .arch
-                    .add_e820_entry(entry.addr, entry.size, t);
+                let mut bp = boot_params().write_irqsave();
+                if !bp.arch.add_e820_entry(entry.addr, entry.size, t) {
+                    log::warn!(
+                        "PVH E820 map truncated: imported {} of {} entries (capacity={})",
+                        imported,
+                        total_entries,
+                        bp.arch.e820_table.len()
+                    );
+                    break;
+                }
+                drop(bp);
 
                 ep = unsafe { ep.add(1) };
             }

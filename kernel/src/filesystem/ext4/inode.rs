@@ -142,7 +142,8 @@ impl IndexNode for LockedExt4Inode {
                 log::warn!("Failed to get current time, using 0");
                 0
             });
-            fs.fs
+            let atime_update = fs
+                .fs
                 .setattr(
                     inode_num,
                     another_ext4::SetAttr {
@@ -156,7 +157,13 @@ impl IndexNode for LockedExt4Inode {
                         crtime: None,
                     },
                 )
-                .map_err(SystemError::from)?;
+                .map_err(SystemError::from);
+            match atime_update {
+                Ok(()) => {}
+                // 只读挂载下，atime 更新失败不应影响读取语义。
+                Err(SystemError::EROFS) => {}
+                Err(e) => return Err(e),
+            }
             page_cache.read(offset, buf)
         } else {
             self.read_direct(offset, len, buf, data)

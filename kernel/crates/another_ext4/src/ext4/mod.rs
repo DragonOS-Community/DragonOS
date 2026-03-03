@@ -52,4 +52,9 @@ impl Ext4 {
         // Create root directory
         self.create_root_inode().map(|_| ())
     }
+
+    /// Returns the current on-disk superblock.
+    pub fn super_block(&self) -> Result<SuperBlock> {
+        self.read_super_block()
+    }
 }

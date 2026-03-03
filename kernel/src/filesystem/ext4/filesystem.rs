@@ -54,6 +54,10 @@ impl FileSystem for Ext4FileSystem {
         vfs::SuperBlock::new(Magic::EXT4_MAGIC, another_ext4::BLOCK_SIZE as u64, 255)
     }
 
+    fn statfs(&self, _inode: &Arc<dyn IndexNode>) -> Result<vfs::SuperBlock, SystemError> {
+        self.read_statfs_from_superblock()
+    }
+
     unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
         PageFaultHandler::filemap_fault(pfm)
     }
@@ -69,6 +73,25 @@ impl FileSystem for Ext4FileSystem {
 }
 
 impl Ext4FileSystem {
+    fn read_statfs_from_superblock(&self) -> Result<vfs::SuperBlock, SystemError> {
+        let ext4_sb = self.fs.super_block()?;
+        let block_size = ext4_sb.block_size();
+        let blocks = ext4_sb.block_count();
+        let overhead_blocks = ext4_sb.clusters_to_blocks(ext4_sb.overhead_clusters() as u64);
+        let bfree = ext4_sb.free_blocks_count();
+        let reserved = ext4_sb.reserved_blocks_count();
+
+        let mut sb = vfs::SuperBlock::new(Magic::EXT4_MAGIC, block_size, 255);
+        // Keep Linux ext4 semantics: f_blocks excludes metadata overhead.
+        sb.blocks = blocks.saturating_sub(overhead_blocks);
+        sb.bfree = bfree;
+        sb.bavail = bfree.saturating_sub(reserved);
+        sb.files = ext4_sb.inode_count() as u64;
+        sb.ffree = ext4_sb.free_inodes_count() as u64;
+        sb.frsize = block_size;
+        Ok(sb)
+    }
+
     /// 探测 gendisk 是否包含 ext4 文件系统
     pub fn probe(gendisk: &Arc<GenDisk>) -> Result<bool, SystemError> {
         Ok(another_ext4::Ext4::load(gendisk.clone())
@@ -78,7 +101,7 @@ impl Ext4FileSystem {
 
     pub fn from_gendisk(mount_data: Arc<GenDisk>) -> Result<Arc<dyn FileSystem>, SystemError> {
         let raw_dev = mount_data.device_num();
-        let fs = another_ext4::Ext4::load(mount_data)?;
+        let fs = another_ext4::Ext4::load(mount_data.clone())?;
         let root_inode: Arc<LockedExt4Inode> =
             Arc::new_cyclic(|self_ref: &Weak<LockedExt4Inode>| {
                 LockedExt4Inode(Mutex::new(Ext4Inode {

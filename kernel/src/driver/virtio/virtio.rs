@@ -1,5 +1,6 @@
 use super::mmio::virtio_probe_mmio;
 use super::transport_pci::PciTransport;
+use super::virtio_fs::virtio_fs;
 use super::virtio_impl::HalImpl;
 use crate::driver::base::device::bus::Bus;
 use crate::driver::base::device::{Device, DeviceId};
@@ -94,6 +95,7 @@ pub(super) fn virtio_device_init(
             warn!("Not support virtio_input device for now");
         }
         DeviceType::Network => virtio_net(transport, dev_id, dev_parent),
+        DeviceType::FileSystem => virtio_fs(transport, dev_id, dev_parent),
         DeviceType::Socket => virtio_vsock(transport, dev_id, dev_parent),
         t => {
             warn!("Unrecognized virtio device: {:?}", t);
@@ -118,7 +120,7 @@ fn virtio_device_search() -> Vec<Arc<PciDeviceStructureGeneralDevice>> {
     // - modern devices:       0x1040..=0x107f
     #[inline]
     fn is_virtio_pci_device_id(device_id: u16) -> bool {
-        (0x1000..=0x103f).contains(&device_id) || (0x1040..=0x107f).contains(&device_id)
+        (0x1000..=0x107f).contains(&device_id)
     }
 
     let list = &*PCI_DEVICE_LINKEDLIST;

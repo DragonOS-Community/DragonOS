@@ -257,6 +257,12 @@ impl DevFS {
                     // loop块设备 (loop0, loop1, ...) 挂载在 /dev 下
                     // 注意：不能简单用 starts_with("loop")，因为会与网络 loopback 设备冲突
                     dev_root_inode.add_dev(name, device.clone())?;
+                } else if name.starts_with("pmem")
+                    && name.len() > 4
+                    && name[4..].chars().all(|c| c.is_ascii_digit())
+                {
+                    // PMEM 块设备 (pmem0, pmem1, ...) 挂载在 /dev 下
+                    dev_root_inode.add_dev(name, device.clone())?;
                 } else {
                     dev_block_inode.add_dev(name, device.clone())?;
                     device.set_parent(Arc::downgrade(&dev_block_inode));

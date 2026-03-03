@@ -10,6 +10,10 @@
 #
 # - AUTO_TEST: 自动测试选项
 # - SYSCALL_TEST_DIR: 系统调用测试目录
+# - DRAGONOS_VIRTIOFS_ENABLE: 是否启用 virtiofs（1启用，默认0）
+# - DRAGONOS_VIRTIOFS_SOCKET: virtiofsd socket路径
+# - DRAGONOS_VIRTIOFS_TAG: virtiofs 挂载tag
+# - DRAGONOS_VIRTIOFS_ENV_FILE: virtiofs配置文件路径（默认 ${ROOT_PATH}/tools/virtiofs/env.sh）
 #
 
 check_dependencies()
@@ -106,6 +110,10 @@ QEMU_NVDIMM_SLOTS="${QEMU_NVDIMM_SLOTS:-4}"
 QEMU_NVDIMM_MAXMEM="${QEMU_NVDIMM_MAXMEM:-4G}"
 PMEM_ENABLED=false
 PMEM_QEMU_ARGS=()
+DRAGONOS_VIRTIOFS_ENABLE=${DRAGONOS_VIRTIOFS_ENABLE:=0}
+DRAGONOS_VIRTIOFS_SOCKET=${DRAGONOS_VIRTIOFS_SOCKET:=/tmp/dragonos-virtiofsd.sock}
+DRAGONOS_VIRTIOFS_TAG=${DRAGONOS_VIRTIOFS_TAG:=hostshare}
+DRAGONOS_VIRTIOFS_ENV_FILE=${DRAGONOS_VIRTIOFS_ENV_FILE:=}
 
 # 检查必要的环境变量
 if [ -z "${ROOT_PATH}" ]; then
@@ -222,6 +230,9 @@ QEMU_DRIVE_ARGS=(-drive "id=disk,file=${QEMU_DISK_IMAGE},if=none,format=raw")
 QEMU_ACCEL_ARGS=()
 QEMU_DEVICE_ARGS=()
 QEMU_DISPLAY_ARGS=()
+QEMU_OBJECT_ARGS=()
+QEMU_NUMA_ARGS=()
+QEMU_CHARDEV_ARGS=()
 QEMU_ARGS=()
 # QEMU_ARGUMENT+=" -S "
 
@@ -375,6 +386,43 @@ setup_kernel_init_program
 # 从环境变量设置内核命令行参数
 setup_kernel_cmdline_from_env
 
+if [ "${DRAGONOS_VIRTIOFS_ENABLE}" == "1" ]; then
+    if [ "${ARCH}" != "x86_64" ]; then
+        echo "[错误] virtiofs临时运行支持当前仅实现x86_64"
+        exit 1
+    fi
+
+    if [ -z "${DRAGONOS_VIRTIOFS_ENV_FILE}" ]; then
+        DRAGONOS_VIRTIOFS_ENV_FILE="${ROOT_PATH}/tools/virtiofs/env.sh"
+    fi
+
+    if [ -f "${DRAGONOS_VIRTIOFS_ENV_FILE}" ]; then
+        # shellcheck source=/dev/null
+        . "${DRAGONOS_VIRTIOFS_ENV_FILE}"
+        if [ "${DRAGONOS_VIRTIOFS_SOCKET}" = "/tmp/dragonos-virtiofsd.sock" ] && [ -n "${SOCKET_PATH:-}" ]; then
+            DRAGONOS_VIRTIOFS_SOCKET="${SOCKET_PATH}"
+        fi
+        if [ "${DRAGONOS_VIRTIOFS_TAG}" = "hostshare" ] && [ -n "${VIRTIOFS_TAG:-}" ]; then
+            DRAGONOS_VIRTIOFS_TAG="${VIRTIOFS_TAG}"
+        fi
+    fi
+
+    if [ ! -S "${DRAGONOS_VIRTIOFS_SOCKET}" ]; then
+        echo "[错误] 未检测到virtiofsd socket: ${DRAGONOS_VIRTIOFS_SOCKET}"
+        echo "[提示] 请先在另一个终端启动: tools/virtiofs/start_virtiofsd.sh"
+        exit 1
+    fi
+
+    echo "[INFO] 启用virtiofs: tag=${DRAGONOS_VIRTIOFS_TAG}, socket=${DRAGONOS_VIRTIOFS_SOCKET}"
+
+    QEMU_OBJECT_ARGS+=(
+      -object "memory-backend-memfd,id=mem,size=${QEMU_MEMORY},share=on"
+    )
+    QEMU_NUMA_ARGS+=(-numa "node,memdev=mem")
+    QEMU_CHARDEV_ARGS+=(-chardev "socket,id=char_virtiofs,path=${DRAGONOS_VIRTIOFS_SOCKET}")
+    QEMU_DEVICE_ARGS+=(-device "vhost-user-fs-pci,chardev=char_virtiofs,tag=${DRAGONOS_VIRTIOFS_TAG}")
+fi
+
 
 if [ ${QEMU_NOGRAPHIC} == true ]; then
     QEMU_SERIAL_ARGS=(-serial chardev:mux -monitor chardev:mux -chardev "stdio,id=mux,mux=on,signal=off,logfile=${QEMU_SERIAL_LOG_FILE}")
@@ -438,6 +486,9 @@ QEMU_ARGS+=(
   "${QEMU_MACHINE_ARGS[@]}"
   "${QEMU_CPU_ARGS[@]}"
   "${QEMU_RTC_ARGS[@]}"
+  "${QEMU_OBJECT_ARGS[@]}"
+  "${QEMU_NUMA_ARGS[@]}"
+  "${QEMU_CHARDEV_ARGS[@]}"
   "${QEMU_SERIAL_ARGS[@]}"
   "${QEMU_DRIVE_ARGS[@]}"
   "${QEMU_DEVICE_ARGS[@]}"

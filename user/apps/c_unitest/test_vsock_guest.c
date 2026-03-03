@@ -10,8 +10,8 @@
   2. Host 连接 Guest（guest 当 server）
   # guest 内先监听
   ./test_vsock_guest guest-listen 40501 hello-from-host guest-ack
-  # host 上连接（guest-cid=3）
-  ./test_vsock_host client 3 40501 hello-from-host guest-ack
+  # host 上连接（guest-cid请使用 VMSTATE_DIR/vsock_cid，例如: $(cat bin/vmstate/vsock_cid)）
+  ./test_vsock_host client <guest-cid> 40501 hello-from-host guest-ack
 
   3. Guest 连接 Host（host 当 server）
   # host 先监听
@@ -42,7 +42,18 @@ static void usage(const char *prog)
     fprintf(stderr, "Usage:\n");
     fprintf(stderr, "  %s selftest [port]\n", prog);
     fprintf(stderr, "  %s guest-listen <port> [expect_msg] [reply]\n", prog);
+    fprintf(stderr, "    <port>       : 监听端口（示例: 10088）\n");
+    fprintf(stderr, "    [expect_msg] : 期望从对端收到的消息，默认不校验\n");
+    fprintf(stderr, "    [reply]      : 收到后回给对端的消息，默认 \"guest-ack\"\n");
     fprintf(stderr, "  %s guest-connect <cid> <port> [msg] [expect_reply]\n", prog);
+    fprintf(stderr, "    <cid>        : 对端CID（host通常为2）\n");
+    fprintf(stderr, "    <port>       : 对端监听端口\n");
+    fprintf(stderr, "    [msg]        : 主动发送的消息，默认 \"hello-from-guest\"\n");
+    fprintf(stderr, "    [expect_reply]: 期望收到的回复，默认 \"host-ack\"\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Tips:\n");
+    fprintf(stderr, "  - guest-listen 的第二个参数是 expect_msg，不是端口。\n");
+    fprintf(stderr, "  - 若 host 用默认消息，expect_msg 应写 hello-from-host。\n");
 }
 
 static int parse_u32(const char *s, uint32_t *out)

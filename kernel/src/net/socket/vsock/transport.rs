@@ -264,12 +264,12 @@ pub fn transport_local_cid() -> u32 {
         return transport.local_cid();
     }
 
-    if LOCAL_CID_FALLBACK_LOGGED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-    {
-        log::warn!("vsock: no ready transport, fallback local cid to VMADDR_CID_LOCAL");
-    }
+    let _ = LOCAL_CID_FALLBACK_LOGGED.compare_exchange(
+        false,
+        true,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
 
     super::addr::VMADDR_CID_LOCAL
 }

@@ -125,8 +125,6 @@ pub fn ensure_transport_event_worker_started() {
         log::error!("failed to start vsock event worker");
         return;
     }
-
-    log::info!("vsock event worker started");
 }
 
 /// 创建 AF_VSOCK 套接字对象。

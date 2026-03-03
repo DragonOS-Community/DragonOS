@@ -299,7 +299,6 @@ pub fn virtio_vsock(
     dev_id: Arc<DeviceId>,
     _dev_parent: Option<Arc<dyn Device>>,
 ) {
-    log::info!("virtio-vsock: init start for device {:?}", dev_id.id());
     let socket = match VirtIOSocket::<HalImpl, VirtIOTransport>::new(transport) {
         Ok(socket) => socket,
         Err(err) => {
@@ -326,11 +325,6 @@ pub fn virtio_vsock(
 
     let manager = VsockConnectionManager::new(socket);
     let transport = Arc::new(VirtioVsockTransport::new(manager, guest_cid));
-    log::info!(
-        "virtio-vsock: registering transport for device {:?}, guest_cid={}",
-        dev_id.id(),
-        guest_cid
-    );
     if let Err(err) = register_transport(transport as Arc<dyn VsockTransport>) {
         log::warn!(
             "virtio-vsock transport registration rejected for device {:?}, guest_cid={}: {:?}",
@@ -341,9 +335,4 @@ pub fn virtio_vsock(
         return;
     }
     ensure_transport_event_worker_started();
-    log::info!(
-        "virtio-vsock transport registered for device {:?}, guest_cid={}",
-        dev_id.id(),
-        guest_cid
-    );
 }

@@ -37,6 +37,7 @@ use super::{
     fs::{FuseFS, FuseMountData},
     protocol::{
         fuse_pack_struct, fuse_read_struct, FuseInHeader, FuseOutHeader, FUSE_DESTROY, FUSE_FORGET,
+        FUSE_INTERRUPT,
     },
 };
 
@@ -206,7 +207,7 @@ impl VirtioFsBridgeContext {
             let req = self.req_buf[..len].to_vec();
             let in_hdr: FuseInHeader = fuse_read_struct(&req)?;
             let noreply = matches!(in_hdr.opcode, FUSE_FORGET | FUSE_DESTROY);
-            let queue = if in_hdr.opcode == FUSE_FORGET {
+            let queue = if matches!(in_hdr.opcode, FUSE_FORGET | FUSE_INTERRUPT) {
                 QueueKind::Hiprio
             } else {
                 QueueKind::Request(self.choose_request_slot()?)

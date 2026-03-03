@@ -18,6 +18,8 @@ use super::transport::VirtIOTransport;
 
 const VIRTIO_FS_TAG_LEN: usize = 36;
 const VIRTIO_FS_REQUEST_QUEUE_BASE: u16 = 1;
+const VIRTIO_FS_MAX_REQUEST_QUEUES: u32 =
+    (u16::MAX as u32) - (VIRTIO_FS_REQUEST_QUEUE_BASE as u32) + 1;
 
 #[repr(C, packed)]
 struct VirtioFsConfig {
@@ -101,8 +103,9 @@ impl VirtioFsInstance {
         if slot >= self.request_queue_count() {
             return None;
         }
+        let slot = u16::try_from(slot).ok()?;
         VIRTIO_FS_REQUEST_QUEUE_BASE
-            .checked_add(slot as u16)
+            .checked_add(slot)
             .filter(|idx| {
                 (*idx as usize)
                     < (VIRTIO_FS_REQUEST_QUEUE_BASE as usize + self.request_queue_count())
@@ -177,7 +180,7 @@ fn read_config(transport: &VirtIOTransport) -> Result<(String, u32), SystemError
         *b = unsafe { ptr::read_volatile(base.add(VIRTIO_FS_TAG_LEN + i)) };
     }
     let nrqs = u32::from_le_bytes(nrqs_raw);
-    if nrqs == 0 {
+    if nrqs == 0 || nrqs > VIRTIO_FS_MAX_REQUEST_QUEUES {
         return Err(SystemError::EINVAL);
     }
 

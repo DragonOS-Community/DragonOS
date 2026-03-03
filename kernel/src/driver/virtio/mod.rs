@@ -15,6 +15,7 @@ pub mod transport_pci;
 pub mod virtio;
 pub mod virtio_fs;
 pub mod virtio_impl;
+pub mod virtio_vsock;
 
 /// virtio 设备厂商ID
 pub const VIRTIO_VENDOR_ID: u16 = 0x1af4;

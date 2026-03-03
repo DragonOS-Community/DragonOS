@@ -156,6 +156,11 @@ get-vmstate:
 	else \
 		echo "GDB端口: VM未运行"; \
 	fi
+	@if [ -f "$(VMSTATE_DIR)/vsock_cid" ]; then \
+		echo "VSOCK CID: $$(cat $(VMSTATE_DIR)/vsock_cid)"; \
+	else \
+		echo "VSOCK CID: 未启用或VM未运行"; \
+	fi
 
 
 # （nix）构建用户程序并生成磁盘镜像

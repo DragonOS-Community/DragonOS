@@ -9,6 +9,7 @@ pub mod packet;
 mod posix;
 pub mod unix;
 mod utils;
+pub mod vsock;
 
 /// `recvfrom(2)` 源地址输出参数的语义。
 ///

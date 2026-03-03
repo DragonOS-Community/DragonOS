@@ -210,6 +210,104 @@ find_free_port() {
     echo $port
 }
 
+# vsock CID 注册表（用于避免并发启动时分配重复CID）
+VSOCK_CID_REGISTRY="/tmp/dragonos-vsock-cid-registry"
+VSOCK_CID_LOCKDIR="/tmp/dragonos-vsock-cid-lock"
+
+acquire_vsock_lock() {
+    local retries=200
+    local i=0
+    while ! mkdir "${VSOCK_CID_LOCKDIR}" 2>/dev/null; do
+        i=$((i + 1))
+        if [ "${i}" -ge "${retries}" ]; then
+            echo "[WARN] failed to acquire vsock CID lock; skip vsock device"
+            return 1
+        fi
+        sleep 0.05
+    done
+    return 0
+}
+
+release_vsock_lock() {
+    rmdir "${VSOCK_CID_LOCKDIR}" 2>/dev/null || true
+}
+
+cleanup_stale_vsock_registry() {
+    local tmp_file
+    tmp_file=$(mktemp)
+    if [ -f "${VSOCK_CID_REGISTRY}" ]; then
+        while IFS=' ' read -r cid owner_pid owner_vmstate; do
+            if [ -z "${cid}" ] || [ -z "${owner_pid}" ]; then
+                continue
+            fi
+            if kill -0 "${owner_pid}" 2>/dev/null; then
+                printf '%s %s %s\n' "${cid}" "${owner_pid}" "${owner_vmstate}" >> "${tmp_file}"
+            fi
+        done < "${VSOCK_CID_REGISTRY}"
+    fi
+    mv "${tmp_file}" "${VSOCK_CID_REGISTRY}"
+}
+
+is_vsock_cid_in_registry() {
+    local cid="$1"
+    grep -q "^${cid} " "${VSOCK_CID_REGISTRY}" 2>/dev/null
+}
+
+generate_random_vsock_cid() {
+    # 有效CID范围: [3, 2147483647]
+    echo $(( (RANDOM << 16 | RANDOM) % 2147483645 + 3 ))
+}
+
+resolve_vsock_guest_cid() {
+    local requested="$1"
+    local chosen=""
+    local attempts=128
+    local i=0
+
+    if ! acquire_vsock_lock; then
+        return 1
+    fi
+
+    cleanup_stale_vsock_registry
+
+    if [ -z "${requested}" ] || [ "${requested}" = "random" ]; then
+        while [ "${i}" -lt "${attempts}" ]; do
+            chosen=$(generate_random_vsock_cid)
+            if [ "${chosen}" != "2" ] && ! is_vsock_cid_in_registry "${chosen}"; then
+                break
+            fi
+            i=$((i + 1))
+        done
+        if [ "${i}" -ge "${attempts}" ]; then
+            release_vsock_lock
+            echo "[WARN] failed to allocate unique random vsock CID; skip vsock device"
+            return 1
+        fi
+    else
+        if ! [[ "${requested}" =~ ^[0-9]+$ ]]; then
+            release_vsock_lock
+            echo "[WARN] invalid QEMU_VSOCK_GUEST_CID='${requested}'; skip vsock device"
+            return 1
+        fi
+        if [ "${requested}" -le 2 ]; then
+            release_vsock_lock
+            echo "[WARN] guest CID must be > 2; skip vhost-vsock-pci"
+            return 1
+        fi
+        if is_vsock_cid_in_registry "${requested}"; then
+            release_vsock_lock
+            echo "[WARN] guest CID=${requested} already in use by another DragonOS instance; skip vhost-vsock-pci"
+            return 1
+        fi
+        chosen="${requested}"
+    fi
+
+    QEMU_VSOCK_GUEST_CID="${chosen}"
+    printf '%s %s %s\n' "${QEMU_VSOCK_GUEST_CID}" "$$" "${VMSTATE_DIR}" >> "${VSOCK_CID_REGISTRY}"
+    release_vsock_lock
+    return 0
+}
+
 # 先分配网络端口
 HOST_PORT=$(find_free_port 12580)
 # GDB端口从网络端口的下一位开始搜索，确保不重复
@@ -234,7 +332,19 @@ QEMU_OBJECT_ARGS=()
 QEMU_NUMA_ARGS=()
 QEMU_CHARDEV_ARGS=()
 QEMU_ARGS=()
-# QEMU_ARGUMENT+=" -S "
+
+# vsock 配置：
+# - QEMU_ENABLE_VSOCK=1: 默认启用，条件不满足时自动降级跳过
+# - QEMU_VSOCK_GUEST_CID: guest CID；默认 random（可显式指定 >2 的数字）
+QEMU_ENABLE_VSOCK=1
+QEMU_VSOCK_GUEST_CID=${QEMU_VSOCK_GUEST_CID:=random}
+QEMU_ATTACH_VSOCK=0
+# 推荐 non-transitional 模型，PCI device id 对应 0x1053 (VSOCK)。
+QEMU_VSOCK_DEVICE_MODEL="vhost-vsock-pci-non-transitional"
+# GDB调试支持：
+# - QEMU_GDB_WAIT=1: QEMU 启动后立即暂停CPU（等同 -S），等待 GDB/monitor 手动继续
+# - QEMU_GDB_WAIT=0: 默认不暂停
+QEMU_GDB_WAIT=0
 
 if [ -f "${QEMU_EXT4_DISK_IMAGE}" ]; then
   QEMU_DRIVE_ARGS+=(-drive "id=ext4disk,file=${QEMU_EXT4_DISK_IMAGE},if=none,format=raw")
@@ -304,6 +414,24 @@ if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
     fi
     if [ -f "${QEMU_FAT_DISK_IMAGE}" ]; then
       QEMU_DEVICE_DISK_ARGS+=(-device virtio-blk-pci,drive=fatdisk)
+    fi
+
+    # 默认启用 vsock；若宿主环境不满足条件则降级为跳过该设备。
+    if [ "${QEMU_ENABLE_VSOCK}" = "1" ]; then
+      if [ "${ARCH}" != "x86_64" ]; then
+        echo "[WARN] vsock enabled but unsupported arch (${ARCH}); skip vsock device"
+      elif [ ! -e /dev/vhost-vsock ]; then
+        echo "[WARN] /dev/vhost-vsock not found; skip vsock device"
+        echo "[WARN] Hint: sudo modprobe vhost_vsock"
+      elif ! "${QEMU}" -device help 2>/dev/null | grep -q "${QEMU_VSOCK_DEVICE_MODEL}"; then
+        echo "[WARN] QEMU device model '${QEMU_VSOCK_DEVICE_MODEL}' not supported; skip vsock device"
+      elif ! resolve_vsock_guest_cid "${QEMU_VSOCK_GUEST_CID}"; then
+        :
+      else
+        QEMU_ATTACH_VSOCK=1
+      fi
+    else
+      echo "[INFO] vsock disabled by script config (QEMU_ENABLE_VSOCK=0)"
     fi
 
 elif [ ${ARCH} == "riscv64" ]; then
@@ -462,6 +590,11 @@ QEMU_DEVICE_ARGS+=(
   -device "qemu-xhci,id=xhci,p2=8,p3=4"
 ) 
 
+if [ "${QEMU_ATTACH_VSOCK}" = "1" ]; then
+  QEMU_DEVICE_ARGS+=(-device "${QEMU_VSOCK_DEVICE_MODEL},guest-cid=${QEMU_VSOCK_GUEST_CID}")
+  echo "[INFO] enable vsock device: ${QEMU_VSOCK_DEVICE_MODEL},guest-cid=${QEMU_VSOCK_GUEST_CID}"
+fi
+
 QEMU_DEVICE_ARGS+=("${PMEM_QEMU_ARGS[@]}")
 # E1000E
 # QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -netdev user,id=hostnet0,hostfwd=tcp::12580-:12580 -net nic,model=e1000e,netdev=hostnet0,id=net0 -netdev user,id=hostnet1,hostfwd=tcp::12581-:12581 -device virtio-net-pci,vectors=5,netdev=hostnet1,id=net1 -usb -device qemu-xhci,id=xhci,p2=8,p3=4 " 
@@ -530,8 +663,13 @@ install_riscv_uboot()
 
 if [ $flag_can_run -eq 1 ]; then
 
-  # 清理旧的PID文件
+  # 清理旧的状态文件
   rm -f "${VMSTATE_DIR}/pid"
+  rm -f "${VMSTATE_DIR}/vsock_cid"
+
+  if [ "${QEMU_ATTACH_VSOCK}" = "1" ]; then
+    echo "${QEMU_VSOCK_GUEST_CID}" > "${VMSTATE_DIR}/vsock_cid"
+  fi
 
   # 启动QEMU的函数
   launch_qemu() {

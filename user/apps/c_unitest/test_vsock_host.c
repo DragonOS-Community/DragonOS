@@ -1,4 +1,25 @@
 // 请在 host 中使用这个文件，与 vsock_test.c 配套使用
+/*
+  使用方式示例：
+  1. 只测 guest 本地回环（不依赖 host）
+  # 在 DragonOS guest 内
+  test_vsock_guest selftest
+  # 或指定端口
+  test_vsock_guest selftest 40500
+
+  2. Host 连接 Guest（guest 当 server）
+  # guest 内先监听
+  ./test_vsock_guest guest-listen 40501 hello-from-host guest-ack
+  # host 上连接（guest-cid=3）
+  ./test_vsock_host client 3 40501 hello-from-host guest-ack
+
+  3. Guest 连接 Host（host 当 server）
+  # host 先监听
+  ./test_vsock_host server 40502 hello-from-guest host-ack
+  # guest 连接 host（host cid=2）
+  ./test_vsock_guest guest-connect 2 40502 hello-from-guest host-ack
+*/
+
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>

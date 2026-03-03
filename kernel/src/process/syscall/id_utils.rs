@@ -153,40 +153,42 @@ pub fn validate_setuid_id(v: usize) -> Result<(), SystemError> {
 /// 2. 如果 euid 从 0 变为非 0，清除 effective capabilities
 /// 3. 如果 euid 从非 0 变为 0，设置 effective = permitted
 ///
+#[derive(Debug, Clone, Copy)]
+pub struct UidTransition {
+    pub old_ruid: usize,
+    pub old_euid: usize,
+    pub old_suid: usize,
+    pub new_ruid: usize,
+    pub new_euid: usize,
+    pub new_suid: usize,
+}
+
 /// # 参数
 /// - `new_cred`: 新的凭证（将被修改）
-/// - `old_ruid`: 旧的 real UID
-/// - `old_euid`: 旧的 effective UID
-/// - `old_suid`: 旧的 saved UID
-/// - `new_ruid`: 新的 real UID
-/// - `new_euid`: 新的 effective UID
-/// - `new_suid`: 新的 saved UID
-pub fn handle_uid_capabilities(
-    new_cred: &mut Cred,
-    old_ruid: usize,
-    old_euid: usize,
-    old_suid: usize,
-    new_ruid: usize,
-    new_euid: usize,
-    new_suid: usize,
-) {
-    let old_has_root = old_ruid == 0 || old_euid == 0 || old_suid == 0;
-    let new_has_root = new_ruid == 0 || new_euid == 0 || new_suid == 0;
+/// - `uids`: UID 变更前后上下文
+/// - `keepcaps`: 是否保留 permitted capabilities
+pub fn handle_uid_capabilities(new_cred: &mut Cred, uids: UidTransition, keepcaps: bool) {
+    let old_has_root = uids.old_ruid == 0 || uids.old_euid == 0 || uids.old_suid == 0;
+    let new_has_root = uids.new_ruid == 0 || uids.new_euid == 0 || uids.new_suid == 0;
 
-    // 规则 1: 所有 UID 都从 root 变为非 root，清除 permitted, effective, ambient
+    // 规则 1: 所有 UID 都从 root 变为非 root
+    // - keepcaps=false: 清除 permitted/effective/ambient
+    // - keepcaps=true: 保留 permitted，ambient 仍需清除
     if old_has_root && !new_has_root {
-        new_cred.cap_permitted = CAPFlags::CAP_EMPTY_SET;
-        new_cred.cap_effective = CAPFlags::CAP_EMPTY_SET;
+        if !keepcaps {
+            new_cred.cap_permitted = CAPFlags::CAP_EMPTY_SET;
+            new_cred.cap_effective = CAPFlags::CAP_EMPTY_SET;
+        }
         new_cred.cap_ambient = CAPFlags::CAP_EMPTY_SET;
     }
 
     // 规则 2: euid 从 root 变为非 root，清除 effective
-    if old_euid == 0 && new_euid != 0 {
+    if uids.old_euid == 0 && uids.new_euid != 0 {
         new_cred.cap_effective = CAPFlags::CAP_EMPTY_SET;
     }
 
     // 规则 3: euid 从非 root 变为 root，设置 effective = permitted
-    if old_euid != 0 && new_euid == 0 {
+    if uids.old_euid != 0 && uids.new_euid == 0 {
         new_cred.cap_effective = new_cred.cap_permitted;
     }
 }

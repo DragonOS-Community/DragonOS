@@ -44,8 +44,8 @@ enum PrctlOption {
     GetPDeathSig = 2,
     GetDumpable = 3,
     SetDumpable = 4,
+    GetKeepCaps = 7,
     SetKeepCaps = 8,
-    GetKeepCaps = 9,
     SetName = 15,
     GetName = 16,
     CapBsetRead = 23,
@@ -105,11 +105,18 @@ impl Syscall for SysPrctl {
                 }
             }
             PrctlOption::SetKeepCaps => {
-                // Linux: arg2 非 0 表示置位，0 表示清除。
-                let v = arg2 as isize;
-                let enable = v != 0;
-                current.set_keepcaps(enable);
-                Ok(0)
+                // Linux: PR_SET_KEEPCAPS 仅允许 0/1，其他值返回 EINVAL。
+                match arg2 {
+                    0 => {
+                        current.set_keepcaps(false);
+                        Ok(0)
+                    }
+                    1 => {
+                        current.set_keepcaps(true);
+                        Ok(0)
+                    }
+                    _ => Err(SystemError::EINVAL),
+                }
             }
             PrctlOption::GetKeepCaps => {
                 // Linux: 返回 1 表示置位，0 表示未置位。

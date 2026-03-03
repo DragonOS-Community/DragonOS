@@ -6,8 +6,8 @@ use core::{
 use printf_compat::{format, output};
 
 /// Printf according to the format string, function will return the number of bytes written(including '\0')
-pub unsafe extern "C" fn printf(w: &mut impl Write, str: *const c_char, mut args: ...) -> c_int {
-    let bytes_written = format(str as _, args.as_va_list(), output::fmt_write(w));
+pub unsafe extern "C" fn printf(w: &mut impl Write, str: *const c_char, args: ...) -> c_int {
+    let bytes_written = format(str as _, args, output::fmt_write(w));
     bytes_written + 1
 }
 

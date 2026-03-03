@@ -5,7 +5,7 @@ include ./env.mk
 ifeq ($(USING_DRAGONOS_NIX_ENV),1)
 export TOOLCHAIN =
 else
-export TOOLCHAIN := +nightly-2025-08-10
+export TOOLCHAIN := +nightly-2026-02-24
 endif
 
 # export ARCH ?= x86_64
@@ -20,7 +20,7 @@ else
 	$(error "Unsupported ARCH: $(ARCH)")
 endif
 
-export CARGO_ZBUILD=-Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem
+export CARGO_ZBUILD=-Zjson-target-spec -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem
 
 .PHONY: ECHO
 ECHO:

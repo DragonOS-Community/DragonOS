@@ -33,6 +33,8 @@ impl Major {
     pub const AHCI_BLK_MAJOR: Self = Self::new(8);
     pub const VIRTIO_BLK_MAJOR: Self = Self::new(254);
     pub const MMC_BLK_MAJOR: Self = Self::new(179);
+    /// PMEM block device
+    pub const PMEM_BLK_MAJOR: Self = Self::new(259);
 
     pub const HVC_MAJOR: Self = Self::new(229);
 
@@ -88,6 +90,19 @@ impl DeviceNumber {
         let major = self.major().data();
         let minor = self.minor();
         return (minor & 0xff) | (major << 8) | ((minor & !0xff) << 12);
+    }
+
+    /// Decode a Linux-encoded dev_t and create a DeviceNumber.
+    ///
+    /// Linux dev_t encoding (compatible with glibc makedev/major/minor):
+    /// - major = (dev & 0xfff00) >> 8
+    /// - minor = (dev & 0xff) | ((dev >> 12) & 0xfff00)
+    ///
+    /// This works for both old format (major < 256 && minor < 256) and new format.
+    pub const fn from_linux_dev_t(dev: u32) -> Self {
+        let major = (dev & 0xfff00) >> 8;
+        let minor = (dev & 0xff) | ((dev >> 12) & 0xfff00);
+        Self::new(Major::new(major), minor)
     }
 }
 

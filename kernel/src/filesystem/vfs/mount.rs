@@ -237,6 +237,7 @@ pub struct MountFS {
     mount_id: MountId,
 
     mount_flags: MountFlags,
+    mount_source: RwSem<Option<String>>,
 }
 
 impl Debug for MountFS {
@@ -280,6 +281,7 @@ impl MountFS {
         propagation: Arc<MountPropagation>,
         mnt_ns: Option<&Arc<MntNamespace>>,
         mount_flags: MountFlags,
+        mount_source: Option<String>,
     ) -> Arc<Self> {
         let result = Arc::new_cyclic(|self_ref| MountFS {
             inner_filesystem,
@@ -290,6 +292,7 @@ impl MountFS {
             propagation,
             mount_id: MountId::alloc(),
             mount_flags,
+            mount_source: RwSem::new(mount_source),
         });
 
         if let Some(mnt_ns) = mnt_ns {
@@ -302,6 +305,7 @@ impl MountFS {
     pub fn deepcopy(&self, self_mountpoint: Option<Arc<MountFSInode>>) -> Arc<Self> {
         // Clone propagation state for the new mount copy
         let new_propagation = self.propagation.clone_for_copy();
+        let mount_source = self.mount_source();
 
         let mountfs = Arc::new_cyclic(|self_ref| MountFS {
             inner_filesystem: self.inner_filesystem.clone(),
@@ -312,6 +316,7 @@ impl MountFS {
             propagation: new_propagation,
             mount_id: MountId::alloc(),
             mount_flags: self.mount_flags,
+            mount_source: RwSem::new(mount_source),
         });
 
         return mountfs;
@@ -352,6 +357,14 @@ impl MountFS {
 
     pub fn fs_type(&self) -> &str {
         self.inner_filesystem.name()
+    }
+
+    pub fn mount_source(&self) -> Option<String> {
+        self.mount_source.read().clone()
+    }
+
+    pub fn set_mount_source(&self, mount_source: Option<String>) {
+        *self.mount_source.write() = mount_source;
     }
 
     #[inline(never)]
@@ -400,21 +413,18 @@ impl MountFS {
     /// # Errors
     /// 如果当前文件系统是根文件系统，那么将会返回`EINVAL`
     pub fn umount(&self) -> Result<Arc<MountFS>, SystemError> {
-        // Unregister from peer group before unmounting
-        let propagation = self.propagation();
-        if propagation.is_shared() {
-            let group_id = propagation.peer_group_id();
-            unregister_peer(group_id, &self.self_ref());
-        }
-
-        let r = self
+        let result = self
             .self_mountpoint()
             .ok_or(SystemError::EINVAL)?
             .do_umount();
 
-        self.self_mountpoint.write().take();
+        // Only clear mountpoint state and notify filesystem after successful detach.
+        if result.is_ok() {
+            self.self_mountpoint.write().take();
+            self.inner_filesystem.on_umount();
+        }
 
-        return r;
+        return result;
     }
 }
 
@@ -428,6 +438,12 @@ impl Drop for MountFS {
 }
 
 impl MountFSInode {
+    /// 返回被挂载包装器包裹的底层 inode。
+    #[inline]
+    pub(super) fn underlying_inode(&self) -> Arc<dyn IndexNode> {
+        self.inner_inode.clone()
+    }
+
     /// @brief 用Arc指针包裹MountFSInode对象。
     /// 本函数的主要功能为，初始化MountFSInode对象中的自引用Weak指针
     /// 本函数只应在构造器中被调用
@@ -530,21 +546,14 @@ impl MountFSInode {
 
         let mountpoint_id = self.inner_inode.metadata()?.inode_id;
 
-        // Get the child mount that will be unmounted
+        // Detach first. Follow-up bookkeeping (peer registry and propagation)
+        // must not run if detach itself failed.
         let child_mount = self
             .mount_fs
             .mountpoints
             .lock()
-            .get(&mountpoint_id)
-            .cloned();
-
-        if let Some(ref child) = child_mount {
-            // Unregister from peer group if shared
-            let child_prop = child.propagation();
-            if child_prop.is_shared() {
-                unregister_peer(child_prop.peer_group_id(), child);
-            }
-        }
+            .remove(&mountpoint_id)
+            .ok_or(SystemError::ENOENT)?;
 
         // Propagate umount to peers and slaves of the parent mount
         let parent_prop = self.mount_fs.propagation();
@@ -554,13 +563,13 @@ impl MountFSInode {
             }
         }
 
-        // Remove the mount
-        return self
-            .mount_fs
-            .mountpoints
-            .lock()
-            .remove(&mountpoint_id)
-            .ok_or(SystemError::ENOENT);
+        // Remove detached mount from peer registry if needed.
+        let child_prop = child_mount.propagation();
+        if child_prop.is_shared() {
+            unregister_peer(child_prop.peer_group_id(), &child_mount);
+        }
+
+        return Ok(child_mount);
     }
 
     #[inline(never)]
@@ -652,6 +661,14 @@ impl IndexNode for MountFSInode {
 
     fn sync(&self) -> Result<(), SystemError> {
         return self.inner_inode.sync();
+    }
+
+    fn sync_file(
+        &self,
+        datasync: bool,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        self.inner_inode.sync_file(datasync, data)
     }
 
     fn fadvise(
@@ -793,6 +810,15 @@ impl IndexNode for MountFSInode {
         return self.inner_inode.link(name, &other_inner);
     }
 
+    fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let inner_inode = self.inner_inode.symlink(name, target)?;
+        Ok(Arc::new_cyclic(|self_ref| MountFSInode {
+            inner_inode,
+            mount_fs: self.mount_fs.clone(),
+            self_ref: self_ref.clone(),
+        }))
+    }
+
     /// @brief 在挂载文件系统中删除文件/文件夹
     #[inline]
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
@@ -845,6 +871,13 @@ impl IndexNode for MountFSInode {
             .move_to(old_name, &target_inner, new_name, flags);
     }
 
+    fn check_access(
+        &self,
+        mask: crate::filesystem::vfs::permission::PermissionMask,
+    ) -> Result<(), SystemError> {
+        self.inner_inode.check_access(mask)
+    }
+
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
         match name {
             // 查找的是当前目录
@@ -880,7 +913,7 @@ impl IndexNode for MountFSInode {
         &self,
         cmd: u32,
         data: usize,
-        private_data: &FilePrivateData,
+        private_data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         return self.inner_inode.ioctl(cmd, data, private_data);
     }
@@ -922,6 +955,7 @@ impl IndexNode for MountFSInode {
             new_propagation,
             Some(&ProcessManager::current_mntns()),
             mount_flags,
+            None,
         );
 
         // Perform all potentially-failing operations first before registering in peer group
@@ -1092,6 +1126,21 @@ impl FileSystem for MountFS {
         let mut sb = self.inner_filesystem.super_block();
         sb.flags = self.mount_flags.bits() as u64;
         sb
+    }
+
+    fn statfs(&self, inode: &Arc<dyn IndexNode>) -> Result<SuperBlock, SystemError> {
+        let inner_inode = inode
+            .as_any_ref()
+            .downcast_ref::<MountFSInode>()
+            .map(|mnt| mnt.inner_inode.clone())
+            .unwrap_or_else(|| inode.clone());
+        let mut sb = self.inner_filesystem.statfs(&inner_inode)?;
+        sb.flags = self.mount_flags.bits() as u64;
+        Ok(sb)
+    }
+
+    fn permission_policy(&self) -> crate::filesystem::vfs::FsPermissionPolicy {
+        self.inner_filesystem.permission_policy()
     }
 
     unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {

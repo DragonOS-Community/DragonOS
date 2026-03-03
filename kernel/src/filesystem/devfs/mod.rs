@@ -148,6 +148,7 @@ impl DevFS {
 
     /// @brief 注册系统内部自带的设备
     fn register_bultinin_device(&self) {
+        use crate::filesystem::fuse::dev::LockedFuseDevInode;
         use null_dev::LockedNullInode;
         use random_dev::LockedRandomInode;
         use zero_dev::LockedZeroInode;
@@ -161,6 +162,9 @@ impl DevFS {
         dev_root
             .add_dev("random", LockedRandomInode::new())
             .expect("DevFS: Failed to register /dev/random");
+        dev_root
+            .add_dev("fuse", LockedFuseDevInode::new())
+            .expect("DevFS: Failed to register /dev/fuse");
     }
 
     /// @brief 在devfs内注册设备
@@ -252,6 +256,12 @@ impl DevFS {
                 {
                     // loop块设备 (loop0, loop1, ...) 挂载在 /dev 下
                     // 注意：不能简单用 starts_with("loop")，因为会与网络 loopback 设备冲突
+                    dev_root_inode.add_dev(name, device.clone())?;
+                } else if name.starts_with("pmem")
+                    && name.len() > 4
+                    && name[4..].chars().all(|c| c.is_ascii_digit())
+                {
+                    // PMEM 块设备 (pmem0, pmem1, ...) 挂载在 /dev 下
                     dev_root_inode.add_dev(name, device.clone())?;
                 } else {
                     dev_block_inode.add_dev(name, device.clone())?;
@@ -618,7 +628,7 @@ impl IndexNode for LockedDevFSInode {
         &self,
         _cmd: u32,
         _data: usize,
-        _private_data: &FilePrivateData,
+        _private_data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }

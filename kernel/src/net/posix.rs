@@ -101,7 +101,7 @@ pub struct SockAddrLl {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct SockAddrNl {
-    pub nl_family: AddressFamily,
+    pub nl_family: u16,
     pub nl_pad: u16,
     pub nl_pid: u32,
     pub nl_groups: u32,
@@ -189,7 +189,7 @@ impl From<NetlinkSocketAddr> for SockAddr {
     fn from(value: NetlinkSocketAddr) -> Self {
         SockAddr {
             addr_nl: SockAddrNl {
-                nl_family: AddressFamily::Netlink,
+                nl_family: AddressFamily::Netlink as u16,
                 nl_pad: 0,
                 nl_pid: value.port(),
                 nl_groups: value.groups().as_u32(),

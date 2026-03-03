@@ -62,7 +62,7 @@ impl Ext4 {
     /// * `EEXIST` - The object already exists.
     pub fn generic_create(&self, root: InodeId, path: &str, mode: InodeMode) -> Result<InodeId> {
         // Search from the given parent inode
-        let mut cur = self.read_inode(root);
+        let mut cur = self.read_inode(root)?;
         let search_path = Self::split_path(path);
         // Search recursively
         for (i, path) in search_path.iter().enumerate() {
@@ -75,7 +75,7 @@ impl Ext4 {
                         // Reach the object and it already exists
                         return_error!(ErrCode::EEXIST, "Object {}/{} already exists", root, path);
                     }
-                    cur = self.read_inode(id);
+                    cur = self.read_inode(id)?;
                 }
                 Err(e) => {
                     if e.code() != ErrCode::ENOENT {
@@ -116,10 +116,10 @@ impl Ext4 {
         let parent_id = self.generic_lookup(root, &parent_path)?;
         // Get the child inode
         let child_id = self.lookup(parent_id, file_name)?;
-        let mut parent = self.read_inode(parent_id);
-        let mut child = self.read_inode(child_id);
+        let mut parent = self.read_inode(parent_id)?;
+        let mut child = self.read_inode(child_id)?;
         // Check if child is a non-empty directory
-        if child.inode.is_dir() && self.dir_list_entries(&child).len() > 2 {
+        if child.inode.is_dir() && self.dir_list_entries(&child)?.len() > 2 {
             return_error!(ErrCode::ENOTEMPTY, "Directory {} not empty", path);
         }
         // Unlink the file

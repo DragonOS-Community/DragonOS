@@ -1,3 +1,5 @@
+#![allow(function_casts_as_integer)]
+
 use crate::arch::MMArch;
 use crate::init::boot_params;
 use crate::init::kexec::Kimage;

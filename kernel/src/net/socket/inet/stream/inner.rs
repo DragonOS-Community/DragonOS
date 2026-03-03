@@ -94,7 +94,7 @@ impl Init {
                 new_sock.set_timeout(socket.timeout());
                 new_sock.set_hop_limit(socket.hop_limit());
 
-                *socket = Box::new(new_sock);
+                **socket = new_sock;
                 Ok(())
             }
             Init::Bound((inner, _)) => {

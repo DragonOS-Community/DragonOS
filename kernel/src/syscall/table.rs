@@ -1,4 +1,5 @@
 #![allow(unused)]
+#![allow(function_casts_as_integer)]
 
 use alloc::string::String;
 use alloc::string::ToString;

@@ -4,13 +4,10 @@ use crate::{
     filesystem::vfs::{
         fcntl::AtFlags,
         utils::{rsplit_path, user_path_at},
-        FilePrivateData, FileType, NAME_MAX, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        FileType, NAME_MAX, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
-    libs::mutex::Mutex,
     process::ProcessManager,
 };
-
-use super::InodeMode;
 
 pub fn do_symlinkat(from: &str, newdfd: Option<i32>, to: &str) -> Result<usize, SystemError> {
     let newdfd = match newdfd {
@@ -52,12 +49,7 @@ pub fn do_symlinkat(from: &str, newdfd: Option<i32>, to: &str) -> Result<usize, 
         return Err(SystemError::ENOTDIR);
     }
 
-    let new_inode =
-        new_parent.create_with_data(new_name, FileType::SymLink, InodeMode::S_IRWXUGO, 0)?;
-
-    let buf = from.as_bytes();
-    let len = buf.len();
-    new_inode.write_at(0, len, buf, Mutex::new(FilePrivateData::Unused).lock())?;
+    new_parent.symlink(new_name, from)?;
 
     return Ok(0);
 }

@@ -1,3 +1,5 @@
+#![allow(function_casts_as_integer)]
+
 use crate::{
     arch::{
         ipc::signal::X86_64SignalArch,

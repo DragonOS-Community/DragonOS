@@ -1,3 +1,5 @@
+#![allow(function_casts_as_integer)]
+
 use core::{
     hint::spin_loop,
     sync::atomic::{compiler_fence, fence, AtomicBool, Ordering},

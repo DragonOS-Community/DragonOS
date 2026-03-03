@@ -262,10 +262,7 @@ impl IndexNode for GenDisk {
         let blocks = range.lba_end.saturating_sub(range.lba_start);
         let size_in_bytes = blocks.saturating_mul(LBA_SIZE);
 
-        meta.size = match i64::try_from(size_in_bytes) {
-            Ok(val) => val,
-            Err(_) => i64::MAX,
-        };
+        meta.size = i64::try_from(size_in_bytes).unwrap_or(i64::MAX);
         meta.blocks = blocks;
         meta.blk_size = LBA_SIZE;
         Ok(meta)
@@ -302,7 +299,7 @@ impl IndexNode for GenDisk {
         &self,
         cmd: u32,
         data: usize,
-        private_data: &crate::filesystem::vfs::FilePrivateData,
+        private_data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let bdev = self.block_device();
         if let Some(loop_dev) = BlockDevice::as_any_ref(&*bdev).downcast_ref::<LoopDevice>() {

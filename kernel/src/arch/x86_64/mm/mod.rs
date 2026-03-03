@@ -1,3 +1,5 @@
+#![allow(function_casts_as_integer)]
+
 pub mod barrier;
 pub mod bump;
 pub mod fault;

@@ -1885,20 +1885,15 @@ impl VirtualConsoleInfo {
 }
 
 /// 字符强度
-#[derive(Debug, Clone, PartialEq, Copy)]
+#[derive(Debug, Clone, PartialEq, Copy, Default)]
 pub enum VirtualConsoleIntensity {
     /// 暗淡
     HalfBright = 0,
     /// 正常
+    #[default]
     Normal = 1,
     /// 粗体
     Bold = 2,
-}
-
-impl Default for VirtualConsoleIntensity {
-    fn default() -> Self {
-        Self::Normal
-    }
 }
 
 /// ## 虚拟控制台的状态

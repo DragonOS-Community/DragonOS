@@ -232,8 +232,23 @@ impl BlockDevManager {
     ///
     /// - `path`: 分区路径 `/dev/sda1` 或者 `sda1`，或者是`/dev/sda`
     pub fn lookup_gendisk_by_path(&self, path: &str) -> Option<Arc<GenDisk>> {
+        let raw = path.strip_prefix("/dev/").unwrap_or(path);
         let (devname, partno) = self.path2devname(path)?;
         let inner = self.inner();
+
+        // 优先精确匹配整盘设备名，避免把数字结尾设备名（如 pmem0/loop0）误解析为分区号。
+        for dev in inner.disks.values() {
+            if dev.dev_name().as_str() == raw {
+                return dev
+                    .blkdev_meta()
+                    .inner()
+                    .gendisks
+                    .get(&GenDisk::ENTIRE_DISK_IDX)
+                    .cloned();
+            }
+        }
+
+        // 精确匹配失败后再回退到传统“尾部数字=分区号”解析。
         for dev in inner.disks.values() {
             if dev.dev_name().as_str() == devname {
                 return dev.blkdev_meta().inner().gendisks.get(&partno).cloned();

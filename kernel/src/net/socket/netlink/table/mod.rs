@@ -1,9 +1,10 @@
 mod multicast;
+pub use multicast::MulticastMessage;
 
 use crate::net::socket::netlink::addr::multicast::GroupIdSet;
+use crate::net::socket::netlink::kobject::message::KobjectUeventMessage;
 use crate::net::socket::netlink::route::kern::NetlinkRouteKernelSocket;
 use crate::net::socket::netlink::route::message::RouteNlMessage;
-use crate::net::socket::netlink::table::multicast::MulticastMessage;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
 use crate::{libs::rand, net::socket::netlink::addr::NetlinkSocketAddr};
@@ -25,14 +26,14 @@ const MAX_GROUPS: u32 = 32;
 #[derive(Debug)]
 pub struct NetlinkSocketTable {
     route: Arc<RwSem<ProtocolSocketTable<RouteNlMessage>>>,
-    // 在这里继续补充其他协议下的 socket table
-    // 比如 uevent: Arc<RwSem<ProtocolSocketTable<UeventMessage>>>,
+    kobject_uevent: Arc<RwSem<ProtocolSocketTable<KobjectUeventMessage>>>,
 }
 
 impl Default for NetlinkSocketTable {
     fn default() -> Self {
         Self {
             route: Arc::new(RwSem::new(ProtocolSocketTable::new())),
+            kobject_uevent: Arc::new(RwSem::new(ProtocolSocketTable::new())),
         }
     }
 }
@@ -40,6 +41,10 @@ impl Default for NetlinkSocketTable {
 impl NetlinkSocketTable {
     pub fn route(&self) -> Arc<RwSem<ProtocolSocketTable<RouteNlMessage>>> {
         self.route.clone()
+    }
+
+    pub fn kobject_uevent(&self) -> Arc<RwSem<ProtocolSocketTable<KobjectUeventMessage>>> {
+        self.kobject_uevent.clone()
     }
 }
 
@@ -240,6 +245,17 @@ impl SupportedNetlinkProtocol for NetlinkRouteProtocol {
 
     fn socket_table(netns: Arc<NetNamespace>) -> Arc<RwSem<ProtocolSocketTable<Self::Message>>> {
         netns.netlink_socket_table().route()
+    }
+}
+
+#[derive(Debug)]
+pub struct NetlinkKobjectUeventProtocol;
+
+impl SupportedNetlinkProtocol for NetlinkKobjectUeventProtocol {
+    type Message = KobjectUeventMessage;
+
+    fn socket_table(netns: Arc<NetNamespace>) -> Arc<RwSem<ProtocolSocketTable<Self::Message>>> {
+        netns.netlink_socket_table().kobject_uevent()
     }
 }
 

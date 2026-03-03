@@ -16,19 +16,14 @@ pub mod virtual_terminal;
 // 下列结构体暂时放在这
 /// 键盘/显示器"（Keyboard/Display）模式
 #[allow(dead_code)]
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Default)]
 pub enum KDMode {
     KdText,
     KdGraphics,
     KdText0,
     KdText1,
+    #[default]
     Undefined,
-}
-
-impl Default for KDMode {
-    fn default() -> Self {
-        Self::Undefined
-    }
 }
 
 #[derive(Debug, Default, Clone)]

@@ -2,7 +2,7 @@
 # 用于DragonOS项目
 
 # Rust工具链配置
-TOOLCHAIN="+nightly-2025-08-10-x86_64-unknown-linux-gnu"
+TOOLCHAIN="+nightly-2026-02-24-x86_64-unknown-linux-gnu"
 RUSTFLAGS+=""
 
 ifdef DADK_CURRENT_BUILD_DIR

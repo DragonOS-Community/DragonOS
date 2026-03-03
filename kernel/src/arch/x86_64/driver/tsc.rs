@@ -9,9 +9,11 @@ use core::{
     intrinsics::unlikely,
 };
 use log::{debug, error, info, warn};
+use raw_cpuid::CpuId;
 use system_error::SystemError;
 
 use super::hpet::{hpet_instance, is_hpet_enabled};
+use crate::driver::clocksource::tsc::init_tsc_clocksource;
 
 #[derive(Debug)]
 pub struct TSCManager;
@@ -22,41 +24,64 @@ static mut CPU_KHZ: u64 = 0;
 impl TSCManager {
     const DEFAULT_THRESHOLD: u64 = 0x20000;
 
-    /// 初始化TSC
+    /// 初始化 tsc 硬件计数器，包括测量 tsc 的频率和 cpu 的频率，初始化 tsc_clocksource
     ///
-    /// 目前由于未支持acpi pm timer, 因此调用该函数时，HPET应当完成初始化，否则将无法校准TSC
+    /// ### 副作用
+    /// - 可能会修改全局变量 `TSC_KHZ` 和 `CPU_KHZ`
+    /// - 可能会初始化并注册 TSC 作为系统的时钟源
     ///
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/tsc.c#1511
     pub fn init() -> Result<(), SystemError> {
-        let cpuid = x86::cpuid::CpuId::new();
+        let cpuid = CpuId::new();
         let feat = cpuid.get_feature_info().ok_or(SystemError::ENODEV)?;
         if !feat.has_tsc() {
             error!("TSC is not available");
             return Err(SystemError::ENODEV);
         }
 
-        if Self::cpu_khz() != 0 && Self::tsc_khz() != 0 {
-            return Ok(());
-        }
-
         if unsafe { TSC_KHZ == 0 } {
             if let Err(e) = Self::determine_cpu_tsc_frequency(false) {
                 error!("Failed to determine CPU TSC frequency: {:?}", e);
-                // todo: mark TSC as unstable clock source
+                // TODO: 添加静态变量 TSC_UNSTABLE 标志到该文件中。
+                // TODO: 标记 TSC_UNSTABLE == true，然后“初始化”并标记 tsc_clocksource 为不稳定
                 return Err(e);
             }
         }
 
-        // todo: register TSC as clock source and deal with unstable clock source
+        if !Self::has_invariant_tsc() {
+            warn!("TSC is not invariant, skip TSC clocksource registration");
+            // TODO: 添加静态变量 TSC_UNSTABLE 标志到该文件中。
+            // TODO: 标记 TSC_UNSTABLE == true，然后“初始化”并标记 tsc_clocksource 为不稳定
+            return Ok(());
+        }
+
+        init_tsc_clocksource().map_err(|e| {
+            error!("Failed to register TSC clocksource: {:?}", e);
+            e
+        })?;
 
         return Ok(());
     }
 
-    /// 获取TSC和CPU总线的频率
+    /// 检查平台是否支持不受频率与电源状态影响的稳定 TSC
+    fn has_invariant_tsc() -> bool {
+        CpuId::new()
+            .get_advanced_power_mgmt_info()
+            .is_some_and(|apm| apm.has_invariant_tsc())
+    }
+
+    /// 通过其他硬件时钟源测量 TSC 频率放入 CPU_KHZ 中，然后利用其设置 TSC_KHZ。
     ///
-    /// ## 参数
+    /// ### 参数
+    /// - `early`：是否在系统早期初始化阶段
     ///
-    /// - `early`：是否在早期初始化
+    /// ### 返回值
+    /// - `Ok(())`：成功设置 CPU_KHZ 和 TSC_KHZ
+    /// - `Err(SystemError)`：测量失败，无法确定 TSC 或 CPU 频率
+    ///
+    /// ### 副作用
+    /// - 可能会修改全局变量 `CPU_KHZ` 和 `TSC_KHZ`，如果测量成功的话
+    /// - 可能会输出日志，记录测量过程和结果
     ///
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/tsc.c#1438
     fn determine_cpu_tsc_frequency(early: bool) -> Result<(), SystemError> {
@@ -64,21 +89,31 @@ impl TSCManager {
             warn!("TSC and CPU frequency already determined");
         }
 
+        // 下面所有代码的逻辑是这样的：
+        // - 我们先使用其他参照物（cpu内置的有关tsc的信息/其他已经初始化的硬件定时器）
+        //   测量出一个可能的 tsc 频率放入 CPU_KHZ 中作为 TSC_KHZ 的备选值，然后将其与可能存在的 TSC_KHZ 进行对比。
+        //   - 如果 TSC_KHZ 没有被其他途径设置，那么我们就使用 CPU_KHZ 作为 TSC_KHZ。
+        //   - 如果 TSC_KHZ 被其他途径设置，我们认为它更准确，然后使用它校准 CPU_KHZ。
+        // - 最后检查 CPU_KHZ 是否被成功设置，如果没有成功设置，说明既没有测量出 tsc 频率，也没有其他途径提供 tsc 频率。
+        //
+        //
+        // 你可能会想，为什么不直接使用 CPU_KHZ 作为 TSC_KHZ 呢？
+        // 这是因为 TSC_KHZ 还有其他的备选值，这些备选值会被提前放入 TSC_KHZ 中（比如 kvm-clock 提供的 pvclock 频率）。
+        // 直接被放入 TSC_KHZ 的频率通常是比较准确的，所以我们会优先使用 TSC_KHZ 中的频率，如果 TSC_KHZ 中没有频率，
+        // 那么我们才会使用 CPU_KHZ 中的频率设置 TSC_KHZ。
+        // 这种设计可以让我们在不同的环境下都能尽可能准确地确定 TSC 的频率。
         if early {
-            // todo: 先根据cpuid或者读取msr或者pit来测量TSC和CPU总线的频率
+            // TODO：使用cpuid指令查询或者读取msr寄存器或中相关信息或者使用 PIT 辅助计算的方式获取 tsc 频率，存放在 CPU_KHZ 中
             todo!("detect TSC and CPU frequency by cpuid or msr or pit");
         } else {
-            // 使用pit来测量TSC和CPU总线的频率
             Self::set_cpu_khz(Self::calibrate_cpu_by_pit_hpet_pmtimer()?);
         }
 
-        // 认为非0的TSC频率是可靠的，并且使用它来检查CPU总线的频率
         if Self::tsc_khz() == 0 {
             Self::set_tsc_khz(Self::cpu_khz());
         } else if (Self::cpu_khz() as i64 - Self::tsc_khz() as i64).abs() * 10
             > Self::cpu_khz() as i64
         {
-            // 如果TSC和CPU总线的频率相差太大，那么认为CPU总线的频率是不可靠的,使用TSC的频率
             Self::set_cpu_khz(Self::tsc_khz());
         }
 

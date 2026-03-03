@@ -547,8 +547,9 @@ pub enum TtyDriverType {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, PartialEq, Copy, Clone)]
+#[derive(Debug, PartialEq, Copy, Clone, Default)]
 pub enum TtyDriverSubType {
+    #[default]
     Undefined,
     Tty,
     Console,
@@ -557,12 +558,6 @@ pub enum TtyDriverSubType {
     PtyMaster,
     PtySlave,
     SerialNormal,
-}
-
-impl Default for TtyDriverSubType {
-    fn default() -> Self {
-        Self::Undefined
-    }
 }
 
 bitflags! {

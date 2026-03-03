@@ -404,12 +404,10 @@ impl IdTable {
     /// @parameter None
     /// @return: 设备名
     pub fn name(&self) -> String {
-        if self.id.is_none() {
-            return self.basename.clone();
-        } else {
-            let id = self.id.unwrap();
+        if let Some(id) = self.id {
             return format!("{}:{}", id.major().data(), id.minor());
         }
+        self.basename.clone()
     }
 
     pub fn device_number(&self) -> DeviceNumber {
@@ -1098,11 +1096,10 @@ impl DeviceId {
     }
 
     pub fn id(&self) -> Option<&str> {
-        if self.data.is_some() {
-            return Some(self.data.unwrap());
-        } else {
-            return self.allocated.as_deref();
+        if let Some(data) = self.data {
+            return Some(data);
         }
+        self.allocated.as_deref()
     }
 
     #[allow(dead_code)]

@@ -51,7 +51,7 @@ pub trait Bound {
         &self,
         writer: &mut [u8],
         flags: PMSG,
-    ) -> Result<(usize, Self::Endpoint), SystemError>;
+    ) -> Result<(usize, usize, Self::Endpoint), SystemError>;
 
     fn try_send(&self, buf: &[u8], to: &Self::Endpoint, flags: PMSG) -> Result<usize, SystemError>;
 
@@ -151,7 +151,7 @@ where
         &self,
         writer: &mut [u8],
         flags: PMSG,
-    ) -> Result<(usize, UnboundSocket::Endpoint), SystemError> {
+    ) -> Result<(usize, usize, UnboundSocket::Endpoint), SystemError> {
         match self {
             Inner::Unbound(_) => Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
             Inner::Bound(bound) => bound.try_recv(writer, flags),

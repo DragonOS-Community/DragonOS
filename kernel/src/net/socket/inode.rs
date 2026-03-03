@@ -379,7 +379,7 @@ impl<T: Socket + 'static> IndexNode for T {
         &self,
         cmd: u32,
         data: usize,
-        _private_data: &FilePrivateData,
+        private_data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         match cmd {
             SIOCGIFCONF => handle_siocgifconf(data),
@@ -404,7 +404,7 @@ impl<T: Socket + 'static> IndexNode for T {
             }
             _ => {
                 // 透穿调用子协议栈的ioctl
-                Socket::ioctl(self, cmd, data, _private_data)
+                Socket::ioctl(self, cmd, data, &private_data)
             }
         }
     }

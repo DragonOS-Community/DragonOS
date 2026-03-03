@@ -35,6 +35,7 @@ pub mod multicast_loopback;
 mod udp_bindings;
 
 type EP = crate::filesystem::epoll::EPollEventType;
+const IFACE_POLL_BATCH_ROUNDS: usize = 128;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -228,6 +229,30 @@ impl UdpSocket {
         self.nonblock.load(core::sync::atomic::Ordering::Relaxed)
     }
 
+    #[inline]
+    fn poll_iface_until_quiescent(iface: &dyn crate::net::Iface) {
+        loop {
+            let mut progressed = false;
+            for i in 0..IFACE_POLL_BATCH_ROUNDS {
+                if !iface.poll() {
+                    return;
+                }
+                progressed = true;
+                if (i & 0x7) == 0x7 {
+                    let pcb = ProcessManager::current_pcb();
+                    if pcb.has_pending_signal_fast() && pcb.has_pending_not_masked_signal() {
+                        return;
+                    }
+                }
+            }
+            if progressed {
+                crate::sched::sched_yield();
+            } else {
+                return;
+            }
+        }
+    }
+
     fn recv_timeout(&self) -> Option<crate::time::Duration> {
         let us = self
             .recv_timeout_us
@@ -236,6 +261,18 @@ impl UdpSocket {
             None
         } else {
             Some(crate::time::Duration::from_micros(us))
+        }
+    }
+
+    #[inline]
+    fn loopback_send_len_result(
+        payload_len: usize,
+        max_payload: usize,
+    ) -> Result<usize, SystemError> {
+        if payload_len > max_payload || payload_len > u16::MAX as usize {
+            Err(SystemError::EMSGSIZE)
+        } else {
+            Ok(payload_len)
         }
     }
 
@@ -749,6 +786,7 @@ impl UdpSocket {
             result,
             send_iface,
             dest,
+            dest_is_broadcast,
             loopback_send,
             send_iface_is_loopback,
             mcast_ifindex,
@@ -841,55 +879,34 @@ impl UdpSocket {
                         Ipv4(v4) => v4.is_loopback(),
                         Ipv6(v6) => v6.is_loopback(),
                     };
-                    let is_broadcast = matches!(dest.addr, Ipv4(v4) if v4.is_broadcast());
-                    if is_loopback {
+                    let loopback_broadcast = self
+                        .netns
+                        .loopback_iface()
+                        .map(|lo| lo.smol_iface().lock().inner.is_broadcast(&dest.addr))
+                        .unwrap_or(false);
+                    let is_broadcast = loopback_broadcast
+                        || (send_iface_is_loopback
+                            && bound_iface
+                                .smol_iface()
+                                .lock()
+                                .inner
+                                .is_broadcast(&dest.addr));
+                    let should_loopback_send = is_loopback
+                        || ((is_multicast || is_broadcast)
+                            && (send_iface_is_loopback || loopback_broadcast));
+                    if should_loopback_send {
                         let max_payload =
                             bound.with_socket(|socket| socket.payload_send_capacity());
-                        if buf.len() > max_payload || buf.len() > u16::MAX as usize {
-                            (
-                                Err(SystemError::EMSGSIZE),
-                                bound_iface,
-                                Some(dest),
-                                true,
-                                send_iface_is_loopback,
-                                mcast_ifindex,
-                                None,
-                            )
-                        } else {
-                            (
-                                Ok(buf.len()),
-                                bound_iface,
-                                Some(dest),
-                                true,
-                                send_iface_is_loopback,
-                                mcast_ifindex,
-                                None,
-                            )
-                        }
-                    } else if (is_multicast || is_broadcast) && send_iface_is_loopback {
-                        let max_payload =
-                            bound.with_socket(|socket| socket.payload_send_capacity());
-                        if buf.len() > max_payload || buf.len() > u16::MAX as usize {
-                            (
-                                Err(SystemError::EMSGSIZE),
-                                bound_iface,
-                                Some(dest),
-                                true,
-                                send_iface_is_loopback,
-                                mcast_ifindex,
-                                None,
-                            )
-                        } else {
-                            (
-                                Ok(buf.len()),
-                                bound_iface,
-                                Some(dest),
-                                true,
-                                send_iface_is_loopback,
-                                mcast_ifindex,
-                                None,
-                            )
-                        }
+                        (
+                            Self::loopback_send_len_result(buf.len(), max_payload),
+                            bound_iface,
+                            Some(dest),
+                            is_broadcast,
+                            true,
+                            send_iface_is_loopback,
+                            mcast_ifindex,
+                            None,
+                        )
                     } else {
                         let mut send_iface = bound_iface.clone();
                         let mut restore_iface = None;
@@ -913,6 +930,7 @@ impl UdpSocket {
                             ret,
                             send_iface,
                             Some(dest),
+                            is_broadcast,
                             false,
                             send_iface_is_loopback,
                             mcast_ifindex,
@@ -958,6 +976,14 @@ impl UdpSocket {
                             );
                         }
                     }
+                } else if dest_is_broadcast {
+                    udp_bindings::deliver_broadcast_all(
+                        &self.netns,
+                        dest,
+                        src_endpoint,
+                        ifindex,
+                        buf,
+                    );
                 } else {
                     udp_bindings::deliver_unicast_loopback(
                         &self.netns,
@@ -1016,7 +1042,7 @@ impl UdpSocket {
 
         // Poll AFTER releasing the lock to avoid deadlock
         // when socket sends to itself on loopback
-        send_iface.poll();
+        Self::poll_iface_until_quiescent(send_iface.as_ref());
 
         if let Some(orig_iface) = restore_iface {
             let mut inner_guard = self.inner.write();

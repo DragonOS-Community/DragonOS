@@ -11,26 +11,19 @@ CFLAGS := -Wall -O2 -static -lpthread
 SRCS := $(wildcard *.c)
 BINS := $(SRCS:.c=)
 
-
-
-$(C_TARGETS): %.o: %.c
-	$(CC) -c $< -o $@
-
 all: $(BINS)
 # 	@echo "src: $(SRCS)"
 	@echo "bins: $(BINS)"
 
-%: %.c
-	$(CC) $(CFLAGS)  $< -o $@
-
+# 依赖同目录下所有 .h，任意头文件变更都会触发重编
+%: %.c $(wildcard *.h)
+	$(CC) $(CFLAGS) $< -o $@
 
 install: all
 	@echo "Installing binaries to $(DADK_CURRENT_BUILD_DIR)/"
 	mv $(BINS) $(DADK_CURRENT_BUILD_DIR)/
 
-
 clean:
 	rm -f $(BINS)
-
 
 .PHONY: all install clean

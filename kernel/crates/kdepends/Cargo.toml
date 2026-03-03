@@ -10,7 +10,7 @@ description = "需要导出的依赖项（为保持内核依赖版本与调试�
 crc = { path = "../crc" }
 memoffset = "0.9.0"
 ringbuffer = "0.15.0"
-xarray = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/xarray", rev = "de93b57c34", features = ["slab-friendly"] }
+xarray = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/xarray", rev = "5113ad0ea0", features = ["slab-friendly"] }
 another_ext4 = { path = "../another_ext4", default-features = false }
 
 # 一个无锁MPSC队列

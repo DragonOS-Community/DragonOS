@@ -4,19 +4,20 @@
 
    - Source document: userland/rootfs/index.rst
 
-   - Translation time: 2025-12-26 10:51:47
+   - Translation time: 2026-02-10 05:29:17
 
    - Translation model: `hunyuan-turbos-latest`
 
 
    Please report issues via `Community Channel <https://github.com/DragonOS-Community/DragonOS/issues>`_
 
-User-space Build Documentation (Nix)  
-===================================================  
+User-space Build Documentation (Nix)
+===================================================
 
-.. toctree::  
-   :maxdepth: 1  
-   :caption: Table of Contents  
+.. toctree::
+   :maxdepth: 1
+   :caption: Table of Contents
 
-   diskgen  
+   dadk-rootfs-manifest
+   diskgen
    add-your-own-app

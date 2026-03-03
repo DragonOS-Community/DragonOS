@@ -112,3 +112,19 @@ bitflags! {
 
 /// for F_[GET|SET]FL
 pub const FD_CLOEXEC: u32 = 1;
+
+/// for POSIX fcntl() record locks
+pub const F_RDLCK: i16 = 0;
+pub const F_WRLCK: i16 = 1;
+pub const F_UNLCK: i16 = 2;
+
+/// userspace `struct flock` ABI (64-bit)
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PosixFlock {
+    pub l_type: i16,
+    pub l_whence: i16,
+    pub l_start: i64,
+    pub l_len: i64,
+    pub l_pid: i32,
+}

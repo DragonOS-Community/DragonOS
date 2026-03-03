@@ -24,7 +24,7 @@ impl Ext4 {
     pub fn load(block_device: Arc<dyn BlockDevice>) -> Result<Self> {
         // Load the superblock
         // TODO: if the main superblock is corrupted, should we load the backup?
-        let block = block_device.read_block(0);
+        let block = block_device.read_block(0)?;
         let sb = block.read_offset_as::<SuperBlock>(BASE_OFFSET);
         log::debug!("Load Ext4 Superblock: {:?}", sb);
         // Check magic number
@@ -51,5 +51,10 @@ impl Ext4 {
     pub fn init(&mut self) -> Result<()> {
         // Create root directory
         self.create_root_inode().map(|_| ())
+    }
+
+    /// Returns the current on-disk superblock.
+    pub fn super_block(&self) -> Result<SuperBlock> {
+        self.read_super_block()
     }
 }

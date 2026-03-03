@@ -1025,9 +1025,8 @@ impl Socket for UnixDatagramSocket {
                 let fd_table_binding = ProcessManager::current_pcb().fd_table();
                 let mut fd_table = fd_table_binding.write();
                 for file in rights.iter().take(fit) {
-                    let new_file = file.as_ref().try_clone().ok_or(SystemError::EINVAL)?;
-                    new_file.set_close_on_exec(cloexec);
-                    let new_fd = fd_table.alloc_fd(new_file, None)?;
+                    // SCM_RIGHTS 复制的是 fd 引用，必须共享同一个 open file description。
+                    let new_fd = fd_table.alloc_fd_arc(file.clone(), None, cloexec)?;
                     received_fds.push(new_fd);
                 }
             }

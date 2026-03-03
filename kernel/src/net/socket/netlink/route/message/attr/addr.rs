@@ -1,5 +1,6 @@
 use crate::net::socket::netlink::{message::attr::Attribute, route::message::attr::IFNAME_SIZE};
 use alloc::ffi::CString;
+use alloc::vec::Vec;
 use system_error::SystemError;
 
 #[derive(Debug, Clone, Copy)]
@@ -43,8 +44,8 @@ impl TryFrom<u16> for AddrAttrClass {
 
 #[derive(Debug)]
 pub enum AddrAttr {
-    Address([u8; 4]),
-    Local([u8; 4]),
+    Address(Vec<u8>),
+    Local(Vec<u8>),
     Label(CString),
 }
 
@@ -90,15 +91,15 @@ impl Attribute for AddrAttr {
         let buf = &payload_buf[..payload_len.min(payload_buf.len())];
 
         let res = match (addr_class, buf.len()) {
-            (AddrAttrClass::ADDRESS, 4) => {
-                let mut arr = [0u8; 4];
-                arr.copy_from_slice(&buf[0..4]);
-                AddrAttr::Address(arr)
+            (AddrAttrClass::ADDRESS, 4 | 16) => {
+                let mut addr = vec![0u8; buf.len()];
+                addr.copy_from_slice(buf);
+                AddrAttr::Address(addr)
             }
-            (AddrAttrClass::LOCAL, 4) => {
-                let mut arr = [0u8; 4];
-                arr.copy_from_slice(&buf[0..4]);
-                AddrAttr::Local(arr)
+            (AddrAttrClass::LOCAL, 4 | 16) => {
+                let mut addr = vec![0u8; buf.len()];
+                addr.copy_from_slice(buf);
+                AddrAttr::Local(addr)
             }
             (AddrAttrClass::LABEL, 1..=IFNAME_SIZE) => {
                 // 查找第一个0字节作为结尾，否则用全部

@@ -1,4 +1,5 @@
 #![allow(clippy::new_without_default)]
+#![allow(function_casts_as_integer)]
 
 mod basic_macro;
 mod point;

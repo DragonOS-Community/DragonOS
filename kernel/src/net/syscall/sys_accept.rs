@@ -112,10 +112,13 @@ pub(crate) fn do_accept(
         file_mode |= FileFlags::O_CLOEXEC;
     }
 
-    let new_fd = ProcessManager::current_pcb()
-        .fd_table()
-        .write()
-        .alloc_fd(File::new_socket(new_socket, file_mode)?, None)?;
+    let cloexec = flags & FileFlags::O_CLOEXEC.bits() != 0;
+
+    let new_fd = ProcessManager::current_pcb().fd_table().write().alloc_fd(
+        File::new_socket(new_socket, file_mode)?,
+        None,
+        cloexec,
+    )?;
 
     if !addr.is_null() {
         // 将对端地址写入用户空间

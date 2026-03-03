@@ -61,10 +61,12 @@ impl Syscall for SysPidFdOpen {
         }
 
         // 存入pcb
+        // Linux 的 __pidfd_prepare() 无条件对 pidfd 设置 O_CLOEXEC，
+        // 无论用户传入什么 flags，pidfd 始终是 close-on-exec 的。
         ProcessManager::current_pcb()
             .fd_table()
             .write()
-            .alloc_fd(file, None)
+            .alloc_fd(file, None, true)
             .map(|fd| fd as usize)
     }
 

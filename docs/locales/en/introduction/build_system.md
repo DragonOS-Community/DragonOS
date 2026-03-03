@@ -5,7 +5,7 @@ This document was automatically translated by `hunyuan-turbos-latest` model, for
 
 - Source document: introduction/build_system.md
 
-- Translation time: 2025-12-16 16:22:38
+- Translation time: 2026-02-10 05:30:33
 
 - Translation model: `hunyuan-turbos-latest`
 
@@ -38,9 +38,9 @@ If you need to develop DragonOS or want to deeply understand its build process, 
 
 ## 1. Preliminaries
 
-&emsp;&emsp;Regardless of which method you use to compile DragonOS from the following sections, you must first initialize your development environment by following the steps in this section.
+&emsp;&emsp;Regardless of which method you use to compile DragonOS from the following sections, you must first initialize your development environment by following the steps in this subsection.
 
-&emsp;&emsp;Before you begin, you need a computer running Linux or MacOS with an X86-64 processor architecture.
+&emsp;&emsp;Before starting, you need a computer running Linux or MacOS with an X86-64 processor architecture.
 
 &emsp;&emsp;For Linux distributions, it is recommended to use newer ones like Ubuntu 22, Debian, or Arch Linux, as they have more up-to-date repository software versions, which can save you a lot of trouble.
 
@@ -101,15 +101,15 @@ Welcome to improve the build scripts for other systems!
 |------------------------------------------|
 ```
 
-**Then, please proceed directly to {ref}`编译命令讲解 <_build_system_command>` for further reading.**
+**Then, please proceed directly to {ref}`编译命令讲解 <_build_system_command>` for further reading!**
 
 ## 3. Manual Installation
 
 ### 3.1 Dependency List
 
-&emsp;&emsp;If the automatic installation script does not support your operating system, you will need to manually install the required dependencies. Below is the list of dependencies:
+&emsp;&emsp;If the automatic installation script does not support your operating system, you will need to manually install the dependency programs. The following is the dependency list:
 
-&emsp;&emsp;Among the following dependencies, all except `docker-ce` and `Rust及其工具链` can be installed via your system's package manager. For Docker and Rust installation, please refer to the following sections.
+&emsp;&emsp;Among the following dependencies, except for `docker-ce` and `Rust及其工具链`, the others can be installed through the system's package manager. For Docker and Rust installation, please refer to the following sections.
 
 - docker-ce
 - llvm-dev
@@ -125,15 +125,15 @@ Welcome to improve the build scripts for other systems!
 - unzip
 - Rust and its toolchain
 
-**Please note: If your Linux system is running in a virtual machine, make sure to enable the Intel VT-x or AMD-V option in the processor settings tab of your VMware/VirtualBox virtual machine. Otherwise, DragonOS will not run.**
+**Please note: If your Linux system is running in a virtual machine, please enable the Intel VT-x or AMD-V option in the processor settings tab of your VMware/VirtualBox virtual machine; otherwise, DragonOS will not run.**
 
 :::{note}
 
-*The QEMU built from some Linux distribution repositories may be incompatible with DragonOS due to older versions. If you encounter this issue, uninstall QEMU and reinstall it by compiling from source.*
+*The Qemu built in some Linux distribution repositories may be incompatible with DragonOS due to its low version. If you encounter this issue, please uninstall Qemu and reinstall it by compiling from source.*
 
-Download the QEMU source code from this address: https://download.qemu.org/
+Download the Qemu source code from this address: https://download.qemu.org/
 
-After extracting, navigate to the source code directory and execute the following commands:
+After extracting, enter the source code directory and execute the following commands:
 
 ```shell
 # 安装编译依赖项
@@ -154,12 +154,12 @@ Please note that the compiled QEMU will connect via VNC mode, so you will also n
 
 &emsp;&emsp;You can download and install docker-ce from the Docker official website.
 
-> For details, go to: [https://docs.docker.com/engine/install/](https://docs.docker.com/engine/install/)
+> For details, please go to: [https://docs.docker.com/engine/install/](https://docs.docker.com/engine/install/)
 
 ### 3.3 Installing Rust
 
 :::{warning}
-**【Common Misconception】**: If you plan to use Docker for compilation, although the Docker image already has the Rust compilation environment installed, your host machine still needs to have the Rust environment installed to enable Rust-Analyzer code suggestions in VSCode and for the `make clean` command to work properly.
+**【Common Misconception】**: If you plan to compile using Docker, although the Docker image already has the Rust compilation environment installed, your host machine still needs to have the Rust environment installed to enable Rust-Analyzer code hints in VSCode and for the `make clean` command to work properly.
 :::
 
 &emsp;&emsp;You can install Rust by entering the following command in the console.
@@ -197,7 +197,7 @@ rustup target add x86_64-unknown-none
 
 **At this point, the common dependencies have been installed. You can proceed to the following sections based on your needs.**
 
-**For the usage of compilation commands, see: {ref}`编译命令讲解 <_build_system_command>`**
+**For the usage of compilation commands, please see: {ref}`编译命令讲解 <_build_system_command>`**
 
 ## 4. Building from Docker (Not Recommended)
 
@@ -223,7 +223,7 @@ bash create_hdd_image.sh
 
 ### 4.3 Running DragonOS
 
-&emsp;&emsp;If all goes well, this will be the final step to run DragonOS. You only need to execute the following command in the root directory of DragonOS to run it.
+&emsp;&emsp;If all goes well, this will be the final step to run DragonOS. You just need to execute the following command in the root directory of DragonOS to run it.
 
 ```shell
 make run-docker
@@ -234,19 +234,19 @@ make run-docker
 &emsp;&emsp;After the QEMU virtual machine is launched, you need to enter the letter `c` in the console and press Enter. The virtual machine will then begin execution.
 
 :::{note}
-1. During the first compilation, it may take some time to download Rust-related indexes (several hundred MB in size). Please be patient!
+1. During the first compilation, it may take some time to download Rust-related indexes (several hundred MB in size), so please be patient!
 2. The command may need to be prefixed with sudo.
 :::
 
-**For the usage of compilation commands, see: {ref}`编译命令讲解 <_build_system_command>`**
+**For the usage of compilation commands, please see: {ref}`编译命令讲解 <_build_system_command>`**
 
 ## 5. Other Notes
 
 ### 5.1 Creating a Disk Image
 
-&emsp;&emsp;First, you need to run `tools/create_hdd_image.sh` with **regular user** privileges to create a disk image file for DragonOS. The script will automatically complete the creation of the disk image and move it to the `bin/` directory.
+&emsp;&emsp;First, you need to run `tools/create_hdd_image.sh` with **regular user** privileges to create a disk image file for DragonOS. This script will automatically complete the creation of the disk image and move it to the `bin/` directory.
 
-&emsp;&emsp;Please note that due to permission issues, you must run this script with **regular user** privileges. (When elevated permissions are required after running, the system may ask you for a password.)
+&emsp;&emsp;Please note that due to permission issues, you must run this script with **regular user** privileges. (When elevated privileges are required after running, the system may ask you for a password.)
 
 ### 5.2 Compiling and Running DragonOS
 
@@ -257,23 +257,25 @@ make run-docker
 &emsp;&emsp;After the QEMU virtual machine is launched, you need to enter the letter `c` in the console and press Enter. The virtual machine will then begin execution.
 
 :::{note}
-During the first compilation, it may take some time to download Rust-related indexes (several hundred MB in size). Please be patient!
+During the first compilation, it may take some time to download Rust-related indexes (several hundred MB in size), so please be patient!
 :::
 
-**For the usage of compilation commands, see: {ref}`编译命令讲解 <_build_system_command>`**
+**For the usage of compilation commands, please see: {ref}`编译命令讲解 <_build_system_command>`**
 
 (_translated_label___build_system_command_en)=
 ## 6. Explanation of Compilation Commands
 
+**For how to configure RootFS (`ROOTFS_MANIFEST`, base images, and package set switching), please read first: {ref}`DADK RootFS Manifest 配置（非 Nix） <_dadk_rootfs_manifest>`**
+
 - Local compilation, no run: `make all -j 您的CPU核心数`
 - Local compilation, write to disk image, no run: `make build`
 - Local compilation, write to disk image, and run in QEMU: `make run`
-- Local compilation, write to disk image, run in headless mode: 
+- Local compilation, write to disk image, run in non-graphical mode: 
 `make run-nographic`
 - Docker compilation, write to disk image: `make docker`
 - Docker compilation, write to disk image, and run in QEMU: `make run-docker`
 - No compilation, directly boot from existing disk image: `make qemu`
-- No compilation, directly boot from existing disk image (headless mode): `make qemu-nographic`
+- No compilation, directly boot from existing disk image (non-graphical mode): `make qemu-nographic`
 - Clean compiled files: `make clean`
 - Compile documentation: `make docs` (requires manual installation of sphinx and dependencies in `requirements.txt` under docs)
 - Clean documentation: `make clean-docs`
@@ -296,7 +298,7 @@ Change the value of `ARCH` in `env.mk` to `riscv64`, and comment out `"rust-anal
 
 2. Restart rust-analyzer
 
-3. Clean the compilation cache
+3. Clean compilation cache
 
 Due to architectural differences between x86_64 and riscv64, there may be compilation issues caused by caching. Ensure the cache is cleared before running.
 

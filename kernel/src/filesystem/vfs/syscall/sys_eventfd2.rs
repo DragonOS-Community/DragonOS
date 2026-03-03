@@ -94,9 +94,12 @@ pub fn do_eventfd(init_val: u32, flags: u32) -> Result<usize, SystemError> {
     } else {
         FileFlags::O_RDWR
     };
+    let cloexec = flags.contains(EventFdFlags::EFD_CLOEXEC);
     let file = File::new(inode, filemode)?;
     let binding = ProcessManager::current_pcb().fd_table();
     let mut fd_table_guard = binding.write();
-    let fd = fd_table_guard.alloc_fd(file, None).map(|x| x as usize);
+    let fd = fd_table_guard
+        .alloc_fd(file, None, cloexec)
+        .map(|x| x as usize);
     return fd;
 }

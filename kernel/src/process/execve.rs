@@ -109,10 +109,12 @@ fn do_execve_internal(
             // 参考 Linux: https://elixir.bootlin.com/linux/v6.1.9/source/fs/exec.c#L1857
             // "Ensure the files table is not shared"
             {
-                let fd_table = pcb.fd_table();
-                // 检查 fd_table 是否被共享 (Arc::strong_count() > 1)
-                if Arc::strong_count(&fd_table) > 1 {
+                // 注意：不能先调用 pcb.fd_table() 再判断 strong_count，
+                // 因为 fd_table() 会克隆 Arc，导致计数至少 +1，误判为“被共享”。
+                let need_unshare = pcb.basic().fd_table_is_shared();
+                if need_unshare {
                     // fd_table 被共享，需要创建私有副本
+                    let fd_table = pcb.fd_table();
                     let new_fd_table = fd_table.read().clone();
                     let new_fd_table = Arc::new(RwSem::new(new_fd_table));
                     pcb.basic_mut().set_fd_table(Some(new_fd_table));

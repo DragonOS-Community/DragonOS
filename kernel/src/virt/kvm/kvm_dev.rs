@@ -141,7 +141,7 @@ impl IndexNode for LockedKvmInode {
         &self,
         cmd: u32,
         data: usize,
-        _private_data: &FilePrivateData,
+        _private_data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         match cmd {
             0xdeadbeef => {
@@ -194,7 +194,7 @@ pub fn kvm_dev_ioctl_create_vm(_vmtype: usize) -> Result<usize, SystemError> {
     let r = ProcessManager::current_pcb()
         .fd_table()
         .write()
-        .alloc_fd(file, None)
+        .alloc_fd(file, None, false)
         .map(|fd| fd as usize);
     return r;
 }

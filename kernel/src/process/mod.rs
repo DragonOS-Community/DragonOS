@@ -589,6 +589,11 @@ impl ProcessManager {
                 .wait_queue
                 .wakeup_all(Some(ProcessState::Blocked(true)));
 
+            // kthread 退出时显式唤醒 kthreadd，使其回收 zombie
+            if current.is_kthread() {
+                let _ = ProcessManager::wakeup(&parent_pcb);
+            }
+
             // 根据 Linux wait 语义，线程组中的任何线程都可以等待同一线程组中任何线程创建的子进程。
             // 由于子进程被添加到线程组 leader 的 children 列表中，
             // 因此还需要唤醒线程组 leader 的 wait_queue（如果 leader 不是 parent_pcb 本身）。
@@ -678,17 +683,8 @@ impl ProcessManager {
                 vd.complete_all();
             }
 
-            // clear_child_tid/robust_list 可能触发用户态缺页，必须在调度实体 deactive 前完成
-            let rq = cpu_rq(smp_get_processor_id().data() as usize);
-            let (rq, guard) = rq.self_lock();
-            rq.deactivate_task(
-                pcb.clone(),
-                DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
-            );
-            drop(guard);
-
-            unsafe { pcb.basic_mut().set_user_vm(None) };
             pcb.exit_files();
+            pcb.exit_timers();
             // TODO 由于未实现进程组，tty记录的前台进程组等于当前进程，故退出前要置空
             // 后续相关逻辑需要在SYS_EXIT_GROUP系统调用中实现
             if let Some(tty) = pcb.sig_info_irqsave().tty() {
@@ -704,6 +700,19 @@ impl ProcessManager {
             pcb.sched_info
                 .inner_lock_write_irqsave()
                 .set_state(ProcessState::Exited(exit_code));
+
+            let rq = cpu_rq(smp_get_processor_id().data() as usize);
+            let (rq, guard) = rq.self_lock();
+            rq.update_rq_clock();
+            rq.deactivate_task(
+                pcb.clone(),
+                DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
+            );
+            drop(guard);
+
+            // 注意：exit_files() 可能会触发阻塞（例如关闭 FUSE fd 需要等待 daemon 回复），
+            // 因此不能在它之前清空 user_vm，否则后续调度切换会遇到 user_vm==None 的普通进程并崩溃。
+            unsafe { pcb.basic_mut().set_user_vm(None) };
 
             drop(pcb);
 
@@ -1217,7 +1226,7 @@ impl ProcessControlBlock {
     ///
     /// 若进程是内核进程则返回true 否则返回false
     pub fn is_kthread(&self) -> bool {
-        return matches!(self.flags(), &mut ProcessFlags::KTHREAD);
+        self.flags().contains(ProcessFlags::KTHREAD)
     }
 
     #[inline(never)]
@@ -1971,6 +1980,44 @@ impl ProcessControlBlock {
         return self.posix_timers.lock_irqsave();
     }
 
+    /// 清理当前进程/线程的定时器
+    ///
+    /// 参考 Linux do_exit() 中的定时器清理逻辑：
+    /// ```c
+    /// if (group_dead) {
+    ///     hrtimer_cancel(&tsk->signal->real_timer);
+    ///     exit_itimers(tsk);
+    /// }
+    /// ```
+    ///
+    /// DragonOS 中 alarm_timer 是 per-PCB 的，因此每个线程退出时
+    /// 都需要取消自己的 alarm timer。itimers 和 posix_timers 仅在
+    /// 线程组 leader 退出时（group_dead）清理。
+    fn exit_timers(&self) {
+        // 1. 取消当前线程的 alarm timer
+        if let Some(alarm) = self.alarm_timer.lock_irqsave().take() {
+            alarm.cancel();
+        }
+
+        let group_dead = self.is_thread_group_leader();
+        if group_dead {
+            // 2. 取消 ITIMER_REAL
+            if let Some(real_itimer) = self.itimers.lock_irqsave().real.take() {
+                real_itimer.timer.cancel();
+            }
+
+            // 3. 删除所有 POSIX interval timers
+            let mut posix_timers = self.posix_timers.lock_irqsave();
+            let timer_ids: alloc::vec::Vec<i32> = posix_timers.timer_ids().collect();
+            let self_arc = self.self_ref.upgrade();
+            if let Some(ref pcb) = self_arc {
+                for id in timer_ids {
+                    let _ = posix_timers.delete(pcb, id);
+                }
+            }
+        }
+    }
+
     /// Exit fd table when process exit
     fn exit_files(&self) {
         // 关闭文件描述符表
@@ -2240,6 +2287,14 @@ impl ProcessBasicInfo {
 
     pub fn try_fd_table(&self) -> Option<Arc<RwSem<FileDescriptorVec>>> {
         return self.fd_table.clone();
+    }
+
+    #[inline]
+    pub fn fd_table_is_shared(&self) -> bool {
+        self.fd_table
+            .as_ref()
+            .map(|t| Arc::strong_count(t) > 1)
+            .unwrap_or(false)
     }
 
     pub fn set_fd_table(
@@ -2713,8 +2768,8 @@ impl KernelStack {
 
 impl Drop for KernelStack {
     fn drop(&mut self) {
-        if self.stack.is_some() {
-            let ptr = self.stack.as_ref().unwrap().as_ptr() as *const *const ProcessControlBlock;
+        if let Some(stack) = &self.stack {
+            let ptr = stack.as_ptr() as *const *const ProcessControlBlock;
             if unsafe { !(*ptr).is_null() } {
                 let pcb_ptr: Weak<ProcessControlBlock> = unsafe { Weak::from_raw(*ptr) };
                 drop(pcb_ptr);

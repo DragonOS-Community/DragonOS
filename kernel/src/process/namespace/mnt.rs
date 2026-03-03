@@ -69,6 +69,7 @@ impl MntNamespace {
             MountPropagation::new_private(),
             None,
             MountFlags::empty(),
+            None,
         );
 
         let result = Arc::new_cyclic(|self_ref| Self {

@@ -33,6 +33,8 @@ impl Major {
     pub const AHCI_BLK_MAJOR: Self = Self::new(8);
     pub const VIRTIO_BLK_MAJOR: Self = Self::new(254);
     pub const MMC_BLK_MAJOR: Self = Self::new(179);
+    /// PMEM block device
+    pub const PMEM_BLK_MAJOR: Self = Self::new(259);
 
     pub const HVC_MAJOR: Self = Self::new(229);
 

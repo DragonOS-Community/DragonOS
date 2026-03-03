@@ -1,5 +1,6 @@
 use alloc::boxed::Box;
 use kdepends::another_ext4;
+use system_error::SystemError;
 
 use crate::driver::base::block::block_device::LBA_SIZE;
 use crate::driver::base::block::gendisk::GenDisk;
@@ -21,6 +22,19 @@ impl GenDisk {
         let block_count = blocks_per_ext4_block;
         (start_lba_offset, lba_id_start, block_count)
     }
+
+    fn map_system_error_to_ext4(e: &SystemError) -> another_ext4::ErrCode {
+        match e {
+            SystemError::EROFS => another_ext4::ErrCode::EROFS,
+            SystemError::ENOSPC => another_ext4::ErrCode::ENOSPC,
+            SystemError::ENOENT => another_ext4::ErrCode::ENOENT,
+            SystemError::ENOTDIR => another_ext4::ErrCode::ENOTDIR,
+            SystemError::EISDIR => another_ext4::ErrCode::EISDIR,
+            SystemError::EINVAL => another_ext4::ErrCode::EINVAL,
+            SystemError::EIO => another_ext4::ErrCode::EIO,
+            _ => another_ext4::ErrCode::EIO,
+        }
+    }
 }
 
 impl another_ext4::BlockDevice for GenDisk {
@@ -41,7 +55,7 @@ impl another_ext4::BlockDevice for GenDisk {
             .read_at(lba_id_start, block_count, &mut *buf)
             .map_err(|e| {
                 log::error!("Ext4BlkDevice '{:?}' read_block failed: {:?}", block_id, e);
-                another_ext4::Ext4Error::new(another_ext4::ErrCode::EIO)
+                another_ext4::Ext4Error::new(Self::map_system_error_to_ext4(&e))
             })?;
         Ok(another_ext4::Block::new(block_id, buf))
     }
@@ -54,8 +68,17 @@ impl another_ext4::BlockDevice for GenDisk {
         self.block_device()
             .write_at(lba_id_start, block_count, &*block.data)
             .map_err(|e| {
-                log::error!("Ext4BlkDevice '{:?}' write_block failed: {:?}", block.id, e);
-                another_ext4::Ext4Error::new(another_ext4::ErrCode::EIO)
+                let code = Self::map_system_error_to_ext4(&e);
+                if code == another_ext4::ErrCode::EROFS {
+                    log::trace!(
+                        "Ext4BlkDevice '{:?}' write_block on readonly media: {:?}",
+                        block.id,
+                        e
+                    );
+                } else {
+                    log::error!("Ext4BlkDevice '{:?}' write_block failed: {:?}", block.id, e);
+                }
+                another_ext4::Ext4Error::new(code)
             })?;
         Ok(())
     }

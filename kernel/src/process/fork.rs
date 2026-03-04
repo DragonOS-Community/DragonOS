@@ -371,6 +371,7 @@ impl ProcessManager {
     /// 复制 prctl 相关的进程/线程状态。
     ///
     /// - no_new_privs：线程级语义，clone/fork 继承，execve 保持（execve 不走这里）。
+    /// - keepcaps：clone/fork 继承。
     /// - dumpable：fork 继承。
     fn copy_prctl_state(
         _clone_flags: &CloneFlags,
@@ -381,6 +382,9 @@ impl ProcessManager {
         if current_pcb.no_new_privs() != 0 {
             new_pcb.set_no_new_privs(true);
         }
+
+        // KEEPCAPS
+        new_pcb.set_keepcaps(current_pcb.keepcaps());
 
         // DUMPABLE
         new_pcb.set_dumpable(current_pcb.dumpable());

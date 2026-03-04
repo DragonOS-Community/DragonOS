@@ -229,50 +229,65 @@ impl Socket for TcpSocket {
             return ret;
         }
 
-        // 先尝试写一次：写到多少就返回多少（允许短写）。
-        match self.try_send(buffer) {
-            Ok(n) => {
-                if n > 0 {
+        // Linux 语义（tcp_sendmsg）：阻塞发送会尽量持续发送直到：
+        // 1) 请求数据全部写入；或
+        // 2) 在尚未写入任何字节前遇到错误（返回错误）；或
+        // 3) 已写入部分数据后遇到错误/中断（返回短写）。
+        let mut total_sent = 0usize;
+
+        while total_sent < buffer.len() {
+            match self.try_send(&buffer[total_sent..]) {
+                Ok(n) => {
+                    if n == 0 {
+                        if total_sent > 0 {
+                            break;
+                        }
+                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                    }
+                    total_sent += n;
                     self.notify();
+                    continue;
                 }
-                return Ok(n);
-            }
-            Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => { /* fallthrough: block */ }
-            Err(e) => return Err(e),
-        }
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                    // loopback 场景需要把协议栈推进到“真正可写/不可写”的稳定状态，避免丢唤醒。
+                    if let Some(iface) = self.inner.read().as_ref().and_then(|i| i.iface()).cloned()
+                    {
+                        poll_util::poll_iface_until_quiescent(iface.as_ref());
+                    }
 
-        let ret = loop {
-            // loopback 场景需要把协议栈推进到“真正可写/不可写”的稳定状态，避免丢唤醒。
-            if let Some(iface) = self.inner.read().as_ref().and_then(|i| i.iface()).cloned() {
-                poll_util::poll_iface_until_quiescent(iface.as_ref());
-            }
-
-            // 若已经可写，重试一次并直接返回（允许短写）。
-            let events = EP::from_bits_truncate(
-                self.pollee.load(core::sync::atomic::Ordering::SeqCst) as u32,
-            );
-            if events.intersects(EP::EPOLLOUT | EP::EPOLLHUP | EP::EPOLLERR) {
-                break self.try_send(buffer);
-            }
-
-            // 等待可写或超时/信号。
-            self.wait_queue.wait_event_io_interruptible_timeout(
-                || {
                     let events = EP::from_bits_truncate(
                         self.pollee.load(core::sync::atomic::Ordering::SeqCst) as u32,
                     );
-                    events.intersects(EP::EPOLLOUT | EP::EPOLLHUP | EP::EPOLLERR)
-                },
-                self.send_timeout(),
-            )?;
-        };
+                    if events.intersects(EP::EPOLLOUT | EP::EPOLLHUP | EP::EPOLLERR) {
+                        continue;
+                    }
 
-        if let Ok(n) = ret {
-            if n > 0 {
-                self.notify();
+                    let wait_ret = self.wait_queue.wait_event_io_interruptible_timeout(
+                        || {
+                            let events = EP::from_bits_truncate(
+                                self.pollee.load(core::sync::atomic::Ordering::SeqCst) as u32,
+                            );
+                            events.intersects(EP::EPOLLOUT | EP::EPOLLHUP | EP::EPOLLERR)
+                        },
+                        self.send_timeout(),
+                    );
+                    if let Err(e) = wait_ret {
+                        if total_sent > 0 {
+                            break;
+                        }
+                        return Err(e);
+                    }
+                }
+                Err(e) => {
+                    if total_sent > 0 {
+                        break;
+                    }
+                    return Err(e);
+                }
             }
         }
-        ret
+
+        Ok(total_sent)
     }
 
     fn send_buffer_size(&self) -> usize {

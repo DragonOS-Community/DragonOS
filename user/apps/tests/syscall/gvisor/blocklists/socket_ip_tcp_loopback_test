@@ -1,3 +1,0 @@
-# 缺少 SYS_SENDMMSG
-AllTCPSockets/AllSocketPairTest.BasicSendmmsg/*
-AllTCPSockets/AllSocketPairTest.SendmmsgIsLimitedByMAXIOV/*

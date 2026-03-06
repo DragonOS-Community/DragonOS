@@ -385,12 +385,10 @@ impl ProcessControlBlock {
 
     /// 设置ptrace跟踪器
     pub fn set_tracer(&self, tracer: RawPid) -> Result<(), SystemError> {
-        // 确保当前没有被追踪
-        if self.ptrace_state.lock().tracer.is_some() {
+        let mut state = self.ptrace_state.lock();
+        if state.tracer.is_some() {
             return Err(SystemError::EPERM);
         }
-        // 设置跟踪关系
-        let mut state = self.ptrace_state.lock();
         state.tracer = Some(tracer);
         // 设置 PTRACED 标志
         self.flags().insert(ProcessFlags::PTRACED);
@@ -641,9 +639,7 @@ impl ProcessControlBlock {
         schedule(SchedMode::SM_NONE);
 
         // event_message/last_siginfo 必须在 tracee 被 tracer 唤醒、从 schedule() 返回后再清理，
-        // 不能在 notify_tracer() 之前清零，否则 tracer 的 PTRACE_GETEVENTMSG / GETSIGINFO 会读到 0 或陈旧值。
-        // DragonOS 目前没有 Linux 的 exit_code/jobctl 机制，这里用 injected_signal
-        // 承载 ptrace_resume(data) 的恢复信号，并在返回到调用方前清理 stop 元数据。
+        // 不能在 notify_tracer() 之前清零，否则 tracer 的 PTRACE_GETEVENTMSG / GETSIGINFO 会读到 0 或陈旧值
         let mut ptrace_state = self.ptrace_state.lock();
         let injected_signal = ptrace_state.injected_signal;
         ptrace_state.clear_last_siginfo();
@@ -755,8 +751,10 @@ impl ProcessControlBlock {
         self.set_tracer(tracer.raw_pid())?;
         self.set_parent(tracer)?;
 
-        // 如果 root 进程 attach 一个普通用户进程，该进程必须保持原有权限。
-        tracer.ptraced_list.write_irqsave().push(self.raw_pid());
+        let mut ptraced_list = tracer.ptraced_list.write_irqsave();
+        if !ptraced_list.contains(&self.raw_pid()) {
+            ptraced_list.push(self.raw_pid());
+        }
 
         Ok(())
     }

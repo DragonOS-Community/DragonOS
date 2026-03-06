@@ -540,14 +540,24 @@ impl Signal {
 
             // 线程组 stop：对组内所有线程置为 Stopped，保证 SIGSTOP 对整个线程组生效。
             for_each_thread_in_group(&mut |t| {
-                let _ = ProcessManager::stop_task(t, *self);
+                match ProcessManager::stop_task(t, *self) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        log::error!("do_stop: failed to stop thread {:?}: {:?}", t.pid(), e);
+                        // 继续处理其他线程
+                    }
+                }
             });
 
             if let Some(parent) = pcb.parent_pcb() {
-                let _ = send_signal_to_pcb(parent.clone(), Signal::SIGCHLD);
+                if let Err(e) = send_signal_to_pcb(parent.clone(), Signal::SIGCHLD) {
+                    log::error!("do_stop: failed to send SIGCHLD to parent: {:?}", e);
+                }
                 parent.wake_all_waiters();
             } else if let Some(real_parent) = pcb.real_parent_pcb() {
-                let _ = send_signal_to_pcb(real_parent.clone(), Signal::SIGCHLD);
+                if let Err(e) = send_signal_to_pcb(real_parent.clone(), Signal::SIGCHLD) {
+                    log::error!("do_stop: failed to send SIGCHLD to real_parent: {:?}", e);
+                }
                 real_parent.wake_all_waiters();
             }
             // 唤醒等待在该子进程/线程上的等待者
@@ -584,7 +594,13 @@ impl Signal {
             if was_stopped {
                 // 线程组 continue：唤醒组内所有线程（由各线程在内核路径继续执行/重新阻塞）。
                 for_each_thread_in_group(&mut |t| {
-                    let _ = ProcessManager::wakeup_stop(t);
+                    match ProcessManager::wakeup_stop(t) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            log::error!("do_stop: failed to wakeup thread {:?}: {:?}", t.pid(), e);
+                            // 继续处理其他线程
+                        }
+                    }
                 });
                 // 标记继续事件，供 waitid(WCONTINUED) 可见
                 thread_group_leader
@@ -601,10 +617,20 @@ impl Signal {
                     .sighand()
                     .flags_remove(SignalFlags::STOP_STOPPED);
                 if let Some(parent) = pcb.parent_pcb() {
-                    let _ = send_signal_to_pcb(parent.clone(), Signal::SIGCHLD);
+                    if let Err(e) = send_signal_to_pcb(parent.clone(), Signal::SIGCHLD) {
+                        log::error!(
+                            "do_stop: failed to send SIGCHLD to parent after continue: {:?}",
+                            e
+                        );
+                    }
                     parent.wake_all_waiters();
                 } else if let Some(real_parent) = pcb.real_parent_pcb() {
-                    let _ = send_signal_to_pcb(real_parent.clone(), Signal::SIGCHLD);
+                    if let Err(e) = send_signal_to_pcb(real_parent.clone(), Signal::SIGCHLD) {
+                        log::error!(
+                            "do_stop: failed to send SIGCHLD to real_parent after continue: {:?}",
+                            e
+                        );
+                    }
                     real_parent.wake_all_waiters();
                 }
                 // 唤醒等待在该子进程上的等待者

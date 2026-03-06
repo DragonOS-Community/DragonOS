@@ -2,19 +2,18 @@ use crate::{
     arch::{
         interrupt::{TrapFrame, UserRegsStruct},
         ipc::signal::Signal,
-        syscall::nr::{SYS_EXIT, SYS_PTRACE},
+        syscall::nr::SYS_PTRACE,
         MMArch,
     },
     ipc::signal_types::PosixSigInfo,
     mm::{MemoryManagementArch, PhysAddr, VirtAddr},
     process::{
         ptrace::{PtraceOptions, PtraceRequest},
-        syscall::sys_exit::SysExit,
-        ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState, RawPid,
+        ProcessControlBlock, ProcessManager, ProcessState, RawPid,
     },
     syscall::{
         table::{FormattedSyscallParam, Syscall},
-        user_access::UserBufferWriter,
+        user_access::{UserBufferReader, UserBufferWriter},
     },
 };
 use alloc::sync::Arc;
@@ -40,6 +39,7 @@ impl TryFrom<usize> for PtraceRequest {
             0x4200 => Ok(PtraceRequest::Setoptions),
             0x4202 => Ok(PtraceRequest::Getsiginfo),
             0x4206 => Ok(PtraceRequest::Seize),
+            0x420e => Ok(PtraceRequest::Getsyscallinfo),
             _ => Err(SystemError::EINVAL),
         }
     }
@@ -159,9 +159,6 @@ fn ptrace_peek_data(
 
     drop(tracee_vm_guard);
 
-    // Linux PTRACE_PEEKDATA 语义：返回值通过系统调用返回值传递，不写入 data 指针。
-    // data 参数在历史上是目标指针，但现代 Linux 内核忽略它，
-    // 调用者（如 peek_word）通过函数返回值读取结果。
     Ok(value as isize)
 }
 
@@ -284,7 +281,6 @@ impl SysPtrace {
 
     /// 处理 PTRACE_SEIZE 请求（现代附加 API）
     ///
-    /// 按照 Linux 6.6.21 实现：
     /// - 不发送 SIGSTOP 给 tracee
     /// - addr 参数必须为 0
     /// - data 参数包含 ptrace 选项
@@ -317,20 +313,6 @@ impl SysPtrace {
         tracee.detach(signal)
     }
 
-    /// 处理 PTRACE_SYSCALL 请求（在系统调用入口和出口暂停）
-    #[allow(dead_code)]
-    fn handle_syscall(tracee: &Arc<ProcessControlBlock>) -> Result<isize, SystemError> {
-        // 检查调用者是否是该进程的跟踪器
-        let tracer_pid = ProcessManager::current_pcb().raw_pid();
-        let tracee_tracer = tracee.tracer().ok_or(SystemError::ESRCH)?;
-        if tracer_pid != tracee_tracer {
-            return Err(SystemError::ESRCH);
-        }
-        // 设置系统调用跟踪标志
-        tracee.enable_syscall_tracing();
-        tracee.trace_syscall()
-    }
-
     /// 处理 PTRACE_SETOPTIONS 请求（设置跟踪选项）
     fn handle_set_options(
         tracee: &Arc<ProcessControlBlock>,
@@ -360,6 +342,15 @@ impl SysPtrace {
         siginfo.copy_posix_siginfo_to_user(uinfo)?;
         log::debug!("PTRACE_GETSIGINFO: siginfo={:?}", siginfo);
         Ok(0)
+    }
+
+    /// 处理 PTRACE_GET_SYSCALL_INFO 请求
+    fn handle_get_syscall_info(
+        tracee: &Arc<ProcessControlBlock>,
+        user_size: usize,
+        data: usize,
+    ) -> Result<isize, SystemError> {
+        tracee.ptrace_get_syscall_info(user_size, data)
     }
 
     /// 处理 PTRACE_PEEKUSER 请求
@@ -397,25 +388,6 @@ impl SysPtrace {
         data: usize,
     ) -> Result<isize, SystemError> {
         ptrace_poke_data(tracee, addr, data)
-    }
-
-    /// 处理 PTRACE_SINGLESTEP 请求 (单步执行)
-    #[allow(dead_code)]
-    fn handle_single_step(tracee: &Arc<ProcessControlBlock>) -> Result<isize, SystemError> {
-        // 检查调用者是否是该进程的跟踪器
-        let tracer_pid = ProcessManager::current_pcb().raw_pid();
-        let tracee_tracer = tracee.tracer().ok_or(SystemError::ESRCH)?;
-        if tracer_pid != tracee_tracer {
-            return Err(SystemError::ESRCH);
-        }
-        // 设置 EFLAGS 的 TF 标志
-        tracee.enable_single_step();
-        // 恢复进程运行
-        let mut sched_info = tracee.sched_info.inner_lock_write_irqsave();
-        if let ProcessState::Stopped(_signal) = sched_info.state() {
-            sched_info.set_state(ProcessState::Runnable);
-        }
-        Ok(0)
     }
 
     /// 处理 PTRACE_GETREGS 请求 (获取寄存器值)
@@ -460,68 +432,38 @@ impl SysPtrace {
 
     /// 处理 PTRACE_SETREGS 请求 (设置寄存器值)
     fn handle_set_regs(
-        _tracee: &Arc<ProcessControlBlock>,
-        _data: usize,
+        tracee: &Arc<ProcessControlBlock>,
+        data: usize,
     ) -> Result<isize, SystemError> {
-        // 从用户空间复制寄存器结构体
+        let mut user_regs = UserRegsStruct::default();
+        let reader = UserBufferReader::new(
+            data as *const u8,
+            core::mem::size_of::<UserRegsStruct>(),
+            true,
+        )?;
+        reader.copy_one_from_user(&mut user_regs, 0)?;
+
+        // 获取 tracee 的 TrapFrame（位于其内核栈顶部）
+        let kstack = tracee.kernel_stack();
+        let trap_frame_vaddr =
+            VirtAddr::new(kstack.stack_max_address().data() - core::mem::size_of::<TrapFrame>());
+        let trap_frame = unsafe { &mut *(trap_frame_vaddr.data() as *mut TrapFrame) };
+
+        user_regs.write_to_trap_frame(trap_frame);
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            // x86_64 额外字段不在 TrapFrame 中，需要同步到 arch_info。
+            let mut arch_info = tracee.arch_info_irqsave();
+            arch_info.set_fsbase(user_regs.fs_base as usize);
+            arch_info.set_gsbase(user_regs.gs_base as usize);
+            arch_info.set_fs(user_regs.fs as u16);
+            arch_info.set_gs(user_regs.gs as u16);
+        }
+
         Ok(0)
     }
 
-    // 在系统调用处理之前
-    #[allow(dead_code)]
-    fn before_handle_syscall(num: usize, args: &[usize]) {
-        let current = ProcessManager::current_pcb();
-        // 检查进程是否被跟踪并且启用了系统调用跟踪
-        if current
-            .flags()
-            .contains(ProcessFlags::PTRACED | ProcessFlags::TRACE_SYSCALL)
-        {
-            // 保存系统调用信息
-            current.on_syscall_entry(num, args);
-            // 暂停进程等待跟踪器
-            current.set_state(ProcessState::Stopped(1));
-            // Scheduler::schedule(SchedMode::SM_NONE); // 切换到其他进程
-        }
-    }
-
-    // 在系统调用处理之后
-    #[allow(dead_code)]
-    fn after_handle_syscall(_num: usize, result: isize) {
-        let current = ProcessManager::current_pcb();
-        // 检查进程是否被跟踪并且启用了系统调用跟踪
-        if current
-            .flags()
-            .contains(ProcessFlags::PTRACED | ProcessFlags::TRACE_SYSCALL)
-        {
-            // 保存系统调用结果
-            current.on_syscall_exit(result);
-            // 暂停进程等待跟踪器
-            current.set_state(ProcessState::Stopped(1));
-            // Scheduler::schedule(SchedMode::SM_NONE); // 切换到其他进程
-        }
-    }
-
-    // 在系统调用分发函数中
-    #[allow(dead_code)]
-    fn dispatch_syscall(
-        num: usize,
-        args: &[usize],
-        frame: &mut TrapFrame,
-    ) -> Result<usize, SystemError> {
-        Self::before_handle_syscall(num, args);
-
-        // 执行实际的系统调用处理
-        let result = match num {
-            SYS_EXIT => SysExit.handle(args, frame)?,
-            // ... 其他系统调用 ...
-            _ => Err(SystemError::ENOSYS)?,
-        };
-
-        Self::after_handle_syscall(num, result as isize);
-        Ok(result)
-    }
-
-    #[allow(dead_code)]
     fn ptrace_check_attach(
         tracee: &Arc<ProcessControlBlock>,
         _request: PtraceRequest,
@@ -529,10 +471,10 @@ impl SysPtrace {
         let current = ProcessManager::current_pcb();
 
         if !tracee.is_traced_by(&current) {
-            return Err(SystemError::EPERM);
+            return Err(SystemError::ESRCH);
         }
         match tracee.sched_info().inner_lock_read_irqsave().state() {
-            ProcessState::Stopped(_) | ProcessState::TracedStopped(_) => Ok(()),
+            ProcessState::TracedStopped(_) => Ok(()),
             _ => Err(SystemError::ESRCH),
         }
     }
@@ -559,6 +501,14 @@ impl Syscall for SysPtrace {
         }
         let tracee: Arc<ProcessControlBlock> =
             ProcessManager::find(pid).ok_or(SystemError::ESRCH)?;
+
+        if !matches!(
+            request,
+            PtraceRequest::Traceme | PtraceRequest::Attach | PtraceRequest::Seize
+        ) {
+            Self::ptrace_check_attach(&tracee, request)?;
+        }
+
         let result: isize = match request {
             // 读取进程内存
             PtraceRequest::Peekdata => Self::handle_peek_data(&tracee, addr, data)?,
@@ -597,6 +547,8 @@ impl Syscall for SysPtrace {
             PtraceRequest::Setoptions => Self::handle_set_options(&tracee, data)?,
             // 获取信号信息
             PtraceRequest::Getsiginfo => Self::handle_get_siginfo(&tracee, data)?,
+            // 获取系统调用停止信息
+            PtraceRequest::Getsyscallinfo => Self::handle_get_syscall_info(&tracee, addr, data)?,
             // PTRACE_SEIZE：现代 API，不发送 SIGSTOP
             PtraceRequest::Seize => Self::handle_seize(&tracer, pid, addr, data)?,
             // 其他请求类型

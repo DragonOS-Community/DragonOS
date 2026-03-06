@@ -222,24 +222,29 @@ pub fn kernel_waitid(
     Ok(0)
 }
 
-/// 检查子进程是否可以被当前线程等待
-///
-/// 1. 只有 child->parent 指向当前线程或线程组时，才有资格等待。
-/// 2. 如果子进程被 Ptrace，其 parent 指向 Tracer。此时只有 Tracer 能等待，原始父进程不能等待。
-fn is_eligible_child(child_pcb: &Arc<ProcessControlBlock>, options: WaitOption) -> bool {
+/// - 遍历 children 列表时看 real_parent（自然父进程）
+/// - 遍历 ptraced_list 或按 pid 直接等待 ptracee 时看 parent（当前 tracer）
+fn is_effectively_child(
+    child_pcb: &Arc<ProcessControlBlock>,
+    ptrace: bool,
+    options: WaitOption,
+) -> bool {
     let current = ProcessManager::current_pcb();
 
-    // 获取子进程当前的parent父进程
-    let child_parent = match child_pcb.parent_pcb() {
+    let child_parent = match if ptrace {
+        child_pcb.parent_pcb()
+    } else {
+        child_pcb.real_parent_pcb()
+    } {
         Some(p) => p,
         None => return false,
     };
 
     if options.contains(WaitOption::WNOTHREAD) {
-        // __WNOTHREAD: 请求者必须是子进程的直接 parent
+        // __WNOTHREAD: 请求者必须是对应关系上的直接父进程/ptracer。
         Arc::ptr_eq(&child_parent, &current)
     } else {
-        // 默认情况 (WEXITED 等): 只要子进程的 parent 属于当前线程组，就可以等待。
+        // 默认情况：当前线程组内任一线程都可以等待同组线程的 child/ptracee。
         child_parent.tgid == current.tgid
     }
 }
@@ -268,11 +273,13 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
 
             let current = ProcessManager::current_pcb();
 
-            // 检查子进程是否可以被当前线程等待
-            // 根据 Linux 语义：
-            // - 默认情况下，线程组中的任何线程都可以等待同一线程组中任何线程 fork 的子进程
-            // - 如果指定了 __WNOTHREAD，则只能等待当前线程自己创建的子进程
-            if !is_eligible_child(&child_pcb, kwo.options) {
+            // 对标 Linux do_wait_pid():
+            // - 自然父进程按 real_parent 匹配
+            // - tracer 按 parent 匹配
+            let is_natural_child = is_effectively_child(&child_pcb, false, kwo.options);
+            let is_ptrace_child =
+                child_pcb.is_traced() && is_effectively_child(&child_pcb, true, kwo.options);
+            if !is_natural_child && !is_ptrace_child {
                 return Err(SystemError::ECHILD);
             }
 
@@ -344,7 +351,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             Some(p) => p,
                             None => continue,
                         };
-                        if !is_eligible_child(&pcb, kwo.options) {
+                        if !is_effectively_child(&pcb, false, kwo.options) {
                             continue;
                         }
                         if !child_matches_wait_options(&pcb, kwo.options) {
@@ -466,7 +473,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 None => continue,
                             };
 
-                            if !is_eligible_child(&pcb, kwo.options) {
+                            if !is_effectively_child(&pcb, false, kwo.options) {
                                 continue;
                             }
                             if !child_matches_wait_options(&pcb, kwo.options) {
@@ -522,36 +529,22 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 drop(sched_guard);
                                 break;
                             } else if matches!(state, ProcessState::TracedStopped(_)) {
-                                // TracedStopped 状态类似于 Linux 的 TASK_TRACED
-                                // 这是 ptrace 专用的停止状态，总是报告给 tracer
-                                // 提取纯信号号（去掉 0x80 位）
-                                let actual_sig = if let ProcessState::TracedStopped(sig) = state {
-                                    (sig & 0x7f) as i32 // 去掉 0x80 位，只保留信号号
+                                // 对标 Linux wait_task_stopped(ptrace=true):
+                                // - ptrace stop 的状态码按原始 stop code 返回，不能丢弃高位事件信息
+                                // - 例如 SIGTRAP|0x80 (TRACESYSGOOD) 和 PTRACE_EVENT_xxx
+                                let raw_stop = if let ProcessState::TracedStopped(sig) = state {
+                                    sig as i32
                                 } else {
                                     Signal::SIGSTOP as i32
                                 };
-                                // 检查是否有 PTRACE_SYSCALL 事件（0x80 位）
-                                let has_ptrace_syscall =
-                                    if let ProcessState::TracedStopped(sig) = state {
-                                        (sig & 0x80) != 0
-                                    } else {
-                                        false
-                                    };
                                 kwo.no_task_error = None;
-                                // ret_info.status 使用纯信号号（不含 0x80 位）
                                 kwo.ret_info = Some(WaitIdInfo {
                                     pid: pcb.task_pid_vnr(),
-                                    status: actual_sig,
+                                    status: raw_stop,
                                     cause: SigChildCode::Trapped.into(),
                                     uid: get_child_uid(&pcb),
                                 });
-                                // ret_status 编码：如果是 PTRACE_SYSCALL 事件，在信号上加 0x80
-                                let status_sig = if has_ptrace_syscall {
-                                    actual_sig | 0x80
-                                } else {
-                                    actual_sig
-                                };
-                                kwo.ret_status = (status_sig << 8) | 0x7f;
+                                kwo.ret_status = (raw_stop << 8) | 0x7f;
                                 scan_result = Some(Ok((*pid).into()));
                                 drop(sched_guard);
                                 break;
@@ -634,20 +627,20 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 }
 
                                 if matches!(state, ProcessState::TracedStopped(_)) {
-                                    // TracedStopped 状态总是报告给 tracer
-                                    let stopsig = if let ProcessState::TracedStopped(sig) = state {
-                                        (sig & 0x7f) as i32
+                                    // 必须保留原始 stop code（含 0x80 / PTRACE_EVENT 高位）
+                                    let raw_stop = if let ProcessState::TracedStopped(sig) = state {
+                                        sig as i32
                                     } else {
                                         Signal::SIGSTOP as i32
                                     };
                                     kwo.no_task_error = None;
                                     kwo.ret_info = Some(WaitIdInfo {
                                         pid: pcb.task_pid_vnr(),
-                                        status: stopsig,
+                                        status: raw_stop,
                                         cause: SigChildCode::Trapped.into(),
                                         uid: get_child_uid(&pcb),
                                     });
-                                    kwo.ret_status = (stopsig << 8) | 0x7f;
+                                    kwo.ret_status = (raw_stop << 8) | 0x7f;
                                     scan_result = Some(Ok((*pid).into()));
                                     drop(sched_guard);
                                     break;
@@ -743,7 +736,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             None => continue,
                         };
 
-                        if !is_eligible_child(&pcb, kwo.options) {
+                        if !is_effectively_child(&pcb, false, kwo.options) {
                             continue;
                         }
 
@@ -875,7 +868,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 None => continue,
                             };
 
-                            if !is_eligible_child(&pcb, kwo.options) {
+                            if !is_effectively_child(&pcb, false, kwo.options) {
                                 continue;
                             }
 
@@ -1026,20 +1019,20 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 }
 
                                 if matches!(state, ProcessState::TracedStopped(_)) {
-                                    // TracedStopped 状态总是报告给 tracer
-                                    let stopsig = if let ProcessState::TracedStopped(sig) = state {
-                                        (sig & 0x7f) as i32
+                                    // 必须保留原始 stop code（含 0x80 / PTRACE_EVENT 高位）
+                                    let raw_stop = if let ProcessState::TracedStopped(sig) = state {
+                                        sig as i32
                                     } else {
                                         Signal::SIGSTOP as i32
                                     };
                                     kwo.no_task_error = None;
                                     kwo.ret_info = Some(WaitIdInfo {
                                         pid: pcb.task_pid_vnr(),
-                                        status: stopsig,
+                                        status: raw_stop,
                                         cause: SigChildCode::Trapped.into(),
                                         uid: get_child_uid(&pcb),
                                     });
-                                    kwo.ret_status = (stopsig << 8) | 0x7f;
+                                    kwo.ret_status = (raw_stop << 8) | 0x7f;
                                     scan_result = Some(Ok((*ptraced_pid).into()));
                                     drop(sched_guard);
                                     break;
@@ -1181,27 +1174,19 @@ fn do_waitpid(
             return None;
         }
         ProcessState::Stopped(stopsig) => {
-            // todo: 在stopped里面，添加code字段，表示停止的原因
-            // stopsig 的格式可能是：
-            // - ((signal << 8) | 0x7f) - 普通停止
-            // - ((signal << 8) | 0x80) - ptrace 陷阱停止
-            // 我们需要提取实际的信号编号 (低 8 位 & 0x7f)
+            // group-stop 只在存在“待上报停止事件”时才可见，并且在非 WNOWAIT 下消费该事件。
+            if !kwo.options.contains(WaitOption::WUNTRACED)
+                || !child_pcb.sighand().flags_contains(SignalFlags::CLD_STOPPED)
+            {
+                return None;
+            }
+
             let actual_sig = stopsig & 0x7f;
             if actual_sig >= Signal::SIGRTMAX.into() {
                 return Some(Err(SystemError::EINVAL));
             }
-            let ptrace = child_pcb.is_traced();
-            // 对于被跟踪的进程，总是报告停止状态，无论 WUNTRACED 是否设置
-            // 对于非跟踪进程，只有在设置了 WUNTRACED 时才报告停止状态
-            if (!ptrace) && (!kwo.options.contains(WaitOption::WUNTRACED)) {
-                // 调用方未请求 WSTOPPED，按照 Linux 语义应当继续等待其它事件
-                // 而不是返回 0 并写回空的 siginfo。
-                return None;
-            }
+
             if likely(!(kwo.options.contains(WaitOption::WNOWAIT))) {
-                // 根据 Linux 6.6.21 语义：
-                // - 普通停止：(signal << 8) | 0x7f
-                // - ptrace 停止：(signal << 8) | 0x80
                 kwo.ret_status = if (stopsig & 0x80) != 0 {
                     // ptrace 停止，保留 0x80 标志
                     ((actual_sig << 8) | 0x80) as i32
@@ -1210,13 +1195,7 @@ fn do_waitpid(
                     ((actual_sig << 8) | 0x7f) as i32
                 };
             }
-            // if let Some(infop) = &mut kwo.ret_info {
-            //     *infop = WaitIdInfo {
-            //         pid: child_pcb.raw_pid(),
-            //         status: stopsig,
-            //         cause: SigChildCode::Stopped.into(),
-            //     };
-            // }
+
             kwo.ret_info = Some(WaitIdInfo {
                 pid: child_pcb.task_pid_vnr(),
                 status: actual_sig as i32,
@@ -1224,8 +1203,6 @@ fn do_waitpid(
                 uid: get_child_uid(&child_pcb),
             });
 
-            // 获取 rusage（如果提供了 rusage 缓冲区）
-            // 参考: https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/exit.c#1308
             if let Some(rusage) = kwo.ret_rusage.as_mut() {
                 if let Some(child_rusage) =
                     child_pcb.get_rusage(super::resource::RUsageWho::RUsageSelf)
@@ -1234,32 +1211,27 @@ fn do_waitpid(
                 }
             }
 
+            if !kwo.options.contains(WaitOption::WNOWAIT) {
+                child_pcb.sighand().flags_remove(SignalFlags::CLD_STOPPED);
+            }
+
             return Some(Ok(child_pcb.raw_pid().data()));
         }
         ProcessState::TracedStopped(stopsig) => {
             // TracedStopped 状态类似于 Linux 的 TASK_TRACED
             // 这是 ptrace 专用的停止状态，总是报告给 tracer
-            // 提取纯信号号（去掉 0x80 位）
             let actual_sig = stopsig & 0x7f;
-            // 检查是否有 PTRACE_SYSCALL 事件（0x80 位）
-            let has_ptrace_syscall = (stopsig & 0x80) != 0;
             if actual_sig >= Signal::SIGRTMAX.into() {
                 return Some(Err(SystemError::EINVAL));
             }
             // TracedStopped 状态总是被 ptrace，所以总是报告停止状态
             // 不需要检查 WUNTRACED 标志
             if likely(!(kwo.options.contains(WaitOption::WNOWAIT))) {
-                // ret_status 编码：如果是 PTRACE_SYSCALL 事件，在信号上加 0x80
-                let status_sig = if has_ptrace_syscall {
-                    actual_sig | 0x80
-                } else {
-                    actual_sig
-                };
-                kwo.ret_status = ((status_sig << 8) | 0x7f) as i32;
+                kwo.ret_status = ((stopsig as i32) << 8) | 0x7f;
             }
             kwo.ret_info = Some(WaitIdInfo {
                 pid: child_pcb.task_pid_vnr(),
-                status: actual_sig as i32,
+                status: stopsig as i32,
                 cause: SigChildCode::Trapped.into(),
                 uid: get_child_uid(&child_pcb),
             });

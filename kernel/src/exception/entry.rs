@@ -58,7 +58,7 @@ unsafe fn exit_to_user_mode_loop(frame: &mut TrapFrame) {
 }
 
 /// 从系统调用返回到用户态的统一退出路径
-/// 对应 Linux 6.6.21 arch/x86/entry/common.c::syscall_return_to_user_mode
+/// 对应 arch/x86/entry/common.c::syscall_return_to_user_mode
 ///
 /// # Safety
 ///
@@ -70,7 +70,7 @@ pub unsafe extern "C" fn syscall_exit_to_user_mode(frame: &mut TrapFrame) {
 }
 
 /// 从中断/异常返回到用户态的退出路径
-/// 对应 Linux 6.6.21 kernel/entry/common.c::irqentry_exit_to_user_mode
+/// 对应 kernel/entry/common.c::irqentry_exit_to_user_mode
 /// 用于处理非系统调用的返回路径（如中断返回）
 #[no_mangle]
 pub unsafe extern "C" fn irqentry_exit(frame: &mut TrapFrame) {

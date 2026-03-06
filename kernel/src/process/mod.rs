@@ -1110,19 +1110,12 @@ bitflags! {
         const TRACE_SYSCALL = 1 << 18;
         /// 跟踪器已发出PTRACE_SINGLESTEP请求
         const TRACE_SINGLESTEP = 1 << 19;
-        /// 跟踪器设置了TRACE_EXIT选项
-        const TRACE_EXIT = 1 << 20;
-        /// 跟踪器设置了TRACE_FORK/CLONE选项
-        const TRACE_FORK = 1 << 21;
-        /// 跟踪器设置了TRACE_VFORK选项
-        const TRACE_VFORK = 1 << 22;
-        /// 跟踪器设置了TRACE_EXEC选项
-        const TRACE_EXEC = 1 << 23;
-        /// 系统调用正在中断点（入口或出口）
-        const SYSCALL_INTERRUPT = 1 << 24;
         /// 进程通过 PTRACE_SEIZE 被附加（而非 PTRACE_ATTACH）
         /// SEIZED 进程不会收到 Legacy SIGTRAP
-        const PT_SEIZED = 1 << 25;
+        const PT_SEIZED = 1 << 20;
+        /// ptrace attach 到已停止的进程时设置，表示需要进入 ptrace stop
+        /// 对标 Linux 的 JOBCTL_TRAP_STOP
+        const PENDING_PTRACE_STOP = 1 << 21;
     }
 }
 
@@ -1861,7 +1854,6 @@ impl ProcessControlBlock {
             return Ok(());
         }
 
-        // 按照 Linux 6.6.21 的 ptrace 语义：
         // 如果子进程正在被当前进程 ptrace，则不要转移它
         // tracer 需要能够 wait 这个子进程，即使子进程已经退出
         let mut ptraced_children: Vec<RawPid> = Vec::new();

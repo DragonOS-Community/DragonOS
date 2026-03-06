@@ -594,6 +594,17 @@ impl SigFrame {
 unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     let pcb = ProcessManager::current_pcb();
 
+    // 检查 PENDING_PTRACE_STOP 标志（ptrace attach 到已停止进程时设置）
+    // get_signal() 中对 JOBCTL_TRAP_STOP 的处理
+    if pcb.flags().contains(ProcessFlags::PENDING_PTRACE_STOP) {
+        // 清除标志并调用 ptrace_signal 触发 ptrace_stop
+        pcb.flags().remove(ProcessFlags::PENDING_PTRACE_STOP);
+        // 使用 SIGSTOP 作为触发信号，但 siginfo 为 None（表示不是真正的信号）
+        // ptrace_signal 会调用 ptrace_stop 使进程进入 TracedStopped 状态
+        let _ = ptrace_signal(&pcb, Signal::SIGSTOP, &mut None);
+        // ptrace_stop 后继续处理其他信号
+    }
+
     let siginfo = pcb.try_siginfo_irqsave(5);
     if unlikely(siginfo.is_none()) {
         pcb.recalc_sigpending();
@@ -642,8 +653,8 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
             break;
         }
 
-        // 只要进程处于 PTRACED 状态，都必须先通知 Tracer
-        if pcb.flags().contains(ProcessFlags::PTRACED) {
+        // 仅当 signr != SIGKILL 时才进入 ptrace_signal()，SIGKILL 不能被 tracer 拦截/吞掉
+        if pcb.flags().contains(ProcessFlags::PTRACED) && sig != Signal::SIGKILL {
             let result = ptrace_signal(&pcb, sig, &mut info);
             match result {
                 Some(new_sig) => {

@@ -136,7 +136,7 @@ fn do_execve_internal(
             // 清除 rseq 状态（execve 后需要重新注册）
             crate::process::rseq::rseq_execve(&pcb);
 
-            // 参考 Linux 6.6.21: fs/exec.c:flush_old_exec() -> exit_it_signals()
+            // 参考: fs/exec.c:flush_old_exec() -> exit_it_signals()
             // 清理所有 itimers，防止 exec 后继续收到 SIGALRM 等定时器信号
             // 这对于 fork 后 exec 的场景尤其重要，因为子进程不应继承父进程的定时器
             {
@@ -150,7 +150,6 @@ fn do_execve_internal(
                 itimers.prof = Default::default();
             }
 
-            // 参考 Linux 6.6.21: fs/exec.c:load_elf_binary() -> setup_new_exec() -> ptrace_event()
             // 在 execve 成功后，发送 ptrace exec 事件（如果需要）
             pcb.ptrace_event(PtraceEvent::Exec, 0);
 

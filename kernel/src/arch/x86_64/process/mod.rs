@@ -234,6 +234,14 @@ impl ArchPCBInfo {
         self.gsbase
     }
 
+    pub fn set_fsbase(&mut self, fsbase: usize) {
+        self.fsbase = fsbase;
+    }
+
+    pub fn set_gsbase(&mut self, gsbase: usize) {
+        self.gsbase = gsbase;
+    }
+
     /// 获取 FS 段选择器的值
     pub fn fs(&self) -> u16 {
         self.fs.bits()
@@ -242,6 +250,14 @@ impl ArchPCBInfo {
     /// 获取 GS 段选择器的值
     pub fn gs(&self) -> u16 {
         self.gs.bits()
+    }
+
+    pub fn set_fs(&mut self, fs: u16) {
+        self.fs = SegmentSelector::from_bits_truncate(fs);
+    }
+
+    pub fn set_gs(&mut self, gs: u16) {
+        self.gs = SegmentSelector::from_bits_truncate(gs);
     }
 
     pub fn cr2_mut(&mut self) -> &mut usize {

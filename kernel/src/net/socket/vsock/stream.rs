@@ -1265,6 +1265,17 @@ impl Socket for VsockStreamSocket {
         }
     }
 
+    fn read_to_user_buffer(
+        &self,
+        user_buffer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+    ) -> Result<usize, SystemError> {
+        crate::net::socket::base::read_to_user_buffer_via_kernel_buf(
+            self,
+            user_buffer,
+            self.recv_buffer_size(),
+        )
+    }
+
     /// `recvfrom` 变体，地址参数对 stream 语义仅做兼容返回。
     fn recv_from(
         &self,

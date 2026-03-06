@@ -14,8 +14,7 @@ use unified_init::macros::unified_init;
 
 lazy_static! {
     //todo 按照软中断的做法，这里应该是每个CPU一个列表，但目前只实现单CPU版本
-    static ref GLOBAL_NAPI_MANAGER: Arc<NapiManager> =
-        NapiManager::new();
+    static ref GLOBAL_NAPI_MANAGER: Arc<NapiManager> = NapiManager::new();
 }
 
 /// # NAPI 结构体
@@ -126,14 +125,6 @@ fn net_rx_action() {
 
         // log::info!("NAPI softirq processing {} instances", poll_list.len());
 
-        // 如果此时长度为0,则让当前进程休眠，等待被唤醒
-        if poll_list.is_empty() {
-            GLOBAL_NAPI_MANAGER
-                .inner()
-                .has_pending_signal
-                .store(false, Ordering::SeqCst);
-        }
-
         while let Some(napi) = poll_list.pop() {
             let has_work_left = napi.poll();
             // log::info!("yes");
@@ -147,10 +138,39 @@ fn net_rx_action() {
 
         // log::info!("napi softirq iteration complete")
 
-        // 在这种情况下，poll_list 中仍然有待处理的 NAPI 实例，压回队列，等待下一次唤醒时处理
+        // 若 budget 用尽后仍有 backlog，必须继续自驱动处理，不能依赖新的外部唤醒。
+        // 否则 loopback/TCP 大流量场景下，发送端已经结束后不会再触发 napi_schedule()，
+        // 剩余包会永久滞留在 backlog 中，接收端 read()/recv() 就会偶发卡死。
         if !poll_list.is_empty() {
-            GLOBAL_NAPI_MANAGER.inner().napi_list.extend(poll_list);
+            let mut inner = GLOBAL_NAPI_MANAGER.inner();
+            inner.napi_list.extend(poll_list);
+            inner.has_pending_signal.store(true, Ordering::SeqCst);
+            drop(inner);
+            continue;
         }
+
+        // 关键竞态：
+        // `poll()` / `poll_egress()` 期间，loopback Tx 可能再次调用 `napi_schedule()`，
+        // 把“新产生的 ingress 工作”塞回全局 `napi_list`。
+        //
+        // 由于本轮处理的是循环开始时快照出的 `poll_list`，如果这里不重新检查全局列表，
+        // 就可能出现：
+        // 1) 当前本地 `poll_list` 已空；
+        // 2) 但全局 `napi_list` 已被并发加入了新工作；
+        // 3) 当前线程仍把 `has_pending_signal` 清零并睡眠。
+        //
+        // 对 loopback/TCP 大包发送，这会把“send 过程中产生的后续本地收包”永久遗落，
+        // 直到下一次外部网络事件才被重新推进，从而表现为 recv() 偶发永久卡住。
+        let inner = GLOBAL_NAPI_MANAGER.inner();
+        if !inner.napi_list.is_empty() {
+            inner.has_pending_signal.store(true, Ordering::SeqCst);
+            drop(inner);
+            continue;
+        }
+
+        // 只有确认全局队列也为空时，才真正进入睡眠。
+        inner.has_pending_signal.store(false, Ordering::SeqCst);
+        drop(inner);
 
         let _ = wq_wait_event_interruptible!(
             GLOBAL_NAPI_MANAGER.wait_queue(),

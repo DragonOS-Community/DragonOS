@@ -2,13 +2,15 @@ use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_READ;
-use crate::filesystem::vfs::file::FileFlags;
+use crate::filesystem::vfs::file::{File, FileFlags};
+use crate::filesystem::vfs::FileType;
 use crate::mm::VirtAddr;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use crate::syscall::user_access::{copy_to_user_protected, user_accessible_len, UserBufferWriter};
 use alloc::string::ToString;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 /// System call handler for the `read` syscall
@@ -102,6 +104,11 @@ syscall_table_macros::declare_syscall!(SYS_READ, SysReadHandle);
 /// * `Ok(usize)` - Number of bytes successfully read
 /// * `Err(SystemError)` - Error code if operation fails
 pub(super) fn do_read(fd: i32, buf: &mut [u8]) -> Result<usize, SystemError> {
+    let file = get_read_file(fd)?;
+    do_read_file(file.as_ref(), buf)
+}
+
+fn get_read_file(fd: i32) -> Result<Arc<File>, SystemError> {
     let binding = ProcessManager::current_pcb().fd_table();
     let fd_table_guard = binding.read();
 
@@ -112,11 +119,15 @@ pub(super) fn do_read(fd: i32, buf: &mut [u8]) -> Result<usize, SystemError> {
     // drop guard 以避免无法调度的问题
     drop(fd_table_guard);
 
+    Ok(file)
+}
+
+fn do_read_file(file: &File, buf: &mut [u8]) -> Result<usize, SystemError> {
     if file.flags().contains(FileFlags::O_PATH) {
         return Err(SystemError::EBADF);
     }
 
-    return file.read(buf.len(), buf);
+    file.read(buf.len(), buf)
 }
 
 /// Read into a userspace buffer safely (exception-table protected) and in chunks.
@@ -131,6 +142,11 @@ fn read_into_user_buffer(fd: i32, user_ptr: *mut u8, len: usize) -> Result<usize
         return Err(SystemError::EFAULT);
     }
 
+    let file = get_read_file(fd)?;
+    if file.file_type() == FileType::Socket {
+        return read_socket_into_user_buffer(file.as_ref(), user_ptr, accessible);
+    }
+
     // Keep the kernel-side buffer modest to avoid huge allocations/long critical sections.
     const CHUNK: usize = 64 * 1024;
     let mut total = 0usize;
@@ -140,7 +156,7 @@ fn read_into_user_buffer(fd: i32, user_ptr: *mut u8, len: usize) -> Result<usize
         let chunk_len = core::cmp::min(CHUNK, remain);
 
         let mut kbuf = alloc::vec![0u8; chunk_len];
-        let n = do_read(fd, &mut kbuf[..])?;
+        let n = do_read_file(file.as_ref(), &mut kbuf[..])?;
         if n == 0 {
             break;
         }
@@ -166,4 +182,17 @@ fn read_into_user_buffer(fd: i32, user_ptr: *mut u8, len: usize) -> Result<usize
     }
 
     Ok(total)
+}
+
+fn read_socket_into_user_buffer(
+    file: &File,
+    user_ptr: *mut u8,
+    accessible: usize,
+) -> Result<usize, SystemError> {
+    let inode = file.inode();
+    let socket = inode.as_socket().ok_or(SystemError::ENOTSOCK)?;
+
+    let mut writer = UserBufferWriter::new(user_ptr, accessible, true)?;
+    let mut user_buffer = writer.buffer_protected(0)?;
+    socket.read_to_user_buffer(&mut user_buffer)
 }

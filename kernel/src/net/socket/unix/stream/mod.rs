@@ -806,6 +806,17 @@ impl Socket for UnixStreamSocket {
         // }
     }
 
+    fn read_to_user_buffer(
+        &self,
+        user_buffer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+    ) -> Result<usize, SystemError> {
+        crate::net::socket::base::read_to_user_buffer_via_kernel_buf(
+            self,
+            user_buffer,
+            self.recv_buffer_size(),
+        )
+    }
+
     fn recv_msg(&self, _msg: &mut MsgHdr, _flags: socket::PMSG) -> Result<usize, SystemError> {
         let msg = _msg;
 

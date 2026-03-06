@@ -294,7 +294,6 @@ impl NetNamespace {
             ),
         });
 
-        // Self::create_polling_thread(netns.clone(), "netns_root".to_string());
         log::info!("Initialized root net namespace");
         netns
     }

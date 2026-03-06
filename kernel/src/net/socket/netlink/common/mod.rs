@@ -233,6 +233,18 @@ where
         Ok(len)
     }
 
+    fn read_to_user_buffer(
+        &self,
+        user_buffer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+    ) -> Result<usize, SystemError> {
+        const NETLINK_READ_SCRATCH: usize = 64 * 1024;
+        crate::net::socket::base::read_to_user_buffer_via_kernel_buf(
+            self,
+            user_buffer,
+            NETLINK_READ_SCRATCH,
+        )
+    }
+
     fn recv_msg(
         &self,
         msg: &mut crate::net::posix::MsgHdr,

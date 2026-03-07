@@ -11,6 +11,7 @@ use crate::{
     },
     mm::{MemoryManagementArch, PhysAddr, VirtAddr},
     process::{
+        pid::PidType,
         ptrace::{PtraceOptions, PtraceRequest},
         ProcessControlBlock, ProcessManager, ProcessState, RawPid,
     },
@@ -37,6 +38,7 @@ impl TryFrom<usize> for PtraceRequest {
             3 => Ok(PtraceRequest::Peekuser),
             5 => Ok(PtraceRequest::Pokedata),
             7 => Ok(PtraceRequest::Cont),
+            8 => Ok(PtraceRequest::Kill),
             9 => Ok(PtraceRequest::Singlestep),
             12 => Ok(PtraceRequest::Getregs),
             13 => Ok(PtraceRequest::Setregs),
@@ -524,6 +526,21 @@ impl SysPtrace {
         ptrace_poke_data(tracee, addr, data)
     }
 
+    /// 处理 PTRACE_KILL 请求
+    fn handle_kill(tracee: &Arc<ProcessControlBlock>) -> Result<isize, SystemError> {
+        let mut info = SigInfo::new(
+            Signal::SIGKILL,
+            0,
+            SigCode::Origin(OriginCode::Kernel),
+            SigType::Kill {
+                pid: RawPid::new(0),
+                uid: 0,
+            },
+        );
+        Signal::SIGKILL.send_signal_info_to_pcb(Some(&mut info), tracee.clone(), PidType::PID)?;
+        Ok(0)
+    }
+
     /// 处理 PTRACE_GETREGS 请求 (获取寄存器值)
     fn handle_get_regs(
         tracee: &Arc<ProcessControlBlock>,
@@ -714,6 +731,8 @@ impl Syscall for SysPtrace {
             PtraceRequest::Peekuser => Self::handle_peek_user(&tracee, addr)?,
             // 写入进程内存
             PtraceRequest::Pokedata => Self::handle_poke_data(&tracee, addr, data)?,
+            // 终止目标进程
+            PtraceRequest::Kill => Self::handle_kill(&tracee)?,
             // 继续执行目标进程
             PtraceRequest::Cont
             | PtraceRequest::Singlestep

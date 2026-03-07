@@ -32,6 +32,7 @@ pub enum PtraceRequest {
     Peekuser = 3,
     Pokedata = 5,
     Cont = 7,
+    Kill = 8,
     Singlestep = 9,
     Getregs = 12,
     Setregs = 13,

@@ -78,12 +78,15 @@ impl Syscall for SysSetResUid {
         // 处理 capability 更新（使用统一的处理函数）
         id_utils::handle_uid_capabilities(
             &mut new_cred,
-            old_ruid,
-            old_euid,
-            old_suid,
-            new_ruid,
-            new_euid,
-            new_suid,
+            id_utils::UidTransition {
+                old_ruid,
+                old_euid,
+                old_suid,
+                new_ruid,
+                new_euid,
+                new_suid,
+            },
+            pcb.keepcaps(),
         );
 
         // fsuid 跟随 euid

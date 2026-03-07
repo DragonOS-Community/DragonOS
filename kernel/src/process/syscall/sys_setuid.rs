@@ -53,14 +53,18 @@ impl Syscall for SysSetUid {
         let new_ruid = new_cred.uid.data();
         let new_euid = new_cred.euid.data();
         let new_suid = new_cred.suid.data();
+        let keepcaps = pcb.keepcaps();
         id_utils::handle_uid_capabilities(
             &mut new_cred,
-            old_ruid,
-            old_euid,
-            old_suid,
-            new_ruid,
-            new_euid,
-            new_suid,
+            id_utils::UidTransition {
+                old_ruid,
+                old_euid,
+                old_suid,
+                new_ruid,
+                new_euid,
+                new_suid,
+            },
+            keepcaps,
         );
 
         *guard = Cred::new_arc(new_cred);

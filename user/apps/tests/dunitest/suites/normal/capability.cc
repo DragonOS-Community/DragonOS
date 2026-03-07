@@ -1,6 +1,9 @@
 #include <gtest/gtest.h>
 
 #include <errno.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include <string.h>
 #include <sys/wait.h>
 
@@ -164,6 +167,99 @@ TEST(CapSet, PermittedNotIncrease) {
 TEST(CapSet, InheritableBounds) {
     // 子进程先降权到 pI=0,pP=0，再尝试提升 pI(bit0)，应触发 EPERM
     expect_capset_eperm_after_drop(0, 0, 1);
+}
+
+static uint64_t current_permitted_caps() {
+    cap_user_data_t data[2] = {};
+    int err = capget_errno(_LINUX_CAPABILITY_VERSION_3, 0, data);
+    if (err != 0) {
+        return 0;
+    }
+    return cap_permitted_u64(data);
+}
+
+TEST(PrctlKeepCaps, GetOptionNumberLinuxCompatible) {
+    errno = 0;
+    long ret = syscall(SYS_prctl, 7, 0, 0, 0, 0);
+    ASSERT_NE(-1, ret) << "prctl(PR_GET_KEEPCAPS=7) failed: errno=" << errno << " ("
+                       << strerror(errno) << ")";
+    EXPECT_TRUE(ret == 0 || ret == 1) << "unexpected PR_GET_KEEPCAPS value: " << ret;
+}
+
+TEST(PrctlKeepCaps, SetRejectsInvalidValue) {
+    errno = 0;
+    long ret = syscall(SYS_prctl, PR_SET_KEEPCAPS, 2, 0, 0, 0);
+    ASSERT_EQ(-1, ret);
+    EXPECT_EQ(EINVAL, errno);
+}
+
+TEST(PrctlKeepCaps, SetuidDropWithoutKeepCapsClearsPermitted) {
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed: errno=" << errno << " (" << strerror(errno) << ")";
+    if (child == 0) {
+        // 仅在 root 场景验证；非 root 环境下跳过（退出码 0）。
+        if (geteuid() != 0) {
+            _exit(0);
+        }
+
+        if (syscall(SYS_prctl, PR_SET_KEEPCAPS, 0, 0, 0, 0) != 0) {
+            _exit(2);
+        }
+
+        if (setuid(1000) != 0) {
+            _exit(3);
+        }
+
+        uint64_t p = current_permitted_caps();
+        _exit(p == 0 ? 0 : 4);
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0));
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+TEST(PrctlKeepCaps, SetuidDropWithKeepCapsRetainsPermitted) {
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed: errno=" << errno << " (" << strerror(errno) << ")";
+    if (child == 0) {
+        // 仅在 root 场景验证；非 root 环境下跳过（退出码 0）。
+        if (geteuid() != 0) {
+            _exit(0);
+        }
+
+        if (syscall(SYS_prctl, PR_SET_KEEPCAPS, 1, 0, 0, 0) != 0) {
+            _exit(2);
+        }
+
+        cap_user_data_t before[2] = {};
+        int before_err = capget_errno(_LINUX_CAPABILITY_VERSION_3, 0, before);
+        if (before_err != 0) {
+            _exit(6);
+        }
+
+        if (setuid(1000) != 0) {
+            _exit(3);
+        }
+
+        cap_user_data_t data[2] = {};
+        int err = capget_errno(_LINUX_CAPABILITY_VERSION_3, 0, data);
+        if (err != 0) {
+            _exit(4);
+        }
+
+        uint64_t p_before = cap_permitted_u64(before);
+        uint64_t p = cap_permitted_u64(data);
+        uint64_t e = cap_effective_u64(data);
+        // Linux 语义：keepcaps 保留 permitted；euid 0->non0 会清除 effective。
+        _exit((p == p_before && e == 0) ? 0 : 5);
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0));
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
 }
 
 int main(int argc, char** argv) {

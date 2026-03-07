@@ -9,7 +9,7 @@ use system_error::SystemError;
 use crate::{
     arch::{
         interrupt::{TrapFrame, UserRegsStruct},
-        ipc::signal::{SigFlags, Signal},
+        ipc::signal::{SigFlags, SigSet, Signal},
         kprobe,
     },
     ipc::signal_types::{
@@ -40,6 +40,9 @@ pub enum PtraceRequest {
     Syscall = 24,
     Setoptions = 0x4200,
     Getsiginfo = 0x4202,
+    Setsiginfo = 0x4203,
+    Getsigmask = 0x420a,
+    Setsigmask = 0x420b,
     Getsyscallinfo = 0x420e,
     Seize = 0x4206, // 现代 API，不发送 SIGSTOP
 }
@@ -327,10 +330,10 @@ pub fn ptrace_signal(
         return None;
     }
 
-    // 如果追踪者注入了不同于原始信号的新信号，更新 siginfo
-    if injected_signal != original_signal {
-        if let Some(info_ref) = info {
-            // 严格对标 Linux: 重新初始化 siginfo，来源固定为 SI_USER
+    // 这样 PTRACE_SETSIGINFO 修改过的 signo 才能生效。
+    if let Some(info_ref) = info {
+        if injected_signal as i32 != info_ref.signo_i32() {
+            // 重新初始化 siginfo，来源固定为 SI_USER
             // 获取当前父进程 (在 ptrace 期间通常是 tracer)
             let parent = pcb_clone.parent_pcb();
             let pid = parent.as_ref().map_or(RawPid::new(0), |p| p.raw_pid());
@@ -440,6 +443,43 @@ impl ProcessControlBlock {
     /// 获取停止状态的状态字
     pub fn ptrace_status_code(&self) -> usize {
         self.ptrace_state.lock().status_code()
+    }
+
+    /// 如果线程带着 restore-sigmask 标记，则优先暴露 saved_sigmask，
+    /// 否则暴露当前 blocked mask。
+    pub fn ptrace_get_sigmask(&self) -> SigSet {
+        let sig_info = self.sig_info_irqsave();
+        if self.flags().contains(ProcessFlags::RESTORE_SIG_MASK) {
+            *sig_info.saved_sigmask()
+        } else {
+            *sig_info.sig_blocked()
+        }
+    }
+
+    /// 更新 tracee 的 blocked mask，并清除 restore-sigmask 标记。
+    pub fn ptrace_set_sigmask(&self, mut new_set: SigSet) {
+        new_set.remove(Signal::SIGKILL.into());
+        new_set.remove(Signal::SIGSTOP.into());
+
+        {
+            let mut sig_info = self.sig_info_mut();
+            *sig_info.sig_block_mut() = new_set;
+        }
+
+        self.flags().remove(ProcessFlags::RESTORE_SIG_MASK);
+        // 这里立即刷新 pending 可见性，保证 tracer 改 mask 后的可观察行为一致。
+        self.recalc_sigpending();
+    }
+
+    /// 只在 signal-delivery-stop 中允许更新 last_siginfo。
+    pub fn ptrace_setsiginfo(&self, info: SigInfo) -> Result<(), SystemError> {
+        let mut ptrace_state = self.ptrace_state.lock();
+        if ptrace_state.last_siginfo().is_none() {
+            return Err(SystemError::EINVAL);
+        }
+
+        ptrace_state.set_last_siginfo(info);
+        Ok(())
     }
 
     /// 添加信号到队列
@@ -576,7 +616,7 @@ impl ProcessControlBlock {
     /// 设置进程为停止状态
     ///
     /// - 设置状态为 TracedStopped (类似 TASK_TRACED)
-    /// - 存储 last_siginfo（供 PTRACE_GETSIGINFO 读取）
+    /// - 存储 last_siginfo（供 PTRACE_GETSIGINFO / PTRACE_SETSIGINFO 访问）
     /// - 调用 schedule() 让出 CPU，调度器会自动将任务从运行队列移除
     /// - 返回 tracer 在恢复 tracee 时指定的 signal；0 表示不注入信号
     pub fn ptrace_stop(
@@ -585,6 +625,8 @@ impl ProcessControlBlock {
         why: ChldCode,
         info: Option<&mut SigInfo>,
     ) -> usize {
+        let mut info = info;
+
         // 前置检查：ptrace 关系是否还存在
         if !self.is_traced() {
             log::warn!(
@@ -612,8 +654,8 @@ impl ProcessControlBlock {
         sched_info.set_state(ProcessState::TracedStopped(exit_code));
         sched_info.set_sleep();
 
-        if let Some(info) = info {
-            self.ptrace_state.lock().set_last_siginfo(*info);
+        if let Some(info_ref) = info.as_mut() {
+            self.ptrace_state.lock().set_last_siginfo(**info_ref);
         }
 
         // TODO: 这里应使用等价于 smp_wmb() 的体系结构内存屏障，并与
@@ -641,6 +683,13 @@ impl ProcessControlBlock {
         // event_message/last_siginfo 必须在 tracee 被 tracer 唤醒、从 schedule() 返回后再清理，
         // 不能在 notify_tracer() 之前清零，否则 tracer 的 PTRACE_GETEVENTMSG / GETSIGINFO 会读到 0 或陈旧值
         let mut ptrace_state = self.ptrace_state.lock();
+        if let Some(info_ref) = info {
+            if let Some(saved_siginfo) = ptrace_state.last_siginfo() {
+                // DragonOS 的 last_siginfo 当前是“停住时保存的一份副本”，这里在返回
+                // signal delivery 路径前回填，确保 PTRACE_SETSIGINFO 的修改真正参与后续递送。
+                *info_ref = saved_siginfo;
+            }
+        }
         let injected_signal = ptrace_state.injected_signal;
         ptrace_state.clear_last_siginfo();
         ptrace_state.event_message = 0;
@@ -1003,10 +1052,9 @@ impl ProcessControlBlock {
         _frame: &mut TrapFrame,
     ) -> Result<isize, SystemError> {
         match request {
-            // 对标 Linux ptrace_resume：
-            // - PTRACE_SYSCALL: 开启 syscall-trace，关闭 single-step
-            // - PTRACE_SINGLESTEP: 开启 single-step，关闭 syscall-trace
-            // - PTRACE_CONT: 两者都关闭
+            // PTRACE_SYSCALL: 开启 syscall-trace，关闭 single-step
+            // PTRACE_SINGLESTEP: 开启 single-step，关闭 syscall-trace
+            // PTRACE_CONT: 两者都关闭
             PtraceRequest::Syscall => {
                 self.flags().insert(ProcessFlags::TRACE_SYSCALL);
                 self.flags().remove(ProcessFlags::TRACE_SINGLESTEP);

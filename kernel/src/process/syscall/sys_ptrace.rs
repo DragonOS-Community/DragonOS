@@ -1,11 +1,13 @@
 use crate::{
     arch::{
         interrupt::{TrapFrame, UserRegsStruct},
-        ipc::signal::Signal,
+        ipc::signal::{SigSet, Signal},
         syscall::nr::SYS_PTRACE,
         MMArch,
     },
-    ipc::signal_types::PosixSigInfo,
+    ipc::signal_types::{
+        OriginCode, PosixSigInfo, SigChldInfo, SigCode, SigFaultInfo, SigInfo, SigType,
+    },
     mm::{MemoryManagementArch, PhysAddr, VirtAddr},
     process::{
         ptrace::{PtraceOptions, PtraceRequest},
@@ -38,16 +40,96 @@ impl TryFrom<usize> for PtraceRequest {
             24 => Ok(PtraceRequest::Syscall),
             0x4200 => Ok(PtraceRequest::Setoptions),
             0x4202 => Ok(PtraceRequest::Getsiginfo),
+            0x4203 => Ok(PtraceRequest::Setsiginfo),
             0x4206 => Ok(PtraceRequest::Seize),
+            0x420a => Ok(PtraceRequest::Getsigmask),
+            0x420b => Ok(PtraceRequest::Setsigmask),
             0x420e => Ok(PtraceRequest::Getsyscallinfo),
             _ => Err(SystemError::EINVAL),
         }
     }
 }
 
+fn ptrace_siginfo_pid(pid: i32) -> RawPid {
+    if pid < 0 {
+        RawPid(0)
+    } else {
+        RawPid(pid as usize)
+    }
+}
+
+fn ptrace_siginfo_type(signal: Signal, si_code: i32, user_info: &PosixSigInfo) -> SigType {
+    if si_code == i32::from(SigCode::Origin(OriginCode::Queue)) {
+        let rt = unsafe { user_info._sifields._rt };
+        return SigType::Rt {
+            pid: ptrace_siginfo_pid(rt.si_pid),
+            uid: rt.si_uid,
+            sigval: rt.si_sigval,
+        };
+    }
+
+    if si_code == i32::from(SigCode::Origin(OriginCode::Timer)) {
+        let timer = unsafe { user_info._sifields._timer };
+        return SigType::PosixTimer {
+            timerid: timer.si_tid,
+            overrun: timer.si_overrun,
+            sigval: timer.si_sigval,
+        };
+    }
+
+    if signal == Signal::SIGCHLD {
+        let chld = unsafe { user_info._sifields._sigchld };
+        return SigType::SigChld(SigChldInfo {
+            pid: ptrace_siginfo_pid(chld.si_pid),
+            uid: chld.si_uid as usize,
+            status: chld.si_status,
+            utime: chld.si_utime as u64,
+            stime: chld.si_stime as u64,
+        });
+    }
+
+    if matches!(
+        signal,
+        Signal::SIGILL | Signal::SIGFPE | Signal::SIGSEGV | Signal::SIGBUS | Signal::SIGTRAP
+    ) {
+        let fault = unsafe { user_info._sifields._sigfault };
+        return SigType::SigFault(SigFaultInfo {
+            addr: fault.si_addr as usize,
+            trapno: 0,
+        });
+    }
+
+    let kill = unsafe { user_info._sifields._kill };
+    SigType::Kill {
+        pid: ptrace_siginfo_pid(kill.si_pid),
+        uid: kill.si_uid,
+    }
+}
+
+fn ptrace_siginfo_from_user(data: usize) -> Result<SigInfo, SystemError> {
+    let reader = UserBufferReader::new(
+        data as *const u8,
+        core::mem::size_of::<PosixSigInfo>(),
+        true,
+    )?;
+    let buffer = reader.buffer_protected(0)?;
+    let user_info = buffer.read_one::<PosixSigInfo>(0)?;
+
+    let signal = Signal::from(user_info.si_signo);
+    if signal == Signal::INVALID {
+        return Err(SystemError::EINVAL);
+    }
+
+    let sig_code =
+        SigCode::try_from_i32(user_info.si_code).unwrap_or(SigCode::Raw(user_info.si_code));
+    let sig_type = ptrace_siginfo_type(signal, user_info.si_code, &user_info);
+
+    Ok(SigInfo::new(signal, user_info.si_errno, sig_code, sig_type))
+}
+
 /// ptrace 内存访问辅助函数
 ///
-/// 按照 Linux 6.6 的 ptrace_access_vm 模式实现，但不使用页表切换：
+/// 按照的 ptrace_access_vm 模式实现，但不使用页表切换：
 /// - 直接将 tracee 的虚拟地址翻译为物理地址
 /// - 通过 phys_2_virt 映射到内核虚拟地址空间
 /// - 使用异常表保护的拷贝函数，安全处理缺页异常
@@ -344,6 +426,49 @@ impl SysPtrace {
         Ok(0)
     }
 
+    /// 处理 PTRACE_SETSIGINFO 请求
+    fn handle_set_siginfo(
+        tracee: &Arc<ProcessControlBlock>,
+        data: usize,
+    ) -> Result<isize, SystemError> {
+        let siginfo = ptrace_siginfo_from_user(data)?;
+        tracee.ptrace_setsiginfo(siginfo)?;
+        Ok(0)
+    }
+
+    /// 处理 PTRACE_GETSIGMASK 请求
+    fn handle_get_sigmask(
+        tracee: &Arc<ProcessControlBlock>,
+        user_size: usize,
+        data: usize,
+    ) -> Result<isize, SystemError> {
+        if user_size != core::mem::size_of::<SigSet>() {
+            return Err(SystemError::EINVAL);
+        }
+        let sigmask = tracee.ptrace_get_sigmask();
+        let mut writer =
+            UserBufferWriter::new(data as *mut u8, core::mem::size_of::<SigSet>(), true)?;
+        writer.copy_one_to_user(&sigmask, 0)?;
+        Ok(0)
+    }
+
+    /// 处理 PTRACE_SETSIGMASK 请求（更新 tracee 的 blocked mask）
+    fn handle_set_sigmask(
+        tracee: &Arc<ProcessControlBlock>,
+        user_size: usize,
+        data: usize,
+    ) -> Result<isize, SystemError> {
+        if user_size != core::mem::size_of::<SigSet>() {
+            return Err(SystemError::EINVAL);
+        }
+        let reader =
+            UserBufferReader::new(data as *const u8, core::mem::size_of::<SigSet>(), true)?;
+        let mut sigmask = SigSet::empty();
+        reader.copy_one_from_user(&mut sigmask, 0)?;
+        tracee.ptrace_set_sigmask(sigmask);
+        Ok(0)
+    }
+
     /// 处理 PTRACE_GET_SYSCALL_INFO 请求
     fn handle_get_syscall_info(
         tracee: &Arc<ProcessControlBlock>,
@@ -547,6 +672,12 @@ impl Syscall for SysPtrace {
             PtraceRequest::Setoptions => Self::handle_set_options(&tracee, data)?,
             // 获取信号信息
             PtraceRequest::Getsiginfo => Self::handle_get_siginfo(&tracee, data)?,
+            // 设置信号信息
+            PtraceRequest::Setsiginfo => Self::handle_set_siginfo(&tracee, data)?,
+            // 获取 signal mask
+            PtraceRequest::Getsigmask => Self::handle_get_sigmask(&tracee, addr, data)?,
+            // 设置 signal mask
+            PtraceRequest::Setsigmask => Self::handle_set_sigmask(&tracee, addr, data)?,
             // 获取系统调用停止信息
             PtraceRequest::Getsyscallinfo => Self::handle_get_syscall_info(&tracee, addr, data)?,
             // PTRACE_SEIZE：现代 API，不发送 SIGSTOP

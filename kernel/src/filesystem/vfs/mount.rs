@@ -244,6 +244,7 @@ pub struct MountFS {
     /// 这是为了支持container场景：bind mount /tmp/xxx/rootfs 后，
     /// pivot_root到这个mount时，看到的应该是rootfs的内容，而不是底层tmpfs的根。
     bind_target_root: RwSem<Option<Arc<MountFSInode>>>,
+    mount_source: RwSem<Option<String>>,
 }
 
 impl Debug for MountFS {
@@ -287,6 +288,7 @@ impl MountFS {
         propagation: Arc<MountPropagation>,
         mnt_ns: Option<&Arc<MntNamespace>>,
         mount_flags: MountFlags,
+        mount_source: Option<String>,
     ) -> Arc<Self> {
         let result = Arc::new_cyclic(|self_ref| MountFS {
             inner_filesystem,
@@ -298,6 +300,7 @@ impl MountFS {
             mount_id: MountId::alloc(),
             mount_flags,
             bind_target_root: RwSem::new(None),
+            mount_source: RwSem::new(mount_source),
         });
 
         if let Some(mnt_ns) = mnt_ns {
@@ -310,6 +313,7 @@ impl MountFS {
     pub fn deepcopy(&self, self_mountpoint: Option<Arc<MountFSInode>>) -> Arc<Self> {
         // Clone propagation state for the new mount copy
         let new_propagation = self.propagation.clone_for_copy();
+        let mount_source = self.mount_source();
 
         let mountfs = Arc::new_cyclic(|self_ref| MountFS {
             inner_filesystem: self.inner_filesystem.clone(),
@@ -321,6 +325,7 @@ impl MountFS {
             mount_id: MountId::alloc(),
             mount_flags: self.mount_flags,
             bind_target_root: RwSem::new(None),
+            mount_source: RwSem::new(mount_source),
         });
 
         return mountfs;
@@ -404,6 +409,14 @@ impl MountFS {
 
     pub fn fs_type(&self) -> &str {
         self.inner_filesystem.name()
+    }
+
+    pub fn mount_source(&self) -> Option<String> {
+        self.mount_source.read().clone()
+    }
+
+    pub fn set_mount_source(&self, mount_source: Option<String>) {
+        *self.mount_source.write() = mount_source;
     }
 
     #[inline(never)]
@@ -1061,6 +1074,7 @@ impl IndexNode for MountFSInode {
             new_propagation,
             Some(&ProcessManager::current_mntns()),
             mount_flags,
+            None,
         );
 
         // Perform all potentially-failing operations first before registering in peer group

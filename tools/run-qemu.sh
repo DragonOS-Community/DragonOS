@@ -10,6 +10,10 @@
 #
 # - AUTO_TEST: 自动测试选项
 # - SYSCALL_TEST_DIR: 系统调用测试目录
+# - DRAGONOS_VIRTIOFS_ENABLE: 是否启用 virtiofs（1启用，默认0）
+# - DRAGONOS_VIRTIOFS_SOCKET: virtiofsd socket路径
+# - DRAGONOS_VIRTIOFS_TAG: virtiofs 挂载tag
+# - DRAGONOS_VIRTIOFS_ENV_FILE: virtiofs配置文件路径（默认 ${ROOT_PATH}/tools/virtiofs/env.sh）
 #
 
 check_dependencies()
@@ -99,6 +103,17 @@ QEMU_DISK_IMAGE="../bin/${DISK_NAME}"
 QEMU_EXT4_DISK_IMAGE="../bin/${EXT4_DISK_NAME}"
 QEMU_FAT_DISK_IMAGE="../bin/${FAT_DISK_NAME}"
 QEMU_MEMORY="2G"
+PMEM_IMAGE_PATH="${PMEM_IMAGE_PATH:-}"
+PMEM_SIZE="${PMEM_SIZE:-}"
+QEMU_ENABLE_PMEM="${QEMU_ENABLE_PMEM:-false}"
+QEMU_NVDIMM_SLOTS="${QEMU_NVDIMM_SLOTS:-4}"
+QEMU_NVDIMM_MAXMEM="${QEMU_NVDIMM_MAXMEM:-4G}"
+PMEM_ENABLED=false
+PMEM_QEMU_ARGS=()
+DRAGONOS_VIRTIOFS_ENABLE=${DRAGONOS_VIRTIOFS_ENABLE:=0}
+DRAGONOS_VIRTIOFS_SOCKET=${DRAGONOS_VIRTIOFS_SOCKET:=/tmp/dragonos-virtiofsd.sock}
+DRAGONOS_VIRTIOFS_TAG=${DRAGONOS_VIRTIOFS_TAG:=hostshare}
+DRAGONOS_VIRTIOFS_ENV_FILE=${DRAGONOS_VIRTIOFS_ENV_FILE:=}
 
 # 检查必要的环境变量
 if [ -z "${ROOT_PATH}" ]; then
@@ -106,10 +121,83 @@ if [ -z "${ROOT_PATH}" ]; then
     echo "[错误] 请通过 Makefile 运行本脚本 (make qemu, make run 等)"
     exit 1
 fi
+PMEM_IMAGE_PATH="${PMEM_IMAGE_PATH:-${ROOT_PATH}/bin/pmem.img}"
 
 # 状态文件目录（优先使用环境变量，否则使用默认值）
 VMSTATE_DIR="${VMSTATE_DIR:-${ROOT_PATH}/bin/vmstate}"
 mkdir -p "${VMSTATE_DIR}"
+
+is_truthy() {
+    case "${1}" in
+        1|y|Y|yes|YES|true|TRUE|on|ON) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+detect_file_size_bytes() {
+    if size=$(stat -c%s "$1" 2>/dev/null); then
+        echo "${size}"
+        return 0
+    fi
+    if size=$(stat -f%z "$1" 2>/dev/null); then
+        echo "${size}"
+        return 0
+    fi
+    return 1
+}
+
+setup_pmem_support() {
+    PMEM_ENABLED=false
+    PMEM_QEMU_ARGS=()
+
+    if ! is_truthy "${QEMU_ENABLE_PMEM}"; then
+        return 0
+    fi
+
+    if [ "${ARCH}" != "x86_64" ]; then
+        echo "[QEMU] 错误: PMEM/NVDIMM 目前仅支持 ARCH=x86_64 (当前: ${ARCH})"
+        exit 1
+    fi
+
+    if [ ! -f "${PMEM_IMAGE_PATH}" ]; then
+        echo "[QEMU] 错误: PMEM镜像不存在: ${PMEM_IMAGE_PATH}"
+        echo "[QEMU] 请先准备只读ext4镜像文件，再启动QEMU。"
+        exit 1
+    fi
+
+    if [ ! -r "${PMEM_IMAGE_PATH}" ]; then
+        echo "[QEMU] 错误: PMEM镜像不可读: ${PMEM_IMAGE_PATH}"
+        exit 1
+    fi
+
+    case "${QEMU_NVDIMM_SLOTS}" in
+        ''|*[!0-9]*|0)
+            echo "[QEMU] 错误: QEMU_NVDIMM_SLOTS 必须是正整数 (当前: ${QEMU_NVDIMM_SLOTS})"
+            exit 1
+            ;;
+    esac
+
+    if [ -z "${QEMU_NVDIMM_MAXMEM}" ]; then
+        echo "[QEMU] 错误: QEMU_NVDIMM_MAXMEM 不能为空"
+        exit 1
+    fi
+
+    if [ -z "${PMEM_SIZE}" ]; then
+        PMEM_SIZE=$(detect_file_size_bytes "${PMEM_IMAGE_PATH}") || {
+            echo "[QEMU] 错误: 无法自动获取PMEM镜像大小，请显式设置 PMEM_SIZE"
+            exit 1
+        }
+    fi
+
+    PMEM_ENABLED=true
+    PMEM_QEMU_ARGS=(
+        -object "memory-backend-file,id=pmem0,mem-path=${PMEM_IMAGE_PATH},size=${PMEM_SIZE},share=on,readonly=on"
+        -device "nvdimm,id=nv0,memdev=pmem0,unarmed=on"
+    )
+    echo "[QEMU] PMEM已启用: image=${PMEM_IMAGE_PATH}, size=${PMEM_SIZE}, slots=${QEMU_NVDIMM_SLOTS}, maxmem=${QEMU_NVDIMM_MAXMEM}"
+}
+
+setup_pmem_support
 
 # 分配可用端口的函数
 find_free_port() {
@@ -120,6 +208,104 @@ find_free_port() {
         port=$((port + 1))
     done
     echo $port
+}
+
+# vsock CID 注册表（用于避免并发启动时分配重复CID）
+VSOCK_CID_REGISTRY="/tmp/dragonos-vsock-cid-registry"
+VSOCK_CID_LOCKDIR="/tmp/dragonos-vsock-cid-lock"
+
+acquire_vsock_lock() {
+    local retries=200
+    local i=0
+    while ! mkdir "${VSOCK_CID_LOCKDIR}" 2>/dev/null; do
+        i=$((i + 1))
+        if [ "${i}" -ge "${retries}" ]; then
+            echo "[WARN] failed to acquire vsock CID lock; skip vsock device"
+            return 1
+        fi
+        sleep 0.05
+    done
+    return 0
+}
+
+release_vsock_lock() {
+    rmdir "${VSOCK_CID_LOCKDIR}" 2>/dev/null || true
+}
+
+cleanup_stale_vsock_registry() {
+    local tmp_file
+    tmp_file=$(mktemp)
+    if [ -f "${VSOCK_CID_REGISTRY}" ]; then
+        while IFS=' ' read -r cid owner_pid owner_vmstate; do
+            if [ -z "${cid}" ] || [ -z "${owner_pid}" ]; then
+                continue
+            fi
+            if kill -0 "${owner_pid}" 2>/dev/null; then
+                printf '%s %s %s\n' "${cid}" "${owner_pid}" "${owner_vmstate}" >> "${tmp_file}"
+            fi
+        done < "${VSOCK_CID_REGISTRY}"
+    fi
+    mv "${tmp_file}" "${VSOCK_CID_REGISTRY}"
+}
+
+is_vsock_cid_in_registry() {
+    local cid="$1"
+    grep -q "^${cid} " "${VSOCK_CID_REGISTRY}" 2>/dev/null
+}
+
+generate_random_vsock_cid() {
+    # 有效CID范围: [3, 2147483647]
+    echo $(( (RANDOM << 16 | RANDOM) % 2147483645 + 3 ))
+}
+
+resolve_vsock_guest_cid() {
+    local requested="$1"
+    local chosen=""
+    local attempts=128
+    local i=0
+
+    if ! acquire_vsock_lock; then
+        return 1
+    fi
+
+    cleanup_stale_vsock_registry
+
+    if [ -z "${requested}" ] || [ "${requested}" = "random" ]; then
+        while [ "${i}" -lt "${attempts}" ]; do
+            chosen=$(generate_random_vsock_cid)
+            if [ "${chosen}" != "2" ] && ! is_vsock_cid_in_registry "${chosen}"; then
+                break
+            fi
+            i=$((i + 1))
+        done
+        if [ "${i}" -ge "${attempts}" ]; then
+            release_vsock_lock
+            echo "[WARN] failed to allocate unique random vsock CID; skip vsock device"
+            return 1
+        fi
+    else
+        if ! [[ "${requested}" =~ ^[0-9]+$ ]]; then
+            release_vsock_lock
+            echo "[WARN] invalid QEMU_VSOCK_GUEST_CID='${requested}'; skip vsock device"
+            return 1
+        fi
+        if [ "${requested}" -le 2 ]; then
+            release_vsock_lock
+            echo "[WARN] guest CID must be > 2; skip vhost-vsock-pci"
+            return 1
+        fi
+        if is_vsock_cid_in_registry "${requested}"; then
+            release_vsock_lock
+            echo "[WARN] guest CID=${requested} already in use by another DragonOS instance; skip vhost-vsock-pci"
+            return 1
+        fi
+        chosen="${requested}"
+    fi
+
+    QEMU_VSOCK_GUEST_CID="${chosen}"
+    printf '%s %s %s\n' "${QEMU_VSOCK_GUEST_CID}" "$$" "${VMSTATE_DIR}" >> "${VSOCK_CID_REGISTRY}"
+    release_vsock_lock
+    return 0
 }
 
 # 先分配网络端口
@@ -142,8 +328,23 @@ QEMU_DRIVE_ARGS=(-drive "id=disk,file=${QEMU_DISK_IMAGE},if=none,format=raw")
 QEMU_ACCEL_ARGS=()
 QEMU_DEVICE_ARGS=()
 QEMU_DISPLAY_ARGS=()
+QEMU_OBJECT_ARGS=()
+QEMU_NUMA_ARGS=()
+QEMU_CHARDEV_ARGS=()
 QEMU_ARGS=()
-# QEMU_ARGUMENT+=" -S "
+
+# vsock 配置：
+# - QEMU_ENABLE_VSOCK=1: 默认启用，条件不满足时自动降级跳过
+# - QEMU_VSOCK_GUEST_CID: guest CID；默认 random（可显式指定 >2 的数字）
+QEMU_ENABLE_VSOCK=1
+QEMU_VSOCK_GUEST_CID=${QEMU_VSOCK_GUEST_CID:=random}
+QEMU_ATTACH_VSOCK=0
+# 推荐 non-transitional 模型，PCI device id 对应 0x1053 (VSOCK)。
+QEMU_VSOCK_DEVICE_MODEL="vhost-vsock-pci-non-transitional"
+# GDB调试支持：
+# - QEMU_GDB_WAIT=1: QEMU 启动后立即暂停CPU（等同 -S），等待 GDB/monitor 手动继续
+# - QEMU_GDB_WAIT=0: 默认不暂停
+QEMU_GDB_WAIT=0
 
 if [ -f "${QEMU_EXT4_DISK_IMAGE}" ]; then
   QEMU_DRIVE_ARGS+=(-drive "id=ext4disk,file=${QEMU_EXT4_DISK_IMAGE},if=none,format=raw")
@@ -175,23 +376,24 @@ VIRTIO_BLK_DEVICE=true
 
 # 如果qemu_accel不为空
 if [ -n "${qemu_accel}" ]; then
-    QEMU_ACCEL_ARGS=(-machine "accel=${qemu_accel}")
   if [ "${qemu_accel}" == "kvm" ]; then
     QEMU_ACCEL_ARGS+=(-enable-kvm)
   fi
 fi
 
 if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
-    # 根据加速方式设置机器参数
-    # 仅在KVM加速时禁用HPET，以使用KVM clock作为时钟源
-    # 非KVM加速（如TCG）时保留HPET，因为kvm-clock不可用
-    if [ "${qemu_accel}" == "kvm" ]; then
-        # KVM加速：禁用HPET，使用kvm-clock（性能更好且延迟更低）
-        QEMU_MACHINE_ARGS=(-machine "q35,hpet=off")
-    else
-        # 非KVM加速
-        QEMU_MACHINE_ARGS=(-machine q35)
+    qemu_machine="q35"
+    if [ -n "${qemu_accel}" ]; then
+        qemu_machine+=",accel=${qemu_accel}"
     fi
+    # KVM加速时禁用HPET，使用kvm-clock（性能更好且延迟更低）
+    if [ "${qemu_accel}" == "kvm" ]; then
+        qemu_machine+=",hpet=off"
+    fi
+    if [ "${PMEM_ENABLED}" == "true" ]; then
+        qemu_machine+=",nvdimm=on"
+    fi
+    QEMU_MACHINE_ARGS=(-machine "${qemu_machine}")
     # 根据加速方式选择CPU型号：KVM使用host，TCG使用IvyBridge
     cpu_model=$([ "${qemu_accel}" == "kvm" ] && echo "host" || echo "IvyBridge")
     if [ -n "${allflags}" ]; then
@@ -212,6 +414,24 @@ if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
     fi
     if [ -f "${QEMU_FAT_DISK_IMAGE}" ]; then
       QEMU_DEVICE_DISK_ARGS+=(-device virtio-blk-pci,drive=fatdisk)
+    fi
+
+    # 默认启用 vsock；若宿主环境不满足条件则降级为跳过该设备。
+    if [ "${QEMU_ENABLE_VSOCK}" = "1" ]; then
+      if [ "${ARCH}" != "x86_64" ]; then
+        echo "[WARN] vsock enabled but unsupported arch (${ARCH}); skip vsock device"
+      elif [ ! -e /dev/vhost-vsock ]; then
+        echo "[WARN] /dev/vhost-vsock not found; skip vsock device"
+        echo "[WARN] Hint: sudo modprobe vhost_vsock"
+      elif ! "${QEMU}" -device help 2>/dev/null | grep -q "${QEMU_VSOCK_DEVICE_MODEL}"; then
+        echo "[WARN] QEMU device model '${QEMU_VSOCK_DEVICE_MODEL}' not supported; skip vsock device"
+      elif ! resolve_vsock_guest_cid "${QEMU_VSOCK_GUEST_CID}"; then
+        :
+      else
+        QEMU_ATTACH_VSOCK=1
+      fi
+    else
+      echo "[INFO] vsock disabled by script config (QEMU_ENABLE_VSOCK=0)"
     fi
 
 elif [ ${ARCH} == "riscv64" ]; then
@@ -294,6 +514,43 @@ setup_kernel_init_program
 # 从环境变量设置内核命令行参数
 setup_kernel_cmdline_from_env
 
+if [ "${DRAGONOS_VIRTIOFS_ENABLE}" == "1" ]; then
+    if [ "${ARCH}" != "x86_64" ]; then
+        echo "[错误] virtiofs临时运行支持当前仅实现x86_64"
+        exit 1
+    fi
+
+    if [ -z "${DRAGONOS_VIRTIOFS_ENV_FILE}" ]; then
+        DRAGONOS_VIRTIOFS_ENV_FILE="${ROOT_PATH}/tools/virtiofs/env.sh"
+    fi
+
+    if [ -f "${DRAGONOS_VIRTIOFS_ENV_FILE}" ]; then
+        # shellcheck source=/dev/null
+        . "${DRAGONOS_VIRTIOFS_ENV_FILE}"
+        if [ "${DRAGONOS_VIRTIOFS_SOCKET}" = "/tmp/dragonos-virtiofsd.sock" ] && [ -n "${SOCKET_PATH:-}" ]; then
+            DRAGONOS_VIRTIOFS_SOCKET="${SOCKET_PATH}"
+        fi
+        if [ "${DRAGONOS_VIRTIOFS_TAG}" = "hostshare" ] && [ -n "${VIRTIOFS_TAG:-}" ]; then
+            DRAGONOS_VIRTIOFS_TAG="${VIRTIOFS_TAG}"
+        fi
+    fi
+
+    if [ ! -S "${DRAGONOS_VIRTIOFS_SOCKET}" ]; then
+        echo "[错误] 未检测到virtiofsd socket: ${DRAGONOS_VIRTIOFS_SOCKET}"
+        echo "[提示] 请先在另一个终端启动: tools/virtiofs/start_virtiofsd.sh"
+        exit 1
+    fi
+
+    echo "[INFO] 启用virtiofs: tag=${DRAGONOS_VIRTIOFS_TAG}, socket=${DRAGONOS_VIRTIOFS_SOCKET}"
+
+    QEMU_OBJECT_ARGS+=(
+      -object "memory-backend-memfd,id=mem,size=${QEMU_MEMORY},share=on"
+    )
+    QEMU_NUMA_ARGS+=(-numa "node,memdev=mem")
+    QEMU_CHARDEV_ARGS+=(-chardev "socket,id=char_virtiofs,path=${DRAGONOS_VIRTIOFS_SOCKET}")
+    QEMU_DEVICE_ARGS+=(-device "vhost-user-fs-pci,chardev=char_virtiofs,tag=${DRAGONOS_VIRTIOFS_TAG}")
+fi
+
 
 if [ ${QEMU_NOGRAPHIC} == true ]; then
     QEMU_SERIAL_ARGS=(-serial chardev:mux -monitor chardev:mux -chardev "stdio,id=mux,mux=on,signal=off,logfile=${QEMU_SERIAL_LOG_FILE}")
@@ -332,12 +589,25 @@ QEMU_DEVICE_ARGS+=(
   -usb
   -device "qemu-xhci,id=xhci,p2=8,p3=4"
 ) 
+
+if [ "${QEMU_ATTACH_VSOCK}" = "1" ]; then
+  QEMU_DEVICE_ARGS+=(-device "${QEMU_VSOCK_DEVICE_MODEL},guest-cid=${QEMU_VSOCK_GUEST_CID}")
+  echo "[INFO] enable vsock device: ${QEMU_VSOCK_DEVICE_MODEL},guest-cid=${QEMU_VSOCK_GUEST_CID}"
+fi
+
+QEMU_DEVICE_ARGS+=("${PMEM_QEMU_ARGS[@]}")
 # E1000E
 # QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -netdev user,id=hostnet0,hostfwd=tcp::12580-:12580 -net nic,model=e1000e,netdev=hostnet0,id=net0 -netdev user,id=hostnet1,hostfwd=tcp::12581-:12581 -device virtio-net-pci,vectors=5,netdev=hostnet1,id=net1 -usb -device qemu-xhci,id=xhci,p2=8,p3=4 " 
 
 
+if [ "${PMEM_ENABLED}" == "true" ]; then
+  QEMU_MEMORY_ARG="${QEMU_MEMORY},slots=${QEMU_NVDIMM_SLOTS},maxmem=${QEMU_NVDIMM_MAXMEM}"
+else
+  QEMU_MEMORY_ARG="${QEMU_MEMORY}"
+fi
+
 QEMU_ARGS+=(
-  -m "${QEMU_MEMORY}"
+  -m "${QEMU_MEMORY_ARG}"
   -smp "${QEMU_SMP}"
   -boot order=d
 )
@@ -349,6 +619,9 @@ QEMU_ARGS+=(
   "${QEMU_MACHINE_ARGS[@]}"
   "${QEMU_CPU_ARGS[@]}"
   "${QEMU_RTC_ARGS[@]}"
+  "${QEMU_OBJECT_ARGS[@]}"
+  "${QEMU_NUMA_ARGS[@]}"
+  "${QEMU_CHARDEV_ARGS[@]}"
   "${QEMU_SERIAL_ARGS[@]}"
   "${QEMU_DRIVE_ARGS[@]}"
   "${QEMU_DEVICE_ARGS[@]}"
@@ -390,8 +663,13 @@ install_riscv_uboot()
 
 if [ $flag_can_run -eq 1 ]; then
 
-  # 清理旧的PID文件
+  # 清理旧的状态文件
   rm -f "${VMSTATE_DIR}/pid"
+  rm -f "${VMSTATE_DIR}/vsock_cid"
+
+  if [ "${QEMU_ATTACH_VSOCK}" = "1" ]; then
+    echo "${QEMU_VSOCK_GUEST_CID}" > "${VMSTATE_DIR}/vsock_cid"
+  fi
 
   # 启动QEMU的函数
   launch_qemu() {

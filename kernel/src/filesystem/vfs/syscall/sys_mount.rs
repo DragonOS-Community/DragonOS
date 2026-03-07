@@ -352,7 +352,9 @@ fn do_new_mount(
 
     // 允许在已有挂载点上再次挂载（符合 Linux 允许叠加挂载的语义）
     // MountList::insert 会替换同一路径的记录，无需提前返回 EBUSY。
-    return target_inode.mount(fs, mount_flags);
+    let new_mount = target_inode.mount(fs, mount_flags)?;
+    new_mount.set_mount_source(Some(source));
+    Ok(new_mount)
 }
 #[inline(never)]
 fn copy_mount_string(raw: Option<*const u8>) -> Result<Option<String>, SystemError> {
@@ -478,6 +480,8 @@ fn do_bind_mount(
     //     target_mfs.fs_type()
     // );
 
+    target_mfs.set_mount_source(Some(source_path.clone()));
+
     // 设置 bind_target_root
     // DragonOS 的 bind mount 与 Linux 有差异：
     // - Linux: bind mount 创建的挂载以 bind target 目录为根
@@ -510,6 +514,7 @@ fn do_bind_mount(
         let pcb = ProcessManager::current_pcb();
         pcb.fs_struct_mut().set_root(mnt_ns.root_inode());
     }
+
 
     // If MS_REC is set, recursively bind all submounts from source to target
     if flags.contains(MountFlags::REC) {
@@ -684,13 +689,22 @@ fn do_recursive_bind_mount(
         let child_inner_fs = info.source_mfs.inner_filesystem();
 
         // Create the bind mount
-        if let Err(e) = target_child_inode.mount(child_inner_fs, MountFlags::empty()) {
-            log::warn!(
-                "do_recursive_bind_mount: failed to mount at {}: {:?}",
-                target_child_path,
-                e
-            );
-            continue;
+        match target_child_inode.mount(child_inner_fs, MountFlags::empty()) {
+            Ok(new_child_mnt) => {
+                let source = info
+                    .source_mfs
+                    .mount_source()
+                    .unwrap_or_else(|| String::from(child_mount_path.as_str()));
+                new_child_mnt.set_mount_source(Some(source));
+            }
+            Err(e) => {
+                log::warn!(
+                    "do_recursive_bind_mount: failed to mount at {}: {:?}",
+                    target_child_path,
+                    e
+                );
+                continue;
+            }
         }
 
         // Add this submount's children to the queue

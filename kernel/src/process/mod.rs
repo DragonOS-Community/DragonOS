@@ -684,6 +684,7 @@ impl ProcessManager {
             }
 
             pcb.exit_files();
+            pcb.exit_timers();
             // TODO 由于未实现进程组，tty记录的前台进程组等于当前进程，故退出前要置空
             // 后续相关逻辑需要在SYS_EXIT_GROUP系统调用中实现
             if let Some(tty) = pcb.sig_info_irqsave().tty() {
@@ -1136,6 +1137,10 @@ pub struct ProcessControlBlock {
     /// prctl(PR_SET/GET_NO_NEW_PRIVS) 状态：线程级（task）语义。
     no_new_privs: AtomicBool,
 
+    /// prctl(PR_SET/GET_KEEPCAPS) 状态：线程级（task）语义。
+    /// 当为 true 时，进程改变 UID/GID 后会保留 capabilities。
+    keepcaps: AtomicBool,
+
     /// prctl(PR_SET/GET_DUMPABLE) 状态。
     /// Linux: 0=SUID_DUMP_DISABLE, 1=SUID_DUMP_USER；2(SUID_DUMP_ROOT) 不允许通过 PR_SET_DUMPABLE 设置。
     dumpable: AtomicU8,
@@ -1294,6 +1299,7 @@ impl ProcessControlBlock {
                 pdeath_signal: AtomicSignal::new(Signal::INVALID),
 
                 no_new_privs: AtomicBool::new(false),
+                keepcaps: AtomicBool::new(false),
                 // 默认设置为 SUID_DUMP_USER(=1)，满足 gVisor 的 SetGetDumpability 预期。
                 dumpable: AtomicU8::new(1),
                 parent_pcb: RwLock::new(ppcb.clone()),
@@ -1543,6 +1549,16 @@ impl ProcessControlBlock {
         if value {
             self.no_new_privs.store(true, Ordering::SeqCst);
         }
+    }
+
+    #[inline(always)]
+    pub fn keepcaps(&self) -> bool {
+        self.keepcaps.load(Ordering::SeqCst)
+    }
+
+    #[inline(always)]
+    pub fn set_keepcaps(&self, value: bool) {
+        self.keepcaps.store(value, Ordering::SeqCst);
     }
 
     #[inline(always)]
@@ -1962,6 +1978,44 @@ impl ProcessControlBlock {
 
     pub fn posix_timers_irqsave(&self) -> SpinLockGuard<'_, posix_timer::ProcessPosixTimers> {
         return self.posix_timers.lock_irqsave();
+    }
+
+    /// 清理当前进程/线程的定时器
+    ///
+    /// 参考 Linux do_exit() 中的定时器清理逻辑：
+    /// ```c
+    /// if (group_dead) {
+    ///     hrtimer_cancel(&tsk->signal->real_timer);
+    ///     exit_itimers(tsk);
+    /// }
+    /// ```
+    ///
+    /// DragonOS 中 alarm_timer 是 per-PCB 的，因此每个线程退出时
+    /// 都需要取消自己的 alarm timer。itimers 和 posix_timers 仅在
+    /// 线程组 leader 退出时（group_dead）清理。
+    fn exit_timers(&self) {
+        // 1. 取消当前线程的 alarm timer
+        if let Some(alarm) = self.alarm_timer.lock_irqsave().take() {
+            alarm.cancel();
+        }
+
+        let group_dead = self.is_thread_group_leader();
+        if group_dead {
+            // 2. 取消 ITIMER_REAL
+            if let Some(real_itimer) = self.itimers.lock_irqsave().real.take() {
+                real_itimer.timer.cancel();
+            }
+
+            // 3. 删除所有 POSIX interval timers
+            let mut posix_timers = self.posix_timers.lock_irqsave();
+            let timer_ids: alloc::vec::Vec<i32> = posix_timers.timer_ids().collect();
+            let self_arc = self.self_ref.upgrade();
+            if let Some(ref pcb) = self_arc {
+                for id in timer_ids {
+                    let _ = posix_timers.delete(pcb, id);
+                }
+            }
+        }
     }
 
     /// Exit fd table when process exit

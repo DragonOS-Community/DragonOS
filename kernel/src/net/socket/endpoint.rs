@@ -1,7 +1,9 @@
 use crate::{
     net::{
         posix::SockAddr,
-        socket::{netlink::addr::NetlinkSocketAddr, unix::UnixEndpoint},
+        socket::{
+            netlink::addr::NetlinkSocketAddr, unix::UnixEndpoint, vsock::addr::VsockEndpoint,
+        },
     },
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
@@ -20,6 +22,8 @@ pub enum Endpoint {
     Unix(UnixEndpoint),
     /// Netlink端点
     Netlink(NetlinkSocketAddr),
+    /// Vsock端点
+    Vsock(VsockEndpoint),
 }
 
 /// @brief 链路层端点 (对应 sockaddr_ll)
@@ -101,6 +105,7 @@ impl Endpoint {
             Endpoint::LinkLayer(_) => Ok(SockAddr::from(self.clone()).len()?),
             Endpoint::Ip(_) => Ok(SockAddr::from(self.clone()).len()?),
             Endpoint::Netlink(_) => Ok(SockAddr::from(self.clone()).len()?),
+            Endpoint::Vsock(_) => Ok(SockAddr::from(self.clone()).len()?),
             Endpoint::Unix(unix) => {
                 // Linux AF_UNIX getsockname/getpeername length semantics depend on the
                 // effective address length, not always sizeof(sockaddr_un).

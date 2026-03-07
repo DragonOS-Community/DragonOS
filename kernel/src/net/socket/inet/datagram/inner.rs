@@ -646,14 +646,17 @@ impl BoundUdp {
                         // log::debug!("try_send: send successful");
                         Ok(buf.len())
                     }
+                    Err(smoltcp::socket::udp::SendError::BufferFull) => {
+                        Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+                    }
                     Err(_e) => {
                         // log::debug!("try_send: send failed: {:?}", _e);
                         Err(SystemError::ENOBUFS)
                     }
                 }
             } else {
-                // log::debug!("try_send: can_send=false, returning ENOBUFS");
-                Err(SystemError::ENOBUFS)
+                // log::debug!("try_send: can_send=false, returning EAGAIN");
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
             }
         })
     }

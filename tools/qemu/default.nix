@@ -5,6 +5,9 @@
   kernel,
   testOpt,
   debug ? false,
+  enableVsock ? true,
+  vsockGuestCid ? "random",
+  vsockDeviceModel ? "vhost-vsock-pci-non-transitional",
   vmstateDir ? null,
   preferSystemQemu ? false,
 }:
@@ -163,6 +166,9 @@ let
       vmstateDirStr = if vmstateDir != null then vmstateDir else "";
       hasVmstateDir = vmstateDir != null;
       preferSystemQemuStr = if preferSystemQemu then "true" else "false";
+      enableVsockStr = if enableVsock then "true" else "false";
+      vsockGuestCidStr = builtins.toString vsockGuestCid;
+      vsockDeviceModelStr = vsockDeviceModel;
 
     in
     pkgs.writeScriptBin name ''
@@ -197,12 +203,134 @@ let
       ACCEL="tcg"
       if [ -e /dev/kvm ] && [ -w /dev/kvm ]; then ACCEL="kvm"; fi
 
+      VSOCK_CID_REGISTRY="/tmp/dragonos-vsock-cid-registry"
+      VSOCK_CID_LOCKDIR="/tmp/dragonos-vsock-cid-lock"
+
+      acquire_vsock_lock() {
+        local retries=200
+        local i=0
+        while ! mkdir "$VSOCK_CID_LOCKDIR" 2>/dev/null; do
+          i=$((i + 1))
+          if [ "$i" -ge "$retries" ]; then
+            echo "[WARN] failed to acquire vsock CID lock; skip vsock device"
+            return 1
+          fi
+          sleep 0.05
+        done
+        return 0
+      }
+
+      release_vsock_lock() {
+        rmdir "$VSOCK_CID_LOCKDIR" 2>/dev/null || true
+      }
+
+      cleanup_stale_vsock_registry() {
+        local tmp_file
+        tmp_file=$(mktemp)
+        if [ -f "$VSOCK_CID_REGISTRY" ]; then
+          while IFS=' ' read -r cid owner_pid owner_vmstate; do
+            if [ -z "$cid" ] || [ -z "$owner_pid" ]; then
+              continue
+            fi
+            if kill -0 "$owner_pid" 2>/dev/null; then
+              printf '%s %s %s\n' "$cid" "$owner_pid" "$owner_vmstate" >> "$tmp_file"
+            fi
+          done < "$VSOCK_CID_REGISTRY"
+        fi
+        mv "$tmp_file" "$VSOCK_CID_REGISTRY"
+      }
+
+      is_vsock_cid_in_registry() {
+        local cid="$1"
+        grep -q "^$cid " "$VSOCK_CID_REGISTRY" 2>/dev/null
+      }
+
+      generate_random_vsock_cid() {
+        # 有效CID范围: [3, 2147483647]
+        echo $(( (RANDOM << 16 | RANDOM) % 2147483645 + 3 ))
+      }
+
+      resolve_vsock_guest_cid() {
+        local requested="$1"
+        local chosen=""
+        local attempts=128
+        local i=0
+
+        if ! acquire_vsock_lock; then
+          return 1
+        fi
+
+        cleanup_stale_vsock_registry
+
+        if [ -z "$requested" ] || [ "$requested" = "random" ]; then
+          while [ "$i" -lt "$attempts" ]; do
+            chosen=$(generate_random_vsock_cid)
+            if [ "$chosen" != "2" ] && ! is_vsock_cid_in_registry "$chosen"; then
+              break
+            fi
+            i=$((i + 1))
+          done
+          if [ "$i" -ge "$attempts" ]; then
+            release_vsock_lock
+            echo "[WARN] failed to allocate unique random vsock CID; skip vsock device"
+            return 1
+          fi
+        else
+          if ! [[ "$requested" =~ ^[0-9]+$ ]]; then
+            release_vsock_lock
+            echo "[WARN] invalid vsockGuestCid='$requested'; skip vsock device"
+            return 1
+          fi
+          if [ "$requested" -le 2 ]; then
+            release_vsock_lock
+            echo "[WARN] vsock guest CID must be > 2 (host CID=2); skip"
+            return 1
+          fi
+          if is_vsock_cid_in_registry "$requested"; then
+            release_vsock_lock
+            echo "[WARN] vsock guest CID=$requested already in use by another DragonOS instance; skip"
+            return 1
+          fi
+          chosen="$requested"
+        fi
+
+        VSOCK_GUEST_CID="$chosen"
+        printf '%s %s %s\n' "$VSOCK_GUEST_CID" "$$" "$VMSTATE_DIR" >> "$VSOCK_CID_REGISTRY"
+        release_vsock_lock
+        return 0
+      }
+
+      VSOCK_ARGS=()
+      VSOCK_GUEST_CID=""
+      # 默认启用 vsock；若条件不满足则自动降级为跳过该设备。
+      if [ "${enableVsockStr}" = "true" ]; then
+        if [ "${arch}" != "x86_64" ]; then
+          echo "[WARN] vsock enabled but unsupported arch (${arch}); skip"
+        elif [ ! -e /dev/vhost-vsock ]; then
+          echo "[WARN] /dev/vhost-vsock not found; skip vsock device"
+          echo "[WARN] Hint: sudo modprobe vhost_vsock"
+        elif ! ${qemuBin} -device help 2>/dev/null | grep -q "${vsockDeviceModelStr}"; then
+          echo "[WARN] QEMU device model '${vsockDeviceModelStr}' not supported; skip vsock device"
+        elif ! resolve_vsock_guest_cid "${vsockGuestCidStr}"; then
+          :
+        else
+          VSOCK_ARGS=( "-device" "${vsockDeviceModelStr},guest-cid=$VSOCK_GUEST_CID" )
+          echo "[INFO] enable vsock device: ${vsockDeviceModelStr},guest-cid=$VSOCK_GUEST_CID"
+        fi
+      else
+        echo "[INFO] vsock disabled by nix config (enableVsock=false)"
+      fi
+
       ${
         if hasVmstateDir then
           ''
             VMSTATE_DIR="${vmstateDirStr}"
             mkdir -p "$VMSTATE_DIR"
+            rm -f "$VMSTATE_DIR/pid" "$VMSTATE_DIR/vsock_cid"
             echo "$HOST_PORT" > "$VMSTATE_DIR/port"
+            if [ -n "$VSOCK_GUEST_CID" ]; then
+              echo "$VSOCK_GUEST_CID" > "$VMSTATE_DIR/vsock_cid"
+            fi
           ''
         else
           ""
@@ -210,7 +338,7 @@ let
 
       cleanup() {
         sudo rm -f /dev/shm/${baseConfig.shmId}
-        ${if hasVmstateDir then ''rm -f "$VMSTATE_DIR/pid"'' else ""}
+        ${if hasVmstateDir then ''rm -f "$VMSTATE_DIR/pid" "$VMSTATE_DIR/vsock_cid"'' else ""}
       }
       trap cleanup EXIT
       # FIXED: 既然用了 sudo 运行 qemu，这里创建 shm 也需要权限，
@@ -239,6 +367,7 @@ let
       echo -e "Boot Args: ''${BOOT_ARGS[*]}"
       echo -e "Disk Args: ''${DISK_ARGS[*]}"
       echo -e "Net Args: ''${NET_ARGS[*]}"
+      echo -e "Vsock Args: ''${VSOCK_ARGS[*]}"
       echo -e "Host Port: $HOST_PORT"
       echo -e "=================================================================="
       echo ""
@@ -253,13 +382,13 @@ let
           ''
             sudo bash -c 'pidfile="$1"; shift; echo $$ > "$pidfile"; exec "$@"' bash "$VMSTATE_DIR/pid" ${qemuBin} ${qemuFlagsStr} "''${NET_ARGS[@]}" ${
               if qemuFirmware != null then "-L ${qemuFirmware}" else ""
-            } "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "$@"
+            } "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "''${VSOCK_ARGS[@]}" "$@"
           ''
         else
           ''
             sudo ${qemuBin} ${qemuFlagsStr} "''${NET_ARGS[@]}" ${
               if qemuFirmware != null then "-L ${qemuFirmware}" else ""
-            } "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "$@"
+            } "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "''${VSOCK_ARGS[@]}" "$@"
           ''
       }
     '';

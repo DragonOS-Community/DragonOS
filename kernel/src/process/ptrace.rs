@@ -38,9 +38,13 @@ pub enum PtraceRequest {
     Attach = 16,
     Detach = 17,
     Syscall = 24,
+    Sysemu = 31,
+    SysemuSinglestep = 32,
     Setoptions = 0x4200,
     Getsiginfo = 0x4202,
     Setsiginfo = 0x4203,
+    Getregset = 0x4204,
+    Setregset = 0x4205,
     Getsigmask = 0x420a,
     Setsigmask = 0x420b,
     Getsyscallinfo = 0x420e,
@@ -376,13 +380,35 @@ pub fn ptrace_signal(
 }
 
 impl ProcessControlBlock {
-    fn tracee_trap_frame_ptr(&self) -> *mut TrapFrame {
-        let kstack = self.kernel_stack();
-        let trap_frame_ptr = kstack.stack_max_address().data() - size_of::<TrapFrame>();
+    fn trap_frame_ptr_on_stack(stack: &crate::process::KernelStack) -> *mut TrapFrame {
+        let trap_frame_ptr = stack.stack_max_address().data() - size_of::<TrapFrame>();
         trap_frame_ptr as *mut TrapFrame
     }
 
-    fn tracee_trap_frame(&self) -> &TrapFrame {
+    pub(crate) fn tracee_trap_frame_ptr(&self) -> *mut TrapFrame {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let saved_rsp = self.arch_info_irqsave().rsp();
+
+            let syscall_stack = self.syscall_stack();
+            let syscall_start = syscall_stack.start_address().data();
+            let syscall_end = syscall_stack.stack_max_address().data();
+            if (syscall_start..syscall_end).contains(&saved_rsp) {
+                return Self::trap_frame_ptr_on_stack(&syscall_stack);
+            }
+
+            let kernel_stack = self.kernel_stack();
+            return Self::trap_frame_ptr_on_stack(&kernel_stack);
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let kernel_stack = self.kernel_stack();
+            Self::trap_frame_ptr_on_stack(&kernel_stack)
+        }
+    }
+
+    pub(crate) fn tracee_trap_frame(&self) -> &TrapFrame {
         unsafe { &*self.tracee_trap_frame_ptr().cast_const() }
     }
 
@@ -401,8 +427,12 @@ impl ProcessControlBlock {
     /// 移除ptrace跟踪器
     pub fn clear_tracer(&self) {
         self.ptrace_state.lock().tracer = None;
-        self.flags()
-            .remove(ProcessFlags::PTRACED | ProcessFlags::TRACE_SYSCALL);
+        self.flags().remove(
+            ProcessFlags::PTRACED
+                | ProcessFlags::TRACE_SYSCALL
+                | ProcessFlags::TRACE_SINGLESTEP
+                | ProcessFlags::TRACE_SYSEMU,
+        );
     }
 
     /// 获取ptrace跟踪器
@@ -1054,10 +1084,21 @@ impl ProcessControlBlock {
         match request {
             // PTRACE_SYSCALL: 开启 syscall-trace，关闭 single-step
             // PTRACE_SINGLESTEP: 开启 single-step，关闭 syscall-trace
-            // PTRACE_CONT: 两者都关闭
+            // PTRACE_SYSEMU: 在 syscall-entry-stop 停住，但不真正执行 syscall
+            // PTRACE_CONT: 全部都关闭
             PtraceRequest::Syscall => {
                 self.flags().insert(ProcessFlags::TRACE_SYSCALL);
-                self.flags().remove(ProcessFlags::TRACE_SINGLESTEP);
+                self.flags()
+                    .remove(ProcessFlags::TRACE_SINGLESTEP | ProcessFlags::TRACE_SYSEMU);
+                let tracee_frame = unsafe { &mut *self.tracee_trap_frame_ptr() };
+                let ctx = kprobe::KProbeContext::from(&*tracee_frame);
+                let ip = kprobe::instruction_pointer(&ctx) as usize;
+                kprobe::clear_single_step(tracee_frame, ip);
+            }
+            PtraceRequest::Sysemu => {
+                self.flags().insert(ProcessFlags::TRACE_SYSEMU);
+                self.flags()
+                    .remove(ProcessFlags::TRACE_SYSCALL | ProcessFlags::TRACE_SINGLESTEP);
                 let tracee_frame = unsafe { &mut *self.tracee_trap_frame_ptr() };
                 let ctx = kprobe::KProbeContext::from(&*tracee_frame);
                 let ip = kprobe::instruction_pointer(&ctx) as usize;
@@ -1065,6 +1106,16 @@ impl ProcessControlBlock {
             }
             PtraceRequest::Singlestep => {
                 self.flags().insert(ProcessFlags::TRACE_SINGLESTEP);
+                self.flags()
+                    .remove(ProcessFlags::TRACE_SYSCALL | ProcessFlags::TRACE_SYSEMU);
+                let tracee_frame = unsafe { &mut *self.tracee_trap_frame_ptr() };
+                let ctx = kprobe::KProbeContext::from(&*tracee_frame);
+                let ip = kprobe::instruction_pointer(&ctx) as usize;
+                kprobe::setup_single_step(tracee_frame, ip);
+            }
+            PtraceRequest::SysemuSinglestep => {
+                self.flags()
+                    .insert(ProcessFlags::TRACE_SINGLESTEP | ProcessFlags::TRACE_SYSEMU);
                 self.flags().remove(ProcessFlags::TRACE_SYSCALL);
                 let tracee_frame = unsafe { &mut *self.tracee_trap_frame_ptr() };
                 let ctx = kprobe::KProbeContext::from(&*tracee_frame);
@@ -1072,8 +1123,11 @@ impl ProcessControlBlock {
                 kprobe::setup_single_step(tracee_frame, ip);
             }
             PtraceRequest::Cont => {
-                self.flags()
-                    .remove(ProcessFlags::TRACE_SYSCALL | ProcessFlags::TRACE_SINGLESTEP);
+                self.flags().remove(
+                    ProcessFlags::TRACE_SYSCALL
+                        | ProcessFlags::TRACE_SINGLESTEP
+                        | ProcessFlags::TRACE_SYSEMU,
+                );
                 let tracee_frame = unsafe { &mut *self.tracee_trap_frame_ptr() };
                 let ctx = kprobe::KProbeContext::from(&*tracee_frame);
                 let ip = kprobe::instruction_pointer(&ctx) as usize;

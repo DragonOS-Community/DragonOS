@@ -1116,6 +1116,8 @@ bitflags! {
         /// ptrace attach 到已停止的进程时设置，表示需要进入 ptrace stop
         /// 对标 Linux 的 JOBCTL_TRAP_STOP
         const PENDING_PTRACE_STOP = 1 << 21;
+        /// 跟踪器已发出 PTRACE_SYSEMU/PTRACE_SYSEMU_SINGLESTEP 请求
+        const TRACE_SYSEMU = 1 << 22;
     }
 }
 
@@ -1700,6 +1702,11 @@ impl ProcessControlBlock {
     #[inline(always)]
     pub fn kernel_stack(&self) -> RwLockReadGuard<'_, KernelStack> {
         return self.kernel_stack.read();
+    }
+
+    #[inline(always)]
+    pub fn syscall_stack(&self) -> RwLockReadGuard<'_, KernelStack> {
+        return self.syscall_stack.read();
     }
 
     pub unsafe fn kernel_stack_force_ref(&self) -> &KernelStack {

@@ -138,6 +138,10 @@ impl ArchPCBInfo {
         self.rbp
     }
 
+    pub fn rsp(&self) -> usize {
+        self.rsp
+    }
+
     pub unsafe fn push_to_stack(&mut self, value: usize) {
         self.rsp -= core::mem::size_of::<usize>();
         *(self.rsp as *mut usize) = value;
@@ -223,7 +227,7 @@ impl ArchPCBInfo {
 
     /// ### 初始化系统调用栈，不得与PCB内核栈冲突(即传入的应该是一个新的栈，避免栈损坏)
     pub fn init_syscall_stack(&mut self, stack: &KernelStack) {
-        self.gsdata.set_kstack(stack.stack_max_address() - 8);
+        self.gsdata.set_kstack(stack.stack_max_address());
     }
 
     pub fn fsbase(&self) -> usize {

@@ -145,16 +145,18 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
 
     let pcb = ProcessManager::current_pcb();
 
-    let needs_syscall_trace = pcb
-        .flags()
-        .contains(ProcessFlags::PTRACED | ProcessFlags::TRACE_SYSCALL);
+    let trace_flags = *pcb.flags();
+    let needs_syscall_trace = trace_flags.contains(ProcessFlags::PTRACED)
+        && trace_flags.intersects(ProcessFlags::TRACE_SYSCALL | ProcessFlags::TRACE_SYSEMU);
+    let is_sysemu = trace_flags.contains(ProcessFlags::TRACE_SYSEMU);
     if needs_syscall_trace {
+        frame.rax = SystemError::ENOSYS.to_posix_errno() as u64;
         ptrace_report_syscall_stop(&pcb, PTRACE_EVENTMSG_SYSCALL_ENTRY, pid);
 
         // 只要 syscall-entry stop 结束后已有 fatal signal pending，
         // 本次系统调用就必须取消；典型场景是 tracer 恢复时注入 SIGKILL。
-        if Signal::fatal_signal_pending(&pcb) {
-            syscall_return!(SystemError::ENOSYS.to_posix_errno() as usize, frame, show);
+        if Signal::fatal_signal_pending(&pcb) || is_sysemu {
+            syscall_return!(frame.rax, frame, show);
         }
     }
 

@@ -5,6 +5,7 @@ use crate::{
         syscall::nr::SYS_PTRACE,
         MMArch,
     },
+    filesystem::vfs::iov::IoVec,
     ipc::signal_types::{
         OriginCode, PosixSigInfo, SigChldInfo, SigCode, SigFaultInfo, SigInfo, SigType,
     },
@@ -20,7 +21,11 @@ use crate::{
 };
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::{cmp::min, slice};
 use system_error::SystemError;
+
+const NT_PRSTATUS: usize = 1;
+const X86_REGSET_WORD_SIZE: usize = core::mem::size_of::<usize>();
 
 impl TryFrom<usize> for PtraceRequest {
     type Error = SystemError;
@@ -38,9 +43,13 @@ impl TryFrom<usize> for PtraceRequest {
             16 => Ok(PtraceRequest::Attach),
             17 => Ok(PtraceRequest::Detach),
             24 => Ok(PtraceRequest::Syscall),
+            31 => Ok(PtraceRequest::Sysemu),
+            32 => Ok(PtraceRequest::SysemuSinglestep),
             0x4200 => Ok(PtraceRequest::Setoptions),
             0x4202 => Ok(PtraceRequest::Getsiginfo),
             0x4203 => Ok(PtraceRequest::Setsiginfo),
+            0x4204 => Ok(PtraceRequest::Getregset),
+            0x4205 => Ok(PtraceRequest::Setregset),
             0x4206 => Ok(PtraceRequest::Seize),
             0x420a => Ok(PtraceRequest::Getsigmask),
             0x420b => Ok(PtraceRequest::Setsigmask),
@@ -520,29 +529,7 @@ impl SysPtrace {
         tracee: &Arc<ProcessControlBlock>,
         data: usize,
     ) -> Result<isize, SystemError> {
-        // 获取 tracee 的 TrapFrame
-        // TrapFrame 位于内核栈顶部：kernel_stack.max_address - size_of::<TrapFrame>()
-        let kstack = tracee.kernel_stack();
-        let trap_frame_vaddr =
-            VirtAddr::new(kstack.stack_max_address().data() - core::mem::size_of::<TrapFrame>());
-
-        // 从 tracee 的内核栈读取 TrapFrame
-        let trap_frame = unsafe { &*(trap_frame_vaddr.data() as *const TrapFrame) };
-
-        #[cfg(target_arch = "x86_64")]
-        let user_regs = {
-            // 获取 fs_base、gs_base 和段选择器
-            let arch_info = tracee.arch_info_irqsave();
-            let fs_base = arch_info.fsbase() as u64;
-            let gs_base = arch_info.gsbase() as u64;
-            let fs = arch_info.fs() as u64;
-            let gs = arch_info.gs() as u64;
-            drop(arch_info);
-            // 使用 UserRegsStruct::from_trap_frame 构造用户态寄存器结构体
-            UserRegsStruct::from_trap_frame(trap_frame, fs_base, gs_base, fs, gs)
-        };
-        #[cfg(not(target_arch = "x86_64"))]
-        let user_regs = { UserRegsStruct::from_trap_frame(trap_frame) };
+        let user_regs = Self::tracee_user_regs(tracee);
 
         // 拷贝到用户空间
         let mut writer = UserBufferWriter::new(
@@ -568,11 +555,34 @@ impl SysPtrace {
         )?;
         reader.copy_one_from_user(&mut user_regs, 0)?;
 
-        // 获取 tracee 的 TrapFrame（位于其内核栈顶部）
-        let kstack = tracee.kernel_stack();
-        let trap_frame_vaddr =
-            VirtAddr::new(kstack.stack_max_address().data() - core::mem::size_of::<TrapFrame>());
-        let trap_frame = unsafe { &mut *(trap_frame_vaddr.data() as *mut TrapFrame) };
+        Self::write_tracee_user_regs(tracee, &user_regs);
+
+        Ok(0)
+    }
+
+    fn tracee_user_regs(tracee: &Arc<ProcessControlBlock>) -> UserRegsStruct {
+        let trap_frame = tracee.tracee_trap_frame();
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            // 获取 fs_base、gs_base 和段选择器
+            let arch_info = tracee.arch_info_irqsave();
+            let fs_base = arch_info.fsbase() as u64;
+            let gs_base = arch_info.gsbase() as u64;
+            let fs = arch_info.fs() as u64;
+            let gs = arch_info.gs() as u64;
+            drop(arch_info);
+
+            UserRegsStruct::from_trap_frame(trap_frame, fs_base, gs_base, fs, gs)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            UserRegsStruct::from_trap_frame(trap_frame)
+        }
+    }
+
+    fn write_tracee_user_regs(tracee: &Arc<ProcessControlBlock>, user_regs: &UserRegsStruct) {
+        let trap_frame = unsafe { &mut *tracee.tracee_trap_frame_ptr() };
 
         user_regs.write_to_trap_frame(trap_frame);
 
@@ -585,7 +595,70 @@ impl SysPtrace {
             arch_info.set_fs(user_regs.fs as u16);
             arch_info.set_gs(user_regs.gs as u16);
         }
+    }
 
+    fn ptrace_regset(
+        tracee: &Arc<ProcessControlBlock>,
+        request: PtraceRequest,
+        note_type: usize,
+        iov: &mut IoVec,
+    ) -> Result<(), SystemError> {
+        if note_type != NT_PRSTATUS || !iov.iov_len.is_multiple_of(X86_REGSET_WORD_SIZE) {
+            return Err(SystemError::EINVAL);
+        }
+
+        let full_len = core::mem::size_of::<UserRegsStruct>();
+        iov.iov_len = min(iov.iov_len, full_len);
+
+        match request {
+            PtraceRequest::Getregset => {
+                let user_regs = Self::tracee_user_regs(tracee);
+                let reg_bytes = unsafe {
+                    slice::from_raw_parts(
+                        (&user_regs as *const UserRegsStruct).cast::<u8>(),
+                        full_len,
+                    )
+                };
+                let mut writer = UserBufferWriter::new(iov.iov_base, iov.iov_len, true)?;
+                writer
+                    .buffer_protected(0)?
+                    .write_to_user(0, &reg_bytes[..iov.iov_len])?;
+            }
+            PtraceRequest::Setregset => {
+                let mut user_regs = Self::tracee_user_regs(tracee);
+                let reg_bytes = unsafe {
+                    slice::from_raw_parts_mut(
+                        (&mut user_regs as *mut UserRegsStruct).cast::<u8>(),
+                        full_len,
+                    )
+                };
+                let reader = UserBufferReader::new(iov.iov_base, iov.iov_len, true)?;
+                reader
+                    .buffer_protected(0)?
+                    .read_from_user(0, &mut reg_bytes[..iov.iov_len])?;
+                Self::write_tracee_user_regs(tracee, &user_regs);
+            }
+            _ => return Err(SystemError::EINVAL),
+        }
+
+        Ok(())
+    }
+
+    fn handle_regset(
+        tracee: &Arc<ProcessControlBlock>,
+        request: PtraceRequest,
+        addr: usize,
+        data: usize,
+    ) -> Result<isize, SystemError> {
+        let uiov_reader =
+            UserBufferReader::new(data as *const IoVec, core::mem::size_of::<IoVec>(), true)?;
+        let mut iov = uiov_reader.buffer_protected(0)?.read_one::<IoVec>(0)?;
+
+        Self::ptrace_regset(tracee, request, addr, &mut iov)?;
+
+        let mut uiov_writer =
+            UserBufferWriter::new(data as *mut IoVec, core::mem::size_of::<IoVec>(), true)?;
+        uiov_writer.copy_one_to_user(&iov.iov_len, core::mem::offset_of!(IoVec, iov_len))?;
         Ok(0)
     }
 
@@ -642,7 +715,11 @@ impl Syscall for SysPtrace {
             // 写入进程内存
             PtraceRequest::Pokedata => Self::handle_poke_data(&tracee, addr, data)?,
             // 继续执行目标进程
-            PtraceRequest::Cont | PtraceRequest::Singlestep | PtraceRequest::Syscall => {
+            PtraceRequest::Cont
+            | PtraceRequest::Singlestep
+            | PtraceRequest::Syscall
+            | PtraceRequest::Sysemu
+            | PtraceRequest::SysemuSinglestep => {
                 // data 是要注入的信号编号，0 表示无信号
                 // 仅在这里转换 signal，避免对其他 request（如 GETREGS）中 data 是指针时产生误报
                 let signal = if data == 0 {
@@ -656,6 +733,10 @@ impl Syscall for SysPtrace {
             PtraceRequest::Getregs => Self::handle_get_regs(&tracee, data)?,
             // 设置寄存器值
             PtraceRequest::Setregs => Self::handle_set_regs(&tracee, data)?,
+            // 获取寄存器集合
+            PtraceRequest::Getregset => Self::handle_regset(&tracee, request, addr, data)?,
+            // 设置寄存器集合
+            PtraceRequest::Setregset => Self::handle_regset(&tracee, request, addr, data)?,
             // 附加到目标进程
             PtraceRequest::Attach => Self::handle_attach(&tracer, pid)?,
             // 分离目标进程

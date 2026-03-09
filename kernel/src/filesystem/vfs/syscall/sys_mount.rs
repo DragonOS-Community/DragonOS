@@ -224,16 +224,10 @@ fn path_mount(
         mnt_flags.insert(MountFlags::NOSYMFOLLOW);
     }
 
-    // todo: 处理remount时，atime相关的选项
-    // https://code.dragonos.org.cn/xref/linux-6.6.21/fs/namespace.c#3646
-
-    // todo: 参考linux的，实现对各个挂载选项的处理
-    // https://code.dragonos.org.cn/xref/linux-6.6.21/fs/namespace.c#3662
     if flags.intersection(MountFlags::REMOUNT | MountFlags::BIND)
         == (MountFlags::REMOUNT | MountFlags::BIND)
     {
-        log::warn!("todo: reconfigure mnt");
-        return Err(SystemError::ENOSYS);
+        return do_reconfigure_bind_mount(target_inode, mnt_flags);
     }
 
     if flags.contains(MountFlags::REMOUNT) {
@@ -256,6 +250,32 @@ fn path_mount(
 
     // 创建新的挂载
     return do_new_mount(source, target_inode, filesystemtype, data, mnt_flags).map(|_| ());
+}
+
+fn do_reconfigure_bind_mount(
+    target_inode: Arc<dyn IndexNode>,
+    requested_flags: MountFlags,
+) -> Result<(), SystemError> {
+    let target_mfs = target_inode.fs().downcast_arc::<MountFS>().ok_or_else(|| {
+        log::warn!("do_reconfigure_bind_mount: target is not on a mount");
+        SystemError::EINVAL
+    })?;
+
+    let reconfigurable_flags = MountFlags::RDONLY
+        | MountFlags::NOSUID
+        | MountFlags::NODEV
+        | MountFlags::NOEXEC
+        | MountFlags::NOATIME
+        | MountFlags::NODIRATIME
+        | MountFlags::RELATIME
+        | MountFlags::STRICTATIME
+        | MountFlags::NOSYMFOLLOW;
+
+    let mut merged_flags = target_mfs.mount_flags();
+    merged_flags.remove(reconfigurable_flags);
+    merged_flags.insert(requested_flags & reconfigurable_flags);
+    target_mfs.set_mount_flags(merged_flags);
+    Ok(())
 }
 
 fn do_new_mount(
@@ -376,14 +396,22 @@ fn do_bind_mount(
     // Clone source_mfs for recursive bind mount (need to keep it for later use)
     let source_mfs_for_recursive = source_mfs.clone();
 
-    // Get the inner filesystem for mounting
+    let root_inner_inode = source_inode
+        .clone()
+        .downcast_arc::<crate::filesystem::vfs::mount::MountFSInode>()
+        .map(|inode| inode.underlying_inode())
+        .unwrap_or_else(|| source_inode.clone());
+
+    // Get the inner filesystem for mounting while preserving the source subtree root.
     let inner_fs = source_mfs
         .map(|mfs| mfs.inner_filesystem())
         .unwrap_or(source_fs);
 
-    // Use the target_inode.mount() method which handles all the mounting logic
-    // This properly creates a new MountFS and registers it
-    let target_mfs = target_inode.mount(inner_fs, MountFlags::empty())?;
+    let target_mfs = target_inode
+        .clone()
+        .downcast_arc::<crate::filesystem::vfs::mount::MountFSInode>()
+        .ok_or(SystemError::EINVAL)?
+        .mount_subtree(inner_fs, root_inner_inode, MountFlags::empty())?;
     target_mfs.set_mount_source(Some(source_path.clone()));
 
     // If MS_REC is set, recursively bind all submounts from source to target
@@ -559,7 +587,13 @@ fn do_recursive_bind_mount(
         let child_inner_fs = info.source_mfs.inner_filesystem();
 
         // Create the bind mount
-        match target_child_inode.mount(child_inner_fs, MountFlags::empty()) {
+        let child_root_inner_inode = info.source_mfs.root_inner_inode();
+        match target_child_inode
+            .clone()
+            .downcast_arc::<crate::filesystem::vfs::mount::MountFSInode>()
+            .ok_or(SystemError::EINVAL)?
+            .mount_subtree(child_inner_fs, child_root_inner_inode, MountFlags::empty())
+        {
             Ok(new_child_mnt) => {
                 let source = info
                     .source_mfs

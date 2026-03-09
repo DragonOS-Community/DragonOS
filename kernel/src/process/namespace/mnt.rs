@@ -66,6 +66,7 @@ impl MntNamespace {
         let ramfs = MountFS::new(
             ramfs,
             None,
+            None,
             MountPropagation::new_private(),
             None,
             MountFlags::empty(),

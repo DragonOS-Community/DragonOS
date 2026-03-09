@@ -5,6 +5,7 @@ use system_error::SystemError;
 use crate::exception::workqueue::{schedule_work, Work};
 use crate::net::socket::inet::InetSocket;
 use crate::net::socket::PMSG;
+use crate::syscall::user_buffer::UserBuffer;
 use crate::time::timer::{next_n_us_timer_jiffies, Timer, TimerFunction};
 
 use alloc::sync::Weak;
@@ -230,6 +231,121 @@ impl TcpSocket {
         Ok(total)
     }
 
+    fn recv_established_to_user(
+        &self,
+        socket: &mut smoltcp::socket::tcp::Socket,
+        user_buffer: &mut UserBuffer<'_>,
+        offset: usize,
+    ) -> Result<usize, SystemError> {
+        if offset > user_buffer.len() {
+            return Err(SystemError::EINVAL);
+        }
+
+        let mut user_remaining = user_buffer.len() - offset;
+        let is_recv_shutdown = self.is_recv_shutdown();
+        if is_recv_shutdown {
+            let remaining = self.recv_shutdown.remaining_limit();
+            if remaining == 0 {
+                discard_recv_queue(socket);
+                return Ok(0);
+            }
+            user_remaining = core::cmp::min(user_remaining, remaining);
+        }
+
+        if user_remaining == 0 {
+            return Ok(0);
+        }
+
+        if !socket.can_recv() {
+            if !socket.may_recv() {
+                return match socket.recv(|_data| (0usize, ())) {
+                    Ok(()) => Ok(0),
+                    Err(smoltcp::socket::tcp::RecvError::Finished) => Ok(0),
+                    Err(smoltcp::socket::tcp::RecvError::InvalidState) => {
+                        Err(SystemError::ECONNRESET)
+                    }
+                };
+            }
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+
+        let mut total = 0usize;
+        while total < user_remaining {
+            if !socket.can_recv() {
+                break;
+            }
+
+            let want = user_remaining - total;
+            let got = match socket.recv(|data| {
+                let take = core::cmp::min(want, data.len());
+                let copy = if take > 0 {
+                    user_buffer
+                        .write_to_user(offset + total, &data[..take])
+                        .map(|_| take)
+                } else {
+                    Ok(0)
+                };
+                (take, copy)
+            }) {
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => {
+                    if e == SystemError::EFAULT && total > 0 {
+                        break;
+                    }
+                    return Err(e);
+                }
+                Err(smoltcp::socket::tcp::RecvError::InvalidState) => {
+                    return Err(SystemError::ENOTCONN);
+                }
+                Err(smoltcp::socket::tcp::RecvError::Finished) => {
+                    return Ok(total);
+                }
+            };
+
+            if got == 0 {
+                break;
+            }
+            total += got;
+        }
+
+        if total == 0 {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        if is_recv_shutdown && self.recv_shutdown.record_read(total) {
+            discard_recv_queue(socket);
+        }
+        Ok(total)
+    }
+
+    fn finish_recv_progress(&self, consumed: bool) {
+        if consumed {
+            self.notify();
+        }
+
+        if let Some(iface) = self
+            .inner
+            .read()
+            .as_ref()
+            .and_then(|inner| inner.iface())
+            .cloned()
+        {
+            // After a successful TCP recv() we may have just freed a significant portion of the
+            // receive window. On loopback/blocking-large-send paths, sender progress depends on
+            // promptly turning that freed window into ACK/window-update processing and sender-side
+            // wakeups. A single poll is not always enough to complete the roundtrip, so mirror the
+            // send path and drive the stack until quiescent.
+            if !matches!(
+                self.inner.read().as_ref(),
+                Some(inner::Inner::SelfConnected(_))
+            ) {
+                if let Some(netns) = iface.common().net_namespace() {
+                    netns.wakeup_poll_thread();
+                }
+                super::poll_util::poll_iface_until_quiescent(iface.as_ref());
+            }
+        }
+    }
+
     pub(super) fn try_recv_with_flags(
         &self,
         buf: &mut [u8],
@@ -252,7 +368,10 @@ impl TcpSocket {
                     .and_then(|inner| inner.iface())
                     .cloned()
                 {
-                    iface.poll();
+                    if let Some(netns) = iface.common().net_namespace() {
+                        netns.wakeup_poll_thread();
+                    }
+                    super::poll_util::poll_iface_until_quiescent(iface.as_ref());
                 }
             }
 
@@ -335,27 +454,147 @@ impl TcpSocket {
 
         // For self-connect, consuming bytes frees space for senders waiting on EPOLLOUT.
         // Wake waiters and refresh pollee after we actually consumed data.
-        if total_read > 0 && !flags.contains(PMSG::PEEK) {
-            self.notify();
-        }
+        self.finish_recv_progress(total_read > 0 && !flags.contains(PMSG::PEEK));
 
-        if let Some(iface) = self
-            .inner
-            .read()
-            .as_ref()
-            .and_then(|inner| inner.iface())
-            .cloned()
-        {
-            // SelfConnected does not need iface.poll(); keep this call for real TCP sockets only.
-            if !matches!(
+        Ok(total_read)
+    }
+
+    pub(super) fn try_read_to_user_buffer(
+        &self,
+        user_buffer: &mut UserBuffer<'_>,
+    ) -> Result<usize, SystemError> {
+        let mut total_read = 0usize;
+
+        loop {
+            let skip_iface_poll = matches!(
                 self.inner.read().as_ref(),
                 Some(inner::Inner::SelfConnected(_))
-            ) {
-                iface.poll();
+            );
+            if !skip_iface_poll {
+                if let Some(iface) = self
+                    .inner
+                    .read()
+                    .as_ref()
+                    .and_then(|inner| inner.iface())
+                    .cloned()
+                {
+                    if let Some(netns) = iface.common().net_namespace() {
+                        netns.wakeup_poll_thread();
+                    }
+                    super::poll_util::poll_iface_until_quiescent(iface.as_ref());
+                }
+            }
+
+            let iter_result = match self
+                .inner
+                .read()
+                .as_ref()
+                .expect("Tcp inner::Inner is None")
+            {
+                inner::Inner::Established(established) => established.with_mut(|socket| {
+                    self.recv_established_to_user(socket, user_buffer, total_read)
+                }),
+                inner::Inner::SelfConnected(sc) => {
+                    let mut limit = user_buffer.len().saturating_sub(total_read);
+                    if self.is_recv_shutdown() {
+                        let remaining = self.recv_shutdown.remaining_limit();
+                        if remaining == 0 {
+                            sc.discard_all();
+                            return Ok(0);
+                        }
+                        limit = core::cmp::min(limit, remaining);
+                    }
+                    let n =
+                        sc.recv_to_user(user_buffer, total_read, limit, self.is_send_shutdown())?;
+                    if self.is_recv_shutdown() && self.recv_shutdown.record_read(n) {
+                        sc.discard_all();
+                    }
+                    Ok(n)
+                }
+                inner::Inner::Connecting(connecting) => {
+                    if let Some(err) = connecting.failure_reason() {
+                        connecting.consume_error();
+                        return Err(err);
+                    }
+                    if connecting.is_refused_consumed() {
+                        return Ok(0);
+                    }
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+                }
+                inner::Inner::Init(_) | inner::Inner::Closed(_) => Err(SystemError::ENOTCONN),
+                _ => Err(SystemError::EINVAL),
+            };
+
+            match iter_result {
+                Ok(n) => {
+                    total_read += n;
+
+                    if n == 0 || total_read == user_buffer.len() {
+                        break;
+                    }
+                }
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                    if total_read > 0 {
+                        break;
+                    }
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
+                Err(e) => return Err(e),
             }
         }
 
+        self.finish_recv_progress(total_read > 0);
         Ok(total_read)
+    }
+
+    pub(super) fn read_to_user_buffer_impl(
+        &self,
+        user_buffer: &mut UserBuffer<'_>,
+    ) -> Result<usize, SystemError> {
+        if self.is_recv_shutdown() {
+            let limit = self.recv_shutdown.limit();
+            if limit == 0 {
+                return Ok(0);
+            }
+        }
+
+        if self.is_nonblock() {
+            return self.try_read_to_user_buffer(user_buffer);
+        }
+
+        loop {
+            match self.try_read_to_user_buffer(user_buffer) {
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                    if let Some(iface) = self.inner.read().as_ref().and_then(|i| i.iface()).cloned()
+                    {
+                        super::poll_util::poll_iface_until_quiescent(iface.as_ref());
+                    }
+                    let events = self.check_io_event();
+                    if events.intersects(
+                        crate::filesystem::epoll::EPollEventType::EPOLLIN
+                            | crate::filesystem::epoll::EPollEventType::EPOLLHUP
+                            | crate::filesystem::epoll::EPollEventType::EPOLLRDHUP
+                            | crate::filesystem::epoll::EPollEventType::EPOLLERR,
+                    ) {
+                        continue;
+                    }
+
+                    let wait_ret = self.wait_queue.wait_event_io_interruptible_timeout(
+                        || {
+                            self.check_io_event().intersects(
+                                crate::filesystem::epoll::EPollEventType::EPOLLIN
+                                    | crate::filesystem::epoll::EPollEventType::EPOLLHUP
+                                    | crate::filesystem::epoll::EPollEventType::EPOLLRDHUP
+                                    | crate::filesystem::epoll::EPollEventType::EPOLLERR,
+                            )
+                        },
+                        self.recv_timeout(),
+                    );
+                    wait_ret?;
+                }
+                result => return result,
+            }
+        }
     }
 
     pub fn try_send(&self, buf: &[u8]) -> Result<usize, SystemError> {

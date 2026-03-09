@@ -297,6 +297,10 @@ impl LoopbackDriver {
     pub fn iface(&self) -> Option<Arc<dyn Iface>> {
         self.iface.lock().as_ref().and_then(|w| w.upgrade())
     }
+
+    pub fn has_pending_rx(&self) -> bool {
+        !self.inner.lock().queue.is_empty()
+    }
 }
 
 /// ## LoopbackInterface结构
@@ -572,11 +576,18 @@ impl Iface for LoopbackInterface {
     }
 
     fn poll(&self) -> bool {
-        self.common.poll(self.driver.force_get_mut())
+        // loopback 特有语义：
+        // 一次 `poll()` 的 egress 阶段可能会把新包重新塞回 lo 的本地接收队列。
+        // 即使 smoltcp 没返回 `SocketStateChanged` / `poll_at == Now`，
+        // 这些新包也需要立刻再 poll 一轮才能被当前线程吃掉。
+        let progressed = self.common.poll(self.driver.force_get_mut());
+        progressed || self.driver.has_pending_rx()
     }
 
     fn poll_napi(&self, budget: usize) -> bool {
-        self.common.poll_napi(self.driver.force_get_mut(), budget)
+        // 与普通 poll 相同：若 egress 刚把包送回 lo 队列，则 NAPI 也必须继续自驱动。
+        let has_work_left = self.common.poll_napi(self.driver.force_get_mut(), budget);
+        has_work_left || self.driver.has_pending_rx()
     }
 
     fn should_drop_rx_packet(&self, packet: &[u8]) -> bool {

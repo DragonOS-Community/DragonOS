@@ -5,6 +5,7 @@ use alloc::sync::Arc;
 use system_error::SystemError;
 
 use super::inner;
+use super::poll_util;
 use super::TcpSocket;
 
 impl TcpSocket {
@@ -426,11 +427,29 @@ impl TcpSocket {
     }
 
     pub fn close_socket(&self) -> Result<(), SystemError> {
+        // 先把 iface 推进到稳定态，再决定 close(2) 是走 FIN 还是 RST。
+        // 否则 loopback 上尚未被 poll 到接收队列的数据会让 unread 误判为 0，
+        // 导致本应 abort(RST) 的场景被错误地当成 graceful close(FIN)。
+        if let Some(iface) = self
+            .inner
+            .read()
+            .as_ref()
+            .and_then(|inner| inner.iface())
+            .cloned()
+        {
+            if let Some(netns) = iface.common().net_namespace() {
+                netns.wakeup_poll_thread();
+            }
+            poll_util::poll_iface_until_quiescent(iface.as_ref());
+        }
+
         let mut writer = self.inner.write();
         let Some(inner) = writer.take() else {
             log::warn!("TcpSocket::close: already closed, unexpected");
             return Ok(());
         };
+
+        let mut post_poll_iface: Option<Arc<dyn crate::net::Iface>> = None;
 
         // close(fd) must not break in-flight syscalls that already hold a
         // reference to this socket object (gVisor ClosedWriteBlockingSocket).
@@ -457,11 +476,12 @@ impl TcpSocket {
                     let local_port = conn.get_name().port;
                     let iface = conn.iface().clone();
                     let me: alloc::sync::Weak<dyn InetSocket> = self.self_ref.clone();
-                    conn.close();
+                    conn.with_mut(|socket| socket.close());
                     if conn.owns_port() {
                         iface.port_manager().unbind_port(Types::Tcp, local_port);
                     }
                     iface.common().defer_tcp_close(handle, local_port, me);
+                    post_poll_iface = Some(iface);
                     writer.replace(inner::Inner::Established(conn));
                 }
             }
@@ -481,14 +501,14 @@ impl TcpSocket {
                 let unread = es.with(|socket| socket.recv_queue());
                 if linger_abort || unread > 0 {
                     es.with_mut(|socket| socket.abort());
-                    es.iface().poll();
                 } else {
-                    es.close();
+                    es.with_mut(|socket| socket.close());
                 }
                 if es.owns_port() {
                     iface.port_manager().unbind_port(Types::Tcp, local_port);
                 }
                 iface.common().defer_tcp_close(handle, local_port, me);
+                post_poll_iface = Some(iface);
                 writer.replace(inner::Inner::Established(es));
             }
             inner::Inner::SelfConnected(sc) => {
@@ -535,6 +555,13 @@ impl TcpSocket {
             }
         };
         drop(writer);
+        if let Some(iface) = post_poll_iface {
+            if let Some(netns) = iface.common().net_namespace() {
+                netns.wakeup_poll_thread();
+            }
+            poll_util::poll_iface_until_quiescent(iface.as_ref());
+            iface.common().notify_all_bound_sockets();
+        }
         self.notify();
         Ok(())
     }

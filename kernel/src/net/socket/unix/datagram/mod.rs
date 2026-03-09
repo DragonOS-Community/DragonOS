@@ -827,6 +827,17 @@ impl Socket for UnixDatagramSocket {
         }
     }
 
+    fn read_to_user_buffer(
+        &self,
+        user_buffer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+    ) -> Result<usize, SystemError> {
+        crate::net::socket::base::read_to_user_buffer_via_kernel_buf(
+            self,
+            user_buffer,
+            self.recv_buffer_size(),
+        )
+    }
+
     fn recv_msg(&self, msg: &mut MsgHdr, flags: socket::PMSG) -> Result<usize, SystemError> {
         // recvmsg semantics:
         // - Deliver SCM_RIGHTS if present on the next datagram.

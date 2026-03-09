@@ -7,6 +7,7 @@ use crate::libs::mutex::Mutex;
 use crate::libs::rwsem::RwSem;
 use crate::net::socket::{self, inet::Types};
 use crate::process::namespace::net_namespace::NetNamespace;
+use crate::syscall::user_buffer::UserBuffer;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use smoltcp;
@@ -696,12 +697,6 @@ impl Established {
         self.owns_port
     }
 
-    pub fn close(&self) {
-        self.inner
-            .with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.close());
-        self.inner.iface().poll();
-    }
-
     pub fn get_name(&self) -> smoltcp::wire::IpEndpoint {
         // smoltcp may clear endpoints in TIME_WAIT/CLOSED; keep a cached copy.
         self.inner
@@ -953,6 +948,45 @@ impl SelfConnected {
             }
         }
         Ok(n)
+    }
+
+    pub fn recv_to_user(
+        &self,
+        out: &mut UserBuffer<'_>,
+        offset: usize,
+        max_len: usize,
+        send_shutdown: bool,
+    ) -> Result<usize, SystemError> {
+        if offset > out.len() {
+            return Err(SystemError::EINVAL);
+        }
+        let available = core::cmp::min(out.len() - offset, max_len);
+        if available == 0 {
+            return Ok(0);
+        }
+
+        let mut q = self.buf.lock();
+        if q.is_empty() {
+            if send_shutdown {
+                return Ok(0);
+            }
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+
+        let n = core::cmp::min(available, q.len());
+        let mut tmp = Vec::with_capacity(n);
+        tmp.extend(q.iter().take(n).copied());
+
+        match out.write_to_user(offset, &tmp) {
+            Ok(_) => {
+                for _ in 0..n {
+                    let _ = q.pop_front();
+                }
+                Ok(n)
+            }
+            Err(SystemError::EFAULT) => Err(SystemError::EFAULT),
+            Err(e) => Err(e),
+        }
     }
 
     pub fn update_io_events(&self, pollee: &AtomicUsize, send_shutdown: bool) {

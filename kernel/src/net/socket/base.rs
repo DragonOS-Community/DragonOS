@@ -129,6 +129,13 @@ pub trait Socket: PollableInode + IndexNode {
         self.recv(buffer, PMSG::empty())
     }
 
+    /// 直接把 `read(2)` 数据写入用户缓冲区。
+    ///
+    fn read_to_user_buffer(
+        &self,
+        user_buffer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+    ) -> Result<usize, SystemError>;
+
     /// # `recv`
     /// 接收数据，`read` = `recv` with flags = 0
     fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError>;
@@ -217,4 +224,20 @@ pub trait Socket: PollableInode + IndexNode {
     fn write(&self, buffer: &[u8]) -> Result<usize, SystemError> {
         self.send(buffer, PMSG::empty())
     }
+}
+
+pub(crate) fn read_to_user_buffer_via_kernel_buf<S: Socket + ?Sized>(
+    socket: &S,
+    user_buffer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+    kernel_buf_len: usize,
+) -> Result<usize, SystemError> {
+    if user_buffer.is_empty() {
+        return Ok(0);
+    }
+
+    let scratch_len = core::cmp::min(kernel_buf_len.max(1), user_buffer.len());
+    let mut kbuf = alloc::vec![0u8; scratch_len];
+    let n = socket.read(&mut kbuf)?;
+    user_buffer.write_to_user(0, &kbuf[..n])?;
+    Ok(n)
 }

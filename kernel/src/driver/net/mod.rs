@@ -446,7 +446,14 @@ impl IfaceCommon {
         //     .extract_if(|closing_socket| closing_socket.is_closed())
         //     .collect::<Vec<_>>();
         // drop(closed_sockets);
-        has_events
+        // `Iface::poll()` 的返回值不仅用于“这轮有没有状态变化”，还会被
+        // `poll_iface_until_quiescent()` 当作“是否还需要立刻再 poll 一轮”的判据。
+        //
+        // smoltcp 会通过 `poll_at() == Now` 表示还有立即可推进的工作
+        // （例如 loopback 二次往返、ACK/window update、仅 egress 前进等）。
+        // 如果这里只返回 `has_events`，快路径会过早停止，剩余工作只能等下一次外部事件，
+        // 在 blocking TCP 大包场景就会表现为 send/recv 偶发永久卡住。
+        has_events || matches!(poll_at, Some(instant) if instant <= timestamp)
     }
 
     /// 返回 smoltcp 计算的“下次需要 poll 的时间点”（微秒时间戳）。
@@ -531,8 +538,17 @@ impl IfaceCommon {
             }
         }
 
-        // NAPI 语义：仅当 ingress backlog 超过 budget 才认为“还有工作没做完”。
-        had_packet && processed == budget
+        // NAPI 语义：只要“还有立即可推进的工作”，就应继续留在 poll_list。
+        //
+        // 除了 ingress backlog 超过 budget 之外，egress/ACK 路径也可能要求立刻再次 poll：
+        // smoltcp 会通过 `poll_at() == Now`（这里被 clamp 成 `Some(timestamp)`）表达这一点。
+        // 如果忽略这个条件，loopback/TCP 大流量场景可能出现：
+        // - 已处理完当前 ingress batch；
+        // - 但仍有 ACK / window update / 后续 egress 需要立即发送；
+        // - NAPI 线程却错误睡眠，直到下一次外部事件才继续推进，
+        //   导致 send done 后 recv 端偶发卡住。
+        (had_packet && processed == budget)
+            || matches!(poll_at, Some(instant) if instant <= timestamp)
     }
 
     pub fn update_ip_addrs(&self, ip_addrs: &[smoltcp::wire::IpCidr]) -> Result<(), SystemError> {

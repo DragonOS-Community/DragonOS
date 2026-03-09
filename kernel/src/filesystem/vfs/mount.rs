@@ -2,6 +2,7 @@ use core::{
     any::Any,
     fmt::Debug,
     hash::Hash,
+    mem,
     sync::atomic::{compiler_fence, Ordering},
 };
 
@@ -355,6 +356,10 @@ impl MountFS {
         self.namespace.init(namespace);
     }
 
+    pub fn namespace(&self) -> Option<Arc<MntNamespace>> {
+        self.namespace.try_get().and_then(|ns| ns.upgrade())
+    }
+
     pub fn fs_type(&self) -> &str {
         self.inner_filesystem.name()
     }
@@ -370,6 +375,10 @@ impl MountFS {
     #[inline(never)]
     pub fn self_mountpoint(&self) -> Option<Arc<MountFSInode>> {
         self.self_mountpoint.read().as_ref().cloned()
+    }
+
+    pub fn set_self_mountpoint(&self, mountpoint: Option<Arc<MountFSInode>>) {
+        *self.self_mountpoint.write() = mountpoint;
     }
 
     /// @brief 用Arc指针包裹MountFS对象。
@@ -553,7 +562,14 @@ impl MountFSInode {
             .mountpoints
             .lock()
             .remove(&mountpoint_id)
-            .ok_or(SystemError::ENOENT)?;
+            .ok_or_else(|| {
+                log::warn!(
+                    "do_umount: mountpoint id {:?} not found in parent fs '{}'",
+                    mountpoint_id,
+                    self.mount_fs.name()
+                );
+                SystemError::ENOENT
+            })?;
 
         // Propagate umount to peers and slaves of the parent mount
         let parent_prop = self.mount_fs.propagation();
@@ -586,7 +602,17 @@ impl MountFSInode {
         // 注意：不同文件系统的 inode_id 空间可能互相独立，不能用“全局根 inode_id”作为终止条件。
         // 正确做法应当按挂载树向上走，直到到达“命名空间根”（即 rootfs 的 mount，self_mountpoint 为 None）。
         loop {
-            // 到达全局根（该 mount 没有挂载点）：结束
+            // 到达当前命名空间根：结束。
+            if current.is_mountpoint_root()?
+                && current
+                    .mount_fs
+                    .namespace()
+                    .is_some_and(|ns| Arc::ptr_eq(&current.mount_fs, ns.root_mntfs()))
+            {
+                break;
+            }
+
+            // 兼容旧模型：若 mount 没有挂载点，也将其视为根。
             if current.is_mountpoint_root()? && current.mount_fs.self_mountpoint().is_none() {
                 break;
             }
@@ -643,6 +669,14 @@ impl MountFSInode {
             mount_fs,
             self_ref: self_ref.clone(),
         })
+    }
+
+    pub fn mount_fs(&self) -> Arc<MountFS> {
+        self.mount_fs.clone()
+    }
+
+    pub fn inode_id(&self) -> Result<InodeId, SystemError> {
+        Ok(self.inner_inode.metadata()?.inode_id)
     }
 }
 
@@ -1102,11 +1136,9 @@ impl FileSystem for MountFS {
         self.inner_filesystem.support_readahead()
     }
     fn root_inode(&self) -> Arc<dyn IndexNode> {
-        match self.self_mountpoint() {
-            Some(inode) => return inode.mount_fs.root_inode(),
-            // 当前文件系统是rootfs
-            None => self.mountpoint_root_inode(),
-        }
+        // A mounted filesystem's root inode is always its own mount root wrapper.
+        // Returning the parent mount's root breaks mount-root checks such as pivot_root(2).
+        self.mountpoint_root_inode()
     }
 
     fn info(&self) -> super::FsInfo {
@@ -1349,6 +1381,37 @@ impl MountList {
             }
         }
         None
+    }
+
+    pub fn rewrite_paths<F>(&self, mut rewrite: F)
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        let mut inner = self.inner.write();
+        let old_mounts = mem::take(&mut inner.mounts);
+        let mut new_mounts = HashMap::new();
+        let mut new_ino2mp = HashMap::new();
+        let mut new_mfs2ino = HashMap::new();
+
+        for (old_path, stack) in old_mounts {
+            let Some(new_path) = rewrite(old_path.as_str()) else {
+                continue;
+            };
+            let new_path = Arc::new(MountPath::from(new_path));
+            let entry = new_mounts.entry(new_path.clone()).or_insert_with(Vec::new);
+
+            for rec in stack {
+                if let Some(ino) = rec.ino {
+                    new_ino2mp.insert(ino, new_path.clone());
+                    new_mfs2ino.insert(rec.fs.clone(), ino);
+                }
+                entry.push(rec);
+            }
+        }
+
+        inner.mounts = new_mounts;
+        inner.ino2mp = new_ino2mp;
+        inner.mfs2ino = new_mfs2ino;
     }
 
     /// # clone_inner - 克隆内部挂载点列表

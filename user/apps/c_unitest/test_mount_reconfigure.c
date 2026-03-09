@@ -55,6 +55,56 @@ static void cleanup_mount(const char *path) {
     rmdir(path);
 }
 
+static bool mount_has_option(const char *mountpoint, const char *option) {
+    FILE *fp;
+    char *line = NULL;
+    size_t cap = 0;
+    bool found = false;
+
+    fp = fopen("/proc/self/mounts", "r");
+    if (fp == NULL) {
+        return false;
+    }
+
+    while (getline(&line, &cap, fp) > 0) {
+        char *saveptr = NULL;
+        char *field = NULL;
+        char *current_mountpoint;
+        char *options;
+        char *opt_saveptr = NULL;
+
+        field = strtok_r(line, " ", &saveptr);
+        if (field == NULL) {
+            continue;
+        }
+
+        current_mountpoint = strtok_r(NULL, " ", &saveptr);
+        if (current_mountpoint == NULL || strcmp(current_mountpoint, mountpoint) != 0) {
+            continue;
+        }
+
+        strtok_r(NULL, " ", &saveptr);
+        options = strtok_r(NULL, " ", &saveptr);
+        if (options == NULL) {
+            continue;
+        }
+
+        for (field = strtok_r(options, ",", &opt_saveptr); field != NULL;
+             field = strtok_r(NULL, ",", &opt_saveptr)) {
+            if (strcmp(field, option) == 0) {
+                found = true;
+                break;
+            }
+        }
+
+        break;
+    }
+
+    free(line);
+    fclose(fp);
+    return found;
+}
+
 static void test_bind_remount_readonly(void) {
     const char *name = "bind_remount_readonly";
     const char *base = "/tmp/test_mount_reconfigure";
@@ -285,10 +335,80 @@ static void test_bind_subdir_preserves_subtree_root(void) {
     TEST_PASS(name);
 }
 
+static void test_bind_remount_preserves_noatime(void) {
+    const char *name = "bind_remount_preserves_noatime";
+    const char *base = "/tmp/test_mount_reconfigure_atime";
+    const char *source = "/tmp/test_mount_reconfigure_atime/source";
+    const char *target = "/tmp/test_mount_reconfigure_atime/target";
+
+    ensure_dir("/tmp");
+    ensure_dir(base);
+    ensure_dir(source);
+    ensure_dir(target);
+
+    if (unshare(CLONE_NEWNS) != 0) {
+        TEST_SKIP(name, strerror(errno));
+        return;
+    }
+
+    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+
+    if (mount("", source, "ramfs", 0, NULL) != 0) {
+        TEST_SKIP(name, strerror(errno));
+        return;
+    }
+
+    if (mount(source, target, NULL, MS_BIND, NULL) != 0) {
+        cleanup_mount(source);
+        TEST_FAIL(name, "bind mount failed");
+        return;
+    }
+
+    if (mount(target, target, NULL, MS_BIND | MS_REMOUNT | MS_NOATIME, NULL) != 0) {
+        umount(target);
+        cleanup_mount(source);
+        TEST_FAIL(name, "set noatime on bind mount failed");
+        return;
+    }
+
+    if (!mount_has_option(target, "noatime") || mount_has_option(target, "relatime")) {
+        umount(target);
+        cleanup_mount(source);
+        TEST_FAIL(name, "bind mount did not enter noatime state");
+        return;
+    }
+
+    if (mount(target, target, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) != 0) {
+        umount(target);
+        cleanup_mount(source);
+        TEST_FAIL(name, "readonly bind remount failed");
+        return;
+    }
+
+    if (!mount_has_option(target, "noatime")) {
+        umount(target);
+        cleanup_mount(source);
+        TEST_FAIL(name, "readonly bind remount lost noatime");
+        return;
+    }
+
+    if (mount_has_option(target, "relatime")) {
+        umount(target);
+        cleanup_mount(source);
+        TEST_FAIL(name, "readonly bind remount unexpectedly enabled relatime");
+        return;
+    }
+
+    umount(target);
+    cleanup_mount(source);
+    TEST_PASS(name);
+}
+
 int main(void) {
     test_bind_remount_readonly();
     test_self_bind_subdir_remount_readonly();
     test_bind_subdir_preserves_subtree_root();
+    test_bind_remount_preserves_noatime();
     printf("passed=%d failed=%d\n", tests_passed, tests_failed);
     return tests_failed == 0 ? 0 : 1;
 }

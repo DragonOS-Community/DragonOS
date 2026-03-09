@@ -178,8 +178,6 @@ fn path_mount(
     data: Option<String>,
     mut flags: MountFlags,
 ) -> Result<(), SystemError> {
-    let mut mnt_flags = MountFlags::empty();
-
     if flags & MountFlags::MGC_MASK == MountFlags::MGC_VAL {
         flags.remove(MountFlags::MGC_MASK);
     }
@@ -187,6 +185,14 @@ fn path_mount(
     if flags.contains(MountFlags::NOUSER) {
         return Err(SystemError::EINVAL);
     }
+
+    if flags.intersection(MountFlags::REMOUNT | MountFlags::BIND)
+        == (MountFlags::REMOUNT | MountFlags::BIND)
+    {
+        return do_reconfigure_bind_mount(target_inode, bind_remount_requested_flags(flags));
+    }
+
+    let mut mnt_flags = MountFlags::empty();
 
     // Default to relatime unless overriden
     if !flags.contains(MountFlags::NOATIME) {
@@ -224,12 +230,6 @@ fn path_mount(
         mnt_flags.insert(MountFlags::NOSYMFOLLOW);
     }
 
-    if flags.intersection(MountFlags::REMOUNT | MountFlags::BIND)
-        == (MountFlags::REMOUNT | MountFlags::BIND)
-    {
-        return do_reconfigure_bind_mount(target_inode, mnt_flags);
-    }
-
     if flags.contains(MountFlags::REMOUNT) {
         log::warn!("todo: remount");
         return Err(SystemError::ENOSYS);
@@ -252,6 +252,20 @@ fn path_mount(
     return do_new_mount(source, target_inode, filesystemtype, data, mnt_flags).map(|_| ());
 }
 
+fn bind_remount_requested_flags(flags: MountFlags) -> MountFlags {
+    let reconfigurable_flags = MountFlags::RDONLY
+        | MountFlags::NOSUID
+        | MountFlags::NODEV
+        | MountFlags::NOEXEC
+        | MountFlags::NOATIME
+        | MountFlags::NODIRATIME
+        | MountFlags::RELATIME
+        | MountFlags::STRICTATIME
+        | MountFlags::NOSYMFOLLOW;
+
+    flags & reconfigurable_flags
+}
+
 fn do_reconfigure_bind_mount(
     target_inode: Arc<dyn IndexNode>,
     requested_flags: MountFlags,
@@ -270,10 +284,22 @@ fn do_reconfigure_bind_mount(
         | MountFlags::RELATIME
         | MountFlags::STRICTATIME
         | MountFlags::NOSYMFOLLOW;
+    let atime_flags = MountFlags::NOATIME
+        | MountFlags::NODIRATIME
+        | MountFlags::RELATIME
+        | MountFlags::STRICTATIME;
 
     let mut merged_flags = target_mfs.mount_flags();
-    merged_flags.remove(reconfigurable_flags);
-    merged_flags.insert(requested_flags & reconfigurable_flags);
+    let mut replace_mask = reconfigurable_flags;
+
+    // Linux keeps the current atime mode for bind remounts unless userspace
+    // explicitly requests a new atime policy.
+    if (requested_flags & atime_flags).is_empty() {
+        replace_mask.remove(atime_flags);
+    }
+
+    merged_flags.remove(replace_mask);
+    merged_flags.insert(requested_flags & replace_mask);
     target_mfs.set_mount_flags(merged_flags);
     Ok(())
 }

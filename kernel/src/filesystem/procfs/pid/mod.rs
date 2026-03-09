@@ -40,6 +40,10 @@ use statm::StatmFileOps;
 use status::StatusFileOps;
 use task::TaskDirOps;
 
+pub(super) fn find_process_by_vpid(pid: RawPid) -> Option<Arc<ProcessControlBlock>> {
+    ProcessManager::find_task_by_vpid(pid)
+}
+
 /// /proc/[pid] 目录的 DirOps 实现
 #[derive(Debug)]
 pub struct PidDirOps {
@@ -58,7 +62,7 @@ impl PidDirOps {
 
     /// 获取进程引用
     fn get_process(&self) -> Option<Arc<ProcessControlBlock>> {
-        ProcessManager::find(self.pid)
+        find_process_by_vpid(self.pid)
     }
 
     /// 静态条目表
@@ -94,8 +98,8 @@ impl PidDirOps {
         ("exe", |ops, parent| ExeSymOps::new_inode(ops.pid, parent)),
         ("fd", |ops, parent| {
             // fd 目录仍然需要进程引用来列出文件描述符
-            if let Some(process) = ops.get_process() {
-                FdDirOps::new_inode(process, parent)
+            if ops.get_process().is_some() {
+                FdDirOps::new_inode(ops.pid, parent)
             } else {
                 // 进程已退出，创建空目录
                 use crate::filesystem::procfs::template::ProcDirBuilder;
@@ -124,8 +128,8 @@ impl PidDirOps {
         }),
         ("fdinfo", |ops, parent| {
             // fdinfo 目录也需要进程引用来列出文件描述符
-            if let Some(process) = ops.get_process() {
-                FdInfoDirOps::new_inode(process, parent)
+            if ops.get_process().is_some() {
+                FdInfoDirOps::new_inode(ops.pid, parent)
             } else {
                 // 进程已退出，创建空目录
                 use crate::filesystem::procfs::template::ProcDirBuilder;
@@ -157,7 +161,7 @@ impl PidDirOps {
 
 impl DirOps for PidDirOps {
     fn owner(&self) -> Option<(usize, usize)> {
-        let pcb = ProcessManager::find(self.pid)?;
+        let pcb = find_process_by_vpid(self.pid)?;
         if pcb.is_kthread() {
             return Some((0, 0));
         }

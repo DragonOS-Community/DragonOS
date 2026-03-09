@@ -6,12 +6,13 @@ use crate::libs::mutex::MutexGuard;
 use crate::{
     filesystem::{
         procfs::{
+            pid::find_process_by_vpid,
             template::{Builder, FileOps, ProcFileBuilder},
             utils::{proc_read, trim_string},
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    process::{ProcessManager, RawPid},
+    process::RawPid,
 };
 use alloc::{
     borrow::ToOwned,
@@ -44,7 +45,7 @@ impl StatusFileOps {
     /// 生成 status 文件内容
     fn generate_status_content(&self) -> Result<Vec<u8>, SystemError> {
         // 动态查找进程，确保获取最新状态
-        let pcb = ProcessManager::find(self.pid).ok_or(SystemError::ESRCH)?;
+        let pcb = find_process_by_vpid(self.pid).ok_or(SystemError::ESRCH)?;
         let mut pdata = Vec::new();
 
         // Name

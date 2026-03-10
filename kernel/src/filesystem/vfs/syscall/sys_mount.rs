@@ -270,6 +270,11 @@ fn do_reconfigure_bind_mount(
     target_inode: Arc<dyn IndexNode>,
     requested_flags: MountFlags,
 ) -> Result<(), SystemError> {
+    if !is_mountpoint_root(&target_inode) {
+        log::warn!("do_reconfigure_bind_mount: target is not a mount root");
+        return Err(SystemError::EINVAL);
+    }
+
     let target_mfs = target_inode.fs().downcast_arc::<MountFS>().ok_or_else(|| {
         log::warn!("do_reconfigure_bind_mount: target is not on a mount");
         SystemError::EINVAL
@@ -282,25 +287,23 @@ fn do_reconfigure_bind_mount(
         | MountFlags::NOATIME
         | MountFlags::NODIRATIME
         | MountFlags::RELATIME
-        | MountFlags::STRICTATIME
         | MountFlags::NOSYMFOLLOW;
-    let atime_flags = MountFlags::NOATIME
-        | MountFlags::NODIRATIME
-        | MountFlags::RELATIME
-        | MountFlags::STRICTATIME;
+    let atime_flags = MountFlags::NOATIME | MountFlags::NODIRATIME | MountFlags::RELATIME;
+    let requested_atime_flags = requested_flags & atime_flags;
+    let strict_atime = requested_flags.contains(MountFlags::STRICTATIME);
 
-    let mut merged_flags = target_mfs.mount_flags();
-    let mut replace_mask = reconfigurable_flags;
+    target_mfs.update_mount_flags(|mount_flags| {
+        mount_flags.remove(reconfigurable_flags & !atime_flags);
+        mount_flags.insert(requested_flags & (reconfigurable_flags & !atime_flags));
 
-    // Linux keeps the current atime mode for bind remounts unless userspace
-    // explicitly requests a new atime policy.
-    if (requested_flags & atime_flags).is_empty() {
-        replace_mask.remove(atime_flags);
-    }
+        if strict_atime {
+            mount_flags.remove(atime_flags);
+        } else if !requested_atime_flags.is_empty() {
+            mount_flags.remove(atime_flags);
+            mount_flags.insert(requested_atime_flags);
+        }
+    });
 
-    merged_flags.remove(replace_mask);
-    merged_flags.insert(requested_flags & replace_mask);
-    target_mfs.set_mount_flags(merged_flags);
     Ok(())
 }
 

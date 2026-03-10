@@ -336,6 +336,11 @@ impl MountFS {
         *self.mount_flags.write() = mount_flags;
     }
 
+    pub fn update_mount_flags(&self, update: impl FnOnce(&mut MountFlags)) {
+        let mut mount_flags = self.mount_flags.write();
+        update(&mut mount_flags);
+    }
+
     pub fn add_mount(&self, inode_id: InodeId, mount_fs: Arc<MountFS>) -> Result<(), SystemError> {
         // 检查是否已经存在同名的挂载点
         if self.mountpoints.lock().contains_key(&inode_id) {
@@ -543,7 +548,7 @@ impl MountFSInode {
 
     /// @brief 判断当前inode是否为它所在的文件系统的root inode
     fn is_mountpoint_root(&self) -> Result<bool, SystemError> {
-        return Ok(self.inner_inode.fs().root_inode().metadata()?.inode_id
+        return Ok(self.mount_fs.root_inner_inode().metadata()?.inode_id
             == self.inner_inode.metadata()?.inode_id);
     }
 
@@ -1124,6 +1129,7 @@ impl IndexNode for MountFSInode {
     }
 
     fn write_sync(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        self.ensure_mount_writable()?;
         self.inner_inode.write_sync(offset, buf)
     }
 
@@ -1132,6 +1138,7 @@ impl IndexNode for MountFSInode {
     }
 
     fn setxattr(&self, name: &str, value: &[u8]) -> Result<usize, SystemError> {
+        self.ensure_mount_writable()?;
         self.inner_inode.setxattr(name, value)
     }
 }
@@ -1429,7 +1436,7 @@ impl Debug for MountList {
 /// - `true`: 是根inode
 /// - `false`: 不是根inode或者传入的inode不是MountFSInode类型，或者调用inode的metadata方法时报错了。
 pub fn is_mountpoint_root(inode: &Arc<dyn IndexNode>) -> bool {
-    let mnt_inode = inode.as_any_ref().downcast_ref::<MountFSInode>();
+    let mnt_inode = inode.clone().downcast_arc::<MountFSInode>();
     if let Some(mnt) = mnt_inode {
         return mnt.is_mountpoint_root().unwrap_or(false);
     }

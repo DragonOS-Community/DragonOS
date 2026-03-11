@@ -1,11 +1,9 @@
-#define _GNU_SOURCE
+#include <gtest/gtest.h>
 
 #include <errno.h>
 #include <fcntl.h>
 #include <sched.h>
-#include <stdbool.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
@@ -21,33 +19,13 @@
 #define MS_REC 16384
 #endif
 
-static int tests_passed = 0;
-static int tests_failed = 0;
-
-#define TEST_PASS(name)                                                        \
-    do {                                                                       \
-        printf("[PASS] %s\n", name);                                           \
-        tests_passed++;                                                        \
-    } while (0)
-
-#define TEST_FAIL(name, reason)                                                \
-    do {                                                                       \
-        printf("[FAIL] %s: %s\n", name, reason);                               \
-        tests_failed++;                                                        \
-    } while (0)
-
-#define TEST_SKIP(name, reason)                                                \
-    do {                                                                       \
-        printf("[SKIP] %s: %s\n", name, reason);                               \
-    } while (0)
+namespace {
 
 static int ensure_dir(const char *path) {
     struct stat st;
-
     if (stat(path, &st) == 0) {
         return S_ISDIR(st.st_mode) ? 0 : -1;
     }
-
     return mkdir(path, 0755);
 }
 
@@ -106,9 +84,9 @@ static bool mount_has_option(const char *mountpoint, const char *option) {
     return found;
 }
 
-static void test_bind_remount_readonly(void) {
-    const char *name = "bind_remount_readonly";
-    const char *base = "/tmp/test_mount_reconfigure";
+}  // namespace
+
+TEST(MountReconfigure, BindRemountReadonly) {
     const char *source = "/tmp/test_mount_reconfigure/source";
     const char *target = "/tmp/test_mount_reconfigure/target";
     char src_file[256];
@@ -116,35 +94,31 @@ static void test_bind_remount_readonly(void) {
     int fd;
 
     ensure_dir("/tmp");
-    ensure_dir(base);
+    ensure_dir("/tmp/test_mount_reconfigure");
     ensure_dir(source);
     ensure_dir(target);
 
     if (unshare(CLONE_NEWNS) != 0) {
-        TEST_SKIP(name, strerror(errno));
-        return;
+        GTEST_SKIP() << strerror(errno);
     }
 
     mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
 
     if (mount("", source, "ramfs", 0, NULL) != 0) {
-        TEST_SKIP(name, strerror(errno));
-        return;
+        GTEST_SKIP() << strerror(errno);
     }
 
     snprintf(src_file, sizeof(src_file), "%s/source.txt", source);
     fd = open(src_file, O_CREAT | O_WRONLY | O_TRUNC, 0644);
     if (fd < 0) {
         cleanup_mount(source);
-        TEST_FAIL(name, "create source file failed");
-        return;
+        FAIL() << "create source file failed";
     }
     close(fd);
 
     if (mount(source, target, NULL, MS_BIND, NULL) != 0) {
         cleanup_mount(source);
-        TEST_FAIL(name, "bind mount failed");
-        return;
+        FAIL() << "bind mount failed";
     }
 
     if (mount(target, target, NULL,
@@ -152,8 +126,7 @@ static void test_bind_remount_readonly(void) {
               NULL) != 0) {
         umount(target);
         cleanup_mount(source);
-        TEST_FAIL(name, strerror(errno));
-        return;
+        FAIL() << strerror(errno);
     }
 
     snprintf(dst_file, sizeof(dst_file), "%s/readonly.txt", target);
@@ -163,65 +136,53 @@ static void test_bind_remount_readonly(void) {
         unlink(dst_file);
         umount(target);
         cleanup_mount(source);
-        TEST_FAIL(name, "readonly bind mount still writable");
-        return;
+        FAIL() << "readonly bind mount still writable";
     }
 
     if (errno != EROFS) {
         umount(target);
         cleanup_mount(source);
-        TEST_FAIL(name, "expected EROFS on readonly bind mount");
-        return;
+        FAIL() << "expected EROFS on readonly bind mount";
     }
 
     umount(target);
     cleanup_mount(source);
-    TEST_PASS(name);
 }
 
-static void test_self_bind_subdir_remount_readonly(void) {
-    const char *name = "self_bind_subdir_remount_readonly";
-    const char *base = "/tmp/test_mount_reconfigure_subdir";
+TEST(MountReconfigure, SelfBindSubdirRemountReadonly) {
     const char *root = "/tmp/test_mount_reconfigure_subdir/root";
     const char *subdir = "/tmp/test_mount_reconfigure_subdir/root/proc_bus";
     char ro_file[256];
     int fd;
 
     ensure_dir("/tmp");
-    ensure_dir(base);
+    ensure_dir("/tmp/test_mount_reconfigure_subdir");
     ensure_dir(root);
 
     if (unshare(CLONE_NEWNS) != 0) {
-        TEST_SKIP(name, strerror(errno));
-        return;
+        GTEST_SKIP() << strerror(errno);
     }
 
     mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
 
     if (mount("", root, "ramfs", 0, NULL) != 0) {
-        TEST_SKIP(name, strerror(errno));
-        return;
+        GTEST_SKIP() << strerror(errno);
     }
 
     if (ensure_dir(subdir) != 0) {
         cleanup_mount(root);
-        TEST_FAIL(name, "create subdir failed");
-        return;
+        FAIL() << "create subdir failed";
     }
 
     if (mount(subdir, subdir, NULL, MS_BIND | MS_REC, NULL) != 0) {
         cleanup_mount(root);
-        TEST_FAIL(name, "self bind mount failed");
-        return;
+        FAIL() << "self bind mount failed";
     }
 
-    if (mount(subdir, subdir, NULL,
-              MS_BIND | MS_REC | MS_REMOUNT | MS_RDONLY,
-              NULL) != 0) {
+    if (mount(subdir, subdir, NULL, MS_BIND | MS_REC | MS_REMOUNT | MS_RDONLY, NULL) != 0) {
         umount(subdir);
         cleanup_mount(root);
-        TEST_FAIL(name, strerror(errno));
-        return;
+        FAIL() << strerror(errno);
     }
 
     snprintf(ro_file, sizeof(ro_file), "%s/ro.txt", subdir);
@@ -231,29 +192,23 @@ static void test_self_bind_subdir_remount_readonly(void) {
         unlink(ro_file);
         umount(subdir);
         cleanup_mount(root);
-        TEST_FAIL(name, "self bind remount is still writable");
-        return;
+        FAIL() << "self bind remount is still writable";
     }
 
     if (errno != EROFS) {
         umount(subdir);
         cleanup_mount(root);
-        TEST_FAIL(name, "expected EROFS after self bind remount");
-        return;
+        FAIL() << "expected EROFS after self bind remount";
     }
 
     if (umount(subdir) != 0) {
         cleanup_mount(root);
-        TEST_FAIL(name, "umount(self bind subdir) failed");
-        return;
+        FAIL() << "umount(self bind subdir) failed";
     }
     cleanup_mount(root);
-    TEST_PASS(name);
 }
 
-static void test_bind_subdir_preserves_subtree_root(void) {
-    const char *name = "bind_subdir_preserves_subtree_root";
-    const char *base = "/tmp/test_mount_bind_subtree";
+TEST(MountReconfigure, BindSubdirPreservesSubtreeRoot) {
     const char *root = "/tmp/test_mount_bind_subtree/root";
     const char *subdir = "/tmp/test_mount_bind_subtree/root/subdir";
     const char *target = "/tmp/test_mount_bind_subtree/target";
@@ -262,207 +217,173 @@ static void test_bind_subdir_preserves_subtree_root(void) {
     int fd;
 
     ensure_dir("/tmp");
-    ensure_dir(base);
+    ensure_dir("/tmp/test_mount_bind_subtree");
     ensure_dir(root);
     ensure_dir(target);
 
     if (unshare(CLONE_NEWNS) != 0) {
-        TEST_SKIP(name, strerror(errno));
-        return;
+        GTEST_SKIP() << strerror(errno);
     }
 
     mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
 
     if (mount("", root, "ramfs", 0, NULL) != 0) {
-        TEST_SKIP(name, strerror(errno));
-        return;
+        GTEST_SKIP() << strerror(errno);
     }
 
     if (ensure_dir(subdir) != 0) {
         cleanup_mount(root);
-        TEST_FAIL(name, "create subdir failed");
-        return;
+        FAIL() << "create subdir failed";
     }
 
     snprintf(sub_only, sizeof(sub_only), "%s/sub_only", subdir);
     fd = open(sub_only, O_CREAT | O_WRONLY | O_TRUNC, 0644);
     if (fd < 0) {
         cleanup_mount(root);
-        TEST_FAIL(name, "create subdir marker failed");
-        return;
+        FAIL() << "create subdir marker failed";
     }
     close(fd);
 
     snprintf(root_only, sizeof(root_only), "%s/root_only", root);
     fd = open(root_only, O_CREAT | O_WRONLY | O_TRUNC, 0644);
     if (fd < 0) {
-        unlink(sub_only);
         cleanup_mount(root);
-        TEST_FAIL(name, "create root marker failed");
-        return;
+        FAIL() << "create root marker failed";
     }
     close(fd);
 
     if (mount(subdir, target, NULL, MS_BIND, NULL) != 0) {
-        unlink(root_only);
-        unlink(sub_only);
         cleanup_mount(root);
-        TEST_FAIL(name, "bind mount failed");
-        return;
+        FAIL() << "bind mount failed";
     }
 
     snprintf(sub_only, sizeof(sub_only), "%s/sub_only", target);
     snprintf(root_only, sizeof(root_only), "%s/root_only", target);
+
     if (access(sub_only, F_OK) != 0) {
         umount(target);
         cleanup_mount(root);
-        TEST_FAIL(name, "subdir marker missing from bind target");
-        return;
+        FAIL() << "subdir marker missing from bind target";
     }
 
     if (access(root_only, F_OK) == 0) {
         umount(target);
         cleanup_mount(root);
-        TEST_FAIL(name, "bind target exposed source root instead of subdir root");
-        return;
+        FAIL() << "bind target exposed source root instead of subdir root";
     }
 
     if (umount(target) != 0) {
         cleanup_mount(root);
-        TEST_FAIL(name, "umount(bind subtree target) failed");
-        return;
+        FAIL() << "umount(bind subtree target) failed";
     }
     cleanup_mount(root);
-    TEST_PASS(name);
 }
 
-static void test_bind_remount_preserves_noatime(void) {
-    const char *name = "bind_remount_preserves_noatime";
-    const char *base = "/tmp/test_mount_reconfigure_atime";
+TEST(MountReconfigure, BindRemountPreservesNoatime) {
     const char *source = "/tmp/test_mount_reconfigure_atime/source";
     const char *target = "/tmp/test_mount_reconfigure_atime/target";
 
     ensure_dir("/tmp");
-    ensure_dir(base);
+    ensure_dir("/tmp/test_mount_reconfigure_atime");
     ensure_dir(source);
     ensure_dir(target);
 
     if (unshare(CLONE_NEWNS) != 0) {
-        TEST_SKIP(name, strerror(errno));
-        return;
+        GTEST_SKIP() << strerror(errno);
     }
 
     mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
 
     if (mount("", source, "ramfs", 0, NULL) != 0) {
-        TEST_SKIP(name, strerror(errno));
-        return;
+        GTEST_SKIP() << strerror(errno);
     }
 
     if (mount(source, target, NULL, MS_BIND, NULL) != 0) {
         cleanup_mount(source);
-        TEST_FAIL(name, "bind mount failed");
-        return;
+        FAIL() << "bind mount failed";
     }
 
     if (mount(target, target, NULL, MS_BIND | MS_REMOUNT | MS_NOATIME, NULL) != 0) {
         umount(target);
         cleanup_mount(source);
-        TEST_FAIL(name, "set noatime on bind mount failed");
-        return;
+        FAIL() << "set noatime on bind mount failed";
     }
 
     if (!mount_has_option(target, "noatime") || mount_has_option(target, "relatime")) {
         umount(target);
         cleanup_mount(source);
-        TEST_FAIL(name, "bind mount did not enter noatime state");
-        return;
+        FAIL() << "bind mount did not enter noatime state";
     }
 
     if (mount(target, target, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) != 0) {
         umount(target);
         cleanup_mount(source);
-        TEST_FAIL(name, "readonly bind remount failed");
-        return;
+        FAIL() << "readonly bind remount failed";
     }
 
     if (!mount_has_option(target, "noatime")) {
         umount(target);
         cleanup_mount(source);
-        TEST_FAIL(name, "readonly bind remount lost noatime");
-        return;
+        FAIL() << "readonly bind remount lost noatime";
     }
 
     if (mount_has_option(target, "relatime")) {
         umount(target);
         cleanup_mount(source);
-        TEST_FAIL(name, "readonly bind remount unexpectedly enabled relatime");
-        return;
+        FAIL() << "readonly bind remount unexpectedly enabled relatime";
     }
 
     umount(target);
     cleanup_mount(source);
-    TEST_PASS(name);
 }
 
-static void test_bind_remount_requires_mount_root(void) {
-    const char *name = "bind_remount_requires_mount_root";
-    const char *base = "/tmp/test_mount_reconfigure_mount_root";
+TEST(MountReconfigure, BindRemountRequiresMountRoot) {
     const char *source = "/tmp/test_mount_reconfigure_mount_root/source";
     const char *target = "/tmp/test_mount_reconfigure_mount_root/target";
     const char *source_subdir = "/tmp/test_mount_reconfigure_mount_root/source/subdir";
 
     ensure_dir("/tmp");
-    ensure_dir(base);
+    ensure_dir("/tmp/test_mount_reconfigure_mount_root");
     ensure_dir(source);
     ensure_dir(target);
 
     if (unshare(CLONE_NEWNS) != 0) {
-        TEST_SKIP(name, strerror(errno));
-        return;
+        GTEST_SKIP() << strerror(errno);
     }
 
     mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
 
     if (mount("", source, "ramfs", 0, NULL) != 0) {
-        TEST_SKIP(name, strerror(errno));
-        return;
+        GTEST_SKIP() << strerror(errno);
     }
 
     if (ensure_dir(source_subdir) != 0) {
         cleanup_mount(source);
-        TEST_FAIL(name, "create source subdir failed");
-        return;
+        FAIL() << "create source subdir failed";
     }
 
     if (mount(source, target, NULL, MS_BIND, NULL) != 0) {
         cleanup_mount(source);
-        TEST_FAIL(name, "bind mount failed");
-        return;
+        FAIL() << "bind mount failed";
     }
 
     if (mount(source_subdir, source_subdir, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) == 0) {
         umount(target);
         cleanup_mount(source);
-        TEST_FAIL(name, "bind remount unexpectedly accepted non-root target");
-        return;
+        FAIL() << "bind remount unexpectedly accepted non-root target";
     }
 
     if (errno != EINVAL) {
         umount(target);
         cleanup_mount(source);
-        TEST_FAIL(name, "expected EINVAL for non-root bind remount target");
-        return;
+        FAIL() << "expected EINVAL for non-root bind remount target";
     }
 
     umount(target);
     cleanup_mount(source);
-    TEST_PASS(name);
 }
 
-static void test_bind_remount_setxattr_readonly(void) {
-    const char *name = "bind_remount_setxattr_readonly";
-    const char *base = "/tmp/test_mount_reconfigure_xattr";
+TEST(MountReconfigure, BindRemountSetxattrReadonly) {
     const char *source = "/tmp/test_mount_reconfigure_xattr/source";
     const char *target = "/tmp/test_mount_reconfigure_xattr/target";
     char src_file[256];
@@ -470,139 +391,113 @@ static void test_bind_remount_setxattr_readonly(void) {
     int fd;
 
     ensure_dir("/tmp");
-    ensure_dir(base);
+    ensure_dir("/tmp/test_mount_reconfigure_xattr");
     ensure_dir(source);
     ensure_dir(target);
 
     if (unshare(CLONE_NEWNS) != 0) {
-        TEST_SKIP(name, strerror(errno));
-        return;
+        GTEST_SKIP() << strerror(errno);
     }
 
     mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
 
     if (mount("", source, "ramfs", 0, NULL) != 0) {
-        TEST_SKIP(name, strerror(errno));
-        return;
+        GTEST_SKIP() << strerror(errno);
     }
 
     snprintf(src_file, sizeof(src_file), "%s/source.txt", source);
     fd = open(src_file, O_CREAT | O_WRONLY | O_TRUNC, 0644);
     if (fd < 0) {
         cleanup_mount(source);
-        TEST_FAIL(name, "create source file failed");
-        return;
+        FAIL() << "create source file failed";
     }
     close(fd);
 
     if (setxattr(src_file, "user.mount_ro", "before", 6, 0) != 0) {
         if (errno == ENOTSUP || errno == ENOSYS) {
             cleanup_mount(source);
-            TEST_SKIP(name, "xattr not supported");
-            return;
+            GTEST_SKIP() << "xattr not supported";
         }
         cleanup_mount(source);
-        TEST_FAIL(name, "initial setxattr failed");
-        return;
+        FAIL() << "initial setxattr failed";
     }
 
     if (mount(source, target, NULL, MS_BIND, NULL) != 0) {
         cleanup_mount(source);
-        TEST_FAIL(name, "bind mount failed");
-        return;
+        FAIL() << "bind mount failed";
     }
 
     if (mount(target, target, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) != 0) {
         umount(target);
         cleanup_mount(source);
-        TEST_FAIL(name, "readonly bind remount failed");
-        return;
+        FAIL() << "readonly bind remount failed";
     }
 
     snprintf(dst_file, sizeof(dst_file), "%s/source.txt", target);
     if (setxattr(dst_file, "user.mount_ro", "after", 5, XATTR_REPLACE) == 0) {
         umount(target);
         cleanup_mount(source);
-        TEST_FAIL(name, "readonly bind mount still allowed setxattr");
-        return;
+        FAIL() << "readonly bind mount still allowed setxattr";
     }
 
     if (errno != EROFS) {
         umount(target);
         cleanup_mount(source);
-        TEST_FAIL(name, "expected EROFS for setxattr on readonly bind mount");
-        return;
+        FAIL() << "expected EROFS for setxattr on readonly bind mount";
     }
 
     umount(target);
     cleanup_mount(source);
-    TEST_PASS(name);
 }
 
-static void test_bind_remount_strictatime_not_persisted(void) {
-    const char *name = "bind_remount_strictatime_not_persisted";
-    const char *base = "/tmp/test_mount_reconfigure_strictatime";
+TEST(MountReconfigure, BindRemountStrictatimeNotPersisted) {
     const char *source = "/tmp/test_mount_reconfigure_strictatime/source";
     const char *target = "/tmp/test_mount_reconfigure_strictatime/target";
 
     ensure_dir("/tmp");
-    ensure_dir(base);
+    ensure_dir("/tmp/test_mount_reconfigure_strictatime");
     ensure_dir(source);
     ensure_dir(target);
 
     if (unshare(CLONE_NEWNS) != 0) {
-        TEST_SKIP(name, strerror(errno));
-        return;
+        GTEST_SKIP() << strerror(errno);
     }
 
     mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
 
     if (mount("", source, "ramfs", 0, NULL) != 0) {
-        TEST_SKIP(name, strerror(errno));
-        return;
+        GTEST_SKIP() << strerror(errno);
     }
 
     if (mount(source, target, NULL, MS_BIND, NULL) != 0) {
         cleanup_mount(source);
-        TEST_FAIL(name, "bind mount failed");
-        return;
+        FAIL() << "bind mount failed";
     }
 
     if (mount(target, target, NULL, MS_BIND | MS_REMOUNT | MS_STRICTATIME, NULL) != 0) {
         umount(target);
         cleanup_mount(source);
-        TEST_FAIL(name, "strictatime bind remount failed");
-        return;
+        FAIL() << "strictatime bind remount failed";
     }
 
     if (mount_has_option(target, "strictatime")) {
         umount(target);
         cleanup_mount(source);
-        TEST_FAIL(name, "bind remount unexpectedly persisted strictatime");
-        return;
+        FAIL() << "bind remount unexpectedly persisted strictatime";
     }
 
     if (mount_has_option(target, "relatime") || mount_has_option(target, "noatime") ||
         mount_has_option(target, "nodiratime")) {
         umount(target);
         cleanup_mount(source);
-        TEST_FAIL(name, "strictatime bind remount left stale atime flags");
-        return;
+        FAIL() << "strictatime bind remount left stale atime flags";
     }
 
     umount(target);
     cleanup_mount(source);
-    TEST_PASS(name);
 }
 
-int main(void) {
-    test_bind_remount_readonly();
-    test_self_bind_subdir_remount_readonly();
-    test_bind_subdir_preserves_subtree_root();
-    test_bind_remount_preserves_noatime();
-    test_bind_remount_requires_mount_root();
-    test_bind_remount_setxattr_readonly();
-    test_bind_remount_strictatime_not_persisted();
-    printf("passed=%d failed=%d\n", tests_passed, tests_failed);
-    return tests_failed == 0 ? 0 : 1;
+int main(int argc, char **argv) {
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
 }

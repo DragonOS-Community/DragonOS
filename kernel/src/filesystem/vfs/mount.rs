@@ -225,6 +225,8 @@ impl MountId {
 pub struct MountFS {
     // MountFS内部的文件系统
     inner_filesystem: Arc<dyn FileSystem>,
+    /// 当前挂载暴露的根 inode。对 bind-mount 子目录时，这不是底层文件系统的全局根。
+    root_inner_inode: Arc<dyn IndexNode>,
     /// 用来存储InodeID->挂载点的MountFS的B树
     mountpoints: Mutex<BTreeMap<InodeId, Arc<MountFS>>>,
     /// 当前文件系统挂载到的那个挂载点的Inode
@@ -236,7 +238,7 @@ pub struct MountFS {
     propagation: Arc<MountPropagation>,
     mount_id: MountId,
 
-    mount_flags: MountFlags,
+    mount_flags: RwSem<MountFlags>,
     mount_source: RwSem<Option<String>>,
 }
 
@@ -277,21 +279,24 @@ pub struct MountFSInode {
 impl MountFS {
     pub fn new(
         inner_filesystem: Arc<dyn FileSystem>,
+        root_inner_inode: Option<Arc<dyn IndexNode>>,
         self_mountpoint: Option<Arc<MountFSInode>>,
         propagation: Arc<MountPropagation>,
         mnt_ns: Option<&Arc<MntNamespace>>,
         mount_flags: MountFlags,
         mount_source: Option<String>,
     ) -> Arc<Self> {
+        let root_inner_inode = root_inner_inode.unwrap_or_else(|| inner_filesystem.root_inode());
         let result = Arc::new_cyclic(|self_ref| MountFS {
             inner_filesystem,
+            root_inner_inode,
             mountpoints: Mutex::new(BTreeMap::new()),
             self_mountpoint: RwSem::new(self_mountpoint),
             self_ref: self_ref.clone(),
             namespace: Lazy::new(),
             propagation,
             mount_id: MountId::alloc(),
-            mount_flags,
+            mount_flags: RwSem::new(mount_flags),
             mount_source: RwSem::new(mount_source),
         });
 
@@ -309,13 +314,14 @@ impl MountFS {
 
         let mountfs = Arc::new_cyclic(|self_ref| MountFS {
             inner_filesystem: self.inner_filesystem.clone(),
+            root_inner_inode: self.root_inner_inode.clone(),
             mountpoints: Mutex::new(BTreeMap::new()),
             self_mountpoint: RwSem::new(self_mountpoint),
             self_ref: self_ref.clone(),
             namespace: Lazy::new(),
             propagation: new_propagation,
             mount_id: MountId::alloc(),
-            mount_flags: self.mount_flags,
+            mount_flags: RwSem::new(self.mount_flags()),
             mount_source: RwSem::new(mount_source),
         });
 
@@ -323,7 +329,16 @@ impl MountFS {
     }
 
     pub fn mount_flags(&self) -> MountFlags {
-        self.mount_flags
+        *self.mount_flags.read()
+    }
+
+    pub fn set_mount_flags(&self, mount_flags: MountFlags) {
+        *self.mount_flags.write() = mount_flags;
+    }
+
+    pub fn update_mount_flags(&self, update: impl FnOnce(&mut MountFlags)) {
+        let mut mount_flags = self.mount_flags.write();
+        update(&mut mount_flags);
     }
 
     pub fn add_mount(&self, inode_id: InodeId, mount_fs: Arc<MountFS>) -> Result<(), SystemError> {
@@ -395,7 +410,7 @@ impl MountFS {
     /// @brief 获取挂载点的文件系统的root inode
     pub fn mountpoint_root_inode(&self) -> Arc<MountFSInode> {
         return Arc::new_cyclic(|self_ref| MountFSInode {
-            inner_inode: self.inner_filesystem.root_inode(),
+            inner_inode: self.root_inner_inode.clone(),
             mount_fs: self.self_ref.upgrade().unwrap(),
             self_ref: self_ref.clone(),
         });
@@ -403,6 +418,10 @@ impl MountFS {
 
     pub fn inner_filesystem(&self) -> Arc<dyn FileSystem> {
         return self.inner_filesystem.clone();
+    }
+
+    pub fn root_inner_inode(&self) -> Arc<dyn IndexNode> {
+        self.root_inner_inode.clone()
     }
 
     pub fn self_ref(&self) -> Arc<Self> {
@@ -438,9 +457,69 @@ impl Drop for MountFS {
 }
 
 impl MountFSInode {
+    #[inline]
+    fn ensure_mount_writable(&self) -> Result<(), SystemError> {
+        if self.mount_fs.mount_flags().contains(MountFlags::RDONLY) {
+            return Err(SystemError::EROFS);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mount_subtree(
+        &self,
+        inner_fs: Arc<dyn FileSystem>,
+        root_inner_inode: Arc<dyn IndexNode>,
+        mount_flags: MountFlags,
+    ) -> Result<Arc<MountFS>, SystemError> {
+        let metadata = self.inner_inode.metadata()?;
+        if metadata.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+
+        let parent_propagation = self.mount_fs.propagation();
+        let new_propagation = if parent_propagation.is_shared() {
+            MountPropagation::new_shared()
+        } else {
+            MountPropagation::new_private()
+        };
+
+        let new_mount_fs = MountFS::new(
+            inner_fs,
+            Some(root_inner_inode),
+            Some(self.self_ref.upgrade().unwrap()),
+            new_propagation,
+            Some(&ProcessManager::current_mntns()),
+            mount_flags,
+            None,
+        );
+
+        self.mount_fs
+            .add_mount(metadata.inode_id, new_mount_fs.clone())?;
+
+        let mount_path = Arc::new(MountPath::from(self.absolute_path()?));
+        ProcessManager::current_mntns().add_mount(
+            Some(metadata.inode_id),
+            mount_path,
+            new_mount_fs.clone(),
+        )?;
+
+        if new_mount_fs.propagation().is_shared() {
+            let group_id = new_mount_fs.propagation().peer_group_id();
+            register_peer(group_id, &new_mount_fs);
+        }
+
+        if parent_propagation.is_shared() {
+            if let Err(e) = propagate_mount(&self.mount_fs, metadata.inode_id, &new_mount_fs) {
+                log::warn!("mount: propagation failed: {:?}", e);
+            }
+        }
+
+        Ok(new_mount_fs)
+    }
+
     /// 返回被挂载包装器包裹的底层 inode。
     #[inline]
-    pub(super) fn underlying_inode(&self) -> Arc<dyn IndexNode> {
+    pub(crate) fn underlying_inode(&self) -> Arc<dyn IndexNode> {
         self.inner_inode.clone()
     }
 
@@ -469,7 +548,7 @@ impl MountFSInode {
 
     /// @brief 判断当前inode是否为它所在的文件系统的root inode
     fn is_mountpoint_root(&self) -> Result<bool, SystemError> {
-        return Ok(self.inner_inode.fs().root_inode().metadata()?.inode_id
+        return Ok(self.mount_fs.root_inner_inode().metadata()?.inode_id
             == self.inner_inode.metadata()?.inode_id);
     }
 
@@ -692,6 +771,7 @@ impl IndexNode for MountFSInode {
         mode: InodeMode,
         data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.ensure_mount_writable()?;
         let inner_inode = self
             .inner_inode
             .create_with_data(name, file_type, mode, data)?;
@@ -703,6 +783,7 @@ impl IndexNode for MountFSInode {
     }
 
     fn truncate(&self, len: usize) -> Result<(), SystemError> {
+        self.ensure_mount_writable()?;
         return self.inner_inode.truncate(len);
     }
 
@@ -723,6 +804,7 @@ impl IndexNode for MountFSInode {
         buf: &[u8],
         data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        self.ensure_mount_writable()?;
         return self.inner_inode.write_at(offset, len, buf, data);
     }
 
@@ -743,6 +825,7 @@ impl IndexNode for MountFSInode {
         buf: &[u8],
         data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        self.ensure_mount_writable()?;
         self.inner_inode.write_direct(offset, len, buf, data)
     }
 
@@ -773,11 +856,13 @@ impl IndexNode for MountFSInode {
 
     #[inline]
     fn set_metadata(&self, metadata: &super::Metadata) -> Result<(), SystemError> {
+        self.ensure_mount_writable()?;
         return self.inner_inode.set_metadata(metadata);
     }
 
     #[inline]
     fn resize(&self, len: usize) -> Result<(), SystemError> {
+        self.ensure_mount_writable()?;
         return self.inner_inode.resize(len);
     }
 
@@ -788,6 +873,7 @@ impl IndexNode for MountFSInode {
         file_type: FileType,
         mode: InodeMode,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.ensure_mount_writable()?;
         let inner_inode = self.inner_inode.create(name, file_type, mode)?;
         return Ok(Arc::new_cyclic(|self_ref| MountFSInode {
             inner_inode,
@@ -797,6 +883,7 @@ impl IndexNode for MountFSInode {
     }
 
     fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
+        self.ensure_mount_writable()?;
         // 文件系统实现期望 `other` 是同一具体文件系统的 inode（例如 LockedExt4Inode）。当启用 VFS 挂载包装时，
         // `other` 通常是 `MountFSInode`，这会导致文件系统层面的向下转换失败并错误地返回 EINVAL。
         //
@@ -811,6 +898,7 @@ impl IndexNode for MountFSInode {
     }
 
     fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.ensure_mount_writable()?;
         let inner_inode = self.inner_inode.symlink(name, target)?;
         Ok(Arc::new_cyclic(|self_ref| MountFSInode {
             inner_inode,
@@ -822,6 +910,7 @@ impl IndexNode for MountFSInode {
     /// @brief 在挂载文件系统中删除文件/文件夹
     #[inline]
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
+        self.ensure_mount_writable()?;
         let inode_id = self.inner_inode.find(name)?.metadata()?.inode_id;
 
         // 先检查这个inode是否为一个挂载点，如果当前inode是一个挂载点，那么就不能删除这个inode
@@ -834,6 +923,7 @@ impl IndexNode for MountFSInode {
 
     #[inline]
     fn rmdir(&self, name: &str) -> Result<(), SystemError> {
+        self.ensure_mount_writable()?;
         let inode_id = self.inner_inode.find(name)?.metadata()?.inode_id;
 
         // 先检查这个inode是否为一个挂载点，如果当前inode是一个挂载点，那么就不能删除这个inode
@@ -854,6 +944,7 @@ impl IndexNode for MountFSInode {
         new_name: &str,
         flags: RenameFlags,
     ) -> Result<(), SystemError> {
+        self.ensure_mount_writable()?;
         // Filesystem implementations generally expect `target` to be an inode
         // of the same concrete FS (e.g. tmpfs' LockedTmpfsInode). When VFS
         // mount wrapping is enabled, `target` is often a `MountFSInode`, which
@@ -928,64 +1019,16 @@ impl IndexNode for MountFSInode {
         fs: Arc<dyn FileSystem>,
         mount_flags: MountFlags,
     ) -> Result<Arc<MountFS>, SystemError> {
-        let metadata = self.inner_inode.metadata()?;
-        if metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
-
-        // 若已有挂载系统，保证MountFS只包一层
-        let to_mount_fs = fs
+        let (to_mount_fs, root_inner_inode) = fs
             .clone()
             .downcast_arc::<MountFS>()
-            .map(|it| it.inner_filesystem())
-            .unwrap_or(fs);
+            .map(|it| (it.inner_filesystem(), it.root_inner_inode()))
+            .unwrap_or_else(|| {
+                let root_inner_inode = fs.root_inode();
+                (fs, root_inner_inode)
+            });
 
-        // Check if parent mount is shared - if so, new mount should also be shared
-        let parent_propagation = self.mount_fs.propagation();
-        let new_propagation = if parent_propagation.is_shared() {
-            // Create shared propagation with a new group
-            MountPropagation::new_shared()
-        } else {
-            MountPropagation::new_private()
-        };
-
-        let new_mount_fs = MountFS::new(
-            to_mount_fs,
-            Some(self.self_ref.upgrade().unwrap()),
-            new_propagation,
-            Some(&ProcessManager::current_mntns()),
-            mount_flags,
-            None,
-        );
-
-        // Perform all potentially-failing operations first before registering in peer group
-        self.mount_fs
-            .add_mount(metadata.inode_id, new_mount_fs.clone())?;
-
-        let mount_path = self.absolute_path();
-        let mount_path = Arc::new(MountPath::from(mount_path?));
-        ProcessManager::current_mntns().add_mount(
-            Some(metadata.inode_id),
-            mount_path,
-            new_mount_fs.clone(),
-        )?;
-
-        // Now that all operations succeeded, register in peer group if shared
-        // This ensures we don't leave dangling registrations if earlier operations fail
-        if new_mount_fs.propagation().is_shared() {
-            let group_id = new_mount_fs.propagation().peer_group_id();
-            register_peer(group_id, &new_mount_fs);
-        }
-
-        // Propagate this mount to all peers and slaves of the parent mount
-        if parent_propagation.is_shared() {
-            if let Err(e) = propagate_mount(&self.mount_fs, metadata.inode_id, &new_mount_fs) {
-                log::warn!("mount: propagation failed: {:?}", e);
-                // Don't fail the mount, just log warning
-            }
-        }
-
-        return Ok(new_mount_fs);
+        self.mount_subtree(to_mount_fs, root_inner_inode, mount_flags)
     }
 
     fn mount_from(&self, from: Arc<dyn IndexNode>) -> Result<Arc<MountFS>, SystemError> {
@@ -1042,6 +1085,7 @@ impl IndexNode for MountFSInode {
         mode: InodeMode,
         dev_t: DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.ensure_mount_writable()?;
         let inner_inode = self.inner_inode.mknod(filename, mode, dev_t)?;
         return Ok(Arc::new_cyclic(|self_ref| MountFSInode {
             inner_inode,
@@ -1085,6 +1129,7 @@ impl IndexNode for MountFSInode {
     }
 
     fn write_sync(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        self.ensure_mount_writable()?;
         self.inner_inode.write_sync(offset, buf)
     }
 
@@ -1093,6 +1138,7 @@ impl IndexNode for MountFSInode {
     }
 
     fn setxattr(&self, name: &str, value: &[u8]) -> Result<usize, SystemError> {
+        self.ensure_mount_writable()?;
         self.inner_inode.setxattr(name, value)
     }
 }
@@ -1124,7 +1170,7 @@ impl FileSystem for MountFS {
     }
     fn super_block(&self) -> SuperBlock {
         let mut sb = self.inner_filesystem.super_block();
-        sb.flags = self.mount_flags.bits() as u64;
+        sb.flags = self.mount_flags().bits() as u64;
         sb
     }
 
@@ -1135,7 +1181,7 @@ impl FileSystem for MountFS {
             .map(|mnt| mnt.inner_inode.clone())
             .unwrap_or_else(|| inode.clone());
         let mut sb = self.inner_filesystem.statfs(&inner_inode)?;
-        sb.flags = self.mount_flags.bits() as u64;
+        sb.flags = self.mount_flags().bits() as u64;
         Ok(sb)
     }
 
@@ -1390,7 +1436,7 @@ impl Debug for MountList {
 /// - `true`: 是根inode
 /// - `false`: 不是根inode或者传入的inode不是MountFSInode类型，或者调用inode的metadata方法时报错了。
 pub fn is_mountpoint_root(inode: &Arc<dyn IndexNode>) -> bool {
-    let mnt_inode = inode.as_any_ref().downcast_ref::<MountFSInode>();
+    let mnt_inode = inode.clone().downcast_arc::<MountFSInode>();
     if let Some(mnt) = mnt_inode {
         return mnt.is_mountpoint_root().unwrap_or(false);
     }

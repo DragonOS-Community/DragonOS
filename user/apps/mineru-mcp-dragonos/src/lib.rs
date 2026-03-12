@@ -13,6 +13,7 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use thiserror::Error;
@@ -20,6 +21,15 @@ use tokio::time::sleep;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 use walkdir::WalkDir;
+
+// HTTP 健康检查相关
+use axum::{
+    extract::State,
+    response::Json as AxumJson,
+    routing::get,
+    Router,
+};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -196,6 +206,18 @@ pub struct MineruServer {
     settings: Settings,
     client: reqwest::Client,
     tool_router: ToolRouter<Self>,
+    healthy: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HealthCheckResponse {
+    pub status: String,
+    pub server: String,
+    pub timestamp: String,
+    pub api_mode: String,
+    pub api_base: String,
+    pub has_api_key: bool,
+    pub version: &'static str,
 }
 
 #[tool_router]
@@ -209,6 +231,7 @@ impl MineruServer {
             settings,
             client,
             tool_router: Self::tool_router(),
+            healthy: Arc::new(AtomicBool::new(true)),
         })
     }
 
@@ -987,6 +1010,43 @@ fn init_tracing() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
+/// 启动 HTTP 健康检查服务器
+pub async fn run_health_check_server(
+    server: MineruServer,
+    port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let app = Router::new()
+        .route("/health", get(health_handler))
+        .route("/", get(root_handler))
+        .with_state(server);
+
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
+    info!("健康检查服务器启动在 http://0.0.0.0:{}", port);
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn health_handler(State(server): State<MineruServer>) -> AxumJson<HealthCheckResponse> {
+    let is_healthy = server.healthy.load(Ordering::Relaxed);
+    AxumJson(HealthCheckResponse {
+        status: if is_healthy { "ok".to_string() } else { "error".to_string() },
+        server: "mineru-mcp-dragonos".to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        api_mode: if server.settings.use_local_api { "local".to_string() } else { "remote".to_string() },
+        api_base: if server.settings.use_local_api {
+            server.settings.local_mineru_api_base.clone()
+        } else {
+            server.settings.mineru_api_base.clone()
+        },
+        has_api_key: server.settings.mineru_api_key.is_some(),
+        version: env!("CARGO_PKG_VERSION"),
+    })
+}
+
+async fn root_handler() -> &'static str {
+    "MinerU MCP DragonOS Server - Health Check: GET /health"
+}
+
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
     let settings = Settings::from_env();
@@ -994,7 +1054,25 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         warn!("MINERU_API_KEY 未设置，远程解析将失败");
     }
     let server = MineruServer::new(settings)?;
-    let service = server.serve(stdio()).await.inspect_err(|err| {
+
+    // 从环境变量读取健康检查端口，默认 3000
+    let health_port = env::var("HEALTH_CHECK_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(3000);
+
+    // 启动 HTTP 健康检查服务器
+    let server_clone = server.clone();
+    tokio::spawn(async move {
+        if let Err(err) = run_health_check_server(server_clone, health_port).await {
+            error!("健康检查服务器错误: {err}");
+        }
+    });
+
+    // 启动 MCP stdio 服务
+    let service = server.serve(stdio())
+        .await
+        .inspect_err(|err| {
         error!("启动MCP服务失败: {err}");
     })?;
     service.waiting().await?;

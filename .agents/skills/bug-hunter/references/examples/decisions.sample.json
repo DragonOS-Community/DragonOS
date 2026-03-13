@@ -1,0 +1,20 @@
+[
+  {
+    "agent": "Security Sentinel",
+    "status": "accepted",
+    "bucket_id": "BUG-001",
+    "reason": "fixed by permission check patch"
+  },
+  {
+    "agent": "Diverse Reviewer C",
+    "status": "accepted",
+    "bucket_id": "BUG-002",
+    "reason": "error path fixed"
+  },
+  {
+    "agent": "Concurrency Engineer",
+    "status": "rejected",
+    "bucket_id": "BUG-003",
+    "reason": "cannot reproduce race"
+  }
+]

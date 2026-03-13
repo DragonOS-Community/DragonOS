@@ -43,6 +43,11 @@
 }
 ```
 
+推荐扩展字段：
+
+- `pass_id` `int>=1` 可选
+  表示该 finding 来自 `shuffled_passes.json` 的哪一轮输入，便于复盘 Stage 2 抽样行为。后续脚本应忽略未识别字段，因此该字段不会影响 Stage 3/4。
+
 ## 4. buckets.json
 
 `semantic_bucket.py` 输出：
@@ -66,7 +71,38 @@
 }
 ```
 
-## 5. debate_candidates.json
+## 5. shuffled_passes.json
+
+`shuffle_diff.py` 输出：
+
+```json
+{
+  "schema_version": "1.0",
+  "strategy": "deterministic_file_and_hunk_shuffle",
+  "original_block_count": 2,
+  "passes": [
+    {
+      "pass_id": 1,
+      "seed": 123456789,
+      "file_order": ["kernel/src/foo.rs", "kernel/src/bar.rs"],
+      "block_count": 2,
+      "diff": "diff --git a/..."
+    }
+  ]
+}
+```
+
+字段约束：
+
+- `strategy`：当前固定为 `deterministic_file_and_hunk_shuffle`
+- `original_block_count`：原始 diff 中按文件切分的 block 数量
+- `passes[*].pass_id`：从 `1` 开始递增
+- `passes[*].seed`：该轮派生 seed，便于复现
+- `passes[*].file_order`：该轮文件 block 顺序
+- `passes[*].block_count`：该轮 block 数量
+- `passes[*].diff`：重排后的完整 unified diff 文本
+
+## 6. debate_candidates.json
 
 `debate_picker.py` 输出：
 
@@ -87,7 +123,7 @@
 }
 ```
 
-## 6. verdict.json
+## 7. verdict.json
 
 `weighted_vote.py` 输出：
 
@@ -111,7 +147,7 @@
 - `consensus_strength`
 - `findings`
 
-## 7. decisions.json
+## 8. decisions.json
 
 `update_resolution_history.py` 输入：
 
@@ -129,7 +165,7 @@
 
 兼容策略：只要包含 `agent` + `status` 即可。
 
-## 8. review_history.json / weight_suggestion.json
+## 9. review_history.json / weight_suggestion.json
 
 - `review_history.json`：累计接受率、拒绝率、分角色统计。
 - `weight_suggestion.json`：建议权重，格式为：

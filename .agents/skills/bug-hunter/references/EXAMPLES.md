@@ -19,15 +19,27 @@ git diff "$(git merge-base HEAD "$BASE_REF")"...HEAD > /tmp/current.diff
 2) Stage1 随机化输入
 
 ```bash
-python3 .agents/skills/bug-hunter/scripts/run_pipeline.py \
-  --diff-file /tmp/current.diff \
-  --raw-findings artifacts/raw_findings.json \
-  --out-dir artifacts
+python3 .agents/skills/bug-hunter/scripts/redact_sensitive.py \
+  /tmp/current.diff \
+  -o artifacts/redacted.diff
+
+python3 .agents/skills/bug-hunter/scripts/shuffle_diff.py \
+  artifacts/redacted.diff \
+  --passes 8 \
+  -o artifacts/shuffled_passes.json
 ```
 
-说明：此时需要先准备 `artifacts/raw_findings.json`（由并行评审产出）。
+说明：`artifacts/shuffled_passes.json` 交给外部 Stage2 编排器。编排器应为每个 persona 随机抽取 1 个 `passes[*].diff`，并把 8 个 agent 的输出汇总为 `artifacts/raw_findings.json`。
 
 3) 并行评审（外部编排器）后写入 `raw_findings.json`
+
+最小编排要求：
+
+- 8 个 agent 并行启动
+- 每个 agent persona 固定
+- 每个 agent 从 `shuffled_passes.json` 随机选取 1 个 pass
+- 每个 agent 只返回 JSON findings
+- 编排器统一汇总为 `raw_findings.json`
 
 4) 运行 Stage3/4 报告链路
 
@@ -40,6 +52,9 @@ python3 .agents/skills/bug-hunter/scripts/run_pipeline.py \
 
 ### 输出
 
+- `artifacts/redacted.diff`
+- `artifacts/shuffled_passes.json`
+- `artifacts/raw_findings.validated.json`
 - `artifacts/buckets.json`
 - `artifacts/debate_candidates.json`
 - `artifacts/verdict.json`
@@ -61,7 +76,8 @@ python3 .agents/skills/bug-hunter/scripts/run_pipeline.py \
       "description": "wait4 path forgets to propagate rusage error code",
       "fix_code": "return_errno!(Errno::ECHILD);",
       "confidence": 0.78,
-      "agent": "Diverse Reviewer C"
+      "agent": "Diverse Reviewer C",
+      "pass_id": 4
     }
   ]
 }

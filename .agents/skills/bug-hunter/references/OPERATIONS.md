@@ -36,6 +36,7 @@ python3 .agents/skills/bug-hunter/scripts/run_pipeline.py \
 
 - `redacted.diff`
 - `shuffled_passes.json`
+- `raw_findings.validated.json`
 - `buckets.json`
 - `debate_candidates.json`
 - `verdict.json`
@@ -86,3 +87,5 @@ python3 .agents/skills/bug-hunter/scripts/run_pipeline.py \
 - 强烈建议：`agent,fix_code`
 
 缺失 `agent` 会导致降级为默认角色权重。
+
+当从 diff 开始时，Stage2 应消费 `artifacts/shuffled_passes.json` 的 `passes[*].diff`，而不是直接读取原始 diff。

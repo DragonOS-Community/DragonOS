@@ -9,7 +9,16 @@
 - 确认 `--raw-findings` 路径存在。
 - 先运行外部 Stage2，生成 `raw_findings.json`。
 
-## 2. 校验失败：缺字段或类型错误
+## 2. `shuffle_diff.py` 输出路径不存在
+
+现象：写 `artifacts/shuffled_passes.json` 时提示 `No such file or directory`。
+
+排查：
+
+- 使用当前版本 `shuffle_diff.py`，脚本会自动创建输出目录。
+- 若仍失败，检查目标路径是否被同名普通文件占用。
+
+## 3. 校验失败：缺字段或类型错误
 
 现象：`validate_findings.py` 报错 `missing required field` 或 `confidence out of range`。
 
@@ -19,7 +28,7 @@
 - 确认 `line` 为整数且 `>=1`。
 - 确认 `confidence` 在 `[0,1]`。
 
-## 3. `weighted_vote.py` 权重文件格式不兼容
+## 4. `weighted_vote.py` 权重文件格式不兼容
 
 现象：分数异常或所有角色权重都变成默认值。
 
@@ -29,7 +38,7 @@
 - 或使用扁平映射 `{"Security Sentinel": 5.0, ...}`。
 - 检查角色名是否与 `persona_matrix.json` 一致。
 
-## 4. 报告为空（Accepted findings = 0）
+## 5. 报告为空（Accepted findings = 0）
 
 现象：`bug_hunter_report.md` 里无通过项。
 
@@ -39,7 +48,7 @@
 - 确认 Stage2 输出提供了合理 `confidence`。
 - 检查 `fix_code` 是否长期缺失（会被惩罚）。
 
-## 5. 聚类过度，多个问题被并成一个桶
+## 6. 聚类过度，多个问题被并成一个桶
 
 现象：`buckets.json` 数量显著少于原始 findings。
 
@@ -49,7 +58,17 @@
 - 缩小 `--line-window`。
 - 检查描述文本是否过于模板化（导致高相似度）。
 
-## 6. 安全隔离执行不规范
+## 7. 从 diff 启动 pipeline 时失败
+
+现象：`run_pipeline.py --diff-file ...` 在 Stage1 直接退出。
+
+排查：
+
+- 确认 `scripts/shuffle_diff.py` 存在并可执行。
+- 先单独执行 `redact_sensitive.py` 与 `shuffle_diff.py`，确认输入 diff 是合法 unified diff。
+- 若 diff 不含 `diff --git` 头，`shuffle_diff.py` 会退化为单 block 输出，属于可接受行为。
+
+## 8. 安全隔离执行不规范
 
 现象：中间产物混写、路径污染。
 

@@ -165,6 +165,38 @@ impl BoundInner {
     }
 }
 
+/// Validate the Linux dual-stack rule for an AF_INET6 socket that has already
+/// been bound to a concrete local address.
+///
+/// Linux 6.6 keeps the effective local address family once an IPv6 socket is
+/// bound to a specific address:
+/// - bound to a native IPv6 address, then sending to an IPv4-mapped peer
+///   returns `ENETUNREACH`
+/// - bound to an IPv4-mapped address, then sending to a native IPv6 peer
+///   returns `EAFNOSUPPORT`
+///
+/// Unspecified local addresses (`::`) remain dual-stack and therefore bypass
+/// this check.
+#[inline]
+pub fn ensure_bound_dual_stack_remote_compatible(
+    local_addr: smoltcp::wire::IpAddress,
+    remote_addr: smoltcp::wire::IpAddress,
+) -> Result<(), SystemError> {
+    if local_addr.is_unspecified() {
+        return Ok(());
+    }
+
+    match (local_addr, remote_addr) {
+        (smoltcp::wire::IpAddress::Ipv6(_), smoltcp::wire::IpAddress::Ipv4(_)) => {
+            Err(SystemError::ENETUNREACH)
+        }
+        (smoltcp::wire::IpAddress::Ipv4(_), smoltcp::wire::IpAddress::Ipv6(_)) => {
+            Err(SystemError::EAFNOSUPPORT)
+        }
+        _ => Ok(()),
+    }
+}
+
 #[inline]
 pub fn get_iface_to_bind(
     ip_addr: &smoltcp::wire::IpAddress,

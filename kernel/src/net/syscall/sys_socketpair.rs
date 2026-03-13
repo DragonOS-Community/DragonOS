@@ -117,19 +117,25 @@ pub(super) fn do_socketpair(
 ) -> Result<usize, SystemError> {
     let address_family = AddressFamily::try_from(address_family as u16)?;
     let socket_type = PosixArgsSocketType::from_bits_truncate(socket_type as u32);
-    let stype = socket::PSOCK::try_from(socket_type)?;
+    let stype = match socket::PSOCK::try_from(socket_type) {
+        Ok(stype) => stype,
+        Err(SystemError::EINVAL) => return Err(SystemError::ESOCKTNOSUPPORT),
+        Err(err) => return Err(err),
+    };
 
     let binding = ProcessManager::current_pcb().fd_table();
     let mut fd_table_guard = binding.write();
 
-    // check address family, only support AF_UNIX
+    // Linux socketpair(2) semantics:
+    // - known non-UNIX families with a valid type return EOPNOTSUPP
+    // - invalid/unsupported type returns ESOCKTNOSUPPORT before family-specific pairing logic
     if address_family != AddressFamily::Unix {
         log::warn!(
-            "only support AF_UNIX, {:?} with protocol {:?} is not supported",
+            "socketpair is not supported for {:?} with protocol {:?}",
             address_family,
             protocol
         );
-        return Err(SystemError::EAFNOSUPPORT);
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
     // Linux: if protocol is non-zero and not PF_UNIX/AF_UNIX, return EPROTONOSUPPORT.

@@ -27,7 +27,10 @@ use core::sync::atomic::{
 };
 use smoltcp::wire::{IpAddress::*, IpEndpoint, IpListenEndpoint, IpVersion};
 
-use super::{InetSocket, UNSPECIFIED_LOCAL_ENDPOINT_V4, UNSPECIFIED_LOCAL_ENDPOINT_V6};
+use super::{
+    common::ensure_bound_dual_stack_remote_compatible, InetSocket, UNSPECIFIED_LOCAL_ENDPOINT_V4,
+    UNSPECIFIED_LOCAL_ENDPOINT_V6,
+};
 
 mod option;
 
@@ -286,6 +289,23 @@ impl UdpSocket {
         } else {
             Ok(payload_len)
         }
+    }
+
+    #[inline]
+    fn validate_bound_send_dest(
+        &self,
+        bound: &inner::BoundUdp,
+        dest: IpEndpoint,
+    ) -> Result<(), SystemError> {
+        if self.ip_version != IpVersion::Ipv6 {
+            return Ok(());
+        }
+
+        if let Some(local_addr) = bound.endpoint().addr {
+            ensure_bound_dual_stack_remote_compatible(local_addr, dest.addr)?;
+        }
+
+        Ok(())
     }
 
     fn loopback_accepts_with_preconnect(
@@ -858,6 +878,7 @@ impl UdpSocket {
                     let dest = to
                         .or_else(|| bound.remote_endpoint().ok())
                         .ok_or(SystemError::EDESTADDRREQ)?;
+                    self.validate_bound_send_dest(bound, dest)?;
                     let bound_iface = bound.inner().iface().clone();
                     let is_multicast = dest.addr.is_multicast();
                     let mcast_ifindex = if is_multicast {

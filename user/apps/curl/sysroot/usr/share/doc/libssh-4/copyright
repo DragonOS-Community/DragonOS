@@ -1,0 +1,315 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: libssh
+Upstream-Contact: libssh@libssh.org
+                  Andreas Schneider <asn@cryptomilk.org>
+Source: https://git.libssh.org/projects/libssh.git
+
+Files: *
+Copyright: *No copyright*
+License: LGPL-2.1+~OpenSSL
+Comment:
+ Using license from COPYING file.
+
+Files: include/libssh/*.h
+       src/*.c
+       tests/benchmarks/bench_raw.c
+       tests/benchmarks/bench_scp.c
+       tests/benchmarks/bench_sftp.c
+       tests/benchmarks/benchmarks.c
+       tests/benchmarks/benchmarks.h
+       tests/benchmarks/latency.c
+       tests/client/torture_algorithms.c
+       tests/client/torture_auth.c
+       tests/client/torture_connect.c
+       tests/client/torture_knownhosts.c
+       tests/client/torture_session.c
+       tests/test_socket.c
+Copyright: 2003-2021, Aris Adamantiadis
+           2008-2018 Andreas Schneider <asn@cryptomilk.org>
+           2017 Sartura d.o.o.
+           2019 by Red Hat, Inc.
+           2020 by Heiko Thiery
+           1997 Niels Provos <provos@physnet.uni-hamburg.de>
+           2018-2019 by Anderson Toshiyuki Sasaki - Red Hat, Inc.
+           2019 Simo Sorce - Red Hat, Inc.
+License: LGPL-2.1+~OpenSSL
+
+Files: examples/exec.c
+       examples/senddata.c
+       examples/CMakeLists.txt
+       include/libssh/ssh2.h
+       tests/benchmarks/bench1.sh
+       tests/benchmarks/bench2.sh
+       tests/chmodtest.c
+       tests/client/torture_proxycommand.c
+       tests/client/torture_sftp_dir.c
+       tests/client/torture_sftp_read.c
+       tests/cmdline.c
+       tests/generate.py
+       tests/unittests/torture_buffer.c
+       tests/unittests/torture_callbacks.c
+       tests/unittests/torture_channel.c
+       tests/unittests/torture_init.c
+       tests/unittests/torture_isipaddr.c
+       tests/unittests/torture_keyfiles.c
+       tests/unittests/torture_list.c
+       tests/unittests/torture_misc.c
+       tests/unittests/torture_options.c
+       tests/unittests/torture_pki.c
+       tests/unittests/torture_rand.c
+Copyright: *No copyright*
+License: LGPL-2.1+~OpenSSL
+Comment:
+ Using license from COPYING file.
+
+Files: examples/authentication.c
+       examples/connect_ssh.c
+       examples/examples_common.h
+       examples/knownhosts.c
+       examples/libssh_scp.c
+       examples/libsshpp.cpp
+       examples/libsshpp_noexcept.cpp
+       examples/proxy.c
+       examples/samplesftp.c
+       examples/samplesshd-cb.c
+       examples/samplesshd-kbdint.c
+       examples/scp_download.c
+       examples/sshnetcat.c
+Copyright: 2003-2013, Aris Adamantiadis
+License: public-domain
+ You are free to copy this file, modify it in any way, consider it being public
+ domain. This does not apply to the rest of the library though, but it is
+ allowed to cut-and-paste working code from this file to any license of
+ program.
+
+Files: src/external/curve25519_ref.c
+       src/external/ed25519.c
+       src/external/fe25519.c
+       src/external/ge25519.c
+       src/external/ge25519_base.data
+       src/external/sc25519.c
+Copyright: *No copyright*
+License: public-domain
+ Copied from supercop project <https://bench.cr.yp.to/supercop.html>
+
+Files: tests/pkd/pkd_client.h
+       tests/pkd/pkd_daemon.c
+       tests/pkd/pkd_daemon.h
+       tests/pkd/pkd_hello.c
+       tests/pkd/pkd_keyutil.c
+       tests/pkd/pkd_keyutil.h
+       tests/pkd/pkd_util.c
+       tests/pkd/pkd_util.h
+Copyright: 2014, Jon Simons
+License: LGPL-2.1+~OpenSSL
+
+Files: src/channels.c
+       src/gzip.c
+       src/known_hosts.c
+       src/misc.c
+       src/options.c
+       src/pki.c
+       src/pki_crypto.c
+       src/pki_gcrypt.c
+       src/sftp.c
+Copyright: 2003-2013, Aris Adamantiadis
+           2008-2013, Andreas Schneider <asn@cryptomilk.org>
+License: LGPL-2.1+~OpenSSL
+
+Files: include/libssh/agent.h
+       include/libssh/options.h
+       src/agent.c
+       src/callbacks.c
+       src/config.c
+       tests/client/torture_forward.c
+       tests/client/torture_request_env.c
+       tests/torture.c
+       tests/torture.h
+Copyright: 2008-2013, Andreas Schneider <asn@cryptomilk.org>
+License: LGPL-2.1+~OpenSSL
+
+Files: include/libssh/curve25519.h
+       src/curve25519.c
+Copyright: 2013, Aris Adamantiadis <aris@badcode.be>
+License: LGPL-2.1
+Comment:
+ Upstream has been notified about the license incongruity with
+ all the other files. (Is: LGPL-2.1, should be: LGPL-2.1+~OpenSSL).
+
+Files: include/libssh/callbacks.h
+       src/scp.c
+Copyright: 2009, Aris Adamantiadis <aris@0xbadc0de.be>
+License: LGPL-2.1+~OpenSSL
+
+Files: src/match.c
+Copyright: 1995, Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
+           2000, Markus Friedl
+License: BSD-2-clause
+
+Files: include/libssh/knownhosts.h
+Copyright: 2014, Aris Adamantiadis <aris@badcode.be>
+License: LGPL-2.1
+Comment:
+ File header gives 20014 as the copyright year. Assuming
+ a typo (20014 -> 2014).
+ .
+ Upstream has been notified about the license incongruity with
+ all the other files. (Is: LGPL-2.1, should be: LGPL-2.1+~OpenSSL).
+
+Files: src/poll.c
+Copyright: 2003-2013, Aris Adamantiadis
+           2009, Aleksandar Kanchev
+           2009-2013, Andreas Schneider <asn@cryptomilk.org>
+License: LGPL-2.1+~OpenSSL
+
+Files: src/dh.c
+Copyright: 2003-2013, Aris Adamantiadis
+           2009-2013, Andreas Schneider <asn@cryptomilk.org>
+           2012, Dmitriy Kuznetsov <dk@yandex.ru>
+License: LGPL-2.1+~OpenSSL
+
+Files: src/auth.c
+Copyright: 2003-2013, Aris Adamantiadis <aris@0xbadc0de.be>
+           2008-2013, Andreas Schneider <asn@cryptomilk.org>
+License: LGPL-2.1+~OpenSSL
+
+Files: src/getpass.c
+Copyright: 2011-2013, Andreas Schneider <asn@cryptomilk.org>
+License: LGPL-2.1+~OpenSSL
+
+Files: src/gssapi.c
+Copyright: 2013, Aris Adamantiadis <aris@badcode.be>
+License: LGPL-2.1+~OpenSSL
+
+Files: cmake/Modules/DefineCMakeDefaults.cmake
+       cmake/Modules/DefineCompilerFlags.cmake
+       cmake/Modules/DefinePlatformDefaults.cmake
+Copyright: *No copyright*
+License: BSD-3-clause
+Comment:
+ Using license from cmake/Modules/COPYING-CMAKE-SCRIPTS
+
+Files: cmake/Modules/AddCCompilerFlag.cmake
+       cmake/Modules/AddCMockaTest.cmake
+       cmake/Modules/CheckCCompilerFlagSSP.cmake
+       cmake/Modules/ExtractSymbols.cmake
+       cmake/Modules/FindABIMap.cmake
+       cmake/Modules/FindArgp.cmake
+       cmake/Modules/FindCMocka.cmake
+       cmake/Modules/FindGCrypt.cmake
+       cmake/Modules/FindGSSAPI.cmake
+       cmake/Modules/FindMbedTLS.cmake
+       cmake/Modules/FindNSIS.cmake
+       cmake/Modules/FindNaCl.cmake
+       cmake/Modules/GenerateMap.cmake
+       cmake/Modules/GetFilesList.cmake
+       cmake/Modules/MacroEnsureOutOfSourceBuild.cmake
+Copyright: 2007-2018 Andreas Schneider
+           2013 Aris Adamantiadis
+           2017 Sartura d.o.o.
+           2018 Anderson Toshiyuki Sasaki <ansasaki@redhat.com>
+           006, Alexander Neundorf, <neundorf@kde.org>
+           2007 Daniel Gollub <dgollub@suse.de>
+License: BSD-3-clause
+
+
+Files: debian/*
+Copyright: 2005-2006, Jean-Philippe Garcia Ballester <giga@le-pec.org>
+           2006-2020, Laurent Bigonville <bigon@debian.org>
+           2019-2021, Martin Pitt <mpitt@debian.org>
+           2014, Mike Gabriel <sunweaver@debian.org>
+License: LGPL-2.1+~OpenSSL or BSD-2-clause or BSD-3-clause
+
+License: LGPL-2.1+~OpenSSL
+ This library is free software; you can redistribute it and/or
+ modify it under the terms of the GNU Lesser General Public
+ License as published by the Free Software Foundation; either
+ version 2.1 of the License, or (at your option) any later version.
+ .
+ This library is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ Lesser General Public License for more details.
+ .
+ You should have received a copy of the GNU Lesser General Public
+ License along with this library; if not, write to the Free Software
+ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+ .
+ On Debian systems, the complete text of the GNU Library General
+ Public License version 2.1 can be found in "/usr/share/common-licenses/LGPL-2.1".
+ .
+ In addition, as a special exception, the author of this
+ program gives permission to link the code of its
+ release with the OpenSSL project's "OpenSSL" library (or
+ with modified versions of it that use the same license as
+ the "OpenSSL" library), and distribute the linked
+ executables. You must obey the GNU General Public
+ License in all respects for all of the code used other
+ than "OpenSSL".  If you modify this file, you may extend
+ this exception to your version of the file, but you are
+ not obligated to do so.  If you do not wish to do so,
+ delete this exception statement from your version.
+
+License: LGPL-2.1
+ This library is free software; you can redistribute it and/or
+ modify it under the terms of the GNU Lesser General Public
+ License as published by the Free Software Foundation; either
+ version 2.1 of the License.
+ .
+ This library is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ Lesser General Public License for more details.
+ .
+ You should have received a copy of the GNU Lesser General Public
+ License along with this library; if not, write to the Free Software
+ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+ .
+ On Debian systems, the complete text of the GNU Library General
+ Public License version 2.1 can be found in "/usr/share/common-licenses/LGPL-2.1".
+
+License: BSD-2-clause
+ Redistribution and use in source and binary forms, with or without
+ modification, are permitted provided that the following conditions
+ are met:
+ .
+ 1. Redistributions of source code must retain the above copyright
+    notice, this list of conditions and the following disclaimer.
+ 2. Redistributions in binary form must reproduce the above copyright
+    notice, this list of conditions and the following disclaimer in the
+    documentation and/or other materials provided with the distribution.
+ .
+ THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+ IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+ OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+ IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+ INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+ NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+ THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+License: BSD-3-clause
+ Redistribution and use in source and binary forms, with or without
+ modification, are permitted provided that the following conditions
+ are met:
+ .
+ 1. Redistributions of source code must retain the copyright
+    notice, this list of conditions and the following disclaimer.
+ 2. Redistributions in binary form must reproduce the copyright
+    notice, this list of conditions and the following disclaimer in the
+    documentation and/or other materials provided with the distribution.
+ 3. The name of the author may not be used to endorse or promote products
+    derived from this software without specific prior written permission.
+ .
+ THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+ IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+ OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+ IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+ INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+ NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+ THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

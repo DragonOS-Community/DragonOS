@@ -1,0 +1,138 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: nghttp2
+Upstream-Contact: Tatsuhiro Tsujikawa <t-tujikawa@users.sourceforge.net>
+Source: https://github.com/tatsuhiro-t/nghttp2
+
+Files: *
+Copyright: 2012, 2013, 2014 Tatsuhiro Tsujikawa
+License: Expat
+
+Files: tests/nghttp2_npn_test.*
+Copyright: 2012, Twist Inc.
+License: Expat
+
+Files: m4/ax_cxx_compile_stdcxx.m4
+Copyright: 2008, Benjamin Kosnik <bkoz@redhat.com>,
+           2012, Zack Weinberg <zackw@panix.com>,
+           2013, Roy Stogner <roystgnr@ices.utexas.edu>
+License: all-permissive
+
+Files: m4/ax_python_devel.m4
+Copyright: 2009 Sebastian Huber <sebastian-huber@web.de>,
+           2009 Alan W. Irwin,
+           2009 Rafael Laboissiere <rafael@laboissiere.net>,
+           2009 Andrew Collier,
+           2009 Matteo Settenvini <matteo@member.fsf.org>,
+           2009 Horst Knorr <hk_classes@knoda.org>,
+           2013 Daniel Mullner <muellner@math.stanford.edu>
+License: GPL-3+ with autoconf exception
+
+Files: doc/_themes/sphinx_rtd_theme/*
+Copyright: 2013 Dave Snider
+License: MIT
+
+Files: doc/_themes/sphinx_rtd_theme/search.html
+Copyright: 2007-2013 by the Sphinx team
+License: BSD-2-clause
+Comment: License details from https://bitbucket.org/birkenfeld/sphinx/src file LICENSE
+
+
+License: Expat
+ Permission is hereby granted, free of charge, to any person obtaining
+ a copy of this software and associated documentation files (the
+ "Software"), to deal in the Software without restriction, including
+ without limitation the rights to use, copy, modify, merge, publish,
+ distribute, sublicense, and/or sell copies of the Software, and to
+ permit persons to whom the Software is furnished to do so, subject to
+ the following conditions:
+ .
+ The above copyright notice and this permission notice shall be
+ included in all copies or substantial portions of the Software.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+ LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+License: MIT
+ Permission is hereby granted, free of charge, to any person obtaining a copy
+ of this software and associated documentation files (the "Software"), to
+ deal in the Software without restriction, including without limitation the
+ rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ sell copies of the Software, and to permit persons to whom the Software is
+ furnished to do so, subject to the following conditions:
+ .
+ The above copyright notice and this permission notice shall be included in
+ all copies or substantial portions of the Software.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ IN THE SOFTWARE.
+
+License: GPL-3+ with autoconf exception
+ This program is free software: you can redistribute it and/or modify it
+ under the terms of the GNU General Public License as published by the
+ Free Software Foundation, either version 3 of the License, or (at your
+ option) any later version.
+ .
+ This program is distributed in the hope that it will be useful, but
+ WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General
+ Public License for more details.
+ .
+ You should have received a copy of the GNU General Public License along
+ with this program. If not, see <http://www.gnu.org/licenses/>.
+ .
+ As a special exception, the respective Autoconf Macro's copyright owner
+ gives unlimited permission to copy, distribute and modify the configure
+ scripts that are the output of Autoconf when processing the Macro. You
+ need not follow the terms of the GNU General Public License when using
+ or distributing such scripts, even though portions of the text of the
+ Macro appear in them. The GNU General Public License (GPL) does govern
+ all other use of the material that constitutes the Autoconf Macro.
+ .
+ This special exception to the GPL applies to versions of the Autoconf
+ Macro released by the Autoconf Archive. When you make and distribute a
+ modified version of the Autoconf Macro, you may extend this special
+ exception to the GPL to apply to your modified version as well.
+ .
+ On Debian systems, the full text of the GNU General Public
+ License version 3 can be found in the file
+ `/usr/share/common-licenses/GPL-3'.
+
+License: all-permissive
+ Copying and distribution of this file, with or without modification, are
+ permitted in any medium without royalty provided the copyright notice
+ and this notice are preserved. This file is offered as-is, without any
+ warranty.
+
+License: BSD-2-clause
+ Redistribution and use in source and binary forms, with or without
+ modification, are permitted provided that the following conditions are
+ met:
+ .
+ * Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+ .
+ * Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+ .
+ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+ A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+ OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+ LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

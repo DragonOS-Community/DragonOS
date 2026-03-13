@@ -1,0 +1,7 @@
+libssh for Debian
+----------------------
+
+This is a package for the library libssh with the soname 4.
+There are some other projects which have nearly the same name, so be careful.
+
+ -- Laurent Bigonville <bigon@debian.org>  Sun, 22 Nov 2009 20:16:08 +0100

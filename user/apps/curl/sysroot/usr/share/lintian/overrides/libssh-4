@@ -1,0 +1,2 @@
+# We use libssh-4 name to avoid name clash with libssh2 package.
+libssh-4: package-name-doesnt-match-sonames libssh4

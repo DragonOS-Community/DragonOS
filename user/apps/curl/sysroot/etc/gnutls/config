@@ -1,0 +1,6 @@
+[overrides]
+disabled-version = tls1.0
+disabled-version = tls1.1
+disabled-version = dtls0.9
+disabled-version = dtls1.0
+

@@ -1,0 +1,2 @@
+# false positive: libidn2 is supposed to contain libidn2
+libidn2-0: embedded-library *

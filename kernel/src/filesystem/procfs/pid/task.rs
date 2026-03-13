@@ -5,7 +5,7 @@
 use crate::{
     filesystem::{
         procfs::{
-            pid::stat::StatFileOps,
+            pid::{find_process_by_vpid, stat::StatFileOps},
             template::{
                 lookup_child_from_table, populate_children_from_table, DirOps, ProcDir,
                 ProcDirBuilder,
@@ -14,7 +14,7 @@ use crate::{
         },
         vfs::{IndexNode, InodeMode},
     },
-    process::{ProcessManager, RawPid},
+    process::RawPid,
 };
 use alloc::{
     string::ToString,
@@ -55,7 +55,7 @@ impl DirOps for TaskDirOps {
         }
 
         // 检查进程是否存在
-        if ProcessManager::find(self.pid).is_none() {
+        if find_process_by_vpid(self.pid).is_none() {
             return Err(SystemError::ESRCH);
         }
 
@@ -72,7 +72,7 @@ impl DirOps for TaskDirOps {
 
     fn populate_children(&self, dir: &ProcDir<Self>) {
         // 检查进程是否存在
-        if ProcessManager::find(self.pid).is_none() {
+        if find_process_by_vpid(self.pid).is_none() {
             return;
         }
 

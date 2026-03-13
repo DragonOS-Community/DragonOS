@@ -4,10 +4,13 @@
 
 use crate::{
     filesystem::{
-        procfs::template::{Builder, ProcSymBuilder, SymOps},
+        procfs::{
+            pid::find_process_by_vpid,
+            template::{Builder, ProcSymBuilder, SymOps},
+        },
         vfs::{IndexNode, InodeMode},
     },
-    process::{ProcessManager, RawPid},
+    process::RawPid,
 };
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
@@ -35,7 +38,7 @@ impl ExeSymOps {
 impl SymOps for ExeSymOps {
     fn read_link(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
         // 动态查找进程，获取目标进程的可执行文件路径
-        let pcb = ProcessManager::find(self.pid).ok_or(SystemError::ESRCH)?;
+        let pcb = find_process_by_vpid(self.pid).ok_or(SystemError::ESRCH)?;
         let exe = pcb.execute_path();
         let exe_bytes = exe.as_bytes();
         let len = exe_bytes.len().min(buf.len());

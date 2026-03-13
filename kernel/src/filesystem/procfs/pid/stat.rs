@@ -9,13 +9,14 @@ use crate::{
     arch::MMArch,
     filesystem::{
         procfs::{
+            pid::find_process_by_vpid,
             template::{Builder, FileOps, ProcFileBuilder},
             utils::proc_read,
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
     mm::MemoryManagementArch,
-    process::{pid::PidType, ProcessControlBlock, ProcessManager, ProcessState, RawPid},
+    process::{pid::PidType, ProcessControlBlock, ProcessState, RawPid},
     sched::{cputime::ns_to_clock_t, prio::PrioUtil},
 };
 use alloc::{
@@ -149,7 +150,7 @@ impl FileOps for StatFileOps {
         buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let pcb = ProcessManager::find(self.pid).ok_or(SystemError::ESRCH)?;
+        let pcb = find_process_by_vpid(self.pid).ok_or(SystemError::ESRCH)?;
 
         let comm = pcb.basic().name().to_string();
         let sched = pcb.sched_info();

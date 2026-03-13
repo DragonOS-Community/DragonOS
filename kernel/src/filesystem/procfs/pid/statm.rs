@@ -7,13 +7,14 @@ use crate::{
     arch::MMArch,
     filesystem::{
         procfs::{
+            pid::find_process_by_vpid,
             template::{Builder, FileOps, ProcFileBuilder},
             utils::proc_read,
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
     mm::MemoryManagementArch,
-    process::{ProcessManager, RawPid},
+    process::RawPid,
 };
 use alloc::{
     format,
@@ -45,7 +46,7 @@ impl FileOps for StatmFileOps {
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         // 查找进程
-        let pcb = ProcessManager::find(self.pid).ok_or(SystemError::ESRCH)?;
+        let pcb = find_process_by_vpid(self.pid).ok_or(SystemError::ESRCH)?;
 
         // 获取进程内存信息（简化实现）
         let size_pages = pcb

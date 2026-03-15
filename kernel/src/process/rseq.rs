@@ -17,8 +17,8 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use system_error::SystemError;
 
 use crate::{
-    arch::cpu::current_cpu_id,
-    mm::VirtAddr,
+    arch::{cpu::current_cpu_id, MMArch},
+    mm::{MemoryManagementArch, VirtAddr},
     process::{ProcessControlBlock, ProcessFlags, ProcessManager},
 };
 
@@ -451,8 +451,6 @@ impl Rseq {
         rseq_len: u32,
         sig: u32,
     ) -> Result<usize, SystemError> {
-        use crate::{arch::MMArch, mm::MemoryManagementArch};
-
         let mut rseq_state = pcb.rseq_state_mut();
 
         // 检查是否已注册
@@ -546,8 +544,6 @@ impl Rseq {
     ///
     /// 在返回用户态前调用，执行 IP 修正和 cpu_id 更新
     pub fn handle_notify_resume<F: RseqTrapFrame>(frame: Option<&mut F>) -> Result<(), ()> {
-        use crate::{arch::MMArch, mm::MemoryManagementArch};
-
         let pcb = ProcessManager::current_pcb();
 
         // 如果进程正在退出，直接返回

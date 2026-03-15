@@ -1,25 +1,17 @@
-use alloc::vec::Vec;
+use alloc::{string::ToString, sync::Arc, vec::Vec};
 use core::sync::atomic::Ordering;
-
-use crate::arch::MMArch;
-use crate::filesystem::vfs::file::File;
-use crate::filesystem::vfs::file::FileFlags;
-use crate::filesystem::vfs::file::FilePrivateData;
-use crate::filesystem::vfs::FileType;
-use crate::filesystem::vfs::InodeMode;
-use crate::mm::access_ok;
-use crate::mm::MemoryManagementArch;
-use crate::process::pid::PidPrivateData;
-use alloc::{string::ToString, sync::Arc};
-use log::{error, warn};
 use system_error::SystemError;
 
 use crate::{
-    arch::{interrupt::TrapFrame, ipc::signal::Signal},
+    arch::{interrupt::TrapFrame, ipc::signal::Signal, MMArch},
+    filesystem::vfs::{
+        file::{File, FileFlags, FilePrivateData},
+        FileType, InodeMode,
+    },
     ipc::signal_types::SignalFlags,
     libs::rwsem::RwSem,
-    mm::VirtAddr,
-    process::ProcessFlags,
+    mm::{access_ok, MemoryManagementArch, VirtAddr},
+    process::{pid::PidPrivateData, ProcessFlags},
     sched::{sched_cgroup_fork, sched_fork},
     smp::core::smp_get_processor_id,
     syscall::user_access::UserBufferWriter,
@@ -206,7 +198,7 @@ impl ProcessManager {
         args.verify()?;
         let pcb = ProcessControlBlock::new(name, new_kstack);
         Self::copy_process(&current_pcb, &pcb, args, current_trapframe).map_err(|e| {
-            error!(
+            log::error!(
                 "fork: Failed to copy process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.raw_pid(),
                 pcb.raw_pid(),
@@ -697,8 +689,10 @@ impl ProcessManager {
                 *pcb.real_parent_pcb.write_irqsave() =
                     current_pcb.real_parent_pcb.read_irqsave().clone();
             } else {
-                *pcb.parent_pcb.write_irqsave() = Arc::downgrade(&current_leader);
-                *pcb.real_parent_pcb.write_irqsave() = Arc::downgrade(&current_leader);
+                // 对于普通 fork（非 CLONE_THREAD|CLONE_PARENT），
+                // 子进程的 parent 应该指向实际调用 fork 的线程（current），而不是线程组组长。
+                *pcb.parent_pcb.write_irqsave() = Arc::downgrade(current_pcb);
+                *pcb.real_parent_pcb.write_irqsave() = Arc::downgrade(current_pcb);
             }
             pcb.exit_signal
                 .store(clone_args.exit_signal, Ordering::SeqCst);
@@ -822,14 +816,14 @@ impl ProcessManager {
                 if vpid.data() != 0 {
                     children.push(vpid);
                 } else {
-                    warn!(
+                    log::warn!(
                         "fork: child pid is 0 in parent pidns, parent pid={:?}, child pid={:?}",
                         parent_leader.raw_pid(),
                         pcb.raw_pid()
                     );
                 }
             } else {
-                warn!(
+                log::warn!(
                     "fork: failed to resolve child pid in parent pidns, parent pid={:?}, child pid={:?}",
                     parent_leader.raw_pid(),
                     pcb.raw_pid()

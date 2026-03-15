@@ -19,6 +19,43 @@ use crate::{
 #[derive(Copy, Debug, Clone, PartialEq, Eq)]
 #[repr(i32)]
 pub enum SigCode {
+    /// 描述通用来源
+    Origin(OriginCode),
+    /// 描述 SIGCHLD 的具体原因
+    SigChld(ChldCode),
+    /// 描述 SIGTRAP 的具体原因 (TRAP_*)
+    Trap(TrapCode),
+    /// 描述 SIGILL 的原因
+    Ill(IllCode),
+    /// 描述 SIGFPE 的原因
+    Fpe(FpeCode),
+    /// 描述 SIGSEGV 的原因
+    Segv(SegvCode),
+    /// 描述 SIGBUS 的原因
+    Bus(BusCode),
+    /// 其他未分类的 si_code (如 ptrace event 生成的 (event<<8)|SIGTRAP)
+    Raw(i32),
+}
+
+impl From<SigCode> for i32 {
+    fn from(code: SigCode) -> i32 {
+        match code {
+            SigCode::Origin(origin) => origin as i32,
+            SigCode::SigChld(chld) => chld as i32,
+            SigCode::Trap(trap) => trap as i32,
+            SigCode::Ill(ill) => ill as i32,
+            SigCode::Fpe(fpe) => fpe as i32,
+            SigCode::Segv(segv) => segv as i32,
+            SigCode::Bus(bus) => bus as i32,
+            SigCode::Raw(raw) => raw,
+        }
+    }
+}
+
+/// 信号的通用来源码 (SI_*)
+#[derive(Copy, Debug, Clone, PartialEq, Eq)]
+#[repr(i32)]
+pub enum OriginCode {
     /// sent by kill, sigsend, raise
     User = 0,
     /// sent by kernel from somewhere
@@ -37,17 +74,110 @@ pub enum SigCode {
     Tkill = -6,
 }
 
+/// SIGCHLD 专用原因码 (CLD_*)
+#[derive(Copy, Debug, Clone, PartialEq, Eq)]
+#[repr(i32)]
+pub enum ChldCode {
+    Exited = 1,
+    Killed = 2,
+    Dumped = 3,
+    Trapped = 4,
+    Stopped = 5,
+    Continued = 6,
+}
+
+/// SIGTRAP si_codes (TRAP_*)
+/// 用于区分不同类型的陷阱/断点
+#[derive(Copy, Debug, Clone, PartialEq, Eq)]
+#[repr(i32)]
+#[allow(dead_code)]
+pub enum TrapCode {
+    /// process breakpoint - 断点触发
+    Brkpt = 1,
+    /// process trace trap - ptrace 单步执行
+    Trace = 2,
+    /// process taken branch trap - 分支跟踪
+    Branch = 3,
+    /// hardware breakpoint/watchpoint - 硬件断点
+    Hwbkpt = 4,
+    /// undiagnosed trap - 未诊断的陷阱
+    Unk = 5,
+    /// perf event with sigtrap=1 - 性能事件
+    Perf = 6,
+}
+
+/// SIGILL/SIGFPE/SIGSEGV/SIGBUS 的原因码 (ILL_*, FPE_*, SEGV_*, BUS_*)
+#[derive(Copy, Debug, Clone, PartialEq, Eq)]
+#[repr(i32)]
+pub enum IllCode {
+    /// 非法操作码 (Illegal Opcode)
+    IllOpC = 1,
+    /// 非法操作数 (Illegal Operand)
+    IllOpN = 2,
+    /// 非法寻址模式 (Illegal Addressing Mode)
+    IllAdr = 3,
+    /// 非法陷阱 (Illegal Trap)
+    IllTrp = 4,
+    /// 特权操作码 (Privileged Opcode)
+    PrvOpC = 5,
+    /// 特权寄存器 (Privileged Register)
+    PrvReg = 6,
+    /// 协处理器错误 (Coprocessor Error)
+    CoProc = 7,
+    /// 内部堆栈错误 (Internal Stack Error)
+    BadStk = 8,
+}
+
+/// SIGFPE si_codes
+#[derive(Copy, Debug, Clone, PartialEq, Eq)]
+#[repr(i32)]
+#[allow(dead_code)]
+pub enum FpeCode {
+    IntDiv = 1, /* integer divide by zero */
+    IntOvf = 2, /* integer overflow */
+    FltDiv = 3, /* floating point divide by zero */
+    FltOvf = 4, /* floating point overflow */
+    FltUnd = 5, /* floating point underflow */
+    FltRes = 6, /* floating point inexact result */
+    FltInv = 7, /* floating point invalid operation */
+    FltSub = 8, /* subscript out of range */
+}
+
+/// SIGSEGV si_codes
+#[derive(Copy, Debug, Clone, PartialEq, Eq)]
+#[repr(i32)]
+#[allow(clippy::enum_variant_names)]
+#[allow(dead_code)]
+pub enum SegvCode {
+    MapErr = 1, /* address not mapped to object */
+    AccErr = 2, /* invalid permissions for mapped object */
+    BndErr = 3, /* failed address bound checks */
+    PkuErr = 4, /* access was denied by memory protection keys */
+}
+
+/// SIGBUS si_codes
+#[derive(Copy, Debug, Clone, PartialEq, Eq)]
+#[repr(i32)]
+#[allow(dead_code)]
+pub enum BusCode {
+    AdrAln = 1,   /* invalid address alignment */
+    AdrErr = 2,   /* non-existent physical address */
+    ObjErr = 3,   /* object specific hardware error */
+    MceErrAr = 4, /* hardware memory error consumed on a machine check: action required */
+    MceErrAo = 5, /* hardware memory error detected in process but not consumed: action optional */
+}
+
 impl SigCode {
     pub fn try_from_i32(x: i32) -> Option<SigCode> {
         match x {
-            0 => Some(Self::User),
-            0x80 => Some(Self::Kernel),
-            -1 => Some(Self::Queue),
-            -2 => Some(Self::Timer),
-            -3 => Some(Self::Mesgq),
-            -4 => Some(Self::AsyncIO),
-            -5 => Some(Self::SigIO),
-            -6 => Some(Self::Tkill),
+            0 => Some(Self::Origin(OriginCode::User)),
+            0x80 => Some(Self::Origin(OriginCode::Kernel)),
+            -1 => Some(Self::Origin(OriginCode::Queue)),
+            -2 => Some(Self::Origin(OriginCode::Timer)),
+            -3 => Some(Self::Origin(OriginCode::Mesgq)),
+            -4 => Some(Self::Origin(OriginCode::AsyncIO)),
+            -5 => Some(Self::Origin(OriginCode::SigIO)),
+            -6 => Some(Self::Origin(OriginCode::Tkill)),
             _ => None,
         }
     }
@@ -498,8 +628,8 @@ impl SigInfo {
         match self.sig_type {
             SigType::Kill { pid, uid } => PosixSigInfo {
                 si_signo: self.sig_no,
+                si_code: i32::from(self.sig_code),
                 si_errno: self.errno,
-                si_code: self.sig_code as i32,
                 _sifields: PosixSiginfoFields {
                     _kill: PosixSiginfoKill {
                         si_pid: pid.data() as i32,
@@ -510,7 +640,7 @@ impl SigInfo {
             SigType::Rt { pid, uid, sigval } => PosixSigInfo {
                 si_signo: self.sig_no,
                 si_errno: self.errno,
-                si_code: self.sig_code as i32,
+                si_code: i32::from(self.sig_code),
                 _sifields: PosixSiginfoFields {
                     _rt: PosixSiginfoRt {
                         si_pid: pid.data() as i32,
@@ -521,8 +651,8 @@ impl SigInfo {
             },
             SigType::Alarm(pid) => PosixSigInfo {
                 si_signo: self.sig_no,
+                si_code: i32::from(self.sig_code),
                 si_errno: self.errno,
-                si_code: self.sig_code as i32,
                 _sifields: PosixSiginfoFields {
                     _timer: PosixSiginfoTimer {
                         si_tid: pid.data() as i32,
@@ -538,12 +668,39 @@ impl SigInfo {
             } => PosixSigInfo {
                 si_signo: self.sig_no,
                 si_errno: self.errno,
-                si_code: self.sig_code as i32,
+                si_code: i32::from(self.sig_code),
                 _sifields: PosixSiginfoFields {
                     _timer: PosixSiginfoTimer {
                         si_tid: timerid,
                         si_overrun: overrun,
                         si_sigval: sigval,
+                    },
+                },
+            },
+            SigType::SigFault(sig_fault_info) => PosixSigInfo {
+                si_signo: self.sig_no,
+                si_errno: self.errno,
+                si_code: i32::from(self.sig_code),
+                _sifields: PosixSiginfoFields {
+                    _sigfault: PosixSiginfoSigfault {
+                        si_addr: sig_fault_info.addr as u64,
+                        si_addr_lsb: 0,
+                        si_band: 0,
+                        si_fd: 0,
+                    },
+                },
+            },
+            SigType::SigChld(sig_chld_info) => PosixSigInfo {
+                si_signo: self.sig_no,
+                si_errno: self.errno,
+                si_code: i32::from(self.sig_code),
+                _sifields: PosixSiginfoFields {
+                    _sigchld: PosixSiginfoSigchld {
+                        si_pid: sig_chld_info.pid.data() as i32,
+                        si_uid: sig_chld_info.uid as u32,
+                        si_status: sig_chld_info.status,
+                        si_utime: sig_chld_info.utime as i64,
+                        si_stime: sig_chld_info.stime as i64,
                     },
                 },
             },
@@ -599,10 +756,26 @@ pub enum SigType {
     // 后续完善下列中的具体字段
     // Timer,
     // Rt,
-    // SigChild,
-    // SigFault,
+    SigFault(SigFaultInfo),
+    SigChld(SigChldInfo),
     // SigPoll,
     // SigSys,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SigFaultInfo {
+    pub addr: usize,
+    pub trapno: i32,
+    // 对于某些架构，可能有额外的字段
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct SigChldInfo {
+    pub pid: RawPid,
+    pub uid: usize,
+    pub status: i32,
+    pub utime: u64,
+    pub stime: u64,
 }
 
 impl SigInfo {
@@ -645,7 +818,7 @@ impl SigPending {
         for info in self.queue.q.iter_mut() {
             // bump(0) 作为“匹配探测”，不会改变值
             if info.is_signal(sig)
-                && info.sig_code() == SigCode::Timer
+                && info.sig_code() == SigCode::Origin(OriginCode::Timer)
                 && info.bump_posix_timer_overrun(timerid, 0)
             {
                 return true;
@@ -658,7 +831,7 @@ impl SigPending {
     pub fn posix_timer_bump_overrun(&mut self, sig: Signal, timerid: i32, bump: i32) -> bool {
         for info in self.queue.q.iter_mut() {
             if info.is_signal(sig)
-                && info.sig_code() == SigCode::Timer
+                && info.sig_code() == SigCode::Origin(OriginCode::Timer)
                 && info.bump_posix_timer_overrun(timerid, bump)
             {
                 return true;
@@ -671,7 +844,7 @@ impl SigPending {
     pub fn posix_timer_reset_overrun(&mut self, sig: Signal, timerid: i32) -> bool {
         for info in self.queue.q.iter_mut() {
             if info.is_signal(sig)
-                && info.sig_code() == SigCode::Timer
+                && info.sig_code() == SigCode::Origin(OriginCode::Timer)
                 && info.reset_posix_timer_overrun(timerid)
             {
                 return true;
@@ -726,9 +899,9 @@ impl SigPending {
             let mut ret = SigInfo::new(
                 sig,
                 0,
-                SigCode::User,
+                SigCode::Origin(OriginCode::User),
                 SigType::Kill {
-                    pid: RawPid::from(0),
+                    pid: RawPid::new(0),
                     uid: 0,
                 },
             );

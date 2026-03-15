@@ -5,8 +5,8 @@ use core::mem::size_of;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_RT_SIGQUEUEINFO;
-use crate::ipc::signal_types::{PosixSigInfo, SigCode, SigInfo, SigType};
-use crate::ipc::syscall::sys_kill::check_signal_permission_pcb_with_sig;
+use crate::ipc::signal_types::{OriginCode, PosixSigInfo, SigCode, SigInfo, SigType};
+use crate::ipc::syscall::sys_kill::check_kill_permission;
 use crate::process::pid::PidType;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::UserBufferReader;
@@ -63,7 +63,7 @@ impl Syscall for SysRtSigqueueinfoHandle {
             let target_pid = RawPid::from(pid as usize);
             let target = ProcessManager::find_task_by_vpid(target_pid).ok_or(SystemError::ESRCH)?;
             // 传入 Signal::INVALID/0 在权限检查里无特殊含义，这里用 None 即可
-            check_signal_permission_pcb_with_sig(&target, None)?;
+            check_kill_permission(&target, None)?;
             return Ok(0);
         }
 
@@ -83,16 +83,18 @@ impl Syscall for SysRtSigqueueinfoHandle {
 
         // Linux 6.6: do_rt_sigqueueinfo 权限校验
         let si_code = user_info.si_code;
-        if (si_code >= 0 || si_code == (SigCode::Tkill as i32)) && current_pid != target_pid {
+        if (si_code >= 0 || si_code == (SigCode::Origin(OriginCode::Tkill)).into())
+            && current_pid != target_pid
+        {
             return Err(SystemError::EPERM);
         }
 
         // 解析 si_code（未知 code：尽量保持“来自用户态(负值)”的语义，不 panic）
         let code_enum = SigCode::try_from_i32(si_code).unwrap_or({
             if si_code < 0 {
-                SigCode::Queue
+                SigCode::Origin(OriginCode::Queue)
             } else {
-                SigCode::User
+                SigCode::Origin(OriginCode::User)
             }
         });
 
@@ -101,7 +103,7 @@ impl Syscall for SysRtSigqueueinfoHandle {
 
         // 根据信号来源/布局构造内核 SigInfo
         let sig_type = match code_enum {
-            SigCode::Queue => {
+            SigCode::Origin(OriginCode::Queue) => {
                 let sigval = unsafe { user_info._sifields._rt.si_sigval };
                 SigType::Rt {
                     pid: sender_pid,
@@ -109,7 +111,7 @@ impl Syscall for SysRtSigqueueinfoHandle {
                     sigval,
                 }
             }
-            SigCode::Timer => {
+            SigCode::Origin(OriginCode::Timer) => {
                 let timer = unsafe { user_info._sifields._timer };
                 SigType::PosixTimer {
                     timerid: timer.si_tid,
@@ -127,7 +129,7 @@ impl Syscall for SysRtSigqueueinfoHandle {
 
         // 查找目标进程并检查权限
         let target = ProcessManager::find_task_by_vpid(target_pid).ok_or(SystemError::ESRCH)?;
-        check_signal_permission_pcb_with_sig(&target, Some(signal))?;
+        check_kill_permission(&target, Some(signal))?;
 
         // rt_sigqueueinfo 发送进程级信号，使用 PidType::TGID
         signal

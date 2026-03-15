@@ -7,7 +7,9 @@ use system_error::SystemError;
 
 use crate::{
     arch::ipc::signal::{SigFlags, SigSet, Signal, MAX_SIG_NUM},
-    ipc::signal_types::{SaHandlerType, SigCode, SigInfo, SigPending, SigactionType, SignalFlags},
+    ipc::signal_types::{
+        OriginCode, SaHandlerType, SigCode, SigInfo, SigPending, SigactionType, SignalFlags,
+    },
     libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
     libs::wait_queue::WaitQueue,
     process::{
@@ -142,7 +144,7 @@ impl SigHand {
         for info in g.shared_pending.queue_mut().q.iter_mut() {
             // bump(0) 作为“匹配探测”，不会改变值
             if info.is_signal(sig)
-                && info.sig_code() == SigCode::Timer
+                && info.sig_code() == SigCode::Origin(OriginCode::Timer)
                 && info.bump_posix_timer_overrun(timerid, 0)
             {
                 return true;
@@ -161,7 +163,7 @@ impl SigHand {
         let mut g = self.inner_mut();
         for info in g.shared_pending.queue_mut().q.iter_mut() {
             if info.is_signal(sig)
-                && info.sig_code() == SigCode::Timer
+                && info.sig_code() == SigCode::Origin(OriginCode::Timer)
                 && info.bump_posix_timer_overrun(timerid, bump)
             {
                 return true;
@@ -175,7 +177,7 @@ impl SigHand {
         let mut g = self.inner_mut();
         for info in g.shared_pending.queue_mut().q.iter_mut() {
             if info.is_signal(sig)
-                && info.sig_code() == SigCode::Timer
+                && info.sig_code() == SigCode::Origin(OriginCode::Timer)
                 && info.reset_posix_timer_overrun(timerid)
             {
                 return true;

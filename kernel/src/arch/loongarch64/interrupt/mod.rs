@@ -1,6 +1,7 @@
 pub mod entry;
 mod handle;
 pub mod ipi;
+pub mod ptrace;
 
 use core::any::Any;
 
@@ -141,3 +142,5 @@ impl crate::process::rseq::RseqTrapFrame for TrapFrame {
         self.csr_era = ip;
     }
 }
+
+pub use ptrace::UserRegsStruct;

@@ -1,11 +1,10 @@
-use crate::exception::InterruptArch;
-use crate::ipc::signal_types::SigType;
-use crate::process::pid::PidType;
-use crate::process::CurrentIrqArch;
-use crate::process::ProcessControlBlock;
-use crate::process::SigInfo;
-use crate::time::timer::{clock, Jiffies, Timer, TimerFunction};
-use crate::{arch::ipc::signal::Signal, ipc::signal_types::SigCode};
+use crate::{
+    arch::ipc::signal::Signal,
+    exception::InterruptArch,
+    ipc::signal_types::{OriginCode, SigCode, SigType},
+    process::{pid::PidType, CurrentIrqArch, ProcessControlBlock, SigInfo},
+    time::timer::{clock, Jiffies, Timer, TimerFunction},
+};
 use alloc::{boxed::Box, sync::Arc, sync::Weak};
 use core::sync::atomic::compiler_fence;
 use core::time::Duration;
@@ -130,7 +129,12 @@ impl TimerFunction for AlarmTimerFunc {
 
         let pid = pcb.raw_pid();
         let sig = Signal::SIGALRM;
-        let mut info = SigInfo::new(sig, 0, SigCode::Timer, SigType::Alarm(pid));
+        let mut info = SigInfo::new(
+            sig,
+            0,
+            SigCode::Origin(OriginCode::Timer),
+            SigType::Alarm(pid),
+        );
 
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };

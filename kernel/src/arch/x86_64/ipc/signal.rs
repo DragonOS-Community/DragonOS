@@ -1,5 +1,9 @@
-use core::sync::atomic::{compiler_fence, Ordering};
-use core::{ffi::c_void, intrinsics::unlikely, mem::size_of};
+use core::{
+    ffi::c_void,
+    intrinsics::unlikely,
+    mem::size_of,
+    sync::atomic::{compiler_fence, Ordering},
+};
 
 use defer::defer;
 use log::error;
@@ -11,7 +15,6 @@ pub use crate::ipc::generic_signal::GenericSigSet as SigSet;
 pub use crate::ipc::generic_signal::GenericSigStackFlags as SigStackFlags;
 pub use crate::ipc::generic_signal::GenericSignal as Signal;
 
-use crate::process::rseq::Rseq;
 use crate::{
     arch::{
         fpu::FpState,
@@ -28,7 +31,7 @@ use crate::{
         },
     },
     mm::MemoryManagementArch,
-    process::ProcessManager,
+    process::{ptrace::ptrace_signal, rseq::Rseq, ProcessFlags, ProcessManager},
     syscall::user_access::UserBufferWriter,
 };
 
@@ -591,8 +594,18 @@ impl SigFrame {
 unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     let pcb = ProcessManager::current_pcb();
 
-    let siginfo = pcb.try_siginfo_irqsave(5);
+    // 检查 PENDING_PTRACE_STOP 标志（ptrace attach 到已停止进程时设置）
+    // get_signal() 中对 JOBCTL_TRAP_STOP 的处理
+    if pcb.flags().contains(ProcessFlags::PENDING_PTRACE_STOP) {
+        // 清除标志并调用 ptrace_signal 触发 ptrace_stop
+        pcb.flags().remove(ProcessFlags::PENDING_PTRACE_STOP);
+        // 使用 SIGSTOP 作为触发信号，但 siginfo 为 None（表示不是真正的信号）
+        // ptrace_signal 会调用 ptrace_stop 使进程进入 TracedStopped 状态
+        let _ = ptrace_signal(&pcb, Signal::SIGSTOP, &mut None);
+        // ptrace_stop 后继续处理其他信号
+    }
 
+    let siginfo = pcb.try_siginfo_irqsave(5);
     if unlikely(siginfo.is_none()) {
         pcb.recalc_sigpending();
         return;
@@ -610,103 +623,154 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
         return;
     }
 
-    let mut sig_number: Signal;
+    let mut sig: Signal;
     let mut info: Option<SigInfo>;
-    let mut sigaction: Option<Sigaction>;
-    let sig_block: SigSet = *siginfo_read_guard.sig_blocked();
+    let mut sa: Sigaction;
     drop(siginfo_read_guard);
-
     loop {
-        (sig_number, info) = pcb.dequeue_pending_signal(&sig_block);
+        // Dequeue 信号
+        (sig, info) = {
+            let res = {
+                let mut siginfo_mut_guard = pcb.sig_info_mut();
+                // 获取当前最新的信号阻塞掩码（处理 ptrace 可能修改 blocked 的情况）
+                let sig_block = *siginfo_mut_guard.sig_blocked();
+                let res = siginfo_mut_guard
+                    .sig_pending_mut()
+                    .dequeue_signal(&sig_block);
+                // 如果没有更多信号，重新计算 sigpending 并返回
+                if res.0 != Signal::INVALID {
+                    res
+                } else {
+                    drop(siginfo_mut_guard);
+                    pcb.sighand().shared_pending_dequeue(&sig_block)
+                }
+            };
+            pcb.recalc_sigpending();
+            res
+        };
 
-        // 如果信号非法，则直接返回
-        if sig_number == Signal::INVALID {
-            return;
+        if sig == Signal::INVALID {
+            break;
         }
 
-        // 对 kernel-only 信号（如 SIGKILL/SIGSTOP）直接使用默认处理，避免任何用户帧构造
-        if sig_number.kernel_only() {
-            // log::error!(
-            //     "do_signal: kernel-only sig={} for pid={:?} -> default handler (no user frame)",
-            //     sig_number as i32,
-            //     pcb.raw_pid()
-            // );
-            // 释放锁，按常规路径在本线程上下文执行默认处理
-            let _oldset = sig_block;
-            drop(pcb);
+        // 仅当 signr != SIGKILL 时才进入 ptrace_signal()，SIGKILL 不能被 tracer 拦截/吞掉
+        if pcb.flags().contains(ProcessFlags::PTRACED) && sig != Signal::SIGKILL {
+            let result = ptrace_signal(&pcb, sig, &mut info);
+            match result {
+                Some(new_sig) => {
+                    sig = new_sig; // tracer 注入了新信号，继续处理
+                }
+                None => {
+                    // tracer 忽略了信号（注入了 0）
+                    // 在继续寻找下一个信号之前，检查是否有系统调用需要重启
+                    // 这处理了 ptrace 在系统调用重启期间停止 tracee 的情况
+                    if unsafe { frame.syscall_nr() }.is_some() {
+                        if let Some(syscall_err) = unsafe { frame.syscall_error() } {
+                            match syscall_err {
+                                SystemError::ERESTARTSYS
+                                | SystemError::ERESTARTNOHAND
+                                | SystemError::ERESTARTNOINTR => {
+                                    // 这些错误码需要重启系统调用，即使没有信号要处理
+                                    // 设置 got_signal = false 让 try_restart_syscall 处理
+                                    // 但先检查是否应该返回 EINTR（对于 ERESTARTNOHAND）
+                                    if matches!(syscall_err, SystemError::ERESTARTNOHAND) {
+                                        // ERESTARTNOHAND 应该返回 EINTR
+                                        frame.rax =
+                                            SystemError::EINTR.to_posix_errno() as i64 as u64;
+                                        return;
+                                    }
+                                }
+                                SystemError::ERESTART_RESTARTBLOCK => {
+                                    // ERESTART_RESTARTBLOCK 应该返回 EINTR
+                                    frame.rax = SystemError::EINTR.to_posix_errno() as i64 as u64;
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    continue; // 继续寻找下一个信号
+                }
+            }
+        }
+
+        // 这类信号不进入用户态 Handler，直接在内核处理
+        if sig.kernel_only() {
             CurrentIrqArch::interrupt_enable();
-            sig_number.handle_default();
-            return;
+            sig.handle_default();
+            // 如果是 SIGSTOP 唤醒后 continue 检查新信号
+            continue;
         }
-        let sa = pcb.sighand().handler(sig_number).unwrap();
 
+        // 未注册处理器时使用默认处理
+        if let Some(sigaction) = pcb.sighand().handler(sig) {
+            sa = sigaction;
+        } else {
+            if sig.kernel_ignore() {
+                continue;
+            }
+            sa = Sigaction::default();
+        }
+
+        // Init 进程保护
+        if pcb.sighand().flags_contains(SignalFlags::UNKILLABLE) && !sa.action().is_customized() {
+            continue; // Init 忽略非自定义处理的信号
+        }
+
+        // 检查 handler 类型
         match sa.action() {
             SigactionType::SaHandler(action_type) => match action_type {
                 SaHandlerType::Error => {
                     error!("Trying to handle a Sigerror on Process:{:?}", pcb.raw_pid());
                     return;
                 }
-                SaHandlerType::Default => {
-                    sigaction = Some(sa);
-                }
                 SaHandlerType::Ignore => continue,
+                SaHandlerType::Default => {
+                    if sig.kernel_ignore() {
+                        continue;
+                    }
+                    if sig.kernel_stop() {
+                        sig.handle_default(); // 进程在此处挂起
+                        continue; // 被 SIGCONT 唤醒后重新检查
+                    }
+                    // 其余默认动作
+                    sig.handle_default();
+                    return;
+                }
+                // 自定义处理器
                 SaHandlerType::Customized(_) => {
-                    sigaction = Some(sa);
+                    // 检查 SA_RESETHAND 标志（对应 Linux 的 SA_ONESHOT）
+                    if sa.flags().contains(SigFlags::SA_RESETHAND) {
+                        pcb.sighand().set_handler(sig, Sigaction::default());
+                    }
+                    // 保存 oldset，释放锁
+                    let oldset = { *pcb.sig_info_mut().sig_blocked() };
+                    // 调用 handle_signal 设置信号帧
+                    let mut sigaction = sa;
+                    let res = handle_signal(sig, &mut sigaction, &info.unwrap(), &oldset, frame);
+                    // 更新 got_signal 状态
+                    if res.is_ok() {
+                        *got_signal = true;
+                    }
+
+                    compiler_fence(Ordering::SeqCst);
+                    if let Err(e) = res {
+                        if e != SystemError::EFAULT {
+                            error!(
+                                "Error occurred when handling signal: {}, pid={:?}, errcode={:?}",
+                                sig as i32,
+                                ProcessManager::current_pcb().raw_pid(),
+                                &e
+                            );
+                        }
+                    }
+                    return;
                 }
             },
-            SigactionType::SaSigaction(_) => todo!(),
-        }
-
-        /*
-         * Global init gets no signals it doesn't want.
-         * Container-init gets no signals it doesn't want from same
-         * container.
-         *
-         * Note that if global/container-init sees a sig_kernel_only()
-         * signal here, the signal must have been generated internally
-         * or must have come from an ancestor namespace. In either
-         * case, the signal cannot be dropped.
-         */
-        // todo: https://code.dragonos.org.cn/xref/linux-6.6.21/include/linux/signal.h?fi=sig_kernel_only#444
-        if ProcessManager::current_pcb()
-            .sighand()
-            .flags_contains(SignalFlags::UNKILLABLE)
-            && !sig_number.kernel_only()
-        {
-            continue;
-        }
-
-        if sigaction.is_some() {
-            break;
-        }
-    }
-
-    let oldset = sig_block;
-    // no sig_struct guard to drop
-    drop(pcb);
-    // 做完上面的检查后，开中断
-    CurrentIrqArch::interrupt_enable();
-
-    if sigaction.is_none() {
-        return;
-    }
-    *got_signal = true;
-
-    let mut sigaction = sigaction.unwrap();
-
-    // 注意！由于handle_signal里面可能会退出进程，
-    // 因此这里需要检查清楚：上面所有的锁、arc指针都被释放了。否则会产生资源泄露的问题！
-    let res: Result<i32, SystemError> =
-        handle_signal(sig_number, &mut sigaction, &info.unwrap(), &oldset, frame);
-    compiler_fence(Ordering::SeqCst);
-    if let Err(e) = res {
-        if e != SystemError::EFAULT {
-            error!(
-                "Error occurred when handling signal: {}, pid={:?}, errcode={:?}",
-                sig_number as i32,
-                ProcessManager::current_pcb().raw_pid(),
-                &e
-            );
+            SigactionType::SaSigaction(_) => {
+                // SA_SIGINFO 风格的处理器（待实现）
+                todo!("SA_SIGINFO not implemented yet");
+            }
         }
     }
 }
@@ -730,18 +794,25 @@ fn try_restart_syscall(frame: &mut TrapFrame) {
     let mut restart = false;
     match syscall_err {
         SystemError::ERESTARTSYS | SystemError::ERESTARTNOHAND | SystemError::ERESTARTNOINTR => {
+            // 恢复系统调用号到 rax，并回退 RIP 以重新执行系统调用
             frame.rax = frame.errcode;
             frame.rip -= 2;
             restart = true;
         }
         SystemError::ERESTART_RESTARTBLOCK => {
+            // 使用特殊的 restart_syscall 系统调用
             frame.rax = SYS_RESTART_SYSCALL as u64;
             frame.rip -= 2;
             restart = true;
         }
         _ => {}
     }
-    log::debug!("try restart syscall: {:?}", restart);
+    log::debug!(
+        "try restart syscall: {:?}, nr={}, rip=0x{:x}",
+        restart,
+        frame.errcode,
+        frame.rip
+    );
 }
 
 pub struct X86_64SignalArch;
@@ -823,9 +894,11 @@ fn handle_signal(
         if let Some(syscall_err) = unsafe { frame.syscall_error() } {
             match syscall_err {
                 SystemError::ERESTARTNOHAND => {
+                    // ERESTARTNOHAND 总是返回 EINTR，不检查 SA_RESTART
                     frame.rax = SystemError::EINTR.to_posix_errno() as i64 as u64;
                 }
                 SystemError::ERESTARTSYS => {
+                    // ERESTARTSYS：如果没有 SA_RESTART，返回 EINTR；否则重启系统调用
                     if !sigaction.flags().contains(SigFlags::SA_RESTART) {
                         frame.rax = SystemError::EINTR.to_posix_errno() as i64 as u64;
                     } else {
@@ -834,16 +907,12 @@ fn handle_signal(
                     }
                 }
                 SystemError::ERESTART_RESTARTBLOCK => {
-                    // 为了让带 SA_RESTART 的时序（例如 clock_nanosleep 相对睡眠）也能自动重启，
-                    // 当 SA_RESTART 设置时，按 ERESTARTSYS 的语义处理；否则返回 EINTR。
-                    if !sigaction.flags().contains(SigFlags::SA_RESTART) {
-                        frame.rax = SystemError::EINTR.to_posix_errno() as i64 as u64;
-                    } else {
-                        frame.rax = frame.errcode;
-                        frame.rip -= 2;
-                    }
+                    // ERESTART_RESTARTBLOCK 总是返回 EINTR，不检查 SA_RESTART
+                    // （使用 restart_syscall 的情况需要用户空间处理）
+                    frame.rax = SystemError::EINTR.to_posix_errno() as i64 as u64;
                 }
                 SystemError::ERESTARTNOINTR => {
+                    // ERESTARTNOINTR 总是重启系统调用
                     frame.rax = frame.errcode;
                     frame.rip -= 2;
                 }

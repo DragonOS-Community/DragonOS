@@ -68,6 +68,7 @@ setns_test
 eventfd_test
 poll_test
 rseq_test
+ptrace_test
 
 
 # 内存管理测试

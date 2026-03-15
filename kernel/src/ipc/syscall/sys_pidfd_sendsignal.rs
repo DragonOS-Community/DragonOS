@@ -1,5 +1,5 @@
 use crate::arch::ipc::signal::Signal;
-use crate::ipc::signal_types::SigCode;
+use crate::ipc::signal_types::{OriginCode, SigCode};
 use crate::ipc::signal_types::{SigInfo, SigType};
 use alloc::string::ToString;
 use alloc::vec::Vec;
@@ -69,7 +69,7 @@ impl Syscall for SysPidfdSendSignalHandle {
         let mut info = SigInfo::new(
             sig,
             0,
-            SigCode::User,
+            SigCode::Origin(OriginCode::User),
             SigType::Kill {
                 pid: sender_pid,
                 uid: sender_uid,

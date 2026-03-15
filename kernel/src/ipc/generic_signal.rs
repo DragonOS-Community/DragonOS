@@ -5,11 +5,11 @@ use num_traits::FromPrimitive;
 use crate::ipc::signal_types::SignalFlags;
 use crate::{
     arch::{
-        ipc::signal::{SigSet, Signal, MAX_SIG_NUM},
+        ipc::signal::{SigFlags, SigSet, Signal, MAX_SIG_NUM},
         CurrentIrqArch,
     },
     exception::InterruptArch,
-    process::ProcessManager,
+    process::{ProcessFlags, ProcessManager},
     sched::{schedule, SchedMode},
 };
 use alloc::sync::Arc;
@@ -211,7 +211,22 @@ impl GenericSignal {
     }
 
     pub fn kernel_only(&self) -> bool {
-        matches!(self, Self::SIGKILL | Self::SIGSTOP)
+        crate::ipc::signal_types::SIG_KERNEL_ONLY_MASK.contains(self.into_sigset())
+    }
+
+    /// 判断信号的默认行为是否为忽略
+    pub fn kernel_ignore(&self) -> bool {
+        crate::ipc::signal_types::SIG_KERNEL_IGNORE_MASK.contains(self.into_sigset())
+    }
+
+    /// 判断信号的默认行为是否为停止进程
+    pub fn kernel_stop(&self) -> bool {
+        crate::ipc::signal_types::SIG_KERNEL_STOP_MASK.contains(self.into_sigset())
+    }
+
+    /// 判断信号的默认行为是否为 coredump
+    pub fn kernel_coredump(&self) -> bool {
+        crate::ipc::signal_types::SIG_KERNEL_COREDUMP_MASK.contains(self.into_sigset())
     }
 }
 
@@ -439,39 +454,61 @@ fn sig_terminate_dump(sig: Signal) {
     // TODO 生成 coredump 文件
 }
 
-/// 信号默认处理函数——暂停进程
+/// 信号默认处理函数——暂停进程 (SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU)
+///
 fn sig_stop(sig: Signal) {
-    // 在接收者上下文设置停止标志，并让当前任务进入 Stopped
-    let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-    {
-        let pcb = ProcessManager::current_pcb();
-        // 标记停止事件，供 waitid(WSTOPPED) 可见
-        pcb.sighand().flags_insert(SignalFlags::CLD_STOPPED);
-        pcb.sighand().flags_insert(SignalFlags::STOP_STOPPED);
+    let pcb = ProcessManager::current_pcb();
+
+    // ===== Ptrace 进程的特殊处理 =====
+    // 被 ptrace 的进程由 tracer 控制其状态(TASK_TRACED)，不进入标准的 TASK_STOPPED
+    // 如果执行到这里，说明 ptrace_signal 已经在 do_signal 中处理过该信号
+    // tracer 决定将信号注入给 tracee，但这不意味着 tracee 要再次停止
+    // 直接返回，不做任何操作
+    if pcb.flags().contains(ProcessFlags::PTRACED) {
+        return;
     }
-    ProcessManager::mark_stop().unwrap_or_else(|e| {
+
+    // ===== 非 ptrace 进程的 Group Stop 逻辑 =====
+    // 标记停止事件，供 waitid(WSTOPPED) 可见
+    pcb.sighand().flags_insert(SignalFlags::CLD_STOPPED);
+    pcb.sighand().flags_insert(SignalFlags::STOP_STOPPED);
+
+    // 切换进程状态为 Stopped 并调度
+    let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+    ProcessManager::mark_stop(sig).unwrap_or_else(|e| {
         log::error!(
             "sleep error :{:?},failed to sleep process :{:?}, with signal :{:?}",
             e,
-            ProcessManager::current_pcb().pid(),
+            pcb.pid(),
             sig
         );
     });
     drop(guard);
-    log::debug!(
-        "sig_stop: pid={:?} entered Stopped; notifying parent and scheduler",
-        ProcessManager::current_pcb().raw_pid()
-    );
+
     // 向父进程报告 SIGCHLD 并唤醒父进程可能阻塞的 wait
     let pcb = ProcessManager::current_pcb();
     if let Some(parent) = pcb.parent_pcb() {
-        let _ = crate::ipc::kill::send_signal_to_pcb(parent.clone(), Signal::SIGCHLD);
+        // 检查父进程是否设置了 SA_NOCLDSTOP
+        let should_notify = {
+            let sighand = parent.sighand();
+            sighand
+                .handler(Signal::SIGCHLD)
+                .map(|sa| !sa.flags().contains(SigFlags::SA_NOCLDSTOP))
+                .unwrap_or(false)
+        };
+
+        if should_notify {
+            let _ = crate::ipc::kill::send_signal_to_pcb(parent.clone(), Signal::SIGCHLD);
+        }
+        // 无论是否发送 SIGCHLD，都需要唤醒父进程的 wait 队列，因为 waitpid(WUNTRACED) 可能需要返回
         parent.wake_all_waiters();
     }
     // 唤醒等待在该子进程等待队列上的等待者
     pcb.wake_all_waiters();
+    // 让出 CPU 进入睡眠
     schedule(SchedMode::SM_NONE);
 }
+
 /// 信号默认处理函数——继续进程
 fn sig_continue(_sig: Signal) {
     // 默认处理改为最小化：仅在已处于 Stopped 时唤醒停止，让进程继续运行。

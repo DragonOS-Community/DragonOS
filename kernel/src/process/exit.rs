@@ -56,15 +56,24 @@ fn should_defer_unhash_for_group_exec(pcb: &ProcessControlBlock, group_dead: boo
     }
 }
 
+/// 获取子进程的 uid，用于填充 siginfo_t
+fn get_child_uid(child_pcb: &Arc<ProcessControlBlock>) -> u32 {
+    child_pcb.cred().uid.data() as u32
+}
+
 /// 检查子进程的 exit_signal 是否与等待选项匹配
 ///
-/// 根据 Linux wait 语义：
 /// - __WALL: 等待所有子进程，忽略 exit_signal
+/// - 如果子进程被 ptrace：总是可以等待，忽略 exit_signal
 /// - __WCLONE: 只等待"克隆"子进程（exit_signal != SIGCHLD）
 /// - 默认（无 __WCLONE）: 只等待"正常"子进程（exit_signal == SIGCHLD）
 fn child_matches_wait_options(child_pcb: &Arc<ProcessControlBlock>, options: WaitOption) -> bool {
     // __WALL 匹配所有子进程
     if options.contains(WaitOption::WALL) {
+        return true;
+    }
+    // 如果子进程被 ptrace，它总是可以被 wait
+    if child_pcb.is_traced() {
         return true;
     }
 
@@ -88,11 +97,11 @@ pub struct KernelWaitOption<'a> {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct WaitIdInfo {
     pub pid: RawPid,
     pub status: i32,
     pub cause: i32,
+    pub uid: u32, // 子进程的 uid，用于填充 siginfo_t
 }
 
 impl KernelWaitOption<'_> {
@@ -122,7 +131,15 @@ pub fn kernel_wait4(
     // 构造参数
     let mut kwo = KernelWaitOption::new(converter, options);
 
+    // 根据 Linux 语义：
+    // - wait4/waitpid 默认只等待 WEXITED（退出的子进程）
+    // - 只有显式传入 WUNTRACED (WSTOPPED) 时才报告停止的子进程
+    // - __WALL 和 __WCLONE 是内部标志，不影响 WEXITED 的默认行为
+    //
+    // 参考: https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/exit.c#1744
     kwo.options.insert(WaitOption::WEXITED);
+    // 注意：绝不在这里默认添加 WSTOPPED！
+
     kwo.ret_rusage = rusage_buf;
 
     // 调用do_wait，执行等待
@@ -179,7 +196,7 @@ pub fn kernel_waitid(
             si._sifields = PosixSiginfoFields {
                 _sigchld: PosixSiginfoSigchld {
                     si_pid: info.pid.data() as i32,
-                    si_uid: 0,
+                    si_uid: info.uid, // 从 WaitIdInfo 获取 uid
                     si_status: info.status,
                     si_utime: 0,
                     si_stime: 0,
@@ -205,55 +222,30 @@ pub fn kernel_waitid(
     Ok(0)
 }
 
-/// 检查子进程是否可以被当前线程等待
-///
-/// 根据 Linux wait 语义：
-/// - 默认情况下，线程组中的任何线程都可以等待同一线程组中任何线程 fork 的子进程
-/// - 如果指定了 __WNOTHREAD，则只能等待当前线程自己创建的子进程
-///
-/// # 参数
-/// - `child_pcb`: 要检查的子进程
-/// - `options`: 等待选项
-///
-/// # 返回值
-/// 返回 true 如果当前线程可以等待该子进程
-fn is_eligible_child(child_pcb: &Arc<ProcessControlBlock>, options: WaitOption) -> bool {
+/// - 遍历 children 列表时看 real_parent（自然父进程）
+/// - 遍历 ptraced_list 或按 pid 直接等待 ptracee 时看 parent（当前 tracer）
+fn is_effectively_child(
+    child_pcb: &Arc<ProcessControlBlock>,
+    ptrace: bool,
+    options: WaitOption,
+) -> bool {
     let current = ProcessManager::current_pcb();
-    let current_tgid = current.tgid;
+
+    let child_parent = match if ptrace {
+        child_pcb.parent_pcb()
+    } else {
+        child_pcb.real_parent_pcb()
+    } {
+        Some(p) => p,
+        None => return false,
+    };
 
     if options.contains(WaitOption::WNOTHREAD) {
-        // 带 __WNOTHREAD：只能等待当前线程自己创建的子进程
-        let fork_parent = match child_pcb.fork_parent_pcb() {
-            Some(p) => p,
-            None => return false,
-        };
-        Arc::ptr_eq(&fork_parent, &current)
+        // __WNOTHREAD: 请求者必须是对应关系上的直接父进程/ptracer。
+        Arc::ptr_eq(&child_parent, &current)
     } else {
-        // 获取子进程的 real_parent
-        let child_parent = match child_pcb.real_parent_pcb() {
-            Some(p) => p,
-            None => {
-                // log::warn!(
-                //     "is_eligible_child: child {:?} has no real parent",
-                //     child_pcb.raw_pid()
-                // );
-                return false;
-            }
-        };
-        // 默认情况：线程组中的任何线程都可以等待同一线程组中任何线程创建的子进程
-        // 检查子进程的 real_parent 的 tgid 是否与当前线程的 tgid 相同
-        let res = child_parent.tgid == current_tgid;
-        if !res {
-            // log::warn!(
-            //     "is_eligible_child failed: child={:?} child_parent={:?} (tgid={:?}) current={:?} (tgid={:?})",
-            //     child_pcb.raw_pid(),
-            //     child_parent.raw_pid(),
-            //     child_parent.tgid,
-            //     current.raw_pid(),
-            //     current_tgid
-            // );
-        }
-        res
+        // 默认情况：当前线程组内任一线程都可以等待同组线程的 child/ptracee。
+        child_parent.tgid == current.tgid
     }
 }
 
@@ -281,11 +273,13 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
 
             let current = ProcessManager::current_pcb();
 
-            // 检查子进程是否可以被当前线程等待
-            // 根据 Linux 语义：
-            // - 默认情况下，线程组中的任何线程都可以等待同一线程组中任何线程 fork 的子进程
-            // - 如果指定了 __WNOTHREAD，则只能等待当前线程自己创建的子进程
-            if !is_eligible_child(&child_pcb, kwo.options) {
+            // 对标 Linux do_wait_pid():
+            // - 自然父进程按 real_parent 匹配
+            // - tracer 按 parent 匹配
+            let is_natural_child = is_effectively_child(&child_pcb, false, kwo.options);
+            let is_ptrace_child =
+                child_pcb.is_traced() && is_effectively_child(&child_pcb, true, kwo.options);
+            if !is_natural_child && !is_ptrace_child {
                 return Err(SystemError::ECHILD);
             }
 
@@ -357,7 +351,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             Some(p) => p,
                             None => continue,
                         };
-                        if !is_eligible_child(&pcb, kwo.options) {
+                        if !is_effectively_child(&pcb, false, kwo.options) {
                             continue;
                         }
                         if !child_matches_wait_options(&pcb, kwo.options) {
@@ -371,7 +365,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             all_waitable_children_exited = false;
                         }
 
-                        if matches!(state, ProcessState::Stopped)
+                        if state.is_stopped()
                             && kwo.options.contains(WaitOption::WSTOPPED)
                             && pcb.sighand().flags_contains(SignalFlags::CLD_STOPPED)
                         {
@@ -381,6 +375,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 pid: pcb.task_pid_vnr(),
                                 status: stopsig,
                                 cause: SigChildCode::Stopped.into(),
+                                uid: pcb.cred().uid.data() as u32,
                             });
                             kwo.ret_status = (stopsig << 8) | 0x7f;
                             if !kwo.options.contains(WaitOption::WNOWAIT) {
@@ -397,6 +392,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 pid: pcb.task_pid_vnr(),
                                 status: Signal::SIGCONT as i32,
                                 cause: SigChildCode::Continued.into(),
+                                uid: pcb.cred().uid.data() as u32,
                             });
                             kwo.ret_status = 0xffff;
                             if !kwo.options.contains(WaitOption::WNOWAIT) {
@@ -422,6 +418,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 pid: pcb.task_pid_vnr(),
                                 status: status8,
                                 cause: SigChildCode::Exited.into(),
+                                uid: pcb.cred().uid.data() as u32,
                             });
                             tmp_child_pcb = Some(pcb.clone());
                             if !kwo.options.contains(WaitOption::WNOWAIT) {
@@ -455,31 +452,36 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
 
                 let mut scan_result: Option<Result<usize, SystemError>> = None;
                 let mut echild = false;
+                let mut has_eligible_child = false;
 
                 let wait_res = parent.wait_queue.wait_event_interruptible(
                     || {
                         let rd_childen = parent.children.read();
-                        if rd_childen.is_empty() {
+                        let rd_ptraced = parent.ptraced_list.read();
+
+                        if rd_childen.is_empty() && rd_ptraced.is_empty() {
                             echild = true;
                             return true;
                         }
-                        let mut has_waitable_child = false;
                         let mut all_waitable_children_exited = true;
                         let mut pid_to_release: Option<RawPid> = None;
 
+                        // 首先遍历 children 列表（类似 Linux 的 do_wait_thread）
                         for pid in rd_childen.iter() {
                             let pcb = match ProcessManager::find_task_by_vpid(*pid) {
                                 Some(p) => p,
                                 None => continue,
                             };
 
-                            if !is_eligible_child(&pcb, kwo.options) {
+                            if !is_effectively_child(&pcb, false, kwo.options) {
                                 continue;
                             }
                             if !child_matches_wait_options(&pcb, kwo.options) {
                                 continue;
                             }
-                            has_waitable_child = true;
+
+                            // 找到了符合条件的子进程，标记为有可等待的子进程
+                            has_eligible_child = true;
 
                             let sched_guard = pcb.sched_info().inner_lock_read_irqsave();
                             let state = sched_guard.state();
@@ -487,21 +489,62 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 all_waitable_children_exited = false;
                             }
 
-                            if matches!(state, ProcessState::Stopped)
+                            if matches!(state, ProcessState::Stopped(_))
                                 && kwo.options.contains(WaitOption::WSTOPPED)
                                 && pcb.sighand().flags_contains(SignalFlags::CLD_STOPPED)
                             {
-                                let stopsig = Signal::SIGSTOP as i32;
+                                // 从 ProcessState::Stopped 中提取实际的停止信号号
+                                // 注意：提取纯信号号（去掉 0x80 位），用于 stopsig
+                                let actual_sig = if let ProcessState::Stopped(sig) = state {
+                                    (sig & 0x7f) as i32 // 去掉 0x80 位，只保留信号号
+                                } else {
+                                    Signal::SIGSTOP as i32
+                                };
+                                // 检查是否有 PTRACE_SYSCALL 事件（0x80 位）
+                                let has_ptrace_syscall = if let ProcessState::Stopped(sig) = state {
+                                    (sig & 0x80) != 0
+                                } else {
+                                    false
+                                };
                                 kwo.no_task_error = None;
+                                // ret_info.status 使用纯信号号（不含 0x80 位）
                                 kwo.ret_info = Some(WaitIdInfo {
                                     pid: pcb.task_pid_vnr(),
-                                    status: stopsig,
+                                    status: actual_sig,
                                     cause: SigChildCode::Stopped.into(),
+                                    uid: get_child_uid(&pcb),
                                 });
-                                kwo.ret_status = (stopsig << 8) | 0x7f;
+                                // ret_status 编码：如果是 PTRACE_SYSCALL 事件，在信号上加 0x80
+                                // 这样 WSTOPSIG(status) 返回 (signal | 0x80)，tracer 可以通过检查 0x80 位区分
+                                let status_sig = if has_ptrace_syscall {
+                                    actual_sig | 0x80
+                                } else {
+                                    actual_sig
+                                };
+                                kwo.ret_status = (status_sig << 8) | 0x7f;
                                 if !kwo.options.contains(WaitOption::WNOWAIT) {
                                     pcb.sighand().flags_remove(SignalFlags::CLD_STOPPED);
                                 }
+                                scan_result = Some(Ok((*pid).into()));
+                                drop(sched_guard);
+                                break;
+                            } else if matches!(state, ProcessState::TracedStopped(_)) {
+                                // 对标 Linux wait_task_stopped(ptrace=true):
+                                // - ptrace stop 的状态码按原始 stop code 返回，不能丢弃高位事件信息
+                                // - 例如 SIGTRAP|0x80 (TRACESYSGOOD) 和 PTRACE_EVENT_xxx
+                                let raw_stop = if let ProcessState::TracedStopped(sig) = state {
+                                    sig as i32
+                                } else {
+                                    Signal::SIGSTOP as i32
+                                };
+                                kwo.no_task_error = None;
+                                kwo.ret_info = Some(WaitIdInfo {
+                                    pid: pcb.task_pid_vnr(),
+                                    status: raw_stop,
+                                    cause: SigChildCode::Trapped.into(),
+                                    uid: get_child_uid(&pcb),
+                                });
+                                kwo.ret_status = (raw_stop << 8) | 0x7f;
                                 scan_result = Some(Ok((*pid).into()));
                                 drop(sched_guard);
                                 break;
@@ -513,6 +556,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                     pid: pcb.task_pid_vnr(),
                                     status: Signal::SIGCONT as i32,
                                     cause: SigChildCode::Continued.into(),
+                                    uid: get_child_uid(&pcb),
                                 });
                                 kwo.ret_status = 0xffff;
                                 if !kwo.options.contains(WaitOption::WNOWAIT) {
@@ -538,6 +582,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                     pid: pcb.task_pid_vnr(),
                                     status: status8,
                                     cause: SigChildCode::Exited.into(),
+                                    uid: get_child_uid(&pcb),
                                 });
                                 tmp_child_pcb = Some(pcb.clone());
                                 if !kwo.options.contains(WaitOption::WNOWAIT) {
@@ -554,19 +599,90 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             drop(sched_guard);
                         }
                         drop(rd_childen);
+
+                        // 然后遍历 ptraced_list（类似 Linux 的 ptrace_do_wait）
+                        // 被 ptrace 的进程不在 children 列表中，但可以被 tracer wait
+                        if scan_result.is_none() {
+                            for pid in rd_ptraced.iter() {
+                                if scan_result.is_some() {
+                                    break;
+                                }
+                                let pcb = match ProcessManager::find_task_by_vpid(*pid) {
+                                    Some(p) => p,
+                                    None => continue,
+                                };
+
+                                // ptrace 的子进程总是可以被 wait，不需要检查 is_eligible_child
+                                if !child_matches_wait_options(&pcb, kwo.options) {
+                                    continue;
+                                }
+
+                                // 找到了符合条件的ptrace子进程，标记为有可等待的子进程
+                                has_eligible_child = true;
+
+                                let sched_guard = pcb.sched_info().inner_lock_read_irqsave();
+                                let state = sched_guard.state();
+                                if !state.is_exited() {
+                                    all_waitable_children_exited = false;
+                                }
+
+                                if matches!(state, ProcessState::TracedStopped(_)) {
+                                    // 必须保留原始 stop code（含 0x80 / PTRACE_EVENT 高位）
+                                    let raw_stop = if let ProcessState::TracedStopped(sig) = state {
+                                        sig as i32
+                                    } else {
+                                        Signal::SIGSTOP as i32
+                                    };
+                                    kwo.no_task_error = None;
+                                    kwo.ret_info = Some(WaitIdInfo {
+                                        pid: pcb.task_pid_vnr(),
+                                        status: raw_stop,
+                                        cause: SigChildCode::Trapped.into(),
+                                        uid: get_child_uid(&pcb),
+                                    });
+                                    kwo.ret_status = (raw_stop << 8) | 0x7f;
+                                    scan_result = Some(Ok((*pid).into()));
+                                    drop(sched_guard);
+                                    break;
+                                } else if state.is_exited()
+                                    && kwo.options.contains(WaitOption::WEXITED)
+                                {
+                                    let raw = state.exit_code().unwrap() as i32;
+                                    kwo.ret_status = raw;
+                                    let status8 = wstatus_to_waitid_status(raw);
+                                    kwo.no_task_error = None;
+                                    kwo.ret_info = Some(WaitIdInfo {
+                                        pid: pcb.task_pid_vnr(),
+                                        status: status8,
+                                        cause: SigChildCode::Exited.into(),
+                                        uid: get_child_uid(&pcb),
+                                    });
+                                    tmp_child_pcb = Some(pcb.clone());
+                                    if !kwo.options.contains(WaitOption::WNOWAIT) {
+                                        pid_to_release = Some(pcb.raw_pid());
+                                    }
+                                    scan_result = Some(Ok((*pid).into()));
+                                    drop(sched_guard);
+                                    break;
+                                }
+                                drop(sched_guard);
+                            }
+                        }
+
                         if let Some(pid) = pid_to_release {
                             unsafe { ProcessManager::release(pid) };
                         }
                         if scan_result.is_some() {
                             return true;
                         }
-                        if !has_waitable_child {
-                            echild = true;
-                            return true;
-                        }
                         if all_waitable_children_exited
                             && !kwo.options.contains(WaitOption::WEXITED)
                         {
+                            echild = true;
+                            return true;
+                        }
+                        // 如果没有找到任何符合条件的子进程，返回ECHILD
+                        if !has_eligible_child {
                             echild = true;
                             return true;
                         }
@@ -582,6 +698,11 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                         }
                         if echild {
                             break Err(SystemError::ECHILD);
+                        }
+                        // 如果设置了WNOHANG，且没有符合条件的子进程准备好，
+                        // 返回0表示"没有子进程准备好但存在可等待的子进程"
+                        if kwo.options.contains(WaitOption::WNOHANG) {
+                            break Ok(0);
                         }
                         if ProcessManager::current_pcb().has_pending_signal_fast() {
                             break Err(SystemError::ERESTARTSYS);
@@ -615,7 +736,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             None => continue,
                         };
 
-                        if !is_eligible_child(&pcb, kwo.options) {
+                        if !is_effectively_child(&pcb, false, kwo.options) {
                             continue;
                         }
 
@@ -639,7 +760,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             all_matching_children_exited = false;
                         }
 
-                        if matches!(state, ProcessState::Stopped)
+                        if state.is_stopped()
                             && kwo.options.contains(WaitOption::WSTOPPED)
                             && pcb.sighand().flags_contains(SignalFlags::CLD_STOPPED)
                         {
@@ -649,6 +770,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 pid: pcb.task_pid_vnr(),
                                 status: stopsig,
                                 cause: SigChildCode::Stopped.into(),
+                                uid: pcb.cred().uid.data() as u32,
                             });
                             kwo.ret_status = (stopsig << 8) | 0x7f;
                             if !kwo.options.contains(WaitOption::WNOWAIT) {
@@ -665,6 +787,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 pid: pcb.task_pid_vnr(),
                                 status: Signal::SIGCONT as i32,
                                 cause: SigChildCode::Continued.into(),
+                                uid: pcb.cred().uid.data() as u32,
                             });
                             kwo.ret_status = 0xffff;
                             if !kwo.options.contains(WaitOption::WNOWAIT) {
@@ -690,6 +813,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 pid: pcb.task_pid_vnr(),
                                 status: status8,
                                 cause: SigChildCode::Exited.into(),
+                                uid: pcb.cred().uid.data() as u32,
                             });
                             tmp_child_pcb = Some(pcb.clone());
                             if !kwo.options.contains(WaitOption::WNOWAIT) {
@@ -727,7 +851,9 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                 let wait_res = parent.wait_queue.wait_event_interruptible(
                     || {
                         let rd_children = parent.children.read();
-                        if rd_children.is_empty() {
+                        let rd_ptraced = parent.ptraced_list.read();
+
+                        if rd_children.is_empty() && rd_ptraced.is_empty() {
                             echild = true;
                             return true;
                         }
@@ -742,7 +868,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 None => continue,
                             };
 
-                            if !is_eligible_child(&pcb, kwo.options) {
+                            if !is_effectively_child(&pcb, false, kwo.options) {
                                 continue;
                             }
 
@@ -767,18 +893,39 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 all_matching_children_exited = false;
                             }
 
-                            if matches!(state, ProcessState::Stopped)
+                            if matches!(state, ProcessState::Stopped(_))
                                 && kwo.options.contains(WaitOption::WSTOPPED)
                                 && pcb.sighand().flags_contains(SignalFlags::CLD_STOPPED)
                             {
-                                let stopsig = Signal::SIGSTOP as i32;
+                                // 从 ProcessState::Stopped 中提取实际的停止信号号
+                                // 注意：提取纯信号号（去掉 0x80 位），用于 stopsig
+                                let actual_sig = if let ProcessState::Stopped(sig) = state {
+                                    (sig & 0x7f) as i32 // 去掉 0x80 位，只保留信号号
+                                } else {
+                                    Signal::SIGSTOP as i32
+                                };
+                                // 检查是否有 PTRACE_SYSCALL 事件（0x80 位）
+                                let has_ptrace_syscall = if let ProcessState::Stopped(sig) = state {
+                                    (sig & 0x80) != 0
+                                } else {
+                                    false
+                                };
                                 kwo.no_task_error = None;
+                                // ret_info.status 使用纯信号号（不含 0x80 位）
                                 kwo.ret_info = Some(WaitIdInfo {
                                     pid: pcb.task_pid_vnr(),
-                                    status: stopsig,
+                                    status: actual_sig,
                                     cause: SigChildCode::Stopped.into(),
+                                    uid: get_child_uid(&pcb),
                                 });
-                                kwo.ret_status = (stopsig << 8) | 0x7f;
+                                // ret_status 编码：如果是 PTRACE_SYSCALL 事件，在信号上加 0x80
+                                // 这样 WSTOPSIG(status) 返回 (signal | 0x80)，tracer 可以通过检查 0x80 位区分
+                                let status_sig = if has_ptrace_syscall {
+                                    actual_sig | 0x80
+                                } else {
+                                    actual_sig
+                                };
+                                kwo.ret_status = (status_sig << 8) | 0x7f;
                                 if !kwo.options.contains(WaitOption::WNOWAIT) {
                                     pcb.sighand().flags_remove(SignalFlags::CLD_STOPPED);
                                 }
@@ -793,6 +940,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                     pid: pcb.task_pid_vnr(),
                                     status: Signal::SIGCONT as i32,
                                     cause: SigChildCode::Continued.into(),
+                                    uid: get_child_uid(&pcb),
                                 });
                                 kwo.ret_status = 0xffff;
                                 if !kwo.options.contains(WaitOption::WNOWAIT) {
@@ -818,6 +966,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                     pid: pcb.task_pid_vnr(),
                                     status: status8,
                                     cause: SigChildCode::Exited.into(),
+                                    uid: get_child_uid(&pcb),
                                 });
                                 tmp_child_pcb = Some(pcb.clone());
                                 if !kwo.options.contains(WaitOption::WNOWAIT) {
@@ -834,6 +983,85 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             drop(sched_guard);
                         }
                         drop(rd_children);
+
+                        if scan_result.is_none() {
+                            for ptraced_pid in rd_ptraced.iter() {
+                                if scan_result.is_some() {
+                                    break;
+                                }
+
+                                let pcb = match ProcessManager::find_task_by_vpid(*ptraced_pid) {
+                                    Some(p) => p,
+                                    None => continue,
+                                };
+
+                                // 检查 PGID 是否匹配
+                                let child_pgrp = pcb.task_pgrp();
+                                let in_target_pgrp = match &child_pgrp {
+                                    Some(cp) => Arc::ptr_eq(cp, pgid),
+                                    None => false,
+                                };
+                                if !in_target_pgrp {
+                                    continue;
+                                }
+
+                                has_matching_child = true;
+
+                                // ptrace 的子进程总是可以被 wait，不需要检查 is_eligible_child
+                                if !child_matches_wait_options(&pcb, kwo.options) {
+                                    continue;
+                                }
+
+                                let sched_guard = pcb.sched_info().inner_lock_read_irqsave();
+                                let state = sched_guard.state();
+                                if !state.is_exited() {
+                                    all_matching_children_exited = false;
+                                }
+
+                                if matches!(state, ProcessState::TracedStopped(_)) {
+                                    // 必须保留原始 stop code（含 0x80 / PTRACE_EVENT 高位）
+                                    let raw_stop = if let ProcessState::TracedStopped(sig) = state {
+                                        sig as i32
+                                    } else {
+                                        Signal::SIGSTOP as i32
+                                    };
+                                    kwo.no_task_error = None;
+                                    kwo.ret_info = Some(WaitIdInfo {
+                                        pid: pcb.task_pid_vnr(),
+                                        status: raw_stop,
+                                        cause: SigChildCode::Trapped.into(),
+                                        uid: get_child_uid(&pcb),
+                                    });
+                                    kwo.ret_status = (raw_stop << 8) | 0x7f;
+                                    scan_result = Some(Ok((*ptraced_pid).into()));
+                                    drop(sched_guard);
+                                    break;
+                                } else if state.is_exited()
+                                    && kwo.options.contains(WaitOption::WEXITED)
+                                {
+                                    let raw = state.exit_code().unwrap() as i32;
+                                    kwo.ret_status = raw;
+                                    let status8 = wstatus_to_waitid_status(raw);
+                                    kwo.no_task_error = None;
+                                    kwo.ret_info = Some(WaitIdInfo {
+                                        pid: pcb.task_pid_vnr(),
+                                        status: status8,
+                                        cause: SigChildCode::Exited.into(),
+                                        uid: get_child_uid(&pcb),
+                                    });
+                                    tmp_child_pcb = Some(pcb.clone());
+                                    if !kwo.options.contains(WaitOption::WNOWAIT) {
+                                        pid_to_release = Some(pcb.raw_pid());
+                                    }
+                                    scan_result = Some(Ok((*ptraced_pid).into()));
+                                    drop(sched_guard);
+                                    break;
+                                }
+                                drop(sched_guard);
+                            }
+                        }
+                        drop(rd_ptraced);
+
                         if let Some(pid) = pid_to_release {
                             unsafe { ProcessManager::release(pid) };
                         }
@@ -910,11 +1138,21 @@ fn do_waitpid(
             pid: child_pcb.task_pid_vnr(),
             status: Signal::SIGCONT as i32,
             cause: SigChildCode::Continued.into(),
+            uid: get_child_uid(&child_pcb),
         });
 
         // 设置 ret_status 供 wait4 使用
         // Linux wait(2) 语义：continued 进程的 wstatus = 0xffff
         kwo.ret_status = 0xffff;
+
+        // 获取 rusage（如果提供了 rusage 缓冲区）
+        // 参考: https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/exit.c#1358
+        if let Some(rusage) = kwo.ret_rusage.as_mut() {
+            if let Some(child_rusage) = child_pcb.get_rusage(super::resource::RUsageWho::RUsageSelf)
+            {
+                **rusage = child_rusage;
+            }
+        }
 
         if !kwo.options.contains(WaitOption::WNOWAIT) {
             child_pcb.sighand().flags_remove(SignalFlags::CLD_CONTINUED);
@@ -935,33 +1173,77 @@ fn do_waitpid(
             // 而不是立即返回0。只有当子进程真正退出时才应该返回。
             return None;
         }
-        ProcessState::Stopped => {
-            // 非 ptrace 停止：报告 stopsig=SIGSTOP
-            let stopsig = Signal::SIGSTOP as i32;
-            // 由于目前不支持ptrace，因此这个值为false
-            let ptrace = false;
-
-            if (!ptrace) && (!kwo.options.contains(WaitOption::WSTOPPED)) {
-                // 调用方未请求 WSTOPPED，按照 Linux 语义应当继续等待其它事件
-                // 而不是返回 0 并写回空的 siginfo。
+        ProcessState::Stopped(stopsig) => {
+            // group-stop 只在存在“待上报停止事件”时才可见，并且在非 WNOWAIT 下消费该事件。
+            if !kwo.options.contains(WaitOption::WUNTRACED)
+                || !child_pcb.sighand().flags_contains(SignalFlags::CLD_STOPPED)
+            {
                 return None;
             }
 
-            // 填充 waitid 信息
-            // log::debug!("do_waitpid: report CLD_STOPPED for pid={:?}", child_pcb.raw_pid());
+            let actual_sig = stopsig & 0x7f;
+            if actual_sig >= Signal::SIGRTMAX.into() {
+                return Some(Err(SystemError::EINVAL));
+            }
+
+            if likely(!(kwo.options.contains(WaitOption::WNOWAIT))) {
+                kwo.ret_status = if (stopsig & 0x80) != 0 {
+                    // ptrace 停止，保留 0x80 标志
+                    ((actual_sig << 8) | 0x80) as i32
+                } else {
+                    // 普通停止
+                    ((actual_sig << 8) | 0x7f) as i32
+                };
+            }
+
             kwo.ret_info = Some(WaitIdInfo {
                 pid: child_pcb.task_pid_vnr(),
-                status: stopsig,
+                status: actual_sig as i32,
                 cause: SigChildCode::Stopped.into(),
+                uid: get_child_uid(&child_pcb),
             });
 
-            // 设置 ret_status 供 wait4 使用
-            // Linux wait(2) 语义：stopped 进程的 wstatus = (stopsig << 8) | 0x7f
-            kwo.ret_status = (stopsig << 8) | 0x7f;
+            if let Some(rusage) = kwo.ret_rusage.as_mut() {
+                if let Some(child_rusage) =
+                    child_pcb.get_rusage(super::resource::RUsageWho::RUsageSelf)
+                {
+                    **rusage = child_rusage;
+                }
+            }
 
             if !kwo.options.contains(WaitOption::WNOWAIT) {
-                // 消费一次停止事件标志（若存在）
                 child_pcb.sighand().flags_remove(SignalFlags::CLD_STOPPED);
+            }
+
+            return Some(Ok(child_pcb.raw_pid().data()));
+        }
+        ProcessState::TracedStopped(stopsig) => {
+            // TracedStopped 状态类似于 Linux 的 TASK_TRACED
+            // 这是 ptrace 专用的停止状态，总是报告给 tracer
+            let actual_sig = stopsig & 0x7f;
+            if actual_sig >= Signal::SIGRTMAX.into() {
+                return Some(Err(SystemError::EINVAL));
+            }
+            // TracedStopped 状态总是被 ptrace，所以总是报告停止状态
+            // 不需要检查 WUNTRACED 标志
+            if likely(!(kwo.options.contains(WaitOption::WNOWAIT))) {
+                kwo.ret_status = ((stopsig as i32) << 8) | 0x7f;
+            }
+            kwo.ret_info = Some(WaitIdInfo {
+                pid: child_pcb.task_pid_vnr(),
+                status: stopsig as i32,
+                cause: SigChildCode::Trapped.into(),
+                uid: get_child_uid(&child_pcb),
+            });
+
+            // 获取 rusage（如果提供了 rusage 缓冲区）
+            // 参考: https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/exit.c#1308
+            if let Some(rusage) = kwo.ret_rusage.as_mut() {
+                if let Some(child_rusage) =
+                    child_pcb.get_rusage(super::resource::RUsageWho::RUsageSelf)
+                {
+                    **rusage = child_rusage;
+                }
             }
 
             return Some(Ok(child_pcb.raw_pid().data()));
@@ -985,9 +1267,21 @@ fn do_waitpid(
                 pid,
                 status: wstatus_to_waitid_status(status as i32),
                 cause: SigChildCode::Exited.into(),
+                uid: get_child_uid(&child_pcb),
             });
 
             kwo.ret_status = status as i32;
+
+            // 获取 rusage（如果提供了 rusage 缓冲区）
+            // 参考: https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/exit.c#1191
+            // 注意：需要在释放进程前获取 rusage
+            if let Some(rusage) = kwo.ret_rusage.as_mut() {
+                if let Some(child_rusage) =
+                    child_pcb.get_rusage(super::resource::RUsageWho::RUsageSelf)
+                {
+                    **rusage = child_rusage;
+                }
+            }
 
             // 若指定 WNOWAIT，则只观测不回收
             if !kwo.options.contains(WaitOption::WNOWAIT) {
@@ -1010,7 +1304,7 @@ fn do_waitpid(
 
 impl ProcessControlBlock {
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/exit.c#143
-    pub(super) fn __exit_signal(&mut self) {
+    pub(super) fn __exit_signal(&self) {
         let sighand = self.sighand();
         if sighand.flags_contains(SignalFlags::GROUP_EXEC) {
             let this = self.self_ref.upgrade();

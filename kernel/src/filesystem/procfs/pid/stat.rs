@@ -1,7 +1,3 @@
-//! /proc/[pid]/stat - 进程状态信息
-//!
-//! 以单行格式返回进程的状态信息，兼容 Linux procfs 格式
-
 use core::sync::atomic::Ordering;
 
 use crate::libs::mutex::MutexGuard;
@@ -15,7 +11,7 @@ use crate::{
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
     mm::MemoryManagementArch,
-    process::{pid::PidType, ProcessControlBlock, ProcessManager, ProcessState, RawPid},
+    process::{ProcessControlBlock, ProcessManager, ProcessState, RawPid},
     sched::{cputime::ns_to_clock_t, prio::PrioUtil},
 };
 use alloc::{
@@ -40,8 +36,15 @@ impl StatFileOps {
     }
 }
 
-/// 将进程状态转换为 Linux 风格的字符
-fn state_to_linux_char(state: ProcessState) -> char {
+/// 将进程状态转换为 Linux 风格字符
+fn state_to_linux_char(pcb: &ProcessControlBlock, state: ProcessState) -> char {
+    if pcb.is_dead() {
+        return 'X';
+    }
+    if pcb.is_zombie() {
+        return 'Z';
+    }
+
     match state {
         ProcessState::Runnable => 'R',
         ProcessState::Blocked(interruptable) => {
@@ -63,18 +66,42 @@ fn sanitize_comm_for_proc_stat(comm: &str) -> String {
         .collect()
 }
 
+/// 统计线程组中的线程数量
+fn thread_count(pcb: &Arc<ProcessControlBlock>) -> i64 {
+    let leader = if pcb.is_thread_group_leader() {
+        pcb.clone()
+    } else {
+        pcb.threads_read_irqsave()
+            .group_leader()
+            .unwrap_or_else(|| pcb.clone())
+    };
+
+    let ti = leader.threads_read_irqsave();
+    let mut cnt = 1i64;
+
+    for weak in ti.group_tasks_clone() {
+        if let Some(task) = weak.upgrade() {
+            if !task.is_dead() {
+                cnt += 1;
+            }
+        }
+    }
+
+    cnt
+}
+
 /// 生成 Linux 风格的 /proc/[pid]/stat 行
 fn generate_linux_proc_stat_line(
     pid: RawPid,
     comm: &str,
     state: ProcessState,
-    ppid: RawPid,
     pcb: &Arc<ProcessControlBlock>,
 ) -> String {
     let comm = sanitize_comm_for_proc_stat(comm);
-    let state_ch = state_to_linux_char(state);
+    let state_ch = state_to_linux_char(pcb, state);
 
-    // 尽量填真实值；拿不到的先填 0
+    // 当前先尽量填真实值；拿不到的保守填 0
+    let ppid: usize = pcb.basic().ppid().data();
     let pgrp: usize = 0;
     let session: usize = 0;
     let tty_nr: i32 = pcb
@@ -83,13 +110,14 @@ fn generate_linux_proc_stat_line(
         .map(|tty| tty.core().device_number().new_encode_dev() as i32)
         .unwrap_or(0);
     let tpgid: i32 = 0;
-    let flags: u64 = 0;
+    let flags: u64 = pcb.flags().bits() as u64;
+
     let minflt: u64 = 0;
     let cminflt: u64 = 0;
     let majflt: u64 = 0;
     let cmajflt: u64 = 0;
 
-    // === 读取真实的 CPU 时间 ===
+    // 真实 CPU 时间
     let cpu_time = pcb.cputime();
     let utime = ns_to_clock_t(cpu_time.utime.load(Ordering::Relaxed));
     let stime = ns_to_clock_t(cpu_time.stime.load(Ordering::Relaxed));
@@ -97,23 +125,20 @@ fn generate_linux_proc_stat_line(
     let cutime: i64 = 0;
     let cstime: i64 = 0;
 
-    // === 读取真实的 priority 和 nice 值 ===
+    // priority / nice
     let prio_data = pcb.sched_info().prio_data();
     let priority: i64 = prio_data.prio as i64;
     let nice: i64 = PrioUtil::prio_to_nice(prio_data.static_prio) as i64;
     drop(prio_data);
 
-    // 线程组中的线程数量
-    let num_threads: i64 = pcb
-        .task_pid_ptr(PidType::TGID)
-        .map(|tgid_pid| tgid_pid.tasks_iter(PidType::TGID).count() as i64)
-        .unwrap_or(1);
+    let num_threads: i64 = thread_count(pcb);
     let itrealvalue: i64 = 0;
 
-    // starttime: 进程启动时间（暂时为 0，需要 PCB 添加 start_time 字段）
+    // 当前还没有可靠的“进程启动时刻 clock ticks”来源，先保守为 0
     let starttime: u64 = 0;
 
     // vsize: bytes, rss: pages
+    // 这里 rss 仍是近似值：按 VMA 总大小折算页数，而不是真实驻留页统计
     let (vsize_bytes, rss_pages) = pcb
         .basic()
         .user_vm()
@@ -125,7 +150,7 @@ fn generate_linux_proc_stat_line(
         })
         .unwrap_or((0, 0));
 
-    // processor: 进程最后运行的 CPU ID
+    // processor: 最后运行的 CPU ID
     let processor: i32 = pcb
         .sched_info()
         .on_cpu()
@@ -137,7 +162,6 @@ fn generate_linux_proc_stat_line(
 {minflt} {cminflt} {majflt} {cmajflt} {utime} {stime} {cutime} {cstime} {priority} {nice} \
 {num_threads} {itrealvalue} {starttime} {vsize_bytes} {rss_pages} 0 0 0 0 0 0 0 0 0 0 0 0 0 {processor} 0 0 0 0 0\n",
         pid = pid.data(),
-        ppid = ppid.data(),
     )
 }
 
@@ -155,12 +179,7 @@ impl FileOps for StatFileOps {
         let sched = pcb.sched_info();
         let state = sched.inner_lock_read_irqsave().state();
 
-        let ppid = pcb
-            .parent_pcb()
-            .map(|p| p.raw_pid())
-            .unwrap_or(RawPid::new(0));
-
-        let content = generate_linux_proc_stat_line(self.pid, &comm, state, ppid, &pcb);
+        let content = generate_linux_proc_stat_line(self.pid, &comm, state, &pcb);
         proc_read(offset, len, buf, content.as_bytes())
     }
 }

@@ -8,6 +8,7 @@ use crate::{
             cmdline::CmdlineFileOps,
             cpuinfo::CpuInfoFileOps,
             kmsg_file::KmsgFileOps,
+            uptime::UptimeFileOps,
             loadavg::LoadavgFileOps,
             meminfo::MeminfoFileOps,
             mounts::MountsFileOps,
@@ -63,6 +64,7 @@ impl RootDirOps {
         ("cmdline", CmdlineFileOps::new_inode),
         ("cpuinfo", CpuInfoFileOps::new_inode),
         ("kmsg", KmsgFileOps::new_inode),
+        ("uptime", UptimeFileOps::new_inode),
         ("loadavg", LoadavgFileOps::new_inode),
         ("meminfo", MeminfoFileOps::new_inode),
         ("mounts", MountsFileOps::new_inode),
@@ -85,23 +87,21 @@ impl DirOps for RootDirOps {
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 首先检查是否是 PID 目录
         if let Ok(pid) = name.parse::<RawPid>() {
-            // 检查进程是否存在
-            if ProcessManager::find(pid).is_some() {
-                let mut cached_children = dir.cached_children().write();
+    let mut cached_children = dir.cached_children().write();
 
-                // 检查缓存中是否已存在
-                if let Some(child) = cached_children.get(name) {
-                    return Ok(child.clone());
-                }
+    if ProcessManager::find(pid).is_none() {
+        cached_children.remove(name);
+        return Err(SystemError::ENOENT);
+    }
 
-                // 创建新的 PID 目录（只传递 PID，不传递进程引用）
-                let inode = PidDirOps::new_inode(pid, dir.self_ref_weak().clone());
-                cached_children.insert(name.to_string(), inode.clone());
-                return Ok(inode);
-            } else {
-                return Err(SystemError::ENOENT);
-            }
-        }
+    if let Some(child) = cached_children.get(name) {
+        return Ok(child.clone());
+    }
+
+    let inode = PidDirOps::new_inode(pid, dir.self_ref_weak().clone());
+    cached_children.insert(name.to_string(), inode.clone());
+    return Ok(inode);
+}
 
         // 查找静态条目
         let mut cached_children = dir.cached_children().write();
@@ -132,17 +132,26 @@ impl DirOps for RootDirOps {
         // 获取缓存写锁并填充
         let mut cached_children = dir.cached_children().write();
 
-        // 填充进程目录（只传递 PID）
-        for pid in pid_list {
-            cached_children
-                .entry(pid.to_string())
-                .or_insert_with(|| PidDirOps::new_inode(pid, dir.self_ref_weak().clone()));
-        }
+	// 先删除已经失效的 PID 目录缓存
+	cached_children.retain(|name, _| {
+	    if let Ok(pid) = name.parse::<RawPid>() {
+		pid_list.contains(&pid)
+	    } else {
+		true
+	    }
+	});
 
-        // 填充静态条目
-        populate_children_from_table(&mut cached_children, Self::STATIC_ENTRIES, |f| {
-            (f)(dir.self_ref_weak().clone())
-        });
+	// 再填充当前仍存在的 PID 目录
+	for pid in pid_list.iter().copied() {
+	    cached_children
+		.entry(pid.to_string())
+		.or_insert_with(|| PidDirOps::new_inode(pid, dir.self_ref_weak().clone()));
+	}
+
+	// 填充静态条目
+	populate_children_from_table(&mut cached_children, Self::STATIC_ENTRIES, |f| {
+	    (f)(dir.self_ref_weak().clone())
+	});
         // 写锁在这里自动释放
     }
 }

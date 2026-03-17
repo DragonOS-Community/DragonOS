@@ -332,13 +332,16 @@ impl TcpSocket {
                     let local = listening.get_name();
                     let port = local.port;
 
-                    // Unregister from all unique interfaces.
+                    // Unregister listen port and unbind socket from all unique interfaces.
+                    // For INADDR_ANY listeners, listen sockets span multiple interfaces.
                     {
+                        let me = self.self_ref.upgrade().unwrap();
                         let mut unregistered: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
                         for b in &listening.inners {
                             let nic_id = b.iface().nic_id();
                             if !unregistered.contains(&nic_id) {
                                 b.iface().common().unregister_tcp_listen_port(port);
+                                b.iface().common().unbind_socket(me.clone());
                                 unregistered.push(nic_id);
                             }
                         }
@@ -478,10 +481,16 @@ impl TcpSocket {
         // close(fd) must not break in-flight syscalls that already hold a
         // reference to this socket object (gVisor ClosedWriteBlockingSocket).
         // So we do NOT leave self.inner as None; we always reinsert it below.
-        if let Some(iface) = inner.iface() {
-            iface
-                .common()
-                .unbind_socket(self.self_ref.upgrade().unwrap());
+        //
+        // For Listening sockets, unbind_socket must be done per-iface inside the
+        // Listening match arm (INADDR_ANY spans multiple interfaces). For all other
+        // states, inner.iface() returns the single owning iface.
+        if !matches!(inner, inner::Inner::Listening(_)) {
+            if let Some(iface) = inner.iface() {
+                iface
+                    .common()
+                    .unbind_socket(self.self_ref.upgrade().unwrap());
+            }
         }
 
         match inner {
@@ -550,14 +559,18 @@ impl TcpSocket {
             inner::Inner::Listening(mut ls) => {
                 // close(listen_fd) should stop listening on the port.
                 let port = ls.get_name().port;
-                // Unregister from all unique interfaces.
+                // Unregister listen port and unbind socket from all unique interfaces.
+                // For INADDR_ANY listeners, listen sockets span multiple interfaces,
+                // so we must clean up each one.
                 {
-                    let mut unregistered: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+                    let me = self.self_ref.upgrade().unwrap();
+                    let mut cleaned: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
                     for b in &ls.inners {
                         let nic_id = b.iface().nic_id();
-                        if !unregistered.contains(&nic_id) {
+                        if !cleaned.contains(&nic_id) {
                             b.iface().common().unregister_tcp_listen_port(port);
-                            unregistered.push(nic_id);
+                            b.iface().common().unbind_socket(me.clone());
+                            cleaned.push(nic_id);
                         }
                     }
                 }

@@ -701,7 +701,13 @@ impl Listening {
         for inner in self.inners.iter() {
             inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.close());
         }
-        self.inners[0]
+        // The original port-owning socket is always the *last* element in `inners`
+        // (pushed last during listen() construction). We must unbind from its
+        // port_manager, not inners[0] which may belong to a different iface for
+        // INADDR_ANY listeners.
+        self.inners
+            .last()
+            .expect("Listening socket must have at least one inner")
             .iface()
             .port_manager()
             .unbind_port(Types::Tcp, port);

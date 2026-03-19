@@ -5,6 +5,22 @@ use crate::format_error;
 use crate::prelude::*;
 use core::cmp::min;
 
+impl Ext4 {
+    /// Write an extent block to disk with checksum in the extent tail.
+    fn write_extent_block(&self, block: &mut Block, inode_ref: &InodeRef) -> Result<()> {
+        let tail_offset = BLOCK_SIZE - core::mem::size_of::<ExtentTail>();
+        let csum = extent_block_checksum(
+            &self.read_super_block_cached().uuid(),
+            inode_ref.id,
+            inode_ref.inode.generation(),
+            &*block.data,
+        );
+        // Write checksum into the tail
+        block.data[tail_offset..tail_offset + 4].copy_from_slice(&csum.to_le_bytes());
+        self.write_block(block)
+    }
+}
+
 #[derive(Debug)]
 struct ExtentSearchStep {
     /// The physical block where this extent node is stored.
@@ -89,17 +105,79 @@ impl Ext4 {
                 let ex = ex_node.extent_at(index);
                 Ok(ex.start_pblock() + (iblock - ex.start_lblock()) as PBlockId)
             }
-            Err(_) => {
-                // Not found, create a new extent
+            Err(insert_pos) => {
+                // Not found, check if we can merge with the previous extent
+                // before allocating. We extract the merge candidate info here
+                // while we still hold ex_node, then release it before allocating.
+                let merge_candidate = if insert_pos > 0 {
+                    let prev = ex_node.extent_at(insert_pos - 1);
+                    Some((prev.start_lblock(), prev.start_pblock(), prev.block_count()))
+                } else {
+                    None
+                };
+                let leaf_pblock = leaf.pblock;
+
+                // ex_node borrow is released here when it goes out of scope
+
                 let block_count = min(block_count, MAX_BLOCKS - iblock);
                 // Allocate physical block
                 let fblock = self.alloc_block(inode_ref)?;
-                // Create a new extent
                 let new_ext = Extent::new(iblock, fblock, block_count as u16);
-                // Insert the new extent
+
+                // Try to merge with the previous extent
+                if let Some((prev_lblock, prev_pblock, prev_count)) = merge_candidate {
+                    let prev_as_ext = Extent::new(prev_lblock, prev_pblock, prev_count as u16);
+                    if Extent::can_append(&prev_as_ext, &new_ext) {
+                        // Merge: extend the previous extent's block_count
+                        let merged_count = (prev_count + new_ext.block_count()) as u16;
+                        let merged = Extent::new(prev_lblock, prev_pblock, merged_count);
+                        let prev_idx = insert_pos - 1;
+                        if leaf_pblock != 0 {
+                            // Re-read the leaf block and update
+                            let mut leaf_block = self.read_block(leaf_pblock)?;
+                            let mut leaf_node = ExtentNodeMut::from_bytes(&mut *leaf_block.data);
+                            *leaf_node.extent_mut_at(prev_idx) = merged;
+                            self.write_extent_block(&mut leaf_block, inode_ref)?;
+                        } else {
+                            // Root node
+                            let mut root = inode_ref.inode.extent_root_mut();
+                            *root.extent_mut_at(prev_idx) = merged;
+                            self.write_inode_with_csum(inode_ref)?;
+                        }
+                        return Ok(fblock);
+                    }
+                }
+
+                // Cannot merge, insert as a new extent entry
                 self.insert_extent(inode_ref, &path, &new_ext)?;
                 Ok(fblock)
             }
+        }
+    }
+
+    /// Get the next logical block id to append (= one past the last allocated data block).
+    /// This is computed from the extent tree, not from i_blocks, because i_blocks
+    /// may include tree metadata blocks.
+    pub(super) fn extent_next_data_lblock(&self, inode_ref: &InodeRef) -> Result<LBlockId> {
+        let ex_node = inode_ref.inode.extent_root();
+        if ex_node.header().entries_count() == 0 {
+            return Ok(0);
+        }
+        self.extent_last_lblock_recursive(&ex_node)
+    }
+
+    fn extent_last_lblock_recursive(&self, ex_node: &ExtentNode) -> Result<LBlockId> {
+        let last = ex_node.header().entries_count() as usize - 1;
+        if ex_node.header().depth() == 0 {
+            // Leaf: return start_lblock + block_count of the last extent
+            let ex = ex_node.extent_at(last);
+            Ok(ex.start_lblock() + ex.block_count())
+        } else {
+            // Non-leaf: descend into the last child
+            let ex_idx = ex_node.extent_index_at(last);
+            let child_block = self.read_block(ex_idx.leaf())?;
+            let child_node = ExtentNode::from_bytes(&*child_block.data);
+            self.extent_last_lblock_recursive(&child_node)
         }
     }
 
@@ -230,7 +308,7 @@ impl Ext4 {
         let mut leaf_node = ExtentNodeMut::from_bytes(&mut *leaf_block.data);
         // Insert the extent
         let res = leaf_node.insert_extent(new_ext, leaf.index.unwrap_err());
-        self.write_block(&leaf_block)?;
+        self.write_extent_block(&mut leaf_block, inode_ref)?;
         // Handle split
         if let Err(mut split) = res {
             // Handle split until root
@@ -304,12 +382,12 @@ impl Ext4 {
             let mut parent_node = ExtentNodeMut::from_bytes(&mut *parent_block.data);
             parent_depth = parent_node.header().depth();
             res = parent_node.insert_extent_index(&extent_index, child_pos + 1);
-            self.write_block(&parent_block)?;
+            self.write_extent_block(&mut parent_block, inode_ref)?;
         }
 
         // Right node is the child of parent, so its depth is 1 less than parent
         right_node.header_mut().set_depth(parent_depth - 1);
-        self.write_block(&right_block)?;
+        self.write_extent_block(&mut right_block, inode_ref)?;
 
         Ok(res)
     }
@@ -355,8 +433,8 @@ impl Ext4 {
         *root.extent_index_mut_at(1) = ExtentIndex::new(right.extent_at(0).start_lblock(), r_bid);
 
         // Sync to disk
-        self.write_block(&l_block)?;
-        self.write_block(&r_block)?;
+        self.write_extent_block(&mut l_block, inode_ref)?;
+        self.write_extent_block(&mut r_block, inode_ref)?;
         self.write_inode_with_csum(inode_ref)?;
 
         Ok(())
@@ -451,7 +529,7 @@ impl Ext4 {
     }
 
     fn ensure_valid_pblock(&self, inode_id: InodeId, pblock: PBlockId, what: &str) -> Result<()> {
-        let sb = self.read_super_block()?;
+        let sb = self.read_super_block_cached();
         let block_count = sb.block_count();
         if pblock >= block_count {
             return Err(format_error!(
@@ -500,20 +578,29 @@ mod tests {
         }
     }
 
+    fn make_test_fs(block_count: u32) -> Ext4 {
+        let block_device = Arc::new(StubBlockDevice::with_block_count(block_count));
+        let block = block_device.read_block(0).unwrap();
+        let sb = block.read_offset_as::<SuperBlock>(BASE_OFFSET);
+        Ext4 {
+            block_device,
+            cached_super_block: spin::Mutex::new(sb),
+            cached_block_groups: Vec::new(),
+            inode_cache: spin::Mutex::new(crate::ext4::InodeCache::new(16)),
+            alloc_lock: spin::Mutex::new(()),
+        }
+    }
+
     #[test]
     fn ensure_valid_pblock_rejects_out_of_range() {
-        let fs = Ext4 {
-            block_device: Arc::new(StubBlockDevice::with_block_count(16)),
-        };
+        let fs = make_test_fs(16);
         let err = fs.ensure_valid_pblock(2, 16, "test").unwrap_err();
         assert_eq!(err.code(), ErrCode::EIO);
     }
 
     #[test]
     fn validate_extent_node_rejects_overlapped_leaf_extents() {
-        let fs = Ext4 {
-            block_device: Arc::new(StubBlockDevice::with_block_count(1024)),
-        };
+        let fs = make_test_fs(1024);
         let mut raw = [0u8; 60];
         let mut node = ExtentNodeMut::from_bytes(&mut raw);
         node.init(0, 0);
@@ -528,9 +615,7 @@ mod tests {
 
     #[test]
     fn validate_extent_node_rejects_unsorted_index() {
-        let fs = Ext4 {
-            block_device: Arc::new(StubBlockDevice::with_block_count(1024)),
-        };
+        let fs = make_test_fs(1024);
         let mut raw = [0u8; 60];
         let mut node = ExtentNodeMut::from_bytes(&mut raw);
         node.init(1, 0);

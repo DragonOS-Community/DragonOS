@@ -114,6 +114,8 @@ impl Ext4FileSystem {
                     parent: self_ref.clone(),
                     self_ref: self_ref.clone(),
                     special_node: None,
+                    cached_file_size: None,
+                    metadata_dirty: false,
                 }))
             });
 

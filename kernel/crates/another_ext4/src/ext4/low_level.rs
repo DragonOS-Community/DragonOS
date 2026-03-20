@@ -196,12 +196,7 @@ impl Ext4 {
     ///
     /// Call this after `allocate_blocks_for_write` + successful page-cache
     /// write to finalise the new file size.
-    pub fn commit_inode_size(
-        &self,
-        id: InodeId,
-        size: u64,
-        mtime: Option<u32>,
-    ) -> Result<()> {
+    pub fn commit_inode_size(&self, id: InodeId, size: u64, mtime: Option<u32>) -> Result<()> {
         let mut inode = self.read_inode(id)?;
         inode.inode.set_size(size);
         if let Some(mtime) = mtime {

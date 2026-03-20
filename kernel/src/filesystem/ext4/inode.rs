@@ -208,28 +208,28 @@ impl IndexNode for LockedExt4Inode {
             let new_end = (offset + len) as u64;
             let current_file_size = core::cmp::max(old_file_size, new_end);
 
-            // Two-phase write protocol (mirrors Linux ext4 write_begin/write_end):
+            // Two-phase write protocol that decouples block allocation from i_size:
             //
             // Phase 1 – Pre-allocate disk blocks WITHOUT updating i_size.
-            //   This ensures the async writeback thread can always find extent
+            //   Ensures the async writeback thread can always find extent
             //   mappings, avoiding the EIO that would occur if page-cache pages
             //   were dirtied before blocks existed.
             //
-            // Phase 2 (after PageCache::write succeeds) – Commit i_size.
-            //   If PageCache::write fails, i_size is unchanged and the file
-            //   only has a few extra pre-allocated blocks (harmless).
+            // Phase 2 – Commit i_size BEFORE writing page cache.
+            //   Must complete before PageCache::write so that concurrent
+            //   writeback (flush_dirty_pages / writeback_entry) sees the
+            //   correct file size and does not race with our disk I/O.
+            //   If commit_inode_size fails, no dirty pages exist yet → clean.
+            //   If PageCache::write later fails, i_size is already extended
+            //   but the extended region reads as zeros – same as old setattr
+            //   behaviour and acceptable since PageCache::write only fails on
+            //   OOM.
             let extending = new_end > old_file_size;
             if extending {
                 fs.fs
                     .allocate_blocks_for_write(inode_num, current_file_size)
                     .map_err(SystemError::from)?;
-            }
 
-            // 磁盘块已就绪，现在安全写入 page cache
-            let write_len = PageCache::write(&page_cache, offset, buf)?;
-
-            // Phase 2 – 数据已成功写入 page cache，提交 i_size 和 mtime
-            if extending {
                 let time = PosixTimeSpec::now().tv_sec.to_u32().unwrap_or_else(|| {
                     log::warn!("Failed to get current time, using 0");
                     0
@@ -238,6 +238,9 @@ impl IndexNode for LockedExt4Inode {
                     .commit_inode_size(inode_num, current_file_size, Some(time))
                     .map_err(SystemError::from)?;
             }
+
+            // 磁盘块已就绪、i_size 已更新，现在安全写入 page cache
+            let write_len = PageCache::write(&page_cache, offset, buf)?;
 
             // 更新内存中的缓存大小
             {

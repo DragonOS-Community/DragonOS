@@ -26,18 +26,23 @@ impl Ext4 {
     }
 
     /// Write super block to block device and update cache.
+    ///
+    /// The disk write is performed **before** the cache update so that a
+    /// failed I/O does not leave the in-memory cache diverged from on-disk
+    /// state (which would corrupt free-block / free-inode accounting).
     pub(super) fn write_super_block(&self, sb: &SuperBlock) -> Result<()> {
-        // Update cache first
-        *self.cached_super_block.lock() = *sb;
-        // Then write to disk
+        // Write to disk first.
         // Must preserve other content in block 0 besides superblock (such as 1024B padding/boot code),
         // cannot overwrite with all-zero block; also need to update superblock checksum,
         // otherwise Linux will consider the filesystem corrupted and require e2fsck.
         let mut block = self.read_block(0)?;
-        let mut sb = *sb;
-        sb.set_checksum();
-        block.write_offset_as(BASE_OFFSET, &sb);
-        self.write_block(&block)
+        let mut sb_with_csum = *sb;
+        sb_with_csum.set_checksum();
+        block.write_offset_as(BASE_OFFSET, &sb_with_csum);
+        self.write_block(&block)?;
+        // Disk write succeeded, now commit to cache.
+        *self.cached_super_block.lock() = *sb;
+        Ok(())
     }
 
     /// Read an inode from cache or block device, return an `InodeRef` that

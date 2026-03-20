@@ -156,6 +156,61 @@ impl Ext4 {
         Ok(())
     }
 
+    /// Pre-allocate disk blocks so that the inode can hold at least `size`
+    /// bytes, **without** updating `i_size`.
+    ///
+    /// This is the first half of a two-phase write protocol:
+    ///   1. `allocate_blocks_for_write` – ensure extents exist (before page-cache write)
+    ///   2. `commit_inode_size`         – update `i_size` (after page-cache write succeeds)
+    ///
+    /// If the required blocks are already allocated this is a no-op.
+    pub fn allocate_blocks_for_write(&self, id: InodeId, size: u64) -> Result<()> {
+        let mut inode = self.read_inode(id)?;
+        if inode.inode.mode().bits() == 0 {
+            return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
+        }
+        let required_fs_blocks = (size as usize).div_ceil(BLOCK_SIZE) as u64;
+        let data_fs_blocks = self.extent_next_data_lblock(&inode)? as u64;
+        if required_fs_blocks > data_fs_blocks {
+            for i in data_fs_blocks..required_fs_blocks {
+                if let Err(e) = self.inode_append_block(&mut inode) {
+                    debug!(
+                        "allocate_blocks_for_write: FAILED at block {}/{}: ino={} err={:?}",
+                        i, required_fs_blocks, id, e
+                    );
+                    return Err(e);
+                }
+            }
+            // Recompute i_blocks: data blocks + extent-tree metadata blocks
+            let tree_blocks = self.extent_all_tree_blocks(&inode)?.len() as u64;
+            let data_sectors = required_fs_blocks * (BLOCK_SIZE / INODE_BLOCK_SIZE) as u64;
+            let tree_sectors = tree_blocks * (BLOCK_SIZE / INODE_BLOCK_SIZE) as u64;
+            inode.inode.set_block_count(data_sectors + tree_sectors);
+            self.write_inode_with_csum(&mut inode)?;
+        }
+        Ok(())
+    }
+
+    /// Commit the file size (`i_size`) and optionally `mtime` to disk,
+    /// **without** allocating any blocks.
+    ///
+    /// Call this after `allocate_blocks_for_write` + successful page-cache
+    /// write to finalise the new file size.
+    pub fn commit_inode_size(
+        &self,
+        id: InodeId,
+        size: u64,
+        mtime: Option<u32>,
+    ) -> Result<()> {
+        let mut inode = self.read_inode(id)?;
+        inode.inode.set_size(size);
+        if let Some(mtime) = mtime {
+            inode.inode.set_mtime(mtime);
+        }
+        self.write_inode_with_csum(&mut inode)?;
+        Ok(())
+    }
+
     /// Link a newly created inode into `parent`.
     ///
     /// If linking fails, this function frees the newly allocated inode to avoid leaks.

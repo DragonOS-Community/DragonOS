@@ -208,33 +208,36 @@ impl IndexNode for LockedExt4Inode {
             let new_end = (offset + len) as u64;
             let current_file_size = core::cmp::max(old_file_size, new_end);
 
-            // 关键：必须先通过 setattr 分配磁盘块，再写入 page cache。
-            // 如果先写 page cache，异步回写线程可能在 setattr 之前触发，
-            // 导致 Ext4::write() 找不到 extent 映射而返回 EIO。
-            if new_end > old_file_size {
-                let time = PosixTimeSpec::now().tv_sec.to_u32().unwrap_or_else(|| {
-                    log::warn!("Failed to get current time, using 0");
-                    0
-                });
+            // Two-phase write protocol (mirrors Linux ext4 write_begin/write_end):
+            //
+            // Phase 1 – Pre-allocate disk blocks WITHOUT updating i_size.
+            //   This ensures the async writeback thread can always find extent
+            //   mappings, avoiding the EIO that would occur if page-cache pages
+            //   were dirtied before blocks existed.
+            //
+            // Phase 2 (after PageCache::write succeeds) – Commit i_size.
+            //   If PageCache::write fails, i_size is unchanged and the file
+            //   only has a few extra pre-allocated blocks (harmless).
+            let extending = new_end > old_file_size;
+            if extending {
                 fs.fs
-                    .setattr(
-                        inode_num,
-                        another_ext4::SetAttr {
-                            mode: None,
-                            uid: None,
-                            gid: None,
-                            size: Some(current_file_size),
-                            atime: None,
-                            mtime: Some(time),
-                            ctime: None,
-                            crtime: None,
-                        },
-                    )
+                    .allocate_blocks_for_write(inode_num, current_file_size)
                     .map_err(SystemError::from)?;
             }
 
             // 磁盘块已就绪，现在安全写入 page cache
             let write_len = PageCache::write(&page_cache, offset, buf)?;
+
+            // Phase 2 – 数据已成功写入 page cache，提交 i_size 和 mtime
+            if extending {
+                let time = PosixTimeSpec::now().tv_sec.to_u32().unwrap_or_else(|| {
+                    log::warn!("Failed to get current time, using 0");
+                    0
+                });
+                fs.fs
+                    .commit_inode_size(inode_num, current_file_size, Some(time))
+                    .map_err(SystemError::from)?;
+            }
 
             // 更新内存中的缓存大小
             {
@@ -257,7 +260,7 @@ impl IndexNode for LockedExt4Inode {
         match fs.fs.getattr(inode_num)?.ftype {
             FileType::Directory => Err(SystemError::EISDIR),
             FileType::Unknown => Err(SystemError::EROFS),
-            // Use write_data_only: blocks are pre-allocated by setattr() in write_at().
+            // Use write_data_only: blocks are pre-allocated by allocate_blocks_for_write() in write_at().
             // Using Ext4::write() here would cause it to call write_inode_with_csum()
             // which overwrites the inode's block_count/extent tree with a stale
             // snapshot, causing setattr to re-allocate blocks endlessly until

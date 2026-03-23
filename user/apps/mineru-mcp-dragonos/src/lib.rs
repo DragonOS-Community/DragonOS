@@ -1,11 +1,15 @@
 use bytes::Bytes;
 use rmcp::{
-    ErrorData as McpError, Json, ServerHandler, ServiceExt,
+    ErrorData as McpError, Json, ServerHandler,
     handler::server::tool::ToolRouter,
     handler::server::wrapper::Parameters,
     model::{ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router,
-    transport::stdio,
+    transport::streamable_http_server::{
+        StreamableHttpServerConfig,
+        StreamableHttpService,
+        session::local::LocalSessionManager,
+    },
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -18,11 +22,12 @@ use std::{
 };
 use thiserror::Error;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-// HTTP 健康检查相关
+// HTTP 相关
 use axum::{
     extract::State,
     response::Json as AxumJson,
@@ -1010,22 +1015,6 @@ fn init_tracing() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
-/// 启动 HTTP 健康检查服务器
-pub async fn run_health_check_server(
-    server: MineruServer,
-    port: u16,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let app = Router::new()
-        .route("/health", get(health_handler))
-        .route("/", get(root_handler))
-        .with_state(server);
-
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
-    info!("健康检查服务器启动在 http://0.0.0.0:{}", port);
-    axum::serve(listener, app).await?;
-    Ok(())
-}
-
 async fn health_handler(State(server): State<MineruServer>) -> AxumJson<HealthCheckResponse> {
     let is_healthy = server.healthy.load(Ordering::Relaxed);
     AxumJson(HealthCheckResponse {
@@ -1044,37 +1033,56 @@ async fn health_handler(State(server): State<MineruServer>) -> AxumJson<HealthCh
 }
 
 async fn root_handler() -> &'static str {
-    "MinerU MCP DragonOS Server - Health Check: GET /health"
+    "MinerU MCP DragonOS Server\n\nEndpoints:\n  GET  /health - Health check\n  POST /mcp    - MCP JSON-RPC requests\n  GET  /mcp    - SSE event stream"
 }
 
+/// 启动 HTTP/SSE MCP 服务器
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
     let settings = Settings::from_env();
     if !settings.use_local_api && settings.mineru_api_key.is_none() {
         warn!("MINERU_API_KEY 未设置，远程解析将失败");
     }
-    let server = MineruServer::new(settings)?;
 
-    // 从环境变量读取健康检查端口，默认 3000
-    let health_port = env::var("HEALTH_CHECK_PORT")
+    let ct = CancellationToken::new();
+    let port = env::var("MCP_PORT")
         .ok()
         .and_then(|v| v.parse::<u16>().ok())
-        .unwrap_or(3000);
+        .unwrap_or(8080);
 
-    // 启动 HTTP 健康检查服务器
-    let server_clone = server.clone();
-    tokio::spawn(async move {
-        if let Err(err) = run_health_check_server(server_clone, health_port).await {
-            error!("健康检查服务器错误: {err}");
-        }
-    });
+    // 创建 HTTP/SSE MCP 服务
+    let mcp_service: StreamableHttpService<MineruServer, LocalSessionManager> =
+        StreamableHttpService::new(
+            || {
+                let s = Settings::from_env();
+                MineruServer::new(s).map_err(|e| std::io::Error::other(e.to_string()))
+            },
+            Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig {
+                stateful_mode: true,
+                sse_keep_alive: Some(Duration::from_secs(15)),
+                cancellation_token: ct.child_token(),
+                ..Default::default()
+            },
+        );
 
-    // 启动 MCP stdio 服务
-    let service = server.serve(stdio())
-        .await
-        .inspect_err(|err| {
-        error!("启动MCP服务失败: {err}");
-    })?;
-    service.waiting().await?;
+    // 创建一个用于健康检查的 server 实例
+    let health_server = MineruServer::new(settings)?;
+
+    // 统一的 Axum 路由
+    let app = Router::new()
+        .route("/health", get(health_handler))
+        .route("/", get(root_handler))
+        .with_state(health_server)
+        .nest_service("/mcp", mcp_service);
+
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+    info!("MCP HTTP/SSE 服务启动在 http://0.0.0.0:{}", port);
+    info!("端点: GET /health, POST /mcp, GET /mcp");
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move { ct.cancelled().await })
+        .await?;
+
     Ok(())
 }

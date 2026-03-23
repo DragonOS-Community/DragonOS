@@ -5,7 +5,7 @@
 set -e
 
 # 配置
-PORT="${1:-3000}"
+PORT="${1:-8080}"
 HOST="127.0.0.1"
 URL="http://${HOST}:${PORT}/health"
 TIMEOUT=5

@@ -7,7 +7,9 @@ use core::mem::size_of;
 use bitflags::bitflags;
 
 use crate::arch::ipc::signal::{SigSet, Signal};
+use crate::arch::CurrentIrqArch;
 use crate::arch::MMArch;
+use crate::exception::InterruptArch;
 use crate::filesystem::epoll::event_poll::{EventPoll, LockedEPItemLinkedList};
 use crate::filesystem::epoll::{EPollEventType, EPollItem};
 use crate::filesystem::vfs::file::FileFlags;
@@ -17,7 +19,6 @@ use crate::filesystem::vfs::{
 };
 use crate::libs::mutex::MutexGuard;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
-use crate::libs::wait_queue::WaitQueue;
 use crate::mm::MemoryManagementArch;
 use crate::process::ProcessManager;
 use crate::syscall::user_access::UserBufferReader;
@@ -100,7 +101,6 @@ struct SignalFdState {
 #[derive(Debug)]
 pub struct SignalFdInode {
     state: SpinLock<SignalFdState>,
-    wait_queue: WaitQueue,
     epitems: LockedEPItemLinkedList,
 }
 
@@ -130,7 +130,6 @@ impl SignalFdInode {
                 flags,
                 metadata,
             }),
-            wait_queue: WaitQueue::default(),
             epitems: LockedEPItemLinkedList::default(),
         }
     }
@@ -145,18 +144,16 @@ impl SignalFdInode {
     }
 
     fn readable(&self) -> bool {
-        let mask = self.state.lock().mask;
+        let mask = self.state.lock_irqsave().mask;
         self.has_pending_for_mask(&mask)
     }
 
-    pub fn notify_signal(&self, sig: Signal) {
-        let mask = self.state.lock().mask;
+    /// 仅通知 epoll 等待者。仅在进程上下文中调用（`Mutex` 安全）。
+    fn notify_epoll_only(&self, sig: Signal) {
+        let mask = self.state.lock_irqsave().mask;
         if !mask.contains(sig.into()) {
             return;
         }
-        // 唤醒阻塞 read() 的等待者
-        self.wait_queue.wakeup_all(None);
-        // 唤醒 epoll 等待者
         let _ = EventPoll::wakeup_epoll(
             &self.epitems,
             EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
@@ -165,7 +162,7 @@ impl SignalFdInode {
 
     fn dequeue_one(&self) -> Option<Signal> {
         let pcb = ProcessManager::current_pcb();
-        let mask = self.state.lock().mask;
+        let mask = self.state.lock_irqsave().mask;
         let ignore_mask = mask.complement();
         let (sig, _info) = pcb.dequeue_pending_signal(&ignore_mask);
         if sig == Signal::INVALID {
@@ -180,7 +177,7 @@ impl SignalFdInode {
     }
 
     pub(super) fn set_mask_and_flags(&self, mask: SigSet, flags: SignalFdFlags) {
-        let mut guard = self.state.lock();
+        let mut guard = self.state.lock_irqsave();
         guard.mask = mask;
         guard.flags = flags;
     }
@@ -188,7 +185,7 @@ impl SignalFdInode {
 
 impl PollableInode for SignalFdInode {
     fn poll(&self, _private_data: &FilePrivateData) -> Result<usize, SystemError> {
-        let mask = self.state.lock().mask;
+        let mask = self.state.lock_irqsave().mask;
         if self.has_pending_for_mask(&mask) {
             Ok((EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM).bits() as usize)
         } else {
@@ -259,14 +256,17 @@ impl IndexNode for SignalFdInode {
                 return Ok(size_of::<SignalFdSigInfo>());
             }
 
-            let state_guard = self.state.lock();
+            let state_guard = self.state.lock_irqsave();
             if self.nonblock(&state_guard) {
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
             drop(state_guard);
 
-            // 阻塞等待：由 notify_signal() 唤醒
-            let r = wq_wait_event_interruptible!(self.wait_queue, self.readable(), {});
+            // 阻塞等待：在 sighand 的共享 signalfd_wqh 上睡眠。
+            // 信号投递路径（含 hardirq）通过 signalfd_wqh.wakeup_all() 唤醒。
+            let pcb = ProcessManager::current_pcb();
+            let sighand = pcb.sighand();
+            let r = wq_wait_event_interruptible!(sighand.signalfd_wqh(), self.readable(), {});
             if r.is_err() {
                 return Err(SystemError::ERESTARTSYS);
             }
@@ -296,7 +296,7 @@ impl IndexNode for SignalFdInode {
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
-        Ok(self.state.lock().metadata.clone())
+        Ok(self.state.lock_irqsave().metadata.clone())
     }
 
     fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
@@ -320,21 +320,44 @@ pub(super) fn read_user_sigset(mask_ptr: usize, mask_size: usize) -> Result<SigS
     Ok(SigSet::from_bits_truncate(bits))
 }
 
-/// 在向 pcb 投递信号后，唤醒该 pcb 中所有匹配 mask 的 signalfd。
+/// 在向 pcb 投递信号后，唤醒该 pcb 中所有 signalfd 等待者。
+///
+/// 此函数可能在 hardirq 上下文中调用（例如 timer IRQ → ITIMER_PROF → SIGPROF），
+/// 因此通知路径必须完全 hardirq-safe：
+///
+/// 1. **共享等待队列唤醒**（始终执行）：通过 `sighand.signalfd_wqh().wakeup_all()`
+///    唤醒所有阻塞在 signalfd `read()` 的线程。`WaitQueue` 内部使用
+///    `SpinLock` + `lock_irqsave`，hardirq 安全。
+///
+/// 2. **epoll 通知**（仅在进程上下文执行）：`EventPoll::wakeup_epoll` 依赖
+///    `Mutex`（可睡眠），不能在 hardirq 中调用。因此仅当 IRQ 开启（进程上下文）
+///    时才遍历 fd_table 做 epoll 通知。hardirq 场景下 epoll 用户将在下次
+///    `epoll_wait` re-poll 时感知就绪状态。
 pub fn notify_signalfd_for_pcb(pcb: &Arc<crate::process::ProcessControlBlock>, sig: Signal) {
+    // 始终安全：WaitQueue 内部使用 SpinLock + lock_irqsave
+    pcb.sighand().signalfd_wqh().wakeup_all(None);
+
+    // epoll 通知：仅在进程上下文中安全（IRQ enabled 表示非 hardirq）
+    if !CurrentIrqArch::is_irq_enabled() {
+        return;
+    }
+
+    // 进程上下文：走完整 epoll 通知路径
     let fd_table = {
         let basic = pcb.basic();
         basic.try_fd_table()
     };
     let Some(fd_table) = fd_table else {
-        // 该任务可能正在退出或是内核线程，没有 fd_table。
         return;
     };
-    let guard = fd_table.read();
+    // 使用 try_read 避免在信号投递路径上阻塞等锁
+    let Some(guard) = fd_table.try_read() else {
+        return;
+    };
     for (_fd, file) in guard.iter() {
         let inode = file.inode();
         if let Some(sfd) = inode.as_any_ref().downcast_ref::<SignalFdInode>() {
-            sfd.notify_signal(sig);
+            sfd.notify_epoll_only(sig);
         }
     }
 }

@@ -21,6 +21,12 @@ use super::signal_types::Sigaction;
 pub struct SigHand {
     inner: RwLock<InnerSigHand>,
     group_exec_wait_queue: WaitQueue,
+    /// signalfd 共享等待队列，对标 Linux `sighand_struct::signalfd_wqh`。
+    ///
+    /// 信号投递路径（包括 hardirq 上下文）调用 `signalfd_wqh.wakeup_all()`
+    /// 唤醒所有阻塞在 signalfd `read()` 的线程。
+    /// `WaitQueue` 内部使用 `SpinLock` + `lock_irqsave`，hardirq 安全。
+    signalfd_wqh: WaitQueue,
 }
 
 impl Debug for SigHand {
@@ -51,6 +57,7 @@ impl SigHand {
         Arc::new(Self {
             inner: RwLock::new(InnerSigHand::default()),
             group_exec_wait_queue: WaitQueue::default(),
+            signalfd_wqh: WaitQueue::default(),
         })
     }
 
@@ -68,6 +75,14 @@ impl SigHand {
 
     fn group_exec_wait_queue(&self) -> &WaitQueue {
         &self.group_exec_wait_queue
+    }
+
+    /// 获取 signalfd 共享等待队列引用。
+    ///
+    /// signalfd 的 `read()` 路径在此队列上注册等待者，
+    /// 信号投递路径通过 `wakeup_all()` 唤醒它们。
+    pub fn signalfd_wqh(&self) -> &WaitQueue {
+        &self.signalfd_wqh
     }
 
     pub fn wait_group_exec_event_interruptible<F, B>(

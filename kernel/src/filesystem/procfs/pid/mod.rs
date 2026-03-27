@@ -165,6 +165,10 @@ impl DirOps for PidDirOps {
         Some((cred.euid.data(), cred.egid.data()))
     }
 
+    fn validate_child(&self, _child: &dyn IndexNode) -> bool {
+        ProcessManager::find(self.pid).is_some()
+    }
+
     fn lookup_child(
         &self,
         dir: &ProcDir<Self>,

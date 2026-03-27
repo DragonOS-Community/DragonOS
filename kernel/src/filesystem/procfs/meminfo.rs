@@ -16,8 +16,8 @@ use crate::{
     mm::page_cache_stats,
 };
 use alloc::{
-    borrow::ToOwned,
     format,
+    string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -36,68 +36,52 @@ impl MeminfoFileOps {
     }
 
     fn generate_meminfo_content() -> Vec<u8> {
-        use crate::arch::mm::LockedFrameAllocator;
-        use crate::arch::MMArch;
+    use crate::arch::mm::LockedFrameAllocator;
+    use crate::arch::MMArch;
 
-        let usage = unsafe { LockedFrameAllocator.usage() };
-        let stats = page_cache_stats::snapshot();
-        let page_kb = (MMArch::PAGE_SIZE >> 10) as u64;
-        let cached_pages = stats.file_pages.saturating_sub(stats.shmem_pages);
+    let usage = unsafe { LockedFrameAllocator.usage() };
+    let stats = page_cache_stats::snapshot();
+    let page_kb = (MMArch::PAGE_SIZE >> 10) as u64;
 
-        let mut data: Vec<u8> = vec![];
+    let mem_total_kb = (usage.total().bytes() >> 10) as u64;
+	let mem_free_kb = (usage.free().bytes() >> 10) as u64;
 
-        data.append(
-            &mut format!("MemTotal:\t{} kB\n", usage.total().bytes() >> 10)
-                .as_bytes()
-                .to_owned(),
-        );
+	let cached_pages = stats.file_pages.saturating_sub(stats.shmem_pages);
+	let cached_kb = cached_pages * page_kb;
 
-        data.append(
-            &mut format!("MemFree:\t{} kB\n", usage.free().bytes() >> 10)
-                .as_bytes()
-                .to_owned(),
-        );
+	let dirty_kb = stats.file_dirty * page_kb;
+	let writeback_kb = stats.file_writeback * page_kb;
+	let mapped_kb = stats.file_mapped * page_kb;
+	let shmem_kb = stats.shmem_pages * page_kb;
 
-        data.append(&mut format!("Buffers:\t{} kB\n", 0u64).as_bytes().to_owned());
-        data.append(
-            &mut format!("Cached:\t\t{} kB\n", cached_pages * page_kb)
-                .as_bytes()
-                .to_owned(),
-        );
-        data.append(&mut format!("SwapTotal:\t{} kB\n", 0u64).as_bytes().to_owned());
-        data.append(&mut format!("SwapFree:\t{} kB\n", 0u64).as_bytes().to_owned());
-        data.append(
-            &mut format!("Dirty:\t\t{} kB\n", stats.file_dirty * page_kb)
-                .as_bytes()
-                .to_owned(),
-        );
-        data.append(
-            &mut format!("Writeback:\t{} kB\n", stats.file_writeback * page_kb)
-                .as_bytes()
-                .to_owned(),
-        );
-        data.append(
-            &mut format!("Mapped:\t\t{} kB\n", stats.file_mapped * page_kb)
-                .as_bytes()
-                .to_owned(),
-        );
-        data.append(
-            &mut format!("Shmem:\t\t{} kB\n", stats.shmem_pages * page_kb)
-                .as_bytes()
-                .to_owned(),
-        );
-        data.append(&mut format!("Slab:\t\t{} kB\n", 0u64).as_bytes().to_owned());
-        data.append(
-            &mut format!("SReclaimable:\t{} kB\n", 0u64)
-                .as_bytes()
-                .to_owned(),
-        );
-        data.append(&mut format!("SUnreclaim:\t{} kB\n", 0u64).as_bytes().to_owned());
+	let mem_available_kb = mem_free_kb.saturating_add(cached_kb);
 
-        // 去除多余的 \0 并在结尾添加 \0
-        trim_string(&mut data);
+    let mut s = String::new();
 
-        data
+    macro_rules! push_kb {
+        ($name:expr, $value:expr) => {
+            s.push_str(&format!("{:<15}{:>8} kB\n", concat!($name, ":"), $value));
+        };
+    }
+
+    push_kb!("MemTotal", mem_total_kb);
+    push_kb!("MemFree", mem_free_kb);
+    push_kb!("MemAvailable", mem_available_kb);
+    push_kb!("Buffers", 0u64);
+    push_kb!("Cached", cached_kb);
+    push_kb!("SwapTotal", 0u64);
+    push_kb!("SwapFree", 0u64);
+    push_kb!("Dirty", dirty_kb);
+    push_kb!("Writeback", writeback_kb);
+    push_kb!("Mapped", mapped_kb);
+    push_kb!("Shmem", shmem_kb);
+    push_kb!("Slab", 0u64);
+    push_kb!("SReclaimable", 0u64);
+    push_kb!("SUnreclaim", 0u64);
+
+    let mut data = s.into_bytes();
+    trim_string(&mut data);
+    data
     }
 }
 

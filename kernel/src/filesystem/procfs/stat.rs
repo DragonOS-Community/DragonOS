@@ -1,5 +1,3 @@
-//! /proc/stat - 系统统计信息
-
 use crate::{
     filesystem::{
         procfs::{
@@ -12,6 +10,7 @@ use crate::{
     process::{pid::PidType, ProcessManager, ProcessState},
     sched::cputime::{kcpustat_cpu, ns_to_clock_t, CpuUsageStat, NR_CPU_STATS},
     smp::cpu::{smp_cpu_manager, ProcessorId},
+    time::{timekeeping::getnstimeofday, uptime_secs},
 };
 use alloc::{borrow::ToOwned, format, sync::Arc, sync::Weak, vec::Vec};
 use system_error::SystemError;
@@ -45,7 +44,7 @@ impl StatFileOps {
             }
         }
 
-        // 输出总 CPU 行（8 个字段：user nice system idle iowait irq softirq steal）
+        // 输出总 CPU 行
         data.append(
             &mut format!(
                 "cpu {} {} {} {} {} {} {} {}\n",
@@ -84,9 +83,15 @@ impl StatFileOps {
             );
         }
 
+        // 暂未接入精确的中断/上下文切换/softirq 统计，先保留标准字段
         data.append(&mut b"intr 0\n".to_vec());
         data.append(&mut b"ctxt 0\n".to_vec());
-        data.append(&mut b"btime 0\n".to_vec());
+
+        // btime: 系统启动时刻（epoch 秒）
+        let now = getnstimeofday();
+        let up = uptime_secs() as i64;
+        let btime = now.tv_sec.saturating_sub(up);
+        data.append(&mut format!("btime {}\n", btime).as_bytes().to_owned());
 
         let pidns = ProcessManager::current_pcb().active_pid_ns();
         let processes = pidns.processes_created();
@@ -94,12 +99,14 @@ impl StatFileOps {
 
         let mut procs_running = 0u64;
         let mut procs_blocked = 0u64;
+
         for pid in pids {
             if let Some(pcb) = pid.pid_task(PidType::PID) {
                 let state = pcb.sched_info().inner_lock_read_irqsave().state();
                 if state.is_runnable() {
                     procs_running += 1;
                 } else if matches!(state, ProcessState::Blocked(false)) {
+                    // 按 Linux 语义，procs_blocked 更接近不可中断阻塞
                     procs_blocked += 1;
                 }
             }

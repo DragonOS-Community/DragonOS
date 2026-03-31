@@ -7,6 +7,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::ipc::signal::{SigFlags, SigSet, Signal, MAX_SIG_NUM},
+    filesystem::epoll::event_poll::LockedEPItemLinkedList,
     ipc::signal_types::{SaHandlerType, SigCode, SigInfo, SigPending, SigactionType, SignalFlags},
     libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
     libs::wait_queue::WaitQueue,
@@ -27,6 +28,13 @@ pub struct SigHand {
     /// 唤醒所有阻塞在 signalfd `read()` 的线程。
     /// `WaitQueue` 内部使用 `SpinLock` + `lock_irqsave`，hardirq 安全。
     signalfd_wqh: WaitQueue,
+    /// signalfd 的 epoll 通知列表。
+    ///
+    /// 所有注册在此进程 signalfd 上的 EPollItem 都会被收集到这里。
+    /// 信号投递路径（包括 hardirq）直接对此列表调用 `wakeup_epoll`，
+    /// 避免遍历 fd_table（涉及 RwLock/RwSem，在 hardirq 中不安全）。
+    /// 使用 irqsave SpinLock，hardirq 安全。
+    signalfd_epitems: LockedEPItemLinkedList,
 }
 
 impl Debug for SigHand {
@@ -58,6 +66,7 @@ impl SigHand {
             inner: RwLock::new(InnerSigHand::default()),
             group_exec_wait_queue: WaitQueue::default(),
             signalfd_wqh: WaitQueue::default(),
+            signalfd_epitems: LockedEPItemLinkedList::default(),
         })
     }
 
@@ -83,6 +92,15 @@ impl SigHand {
     /// 信号投递路径通过 `wakeup_all()` 唤醒它们。
     pub fn signalfd_wqh(&self) -> &WaitQueue {
         &self.signalfd_wqh
+    }
+
+    /// 获取 signalfd 的 epoll 通知列表引用。
+    ///
+    /// signalfd 的 `add_epitem` 将 EPollItem 同时注册到此列表中，
+    /// 信号投递路径通过 `wakeup_epoll(&signalfd_epitems, ...)` 直接通知 epoll，
+    /// 避免在 hardirq 中遍历 fd_table。
+    pub fn signalfd_epitems(&self) -> &LockedEPItemLinkedList {
+        &self.signalfd_epitems
     }
 
     pub fn wait_group_exec_event_interruptible<F, B>(

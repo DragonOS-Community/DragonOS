@@ -18,7 +18,7 @@ use crate::include::bindings::linux_bpf::{
     perf_event_attr, perf_event_sample_format, perf_sw_ids, perf_type_id,
 };
 use crate::libs::casting::DowncastArc;
-use crate::libs::mutex::{Mutex, MutexGuard};
+use crate::libs::mutex::MutexGuard;
 use crate::mm::allocator::page_frame::{
     allocate_page_frames, deallocate_page_frames, PageFrameCount, PhysPageFrame,
 };
@@ -28,7 +28,6 @@ use crate::perf::bpf::BpfPerfEvent;
 use crate::perf::util::{PerfEventIoc, PerfEventOpenFlags, PerfProbeArgs, PerfProbeConfig};
 use crate::process::ProcessManager;
 use alloc::boxed::Box;
-use alloc::collections::LinkedList;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -168,7 +167,7 @@ impl PerfEventInode {
     pub fn new(event: Box<dyn PerfEventOps>) -> Self {
         Self {
             event,
-            epitems: Mutex::new(LinkedList::new()),
+            epitems: LockedEPItemLinkedList::default(),
         }
     }
     fn do_poll(&self) -> Result<usize> {

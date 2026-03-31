@@ -168,9 +168,31 @@ impl Socket for TcpSocket {
             return ret;
         }
 
+        let waitall = flags.contains(PMSG::WAITALL)
+            && !flags.contains(PMSG::PEEK)
+            && !flags.contains(PMSG::TRUNC);
+        let mut total_read = 0usize;
+
         let ret = loop {
-            match self.try_recv_with_flags(buffer, flags) {
+            match self.try_recv_with_flags(&mut buffer[total_read..], flags) {
+                Ok(n) => {
+                    total_read += n;
+                    if n == 0 {
+                        // EOF or no more bytes available.
+                        break Ok(total_read);
+                    }
+                    if total_read == buffer.len() {
+                        break Ok(total_read);
+                    }
+                    if !waitall {
+                        break Ok(total_read);
+                    }
+                    continue;
+                }
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                    if total_read > 0 && !waitall {
+                        break Ok(total_read);
+                    }
                     // Poll in a loop until no more events. This is critical for loopback:
                     // - Poll 1: TX sends data to loopback queue, RX processes existing packets
                     // - Poll 2: RX processes the data we just transmitted (loopback roundtrip)
@@ -196,9 +218,19 @@ impl Socket for TcpSocket {
                         },
                         self.recv_timeout(),
                     );
-                    wait_ret?;
+                    if let Err(e) = wait_ret {
+                        if total_read > 0 {
+                            break Ok(total_read);
+                        }
+                        break Err(e);
+                    }
                 }
-                result => break result,
+                Err(e) => {
+                    if total_read > 0 {
+                        break Ok(total_read);
+                    }
+                    break Err(e);
+                }
             }
         };
 

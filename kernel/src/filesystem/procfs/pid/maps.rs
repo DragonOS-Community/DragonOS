@@ -7,13 +7,14 @@ use crate::{
     arch::MMArch,
     filesystem::{
         procfs::{
+            pid::find_process_by_vpid,
             template::{Builder, FileOps, ProcFileBuilder},
             utils::proc_read,
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
     mm::{ucontext::LockedVMA, MemoryManagementArch, VmFlags},
-    process::{ProcessManager, RawPid},
+    process::RawPid,
 };
 use alloc::{
     format,
@@ -104,7 +105,7 @@ fn format_dev_inode_and_path(
 
 /// 生成 /proc/[pid]/maps 内容
 fn generate_maps_content(pid: RawPid) -> Result<Vec<u8>, SystemError> {
-    let target_pcb = ProcessManager::find(pid).ok_or(SystemError::ESRCH)?;
+    let target_pcb = find_process_by_vpid(pid).ok_or(SystemError::ESRCH)?;
 
     let vm = target_pcb.basic().user_vm().ok_or(SystemError::EINVAL)?;
     let root_prefix = target_pcb

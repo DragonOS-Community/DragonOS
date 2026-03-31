@@ -187,12 +187,40 @@ impl Init {
     }
 
     /// # `listen`
-    pub(super) fn listen(self, backlog: usize) -> Result<Listening, (Self, SystemError)> {
-        let (inner, local) = match self {
-            Init::Unbound(_) => {
-                return Err((self, SystemError::EINVAL));
+    ///
+    /// Linux semantics: calling `listen()` on an unbound TCP socket auto-binds
+    /// to `INADDR_ANY` (or `::`) with an ephemeral port, just like an implicit
+    /// `bind(0.0.0.0:0)` before `listen()`.
+    pub(super) fn listen(
+        self,
+        backlog: usize,
+        netns: Arc<NetNamespace>,
+    ) -> Result<Listening, (Self, SystemError)> {
+        // If unbound, auto-bind to INADDR_ANY:ephemeral (Linux compat).
+        let bound_self = if matches!(self, Init::Unbound(_)) {
+            let ver = match &self {
+                Init::Unbound((_, v)) => *v,
+                _ => unreachable!(),
+            };
+            let unspec_addr = match ver {
+                smoltcp::wire::IpVersion::Ipv4 => {
+                    smoltcp::wire::IpAddress::from(smoltcp::wire::Ipv4Address::UNSPECIFIED)
+                }
+                smoltcp::wire::IpVersion::Ipv6 => {
+                    smoltcp::wire::IpAddress::from(smoltcp::wire::Ipv6Address::UNSPECIFIED)
+                }
+            };
+            let auto_bind_ep = smoltcp::wire::IpEndpoint::new(unspec_addr, 0);
+            match self.bind(auto_bind_ep, netns.clone()) {
+                Ok(bound) => bound,
+                Err(err) => return Err((Init::new(ver), err)),
             }
+        } else {
+            self
+        };
+        let (inner, local) = match bound_self {
             Init::Bound(inner) => inner,
+            Init::Unbound(_) => unreachable!(),
         };
         let listen_addr = if local.addr.is_unspecified() {
             smoltcp::wire::IpListenEndpoint::from(local.port)
@@ -218,23 +246,55 @@ impl Init {
         let backlog = core::cmp::min(if backlog == 0 { 1 } else { backlog }, 8);
 
         let mut inners = Vec::new();
+        let is_any_addr = listen_addr.addr.is_none();
 
         if let Err(err) = || -> Result<(), SystemError> {
-            let additional_sockets = backlog.saturating_sub(1);
-            for _ in 0..additional_sockets {
-                // -1 because the first one is already bound
-                // log::debug!("loop {:?}", _i);
-                let new_listen = socket::inet::BoundInner::bind(
-                    new_listen_smoltcp_socket(listen_addr)?,
-                    listen_addr
-                        .addr
-                        .as_ref()
-                        .unwrap_or(&smoltcp::wire::IpAddress::from(
-                            smoltcp::wire::Ipv4Address::UNSPECIFIED,
-                        )),
-                    inner.netns(),
-                )?;
-                inners.push(new_listen);
+            if is_any_addr {
+                // INADDR_ANY / [::]: smoltcp uses per-interface SocketSets, so we must
+                // create at least one listen socket on *every* interface; otherwise a SYN
+                // arriving on an interface without a listen socket gets no response (RST
+                // or silent drop depending on smoltcp version).
+                //
+                // Strategy: place ≥1 listen socket on each interface. Any remaining
+                // backlog slots go to the primary interface.
+                let device_list = netns.device_list();
+                for (_, iface) in device_list.iter() {
+                    if alloc::sync::Arc::ptr_eq(iface, inner.iface()) {
+                        continue; // primary inner already covers this iface
+                    }
+                    let new_listen = socket::inet::BoundInner::bind_on_iface(
+                        new_listen_smoltcp_socket(listen_addr)?,
+                        iface.clone(),
+                        inner.netns(),
+                    )?;
+                    inners.push(new_listen);
+                }
+                // Fill remaining backlog slots on the primary interface.
+                let remaining = backlog.saturating_sub(1 + inners.len());
+                for _ in 0..remaining {
+                    let new_listen = socket::inet::BoundInner::bind_on_iface(
+                        new_listen_smoltcp_socket(listen_addr)?,
+                        inner.iface().clone(),
+                        inner.netns(),
+                    )?;
+                    inners.push(new_listen);
+                }
+            } else {
+                // Specific address: all backlog sockets go to the same interface.
+                let additional_sockets = backlog.saturating_sub(1);
+                for _ in 0..additional_sockets {
+                    let new_listen = socket::inet::BoundInner::bind(
+                        new_listen_smoltcp_socket(listen_addr)?,
+                        listen_addr
+                            .addr
+                            .as_ref()
+                            .unwrap_or(&smoltcp::wire::IpAddress::from(
+                                smoltcp::wire::Ipv4Address::UNSPECIFIED,
+                            )),
+                        inner.netns(),
+                    )?;
+                    inners.push(new_listen);
+                }
             }
             Ok(())
         }() {
@@ -574,16 +634,27 @@ impl Listening {
 
         // log::debug!("local at {:?}", local_endpoint);
 
-        let mut new_listen = socket::inet::BoundInner::bind(
-            new_listen_smoltcp_socket(self.listen_addr)?,
-            self.listen_addr
-                .addr
-                .as_ref()
-                .unwrap_or(&smoltcp::wire::IpAddress::from(
-                    smoltcp::wire::Ipv4Address::UNSPECIFIED,
-                )),
-            connected.netns(),
-        )?;
+        // Create a replacement listen socket on the *same* interface as the one
+        // that just accepted a connection. This is critical for INADDR_ANY listeners
+        // where each interface has its own listen socket in the smoltcp SocketSet.
+        let mut new_listen = if self.listen_addr.addr.is_none() {
+            socket::inet::BoundInner::bind_on_iface(
+                new_listen_smoltcp_socket(self.listen_addr)?,
+                connected.iface().clone(),
+                connected.netns(),
+            )?
+        } else {
+            socket::inet::BoundInner::bind(
+                new_listen_smoltcp_socket(self.listen_addr)?,
+                self.listen_addr
+                    .addr
+                    .as_ref()
+                    .unwrap_or(&smoltcp::wire::IpAddress::from(
+                        smoltcp::wire::Ipv4Address::UNSPECIFIED,
+                    )),
+                connected.netns(),
+            )?
+        };
 
         // swap the connected socket with the new_listen socket
         // TODO is smoltcp socket swappable?
@@ -630,7 +701,13 @@ impl Listening {
         for inner in self.inners.iter() {
             inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.close());
         }
-        self.inners[0]
+        // The original port-owning socket is always the *last* element in `inners`
+        // (pushed last during listen() construction). We must unbind from its
+        // port_manager, not inners[0] which may belong to a different iface for
+        // INADDR_ANY listeners.
+        self.inners
+            .last()
+            .expect("Listening socket must have at least one inner")
             .iface()
             .port_manager()
             .unbind_port(Types::Tcp, port);

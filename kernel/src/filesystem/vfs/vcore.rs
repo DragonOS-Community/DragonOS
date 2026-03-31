@@ -88,6 +88,7 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     let new_fs = MountFS::new(
         new_fs,
         None,
+        None,
         old_mntfs.propagation(),
         Some(&current_mntns),
         old_mntfs.mount_flags(),

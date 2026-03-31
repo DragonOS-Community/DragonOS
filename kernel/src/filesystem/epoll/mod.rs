@@ -1,8 +1,8 @@
 use super::{poll::PollFlags, vfs::file::File};
-use crate::libs::{mutex::Mutex, rwsem::RwSem};
+use crate::libs::{mutex::Mutex, spinlock::SpinLock};
 use alloc::sync::Weak;
 use core::fmt::Debug;
-use event_poll::EventPoll;
+use event_poll::{EventPoll, ReadyState};
 use system_error::SystemError;
 
 pub mod event_poll;
@@ -54,8 +54,15 @@ impl EPollEvent {
 pub struct EPollItem {
     /// 对应的Epoll
     epoll: Weak<Mutex<EventPoll>>,
+    /// 直接引用 EventPoll 的 ready_state，使回调路径绕过外层 Mutex。
+    /// 对标 Linux 中 ep_poll_callback 仅获取 ep->lock 而不获取 ep->mtx 的设计。
+    ready_state: Weak<SpinLock<ReadyState>>,
     /// 用户注册的事件
-    event: RwSem<EPollEvent>,
+    /// 使用 irqsave SpinLock 而非 RwSem，因为 wakeup_epoll 回调路径可能在
+    /// hardirq 上下文中执行（例如 timer IRQ → signal → signalfd → epoll），
+    /// RwSem 是可睡眠锁，在 hardirq 中使用会导致死锁。
+    /// 对标 Linux 中 epitem.event 由 ep->lock (spin_lock_irqsave) 保护的设计。
+    event: SpinLock<EPollEvent>,
     /// 监听的描述符
     fd: i32,
     /// 对应的文件
@@ -63,15 +70,18 @@ pub struct EPollItem {
 }
 
 impl EPollItem {
-    pub fn new(
+    #[allow(private_interfaces)]
+    pub(super) fn new(
         epoll: Weak<Mutex<EventPoll>>,
+        ready_state: Weak<SpinLock<ReadyState>>,
         events: EPollEvent,
         fd: i32,
         file: Weak<File>,
     ) -> Self {
         Self {
             epoll,
-            event: RwSem::new(events),
+            ready_state,
+            event: SpinLock::new(events),
             fd,
             file,
         }
@@ -81,7 +91,13 @@ impl EPollItem {
         self.epoll.clone()
     }
 
-    pub fn event(&self) -> &RwSem<EPollEvent> {
+    /// 获取 ready_state 的 Weak 引用，用于回调路径直接访问就绪状态。
+    #[allow(dead_code)]
+    pub(crate) fn ready_state(&self) -> Weak<SpinLock<ReadyState>> {
+        self.ready_state.clone()
+    }
+
+    pub fn event(&self) -> &SpinLock<EPollEvent> {
         &self.event
     }
 
@@ -104,7 +120,7 @@ impl EPollItem {
         // 对于不支持poll的普通文件/目录，返回默认掩码（总是就绪）
         // 需要与用户注册的事件掩码相交，保持与普通文件路径的一致性
         if file.is_always_ready() {
-            let interested = self.event.read().events;
+            let interested = self.event.lock_irqsave().events;
             return EPollEventType::from_bits_truncate(
                 Self::default_poll_mask().bits() & interested,
             );
@@ -112,7 +128,7 @@ impl EPollItem {
 
         match file.poll() {
             Ok(events) => {
-                let interested = self.event.read().events;
+                let interested = self.event.lock_irqsave().events;
                 EPollEventType::from_bits_truncate(events as u32 & interested)
             }
             Err(_) => EPollEventType::empty(),

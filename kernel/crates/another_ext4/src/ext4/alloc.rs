@@ -86,6 +86,7 @@ impl Ext4 {
 
     /// Free an allocated inode and all data blocks allocated for it
     pub(super) fn free_inode(&self, inode: &mut InodeRef) -> Result<()> {
+        let inode_id = inode.id;
         // Free the data blocks allocated for the inode
         let pblocks = self.extent_all_data_blocks(inode)?;
         for pblock in pblocks {
@@ -112,6 +113,8 @@ impl Ext4 {
         }
         // Deallocate the inode
         self.dealloc_inode(inode)?;
+        // Invalidate inode cache entry
+        self.inode_cache.lock().invalidate(inode_id);
         Ok(())
     }
 
@@ -128,11 +131,13 @@ impl Ext4 {
     /// If the inode is a directory, `inode.size` will be increased when adding a new entry to the
     /// newly created block.
     pub(super) fn inode_append_block(&self, inode: &mut InodeRef) -> Result<(LBlockId, PBlockId)> {
-        // The new logical block id
-        let iblock = inode.inode.fs_block_count() as LBlockId;
+        // Determine the next logical block from the extent tree.
+        // We cannot use fs_block_count() because i_blocks may include tree
+        // metadata blocks (added by setattr after the allocation loop).
+        let iblock = self.extent_next_data_lblock(inode)?;
         // Check the extent tree to get the physical block id
         let fblock = self.extent_query_or_create(inode, iblock, 1)?;
-        // Update block count
+        // Update block count: data blocks only (tree blocks are added by setattr)
         inode.inode.set_fs_block_count(iblock as u64 + 1);
         self.write_inode_with_csum(inode)?;
 
@@ -141,7 +146,8 @@ impl Ext4 {
 
     /// Allocate a new physical block for an inode, return the physical block number
     pub(super) fn alloc_block(&self, inode: &mut InodeRef) -> Result<PBlockId> {
-        let mut sb = self.read_super_block()?;
+        let _alloc_guard = self.alloc_lock.lock();
+        let mut sb = self.read_super_block_cached();
 
         // Calc block group id
         let inodes_per_group = sb.inodes_per_group();
@@ -182,7 +188,8 @@ impl Ext4 {
 
     /// Deallocate a physical block allocated for an inode
     pub(super) fn dealloc_block(&self, inode: &mut InodeRef, pblock: PBlockId) -> Result<()> {
-        let mut sb = self.read_super_block()?;
+        let _alloc_guard = self.alloc_lock.lock();
+        let mut sb = self.read_super_block_cached();
 
         // Calc block group id
         let inodes_per_group = sb.inodes_per_group();
@@ -220,7 +227,8 @@ impl Ext4 {
 
     /// Allocate a new inode, returning the inode number.
     fn alloc_inode(&self, is_dir: bool) -> Result<InodeId> {
-        let mut sb = self.read_super_block()?;
+        let _alloc_guard = self.alloc_lock.lock();
+        let mut sb = self.read_super_block_cached();
         let bg_count = sb.block_group_count();
 
         let mut bgid = 0;
@@ -280,7 +288,8 @@ impl Ext4 {
 
     /// Free an inode
     fn dealloc_inode(&self, inode_ref: &mut InodeRef) -> Result<()> {
-        let mut sb = self.read_super_block()?;
+        let _alloc_guard = self.alloc_lock.lock();
+        let mut sb = self.read_super_block_cached();
 
         // Calc block group id and index in block group
         let inodes_per_group = sb.inodes_per_group();

@@ -6,6 +6,7 @@ use crate::libs::mutex::MutexGuard;
 use crate::{
     filesystem::{
         procfs::{
+            pid::find_process_by_vpid,
             template::{Builder, DirOps, ProcDir, ProcDirBuilder, ProcSymBuilder, SymOps},
             thread_self::NsFileType,
         },
@@ -16,7 +17,7 @@ use crate::{
     },
     process::{
         namespace::{nsproxy::NamespaceId, NamespaceOps},
-        ProcessManager, RawPid,
+        RawPid,
     },
 };
 use alloc::{
@@ -29,7 +30,7 @@ use system_error::SystemError;
 
 /// 获取指定进程的命名空间 ID
 fn get_pid_ns_ino(pid: RawPid, ns_type: NsFileType) -> Result<usize, SystemError> {
-    let pcb = ProcessManager::find(pid).ok_or(SystemError::ESRCH)?;
+    let pcb = find_process_by_vpid(pid).ok_or(SystemError::ESRCH)?;
     let nsproxy = pcb.nsproxy();
 
     let ino: NamespaceId = match ns_type {
@@ -76,7 +77,7 @@ impl DirOps for NsDirOps {
         let ns_type = NsFileType::try_from(name)?;
 
         // 检查进程是否存在
-        if ProcessManager::find(self.pid).is_none() {
+        if find_process_by_vpid(self.pid).is_none() {
             return Err(SystemError::ESRCH);
         }
 
@@ -93,7 +94,7 @@ impl DirOps for NsDirOps {
 
     fn populate_children(&self, dir: &ProcDir<Self>) {
         // 检查进程是否存在
-        if ProcessManager::find(self.pid).is_none() {
+        if find_process_by_vpid(self.pid).is_none() {
             return;
         }
 
@@ -154,7 +155,7 @@ impl SymOps for NsSymOps {
     fn open(&self, data: &mut MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         // 当打开命名空间文件时，设置命名空间私有数据
         // 这使得 setns() 可以使用这个 fd
-        let pcb = ProcessManager::find(self.pid).ok_or(SystemError::ESRCH)?;
+        let pcb = find_process_by_vpid(self.pid).ok_or(SystemError::ESRCH)?;
         let nsproxy = pcb.nsproxy();
 
         let ns_data = match self.ns_type {

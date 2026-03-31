@@ -101,6 +101,7 @@ pub fn initramfs_init() -> Result<(), SystemError> {
     let mount_fs = MountFS::new(
         ramfs,
         None,
+        None,
         MountPropagation::new_private(),
         None,
         MountFlags::empty(),

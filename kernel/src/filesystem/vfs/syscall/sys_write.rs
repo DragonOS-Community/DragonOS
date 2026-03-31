@@ -48,7 +48,7 @@ impl Syscall for SysWriteHandle {
         }
 
         // 用户态：先检查可访问长度，避免直接触碰无效页；内核态直接使用
-        let (user_buffer_reader, write_len) = if frame.is_from_user() {
+        let user_buffer_reader = if frame.is_from_user() {
             let accessible = user_accessible_len(
                 VirtAddr::new(buf_vaddr as usize),
                 len,
@@ -57,17 +57,19 @@ impl Syscall for SysWriteHandle {
             if accessible == 0 {
                 return Err(SystemError::EFAULT);
             }
-            (
-                UserBufferReader::new(buf_vaddr, accessible, true)?,
-                accessible,
-            )
+            UserBufferReader::new(buf_vaddr, accessible, true)?
         } else {
-            (UserBufferReader::new(buf_vaddr, len, false)?, len)
+            UserBufferReader::new(buf_vaddr, len, false)?
         };
 
-        let user_buf = user_buffer_reader.read_from_user(0)?;
+        let kernel_buf = if frame.is_from_user() {
+            let protected_buf = user_buffer_reader.buffer_protected(0)?;
+            protected_buf.read_all()?
+        } else {
+            user_buffer_reader.read_from_user(0)?.to_vec()
+        };
         // 可访问长度小于请求长度时，按可访问部分写入（短写），与 Linux 行为接近
-        do_write(fd, &user_buf[..write_len])
+        do_write(fd, &kernel_buf)
     }
 
     /// Formats the syscall parameters for display/debug purposes

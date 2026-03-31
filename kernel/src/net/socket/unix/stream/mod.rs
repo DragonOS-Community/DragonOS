@@ -233,6 +233,20 @@ impl UnixStreamSocket {
         }
     }
 
+    fn wake_peer_readable(&self) {
+        if let Some(peer_weak) = self.peer.lock().as_ref() {
+            if let Some(peer) = peer_weak.upgrade() {
+                peer.fasync_items.send_sigio();
+                peer.wait_queue
+                    .wakeup(Some(crate::process::ProcessState::Blocked(true)));
+                let _ = EventPoll::wakeup_epoll(
+                    peer.epoll_items().as_ref(),
+                    EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
+                );
+            }
+        }
+    }
+
     pub fn new(is_nonblocking: bool, is_seqpacket: bool) -> Arc<Self> {
         let netns = ProcessManager::current_netns();
         Self::new_init(Init::new(), is_nonblocking, is_seqpacket, netns)
@@ -409,11 +423,51 @@ impl UnixStreamSocket {
         }
 
         let deadline = self.send_timeout().map(|t| Instant::now() + t);
+        let mut total_sent = 0usize;
+        let mut total_written_len = 0usize;
+        let mut first_start: Option<Wrapping<usize>> = None;
+        let mut seqpacket_zero_len_enqueued = false;
+
         loop {
-            match self.try_send_with_meta(buffer) {
-                Ok(v) => return Ok(v),
+            let pending = &buffer[total_sent..];
+            match self.try_send_with_meta(pending) {
+                Ok((sent, start, written_len)) => {
+                    if sent == 0 {
+                        if self.is_seqpacket && written_len != 0 {
+                            if first_start.is_none() {
+                                first_start = Some(start);
+                            }
+                            total_written_len += written_len;
+                            seqpacket_zero_len_enqueued = true;
+                            break;
+                        }
+                        if total_sent == 0 {
+                            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                        }
+                        break;
+                    }
+                    if first_start.is_none() {
+                        first_start = Some(start);
+                    }
+                    total_sent += sent;
+                    total_written_len += written_len;
+
+                    // Match Linux unix_stream_sendmsg behavior: make each chunk
+                    // visible to blocking readers immediately, otherwise a large
+                    // sendmsg can deadlock with a sleeping reader.
+                    if !self.is_seqpacket && total_sent < buffer.len() {
+                        self.wake_peer_readable();
+                    }
+
+                    if total_sent >= buffer.len() || nonblock || self.is_seqpacket {
+                        break;
+                    }
+                }
                 Err(SystemError::ENOBUFS) if nonblock => {
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+                    if total_sent == 0 {
+                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                    }
+                    break;
                 }
                 Err(SystemError::ENOBUFS) => {
                     let timeout = deadline
@@ -426,18 +480,20 @@ impl UnixStreamSocket {
                             .expect("UnixStreamSocket inner is None")
                         {
                             Inner::Connected(connected) => {
-                                // Must match Connected::try_send(): it requires the *entire*
-                                // payload (plus seqpacket header) to fit.
-                                let need = if self.is_seqpacket {
-                                    buffer.len() + core::mem::size_of::<u32>()
-                                } else {
-                                    buffer.len()
-                                };
+                                if connected.send_closed() {
+                                    return true;
+                                }
 
                                 let sndbuf = self.sndbuf.load(Ordering::Relaxed);
                                 let queued = connected.outq_len(self.is_seqpacket);
-                                connected.send_free_len() >= need
-                                    && queued.saturating_add(need) <= sndbuf
+
+                                if self.is_seqpacket {
+                                    let need = pending.len() + core::mem::size_of::<u32>();
+                                    connected.send_free_len() >= need
+                                        && queued.saturating_add(need) <= sndbuf
+                                } else {
+                                    connected.send_free_len() > 0 && queued < sndbuf
+                                }
                             }
                             _ => true,
                         },
@@ -446,14 +502,34 @@ impl UnixStreamSocket {
 
                     if let Some(d) = deadline {
                         if Instant::now() >= d {
+                            if total_sent > 0 {
+                                break;
+                            }
                             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                         }
                     }
-                    continue;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    if total_sent > 0 {
+                        break;
+                    }
+                    return Err(e);
+                }
             }
         }
+
+        if total_sent == 0 {
+            if seqpacket_zero_len_enqueued {
+                return Ok((0, first_start.unwrap_or(Wrapping(0)), total_written_len));
+            }
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+
+        Ok((
+            total_sent,
+            first_start.expect("send_with_timeout has bytes but no start"),
+            total_written_len,
+        ))
     }
 }
 
@@ -695,6 +771,12 @@ impl Socket for UnixStreamSocket {
         }
 
         let nonblock = self.is_nonblocking() || _flags.contains(socket::PMSG::DONTWAIT);
+        let waitall = !self.is_seqpacket
+            && _flags.contains(socket::PMSG::WAITALL)
+            && !_flags.contains(socket::PMSG::PEEK)
+            && !_flags.contains(socket::PMSG::TRUNC);
+        let mut total_read = 0usize;
+
         loop {
             let result = if self.is_seqpacket {
                 let peek = _flags.contains(socket::PMSG::PEEK);
@@ -712,15 +794,20 @@ impl Socket for UnixStreamSocket {
                 }
             } else if _flags.contains(socket::PMSG::PEEK) {
                 match self.inner.read().as_ref().expect("inner is None") {
-                    Inner::Connected(connected) => connected.try_peek(buffer, self.is_seqpacket),
+                    Inner::Connected(connected) => {
+                        connected.try_peek(&mut buffer[total_read..], self.is_seqpacket)
+                    }
                     _ => Err(SystemError::ENOTCONN),
                 }
             } else {
-                self.try_recv(buffer)
+                self.try_recv(&mut buffer[total_read..])
             };
 
             match result {
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if !nonblock => {
+                    if total_read > 0 && !waitall {
+                        return Ok(total_read);
+                    }
                     self.wait_queue.wait_event_interruptible_timeout(
                         || self.can_recv(),
                         self.recv_timeout(),
@@ -736,15 +823,33 @@ impl Socket for UnixStreamSocket {
                             .connreset_pending
                             .swap(false, core::sync::atomic::Ordering::SeqCst);
                         if ring_reset || sock_reset {
+                            if total_read > 0 {
+                                return Ok(total_read);
+                            }
                             return Err(SystemError::ECONNRESET);
                         }
                     }
                     if n != 0 && !_flags.contains(socket::PMSG::PEEK) {
                         self.wake_peer_writable();
                     }
-                    return Ok(n);
+                    total_read += n;
+                    if n == 0 {
+                        return Ok(total_read);
+                    }
+                    if total_read == buffer.len() {
+                        return Ok(total_read);
+                    }
+                    if !waitall {
+                        return Ok(total_read);
+                    }
+                    continue;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    if total_read > 0 {
+                        return Ok(total_read);
+                    }
+                    return Err(e);
+                }
             }
         }
     }
@@ -1058,21 +1163,10 @@ impl Socket for UnixStreamSocket {
 
         // If send succeeded, notify peer's fasync_items for SIGIO
         if result.is_ok() && result.as_ref().unwrap().0 > 0 {
-            if let Some(peer_weak) = self.peer.lock().as_ref() {
-                if let Some(peer) = peer_weak.upgrade() {
-                    peer.fasync_items.send_sigio();
-
-                    // Wake EPOLLIN waiters on the peer. This is required for EPOLLET semantics
-                    // in gVisor tests (a second write should re-trigger EPOLLIN even if the
-                    // socket remains readable).
-                    peer.wait_queue
-                        .wakeup(Some(crate::process::ProcessState::Blocked(true)));
-                    let _ = EventPoll::wakeup_epoll(
-                        peer.epoll_items().as_ref(),
-                        EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
-                    );
-                }
-            }
+            // Wake EPOLLIN waiters on the peer. This is required for EPOLLET semantics
+            // in gVisor tests (a second write should re-trigger EPOLLIN even if the
+            // socket remains readable).
+            self.wake_peer_readable();
         }
 
         result.map(|(n, _, _)| n)
@@ -1153,17 +1247,7 @@ impl Socket for UnixStreamSocket {
 
         // Notify peer on successful write.
         if sent > 0 {
-            if let Some(peer_weak) = self.peer.lock().as_ref() {
-                if let Some(peer) = peer_weak.upgrade() {
-                    peer.fasync_items.send_sigio();
-                    peer.wait_queue
-                        .wakeup(Some(crate::process::ProcessState::Blocked(true)));
-                    let _ = EventPoll::wakeup_epoll(
-                        peer.epoll_items().as_ref(),
-                        EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
-                    );
-                }
-            }
+            self.wake_peer_readable();
         }
 
         if sent != 0 {

@@ -4,10 +4,13 @@
 
 use crate::{
     filesystem::{
-        procfs::template::{Builder, DirOps, ProcDir, ProcDirBuilder, ProcSymBuilder, SymOps},
+        procfs::{
+            pid::find_process_by_vpid,
+            template::{Builder, DirOps, ProcDir, ProcDirBuilder, ProcSymBuilder, SymOps},
+        },
         vfs::{IndexNode, InodeMode, SpecialNodeData},
     },
-    process::{ProcessControlBlock, ProcessManager, RawPid},
+    process::RawPid,
 };
 use alloc::{
     format,
@@ -25,11 +28,7 @@ pub struct FdDirOps {
 }
 
 impl FdDirOps {
-    pub fn new_inode(
-        process_ref: Arc<ProcessControlBlock>,
-        parent: Weak<dyn IndexNode>,
-    ) -> Arc<dyn IndexNode> {
-        let pid = process_ref.raw_pid();
+    pub fn new_inode(pid: RawPid, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
         ProcDirBuilder::new(Self { pid }, InodeMode::from_bits_truncate(0o500)) // dr-x------
             .parent(parent)
             .volatile() // fd 是易失的，因为它们与特定进程关联
@@ -38,8 +37,8 @@ impl FdDirOps {
     }
 
     /// 获取进程引用
-    fn get_process(&self) -> Option<Arc<ProcessControlBlock>> {
-        ProcessManager::find(self.pid)
+    fn get_process(&self) -> Option<Arc<crate::process::ProcessControlBlock>> {
+        find_process_by_vpid(self.pid)
     }
 }
 
@@ -129,7 +128,7 @@ impl FdSymOps {
 impl SymOps for FdSymOps {
     fn read_link(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
         // 动态查找进程
-        let process = ProcessManager::find(self.pid).ok_or(SystemError::ESRCH)?;
+        let process = find_process_by_vpid(self.pid).ok_or(SystemError::ESRCH)?;
 
         // 先获取文件对象的 clone，然后立即释放 fd_table 锁
         // 避免在持有锁时调用可能获取其他锁的方法（如 absolute_path）
@@ -181,7 +180,7 @@ impl SymOps for FdSymOps {
 
     fn special_node(&self) -> Option<SpecialNodeData> {
         // 动态查找进程
-        let process = ProcessManager::find(self.pid)?;
+        let process = find_process_by_vpid(self.pid)?;
 
         // 获取文件对象
         let file = {

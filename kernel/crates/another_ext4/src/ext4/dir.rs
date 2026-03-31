@@ -55,7 +55,7 @@ impl Ext4 {
             if dir_block.insert(name, child.id, child.inode.file_type()) {
                 // Update checksum
                 dir_block.set_checksum(
-                    &self.read_super_block()?.uuid(),
+                    &self.read_super_block_cached().uuid(),
                     dir.id,
                     dir.inode.generation(),
                 );
@@ -77,7 +77,7 @@ impl Ext4 {
         new_dir_block.init();
         new_dir_block.insert(name, child.id, child.inode.file_type());
         new_dir_block.set_checksum(
-            &self.read_super_block()?.uuid(),
+            &self.read_super_block_cached().uuid(),
             dir.id,
             dir.inode.generation(),
         );
@@ -102,7 +102,7 @@ impl Ext4 {
             if dir_block.remove(name) {
                 // Update checksum
                 dir_block.set_checksum(
-                    &self.read_super_block()?.uuid(),
+                    &self.read_super_block_cached().uuid(),
                     dir.id,
                     dir.inode.generation(),
                 );
@@ -161,7 +161,7 @@ impl Ext4 {
             let mut dir_block = DirBlock::new(self.read_block(fblock)?);
             if dir_block.replace(name, new_inode, new_type) {
                 dir_block.set_checksum(
-                    &self.read_super_block()?.uuid(),
+                    &self.read_super_block_cached().uuid(),
                     dir.id,
                     dir.inode.generation(),
                 );

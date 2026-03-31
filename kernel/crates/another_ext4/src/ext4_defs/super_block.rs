@@ -221,13 +221,14 @@ impl SuperBlock {
 
     /// Calc and set the superblock checksum (crc32c).
     ///
-    /// Ext4 Linux behavior: superblock checksum uses crc32c with UUID as seed,
-    /// covering all content from start to before checksum field in superblock byte sequence.
+    /// Linux (`fs/ext4/super.c` `ext4_superblock_csum`):
+    ///   csum = crc32c(~0, superblock_bytes[0 .. offset_of(s_checksum)])
+    ///
+    /// The UUID is already part of the superblock byte stream so it does NOT
+    /// need a separate seed step (unlike inode / block-group checksums).
     pub fn set_checksum(&mut self) {
         let off = core::mem::offset_of!(SuperBlock, checksum);
         let bytes = self.to_bytes();
-        let mut csum = crc32(CRC32_INIT, &self.uuid);
-        csum = crc32(csum, &bytes[..off]);
-        self.checksum = csum;
+        self.checksum = crc32(CRC32_INIT, &bytes[..off]);
     }
 }

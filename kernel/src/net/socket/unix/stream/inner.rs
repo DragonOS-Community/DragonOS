@@ -255,25 +255,28 @@ impl Connected {
         };
         let mut guard = self.writer.lock();
 
-        // SO_SNDBUF accounting (Linux-like, approximate): fail with ENOBUFS when
-        // the amount of queued data would exceed the configured send buffer.
-        // This is required by gVisor stream unix socket tests.
         let queued = guard.len();
-        if queued.saturating_add(buffer.len()) > sndbuf_limit {
-            return Err(SystemError::ENOBUFS);
-        }
-
         let start = guard.tail();
-        let can_send = guard.free_len() >= buffer.len();
 
-        // log::info!("Going to send {} bytes", buffer.len());
-        if can_send {
+        if is_seqpacket {
+            // SOCK_SEQPACKET requires all-or-nothing record enqueue.
+            if queued.saturating_add(buffer.len()) > sndbuf_limit || guard.free_len() < buffer.len()
+            {
+                return Err(SystemError::ENOBUFS);
+            }
             guard.push_slice(&buffer);
-        } else {
+            return Ok((buf.len(), start, buffer.len()));
+        }
+
+        // SOCK_STREAM allows partial write when buffer is full.
+        let max_by_sndbuf = sndbuf_limit.saturating_sub(queued);
+        let max_write = core::cmp::min(buf.len(), core::cmp::min(guard.free_len(), max_by_sndbuf));
+        if max_write == 0 {
             return Err(SystemError::ENOBUFS);
         }
 
-        Ok((buf.len(), start, buffer.len()))
+        guard.push_slice(&buf[..max_write]);
+        Ok((max_write, start, max_write))
     }
 
     pub fn try_recv(&self, buf: &mut [u8], is_seqpacket: bool) -> Result<usize, SystemError> {
@@ -429,6 +432,11 @@ impl Connected {
 
     pub(super) fn shutdown_send(&self) {
         self.writer.lock().set_send_shutdown();
+    }
+
+    pub(super) fn send_closed(&self) -> bool {
+        let guard = self.writer.lock();
+        guard.is_send_shutdown() || guard.is_recv_shutdown()
     }
 
     pub(super) fn peer_send_shutdown(&self) -> bool {

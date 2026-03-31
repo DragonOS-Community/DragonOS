@@ -60,14 +60,6 @@ impl DirOps for FdDirOps {
             let fd_table_guard = fd_table.read();
 
             if fd_table_guard.get_file_by_fd(fd).is_none() {
-                let open_fds: Vec<i32> =
-                    fd_table_guard.iter().map(|(open_fd, _)| open_fd).collect();
-                log::warn!(
-                    "procfd lookup miss: pid={} fd={} open_fds={:?}",
-                    self.pid,
-                    fd,
-                    open_fds
-                );
                 return Err(SystemError::ENOENT);
             }
         } // fd_table_guard在这里被释放

@@ -449,6 +449,176 @@ void case_permission_failure() {
     child_fail("expected EPERM");
 }
 
+// ---- Tests for shared mount rejection ----
+
+void case_shared_mount_rejection() {
+    const char* new_root = "/tmp/test_pivot_root/shared/newroot";
+    const char* oldroot_abs = "/tmp/test_pivot_root/shared/newroot/oldroot";
+
+    ensure_parent_tree();
+    ensure_dir("/tmp/test_pivot_root/shared");
+    ensure_dir(new_root);
+
+    // Enter new mount namespace but DON'T make it private — keep shared
+    if (unshare(CLONE_NEWNS) != 0) {
+        child_skip(strerror(errno));
+    }
+
+    // Explicitly make root shared
+    if (mount(nullptr, "/", nullptr, MS_REC | MS_SHARED, nullptr) != 0) {
+        child_skip("cannot make root shared");
+    }
+
+    if (mount("", new_root, "ramfs", 0, nullptr) != 0) {
+        child_skip(strerror(errno));
+    }
+
+    if (mkdir(oldroot_abs, 0755) != 0 && errno != EEXIST) {
+        cleanup_mount(new_root);
+        child_fail("mkdir(oldroot) failed");
+    }
+
+    // pivot_root should fail with EINVAL because mounts are shared
+    if (do_pivot_root(new_root, oldroot_abs) == -1 && errno == EINVAL) {
+        cleanup_mount(new_root);
+        child_pass();
+    }
+
+    cleanup_mount(new_root);
+    child_fail("expected EINVAL for shared mount");
+}
+
+// ---- Test for mount namespace isolation (BUG-0a regression) ----
+// After clone(CLONE_NEWNS), child's mounts must NOT leak into parent namespace.
+
+void case_mount_namespace_isolation() {
+    const char* marker = "/tmp/test_pivot_root/ns_isolation_marker";
+
+    ensure_parent_tree();
+
+    // Remove marker if it exists from a previous run
+    rmdir(marker);
+
+    pid_t child = fork();
+    if (child < 0) {
+        child_fail("fork failed");
+    }
+
+    if (child == 0) {
+        // Child: create new mount namespace, mount tmpfs, create marker dir
+        if (unshare(CLONE_NEWNS) != 0) {
+            _exit(77);  // skip
+        }
+
+        if (mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) {
+            _exit(77);
+        }
+
+        ensure_dir("/tmp/test_pivot_root/ns_iso");
+
+        if (mount("tmpfs", "/tmp/test_pivot_root/ns_iso", "tmpfs", 0, nullptr) != 0) {
+            _exit(77);
+        }
+
+        // Create a marker directory inside the tmpfs
+        mkdir("/tmp/test_pivot_root/ns_iso/child_was_here", 0755);
+
+        // Verify marker exists in child
+        struct stat st = {};
+        if (stat("/tmp/test_pivot_root/ns_iso/child_was_here", &st) != 0) {
+            _exit(2);  // fail: can't even see own marker
+        }
+
+        umount("/tmp/test_pivot_root/ns_iso");
+        _exit(0);
+    }
+
+    int status = 0;
+    waitpid(child, &status, 0);
+
+    if (!WIFEXITED(status)) {
+        child_fail("child did not exit normally");
+    }
+
+    int code = WEXITSTATUS(status);
+    if (code == 77) {
+        child_skip("child could not set up namespace");
+    }
+    if (code == 2) {
+        child_fail("child could not see its own marker");
+    }
+    if (code != 0) {
+        child_fail("child exited with unexpected code");
+    }
+
+    // Parent: check that child's tmpfs mount is NOT visible here.
+    // If namespace isolation works, /tmp/test_pivot_root/ns_iso/child_was_here
+    // should NOT exist in the parent namespace.
+    struct stat st = {};
+    if (stat("/tmp/test_pivot_root/ns_iso/child_was_here", &st) == 0) {
+        child_fail("child's tmpfs mount leaked into parent namespace (BUG-0a)");
+    }
+
+    child_pass();
+}
+
+// ---- Test for double pivot_root (pivot then pivot back) ----
+
+void case_double_pivot() {
+    const char* new_root = "/tmp/test_pivot_root/double/newroot";
+    const char* oldroot_abs = "/tmp/test_pivot_root/double/newroot/oldroot";
+
+    ensure_parent_tree();
+    ensure_dir("/tmp/test_pivot_root/double");
+    ensure_dir(new_root);
+    prepare_private_mount_namespace();
+
+    if (mount("", new_root, "ramfs", 0, nullptr) != 0) {
+        child_skip(strerror(errno));
+    }
+
+    if (mkdir(oldroot_abs, 0755) != 0 && errno != EEXIST) {
+        cleanup_mount(new_root);
+        child_fail("mkdir(oldroot) failed");
+    }
+
+    if (chdir(new_root) != 0) {
+        cleanup_mount(new_root);
+        child_fail("chdir(new_root) failed");
+    }
+
+    // First pivot: make ramfs the new root
+    if (do_pivot_root(".", "oldroot") != 0) {
+        child_fail("first pivot_root failed");
+    }
+
+    chdir("/");
+
+    // Verify first pivot worked
+    if (access("/oldroot", F_OK) != 0) {
+        child_fail("old root not accessible at /oldroot after first pivot");
+    }
+
+    // Create put_back directory inside old root for second pivot
+    if (mkdir("/oldroot/put_back", 0755) != 0 && errno != EEXIST) {
+        child_fail("mkdir(put_back) in oldroot failed");
+    }
+
+    // Second pivot: restore old root
+    if (do_pivot_root("/oldroot", "/oldroot/put_back") != 0) {
+        child_fail(strerror(errno));
+    }
+
+    chdir("/");
+
+    // After pivoting back, /put_back should contain the ramfs
+    if (access("/put_back", F_OK) != 0) {
+        child_fail("/put_back not accessible after second pivot");
+    }
+
+    child_pass();
+}
+
 TEST(PivotRoot, SuccessPath) {
     expect_case_pass_or_skip("pivot_root_success", case_success_path);
 }
@@ -475,6 +645,19 @@ TEST(PivotRoot, BusyTarget) {
 
 TEST(PivotRoot, PermissionFailure) {
     expect_case_pass_or_skip("pivot_root_permission_failure", case_permission_failure);
+}
+
+TEST(PivotRoot, SharedMountRejection) {
+    expect_case_pass_or_skip("pivot_root_shared_mount_rejection", case_shared_mount_rejection);
+}
+
+TEST(PivotRoot, MountNamespaceIsolation) {
+    expect_case_pass_or_skip("pivot_root_mount_namespace_isolation",
+                             case_mount_namespace_isolation);
+}
+
+TEST(PivotRoot, DoublePivot) {
+    expect_case_pass_or_skip("pivot_root_double_pivot", case_double_pivot);
 }
 
 }  // namespace

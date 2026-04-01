@@ -508,7 +508,7 @@ impl MountFSInode {
         let mount_path = Arc::new(MountPath::from(self.absolute_path()?));
         ProcessManager::current_mntns().add_mount(
             Some(metadata.inode_id),
-            mount_path,
+            mount_path.clone(),
             new_mount_fs.clone(),
         )?;
 
@@ -518,7 +518,12 @@ impl MountFSInode {
         }
 
         if parent_propagation.is_shared() {
-            if let Err(e) = propagate_mount(&self.mount_fs, metadata.inode_id, &new_mount_fs) {
+            if let Err(e) = propagate_mount(
+                &self.mount_fs,
+                metadata.inode_id,
+                &new_mount_fs,
+                &mount_path,
+            ) {
                 log::warn!("mount: propagation failed: {:?}", e);
             }
         }

@@ -170,6 +170,20 @@ impl ProcessManager {
 
         child_pcb.set_nsproxy(new_ns);
 
+        // 如果创建了新的 mount namespace，需要将子进程的 fs_struct (root/pwd)
+        // 从旧 namespace 的 inode 切换到新 namespace 的根 inode。
+        // 否则子进程的路径解析和挂载操作会直接作用于父 namespace 的 mount 树，
+        // 完全破坏 mount namespace 的隔离性。
+        //
+        // 参考 Linux: fs/namespace.c copy_mnt_ns() 中遍历 mount 树时
+        //   替换 new_fs->root.mnt 和 new_fs->pwd.mnt
+        if clone_flags.contains(CloneFlags::CLONE_NEWNS) {
+            let new_root = child_pcb.nsproxy().mnt_namespace().root_inode();
+            let fs = child_pcb.fs_struct();
+            fs.set_root(new_root.clone());
+            fs.set_pwd(new_root);
+        }
+
         Ok(())
     }
 }

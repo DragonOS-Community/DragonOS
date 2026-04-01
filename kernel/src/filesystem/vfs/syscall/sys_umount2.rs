@@ -96,12 +96,6 @@ pub fn do_umount2(
     let (work, rest) = user_path_at(&ProcessManager::current_pcb(), dirfd, target)?;
     let target_inode = work.lookup_follow_symlink(&rest, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
     let path = visible_umount_path(&target_inode)?;
-    log::warn!(
-        "do_umount2: target='{}' resolved='{}' inode_fs='{}'",
-        target,
-        path,
-        target_inode.fs().name()
-    );
 
     let result = ProcessManager::current_mntns().remove_mount(&path);
     if let Some(fs) = result {

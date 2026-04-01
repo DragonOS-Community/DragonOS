@@ -282,19 +282,20 @@ impl MntNamespace {
                 continue; // Skip the root mountfs
             }
         }
+
         // 将root mntfs下的所有挂载点复制到新的mntns中
         for (ino, mfs) in old_root_mntfs.mountpoints().iter() {
             let mount_path = inner
                 .mount_list
                 .get_mount_path_by_ino(*ino)
-                .ok_or_else(|| {
+                .unwrap_or_else(|| {
                     panic!(
-                        "mount_path not found for inode {:?}, mfs name: {}",
+                        "copy_mnt_ns: mount_path not found for ino={:?}, mfs name={}. \
+                         mountpoints and mount_list are out of sync.",
                         ino,
                         mfs.name()
-                    );
-                })
-                .unwrap();
+                    )
+                });
 
             queue.push(MountFSCopyInfo {
                 old_mount_fs: mfs.clone(),
@@ -316,10 +317,6 @@ impl MntNamespace {
             if old_propagation.is_shared() {
                 let group_id = old_propagation.peer_group_id();
                 register_peer(group_id, &new_mount_fs);
-                // log::debug!(
-                //     "copy_mnt_ns: registered new mount in peer group {}",
-                //     group_id.data()
-                // );
             }
 
             data.parent_mount_fs
@@ -336,14 +333,23 @@ impl MntNamespace {
             // 原有的挂载点的子挂载点加入队列中
 
             for (child_ino, child_mfs) in data.old_mount_fs.mountpoints().iter() {
+                let child_mount_path = inner
+                    .mount_list
+                    .get_mount_path_by_ino(*child_ino)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "copy_mnt_ns: child mount_path not found for ino={:?}, mfs name={}, \
+                             parent path={}. mountpoints and mount_list are out of sync.",
+                            child_ino,
+                            child_mfs.name(),
+                            data.mount_path.as_str()
+                        )
+                    });
                 queue.push(MountFSCopyInfo {
                     old_mount_fs: child_mfs.clone(),
                     parent_mount_fs: new_mount_fs.clone(),
                     self_mp_inode_id: *child_ino,
-                    mount_path: inner
-                        .mount_list
-                        .get_mount_path_by_ino(*child_ino)
-                        .expect("mount_path not found"),
+                    mount_path: child_mount_path,
                 });
             }
         }

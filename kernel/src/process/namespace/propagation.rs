@@ -33,7 +33,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use hashbrown::HashSet;
 use system_error::SystemError;
 
-use crate::filesystem::vfs::{mount::MountFlags, MountFS};
+use crate::filesystem::vfs::{mount::MountFlags, mount::MountPath, MountFS};
 use crate::libs::rwlock::RwLock;
 
 // ============================================================================
@@ -726,6 +726,7 @@ use crate::libs::spinlock::SpinLock;
 /// * `source_mnt` - The mount where the new mount was created
 /// * `mountpoint_id` - The inode ID of the mountpoint
 /// * `new_child` - The newly created MountFS
+/// * `mount_path` - The mount path to register in peer namespaces' mount_list
 ///
 /// # Returns
 /// * `Ok(())` on success
@@ -734,6 +735,7 @@ pub fn propagate_mount(
     source_mnt: &Arc<MountFS>,
     mountpoint_id: InodeId,
     new_child: &Arc<MountFS>,
+    mount_path: &Arc<MountPath>,
 ) -> Result<(), SystemError> {
     let propagation = source_mnt.propagation();
     let group_id = propagation.peer_group_id();
@@ -763,7 +765,7 @@ pub fn propagate_mount(
         }
         propagated.insert(peer_id);
 
-        if let Err(e) = propagate_one(&peer, mountpoint_id, new_child) {
+        if let Err(e) = propagate_one(&peer, mountpoint_id, new_child, mount_path) {
             log::warn!("propagate_mount: failed to propagate to peer: {:?}", e);
             // Continue with other peers even if one fails
         }
@@ -777,12 +779,18 @@ pub fn propagate_mount(
         }
         propagated.insert(slave_id);
 
-        if let Err(e) = propagate_one(&slave, mountpoint_id, new_child) {
+        if let Err(e) = propagate_one(&slave, mountpoint_id, new_child, mount_path) {
             log::warn!("propagate_mount: failed to propagate to slave: {:?}", e);
         }
 
         // Also propagate to slaves of slaves (recursive)
-        propagate_to_slaves(&slave, mountpoint_id, new_child, &mut propagated);
+        propagate_to_slaves(
+            &slave,
+            mountpoint_id,
+            new_child,
+            mount_path,
+            &mut propagated,
+        );
     }
 
     Ok(())
@@ -796,6 +804,7 @@ fn propagate_one(
     target_mnt: &Arc<MountFS>,
     mountpoint_id: InodeId,
     source_child: &Arc<MountFS>,
+    mount_path: &Arc<MountPath>,
 ) -> Result<(), SystemError> {
     // Check if the target has the same mountpoint
     let target_mountpoints = target_mnt.mountpoints();
@@ -818,8 +827,14 @@ fn propagate_one(
         register_peer(group_id, &cloned_child);
     }
 
-    // Add the cloned mount to the target
+    // Add the cloned mount to the target's mountpoints
     target_mnt.add_mount(mountpoint_id, cloned_child.clone())?;
+
+    // Synchronize: also add to the target namespace's mount_list so that
+    // copy_mnt_ns can find the mount_path for every entry in mountpoints().
+    if let Some(ns) = target_mnt.namespace() {
+        let _ = ns.add_mount(Some(mountpoint_id), mount_path.clone(), cloned_child);
+    }
 
     Ok(())
 }
@@ -829,6 +844,7 @@ fn propagate_to_slaves(
     mnt: &Arc<MountFS>,
     mountpoint_id: InodeId,
     source_child: &Arc<MountFS>,
+    mount_path: &Arc<MountPath>,
     propagated: &mut HashSet<usize>,
 ) {
     let prop = mnt.propagation();
@@ -839,12 +855,12 @@ fn propagate_to_slaves(
         }
         propagated.insert(slave_id);
 
-        if let Err(e) = propagate_one(&slave, mountpoint_id, source_child) {
+        if let Err(e) = propagate_one(&slave, mountpoint_id, source_child, mount_path) {
             log::warn!("propagate_to_slaves: failed: {:?}", e);
         }
 
         // Recurse
-        propagate_to_slaves(&slave, mountpoint_id, source_child, propagated);
+        propagate_to_slaves(&slave, mountpoint_id, source_child, mount_path, propagated);
     }
 }
 
@@ -925,6 +941,13 @@ fn umount_at_peer(peer_mnt: &Arc<MountFS>, mountpoint_id: InodeId) -> Result<(),
         let child_prop = child.propagation();
         if child_prop.is_shared() {
             unregister_peer(child_prop.peer_group_id(), &child);
+        }
+
+        // Synchronize: also remove from the peer namespace's mount_list
+        if let Some(ns) = peer_mnt.namespace() {
+            if let Some(mp) = ns.mount_list().get_mount_path_by_ino(mountpoint_id) {
+                ns.remove_mount(mp.as_str());
+            }
         }
         // log::debug!("umount_at_peer: removed mount at {:?}", mountpoint_id);
     }

@@ -413,6 +413,9 @@ impl TcpSocket {
                 // - SHUT_WR: subsequent send() returns EPIPE; recv() returns EOF once queue drains.
                 // - SHUT_RD: subsequent recv() returns 0.
                 // No smoltcp close/abort is needed.
+                if how.contains(ShutdownBit::SHUT_WR) {
+                    sc.set_send_shutdown();
+                }
                 if how.contains(ShutdownBit::SHUT_RD) {
                     let queued = sc.recv_queue();
                     self.recv_shutdown.init(queued);

@@ -109,12 +109,8 @@ impl PollableInode for EPollInode {
         epitem: Arc<super::EPollItem>,
         _private_data: &FilePrivateData,
     ) -> Result<(), SystemError> {
-        self.epoll
-            .0
-            .lock()
-            .poll_epitems
-            .lock_irqsave()
-            .push_back(epitem);
+        let poll_epitems = { self.epoll.0.lock().poll_epitems.clone() };
+        poll_epitems.lock_irqsave().push_back(epitem);
         Ok(())
     }
 
@@ -123,8 +119,8 @@ impl PollableInode for EPollInode {
         epitem: &Arc<super::EPollItem>,
         _private_data: &FilePrivateData,
     ) -> Result<(), SystemError> {
-        let ep = self.epoll.0.lock();
-        let mut guard = ep.poll_epitems.lock_irqsave();
+        let poll_epitems = { self.epoll.0.lock().poll_epitems.clone() };
+        let mut guard = poll_epitems.lock_irqsave();
         let len = guard.len();
         guard.retain(|x| !Arc::ptr_eq(x, epitem));
         if guard.len() != len {

@@ -76,7 +76,7 @@ pub struct EventPoll {
     /// 就绪状态（由内层 irqsave SpinLock 保护）
     ready_state: Arc<SpinLock<ReadyState>>,
     /// 监听本 epollfd 的 epitems（用于支持 epoll 嵌套：epollfd 被加入另一个 epoll）
-    pub(super) poll_epitems: LockedEPItemLinkedList,
+    pub(super) poll_epitems: Arc<LockedEPItemLinkedList>,
     /// 是否已经关闭
     shutdown: AtomicBool,
     self_ref: Option<Weak<Mutex<EventPoll>>>,
@@ -95,7 +95,7 @@ impl EventPoll {
                 ovflist: None,
                 epoll_wq: WaitQueue::default(),
             })),
-            poll_epitems: LockedEPItemLinkedList::default(),
+            poll_epitems: Arc::new(LockedEPItemLinkedList::default()),
             shutdown: AtomicBool::new(false),
             self_ref: None,
         }
@@ -251,7 +251,7 @@ impl EventPoll {
             Self::ep_loop_check(&src_epoll, &dst_epoll)?;
         }
 
-        {
+        let notify_nested = {
             let mut epoll_guard = {
                 if nonblock {
                     // 如果设置非阻塞，则尝试获取一次锁
@@ -266,7 +266,7 @@ impl EventPoll {
             };
 
             let ep_item = epoll_guard.ep_items.get(&dstfd).cloned();
-            match op {
+            let notify_nested = match op {
                 EPollCtlOption::Add => {
                     // 如果已经存在，则返回错误
                     if ep_item.is_some() {
@@ -277,24 +277,24 @@ impl EventPoll {
                     let epitem = Arc::new(EPollItem::new(
                         Arc::downgrade(&epoll_data.epoll.0),
                         Arc::downgrade(&epoll_guard.ready_state),
+                        Arc::downgrade(&epoll_guard.poll_epitems),
                         epds,
                         dstfd,
                         Arc::downgrade(&dst_file),
                     ));
-                    Self::ep_insert(&mut epoll_guard, dst_file, epitem)?;
+                    Self::ep_insert(&mut epoll_guard, dst_file, epitem)?
                 }
-                EPollCtlOption::Del => {
-                    match ep_item {
-                        Some(ref ep_item) => {
-                            // 删除
-                            Self::ep_remove(&mut epoll_guard, dstfd, Some(dst_file), ep_item)?;
-                        }
-                        None => {
-                            // 不存在则返回错误
-                            return Err(SystemError::ENOENT);
-                        }
+                EPollCtlOption::Del => match ep_item {
+                    Some(ref ep_item) => {
+                        // 删除
+                        Self::ep_remove(&mut epoll_guard, dstfd, Some(dst_file), ep_item)?;
+                        false
                     }
-                }
+                    None => {
+                        // 不存在则返回错误
+                        return Err(SystemError::ENOENT);
+                    }
+                },
                 EPollCtlOption::Mod => {
                     // 不存在则返回错误
                     if ep_item.is_none() {
@@ -309,9 +309,22 @@ impl EventPoll {
                         epds.events |= EPollEventType::EPOLLEXCLUSIVE.bits();
                     }
 
-                    Self::ep_modify(&mut epoll_guard, ep_item, &epds)?;
+                    Self::ep_modify(&mut epoll_guard, ep_item, &epds)?
                 }
+            };
+
+            if notify_nested {
+                Some(epoll_guard.poll_epitems.clone())
+            } else {
+                None
             }
+        };
+
+        if let Some(poll_epitems) = notify_nested {
+            let _ = Self::wakeup_epoll(
+                poll_epitems.as_ref(),
+                EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
+            );
         }
 
         Ok(0)
@@ -511,7 +524,9 @@ impl EventPoll {
                 {
                     // 注册前再次检查，避免错过事件（仅需 SpinLock）
                     let rs = rs_arc.lock_irqsave();
-                    if !rs.ready_list.is_empty() || epoll.0.lock().shutdown.load(Ordering::SeqCst) {
+                    if Self::ready_state_has_events(&rs)
+                        || epoll.0.lock().shutdown.load(Ordering::SeqCst)
+                    {
                         available = true;
                         // 不注册，直接继续
                     } else {
@@ -539,7 +554,7 @@ impl EventPoll {
                     // 清理 waker（仅需 SpinLock）
                     let rs = rs_arc.lock_irqsave();
                     rs.epoll_wq.remove_waker(&waker);
-                    available = !rs.ready_list.is_empty();
+                    available = Self::ready_state_has_events(&rs);
                     if epoll.0.lock().shutdown.load(Ordering::SeqCst) {
                         // epoll 被关闭，直接退出
                         return Err(SystemError::EINVAL);
@@ -564,7 +579,12 @@ impl EventPoll {
     /// 通过 ready_state Arc 检查是否有就绪事件（不需要外层 Mutex）
     fn ep_events_available_rs(rs_arc: &Arc<SpinLock<ReadyState>>) -> bool {
         let rs = rs_arc.lock_irqsave();
-        !rs.ready_list.is_empty()
+        Self::ready_state_has_events(&rs)
+    }
+
+    #[inline]
+    fn ready_state_has_events(rs: &ReadyState) -> bool {
+        !rs.ready_list.is_empty() || rs.ovflist.is_some()
     }
 
     /// 开始就绪列表扫描：偷取 ready_list 到返回的 Vec 中，
@@ -684,7 +704,7 @@ impl EventPoll {
         epoll_guard: &mut MutexGuard<EventPoll>,
         dst_file: Arc<File>,
         epitem: Arc<EPollItem>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<bool, SystemError> {
         // 检查文件是否为"总是就绪"类型（不支持poll的普通文件/目录）
         let is_always_ready = dst_file.is_always_ready();
 
@@ -716,27 +736,18 @@ impl EventPoll {
 
         // 现在检查文件是否已经有事件发生。
         let event = epitem.ep_item_poll();
+        let mut notify_nested = false;
         if !event.is_empty() {
             let mut rs = epoll_guard.ready_state.lock_irqsave();
             if !rs.ready_list.iter().any(|e| Arc::ptr_eq(e, &epitem)) {
                 let was_empty = rs.ready_list.is_empty();
                 rs.ready_list.push_back(epitem.clone());
-                // 通知嵌套 epoll（如果 ready_list 从空变非空）
-                if was_empty {
-                    drop(rs);
-                    let _ = Self::wakeup_epoll(
-                        &epoll_guard.poll_epitems,
-                        EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
-                    );
-                    let rs2 = epoll_guard.ready_state.lock_irqsave();
-                    rs2.epoll_wq.wakeup(None);
-                } else {
-                    rs.epoll_wq.wakeup(None);
-                }
+                notify_nested = was_empty;
+                rs.epoll_wq.wakeup(None);
             }
         }
 
-        Ok(())
+        Ok(notify_nested)
     }
 
     pub fn ep_remove(
@@ -767,7 +778,7 @@ impl EventPoll {
         epoll_guard: &mut MutexGuard<EventPoll>,
         epitem: Arc<EPollItem>,
         event: &EPollEvent,
-    ) -> Result<(), SystemError> {
+    ) -> Result<bool, SystemError> {
         let mut epi_event_guard = epitem.event.lock_irqsave();
 
         // 修改epitem
@@ -777,33 +788,25 @@ impl EventPoll {
         drop(epi_event_guard);
         // 修改后检查文件是否已经有感兴趣事件发生
         let event = epitem.ep_item_poll();
+        let mut notify_nested = false;
         if !event.is_empty() {
             let mut rs = epoll_guard.ready_state.lock_irqsave();
             if !rs.ready_list.iter().any(|e| Arc::ptr_eq(e, &epitem)) {
                 let was_empty = rs.ready_list.is_empty();
                 rs.ready_list.push_back(epitem.clone());
-                if was_empty {
-                    drop(rs);
-                    let _ = Self::wakeup_epoll(
-                        &epoll_guard.poll_epitems,
-                        EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
-                    );
-                    let rs2 = epoll_guard.ready_state.lock_irqsave();
-                    rs2.epoll_wq.wakeup(None);
-                } else {
-                    rs.epoll_wq.wakeup(None);
-                }
+                notify_nested = was_empty;
+                rs.epoll_wq.wakeup(None);
             }
         }
         // TODO:处理EPOLLWAKEUP，目前不支持
 
-        Ok(())
+        Ok(notify_nested)
     }
 
     /// ### 判断epoll是否有就绪item（由外层 Mutex 保护的调用路径使用）
     pub fn ep_events_available(&self) -> bool {
         let rs = self.ready_state.lock_irqsave();
-        !rs.ready_list.is_empty()
+        Self::ready_state_has_events(&rs)
     }
 
     /// Linux 语义：epoll 嵌套需要进行 loop/depth 检查（失败返回 ELOOP）。
@@ -897,28 +900,37 @@ impl EventPoll {
                 continue;
             }
 
-            // 仅获取 SpinLock（irqsave）— hardirq-safe
-            let mut rs = rs_arc.lock_irqsave();
+            {
+                // 仅获取 SpinLock（irqsave）— hardirq-safe
+                let mut rs = rs_arc.lock_irqsave();
 
-            if let Some(ref mut ovflist) = rs.ovflist {
-                // 扫描进行中 — 推入溢出列表
-                if !ovflist.iter().any(|e| Arc::ptr_eq(e, epitem)) {
-                    ovflist.push(epitem.clone());
+                if let Some(ref mut ovflist) = rs.ovflist {
+                    // 扫描进行中 — 推入溢出列表
+                    if !ovflist.iter().any(|e| Arc::ptr_eq(e, epitem)) {
+                        ovflist.push(epitem.clone());
+                    }
+                } else {
+                    // 正常模式 — 推入 ready_list
+                    if !rs.ready_list.iter().any(|e| Arc::ptr_eq(e, epitem)) {
+                        rs.ready_list.push_back(epitem.clone());
+                    }
                 }
-            } else {
-                // 正常模式 — 推入 ready_list
-                if !rs.ready_list.iter().any(|e| Arc::ptr_eq(e, epitem)) {
-                    rs.ready_list.push_back(epitem.clone());
+
+                if ep_events.contains(EPollEventType::EPOLLEXCLUSIVE)
+                    && !pollflags.contains(EPollEventType::POLLFREE)
+                {
+                    // 避免惊群
+                    rs.epoll_wq.wakeup(None);
+                } else {
+                    rs.epoll_wq.wakeup_all(None);
                 }
             }
 
-            if ep_events.contains(EPollEventType::EPOLLEXCLUSIVE)
-                && !pollflags.contains(EPollEventType::POLLFREE)
-            {
-                // 避免惊群
-                rs.epoll_wq.wakeup(None);
-            } else {
-                rs.epoll_wq.wakeup_all(None);
+            if let Some(poll_epitems) = epitem.poll_epitems().upgrade() {
+                let _ = Self::wakeup_epoll(
+                    poll_epitems.as_ref(),
+                    EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
+                );
             }
         }
         Ok(())

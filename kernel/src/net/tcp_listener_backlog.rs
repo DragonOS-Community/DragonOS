@@ -121,17 +121,23 @@ impl TcpListenerBacklog {
             }
         }
 
-        if let Ok(pkt4) = Ipv4Packet::new_checked(maybe_ip) {
-            if pkt4.next_header() != IpProtocol::Tcp {
-                return false;
+        // 先检查 IP 版本，再解析，避免 smoltcp::Ipv4Packet::new_checked 不校验版本字段
+        // 导致 IPv6 包误走 IPv4 解析路径。
+        let version = maybe_ip.first().map(|b| b >> 4).unwrap_or(0);
+
+        if version == 4 {
+            if let Ok(pkt4) = Ipv4Packet::new_checked(maybe_ip) {
+                if pkt4.next_header() != IpProtocol::Tcp {
+                    return false;
+                }
+                if let Ok(tcp) = TcpPacket::new_checked(pkt4.payload()) {
+                    dst_port = Some(tcp.dst_port());
+                    is_pure_syn = tcp.syn() && !tcp.ack();
+                }
             }
-            if let Ok(tcp) = TcpPacket::new_checked(pkt4.payload()) {
-                dst_port = Some(tcp.dst_port());
-                is_pure_syn = tcp.syn() && !tcp.ack();
-            }
-        } else if let Ok(pkt6) = Ipv6Packet::new_checked(maybe_ip) {
+        } else if version == 6 {
             // IPv6 可能包含扩展头，这里做一个保守跳过：能到 TCP 则解析，否则不丢。
-            let data = pkt6.as_ref();
+            let data = maybe_ip;
             if data.len() < 40 {
                 return false;
             }

@@ -2,7 +2,7 @@ use super::{poll::PollFlags, vfs::file::File};
 use crate::libs::{mutex::Mutex, spinlock::SpinLock};
 use alloc::sync::Weak;
 use core::fmt::Debug;
-use event_poll::{EventPoll, ReadyState};
+use event_poll::{EventPoll, LockedEPItemLinkedList, ReadyState};
 use system_error::SystemError;
 
 pub mod event_poll;
@@ -57,6 +57,8 @@ pub struct EPollItem {
     /// 直接引用 EventPoll 的 ready_state，使回调路径绕过外层 Mutex。
     /// 对标 Linux 中 ep_poll_callback 仅获取 ep->lock 而不获取 ep->mtx 的设计。
     ready_state: Weak<SpinLock<ReadyState>>,
+    /// 直接引用 EventPoll 的 poll_epitems，使嵌套 epoll 的向上传播无需获取外层 Mutex。
+    poll_epitems: Weak<LockedEPItemLinkedList>,
     /// 用户注册的事件
     /// 使用 irqsave SpinLock 而非 RwSem，因为 wakeup_epoll 回调路径可能在
     /// hardirq 上下文中执行（例如 timer IRQ → signal → signalfd → epoll），
@@ -74,6 +76,7 @@ impl EPollItem {
     pub(super) fn new(
         epoll: Weak<Mutex<EventPoll>>,
         ready_state: Weak<SpinLock<ReadyState>>,
+        poll_epitems: Weak<LockedEPItemLinkedList>,
         events: EPollEvent,
         fd: i32,
         file: Weak<File>,
@@ -81,6 +84,7 @@ impl EPollItem {
         Self {
             epoll,
             ready_state,
+            poll_epitems,
             event: SpinLock::new(events),
             fd,
             file,
@@ -95,6 +99,12 @@ impl EPollItem {
     #[allow(dead_code)]
     pub(crate) fn ready_state(&self) -> Weak<SpinLock<ReadyState>> {
         self.ready_state.clone()
+    }
+
+    /// 获取 poll_epitems 的 Weak 引用，用于嵌套 epoll 的向上传播。
+    #[allow(dead_code)]
+    pub(crate) fn poll_epitems(&self) -> Weak<LockedEPItemLinkedList> {
+        self.poll_epitems.clone()
     }
 
     pub fn event(&self) -> &SpinLock<EPollEvent> {

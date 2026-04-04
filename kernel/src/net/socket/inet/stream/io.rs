@@ -398,8 +398,7 @@ impl TcpSocket {
                     }
                     let peek = flags.contains(PMSG::PEEK);
                     let trunc = flags.contains(PMSG::TRUNC);
-                    let send_shutdown = self.is_send_shutdown();
-                    let n = sc.recv_into(current_buf, peek, trunc, send_shutdown)?;
+                    let n = sc.recv_into(current_buf, peek, trunc)?;
                     if self.is_recv_shutdown() && !peek && self.recv_shutdown.record_read(n) {
                         sc.discard_all();
                     }
@@ -504,8 +503,7 @@ impl TcpSocket {
                         }
                         limit = core::cmp::min(limit, remaining);
                     }
-                    let n =
-                        sc.recv_to_user(user_buffer, total_read, limit, self.is_send_shutdown())?;
+                    let n = sc.recv_to_user(user_buffer, total_read, limit)?;
                     if self.is_recv_shutdown() && self.recv_shutdown.record_read(n) {
                         sc.discard_all();
                     }

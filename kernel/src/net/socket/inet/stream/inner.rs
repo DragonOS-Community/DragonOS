@@ -916,6 +916,9 @@ pub struct SelfConnected {
     /// Effective receive capacity for the loopback queue (bytes).
     rx_cap: AtomicUsize,
     buf: Mutex<VecDeque<u8>>,
+    /// SHUT_WR flag for this self-connected socket. Stored here to avoid TOCTOU
+    /// race between checking shutdown and checking queue emptiness.
+    send_shutdown: AtomicBool,
 }
 
 impl SelfConnected {
@@ -929,6 +932,7 @@ impl SelfConnected {
             local,
             rx_cap: AtomicUsize::new(rx_cap),
             buf: Mutex::new(VecDeque::new()),
+            send_shutdown: AtomicBool::new(false),
         }
     }
 
@@ -993,20 +997,27 @@ impl SelfConnected {
         Ok(n)
     }
 
-    pub fn recv_into(
-        &self,
-        out: &mut [u8],
-        peek: bool,
-        trunc: bool,
-        send_shutdown: bool,
-    ) -> Result<usize, SystemError> {
+    /// Set the send_shutdown flag (called when SHUT_WR is performed).
+    pub fn set_send_shutdown(&self) {
+        self.send_shutdown.store(true, Ordering::Release);
+    }
+
+    /// Check if send_shutdown flag is set.
+    #[inline]
+    #[allow(dead_code)]
+    pub fn is_send_shutdown(&self) -> bool {
+        self.send_shutdown.load(Ordering::Acquire)
+    }
+
+    pub fn recv_into(&self, out: &mut [u8], peek: bool, trunc: bool) -> Result<usize, SystemError> {
         if out.is_empty() {
             return Ok(0);
         }
         let mut q = self.buf.lock();
         if q.is_empty() {
             // EOF after SHUT_WR once all queued data is drained.
-            if send_shutdown {
+            // Check send_shutdown inside the lock to avoid TOCTOU race.
+            if self.send_shutdown.load(Ordering::Acquire) {
                 return Ok(0);
             }
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
@@ -1032,7 +1043,6 @@ impl SelfConnected {
         out: &mut UserBuffer<'_>,
         offset: usize,
         max_len: usize,
-        send_shutdown: bool,
     ) -> Result<usize, SystemError> {
         if offset > out.len() {
             return Err(SystemError::EINVAL);
@@ -1044,7 +1054,8 @@ impl SelfConnected {
 
         let mut q = self.buf.lock();
         if q.is_empty() {
-            if send_shutdown {
+            // Check send_shutdown inside the lock to avoid TOCTOU race.
+            if self.send_shutdown.load(Ordering::Acquire) {
                 return Ok(0);
             }
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
@@ -1066,7 +1077,8 @@ impl SelfConnected {
         }
     }
 
-    pub fn update_io_events(&self, pollee: &AtomicUsize, send_shutdown: bool) {
+    pub fn update_io_events(&self, pollee: &AtomicUsize) {
+        let send_shutdown = self.send_shutdown.load(Ordering::Acquire);
         let queued = self.recv_queue();
         let cap = self.rx_cap.load(Ordering::Relaxed);
         let writable = !send_shutdown && queued < cap;

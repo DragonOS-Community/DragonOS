@@ -145,6 +145,7 @@ pub fn check_signal_permission_pcb(target: &Arc<ProcessControlBlock>) -> Result<
 }
 
 /// Check if the current process has permission to send a signal to the target process.
+#[allow(dead_code)]
 fn check_signal_permission(target_pid: RawPid) -> Result<(), SystemError> {
     let target = ProcessManager::find_task_by_vpid(target_pid).ok_or(SystemError::ESRCH)?;
     check_signal_permission_pcb(&target)

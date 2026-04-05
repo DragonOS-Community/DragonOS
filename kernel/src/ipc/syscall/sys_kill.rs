@@ -5,7 +5,7 @@ use core::ffi::c_int;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::process::cred::CAPFlags;
-use crate::process::pid::Pid;
+use crate::process::pid::{Pid, PidType};
 use crate::process::ProcessControlBlock;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
@@ -166,7 +166,18 @@ fn handle_null_signal(converter: &PidConverter) -> Result<usize, SystemError> {
     match converter {
         PidConverter::Pid(pid) => {
             // Check existence and permissions for a specific process
-            check_signal_permission(pid.pid_vnr())?;
+            // 对于 TID（线程 ID），Linux 允许 kill() 使用 TID 来检查线程是否存在
+            // 参考: https://man7.org/linux/man-pages/man2/kill.2.html
+            // "If pid is positive, then signal sig is sent to the process with the ID specified by pid."
+            // 在 Linux 中，TID 也是一个有效的 PID，可以用于 kill() 调用
+
+            // 直接从 Arc<Pid> 获取对应的任务，避免二次查找
+            // 使用 PidType::PID 因为 kill() 接受的是 PID/TID
+            let target = pid.pid_task(PidType::PID)
+                .ok_or(SystemError::ESRCH)?;
+
+            // 检查权限
+            check_signal_permission_pcb(&target)?;
             Ok(0)
         }
         PidConverter::Pgid(pgid) => {

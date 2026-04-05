@@ -6,12 +6,13 @@ use crate::libs::mutex::MutexGuard;
 use crate::{
     filesystem::{
         procfs::{
+            pid::find_process_by_vpid,
             template::{Builder, FileOps, ProcFileBuilder},
             utils::proc_read,
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    process::{ProcessManager, RawPid},
+    process::RawPid,
 };
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
@@ -40,7 +41,7 @@ impl FileOps for CmdlineFileOps {
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         // 查找进程
-        let pcb = ProcessManager::find(self.pid).ok_or(SystemError::ESRCH)?;
+        let pcb = find_process_by_vpid(self.pid).ok_or(SystemError::ESRCH)?;
 
         // 获取 cmdline 字节
         let cmdline_bytes = pcb.cmdline_bytes();

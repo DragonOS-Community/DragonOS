@@ -28,7 +28,7 @@ use crate::{
         },
         vfs::{FileSystemMakerData, IndexNode, InodeMode, FSMAKER},
     },
-    process::{ProcessManager, RawPid},
+    process::{pid::PidType, ProcessManager, RawPid},
     register_mountable_fs,
 };
 use alloc::{
@@ -86,7 +86,7 @@ impl DirOps for RootDirOps {
         // 首先检查是否是 PID 目录
         if let Ok(pid) = name.parse::<RawPid>() {
             // 检查进程是否存在
-            if ProcessManager::find(pid).is_some() {
+            if ProcessManager::find_task_by_vpid(pid).is_some() {
                 let mut cached_children = dir.cached_children().write();
 
                 // 检查缓存中是否已存在
@@ -118,16 +118,14 @@ impl DirOps for RootDirOps {
     }
 
     fn populate_children(&self, dir: &ProcDir<Self>) {
-        // 先收集进程 PID，然后立即释放进程表锁
-        let pid_list = {
-            let all_processes = crate::process::all_process().lock_irqsave();
-            if let Some(process_map) = all_processes.as_ref() {
-                process_map.keys().cloned().collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            }
-        };
-        // 进程表锁已经释放
+        let active_pid_ns = ProcessManager::current_pcb().active_pid_ns();
+        let pid_list = active_pid_ns
+            .collect_pids()
+            .into_iter()
+            .filter(|pid| pid.pid_task(PidType::PID).is_some())
+            .map(|pid| pid.pid_nr_ns(&active_pid_ns))
+            .filter(|pid| pid.data() != 0)
+            .collect::<Vec<_>>();
 
         // 获取缓存写锁并填充
         let mut cached_children = dir.cached_children().write();

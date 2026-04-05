@@ -2,15 +2,18 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use system_error::SystemError;
 
-use crate::process::{
-    fork::CloneFlags,
-    namespace::{
-        cgroup_namespace::{CgroupNamespace, INIT_CGROUP_NAMESPACE},
-        mnt::{root_mnt_namespace, MntNamespace},
-        net_namespace::{NetNamespace, INIT_NET_NAMESPACE},
-        uts_namespace::{UtsNamespace, INIT_UTS_NAMESPACE},
+use crate::{
+    filesystem::vfs::{IndexNode, VFS_MAX_FOLLOW_SYMLINK_TIMES},
+    process::{
+        fork::CloneFlags,
+        namespace::{
+            cgroup_namespace::{CgroupNamespace, INIT_CGROUP_NAMESPACE},
+            mnt::{root_mnt_namespace, MntNamespace},
+            net_namespace::{NetNamespace, INIT_NET_NAMESPACE},
+            uts_namespace::{UtsNamespace, INIT_UTS_NAMESPACE},
+        },
+        ProcessControlBlock, ProcessManager,
     },
-    ProcessControlBlock, ProcessManager,
 };
 use core::{fmt::Debug, intrinsics::likely};
 
@@ -167,6 +170,20 @@ impl ProcessManager {
 
         child_pcb.set_nsproxy(new_ns);
 
+        // 如果创建了新的 mount namespace，需要将子进程的 fs_struct (root/pwd)
+        // 从旧 namespace 的 inode 切换到新 namespace 的根 inode。
+        // 否则子进程的路径解析和挂载操作会直接作用于父 namespace 的 mount 树，
+        // 完全破坏 mount namespace 的隔离性。
+        //
+        // 参考 Linux: fs/namespace.c copy_mnt_ns() 中遍历 mount 树时
+        //   替换 new_fs->root.mnt 和 new_fs->pwd.mnt
+        if clone_flags.contains(CloneFlags::CLONE_NEWNS) {
+            let new_root = child_pcb.nsproxy().mnt_namespace().root_inode();
+            let fs = child_pcb.fs_struct();
+            fs.set_root(new_root.clone());
+            fs.set_pwd(new_root);
+        }
+
         Ok(())
     }
 }
@@ -264,6 +281,47 @@ pub fn switch_task_namespaces(
     tsk: &Arc<ProcessControlBlock>,
     new_nsproxy: Arc<NsProxy>,
 ) -> Result<(), SystemError> {
+    let rebound_paths = if Arc::ptr_eq(tsk.nsproxy().mnt_namespace(), &new_nsproxy.mnt_ns) {
+        None
+    } else {
+        Some(resolve_fs_paths_for_new_mntns(tsk, &new_nsproxy.mnt_ns)?)
+    };
+
     tsk.set_nsproxy(new_nsproxy);
+
+    if let Some((new_root, new_pwd)) = rebound_paths {
+        let fs = tsk.fs_struct_mut();
+        fs.set_root(new_root);
+        fs.set_pwd(new_pwd);
+    }
+
     Ok(())
+}
+
+type ReboundFsPaths = (Arc<dyn IndexNode>, Arc<dyn IndexNode>);
+
+fn resolve_fs_paths_for_new_mntns(
+    tsk: &Arc<ProcessControlBlock>,
+    new_mntns: &Arc<MntNamespace>,
+) -> Result<ReboundFsPaths, SystemError> {
+    let fs = tsk.fs_struct();
+    let old_root_path = fs.root().absolute_path()?;
+    let old_pwd_path = fs.pwd().absolute_path()?;
+    drop(fs);
+
+    let new_root = resolve_from_namespace_root(new_mntns, &old_root_path)?;
+    let new_pwd = resolve_from_namespace_root(new_mntns, &old_pwd_path)?;
+    Ok((new_root, new_pwd))
+}
+
+fn resolve_from_namespace_root(
+    mntns: &Arc<MntNamespace>,
+    path: &str,
+) -> Result<Arc<dyn IndexNode>, SystemError> {
+    let namespace_root = mntns.root_inode();
+    if path.is_empty() || path == "/" {
+        return Ok(namespace_root);
+    }
+
+    namespace_root.lookup_follow_symlink(path.trim_start_matches('/'), VFS_MAX_FOLLOW_SYMLINK_TIMES)
 }

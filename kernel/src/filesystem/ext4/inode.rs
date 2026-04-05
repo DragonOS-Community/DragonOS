@@ -49,6 +49,12 @@ pub struct Ext4Inode {
 
     // 特殊节点数据（用于 FIFO 的 pipe inode）
     pub(super) special_node: Option<SpecialNodeData>,
+
+    /// 缓存的文件大小，避免频繁调用 getattr/setattr。
+    /// None 表示未初始化（第一次写时从磁盘读取并缓存）。
+    pub(super) cached_file_size: Option<u64>,
+    /// 标记是否有未刷回磁盘的元数据变更（file_size/mtime）
+    pub(super) metadata_dirty: bool,
 }
 
 #[derive(Debug)]
@@ -128,42 +134,15 @@ impl IndexNode for LockedExt4Inode {
         // PageCache 读写路径内部会调用 inode.metadata() 获取文件大小：
         // - prepare_read(): inode.metadata()
         // 若此处持有 inode 锁，则会在 metadata() 再次尝试获取同一把锁而自旋死锁。
-        let (fs, inode_num, page_cache) = {
+        let page_cache = {
             let guard = self.0.lock();
-            (
-                guard.concret_fs(),
-                guard.inner_inode_num,
-                guard.page_cache.clone(),
-            )
+            guard.page_cache.clone()
         };
 
         if let Some(page_cache) = page_cache {
-            let time = PosixTimeSpec::now().tv_sec.to_u32().unwrap_or_else(|| {
-                log::warn!("Failed to get current time, using 0");
-                0
-            });
-            let atime_update = fs
-                .fs
-                .setattr(
-                    inode_num,
-                    another_ext4::SetAttr {
-                        mode: None,
-                        uid: None,
-                        gid: None,
-                        size: None,
-                        atime: Some(time),
-                        mtime: None,
-                        ctime: None,
-                        crtime: None,
-                    },
-                )
-                .map_err(SystemError::from);
-            match atime_update {
-                Ok(()) => {}
-                // 只读挂载下，atime 更新失败不应影响读取语义。
-                Err(SystemError::EROFS) => {}
-                Err(e) => return Err(e),
-            }
+            // 性能优化：不再每次 read 都同步更新 atime 到磁盘。
+            // 这等同于 Linux 的 noatime 挂载选项，避免每次读取引发
+            // read_inode + write_inode 的额外磁盘 I/O。
             page_cache.read(offset, buf)
         } else {
             self.read_direct(offset, len, buf, data)
@@ -205,38 +184,71 @@ impl IndexNode for LockedExt4Inode {
         let len = core::cmp::min(len, buf.len());
         let buf = &buf[0..len];
 
-        let (fs, inode_num, page_cache) = {
+        let (fs, inode_num, page_cache, old_cached_size) = {
             let guard = self.0.lock();
             (
                 guard.concret_fs(),
                 guard.inner_inode_num,
                 guard.page_cache.clone(),
+                guard.cached_file_size,
             )
         };
 
         if let Some(page_cache) = page_cache {
+            // 使用缓存的文件大小，避免 getattr 磁盘 I/O
+            let old_file_size = match old_cached_size {
+                Some(size) => size,
+                None => {
+                    let size = fs.fs.getattr(inode_num)?.size;
+                    self.0.lock().cached_file_size = Some(size);
+                    size
+                }
+            };
+
+            let new_end = (offset + len) as u64;
+            let current_file_size = core::cmp::max(old_file_size, new_end);
+
+            // Two-phase write protocol that decouples block allocation from i_size:
+            //
+            // Phase 1 – Pre-allocate disk blocks WITHOUT updating i_size.
+            //   Ensures the async writeback thread can always find extent
+            //   mappings, avoiding the EIO that would occur if page-cache pages
+            //   were dirtied before blocks existed.
+            //
+            // Phase 2 – Commit i_size BEFORE writing page cache.
+            //   Must complete before PageCache::write so that concurrent
+            //   writeback (flush_dirty_pages / writeback_entry) sees the
+            //   correct file size and does not race with our disk I/O.
+            //   If commit_inode_size fails, no dirty pages exist yet → clean.
+            //   If PageCache::write later fails, i_size is already extended
+            //   but the extended region reads as zeros – same as old setattr
+            //   behaviour and acceptable since PageCache::write only fails on
+            //   OOM.
+            let extending = new_end > old_file_size;
+            if extending {
+                fs.fs
+                    .allocate_blocks_for_write(inode_num, current_file_size)
+                    .map_err(SystemError::from)?;
+
+                let time = PosixTimeSpec::now().tv_sec.to_u32().unwrap_or_else(|| {
+                    log::warn!("Failed to get current time, using 0");
+                    0
+                });
+                fs.fs
+                    .commit_inode_size(inode_num, current_file_size, Some(time))
+                    .map_err(SystemError::from)?;
+            }
+
+            // 磁盘块已就绪、i_size 已更新，现在安全写入 page cache
             let write_len = PageCache::write(&page_cache, offset, buf)?;
-            let old_file_size = fs.fs.getattr(inode_num)?.size;
-            let current_file_size = core::cmp::max(old_file_size, (offset + write_len) as u64);
-            let time = PosixTimeSpec::now().tv_sec.to_u32().unwrap_or_else(|| {
-                log::warn!("Failed to get current time, using 0");
-                0
-            });
-            fs.fs
-                .setattr(
-                    inode_num,
-                    another_ext4::SetAttr {
-                        mode: None,
-                        uid: None,
-                        gid: None,
-                        size: Some(current_file_size),
-                        atime: None,
-                        mtime: Some(time),
-                        ctime: None,
-                        crtime: None,
-                    },
-                )
-                .map_err(SystemError::from)?;
+
+            // 更新内存中的缓存大小
+            {
+                let mut guard = self.0.lock();
+                guard.cached_file_size = Some(current_file_size);
+                guard.metadata_dirty = true;
+            }
+
             Ok(write_len)
         } else {
             self.write_direct(offset, len, buf, data)
@@ -251,7 +263,15 @@ impl IndexNode for LockedExt4Inode {
         match fs.fs.getattr(inode_num)?.ftype {
             FileType::Directory => Err(SystemError::EISDIR),
             FileType::Unknown => Err(SystemError::EROFS),
-            FileType::RegularFile => fs.fs.write(inode_num, offset, buf).map_err(From::from),
+            // Use write_data_only: blocks are pre-allocated by allocate_blocks_for_write() in write_at().
+            // Using Ext4::write() here would cause it to call write_inode_with_csum()
+            // which overwrites the inode's block_count/extent tree with a stale
+            // snapshot, causing setattr to re-allocate blocks endlessly until
+            // the extent tree overflows (entries > max_entries → EIO).
+            FileType::RegularFile => fs
+                .fs
+                .write_data_only(inode_num, offset, buf)
+                .map_err(From::from),
             _ => Err(SystemError::EINVAL),
         }
     }
@@ -411,6 +431,40 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn close(&self, _: PrivateData) -> Result<(), SystemError> {
+        // 在 close 时刷回延迟的元数据更新（mtime 等）
+        let (fs, inode_num, dirty, cached_size) = {
+            let mut guard = self.0.lock();
+            let dirty = guard.metadata_dirty;
+            let cached_size = guard.cached_file_size;
+            if dirty {
+                guard.metadata_dirty = false;
+            }
+            (
+                guard.concret_fs(),
+                guard.inner_inode_num,
+                dirty,
+                cached_size,
+            )
+        };
+        if dirty {
+            let time = PosixTimeSpec::now().tv_sec.to_u32().unwrap_or_else(|| {
+                log::warn!("Failed to get current time, using 0");
+                0
+            });
+            let _ = fs.fs.setattr(
+                inode_num,
+                another_ext4::SetAttr {
+                    mode: None,
+                    uid: None,
+                    gid: None,
+                    size: cached_size,
+                    atime: None,
+                    mtime: Some(time),
+                    ctime: None,
+                    crtime: None,
+                },
+            );
+        }
         Ok(())
     }
 
@@ -463,6 +517,9 @@ impl IndexNode for LockedExt4Inode {
             },
         )
         .map_err(SystemError::from)?;
+        drop(guard);
+        // 更新缓存的文件大小
+        self.0.lock().cached_file_size = Some(len as u64);
         Ok(())
     }
 
@@ -864,6 +921,8 @@ impl Ext4Inode {
             parent: parent.unwrap_or_default(),
             self_ref: Weak::new(), // 将在LockedExt4Inode::new()中设置
             special_node: None,
+            cached_file_size: None,
+            metadata_dirty: false,
         }
     }
 }

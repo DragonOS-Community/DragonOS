@@ -6,6 +6,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 
 mod block_file;
+mod cache_test;
 mod rename_exchange_test;
 
 const ROOT_INO: u32 = EXT4_ROOT_INO;
@@ -104,7 +105,7 @@ fn corrupt_inode_extent_root_magic(path: &str, inode_id: u32) {
 fn extent_corruption_test() {
     make_ext4();
     let ino = {
-        let mut ext4 = open_ext4();
+        let ext4 = open_ext4();
         let file_mode: InodeMode = InodeMode::FILE | InodeMode::ALL_RWX;
         let ino = ext4
             .generic_create(ROOT_INO, "corrupt_target", file_mode)
@@ -222,6 +223,118 @@ fn xattr_test(ext4: &mut Ext4) {
     assert_eq!(names, vec!["user.testtwo"]);
 }
 
+/// Simulate the apt update scenario: multiple files being grown via setattr
+/// in an interleaved pattern, then verified via extent_query (write_data_only).
+/// This reproduces the ENOENT bug where extent_query cannot find blocks that
+/// setattr already allocated.
+fn interleaved_setattr_writeback_test() {
+    use another_ext4::{FileAttr, SetAttr};
+
+    make_ext4();
+    let ext4 = load_ext4();
+    let file_mode: InodeMode = InodeMode::FILE | InodeMode::ALL_RWX;
+
+    // Create 3 files to simulate concurrent downloads
+    let ino1 = ext4
+        .generic_create(ROOT_INO, "pkg1.deb", file_mode)
+        .expect("create pkg1 failed");
+    let ino2 = ext4
+        .generic_create(ROOT_INO, "pkg2.deb", file_mode)
+        .expect("create pkg2 failed");
+    let ino3 = ext4
+        .generic_create(ROOT_INO, "pkg3.deb", file_mode)
+        .expect("create pkg3 failed");
+
+    let files = [ino1, ino2, ino3];
+    let mut file_sizes = [0u64; 3];
+    let chunk_size = 65536u64; // 64KB chunks, like apt download buffers
+
+    // Simulate interleaved growth: grow each file by 64KB in round-robin,
+    // up to ~1.6MB each (400 blocks). This forces non-contiguous allocation
+    // because different files interleave their alloc_block calls.
+    let target_size = 1_600_000u64;
+
+    for round in 0u64.. {
+        let mut all_done = true;
+        for (i, &ino) in files.iter().enumerate() {
+            if file_sizes[i] >= target_size {
+                continue;
+            }
+            all_done = false;
+            let new_size = core::cmp::min(file_sizes[i] + chunk_size, target_size);
+
+            // setattr to grow file (allocate blocks)
+            ext4.setattr(
+                ino,
+                SetAttr {
+                    mode: None,
+                    uid: None,
+                    gid: None,
+                    size: Some(new_size),
+                    atime: None,
+                    mtime: None,
+                    ctime: None,
+                    crtime: None,
+                },
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "setattr FAILED: ino={} round={} old_size={} new_size={} err={:?}",
+                    ino, round, file_sizes[i], new_size, e
+                )
+            });
+
+            // Simulate writeback: write_data_only for all blocks in the
+            // newly allocated region
+            let old_block = (file_sizes[i] as usize) / 4096;
+            let new_block = ((new_size as usize) + 4095) / 4096;
+            for blk in old_block..new_block {
+                let offset = blk * 4096;
+                let data = vec![0xABu8; 4096];
+                let write_len = core::cmp::min(4096, new_size as usize - offset);
+                ext4.write_data_only(ino, offset, &data[..write_len])
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "write_data_only FAILED: ino={} round={} iblock={} offset={} \
+                             old_size={} new_size={} err={:?}",
+                            ino, round, blk, offset, file_sizes[i], new_size, e
+                        )
+                    });
+            }
+
+            file_sizes[i] = new_size;
+        }
+        if all_done {
+            break;
+        }
+    }
+
+    // Verify: read back all data
+    for (i, &ino) in files.iter().enumerate() {
+        let mut buf = vec![0u8; file_sizes[i] as usize];
+        let n = ext4.read(ino, 0, &mut buf).expect("read failed");
+        assert_eq!(n, file_sizes[i] as usize, "file {} size mismatch", i);
+        // All written bytes should be 0xAB
+        for (j, &b) in buf.iter().enumerate() {
+            assert_eq!(b, 0xAB, "file {} byte {} mismatch: got {}", i, j, b);
+        }
+    }
+
+    drop(ext4);
+
+    // e2fsck validation
+    let output = std::process::Command::new("e2fsck")
+        .args(["-fn", "ext4.img"])
+        .output()
+        .expect("e2fsck failed");
+    assert!(
+        output.status.success(),
+        "e2fsck FAILED:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    println!("interleaved setattr+writeback test done");
+}
+
 fn main() {
     SimpleLogger::new().init().unwrap();
     log::set_max_level(log::LevelFilter::Off);
@@ -246,4 +359,18 @@ fn main() {
     drop(ext4);
     extent_corruption_test();
     println!("extent corruption test done");
+
+    // Interleaved setattr + writeback test
+    interleaved_setattr_writeback_test();
+
+    // Cache correctness tests — run on a fresh image
+    // Use load_ext4 (not open_ext4) to avoid init() corrupting mkfs.ext4 checksums
+    println!("\n--- Running cache correctness tests ---");
+    make_ext4();
+    let ext4 = load_ext4();
+    cache_test::run_all_cache_tests(&ext4, "ext4.img");
+    drop(ext4);
+    // e2fsck validation after all writes are flushed
+    cache_test::e2fsck_validation("ext4.img");
+    println!("--- All cache correctness tests passed! ---");
 }

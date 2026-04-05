@@ -13,7 +13,32 @@
 //! inode.i_block, which allows for the first four extents to be recorded without
 //! the use of extra metadata blocks.
 
+use super::crc::crc32;
+use crate::constants::{BLOCK_SIZE, CRC32_INIT};
 use crate::prelude::*;
+
+/// Compute the CRC32C checksum for an extent block (non-root node).
+///
+/// Linux formula: `crc32c(csum_seed, eh_data[0..tail_offset])`
+/// where `csum_seed = crc32c(crc32c(uuid_seed, inum_le), igen_le)`
+/// and `tail_offset = sizeof(header) + sizeof(extent) * eh_max`.
+///
+/// For a 4096-byte block: tail is the last 4 bytes.
+pub fn extent_block_checksum(uuid: &[u8], ino: u32, ino_gen: u32, block: &[u8]) -> u32 {
+    let csum = crc32(CRC32_INIT, uuid);
+    let csum = crc32(csum, &ino.to_le_bytes());
+    let csum = crc32(csum, &ino_gen.to_le_bytes());
+
+    let tail_offset = BLOCK_SIZE - core::mem::size_of::<ExtentTail>();
+    crc32(csum, &block[..tail_offset])
+}
+
+/// The extent tail structure, stored at the end of each extent block.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ExtentTail {
+    pub checksum: u32,
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 #[repr(C)]
@@ -452,13 +477,14 @@ impl<'a> ExtentNodeMut<'a> {
         extent: &Extent,
         pos: usize,
     ) -> core::result::Result<(), Vec<FakeExtent>> {
-        if self.extent_at(pos).is_unwritten() {
+        // Only check for unwritten extent if pos is within current entries
+        if pos < self.header().entries_count() as usize && self.extent_at(pos).is_unwritten() {
             // The position has an uninitialized extent
             *self.extent_mut_at(pos) = *extent;
             self.header_mut().entries_count += 1;
             return Ok(());
         }
-        // The position has a valid extent
+        // The position has a valid extent or is at the end
         if self.header().entries_count() < self.header().max_entries_count() {
             // The extent node is not full
             // Insert the extent and move the following extents

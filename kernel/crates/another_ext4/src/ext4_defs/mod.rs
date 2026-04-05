@@ -34,6 +34,12 @@ pub use inode::*;
 pub use super_block::*;
 pub use xattr::*;
 
+// Compile-time assertions: struct sizes must match on-disk layout exactly.
+const _: () = assert!(core::mem::size_of::<Inode>() == 256);
+const _: () = assert!(core::mem::size_of::<BlockGroupDesc>() == 64);
+// SuperBlock struct occupies 1024 bytes on disk (offset 1024 within block 0).
+const _: () = assert!(core::mem::size_of::<SuperBlock>() == 1024);
+
 /// All file types. Also matches the defination in directory entries.
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 #[repr(u8)]

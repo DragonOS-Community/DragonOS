@@ -37,6 +37,7 @@ mod sys_lseek;
 mod sys_mkdirat;
 pub mod sys_mknodat;
 mod sys_openat;
+mod sys_pivot_root;
 #[cfg(target_arch = "x86_64")]
 mod sys_poll;
 mod sys_ppoll;

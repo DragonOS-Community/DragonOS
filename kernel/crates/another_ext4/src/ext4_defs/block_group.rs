@@ -110,7 +110,7 @@ impl BlockGroupDesc {
         let mut csum = crc32(CRC32_INIT, uuid);
         csum = crc32(csum, bitmap.as_bytes());
         self.inode_bitmap_csum_lo = csum as u16;
-        self.block_bitmap_csum_hi = (csum >> 16) as u16;
+        self.inode_bitmap_csum_hi = (csum >> 16) as u16;
     }
 
     pub fn set_block_bitmap_csum(&mut self, uuid: &[u8], bitmap: &Bitmap) {

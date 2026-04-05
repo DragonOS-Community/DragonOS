@@ -161,6 +161,10 @@ pub struct Inode {
     version_hi: u32,
     /// Project id
     projid: u32,
+    /// Padding to fill the on-disk inode to 256 bytes (SB_GOOD_INODE_SIZE).
+    /// Linux ext4 computes the inode checksum over the full inode_size bytes,
+    /// so we must include this padding in the struct.
+    _padding: [u8; 256 - 160],
 }
 
 /// Because `[u8; 60]` cannot derive `Default`, we implement it manually.
@@ -192,7 +196,9 @@ impl Default for Inode {
                 l_checksum_lo: 0,
                 l_reserved: 0,
             },
-            extra_isize: (core::mem::size_of::<Inode>() - 128) as u16,
+            // extra_isize = bytes of extended inode fields beyond the 128-byte base.
+            // Our defined fields end at projid (offset 160), so 160 - 128 = 32.
+            extra_isize: 32,
             checksum_hi: 0,
             ctime_extra: 0,
             mtime_extra: 0,
@@ -201,6 +207,7 @@ impl Default for Inode {
             crtime_extra: 0,
             version_hi: 0,
             projid: 0,
+            _padding: [0u8; 256 - 160],
         }
     }
 }

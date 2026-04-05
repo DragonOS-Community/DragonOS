@@ -159,7 +159,10 @@ impl DirEntryTail {
         let mut csum = crc32(CRC32_INIT, uuid);
         csum = crc32(csum, &ino.to_le_bytes());
         csum = crc32(csum, &ino_gen.to_le_bytes());
-        self.checksum = crc32(csum, &block.data[..size_of::<DirEntryTail>()]);
+        // Hash all directory entries up to (but not including) this tail struct.
+        // Linux: csum = ext4_chksum(sbi, i_csum_seed, dirent, (char*)tail - block_start)
+        let tail_offset = BLOCK_SIZE - size_of::<DirEntryTail>();
+        self.checksum = crc32(csum, &block.data[..tail_offset]);
     }
 }
 

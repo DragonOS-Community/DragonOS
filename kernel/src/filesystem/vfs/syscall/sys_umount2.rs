@@ -2,14 +2,22 @@
 
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_UMOUNT2},
-    filesystem::vfs::{fcntl::AtFlags, utils::user_path_at, MountFS, MAX_PATHLEN},
+    filesystem::vfs::{
+        fcntl::AtFlags, utils::user_path_at, FileSystem, IndexNode, MountFS, MAX_PATHLEN,
+        VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    },
+    libs::casting::DowncastArc,
     process::ProcessManager,
     syscall::{
         table::{FormattedSyscallParam, Syscall},
         user_access,
     },
 };
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 use system_error::SystemError;
 
 /// src/linux/mount.c `umount` & `umount2`
@@ -86,30 +94,55 @@ pub fn do_umount2(
     }
 
     let (work, rest) = user_path_at(&ProcessManager::current_pcb(), dirfd, target)?;
-
-    // user_path_at 已经保证：
-    // - 绝对路径：rest 以 '/' 开头
-    // - 相对路径：rest 不以 '/' 开头，work 为 dirfd/cwd inode
-    //
-    // 因此这里不能无脑拼接 work.absolute_path()+rest，否则绝对路径会被重复前缀化，导致找不到挂载记录。
-    let path = if rest.starts_with('/') {
-        rest
-    } else {
-        let mut base = work.absolute_path()?;
-        if !base.ends_with('/') {
-            base.push('/');
-        }
-        base.push_str(&rest);
-        base
-    };
+    let target_inode = work.lookup_follow_symlink(&rest, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    let path = visible_umount_path(&target_inode)?;
 
     let result = ProcessManager::current_mntns().remove_mount(&path);
     if let Some(fs) = result {
         // Todo: 占用检测
-        fs.umount()?;
+        if let Err(err) = fs.umount() {
+            log::warn!(
+                "do_umount2: fs.umount failed for resolved='{}', fs='{}': {:?}",
+                path,
+                fs.name(),
+                err
+            );
+            return Err(err);
+        }
         return Ok(fs);
     }
+    log::warn!("do_umount2: mount_list miss for resolved='{}'", path);
     return Err(SystemError::EINVAL);
+}
+
+fn visible_umount_path(target_inode: &Arc<dyn IndexNode>) -> Result<String, SystemError> {
+    let absolute_path = target_inode.absolute_path()?;
+    let Some(target_mfs) = target_inode.fs().downcast_arc::<MountFS>() else {
+        return Ok(absolute_path);
+    };
+
+    let mount_root = target_mfs.root_inode();
+    if same_path_ref(target_inode, &mount_root) {
+        if let Some(mount_path) = ProcessManager::current_mntns()
+            .mount_list()
+            .get_mount_path_by_mountfs(&target_mfs)
+        {
+            return Ok(mount_path.as_str().to_string());
+        }
+    }
+
+    Ok(absolute_path)
+}
+
+fn same_path_ref(left: &Arc<dyn IndexNode>, right: &Arc<dyn IndexNode>) -> bool {
+    let Ok(left_meta) = left.metadata() else {
+        return false;
+    };
+    let Ok(right_meta) = right.metadata() else {
+        return false;
+    };
+
+    Arc::ptr_eq(&left.fs(), &right.fs()) && left_meta.inode_id == right_meta.inode_id
 }
 
 bitflags! {

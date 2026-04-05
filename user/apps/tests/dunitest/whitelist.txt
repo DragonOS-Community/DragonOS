@@ -4,6 +4,7 @@ demo/gtest_demo
 normal/capability
 normal/fcntl_lock
 normal/epoll_timeout_budget
+normal/test_pivot_root
 normal/test_mount_reconfigure
 fuse/fuse_core
 fuse/fuse_extended

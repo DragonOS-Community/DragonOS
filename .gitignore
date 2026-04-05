@@ -29,6 +29,3 @@ config/rootfs.generated.toml
 *.cpio.xz
 *.cpio*
 .direnv/
-__pycache__/
-*.pyc
-artifacts/

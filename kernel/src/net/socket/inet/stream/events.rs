@@ -82,7 +82,7 @@ impl TcpSocket {
                 // Self-connect is modeled by an internal receive queue. Readable becomes true
                 // when the queue has data OR after SHUT_WR (EOF). Writable depends on queue
                 // free space unless SHUT_WR (then send() returns EPIPE).
-                sc.update_io_events(&self.pollee, self.is_send_shutdown());
+                sc.update_io_events(&self.pollee);
 
                 // Match established behavior for shutdown bits.
                 if self.is_send_shutdown() {

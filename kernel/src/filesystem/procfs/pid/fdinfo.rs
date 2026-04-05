@@ -5,10 +5,13 @@
 use crate::libs::mutex::MutexGuard;
 use crate::{
     filesystem::{
-        procfs::template::{Builder, DirOps, FileOps, ProcDir, ProcDirBuilder, ProcFileBuilder},
+        procfs::{
+            pid::find_process_by_vpid,
+            template::{Builder, DirOps, FileOps, ProcDir, ProcDirBuilder, ProcFileBuilder},
+        },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    process::{ProcessControlBlock, ProcessManager, RawPid},
+    process::RawPid,
 };
 use alloc::{
     string::ToString,
@@ -25,11 +28,7 @@ pub struct FdInfoDirOps {
 }
 
 impl FdInfoDirOps {
-    pub fn new_inode(
-        process_ref: Arc<ProcessControlBlock>,
-        parent: Weak<dyn IndexNode>,
-    ) -> Arc<dyn IndexNode> {
-        let pid = process_ref.raw_pid();
+    pub fn new_inode(pid: RawPid, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
         ProcDirBuilder::new(Self { pid }, InodeMode::from_bits_truncate(0o555))
             .parent(parent)
             .volatile()
@@ -38,8 +37,8 @@ impl FdInfoDirOps {
     }
 
     /// 获取进程引用
-    fn get_process(&self) -> Option<Arc<ProcessControlBlock>> {
-        ProcessManager::find(self.pid)
+    fn get_process(&self) -> Option<Arc<crate::process::ProcessControlBlock>> {
+        find_process_by_vpid(self.pid)
     }
 }
 

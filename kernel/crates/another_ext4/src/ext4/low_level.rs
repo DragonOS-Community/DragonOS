@@ -109,9 +109,34 @@ impl Ext4 {
         }
         if let Some(size) = attr.size {
             // If size increases, allocate new blocks if needed.
-            let required_blocks = (size as usize).div_ceil(INODE_BLOCK_SIZE);
-            for _ in inode.inode.block_count()..required_blocks as u64 {
-                self.inode_append_block(&mut inode)?;
+            // Use BLOCK_SIZE (4096) units, consistent with inode_append_block.
+            let required_fs_blocks = (size as usize).div_ceil(BLOCK_SIZE) as u64;
+            // Compute data-only block count from extent tree (not from i_blocks,
+            // which may include tree metadata blocks).
+            let data_fs_blocks = self.extent_next_data_lblock(&inode)? as u64;
+            if required_fs_blocks > data_fs_blocks {
+                // debug!(
+                //     "setattr grow: ino={} size={} cur_fsblk={} req_fsblk={}",
+                //     id, size, data_fs_blocks, required_fs_blocks
+                // );
+                for i in data_fs_blocks..required_fs_blocks {
+                    if let Err(e) = self.inode_append_block(&mut inode) {
+                        debug!(
+                            "setattr: inode_append_block FAILED at block {}/{}: ino={} err={:?}",
+                            i, required_fs_blocks, id, e
+                        );
+                        return Err(e);
+                    }
+                }
+                // Recompute i_blocks: data blocks + tree metadata blocks
+                let tree_blocks = self.extent_all_tree_blocks(&inode)?.len() as u64;
+                let data_sectors = required_fs_blocks * (BLOCK_SIZE / INODE_BLOCK_SIZE) as u64;
+                let tree_sectors = tree_blocks * (BLOCK_SIZE / INODE_BLOCK_SIZE) as u64;
+                inode.inode.set_block_count(data_sectors + tree_sectors);
+                // debug!(
+                //     "setattr done: ino={} final_fsblk={}",
+                //     id, inode.inode.fs_block_count()
+                // );
             }
             inode.inode.set_size(size);
         }
@@ -126,6 +151,56 @@ impl Ext4 {
         }
         if let Some(crtime) = attr.crtime {
             inode.inode.set_crtime(crtime);
+        }
+        self.write_inode_with_csum(&mut inode)?;
+        Ok(())
+    }
+
+    /// Pre-allocate disk blocks so that the inode can hold at least `size`
+    /// bytes, **without** updating `i_size`.
+    ///
+    /// This is the first half of a two-phase write protocol:
+    ///   1. `allocate_blocks_for_write` – ensure extents exist (before page-cache write)
+    ///   2. `commit_inode_size`         – update `i_size` (after page-cache write succeeds)
+    ///
+    /// If the required blocks are already allocated this is a no-op.
+    pub fn allocate_blocks_for_write(&self, id: InodeId, size: u64) -> Result<()> {
+        let mut inode = self.read_inode(id)?;
+        if inode.inode.mode().bits() == 0 {
+            return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
+        }
+        let required_fs_blocks = (size as usize).div_ceil(BLOCK_SIZE) as u64;
+        let data_fs_blocks = self.extent_next_data_lblock(&inode)? as u64;
+        if required_fs_blocks > data_fs_blocks {
+            for i in data_fs_blocks..required_fs_blocks {
+                if let Err(e) = self.inode_append_block(&mut inode) {
+                    debug!(
+                        "allocate_blocks_for_write: FAILED at block {}/{}: ino={} err={:?}",
+                        i, required_fs_blocks, id, e
+                    );
+                    return Err(e);
+                }
+            }
+            // Recompute i_blocks: data blocks + extent-tree metadata blocks
+            let tree_blocks = self.extent_all_tree_blocks(&inode)?.len() as u64;
+            let data_sectors = required_fs_blocks * (BLOCK_SIZE / INODE_BLOCK_SIZE) as u64;
+            let tree_sectors = tree_blocks * (BLOCK_SIZE / INODE_BLOCK_SIZE) as u64;
+            inode.inode.set_block_count(data_sectors + tree_sectors);
+            self.write_inode_with_csum(&mut inode)?;
+        }
+        Ok(())
+    }
+
+    /// Commit the file size (`i_size`) and optionally `mtime` to disk,
+    /// **without** allocating any blocks.
+    ///
+    /// Call this after `allocate_blocks_for_write` + successful page-cache
+    /// write to finalise the new file size.
+    pub fn commit_inode_size(&self, id: InodeId, size: u64, mtime: Option<u32>) -> Result<()> {
+        let mut inode = self.read_inode(id)?;
+        inode.inode.set_size(size);
+        if let Some(mtime) = mtime {
+            inode.inode.set_mtime(mtime);
         }
         self.write_inode_with_csum(&mut inode)?;
         Ok(())
@@ -407,10 +482,7 @@ impl Ext4 {
             let write_len = min(BLOCK_SIZE - block_offset, write_size - cursor);
             let fblock = self.extent_query(&file, iblock)?;
             let mut block = self.read_block(fblock)?;
-            block.write_offset(
-                (offset + cursor) % BLOCK_SIZE,
-                &data[cursor..cursor + write_len],
-            );
+            block.write_offset(block_offset, &data[cursor..cursor + write_len]);
             self.write_block(&block)?;
             cursor += write_len;
             iblock += 1;
@@ -419,6 +491,55 @@ impl Ext4 {
             file.inode.set_size((offset + cursor) as u64);
         }
         self.write_inode_with_csum(&mut file)?;
+
+        Ok(cursor)
+    }
+
+    /// Write data to pre-allocated blocks without modifying inode metadata.
+    ///
+    /// This is used by page cache writeback: blocks are already allocated by
+    /// `setattr(size=...)` in the foreground `write_at` path; the writeback
+    /// thread only needs to push dirty page data to the corresponding
+    /// physical blocks.
+    ///
+    /// Unlike `write()`, this function:
+    /// - Does **not** allocate blocks (`inode_append_block`)
+    /// - Does **not** update inode size or write inode back to disk
+    /// - Returns `ENOENT` if a required logical block has no extent mapping
+    ///
+    /// This eliminates the race between foreground `setattr` block-allocation
+    /// and background writeback, which can corrupt the extent tree when both
+    /// operate on cloned `InodeRef` snapshots from the inode cache.
+    pub fn write_data_only(&self, file: InodeId, offset: usize, data: &[u8]) -> Result<usize> {
+        let file = self.read_inode(file)?;
+        if !file.inode.is_file() {
+            return_error!(ErrCode::EISDIR, "Inode {} is not a file", file.id);
+        }
+
+        let write_size = data.len();
+        let mut cursor = 0;
+        let mut iblock = (offset / BLOCK_SIZE) as LBlockId;
+        while cursor < write_size {
+            let block_offset = (offset + cursor) % BLOCK_SIZE;
+            let write_len = min(BLOCK_SIZE - block_offset, write_size - cursor);
+            match self.extent_query(&file, iblock) {
+                Ok(fblock) => {
+                    let mut block = self.read_block(fblock)?;
+                    block.write_offset(block_offset, &data[cursor..cursor + write_len]);
+                    self.write_block(&block)?;
+                }
+                Err(e) => {
+                    debug!(
+                        "write_data_only: extent_query FAILED ino={} iblock={} offset={} len={} fs_blkcnt={} size={} err={:?}",
+                        file.id, iblock, offset, write_size,
+                        file.inode.fs_block_count(), file.inode.size(), e
+                    );
+                    return Err(e);
+                }
+            }
+            cursor += write_len;
+            iblock += 1;
+        }
 
         Ok(cursor)
     }

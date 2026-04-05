@@ -173,8 +173,7 @@ fn handle_null_signal(converter: &PidConverter) -> Result<usize, SystemError> {
 
             // 直接从 Arc<Pid> 获取对应的任务，避免二次查找
             // 使用 PidType::PID 因为 kill() 接受的是 PID/TID
-            let target = pid.pid_task(PidType::PID)
-                .ok_or(SystemError::ESRCH)?;
+            let target = pid.pid_task(PidType::PID).ok_or(SystemError::ESRCH)?;
 
             // 检查权限
             check_signal_permission_pcb(&target)?;

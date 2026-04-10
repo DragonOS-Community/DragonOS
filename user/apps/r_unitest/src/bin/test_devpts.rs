@@ -52,7 +52,11 @@ fn main() {
         all_pass &= report(
             "close /dev/pts fd",
             close_ok,
-            if close_ok { "close succeeded" } else { "close failed" },
+            if close_ok {
+                "close succeeded"
+            } else {
+                "close failed"
+            },
         );
     }
 

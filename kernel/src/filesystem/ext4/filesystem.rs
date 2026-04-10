@@ -39,7 +39,10 @@ impl FileSystem for Ext4FileSystem {
     }
 
     fn info(&self) -> vfs::FsInfo {
-        todo!()
+        vfs::FsInfo {
+            blk_dev_id: self.raw_dev.data() as usize,
+            max_name_len: 255,
+        }
     }
 
     fn as_any_ref(&self) -> &dyn core::any::Any {

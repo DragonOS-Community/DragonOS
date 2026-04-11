@@ -6,5 +6,6 @@ normal/fcntl_lock
 normal/epoll_timeout_budget
 normal/test_pivot_root
 normal/test_mount_reconfigure
+normal/proc_self_limits
 fuse/fuse_core
 fuse/fuse_extended

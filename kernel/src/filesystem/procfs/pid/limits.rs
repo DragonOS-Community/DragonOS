@@ -122,7 +122,9 @@ impl LimitsFile {
         let pcb = find_process_by_vpid(self.pid).ok_or(SystemError::ESRCH)?;
 
         // 与 Linux fs/proc/base.c 的表头保持一致。
-        let mut content = String::from("Limit                     Soft Limit           Hard Limit           Units\n");
+        let mut content = String::from(
+            "Limit                     Soft Limit           Hard Limit           Units\n",
+        );
 
         for i in 0..(RLimitID::Nlimits as usize) {
             let rid = RLimitID::try_from(i)?;
@@ -136,10 +138,7 @@ impl LimitsFile {
                 let _ = writeln!(
                     content,
                     "{:<25} {:<20} {:<20} {:<10}",
-                    name.name,
-                    soft,
-                    hard,
-                    unit
+                    name.name, soft, hard, unit
                 );
             } else {
                 // Linux 对无单位项仅输出换行，保留 hard 列后的尾随空格。

@@ -354,9 +354,8 @@ pub fn cgroup_common_ancestor(left: &Arc<CgroupNode>, right: &Arc<CgroupNode>) -
 }
 //一个已经作为管理节点的node不能同时作为迁移目的地承载普通节点
 pub fn cgroup_migrate_vet_dst(dst: &Arc<CgroupNode>) -> Result<(), SystemError> {
-    // v2 no-internal-process 最小约束：
-    // 目标 cgroup 如果已经有进程并且启用了 subtree_control，则拒绝迁移。
-    if dst.has_tasks() && !dst.subtree_control().is_empty() {
+    // v2 no-internal-process 约束：只要启用了 subtree_control 就禁止迁移进程
+    if !dst.subtree_control().is_empty() {
         return Err(SystemError::EBUSY);
     }
     Ok(())

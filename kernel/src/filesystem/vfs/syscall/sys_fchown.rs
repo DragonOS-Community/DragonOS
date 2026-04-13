@@ -3,7 +3,8 @@ use system_error::SystemError;
 use crate::arch::syscall::nr::SYS_FCHOWN;
 use crate::{
     arch::interrupt::TrapFrame,
-    filesystem::vfs::open::ksys_fchown,
+    filesystem::vfs::{file::FileFlags, open::ksys_fchown},
+    process::ProcessManager,
     syscall::table::{FormattedSyscallParam, Syscall},
 };
 use alloc::vec::Vec;
@@ -19,6 +20,18 @@ impl Syscall for SysFchownHandle {
         let fd = Self::fd(args);
         let uid = Self::uid(args);
         let gid = Self::gid(args);
+
+        let binding = ProcessManager::current_pcb().fd_table();
+        let fd_table_guard = binding.read();
+        let file = fd_table_guard
+            .get_file_by_fd(fd)
+            .ok_or(SystemError::EBADF)?;
+
+        // Linux 语义：对 O_PATH fd 执行 fchown 应返回 EBADF
+        if file.flags().contains(FileFlags::O_PATH) {
+            return Err(SystemError::EBADF);
+        }
+
         ksys_fchown(fd, uid, gid)
     }
 

@@ -254,7 +254,6 @@ impl ProcessManager {
             .as_mut()
             .unwrap()
             .insert(pcb.raw_pid(), pcb.clone());
-        pcb.task_cgroup_node().add_task(pcb.raw_pid());
     }
 
     pub(crate) fn exchange_tid_and_raw_pids(
@@ -866,11 +865,7 @@ impl ProcessManager {
     pub(super) unsafe fn release(pid: RawPid) {
         let pcb = ProcessManager::find(pid);
         if let Some(ref pcb) = pcb {
-            // 必须持有 cgroup_accounting_lock 以避免与 cgroup.procs 写入死锁
-            {
-                let _cgroup_guard = crate::cgroup::cgroup_accounting_lock().lock();
-                pcb.task_cgroup_node().remove_task(pid);
-            }
+            // remove_task 已在 do_exit 中完成，此处不再重复
             // 从父进程的 children 列表中移除
             if let Some(parent) = pcb.real_parent_pcb() {
                 let parent_ns = parent.active_pid_ns();

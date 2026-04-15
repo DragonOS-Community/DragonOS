@@ -842,6 +842,7 @@ impl ProcessManager {
                 cgroup_migrate_vet_dst_with_src(&src_node, &target_node, 1)?;
                 pcb.set_task_cgroup_node_for_fork(target_node);
             }
+            pcb.task_cgroup_node().add_task(pcb.raw_pid());
             ProcessManager::add_pcb(pcb.clone());
         }
 

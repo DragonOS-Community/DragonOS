@@ -23,6 +23,7 @@ pub struct CgroupNode {
     subtree_control: RwLock<HashSet<String>>,
     pids_max: RwLock<Option<usize>>,
     pids_events_max: AtomicU64,
+    subtree_task_counter: AtomicUsize,
 }
 
 impl CgroupNode {
@@ -36,6 +37,7 @@ impl CgroupNode {
             subtree_control: RwLock::new(HashSet::new()),
             pids_max: RwLock::new(None),
             pids_events_max: AtomicU64::new(0),
+            subtree_task_counter: AtomicUsize::new(0),
         })
     }
 
@@ -49,6 +51,7 @@ impl CgroupNode {
             subtree_control: RwLock::new(HashSet::new()),
             pids_max: RwLock::new(None),
             pids_events_max: AtomicU64::new(0),
+            subtree_task_counter: AtomicUsize::new(0),
         })
     }
 
@@ -66,10 +69,20 @@ impl CgroupNode {
 
     pub fn add_task(&self, pid: RawPid) {
         self.tasks.write().insert(pid);
+        let mut cur = self.parent();
+        while let Some(node) = cur {
+            node.subtree_task_counter.fetch_add(1, Ordering::Release);
+            cur = node.parent();
+        }
     }
 
     pub fn remove_task(&self, pid: RawPid) {
         self.tasks.write().remove(&pid);
+        let mut cur = self.parent();
+        while let Some(node) = cur {
+            node.subtree_task_counter.fetch_sub(1, Ordering::Release);
+            cur = node.parent();
+        }
     }
 
     pub fn tasks(&self) -> Vec<RawPid> {
@@ -120,14 +133,9 @@ impl CgroupNode {
         self.pids_events_max.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn subtree_task_count(self: &Arc<Self>) -> usize {
-        let mut total: usize = 0;
-        let mut stack = vec![self.clone()];
-        while let Some(node) = stack.pop() {
-            total = total.saturating_add(node.tasks.read().len());
-            stack.extend(node.children());
-        }
-        total
+    pub fn subtree_task_count(&self) -> usize {
+        self.tasks.read().len()
+            .saturating_add(self.subtree_task_counter.load(Ordering::Acquire))
     }
 
     pub fn is_ancestor_of(self: &Arc<Self>, other: &Arc<Self>) -> bool {

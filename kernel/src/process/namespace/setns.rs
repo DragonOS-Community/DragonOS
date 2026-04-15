@@ -81,9 +81,6 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
 
     // 2. 解析 fd，当前仅支持 pidfd
     let current = ProcessManager::current_pcb();
-    if !current.cred().has_cap_sys_admin() {
-        return Err(SystemError::EPERM);
-    }
     let fd_table = current.fd_table();
     let file = fd_table
         .read()

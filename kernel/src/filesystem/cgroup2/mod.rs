@@ -994,25 +994,28 @@ impl IndexNode for Cgroup2Inode {
         Cgroup2Inode::prune_stale_dir_cache(&this)?;
         let child = Cgroup2Inode::lookup_child(&this, name)?;
 
-        {
+        // 先检查 child 状态，与 parent lock 解耦以避免 ABBA 死锁
+        let cgroup = {
             let inner = child.inner.lock();
             match &inner.kind {
-                Cgroup2InodeKind::Dir {
-                    cgroup,
-                    children: _children,
-                } => {
+                Cgroup2InodeKind::Dir { cgroup, .. } => {
                     if cgroup.has_children() {
                         return Err(SystemError::ENOTEMPTY);
                     }
                     if cgroup.has_tasks() {
                         return Err(SystemError::EBUSY);
                     }
-                    let parent_cgroup = this.inner.lock();
-                    if let Cgroup2InodeKind::Dir { cgroup: p, .. } = &parent_cgroup.kind {
-                        cgroup_root().remove_child(p, name)?;
-                    }
+                    cgroup.clone()
                 }
                 _ => return Err(SystemError::ENOTDIR),
+            }
+        }; // child lock 在此释放
+
+        // 再按 parent -> child 的顺序获取 parent lock 执行删除
+        {
+            let parent_cgroup = this.inner.lock();
+            if let Cgroup2InodeKind::Dir { cgroup: p, .. } = &parent_cgroup.kind {
+                cgroup_root().remove_child(p, name)?;
             }
         }
 

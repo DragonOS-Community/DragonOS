@@ -138,7 +138,9 @@ impl CgroupNode {
     }
 
     pub fn subtree_task_count(&self) -> usize {
-        self.tasks.read().len()
+        self.tasks
+            .read()
+            .len()
             .saturating_add(self.subtree_task_counter.load(Ordering::Acquire))
     }
 

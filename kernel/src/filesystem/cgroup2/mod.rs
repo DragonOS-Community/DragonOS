@@ -596,8 +596,7 @@ impl Cgroup2Inode {
     /// 判断 cgroup 及其子树是否包含任务
     /// 利用 subtree_task_counter 实现 O(1) 查询
     fn is_populated(cgroup: &Arc<CgroupNode>) -> bool {
-        cgroup.has_tasks()
-            || cgroup.subtree_task_counter().load(Ordering::Acquire) > 0
+        cgroup.has_tasks() || cgroup.subtree_task_counter().load(Ordering::Acquire) > 0
     }
 
     fn read_file(

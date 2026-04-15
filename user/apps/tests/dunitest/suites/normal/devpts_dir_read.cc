@@ -24,7 +24,10 @@ TEST(DevPtsDir, ReadReturnsEisdir) {
     errno = 0;
     ssize_t nread = read(fd, buf, sizeof(buf));
     int saved_errno = errno;
-    close(fd);
+
+    int close_ret = close(fd);
+    ASSERT_EQ(0, close_ret)
+        << "close(/dev/pts) failed: errno=" << errno << " (" << strerror(errno) << ")";
 
     EXPECT_EQ(-1, nread) << "read(/dev/pts) unexpectedly succeeded";
     EXPECT_EQ(EISDIR, saved_errno)

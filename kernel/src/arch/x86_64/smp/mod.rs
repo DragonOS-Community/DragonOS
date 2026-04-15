@@ -7,12 +7,13 @@ use core::{
 
 use kdepends::memoffset::offset_of;
 use log::debug;
+use raw_cpuid::CpuId;
 use system_error::SystemError;
 
 use crate::{
-    arch::{mm::LowAddressRemapping, process::table::TSSManager, MMArch},
+    arch::{mm::LowAddressRemapping, process::table::TSSManager, CurrentTimeArch, MMArch},
     exception::InterruptArch,
-    libs::{cpumask::CpuMask, rwlock::RwLock},
+    libs::cpumask::CpuMask,
     mm::{percpu::PerCpu, MemoryManagementArch, PhysAddr, VirtAddr, IDLE_PROCESS_ADDRESS_SPACE},
     process::ProcessManager,
     smp::{
@@ -25,9 +26,10 @@ use crate::{
 
 use super::{
     acpi::early_acpi_boot_init,
-    interrupt::ipi::{ipi_send_smp_init, ipi_send_smp_startup},
+    interrupt::ipi::{ipi_send_smp_init, ipi_send_smp_init_deassert, ipi_send_smp_startup},
     CurrentIrqArch,
 };
+use crate::time::TimeArch;
 
 extern "C" {
     /// AP处理器启动时，会将CR3设置为这个值
@@ -37,6 +39,10 @@ extern "C" {
 }
 
 pub(super) static X86_64_SMP_MANAGER: X86_64SmpManager = X86_64SmpManager::new();
+
+const AP_INIT_ASSERT_DELAY_NS_LEGACY: usize = 10_000_000;
+const AP_STARTUP_RETRY_DELAY_NS_MODERN: usize = 20_000;
+const AP_STARTUP_RETRY_DELAY_NS_LEGACY: usize = 500_000;
 
 #[repr(C)]
 struct ApStartStackInfo {
@@ -110,6 +116,10 @@ impl SmpBootData {
         self.cpu_count
     }
 
+    pub fn is_initialized(&self) -> bool {
+        self.initialized.load(Ordering::SeqCst)
+    }
+
     /// 获取CPU的物理ID
     pub fn phys_id(&self, cpu_id: usize) -> usize {
         self.phys_id[cpu_id]
@@ -149,7 +159,7 @@ pub static SMP_BOOT_DATA: SmpBootData = SmpBootData {
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct X86_64SmpManager {
-    ia64_cpu_to_sapicid: RwLock<[Option<usize>; PerCpu::MAX_CPU_NUM as usize]>,
+    _reserved: (),
 }
 
 impl X86_64SmpManager {
@@ -158,15 +168,11 @@ impl X86_64SmpManager {
     /// 注：由于该函数只在编译时被调用，因此 `#[allow(clippy::large_stack_frames)]` 是安全的。
     #[allow(clippy::large_stack_frames)]
     const fn new() -> Self {
-        return Self {
-            ia64_cpu_to_sapicid: RwLock::new([None; PerCpu::MAX_CPU_NUM as usize]),
-        };
+        return Self { _reserved: () };
     }
 
     /// initialize the logical cpu number to APIC ID mapping
     pub fn build_cpu_map(&self) -> Result<(), SystemError> {
-        // 参考：https://code.dragonos.org.cn/xref/linux-6.1.9/arch/ia64/kernel/smpboot.c?fi=smp_build_cpu_map#496
-        // todo!("build_cpu_map")
         unsafe {
             smp_cpu_manager().set_possible_cpu(ProcessorId::new(0), true);
             smp_cpu_manager().set_present_cpu(ProcessorId::new(0), true);
@@ -218,12 +224,17 @@ impl SMPArch for X86_64SMPArch {
 
     fn start_cpu(cpu_id: ProcessorId, _cpu_hpstate: &CpuHpCpuState) -> Result<(), SystemError> {
         Self::copy_smp_start_code();
+        let init_assert_delay_ns = Self::ap_init_assert_delay_ns();
 
         fence(Ordering::SeqCst);
-        ipi_send_smp_init();
+        ipi_send_smp_init(cpu_id)?;
+        Self::busy_wait_ns(init_assert_delay_ns);
+        fence(Ordering::SeqCst);
+        ipi_send_smp_init_deassert(cpu_id)?;
         fence(Ordering::SeqCst);
         ipi_send_smp_startup(cpu_id)?;
 
+        Self::busy_wait_ns(Self::startup_retry_delay_ns(init_assert_delay_ns));
         fence(Ordering::SeqCst);
         ipi_send_smp_startup(cpu_id)?;
 
@@ -235,6 +246,49 @@ impl SMPArch for X86_64SMPArch {
 
 impl X86_64SMPArch {
     const SMP_CODE_START: usize = 0x20000;
+
+    #[inline(always)]
+    fn ap_init_assert_delay_ns() -> usize {
+        let cpuid = CpuId::new();
+        let Some(feature_info) = cpuid.get_feature_info() else {
+            return AP_INIT_ASSERT_DELAY_NS_LEGACY;
+        };
+        let Some(vendor_info) = cpuid.get_vendor_info() else {
+            return AP_INIT_ASSERT_DELAY_NS_LEGACY;
+        };
+
+        let family_id = feature_info.family_id() as u32;
+        let display_family = if family_id == 0x0f {
+            family_id + feature_info.extended_family_id() as u32
+        } else {
+            family_id
+        };
+
+        match vendor_info.as_str() {
+            "GenuineIntel" if display_family == 0x06 => 0,
+            "AuthenticAMD" if display_family >= 0x0f => 0,
+            "HygonGenuine" if display_family >= 0x18 => 0,
+            _ => AP_INIT_ASSERT_DELAY_NS_LEGACY,
+        }
+    }
+
+    #[inline(always)]
+    fn startup_retry_delay_ns(init_assert_delay_ns: usize) -> usize {
+        if init_assert_delay_ns == 0 {
+            AP_STARTUP_RETRY_DELAY_NS_MODERN
+        } else {
+            AP_STARTUP_RETRY_DELAY_NS_LEGACY
+        }
+    }
+
+    #[inline(always)]
+    fn busy_wait_ns(ns: usize) {
+        let expire = CurrentTimeArch::cal_expire_cycles(ns);
+        while CurrentTimeArch::get_cycles() < expire {
+            spin_loop();
+        }
+    }
+
     /// 复制SMP启动代码到0x20000处
     fn copy_smp_start_code() -> (VirtAddr, usize) {
         let apu_boot_size = Self::start_code_size();

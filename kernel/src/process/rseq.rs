@@ -17,9 +17,9 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use system_error::SystemError;
 
 use crate::{
-    arch::cpu::current_cpu_id,
     mm::VirtAddr,
     process::{ProcessControlBlock, ProcessFlags, ProcessManager},
+    smp::core::smp_get_processor_id,
 };
 
 // ============================================================================
@@ -582,7 +582,7 @@ impl Rseq {
         }
 
         // 更新 cpu_id 等字段
-        let cpu_id = current_cpu_id().data() as u32;
+        let cpu_id = smp_get_processor_id().data() as u32;
         if let Err(_e) = unsafe { access.update_cpu_node_id(cpu_id, 0, 0) } {
             // log::debug!("rseq update_cpu_node_id failed: {:?}", e);
             Self::disable_current_rseq_after_fault(&pcb);

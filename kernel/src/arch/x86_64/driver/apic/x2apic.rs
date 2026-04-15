@@ -1,9 +1,12 @@
-use core::sync::atomic::{fence, Ordering};
+use core::{
+    hint::spin_loop,
+    sync::atomic::{fence, Ordering},
+};
 
 use log::info;
 use x86::msr::{
-    rdmsr, wrmsr, IA32_APIC_BASE, IA32_X2APIC_APICID, IA32_X2APIC_EOI, IA32_X2APIC_SIVR,
-    IA32_X2APIC_VERSION,
+    rdmsr, wrmsr, IA32_APIC_BASE, IA32_X2APIC_APICID, IA32_X2APIC_EOI, IA32_X2APIC_ICR,
+    IA32_X2APIC_SIVR, IA32_X2APIC_VERSION,
 };
 
 use super::{hw_irq::ApicId, LVTRegister, LocalAPIC, LVT};
@@ -121,6 +124,14 @@ impl LocalAPIC for X2Apic {
     }
 
     fn write_icr(&self, icr: x86::apic::Icr) {
-        unsafe { wrmsr(0x830, ((icr.upper() as u64) << 32) | icr.lower() as u64) };
+        unsafe {
+            wrmsr(
+                IA32_X2APIC_ICR,
+                ((icr.upper() as u64) << 32) | icr.lower() as u64,
+            );
+            while ((rdmsr(IA32_X2APIC_ICR) >> 12) & 0x1) != 0 {
+                spin_loop();
+            }
+        };
     }
 }

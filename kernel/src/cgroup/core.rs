@@ -133,6 +133,10 @@ impl CgroupNode {
         self.pids_events_max.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn subtree_task_counter(&self) -> &AtomicUsize {
+        &self.subtree_task_counter
+    }
+
     pub fn subtree_task_count(&self) -> usize {
         self.tasks.read().len()
             .saturating_add(self.subtree_task_counter.load(Ordering::Acquire))

@@ -4,6 +4,7 @@ use alloc::{
     vec::Vec,
 };
 use core::any::Any;
+use core::sync::atomic::Ordering;
 
 use hashbrown::{HashMap, HashSet};
 use system_error::SystemError;
@@ -592,33 +593,11 @@ impl Cgroup2Inode {
     /// Check if a cgroup has any tasks or populated descendants.
     ///
     /// Uses depth-limited recursion to prevent stack overflow.
-    /// Maximum recursion depth is set to 128 levels, which is far beyond any
-    /// reasonable cgroup hierarchy depth.
+    /// 判断 cgroup 及其子树是否包含任务
+    /// 利用 subtree_task_counter 实现 O(1) 查询
     fn is_populated(cgroup: &Arc<CgroupNode>) -> bool {
-        const MAX_DEPTH: usize = 128;
-        Self::is_populated_helper(cgroup, MAX_DEPTH)
-    }
-
-    fn is_populated_helper(cgroup: &Arc<CgroupNode>, depth: usize) -> bool {
-        // Depth limit to prevent stack overflow
-        if depth == 0 {
-            return false;
-        }
-
-        // Check if this cgroup has tasks
-        if cgroup.has_tasks() {
-            return true;
-        }
-
-        // Recursively check children using direct child references instead of
-        // path-based lookup to avoid issues with path resolution
-        for child in cgroup.children() {
-            if Self::is_populated_helper(&child, depth - 1) {
-                return true;
-            }
-        }
-
-        false
+        cgroup.has_tasks()
+            || cgroup.subtree_task_counter().load(Ordering::Acquire) > 0
     }
 
     fn read_file(
@@ -995,7 +974,7 @@ impl IndexNode for Cgroup2Inode {
         let child = Cgroup2Inode::lookup_child(&this, name)?;
 
         // 先检查 child 状态，与 parent lock 解耦以避免 ABBA 死锁
-        let cgroup = {
+        let _cgroup = {
             let inner = child.inner.lock();
             match &inner.kind {
                 Cgroup2InodeKind::Dir { cgroup, .. } => {

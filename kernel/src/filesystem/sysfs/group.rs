@@ -97,7 +97,7 @@ impl SysFS {
 
         if let Err(e) = self.group_create_files(parent_inode.clone(), kobj, group, update) {
             if group.name().is_some() {
-                parent_inode.remove_recursive();
+                parent_inode.remove_inode_include_self();
             }
             return Err(e);
         }
@@ -148,7 +148,7 @@ impl SysFS {
         self.group_remove_files(&parent_inode, group);
 
         if group.name().is_some() {
-            parent_inode.remove_recursive();
+            parent_inode.remove_inode_include_self();
         }
 
         return Ok(());

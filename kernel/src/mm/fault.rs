@@ -12,7 +12,7 @@ use crate::{
     libs::align::align_down,
     mm::{
         page::{page_manager_lock, EntryFlags},
-        ucontext::LockedVMA,
+        ucontext::{AddressSpace, LockedVMA},
         VirtAddr, VmFaultReason, VmFlags,
     },
     process::{ProcessManager, ProcessState},
@@ -58,6 +58,10 @@ pub struct PageFaultMessage<'a> {
     page: Option<Arc<Page>>,
     /// 写时拷贝需要的页面
     cow_page: Option<Arc<Page>>,
+    /// 缺页所属的地址空间。
+    ///
+    /// do_wp_page 等在修改 PTE 后需要走 mm-aware shootdown 的路径要依赖它（`AddressSpace::flush_tlb_range`）。
+    mm: Arc<AddressSpace>,
 }
 
 impl<'a> PageFaultMessage<'a> {
@@ -66,6 +70,7 @@ impl<'a> PageFaultMessage<'a> {
         address: VirtAddr,
         flags: FaultFlags,
         mapper: &'a mut PageMapper,
+        mm: Arc<AddressSpace>,
     ) -> Self {
         let guard = vma.lock();
         let backing_pgoff = guard.backing_page_offset().map(|backing_page_offset| {
@@ -80,6 +85,7 @@ impl<'a> PageFaultMessage<'a> {
             page: None,
             mapper,
             cow_page: None,
+            mm,
         }
     }
 
@@ -105,6 +111,12 @@ impl<'a> PageFaultMessage<'a> {
     #[allow(dead_code)]
     pub fn flags(&self) -> FaultFlags {
         self.flags
+    }
+
+    /// 缺页所属的地址空间。
+    #[inline(always)]
+    pub fn mm(&self) -> &Arc<AddressSpace> {
+        &self.mm
     }
 }
 
@@ -470,6 +482,7 @@ impl PageFaultHandler {
     pub unsafe fn do_wp_page(pfm: &mut PageFaultMessage) -> VmFaultReason {
         let address = pfm.address_aligned_down();
         let vma = pfm.vma.clone();
+        let mm = pfm.mm().clone();
         let mapper = &mut pfm.mapper;
 
         let old_paddr = mapper.translate(address).unwrap().0;
@@ -481,8 +494,15 @@ impl PageFaultHandler {
         let mut entry = mapper.get_entry(address, 0).unwrap();
         let new_flags = entry.flags().set_write(true).set_dirty(true);
 
+        // 统一为 do_wp_page 所有分支做 mm-aware shootdown：
+        // 这里的 `mm` 可能被多个线程/CPU 共享（CLONE_VM / CLONE_THREAD），
+        // 任何修改 PTE（RO -> RW 或替换物理页）的分支都必须让远端 CPU 同步失效旧 TLB。
+        // 旧的本地 `invlpg` / 无 flush 写法会让其他 CPU 继续持有旧翻译，
+        // 导致错误的重复写保护 fault 或访问到已被替换的旧物理页（风险 4 残留）。
+        let end = VirtAddr::new(address.data() + MMArch::PAGE_SIZE);
+
         if vma.lock().vm_flags().contains(VmFlags::VM_SHARED) {
-            // 共享映射，直接修改页表项保护位，标记为脏页
+            // 共享映射：原地升级 PTE 为可写，并标记脏。
             let table = mapper.get_table(address, 0).unwrap();
             let i = table.index_of(address).unwrap();
             entry.set_flags(new_flags);
@@ -495,24 +515,33 @@ impl PageFaultHandler {
                 }
             }
 
+            // PTE 从 RO 升级为 RW：其他 CPU 持有的 RO 缓存会导致它们访问时触发虚假写保护 fault，
+            // 必须 mm-aware shootdown 让其它 CPU 重新 walk 最新 PTE。
+            mm.flush_tlb_range(address, end, MMArch::PAGE_SHIFT as u8, false);
             VmFaultReason::VM_FAULT_COMPLETED
         } else if vma.is_anonymous() {
             // 私有匿名映射，根据引用计数判断是否拷贝页面
             if map_count == 1 {
+                // 只剩当前 mm 引用该页：直接原地升级为可写。
+                // 注意：这里 `map_count == 1` 仅代表“只有一个 VMA 在 rmap 链上映射到该物理页”，
+                // 不代表“只有一个 CPU 在运行这个 mm”，所以仍然需要 mm-aware shootdown。
                 let table = mapper.get_table(address, 0).unwrap();
                 let i = table.index_of(address).unwrap();
                 entry.set_flags(new_flags);
                 table.set_entry(i, entry);
+
+                mm.flush_tlb_range(address, end, MMArch::PAGE_SHIFT as u8, false);
                 VmFaultReason::VM_FAULT_COMPLETED
             } else if let Some(flush) = mapper.map(address, new_flags) {
                 let mut page_manager_guard = page_manager_lock();
                 let old_page = page_manager_guard.get_unwrap(&old_paddr);
                 old_page.write().remove_vma(&vma);
-                // drop(page_manager_guard);
 
-                flush.flush();
+                // 替换为新的物理页：必须先让其他 CPU 的 TLB 失效，
+                // 才能保证它们不会再通过旧 TLB 访问旧物理页。
+                // SAFETY: 后续 mm.flush_tlb_range 会做 mm-aware 远端 + 本地 shootdown。
+                unsafe { flush.ignore() };
                 let paddr = mapper.translate(address).unwrap().0;
-                // let mut page_manager_guard = page_manager_lock();
                 let page = page_manager_guard.get_unwrap(&paddr);
                 page.write().insert_vma(vma.clone());
 
@@ -521,6 +550,8 @@ impl PageFaultHandler {
                     MMArch::PAGE_SIZE,
                 );
 
+                drop(page_manager_guard);
+                mm.flush_tlb_range(address, end, MMArch::PAGE_SHIFT as u8, false);
                 VmFaultReason::VM_FAULT_COMPLETED
             } else {
                 VmFaultReason::VM_FAULT_OOM
@@ -531,11 +562,10 @@ impl PageFaultHandler {
                 let mut page_manager_guard = page_manager_lock();
                 let old_page = page_manager_guard.get_unwrap(&old_paddr);
                 old_page.write().remove_vma(&vma);
-                // drop(page_manager_guard);
 
-                flush.flush();
+                // SAFETY: 后续 mm.flush_tlb_range 会做 mm-aware 远端 + 本地 shootdown。
+                unsafe { flush.ignore() };
                 let paddr = mapper.translate(address).unwrap().0;
-                // let mut page_manager_guard = page_manager_lock();
                 let page = page_manager_guard.get_unwrap(&paddr);
                 page.write().insert_vma(vma.clone());
 
@@ -544,6 +574,8 @@ impl PageFaultHandler {
                     MMArch::PAGE_SIZE,
                 );
 
+                drop(page_manager_guard);
+                mm.flush_tlb_range(address, end, MMArch::PAGE_SHIFT as u8, false);
                 VmFaultReason::VM_FAULT_COMPLETED
             } else {
                 VmFaultReason::VM_FAULT_OOM

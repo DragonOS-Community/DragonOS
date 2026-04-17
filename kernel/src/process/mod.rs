@@ -712,6 +712,23 @@ impl ProcessManager {
 
             // 注意：exit_files() 可能会触发阻塞（例如关闭 FUSE fd 需要等待 daemon 回复），
             // 因此不能在它之前清空 user_vm，否则后续调度切换会遇到 user_vm==None 的普通进程并崩溃。
+            //
+            // INV-1: Before releasing the hold on user_vm, clear this CPU from the mm's active_cpus,
+            // otherwise after the mm is freed (Arc count reaches zero) a stale per-CPU cpumask bit
+            // will remain, and subsequent flushes by other threads on the same mm would still target
+            // this CPU and send spurious IPIs.
+            //
+            // Note that this CPU's hardware page table still points to this mm, but __schedule will
+            // immediately switch to idle, whose IDLE_PROCESS_ADDRESS_SPACE will re-set this CPU's
+            // active_cpus bit and write the correct per-CPU TlbState. So clearing the old mm's bit
+            // here is sufficient.
+            {
+                let cpu = smp_get_processor_id();
+                if let Some(old_vm) = pcb.basic().user_vm() {
+                    old_vm.active_cpus_clear(cpu);
+                }
+            }
+
             unsafe { pcb.basic_mut().set_user_vm(None) };
 
             drop(pcb);

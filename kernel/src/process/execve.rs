@@ -181,9 +181,20 @@ fn do_execve_switch_user_vm(new_vm: Arc<AddressSpace>) -> Option<Arc<AddressSpac
     let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     let pcb = ProcessManager::current_pcb();
 
+    let cpu = crate::smp::core::smp_get_processor_id();
+
     let mut basic_info = pcb.basic_mut();
     // 暂存原本的用户地址空间的引用(因为如果在切换页表之前释放了它，可能会造成内存use after free)
     let old_address_space = basic_info.user_vm();
+
+    // INV-1: when execve switches mm, first clear this CPU from the old mm's active_cpus,
+    // then switch the hardware page table, then add this CPU to the new mm's active_cpus,
+    // and finally update per-CPU TlbState.
+    // Note: on the execve path the old/new mm are always different (the new mm is a freshly
+    // created AddressSpace::new result).
+    if let Some(old_vm) = old_address_space.as_ref() {
+        old_vm.active_cpus_clear(cpu);
+    }
 
     // 在pcb中原来的用户地址空间
     unsafe {
@@ -204,6 +215,9 @@ fn do_execve_switch_user_vm(new_vm: Arc<AddressSpace>) -> Option<Arc<AddressSpac
 
     // 切换到新的用户地址空间
     unsafe { new_vm.make_current() };
+
+    new_vm.active_cpus_set(cpu);
+    unsafe { crate::mm::tlb::tlb_state_set_loaded_mm(new_vm.clone()) };
 
     drop(irq_guard);
 

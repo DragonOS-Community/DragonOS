@@ -8,6 +8,7 @@ normal/devpts_dir_read
 normal/test_pivot_root
 normal/test_mount_reconfigure
 normal/proc_self_limits
+normal/test_tlb_shootdown
 fuse/fuse_core
 fuse/fuse_extended
 normal/test_procfs_link

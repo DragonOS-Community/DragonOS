@@ -6,6 +6,7 @@ use core::{
 use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
+    libs::cpumask::CpuMask,
     mm::{percpu::PerCpu, VirtAddr, IDLE_PROCESS_ADDRESS_SPACE},
     process::KernelStack,
     sched::{cpu_rq, OnRq},
@@ -61,6 +62,9 @@ impl ProcessManager {
 
             assert!(idle_pcb.sched_info().on_cpu().is_none());
             idle_pcb.sched_info().set_on_cpu(Some(ProcessorId::new(i)));
+            idle_pcb
+                .sched_info()
+                .set_cpus_allowed(CpuMask::from_cpu(ProcessorId::new(i)));
             *idle_pcb.sched_info().sched_policy.write_irqsave() = crate::sched::SchedPolicy::IDLE;
 
             let rq = cpu_rq(i as usize);

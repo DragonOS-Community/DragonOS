@@ -12,3 +12,4 @@ normal/test_tlb_shootdown
 fuse/fuse_core
 fuse/fuse_extended
 normal/test_procfs_link
+normal/sched_affinity

@@ -547,6 +547,12 @@ impl ProcessManager {
                 current_pcb.raw_pid(), pcb.raw_pid(), e
             )
         });
+        // pid 0 是 bootstrap idle 线程。它的 affinity 可能是“当前 CPU only”，
+        // 但普通任务不能把这份临时/per-cpu mask 当作默认继承下来。
+        if current_pcb.raw_pid() != RawPid(0) {
+            pcb.sched_info()
+                .set_cpus_allowed(current_pcb.sched_info().cpus_allowed());
+        }
 
         // 拷贝标志位
         Self::copy_flags(&clone_flags, pcb).unwrap_or_else(|e| {

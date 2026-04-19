@@ -43,9 +43,9 @@ impl KernelThreadMechanism {
             e
         })?;
 
-        ProcessManager::find(pid)
-            .unwrap()
-            .set_name(info.name().clone());
+        let pcb = ProcessManager::find(pid).unwrap();
+        pcb.set_name(info.name().clone());
+        info.setup_pcb(&pcb);
 
         return Ok(pid);
     }

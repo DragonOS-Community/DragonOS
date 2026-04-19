@@ -129,7 +129,7 @@ impl<const N: usize, const M: usize> BitMapOps<usize> for StaticBitmap<N, M> {
     unsafe fn as_bytes(&self) -> &[u8] {
         core::slice::from_raw_parts(
             self.data.as_ptr() as *const u8,
-            core::mem::size_of::<Self>(),
+            self.data.len() * core::mem::size_of::<usize>(),
         )
     }
 

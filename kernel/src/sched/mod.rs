@@ -391,10 +391,6 @@ impl CpuRunQueue {
         (self.force_mut_locked(), guard)
     }
 
-    fn lock(&self) -> SpinLockGuard<'_, ()> {
-        self.lock.lock_irqsave()
-    }
-
     #[allow(clippy::mut_from_ref)]
     fn force_mut(&self) -> &mut Self {
         unsafe { (self as *const Self as *mut Self).as_mut().unwrap() }
@@ -664,6 +660,9 @@ impl CpuRunQueue {
     pub fn sub_nr_running(&mut self, count: usize) {
         self.nr_running -= count;
         loadavg::dec_nr_running(count);
+        if self.nr_running < 2 && self.overload {
+            self.overload = false;
+        }
     }
 
     pub fn dec_nr_uninterruptible(&mut self) {
@@ -1135,4 +1134,31 @@ pub fn sched_yield() {
     drop(preempt_guard);
 
     schedule(SchedMode::SM_NONE);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::loadavg;
+    use crate::sched::CpuRunQueue;
+    use crate::smp::cpu::ProcessorId;
+
+    #[test]
+    fn rq_overload_clears_after_nr_running_drops_below_two() {
+        let mut rq = CpuRunQueue::new(ProcessorId::new(0));
+        let global_before = loadavg::nr_running();
+
+        rq.add_nr_running(2);
+        assert!(rq.overload);
+        assert_eq!(rq.nr_running, 2);
+
+        rq.sub_nr_running(1);
+        assert!(!rq.overload);
+        assert_eq!(rq.nr_running, 1);
+
+        assert_eq!(loadavg::nr_running(), global_before + 1);
+
+        rq.sub_nr_running(1);
+        assert_eq!(rq.nr_running, 0);
+        assert_eq!(loadavg::nr_running(), global_before);
+    }
 }

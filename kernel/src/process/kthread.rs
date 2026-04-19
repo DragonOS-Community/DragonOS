@@ -17,9 +17,10 @@ use crate::{
     arch::CurrentIrqArch,
     exception::{irqdesc::IrqAction, InterruptArch},
     init::initial_kthread::{initial_kernel_thread, set_system_state, SystemState},
-    libs::{once::Once, spinlock::SpinLock},
+    libs::{cpumask::CpuMask, once::Once, spinlock::SpinLock},
     process::{ProcessManager, ProcessState},
     sched::{schedule, SchedMode},
+    smp::cpu::ProcessorId,
 };
 
 use super::{fork::CloneFlags, ProcessControlBlock, ProcessFlags, RawPid};
@@ -137,6 +138,8 @@ pub struct KernelThreadCreateInfo {
     self_ref: Weak<Self>,
     /// 如果该值为true在进入bootstrap stage2之后，就会进入睡眠状态
     to_mark_sleep: AtomicBool,
+    flags: SpinLock<KernelThreadFlags>,
+    bound_cpu: SpinLock<Option<ProcessorId>>,
 }
 
 #[atomic_enum]
@@ -158,6 +161,8 @@ impl KernelThreadCreateInfo {
             has_unsafe_arc_instance: AtomicBool::new(false),
             self_ref: Weak::new(),
             to_mark_sleep: AtomicBool::new(true),
+            flags: SpinLock::new(KernelThreadFlags::empty()),
+            bound_cpu: SpinLock::new(None),
         });
         let tmp = result.clone();
         unsafe {
@@ -256,6 +261,39 @@ impl KernelThreadCreateInfo {
 
     pub fn to_mark_sleep(&self) -> bool {
         self.to_mark_sleep.load(Ordering::SeqCst)
+    }
+
+    pub fn set_per_cpu(&self, cpu: ProcessorId) -> Result<(), SystemError> {
+        let result_guard = self.result_pcb.lock();
+        if result_guard.is_some() {
+            return Err(SystemError::EINVAL);
+        }
+        drop(result_guard);
+
+        self.flags.lock().insert(KernelThreadFlags::IS_PER_CPU);
+        *self.bound_cpu.lock() = Some(cpu);
+        Ok(())
+    }
+
+    pub fn setup_pcb(&self, pcb: &Arc<ProcessControlBlock>) {
+        let flags = *self.flags.lock();
+        if flags.is_empty() {
+            return;
+        }
+
+        let mut worker_private_guard = pcb.worker_private();
+        let worker_private = worker_private_guard
+            .as_mut()
+            .and_then(|x| x.kernel_thread_mut())
+            .expect("kthread create: missing worker_private");
+        worker_private.flags |= flags;
+        drop(worker_private_guard);
+
+        if flags.contains(KernelThreadFlags::IS_PER_CPU) {
+            let cpu = (*self.bound_cpu.lock())
+                .expect("kthread create: per-cpu thread missing target cpu");
+            pcb.sched_info().set_cpus_allowed(CpuMask::from_cpu(cpu));
+        }
     }
 }
 

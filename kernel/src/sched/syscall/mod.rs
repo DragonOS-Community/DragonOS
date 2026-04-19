@@ -4,4 +4,4 @@ mod sys_pause;
 mod sys_sched_getparam;
 mod sys_sched_getscheduler;
 mod sys_sched_yield;
-mod util;
+pub(crate) mod util;

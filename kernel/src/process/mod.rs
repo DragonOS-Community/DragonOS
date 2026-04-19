@@ -41,6 +41,7 @@ use crate::{
     },
     libs::{
         align::AlignedBox,
+        cpumask::CpuMask,
         futex::{
             constant::{FutexFlag, FUTEX_BITSET_MATCH_ANY},
             futex::{Futex, RobustListHead},
@@ -2364,6 +2365,8 @@ pub struct ProcessSchedulerInfo {
     /// cfs调度实体
     pub sched_entity: Arc<FairSchedEntity>,
     pub on_rq: SpinLock<OnRq>,
+    pub cpus_allowed: SpinLock<CpuMask>,
+    pub nr_cpus_allowed: AtomicUsize,
 
     pub prio_data: RwLock<PrioData>,
 }
@@ -2430,9 +2433,21 @@ impl InnerSchedInfo {
 }
 
 impl ProcessSchedulerInfo {
+    fn default_cpus_allowed() -> CpuMask {
+        if crate::smp::cpu::smp_cpu_manager_initialized() {
+            return crate::smp::cpu::smp_cpu_manager().possible_cpus().clone();
+        }
+
+        // 进程管理初始化早于 SMP 拓扑初始化。此时先退化为“当前引导 CPU 可运行”，
+        // 待后续显式初始化（如 idle/per-cpu kthread）再收敛到更精确的 mask。
+        CpuMask::from_cpu(current_cpu_id())
+    }
+
     #[inline(never)]
     pub fn new(on_cpu: Option<ProcessorId>) -> Self {
         let cpu_id = on_cpu.unwrap_or(ProcessorId::INVALID);
+        let cpus_allowed = Self::default_cpus_allowed();
+        let nr_cpus_allowed = cpus_allowed.iter_cpu().count();
         return Self {
             on_cpu: AtomicProcessorId::new(cpu_id),
             // migrate_to: AtomicProcessorId::new(ProcessorId::INVALID),
@@ -2447,6 +2462,8 @@ impl ProcessSchedulerInfo {
             sched_policy: RwLock::new(crate::sched::SchedPolicy::CFS),
             sched_entity: FairSchedEntity::new(),
             on_rq: SpinLock::new(OnRq::None),
+            cpus_allowed: SpinLock::new(cpus_allowed),
+            nr_cpus_allowed: AtomicUsize::new(nr_cpus_allowed),
             prio_data: RwLock::new(PrioData::default()),
         };
     }
@@ -2554,6 +2571,21 @@ impl ProcessSchedulerInfo {
 
     pub fn prio_data(&self) -> RwLockReadGuard<'_, PrioData> {
         return self.prio_data.read_irqsave();
+    }
+
+    pub fn cpus_allowed(&self) -> CpuMask {
+        return self.cpus_allowed.lock_irqsave().clone();
+    }
+
+    pub fn nr_cpus_allowed(&self) -> usize {
+        return self.nr_cpus_allowed.load(Ordering::SeqCst);
+    }
+
+    pub fn set_cpus_allowed(&self, cpus_allowed: CpuMask) {
+        let nr_cpus_allowed = cpus_allowed.iter_cpu().count();
+        *self.cpus_allowed.lock_irqsave() = cpus_allowed;
+        self.nr_cpus_allowed
+            .store(nr_cpus_allowed, Ordering::SeqCst);
     }
 }
 

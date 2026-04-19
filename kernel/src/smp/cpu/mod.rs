@@ -23,6 +23,11 @@ impl ProcessorId {
 static mut SMP_CPU_MANAGER: Option<SmpCpuManager> = None;
 
 #[inline]
+pub fn smp_cpu_manager_initialized() -> bool {
+    unsafe { SMP_CPU_MANAGER.is_some() }
+}
+
+#[inline]
 pub fn smp_cpu_manager() -> &'static SmpCpuManager {
     unsafe { SMP_CPU_MANAGER.as_ref().unwrap() }
 }

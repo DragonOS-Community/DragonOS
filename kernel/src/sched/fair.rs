@@ -1105,7 +1105,7 @@ impl CfsRunQueue {
 
         if se.is_task() {
             let rq = self.rq();
-            let (rq, _guard) = rq.self_lock();
+            let rq = rq.force_mut_locked();
             // TODO:numa
             rq.cfs_tasks.push_back(se.clone());
         }
@@ -1120,7 +1120,7 @@ impl CfsRunQueue {
 
         if se.is_task() {
             let rq = self.rq();
-            let (rq, _guard) = rq.self_lock();
+            let rq = rq.force_mut_locked();
 
             // TODO:numa
             let _ = rq.cfs_tasks.extract_if(|x| Arc::ptr_eq(x, se));

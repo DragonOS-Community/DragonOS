@@ -504,6 +504,46 @@ impl CpuRunQueue {
         }
     }
 
+    /// 远端 wakeup/策略调整场景下的保守抢占检查。
+    ///
+    /// Linux 会在持有目标 rq 锁且目标 rq 时钟已更新后执行完整的 wakeup-preempt 检查。
+    /// 当前明确禁止跨核 `update_rq_clock()`，因此远端路径只能保留那些不依赖
+    /// `rq.clock_task` 最新值的抢占决策：
+    /// - 更高调度类抢占；
+    /// - FIFO 优先级抢占；
+    /// - idle 被非 idle 任务抢占。
+    ///
+    /// CFS 的 wakeup-preempt 需要像 Linux `check_preempt_wakeup()` 一样先更新当前实体，
+    /// 这在远端场景会重新引入“错误 CPU 更新目标 rq 时钟”的问题，因此这里故意跳过。
+    #[allow(clippy::comparison_chain)]
+    pub fn check_preempt_remote(&mut self, pcb: &Arc<ProcessControlBlock>, flags: WakeupFlags) {
+        let current = self.current();
+        let current_policy = current.sched_info().policy();
+        let next_policy = pcb.sched_info().policy();
+
+        if current.flags().contains(ProcessFlags::NEED_SCHEDULE) {
+            return;
+        }
+
+        if next_policy < current_policy {
+            self.resched_current();
+        } else if next_policy == current_policy {
+            match current_policy {
+                SchedPolicy::CFS => {}
+                SchedPolicy::FIFO => FifoScheduler::check_preempt_currnet(self, pcb, flags),
+                SchedPolicy::RT => todo!(),
+                SchedPolicy::IDLE => IdleScheduler::check_preempt_currnet(self, pcb, flags),
+            }
+        }
+
+        if *self.current().sched_info().on_rq.lock_irqsave() == OnRq::Queued
+            && self.current().flags().contains(ProcessFlags::NEED_SCHEDULE)
+        {
+            self.clock_updata_flags
+                .insert(ClockUpdataFlag::RQCF_REQ_SKIP);
+        }
+    }
+
     /// 禁用一个任务，将离开队列
     pub fn deactivate_task(&mut self, pcb: Arc<ProcessControlBlock>, flags: DequeueFlag) {
         if flags.contains(DequeueFlag::DEQUEUE_SLEEP)
@@ -546,6 +586,12 @@ impl CpuRunQueue {
 
     /// 更新rq时钟
     pub fn update_rq_clock(&mut self) {
+        debug_assert_eq!(
+            self.cpu,
+            smp_get_processor_id(),
+            "update_rq_clock must run on its own cpu"
+        );
+
         // 需要跳过这次时钟更新
         if self
             .clock_updata_flags

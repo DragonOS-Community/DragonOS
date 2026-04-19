@@ -124,6 +124,15 @@ impl<'a> PageFaultMessage<'a> {
 pub struct PageFaultHandler;
 
 impl PageFaultHandler {
+    fn file_page_cache(
+        pfm: &PageFaultMessage<'_>,
+    ) -> Option<Arc<crate::filesystem::page_cache::PageCache>> {
+        let vma = pfm.vma();
+        let vma_guard = vma.lock();
+        let file = vma_guard.vm_file()?;
+        file.inode().page_cache()
+    }
+
     /// 处理缺页异常
     /// ## 参数
     ///
@@ -174,23 +183,31 @@ impl PageFaultHandler {
     pub unsafe fn handle_normal_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
         let address = pfm.address_aligned_down();
         let vma = pfm.vma();
-        let mapper = &mut pfm.mapper;
-        if mapper.get_entry(address, 3).is_none() {
-            mapper
-                .allocate_table(address, 2)
-                .expect("failed to allocate PUD table");
+        let mm = pfm.mm().clone();
+        {
+            let _pt_edit = mm.page_table_edit();
+            let mapper = &mut pfm.mapper;
+            if mapper.get_entry(address, 3).is_none() {
+                mapper
+                    .allocate_table(address, 2)
+                    .expect("failed to allocate PUD table");
+            }
         }
         let page_flags = vma.lock().flags();
 
         for level in 2..=3 {
             let level = MMArch::PAGE_LEVELS - level;
-            if mapper.get_entry(address, level).is_none() {
-                if vma.is_hugepage() {
-                    if vma.is_anonymous() {
-                        mapper.map_huge_page(address, page_flags);
+            {
+                let _pt_edit = mm.page_table_edit();
+                let mapper = &mut pfm.mapper;
+                if mapper.get_entry(address, level).is_none() {
+                    if vma.is_hugepage() {
+                        if vma.is_anonymous() {
+                            mapper.map_huge_page(address, page_flags);
+                        }
+                    } else if mapper.allocate_table(address, level - 1).is_none() {
+                        return VmFaultReason::VM_FAULT_OOM;
                     }
-                } else if mapper.allocate_table(address, level - 1).is_none() {
-                    return VmFaultReason::VM_FAULT_OOM;
                 }
             }
         }
@@ -250,6 +267,8 @@ impl PageFaultHandler {
     pub unsafe fn do_anonymous_page(pfm: &mut PageFaultMessage) -> VmFaultReason {
         let address = pfm.address_aligned_down();
         let vma = pfm.vma.clone();
+        let mm = pfm.mm().clone();
+        let _pt_edit = mm.page_table_edit();
         let mapper = &mut pfm.mapper;
 
         // If this is an anonymous shared mapping, use a shared backing so pages are visible across fork
@@ -341,6 +360,10 @@ impl PageFaultHandler {
     /// - VmFaultReason: 页面错误处理信息标志
     #[inline(never)]
     pub unsafe fn do_cow_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
+        let page_cache = Self::file_page_cache(pfm);
+        let _invalidate = page_cache
+            .as_ref()
+            .map(|page_cache| page_cache.invalidate_read());
         let mut ret = Self::filemap_fault(pfm);
 
         if unlikely(ret.intersects(
@@ -377,6 +400,10 @@ impl PageFaultHandler {
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
     pub unsafe fn do_read_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
+        let page_cache = Self::file_page_cache(pfm);
+        let _invalidate = page_cache
+            .as_ref()
+            .map(|page_cache| page_cache.invalidate_read());
         let fs = pfm.vma().lock().vm_file().unwrap().inode().fs();
 
         let mut ret = Self::do_fault_around(pfm);
@@ -410,6 +437,10 @@ impl PageFaultHandler {
     /// - VmFaultReason: 页面错误处理信息标志
     #[inline(never)]
     pub unsafe fn do_shared_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
+        let page_cache = Self::file_page_cache(pfm);
+        let _invalidate = page_cache
+            .as_ref()
+            .map(|page_cache| page_cache.invalidate_read());
         let mut ret = Self::filemap_fault(pfm);
 
         if ret.intersects(VmFaultReason::VM_FAULT_ERROR) {
@@ -483,6 +514,7 @@ impl PageFaultHandler {
         let address = pfm.address_aligned_down();
         let vma = pfm.vma.clone();
         let mm = pfm.mm().clone();
+        let _pt_edit = mm.page_table_edit();
         let mapper = &mut pfm.mapper;
 
         let old_paddr = mapper.translate(address).unwrap().0;
@@ -594,12 +626,15 @@ impl PageFaultHandler {
     pub unsafe fn do_fault_around(pfm: &mut PageFaultMessage) -> VmFaultReason {
         let vma = pfm.vma();
         let address = pfm.address();
-        let mapper = &mut pfm.mapper;
-
-        if mapper.get_table(address, 0).is_none() {
-            mapper
-                .allocate_table(address, 0)
-                .expect("failed to allocate pte table");
+        let mm = pfm.mm().clone();
+        {
+            let _pt_edit = mm.page_table_edit();
+            let mapper = &mut pfm.mapper;
+            if mapper.get_table(address, 0).is_none() {
+                mapper
+                    .allocate_table(address, 0)
+                    .expect("failed to allocate pte table");
+            }
         }
         let vma_guard = vma.lock();
         let vma_region = *vma_guard.region();
@@ -637,8 +672,13 @@ impl PageFaultHandler {
         );
 
         // 预先分配pte页表（如果不存在）
-        if mapper.get_table(address, 0).is_none() && mapper.allocate_table(address, 0).is_none() {
-            return VmFaultReason::VM_FAULT_OOM;
+        {
+            let _pt_edit = mm.page_table_edit();
+            let mapper = &mut pfm.mapper;
+            if mapper.get_table(address, 0).is_none() && mapper.allocate_table(address, 0).is_none()
+            {
+                return VmFaultReason::VM_FAULT_OOM;
+            }
         }
 
         let fs = pfm.vma().lock().vm_file().unwrap().inode().fs();
@@ -677,6 +717,8 @@ impl PageFaultHandler {
                 return VmFaultReason::VM_FAULT_SIGBUS;
             }
         };
+        let mm = pfm.mm().clone();
+        let _pt_edit = mm.page_table_edit();
         let mapper = &mut pfm.mapper;
 
         // 起始页地址
@@ -812,6 +854,8 @@ impl PageFaultHandler {
         let cache_page = pfm.page.clone();
         let cow_page = pfm.cow_page.clone();
         let address = pfm.address();
+        let mm = pfm.mm().clone();
+        let _pt_edit = mm.page_table_edit();
         let mapper = &mut pfm.mapper;
 
         let page_to_map = if flags.contains(FaultFlags::FAULT_FLAG_WRITE)
@@ -836,6 +880,8 @@ impl PageFaultHandler {
         let address = pfm.address_aligned_down();
         let vma = pfm.vma();
         let flags = vma.lock().flags();
+        let mm = pfm.mm().clone();
+        let _pt_edit = mm.page_table_edit();
         let mapper = &mut pfm.mapper;
 
         if let Some(flush) = mapper.map(address, flags) {
@@ -866,6 +912,8 @@ impl PageFaultHandler {
         let flags = vma_guard.flags();
         drop(vma_guard);
 
+        let mm = pfm.mm().clone();
+        let _pt_edit = mm.page_table_edit();
         let mapper = &mut pfm.mapper;
         for pgoff in start_pgoff..end_pgoff {
             let addr = VirtAddr::new(base.data() + ((pgoff - backing_pgoff) << MMArch::PAGE_SHIFT));

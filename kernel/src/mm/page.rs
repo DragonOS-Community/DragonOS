@@ -422,28 +422,9 @@ impl PageReclaimer {
         let inode = page_cache.inode().clone().unwrap().upgrade().unwrap();
         let backend = page_cache.backend();
 
-        for vma in guard.vma_set() {
-            let address_space = vma.lock().address_space().and_then(|x| x.upgrade());
-            if address_space.is_none() {
-                continue;
-            }
-            let address_space = address_space.unwrap();
-            let mut guard = address_space.write();
-            let mapper = &mut guard.user_mapper.utable;
-            let virt = vma.lock().page_address(page_index).unwrap();
-            if unmap {
-                unsafe {
-                    // 取消页表映射
-                    mapper.unmap(virt, false).unwrap().flush();
-                }
-            } else {
-                unsafe {
-                    // 保护位设为只读
-                    mapper.remap(
-                        virt,
-                        mapper.get_entry(virt, 0).unwrap().flags().set_write(false),
-                    )
-                };
+        if let Ok(unmapped_vmas) = page_cache.mkclean_page(page_index, unmap) {
+            for vma in unmapped_vmas {
+                guard.remove_vma(vma.as_ref());
             }
         }
 
@@ -1804,6 +1785,29 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
             .flatten();
     }
 
+    /// Modify the leaf PTE flags of an existing mapping without allocating or freeing any page-table pages.
+    ///
+    /// This variant only touches an already present leaf entry and therefore works with `&self`.
+    /// It is intended for reverse-mapping walkers such as `mkclean` / file truncate zap, which
+    /// run under a separate page-table edit lock and must not require `&mut PageMapper`.
+    pub unsafe fn remap_present(
+        &self,
+        virt: VirtAddr,
+        flags: EntryFlags<Arch>,
+    ) -> Option<PageFlush<Arch>> {
+        self.visit(virt, |p1, i| {
+            let mut entry = p1.entry(i)?;
+            if entry.empty() {
+                return None;
+            }
+
+            entry.set_flags(flags);
+            p1.set_entry(i, entry);
+            Some(PageFlush::new(virt))
+        })
+        .flatten()
+    }
+
     /// 根据虚拟地址，查找页表，获取对应的物理地址和页表项的flags
     ///
     /// ## 参数
@@ -1886,6 +1890,36 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
             &mut freed_tables,
         )
         .map(|(paddr, flags)| (paddr, flags, PageFlush::<Arch>::new(virt), freed_tables))
+    }
+
+    /// Clear an existing leaf PTE without freeing intermediate page-table pages.
+    ///
+    /// This is the non-allocating / non-freeing counterpart used by cross-mm file-rmap walkers.
+    /// Keeping parent page tables intact avoids needing access to the frame allocator and mirrors
+    /// Linux's `zap_pte_range()` style leaf-only invalidation.
+    pub unsafe fn unmap_phys_preserve_tables(
+        &self,
+        virt: VirtAddr,
+    ) -> Option<(PhysAddr, EntryFlags<Arch>, PageFlush<Arch>)> {
+        if !virt.check_aligned(Arch::PAGE_SIZE) {
+            error!("Try to unmap unaligned page: virt={:?}", virt);
+            return None;
+        }
+
+        self.visit(virt, |p1, i| {
+            let entry = p1.entry(i)?;
+            if entry.empty() {
+                return None;
+            }
+
+            p1.set_entry(i, PageEntry::from_usize(0));
+            Some((
+                entry.address().ok()?,
+                entry.flags(),
+                PageFlush::<Arch>::new(virt),
+            ))
+        })
+        .flatten()
     }
 
     /// 在页表中，访问虚拟地址对应的页表项，并调用传入的函数F

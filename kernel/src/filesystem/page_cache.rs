@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use alloc::{
     collections::BTreeSet,
@@ -11,17 +11,21 @@ use system_error::SystemError;
 use super::vfs::{FilePrivateData, IndexNode};
 use crate::exception::workqueue::{schedule_work, Work, WorkQueue};
 use crate::libs::mutex::MutexGuard;
+use crate::libs::rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard};
 use crate::libs::spinlock::SpinLock;
 use crate::libs::wait_queue::WaitQueue;
 use crate::mm::page::FileMapInfo;
 use crate::mm::page_cache_stats as pc_stats;
+use crate::mm::ucontext::LockedVMA;
 use crate::sched::completion::Completion;
 use crate::{arch::mm::LockedFrameAllocator, libs::lazy_init::Lazy};
 use crate::{
     arch::MMArch,
     libs::mutex::Mutex,
     mm::{
+        mmu_gather::MmuGather,
         page::{page_manager_lock, page_reclaimer_lock, Page, PageFlags},
+        ucontext::AddressSpace,
         MemoryManagementArch,
     },
 };
@@ -32,6 +36,62 @@ static PAGE_CACHE_ID: AtomicUsize = AtomicUsize::new(0);
 
 const PAGECACHE_IO_WORKERS: usize = 4;
 static PAGECACHE_IO_RR: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, Default)]
+struct FileVmaIndex {
+    vmas: HashMap<usize, Weak<LockedVMA>>,
+}
+
+impl FileVmaIndex {
+    fn register(&mut self, vma: &Arc<LockedVMA>) {
+        self.vmas.insert(vma.id(), Arc::downgrade(vma));
+    }
+
+    fn unregister(&mut self, vma_id: usize) {
+        self.vmas.remove(&vma_id);
+    }
+
+    fn collect_all(&mut self) -> Vec<Arc<LockedVMA>> {
+        let mut result = Vec::new();
+        self.vmas.retain(|_, weak| {
+            if let Some(vma) = weak.upgrade() {
+                result.push(vma);
+                true
+            } else {
+                false
+            }
+        });
+        result
+    }
+}
+
+struct MmFileRangeGroup {
+    mm: Arc<AddressSpace>,
+    ranges: Vec<(Arc<LockedVMA>, crate::mm::VirtRegion)>,
+}
+
+impl MmFileRangeGroup {
+    fn new(mm: Arc<AddressSpace>) -> Self {
+        Self {
+            mm,
+            ranges: Vec::new(),
+        }
+    }
+}
+
+struct MmFilePageGroup {
+    mm: Arc<AddressSpace>,
+    items: Vec<(Arc<LockedVMA>, crate::mm::VirtAddr)>,
+}
+
+impl MmFilePageGroup {
+    fn new(mm: Arc<AddressSpace>) -> Self {
+        Self {
+            mm,
+            items: Vec::new(),
+        }
+    }
+}
 
 lazy_static! {
     static ref PAGECACHE_IO_WQS: Vec<Arc<WorkQueue>> = {
@@ -194,6 +254,10 @@ pub struct PageCache {
     inner: Mutex<InnerPageCache>,
     inode: Lazy<Weak<dyn IndexNode>>,
     backend: Lazy<Arc<dyn PageCacheBackend>>,
+    i_mmap_rwsem: RwSem<()>,
+    invalidate_lock: RwSem<()>,
+    file_vma_seq: AtomicU64,
+    file_vmas: SpinLock<FileVmaIndex>,
     unevictable: AtomicBool,
     is_shmem: AtomicBool,
     manager: PageCacheManager,
@@ -512,6 +576,7 @@ impl PageCacheManager {
         };
 
         if len > 0 {
+            let _ = cache.mkclean_page(page_index, false);
             {
                 let mut guard = page.write();
                 guard.remove_flags(PageFlags::PG_DIRTY);
@@ -773,6 +838,10 @@ impl PageCache {
                 }
                 v
             },
+            i_mmap_rwsem: RwSem::new(()),
+            invalidate_lock: RwSem::new(()),
+            file_vma_seq: AtomicU64::new(0),
+            file_vmas: SpinLock::new(FileVmaIndex::default()),
             unevictable: AtomicBool::new(false),
             is_shmem: AtomicBool::new(false),
             manager: PageCacheManager::new(weak.clone()),
@@ -818,6 +887,289 @@ impl PageCache {
 
     pub fn manager(&self) -> &PageCacheManager {
         &self.manager
+    }
+
+    pub fn i_mmap_read(&self) -> RwSemReadGuard<'_, ()> {
+        self.i_mmap_rwsem.read()
+    }
+
+    pub fn i_mmap_write(&self) -> RwSemWriteGuard<'_, ()> {
+        self.i_mmap_rwsem.write()
+    }
+
+    pub fn invalidate_read(&self) -> RwSemReadGuard<'_, ()> {
+        self.invalidate_lock.read()
+    }
+
+    pub fn invalidate_write(&self) -> RwSemWriteGuard<'_, ()> {
+        self.invalidate_lock.write()
+    }
+
+    fn note_file_vma_mutation(&self) {
+        self.file_vma_seq.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn file_vma_seq(&self) -> u64 {
+        self.file_vma_seq.load(Ordering::Acquire)
+    }
+
+    pub fn register_file_vma(&self, vma: &Arc<LockedVMA>) {
+        let _guard = self.i_mmap_write();
+        self.file_vmas.lock_irqsave().register(vma);
+        self.note_file_vma_mutation();
+    }
+
+    pub fn unregister_file_vma(&self, vma_id: usize) {
+        let _guard = self.i_mmap_write();
+        self.file_vmas.lock_irqsave().unregister(vma_id);
+        self.note_file_vma_mutation();
+    }
+
+    pub fn collect_file_vmas(&self) -> Vec<Arc<LockedVMA>> {
+        let _guard = self.i_mmap_read();
+        self.file_vmas.lock_irqsave().collect_all()
+    }
+
+    pub fn collect_file_vmas_in_page_range(
+        &self,
+        start_page_index: usize,
+        end_page_index: usize,
+    ) -> Vec<Arc<LockedVMA>> {
+        let _guard = self.i_mmap_read();
+        self.file_vmas
+            .lock_irqsave()
+            .collect_all()
+            .into_iter()
+            .filter(|vma| {
+                let guard = vma.lock();
+                let Some(vma_pgoff) = guard.backing_page_offset() else {
+                    return false;
+                };
+                let vma_pages = guard.region().size() >> MMArch::PAGE_SHIFT;
+                let vma_end = vma_pgoff.saturating_add(vma_pages);
+                start_page_index < vma_end && vma_pgoff <= end_page_index
+            })
+            .collect()
+    }
+
+    fn collect_file_vmas_snapshot(
+        &self,
+        page_range: Option<(usize, Option<usize>)>,
+    ) -> (u64, Vec<Arc<LockedVMA>>) {
+        let _guard = self.i_mmap_read();
+        let seq = self.file_vma_seq();
+        let mut vmas = self.file_vmas.lock_irqsave().collect_all();
+        if let Some((start_page_index, end_page_index_exclusive)) = page_range {
+            vmas.retain(|vma| {
+                vma.file_pgoff_intersection(start_page_index, end_page_index_exclusive)
+                    .is_some()
+            });
+        }
+        (seq, vmas)
+    }
+
+    pub fn collect_mapped_vmas_for_page(&self, page_index: usize) -> Vec<Arc<LockedVMA>> {
+        self.collect_file_vmas_in_page_range(page_index, page_index)
+    }
+
+    pub fn unmap_mapping_pages(
+        &self,
+        start_page_index: usize,
+        end_page_index_exclusive: Option<usize>,
+    ) -> Result<(), SystemError> {
+        loop {
+            let (seq, snapshot) =
+                self.collect_file_vmas_snapshot(Some((start_page_index, end_page_index_exclusive)));
+            let mut mm_groups: HashMap<u64, MmFileRangeGroup> = HashMap::new();
+
+            for vma in snapshot {
+                let Some(region) =
+                    vma.file_pgoff_intersection(start_page_index, end_page_index_exclusive)
+                else {
+                    continue;
+                };
+                let Some(mm) = vma.lock().address_space().and_then(|space| space.upgrade()) else {
+                    continue;
+                };
+                mm_groups
+                    .entry(mm.id())
+                    .or_insert_with(|| MmFileRangeGroup::new(mm.clone()))
+                    .ranges
+                    .push((vma, region));
+            }
+
+            for (_id, group) in mm_groups {
+                let mm_guard = group.mm.read();
+                let _pt_edit = group.mm.page_table_edit();
+                let mut tlb = MmuGather::gather(&group.mm);
+                for (vma, region) in group.ranges {
+                    vma.unmap_range(region, &mm_guard.user_mapper.utable, &mut tlb);
+                }
+                tlb.finish();
+            }
+
+            if self.file_vma_seq() == seq {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn truncate(&self, new_size: usize) -> Result<(), SystemError> {
+        let _invalidate = self.invalidate_write();
+        self.truncate_locked(new_size)
+    }
+
+    fn truncate_locked(&self, new_size: usize) -> Result<(), SystemError> {
+        let hole_start_page = page_align_up(new_size) >> MMArch::PAGE_SHIFT;
+        self.unmap_mapping_pages(hole_start_page, None)?;
+
+        let first_full_truncate_page = page_align_up(new_size) >> MMArch::PAGE_SHIFT;
+        let truncate_indices: Vec<usize> = {
+            let guard = self.inner.lock();
+            guard
+                .pages
+                .keys()
+                .copied()
+                .filter(|index| *index >= first_full_truncate_page)
+                .collect()
+        };
+
+        for page_index in truncate_indices {
+            loop {
+                let entry = {
+                    let guard = self.inner.lock();
+                    guard.get_entry(page_index)
+                };
+                let Some(entry) = entry else {
+                    break;
+                };
+                match entry.state() {
+                    PageState::Loading => {
+                        let _ = entry.wait_ready();
+                        continue;
+                    }
+                    PageState::Writeback => {
+                        let _ = entry.wait_queue.wait_until(|| match entry.state() {
+                            PageState::Writeback => None,
+                            PageState::Error => Some(Err(SystemError::EIO)),
+                            _ => Some(Ok(())),
+                        });
+                        continue;
+                    }
+                    _ => {}
+                }
+
+                if let Some(page) = self.inner.lock().remove_page(page_index) {
+                    let paddr = page.phys_address();
+                    page_manager_lock().remove_page(&paddr);
+                    let _ = page_reclaimer_lock().remove_page(&paddr);
+                }
+                break;
+            }
+        }
+
+        if new_size > 0 && !new_size.is_multiple_of(MMArch::PAGE_SIZE) {
+            let last_page_index = (new_size - 1) >> MMArch::PAGE_SHIFT;
+            let last_len = new_size - (last_page_index << MMArch::PAGE_SHIFT);
+            let entry = {
+                let guard = self.inner.lock();
+                guard.get_entry(last_page_index)
+            };
+            if let Some(entry) = entry {
+                match entry.state() {
+                    PageState::Loading => {
+                        let _ = entry.wait_ready();
+                    }
+                    PageState::Writeback => {
+                        let _ = entry.wait_queue.wait_until(|| match entry.state() {
+                            PageState::Writeback => None,
+                            PageState::Error => Some(Err(SystemError::EIO)),
+                            _ => Some(Ok(())),
+                        });
+                    }
+                    _ => {}
+                }
+                unsafe {
+                    entry.page.write().truncate(last_len);
+                }
+            }
+        }
+
+        self.unmap_mapping_pages(hole_start_page, None)?;
+
+        Ok(())
+    }
+
+    pub fn mkclean_page(
+        &self,
+        page_index: usize,
+        unmap: bool,
+    ) -> Result<Vec<Arc<LockedVMA>>, SystemError> {
+        loop {
+            let (seq, snapshot) =
+                self.collect_file_vmas_snapshot(Some((page_index, Some(page_index + 1))));
+            let mut mm_groups: HashMap<u64, MmFilePageGroup> = HashMap::new();
+
+            for vma in snapshot {
+                let (Some(mm), Ok(virt)) = ({
+                    let guard = vma.lock();
+                    (
+                        guard.address_space().and_then(|space| space.upgrade()),
+                        guard.page_address(page_index),
+                    )
+                }) else {
+                    continue;
+                };
+
+                mm_groups
+                    .entry(mm.id())
+                    .or_insert_with(|| MmFilePageGroup::new(mm.clone()))
+                    .items
+                    .push((vma, virt));
+            }
+
+            let mut unmapped = Vec::new();
+            for (_id, group) in mm_groups {
+                let mm_guard = group.mm.read();
+                let _pt_edit = group.mm.page_table_edit();
+                let mut tlb = MmuGather::gather(&group.mm);
+                for (vma, virt) in group.items {
+                    if unmap {
+                        if let Some((_paddr, _flags, flush)) =
+                            unsafe { mm_guard.user_mapper.utable.unmap_phys_preserve_tables(virt) }
+                        {
+                            unsafe { flush.ignore() };
+                            tlb.accumulate_range(virt);
+                            unmapped.push(vma);
+                        }
+                        continue;
+                    }
+
+                    let Some((_paddr, flags)) = mm_guard.user_mapper.utable.translate(virt) else {
+                        continue;
+                    };
+                    if !flags.has_write() {
+                        continue;
+                    }
+                    if let Some(flush) = unsafe {
+                        mm_guard
+                            .user_mapper
+                            .utable
+                            .remap_present(virt, flags.set_write(false).set_dirty(false))
+                    } {
+                        unsafe { flush.ignore() };
+                        tlb.accumulate_range(virt);
+                    }
+                }
+                tlb.finish();
+            }
+
+            if self.file_vma_seq() == seq {
+                return Ok(unmapped);
+            }
+        }
     }
 
     pub fn drop_clean_pages(&self) -> usize {
@@ -1288,7 +1640,10 @@ impl PageCache {
                 continue;
             }
 
-            let entry = self.get_or_create_entry(page_index, false)?;
+            let full_page_overwrite =
+                write_start == page_start && page_write_len == MMArch::PAGE_SIZE;
+            let populate_backend = !self.is_shmem() && !full_page_overwrite;
+            let entry = self.get_or_create_entry(page_index, populate_backend)?;
             copies.push(CopyItem {
                 entry,
                 page_index,

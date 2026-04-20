@@ -1,18 +1,18 @@
 use crate::arch::CurrentIrqArch;
 use crate::exception::InterruptArch;
 use crate::filesystem::vfs::fcntl::AtFlags;
-use crate::filesystem::vfs::file::File;
-use crate::filesystem::vfs::open::do_open_execat;
+use crate::filesystem::vfs::open::{do_open_execat, do_open_execat_with_flags};
 use crate::libs::rwsem::RwSem;
 use crate::process::exec::{
-    load_binary_file_with_context, ExecContext, ExecParam, ExecParamFlags, LoadBinaryResult,
+    load_binary_file_with_context, ExecContext, ExecInterpFlags, ExecParam, ExecParamFlags,
+    ExecStartInfo, LoadBinaryResult,
 };
-use crate::process::ProcessManager;
+use crate::process::{ProcessControlBlock, ProcessManager};
 use crate::syscall::Syscall;
 use crate::{libs::rand::rand_bytes, mm::ucontext::AddressSpace};
 
 use crate::arch::interrupt::TrapFrame;
-use alloc::{ffi::CString, sync::Arc, vec::Vec};
+use alloc::{ffi::CString, string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
 /// 执行execve系统调用
@@ -31,16 +31,68 @@ pub fn do_execve(
     envp: Vec<CString>,
     regs: &mut TrapFrame,
 ) -> Result<(), SystemError> {
-    // 创建初始执行上下文
-    let mut ctx = ExecContext::new();
-
-    // 保存原始脚本路径（用于shebang场景）
-    ctx.original_path = Some(path.into());
-
-    // 通过正常的open流程打开文件
     let file = do_open_execat(AtFlags::AT_FDCWD.bits(), path)?;
+    let start = ExecStartInfo::new(file, path.into(), path.into(), ExecInterpFlags::empty());
 
-    do_execve_internal(file, argv, envp, regs, ctx)
+    do_execve_with_info(start, argv, envp, regs)
+}
+
+pub fn do_execveat(
+    dirfd: i32,
+    path: &str,
+    argv: Vec<CString>,
+    envp: Vec<CString>,
+    flags: AtFlags,
+    regs: &mut TrapFrame,
+) -> Result<(), SystemError> {
+    let file = do_open_execat_with_flags(dirfd, path, flags)?;
+    let start = ExecStartInfo::new(
+        file,
+        exec_visible_name(dirfd, path),
+        exec_initial_execfn(dirfd, path),
+        exec_path_interp_flags(dirfd, path),
+    );
+
+    do_execve_with_info(start, argv, envp, regs)
+}
+
+pub fn do_execve_with_info(
+    start: ExecStartInfo,
+    argv: Vec<CString>,
+    envp: Vec<CString>,
+    regs: &mut TrapFrame,
+) -> Result<(), SystemError> {
+    do_execve_internal(start, argv, envp, regs, ExecContext::new())
+}
+
+pub fn exec_visible_name(dirfd: i32, path: &str) -> String {
+    if dirfd == AtFlags::AT_FDCWD.bits() || path.starts_with('/') {
+        path.into()
+    } else if path.is_empty() {
+        alloc::format!("/dev/fd/{dirfd}")
+    } else {
+        alloc::format!("/dev/fd/{dirfd}/{path}")
+    }
+}
+
+pub fn exec_initial_execfn(dirfd: i32, path: &str) -> String {
+    exec_visible_name(dirfd, path)
+}
+
+fn exec_path_interp_flags(dirfd: i32, path: &str) -> ExecInterpFlags {
+    if dirfd == AtFlags::AT_FDCWD.bits() || path.starts_with('/') {
+        return ExecInterpFlags::empty();
+    }
+
+    let cloexec = ProcessManager::current_pcb()
+        .fd_table()
+        .read()
+        .get_cloexec(dirfd);
+    if cloexec {
+        ExecInterpFlags::PATH_INACCESSIBLE
+    } else {
+        ExecInterpFlags::empty()
+    }
 }
 
 /// execve的内部实现，支持递归执行（用于shebang）
@@ -53,7 +105,7 @@ pub fn do_execve(
 /// - `ctx`: 执行上下文，用于跟踪递归深度
 #[inline(never)]
 fn do_execve_internal(
-    file: Arc<File>,
+    start: ExecStartInfo,
     argv: Vec<CString>,
     envp: Vec<CString>,
     regs: &mut TrapFrame,
@@ -61,9 +113,14 @@ fn do_execve_internal(
 ) -> Result<(), SystemError> {
     let address_space = AddressSpace::new(true).expect("Failed to create new address space");
 
-    let mut param = ExecParam::new(file, address_space.clone(), ExecParamFlags::EXEC);
-
-    param.begin_new_exec().map_err(SystemError::from)?;
+    let mut param = ExecParam::new(
+        start.file(),
+        address_space.clone(),
+        ExecParamFlags::EXEC,
+        CString::new(start.filename()).map_err(|_| SystemError::EINVAL)?,
+        CString::new(start.execfn()).map_err(|_| SystemError::EINVAL)?,
+        start.interp_flags(),
+    );
 
     // 预先设置args，以便shebang处理时可以访问原始参数
     param.init_info_mut().args = argv.clone();
@@ -96,14 +153,7 @@ fn do_execve_internal(
             };
             address_space.write().user_stack = Some(ustack_message);
 
-            // execve 成功后，如果是 vfork 创建的子进程，需要通知父进程继续执行
-            // 在通知父进程之前，必须先清除 vfork_done，防止子进程退出时再次通知
             let pcb = ProcessManager::current_pcb();
-            let vfork_done = pcb.thread.write_irqsave().vfork_done.take();
-
-            if let Some(completion) = vfork_done {
-                completion.complete_all();
-            }
 
             // unshare fd_table if it's shared (CLONE_FILES case)
             // 参考 Linux: https://elixir.bootlin.com/linux/v6.1.9/source/fs/exec.c#L1857
@@ -121,6 +171,9 @@ fn do_execve_internal(
                 }
             }
 
+            // close-on-exec 必须属于成功 exec 的 commit 过程，不能留在 syscall wrapper 尾部。
+            pcb.fd_table().write().close_on_exec();
+
             if pcb.sighand().is_shared() {
                 // Linux出于进程和线程隔离，要确保在execve时，对共享的 SigHand 进行深拷贝
                 // 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/fs/exec.c#1187
@@ -135,13 +188,29 @@ fn do_execve_internal(
             // 清除 rseq 状态（execve 后需要重新注册）
             crate::process::rseq::rseq_execve(&pcb);
 
-            Syscall::arch_do_execve(regs, &param, &result, user_sp, argv_ptr)
+            let executable_path = param
+                .file_ref()
+                .inode()
+                .absolute_path()
+                .unwrap_or_else(|_| param.filename().to_string_lossy().into_owned());
+            pcb.basic_mut()
+                .set_name(ProcessControlBlock::generate_name(&executable_path));
+            pcb.set_execute_path(executable_path);
+            pcb.set_cmdline_from_argv(&param.init_info().args);
+
+            // vfork 父进程必须在 child 完成 exec commit 后再恢复。
+            // 否则父子仍可能共享 files_struct，child 的 close_on_exec() 会污染父进程。
+            let vfork_done = pcb.thread.write_irqsave().vfork_done.take();
+            let exec_ret = Syscall::arch_do_execve(regs, &param, &result, user_sp, argv_ptr);
+            if exec_ret.is_ok() {
+                if let Some(completion) = vfork_done {
+                    completion.complete_all();
+                }
+            }
+            exec_ret
         }
 
-        Ok(LoadBinaryResult::NeedReexec {
-            interpreter_file,
-            new_argv,
-        }) => {
+        Ok(LoadBinaryResult::NeedReexec { next, new_argv }) => {
             // Shebang场景：需要递归执行解释器
             // 恢复旧的地址空间
             if let Some(old_vm) = old_vm {
@@ -151,7 +220,7 @@ fn do_execve_internal(
             // 增加递归深度并递归调用
             let new_ctx = ctx.increment_depth();
 
-            do_execve_internal(interpreter_file, new_argv, envp, regs, new_ctx)
+            do_execve_internal(next, new_argv, envp, regs, new_ctx)
         }
 
         Err(e) => {

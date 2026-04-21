@@ -7,7 +7,7 @@ use crate::filesystem::vfs::{MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES};
 use crate::mm::page::PAGE_4K_SIZE;
 use crate::mm::{access_ok, VirtAddr};
 use crate::process::execve::do_execve;
-use crate::process::{ProcessControlBlock, ProcessManager};
+use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::{check_and_clone_cstr_array, vfs_check_and_clone_cstr};
 use alloc::{ffi::CString, vec::Vec};
@@ -93,21 +93,7 @@ impl SysExecve {
         envp: Vec<CString>,
         frame: &mut TrapFrame,
     ) -> Result<(), SystemError> {
-        ProcessManager::current_pcb()
-            .basic_mut()
-            .set_name(ProcessControlBlock::generate_name(path));
-
-        // 仅在 execve 成功后再写入 cmdline，避免失败时污染当前进程信息
-        let argv_for_cmdline = argv.clone();
         do_execve(path, argv, envp, frame)?;
-
-        let pcb = ProcessManager::current_pcb();
-        // 关闭设置了O_CLOEXEC的文件描述符
-        let fd_table = pcb.fd_table();
-        fd_table.write().close_on_exec();
-
-        pcb.set_execute_path(path.to_string());
-        pcb.set_cmdline_from_argv(&argv_for_cmdline);
         Ok(())
     }
 }
@@ -140,12 +126,7 @@ impl Syscall for SysExecve {
             return Err(SystemError::ENOENT);
         }
 
-        // 获取解析符号链接后的绝对路径（用于set_execute_path）
-        let pwd = ProcessManager::current_pcb().pwd_inode();
-        let inode = pwd.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-        let resolved_path = inode.absolute_path().unwrap_or(path.clone());
-
-        Self::execve(&resolved_path, argv, envp, frame)?;
+        Self::execve(&path, argv, envp, frame)?;
         return Ok(0);
     }
 

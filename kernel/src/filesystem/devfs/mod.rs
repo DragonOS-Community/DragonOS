@@ -140,6 +140,10 @@ impl DevFS {
             .expect("DevFS: Failed to create /dev/block");
         // 预创建 /dev/ptmx 符号链接指向 devpts 内部节点，避免早期 ENOENT
         let _ = root.add_dev_symlink("pts/ptmx", "ptmx");
+        // Linux 用户态会通过 /dev/fd/N[/path] 重新访问 fd 派生的可见路径。
+        // DragonOS 的真实对象解析能力在 /proc/self/fd，因此这里补兼容入口。
+        root.add_dev_symlink("/proc/self/fd", "fd")
+            .expect("DevFS: Failed to create /dev/fd");
         devfs.register_bultinin_device();
 
         // debug!("ls /dev: {:?}", root.list());

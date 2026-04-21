@@ -62,11 +62,57 @@ pub enum LoadBinaryResult {
     Loaded(BinaryLoaderResult),
     /// 需要重新执行解释器 (shebang场景)
     NeedReexec {
-        /// 解释器文件（通过do_open_execat打开）
-        interpreter_file: Arc<File>,
+        /// 下一轮 exec 的启动信息
+        next: ExecStartInfo,
         /// 新的argv (解释器路径 + [可选参数] + 脚本路径 + 原始参数)
         new_argv: Vec<CString>,
     },
+}
+
+bitflags! {
+    pub struct ExecInterpFlags: u32 {
+        const PATH_INACCESSIBLE = 1 << 0;
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecStartInfo {
+    file: Arc<File>,
+    filename: String,
+    execfn: String,
+    interp_flags: ExecInterpFlags,
+}
+
+impl ExecStartInfo {
+    pub fn new(
+        file: Arc<File>,
+        filename: String,
+        execfn: String,
+        interp_flags: ExecInterpFlags,
+    ) -> Self {
+        Self {
+            file,
+            filename,
+            execfn,
+            interp_flags,
+        }
+    }
+
+    pub fn file(&self) -> Arc<File> {
+        self.file.clone()
+    }
+
+    pub fn filename(&self) -> &str {
+        &self.filename
+    }
+
+    pub fn execfn(&self) -> &str {
+        &self.execfn
+    }
+
+    pub fn interp_flags(&self) -> ExecInterpFlags {
+        self.interp_flags
+    }
 }
 
 /// 执行上下文，用于跟踪递归执行状态
@@ -74,8 +120,6 @@ pub enum LoadBinaryResult {
 pub struct ExecContext {
     /// 当前递归深度
     pub recursion_depth: usize,
-    /// 原始脚本路径 (用于argv)
-    pub original_path: Option<String>,
 }
 
 impl Default for ExecContext {
@@ -86,10 +130,7 @@ impl Default for ExecContext {
 
 impl ExecContext {
     pub fn new() -> Self {
-        Self {
-            recursion_depth: 0,
-            original_path: None,
-        }
+        Self { recursion_depth: 0 }
     }
 
     /// 检查是否超过最大递归深度
@@ -159,6 +200,9 @@ pub struct ExecParam {
     vm: Arc<AddressSpace>,
     /// 一些标志位
     flags: ExecParamFlags,
+    filename: CString,
+    execfn: CString,
+    interp_flags: ExecInterpFlags,
     /// 用来初始化进程的一些信息。这些信息由二进制加载器和exec机制来共同填充
     init_info: ProcInitInfo,
 }
@@ -179,12 +223,24 @@ impl ExecParam {
     /// - `file`: 通过do_open_execat打开的可执行文件
     /// - `vm`: 地址空间
     /// - `flags`: 执行标志
-    pub fn new(file: Arc<File>, vm: Arc<AddressSpace>, flags: ExecParamFlags) -> Self {
+    pub fn new(
+        file: Arc<File>,
+        vm: Arc<AddressSpace>,
+        flags: ExecParamFlags,
+        filename: CString,
+        execfn: CString,
+        interp_flags: ExecInterpFlags,
+    ) -> Self {
+        let mut init_info = ProcInitInfo::new(execfn.to_string_lossy().as_ref());
+        init_info.execfn = Some(execfn.clone());
         Self {
             file,
             vm,
             flags,
-            init_info: ProcInitInfo::new(ProcessManager::current_pcb().basic().name()),
+            filename,
+            execfn,
+            interp_flags,
+            init_info,
         }
     }
 
@@ -220,6 +276,18 @@ impl ExecParam {
     /// 获取File的Arc引用
     pub fn file(&self) -> Arc<File> {
         self.file.clone()
+    }
+
+    pub fn filename(&self) -> &CString {
+        &self.filename
+    }
+
+    pub fn execfn(&self) -> &CString {
+        &self.execfn
+    }
+
+    pub fn interp_flags(&self) -> ExecInterpFlags {
+        self.interp_flags
     }
 
     /// 消费ExecParam并获取File的所有权（用于将文件加入文件描述符表）
@@ -460,6 +528,13 @@ pub fn load_binary_file_with_context(
         let shebang_info =
             ShebangLoader::parse_shebang_line(&head_buf).map_err(|_| SystemError::ENOEXEC)?;
 
+        if param
+            .interp_flags()
+            .contains(ExecInterpFlags::PATH_INACCESSIBLE)
+        {
+            return Err(SystemError::ENOENT);
+        }
+
         // 通过正常的open流程打开解释器文件
         let interpreter_file =
             do_open_execat(AtFlags::AT_FDCWD.bits(), &shebang_info.interpreter_path).inspect_err(
@@ -473,11 +548,7 @@ pub fn load_binary_file_with_context(
             )?;
 
         // 获取脚本路径
-        let script_path = param
-            .file_ref()
-            .inode()
-            .absolute_path()
-            .unwrap_or_else(|_| ctx.original_path.clone().unwrap_or_default());
+        let script_path = param.filename().to_string_lossy().into_owned();
 
         // 构建新的argv
         // Linux语义: [interpreter, optional_arg, script_path, original_args[1:]...]
@@ -503,7 +574,12 @@ pub fn load_binary_file_with_context(
         }
 
         return Ok(LoadBinaryResult::NeedReexec {
-            interpreter_file,
+            next: ExecStartInfo::new(
+                interpreter_file,
+                shebang_info.interpreter_path.clone(),
+                param.execfn().to_string_lossy().into_owned(),
+                ExecInterpFlags::empty(),
+            ),
             new_argv,
         });
     }
@@ -537,6 +613,7 @@ pub struct ProcInitInfo {
     pub args: Vec<CString>,
     pub envs: Vec<CString>,
     pub auxv: BTreeMap<u8, usize>,
+    pub execfn: Option<CString>,
     pub rand_num: [u8; 16],
 }
 
@@ -547,6 +624,7 @@ impl ProcInitInfo {
             args: Vec::new(),
             envs: Vec::new(),
             auxv: BTreeMap::new(),
+            execfn: None,
             rand_num: [0u8; 16],
         }
     }
@@ -589,10 +667,23 @@ impl ProcInitInfo {
         self.auxv
             .insert(super::abi::AtType::Random as u8, ustack.sp().data());
 
+        if let Some(execfn) = self.execfn.as_ref() {
+            self.push_str(ustack, execfn)?;
+            self.auxv
+                .insert(super::abi::AtType::ExecFn as u8, ustack.sp().data());
+        }
+
         // 实现栈的16字节对齐
-        // 用当前栈顶地址减去后续要压栈的长度，得到的压栈后的栈顶地址与0xF按位与操作得到对齐要填充的字节数
-        let length_to_push = (self.auxv.len() + envps.len() + 1 + argps.len() + 1 + 1)
-            * core::mem::align_of::<usize>();
+        // 后续要压入的内容都是 `usize` 宽度：
+        // - auxv 终止项: 2 words
+        // - auxv 条目: 2 words / entry
+        // - envp NULL: 1 word
+        // - envp 指针数组: envps.len() words
+        // - argv NULL: 1 word
+        // - argv 指针数组: argps.len() words
+        // - argc: 1 word
+        let length_to_push =
+            self.remaining_stack_words(envps.len(), argps.len()) * core::mem::size_of::<usize>();
         self.push_slice(
             ustack,
             &vec![0u8; (ustack.sp().data() - length_to_push) & 0xF],
@@ -617,6 +708,14 @@ impl ProcInitInfo {
         self.push_slice(ustack, &[self.args.len()])?;
 
         return Ok((ustack.sp(), argv_ptr));
+    }
+
+    fn remaining_stack_words(&self, envc: usize, argc: usize) -> usize {
+        let aux_words = 2 + self.auxv.len() * 2;
+        let env_words = 1 + envc;
+        let argv_words = 1 + argc;
+        let argc_words = 1;
+        aux_words + env_words + argv_words + argc_words
     }
 
     fn push_slice<T: Copy>(&self, ustack: &mut UserStack, slice: &[T]) -> Result<(), SystemError> {

@@ -1,6 +1,6 @@
 use core::{
     fmt,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicI32, AtomicUsize, Ordering},
 };
 
 use alloc::{string::String, sync::Arc, vec::Vec};
@@ -428,6 +428,11 @@ pub struct File {
     posix_lock_key: (usize, InodeId),
     /// 预读状态
     ra_state: Mutex<FileReadaheadState>,
+        /// 预读状态
+    ra_state: Mutex<FileReadaheadState>,
+    /// 异步 I/O 通知信号编号（F_SETSIG/F_GETSIG）。
+    /// 0 表示默认 SIGIO；范围 [0, SIGRTMAX]。
+    fasync_signum: AtomicI32,
 }
 
 impl File {
@@ -652,6 +657,7 @@ impl File {
             pid: Mutex::new(None),
             posix_lock_key,
             ra_state: Mutex::new(FileReadaheadState::new()),
+            fasync_signum: AtomicI32::new(0),
         };
 
         return Ok(f);
@@ -1181,6 +1187,7 @@ impl File {
             pid: Mutex::new(None),
             posix_lock_key: self.posix_lock_key,
             ra_state: Mutex::new(self.ra_state.lock().clone()),
+            fasync_signum: AtomicI32::new(self.fasync_signum.load(Ordering::Relaxed)),
         };
         // 调用inode的open方法，让inode知道有新的文件打开了这个inode
         // TODO: reopen is not a good idea for some inodes, need a better design
@@ -1378,7 +1385,21 @@ impl File {
         // todo: update inode owner
         Ok(())
     }
+        /// 获取异步 I/O 通知信号编号（F_GETSIG）。
+    ///
+    /// 返回 `0` 表示尚未设置，应默认为 `SIGIO`。
+    #[inline]
+    pub fn fasync_signum(&self) -> i32 {
+        self.fasync_signum.load(Ordering::Relaxed)
+    }
 
+    /// 设置异步 I/O 通知信号编号（F_SETSIG）。
+    ///
+    /// 调用方负责校验 `signum` 的合法性（`[0, SIGRTMAX]`）。
+    #[inline]
+    pub fn set_fasync_signum(&self, signum: i32) {
+        self.fasync_signum.store(signum, Ordering::Relaxed);
+    }
     pub fn get_inode_flags(&self) -> Result<InodeFlags, SystemError> {
         let metadata = self.inode.metadata()?;
         Ok(metadata.flags)

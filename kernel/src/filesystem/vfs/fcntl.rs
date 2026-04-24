@@ -23,10 +23,14 @@ pub enum FcntlCommand {
     SetLock = 6,
     /// set record locking info (blocking)
     SetLockWait = 7,
-    /// set owner
+        /// set owner
     SetOwn = 8,
     /// get owner
     GetOwn = 9,
+    /// set signal to send on asynchronous I/O (0 means SIGIO)
+    SetSig = 10,
+    /// get signal to send on asynchronous I/O (0 means SIGIO)
+    GetSig = 11,
 
     SetLease = F_LINUX_SPECIFIC_BASE,
     GetLease = F_LINUX_SPECIFIC_BASE + 1,

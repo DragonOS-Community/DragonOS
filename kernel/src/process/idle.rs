@@ -9,7 +9,7 @@ use crate::{
     libs::cpumask::CpuMask,
     mm::{percpu::PerCpu, VirtAddr, IDLE_PROCESS_ADDRESS_SPACE},
     process::KernelStack,
-    sched::{cpu_rq, OnRq},
+    sched::{cpu_rq, OnRq, IDLE_CPUS},
     smp::cpu::ProcessorId,
 };
 
@@ -71,6 +71,7 @@ impl ProcessManager {
             let (rq, _guard) = rq.self_lock();
             rq.set_current(Arc::downgrade(&idle_pcb));
             rq.set_idle(Arc::downgrade(&idle_pcb));
+            IDLE_CPUS.set(ProcessorId::new(i));
 
             *idle_pcb.sched_info().on_rq.lock_irqsave() = OnRq::Queued;
 

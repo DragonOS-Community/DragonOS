@@ -21,6 +21,7 @@ mod mounts;
 mod net;
 mod pid;
 pub mod root;
+mod sched_idle_cpus;
 mod self_;
 mod stat;
 mod sys;

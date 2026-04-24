@@ -191,11 +191,19 @@ impl SmpCpuManager {
     }
 
     pub fn set_online_cpu(&self, cpu_id: ProcessorId, is_online: bool) {
-        if is_online {
-            unsafe { self.set_cpuhp_state(cpu_id, CpuHpState::Online) };
+        let target_state = if is_online {
+            CpuHpState::Online
         } else {
-            unsafe { self.set_cpuhp_state(cpu_id, CpuHpState::Offline) };
-        }
+            CpuHpState::Offline
+        };
+
+        unsafe { self.set_cpuhp_state(cpu_id, target_state) };
+        self.cpuhp_state_mut(cpu_id).state = target_state;
+    }
+
+    #[inline]
+    pub fn is_online_cpu(&self, cpu_id: ProcessorId) -> bool {
+        self.cpuhp_state(cpu_id).state == CpuHpState::Online
     }
 
     /// 获取出现在系统中的CPU
@@ -295,6 +303,7 @@ impl SmpCpuManager {
         let cpu_id = smp_get_processor_id();
         let cpu_state = self.cpuhp_state_mut(cpu_id);
         if bringup {
+            cpu_state.state = cpu_state.target_state;
             cpu_state.comp_done_up.complete();
         } else {
             todo!("complete_ap_thread")

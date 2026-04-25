@@ -202,6 +202,7 @@ impl SmpCpuManager {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn is_online_cpu(&self, cpu_id: ProcessorId) -> bool {
         self.cpuhp_state(cpu_id).state == CpuHpState::Online
     }
@@ -325,6 +326,7 @@ pub fn smp_cpu_manager_init(boot_cpu: ProcessorId) {
 
     unsafe { smp_cpu_manager().set_possible_cpu(boot_cpu, true) };
     unsafe { smp_cpu_manager().set_present_cpu(boot_cpu, true) };
+    smp_cpu_manager().set_online_cpu(boot_cpu, true);
 
     SmpCpuManager::arch_init(boot_cpu);
 }

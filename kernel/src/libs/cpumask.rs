@@ -204,19 +204,6 @@ impl AtomicCpuMask {
         (self.words[word].load(Ordering::Relaxed) & bit) != 0
     }
 
-    pub fn to_cpumask(&self) -> CpuMask {
-        let mut mask = CpuMask::new();
-
-        for cpu in 0..PerCpu::MAX_CPU_NUM {
-            let cpu = ProcessorId::new(cpu);
-            if self.get(cpu) {
-                mask.set(cpu, true);
-            }
-        }
-
-        mask
-    }
-
     #[allow(dead_code)]
     pub fn first_and(&self, rhs: &CpuMask) -> Option<ProcessorId> {
         rhs.iter_cpu().find(|&cpu| self.get(cpu))

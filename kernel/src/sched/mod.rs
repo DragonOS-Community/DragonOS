@@ -92,10 +92,6 @@ fn task_is_idle(pcb: &Arc<ProcessControlBlock>) -> bool {
     pcb.sched_info().policy() == SchedPolicy::IDLE
 }
 
-pub fn idle_cpus_snapshot() -> CpuMask {
-    IDLE_CPUS.to_cpumask()
-}
-
 #[inline]
 fn rq_is_idle_cpu(rq: &CpuRunQueue) -> bool {
     task_is_idle(&rq.current()) && rq.nr_running == 0

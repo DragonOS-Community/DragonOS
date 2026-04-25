@@ -28,18 +28,11 @@
 pub struct Mutex<T> {
     /// 该Mutex保护的数据
     data: UnsafeCell<T>,
-    /// Mutex内部的信息
-    inner: SpinLock<MutexInner>,
+    /// Mutex锁状态
+    lock: AtomicBool,
+    /// 等待队列（Waiter/Waker 机制避免唤醒丢失）
+    wait_queue: WaitQueue,
 }
-
-#[derive(Debug)]
-struct MutexInner {
-    /// 当前Mutex是否已经被上锁(上锁时，为true)
-    is_locked: bool,
-    /// 等待获得这个锁的进程的链表
-    wait_list: LinkedList<&'static mut process_control_block>,
-}
-
 ```
 
 ## 3. 使用
@@ -110,7 +103,7 @@ pub fn lock(&self) -> MutexGuard<T>
 
 &emsp;&emsp;对Mutex加锁，返回Mutex的守卫，您可以使用这个守卫来操作被保护的数据。
 
-&emsp;&emsp;如果Mutex已经被加锁，那么，该方法会阻塞当前进程，直到Mutex被释放。
+&emsp;&emsp;如果Mutex已经被加锁，那么，该方法会通过 `WaitQueue.wait_until()` 进入阻塞等待，直到锁可用。等待过程使用 Waiter/Waker 状态机握手，避免唤醒丢失。
 
 ### 4.3. try_lock - 尝试加锁
 
@@ -123,49 +116,3 @@ pub fn try_lock(&self) -> Result<MutexGuard<T>, i32>
 #### 说明
 
 &emsp;&emsp;尝试对Mutex加锁。如果加锁失败，不会将当前进程加入等待队列。如果加锁成功，返回Mutex的守卫；如果当前Mutex已经被加锁，返回`Err(错误码)`。
-
-## 5. C版本的Mutex（在将来会被废弃）
-
-&emsp;&emsp;mutex定义在`common/mutex.h`中。其数据类型如下所示：
-
-```c
-typedef struct
-{
-
-    atomic_t count; // 锁计数。1->已解锁。 0->已上锁,且有可能存在等待者
-    spinlock_t wait_lock;   // mutex操作锁，用于对mutex的list的操作进行加锁
-    struct List wait_list;  // Mutex的等待队列
-} mutex_t;
-```
-
-### 5.1. API
-
-#### mutex_init
-
-**`void mutex_init(mutex_t *lock)`**
-
-&emsp;&emsp;初始化一个mutex对象。
-
-#### mutex_lock
-
-**`void mutex_lock(mutex_t *lock)`**
-
-&emsp;&emsp;对一个mutex对象加锁。若mutex当前被其他进程持有，则当前进程进入休眠状态。
-
-#### mutex_unlock
-
-**`void mutex_unlock(mutex_t *lock)`**
-
-&emsp;&emsp;对一个mutex对象解锁。若mutex的等待队列中有其他的进程，则唤醒下一个进程。
-
-#### mutex_trylock
-
-**`void mutex_trylock(mutex_t *lock)`**
-
-&emsp;&emsp;尝试对一个mutex对象加锁。若mutex当前被其他进程持有，则返回0.否则，加锁成功，返回1.
-
-#### mutex_is_locked
-
-**`void mutex_is_locked(mutex_t *lock)`**
-
-&emsp;&emsp;判断mutex是否已被加锁。若给定的mutex已处于上锁状态，则返回1，否则返回0。

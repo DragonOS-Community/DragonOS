@@ -1,12 +1,12 @@
 .. note:: AI Translation Notice
 
-   This document was automatically translated by `Qwen/Qwen3-8B` model, for reference only.
+   This document was automatically translated by `hunyuan-turbos-latest` model, for reference only.
 
    - Source document: kernel/locking/index.rst
 
-   - Translation time: 2025-05-19 01:41:08
+   - Translation time: 2026-01-05 12:00:59
 
-   - Translation model: `Qwen/Qwen3-8B`
+   - Translation model: `hunyuan-turbos-latest`
 
 
    Please report issues via `Community Channel <https://github.com/DragonOS-Community/DragonOS/issues>`_
@@ -15,12 +15,13 @@
 Locks
 ====================================
 
-   This is the documentation explaining the lock variables in DragonOS.
+   This is the documentation for lock variables in DragonOS.
 
 .. toctree::
    :maxdepth: 1
 
    locks
    spinlock
-   mutex
    rwlock
+   mutex
+   rwsem

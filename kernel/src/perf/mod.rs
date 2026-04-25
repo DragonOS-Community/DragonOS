@@ -1,5 +1,6 @@
 mod bpf;
 mod kprobe;
+mod sys_perf_event_open;
 mod tracepoint;
 mod util;
 
@@ -17,7 +18,7 @@ use crate::include::bindings::linux_bpf::{
     perf_event_attr, perf_event_sample_format, perf_sw_ids, perf_type_id,
 };
 use crate::libs::casting::DowncastArc;
-use crate::libs::spinlock::{SpinLock, SpinLockGuard};
+use crate::libs::mutex::MutexGuard;
 use crate::mm::allocator::page_frame::{
     allocate_page_frames, deallocate_page_frames, PageFrameCount, PhysPageFrame,
 };
@@ -26,10 +27,7 @@ use crate::mm::{MemoryManagementArch, VirtAddr, VmFaultReason};
 use crate::perf::bpf::BpfPerfEvent;
 use crate::perf::util::{PerfEventIoc, PerfEventOpenFlags, PerfProbeArgs, PerfProbeConfig};
 use crate::process::ProcessManager;
-use crate::syscall::user_access::UserBufferReader;
-use crate::syscall::Syscall;
 use alloc::boxed::Box;
-use alloc::collections::LinkedList;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -169,7 +167,7 @@ impl PerfEventInode {
     pub fn new(event: Box<dyn PerfEventOps>) -> Self {
         Self {
             event,
-            epitems: SpinLock::new(LinkedList::new()),
+            epitems: LockedEPItemLinkedList::default(),
         }
     }
     fn do_poll(&self) -> Result<usize> {
@@ -198,10 +196,10 @@ impl IndexNode for PerfEventInode {
     fn mmap(&self, start: usize, len: usize, offset: usize) -> Result<()> {
         self.event.mmap(start, len, offset)
     }
-    fn open(&self, _data: SpinLockGuard<FilePrivateData>, _flags: &FileFlags) -> Result<()> {
+    fn open(&self, _data: MutexGuard<FilePrivateData>, _flags: &FileFlags) -> Result<()> {
         Ok(())
     }
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<()> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<()> {
         Ok(())
     }
     fn read_at(
@@ -209,7 +207,7 @@ impl IndexNode for PerfEventInode {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize> {
         panic!("read_at not implemented for PerfEvent");
     }
@@ -219,7 +217,7 @@ impl IndexNode for PerfEventInode {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize> {
         panic!("write_at not implemented for PerfEvent");
     }
@@ -237,7 +235,12 @@ impl IndexNode for PerfEventInode {
         Ok(())
     }
 
-    fn ioctl(&self, cmd: u32, data: usize, _private_data: &FilePrivateData) -> Result<usize> {
+    fn ioctl(
+        &self,
+        cmd: u32,
+        data: usize,
+        _private_data: MutexGuard<FilePrivateData>,
+    ) -> Result<usize> {
         let req = PerfEventIoc::from_u32(cmd).ok_or(SystemError::EINVAL)?;
         info!("perf_event_ioctl: request: {:?}, arg: {}", req, data);
         match req {
@@ -351,24 +354,6 @@ impl FileSystem for PerfFakeFs {
     }
 }
 
-impl Syscall {
-    pub fn sys_perf_event_open(
-        attr: *const u8,
-        pid: i32,
-        cpu: i32,
-        group_fd: i32,
-        flags: u32,
-    ) -> Result<usize> {
-        let buf = UserBufferReader::new(
-            attr as *const perf_event_attr,
-            size_of::<perf_event_attr>(),
-            true,
-        )?;
-        let attr = buf.read_one_from_user(0)?;
-        perf_event_open(attr, pid, cpu, group_fd, flags)
-    }
-}
-
 pub fn perf_event_open(
     attr: &perf_event_attr,
     pid: i32,
@@ -386,6 +371,7 @@ pub fn perf_event_open(
     } else {
         FileFlags::O_RDWR
     };
+    let cloexec = file_mode.contains(FileFlags::O_CLOEXEC);
 
     let event: Box<dyn PerfEventOps> = match args.type_ {
         // Kprobe
@@ -423,7 +409,10 @@ pub fn perf_event_open(
     }
     let file = File::new(perf_event, file_mode)?;
     let fd_table = ProcessManager::current_pcb().fd_table();
-    let fd = fd_table.write().alloc_fd(file, None).map(|x| x as usize)?;
+    let fd = fd_table
+        .write()
+        .alloc_fd(file, None, cloexec)
+        .map(|x| x as usize)?;
     Ok(fd)
 }
 

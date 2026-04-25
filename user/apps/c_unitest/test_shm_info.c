@@ -63,7 +63,7 @@ int main() {
   // IPC_INFO
   printf("IPC_INFO:\n");
   struct shminfo shmmetainfo;
-  if (shmctl(shmid, IPC_INFO, &shmmetainfo) == -1) { // 获取共享内存段信息
+  if (shmctl(shmid, IPC_INFO, (struct shmid_ds *)&shmmetainfo) == -1) { // 获取共享内存段信息
     perror("shmctl");
     exit(EXIT_FAILURE);
   }
@@ -77,11 +77,11 @@ int main() {
   printf("\n");
   printf("SHM_INFO:\n");
   struct shm_info shm_info;
-  if (shmctl(shmid, SHM_INFO, &shm_info) == -1) { // 获取共享内存段信息
+  if (shmctl(shmid, SHM_INFO, (struct shmid_ds *)&shm_info) == -1) { // 获取共享内存段信息
     perror("shmctl");
     exit(EXIT_FAILURE);
   }
-  printf("__used_ids: %lu\n", shm_info.__used_ids);
+  printf("__used_ids: %d\n", shm_info.__used_ids);
   printf("shm_tot: %lu\n", shm_info.shm_tot);
   printf("shm_rss: %lu\n", shm_info.shm_rss);
   printf("shm_swp: %lu\n", shm_info.shm_swp);

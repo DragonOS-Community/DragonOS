@@ -36,10 +36,7 @@ use crate::{
         },
     },
     init::initcall::INITCALL_DEVICE,
-    libs::{
-        rwlock::{RwLock, RwLockWriteGuard},
-        spinlock::SpinLockGuard,
-    },
+    libs::{mutex::MutexGuard, rwlock::RwLock},
     mm::VirtAddr,
     process::ProcessManager,
     syscall::user_access::{UserBufferReader, UserBufferWriter},
@@ -79,12 +76,15 @@ impl InnerTtyDevice {
             inode: None,
             driver: None,
             can_match: false,
-            metadata: Metadata::new(FileType::CharDevice, InodeMode::from_bits_truncate(0o755)),
+            metadata: {
+                let mut md =
+                    Metadata::new(FileType::CharDevice, InodeMode::from_bits_truncate(0o755));
+                // 对于字符设备，选择与 Linux devpts/devfs 一致的首选 I/O 块大小。
+                // 1024 满足测试期望 (允许 1024 或 4096)。
+                md.blk_size = 1024;
+                md
+            },
         }
-    }
-
-    pub fn metadata_mut(&mut self) -> &mut Metadata {
-        &mut self.metadata
     }
 }
 
@@ -141,7 +141,7 @@ impl TtyDevice {
         Arc::new(dev)
     }
 
-    pub fn inner_write(&self) -> RwLockWriteGuard<'_, InnerTtyDevice> {
+    pub fn inner_write(&self) -> crate::libs::rwlock::RwLockWriteGuard<'_, InnerTtyDevice> {
         self.inner.write()
     }
 
@@ -221,19 +221,32 @@ impl PollableInode for TtyDevice {
 impl IndexNode for TtyDevice {
     fn open(
         &self,
-        mut data: SpinLockGuard<FilePrivateData>,
+        mut data: MutexGuard<FilePrivateData>,
         mode: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         if self.tty_type == TtyType::Pty(PtyType::Ptm) {
-            return ptmx_open(data, mode);
+            return ptmx_open(self, data, mode);
         }
         let dev_num = self.metadata()?.raw_dev;
+        // /dev/tty 仅在已有控制终端时才能打开；否则返回 ENXIO
+        let mut tty = if dev_num == DeviceNumber::new(Major::TTYAUX_MAJOR, 0) {
+            if let Some(current) = self.open_current_tty(dev_num, &mut data) {
+                Some(current)
+            } else {
+                return Err(SystemError::ENXIO);
+            }
+        } else {
+            None
+        };
+
         // log::debug!(
         //     "TtyDevice::open: dev_num: {}, current pid: {}",
         //     dev_num,
         //     ProcessManager::current_pid()
         // );
-        let mut tty = self.open_current_tty(dev_num, &mut data);
+        if tty.is_none() {
+            tty = self.open_current_tty(dev_num, &mut data);
+        }
         if tty.is_none() {
             let (index, driver) =
                 TtyDriverManager::lookup_tty_driver(dev_num).ok_or(SystemError::ENODEV)?;
@@ -260,21 +273,22 @@ impl IndexNode for TtyDevice {
         }
 
         let driver = tty.core().driver();
-        // 考虑noctty（当前tty）
+        // 考虑 O_NOCTTY：显式指定则不设置控制终端；pty master 也不会成为控制终端。
         if !(mode.contains(FileFlags::O_NOCTTY)
-            && dev_num == DeviceNumber::new(Major::TTY_MAJOR, 0)
-            || dev_num == DeviceNumber::new(Major::TTYAUX_MAJOR, 1)
             || (driver.tty_driver_type() == TtyDriverType::Pty
                 && driver.tty_driver_sub_type() == TtyDriverSubType::PtyMaster))
         {
             let pcb = ProcessManager::current_pcb();
             let pcb_tty = pcb.sig_info_irqsave().tty();
-
-            let cond1 = pcb_tty.is_none();
-            let _cond2 = tty.core().contorl_info_irqsave().session.is_none();
-
-            // 注意！！这里为了debug,临时把cond2的判断去掉了，其实要cond1 && cond2才对
-            if cond1 {
+            let is_session_leader = pcb.sig_info_irqsave().is_session_leader;
+            let tty_session_is_none = tty.core().contorl_info_irqsave().session.is_none();
+            // Linux tty_open_proc_set_tty 语义：必须是会话首进程、尚无 controlling tty、
+            // tty 当前未被会话占用，且本次 open 具备读权限（不是 O_WRONLY）。
+            if is_session_leader
+                && pcb_tty.is_none()
+                && tty_session_is_none
+                && !mode.is_write_only()
+            {
                 TtyJobCtrlManager::proc_set_tty(tty);
             }
         }
@@ -287,7 +301,7 @@ impl IndexNode for TtyDevice {
         _offset: usize,
         len: usize,
         buf: &mut [u8],
-        data: SpinLockGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
         let (tty, flags) = if let FilePrivateData::Tty(tty_priv) = &*data {
             (tty_priv.tty(), tty_priv.flags)
@@ -300,18 +314,24 @@ impl IndexNode for TtyDevice {
         let ld = tty.ldisc();
         let mut offset = 0;
         let mut cookie = false;
+
+        // 边界检查：防止整数下溢
+        if len > buf.len() {
+            return Err(SystemError::EINVAL);
+        }
+
         loop {
-            let mut size = if len > buf.len() { buf.len() } else { len };
-            size = ld.read(tty.clone(), buf, size, &mut cookie, offset, flags)?;
-            // 没有更多数据
+            let mut size = (len - offset).min(buf.len() - offset);
+            size = ld.read(tty.clone(), &mut buf[offset..], size, &mut cookie, 0, flags)?;
+            // 本次迭代未读取到数据，可能是EOF或暂时无数据可读
             if size == 0 {
                 break;
             }
 
             offset += size;
 
-            // 缓冲区写满
-            if offset >= len {
+            // 已满足读取请求或缓冲区已满
+            if offset >= len || offset >= buf.len() {
                 break;
             }
 
@@ -329,7 +349,7 @@ impl IndexNode for TtyDevice {
         _offset: usize,
         len: usize,
         buf: &[u8],
-        data: SpinLockGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
         let mut count = len;
         let (tty, flags) = if let FilePrivateData::Tty(tty_priv) = &*data {
@@ -413,7 +433,7 @@ impl IndexNode for TtyDevice {
         None
     }
 
-    fn close(&self, data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         let (tty, _flags) = if let FilePrivateData::Tty(tty_priv) = &*data {
             (tty_priv.tty(), tty_priv.flags)
         } else {
@@ -428,12 +448,20 @@ impl IndexNode for TtyDevice {
         Ok(())
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize, data: &FilePrivateData) -> Result<usize, SystemError> {
-        let (tty, _) = if let FilePrivateData::Tty(tty_priv) = data {
+    fn ioctl(
+        &self,
+        cmd: u32,
+        arg: usize,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        let (tty, _) = if let FilePrivateData::Tty(tty_priv) = &*data {
             (tty_priv.tty(), tty_priv.flags)
         } else {
             return Err(SystemError::EIO);
         };
+
+        // Drop the lock early: tty ioctl paths may block.
+        drop(data);
 
         match cmd {
             TtyIoctlCmd::TIOCSETD
@@ -587,13 +615,13 @@ impl KObject for TtyDevice {
 
     fn kobj_state(
         &self,
-    ) -> crate::libs::rwlock::RwLockReadGuard<'_, crate::driver::base::kobject::KObjectState> {
+    ) -> crate::libs::rwsem::RwSemReadGuard<'_, crate::driver::base::kobject::KObjectState> {
         self.kobj_state.read()
     }
 
     fn kobj_state_mut(
         &self,
-    ) -> crate::libs::rwlock::RwLockWriteGuard<'_, crate::driver::base::kobject::KObjectState> {
+    ) -> crate::libs::rwsem::RwSemWriteGuard<'_, crate::driver::base::kobject::KObjectState> {
         self.kobj_state.write()
     }
 

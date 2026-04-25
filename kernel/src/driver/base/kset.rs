@@ -11,20 +11,20 @@ use super::kobject::{
 };
 use crate::{
     filesystem::kernfs::KernFSInode,
-    libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+    libs::rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
 };
 use system_error::SystemError;
 
 #[derive(Debug)]
 pub struct KSet {
     /// 属于当前kset的kobject
-    kobjects: RwLock<Vec<Weak<dyn KObject>>>,
+    kobjects: RwSem<Vec<Weak<dyn KObject>>>,
     /// 节点的一些信息
-    inner: RwLock<InnerKSet>,
+    inner: RwSem<InnerKSet>,
     /// kobject的状态
     kobj_state: LockedKObjectState,
     /// 与父节点有关的一些信息
-    parent_data: RwLock<KSetParentData>,
+    parent_data: RwSem<KSetParentData>,
     self_ref: Weak<KSet>,
 }
 
@@ -46,10 +46,10 @@ impl core::cmp::PartialEq for KSet {
 impl KSet {
     pub fn new(name: String) -> Arc<Self> {
         let r = Self {
-            kobjects: RwLock::new(Vec::new()),
-            inner: RwLock::new(InnerKSet::new(name)),
+            kobjects: RwSem::new(Vec::new()),
+            inner: RwSem::new(InnerKSet::new(name)),
             kobj_state: LockedKObjectState::new(None),
-            parent_data: RwLock::new(KSetParentData::new(None, None)),
+            parent_data: RwSem::new(KSetParentData::new(None, None)),
             self_ref: Weak::default(),
         };
 
@@ -134,7 +134,7 @@ impl KSet {
         return self.self_ref.upgrade().unwrap();
     }
 
-    pub fn kobjects(&self) -> RwLockReadGuard<'_, Vec<Weak<dyn KObject>>> {
+    pub fn kobjects(&self) -> RwSemReadGuard<'_, Vec<Weak<dyn KObject>>> {
         return self.kobjects.read();
     }
 }
@@ -160,11 +160,11 @@ impl KObject for KSet {
         self.parent_data.write().parent = parent;
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 

@@ -16,5 +16,6 @@
 .. toctree::
    :maxdepth: 1
 
+   dunitest
    gvisor_syscall_test
 

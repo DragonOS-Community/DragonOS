@@ -100,13 +100,68 @@ fn test_mmap_allocator() {
 
     match mmap.allocate_page() {
         Some(sp) => {
-            sp.bitfield.initialize(8, OBJECT_PAGE_SIZE - 80);
+            sp.bitfield
+                .initialize(8, OBJECT_PAGE_SIZE - OBJECT_PAGE_METADATA_OVERHEAD);
             assert!(!sp.is_full(), "Got empty slab");
             assert!(sp.is_empty(6 * 64), "Got empty slab");
             mmap.release_page(sp)
         }
         None => panic!("failed to allocate ObjectPage"),
     }
+}
+
+#[test]
+fn page_list_state_migration_full_partial_empty() {
+    let _ = env_logger::try_init();
+    let mut pager = Pager::new();
+    let mut sa: SCAllocator<ObjectPage> = SCAllocator::new(8);
+    let layout = Layout::from_size_align(8, 1).unwrap();
+
+    // Provide exactly one page to the allocator.
+    let page = pager.allocate_page().expect("Can't allocate a page");
+    unsafe { sa.refill(page) };
+
+    // Allocate until we run out of memory: with a single page, this should end in Full.
+    let mut objs: Vec<NonNull<u8>> = Vec::new();
+    loop {
+        match sa.allocate(layout) {
+            Ok(p) => objs.push(p),
+            Err(AllocationError::OutOfMemory) => break,
+            Err(AllocationError::InvalidLayout) => unreachable!("Unexpected error"),
+        }
+    }
+
+    assert_eq!(
+        sa.full_slabs.elements, 1,
+        "single page should end up in full list"
+    );
+    assert_eq!(sa.slabs.elements, 0);
+    assert_eq!(sa.empty_slabs.elements, 0);
+
+    // Free one object: Full -> Partial.
+    let one = objs.pop().expect("must have at least one allocation");
+    unsafe { sa.deallocate(one, layout).expect("Can't deallocate") };
+    assert_eq!(sa.full_slabs.elements, 0, "full -> partial on first free");
+    assert_eq!(sa.slabs.elements, 1);
+    assert_eq!(sa.empty_slabs.elements, 0);
+
+    // Free all remaining objects: Partial -> Empty.
+    for p in objs.drain(..) {
+        unsafe { sa.deallocate(p, layout).expect("Can't deallocate") };
+    }
+
+    assert_eq!(sa.full_slabs.elements, 0);
+    assert_eq!(sa.slabs.elements, 0);
+    assert_eq!(
+        sa.empty_slabs.elements, 1,
+        "page should become empty after last free"
+    );
+
+    // Reclaim and ensure pager sees it returned.
+    sa.try_reclaim_pages(usize::MAX, &mut |p: *mut ObjectPage| unsafe {
+        pager.release_page(&mut *p)
+    });
+    assert_eq!(pager.currently_allocated(), 0);
 }
 
 macro_rules! test_sc_allocation {
@@ -177,7 +232,6 @@ macro_rules! test_sc_allocation {
                 }
 
                 objects.clear();
-                sa.check_page_assignments();
 
                 // then allocate everything again,
                 for _ in 0..$allocations {
@@ -464,8 +518,12 @@ pub fn check_is_full_8() {
     let layout = Layout::from_size_align(8, 1).unwrap();
 
     let mut page: ObjectPage = Default::default();
-    page.bitfield.initialize(8, OBJECT_PAGE_SIZE - 80);
-    let obj_per_page = core::cmp::min((OBJECT_PAGE_SIZE - 80) / 8, 8 * 64);
+    page.bitfield
+        .initialize(8, OBJECT_PAGE_SIZE - OBJECT_PAGE_METADATA_OVERHEAD);
+    let obj_per_page = core::cmp::min(
+        (OBJECT_PAGE_SIZE - OBJECT_PAGE_METADATA_OVERHEAD) / 8,
+        8 * 64,
+    );
 
     let mut allocs = 0;
     loop {
@@ -494,9 +552,13 @@ pub fn check_is_full_8() {
 pub fn check_is_full_512() {
     let _r = env_logger::try_init();
     let mut page: ObjectPage = Default::default();
-    page.bitfield.initialize(512, OBJECT_PAGE_SIZE - 80);
+    page.bitfield
+        .initialize(512, OBJECT_PAGE_SIZE - OBJECT_PAGE_METADATA_OVERHEAD);
     let layout = Layout::from_size_align(512, 1).unwrap();
-    let obj_per_page = core::cmp::min((OBJECT_PAGE_SIZE - 80) / 512, 6 * 64);
+    let obj_per_page = core::cmp::min(
+        (OBJECT_PAGE_SIZE - OBJECT_PAGE_METADATA_OVERHEAD) / 512,
+        6 * 64,
+    );
 
     let mut allocs = 0;
     loop {
@@ -506,7 +568,7 @@ pub fn check_is_full_512() {
 
         allocs += 1;
 
-        if allocs < (OBJECT_PAGE_SIZE - 80) / 512 {
+        if allocs < (OBJECT_PAGE_SIZE - OBJECT_PAGE_METADATA_OVERHEAD) / 512 {
             assert!(!page.is_full());
             assert!(!page.is_empty(obj_per_page));
         }

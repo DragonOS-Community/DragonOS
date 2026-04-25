@@ -27,7 +27,6 @@ macro_rules! _wq_wait_event_interruptible {
     ($wq:expr, $condition: expr, $cmd: expr) => {{
         wait_queue_macros::__wq_wait_event!($wq, $condition, true, Ok(()), {
             $cmd;
-            crate::sched::schedule(SchedMode::SM_NONE)
         })
     }};
 }
@@ -36,23 +35,18 @@ macro_rules! _wq_wait_event_interruptible {
 macro_rules! __wq_wait_event(
     ($wq:expr, $condition: expr, $interruptible: expr, $ret: expr, $cmd:expr) => {{
         let mut retval = $ret;
-        let mut exec_finish_wait = true;
         loop {
-            let x = $wq.prepare_to_wait_event($interruptible);
-            if $condition {
+            if $condition { break; }
+            let res = if $interruptible {
+                $wq.wait_event_interruptible(|| $condition, Some(|| $cmd))
+            } else {
+                $wq.wait_event_uninterruptible(|| $condition, Some(|| $cmd))
+            };
+            if let Err(e) = res {
+                retval = Err(e);
                 break;
             }
-
-            if $interruptible && !x.is_ok() {
-                retval = x;
-                exec_finish_wait = false;
-                break;
-            }
-
-            $cmd;
-        }
-        if exec_finish_wait {
-            $wq.finish_wait();
+            if $condition { break; }
         }
 
         retval

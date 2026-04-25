@@ -1,0 +1,21 @@
+# 需要rootfs支持符号链接
+ExecTest.InterpreterScript
+ExecTest.InterpreterScriptArgSplit
+ExecTest.InterpreterScriptArgvZero
+ExecTest.InterpreterScriptArgvZeroRelative
+ExecTest.InterpreterScriptArgvZeroAdded
+ExecTest.InterpreterScriptArgNUL
+ExecTest.InterpreterScriptArgWhitespace
+
+# 需要支持ptrace
+ExecTest.Setpgid
+
+# 需要/bin/echo,而fat不支持符号链接
+ExecTest.ExecFn
+ExecTest.ExecNameScript
+ExecTest.SymlinkLimitRefreshedForInterpreter
+ExecveatTest.SymlinkNoFollowIgnoreSymlinkAncestor
+ExecveatTest.SymlinkNoFollowWithNormalFile
+
+# 需要set priority
+GetpriorityTest.ExecveMaintainsPriority

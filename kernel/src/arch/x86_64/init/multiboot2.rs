@@ -247,7 +247,29 @@ impl BootCallbacks for Mb2Callback {
     }
 
     fn init_memmap_bp(&self) -> Result<(), SystemError> {
-        log::error!("mb2, init_memmap_bp is not impled");
+        let mb2_info = MB2_INFO.get();
+        let mem_regions_tag = mb2_info
+            .memory_map_tag()
+            .expect("MB2: Memory map tag not found!");
+
+        let mut bp = boot_params().write_irqsave();
+        let total_regions = mem_regions_tag.memory_areas().len();
+        for (imported, region) in mem_regions_tag.memory_areas().iter().enumerate() {
+            // Multiboot2 memory map type 与 E820 常见值兼容（1/2/3/4/5），
+            // 对于扩展类型（如 7/12）按原值透传，便于后续 PMEM 识别。
+            if !bp
+                .arch
+                .add_e820_entry(region.start_address(), region.size(), region.typ().into())
+            {
+                log::warn!(
+                    "MB2 E820 map truncated: imported {} of {} entries (capacity={})",
+                    imported,
+                    total_regions,
+                    bp.arch.e820_table.len()
+                );
+                break;
+            }
+        }
         Ok(())
     }
 }

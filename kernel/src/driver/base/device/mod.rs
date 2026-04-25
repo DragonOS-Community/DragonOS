@@ -21,7 +21,7 @@ use crate::{
         vfs::InodeMode,
     },
     libs::{
-        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+        rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
 };
@@ -404,12 +404,10 @@ impl IdTable {
     /// @parameter None
     /// @return: 设备名
     pub fn name(&self) -> String {
-        if self.id.is_none() {
-            return self.basename.clone();
-        } else {
-            let id = self.id.unwrap();
+        if let Some(id) = self.id {
             return format!("{}:{}", id.major().data(), id.minor());
         }
+        self.basename.clone()
     }
 
     pub fn device_number(&self) -> DeviceNumber {
@@ -1098,11 +1096,10 @@ impl DeviceId {
     }
 
     pub fn id(&self) -> Option<&str> {
-        if self.data.is_some() {
-            return Some(self.data.unwrap());
-        } else {
-            return self.allocated.as_deref();
+        if let Some(data) = self.data {
+            return Some(data);
         }
+        self.allocated.as_deref()
     }
 
     #[allow(dead_code)]
@@ -1130,7 +1127,7 @@ impl IrqHandlerData for DeviceId {}
 
 lazy_static! {
     /// class_dir列表，通过parent kobject的name和class_dir的name来索引class_dir实例
-    static ref CLASS_DIR_KSET_INSTANCE: RwLock<BTreeMap<String, Arc<ClassDir>>> = RwLock::new(BTreeMap::new());
+    static ref CLASS_DIR_KSET_INSTANCE: RwSem<BTreeMap<String, Arc<ClassDir>>> = RwSem::new(BTreeMap::new());
 }
 
 #[derive(Debug)]
@@ -1205,11 +1202,11 @@ impl KObject for ClassDir {
         self.inner().name = Some(name);
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.locked_kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.locked_kobj_state.write()
     }
 

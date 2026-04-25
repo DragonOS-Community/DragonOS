@@ -1,45 +1,94 @@
 use core::{
     fmt,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 use log::error;
 use system_error::SystemError;
 
-use super::{FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
+use super::{
+    append_lock::with_inode_append_lock, mount::MountFSInode, utils::should_remove_sgid, FileType,
+    IndexNode, InodeId, Metadata, SpecialNodeData,
+};
+use crate::{arch::ipc::signal::Signal, filesystem::vfs::InodeFlags, process::pid::PidPrivateData};
 use crate::{
     arch::MMArch,
     driver::{
         base::{block::SeekFrom, device::DevicePrivateData},
+        block::loop_device::LoopPrivateData,
         tty::tty_device::TtyFilePrivateData,
     },
     filesystem::{
         epoll::{event_poll::EPollPrivateData, EPollItem},
+        fuse::private_data::FuseFilePrivateData,
         procfs::ProcfsFilePrivateData,
         vfs::FilldirContext,
     },
     ipc::{kill::send_signal_to_pid, pipe::PipeFsPrivateData},
-    libs::{rwlock::RwLock, spinlock::SpinLock},
+    libs::{casting::DowncastArc, mutex::Mutex, rwsem::RwSem},
     mm::{
         page::PageFlags,
         readahead::{page_cache_async_readahead, page_cache_sync_readahead, FileReadaheadState},
         MemoryManagementArch,
     },
     process::{
-        cred::Cred,
+        cred::{CAPFlags, Cred},
         namespace::{
-            ipc_namespace::IpcNamespace, mnt::MntNamespace, net_namespace::NetNamespace,
-            pid_namespace::PidNamespace, user_namespace::UserNamespace,
-            uts_namespace::UtsNamespace,
+            cgroup_namespace::CgroupNamespace, ipc_namespace::IpcNamespace, mnt::MntNamespace,
+            net_namespace::NetNamespace, pid_namespace::PidNamespace,
+            user_namespace::UserNamespace, uts_namespace::UtsNamespace,
         },
         resource::RLimitID,
         ProcessControlBlock, ProcessManager, RawPid,
     },
 };
-use crate::{filesystem::vfs::InodeFlags, process::pid::PidPrivateData};
+
+use crate::filesystem::vfs::InodeMode;
 
 const MAX_LFS_FILESIZE: i64 = i64::MAX;
+static NEXT_OPEN_FILE_ID: AtomicUsize = AtomicUsize::new(1);
+static NEXT_LOCK_OWNER_ID: AtomicUsize = AtomicUsize::new(1);
+
+#[inline]
+fn alloc_open_file_id() -> usize {
+    NEXT_OPEN_FILE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+#[inline]
+fn alloc_lock_owner_id() -> usize {
+    NEXT_LOCK_OWNER_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn canonical_inode_for_posix_lock(mut inode: Arc<dyn IndexNode>) -> Arc<dyn IndexNode> {
+    loop {
+        match inode.clone().downcast_arc::<MountFSInode>() {
+            Some(mnt_inode) => inode = mnt_inode.underlying_inode(),
+            None => return inode,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum OffsetUpdate {
+    /// Sequential write path: advance file offset by written length.
+    Add,
+    /// Append path: set file offset to end-of-write (actual_offset + written_len).
+    StoreEnd,
+}
+
+/// 写操作的配置参数
+#[derive(Clone, Copy)]
+struct WriteConfig {
+    /// 是否更新文件偏移量
+    update_offset: bool,
+    /// 偏移量更新方式
+    offset_update: OffsetUpdate,
+    /// 文件标志
+    flags: FileFlags,
+    /// inode 标志
+    inode_flags: InodeFlags,
+}
 /// Namespace fd backing data, typically created from /proc/thread-self/ns/* files.
 #[derive(Clone)]
 #[allow(dead_code)]
@@ -53,7 +102,9 @@ pub enum NamespaceFilePrivateData {
     /// PID namespace for children.
     PidForChildren(Arc<PidNamespace>),
     User(Arc<UserNamespace>),
-    // Time/cgroup namespaces are not implemented yet.
+    /// Cgroup namespace.
+    Cgroup(Arc<CgroupNamespace>),
+    // Time namespace is not implemented yet.
 }
 
 impl fmt::Debug for NamespaceFilePrivateData {
@@ -68,6 +119,9 @@ impl fmt::Debug for NamespaceFilePrivateData {
                 f.write_str("NamespaceFilePrivateData::PidForChildren(..)")
             }
             NamespaceFilePrivateData::User(_) => f.write_str("NamespaceFilePrivateData::User(..)"),
+            NamespaceFilePrivateData::Cgroup(_) => {
+                f.write_str("NamespaceFilePrivateData::Cgroup(..)")
+            }
         }
     }
 }
@@ -88,8 +142,14 @@ pub enum FilePrivateData {
     EPoll(EPollPrivateData),
     /// pid私有信息
     Pid(PidPrivateData),
+    //loop私有信息
+    Loop(LoopPrivateData),
     /// namespace fd 私有信息（/proc/thread-self/ns/* 打开后得到）
     Namespace(NamespaceFilePrivateData),
+    /// Socket file created by socket syscalls (not by VFS open(2)).
+    SocketCreate,
+    /// FUSE file private data.
+    Fuse(FuseFilePrivateData),
     /// 不需要文件私有信息
     Unused,
 }
@@ -345,34 +405,168 @@ impl FileMode {
 /// @brief 抽象文件结构体
 #[derive(Debug)]
 pub struct File {
+    /// 唯一 open file description id，用于 flock owner 标识。
+    open_file_id: usize,
     inode: Arc<dyn IndexNode>,
     /// 对于文件，表示字节偏移量；对于文件夹，表示当前操作的子目录项偏移量
     offset: AtomicUsize,
     /// 文件的打开模式
-    flags: RwLock<FileFlags>,
+    flags: RwSem<FileFlags>,
     /// 文件的访问模式
-    mode: RwLock<FileMode>,
+    mode: RwSem<FileMode>,
     /// 文件类型
     file_type: FileType,
     /// readdir时候用的，暂存的本次循环中，所有子目录项的名字的数组
-    readdir_subdirs_name: SpinLock<Vec<String>>,
-    pub private_data: SpinLock<FilePrivateData>,
+    readdir_subdirs_name: Mutex<Vec<String>>,
+    pub private_data: Mutex<FilePrivateData>,
     /// 文件的凭证
     cred: Arc<Cred>,
-    /// 文件描述符标志：是否在execve时关闭
-    close_on_exec: AtomicBool,
     /// owner
-    pid: SpinLock<Option<Arc<ProcessControlBlock>>>,
+    pid: Mutex<Option<Arc<ProcessControlBlock>>>,
+    /// Stable key for POSIX record locks. Cached at open time to avoid metadata fetch
+    /// in close/drop_fd path (which can deadlock with user-space FUSE daemon).
+    posix_lock_key: (usize, InodeId),
     /// 预读状态
-    ra_state: SpinLock<FileReadaheadState>,
+    ra_state: Mutex<FileReadaheadState>,
 }
 
 impl File {
+    fn maybe_kill_suid_sgid_after_write(&self) -> Result<(), SystemError> {
+        // 仅对普通文件生效。
+        if self.file_type != FileType::File {
+            return Ok(());
+        }
+
+        // Linux 语义：若调用者具备 CAP_FSETID，则写/截断不会清除 suid/sgid。
+        let cred = ProcessManager::current_pcb().cred();
+        if cred.has_capability(CAPFlags::CAP_FSETID) {
+            return Ok(());
+        }
+
+        let mut md = self.inode.metadata()?;
+        if !md.mode.intersects(InodeMode::S_ISUID | InodeMode::S_ISGID) {
+            return Ok(());
+        }
+
+        // suid always must be killed on write/truncate when no CAP_FSETID.
+        md.mode.remove(InodeMode::S_ISUID);
+
+        // setgid 清理规则与 Linux fs/attr.c:setattr_should_drop_sgid 对齐：
+        // - 若 S_IXGRP 置位：无条件清除（这是"真正的"SGID 可执行文件）
+        // - 否则（mandatory locking 语义）：仅当调用者不在文件所属组时清除
+        if should_remove_sgid(md.mode, md.gid, &cred) {
+            md.mode.remove(InodeMode::S_ISGID);
+        }
+
+        self.inode.set_metadata(&md)?;
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn limit_write_len_by_fsize(
+        &self,
+        file_type: FileType,
+        offset: usize,
+        len: usize,
+    ) -> Result<usize, SystemError> {
+        if !matches!(file_type, FileType::File) {
+            return Ok(len);
+        }
+        let current_pcb = ProcessManager::current_pcb();
+        let fsize_limit = current_pcb.get_rlimit(RLimitID::Fsize);
+
+        if fsize_limit.rlim_cur == u64::MAX {
+            return Ok(len);
+        }
+
+        let limit = fsize_limit.rlim_cur as usize;
+        if offset >= limit {
+            let _ = send_signal_to_pid(
+                current_pcb.raw_pid(),
+                crate::arch::ipc::signal::Signal::SIGXFSZ,
+            );
+            return Err(SystemError::EFBIG);
+        }
+
+        Ok(len.min(limit.saturating_sub(offset)))
+    }
+
+    fn maybe_sync_after_write(
+        &self,
+        flags: FileFlags,
+        inode_flags: InodeFlags,
+    ) -> Result<(), SystemError> {
+        // O_SYNC 包含 O_DSYNC 位，所以只需检查 O_DSYNC 即可判断是否需要数据同步
+        let need_data_sync = flags.contains(FileFlags::O_DSYNC);
+        // 检查是否需要元数据同步（O_SYNC = __O_SYNC | O_DSYNC）
+        let need_metadata_sync = flags.contains(FileFlags::__O_SYNC);
+
+        // inode 级别的 S_SYNC 标志
+        let inode_sync = inode_flags.contains(InodeFlags::S_SYNC);
+
+        if need_data_sync || inode_sync {
+            if need_metadata_sync || inode_sync {
+                // O_SYNC 或 S_SYNC: 完整同步（数据 + 元数据）
+                self.inode.sync_file(false, self.private_data.lock())?;
+            } else {
+                // O_DSYNC: 仅数据同步
+                self.inode.sync_file(true, self.private_data.lock())?;
+            }
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn write_at_and_finalize(
+        &self,
+        actual_offset: usize,
+        actual_len: usize,
+        buf: &[u8],
+        config: WriteConfig,
+    ) -> Result<usize, SystemError> {
+        let written_len =
+            self.inode
+                .write_at(actual_offset, actual_len, buf, self.private_data.lock())?;
+
+        if written_len > 0 {
+            self.maybe_kill_suid_sgid_after_write()?;
+        }
+
+        if config.update_offset {
+            match config.offset_update {
+                OffsetUpdate::StoreEnd => {
+                    self.offset.store(
+                        actual_offset + written_len,
+                        core::sync::atomic::Ordering::SeqCst,
+                    );
+                }
+                OffsetUpdate::Add => {
+                    self.offset
+                        .fetch_add(written_len, core::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }
+
+        self.maybe_sync_after_write(config.flags, config.inode_flags)?;
+        Ok(written_len)
+    }
     /// @brief 创建一个新的文件对象
     ///
     /// @param inode 文件对象对应的inode
     /// @param flags 文件的打开模式
-    pub fn new(inode: Arc<dyn IndexNode>, mut flags: FileFlags) -> Result<Self, SystemError> {
+    pub fn new(inode: Arc<dyn IndexNode>, flags: FileFlags) -> Result<Self, SystemError> {
+        Self::new_with_private_data(inode, flags, FilePrivateData::default())
+    }
+
+    /// Create a new file object with an explicit initial FilePrivateData.
+    ///
+    /// This is primarily used for objects that are not created via VFS open(2)
+    /// semantics (e.g. sockets created by socket syscalls).
+    pub fn new_with_private_data(
+        inode: Arc<dyn IndexNode>,
+        mut flags: FileFlags,
+        private_data_init: FilePrivateData,
+    ) -> Result<Self, SystemError> {
         let mut inode = inode;
         let file_type = inode.metadata()?.file_type;
         // 检查是否为命名管道（FIFO）
@@ -397,22 +591,35 @@ impl File {
             flags.insert(FileFlags::O_APPEND);
         }
 
-        let close_on_exec = flags.contains(FileFlags::O_CLOEXEC);
+        let canonical_inode = canonical_inode_for_posix_lock(inode.clone());
+        let posix_lock_key = if Arc::ptr_eq(&canonical_inode, &inode) {
+            (metadata.dev_id, metadata.inode_id)
+        } else {
+            let lock_md = canonical_inode.metadata()?;
+            (lock_md.dev_id, lock_md.inode_id)
+        };
+
+        // O_CLOEXEC 是 per-fd 属性，由 alloc_fd/alloc_fd_arc 的 cloexec 参数控制，
+        // 不存储在 File.flags 中。
         flags.remove(FileFlags::O_CLOEXEC);
 
         let mut mode = FileMode::open_fmode(flags);
 
-        let private_data = SpinLock::new(FilePrivateData::default());
+        let private_data = Mutex::new(private_data_init);
         inode.open(private_data.lock(), &flags)?;
 
-        // 设置默认能力 (可以在文件系统的open()中清除)
-        if file_type == FileType::File || file_type == FileType::Dir {
-            mode.insert(
-                FileMode::FMODE_LSEEK
-                    | FileMode::FMODE_PREAD
-                    | FileMode::FMODE_PWRITE
-                    | FileMode::FMODE_ATOMIC_POS,
-            );
+        // 设置默认能力（由 inode 能力接口统一决定；避免 syscall 层/字符串特判）
+        if inode.is_stream() {
+            mode.insert(FileMode::FMODE_STREAM);
+        }
+        if inode.supports_seek() {
+            mode.insert(FileMode::FMODE_LSEEK | FileMode::FMODE_ATOMIC_POS);
+        }
+        if inode.supports_pread() {
+            mode.insert(FileMode::FMODE_PREAD);
+        }
+        if inode.supports_pwrite() {
+            mode.insert(FileMode::FMODE_PWRITE);
         }
 
         // TODO: 检查inode是否有read/write方法,设置FMODE_CAN_READ/WRITE
@@ -433,20 +640,28 @@ impl File {
         }
 
         let f = File {
+            open_file_id: alloc_open_file_id(),
             inode,
             offset: AtomicUsize::new(0),
-            flags: RwLock::new(flags),
-            mode: RwLock::new(mode),
+            flags: RwSem::new(flags),
+            mode: RwSem::new(mode),
             file_type,
-            readdir_subdirs_name: SpinLock::new(Vec::default()),
+            readdir_subdirs_name: Mutex::new(Vec::default()),
             private_data,
             cred: ProcessManager::current_pcb().cred(),
-            close_on_exec: AtomicBool::new(close_on_exec),
-            pid: SpinLock::new(None),
-            ra_state: SpinLock::new(FileReadaheadState::new()),
+            pid: Mutex::new(None),
+            posix_lock_key,
+            ra_state: Mutex::new(FileReadaheadState::new()),
         };
 
         return Ok(f);
+    }
+
+    /// Create a file object for sockets created by socket syscalls.
+    ///
+    /// These should not be subject to open(2) pathname semantics.
+    pub fn new_socket(inode: Arc<dyn IndexNode>, flags: FileFlags) -> Result<Self, SystemError> {
+        Self::new_with_private_data(inode, flags, FilePrivateData::SocketCreate)
     }
 
     /// ## 从文件中读取指定的字节数到buffer中
@@ -468,6 +683,16 @@ impl File {
         )
     }
 
+    /// Read from the current file position without advancing it.
+    pub fn read_noadv(&self, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        self.do_read(
+            self.offset.load(core::sync::atomic::Ordering::SeqCst),
+            len,
+            buf,
+            false,
+        )
+    }
+
     /// ## 从buffer向文件写入指定的字节数的数据
     ///
     /// ### 参数
@@ -484,6 +709,7 @@ impl File {
             len,
             buf,
             true,
+            false,
         )
     }
 
@@ -497,6 +723,34 @@ impl File {
     /// ### 返回值
     /// - `Ok(usize)`: 成功读取的字节数
     pub fn pread(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        // Linux 语义：O_PATH fd 任何 I/O 都应返回 EBADF（优先于 ESPIPE）。
+        let mode = *self.mode.read();
+        if mode.contains(FileMode::FMODE_PATH) {
+            return Err(SystemError::EBADF);
+        }
+
+        // Linux 语义：对不可 seek 的“流式对象”（Pipe/Socket/部分伪文件等），
+        // pread/pwrite/preadv/pwritev 应返回 ESPIPE（优先于读写权限导致的 EBADF）。
+        // 这里用 FMODE_STREAM 作为 VFS 层收敛点，避免因 FMODE_PREAD/权限位组合导致误报 EBADF。
+        if mode.contains(FileMode::FMODE_STREAM) {
+            return Err(SystemError::ESPIPE);
+        }
+
+        // 对于不支持随机访问的文件（如管道），应该返回 ESPIPE，而不是因为权限问题返回 EBADF
+        if !mode.contains(FileMode::FMODE_PREAD) {
+            return Err(SystemError::ESPIPE);
+        }
+
+        // 检查读权限
+        if !mode.contains(FileMode::FMODE_READ) {
+            return Err(SystemError::EBADF);
+        }
+
+        // 检查读能力
+        if !mode.can_read() {
+            return Err(SystemError::EINVAL);
+        }
+
         self.do_read(offset, len, buf, false)
     }
 
@@ -510,10 +764,69 @@ impl File {
     /// ### 返回值
     /// - `Ok(usize)`: 成功写入的字节数
     pub fn pwrite(&self, offset: usize, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
-        self.do_write(offset, len, buf, false)
+        // Linux 语义：O_PATH fd 任何 I/O 都应返回 EBADF（优先于 ESPIPE）。
+        let mode = *self.mode.read();
+        if mode.contains(FileMode::FMODE_PATH) {
+            return Err(SystemError::EBADF);
+        }
+
+        // 同 pread：流式对象不支持随机偏移写入，返回 ESPIPE（优先于权限 EBADF）。
+        if mode.contains(FileMode::FMODE_STREAM) {
+            return Err(SystemError::ESPIPE);
+        }
+
+        // 对于不支持随机访问的文件（如管道），应该返回 ESPIPE，而不是因为权限问题返回 EBADF
+        if !mode.contains(FileMode::FMODE_PWRITE) {
+            return Err(SystemError::ESPIPE);
+        }
+
+        // 检查写权限
+        if !mode.contains(FileMode::FMODE_WRITE) {
+            return Err(SystemError::EBADF);
+        }
+
+        self.do_write(offset, len, buf, false, false)
+    }
+
+    /// 强制追加写（Linux `RWF_APPEND`/`IOCB_APPEND` 语义）：
+    /// - 对常规文件：忽略当前偏移/给定偏移，追加到 EOF
+    /// - 会推进本 fd 的文件偏移（类似 write）
+    pub fn write_append(&self, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        self.do_write(
+            self.offset.load(core::sync::atomic::Ordering::SeqCst),
+            len,
+            buf,
+            true,
+            true,
+        )
+    }
+
+    /// 强制追加 pwrite（Linux `RWF_APPEND` 语义）：
+    /// - 对常规文件：忽略给定 offset，追加到 EOF
+    /// - 不推进本 fd 的文件偏移（类似 pwrite）
+    pub fn pwrite_append(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+    ) -> Result<usize, SystemError> {
+        self.writeable()?;
+        if !self.mode().contains(FileMode::FMODE_PWRITE) {
+            return Err(SystemError::ESPIPE);
+        }
+        self.do_write(offset, len, buf, false, true)
     }
 
     fn file_readahead(&self, offset: usize, len: usize) -> Result<(), SystemError> {
+        if self.mode().contains(FileMode::FMODE_RANDOM) {
+            return Ok(());
+        }
+
+        // 检查文件系统是否支持 readahead
+        if !self.inode.fs().support_readahead() {
+            return Ok(());
+        }
+
         let page_cache = match self.inode.page_cache() {
             Some(page_cahce) => page_cahce,
             None => return Ok(()),
@@ -523,18 +836,12 @@ impl File {
         let end_page = (offset + len - 1) >> MMArch::PAGE_SHIFT;
 
         let (async_trigger_page, missing_page) = {
-            let page_cache_guard = page_cache.lock_irqsave();
             let mut async_trigger_page = None;
             let mut missing_page = None;
 
             for index in start_page..=end_page {
-                match page_cache_guard.get_page(index) {
-                    Some(page)
-                        if page
-                            .read_irqsave()
-                            .flags()
-                            .contains(PageFlags::PG_READAHEAD) =>
-                    {
+                match page_cache.manager().peek_page(index) {
+                    Some(page) if page.read().flags().contains(PageFlags::PG_READAHEAD) => {
                         async_trigger_page = Some((index, page.clone()));
                         break;
                     }
@@ -551,7 +858,7 @@ impl File {
         if let Some((index, page)) = async_trigger_page {
             let mut ra_state = self.ra_state.lock().clone();
             let req_pages = end_page - index + 1;
-            page.write_irqsave().remove_flags(PageFlags::PG_READAHEAD);
+            page.write().remove_flags(PageFlags::PG_READAHEAD);
 
             page_cache_async_readahead(&page_cache, &self.inode, &mut ra_state, index, req_pages)?;
             *self.ra_state.lock() = ra_state;
@@ -572,8 +879,11 @@ impl File {
         buf: &mut [u8],
         update_offset: bool,
     ) -> Result<usize, SystemError> {
-        // 先检查本文件在权限等规则下，是否可读取。
         self.readable()?;
+        // Linux/POSIX: count==0 must not touch the buffer and must not block.
+        if len == 0 {
+            return Ok(0);
+        }
         if buf.len() < len {
             return Err(SystemError::ENOBUFS);
         }
@@ -608,96 +918,73 @@ impl File {
         len: usize,
         buf: &[u8],
         update_offset: bool,
+        force_append: bool,
     ) -> Result<usize, SystemError> {
-        // 先检查本文件在权限等规则下，是否可写入。
         self.writeable()?;
 
         let inode_flags = self.get_inode_flags()?;
+        let flags = self.flags();
         // 检查 S_IMMUTABLE
         if inode_flags.contains(InodeFlags::S_IMMUTABLE) {
             return Err(SystemError::EPERM);
         }
         // S_APPEND 的 inode 只能追加写入
-        if inode_flags.contains(InodeFlags::S_APPEND) && !self.flags().contains(FileFlags::O_APPEND)
-        {
+        if inode_flags.contains(InodeFlags::S_APPEND) && !flags.contains(FileFlags::O_APPEND) {
             return Err(SystemError::EPERM);
         }
 
         if buf.len() < len {
             return Err(SystemError::ENOBUFS);
         }
-        // 获取文件类型
         let md = self.inode.metadata()?;
         let file_type = md.file_type;
 
-        // 检查RLIMIT_FSIZE限制（仅对常规文件生效）
-        let actual_len = if matches!(file_type, FileType::File) {
-            let current_pcb = ProcessManager::current_pcb();
-            let fsize_limit = current_pcb.get_rlimit(RLimitID::Fsize);
+        let is_append = (flags.contains(FileFlags::O_APPEND) || force_append)
+            && matches!(file_type, FileType::File);
 
-            if fsize_limit.rlim_cur != u64::MAX {
-                let limit = fsize_limit.rlim_cur as usize;
+        // Linux 语义要求 O_APPEND（以及 RWF_APPEND）在并发下满足“取 EOF + 写入”的原子性，
+        // 否则多个线程可能拿到相同 EOF 导致覆盖写，最终 size 比预期小。
+        if is_append {
+            let dev_id = md.dev_id;
+            let inode_id = md.inode_id;
+            return with_inode_append_lock(dev_id, inode_id, || {
+                // 在锁内刷新元数据，确保 EOF 是最新的。
+                let md = self.inode.metadata()?;
+                let actual_offset = md.size.max(0) as usize;
+                let actual_len = self.limit_write_len_by_fsize(file_type, actual_offset, len)?;
 
-                // 如果当前文件大小已经达到或超过限制，不允许写入
-                if offset >= limit {
-                    // 发送SIGXFSZ信号
-                    let _ = send_signal_to_pid(
-                        current_pcb.raw_pid(),
-                        crate::arch::ipc::signal::Signal::SIGXFSZ,
-                    );
-                    return Err(SystemError::EFBIG);
-                }
-
-                // 计算可写入的最大长度（不超过限制）
-                let max_writable = limit.saturating_sub(offset);
-                if len > max_writable {
-                    max_writable
-                } else {
-                    len
-                }
-            } else {
-                len
-            }
-        } else {
-            len
-        };
-
-        // 仅常规文件考虑“指针超过大小则扩展”语义；管道/字符设备等不应触发 resize
-        if matches!(file_type, FileType::File) && offset > md.size as usize {
-            self.inode.resize(offset)?;
-        }
-        let written_len = self
-            .inode
-            .write_at(offset, actual_len, buf, self.private_data.lock())?;
-
-        if update_offset {
-            self.offset
-                .fetch_add(written_len, core::sync::atomic::Ordering::SeqCst);
+                self.write_at_and_finalize(
+                    actual_offset,
+                    actual_len,
+                    buf,
+                    WriteConfig {
+                        update_offset,
+                        offset_update: OffsetUpdate::StoreEnd,
+                        flags,
+                        inode_flags,
+                    },
+                )
+            });
         }
 
-        let flags = self.flags();
-        // O_SYNC 包含 O_DSYNC 位，所以只需检查 O_DSYNC 即可判断是否需要数据同步
-        let need_data_sync = flags.contains(FileFlags::O_DSYNC);
-        // 检查是否需要元数据同步（O_SYNC = __O_SYNC | O_DSYNC）
-        let need_metadata_sync = flags.contains(FileFlags::__O_SYNC);
+        let actual_offset = offset;
+        let actual_len = self.limit_write_len_by_fsize(file_type, actual_offset, len)?;
 
-        // 也检查 inode 级别的 S_SYNC 标志
-        let inode_sync = self
-            .get_inode_flags()
-            .map(|f| f.contains(InodeFlags::S_SYNC))
-            .unwrap_or(false);
-
-        if need_data_sync || inode_sync {
-            if need_metadata_sync || inode_sync {
-                // O_SYNC 或 S_SYNC: 完整同步（数据 + 元数据）
-                self.inode.sync()?;
-            } else {
-                // O_DSYNC: 仅数据同步
-                self.inode.datasync()?;
-            }
+        if matches!(file_type, FileType::File) && actual_offset > md.size.max(0) as usize {
+            self.inode.resize(actual_offset)?;
         }
 
-        Ok(written_len)
+        self.write_at_and_finalize(
+            actual_offset,
+            actual_len,
+            buf,
+            WriteConfig {
+                update_offset,
+                offset_update: OffsetUpdate::Add,
+                flags,
+                inode_flags,
+            },
+        )
     }
 
     /// @brief 获取文件的元数据
@@ -715,13 +1002,16 @@ impl File {
     ///
     /// @param origin 调整的起始位置
     pub fn lseek(&self, origin: SeekFrom) -> Result<usize, SystemError> {
-        let file_type = self.inode.metadata()?.file_type;
-        match file_type {
-            FileType::Pipe | FileType::CharDevice => {
-                return Err(SystemError::ESPIPE);
-            }
-            _ => {}
+        let mode = self.mode();
+        // Linux 语义：O_PATH fd 的 lseek 返回 EBADF（优先于 ESPIPE）。
+        if mode.contains(FileMode::FMODE_PATH) {
+            return Err(SystemError::EBADF);
         }
+        if mode.contains(FileMode::FMODE_STREAM) || !mode.contains(FileMode::FMODE_LSEEK) {
+            return Err(SystemError::ESPIPE);
+        }
+
+        let file_type = self.inode.metadata()?.file_type;
         // Check for procfs private data. If this is a procfs pseudo-file, disallow SEEK_END
         // and other unsupported seek modes.
         {
@@ -764,7 +1054,6 @@ impl File {
     #[inline]
     pub fn readable(&self) -> Result<(), SystemError> {
         let mode = *self.mode.read();
-
         // O_PATH文件几乎不能做任何I/O操作
         if mode.contains(FileMode::FMODE_PATH) {
             return Err(SystemError::EBADF);
@@ -796,11 +1085,6 @@ impl File {
         // 检查写权限
         if !mode.contains(FileMode::FMODE_WRITE) {
             return Err(SystemError::EBADF);
-        }
-
-        // 检查写能力
-        if !mode.can_write() {
-            return Err(SystemError::EINVAL);
         }
 
         Ok(())
@@ -885,17 +1169,18 @@ impl File {
     /// @return Option<File> 克隆后的文件结构体。如果克隆失败，返回None
     pub fn try_clone(&self) -> Option<File> {
         let res = Self {
+            open_file_id: alloc_open_file_id(),
             inode: self.inode.clone(),
             offset: AtomicUsize::new(self.offset.load(Ordering::SeqCst)),
-            flags: RwLock::new(self.flags()),
-            mode: RwLock::new(self.mode()),
+            flags: RwSem::new(self.flags()),
+            mode: RwSem::new(self.mode()),
             file_type: self.file_type,
-            readdir_subdirs_name: SpinLock::new(self.readdir_subdirs_name.lock().clone()),
-            private_data: SpinLock::new(self.private_data.lock().clone()),
+            readdir_subdirs_name: Mutex::new(self.readdir_subdirs_name.lock().clone()),
+            private_data: Mutex::new(self.private_data.lock().clone()),
             cred: self.cred.clone(),
-            close_on_exec: AtomicBool::new(self.close_on_exec.load(Ordering::SeqCst)),
-            pid: SpinLock::new(None),
-            ra_state: SpinLock::new(self.ra_state.lock().clone()),
+            pid: Mutex::new(None),
+            posix_lock_key: self.posix_lock_key,
+            ra_state: Mutex::new(self.ra_state.lock().clone()),
         };
         // 调用inode的open方法，让inode知道有新的文件打开了这个inode
         // TODO: reopen is not a good idea for some inodes, need a better design
@@ -916,6 +1201,52 @@ impl File {
         return self.file_type;
     }
 
+    #[inline]
+    pub fn open_file_id(&self) -> usize {
+        self.open_file_id
+    }
+
+    #[inline]
+    pub fn posix_lock_key(&self) -> (usize, InodeId) {
+        self.posix_lock_key
+    }
+
+    /// 获取当前文件偏移（等价于用户态的 file position）。
+    #[inline]
+    pub fn pos(&self) -> usize {
+        self.offset.load(Ordering::SeqCst)
+    }
+
+    /// 推进当前文件偏移。
+    #[inline]
+    pub fn advance_pos(&self, delta: usize) {
+        if delta == 0 {
+            return;
+        }
+        self.offset.fetch_add(delta, Ordering::SeqCst);
+    }
+
+    /// 检查文件是否为普通文件或目录
+    ///
+    /// 用于 poll(2)/epoll 的"总是就绪"判断。
+    /// Linux 语义：普通文件和目录的 I/O 操作不会阻塞，因此它们在 poll 中总是可读/可写的。
+    #[inline]
+    pub fn is_regular_file_or_dir(&self) -> bool {
+        matches!(self.file_type, FileType::File | FileType::Dir)
+    }
+
+    /// 检查文件是否为"总是就绪"类型（用于 epoll）
+    ///
+    /// 满足以下条件的文件总是就绪：
+    /// 1. 文件类型为普通文件或目录
+    /// 2. 文件不支持 poll 操作
+    ///
+    /// Linux 语义：普通文件和目录的 I/O 操作不会阻塞，因此它们总是可读/可写的。
+    /// 参考 Linux 内核的 DEFAULT_POLLMASK
+    pub fn is_always_ready(&self) -> bool {
+        !self.supports_poll() && self.is_regular_file_or_dir()
+    }
+
     /// @brief 获取文件的打开模式
     #[inline]
     pub fn flags(&self) -> FileFlags {
@@ -926,18 +1257,6 @@ impl File {
     #[inline]
     pub fn mode(&self) -> FileMode {
         return *self.mode.read();
-    }
-
-    /// 获取文件是否在execve时关闭
-    #[inline]
-    pub fn close_on_exec(&self) -> bool {
-        return self.close_on_exec.load(Ordering::SeqCst);
-    }
-
-    /// 设置文件是否在execve时关闭
-    #[inline]
-    pub fn set_close_on_exec(&self, close_on_exec: bool) {
-        self.close_on_exec.store(close_on_exec, Ordering::SeqCst);
     }
 
     pub fn set_flags(&self, mut new_flags: FileFlags) -> Result<(), SystemError> {
@@ -977,8 +1296,30 @@ impl File {
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
     pub fn ftruncate(&self, len: usize) -> Result<(), SystemError> {
-        // 如果文件不可写，返回错误
-        self.writeable()?;
+        // 类型必须是普通文件，否则 EINVAL
+        let md = self.inode.metadata()?;
+        if md.file_type != FileType::File {
+            return Err(SystemError::EINVAL);
+        }
+
+        // O_PATH 直接返回 EBADF，保持与 open 时的行为一致
+        let mode = *self.mode.read();
+        if mode.contains(FileMode::FMODE_PATH) {
+            return Err(SystemError::EBADF);
+        }
+
+        // 非可写打开返回 EINVAL（对齐 gVisor 预期）
+        if !mode.contains(FileMode::FMODE_WRITE) || !mode.can_write() {
+            return Err(SystemError::EINVAL);
+        }
+
+        // RLIMIT_FSIZE 检查
+        let current_pcb = ProcessManager::current_pcb();
+        let fsize_limit = current_pcb.get_rlimit(RLimitID::Fsize);
+        if fsize_limit.rlim_cur != u64::MAX && len as u64 > fsize_limit.rlim_cur {
+            let _ = send_signal_to_pid(current_pcb.raw_pid(), Signal::SIGXFSZ);
+            return Err(SystemError::EFBIG);
+        }
 
         // 统一通过 VFS 封装，复用类型/只读检查
         crate::filesystem::vfs::vcore::vfs_truncate(self.inode(), len)?;
@@ -1005,6 +1346,12 @@ impl File {
     pub fn poll(&self) -> Result<usize, SystemError> {
         let private_data = self.private_data.lock();
         self.inode.as_pollable_inode()?.poll(&private_data)
+    }
+
+    /// 检查文件是否支持 poll 操作
+    #[inline]
+    pub fn supports_poll(&self) -> bool {
+        self.inode.as_pollable_inode().is_ok()
     }
 
     pub fn owner(&self) -> Option<RawPid> {
@@ -1036,18 +1383,43 @@ impl File {
         let metadata = self.inode.metadata()?;
         Ok(metadata.flags)
     }
+
+    /// 修改文件访问模式标志
+    pub fn set_mode_flags(&self, flags: FileMode) {
+        self.mode.write().insert(flags);
+    }
+
+    /// 清除文件访问模式标志
+    pub fn remove_mode_flags(&self, flags: FileMode) {
+        self.mode.write().remove(flags);
+    }
+
+    /// 设置预读窗口大小
+    pub fn set_ra_pages(&self, pages: usize) {
+        self.ra_state.lock().ra_pages = pages;
+    }
+
+    pub fn get_ra_state(&self) -> FileReadaheadState {
+        self.ra_state.lock().clone()
+    }
+
+    pub fn set_ra_state(&self, ra_state: FileReadaheadState) -> Result<(), SystemError> {
+        *self.ra_state.lock() = ra_state;
+        Ok(())
+    }
 }
 
 impl Drop for File {
     fn drop(&mut self) {
+        super::flock::release_all_for_file(self);
         let r: Result<(), SystemError> = self.inode.close(self.private_data.lock());
         // 打印错误信息
-        if r.is_err() {
+        if let Err(e) = r {
             error!(
                 "pid: {:?} failed to close file: {:?}, errno={:?}",
                 ProcessManager::current_pcb().raw_pid(),
                 self,
-                r.as_ref().unwrap_err()
+                e
             );
         }
     }
@@ -1058,6 +1430,10 @@ impl Drop for File {
 pub struct FileDescriptorVec {
     /// 当前进程打开的文件描述符
     fds: Vec<Option<Arc<File>>>,
+    /// per-fd 的 close_on_exec 标志（与 fds 并行，对应 Linux fdtable.close_on_exec 位图）
+    cloexec: Vec<bool>,
+    /// POSIX record lock owner id，对齐 Linux current->files 语义。
+    lock_owner_id: usize,
     /// 下一个可能空闲的文件描述符号（用于优化分配，避免O(n²)扫描）
     /// 类似于 Linux 的 fd_next_fd
     next_fd: usize,
@@ -1078,14 +1454,24 @@ impl FileDescriptorVec {
         let mut data = Vec::with_capacity(FileDescriptorVec::INITIAL_CAPACITY);
         data.resize(FileDescriptorVec::INITIAL_CAPACITY, None);
 
+        let mut cloexec = Vec::with_capacity(FileDescriptorVec::INITIAL_CAPACITY);
+        cloexec.resize(FileDescriptorVec::INITIAL_CAPACITY, false);
+
         // 初始化文件描述符数组结构体
         return FileDescriptorVec {
             fds: data,
+            cloexec,
+            lock_owner_id: alloc_lock_owner_id(),
             next_fd: 0,
         };
     }
 
     /// @brief 克隆一个文件描述符数组
+    ///
+    /// 语义对齐 Linux dup_fd/new files_struct：
+    /// - 复制 fd 与 cloexec 状态
+    /// - 分配新的 record-lock owner（POSIX 锁 owner 绑定 files table）
+    ///   因此 fork 出来的新进程不会与父进程共享 POSIX record lock owner。
     ///
     /// @return FileDescriptorVec 克隆后的文件描述符数组
     pub fn clone(&self) -> FileDescriptorVec {
@@ -1096,10 +1482,13 @@ impl FileDescriptorVec {
         for i in 0..self.fds.len() {
             if let Some(file) = &self.fds[i] {
                 res.fds[i] = Some(file.clone());
+                res.cloexec[i] = self.cloexec[i];
             }
         }
         // 复制 next_fd 以保持相同的分配状态
         res.next_fd = self.next_fd;
+        // 新 fd table 必须拥有新的 record-lock owner（对齐 Linux 新 files_struct）。
+        res.lock_owner_id = alloc_lock_owner_id();
         return res;
     }
 
@@ -1125,12 +1514,20 @@ impl FileDescriptorVec {
 
         let current_len = self.fds.len();
         if new_capacity > current_len {
-            // 扩容：扩展向量并填充None
+            // 扩容：扩展向量并填充None/false
             // 使用 try_reserve 先检查内存分配是否可能成功
             if self.fds.try_reserve(new_capacity - current_len).is_err() {
                 return Err(SystemError::ENOMEM);
             }
+            if self
+                .cloexec
+                .try_reserve(new_capacity - current_len)
+                .is_err()
+            {
+                return Err(SystemError::ENOMEM);
+            }
             self.fds.resize(new_capacity, None);
+            self.cloexec.resize(new_capacity, false);
         } else if new_capacity < current_len {
             // 缩容：允许，但不能丢弃仍在使用的高位fd。
             // 若高位fd仍在使用，将缩容目标提升到 (最高已用fd + 1)。
@@ -1138,6 +1535,7 @@ impl FileDescriptorVec {
             let target = core::cmp::max(new_capacity, floor);
             if target < current_len {
                 self.fds.truncate(target);
+                self.cloexec.truncate(target);
                 // 确保 next_fd 不超过新的容量
                 if self.next_fd > target {
                     self.next_fd = target;
@@ -1174,12 +1572,36 @@ impl FileDescriptorVec {
     ///
     /// - `file` 要存放的文件对象
     /// - `fd` 如果为Some(i32)，表示指定要申请这个文件描述符，如果这个文件描述符已经被使用，那么返回EBADF
+    /// - `cloexec` 是否设置 close_on_exec 标志（per-fd 属性）
     ///
     /// ## 返回值
     ///
     /// - `Ok(i32)` 申请成功，返回申请到的文件描述符
     /// - `Err(SystemError)` 申请失败，返回错误码，并且，file对象将被drop掉
-    pub fn alloc_fd(&mut self, file: File, fd: Option<i32>) -> Result<i32, SystemError> {
+    pub fn alloc_fd(
+        &mut self,
+        file: File,
+        fd: Option<i32>,
+        cloexec: bool,
+    ) -> Result<i32, SystemError> {
+        self.alloc_fd_arc(Arc::new(file), fd, cloexec)
+    }
+
+    /// 申请文件描述符，并把已有的 Arc<File> 存入其中。
+    ///
+    /// 用于 dup/dup2/dup3 等需要多个 fd 共享同一个 open file description 的场景。
+    ///
+    /// ## 参数
+    ///
+    /// - `file` 要存放的文件对象（Arc 引用）
+    /// - `fd` 如果为Some(i32)，表示指定要申请这个文件描述符
+    /// - `cloexec` 是否设置 close_on_exec 标志（per-fd 属性）
+    pub fn alloc_fd_arc(
+        &mut self,
+        file: Arc<File>,
+        fd: Option<i32>,
+        cloexec: bool,
+    ) -> Result<i32, SystemError> {
         // 获取RLIMIT_NOFILE限制
         let nofile_limit = crate::process::ProcessManager::current_pcb()
             .get_rlimit(crate::process::resource::RLimitID::Nofile)
@@ -1198,7 +1620,8 @@ impl FileDescriptorVec {
 
             let x = &mut self.fds[new_fd as usize];
             if x.is_none() {
-                *x = Some(Arc::new(file));
+                *x = Some(file);
+                self.cloexec[new_fd as usize] = cloexec;
                 // 更新 next_fd：如果分配的是 next_fd 位置，则推进到下一个
                 if new_fd as usize == self.next_fd {
                     self.next_fd = new_fd as usize + 1;
@@ -1215,7 +1638,8 @@ impl FileDescriptorVec {
             // 从 next_fd 开始查找空位
             for i in self.next_fd..max_search {
                 if self.fds[i].is_none() {
-                    self.fds[i] = Some(Arc::new(file));
+                    self.fds[i] = Some(file);
+                    self.cloexec[i] = cloexec;
                     // 更新 next_fd 为下一个位置
                     self.next_fd = i + 1;
                     return Ok(i as i32);
@@ -1235,7 +1659,8 @@ impl FileDescriptorVec {
 
                 // 扩容后，第一个新位置就是空的
                 let new_fd = current_len;
-                self.fds[new_fd] = Some(Arc::new(file));
+                self.fds[new_fd] = Some(file);
+                self.cloexec[new_fd] = cloexec;
                 // 更新 next_fd
                 self.next_fd = new_fd + 1;
                 return Ok(new_fd as i32);
@@ -1255,6 +1680,19 @@ impl FileDescriptorVec {
             return None;
         }
         self.fds[fd as usize].clone()
+    }
+
+    /// 根据文件描述符序号，获取文件结构体的Arc指针, 并检测FileMode
+    ///
+    /// ## 参数
+    ///
+    /// - `fd` 文件描述符序号
+    pub fn get_file_by_fd_not_raw(&self, fd: i32, mask: FileMode) -> Option<Arc<File>> {
+        if !self.validate_fd(fd) {
+            return None;
+        }
+        let file = self.fds[fd as usize].clone();
+        file.filter(|f| !f.mode().contains(mask))
     }
 
     /// 当RLIMIT_NOFILE变化时调整文件描述符表容量
@@ -1292,6 +1730,9 @@ impl FileDescriptorVec {
 
         // 把文件描述符数组对应位置设置为空
         let file = self.fds[fd as usize].take().unwrap();
+        super::posix_lock::release_posix_for_file_owner(&file, self.lock_owner_id);
+        // 清除 per-fd close_on_exec 标志
+        self.cloexec[fd as usize] = false;
 
         // 更新 next_fd：如果释放的fd比当前next_fd小，则更新next_fd
         // 这确保下次分配时可以复用较小的fd号，符合POSIX语义
@@ -1308,21 +1749,49 @@ impl FileDescriptorVec {
         return FileDescriptorIterator::new(self);
     }
 
+    /// 获取指定 fd 的 close_on_exec 标志
+    #[inline]
+    pub fn get_cloexec(&self, fd: i32) -> bool {
+        if !self.validate_fd(fd) {
+            return false;
+        }
+        self.cloexec[fd as usize]
+    }
+
+    /// 设置指定 fd 的 close_on_exec 标志
+    #[inline]
+    pub fn set_cloexec(&mut self, fd: i32, val: bool) {
+        if self.validate_fd(fd) {
+            self.cloexec[fd as usize] = val;
+        }
+    }
+
+    #[inline]
+    pub fn lock_owner_id(&self) -> usize {
+        self.lock_owner_id
+    }
+
+    /// 在 execve 时关闭所有设置了 close_on_exec 的文件描述符
     pub fn close_on_exec(&mut self) {
         for i in 0..self.fds.len() {
-            if let Some(file) = &self.fds[i] {
-                let to_drop = file.close_on_exec();
-                if to_drop {
-                    if let Err(r) = self.drop_fd(i as i32) {
-                        error!(
-                            "Failed to close file: pid = {:?}, fd = {}, error = {:?}",
-                            ProcessManager::current_pcb().raw_pid(),
-                            i,
-                            r
-                        );
-                    }
+            if self.fds[i].is_some() && self.cloexec[i] {
+                if let Err(r) = self.drop_fd(i as i32) {
+                    error!(
+                        "Failed to close file: pid = {:?}, fd = {}, error = {:?}",
+                        ProcessManager::current_pcb().raw_pid(),
+                        i,
+                        r
+                    );
                 }
             }
+        }
+    }
+}
+
+impl Drop for FileDescriptorVec {
+    fn drop(&mut self) {
+        for file in self.fds.iter().filter_map(|f| f.as_ref()) {
+            super::posix_lock::release_posix_for_file_owner(file, self.lock_owner_id);
         }
     }
 }

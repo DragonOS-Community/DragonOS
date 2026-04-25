@@ -6,6 +6,17 @@ use crate::{
     smp::core::smp_get_processor_id,
 };
 
+/// IPI delivery on RISC-V:
+///
+/// - `FlushTLB` broadcasts TLB invalidation synchronously via SBI `remote_sfence_vma`;
+///   when the call returns, all target CPUs have completed invalidation. No per-CPU CSD
+///   ack protocol is needed (unlike x86_64).
+/// - Therefore `crate::mm::tlb::flush_tlb_multi` on RISC-V goes directly here without
+///   requiring the initiator to poll for ack before returning to userspace.
+///
+/// Other direct-send paths for `IpiKind::FlushTLB` (e.g. the old `InactiveFlusher` /
+/// `PageFlushAll`) have been removed on x86_64; the RISC-V implementation is kept here
+/// to facilitate future integration with the new `mm::tlb::flush_tlb_multi` flow.
 #[inline(always)]
 pub fn send_ipi(kind: IpiKind, target: IpiTarget) {
     let mask = Into::into(target);

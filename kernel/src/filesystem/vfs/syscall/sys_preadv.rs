@@ -5,7 +5,6 @@ use system_error::SystemError;
 
 use crate::arch::syscall::nr::SYS_PREADV;
 use crate::filesystem::vfs::iov::{IoVec, IoVecs};
-use crate::filesystem::vfs::FileType;
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 
@@ -72,15 +71,6 @@ pub fn do_preadv(fd: i32, iovecs: &IoVecs, offset: usize) -> Result<usize, Syste
 
     drop(fd_table_guard);
 
-    // 检查是否是管道/Socket (ESPIPE)
-    let md = file.metadata()?;
-    if md.file_type == FileType::Pipe
-        || md.file_type == FileType::Socket
-        || md.file_type == FileType::CharDevice
-    {
-        return Err(SystemError::ESPIPE);
-    }
-
     // Create a kernel buffer to read data into.
     // TODO: Support scatter-gather I/O directly in FS to avoid this copy.
     let mut data = vec![0; iovecs.total_len()];
@@ -89,9 +79,9 @@ pub fn do_preadv(fd: i32, iovecs: &IoVecs, offset: usize) -> Result<usize, Syste
     let read_len = file.pread(offset, data.len(), &mut data)?;
 
     // Scatter the read data back to user buffers.
-    iovecs.scatter(&data[..read_len]);
+    let copied = iovecs.scatter(&data[..read_len])?;
 
-    Ok(read_len)
+    Ok(copied)
 }
 
 syscall_table_macros::declare_syscall!(SYS_PREADV, SysPreadVHandle);

@@ -5,7 +5,7 @@ use crate::arch::syscall::nr::SYS_SETDOMAINNAME;
 use crate::process::namespace::uts_namespace::NewUtsName;
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
-use crate::syscall::user_access::check_and_clone_cstr;
+use crate::syscall::user_access::UserBufferReader;
 use alloc::vec::Vec;
 use system_error::SystemError;
 
@@ -43,15 +43,11 @@ impl Syscall for SysSetdomainname {
             return Err(SystemError::EINVAL);
         }
 
-        // 使用check_and_clone_cstr安全地从用户空间读取字符串，但限制长度为len
-        let s = check_and_clone_cstr(name_ptr, Some(core::cmp::min(len, NewUtsName::MAXLEN) + 1))?;
-        let ss = s.to_str().map_err(|_| SystemError::EINVAL)?;
+        let reader = UserBufferReader::new_checked(name_ptr, len, true)?;
+        let mut buf = vec![0u8; len];
+        reader.copy_from_user_protected(&mut buf, 0)?;
 
-        // 截断到指定长度
-        let truncated = if ss.len() > len { &ss[..len] } else { ss };
-
-        // 设置域名
-        uts_ns.set_domainname(truncated)?;
+        uts_ns.set_domainname(&buf)?;
 
         Ok(0)
     }

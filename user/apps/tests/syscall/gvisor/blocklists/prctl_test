@@ -1,11 +1,4 @@
 # 缺少 SYS_PTRACE
-PrctlTest.NoNewPrivsPreservedAcrossCloneForkAndExecve
 PrctlTest.PDeathSig
-# 暂不支持
-PrctlTest.InvalidPrSetMM
-PrctlTest.SetGetDumpability
-
-PrctlTest.SimpleSetGetChildSubreaper
-PrctlTest.ThreadsInheritChildSubreaperBit
-PrctlTest.ProcessesDoNotInheritChildSubreaperBit
+# 缺少测试文件
 PrctlTest.OrphansReparentedToSubreaper

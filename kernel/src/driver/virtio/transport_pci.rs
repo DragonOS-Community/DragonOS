@@ -10,9 +10,7 @@ use crate::driver::pci::root::pci_root_0;
 
 use crate::exception::IrqNumber;
 
-use crate::libs::volatile::{
-    volread, volwrite, ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly,
-};
+use crate::libs::volatile::{ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly};
 use crate::mm::VirtAddr;
 
 use alloc::sync::Arc;
@@ -27,6 +25,7 @@ use virtio_drivers::{
 };
 
 use super::VIRTIO_VENDOR_ID;
+use crate::driver::pci::pci_irq::IrqType;
 
 /// The offset to add to a VirtIO device ID to get the corresponding PCI device ID.
 /// PCI Virtio设备的DEVICE_ID 的offset
@@ -325,9 +324,23 @@ impl Transport for PciTransport {
             volwrite!(self.common_cfg, queue_driver, driver_area as u64);
             volwrite!(self.common_cfg, queue_device, device_area as u64);
             // 这里设置队列中断对应的中断项
-            if queue == QUEUE_RECEIVE {
+            if matches!(*self.device.irq_type.read(), IrqType::Msix { .. }) {
+                if queue == QUEUE_RECEIVE {
+                    volwrite!(self.common_cfg, msix_config, VIRTIO_RECV_VECTOR_INDEX);
+                    // let cfg_vector = volread!(self.common_cfg, msix_config);
+                    // debug!(
+                    //     "VirtIO PCI msix_config readback: vector {:#x}",
+                    //     cfg_vector
+                    // );
+                }
                 volwrite!(self.common_cfg, queue_msix_vector, VIRTIO_RECV_VECTOR_INDEX);
                 let vector = volread!(self.common_cfg, queue_msix_vector);
+                // if self.device_type == DeviceType::Network && (queue == 0 || queue == 1) {
+                //     debug!(
+                //         "VirtIO PCI net queue_msix_vector readback: queue {}, vector {:#x}",
+                //         queue, vector
+                //     );
+                // }
                 if vector != VIRTIO_RECV_VECTOR_INDEX {
                     panic!("Vector set failed");
                 }

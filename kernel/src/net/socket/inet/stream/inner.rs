@@ -1,10 +1,13 @@
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
-use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::filesystem::epoll::EPollEventType;
-use crate::libs::rwlock::RwLock;
+use crate::libs::mutex::Mutex;
+use crate::libs::rwsem::RwSem;
 use crate::net::socket::{self, inet::Types};
 use crate::process::namespace::net_namespace::NetNamespace;
+use crate::syscall::user_buffer::UserBuffer;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use smoltcp;
@@ -15,19 +18,49 @@ use system_error::SystemError;
 pub const DEFAULT_RX_BUF_SIZE: usize = 128 * 1024;
 pub const DEFAULT_TX_BUF_SIZE: usize = 128 * 1024;
 
-fn new_smoltcp_socket() -> smoltcp::socket::tcp::Socket<'static> {
-    let rx_buffer = smoltcp::socket::tcp::SocketBuffer::new(vec![0; DEFAULT_RX_BUF_SIZE]);
-    let tx_buffer = smoltcp::socket::tcp::SocketBuffer::new(vec![0; DEFAULT_TX_BUF_SIZE]);
+/// 显式的“已关闭”状态：不再绑定/访问 smoltcp SocketSet 中的任何 handle。
+///
+/// 目的：
+/// - 语义上表示 socket 已经 close；
+/// - 并发上避免在 handle 已被 remove 后仍通过 update_events()/poll/notify 触达 SocketSet，
+///   触发 smoltcp 的 "handle does not refer to a valid socket" panic。
+#[derive(Debug, Clone, Copy)]
+pub struct Closed {
+    ver: smoltcp::wire::IpVersion,
+}
+
+impl Closed {
+    #[inline]
+    pub fn new(ver: smoltcp::wire::IpVersion) -> Self {
+        Self { ver }
+    }
+}
+
+fn new_smoltcp_socket_with_size(
+    rx_size: usize,
+    tx_size: usize,
+) -> smoltcp::socket::tcp::Socket<'static> {
+    let rx_buffer = smoltcp::socket::tcp::SocketBuffer::new(vec![0; rx_size]);
+    let tx_buffer = smoltcp::socket::tcp::SocketBuffer::new(vec![0; tx_size]);
     smoltcp::socket::tcp::Socket::new(rx_buffer, tx_buffer)
 }
 
-fn new_listen_smoltcp_socket<T>(local_endpoint: T) -> smoltcp::socket::tcp::Socket<'static>
+fn new_smoltcp_socket() -> smoltcp::socket::tcp::Socket<'static> {
+    new_smoltcp_socket_with_size(DEFAULT_RX_BUF_SIZE, DEFAULT_TX_BUF_SIZE)
+}
+
+fn new_listen_smoltcp_socket<T>(
+    local_endpoint: T,
+) -> Result<smoltcp::socket::tcp::Socket<'static>, SystemError>
 where
     T: Into<smoltcp::wire::IpListenEndpoint>,
 {
     let mut socket = new_smoltcp_socket();
-    socket.listen(local_endpoint).unwrap();
-    socket
+    socket.listen(local_endpoint).map_err(|e| match e {
+        tcp::ListenError::InvalidState => SystemError::EINVAL, // TODO: Check is right impl
+        tcp::ListenError::Unaddressable => SystemError::EADDRINUSE,
+    })?;
+    Ok(socket)
 }
 
 #[derive(Debug)]
@@ -46,14 +79,33 @@ impl Init {
         Init::Unbound((Box::new(new_smoltcp_socket()), ver))
     }
 
-    /// 传入一个已经绑定的socket
-    pub(super) fn new_bound(inner: socket::inet::BoundInner) -> Self {
-        let endpoint = inner.with::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
-            socket
-                .local_endpoint()
-                .expect("A Bound Socket Must Have A Local Endpoint")
-        });
-        Init::Bound((inner, endpoint))
+    pub(super) fn resize_buffers(
+        &mut self,
+        rx_size: usize,
+        tx_size: usize,
+    ) -> Result<(), SystemError> {
+        match self {
+            Init::Unbound((socket, _)) => {
+                let mut new_sock = new_smoltcp_socket_with_size(rx_size, tx_size);
+
+                // Copy options
+                new_sock.set_nagle_enabled(socket.nagle_enabled());
+                new_sock.set_ack_delay(socket.ack_delay());
+                new_sock.set_keep_alive(socket.keep_alive());
+                new_sock.set_timeout(socket.timeout());
+                new_sock.set_hop_limit(socket.hop_limit());
+
+                **socket = new_sock;
+                Ok(())
+            }
+            Init::Bound((inner, _)) => {
+                inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
+                    socket.set_send_buffer_size(tx_size);
+                    socket.set_recv_buffer_size(rx_size);
+                });
+                Ok(())
+            }
+        }
     }
 
     pub(super) fn bind(
@@ -64,11 +116,20 @@ impl Init {
         match self {
             Init::Unbound((socket, _)) => {
                 let bound = socket::inet::BoundInner::bind(*socket, &local_endpoint.addr, netns)?;
-                bound
-                    .port_manager()
-                    .bind_port(Types::Tcp, local_endpoint.port)?;
-                // bound.iface().common().bind_socket()
-                Ok(Init::Bound((bound, local_endpoint)))
+
+                // Handle ephemeral port assignment (port 0)
+                let bind_port = if local_endpoint.port == 0 {
+                    bound.port_manager().bind_ephemeral_port(Types::Tcp)?
+                } else {
+                    bound
+                        .port_manager()
+                        .bind_port(Types::Tcp, local_endpoint.port)?;
+                    local_endpoint.port
+                };
+
+                // Create endpoint with actual assigned port
+                let final_endpoint = smoltcp::wire::IpEndpoint::new(local_endpoint.addr, bind_port);
+                Ok(Init::Bound((bound, final_endpoint)))
             }
             Init::Bound(_) => {
                 log::debug!("Already Bound");
@@ -120,40 +181,120 @@ impl Init {
                 .map_err(|_| SystemError::ECONNREFUSED)
         });
         match result {
-            Ok(_) => Ok(Connecting::new(inner)),
+            Ok(_) => Ok(Connecting::new(inner, local, remote_endpoint)),
             Err(err) => Err((Init::Bound((inner, local)), err)),
         }
     }
 
     /// # `listen`
-    pub(super) fn listen(self, backlog: usize) -> Result<Listening, (Self, SystemError)> {
-        let (inner, local) = match self {
-            Init::Unbound(_) => {
-                return Err((self, SystemError::EINVAL));
+    ///
+    /// Linux semantics: calling `listen()` on an unbound TCP socket auto-binds
+    /// to `INADDR_ANY` (or `::`) with an ephemeral port, just like an implicit
+    /// `bind(0.0.0.0:0)` before `listen()`.
+    pub(super) fn listen(
+        self,
+        backlog: usize,
+        netns: Arc<NetNamespace>,
+    ) -> Result<Listening, (Self, SystemError)> {
+        // If unbound, auto-bind to INADDR_ANY:ephemeral (Linux compat).
+        let bound_self = if matches!(self, Init::Unbound(_)) {
+            let ver = match &self {
+                Init::Unbound((_, v)) => *v,
+                _ => unreachable!(),
+            };
+            let unspec_addr = match ver {
+                smoltcp::wire::IpVersion::Ipv4 => {
+                    smoltcp::wire::IpAddress::from(smoltcp::wire::Ipv4Address::UNSPECIFIED)
+                }
+                smoltcp::wire::IpVersion::Ipv6 => {
+                    smoltcp::wire::IpAddress::from(smoltcp::wire::Ipv6Address::UNSPECIFIED)
+                }
+            };
+            let auto_bind_ep = smoltcp::wire::IpEndpoint::new(unspec_addr, 0);
+            match self.bind(auto_bind_ep, netns.clone()) {
+                Ok(bound) => bound,
+                Err(err) => return Err((Init::new(ver), err)),
             }
+        } else {
+            self
+        };
+        let (inner, local) = match bound_self {
             Init::Bound(inner) => inner,
+            Init::Unbound(_) => unreachable!(),
         };
         let listen_addr = if local.addr.is_unspecified() {
             smoltcp::wire::IpListenEndpoint::from(local.port)
         } else {
             smoltcp::wire::IpListenEndpoint::from(local)
         };
-        log::debug!("listen at {:?}", listen_addr);
+        if listen_addr.port == 0 {
+            // Invalid port number
+            return Err((Init::Bound((inner, local)), SystemError::EINVAL));
+        }
+        // log::debug!("listen at {:?}, backlog {}", listen_addr, backlog);
+        //
+        // Linux semantics: listen(backlog=0) is valid. In practice it still allows
+        // one pending connection in the accept queue (see sk_acceptq_is_full logic).
+        // DragonOS uses multiple smoltcp TCP sockets to emulate accept queue slots.
+        if backlog > u16::MAX as usize {
+            return Err((Init::Bound((inner, local)), SystemError::EINVAL));
+        }
+
+        // Backlog emulation:
+        // - backlog==0 => emulate a single accept slot
+        // - cap to avoid excessive socket allocations (FIXME: refactor backlog mechanism)
+        let backlog = core::cmp::min(if backlog == 0 { 1 } else { backlog }, 8);
+
         let mut inners = Vec::new();
+        let is_any_addr = listen_addr.addr.is_none();
+
         if let Err(err) = || -> Result<(), SystemError> {
-            for _ in 0..(backlog - 1) {
-                // -1 because the first one is already bound
-                let new_listen = socket::inet::BoundInner::bind(
-                    new_listen_smoltcp_socket(listen_addr),
-                    listen_addr
-                        .addr
-                        .as_ref()
-                        .unwrap_or(&smoltcp::wire::IpAddress::from(
-                            smoltcp::wire::Ipv4Address::UNSPECIFIED,
-                        )),
-                    inner.netns(),
-                )?;
-                inners.push(new_listen);
+            if is_any_addr {
+                // INADDR_ANY / [::]: smoltcp uses per-interface SocketSets, so we must
+                // create at least one listen socket on *every* interface; otherwise a SYN
+                // arriving on an interface without a listen socket gets no response (RST
+                // or silent drop depending on smoltcp version).
+                //
+                // Strategy: place ≥1 listen socket on each interface. Any remaining
+                // backlog slots go to the primary interface.
+                let device_list = netns.device_list();
+                for (_, iface) in device_list.iter() {
+                    if alloc::sync::Arc::ptr_eq(iface, inner.iface()) {
+                        continue; // primary inner already covers this iface
+                    }
+                    let new_listen = socket::inet::BoundInner::bind_on_iface(
+                        new_listen_smoltcp_socket(listen_addr)?,
+                        iface.clone(),
+                        inner.netns(),
+                    )?;
+                    inners.push(new_listen);
+                }
+                // Fill remaining backlog slots on the primary interface.
+                let remaining = backlog.saturating_sub(1 + inners.len());
+                for _ in 0..remaining {
+                    let new_listen = socket::inet::BoundInner::bind_on_iface(
+                        new_listen_smoltcp_socket(listen_addr)?,
+                        inner.iface().clone(),
+                        inner.netns(),
+                    )?;
+                    inners.push(new_listen);
+                }
+            } else {
+                // Specific address: all backlog sockets go to the same interface.
+                let additional_sockets = backlog.saturating_sub(1);
+                for _ in 0..additional_sockets {
+                    let new_listen = socket::inet::BoundInner::bind(
+                        new_listen_smoltcp_socket(listen_addr)?,
+                        listen_addr
+                            .addr
+                            .as_ref()
+                            .unwrap_or(&smoltcp::wire::IpAddress::from(
+                                smoltcp::wire::Ipv4Address::UNSPECIFIED,
+                            )),
+                        inner.netns(),
+                    )?;
+                    inners.push(new_listen);
+                }
             }
             Ok(())
         }() {
@@ -161,9 +302,10 @@ impl Init {
         }
 
         if let Err(err) = inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
-            socket
-                .listen(listen_addr)
-                .map_err(|_| SystemError::ECONNREFUSED)
+            socket.listen(listen_addr).map_err(|err| match err {
+                tcp::ListenError::InvalidState => SystemError::EINVAL,
+                tcp::ListenError::Unaddressable => SystemError::EINVAL,
+            })
         }) {
             return Err((Init::Bound((inner, local)), err));
         }
@@ -193,19 +335,34 @@ enum ConnectResult {
     #[default]
     Connecting,
     Refused,
+    RefusedConsumed,
 }
 
 #[derive(Debug)]
 pub struct Connecting {
     inner: socket::inet::BoundInner,
-    result: RwLock<ConnectResult>,
+    result: RwSem<ConnectResult>,
+    /// Track if the connection was ever in ESTABLISHED state.
+    /// This is needed because for loopback, SYN+ACK and RST can be processed in the same poll,
+    /// so we might miss the ESTABLISHED state. If we were ever established, receiving RST
+    /// should not be treated as "connection refused" but as "connection reset".
+    was_established: AtomicBool,
+    local: smoltcp::wire::IpEndpoint,
+    remote: smoltcp::wire::IpEndpoint,
 }
 
 impl Connecting {
-    fn new(inner: socket::inet::BoundInner) -> Self {
+    fn new(
+        inner: socket::inet::BoundInner,
+        local: smoltcp::wire::IpEndpoint,
+        remote: smoltcp::wire::IpEndpoint,
+    ) -> Self {
         Connecting {
             inner,
-            result: RwLock::new(ConnectResult::Connecting),
+            result: RwSem::new(ConnectResult::Connecting),
+            was_established: AtomicBool::new(false),
+            local,
+            remote,
         }
     }
 
@@ -216,6 +373,14 @@ impl Connecting {
         self.inner.with_mut(f)
     }
 
+    pub fn with<R, F: Fn(&smoltcp::socket::tcp::Socket<'static>) -> R>(&self, f: F) -> R {
+        self.inner.with(f)
+    }
+
+    pub fn iface(&self) -> &Arc<dyn crate::net::Iface> {
+        self.inner.iface()
+    }
+
     pub fn into_result(self) -> (Inner, Result<(), SystemError>) {
         let result = *self.result.read();
         match result {
@@ -224,18 +389,44 @@ impl Connecting {
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
             ),
             ConnectResult::Connected => (
-                Inner::Established(Established { inner: self.inner }),
+                Inner::Established(Established::new(self.inner, true)),
                 Ok(()),
             ),
-            ConnectResult::Refused => (
-                Inner::Init(Init::new_bound(self.inner)),
-                Err(SystemError::ECONNREFUSED),
-            ),
+            ConnectResult::Refused | ConnectResult::RefusedConsumed => {
+                // unbind port
+                self.inner
+                    .port_manager()
+                    .unbind_port(Types::Tcp, self.local.port);
+                let socket = self.inner.into_socket();
+                let socket = match socket {
+                    smoltcp::socket::Socket::Tcp(s) => s,
+                    _ => panic!("Connecting socket is not TCP"),
+                };
+                let ver = match self.local.addr {
+                    smoltcp::wire::IpAddress::Ipv4(_) => smoltcp::wire::IpVersion::Ipv4,
+                    smoltcp::wire::IpAddress::Ipv6(_) => smoltcp::wire::IpVersion::Ipv6,
+                };
+                (
+                    Inner::Init(Init::Unbound((Box::new(socket), ver))),
+                    Err(SystemError::ECONNREFUSED),
+                )
+            }
         }
     }
 
+    pub fn is_connected(&self) -> bool {
+        matches!(*self.result.read(), ConnectResult::Connected)
+    }
+
+    /// Transmutes the Connecting state to Established state.
+    ///
+    /// # Safety
+    ///
+    /// This function is unsafe because it forces a state transition without verifying
+    /// that the underlying socket is actually in the ESTABLISHED state.
+    /// The caller must ensure that the socket handshake has completed successfully.
     pub unsafe fn into_established(self) -> Established {
-        Established { inner: self.inner }
+        Established::new(self.inner, true)
     }
 
     /// Returns `true` when `conn_result` becomes ready, which indicates that the caller should
@@ -244,58 +435,182 @@ impl Connecting {
     /// Since `into_result()` needs to be called only once, this method will return `true`
     /// _exactly_ once. The caller is responsible for not missing this event.
     #[must_use]
-    pub(super) fn update_io_events(&self) -> bool {
-        // if matches!(*self.result.read_irqsave(), ConnectResult::Connecting) {
-        //     return false;
-        // }
-
+    pub(super) fn update_io_events(&self, pollee: &core::sync::atomic::AtomicUsize) -> bool {
         self.inner
             .with_mut(|socket: &mut smoltcp::socket::tcp::Socket| {
                 let mut result = self.result.write();
-                if matches!(*result, ConnectResult::Refused | ConnectResult::Connected) {
-                    return false; // Already connected or refused
+                let state = socket.state();
+
+                // Track if we ever reach ESTABLISHED state
+                if matches!(state, tcp::State::Established | tcp::State::CloseWait) {
+                    self.was_established
+                        .store(true, core::sync::atomic::Ordering::Relaxed);
                 }
 
-                // Connected
-                if socket.can_send() {
-                    log::debug!("can send");
-                    *result = ConnectResult::Connected;
-                    return true;
+                let was_established = self
+                    .was_established
+                    .load(core::sync::atomic::Ordering::Relaxed);
+
+                // Heuristic: if socket has valid remote endpoint AND local endpoint in CLOSED state,
+                // it likely completed the handshake before receiving RST. This helps detect the case
+                // where SYN+ACK and RST are processed in the same poll() call for loopback.
+                let endpoints_valid =
+                    socket.local_endpoint().is_some() && socket.remote_endpoint().is_some();
+                let likely_was_established =
+                    was_established || (matches!(state, tcp::State::Closed) && endpoints_valid);
+
+                // Only update result if not already final
+                if !matches!(
+                    *result,
+                    ConnectResult::Refused
+                        | ConnectResult::Connected
+                        | ConnectResult::RefusedConsumed
+                ) {
+                    if matches!(state, tcp::State::Established | tcp::State::CloseWait) {
+                        // log::debug!(
+                        //     "tcp connected: state={:?} local={:?} remote={:?}",
+                        //     state,
+                        //     socket.local_endpoint(),
+                        //     socket.remote_endpoint()
+                        // );
+                        *result = ConnectResult::Connected;
+                    } else if socket.is_open() {
+                        *result = ConnectResult::Connecting;
+                    } else {
+                        // Socket is closed. Determine if it was ever established.
+                        if likely_was_established {
+                            // Connection was established, then closed (e.g., received RST after handshake)
+                            log::debug!(
+                                "tcp connection reset: state={:?} local={:?} remote={:?}",
+                                state,
+                                socket.local_endpoint(),
+                                socket.remote_endpoint()
+                            );
+                            *result = ConnectResult::Connected;
+                        } else {
+                            // Connection was never established (refused)
+                            // log::debug!(
+                            //     "tcp connect refused: state={:?} local={:?} remote={:?}",
+                            //     state,
+                            //     socket.local_endpoint(),
+                            //     socket.remote_endpoint()
+                            // );
+                            *result = ConnectResult::Refused;
+                        }
+                    }
                 }
-                // Connecting
-                if socket.is_open() {
-                    log::debug!("connecting");
-                    *result = ConnectResult::Connecting;
-                    return false;
+
+                // Update pollee based on current result
+                // CRITICAL: For Connecting state, we only set POLLOUT | POLLWRNORM when connect
+                // completes (success or failure). We do NOT set POLLHUP/POLLRDHUP here!
+                // Those events will be set by Established::update_io_events() after the state
+                // transition, which correctly reflects the actual socket state.
+
+                match *result {
+                    ConnectResult::Connected => {
+                        // Connection attempt completed successfully
+                        // Set only POLLOUT | POLLWRNORM to indicate connect() completed.
+                        // Clear all other flags - Established::update_io_events() will set
+                        // the correct flags after state transition.
+                        pollee.fetch_or(
+                            (EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM).bits()
+                                as usize,
+                            Ordering::Relaxed,
+                        );
+                        // Clear error/hangup bits - they should not be set while in Connecting state
+                        pollee.fetch_and(
+                            !(EPollEventType::EPOLLIN
+                                | EPollEventType::EPOLLERR
+                                | EPollEventType::EPOLLHUP
+                                | EPollEventType::EPOLLRDHUP
+                                | EPollEventType::EPOLLRDNORM)
+                                .bits() as usize,
+                            Ordering::Relaxed,
+                        );
+                    }
+                    ConnectResult::Refused | ConnectResult::RefusedConsumed => {
+                        // Connection attempt refused (or reset during handshake).
+                        // This is equivalent to a closed socket with error.
+                        // Should be readable, writable, and have HUP/ERR set.
+
+                        let mut events_to_set = EPollEventType::EPOLLIN
+                            | EPollEventType::EPOLLRDNORM
+                            | EPollEventType::EPOLLOUT
+                            | EPollEventType::EPOLLWRNORM
+                            | EPollEventType::EPOLLHUP
+                            | EPollEventType::EPOLLRDHUP;
+
+                        // If error not consumed yet, set EPOLLERR
+                        if matches!(*result, ConnectResult::Refused) {
+                            events_to_set |= EPollEventType::EPOLLERR;
+                        }
+
+                        pollee.fetch_or(events_to_set.bits() as usize, Ordering::Relaxed);
+
+                        // If error IS consumed, clear EPOLLERR (if it was set previously)
+                        if matches!(*result, ConnectResult::RefusedConsumed) {
+                            pollee.fetch_and(
+                                !(EPollEventType::EPOLLERR).bits() as usize,
+                                Ordering::Relaxed,
+                            );
+                        }
+                    }
+                    ConnectResult::Connecting => {
+                        // Still connecting - clear all events
+                        pollee.fetch_and(
+                            !(EPollEventType::EPOLLIN
+                                | EPollEventType::EPOLLOUT
+                                | EPollEventType::EPOLLERR
+                                | EPollEventType::EPOLLHUP
+                                | EPollEventType::EPOLLRDHUP
+                                | EPollEventType::EPOLLRDNORM
+                                | EPollEventType::EPOLLWRNORM)
+                                .bits() as usize,
+                            Ordering::Relaxed,
+                        );
+                    }
                 }
-                // Refused
-                *result = ConnectResult::Refused;
-                return true;
+
+                matches!(
+                    *result,
+                    ConnectResult::Refused
+                        | ConnectResult::Connected
+                        | ConnectResult::RefusedConsumed
+                )
             })
     }
 
     pub fn get_name(&self) -> smoltcp::wire::IpEndpoint {
-        self.inner
-            .with::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
-                socket
-                    .local_endpoint()
-                    .expect("A Connecting Tcp With No Local Endpoint")
-            })
+        self.local
     }
 
     pub fn get_peer_name(&self) -> smoltcp::wire::IpEndpoint {
-        self.inner
-            .with::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
-                socket
-                    .remote_endpoint()
-                    .expect("A Connecting Tcp With No Remote Endpoint")
-            })
+        self.remote
+    }
+
+    pub fn failure_reason(&self) -> Option<SystemError> {
+        if matches!(*self.result.read(), ConnectResult::Refused) {
+            Some(SystemError::ECONNREFUSED)
+        } else {
+            None
+        }
+    }
+
+    pub fn consume_error(&self) {
+        let mut guard = self.result.write();
+        if matches!(*guard, ConnectResult::Refused) {
+            *guard = ConnectResult::RefusedConsumed;
+        }
+    }
+
+    pub fn is_refused_consumed(&self) -> bool {
+        matches!(*self.result.read(), ConnectResult::RefusedConsumed)
     }
 }
 
 #[derive(Debug)]
 pub struct Listening {
-    inners: Vec<socket::inet::BoundInner>,
+    pub inners: Vec<socket::inet::BoundInner>,
     connect: AtomicUsize,
     listen_addr: smoltcp::wire::IpListenEndpoint,
 }
@@ -319,22 +634,33 @@ impl Listening {
 
         // log::debug!("local at {:?}", local_endpoint);
 
-        let mut new_listen = socket::inet::BoundInner::bind(
-            new_listen_smoltcp_socket(self.listen_addr),
-            self.listen_addr
-                .addr
-                .as_ref()
-                .unwrap_or(&smoltcp::wire::IpAddress::from(
-                    smoltcp::wire::Ipv4Address::UNSPECIFIED,
-                )),
-            connected.netns(),
-        )?;
+        // Create a replacement listen socket on the *same* interface as the one
+        // that just accepted a connection. This is critical for INADDR_ANY listeners
+        // where each interface has its own listen socket in the smoltcp SocketSet.
+        let mut new_listen = if self.listen_addr.addr.is_none() {
+            socket::inet::BoundInner::bind_on_iface(
+                new_listen_smoltcp_socket(self.listen_addr)?,
+                connected.iface().clone(),
+                connected.netns(),
+            )?
+        } else {
+            socket::inet::BoundInner::bind(
+                new_listen_smoltcp_socket(self.listen_addr)?,
+                self.listen_addr
+                    .addr
+                    .as_ref()
+                    .unwrap_or(&smoltcp::wire::IpAddress::from(
+                        smoltcp::wire::Ipv4Address::UNSPECIFIED,
+                    )),
+                connected.netns(),
+            )?
+        };
 
         // swap the connected socket with the new_listen socket
         // TODO is smoltcp socket swappable?
         core::mem::swap(&mut new_listen, connected);
 
-        return Ok((Established { inner: new_listen }, remote_endpoint));
+        return Ok((Established::new(new_listen, false), remote_endpoint));
     }
 
     pub fn update_io_events(&self, pollee: &AtomicUsize) {
@@ -375,13 +701,19 @@ impl Listening {
         for inner in self.inners.iter() {
             inner.with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.close());
         }
-        self.inners[0]
+        // The original port-owning socket is always the *last* element in `inners`
+        // (pushed last during listen() construction). We must unbind from its
+        // port_manager, not inners[0] which may belong to a different iface for
+        // INADDR_ANY listeners.
+        self.inners
+            .last()
+            .expect("Listening socket must have at least one inner")
             .iface()
             .port_manager()
             .unbind_port(Types::Tcp, port);
     }
 
-    pub fn release(&self) {
+    pub fn release(&mut self) {
         // log::debug!("Release Listening Socket");
         for inner in self.inners.iter() {
             inner.release();
@@ -392,9 +724,33 @@ impl Listening {
 #[derive(Debug)]
 pub struct Established {
     inner: socket::inet::BoundInner,
+    local: smoltcp::wire::IpEndpoint,
+    peer: smoltcp::wire::IpEndpoint,
+    owns_port: bool,
 }
 
 impl Established {
+    pub fn new(inner: socket::inet::BoundInner, owns_port: bool) -> Self {
+        let local = inner
+            .with::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.local_endpoint())
+            .unwrap_or(smoltcp::wire::IpEndpoint::new(
+                smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::UNSPECIFIED),
+                0,
+            ));
+        let peer = inner
+            .with::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.remote_endpoint())
+            .unwrap_or(smoltcp::wire::IpEndpoint::new(
+                smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::UNSPECIFIED),
+                0,
+            ));
+        Self {
+            inner,
+            local,
+            peer,
+            owns_port,
+        }
+    }
+
     pub fn with_mut<R, F: FnMut(&mut smoltcp::socket::tcp::Socket<'static>) -> R>(
         &self,
         f: F,
@@ -402,44 +758,34 @@ impl Established {
         self.inner.with_mut(f)
     }
 
+    pub fn with<R, F: Fn(&smoltcp::socket::tcp::Socket<'static>) -> R>(&self, f: F) -> R {
+        self.inner.with(f)
+    }
+
     pub fn iface(&self) -> &Arc<dyn crate::driver::net::Iface> {
         self.inner.iface()
     }
 
-    pub fn close(&self) {
-        self.inner
-            .with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.close());
-        self.inner.iface().poll();
+    pub fn handle(&self) -> smoltcp::iface::SocketHandle {
+        self.inner.handle()
     }
 
-    pub fn release(&self) {
-        self.inner.release();
+    pub fn owns_port(&self) -> bool {
+        self.owns_port
     }
 
     pub fn get_name(&self) -> smoltcp::wire::IpEndpoint {
+        // smoltcp may clear endpoints in TIME_WAIT/CLOSED; keep a cached copy.
         self.inner
             .with::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.local_endpoint())
-            .unwrap()
+            .unwrap_or(self.local)
     }
 
     pub fn get_peer_name(&self) -> smoltcp::wire::IpEndpoint {
+        // smoltcp may clear endpoints in TIME_WAIT/CLOSED; keep a cached copy.
         self.inner
-            .with::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.remote_endpoint().unwrap())
-    }
-
-    pub fn recv_slice(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
-        self.inner
-            .with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
-                if socket.can_recv() {
-                    match socket.recv_slice(buf) {
-                        Ok(size) => Ok(size),
-                        Err(tcp::RecvError::InvalidState) => Err(SystemError::ENOTCONN),
-                        Err(tcp::RecvError::Finished) => Ok(0),
-                    }
-                } else {
-                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
-                }
-            })
+            .with::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.remote_endpoint())
+            .unwrap_or(self.peer)
     }
 
     pub fn send_slice(&self, buf: &[u8]) -> Result<usize, SystemError> {
@@ -450,7 +796,13 @@ impl Established {
                         .send_slice(buf)
                         .map_err(|_| SystemError::ECONNABORTED)
                 } else {
-                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+                    match socket.state() {
+                        smoltcp::socket::tcp::State::Closed => Err(SystemError::ECONNRESET),
+                        smoltcp::socket::tcp::State::TimeWait
+                        | smoltcp::socket::tcp::State::Closing
+                        | smoltcp::socket::tcp::State::LastAck => Err(SystemError::EPIPE),
+                        _ => Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
+                    }
                 }
             })
     }
@@ -458,29 +810,307 @@ impl Established {
     pub fn update_io_events(&self, pollee: &AtomicUsize) {
         self.inner
             .with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| {
+                let state = socket.state();
+
+                // Check if socket is still open and in a "normal" connected state
+                let is_connected = matches!(
+                    state,
+                    smoltcp::socket::tcp::State::Established
+                        | smoltcp::socket::tcp::State::SynReceived
+                );
+
+                // FIN received states: peer has closed their side
+                let fin_received = matches!(
+                    state,
+                    smoltcp::socket::tcp::State::CloseWait
+                        | smoltcp::socket::tcp::State::LastAck
+                        | smoltcp::socket::tcp::State::Closing
+                        | smoltcp::socket::tcp::State::TimeWait
+                        | smoltcp::socket::tcp::State::Closed
+                );
+
+                // Socket closed (no more I/O possible)
+                let is_closed = matches!(
+                    state,
+                    smoltcp::socket::tcp::State::TimeWait | smoltcp::socket::tcp::State::Closed
+                );
+
                 if socket.can_send() {
                     pollee.fetch_or(
-                        EPollEventType::EPOLLOUT.bits() as usize,
-                        core::sync::atomic::Ordering::Relaxed,
+                        (EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM).bits() as usize,
+                        Ordering::Relaxed,
                     );
                 } else {
                     pollee.fetch_and(
-                        !EPollEventType::EPOLLOUT.bits() as usize,
-                        core::sync::atomic::Ordering::Relaxed,
+                        !(EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM).bits() as usize,
+                        Ordering::Relaxed,
                     );
                 }
-                if socket.can_recv() {
+
+                // EPOLLIN should be set if there is data to read OR if the socket has received FIN (EOF).
+                if socket.can_recv() || fin_received {
                     pollee.fetch_or(
-                        EPollEventType::EPOLLIN.bits() as usize,
-                        core::sync::atomic::Ordering::Relaxed,
+                        (EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM).bits() as usize,
+                        Ordering::Relaxed,
                     );
                 } else {
                     pollee.fetch_and(
-                        !EPollEventType::EPOLLIN.bits() as usize,
-                        core::sync::atomic::Ordering::Relaxed,
+                        !(EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM).bits() as usize,
+                        Ordering::Relaxed,
+                    );
+                }
+
+                // Handle EPOLLHUP, EPOLLRDHUP, EPOLLERR based on socket state
+                // CRITICAL: When socket is still connected, clear these flags!
+                // This fixes the issue where Connecting state might have set these flags
+                // before transitioning to Established.
+                if is_connected {
+                    // Socket is open and connected - clear all error/hangup flags
+                    pollee.fetch_and(
+                        !(EPollEventType::EPOLLHUP
+                            | EPollEventType::EPOLLRDHUP
+                            | EPollEventType::EPOLLERR)
+                            .bits() as usize,
+                        Ordering::Relaxed,
+                    );
+                } else if fin_received && !is_closed {
+                    // Peer sent FIN but socket not fully closed yet (CloseWait, LastAck, Closing)
+                    // Set EPOLLRDHUP to indicate peer shutdown for reading
+                    pollee.fetch_or(
+                        EPollEventType::EPOLLRDHUP.bits() as usize,
+                        Ordering::Relaxed,
+                    );
+                    // Clear EPOLLHUP (full hangup) and EPOLLERR (no error)
+                    pollee.fetch_and(
+                        !(EPollEventType::EPOLLHUP | EPollEventType::EPOLLERR).bits() as usize,
+                        Ordering::Relaxed,
+                    );
+                } else if is_closed {
+                    // Socket fully closed - set both EPOLLHUP and EPOLLRDHUP
+                    pollee.fetch_or(
+                        (EPollEventType::EPOLLHUP | EPollEventType::EPOLLRDHUP).bits() as usize,
+                        Ordering::Relaxed,
+                    );
+                    // Clear EPOLLERR - closed is not an error condition
+                    pollee.fetch_and(
+                        !(EPollEventType::EPOLLERR).bits() as usize,
+                        Ordering::Relaxed,
                     );
                 }
             })
+    }
+}
+
+/// Linux-compatible TCP "self-connect" (connect to the same local addr:port on the same socket).
+///
+/// Linux allows this with a single socket FD, and bytes written to the socket are readable
+/// back from the same socket. smoltcp's TCP socket cannot model this with a single instance,
+/// because a TCP endpoint should not receive its own outbound segments.
+///
+/// We implement the user-visible semantics by internally queueing sent bytes into a local
+/// receive queue, and driving readiness/EOF based on shutdown state.
+#[derive(Debug)]
+pub struct SelfConnected {
+    inner: socket::inet::BoundInner,
+    local: smoltcp::wire::IpEndpoint,
+    /// Effective receive capacity for the loopback queue (bytes).
+    rx_cap: AtomicUsize,
+    buf: Mutex<VecDeque<u8>>,
+    /// SHUT_WR flag for this self-connected socket. Stored here to avoid TOCTOU
+    /// race between checking shutdown and checking queue emptiness.
+    send_shutdown: AtomicBool,
+}
+
+impl SelfConnected {
+    pub fn new(
+        inner: socket::inet::BoundInner,
+        local: smoltcp::wire::IpEndpoint,
+        rx_cap: usize,
+    ) -> Self {
+        Self {
+            inner,
+            local,
+            rx_cap: AtomicUsize::new(rx_cap),
+            buf: Mutex::new(VecDeque::new()),
+            send_shutdown: AtomicBool::new(false),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn iface(&self) -> &Arc<dyn crate::driver::net::Iface> {
+        self.inner.iface()
+    }
+
+    #[allow(dead_code)]
+    pub fn handle(&self) -> smoltcp::iface::SocketHandle {
+        self.inner.handle()
+    }
+
+    #[inline]
+    pub fn get_name(&self) -> smoltcp::wire::IpEndpoint {
+        self.local
+    }
+
+    #[inline]
+    pub fn get_peer_name(&self) -> smoltcp::wire::IpEndpoint {
+        self.local
+    }
+
+    #[inline]
+    pub fn recv_queue(&self) -> usize {
+        self.buf.lock().len()
+    }
+
+    pub fn discard_all(&self) {
+        self.buf.lock().clear();
+    }
+
+    pub fn set_recv_buffer_size(&self, rx_size: usize) {
+        self.rx_cap.store(rx_size, Ordering::Relaxed);
+    }
+
+    pub fn recv_capacity(&self) -> usize {
+        self.rx_cap.load(Ordering::Relaxed)
+    }
+
+    pub fn send_capacity(&self) -> usize {
+        // For self-connect, use the same capacity for "send" as the local receive queue.
+        self.rx_cap.load(Ordering::Relaxed)
+    }
+
+    pub fn send_slice(&self, data: &[u8], send_shutdown: bool) -> Result<usize, SystemError> {
+        if send_shutdown {
+            return Err(SystemError::EPIPE);
+        }
+        if data.is_empty() {
+            return Ok(0);
+        }
+
+        let cap = self.rx_cap.load(Ordering::Relaxed);
+        let mut q = self.buf.lock();
+        let free = cap.saturating_sub(q.len());
+        if free == 0 {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        let n = core::cmp::min(free, data.len());
+        q.extend(&data[..n]);
+        Ok(n)
+    }
+
+    /// Set the send_shutdown flag (called when SHUT_WR is performed).
+    pub fn set_send_shutdown(&self) {
+        self.send_shutdown.store(true, Ordering::Release);
+    }
+
+    /// Check if send_shutdown flag is set.
+    #[inline]
+    #[allow(dead_code)]
+    pub fn is_send_shutdown(&self) -> bool {
+        self.send_shutdown.load(Ordering::Acquire)
+    }
+
+    pub fn recv_into(&self, out: &mut [u8], peek: bool, trunc: bool) -> Result<usize, SystemError> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let mut q = self.buf.lock();
+        if q.is_empty() {
+            // EOF after SHUT_WR once all queued data is drained.
+            // Check send_shutdown inside the lock to avoid TOCTOU race.
+            if self.send_shutdown.load(Ordering::Acquire) {
+                return Ok(0);
+            }
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+
+        let n = core::cmp::min(out.len(), q.len());
+        if !trunc {
+            for (i, b) in q.iter().take(n).enumerate() {
+                out[i] = *b;
+            }
+        }
+
+        if !peek {
+            for _ in 0..n {
+                let _ = q.pop_front();
+            }
+        }
+        Ok(n)
+    }
+
+    pub fn recv_to_user(
+        &self,
+        out: &mut UserBuffer<'_>,
+        offset: usize,
+        max_len: usize,
+    ) -> Result<usize, SystemError> {
+        if offset > out.len() {
+            return Err(SystemError::EINVAL);
+        }
+        let available = core::cmp::min(out.len() - offset, max_len);
+        if available == 0 {
+            return Ok(0);
+        }
+
+        let mut q = self.buf.lock();
+        if q.is_empty() {
+            // Check send_shutdown inside the lock to avoid TOCTOU race.
+            if self.send_shutdown.load(Ordering::Acquire) {
+                return Ok(0);
+            }
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+
+        let n = core::cmp::min(available, q.len());
+        let mut tmp = Vec::with_capacity(n);
+        tmp.extend(q.iter().take(n).copied());
+
+        match out.write_to_user(offset, &tmp) {
+            Ok(_) => {
+                for _ in 0..n {
+                    let _ = q.pop_front();
+                }
+                Ok(n)
+            }
+            Err(SystemError::EFAULT) => Err(SystemError::EFAULT),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn update_io_events(&self, pollee: &AtomicUsize) {
+        let send_shutdown = self.send_shutdown.load(Ordering::Acquire);
+        let queued = self.recv_queue();
+        let cap = self.rx_cap.load(Ordering::Relaxed);
+        let writable = !send_shutdown && queued < cap;
+        let readable = queued > 0 || send_shutdown; // readable after FIN to signal EOF
+
+        if writable {
+            pollee.fetch_or(
+                (EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM).bits() as usize,
+                Ordering::Relaxed,
+            );
+        } else {
+            pollee.fetch_and(
+                !(EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM).bits() as usize,
+                Ordering::Relaxed,
+            );
+        }
+
+        if readable {
+            pollee.fetch_or(
+                (EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM).bits() as usize,
+                Ordering::Relaxed,
+            );
+        } else {
+            pollee.fetch_and(
+                !(EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM).bits() as usize,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    pub fn release(&self) {
+        self.inner.release();
     }
 }
 
@@ -490,28 +1120,70 @@ pub enum Inner {
     Connecting(Connecting),
     Listening(Listening),
     Established(Established),
+    SelfConnected(SelfConnected),
+    Closed(Closed),
 }
 
 impl Inner {
+    pub fn with_socket<R, F>(&self, f: F) -> R
+    where
+        F: Fn(&smoltcp::socket::tcp::Socket<'static>) -> R,
+    {
+        match self {
+            Inner::Init(init) => match init {
+                Init::Unbound((socket, _)) => f(socket),
+                Init::Bound((inner, _)) => inner.with(f),
+            },
+            Inner::Connecting(conn) => conn.with(f),
+            Inner::Listening(listen) => listen.inners[0].with(f),
+            Inner::Established(est) => est.with(f),
+            Inner::SelfConnected(_) => {
+                // SelfConnected keeps a BoundInner for resource management, but does not
+                // model its data path via smoltcp. Avoid touching the underlying socket.
+                panic!("Inner::with_socket called on SelfConnected socket")
+            }
+            Inner::Closed(_) => {
+                // Closed 状态不应再触达任何 smoltcp socket。
+                // 调用者应当在更上层对 Closed 做分支处理。
+                panic!("Inner::with_socket called on Closed socket")
+            }
+        }
+    }
+
+    pub fn for_each_socket_mut<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&mut smoltcp::socket::tcp::Socket<'static>),
+    {
+        match self {
+            Inner::Init(init) => match init {
+                Init::Unbound((socket, _)) => f(socket),
+                Init::Bound((inner, _)) => inner.with_mut(f),
+            },
+            Inner::Connecting(conn) => conn.with_mut(f),
+            Inner::Listening(listen) => {
+                for inner in &listen.inners {
+                    inner.with_mut(&mut f);
+                }
+            }
+            Inner::Established(est) => est.with_mut(f),
+            Inner::SelfConnected(_) => {}
+            Inner::Closed(_) => {}
+        }
+    }
+
     pub fn send_buffer_size(&self) -> usize {
         match self {
-            Inner::Init(_) => DEFAULT_TX_BUF_SIZE,
-            Inner::Connecting(conn) => conn.with_mut(|socket| socket.send_capacity()),
-            // only the first socket in the list is used for sending
-            Inner::Listening(listen) => listen.inners[0]
-                .with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.send_capacity()),
-            Inner::Established(est) => est.with_mut(|socket| socket.send_capacity()),
+            Inner::Closed(_) => 0,
+            Inner::SelfConnected(sc) => sc.send_capacity(),
+            _ => self.with_socket(|socket| socket.send_capacity()),
         }
     }
 
     pub fn recv_buffer_size(&self) -> usize {
         match self {
-            Inner::Init(_) => DEFAULT_RX_BUF_SIZE,
-            Inner::Connecting(conn) => conn.with_mut(|socket| socket.recv_capacity()),
-            // only the first socket in the list is used for receiving
-            Inner::Listening(listen) => listen.inners[0]
-                .with_mut::<smoltcp::socket::tcp::Socket, _, _>(|socket| socket.recv_capacity()),
-            Inner::Established(est) => est.with_mut(|socket| socket.recv_capacity()),
+            Inner::Closed(_) => 0,
+            Inner::SelfConnected(sc) => sc.recv_capacity(),
+            _ => self.with_socket(|socket| socket.recv_capacity()),
         }
     }
 
@@ -521,6 +1193,51 @@ impl Inner {
             Inner::Connecting(conn) => Some(conn.inner.iface()),
             Inner::Listening(listen) => Some(listen.inners[0].iface()),
             Inner::Established(est) => Some(est.inner.iface()),
+            Inner::SelfConnected(sc) => Some(sc.inner.iface()),
+            Inner::Closed(_) => None,
+        }
+    }
+
+    pub fn local_endpoint(&self) -> smoltcp::wire::IpEndpoint {
+        match self {
+            Inner::Init(init) => match init {
+                Init::Unbound((_, ver)) => match ver {
+                    smoltcp::wire::IpVersion::Ipv4 => smoltcp::wire::IpEndpoint::new(
+                        smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::UNSPECIFIED),
+                        0,
+                    ),
+                    smoltcp::wire::IpVersion::Ipv6 => smoltcp::wire::IpEndpoint::new(
+                        smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address::UNSPECIFIED),
+                        0,
+                    ),
+                },
+                Init::Bound((_, local)) => *local,
+            },
+            Inner::Connecting(conn) => conn.get_name(),
+            Inner::Listening(listen) => listen.get_name(),
+            Inner::Established(est) => est.get_name(),
+            Inner::SelfConnected(sc) => sc.get_name(),
+            Inner::Closed(closed) => match closed.ver {
+                smoltcp::wire::IpVersion::Ipv4 => smoltcp::wire::IpEndpoint::new(
+                    smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::UNSPECIFIED),
+                    0,
+                ),
+                smoltcp::wire::IpVersion::Ipv6 => smoltcp::wire::IpEndpoint::new(
+                    smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address::UNSPECIFIED),
+                    0,
+                ),
+            },
+        }
+    }
+
+    pub fn remote_endpoint(&self) -> Option<smoltcp::wire::IpEndpoint> {
+        match self {
+            Inner::Init(_) => None,
+            Inner::Listening(_) => None,
+            Inner::Connecting(conn) => Some(conn.get_peer_name()),
+            Inner::Established(est) => Some(est.get_peer_name()),
+            Inner::SelfConnected(sc) => Some(sc.get_peer_name()),
+            Inner::Closed(_) => None,
         }
     }
 }

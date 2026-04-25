@@ -129,3 +129,15 @@ impl ProbeArgs for TrapFrame {
         todo!("TrapFrame::debug_address()")
     }
 }
+
+impl crate::process::rseq::RseqTrapFrame for TrapFrame {
+    #[inline]
+    fn rseq_ip(&self) -> usize {
+        self.csr_era
+    }
+
+    #[inline]
+    fn set_rseq_ip(&mut self, ip: usize) {
+        self.csr_era = ip;
+    }
+}

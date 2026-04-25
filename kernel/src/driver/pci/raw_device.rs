@@ -13,7 +13,8 @@ use crate::{
         kset::KSet,
     },
     filesystem::{kernfs::KernFSInode, sysfs::AttributeGroup},
-    libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+    libs::rwlock::RwLock,
+    libs::rwsem::{RwSemReadGuard, RwSemWriteGuard},
 };
 
 use super::{
@@ -217,11 +218,11 @@ impl KObject for PciGeneralDevice {
         self.inner.write().name = Some(name);
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 

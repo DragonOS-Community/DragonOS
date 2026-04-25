@@ -1,3 +1,4 @@
+use crate::libs::spinlock::SpinLockGuard;
 use alloc::sync::{Arc, Weak};
 use core::{
     arch::asm,
@@ -16,7 +17,6 @@ use crate::{
         CurrentIrqArch,
     },
     exception::InterruptArch,
-    libs::spinlock::SpinLockGuard,
     mm::VirtAddr,
     process::{
         fork::{CloneFlags, KernelCloneArgs},
@@ -172,12 +172,36 @@ impl ProcessManager {
         Self::switch_process_fpu(&prev, &next);
         Self::switch_local_context(&prev, &next);
 
-        // 切换地址空间
-        let next_addr_space = next.basic().user_vm().as_ref().unwrap().clone();
+        // 切换地址空间（无锁快速路径）
+        // 必须同时维护 mm-aware shootdown 的前置状态：
+        //   - 被切出的 mm：从 active_cpus 里摘掉当前 CPU；
+        //   - 被切入的 mm：在加载 satp 后写入 active_cpus 并更新 per-CPU TlbState.loaded_mm，
+        //     这样后续 `flush_tlb_mm_range` / `flush_tlb_multi` 才能正确把本 CPU 当成目标。
+        // 顺序：clear(prev) -> make_current(next) -> set(next) -> tlb_state_set_loaded_mm(next)
+        // 与 x86_64 switch_process 保持一致 (见 kernel/src/arch/x86_64/process/mod.rs:switch_process)。
+        let next_addr_space = next.basic().user_vm().unwrap();
+        let prev_addr_space = prev.basic().user_vm();
+        let cpu = crate::smp::core::smp_get_processor_id();
         compiler_fence(Ordering::SeqCst);
 
-        next_addr_space.read().user_mapper.utable.make_current();
-        drop(next_addr_space);
+        let same_mm = match prev_addr_space.as_ref() {
+            Some(p) => Arc::ptr_eq(p, &next_addr_space),
+            None => false,
+        };
+
+        if !same_mm {
+            if let Some(prev_mm) = prev_addr_space.as_ref() {
+                prev_mm.active_cpus_clear(cpu);
+            }
+        }
+
+        next_addr_space.make_current();
+        compiler_fence(Ordering::SeqCst);
+
+        if !same_mm {
+            next_addr_space.active_cpus_set(cpu);
+        }
+        unsafe { crate::mm::tlb::tlb_state_set_loaded_mm(next_addr_space.clone()) };
         compiler_fence(Ordering::SeqCst);
 
         // debug!("current sum={}, prev sum={}, next_sum={}", riscv::register::sstatus::read().sum(), prev.arch_info_irqsave().sstatus.sum(), next.arch_info_irqsave().sstatus.sum());

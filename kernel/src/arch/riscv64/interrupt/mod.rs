@@ -186,3 +186,15 @@ impl ProbeArgs for TrapFrame {
         self.epc
     }
 }
+
+impl crate::process::rseq::RseqTrapFrame for TrapFrame {
+    #[inline]
+    fn rseq_ip(&self) -> usize {
+        self.epc
+    }
+
+    #[inline]
+    fn set_rseq_ip(&mut self, ip: usize) {
+        self.epc = ip;
+    }
+}

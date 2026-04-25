@@ -7,19 +7,40 @@ on:
     branches: ["master", "feat-*", "fix-*"]
 
 jobs:
+  changes:
+    name: Detect kernel changes
+    runs-on: ubuntu-latest
+    outputs:
+      kernel_changed: ${{ steps.filter.outputs.kernel }}
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - name: Check changed paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            kernel:
+              - 'kernel/**'
+
   format-check:
     name: Format check ${{ matrix.arch }}
     runs-on: ubuntu-latest
     continue-on-error: true
-    container: dragonos/dragonos-dev:v1.17
+    container: dragonos/dragonos-dev:v1.23
 
     strategy:
       matrix:
         arch: [x86_64, riscv64, loongarch64]
 
     steps:
-      - run: echo "Running in dragonos/dragonos-dev:v1.17"
+      - run: echo "Running in dragonos/dragonos-dev:v1.23"
       - uses: actions/checkout@v3
+
+      - name: Change source
+        run: |
+          find . -type f \( -name "*.toml" -o -name "Makefile" \) -exec sed -i 's/git\.mirrors\.dragonos\.org\.cn/github\.com/g' {} +
 
       - name: Format check
         env:
@@ -29,23 +50,28 @@ jobs:
         run: |
           printf "\n" >> kernel/src/include/bindings/bindings.rs
           printf "\n" >> kernel/src/init/version_info.rs
-          sed -i 's/arch = ".*"/arch = "${{ matrix.arch }}"/' dadk-manifest.toml
           FMT_CHECK=1 make fmt
 
   kernel-static-test:
     name: Kernel static test ${{ matrix.arch }}
+    needs: changes
+    if: needs.changes.outputs.kernel_changed == 'true'
     runs-on: ubuntu-latest
     continue-on-error: true
-    container: dragonos/dragonos-dev:v1.17
+    container: dragonos/dragonos-dev:v1.23
 
     strategy:
       matrix:
         arch: [x86_64, riscv64, loongarch64]
 
     steps:
-      - run: echo "Running in dragonos/dragonos-dev:v1.17"
+      - run: echo "Running in dragonos/dragonos-dev:v1.23"
 
       - uses: actions/checkout@v3
+
+      - name: Change source
+        run: |
+          find . -type f \( -name "*.toml" -o -name "Makefile" \) -exec sed -i 's/git\.mirrors\.dragonos\.org\.cn/github\.com/g' {} +
 
       - name: Run kernel static test
         shell: bash -ileo pipefail {0}
@@ -57,7 +83,7 @@ jobs:
   build:
     name: Build ${{ matrix.arch }}
     runs-on: ubuntu-latest
-    container: dragonos/dragonos-dev:v1.17
+    container: dragonos/dragonos-dev:v1.23
     continue-on-error: true
     strategy:
       matrix:
@@ -74,10 +100,14 @@ jobs:
             checkout_params: {}
 
     steps:
-      - run: echo "Running in dragonos/dragonos-dev:v1.17"
-      
+      - run: echo "Running in dragonos/dragonos-dev:v1.23"
+
       - uses: actions/checkout@v3
         with: ${{ matrix.checkout_params }}
+
+      - name: Change source
+        run: |
+          find . -type f \( -name "*.toml" -o -name "Makefile" \) -exec sed -i 's/git\.mirrors\.dragonos\.org\.cn/github\.com/g' {} +
 
       - name: Build the DragonOS
         env:
@@ -92,5 +122,4 @@ jobs:
           if [[ "$ARCH" == "x86_64" ]]; then
             export DragonOS_GCC=$HOME/opt/dragonos-gcc/gcc-x86_64-unknown-none/bin
           fi
-          sed -i 's/arch = ".*"/arch = "${{ env.ARCH }}"/' dadk-manifest.toml
           make ${{ matrix.make_target }} -j $(nproc)

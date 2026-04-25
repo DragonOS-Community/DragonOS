@@ -7,6 +7,7 @@ use alloc::{
 
 use unified_init::macros::unified_init;
 
+use crate::libs::mutex::MutexGuard;
 use crate::{
     arch::{io::PortIOArch, CurrentIrqArch, CurrentPortIOArch},
     driver::{
@@ -27,11 +28,7 @@ use crate::{
         },
     },
     init::initcall::INITCALL_DEVICE,
-    libs::{
-        keyboard_parser::TypeOneFSM,
-        rwlock::RwLock,
-        spinlock::{SpinLock, SpinLockGuard},
-    },
+    libs::{keyboard_parser::TypeOneFSM, rwlock::RwLock, spinlock::SpinLock},
     time::PosixTimeSpec,
 };
 use system_error::SystemError;
@@ -128,7 +125,7 @@ impl IndexNode for LockedPS2KeyBoardInode {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         return Err(SystemError::ENOSYS);
     }
@@ -138,20 +135,20 @@ impl IndexNode for LockedPS2KeyBoardInode {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         return Err(SystemError::ENOSYS);
     }
 
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         return Ok(());
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 

@@ -1,0 +1,55 @@
+{
+  "schema_version": "1.0",
+  "findings": [
+    {
+      "file": "kernel/src/process/exit.rs",
+      "line": 42,
+      "type": "logic",
+      "severity": "major",
+      "description": "wait4 path forgets to propagate rusage related errno",
+      "fix_code": "return_errno!(Errno::ECHILD);",
+      "confidence": 0.82,
+      "agent": "Diverse Reviewer C"
+    },
+    {
+      "file": "kernel/src/process/exit.rs",
+      "line": 43,
+      "type": "logic",
+      "severity": "major",
+      "description": "missing errno propagation in wait4 rusage branch",
+      "fix_code": "return_errno!(Errno::ECHILD);",
+      "confidence": 0.76,
+      "agent": "Diverse Reviewer A"
+    },
+    {
+      "file": "kernel/src/sched/futex.rs",
+      "line": 118,
+      "type": "concurrency",
+      "severity": "critical",
+      "description": "futex wake path may race with waiter unlink sequence",
+      "fix_code": "",
+      "confidence": 0.58,
+      "agent": "Concurrency Engineer"
+    },
+    {
+      "file": "kernel/src/net/socket.rs",
+      "line": 87,
+      "type": "security",
+      "severity": "critical",
+      "description": "socket credential check can be bypassed on fast path",
+      "fix_code": "if !task.can_access(sock_cred) { return_errno!(Errno::EACCES); }",
+      "confidence": 0.92,
+      "agent": "Security Sentinel"
+    },
+    {
+      "file": "kernel/src/mm/slab.rs",
+      "line": 201,
+      "type": "performance",
+      "severity": "minor",
+      "description": "allocator hot path does repeated small vector realloc",
+      "fix_code": "",
+      "confidence": 0.35,
+      "agent": "Performance Analyst"
+    }
+  ]
+}

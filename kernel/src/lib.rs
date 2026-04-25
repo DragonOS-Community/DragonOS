@@ -1,7 +1,6 @@
 #![no_main] // <1>
 #![no_std]
 #![feature(alloc_error_handler)]
-#![feature(new_zeroed_alloc)]
 #![feature(allocator_api)]
 #![feature(arbitrary_self_types)]
 #![feature(const_for)]
@@ -12,9 +11,10 @@
 #![feature(fn_align)]
 #![feature(linked_list_retain)]
 #![feature(ptr_internals)]
+#![feature(slice_pattern)]
 #![feature(slice_ptr_get)]
+#![feature(negative_impls)]
 #![feature(sync_unsafe_cell)]
-#![feature(vec_into_raw_parts)]
 #![feature(linkage)]
 #![feature(panic_can_unwind)]
 #![allow(

@@ -13,7 +13,9 @@ use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::vfs::{FilePrivateData, FileSystem, FileType, IndexNode, Metadata};
 use crate::include::bindings::linux_bpf::{bpf_attr, bpf_map_type};
 use crate::libs::casting::DowncastArc;
-use crate::libs::spinlock::{SpinLock, SpinLockGuard};
+use crate::libs::mutex::MutexGuard;
+use crate::libs::spinlock::SpinLock;
+
 use crate::process::ProcessManager;
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
 use alloc::boxed::Box;
@@ -132,10 +134,10 @@ impl BpfMap {
 }
 
 impl IndexNode for BpfMap {
-    fn open(&self, _data: SpinLockGuard<FilePrivateData>, _flags: &FileFlags) -> Result<()> {
+    fn open(&self, _data: MutexGuard<FilePrivateData>, _flags: &FileFlags) -> Result<()> {
         Ok(())
     }
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<()> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<()> {
         Ok(())
     }
     fn read_at(
@@ -143,7 +145,7 @@ impl IndexNode for BpfMap {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize> {
         Err(SystemError::ENOSYS)
     }
@@ -153,7 +155,7 @@ impl IndexNode for BpfMap {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize> {
         Err(SystemError::ENOSYS)
     }
@@ -247,7 +249,10 @@ pub fn bpf_map_create(attr: &bpf_attr) -> Result<usize> {
     let bpf_map = BpfMap::new(map, map_meta);
     let fd_table = ProcessManager::current_pcb().fd_table();
     let file = File::new(Arc::new(bpf_map), FileFlags::O_RDWR | FileFlags::O_CLOEXEC)?;
-    let fd = fd_table.write().alloc_fd(file, None).map(|x| x as usize)?;
+    let fd = fd_table
+        .write()
+        .alloc_fd(file, None, true)
+        .map(|x| x as usize)?;
     info!("create map with fd: [{}]", fd);
     Ok(fd)
 }

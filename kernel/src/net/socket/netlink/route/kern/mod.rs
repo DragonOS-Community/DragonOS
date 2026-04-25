@@ -4,7 +4,7 @@
 use crate::{
     net::socket::netlink::{
         message::{
-            segment::{ack::ErrorSegment, CSegmentType},
+            segment::{ack::ErrorSegment, header::SegHdrCommonFlags, CSegmentType},
             ProtocolSegment,
         },
         route::message::{segment::RouteNlSegment, RouteNlMessage},
@@ -17,6 +17,7 @@ use crate::{
 };
 use alloc::sync::Arc;
 use core::marker::PhantomData;
+use system_error::SystemError;
 
 mod addr;
 mod link;
@@ -45,27 +46,46 @@ impl NetlinkRouteKernelSocket {
         for segment in request.segments() {
             let header = segment.header();
 
-            let seg_type = CSegmentType::try_from(header.type_).unwrap();
-            let responce = match segment {
+            let Ok(seg_type) = CSegmentType::try_from(header.type_) else {
+                let err_segment = ErrorSegment::new_from_request(header, Some(SystemError::EINVAL));
+                let err_msg = RouteNlMessage::new(vec![RouteNlSegment::Error(err_segment)]);
+                let _ = NetlinkRouteProtocol::unicast(dst_port, err_msg, netns.clone());
+                continue;
+            };
+
+            let request_flags = SegHdrCommonFlags::from_bits_truncate(header.flags);
+            let need_ack = request_flags.contains(SegHdrCommonFlags::ACK);
+
+            let response_segments = match segment {
                 RouteNlSegment::GetAddr(request) => addr::do_get_addr(request, netns.clone()),
+                RouteNlSegment::NewAddr(request) => addr::do_new_addr(request, netns.clone()),
+                RouteNlSegment::DelAddr(request) => addr::do_del_addr(request, netns.clone()),
                 RouteNlSegment::GetLink(request) => link::do_get_link(request, netns.clone()),
-                RouteNlSegment::GetRoute(_new_route) => todo!(),
+                RouteNlSegment::GetRoute(_new_route) => Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
                 _ => {
                     log::warn!("Unsupported route request segment type: {:?}", seg_type);
-                    todo!()
+                    Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
                 }
             };
 
-            let responce = match responce {
-                Ok(segments) => RouteNlMessage::new(segments),
+            let response = match response_segments {
+                Ok(mut segments) => {
+                    if segments.is_empty() {
+                        if !need_ack {
+                            continue;
+                        }
+                        let ack_segment = ErrorSegment::new_from_request(header, None);
+                        segments.push(RouteNlSegment::Error(ack_segment));
+                    }
+                    RouteNlMessage::new(segments)
+                }
                 Err(error) => {
-                    //todo 处理 `NetlinkMessageCommonFlags::ACK`
                     let err_segment = ErrorSegment::new_from_request(header, Some(error));
                     RouteNlMessage::new(vec![RouteNlSegment::Error(err_segment)])
                 }
             };
 
-            NetlinkRouteProtocol::unicast(dst_port, responce, netns.clone()).unwrap();
+            let _ = NetlinkRouteProtocol::unicast(dst_port, response, netns.clone());
         }
     }
 }

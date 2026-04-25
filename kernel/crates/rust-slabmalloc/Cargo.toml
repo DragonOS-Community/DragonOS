@@ -6,11 +6,19 @@ edition = "2018"
 [features]
 unstable = []
 default = [ "unstable" ]
+host = ["rand"]
 
 [dependencies]
 log = "0.4"
+rand = { version = "0.8", optional = true, features = ["std", "small_rng"] }
 
 [target.'cfg(unix)'.dev-dependencies]
-rand = "0.8"
+rand = { version = "0.8", features = ["small_rng"] }
 env_logger = "0.9"
 spin = "0.9.8"
+proptest = "1.6"
+
+[[bin]]
+name = "slab_stress"
+path = "src/bin/slab_stress.rs"
+required-features = ["host"]

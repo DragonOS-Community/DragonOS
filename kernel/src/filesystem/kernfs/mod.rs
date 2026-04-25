@@ -10,14 +10,11 @@ use hashbrown::HashMap;
 use log::warn;
 use system_error::SystemError;
 
+use crate::libs::mutex::{Mutex, MutexGuard};
 use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::syscall::RenameFlags,
-    libs::{
-        casting::DowncastArc,
-        rwlock::RwLock,
-        spinlock::{SpinLock, SpinLockGuard},
-    },
+    libs::{casting::DowncastArc, rwsem::RwSem},
     time::PosixTimeSpec,
 };
 
@@ -103,19 +100,19 @@ impl KernFS {
         };
         let root_inode = Arc::new_cyclic(|self_ref| KernFSInode {
             name: String::from(""),
-            inner: RwLock::new(InnerKernFSInode {
+            inner: RwSem::new(InnerKernFSInode {
                 parent: Weak::new(),
                 metadata,
                 symlink_target: None,
                 symlink_target_absolute_path: None,
             }),
             self_ref: self_ref.clone(),
-            fs: RwLock::new(Weak::new()),
-            private_data: SpinLock::new(None),
+            fs: RwSem::new(Weak::new()),
+            private_data: Mutex::new(None),
             callback: None,
-            children: SpinLock::new(HashMap::new()),
+            children: Mutex::new(HashMap::new()),
             inode_type: KernInodeType::Dir,
-            lazy_list: SpinLock::new(HashMap::new()),
+            lazy_list: Mutex::new(HashMap::new()),
         });
 
         return root_inode;
@@ -124,23 +121,23 @@ impl KernFS {
 
 #[derive(Debug)]
 pub struct KernFSInode {
-    inner: RwLock<InnerKernFSInode>,
+    inner: RwSem<InnerKernFSInode>,
     /// 指向当前Inode所属的文件系统的弱引用
-    fs: RwLock<Weak<KernFS>>,
+    fs: RwSem<Weak<KernFS>>,
     /// 指向自身的弱引用
     self_ref: Weak<KernFSInode>,
     /// 私有数据
-    private_data: SpinLock<Option<KernInodePrivateData>>,
+    private_data: Mutex<Option<KernInodePrivateData>>,
     /// 回调函数
     callback: Option<&'static dyn KernFSCallback>,
     /// 子Inode
-    children: SpinLock<HashMap<String, Arc<KernFSInode>>>,
+    children: Mutex<HashMap<String, Arc<KernFSInode>>>,
     /// Inode类型
     inode_type: KernInodeType,
     /// Inode名称
     name: String,
     /// lazy list
-    lazy_list: SpinLock<HashMap<String, fn() -> KernFSInodeArgs>>,
+    lazy_list: Mutex<HashMap<String, fn() -> KernFSInodeArgs>>,
 }
 
 pub struct KernFSInodeArgs {
@@ -169,7 +166,7 @@ impl IndexNode for KernFSInode {
 
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         if let Some(callback) = self.callback {
@@ -181,7 +178,7 @@ impl IndexNode for KernFSInode {
         return Ok(());
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 
@@ -211,7 +208,7 @@ impl IndexNode for KernFSInode {
 
     fn link(&self, _name: &str, _other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
         // 应当通过kernfs的其它方法来操作文件，而不能从用户态直接调用此方法。
-        return Err(SystemError::ENOSYS);
+        return Err(SystemError::EROFS);
     }
 
     fn unlink(&self, _name: &str) -> Result<(), SystemError> {
@@ -226,12 +223,29 @@ impl IndexNode for KernFSInode {
 
     fn move_to(
         &self,
-        _old_name: &str,
-        _target: &Arc<dyn IndexNode>,
-        _new_name: &str,
+        old_name: &str,
+        target: &Arc<dyn IndexNode>,
+        new_name: &str,
         _flags: RenameFlags,
     ) -> Result<(), SystemError> {
-        // 应当通过kernfs的其它方法来操作文件，而不能从用户态直接调用此方法。
+        // 处理重命名到自身的特殊情况
+        // 如果源目录和目标目录是同一个 inode，且文件名相同，则直接返回成功
+        // 这符合 Linux 的 rename 语义：重命名到自身是一个空操作
+        if let Some(target_kernfs) = target.clone().downcast_arc::<KernFSInode>() {
+            // 使用 Arc::ptr_eq 比较两个 Arc 是否指向同一个对象
+            // 通过 self_ref.upgrade() 获取 Arc<KernFSInode>
+            let self_arc = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+            let target_arc = target_kernfs
+                .self_ref
+                .upgrade()
+                .ok_or(SystemError::ENOENT)?;
+
+            if Arc::ptr_eq(&self_arc, &target_arc) && old_name == new_name {
+                return Ok(());
+            }
+        }
+
+        // 其他情况返回 ENOSYS（sysfs/kernfs 不支持真正的重命名操作）
         return Err(SystemError::ENOSYS);
     }
 
@@ -305,7 +319,7 @@ impl IndexNode for KernFSInode {
         &self,
         _cmd: u32,
         _data: usize,
-        _private_data: &FilePrivateData,
+        _private_data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
         return Err(SystemError::ENOSYS);
@@ -346,7 +360,7 @@ impl IndexNode for KernFSInode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        data: SpinLockGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if self.inode_type == KernInodeType::SymLink {
             let inner = self.inner.read();
@@ -392,7 +406,7 @@ impl IndexNode for KernFSInode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        data: SpinLockGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if self.inode_type != KernInodeType::File {
             return Err(SystemError::EISDIR);
@@ -429,19 +443,19 @@ impl KernFSInode {
 
         let inode = Arc::new(KernFSInode {
             name,
-            inner: RwLock::new(InnerKernFSInode {
+            inner: RwSem::new(InnerKernFSInode {
                 parent: parent.clone(),
                 metadata,
                 symlink_target: None,
                 symlink_target_absolute_path: None,
             }),
             self_ref: Weak::new(),
-            fs: RwLock::new(Weak::new()),
-            private_data: SpinLock::new(private_data),
+            fs: RwSem::new(Weak::new()),
+            private_data: Mutex::new(private_data),
             callback,
-            children: SpinLock::new(HashMap::new()),
+            children: Mutex::new(HashMap::new()),
             inode_type,
-            lazy_list: SpinLock::new(HashMap::new()),
+            lazy_list: Mutex::new(HashMap::new()),
         });
 
         {
@@ -660,7 +674,7 @@ impl KernFSInode {
         return self.inner.read().parent.upgrade();
     }
 
-    pub fn private_data_mut(&self) -> SpinLockGuard<'_, Option<KernInodePrivateData>> {
+    pub fn private_data_mut(&self) -> MutexGuard<'_, Option<KernInodePrivateData>> {
         return self.private_data.lock();
     }
 

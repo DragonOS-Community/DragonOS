@@ -36,14 +36,17 @@ fn fault_handler(regs: &dyn ProbeArgs) {
 }
 
 pub fn kprobe_test() {
-    info!("kprobe test for [detect_func]: {:#x}", detect_func as usize);
+    info!(
+        "kprobe test for [detect_func]: {:#x}",
+        detect_func as *const () as usize
+    );
     let kprobe_info = KprobeInfo {
         pre_handler,
         post_handler,
         fault_handler: Some(fault_handler),
         event_callback: None,
         symbol: None,
-        addr: Some(detect_func as usize),
+        addr: Some(detect_func as *const () as usize),
         offset: 0,
         enable: true,
     };
@@ -70,14 +73,14 @@ pub fn kprobe_test() {
     let kprobe2 = register_kprobe(kprobe_info).unwrap();
     info!(
         "install 2 kprobes at [detect_func]: {:#x}",
-        detect_func as usize
+        detect_func as *const () as usize
     );
     detect_func(1, 2);
     unregister_kprobe(kprobe);
     unregister_kprobe(kprobe2);
     info!(
         "uninstall 2 kprobes at [detect_func]: {:#x}",
-        detect_func as usize
+        detect_func as *const () as usize
     );
     detect_func(1, 2);
     info!("kprobe test end");

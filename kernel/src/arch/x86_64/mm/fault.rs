@@ -1,8 +1,5 @@
 use alloc::sync::Arc;
-use core::{
-    intrinsics::{likely, unlikely},
-    panic,
-};
+use core::{intrinsics::unlikely, panic};
 use log::error;
 use x86::{bits64::rflags::RFlags, controlregs::Cr4};
 
@@ -30,7 +27,7 @@ pub type PageMapper =
 
 impl X86_64MMArch {
     pub fn vma_access_error(vma: Arc<LockedVMA>, error_code: X86PfErrorCode) -> bool {
-        let vm_flags = *vma.lock_irqsave().vm_flags();
+        let vm_flags = *vma.lock().vm_flags();
         let foreign = false;
         if error_code.contains(X86PfErrorCode::X86_PF_PK) {
             return true;
@@ -281,7 +278,13 @@ impl X86_64MMArch {
 
         let send_segv = || {
             let pid = ProcessManager::current_pid();
-            let mut info = SigInfo::new(Signal::SIGSEGV, 0, SigCode::User, SigType::Kill(pid));
+            let uid = ProcessManager::current_pcb().cred().uid.data() as u32;
+            let mut info = SigInfo::new(
+                Signal::SIGSEGV,
+                0,
+                SigCode::User,
+                SigType::Kill { pid, uid },
+            );
             Signal::SIGSEGV
                 .send_signal_info(Some(&mut info), pid)
                 .expect("failed to send SIGSEGV to process");
@@ -307,7 +310,7 @@ impl X86_64MMArch {
         };
 
         let current_address_space: Arc<AddressSpace> = AddressSpace::current().unwrap();
-        let mut space_guard = current_address_space.write_irqsave();
+        let mut space_guard = current_address_space.write();
         let mut fault;
         loop {
             let vma = space_guard.mappings.find_nearest(address);
@@ -331,17 +334,39 @@ impl X86_64MMArch {
                     return;
                 }
             };
-            let guard = vma.lock_irqsave();
+            let guard = vma.lock();
             let region = *guard.region();
             let vm_flags = *guard.vm_flags();
             drop(guard);
 
             if !region.contains(address) {
                 if vm_flags.contains(VmFlags::VM_GROWSDOWN) {
-                    if !space_guard.can_extend_stack(region.start() - address) {
-                        // exceeds stack limit
-                        log::error!(
-                            "pid {} stack limit exceeded, error_code: {:?}, address: {:#x}",
+                    let extension_size = region.start() - address;
+
+                    // 首先检查地址是否在栈的合理扩展范围内
+                    // 如果地址距离栈底太远（超过最大栈限制），则这不是一个栈扩展请求，
+                    // 而是一个无关的无效内存访问（例如空指针解引用）
+                    let max_stack_limit = space_guard
+                        .user_stack
+                        .as_ref()
+                        .map(|s| s.max_limit())
+                        .unwrap_or(0);
+
+                    if extension_size > max_stack_limit {
+                        // 地址距离栈太远，这不是栈扩展请求，而是普通的无效内存访问
+                        // 检查是否需要异常表修复
+                        if handle_kernel_access_failed(regs) {
+                            return; // 已通过异常表修复
+                        }
+
+                        send_segv();
+                        return;
+                    }
+
+                    if !space_guard.can_extend_stack(extension_size) {
+                        // 栈扩展超过限制
+                        log::warn!(
+                            "pid {} user stack limit exceeded, error_code: {:?}, address: {:#x}",
                             ProcessManager::current_pid().data(),
                             error_code,
                             address.data(),
@@ -356,7 +381,7 @@ impl X86_64MMArch {
                         return;
                     }
                     space_guard
-                        .extend_stack(region.start() - address)
+                        .extend_stack(extension_size)
                         .unwrap_or_else(|_| {
                             panic!(
                                 "user stack extend failed, error_code: {:?}, address: {:#x}",
@@ -391,16 +416,23 @@ impl X86_64MMArch {
                     return; // 已通过异常表修复
                 }
 
-                log::error!(
-                    "vma access error, error_code: {:?}, address: {:#x}",
-                    error_code,
-                    address.data(),
-                );
+                // log::error!(
+                //     "vma access error, error_code: {:?}, address: {:#x}",
+                //     error_code,
+                //     address.data(),
+                // );
 
                 send_segv();
+                return;
             }
             let mapper = &mut space_guard.user_mapper.utable;
-            let message = PageFaultMessage::new(vma.clone(), address, flags, mapper);
+            let message = PageFaultMessage::new(
+                vma.clone(),
+                address,
+                flags,
+                mapper,
+                current_address_space.clone(),
+            );
 
             fault = PageFaultHandler::handle_mm_fault(message);
 
@@ -422,8 +454,41 @@ impl X86_64MMArch {
             | VmFaultReason::VM_FAULT_HWPOISON_LARGE
             | VmFaultReason::VM_FAULT_FALLBACK;
 
-        if likely(!fault.contains(vm_fault_error)) {
-            panic!("fault error: {:?}", fault)
+        if fault.intersects(vm_fault_error) {
+            // 内核态访问用户地址（如 copy_from_user）应走异常表修复，返回 -EFAULT，而不是发送信号/崩溃
+            if !regs.is_from_user() {
+                if Self::try_fixup_exception(regs, error_code, address) {
+                    return;
+                }
+                panic!(
+                    "kernel access to user addr failed without fixup, fault: {:?}, addr: {:#x}, rip: {:#x}",
+                    fault,
+                    address.data(),
+                    regs.rip
+                );
+            }
+
+            // 用户态 fault：发送对应信号
+            let sig = if fault.contains(VmFaultReason::VM_FAULT_SIGSEGV) {
+                Signal::SIGSEGV
+            } else {
+                // 包括 SIGBUS / OOM / HWPOISON 等：目前统一 SIGBUS（后续可按 Linux 进一步细分）
+                Signal::SIGBUS
+            };
+
+            let mut info = SigInfo::new(
+                sig,
+                0,
+                SigCode::User,
+                SigType::Kill {
+                    pid: ProcessManager::current_pid(),
+                    uid: ProcessManager::current_pcb().cred().uid.data() as u32,
+                },
+            );
+            let _ = sig.send_signal_info(Some(&mut info), ProcessManager::current_pid());
+            return;
         }
+
+        panic!("fault error: {:?}", fault)
     }
 }

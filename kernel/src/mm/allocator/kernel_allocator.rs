@@ -69,9 +69,10 @@ impl LocalAlloc for KernelAllocator {
                 .map(|x| x.as_mut_ptr())
                 .unwrap_or_default();
         } else {
-            if let Some(ref mut slab) = SLABALLOCATOR {
+            let mut guard = SLABALLOCATOR.lock_irqsave();
+            if let Some(ref mut slab) = *guard {
                 return slab.allocate(layout);
-            };
+            }
             return core::ptr::null_mut();
         }
     }
@@ -87,9 +88,15 @@ impl LocalAlloc for KernelAllocator {
                 })
                 .unwrap_or_default();
         } else {
-            if let Some(ref mut slab) = SLABALLOCATOR {
-                return slab.allocate(layout);
-            };
+            let mut guard = SLABALLOCATOR.lock_irqsave();
+            if let Some(ref mut slab) = *guard {
+                let ptr = slab.allocate(layout);
+                drop(guard);
+                if !ptr.is_null() {
+                    core::ptr::write_bytes(ptr, 0, layout.size());
+                }
+                return ptr;
+            }
             return core::ptr::null_mut();
         }
     }
@@ -97,8 +104,11 @@ impl LocalAlloc for KernelAllocator {
     unsafe fn local_dealloc(&self, ptr: *mut u8, layout: Layout) {
         if allocator_select_condition(layout) {
             self.free_in_buddy(ptr, layout)
-        } else if let Some(ref mut slab) = SLABALLOCATOR {
-            slab.deallocate(ptr, layout).unwrap()
+        } else {
+            let mut guard = SLABALLOCATOR.lock_irqsave();
+            if let Some(ref mut slab) = *guard {
+                slab.deallocate(ptr, layout).unwrap()
+            }
         }
     }
 }

@@ -47,7 +47,8 @@ use crate::{
     filesystem::{kernfs::KernFSInode, sysfs::AttributeGroup},
     init::initcall::INITCALL_POSTCORE,
     libs::{
-        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+        rwlock::RwLock,
+        rwsem::{RwSemReadGuard, RwSemWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
     net::generate_iface_id,
@@ -73,9 +74,13 @@ pub struct VirtIONetDevice {
     dev_id: Arc<DeviceId>,
     inner: SpinLock<InnerVirtIONetDevice>,
     locked_kobj_state: LockedKObjectState,
+    device_inner: VirtIONicDeviceInner,
 
     // 指向对应的interface
     iface_ref: RwLock<Weak<VirtioInterface>>,
+
+    /// 是否使用MSIX中断
+    irq_is_msix: bool,
 }
 
 impl Debug for VirtIONetDevice {
@@ -90,7 +95,6 @@ unsafe impl Send for VirtIONetDevice {}
 unsafe impl Sync for VirtIONetDevice {}
 
 struct InnerVirtIONetDevice {
-    device_inner: VirtIONicDeviceInner,
     name: Option<String>,
     virtio_index: Option<VirtIODeviceIndex>,
     kobj_common: KObjectCommonData,
@@ -111,6 +115,7 @@ impl VirtIONetDevice {
             return None;
         }
 
+        let irq_is_msix = transport.irq_is_msix();
         let driver_net: VirtIONet<HalImpl, VirtIOTransport, 2> =
             match VirtIONet::<HalImpl, VirtIOTransport, 2>::new(transport, 4096) {
                 Ok(net) => net,
@@ -126,14 +131,15 @@ impl VirtIONetDevice {
         let dev = Arc::new(Self {
             dev_id,
             inner: SpinLock::new(InnerVirtIONetDevice {
-                device_inner,
                 name: None,
                 virtio_index: None,
                 kobj_common: KObjectCommonData::default(),
                 device_common: DeviceCommonData::default(),
             }),
             locked_kobj_state: LockedKObjectState::default(),
+            device_inner,
             iface_ref: RwLock::new(Weak::new()),
+            irq_is_msix,
         });
 
         // dev.set_driver(Some(Arc::downgrade(&virtio_net_driver()) as Weak<dyn Driver>));
@@ -199,11 +205,11 @@ impl KObject for VirtIONetDevice {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.locked_kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.locked_kobj_state.write()
     }
 
@@ -286,19 +292,27 @@ impl Device for VirtIONetDevice {
 
 impl VirtIODevice for VirtIONetDevice {
     fn handle_irq(&self, _irq: IrqNumber) -> Result<IrqReturn, SystemError> {
+        if !self.device_inner.ack_interrupt() && !self.irq_is_msix {
+            log::debug!(
+                "VirtIONetDevice '{:?}' ack_interrupt not set",
+                self.dev_id.id()
+            );
+        }
+
         let Some(iface) = self.iface() else {
             error!(
                 "VirtIONetDevice '{:?}' has no associated iface to handle irq",
                 self.dev_id.id()
             );
-            return Ok(IrqReturn::NotHandled);
+            return Ok(IrqReturn::Handled);
         };
 
         let Some(napi) = iface.napi_struct() else {
             log::error!("Virtio net device {} has no napi_struct", iface.name());
-            return Ok(IrqReturn::NotHandled);
+            return Ok(IrqReturn::Handled);
         };
 
+        // log::debug!("virtio net irq: schedule napi");
         napi_schedule(napi);
 
         // self.netns.wakeup_poll_thread();
@@ -394,12 +408,15 @@ impl VirtIONicDeviceInnerWrapper {
 /// Virtio网络设备驱动(加锁)
 pub struct VirtIONicDeviceInner {
     pub inner: Arc<SpinLock<VirtIoNetImpl>>,
+    /// 指向所属网络接口的弱引用，用于 packet socket 分发
+    iface: SpinLock<Weak<dyn super::Iface>>,
 }
 
 impl Clone for VirtIONicDeviceInner {
     fn clone(&self) -> Self {
         return VirtIONicDeviceInner {
             inner: self.inner.clone(),
+            iface: SpinLock::new(self.iface.lock().clone()),
         };
     }
 }
@@ -421,93 +438,6 @@ pub struct VirtioInterface {
     locked_kobj_state: LockedKObjectState,
 }
 
-// // 先手糊为virtio实现这些，后面系统要是有了其他类型网卡，这些实现就得实现成一个单独的trait
-// impl VirtioInterface {
-//     /// 消耗token然后主动发送一个 arp 数据包
-//     pub fn emit_arp(arp_repr: &ArpRepr, tx_token: VirtioNetToken) {
-//         let ether_repr = match arp_repr {
-//             ArpRepr::EthernetIpv4 {
-//                 source_hardware_addr,
-//                 target_hardware_addr,
-//                 ..
-//             } => EthernetRepr {
-//                 src_addr: *source_hardware_addr,
-//                 dst_addr: *target_hardware_addr,
-//                 ethertype: EthernetProtocol::Arp,
-//             },
-//             _ => return,
-//         };
-
-//         tx_token.consume(ether_repr.buffer_len() + arp_repr.buffer_len(), |buffer| {
-//             let mut frame = EthernetFrame::new_unchecked(buffer);
-//             ether_repr.emit(&mut frame);
-
-//             let mut pkt = ArpPacket::new_unchecked(frame.payload_mut());
-//             arp_repr.emit(&mut pkt);
-//         });
-//     }
-
-//     /// 解析 arp 包并处理
-//     pub fn process_arp(&self, arp_repr: &ArpRepr) -> Option<ArpRepr> {
-//         match arp_repr {
-//             ArpRepr::EthernetIpv4 {
-//                 operation: ArpOperation::Reply,
-//                 source_hardware_addr,
-//                 source_protocol_addr,
-//                 ..
-//             } => {
-//                 if !source_hardware_addr.is_unicast()
-//                     || !self
-//                         .common()
-//                         .smol_iface
-//                         .lock()
-//                         .context()
-//                         .in_same_network(&IpAddress::Ipv4(*source_protocol_addr))
-//                 {
-//                     return None;
-//                 }
-
-//                 self.common().router_common_data.arp_table.write().insert(
-//                     IpAddress::Ipv4(*source_protocol_addr),
-//                     *source_hardware_addr,
-//                 );
-
-//                 None
-//             }
-//             ArpRepr::EthernetIpv4 {
-//                 operation: ArpOperation::Request,
-//                 source_hardware_addr,
-//                 source_protocol_addr,
-//                 target_protocol_addr,
-//                 ..
-//             } => {
-//                 if !source_hardware_addr.is_unicast() || !source_protocol_addr.x_is_unicast() {
-//                     return None;
-//                 }
-
-//                 if self
-//                     .common()
-//                     .smol_iface
-//                     .lock()
-//                     .context()
-//                     .ipv4_addr()
-//                     .is_none_or(|addr| addr != *target_protocol_addr)
-//                 {
-//                     return None;
-//                 }
-//                 Some(ArpRepr::EthernetIpv4 {
-//                     operation: ArpOperation::Reply,
-//                     source_hardware_addr: self.mac(),
-//                     source_protocol_addr: *target_protocol_addr,
-//                     target_hardware_addr: *source_hardware_addr,
-//                     target_protocol_addr: *source_protocol_addr,
-//                 })
-//             }
-//             _ => None,
-//         }
-//     }
-// }
-
 #[derive(Debug)]
 struct InnerVirtIOInterface {
     kobj_common: KObjectCommonData,
@@ -519,7 +449,7 @@ impl VirtioInterface {
     pub fn new(mut device_inner: VirtIONicDeviceInner) -> Arc<Self> {
         let iface_id = generate_iface_id();
         let mut iface_config = iface::Config::new(wire::HardwareAddress::Ethernet(
-            wire::EthernetAddress(device_inner.inner.lock().mac_address()),
+            wire::EthernetAddress(device_inner.inner.lock_irqsave().mac_address()),
         ));
         iface_config.random_seed = rand() as u64;
 
@@ -548,8 +478,14 @@ impl VirtioInterface {
             }),
         });
 
+        // 设置 device_inner 对接口的弱引用，用于 packet socket 分发
+        iface
+            .device_inner
+            .force_get_mut()
+            .set_iface(Arc::downgrade(&iface) as Weak<dyn super::Iface>);
+
         // 设置napi struct
-        let napi_struct = NapiStruct::new(iface.clone(), 10);
+        let napi_struct = NapiStruct::new(iface.clone(), 64);
         *iface.common().napi_struct.write() = Some(napi_struct);
 
         iface
@@ -647,15 +583,26 @@ impl Device for VirtioInterface {
 
 impl VirtIONicDeviceInner {
     pub fn new(driver_net: VirtIONet<HalImpl, VirtIOTransport, 2>) -> Self {
-        let mut iface_config = iface::Config::new(wire::HardwareAddress::Ethernet(
-            wire::EthernetAddress(driver_net.mac_address()),
-        ));
-
-        iface_config.random_seed = rand() as u64;
-
         let inner = Arc::new(SpinLock::new(VirtIoNetImpl::new(driver_net)));
-        let result = VirtIONicDeviceInner { inner };
+        let result = VirtIONicDeviceInner {
+            inner,
+            iface: SpinLock::new(Weak::<VirtioInterface>::new()),
+        };
         return result;
+    }
+
+    pub fn ack_interrupt(&self) -> bool {
+        self.inner.lock_irqsave().ack_interrupt()
+    }
+
+    /// 设置所属网络接口的引用
+    pub fn set_iface(&self, iface: Weak<dyn super::Iface>) {
+        *self.iface.lock() = iface;
+    }
+
+    /// 获取所属网络接口
+    pub fn iface(&self) -> Option<Arc<dyn super::Iface>> {
+        self.iface.lock().upgrade()
     }
 }
 
@@ -687,7 +634,7 @@ impl phy::Device for VirtIONicDeviceInner {
         &mut self,
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        match self.inner.lock().receive() {
+        match self.inner.lock_irqsave().receive() {
             Ok(buf) => Some((
                 VirtioNetToken::new(self.clone(), Some(buf)),
                 VirtioNetToken::new(self.clone(), None),
@@ -717,7 +664,7 @@ impl phy::Device for VirtIONicDeviceInner {
            The network device is unable to send or receive bursts large than the value returned by this function.
            If None, there is no fixed limit on burst size, e.g. if network buffers are dynamically allocated.
         */
-        caps.max_burst_size = Some(1);
+        caps.max_burst_size = None;
         return caps;
     }
 }
@@ -728,7 +675,7 @@ impl phy::TxToken for VirtioNetToken {
         F: FnOnce(&mut [u8]) -> R,
     {
         // // 为了线程安全，这里需要对VirtioNet进行加【写锁】，以保证对设备的互斥访问。
-        let mut driver_net = self.driver.inner.lock();
+        let mut driver_net = self.driver.inner.lock_irqsave();
         let mut tx_buf = driver_net.new_tx_buffer(len);
         let result = f(tx_buf.packet_mut());
         driver_net.send(tx_buf).expect("virtio_net send failed");
@@ -743,14 +690,55 @@ impl phy::RxToken for VirtioNetToken {
     {
         // 为了线程安全，这里需要对VirtioNet进行加【写锁】，以保证对设备的互斥访问。
         let rx_buf = self.rx_buffer.unwrap();
-        let result = f(rx_buf.packet());
+        let packet = rx_buf.packet();
+
+        // 向注册的 packet socket 分发数据包
+        if let Some(iface) = self.driver.iface() {
+            let pkt_type = determine_packet_type(packet, &iface);
+            iface.common().deliver_to_packet_sockets(packet, pkt_type);
+        }
+
+        let result = f(packet);
         self.driver
             .inner
-            .lock()
+            .lock_irqsave()
             .recycle_rx_buffer(rx_buf)
             .expect("virtio_net recv failed");
         result
     }
+}
+
+/// 根据以太网帧的目的 MAC 地址确定数据包类型
+fn determine_packet_type(
+    frame: &[u8],
+    iface: &Arc<dyn super::Iface>,
+) -> crate::net::socket::packet::PacketType {
+    use crate::net::socket::packet::PacketType;
+
+    if frame.len() < 14 {
+        return PacketType::Host;
+    }
+
+    let dst_mac = &frame[0..6];
+
+    // 检查是否为广播地址 (FF:FF:FF:FF:FF:FF)
+    if dst_mac == [0xff, 0xff, 0xff, 0xff, 0xff, 0xff] {
+        return PacketType::Broadcast;
+    }
+
+    // 检查是否为多播地址 (第一个字节的最低位为1)
+    if dst_mac[0] & 0x01 != 0 {
+        return PacketType::Multicast;
+    }
+
+    // 检查是否为发往本机的包
+    let our_mac = iface.mac();
+    if dst_mac == our_mac.as_bytes() {
+        return PacketType::Host;
+    }
+
+    // 其他情况为发往其他主机的包（混杂模式下捕获）
+    PacketType::OtherHost
 }
 
 /// @brief virtio-net 驱动的初始化与测试
@@ -777,7 +765,7 @@ impl Iface for VirtioInterface {
     }
 
     fn mac(&self) -> wire::EthernetAddress {
-        let mac: [u8; 6] = self.device_inner.inner.lock().mac_address();
+        let mac: [u8; 6] = self.device_inner.inner.lock_irqsave().mac_address();
         return wire::EthernetAddress::from_bytes(&mac);
     }
 
@@ -789,6 +777,11 @@ impl Iface for VirtioInterface {
     fn poll(&self) -> bool {
         // log::debug!("VirtioInterface: poll");
         self.iface_common.poll(self.device_inner.force_get_mut())
+    }
+
+    fn poll_napi(&self, budget: usize) -> bool {
+        self.iface_common
+            .poll_napi(self.device_inner.force_get_mut(), budget)
     }
 
     // fn as_any_ref(&'static self) -> &'static dyn core::any::Any {
@@ -870,11 +863,11 @@ impl KObject for VirtioInterface {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.locked_kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.locked_kobj_state.write()
     }
 
@@ -955,7 +948,7 @@ impl VirtIODriver for VirtIONetDriver {
             })?;
 
         let iface: Arc<VirtioInterface> =
-            VirtioInterface::new(virtio_net_device.inner().device_inner.clone());
+            VirtioInterface::new(virtio_net_device.device_inner.clone());
         // 标识网络设备已经启动
         iface.set_net_state(NetDeivceState::__LINK_STATE_START);
         // 设置iface的父设备为virtio_net_device
@@ -1085,11 +1078,11 @@ impl KObject for VirtIONetDriver {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 

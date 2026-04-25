@@ -2,8 +2,7 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_CLOCK_GETTIME;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::UserBufferWriter;
-use crate::time::timekeeping::getnstimeofday;
-use crate::time::{syscall::PosixClockID, PosixTimeSpec};
+use crate::time::{syscall::posix_clock_now, syscall::PosixClockID, PosixTimeSpec};
 use alloc::vec::Vec;
 use system_error::SystemError;
 
@@ -26,9 +25,6 @@ impl Syscall for SysClockGettime {
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let clock_id = PosixClockID::try_from(Self::clock_id(args))?;
-        if clock_id != PosixClockID::Realtime {
-            // warn!("clock_gettime: currently only support Realtime clock, but got {:?}. Defaultly return realtime!!!\n", clock_id);
-        }
 
         let tp = Self::timespec_ptr(args);
         if tp.is_null() {
@@ -41,9 +37,9 @@ impl Syscall for SysClockGettime {
             true,
         )?;
 
-        let timespec = getnstimeofday();
+        let timespec = posix_clock_now(clock_id);
 
-        tp_buf.copy_one_to_user(&timespec, 0)?;
+        tp_buf.buffer_protected(0)?.write_one(0, &timespec)?;
 
         return Ok(0);
     }

@@ -1,4 +1,5 @@
 use core::{
+    convert::TryFrom,
     ops::{Deref, DerefMut},
     sync::atomic::{AtomicU32, Ordering},
 };
@@ -10,16 +11,15 @@ use alloc::{
 use hashbrown::HashMap;
 use system_error::SystemError;
 
+use super::block_device::{BlockDevice, BlockId, GeneralBlockRange, LBA_SIZE};
 use crate::{
-    driver::base::device::device_number::DeviceNumber,
+    driver::{base::device::device_number::DeviceNumber, block::loop_device::LoopDevice},
     filesystem::{
         devfs::{DevFS, DeviceINode, LockedDevFSInode},
         vfs::{utils::DName, IndexNode, InodeMode, Metadata},
     },
-    libs::{rwlock::RwLock, spinlock::SpinLockGuard},
+    libs::{mutex::MutexGuard, rwlock::RwLock},
 };
-
-use super::block_device::{BlockDevice, BlockId, GeneralBlockRange, LBA_SIZE};
 
 const MINORS_PER_DISK: u32 = 256;
 
@@ -221,22 +221,34 @@ impl IndexNode for GenDisk {
 
     fn read_at(
         &self,
-        _offset: usize,
-        _len: usize,
-        _buf: &mut [u8],
-        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        Err(SystemError::EPERM)
+        if len == 0 {
+            return Ok(0);
+        }
+        if len > buf.len() {
+            return Err(SystemError::ENOBUFS);
+        }
+        self.read_at_bytes(&mut buf[..len], offset)
     }
 
     fn write_at(
         &self,
-        _offset: usize,
-        _len: usize,
-        _buf: &[u8],
-        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        Err(SystemError::EPERM)
+        if len == 0 {
+            return Ok(0);
+        }
+        if len > buf.len() {
+            return Err(SystemError::E2BIG);
+        }
+        self.write_at_bytes(&buf[..len], offset)
     }
 
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
@@ -244,7 +256,16 @@ impl IndexNode for GenDisk {
     }
 
     fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
-        Ok(self.metadata.clone())
+        let mut meta = self.metadata.clone();
+        let bdev = self.block_device();
+        let range = bdev.disk_range();
+        let blocks = range.lba_end.saturating_sub(range.lba_start);
+        let size_in_bytes = blocks.saturating_mul(LBA_SIZE);
+
+        meta.size = i64::try_from(size_in_bytes).unwrap_or(i64::MAX);
+        meta.blocks = blocks;
+        meta.blk_size = LBA_SIZE;
+        Ok(meta)
     }
 
     fn dname(&self) -> Result<DName, SystemError> {
@@ -261,17 +282,31 @@ impl IndexNode for GenDisk {
 
     fn close(
         &self,
-        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<(), SystemError> {
         Ok(())
     }
 
     fn open(
         &self,
-        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
         _mode: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
+    }
+
+    fn ioctl(
+        &self,
+        cmd: u32,
+        data: usize,
+        private_data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        let bdev = self.block_device();
+        if let Some(loop_dev) = BlockDevice::as_any_ref(&*bdev).downcast_ref::<LoopDevice>() {
+            loop_dev.ioctl(cmd, data, private_data)
+        } else {
+            Err(SystemError::ENOSYS)
+        }
     }
 }
 

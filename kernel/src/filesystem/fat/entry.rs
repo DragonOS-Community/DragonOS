@@ -16,7 +16,7 @@ use log::{debug, warn};
 use system_error::SystemError;
 
 use super::{
-    fs::{Cluster, FATFileSystem, MAX_FILE_SIZE},
+    fs::{Cluster, FATFileSystem, MAX_FILE_SIZE, ZERO_BUF_SIZE},
     utils::decode_u8_ascii,
 };
 
@@ -197,10 +197,13 @@ impl FATFile {
 
             // 计算本次写入位置在分区上的偏移量
             let offset = fs.cluster_bytes_offset(current_cluster) + in_cluster_bytes_offset;
-            // 写入磁盘
+            // 写入磁盘（防御性检查：若设备返回0字节写入视为IO错误）
             let w = fs
                 .gendisk
                 .write_at_bytes(&buf[start..start + end_len], offset as usize)?;
+            if w == 0 {
+                return Err(SystemError::EIO);
+            }
 
             // 更新偏移量数据
             write_ok += w;
@@ -322,8 +325,22 @@ impl FATFile {
             return Ok(());
         }
 
-        let zeroes: Vec<u8> = vec![0u8; (range_end - range_start) as usize];
-        fs.gendisk.write_at_bytes(&zeroes, range_start as usize)?;
+        // 限制每次写入的缓冲区大小，避免大文件扩展时分配过大内存
+        let zeroes: Vec<u8> = vec![0u8; ZERO_BUF_SIZE];
+        let mut offset = range_start;
+        let mut remain = (range_end - range_start) as usize;
+
+        while remain > 0 {
+            let write_size = core::cmp::min(remain, ZERO_BUF_SIZE);
+            let w = fs
+                .gendisk
+                .write_at_bytes(&zeroes[..write_size], offset as usize)?;
+            if w == 0 {
+                return Err(SystemError::EIO);
+            }
+            offset += write_size as u64;
+            remain -= write_size;
+        }
 
         return Ok(());
     }
@@ -1144,6 +1161,11 @@ impl LongDirEntry {
         fs: Arc<FATFileSystem>,
         gendisk_bytes_offset: u64,
     ) -> Result<(), SystemError> {
+        // 目录项扇区 RMW 必须串行化，否则与并发的短/长目录项 flush 交错时，
+        // 后写入者会以自己先前读到的旧扇区覆盖对方的新目录项。详见
+        // `FATFileSystem::dirent_io_lock` 的注释。
+        let _dirent_guard = fs.lock_dirent_io();
+
         // 从磁盘读取数据
         let blk_offset = fs.get_in_block_offset(gendisk_bytes_offset);
         let lba = fs.gendisk_lba_from_offset(fs.bytes_to_sector(gendisk_bytes_offset));
@@ -1357,6 +1379,12 @@ impl ShortDirEntry {
         fs: &Arc<FATFileSystem>,
         gendisk_bytes_offset: u64,
     ) -> Result<(), SystemError> {
+        // 目录项扇区 RMW 必须串行化。典型 race：`FATFile::ensure_len` 触发的 pagecache
+        // 异步回写在扇区 S 上做 RMW；同时主线程在同扇区 S 里新建文件写入长/短目录项。
+        // 若不加锁，后写入者会用自己 read 阶段读到的旧扇区覆盖对方的新目录项，
+        // 导致新建的文件立刻“消失”，后续 `find` 返回 `ENOENT`。
+        let _dirent_guard = fs.lock_dirent_io();
+
         // 从磁盘读取数据
         let blk_offset = fs.get_in_block_offset(gendisk_bytes_offset);
         let lba = fs.gendisk_lba_from_offset(fs.bytes_to_sector(gendisk_bytes_offset));

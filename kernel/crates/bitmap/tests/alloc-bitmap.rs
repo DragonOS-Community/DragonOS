@@ -2,6 +2,22 @@
 
 use bitmap::{traits::BitMapOps, AllocBitmap};
 
+#[test]
+fn test_alloc_bitmap_as_bytes_matches_bitmap_payload() {
+    let mut bitmap = AllocBitmap::new(128);
+    bitmap.set(0, true);
+    bitmap.set(63, true);
+    bitmap.set(64, true);
+    bitmap.set(127, true);
+
+    let bytes = unsafe { bitmap.as_bytes() };
+    assert_eq!(bytes.len(), bitmap.size());
+    assert_eq!(bytes[0], 0x01);
+    assert_eq!(bytes[7], 0x80);
+    assert_eq!(bytes[8], 0x01);
+    assert_eq!(bytes[15], 0x80);
+}
+
 /// 测试空的位图
 ///
 /// 这是一个测试空的位图的例子

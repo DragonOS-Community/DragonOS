@@ -8,7 +8,8 @@ use crate::{
     libs::align::page_align_up,
     mm::{
         allocator::page_frame::{PageFrameCount, PhysPageFrame, VirtPageFrame},
-        page::{page_manager_lock_irqsave, EntryFlags, PageFlushAll},
+        mmu_gather::MmuGather,
+        page::{page_manager_lock, DeferredFlusher, EntryFlags},
         syscall::ProtFlags,
         ucontext::{AddressSpace, PhysmapParams, VMA},
         VirtAddr, VmFlags,
@@ -58,7 +59,9 @@ pub(super) fn do_kernel_shmat(
             let destination = VirtPageFrame::new(region.start());
             let page_flags: EntryFlags<MMArch> =
                 EntryFlags::from_prot_flags(ProtFlags::from(vm_flags), true);
-            let flusher: PageFlushAll<MMArch> = PageFlushAll::new();
+            // New region mapping: no prior PTE, no TLB shootdown needed;
+            // use DeferredFlusher to silently consume internal PageFlush tokens.
+            let flusher = DeferredFlusher::new();
 
             // 将共享内存映射到对应虚拟区域
             let params = PhysmapParams {
@@ -83,7 +86,7 @@ pub(super) fn do_kernel_shmat(
                 .mappings
                 .contains(vaddr)
                 .ok_or(SystemError::EINVAL)?;
-            if vma.lock_irqsave().region().start() != vaddr {
+            if vma.lock().region().start() != vaddr {
                 return Err(SystemError::EINVAL);
             }
 
@@ -98,12 +101,15 @@ pub(super) fn do_kernel_shmat(
                 .ok_or(SystemError::EINVAL)?
                 .1;
 
-            // 取消原映射
-            let flusher: PageFlushAll<MMArch> = PageFlushAll::new();
-            vma.unmap(&mut address_write_guard.user_mapper.utable, flusher);
+            // Unmap the old mapping via MmuGather: cross-core shootdown first, then free physical pages (INV-3).
+            {
+                let mut tlb = MmuGather::gather(&current_address_space);
+                vma.unmap(&mut address_write_guard.user_mapper.utable, &mut tlb);
+                tlb.finish();
+            }
 
             // 将该虚拟内存区域映射到共享内存区域
-            let mut page_manager_guard = page_manager_lock_irqsave();
+            let mut page_manager_guard = page_manager_lock();
             let mut virt = VirtPageFrame::new(vaddr);
             for _ in 0..count.data() {
                 let r = unsafe {
@@ -119,7 +125,7 @@ pub(super) fn do_kernel_shmat(
                 // 将vma加入到对应Page的anon_vma
                 page_manager_guard
                     .get_unwrap(&phys.phys_address())
-                    .write_irqsave()
+                    .write()
                     .insert_vma(vma.clone());
 
                 phys = phys.next();
@@ -127,7 +133,7 @@ pub(super) fn do_kernel_shmat(
             }
 
             // 更新vma的映射状态
-            let mut vma_guard = vma.lock_irqsave();
+            let mut vma_guard = vma.lock();
             vma_guard.set_mapped(true);
             vma_guard.set_shm_id(Some(id));
             drop(vma_guard);

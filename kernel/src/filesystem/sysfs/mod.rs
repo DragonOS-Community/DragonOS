@@ -1,16 +1,16 @@
 use core::fmt::Debug;
 
 use self::{dir::SysKernDirPriv, file::SysKernFilePriv};
-
 use super::{
     kernfs::{KernFS, KernFSInode},
-    vfs::{FileSystem, InodeMode},
+    vfs::{FileSystem, FileSystemMakerData, InodeMode, MountableFileSystem, SuperBlock},
 };
 use crate::{
     driver::base::kobject::KObject,
-    filesystem::vfs::mount::MountFlags,
+    filesystem::vfs::{mount::MountFlags, FSMAKER},
     libs::{casting::DowncastArc, once::Once},
     process::ProcessManager,
+    register_mountable_fs,
 };
 use alloc::sync::Arc;
 use log::{info, warn};
@@ -231,3 +231,50 @@ impl SysFS {
         warn!("duplicate sysfs entry: {path}/{name}");
     }
 }
+
+use linkme::distributed_slice;
+
+impl FileSystem for SysFS {
+    fn root_inode(&self) -> Arc<dyn super::vfs::IndexNode> {
+        return self.root_inode.clone();
+    }
+
+    fn info(&self) -> super::vfs::FsInfo {
+        return self.kernfs.info();
+    }
+
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "sysfs"
+    }
+
+    fn super_block(&self) -> SuperBlock {
+        self.kernfs.super_block()
+    }
+}
+
+impl MountableFileSystem for SysFS {
+    /// 创建 sysfs 挂载数据
+    ///
+    /// sysfs 是一个虚拟文件系统，不需要任何挂载数据。
+    fn make_mount_data(
+        _raw_data: Option<&str>,
+        _source: &str,
+    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+        // sysfs 不需要任何额外的挂载数据
+        Ok(None)
+    }
+
+    fn make_fs(
+        _data: Option<&dyn FileSystemMakerData>,
+    ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
+        let fs = SysFS::new();
+        Ok(Arc::new(fs))
+    }
+}
+
+// 注册 sysfs 为可挂载文件系统
+register_mountable_fs!(SysFS, SYSFSMAKER, "sysfs");

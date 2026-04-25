@@ -4,7 +4,7 @@
 
    - Source document: kernel/net/index.rst
 
-   - Translation time: 2025-11-22 06:49:51
+   - Translation time: 2026-01-07 14:51:45
 
    - Translation model: `hunyuan-turbos-latest`
 
@@ -21,3 +21,4 @@ DragonOS Network Subsystem
    inet
    unix
    ssh
+   napi_and_netns_poll

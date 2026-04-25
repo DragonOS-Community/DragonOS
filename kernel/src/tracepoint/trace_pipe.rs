@@ -1,4 +1,7 @@
-use crate::tracepoint::{TraceEntry, TracePointMap};
+use crate::{
+    smp::core::smp_get_processor_id,
+    tracepoint::{TraceEntry, TracePointMap},
+};
 use alloc::{format, string::String, vec::Vec};
 
 pub trait TracePipeOps {
@@ -227,7 +230,7 @@ impl TraceEntryParser {
         let str = fmt_func(&entry[offset..]);
 
         let time = crate::time::Instant::now().total_micros() * 1000; // Convert to nanoseconds
-        let cpu_id = crate::arch::cpu::current_cpu_id().data();
+        let cpu_id = smp_get_processor_id().data();
 
         // Copy the packed field to a local variable to avoid unaligned reference
         let pid = trace_entry.pid;

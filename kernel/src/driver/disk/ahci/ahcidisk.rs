@@ -21,9 +21,9 @@ use crate::driver::disk::ahci::hba::{
     FisRegH2D, FisType, HbaCmdHeader, ATA_CMD_READ_DMA_EXT, ATA_CMD_WRITE_DMA_EXT, ATA_DEV_BUSY,
     ATA_DEV_DRQ,
 };
-use crate::libs::rwlock::{RwLockReadGuard, RwLockWriteGuard};
+use crate::libs::rwsem::{RwSemReadGuard, RwSemWriteGuard};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
-use crate::mm::{verify_area, MemoryManagementArch, PhysAddr, VirtAddr};
+use crate::mm::{access_ok, MemoryManagementArch, PhysAddr, VirtAddr};
 use log::error;
 use system_error::SystemError;
 
@@ -114,7 +114,7 @@ impl AhciDisk {
         // 由于目前的内存管理机制无法把用户空间的内存地址转换为物理地址，所以只能先把数据拷贝到内核空间
         // TODO：在内存管理重构后，可以直接使用用户空间的内存地址
 
-        let user_buf = verify_area(VirtAddr::new(buf_ptr), buf.len()).is_ok();
+        let user_buf = access_ok(VirtAddr::new(buf_ptr), buf.len()).is_ok();
         let mut kbuf = if user_buf {
             let x: Vec<u8> = vec![0; buf.len()];
             Some(x)
@@ -276,7 +276,7 @@ impl AhciDisk {
 
         // 由于目前的内存管理机制无法把用户空间的内存地址转换为物理地址，所以只能先把数据拷贝到内核空间
         // TODO：在内存管理重构后，可以直接使用用户空间的内存地址
-        let user_buf = verify_area(VirtAddr::new(buf_ptr), buf.len()).is_ok();
+        let user_buf = access_ok(VirtAddr::new(buf_ptr), buf.len()).is_ok();
         let mut kbuf = if user_buf {
             let mut x: Vec<u8> = vec![0; buf.len()];
             x.resize(buf.len(), 0);
@@ -431,11 +431,11 @@ impl KObject for LockedAhciDisk {
         todo!()
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         todo!()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         todo!()
     }
 

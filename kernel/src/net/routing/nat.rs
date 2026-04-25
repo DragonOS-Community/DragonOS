@@ -1,6 +1,6 @@
 use core::marker::PhantomData;
 
-use crate::libs::spinlock::SpinLock;
+use crate::libs::mutex::Mutex;
 use crate::time::Duration;
 use crate::time::Instant;
 use alloc::fmt::Debug;
@@ -277,8 +277,8 @@ impl NatPolicy for DnatPolicy {
 
 #[derive(Debug)]
 pub struct ConnTracker {
-    pub(super) snat: SpinLock<NatTracker<SnatPolicy>>,
-    pub(super) dnat: SpinLock<NatTracker<DnatPolicy>>,
+    pub(super) snat: Mutex<NatTracker<SnatPolicy>>,
+    pub(super) dnat: Mutex<NatTracker<DnatPolicy>>,
 }
 
 impl ConnTracker {
@@ -299,8 +299,8 @@ impl ConnTracker {
 impl Default for ConnTracker {
     fn default() -> Self {
         Self {
-            snat: SpinLock::new(NatTracker::<SnatPolicy>::default()),
-            dnat: SpinLock::new(NatTracker::<DnatPolicy>::default()),
+            snat: Mutex::new(NatTracker::<SnatPolicy>::default()),
+            dnat: Mutex::new(NatTracker::<DnatPolicy>::default()),
         }
     }
 }

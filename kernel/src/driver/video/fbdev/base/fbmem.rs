@@ -10,6 +10,7 @@ use log::error;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
+use crate::libs::mutex::MutexGuard;
 use crate::{
     driver::base::{
         class::{class_manager, Class},
@@ -34,7 +35,8 @@ use crate::{
     },
     init::initcall::INITCALL_SUBSYS,
     libs::{
-        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+        rwlock::RwLock,
+        rwsem::{RwSemReadGuard, RwSemWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
 };
@@ -321,11 +323,11 @@ impl KObject for FbDevice {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 
@@ -404,13 +406,13 @@ impl DeviceINode for FbDevice {
 impl IndexNode for FbDevice {
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         Ok(())
     }
     fn read_at(
@@ -418,7 +420,7 @@ impl IndexNode for FbDevice {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let fb = self.inner.lock().fb.upgrade().unwrap();
         return fb.fb_read(&mut buf[0..len], offset);
@@ -429,7 +431,7 @@ impl IndexNode for FbDevice {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let fb = self.inner.lock().fb.upgrade().unwrap();
         return fb.fb_write(&buf[0..len], offset);

@@ -4,6 +4,7 @@ use std::{
     collections::HashSet,
     fs::{self, File},
     io::{BufRead, BufReader, Write},
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -65,7 +66,7 @@ pub struct Config {
     pub temp_dir: PathBuf,
     pub extra_blocklist_dirs: Vec<PathBuf>,
     pub test_patterns: Vec<String>,
-    pub output_to_stdout: bool,  // 是否输出到控制台而不是文件
+    pub output_to_stdout: bool, // 是否输出到控制台而不是文件
 }
 
 impl Default for Config {
@@ -87,7 +88,7 @@ impl Default for Config {
             ),
             extra_blocklist_dirs: Vec::new(),
             test_patterns: Vec::new(),
-            output_to_stdout: false,
+            output_to_stdout: true,
         }
     }
 }
@@ -333,7 +334,10 @@ impl TestRunner {
         // 根据配置决定输出方式
         let (stdout, stderr) = if self.config.output_to_stdout {
             // 单个测例：直接输出到控制台
-            (std::process::Stdio::inherit(), std::process::Stdio::inherit())
+            (
+                std::process::Stdio::inherit(),
+                std::process::Stdio::inherit(),
+            )
         } else {
             // 批量测试：输出到文件
             // 确保结果目录存在
@@ -354,7 +358,10 @@ impl TestRunner {
             }
             let out = out?;
             let err = out.try_clone()?;
-            (std::process::Stdio::from(out), std::process::Stdio::from(err))
+            (
+                std::process::Stdio::from(out),
+                std::process::Stdio::from(err),
+            )
         };
 
         // 构造并执行命令（不使用 shell，不捕获输出，不创建管道）
@@ -362,6 +369,19 @@ impl TestRunner {
         let mut cmd = Command::new(&test_path);
         if !blocked_subtests.is_empty() {
             cmd.arg(format!("--gtest_filter=-{}", blocked_subtests.join(":")));
+        }
+        // Run each test binary in a fresh network namespace to avoid sysctl leakage.
+        let name_lc = test_name.to_ascii_lowercase();
+        if name_lc.contains("socket") || name_lc.contains("net") {
+            unsafe {
+                cmd.pre_exec(|| {
+                    let ret = libc::unshare(libc::CLONE_NEWNET);
+                    if ret != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
         }
 
         let status = cmd

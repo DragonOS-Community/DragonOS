@@ -1,3 +1,5 @@
+#![allow(function_casts_as_integer)]
+
 use core::{
     arch::asm,
     intrinsics::unlikely,
@@ -156,11 +158,13 @@ impl ArchPCBInfo {
     }
 
     pub fn restore_fp_state(&mut self) {
-        if unlikely(self.fp_state.is_none()) {
-            return;
+        // Linux 语义：新建线程/进程在首次运行用户态前必须拥有确定的初始 FPU 状态
+        // （x87 控制字 / MXCSR 等），不能继承上一个任务的寄存器状态。
+        if self.fp_state.is_none() {
+            self.fp_state = Some(FpState::new());
         }
 
-        self.fp_state.as_mut().unwrap().restore();
+        self.fp_state.as_ref().unwrap().restore();
     }
 
     /// 返回浮点寄存器结构体的副本
@@ -393,12 +397,36 @@ impl ProcessManager {
         // 切换gsbase
         Self::switch_gsbase(&prev, &next);
 
-        // 切换地址空间
-        let next_addr_space = next.basic().user_vm().as_ref().unwrap().clone();
+        // 切换地址空间（无锁快速路径）
+        let next_addr_space = next.basic().user_vm().unwrap();
+        let prev_addr_space = prev.basic().user_vm();
+        let cpu = crate::smp::core::smp_get_processor_id();
         compiler_fence(Ordering::SeqCst);
 
-        next_addr_space.read().user_mapper.utable.make_current();
-        drop(next_addr_space);
+        // INV-1: clear prev mm's bit before switching hardware page table (if prev/next differ),
+        // set next mm's bit after switching.
+        // Order: clear(prev) → set CR3 → set(next) → update per-CPU TlbState.
+        //
+        // Note: if prev and next point to the same mm (same-address-space thread switch), keep the bit unchanged.
+        let same_mm = match prev_addr_space.as_ref() {
+            Some(p) => Arc::ptr_eq(p, &next_addr_space),
+            None => false,
+        };
+
+        if !same_mm {
+            if let Some(prev_mm) = prev_addr_space.as_ref() {
+                prev_mm.active_cpus_clear(cpu);
+            }
+        }
+
+        next_addr_space.make_current();
+        compiler_fence(Ordering::SeqCst);
+
+        if !same_mm {
+            next_addr_space.active_cpus_set(cpu);
+        }
+        // Update per-CPU TlbState: hardware-loaded mm and generation
+        crate::mm::tlb::tlb_state_set_loaded_mm(next_addr_space.clone());
         compiler_fence(Ordering::SeqCst);
         // 切换内核栈
 
@@ -522,6 +550,12 @@ unsafe extern "sysv64" fn switch_back() -> ! {
 pub unsafe fn arch_switch_to_user(trap_frame: TrapFrame) -> ! {
     // 以下代码不能发生中断
     CurrentIrqArch::interrupt_disable();
+
+    // 确保在返回用户态之前，当前任务的 FPU/SSE 状态已被恢复。
+    // 这对于“第一次进入用户态但还没发生过一次调度切换”的任务尤为关键。
+    ProcessManager::current_pcb()
+        .arch_info_irqsave()
+        .restore_fp_state();
 
     let current_pcb = ProcessManager::current_pcb();
     let trap_frame_vaddr = VirtAddr::new(

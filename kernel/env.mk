@@ -1,7 +1,9 @@
 include ../env.mk
 
 # 设置编译器
-ifeq ($(ARCH), x86_64)
+ifeq ($(USING_DRAGONOS_NIX_ENV),1) # Nix toolchain doesn't need to specify the prefix
+CCPREFIX=
+else ifeq ($(ARCH), x86_64)
 CCPREFIX=x86_64-linux-gnu-
 else ifeq ($(ARCH), riscv64)
 CCPREFIX=riscv64-linux-gnu-
@@ -33,7 +35,7 @@ GLOBAL_CFLAGS += -mcmodel=large -march=loongarch64
 endif
 
 ifeq ($(DEBUG), DEBUG)
-GLOBAL_CFLAGS += -g 
+GLOBAL_CFLAGS += -g
 endif
 
 export RUSTFLAGS := -C link-args=-znostart-stop-gc

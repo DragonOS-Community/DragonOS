@@ -1,9 +1,11 @@
+use crate::libs::mutex::MutexGuard;
 use crate::driver::base::device::device_number::DeviceNumber;
+use crate::libs::mutex::MutexGuard;
 use crate::filesystem;
 use crate::filesystem::devfs::{DevFS, DeviceINode};
 use crate::filesystem::vfs::{
     core::generate_inode_id,
-    file::{File, FileMode},
+    file::{File, FileFlags, FileMode},
     FilePrivateData, FileSystem, FileType, IndexNode, InodeFlags, Metadata,
 };
 use crate::libs::spinlock::SpinLockGuard;
@@ -93,14 +95,14 @@ impl IndexNode for LockedKvmInode {
 
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _mode: &FileMode,
     ) -> Result<(), SystemError> {
         debug!("file private data:{:?}", _data);
         return Ok(());
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 
@@ -139,7 +141,7 @@ impl IndexNode for LockedKvmInode {
         &self,
         cmd: u32,
         data: usize,
-        _private_data: &FilePrivateData,
+        _private_data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         match cmd {
             0xdeadbeef => {
@@ -165,7 +167,7 @@ impl IndexNode for LockedKvmInode {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
@@ -176,7 +178,7 @@ impl IndexNode for LockedKvmInode {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
@@ -188,11 +190,11 @@ pub fn kvm_dev_ioctl_create_vm(_vmtype: usize) -> Result<usize, SystemError> {
 
     // 创建vm文件，返回文件描述符
     let vm_inode = LockedVmInode::new();
-    let file: File = File::new(vm_inode, FileMode::O_RDWR)?;
+    let file: File = File::new(vm_inode, FileFlags::O_RDWR)?;
     let r = ProcessManager::current_pcb()
         .fd_table()
         .write()
-        .alloc_fd(file, None)
+        .alloc_fd(file, None, false)
         .map(|fd| fd as usize);
     return r;
 }

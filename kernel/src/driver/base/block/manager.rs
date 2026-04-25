@@ -1,6 +1,6 @@
 use core::{fmt::Formatter, sync::atomic::AtomicU32};
 
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 use hashbrown::HashMap;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
@@ -11,12 +11,12 @@ use crate::{
         device::{device_number::Major, DevName},
     },
     filesystem::{
-        devfs::devfs_register,
+        devfs::{devfs_register, devfs_unregister},
         mbr::MbrDiskPartionTable,
         vfs::{utils::DName, IndexNode},
     },
     init::initcall::INITCALL_POSTCORE,
-    libs::spinlock::{SpinLock, SpinLockGuard},
+    libs::mutex::{Mutex, MutexGuard},
 };
 
 use super::{
@@ -41,7 +41,7 @@ pub fn block_dev_manager_init() -> Result<(), SystemError> {
 
 /// 磁盘设备管理器
 pub struct BlockDevManager {
-    inner: SpinLock<InnerBlockDevManager>,
+    inner: Mutex<InnerBlockDevManager>,
 }
 
 struct InnerBlockDevManager {
@@ -52,14 +52,14 @@ struct InnerBlockDevManager {
 impl BlockDevManager {
     pub fn new() -> Self {
         BlockDevManager {
-            inner: SpinLock::new(InnerBlockDevManager {
+            inner: Mutex::new(InnerBlockDevManager {
                 disks: HashMap::new(),
                 minors: HashMap::new(),
             }),
         }
     }
 
-    fn inner(&self) -> SpinLockGuard<'_, InnerBlockDevManager> {
+    fn inner(&self) -> MutexGuard<'_, InnerBlockDevManager> {
         self.inner.lock()
     }
 
@@ -166,22 +166,89 @@ impl BlockDevManager {
     }
 
     /// 卸载磁盘设备
-    #[allow(dead_code)]
-    pub fn unregister(&self, dev: &Arc<dyn BlockDevice>) {
-        let mut inner = self.inner();
-        inner.disks.remove(dev.dev_name());
-        // todo: 这里应该callback一下磁盘设备，但是现在还没实现热插拔，所以暂时没做这里
-        todo!("BlockDevManager: unregister disk")
-    }
+    pub fn unregister(&self, dev: &Arc<dyn BlockDevice>) -> Result<(), SystemError> {
+        // 回归注释（保持原子性/可恢复性）：
+        // 这里不能在 devfs_unregister 之前就把设备从 manager 移除、或清空 blk_meta.gendisks。
+        // 否则一旦 devfs_unregister 中途失败，会留下不可恢复的不一致状态：
+        // - manager 中设备已消失（重试会 ENOENT）
+        // - 元数据 gendisks 已清空（无法再找到需要卸载的节点）
+        // - devfs 里可能还有残留节点
+        //
+        // 正确做法是“两阶段”：
+        // 1) 锁外尝试卸载所有 devfs 节点（中途失败则回滚已卸载部分，确保可重试）
+        // 2) 全部卸载成功后，才清理 manager/元数据
 
+        // 先检查设备是否存在，但不要移除（避免失败后不可重试）
+        {
+            let inner = self.inner();
+            if !inner.disks.contains_key(dev.dev_name()) {
+                return Err(SystemError::ENOENT);
+            }
+        }
+
+        let blk_meta = dev.blkdev_meta();
+        let gendisks: Vec<Arc<GenDisk>> = {
+            let meta_inner = blk_meta.inner();
+            meta_inner.gendisks.values().cloned().collect()
+        };
+
+        let mut unregistered: Vec<Arc<GenDisk>> = Vec::new();
+        for gendisk in &gendisks {
+            let dname = gendisk.dname()?;
+            if let Err(e) = devfs_unregister(dname.as_ref(), gendisk.clone()) {
+                // 回滚：尽量把已卸载的重新注册回 devfs，保持系统可用/一致。
+                for rg in unregistered.into_iter() {
+                    if let Ok(rname) = rg.dname() {
+                        let _ = devfs_register(rname.as_ref(), rg.clone());
+                    }
+                }
+                return Err(e);
+            }
+            unregistered.push(gendisk.clone());
+        }
+
+        // 全部 devfs 卸载成功：再移除 manager 记录并清空 gendisks 元数据
+        let mut inner = self.inner();
+        if inner.disks.remove(dev.dev_name()).is_none() {
+            // 理论上不应发生：在 devfs 卸载过程中该设备被并发移除
+            // 尽力回滚 devfs，以免留下“manager 不存在但 devfs 存在/不存在”的混乱状态
+            drop(inner);
+            for rg in unregistered.into_iter() {
+                if let Ok(rname) = rg.dname() {
+                    let _ = devfs_register(rname.as_ref(), rg.clone());
+                }
+            }
+            return Err(SystemError::ENOENT);
+        }
+        drop(inner);
+
+        let mut meta_inner = blk_meta.inner();
+        meta_inner.gendisks.clear();
+        Ok(())
+    }
     /// 通过路径查找gendisk
     ///
     /// # 参数
     ///
     /// - `path`: 分区路径 `/dev/sda1` 或者 `sda1`，或者是`/dev/sda`
     pub fn lookup_gendisk_by_path(&self, path: &str) -> Option<Arc<GenDisk>> {
+        let raw = path.strip_prefix("/dev/").unwrap_or(path);
         let (devname, partno) = self.path2devname(path)?;
         let inner = self.inner();
+
+        // 优先精确匹配整盘设备名，避免把数字结尾设备名（如 pmem0/loop0）误解析为分区号。
+        for dev in inner.disks.values() {
+            if dev.dev_name().as_str() == raw {
+                return dev
+                    .blkdev_meta()
+                    .inner()
+                    .gendisks
+                    .get(&GenDisk::ENTIRE_DISK_IDX)
+                    .cloned();
+            }
+        }
+
+        // 精确匹配失败后再回退到传统“尾部数字=分区号”解析。
         for dev in inner.disks.values() {
             if dev.dev_name().as_str() == devname {
                 return dev.blkdev_meta().inner().gendisks.get(&partno).cloned();
@@ -254,7 +321,7 @@ pub struct BlockDevMeta {
     pub devname: DevName,
     pub major: Major,
     pub base_minor: u32,
-    inner: SpinLock<InnerBlockDevMeta>,
+    inner: Mutex<InnerBlockDevMeta>,
 }
 
 pub struct InnerBlockDevMeta {
@@ -268,14 +335,14 @@ impl BlockDevMeta {
             devname,
             major,
             base_minor: block_dev_manager().next_minor(major),
-            inner: SpinLock::new(InnerBlockDevMeta {
+            inner: Mutex::new(InnerBlockDevMeta {
                 gendisks: GenDiskMap::new(),
                 dev_idx: 0, // 默认索引为0
             }),
         }
     }
 
-    pub(crate) fn inner(&self) -> SpinLockGuard<'_, InnerBlockDevMeta> {
+    pub(crate) fn inner(&self) -> MutexGuard<'_, InnerBlockDevMeta> {
         self.inner.lock()
     }
 }

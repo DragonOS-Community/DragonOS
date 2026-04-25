@@ -1,36 +1,36 @@
 :::{note}
 **AI Translation Notice**
 
-This document was automatically translated by `Qwen/Qwen3-8B` model, for reference only.
+This document was automatically translated by `hunyuan-turbos-latest` model, for reference only.
 
 - Source document: kernel/filesystem/overview.md
 
-- Translation time: 2025-05-19 01:41:36
+- Translation time: 2026-01-15 12:54:32
 
-- Translation model: `Qwen/Qwen3-8B`
+- Translation model: `hunyuan-turbos-latest`
 
 Please report issues via [Community Channel](https://github.com/DragonOS-Community/DragonOS/issues)
 
 :::
 
 :::{note}
-Author of this article: Long Jin
+Author: Long Jin
 
 Email: <longjin@DragonOS.org>
 :::
 
 # Overview
 
-&emsp;&emsp;In this article, we will introduce the architecture design of the DragonOS file system.
+&emsp;&emsp;In this document, we will introduce the architectural design of the DragonOS file system.
 
-## Overview
+## Summary
 
-&emsp;&emsp;As shown in the following diagram, the file system-related mechanisms of DragonOS mainly include the following parts:
+&emsp;&emsp;As shown in the following diagram, the file system-related mechanisms in DragonOS mainly consist of the following components:
 
 - System call interface
-- Virtual File System (VFS)
+- Virtual file system
     - File abstraction (File)
-    - Mount file system (MountFS)
+    - Mounted file system (MountFS)
 - Specific file systems
 
 ```text
@@ -66,42 +66,29 @@ Syscall:    │   sys_open, sys_read, sys_write, sys_close,     │
 
 ## System Call Interface
 
-&emsp;&emsp;The file system-related system call interfaces of DragonOS mainly include the following:
-
-- `sys_open`: Open file
-- `sys_read`: Read file
-- `sys_write`: Write file
-- `sys_close`: Close file
-- `sys_lseek`: Set file pointer position
-- `sys_mkdir`: Create directory
-- `sys_unlink_at`: Delete file or directory (distinguish between file and directory by parameter `flag`)
-- `sys_ioctl`: Control device (not implemented)
-- `sys_fstat`: Get file status (not implemented)
-- `sys_fsync`: Synchronize file (not implemented)
-- `sys_ftruncate`: Truncate file (not implemented)
-- `sys_fchmod`: Modify file permissions (not implemented)
-- Other system call interfaces (not implemented)
-
-&emsp;&emsp;For the specific meaning of the interfaces, you can refer to the relevant documentation of Linux.
+&emsp;&emsp;For the specific meanings of the interfaces, please refer to the relevant Linux documentation.
 
 ## Virtual File System (VFS)
 
-&emsp;&emsp;VFS is the core of the DragonOS file system, providing a unified set of file system interfaces, allowing DragonOS to support various different file systems. The main functions of VFS include:
+&emsp;&emsp;VFS is the core of the DragonOS file system. It provides a unified file system interface, enabling DragonOS to support multiple different file systems. The main functions of VFS include:
 
-- Provide a unified file system interface
-- Provide file system mounting and unmounting mechanism (MountFS)
-- Provide file abstraction (File)
-- Provide file system abstraction (FileSystem)
-- Provide IndexNode abstraction
-- Provide file system caching and synchronization mechanism (not implemented yet)
+- Providing a unified file system interface
+- Providing file system mounting and unmounting mechanisms (MountFS)
+- Providing file abstraction (File)
+- Providing file system abstraction (FileSystem)
+- Providing IndexNode abstraction
+- Providing file system caching and synchronization mechanisms
 
-&emsp;&emsp;For detailed introduction of VFS, please see [DragonOS Virtual File System](vfs/index.rst).
+&emsp;&emsp;For a detailed introduction to VFS, please see [DragonOS Virtual File System](vfs/index.rst).
 
 ## Specific File Systems
 
 &emsp;&emsp;The file systems currently supported by DragonOS include:
 
-- FAT file system (FAT12, FAT16, FAT32)
+- FAT file systems (FAT12, FAT16, FAT32)
+- ext4
 - DevFS
 - ProcFS
 - RamFS
+- sysfs
+- tmpfs

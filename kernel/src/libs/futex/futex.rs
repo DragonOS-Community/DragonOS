@@ -1,4 +1,5 @@
 use alloc::{
+    boxed::Box,
     collections::LinkedList,
     sync::{Arc, Weak},
 };
@@ -17,13 +18,15 @@ use system_error::SystemError;
 use crate::{
     arch::{CurrentIrqArch, MMArch},
     exception::InterruptArch,
-    libs::spinlock::{SpinLock, SpinLockGuard},
+    libs::{
+        mutex::{Mutex, MutexGuard},
+        wait_queue::{Waiter, Waker},
+    },
     mm::{ucontext::AddressSpace, MemoryManagementArch, VirtAddr},
     process::{ProcessControlBlock, ProcessManager, RawPid},
-    sched::{schedule, SchedMode},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
     time::{
-        timer::{next_n_us_timer_jiffies, Timer, WakeUpHelper},
+        timer::{next_n_us_timer_jiffies, Timer, TimerFunction},
         PosixTimeSpec,
     },
 };
@@ -33,11 +36,11 @@ use super::constant::*;
 static mut FUTEX_DATA: Option<FutexData> = None;
 
 pub struct FutexData {
-    data: SpinLock<HashMap<FutexKey, FutexHashBucket>>,
+    data: Mutex<HashMap<FutexKey, FutexHashBucket>>,
 }
 
 impl FutexData {
-    pub fn futex_map() -> SpinLockGuard<'static, HashMap<FutexKey, FutexHashBucket>> {
+    pub fn futex_map() -> MutexGuard<'static, HashMap<FutexKey, FutexHashBucket>> {
         unsafe { FUTEX_DATA.as_ref().unwrap().data.lock() }
     }
 
@@ -45,7 +48,7 @@ impl FutexData {
         unsafe {
             let mut guard = FUTEX_DATA.as_ref().unwrap().data.lock();
             if let Some(futex) = guard.get(key) {
-                if futex.chain.is_empty() {
+                if futex.chain.is_empty() && futex.pi_waiters.is_empty() && futex.pi_owner == 0 {
                     return guard.remove(key);
                 }
             }
@@ -60,29 +63,33 @@ pub struct Futex;
 pub struct FutexHashBucket {
     // 该futex维护的等待队列
     pub(super) chain: LinkedList<Arc<FutexObj>>,
+    // PI futex state
+    pub(super) pi_owner: u32,
+    pub(super) pi_waiters: LinkedList<Arc<FutexObj>>,
 }
 
 impl FutexHashBucket {
+    pub fn new() -> Self {
+        Self {
+            chain: LinkedList::new(),
+            pi_owner: 0,
+            pi_waiters: LinkedList::new(),
+        }
+    }
+
     /// ## 判断是否在bucket里
+    #[allow(dead_code)]
     pub fn contains(&self, futex_q: &FutexObj) -> bool {
         self.chain
             .iter()
-            .filter(|x| futex_q.pcb.ptr_eq(&x.pcb) && x.key == futex_q.key)
+            .filter(|x| Arc::ptr_eq(&x.waker, &futex_q.waker) && x.key == futex_q.key)
             .count()
             != 0
     }
 
-    /// 让futex_q在该bucket上挂起
-    ///
-    /// 进入该函数前，需要关中断
     #[inline(always)]
-    pub fn sleep_no_sched(&mut self, futex_q: Arc<FutexObj>) -> Result<(), SystemError> {
-        assert!(!CurrentIrqArch::is_irq_enabled());
+    pub fn enqueue(&mut self, futex_q: Arc<FutexObj>) {
         self.chain.push_back(futex_q);
-
-        ProcessManager::mark_sleep(true)?;
-
-        Ok(())
     }
 
     /// ## 唤醒队列中的最多nr_wake个进程
@@ -121,9 +128,7 @@ impl FutexHashBucket {
 
                 // key和bitset都匹配，尝试唤醒
                 // 注意：pop_front已经将futex_q从队列中移除，无需再次调用remove
-                if let Some(pcb) = futex_q.pcb.upgrade() {
-                    // TODO: 考虑优先级继承的机制
-                    ProcessManager::wakeup(&pcb)?;
+                if futex_q.waker.wake() {
                     count += 1;
                 }
                 // 如果pcb已经被释放，也算处理了一个，继续下一个
@@ -138,19 +143,34 @@ impl FutexHashBucket {
     }
 
     /// 将FutexObj从bucket中删除
-    pub fn remove(&mut self, futex: Arc<FutexObj>) {
+    pub fn remove_by_waker(&mut self, waker: &Arc<Waker>) -> bool {
+        let before = self.chain.len();
         self.chain
-            .extract_if(|x| Arc::ptr_eq(x, &futex))
+            .extract_if(|x| Arc::ptr_eq(&x.waker, waker))
             .for_each(drop);
+        before != self.chain.len()
     }
 }
 
 #[derive(Debug)]
 pub struct FutexObj {
-    pub(super) pcb: Weak<ProcessControlBlock>,
+    pub(super) waker: Arc<Waker>,
     pub(super) key: FutexKey,
     pub(super) bitset: u32,
+    pub(super) tid: u32,
     // TODO: 优先级继承
+}
+
+#[derive(Debug)]
+struct WakerTimer {
+    waker: Arc<Waker>,
+}
+
+impl TimerFunction for WakerTimer {
+    fn run(&mut self) -> Result<(), SystemError> {
+        self.waker.wake();
+        Ok(())
+    }
 }
 
 pub enum FutexAccess {
@@ -230,7 +250,7 @@ impl Futex {
     pub fn init() {
         unsafe {
             FUTEX_DATA = Some(FutexData {
-                data: SpinLock::new(HashMap::new()),
+                data: Mutex::new(HashMap::new()),
             })
         };
     }
@@ -259,9 +279,7 @@ impl Futex {
         let bucket_mut = match bucket {
             Some(bucket) => bucket,
             None => {
-                let bucket = FutexHashBucket {
-                    chain: LinkedList::new(),
-                };
+                let bucket = FutexHashBucket::new();
                 futex_map_guard.insert(key.clone(), bucket);
                 futex_map_guard.get_mut(&key).unwrap()
             }
@@ -284,7 +302,7 @@ impl Futex {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
 
-        let pcb = ProcessManager::current_pcb();
+        let (waiter, waker) = Waiter::new_pair();
         // 创建超时计时器任务
         let mut timer = None;
         if let Some(time) = abs_time {
@@ -297,30 +315,32 @@ impl Futex {
                 return Err(SystemError::ETIMEDOUT);
             }
 
-            let wakeup_helper = WakeUpHelper::new(pcb.clone());
             let jiffies = next_n_us_timer_jiffies(total_us);
-
-            let wake_up = Timer::new(wakeup_helper, jiffies);
+            let wake_up = Timer::new(
+                Box::new(WakerTimer {
+                    waker: waker.clone(),
+                }),
+                jiffies,
+            );
             timer = Some(wake_up);
         }
 
         let futex_q = Arc::new(FutexObj {
-            pcb: Arc::downgrade(&pcb),
+            waker: waker.clone(),
             key: key.clone(),
             bitset,
+            tid: 0,
         });
-        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-        // 满足条件则将当前进程在该bucket上挂起
-        bucket_mut.sleep_no_sched(futex_q.clone())?;
+        bucket_mut.enqueue(futex_q.clone());
 
-        // 在关中断并且已经标记阻塞后，激活定时器，避免短超时在阻塞之前触发造成唤醒丢失
+        // 在入队后激活定时器，避免短超时在阻塞之前触发造成唤醒丢失
         if let Some(ref t) = timer {
             t.activate();
         }
 
         drop(futex_map_guard);
-        drop(irq_guard);
-        schedule(SchedMode::SM_NONE);
+        // 阻塞等待
+        let wait_res = waiter.wait(true);
 
         // ========== 被唤醒后的检查 ==========
         // 进程被唤醒可能有以下几种情况：
@@ -331,41 +351,14 @@ impl Futex {
 
         let mut futex_map_guard = FutexData::futex_map();
 
-        // 首先检查超时，优先级最高
-        // 注意：必须在检查队列之前先检查超时，否则可能漏掉超时情况
+        // 首先检查超时
         let is_timeout = timer.as_ref().is_some_and(|t| t.timeout());
 
-        if is_timeout {
-            // 超时唤醒：从队列中移除并返回 ETIMEDOUT
-            if let Some(bucket_mut) = futex_map_guard.get_mut(&key) {
-                bucket_mut.remove(futex_q.clone());
-            }
-            return Err(SystemError::ETIMEDOUT);
-        }
-
-        // 检查是否被正常唤醒（futex_wake）
-        let bucket = futex_map_guard.get_mut(&key);
-        match bucket {
-            Some(bucket_mut) => {
-                if !bucket_mut.contains(&futex_q) {
-                    // futex_q 不在队列中，说明被 futex_wake 正常唤醒
-                    if let Some(timer) = timer {
-                        timer.cancel();
-                    }
-                    return Ok(0);
-                }
-                // futex_q 仍在队列中，说明是信号或伪唤醒
-                // 从队列中移除
-                bucket_mut.remove(futex_q.clone());
-            }
-            None => {
-                // 队列已被清空，说明被正常唤醒
-                if let Some(timer) = timer {
-                    timer.cancel();
-                }
-                return Ok(0);
-            }
-        }
+        // 从队列中移除自身（如果仍在队列）
+        let in_queue = futex_map_guard
+            .get_mut(&key)
+            .map(|bucket| bucket.remove_by_waker(&waker))
+            .unwrap_or(false);
 
         drop(futex_map_guard);
 
@@ -374,9 +367,19 @@ impl Futex {
             timer.cancel();
         }
 
-        // 检查是否有待处理的信号
-        if ProcessManager::current_pcb().has_pending_signal() {
-            return Err(SystemError::ERESTARTSYS);
+        // 处理等待结果
+        if is_timeout {
+            return Err(SystemError::ETIMEDOUT);
+        }
+
+        if wait_res.is_err() || ProcessManager::current_pcb().has_pending_signal() {
+            // 按 Linux 语义，将可中断唤醒视为 EINTR 而非内部重启错误
+            return Err(SystemError::EINTR);
+        }
+
+        if in_queue {
+            // 未被正常唤醒，视为伪唤醒/信号
+            return Err(SystemError::EINTR);
         }
 
         Ok(0)
@@ -405,9 +408,7 @@ impl Futex {
         )?;
 
         let mut binding = FutexData::futex_map();
-        let bucket_mut = binding.entry(key.clone()).or_insert(FutexHashBucket {
-            chain: LinkedList::new(),
-        });
+        let bucket_mut = binding.entry(key.clone()).or_insert(FutexHashBucket::new());
 
         // 确保后面的唤醒操作是有意义的
         if bucket_mut.chain.is_empty() {
@@ -590,7 +591,7 @@ impl Futex {
             .mappings
             .contains(uaddr)
             .ok_or(SystemError::EINVAL)?;
-        let vma_guard = vma.lock_irqsave();
+        let vma_guard = vma.lock();
 
         // 页内索引（相对VMA起始地址）
         let page_index =
@@ -601,7 +602,7 @@ impl Futex {
             let md = file.metadata()?;
             let dev = md.dev_id as u64;
             let ino = md.inode_id.into() as u64;
-            let base_pgoff = vma_guard.file_page_offset().unwrap_or(0) as u64;
+            let base_pgoff = vma_guard.backing_page_offset().unwrap_or(0) as u64;
             let shared = SharedKey {
                 kind: SharedKeyKind::File { dev, ino },
                 page_offset: base_pgoff + page_index,
@@ -836,7 +837,10 @@ impl RobustListHead {
             mem::size_of::<PosixRobustListHead>(),
             true,
         )?;
-        let robust_list_head = *user_buffer_reader.read_one_from_user::<PosixRobustListHead>(0)?;
+        // 使用异常表保护读取，避免用户地址缺页/无效导致内核崩溃
+        let robust_list_head = user_buffer_reader
+            .buffer_protected(0)?
+            .read_one::<PosixRobustListHead>(0)?;
         let robust_list_head = RobustListHead {
             posix: robust_list_head,
             uaddr: head_uaddr,
@@ -889,7 +893,10 @@ impl RobustListHead {
             core::mem::size_of::<usize>(),
             true,
         )?;
-        user_writer.copy_one_to_user(&mem::size_of::<PosixRobustListHead>(), 0)?;
+        // 使用异常表保护写回
+        user_writer
+            .buffer_protected(0)?
+            .write_one::<usize>(0, &mem::size_of::<PosixRobustListHead>())?;
 
         // 获取当前线程的robust list head
         let robust_list_head_opt = *pcb.get_robust_list();
@@ -904,7 +911,10 @@ impl RobustListHead {
             mem::size_of::<usize>(),
             true,
         )?;
-        user_writer.copy_one_to_user(&head_uaddr, 0)?;
+        // 使用异常表保护写回
+        user_writer
+            .buffer_protected(0)?
+            .write_one::<usize>(0, &head_uaddr)?;
 
         return Ok(0);
     }
@@ -935,8 +945,11 @@ impl RobustListHead {
             }
         };
 
-        let posix_head = match user_buffer_reader.read_one_from_user::<PosixRobustListHead>(0) {
-            Ok(head) => *head,
+        let posix_head = match user_buffer_reader
+            .buffer_protected(0)
+            .and_then(|b| b.read_one::<PosixRobustListHead>(0))
+        {
+            Ok(head) => head,
             Err(_) => {
                 return;
             }
@@ -949,7 +962,13 @@ impl RobustListHead {
 
         // 遍历当前进程/线程的robust list
         for futex_uaddr in head.futexes() {
-            let ret = Self::handle_futex_death(futex_uaddr, pcb.raw_pid().into() as u32);
+            let pid = pcb.raw_pid().into() as u32;
+            match Self::handle_pi_futex_death(futex_uaddr, pid) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(_) => return,
+            }
+            let ret = Self::handle_futex_death(futex_uaddr, pid);
             if ret.is_err() {
                 return;
             }
@@ -975,8 +994,9 @@ impl RobustListHead {
 
     /// # 安全地从用户空间读取u32值，如果地址无效则返回None
     fn safe_read_u32(addr: VirtAddr) -> Option<u32> {
-        Self::safe_read::<u32>(addr)
-            .and_then(|reader| reader.read_one_from_user::<u32>(0).ok().cloned())
+        let reader =
+            UserBufferReader::new(addr.as_ptr::<u32>(), core::mem::size_of::<u32>(), true).ok()?;
+        reader.buffer_protected(0).ok()?.read_one::<u32>(0).ok()
     }
 
     /// # 处理进程即将死亡时，进程已经持有的futex，唤醒其他等待该futex的线程
@@ -1031,6 +1051,138 @@ impl RobustListHead {
         }
 
         return Ok(0);
+    }
+
+    /// # 处理 PI futex 的 owner death，唤醒 PI 等待者并设置 OWNER_DIED
+    ///
+    /// 返回值：
+    /// - Ok(true): 已处理为 PI futex
+    /// - Ok(false): 不是 PI futex（或不需要处理）
+    fn handle_pi_futex_death(futex_uaddr: VirtAddr, pid: u32) -> Result<bool, SystemError> {
+        let futex_val = match Self::safe_read_u32(futex_uaddr) {
+            Some(val) => val,
+            None => return Ok(false),
+        };
+
+        let mut uval = futex_val;
+        let atomic_futex = unsafe { AtomicU32::from_ptr(futex_uaddr.as_ptr::<u32>()) };
+
+        let key_private = Futex::get_futex_key(futex_uaddr, false, FutexAccess::FutexWrite).ok();
+        let key_shared = Futex::get_futex_key(futex_uaddr, true, FutexAccess::FutexWrite).ok();
+
+        let key = {
+            let guard = FutexData::futex_map();
+            let mut chosen = None;
+            if let Some(k) = key_private.as_ref() {
+                if guard.get(k).is_some() {
+                    chosen = Some(k.clone());
+                }
+            }
+            if chosen.is_none() {
+                if let Some(k) = key_shared.as_ref() {
+                    if guard.get(k).is_some() {
+                        chosen = Some(k.clone());
+                    }
+                }
+            }
+            drop(guard);
+            chosen
+        };
+
+        loop {
+            let owner = uval & FUTEX_TID_MASK;
+            if owner != pid {
+                return Ok(false);
+            }
+
+            if let Some(ref key) = key {
+                let mut futex_map_guard = FutexData::futex_map();
+                let bucket = match futex_map_guard.get_mut(key) {
+                    Some(bucket) => bucket,
+                    None => {
+                        drop(futex_map_guard);
+                        let mval = FUTEX_OWNER_DIED;
+                        match atomic_futex.compare_exchange(
+                            uval,
+                            mval,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        ) {
+                            Ok(_) => return Ok(true),
+                            Err(current) => {
+                                uval = current;
+                                continue;
+                            }
+                        }
+                    }
+                };
+
+                if bucket.pi_owner == 0 && bucket.pi_waiters.is_empty() {
+                    drop(futex_map_guard);
+                    return Ok(false);
+                }
+
+                if bucket.pi_waiters.is_empty() {
+                    let mval = FUTEX_OWNER_DIED;
+                    match atomic_futex.compare_exchange(
+                        uval,
+                        mval,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(_) => {
+                            bucket.pi_owner = 0;
+                            drop(futex_map_guard);
+                            FutexData::try_remove(key);
+                            return Ok(true);
+                        }
+                        Err(current) => {
+                            uval = current;
+                            continue;
+                        }
+                    }
+                }
+
+                let next_waiter = bucket.pi_waiters.pop_front();
+                if let Some(next_waiter) = next_waiter {
+                    let has_more = !bucket.pi_waiters.is_empty();
+                    let new_val = next_waiter.tid
+                        | FUTEX_OWNER_DIED
+                        | if has_more { FUTEX_WAITERS } else { 0 };
+                    match atomic_futex.compare_exchange(
+                        uval,
+                        new_val,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(_) => {
+                            bucket.pi_owner = next_waiter.tid;
+                            drop(futex_map_guard);
+                            next_waiter.waker.wake();
+                            return Ok(true);
+                        }
+                        Err(current) => {
+                            bucket.pi_waiters.push_front(next_waiter);
+                            drop(futex_map_guard);
+                            uval = current;
+                            continue;
+                        }
+                    }
+                }
+
+                drop(futex_map_guard);
+                continue;
+            }
+
+            let mval = FUTEX_OWNER_DIED;
+            match atomic_futex.compare_exchange(uval, mval, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return Ok(true),
+                Err(current) => {
+                    uval = current;
+                    continue;
+                }
+            }
+        }
     }
 }
 

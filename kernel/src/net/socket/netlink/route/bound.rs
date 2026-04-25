@@ -51,12 +51,11 @@ impl datagram_common::Bound for BoundNetlink<RouteNlMessage> {
                 return Err(e);
             }
             Err(e) => {
-                // 传播错误，静默处理
                 log::warn!(
                     "netlink_send: failed to read netlink message from buffer: {:?}",
                     e
                 );
-                return Ok(sum_lens);
+                return Err(e);
             }
         };
 
@@ -91,19 +90,25 @@ impl datagram_common::Bound for BoundNetlink<RouteNlMessage> {
         &self,
         writer: &mut [u8],
         flags: crate::net::socket::PMSG,
-    ) -> Result<(usize, Self::Endpoint), SystemError> {
+    ) -> Result<(usize, usize, Self::Endpoint), SystemError> {
         let mut receive_queue = self.receive_queue.0.lock();
 
         let Some(res) = receive_queue.front() else {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         };
 
-        let len = {
-            let max = writer.len();
-            res.total_len().min(max)
+        let orig_len = res.total_len();
+        let copied = if writer.len() >= orig_len {
+            res.write_to(writer)?
+        } else {
+            let mut full = alloc::vec![0u8; orig_len];
+            let written = res.write_to(&mut full)?;
+            let copy_len = written.min(writer.len());
+            if copy_len > 0 {
+                writer[..copy_len].copy_from_slice(&full[..copy_len]);
+            }
+            copy_len
         };
-
-        let _copied = res.write_to(writer)?;
 
         if !flags.contains(PMSG::PEEK) {
             receive_queue.pop_front();
@@ -112,7 +117,7 @@ impl datagram_common::Bound for BoundNetlink<RouteNlMessage> {
         // todo 目前这个信息只能来自内核
         let remote = NetlinkSocketAddr::new_unspecified();
 
-        Ok((len, remote))
+        Ok((copied, orig_len, remote))
     }
 
     fn check_io_events(&self) -> EPollEventType {

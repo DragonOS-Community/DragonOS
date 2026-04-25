@@ -21,6 +21,7 @@ use self::{
 };
 
 pub mod allocator;
+pub mod dma;
 pub mod early_ioremap;
 pub mod fault;
 pub mod ident_map;
@@ -30,12 +31,15 @@ pub mod madvise;
 pub mod memblock;
 pub mod mincore;
 pub mod mmio_buddy;
+pub mod mmu_gather;
 pub mod no_init;
 pub mod page;
+pub mod page_cache_stats;
 pub mod percpu;
 pub mod readahead;
 pub mod syscall;
 pub mod sysfs;
+pub mod tlb;
 pub mod truncate;
 pub mod ucontext;
 
@@ -743,6 +747,38 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     }
 }
 
+/// RAII guard for kernel write protection
+///
+/// Ensures write protection is re-enabled even if a panic occurs.
+/// This guard disables kernel write protection on creation and
+/// re-enables it when dropped.
+///
+/// # Example
+/// ```ignore
+/// {
+///     let _guard = KernelWpGuard::new();
+///     // Write protection is disabled here
+///     // ... perform write operations ...
+/// } // Write protection is re-enabled when _guard is dropped
+/// ```
+pub struct KernelWpGuard;
+
+impl KernelWpGuard {
+    /// Create a new guard that disables kernel write protection
+    #[inline]
+    pub fn new() -> Self {
+        MMArch::disable_kernel_wp();
+        Self
+    }
+}
+
+impl Drop for KernelWpGuard {
+    #[inline]
+    fn drop(&mut self) {
+        MMArch::enable_kernel_wp();
+    }
+}
+
 /// @brief 虚拟地址范围
 /// 该结构体用于表示一个虚拟地址范围，包括起始地址与大小
 ///
@@ -889,13 +925,31 @@ impl Ord for VirtRegion {
     }
 }
 
-/// ## 判断虚拟地址是否超出了用户空间
+/// ## 快速检查用户地址范围的基本合法性
 ///
-/// 如果虚拟地址超出了用户空间，返回Err(SystemError::EFAULT).
-/// 如果end < start，返回Err(SystemError::EOVERFLOW)
+/// 该函数是**第一层检查**，仅验证地址是否在用户空间范围内，
+/// 以及是否发生算术溢出。**不保证地址真正可访问**。
 ///
-/// 否则返回Ok(())
-pub fn verify_area(addr: VirtAddr, size: usize) -> Result<(), SystemError> {
+/// ⚠️ **重要**: 返回 `Ok(())` 不意味着地址已映射或真正可访问。
+/// 实际访问时仍可能触发缺页异常。
+///
+/// ### 参数
+/// - `addr`: 起始虚拟地址
+/// - `size`: 要检查的字节数
+///
+/// ### 返回值
+/// - `Ok(())`: 地址范围看起来合法，**可以尝试访问**
+/// - `Err(SystemError::EFAULT)`: 地址不在用户空间
+/// - `Err(SystemError::EOVERFLOW)`: `addr + size` 溢出
+///
+/// ### 典型用法
+/// ```rust
+/// // 作为快速失败的前置检查
+/// if access_ok(user_ptr, size).is_ok() {
+///     copy_to_user(user_ptr, data, size)?;  // 真正的访问（带缺页处理）
+/// }
+/// ```
+pub fn access_ok(addr: VirtAddr, size: usize) -> Result<(), SystemError> {
     let end = addr.add(size);
     if unlikely(end.data() < addr.data()) {
         return Err(SystemError::EOVERFLOW);

@@ -1,10 +1,10 @@
-use log::warn;
 use system_error::SystemError;
 
 use crate::arch::syscall::nr::SYS_FCHMOD;
+use crate::filesystem::vfs::file::FileFlags;
 use crate::{
     arch::interrupt::TrapFrame,
-    filesystem::vfs::InodeMode,
+    filesystem::vfs::{open::do_fchmod, InodeMode},
     process::ProcessManager,
     syscall::table::{FormattedSyscallParam, Syscall},
 };
@@ -20,17 +20,21 @@ impl Syscall for SysFchmodHandle {
         let fd = Self::fd(args);
         let mode = Self::mode(args);
 
-        let _mode = InodeMode::from_bits(mode).ok_or(SystemError::EINVAL)?;
+        let mode = InodeMode::from_bits(mode).ok_or(SystemError::EINVAL)?;
         let binding = ProcessManager::current_pcb().fd_table();
         let fd_table_guard = binding.read();
-        let _file = fd_table_guard
+        let file = fd_table_guard
             .get_file_by_fd(fd)
             .ok_or(SystemError::EBADF)?;
 
-        // fchmod没完全实现，因此不修改文件的权限
-        // todo: 实现fchmod
-        warn!("fchmod not fully implemented");
-        return Ok(0);
+        // Linux 语义：对 O_PATH fd 执行 fchmod 应返回 EBADF
+        if file.flags().contains(FileFlags::O_PATH) {
+            return Err(SystemError::EBADF);
+        }
+
+        // 通过 inode 修改元数据（保留文件类型位，仅替换权限/特殊位）
+        // 注意：read()/write() 权限只在 open 时检查，chmod 不影响已打开 fd 的读写能力。
+        do_fchmod(file.inode(), mode)
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

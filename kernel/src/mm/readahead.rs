@@ -90,22 +90,25 @@ impl<'a> ReadaheadControl<'a> {
     /// 执行实际的页缓存预读
     /// 由于目前DragonOS不支持异步，
     /// 所以直接把整个窗口同步读完
-    fn do_page_cache_readahead(&self, number_to_read: usize) -> Result<usize, SystemError> {
+    fn do_page_cache_readahead(
+        &self,
+        number_to_read: usize,
+        mut set_flag: bool,
+    ) -> Result<usize, SystemError> {
         let page_cache = self.page_cache;
-        let start_index = self.ra_state.start;
+        let start_index = self.index;
 
-        let page_cache_guard = page_cache.lock_irqsave();
-
-        let set_flag = page_cache_guard
-            .get_page(self.ra_state.start + self.ra_state.size - self.ra_state.async_size)
-            .is_none();
+        if set_flag {
+            set_flag = page_cache
+                .manager()
+                .peek_page(self.ra_state.start + self.ra_state.size - self.ra_state.async_size)
+                .is_none();
+        }
 
         let missing_pages: Vec<_> = (0..number_to_read)
             .map(|i| start_index + i)
-            .filter(|&idx| page_cache_guard.get_page(idx).is_none())
+            .filter(|&idx| !page_cache.is_page_ready(idx))
             .collect();
-
-        drop(page_cache_guard);
 
         if missing_pages.is_empty() {
             return Ok(0);
@@ -113,36 +116,33 @@ impl<'a> ReadaheadControl<'a> {
 
         let ranges = merge_ranges(&missing_pages);
         let mut total_read = 0;
+        let file_size = self.inode.metadata()?.size.max(0) as usize;
+        if file_size == 0 {
+            return Ok(0);
+        }
 
         for (page_index, count) in ranges {
-            let mut page_buf = alloc::vec![0u8; MMArch::PAGE_SIZE * count];
-            let offset = page_index << MMArch::PAGE_SHIFT;
-            let read_len = self.inode.read_sync(offset, &mut page_buf)?;
-
-            if read_len == 0 {
+            let start_offset = page_index * MMArch::PAGE_SIZE;
+            let end_offset = core::cmp::min((page_index + count) * MMArch::PAGE_SIZE, file_size);
+            if end_offset <= start_offset {
                 continue;
             }
-
-            page_buf.truncate(read_len);
-            let actual_page_count = (read_len + MMArch::PAGE_SIZE - 1) >> MMArch::PAGE_SHIFT;
-
-            let mut page_cache_guard = page_cache.lock_irqsave();
-            page_cache_guard.create_pages(page_index, &page_buf)?;
-            drop(page_cache_guard);
-
+            let actual_page_count =
+                (end_offset - start_offset + MMArch::PAGE_SIZE - 1) >> MMArch::PAGE_SHIFT;
+            page_cache.read_pages(page_index, actual_page_count)?;
             total_read += actual_page_count;
         }
 
         if set_flag {
-            let page_cache_guard = page_cache.lock_irqsave();
-            if let Some(page) = page_cache_guard
-                .get_page(self.ra_state.start + self.ra_state.size - self.ra_state.async_size)
+            if let Some(page) = page_cache
+                .manager()
+                .peek_page(self.ra_state.start + self.ra_state.size - self.ra_state.async_size)
             {
                 // log::debug!(
                 //     "set ra flag at {}",
                 //     self.ra_state.start + self.ra_state.size - self.ra_state.async_size
                 // );
-                page.write_irqsave().add_flags(PageFlags::PG_READAHEAD);
+                page.write().add_flags(PageFlags::PG_READAHEAD);
             }
         }
 
@@ -175,13 +175,12 @@ impl<'a> ReadaheadControl<'a> {
 
         if is_async {
             // 第二次及以后的连续读
-            let page_cache_gaurd = self.page_cache.lock_irqsave();
-            let next_missing_pages = {
+            let next_missing_page = {
                 (start_index..start_index + max_pages)
-                    .find(|idx| page_cache_gaurd.get_page(*idx).is_none())
+                    .find(|idx| !self.page_cache.is_page_ready(*idx))
             };
 
-            if let Some(next_missing_page) = next_missing_pages {
+            if let Some(next_missing_page) = next_missing_page {
                 if next_missing_page - start_index > max_pages {
                     return Ok(0);
                 }
@@ -228,8 +227,9 @@ impl<'a> ReadaheadControl<'a> {
         }
         // log::debug!("is_async: {}, start: {}, size: {}, async_size: {}", is_async, ra_state.start, ra_state.size, ra_state.async_size);
 
+        self.index = ra_state.start;
         let nr_to_read = ra_state.size;
-        let read_count = self.do_page_cache_readahead(nr_to_read)?;
+        let read_count = self.do_page_cache_readahead(nr_to_read, true)?;
 
         Ok(read_count)
     }
@@ -269,4 +269,44 @@ pub fn page_cache_async_readahead(
     };
 
     ractl.ondemand_readahead(req_size, true)
+}
+
+pub fn force_page_cache_readahead(
+    page_cache: &Arc<PageCache>,
+    inode: &Arc<dyn IndexNode>,
+    ra_state: &mut FileReadaheadState,
+    start_index: usize,
+    page_num: usize,
+) -> Result<usize, SystemError> {
+    const CHUNK_SIZE: usize = (2 * 1024 * 1024) >> MMArch::PAGE_SHIFT; // 2MB / 4KB = 512 页
+
+    let file_size = inode.metadata()?.size;
+    if file_size == 0 {
+        return Ok(0);
+    }
+
+    let mut ractl = ReadaheadControl {
+        page_cache,
+        inode,
+        ra_state,
+        index: start_index,
+    };
+
+    let end_index = ((file_size - 1) >> MMArch::PAGE_SHIFT) as usize;
+    let mut total_read = 0;
+    let mut index = ractl.index;
+    let mut remaining = page_num;
+
+    while remaining > 0 && index <= end_index {
+        let chunk = core::cmp::min(remaining, CHUNK_SIZE);
+        let chunk = core::cmp::min(chunk, end_index - index + 1);
+
+        ractl.index = index;
+        total_read += ractl.do_page_cache_readahead(chunk, false)?;
+
+        index += chunk;
+        remaining -= chunk;
+    }
+
+    Ok(total_read)
 }

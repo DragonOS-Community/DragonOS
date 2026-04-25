@@ -22,7 +22,7 @@ impl Syscall for SysLchownHandle {
         let uid = Self::uid(args);
         let gid = Self::gid(args);
 
-        let pathname = user_access::check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?
+        let pathname = user_access::vfs_check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
         return do_fchownat(

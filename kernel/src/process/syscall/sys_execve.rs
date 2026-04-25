@@ -1,17 +1,15 @@
-use alloc::string::String;
 #[allow(unused_imports)]
 use alloc::string::ToString;
-use alloc::sync::Arc;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_EXECVE;
-use crate::filesystem::vfs::{IndexNode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES};
+use crate::filesystem::vfs::{MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES};
 use crate::mm::page::PAGE_4K_SIZE;
-use crate::mm::{verify_area, VirtAddr};
+use crate::mm::{access_ok, VirtAddr};
 use crate::process::execve::do_execve;
-use crate::process::{ProcessControlBlock, ProcessManager};
+use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
-use crate::syscall::user_access::{check_and_clone_cstr, check_and_clone_cstr_array};
+use crate::syscall::user_access::{check_and_clone_cstr_array, vfs_check_and_clone_cstr};
 use alloc::{ffi::CString, vec::Vec};
 use log::error;
 use system_error::SystemError;
@@ -46,9 +44,9 @@ impl SysExecve {
 
         // 权限校验
         if frame.is_from_user()
-            && (verify_area(virt_path_ptr, MAX_PATHLEN).is_err()
-                || verify_area(virt_argv_ptr, PAGE_4K_SIZE).is_err())
-            || verify_area(virt_env_ptr, PAGE_4K_SIZE).is_err()
+            && (access_ok(virt_path_ptr, MAX_PATHLEN).is_err()
+                || access_ok(virt_argv_ptr, PAGE_4K_SIZE).is_err())
+            || access_ok(virt_env_ptr, PAGE_4K_SIZE).is_err()
         {
             return Err(SystemError::EFAULT);
         }
@@ -60,44 +58,42 @@ impl SysExecve {
         argv: *const *const u8,
         envp: *const *const u8,
     ) -> Result<(CString, Vec<CString>, Vec<CString>), SystemError> {
-        let path: CString = check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let path: CString = vfs_check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
         let mut argv: Vec<CString> = check_and_clone_cstr_array(argv)?;
         let envp: Vec<CString> = check_and_clone_cstr_array(envp)?;
 
-        // 这里需要处理符号链接, 应用程序一般不支持嵌套符号链接
-        // 如 test -> echo -> busybox, 需要内核代为解析到 echo, 传入 test 则不会让程序执行 echo 命令
-        let root = ProcessManager::current_mntns().root_inode();
-        if let Ok(real_inode) = root.lookup_follow_symlink2(
-            argv[0].to_string_lossy().as_ref(),
-            VFS_MAX_FOLLOW_SYMLINK_TIMES,
-            false,
-        ) {
-            let real_path = real_inode.absolute_path()?;
-            argv[0] = CString::new(real_path).unwrap();
+        // Linux 语义：当 argv 为空时，添加一个空字符串作为 argv[0]，使 argc = 1
+        // 这确保用户空间程序不会混淆，避免它们从 argv[1] 开始处理或意外遍历 envp
+        if argv.is_empty() {
+            argv.push(CString::new("").unwrap());
+        } else if !argv[0].is_empty() {
+            // 这里需要处理符号链接, 应用程序一般不支持嵌套符号链接
+            // 如 test -> echo -> busybox, 需要内核代为解析到 echo, 传入 test 则不会让程序执行 echo 命令
+            // 只有当 argv[0] 非空时才尝试解析符号链接
+            let root = ProcessManager::current_mntns().root_inode();
+            if let Ok(real_inode) = root.lookup_follow_symlink2(
+                argv[0].to_string_lossy().as_ref(),
+                VFS_MAX_FOLLOW_SYMLINK_TIMES,
+                false,
+            ) {
+                // 只有当 absolute_path() 成功时才替换 argv[0]
+                // 如果失败（返回 ENOSYS），保持原路径不变
+                if let Ok(real_path) = real_inode.absolute_path() {
+                    argv[0] = CString::new(real_path).unwrap();
+                }
+            }
         }
 
         Ok((path, argv, envp))
     }
 
     pub fn execve(
-        inode: Arc<dyn IndexNode>,
-        path: String,
+        path: &str,
         argv: Vec<CString>,
         envp: Vec<CString>,
         frame: &mut TrapFrame,
     ) -> Result<(), SystemError> {
-        ProcessManager::current_pcb()
-            .basic_mut()
-            .set_name(ProcessControlBlock::generate_name(&path));
-
-        do_execve(inode, argv, envp, frame)?;
-
-        let pcb = ProcessManager::current_pcb();
-        // 关闭设置了O_CLOEXEC的文件描述符
-        let fd_table = pcb.fd_table();
-        fd_table.write().close_on_exec();
-
-        pcb.set_execute_path(path);
+        do_execve(path, argv, envp, frame)?;
         Ok(())
     }
 }
@@ -125,14 +121,12 @@ impl Syscall for SysExecve {
 
         let path = path.into_string().map_err(|_| SystemError::EINVAL)?;
 
-        let pwd = ProcessManager::current_pcb().pwd_inode();
-        let inode = pwd.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        // 如果路径为空字符串，返回 ENOENT
+        if path.is_empty() {
+            return Err(SystemError::ENOENT);
+        }
 
-        // 获取inode的绝对路径，而不是使用用户传入的原始路径
-        // 这样可以正确处理符号链接（如/proc/self/exe）
-        let resolved_path = inode.absolute_path().unwrap_or(path.clone());
-
-        Self::execve(inode, resolved_path, argv, envp, frame)?;
+        Self::execve(&path, argv, envp, frame)?;
         return Ok(0);
     }
 

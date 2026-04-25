@@ -1,9 +1,8 @@
 use crate::arch::interrupt::TrapFrame;
-use crate::mm::page::PageFlushAll;
+use crate::mm::mmu_gather::MmuGather;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::{
     arch::syscall::nr::SYS_SHMDT,
-    arch::MMArch,
     mm::{ucontext::AddressSpace, VirtAddr},
     syscall::table::Syscall,
 };
@@ -52,13 +51,16 @@ impl Syscall for SysShmdtHandle {
             .ok_or(SystemError::EINVAL)?;
 
         // 判断vaddr是否为起始地址
-        if vma.lock_irqsave().region().start() != vaddr {
+        if vma.lock().region().start() != vaddr {
             return Err(SystemError::EINVAL);
         }
 
-        // 取消映射
-        let flusher: PageFlushAll<MMArch> = PageFlushAll::new();
-        vma.unmap(&mut address_write_guard.user_mapper.utable, flusher);
+        // Unmap via MmuGather: shootdown first, then free physical pages (INV-3).
+        {
+            let mut tlb = MmuGather::gather(&current_address_space);
+            vma.unmap(&mut address_write_guard.user_mapper.utable, &mut tlb);
+            tlb.finish();
+        }
 
         return Ok(0);
     }

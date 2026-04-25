@@ -1,3 +1,5 @@
+#![allow(function_casts_as_integer)]
+
 use core::intrinsics::likely;
 use core::intrinsics::unlikely;
 use core::sync::atomic::{AtomicBool, Ordering};

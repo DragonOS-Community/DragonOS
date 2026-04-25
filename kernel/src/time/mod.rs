@@ -98,7 +98,31 @@ impl PosixTimeSpec {
 
     /// 换算成纳秒
     pub fn total_nanos(&self) -> i64 {
-        self.tv_sec * 1000000000 + self.tv_nsec
+        self.tv_sec * NSEC_PER_SEC as i64 + self.tv_nsec
+    }
+
+    /// 从纳秒创建 PosixTimeSpec
+    pub fn from_ns(ns: u64) -> PosixTimeSpec {
+        PosixTimeSpec {
+            tv_sec: (ns / NSEC_PER_SEC as u64) as i64,
+            tv_nsec: (ns % NSEC_PER_SEC as u64) as i64,
+        }
+    }
+
+    /// 将 PosixTimeSpec 转换为毫秒数
+    ///
+    /// # 返回值
+    /// 返回总毫秒数，如果结果为负数则返回 0
+    pub fn as_millis(&self) -> i64 {
+        self.tv_sec * MSEC_PER_SEC as i64 + self.tv_nsec / NSEC_PER_MSEC as i64
+    }
+
+    pub fn as_millis_saturating_u64(&self) -> u64 {
+        let sec_ms = (self.tv_sec as u64).saturating_mul(MSEC_PER_SEC as u64);
+        let nsec_ms = (self.tv_nsec as u64) / NSEC_PER_MSEC as u64;
+        let ms = sec_ms.saturating_add(nsec_ms);
+        let max_ms = (i64::MAX as u64) / 1000;
+        ms.min(max_ms)
     }
 }
 
@@ -524,7 +548,9 @@ impl From<smoltcp::time::Instant> for Instant {
 
 impl From<Instant> for smoltcp::time::Instant {
     fn from(val: Instant) -> Self {
-        smoltcp::time::Instant::from_millis(val.millis())
+        // smoltcp 的 Instant 单位是微秒，且要求单调递增。
+        // 这里必须使用 total_micros（而不是 millis() 这种“秒内小数部分”），否则会每秒回绕，导致 poll_at/定时器异常。
+        smoltcp::time::Instant::from_micros(val.total_micros())
     }
 }
 
@@ -537,7 +563,8 @@ impl From<smoltcp::time::Duration> for Duration {
 
 impl From<Duration> for smoltcp::time::Duration {
     fn from(val: Duration) -> Self {
-        smoltcp::time::Duration::from_millis(val.millis())
+        // smoltcp 的 Duration 单位是微秒；同样不能使用 millis() 这种“秒内小数部分”，否则会严重截断。
+        smoltcp::time::Duration::from_micros(val.total_micros())
     }
 }
 
@@ -558,4 +585,10 @@ pub trait TimeArch {
 
     /// 将CPU的时钟周期数转换为纳秒
     fn cycles2ns(cycles: usize) -> usize;
+}
+
+/// 获取系统运行时间（秒）
+pub fn uptime_secs() -> u64 {
+    // todo：以后需要改成高精度时钟源
+    crate::time::timer::clock() / crate::time::clocksource::HZ
 }

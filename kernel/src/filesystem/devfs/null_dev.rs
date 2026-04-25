@@ -6,8 +6,8 @@ use crate::filesystem::vfs::{
     vcore::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode, InodeFlags,
     Metadata,
 };
-use crate::libs::spinlock::SpinLockGuard;
-use crate::{libs::spinlock::SpinLock, time::PosixTimeSpec};
+use crate::libs::mutex::MutexGuard;
+use crate::{libs::mutex::Mutex, time::PosixTimeSpec};
 use alloc::{
     string::String,
     sync::{Arc, Weak},
@@ -31,7 +31,7 @@ pub struct NullInode {
 }
 
 #[derive(Debug)]
-pub struct LockedNullInode(SpinLock<NullInode>);
+pub struct LockedNullInode(Mutex<NullInode>);
 
 impl LockedNullInode {
     pub fn new() -> Arc<Self> {
@@ -60,7 +60,7 @@ impl LockedNullInode {
             },
         };
 
-        let result = Arc::new(LockedNullInode(SpinLock::new(inode)));
+        let result = Arc::new(LockedNullInode(Mutex::new(inode)));
         result.0.lock().self_ref = Arc::downgrade(&result);
 
         return result;
@@ -84,13 +84,13 @@ impl IndexNode for LockedNullInode {
 
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         return Ok(());
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 
@@ -125,7 +125,7 @@ impl IndexNode for LockedNullInode {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         return Ok(0);
     }
@@ -136,7 +136,7 @@ impl IndexNode for LockedNullInode {
         _offset: usize,
         len: usize,
         buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if buf.len() < len {
             return Err(SystemError::EINVAL);

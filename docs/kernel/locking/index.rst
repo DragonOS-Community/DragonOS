@@ -9,6 +9,8 @@
 
    locks
    spinlock
-   mutex
    rwlock
+   mutex
+   rwsem
+
 

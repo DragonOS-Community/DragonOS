@@ -9,6 +9,7 @@ use kdepends::ringbuffer::{AllocRingBuffer, RingBuffer};
 use log::{debug, error};
 use system_error::SystemError;
 
+use crate::libs::mutex::MutexGuard;
 use crate::{
     arch::{io::PortIOArch, CurrentIrqArch, CurrentPortIOArch},
     driver::{
@@ -36,7 +37,7 @@ use crate::{
         },
     },
     libs::{
-        rwlock::{RwLockReadGuard, RwLockWriteGuard},
+        rwsem::{RwSemReadGuard, RwSemWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
     time::PosixTimeSpec,
@@ -573,11 +574,11 @@ impl KObject for Ps2MouseDevice {
 
     fn set_name(&self, _name: alloc::string::String) {}
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 
@@ -599,7 +600,7 @@ impl DeviceINode for Ps2MouseDevice {
 impl IndexNode for Ps2MouseDevice {
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _mode: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         let mut guard = self.inner.lock_irqsave();
@@ -607,7 +608,7 @@ impl IndexNode for Ps2MouseDevice {
         Ok(())
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         let mut guard = self.inner.lock_irqsave();
         guard.buf.clear();
         Ok(())
@@ -618,7 +619,7 @@ impl IndexNode for Ps2MouseDevice {
         _offset: usize,
         _len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let mut guard = self.inner.lock_irqsave();
 
@@ -637,7 +638,7 @@ impl IndexNode for Ps2MouseDevice {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         return Err(SystemError::ENOSYS);
     }

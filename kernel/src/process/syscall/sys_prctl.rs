@@ -5,6 +5,8 @@ use num_traits::FromPrimitive;
 use alloc::{borrow::ToOwned, string::String, vec::Vec};
 use system_error::SystemError;
 
+use crate::process::cred::{CAPFlags, Cred};
+
 use crate::{
     arch::{interrupt::TrapFrame, ipc::signal::Signal, syscall::nr::SYS_PRCTL},
     process::ProcessManager,
@@ -16,13 +18,46 @@ use crate::{
 
 const TASK_COMM_LEN: usize = 16;
 
+/// Linux 定义了 41 个 capability (索引 0-40)
+const CAP_LAST_CAP: usize = 40;
+
+/// 将 capability 索引转换为 CAPFlags
+///
+/// # 参数
+/// - `idx`: capability 索引 (0-40)
+///
+/// # 返回
+/// - 成功返回对应的 CAPFlags
+/// - 失败返回 EINVAL (索引超出范围)
+fn capability_from_index(idx: usize) -> Result<CAPFlags, SystemError> {
+    if idx > CAP_LAST_CAP {
+        return Err(SystemError::EINVAL);
+    }
+    let cap_bit = 1u64 << idx;
+    CAPFlags::from_bits(cap_bit).ok_or(SystemError::EINVAL)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, FromPrimitive)]
 #[repr(usize)]
 enum PrctlOption {
     SetPDeathSig = 1,
     GetPDeathSig = 2,
+    GetDumpable = 3,
+    SetDumpable = 4,
+    GetKeepCaps = 7,
+    SetKeepCaps = 8,
     SetName = 15,
     GetName = 16,
+    CapBsetRead = 23,
+    CapBsetDrop = 24,
+
+    SetMm = 35,
+
+    SetChildSubreaper = 36,
+    GetChildSubreaper = 37,
+
+    SetNoNewPrivs = 38,
+    GetNoNewPrivs = 39,
 }
 
 impl TryFrom<usize> for PrctlOption {
@@ -50,7 +85,46 @@ impl Syscall for SysPrctl {
         let from_user = frame.is_from_user();
         let current = ProcessManager::current_pcb();
 
+        // prctl 的部分选项在 Linux 中具有“线程组/进程级”语义。
+        // DragonOS 当前没有显式的 signal_struct / thread_group 抽象，
+        // 这里使用线程组 leader 来承载该类状态。
+        let thread_group_leader = get_thread_group_leader(&current);
+
         match option {
+            PrctlOption::GetDumpable => Ok(current.dumpable().into()),
+            PrctlOption::SetDumpable => {
+                // Linux: PR_SET_DUMPABLE 允许设置为 0/1；2(SUID_DUMP_ROOT) 不允许。
+                // 参考 gVisor: RootDumpability / SetGetDumpability。
+                let val = arg2 as i32;
+                match val {
+                    0 | 1 => {
+                        current.set_dumpable(val as u8);
+                        Ok(0)
+                    }
+                    _ => Err(SystemError::EINVAL),
+                }
+            }
+            PrctlOption::SetKeepCaps => {
+                // Linux: PR_SET_KEEPCAPS 仅允许 0/1，其他值返回 EINVAL。
+                match arg2 {
+                    0 => {
+                        current.set_keepcaps(false);
+                        Ok(0)
+                    }
+                    1 => {
+                        current.set_keepcaps(true);
+                        Ok(0)
+                    }
+                    _ => Err(SystemError::EINVAL),
+                }
+            }
+            PrctlOption::GetKeepCaps => {
+                // Linux: 返回 1 表示置位，0 表示未置位。
+                let value: c_int = if current.keepcaps() { 1 } else { 0 };
+                // 注意：根据 prctl 的语义，返回值应该直接返回，而不是写入用户空间。
+                // PR_GET_KEEPCAPS 的返回值就是当前状态，不需要额外的参数。
+                Ok(value as usize)
+            }
             PrctlOption::SetPDeathSig => {
                 let signal = parse_pdeathsig(arg2)?;
                 current.set_pdeath_signal(signal);
@@ -90,6 +164,83 @@ impl Syscall for SysPrctl {
                 write_comm_buffer(dest, from_user, name.as_bytes())?;
                 Ok(0)
             }
+
+            PrctlOption::SetMm => {
+                // gVisor: PR_SET_MM 在缺少 CAP_SYS_RESOURCE 时必须返回 EPERM。
+                let cred = current.cred();
+                if !cred.has_capability(crate::process::cred::CAPFlags::CAP_SYS_RESOURCE) {
+                    return Err(SystemError::EPERM);
+                }
+
+                // 其余 PR_SET_MM 子操作目前未实现。
+                Err(SystemError::EINVAL)
+            }
+
+            PrctlOption::SetChildSubreaper => {
+                // Linux: 任何非 0 值都表示置 1；0 表示清除。
+                let v = arg2 as isize;
+                let enable = v != 0;
+                thread_group_leader
+                    .sig_info_mut()
+                    .set_is_child_subreaper(enable);
+                Ok(0)
+            }
+            PrctlOption::GetChildSubreaper => {
+                let dest = arg2 as *mut c_int;
+                if dest.is_null() {
+                    return Err(SystemError::EFAULT);
+                }
+                let mut writer = UserBufferWriter::new(dest, mem::size_of::<c_int>(), from_user)?;
+                let is_subreaper = thread_group_leader.sig_info_irqsave().is_child_subreaper();
+                let value: c_int = if is_subreaper { 1 } else { 0 };
+                writer.copy_one_to_user(&value, 0)?;
+                Ok(0)
+            }
+
+            PrctlOption::CapBsetRead => {
+                // PR_CAPBSET_READ: 检查某个 capability 是否在 bounding set 中
+                // arg2 是 capability 的编号 (0-40)
+                let cap_flag = capability_from_index(arg2)?;
+                let cred = current.cred();
+                let has_cap = cred.cap_bset.contains(cap_flag);
+                Ok(if has_cap { 1 } else { 0 })
+            }
+            PrctlOption::CapBsetDrop => {
+                // PR_CAPBSET_DROP: 从 bounding set 中删除某个 capability
+                // arg2 是 capability 的编号 (0-40)
+                // 需要 CAP_SETPCAP 权限
+                let cap_flag = capability_from_index(arg2)?;
+
+                let old_cred = current.cred();
+                // Linux: PR_CAPBSET_DROP 需要 CAP_SETPCAP 权限
+                if !old_cred.has_capability(CAPFlags::CAP_SETPCAP) {
+                    return Err(SystemError::EPERM);
+                }
+
+                // 检查 capability 是否已在 bounding set 中
+                if !old_cred.cap_bset.contains(cap_flag) {
+                    // 已经不在 bounding set 中，直接返回成功
+                    return Ok(0);
+                }
+
+                // 使用 Clone trait 简化代码
+                let mut new_cred = old_cred.as_ref().clone();
+                new_cred.cap_bset.remove(cap_flag);
+                let new_cred = Cred::new_arc(new_cred);
+
+                current.set_cred(new_cred)?;
+                Ok(0)
+            }
+
+            PrctlOption::SetNoNewPrivs => {
+                // Linux: arg2 必须为 1；no_new_privs 一旦置位不可清除。
+                if arg2 != 1 {
+                    return Err(SystemError::EINVAL);
+                }
+                current.set_no_new_privs(true);
+                Ok(0)
+            }
+            PrctlOption::GetNoNewPrivs => Ok(current.no_new_privs()),
         }
     }
 
@@ -156,3 +307,10 @@ fn write_comm_buffer(dest: *mut u8, from_user: bool, name_bytes: &[u8]) -> Resul
 }
 
 syscall_table_macros::declare_syscall!(SYS_PRCTL, SysPrctl);
+
+fn get_thread_group_leader(
+    pcb: &alloc::sync::Arc<crate::process::ProcessControlBlock>,
+) -> alloc::sync::Arc<crate::process::ProcessControlBlock> {
+    let ti = pcb.threads_read_irqsave();
+    ti.group_leader().unwrap_or_else(|| pcb.clone())
+}

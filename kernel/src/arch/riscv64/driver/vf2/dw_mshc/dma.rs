@@ -4,7 +4,7 @@ use bitfield_struct::bitfield;
 pub struct DES0 {
     _reserved0: bool,
     disable_interrupt_on_completion: bool,
-    last_decriptor: bool,
+    last_descriptor: bool,
     first_descriptor: bool,
     second_address_chained: bool,
     end_of_ring: bool,

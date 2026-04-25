@@ -4,7 +4,7 @@ use crate::{
         kset::KSet,
     },
     filesystem::{kernfs::KernFSInode, sysfs::BinAttribute},
-    libs::rwlock::{RwLockReadGuard, RwLockWriteGuard},
+    libs::rwsem::{RwSemReadGuard, RwSemWriteGuard},
     libs::spinlock::SpinLock,
 };
 use alloc::{
@@ -144,11 +144,11 @@ impl KObject for DeviceNode {
 
     fn set_name(&self, _name: String) {}
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         todo!()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         todo!()
     }
 

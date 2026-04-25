@@ -1,3 +1,5 @@
+#![allow(function_casts_as_integer)]
+
 use core::ffi::CStr;
 
 #[linkage = "weak"]

@@ -8,7 +8,7 @@ use crate::{
         acpi::acpi_init, base::init::driver_init, serial::serial_early_init,
         video::VideoRefreshManager,
     },
-    exception::{init::irq_init, softirq::softirq_init, InterruptArch},
+    exception::{bottom_half::irq_bottom_half_init, init::irq_init, InterruptArch},
     filesystem::vfs::vcore::vfs_init,
     init::init_intertrait,
     libs::{
@@ -90,7 +90,8 @@ fn do_start_kernel() {
     CurrentSMPArch::prepare_cpus().expect("prepare_cpus failed");
 
     // sched_init();
-    softirq_init().expect("softirq init failed");
+    // 初始化中断下半部（softirq、bottom_half、tasklet）
+    irq_bottom_half_init().expect("bottom half subsystem init failed");
     Syscall::init().expect("syscall init failed");
     timekeeping_init();
     time_init();

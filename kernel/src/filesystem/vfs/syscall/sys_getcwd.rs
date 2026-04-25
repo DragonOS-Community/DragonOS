@@ -5,7 +5,8 @@ use system_error::SystemError;
 use crate::alloc::string::ToString;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_GETCWD;
-use crate::mm::verify_area;
+use crate::filesystem::vfs::utils::is_ancestor;
+use crate::mm::access_ok;
 use crate::mm::VirtAddr;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
@@ -35,7 +36,7 @@ impl Syscall for SysGetcwdHandle {
         let size = Self::size(args);
 
         let security_check = || {
-            verify_area(VirtAddr::new(buf_vaddr as usize), size)?;
+            access_ok(VirtAddr::new(buf_vaddr as usize), size)?;
             return Ok(());
         };
         let r = security_check();
@@ -44,7 +45,22 @@ impl Syscall for SysGetcwdHandle {
         } else {
             let buf = unsafe { core::slice::from_raw_parts_mut(buf_vaddr, size) };
             let proc = ProcessManager::current_pcb();
-            let cwd = proc.basic().cwd();
+            let fs = proc.fs_struct();
+            let root = fs.root();
+            let pwd = fs.pwd();
+
+            // Linux 语义（与 gVisor 测试对齐）：
+            // - 若 cwd 不在当前 fs root 下：返回 "(unreachable)" + 旧 cwd（通常是全局路径）
+            // - 否则：返回进程维护的 cwd 字符串
+            //
+            // 说明：这里不强依赖各文件系统的 dname 缓存能力，避免 getcwd(2) 因 ENOSYS 失败。
+            let cwd = if is_ancestor(&root, &pwd) {
+                proc.basic().cwd()
+            } else {
+                let mut s = "(unreachable)".to_string();
+                s.push_str(&proc.basic().cwd());
+                s
+            };
 
             let cwd_bytes = cwd.as_bytes();
             let cwd_len = cwd_bytes.len();

@@ -1,17 +1,20 @@
+pub mod append_lock;
 pub mod fasync;
 pub mod fcntl;
 pub mod file;
+pub mod flock;
 pub mod iov;
 pub mod mount;
 pub mod open;
 pub mod permission;
+pub mod posix_lock;
 pub mod stat;
 pub mod syscall;
 pub mod utils;
 pub mod vcore;
 
-use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
 use alloc::{string::String, sync::Arc, vec::Vec};
+use core::{any::Any, fmt::Debug, fmt::Display, sync::atomic::AtomicUsize};
 use derive_builder::Builder;
 use intertrait::CastFromSync;
 use mount::MountFlags;
@@ -23,12 +26,12 @@ use crate::{
     },
     filesystem::{
         epoll::EPollItem,
-        vfs::{permission::PermissionMask, syscall::RenameFlags},
+        vfs::{file::File, permission::PermissionMask, syscall::RenameFlags},
     },
     ipc::pipe::LockedPipeInode,
     libs::{
         casting::DowncastArc,
-        spinlock::{SpinLock, SpinLockGuard},
+        mutex::{Mutex, MutexGuard},
     },
     mm::{fault::PageFaultMessage, VmFaultReason},
     net::socket::Socket,
@@ -43,10 +46,19 @@ pub use self::{file::FilePrivateData, mount::MountFS};
 use super::page_cache::PageCache;
 
 /// vfs容许的最大的路径名称长度
-pub const MAX_PATHLEN: usize = 1024;
+pub const MAX_PATHLEN: usize = 4096;
+
+/// 单个文件名的最大长度
+pub const NAME_MAX: usize = 255;
 
 // 定义inode号
 int_like!(InodeId, AtomicInodeId, usize, AtomicUsize);
+
+impl Display for InodeId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// 文件的类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,8 +241,17 @@ pub const DT_WHT: u16 = 14;
 #[allow(dead_code)]
 pub const DT_MAX: u16 = 16;
 
-/// vfs容许的最大的符号链接跳转次数
-pub const VFS_MAX_FOLLOW_SYMLINK_TIMES: usize = 8;
+/// VFS 允许的最大符号链接跟随次数。
+///
+/// Linux 6.6: MAXSYMLINKS = 40
+///
+/// 重要约定（兼容既有调用点）：
+/// - `max_follow_times == 0` 表示 **完全禁用** symlink 跟随（旧行为：不会因为 symlink 而返回 ELOOP）
+/// - `max_follow_times == 1` 表示"计数已耗尽"，此时若仍需要跟随 symlink，应返回 `ELOOP`
+/// - `max_follow_times >= 2` 才允许继续跟随，并在每次跟随时递减
+///
+/// 因此这里取 41，以"保留 0 的禁用语义"同时实现"最多 40 次跟随"的 Linux 语义。
+pub const VFS_MAX_FOLLOW_SYMLINK_TIMES: usize = 41;
 
 impl FileType {
     pub fn get_file_type_num(&self) -> u16 {
@@ -296,6 +317,51 @@ pub trait PollableInode: Any + Sync + Send + Debug + CastFromSync {
 }
 
 pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
+    /// 是否为"流式"文件（不可 random access / 不可 seek）。
+    ///
+    /// 语义目标：把"pread/pwrite/lseek 应返回 ESPIPE"的判定收敛在 VFS 层，
+    /// 避免在 syscall 层枚举 FileType 或做硬编码特判。
+    ///
+    /// 默认规则仅覆盖"天然流式"的基础类型：Pipe/Socket。
+    /// 其它伪文件（eventfd/epollfd/...）应在各自 inode 中覆写此方法。
+    fn is_stream(&self) -> bool {
+        match self.metadata() {
+            Ok(md) => matches!(md.file_type, FileType::Pipe | FileType::Socket),
+            // 元数据都拿不到时，保守起见按不可 seek 处理，避免误放行 pread/pwrite。
+            Err(_) => true,
+        }
+    }
+
+    /// 是否支持 seek（lseek）。
+    ///
+    /// 默认：普通文件/目录/块设备可 seek；Pipe/Socket/CharDevice 不可 seek；
+    /// 其它类型保守按可 seek（更接近现有行为：lseek 仅显式拒绝 Pipe/CharDevice）。
+    fn supports_seek(&self) -> bool {
+        if self.is_stream() {
+            return false;
+        }
+        match self.metadata() {
+            Ok(md) => !matches!(
+                md.file_type,
+                FileType::Pipe | FileType::Socket | FileType::CharDevice
+            ),
+            Err(_) => false,
+        }
+    }
+
+    /// 是否允许 pread（随机读，不推进文件偏移）。
+    ///
+    /// 默认：对 stream 文件返回 false；对非 stream 默认允许。
+    /// 伪文件（如 eventfd/epollfd）应覆写 `is_stream()` 或此方法以匹配 Linux 语义。
+    fn supports_pread(&self) -> bool {
+        !self.is_stream()
+    }
+
+    /// 是否允许 pwrite（随机写，不推进文件偏移）。
+    fn supports_pwrite(&self) -> bool {
+        !self.is_stream()
+    }
+
     fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
         return Err(SystemError::ENOSYS);
     }
@@ -314,10 +380,10 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///         失败：Err(错误码)
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
-        // 若文件系统没有实现此方法，则返回“不支持”
+        // 若文件系统没有实现此方法，则返回"不支持"
         return Err(SystemError::ENOSYS);
     }
 
@@ -325,8 +391,8 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
-        // 若文件系统没有实现此方法，则返回“不支持”
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
+        // 若文件系统没有实现此方法，则返回"不支持"
         return Err(SystemError::ENOSYS);
     }
 
@@ -345,7 +411,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError>;
 
     /// @brief 在inode的指定偏移量开始，写入指定大小的数据（从buf的第0byte开始写入）
@@ -362,7 +428,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError>;
 
     /// # 在inode的指定偏移量开始，读取指定大小的数据，忽略PageCache
@@ -383,7 +449,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         return Err(SystemError::ENOSYS);
     }
@@ -406,7 +472,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         return Err(SystemError::ENOSYS);
     }
@@ -416,7 +482,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @return 成功：Ok(inode的元数据)
     ///         失败：Err(错误码)
     fn metadata(&self) -> Result<Metadata, SystemError> {
-        // 若文件系统没有实现此方法，则返回“不支持”
+        // 若文件系统没有实现此方法，则返回"不支持"
         return Err(SystemError::ENOSYS);
     }
 
@@ -425,7 +491,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
     fn set_metadata(&self, _metadata: &Metadata) -> Result<(), SystemError> {
-        // 若文件系统没有实现此方法，则返回“不支持”
+        // 若文件系统没有实现此方法，则返回"不支持"
         return Err(SystemError::ENOSYS);
     }
 
@@ -437,7 +503,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
     fn resize(&self, _len: usize) -> Result<(), SystemError> {
-        // 若文件系统没有实现此方法，则返回“不支持”
+        // 若文件系统没有实现此方法，则返回"不支持"
         return Err(SystemError::ENOSYS);
     }
 
@@ -475,8 +541,17 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _mode: InodeMode,
         _data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        // 若文件系统没有实现此方法，则返回“不支持”
+        // 若文件系统没有实现此方法，则返回"不支持"
         return Err(SystemError::ENOSYS);
+    }
+
+    /// @brief 在当前目录下创建符号链接（name -> target）
+    fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let inode = self.create_with_data(name, FileType::SymLink, InodeMode::S_IRWXUGO, 0)?;
+        let bytes = target.as_bytes();
+        let len = bytes.len();
+        inode.write_at(0, len, bytes, Mutex::new(FilePrivateData::Unused).lock())?;
+        Ok(inode)
     }
 
     /// @brief 在当前目录下，创建一个名为Name的硬链接，指向另一个IndexNode
@@ -487,7 +562,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
     fn link(&self, _name: &str, _other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
-        // 若文件系统没有实现此方法，则返回“不支持”
+        // 若文件系统没有实现此方法，则返回"不支持"
         return Err(SystemError::ENOSYS);
     }
 
@@ -498,7 +573,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
     fn unlink(&self, _name: &str) -> Result<(), SystemError> {
-        // 若文件系统没有实现此方法，则返回“不支持”
+        // 若文件系统没有实现此方法，则返回"不支持"
         return Err(SystemError::ENOSYS);
     }
 
@@ -523,8 +598,13 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _new_name: &str,
         _flag: RenameFlags,
     ) -> Result<(), SystemError> {
-        // 若文件系统没有实现此方法，则返回“不支持”
+        // 若文件系统没有实现此方法，则返回"不支持"
         return Err(SystemError::ENOSYS);
+    }
+
+    /// @brief 专用于 remote 权限模型下 access(2) 的检查
+    fn check_access(&self, _mask: PermissionMask) -> Result<(), SystemError> {
+        Err(SystemError::ENOSYS)
     }
 
     /// @brief 寻找一个名为Name的inode
@@ -534,7 +614,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
     fn find(&self, _name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
-        // 若文件系统没有实现此方法，则返回“不支持”
+        // 若文件系统没有实现此方法，则返回"不支持"
         return Err(SystemError::ENOSYS);
     }
 
@@ -545,7 +625,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
     fn get_entry_name(&self, _ino: InodeId) -> Result<String, SystemError> {
-        // 若文件系统没有实现此方法，则返回“不支持”
+        // 若文件系统没有实现此方法，则返回"不支持"
         return Err(SystemError::ENOSYS);
     }
 
@@ -573,9 +653,9 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         &self,
         _cmd: u32,
         _data: usize,
-        _private_data: &FilePrivateData,
+        _private_data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        // 若文件系统没有实现此方法，则返回“不支持”
+        // 若文件系统没有实现此方法，则返回"不支持"
         return Err(SystemError::ENOSYS);
     }
 
@@ -587,7 +667,9 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn as_any_ref(&self) -> &dyn Any;
 
     /// @brief 列出当前inode下的所有目录项的名字
-    fn list(&self) -> Result<Vec<String>, SystemError>;
+    fn list(&self) -> Result<Vec<String>, SystemError> {
+        Err(SystemError::ENOTDIR)
+    }
 
     /// # mount - 挂载文件系统
     ///
@@ -698,6 +780,21 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         self.datasync()
     }
 
+    /// @brief 基于打开文件上下文执行同步（可使用文件句柄等私有信息）
+    ///
+    /// 默认实现回退到 inode 级 `sync/datasync`。
+    fn sync_file(
+        &self,
+        datasync: bool,
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        if datasync {
+            self.datasync()
+        } else {
+            self.sync()
+        }
+    }
+
     /// @brief 仅同步数据到磁盘（不包括元数据）
     ///
     /// O_DSYNC 语义：确保数据写入完成，但不保证元数据（如 mtime）更新
@@ -705,7 +802,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn datasync(&self) -> Result<(), SystemError> {
         let page_cache = self.page_cache();
         if let Some(page_cache) = page_cache {
-            return page_cache.lock_irqsave().sync();
+            return page_cache.manager().sync();
         }
         Ok(())
     }
@@ -788,10 +885,10 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     }
 
     fn page_cache(&self) -> Option<Arc<PageCache>> {
-        log::error!(
-            "function page_cache() has not yet been implemented for inode:{}",
-            crate::libs::name::get_type_name(&self)
-        );
+        // log::warn!(
+        //     "function page_cache() has not yet been implemented for inode:{}",
+        //     crate::libs::name::get_type_name(&self)
+        // );
         None
     }
 
@@ -844,6 +941,16 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// 所以如果可以确定当前`dyn IndexNode`是`dyn Socket`类型，则可以直接调用此方法进行转换
     fn as_socket(&self) -> Option<&dyn Socket> {
         None
+    }
+
+    fn fadvise(
+        &self,
+        _file: &Arc<File>,
+        _offset: i64,
+        _len: i64,
+        _advise: i32,
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::ENOSYS)
     }
 }
 
@@ -912,20 +1019,21 @@ impl dyn IndexNode {
             return Err(SystemError::ENOTDIR);
         }
 
-        let root_inode = ProcessManager::current_mntns().root_inode();
-
-        // 获取当前进程的凭证（用于路径遍历的权限检查）
-        let cred = ProcessManager::current_pcb().cred();
+        // Linux 语义：绝对路径应当以"进程 fs root"（可被 chroot 改变）为起点
+        let process_root_inode = ProcessManager::current_pcb().fs_struct().root();
+        let trailing_slash = path.ends_with('/');
 
         // 处理绝对路径
         // result: 上一个被找到的inode
         // rest_path: 还没有查找的路径
         let (mut result, mut rest_path) = if let Some(rest) = path.strip_prefix('/') {
-            (root_inode.clone(), String::from(rest))
+            (process_root_inode.clone(), String::from(rest))
         } else {
             // 是相对路径
             (self.find(".")?, String::from(path))
         };
+
+        let mut symlink_follows_remaining = max_follow_times;
 
         // 逐级查找文件
         while !rest_path.is_empty() {
@@ -935,12 +1043,12 @@ impl dyn IndexNode {
             }
 
             // 检查当前目录的执行权限（搜索权限）
-            // 这确保了进程有权限遍历到此目录
+            // 这确保了进程有权限遍历到此目录（对 Remote 权限模型的 FS，该检查会被绕过）
             let metadata = result.metadata()?;
-            cred.inode_permission(&metadata, PermissionMask::MAY_EXEC.bits())?;
+            permission::check_inode_permission(&result, &metadata, PermissionMask::MAY_EXEC)?;
 
             let name;
-            // 寻找“/”
+            // 寻找"/"
             match rest_path.find('/') {
                 Some(pos) => {
                     name = String::from(&rest_path[0..pos]);
@@ -957,29 +1065,71 @@ impl dyn IndexNode {
                 continue;
             }
 
+            // 进程 root 边界：当解析到进程 root 时，".." 不允许逃逸，应当停留在 root。
+            // 这对应 Linux 的路径解析语义（参照 namei.c 中对 root 的处理）。
+            if name == ".." {
+                let cur_md = result.metadata()?;
+                let root_md = process_root_inode.metadata()?;
+                if cur_md.dev_id == root_md.dev_id && cur_md.inode_id == root_md.inode_id {
+                    continue;
+                }
+            }
+
             let inode = result.find(&name)?;
             let file_type = inode.metadata()?.file_type;
             // 如果已经是路径的最后一个部分，并且不希望跟随最后的符号链接
             if rest_path.is_empty() && !follow_final_symlink && file_type == FileType::SymLink {
-                // 返回符号链接本身
-                return Ok(inode);
+                // Linux 语义：若 pathname 以 '/' 结尾，则必须解析为目录，
+                // 此时即使请求"不跟随最终 symlink"，也不能返回 symlink 本身。
+                if !trailing_slash {
+                    // 返回符号链接本身
+                    return Ok(inode);
+                }
             }
 
             // 跟随符号链接跳转
-            if file_type == FileType::SymLink && max_follow_times > 0 {
+            if file_type == FileType::SymLink {
+                // 需要跟随 symlink 的场景：
+                // - symlink 位于路径中间（rest_path 非空）
+                // - 需要跟随最终 symlink（follow_final_symlink=true）
+                // - 或者 pathname 以 '/' 结尾（trailing_slash=true）
+                let need_follow = !rest_path.is_empty()
+                    || follow_final_symlink
+                    || (trailing_slash && rest_path.is_empty());
+
+                // 兼容旧语义：symlink_follows_remaining==0 表示完全不跟随 symlink。
+                // 在这种模式下，如果路径解析"需要跟随"（例如 symlink 位于中间，或末尾带 '/'），
+                // 我们保持旧行为：把 symlink 当作普通 inode 继续推进，后续通常会因非目录而 ENOTDIR。
+                if symlink_follows_remaining == 0 {
+                    result = inode;
+                    continue;
+                }
+
+                // Linux 语义：超过最大符号链接层数应返回 ELOOP。
+                // 根据上面的约定：symlink_follows_remaining==1 表示计数已耗尽，不允许再跟随。
+                if need_follow && symlink_follows_remaining == 1 {
+                    return Err(SystemError::ELOOP);
+                }
+
+                // 若不需要跟随（理论上只可能发生在"末尾 symlink + 不跟随 + 无 trailing '/'"），
+                // 则 result=inode 由循环末尾处理即可。
+                if !need_follow {
+                    result = inode;
+                    continue;
+                }
+
+                symlink_follows_remaining -= 1;
+
                 // 首先检查是否是"魔法链接"（如 /proc/self/fd/N）
                 // 这些链接的 readlink 返回的路径可能不可解析（如 pipe:[xxx]），
                 // 但它们有一个 special_node 指向真实的 inode
                 if let Some(SpecialNodeData::Reference(target_inode)) = inode.special_node() {
-                    // 如果还有剩余路径，继续在目标 inode 上查找
                     if rest_path.is_empty() {
                         return Ok(target_inode);
                     } else {
-                        return target_inode.lookup_follow_symlink2(
-                            &rest_path,
-                            max_follow_times - 1,
-                            follow_final_symlink,
-                        );
+                        // 将 result 设为 magic link 的目标 inode，继续迭代
+                        result = target_inode;
+                        continue;
                     }
                 }
 
@@ -990,7 +1140,7 @@ impl dyn IndexNode {
                     0,
                     256,
                     &mut content,
-                    SpinLock::new(FilePrivateData::Unused).lock(),
+                    Mutex::new(FilePrivateData::Unused).lock(),
                 )?;
 
                 // 将读到的数据转换为utf8字符串（先转为str，再转为String）
@@ -998,22 +1148,32 @@ impl dyn IndexNode {
                     ::core::str::from_utf8(&content[..len]).map_err(|_| SystemError::EINVAL)?,
                 );
 
-                // 拼接路径时，如果rest_path为空，则不添加斜杠
+                // 拼接路径：将 symlink 目标 + 剩余路径组合
                 let new_path = if rest_path.is_empty() {
                     link_path
                 } else {
                     link_path + "/" + &rest_path
                 };
 
-                // 继续查找符号链接
-                return result.lookup_follow_symlink2(
-                    &new_path,
-                    max_follow_times - 1,
-                    follow_final_symlink,
-                );
-            } else {
-                result = inode;
+                // 处理 symlink 目标为绝对路径或相对路径
+                // 绝对路径：从进程 root 开始
+                // 相对路径：从当前 result（symlink 所在目录）开始
+                if let Some(rest) = new_path.strip_prefix('/') {
+                    result = process_root_inode.clone();
+                    rest_path = String::from(rest);
+                } else {
+                    rest_path = new_path;
+                }
+
+                // 继续迭代（不递归）
+                continue;
             }
+
+            result = inode;
+        }
+
+        if trailing_slash && result.metadata()?.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
         }
 
         return Ok(result);
@@ -1149,12 +1309,28 @@ bitflags! {
         const DEVFS_MAGIC = 0x1373;
         const FAT_MAGIC =  0xf2f52011;
         const EXT4_MAGIC = 0xef53;
+        const FUSE_MAGIC = 0x65735546;
+        const TMPFS_MAGIC = 0x01021994;
         const KER_MAGIC = 0x3153464b;
         const PROC_MAGIC = 0x9fa0;
         const RAMFS_MAGIC = 0x858458f6;
+        const DEVPTS_MAGIC = 0x1cd1;
         const MOUNT_MAGIC = 61267;
         const PIPEFS_MAGIC = 0x50495045;
+        const EVENTFD_MAGIC = 0x45564446; // "EVDF" in ASCII
     }
+}
+
+/// Filesystem-level permission checking policy used by VFS.
+///
+/// - `Dac`: VFS performs Unix DAC permission checks (mode/uid/gid) locally.
+/// - `Remote`: VFS bypasses local DAC checks and lets the filesystem/server decide.
+///   For Linux FUSE remote model, execute permission is still checked locally for
+///   regular files; see `vfs::permission::check_inode_permission()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FsPermissionPolicy {
+    Dac,
+    Remote,
 }
 
 /// @brief 所有文件系统都应该实现的trait
@@ -1165,6 +1341,14 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     /// @brief 获取当前文件系统的信息
     fn info(&self) -> FsInfo;
 
+    /// @brief 文件系统是否支持 readahead
+    ///
+    /// 对于内存文件系统（如 tmpfs），数据已经在 page_cache 中，不需要 readahead
+    /// 对于磁盘文件系统（如 ext4、fat），需要从磁盘预读数据，应该支持 readahead
+    fn support_readahead(&self) -> bool {
+        true // 默认支持 readahead
+    }
+
     /// @brief 本函数用于实现动态转换。
     /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
     fn as_any_ref(&self) -> &dyn Any;
@@ -1173,11 +1357,26 @@ pub trait FileSystem: Any + Sync + Send + Debug {
 
     fn super_block(&self) -> SuperBlock;
 
+    /// @brief 获取文件系统统计信息（statfs）
+    ///
+    /// 默认实现直接返回 super_block。需要自定义 statfs 行为的文件系统可覆写此方法。
+    fn statfs(&self, _inode: &Arc<dyn IndexNode>) -> Result<SuperBlock, SystemError> {
+        Ok(self.super_block())
+    }
+
+    /// VFS permission checking policy for this filesystem instance.
+    ///
+    /// Default is `Dac` (local Unix DAC checks).
+    fn permission_policy(&self) -> FsPermissionPolicy {
+        FsPermissionPolicy::Dac
+    }
+
+    /// Called after a filesystem is successfully unmounted.
+    /// Default is no-op.
+    fn on_umount(&self) {}
+
     unsafe fn fault(&self, _pfm: &mut PageFaultMessage) -> VmFaultReason {
-        panic!(
-            "fault() has not yet been implemented for filesystem: {}",
-            crate::libs::name::get_type_name(&self)
-        )
+        VmFaultReason::VM_FAULT_SIGBUS
     }
 
     unsafe fn map_pages(
@@ -1244,19 +1443,20 @@ macro_rules! register_mountable_fs {
         }
 
         #[distributed_slice(FSMAKER)]
-        static $maker_name: FileSystemMaker = FileSystemMaker::new(
-            $fs_name,
-            &($fs::make_fs_bridge
-                as fn(
-                    Option<&dyn FileSystemMakerData>,
-                ) -> Result<Arc<dyn FileSystem + 'static>, SystemError>),
-            &($fs::make_mount_data_bridge
-                as fn(
-                    Option<&str>,
-                    &str,
-                )
-                    -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError>),
-        );
+        static $maker_name: $crate::filesystem::vfs::FileSystemMaker =
+            $crate::filesystem::vfs::FileSystemMaker::new(
+                $fs_name,
+                &($fs::make_fs_bridge
+                    as fn(
+                        Option<&dyn FileSystemMakerData>,
+                    ) -> Result<Arc<dyn FileSystem + 'static>, SystemError>),
+                &($fs::make_mount_data_bridge
+                    as fn(
+                        Option<&str>,
+                        &str,
+                    )
+                        -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError>),
+            );
     };
 }
 
@@ -1360,7 +1560,13 @@ pub fn produce_fs(
     data: Option<&str>,
     source: &str,
 ) -> Result<Arc<dyn FileSystem>, SystemError> {
-    match FSMAKER.iter().find(|&m| m.name == filesystem) {
+    let canonical_filesystem = if filesystem.starts_with("fuse.") {
+        "fuse"
+    } else {
+        filesystem
+    };
+
+    match FSMAKER.iter().find(|&m| m.name == canonical_filesystem) {
         Some(maker) => {
             let mount_data = (maker.builder)(data, source)?;
             let mount_data_ref = mount_data.as_ref().map(|arc| arc.as_ref());
@@ -1447,14 +1653,6 @@ impl<'a> FilldirContext<'a> {
 
         // 获取当前写入位置的偏移量
         let buf_start = self.current_pos;
-        // 清零缓冲区（确保对齐部分为0）
-        // 如果清零失败（例如访问不可写页面），视为缓冲区空间不足
-        if let Err(_e) = self.user_buf.clear_range(buf_start, align_up_reclen) {
-            // 将 EFAULT 或其他写入错误转换为 EINVAL，表示缓冲区空间不足
-            // 这样 read_dir 会正常返回，而不是传播错误
-            self.error = Some(SystemError::EINVAL);
-            return Err(SystemError::EINVAL);
-        }
         // 在内核空间构建完整的 dirent 数据
         let mut dirent_data = vec![0u8; align_up_reclen];
 
@@ -1508,12 +1706,10 @@ impl<'a> FilldirContext<'a> {
             }
         }
         // 使用受保护的方法写入用户缓冲区
-        // 如果写入失败（例如访问不可写页面），视为缓冲区空间不足
+        // 如果写入失败（例如访问不可写页面），应当返回 EFAULT
         if let Err(_e) = self.user_buf.write_to_user(buf_start, &dirent_data) {
-            // 将 EFAULT 或其他写入错误转换为 EINVAL，表示缓冲区空间不足
-            // 这样 read_dir 会正常返回，而不是传播错误
-            self.error = Some(SystemError::EINVAL);
-            return Err(SystemError::EINVAL);
+            self.error = Some(SystemError::EFAULT);
+            return Err(SystemError::EFAULT);
         }
         // 更新位置
         self.current_pos += align_up_reclen;

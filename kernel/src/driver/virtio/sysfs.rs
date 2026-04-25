@@ -196,14 +196,12 @@ impl VirtIODeviceManager {
         dev.set_virtio_device_index(virtio_index);
         dev.set_device_name(format!("virtio{}", virtio_index.data()));
 
-        log::debug!("virtio_device_add: dev: {:?}", dev.name());
+        // log::debug!("virtio_device_add: dev: {:?}", dev.name());
+        self.setup_irq(&dev)?;
         // 添加设备到设备管理器
         device_manager().add_device(dev.clone() as Arc<dyn Device>)?;
         let r = device_manager()
             .add_groups(&(dev.clone() as Arc<dyn Device>), &[&VirtIODeviceAttrGroup]);
-        log::debug!("virtio_device_add: to setup irq");
-        self.setup_irq(&dev).ok();
-        log::debug!("virtio_device_add: setup irq done");
 
         return r;
     }
@@ -212,7 +210,11 @@ impl VirtIODeviceManager {
     ///
     /// 为virtio设备设置中断。
     fn setup_irq(&self, dev: &Arc<dyn VirtIODevice>) -> Result<(), SystemError> {
-        let irq = dev.irq().ok_or(SystemError::EINVAL)?;
+        let irq = dev.irq();
+        if irq.is_none() {
+            return Ok(());
+        }
+        let irq = irq.unwrap();
         if let Err(e) = irq_manager().request_irq(
             irq,
             dev.device_name(),

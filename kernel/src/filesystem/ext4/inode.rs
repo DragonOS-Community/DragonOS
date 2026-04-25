@@ -1,15 +1,18 @@
 use crate::{
+    driver::base::device::device_number::DeviceNumber,
     filesystem::{
-        page_cache::PageCache,
+        page_cache::{AsyncPageCacheBackend, PageCache},
         vfs::{
-            self, utils::DName, vcore::generate_inode_id, FilePrivateData, IndexNode, InodeFlags,
-            InodeId, InodeMode,
+            self, syscall::RenameFlags, utils::DName, vcore::generate_inode_id, FilePrivateData,
+            IndexNode, InodeFlags, InodeId, InodeMode, SpecialNodeData,
         },
     },
+    ipc::pipe::LockedPipeInode,
     libs::{
         casting::DowncastArc,
-        spinlock::{SpinLock, SpinLockGuard},
+        mutex::{Mutex, MutexGuard},
     },
+    mm::truncate::truncate_inode_pages,
     time::PosixTimeSpec,
 };
 use alloc::{
@@ -25,7 +28,7 @@ use system_error::SystemError;
 
 use super::filesystem::Ext4FileSystem;
 
-type PrivateData<'a> = crate::libs::spinlock::SpinLockGuard<'a, vfs::FilePrivateData>;
+type PrivateData<'a> = crate::libs::mutex::MutexGuard<'a, vfs::FilePrivateData>;
 
 pub struct Ext4Inode {
     // 对应another_ext4里面的inode号，用于在ext4文件系统中查找相应的inode
@@ -37,15 +40,34 @@ pub struct Ext4Inode {
 
     // 对应vfs的inode id，用于标识系统中唯一的inode
     pub(super) vfs_inode_id: InodeId,
+
+    // 指向父级IndexNode的Weak指针
+    pub(super) parent: Weak<LockedExt4Inode>,
+
+    // 指向自身的Weak指针，用于获取Arc<Self>
+    pub(super) self_ref: Weak<LockedExt4Inode>,
+
+    // 特殊节点数据（用于 FIFO 的 pipe inode）
+    pub(super) special_node: Option<SpecialNodeData>,
+
+    /// 缓存的文件大小，避免频繁调用 getattr/setattr。
+    /// None 表示未初始化（第一次写时从磁盘读取并缓存）。
+    pub(super) cached_file_size: Option<u64>,
+    /// 标记是否有未刷回磁盘的元数据变更（file_size/mtime）
+    pub(super) metadata_dirty: bool,
 }
 
 #[derive(Debug)]
-pub struct LockedExt4Inode(pub(super) SpinLock<Ext4Inode>);
+pub struct LockedExt4Inode(pub(super) Mutex<Ext4Inode>);
 
 impl IndexNode for LockedExt4Inode {
+    fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
+        Ok(())
+    }
+
     fn open(
         &self,
-        _data: crate::libs::spinlock::SpinLockGuard<vfs::FilePrivateData>,
+        _data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
         _mode: &vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
@@ -60,14 +82,24 @@ impl IndexNode for LockedExt4Inode {
         let mut guard = self.0.lock();
         // another_ext4的高4位是文件类型，低12位是权限
         let file_mode = InodeMode::from(file_type).union(mode);
+        let file_mode = another_ext4::InodeMode::from_bits_truncate(file_mode.bits() as u16);
         let ext4 = &guard.concret_fs().fs;
-        let id = ext4.create(
-            guard.inner_inode_num,
-            name,
-            another_ext4::InodeMode::from_bits_truncate(file_mode.bits() as u16),
-        )?;
+
+        let id = if file_type == vfs::FileType::Dir {
+            ext4.mkdir(guard.inner_inode_num, name, file_mode)?
+        } else {
+            ext4.create(guard.inner_inode_num, name, file_mode)?
+        };
+
         let dname = DName::from(name);
-        let inode = LockedExt4Inode::new(id, guard.fs_ptr.clone(), dname.clone());
+        // 通过self_ref获取Arc<Self>，然后转换为Arc<dyn IndexNode>
+        let self_arc = guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+        let inode = LockedExt4Inode::new(
+            id,
+            guard.fs_ptr.clone(),
+            dname.clone(),
+            Some(Arc::downgrade(&self_arc)),
+        );
         // 更新 children 缓存
         guard.children.insert(dname, inode.clone());
         drop(guard);
@@ -95,42 +127,38 @@ impl IndexNode for LockedExt4Inode {
         buf: &mut [u8],
         data: PrivateData,
     ) -> Result<usize, SystemError> {
-        let guard = self.0.lock();
-
         let len = core::cmp::min(len, buf.len());
         let buf = &mut buf[0..len];
-        let ext4 = &guard.concret_fs().fs;
-        if let Some(page_cache) = &guard.page_cache {
-            let time = PosixTimeSpec::now().tv_sec.to_u32().unwrap_or_else(|| {
-                log::warn!("Failed to get current time, using 0");
-                0
-            });
-            ext4.setattr(
-                guard.inner_inode_num,
-                None,
-                None,
-                None,
-                None,
-                Some(time),
-                None,
-                None,
-                None,
-            )
-            .map_err(SystemError::from)?;
-            page_cache.lock_irqsave().read(offset, buf)
+
+        // 关键修复：不要在持有 Ext4 inode 自旋锁期间调用 PageCache::{read,write}。
+        // PageCache 读写路径内部会调用 inode.metadata() 获取文件大小：
+        // - prepare_read(): inode.metadata()
+        // 若此处持有 inode 锁，则会在 metadata() 再次尝试获取同一把锁而自旋死锁。
+        let page_cache = {
+            let guard = self.0.lock();
+            guard.page_cache.clone()
+        };
+
+        if let Some(page_cache) = page_cache {
+            // 性能优化：不再每次 read 都同步更新 atime 到磁盘。
+            // 这等同于 Linux 的 noatime 挂载选项，避免每次读取引发
+            // read_inode + write_inode 的额外磁盘 I/O。
+            page_cache.read(offset, buf)
         } else {
             self.read_direct(offset, len, buf, data)
         }
     }
 
     fn read_sync(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let guard = self.0.lock();
-        let ext4 = &guard.concret_fs().fs;
-        let inode_num = guard.inner_inode_num;
-        match ext4.getattr(inode_num)?.ftype {
+        let (fs, inode_num) = {
+            let guard = self.0.lock();
+            (guard.concret_fs(), guard.inner_inode_num)
+        };
+        match fs.fs.getattr(inode_num)?.ftype {
             FileType::Directory => Err(SystemError::EISDIR),
             FileType::Unknown => Err(SystemError::EROFS),
-            FileType::RegularFile => ext4.read(inode_num, offset, buf).map_err(From::from),
+            FileType::RegularFile => fs.fs.read(inode_num, offset, buf).map_err(From::from),
+            FileType::SymLink => fs.fs.readlink(inode_num, offset, buf).map_err(From::from),
             _ => Err(SystemError::EINVAL),
         }
     }
@@ -140,7 +168,7 @@ impl IndexNode for LockedExt4Inode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: crate::libs::spinlock::SpinLockGuard<vfs::FilePrivateData>,
+        _data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let len = core::cmp::min(len, buf.len());
         self.read_sync(offset, &mut buf[0..len])
@@ -153,30 +181,74 @@ impl IndexNode for LockedExt4Inode {
         buf: &[u8],
         data: PrivateData,
     ) -> Result<usize, SystemError> {
-        let guard = self.0.lock();
-        let ext4 = &guard.concret_fs().fs;
         let len = core::cmp::min(len, buf.len());
         let buf = &buf[0..len];
-        if let Some(page_cache) = &guard.page_cache {
-            let write_len = page_cache.lock_irqsave().write(offset, buf)?;
-            let old_file_size = ext4.getattr(guard.inner_inode_num)?.size;
-            let current_file_size = core::cmp::max(old_file_size, (offset + write_len) as u64);
-            let time = PosixTimeSpec::now().tv_sec.to_u32().unwrap_or_else(|| {
-                log::warn!("Failed to get current time, using 0");
-                0
-            });
-            ext4.setattr(
+
+        let (fs, inode_num, page_cache, old_cached_size) = {
+            let guard = self.0.lock();
+            (
+                guard.concret_fs(),
                 guard.inner_inode_num,
-                None,
-                None,
-                None,
-                Some(current_file_size),
-                None,
-                Some(time),
-                None,
-                None,
+                guard.page_cache.clone(),
+                guard.cached_file_size,
             )
-            .map_err(SystemError::from)?;
+        };
+
+        if let Some(page_cache) = page_cache {
+            // 使用缓存的文件大小，避免 getattr 磁盘 I/O
+            let old_file_size = match old_cached_size {
+                Some(size) => size,
+                None => {
+                    let size = fs.fs.getattr(inode_num)?.size;
+                    self.0.lock().cached_file_size = Some(size);
+                    size
+                }
+            };
+
+            let new_end = (offset + len) as u64;
+            let current_file_size = core::cmp::max(old_file_size, new_end);
+
+            // Two-phase write protocol that decouples block allocation from i_size:
+            //
+            // Phase 1 – Pre-allocate disk blocks WITHOUT updating i_size.
+            //   Ensures the async writeback thread can always find extent
+            //   mappings, avoiding the EIO that would occur if page-cache pages
+            //   were dirtied before blocks existed.
+            //
+            // Phase 2 – Commit i_size BEFORE writing page cache.
+            //   Must complete before PageCache::write so that concurrent
+            //   writeback (flush_dirty_pages / writeback_entry) sees the
+            //   correct file size and does not race with our disk I/O.
+            //   If commit_inode_size fails, no dirty pages exist yet → clean.
+            //   If PageCache::write later fails, i_size is already extended
+            //   but the extended region reads as zeros – same as old setattr
+            //   behaviour and acceptable since PageCache::write only fails on
+            //   OOM.
+            let extending = new_end > old_file_size;
+            if extending {
+                fs.fs
+                    .allocate_blocks_for_write(inode_num, current_file_size)
+                    .map_err(SystemError::from)?;
+
+                let time = PosixTimeSpec::now().tv_sec.to_u32().unwrap_or_else(|| {
+                    log::warn!("Failed to get current time, using 0");
+                    0
+                });
+                fs.fs
+                    .commit_inode_size(inode_num, current_file_size, Some(time))
+                    .map_err(SystemError::from)?;
+            }
+
+            // 磁盘块已就绪、i_size 已更新，现在安全写入 page cache
+            let write_len = PageCache::write(&page_cache, offset, buf)?;
+
+            // 更新内存中的缓存大小
+            {
+                let mut guard = self.0.lock();
+                guard.cached_file_size = Some(current_file_size);
+                guard.metadata_dirty = true;
+            }
+
             Ok(write_len)
         } else {
             self.write_direct(offset, len, buf, data)
@@ -184,13 +256,22 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn write_sync(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
-        let guard = self.0.lock();
-        let ext4 = &guard.concret_fs().fs;
-        let inode_num = guard.inner_inode_num;
-        match ext4.getattr(inode_num)?.ftype {
+        let (fs, inode_num) = {
+            let guard = self.0.lock();
+            (guard.concret_fs(), guard.inner_inode_num)
+        };
+        match fs.fs.getattr(inode_num)?.ftype {
             FileType::Directory => Err(SystemError::EISDIR),
             FileType::Unknown => Err(SystemError::EROFS),
-            FileType::RegularFile => ext4.write(inode_num, offset, buf).map_err(From::from),
+            // Use write_data_only: blocks are pre-allocated by allocate_blocks_for_write() in write_at().
+            // Using Ext4::write() here would cause it to call write_inode_with_csum()
+            // which overwrites the inode's block_count/extent tree with a stale
+            // snapshot, causing setattr to re-allocate blocks endlessly until
+            // the extent tree overflows (entries > max_entries → EIO).
+            FileType::RegularFile => fs
+                .fs
+                .write_data_only(inode_num, offset, buf)
+                .map_err(From::from),
             _ => Err(SystemError::EINVAL),
         }
     }
@@ -200,7 +281,7 @@ impl IndexNode for LockedExt4Inode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let len = core::cmp::min(len, buf.len());
         self.write_sync(offset, &buf[0..len])
@@ -221,9 +302,29 @@ impl IndexNode for LockedExt4Inode {
             return Ok(child.clone() as Arc<dyn IndexNode>);
         }
         let next_inode = guard.concret_fs().fs.lookup(guard.inner_inode_num, name)?;
-        let inode = LockedExt4Inode::new(next_inode, guard.fs_ptr.clone(), dname.clone());
+        // 通过self_ref获取Arc<Self>，然后转换为Arc<dyn IndexNode>
+        let self_arc = guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+        let inode = LockedExt4Inode::new(
+            next_inode,
+            guard.fs_ptr.clone(),
+            dname.clone(),
+            Some(Arc::downgrade(&self_arc)),
+        );
         guard.children.insert(dname, inode.clone());
         Ok(inode)
+    }
+
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        // 只有目录才有父目录的概念
+        // 先检查当前inode是否为目录
+        let guard = self.0.lock();
+
+        // 如果存储了父级指针，直接返回
+        if let Some(parent) = guard.parent.upgrade() {
+            return Ok(parent);
+        }
+
+        Err(SystemError::ENOENT)
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
@@ -245,10 +346,7 @@ impl IndexNode for LockedExt4Inode {
             .clone()
             .downcast_arc::<LockedExt4Inode>()
             .ok_or(SystemError::EINVAL)?;
-        let other = other
-            .downcast_ref::<LockedExt4Inode>()
-            .ok_or(SystemError::EPERM)?;
-        let other_inode_num = other.0.lock().inner_inode_num;
+        let other_inode_num = other_arc.0.lock().inner_inode_num;
 
         let my_attr = ext4.getattr(inode_num)?;
         let other_attr = ext4.getattr(other_inode_num)?;
@@ -288,12 +386,32 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn metadata(&self) -> Result<vfs::Metadata, SystemError> {
-        let guard = self.0.lock();
-        let ext4 = &guard.concret_fs().fs;
-        let attr = ext4.getattr(guard.inner_inode_num)?;
-        let raw_dev = guard.fs_ptr.upgrade().unwrap().raw_dev;
+        let (fs, inode_num, vfs_inode_id) = {
+            let guard = self.0.lock();
+            (
+                guard.concret_fs(),
+                guard.inner_inode_num,
+                guard.vfs_inode_id,
+            )
+        };
+        let attr = fs.fs.getattr(inode_num)?;
+
+        // dev_id: filesystem device number (st_dev)
+        let dev_id = fs.raw_dev.data() as usize;
+
+        // raw_dev: device node's rdev (st_rdev), only for char/block devices
+        let raw_dev = if matches!(attr.ftype, FileType::CharacterDev | FileType::BlockDev) {
+            let (major, minor) = attr.rdev;
+            DeviceNumber::new(
+                crate::driver::base::device::device_number::Major::new(major),
+                minor,
+            )
+        } else {
+            DeviceNumber::default()
+        };
+
         Ok(vfs::Metadata {
-            inode_id: guard.vfs_inode_id,
+            inode_id: vfs_inode_id,
             size: attr.size as i64,
             blk_size: another_ext4::BLOCK_SIZE,
             blocks: attr.blocks as usize,
@@ -307,12 +425,46 @@ impl IndexNode for LockedExt4Inode {
             nlinks: attr.links as usize,
             uid: attr.uid as usize,
             gid: attr.gid as usize,
-            dev_id: 0,
+            dev_id,
             raw_dev,
         })
     }
 
     fn close(&self, _: PrivateData) -> Result<(), SystemError> {
+        // 在 close 时刷回延迟的元数据更新（mtime 等）
+        let (fs, inode_num, dirty, cached_size) = {
+            let mut guard = self.0.lock();
+            let dirty = guard.metadata_dirty;
+            let cached_size = guard.cached_file_size;
+            if dirty {
+                guard.metadata_dirty = false;
+            }
+            (
+                guard.concret_fs(),
+                guard.inner_inode_num,
+                dirty,
+                cached_size,
+            )
+        };
+        if dirty {
+            let time = PosixTimeSpec::now().tv_sec.to_u32().unwrap_or_else(|| {
+                log::warn!("Failed to get current time, using 0");
+                0
+            });
+            let _ = fs.fs.setattr(
+                inode_num,
+                another_ext4::SetAttr {
+                    mode: None,
+                    uid: None,
+                    gid: None,
+                    size: cached_size,
+                    atime: None,
+                    mtime: Some(time),
+                    ctime: None,
+                    crtime: None,
+                },
+            );
+        }
         Ok(())
     }
 
@@ -330,16 +482,18 @@ impl IndexNode for LockedExt4Inode {
         let ext4 = &guard.concret_fs().fs;
         ext4.setattr(
             guard.inner_inode_num,
-            Some(another_ext4::InodeMode::from_bits_truncate(
-                mode.bits() as u16
-            )),
-            Some(metadata.uid as u32),
-            Some(metadata.gid as u32),
-            Some(metadata.size as u64),
-            Some(to_ext4_time(&metadata.atime)),
-            Some(to_ext4_time(&metadata.mtime)),
-            Some(to_ext4_time(&metadata.ctime)),
-            Some(to_ext4_time(&metadata.btime)),
+            another_ext4::SetAttr {
+                mode: Some(another_ext4::InodeMode::from_bits_truncate(
+                    mode.bits() as u16
+                )),
+                uid: Some(metadata.uid as u32),
+                gid: Some(metadata.gid as u32),
+                size: Some(metadata.size as u64),
+                atime: Some(to_ext4_time(&metadata.atime)),
+                mtime: Some(to_ext4_time(&metadata.mtime)),
+                ctime: Some(to_ext4_time(&metadata.ctime)),
+                crtime: Some(to_ext4_time(&metadata.btime)),
+            },
         )?;
 
         Ok(())
@@ -351,16 +505,21 @@ impl IndexNode for LockedExt4Inode {
         // 仅调整文件大小，其他属性保持不变
         ext4.setattr(
             guard.inner_inode_num,
-            None,
-            None,
-            None,
-            Some(len as u64),
-            None,
-            None,
-            None,
-            None,
+            another_ext4::SetAttr {
+                mode: None,
+                uid: None,
+                gid: None,
+                size: Some(len as u64),
+                atime: None,
+                mtime: None,
+                ctime: None,
+                crtime: None,
+            },
         )
         .map_err(SystemError::from)?;
+        drop(guard);
+        // 更新缓存的文件大小
+        self.0.lock().cached_file_size = Some(len as u64);
         Ok(())
     }
 
@@ -434,21 +593,289 @@ impl IndexNode for LockedExt4Inode {
 
         Ok(0)
     }
+
+    fn mknod(
+        &self,
+        filename: &str,
+        mode: InodeMode,
+        dev_t: DeviceNumber,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        if mode.contains(InodeMode::S_IFREG) {
+            return self.create(filename, vfs::FileType::File, mode);
+        }
+
+        let mut guard = self.0.lock();
+        let ext4 = &guard.concret_fs().fs;
+        let inode_num = guard.inner_inode_num;
+
+        if ext4.getattr(inode_num)?.ftype != FileType::Directory {
+            return Err(SystemError::ENOTDIR);
+        }
+
+        // VFS InodeMode(u32) → another_ext4 InodeMode(u16)
+        let file_mode = another_ext4::InodeMode::from_bits_truncate(mode.bits() as u16);
+
+        // Create inode based on file type
+        let id = if mode.contains(InodeMode::S_IFCHR) || mode.contains(InodeMode::S_IFBLK) {
+            // Character/block device: use mknod to store device number in i_block
+            ext4.mknod(
+                inode_num,
+                filename,
+                file_mode,
+                dev_t.major().data(),
+                dev_t.minor(),
+            )?
+        } else {
+            // FIFO, Socket, etc.: use regular create (no device number needed)
+            ext4.create(inode_num, filename, file_mode)?
+        };
+
+        // Wrap as VFS inode and cache
+        let dname = DName::from(filename);
+        let self_arc = guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+        let inode = LockedExt4Inode::new(
+            id,
+            guard.fs_ptr.clone(),
+            dname.clone(),
+            Some(Arc::downgrade(&self_arc)),
+        );
+        guard.children.insert(dname, inode.clone());
+        drop(guard);
+        Ok(inode as Arc<dyn IndexNode>)
+    }
+
+    fn special_node(&self) -> Option<SpecialNodeData> {
+        self.0.lock().special_node.clone()
+    }
+
+    fn move_to(
+        &self,
+        old_name: &str,
+        target: &Arc<dyn IndexNode>,
+        new_name: &str,
+        flags: RenameFlags,
+    ) -> Result<(), SystemError> {
+        let target_locked = target
+            .clone()
+            .downcast_arc::<LockedExt4Inode>()
+            .ok_or(SystemError::EXDEV)?;
+
+        let (ext4_fs, src_inode_num) = {
+            let guard = self.0.lock();
+            (guard.concret_fs(), guard.inner_inode_num)
+        };
+        let ext4 = &ext4_fs.fs;
+        let target_inode_num = target_locked.0.lock().inner_inode_num;
+
+        let old_dname = DName::from(old_name);
+        let new_dname = DName::from(new_name);
+
+        // Same directory, same name -> no-op
+        if src_inode_num == target_inode_num && old_dname == new_dname {
+            return Ok(());
+        }
+
+        // NOREPLACE check (VFS layer responsibility - ext4 lib doesn't know about flags)
+        if flags.contains(RenameFlags::NOREPLACE) && ext4.lookup(target_inode_num, new_name).is_ok()
+        {
+            return Err(SystemError::EEXIST);
+        }
+
+        // RENAME_EXCHANGE: 原子交换两个文件/目录
+        if flags.contains(RenameFlags::EXCHANGE) {
+            // VFS 层已验证目标存在，直接调用 exchange
+            ext4.rename_exchange(src_inode_num, old_name, target_inode_num, new_name)?;
+
+            // 更新缓存：交换两个条目
+            self.update_exchange_cache(
+                &target_locked,
+                src_inode_num,
+                target_inode_num,
+                &old_dname,
+                &new_dname,
+            );
+            return Ok(());
+        }
+
+        // Check if target exists (for cache update and page cache cleanup)
+        let had_dst = ext4.lookup(target_inode_num, new_name).is_ok();
+
+        // Clear target's page cache if it exists and is a file
+        if had_dst {
+            if let Ok(target_inode) = target_locked.find(new_name) {
+                if let Some(pc) = target_inode.page_cache() {
+                    truncate_inode_pages(pc, 0);
+                }
+            }
+        }
+
+        // ext4 library now correctly handles atomic replace
+        ext4.rename(src_inode_num, old_name, target_inode_num, new_name)?;
+
+        // Update cache
+        self.update_rename_cache(
+            &target_locked,
+            src_inode_num,
+            target_inode_num,
+            &old_dname,
+            &new_dname,
+            had_dst,
+        );
+        Ok(())
+    }
 }
 
 impl LockedExt4Inode {
+    /// 更新 rename 后的缓存
+    fn update_rename_cache(
+        &self,
+        target: &Arc<LockedExt4Inode>,
+        src_dir: u32,
+        dst_dir: u32,
+        old_dname: &DName,
+        new_dname: &DName,
+        had_dst: bool,
+    ) {
+        if src_dir == dst_dir {
+            let mut guard = self.0.lock();
+            if had_dst {
+                guard.children.remove(new_dname);
+            }
+            if let Some(child) = guard.children.remove(old_dname) {
+                child.0.lock().dname = new_dname.clone();
+                guard.children.insert(new_dname.clone(), child);
+            }
+        } else {
+            let (mut src_guard, mut dst_guard) = if src_dir < dst_dir {
+                (self.0.lock(), target.0.lock())
+            } else {
+                let d = target.0.lock();
+                let s = self.0.lock();
+                (s, d)
+            };
+
+            if had_dst {
+                dst_guard.children.remove(new_dname);
+            }
+            if let Some(child) = src_guard.children.remove(old_dname) {
+                dst_guard.children.insert(new_dname.clone(), child.clone());
+                drop(src_guard);
+                drop(dst_guard);
+                let mut child_guard = child.0.lock();
+                child_guard.dname = new_dname.clone();
+                child_guard.parent = Arc::downgrade(target);
+            }
+        }
+    }
+
+    /// 更新 exchange 后的缓存：交换两个条目
+    fn update_exchange_cache(
+        &self,
+        target: &Arc<LockedExt4Inode>,
+        src_dir: u32,
+        dst_dir: u32,
+        old_dname: &DName,
+        new_dname: &DName,
+    ) {
+        if src_dir == dst_dir {
+            // 同目录交换
+            let mut guard = self.0.lock();
+            let old_child = guard.children.remove(old_dname);
+            let new_child = guard.children.remove(new_dname);
+
+            if let Some(child) = old_child {
+                child.0.lock().dname = new_dname.clone();
+                guard.children.insert(new_dname.clone(), child);
+            }
+            if let Some(child) = new_child {
+                child.0.lock().dname = old_dname.clone();
+                guard.children.insert(old_dname.clone(), child);
+            }
+        } else {
+            // 跨目录交换
+            let (mut src_guard, mut dst_guard) = if src_dir < dst_dir {
+                (self.0.lock(), target.0.lock())
+            } else {
+                let d = target.0.lock();
+                let s = self.0.lock();
+                (s, d)
+            };
+
+            let old_child = src_guard.children.remove(old_dname);
+            let new_child = dst_guard.children.remove(new_dname);
+
+            // old_child 移到 target 目录
+            if let Some(child) = old_child {
+                dst_guard.children.insert(new_dname.clone(), child.clone());
+                drop(src_guard);
+                drop(dst_guard);
+
+                let mut child_guard = child.0.lock();
+                child_guard.dname = new_dname.clone();
+                child_guard.parent = Arc::downgrade(target);
+                drop(child_guard);
+
+                // 重新获取锁处理 new_child
+                if let Some(new_c) = new_child {
+                    let mut src_guard = self.0.lock();
+                    src_guard.children.insert(old_dname.clone(), new_c.clone());
+                    drop(src_guard);
+
+                    let mut new_c_guard = new_c.0.lock();
+                    new_c_guard.dname = old_dname.clone();
+                    new_c_guard.parent = self.0.lock().self_ref.clone();
+                }
+            } else if let Some(new_c) = new_child {
+                // 只有 new_child 在缓存中
+                src_guard.children.insert(old_dname.clone(), new_c.clone());
+                drop(src_guard);
+                drop(dst_guard);
+
+                let mut new_c_guard = new_c.0.lock();
+                new_c_guard.dname = old_dname.clone();
+                new_c_guard.parent = self.0.lock().self_ref.clone();
+            }
+        }
+    }
+
     pub fn new(
         inode_num: u32,
         fs_ptr: Weak<super::filesystem::Ext4FileSystem>,
         dname: DName,
+        parent: Option<Weak<LockedExt4Inode>>,
     ) -> Arc<Self> {
-        let inode = Arc::new(LockedExt4Inode(SpinLock::new(Ext4Inode::new(
-            inode_num, fs_ptr, dname,
-        ))));
+        let inode = Arc::new({
+            LockedExt4Inode(Mutex::new(Ext4Inode::new(
+                inode_num,
+                fs_ptr.clone(),
+                dname,
+                parent,
+            )))
+        });
         let mut guard = inode.0.lock();
 
-        let page_cache = PageCache::new(Some(Arc::downgrade(&inode) as Weak<dyn IndexNode>));
+        // 设置self_ref
+        guard.self_ref = Arc::downgrade(&inode);
+
+        let backend = Arc::new(AsyncPageCacheBackend::new(
+            Arc::downgrade(&inode) as Weak<dyn IndexNode>
+        ));
+        let page_cache = PageCache::new(
+            Some(Arc::downgrade(&inode) as Weak<dyn IndexNode>),
+            Some(backend),
+        );
         guard.page_cache = Some(page_cache);
+
+        // 对于 FIFO，创建 pipe inode
+        if let Some(fs) = fs_ptr.upgrade() {
+            if let Ok(attr) = fs.fs.getattr(inode_num) {
+                if attr.ftype == FileType::Fifo {
+                    let pipe_inode = LockedPipeInode::new();
+                    pipe_inode.set_fifo();
+                    guard.special_node = Some(SpecialNodeData::Pipe(pipe_inode));
+                }
+            }
+        }
 
         drop(guard);
         return inode;
@@ -478,7 +905,12 @@ impl Ext4Inode {
             .expect("Ext4FileSystem should be alive")
     }
 
-    pub fn new(inode_num: u32, fs_ptr: Weak<Ext4FileSystem>, dname: DName) -> Self {
+    pub fn new(
+        inode_num: u32,
+        fs_ptr: Weak<Ext4FileSystem>,
+        dname: DName,
+        parent: Option<Weak<LockedExt4Inode>>,
+    ) -> Self {
         Self {
             inner_inode_num: inode_num,
             fs_ptr,
@@ -486,6 +918,11 @@ impl Ext4Inode {
             children: BTreeMap::new(),
             dname,
             vfs_inode_id: generate_inode_id(),
+            parent: parent.unwrap_or_default(),
+            self_ref: Weak::new(), // 将在LockedExt4Inode::new()中设置
+            special_node: None,
+            cached_file_size: None,
+            metadata_dirty: false,
         }
     }
 }

@@ -1,12 +1,12 @@
 use crate::{
     filesystem::vfs::{
-        mount::{MountFlags, MountList, MountPath},
+        mount::{MountFSInode, MountFlags, MountList, MountPath},
         FileSystem, IndexNode, InodeId, MountFS,
     },
     libs::{once::Once, spinlock::SpinLock},
     process::{fork::CloneFlags, namespace::NamespaceType, ProcessManager},
 };
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
@@ -66,9 +66,11 @@ impl MntNamespace {
         let ramfs = MountFS::new(
             ramfs,
             None,
+            None,
             MountPropagation::new_private(),
             None,
             MountFlags::empty(),
+            None,
         );
 
         let result = Arc::new_cyclic(|self_ref| Self {
@@ -103,6 +105,99 @@ impl MntNamespace {
         inner_guard.mount_list.insert(None, path, new_root);
 
         // update mount list ino
+    }
+
+    pub fn pivot_root(
+        &self,
+        new_root: Arc<MountFS>,
+        put_old_mountpoint: Arc<MountFSInode>,
+        old_new_root_path: &str,
+        old_put_old_path: &str,
+        new_put_old_path: &str,
+    ) -> Result<(), SystemError> {
+        let old_root = self.root_mountfs.clone();
+        let old_root_mountpoint = old_root.self_mountpoint();
+        let new_root_mountpoint = new_root.self_mountpoint().ok_or(SystemError::EINVAL)?;
+        let new_root_parent = new_root_mountpoint.mount_fs();
+        let put_old_parent = put_old_mountpoint.mount_fs();
+        let put_old_is_new_root = old_put_old_path == old_new_root_path;
+        let new_root_mountpoint_id = new_root_mountpoint.inode_id()?;
+        let put_old_mountpoint_id = put_old_mountpoint.inode_id()?;
+
+        {
+            let put_old_mounts = put_old_parent.mountpoints();
+            if put_old_mounts.contains_key(&put_old_mountpoint_id) {
+                return Err(SystemError::EBUSY);
+            }
+        }
+
+        {
+            let mut parent_mounts = new_root_parent.mountpoints();
+            parent_mounts
+                .remove(&new_root_mountpoint_id)
+                .ok_or(SystemError::EINVAL)?;
+        }
+
+        old_root.set_self_mountpoint(Some(put_old_mountpoint.clone()));
+        {
+            let mut put_old_mounts = put_old_parent.mountpoints();
+            if put_old_mounts
+                .insert(put_old_mountpoint_id, old_root.clone())
+                .is_some()
+            {
+                old_root.set_self_mountpoint(old_root_mountpoint);
+                new_root_parent
+                    .add_mount(new_root_mountpoint_id, new_root.clone())
+                    .map_err(|_| SystemError::EBUSY)?;
+                return Err(SystemError::EBUSY);
+            }
+        }
+
+        new_root.set_self_mountpoint(None);
+
+        let inner_guard = self.inner.lock();
+        let ptr = self as *const Self as *mut Self;
+        let self_mut = unsafe { (ptr).as_mut().unwrap() };
+        self_mut.root_mountfs = new_root.clone();
+
+        inner_guard.mount_list.remove("/");
+        if put_old_is_new_root {
+            inner_guard.mount_list.rewrite_paths(|path| {
+                if path == old_new_root_path || path_is_under(path, old_new_root_path) {
+                    return Some(rewrite_pivot_path(
+                        path,
+                        old_new_root_path,
+                        new_put_old_path,
+                    ));
+                }
+
+                None
+            });
+            inner_guard.mount_list.insert(
+                Some(put_old_mountpoint_id),
+                Arc::new(MountPath::from("/")),
+                old_root,
+            );
+        } else {
+            inner_guard.mount_list.rewrite_paths(|path| {
+                if path == old_put_old_path || path_is_under(path, old_put_old_path) {
+                    return None;
+                }
+
+                Some(rewrite_pivot_path(
+                    path,
+                    old_new_root_path,
+                    new_put_old_path,
+                ))
+            });
+            inner_guard.mount_list.insert(
+                Some(put_old_mountpoint_id),
+                Arc::new(MountPath::from(new_put_old_path)),
+                old_root,
+            );
+        }
+
+        Ok(())
     }
 
     fn copy_with_mountfs(&self, new_root: Arc<MountFS>, _user_ns: Arc<UserNamespace>) -> Arc<Self> {
@@ -187,19 +282,20 @@ impl MntNamespace {
                 continue; // Skip the root mountfs
             }
         }
+
         // 将root mntfs下的所有挂载点复制到新的mntns中
         for (ino, mfs) in old_root_mntfs.mountpoints().iter() {
             let mount_path = inner
                 .mount_list
                 .get_mount_path_by_ino(*ino)
-                .ok_or_else(|| {
+                .unwrap_or_else(|| {
                     panic!(
-                        "mount_path not found for inode {:?}, mfs name: {}",
+                        "copy_mnt_ns: mount_path not found for ino={:?}, mfs name={}. \
+                         mountpoints and mount_list are out of sync.",
                         ino,
                         mfs.name()
-                    );
-                })
-                .unwrap();
+                    )
+                });
 
             queue.push(MountFSCopyInfo {
                 old_mount_fs: mfs.clone(),
@@ -221,10 +317,6 @@ impl MntNamespace {
             if old_propagation.is_shared() {
                 let group_id = old_propagation.peer_group_id();
                 register_peer(group_id, &new_mount_fs);
-                // log::debug!(
-                //     "copy_mnt_ns: registered new mount in peer group {}",
-                //     group_id.data()
-                // );
             }
 
             data.parent_mount_fs
@@ -241,14 +333,23 @@ impl MntNamespace {
             // 原有的挂载点的子挂载点加入队列中
 
             for (child_ino, child_mfs) in data.old_mount_fs.mountpoints().iter() {
+                let child_mount_path = inner
+                    .mount_list
+                    .get_mount_path_by_ino(*child_ino)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "copy_mnt_ns: child mount_path not found for ino={:?}, mfs name={}, \
+                             parent path={}. mountpoints and mount_list are out of sync.",
+                            child_ino,
+                            child_mfs.name(),
+                            data.mount_path.as_str()
+                        )
+                    });
                 queue.push(MountFSCopyInfo {
                     old_mount_fs: child_mfs.clone(),
                     parent_mount_fs: new_mount_fs.clone(),
                     self_mp_inode_id: *child_ino,
-                    mount_path: inner
-                        .mount_list
-                        .get_mount_path_by_ino(*child_ino)
-                        .expect("mount_path not found"),
+                    mount_path: child_mount_path,
                 });
             }
         }
@@ -275,7 +376,7 @@ impl MntNamespace {
         mntfs: Arc<MountFS>,
     ) -> Result<(), SystemError> {
         self.inner.lock().mount_list.insert(ino, mount_path, mntfs);
-        return Ok(());
+        Ok(())
     }
 
     pub fn mount_list(&self) -> Arc<MountList> {
@@ -283,7 +384,7 @@ impl MntNamespace {
     }
 
     pub fn remove_mount(&self, mount_path: &str) -> Option<Arc<MountFS>> {
-        return self.inner.lock().mount_list.remove(mount_path);
+        self.inner.lock().mount_list.remove(mount_path)
     }
 
     pub fn get_mount_point(
@@ -310,6 +411,54 @@ struct MountFSCopyInfo {
     parent_mount_fs: Arc<MountFS>,
     self_mp_inode_id: InodeId,
     mount_path: Arc<MountPath>,
+}
+
+fn rewrite_pivot_path(path: &str, old_new_root_path: &str, new_put_old_path: &str) -> String {
+    if path == old_new_root_path {
+        return "/".to_string();
+    }
+
+    if let Some(suffix) = path.strip_prefix(old_new_root_path) {
+        if suffix.is_empty() {
+            return "/".to_string();
+        }
+
+        return normalize_pivot_path(suffix);
+    }
+
+    if path == "/" {
+        return new_put_old_path.to_string();
+    }
+
+    join_pivot_paths(new_put_old_path, path)
+}
+
+fn path_is_under(path: &str, prefix: &str) -> bool {
+    path != prefix
+        && path
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn normalize_pivot_path(path: &str) -> String {
+    if path.is_empty() || path == "/" {
+        "/".to_string()
+    } else if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{}", path)
+    }
+}
+
+fn join_pivot_paths(prefix: &str, suffix: &str) -> String {
+    if prefix == "/" {
+        return normalize_pivot_path(suffix);
+    }
+
+    let mut result = prefix.trim_end_matches('/').to_string();
+    result.push('/');
+    result.push_str(suffix.trim_start_matches('/'));
+    result
 }
 
 // impl Drop for MntNamespace {

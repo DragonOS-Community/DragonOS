@@ -17,9 +17,10 @@ use crate::{
     arch::CurrentIrqArch,
     exception::{irqdesc::IrqAction, InterruptArch},
     init::initial_kthread::{initial_kernel_thread, set_system_state, SystemState},
-    libs::{once::Once, spinlock::SpinLock},
+    libs::{cpumask::CpuMask, once::Once, spinlock::SpinLock},
     process::{ProcessManager, ProcessState},
     sched::{schedule, SchedMode},
+    smp::cpu::ProcessorId,
 };
 
 use super::{fork::CloneFlags, ProcessControlBlock, ProcessFlags, RawPid};
@@ -137,6 +138,8 @@ pub struct KernelThreadCreateInfo {
     self_ref: Weak<Self>,
     /// 如果该值为true在进入bootstrap stage2之后，就会进入睡眠状态
     to_mark_sleep: AtomicBool,
+    flags: SpinLock<KernelThreadFlags>,
+    bound_cpu: SpinLock<Option<ProcessorId>>,
 }
 
 #[atomic_enum]
@@ -158,6 +161,8 @@ impl KernelThreadCreateInfo {
             has_unsafe_arc_instance: AtomicBool::new(false),
             self_ref: Weak::new(),
             to_mark_sleep: AtomicBool::new(true),
+            flags: SpinLock::new(KernelThreadFlags::empty()),
+            bound_cpu: SpinLock::new(None),
         });
         let tmp = result.clone();
         unsafe {
@@ -257,6 +262,39 @@ impl KernelThreadCreateInfo {
     pub fn to_mark_sleep(&self) -> bool {
         self.to_mark_sleep.load(Ordering::SeqCst)
     }
+
+    pub fn set_per_cpu(&self, cpu: ProcessorId) -> Result<(), SystemError> {
+        let result_guard = self.result_pcb.lock();
+        if result_guard.is_some() {
+            return Err(SystemError::EINVAL);
+        }
+        drop(result_guard);
+
+        self.flags.lock().insert(KernelThreadFlags::IS_PER_CPU);
+        *self.bound_cpu.lock() = Some(cpu);
+        Ok(())
+    }
+
+    pub fn setup_pcb(&self, pcb: &Arc<ProcessControlBlock>) {
+        let flags = *self.flags.lock();
+        if flags.is_empty() {
+            return;
+        }
+
+        let mut worker_private_guard = pcb.worker_private();
+        let worker_private = worker_private_guard
+            .as_mut()
+            .and_then(|x| x.kernel_thread_mut())
+            .expect("kthread create: missing worker_private");
+        worker_private.flags |= flags;
+        drop(worker_private_guard);
+
+        if flags.contains(KernelThreadFlags::IS_PER_CPU) {
+            let cpu = (*self.bound_cpu.lock())
+                .expect("kthread create: per-cpu thread missing target cpu");
+            pcb.sched_info().set_cpus_allowed(CpuMask::from_cpu(cpu));
+        }
+    }
 }
 
 pub struct KernelThreadMechanism;
@@ -286,7 +324,7 @@ impl KernelThreadMechanism {
 
         KernelThreadMechanism::__inner_create(
             &create_info,
-            CloneFlags::CLONE_VM | CloneFlags::CLONE_SIGHAND,
+            CloneFlags::CLONE_VM | CloneFlags::CLONE_FS | CloneFlags::CLONE_FILES,
         )
         .unwrap_or_else(|e| panic!("Failed to create initial kernel thread, error: {:?}", e));
 
@@ -314,7 +352,7 @@ impl KernelThreadMechanism {
                 .expect("kthreadadd should be run first");
             let kthreadd_pid: RawPid = Self::__inner_create(
                 &info,
-                CloneFlags::CLONE_VM | CloneFlags::CLONE_FS | CloneFlags::CLONE_SIGHAND,
+                CloneFlags::CLONE_VM | CloneFlags::CLONE_FS | CloneFlags::CLONE_FILES,
             )
             .expect("Failed to create kthread daemon");
             let pcb = ProcessManager::find_task_by_vpid(kthreadd_pid).unwrap();
@@ -412,6 +450,32 @@ impl KernelThreadMechanism {
         }
     }
 
+    /// 请求一个内核线程退出（不等待其真正退出）
+    #[allow(dead_code)]
+    pub fn request_stop(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
+        if !pcb.flags().contains(ProcessFlags::KTHREAD) {
+            panic!("Cannt stop a non-kthread process");
+        }
+
+        let mut worker_private = pcb.worker_private();
+        assert!(
+            worker_private.is_some(),
+            "kthread request_stop: worker_private is none, pid: {:?}",
+            pcb.raw_pid()
+        );
+        worker_private
+            .as_mut()
+            .unwrap()
+            .kernel_thread_mut()
+            .expect("Error type of worker private")
+            .flags
+            .insert(KernelThreadFlags::SHOULD_STOP);
+
+        drop(worker_private);
+        ProcessManager::wakeup(pcb).ok();
+        Ok(())
+    }
+
     /// 判断一个内核线程是否应当停止
     ///
     /// ## 参数
@@ -458,6 +522,7 @@ impl KernelThreadMechanism {
         }
         // 设置为kthread
         current_pcb.flags().insert(ProcessFlags::KTHREAD);
+        let kthreadd_pcb = current_pcb.clone();
         drop(current_pcb);
 
         loop {
@@ -467,7 +532,7 @@ impl KernelThreadMechanism {
                 // create a new kernel thread
                 let result: Result<RawPid, SystemError> = Self::__inner_create(
                     &info,
-                    CloneFlags::CLONE_VM | CloneFlags::CLONE_FS | CloneFlags::CLONE_SIGHAND,
+                    CloneFlags::CLONE_VM | CloneFlags::CLONE_FS | CloneFlags::CLONE_FILES,
                 );
                 if result.is_err() {
                     // 创建失败
@@ -478,10 +543,34 @@ impl KernelThreadMechanism {
             }
             drop(list);
 
+            Self::reap_zombie_kthreads(&kthreadd_pcb);
+
             let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
             ProcessManager::mark_sleep(true).ok();
             drop(irq_guard);
             schedule(SchedMode::SM_NONE);
+        }
+    }
+
+    fn reap_zombie_kthreads(current_pcb: &Arc<ProcessControlBlock>) {
+        let child_pids = {
+            let guard = current_pcb.children_read_irqsave();
+            guard.clone()
+        };
+
+        for pid in child_pids {
+            let Some(task) = ProcessManager::find_task_by_vpid(pid) else {
+                continue;
+            };
+            if !task.is_kthread() || !task.is_zombie() {
+                continue;
+            }
+            if task.try_mark_dead_from_zombie() {
+                unsafe {
+                    ProcessManager::release(task.raw_pid());
+                }
+            }
+            drop(task);
         }
     }
 }

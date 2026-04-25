@@ -30,8 +30,7 @@ impl Syscall for SysAlarm {
         //alarm第一次调用
         if alarm.is_none() {
             //注册alarm定时器
-            let pid = ProcessManager::current_pid();
-            let new_alarm = Some(AlarmTimer::alarm_timer_init(pid, second.as_secs()));
+            let new_alarm = Some(AlarmTimer::alarm_timer_init(pcb.clone(), second.as_secs()));
             *pcb_alarm = new_alarm;
             drop(pcb_alarm);
             return Ok(0);
@@ -48,8 +47,7 @@ impl Syscall for SysAlarm {
         if !alarmtimer.timeout() {
             alarmtimer.cancel();
         }
-        let pid = ProcessManager::current_pid();
-        let new_alarm = Some(AlarmTimer::alarm_timer_init(pid, second.as_secs()));
+        let new_alarm = Some(AlarmTimer::alarm_timer_init(pcb.clone(), second.as_secs()));
         *pcb_alarm = new_alarm;
         drop(pcb_alarm);
         return Ok(remain.as_secs() as usize);

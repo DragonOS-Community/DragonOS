@@ -4,20 +4,28 @@ use core::{
 };
 
 use alloc::{
+    boxed::Box,
     string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
 };
 use bitmap::{static_bitmap, traits::BitMapOps};
+use hashbrown::HashMap;
 use log::error;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
-use virtio_drivers::device::blk::{VirtIOBlk, SECTOR_SIZE};
+use virtio_drivers::{
+    device::blk::{BlkReq, BlkResp, VirtIOBlk, SECTOR_SIZE},
+    Error as VirtioError,
+};
 
 use crate::{
+    arch::CurrentIrqArch,
     driver::{
         base::{
             block::{
+                bio::{BioRequest, BioType},
+                bio_queue::BioQueue,
                 block_device::{BlockDevice, BlockId, GeneralBlockRange, LBA_SIZE},
                 disk_info::Partition,
                 manager::{block_dev_manager, BlockDevMeta},
@@ -40,7 +48,11 @@ use crate::{
             VIRTIO_VENDOR_ID,
         },
     },
-    exception::{irqdesc::IrqReturn, IrqNumber},
+    exception::{
+        irqdesc::IrqReturn,
+        tasklet::{tasklet_schedule, Tasklet},
+        InterruptArch, IrqNumber,
+    },
     filesystem::{
         devfs::{DevFS, DeviceINode, LockedDevFSInode},
         kernfs::KernFSInode,
@@ -49,14 +61,172 @@ use crate::{
     },
     init::initcall::INITCALL_POSTCORE,
     libs::{
-        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+        mutex::MutexGuard,
+        rwlock::RwLock,
+        rwsem::{RwSemReadGuard, RwSemWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
+    process::{
+        kthread::{KernelThreadClosure, KernelThreadMechanism},
+        ProcessControlBlock, ProcessManager,
+    },
+    sched::prio::MAX_RT_PRIO,
+    time::{sleep::nanosleep, PosixTimeSpec},
 };
 
 const VIRTIO_BLK_BASENAME: &str = "virtio_blk";
 
+// IO线程的budget配置
+const IO_BUDGET: usize = 32; // 每次最多处理32个请求
+const SLEEP_MS: usize = 20; // 达到budget后睡眠20ms
+
+/// Token映射表：virtqueue token -> BioRequest
+/// BIO请求的完整上下文，包含virtio需要的req和resp
+struct BioContext {
+    bio: Arc<BioRequest>,
+    req: Box<BlkReq>,
+    resp: Box<BlkResp>,
+}
+
+struct BioTokenMap {
+    inner: SpinLock<HashMap<u16, BioContext>>,
+}
+
+impl BioTokenMap {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: SpinLock::new(HashMap::new()),
+        })
+    }
+
+    pub fn insert(&self, token: u16, ctx: BioContext) -> Result<(), BioContext> {
+        let mut inner = self.inner.lock_irqsave();
+        if inner.contains_key(&token) {
+            return Err(ctx);
+        }
+        inner.insert(token, ctx);
+        Ok(())
+    }
+
+    pub fn remove(&self, token: u16) -> Option<BioContext> {
+        self.inner.lock_irqsave().remove(&token)
+    }
+}
+
 static mut VIRTIO_BLK_DRIVER: Option<Arc<VirtIOBlkDriver>> = None;
+
+/// 中断下半部：完成 BIO 请求
+struct BioCompletionTasklet {
+    token_map: Arc<BioTokenMap>,
+    device: Weak<VirtIOBlkDevice>,
+    tasklet: Arc<Tasklet>,
+}
+
+impl BioCompletionTasklet {
+    fn new(device: Weak<VirtIOBlkDevice>, token_map: Arc<BioTokenMap>) -> Arc<Self> {
+        Arc::new_cyclic(|weak: &alloc::sync::Weak<Self>| {
+            let weak_for_cb = weak.clone();
+            let tasklet = Tasklet::new(
+                move |_, _| {
+                    if let Some(tasklet) = weak_for_cb.upgrade() {
+                        tasklet.run();
+                    }
+                },
+                0,
+                None,
+            );
+            BioCompletionTasklet {
+                token_map,
+                device,
+                tasklet,
+            }
+        })
+    }
+
+    fn schedule(&self) {
+        tasklet_schedule(&self.tasklet);
+    }
+
+    fn run(&self) {
+        let device = match self.device.upgrade() {
+            Some(dev) => dev,
+            None => return,
+        };
+        loop {
+            let mut inner = device.inner();
+            let token = match inner.device_inner.peek_used() {
+                Some(token) => token,
+                None => break,
+            };
+
+            let ctx = match self.token_map.remove(token) {
+                Some(ctx) => ctx,
+                None => {
+                    error!("VirtIOBlk: token {} not found in token_map", token);
+                    continue;
+                }
+            };
+
+            let mut ctx = ctx;
+            let bio = ctx.bio.clone();
+            let count = bio.count();
+            let result = match bio.bio_type() {
+                BioType::Read => {
+                    let buf_ptr = bio.buffer_mut();
+                    let buf = unsafe { &mut *buf_ptr };
+                    match unsafe {
+                        inner.device_inner.complete_read_blocks(
+                            token,
+                            &ctx.req,
+                            &mut buf[..count * LBA_SIZE],
+                            &mut ctx.resp,
+                        )
+                    } {
+                        Ok(_) => Ok(count * LBA_SIZE),
+                        Err(VirtioError::NotReady) => {
+                            if self.token_map.insert(token, ctx).is_err() {
+                                error!("VirtIOBlk: token {} reinsert failed", token);
+                                bio.complete(Err(SystemError::EIO));
+                            }
+                            break;
+                        }
+                        Err(e) => {
+                            error!("VirtIOBlk complete_read_blocks failed: {:?}", e);
+                            Err(SystemError::EIO)
+                        }
+                    }
+                }
+                BioType::Write => {
+                    let buf_ptr = bio.buffer();
+                    let buf = unsafe { &*buf_ptr };
+                    match unsafe {
+                        inner.device_inner.complete_write_blocks(
+                            token,
+                            &ctx.req,
+                            &buf[..count * LBA_SIZE],
+                            &mut ctx.resp,
+                        )
+                    } {
+                        Ok(_) => Ok(count * LBA_SIZE),
+                        Err(VirtioError::NotReady) => {
+                            if self.token_map.insert(token, ctx).is_err() {
+                                error!("VirtIOBlk: token {} reinsert failed", token);
+                                bio.complete(Err(SystemError::EIO));
+                            }
+                            break;
+                        }
+                        Err(e) => {
+                            error!("VirtIOBlk complete_write_blocks failed: {:?}", e);
+                            Err(SystemError::EIO)
+                        }
+                    }
+                }
+            };
+            drop(inner);
+            bio.complete(result);
+        }
+    }
+}
 
 #[inline(always)]
 #[allow(dead_code)]
@@ -191,6 +361,7 @@ impl VirtIOBlkDevice {
 
         let devname = virtioblk_manager().alloc_id()?;
         let irq = Some(transport.irq());
+        let irq_is_msix = transport.irq_is_msix();
         let device_inner = VirtIOBlk::<HalImpl, VirtIOTransport>::new(transport);
         if let Err(e) = device_inner {
             error!("VirtIOBlkDevice '{dev_id:?}' create failed: {:?}", e);
@@ -199,8 +370,13 @@ impl VirtIOBlkDevice {
 
         let mut device_inner: VirtIOBlk<HalImpl, VirtIOTransport> = device_inner.unwrap();
         device_inner.enable_interrupts();
+
+        // 创建BIO队列和token映射表
+        let bio_queue = BioQueue::new();
+        let bio_token_map = BioTokenMap::new();
+
         let dev = Arc::new_cyclic(|self_ref| Self {
-            blkdev_meta: BlockDevMeta::new(devname, Major::VIRTIO_BLK_MAJOR),
+            blkdev_meta: BlockDevMeta::new(devname.clone(), Major::VIRTIO_BLK_MAJOR),
             self_ref: self_ref.clone(),
             dev_id,
             locked_kobj_state: LockedKObjectState::default(),
@@ -211,6 +387,11 @@ impl VirtIOBlkDevice {
                 device_common: DeviceCommonData::default(),
                 kobject_common: KObjectCommonData::default(),
                 irq,
+                irq_is_msix,
+                bio_queue: Some(bio_queue.clone()),
+                bio_token_map: Some(bio_token_map.clone()),
+                io_thread_pcb: None, // 稍后初始化
+                completion_tasklet: None,
             }),
             parent: RwLock::new(Weak::default()),
             fs: RwLock::new(Weak::default()),
@@ -220,11 +401,41 @@ impl VirtIOBlkDevice {
             ),
         });
 
+        let device_weak = Arc::downgrade(&dev);
+
+        // 创建BIO完成 tasklet
+        let completion_tasklet = BioCompletionTasklet::new(device_weak.clone(), bio_token_map);
+        dev.inner().completion_tasklet = Some(completion_tasklet);
+
+        // 创建IO线程
+        let thread_name = format!("virtio_blk_io_{}", devname.id());
+        let io_thread = KernelThreadMechanism::create_and_run(
+            KernelThreadClosure::EmptyClosure((
+                alloc::boxed::Box::new(move || bio_io_thread_loop(device_weak.clone())),
+                (),
+            )),
+            thread_name.clone(),
+        );
+
+        if let Some(io_thread) = io_thread {
+            // 设置FIFO调度策略
+            if let Err(err) = ProcessManager::set_fifo_policy(&io_thread, MAX_RT_PRIO - 1) {
+                error!("Failed to set FIFO policy for {}: {:?}", thread_name, err);
+            }
+
+            // 保存IO线程PCB
+            dev.inner().io_thread_pcb = Some(io_thread.clone());
+        } else {
+            error!("Failed to create IO thread for {}", thread_name);
+            virtioblk_manager().free_id(devname.id());
+            return None;
+        }
+
         Some(dev)
     }
 
     fn inner(&self) -> SpinLockGuard<'_, InnerVirtIOBlkDevice> {
-        self.inner.lock()
+        self.inner.lock_irqsave()
     }
 }
 
@@ -243,7 +454,7 @@ impl IndexNode for VirtIOBlkDevice {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
@@ -252,7 +463,7 @@ impl IndexNode for VirtIOBlkDevice {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
@@ -273,7 +484,7 @@ impl IndexNode for VirtIOBlkDevice {
 
     fn close(
         &self,
-        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<(), SystemError> {
         Ok(())
     }
@@ -285,7 +496,7 @@ impl IndexNode for VirtIOBlkDevice {
 
     fn open(
         &self,
-        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
         _mode: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
@@ -315,11 +526,6 @@ impl BlockDevice for VirtIOBlkDevice {
         let inner = self.inner();
         let blocks = inner.device_inner.capacity() as usize * SECTOR_SIZE / LBA_SIZE;
         drop(inner);
-        log::debug!(
-            "VirtIOBlkDevice '{:?}' disk_range: 0..{}",
-            self.dev_name(),
-            blocks
-        );
         GeneralBlockRange::new(0, blocks).unwrap()
     }
 
@@ -329,19 +535,11 @@ impl BlockDevice for VirtIOBlkDevice {
         count: usize,
         buf: &mut [u8],
     ) -> Result<usize, SystemError> {
-        let mut inner = self.inner();
-
-        inner
-            .device_inner
-            .read_blocks(lba_id_start, &mut buf[..count * LBA_SIZE])
-            .map_err(|e| {
-                error!(
-                    "VirtIOBlkDevice '{:?}' read_at_sync failed: {:?}",
-                    self.dev_id, e
-                );
-                SystemError::EIO
-            })?;
-
+        let bio = self.submit_bio_read(lba_id_start, count)?;
+        let data = bio
+            .wait()
+            .inspect_err(|e| log::error!("VirtIOBlkDevice read_at_sync error: {:?}", e))?;
+        buf[..count * LBA_SIZE].copy_from_slice(&data[..count * LBA_SIZE]);
         Ok(count)
     }
 
@@ -351,10 +549,10 @@ impl BlockDevice for VirtIOBlkDevice {
         count: usize,
         buf: &[u8],
     ) -> Result<usize, SystemError> {
-        self.inner()
-            .device_inner
-            .write_blocks(lba_id_start, &buf[..count * LBA_SIZE])
-            .map_err(|_| SystemError::EIO)?;
+        let bio = self.submit_bio_write(lba_id_start, count, &buf[..count * LBA_SIZE])?;
+        let _ = bio
+            .wait()
+            .inspect_err(|e| log::error!("VirtIOBlkDevice write_at_sync error: {:?}", e))?;
         Ok(count)
     }
 
@@ -384,6 +582,17 @@ impl BlockDevice for VirtIOBlkDevice {
             .expect("Failed to get MBR partition table");
         mbr_table.partitions(Arc::downgrade(&device))
     }
+
+    /// 提交异步BIO请求
+    fn submit_bio(&self, bio: Arc<BioRequest>) -> Result<(), SystemError> {
+        let inner = self.inner();
+        if let Some(bio_queue) = &inner.bio_queue {
+            bio_queue.submit(bio);
+            Ok(())
+        } else {
+            Err(SystemError::ENOSYS)
+        }
+    }
 }
 
 struct InnerVirtIOBlkDevice {
@@ -393,6 +602,11 @@ struct InnerVirtIOBlkDevice {
     device_common: DeviceCommonData,
     kobject_common: KObjectCommonData,
     irq: Option<IrqNumber>,
+    irq_is_msix: bool,
+    bio_queue: Option<Arc<BioQueue>>,
+    bio_token_map: Option<Arc<BioTokenMap>>,
+    io_thread_pcb: Option<Arc<ProcessControlBlock>>,
+    completion_tasklet: Option<Arc<BioCompletionTasklet>>,
 }
 
 impl Debug for InnerVirtIOBlkDevice {
@@ -410,7 +624,19 @@ impl VirtIODevice for VirtIOBlkDevice {
         &self,
         _irq: crate::exception::IrqNumber,
     ) -> Result<IrqReturn, system_error::SystemError> {
-        // todo: handle virtio blk irq
+        let mut inner = self.inner();
+        let acked = inner.device_inner.ack_interrupt();
+        if !acked && !inner.irq_is_msix {
+            log::debug!(
+                "VirtIOBlkDevice '{:?}' ack_interrupt not set",
+                self.dev_id.id()
+            );
+            return Ok(crate::exception::irqdesc::IrqReturn::NotHandled);
+        }
+        let tasklet = inner.completion_tasklet.clone();
+        if let Some(tasklet) = tasklet {
+            tasklet.schedule();
+        }
         Ok(crate::exception::irqdesc::IrqReturn::Handled)
     }
 
@@ -557,11 +783,11 @@ impl KObject for VirtIOBlkDevice {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.locked_kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.locked_kobj_state.write()
     }
 
@@ -571,6 +797,39 @@ impl KObject for VirtIOBlkDevice {
 
     fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
         self.inner().kobject_common.kobj_type = ktype;
+    }
+}
+
+impl Drop for VirtIOBlkDevice {
+    fn drop(&mut self) {
+        let (bio_queue, bio_token_map) = {
+            let inner = self.inner.lock_irqsave();
+            (inner.bio_queue.clone(), inner.bio_token_map.clone())
+        };
+
+        if let Some(bio_queue) = bio_queue {
+            loop {
+                let batch = bio_queue.drain_batch();
+                if batch.is_empty() {
+                    break;
+                }
+                for bio in batch {
+                    bio.complete(Err(SystemError::ENODEV));
+                }
+            }
+        }
+
+        if let Some(token_map) = bio_token_map {
+            let pending: Vec<BioContext> = token_map
+                .inner
+                .lock_irqsave()
+                .drain()
+                .map(|(_, v)| v)
+                .collect();
+            for ctx in pending {
+                ctx.bio.complete(Err(SystemError::ENODEV));
+            }
+        }
     }
 }
 
@@ -641,8 +900,8 @@ impl VirtIODriver for VirtIOBlkDriver {
             );
                 SystemError::EINVAL
             })?;
-
         block_dev_manager().register(dev as Arc<dyn BlockDevice>)?;
+
         return Ok(());
     }
 
@@ -748,15 +1007,163 @@ impl KObject for VirtIOBlkDriver {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 
     fn set_kobj_state(&self, state: KObjectState) {
         *self.kobj_state.write() = state;
     }
+}
+
+/// IO线程入口函数
+fn bio_io_thread_loop(device_weak: Weak<VirtIOBlkDevice>) -> i32 {
+    loop {
+        let device = match device_weak.upgrade() {
+            Some(dev) => dev,
+            None => {
+                // 设备已被销毁，线程退出
+                break;
+            }
+        };
+
+        let bio_queue: Option<Arc<BioQueue>> = {
+            let inner = device.inner();
+            inner.bio_queue.clone()
+        };
+
+        if let Some(bio_queue) = bio_queue {
+            // 等待队列中有请求
+            if let Err(e) = bio_queue.wait_for_work() {
+                log::error!("virtio bio wait_for_work interrupted: {:?}", e);
+                continue;
+            }
+
+            let mut processed = 0;
+
+            // 批量提交新请求，遵守budget限制
+            while processed < IO_BUDGET {
+                let batch = bio_queue.drain_batch();
+                if batch.is_empty() {
+                    break; // 队列空了，退出
+                }
+
+                for bio in batch {
+                    if let Err(e) = submit_bio_to_virtio(&device, bio.clone()) {
+                        log::error!("virtio submit_bio_to_virtio failed: {:?}", e);
+                        // 失败时立即完成BIO
+                        bio.complete(Err(e));
+                    }
+                    processed += 1;
+
+                    if processed >= IO_BUDGET {
+                        break; // 达到budget上限
+                    }
+                }
+            }
+
+            // 达到budget，主动睡眠20ms，避免独占CPU
+            if processed >= IO_BUDGET {
+                let sleep_time = PosixTimeSpec::new(0, (SLEEP_MS as i64) * 1_000_000); // 20ms
+                let _ = nanosleep(sleep_time);
+            }
+        } else {
+            break;
+        }
+    }
+
+    0
+}
+
+/// 将BIO请求提交到VirtIO设备（异步）
+fn submit_bio_to_virtio(
+    device: &Arc<VirtIOBlkDevice>,
+    bio: Arc<BioRequest>,
+) -> Result<(), SystemError> {
+    // 获取BIO信息
+    let lba_start = bio.lba_start();
+    let count = bio.count();
+    let bio_type = bio.bio_type();
+
+    // 获取token_map（clone以避免借用冲突）
+    let token_map = {
+        let inner = device.inner();
+        inner
+            .bio_token_map
+            .as_ref()
+            .ok_or(SystemError::EINVAL)?
+            .clone()
+    };
+
+    // 创建请求和响应结构
+    let mut req = Box::new(BlkReq::default());
+    let mut resp = Box::new(BlkResp::default());
+
+    // 获取buffer指针（在整个异步操作期间，bio会被BioContext持有，保证buffer有效）
+    let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+
+    // 提交异步请求，获取token
+    let token = {
+        let mut inner = device.inner();
+        match bio_type {
+            BioType::Read => {
+                let buf_ptr = bio.buffer_mut();
+                let buf = unsafe { &mut *buf_ptr };
+                unsafe {
+                    inner.device_inner.read_blocks_nb(
+                        lba_start,
+                        &mut req,
+                        &mut buf[..count * LBA_SIZE],
+                        &mut resp,
+                    )
+                }
+                .map_err(|e| {
+                    error!("VirtIOBlk async read_blocks_nb failed: {:?}", e);
+                    SystemError::EIO
+                })?
+            }
+            BioType::Write => {
+                let buf_ptr = bio.buffer();
+                let buf = unsafe { &*buf_ptr };
+                unsafe {
+                    inner.device_inner.write_blocks_nb(
+                        lba_start,
+                        &mut req,
+                        &buf[..count * LBA_SIZE],
+                        &mut resp,
+                    )
+                }
+                .map_err(|e| {
+                    error!("VirtIOBlk async write_blocks_nb failed: {:?}", e);
+                    SystemError::EIO
+                })?
+            }
+        }
+    };
+
+    // 保存上下文到token_map
+    let ctx = BioContext {
+        bio: bio.clone(),
+        req,
+        resp,
+    };
+    if token_map.insert(token, ctx).is_err() {
+        drop(irq_guard);
+        return Err(SystemError::EEXIST);
+    }
+
+    // 标记BIO为已提交
+    if let Err(e) = bio.mark_submitted(token) {
+        token_map.remove(token);
+        drop(irq_guard);
+        return Err(e);
+    }
+
+    drop(irq_guard);
+
+    Ok(())
 }

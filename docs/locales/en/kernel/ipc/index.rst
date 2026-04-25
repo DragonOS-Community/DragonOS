@@ -4,7 +4,7 @@
 
    - Source document: kernel/ipc/index.rst
 
-   - Translation time: 2025-09-24 08:15:51
+   - Translation time: 2025-12-27 12:35:15
 
    - Translation model: `hunyuan-turbos-latest`
 
@@ -22,3 +22,4 @@ Interprocess Communication
 
    signal
    ipc_namespace
+   rseq

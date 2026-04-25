@@ -6,7 +6,7 @@ DragonOS.iso
 /tmp/
 kernel/kernel
 .DS_Store
-
+result/
 *.o
 *.a
 *.s
@@ -20,15 +20,12 @@ cppcheck.xml
 compile_commands.json
 /logs/
 *.log
-
-# Nix dev files
-/.envrc
-/.direnv/
-/flake.nix
-flake.lock
-/default.nix
+.nix-gc-root
+dadk-manifest.generated.toml
+config/rootfs.generated.toml
 
 # initram
 *.cpio
 *.cpio.xz
 *.cpio*
+.direnv/

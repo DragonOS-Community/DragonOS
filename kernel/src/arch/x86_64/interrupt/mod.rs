@@ -185,6 +185,18 @@ impl TrapFrame {
         self.rip = pc as u64;
     }
 
+    /// 获取当前的程序计数器（指令指针）
+    #[inline]
+    pub fn rip(&self) -> usize {
+        self.rip as usize
+    }
+
+    /// 设置指令指针
+    #[inline]
+    pub fn set_rip(&mut self, rip: usize) {
+        self.rip = rip as u64;
+    }
+
     /// 返回当前 TrapFrame 对应的用户态栈指针。
     #[inline(always)]
     pub fn stack_pointer(&self) -> usize {
@@ -227,5 +239,17 @@ impl ProbeArgs for TrapFrame {
 
     fn debug_address(&self) -> usize {
         self.rip as usize
+    }
+}
+
+impl crate::process::rseq::RseqTrapFrame for TrapFrame {
+    #[inline]
+    fn rseq_ip(&self) -> usize {
+        self.rip as usize
+    }
+
+    #[inline]
+    fn set_rseq_ip(&mut self, ip: usize) {
+        self.rip = ip as u64;
     }
 }

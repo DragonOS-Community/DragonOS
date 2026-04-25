@@ -78,6 +78,18 @@ int main() {
         perror("✗ setdomainname failed");
     }
     printf("\n");
+
+    printf("Test 3.1: UTF-8 boundary cut\n");
+    char utf8_domain[] = "测试domain";
+    size_t utf8_len = 4;
+    printf("Setting domainname to: '%s' with len=%zu\n", utf8_domain, utf8_len);
+    long ret = sys_setdomainname(utf8_domain, utf8_len);
+    if (ret == 0) {
+        printf("✓ setdomainname succeeded (unexpected)\n");
+    } else {
+        printf("setdomainname failed with error: %s\n", strerror(errno));
+    }
+    printf("\n");
     
     // Test 4: Test with zero length
     printf("Test 4: Test with zero length\n");

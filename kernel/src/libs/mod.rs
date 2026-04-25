@@ -1,4 +1,5 @@
 pub mod align;
+pub mod byte_parser;
 pub mod casting;
 pub mod cpumask;
 pub mod elf;
@@ -16,6 +17,7 @@ pub mod printk;
 pub mod rbtree;
 #[macro_use]
 pub mod rwlock;
+pub mod rwsem;
 pub mod semaphore;
 pub mod spinlock;
 pub mod vec_cursor;

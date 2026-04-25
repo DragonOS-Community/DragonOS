@@ -29,6 +29,7 @@ use crate::{
 
 use super::{
     jiffies::clocksource_default_clock,
+    timekeeping,
     timer::{clock, Timer, TimerFunction},
     NSEC_PER_SEC, NSEC_PER_USEC,
 };
@@ -41,7 +42,7 @@ lazy_static! {
     pub static ref WATCHDOG_LIST: SpinLock<LinkedList<Arc<dyn Clocksource>>> =
         SpinLock::new(LinkedList::new());
 
-    pub static ref CLOCKSOURCE_WATCHDOG:SpinLock<ClocksouceWatchdog>  = SpinLock::new(ClocksouceWatchdog::new());
+    pub static ref CLOCKSOURCE_WATCHDOG:SpinLock<ClocksourceWatchdog>  = SpinLock::new(ClocksourceWatchdog::new());
 
     pub static ref OVERRIDE_NAME: SpinLock<String> = SpinLock::new(String::from(""));
 
@@ -133,7 +134,7 @@ impl ClocksourceFlags {
 }
 
 #[derive(Debug)]
-pub struct ClocksouceWatchdog {
+pub struct ClocksourceWatchdog {
     /// 监视器
     watchdog: Option<Arc<dyn Clocksource>>,
     /// 检查器是否在工作的标志
@@ -141,7 +142,7 @@ pub struct ClocksouceWatchdog {
     /// 定时监视器的过期时间
     timer_expires: u64,
 }
-impl ClocksouceWatchdog {
+impl ClocksourceWatchdog {
     pub fn new() -> Self {
         Self {
             watchdog: None,
@@ -994,19 +995,26 @@ pub fn clocksource_select() {
         }
     }
     // 对比当前的时钟源和记录到最好的时钟源的精度
-    if CUR_CLOCKSOURCE.lock().as_ref().is_some() {
-        // 当前时钟源不为空
-        let cur_clocksource = CUR_CLOCKSOURCE.lock().as_ref().unwrap().clone();
-        let best_name = &best.clocksource_data().name;
-        if cur_clocksource.clocksource_data().name.ne(best_name) {
-            info!("Switching to the clocksource {:?}\n", best_name);
-            drop(cur_clocksource);
-            CUR_CLOCKSOURCE.lock().replace(best.clone());
-            // TODO 通知timerkeeping 切换了时间源
+    let mut should_update_timekeeper = false;
+    {
+        let mut cur_guard = CUR_CLOCKSOURCE.lock();
+        if cur_guard.as_ref().is_some() {
+            // 当前时钟源不为空
+            let cur_clocksource = cur_guard.as_ref().unwrap().clone();
+            let best_name = &best.clocksource_data().name;
+            if cur_clocksource.clocksource_data().name.ne(best_name) {
+                info!("Switching to the clocksource {:?}\n", best_name);
+                cur_guard.replace(best.clone());
+                should_update_timekeeper = true;
+            }
+        } else {
+            // 当前时钟源为空
+            cur_guard.replace(best.clone());
+            should_update_timekeeper = true;
         }
-    } else {
-        // 当前时钟源为空
-        CUR_CLOCKSOURCE.lock().replace(best.clone());
+    }
+    if should_update_timekeeper && timekeeping::timekeeping_is_initialized() {
+        timekeeping::timekeeper().timekeeper_setup_internals(best.clone());
     }
     debug!("clocksource_select finish, CUR_CLOCKSOURCE = {best:?}");
 }
@@ -1014,8 +1022,12 @@ pub fn clocksource_select() {
 /// # clocksource模块加载完成
 pub fn clocksource_boot_finish() {
     let mut cur_clocksource = CUR_CLOCKSOURCE.lock();
-    cur_clocksource.replace(clocksource_default_clock());
+    if cur_clocksource.is_none() {
+        cur_clocksource.replace(clocksource_default_clock());
+    }
     FINISHED_BOOTING.store(true, Ordering::Relaxed);
+    drop(cur_clocksource);
+    clocksource_select();
     // 清除不稳定的时钟源
     __clocksource_watchdog_kthread();
     debug!("clocksource_boot_finish");

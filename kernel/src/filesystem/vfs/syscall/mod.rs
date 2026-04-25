@@ -1,4 +1,4 @@
-use crate::{syscall::user_access::check_and_clone_cstr, time::PosixTimeSpec};
+use crate::time::PosixTimeSpec;
 
 use super::{fcntl::AtFlags, file::FileFlags, InodeMode, SuperBlock};
 mod dup2;
@@ -6,20 +6,27 @@ mod faccessat2;
 mod link_utils;
 mod newfstat;
 mod open_utils;
+mod pread_pwrite_common;
 mod readlink_at;
 mod rename_utils;
 mod sys_chdir;
+mod sys_chroot;
 mod sys_close;
 mod sys_dup;
 mod sys_dup3;
+#[cfg(target_arch = "x86_64")]
+mod sys_eventfd;
+mod sys_eventfd2;
 mod sys_faccessat;
 mod sys_faccessat2;
+mod sys_fallocate;
 mod sys_fchdir;
 mod sys_fchmod;
 mod sys_fchmodat;
 mod sys_fchown;
 mod sys_fchownat;
 mod sys_fcntl;
+mod sys_flock;
 mod sys_fstatfs;
 mod sys_ftruncate;
 mod sys_getcwd;
@@ -30,11 +37,17 @@ mod sys_lseek;
 mod sys_mkdirat;
 pub mod sys_mknodat;
 mod sys_openat;
+mod sys_pivot_root;
+#[cfg(target_arch = "x86_64")]
+mod sys_poll;
+mod sys_ppoll;
 mod sys_pread64;
 mod sys_preadv;
+mod sys_preadv2;
 mod sys_pselect6;
 mod sys_pwrite64;
 mod sys_pwritev;
+mod sys_pwritev2;
 mod sys_read;
 mod sys_readlinkat;
 mod sys_readv;
@@ -56,12 +69,15 @@ mod sys_epoll_ctl;
 mod sys_epoll_pwait;
 
 pub mod symlink_utils;
+mod sys_copy_file_range;
 #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 mod sys_fstat;
 mod sys_fsync;
 pub mod sys_mount;
 mod sys_sendfile;
+mod sys_splice;
 mod sys_sync;
+mod sys_tee;
 pub mod sys_umount2;
 
 #[cfg(target_arch = "x86_64")]
@@ -77,6 +93,8 @@ mod sys_epoll_create;
 #[cfg(target_arch = "x86_64")]
 mod sys_epoll_wait;
 
+#[cfg(target_arch = "x86_64")]
+mod sys_creat;
 #[cfg(target_arch = "x86_64")]
 mod sys_futimesat;
 #[cfg(target_arch = "x86_64")]
@@ -457,5 +475,20 @@ bitflags! {
         // 			return -EAGAIN if that's not
         // 			possible.
         const RESOLVE_CACHED = 0x20;
+    }
+}
+
+bitflags! {
+    /// splice 系统调用的标志位
+    /// 参考: linux/include/uapi/linux/splice.h
+    pub struct SpliceFlags: u32 {
+        /// 尝试移动页面而非复制（当前阶段忽略，为未来零拷贝预留）
+        const SPLICE_F_MOVE = 0x01;
+        /// 非阻塞模式：不要在管道拼接时阻塞
+        const SPLICE_F_NONBLOCK = 0x02;
+        /// 预期更多数据（当前阶段忽略）
+        const SPLICE_F_MORE = 0x04;
+        /// 传递页面无需释放（当前阶段忽略）
+        const SPLICE_F_GIFT = 0x08;
     }
 }

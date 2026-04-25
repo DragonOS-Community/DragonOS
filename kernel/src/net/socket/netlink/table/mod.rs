@@ -1,14 +1,15 @@
 mod multicast;
+pub use multicast::MulticastMessage;
 
 use crate::net::socket::netlink::addr::multicast::GroupIdSet;
+use crate::net::socket::netlink::kobject::message::KobjectUeventMessage;
 use crate::net::socket::netlink::route::kern::NetlinkRouteKernelSocket;
 use crate::net::socket::netlink::route::message::RouteNlMessage;
-use crate::net::socket::netlink::table::multicast::MulticastMessage;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
 use crate::{libs::rand, net::socket::netlink::addr::NetlinkSocketAddr};
 use crate::{
-    libs::rwlock::RwLock,
+    libs::rwsem::RwSem,
     net::socket::netlink::{receiver::MessageReceiver, table::multicast::MulticastGroup},
 };
 use alloc::boxed::Box;
@@ -24,22 +25,26 @@ const MAX_GROUPS: u32 = 32;
 
 #[derive(Debug)]
 pub struct NetlinkSocketTable {
-    route: Arc<RwLock<ProtocolSocketTable<RouteNlMessage>>>,
-    // 在这里继续补充其他协议下的 socket table
-    // 比如 uevent: Arc<RwLock<ProtocolSocketTable<UeventMessage>>>,
+    route: Arc<RwSem<ProtocolSocketTable<RouteNlMessage>>>,
+    kobject_uevent: Arc<RwSem<ProtocolSocketTable<KobjectUeventMessage>>>,
 }
 
 impl Default for NetlinkSocketTable {
     fn default() -> Self {
         Self {
-            route: Arc::new(RwLock::new(ProtocolSocketTable::new())),
+            route: Arc::new(RwSem::new(ProtocolSocketTable::new())),
+            kobject_uevent: Arc::new(RwSem::new(ProtocolSocketTable::new())),
         }
     }
 }
 
 impl NetlinkSocketTable {
-    pub fn route(&self) -> Arc<RwLock<ProtocolSocketTable<RouteNlMessage>>> {
+    pub fn route(&self) -> Arc<RwSem<ProtocolSocketTable<RouteNlMessage>>> {
         self.route.clone()
+    }
+
+    pub fn kobject_uevent(&self) -> Arc<RwSem<ProtocolSocketTable<KobjectUeventMessage>>> {
+        self.kobject_uevent.clone()
     }
 }
 
@@ -60,7 +65,7 @@ impl<Message: 'static + Debug> ProtocolSocketTable<Message> {
 
     fn bind(
         &mut self,
-        socket_table: Arc<RwLock<ProtocolSocketTable<Message>>>,
+        socket_table: Arc<RwSem<ProtocolSocketTable<Message>>>,
         addr: &NetlinkSocketAddr,
         receiver: MessageReceiver<Message>,
     ) -> Result<BoundHandle<Message>, SystemError> {
@@ -115,14 +120,14 @@ impl<Message: 'static + Debug> ProtocolSocketTable<Message> {
 
 #[derive(Debug)]
 pub struct BoundHandle<Message: 'static + Debug> {
-    socket_table: Arc<RwLock<ProtocolSocketTable<Message>>>,
+    socket_table: Arc<RwSem<ProtocolSocketTable<Message>>>,
     port: u32,
     groups: GroupIdSet,
 }
 
 impl<Message: 'static + Debug> BoundHandle<Message> {
     fn new(
-        socket_table: Arc<RwLock<ProtocolSocketTable<Message>>>,
+        socket_table: Arc<RwSem<ProtocolSocketTable<Message>>>,
         port: u32,
         groups: GroupIdSet,
     ) -> Self {
@@ -196,7 +201,7 @@ impl<Message: 'static + Debug> Drop for BoundHandle<Message> {
 pub trait SupportedNetlinkProtocol: Debug {
     type Message: 'static + Send + Debug;
 
-    fn socket_table(netns: Arc<NetNamespace>) -> Arc<RwLock<ProtocolSocketTable<Self::Message>>>;
+    fn socket_table(netns: Arc<NetNamespace>) -> Arc<RwSem<ProtocolSocketTable<Self::Message>>>;
 
     fn bind(
         addr: &NetlinkSocketAddr,
@@ -238,8 +243,19 @@ pub struct NetlinkRouteProtocol;
 impl SupportedNetlinkProtocol for NetlinkRouteProtocol {
     type Message = RouteNlMessage;
 
-    fn socket_table(netns: Arc<NetNamespace>) -> Arc<RwLock<ProtocolSocketTable<Self::Message>>> {
+    fn socket_table(netns: Arc<NetNamespace>) -> Arc<RwSem<ProtocolSocketTable<Self::Message>>> {
         netns.netlink_socket_table().route()
+    }
+}
+
+#[derive(Debug)]
+pub struct NetlinkKobjectUeventProtocol;
+
+impl SupportedNetlinkProtocol for NetlinkKobjectUeventProtocol {
+    type Message = KobjectUeventMessage;
+
+    fn socket_table(netns: Arc<NetNamespace>) -> Arc<RwSem<ProtocolSocketTable<Self::Message>>> {
+        netns.netlink_socket_table().kobject_uevent()
     }
 }
 

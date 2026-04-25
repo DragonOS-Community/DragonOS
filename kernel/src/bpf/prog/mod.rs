@@ -9,7 +9,7 @@ use crate::filesystem::vfs::file::{File, FileFlags};
 use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::vfs::{FilePrivateData, FileSystem, FileType, IndexNode, Metadata};
 use crate::include::bindings::linux_bpf::bpf_attr;
-use crate::libs::spinlock::SpinLockGuard;
+use crate::libs::mutex::MutexGuard;
 use crate::process::ProcessManager;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -45,10 +45,10 @@ impl BpfProg {
 }
 
 impl IndexNode for BpfProg {
-    fn open(&self, _data: SpinLockGuard<FilePrivateData>, _flags: &FileFlags) -> Result<()> {
+    fn open(&self, _data: MutexGuard<FilePrivateData>, _flags: &FileFlags) -> Result<()> {
         Ok(())
     }
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<()> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<()> {
         Ok(())
     }
     fn read_at(
@@ -56,7 +56,7 @@ impl IndexNode for BpfProg {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize> {
         Err(SystemError::ENOSYS)
     }
@@ -66,7 +66,7 @@ impl IndexNode for BpfProg {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize> {
         Err(SystemError::ENOSYS)
     }
@@ -122,6 +122,9 @@ pub fn bpf_prog_load(attr: &bpf_attr) -> Result<usize> {
     let fd_table = ProcessManager::current_pcb().fd_table();
     let prog = BpfProgVerifier::new(prog, log_info.log_level, &mut []).verify(&fd_table)?;
     let file = File::new(Arc::new(prog), FileFlags::O_RDWR)?;
-    let fd = fd_table.write().alloc_fd(file, None).map(|x| x as usize)?;
+    let fd = fd_table
+        .write()
+        .alloc_fd(file, None, false)
+        .map(|x| x as usize)?;
     Ok(fd)
 }

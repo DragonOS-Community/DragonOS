@@ -28,7 +28,7 @@ use crate::{
     init::initcall::INITCALL_DEVICE,
     libs::{
         mutex::Mutex,
-        rwlock::{RwLockReadGuard, RwLockWriteGuard},
+        rwsem::{RwSemReadGuard, RwSemWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
 };
@@ -246,11 +246,11 @@ impl KObject for CmosRtcDevice {
         // Do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.locked_kobjstate.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.locked_kobjstate.write()
     }
 

@@ -12,4 +12,10 @@ endif
 
 export INITRAM_PATH?=$(ROOT_PATH)/x86.cpio.xz
 
+ifeq ($(USING_DRAGONOS_NIX_ENV),1)
+else
 export DADK?=$(shell which dadk)
+endif
+
+# RootFS manifest name under config/rootfs-manifests/
+export ROOTFS_MANIFEST?=default

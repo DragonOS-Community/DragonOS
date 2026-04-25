@@ -1,19 +1,7 @@
 // Driver for Synopsys DesignWare Mobile Storage Host Controller
 
-use alloc::{
-    string::String,
-    string::ToString,
-    sync::{Arc, Weak},
-    vec::Vec,
-};
-use core::{
-    any::Any,
-    cell::UnsafeCell,
-    fmt::Debug,
-    mem::{self, size_of},
-};
-
 use crate::arch::MMArch;
+use crate::driver::base::block::block_device::LBA_SIZE;
 use crate::driver::base::block::block_device::{BlockDevice, BlockId, GeneralBlockRange};
 use crate::driver::base::block::disk_info::Partition;
 use crate::driver::base::block::manager::BlockDevMeta;
@@ -26,7 +14,6 @@ use crate::driver::base::kobject::{
     KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState,
 };
 use crate::driver::base::kset::KSet;
-use crate::driver::block::cache::BLOCK_SIZE;
 use crate::filesystem::devfs::LockedDevFSInode;
 use crate::filesystem::{
     devfs::{DevFS, DeviceINode},
@@ -34,14 +21,27 @@ use crate::filesystem::{
     mbr::MbrDiskPartionTable,
     vfs::{IndexNode, InodeMode, Metadata},
 };
+use crate::libs::mutex::MutexGuard;
 use crate::libs::{
-    rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+    rwlock::RwLock,
+    rwsem::{RwSemReadGuard, RwSemWriteGuard},
     spinlock::{SpinLock, SpinLockGuard},
 };
 use crate::mm::allocator::page_frame::PhysPageFrame;
 use crate::mm::mmio_buddy::{mmio_pool, MMIOSpaceGuard};
 use crate::mm::{MemoryManagementArch, PhysAddr};
-use byte_slice_cast::*;
+use alloc::{
+    string::String,
+    string::ToString,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
+use core::{
+    any::Any,
+    cell::UnsafeCell,
+    fmt::Debug,
+    mem::{self, size_of},
+};
 use log::{debug, info, warn};
 use system_error::SystemError;
 
@@ -216,7 +216,7 @@ impl MMC {
             info!("CID: {:x?}", cid);
             info!(
                 "Card Name: {}",
-                core::str::from_utf8(cid.name().to_be_bytes().as_byte_slice()).unwrap()
+                core::str::from_utf8(&cid.name().to_be_bytes()).unwrap()
             );
         }
 
@@ -688,7 +688,7 @@ impl MMC {
     }
 
     fn read_block(&self, block_id: usize, buf: &mut [u8]) {
-        assert!(buf.len() == BLOCK_SIZE);
+        assert!(buf.len() == LBA_SIZE);
 
         let buf_trans: &mut [usize] = unsafe {
             let len = buf.len() / mem::size_of::<usize>();
@@ -704,9 +704,9 @@ impl MMC {
     }
 
     fn write_block(&self, block_id: usize, buf: &[u8]) {
-        assert!(buf.len() == BLOCK_SIZE);
+        assert!(buf.len() == LBA_SIZE);
 
-        let mut temp_buf = [0usize; BLOCK_SIZE / core::mem::size_of::<usize>()];
+        let mut temp_buf = [0usize; LBA_SIZE / core::mem::size_of::<usize>()];
 
         unsafe {
             core::ptr::copy_nonoverlapping(
@@ -863,7 +863,7 @@ impl BlockDevice for MMC {
     }
 
     fn block_size(&self) -> usize {
-        BLOCK_SIZE
+        LBA_SIZE
     }
 
     fn partitions(&self) -> Vec<Arc<Partition>> {
@@ -915,11 +915,11 @@ impl KObject for MMC {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<KObjectState> {
         self.locked_kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<KObjectState> {
         self.locked_kobj_state.write()
     }
 
@@ -944,7 +944,7 @@ impl IndexNode for MMC {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
@@ -953,7 +953,7 @@ impl IndexNode for MMC {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }

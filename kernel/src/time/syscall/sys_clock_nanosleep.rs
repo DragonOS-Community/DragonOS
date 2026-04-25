@@ -35,13 +35,29 @@ impl SysClockNanosleep {
         match clockid {
             Realtime => getnstimeofday(),
             Monotonic | Boottime => getnstimeofday(),
+            ProcessCPUTimeID => {
+                let pcb = ProcessManager::current_pcb();
+                PosixTimeSpec::from_ns(pcb.process_cputime_ns())
+            }
+            ThreadCPUTimeID => {
+                let pcb = ProcessManager::current_pcb();
+                PosixTimeSpec::from_ns(pcb.thread_cputime_ns())
+            }
             _ => getnstimeofday(),
         }
     }
 
     #[inline]
     fn is_valid_timespec(ts: &PosixTimeSpec) -> bool {
-        ts.tv_nsec >= 0 && ts.tv_nsec < 1_000_000_000
+        ts.tv_sec >= 0 && ts.tv_nsec >= 0 && ts.tv_nsec < 1_000_000_000
+    }
+
+    #[inline]
+    fn to_ns(ts: &PosixTimeSpec) -> u64 {
+        // 这里已经保证了 tv_sec/tv_nsec 非负且 tv_nsec < 1e9
+        (ts.tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(ts.tv_nsec as u64)
     }
 
     #[inline]
@@ -79,12 +95,43 @@ impl SysClockNanosleep {
     }
 
     fn do_wait_until(deadline: &PosixTimeSpec, clockid: PosixClockID) -> Result<(), SystemError> {
-        let now = Self::ktime_now(clockid);
-        let remain = Self::calc_remaining(deadline, &now);
-        if remain.tv_sec == 0 && remain.tv_nsec == 0 {
-            return Ok(());
+        match clockid {
+            ProcessCPUTimeID => {
+                let current = ProcessManager::current_pcb();
+                let leader = if current.is_thread_group_leader() {
+                    current
+                } else {
+                    current
+                        .threads_read_irqsave()
+                        .group_leader()
+                        .unwrap_or_else(ProcessManager::current_pcb)
+                };
+
+                let deadline_ns = Self::to_ns(deadline);
+                leader.cputime_wait_queue().wait_event_interruptible(
+                    || leader.process_cputime_ns() >= deadline_ns,
+                    None::<fn()>,
+                )?;
+                Ok(())
+            }
+            ThreadCPUTimeID => {
+                let pcb = ProcessManager::current_pcb();
+                let deadline_ns = Self::to_ns(deadline);
+                pcb.cputime_wait_queue().wait_event_interruptible(
+                    || pcb.thread_cputime_ns() >= deadline_ns,
+                    None::<fn()>,
+                )?;
+                Ok(())
+            }
+            _ => {
+                let now = Self::ktime_now(clockid);
+                let remain = Self::calc_remaining(deadline, &now);
+                if remain.tv_sec == 0 && remain.tv_nsec == 0 {
+                    return Ok(());
+                }
+                nanosleep(remain).map(|_| ())
+            }
         }
-        nanosleep(remain).map(|_| ())
     }
 }
 
@@ -97,7 +144,7 @@ impl Syscall for SysClockNanosleep {
         // 解析/校验参数
         let clockid = PosixClockID::try_from(Self::which_clock(args))?;
         match clockid {
-            Realtime | Monotonic | Boottime => {}
+            Realtime | Monotonic | Boottime | ProcessCPUTimeID | ThreadCPUTimeID => {}
             _ => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
         }
         let flags = Self::flags(args);

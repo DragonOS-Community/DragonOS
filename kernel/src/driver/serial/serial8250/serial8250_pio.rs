@@ -20,7 +20,7 @@ use crate::{
         serial::{AtomicBaudRate, BaudRate, DivisorFraction, UartPort},
         tty::{
             console::ConsoleSwitch,
-            kthread::send_to_tty_refresh_thread,
+            kthread::enqueue_tty_rx_from_irq,
             termios::WindowSize,
             tty_core::{TtyCore, TtyCoreData},
             tty_driver::{TtyDriver, TtyDriverManager, TtyOperation},
@@ -34,7 +34,7 @@ use crate::{
         manage::irq_manager,
         IrqNumber,
     },
-    libs::{rwlock::RwLock, spinlock::SpinLock},
+    libs::{rwsem::RwSem, spinlock::SpinLock},
 };
 use system_error::SystemError;
 
@@ -104,7 +104,7 @@ pub struct Serial8250PIOPort {
     iobase: Serial8250PortBase,
     baudrate: AtomicBaudRate,
     initialized: AtomicBool,
-    inner: RwLock<Serial8250PIOPortInner>,
+    inner: RwSem<Serial8250PIOPortInner>,
 }
 
 impl Serial8250PIOPort {
@@ -114,7 +114,7 @@ impl Serial8250PIOPort {
             iobase,
             baudrate: AtomicBaudRate::new(baudrate),
             initialized: AtomicBool::new(false),
-            inner: RwLock::new(Serial8250PIOPortInner::new()),
+            inner: RwSem::new(Serial8250PIOPortInner::new()),
         };
 
         r.check_baudrate(&baudrate)?;
@@ -280,7 +280,7 @@ impl UartPort for Serial8250PIOPort {
             }
         }
 
-        send_to_tty_refresh_thread(&buf[0..index]);
+        enqueue_tty_rx_from_irq(&buf[0..index]);
         Ok(())
     }
 

@@ -1,4 +1,4 @@
-TOOLCHAIN="+nightly-2025-08-10-x86_64-unknown-linux-gnu"
+TOOLCHAIN="+nightly-2026-02-24-x86_64-unknown-linux-gnu"
 # RUSTFLAGS+="-C target-feature=+crt-static -C link-arg=-no-pie"
 
 ifdef DADK_CURRENT_BUILD_DIR

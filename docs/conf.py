@@ -88,6 +88,7 @@ myst_enable_extensions = [
     "strikethrough",
     "substitution",
     "tasklist",
+    "linkify"
 ]
 
 # sphinx-multiversion 指定哪个分支为 lastest 版本

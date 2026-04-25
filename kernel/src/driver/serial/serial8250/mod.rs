@@ -29,7 +29,8 @@ use crate::{
         tty::tty_driver::{TtyDriver, TtyDriverManager, TtyDriverType},
     },
     filesystem::kernfs::KernFSInode,
-    libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+    libs::rwlock::RwLock,
+    libs::rwsem::{RwSemReadGuard, RwSemWriteGuard},
 };
 
 #[cfg(target_arch = "x86_64")]
@@ -349,11 +350,11 @@ impl KObject for Serial8250ISADevices {
 
     fn set_name(&self, _name: String) {}
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 
@@ -549,11 +550,11 @@ impl KObject for Serial8250ISADriver {
 
     fn set_name(&self, _name: String) {}
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 

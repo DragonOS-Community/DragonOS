@@ -9,7 +9,7 @@ use crate::driver::base::kset::KSet;
 use crate::filesystem::kernfs::KernFSInode;
 use crate::filesystem::sysfs::{Attribute, SysFSOpsSupport};
 use crate::filesystem::vfs::InodeMode;
-use crate::libs::rwlock::{RwLockReadGuard, RwLockWriteGuard};
+use crate::libs::rwsem::{RwSemReadGuard, RwSemWriteGuard};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
@@ -92,11 +92,11 @@ impl KObject for KprobeDevice {
 
     fn set_name(&self, _name: String) {}
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 

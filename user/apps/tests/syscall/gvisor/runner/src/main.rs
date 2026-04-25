@@ -81,10 +81,10 @@ fn main() -> Result<()> {
                 .help("测试名称模式"),
         )
         .arg(
-            Arg::new("stdout")
-                .long("stdout")
+            Arg::new("no-stdout")
+                .long("no-stdout")
                 .action(clap::ArgAction::SetTrue)
-                .help("将测试输出直接显示到控制台，而不是保存到文件"),
+                .help("将测试输出保存到文件，而不是直接显示到控制台"),
         );
 
     let matches = app.get_matches();
@@ -117,8 +117,8 @@ fn main() -> Result<()> {
         config.test_patterns = patterns.cloned().collect();
     }
 
-    // 设置输出方式
-    config.output_to_stdout = matches.get_flag("stdout");
+    // 设置输出方式（默认为true，--no-stdout 设为 false）
+    config.output_to_stdout = !matches.get_flag("no-stdout");
 
     // 创建测试运行器
     let runner = TestRunner::new(config);

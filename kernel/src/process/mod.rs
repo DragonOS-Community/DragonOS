@@ -4,10 +4,12 @@ use core::{
     hint::spin_loop,
     intrinsics::unlikely,
     mem::ManuallyDrop,
-    sync::atomic::{compiler_fence, fence, AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    str::FromStr,
+    sync::atomic::{compiler_fence, fence, AtomicBool, AtomicU8, AtomicUsize, Ordering},
 };
 
 use alloc::{
+    ffi::CString,
     string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
@@ -29,23 +31,23 @@ use crate::{
     exception::InterruptArch,
     filesystem::{
         fs::FsStruct,
-        procfs::procfs_unregister_pid,
         vfs::{file::FileDescriptorVec, FileType, IndexNode},
     },
     ipc::{
-        kill::send_signal_to_pcb,
         sighand::SigHand,
         signal::RestartBlock,
-        signal_types::{SigInfo, SigPending},
+        signal_types::{SigCode, SigInfo, SigPending, SigType, SignalFlags},
     },
     libs::{
         align::AlignedBox,
+        cpumask::CpuMask,
         futex::{
             constant::{FutexFlag, FUTEX_BITSET_MATCH_ANY},
             futex::{Futex, RobustListHead},
         },
         lock_free_flags::LockFreeFlags,
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
+        rwsem::RwSem,
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
     },
@@ -73,6 +75,7 @@ use self::{cred::Cred, kthread::WorkerPrivate};
 use crate::process::namespace::nsproxy::NsProxy;
 
 pub mod abi;
+pub mod cputime;
 pub mod cred;
 pub mod exec;
 pub mod execve;
@@ -83,19 +86,52 @@ pub mod idle;
 pub mod kthread;
 pub mod namespace;
 pub mod pid;
+pub mod posix_timer;
 pub mod preempt;
 pub mod process_group;
 pub mod resource;
+pub mod rseq;
 pub mod session;
+pub mod shebang;
 pub mod signal;
 pub mod stdio;
 pub mod syscall;
 pub mod timer;
 pub mod utils;
 
+pub use cputime::ProcessCpuTime;
+
 /// 系统中所有进程的pcb
 static ALL_PROCESS: SpinLock<Option<HashMap<RawPid, Arc<ProcessControlBlock>>>> =
     SpinLock::new(None);
+
+pub(crate) fn all_process() -> &'static SpinLock<Option<HashMap<RawPid, Arc<ProcessControlBlock>>>>
+{
+    &ALL_PROCESS
+}
+
+fn exchange_raw_pids_locked(
+    map: &mut HashMap<RawPid, Arc<ProcessControlBlock>>,
+    left: &Arc<ProcessControlBlock>,
+    right: &Arc<ProcessControlBlock>,
+) -> Result<(), SystemError> {
+    let left_pid = left.raw_pid();
+    let right_pid = right.raw_pid();
+    if left_pid == right_pid {
+        return Err(SystemError::EINVAL);
+    }
+    let left_entry = map.remove(&left_pid).ok_or(SystemError::ESRCH)?;
+    let right_entry = map.remove(&right_pid).ok_or(SystemError::ESRCH)?;
+
+    unsafe {
+        left.force_set_raw_pid(right_pid);
+        right.force_set_raw_pid(left_pid);
+    }
+
+    map.insert(right_pid, left_entry);
+    map.insert(left_pid, right_entry);
+    Ok(())
+}
 
 pub static mut PROCESS_SWITCH_RESULT: Option<PerCpuVar<SwitchResult>> = None;
 
@@ -219,6 +255,24 @@ impl ProcessManager {
             .insert(pcb.raw_pid(), pcb.clone());
     }
 
+    pub(crate) fn exchange_tid_and_raw_pids(
+        left: &Arc<ProcessControlBlock>,
+        right: &Arc<ProcessControlBlock>,
+    ) -> Result<(), SystemError> {
+        let mut all_proc = all_process().lock_irqsave();
+        let map = all_proc.as_mut().ok_or(SystemError::EINVAL)?;
+        let left_pid = left.raw_pid();
+        let right_pid = right.raw_pid();
+        if left_pid == right_pid {
+            return Err(SystemError::EINVAL);
+        }
+        if !map.contains_key(&left_pid) || !map.contains_key(&right_pid) {
+            return Err(SystemError::ESRCH);
+        }
+        left.exchange_tid_with(right)?;
+        exchange_raw_pids_locked(map, left, right)
+    }
+
     /// ### 获取所有进程的pid
     pub fn get_all_processes() -> Vec<RawPid> {
         let mut pids = Vec::new();
@@ -232,6 +286,7 @@ impl ProcessManager {
     pub fn wakeup(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let state = pcb.sched_info().inner_lock_read_irqsave().state();
+        let was_uninterruptible = matches!(state, ProcessState::Blocked(false));
         if state.is_blocked() {
             let mut writer = pcb.sched_info().inner_lock_write_irqsave();
             let state = writer.state();
@@ -242,26 +297,21 @@ impl ProcessManager {
                 // avoid deadlock
                 drop(writer);
 
-                let prev_cpu = pcb.sched_info().on_cpu().unwrap_or(smp_get_processor_id());
-
-                // 使用负载均衡器选择目标CPU
-                let target_cpu =
-                    crate::sched::load_balance::LoadBalancer::select_task_rq(pcb, prev_cpu, 0);
-
-                let rq = cpu_rq(target_cpu.data() as usize);
+                let rq =
+                    cpu_rq(pcb.sched_info().on_cpu().unwrap_or(current_cpu_id()).data() as usize);
 
                 let (rq, _guard) = rq.self_lock();
                 rq.update_rq_clock();
+                rq.activate_task(
+                    pcb,
+                    EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK,
+                );
 
-                // 如果目标CPU与原CPU不同，添加迁移标志
-                let mut flags = EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK;
-                if target_cpu != prev_cpu {
-                    flags |= EnqueueFlag::ENQUEUE_MIGRATED;
+                if update_clock {
+                    rq.check_preempt_currnet(pcb, WakeupFlags::empty());
+                } else {
+                    rq.check_preempt_remote(pcb, WakeupFlags::empty());
                 }
-
-                rq.activate_task(pcb, flags);
-
-                rq.check_preempt_currnet(pcb, WakeupFlags::empty());
 
                 // sched_enqueue(pcb.clone(), true);
                 return Ok(());
@@ -277,6 +327,69 @@ impl ProcessManager {
         }
     }
 
+    #[allow(dead_code)]
+    pub fn set_fifo_policy(pcb: &Arc<ProcessControlBlock>, prio: i32) -> Result<(), SystemError> {
+        if !pcb.flags().contains(ProcessFlags::KTHREAD) {
+            return Err(SystemError::EPERM);
+        }
+
+        if !(0..crate::sched::prio::MAX_RT_PRIO).contains(&prio) {
+            return Err(SystemError::EINVAL);
+        }
+
+        let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+
+        let on_rq = *pcb.sched_info().on_rq.lock_irqsave();
+        if on_rq == crate::sched::OnRq::Queued {
+            let target_cpu = pcb.sched_info().on_cpu().unwrap_or(current_cpu_id());
+            let update_clock = target_cpu == smp_get_processor_id();
+            let rq = crate::sched::cpu_rq(target_cpu.data() as usize);
+            let (rq, _guard) = rq.self_lock();
+            if update_clock {
+                rq.update_rq_clock();
+            }
+
+            let old_policy = pcb.sched_info().policy();
+            if old_policy != crate::sched::SchedPolicy::FIFO {
+                rq.dequeue_task(
+                    pcb.clone(),
+                    crate::sched::DequeueFlag::DEQUEUE_NOCLOCK
+                        | crate::sched::DequeueFlag::DEQUEUE_SAVE,
+                );
+            }
+
+            {
+                *pcb.sched_info().sched_policy.write_irqsave() = crate::sched::SchedPolicy::FIFO;
+                let mut prio_data = pcb.sched_info().prio_data.write_irqsave();
+                prio_data.prio = prio;
+                prio_data.static_prio = prio;
+                prio_data.normal_prio = prio;
+            }
+
+            if old_policy != crate::sched::SchedPolicy::FIFO {
+                rq.enqueue_task(
+                    pcb.clone(),
+                    crate::sched::EnqueueFlag::ENQUEUE_NOCLOCK
+                        | crate::sched::EnqueueFlag::ENQUEUE_RESTORE,
+                );
+            }
+
+            if update_clock {
+                rq.check_preempt_currnet(pcb, crate::sched::WakeupFlags::empty());
+            } else {
+                rq.check_preempt_remote(pcb, crate::sched::WakeupFlags::empty());
+            }
+        } else {
+            *pcb.sched_info().sched_policy.write_irqsave() = crate::sched::SchedPolicy::FIFO;
+            let mut prio_data = pcb.sched_info().prio_data.write_irqsave();
+            prio_data.prio = prio;
+            prio_data.static_prio = prio;
+            prio_data.normal_prio = prio;
+        }
+
+        Ok(())
+    }
+
     /// 唤醒暂停的进程
     pub fn wakeup_stop(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
@@ -286,29 +399,30 @@ impl ProcessManager {
             let state = writer.state();
             if let ProcessState::Stopped = state {
                 writer.set_state(ProcessState::Runnable);
+                // Stopped -> Runnable：必须清理 sleep 标志，否则调度器可能把该任务当作“睡眠出队”处理。
+                writer.set_wakeup();
                 // avoid deadlock
                 drop(writer);
 
-                let prev_cpu = pcb.sched_info().on_cpu().unwrap_or(smp_get_processor_id());
-
-                // 使用负载均衡器选择目标CPU
-                let target_cpu =
-                    crate::sched::load_balance::LoadBalancer::select_task_rq(pcb, prev_cpu, 0);
-
-                let rq = cpu_rq(target_cpu.data() as usize);
+                let rq = cpu_rq(
+                    pcb.sched_info()
+                        .on_cpu()
+                        .unwrap_or(smp_get_processor_id())
+                        .data() as usize,
+                );
 
                 let (rq, _guard) = rq.self_lock();
                 rq.update_rq_clock();
+                rq.activate_task(
+                    pcb,
+                    EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK,
+                );
 
-                // 如果目标CPU与原CPU不同，添加迁移标志
-                let mut flags = EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK;
-                if target_cpu != prev_cpu {
-                    flags |= EnqueueFlag::ENQUEUE_MIGRATED;
+                if update_clock {
+                    rq.check_preempt_currnet(pcb, WakeupFlags::empty());
+                } else {
+                    rq.check_preempt_remote(pcb, WakeupFlags::empty());
                 }
-
-                rq.activate_task(pcb, flags);
-
-                rq.check_preempt_currnet(pcb, WakeupFlags::empty());
 
                 // sched_enqueue(pcb.clone(), true);
                 return Ok(());
@@ -332,13 +446,37 @@ impl ProcessManager {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let mut writer = pcb.sched_info().inner_lock_write_irqsave();
         let state = writer.state();
-        if !matches!(state, ProcessState::Exited(_)) {
-            writer.set_state(ProcessState::Stopped);
-            pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
-            drop(writer);
-            return Ok(());
+        if matches!(state, ProcessState::Exited(_)) {
+            return Err(SystemError::EINTR);
         }
-        return Err(SystemError::EINTR);
+
+        // Stopped 的任务不应继续留在 runqueue 中，否则仍可能被选中运行。
+        let on_rq = *pcb.sched_info().on_rq.lock_irqsave();
+        writer.set_state(ProcessState::Stopped);
+        // stop 后不应再被视为“睡眠任务”，避免后续调度错误地做 DEQUEUE_SLEEP。
+        writer.set_wakeup();
+        pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
+        drop(writer);
+
+        if on_rq == OnRq::Queued {
+            let target_cpu = pcb.sched_info().on_cpu().unwrap_or(current_cpu_id());
+            let update_clock = target_cpu == smp_get_processor_id();
+            let rq = cpu_rq(target_cpu.data() as usize);
+            let (rq, _guard) = rq.self_lock();
+            if update_clock {
+                rq.update_rq_clock();
+            }
+            // STOP 使任务不可运行：应从 rq 移除，但这不是 CPU 迁移。
+            // 使用 DEQUEUE_STOPPED 让 OnRq 进入 None，避免后续 activate_task() 走 ENQUEUE_MIGRATED 分支。
+            rq.deactivate_task(
+                pcb.clone(),
+                DequeueFlag::DEQUEUE_STOPPED | DequeueFlag::DEQUEUE_NOCLOCK,
+            );
+        }
+
+        // 强制让目标 CPU 尽快进入内核并重新调度，缩短 stop 生效延迟。
+        ProcessManager::kick(pcb);
+        Ok(())
     }
 
     /// 标志当前进程永久睡眠，但是发起调度的工作，应该由调用者完成
@@ -394,6 +532,42 @@ impl ProcessManager {
     #[inline(never)]
     fn exit_notify() {
         let current = ProcessManager::current_pcb();
+        let sighand = current.sighand();
+        let exec_task = if sighand.flags_contains(SignalFlags::GROUP_EXEC) {
+            sighand.group_exec_task()
+        } else {
+            None
+        };
+        let is_mt_exec_leader = current.is_thread_group_leader()
+            && exec_task
+                .as_ref()
+                .map(|t| !Arc::ptr_eq(t, &current))
+                .unwrap_or(false);
+        if sighand.flags_contains(SignalFlags::GROUP_EXEC) {
+            if let Some(exec_task) = exec_task.as_ref() {
+                if !Arc::ptr_eq(exec_task, &current) {
+                    let notify_count = sighand.group_exec_notify_count();
+                    if notify_count < 0 {
+                        // mt-exec: exec 线程正在等待 leader 退出
+                        sighand.wake_group_exec_waiters();
+                    } else if !current.is_thread_group_leader() {
+                        sighand.dec_group_exec_notify_count_and_wake();
+                    }
+                }
+            }
+            let should_clear = exec_task
+                .as_ref()
+                .map(|t| Arc::ptr_eq(t, &current))
+                .unwrap_or(false);
+            if should_clear {
+                sighand.finish_group_exec();
+            }
+        }
+        // mt-exec: leader 退出时只标记 zombie，避免触发普通退出通知/收养
+        if is_mt_exec_leader {
+            current.set_exit_state_zombie();
+            return;
+        }
         // 让INIT进程收养所有子进程
         if current.raw_pid() != RawPid(1) {
             unsafe {
@@ -401,6 +575,8 @@ impl ProcessManager {
                     .adopt_childen()
                     .unwrap_or_else(|e| panic!("adopte_childen failed: error: {e:?}"))
             };
+            // 在通知父进程之前，先标记为 Zombie，保证 wait 可见
+            current.set_exit_state_zombie();
             let r = current.parent_pcb.read_irqsave().upgrade();
             if r.is_none() {
                 return;
@@ -419,24 +595,32 @@ impl ProcessManager {
                         e
                     );
                 }
-                // 额外唤醒：父进程可能阻塞在 wait 系列调用上
-                parent_pcb
-                    .wait_queue
-                    .wakeup_all(Some(ProcessState::Blocked(true)));
+            }
 
-                // 根据 Linux wait 语义，线程组中的任何线程都可以等待同一线程组中任何线程创建的子进程。
-                // 由于子进程被添加到线程组 leader 的 children 列表中，
-                // 因此还需要唤醒线程组 leader 的 wait_queue（如果 leader 不是 parent_pcb 本身）。
-                let parent_group_leader = {
-                    let ti = parent_pcb.thread.read_irqsave();
-                    ti.group_leader()
-                };
-                if let Some(leader) = parent_group_leader {
-                    if !Arc::ptr_eq(&leader, &parent_pcb) {
-                        leader
-                            .wait_queue
-                            .wakeup_all(Some(ProcessState::Blocked(true)));
-                    }
+            // 无论exit_signal是什么值，都要唤醒父进程的wait_queue
+            // 因为父进程可能使用__WALL选项等待任何类型的子进程（包括exit_signal=0的clone子进程）
+            // 根据Linux语义，exit_signal只决定发送什么信号，不决定是否唤醒父进程
+            parent_pcb
+                .wait_queue
+                .wakeup_all(Some(ProcessState::Blocked(true)));
+
+            // kthread 退出时显式唤醒 kthreadd，使其回收 zombie
+            if current.is_kthread() {
+                let _ = ProcessManager::wakeup(&parent_pcb);
+            }
+
+            // 根据 Linux wait 语义，线程组中的任何线程都可以等待同一线程组中任何线程创建的子进程。
+            // 由于子进程被添加到线程组 leader 的 children 列表中，
+            // 因此还需要唤醒线程组 leader 的 wait_queue（如果 leader 不是 parent_pcb 本身）。
+            let parent_group_leader = {
+                let ti = parent_pcb.thread.read_irqsave();
+                ti.group_leader()
+            };
+            if let Some(leader) = parent_group_leader {
+                if !Arc::ptr_eq(&leader, &parent_pcb) {
+                    leader
+                        .wait_queue
+                        .wakeup_all(Some(ProcessState::Blocked(true)));
                 }
             }
             // todo: 这里还需要根据线程组的信息，决定信号的发送
@@ -475,27 +659,31 @@ impl ProcessManager {
         // log::debug!("[exit: {}]", raw_pid.data());
         {
             let pcb = ProcessManager::current_pcb();
+            pcb.mark_exiting();
             pid = pcb.pid();
             pcb.wait_queue.mark_dead();
 
-            let rq = cpu_rq(smp_get_processor_id().data() as usize);
-            let (rq, guard) = rq.self_lock();
-            rq.deactivate_task(
-                pcb.clone(),
-                DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
-            );
-            drop(guard);
-
             // 进行进程退出后的工作
             let thread = pcb.thread.write_irqsave();
-
-            if let Some(addr) = thread.clear_child_tid {
+            let clear_child_tid = thread.clear_child_tid;
+            let vfork_done = thread.vfork_done.clone();
+            drop(thread);
+            if let Some(addr) = clear_child_tid {
                 // 按 Linux 语义：先清零 userland 的 *clear_child_tid，再 futex_wake(addr)
-                unsafe {
-                    clear_user_protected(addr, core::mem::size_of::<i32>())
-                        .expect("clear tid failed")
+                let cleared_ok = unsafe {
+                    match clear_user_protected(addr, core::mem::size_of::<i32>()) {
+                        Ok(_) => true,
+                        Err(e) => {
+                            // clear_child_tid 指针可能无效或已拆映射：不能因此 panic。
+                            warn!("clear tid failed: {e:?}");
+                            false
+                        }
+                    }
                 };
-                if Arc::strong_count(&pcb.basic().user_vm().expect("User VM Not found")) > 1 {
+                // 若无法清零 *clear_child_tid，则也不要 futex_wake（避免进一步的非法用户态访问）
+                if cleared_ok
+                    && Arc::strong_count(&pcb.basic().user_vm().expect("User VM Not found")) > 1
+                {
                     // Linux 使用 FUTEX_SHARED 标志来唤醒 clear_child_tid
                     // 这允许跨进程/线程的同步（例如 pthread_join）
                     let _ =
@@ -506,13 +694,12 @@ impl ProcessManager {
 
             RobustListHead::exit_robust_list(pcb.clone());
             // 如果是vfork出来的进程，则需要处理completion
-            if thread.vfork_done.is_some() {
-                thread.vfork_done.as_ref().unwrap().complete_all();
+            if let Some(vd) = vfork_done {
+                vd.complete_all();
             }
-            drop(thread);
 
-            unsafe { pcb.basic_mut().set_user_vm(None) };
             pcb.exit_files();
+            pcb.exit_timers();
             // TODO 由于未实现进程组，tty记录的前台进程组等于当前进程，故退出前要置空
             // 后续相关逻辑需要在SYS_EXIT_GROUP系统调用中实现
             if let Some(tty) = pcb.sig_info_irqsave().tty() {
@@ -524,10 +711,40 @@ impl ProcessManager {
             }
             pcb.sig_info_mut().set_tty(None);
 
-            // 在最后，调用 exit_notify 之前，设置状态为 Exited
+            // 在最后，调用 exit_notify 之前，设置调度状态为 Exited
             pcb.sched_info
                 .inner_lock_write_irqsave()
                 .set_state(ProcessState::Exited(exit_code));
+
+            let rq = cpu_rq(smp_get_processor_id().data() as usize);
+            let (rq, guard) = rq.self_lock();
+            rq.update_rq_clock();
+            rq.deactivate_task(
+                pcb.clone(),
+                DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
+            );
+            drop(guard);
+
+            // 注意：exit_files() 可能会触发阻塞（例如关闭 FUSE fd 需要等待 daemon 回复），
+            // 因此不能在它之前清空 user_vm，否则后续调度切换会遇到 user_vm==None 的普通进程并崩溃。
+            //
+            // INV-1: Before releasing the hold on user_vm, clear this CPU from the mm's active_cpus,
+            // otherwise after the mm is freed (Arc count reaches zero) a stale per-CPU cpumask bit
+            // will remain, and subsequent flushes by other threads on the same mm would still target
+            // this CPU and send spurious IPIs.
+            //
+            // Note that this CPU's hardware page table still points to this mm, but __schedule will
+            // immediately switch to idle, whose IDLE_PROCESS_ADDRESS_SPACE will re-set this CPU's
+            // active_cpus bit and write the correct per-CPU TlbState. So clearing the old mm's bit
+            // here is sufficient.
+            {
+                let cpu = smp_get_processor_id();
+                if let Some(old_vm) = pcb.basic().user_vm() {
+                    old_vm.active_cpus_clear(cpu);
+                }
+            }
+
+            unsafe { pcb.basic_mut().set_user_vm(None) };
 
             drop(pcb);
 
@@ -568,12 +785,33 @@ impl ProcessManager {
             // 1. 在共享的 sighand 上原子性地设置 GROUP_EXIT 标志与 group_exit_code
             //    若已有线程抢先设置，则复用已存在的退出码。
             let sighand = current_pcb.sighand();
+            current_pcb.mark_exiting();
             final_exit_code = sighand.start_group_exit(exit_code);
 
             // 2. 向同一线程组内的其他线程发送 SIGKILL，唤醒并强制终止它们
             //    仿照 Linux zap_other_threads 的语义，这里仅负责投递 SIGKILL，
             //    实际退出在各线程上下文中完成。
             {
+                let send_sigkill_thread = |task: Arc<ProcessControlBlock>| {
+                    if task.flags().contains(ProcessFlags::EXITING) {
+                        return;
+                    }
+                    let mut info = SigInfo::new(
+                        Signal::SIGKILL,
+                        0,
+                        SigCode::Kernel,
+                        SigType::Kill {
+                            pid: RawPid::new(0),
+                            uid: 0,
+                        },
+                    );
+                    let _ = Signal::SIGKILL.send_signal_info_to_pcb(
+                        Some(&mut info),
+                        task,
+                        PidType::PID,
+                    );
+                };
+
                 // 统一从线程组组长的 ThreadInfo 中获取完整的线程列表，
                 // 避免从非组长线程看到的 group_tasks 为空导致遗漏。
                 let leader = {
@@ -590,7 +828,7 @@ impl ProcessManager {
                 if !Arc::ptr_eq(&leader, &current_pcb)
                     && !leader.flags().contains(ProcessFlags::EXITING)
                 {
-                    let _ = send_signal_to_pcb(leader.clone(), Signal::SIGKILL);
+                    send_sigkill_thread(leader.clone());
                 }
 
                 // 再遍历组长维护的 group_tasks，向其他线程发送 SIGKILL
@@ -603,7 +841,7 @@ impl ProcessManager {
                         if task.flags().contains(ProcessFlags::EXITING) {
                             continue;
                         }
-                        let _ = send_signal_to_pcb(task.clone(), Signal::SIGKILL);
+                        send_sigkill_thread(task);
                     }
                 }
             }
@@ -629,8 +867,12 @@ impl ProcessManager {
         if let Some(ref pcb) = pcb {
             // 从父进程的 children 列表中移除
             if let Some(parent) = pcb.real_parent_pcb() {
+                let parent_ns = parent.active_pid_ns();
+                let vpid = pcb
+                    .task_pid_nr_ns(PidType::PID, Some(parent_ns))
+                    .unwrap_or(RawPid::new(0));
                 let mut children = parent.children.write();
-                children.retain(|&p| p != pid);
+                children.retain(|&p| p != vpid);
             }
 
             ALL_PROCESS.lock_irqsave().as_mut().unwrap().remove(&pid);
@@ -709,6 +951,15 @@ impl fmt::Display for RawPid {
     }
 }
 
+impl FromStr for RawPid {
+    type Err = core::num::ParseIntError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let pid = usize::from_str(s)?;
+        Ok(RawPid(pid))
+    }
+}
+
 impl RawPid {
     /// 该RawPid暂未分配，待会会初始化它。
     /// 这个状态只应当出现在进程/线程创建的过程中
@@ -733,6 +984,24 @@ pub enum ProcessState {
     Stopped,
     /// 进程已经退出，usize表示进程的退出码
     Exited(usize),
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExitState {
+    Running = 0,
+    Zombie = 1,
+    Dead = 2,
+}
+
+impl ExitState {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => ExitState::Zombie,
+            2 => ExitState::Dead,
+            _ => ExitState::Running,
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -804,12 +1073,18 @@ bitflags! {
         const RESTORE_SIG_MASK = 1 << 10;
         /// Forked but didn't exec
         const FORKNOEXEC = 1 << 11;
+        /// 进程需要在返回用户态前处理 rseq
+        const NEED_RSEQ = 1 << 12;
+        /// 进程正在等待 IO 操作完成（用于 iowait 统计）
+        const IN_IOWAIT = 1 << 13;
+        /// 线程组 exec 期间延迟 PID/TGID/PGID/SID 的 unhash
+        const DEFER_UNHASH = 1 << 14;
     }
 }
 
 impl ProcessFlags {
     pub const fn exit_to_user_mode_work(&self) -> Self {
-        Self::from_bits_truncate(self.bits & (Self::HAS_PENDING_SIGNAL.bits))
+        Self::from_bits_truncate(self.bits & (Self::HAS_PENDING_SIGNAL.bits | Self::NEED_RSEQ.bits))
     }
 
     /// 测试并清除标志位
@@ -826,14 +1101,6 @@ impl ProcessFlags {
         self.bits &= !rhs.bits;
         r
     }
-}
-
-// TODO 完善相关的方法
-#[derive(Debug, Default)]
-pub struct ProcessCpuTime {
-    pub utime: AtomicU64,
-    pub stime: AtomicU64,
-    pub sum_exec_runtime: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -859,7 +1126,7 @@ pub struct ProcessItimers {
 #[derive(Debug)]
 pub struct ProcessControlBlock {
     /// 当前进程的pid
-    pid: RawPid,
+    pid: AtomicRawPid,
     /// 当前进程的线程组id（这个值在同一个线程组内永远不变）
     tgid: RawPid,
 
@@ -891,22 +1158,39 @@ pub struct ProcessControlBlock {
     sighand: RwLock<Arc<SigHand>>,
     /// 备用信号栈
     sig_altstack: RwLock<SigStackArch>,
+    /// 退出状态（Running/Zombie/Dead）
+    exit_state: AtomicU8,
 
     /// 退出信号S
     exit_signal: AtomicSignal,
     /// 父进程退出时要发送给当前进程的信号（PR_SET_PDEATHSIG）
     pdeath_signal: AtomicSignal,
 
+    /// prctl(PR_SET/GET_NO_NEW_PRIVS) 状态：线程级（task）语义。
+    no_new_privs: AtomicBool,
+
+    /// prctl(PR_SET/GET_KEEPCAPS) 状态：线程级（task）语义。
+    /// 当为 true 时，进程改变 UID/GID 后会保留 capabilities。
+    keepcaps: AtomicBool,
+
+    /// prctl(PR_SET/GET_DUMPABLE) 状态。
+    /// Linux: 0=SUID_DUMP_DISABLE, 1=SUID_DUMP_USER；2(SUID_DUMP_ROOT) 不允许通过 PR_SET_DUMPABLE 设置。
+    dumpable: AtomicU8,
+
     /// 父进程指针
-    parent_pcb: RwLock<Weak<ProcessControlBlock>>,
+    pub(crate) parent_pcb: RwLock<Weak<ProcessControlBlock>>,
     /// 真实父进程指针
-    real_parent_pcb: RwLock<Weak<ProcessControlBlock>>,
+    pub(crate) real_parent_pcb: RwLock<Weak<ProcessControlBlock>>,
+    pub(crate) fork_parent_pcb: RwLock<Weak<ProcessControlBlock>>,
 
     /// 子进程链表
     children: RwLock<Vec<RawPid>>,
 
     /// 等待队列
     wait_queue: WaitQueue,
+
+    /// CPU-time 等待队列：用于 CLOCK_{PROCESS,THREAD}_CPUTIME_ID 的 clock_nanosleep
+    cputime_wait_queue: WaitQueue,
 
     /// 线程信息
     thread: RwLock<ThreadInfo>,
@@ -917,12 +1201,17 @@ pub struct ProcessControlBlock {
     ///闹钟定时器
     alarm_timer: SpinLock<Option<AlarmTimer>>,
     itimers: SpinLock<ProcessItimers>,
+    /// POSIX interval timers（timer_create/timer_settime/...）
+    posix_timers: SpinLock<posix_timer::ProcessPosixTimers>,
 
     /// CPU时间片
     cpu_time: Arc<ProcessCpuTime>,
 
     /// 进程的robust lock列表
     robust_list: RwLock<Option<RobustListHead>>,
+
+    /// rseq（Restartable Sequences）状态
+    rseq_state: RwLock<rseq::RseqState>,
 
     /// 进程作为主体的凭证集
     cred: SpinLock<Arc<Cred>>,
@@ -932,6 +1221,8 @@ pub struct ProcessControlBlock {
 
     /// 进程的可执行文件路径
     executable_path: RwLock<String>,
+    /// 进程的命令行（用于 /proc/<pid>/cmdline，Linux 语义：argv 以 '\0' 分隔）
+    cmdline: RwLock<Vec<u8>>,
     /// 资源限制（rlimit）数组
     rlimits: RwLock<[RLimit64; RLimitID::Nlimits as usize]>,
 }
@@ -967,7 +1258,7 @@ impl ProcessControlBlock {
     ///
     /// 若进程是内核进程则返回true 否则返回false
     pub fn is_kthread(&self) -> bool {
-        return matches!(self.flags(), &mut ProcessFlags::KTHREAD);
+        self.flags().contains(ProcessFlags::KTHREAD)
     }
 
     #[inline(never)]
@@ -993,11 +1284,6 @@ impl ProcessControlBlock {
         } else {
             let ppid = ProcessManager::current_pcb().task_pid_vnr();
             let cred = ProcessManager::current_pcb().cred();
-            if cred.cap_ambient != cred.cap_permitted || cred.cap_ambient != cred.cap_effective {
-                todo!("create a new cred for child.")
-                //     cred.cap_permitted = cred.cap_ambient;
-                // cred.cap_effective = cred.cap_ambient;
-            }
 
             let cwd = ProcessManager::current_pcb().basic().cwd();
             let tty = ProcessManager::current_pcb().sig_info_irqsave().tty();
@@ -1024,7 +1310,7 @@ impl ProcessControlBlock {
             let arch_info = SpinLock::new(ArchPCBInfo::new(&kstack));
 
             let pcb = Self {
-                pid: raw_pid,
+                pid: AtomicRawPid::new(raw_pid),
                 tgid: raw_pid,
                 thread_pid: RwLock::new(None),
                 pid_links: core::array::from_fn(|_| PidLink::default()),
@@ -1040,22 +1326,33 @@ impl ProcessControlBlock {
                 sig_info: RwLock::new(ProcessSignalInfo::default()),
                 sighand: RwLock::new(SigHand::new()),
                 sig_altstack: RwLock::new(SigStackArch::new()),
+                exit_state: AtomicU8::new(ExitState::Running as u8),
                 exit_signal: AtomicSignal::new(Signal::SIGCHLD),
                 pdeath_signal: AtomicSignal::new(Signal::INVALID),
+
+                no_new_privs: AtomicBool::new(false),
+                keepcaps: AtomicBool::new(false),
+                // 默认设置为 SUID_DUMP_USER(=1)，满足 gVisor 的 SetGetDumpability 预期。
+                dumpable: AtomicU8::new(1),
                 parent_pcb: RwLock::new(ppcb.clone()),
-                real_parent_pcb: RwLock::new(ppcb),
+                real_parent_pcb: RwLock::new(ppcb.clone()),
+                fork_parent_pcb: RwLock::new(ppcb),
                 children: RwLock::new(Vec::new()),
                 wait_queue: WaitQueue::default(),
+                cputime_wait_queue: WaitQueue::default(),
                 thread: RwLock::new(ThreadInfo::new()),
                 fs: RwLock::new(Arc::new(FsStruct::new())),
                 alarm_timer: SpinLock::new(None),
                 itimers: SpinLock::new(ProcessItimers::default()),
+                posix_timers: SpinLock::new(posix_timer::ProcessPosixTimers::default()),
                 cpu_time: Arc::new(ProcessCpuTime::default()),
                 robust_list: RwLock::new(None),
+                rseq_state: RwLock::new(rseq::RseqState::new()),
                 cred: SpinLock::new(cred),
                 self_ref: weak.clone(),
                 restart_block: SpinLock::new(None),
                 executable_path: RwLock::new(name),
+                cmdline: RwLock::new(Vec::new()),
                 rlimits: RwLock::new(Self::default_rlimits()),
             };
 
@@ -1270,6 +1567,43 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
+    pub fn no_new_privs(&self) -> usize {
+        if self.no_new_privs.load(Ordering::SeqCst) {
+            1
+        } else {
+            0
+        }
+    }
+
+    #[inline(always)]
+    pub fn set_no_new_privs(&self, value: bool) {
+        // Linux 语义：no_new_privs 一旦置位不可清除。
+        if value {
+            self.no_new_privs.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[inline(always)]
+    pub fn keepcaps(&self) -> bool {
+        self.keepcaps.load(Ordering::SeqCst)
+    }
+
+    #[inline(always)]
+    pub fn set_keepcaps(&self, value: bool) {
+        self.keepcaps.store(value, Ordering::SeqCst);
+    }
+
+    #[inline(always)]
+    pub fn dumpable(&self) -> u8 {
+        self.dumpable.load(Ordering::SeqCst)
+    }
+
+    #[inline(always)]
+    pub fn set_dumpable(&self, value: u8) {
+        self.dumpable.store(value, Ordering::SeqCst)
+    }
+
+    #[inline(always)]
     pub fn basic_mut(&self) -> RwLockWriteGuard<'_, ProcessBasicInfo> {
         return self.basic.write_irqsave();
     }
@@ -1328,12 +1662,12 @@ impl ProcessControlBlock {
 
     #[inline(always)]
     pub fn raw_pid(&self) -> RawPid {
-        return self.pid;
+        return self.pid.load(Ordering::Acquire);
     }
 
     #[inline(always)]
     pub fn raw_tgid(&self) -> RawPid {
-        return self.pid;
+        return self.tgid;
     }
 
     #[inline(always)]
@@ -1351,7 +1685,7 @@ impl ProcessControlBlock {
 
     /// 获取文件描述符表的Arc指针
     #[inline(always)]
-    pub fn fd_table(&self) -> Arc<RwLock<FileDescriptorVec>> {
+    pub fn fd_table(&self) -> Arc<RwSem<FileDescriptorVec>> {
         return self.basic.read().try_fd_table().unwrap();
     }
 
@@ -1377,8 +1711,35 @@ impl ProcessControlBlock {
         self.executable_path.read().clone()
     }
 
+    /// 获取 /proc/<pid>/cmdline 的原始字节序列（argv 以 '\0' 分隔）。
+    #[inline(always)]
+    pub fn cmdline_bytes(&self) -> Vec<u8> {
+        self.cmdline.read().clone()
+    }
+
+    /// 直接设置 cmdline（用于 fork 继承等场景）。
+    #[inline(always)]
+    pub fn set_cmdline_bytes(&self, data: Vec<u8>) {
+        *self.cmdline.write() = data;
+    }
+
+    /// 在 exec 成功后写入 argv（Linux 语义：每个参数以 '\0' 结尾，整体通常也以 '\0' 结尾）。
+    #[inline(never)]
+    pub fn set_cmdline_from_argv(&self, argv: &[CString]) {
+        let mut buf: Vec<u8> = Vec::new();
+        for arg in argv {
+            buf.extend_from_slice(arg.as_bytes());
+            buf.push(0);
+        }
+        *self.cmdline.write() = buf;
+    }
+
     pub fn real_parent_pcb(&self) -> Option<Arc<ProcessControlBlock>> {
         return self.real_parent_pcb.read_irqsave().upgrade();
+    }
+
+    pub fn fork_parent_pcb(&self) -> Option<Arc<ProcessControlBlock>> {
+        self.fork_parent_pcb.read_irqsave().upgrade()
     }
 
     /// 判断当前进程是否是全局的init进程
@@ -1428,51 +1789,95 @@ impl ProcessControlBlock {
 
     /// 当前进程退出时,让初始进程收养所有子进程
     unsafe fn adopt_childen(&self) -> Result<(), SystemError> {
-        let child_pids = {
-            let childen_guard = self.children.write();
-            childen_guard.clone()
+        // 取出并清空 children 列表，避免后续 wait/reparent 出现重复。
+        let child_pids: Vec<RawPid> = {
+            let mut children_guard = self.children.write();
+            core::mem::take(&mut *children_guard)
         };
+
+        if child_pids.is_empty() {
+            return Ok(());
+        }
 
         self.notify_parent_exit_for_children(&child_pids);
 
-        match ProcessManager::find_task_by_vpid(RawPid(1)) {
-            Some(init_pcb) => {
-                if Arc::ptr_eq(&self.self_ref.upgrade().unwrap(), &init_pcb) {
-                    // 当前进程是namespace的init进程，由父进程所在的pidns的init进程去收养子进程
-                    if let Some(parent_pcb) = self.real_parent_pcb() {
-                        assert!(
-                            !Arc::ptr_eq(&parent_pcb, &init_pcb),
-                            "adopt_childen: parent_pcb is init_pcb, pid: {}",
-                            self.raw_pid()
-                        );
-                        let parent_init = ProcessManager::find_task_by_pid_ns(
-                            RawPid(1),
-                            &parent_pcb.active_pid_ns(),
-                        );
-                        if parent_init.is_none() {
-                            return Ok(());
-                        }
-                        let parent_init = parent_init.unwrap();
-                        let mut parent_children_guard = parent_init.children.write();
-                        child_pids.iter().for_each(|pid| {
-                            parent_children_guard.push(*pid);
-                        });
+        let init_pcb = ProcessManager::find_task_by_vpid(RawPid(1)).ok_or(SystemError::ECHILD)?;
 
-                        return Ok(());
-                    } else {
-                        return Ok(());
+        // 如果当前进程是 namespace 的 init，则由父进程所在 pidns 的 init 去收养。
+        if Arc::ptr_eq(&self.self_ref.upgrade().unwrap(), &init_pcb) {
+            if let Some(parent_pcb) = self.real_parent_pcb() {
+                assert!(
+                    !Arc::ptr_eq(&parent_pcb, &init_pcb),
+                    "adopt_childen: parent_pcb is init_pcb, pid: {}",
+                    self.raw_pid()
+                );
+                let parent_init =
+                    ProcessManager::find_task_by_pid_ns(RawPid(1), &parent_pcb.active_pid_ns());
+                if let Some(parent_init) = parent_init {
+                    for pid in child_pids.iter().copied() {
+                        if let Some(child) = ProcessManager::find_task_by_vpid(pid) {
+                            *child.parent_pcb.write_irqsave() = Arc::downgrade(&parent_init);
+                            *child.real_parent_pcb.write_irqsave() = Arc::downgrade(&parent_init);
+                            let parent_pid_in_child_ns = parent_init
+                                .task_pid_nr_ns(PidType::PID, Some(child.active_pid_ns()))
+                                .unwrap_or(RawPid::new(0));
+                            child.basic.write_irqsave().ppid = parent_pid_in_child_ns;
+
+                            let child_vpid_in_parent_ns = child
+                                .task_pid_nr_ns(PidType::PID, Some(parent_init.active_pid_ns()))
+                                .unwrap_or(RawPid::new(0));
+                            if child_vpid_in_parent_ns.data() != 0 {
+                                parent_init.children.write().push(child_vpid_in_parent_ns);
+                            }
+                        }
                     }
                 }
-                let mut init_childen_guard = init_pcb.children.write();
-
-                child_pids.iter().for_each(|pid| {
-                    init_childen_guard.push(*pid);
-                });
-
-                return Ok(());
             }
-            _ => Err(SystemError::ECHILD),
+            return Ok(());
         }
+
+        // 常规情况：优先 reparent 到“最近祖先 subreaper”，否则 reparent 到 init。
+        let mut reaper: Arc<ProcessControlBlock> = init_pcb.clone();
+        let mut cursor = self.parent_pcb();
+        while let Some(p) = cursor {
+            // Linux 语义：child_subreaper 是线程组级；这里统一按线程组 leader 判定。
+            let leader = {
+                let ti = p.threads_read_irqsave();
+                ti.group_leader().unwrap_or_else(|| p.clone())
+            };
+
+            if leader.sig_info_irqsave().is_child_subreaper() {
+                reaper = leader;
+                break;
+            }
+
+            if leader.raw_pid() == RawPid(1) {
+                break;
+            }
+
+            cursor = leader.parent_pcb();
+        }
+
+        for pid in child_pids.iter().copied() {
+            if let Some(child) = ProcessManager::find_task_by_vpid(pid) {
+                *child.parent_pcb.write_irqsave() = Arc::downgrade(&reaper);
+                *child.real_parent_pcb.write_irqsave() = Arc::downgrade(&reaper);
+                let parent_pid_in_child_ns = reaper
+                    .task_pid_nr_ns(PidType::PID, Some(child.active_pid_ns()))
+                    .unwrap_or(RawPid::new(0));
+                child.basic.write_irqsave().ppid = parent_pid_in_child_ns;
+
+                // 按 wait 语义，将被收养子进程挂到收养者（线程组 leader）的 children 列表中。
+                let child_vpid_in_reaper_ns = child
+                    .task_pid_nr_ns(PidType::PID, Some(reaper.active_pid_ns()))
+                    .unwrap_or(RawPid::new(0));
+                if child_vpid_in_reaper_ns.data() != 0 {
+                    reaper.children.write().push(child_vpid_in_reaper_ns);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn notify_parent_exit_for_children(&self, child_pids: &[RawPid]) {
@@ -1523,6 +1928,18 @@ impl ProcessControlBlock {
         self.sig_info.write_irqsave()
     }
 
+    /// 获取 rseq 状态的只读引用
+    #[inline]
+    pub fn rseq_state(&self) -> RwLockReadGuard<'_, rseq::RseqState> {
+        self.rseq_state.read_irqsave()
+    }
+
+    /// 获取 rseq 状态的可变引用
+    #[inline]
+    pub fn rseq_state_mut(&self) -> RwLockWriteGuard<'_, rseq::RseqState> {
+        self.rseq_state.write_irqsave()
+    }
+
     pub fn try_siginfo_mut(&self, times: u8) -> Option<RwLockWriteGuard<'_, ProcessSignalInfo>> {
         for _ in 0..times {
             if let Some(r) = self.sig_info.try_write_irqsave() {
@@ -1559,6 +1976,8 @@ impl ProcessControlBlock {
         let blocked: SigSet = *sig_info.sig_blocked();
         let mut pending: SigSet = sig_info.sig_pending().signal();
         drop(sig_info);
+        // 同时检查 shared_pending
+        pending |= self.sighand().shared_pending_signal();
         pending.remove(blocked);
         // log::debug!(
         //     "pending and not masked:{:?}, masked: {:?}",
@@ -1589,29 +2008,46 @@ impl ProcessControlBlock {
         return self.itimers.lock_irqsave();
     }
 
-    #[inline(always)]
-    pub fn cputime(&self) -> Arc<ProcessCpuTime> {
-        return self.cpu_time.clone();
+    pub fn posix_timers_irqsave(&self) -> SpinLockGuard<'_, posix_timer::ProcessPosixTimers> {
+        return self.posix_timers.lock_irqsave();
     }
-    #[inline(always)]
-    pub fn account_utime(&self, ns: u64) {
-        if ns == 0 {
-            return;
+
+    /// 清理当前进程/线程的定时器
+    ///
+    /// 参考 Linux do_exit() 中的定时器清理逻辑：
+    /// ```c
+    /// if (group_dead) {
+    ///     hrtimer_cancel(&tsk->signal->real_timer);
+    ///     exit_itimers(tsk);
+    /// }
+    /// ```
+    ///
+    /// DragonOS 中 alarm_timer 是 per-PCB 的，因此每个线程退出时
+    /// 都需要取消自己的 alarm timer。itimers 和 posix_timers 仅在
+    /// 线程组 leader 退出时（group_dead）清理。
+    fn exit_timers(&self) {
+        // 1. 取消当前线程的 alarm timer
+        if let Some(alarm) = self.alarm_timer.lock_irqsave().take() {
+            alarm.cancel();
         }
-        self.cpu_time.utime.fetch_add(ns, Ordering::Relaxed);
-    }
-    #[inline(always)]
-    pub fn account_stime(&self, ns: u64) {
-        if ns == 0 {
-            return;
+
+        let group_dead = self.is_thread_group_leader();
+        if group_dead {
+            // 2. 取消 ITIMER_REAL
+            if let Some(real_itimer) = self.itimers.lock_irqsave().real.take() {
+                real_itimer.timer.cancel();
+            }
+
+            // 3. 删除所有 POSIX interval timers
+            let mut posix_timers = self.posix_timers.lock_irqsave();
+            let timer_ids: alloc::vec::Vec<i32> = posix_timers.timer_ids().collect();
+            let self_arc = self.self_ref.upgrade();
+            if let Some(ref pcb) = self_arc {
+                for id in timer_ids {
+                    let _ = posix_timers.delete(pcb, id);
+                }
+            }
         }
-        self.cpu_time.stime.fetch_add(ns, Ordering::Relaxed);
-    }
-    #[inline(always)]
-    pub fn add_sum_exec_runtime(&self, ns: u64) {
-        self.cpu_time
-            .sum_exec_runtime
-            .fetch_add(ns, Ordering::Relaxed);
     }
 
     /// Exit fd table when process exit
@@ -1666,6 +2102,39 @@ impl ProcessControlBlock {
             .exit_code()
     }
 
+    pub fn exit_state(&self) -> ExitState {
+        ExitState::from_u8(self.exit_state.load(Ordering::Acquire))
+    }
+
+    pub fn is_zombie(&self) -> bool {
+        self.exit_state() == ExitState::Zombie
+    }
+
+    pub fn is_dead(&self) -> bool {
+        self.exit_state() == ExitState::Dead
+    }
+
+    pub fn set_exit_state_zombie(&self) {
+        self.exit_state
+            .store(ExitState::Zombie as u8, Ordering::Release);
+    }
+
+    pub fn try_mark_dead_from_zombie(&self) -> bool {
+        self.exit_state
+            .compare_exchange(
+                ExitState::Zombie as u8,
+                ExitState::Dead as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub fn mark_exiting(&self) {
+        self.flags().insert(ProcessFlags::EXITING);
+        fence(Ordering::SeqCst);
+    }
+
     /// 获取进程的namespace代理
     pub fn nsproxy(&self) -> Arc<NsProxy> {
         self.nsproxy.read().clone()
@@ -1701,9 +2170,8 @@ impl Drop for ProcessControlBlock {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         // log::debug!("Drop ProcessControlBlock: pid: {}", self.raw_pid(),);
         self.__exit_signal();
-        // 在ProcFS中,解除进程的注册
-        // 这里忽略错误，因为进程可能未注册到procfs
-        procfs_unregister_pid(self.raw_pid()).ok();
+        // 新的 ProcFS 是动态的，进程目录会在访问时按需创建
+        // 不再需要显式注册/注销进程
         if let Some(ppcb) = self.parent_pcb.read_irqsave().upgrade() {
             ppcb.children
                 .write_irqsave()
@@ -1751,11 +2219,32 @@ impl ThreadInfo {
         return self.group_leader.upgrade();
     }
 
+    /// 返回线程组中除组长外的线程列表（由组长维护）。
+    ///
+    /// 说明：该列表存储为 `Weak`，调用者应当在使用前 `upgrade()` 并处理失败场景。
+    pub fn group_tasks_clone(&self) -> Vec<Weak<ProcessControlBlock>> {
+        self.group_tasks.clone()
+    }
+
     pub fn thread_group_empty(&self) -> bool {
         let group_leader = self.group_leader();
         if let Some(leader) = group_leader {
             if Arc::ptr_eq(&leader, &ProcessManager::current_pcb()) {
-                return self.group_tasks.is_empty();
+                if self.group_tasks.is_empty() {
+                    return true;
+                }
+                // 仅当组内存在“存活线程”时才返回 false
+                for weak in &self.group_tasks {
+                    if let Some(task) = weak.upgrade() {
+                        if Arc::ptr_eq(&task, &ProcessManager::current_pcb()) {
+                            continue;
+                        }
+                        if !task.is_exited() && !task.is_dead() && !task.is_zombie() {
+                            return false;
+                        }
+                    }
+                }
+                return true;
             }
             return false;
         }
@@ -1780,7 +2269,7 @@ pub struct ProcessBasicInfo {
     user_vm: Option<Arc<AddressSpace>>,
 
     /// 文件描述符表
-    fd_table: Option<Arc<RwLock<FileDescriptorVec>>>,
+    fd_table: Option<Arc<RwSem<FileDescriptorVec>>>,
 }
 
 impl ProcessBasicInfo {
@@ -1791,7 +2280,7 @@ impl ProcessBasicInfo {
         cwd: String,
         user_vm: Option<Arc<AddressSpace>>,
     ) -> RwLock<Self> {
-        let fd_table = Arc::new(RwLock::new(FileDescriptorVec::new()));
+        let fd_table = Arc::new(RwSem::new(FileDescriptorVec::new()));
         return RwLock::new(Self {
             ppid,
             name,
@@ -1828,14 +2317,22 @@ impl ProcessBasicInfo {
         self.user_vm = user_vm;
     }
 
-    pub fn try_fd_table(&self) -> Option<Arc<RwLock<FileDescriptorVec>>> {
+    pub fn try_fd_table(&self) -> Option<Arc<RwSem<FileDescriptorVec>>> {
         return self.fd_table.clone();
+    }
+
+    #[inline]
+    pub fn fd_table_is_shared(&self) -> bool {
+        self.fd_table
+            .as_ref()
+            .map(|t| Arc::strong_count(t) > 1)
+            .unwrap_or(false)
     }
 
     pub fn set_fd_table(
         &mut self,
-        fd_table: Option<Arc<RwLock<FileDescriptorVec>>>,
-    ) -> Option<Arc<RwLock<FileDescriptorVec>>> {
+        fd_table: Option<Arc<RwSem<FileDescriptorVec>>>,
+    ) -> Option<Arc<RwSem<FileDescriptorVec>>> {
         let old = self.fd_table.take();
         self.fd_table = fd_table;
         return old;
@@ -1862,6 +2359,8 @@ pub struct ProcessSchedulerInfo {
     /// cfs调度实体
     pub sched_entity: Arc<FairSchedEntity>,
     pub on_rq: SpinLock<OnRq>,
+    pub cpus_allowed: SpinLock<CpuMask>,
+    pub nr_cpus_allowed: AtomicUsize,
 
     pub prio_data: RwLock<PrioData>,
 }
@@ -1928,9 +2427,21 @@ impl InnerSchedInfo {
 }
 
 impl ProcessSchedulerInfo {
+    fn default_cpus_allowed() -> CpuMask {
+        if crate::smp::cpu::smp_cpu_manager_initialized() {
+            return crate::smp::cpu::smp_cpu_manager().possible_cpus().clone();
+        }
+
+        // 进程管理初始化早于 SMP 拓扑初始化。此时先退化为“当前引导 CPU 可运行”，
+        // 待后续显式初始化（如 idle/per-cpu kthread）再收敛到更精确的 mask。
+        CpuMask::from_cpu(current_cpu_id())
+    }
+
     #[inline(never)]
     pub fn new(on_cpu: Option<ProcessorId>) -> Self {
         let cpu_id = on_cpu.unwrap_or(ProcessorId::INVALID);
+        let cpus_allowed = Self::default_cpus_allowed();
+        let nr_cpus_allowed = cpus_allowed.iter_cpu().count();
         return Self {
             on_cpu: AtomicProcessorId::new(cpu_id),
             // migrate_to: AtomicProcessorId::new(ProcessorId::INVALID),
@@ -1945,6 +2456,8 @@ impl ProcessSchedulerInfo {
             sched_policy: RwLock::new(crate::sched::SchedPolicy::CFS),
             sched_entity: FairSchedEntity::new(),
             on_rq: SpinLock::new(OnRq::None),
+            cpus_allowed: SpinLock::new(cpus_allowed),
+            nr_cpus_allowed: AtomicUsize::new(nr_cpus_allowed),
             prio_data: RwLock::new(PrioData::default()),
         };
     }
@@ -2048,6 +2561,25 @@ impl ProcessSchedulerInfo {
 
     pub fn policy(&self) -> crate::sched::SchedPolicy {
         return *self.sched_policy.read_irqsave();
+    }
+
+    pub fn prio_data(&self) -> RwLockReadGuard<'_, PrioData> {
+        return self.prio_data.read_irqsave();
+    }
+
+    pub fn cpus_allowed(&self) -> CpuMask {
+        return self.cpus_allowed.lock_irqsave().clone();
+    }
+
+    pub fn nr_cpus_allowed(&self) -> usize {
+        return self.nr_cpus_allowed.load(Ordering::SeqCst);
+    }
+
+    pub fn set_cpus_allowed(&self, cpus_allowed: CpuMask) {
+        let nr_cpus_allowed = cpus_allowed.iter_cpu().count();
+        *self.cpus_allowed.lock_irqsave() = cpus_allowed;
+        self.nr_cpus_allowed
+            .store(nr_cpus_allowed, Ordering::SeqCst);
     }
 }
 
@@ -2299,8 +2831,8 @@ impl KernelStack {
 
 impl Drop for KernelStack {
     fn drop(&mut self) {
-        if self.stack.is_some() {
-            let ptr = self.stack.as_ref().unwrap().as_ptr() as *const *const ProcessControlBlock;
+        if let Some(stack) = &self.stack {
+            let ptr = stack.as_ptr() as *const *const ProcessControlBlock;
             if unsafe { !(*ptr).is_null() } {
                 let pcb_ptr: Weak<ProcessControlBlock> = unsafe { Weak::from_raw(*ptr) };
                 drop(pcb_ptr);
@@ -2383,27 +2915,13 @@ impl ProcessSignalInfo {
         self.tty = tty;
     }
 
-    /// 从 pcb 的 siginfo中取出下一个要处理的信号，先处理线程信号，再处理进程信号
+    /// 从当前线程的 pending 中取出下一个要处理的信号
     ///
     /// ## 参数
     ///
     /// - `sig_mask` 被忽略掉的信号
-    ///
-    pub fn dequeue_signal(
-        &mut self,
-        sig_mask: &SigSet,
-        pcb: &Arc<ProcessControlBlock>,
-    ) -> (Signal, Option<SigInfo>) {
-        let res = self.sig_pending.dequeue_signal(sig_mask);
-        pcb.recalc_sigpending(Some(self));
-        if res.0 != Signal::INVALID {
-            return res;
-        } else {
-            let sighand = pcb.sighand();
-            let res = sighand.shared_pending_dequeue(sig_mask);
-            pcb.recalc_sigpending(Some(self));
-            return res;
-        }
+    pub fn dequeue_thread_signal(&mut self, sig_mask: &SigSet) -> (Signal, Option<SigInfo>) {
+        self.sig_pending.dequeue_signal(sig_mask)
     }
 
     pub fn has_child_subreaper(&self) -> bool {

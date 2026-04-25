@@ -12,12 +12,11 @@ impl Syscall for SysGetPid {
         0
     }
 
-    /// # 函数的功能
-    /// 获取当前进程的pid
+    /// 获取当前进程的tpid
     fn handle(&self, _args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
-
-        Ok(current_pcb.task_pid_vnr().into())
+        let tgid = current_pcb.task_tgid_vnr().ok_or(SystemError::ESRCH)?;
+        Ok(tgid.into())
     }
 
     fn entry_format(&self, _args: &[usize]) -> Vec<FormattedSyscallParam> {

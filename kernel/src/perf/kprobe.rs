@@ -9,7 +9,7 @@ use crate::filesystem::page_cache::PageCache;
 use crate::filesystem::vfs::file::File;
 use crate::filesystem::vfs::{FilePrivateData, FileSystem, IndexNode};
 use crate::libs::casting::DowncastArc;
-use crate::libs::spinlock::SpinLockGuard;
+use crate::libs::mutex::MutexGuard;
 use crate::perf::util::PerfProbeArgs;
 use crate::perf::{BasicPerfEbpfCallBack, PerfEventOps};
 use alloc::boxed::Box;
@@ -104,7 +104,7 @@ impl IndexNode for KprobePerfEvent {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize> {
         panic!("read_at not implemented for PerfEvent");
     }
@@ -114,7 +114,7 @@ impl IndexNode for KprobePerfEvent {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize> {
         panic!("write_at not implemented for PerfEvent");
     }

@@ -9,3 +9,5 @@
 
    signal
    ipc_namespace
+   rseq
+

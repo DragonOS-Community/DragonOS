@@ -7,6 +7,7 @@ use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::arch::CurrentIrqArch;
+use crate::exception::bottom_half::{local_bh_disable, LocalBhDisableGuard};
 use crate::exception::{InterruptArch, IrqFlagsGuard};
 use crate::process::ProcessManager;
 use system_error::SystemError;
@@ -28,7 +29,14 @@ pub struct SpinLockGuard<'a, T: 'a> {
     lock: &'a SpinLock<T>,
     data: *mut T,
     irq_flag: Option<IrqFlagsGuard>,
-    flags: SpinLockGuardFlags,
+}
+
+/// `spin_lock_bh` 风格的守卫：持锁期间屏蔽本 CPU 的 softirq/tasklet 执行（不关硬中断）。
+///
+/// Drop 顺序：先解锁，再恢复 BH（等价于 Linux 的 `spin_unlock_bh`）。
+pub struct SpinLockBhGuard<'a, T: 'a> {
+    bh: LocalBhDisableGuard,
+    guard: SpinLockGuard<'a, T>,
 }
 
 impl<'a, T: 'a> SpinLockGuard<'a, T> {
@@ -46,12 +54,6 @@ impl<'a, T: 'a> SpinLockGuard<'a, T> {
         let this = ManuallyDrop::new(this);
         // We know statically that only we are referencing data
         unsafe { &mut *this.lock.data.get() }
-    }
-
-    fn unlock_no_preempt(&self) {
-        unsafe {
-            self.lock.force_unlock();
-        }
     }
 }
 
@@ -78,17 +80,6 @@ impl<T> SpinLock<T> {
         }
     }
 
-    /// 加锁，但是不更改preempt count
-    #[inline(always)]
-    pub fn lock_no_preempt(&self) -> SpinLockGuard<'_, T> {
-        loop {
-            if let Ok(guard) = self.try_lock_no_preempt() {
-                return guard;
-            }
-            spin_loop();
-        }
-    }
-
     pub fn lock_irqsave(&self) -> SpinLockGuard<'_, T> {
         loop {
             if let Ok(guard) = self.try_lock_irqsave() {
@@ -96,6 +87,16 @@ impl<T> SpinLock<T> {
             }
             spin_loop();
         }
+    }
+
+    /// `spin_lock_bh()`：禁用本 CPU BH 后获取锁。
+    ///
+    /// 注意：该接口不关硬中断；若同一把锁也会在 hardirq 获取，则必须用 `lock_irqsave()`。
+    pub fn lock_bh(&self) -> SpinLockBhGuard<'_, T> {
+        let bh = local_bh_disable();
+        // `local_bh_disable()` 不禁用抢占，由 `lock()` 来禁用
+        let guard = self.lock();
+        SpinLockBhGuard { bh, guard }
     }
 
     pub fn try_lock(&self) -> Result<SpinLockGuard<'_, T>, SystemError> {
@@ -107,7 +108,6 @@ impl<T> SpinLock<T> {
                 lock: self,
                 data: unsafe { &mut *self.data.get() },
                 irq_flag: None,
-                flags: SpinLockGuardFlags::empty(),
             });
         }
 
@@ -133,23 +133,10 @@ impl<T> SpinLock<T> {
                 lock: self,
                 data: unsafe { &mut *self.data.get() },
                 irq_flag: Some(irq_guard),
-                flags: SpinLockGuardFlags::empty(),
             });
         }
         ProcessManager::preempt_enable();
         drop(irq_guard);
-        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-    }
-
-    pub fn try_lock_no_preempt(&self) -> Result<SpinLockGuard<'_, T>, SystemError> {
-        if self.inner_try_lock() {
-            return Ok(SpinLockGuard {
-                lock: self,
-                data: unsafe { &mut *self.data.get() },
-                irq_flag: None,
-                flags: SpinLockGuardFlags::NO_PREEMPT,
-            });
-        }
         return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
     }
 
@@ -192,19 +179,21 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
 /// @brief 为SpinLockGuard实现Drop方法，那么，一旦守卫的生命周期结束，就会自动释放自旋锁，避免了忘记放锁的情况
 impl<T> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
-        if self.flags.contains(SpinLockGuardFlags::NO_PREEMPT) {
-            self.unlock_no_preempt();
-        } else {
-            self.lock.unlock();
-        }
+        self.lock.unlock();
         // restore irq
         self.irq_flag.take();
     }
 }
 
-bitflags! {
-    struct SpinLockGuardFlags: u8 {
-        /// 守卫是由“*no_preempt”方法获得的
-        const NO_PREEMPT = (1<<0);
+impl<T> Deref for SpinLockBhGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        self.guard.deref()
+    }
+}
+
+impl<T> DerefMut for SpinLockBhGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard.deref_mut()
     }
 }

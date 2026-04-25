@@ -21,14 +21,29 @@
 
 &emsp;&emsp;DragonOS is rapidly evolving under community-driven development. Currently, DragonOS has implemented approximately 1/4 of Linux interfaces. In the future, we will provide 100% Linux compatibility along with new features.
 
+&emsp;&emsp;🌟 **Want to quickly experience DragonOS?** Visit [DragonOS Playground](https://cnb.cool/DragonOS-Community/playground) to launch DragonOS in the cloud with zero configuration and experience the latest nightly build!
+
 ## 📰 Community News
 
+- **2025-12-17**: ☁️ **DragonOS Playground is now live!** Experience DragonOS with zero configuration on CNB platform, with daily nightly build updates! [Try it now →](https://cnb.cool/DragonOS-Community/playground)
 - **2025-11-20**: 🚀 DragonOS 0.3.0 has been released! Now supports running Go programs directly!
 - **2025-11-18**: 📊 DragonOS CI Dashboard is now live! [Check out DragonOS Linux compatibility data now!](https://ci-dashboard.dragonos.org)
 
 ## How to Run?
 
-&emsp;&emsp;Running DragonOS is straightforward. You can refer to the following resources to get DragonOS up and running in as little as 15 minutes!
+### 🌟 Method 1: Cloud-Native Development (Recommended)
+
+**Zero configuration, one-click launch!** Experience DragonOS on the CNB cloud-native development platform - the simplest and fastest way, no local dependencies required!
+
+<div align="center">
+
+[![Launch on CNB](docs/_static/cnb-launch-button-en.svg)](https://cnb.cool/DragonOS-Community/playground)
+
+</div>
+
+### Method 2: Local Build
+
+&emsp;&emsp;If you prefer to build and run DragonOS locally, you can refer to the following documentation:
 
 - [Building DragonOS — DragonOS dev documentation](https://docs.dragonos.org.cn/locales/en/introduction/build_system.html)
 

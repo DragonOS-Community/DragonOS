@@ -7,8 +7,12 @@ use super::Metadata;
 use crate::{
     filesystem::vfs::{FileType, InodeMode},
     process::cred::{CAPFlags, Cred},
+    process::ProcessManager,
 };
+use alloc::sync::Arc;
 use system_error::SystemError;
+
+use super::{FsPermissionPolicy, IndexNode};
 
 bitflags! {
     pub struct PermissionMask: u32 {
@@ -28,6 +32,35 @@ bitflags! {
         const MAY_CHDIR = 0x40;
 
         const MAY_RWX = Self::MAY_READ.bits + Self::MAY_WRITE.bits + Self::MAY_EXEC.bits;
+    }
+}
+
+/// VFS permission check wrapper that respects per-filesystem policy.
+///
+/// This is the single entry point that should be used by VFS/pathwalk/syscalls
+/// when deciding whether to apply local Unix DAC checks.
+///
+/// Linux FUSE remote permission model:
+/// - Without `default_permissions`, the kernel bypasses most DAC checks and
+///   lets the userspace daemon decide.
+/// - Execute permission is still checked locally for regular files.
+pub fn check_inode_permission(
+    inode: &Arc<dyn IndexNode>,
+    metadata: &Metadata,
+    mask: PermissionMask,
+) -> Result<(), SystemError> {
+    let cred = ProcessManager::current_pcb().cred();
+    match inode.fs().permission_policy() {
+        FsPermissionPolicy::Dac => cred.inode_permission(metadata, mask.bits()),
+        FsPermissionPolicy::Remote => {
+            if mask.contains(PermissionMask::MAY_EXEC)
+                && metadata.file_type == FileType::File
+                && (metadata.mode.bits() & InodeMode::S_IXUGO.bits()) == 0
+            {
+                return Err(SystemError::EACCES);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -97,7 +130,7 @@ impl Cred {
 
     /// 检查当前进程是否以 inode 所有者的身份运行
     #[inline]
-    fn is_owner(&self, metadata: &Metadata) -> bool {
+    pub fn is_owner(&self, metadata: &Metadata) -> bool {
         self.fsuid.data() == metadata.uid
     }
 
@@ -120,13 +153,15 @@ impl Cred {
     fn try_capability_override(&self, metadata: &Metadata, mask: u32) -> bool {
         // CAP_DAC_OVERRIDE: 绕过所有文件读、写和执行权限检查
         if self.has_capability(CAPFlags::CAP_DAC_OVERRIDE) {
-            // 对于目录或文件，只要满足下列条件之一就允许
-            if metadata.file_type == super::FileType::Dir
-                || mask & PermissionMask::MAY_EXEC.bits() == 0
-                || metadata.mode.bits() & PermissionMask::MAY_RWX.bits() != 0
+            // Linux: CAP_DAC_OVERRIDE does not bypass execute checks for regular files
+            // when no execute bit is set.
+            if mask & PermissionMask::MAY_EXEC.bits() != 0
+                && metadata.file_type != super::FileType::Dir
+                && (metadata.mode.bits() & InodeMode::S_IXUGO.bits()) == 0
             {
-                return true;
+                return false;
             }
+            return true;
         }
 
         // CAP_DAC_READ_SEARCH: 绕过读和搜索（目录上的执行）检查

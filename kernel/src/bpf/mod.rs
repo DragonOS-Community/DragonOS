@@ -1,23 +1,12 @@
 pub mod helper;
 pub mod map;
 pub mod prog;
+mod sys_bpf;
 use crate::include::bindings::linux_bpf::{bpf_attr, bpf_cmd};
-use crate::syscall::user_access::UserBufferReader;
-use crate::syscall::Syscall;
 use log::error;
-use num_traits::FromPrimitive;
 use system_error::SystemError;
 
 type Result<T> = core::result::Result<T, SystemError>;
-
-impl Syscall {
-    pub fn sys_bpf(cmd: u32, attr: *mut u8, size: u32) -> Result<usize> {
-        let buf = UserBufferReader::new(attr, size as usize, true)?;
-        let attr = buf.read_one_from_user::<bpf_attr>(0)?;
-        let cmd = bpf_cmd::from_u32(cmd).ok_or(SystemError::EINVAL)?;
-        bpf(cmd, attr)
-    }
-}
 
 pub fn bpf(cmd: bpf_cmd, attr: &bpf_attr) -> Result<usize> {
     let res = match cmd {

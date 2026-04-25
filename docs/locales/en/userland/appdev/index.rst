@@ -1,24 +1,24 @@
 .. note:: AI Translation Notice
 
-   This document was automatically translated by `Qwen/Qwen3-8B` model, for reference only.
+   This document was automatically translated by `hunyuan-turbos-latest` model, for reference only.
 
    - Source document: userland/appdev/index.rst
 
-   - Translation time: 2025-05-19 02:13:34
+   - Translation time: 2025-12-26 10:51:40
 
-   - Translation model: `Qwen/Qwen3-8B`
+   - Translation model: `hunyuan-turbos-latest`
 
 
    Please report issues via `Community Channel <https://github.com/DragonOS-Community/DragonOS/issues>`_
 
-Application Development Documentation
+User-space Build Documentation (DADK)
 ===================================================
 
 .. toctree::
    :maxdepth: 1
-   :caption: Contents
+   :caption: Table of Contents
 
    rust-quick-start
    c-cpp-quick-start
-   Quick Start to Package an Application to DragonOS Using DADK <https://docs.dragonos.org.cn/p/dadk/user-manual/quickstart.html>
-   DADK Complete Documentation <https://docs.dragonos.org.cn/p/dadk/>
+   Quickly Package an Application into DragonOS Using DADK <https://docs.dragonos.org.cn/p/dadk/user-manual/quickstart.html>
+   Complete DADK Documentation <https://docs.dragonos.org.cn/p/dadk/>

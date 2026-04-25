@@ -652,9 +652,10 @@ impl TtyOperation for TtyCore {
         self.core().dec_count();
         let cnt = self.core().count();
         // TODO: fix pty slave close issue
-        let is_pty_slave_last =
-            cnt == 1 && tty.core().driver().tty_driver_sub_type() == TtyDriverSubType::PtySlave;
-        if !self.core().count_valid() || is_pty_slave_last {
+        let subtype = tty.core().driver().tty_driver_sub_type();
+        let is_pty_slave_last = cnt == 1 && subtype == TtyDriverSubType::PtySlave;
+        let is_pty_master_last = cnt == 1 && subtype == TtyDriverSubType::PtyMaster;
+        if !self.core().count_valid() || is_pty_slave_last || is_pty_master_last {
             // log::debug!(
             //     "TtyCore close: ref count: {}, tty: {}",
             //     cnt,

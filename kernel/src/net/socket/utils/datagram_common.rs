@@ -1,7 +1,7 @@
 use crate::filesystem::epoll::EPollEventType;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::{
-    libs::{rwlock::RwLock, wait_queue::WaitQueue},
+    libs::{rwsem::RwSem, wait_queue::WaitQueue},
     net::socket::PMSG,
 };
 use alloc::fmt::Debug;
@@ -51,7 +51,7 @@ pub trait Bound {
         &self,
         writer: &mut [u8],
         flags: PMSG,
-    ) -> Result<(usize, Self::Endpoint), SystemError>;
+    ) -> Result<(usize, usize, Self::Endpoint), SystemError>;
 
     fn try_send(&self, buf: &[u8], to: &Self::Endpoint, flags: PMSG) -> Result<usize, SystemError>;
 
@@ -151,7 +151,7 @@ where
         &self,
         writer: &mut [u8],
         flags: PMSG,
-    ) -> Result<(usize, UnboundSocket::Endpoint), SystemError> {
+    ) -> Result<(usize, usize, UnboundSocket::Endpoint), SystemError> {
         match self {
             Inner::Unbound(_) => Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
             Inner::Bound(bound) => bound.try_recv(writer, flags),
@@ -162,7 +162,7 @@ where
 }
 
 pub fn select_remote_and_bind<UnboundSocket, BoundSocket, B, F, R>(
-    inner_lock: &RwLock<Inner<UnboundSocket, BoundSocket>>,
+    inner_lock: &RwSem<Inner<UnboundSocket, BoundSocket>>,
     remote: Option<UnboundSocket::Endpoint>,
     bind_ephemeral: B,
     op: F,

@@ -7,7 +7,7 @@ use crate::{
     process::{
         cred::CAPFlags,
         pid::{Pid, PidType},
-        ProcessControlBlock, ProcessFlags, ProcessManager, ProcessSignalInfo, RawPid,
+        ProcessControlBlock, ProcessManager, ProcessSignalInfo, RawPid,
     },
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
@@ -47,6 +47,7 @@ impl TtyJobCtrlManager {
     pub fn remove_session_tty(tty: &Arc<TtyCore>) {
         let mut ctrl = tty.core().contorl_info_irqsave();
         ctrl.session = None;
+        ctrl.pgid = None;
     }
 
     /// ### 检查tty
@@ -85,9 +86,6 @@ impl TtyJobCtrlManager {
                 return Err(SystemError::EIO);
             } else {
                 crate::ipc::kill::send_signal_to_pgid(&pgid, sig)?;
-                ProcessManager::current_pcb()
-                    .flags()
-                    .insert(ProcessFlags::HAS_PENDING_SIGNAL);
                 log::debug!(
                     "job_ctrl_ioctl: kill. pgid: {}, tty_pgid: {:?}",
                     pgid.pid_vnr().data(),
@@ -117,6 +115,7 @@ impl TtyJobCtrlManager {
             TtyIoctlCmd::TIOCGPGRP => Self::tiocgpgrp(real_tty, arg),
             TtyIoctlCmd::TIOCGSID => Self::tiocgsid(real_tty, arg),
             TtyIoctlCmd::TIOCSCTTY => Self::tiocsctty(real_tty, arg),
+            TtyIoctlCmd::TIOCNOTTY => Self::tiocnotty(real_tty),
             _ => {
                 return Err(SystemError::ENOIOCTLCMD);
             }
@@ -178,9 +177,8 @@ impl TtyJobCtrlManager {
     fn tiocgpgrp(real_tty: Arc<TtyCore>, arg: usize) -> Result<usize, SystemError> {
         // log::debug!("job_ctrl_ioctl: TIOCGPGRP");
         let current = ProcessManager::current_pcb();
-        if current.sig_info_irqsave().tty().is_some()
-            && !Arc::ptr_eq(&current.sig_info_irqsave().tty().unwrap(), &real_tty)
-        {
+        let current_tty = current.sig_info_irqsave().tty();
+        if current_tty.is_none() || !Arc::ptr_eq(&current_tty.unwrap(), &real_tty) {
             return Err(SystemError::ENOTTY);
         }
 
@@ -202,9 +200,8 @@ impl TtyJobCtrlManager {
     fn tiocgsid(real_tty: Arc<TtyCore>, arg: usize) -> Result<usize, SystemError> {
         // log::debug!("job_ctrl_ioctl: TIOCGSID");
         let current = ProcessManager::current_pcb();
-        if current.sig_info_irqsave().tty().is_some()
-            && !Arc::ptr_eq(&current.sig_info_irqsave().tty().unwrap(), &real_tty)
-        {
+        let current_tty = current.sig_info_irqsave().tty();
+        if current_tty.is_none() || !Arc::ptr_eq(&current_tty.unwrap(), &real_tty) {
             return Err(SystemError::ENOTTY);
         }
 
@@ -310,6 +307,23 @@ impl TtyJobCtrlManager {
         let sid = p.task_session();
 
         return sid;
+    }
+
+    /// Detach controlling tty from current process if it matches `real_tty`.
+    fn tiocnotty(real_tty: Arc<TtyCore>) -> Result<usize, SystemError> {
+        let pcb = ProcessManager::current_pcb();
+        let mut siginfo = pcb.sig_info_mut();
+        if let Some(cur) = siginfo.tty() {
+            if Arc::ptr_eq(&cur, &real_tty) {
+                Self::__proc_clear_tty(&mut siginfo);
+                drop(siginfo);
+                let mut ctrl = real_tty.core().contorl_info_irqsave();
+                ctrl.session = None;
+                ctrl.pgid = None;
+                return Ok(0);
+            }
+        }
+        Err(SystemError::ENOTTY)
     }
 
     pub(super) fn session_clear_tty(sid: Arc<Pid>) {

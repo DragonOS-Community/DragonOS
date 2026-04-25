@@ -9,7 +9,7 @@
     "hash": "d8667f36cbfe9d9f532737a3fbe39f2d"
   },
   "en:kernel/process_management/index.rst": {
-    "hash": "b200476562e580ee97d8a3ffe19d5605"
+    "hash": "cbea45a3be872849398ff07a02fe3d57"
   },
   "en:kernel/libs/unified-init.md": {
     "hash": "28374260f0134386d53392156d749733"
@@ -45,13 +45,13 @@
     "hash": "9a5c0ec57bae0576c30fbab60407f178"
   },
   "en:kernel/locking/index.rst": {
-    "hash": "299b0ccecf4ef174fffcce4731a98728"
+    "hash": "0e0e7cde9860a5e3b0cba2e026a06b51"
   },
   "en:kernel/sched/index.rst": {
-    "hash": "76ca73ed6d47a4207d2ca193b88eae0b"
+    "hash": "261678cb50d23aa9879632de029f60ba"
   },
   "en:kernel/locking/locks.md": {
-    "hash": "5514ff361db4677d2b4fa522852aaeea"
+    "hash": "041e3ace893dcfcb2ecb85ddcc8b0d31"
   },
   "en:kernel/sched/cfs.md": {
     "hash": "7c89ba1c0416ec346f2982b3139cc819"
@@ -60,10 +60,10 @@
     "hash": "5d21aad4640544ad49348d3cd2e8a386"
   },
   "en:kernel/filesystem/index.rst": {
-    "hash": "52dd12d566da2003602ee21c4a3d007f"
+    "hash": "a732adec7c8ab12c3ca317c351ef673c"
   },
   "en:kernel/ktest/index.rst": {
-    "hash": "d9f0d9b2df4f1ce9d7f0da23639afafb"
+    "hash": "1adde2246ad2b63fd8d2916ce9772075"
   },
   "en:kernel/filesystem/vfs/api.md": {
     "hash": "1b0b3fe0cc2918cc2c53a5af392a96ff"
@@ -126,7 +126,7 @@
     "hash": "72efe542c7854926ac0f33287345b856"
   },
   "en:kernel/ipc/index.rst": {
-    "hash": "e75d2ff6a7b8a4e6f32b2adee7756298"
+    "hash": "4e4a874a6248bd474e36af7a3fb6b146"
   },
   "en:kernel/boot/index.rst": {
     "hash": "8fe854f9c48d4e2e3fee0cf7f3526dfe"
@@ -150,7 +150,7 @@
     "hash": "c931f3fcfca7d8d10cd16a8b68e6274a"
   },
   "en:community/ChangeLog/index.rst": {
-    "hash": "dbf244ec28b422b0b7d8b8bcfa72e94d"
+    "hash": "2166fbbfcea1f1ca34fd498cf095fbc3"
   },
   "en:kernel/trace/index.rst": {
     "hash": "3c466a411a5bd71514f8fa4f15d06241"
@@ -162,16 +162,16 @@
     "hash": "f449acec9b9ad36c4a75e8594d38e44d"
   },
   "en:kernel/filesystem/overview.md": {
-    "hash": "44499f7673a0c68c53b12882258b9f5c"
+    "hash": "296d560c67fbc0e14c695efe46a415f7"
   },
   "en:kernel/boot/bootloader.md": {
     "hash": "e6f65060560663ca2ce4d56d750332d8"
   },
   "en:kernel/ipc/signal.md": {
-    "hash": "abe911dac525b44fe083752a1e6bbdc7"
+    "hash": "4a03545456558732d762dddd3ad82560"
   },
   "en:kernel/locking/mutex.md": {
-    "hash": "a82fa540acd44a93f5cb3c069d5584da"
+    "hash": "db7dc3202e78810c3a90bcf9808557f5"
   },
   "en:kernel/boot/cmdline.md": {
     "hash": "3d17446c60b72e9cadf82002520ebbf9"
@@ -207,7 +207,7 @@
     "hash": "d94351167179beb0bb1b1f3bb82da2ff"
   },
   "en:userland/appdev/index.rst": {
-    "hash": "78e6747475981b5cc17cd206c135ca4f"
+    "hash": "46a9b9ba2cb7616cb7a819fb53418551"
   },
   "en:userland/appdev/c-cpp-quick-start.md": {
     "hash": "0101f8fa98a0536d43ff897145d4a43d"
@@ -234,7 +234,7 @@
     "hash": "bb2435e3905e8e71eca8f6a583e31d94"
   },
   "en:introduction/build_system.md": {
-    "hash": "d15b077dd4ae71bff928efb85aa7999e"
+    "hash": "eae93d905cd74db14b0e034afc07363c"
   },
   "en:community/ChangeLog/V0.1.x/V0.1.4.md": {
     "hash": "5720af929320997f8824bcdfd3a17bdd"
@@ -264,7 +264,7 @@
     "hash": "8b840ec6af5782d8f793f746b1061ed9"
   },
   "en:index.rst": {
-    "hash": "139ea63381896ae9f861c37ca13c888d"
+    "hash": "58cb1094d0d6c86274f989432b5ea329"
   },
   "en:questions/index.rst": {
     "hash": "b1cee9bfde04d6375f24c93a29ce3c71"
@@ -282,7 +282,7 @@
     "hash": "de9331f8d0bc5fe8c4705ad5807c9e8d"
   },
   "en:kernel/net/index.rst": {
-    "hash": "2b7f07b2896787800e902f9f4bb5d2e4"
+    "hash": "0fc2a21f93566c3d278452d330cb07f6"
   },
   "en:kernel/net/inet.md": {
     "hash": "549622e87eeafbeae8fed7f84aba5db9"
@@ -294,7 +294,7 @@
     "hash": "52df04d6a276b42617f7b79bbbffa61e"
   },
   "en:kernel/ktest/gvisor_syscall_test.rst": {
-    "hash": "60cc96606ccd50bb3e669b378693b742"
+    "hash": "75f85fb98952102269062342cdbc57cd"
   },
   "en:kernel/syscall/sys_capget_capset.md": {
     "hash": "f3b86c00e9f28df5c0e6c15905e53907"
@@ -303,7 +303,7 @@
     "hash": "acbc94b056e1c8f7f07275d80b70a930"
   },
   "en:kernel/device/index.rst": {
-    "hash": "71c15cea87dffe58f5d70da38390a083"
+    "hash": "f27dd3c0d3f33aac7f70f2eb90403d88"
   },
   "en:kernel/memory_management/extable_safe_copy_design.md": {
     "hash": "fabf6a20ce3a3d1974d678f039fa32b5"
@@ -316,5 +316,71 @@
   },
   "en:kernel/filesystem/vfs/mount_propagation.md": {
     "hash": "11140afc1e5daa1667d40cae29a80b9a"
+  },
+  "en:kernel/sched/wait_queue.md": {
+    "hash": "31c47608306f88bc8fec9527905ba5b8"
+  },
+  "en:agents/release_agent_capability.md": {
+    "hash": "6c10917f7e05f9a0c5d75c7bbed4bc71"
+  },
+  "en:community/ChangeLog/V0.4.x/V0.4.0.md": {
+    "hash": "940c6a8fc47831f75df1dc8810d7c336"
+  },
+  "en:kernel/device/loop_device.md": {
+    "hash": "1d637a7d292c4168b326ba46755b5622"
+  },
+  "en:introduction/devcontainer.md": {
+    "hash": "b7ea769ce2562ccbcb27df019ff98cc1"
+  },
+  "en:userland/rootfs/index.rst": {
+    "hash": "e91edb5ab11bdee2975a37a248d97adf"
+  },
+  "en:userland/rootfs/add-your-own-app.md": {
+    "hash": "0eafcc92a06fb0bb0bea58617318f1aa"
+  },
+  "en:dev-skills/write-docs.md": {
+    "hash": "898241ba5edc255c7fb035d1d5ff9ad1"
+  },
+  "en:introduction/develop_nix.md": {
+    "hash": "9250c605b765168f1ff962d425f60844"
+  },
+  "en:dev-skills/nix-skills.md": {
+    "hash": "ce15afc55be2502588220eef9b39b637"
+  },
+  "en:userland/rootfs/diskgen.md": {
+    "hash": "cc304450faeead2e99367616ede9327a"
+  },
+  "en:kernel/ipc/rseq.md": {
+    "hash": "b0b020398fb048e2c87135e3bb2974b3"
+  },
+  "en:kernel/locking/rwsem.md": {
+    "hash": "8728e5478056362db9deca9b27089be1"
+  },
+  "en:kernel/sched/fifo.md": {
+    "hash": "7193f93fd9af38c8b7d2ad0ad9453ce5"
+  },
+  "en:kernel/interrupt/index.rst": {
+    "hash": "5a42df4211e7c59aba311c9523bd529d"
+  },
+  "en:kernel/interrupt/workqueue.md": {
+    "hash": "930d4d0eefeb4c4f01ec2a93a2a1b9ad"
+  },
+  "en:kernel/net/napi_and_netns_poll.md": {
+    "hash": "04ae3378b43189a4e61226612f66f9ab"
+  },
+  "en:kernel/interrupt/tasklet.md": {
+    "hash": "254da75179ebb9f39cd9b562486fb122"
+  },
+  "en:kernel/process_management/de_thread.md": {
+    "hash": "d5d9c9a4d491398ecc0a45118e4e92da"
+  },
+  "en:userland/rootfs/dadk-rootfs-manifest.md": {
+    "hash": "a35f61f1e5070812411a8ddb2e449b11"
+  },
+  "en:kernel/ktest/dunitest.rst": {
+    "hash": "a0a5f36d07f61772ca43b9625b0a448e"
+  },
+  "en:kernel/filesystem/fuse.md": {
+    "hash": "00061bdbcbf1be7230dfdc619e3a25f1"
   }
 }

@@ -29,7 +29,7 @@ use crate::{
     filesystem::kernfs::KernFSInode,
     init::initcall::INITCALL_DEVICE,
     libs::{
-        rwlock::{RwLockReadGuard, RwLockWriteGuard},
+        rwsem::{RwSemReadGuard, RwSemWriteGuard},
         spinlock::SpinLock,
     },
 };
@@ -199,11 +199,11 @@ impl KObject for Ps2MouseDriver {
 
     fn set_name(&self, _name: alloc::string::String) {}
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 

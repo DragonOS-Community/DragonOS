@@ -1,4 +1,20 @@
+//! TCP socket option handling.
+//!
+//! This module contains `TcpSocket` methods for setting socket options
+//! at SOL_SOCKET, SOL_TCP, and SOL_IP levels.
+
 use num_traits::{FromPrimitive, ToPrimitive};
+use system_error::SystemError;
+
+use super::constants;
+use super::info;
+use super::inner;
+
+use crate::libs::byte_parser;
+use crate::net::socket::common::{parse_timeval_opt, write_timeval_opt, ShutdownBit};
+use crate::net::socket::{AddressFamily, IpOption, PSO, PSOCK, PSOL};
+use crate::process::cred::CAPFlags;
+use crate::process::ProcessManager;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive)]
 pub enum Options {
@@ -67,7 +83,6 @@ pub enum Options {
     FastOpenNoCookie = 34,
     ZeroCopyReceive = 35,
     /// Notify bytes available to read as a cmsg on read.
-    /// 与TCP_CM_INQ相同
     INQ = 36,
     /// delay outgoing packets by XX usec
     TxDelay = 37,
@@ -87,5 +102,604 @@ impl TryFrom<i32> for Options {
 impl From<Options> for i32 {
     fn from(val: Options) -> Self {
         <Options as ToPrimitive>::to_i32(&val).unwrap()
+    }
+}
+
+/// TCP socket option setters.
+impl super::TcpSocket {
+    const MAX_TCP_KEEPIDLE: i32 = 32767;
+    const MAX_TCP_KEEPINTVL: i32 = 32767;
+    const MAX_TCP_KEEPCNT: i32 = 127;
+
+    #[inline]
+    fn set_bool_option(
+        atomic: &core::sync::atomic::AtomicBool,
+        val: &[u8],
+        on_set: impl FnOnce(bool) -> Result<(), SystemError>,
+    ) -> Result<(), SystemError> {
+        let on = byte_parser::read_bool_flag(val)?;
+        atomic.store(on, core::sync::atomic::Ordering::Relaxed);
+        on_set(on)
+    }
+
+    #[inline]
+    fn write_bool_opt_u32(
+        value: &mut [u8],
+        atomic: &core::sync::atomic::AtomicBool,
+    ) -> Result<usize, SystemError> {
+        let v = if atomic.load(core::sync::atomic::Ordering::Relaxed) {
+            1
+        } else {
+            0
+        };
+        Self::write_u32_opt(value, v)
+    }
+
+    #[inline]
+    fn write_bool_opt_i32(
+        value: &mut [u8],
+        atomic: &core::sync::atomic::AtomicBool,
+    ) -> Result<usize, SystemError> {
+        let v = if atomic.load(core::sync::atomic::Ordering::Relaxed) {
+            1
+        } else {
+            0
+        };
+        Self::write_i32_opt(value, v)
+    }
+
+    /// Helper to write a u32 value to an option buffer.
+    #[inline]
+    fn write_u32_opt(value: &mut [u8], v: u32) -> Result<usize, SystemError> {
+        if value.len() < 4 {
+            return Err(SystemError::EINVAL);
+        }
+        value[..4].copy_from_slice(&v.to_ne_bytes());
+        Ok(4)
+    }
+
+    /// Helper to write an i32 value to an option buffer.
+    #[inline]
+    fn write_i32_opt(value: &mut [u8], v: i32) -> Result<usize, SystemError> {
+        Self::write_u32_opt(value, v as u32)
+    }
+
+    /// Helper to write a linger struct (two i32 fields) to an option buffer.
+    #[inline]
+    fn write_linger_opt(value: &mut [u8], onoff: i32, linger: i32) -> Result<usize, SystemError> {
+        if value.len() < 8 {
+            return Err(SystemError::EINVAL);
+        }
+        value[..4].copy_from_slice(&onoff.to_ne_bytes());
+        value[4..8].copy_from_slice(&linger.to_ne_bytes());
+        Ok(8)
+    }
+
+    /// Helper to read an atomic usize value and write as u32 to an option buffer.
+    #[inline]
+    fn write_atomic_usize_as_u32(
+        value: &mut [u8],
+        atomic: &core::sync::atomic::AtomicUsize,
+    ) -> Result<usize, SystemError> {
+        let v = atomic.load(core::sync::atomic::Ordering::Relaxed);
+        Self::write_u32_opt(value, v as u32)
+    }
+
+    /// Helper to read an atomic i32 value and write to an option buffer.
+    #[inline]
+    fn write_atomic_i32(
+        value: &mut [u8],
+        atomic: &core::sync::atomic::AtomicI32,
+    ) -> Result<usize, SystemError> {
+        let v = atomic.load(core::sync::atomic::Ordering::Relaxed);
+        Self::write_i32_opt(value, v)
+    }
+
+    /// Helper to get a socket property with a default for closed/self-connected/none states.
+    ///
+    /// This pattern is repeated when getting socket options that need to handle
+    /// cases where the socket is closed, self-connected, or not yet initialized.
+    #[inline]
+    fn with_socket_property<F, R>(&self, default: R, f: F) -> R
+    where
+        F: FnOnce(&inner::Inner) -> R,
+    {
+        match self.inner.read().as_ref() {
+            Some(inner::Inner::Closed(_)) | Some(inner::Inner::SelfConnected(_)) | None => default,
+            Some(inner) => f(inner),
+        }
+    }
+
+    #[inline]
+    fn effective_sockbuf_bytes(requested: usize, min: usize, max: usize) -> usize {
+        requested.saturating_mul(2).clamp(min, max)
+    }
+
+    #[inline]
+    fn effective_sockbuf_bytes_force(requested: usize, min: usize) -> usize {
+        let max_val = (i32::MAX as usize) / 2;
+        let requested = requested.min(max_val);
+        requested.saturating_mul(2).max(min)
+    }
+
+    /// Sets a SOL_SOCKET option.
+    pub(super) fn set_socket_option(&self, opt: PSO, val: &[u8]) -> Result<(), SystemError> {
+        match opt {
+            PSO::SNDTIMEO_OLD | PSO::SNDTIMEO_NEW => {
+                let d = parse_timeval_opt(val)?;
+                let us = d.map(|v| v.total_micros()).unwrap_or(u64::MAX);
+                self.send_timeout_us()
+                    .store(us, core::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            PSO::RCVTIMEO_OLD | PSO::RCVTIMEO_NEW => {
+                let d = parse_timeval_opt(val)?;
+                let us = d.map(|v| v.total_micros()).unwrap_or(u64::MAX);
+                self.recv_timeout_us()
+                    .store(us, core::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            PSO::TIMESTAMP_OLD | PSO::TIMESTAMP_NEW => {
+                Self::set_bool_option(self.so_timestamp_enabled(), val, |_| Ok(()))
+            }
+            PSO::SNDBUF | PSO::SNDBUFFORCE => {
+                let requested = byte_parser::read_u32(val)? as usize;
+                if matches!(opt, PSO::SNDBUFFORCE) {
+                    let cred = ProcessManager::current_pcb().cred();
+                    if !cred.has_capability(CAPFlags::CAP_NET_ADMIN) {
+                        return Err(SystemError::EPERM);
+                    }
+                }
+                let size = if matches!(opt, PSO::SNDBUFFORCE) {
+                    Self::effective_sockbuf_bytes_force(requested, constants::SOCK_MIN_SNDBUF)
+                } else {
+                    let requested = requested.min(constants::MAX_SOCKET_BUFFER);
+                    Self::effective_sockbuf_bytes(
+                        requested,
+                        constants::SOCK_MIN_SNDBUF,
+                        constants::MAX_SOCKET_BUFFER,
+                    )
+                };
+                self.send_buf_size()
+                    .store(size, core::sync::atomic::Ordering::Relaxed);
+                self.update_inner_buffers(size, self.recv_buf_size_loaded());
+                crate::net::socket::base::Socket::wait_queue(self).wakeup(None);
+                Ok(())
+            }
+            PSO::RCVBUF | PSO::RCVBUFFORCE => {
+                let requested = byte_parser::read_u32(val)? as usize;
+                if matches!(opt, PSO::RCVBUFFORCE) {
+                    let cred = ProcessManager::current_pcb().cred();
+                    if !cred.has_capability(CAPFlags::CAP_NET_ADMIN) {
+                        return Err(SystemError::EPERM);
+                    }
+                }
+                let size = if matches!(opt, PSO::RCVBUFFORCE) {
+                    Self::effective_sockbuf_bytes_force(requested, constants::SOCK_MIN_RCVBUF)
+                } else {
+                    let requested = requested.min(constants::MAX_SOCKET_BUFFER);
+                    Self::effective_sockbuf_bytes(
+                        requested,
+                        constants::SOCK_MIN_RCVBUF,
+                        constants::MAX_SOCKET_BUFFER,
+                    )
+                };
+                self.recv_buf_size()
+                    .store(size, core::sync::atomic::Ordering::Relaxed);
+                self.update_inner_buffers(self.send_buf_size_loaded(), size);
+                crate::net::socket::base::Socket::wait_queue(self).wakeup(None);
+                Ok(())
+            }
+            PSO::ATTACH_FILTER => {
+                self.so_filter_attached()
+                    .store(true, core::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            PSO::DETACH_FILTER => {
+                if self
+                    .so_filter_attached()
+                    .swap(false, core::sync::atomic::Ordering::Relaxed)
+                {
+                    Ok(())
+                } else {
+                    Err(SystemError::ENOENT)
+                }
+            }
+            PSO::KEEPALIVE => Self::set_bool_option(self.so_keepalive_enabled(), val, |on| {
+                let interval = if on {
+                    let idle = self
+                        .tcp_keepidle_secs()
+                        .load(core::sync::atomic::Ordering::Relaxed);
+                    Some(smoltcp::time::Duration::from_secs(idle.max(1) as u64))
+                } else {
+                    None
+                };
+                self.apply_keepalive(interval);
+                Ok(())
+            }),
+            PSO::REUSEADDR => Self::set_bool_option(self.so_reuseaddr(), val, |_| Ok(())),
+            PSO::BROADCAST => Self::set_bool_option(self.so_broadcast(), val, |_| Ok(())),
+            PSO::PASSCRED => Self::set_bool_option(self.so_passcred(), val, |_| Ok(())),
+            PSO::NO_CHECK => Self::set_bool_option(self.so_no_check(), val, |_| Ok(())),
+            PSO::LINGER => {
+                if val.len() < 8 {
+                    return Err(SystemError::EINVAL);
+                }
+                let l_onoff = i32::from_ne_bytes([val[0], val[1], val[2], val[3]]);
+                let l_linger = i32::from_ne_bytes([val[4], val[5], val[6], val[7]]);
+                let on = if l_onoff != 0 { 1 } else { 0 };
+                self.linger_onoff()
+                    .store(on, core::sync::atomic::Ordering::Relaxed);
+                if on != 0 {
+                    let v = if l_linger < 0 { i32::MAX } else { l_linger };
+                    self.linger_linger()
+                        .store(v, core::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(())
+            }
+            PSO::RCVLOWAT => {
+                let mut v = byte_parser::read_i32(val)?;
+                if v < 0 {
+                    v = i32::MAX;
+                } else if v == 0 {
+                    v = 1;
+                }
+                self.options
+                    .rcvlowat
+                    .store(v, core::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            PSO::OOBINLINE => Self::set_bool_option(self.so_oobinline_enabled(), val, |_| Ok(())),
+            _ => Ok(()), // Accept and ignore other SOL_SOCKET options
+        }
+    }
+
+    /// Sets a SOL_IP option.
+    pub(super) fn set_ip_option(&self, opt: IpOption, val: &[u8]) -> Result<(), SystemError> {
+        match opt {
+            IpOption::MTU_DISCOVER => {
+                let v = byte_parser::read_i32(val)?;
+                self.ip_mtu_discover()
+                    .store(v, core::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            IpOption::MULTICAST_TTL => {
+                let v = byte_parser::read_i32(val)?;
+                if !(0..=255).contains(&v) {
+                    return Err(SystemError::EINVAL);
+                }
+                self.ip_multicast_ttl()
+                    .store(v, core::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            IpOption::MULTICAST_LOOP => {
+                Self::set_bool_option(self.ip_multicast_loop(), val, |_| Ok(()))
+            }
+            _ => Ok(()), // Ignore unsupported IP options
+        }
+    }
+
+    /// Sets a SOL_TCP option.
+    pub(super) fn set_tcp_option(&self, opt: Options, val: &[u8]) -> Result<(), SystemError> {
+        match opt {
+            Options::NoDelay => {
+                let nagle_enabled = !byte_parser::read_bool_flag(val)?;
+                let mut inner = self.inner.write();
+                if let Some(inner) = inner.as_mut() {
+                    inner.for_each_socket_mut(|s| s.set_nagle_enabled(nagle_enabled));
+                }
+                Ok(())
+            }
+            Options::KeepIdle => {
+                let v = byte_parser::read_i32(val)?;
+                if !(1..=Self::MAX_TCP_KEEPIDLE).contains(&v) {
+                    return Err(SystemError::EINVAL);
+                }
+                self.tcp_keepidle_secs()
+                    .store(v, core::sync::atomic::Ordering::Relaxed);
+                if self
+                    .so_keepalive_enabled()
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                {
+                    self.apply_keepalive(Some(smoltcp::time::Duration::from_secs(v as u64)));
+                }
+                Ok(())
+            }
+            Options::KeepIntvl => {
+                let v = byte_parser::read_i32(val)?;
+                if !(1..=Self::MAX_TCP_KEEPINTVL).contains(&v) {
+                    return Err(SystemError::EINVAL);
+                }
+                self.tcp_keepintvl_secs()
+                    .store(v, core::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Options::KeepCnt => {
+                let v = byte_parser::read_i32(val)?;
+                if !(1..=Self::MAX_TCP_KEEPCNT).contains(&v) {
+                    return Err(SystemError::EINVAL);
+                }
+                self.tcp_keepcnt()
+                    .store(v, core::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Options::INQ => Self::set_bool_option(self.tcp_inq_enabled(), val, |_| Ok(())),
+            Options::QuickAck => {
+                Self::set_bool_option(self.tcp_quickack_enabled(), val, |_| Ok(()))
+            }
+            Options::Cork => Self::set_bool_option(&self.options.tcp_cork, val, |on| {
+                if !on {
+                    let _ = self.flush_cork_buffer();
+                }
+                Ok(())
+            }),
+            Options::Congestion => {
+                let s = byte_parser::read_string(val)?;
+                let cc = match s {
+                    "reno" => smoltcp::socket::tcp::CongestionControl::Reno,
+                    "cubic" => smoltcp::socket::tcp::CongestionControl::Cubic,
+                    _ => return Err(SystemError::ENOENT),
+                };
+                self.apply_congestion_control(cc);
+                Ok(())
+            }
+            Options::MaxSegment => {
+                let v = byte_parser::read_u32(val)?;
+                if !(constants::TCP_MIN_MSS..=constants::MAX_TCP_WINDOW).contains(&v) {
+                    return Err(SystemError::EINVAL);
+                }
+                self.tcp_max_seg()
+                    .store(v as usize, core::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Options::DeferAccept => {
+                let v = byte_parser::read_i32(val)?.max(0);
+                self.tcp_defer_accept()
+                    .store(v, core::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Options::Syncnt => {
+                let v = byte_parser::read_i32(val)?;
+                if !(1..=127).contains(&v) {
+                    return Err(SystemError::EINVAL);
+                }
+                self.tcp_syncnt()
+                    .store(v, core::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Options::WindowClamp => {
+                let v = byte_parser::read_u32(val)?;
+                let v = if v == 0 {
+                    let is_closed = matches!(
+                        self.inner.read().as_ref(),
+                        Some(inner::Inner::Init(_)) | None
+                    );
+                    if !is_closed {
+                        return Err(SystemError::EINVAL);
+                    }
+                    0
+                } else {
+                    // 当 TCP_WINDOW_CLAMP < (min SO_RCVBUF)/2 时，应当被提升到 (min SO_RCVBUF)/2。
+                    //
+                    // Linux 中 TCP_WINDOW_CLAMP 最小值由 SOCK_MIN_RCVBUF/2 决定，
+                    // DragonOS 同样用 SOCK_MIN_RCVBUF/2（与 TCP_SKB_MIN_TRUESIZE 保持一致）表达该下限。
+                    let min_window_clamp = (constants::SOCK_MIN_RCVBUF / 2) as u32;
+                    v.max(min_window_clamp)
+                };
+                self.tcp_window_clamp()
+                    .store(v as usize, core::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Options::UserTimeout => {
+                let v = byte_parser::read_i32(val)?;
+                if v < 0 {
+                    return Err(SystemError::EINVAL);
+                }
+                self.tcp_user_timeout()
+                    .store(v, core::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Options::Linger2 => {
+                let v = byte_parser::read_i32(val)?;
+                let v = if v < 0 {
+                    -1
+                } else {
+                    v.min(constants::TCP_FIN_TIMEOUT_MAX)
+                };
+                self.tcp_linger2_secs()
+                    .store(v, core::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            _ => Ok(()), // Silently ignore unsupported TCP options
+        }
+    }
+
+    /// Gets a SOL_SOCKET option.
+    pub(super) fn get_socket_option(
+        &self,
+        opt: PSO,
+        value: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        match opt {
+            PSO::ACCEPTCONN => {
+                let shutdown = self.shutdown.load(core::sync::atomic::Ordering::Acquire);
+                let is_listening = self.is_listening();
+                // shutdown(SHUT_RD) on a listening socket stops it from being a listener (SO_ACCEPTCONN=0).
+                let v = if is_listening && (shutdown & ShutdownBit::SHUT_RD.bits() as usize) == 0 {
+                    1i32
+                } else {
+                    0i32
+                };
+                Self::write_i32_opt(value, v)
+            }
+            PSO::ERROR => {
+                let err = match self.inner.read().as_ref() {
+                    Some(inner::Inner::Connecting(c)) => {
+                        let err = c.failure_reason().map(|e| -e.to_posix_errno()).unwrap_or(0);
+                        if err != 0 {
+                            c.consume_error();
+                        }
+                        err
+                    }
+                    _ => 0,
+                };
+                Self::write_i32_opt(value, err)
+            }
+            PSO::TYPE => Self::write_i32_opt(value, PSOCK::Stream as i32),
+            PSO::DOMAIN => {
+                let domain = match self.ip_version {
+                    smoltcp::wire::IpVersion::Ipv6 => AddressFamily::INet6,
+                    smoltcp::wire::IpVersion::Ipv4 => AddressFamily::INet,
+                };
+                Self::write_i32_opt(value, domain as i32)
+            }
+            PSO::PROTOCOL => Self::write_i32_opt(value, PSOL::TCP as i32),
+            PSO::SNDTIMEO_OLD | PSO::SNDTIMEO_NEW => {
+                let us = self
+                    .send_timeout_us()
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                let us = if us == u64::MAX { 0 } else { us };
+                write_timeval_opt(value, us)
+            }
+            PSO::RCVTIMEO_OLD | PSO::RCVTIMEO_NEW => {
+                let us = self
+                    .recv_timeout_us()
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                let us = if us == u64::MAX { 0 } else { us };
+                write_timeval_opt(value, us)
+            }
+            PSO::RCVLOWAT => {
+                let v = self
+                    .options
+                    .rcvlowat
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                Self::write_i32_opt(value, v)
+            }
+            PSO::KEEPALIVE => Self::write_bool_opt_i32(value, self.so_keepalive_enabled()),
+            PSO::REUSEADDR => Self::write_bool_opt_i32(value, self.so_reuseaddr()),
+            PSO::BROADCAST => Self::write_bool_opt_i32(value, self.so_broadcast()),
+            PSO::PASSCRED => Self::write_bool_opt_i32(value, self.so_passcred()),
+            PSO::NO_CHECK => Self::write_bool_opt_i32(value, self.so_no_check()),
+            PSO::OOBINLINE => Self::write_bool_opt_i32(value, self.so_oobinline_enabled()),
+            PSO::LINGER => {
+                let on = self
+                    .linger_onoff()
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                let linger = self
+                    .linger_linger()
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                Self::write_linger_opt(value, on, linger)
+            }
+            _ => {
+                // Most SOL_SOCKET options are handled by sys_getsockopt directly.
+                Err(SystemError::ENOPROTOOPT)
+            }
+        }
+    }
+
+    /// Gets a SOL_IP option.
+    pub(super) fn get_ip_option(
+        &self,
+        opt: IpOption,
+        value: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        match opt {
+            IpOption::MTU_DISCOVER => Self::write_atomic_i32(value, self.ip_mtu_discover()),
+            IpOption::MULTICAST_TTL => Self::write_atomic_i32(value, self.ip_multicast_ttl()),
+            IpOption::MULTICAST_LOOP => Self::write_bool_opt_i32(value, self.ip_multicast_loop()),
+            _ => Err(SystemError::ENOPROTOOPT),
+        }
+    }
+
+    /// Gets a SOL_TCP option.
+    pub(super) fn get_tcp_option(
+        &self,
+        opt: Options,
+        value: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        match opt {
+            Options::NoDelay => {
+                let nagle_enabled = self
+                    .with_socket_property(true, |inner| inner.with_socket(|s| s.nagle_enabled()));
+                let nodelay: u32 = if nagle_enabled { 0 } else { 1 };
+                Self::write_u32_opt(value, nodelay)
+            }
+            Options::INQ => Self::write_bool_opt_u32(value, self.tcp_inq_enabled()),
+            Options::QuickAck => Self::write_bool_opt_u32(value, self.tcp_quickack_enabled()),
+            Options::Cork => Self::write_bool_opt_i32(value, &self.options.tcp_cork),
+            Options::Congestion => {
+                let cc_name = self
+                    .with_socket_property(smoltcp::socket::tcp::CongestionControl::Reno, |inner| {
+                        inner.with_socket(|s| s.congestion_control())
+                    });
+
+                let name = match cc_name {
+                    smoltcp::socket::tcp::CongestionControl::Reno => "reno",
+                    smoltcp::socket::tcp::CongestionControl::Cubic => "cubic",
+                    _ => "reno",
+                };
+
+                let name_bytes = name.as_bytes();
+                // Linux TCP_CA_NAME_MAX is 16
+                let max_len = 16;
+                let len = core::cmp::min(value.len(), max_len);
+
+                // Fill with 0
+                value[..len].fill(0);
+                // Copy name
+                let copy_len = core::cmp::min(len, name_bytes.len());
+                value[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+
+                Ok(len)
+            }
+            Options::MaxSegment => Self::write_atomic_usize_as_u32(value, self.tcp_max_seg()),
+            Options::DeferAccept => Self::write_atomic_i32(value, self.tcp_defer_accept()),
+            Options::Syncnt => Self::write_atomic_i32(value, self.tcp_syncnt()),
+            Options::KeepIdle => Self::write_atomic_i32(value, self.tcp_keepidle_secs()),
+            Options::KeepIntvl => Self::write_atomic_i32(value, self.tcp_keepintvl_secs()),
+            Options::KeepCnt => Self::write_atomic_i32(value, self.tcp_keepcnt()),
+            Options::WindowClamp => Self::write_atomic_usize_as_u32(value, self.tcp_window_clamp()),
+            Options::UserTimeout => Self::write_atomic_i32(value, self.tcp_user_timeout()),
+            Options::Linger2 => {
+                let stored = self
+                    .tcp_linger2_secs()
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                let v = if stored < 0 {
+                    -1
+                } else if stored == 0 {
+                    constants::TCP_FIN_TIMEOUT_DEFAULT
+                } else {
+                    stored
+                };
+                Self::write_i32_opt(value, v)
+            }
+            Options::Info => self.get_tcp_info(value),
+            _ => Err(SystemError::ENOPROTOOPT),
+        }
+    }
+
+    /// Get TCP_INFO for this socket.
+    fn get_tcp_info(&self, value: &mut [u8]) -> Result<usize, SystemError> {
+        use info::TcpInfoCollector;
+
+        // For closed/unconnected sockets, return default info
+        let info = self.with_socket_property(info::PosixTcpInfo::default(), |inner| {
+            inner.with_socket(|socket| TcpInfoCollector::new(socket).collect())
+        });
+
+        // Copy the info struct to the output buffer
+        let info_bytes = unsafe {
+            core::slice::from_raw_parts(
+                &info as *const info::PosixTcpInfo as *const u8,
+                core::mem::size_of::<info::PosixTcpInfo>(),
+            )
+        };
+
+        let len = core::cmp::min(value.len(), info_bytes.len());
+        if len > 0 {
+            value[..len].copy_from_slice(&info_bytes[..len]);
+        }
+
+        Ok(len)
     }
 }

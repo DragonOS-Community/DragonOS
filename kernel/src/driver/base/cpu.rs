@@ -8,7 +8,8 @@ use alloc::{
 use crate::{
     driver::acpi::acpi_manager,
     filesystem::kernfs::KernFSInode,
-    libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+    libs::rwlock::RwLock,
+    libs::rwsem::{RwSemReadGuard, RwSemWriteGuard},
 };
 
 use super::{
@@ -246,11 +247,11 @@ impl KObject for CpuSubSystemFakeRootDevice {
         self.inner.write().name = name;
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 

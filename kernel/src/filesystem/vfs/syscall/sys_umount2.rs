@@ -2,14 +2,22 @@
 
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_UMOUNT2},
-    filesystem::vfs::{fcntl::AtFlags, utils::user_path_at, MountFS, MAX_PATHLEN},
+    filesystem::vfs::{
+        fcntl::AtFlags, utils::user_path_at, FileSystem, IndexNode, MountFS, MAX_PATHLEN,
+        VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    },
+    libs::casting::DowncastArc,
     process::ProcessManager,
     syscall::{
         table::{FormattedSyscallParam, Syscall},
         user_access,
     },
 };
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 use system_error::SystemError;
 
 /// src/linux/mount.c `umount` & `umount2`
@@ -26,7 +34,7 @@ impl Syscall for SysUmount2Handle {
         let target = Self::target(args);
         let flags = Self::flags(args);
 
-        let target = user_access::check_and_clone_cstr(target, Some(MAX_PATHLEN))?
+        let target = user_access::vfs_check_and_clone_cstr(target, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
         do_umount2(
@@ -80,15 +88,61 @@ pub fn do_umount2(
     target: &str,
     _flag: UmountFlag,
 ) -> Result<Arc<MountFS>, SystemError> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err(SystemError::ENOENT);
+    }
+
     let (work, rest) = user_path_at(&ProcessManager::current_pcb(), dirfd, target)?;
-    let path = work.absolute_path()? + &rest;
+    let target_inode = work.lookup_follow_symlink(&rest, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    let path = visible_umount_path(&target_inode)?;
+
     let result = ProcessManager::current_mntns().remove_mount(&path);
     if let Some(fs) = result {
         // Todo: 占用检测
-        fs.umount()?;
+        if let Err(err) = fs.umount() {
+            log::warn!(
+                "do_umount2: fs.umount failed for resolved='{}', fs='{}': {:?}",
+                path,
+                fs.name(),
+                err
+            );
+            return Err(err);
+        }
         return Ok(fs);
     }
+    log::warn!("do_umount2: mount_list miss for resolved='{}'", path);
     return Err(SystemError::EINVAL);
+}
+
+fn visible_umount_path(target_inode: &Arc<dyn IndexNode>) -> Result<String, SystemError> {
+    let absolute_path = target_inode.absolute_path()?;
+    let Some(target_mfs) = target_inode.fs().downcast_arc::<MountFS>() else {
+        return Ok(absolute_path);
+    };
+
+    let mount_root = target_mfs.root_inode();
+    if same_path_ref(target_inode, &mount_root) {
+        if let Some(mount_path) = ProcessManager::current_mntns()
+            .mount_list()
+            .get_mount_path_by_mountfs(&target_mfs)
+        {
+            return Ok(mount_path.as_str().to_string());
+        }
+    }
+
+    Ok(absolute_path)
+}
+
+fn same_path_ref(left: &Arc<dyn IndexNode>, right: &Arc<dyn IndexNode>) -> bool {
+    let Ok(left_meta) = left.metadata() else {
+        return false;
+    };
+    let Ok(right_meta) = right.metadata() else {
+        return false;
+    };
+
+    Arc::ptr_eq(&left.fs(), &right.fs()) && left_meta.inode_id == right_meta.inode_id
 }
 
 bitflags! {

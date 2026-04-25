@@ -1,13 +1,13 @@
 :::{note}
 **AI Translation Notice**
 
-This document was automatically translated by `Qwen/Qwen3-8B` model, for reference only.
+This document was automatically translated by `hunyuan-turbos-latest` model, for reference only.
 
 - Source document: kernel/locking/mutex.md
 
-- Translation time: 2025-05-19 01:41:16
+- Translation time: 2026-01-13 12:51:18
 
-- Translation model: `Qwen/Qwen3-8B`
+- Translation model: `hunyuan-turbos-latest`
 
 Please report issues via [Community Channel](https://github.com/DragonOS-Community/DragonOS/issues)
 
@@ -16,21 +16,21 @@ Please report issues via [Community Channel](https://github.com/DragonOS-Communi
 (_translated_label___mutex_doc_en)=
 
 :::{note}
-Author: Longjin <longjin@RinGoTek.cn>
+Author: Long Jin <longjin@RinGoTek.cn>
 :::
 
-# Mutex (Mutual Exclusion)
+# mutex (Mutual Exclusion Lock)
 
-&emsp;&emsp;A mutex is a lightweight synchronization primitive, with only two states: locked and idle.
+&emsp;&emsp;A mutex is a lightweight synchronization primitive that has only two states: locked or free.
 
-&emsp;&emsp;When a mutex is occupied, any process attempting to lock it will be put to sleep until the resource becomes available.
+&emsp;&emsp;When a mutex is held, any process attempting to lock it will be put to sleep until the resource becomes available.
 
 ## 1. Features
 
-- Only one task can hold the mutex at a time.
-- Recursive locking and unlocking are not allowed.
-- Mutex can only be operated through its API.
-- Mutex cannot be used in hard interrupts or soft interrupts.
+- Only one task can hold the mutex at any given time
+- Does not allow recursive locking/unlocking
+- Can only be manipulated through the mutex's API
+- Cannot be used in hard interrupts or soft interrupts
 
 ## 2. Definition
 
@@ -43,27 +43,20 @@ Author: Longjin <longjin@RinGoTek.cn>
 pub struct Mutex<T> {
     /// 该Mutex保护的数据
     data: UnsafeCell<T>,
-    /// Mutex内部的信息
-    inner: SpinLock<MutexInner>,
+    /// Mutex锁状态
+    lock: AtomicBool,
+    /// 等待队列（Waiter/Waker 机制避免唤醒丢失）
+    wait_queue: WaitQueue,
 }
-
-#[derive(Debug)]
-struct MutexInner {
-    /// 当前Mutex是否已经被上锁(上锁时，为true)
-    is_locked: bool,
-    /// 等待获得这个锁的进程的链表
-    wait_list: LinkedList<&'static mut process_control_block>,
-}
-
 ```
 
 ## 3. Usage
 
-&emsp;&emsp;Similar to SpinLock, the Rust version of Mutex has a guard. When using it, you need to transfer the ownership of the data to be protected to the Mutex. Moreover, the guard can only be generated after a successful lock, so at any moment, each Mutex can have at most one guard.
+&emsp;&emsp;Similar to SpinLock, the Rust version of Mutex has a guard. When using it, you need to transfer ownership of the data to be protected to the Mutex. Moreover, the guard can only be created after a successful lock, so there can be at most one guard for each Mutex at any time.
 
-&emsp;&emsp;When you need to read or modify the data protected by the Mutex, you should first use the `lock()` method of the Mutex. This method returns a `MutexGuard`. You can use the member functions of the protected data to perform some operations, or directly read or write the protected data. (This is equivalent to obtaining a mutable reference to the protected data.)
+&emsp;&emsp;When you need to read or modify the data protected by the Mutex, first use the `lock()` method of the Mutex. This method returns a `MutexGuard`. You can then use the member functions of the protected data to perform operations, or directly read/write the protected data (equivalent to obtaining a mutable reference to the protected data).
 
-&emsp;&emsp;A complete example is shown in the code below:
+&emsp;&emsp;A complete example is shown in the following code:
 
 ```rust
 let x :Mutex<Vec<i32>>= Mutex::new(Vec::new());
@@ -80,7 +73,7 @@ let x :Mutex<Vec<i32>>= Mutex::new(Vec::new());
     debug!("x={:?}", x);
 ```
 
-&emsp;&emsp;For variables inside a structure, we can use Mutex to perform fine-grained locking, that is, wrap the member variables that need to be locked in detail with Mutex, for example:
+&emsp;&emsp;For variables inside a struct, we can use Mutex for fine-grained locking, i.e., wrapping the member variables that require detailed locking with Mutex, like this:
 
 ```rust
 pub struct a {
@@ -88,7 +81,7 @@ pub struct a {
 }
 ```
 
-&emsp;&emsp;Of course, we can also lock the entire structure:
+&emsp;&emsp;Of course, we can also lock the entire struct:
 
 ```rust
 struct MyStruct {
@@ -110,9 +103,9 @@ pub const fn new(value: T) -> Self
 
 #### Description
 
-&emsp;&emsp;The `new()` method is used to initialize a Mutex. This method requires a protected data as a parameter. It returns a Mutex.
+&emsp;&emsp;The `new()` method is used to initialize a Mutex. This method takes the data to be protected as a parameter and returns a Mutex.
 
-### 4.2. lock - Lock
+### 4.2. lock - Acquire Lock
 
 #### Prototype
 
@@ -122,11 +115,11 @@ pub fn lock(&self) -> MutexGuard<T>
 
 #### Description
 
-&emsp;&emsp;Lock the Mutex, returns the guard of the Mutex. You can use this guard to operate the protected data.
+&emsp;&emsp;Acquires the Mutex lock and returns the Mutex guard, which you can use to manipulate the protected data.
 
-&emsp;&emsp;If the Mutex is already locked, this method will block the current process until the Mutex is released.
+&emsp;&emsp;If the Mutex is already locked, this method will block and wait via `WaitQueue.wait_until()` until the lock becomes available. The waiting process uses a Waiter/Waker state machine handshake to prevent wake-up loss.
 
-### 4.3. try_lock - Try to Lock
+### 4.3. try_lock - Attempt to Acquire Lock
 
 #### Prototype
 
@@ -136,50 +129,4 @@ pub fn try_lock(&self) -> Result<MutexGuard<T>, i32>
 
 #### Description
 
-&emsp;&emsp;Try to lock the Mutex. If the lock fails, the current process will not be added to the waiting queue. If the lock is successful, it returns the guard of the Mutex; if the Mutex is already locked, it returns `Err(错误码)`.
-
-## 5. C Version of Mutex (Will be deprecated in the future)
-
-&emsp;&emsp;The mutex is defined in `common/mutex.h`. Its data type is as follows:
-
-```c
-typedef struct
-{
-
-    atomic_t count; // 锁计数。1->已解锁。 0->已上锁,且有可能存在等待者
-    spinlock_t wait_lock;   // mutex操作锁，用于对mutex的list的操作进行加锁
-    struct List wait_list;  // Mutex的等待队列
-} mutex_t;
-```
-
-### 5.1. API
-
-#### mutex_init
-
-**`void mutex_init(mutex_t *lock)`**
-
-&emsp;&emsp;Initialize a mutex object.
-
-#### mutex_lock
-
-**`void mutex_lock(mutex_t *lock)`**
-
-&emsp;&emsp;Lock a mutex object. If the mutex is currently held by another process, the current process will enter a sleep state.
-
-#### mutex_unlock
-
-**`void mutex_unlock(mutex_t *lock)`**
-
-&emsp;&emsp;Unlock a mutex object. If there are other processes in the mutex's waiting queue, the next process will be awakened.
-
-#### mutex_trylock
-
-**`void mutex_trylock(mutex_t *lock)`**
-
-&emsp;&emsp;Try to lock a mutex object. If the mutex is currently held by another process, it returns 0. Otherwise, the lock is successful and returns 1.
-
-#### mutex_is_locked
-
-**`void mutex_is_locked(mutex_t *lock)`**
-
-&emsp;&emsp;Determine if the mutex is already locked. If the given mutex is in a locked state, it returns 1; otherwise, it returns 0.
+&emsp;&emsp;Attempts to acquire the Mutex lock. If the attempt fails, the current process is not added to the waiting queue. If the lock is successfully acquired, the Mutex guard is returned; if the Mutex is already locked, `Err(错误码)` is returned.

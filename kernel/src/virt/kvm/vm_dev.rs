@@ -1,9 +1,11 @@
+use crate::libs::mutex::MutexGuard;
 use crate::driver::base::device::device_number::DeviceNumber;
+use crate::libs::mutex::MutexGuard;
 use crate::filesystem;
 use crate::filesystem::devfs::DevFS;
 use crate::filesystem::vfs::{
     core::generate_inode_id,
-    file::{File, FileMode},
+    file::{File, FileFlags, FileMode},
     FilePrivateData, FileSystem, FileType, IndexNode, Metadata,
 };
 use crate::libs::spinlock::SpinLockGuard;
@@ -98,14 +100,14 @@ impl IndexNode for LockedVmInode {
 
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _mode: &FileMode,
     ) -> Result<(), SystemError> {
         debug!("file private data:{:?}", _data);
         return Ok(());
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 
@@ -144,7 +146,7 @@ impl IndexNode for LockedVmInode {
         &self,
         cmd: u32,
         data: usize,
-        _private_data: &FilePrivateData,
+        _private_data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         match cmd {
             0xdeadbeef => {
@@ -196,7 +198,7 @@ impl IndexNode for LockedVmInode {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
@@ -207,7 +209,7 @@ impl IndexNode for LockedVmInode {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
@@ -223,11 +225,11 @@ fn kvm_vm_ioctl_create_vcpu(id: u32) -> Result<usize, SystemError> {
     update_vm(0, current_vm);
 
     let vcpu_inode = LockedVcpuInode::new();
-    let file: File = File::new(vcpu_inode, FileMode::O_RDWR)?;
+    let file: File = File::new(vcpu_inode, FileFlags::O_RDWR)?;
     let r = ProcessManager::current_pcb()
         .fd_table()
         .write()
-        .alloc_fd(file, None)
+        .alloc_fd(file, None, false)
         .map(|fd| fd as usize);
     return r;
 }

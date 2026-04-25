@@ -9,20 +9,23 @@ use core::{
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use hashbrown::{HashMap, HashSet};
 use log::{error, info};
 use lru::LruCache;
 
 use crate::{
-    arch::{interrupt::ipi::send_ipi, mm::LockedFrameAllocator, MMArch},
-    exception::ipi::{IpiKind, IpiTarget},
-    filesystem::{page_cache::PageCache, vfs::FilePrivateData},
+    arch::{mm::LockedFrameAllocator, MMArch},
+    filesystem::{
+        page_cache::{list_page_caches, PageCache},
+        vfs::FilePrivateData,
+    },
     init::initcall::INITCALL_CORE,
     libs::{
-        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
-        spinlock::{SpinLock, SpinLockGuard},
+        mutex::{Mutex, MutexGuard},
+        rwsem::{RwSem, RwSemReadGuard, RwSemUpgradeableGuard, RwSemWriteGuard},
     },
+    mm::page_cache_stats as pc_stats,
     process::{ProcessControlBlock, ProcessManager},
     time::{sleep::nanosleep, PosixTimeSpec},
 };
@@ -45,12 +48,12 @@ pub const PAGE_4K_SIZE: usize = 1 << PAGE_4K_SHIFT;
 pub const PAGE_2M_SIZE: usize = 1 << PAGE_2M_SHIFT;
 
 /// 全局物理页信息管理器
-pub static mut PAGE_MANAGER: Option<SpinLock<PageManager>> = None;
+pub static mut PAGE_MANAGER: Option<Mutex<PageManager>> = None;
 
 /// 初始化PAGE_MANAGER
 pub fn page_manager_init() {
     info!("page_manager_init");
-    let page_manager = SpinLock::new(PageManager::new());
+    let page_manager = Mutex::new(PageManager::new());
 
     compiler_fence(Ordering::SeqCst);
     unsafe { PAGE_MANAGER = Some(page_manager) };
@@ -59,8 +62,8 @@ pub fn page_manager_init() {
     info!("page_manager_init done");
 }
 
-pub fn page_manager_lock_irqsave() -> SpinLockGuard<'static, PageManager> {
-    unsafe { PAGE_MANAGER.as_ref().unwrap().lock_irqsave() }
+pub fn page_manager_lock() -> MutexGuard<'static, PageManager> {
+    unsafe { PAGE_MANAGER.as_ref().unwrap().lock() }
 }
 
 // 物理页管理器
@@ -81,14 +84,14 @@ impl PageManager {
     }
 
     pub fn get(&mut self, paddr: &PhysAddr) -> Option<Arc<Page>> {
-        if let Some(p) = page_reclaimer_lock_irqsave().get(paddr) {
+        if let Some(p) = page_reclaimer_lock().get(paddr) {
             return Some(p);
         }
         self.phys2page.get(paddr).cloned()
     }
 
     pub fn get_unwrap(&mut self, paddr: &PhysAddr) -> Arc<Page> {
-        if let Some(p) = page_reclaimer_lock_irqsave().get(paddr) {
+        if let Some(p) = page_reclaimer_lock().get(paddr) {
             return p;
         }
         self.phys2page
@@ -108,8 +111,8 @@ impl PageManager {
         }
     }
 
-    pub fn remove_page(&mut self, paddr: &PhysAddr) {
-        self.phys2page.remove(paddr);
+    pub fn remove_page(&mut self, paddr: &PhysAddr) -> Option<Arc<Page>> {
+        self.phys2page.remove(paddr)
     }
 
     /// # 创建一个新页面并加入管理器
@@ -174,7 +177,7 @@ impl PageManager {
             let page = Page::new(cur_phys.phys_address(), page_type.clone(), flags);
             if let Err(e) = self.insert(&page) {
                 for insert_page in ret {
-                    self.remove_page(&insert_page.read_irqsave().phys_addr);
+                    self.remove_page(&insert_page.read().phys_addr);
                 }
                 return Err(e);
             }
@@ -205,7 +208,7 @@ impl PageManager {
 
         assert!(!self.contains(&paddr), "phys page: {paddr:?} already exist");
 
-        let page = Page::copy(old_page.read_irqsave(), paddr)
+        let page = Page::copy(old_page.read(), paddr)
             .inspect_err(|_| unsafe { allocator.free_one(paddr) })?;
 
         self.insert(&page)?;
@@ -214,11 +217,11 @@ impl PageManager {
     }
 }
 
-pub static mut PAGE_RECLAIMER: Option<SpinLock<PageReclaimer>> = None;
+pub static mut PAGE_RECLAIMER: Option<Mutex<PageReclaimer>> = None;
 
 pub fn page_reclaimer_init() {
     info!("page_reclaimer_init");
-    let page_reclaimer = SpinLock::new(PageReclaimer::new());
+    let page_reclaimer = Mutex::new(PageReclaimer::new());
 
     compiler_fence(Ordering::SeqCst);
     unsafe { PAGE_RECLAIMER = Some(page_reclaimer) };
@@ -258,10 +261,12 @@ fn page_reclaim_thread() -> i32 {
         // 保留4096个页面，总计16MB的空闲空间
         if usage.free().data() < 4096 {
             let page_to_free = 4096;
-            page_reclaimer_lock_irqsave().shrink_list(PageFrameCount::new(page_to_free));
+            // 分离选择和回收阶段，避免长时间持有页面回收器锁导致与
+            // page_manager/page_cache 的锁顺序反转。
+            PageReclaimer::shrink_list(PageFrameCount::new(page_to_free));
         } else {
             //TODO 暂时让页面回收线程负责脏页回写任务，后续需要分离
-            page_reclaimer_lock_irqsave().flush_dirty_pages();
+            page_reclaimer_lock().flush_dirty_pages();
             // 休眠5秒
             // log::info!("sleep");
             let _ = nanosleep(PosixTimeSpec::new(0, 500_000_000));
@@ -270,8 +275,8 @@ fn page_reclaim_thread() -> i32 {
 }
 
 /// 获取页面回收器
-pub fn page_reclaimer_lock_irqsave() -> SpinLockGuard<'static, PageReclaimer> {
-    unsafe { PAGE_RECLAIMER.as_ref().unwrap().lock_irqsave() }
+pub fn page_reclaimer_lock() -> MutexGuard<'static, PageReclaimer> {
+    unsafe { PAGE_RECLAIMER.as_ref().unwrap().lock() }
 }
 
 /// 页面回收器
@@ -298,29 +303,89 @@ impl PageReclaimer {
         self.lru.pop(paddr)
     }
 
-    /// lru链表缩减
-    /// ## 参数
-    ///
-    /// - `count`: 需要缩减的页面数量
-    pub fn shrink_list(&mut self, count: PageFrameCount) {
+    /// lru链表缩减（对外接口，内部自行获取/释放回收器锁）
+    /// 分两阶段：
+    /// 1) 持有回收器锁，从 LRU 中摘下目标页面列表；
+    /// 2) 释放回收器锁后，逐个执行写回与回收，避免锁顺序反转。
+    pub fn shrink_list(count: PageFrameCount) {
+        // 阶段1：仅持有回收器锁，摘取受害者
+        let victims = {
+            let mut reclaimer = page_reclaimer_lock();
+            reclaimer.drain_lru(count)
+        };
+
+        // 阶段2：不持有回收器锁，安全地回收页面
+        Self::evict_pages(victims);
+    }
+
+    /// 从 LRU 中批量弹出页面，不做任何回收操作。
+    fn drain_lru(&mut self, count: PageFrameCount) -> Vec<Arc<Page>> {
+        let mut victims = Vec::new();
         for _ in 0..count.data() {
-            let (_, page) = self.lru.pop_lru().expect("pagecache is empty");
-            let mut guard = page.write_irqsave();
+            match self.lru.pop_lru() {
+                Some((_paddr, page)) => victims.push(page),
+                None => break,
+            }
+        }
+        victims
+    }
+
+    /// 在不持有回收器锁的情况下，完成页面写回与回收。
+    fn evict_pages(victims: Vec<Arc<Page>>) {
+        for page in victims {
+            let mut guard = page.write();
             if let PageType::File(info) = guard.page_type().clone() {
-                let page_cache = &info.page_cache;
+                // Never evict a file-backed page that is still mapped into any VMA.
+                // Our eviction path removes the page from page_cache/page_manager; dropping a
+                // still-mapped page will trip InnerPage::drop assertions and can crash userland.
+                if guard.map_count() != 0 {
+                    drop(guard);
+                    page_reclaimer_lock().insert_page(page.phys_address(), &page);
+                    continue;
+                }
+
                 let page_index = info.index;
                 let paddr = guard.phys_address();
+
                 if guard.flags().contains(PageFlags::PG_DIRTY) {
                     // 先回写脏页
                     Self::page_writeback(&mut guard, true);
+                    if guard.flags().contains(PageFlags::PG_DIRTY) {
+                        drop(guard);
+                        page_reclaimer_lock().insert_page(paddr, &page);
+                        continue;
+                    }
                 }
 
-                // 删除页面
-                page_cache.lock_irqsave().remove_page(page_index);
-                page_manager_lock_irqsave().remove_page(&paddr);
-                self.remove_page(&paddr);
+                // 删除页面：顺序为 page_cache -> page_manager，避免原有的 reclaimer 锁参与死锁
+                //
+                // FileMapInfo 内保存 Weak<PageCache> 以避免 PageCache <-> Page 的强引用环。
+                // 如果此时 PageCache 已被释放（upgrade 失败），说明其 pages 映射也已销毁，无需再 remove。
+                if let Some(page_cache) = info.page_cache.upgrade() {
+                    if !page_cache.is_page_ready(page_index) {
+                        drop(guard);
+                        page_reclaimer_lock().insert_page(paddr, &page);
+                        continue;
+                    }
+                    let _ = page_cache.manager().remove_page(page_index);
+                }
+                page_manager_lock().remove_page(&paddr);
             }
         }
+    }
+
+    /// Drop clean pagecache pages only, matching Linux drop_caches semantics.
+    pub fn drop_pagecache(clean_only: bool) -> usize {
+        if !clean_only {
+            return 0;
+        }
+
+        let mut dropped = 0;
+        for cache in list_page_caches() {
+            dropped += cache.drop_clean_pages();
+        }
+
+        dropped
     }
 
     /// 唤醒页面回收线程
@@ -337,11 +402,17 @@ impl PageReclaimer {
     ///
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
-    pub fn page_writeback(guard: &mut RwLockWriteGuard<InnerPage>, unmap: bool) {
+    pub fn page_writeback(guard: &mut InnerPage, unmap: bool) {
         // log::debug!("page writeback: {:?}", guard.phys_addr);
 
         let (page_cache, page_index) = match guard.page_type() {
-            PageType::File(info) => (info.page_cache.clone(), info.index),
+            PageType::File(info) => match info.page_cache.upgrade() {
+                Some(page_cache) => (page_cache, info.index),
+                None => {
+                    log::warn!("try to writeback a file page but page_cache already dropped");
+                    return;
+                }
+            },
             _ => {
                 log::warn!("try to writeback a non-file page");
                 return;
@@ -349,57 +420,64 @@ impl PageReclaimer {
         };
         let paddr = guard.phys_address();
         let inode = page_cache.inode().clone().unwrap().upgrade().unwrap();
+        let backend = page_cache.backend();
 
-        for vma in guard.vma_set() {
-            let address_space = vma.lock_irqsave().address_space().and_then(|x| x.upgrade());
-            if address_space.is_none() {
-                continue;
-            }
-            let address_space = address_space.unwrap();
-            let mut guard = address_space.write();
-            let mapper = &mut guard.user_mapper.utable;
-            let virt = vma.lock_irqsave().page_address(page_index).unwrap();
-            if unmap {
-                unsafe {
-                    // 取消页表映射
-                    mapper.unmap(virt, false).unwrap().flush();
-                }
-            } else {
-                unsafe {
-                    // 保护位设为只读
-                    mapper.remap(
-                        virt,
-                        mapper.get_entry(virt, 0).unwrap().flags().set_write(false),
-                    )
-                };
+        if let Ok(unmapped_vmas) = page_cache.mkclean_page(page_index, unmap) {
+            for vma in unmapped_vmas {
+                guard.remove_vma(vma.as_ref());
             }
         }
 
+        let page_start = page_index * MMArch::PAGE_SIZE;
         let len = if let Ok(metadata) = inode.metadata() {
-            let size = metadata.size as usize;
-            size.saturating_sub(page_index * MMArch::PAGE_SIZE)
+            let file_size = metadata.size.max(0) as usize;
+            if file_size <= page_start {
+                0
+            } else {
+                core::cmp::min(MMArch::PAGE_SIZE, file_size - page_start)
+            }
         } else {
             MMArch::PAGE_SIZE
         };
 
         if len > 0 {
-            inode
-                .write_direct(
-                    page_index * MMArch::PAGE_SIZE,
+            page_cache.mark_page_writeback(page_index);
+            guard.remove_flags(PageFlags::PG_DIRTY);
+            let data = unsafe {
+                core::slice::from_raw_parts(
+                    MMArch::phys_2_virt(paddr).unwrap().data() as *const u8,
                     len,
-                    unsafe {
-                        core::slice::from_raw_parts(
-                            MMArch::phys_2_virt(paddr).unwrap().data() as *mut u8,
-                            len,
-                        )
-                    },
-                    SpinLock::new(FilePrivateData::Unused).lock(),
                 )
-                .unwrap();
+            };
+            let r = if let Some(backend) = backend {
+                backend.write_page(page_index, data)
+            } else {
+                inode.write_direct(
+                    page_start,
+                    len,
+                    data,
+                    Mutex::new(FilePrivateData::Unused).lock(),
+                )
+            };
+            if let Err(e) = r {
+                log::error!(
+                    "page writeback failed: offset={}, len={}, err={:?}",
+                    page_start,
+                    len,
+                    e
+                );
+                guard.add_flags(PageFlags::PG_ERROR);
+                page_cache.mark_page_error(page_index);
+                return;
+            }
         }
 
-        // 清除标记
-        guard.remove_flags(PageFlags::PG_DIRTY);
+        guard.remove_flags(PageFlags::PG_ERROR);
+        if guard.flags().contains(PageFlags::PG_DIRTY) {
+            page_cache.mark_page_dirty(page_index);
+        } else {
+            page_cache.mark_page_uptodate(page_index);
+        }
     }
 
     /// lru脏页刷新
@@ -407,7 +485,7 @@ impl PageReclaimer {
         // log::info!("flush_dirty_pages");
         let iter = self.lru.iter();
         for (_paddr, page) in iter {
-            let mut guard = page.write_irqsave();
+            let mut guard = page.write();
             if guard.flags().contains(PageFlags::PG_DIRTY) {
                 Self::page_writeback(&mut guard, false);
             }
@@ -440,7 +518,7 @@ bitflags! {
 
 #[derive(Debug)]
 pub struct Page {
-    inner: RwLock<InnerPage>,
+    inner: RwSem<InnerPage>,
     /// 页面所在物理地址
     phys_addr: PhysAddr,
 }
@@ -461,11 +539,11 @@ impl Page {
     fn new(phys_addr: PhysAddr, page_type: PageType, flags: PageFlags) -> Arc<Page> {
         let inner = InnerPage::new(phys_addr, page_type, flags);
         let page = Arc::new(Self {
-            inner: RwLock::new(inner),
+            inner: RwSem::new(inner),
             phys_addr,
         });
-        if page.read_irqsave().flags == PageFlags::PG_LRU {
-            page_reclaimer_lock_irqsave().insert_page(phys_addr, &page);
+        if page.read().flags == PageFlags::PG_LRU {
+            page_reclaimer_lock().insert_page(phys_addr, &page);
         };
         page
     }
@@ -482,7 +560,7 @@ impl Page {
     /// - `Ok(Arc<Page>)`: 新页面
     /// - `Err(SystemError)`: 错误码
     fn copy(
-        old_guard: RwLockReadGuard<InnerPage>,
+        old_guard: RwSemReadGuard<InnerPage>,
         new_phys: PhysAddr,
     ) -> Result<Arc<Page>, SystemError> {
         let page_type = old_guard.page_type().clone();
@@ -496,7 +574,7 @@ impl Page {
                 .copy_from_nonoverlapping(old_vaddr.data() as *mut u8, MMArch::PAGE_SIZE);
         }
         Ok(Arc::new(Self {
-            inner: RwLock::new(inner),
+            inner: RwSem::new(inner),
             phys_addr: new_phys,
         }))
     }
@@ -506,12 +584,16 @@ impl Page {
         self.phys_addr
     }
 
-    pub fn read_irqsave(&self) -> RwLockReadGuard<'_, InnerPage> {
-        self.inner.read_irqsave()
+    pub fn read(&self) -> RwSemReadGuard<'_, InnerPage> {
+        self.inner.read()
     }
 
-    pub fn write_irqsave(&self) -> RwLockWriteGuard<'_, InnerPage> {
-        self.inner.write_irqsave()
+    pub fn upread(&self) -> RwSemUpgradeableGuard<'_, InnerPage> {
+        self.inner.upread()
+    }
+
+    pub fn write(&self) -> RwSemWriteGuard<'_, InnerPage> {
+        self.inner.write()
     }
 }
 
@@ -540,12 +622,24 @@ impl InnerPage {
 
     /// 将vma加入anon_vma
     pub fn insert_vma(&mut self, vma: Arc<LockedVMA>) {
+        let was_mapped = self.map_count() > 0;
         self.vma_set.insert(vma);
+        if !was_mapped && matches!(self.page_type, PageType::File(_)) {
+            pc_stats::inc_file_mapped();
+        }
     }
 
     /// 将vma从anon_vma中删去
     pub fn remove_vma(&mut self, vma: &LockedVMA) {
-        self.vma_set.remove(vma);
+        let was_mapped = self.map_count() > 0;
+        let removed = self.vma_set.remove(vma);
+        if removed
+            && was_mapped
+            && self.map_count() == 0
+            && matches!(self.page_type, PageType::File(_))
+        {
+            pc_stats::dec_file_mapped();
+        }
     }
 
     /// 判断当前物理页是否能被回
@@ -559,7 +653,7 @@ impl InnerPage {
 
     pub fn page_cache(&self) -> Option<Arc<PageCache>> {
         match &self.page_type {
-            PageType::File(info) => Some(info.page_cache.clone()),
+            PageType::File(info) => info.page_cache.upgrade(),
             _ => None,
         }
     }
@@ -677,7 +771,8 @@ pub enum PageType {
 
 #[derive(Debug, Clone)]
 pub struct FileMapInfo {
-    pub page_cache: Arc<PageCache>,
+    /// 指向页缓存的弱引用，避免 PageCache -> Page -> PageCache 的强引用环导致页面无法释放。
+    pub page_cache: Weak<PageCache>,
     /// 在pagecache中的偏移
     pub index: usize,
 }
@@ -855,7 +950,7 @@ impl<Arch: MemoryManagementArch> PageTable<Arch> {
                             new_table.set_entry(i, entry);
                         } else {
                             let phys = allocator.allocate_one()?;
-                            let mut page_manager_guard = page_manager_lock_irqsave();
+                            let mut page_manager_guard = page_manager_lock();
                             let old_phys = entry.address().unwrap();
                             page_manager_guard.copy_page(&old_phys, allocator).ok()?;
                             new_table.set_entry(i, PageEntry::new(phys, entry.flags()));
@@ -1413,8 +1508,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         virt: VirtAddr,
         flags: EntryFlags<Arch>,
     ) -> Option<PageFlush<Arch>> {
-        let mut page_manager_guard: SpinLockGuard<'static, PageManager> =
-            page_manager_lock_irqsave();
+        let mut page_manager_guard = page_manager_lock();
         let page = page_manager_guard
             .create_one_page(
                 PageType::Normal,
@@ -1691,6 +1785,29 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
             .flatten();
     }
 
+    /// Modify the leaf PTE flags of an existing mapping without allocating or freeing any page-table pages.
+    ///
+    /// This variant only touches an already present leaf entry and therefore works with `&self`.
+    /// It is intended for reverse-mapping walkers such as `mkclean` / file truncate zap, which
+    /// run under a separate page-table edit lock and must not require `&mut PageMapper`.
+    pub unsafe fn remap_present(
+        &self,
+        virt: VirtAddr,
+        flags: EntryFlags<Arch>,
+    ) -> Option<PageFlush<Arch>> {
+        self.visit(virt, |p1, i| {
+            let mut entry = p1.entry(i)?;
+            if entry.empty() {
+                return None;
+            }
+
+            entry.set_flags(flags);
+            p1.set_entry(i, entry);
+            Some(PageFlush::new(virt))
+        })
+        .flatten()
+    }
+
     /// 根据虚拟地址，查找页表，获取对应的物理地址和页表项的flags
     ///
     /// ## 参数
@@ -1740,14 +1857,69 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         virt: VirtAddr,
         unmap_parents: bool,
     ) -> Option<(PhysAddr, EntryFlags<Arch>, PageFlush<Arch>)> {
+        self.unmap_phys_with_freed_tables(virt, unmap_parents)
+            .map(|(paddr, flags, flush, _freed)| (paddr, flags, flush))
+    }
+
+    /// Same as `unmap_phys`, but also returns whether intermediate page-table pages were freed during unmapping.
+    ///
+    /// Freed intermediate page-table pages (i.e. this unmap caused a page table level to become empty and
+    /// be returned to the allocator) means that other CPUs' TLBs may still cache intermediate-level translation
+    /// entries pointing to those pages (corresponding to `tlb->freed_tables` in Linux). The caller should
+    /// pass this information to [`MmuGather`] so that shootdown triggers a full-mm invalidation instead of
+    /// per-page invlpg, preventing Paging-Structure Cache from retaining stale entries.
+    ///
+    /// [`MmuGather`]: crate::mm::mmu_gather::MmuGather
+    pub unsafe fn unmap_phys_with_freed_tables(
+        &mut self,
+        virt: VirtAddr,
+        unmap_parents: bool,
+    ) -> Option<(PhysAddr, EntryFlags<Arch>, PageFlush<Arch>, bool)> {
         if !virt.check_aligned(Arch::PAGE_SIZE) {
             error!("Try to unmap unaligned page: virt={:?}", virt);
             return None;
         }
 
         let table = self.table();
-        return unmap_phys_inner(virt, &table, unmap_parents, self.allocator_mut())
-            .map(|(paddr, flags)| (paddr, flags, PageFlush::<Arch>::new(virt)));
+        let mut freed_tables = false;
+        unmap_phys_inner(
+            virt,
+            &table,
+            unmap_parents,
+            self.allocator_mut(),
+            &mut freed_tables,
+        )
+        .map(|(paddr, flags)| (paddr, flags, PageFlush::<Arch>::new(virt), freed_tables))
+    }
+
+    /// Clear an existing leaf PTE without freeing intermediate page-table pages.
+    ///
+    /// This is the non-allocating / non-freeing counterpart used by cross-mm file-rmap walkers.
+    /// Keeping parent page tables intact avoids needing access to the frame allocator and mirrors
+    /// Linux's `zap_pte_range()` style leaf-only invalidation.
+    pub unsafe fn unmap_phys_preserve_tables(
+        &self,
+        virt: VirtAddr,
+    ) -> Option<(PhysAddr, EntryFlags<Arch>, PageFlush<Arch>)> {
+        if !virt.check_aligned(Arch::PAGE_SIZE) {
+            error!("Try to unmap unaligned page: virt={:?}", virt);
+            return None;
+        }
+
+        self.visit(virt, |p1, i| {
+            let entry = p1.entry(i)?;
+            if entry.empty() {
+                return None;
+            }
+
+            p1.set_entry(i, PageEntry::from_usize(0));
+            Some((
+                entry.address().ok()?,
+                entry.flags(),
+                PageFlush::<Arch>::new(virt),
+            ))
+        })
+        .flatten()
     }
 
     /// 在页表中，访问虚拟地址对应的页表项，并调用传入的函数F
@@ -1787,6 +1959,7 @@ unsafe fn unmap_phys_inner<Arch: MemoryManagementArch>(
     table: &PageTable<Arch>,
     unmap_parents: bool,
     allocator: &mut impl FrameAllocator,
+    freed_tables: &mut bool,
 ) -> Option<(PhysAddr, EntryFlags<Arch>)> {
     // 获取页表项的索引
     let i = table.index_of(vaddr)?;
@@ -1800,7 +1973,7 @@ unsafe fn unmap_phys_inner<Arch: MemoryManagementArch>(
 
     let subtable = table.next_level_table(i)?;
     // 递归地取消映射
-    let result = unmap_phys_inner(vaddr, &subtable, unmap_parents, allocator)?;
+    let result = unmap_phys_inner(vaddr, &subtable, unmap_parents, allocator, freed_tables)?;
 
     // TODO: This is a bad idea for architectures where the kernel mappings are done in the process tables,
     // as these mappings may become out of sync
@@ -1816,6 +1989,8 @@ unsafe fn unmap_phys_inner<Arch: MemoryManagementArch>(
             table.set_entry(i, PageEntry::from_usize(0));
             // 释放子页表
             allocator.free_one(subtable.phys());
+            // Mark: intermediate page-table pages were freed; upper layer needs a heavier shootdown for this mm (`freed_tables`).
+            *freed_tables = true;
         }
     }
 
@@ -1871,8 +2046,25 @@ impl<Arch: MemoryManagementArch> Drop for PageFlush<Arch> {
     }
 }
 
-/// 用于刷新整个页表的刷新器。这个刷新器一经产生，就必须调用flush()方法，
-/// 否则会造成对页表的更改被忽略，这是不安全的
+/// A flusher for the entire page table. Once created, its `flush()` method must be called;
+/// otherwise, page table changes will be silently ignored, which is unsafe.
+///
+/// # Usage Constraints
+///
+/// **Only allowed for mappings not attached to any user `AddressSpace`**, for example:
+///
+/// - Kernel-mode fixed mappings (kernel mapper)
+/// - DMA / IO remap regions that are never loaded as a user mm by another CPU
+///
+/// Any user-mm PTE modification must go through [`MmuGather`] + [`AddressSpace::flush_tlb_range`],
+/// which perform synchronous shootdown on all `active_cpus`, preventing stale TLB hits on freed physical pages.
+///
+/// A flush initiated with `PageFlushAll` only takes effect on the current CPU (`invalidate_all`)
+/// and does not perform cross-core shootdown; using it in a user-mm scenario would break TLB
+/// consistency (risk 4).
+///
+/// [`MmuGather`]: crate::mm::mmu_gather::MmuGather
+/// [`AddressSpace::flush_tlb_range`]: crate::mm::ucontext::AddressSpace::flush_tlb_range
 #[must_use = "The flusher must call the 'flush()', or the changes to page table will be unsafely ignored."]
 pub struct PageFlushAll<Arch: MemoryManagementArch> {
     phantom: PhantomData<fn() -> Arch>,
@@ -1914,40 +2106,34 @@ impl<Arch: MemoryManagementArch> Flusher<Arch> for () {
     fn consume(&mut self, _flush: PageFlush<Arch>) {}
 }
 
+/// "Deferred" flusher: silently forgets `PageFlush` on consume;
+/// the caller is responsible for performing a unified mm-aware `AddressSpace::flush_tlb_range` flush later.
+///
+/// This kind of flusher performs no TLB invalidation; suitable for mprotect/mremap/madvise/munmap etc.
+/// where the pattern is "modify PTEs + unified shootdown afterwards".
+#[derive(Debug, Default)]
+pub struct DeferredFlusher;
+
+impl DeferredFlusher {
+    #[inline]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl<Arch: MemoryManagementArch> Flusher<Arch> for DeferredFlusher {
+    #[inline]
+    fn consume(&mut self, flush: PageFlush<Arch>) {
+        // SAFETY: caller guarantees that AddressSpace::flush_tlb_range will be called later for unified TLB flush.
+        unsafe { flush.ignore() };
+    }
+}
+
 impl<Arch: MemoryManagementArch> Drop for PageFlushAll<Arch> {
     fn drop(&mut self) {
         unsafe {
             Arch::invalidate_all();
         }
-    }
-}
-
-/// 未在当前CPU上激活的页表的刷新器
-///
-/// 如果页表没有在当前cpu上激活，那么需要发送ipi到其他核心，尝试在其他核心上刷新页表
-///
-/// TODO: 这个方式很暴力，也许把它改成在指定的核心上刷新页表会更好。（可以测试一下开销）
-#[derive(Debug)]
-pub struct InactiveFlusher;
-
-impl InactiveFlusher {
-    pub fn new() -> Self {
-        return Self {};
-    }
-}
-
-impl Flusher<MMArch> for InactiveFlusher {
-    fn consume(&mut self, flush: PageFlush<MMArch>) {
-        unsafe {
-            flush.ignore();
-        }
-    }
-}
-
-impl Drop for InactiveFlusher {
-    fn drop(&mut self) {
-        // 发送刷新页表的IPI
-        send_ipi(IpiKind::FlushTLB, IpiTarget::Other);
     }
 }
 

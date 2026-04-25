@@ -3,7 +3,7 @@ use system_error::SystemError;
 use crate::{
     arch::interrupt::TrapFrame,
     arch::syscall::nr::{SYS_GET_ROBUST_LIST, SYS_SET_ROBUST_LIST},
-    mm::{verify_area, VirtAddr},
+    mm::{access_ok, VirtAddr},
     syscall::table::{FormattedSyscallParam, Syscall},
 };
 use alloc::{string::ToString, vec::Vec};
@@ -39,7 +39,7 @@ impl Syscall for SysSetRobustListHandle {
         let len = Self::len(args);
 
         // 判断用户空间地址的合法性
-        verify_area(head, core::mem::size_of::<u32>())?;
+        access_ok(head, core::mem::size_of::<u32>())?;
 
         let result = crate::libs::futex::futex::RobustListHead::set_robust_list(head, len);
 
@@ -99,8 +99,8 @@ impl Syscall for SysGetRobustListHandle {
         let len_ptr = Self::len_ptr(args);
 
         // 判断用户空间地址的合法性
-        verify_area(head, core::mem::size_of::<u32>())?;
-        verify_area(len_ptr, core::mem::size_of::<u32>())?;
+        access_ok(head, core::mem::size_of::<u32>())?;
+        access_ok(len_ptr, core::mem::size_of::<u32>())?;
 
         crate::libs::futex::futex::RobustListHead::get_robust_list(pid, head, len_ptr)
     }

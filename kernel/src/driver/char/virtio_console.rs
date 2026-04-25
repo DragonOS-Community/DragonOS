@@ -13,7 +13,7 @@ use crate::{
         },
         tty::{
             console::ConsoleSwitch,
-            kthread::send_to_tty_refresh_thread,
+            kthread::enqueue_tty_rx_from_irq,
             termios::{WindowSize, TTY_STD_TERMIOS},
             tty_core::{TtyCore, TtyCoreData},
             tty_driver::{TtyDriver, TtyDriverManager, TtyDriverType, TtyOperation},
@@ -34,7 +34,8 @@ use crate::{
     init::initcall::INITCALL_POSTCORE,
     libs::{
         lazy_init::Lazy,
-        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+        rwlock::RwLock,
+        rwsem::{RwSemReadGuard, RwSemWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
 };
@@ -225,11 +226,11 @@ impl KObject for VirtIOConsoleDevice {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.locked_kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.locked_kobj_state.write()
     }
 
@@ -325,7 +326,7 @@ impl VirtIODevice for VirtIOConsoleDevice {
             }
         }
 
-        send_to_tty_refresh_thread(&buf[0..index]);
+        enqueue_tty_rx_from_irq(&buf[0..index]);
         Ok(IrqReturn::Handled)
     }
 
@@ -711,11 +712,11 @@ impl KObject for VirtIOConsoleDriver {
         // do nothing
     }
 
-    fn kobj_state(&self) -> RwLockReadGuard<'_, KObjectState> {
+    fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.kobj_state.read()
     }
 
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<'_, KObjectState> {
+    fn kobj_state_mut(&self) -> RwSemWriteGuard<'_, KObjectState> {
         self.kobj_state.write()
     }
 

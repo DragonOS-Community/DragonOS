@@ -5,7 +5,7 @@ use crate::arch::syscall::nr::SYS_LINKAT;
 use crate::filesystem::vfs::syscall::AtFlags;
 use crate::filesystem::vfs::MAX_PATHLEN;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
-use crate::syscall::user_access::check_and_clone_cstr;
+use crate::syscall::user_access::vfs_check_and_clone_cstr;
 use alloc::vec::Vec;
 use system_error::SystemError;
 
@@ -25,10 +25,10 @@ impl Syscall for SysLinkAtHandle {
         let new = Self::new_path(args);
         let flags = Self::flags(args);
 
-        let old = check_and_clone_cstr(old, Some(MAX_PATHLEN))?
+        let old = vfs_check_and_clone_cstr(old, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
-        let new = check_and_clone_cstr(new, Some(MAX_PATHLEN))?
+        let new = vfs_check_and_clone_cstr(new, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
         if old.len() >= MAX_PATHLEN || new.len() >= MAX_PATHLEN {

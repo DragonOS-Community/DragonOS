@@ -14,8 +14,7 @@ use unified_init::macros::unified_init;
 
 lazy_static! {
     //todo 按照软中断的做法，这里应该是每个CPU一个列表，但目前只实现单CPU版本
-    static ref GLOBAL_NAPI_MANAGER: Arc<NapiManager> =
-        NapiManager::new();
+    static ref GLOBAL_NAPI_MANAGER: Arc<NapiManager> = NapiManager::new();
 }
 
 /// # NAPI 结构体
@@ -47,15 +46,13 @@ impl NapiStruct {
         // log::info!("NAPI instance {} polling", self.napi_id);
         // 获取网卡的强引用
         if let Some(iface) = self.net_device.upgrade() {
-            // 这里的weight原意是此次执行可以处理的包，如果超过了这个数就交给专门的内核线程(ksoftirqd)继续处理
-            // 但目前我们就是在相当于ksoftirqd里面处理，如果在weight之内发现没数据包被处理了，在直接返回
-            // 如果超过weight，返回true，表示还有工作没做完，会在下一次轮询继续处理
-            // 因此语义是相同的
-            for _ in 0..self.weight {
-                if !iface.poll() {
-                    return false;
-                }
-            }
+            // Linux NAPI 语义：每次 poll 处理有限工作量（budget/weight），避免无界处理导致 DoS/长时间关中断。
+            // smoltcp 的 Interface::poll() 会在一次调用内处理 device 队列中所有包，因此这里必须走 bounded poll。
+            //
+            // 返回值语义：
+            // - true：还有工作没做完（例如仍有 ingress 包未处理或需要立即继续 poll），保留在 poll_list 继续处理
+            // - false：本次已处理完，可 complete
+            return iface.poll_napi(self.weight);
         } else {
             log::error!(
                 "NAPI instance {}: associated net device is gone",
@@ -63,7 +60,7 @@ impl NapiStruct {
             );
         }
 
-        true
+        false
     }
 }
 
@@ -119,8 +116,6 @@ pub fn napi_init() -> Result<(), SystemError> {
 }
 
 fn net_rx_action() {
-    use crate::sched::SchedMode;
-
     loop {
         // 这里直接将全局的NAPI管理器的napi_list取出，清空全局的列表，避免占用锁时间过长
         let mut inner = GLOBAL_NAPI_MANAGER.inner();
@@ -129,14 +124,6 @@ fn net_rx_action() {
         drop(inner);
 
         // log::info!("NAPI softirq processing {} instances", poll_list.len());
-
-        // 如果此时长度为0,则让当前进程休眠，等待被唤醒
-        if poll_list.is_empty() {
-            GLOBAL_NAPI_MANAGER
-                .inner()
-                .has_pending_signal
-                .store(false, Ordering::SeqCst);
-        }
 
         while let Some(napi) = poll_list.pop() {
             let has_work_left = napi.poll();
@@ -151,10 +138,39 @@ fn net_rx_action() {
 
         // log::info!("napi softirq iteration complete")
 
-        // 在这种情况下，poll_list 中仍然有待处理的 NAPI 实例，压回队列，等待下一次唤醒时处理
+        // 若 budget 用尽后仍有 backlog，必须继续自驱动处理，不能依赖新的外部唤醒。
+        // 否则 loopback/TCP 大流量场景下，发送端已经结束后不会再触发 napi_schedule()，
+        // 剩余包会永久滞留在 backlog 中，接收端 read()/recv() 就会偶发卡死。
         if !poll_list.is_empty() {
-            GLOBAL_NAPI_MANAGER.inner().napi_list.extend(poll_list);
+            let mut inner = GLOBAL_NAPI_MANAGER.inner();
+            inner.napi_list.extend(poll_list);
+            inner.has_pending_signal.store(true, Ordering::SeqCst);
+            drop(inner);
+            continue;
         }
+
+        // 关键竞态：
+        // `poll()` / `poll_egress()` 期间，loopback Tx 可能再次调用 `napi_schedule()`，
+        // 把“新产生的 ingress 工作”塞回全局 `napi_list`。
+        //
+        // 由于本轮处理的是循环开始时快照出的 `poll_list`，如果这里不重新检查全局列表，
+        // 就可能出现：
+        // 1) 当前本地 `poll_list` 已空；
+        // 2) 但全局 `napi_list` 已被并发加入了新工作；
+        // 3) 当前线程仍把 `has_pending_signal` 清零并睡眠。
+        //
+        // 对 loopback/TCP 大包发送，这会把“send 过程中产生的后续本地收包”永久遗落，
+        // 直到下一次外部网络事件才被重新推进，从而表现为 recv() 偶发永久卡住。
+        let inner = GLOBAL_NAPI_MANAGER.inner();
+        if !inner.napi_list.is_empty() {
+            inner.has_pending_signal.store(true, Ordering::SeqCst);
+            drop(inner);
+            continue;
+        }
+
+        // 只有确认全局队列也为空时，才真正进入睡眠。
+        inner.has_pending_signal.store(false, Ordering::SeqCst);
+        drop(inner);
 
         let _ = wq_wait_event_interruptible!(
             GLOBAL_NAPI_MANAGER.wait_queue(),
@@ -213,7 +229,9 @@ impl NapiManager {
     }
 
     pub fn inner(&self) -> SpinLockGuard<'_, NapiManagerInner> {
-        self.inner.lock()
+        // 必须使用 lock_irqsave() 关闭中断，因为 napi_schedule() 可能在中断上下文中被调用
+        // 如果使用普通的 lock()，当内核线程持有锁时发生中断，中断处理程序试图获取同一把锁会死锁
+        self.inner.lock_irqsave()
     }
 
     pub fn wait_queue(&self) -> &WaitQueue {

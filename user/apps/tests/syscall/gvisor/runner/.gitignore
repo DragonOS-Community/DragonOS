@@ -1,6 +1,5 @@
 # Rust构建产物
 /target/
-Cargo.lock
 
 # IDE文件
 .vscode/

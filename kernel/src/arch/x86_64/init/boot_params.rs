@@ -402,14 +402,20 @@ impl ArchBootParams {
         self.scratch = scratch;
     }
 
-    pub fn add_e820_entry(&mut self, addr: u64, size: u64, mtype: u32) {
+    pub fn add_e820_entry(&mut self, addr: u64, size: u64, mtype: u32) -> bool {
         let entry = BootE820Entry {
             addr,
             size,
             type_: mtype,
         };
-        self.e820_entries += 1;
-        self.e820_table[self.e820_entries as usize] = entry;
+        let idx = self.e820_entries as usize;
+        if idx >= self.e820_table.len() {
+            return false;
+        }
+
+        self.e820_table[idx] = entry;
+        self.e820_entries = (idx + 1) as c_uchar;
+        true
     }
 
     pub fn init_setupheader(&mut self) {

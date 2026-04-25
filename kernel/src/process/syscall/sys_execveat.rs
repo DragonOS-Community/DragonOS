@@ -3,8 +3,8 @@ use system_error::SystemError;
 
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_EXECVEAT},
-    filesystem::vfs::{utils::user_path_at, VFS_MAX_FOLLOW_SYMLINK_TIMES},
-    process::{syscall::sys_execve::SysExecve, ProcessManager},
+    filesystem::vfs::fcntl::AtFlags,
+    process::{execve::do_execveat, syscall::sys_execve::SysExecve},
     syscall::table::{FormattedSyscallParam, Syscall},
 };
 
@@ -43,29 +43,13 @@ impl Syscall for SysExecveAt {
         })?;
         let path = path.into_string().map_err(|_| SystemError::EINVAL)?;
 
-        let inode = if flags.contains(OpenFlags::AT_EMPTY_PATH) && path.is_empty() {
-            let binding = ProcessManager::current_pcb().fd_table();
-            let fd_table_guard = binding.read();
+        // 空路径且未设置 AT_EMPTY_PATH 标志 -> 返回 ENOENT
+        if path.is_empty() && !flags.contains(OpenFlags::AT_EMPTY_PATH) {
+            return Err(SystemError::ENOENT);
+        }
 
-            let file = fd_table_guard
-                .get_file_by_fd(dirfd as _)
-                .ok_or(SystemError::EBADF)?;
-            file.inode()
-        } else {
-            let (inode_begin, path) =
-                user_path_at(&ProcessManager::current_pcb(), dirfd as _, &path)?;
-            let inode = inode_begin.lookup_follow_symlink(
-                &path,
-                if flags.contains(OpenFlags::AT_SYMLINK_NOFOLLOW) {
-                    VFS_MAX_FOLLOW_SYMLINK_TIMES
-                } else {
-                    0
-                },
-            )?;
-            inode
-        };
-
-        SysExecve::execve(inode, path, argv, envp, frame)?;
+        let at_flags = AtFlags::from_bits(flags.bits() as i32).ok_or(SystemError::EINVAL)?;
+        do_execveat(dirfd as i32, &path, argv, envp, at_flags, frame)?;
 
         Ok(0)
     }

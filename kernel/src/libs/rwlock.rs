@@ -11,6 +11,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::CurrentIrqArch,
+    exception::bottom_half::{local_bh_disable, LocalBhDisableGuard},
     exception::{InterruptArch, IrqFlagsGuard},
     process::ProcessManager,
 };
@@ -64,6 +65,18 @@ pub struct RwLockWriteGuard<'a, T: 'a> {
     data: *mut T,
     inner: &'a RwLock<T>,
     irq_guard: Option<IrqFlagsGuard>,
+}
+
+/// `*_bh` 风格的读锁守卫：持锁期间屏蔽本 CPU 的 softirq/tasklet 执行（不关硬中断）。
+pub struct RwLockReadBhGuard<'a, T: 'a> {
+    bh: LocalBhDisableGuard,
+    guard: RwLockReadGuard<'a, T>,
+}
+
+/// `*_bh` 风格的写锁守卫：持锁期间屏蔽本 CPU 的 softirq/tasklet 执行（不关硬中断）。
+pub struct RwLockWriteBhGuard<'a, T: 'a> {
+    bh: LocalBhDisableGuard,
+    guard: RwLockWriteGuard<'a, T>,
 }
 
 unsafe impl<T: Send> Send for RwLock<T> {}
@@ -174,6 +187,15 @@ impl<T> RwLock<T> {
                 None => spin_loop(),
             }
         }
+    }
+
+    /// `read_lock_bh()`：禁用本 CPU BH 后获取读锁。
+    ///
+    /// 注意：该接口不关硬中断；若该锁也会在 hardirq 获取，则必须使用 `read_irqsave()`。
+    pub fn read_bh(&self) -> RwLockReadBhGuard<'_, T> {
+        let bh = local_bh_disable();
+        let guard = self.read();
+        RwLockReadBhGuard { bh, guard }
     }
 
     /// 尝试关闭中断并获取读者守卫
@@ -371,6 +393,35 @@ impl<T> RwLock<T> {
     #[allow(dead_code)]
     pub unsafe fn force_get_ref(&self) -> &T {
         unsafe { &*self.data.get() }
+    }
+
+    /// `write_lock_bh()`：禁用本 CPU BH 后获取写锁。
+    ///
+    /// 注意：该接口不关硬中断；若该锁也会在 hardirq 获取，则必须使用 `write_irqsave()`。
+    pub fn write_bh(&self) -> RwLockWriteBhGuard<'_, T> {
+        let bh = local_bh_disable();
+        let guard = self.write();
+        RwLockWriteBhGuard { bh, guard }
+    }
+}
+
+impl<T> Deref for RwLockReadBhGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        self.guard.deref()
+    }
+}
+
+impl<T> Deref for RwLockWriteBhGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        self.guard.deref()
+    }
+}
+
+impl<T> DerefMut for RwLockWriteBhGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard.deref_mut()
     }
 }
 

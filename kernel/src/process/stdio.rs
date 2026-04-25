@@ -22,12 +22,17 @@ pub fn stdio_init() -> Result<(), SystemError> {
         .lookup(&tty_path)
         .unwrap_or_else(|_| panic!("Init stdio: can't find {}", tty_path));
 
-    let stdin =
-        File::new(tty_inode.clone(), FileFlags::O_RDONLY).expect("Init stdio: can't create stdin");
-    let stdout =
-        File::new(tty_inode.clone(), FileFlags::O_WRONLY).expect("Init stdio: can't create stdout");
-    let stderr = File::new(tty_inode.clone(), FileFlags::O_WRONLY | FileFlags::O_SYNC)
-        .expect("Init stdio: can't create stderr");
+    // Linux 语义对齐：init(pid=1) 的早期 stdio 绑定不应自动获得 controlling tty。
+    // 否则会占住 tty session，影响后续用户态会话通过 TIOCSCTTY 建立控制终端。
+    let stdin = File::new(tty_inode.clone(), FileFlags::O_RDONLY | FileFlags::O_NOCTTY)
+        .expect("Init stdio: can't create stdin");
+    let stdout = File::new(tty_inode.clone(), FileFlags::O_WRONLY | FileFlags::O_NOCTTY)
+        .expect("Init stdio: can't create stdout");
+    let stderr = File::new(
+        tty_inode.clone(),
+        FileFlags::O_WRONLY | FileFlags::O_SYNC | FileFlags::O_NOCTTY,
+    )
+    .expect("Init stdio: can't create stderr");
 
     /*
        按照规定，进程的文件描述符数组的前三个位置，分别是stdin, stdout, stderr
@@ -36,7 +41,7 @@ pub fn stdio_init() -> Result<(), SystemError> {
         ProcessManager::current_pcb()
             .fd_table()
             .write()
-            .alloc_fd(stdin, None)
+            .alloc_fd(stdin, None, false)
             .unwrap(),
         0
     );
@@ -44,7 +49,7 @@ pub fn stdio_init() -> Result<(), SystemError> {
         ProcessManager::current_pcb()
             .fd_table()
             .write()
-            .alloc_fd(stdout, None)
+            .alloc_fd(stdout, None, false)
             .unwrap(),
         1
     );
@@ -52,7 +57,7 @@ pub fn stdio_init() -> Result<(), SystemError> {
         ProcessManager::current_pcb()
             .fd_table()
             .write()
-            .alloc_fd(stderr, None)
+            .alloc_fd(stderr, None, false)
             .unwrap(),
         2
     );

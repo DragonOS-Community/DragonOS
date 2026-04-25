@@ -16,11 +16,10 @@ COPY *.sh ./
 
 # 设置sudo免密码
 RUN apt update && \
-    apt install -y ca-certificates curl gnupg wget sudo apt-utils && \
-    bash bootstrap.sh --default && \
-    bash change_rust_src_to_official.sh && \
+    apt install --no-install-recommends -y ca-certificates curl gnupg wget sudo apt-utils && \
+    bash bootstrap.sh --default --ci && \
     git config --global --add safe.directory '*' && \
-    sudo apt autoremove -q -y && \         
+    sudo apt autoremove -q -y && \
     sudo apt clean -q -y && \
     sudo rm -rf /tmp/*
 

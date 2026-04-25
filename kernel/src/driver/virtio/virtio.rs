@@ -1,5 +1,6 @@
 use super::mmio::virtio_probe_mmio;
 use super::transport_pci::PciTransport;
+use super::virtio_fs::virtio_fs;
 use super::virtio_impl::HalImpl;
 use crate::driver::base::device::bus::Bus;
 use crate::driver::base::device::{Device, DeviceId};
@@ -12,6 +13,7 @@ use crate::driver::pci::pci::{
 };
 use crate::driver::pci::subsys::pci_bus;
 use crate::driver::virtio::transport::VirtIOTransport;
+use crate::driver::virtio::virtio_vsock::virtio_vsock;
 use crate::init::initcall::INITCALL_DEVICE;
 
 use alloc::string::String;
@@ -38,7 +40,7 @@ fn virtio_probe_pci() {
     for virtio_device in virtio_list {
         let bdf: String = virtio_device.common_header.bus_device_function.into();
         let dev_id = DeviceId::new(None, Some(bdf)).unwrap();
-        // log::info!("virtio device id: probe {:?}", dev_id.id());
+        // log::debug!("virtio device id: probe {:?}", dev_id.id());
         match PciTransport::new::<HalImpl>(virtio_device.clone(), dev_id.clone()) {
             Ok(mut transport) => {
                 debug!(
@@ -76,6 +78,8 @@ pub(super) fn virtio_device_init(
             warn!("Not support virtio_input device for now");
         }
         DeviceType::Network => virtio_net(transport, dev_id, dev_parent),
+        DeviceType::FileSystem => virtio_fs(transport, dev_id, dev_parent),
+        DeviceType::Socket => virtio_vsock(transport, dev_id, dev_parent),
         t => {
             warn!("Unrecognized virtio device: {:?}", t);
         }
@@ -94,6 +98,14 @@ pub(super) fn virtio_device_init(
 ///
 /// 返回一个包含所有找到的virtio设备的数组
 fn virtio_device_search() -> Vec<Arc<PciDeviceStructureGeneralDevice>> {
+    // VirtIO over PCI:
+    // - transitional devices: 0x1000..=0x103f
+    // - modern devices:       0x1040..=0x107f
+    #[inline]
+    fn is_virtio_pci_device_id(device_id: u16) -> bool {
+        (0x1000..=0x107f).contains(&device_id)
+    }
+
     let list = &*PCI_DEVICE_LINKEDLIST;
     let mut virtio_list = Vec::new();
     let result = get_pci_device_structures_mut_by_vendor_id(list, 0x1AF4);
@@ -101,8 +113,7 @@ fn virtio_device_search() -> Vec<Arc<PciDeviceStructureGeneralDevice>> {
     for device in result {
         let standard_device = device.as_standard_device().unwrap();
         let header = &standard_device.common_header;
-        // log::info!("header: {:?}", header);
-        if header.device_id >= 0x1000 && header.device_id <= 0x103F {
+        if is_virtio_pci_device_id(header.device_id) {
             virtio_list.push(standard_device);
         }
     }

@@ -1,0 +1,4 @@
+TimerTest.ProcessKilledOnCPUSoftLimit
+TimerTest.ProcessPingedRepeatedlyAfterCPUSoftLimit
+TimerTest.ProcessKilledOnCPUHardLimit
+TimerTest.RlimitCpuInheritedAcrossFork

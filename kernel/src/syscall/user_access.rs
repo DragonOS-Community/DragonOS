@@ -13,7 +13,7 @@ use defer::defer;
 
 use crate::{
     arch::MMArch,
-    mm::{verify_area, MemoryManagementArch, VirtAddr, VmFlags},
+    mm::{access_ok, MemoryManagementArch, VirtAddr, VmFlags},
     process::ProcessManager,
 };
 
@@ -57,7 +57,7 @@ pub unsafe fn clear_user_protected(dest: VirtAddr, len: usize) -> Result<usize, 
 ///
 /// - `EFAULT`: Destination address is invalid
 pub unsafe fn clear_user(dest: VirtAddr, len: usize) -> Result<usize, SystemError> {
-    verify_area(dest, len).map_err(|_| SystemError::EFAULT)?;
+    access_ok(dest, len).map_err(|_| SystemError::EFAULT)?;
 
     let p = dest.data() as *mut u8;
     // Clear user space data
@@ -67,7 +67,7 @@ pub unsafe fn clear_user(dest: VirtAddr, len: usize) -> Result<usize, SystemErro
 }
 
 pub unsafe fn copy_to_user(dest: VirtAddr, src: &[u8]) -> Result<usize, SystemError> {
-    verify_area(dest, src.len()).map_err(|_| SystemError::EFAULT)?;
+    access_ok(dest, src.len()).map_err(|_| SystemError::EFAULT)?;
     MMArch::disable_kernel_wp();
     defer!({
         MMArch::enable_kernel_wp();
@@ -100,6 +100,13 @@ pub fn check_and_clone_cstr(
     user: *const u8,
     max_length: Option<usize>,
 ) -> Result<CString, SystemError> {
+    return do_check_and_clone_cstr(user, max_length, false);
+}
+fn do_check_and_clone_cstr(
+    user: *const u8,
+    max_length: Option<usize>,
+    return_name_too_long: bool,
+) -> Result<CString, SystemError> {
     if user.is_null() {
         return Err(SystemError::EFAULT);
     }
@@ -124,10 +131,20 @@ pub fn check_and_clone_cstr(
         }
         buffer.push(NonZero::new(c[0]).ok_or(SystemError::EINVAL)?);
     }
+    if return_name_too_long && buffer.len() >= max_length.unwrap_or(usize::MAX) {
+        return Err(SystemError::ENAMETOOLONG);
+    }
 
     let cstr = CString::from(buffer);
 
     return Ok(cstr);
+}
+
+pub fn vfs_check_and_clone_cstr(
+    user: *const u8,
+    max_length: Option<usize>,
+) -> Result<CString, SystemError> {
+    return do_check_and_clone_cstr(user, max_length, true);
 }
 
 /// Check and copy a C string array from user space
@@ -202,7 +219,12 @@ impl UserBufferReader<'_> {
     /// * Returns UserBufferReader instance on success, error code otherwise
     ///
     pub fn new<U>(addr: *const U, len: usize, from_user: bool) -> Result<Self, SystemError> {
-        if from_user && verify_area(VirtAddr::new(addr as usize), len).is_err() {
+        // SAFETY: constructing a slice from a null pointer with non-zero length is UB.
+        // Linux semantics: passing a null pointer for a non-empty user buffer should fail with EFAULT.
+        if len != 0 && (addr as usize) == 0 {
+            return Err(SystemError::EFAULT);
+        }
+        if from_user && access_ok(VirtAddr::new(addr as usize), len).is_err() {
             return Err(SystemError::EFAULT);
         }
         return Ok(Self {
@@ -297,9 +319,29 @@ impl UserBufferReader<'_> {
         dst: &mut [T],
         offset: usize,
     ) -> Result<usize, SystemError> {
-        let data = self.convert_with_offset(self.buffer, offset)?;
-        dst.copy_from_slice(data);
-        return Ok(dst.len());
+        if dst.is_empty() {
+            return Ok(0);
+        }
+
+        let bytes_needed = dst
+            .len()
+            .checked_mul(core::mem::size_of::<T>())
+            .ok_or(SystemError::EINVAL)?;
+
+        if offset
+            .checked_add(bytes_needed)
+            .filter(|end| *end <= self.buffer.len())
+            .is_none()
+        {
+            return Err(SystemError::EINVAL);
+        }
+
+        // Copy exact bytes into dst without relying on a typed view of the entire remaining buffer.
+        let src_bytes = &self.buffer[offset..offset + bytes_needed];
+        let dst_bytes =
+            unsafe { core::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u8, bytes_needed) };
+        dst_bytes.copy_from_slice(src_bytes);
+        Ok(dst.len())
     }
 
     /// Copy data from user space with page mapping and permission verification
@@ -321,9 +363,37 @@ impl UserBufferReader<'_> {
         dst: &mut [T],
         offset: usize,
     ) -> Result<usize, SystemError> {
-        let data = self.convert_with_offset_checked(self.buffer, offset)?;
-        dst.copy_from_slice(data);
-        return Ok(dst.len());
+        if dst.is_empty() {
+            return Ok(0);
+        }
+
+        let bytes_needed = dst
+            .len()
+            .checked_mul(core::mem::size_of::<T>())
+            .ok_or(SystemError::EINVAL)?;
+
+        if offset
+            .checked_add(bytes_needed)
+            .filter(|end| *end <= self.buffer.len())
+            .is_none()
+        {
+            return Err(SystemError::EINVAL);
+        }
+
+        let accessible_len = user_accessible_len(
+            VirtAddr::new(self.buffer.as_ptr() as usize + offset),
+            bytes_needed,
+            false,
+        );
+        if accessible_len < bytes_needed {
+            return Err(SystemError::EFAULT);
+        }
+
+        let src_bytes = &self.buffer[offset..offset + bytes_needed];
+        let dst_bytes =
+            unsafe { core::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u8, bytes_needed) };
+        dst_bytes.copy_from_slice(src_bytes);
+        Ok(dst.len())
     }
 
     /// Copy one data item from user space (to specified address)
@@ -420,14 +490,20 @@ impl UserBufferReader<'_> {
     }
 
     fn convert_with_offset<T>(&self, src: &[u8], offset: usize) -> Result<&[T], SystemError> {
-        if offset >= src.len() {
+        // offset == src.len is valid, as long as don't try to dereference it in &src[offset..]
+        if offset > src.len() {
             return Err(SystemError::EINVAL);
         }
         let byte_buffer: &[u8] = &src[offset..];
-        if !byte_buffer.len().is_multiple_of(core::mem::size_of::<T>()) || byte_buffer.is_empty() {
+        if byte_buffer.is_empty() {
+            // Empty buffer is valid - return empty slice
+            return Ok(&[]);
+        }
+        if !byte_buffer.len().is_multiple_of(core::mem::size_of::<T>()) {
             return Err(SystemError::EINVAL);
         }
 
+        debug_assert!(offset < src.len());
         let chunks = unsafe {
             from_raw_parts(
                 byte_buffer.as_ptr() as *const T,
@@ -532,7 +608,11 @@ impl<'a> UserBufferWriter<'a> {
     /// * Returns UserBufferWriter instance on success, error code otherwise
     ///
     pub fn new<U>(addr: *mut U, len: usize, from_user: bool) -> Result<Self, SystemError> {
-        if from_user && verify_area(VirtAddr::new(addr as usize), len).is_err() {
+        // SAFETY: constructing a slice from a null pointer with non-zero length is UB.
+        if len != 0 && (addr as usize) == 0 {
+            return Err(SystemError::EFAULT);
+        }
+        if from_user && access_ok(VirtAddr::new(addr as usize), len).is_err() {
             return Err(SystemError::EFAULT);
         }
         return Ok(Self {
@@ -568,7 +648,10 @@ impl<'a> UserBufferWriter<'a> {
         offset: usize,
     ) -> Result<usize, SystemError> {
         let dst = Self::convert_with_offset(self.buffer, offset)?;
-        dst.copy_from_slice(src);
+        if dst.len() < src.len() {
+            return Err(SystemError::EINVAL);
+        }
+        dst[..src.len()].copy_from_slice(src);
         return Ok(src.len());
     }
 
@@ -592,7 +675,10 @@ impl<'a> UserBufferWriter<'a> {
         offset: usize,
     ) -> Result<usize, SystemError> {
         let dst = Self::convert_with_offset_checked(self.buffer, offset)?;
-        dst.copy_from_slice(src);
+        if dst.len() < src.len() {
+            return Err(SystemError::EINVAL);
+        }
+        dst[..src.len()].copy_from_slice(src);
         return Ok(src.len());
     }
 
@@ -696,16 +782,18 @@ impl<'a> UserBufferWriter<'a> {
             return Err(SystemError::EINVAL);
         }
         let byte_buffer: &mut [u8] = &mut src[offset..];
+
+        let len = byte_buffer.len() / core::mem::size_of::<T>();
+        if len == 0 {
+            // Empty buffer is valid - return empty slice
+            return Ok(&mut []);
+        }
+
         if !byte_buffer.len().is_multiple_of(core::mem::size_of::<T>()) {
             return Err(SystemError::EINVAL);
         }
 
-        let chunks = unsafe {
-            from_raw_parts_mut(
-                byte_buffer.as_mut_ptr() as *mut T,
-                byte_buffer.len() / core::mem::size_of::<T>(),
-            )
-        };
+        let chunks = unsafe { from_raw_parts_mut(byte_buffer.as_mut_ptr() as *mut T, len) };
         return Ok(chunks);
     }
 
@@ -825,7 +913,7 @@ fn check_user_access_by_page_table(addr: VirtAddr, size: usize, check_write: boo
     // Calculate number of pages to check (rounded up)
     let pages = aligned_size / MMArch::PAGE_SIZE;
 
-    let guard = vm.read_irqsave();
+    let guard = vm.read();
     for i in 0..pages {
         let page_addr = aligned_addr + i * MMArch::PAGE_SIZE;
         let flags = match guard.user_mapper.utable.translate(VirtAddr::new(page_addr)) {
@@ -872,8 +960,10 @@ pub unsafe fn copy_from_user_protected(
     let dst_ptr = dst.as_mut_ptr();
     let src_ptr = src.data() as *const u8;
 
-    // 快速路径: 页表检查
-    if !check_user_access_by_page_table(src, len, false) {
+    // 预检查：只基于 VMA 做权限/范围检查（不要求 PTE 已经存在）。
+    // Linux 语义：对懒分配/按需调页的用户页，拷贝过程中触发的缺页应由缺页处理器补齐。
+    // 这里避免用“页表必须 present”作为判断条件，否则 read()/readv() 写入 mmap 区域会错误返回 -EFAULT。
+    if user_accessible_len(src, len, false) < len {
         return Err(SystemError::EFAULT);
     }
 
@@ -904,8 +994,10 @@ pub unsafe fn copy_to_user_protected(dest: VirtAddr, src: &[u8]) -> Result<usize
     let dst_ptr = dest.data() as *mut u8;
     let src_ptr = src.as_ptr();
 
-    // 快速路径: 页表检查
-    if !check_user_access_by_page_table(dest, len, true) {
+    // 预检查：只基于 VMA 做权限/范围检查（不要求 PTE 已经存在）。
+    // 真实拷贝期间若遇到缺页，会进入 handle_mm_fault() 分配/映射页面；
+    // 若遇到不可访问区域（无 VMA / PROT_NONE / 无写权限），缺页处理会走异常表修复并返回 -EFAULT。
+    if user_accessible_len(dest, len, true) < len {
         return Err(SystemError::EFAULT);
     }
 
@@ -940,7 +1032,7 @@ pub fn user_accessible_len(addr: VirtAddr, size: usize, check_write: bool) -> us
         None => return 0,
     };
 
-    let vma_read_guard = vm.read_irqsave();
+    let vma_read_guard = vm.read();
     let mappings = &vma_read_guard.mappings;
 
     let mut checked = 0usize;
@@ -953,14 +1045,14 @@ pub fn user_accessible_len(addr: VirtAddr, size: usize, check_write: bool) -> us
         };
 
         // 获取地址所在 VMA 的起始地址 和结束地址，访问权限标志，后备的文件和当前VMA第一页映射到文件的哪一页
-        let (region_start, region_end, vm_flags, vma_size, file, file_page_offset) = {
-            let guard = vma.lock_irqsave();
+        let (region_start, region_end, vm_flags, vma_size, file, backing_page_offset) = {
+            let guard = vma.lock();
             let region_start = guard.region().start().data();
             let region_end = guard.region().end().data();
             let vm_flags = *guard.vm_flags();
             let vma_size = region_end.saturating_sub(region_start);
             let file = guard.vm_file();
-            let file_page_offset = guard.file_page_offset();
+            let backing_page_offset = guard.backing_page_offset();
 
             drop(guard);
             (
@@ -969,7 +1061,7 @@ pub fn user_accessible_len(addr: VirtAddr, size: usize, check_write: bool) -> us
                 vm_flags,
                 vma_size,
                 file,
-                file_page_offset,
+                backing_page_offset,
             )
         };
 
@@ -984,7 +1076,7 @@ pub fn user_accessible_len(addr: VirtAddr, size: usize, check_write: bool) -> us
         }
 
         let file_backed_len = file.and_then(|file| {
-            let file_offset_pages = file_page_offset.unwrap_or(0);
+            let file_offset_pages = backing_page_offset.unwrap_or(0);
             let file_offset_bytes = file_offset_pages.saturating_mul(MMArch::PAGE_SIZE);
             let file_size = match file.metadata() {
                 Ok(md) if md.size > 0 => {

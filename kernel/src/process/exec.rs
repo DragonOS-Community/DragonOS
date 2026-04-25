@@ -7,10 +7,7 @@ use crate::process::Signal;
 
 use crate::{
     driver::base::block::SeekFrom,
-    filesystem::vfs::{
-        file::{File, FileFlags},
-        IndexNode,
-    },
+    filesystem::vfs::{fcntl::AtFlags, file::File, open::do_open_execat},
     libs::elf::ELF_LOADER,
     mm::{
         ucontext::{AddressSpace, UserStack},
@@ -19,7 +16,10 @@ use crate::{
 };
 
 use super::{
-    namespace::nsproxy::exec_task_namespaces, ProcessControlBlock, ProcessFlags, ProcessManager,
+    namespace::nsproxy::exec_task_namespaces,
+    pid::PidType,
+    shebang::{ShebangLoader, SHEBANG_LOADER, SHEBANG_MAX_RECURSION_DEPTH},
+    ProcessControlBlock, ProcessFlags, ProcessManager,
 };
 
 /// 系统支持的所有二进制文件加载器的列表
@@ -50,6 +50,100 @@ impl BinaryLoaderResult {
 
     pub fn entry_point(&self) -> VirtAddr {
         self.entry_point
+    }
+}
+
+/// 二进制文件加载的完整结果
+///
+/// 用于区分正常加载和需要重新执行(shebang场景)的情况
+#[derive(Debug)]
+pub enum LoadBinaryResult {
+    /// 正常加载完成，返回入口点
+    Loaded(BinaryLoaderResult),
+    /// 需要重新执行解释器 (shebang场景)
+    NeedReexec {
+        /// 下一轮 exec 的启动信息
+        next: ExecStartInfo,
+        /// 新的argv (解释器路径 + [可选参数] + 脚本路径 + 原始参数)
+        new_argv: Vec<CString>,
+    },
+}
+
+bitflags! {
+    pub struct ExecInterpFlags: u32 {
+        const PATH_INACCESSIBLE = 1 << 0;
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecStartInfo {
+    file: Arc<File>,
+    filename: String,
+    execfn: String,
+    interp_flags: ExecInterpFlags,
+}
+
+impl ExecStartInfo {
+    pub fn new(
+        file: Arc<File>,
+        filename: String,
+        execfn: String,
+        interp_flags: ExecInterpFlags,
+    ) -> Self {
+        Self {
+            file,
+            filename,
+            execfn,
+            interp_flags,
+        }
+    }
+
+    pub fn file(&self) -> Arc<File> {
+        self.file.clone()
+    }
+
+    pub fn filename(&self) -> &str {
+        &self.filename
+    }
+
+    pub fn execfn(&self) -> &str {
+        &self.execfn
+    }
+
+    pub fn interp_flags(&self) -> ExecInterpFlags {
+        self.interp_flags
+    }
+}
+
+/// 执行上下文，用于跟踪递归执行状态
+#[derive(Debug, Clone)]
+pub struct ExecContext {
+    /// 当前递归深度
+    pub recursion_depth: usize,
+}
+
+impl Default for ExecContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ExecContext {
+    pub fn new() -> Self {
+        Self { recursion_depth: 0 }
+    }
+
+    /// 检查是否超过最大递归深度
+    pub fn check_recursion_limit(&self) -> Result<(), SystemError> {
+        if self.recursion_depth >= SHEBANG_MAX_RECURSION_DEPTH {
+            return Err(SystemError::ELOOP);
+        }
+        Ok(())
+    }
+
+    pub fn increment_depth(mut self) -> Self {
+        self.recursion_depth += 1;
+        self
     }
 }
 
@@ -102,10 +196,13 @@ bitflags! {
 
 #[derive(Debug)]
 pub struct ExecParam {
-    file: File,
+    file: Arc<File>,
     vm: Arc<AddressSpace>,
     /// 一些标志位
     flags: ExecParamFlags,
+    filename: CString,
+    execfn: CString,
+    interp_flags: ExecInterpFlags,
     /// 用来初始化进程的一些信息。这些信息由二进制加载器和exec机制来共同填充
     init_info: ProcInitInfo,
 }
@@ -120,20 +217,31 @@ pub enum ExecLoadMode {
 
 #[allow(dead_code)]
 impl ExecParam {
+    /// 使用已打开的文件创建ExecParam
+    ///
+    /// ## 参数
+    /// - `file`: 通过do_open_execat打开的可执行文件
+    /// - `vm`: 地址空间
+    /// - `flags`: 执行标志
     pub fn new(
-        file_inode: Arc<dyn IndexNode>,
+        file: Arc<File>,
         vm: Arc<AddressSpace>,
         flags: ExecParamFlags,
-    ) -> Result<Self, SystemError> {
-        // 读取文件头部，用于判断文件类型
-        let file = File::new(file_inode, FileFlags::O_RDONLY)?;
-
-        Ok(Self {
+        filename: CString,
+        execfn: CString,
+        interp_flags: ExecInterpFlags,
+    ) -> Self {
+        let mut init_info = ProcInitInfo::new(execfn.to_string_lossy().as_ref());
+        init_info.execfn = Some(execfn.clone());
+        Self {
             file,
             vm,
             flags,
-            init_info: ProcInitInfo::new(ProcessManager::current_pcb().basic().name()),
-        })
+            filename,
+            execfn,
+            interp_flags,
+            init_info,
+        }
     }
 
     pub fn vm(&self) -> &Arc<AddressSpace> {
@@ -161,13 +269,32 @@ impl ExecParam {
         }
     }
 
-    pub fn file_mut(&mut self) -> &mut File {
-        &mut self.file
+    pub fn file_ref(&self) -> &File {
+        &self.file
     }
 
-    /// 获取File的所有权，用于将动态链接器加入文件描述符表中
-    pub fn file(self) -> File {
-        self.file
+    /// 获取File的Arc引用
+    pub fn file(&self) -> Arc<File> {
+        self.file.clone()
+    }
+
+    pub fn filename(&self) -> &CString {
+        &self.filename
+    }
+
+    pub fn execfn(&self) -> &CString {
+        &self.execfn
+    }
+
+    pub fn interp_flags(&self) -> ExecInterpFlags {
+        self.interp_flags
+    }
+
+    /// 消费ExecParam并获取File的所有权（用于将文件加入文件描述符表）
+    ///
+    /// 如果Arc有多个引用，会panic
+    pub fn into_file(self) -> File {
+        Arc::try_unwrap(self.file).expect("Cannot unwrap Arc<File>: multiple references exist")
     }
 
     /// Calling this is the point of no return. None of the failures will be
@@ -194,26 +321,270 @@ impl ExecParam {
 
 /// https://code.dragonos.org.cn/xref/linux-6.6.21/fs/exec.c#1044
 fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
-    ProcessManager::current_pcb().sighand().reset_handlers();
-    // todo: 该函数未正确实现
-    let tg_empty = pcb.threads_read_irqsave().thread_group_empty();
-    if tg_empty {
-        pcb.exit_signal.store(Signal::SIGCHLD, Ordering::SeqCst);
-        return Ok(());
+    let current = ProcessManager::current_pcb();
+    if !Arc::ptr_eq(&current, pcb) {
+        return Err(SystemError::EINVAL);
     }
-    log::warn!("de_thread: todo impl thread group logic");
 
-    return Ok(());
+    let sighand = current.sighand();
+    // 与 group-exit/并发 exec 互斥
+    sighand.start_group_exec(&current)?;
+
+    let result = (|| {
+        // log::info!(
+        //     "de_thread: start pid={:?} tgid={:?}",
+        //     current.raw_pid(),
+        //     current.raw_tgid()
+        // );
+
+        if current.threads_read_irqsave().thread_group_empty() {
+            // log::info!(
+            //     "de_thread: single-thread fast path pid={:?}",
+            //     current.raw_pid()
+            // );
+            current.exit_signal.store(Signal::SIGCHLD, Ordering::SeqCst);
+            return Ok(());
+        }
+
+        let leader = {
+            let ti = current.threads_read_irqsave();
+            ti.group_leader().unwrap_or_else(|| current.clone())
+        };
+
+        // log::info!(
+        //     "de_thread: leader pid={:?}, current_is_leader={}",
+        //     leader.raw_pid(),
+        //     Arc::ptr_eq(&leader, &current)
+        // );
+
+        let mut kill_list: Vec<Arc<ProcessControlBlock>> = Vec::new();
+        let mut leader_in_kill_list = false;
+        if !Arc::ptr_eq(&leader, &current)
+            && !leader.flags().contains(ProcessFlags::EXITING)
+            && !leader.is_exited()
+            && !leader.is_zombie()
+            && !leader.is_dead()
+        {
+            kill_list.push(leader.clone());
+            leader_in_kill_list = true;
+        }
+        {
+            let ti = leader.threads_read_irqsave();
+            for weak in &ti.group_tasks {
+                if let Some(task) = weak.upgrade() {
+                    if Arc::ptr_eq(&task, &current) {
+                        continue;
+                    }
+                    if task.flags().contains(ProcessFlags::EXITING)
+                        || task.is_exited()
+                        || task.is_zombie()
+                        || task.is_dead()
+                    {
+                        continue;
+                    }
+                    kill_list.push(task);
+                }
+            }
+        }
+
+        let mut notify_count = kill_list.len() as isize;
+        // 非 leader exec：notify_count 不包含 leader 本身
+        if !Arc::ptr_eq(&leader, &current) && leader_in_kill_list {
+            notify_count -= 1;
+        }
+        sighand.set_group_exec_notify_count(notify_count);
+
+        for task in kill_list {
+            let _ = Signal::SIGKILL.send_signal_info_to_pcb(None, task, PidType::PID);
+        }
+
+        // 先等待除 leader 外的线程退出（notify_count == 0）
+        let wait_res = sighand.wait_group_exec_event_killable(
+            || {
+                if Signal::fatal_signal_pending(&current) {
+                    return true;
+                }
+                sighand.group_exec_notify_count() == 0
+            },
+            None::<fn()>,
+        );
+        if wait_res.is_err() || Signal::fatal_signal_pending(&current) {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+
+        // 非 leader exec：等待 leader 进入 zombie 后再交换 tid/raw_pid
+        if !Arc::ptr_eq(&leader, &current) {
+            // 标记等待 leader 退出（notify_count < 0），由 exit_notify 唤醒
+            if !leader.is_zombie() && !leader.is_dead() {
+                sighand.set_group_exec_notify_count(-1);
+                let wait_res = sighand.wait_group_exec_event_killable(
+                    || {
+                        if Signal::fatal_signal_pending(&current) {
+                            return true;
+                        }
+                        leader.is_zombie() || leader.is_dead()
+                    },
+                    None::<fn()>,
+                );
+                if wait_res.is_err() || Signal::fatal_signal_pending(&current) {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
+            }
+
+            ProcessManager::exchange_tid_and_raw_pids(&current, &leader)?;
+
+            current.exit_signal.store(Signal::SIGCHLD, Ordering::SeqCst);
+            leader.exit_signal.store(Signal::INVALID, Ordering::SeqCst);
+
+            // 将当前线程提升为线程组 leader，并清空 group_tasks（已无其他线程）
+            {
+                let mut cur_ti = current.threads_write_irqsave();
+                cur_ti.group_leader = Arc::downgrade(&current);
+                cur_ti.group_tasks.clear();
+            }
+            {
+                let mut leader_ti = leader.threads_write_irqsave();
+                leader_ti.group_leader = Arc::downgrade(&current);
+                leader_ti.group_tasks.clear();
+            }
+
+            // 将旧 leader 的 children 列表转移给新 leader
+            {
+                let (first, second) =
+                    if (Arc::as_ptr(&current) as usize) <= (Arc::as_ptr(&leader) as usize) {
+                        (current.clone(), leader.clone())
+                    } else {
+                        (leader.clone(), current.clone())
+                    };
+
+                let mut first_children = first.children.write_irqsave();
+                let mut second_children = second.children.write_irqsave();
+
+                if Arc::ptr_eq(&leader, &first) {
+                    let moved = core::mem::take(&mut *first_children);
+                    second_children.extend(moved);
+                } else {
+                    let moved = core::mem::take(&mut *second_children);
+                    first_children.extend(moved);
+                }
+            }
+
+            // 继承 old leader 的父进程关系
+            let leader_parent = leader.real_parent_pcb.read().clone();
+            *current.parent_pcb.write() = leader_parent.clone();
+            *current.real_parent_pcb.write() = leader_parent;
+            *current.fork_parent_pcb.write() = current.self_ref.clone();
+
+            // log::info!("de_thread: reparented current to old leader's parent");
+
+            // 补做旧 leader 在退出阶段延迟的 PID/TGID/PGID/SID unhash
+            leader.finish_deferred_unhash_for_exec();
+
+            // 旧 leader 应由 exec 线程回收，避免父进程在交换前/后提前回收
+            if leader.is_zombie() {
+                if leader.try_mark_dead_from_zombie() {
+                    unsafe { ProcessManager::release(leader.raw_pid()) };
+                }
+            } else if leader.is_dead() {
+                unsafe { ProcessManager::release(leader.raw_pid()) };
+            }
+        } else {
+            current.exit_signal.store(Signal::SIGCHLD, Ordering::SeqCst);
+        }
+
+        // log::info!("de_thread: done pid={:?}", current.raw_pid());
+        Ok(())
+    })();
+
+    sighand.finish_group_exec();
+    result
 }
 
 /// ## 加载二进制文件
-pub fn load_binary_file(param: &mut ExecParam) -> Result<BinaryLoaderResult, SystemError> {
+///
+///
+/// ## 参数
+/// - `param`: 执行参数
+/// - `ctx`: 执行上下文，用于跟踪递归深度
+///
+/// ## 返回值
+/// - `LoadBinaryResult::Loaded`: 正常加载完成
+/// - `LoadBinaryResult::NeedReexec`: 需要递归执行解释器（shebang场景）
+pub fn load_binary_file_with_context(
+    param: &mut ExecParam,
+    ctx: &ExecContext,
+) -> Result<LoadBinaryResult, SystemError> {
+    // 检查递归深度
+    ctx.check_recursion_limit()?;
+
     // 读取文件头部，用于判断文件类型
     let mut head_buf = [0u8; 512];
-    param.file_mut().lseek(SeekFrom::SeekSet(0))?;
-    let _bytes = param.file_mut().read(512, &mut head_buf)?;
-    // debug!("load_binary_file: read {} bytes", _bytes);
+    param.file_ref().lseek(SeekFrom::SeekSet(0))?;
+    let _bytes = param.file_ref().read(512, &mut head_buf)?;
 
+    // 首先检查是否为shebang脚本
+    if SHEBANG_LOADER.probe(param, &head_buf).is_ok() {
+        // 解析shebang行
+        let shebang_info =
+            ShebangLoader::parse_shebang_line(&head_buf).map_err(|_| SystemError::ENOEXEC)?;
+
+        if param
+            .interp_flags()
+            .contains(ExecInterpFlags::PATH_INACCESSIBLE)
+        {
+            return Err(SystemError::ENOENT);
+        }
+
+        // 通过正常的open流程打开解释器文件
+        let interpreter_file =
+            do_open_execat(AtFlags::AT_FDCWD.bits(), &shebang_info.interpreter_path).inspect_err(
+                |_e| {
+                    // log::warn!(
+                    //     "Shebang interpreter not found: {}, error: {:?}",
+                    //     shebang_info.interpreter_path,
+                    //     e
+                    // );
+                },
+            )?;
+
+        // 获取脚本路径
+        let script_path = param.filename().to_string_lossy().into_owned();
+
+        // 构建新的argv
+        // Linux语义: [interpreter, optional_arg, script_path, original_args[1:]...]
+        let mut new_argv = Vec::new();
+
+        // argv[0] = 解释器路径
+        new_argv.push(
+            CString::new(shebang_info.interpreter_path.clone()).map_err(|_| SystemError::EINVAL)?,
+        );
+
+        // argv[1] = 可选参数 (如果存在)
+        if let Some(ref arg) = shebang_info.interpreter_arg {
+            new_argv.push(CString::new(arg.clone()).map_err(|_| SystemError::EINVAL)?);
+        }
+
+        // argv[N] = 脚本路径
+        new_argv.push(CString::new(script_path).map_err(|_| SystemError::EINVAL)?);
+
+        // 追加原始参数 (跳过argv[0]，因为已经用脚本路径替换)
+        let original_args = &param.init_info().args;
+        if original_args.len() > 1 {
+            new_argv.extend(original_args[1..].iter().cloned());
+        }
+
+        return Ok(LoadBinaryResult::NeedReexec {
+            next: ExecStartInfo::new(
+                interpreter_file,
+                shebang_info.interpreter_path.clone(),
+                param.execfn().to_string_lossy().into_owned(),
+                ExecInterpFlags::empty(),
+            ),
+            new_argv,
+        });
+    }
+
+    // 然后尝试其他加载器 (ELF等)
     let mut loader = None;
     for bl in BINARY_LOADERS.iter() {
         let probe_result = bl.probe(param, &head_buf);
@@ -222,21 +593,17 @@ pub fn load_binary_file(param: &mut ExecParam) -> Result<BinaryLoaderResult, Sys
             break;
         }
     }
-    // debug!("load_binary_file: loader: {:?}", loader);
+
     if loader.is_none() {
         return Err(SystemError::ENOEXEC);
     }
 
     let loader: &&dyn BinaryLoader = loader.unwrap();
     assert!(param.vm().is_current());
-    // debug!("load_binary_file: to load with param: {:?}", param);
 
-    let result: BinaryLoaderResult = loader
-        .load(param, &head_buf)
-        .unwrap_or_else(|e| panic!("load_binary_file failed: error: {e:?}, param: {param:?}"));
+    let result: BinaryLoaderResult = loader.load(param, &head_buf).map_err(SystemError::from)?;
 
-    // debug!("load_binary_file: load success: {result:?}");
-    return Ok(result);
+    Ok(LoadBinaryResult::Loaded(result))
 }
 
 /// 程序初始化信息，这些信息会被压入用户栈中
@@ -246,6 +613,7 @@ pub struct ProcInitInfo {
     pub args: Vec<CString>,
     pub envs: Vec<CString>,
     pub auxv: BTreeMap<u8, usize>,
+    pub execfn: Option<CString>,
     pub rand_num: [u8; 16],
 }
 
@@ -256,6 +624,7 @@ impl ProcInitInfo {
             args: Vec::new(),
             envs: Vec::new(),
             auxv: BTreeMap::new(),
+            execfn: None,
             rand_num: [0u8; 16],
         }
     }
@@ -298,10 +667,23 @@ impl ProcInitInfo {
         self.auxv
             .insert(super::abi::AtType::Random as u8, ustack.sp().data());
 
+        if let Some(execfn) = self.execfn.as_ref() {
+            self.push_str(ustack, execfn)?;
+            self.auxv
+                .insert(super::abi::AtType::ExecFn as u8, ustack.sp().data());
+        }
+
         // 实现栈的16字节对齐
-        // 用当前栈顶地址减去后续要压栈的长度，得到的压栈后的栈顶地址与0xF按位与操作得到对齐要填充的字节数
-        let length_to_push = (self.auxv.len() + envps.len() + 1 + argps.len() + 1 + 1)
-            * core::mem::align_of::<usize>();
+        // 后续要压入的内容都是 `usize` 宽度：
+        // - auxv 终止项: 2 words
+        // - auxv 条目: 2 words / entry
+        // - envp NULL: 1 word
+        // - envp 指针数组: envps.len() words
+        // - argv NULL: 1 word
+        // - argv 指针数组: argps.len() words
+        // - argc: 1 word
+        let length_to_push =
+            self.remaining_stack_words(envps.len(), argps.len()) * core::mem::size_of::<usize>();
         self.push_slice(
             ustack,
             &vec![0u8; (ustack.sp().data() - length_to_push) & 0xF],
@@ -326,6 +708,14 @@ impl ProcInitInfo {
         self.push_slice(ustack, &[self.args.len()])?;
 
         return Ok((ustack.sp(), argv_ptr));
+    }
+
+    fn remaining_stack_words(&self, envc: usize, argc: usize) -> usize {
+        let aux_words = 2 + self.auxv.len() * 2;
+        let env_words = 1 + envc;
+        let argv_words = 1 + argc;
+        let argc_words = 1;
+        aux_words + env_words + argv_words + argc_words
     }
 
     fn push_slice<T: Copy>(&self, ustack: &mut UserStack, slice: &[T]) -> Result<(), SystemError> {

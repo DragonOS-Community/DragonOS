@@ -1,14 +1,16 @@
 use core::{fmt::Debug, sync::atomic::compiler_fence};
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 
 use alloc::vec::Vec;
 use system_error::SystemError;
 
 use crate::{
     arch::ipc::signal::{SigFlags, SigSet, Signal, MAX_SIG_NUM},
-    ipc::signal_types::{SaHandlerType, SigInfo, SigPending, SigactionType, SignalFlags},
+    filesystem::epoll::event_poll::LockedEPItemLinkedList,
+    ipc::signal_types::{SaHandlerType, SigCode, SigInfo, SigPending, SigactionType, SignalFlags},
     libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+    libs::wait_queue::WaitQueue,
     process::{
         pid::{Pid, PidType},
         ProcessControlBlock, ProcessManager,
@@ -19,6 +21,20 @@ use super::signal_types::Sigaction;
 
 pub struct SigHand {
     inner: RwLock<InnerSigHand>,
+    group_exec_wait_queue: WaitQueue,
+    /// signalfd 共享等待队列，对标 Linux `sighand_struct::signalfd_wqh`。
+    ///
+    /// 信号投递路径（包括 hardirq 上下文）调用 `signalfd_wqh.wakeup_all()`
+    /// 唤醒所有阻塞在 signalfd `read()` 的线程。
+    /// `WaitQueue` 内部使用 `SpinLock` + `lock_irqsave`，hardirq 安全。
+    signalfd_wqh: WaitQueue,
+    /// signalfd 的 epoll 通知列表。
+    ///
+    /// 所有注册在此进程 signalfd 上的 EPollItem 都会被收集到这里。
+    /// 信号投递路径（包括 hardirq）直接对此列表调用 `wakeup_epoll`，
+    /// 避免遍历 fd_table（涉及 RwLock/RwSem，在 hardirq 中不安全）。
+    /// 使用 irqsave SpinLock，hardirq 安全。
+    signalfd_epitems: LockedEPItemLinkedList,
 }
 
 impl Debug for SigHand {
@@ -35,6 +51,10 @@ pub struct InnerSigHand {
     /// 线程组退出码（仿照 Linux 的 signal_struct::group_exit_code）
     /// 仅当 flags 中包含 GROUP_EXIT 时才有效
     pub group_exit_code: usize,
+    /// 线程组 exec（de-thread）当前执行者
+    pub group_exec_task: Option<Weak<ProcessControlBlock>>,
+    /// 线程组 exec（de-thread）等待计数（仿照 Linux 的 signal_struct::notify_count）
+    pub group_exec_notify_count: isize,
     pub pids: [Option<Arc<Pid>>; PidType::PIDTYPE_MAX],
     /// 在 sighand 上维护的引用计数（与 Linux 一致的布局位置）
     pub cnt: i64,
@@ -44,6 +64,9 @@ impl SigHand {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             inner: RwLock::new(InnerSigHand::default()),
+            group_exec_wait_queue: WaitQueue::default(),
+            signalfd_wqh: WaitQueue::default(),
+            signalfd_epitems: LockedEPItemLinkedList::default(),
         })
     }
 
@@ -53,6 +76,57 @@ impl SigHand {
 
     fn inner_mut(&self) -> RwLockWriteGuard<'_, InnerSigHand> {
         self.inner.write_irqsave()
+    }
+
+    pub fn inner_read(&self) -> RwLockReadGuard<'_, InnerSigHand> {
+        self.inner()
+    }
+
+    fn group_exec_wait_queue(&self) -> &WaitQueue {
+        &self.group_exec_wait_queue
+    }
+
+    /// 获取 signalfd 共享等待队列引用。
+    ///
+    /// signalfd 的 `read()` 路径在此队列上注册等待者，
+    /// 信号投递路径通过 `wakeup_all()` 唤醒它们。
+    pub fn signalfd_wqh(&self) -> &WaitQueue {
+        &self.signalfd_wqh
+    }
+
+    /// 获取 signalfd 的 epoll 通知列表引用。
+    ///
+    /// signalfd 的 `add_epitem` 将 EPollItem 同时注册到此列表中，
+    /// 信号投递路径通过 `wakeup_epoll(&signalfd_epitems, ...)` 直接通知 epoll，
+    /// 避免在 hardirq 中遍历 fd_table。
+    pub fn signalfd_epitems(&self) -> &LockedEPItemLinkedList {
+        &self.signalfd_epitems
+    }
+
+    pub fn wait_group_exec_event_interruptible<F, B>(
+        &self,
+        cond: F,
+        before_sleep: Option<B>,
+    ) -> Result<(), SystemError>
+    where
+        F: FnMut() -> bool,
+        B: FnMut(),
+    {
+        self.group_exec_wait_queue()
+            .wait_event_interruptible(cond, before_sleep)
+    }
+
+    pub fn wait_group_exec_event_killable<F, B>(
+        &self,
+        cond: F,
+        before_sleep: Option<B>,
+    ) -> Result<(), SystemError>
+    where
+        F: FnMut() -> bool,
+        B: FnMut(),
+    {
+        self.group_exec_wait_queue()
+            .wait_event_killable(cond, before_sleep)
     }
 
     pub fn reset_handlers(&self) {
@@ -95,9 +169,70 @@ impl SigHand {
         g.shared_pending.queue().find(sig).0.is_some()
     }
 
+    /// 查找并判断 shared pending 队列中是否已存在指定 timerid 的 POSIX timer 信号。
+    pub fn shared_pending_posix_timer_exists(&self, sig: Signal, timerid: i32) -> bool {
+        let mut g = self.inner_mut();
+        for info in g.shared_pending.queue_mut().q.iter_mut() {
+            // bump(0) 作为“匹配探测”，不会改变值
+            if info.is_signal(sig)
+                && info.sig_code() == SigCode::Timer
+                && info.bump_posix_timer_overrun(timerid, 0)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 若 shared pending 中已存在该 timer 的信号，则将其 si_overrun 增加 bump，并返回 true。
+    pub fn shared_pending_posix_timer_bump_overrun(
+        &self,
+        sig: Signal,
+        timerid: i32,
+        bump: i32,
+    ) -> bool {
+        let mut g = self.inner_mut();
+        for info in g.shared_pending.queue_mut().q.iter_mut() {
+            if info.is_signal(sig)
+                && info.sig_code() == SigCode::Timer
+                && info.bump_posix_timer_overrun(timerid, bump)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 将 shared pending 中属于该 timer 的信号的 si_overrun 重置为 0（若找到则返回 true）。
+    pub fn shared_pending_posix_timer_reset_overrun(&self, sig: Signal, timerid: i32) -> bool {
+        let mut g = self.inner_mut();
+        for info in g.shared_pending.queue_mut().q.iter_mut() {
+            if info.is_signal(sig)
+                && info.sig_code() == SigCode::Timer
+                && info.reset_posix_timer_overrun(timerid)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn shared_pending_dequeue(&self, sig_mask: &SigSet) -> (Signal, Option<SigInfo>) {
         let mut g = self.inner_mut();
         g.shared_pending.dequeue_signal(sig_mask)
+    }
+
+    /// 向 shared_pending 队列添加信号
+    pub fn shared_pending_push(&self, sig: Signal, info: SigInfo) {
+        let mut g = self.inner_mut();
+        g.shared_pending.queue_mut().q.push(info);
+        g.shared_pending.signal_mut().insert(sig.into());
+    }
+
+    /// 向 shared_pending 的 signal 位图中添加信号（不添加 siginfo）
+    pub fn shared_pending_signal_insert(&self, sig: Signal) {
+        let mut g = self.inner_mut();
+        g.shared_pending.signal_mut().insert(sig.into());
     }
 
     // ===== Signal flags helpers =====
@@ -117,6 +252,91 @@ impl SigHand {
     pub fn flags_remove(&self, flag: SignalFlags) {
         let mut g = self.inner_mut();
         g.flags.remove(flag);
+    }
+
+    /// 尝试开始线程组 exec（去线程化）流程。
+    ///
+    /// - 若已经有 GROUP_EXIT 或 GROUP_EXEC 在进行中，则返回 EAGAIN。
+    /// - 否则设置 GROUP_EXEC 并返回 Ok。
+    pub fn try_start_group_exec(&self) -> Result<(), SystemError> {
+        let mut g = self.inner_mut();
+        if g.flags.contains(SignalFlags::GROUP_EXIT) || g.flags.contains(SignalFlags::GROUP_EXEC) {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        g.flags.insert(SignalFlags::GROUP_EXEC);
+        Ok(())
+    }
+
+    /// 在与 GROUP_EXEC/GROUP_EXIT 相同的锁下，设置 exec 标志并记录执行者。
+    pub fn start_group_exec(&self, task: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
+        let mut g = self.inner_mut();
+        if g.flags.contains(SignalFlags::GROUP_EXIT) || g.flags.contains(SignalFlags::GROUP_EXEC) {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        g.flags.insert(SignalFlags::GROUP_EXEC);
+        g.group_exec_task = Some(Arc::downgrade(task));
+        g.group_exec_notify_count = 0;
+        Ok(())
+    }
+
+    /// 结束线程组 exec 状态。
+    pub fn finish_group_exec(&self) {
+        let mut g = self.inner_mut();
+        g.flags.remove(SignalFlags::GROUP_EXEC);
+        g.group_exec_task = None;
+        g.group_exec_notify_count = 0;
+        drop(g);
+        self.group_exec_wait_queue().wakeup_all(None);
+    }
+
+    /// 记录当前 exec 线程（去线程化执行者）。
+    pub fn set_group_exec_task(&self, task: &Arc<ProcessControlBlock>) {
+        let mut g = self.inner_mut();
+        g.group_exec_task = Some(Arc::downgrade(task));
+    }
+
+    /// 在与 GROUP_EXEC/GROUP_EXIT 相同的锁下执行关键区，避免并发插入线程组。
+    pub fn with_group_exec_check<F, R>(&self, f: F) -> Result<R, SystemError>
+    where
+        F: FnOnce() -> R,
+    {
+        let g = self.inner_mut();
+        if g.flags.contains(SignalFlags::GROUP_EXIT) || g.flags.contains(SignalFlags::GROUP_EXEC) {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        let ret = f();
+        drop(g);
+        Ok(ret)
+    }
+
+    /// 获取当前 exec 线程（去线程化执行者）。
+    pub fn group_exec_task(&self) -> Option<Arc<ProcessControlBlock>> {
+        self.inner().group_exec_task.as_ref()?.upgrade()
+    }
+
+    pub fn group_exec_notify_count(&self) -> isize {
+        self.inner().group_exec_notify_count
+    }
+
+    pub fn set_group_exec_notify_count(&self, count: isize) {
+        let mut g = self.inner_mut();
+        g.group_exec_notify_count = count;
+    }
+
+    pub fn dec_group_exec_notify_count_and_wake(&self) {
+        let mut g = self.inner_mut();
+        if g.group_exec_notify_count > 0 {
+            g.group_exec_notify_count -= 1;
+            if g.group_exec_notify_count == 0 {
+                drop(g);
+                self.group_exec_wait_queue().wakeup_all(None);
+                return;
+            }
+        }
+    }
+
+    pub fn wake_group_exec_waiters(&self) {
+        self.group_exec_wait_queue().wakeup_all(None);
     }
 
     /// 若当前线程组已经处于 group-exit 状态，则返回统一的退出码；否则返回 None
@@ -171,6 +391,8 @@ impl Default for InnerSigHand {
             shared_pending: SigPending::default(),
             flags: SignalFlags::empty(),
             group_exit_code: 0,
+            group_exec_task: None,
+            group_exec_notify_count: 0,
             cnt: 0,
         }
     }

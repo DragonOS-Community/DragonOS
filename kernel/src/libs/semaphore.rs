@@ -35,10 +35,20 @@ impl Semaphore {
     #[allow(dead_code)]
     #[inline]
     fn down(&self) {
-        if self.counter.fetch_sub(1, Ordering::Release) <= 0 {
+        loop {
+            // 尝试占用一个计数
+            if self.counter.fetch_sub(1, Ordering::Acquire) > 0 {
+                return;
+            }
+
+            // 回滚，本次未成功
             self.counter.fetch_add(1, Ordering::Relaxed);
-            self.wait_queue.sleep().ok();
-            //资源不充足,信号量<=0, 此时进程睡眠
+
+            // 资源不足，阻塞等待计数可用
+            let _ = self.wait_queue.wait_event_uninterruptible(
+                || self.counter.load(Ordering::Acquire) > 0,
+                None::<fn()>,
+            );
         }
     }
 
@@ -46,18 +56,15 @@ impl Semaphore {
     #[inline]
     fn up(&self) {
         // 判断有没有进程在等待资源
-        if self.wait_queue.len() > 0 {
+        if !self.wait_queue.is_empty() {
             self.counter.fetch_add(1, Ordering::Release);
-        } else {
-            //尝试唤醒
-            if !self.wait_queue.wakeup(None) {
-                //如果唤醒失败,打印错误信息
-                debug!(
-                    "Semaphore wakeup failed: current pid= {}, semaphore={:?}",
-                    ProcessManager::current_pcb().raw_pid().into(),
-                    self
-                );
-            }
+        } else if !self.wait_queue.wakeup(None) {
+            //如果唤醒失败,打印错误信息
+            debug!(
+                "Semaphore wakeup failed: current pid= {}, semaphore={:?}",
+                ProcessManager::current_pcb().raw_pid().into(),
+                self
+            );
         }
     }
 }

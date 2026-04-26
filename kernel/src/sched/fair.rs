@@ -9,8 +9,7 @@ use crate::libs::spinlock::SpinLock;
 use crate::process::ProcessControlBlock;
 use crate::process::ProcessFlags;
 use crate::sched::clock::ClockUpdataFlag;
-use crate::sched::{cpu_rq, SchedFeature, SCHED_FEATURES};
-use crate::smp::core::smp_get_processor_id;
+use crate::sched::{SchedFeature, SCHED_FEATURES};
 use crate::time::jiffies::TICK_NESC;
 use crate::time::timer::clock;
 use crate::time::NSEC_PER_MSEC;
@@ -1417,6 +1416,10 @@ impl Scheduler for CompletelyFairScheduler {
         mut flags: EnqueueFlag,
     ) {
         let mut se = pcb.sched_info().sched_entity();
+        debug_assert!(
+            Arc::ptr_eq(&se.cfs_rq(), &rq.cfs_rq()),
+            "enqueue: SE's cfs_rq must match target rq's cfs_rq"
+        );
         let mut idle_h_nr_running = pcb.sched_info().policy() == SchedPolicy::IDLE;
         let (should_continue, se) = FairSchedEntity::for_each_in_group(&mut se, |se| {
             if se.on_rq() {
@@ -1694,15 +1697,15 @@ impl Scheduler for CompletelyFairScheduler {
     }
 
     fn task_fork(pcb: Arc<ProcessControlBlock>) {
-        let rq = cpu_rq(smp_get_processor_id().data() as usize);
         let se = pcb.sched_info().sched_entity();
+        let cfs_rq = se.cfs_rq();
+        let rq = cfs_rq.rq();
 
         let (rq, _guard) = rq.self_lock();
 
         rq.update_rq_clock();
 
-        let binding = se.cfs_rq();
-        let cfs_rq = binding.force_mut();
+        let cfs_rq = cfs_rq.force_mut();
 
         if cfs_rq.current().is_some() {
             cfs_rq.update_current();

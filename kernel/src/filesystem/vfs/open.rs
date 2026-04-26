@@ -227,13 +227,17 @@ pub fn ksys_fchown(fd: i32, uid: usize, gid: usize) -> Result<usize, SystemError
     let fd_table = &ProcessManager::current_pcb().fd_table();
     let fd_table = fd_table.read();
 
-    let inode = fd_table.get_file_by_fd(fd).unwrap().inode();
+    let file = fd_table.get_file_by_fd(fd).ok_or(SystemError::EBADF)?;
 
-    let result = chown_common(inode, uid, gid);
+    // Linux 语义：对 O_PATH fd 执行 fchown 应返回 EBADF
+    if file.flags().contains(FileFlags::O_PATH) {
+        return Err(SystemError::EBADF);
+    }
+
+    let inode = file.inode();
 
     drop(fd_table);
-
-    return result;
+    return chown_common(inode, uid, gid);
 }
 
 pub fn do_sys_open(

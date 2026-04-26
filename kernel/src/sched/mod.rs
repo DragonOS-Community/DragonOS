@@ -31,7 +31,9 @@ use crate::{
         ipi::{IpiKind, IpiTarget},
         InterruptArch,
     },
+    init::initial_kthread::{get_system_state, SystemState},
     libs::{
+        cpumask::{AtomicCpuMask, CpuMask},
         lazy_init::Lazy,
         spinlock::{SpinLock, SpinLockGuard},
     },
@@ -41,7 +43,10 @@ use crate::{
         SchedInfo,
     },
     sched::idle::IdleScheduler,
-    smp::{core::smp_get_processor_id, cpu::ProcessorId},
+    smp::{
+        core::smp_get_processor_id,
+        cpu::{smp_cpu_manager, smp_cpu_manager_initialized, ProcessorId},
+    },
     time::{clocksource::HZ, timer::clock},
 };
 
@@ -54,6 +59,7 @@ use self::{
 };
 
 static mut CPU_IRQ_TIME: Option<Vec<&'static mut IrqTime>> = None;
+pub static IDLE_CPUS: AtomicCpuMask = AtomicCpuMask::new();
 
 // 这里虽然rq是percpu的，但是在负载均衡的时候需要修改对端cpu的rq，所以仍需加锁
 static CPU_RUNQUEUE: Lazy<PerCpuVar<Arc<CpuRunQueue>>> = PerCpuVar::define_lazy();
@@ -80,6 +86,39 @@ pub fn cpu_rq(cpu: usize) -> Arc<CpuRunQueue> {
             .force_get(ProcessorId::new(cpu as u32))
             .clone()
     }
+}
+
+#[inline]
+fn task_is_idle(pcb: &Arc<ProcessControlBlock>) -> bool {
+    pcb.sched_info().policy() == SchedPolicy::IDLE
+}
+
+#[inline]
+fn rq_is_idle_cpu(rq: &CpuRunQueue) -> bool {
+    task_is_idle(&rq.current()) && rq.nr_running == 0
+}
+
+#[inline]
+pub fn cpu_is_online(cpu: ProcessorId) -> bool {
+    smp_cpu_manager().is_online_cpu(cpu)
+}
+
+#[inline]
+fn boot_in_progress() -> bool {
+    matches!(
+        get_system_state(),
+        SystemState::Booting | SystemState::Scheduling | SystemState::FreeingInitMem
+    )
+}
+
+pub fn pick_idle_cpu(allowed: &CpuMask) -> Option<ProcessorId> {
+    if !smp_cpu_manager_initialized() {
+        return IDLE_CPUS.first_and(allowed);
+    }
+
+    allowed
+        .iter_cpu()
+        .find(|&cpu| IDLE_CPUS.get(cpu) && cpu_is_online(cpu))
 }
 
 lazy_static! {
@@ -337,6 +376,11 @@ pub struct CpuRunQueue {
 }
 
 impl CpuRunQueue {
+    #[inline]
+    pub fn cpu(&self) -> ProcessorId {
+        self.cpu
+    }
+
     pub fn new(cpu: ProcessorId) -> Self {
         Self {
             lock: SpinLock::new(()),
@@ -459,6 +503,8 @@ impl CpuRunQueue {
 
     /// 启用一个任务，将加入队列
     pub fn activate_task(&mut self, pcb: &Arc<ProcessControlBlock>, mut flags: EnqueueFlag) {
+        let was_idle_cpu = rq_is_idle_cpu(self);
+
         // 如果进程之前因 IO 等待而睡眠，现在被唤醒，减少 nr_iowait 计数
         if pcb.flags().contains(ProcessFlags::IN_IOWAIT) {
             self.nr_iowait.fetch_sub(1, Ordering::Relaxed);
@@ -476,6 +522,14 @@ impl CpuRunQueue {
 
         *pcb.sched_info().on_rq.lock_irqsave() = OnRq::Queued;
         pcb.sched_info().set_on_cpu(Some(self.cpu));
+
+        if was_idle_cpu && !rq_is_idle_cpu(self) {
+            IDLE_CPUS.clear(self.cpu);
+        }
+
+        debug_assert_eq!(*pcb.sched_info().on_rq.lock_irqsave(), OnRq::Queued);
+        debug_assert_eq!(pcb.sched_info().on_cpu(), Some(self.cpu));
+        pcb.debug_assert_fork_cpu_binding();
     }
 
     /// 检查对应的task是否可以抢占当前运行的task
@@ -591,6 +645,11 @@ impl CpuRunQueue {
             "update_rq_clock must run on its own cpu"
         );
 
+        let clock = SchedClock::sched_clock_cpu(self.cpu);
+        self.update_rq_clock_from_clock(clock);
+    }
+
+    pub fn update_rq_clock_from_clock(&mut self, clock: u64) {
         // 需要跳过这次时钟更新
         if self
             .clock_updata_flags
@@ -599,7 +658,6 @@ impl CpuRunQueue {
             return;
         }
 
-        let clock = SchedClock::sched_clock_cpu(self.cpu);
         if clock < self.clock {
             return;
         }
@@ -730,6 +788,8 @@ impl CpuRunQueue {
 
     /// 选择下一个task
     pub fn pick_next_task(&mut self, prev: Arc<ProcessControlBlock>) -> Arc<ProcessControlBlock> {
+        debug_assert_eq!(prev.sched_info().on_cpu(), Some(self.cpu));
+
         let mut next: Option<Arc<ProcessControlBlock>> = None;
 
         if self.fifo.nr_running() > 0 {
@@ -978,6 +1038,12 @@ pub fn __schedule(sched_mod: SchedMode) {
 
     let next = rq.pick_next_task(prev.clone());
 
+    if task_is_idle(&next) {
+        IDLE_CPUS.set(rq.cpu);
+    } else if task_is_idle(&prev) {
+        IDLE_CPUS.clear(rq.cpu);
+    }
+
     // kBUG!(
     //     "after cfs rq pcbs {:?}\nvruntimes {:?}\n",
     //     rq.cfs
@@ -1064,16 +1130,36 @@ pub fn sched_fork(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
 }
 
 pub fn sched_cgroup_fork(pcb: &Arc<ProcessControlBlock>) {
-    __set_task_cpu(pcb, smp_get_processor_id());
+    let fork_cpu = smp_get_processor_id();
+
+    __set_task_cpu(pcb, fork_cpu);
     match pcb.sched_info().policy() {
         SchedPolicy::RT => todo!(),
         SchedPolicy::FIFO => FifoScheduler::task_fork(pcb.clone()),
         SchedPolicy::CFS => CompletelyFairScheduler::task_fork(pcb.clone()),
         SchedPolicy::IDLE => todo!(),
     }
+
+    debug_assert_eq!(
+        pcb.sched_info().sched_entity().cfs_rq().rq().cpu(),
+        fork_cpu,
+        "fork-time task_fork must only charge the local rq clock"
+    );
+}
+
+pub fn sched_set_new_task_cpu(pcb: &Arc<ProcessControlBlock>, target_cpu: ProcessorId) {
+    __set_task_cpu(pcb, target_cpu);
+    pcb.sched_info().set_on_cpu(Some(target_cpu));
+    pcb.debug_assert_fork_cpu_binding();
 }
 
 fn __set_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {
+    debug_assert!(
+        cpu_is_online(cpu) || boot_in_progress(),
+        "__set_task_cpu target cpu {:?} must be online outside boot",
+        cpu
+    );
+
     // TODO: Fixme There is not implement group sched;
     let se = pcb.sched_info().sched_entity();
     let rq = cpu_rq(cpu.data() as usize);

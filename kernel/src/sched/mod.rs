@@ -1286,30 +1286,59 @@ pub fn sched_fork(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
 }
 
 pub fn sched_cgroup_fork(pcb: &Arc<ProcessControlBlock>) {
-    let target_cpu = crate::sched::load_balance::LoadBalancer::select_task_rq(
-        pcb,
-        smp_get_processor_id(),
-        WakeupFlags::WF_FORK.bits(),
-    );
-    __set_task_cpu(pcb, target_cpu);
-    match pcb.sched_info().policy() {
-        SchedPolicy::RT => todo!(),
-        SchedPolicy::FIFO => FifoScheduler::task_fork(pcb.clone()),
-        SchedPolicy::CFS => CompletelyFairScheduler::task_fork(pcb.clone()),
-        SchedPolicy::IDLE => todo!(),
+    // 仅绑定父 CPU，不做负载均衡。
+    // 负载均衡在 wake_up_new_task 中完成。
+    let fork_cpu = smp_get_processor_id();
+    __set_task_cpu(pcb, fork_cpu);
+    if pcb.sched_info().policy() == SchedPolicy::CFS {
+        CompletelyFairScheduler::task_fork(pcb.clone());
+    } else if pcb.sched_info().policy() == SchedPolicy::FIFO {
+        FifoScheduler::task_fork(pcb.clone());
     }
 
     debug_assert_eq!(
         pcb.sched_info().sched_entity().cfs_rq().rq().cpu(),
-        target_cpu,
+        fork_cpu,
         "fork-time task_fork must only charge the local rq clock"
     );
 }
 
-pub fn sched_set_new_task_cpu(pcb: &Arc<ProcessControlBlock>, target_cpu: ProcessorId) {
+/// Fork 后的唯一唤醒入口：做一次 select_task_rq(WF_FORK) 负载均衡，然后 activate_task。
+pub fn wake_up_new_task(pcb: &Arc<ProcessControlBlock>) {
+    let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+
+    let prev_cpu = pcb.sched_info().on_cpu().unwrap_or(smp_get_processor_id());
+
+    // __set_task_cpu(p, select_task_rq(p, task_cpu(p), WF_FORK));
+    let target_cpu = crate::sched::load_balance::LoadBalancer::select_task_rq(
+        pcb,
+        prev_cpu,
+        WakeupFlags::WF_FORK.bits(),
+    );
+    let target_cpu = if target_cpu == ProcessorId::INVALID {
+        log::warn!(
+            "wake_up_new_task: select_task_rq returned INVALID for pid={:?}, fallback to current CPU",
+            pcb.raw_pid()
+        );
+        smp_get_processor_id()
+    } else {
+        target_cpu
+    };
     __set_task_cpu(pcb, target_cpu);
-    pcb.sched_info().set_on_cpu(Some(target_cpu));
-    pcb.debug_assert_fork_cpu_binding();
+
+    // 设置进程状态为 Runnable（WRITE_ONCE(p->__state, TASK_RUNNING)）
+    {
+        let mut writer = pcb.sched_info().inner_lock_write_irqsave();
+        writer.set_state(ProcessState::Runnable);
+        writer.set_wakeup();
+    }
+
+    // rq = __task_rq_lock(p, &rf); activate_task(rq, p, ENQUEUE_NOCLOCK);
+    let rq = cpu_rq(target_cpu.data() as usize);
+    let (rq, _rq_guard) = rq.self_lock();
+    rq.update_rq_clock();
+    rq.activate_task(pcb, EnqueueFlag::ENQUEUE_NOCLOCK);
+    rq.check_preempt_currnet(pcb, WakeupFlags::WF_FORK);
 }
 
 pub(crate) fn __set_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {

@@ -7,7 +7,7 @@ use crate::arch::MMArch;
 use crate::mm::{MemoryManagementArch, VirtAddr};
 use crate::process::fork::{CloneFlags, KernelCloneArgs, MAX_PID_NS_LEVEL};
 use crate::process::{KernelStack, ProcessControlBlock, ProcessManager};
-use crate::sched::{completion::Completion, sched_set_new_task_cpu};
+use crate::sched::{completion::Completion, wake_up_new_task};
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
 use alloc::{string::ToString, sync::Arc};
 use system_error::SystemError;
@@ -74,11 +74,7 @@ pub fn do_clone(
     let name = current_pcb.basic().name().to_string();
 
     let pcb = ProcessControlBlock::new(name, new_kstack);
-    // 克隆pcb
-    let target_cpu = ProcessManager::copy_process(&current_pcb, &pcb, clone_args, frame)?;
-
-    // 新的 ProcFS 是动态的，进程目录会在访问时按需创建
-    // 不再需要显式注册进程
+    ProcessManager::copy_process(&current_pcb, &pcb, clone_args, frame)?;
 
     if flags.contains(CloneFlags::CLONE_VFORK) {
         pcb.thread.write_irqsave().vfork_done = Some(vfork.clone());
@@ -91,15 +87,7 @@ pub fn do_clone(
         writer.copy_one_to_user(&(pcb.raw_pid().data() as i32), 0)?;
     }
 
-    sched_set_new_task_cpu(&pcb, target_cpu);
-
-    ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {
-        panic!(
-            "fork: Failed to wakeup new process, pid: [{:?}]. Error: {:?}",
-            pcb.raw_pid(),
-            e
-        )
-    });
+    wake_up_new_task(&pcb);
 
     if flags.contains(CloneFlags::CLONE_VFORK) {
         // 等待子进程结束或者exec;

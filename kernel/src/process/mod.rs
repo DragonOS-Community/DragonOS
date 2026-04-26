@@ -298,6 +298,8 @@ impl ProcessManager {
                 // avoid deadlock
                 drop(writer);
 
+                pcb.debug_assert_fork_cpu_binding();
+
                 let target_cpu = pcb.sched_info().on_cpu().unwrap_or(current_cpu_id());
                 let update_clock = target_cpu == smp_get_processor_id();
                 let rq = cpu_rq(target_cpu.data() as usize);
@@ -2586,6 +2588,23 @@ impl ProcessSchedulerInfo {
         *self.cpus_allowed.lock_irqsave() = cpus_allowed;
         self.nr_cpus_allowed
             .store(nr_cpus_allowed, Ordering::SeqCst);
+    }
+}
+
+impl ProcessControlBlock {
+    #[inline]
+    pub(crate) fn debug_assert_fork_cpu_binding(&self) {
+        if cfg!(debug_assertions) {
+            let Some(on_cpu) = self.sched_info().on_cpu() else {
+                return;
+            };
+
+            debug_assert_eq!(
+                self.sched_info().sched_entity().cfs_rq().rq().cpu(),
+                on_cpu,
+                "fork target cpu and SE bound rq must stay consistent"
+            );
+        }
     }
 }
 

@@ -362,6 +362,11 @@ pub struct CpuRunQueue {
 }
 
 impl CpuRunQueue {
+    #[inline]
+    pub fn cpu(&self) -> ProcessorId {
+        self.cpu
+    }
+
     pub fn new(cpu: ProcessorId) -> Self {
         Self {
             lock: SpinLock::new(()),
@@ -622,6 +627,11 @@ impl CpuRunQueue {
             "update_rq_clock must run on its own cpu"
         );
 
+        let clock = SchedClock::sched_clock_cpu(self.cpu);
+        self.update_rq_clock_from_clock(clock);
+    }
+
+    pub fn update_rq_clock_from_clock(&mut self, clock: u64) {
         // 需要跳过这次时钟更新
         if self
             .clock_updata_flags
@@ -630,7 +640,6 @@ impl CpuRunQueue {
             return;
         }
 
-        let clock = SchedClock::sched_clock_cpu(self.cpu);
         if clock < self.clock {
             return;
         }
@@ -1100,14 +1109,20 @@ pub fn sched_fork(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
     Ok(())
 }
 
-pub fn sched_cgroup_fork(pcb: &Arc<ProcessControlBlock>) {
-    __set_task_cpu(pcb, smp_get_processor_id());
+pub fn sched_cgroup_fork(pcb: &Arc<ProcessControlBlock>, target_cpu: ProcessorId) {
+    __set_task_cpu(pcb, target_cpu);
     match pcb.sched_info().policy() {
         SchedPolicy::RT => todo!(),
         SchedPolicy::FIFO => FifoScheduler::task_fork(pcb.clone()),
         SchedPolicy::CFS => CompletelyFairScheduler::task_fork(pcb.clone()),
         SchedPolicy::IDLE => todo!(),
     }
+
+    debug_assert_eq!(
+        pcb.sched_info().sched_entity().cfs_rq().rq().cpu(),
+        target_cpu,
+        "fork child SE must stay bound to the requested target rq"
+    );
 }
 
 fn __set_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {

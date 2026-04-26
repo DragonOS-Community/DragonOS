@@ -75,7 +75,7 @@ pub fn do_clone(
 
     let pcb = ProcessControlBlock::new(name, new_kstack);
     // 克隆pcb
-    ProcessManager::copy_process(&current_pcb, &pcb, clone_args, frame)?;
+    let target_cpu = ProcessManager::copy_process(&current_pcb, &pcb, clone_args, frame)?;
 
     // 新的 ProcFS 是动态的，进程目录会在访问时按需创建
     // 不再需要显式注册进程
@@ -90,6 +90,9 @@ pub fn do_clone(
             UserBufferWriter::new(addr.as_ptr::<i32>(), core::mem::size_of::<i32>(), true)?;
         writer.copy_one_to_user(&(pcb.raw_pid().data() as i32), 0)?;
     }
+
+    pcb.sched_info().set_on_cpu(Some(target_cpu));
+    pcb.debug_assert_fork_cpu_binding();
 
     ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {
         panic!(

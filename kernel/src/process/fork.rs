@@ -17,11 +17,14 @@ use system_error::SystemError;
 use crate::{
     arch::{interrupt::TrapFrame, ipc::signal::Signal},
     ipc::signal_types::SignalFlags,
-    libs::rwsem::RwSem,
+    libs::{cpumask::CpuMask, rwsem::RwSem},
     mm::VirtAddr,
     process::ProcessFlags,
-    sched::{sched_cgroup_fork, sched_fork},
-    smp::{core::smp_get_processor_id, cpu::ProcessorId},
+    sched::{sched_cgroup_fork, sched_fork, sched_set_new_task_cpu},
+    smp::{
+        core::smp_get_processor_id,
+        cpu::{smp_cpu_manager, smp_cpu_manager_initialized, ProcessorId},
+    },
     syscall::user_access::UserBufferWriter,
 };
 
@@ -161,10 +164,55 @@ impl KernelCloneArgs {
     }
 
     #[inline]
-    pub fn resolve_target_cpu(&mut self, default_cpu: ProcessorId) -> ProcessorId {
-        let target_cpu = self.target_cpu.unwrap_or(default_cpu);
+    fn target_cpu_is_online(cpu: ProcessorId) -> bool {
+        !smp_cpu_manager_initialized() || smp_cpu_manager().is_online_cpu(cpu)
+    }
+
+    #[inline]
+    fn target_cpu_is_allowed(allowed: &CpuMask, cpu: ProcessorId) -> bool {
+        allowed.get(cpu).unwrap_or(false)
+    }
+
+    #[inline]
+    fn validate_target_cpu(cpu: ProcessorId, allowed: &CpuMask) -> Result<(), SystemError> {
+        if Self::target_cpu_is_allowed(allowed, cpu) && Self::target_cpu_is_online(cpu) {
+            Ok(())
+        } else {
+            Err(SystemError::EINVAL)
+        }
+    }
+
+    #[inline]
+    pub fn validate_requested_target_cpu(&self, allowed: &CpuMask) -> Result<(), SystemError> {
+        if let Some(target_cpu) = self.target_cpu {
+            Self::validate_target_cpu(target_cpu, allowed)?;
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    pub fn resolve_target_cpu(
+        &mut self,
+        default_cpu: ProcessorId,
+        allowed: &CpuMask,
+    ) -> Result<ProcessorId, SystemError> {
+        let target_cpu = if let Some(target_cpu) = self.target_cpu {
+            Self::validate_target_cpu(target_cpu, allowed)?;
+            target_cpu
+        } else if Self::target_cpu_is_allowed(allowed, default_cpu)
+            && Self::target_cpu_is_online(default_cpu)
+        {
+            default_cpu
+        } else {
+            allowed
+                .iter_cpu()
+                .find(|&cpu| Self::target_cpu_is_online(cpu))
+                .ok_or(SystemError::EINVAL)?
+        };
+
         self.target_cpu = Some(target_cpu);
-        target_cpu
+        Ok(target_cpu)
     }
 
     /// 规范化 exit_signal 字段，根据 Linux clone 语义处理
@@ -234,8 +282,7 @@ impl ProcessManager {
         //     );
         // }
 
-        pcb.sched_info().set_on_cpu(Some(target_cpu));
-        pcb.debug_assert_fork_cpu_binding();
+        sched_set_new_task_cpu(&pcb, target_cpu);
 
         ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {
             panic!(
@@ -565,6 +612,7 @@ impl ProcessManager {
             pcb.sched_info()
                 .set_cpus_allowed(current_pcb.sched_info().cpus_allowed());
         }
+        clone_args.validate_requested_target_cpu(&pcb.sched_info().cpus_allowed())?;
 
         // 拷贝标志位
         Self::copy_flags(&clone_flags, pcb).unwrap_or_else(|e| {
@@ -877,8 +925,9 @@ impl ProcessManager {
 
         // 对于 target_cpu=None，必须在 fork 长路径的末尾才解析默认 CPU，
         // 否则父任务在 copy_process() 期间迁移后，会把子任务错误地绑定到过早采样的 CPU。
-        let target_cpu = clone_args.resolve_target_cpu(smp_get_processor_id());
-        sched_cgroup_fork(pcb, target_cpu);
+        let target_cpu = clone_args
+            .resolve_target_cpu(smp_get_processor_id(), &pcb.sched_info().cpus_allowed())?;
+        sched_cgroup_fork(pcb);
 
         // 处理 rseq 状态
         crate::process::rseq::rseq_fork(pcb, clone_flags.contains(CloneFlags::CLONE_VM));

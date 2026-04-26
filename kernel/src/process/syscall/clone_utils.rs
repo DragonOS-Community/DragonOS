@@ -7,7 +7,7 @@ use crate::arch::MMArch;
 use crate::mm::{MemoryManagementArch, VirtAddr};
 use crate::process::fork::{CloneFlags, KernelCloneArgs, MAX_PID_NS_LEVEL};
 use crate::process::{KernelStack, ProcessControlBlock, ProcessManager};
-use crate::sched::completion::Completion;
+use crate::sched::{completion::Completion, sched_set_new_task_cpu};
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
 use alloc::{string::ToString, sync::Arc};
 use system_error::SystemError;
@@ -91,8 +91,7 @@ pub fn do_clone(
         writer.copy_one_to_user(&(pcb.raw_pid().data() as i32), 0)?;
     }
 
-    pcb.sched_info().set_on_cpu(Some(target_cpu));
-    pcb.debug_assert_fork_cpu_binding();
+    sched_set_new_task_cpu(&pcb, target_cpu);
 
     ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {
         panic!(

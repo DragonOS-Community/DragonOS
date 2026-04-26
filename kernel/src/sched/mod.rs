@@ -1109,8 +1109,10 @@ pub fn sched_fork(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
     Ok(())
 }
 
-pub fn sched_cgroup_fork(pcb: &Arc<ProcessControlBlock>, target_cpu: ProcessorId) {
-    __set_task_cpu(pcb, target_cpu);
+pub fn sched_cgroup_fork(pcb: &Arc<ProcessControlBlock>) {
+    let fork_cpu = smp_get_processor_id();
+
+    __set_task_cpu(pcb, fork_cpu);
     match pcb.sched_info().policy() {
         SchedPolicy::RT => todo!(),
         SchedPolicy::FIFO => FifoScheduler::task_fork(pcb.clone()),
@@ -1120,9 +1122,15 @@ pub fn sched_cgroup_fork(pcb: &Arc<ProcessControlBlock>, target_cpu: ProcessorId
 
     debug_assert_eq!(
         pcb.sched_info().sched_entity().cfs_rq().rq().cpu(),
-        target_cpu,
-        "fork child SE must stay bound to the requested target rq"
+        fork_cpu,
+        "fork-time task_fork must only charge the local rq clock"
     );
+}
+
+pub fn sched_set_new_task_cpu(pcb: &Arc<ProcessControlBlock>, target_cpu: ProcessorId) {
+    __set_task_cpu(pcb, target_cpu);
+    pcb.sched_info().set_on_cpu(Some(target_cpu));
+    pcb.debug_assert_fork_cpu_binding();
 }
 
 fn __set_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {

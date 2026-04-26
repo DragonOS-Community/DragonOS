@@ -9,7 +9,7 @@ use crate::libs::spinlock::SpinLock;
 use crate::process::ProcessControlBlock;
 use crate::process::ProcessFlags;
 use crate::sched::clock::ClockUpdataFlag;
-use crate::sched::{cpu_rq, SchedFeature, SCHED_FEATURES};
+use crate::sched::{SchedFeature, SCHED_FEATURES};
 use crate::time::jiffies::TICK_NESC;
 use crate::time::timer::clock;
 use crate::time::NSEC_PER_MSEC;
@@ -1695,12 +1695,11 @@ impl Scheduler for CompletelyFairScheduler {
     fn task_fork(pcb: Arc<ProcessControlBlock>) {
         let se = pcb.sched_info().sched_entity();
         let cfs_rq = se.cfs_rq();
-        let cpu = cfs_rq.rq().cpu();
-        let rq = cpu_rq(cpu.data() as usize);
+        let rq = cfs_rq.rq();
 
         let (rq, _guard) = rq.self_lock();
 
-        rq.update_rq_clock_from_clock(crate::sched::clock::SchedClock::sched_clock_cpu(cpu));
+        rq.update_rq_clock();
 
         let cfs_rq = cfs_rq.force_mut();
 

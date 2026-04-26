@@ -74,11 +74,13 @@ impl ProcessManager {
 
             *idle_pcb.sched_info().on_rq.lock_irqsave() = OnRq::Queued;
 
-            idle_pcb
-                .sched_info()
-                .sched_entity()
-                .force_mut()
-                .set_cfs(Arc::downgrade(&rq.cfs_rq()));
+            unsafe {
+                idle_pcb
+                    .sched_info()
+                    .sched_entity()
+                    .force_mut()
+                    .set_cfs(Arc::downgrade(&rq.cfs_rq()));
+            }
 
             v.push(idle_pcb);
         }

@@ -5,8 +5,8 @@ use system_error::SystemError;
 use crate::arch::driver::apic::{CurrentApic, LocalAPIC};
 
 use crate::{
-    sched::{SchedMode, __schedule},
-    smp::cpu::ProcessorId,
+    sched::{cpu_rq, cpu_wakequeue, EnqueueFlag, SchedMode, WakeupFlags, __schedule},
+    smp::{core::smp_get_processor_id, cpu::ProcessorId},
 };
 
 use super::{
@@ -68,6 +68,25 @@ impl IrqHandler for KickCpuIpiHandler {
         CurrentApic.send_eoi();
 
         // 被其他cpu kick时应该是抢占调度
+        let cpu = smp_get_processor_id();
+        let wq = cpu_wakequeue(cpu.data() as usize);
+        for pcb in wq.drain() {
+            let rq = cpu_rq(cpu.data() as usize);
+            let (rq, _guard) = rq.self_lock();
+            rq.update_rq_clock();
+
+            let prev_cpu = pcb.sched_info().on_cpu().unwrap_or(cpu);
+            if prev_cpu != cpu {
+                crate::sched::__set_task_cpu(&pcb, cpu);
+            }
+            let mut flags = EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK;
+            if prev_cpu != cpu {
+                flags |= EnqueueFlag::ENQUEUE_MIGRATED;
+            }
+            rq.activate_task(&pcb, flags);
+            rq.check_preempt_currnet(&pcb, WakeupFlags::WF_MIGRATED);
+        }
+
         __schedule(SchedMode::SM_PREEMPT);
         Ok(IrqReturn::Handled)
     }

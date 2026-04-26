@@ -70,12 +70,28 @@ impl AcpiManager {
         }
 
         let acpi_args = boot_params().read().acpi;
-        if let BootloaderAcpiArg::NotProvided = acpi_args {
-            error!("acpi_init(): ACPI not provided by bootloader");
-            return Err(SystemError::ENODEV);
+        match acpi_args {
+            BootloaderAcpiArg::NotProvided => {
+                // Fallback: search BIOS areas (EBDA + ROM) for RSDP.
+                // acpi_os_get_root_pointer() -> acpi_find_root_pointer().
+                let res = unsafe { acpi::AcpiTables::search_for_rsdp_bios(AcpiHandlerImpl) };
+                match res {
+                    Ok(acpi_table) => {
+                        Self::set_acpi_table(acpi_table);
+                    }
+                    Err(e) => {
+                        error!(
+                            "acpi_init(): ACPI not provided by bootloader and BIOS search failed: {:?}",
+                            e
+                        );
+                        return Err(SystemError::ENODEV);
+                    }
+                }
+            }
+            _ => {
+                self.map_tables(acpi_args)?;
+            }
         }
-
-        self.map_tables(acpi_args)?;
         self.bus_init()?;
         info!("Acpi Manager initialized.");
         return Ok(());

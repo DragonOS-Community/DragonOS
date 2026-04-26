@@ -10,7 +10,10 @@ pub mod load_balance;
 pub mod loadavg;
 pub mod pelt;
 pub mod prio;
+pub mod rebalance;
+pub mod sched_domain;
 pub mod syscall;
+pub mod topology;
 
 use core::{
     intrinsics::{likely, unlikely},
@@ -24,12 +27,14 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use log::warn;
 use system_error::SystemError;
 
 use crate::{
     arch::{cpu::current_cpu_id, interrupt::ipi::send_ipi, CurrentIrqArch},
     exception::{
         ipi::{IpiKind, IpiTarget},
+        workqueue::schedule_work,
         InterruptArch,
     },
     libs::{
@@ -52,12 +57,14 @@ use self::{
     fair::{CfsRunQueue, CompletelyFairScheduler, FairSchedEntity},
     fifo::FifoScheduler,
     prio::PrioUtil,
+    sched_domain::SchedDomain,
 };
 
 static mut CPU_IRQ_TIME: Option<Vec<&'static mut IrqTime>> = None;
 
 // 这里虽然rq是percpu的，但是在负载均衡的时候需要修改对端cpu的rq，所以仍需加锁
 static CPU_RUNQUEUE: Lazy<PerCpuVar<Arc<CpuRunQueue>>> = PerCpuVar::define_lazy();
+static CPU_WAKEQUEUE: Lazy<PerCpuVar<Arc<WakeQueue>>> = PerCpuVar::define_lazy();
 
 pub const SCHED_FIXEDPOINT_SHIFT: u64 = 10;
 #[allow(dead_code)]
@@ -77,6 +84,17 @@ pub fn cpu_rq(cpu: usize) -> Arc<CpuRunQueue> {
     CPU_RUNQUEUE.ensure();
     unsafe {
         CPU_RUNQUEUE
+            .get()
+            .force_get(ProcessorId::new(cpu as u32))
+            .clone()
+    }
+}
+
+#[inline]
+pub fn cpu_wakequeue(cpu: usize) -> Arc<WakeQueue> {
+    CPU_WAKEQUEUE.ensure();
+    unsafe {
+        CPU_WAKEQUEUE
             .get()
             .force_get(ProcessorId::new(cpu as u32))
             .clone()
@@ -302,10 +320,13 @@ pub struct CpuRunQueue {
     /// 过载
     overload: bool,
 
-    next_balance: u64,
+    /// 下一次负载均衡时间（jiffies）。
+    /// 对齐 Linux 6.6 `rq->next_balance`，使用 AtomicU64 以便在
+    /// trigger_load_balance（rq 锁内）和 rebalance_domains（无 rq 锁）中无锁写入。
+    pub(crate) next_balance: core::sync::atomic::AtomicU64,
 
     /// 运行任务数
-    nr_running: usize,
+    nr_running: AtomicUsize,
 
     /// 被阻塞的任务数量
     nr_uninterruptible: usize,
@@ -335,6 +356,9 @@ pub struct CpuRunQueue {
     current: Weak<ProcessControlBlock>,
 
     idle: Weak<ProcessControlBlock>,
+
+    /// 该 CPU 的 sched_domain 层级（单层模型下只有一个）
+    sched_domain: Option<Arc<SchedDomain>>,
 }
 
 impl CpuRunQueue {
@@ -347,8 +371,8 @@ impl CpuRunQueue {
             prev_irq_time: 0,
             clock_updata_flags: ClockUpdataFlag::empty(),
             overload: false,
-            next_balance: 0,
-            nr_running: 0,
+            next_balance: core::sync::atomic::AtomicU64::new(clock().saturating_add(1)),
+            nr_running: AtomicUsize::new(0),
             nr_uninterruptible: 0,
             nr_iowait: AtomicUsize::new(0),
             calc_load_update: clock() + (5 * HZ + 1),
@@ -362,6 +386,7 @@ impl CpuRunQueue {
             sched_info: SchedInfo::default(),
             current: Weak::new(),
             idle: Weak::new(),
+            sched_domain: None,
         }
     }
 
@@ -392,8 +417,21 @@ impl CpuRunQueue {
         (self.force_mut_locked(), guard)
     }
 
+    /// 尝试获取锁，失败时立即返回 `None` 而不是自旋。
+    /// 用于需要避免死锁的并发路径（如负载均衡获取第二把锁）。
+    #[track_caller]
+    pub fn try_self_lock(&self) -> Option<(&mut Self, SpinLockGuard<'_, ()>)> {
+        match self.lock.try_lock_irqsave() {
+            Ok(guard) => Some((self.force_mut_locked(), guard)),
+            Err(_) => None,
+        }
+    }
+
+    /// # Safety
+    /// 调用者必须保证不存在对该 `CpuRunQueue` 的其他并发引用。
+    /// 实践中这意味着调用者必须持有该 runqueue 的锁。
     #[allow(clippy::mut_from_ref)]
-    fn force_mut(&self) -> &mut Self {
+    unsafe fn force_mut(&self) -> &mut Self {
         unsafe { (self as *const Self as *mut Self).as_mut().unwrap() }
     }
 
@@ -404,13 +442,13 @@ impl CpuRunQueue {
             self.lock.is_locked(),
             "rq must be locked before mutable access"
         );
-        self.force_mut()
+        unsafe { self.force_mut() }
     }
 
     /// 获取运行队列的任务数（不加锁），用于负载均衡决策
     #[inline]
     pub fn nr_running_lockless(&self) -> usize {
-        self.nr_running
+        self.nr_running.load(Ordering::Acquire)
     }
 
     pub fn enqueue_task(&mut self, pcb: Arc<ProcessControlBlock>, flags: EnqueueFlag) {
@@ -466,26 +504,32 @@ impl CpuRunQueue {
 
     /// 启用一个任务，将加入队列
     pub fn activate_task(&mut self, pcb: &Arc<ProcessControlBlock>, mut flags: EnqueueFlag) {
-        // 如果进程之前因 IO 等待而睡眠，现在被唤醒，减少 nr_iowait 计数
         if pcb.flags().contains(ProcessFlags::IN_IOWAIT) {
-            self.nr_iowait.fetch_sub(1, Ordering::Relaxed);
+            let prev = self.nr_iowait.load(Ordering::Relaxed);
+            if prev > 0 {
+                self.nr_iowait.store(prev - 1, Ordering::Relaxed);
+            } else {
+                warn!(
+                    "nr_iowait underflow in activate_task for pcb {:?}",
+                    pcb.pid()
+                );
+            }
         }
 
-        if *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Migrating {
+        let mut on_rq_guard = pcb.sched_info().on_rq.lock_irqsave();
+        if *on_rq_guard == OnRq::Queued {
+            return;
+        }
+        if *on_rq_guard == OnRq::Migrating {
             flags |= EnqueueFlag::ENQUEUE_MIGRATED;
-        }
-
-        if flags.contains(EnqueueFlag::ENQUEUE_MIGRATED) {
-            // 任务被迁移到新的CPU，需要更新其CFS队列引用
-            // 在入队之前更新，确保 h_nr_running 计数器在正确的队列上增加
-            let se = pcb.sched_info().sched_entity();
-            se.force_mut().set_cfs(Arc::downgrade(&self.cfs));
         }
 
         self.enqueue_task(pcb.clone(), flags);
 
-        *pcb.sched_info().on_rq.lock_irqsave() = OnRq::Queued;
-        pcb.sched_info().set_on_cpu(Some(self.cpu));
+        *on_rq_guard = OnRq::Queued;
+        if !flags.contains(EnqueueFlag::ENQUEUE_MIGRATED) {
+            pcb.sched_info().set_on_cpu(Some(self.cpu));
+        }
     }
 
     /// 检查对应的task是否可以抢占当前运行的task
@@ -583,8 +627,28 @@ impl CpuRunQueue {
     }
 
     #[inline]
+    pub fn cpu(&self) -> ProcessorId {
+        self.cpu
+    }
+
+    #[inline]
     pub fn cfs_rq(&self) -> Arc<CfsRunQueue> {
         self.cfs.clone()
+    }
+
+    #[inline]
+    pub fn sched_domain(&self) -> Option<Arc<SchedDomain>> {
+        self.sched_domain.clone()
+    }
+
+    #[inline]
+    pub fn set_sched_domain(&mut self, sd: Option<Arc<SchedDomain>>) {
+        self.sched_domain = sd;
+    }
+
+    #[inline]
+    pub fn cfs_load_avg_lockless(&self) -> usize {
+        self.cfs.load_avg_lockless()
     }
 
     /// 获取因 IO 阻塞而睡眠的任务数量
@@ -658,19 +722,20 @@ impl CpuRunQueue {
     }
 
     pub fn add_nr_running(&mut self, nr_running: usize) {
-        let prev = self.nr_running;
-
-        self.nr_running = prev + nr_running;
+        let prev = self.nr_running.load(Ordering::Relaxed);
+        self.nr_running.store(prev + nr_running, Ordering::Release);
         loadavg::inc_nr_running(nr_running);
-        if prev < 2 && self.nr_running >= 2 && !self.overload {
+        if prev < 2 && prev + nr_running >= 2 && !self.overload {
             self.overload = true;
         }
     }
 
     pub fn sub_nr_running(&mut self, count: usize) {
-        self.nr_running -= count;
+        let prev = self.nr_running.load(Ordering::Relaxed);
+        let new = prev.saturating_sub(count);
+        self.nr_running.store(new, Ordering::Release);
         loadavg::dec_nr_running(count);
-        if self.nr_running < 2 && self.overload {
+        if new < 2 && self.overload {
             self.overload = false;
         }
     }
@@ -684,9 +749,8 @@ impl CpuRunQueue {
 
     /// 在运行idle？
     pub fn sched_idle_rq(&self) -> bool {
-        return unlikely(
-            self.nr_running == self.cfs.idle_h_nr_running as usize && self.nr_running > 0,
-        );
+        let nr_running = self.nr_running.load(Ordering::Relaxed);
+        return unlikely(nr_running == self.cfs.idle_h_nr_running as usize && nr_running > 0);
     }
 
     #[inline]
@@ -767,6 +831,54 @@ impl CpuRunQueue {
 
         next
     }
+}
+
+/// 远程唤醒队列（per-CPU）。
+/// 当任务在 CPU A 被唤醒但目标 CPU 是 B 时，任务被放入 B 的 WakeQueue，
+/// 由 B 在 IPI 处理中自行出队并 activate，避免跨 CPU 直接操作远端 rq。
+#[derive(Debug)]
+pub struct WakeQueue {
+    list: SpinLock<LinkedList<Arc<ProcessControlBlock>>>,
+}
+
+impl WakeQueue {
+    pub fn new() -> Self {
+        Self {
+            list: SpinLock::new(LinkedList::new()),
+        }
+    }
+
+    pub fn push(&self, pcb: Arc<ProcessControlBlock>) {
+        self.list.lock_irqsave().push_back(pcb);
+    }
+
+    pub fn drain(&self) -> LinkedList<Arc<ProcessControlBlock>> {
+        core::mem::take(&mut *self.list.lock_irqsave())
+    }
+}
+
+/// 远程唤醒入队。
+/// 将任务放入目标 CPU 的 WakeQueue 并发送 IPI，由目标 CPU 本地处理 activate。
+pub fn ttwu_queue(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId, wake_flags: WakeupFlags) {
+    let cpu_manager = crate::smp::cpu::smp_cpu_manager();
+    if !cpu_manager.present_cpus().get(cpu).unwrap_or(false) {
+        log::warn!(
+            "ttwu_queue: target CPU {:?} not present, fallback to local",
+            cpu
+        );
+        let local = smp_get_processor_id();
+        let rq = cpu_rq(local.data() as usize);
+        let (rq, _guard) = rq.self_lock();
+        rq.activate_task(
+            pcb,
+            EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK,
+        );
+        rq.check_preempt_currnet(pcb, wake_flags);
+        return;
+    }
+    let wq = cpu_wakequeue(cpu.data() as usize);
+    wq.push(pcb.clone());
+    send_resched_ipi(cpu);
 }
 
 bitflags! {
@@ -896,12 +1008,47 @@ pub fn scheduler_tick() {
 
     rq.calculate_global_load_tick();
 
+    let work = trigger_load_balance(rq);
     drop(guard);
 
-    //todo 检查并执行负载均衡（只检测不均衡，migrate_tasks 内部是空的）
-    if load_balance::LoadBalancer::should_balance() {
-        load_balance::LoadBalancer::run_load_balance();
+    if let Some(work) = work {
+        schedule_work(work);
     }
+}
+
+/// 触发负载均衡的异步执行
+///
+/// 对齐 Linux 6.6 `trigger_load_balance()` (fair.c:12219) 语义：
+/// 1. 检查 `on_null_domain`（domain 未初始化时跳过）
+/// 2. 检查 `jiffies >= rq->next_balance`
+/// 3. 若满足则 raise_softirq（DragonOS 用 schedule_work 替代）
+///
+/// 与 Linux 的差异：Linux 先 `rq_unlock` 再调用 trigger_load_balance；
+/// DragonOS 在 rq 锁内调用，但 trigger 内部只做原子读取和 Work 创建，
+/// 不会嵌套加锁。
+fn trigger_load_balance(
+    rq: &CpuRunQueue,
+) -> Option<alloc::sync::Arc<crate::exception::workqueue::Work>> {
+    rq.sched_domain()?;
+
+    let jiffies = clock();
+    if jiffies < rq.next_balance.load(core::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+
+    if !load_balance::LoadBalancer::should_balance(rq) {
+        return None;
+    }
+
+    let cpu = rq.cpu();
+    Some(crate::exception::workqueue::Work::new(move || {
+        let idle_type = if cpu_rq(cpu.data() as usize).nr_running_lockless() == 0 {
+            rebalance::CpuIdleType::Idle
+        } else {
+            rebalance::CpuIdleType::NotIdle
+        };
+        rebalance::rebalance_domains(cpu, idle_type);
+    }))
 }
 
 /// ## 执行调度
@@ -1069,16 +1216,18 @@ pub fn sched_fork(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         *policy.write_irqsave() = SchedPolicy::CFS;
     }
 
-    pcb.sched_info()
-        .sched_entity()
-        .force_mut()
-        .init_entity_runnable_average();
+    unsafe { pcb.sched_info().sched_entity().force_mut() }.init_entity_runnable_average();
 
     Ok(())
 }
 
 pub fn sched_cgroup_fork(pcb: &Arc<ProcessControlBlock>) {
-    __set_task_cpu(pcb, smp_get_processor_id());
+    let target_cpu = crate::sched::load_balance::LoadBalancer::select_task_rq(
+        pcb,
+        smp_get_processor_id(),
+        WakeupFlags::WF_FORK.bits(),
+    );
+    __set_task_cpu(pcb, target_cpu);
     match pcb.sched_info().policy() {
         SchedPolicy::RT => todo!(),
         SchedPolicy::FIFO => FifoScheduler::task_fork(pcb.clone()),
@@ -1087,11 +1236,18 @@ pub fn sched_cgroup_fork(pcb: &Arc<ProcessControlBlock>) {
     }
 }
 
-fn __set_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {
+pub(crate) fn __set_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {
+    pcb.sched_info().set_on_cpu(Some(cpu));
     // TODO: Fixme There is not implement group sched;
-    let se = pcb.sched_info().sched_entity();
-    let rq = cpu_rq(cpu.data() as usize);
-    se.force_mut().set_cfs(Arc::downgrade(&rq.cfs));
+    if pcb.sched_info().policy() == SchedPolicy::CFS {
+        let se = pcb.sched_info().sched_entity();
+        let rq = cpu_rq(cpu.data() as usize);
+        // SAFETY: __set_task_cpu must only be called when the caller guarantees
+        // that no other CPU is concurrently reading `se.cfs_rq`.
+        // In the wakeup/migration paths this is true because the task is either
+        // still private to the waker or has been dequeued from the source rq.
+        unsafe { se.force_mut().set_cfs(Arc::downgrade(&rq.cfs)) };
+    }
 }
 
 #[inline(never)]
@@ -1112,6 +1268,12 @@ pub fn sched_init() {
         }
 
         CPU_RUNQUEUE.init(PerCpuVar::new(cpu_runqueue).unwrap());
+
+        let mut cpu_wakequeue = Vec::with_capacity(PerCpu::MAX_CPU_NUM as usize);
+        for _cpu in 0..PerCpu::MAX_CPU_NUM as usize {
+            cpu_wakequeue.push(Arc::new(WakeQueue::new()));
+        }
+        CPU_WAKEQUEUE.init(PerCpuVar::new(cpu_wakequeue).unwrap());
     };
 
     // 初始化 per-CPU CPU 时间统计
@@ -1163,16 +1325,16 @@ mod tests {
 
         rq.add_nr_running(2);
         assert!(rq.overload);
-        assert_eq!(rq.nr_running, 2);
+        assert_eq!(rq.nr_running.load(Ordering::Relaxed), 2);
 
         rq.sub_nr_running(1);
         assert!(!rq.overload);
-        assert_eq!(rq.nr_running, 1);
+        assert_eq!(rq.nr_running.load(Ordering::Relaxed), 1);
 
         assert_eq!(loadavg::nr_running(), global_before + 1);
 
         rq.sub_nr_running(1);
-        assert_eq!(rq.nr_running, 0);
+        assert_eq!(rq.nr_running.load(Ordering::Relaxed), 0);
         assert_eq!(loadavg::nr_running(), global_before);
     }
 }

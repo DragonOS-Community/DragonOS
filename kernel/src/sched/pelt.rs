@@ -1,4 +1,5 @@
 use core::intrinsics::unlikely;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use alloc::sync::Arc;
 
@@ -33,7 +34,7 @@ pub struct SchedulerAvg {
     /// 记录周期性任务的贡献值，用于计算平均CPU利用率
     pub period_contrib: u32,
 
-    pub load_avg: usize,
+    pub load_avg: AtomicUsize,
     pub runnable_avg: usize,
     pub util_avg: usize,
 }
@@ -107,7 +108,7 @@ impl SchedulerAvg {
             self.load_sum += (contrib * load) as u64;
         }
         if runnable > 0 {
-            self.runnable_sum += (runnable & contrib << SCHED_CAPACITY_SHIFT) as u64;
+            self.runnable_sum += ((runnable as u64) * (contrib as u64)) << SCHED_CAPACITY_SHIFT;
         }
 
         if running > 0 {
@@ -118,7 +119,7 @@ impl SchedulerAvg {
     }
 
     fn decay_load(mut val: u64, n: u64) -> u64 {
-        if unlikely(n > LOAD_AVG_PERIOD) {
+        if unlikely(n > LOAD_AVG_PERIOD * 63) {
             return 0;
         }
 
@@ -158,7 +159,8 @@ impl SchedulerAvg {
     pub fn update_load_avg(&mut self, load: u64) {
         let divider = self.get_pelt_divider();
 
-        self.load_avg = (load * self.load_sum) as usize / divider;
+        self.load_avg
+            .store((load * self.load_sum) as usize / divider, Ordering::Relaxed);
         self.runnable_avg = self.runnable_sum as usize / divider;
         self.util_avg = self.util_sum as usize / divider;
     }
@@ -167,7 +169,7 @@ impl SchedulerAvg {
     pub fn post_init_entity_util_avg(pcb: &Arc<ProcessControlBlock>) {
         let se = pcb.sched_info().sched_entity();
         let cfs_rq = se.cfs_rq();
-        let sa = &mut se.force_mut().avg;
+        let sa = &mut unsafe { se.force_mut() }.avg;
 
         // TODO: 这里和架构相关
         let cpu_scale = SCHED_CAPACITY_SCALE;
@@ -181,7 +183,7 @@ impl SchedulerAvg {
         if cap > 0 {
             if cfs_rq.avg.util_avg != 0 {
                 sa.util_avg = cfs_rq.avg.util_avg * se.load.weight as usize;
-                sa.util_avg /= cfs_rq.avg.load_avg + 1;
+                sa.util_avg /= cfs_rq.avg.load_avg.load(Ordering::Relaxed) + 1;
 
                 if sa.util_avg as isize > cap {
                     sa.util_avg = cap as usize;
@@ -208,7 +210,6 @@ impl CfsRunQueue {
         }
 
         let rq = self.rq();
-        let rq = rq.force_mut_locked();
 
         return rq.rq_clock_pelt() - self.throttled_clock_pelt_time;
     }

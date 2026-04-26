@@ -21,7 +21,6 @@ use crate::{
     mm::VirtAddr,
     process::ProcessFlags,
     sched::{sched_cgroup_fork, sched_fork},
-    smp::core::smp_get_processor_id,
     syscall::user_access::UserBufferWriter,
 };
 
@@ -224,7 +223,7 @@ impl ProcessManager {
         //     );
         // }
 
-        pcb.sched_info().set_on_cpu(Some(smp_get_processor_id()));
+        // 这里不应再覆盖 on_cpu，否则会导致 on_cpu 和 cfs_rq 不一致。
 
         ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {
             panic!(

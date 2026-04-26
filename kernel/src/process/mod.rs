@@ -937,10 +937,18 @@ impl ProcessManager {
 
         if let Some(cpu_id) = cpu_id {
             let current_cpu_id = smp_get_processor_id();
+            // DragonOS 目前没有 Linux `kick_process()` 那样的 lockless rq.current 约定，
+            // 远端 rq.current 必须在持目标 rq 锁时读取。
+            let should_kick = if cpu_id != current_cpu_id {
+                let rq = cpu_rq(cpu_id.data() as usize);
+                let (rq, _guard) = rq.self_lock();
+                Arc::ptr_eq(&rq.current(), pcb)
+            } else {
+                false
+            };
+
             // Do not kick the current CPU, as it is already running and cannot preempt itself.
-            if pcb.raw_pid() == cpu_rq(cpu_id.data() as usize).current().raw_pid()
-                && cpu_id != current_cpu_id
-            {
+            if should_kick {
                 kick_cpu(cpu_id).expect("ProcessManager::kick(): Failed to kick cpu");
             }
         }

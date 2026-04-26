@@ -74,6 +74,12 @@ impl CpuHpCpuState {
     pub const fn thread(&self) -> &Option<Arc<ProcessControlBlock>> {
         &self.thread
     }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub const fn state(&self) -> CpuHpState {
+        self.state
+    }
 }
 
 pub struct SmpCpuManager {

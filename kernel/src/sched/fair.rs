@@ -1416,6 +1416,10 @@ impl Scheduler for CompletelyFairScheduler {
         mut flags: EnqueueFlag,
     ) {
         let mut se = pcb.sched_info().sched_entity();
+        debug_assert!(
+            Arc::ptr_eq(&se.cfs_rq(), &rq.cfs_rq()),
+            "enqueue: SE's cfs_rq must match target rq's cfs_rq"
+        );
         let mut idle_h_nr_running = pcb.sched_info().policy() == SchedPolicy::IDLE;
         let (should_continue, se) = FairSchedEntity::for_each_in_group(&mut se, |se| {
             if se.on_rq() {

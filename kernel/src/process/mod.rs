@@ -305,6 +305,11 @@ impl ProcessManager {
                 let rq = cpu_rq(target_cpu.data() as usize);
 
                 let (rq, _guard) = rq.self_lock();
+                debug_assert_eq!(
+                    pcb.sched_info().on_cpu(),
+                    Some(rq.cpu()),
+                    "wakeup: on_cpu mismatch with rq.cpu"
+                );
                 if update_clock {
                     rq.update_rq_clock();
                 }
@@ -418,6 +423,11 @@ impl ProcessManager {
                 let rq = cpu_rq(target_cpu.data() as usize);
 
                 let (rq, _guard) = rq.self_lock();
+                debug_assert_eq!(
+                    pcb.sched_info().on_cpu(),
+                    Some(rq.cpu()),
+                    "wakeup_stop: on_cpu mismatch with rq.cpu"
+                );
                 if update_clock {
                     rq.update_rq_clock();
                 }

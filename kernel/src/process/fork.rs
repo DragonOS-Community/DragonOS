@@ -20,10 +20,10 @@ use crate::{
     libs::{cpumask::CpuMask, rwsem::RwSem},
     mm::VirtAddr,
     process::ProcessFlags,
-    sched::{sched_cgroup_fork, sched_fork, sched_set_new_task_cpu},
+    sched::{cpu_is_online, sched_cgroup_fork, sched_fork, sched_set_new_task_cpu},
     smp::{
         core::smp_get_processor_id,
-        cpu::{smp_cpu_manager, smp_cpu_manager_initialized, ProcessorId},
+        cpu::{smp_cpu_manager_initialized, ProcessorId},
     },
     syscall::user_access::UserBufferWriter,
 };
@@ -165,7 +165,7 @@ impl KernelCloneArgs {
 
     #[inline]
     fn target_cpu_is_online(cpu: ProcessorId) -> bool {
-        !smp_cpu_manager_initialized() || smp_cpu_manager().is_online_cpu(cpu)
+        !smp_cpu_manager_initialized() || cpu_is_online(cpu)
     }
 
     #[inline]

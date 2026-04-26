@@ -31,6 +31,7 @@ use crate::{
         ipi::{IpiKind, IpiTarget},
         InterruptArch,
     },
+    init::initial_kthread::{get_system_state, SystemState},
     libs::{
         cpumask::{AtomicCpuMask, CpuMask},
         lazy_init::Lazy,
@@ -97,6 +98,19 @@ fn rq_is_idle_cpu(rq: &CpuRunQueue) -> bool {
     task_is_idle(&rq.current()) && rq.nr_running == 0
 }
 
+#[inline]
+pub fn cpu_is_online(cpu: ProcessorId) -> bool {
+    smp_cpu_manager().is_online_cpu(cpu)
+}
+
+#[inline]
+fn boot_in_progress() -> bool {
+    matches!(
+        get_system_state(),
+        SystemState::Booting | SystemState::Scheduling | SystemState::FreeingInitMem
+    )
+}
+
 pub fn pick_idle_cpu(allowed: &CpuMask) -> Option<ProcessorId> {
     if !smp_cpu_manager_initialized() {
         return IDLE_CPUS.first_and(allowed);
@@ -104,7 +118,7 @@ pub fn pick_idle_cpu(allowed: &CpuMask) -> Option<ProcessorId> {
 
     allowed
         .iter_cpu()
-        .find(|&cpu| IDLE_CPUS.get(cpu) && smp_cpu_manager().is_online_cpu(cpu))
+        .find(|&cpu| IDLE_CPUS.get(cpu) && cpu_is_online(cpu))
 }
 
 lazy_static! {
@@ -512,6 +526,10 @@ impl CpuRunQueue {
         if was_idle_cpu && !rq_is_idle_cpu(self) {
             IDLE_CPUS.clear(self.cpu);
         }
+
+        debug_assert_eq!(*pcb.sched_info().on_rq.lock_irqsave(), OnRq::Queued);
+        debug_assert_eq!(pcb.sched_info().on_cpu(), Some(self.cpu));
+        pcb.debug_assert_fork_cpu_binding();
     }
 
     /// 检查对应的task是否可以抢占当前运行的task
@@ -770,6 +788,8 @@ impl CpuRunQueue {
 
     /// 选择下一个task
     pub fn pick_next_task(&mut self, prev: Arc<ProcessControlBlock>) -> Arc<ProcessControlBlock> {
+        debug_assert_eq!(prev.sched_info().on_cpu(), Some(self.cpu));
+
         let mut next: Option<Arc<ProcessControlBlock>> = None;
 
         if self.fifo.nr_running() > 0 {
@@ -1134,6 +1154,12 @@ pub fn sched_set_new_task_cpu(pcb: &Arc<ProcessControlBlock>, target_cpu: Proces
 }
 
 fn __set_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {
+    debug_assert!(
+        cpu_is_online(cpu) || boot_in_progress(),
+        "__set_task_cpu target cpu {:?} must be online outside boot",
+        cpu
+    );
+
     // TODO: Fixme There is not implement group sched;
     let se = pcb.sched_info().sched_entity();
     let rq = cpu_rq(cpu.data() as usize);

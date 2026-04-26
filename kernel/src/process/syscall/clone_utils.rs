@@ -7,7 +7,7 @@ use crate::arch::MMArch;
 use crate::mm::{MemoryManagementArch, VirtAddr};
 use crate::process::fork::{CloneFlags, KernelCloneArgs, MAX_PID_NS_LEVEL};
 use crate::process::{KernelStack, ProcessControlBlock, ProcessManager};
-use crate::sched::completion::Completion;
+use crate::sched::{completion::Completion, sched_set_new_task_cpu};
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
 use alloc::{string::ToString, sync::Arc};
 use system_error::SystemError;
@@ -75,7 +75,7 @@ pub fn do_clone(
 
     let pcb = ProcessControlBlock::new(name, new_kstack);
     // 克隆pcb
-    ProcessManager::copy_process(&current_pcb, &pcb, clone_args, frame)?;
+    let target_cpu = ProcessManager::copy_process(&current_pcb, &pcb, clone_args, frame)?;
 
     // 新的 ProcFS 是动态的，进程目录会在访问时按需创建
     // 不再需要显式注册进程
@@ -90,6 +90,8 @@ pub fn do_clone(
             UserBufferWriter::new(addr.as_ptr::<i32>(), core::mem::size_of::<i32>(), true)?;
         writer.copy_one_to_user(&(pcb.raw_pid().data() as i32), 0)?;
     }
+
+    sched_set_new_task_cpu(&pcb, target_cpu);
 
     ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {
         panic!(

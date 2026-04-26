@@ -349,16 +349,16 @@ impl ProcessManager {
                 let prev_cpu = pcb.sched_info().on_cpu().unwrap_or(current_cpu_id());
                 Self::ttwu_do_activate(pcb, prev_cpu, WakeupFlags::WF_TTWU, was_uninterruptible);
                 return Ok(());
-            }
-            if state.is_exited() {
+            } else if state.is_exited() {
                 return Err(SystemError::EINVAL);
+            } else {
+                return Ok(());
             }
+        } else if state.is_exited() {
+            return Err(SystemError::EINVAL);
+        } else {
             return Ok(());
         }
-        if state.is_exited() {
-            return Err(SystemError::EINVAL);
-        }
-        Ok(())
     }
 
     #[allow(dead_code)]
@@ -441,16 +441,16 @@ impl ProcessManager {
                 let prev_cpu = pcb.sched_info().on_cpu().unwrap_or(smp_get_processor_id());
                 Self::ttwu_do_activate(pcb, prev_cpu, WakeupFlags::WF_TTWU, false);
                 return Ok(());
-            }
-            if state.is_runnable() {
+            } else if state.is_runnable() {
                 return Ok(());
+            } else {
+                return Err(SystemError::EINVAL);
             }
+        } else if state.is_runnable() {
+            return Ok(());
+        } else {
             return Err(SystemError::EINVAL);
         }
-        if state.is_runnable() {
-            return Ok(());
-        }
-        Err(SystemError::EINVAL)
     }
 
     /// 异步将目标进程置为停止状态（用于 SIGSTOP/SIGTSTP 等作业控制停止）
@@ -2630,6 +2630,23 @@ impl ProcessSchedulerInfo {
         if last != wakee_pid {
             self.last_wakee.store(wakee_pid, Ordering::Release);
             self.wakee_flips.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
+impl ProcessControlBlock {
+    #[inline]
+    pub(crate) fn debug_assert_fork_cpu_binding(&self) {
+        if cfg!(debug_assertions) {
+            let Some(on_cpu) = self.sched_info().on_cpu() else {
+                return;
+            };
+
+            debug_assert_eq!(
+                self.sched_info().sched_entity().cfs_rq().rq().cpu(),
+                on_cpu,
+                "fork target cpu and SE bound rq must stay consistent"
+            );
         }
     }
 }

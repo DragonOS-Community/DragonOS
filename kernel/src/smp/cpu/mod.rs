@@ -91,6 +91,12 @@ impl CpuHpCpuState {
     pub const fn thread(&self) -> &Option<Arc<ProcessControlBlock>> {
         &self.thread
     }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub const fn state(&self) -> CpuHpState {
+        self.state
+    }
 }
 
 pub struct SmpCpuManager {
@@ -208,11 +214,20 @@ impl SmpCpuManager {
     }
 
     pub fn set_online_cpu(&self, cpu_id: ProcessorId, is_online: bool) {
-        if is_online {
-            unsafe { self.set_cpuhp_state(cpu_id, CpuHpState::Online) };
+        let target_state = if is_online {
+            CpuHpState::Online
         } else {
-            unsafe { self.set_cpuhp_state(cpu_id, CpuHpState::Offline) };
-        }
+            CpuHpState::Offline
+        };
+
+        unsafe { self.set_cpuhp_state(cpu_id, target_state) };
+        self.cpuhp_state_mut(cpu_id).state = target_state;
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub fn is_online_cpu(&self, cpu_id: ProcessorId) -> bool {
+        self.cpuhp_state(cpu_id).state == CpuHpState::Online
     }
 
     /// 获取出现在系统中的CPU
@@ -325,6 +340,7 @@ impl SmpCpuManager {
         let cpu_id = smp_get_processor_id();
         let cpu_state = self.cpuhp_state_mut(cpu_id);
         if bringup {
+            cpu_state.state = cpu_state.target_state;
             cpu_state.comp_done_up.complete();
         } else {
             todo!("complete_ap_thread")
@@ -354,6 +370,7 @@ pub fn smp_cpu_manager_init(boot_cpu: ProcessorId) {
 
     unsafe { smp_cpu_manager().set_possible_cpu(boot_cpu, true) };
     unsafe { smp_cpu_manager().set_present_cpu(boot_cpu, true) };
+    smp_cpu_manager().set_online_cpu(boot_cpu, true);
 
     SmpCpuManager::arch_init(boot_cpu);
 }

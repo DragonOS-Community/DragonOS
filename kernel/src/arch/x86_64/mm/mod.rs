@@ -311,7 +311,7 @@ impl MemoryManagementArch for X86_64MMArch {
 
     #[inline(always)]
     fn make_entry(paddr: PhysAddr, page_flags: usize) -> usize {
-        return paddr.data() | page_flags;
+        return (paddr.data() & Self::PAGE_ADDRESS_MASK) | page_flags;
     }
 
     fn vma_access_permitted(
@@ -331,8 +331,7 @@ impl MemoryManagementArch for X86_64MMArch {
 
     const PROTECTION_MAP: [EntryFlags<MMArch>; 16] = protection_map();
 
-    const PAGE_NONE: usize =
-        Self::ENTRY_FLAG_PRESENT | Self::ENTRY_FLAG_ACCESSED | Self::ENTRY_FLAG_GLOBAL;
+    const PAGE_NONE: usize = Self::ENTRY_FLAG_PRESENT | Self::ENTRY_FLAG_ACCESSED;
 
     const PAGE_SHARED: usize = Self::ENTRY_FLAG_PRESENT
         | Self::ENTRY_FLAG_READWRITE

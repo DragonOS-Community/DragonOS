@@ -1506,7 +1506,14 @@ impl CompletelyFairScheduler {
         });
     }
 
-    /// 寻找到最近公共组长
+    /// 寻找到最近公共组长（对齐 Linux 6.6 `find_matching_se` fair.c:8151）。
+    ///
+    /// 在没有组调度（cgroup）的情况下，所有叶 sched_entity 的 depth 都为 0，
+    /// 且其 cfs_rq 应指向同一个 rq 的 cfs_rq。若 cfs_rq 不匹配，说明
+    /// task 的 cfs_rq 指针被错误设置到另一个 CPU 的 rq 上，属于不变量违反。
+    ///
+    /// 这里不 panic，而是 log 警告后直接返回，避免内核崩溃。
+    /// 根本修复应确保 `__set_task_cpu` 在所有迁移/唤醒路径中被正确调用。
     fn find_matching_se(se: &mut Arc<FairSchedEntity>, pse: &mut Arc<FairSchedEntity>) {
         let mut se_depth = se.depth;
         let mut pse_depth = pse.depth;
@@ -1522,8 +1529,29 @@ impl CompletelyFairScheduler {
         }
 
         while !Arc::ptr_eq(&se.cfs_rq(), &pse.cfs_rq()) {
-            *se = se.parent().unwrap();
-            *pse = pse.parent().unwrap();
+            // 无组调度时 parent() 为 None，cfs_rq 不匹配属于不变量违反。
+            // 对齐 Linux：Linux 同样假设 cfs_rq 最终匹配（无 guard），
+            // 但 Linux 必然有组调度才会进入此循环。DragonOS 暂未实现组调度，
+            // 因此安全返回。
+            let se_parent = se.parent();
+            let pse_parent = pse.parent();
+            match (se_parent, pse_parent) {
+                (Some(sp), Some(pp)) => {
+                    *se = sp;
+                    *pse = pp;
+                }
+                _ => {
+                    // 无组调度 parent 为 None，cfs_rq 不匹配 —
+                    // 不 panic，记录警告后返回，让 wakeup-preempt 正常跳过。
+                    log::warn!(
+                        "find_matching_se: cfs_rq mismatch without group scheduling \
+                         (se_rq_cpu={:?}, pse_rq_cpu={:?}), skipping parent walk",
+                        se.cfs_rq().rq().cpu(),
+                        pse.cfs_rq().rq().cpu(),
+                    );
+                    return;
+                }
+            }
         }
     }
 }

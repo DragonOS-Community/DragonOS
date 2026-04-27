@@ -199,21 +199,26 @@ impl LoadBalancer {
         idlest_cpu
     }
 
-    /// 获取运行队列的 CFS PELT 负载平均值（不加锁）。
-    /// 使用 PELT load_avg 而非 nr_running，更接近 Linux 6.6 的负载估算方式。
+    /// 对齐 Linux find_idlest_group_cpu (fair.c:6933) 的负载估算。
+    /// Linux 优先检查 sched_idle_cpu / available_idle_cpu，再比较 load_avg。
+    /// 当前使用 nr_running 作为主要指标：nr_running == 0 的 CPU 比有任务的 CPU 优先。
+    /// 这避免了 PELT load_avg 在系统刚启动时全为 0 导致无法区分 CPU 的问题。
     #[inline]
     fn get_rq_load_lockless(rq: &Arc<CpuRunQueue>) -> u64 {
-        rq.cfs_load_avg_lockless() as u64
+        rq.nr_running_lockless() as u64
     }
 
-    /// 判断指定 CPU 是否完全空闲（nr_running == 0）。
+    /// Linux idle_cpu() (core.c:7325): rq->curr == rq->idle && !rq->nr_running.
     #[inline]
     fn is_idle_cpu(cpu: ProcessorId) -> bool {
         if cpu == ProcessorId::INVALID {
             return false;
         }
         let rq = cpu_rq(cpu.data() as usize);
-        rq.nr_running_lockless() == 0
+        let curr = rq.current();
+        let idle = rq.idle();
+        let is_idle_task = idle.upgrade().is_some_and(|i| Arc::ptr_eq(&curr, &i));
+        is_idle_task && rq.nr_running_lockless() == 0
     }
 
     /// Linux `select_idle_sibling` 的高度简化实现。
@@ -828,15 +833,12 @@ pub fn load_balance(
             first_rq.update_rq_clock();
         }
 
-        let (mut second_rq, _g2) = match second_rq_arc.try_self_lock() {
-            Some((rq, g)) => {
-                if second_cpu == env.dst_cpu {
-                    rq.update_rq_clock();
-                }
-                (rq, g)
-            }
-            None => break,
-        };
+        // 双锁顺序：低 CPU ID 先锁，防止 ABBA 死锁。
+        // first_cpu < second_cpu 由上面 line 822-826 保证。
+        let (mut second_rq, _g2) = second_rq_arc.self_lock();
+        if second_cpu == env.dst_cpu {
+            second_rq.update_rq_clock();
+        }
 
         let (src_rq, dst_rq) = if busiest_cpu == first_cpu {
             (&mut first_rq, &mut second_rq)
@@ -876,13 +878,16 @@ pub fn load_balance(
 
     if ld_moved > 0 {
         sd.nr_balance_failed.store(0, Ordering::Relaxed);
-        // 对齐 Linux fair.c:11268: 成功迁移后重置 interval
         sd.balance_interval
             .store(sd.min_interval.load(Ordering::Relaxed), Ordering::Relaxed);
     } else {
         if env.idle != super::rebalance::CpuIdleType::NewlyIdle {
             sd.nr_balance_failed.fetch_add(1, Ordering::Relaxed);
         }
+        // 找到 busiest 但未能迁移时 reset to min，而非 ×2。
+        // ×2 仅在未找到 busiest（out_balanced 路径）时适用。
+        sd.balance_interval
+            .store(sd.min_interval.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 
     ld_moved > 0

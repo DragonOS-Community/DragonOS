@@ -34,7 +34,6 @@ use crate::{
     arch::{cpu::current_cpu_id, interrupt::ipi::send_ipi, CurrentIrqArch},
     exception::{
         ipi::{IpiKind, IpiTarget},
-        workqueue::schedule_work,
         InterruptArch,
     },
     init::initial_kthread::{get_system_state, SystemState},
@@ -574,18 +573,12 @@ impl CpuRunQueue {
         self.enqueue_task(pcb.clone(), flags);
 
         *on_rq_guard = OnRq::Queued;
-        if !flags.contains(EnqueueFlag::ENQUEUE_MIGRATED) {
-            pcb.sched_info().set_on_cpu(Some(self.cpu));
-        }
 
         if was_idle_cpu && !rq_is_idle_cpu(self) {
             IDLE_CPUS.clear(self.cpu);
         }
 
         debug_assert_eq!(*pcb.sched_info().on_rq.lock_irqsave(), OnRq::Queued);
-        if !flags.contains(EnqueueFlag::ENQUEUE_MIGRATED) {
-            debug_assert_eq!(pcb.sched_info().on_cpu(), Some(self.cpu));
-        }
         pcb.debug_assert_fork_cpu_binding();
     }
 
@@ -817,6 +810,11 @@ impl CpuRunQueue {
     #[inline]
     pub fn set_current(&mut self, pcb: Weak<ProcessControlBlock>) {
         self.current = pcb;
+    }
+
+    #[inline]
+    pub fn idle(&self) -> Weak<ProcessControlBlock> {
+        self.idle.clone()
     }
 
     #[inline]
@@ -1066,28 +1064,24 @@ pub fn scheduler_tick() {
 
     rq.calculate_global_load_tick();
 
-    let work = trigger_load_balance(rq);
-    drop(guard);
-
-    if let Some(work) = work {
-        schedule_work(work);
+    if let Some((cpu, idle_type)) = trigger_load_balance(rq) {
+        drop(guard);
+        rebalance::rebalance_domains(cpu, idle_type);
+    } else {
+        drop(guard);
     }
 }
 
 /// 触发负载均衡的异步执行
-///
-/// 对齐 Linux 6.6 `trigger_load_balance()` (fair.c:12219) 语义：
+/// `trigger_load_balance()` 语义：
 /// 1. 检查 `on_null_domain`（domain 未初始化时跳过）
 /// 2. 检查 `jiffies >= rq->next_balance`
-/// 3. 若满足则 raise_softirq（DragonOS 用 schedule_work 替代）
+/// 3. 若满足则直接调用 rebalance_domains（在调用者的 tick 上下文中运行）
 ///
-/// 与 Linux 的差异：Linux 先 `rq_unlock` 再调用 trigger_load_balance；
-/// DragonOS 在 rq 锁内调用，但 trigger 内部只做原子读取和 Work 创建，
-/// 不会嵌套加锁。
-fn trigger_load_balance(
-    rq: &CpuRunQueue,
-) -> Option<alloc::sync::Arc<crate::exception::workqueue::Work>> {
-    rq.sched_domain()?;
+/// 与 Linux 的差异：Linux 先 `rq_unlock` 再调用 `raise_softirq`；
+/// DragonOS 在 rq 锁外直接调用 `rebalance_domains`，等效于在 softirq 上下文中运行。
+fn trigger_load_balance(rq: &CpuRunQueue) -> Option<(ProcessorId, rebalance::CpuIdleType)> {
+    let sd = rq.sched_domain()?;
 
     let jiffies = clock();
     if jiffies < rq.next_balance.load(core::sync::atomic::Ordering::Relaxed) {
@@ -1099,14 +1093,12 @@ fn trigger_load_balance(
     }
 
     let cpu = rq.cpu();
-    Some(crate::exception::workqueue::Work::new(move || {
-        let idle_type = if cpu_rq(cpu.data() as usize).nr_running_lockless() == 0 {
-            rebalance::CpuIdleType::Idle
-        } else {
-            rebalance::CpuIdleType::NotIdle
-        };
-        rebalance::rebalance_domains(cpu, idle_type);
-    }))
+    let idle_type = if rq.nr_running_lockless() == 0 {
+        rebalance::CpuIdleType::Idle
+    } else {
+        rebalance::CpuIdleType::NotIdle
+    };
+    Some((cpu, idle_type))
 }
 
 /// ## 执行调度
@@ -1230,6 +1222,10 @@ pub fn __schedule(sched_mod: SchedMode) {
         }
 
         rq.set_current(Arc::downgrade(&next));
+
+        // prepare_task(next): WRITE_ONCE(next->on_cpu, 1) — 在 context_switch 前设置。
+        prev.sched_info().set_on_cpu(None);
+        next.sched_info().set_on_cpu(Some(rq.cpu()));
         // warn!(
         //     "switch_process prev {:?} next {:?} sched_mode {sched_mod:?}",
         //     prev.pid(),
@@ -1286,14 +1282,15 @@ pub fn sched_fork(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
 }
 
 pub fn sched_cgroup_fork(pcb: &Arc<ProcessControlBlock>) {
-    // 仅绑定父 CPU，不做负载均衡。
-    // 负载均衡在 wake_up_new_task 中完成。
+    // 对齐 Linux sched_cgroup_fork(): 在 irq 关闭下绑定父 CPU + task_fork
+    let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     let fork_cpu = smp_get_processor_id();
     __set_task_cpu(pcb, fork_cpu);
-    if pcb.sched_info().policy() == SchedPolicy::CFS {
-        CompletelyFairScheduler::task_fork(pcb.clone());
-    } else if pcb.sched_info().policy() == SchedPolicy::FIFO {
-        FifoScheduler::task_fork(pcb.clone());
+    match pcb.sched_info().policy() {
+        SchedPolicy::CFS => CompletelyFairScheduler::task_fork(pcb.clone()),
+        SchedPolicy::FIFO => FifoScheduler::task_fork(pcb.clone()),
+        // TODO: RT / IDLE task_fork 待实现
+        _ => {}
     }
 
     debug_assert_eq!(
@@ -1304,10 +1301,14 @@ pub fn sched_cgroup_fork(pcb: &Arc<ProcessControlBlock>) {
 }
 
 /// Fork 后的唯一唤醒入口：做一次 select_task_rq(WF_FORK) 负载均衡，然后 activate_task。
+/// 锁序：Linux 先 pi_lock 再 rq->lock；此处 task 尚未加入 pid-hash，pi_lock 无争用，
+/// 因此只用 irqsave + rq->self_lock()。
 pub fn wake_up_new_task(pcb: &Arc<ProcessControlBlock>) {
     let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
-    let prev_cpu = pcb.sched_info().on_cpu().unwrap_or(smp_get_processor_id());
+    let prev_cpu = task_cpu(pcb);
+    // TODO: p->recent_used_cpu = task_cpu(p); 需要在 PCB 中新增该字段，
+    //       以对齐 CFS select_task_rq_fair 的快速路径优化。
 
     // __set_task_cpu(p, select_task_rq(p, task_cpu(p), WF_FORK));
     let target_cpu = crate::sched::load_balance::LoadBalancer::select_task_rq(
@@ -1333,12 +1334,27 @@ pub fn wake_up_new_task(pcb: &Arc<ProcessControlBlock>) {
         writer.set_wakeup();
     }
 
-    // rq = __task_rq_lock(p, &rf); activate_task(rq, p, ENQUEUE_NOCLOCK);
-    let rq = cpu_rq(target_cpu.data() as usize);
-    let (rq, _rq_guard) = rq.self_lock();
-    rq.update_rq_clock();
-    rq.activate_task(pcb, EnqueueFlag::ENQUEUE_NOCLOCK);
-    rq.check_preempt_currnet(pcb, WakeupFlags::WF_FORK);
+    let current_cpu = smp_get_processor_id();
+    if target_cpu == current_cpu {
+        // Same CPU: direct activation
+        let rq = cpu_rq(target_cpu.data() as usize);
+        let (rq, _rq_guard) = rq.self_lock();
+        rq.update_rq_clock();
+        crate::sched::pelt::SchedulerAvg::post_init_entity_util_avg(pcb);
+        rq.activate_task(pcb, EnqueueFlag::ENQUEUE_NOCLOCK);
+        rq.check_preempt_currnet(pcb, WakeupFlags::WF_FORK);
+    } else {
+        // Remote CPU: use ttwu_queue path to avoid cross-CPU update_rq_clock
+        crate::sched::pelt::SchedulerAvg::post_init_entity_util_avg(pcb);
+        crate::sched::ttwu_queue(pcb, target_cpu, WakeupFlags::WF_FORK);
+    }
+    // TODO: 当 RT 调度实现后，需在此添加 sched_class::task_woken 回调
+}
+
+/// task_cpu(): 返回 task 当前所在的 CPU（由 sched_entity → cfs_rq → rq 链读取）。
+#[inline]
+pub fn task_cpu(pcb: &Arc<ProcessControlBlock>) -> ProcessorId {
+    pcb.sched_info().sched_entity().cfs_rq().rq().cpu()
 }
 
 pub(crate) fn __set_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {
@@ -1348,15 +1364,12 @@ pub(crate) fn __set_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {
         cpu
     );
 
-    pcb.sched_info().set_on_cpu(Some(cpu));
+    // 只更新 set_task_rq (cfs_rq 指针)，
+    // 不设置 on_cpu。on_cpu 由 prepare_task() 在 context_switch 前设置。
     // TODO: Fixme There is not implement group sched;
     if pcb.sched_info().policy() == SchedPolicy::CFS {
         let se = pcb.sched_info().sched_entity();
         let rq = cpu_rq(cpu.data() as usize);
-        // SAFETY: __set_task_cpu must only be called when the caller guarantees
-        // that no other CPU is concurrently reading `se.cfs_rq`.
-        // In the wakeup/migration paths this is true because the task is either
-        // still private to the waker or has been dequeued from the source rq.
         unsafe { se.force_mut().set_cfs(Arc::downgrade(&rq.cfs)) };
     }
 }
@@ -1401,7 +1414,7 @@ pub fn sched_yield() {
     let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
     let pcb = ProcessManager::current_pcb();
-    let rq = cpu_rq(pcb.sched_info().on_cpu().unwrap_or(current_cpu_id()).data() as usize);
+    let rq = cpu_rq(current_cpu_id().data() as usize);
     let (rq, guard) = rq.self_lock();
 
     // TODO: schedstat_inc(rq->yld_count);

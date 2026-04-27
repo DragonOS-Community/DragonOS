@@ -132,10 +132,6 @@ fn load_balance(
 }
 
 /// 周期性负载均衡核心循环。
-///
-/// 遍历指定 CPU 的 sched_domain 层级，检查每个 domain 是否到达均衡时间，
-/// 若到达则调用 `load_balance`。最后更新 `rq.next_balance` 为所有 domain
-/// 中最早需要再次均衡的时间。
 pub fn rebalance_domains(cpu: ProcessorId, mut idle: CpuIdleType) {
     let rq_ref = cpu_rq(cpu.data() as usize);
     let mut continue_balancing = true;

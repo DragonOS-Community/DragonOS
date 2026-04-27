@@ -60,8 +60,8 @@ use crate::{
     },
     process::resource::{RLimit64, RLimitID},
     sched::{
-        DequeueFlag, EnqueueFlag, OnRq, SchedMode, WakeupFlags, __schedule, completion::Completion,
-        cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO,
+        task_cpu, DequeueFlag, EnqueueFlag, OnRq, SchedMode, WakeupFlags, __schedule,
+        completion::Completion, cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO,
     },
     smp::{
         core::smp_get_processor_id,
@@ -346,7 +346,7 @@ impl ProcessManager {
                 writer.set_wakeup();
                 drop(writer);
 
-                let prev_cpu = pcb.sched_info().on_cpu().unwrap_or(current_cpu_id());
+                let prev_cpu = task_cpu(pcb);
                 Self::ttwu_do_activate(pcb, prev_cpu, WakeupFlags::WF_TTWU, was_uninterruptible);
                 return Ok(());
             } else if state.is_exited() {
@@ -375,7 +375,7 @@ impl ProcessManager {
 
         let on_rq = *pcb.sched_info().on_rq.lock_irqsave();
         if on_rq == crate::sched::OnRq::Queued {
-            let target_cpu = pcb.sched_info().on_cpu().unwrap_or(current_cpu_id());
+            let target_cpu = task_cpu(pcb);
             let update_clock = target_cpu == smp_get_processor_id();
             let rq = crate::sched::cpu_rq(target_cpu.data() as usize);
             let (rq, _guard) = rq.self_lock();
@@ -438,7 +438,7 @@ impl ProcessManager {
                 // avoid deadlock
                 drop(writer);
 
-                let prev_cpu = pcb.sched_info().on_cpu().unwrap_or(smp_get_processor_id());
+                let prev_cpu = task_cpu(pcb);
                 Self::ttwu_do_activate(pcb, prev_cpu, WakeupFlags::WF_TTWU, false);
                 return Ok(());
             } else if state.is_runnable() {
@@ -474,7 +474,7 @@ impl ProcessManager {
         drop(writer);
 
         if on_rq == OnRq::Queued {
-            let target_cpu = pcb.sched_info().on_cpu().unwrap_or(current_cpu_id());
+            let target_cpu = task_cpu(pcb);
             let update_clock = target_cpu == smp_get_processor_id();
             let rq = cpu_rq(target_cpu.data() as usize);
             let (rq, _guard) = rq.self_lock();

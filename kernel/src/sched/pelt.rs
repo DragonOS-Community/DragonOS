@@ -165,7 +165,9 @@ impl SchedulerAvg {
         self.util_avg = self.util_sum as usize / divider;
     }
 
-    #[allow(dead_code)]
+    /// 为新 fork 的 task 初始化 PELT 平均值
+    /// 对于非 CFS 策略，只记录 last_update_time 后立即返回
+    /// 对于 CFS 策略，根据当前 cfs_rq 的负载比例初始化 util_avg / runnable_avg
     pub fn post_init_entity_util_avg(pcb: &Arc<ProcessControlBlock>) {
         let se = pcb.sched_info().sched_entity();
         let cfs_rq = se.cfs_rq();
@@ -174,11 +176,13 @@ impl SchedulerAvg {
         // TODO: 这里和架构相关
         let cpu_scale = SCHED_CAPACITY_SCALE;
 
-        let cap = (cpu_scale as isize - cfs_rq.avg.util_avg as isize) / 2;
-
+        // 非 fair 类只设置 last_update_time 后返回
         if pcb.sched_info().policy() != SchedPolicy::CFS {
             sa.last_update_time = cfs_rq.cfs_rq_clock_pelt();
+            return;
         }
+
+        let cap = (cpu_scale as isize - cfs_rq.avg.util_avg as isize) / 2;
 
         if cap > 0 {
             if cfs_rq.avg.util_avg != 0 {

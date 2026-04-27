@@ -907,8 +907,7 @@ impl ProcessManager {
         }
 
         // 验证 cpus_allowed 中有可用的在线 CPU
-        clone_args
-            .resolve_target_cpu(smp_get_processor_id(), &pcb.sched_info().cpus_allowed())?;
+        clone_args.resolve_target_cpu(smp_get_processor_id(), &pcb.sched_info().cpus_allowed())?;
         // sched_cgroup_fork: 绑定到父 CPU + task_fork（不做负载均衡）
         sched_cgroup_fork(pcb);
 

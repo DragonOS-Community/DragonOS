@@ -5,7 +5,7 @@ use system_error::SystemError;
 use crate::arch::driver::apic::{CurrentApic, LocalAPIC};
 
 use crate::{
-    sched::{cpu_rq, cpu_wakequeue, EnqueueFlag, SchedMode, WakeupFlags, __schedule},
+    sched::{cpu_rq, cpu_wakequeue, task_cpu, EnqueueFlag, SchedMode, WakeupFlags, __schedule},
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
 };
 
@@ -67,21 +67,28 @@ impl IrqHandler for KickCpuIpiHandler {
         #[cfg(target_arch = "x86_64")]
         CurrentApic.send_eoi();
 
-        // 被其他cpu kick时应该是抢占调度
         let cpu = smp_get_processor_id();
         let wq = cpu_wakequeue(cpu.data() as usize);
         for pcb in wq.drain() {
+            let was_uninterruptible = matches!(
+                pcb.sched_info().inner_lock_read_irqsave().state(),
+                crate::process::ProcessState::Blocked(false)
+            );
+
             let rq = cpu_rq(cpu.data() as usize);
             let (rq, _guard) = rq.self_lock();
             rq.update_rq_clock();
 
-            let prev_cpu = pcb.sched_info().on_cpu().unwrap_or(cpu);
+            let prev_cpu = task_cpu(&pcb);
             if prev_cpu != cpu {
                 crate::sched::__set_task_cpu(&pcb, cpu);
             }
             let mut flags = EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK;
             if prev_cpu != cpu {
                 flags |= EnqueueFlag::ENQUEUE_MIGRATED;
+            }
+            if was_uninterruptible {
+                rq.dec_nr_uninterruptible();
             }
             rq.activate_task(&pcb, flags);
             rq.check_preempt_currnet(&pcb, WakeupFlags::WF_MIGRATED);

@@ -19,13 +19,13 @@ impl Semaphore {
     /// @param count 信号量的初始值
     /// @return 条件满足返回semaphore对象,条件不满足返回err信息
     fn new(counter: i32) -> Result<Self, SystemError> {
-        if counter > 0 {
+        if counter >= 0 {
             Ok(Self {
                 counter: AtomicI32::new(counter),
                 wait_queue: WaitQueue::default(),
             })
         } else {
-            return Err(SystemError::EOVERFLOW);
+            return Err(SystemError::EINVAL);
         }
     }
 
@@ -43,10 +43,14 @@ impl Semaphore {
 
             // 资源不足，阻塞等待计数可用
             // Mesa 风格无锁信号量
-            let _ = self.wait_queue.wait_event_uninterruptible(
+            let res = self.wait_queue.wait_event_uninterruptible(
                 || self.counter.load(Ordering::Acquire) > 0,
                 None::<fn()>,
             );
+            if let Err(e) = res {
+                log::error!("Semaphore::down wait failed: {:?}, retrying", e);
+                continue;
+            }
         }
     }
 

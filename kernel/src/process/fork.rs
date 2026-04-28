@@ -272,7 +272,7 @@ impl ProcessManager {
             e
         })?;
 
-        // 对齐 Linux wake_up_new_task: 一次 select_task_rq(WF_FORK) + activate_task
+        // 一次 select_task_rq(WF_FORK) + activate_task
         wake_up_new_task(&pcb);
 
         if ProcessManager::current_pid().data() == 0 {

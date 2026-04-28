@@ -22,15 +22,14 @@ use crate::{
 use super::{
     cpu_rq,
     sched_domain::{GroupType, MigrationType, SchedDomain, SchedGroup, SdLbStats, SgLbStats},
-    CpuRunQueue, SchedPolicy, WakeupFlags, SCHED_CAPACITY_SCALE,
+    CpuRunQueue, EnqueueFlag, SchedPolicy, WakeupFlags, SCHED_CAPACITY_SCALE,
 };
 
 /// 任务迁移的 cache-hot 阈值（纳秒）。
-/// Linux 6.6 默认 sysctl_sched_migration_cost = 500000 (500us)。
 const SYSCTL_SCHED_MIGRATION_COST: u64 = 500_000;
 
 bitflags! {
-    /// 负载均衡标志位，严格对齐 Linux 6.6 `LBF_*` 定义（fair.c:8553-8557）。
+    /// 负载均衡标志位
     pub struct LbfFlags: u32 {
         /// 所有候选任务都被钉住（无法迁移到 dst_cpu）  — LBF_ALL_PINNED 0x01
         const ALL_PINNED = 1 << 0;
@@ -68,11 +67,11 @@ fn is_load_balance_enabled() -> bool {
 pub struct LoadBalancer;
 
 impl LoadBalancer {
-    /// 选择任务唤醒时的目标CPU（Linux `select_task_rq` 的简化实现）。
+    /// 选择任务唤醒时的目标CPU
     ///
     /// 这个函数在任务被唤醒时调用，用于选择最适合运行该任务的CPU。
     /// 目前仅处理 cpus_allowed 掩码、WF_CURRENT_CPU 和粗略负载比较，
-    /// 未实现 Linux 6.6 的 wake_affine、LLC 域扫描及 sched_domain 层级逻辑。
+    /// 未实现 Linux 的 wake_affine、LLC 域扫描及 sched_domain 层级逻辑。
     pub fn select_task_rq(
         pcb: &Arc<ProcessControlBlock>,
         prev_cpu: ProcessorId,
@@ -179,9 +178,8 @@ impl LoadBalancer {
     }
 
     /// ## 找到负载最低的CPU（不加锁）
-    /// 对齐 Linux `find_idlest_cpu` 语义：遍历所有候选 CPU，比较 CFS load_avg，
-    /// 返回 load 最低的 CPU。不因为 nr_running == 0 提前 break，否则在遍历
-    /// 顺序中先遇到 idle CPU 就会漏掉后续更优的候选。
+    /// 遍历所有候选 CPU，比较 CFS load_avg，返回 load 最低的 CPU。
+    /// 不因为 nr_running == 0 提前 break，否则在遍历顺序中先遇到 idle CPU 就会漏掉后续更优的候选。
     fn find_idlest_cpu_lockless(possible_cpus: &CpuMask, fallback: ProcessorId) -> ProcessorId {
         let mut min_load = u64::MAX;
         let mut idlest_cpu = fallback;
@@ -199,7 +197,7 @@ impl LoadBalancer {
         idlest_cpu
     }
 
-    /// 对齐 Linux find_idlest_group_cpu (fair.c:6933) 的负载估算。
+    /// 负载估算
     /// Linux 优先检查 sched_idle_cpu / available_idle_cpu，再比较 load_avg。
     /// 优先使用 PELT load_avg；当 PELT 为 0 时回退到 nr_running，
     /// 避免系统刚启动时 PELT 全为 0 导致无法区分 CPU 的问题。
@@ -213,8 +211,6 @@ impl LoadBalancer {
         }
     }
 
-    /// Linux idle_cpu(): rq->curr == rq->idle && !rq->nr_running.
-    ///
     /// 此函数在 select_task_rq 路径中无锁调用，不能使用 current_ref()（要求 rq lock）。
     /// 使用 current_ptr_lockless()（AtomicPtr Acquire 加载）做指针比较，避免 Option<Arc>
     /// 非原子读取导致的数据竞争。
@@ -230,12 +226,9 @@ impl LoadBalancer {
         is_idle_task && rq.nr_running_lockless() == 0
     }
 
-    /// Linux `select_idle_sibling` 的高度简化实现。
-    ///
-    /// 仅检查 nr_running == 0，未实现 Linux 6.6 的 LLC 域扫描、
-    /// idle-core 检测及 SMT 感知。
-    /// 在 `target`、`prev_cpu` 和 `cpus_allowed` 中优先寻找空闲 CPU，
-    /// 以利用缓存亲和性并减少任务迁移开销。
+    /// `select_idle_sibling` 的高度简化实现
+    /// 仅检查 nr_running == 0，未实现 LLC 域扫描、idle-core 检测及 SMT 感知。
+    /// 在 `target`、`prev_cpu` 和 `cpus_allowed` 中优先寻找空闲 CPU，以利用缓存亲和性并减少任务迁移开销。
     fn select_idle_sibling(
         prev_cpu: ProcessorId,
         target: ProcessorId,
@@ -259,9 +252,7 @@ impl LoadBalancer {
         target
     }
 
-    /// Linux `wake_wide` 的简化实现。
-    ///
-    /// 注意：Linux 6.6 使用 `sd_llc_size`（LLC 共享的 CPU 数量）作为 factor；
+    /// 注意：Linux 使用 `sd_llc_size`（LLC 共享的 CPU 数量）作为 factor；
     /// 当前实现使用 `present_cpus_count()` 代替，在 SMT 系统上阈值可能偏大。
     ///
     /// 当唤醒者与被唤醒者之间的唤醒链过宽时，返回 `true`，
@@ -317,7 +308,7 @@ pub struct LbEnv {
 
 /// 更新调度组的负载均衡统计信息
 ///
-/// 对齐 Linux 6.6 `update_sg_lb_stats()` 语义，针对单层模型简化：
+/// 针对单层模型简化：
 /// - 遍历 sg.cpumask 中的所有 CPU
 /// - 累加 group_load, group_util, group_runnable, sum_h_nr_running, idle_cpus
 /// - 计算 group_capacity 和 group_weight
@@ -351,8 +342,6 @@ pub fn update_sg_lb_stats(sg: &SchedGroup, sgs: &mut SgLbStats, env: &LbEnv) {
 }
 
 /// 判断调度组是否过载
-///
-/// 对齐 Linux 6.6 `group_is_overloaded()` 语义。
 fn group_is_overloaded(imbalance_pct: u32, sgs: &SgLbStats) -> bool {
     if sgs.sum_nr_running <= sgs.group_weight {
         return false;
@@ -367,8 +356,6 @@ fn group_is_overloaded(imbalance_pct: u32, sgs: &SgLbStats) -> bool {
 }
 
 /// 判断调度组是否还有剩余容量
-///
-/// 对齐 Linux 6.6 `group_has_capacity()` 语义。
 fn group_has_capacity(imbalance_pct: u32, sgs: &SgLbStats) -> bool {
     if sgs.sum_nr_running < sgs.group_weight {
         return true;
@@ -383,8 +370,6 @@ fn group_has_capacity(imbalance_pct: u32, sgs: &SgLbStats) -> bool {
 }
 
 /// 对调度组进行分类
-///
-/// 对齐 Linux 6.6 `group_classify()` 语义。
 /// 单层模型下仅实现 HasSpare 和 Overloaded。
 pub fn group_classify(_sg: &SchedGroup, sgs: &SgLbStats, env: &LbEnv) -> GroupType {
     let imbalance_pct = env.sd.as_ref().map(|sd| sd.imbalance_pct).unwrap_or(125);
@@ -402,7 +387,7 @@ pub fn group_classify(_sg: &SchedGroup, sgs: &SgLbStats, env: &LbEnv) -> GroupTy
 
 /// 更新调度域的负载均衡统计信息
 ///
-/// 对齐 Linux 6.6 `update_sd_lb_stats()` 语义，针对单层模型简化：
+/// 针对单层模型简化：
 /// - 仅处理一个调度组（该组同时是 local 和 busiest）
 /// - 不累加 NUMA 相关统计
 pub fn update_sd_lb_stats(sd: &SchedDomain, env: &LbEnv) -> SdLbStats {
@@ -432,7 +417,6 @@ pub fn update_sd_lb_stats(sd: &SchedDomain, env: &LbEnv) -> SdLbStats {
 /// 单组模型下的负载不均衡计算
 ///
 /// 单组模型中 local == busiest（同一组），无法使用 Linux 的组间 avg_load 比较
-/// （`local.avg_load == sds.avg_load` 恒成立，差值永远为 0）。
 ///
 /// 替代策略：比较 dst_cpu 与组内 per-CPU 平均负载。
 /// 若 dst_cpu 负载低于平均值且组内存在负载更高的 CPU，则允许迁移。
@@ -440,7 +424,7 @@ fn calculate_imbalance_single_group(env: &mut LbEnv, sds: &SdLbStats) {
     let local = &sds.local_stat;
     let group_weight = local.group_weight.max(1) as u64;
 
-    // 计算组内 per-CPU 平均负载（对齐 Linux 的 avg_load 思路）
+    // 计算组内 per-CPU 平均负载
     let per_cpu_avg = local.group_load / group_weight;
 
     // dst_cpu 的负载
@@ -458,7 +442,6 @@ fn calculate_imbalance_single_group(env: &mut LbEnv, sds: &SdLbStats) {
         }
     } else {
         // 组未过载但有可用任务：迁移一个任务即可
-        // 对齐 Linux local->group_type == group_has_spare 的行为
         env.migration_type = MigrationType::Task;
         if dst_load < per_cpu_avg || env.idle != super::rebalance::CpuIdleType::NotIdle {
             env.imbalance = 1;
@@ -470,7 +453,7 @@ fn calculate_imbalance_single_group(env: &mut LbEnv, sds: &SdLbStats) {
 
 /// 查找最忙的调度组
 ///
-/// 对齐 Linux 6.6 `find_busiest_group()` 语义，针对单层单组模型简化：
+/// 针对单层单组模型简化：
 /// - 调用 update_sd_lb_stats 统计域信息
 /// - 对唯一的组进行分类
 /// - 若组为 Overloaded 或本地 CPU 空闲且组内有任务，则返回该组
@@ -499,7 +482,7 @@ pub fn find_busiest_group(env: &mut LbEnv) -> Option<Arc<SchedGroup>> {
 
 /// 查找最忙的运行队列
 ///
-/// 对齐 Linux 6.6 `find_busiest_queue()` 语义，针对单层模型简化：
+/// 针对单层模型简化：
 /// - 遍历 group.cpumask 中的 CPU
 /// - 根据 env.migration_type 选择最忙的 CPU
 /// - 返回最忙 CPU 的 ProcessorId
@@ -560,7 +543,6 @@ pub fn find_busiest_queue(env: &LbEnv, group: &SchedGroup) -> Option<ProcessorId
 
 /// 判断指定任务是否可以迁移到 env.dst_cpu。
 ///
-/// 对齐 Linux 6.6 `can_migrate_task()` 语义：
 /// 1. 检查 dst_cpu 是否在 p.cpus_allowed 中；若不在，设置 LBF_SOME_PINNED。
 /// 2. 检查任务是否正在 src_cpu 上运行（task_on_cpu）；若是，跳过。
 /// 3. 检查 cache-hot：比较当前运行片段（delta_exec）与 sysctl_sched_migration_cost。
@@ -574,8 +556,6 @@ fn can_migrate_task(pcb: &Arc<ProcessControlBlock>, env: &mut LbEnv) -> bool {
 
     if !info.cpus_allowed().get(env.dst_cpu).unwrap_or(false) {
         env.flags |= LbfFlags::SOME_PINNED;
-
-        // 对齐 Linux 6.6 can_migrate_task (fair.c:8731-8744):
         // 在 group 中搜索可用的替代 dst_cpu
         if env.idle != super::rebalance::CpuIdleType::NewlyIdle
             && !env.flags.contains(LbfFlags::DST_PINNED)
@@ -626,11 +606,9 @@ fn can_migrate_task(pcb: &Arc<ProcessControlBlock>, env: &mut LbEnv) -> bool {
     true
 }
 
-/// 对齐 Linux 6.6 `sysctl_sched_nr_migrate`（fair.c），限制单次 detach 的任务数。
+/// 限制单次 detach 的任务数。
 const SCHED_NR_MIGRATE_BREAK: u32 = 32;
 
-/// 将 load 右移 n 位，但保证结果至少为 1。
-/// 对齐 Linux 6.6 `shr_bound()` (fair.c)。
 #[inline]
 fn shr_bound(val: u64, shift: u32) -> u64 {
     (val >> shift).max(1)
@@ -731,6 +709,16 @@ pub fn detach_tasks(src_rq: &mut CpuRunQueue, env: &mut LbEnv) -> u32 {
         }
 
         cfs_rq.detach_task(&pcb, src_rq);
+        // set_task_cpu(p, env->dst_cpu)
+        // 在 dequeue 之后、push 之前更新 task_cpu 和 cfs_rq，确保后续
+        // attach_task / activate_task 使用正确的目标 CPU 上下文。
+        log::trace!(
+            "detach_tasks: migrating pid={:?} src_cpu={:?} -> dst_cpu={:?}",
+            pcb.raw_pid(),
+            env.src_cpu,
+            env.dst_cpu
+        );
+        crate::sched::__set_task_cpu(&pcb, env.dst_cpu);
         env.tasks.push_back(pcb);
         detached += 1;
 
@@ -747,34 +735,17 @@ pub fn detach_tasks(src_rq: &mut CpuRunQueue, env: &mut LbEnv) -> u32 {
 }
 
 /// 将 env.tasks 中已分离的任务附加到 dst_rq。
-///
-/// 对齐 Linux 6.6 `attach_tasks()` 语义：
-/// - 遍历 env.tasks
-/// - 对每个任务调用 cfs_rq.attach_task，将其加入 dst_rq
 pub fn attach_tasks(dst_rq: &mut CpuRunQueue, env: &mut LbEnv) {
-    let cfs_rq_arc = dst_rq.cfs_rq();
-    let cfs_rq = unsafe { cfs_rq_arc.force_mut() };
-
     while let Some(pcb) = env.tasks.pop_front() {
-        cfs_rq.attach_task(&pcb, dst_rq);
+        dst_rq.activate_task(&pcb, EnqueueFlag::ENQUEUE_MIGRATED);
         dst_rq.check_preempt_currnet(&pcb, super::WakeupFlags::empty());
     }
 }
 
 /// 执行负载均衡。
 ///
-/// 对齐 Linux 6.6 `load_balance()` (fair.c:11051) 语义：
-/// 1. should_we_balance — 若不是当前 CPU 的轮次则返回 false
-/// 2. find_busiest_group — 查找源调度组
-/// 3. find_busiest_queue — 查找源 CPU
-/// 4. busiest->nr_running > 1 守卫
-/// 5. 按 CPU ID 升序锁定 src_rq + dst_rq（double_rq_lock）
-/// 6. detach_tasks → attach_tasks 循环，含 LBF_NEED_BREAK 重试 (fair.c:11114 more_balance)
-/// 7. LBF_DST_PINNED 时更换 dst_cpu 并重试 (fair.c:11167)
-/// 8. 成功后 sd->balance_interval = sd->min_interval (fair.c:11268)
-///
 /// DragonOS 必须同时持有两把 rq 锁（detach+attach 在同一锁域内），
-/// 因为没有 TASK_ON_RQ_MIGRATING 保护机制（见 Linux fair.c:11124-11130）。
+/// 因为没有 TASK_ON_RQ_MIGRATING 保护机制
 pub fn load_balance(
     cpu: ProcessorId,
     sd: &Arc<SchedDomain>,
@@ -804,15 +775,31 @@ pub fn load_balance(
 
     let group = match find_busiest_group(&mut env) {
         Some(g) => g,
-        None => return false,
+        None => {
+            // out_balanced: 没找到不平衡的 group，倍增 balance_interval 退避（跳过 NEWLY_IDLE）。
+            if idle != super::rebalance::CpuIdleType::NewlyIdle {
+                let cur = sd.balance_interval.load(Ordering::Relaxed);
+                if cur < sd.max_interval {
+                    sd.balance_interval.store(cur * 2, Ordering::Relaxed);
+                }
+            }
+            return false;
+        }
     };
 
     let busiest_cpu = match find_busiest_queue(&env, &group) {
         Some(cpu) => cpu,
-        None => return false,
+        None => {
+            // out_balanced: 找到 group 但没有 busiest queue
+            if idle != super::rebalance::CpuIdleType::NewlyIdle {
+                let cur = sd.balance_interval.load(Ordering::Relaxed);
+                if cur < sd.max_interval {
+                    sd.balance_interval.store(cur * 2, Ordering::Relaxed);
+                }
+            }
+            return false;
+        }
     };
-
-    let busiest_rq_arc = cpu_rq(busiest_cpu.data() as usize);
 
     if busiest_cpu == env.dst_cpu {
         return false;
@@ -820,9 +807,6 @@ pub fn load_balance(
 
     env.src_cpu = busiest_cpu;
 
-    env.loop_max = busiest_rq_arc
-        .nr_running_lockless()
-        .min(SCHED_NR_MIGRATE_BREAK as usize) as u32;
     env.flags |= LbfFlags::ALL_PINNED;
 
     let mut ld_moved: u32 = 0;
@@ -834,6 +818,11 @@ pub fn load_balance(
             (busiest_cpu, env.dst_cpu)
         };
 
+        // 短路检查：自迁移无意义，且会对同一把 rq 锁自旋死锁。
+        if first_cpu == second_cpu {
+            break;
+        }
+
         let first_rq_arc = cpu_rq(first_cpu.data() as usize);
         let second_rq_arc = cpu_rq(second_cpu.data() as usize);
 
@@ -843,7 +832,7 @@ pub fn load_balance(
         }
 
         // 双锁顺序：低 CPU ID 先锁，防止 ABBA 死锁。
-        // first_cpu < second_cpu 由上面 line 822-826 保证。
+        // first_cpu < second_cpu 由上面保证。
         let (mut second_rq, _g2) = second_rq_arc.self_lock();
         if second_cpu == env.dst_cpu {
             second_rq.update_rq_clock();
@@ -854,6 +843,11 @@ pub fn load_balance(
         } else {
             (&mut second_rq, &mut first_rq)
         };
+
+        // loop_max 在 src_rq 锁内计算，避免 TOCTOU。
+        env.loop_max = src_rq
+            .nr_running_lockless()
+            .min(SCHED_NR_MIGRATE_BREAK as usize) as u32;
 
         let cur_ld_moved = detach_tasks(src_rq, &mut env);
 
@@ -871,7 +865,7 @@ pub fn load_balance(
             env.flags -= LbfFlags::NEED_BREAK;
         }
 
-        // LBF_DST_PINNED: 更换 dst_cpu 后重试（对齐 Linux fair.c:11167-11182）
+        // LBF_DST_PINNED: 更换 dst_cpu 后重试
         if env.flags.contains(LbfFlags::DST_PINNED) && env.imbalance > 0 {
             env.dst_cpu = env.new_dst_cpu;
             env.flags -= LbfFlags::DST_PINNED;
@@ -891,10 +885,27 @@ pub fn load_balance(
         if env.idle != super::rebalance::CpuIdleType::NewlyIdle {
             sd.nr_balance_failed.fetch_add(1, Ordering::Relaxed);
         }
-        // 找到 busiest 但未能迁移时 reset to min，而非 ×2。
-        // ×2 仅在未找到 busiest（out_balanced 路径）时适用。
+
+        // 发现不平衡但迁移失败时 reset to min_interval
+        // 倍增仅在 "balanced / all_pinned / one_pinned" 路径中执行。
         sd.balance_interval
             .store(sd.min_interval.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+
+    // out_balanced / out_all_pinned / out_one_pinned 路径:
+    // 当没有找到 busiest (find_busiest_group → None) 或所有任务被 pin 时，
+    // 通过倍增 balance_interval 退避。
+    // DragonOS 的 find_busiest_group → None 直接 return false（不经过此处），
+    // 因此这里的 ALL_PINNED 检查覆盖 "找到 busiest 但全部被 pin" 的情况。
+    if ld_moved == 0
+        && env.flags.contains(LbfFlags::ALL_PINNED)
+        && env.idle != super::rebalance::CpuIdleType::NewlyIdle
+    {
+        let max_pinned = 512u64; // MAX_PINNED_INTERVAL — 对齐 Linux fair.c:10916
+        let cur = sd.balance_interval.load(Ordering::Relaxed);
+        if cur < max_pinned {
+            sd.balance_interval.store(cur * 2, Ordering::Relaxed);
+        }
     }
 
     ld_moved > 0

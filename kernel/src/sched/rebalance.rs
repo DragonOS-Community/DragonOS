@@ -93,21 +93,30 @@ pub fn should_we_balance(env: &LbEnv) -> bool {
     }
 
     // 无空闲 CPU，仅 designated balancer 执行均衡
-    group_balance_cpu(group) == env.dst_cpu
+    group_balance_cpu(group) == Some(env.dst_cpu)
 }
 
 /// 返回调度组中的 designated balancer CPU。
 /// 取 `sg.cpumask` 中第一个被置位的 CPU
-pub fn group_balance_cpu(sg: &SchedGroup) -> ProcessorId {
-    sg.cpumask
-        .first()
-        .expect("SchedGroup cpumask must not be empty")
+pub fn group_balance_cpu(sg: &SchedGroup) -> Option<ProcessorId> {
+    debug_assert!(
+        !sg.cpumask.is_empty(),
+        "SchedGroup cpumask must not be empty"
+    );
+    sg.cpumask.first()
 }
 
-/// 判断指定 CPU 是否空闲（`nr_running == 0`）。
+/// 判断指定 CPU 是否空闲：当前任务为 idle 且 `nr_running == 0`。
 #[inline]
 fn is_idle_cpu(cpu: ProcessorId) -> bool {
-    cpu_rq(cpu.data() as usize).nr_running_lockless() == 0
+    if cpu == ProcessorId::INVALID {
+        return false;
+    }
+    let rq = cpu_rq(cpu.data() as usize);
+    let curr_ptr = rq.current_ptr_lockless();
+    let idle = rq.idle();
+    let is_idle_task = idle.upgrade().is_some_and(|i| Arc::as_ptr(&i) == curr_ptr);
+    is_idle_task && rq.nr_running_lockless() == 0
 }
 
 /// 检查指定 CPU 是否只运行 SCHED_IDLE 任务。

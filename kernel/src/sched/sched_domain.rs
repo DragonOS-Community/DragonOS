@@ -104,7 +104,7 @@ pub struct SchedDomain {
     /// `max_interval` - 最大均衡间隔（毫秒）
     pub max_interval: u64,
     /// `balance_interval` - 初始化为 1，单位为毫秒。
-    /// 成功迁移后重置为 min_interval（对齐 Linux fair.c:11268）。
+    /// 成功迁移后重置为 min_interval
     pub balance_interval: core::sync::atomic::AtomicU64,
     /// `imbalance_pct` - 超过此水位线才进行均衡
     pub imbalance_pct: u32,

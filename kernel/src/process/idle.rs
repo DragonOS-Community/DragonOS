@@ -61,7 +61,6 @@ impl ProcessManager {
             };
 
             assert!(idle_pcb.sched_info().on_cpu().is_none());
-            idle_pcb.sched_info().set_on_cpu(Some(ProcessorId::new(i)));
             idle_pcb
                 .sched_info()
                 .set_cpus_allowed(CpuMask::from_cpu(ProcessorId::new(i)));
@@ -69,19 +68,19 @@ impl ProcessManager {
 
             let rq = cpu_rq(i as usize);
             let (rq, _guard) = rq.self_lock();
+
+            // __set_task_cpu 在 on_rq 赋值之前。
+            // 这确保 idle task 的 cpu 字段和 se.cfs_rq 指针在 task 被 mark 为 Queued 之前
+            // 就已正确指向目标 CPU，避免后续 wakeup 路径看到 INVALID cpu 而调用 __set_task_cpu(pcb, new_cpu) 时触发 on_rq==Queued 断言
+            crate::sched::__set_task_cpu(&idle_pcb, ProcessorId::new(i));
+
             rq.set_current(idle_pcb.clone());
             rq.set_idle(Arc::downgrade(&idle_pcb));
             IDLE_CPUS.set(ProcessorId::new(i));
 
+            // on_rq 和 on_cpu 在 __set_task_cpu 之后设置。
             *idle_pcb.sched_info().on_rq.lock_irqsave() = OnRq::Queued;
-
-            unsafe {
-                idle_pcb
-                    .sched_info()
-                    .sched_entity()
-                    .force_mut()
-                    .set_cfs(Arc::downgrade(&rq.cfs_rq()));
-            }
+            idle_pcb.sched_info().set_on_cpu(Some(ProcessorId::new(i)));
 
             v.push(idle_pcb);
         }

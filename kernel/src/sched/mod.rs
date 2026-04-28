@@ -86,6 +86,12 @@ pub fn cpu_irq_time(cpu: ProcessorId) -> &'static mut IrqTime {
 
 #[inline]
 pub fn cpu_rq(cpu: usize) -> Arc<CpuRunQueue> {
+    assert!(
+        cpu < PerCpu::MAX_CPU_NUM as usize,
+        "cpu_rq: cpu {} out of bounds (MAX_CPU_NUM = {})",
+        cpu,
+        PerCpu::MAX_CPU_NUM
+    );
     CPU_RUNQUEUE.ensure();
     unsafe {
         CPU_RUNQUEUE
@@ -363,8 +369,7 @@ pub struct CpuRunQueue {
     overload: bool,
 
     /// 下一次负载均衡时间（jiffies）。
-    /// 对齐 Linux 6.6 `rq->next_balance`，使用 AtomicU64 以便在
-    /// trigger_load_balance（rq 锁内）和 rebalance_domains（无 rq 锁）中无锁写入。
+    /// 使用 AtomicU64 以便在 trigger_load_balance（rq 锁内）和 rebalance_domains（无 rq 锁）中无锁写入。
     pub(crate) next_balance: core::sync::atomic::AtomicU64,
 
     /// 运行任务数
@@ -396,18 +401,21 @@ pub struct CpuRunQueue {
 
     /// 当前在运行队列上执行的进程。
     ///
-    /// Linux 6.6 使用裸指针 `struct task_struct __rcu *curr`，不持有引用计数，
-    /// 安全由 rq lock + on_cpu flag + RCU 宽限期保证。
+    /// Linux 6.6 使用裸指针 `struct task_struct __rcu *curr`
+    /// `rq->curr` 作为 "current" 持有一个引用计数；
+    /// `finish_task_switch` 通过 `put_task_struct_rcu_user` 在 RCU 宽限期后释放。
+    /// 安全由以下机制保证：
+    /// - rq lock 保护 curr 的修改
+    /// - on_cpu flag 防止 prev 在上下文切换完成前被并发唤醒
+    /// - 引用计数保证 task_struct 在 curr 指向期间不被释放
+    /// - RCU 宽限期保证并发读取者不会观察到已释放的内存
     ///
-    /// DragonOS 使用 Arc 而非裸指针，原因是：
-    /// exit→schedule 路径中，父进程可并发调用 release() 从 ALL_PROCESS 移除 PCB，
-    ///    若使用 Weak，则 Weak::upgrade() 可能失败导致 rq 无法访问当前任务。
-    ///    Arc 保证即使 release() 已执行，rq 仍持有有效引用。
-    ///
-    /// 安全保证：rq lock + on_cpu flag + switch_finish_hook 中的 Arc 释放。
-    ///
-    /// 已知代价：每次 `rq.current()` 执行 `Arc::clone()`（原子递增），
-    /// 而 Linux 只做一次指针读取。
+    /// DragonOS 使用 Arc 替代裸指针：
+    /// - 原因：DragonOS 无 RCU 机制；若使用 Weak，prev 在 __schedule 中 dequeue 后
+    ///   若所有外部强引用消失（如父进程 wait() 完成），Weak::upgrade() 会失败。
+    ///   Arc 保证 rq 在上下文切换完成前始终持有有效引用。
+    /// - 安全：rq lock + on_cpu flag + switch_finish_hook 释放 prev 的 Arc。
+    /// - 代价：rq.current() 每次执行 Arc::clone()（原子递增），Linux 仅一次指针读取。
     current: Option<Arc<ProcessControlBlock>>,
 
     /// 专供无锁路径（如 `is_idle_cpu`）读取当前任务指针。
@@ -574,16 +582,20 @@ impl CpuRunQueue {
     pub fn activate_task(&mut self, pcb: &Arc<ProcessControlBlock>, mut flags: EnqueueFlag) {
         let was_idle_cpu = rq_is_idle_cpu(self);
 
-        // 任务被唤醒时，如果之前因 UNINTERRUPTIBLE 睡眠贡献了 load，则递减计数。
-        if pcb
-            .flags()
-            .contains(ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD)
-        {
-            self.dec_nr_uninterruptible();
-            pcb.flags().remove(ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD);
-        }
+        // SCHED_CONTRIBUTES_TO_LOAD 必须在调用 activate_task 之前由调用者处理
+        // （在目标 rq 上递减 nr_uninterruptible，参见 drain_wake_queue / ttwu_do_activate）。
+        // 参见 drain_wake_queue / ttwu_do_activate 中的处理。
+        debug_assert!(
+            !pcb.flags()
+                .contains(ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD),
+            "activate_task: SCHED_CONTRIBUTES_TO_LOAD must be cleared by caller"
+        );
         let mut on_rq_guard = pcb.sched_info().on_rq.lock_irqsave();
         if *on_rq_guard == OnRq::Queued {
+            log::trace!(
+                "activate_task: pid={:?} already queued (race with parallel wakeup), skip",
+                pcb.raw_pid()
+            );
             return;
         }
 
@@ -594,6 +606,10 @@ impl CpuRunQueue {
             .state()
             .is_exited()
         {
+            log::trace!(
+                "activate_task: pid={:?} exited before activation, skip",
+                pcb.raw_pid()
+            );
             return;
         }
 
@@ -728,6 +744,102 @@ impl CpuRunQueue {
         self.nr_iowait.load(Ordering::Relaxed)
     }
 
+    /// 在持有 rq 锁的上下文中排空本 CPU 的 WakeQueue，将所有待唤醒任务 activate
+    ///
+    /// 调用前提：
+    /// - 调用者持有本 rq 的锁（通过 self_lock / try_self_lock）
+    /// - 调用者在 `update_rq_clock()` 之后调用
+    ///
+    /// 此函数将激活逻辑从 IPI handler 中移出，避免 IPI handler
+    /// 因等待 rq 锁而死锁（如 load_balance 通过 double_rq_lock 持有远端 rq 锁）。
+    pub fn drain_wake_queue(&mut self) {
+        let cpu = self.cpu;
+        let wq = cpu_wakequeue(cpu.data() as usize);
+        for pcb in wq.drain() {
+            let state = pcb.sched_info().inner_lock_read_irqsave().state();
+            // 已退出进程不可被唤醒，跳过过期条目以防重新入队。
+            if state.is_exited() {
+                continue;
+            }
+
+            // sched_ttwu_pending：如果任务已在某个 rq 上排队，
+            // 说明它已经被 activate 过了（可能被另一个 wakeup 路径抢先处理），
+            // 此时不能调用 __set_task_cpu，否则会破坏 cfs_rq 指针导致 dequeue mismatch。
+            // activate_task 内部也有同样的 on_rq==Queued 早退，但我们必须在
+            // __set_task_cpu 之前拦截，因为后者是无条件执行的。
+            if *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Queued {
+                log::trace!(
+                    "drain_wake_queue: pid={:?} already queued, skip",
+                    pcb.raw_pid()
+                );
+                continue;
+            }
+
+            // 等待任务完成上下文切换后再激活，否则可能在中途激活导致竞态。
+            if pcb.sched_info().on_cpu().is_some() {
+                let mut spins = 0u32;
+                while pcb.sched_info().on_cpu().is_some() {
+                    core::hint::spin_loop();
+                    spins += 1;
+                    if spins > 1_000_000 {
+                        log::warn!(
+                            "drain_wake_queue: pid={:?} on_cpu stuck, force proceed",
+                            pcb.raw_pid()
+                        );
+                        break;
+                    }
+                }
+            }
+
+            let prev_cpu = task_cpu(&pcb);
+            let migrated = prev_cpu != cpu;
+
+            // 先迁移（set_task_cpu），后在目标 rq（已持锁）上递减。
+            // 先 set_task_cpu(p, cpu_of(rq))，再 ttwu_do_activate 中 rq->nr_uninterruptible-- 在 local rq 上操作。
+            if migrated {
+                log::trace!(
+                    "drain_wake_queue: migrating pid={:?} prev_cpu={:?} -> local_cpu={:?}",
+                    pcb.raw_pid(),
+                    prev_cpu,
+                    cpu
+                );
+                // nr_iowait 必须在 __set_task_cpu 之前在 source rq 递减。
+                // nr_iowait 是 atomic_t，跨 CPU 安全；nr_uninterruptible 则在 set_task_cpu 之后于目标 rq 上递减
+                if pcb
+                    .flags()
+                    .contains(crate::process::ProcessFlags::IN_IOWAIT)
+                {
+                    cpu_rq(prev_cpu.data() as usize).dec_nr_iowait();
+                }
+                __set_task_cpu(&pcb, cpu);
+            }
+
+            // nr_uninterruptible 在目标 rq（self，已持锁）上递减，对齐 ttwu_do_activate 的处理
+            if pcb
+                .flags()
+                .contains(crate::process::ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD)
+            {
+                self.dec_nr_uninterruptible();
+                pcb.flags()
+                    .remove(crate::process::ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD);
+            }
+            if !migrated
+                && pcb
+                    .flags()
+                    .contains(crate::process::ProcessFlags::IN_IOWAIT)
+            {
+                self.dec_nr_iowait();
+            }
+            let mut flags = EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK;
+            if migrated {
+                flags |= EnqueueFlag::ENQUEUE_MIGRATED;
+            }
+
+            self.activate_task(&pcb, flags);
+            self.check_preempt_currnet(&pcb, WakeupFlags::WF_MIGRATED);
+        }
+    }
+
     /// 更新rq时钟
     pub fn update_rq_clock(&mut self) {
         debug_assert_eq!(
@@ -815,8 +927,8 @@ impl CpuRunQueue {
         }
     }
 
+    /// 裸递减，不做下溢保护。per-CPU 不精确，正确性由全局总和保证
     pub fn dec_nr_uninterruptible(&mut self) {
-        // 裸递减，不做下溢保护。正确性由 sched_contributes_to_load 标志的增减对称性保证。
         self.nr_uninterruptible -= 1;
     }
 
@@ -876,11 +988,10 @@ impl CpuRunQueue {
         self.current = Some(pcb);
     }
 
-    /// # Safety Contract
-    ///
     /// 无锁读取当前任务指针，仅用于 `is_idle_cpu` 等不持有 rq lock 的路径。
-    /// Linux 的 `idle_cpu()` 直接读 `rq->curr`（在 rq lock 下），
-    /// DragonOS 用 AtomicPtr + Acquire 替代锁保护以减少开销。
+    /// Linux `idle_cpu()` (core.c:7325) 同样无锁直接读 `rq->curr`
+    /// （x86 指针自然对齐，天然原子）。DragonOS 用 AtomicPtr + Acquire
+    /// 在 Rust 安全框架下提供等价的原子性保证。
     #[inline]
     pub fn current_ptr_lockless(&self) -> *const ProcessControlBlock {
         self.current_ptr.load(Ordering::Acquire)
@@ -999,12 +1110,50 @@ pub fn ttwu_queue(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId, wake_flags: 
         );
         let local = smp_get_processor_id();
         let rq = cpu_rq(local.data() as usize);
-        let (rq, _guard) = rq.self_lock();
-        rq.activate_task(
-            pcb,
-            EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK,
-        );
-        rq.check_preempt_currnet(pcb, wake_flags);
+
+        // 使用 try_self_lock 防止调用者已持有 rq lock 时死锁。
+        if let Some((rq, _guard)) = rq.try_self_lock() {
+            let prev_cpu = task_cpu(pcb);
+            let migrated = prev_cpu != local;
+
+            if migrated {
+                if pcb
+                    .flags()
+                    .contains(crate::process::ProcessFlags::IN_IOWAIT)
+                {
+                    cpu_rq(prev_cpu.data() as usize).dec_nr_iowait();
+                }
+                __set_task_cpu(pcb, local);
+            }
+
+            if pcb
+                .flags()
+                .contains(crate::process::ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD)
+            {
+                rq.dec_nr_uninterruptible();
+                pcb.flags()
+                    .remove(crate::process::ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD);
+            }
+            if !migrated
+                && pcb
+                    .flags()
+                    .contains(crate::process::ProcessFlags::IN_IOWAIT)
+            {
+                rq.dec_nr_iowait();
+            }
+
+            rq.activate_task(
+                pcb,
+                EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK,
+            );
+            rq.check_preempt_currnet(pcb, wake_flags);
+            return;
+        }
+
+        // 无法获取 local rq lock（调用者可能已持有），走 WakeQueue 延迟路径。
+        let wq = cpu_wakequeue(local.data() as usize);
+        wq.push(pcb.clone());
+        send_resched_ipi(local);
         return;
     }
     let wq = cpu_wakequeue(cpu.data() as usize);
@@ -1139,6 +1288,8 @@ pub fn scheduler_tick() {
 
     rq.calculate_global_load_tick();
 
+    rq.drain_wake_queue();
+
     if let Some((cpu, idle_type)) = trigger_load_balance(rq) {
         drop(guard);
         rebalance::rebalance_domains(cpu, idle_type);
@@ -1177,11 +1328,9 @@ fn trigger_load_balance(rq: &CpuRunQueue) -> Option<(ProcessorId, rebalance::Cpu
 }
 
 /// ## 执行调度
-/// 若preempt_count不为0则报错
 #[inline]
 pub fn schedule(sched_mod: SchedMode) {
     let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-    assert_eq!(ProcessManager::current_pcb().preempt_count(), 0);
     __schedule(sched_mod);
 }
 
@@ -1210,17 +1359,15 @@ pub fn __schedule(sched_mod: SchedMode) {
     let cpu = smp_get_processor_id().data() as usize;
     let rq = cpu_rq(cpu);
     let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-    let mut prev = rq.current();
-    if let ProcessState::Exited(_) = prev.clone().sched_info().inner_lock_read_irqsave().state() {
-        // 从exit进的Schedule
-        prev = ProcessManager::current_pcb();
-    }
+    let prev = rq.current();
 
     // TODO: hrtick_clear(rq);
 
     let (rq, guard) = rq.self_lock();
 
-    // 对齐 Linux __schedule() core.c:6619: switch_count = &prev->nivcsw
+    // 防止 signal_pending_state() 与调用方 __set_current_state() 重排序。
+    fence(Ordering::SeqCst);
+
     let mut voluntary_switch = false;
 
     rq.clock_updata_flags = ClockUpdataFlag::from_bits_truncate(rq.clock_updata_flags.bits() << 1);
@@ -1253,45 +1400,60 @@ pub fn __schedule(sched_mod: SchedMode) {
 
     if !sched_mod.contains(SchedMode::SM_MASK_PREEMPT)
         && prev.sched_info().policy() != SchedPolicy::IDLE
-        && prev.sched_info().inner_lock_read_irqsave().is_mark_sleep()
     {
-        // switch_count = &prev->nvcsw
-        voluntary_switch = true;
-        let (prev_state, wake_kill) = {
+        let (prev_state, wake_kill, is_mark_sleep) = {
             let reader = prev.sched_info().inner_lock_read_irqsave();
-            (reader.state(), reader.is_wake_kill())
+            (
+                reader.state(),
+                reader.is_wake_kill(),
+                reader.is_mark_sleep(),
+            )
         };
-        let interruptible = matches!(prev_state, ProcessState::Blocked(true));
 
-        let has_signal = Signal::signal_pending_state(interruptible, wake_kill, &prev);
-        if has_signal {
-            // WRITE_ONCE(prev->__state, TASK_RUNNING);
-            // 在同一写锁临界区内将状态设为 Runnable 并清除 sleep/wake_kill 标志，避免中间状态被外部观察。
-            // 同时清除 SCHED_CONTRIBUTES_TO_LOAD，防止后续 ttwu_do_activate 路径重复递减 nr_uninterruptible。
-            prev.flags().remove(ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD);
-            let mut writer = prev.sched_info().inner_lock_write_irqsave();
-            writer.set_state(ProcessState::Runnable);
-            writer.set_wakeup();
-        } else {
-            // sched_contributes_to_load 和 nr_uninterruptible++ 必须在任务正式离开运行队列之前完成。
-            // TASK_KILLABLE = TASK_UNINTERRUPTIBLE | TASK_WAKEKILL 应贡献负载。
-            let contributes_to_load =
-                matches!(prev_state, ProcessState::Blocked(false)) || wake_kill;
-            if contributes_to_load {
-                prev.flags().insert(ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD);
-                rq.nr_uninterruptible += 1;
-            } else {
+        let is_exited = matches!(prev_state, ProcessState::Exited(_));
+
+        if is_mark_sleep || is_exited {
+            // switch_count = &prev->nvcsw
+            voluntary_switch = true;
+            let interruptible = matches!(prev_state, ProcessState::Blocked(true));
+
+            let has_signal = Signal::signal_pending_state(interruptible, wake_kill, &prev);
+            if has_signal {
+                // WRITE_ONCE(prev->__state, TASK_RUNNING);
+                // 在同一写锁临界区内将状态设为 Runnable 并清除 sleep/wake_kill 标志，避免中间状态被外部观察。
+                // 同时清除 SCHED_CONTRIBUTES_TO_LOAD，防止后续 ttwu_do_activate 路径重复递减 nr_uninterruptible。
                 prev.flags().remove(ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD);
-            }
+                let mut writer = prev.sched_info().inner_lock_write_irqsave();
+                writer.set_state(ProcessState::Runnable);
+                writer.set_wakeup();
+            } else if is_exited {
+                // TASK_DEAD 任务直接 deactivate，不计入负载。
+                prev.flags().remove(ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD);
+                rq.deactivate_task(
+                    prev.clone(),
+                    DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
+                );
+            } else {
+                // sched_contributes_to_load 和 nr_uninterruptible++ 必须在任务正式离开运行队列之前完成。
+                // TASK_KILLABLE = TASK_UNINTERRUPTIBLE | TASK_WAKEKILL 应贡献负载。
+                let contributes_to_load =
+                    matches!(prev_state, ProcessState::Blocked(false)) || wake_kill;
+                if contributes_to_load {
+                    prev.flags().insert(ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD);
+                    rq.nr_uninterruptible += 1;
+                } else {
+                    prev.flags().remove(ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD);
+                }
 
-            rq.deactivate_task(
-                prev.clone(),
-                DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
-            );
+                rq.deactivate_task(
+                    prev.clone(),
+                    DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
+                );
 
-            // nr_iowait++ 在 deactivate_task 之后
-            if prev.flags().contains(ProcessFlags::IN_IOWAIT) {
-                rq.nr_iowait.fetch_add(1, Ordering::Relaxed);
+                // nr_iowait++ 在 deactivate_task 之后
+                if prev.flags().contains(ProcessFlags::IN_IOWAIT) {
+                    rq.nr_iowait.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -1337,8 +1499,8 @@ pub fn __schedule(sched_mod: SchedMode) {
 
         rq.set_current(next.clone());
 
-        // prepare_task(next): WRITE_ONCE(next->on_cpu, 1) — 在 context_switch 前设置。
-        prev.sched_info().set_on_cpu(None);
+        // 在 context_switch 前设置 next->on_cpu
+        // ttwu 观察到 on_cpu==None 时可能迁移 prev；必须在 finish_task_switch 读取 prev->state 之后才能清除
         next.sched_info().set_on_cpu(Some(rq.cpu()));
         // warn!(
         //     "switch_process prev {:?} next {:?} sched_mode {sched_mod:?}",
@@ -1361,6 +1523,10 @@ pub fn __schedule(sched_mod: SchedMode) {
         // This kernel does not hand off rq lock ownership across context switch.
         // Drop it before switching so the incoming task's first tick/wakeup path
         // can acquire the local rq lock normally.
+        //
+        // 已知限制: Linux 在 context_switch 中持有 rq lock，并在 finish_task_switch → finish_lock_switch 中释放。
+        // DragonOS 目前不在上下文切换间传递锁所有权，因此提前释放。由于此窗口内 IRQ 已禁用，
+        // 且 on_cpu 现在在 switch_finish_hook 中清除，实际竞态窗口很小。
         drop(guard);
 
         unsafe { ProcessManager::switch_process(prev, next) };
@@ -1396,7 +1562,7 @@ pub fn sched_fork(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
 }
 
 pub fn sched_cgroup_fork(pcb: &Arc<ProcessControlBlock>) {
-    // 对齐 Linux sched_cgroup_fork(): 在 irq 关闭下绑定父 CPU + task_fork
+    // 在 irq 关闭下绑定父 CPU + task_fork
     let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     let fork_cpu = smp_get_processor_id();
     __set_task_cpu(pcb, fork_cpu);
@@ -1431,7 +1597,7 @@ pub fn wake_up_new_task(pcb: &Arc<ProcessControlBlock>) {
         WakeupFlags::WF_FORK.bits(),
     );
     let target_cpu = if target_cpu == ProcessorId::INVALID {
-        log::warn!(
+        log::error!(
             "wake_up_new_task: select_task_rq returned INVALID for pid={:?}, fallback to current CPU",
             pcb.raw_pid()
         );
@@ -1465,22 +1631,46 @@ pub fn wake_up_new_task(pcb: &Arc<ProcessControlBlock>) {
     // TODO: 当 RT 调度实现后，需在此添加 sched_class::task_woken 回调
 }
 
-/// task_cpu(): 返回 task 当前所在的 CPU（由 sched_entity → cfs_rq → rq 链读取）。
+/// 返回任务当前绑定的 CPU。
+/// 不通过 cfs_rq 计算，避免 cfs_rq 指针陈旧时返回错误 CPU。
 #[inline]
 pub fn task_cpu(pcb: &Arc<ProcessControlBlock>) -> ProcessorId {
-    pcb.sched_info().sched_entity().cfs_rq().rq().cpu()
+    pcb.sched_info().cpu()
 }
 
 pub(crate) fn __set_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {
-    debug_assert!(
-        cpu_is_online(cpu) || boot_in_progress(),
-        "__set_task_cpu target cpu {:?} must be online outside boot",
-        cpu
+    if smp_cpu_manager_initialized() && !boot_in_progress() {
+        assert!(
+            cpu_is_online(cpu),
+            "__set_task_cpu target cpu {:?} must be online outside boot",
+            cpu
+        );
+    }
+
+    let on_rq = *pcb.sched_info().on_rq.lock_irqsave();
+    assert!(
+        on_rq != OnRq::Queued,
+        "__set_task_cpu called on pid={:?} with on_rq=Queued! \
+         old_cpu={:?} -> new_cpu={:?}. \
+         Caller is corrupting cfs_rq while task is in rbtree.",
+        pcb.raw_pid(),
+        pcb.sched_info().cpu(),
+        cpu,
     );
 
-    // 只更新 set_task_rq (cfs_rq 指针)，
-    // 不设置 on_cpu。on_cpu 由 prepare_task() 在 context_switch 前设置。
-    // TODO: Fixme There is not implement group sched;
+    let old_cpu = pcb.sched_info().cpu();
+    if old_cpu != cpu {
+        log::trace!(
+            "__set_task_cpu: pid={:?} old_cpu={:?} -> new_cpu={:?} on_rq={:?}",
+            pcb.raw_pid(),
+            old_cpu,
+            cpu,
+            on_rq,
+        );
+    }
+
+    // 先更新 cpu 字段，再更新 cfs_rq。on_cpu 由 prepare_task() 在 context_switch 前设置
+    pcb.sched_info().set_cpu(cpu);
     if pcb.sched_info().policy() == SchedPolicy::CFS {
         let se = pcb.sched_info().sched_entity();
         let rq = cpu_rq(cpu.data() as usize);

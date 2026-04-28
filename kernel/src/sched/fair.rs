@@ -9,8 +9,7 @@ use crate::libs::spinlock::SpinLock;
 use crate::process::ProcessControlBlock;
 use crate::process::ProcessFlags;
 use crate::sched::clock::ClockUpdataFlag;
-use crate::sched::{cpu_rq, SchedFeature, SCHED_FEATURES};
-use crate::smp::cpu::ProcessorId;
+use crate::sched::{SchedFeature, SCHED_FEATURES};
 use crate::time::jiffies::TICK_NESC;
 use crate::time::timer::clock;
 use crate::time::NSEC_PER_MSEC;
@@ -1464,36 +1463,6 @@ impl Default for CfsRunQueue {
     }
 }
 
-pub fn migrate_task(pcb: &Arc<ProcessControlBlock>, src_cpu: ProcessorId, dst_cpu: ProcessorId) {
-    if src_cpu == dst_cpu {
-        return;
-    }
-    let (first_cpu, second_cpu) = if src_cpu < dst_cpu {
-        (src_cpu, dst_cpu)
-    } else {
-        (dst_cpu, src_cpu)
-    };
-    let first_rq = cpu_rq(first_cpu.data() as usize);
-    let second_rq = cpu_rq(second_cpu.data() as usize);
-    let (mut first_rq, _g1) = first_rq.self_lock();
-    let (mut second_rq, _g2) = second_rq.self_lock();
-    first_rq.update_rq_clock();
-    second_rq.update_rq_clock();
-    let (src_rq, dst_rq) = if src_cpu == first_cpu {
-        (&mut first_rq, &mut second_rq)
-    } else {
-        (&mut second_rq, &mut first_rq)
-    };
-    assert!(pcb.sched_info().on_cpu() != Some(src_cpu));
-    assert!(pcb
-        .sched_info()
-        .cpus_allowed()
-        .get(dst_cpu)
-        .unwrap_or(false));
-    unsafe { src_rq.cfs_rq().force_mut() }.detach_task(pcb, src_rq);
-    unsafe { dst_rq.cfs_rq().force_mut() }.attach_task(pcb, dst_rq);
-}
-
 pub struct CompletelyFairScheduler;
 
 impl CompletelyFairScheduler {
@@ -1698,8 +1667,7 @@ impl Scheduler for CompletelyFairScheduler {
     }
 
     fn yield_task(rq: &mut CpuRunQueue) {
-        let curr = rq.current();
-        let se = curr.sched_info().sched_entity();
+        let se = rq.current_ref().sched_info().sched_entity();
         let binding = se.cfs_rq();
         let cfs_rq = unsafe { binding.force_mut() };
 
@@ -1723,8 +1691,7 @@ impl Scheduler for CompletelyFairScheduler {
         pcb: &Arc<crate::process::ProcessControlBlock>,
         wake_flags: WakeupFlags,
     ) {
-        let curr = rq.current();
-        let mut se = curr.sched_info().sched_entity();
+        let mut se = rq.current_ref().sched_info().sched_entity();
         let mut pse = pcb.sched_info().sched_entity();
 
         if unlikely(Arc::ptr_eq(&se, &pse)) {
@@ -1754,11 +1721,15 @@ impl Scheduler for CompletelyFairScheduler {
             false
         };
 
-        if curr.flags().contains(ProcessFlags::NEED_SCHEDULE) {
+        if rq
+            .current_ref()
+            .flags()
+            .contains(ProcessFlags::NEED_SCHEDULE)
+        {
             return;
         }
 
-        if unlikely(curr.sched_info().policy() == SchedPolicy::IDLE)
+        if unlikely(rq.current_ref().sched_info().policy() == SchedPolicy::IDLE)
             && likely(pcb.sched_info().policy() != SchedPolicy::IDLE)
         {
             rq.resched_current();
@@ -1887,13 +1858,12 @@ impl Scheduler for CompletelyFairScheduler {
             let curr = cfs_rq.current();
             let next = cfs_rq.pick_next_entity();
 
-            // Determine winner between curr (if valid) and next (from tree)
             let winner = if let Some(c) = curr.clone() {
-                // If curr is valid (prev is running CFS), we compare.
-                // Note: c is an ancestor of prev.
-                if prev_cfs_valid {
+                // 迁移后 cfs_rq.current 可能悬空：dequeue_entity 将 on_rq 置为 None，
+                // 但不清除 cfs_rq.current。用 on_rq() 守护，避免调度已迁移/已退出实体
+                // （Linux 的 pick_next_task_fair 不在此处比较 cfs_rq->curr）
+                if prev_cfs_valid && c.on_rq() {
                     if let Some(n) = &next {
-                        // Simple vruntime comparison
                         if n.vruntime < c.vruntime {
                             n.clone()
                         } else {
@@ -1903,7 +1873,6 @@ impl Scheduler for CompletelyFairScheduler {
                         c
                     }
                 } else {
-                    // curr is invalid (blocked or not CFS), must pick next
                     next?
                 }
             } else {

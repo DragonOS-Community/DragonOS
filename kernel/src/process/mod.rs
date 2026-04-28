@@ -23,7 +23,6 @@ use system_error::SystemError;
 
 use crate::{
     arch::{
-        cpu::current_cpu_id,
         ipc::signal::{AtomicSignal, SigSet, Signal},
         process::ArchPCBInfo,
         CurrentIrqArch, SigStackArch,
@@ -254,6 +253,7 @@ impl ProcessManager {
             .as_mut()
             .unwrap()
             .insert(pcb.raw_pid(), pcb.clone());
+        crate::sched::loadavg::inc_nr_threads();
     }
 
     pub(crate) fn exchange_tid_and_raw_pids(
@@ -288,7 +288,6 @@ impl ProcessManager {
         pcb: &Arc<ProcessControlBlock>,
         prev_cpu: ProcessorId,
         wake_flags: WakeupFlags,
-        was_uninterruptible: bool,
     ) {
         ProcessManager::current_pcb().sched_info().record_wakee(pcb);
 
@@ -309,9 +308,8 @@ impl ProcessManager {
         };
 
         if target_cpu != smp_get_processor_id() {
-            if target_cpu != prev_cpu {
-                crate::sched::__set_task_cpu(pcb, target_cpu);
-            }
+            // 远程唤醒：将任务挂到目标 CPU 的 WakeQueue，由目标 CPU 的 IPI handler
+            // 负责在正确的 source rq 上递减 nr_iowait 并执行 __set_task_cpu。
             crate::sched::ttwu_queue(pcb, target_cpu, wake_flags);
             return;
         }
@@ -320,15 +318,30 @@ impl ProcessManager {
         let (rq, _guard) = rq.self_lock();
         rq.update_rq_clock();
 
-        if was_uninterruptible {
+        // 唤醒时检查 sched_contributes_to_load 并递减 nr_uninterruptible。
+        // 必须清除标志，防止任务后续被 stop/resume 时重复递减。
+        if pcb
+            .flags()
+            .contains(ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD)
+        {
             rq.dec_nr_uninterruptible();
+            pcb.flags().remove(ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD);
         }
 
         let mut flags = EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK;
+        // nr_iowait 必须在 __set_task_cpu 之前在 source rq 上递减。
+        if pcb.flags().contains(ProcessFlags::IN_IOWAIT) {
+            if target_cpu != prev_cpu {
+                cpu_rq(prev_cpu.data() as usize).dec_nr_iowait();
+            } else {
+                rq.dec_nr_iowait();
+            }
+        }
         if target_cpu != prev_cpu {
             crate::sched::__set_task_cpu(pcb, target_cpu);
             flags |= EnqueueFlag::ENQUEUE_MIGRATED;
         }
+
         rq.activate_task(pcb, flags);
         rq.check_preempt_currnet(pcb, wake_flags);
     }
@@ -338,7 +351,6 @@ impl ProcessManager {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let state = pcb.sched_info().inner_lock_read_irqsave().state();
         if state.is_blocked() {
-            let was_uninterruptible = matches!(state, ProcessState::Blocked(false));
             let mut writer = pcb.sched_info().inner_lock_write_irqsave();
             let state = writer.state();
             if state.is_blocked() {
@@ -347,7 +359,7 @@ impl ProcessManager {
                 drop(writer);
 
                 let prev_cpu = task_cpu(pcb);
-                Self::ttwu_do_activate(pcb, prev_cpu, WakeupFlags::WF_TTWU, was_uninterruptible);
+                Self::ttwu_do_activate(pcb, prev_cpu, WakeupFlags::WF_TTWU);
                 return Ok(());
             } else if state.is_exited() {
                 return Err(SystemError::EINVAL);
@@ -439,7 +451,7 @@ impl ProcessManager {
                 drop(writer);
 
                 let prev_cpu = task_cpu(pcb);
-                Self::ttwu_do_activate(pcb, prev_cpu, WakeupFlags::WF_TTWU, false);
+                Self::ttwu_do_activate(pcb, prev_cpu, WakeupFlags::WF_TTWU);
                 return Ok(());
             } else if state.is_runnable() {
                 return Ok(());
@@ -517,6 +529,27 @@ impl ProcessManager {
             return Ok(());
         }
         return Err(SystemError::EINTR);
+    }
+
+    /// TASK_KILLABLE (TASK_UNINTERRUPTIBLE | TASK_WAKEKILL)。
+    /// 仅 fatal signal (SIGKILL) 可唤醒，非 fatal signal 不中断睡眠。
+    pub fn mark_sleep_killable() -> Result<(), SystemError> {
+        assert!(
+            !CurrentIrqArch::is_irq_enabled(),
+            "interrupt must be disabled before enter ProcessManager::mark_sleep_killable()"
+        );
+        let pcb = ProcessManager::current_pcb();
+        let mut writer = pcb.sched_info().inner_lock_write_irqsave();
+        if !matches!(writer.state(), ProcessState::Exited(_)) {
+            writer.set_state(ProcessState::Blocked(false));
+            writer.set_wake_kill();
+            writer.set_sleep();
+            pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
+            fence(Ordering::SeqCst);
+            drop(writer);
+            return Ok(());
+        }
+        Err(SystemError::EINTR)
     }
 
     /// 标志当前进程为停止状态，但是发起调度的工作，应该由调用者完成
@@ -900,6 +933,7 @@ impl ProcessManager {
             }
 
             ALL_PROCESS.lock_irqsave().as_mut().unwrap().remove(&pid);
+            crate::sched::loadavg::dec_nr_threads();
         }
     }
 
@@ -1109,6 +1143,9 @@ bitflags! {
         const IN_IOWAIT = 1 << 13;
         /// 线程组 exec 期间延迟 PID/TGID/PGID/SID 的 unhash
         const DEFER_UNHASH = 1 << 14;
+        /// 进入 UNINTERRUPTIBLE 睡眠时在 __schedule 中设置，
+        /// 唤醒时在 ttwu_do_activate 中读取并递减 nr_uninterruptible。
+        const SCHED_CONTRIBUTES_TO_LOAD = 1 << 15;
     }
 }
 
@@ -1170,6 +1207,10 @@ pub struct ProcessControlBlock {
     basic: RwLock<ProcessBasicInfo>,
     /// 当前进程的自旋锁持有计数
     preempt_count: AtomicUsize,
+    /// 自愿上下文切换次数（进程主动调用 schedule / mark_sleep 等放弃 CPU）
+    nvcsw: AtomicUsize,
+    /// 非自愿上下文切换次数（进程被抢占，如时间片用完、更高优先级任务就绪）
+    nivcsw: AtomicUsize,
 
     flags: LockFreeFlags<ProcessFlags>,
     worker_private: SpinLock<Option<WorkerPrivate>>,
@@ -1347,6 +1388,8 @@ impl ProcessControlBlock {
                 nsproxy: RwLock::new(nsproxy),
                 basic: basic_info,
                 preempt_count,
+                nvcsw: AtomicUsize::new(0),
+                nivcsw: AtomicUsize::new(0),
                 flags,
                 kernel_stack: RwLock::new(kstack),
                 syscall_stack: RwLock::new(KernelStack::new().unwrap()),
@@ -1563,6 +1606,16 @@ impl ProcessControlBlock {
     #[inline(always)]
     pub unsafe fn set_preempt_count(&self, count: usize) {
         self.preempt_count.store(count, Ordering::SeqCst);
+    }
+
+    #[inline]
+    pub fn inc_nvcsw(&self) {
+        self.nvcsw.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_nivcsw(&self) {
+        self.nivcsw.fetch_add(1, Ordering::Relaxed);
     }
 
     #[inline(always)]
@@ -2430,6 +2483,9 @@ pub struct InnerSchedInfo {
     state: ProcessState,
     /// 进程的调度策略
     sleep: bool,
+    /// TASK_WAKEKILL：仅 fatal signal 可唤醒。
+    /// 由 mark_sleep_killable() 设置，__schedule 读取后通过 set_wakeup() 清除。
+    wake_kill: bool,
 }
 
 impl InnerSchedInfo {
@@ -2447,10 +2503,19 @@ impl InnerSchedInfo {
 
     pub fn set_wakeup(&mut self) {
         self.sleep = false;
+        self.wake_kill = false;
     }
 
     pub fn is_mark_sleep(&self) -> bool {
         self.sleep
+    }
+
+    pub fn is_wake_kill(&self) -> bool {
+        self.wake_kill
+    }
+
+    pub fn set_wake_kill(&mut self) {
+        self.wake_kill = true;
     }
 }
 
@@ -2477,6 +2542,7 @@ impl ProcessSchedulerInfo {
             inner_locked: RwLock::new(InnerSchedInfo {
                 state: ProcessState::Blocked(false),
                 sleep: false,
+                wake_kill: false,
             }),
             // virtual_runtime: AtomicIsize::new(0),
             // rt_time_slice: AtomicIsize::new(0),

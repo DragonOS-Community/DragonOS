@@ -201,23 +201,32 @@ impl LoadBalancer {
 
     /// 对齐 Linux find_idlest_group_cpu (fair.c:6933) 的负载估算。
     /// Linux 优先检查 sched_idle_cpu / available_idle_cpu，再比较 load_avg。
-    /// 当前使用 nr_running 作为主要指标：nr_running == 0 的 CPU 比有任务的 CPU 优先。
-    /// 这避免了 PELT load_avg 在系统刚启动时全为 0 导致无法区分 CPU 的问题。
+    /// 优先使用 PELT load_avg；当 PELT 为 0 时回退到 nr_running，
+    /// 避免系统刚启动时 PELT 全为 0 导致无法区分 CPU 的问题。
     #[inline]
     fn get_rq_load_lockless(rq: &Arc<CpuRunQueue>) -> u64 {
-        rq.nr_running_lockless() as u64
+        let pelt = rq.cfs_rq().load_avg_lockless() as u64;
+        if pelt > 0 {
+            pelt
+        } else {
+            rq.nr_running_lockless() as u64
+        }
     }
 
-    /// Linux idle_cpu() (core.c:7325): rq->curr == rq->idle && !rq->nr_running.
+    /// Linux idle_cpu(): rq->curr == rq->idle && !rq->nr_running.
+    ///
+    /// 此函数在 select_task_rq 路径中无锁调用，不能使用 current_ref()（要求 rq lock）。
+    /// 使用 current_ptr_lockless()（AtomicPtr Acquire 加载）做指针比较，避免 Option<Arc>
+    /// 非原子读取导致的数据竞争。
     #[inline]
     fn is_idle_cpu(cpu: ProcessorId) -> bool {
         if cpu == ProcessorId::INVALID {
             return false;
         }
         let rq = cpu_rq(cpu.data() as usize);
-        let curr = rq.current();
+        let curr_ptr = rq.current_ptr_lockless();
         let idle = rq.idle();
-        let is_idle_task = idle.upgrade().is_some_and(|i| Arc::ptr_eq(&curr, &i));
+        let is_idle_task = idle.upgrade().is_some_and(|i| Arc::as_ptr(&i) == curr_ptr);
         is_idle_task && rq.nr_running_lockless() == 0
     }
 
@@ -856,12 +865,10 @@ pub fn load_balance(
         drop(_g2);
         drop(_g1);
 
-        // LBF_NEED_BREAK: 释放锁后重试（对齐 Linux fair.c:11141-11146 more_balance）
+        // LBF_NEED_BREAK: DragonOS 缺少 TASK_ON_RQ_MIGRATING 保护，
+        // 释放锁后重新获取会导致 TOCTOU 竞态。不再重试。
         if env.flags.contains(LbfFlags::NEED_BREAK) {
             env.flags -= LbfFlags::NEED_BREAK;
-            if (env.loop_ctr as usize) < busiest_rq_arc.nr_running_lockless() {
-                continue;
-            }
         }
 
         // LBF_DST_PINNED: 更换 dst_cpu 后重试（对齐 Linux fair.c:11167-11182）

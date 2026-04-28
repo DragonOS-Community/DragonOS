@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use system_error::SystemError;
 
 use crate::{
@@ -65,9 +63,6 @@ impl Completion {
             if remaining.is_some_and(|r| r <= 0) {
                 return Ok(0);
             }
-            if remaining.is_some_and(|r| r <= 0) {
-                return Ok(0);
-            }
 
             // 构造一次等待 + 可选超时定时器
             let (waiter, waker) = Waiter::new_pair();
@@ -129,6 +124,7 @@ impl Completion {
 
     /// @brief 等待指定时间，超时后就返回, 同时设置pcb state为uninteruptible.
     /// @param timeout 非负整数，等待指定时间，超时后就返回/或者提前done
+    #[allow(dead_code)]
     pub fn wait_for_completion_timeout(&self, timeout: i64) -> Result<i64, SystemError> {
         self.do_wait_for_common(timeout, false)
     }
@@ -143,6 +139,7 @@ impl Completion {
         self.do_wait_for_common(MAX_TIMEOUT, true)
     }
 
+    #[allow(dead_code)]
     pub fn wait_for_completion_interruptible_timeout(
         &mut self,
         timeout: i64,
@@ -173,15 +170,14 @@ impl Completion {
     ///
     /// @return true - 表示不需要wait_for_completion，并且已经获取到了一个completion(即返回true意味着done已经被 减1 )
     /// @return false - 表示当前done=0，您需要进入等待，即wait_for_completion
+    #[allow(dead_code)]
     pub fn try_wait_for_completion(&mut self) -> bool {
         let mut inner = self.inner.lock_irqsave();
         if inner.done == 0 {
             return false;
         }
 
-        if inner.done != 0 {
-            return false;
-        } else if inner.done != COMPLETE_ALL {
+        if inner.done != COMPLETE_ALL {
             inner.done -= 1;
         }
         return true;
@@ -189,17 +185,10 @@ impl Completion {
     }
 
     // @brief 测试一个completion是否有waiter。（即done是不是等于0）
+    #[allow(dead_code)]
     pub fn completion_done(&self) -> bool {
         let inner = self.inner.lock_irqsave();
-        if inner.done == 0 {
-            return false;
-        }
-
-        if inner.done == 0 {
-            return false;
-        }
-        return true;
-        // 脱离生命周期，自动释放guard
+        inner.done != 0
     }
 }
 #[derive(Debug)]

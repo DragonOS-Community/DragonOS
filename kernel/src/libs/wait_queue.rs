@@ -897,7 +897,7 @@ fn block_current_killable(waiter: &Waiter) -> Result<(), SystemError> {
             WakerSleepState::Sleeping => {}
         }
 
-        ProcessManager::mark_sleep(true)?;
+        ProcessManager::mark_sleep_killable()?;
 
         if waiter.waker.consume_notification() {
             let pcb = ProcessManager::current_pcb();

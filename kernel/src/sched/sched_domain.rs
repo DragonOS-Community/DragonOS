@@ -3,6 +3,8 @@
 //! 用于周期性 CPU 负载均衡。
 //! 当前未实现 NUMA、cgroups、sched-debug 相关字段。
 
+#![allow(dead_code)]
+
 use alloc::sync::{Arc, Weak};
 
 use crate::libs::cpumask::CpuMask;
@@ -38,9 +40,10 @@ pub const SD_ASYM_PACKING: u64 = 1 << 9;
 
 /// 描述调度组在负载均衡时的状态
 /// 按拉取优先级排序，优先级最低的在前，以便直接比较 `group_type` 来选择最忙的组。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum GroupType {
     /// 组有剩余容量可运行更多任务
+    #[default]
     HasSpare = 0,
     /// 组已满负荷，任务不竞争更多 CPU 周期
     FullyBusy,
@@ -48,11 +51,6 @@ pub enum GroupType {
     Imbalanced,
     /// CPU 过载，无法为所有任务提供预期周期
     Overloaded,
-}
-impl Default for GroupType {
-    fn default() -> Self {
-        GroupType::HasSpare
-    }
 }
 
 /// 迁移类型

@@ -5,7 +5,7 @@ use system_error::SystemError;
 use crate::arch::driver::apic::{CurrentApic, LocalAPIC};
 
 use crate::{
-    sched::{cpu_rq, cpu_wakequeue, task_cpu, EnqueueFlag, SchedMode, WakeupFlags, __schedule},
+    sched::{cpu_rq, cpu_wakequeue, task_cpu, EnqueueFlag, WakeupFlags},
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
 };
 
@@ -70,31 +70,53 @@ impl IrqHandler for KickCpuIpiHandler {
         let cpu = smp_get_processor_id();
         let wq = cpu_wakequeue(cpu.data() as usize);
         for pcb in wq.drain() {
-            let was_uninterruptible = matches!(
-                pcb.sched_info().inner_lock_read_irqsave().state(),
-                crate::process::ProcessState::Blocked(false)
-            );
+            let state = pcb.sched_info().inner_lock_read_irqsave().state();
+            // 已退出进程不可被唤醒，跳过过期条目以防重新入队。
+            if state.is_exited() {
+                continue;
+            }
 
             let rq = cpu_rq(cpu.data() as usize);
             let (rq, _guard) = rq.self_lock();
             rq.update_rq_clock();
 
             let prev_cpu = task_cpu(&pcb);
-            if prev_cpu != cpu {
+            let migrated = prev_cpu != cpu;
+            // nr_iowait 在 __set_task_cpu 之前在 source rq 递减。
+            if pcb
+                .flags()
+                .contains(crate::process::ProcessFlags::IN_IOWAIT)
+            {
+                if migrated {
+                    cpu_rq(prev_cpu.data() as usize).dec_nr_iowait();
+                } else {
+                    rq.dec_nr_iowait();
+                }
+            }
+            if migrated {
                 crate::sched::__set_task_cpu(&pcb, cpu);
             }
             let mut flags = EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK;
-            if prev_cpu != cpu {
+            if migrated {
                 flags |= EnqueueFlag::ENQUEUE_MIGRATED;
             }
-            if was_uninterruptible {
+
+            // dec nr_uninterruptible 后必须清除标志，防止后续 stop/resume 路径重复递减。
+            if pcb
+                .flags()
+                .contains(crate::process::ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD)
+            {
                 rq.dec_nr_uninterruptible();
+                pcb.flags()
+                    .remove(crate::process::ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD);
             }
+
             rq.activate_task(&pcb, flags);
             rq.check_preempt_currnet(&pcb, WakeupFlags::WF_MIGRATED);
         }
 
-        __schedule(SchedMode::SM_PREEMPT);
+        // 不直接调用 __schedule；让 check_preempt_currnet 或 NEED_SCHEDULE 标志
+        // 在从中断返回时由正常路径处理
         Ok(IrqReturn::Handled)
     }
 }

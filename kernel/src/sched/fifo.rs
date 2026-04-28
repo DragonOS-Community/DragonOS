@@ -112,11 +112,10 @@ impl Scheduler for FifoScheduler {
     }
 
     fn yield_task(rq: &mut CpuRunQueue) {
-        let curr = rq.current();
-        if curr.sched_info().policy() != SchedPolicy::FIFO {
+        if rq.current_ref().sched_info().policy() != SchedPolicy::FIFO {
             return;
         }
-        rq.fifo.yield_current(&curr);
+        rq.fifo.yield_current(&rq.current());
         rq.resched_current();
     }
 
@@ -125,14 +124,13 @@ impl Scheduler for FifoScheduler {
         pcb: &Arc<ProcessControlBlock>,
         _flags: WakeupFlags,
     ) {
-        let curr = rq.current();
-        if curr.sched_info().policy() != SchedPolicy::FIFO {
+        if rq.current_ref().sched_info().policy() != SchedPolicy::FIFO {
             rq.resched_current();
             return;
         }
 
         let new_prio = Self::rt_prio(pcb);
-        let curr_prio = Self::rt_prio(&curr);
+        let curr_prio = Self::rt_prio(rq.current_ref());
         if PrioUtil::rt_prio(new_prio) && PrioUtil::rt_prio(curr_prio) && new_prio < curr_prio {
             rq.resched_current();
         }

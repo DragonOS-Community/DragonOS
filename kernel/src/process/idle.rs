@@ -69,7 +69,7 @@ impl ProcessManager {
 
             let rq = cpu_rq(i as usize);
             let (rq, _guard) = rq.self_lock();
-            rq.set_current(Arc::downgrade(&idle_pcb));
+            rq.set_current(idle_pcb.clone());
             rq.set_idle(Arc::downgrade(&idle_pcb));
             IDLE_CPUS.set(ProcessorId::new(i));
 

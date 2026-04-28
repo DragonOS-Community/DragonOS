@@ -1,9 +1,6 @@
 use core::sync::atomic::{AtomicI32, Ordering};
 
-use log::debug;
 use system_error::SystemError;
-
-use crate::process::ProcessManager;
 
 use super::wait_queue::WaitQueue;
 
@@ -45,6 +42,7 @@ impl Semaphore {
             self.counter.fetch_add(1, Ordering::Relaxed);
 
             // 资源不足，阻塞等待计数可用
+            // Mesa 风格无锁信号量
             let _ = self.wait_queue.wait_event_uninterruptible(
                 || self.counter.load(Ordering::Acquire) > 0,
                 None::<fn()>,
@@ -55,16 +53,9 @@ impl Semaphore {
     #[allow(dead_code)]
     #[inline]
     fn up(&self) {
-        // 判断有没有进程在等待资源
-        if !self.wait_queue.is_empty() {
-            self.counter.fetch_add(1, Ordering::Release);
-        } else if !self.wait_queue.wakeup(None) {
-            //如果唤醒失败,打印错误信息
-            debug!(
-                "Semaphore wakeup failed: current pid= {}, semaphore={:?}",
-                ProcessManager::current_pcb().raw_pid().into(),
-                self
-            );
-        }
+        // Mesa 风格无锁信号量：总是增加计数，然后尝试唤醒一个等待者。
+        // 如需严格对齐 Linux，需引入 SpinLock 并改为 Hoare 风格的锁内队列操作。
+        self.counter.fetch_add(1, Ordering::Release);
+        self.wait_queue.wakeup(None);
     }
 }

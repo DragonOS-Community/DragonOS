@@ -20,11 +20,8 @@ use crate::{
     libs::{cpumask::CpuMask, rwsem::RwSem},
     mm::VirtAddr,
     process::ProcessFlags,
-    sched::{cpu_is_online, sched_cgroup_fork, sched_fork, sched_set_new_task_cpu},
-    smp::{
-        core::smp_get_processor_id,
-        cpu::{smp_cpu_manager_initialized, ProcessorId},
-    },
+    sched::{cpu_is_online, sched_cgroup_fork, sched_fork},
+    smp::cpu::{smp_cpu_manager_initialized, ProcessorId},
     syscall::user_access::UserBufferWriter,
 };
 
@@ -105,6 +102,7 @@ bitflags! {
 pub struct KernelCloneArgs {
     pub flags: CloneFlags,
     pub target_cpu: Option<ProcessorId>,
+    pub cpus_allowed: Option<CpuMask>,
 
     // 下列属性均来自用户空间
     pub pidfd: VirtAddr,
@@ -137,6 +135,7 @@ impl KernelCloneArgs {
         Self {
             flags: unsafe { CloneFlags::from_bits_unchecked(0) },
             target_cpu: None,
+            cpus_allowed: None,
             pidfd: null_addr,
             child_tid: null_addr,
             parent_tid: null_addr,
@@ -192,6 +191,7 @@ impl KernelCloneArgs {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn resolve_target_cpu(
         &mut self,
         default_cpu: ProcessorId,
@@ -251,27 +251,33 @@ impl ProcessManager {
         current_trapframe: &TrapFrame,
         clone_flags: CloneFlags,
     ) -> Result<RawPid, SystemError> {
+        let mut args = KernelCloneArgs::new();
+        args.flags = clone_flags;
+        args.exit_signal = Signal::SIGCHLD;
+        Self::fork_with_args(current_trapframe, args)
+    }
+
+    pub fn fork_with_args(
+        current_trapframe: &TrapFrame,
+        args: KernelCloneArgs,
+    ) -> Result<RawPid, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
 
         let new_kstack: KernelStack = KernelStack::new()?;
 
         let name = current_pcb.basic().name().to_string();
 
-        let mut args = KernelCloneArgs::new();
-        args.flags = clone_flags;
-        args.exit_signal = Signal::SIGCHLD;
         args.verify()?;
         let pcb = ProcessControlBlock::new(name, new_kstack);
-        let target_cpu =
-            Self::copy_process(&current_pcb, &pcb, args, current_trapframe).map_err(|e| {
-                error!(
-                    "fork: Failed to copy process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                    current_pcb.raw_pid(),
-                    pcb.raw_pid(),
-                    e
-                );
+        Self::copy_process(&current_pcb, &pcb, args, current_trapframe).map_err(|e| {
+            error!(
+                "fork: Failed to copy process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
+                current_pcb.raw_pid(),
+                pcb.raw_pid(),
                 e
-            })?;
+            );
+            e
+        })?;
         // if pcb.raw_pid().data() > 1 {
         //     log::debug!(
         //         "fork done, pid: {}, pgid: {:?}, tgid: {:?}, sid: {}",
@@ -282,9 +288,7 @@ impl ProcessManager {
         //     );
         // }
 
-        sched_set_new_task_cpu(&pcb, target_cpu);
-
-        ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {
+        ProcessManager::wakeup_new_task(&pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to wakeup new process, pid: [{:?}]. Error: {:?}",
                 pcb.raw_pid(),
@@ -503,7 +507,7 @@ impl ProcessManager {
     /// - pcb 目标pcb
     ///
     /// ## return
-    /// - 成功时返回本次 fork 最终解析出的目标 CPU
+    /// - 成功时返回Ok(())
     /// - 发生错误时返回Err(SystemError)
     #[inline(never)]
     pub fn copy_process(
@@ -511,7 +515,7 @@ impl ProcessManager {
         pcb: &Arc<ProcessControlBlock>,
         mut clone_args: KernelCloneArgs,
         current_trapframe: &TrapFrame,
-    ) -> Result<ProcessorId, SystemError> {
+    ) -> Result<(), SystemError> {
         let clone_flags = clone_args.flags;
         // 不允许与不同namespace的进程共享根目录
 
@@ -611,6 +615,9 @@ impl ProcessManager {
         if current_pcb.raw_pid() != RawPid(0) {
             pcb.sched_info()
                 .set_cpus_allowed(current_pcb.sched_info().cpus_allowed());
+        }
+        if let Some(cpus_allowed) = clone_args.cpus_allowed.take() {
+            pcb.sched_info().set_cpus_allowed(cpus_allowed);
         }
         clone_args.validate_requested_target_cpu(&pcb.sched_info().cpus_allowed())?;
 
@@ -923,16 +930,13 @@ impl ProcessManager {
             writer.copy_one_to_user(&(pcb.raw_pid().0 as i32), 0)?;
         }
 
-        // 对于 target_cpu=None，必须在 fork 长路径的末尾才解析默认 CPU，
-        // 否则父任务在 copy_process() 期间迁移后，会把子任务错误地绑定到过早采样的 CPU。
-        let target_cpu = clone_args
-            .resolve_target_cpu(smp_get_processor_id(), &pcb.sched_info().cpus_allowed())?;
+        pcb.sched_info().mark_new_task(clone_args.target_cpu);
         sched_cgroup_fork(pcb);
 
         // 处理 rseq 状态
         crate::process::rseq::rseq_fork(pcb, clone_flags.contains(CloneFlags::CLONE_VM));
 
-        Ok(target_cpu)
+        Ok(())
     }
 
     fn copy_fs(

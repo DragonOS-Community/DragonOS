@@ -7,7 +7,9 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SCHED_SETAFFINITY;
 use crate::libs::cpumask::CpuMask;
 use crate::process::{ProcessManager, RawPid};
-use crate::sched::syscall::util::has_sched_setaffinity_permission;
+use crate::sched::{
+    request_task_migration, select_task_rq, syscall::util::has_sched_setaffinity_permission,
+};
 use crate::smp::cpu::smp_cpu_manager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::UserBufferReader;
@@ -55,7 +57,22 @@ impl Syscall for SysSchedSetaffinity {
             }
         }
 
-        target_pcb.sched_info().set_cpus_allowed(mask);
+        {
+            let _placement_guard = target_pcb.sched_info().placement_lock();
+            target_pcb.sched_info().set_cpus_allowed(mask.clone());
+        }
+
+        if target_pcb.sched_info().is_new_task() {
+            return Ok(0);
+        }
+
+        if let Some(cpu) = target_pcb.sched_info().on_cpu() {
+            if !mask.get(cpu).unwrap_or(false) {
+                let dest_cpu = select_task_rq(&target_pcb, cpu, crate::sched::WakeupFlags::WF_TTWU);
+                request_task_migration(&target_pcb, dest_cpu)?;
+            }
+        }
+
         Ok(0)
     }
 

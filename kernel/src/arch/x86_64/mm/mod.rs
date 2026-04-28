@@ -525,8 +525,13 @@ const fn protection_map() -> [EntryFlags<MMArch>; 16] {
 }
 
 impl X86_64MMArch {
-    fn init_xd_rsvd() {
-        // 读取并确保开启 NXE，使用户态 PROT_EXEC 正确受 NX 约束
+    /// Initialize the per-CPU XD/NX capability state.
+    ///
+    /// EFER.NXE is an MSR bit, so every CPU that can run user tasks must enable it before
+    /// using page tables that contain `ENTRY_FLAG_NO_EXEC`. Otherwise hardware treats bit 63
+    /// in PTEs as reserved and raises an RSVD page fault.
+    pub(crate) fn init_xd_rsvd() {
+        // 读取并确保开启 NXE，使用户态 PROT_EXEC 正确受 NX 约束。
         let mut efer = x86_64::registers::model_specific::Efer::read();
         if !efer.contains(EferFlags::NO_EXECUTE_ENABLE) {
             debug!("Enabling EFER.NXE for NX support");

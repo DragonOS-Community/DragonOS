@@ -636,6 +636,15 @@ impl ProcessManager {
             )
         });
 
+        crate::process::seccomp::copy_seccomp(
+            current_pcb
+                .seccomp_mode
+                .load(core::sync::atomic::Ordering::Relaxed),
+            &current_pcb.seccomp_filter,
+            &pcb.seccomp_mode,
+            &pcb.seccomp_filter,
+        );
+
         // 拷贝文件描述符表
         Self::copy_files(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(

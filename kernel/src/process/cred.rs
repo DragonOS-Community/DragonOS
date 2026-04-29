@@ -4,6 +4,7 @@ use core::sync::atomic::AtomicUsize;
 use alloc::vec::Vec;
 
 use super::namespace::user_namespace::{UserNamespace, INIT_USER_NAMESPACE};
+use crate::process::ProcessManager;
 
 const GLOBAL_ROOT_UID: Kuid = Kuid(0);
 const GLOBAL_ROOT_GID: Kgid = Kgid(0);
@@ -242,16 +243,75 @@ impl Cred {
         &self.groups
     }
 
-    /// 检查当前进程是否具有指定的capability
+    /// 检查当前进程是否具有指定的capability（在当前 user_ns 中）
     pub fn has_capability(&self, cap: CAPFlags) -> bool {
-        // 检查effective capability set中是否包含指定的capability
-        self.cap_effective.contains(cap)
+        cap_capable(self, &self.user_ns, cap)
     }
 
     /// 检查当前进程是否具有CAP_SYS_ADMIN权限
     pub fn has_cap_sys_admin(&self) -> bool {
         self.has_capability(CAPFlags::CAP_SYS_ADMIN)
     }
+}
+
+/// 检查 cred 在目标 user namespace 中是否具有指定 capability
+///
+/// 遵循 Linux cap_capable 的层次遍历规则：
+/// 1. 如果 cred 就在目标 ns 中，检查 effective cap
+/// 2. 如果 cred 的 ns 比目标更浅，返回 false
+/// 3. 如果 cred 的用户是目标 ns 的直接 owner，返回 true
+/// 4. 否则向上遍历 parent chain
+pub fn cap_capable(cred: &Cred, targ_ns: &Arc<UserNamespace>, cap: CAPFlags) -> bool {
+    let mut ns = targ_ns.clone();
+    loop {
+        if Arc::ptr_eq(&cred.user_ns, &ns) {
+            return cred.cap_effective.contains(cap);
+        }
+
+        if cred.user_ns.level() >= ns.level() {
+            return false;
+        }
+
+        let ns_owner = ns.inner.lock().owner;
+        if let Some(ref parent_weak) = ns.parent {
+            if let Some(parent_ns) = parent_weak.upgrade() {
+                if Arc::ptr_eq(&parent_ns, &cred.user_ns) && ns_owner == cred.euid.data() {
+                    return true;
+                }
+                ns = parent_ns;
+                continue;
+            }
+        }
+
+        return false;
+    }
+}
+
+/// 检查当前进程在指定 ns 中是否有某 capability
+pub fn ns_capable(ns: &Arc<UserNamespace>, cap: CAPFlags) -> bool {
+    let pcb = ProcessManager::current_pcb();
+    cap_capable(&pcb.cred(), ns, cap)
+}
+
+/// 检查当前进程在指定 ns 中是否有某 capability（setid 上下文）
+pub fn ns_capable_setid(ns: &Arc<UserNamespace>, cap: CAPFlags) -> bool {
+    ns_capable(ns, cap)
+}
+
+/// 当进程进入新的 user namespace 时重置 credentials
+///
+/// 遵循 Linux 语义：
+/// - 能力集重置为 FULL（在新 ns 中有全部能力）
+/// - securebits 重置为默认值
+/// - uid/gid/euid/egid/fsuid/fsgid **不改变**
+/// - user_ns 指向新的 namespace
+pub fn set_cred_user_ns(cred: &mut Cred, user_ns: Arc<UserNamespace>) {
+    cred.cap_inheritable = CAPFlags::CAP_EMPTY_SET;
+    cred.cap_permitted = CAPFlags::CAP_FULL_SET;
+    cred.cap_effective = CAPFlags::CAP_FULL_SET;
+    cred.cap_ambient = CAPFlags::CAP_EMPTY_SET;
+    cred.cap_bset = CAPFlags::CAP_FULL_SET;
+    cred.user_ns = user_ns;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

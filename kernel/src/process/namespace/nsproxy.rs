@@ -5,6 +5,7 @@ use system_error::SystemError;
 use crate::{
     filesystem::vfs::{IndexNode, VFS_MAX_FOLLOW_SYMLINK_TIMES},
     process::{
+        cred::Cred,
         fork::CloneFlags,
         namespace::{
             cgroup_namespace::{CgroupNamespace, INIT_CGROUP_NAMESPACE},
@@ -148,8 +149,18 @@ impl ProcessManager {
             return Ok(());
         }
 
-        // todo: 这里要添加一个对user_namespace的处理
-        // https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/nsproxy.c?r=&mo=3770&fi=151#165
+        let user_ns = if clone_flags.contains(CloneFlags::CLONE_NEWUSER) {
+            let mut new_cred = (*child_pcb.cred()).clone();
+            let new_user_ns =
+                crate::process::namespace::user_namespace::UserNamespace::create_user_ns(
+                    &new_cred,
+                )?;
+            crate::process::cred::set_cred_user_ns(&mut new_cred, new_user_ns.clone());
+            child_pcb.set_cred(Cred::new_arc(new_cred))?;
+            new_user_ns
+        } else {
+            child_pcb.cred().user_ns.clone()
+        };
 
         /*
          * CLONE_NEWIPC must detach from the undolist: after switching
@@ -164,7 +175,6 @@ impl ProcessManager {
         {
             return Err(SystemError::EINVAL);
         }
-        let user_ns = child_pcb.cred().user_ns.clone();
         let new_ns = create_new_namespaces(clone_flags, child_pcb, user_ns)?;
         // 设置新的nsproxy
 

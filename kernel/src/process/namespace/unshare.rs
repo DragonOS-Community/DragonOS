@@ -3,6 +3,7 @@ use alloc::sync::Arc;
 use system_error::SystemError;
 
 use crate::process::{
+    cred::Cred,
     fork::CloneFlags,
     namespace::nsproxy::{switch_task_namespaces, NsProxy},
     ProcessManager,
@@ -44,9 +45,18 @@ fn unshare_nsproxy_namespaces(
         return Ok(None);
     }
 
-    // 获取当前进程的 PCB
     let current_pcb = ProcessManager::current_pcb();
-    let user_ns = ProcessManager::current_user_ns();
+
+    let user_ns = if unshare_flags.contains(CloneFlags::CLONE_NEWUSER) {
+        let mut new_cred = (*current_pcb.cred()).clone();
+        let new_user_ns =
+            crate::process::namespace::user_namespace::UserNamespace::create_user_ns(&new_cred)?;
+        crate::process::cred::set_cred_user_ns(&mut new_cred, new_user_ns.clone());
+        current_pcb.set_cred(Cred::new_arc(new_cred))?;
+        new_user_ns
+    } else {
+        ProcessManager::current_user_ns()
+    };
 
     let nsproxy = super::nsproxy::create_new_namespaces(&unshare_flags, &current_pcb, user_ns)?;
     return Ok(Some(nsproxy));

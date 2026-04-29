@@ -4,7 +4,7 @@ use system_error::SystemError;
 
 use crate::{
     filesystem::vfs::file::{FilePrivateData, NamespaceFilePrivateData},
-    process::{fork::CloneFlags, ProcessManager, RawPid},
+    process::{cred::Cred, fork::CloneFlags, ProcessManager, RawPid},
 };
 
 use super::nsproxy::{switch_task_namespaces, NsProxy};
@@ -143,9 +143,12 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
             // 仅影响子进程 PID namespace，保持与 Linux 语义一致
             new_inner.pid_ns_for_children = ns;
         }
-        NamespaceFilePrivateData::User(_ns) => {
-            // 暂未实现 user namespace 切换
-            return Err(SystemError::EINVAL);
+        NamespaceFilePrivateData::User(ns) => {
+            if !flags.is_empty() && !flags.contains(CloneFlags::CLONE_NEWUSER) {
+                return Err(SystemError::EINVAL);
+            }
+            userns_install(&current, ns)?;
+            return Ok(());
         }
         NamespaceFilePrivateData::Cgroup(ns) => {
             if !flags.is_empty() && !flags.contains(CloneFlags::CLONE_NEWCGROUP) {
@@ -159,6 +162,35 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
 
     // 5. 原子切换当前任务的 namespace 代理
     switch_task_namespaces(&current, new_nsproxy)?;
+
+    Ok(())
+}
+
+/// 安装（切换）user namespace（对应 Linux userns_install）
+fn userns_install(
+    current: &Arc<crate::process::ProcessControlBlock>,
+    user_ns: Arc<super::user_namespace::UserNamespace>,
+) -> Result<(), SystemError> {
+    // 1. 不能与当前 ns 相同（防止重复获得能力）
+    if Arc::ptr_eq(&current.cred().user_ns, &user_ns) {
+        return Err(SystemError::EINVAL);
+    }
+
+    // 2. 不能共享线程组
+    if !current.threads_read_irqsave().thread_group_empty() {
+        return Err(SystemError::EINVAL);
+    }
+
+    // 3. 需要 CAP_SYS_ADMIN 在目标 ns
+    // TODO: 实现 ns_capable 后启用
+    // if !ns_capable(&user_ns, CAPFlags::CAP_SYS_ADMIN) {
+    //     return Err(SystemError::EPERM);
+    // }
+
+    // 4. 重置 credentials
+    let mut new_cred = (*current.cred()).clone();
+    crate::process::cred::set_cred_user_ns(&mut new_cred, user_ns);
+    current.set_cred(Cred::new_arc(new_cred))?;
 
     Ok(())
 }

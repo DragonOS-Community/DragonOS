@@ -18,6 +18,7 @@ mod cmdline;
 mod exe;
 mod fd;
 mod fdinfo;
+mod id_map;
 mod limits;
 mod maps;
 mod mountinfo;
@@ -32,6 +33,7 @@ use cmdline::CmdlineFileOps;
 use exe::ExeSymOps;
 use fd::FdDirOps;
 use fdinfo::FdInfoDirOps;
+use id_map::{IdMapFileOps, SetgroupsFileOps};
 use limits::LimitsFile;
 use maps::MapsFileOps;
 use mountinfo::MountInfoFileOps;
@@ -98,6 +100,15 @@ impl PidDirOps {
         }),
         ("status", |ops, parent| {
             StatusFileOps::new_inode(ops.pid, parent)
+        }),
+        ("uid_map", |ops, parent| {
+            IdMapFileOps::new_uid_inode(ops.pid, parent)
+        }),
+        ("gid_map", |ops, parent| {
+            IdMapFileOps::new_gid_inode(ops.pid, parent)
+        }),
+        ("setgroups", |ops, parent| {
+            SetgroupsFileOps::new_inode(ops.pid, parent)
         }),
         ("task", |ops, parent| TaskDirOps::new_inode(ops.pid, parent)),
         ("exe", |ops, parent| ExeSymOps::new_inode(ops.pid, parent)),

@@ -10,7 +10,7 @@
 
 # DragonOS
 
-**Languages** [中文](README_CN.md)|English
+**Languages** [中文](README_CN.md) | English
 &nbsp;
 
 &emsp;&emsp;DragonOS is a 64-bit operating system with a completely independent kernel, designed for lightweight cloud computing scenarios, offering Linux binary compatibility. It aims to provide lightweight, high-performance solutions for containerized workloads. Developed using Rust for enhanced reliability.

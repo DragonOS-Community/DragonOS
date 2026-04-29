@@ -157,6 +157,12 @@ impl StatusFileOps {
                 .to_owned(),
         );
 
+        pdata.append(
+            &mut format!("\nSeccomp:\t{}", pcb.seccomp_mode() as u8)
+                .as_bytes()
+                .to_owned(),
+        );
+
         // 去除多余的 \0 并在结尾添加 \0
         trim_string(&mut pdata);
 

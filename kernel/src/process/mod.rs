@@ -92,6 +92,7 @@ pub mod preempt;
 pub mod process_group;
 pub mod resource;
 pub mod rseq;
+pub mod seccomp;
 pub mod session;
 pub mod shebang;
 pub mod signal;
@@ -1195,6 +1196,9 @@ pub struct ProcessControlBlock {
     /// Linux: 0=SUID_DUMP_DISABLE, 1=SUID_DUMP_USER；2(SUID_DUMP_ROOT) 不允许通过 PR_SET_DUMPABLE 设置。
     dumpable: AtomicU8,
 
+    pub(crate) seccomp_mode: AtomicU8,
+    pub(crate) seccomp_filter: SpinLock<Option<Arc<seccomp::SeccompFilter>>>,
+
     /// 父进程指针
     pub(crate) parent_pcb: RwLock<Weak<ProcessControlBlock>>,
     /// 真实父进程指针
@@ -1352,6 +1356,8 @@ impl ProcessControlBlock {
                 keepcaps: AtomicBool::new(false),
                 // 默认设置为 SUID_DUMP_USER(=1)，满足 gVisor 的 SetGetDumpability 预期。
                 dumpable: AtomicU8::new(1),
+                seccomp_mode: AtomicU8::new(seccomp::SeccompMode::Disabled as u8),
+                seccomp_filter: SpinLock::new(None),
                 parent_pcb: RwLock::new(ppcb.clone()),
                 real_parent_pcb: RwLock::new(ppcb.clone()),
                 fork_parent_pcb: RwLock::new(ppcb),
@@ -1619,6 +1625,21 @@ impl ProcessControlBlock {
     #[inline(always)]
     pub fn set_dumpable(&self, value: u8) {
         self.dumpable.store(value, Ordering::SeqCst)
+    }
+
+    #[inline(always)]
+    pub fn seccomp_mode(&self) -> seccomp::SeccompMode {
+        seccomp::SeccompMode::from(self.seccomp_mode.load(Ordering::Relaxed))
+    }
+
+    #[inline(always)]
+    pub fn set_seccomp_mode(&self, mode: seccomp::SeccompMode) {
+        self.seccomp_mode.store(mode as u8, Ordering::SeqCst);
+    }
+
+    #[inline(always)]
+    pub fn seccomp_filter_lock(&self) -> SpinLockGuard<'_, Option<Arc<seccomp::SeccompFilter>>> {
+        self.seccomp_filter.lock()
     }
 
     #[inline(always)]

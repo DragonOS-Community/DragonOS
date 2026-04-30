@@ -13,7 +13,7 @@ impl OvlInode {
             return Ok(());
         }
 
-        let lower_inode = self.lower_inode.as_ref().ok_or(SystemError::ENOENT)?;
+        let lower_inode = self.lower_inodes.first().ok_or(SystemError::ENOENT)?;
 
         let metadata = lower_inode.metadata()?;
         let new_upper_inode = self.create_upper_inode(metadata.clone())?;

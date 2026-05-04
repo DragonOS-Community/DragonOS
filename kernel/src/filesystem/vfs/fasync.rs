@@ -10,24 +10,38 @@ use alloc::{sync::Weak, vec::Vec};
 use core::sync::atomic::compiler_fence;
 
 use crate::{
-    arch::ipc::signal::Signal, ipc::kill::send_signal_to_pcb, libs::mutex::Mutex,
-    process::ProcessControlBlock,
+    arch::ipc::signal::Signal,
+    ipc::signal_types::{SigCode, SigInfo, SigType},
+    libs::mutex::Mutex,
+    process::pid::PidType,
 };
 use alloc::sync::Arc;
+use system_error::SystemError;
 
-use super::file::File;
+use super::file::{File, FileFlags};
+
+pub const FASYNC_POLL_IN: i64 = 0x00000001 | 0x00000040;
+pub const FASYNC_POLL_OUT: i64 = 0x00000004 | 0x00000100 | 0x00000200;
+
+struct FAsyncSignalTarget {
+    pcb: Arc<crate::process::ProcessControlBlock>,
+    signum: i32,
+    fd: i32,
+    band: i64,
+}
 
 /// FAsyncItem represents a file that wants to receive SIGIO signals
 /// when IO events occur on the underlying inode.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct FAsyncItem {
     /// Weak reference to the file
     file: Weak<File>,
+    fd: i32,
 }
 
 impl FAsyncItem {
-    pub fn new(file: Weak<File>) -> Self {
-        Self { file }
+    pub fn new(file: Weak<File>, fd: i32) -> Self {
+        Self { file, fd }
     }
 
     /// Get the file reference
@@ -45,10 +59,18 @@ impl FAsyncItem {
     pub fn file_weak(&self) -> &Weak<File> {
         &self.file
     }
+
+    pub fn fd(&self) -> i32 {
+        self.fd
+    }
+
+    pub fn set_fd(&mut self, fd: i32) {
+        self.fd = fd;
+    }
 }
 
 /// List of FAsyncItems for an inode
-pub type LockedFAsyncItemList = Mutex<Vec<Arc<FAsyncItem>>>;
+pub type LockedFAsyncItemList = Mutex<Vec<FAsyncItem>>;
 
 /// FAsyncItems manages the list of files that want SIGIO notifications
 #[derive(Debug)]
@@ -71,8 +93,15 @@ impl FAsyncItems {
     }
 
     /// Add a FAsyncItem
-    pub fn add(&self, item: Arc<FAsyncItem>) {
-        self.items.lock().push(item);
+    pub fn add(&self, item: FAsyncItem) {
+        let mut guard = self.items.lock();
+        for old_item in guard.iter_mut() {
+            if Weak::ptr_eq(old_item.file_weak(), item.file_weak()) {
+                old_item.set_fd(item.fd());
+                return;
+            }
+        }
+        guard.push(item);
     }
 
     /// Remove a FAsyncItem by file reference
@@ -89,7 +118,8 @@ impl FAsyncItems {
 
     /// Send SIGIO to all registered file owners
     /// This should be called when IO events occur (e.g., data becomes readable)
-    pub fn send_sigio(&self) {
+    pub fn send_sigio(&self, band: i64) {
+        let mut targets = Vec::new();
         let guard = self.items.lock();
         for item in guard.iter() {
             if let Some(file) = item.file() {
@@ -98,24 +128,73 @@ impl FAsyncItems {
                     continue;
                 }
 
-                // Get the owner process
-                let owner = file.get_owner();
-                if let Some(pcb) = owner {
-                    // Send SIGIO to the owner
-                    Self::send_sigio_to_process(pcb);
+                let owner = file.owner_snapshot();
+                if let Some(pcb) = owner.pcb {
+                    targets.push(FAsyncSignalTarget {
+                        pcb,
+                        signum: owner.signum,
+                        fd: item.fd(),
+                        band,
+                    });
                 }
             }
+        }
+        drop(guard);
+
+        for target in targets {
+            Self::send_sigio_to_process(target.pcb, target.signum, target.fd, target.band);
         }
     }
 
     /// Send SIGIO signal to a process
-    fn send_sigio_to_process(pcb: Arc<ProcessControlBlock>) {
-        let sig = Signal::SIGIO_OR_POLL;
+    fn send_sigio_to_process(
+        pcb: Arc<crate::process::ProcessControlBlock>,
+        signum: i32,
+        fd: i32,
+        band: i64,
+    ) {
+        let sig = if signum == 0 {
+            Signal::SIGIO_OR_POLL
+        } else {
+            Signal::from(signum)
+        };
+
+        if sig == Signal::INVALID {
+            return;
+        }
 
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-        let _ = send_signal_to_pcb(pcb, sig);
+        if signum == 0 {
+            let _ = sig.send_signal_info_to_pcb(None, pcb, PidType::TGID);
+        } else {
+            let mut info = SigInfo::new(sig, 0, SigCode::SigIO, SigType::SigPoll { fd, band });
+            let _ = sig.send_signal_info_to_pcb(Some(&mut info), pcb, PidType::TGID);
+        }
 
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
     }
+}
+
+pub fn set_file_fasync(file: &Arc<File>, fd: i32, enabled: bool) -> Result<(), SystemError> {
+    let mut flags = file.flags();
+    if enabled {
+        flags.insert(FileFlags::FASYNC);
+    } else {
+        flags.remove(FileFlags::FASYNC);
+    }
+
+    file.set_flags(flags)?;
+
+    if let Ok(pollable) = file.inode().as_pollable_inode() {
+        let private_data = file.private_data.lock();
+        if enabled {
+            let item = FAsyncItem::new(Arc::downgrade(file), fd);
+            let _ = pollable.add_fasync(item, &private_data);
+        } else {
+            let _ = pollable.remove_fasync(&Arc::downgrade(file), &private_data);
+        }
+    }
+
+    Ok(())
 }

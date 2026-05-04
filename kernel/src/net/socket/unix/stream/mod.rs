@@ -1,6 +1,10 @@
 use crate::{
     filesystem::epoll::{event_poll::EventPoll, EPollEventType},
-    filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId},
+    filesystem::vfs::{
+        fasync::{FAsyncItems, FASYNC_POLL_IN, FASYNC_POLL_OUT},
+        vcore::generate_inode_id,
+        InodeId,
+    },
     libs::mutex::Mutex,
     libs::rwsem::RwSem,
     net::socket::{self, *},
@@ -228,7 +232,7 @@ impl UnixStreamSocket {
                     peer.epoll_items().as_ref(),
                     EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM,
                 );
-                peer.fasync_items.send_sigio();
+                peer.fasync_items.send_sigio(FASYNC_POLL_OUT);
             }
         }
     }
@@ -236,7 +240,7 @@ impl UnixStreamSocket {
     fn wake_peer_readable(&self) {
         if let Some(peer_weak) = self.peer.lock().as_ref() {
             if let Some(peer) = peer_weak.upgrade() {
-                peer.fasync_items.send_sigio();
+                peer.fasync_items.send_sigio(FASYNC_POLL_IN);
                 peer.wait_queue
                     .wakeup(Some(crate::process::ProcessState::Blocked(true)));
                 let _ = EventPoll::wakeup_epoll(
@@ -1491,7 +1495,7 @@ impl Socket for UnixStreamSocket {
                                 | EPollEventType::EPOLLOUT
                                 | EPollEventType::EPOLLWRNORM,
                         );
-                        peer.fasync_items.send_sigio();
+                        peer.fasync_items.send_sigio(FASYNC_POLL_IN);
                     }
                 }
             }

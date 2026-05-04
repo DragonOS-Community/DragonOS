@@ -8,8 +8,11 @@ use crate::{
             EPollEventType, EPollItem,
         },
         vfs::{
-            file::FileFlags, vcore::generate_inode_id, FilePrivateData, FileSystem, FileType,
-            FsInfo, IndexNode, InodeFlags, InodeMode, Magic, Metadata, PollableInode, SuperBlock,
+            fasync::{FAsyncItem, FAsyncItems, FASYNC_POLL_IN, FASYNC_POLL_OUT},
+            file::FileFlags,
+            vcore::generate_inode_id,
+            FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, InodeFlags, InodeMode, Magic,
+            Metadata, PollableInode, SuperBlock,
         },
     },
     ipc::signal::send_kernel_signal_to_current,
@@ -110,6 +113,8 @@ pub struct LockedPipeInode {
     /// 用于 FIFO 打开时的阻塞等待（等待另一端打开）
     open_wait_queue: WaitQueue,
     epitems: LockedEPItemLinkedList,
+    read_fasync_items: FAsyncItems,
+    write_fasync_items: FAsyncItems,
 }
 
 /// @brief 管道文件i节点(无锁)
@@ -360,6 +365,8 @@ impl LockedPipeInode {
             write_wait_queue: WaitQueue::default(),
             open_wait_queue: WaitQueue::default(),
             epitems: LockedEPItemLinkedList::default(),
+            read_fasync_items: FAsyncItems::default(),
+            write_fasync_items: FAsyncItems::default(),
         });
         let mut guard = result.inner.lock();
         guard.self_ref = Arc::downgrade(&result);
@@ -594,6 +601,7 @@ impl LockedPipeInode {
         let pollflag = inner_guard.poll_both_ends();
         drop(inner_guard);
         let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
+        self.read_fasync_items.send_sigio(FASYNC_POLL_IN);
 
         Ok(to_write)
     }
@@ -717,6 +725,7 @@ impl LockedPipeInode {
         let pollflag = guard.poll_both_ends();
         drop(guard);
         let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
+        self.write_fasync_items.send_sigio(FASYNC_POLL_OUT);
     }
 
     /// Helper: Wait until the pipe is readable (has data).
@@ -851,6 +860,10 @@ impl LockedPipeInode {
 
         let _ = EventPoll::wakeup_epoll(&src.epitems, in_poll);
         let _ = EventPoll::wakeup_epoll(&dst.epitems, out_poll);
+        if consume {
+            src.write_fasync_items.send_sigio(FASYNC_POLL_OUT);
+        }
+        dst.read_fasync_items.send_sigio(FASYNC_POLL_IN);
 
         Ok(copied)
     }
@@ -1053,6 +1066,45 @@ impl PollableInode for LockedPipeInode {
         }
         Err(SystemError::ENOENT)
     }
+
+    fn add_fasync(
+        &self,
+        fasync_item: FAsyncItem,
+        private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        let FilePrivateData::Pipefs(pipe_data) = private_data else {
+            return Err(SystemError::EBADF);
+        };
+
+        let flags = pipe_data.flags;
+        if !flags.is_write_only() {
+            self.read_fasync_items.add(fasync_item.clone());
+        }
+        if !flags.is_read_only() {
+            self.write_fasync_items.add(fasync_item);
+        }
+        Ok(())
+    }
+
+    fn remove_fasync(
+        &self,
+        file: &Weak<crate::filesystem::vfs::file::File>,
+        private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        if let FilePrivateData::Pipefs(pipe_data) = private_data {
+            let flags = pipe_data.flags;
+            if !flags.is_write_only() {
+                self.read_fasync_items.remove(file);
+            }
+            if !flags.is_read_only() {
+                self.write_fasync_items.remove(file);
+            }
+        } else {
+            self.read_fasync_items.remove(file);
+            self.write_fasync_items.remove(file);
+        }
+        Ok(())
+    }
 }
 
 impl IndexNode for LockedPipeInode {
@@ -1136,6 +1188,7 @@ impl IndexNode for LockedPipeInode {
         drop(inner_guard);
         // 唤醒epoll中等待的进程（忽略错误，因为状态已更新，这是尽力而为的通知）
         let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
+        self.write_fasync_items.send_sigio(FASYNC_POLL_OUT);
 
         //返回读取的字节数
         return Ok(num);
@@ -1328,6 +1381,7 @@ impl IndexNode for LockedPipeInode {
                 // 唤醒所有依赖 epoll 的等待者，确保 HUP 事件可见
                 // 忽略错误：状态已更新（writer已减为0），wakeup_epoll失败不影响close操作的语义
                 let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
+                self.read_fasync_items.send_sigio(FASYNC_POLL_IN);
                 return Ok(());
             }
         }
@@ -1354,6 +1408,7 @@ impl IndexNode for LockedPipeInode {
                 self.write_wait_queue.wakeup_all(None);
                 // 唤醒所有依赖 epoll 的等待者，确保 ERR 事件可见
                 let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
+                self.write_fasync_items.send_sigio(FASYNC_POLL_OUT);
                 return Ok(());
             }
         }
@@ -1538,6 +1593,7 @@ impl IndexNode for LockedPipeInode {
         drop(inner_guard);
         // 唤醒epoll中等待的进程（忽略错误，因为数据已写入，这是尽力而为的通知）
         let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
+        self.read_fasync_items.send_sigio(FASYNC_POLL_IN);
 
         // 返回写入的字节数
         return Ok(total_written);

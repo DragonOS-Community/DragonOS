@@ -35,10 +35,13 @@ DragonOS是一个面向云计算轻量化场景的，完全自主内核的，提
 
 - 符合Linux 6.6的语义
 - 结合测例报错、测例代码、DragonOS代码、Linux行为实现来深入分析
+- 修复gVisor系统调用兼容问题时，不能只让接口返回值通过；必须检查接口背后的真实内核状态变化与可观测副作用（例如信号投递、poll/epoll通知、fd继承/dup语义）。
+- 涉及异步I/O通知（`O_ASYNC`/`FASYNC`/`F_SETOWN`/`F_SETSIG`/`F_GETSIG`）时，owner pid 与通知信号必须作为同一一致性域建模，参考Linux `fown_struct`；不得用分散的独立原子字段保存相关状态。
+- 涉及 `fcntl(F_SETFL, O_ASYNC)` 与 `ioctl(FIOASYNC)` 时，两条入口必须复用同一套fasync注册/注销逻辑，避免只更新 `FileFlags` 而没有更新通知链路。
+- 涉及 `F_SETSIG` 的修复必须验证真实异步通知路径：默认 `0` 发送 `SIGIO`，非0值发送用户指定信号，并在支持 `SA_SIGINFO` 时维护 `si_fd`/`si_band`。
 
 ### 开发时的一些常见命令
 
 - 格式化代码：在项目根目录下运行`make fmt`,会自动格式化，并且运行clippy检查
 - 编译内核：在项目根目录下运行`make kernel`. 当你想检查你编辑的代码有没有语法错误的时候，请执行这个命令
-
 

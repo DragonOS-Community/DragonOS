@@ -77,6 +77,34 @@ enum OffsetUpdate {
     StoreEnd,
 }
 
+#[derive(Clone, Debug)]
+pub struct FileOwnerSnapshot {
+    pub pcb: Option<Arc<ProcessControlBlock>>,
+    pub signum: i32,
+}
+
+#[derive(Debug)]
+struct FileOwner {
+    pcb: Option<Arc<ProcessControlBlock>>,
+    signum: i32,
+}
+
+impl FileOwner {
+    fn new() -> Self {
+        Self {
+            pcb: None,
+            signum: 0,
+        }
+    }
+
+    fn snapshot(&self) -> FileOwnerSnapshot {
+        FileOwnerSnapshot {
+            pcb: self.pcb.clone(),
+            signum: self.signum,
+        }
+    }
+}
+
 /// 写操作的配置参数
 #[derive(Clone, Copy)]
 struct WriteConfig {
@@ -421,8 +449,8 @@ pub struct File {
     pub private_data: Mutex<FilePrivateData>,
     /// 文件的凭证
     cred: Arc<Cred>,
-    /// owner
-    pid: Mutex<Option<Arc<ProcessControlBlock>>>,
+    /// Owner state for asynchronous I/O notifications.
+    owner: Mutex<FileOwner>,
     /// Stable key for POSIX record locks. Cached at open time to avoid metadata fetch
     /// in close/drop_fd path (which can deadlock with user-space FUSE daemon).
     posix_lock_key: (usize, InodeId),
@@ -649,7 +677,7 @@ impl File {
             readdir_subdirs_name: Mutex::new(Vec::default()),
             private_data,
             cred: ProcessManager::current_pcb().cred(),
-            pid: Mutex::new(None),
+            owner: Mutex::new(FileOwner::new()),
             posix_lock_key,
             ra_state: Mutex::new(FileReadaheadState::new()),
         };
@@ -1178,7 +1206,7 @@ impl File {
             readdir_subdirs_name: Mutex::new(self.readdir_subdirs_name.lock().clone()),
             private_data: Mutex::new(self.private_data.lock().clone()),
             cred: self.cred.clone(),
-            pid: Mutex::new(None),
+            owner: Mutex::new(FileOwner::new()),
             posix_lock_key: self.posix_lock_key,
             ra_state: Mutex::new(self.ra_state.lock().clone()),
         };
@@ -1355,12 +1383,20 @@ impl File {
     }
 
     pub fn owner(&self) -> Option<RawPid> {
-        self.pid.lock().as_ref().map(|pcb| pcb.pid().pid_vnr())
+        self.owner
+            .lock()
+            .pcb
+            .as_ref()
+            .map(|pcb| pcb.pid().pid_vnr())
     }
 
     /// Get the owner process control block
     pub fn get_owner(&self) -> Option<Arc<ProcessControlBlock>> {
-        self.pid.lock().clone()
+        self.owner.lock().pcb.clone()
+    }
+
+    pub fn owner_snapshot(&self) -> FileOwnerSnapshot {
+        self.owner.lock().snapshot()
     }
 
     /// Set a process (group) as owner of the file descriptor.
@@ -1369,14 +1405,16 @@ impl File {
     /// for I/O events on the file descriptor, if `O_ASYNC` status flag is set
     /// on this file.
     pub fn set_owner(&self, pid: Option<Arc<ProcessControlBlock>>) -> Result<(), SystemError> {
-        let Some(pcb) = pid else {
-            *self.pid.lock() = None;
-            return Ok(());
-        };
-
-        self.pid.lock().replace(pcb);
-        // todo: update inode owner
+        self.owner.lock().pcb = pid;
         Ok(())
+    }
+
+    pub fn owner_signum(&self) -> i32 {
+        self.owner.lock().signum
+    }
+
+    pub fn set_owner_signum(&self, signum: i32) {
+        self.owner.lock().signum = signum;
     }
 
     pub fn get_inode_flags(&self) -> Result<InodeFlags, SystemError> {

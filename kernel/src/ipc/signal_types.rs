@@ -547,6 +547,17 @@ impl SigInfo {
                     },
                 },
             },
+            SigType::SigPoll { fd, band } => PosixSigInfo {
+                si_signo: self.sig_no,
+                si_errno: self.errno,
+                si_code: self.sig_code as i32,
+                _sifields: PosixSiginfoFields {
+                    _sigpoll: PosixSiginfoSigpoll {
+                        si_band: band,
+                        si_fd: fd,
+                    },
+                },
+            },
         }
     }
 
@@ -596,12 +607,16 @@ pub enum SigType {
         overrun: i32,
         sigval: PosixSigval,
     },
+    /// queued SIGIO/F_SETSIG signal carrying poll band and fd.
+    SigPoll {
+        fd: i32,
+        band: i64,
+    },
     // 后续完善下列中的具体字段
     // Timer,
     // Rt,
     // SigChild,
     // SigFault,
-    // SigPoll,
     // SigSys,
 }
 

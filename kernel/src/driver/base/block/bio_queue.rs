@@ -72,9 +72,9 @@ impl BioQueue {
         inner.queue.drain(..batch_size).collect()
     }
 
-    /// Worker waits for new requests or a stop signal.
+    /// Worker等待新请求或停止信号。
     ///
-    /// The BIO worker is a kernel thread and should not be interrupted by normal signals to avoid ERESTARTSYS log storms.
+    /// BIO worker 是内核线程，不应被普通信号打断形成 ERESTARTSYS 日志风暴。
     pub fn wait_for_work_or_stop(&self) -> BioQueueWake {
         let _ = self.wait_queue.wait_event_uninterruptible(
             || {
@@ -92,7 +92,7 @@ impl BioQueue {
         }
     }
 
-    /// Begin stopping: stop accepting new BIOs and wake up the worker to drain the queue.
+    /// 开始停止接收新 BIO，并唤醒 worker 排空已有队列。
     pub fn begin_quiesce(&self) {
         {
             let mut inner = self.inner.lock_irqsave();
@@ -103,7 +103,7 @@ impl BioQueue {
         self.wait_queue.wakeup_all(None);
     }
 
-    /// Stop the queue and drain any BIOs that have not been submitted to the underlying device.
+    /// 停止队列并取出尚未提交给底层设备的 BIO。
     pub fn stop_and_drain(&self) -> Vec<Arc<BioRequest>> {
         let pending = {
             let mut inner = self.inner.lock_irqsave();

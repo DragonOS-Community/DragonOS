@@ -82,7 +82,7 @@ impl BioRequest {
         })
     }
 
-    /// Create a new flush request.
+    /// 创建一个 flush 请求
     pub fn new_flush() -> Arc<Self> {
         Arc::new(Self {
             inner: SpinLock::new(InnerBioRequest {

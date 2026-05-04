@@ -14,9 +14,9 @@ pub(crate) fn machine_halt() -> ! {
     todo!();
 }
 
-/// # Functionality
+/// # 功能
 ///
-/// Perform system power off operation.
+/// 执行系统下电操作
 pub(crate) fn machine_power_off() -> ! {
     log::warn!("loongarch64 machine_power_off is not implemented, spin here.");
     loop {

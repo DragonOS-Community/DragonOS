@@ -987,7 +987,7 @@ pub fn device_shutdown() {
     // 遍历/sys/devices下的所有设备，关闭设备
     let devices_kset = sys_devices_kset();
     let kobjects = devices_kset.kobjects();
-    for weak_kobj in kobjects.iter() {
+    for weak_kobj in kobjects.iter().rev() {
         // 尝试升级weak指针
         if let Some(kobj) = weak_kobj.upgrade() {
             debug!("Found kobject: {}", kobj.name());

@@ -1079,129 +1079,123 @@ pub fn __schedule(sched_mod: SchedMode) {
     let cpu = smp_get_processor_id().data() as usize;
     let rq = cpu_rq(cpu);
     let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-    loop {
-        let mut prev = rq.current();
-        if let ProcessState::Exited(_) = prev.clone().sched_info().inner_lock_read_irqsave().state()
-        {
-            // 从exit进的Schedule
-            prev = ProcessManager::current_pcb();
+    let mut prev = rq.current();
+    if let ProcessState::Exited(_) = prev.clone().sched_info().inner_lock_read_irqsave().state() {
+        // 从exit进的Schedule
+        prev = ProcessManager::current_pcb();
+    }
+
+    // TODO: hrtick_clear(rq);
+
+    let (rq, guard) = rq.self_lock();
+
+    rq.clock_updata_flags = ClockUpdataFlag::from_bits_truncate(rq.clock_updata_flags.bits() << 1);
+
+    rq.update_rq_clock();
+    rq.clock_updata_flags = ClockUpdataFlag::RQCF_UPDATE;
+
+    let mut migrate_prev_to = None;
+    if let Some(dest_cpu) = take_current_migration_target(&prev) {
+        debug_assert!(
+            !task_is_idle(&prev),
+            "idle task must not be migrated through current task migration"
+        );
+        debug_assert!(
+            cpu_is_online(dest_cpu),
+            "current task migration target {:?} must be online",
+            dest_cpu
+        );
+        debug_assert!(
+            prev.sched_info()
+                .cpus_allowed()
+                .get(dest_cpu)
+                .unwrap_or(false),
+            "current task migration target {:?} must be allowed by affinity",
+            dest_cpu
+        );
+
+        rq.deactivate_task(
+            prev.clone(),
+            DequeueFlag::DEQUEUE_MOVE | DequeueFlag::DEQUEUE_NOCLOCK,
+        );
+
+        if prev.sched_info().policy() == SchedPolicy::CFS {
+            let mut se = prev.sched_info().sched_entity();
+            crate::sched::fair::FairSchedEntity::for_each_in_group(&mut se, |se| {
+                se.cfs_rq().force_mut().set_current(Weak::default());
+                (true, true)
+            });
         }
 
-        // TODO: hrtick_clear(rq);
+        *prev.sched_info().on_rq.lock_irqsave() = OnRq::None;
+        migrate_prev_to = Some(dest_cpu);
+    }
 
-        let (rq, guard) = rq.self_lock();
+    // kBUG!(
+    //     "before cfs rq pcbs {:?}\nvruntimes {:?}\n",
+    //     rq.cfs
+    //         .entities
+    //         .iter()
+    //         .map(|x| { x.1.pcb().pid() })
+    //         .collect::<Vec<_>>(),
+    //     rq.cfs
+    //         .entities
+    //         .iter()
+    //         .map(|x| { x.1.vruntime })
+    //         .collect::<Vec<_>>(),
+    // );
 
-        rq.clock_updata_flags =
-            ClockUpdataFlag::from_bits_truncate(rq.clock_updata_flags.bits() << 1);
+    if !sched_mod.contains(SchedMode::SM_MASK_PREEMPT)
+        && prev.sched_info().policy() != SchedPolicy::IDLE
+        && prev.sched_info().inner_lock_read_irqsave().is_mark_sleep()
+    {
+        rq.deactivate_task(
+            prev.clone(),
+            DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
+        );
+    }
 
-        rq.update_rq_clock();
-        rq.clock_updata_flags = ClockUpdataFlag::RQCF_UPDATE;
+    let next = rq.pick_next_task(prev.clone());
 
-        let mut migrate_prev_to = None;
-        if let Some(dest_cpu) = take_current_migration_target(&prev) {
-            debug_assert!(
-                !task_is_idle(&prev),
-                "idle task must not be migrated through current task migration"
-            );
-            debug_assert!(
-                cpu_is_online(dest_cpu),
-                "current task migration target {:?} must be online",
-                dest_cpu
-            );
-            debug_assert!(
-                prev.sched_info()
-                    .cpus_allowed()
-                    .get(dest_cpu)
-                    .unwrap_or(false),
-                "current task migration target {:?} must be allowed by affinity",
-                dest_cpu
-            );
+    if task_is_idle(&next) {
+        IDLE_CPUS.set(rq.cpu);
+    } else if task_is_idle(&prev) {
+        IDLE_CPUS.clear(rq.cpu);
+    }
 
-            rq.deactivate_task(
-                prev.clone(),
-                DequeueFlag::DEQUEUE_MOVE | DequeueFlag::DEQUEUE_NOCLOCK,
-            );
+    prev.flags().remove(ProcessFlags::NEED_SCHEDULE);
+    fence(Ordering::SeqCst);
+    if likely(!Arc::ptr_eq(&prev, &next)) {
+        crate::process::rseq::Rseq::on_preempt(&prev);
+        if next.rseq_state().is_registered() {
+            next.flags().insert(ProcessFlags::NEED_RSEQ);
+        }
 
-            if prev.sched_info().policy() == SchedPolicy::CFS {
-                let mut se = prev.sched_info().sched_entity();
-                crate::sched::fair::FairSchedEntity::for_each_in_group(&mut se, |se| {
-                    se.cfs_rq().force_mut().set_current(Weak::default());
-                    (true, true)
-                });
+        rq.set_current(Arc::downgrade(&next));
+        compiler_fence(Ordering::SeqCst);
+        if let Some(dest_cpu) = migrate_prev_to {
+            unsafe {
+                crate::process::PROCESS_SWITCH_RESULT
+                    .as_mut()
+                    .unwrap()
+                    .get_mut()
+                    .migrate_prev_to = Some(dest_cpu);
             }
-
-            *prev.sched_info().on_rq.lock_irqsave() = OnRq::None;
-            migrate_prev_to = Some(dest_cpu);
         }
+        drop(guard);
 
-        // kBUG!(
-        //     "before cfs rq pcbs {:?}\nvruntimes {:?}\n",
-        //     rq.cfs
-        //         .entities
-        //         .iter()
-        //         .map(|x| { x.1.pcb().pid() })
-        //         .collect::<Vec<_>>(),
-        //     rq.cfs
-        //         .entities
-        //         .iter()
-        //         .map(|x| { x.1.vruntime })
-        //         .collect::<Vec<_>>(),
-        // );
-
-        if !sched_mod.contains(SchedMode::SM_MASK_PREEMPT)
-            && prev.sched_info().policy() != SchedPolicy::IDLE
-            && prev.sched_info().inner_lock_read_irqsave().is_mark_sleep()
-        {
-            rq.deactivate_task(
-                prev.clone(),
-                DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
-            );
-        }
-
-        let next = rq.pick_next_task(prev.clone());
-
-        if task_is_idle(&next) {
-            IDLE_CPUS.set(rq.cpu);
-        } else if task_is_idle(&prev) {
-            IDLE_CPUS.clear(rq.cpu);
-        }
-
-        prev.flags().remove(ProcessFlags::NEED_SCHEDULE);
-        fence(Ordering::SeqCst);
-        if likely(!Arc::ptr_eq(&prev, &next)) {
-            crate::process::rseq::Rseq::on_preempt(&prev);
-            if next.rseq_state().is_registered() {
-                next.flags().insert(ProcessFlags::NEED_RSEQ);
-            }
-
-            rq.set_current(Arc::downgrade(&next));
-            compiler_fence(Ordering::SeqCst);
-            if let Some(dest_cpu) = migrate_prev_to {
-                unsafe {
-                    crate::process::PROCESS_SWITCH_RESULT
-                        .as_mut()
-                        .unwrap()
-                        .get_mut()
-                        .migrate_prev_to = Some(dest_cpu);
-                }
-            }
-            drop(guard);
-
-            unsafe { ProcessManager::switch_process(prev, next) };
-        } else {
-            assert!(
-                migrate_prev_to.is_none(),
-                "current task migration must switch away from the migrated task"
-            );
-            drop(guard);
-            assert!(
-                Arc::ptr_eq(&ProcessManager::current_pcb(), &prev),
-                "{}",
-                ProcessManager::current_pcb().basic().name()
-            );
-        }
-
-        break;
+        unsafe { ProcessManager::switch_process(prev, next) };
+    } else {
+        assert!(
+            migrate_prev_to.is_none(),
+            "current task migration must switch away from the migrated task"
+        );
+        drop(guard);
+        assert!(
+            Arc::ptr_eq(&ProcessManager::current_pcb(), &prev),
+            "{}",
+            ProcessManager::current_pcb().basic().name()
+        );
     }
 }
 

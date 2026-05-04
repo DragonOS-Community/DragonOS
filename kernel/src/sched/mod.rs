@@ -1097,7 +1097,26 @@ pub fn __schedule(sched_mod: SchedMode) {
         rq.update_rq_clock();
         rq.clock_updata_flags = ClockUpdataFlag::RQCF_UPDATE;
 
+        let mut migrate_prev_to = None;
         if let Some(dest_cpu) = take_current_migration_target(&prev) {
+            debug_assert!(
+                !task_is_idle(&prev),
+                "idle task must not be migrated through current task migration"
+            );
+            debug_assert!(
+                cpu_is_online(dest_cpu),
+                "current task migration target {:?} must be online",
+                dest_cpu
+            );
+            debug_assert!(
+                prev.sched_info()
+                    .cpus_allowed()
+                    .get(dest_cpu)
+                    .unwrap_or(false),
+                "current task migration target {:?} must be allowed by affinity",
+                dest_cpu
+            );
+
             rq.deactivate_task(
                 prev.clone(),
                 DequeueFlag::DEQUEUE_MOVE | DequeueFlag::DEQUEUE_NOCLOCK,
@@ -1112,11 +1131,7 @@ pub fn __schedule(sched_mod: SchedMode) {
             }
 
             *prev.sched_info().on_rq.lock_irqsave() = OnRq::None;
-            prev.sched_info().set_on_cpu(None);
-
-            drop(guard);
-            enqueue_task_on_cpu(&prev, dest_cpu, WakeupFlags::WF_MIGRATED);
-            continue;
+            migrate_prev_to = Some(dest_cpu);
         }
 
         // kBUG!(
@@ -1161,10 +1176,23 @@ pub fn __schedule(sched_mod: SchedMode) {
 
             rq.set_current(Arc::downgrade(&next));
             compiler_fence(Ordering::SeqCst);
+            if let Some(dest_cpu) = migrate_prev_to {
+                unsafe {
+                    crate::process::PROCESS_SWITCH_RESULT
+                        .as_mut()
+                        .unwrap()
+                        .get_mut()
+                        .migrate_prev_to = Some(dest_cpu);
+                }
+            }
             drop(guard);
 
             unsafe { ProcessManager::switch_process(prev, next) };
         } else {
+            assert!(
+                migrate_prev_to.is_none(),
+                "current task migration must switch away from the migrated task"
+            );
             drop(guard);
             assert!(
                 Arc::ptr_eq(&ProcessManager::current_pcb(), &prev),

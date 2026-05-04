@@ -142,6 +142,7 @@ static mut __PROCESS_MANAGEMENT_INIT_DONE: bool = false;
 pub struct SwitchResult {
     pub prev_pcb: Option<Arc<ProcessControlBlock>>,
     pub next_pcb: Option<Arc<ProcessControlBlock>>,
+    pub migrate_prev_to: Option<ProcessorId>,
 }
 
 impl SwitchResult {
@@ -149,6 +150,7 @@ impl SwitchResult {
         Self {
             prev_pcb: None,
             next_pcb: None,
+            migrate_prev_to: None,
         }
     }
 }
@@ -960,6 +962,19 @@ impl ProcessManager {
 
         next_pcb.arch_info.force_unlock();
         fence(Ordering::SeqCst);
+
+        let migrate_prev_to = PROCESS_SWITCH_RESULT
+            .as_mut()
+            .unwrap()
+            .get_mut()
+            .migrate_prev_to
+            .take();
+
+        if let Some(dest_cpu) = migrate_prev_to {
+            debug_assert!(!Arc::ptr_eq(&prev_pcb, &next_pcb));
+            prev_pcb.sched_info().set_on_cpu(None);
+            enqueue_task_on_cpu(&prev_pcb, dest_cpu, WakeupFlags::WF_MIGRATED);
+        }
     }
 
     /// 如果目标进程正在目标CPU上运行，那么就让这个cpu陷入内核态

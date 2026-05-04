@@ -79,7 +79,7 @@ const VIRTIO_BLK_BASENAME: &str = "virtio_blk";
 // IO线程的budget配置
 const IO_BUDGET: usize = 32; // 每次最多处理32个请求
 const SLEEP_MS: usize = 20; // 达到budget后睡眠20ms
-const SHUTDOWN_DRAIN_RETRIES: usize = 1000;
+const SHUTDOWN_DRAIN_RETRIES: usize = 32;
 const SHUTDOWN_DRAIN_INTERVAL_NS: i64 = 1_000_000;
 
 /// Token映射表：virtqueue token -> BioRequest
@@ -520,14 +520,14 @@ impl VirtIOBlkDevice {
             bio_queue.begin_quiesce();
         }
 
-        if let Some(io_thread_pcb) = &io_thread_pcb {
-            KernelThreadMechanism::stop(io_thread_pcb)?;
-        }
-
         if let Some(bio_queue) = &bio_queue {
             for bio in bio_queue.stop_and_drain() {
                 bio.complete(Err(SystemError::ESHUTDOWN));
             }
+        }
+
+        if let Some(io_thread_pcb) = &io_thread_pcb {
+            KernelThreadMechanism::stop(io_thread_pcb)?;
         }
 
         {

@@ -5,7 +5,8 @@ use acpi::{
     fadt::Fadt,
     AcpiTable,
 };
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
+use aml::{value::Args, AmlContext, AmlName, AmlValue, DebugVerbosity, Handler};
 use log::{debug, error, warn};
 use system_error::SystemError;
 
@@ -190,113 +191,309 @@ fn acpi_read_pm1_control_pair(
 
 fn find_s5_sleep_type() -> Option<(u16, u16)> {
     let tables = acpi_manager().tables()?;
+    let mut context = AmlContext::new(Box::new(AcpiAmlHandler), DebugVerbosity::None);
+
     let dsdt = tables.dsdt().ok()?;
-    let (vaddr, _) =
-        EarlyIoRemap::map(PhysAddr::new(dsdt.address), dsdt.length as usize, false).ok()?;
-    let bytes = unsafe { slice::from_raw_parts(vaddr.data() as *const u8, dsdt.length as usize) };
-    let result = parse_s5_package(bytes);
+    parse_aml_table(&mut context, &dsdt, "DSDT").ok()?;
+
+    for ssdt in tables.ssdts() {
+        let _ = parse_aml_table(&mut context, &ssdt, "SSDT");
+    }
+
+    find_s5_sleep_type_in_context(&mut context)
+}
+
+fn parse_aml_table(
+    context: &mut AmlContext,
+    table: &acpi::AmlTable,
+    name: &str,
+) -> Result<(), SystemError> {
+    let (vaddr, _) = EarlyIoRemap::map(PhysAddr::new(table.address), table.length as usize, false)?;
+    let bytes = unsafe { slice::from_raw_parts(vaddr.data() as *const u8, table.length as usize) };
+    let result = parse_aml_stream(context, bytes, name);
     let _ = EarlyIoRemap::unmap(vaddr);
     result
 }
 
-fn parse_s5_package(bytes: &[u8]) -> Option<(u16, u16)> {
-    let mut i = 0;
-    while i + 4 <= bytes.len() {
-        if &bytes[i..i + 4] == b"_S5_" {
-            if i >= 1 && bytes[i - 1] == 0x08 {
-                if let Some(result) = parse_s5_package_after_name(bytes, i + 4) {
-                    return Some(result);
-                }
-            }
-            if i >= 2 && bytes[i - 2] == 0x08 && bytes[i - 1] == b'\\' {
-                if let Some(result) = parse_s5_package_after_name(bytes, i + 4) {
-                    return Some(result);
-                }
-            }
-        }
-        i += 1;
-    }
-
-    None
+fn parse_aml_stream(context: &mut AmlContext, bytes: &[u8], name: &str) -> Result<(), SystemError> {
+    context.parse_table(bytes).map_err(|e| {
+        warn!("failed to parse ACPI {} for _S5 lookup: {:?}", name, e);
+        SystemError::EINVAL
+    })
 }
 
-fn parse_s5_package_after_name(bytes: &[u8], mut index: usize) -> Option<(u16, u16)> {
-    let is_var_package = match bytes.get(index).copied()? {
-        0x12 => false,
-        0x13 => true,
-        _ => return None,
+fn find_s5_sleep_type_in_context(context: &mut AmlContext) -> Option<(u16, u16)> {
+    let s5_name = AmlName::from_str("\\_S5_").ok()?;
+    let value = match context.namespace.get_by_path(&s5_name).ok()?.clone() {
+        AmlValue::Method { .. } => context.invoke_method(&s5_name, Args::EMPTY).ok()?,
+        value => value,
     };
-    index += 1;
 
-    let (_package_end, next_index) = parse_aml_package_length(bytes, index)?;
-    index = next_index;
-
-    let (elements, next_index) = if is_var_package {
-        parse_aml_integer(bytes, index)?
-    } else {
-        (*bytes.get(index)? as u64, index + 1)
-    };
-    if elements < 2 {
-        return None;
-    }
-    index = next_index;
-
-    let (slp_typa, next_index) = parse_aml_integer(bytes, index)?;
-    let (slp_typb, _) = parse_aml_integer(bytes, next_index)?;
-    Some((slp_typa as u16, slp_typb as u16))
+    s5_sleep_type_from_value(&value)
 }
 
-fn parse_aml_package_length(bytes: &[u8], index: usize) -> Option<(usize, usize)> {
-    let lead = *bytes.get(index)?;
-    let byte_count = (lead >> 6) as usize;
-    let mut length = if byte_count == 0 {
-        (lead & 0x3f) as usize
-    } else {
-        (lead & 0x0f) as usize
-    };
-    let mut next_index = index + 1;
-
-    for shift in 0..byte_count {
-        length |= (*bytes.get(next_index)? as usize) << (4 + shift * 8);
-        next_index += 1;
-    }
-
-    Some((index + length, next_index))
-}
-
-fn parse_aml_integer(bytes: &[u8], index: usize) -> Option<(u64, usize)> {
-    match *bytes.get(index)? {
-        0x00 => Some((0, index + 1)),
-        0x01 => Some((1, index + 1)),
-        0x0a => Some((*bytes.get(index + 1)? as u64, index + 2)),
-        0x0b => Some((
-            u16::from_le_bytes([*bytes.get(index + 1)?, *bytes.get(index + 2)?]) as u64,
-            index + 3,
-        )),
-        0x0c => Some((
-            u32::from_le_bytes([
-                *bytes.get(index + 1)?,
-                *bytes.get(index + 2)?,
-                *bytes.get(index + 3)?,
-                *bytes.get(index + 4)?,
-            ]) as u64,
-            index + 5,
-        )),
-        0x0e => Some((
-            u64::from_le_bytes([
-                *bytes.get(index + 1)?,
-                *bytes.get(index + 2)?,
-                *bytes.get(index + 3)?,
-                *bytes.get(index + 4)?,
-                *bytes.get(index + 5)?,
-                *bytes.get(index + 6)?,
-                *bytes.get(index + 7)?,
-                *bytes.get(index + 8)?,
-            ]),
-            index + 9,
-        )),
+fn s5_sleep_type_from_value(value: &AmlValue) -> Option<(u16, u16)> {
+    match value {
+        AmlValue::Package(elements) => s5_sleep_type_from_package(elements),
         _ => None,
     }
+}
+
+fn s5_sleep_type_from_package(elements: &[AmlValue]) -> Option<(u16, u16)> {
+    match elements.len() {
+        0 => None,
+        1 => {
+            let encoded = aml_integer(&elements[0])?;
+            Some(((encoded & 0xff) as u16, ((encoded >> 8) & 0xff) as u16))
+        }
+        _ => Some((
+            (aml_integer(&elements[0])? & 0xff) as u16,
+            (aml_integer(&elements[1])? & 0xff) as u16,
+        )),
+    }
+}
+
+fn aml_integer(value: &AmlValue) -> Option<u64> {
+    match value {
+        AmlValue::Integer(value) => Some(*value),
+        _ => None,
+    }
+}
+
+struct AcpiAmlHandler;
+
+impl Handler for AcpiAmlHandler {
+    fn read_u8(&self, address: usize) -> u8 {
+        read_memory(address, 8).unwrap_or_else(|e| {
+            warn!("AML memory read8 failed at {:#x}: {:?}", address, e);
+            0
+        }) as u8
+    }
+
+    fn read_u16(&self, address: usize) -> u16 {
+        read_memory(address, 16).unwrap_or_else(|e| {
+            warn!("AML memory read16 failed at {:#x}: {:?}", address, e);
+            0
+        }) as u16
+    }
+
+    fn read_u32(&self, address: usize) -> u32 {
+        read_memory(address, 32).unwrap_or_else(|e| {
+            warn!("AML memory read32 failed at {:#x}: {:?}", address, e);
+            0
+        }) as u32
+    }
+
+    fn read_u64(&self, address: usize) -> u64 {
+        read_memory(address, 64).unwrap_or_else(|e| {
+            warn!("AML memory read64 failed at {:#x}: {:?}", address, e);
+            0
+        })
+    }
+
+    fn write_u8(&mut self, address: usize, value: u8) {
+        if let Err(e) = write_memory(address, value as u64, 8) {
+            warn!("AML memory write8 failed at {:#x}: {:?}", address, e);
+        }
+    }
+
+    fn write_u16(&mut self, address: usize, value: u16) {
+        if let Err(e) = write_memory(address, value as u64, 16) {
+            warn!("AML memory write16 failed at {:#x}: {:?}", address, e);
+        }
+    }
+
+    fn write_u32(&mut self, address: usize, value: u32) {
+        if let Err(e) = write_memory(address, value as u64, 32) {
+            warn!("AML memory write32 failed at {:#x}: {:?}", address, e);
+        }
+    }
+
+    fn write_u64(&mut self, address: usize, value: u64) {
+        if let Err(e) = write_memory(address, value, 64) {
+            warn!("AML memory write64 failed at {:#x}: {:?}", address, e);
+        }
+    }
+
+    fn read_io_u8(&self, port: u16) -> u8 {
+        unsafe { read_io(port, 8).unwrap_or(0) as u8 }
+    }
+
+    fn read_io_u16(&self, port: u16) -> u16 {
+        unsafe { read_io(port, 16).unwrap_or(0) as u16 }
+    }
+
+    fn read_io_u32(&self, port: u16) -> u32 {
+        unsafe { read_io(port, 32).unwrap_or(0) }
+    }
+
+    fn write_io_u8(&self, port: u16, value: u8) {
+        let _ = unsafe { write_io(port, value as u32, 8) };
+    }
+
+    fn write_io_u16(&self, port: u16, value: u16) {
+        let _ = unsafe { write_io(port, value as u32, 16) };
+    }
+
+    fn write_io_u32(&self, port: u16, value: u32) {
+        let _ = unsafe { write_io(port, value, 32) };
+    }
+
+    fn read_pci_u8(&self, segment: u16, bus: u8, device: u8, function: u8, offset: u16) -> u8 {
+        read_pci_config_u8(segment, bus, device, function, offset)
+    }
+
+    fn read_pci_u16(&self, segment: u16, bus: u8, device: u8, function: u8, offset: u16) -> u16 {
+        (read_pci_config_u8(segment, bus, device, function, offset) as u16)
+            | ((read_pci_config_u8(segment, bus, device, function, offset + 1) as u16) << 8)
+    }
+
+    fn read_pci_u32(&self, segment: u16, bus: u8, device: u8, function: u8, offset: u16) -> u32 {
+        let Some(root) = pci_root_manager().get_pci_root(segment) else {
+            return 0;
+        };
+        if offset & 0x3 != 0 {
+            return (read_pci_config_u8(segment, bus, device, function, offset) as u32)
+                | ((read_pci_config_u8(segment, bus, device, function, offset + 1) as u32) << 8)
+                | ((read_pci_config_u8(segment, bus, device, function, offset + 2) as u32) << 16)
+                | ((read_pci_config_u8(segment, bus, device, function, offset + 3) as u32) << 24);
+        }
+        let devfn = BusDeviceFunction {
+            bus,
+            device,
+            function,
+        };
+        root.read_config(devfn, offset & !0x3)
+    }
+
+    fn write_pci_u8(
+        &self,
+        segment: u16,
+        bus: u8,
+        device: u8,
+        function: u8,
+        offset: u16,
+        value: u8,
+    ) {
+        write_pci_config_u8(segment, bus, device, function, offset, value);
+    }
+
+    fn write_pci_u16(
+        &self,
+        segment: u16,
+        bus: u8,
+        device: u8,
+        function: u8,
+        offset: u16,
+        value: u16,
+    ) {
+        write_pci_config_u8(segment, bus, device, function, offset, value as u8);
+        write_pci_config_u8(
+            segment,
+            bus,
+            device,
+            function,
+            offset + 1,
+            (value >> 8) as u8,
+        );
+    }
+
+    fn write_pci_u32(
+        &self,
+        segment: u16,
+        bus: u8,
+        device: u8,
+        function: u8,
+        offset: u16,
+        value: u32,
+    ) {
+        let Some(root) = pci_root_manager().get_pci_root(segment) else {
+            return;
+        };
+        if offset & 0x3 != 0 {
+            write_pci_config_u8(segment, bus, device, function, offset, value as u8);
+            write_pci_config_u8(
+                segment,
+                bus,
+                device,
+                function,
+                offset + 1,
+                (value >> 8) as u8,
+            );
+            write_pci_config_u8(
+                segment,
+                bus,
+                device,
+                function,
+                offset + 2,
+                (value >> 16) as u8,
+            );
+            write_pci_config_u8(
+                segment,
+                bus,
+                device,
+                function,
+                offset + 3,
+                (value >> 24) as u8,
+            );
+            return;
+        }
+        let devfn = BusDeviceFunction {
+            bus,
+            device,
+            function,
+        };
+        root.write_config(devfn, offset & !0x3, value);
+    }
+
+    fn stall(&self, microseconds: u64) {
+        let time = PosixTimeSpec {
+            tv_sec: (microseconds / 1_000_000) as i64,
+            tv_nsec: ((microseconds % 1_000_000) * 1_000) as i64,
+        };
+        let _ = nanosleep(time);
+    }
+
+    fn sleep(&self, milliseconds: u64) {
+        let time = PosixTimeSpec {
+            tv_sec: (milliseconds / 1_000) as i64,
+            tv_nsec: ((milliseconds % 1_000) * 1_000_000) as i64,
+        };
+        let _ = nanosleep(time);
+    }
+}
+
+fn read_pci_config_u8(segment: u16, bus: u8, device: u8, function: u8, offset: u16) -> u8 {
+    let Some(root) = pci_root_manager().get_pci_root(segment) else {
+        return 0;
+    };
+    let devfn = BusDeviceFunction {
+        bus,
+        device,
+        function,
+    };
+    let shift = ((offset & 0x3) * 8) as u32;
+    ((root.read_config(devfn, offset & !0x3) >> shift) & 0xff) as u8
+}
+
+fn write_pci_config_u8(segment: u16, bus: u8, device: u8, function: u8, offset: u16, value: u8) {
+    let Some(root) = pci_root_manager().get_pci_root(segment) else {
+        return;
+    };
+    let devfn = BusDeviceFunction {
+        bus,
+        device,
+        function,
+    };
+    let aligned_offset = offset & !0x3;
+    let shift = ((offset & 0x3) * 8) as u32;
+    let mask = 0xff << shift;
+    let current = root.read_config(devfn, aligned_offset);
+    root.write_config(
+        devfn,
+        aligned_offset,
+        (current & !mask) | ((value as u32) << shift),
+    );
 }
 
 fn acpi_try_enable(fadt: &Fadt) {
@@ -670,4 +867,56 @@ fn write_memory(paddr: usize, value: u64, width: u32) -> Result<(), SystemError>
     }
 
     return Ok(());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn s5_sleep_type_from_encoded_integer_package() {
+        let value = AmlValue::Package(alloc::vec![AmlValue::Integer(0x0504)]);
+
+        assert_eq!(s5_sleep_type_from_value(&value), Some((4, 5)));
+    }
+
+    #[test]
+    fn s5_sleep_type_from_two_integer_package() {
+        let value = AmlValue::Package(alloc::vec![
+            AmlValue::Integer(4),
+            AmlValue::Integer(5),
+            AmlValue::Integer(0),
+        ]);
+
+        assert_eq!(s5_sleep_type_from_value(&value), Some((4, 5)));
+    }
+
+    #[test]
+    fn s5_sleep_type_rejects_invalid_package() {
+        assert_eq!(
+            s5_sleep_type_from_value(&AmlValue::Package(Vec::new())),
+            None
+        );
+        assert_eq!(
+            s5_sleep_type_from_value(&AmlValue::Package(alloc::vec![
+                AmlValue::Boolean(false),
+                AmlValue::Integer(5),
+            ])),
+            None
+        );
+    }
+
+    #[test]
+    fn s5_sleep_type_can_be_defined_by_ssdt() {
+        let dsdt_without_s5 = [0x08, b'A', b'B', b'C', b'D', 0x01];
+        let ssdt_with_s5 = [
+            0x08, b'_', b'S', b'5', b'_', 0x12, 0x06, 0x02, 0x0a, 0x04, 0x0a, 0x05,
+        ];
+        let mut context = AmlContext::new(Box::new(AcpiAmlHandler), DebugVerbosity::None);
+
+        parse_aml_stream(&mut context, &dsdt_without_s5, "DSDT").unwrap();
+        parse_aml_stream(&mut context, &ssdt_with_s5, "SSDT").unwrap();
+
+        assert_eq!(find_s5_sleep_type_in_context(&mut context), Some((4, 5)));
+    }
 }

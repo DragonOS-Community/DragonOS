@@ -37,6 +37,7 @@ fifo_demo = []
 # 运行时依赖项
 [dependencies]
 acpi = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/acpi-rs.git", rev = "282df2af7b" }
+aml = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/acpi-rs.git", rev = "282df2af7b" }
 asm_macros = { path = "crates/asm_macros" }
 atomic_enum = "=0.2.0"
 bit_field = "=0.10"

@@ -10,6 +10,7 @@ use super::block_device::{BlockId, LBA_SIZE};
 pub enum BioType {
     Read,
     Write,
+    Flush,
 }
 
 /// BIO请求状态
@@ -72,6 +73,23 @@ impl BioRequest {
                 lba_start,
                 count,
                 buffer,
+                state: BioState::Init,
+                completion: Arc::new(Completion::new()),
+                result: None,
+                complete_callbacks: Vec::new(),
+                token: None,
+            }),
+        })
+    }
+
+    /// 创建一个 flush 请求
+    pub fn new_flush() -> Arc<Self> {
+        Arc::new(Self {
+            inner: SpinLock::new(InnerBioRequest {
+                bio_type: BioType::Flush,
+                lba_start: 0,
+                count: 0,
+                buffer: DmaBuffer::alloc_bytes(1, Default::default()),
                 state: BioState::Init,
                 completion: Arc::new(Completion::new()),
                 result: None,

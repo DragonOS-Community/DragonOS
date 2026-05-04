@@ -1,4 +1,4 @@
-use core::ptr;
+use core::{hint::spin_loop, ptr, slice};
 
 use acpi::{
     address::{AccessSize, AddressSpace, GenericAddress},
@@ -22,6 +22,12 @@ use crate::{
 use super::acpi_manager;
 
 const ACPI_ACCESS_BIT_SHIFT: u8 = 2;
+const ACPI_PM1_SLEEP_TYPE_SHIFT: u16 = 10;
+const ACPI_PM1_SLEEP_ENABLE: u16 = 1 << 13;
+const ACPI_SLEEP_CONTROL_TYPE_SHIFT: u16 = 2;
+const ACPI_SLEEP_CONTROL_ENABLE: u16 = 1 << 5;
+const ACPI_POWER_OFF_SPIN_LOOPS: usize = 10_000_000;
+const ACPI_ENABLE_SPIN_LOOPS: usize = 1_000_000;
 
 #[derive(Debug, PartialEq)]
 enum AcpiStatus {
@@ -115,6 +121,199 @@ pub fn acpi_reboot() {
         tv_nsec: 15_000_000, // 15ms
     };
     let _ = nanosleep(sleep_time);
+}
+
+pub fn acpi_power_off() -> Result<(), SystemError> {
+    let tables = acpi_manager().tables().ok_or(SystemError::ENODEV)?;
+    let fadt = tables
+        .find_table::<Fadt>()
+        .map_err(|_| SystemError::ENODEV)?;
+    let (slp_typa, slp_typb) = find_s5_sleep_type().ok_or(SystemError::ENODEV)?;
+
+    acpi_try_enable(&fadt);
+
+    let pm1a_control = fadt.pm1a_control_block().map_err(|_| SystemError::ENODEV)?;
+    if pm1a_control.address != 0 {
+        let pm1b_control = fadt
+            .pm1b_control_block()
+            .map_err(|_| SystemError::ENODEV)?
+            .filter(|register| register.address != 0);
+        let pm1a_sleep_type = slp_typa << ACPI_PM1_SLEEP_TYPE_SHIFT;
+        let pm1b_sleep_type = slp_typb << ACPI_PM1_SLEEP_TYPE_SHIFT;
+
+        acpi_write_pm1_control_pair(pm1a_control, pm1a_sleep_type, pm1b_control, pm1b_sleep_type)?;
+        acpi_write_pm1_control_pair(
+            pm1a_control,
+            pm1a_sleep_type | ACPI_PM1_SLEEP_ENABLE,
+            pm1b_control,
+            pm1b_sleep_type | ACPI_PM1_SLEEP_ENABLE,
+        )?;
+    } else {
+        if let Some(sleep_control) = fadt
+            .sleep_control_register()
+            .map_err(|_| SystemError::ENODEV)?
+            .filter(|register| register.address != 0)
+        {
+            let value = (slp_typa << ACPI_SLEEP_CONTROL_TYPE_SHIFT) | ACPI_SLEEP_CONTROL_ENABLE;
+            acpi_write_sleep_register(sleep_control, value)?;
+        }
+    }
+
+    for _ in 0..ACPI_POWER_OFF_SPIN_LOOPS {
+        spin_loop();
+    }
+
+    Err(SystemError::EIO)
+}
+
+fn acpi_write_pm1_control_pair(
+    pm1a_control: GenericAddress,
+    pm1a_value: u16,
+    pm1b_control: Option<GenericAddress>,
+    pm1b_value: u16,
+) -> Result<(), SystemError> {
+    acpi_write_sleep_register(pm1a_control, pm1a_value)?;
+    if let Some(pm1b_control) = pm1b_control {
+        acpi_write_sleep_register(pm1b_control, pm1b_value)?;
+    }
+
+    Ok(())
+}
+
+fn find_s5_sleep_type() -> Option<(u16, u16)> {
+    let tables = acpi_manager().tables()?;
+    let dsdt = tables.dsdt().ok()?;
+    let (vaddr, _) =
+        EarlyIoRemap::map(PhysAddr::new(dsdt.address), dsdt.length as usize, false).ok()?;
+    let bytes = unsafe { slice::from_raw_parts(vaddr.data() as *const u8, dsdt.length as usize) };
+    let result = parse_s5_package(bytes);
+    let _ = EarlyIoRemap::unmap(vaddr);
+    result
+}
+
+fn parse_s5_package(bytes: &[u8]) -> Option<(u16, u16)> {
+    let mut i = 0;
+    while i + 4 <= bytes.len() {
+        if &bytes[i..i + 4] == b"_S5_" {
+            if i >= 1 && bytes[i - 1] == 0x08 {
+                if let Some(result) = parse_s5_package_after_name(bytes, i + 4) {
+                    return Some(result);
+                }
+            }
+            if i >= 2 && bytes[i - 2] == 0x08 && bytes[i - 1] == b'\\' {
+                if let Some(result) = parse_s5_package_after_name(bytes, i + 4) {
+                    return Some(result);
+                }
+            }
+        }
+        i += 1;
+    }
+
+    None
+}
+
+fn parse_s5_package_after_name(bytes: &[u8], mut index: usize) -> Option<(u16, u16)> {
+    let is_var_package = match bytes.get(index).copied()? {
+        0x12 => false,
+        0x13 => true,
+        _ => return None,
+    };
+    index += 1;
+
+    let (_package_end, next_index) = parse_aml_package_length(bytes, index)?;
+    index = next_index;
+
+    let (elements, next_index) = if is_var_package {
+        parse_aml_integer(bytes, index)?
+    } else {
+        (*bytes.get(index)? as u64, index + 1)
+    };
+    if elements < 2 {
+        return None;
+    }
+    index = next_index;
+
+    let (slp_typa, next_index) = parse_aml_integer(bytes, index)?;
+    let (slp_typb, _) = parse_aml_integer(bytes, next_index)?;
+    Some((slp_typa as u16, slp_typb as u16))
+}
+
+fn parse_aml_package_length(bytes: &[u8], index: usize) -> Option<(usize, usize)> {
+    let lead = *bytes.get(index)?;
+    let byte_count = (lead >> 6) as usize;
+    let mut length = if byte_count == 0 {
+        (lead & 0x3f) as usize
+    } else {
+        (lead & 0x0f) as usize
+    };
+    let mut next_index = index + 1;
+
+    for shift in 0..byte_count {
+        length |= (*bytes.get(next_index)? as usize) << (4 + shift * 8);
+        next_index += 1;
+    }
+
+    Some((index + length, next_index))
+}
+
+fn parse_aml_integer(bytes: &[u8], index: usize) -> Option<(u64, usize)> {
+    match *bytes.get(index)? {
+        0x00 => Some((0, index + 1)),
+        0x01 => Some((1, index + 1)),
+        0x0a => Some((*bytes.get(index + 1)? as u64, index + 2)),
+        0x0b => Some((
+            u16::from_le_bytes([*bytes.get(index + 1)?, *bytes.get(index + 2)?]) as u64,
+            index + 3,
+        )),
+        0x0c => Some((
+            u32::from_le_bytes([
+                *bytes.get(index + 1)?,
+                *bytes.get(index + 2)?,
+                *bytes.get(index + 3)?,
+                *bytes.get(index + 4)?,
+            ]) as u64,
+            index + 5,
+        )),
+        0x0e => Some((
+            u64::from_le_bytes([
+                *bytes.get(index + 1)?,
+                *bytes.get(index + 2)?,
+                *bytes.get(index + 3)?,
+                *bytes.get(index + 4)?,
+                *bytes.get(index + 5)?,
+                *bytes.get(index + 6)?,
+                *bytes.get(index + 7)?,
+                *bytes.get(index + 8)?,
+            ]),
+            index + 9,
+        )),
+        _ => None,
+    }
+}
+
+fn acpi_try_enable(fadt: &Fadt) {
+    if fadt.smi_cmd_port == 0 || fadt.acpi_enable == 0 {
+        return;
+    }
+
+    unsafe {
+        CurrentPortIOArch::out8(fadt.smi_cmd_port as u16, fadt.acpi_enable);
+    }
+
+    for _ in 0..ACPI_ENABLE_SPIN_LOOPS {
+        spin_loop();
+    }
+}
+
+fn acpi_write_sleep_register(register: GenericAddress, value: u16) -> Result<(), SystemError> {
+    match register.address_space {
+        AddressSpace::SystemIo => unsafe {
+            CurrentPortIOArch::out16(register.address as u16, value);
+            Ok(())
+        },
+        AddressSpace::SystemMemory => write_memory(register.address as usize, value as u64, 16),
+        _ => Err(SystemError::ENOSYS),
+    }
 }
 
 fn acpi_pci_reboot(reset_register: GenericAddress, reset_value: u8) {

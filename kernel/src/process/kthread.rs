@@ -19,7 +19,7 @@ use crate::{
     init::initial_kthread::{initial_kernel_thread, set_system_state, SystemState},
     libs::{cpumask::CpuMask, once::Once, spinlock::SpinLock},
     process::{ProcessManager, ProcessState},
-    sched::{schedule, SchedMode},
+    sched::{completion::Completion, schedule, SchedMode},
     smp::cpu::ProcessorId,
 };
 
@@ -62,6 +62,8 @@ bitflags! {
 #[derive(Debug)]
 pub struct KernelThreadPcbPrivate {
     flags: KernelThreadFlags,
+    result: usize,
+    exited: Arc<Completion>,
 }
 
 #[allow(dead_code)]
@@ -69,6 +71,8 @@ impl KernelThreadPcbPrivate {
     pub fn new() -> Self {
         Self {
             flags: KernelThreadFlags::empty(),
+            result: 0,
+            exited: Arc::new(Completion::new()),
         }
     }
 
@@ -78,6 +82,18 @@ impl KernelThreadPcbPrivate {
 
     pub fn flags_mut(&mut self) -> &mut KernelThreadFlags {
         &mut self.flags
+    }
+
+    pub fn result(&self) -> usize {
+        self.result
+    }
+
+    pub fn set_result(&mut self, result: usize) {
+        self.result = result;
+    }
+
+    pub fn exited_completion(&self) -> Arc<Completion> {
+        self.exited.clone()
     }
 }
 
@@ -428,26 +444,39 @@ impl KernelThreadMechanism {
             "kthread stop: worker_private is none, pid: {:?}",
             pcb.raw_pid()
         );
-        worker_private
-            .as_mut()
-            .unwrap()
-            .kernel_thread_mut()
-            .expect("Error type of worker private")
-            .flags
-            .insert(KernelThreadFlags::SHOULD_STOP);
+        let exited_completion = {
+            let kthread = worker_private
+                .as_mut()
+                .unwrap()
+                .kernel_thread_mut()
+                .expect("Error type of worker private");
+            kthread.flags.insert(KernelThreadFlags::SHOULD_STOP);
+            kthread.exited_completion()
+        };
 
         drop(worker_private);
 
         ProcessManager::wakeup(pcb).ok();
 
-        // 忙等目标内核线程退出
-        // todo: 使用completion机制优化这里
-        loop {
-            if let ProcessState::Exited(code) = pcb.sched_info().inner_lock_read_irqsave().state() {
-                return Ok(code);
-            }
-            spin_loop();
+        if let ProcessState::Exited(code) = pcb.sched_info().inner_lock_read_irqsave().state() {
+            return Ok(code);
         }
+
+        exited_completion.wait_for_completion()?;
+
+        let worker_private = pcb.worker_private();
+        let result = worker_private
+            .as_ref()
+            .and_then(|x| x.kernel_thread())
+            .map(|x| x.result())
+            .unwrap_or_else(|| {
+                pcb.sched_info()
+                    .inner_lock_read_irqsave()
+                    .state()
+                    .exit_code()
+                    .unwrap_or(0)
+            });
+        Ok(result)
     }
 
     /// 请求一个内核线程退出（不等待其真正退出）
@@ -603,6 +632,17 @@ pub unsafe extern "C" fn kernel_thread_bootstrap_stage2(ptr: *const KernelThread
     if !KernelThreadMechanism::should_stop(&ProcessManager::current_pcb()) {
         retval = closure.run();
     }
+
+    let current = ProcessManager::current_pcb();
+    {
+        let mut worker_private = current.worker_private();
+        let kthread = worker_private
+            .as_mut()
+            .and_then(|x| x.kernel_thread_mut())
+            .expect("kthread exit: missing worker_private");
+        kthread.set_result(retval as usize);
+    }
+    drop(current);
 
     ProcessManager::exit(retval as usize);
 }

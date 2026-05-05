@@ -733,6 +733,18 @@ impl ProcessManager {
             pcb.sched_info
                 .inner_lock_write_irqsave()
                 .set_state(ProcessState::Exited(exit_code));
+            if pcb.is_kthread() {
+                let exited_completion = {
+                    let worker_private = pcb.worker_private();
+                    worker_private
+                        .as_ref()
+                        .and_then(|x| x.kernel_thread())
+                        .map(|x| x.exited_completion())
+                };
+                if let Some(exited_completion) = exited_completion {
+                    exited_completion.complete_all();
+                }
+            }
 
             let rq = cpu_rq(smp_get_processor_id().data() as usize);
             let (rq, guard) = rq.self_lock();

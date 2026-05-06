@@ -44,6 +44,23 @@ pub enum CpuHpState {
     Online,
 }
 
+impl CpuHpState {
+    pub const fn next(self) -> Option<Self> {
+        match self {
+            CpuHpState::ThresholdBringUp => Some(CpuHpState::Offline),
+            CpuHpState::Offline => Some(CpuHpState::Online),
+            CpuHpState::Online => None,
+        }
+    }
+    pub const fn prev(self) -> Option<Self> {
+        match self {
+            CpuHpState::ThresholdBringUp => None,
+            CpuHpState::Offline => Some(CpuHpState::ThresholdBringUp),
+            CpuHpState::Online => Some(CpuHpState::Offline),
+        }
+    }
+}
+
 /// Per-Cpu Cpu的热插拔状态
 pub struct CpuHpCpuState {
     /// 当前状态
@@ -305,6 +322,19 @@ impl SmpCpuManager {
         }
     }
 
+    pub fn cpuhp_step_state(&self, cpu_id: ProcessorId) {
+        let cpu_state = self.cpuhp_state_mut(cpu_id);
+        if cpu_state.bringup {
+            if let Some(next) = cpu_state.state.next() {
+                cpu_state.state = next;
+            }
+        } else {
+            if let Some(prev) = cpu_state.state.prev() {
+                cpu_state.state = prev;
+            }
+        }
+    }
+
     /// 完成AP的启动
     pub fn complete_ap_thread(&self, bringup: bool) {
         let cpu_id = smp_get_processor_id();
@@ -319,8 +349,16 @@ impl SmpCpuManager {
 
     fn cpuhp_reset_state(&self, st: &mut CpuHpCpuState, prev_state: CpuHpState) {
         let bringup = !st.bringup;
+        if bringup {
+            if let Some(s) = st.state.prev() {
+                st.state = s;
+            }
+        } else {
+            if let Some(s) = st.state.next() {
+                st.state = s;
+            }
+        }
         st.target_state = prev_state;
-
         st.bringup = bringup;
     }
 }

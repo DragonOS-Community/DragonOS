@@ -23,6 +23,7 @@ use crate::{
         SMPArch,
     },
 };
+use x86_64::registers::model_specific::EferFlags;
 
 use super::{
     acpi::early_acpi_boot_init,
@@ -84,6 +85,15 @@ unsafe extern "sysv64" fn smp_init_switch_stack(st: &ApStartStackInfo) -> ! {
 unsafe extern "C" fn smp_ap_start_stage1() -> ! {
     let id = smp_get_processor_id();
     debug!("smp_ap_start_stage1: id: {}\n", id.data());
+
+    // BSP 在 init_xd_rsvd() 中启用了 EFER.NXE，但 AP 也必须启用，
+    // 若 AP 的 EFER.NXE=0，则 bit 63 被视为保留位，触发 RSVD 页错误。
+    let mut efer = x86_64::registers::model_specific::Efer::read();
+    if !efer.contains(EferFlags::NO_EXECUTE_ENABLE) {
+        efer.insert(EferFlags::NO_EXECUTE_ENABLE);
+        unsafe { x86_64::registers::model_specific::Efer::write(efer) };
+    }
+
     let current_idle = ProcessManager::idle_pcb()[smp_get_processor_id().data() as usize].clone();
 
     let tss = TSSManager::current_tss();

@@ -16,7 +16,7 @@ static CALC_LOAD_TASKS: AtomicIsize = AtomicIsize::new(0);
 static CALC_LOAD_UPDATE: AtomicU64 = AtomicU64::new(0);
 static AVENRUN: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 static NR_RUNNING: AtomicUsize = AtomicUsize::new(0);
-static NR_UNINTERRUPTIBLE: AtomicUsize = AtomicUsize::new(0);
+static NR_THREADS: AtomicUsize = AtomicUsize::new(0);
 
 fn calc_load(load: u64, exp: u64, active: u64) -> u64 {
     let mut newload: u128 =
@@ -66,8 +66,8 @@ pub fn nr_running() -> u32 {
     NR_RUNNING.load(Ordering::Relaxed) as u32
 }
 
-pub fn nr_uninterruptible() -> u32 {
-    NR_UNINTERRUPTIBLE.load(Ordering::Relaxed) as u32
+pub fn nr_threads() -> u32 {
+    NR_THREADS.load(Ordering::Relaxed) as u32
 }
 
 pub(super) fn inc_nr_running(delta: usize) {
@@ -78,12 +78,20 @@ pub(super) fn dec_nr_running(delta: usize) {
     NR_RUNNING.fetch_sub(delta, Ordering::Relaxed);
 }
 
-pub(super) fn inc_nr_uninterruptible(delta: usize) {
-    NR_UNINTERRUPTIBLE.fetch_add(delta, Ordering::Relaxed);
+pub(crate) fn inc_nr_threads() {
+    NR_THREADS.fetch_add(1, Ordering::Relaxed);
 }
 
-pub(super) fn dec_nr_uninterruptible(delta: usize) {
-    NR_UNINTERRUPTIBLE.fetch_sub(delta, Ordering::Relaxed);
+pub(crate) fn dec_nr_threads() {
+    NR_THREADS.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// adjust 用于 CPU 热插拔迁移时排除正在迁移的任务（当前传 0）。
+fn calc_load_fold_active(rq: &CpuRunQueue, adjust: isize) -> isize {
+    let nr_active =
+        rq.nr_running.load(Ordering::Relaxed) as isize - adjust + rq.nr_uninterruptible as isize;
+    let delta = nr_active - rq.calc_load_active;
+    delta
 }
 
 pub fn calc_global_load_tick(rq: &mut CpuRunQueue) {
@@ -92,14 +100,13 @@ pub fn calc_global_load_tick(rq: &mut CpuRunQueue) {
         return;
     }
 
-    let nr_active = rq.nr_running as isize + rq.nr_uninterruptible as isize;
-    let delta = nr_active - rq.calc_load_active;
+    let delta = calc_load_fold_active(rq, 0);
     if delta != 0 {
         CALC_LOAD_TASKS.fetch_add(delta, Ordering::SeqCst);
-        rq.calc_load_active = nr_active;
+        rq.calc_load_active += delta;
     }
 
-    rq.calc_load_update = rq.calc_load_update.saturating_add(LOAD_FREQ);
+    rq.calc_load_update += LOAD_FREQ;
 }
 
 pub fn calc_global_load(now_jiffies: u64) {
@@ -122,12 +129,20 @@ pub fn calc_global_load(now_jiffies: u64) {
     let n = 1 + (delta / LOAD_FREQ);
 
     let active_tasks = CALC_LOAD_TASKS.load(Ordering::SeqCst);
-    let active = if active_tasks > 0 {
+    let active: u64 = if active_tasks > 0 {
         (active_tasks as u64).saturating_mul(FIXED_1)
     } else {
-        let running = nr_running() as u64;
-        let uninterruptible = nr_uninterruptible() as u64;
-        (running.saturating_add(uninterruptible)).saturating_mul(FIXED_1)
+        if active_tasks < 0 {
+            log::warn!(
+                "calc_global_load: active_tasks is negative ({}), possible accounting bug",
+                active_tasks
+            );
+        }
+        debug_assert!(
+            active_tasks >= 0,
+            "active_tasks underflow in calc_global_load"
+        );
+        0
     };
 
     let a0 = AVENRUN[0].load(Ordering::SeqCst);

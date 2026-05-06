@@ -5,8 +5,8 @@ use system_error::SystemError;
 use crate::arch::driver::apic::{CurrentApic, LocalAPIC};
 
 use crate::{
-    sched::{SchedMode, __schedule},
-    smp::cpu::ProcessorId,
+    sched::cpu_rq,
+    smp::{core::smp_get_processor_id, cpu::ProcessorId},
 };
 
 use super::{
@@ -67,8 +67,18 @@ impl IrqHandler for KickCpuIpiHandler {
         #[cfg(target_arch = "x86_64")]
         CurrentApic.send_eoi();
 
-        // 被其他cpu kick时应该是抢占调度
-        __schedule(SchedMode::SM_PREEMPT);
+        let cpu = smp_get_processor_id();
+        let rq = cpu_rq(cpu.data() as usize);
+
+        // scheduler_ipi() + sched_ttwu_pending()：
+        // IPI handler 中仅 try_lock，若 rq 锁被持有（如 load_balance 的 double_rq_lock）
+        // 则跳过，任务留在 WakeQueue 中，由下一次 scheduler_tick 或 __schedule 排空。
+        // Linux 的 scheduler_ipi() 完全不操作 rq 锁，实际唤醒延迟到 softirq / schedule 路径。
+        if let Some((rq, _guard)) = rq.try_self_lock() {
+            rq.update_rq_clock();
+            rq.drain_wake_queue();
+        }
+
         Ok(IrqReturn::Handled)
     }
 }

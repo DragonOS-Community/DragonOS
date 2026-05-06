@@ -54,4 +54,18 @@ pub fn smp_init() {
     smp_cpu_manager().bringup_nonboot_cpus();
 
     CurrentSMPArch::post_init().expect("SMP post init failed");
+
+    // 构建单层 system-wide sched_domain
+    crate::sched::topology::build_sched_domains();
+
+    // 启用负载均衡
+    crate::sched::load_balance::enable_load_balance();
+
+    // sched_init_smp(): 将当前 init 进程的 cpus_allowed 扩展到所有 possible CPUs，使其子进程能自然分布到多核。
+    let current_pcb = crate::process::ProcessManager::current_pcb();
+    current_pcb
+        .sched_info()
+        .set_cpus_allowed(smp_cpu_manager().possible_cpus().clone());
+
+    log::info!("SMP initialized.");
 }

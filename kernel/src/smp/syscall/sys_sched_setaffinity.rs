@@ -1,4 +1,5 @@
 use alloc::string::ToString;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bitmap::traits::BitMapOps;
 use system_error::SystemError;
@@ -8,7 +9,9 @@ use crate::arch::syscall::nr::SYS_SCHED_SETAFFINITY;
 use crate::libs::cpumask::CpuMask;
 use crate::process::{ProcessManager, RawPid};
 use crate::sched::syscall::util::has_sched_setaffinity_permission;
+use crate::sched::{schedule, SchedMode};
 use crate::smp::cpu::smp_cpu_manager;
+use crate::smp::smp_get_processor_id;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::UserBufferReader;
 
@@ -55,7 +58,19 @@ impl Syscall for SysSchedSetaffinity {
             }
         }
 
+        // 已知限制：schedule() 仅让出 CPU，并不会将当前任务从本地 rq 迁移。
+        // Linux 使用 stop_one_cpu_nowait + migration_cpu_stop 物理移动任务。
+        // 当前实现仅标记迁移需求，依赖后续负载均衡完成实际迁移。
+        // 完整修复需要实现 CPU stopper 机制。
+        let is_current = Arc::ptr_eq(&target_pcb, &ProcessManager::current_pcb());
+        let cur_cpu_excluded = is_current && mask.get(smp_get_processor_id()) != Some(true);
+
         target_pcb.sched_info().set_cpus_allowed(mask);
+
+        if cur_cpu_excluded {
+            schedule(SchedMode::SM_NONE);
+        }
+
         Ok(0)
     }
 

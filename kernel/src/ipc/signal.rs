@@ -379,13 +379,9 @@ impl Signal {
             return false;
         }
 
-        let is_blocked_non_interruptable =
-            state.is_blocked() && (!state.is_blocked_interruptable());
-
-        if is_blocked_non_interruptable {
-            return false;
-        }
-
+        // wants_signal() 不检查 TASK_UNINTERRUPTIBLE / TASK_KILLABLE 状态：
+        // 只要信号未被屏蔽且进程未 stopped/traced，就应该接收信号。
+        // 唤醒与否由 signal_wake_up() / __schedule() 中的 signal_pending_state() 决定。
         return true;
     }
 

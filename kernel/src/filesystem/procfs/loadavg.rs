@@ -35,11 +35,7 @@ impl LoadavgFileOps {
         let loads = loadavg::get_avenrun(loadavg::FIXED_1 / 200, 0);
 
         let running = loadavg::nr_running();
-        let total = crate::process::all_process()
-            .lock_irqsave()
-            .as_ref()
-            .map(|m| m.len() as u32)
-            .unwrap_or(0);
+        let total = loadavg::nr_threads();
         let last_pid = crate::process::ProcessManager::current_pidns()
             .last_pid()
             .data() as u32;

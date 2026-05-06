@@ -107,8 +107,11 @@ fn kenrel_init_freeable() -> Result<(), SystemError> {
     do_initcalls().unwrap_or_else(|err| {
         panic!("Failed to initialize subsystems: {:?}", err);
     });
-    smp_init();
+    // 必须在 smp_init() 之前初始化 workqueue，因为 smp_init 中的
+    // enable_load_balance() 可能触发 scheduler_tick -> schedule_work，
+    // 而 schedule_work 依赖 SYSTEM_WQ 已初始化。
     crate::exception::workqueue::workqueue_init();
+    smp_init();
     return Ok(());
 }
 

@@ -7,6 +7,7 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SCHED_GETAFFINITY;
 use crate::process::{ProcessManager, RawPid};
 use crate::sched::syscall::util::has_sched_permission;
+use crate::smp::cpu::smp_cpu_manager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::UserBufferWriter;
 
@@ -22,7 +23,10 @@ impl Syscall for SysSchedGetaffinity {
         let size = args[1];
         let set_vaddr = args[2];
 
-        if size == 0 {
+        // size 必须 >= nr_cpu_ids 所需字节数且对齐到 usize
+        let nr_cpu_ids = smp_cpu_manager().possible_cpus_count() as usize;
+        let min_len = nr_cpu_ids.div_ceil(8);
+        if size < min_len || !size.is_multiple_of(core::mem::size_of::<usize>()) {
             return Err(SystemError::EINVAL);
         }
 

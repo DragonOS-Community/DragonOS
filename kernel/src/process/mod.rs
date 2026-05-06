@@ -5,7 +5,7 @@ use core::{
     intrinsics::unlikely,
     mem::ManuallyDrop,
     str::FromStr,
-    sync::atomic::{compiler_fence, fence, AtomicBool, AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{compiler_fence, fence, AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -23,7 +23,6 @@ use system_error::SystemError;
 
 use crate::{
     arch::{
-        cpu::current_cpu_id,
         ipc::signal::{AtomicSignal, SigSet, Signal},
         process::ArchPCBInfo,
         CurrentIrqArch, SigStackArch,
@@ -60,8 +59,8 @@ use crate::{
     },
     process::resource::{RLimit64, RLimitID},
     sched::{
-        DequeueFlag, EnqueueFlag, OnRq, SchedMode, WakeupFlags, __schedule, completion::Completion,
-        cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO,
+        task_cpu, DequeueFlag, EnqueueFlag, OnRq, SchedMode, WakeupFlags, __schedule,
+        completion::Completion, cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO,
     },
     smp::{
         core::smp_get_processor_id,
@@ -254,6 +253,7 @@ impl ProcessManager {
             .as_mut()
             .unwrap()
             .insert(pcb.raw_pid(), pcb.clone());
+        crate::sched::loadavg::inc_nr_threads();
     }
 
     pub(crate) fn exchange_tid_and_raw_pids(
@@ -283,51 +283,120 @@ impl ProcessManager {
         pids
     }
 
+    /// 封装唤醒后的任务入队与抢占检查逻辑。
+    fn ttwu_do_activate(
+        pcb: &Arc<ProcessControlBlock>,
+        prev_cpu: ProcessorId,
+        wake_flags: WakeupFlags,
+    ) {
+        ProcessManager::current_pcb().sched_info().record_wakee(pcb);
+
+        let target_cpu = crate::sched::load_balance::LoadBalancer::select_task_rq(
+            pcb,
+            prev_cpu,
+            wake_flags.bits(),
+        );
+
+        let target_cpu = if target_cpu == ProcessorId::INVALID {
+            log::warn!(
+                "ttwu_do_activate: select_task_rq returned INVALID for pid={:?}, fallback to current CPU",
+                pcb.raw_pid()
+            );
+            smp_get_processor_id()
+        } else {
+            target_cpu
+        };
+
+        if target_cpu != smp_get_processor_id() {
+            // 远程唤醒：将任务挂到目标 CPU 的 WakeQueue，由目标 CPU 的 IPI handler
+            // 负责在正确的 source rq 上递减 nr_iowait 并执行 __set_task_cpu。
+            crate::sched::ttwu_queue(pcb, target_cpu, wake_flags);
+            return;
+        }
+
+        let rq = cpu_rq(target_cpu.data() as usize);
+        let (rq, _guard) = rq.self_lock();
+        rq.update_rq_clock();
+
+        let mut flags = EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK;
+
+        // 1. nr_iowait 在 set_task_cpu 之前于 source rq 递减
+        // 2. set_task_cpu 迁移到目标 rq
+        // 3. nr_uninterruptible 在 set_task_cpu 之后于目标 rq（已持锁）递减
+        if target_cpu != prev_cpu {
+            if pcb.flags().contains(ProcessFlags::IN_IOWAIT) {
+                cpu_rq(prev_cpu.data() as usize).dec_nr_iowait();
+            }
+            log::trace!(
+                "ttwu_do_activate: migrating pid={:?} prev_cpu={:?} -> target_cpu={:?}",
+                pcb.raw_pid(),
+                prev_cpu,
+                target_cpu
+            );
+            crate::sched::__set_task_cpu(pcb, target_cpu);
+            flags |= EnqueueFlag::ENQUEUE_MIGRATED;
+        }
+
+        // nr_uninterruptible: 在目标 rq（已持锁）递减
+        if pcb
+            .flags()
+            .contains(ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD)
+        {
+            rq.dec_nr_uninterruptible();
+            pcb.flags().remove(ProcessFlags::SCHED_CONTRIBUTES_TO_LOAD);
+        }
+        if target_cpu == prev_cpu && pcb.flags().contains(ProcessFlags::IN_IOWAIT) {
+            rq.dec_nr_iowait();
+        }
+
+        rq.activate_task(pcb, flags);
+        rq.check_preempt_currnet(pcb, wake_flags);
+    }
+
     /// 唤醒一个进程
+    ///
+    /// 1. 先检查 on_rq，若已排队则走 ttwu_runnable 快速路径（不迁移、不重新入队）
+    /// 2. 若未排队，检查 on_cpu：若 task 正在运行（on_cpu 不为 None），将 wakeup 放入其
+    ///    所在 CPU 的 WakeQueue，由该 CPU 在 switch_finish_hook 后处理（对齐 Linux
+    ///    ttwu_queue_wakelist）。避免在 __schedule 的 dequeue 窗口内并发 set_task_cpu。
+    /// 3. 若 on_rq == None 且 on_cpu == None，走完整 ttwu_do_activate 路径。
     pub fn wakeup(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let state = pcb.sched_info().inner_lock_read_irqsave().state();
-        let was_uninterruptible = matches!(state, ProcessState::Blocked(false));
         if state.is_blocked() {
             let mut writer = pcb.sched_info().inner_lock_write_irqsave();
             let state = writer.state();
             if state.is_blocked() {
                 writer.set_state(ProcessState::Runnable);
                 writer.set_wakeup();
-
-                // avoid deadlock
                 drop(writer);
 
-                pcb.debug_assert_fork_cpu_binding();
-
-                let target_cpu = pcb.sched_info().on_cpu().unwrap_or(current_cpu_id());
-                let update_clock = target_cpu == smp_get_processor_id();
-                let rq = cpu_rq(target_cpu.data() as usize);
-
-                let (rq, _guard) = rq.self_lock();
-                debug_assert_eq!(
-                    pcb.sched_info().on_cpu(),
-                    Some(rq.cpu()),
-                    "wakeup: on_cpu mismatch with rq.cpu"
-                );
-                if update_clock {
+                // 若 task 已在 rq 上排队，仅做 check_preempt_curr + 标记 RUNNING，
+                // 不调用 set_task_cpu / activate_task，避免在 rbtree 内破坏 cfs_rq 指针。
+                let on_rq = *pcb.sched_info().on_rq.lock_irqsave();
+                if on_rq == OnRq::Queued {
+                    // ttwu_runnable: task 已在 rq 上，无需迁移或重新入队
+                    let prev_cpu = task_cpu(pcb);
+                    let rq = cpu_rq(prev_cpu.data() as usize);
+                    let (rq, _rq_guard) = rq.self_lock();
                     rq.update_rq_clock();
-                }
-                if was_uninterruptible {
-                    rq.dec_nr_uninterruptible();
-                }
-                rq.activate_task(
-                    pcb,
-                    EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK,
-                );
-
-                if update_clock {
-                    rq.check_preempt_currnet(pcb, WakeupFlags::empty());
+                    rq.check_preempt_currnet(pcb, WakeupFlags::WF_TTWU);
+                } else if let Some(cpu_id) = pcb.sched_info().on_cpu() {
+                    // task 正在运行（on_cpu 不为 None），说明它正在某个 CPU 的 __schedule 中。
+                    // 将 wakeup 放入该 CPU 的 WakeQueue，由该 CPU 在 switch_finish_hook
+                    // 后处理，避免在 dequeue 窗口内并发 set_task_cpu 导致 cfs_rq 不匹配。
+                    log::trace!(
+                        "wakeup: pid={:?} on_cpu={:?}, queue to wakelist",
+                        pcb.raw_pid(),
+                        cpu_id
+                    );
+                    let wq = crate::sched::cpu_wakequeue(cpu_id.data() as usize);
+                    wq.push(pcb.clone());
+                    crate::sched::send_resched_ipi(cpu_id);
                 } else {
-                    rq.check_preempt_remote(pcb, WakeupFlags::empty());
+                    let prev_cpu = task_cpu(pcb);
+                    Self::ttwu_do_activate(pcb, prev_cpu, WakeupFlags::WF_TTWU);
                 }
-
-                // sched_enqueue(pcb.clone(), true);
                 return Ok(());
             } else if state.is_exited() {
                 return Err(SystemError::EINVAL);
@@ -353,12 +422,15 @@ impl ProcessManager {
 
         let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
+        // 先获取 task 所在 CPU 的 rq 锁，再操作 on_rq
+        // 避免与 load_balance / activate_task 的 rq -> on_rq 顺序产生 ABBA 死锁。
+        let target_cpu = task_cpu(pcb);
+        let rq = crate::sched::cpu_rq(target_cpu.data() as usize);
+        let (rq, _rq_guard) = rq.self_lock();
+
         let on_rq = *pcb.sched_info().on_rq.lock_irqsave();
         if on_rq == crate::sched::OnRq::Queued {
-            let target_cpu = pcb.sched_info().on_cpu().unwrap_or(current_cpu_id());
             let update_clock = target_cpu == smp_get_processor_id();
-            let rq = crate::sched::cpu_rq(target_cpu.data() as usize);
-            let (rq, _guard) = rq.self_lock();
             if update_clock {
                 rq.update_rq_clock();
             }
@@ -418,31 +490,8 @@ impl ProcessManager {
                 // avoid deadlock
                 drop(writer);
 
-                let target_cpu = pcb.sched_info().on_cpu().unwrap_or(smp_get_processor_id());
-                let update_clock = target_cpu == smp_get_processor_id();
-                let rq = cpu_rq(target_cpu.data() as usize);
-
-                let (rq, _guard) = rq.self_lock();
-                debug_assert_eq!(
-                    pcb.sched_info().on_cpu(),
-                    Some(rq.cpu()),
-                    "wakeup_stop: on_cpu mismatch with rq.cpu"
-                );
-                if update_clock {
-                    rq.update_rq_clock();
-                }
-                rq.activate_task(
-                    pcb,
-                    EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK,
-                );
-
-                if update_clock {
-                    rq.check_preempt_currnet(pcb, WakeupFlags::empty());
-                } else {
-                    rq.check_preempt_remote(pcb, WakeupFlags::empty());
-                }
-
-                // sched_enqueue(pcb.clone(), true);
+                let prev_cpu = task_cpu(pcb);
+                Self::ttwu_do_activate(pcb, prev_cpu, WakeupFlags::WF_TTWU);
                 return Ok(());
             } else if state.is_runnable() {
                 return Ok(());
@@ -469,18 +518,21 @@ impl ProcessManager {
         }
 
         // Stopped 的任务不应继续留在 runqueue 中，否则仍可能被选中运行。
-        let on_rq = *pcb.sched_info().on_rq.lock_irqsave();
         writer.set_state(ProcessState::Stopped);
         // stop 后不应再被视为“睡眠任务”，避免后续调度错误地做 DEQUEUE_SLEEP。
         writer.set_wakeup();
         pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
         drop(writer);
 
+        // 对齐 Linux task_rq_lock 顺序：先获取 rq 锁，再操作 on_rq。
+        // 避免与 load_balance / activate_task 的 rq -> on_rq 顺序产生 ABBA 死锁。
+        let target_cpu = task_cpu(pcb);
+        let rq = cpu_rq(target_cpu.data() as usize);
+        let (rq, _rq_guard) = rq.self_lock();
+
+        let on_rq = *pcb.sched_info().on_rq.lock_irqsave();
         if on_rq == OnRq::Queued {
-            let target_cpu = pcb.sched_info().on_cpu().unwrap_or(current_cpu_id());
             let update_clock = target_cpu == smp_get_processor_id();
-            let rq = cpu_rq(target_cpu.data() as usize);
-            let (rq, _guard) = rq.self_lock();
             if update_clock {
                 rq.update_rq_clock();
             }
@@ -522,6 +574,27 @@ impl ProcessManager {
         return Err(SystemError::EINTR);
     }
 
+    /// TASK_KILLABLE (TASK_UNINTERRUPTIBLE | TASK_WAKEKILL)。
+    /// 仅 fatal signal (SIGKILL) 可唤醒，非 fatal signal 不中断睡眠。
+    pub fn mark_sleep_killable() -> Result<(), SystemError> {
+        assert!(
+            !CurrentIrqArch::is_irq_enabled(),
+            "interrupt must be disabled before enter ProcessManager::mark_sleep_killable()"
+        );
+        let pcb = ProcessManager::current_pcb();
+        let mut writer = pcb.sched_info().inner_lock_write_irqsave();
+        if !matches!(writer.state(), ProcessState::Exited(_)) {
+            writer.set_state(ProcessState::Blocked(false));
+            writer.set_wake_kill();
+            writer.set_sleep();
+            pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
+            fence(Ordering::SeqCst);
+            drop(writer);
+            return Ok(());
+        }
+        Err(SystemError::EINTR)
+    }
+
     /// 标志当前进程为停止状态，但是发起调度的工作，应该由调用者完成
     ///
     /// ## 注意
@@ -551,18 +624,15 @@ impl ProcessManager {
     fn exit_notify() {
         let current = ProcessManager::current_pcb();
         let sighand = current.sighand();
-        let exec_task = if sighand.flags_contains(SignalFlags::GROUP_EXEC) {
+        let group_exec = sighand.flags_contains(SignalFlags::GROUP_EXEC);
+        let exec_task = if group_exec {
             sighand.group_exec_task()
         } else {
             None
         };
-        let is_mt_exec_leader = current.is_thread_group_leader()
-            && exec_task
-                .as_ref()
-                .map(|t| !Arc::ptr_eq(t, &current))
-                .unwrap_or(false);
-        if sighand.flags_contains(SignalFlags::GROUP_EXEC) {
-            if let Some(exec_task) = exec_task.as_ref() {
+
+        if group_exec {
+            if let Some(ref exec_task) = exec_task {
                 if !Arc::ptr_eq(exec_task, &current) {
                     let notify_count = sighand.group_exec_notify_count();
                     if notify_count < 0 {
@@ -573,15 +643,16 @@ impl ProcessManager {
                     }
                 }
             }
-            let should_clear = exec_task
-                .as_ref()
-                .map(|t| Arc::ptr_eq(t, &current))
-                .unwrap_or(false);
-            if should_clear {
+            if exec_task.as_ref().is_some_and(|t| Arc::ptr_eq(t, &current)) {
                 sighand.finish_group_exec();
             }
         }
+
         // mt-exec: leader 退出时只标记 zombie，避免触发普通退出通知/收养
+        let is_mt_exec_leader = current.is_thread_group_leader()
+            && exec_task
+                .as_ref()
+                .is_some_and(|t| !Arc::ptr_eq(t, &current));
         if is_mt_exec_leader {
             current.set_exit_state_zombie();
             return;
@@ -624,7 +695,9 @@ impl ProcessManager {
 
             // kthread 退出时显式唤醒 kthreadd，使其回收 zombie
             if current.is_kthread() {
-                let _ = ProcessManager::wakeup(&parent_pcb);
+                if let Err(e) = ProcessManager::wakeup(&parent_pcb) {
+                    log::warn!("exit_notify: failed to wakeup kthreadd parent: {:?}", e);
+                }
             }
 
             // 根据 Linux wait 语义，线程组中的任何线程都可以等待同一线程组中任何线程创建的子进程。
@@ -704,8 +777,11 @@ impl ProcessManager {
                 {
                     // Linux 使用 FUTEX_SHARED 标志来唤醒 clear_child_tid
                     // 这允许跨进程/线程的同步（例如 pthread_join）
-                    let _ =
-                        Futex::futex_wake(addr, FutexFlag::FLAGS_SHARED, 1, FUTEX_BITSET_MATCH_ANY);
+                    if let Err(e) =
+                        Futex::futex_wake(addr, FutexFlag::FLAGS_SHARED, 1, FUTEX_BITSET_MATCH_ANY)
+                    {
+                        log::warn!("exit: futex_wake for clear_child_tid failed: {:?}", e);
+                    }
                 }
             }
             compiler_fence(Ordering::SeqCst);
@@ -729,7 +805,6 @@ impl ProcessManager {
             }
             pcb.sig_info_mut().set_tty(None);
 
-            // 在最后，调用 exit_notify 之前，设置调度状态为 Exited
             pcb.sched_info
                 .inner_lock_write_irqsave()
                 .set_state(ProcessState::Exited(exit_code));
@@ -746,15 +821,6 @@ impl ProcessManager {
                 }
             }
 
-            let rq = cpu_rq(smp_get_processor_id().data() as usize);
-            let (rq, guard) = rq.self_lock();
-            rq.update_rq_clock();
-            rq.deactivate_task(
-                pcb.clone(),
-                DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
-            );
-            drop(guard);
-
             // 注意：exit_files() 可能会触发阻塞（例如关闭 FUSE fd 需要等待 daemon 回复），
             // 因此不能在它之前清空 user_vm，否则后续调度切换会遇到 user_vm==None 的普通进程并崩溃。
             //
@@ -762,11 +828,6 @@ impl ProcessManager {
             // otherwise after the mm is freed (Arc count reaches zero) a stale per-CPU cpumask bit
             // will remain, and subsequent flushes by other threads on the same mm would still target
             // this CPU and send spurious IPIs.
-            //
-            // Note that this CPU's hardware page table still points to this mm, but __schedule will
-            // immediately switch to idle, whose IDLE_PROCESS_ADDRESS_SPACE will re-set this CPU's
-            // active_cpus bit and write the correct per-CPU TlbState. So clearing the old mm's bit
-            // here is sufficient.
             {
                 let cpu = smp_get_processor_id();
                 if let Some(old_vm) = pcb.basic().user_vm() {
@@ -781,6 +842,7 @@ impl ProcessManager {
             ProcessManager::exit_notify();
         }
 
+        // 由 __schedule 在看到 Exited 状态时统一调用 deactivate_task。
         __schedule(SchedMode::SM_NONE);
         error!("raw_pid {raw_pid:?} exited but sched again!");
         #[allow(clippy::empty_loop)]
@@ -822,7 +884,7 @@ impl ProcessManager {
             //    仿照 Linux zap_other_threads 的语义，这里仅负责投递 SIGKILL，
             //    实际退出在各线程上下文中完成。
             {
-                let send_sigkill_thread = |task: Arc<ProcessControlBlock>| {
+                let send_sigkill_thread = |task: &Arc<ProcessControlBlock>| {
                     if task.flags().contains(ProcessFlags::EXITING) {
                         return;
                     }
@@ -835,11 +897,17 @@ impl ProcessManager {
                             uid: 0,
                         },
                     );
-                    let _ = Signal::SIGKILL.send_signal_info_to_pcb(
+                    if let Err(e) = Signal::SIGKILL.send_signal_info_to_pcb(
                         Some(&mut info),
-                        task,
+                        task.clone(),
                         PidType::PID,
-                    );
+                    ) {
+                        log::warn!(
+                            "group_exit: failed to send SIGKILL to {:?}: {:?}",
+                            task.raw_pid(),
+                            e
+                        );
+                    }
                 };
 
                 // 统一从线程组组长的 ThreadInfo 中获取完整的线程列表，
@@ -858,7 +926,7 @@ impl ProcessManager {
                 if !Arc::ptr_eq(&leader, &current_pcb)
                     && !leader.flags().contains(ProcessFlags::EXITING)
                 {
-                    send_sigkill_thread(leader.clone());
+                    send_sigkill_thread(&leader);
                 }
 
                 // 再遍历组长维护的 group_tasks，向其他线程发送 SIGKILL
@@ -871,7 +939,7 @@ impl ProcessManager {
                         if task.flags().contains(ProcessFlags::EXITING) {
                             continue;
                         }
-                        send_sigkill_thread(task);
+                        send_sigkill_thread(&task);
                     }
                 }
             }
@@ -906,6 +974,7 @@ impl ProcessManager {
             }
 
             ALL_PROCESS.lock_irqsave().as_mut().unwrap().remove(&pid);
+            crate::sched::loadavg::dec_nr_threads();
         }
     }
 
@@ -926,6 +995,11 @@ impl ProcessManager {
             .next_pcb
             .take()
             .expect("next_pcb is None");
+
+        // finish_task(prev): smp_store_release(&prev->on_cpu, 0)
+        // 必须在硬件上下文切换完成后执行，否则 ttwu 可能观察到 on_cpu==None
+        // 并在 prev 仍在执行时尝试在其他 CPU 上唤醒它。
+        prev_pcb.sched_info().set_on_cpu(None);
 
         // 由于进程切换前使用了SpinLockGuard::leak()，所以这里需要手动释放锁
         fence(Ordering::SeqCst);
@@ -953,7 +1027,13 @@ impl ProcessManager {
             if pcb.raw_pid() == cpu_rq(cpu_id.data() as usize).current().raw_pid()
                 && cpu_id != current_cpu_id
             {
-                kick_cpu(cpu_id).expect("ProcessManager::kick(): Failed to kick cpu");
+                if let Err(e) = kick_cpu(cpu_id) {
+                    log::warn!(
+                        "ProcessManager::kick(): Failed to kick cpu {:?}: {:?}",
+                        cpu_id,
+                        e
+                    );
+                }
             }
         }
 
@@ -1109,6 +1189,9 @@ bitflags! {
         const IN_IOWAIT = 1 << 13;
         /// 线程组 exec 期间延迟 PID/TGID/PGID/SID 的 unhash
         const DEFER_UNHASH = 1 << 14;
+        /// 进入 UNINTERRUPTIBLE 睡眠时在 __schedule 中设置，
+        /// 唤醒时在 ttwu_do_activate 中读取并递减 nr_uninterruptible。
+        const SCHED_CONTRIBUTES_TO_LOAD = 1 << 15;
     }
 }
 
@@ -1170,6 +1253,10 @@ pub struct ProcessControlBlock {
     basic: RwLock<ProcessBasicInfo>,
     /// 当前进程的自旋锁持有计数
     preempt_count: AtomicUsize,
+    /// 自愿上下文切换次数（进程主动调用 schedule / mark_sleep 等放弃 CPU）
+    nvcsw: AtomicUsize,
+    /// 非自愿上下文切换次数（进程被抢占，如时间片用完、更高优先级任务就绪）
+    nivcsw: AtomicUsize,
 
     flags: LockFreeFlags<ProcessFlags>,
     worker_private: SpinLock<Option<WorkerPrivate>>,
@@ -1347,6 +1434,8 @@ impl ProcessControlBlock {
                 nsproxy: RwLock::new(nsproxy),
                 basic: basic_info,
                 preempt_count,
+                nvcsw: AtomicUsize::new(0),
+                nivcsw: AtomicUsize::new(0),
                 flags,
                 kernel_stack: RwLock::new(kstack),
                 syscall_stack: RwLock::new(KernelStack::new().unwrap()),
@@ -1397,10 +1486,12 @@ impl ProcessControlBlock {
             pcb
         });
 
-        pcb.sched_info()
-            .sched_entity()
-            .force_mut()
-            .set_pcb(Arc::downgrade(&pcb));
+        unsafe {
+            pcb.sched_info()
+                .sched_entity()
+                .force_mut()
+                .set_pcb(Arc::downgrade(&pcb));
+        }
         // 设置进程的arc指针到内核栈和系统调用栈的最低地址处
         unsafe {
             pcb.kernel_stack
@@ -1563,6 +1654,16 @@ impl ProcessControlBlock {
         self.preempt_count.store(count, Ordering::SeqCst);
     }
 
+    #[inline]
+    pub fn inc_nvcsw(&self) {
+        self.nvcsw.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_nivcsw(&self) {
+        self.nivcsw.fetch_add(1, Ordering::Relaxed);
+    }
+
     #[inline(always)]
     pub fn contain_child(&self, pid: &RawPid) -> bool {
         let children = self.children.read();
@@ -1692,12 +1793,12 @@ impl ProcessControlBlock {
 
     #[inline(always)]
     pub fn raw_pid(&self) -> RawPid {
-        return self.pid.load(Ordering::Acquire);
+        self.pid.load(Ordering::Acquire)
     }
 
     #[inline(always)]
     pub fn raw_tgid(&self) -> RawPid {
-        return self.tgid;
+        self.tgid
     }
 
     #[inline(always)]
@@ -1716,7 +1817,7 @@ impl ProcessControlBlock {
     /// 获取文件描述符表的Arc指针
     #[inline(always)]
     pub fn fd_table(&self) -> Arc<RwSem<FileDescriptorVec>> {
-        return self.basic.read().try_fd_table().unwrap();
+        self.basic.read().try_fd_table().unwrap()
     }
 
     #[inline(always)]
@@ -1834,6 +1935,23 @@ impl ProcessControlBlock {
         let init_pcb = ProcessManager::find_task_by_vpid(RawPid(1)).ok_or(SystemError::ECHILD)?;
 
         // 如果当前进程是 namespace 的 init，则由父进程所在 pidns 的 init 去收养。
+        let reparent_to = |child: &Arc<ProcessControlBlock>,
+                           new_parent: &Arc<ProcessControlBlock>| {
+            *child.parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
+            *child.real_parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
+            let parent_pid_in_child_ns = new_parent
+                .task_pid_nr_ns(PidType::PID, Some(child.active_pid_ns()))
+                .unwrap_or(RawPid::new(0));
+            child.basic.write_irqsave().ppid = parent_pid_in_child_ns;
+
+            let child_vpid = child
+                .task_pid_nr_ns(PidType::PID, Some(new_parent.active_pid_ns()))
+                .unwrap_or(RawPid::new(0));
+            if child_vpid.data() != 0 {
+                new_parent.children.write().push(child_vpid);
+            }
+        };
+
         if Arc::ptr_eq(&self.self_ref.upgrade().unwrap(), &init_pcb) {
             if let Some(parent_pcb) = self.real_parent_pcb() {
                 assert!(
@@ -1841,24 +1959,12 @@ impl ProcessControlBlock {
                     "adopt_childen: parent_pcb is init_pcb, pid: {}",
                     self.raw_pid()
                 );
-                let parent_init =
-                    ProcessManager::find_task_by_pid_ns(RawPid(1), &parent_pcb.active_pid_ns());
-                if let Some(parent_init) = parent_init {
+                if let Some(parent_init) =
+                    ProcessManager::find_task_by_pid_ns(RawPid(1), &parent_pcb.active_pid_ns())
+                {
                     for pid in child_pids.iter().copied() {
                         if let Some(child) = ProcessManager::find_task_by_vpid(pid) {
-                            *child.parent_pcb.write_irqsave() = Arc::downgrade(&parent_init);
-                            *child.real_parent_pcb.write_irqsave() = Arc::downgrade(&parent_init);
-                            let parent_pid_in_child_ns = parent_init
-                                .task_pid_nr_ns(PidType::PID, Some(child.active_pid_ns()))
-                                .unwrap_or(RawPid::new(0));
-                            child.basic.write_irqsave().ppid = parent_pid_in_child_ns;
-
-                            let child_vpid_in_parent_ns = child
-                                .task_pid_nr_ns(PidType::PID, Some(parent_init.active_pid_ns()))
-                                .unwrap_or(RawPid::new(0));
-                            if child_vpid_in_parent_ns.data() != 0 {
-                                parent_init.children.write().push(child_vpid_in_parent_ns);
-                            }
+                            reparent_to(&child, &parent_init);
                         }
                     }
                 }
@@ -1880,30 +1986,15 @@ impl ProcessControlBlock {
                 reaper = leader;
                 break;
             }
-
             if leader.raw_pid() == RawPid(1) {
                 break;
             }
-
             cursor = leader.parent_pcb();
         }
 
         for pid in child_pids.iter().copied() {
             if let Some(child) = ProcessManager::find_task_by_vpid(pid) {
-                *child.parent_pcb.write_irqsave() = Arc::downgrade(&reaper);
-                *child.real_parent_pcb.write_irqsave() = Arc::downgrade(&reaper);
-                let parent_pid_in_child_ns = reaper
-                    .task_pid_nr_ns(PidType::PID, Some(child.active_pid_ns()))
-                    .unwrap_or(RawPid::new(0));
-                child.basic.write_irqsave().ppid = parent_pid_in_child_ns;
-
-                // 按 wait 语义，将被收养子进程挂到收养者（线程组 leader）的 children 列表中。
-                let child_vpid_in_reaper_ns = child
-                    .task_pid_nr_ns(PidType::PID, Some(reaper.active_pid_ns()))
-                    .unwrap_or(RawPid::new(0));
-                if child_vpid_in_reaper_ns.data() != 0 {
-                    reaper.children.write().push(child_vpid_in_reaper_ns);
-                }
+                reparent_to(&child, &reaper);
             }
         }
 
@@ -2003,8 +2094,8 @@ impl ProcessControlBlock {
     /// 注：该函数较慢，因此需要与 has_pending_signal_fast 一起使用。
     pub fn has_pending_not_masked_signal(&self) -> bool {
         let sig_info = self.sig_info_irqsave();
-        let blocked: SigSet = *sig_info.sig_blocked();
-        let mut pending: SigSet = sig_info.sig_pending().signal();
+        let blocked = *sig_info.sig_blocked();
+        let mut pending = sig_info.sig_pending().signal();
         drop(sig_info);
         // 同时检查 shared_pending
         pending |= self.sighand().shared_pending_signal();
@@ -2039,7 +2130,7 @@ impl ProcessControlBlock {
     }
 
     pub fn posix_timers_irqsave(&self) -> SpinLockGuard<'_, posix_timer::ProcessPosixTimers> {
-        return self.posix_timers.lock_irqsave();
+        self.posix_timers.lock_irqsave()
     }
 
     /// 清理当前进程/线程的定时器
@@ -2061,21 +2152,21 @@ impl ProcessControlBlock {
             alarm.cancel();
         }
 
-        let group_dead = self.is_thread_group_leader();
-        if group_dead {
-            // 2. 取消 ITIMER_REAL
-            if let Some(real_itimer) = self.itimers.lock_irqsave().real.take() {
-                real_itimer.timer.cancel();
-            }
+        if !self.is_thread_group_leader() {
+            return;
+        }
 
-            // 3. 删除所有 POSIX interval timers
-            let mut posix_timers = self.posix_timers.lock_irqsave();
-            let timer_ids: alloc::vec::Vec<i32> = posix_timers.timer_ids().collect();
-            let self_arc = self.self_ref.upgrade();
-            if let Some(ref pcb) = self_arc {
-                for id in timer_ids {
-                    let _ = posix_timers.delete(pcb, id);
-                }
+        // 2. 取消 ITIMER_REAL
+        if let Some(real_itimer) = self.itimers.lock_irqsave().real.take() {
+            real_itimer.timer.cancel();
+        }
+
+        // 3. 删除所有 POSIX interval timers
+        let mut posix_timers = self.posix_timers.lock_irqsave();
+        let timer_ids: Vec<i32> = posix_timers.timer_ids().collect();
+        if let Some(ref pcb) = self.self_ref.upgrade() {
+            for id in timer_ids {
+                let _ = posix_timers.delete(pcb, id);
             }
         }
     }
@@ -2371,8 +2462,10 @@ impl ProcessBasicInfo {
 
 #[derive(Debug)]
 pub struct ProcessSchedulerInfo {
-    /// 当前进程所在的cpu
+    /// 当前进程正在哪个 CPU 上执行（context_switch 时更新）
     on_cpu: AtomicProcessorId,
+    /// 任务当前绑定的 CPU（__set_task_cpu 时更新，不通过 cfs_rq 计算，避免 cfs_rq 指针陈旧时返回错误 CPU）
+    cpu: AtomicProcessorId,
     /// 如果当前进程等待被迁移到另一个cpu核心上（也就是flags中的PF_NEED_MIGRATE被置位），
     /// 该字段存储要被迁移到的目标处理器核心号
     // migrate_to: AtomicProcessorId,
@@ -2393,6 +2486,12 @@ pub struct ProcessSchedulerInfo {
     pub nr_cpus_allowed: AtomicUsize,
 
     pub prio_data: RwLock<PrioData>,
+
+    /// 被当前进程唤醒的次数（用于 wake_wide 判断）
+    pub wakee_flips: AtomicUsize,
+    /// 上次被唤醒的进程的 pid（用于 wake_wide 判断）
+    pub last_wakee: AtomicUsize,
+    pub wakee_flip_decay_ts: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -2432,6 +2531,9 @@ pub struct InnerSchedInfo {
     state: ProcessState,
     /// 进程的调度策略
     sleep: bool,
+    /// TASK_WAKEKILL：仅 fatal signal 可唤醒。
+    /// 由 mark_sleep_killable() 设置，__schedule 读取后通过 set_wakeup() 清除。
+    wake_kill: bool,
 }
 
 impl InnerSchedInfo {
@@ -2449,22 +2551,32 @@ impl InnerSchedInfo {
 
     pub fn set_wakeup(&mut self) {
         self.sleep = false;
+        self.wake_kill = false;
     }
 
     pub fn is_mark_sleep(&self) -> bool {
         self.sleep
+    }
+
+    pub fn is_wake_kill(&self) -> bool {
+        self.wake_kill
+    }
+
+    pub fn set_wake_kill(&mut self) {
+        self.wake_kill = true;
     }
 }
 
 impl ProcessSchedulerInfo {
     fn default_cpus_allowed() -> CpuMask {
         if crate::smp::cpu::smp_cpu_manager_initialized() {
-            return crate::smp::cpu::smp_cpu_manager().possible_cpus().clone();
+            crate::smp::cpu::smp_cpu_manager().possible_cpus().clone()
+        } else {
+            // SMP 尚未初始化时，只有 BSP 在线。cpus_allowed 只能包含 BSP，
+            // 否则 select_task_rq 可能选择不存在的 CPU，导致访问未初始化的 per-CPU 数据。
+            // sched_init_smp() 在 SMP 初始化完成后，才将 init 进程的 cpus_allowed 扩展到 cpu_possible_mask。
+            CpuMask::from_cpu(smp_get_processor_id())
         }
-
-        // 进程管理初始化早于 SMP 拓扑初始化。此时先退化为“当前引导 CPU 可运行”，
-        // 待后续显式初始化（如 idle/per-cpu kthread）再收敛到更精确的 mask。
-        CpuMask::from_cpu(current_cpu_id())
     }
 
     #[inline(never)]
@@ -2474,10 +2586,12 @@ impl ProcessSchedulerInfo {
         let nr_cpus_allowed = cpus_allowed.iter_cpu().count();
         return Self {
             on_cpu: AtomicProcessorId::new(cpu_id),
+            cpu: AtomicProcessorId::new(cpu_id),
             // migrate_to: AtomicProcessorId::new(ProcessorId::INVALID),
             inner_locked: RwLock::new(InnerSchedInfo {
                 state: ProcessState::Blocked(false),
                 sleep: false,
+                wake_kill: false,
             }),
             // virtual_runtime: AtomicIsize::new(0),
             // rt_time_slice: AtomicIsize::new(0),
@@ -2489,6 +2603,9 @@ impl ProcessSchedulerInfo {
             cpus_allowed: SpinLock::new(cpus_allowed),
             nr_cpus_allowed: AtomicUsize::new(nr_cpus_allowed),
             prio_data: RwLock::new(PrioData::default()),
+            wakee_flips: AtomicUsize::new(0),
+            last_wakee: AtomicUsize::new(0),
+            wakee_flip_decay_ts: AtomicU64::new(0),
         };
     }
 
@@ -2511,6 +2628,15 @@ impl ProcessSchedulerInfo {
         } else {
             self.on_cpu.store(ProcessorId::INVALID, Ordering::SeqCst);
         }
+    }
+
+    /// 返回任务当前绑定的 CPU，不依赖 cfs_rq 指针。
+    pub fn cpu(&self) -> ProcessorId {
+        self.cpu.load(Ordering::Acquire)
+    }
+
+    pub fn set_cpu(&self, cpu: ProcessorId) {
+        self.cpu.store(cpu, Ordering::Release);
     }
 
     // pub fn migrate_to(&self) -> Option<ProcessorId> {
@@ -2590,19 +2716,19 @@ impl ProcessSchedulerInfo {
     // }
 
     pub fn policy(&self) -> crate::sched::SchedPolicy {
-        return *self.sched_policy.read_irqsave();
+        *self.sched_policy.read_irqsave()
     }
 
     pub fn prio_data(&self) -> RwLockReadGuard<'_, PrioData> {
-        return self.prio_data.read_irqsave();
+        self.prio_data.read_irqsave()
     }
 
     pub fn cpus_allowed(&self) -> CpuMask {
-        return self.cpus_allowed.lock_irqsave().clone();
+        self.cpus_allowed.lock_irqsave().clone()
     }
 
     pub fn nr_cpus_allowed(&self) -> usize {
-        return self.nr_cpus_allowed.load(Ordering::SeqCst);
+        self.nr_cpus_allowed.load(Ordering::SeqCst)
     }
 
     pub fn set_cpus_allowed(&self, cpus_allowed: CpuMask) {
@@ -2610,6 +2736,25 @@ impl ProcessSchedulerInfo {
         *self.cpus_allowed.lock_irqsave() = cpus_allowed;
         self.nr_cpus_allowed
             .store(nr_cpus_allowed, Ordering::SeqCst);
+    }
+
+    /// 记录唤醒关系，用于 `wake_wide` 判断。
+    pub fn record_wakee(&self, pcb: &Arc<ProcessControlBlock>) {
+        use crate::time::clocksource::HZ;
+        let now = crate::time::timer::clock();
+        let ts = self.wakee_flip_decay_ts.load(Ordering::Relaxed);
+        if now >= ts + HZ {
+            let flips = self.wakee_flips.load(Ordering::Relaxed);
+            self.wakee_flips.store(flips >> 1, Ordering::Release);
+            self.wakee_flip_decay_ts.store(now, Ordering::Release);
+        }
+
+        let wakee_pid = pcb.raw_pid().0;
+        let last = self.last_wakee.load(Ordering::Acquire);
+        if last != wakee_pid {
+            self.last_wakee.store(wakee_pid, Ordering::Release);
+            self.wakee_flips.fetch_add(1, Ordering::AcqRel);
+        }
     }
 }
 

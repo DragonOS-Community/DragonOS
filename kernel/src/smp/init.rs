@@ -12,6 +12,8 @@ use crate::{
 pub fn smp_ap_start_stage2() -> ! {
     assert!(!CurrentIrqArch::is_irq_enabled());
 
+    let cpu_id = smp_get_processor_id();
+    smp_cpu_manager().cpuhp_step_state(cpu_id);
     smp_cpu_manager().complete_ap_thread(true);
 
     do_ap_start_stage2();

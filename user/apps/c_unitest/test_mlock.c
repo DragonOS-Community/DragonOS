@@ -5,7 +5,16 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/syscall.h>
 #include <unistd.h>
+
+#ifndef SYS_mlock2
+#define SYS_mlock2 325
+#endif
+
+#ifndef MCL_ONFAULT
+#define MCL_ONFAULT 4
+#endif
 
 static int g_total = 0;
 static int g_failed = 0;
@@ -147,11 +156,52 @@ static void test_file_mapping_lock_lazy_fault(void) {
     unlink(tmpl);
 }
 
+static void test_stubbed_locking_syscalls(void) {
+    size_t ps = page_size();
+    char *addr = mmap(NULL, ps, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(addr != MAP_FAILED, "mmap for stubbed locking syscalls");
+    if (addr == MAP_FAILED) {
+        return;
+    }
+
+    errno = 0;
+    CHECK(syscall(SYS_mlock2, addr, 0, 0) == -1 && errno == EINVAL,
+          "mlock2 length zero returns EINVAL");
+
+    errno = 0;
+    CHECK(syscall(SYS_mlock2, addr, ps, 0x80000000U) == -1 && errno == EINVAL,
+          "mlock2 unknown flags return EINVAL");
+
+    allow_memlock(ps);
+    errno = 0;
+    CHECK(syscall(SYS_mlock2, addr, ps, 0) == 0,
+          "mlock2 valid flags returns success");
+
+    errno = 0;
+    CHECK(mlockall(0) == -1 && errno == EINVAL,
+          "mlockall zero flags returns EINVAL");
+
+    errno = 0;
+    CHECK(mlockall(MCL_ONFAULT) == -1 && errno == EINVAL,
+          "mlockall MCL_ONFAULT alone returns EINVAL");
+
+    errno = 0;
+    CHECK(mlockall(MCL_FUTURE | MCL_ONFAULT) == 0,
+          "mlockall valid flags returns success");
+
+    errno = 0;
+    CHECK(munlockall() == 0, "munlockall returns success");
+
+    munmap(addr, ps);
+}
+
 int main(void) {
     test_invalid_args();
     test_permission_or_limit();
     test_anonymous_populate_and_unlock();
     test_file_mapping_lock_lazy_fault();
+    test_stubbed_locking_syscalls();
 
     printf("Summary: %d/%d passed\n", g_total - g_failed, g_total);
     return g_failed == 0 ? 0 : 1;

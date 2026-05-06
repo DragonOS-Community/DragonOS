@@ -58,27 +58,32 @@ pub(super) fn do_mlock(
         return Err(SystemError::EPERM);
     }
 
-    let pcb = ProcessManager::current_pcb();
-    let has_cap_ipc_lock = pcb.cred().has_capability(CAPFlags::CAP_IPC_LOCK);
-    let rlimit = pcb.get_rlimit(RLimitID::Memlock).rlim_cur;
-
     let vm = AddressSpace::current()?;
     let mut guard = vm.write_interruptible()?;
 
-    if !has_cap_ipc_lock {
-        let new_pages = guard.count_unlocked_pages_for_mlock(start, len)?;
-        let total_pages = guard
-            .locked_vm
-            .checked_add(new_pages)
-            .ok_or(SystemError::ENOMEM)?;
-        let total_bytes = (total_pages as u128) * (MMArch::PAGE_SIZE as u128);
-        if total_bytes > rlimit as u128 {
-            return Err(SystemError::ENOMEM);
-        }
-    }
+    let new_pages = guard.count_unlocked_pages_for_mlock(start, len)?;
+    check_mlock_rlimit(guard.locked_vm, new_pages)?;
 
     guard.apply_vma_lock_flags(start, len, new_flags)?;
     Ok(0)
+}
+
+pub(super) fn check_mlock_rlimit(locked_vm: usize, new_pages: usize) -> Result<(), SystemError> {
+    let pcb = ProcessManager::current_pcb();
+    if pcb.cred().has_capability(CAPFlags::CAP_IPC_LOCK) {
+        return Ok(());
+    }
+
+    let rlimit = pcb.get_rlimit(RLimitID::Memlock).rlim_cur;
+    let total_pages = locked_vm
+        .checked_add(new_pages)
+        .ok_or(SystemError::ENOMEM)?;
+    let total_bytes = (total_pages as u128) * (MMArch::PAGE_SIZE as u128);
+    if total_bytes > rlimit as u128 {
+        return Err(SystemError::ENOMEM);
+    }
+
+    Ok(())
 }
 
 pub(super) fn normalize_mlock_range(

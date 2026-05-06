@@ -301,6 +301,7 @@ impl PageFaultHandler {
                     if let Some(flush) = mapper.map_phys(address, page.phys_address(), flags) {
                         flush.flush();
                         page.write().insert_vma(vma.clone());
+                        // TODO: mlock 缺页联动：若 VMA 带 VM_LOCKED，应标记 PG_UNEVICTABLE。
                         return VmFaultReason::VM_FAULT_COMPLETED;
                     } else {
                         return VmFaultReason::VM_FAULT_OOM;
@@ -325,6 +326,7 @@ impl PageFaultHandler {
             let mut page_manager_guard = page_manager_lock();
             let page = page_manager_guard.get_unwrap(&paddr);
             page.write().insert_vma(vma.clone());
+            // TODO: mlock 缺页联动：若 VMA 带 VM_LOCKED，应标记 PG_UNEVICTABLE。
             VmFaultReason::VM_FAULT_COMPLETED
         } else {
             VmFaultReason::VM_FAULT_OOM
@@ -744,6 +746,7 @@ impl PageFaultHandler {
                             .flush();
                     }
                     page_guard.upgrade().insert_vma(vma.clone());
+                    // TODO: mlock 缺页联动：若 VMA 带 VM_LOCKED，应标记 PG_UNEVICTABLE。
                 }
             }
         }
@@ -872,6 +875,7 @@ impl PageFaultHandler {
 
         mapper.map_phys(address, page_phys, vma_guard.flags());
         page_to_map.write().insert_vma(pfm.vma());
+        // TODO: mlock 缺页联动：若 VMA 带 VM_LOCKED，应标记 PG_UNEVICTABLE。
         VmFaultReason::VM_FAULT_COMPLETED
     }
 
@@ -890,6 +894,7 @@ impl PageFaultHandler {
             let paddr = mapper.translate(address).unwrap().0;
             let page = pm.get_unwrap(&paddr);
             page.write().insert_vma(vma);
+            // TODO: mlock 缺页联动：若 VMA 带 VM_LOCKED，应标记 PG_UNEVICTABLE。
             VmFaultReason::VM_FAULT_COMPLETED
         } else {
             VmFaultReason::VM_FAULT_OOM
@@ -923,6 +928,7 @@ impl PageFaultHandler {
                 let paddr = mapper.translate(addr).unwrap().0;
                 let page = pm.get_unwrap(&paddr);
                 page.write().insert_vma(vma.clone());
+                // TODO: mlock 缺页联动：若 VMA 带 VM_LOCKED，应标记 PG_UNEVICTABLE。
             } else {
                 return VmFaultReason::VM_FAULT_OOM;
             }

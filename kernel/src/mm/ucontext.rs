@@ -251,6 +251,8 @@ impl core::ops::DerefMut for AddressSpace {
 pub struct InnerAddressSpace {
     pub user_mapper: UserMapper,
     pub mappings: UserMappings,
+    /// 已锁定的用户页数量，以页为单位。
+    pub locked_vm: usize,
     pub mmap_min: VirtAddr,
     /// 用户栈信息结构体
     pub user_stack: Option<UserStack>,
@@ -292,6 +294,7 @@ impl InnerAddressSpace {
         let result = Self {
             user_mapper: MMArch::setup_new_usermapper()?,
             mappings: UserMappings::new(),
+            locked_vm: 0,
             mmap_min: VirtAddr(DEFAULT_MMAP_MIN_ADDR),
             elf_brk_start: VirtAddr::new(0),
             elf_brk: VirtAddr::new(0),
@@ -367,7 +370,9 @@ impl InnerAddressSpace {
             let shm_id = vma_guard.shm_id;
 
             // 创建新的VMA
-            let new_vma = LockedVMA::new(vma_guard.clone_info_only());
+            let mut child_vma = vma_guard.clone_info_only();
+            child_vma.vm_flags &= VmFlags::VM_LOCKED_CLEAR_MASK;
+            let new_vma = LockedVMA::new(child_vma);
             new_guard.mappings.attach_vma(&new_vma);
             new_guard.mappings.vmas.insert(new_vma.clone());
             drop(vma_guard);
@@ -1293,6 +1298,223 @@ impl InnerAddressSpace {
 
         return Ok(());
     }
+
+    pub fn count_unlocked_pages_for_mlock(
+        &self,
+        start: VirtAddr,
+        len: usize,
+    ) -> Result<usize, SystemError> {
+        let target = Self::checked_user_region(start, len)?;
+        let mut vmas = self.mappings.conflicts(target).collect::<Vec<_>>();
+        vmas.sort_by_key(|vma| vma.lock().region().start().data());
+
+        let mut cursor = target.start();
+        let mut unlocked_pages = 0usize;
+        for vma in vmas {
+            let guard = vma.lock();
+            let region = *guard.region();
+            let Some(intersection) = region.intersect(&target) else {
+                continue;
+            };
+            if intersection.start() > cursor {
+                return Err(SystemError::ENOMEM);
+            }
+            if intersection.end() > cursor {
+                if !guard.vm_flags().contains(VmFlags::VM_LOCKED) {
+                    unlocked_pages = unlocked_pages
+                        .checked_add(intersection.size() >> MMArch::PAGE_SHIFT)
+                        .ok_or(SystemError::ENOMEM)?;
+                }
+                cursor = intersection.end();
+            }
+            if cursor >= target.end() {
+                break;
+            }
+        }
+
+        if cursor != target.end() {
+            return Err(SystemError::ENOMEM);
+        }
+        Ok(unlocked_pages)
+    }
+
+    pub fn apply_vma_lock_flags(
+        &mut self,
+        start: VirtAddr,
+        len: usize,
+        new_flags: VmFlags,
+    ) -> Result<(), SystemError> {
+        let target = Self::checked_user_region(start, len)?;
+        self.count_unlocked_pages_for_mlock(start, len)?;
+
+        let wants_locked = new_flags.contains(VmFlags::VM_LOCKED);
+        let mut vmas = self.mappings.conflicts(target).collect::<Vec<_>>();
+        vmas.sort_by_key(|vma| vma.lock().region().start().data());
+
+        for cur_vma in vmas {
+            let original_region = *cur_vma.lock().region();
+            let cur_vma = self
+                .mappings
+                .remove_vma(&original_region)
+                .ok_or(SystemError::EFAULT)?;
+            let intersection = cur_vma
+                .lock()
+                .region()
+                .intersect(&target)
+                .ok_or(SystemError::EFAULT)?;
+            let old_flags = *cur_vma.lock().vm_flags();
+            let old_locked = old_flags.contains(VmFlags::VM_LOCKED);
+
+            let split_result = cur_vma
+                .extract(intersection, &self.user_mapper.utable)
+                .ok_or(SystemError::EFAULT)?;
+
+            {
+                let mut guard = cur_vma.lock();
+                guard.set_vm_flags((old_flags & VmFlags::VM_LOCKED_CLEAR_MASK) | new_flags);
+            }
+
+            let pages = intersection.size() >> MMArch::PAGE_SHIFT;
+            if wants_locked && !old_locked {
+                self.locked_vm = self
+                    .locked_vm
+                    .checked_add(pages)
+                    .ok_or(SystemError::ENOMEM)?;
+            } else if !wants_locked && old_locked {
+                self.locked_vm = self.locked_vm.saturating_sub(pages);
+            }
+
+            let page_result = if wants_locked {
+                self.mlock_vma_pages_range(&cur_vma, intersection.start(), intersection.end())
+            } else {
+                self.munlock_vma_pages_range(intersection.start(), intersection.end())
+            };
+
+            if let Some(before) = split_result.prev {
+                self.mappings.insert_vma(before);
+            }
+            if let Some(after) = split_result.after {
+                self.mappings.insert_vma(after);
+            }
+            self.mappings.insert_vma(cur_vma);
+
+            page_result?;
+        }
+
+        Ok(())
+    }
+
+    fn checked_user_region(start: VirtAddr, len: usize) -> Result<VirtRegion, SystemError> {
+        if len == 0 {
+            return Err(SystemError::EINVAL);
+        }
+        start.data().checked_add(len).ok_or(SystemError::EINVAL)?;
+        Ok(VirtRegion::new(start, len))
+    }
+
+    fn mlock_vma_pages_range(
+        &mut self,
+        vma: &Arc<LockedVMA>,
+        start: VirtAddr,
+        end: VirtAddr,
+    ) -> Result<(), SystemError> {
+        let mm = self.outer_addr_space().ok_or(SystemError::EFAULT)?;
+        let _pt_edit = mm.page_table_edit();
+        let mapper = &mut self.user_mapper.utable;
+        let mut mapped = false;
+
+        let (vma_flags, entry_flags, is_populatable, shared_anon, backing_pgoff, region_start) = {
+            let guard = vma.lock();
+            (
+                *guard.vm_flags(),
+                guard.flags(),
+                guard.vm_file().is_none()
+                    && !guard
+                        .vm_flags()
+                        .intersects(VmFlags::VM_IO | VmFlags::VM_PFNMAP),
+                guard.shared_anon.clone(),
+                guard.backing_page_offset().unwrap_or(0),
+                guard.region().start(),
+            )
+        };
+
+        let mut vaddr = start;
+        while vaddr < end {
+            if let Some((paddr, _)) = mapper.translate(vaddr) {
+                let mut page_manager_guard = page_manager_lock();
+                let page = page_manager_guard.get_unwrap(&paddr);
+                page.write().add_flags(PageFlags::PG_UNEVICTABLE);
+            } else if is_populatable {
+                if vma_flags.contains(VmFlags::VM_SHARED) {
+                    if let Some(shared) = shared_anon.clone() {
+                        let pgoff = backing_pgoff + ((vaddr - region_start) >> MMArch::PAGE_SHIFT);
+                        if pgoff >= shared.size_pages() {
+                            return Err(SystemError::ENOMEM);
+                        }
+                        let page = shared.get_or_create_page(pgoff)?;
+                        let flush =
+                            unsafe { mapper.map_phys(vaddr, page.phys_address(), entry_flags) }
+                                .ok_or(SystemError::ENOMEM)?;
+                        flush.flush();
+                        {
+                            let mut guard = page.write();
+                            guard.add_flags(PageFlags::PG_UNEVICTABLE);
+                            guard.insert_vma(vma.clone());
+                        }
+                        mapped = true;
+                    }
+                } else {
+                    let flush =
+                        unsafe { mapper.map(vaddr, entry_flags) }.ok_or(SystemError::ENOMEM)?;
+                    flush.flush();
+                    let paddr = mapper.translate(vaddr).ok_or(SystemError::ENOMEM)?.0;
+                    let mut page_manager_guard = page_manager_lock();
+                    let page = page_manager_guard.get_unwrap(&paddr);
+                    {
+                        let mut guard = page.write();
+                        guard.add_flags(PageFlags::PG_UNEVICTABLE);
+                        guard.insert_vma(vma.clone());
+                    }
+                    mapped = true;
+                }
+            }
+            vaddr = VirtAddr::new(vaddr.data() + MMArch::PAGE_SIZE);
+        }
+
+        if mapped {
+            vma.lock().set_mapped(true);
+        }
+        Ok(())
+    }
+
+    fn munlock_vma_pages_range(
+        &mut self,
+        start: VirtAddr,
+        end: VirtAddr,
+    ) -> Result<(), SystemError> {
+        let mapper = &self.user_mapper.utable;
+        let mut vaddr = start;
+        while vaddr < end {
+            if let Some((paddr, _)) = mapper.translate(vaddr) {
+                let mut page_manager_guard = page_manager_lock();
+                let page = page_manager_guard.get_unwrap(&paddr);
+                let mut page_guard = page.write();
+                if !Self::page_should_remain_unevictable(&page_guard) {
+                    page_guard.remove_flags(PageFlags::PG_UNEVICTABLE);
+                }
+            }
+            vaddr = VirtAddr::new(vaddr.data() + MMArch::PAGE_SIZE);
+        }
+        Ok(())
+    }
+
+    fn page_should_remain_unevictable(page: &crate::mm::page::InnerPage) -> bool {
+        page.vma_set().iter().any(|vma| {
+            let guard = vma.lock();
+            guard.vm_flags().contains(VmFlags::VM_LOCKED) || guard.shared_anon.is_some()
+        })
+    }
+
     pub fn madvise(
         &mut self,
         start_page: VirtPageFrame,

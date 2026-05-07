@@ -99,11 +99,13 @@ impl IdMapFileOps {
         for e in extents {
             // lower_first 显示为对读者可见的值
             let visible_lower = if let Some(parent) = user_ns.parent_ns() {
-                crate::process::namespace::user_namespace::map_id_up(
-                    &parent.inner.lock().uid_map,
-                    e.lower_first,
-                )
-                .unwrap_or(e.lower_first)
+                let parent_inner = parent.inner.lock();
+                let parent_map = match self.map_type {
+                    MapType::Uid => &parent_inner.uid_map,
+                    MapType::Gid => &parent_inner.gid_map,
+                };
+                crate::process::namespace::user_namespace::map_id_up(parent_map, e.lower_first)
+                    .unwrap_or(e.lower_first)
             } else {
                 e.lower_first
             };
@@ -120,7 +122,7 @@ impl IdMapFileOps {
         buf: &[u8],
         map: &mut UidGidMap,
         parent_map: &UidGidMap,
-        _cap_setid: CAPFlags,
+        cap_setid: CAPFlags,
         user_ns: &Arc<crate::process::namespace::user_namespace::UserNamespace>,
     ) -> Result<usize, SystemError> {
         // 1. 只写一次检查
@@ -157,9 +159,7 @@ impl IdMapFileOps {
             }
 
             // 检查溢出
-            if first.saturating_add(count) < first
-                || lower_first.saturating_add(count) < lower_first
-            {
+            if first.checked_add(count).is_none() || lower_first.checked_add(count).is_none() {
                 return Err(SystemError::EINVAL);
             }
 
@@ -190,6 +190,13 @@ impl IdMapFileOps {
         // 4. 验证 parent map
         for e in &new_extents {
             if map_id_range_down(parent_map, e.lower_first, e.count).is_none() {
+                return Err(SystemError::EPERM);
+            }
+        }
+
+        // 5. 对非特权的 multi-extent 映射，需要 parent ns 的 CAP_SETUID/CAP_SETGID
+        if let Some(parent_ns) = user_ns.parent_ns() {
+            if !ns_capable(&parent_ns, cap_setid) {
                 return Err(SystemError::EPERM);
             }
         }

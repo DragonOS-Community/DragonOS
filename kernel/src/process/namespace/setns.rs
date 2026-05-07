@@ -4,7 +4,11 @@ use system_error::SystemError;
 
 use crate::{
     filesystem::vfs::file::{FilePrivateData, NamespaceFilePrivateData},
-    process::{cred::Cred, fork::CloneFlags, ProcessManager, RawPid},
+    process::{
+        cred::{ns_capable, CAPFlags, Cred},
+        fork::CloneFlags,
+        ProcessManager, RawPid,
+    },
 };
 
 use super::nsproxy::{switch_task_namespaces, NsProxy};
@@ -182,10 +186,9 @@ fn userns_install(
     }
 
     // 3. 需要 CAP_SYS_ADMIN 在目标 ns
-    // TODO: 实现 ns_capable 后启用
-    // if !ns_capable(&user_ns, CAPFlags::CAP_SYS_ADMIN) {
-    //     return Err(SystemError::EPERM);
-    // }
+    if !ns_capable(&user_ns, CAPFlags::CAP_SYS_ADMIN) {
+        return Err(SystemError::EPERM);
+    }
 
     // 4. 重置 credentials
     let mut new_cred = (*current.cred()).clone();

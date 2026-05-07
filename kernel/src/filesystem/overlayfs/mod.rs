@@ -3,11 +3,11 @@ pub mod copy_up;
 pub mod entry;
 
 use super::ramfs::{LockedRamFSInode, RamFSInode};
+use super::vfs::utils::DName;
 use super::vfs::FSMAKER;
 use super::vfs::{
     self, FileSystem, FileType, FsInfo, IndexNode, Metadata, MountableFileSystem, SuperBlock,
 };
-use super::vfs::utils::DName;
 use crate::driver::base::device::device_number::DeviceNumber;
 use crate::driver::base::device::device_number::Major;
 use crate::filesystem::vfs::{FileSystemMaker, FileSystemMakerData};
@@ -25,6 +25,7 @@ use system_error::SystemError;
 const WHITEOUT_MODE: u64 = 0o020000 | 0o600; // whiteout字符设备文件模式与权限
 const WHITEOUT_DEV: DeviceNumber = DeviceNumber::new(Major::UNNAMED_MAJOR, 0); // Whiteout 文件设备号
 const WHITEOUT_FLAG: u64 = 0x1;
+type LowerRoot = (String, Arc<dyn IndexNode>);
 
 #[derive(Debug)]
 pub struct OverlayMountData {
@@ -80,6 +81,7 @@ struct OverlayFS {
     layers: Vec<OvlLayer>, // 第0层为读写层，后面是只读层
     workdir: Arc<OvlInode>,
     root_inode: Arc<OvlInode>,
+    super_block: SuperBlock,
 }
 
 #[derive(Debug)]
@@ -90,7 +92,7 @@ pub struct OvlInode {
     upper_inode: Mutex<Option<Arc<dyn IndexNode>>>, // 读写层
     lower_inodes: Vec<Arc<dyn IndexNode>>,          // 只读层（支持多层）
     oe: Arc<OvlEntry>,
-    fs: Weak<OverlayFS>,
+    fs: Mutex<Weak<OverlayFS>>,
 }
 impl OvlInode {
     pub fn new(
@@ -106,8 +108,12 @@ impl OvlInode {
             upper_inode: Mutex::new(upper),
             lower_inodes,
             oe: Arc::new(OvlEntry::new()),
-            fs: Weak::default(),
+            fs: Mutex::new(Weak::default()),
         }
+    }
+
+    fn set_fs(&self, fs: Weak<OverlayFS>) {
+        *self.fs.lock() = fs;
     }
 }
 
@@ -132,12 +138,12 @@ impl FileSystem for OverlayFS {
     }
 
     fn super_block(&self) -> SuperBlock {
-        SuperBlock::new(vfs::Magic::OVERLAYFS_MAGIC, 4096, 255)
+        self.super_block.clone()
     }
 }
 
 impl OverlayFS {
-    pub fn ovl_upper_mnt(&self) -> Arc<dyn IndexNode> {
+    pub fn ovl_upper_mnt(&self) -> Arc<OvlInode> {
         self.layers[0].mnt.clone()
     }
 }
@@ -158,29 +164,38 @@ impl MountableFileSystem for OverlayFS {
             mnt: Arc::new(OvlInode::new(
                 mount_data.upper_dir.clone(),
                 upper_file_type,
-                Some(upper_inode),
+                Some(upper_inode.clone()),
                 Vec::new(),
             )),
             index: 0,
             fsid: 0,
         };
 
-        let lower_layers: Result<Vec<OvlLayer>, SystemError> = mount_data
+        let lower_roots: Result<Vec<LowerRoot>, SystemError> = mount_data
             .lower_dirs
             .iter()
-            .enumerate()
-            .map(|(i, dir)| {
+            .map(|dir| {
                 let lower_inode = ProcessManager::current_mntns()
                     .root_inode()
                     .lookup(dir)
                     .map_err(|_| SystemError::EINVAL)?;
+                Ok((dir.clone(), lower_inode))
+            })
+            .collect();
+
+        let lower_roots = lower_roots?;
+
+        let lower_layers: Result<Vec<OvlLayer>, SystemError> = lower_roots
+            .iter()
+            .enumerate()
+            .map(|(i, (dir, lower_inode))| {
                 let lower_file_type = lower_inode.metadata()?.file_type;
                 Ok(OvlLayer {
                     mnt: Arc::new(OvlInode::new(
                         dir.clone(),
                         lower_file_type,
                         None,
-                        vec![lower_inode],
+                        vec![lower_inode.clone()],
                     )),
                     index: (i + 1) as u32,
                     fsid: (i + 1) as u32,
@@ -197,7 +212,7 @@ impl MountableFileSystem for OverlayFS {
             Vec::new(),
         ));
 
-        if lower_layers.is_empty() {
+        if lower_roots.is_empty() {
             return Err(SystemError::EINVAL);
         }
 
@@ -205,17 +220,35 @@ impl MountableFileSystem for OverlayFS {
         layers.push(upper_layer);
         layers.extend(lower_layers);
 
-        let root_inode = layers[0].mnt.clone();
+        let root_inode = Arc::new(OvlInode::new(
+            String::new(),
+            upper_file_type,
+            Some(upper_inode),
+            lower_roots
+                .iter()
+                .map(|(_, lower_inode)| lower_inode.clone())
+                .collect(),
+        ));
 
-        let fs = OverlayFS {
-            numlayer: layers.len(),
-            numfs: 1,
-            numdatalayer: layers.len() - 1,
-            layers,
-            workdir,
-            root_inode,
-        };
-        Ok(Arc::new(fs))
+        let super_block = SuperBlock::new(vfs::Magic::OVERLAYFS_MAGIC, 4096, 255);
+        let fs = Arc::new_cyclic(|weak_fs| {
+            for layer in &layers {
+                layer.mnt.set_fs(weak_fs.clone());
+            }
+            workdir.set_fs(weak_fs.clone());
+            root_inode.set_fs(weak_fs.clone());
+
+            OverlayFS {
+                numlayer: layers.len(),
+                numfs: 1,
+                numdatalayer: lower_roots.len(),
+                layers,
+                workdir,
+                root_inode,
+                super_block: super_block.clone(),
+            }
+        });
+        Ok(fs)
     }
 
     fn make_mount_data(
@@ -234,49 +267,113 @@ register_mountable_fs!(OverlayFS, OVERLAYFSMAKER, "overlay");
 
 impl OvlInode {
     pub fn ovl_lower_redirect(&self) -> Option<&str> {
-        if self.file_type == FileType::File || self.file_type == FileType::Dir {
+        if !self.lower_inodes.is_empty()
+            && (self.file_type == FileType::File || self.file_type == FileType::Dir)
+        {
             Some(&self.redirect)
         } else {
             None
         }
     }
 
-    pub fn create_whiteout(&self, name: &str) -> Result<(), SystemError> {
-        let whiteout_mode = vfs::InodeMode::S_IFCHR;
-        {
-            let upper_inode = self.upper_inode.lock();
-            if let Some(ref upper_inode) = *upper_inode {
-                upper_inode.mknod(name, whiteout_mode, WHITEOUT_DEV)?;
-                let mut flags = self.flags.lock();
-                *flags |= WHITEOUT_FLAG;
-                return Ok(());
+    fn overlay_fs(&self) -> Result<Arc<OverlayFS>, SystemError> {
+        self.fs.lock().upgrade().ok_or(SystemError::EINVAL)
+    }
+
+    fn upper_root_inode(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let upper_mnt = self.overlay_fs()?.ovl_upper_mnt();
+        let upper_inode = upper_mnt.upper_inode.lock();
+        upper_inode.clone().ok_or(SystemError::EROFS)
+    }
+
+    fn child_redirect(&self, name: &str) -> String {
+        if self.redirect.is_empty() {
+            String::from(name)
+        } else {
+            let mut redirect = self.redirect.clone();
+            redirect.push('/');
+            redirect.push_str(name);
+            redirect
+        }
+    }
+
+    fn ensure_upper_dir_path(&self, path: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let mut current = self.upper_root_inode()?;
+        if path.is_empty() {
+            return Ok(current);
+        }
+
+        let mut current_path = String::new();
+        for component in path.split('/').filter(|component| !component.is_empty()) {
+            if !current_path.is_empty() {
+                current_path.push('/');
+            }
+            current_path.push_str(component);
+
+            match current.find(component) {
+                Ok(next) => current = next,
+                Err(SystemError::ENOENT) => {
+                    let mode = self.lower_dir_mode(&current_path)?;
+                    current = current.mkdir(component, mode)?;
+                }
+                Err(err) => return Err(err),
             }
         }
-        // No upper inode — ensure upper dir exists via copy_up
-        drop(self.upper_inode.lock());
+
+        Ok(current)
+    }
+
+    fn lower_dir_mode(&self, path: &str) -> Result<vfs::InodeMode, SystemError> {
+        let fs = self.overlay_fs()?;
+        for layer in fs.layers.iter().skip(1) {
+            if let Some(lower_root) = layer.mnt.lower_inodes.first() {
+                if let Ok(inode) = lower_root.lookup(path) {
+                    return Ok(inode.metadata()?.mode);
+                }
+            }
+        }
+
+        Ok(vfs::InodeMode::S_IRWXUGO)
+    }
+
+    fn is_whiteout_inode(inode: &Arc<dyn IndexNode>) -> bool {
+        inode
+            .metadata()
+            .map(|metadata| {
+                metadata.file_type == FileType::CharDevice && metadata.raw_dev == WHITEOUT_DEV
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn create_whiteout(&self, name: &str) -> Result<(), SystemError> {
+        let whiteout_mode = vfs::InodeMode::S_IFCHR;
+        if let Some(ref upper_inode) = *self.upper_inode.lock() {
+            upper_inode.mknod(name, whiteout_mode, WHITEOUT_DEV)?;
+            return Ok(());
+        }
+
         self.copy_up()?;
         let upper_inode = self.upper_inode.lock();
         if let Some(ref upper_inode) = *upper_inode {
             upper_inode.mknod(name, whiteout_mode, WHITEOUT_DEV)?;
-            let mut flags = self.flags.lock();
-            *flags |= WHITEOUT_FLAG;
             return Ok(());
         }
         Err(SystemError::EROFS)
     }
 
     fn is_whiteout(&self) -> bool {
-        let flags = self.flags.lock();
-        self.file_type == FileType::CharDevice && (*flags & WHITEOUT_FLAG) != 0
+        self.file_type == FileType::CharDevice
+            && self
+                .metadata()
+                .map(|metadata| metadata.raw_dev == WHITEOUT_DEV)
+                .unwrap_or(false)
     }
 
     fn has_whiteout(&self, name: &str) -> bool {
         let upper_inode = self.upper_inode.lock();
         if let Some(ref upper_inode) = *upper_inode {
             if let Ok(inode) = upper_inode.find(name) {
-                if let Some(ovl_inode) = inode.as_any_ref().downcast_ref::<OvlInode>() {
-                    return ovl_inode.is_whiteout();
-                }
+                return Self::is_whiteout_inode(&inode);
             }
         }
         false
@@ -295,8 +392,21 @@ impl IndexNode for OvlInode {
             return upper_inode.read_at(offset, len, buf, data);
         }
 
-        if let Some(lower_inode) = self.lower_inodes.first() {
-            return lower_inode.read_at(offset, len, buf, data);
+        let mut lower_inodes = self.lower_inodes.iter();
+        if let Some(lower_inode) = lower_inodes.next() {
+            match lower_inode.read_at(offset, len, buf, data) {
+                Ok(read_len) => return Ok(read_len),
+                Err(mut err) => {
+                    for lower_inode in lower_inodes {
+                        let lock = Mutex::new(vfs::FilePrivateData::Unused);
+                        match lower_inode.read_at(offset, len, buf, lock.lock()) {
+                            Ok(read_len) => return Ok(read_len),
+                            Err(next_err) => err = next_err,
+                        }
+                    }
+                    return Err(err);
+                }
+            }
         }
 
         Err(SystemError::ENOENT)
@@ -320,7 +430,7 @@ impl IndexNode for OvlInode {
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
-        self.fs.upgrade().unwrap()
+        self.fs.lock().upgrade().unwrap()
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
@@ -328,8 +438,10 @@ impl IndexNode for OvlInode {
             return upper_inode.metadata();
         }
 
-        if let Some(lower_inode) = self.lower_inodes.first() {
-            return lower_inode.metadata();
+        for lower_inode in &self.lower_inodes {
+            if let Ok(metadata) = lower_inode.metadata() {
+                return Ok(metadata);
+            }
         }
         Ok(Metadata::default())
     }
@@ -347,7 +459,11 @@ impl IndexNode for OvlInode {
         let upper_inode = self.upper_inode.lock();
         if let Some(ref upper_inode) = *upper_inode {
             let upper_entries = upper_inode.list()?;
-            entries.extend(upper_entries);
+            for entry in upper_entries {
+                if !self.has_whiteout(&entry) {
+                    entries.push(entry);
+                }
+            }
         }
         for lower_inode in &self.lower_inodes {
             let lower_entries = lower_inode.list()?;
@@ -374,29 +490,43 @@ impl IndexNode for OvlInode {
     }
 
     fn rmdir(&self, name: &str) -> Result<(), SystemError> {
-        let upper_inode = self.upper_inode.lock();
-        if let Some(ref upper_inode) = *upper_inode {
-            upper_inode.rmdir(name)?;
-        } else if self.lower_inodes.iter().any(|l| l.find(name).is_ok()) {
-            self.create_whiteout(name)?;
-        } else {
-            return Err(SystemError::ENOENT);
+        if let Some(ref upper_inode) = *self.upper_inode.lock() {
+            match upper_inode.rmdir(name) {
+                Ok(()) => return Ok(()),
+                Err(SystemError::ENOENT) => {}
+                Err(err) => return Err(err),
+            }
         }
 
-        Ok(())
+        if self
+            .lower_inodes
+            .iter()
+            .any(|lower| lower.find(name).is_ok())
+        {
+            return self.create_whiteout(name);
+        }
+
+        Err(SystemError::ENOENT)
     }
 
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
-        let upper_inode = self.upper_inode.lock();
-        if let Some(ref upper_inode) = *upper_inode {
-            upper_inode.unlink(name)?;
-        } else if self.lower_inodes.iter().any(|l| l.find(name).is_ok()) {
-            self.create_whiteout(name)?;
-        } else {
-            return Err(SystemError::ENOENT);
+        if let Some(ref upper_inode) = *self.upper_inode.lock() {
+            match upper_inode.unlink(name) {
+                Ok(()) => return Ok(()),
+                Err(SystemError::ENOENT) => {}
+                Err(err) => return Err(err),
+            }
         }
 
-        Ok(())
+        if self
+            .lower_inodes
+            .iter()
+            .any(|lower| lower.find(name).is_ok())
+        {
+            return self.create_whiteout(name);
+        }
+
+        Err(SystemError::ENOENT)
     }
 
     fn link(
@@ -425,23 +555,52 @@ impl IndexNode for OvlInode {
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
-        let upper_inode = self.upper_inode.lock();
-        if let Some(ref upper) = *upper_inode {
-            if let Ok(inode) = upper.find(name) {
-                return Ok(inode);
+        let mut upper_inode = None;
+        if let Some(ref upper) = *self.upper_inode.lock() {
+            match upper.find(name) {
+                Ok(inode) => {
+                    if Self::is_whiteout_inode(&inode) {
+                        return Err(SystemError::ENOENT);
+                    }
+                    upper_inode = Some(inode);
+                }
+                Err(SystemError::ENOENT) => {}
+                Err(err) => return Err(err),
             }
         }
+
         if self.has_whiteout(name) {
             return Err(SystemError::ENOENT);
         }
 
+        let mut lower_inodes = Vec::new();
         for lower in &self.lower_inodes {
-            if let Ok(inode) = lower.find(name) {
-                return Ok(inode);
+            match lower.find(name) {
+                Ok(inode) => lower_inodes.push(inode),
+                Err(SystemError::ENOENT) => {}
+                Err(err) => return Err(err),
             }
         }
 
-        Err(SystemError::ENOENT)
+        if upper_inode.is_none() && lower_inodes.is_empty() {
+            return Err(SystemError::ENOENT);
+        }
+
+        let file_type = if let Some(ref upper_inode) = upper_inode {
+            upper_inode.metadata()?.file_type
+        } else {
+            lower_inodes[0].metadata()?.file_type
+        };
+
+        let inode = Arc::new(OvlInode::new(
+            self.child_redirect(name),
+            file_type,
+            upper_inode,
+            lower_inodes,
+        ));
+        inode.set_fs(self.fs.lock().clone());
+
+        Ok(inode)
     }
 
     fn mknod(

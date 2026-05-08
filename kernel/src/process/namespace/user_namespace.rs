@@ -348,3 +348,205 @@ impl ProcessManager {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    fn make_extent(first: u32, lower_first: u32, count: u32) -> UidGidExtent {
+        UidGidExtent {
+            first,
+            lower_first,
+            count,
+        }
+    }
+
+    fn make_map_inline(extents: &[UidGidExtent]) -> UidGidMap {
+        let mut map = UidGidMap::default();
+        for (i, e) in extents.iter().enumerate() {
+            map.extent[i] = *e;
+        }
+        map.nr_extents
+            .store(extents.len() as u32, core::sync::atomic::Ordering::Release);
+        map
+    }
+
+    fn make_map_heap(extents: &[UidGidExtent]) -> UidGidMap {
+        let mut map = UidGidMap::default();
+        let mut forward = extents.to_vec();
+        forward.sort_by_key(|e| e.first);
+        let mut reverse = extents.to_vec();
+        reverse.sort_by_key(|e| e.lower_first);
+        map.forward = Some(forward);
+        map.reverse = Some(reverse);
+        map.nr_extents
+            .store(extents.len() as u32, core::sync::atomic::Ordering::Release);
+        map
+    }
+
+    // ── map_id_down ──
+
+    #[test]
+    fn test_map_id_down_empty() {
+        let map = UidGidMap::default();
+        assert_eq!(map_id_down(&map, 0), None);
+        assert_eq!(map_id_down(&map, 1000), None);
+    }
+
+    #[test]
+    fn test_map_id_down_single_extent() {
+        let map = make_map_inline(&[make_extent(0, 1000, 10)]);
+        assert_eq!(map_id_down(&map, 0), Some(1000));
+        assert_eq!(map_id_down(&map, 5), Some(1005));
+        assert_eq!(map_id_down(&map, 9), Some(1009));
+        assert_eq!(map_id_down(&map, 10), None);
+    }
+
+    #[test]
+    fn test_map_id_down_offset_extent() {
+        let map = make_map_inline(&[make_extent(100, 200, 50)]);
+        assert_eq!(map_id_down(&map, 99), None);
+        assert_eq!(map_id_down(&map, 100), Some(200));
+        assert_eq!(map_id_down(&map, 149), Some(349));
+        assert_eq!(map_id_down(&map, 150), None);
+    }
+
+    #[test]
+    fn test_map_id_down_multiple_inline() {
+        let map = make_map_inline(&[make_extent(0, 100, 10), make_extent(1000, 5000, 20)]);
+        assert_eq!(map_id_down(&map, 5), Some(105));
+        assert_eq!(map_id_down(&map, 1005), Some(5005));
+        assert_eq!(map_id_down(&map, 500), None);
+    }
+
+    #[test]
+    fn test_map_id_down_identity() {
+        let map = UidGidMap::new_identity();
+        assert_eq!(map_id_down(&map, 0), Some(0));
+        assert_eq!(map_id_down(&map, 1000), Some(1000));
+        assert_eq!(map_id_down(&map, u32::MAX - 1), Some(u32::MAX - 1));
+    }
+
+    #[test]
+    fn test_map_id_down_heap_binary_search() {
+        let extents: Vec<UidGidExtent> = (0..10)
+            .map(|i| make_extent(i * 100, i * 1000, 50))
+            .collect();
+        let map = make_map_heap(&extents);
+        assert_eq!(map_id_down(&map, 0), Some(0));
+        assert_eq!(map_id_down(&map, 250), Some(2500));
+        assert_eq!(map_id_down(&map, 949), Some(9400));
+        assert_eq!(map_id_down(&map, 950), None);
+        assert_eq!(map_id_down(&map, 5000), None);
+    }
+
+    // ── map_id_up ──
+
+    #[test]
+    fn test_map_id_up_empty() {
+        let map = UidGidMap::default();
+        assert_eq!(map_id_up(&map, 0), None);
+    }
+
+    #[test]
+    fn test_map_id_up_single_extent() {
+        let map = make_map_inline(&[make_extent(100, 500, 10)]);
+        assert_eq!(map_id_up(&map, 500), Some(100));
+        assert_eq!(map_id_up(&map, 509), Some(109));
+        assert_eq!(map_id_up(&map, 499), None);
+        assert_eq!(map_id_up(&map, 510), None);
+    }
+
+    #[test]
+    fn test_map_id_up_identity() {
+        let map = UidGidMap::new_identity();
+        assert_eq!(map_id_up(&map, 0), Some(0));
+        assert_eq!(map_id_up(&map, u32::MAX - 1), Some(u32::MAX - 1));
+    }
+
+    #[test]
+    fn test_map_id_up_heap_binary_search() {
+        let extents: Vec<UidGidExtent> = (0..10)
+            .map(|i| make_extent(i * 100, i * 1000, 50))
+            .collect();
+        let map = make_map_heap(&extents);
+        assert_eq!(map_id_up(&map, 0), Some(0));
+        assert_eq!(map_id_up(&map, 2500), Some(250));
+        assert_eq!(map_id_up(&map, 9400), Some(940));
+        assert_eq!(map_id_up(&map, 9450), None);
+    }
+
+    // ── map_id_range_down ──
+
+    #[test]
+    fn test_map_id_range_down_zero_count() {
+        let map = UidGidMap::default();
+        assert_eq!(map_id_range_down(&map, 42, 0), Some(42));
+    }
+
+    #[test]
+    fn test_map_id_range_down_within_extent() {
+        let map = make_map_inline(&[make_extent(0, 100, 50)]);
+        assert_eq!(map_id_range_down(&map, 0, 10), Some(100));
+        assert_eq!(map_id_range_down(&map, 5, 20), Some(105));
+    }
+
+    #[test]
+    fn test_map_id_range_down_cross_extent_fails() {
+        let map = make_map_inline(&[make_extent(0, 100, 10), make_extent(100, 200, 10)]);
+        // 跨越两个不连续的 extent，映射不连续
+        assert_eq!(map_id_range_down(&map, 0, 20), None);
+    }
+
+    #[test]
+    fn test_map_id_range_down_out_of_range() {
+        let map = make_map_inline(&[make_extent(0, 100, 10)]);
+        assert_eq!(map_id_range_down(&map, 0, 11), None);
+        assert_eq!(map_id_range_down(&map, 10, 1), None);
+    }
+
+    // ── UidGidMap constructors ──
+
+    #[test]
+    fn test_default_map_not_written() {
+        let map = UidGidMap::default();
+        assert!(!map.is_written());
+        assert_eq!(map.get_nr_extents(), 0);
+    }
+
+    #[test]
+    fn test_identity_map_written() {
+        let map = UidGidMap::new_identity();
+        assert!(map.is_written());
+        assert_eq!(map.get_nr_extents(), 1);
+    }
+
+    #[test]
+    fn test_roundtrip_inline() {
+        let map = make_map_inline(&[make_extent(0, 1000, 100)]);
+        for id in 0..100u32 {
+            let down = map_id_down(&map, id).unwrap();
+            assert_eq!(down, id + 1000);
+            let up = map_id_up(&map, down).unwrap();
+            assert_eq!(up, id);
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_heap() {
+        let extents: Vec<UidGidExtent> = (0..8)
+            .map(|i| make_extent(i * 100, i * 1000 + 500, 50))
+            .collect();
+        let map = make_map_heap(&extents);
+        for i in 0..8u32 {
+            for offset in [0, 25, 49] {
+                let child_id = i * 100 + offset;
+                let parent_id = map_id_down(&map, child_id).unwrap();
+                assert_eq!(parent_id, i * 1000 + 500 + offset);
+                let back = map_id_up(&map, parent_id).unwrap();
+                assert_eq!(back, child_id);
+            }
+        }
+    }
+}

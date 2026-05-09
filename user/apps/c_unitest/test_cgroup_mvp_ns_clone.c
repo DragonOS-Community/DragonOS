@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -87,6 +88,61 @@ static int read_text(const char *path, char *buf, size_t len) {
     }
     buf[n] = '\0';
     return 0;
+}
+
+static unsigned long read_ulong_file(const char *path) {
+    char buf[64];
+    char *end = NULL;
+    unsigned long value;
+
+    if (read_text(path, buf, sizeof(buf)) != 0) {
+        fail(path);
+    }
+
+    errno = 0;
+    value = strtoul(buf, &end, 10);
+    if (errno != 0 || end == buf) {
+        printf("[FAIL] parse unsigned long from %s: %s\n", path, buf);
+        exit(1);
+    }
+
+    return value;
+}
+
+static int file_contains_pid(const char *path, long pid) {
+    char buf[512];
+    char *save = NULL;
+    char *line;
+
+    if (read_text(path, buf, sizeof(buf)) != 0) {
+        fail(path);
+    }
+
+    for (line = strtok_r(buf, "\n", &save); line != NULL;
+         line = strtok_r(NULL, "\n", &save)) {
+        if (strtol(line, NULL, 10) == pid) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static void *map_prot_none_page(void) {
+    long page_size = sysconf(_SC_PAGESIZE);
+    void *addr;
+
+    if (page_size <= 0) {
+        printf("[FAIL] invalid page size: %ld\n", page_size);
+        exit(1);
+    }
+
+    addr = mmap(NULL, (size_t)page_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (addr == MAP_FAILED) {
+        fail("mmap PROT_NONE");
+    }
+
+    return addr;
 }
 
 static void run_unshare_setns_case(void) {
@@ -195,6 +251,118 @@ static void run_clone3_into_cgroup_case(void) {
     }
 }
 
+static void run_invalid_parent_settid_case(void) {
+    const char *grp = "/sys/fs/cgroup/mvp_parent_settid_invalid";
+    const char *procs = "/sys/fs/cgroup/mvp_parent_settid_invalid/cgroup.procs";
+    const char *pids_current = "/sys/fs/cgroup/mvp_parent_settid_invalid/pids.current";
+    void *bad_tid = map_prot_none_page();
+    struct clone_args_local args = {0};
+    unsigned long before;
+    unsigned long after;
+    long child;
+    int status = 0;
+
+    if (ensure_dir(grp) != 0) {
+        fail("mkdir mvp_parent_settid_invalid");
+    }
+    if (write_text(procs, "0\n") != 0) {
+        fail("move self to mvp_parent_settid_invalid");
+    }
+
+    before = read_ulong_file(pids_current);
+
+    args.flags = CLONE_PARENT_SETTID;
+    args.exit_signal = SIGCHLD;
+    args.parent_tid = (uint64_t)(uintptr_t)bad_tid;
+
+    child = syscall(SYS_clone3, &args, sizeof(args));
+    if (child < 0) {
+        fail("clone3 invalid parent_tid");
+    }
+    if (child == 0) {
+        _exit(0);
+    }
+
+    if (waitpid((pid_t)child, &status, 0) < 0) {
+        fail("waitpid invalid parent_tid child");
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        printf("[FAIL] invalid parent_tid child status=0x%x\n", status);
+        exit(1);
+    }
+
+    after = read_ulong_file(pids_current);
+    if (after != before) {
+        printf("[FAIL] invalid parent_tid leaked pids.current: before=%lu after=%lu\n", before,
+               after);
+        exit(1);
+    }
+    if (file_contains_pid(procs, child)) {
+        printf("[FAIL] invalid parent_tid leaked child pid %ld into cgroup.procs\n", child);
+        exit(1);
+    }
+
+    if (munmap(bad_tid, (size_t)sysconf(_SC_PAGESIZE)) != 0) {
+        fail("munmap invalid parent_tid page");
+    }
+}
+
+static void run_invalid_child_settid_case(void) {
+    const char *grp = "/sys/fs/cgroup/mvp_child_settid_invalid";
+    const char *procs = "/sys/fs/cgroup/mvp_child_settid_invalid/cgroup.procs";
+    const char *pids_current = "/sys/fs/cgroup/mvp_child_settid_invalid/pids.current";
+    void *bad_tid = map_prot_none_page();
+    struct clone_args_local args = {0};
+    unsigned long before;
+    unsigned long after;
+    long child;
+    int status = 0;
+
+    if (ensure_dir(grp) != 0) {
+        fail("mkdir mvp_child_settid_invalid");
+    }
+    if (write_text(procs, "0\n") != 0) {
+        fail("move self to mvp_child_settid_invalid");
+    }
+
+    before = read_ulong_file(pids_current);
+
+    args.flags = CLONE_CHILD_SETTID;
+    args.exit_signal = SIGCHLD;
+    args.child_tid = (uint64_t)(uintptr_t)bad_tid;
+
+    child = syscall(SYS_clone3, &args, sizeof(args));
+    if (child < 0) {
+        fail("clone3 invalid child_tid");
+    }
+    if (child == 0) {
+        _exit(0);
+    }
+
+    if (waitpid((pid_t)child, &status, 0) < 0) {
+        fail("waitpid invalid child_tid child");
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        printf("[FAIL] invalid child_tid child status=0x%x\n", status);
+        exit(1);
+    }
+
+    after = read_ulong_file(pids_current);
+    if (after != before) {
+        printf("[FAIL] invalid child_tid leaked pids.current: before=%lu after=%lu\n", before,
+               after);
+        exit(1);
+    }
+    if (file_contains_pid(procs, child)) {
+        printf("[FAIL] invalid child_tid leaked child pid %ld into cgroup.procs\n", child);
+        exit(1);
+    }
+
+    if (munmap(bad_tid, (size_t)sysconf(_SC_PAGESIZE)) != 0) {
+        fail("munmap invalid child_tid page");
+    }
+}
+
 static void run_sibling_view_case(void) {
     const char *ga = "/sys/fs/cgroup/mvp_view_a_combo";
     const char *gb = "/sys/fs/cgroup/mvp_view_b_combo";
@@ -271,6 +439,8 @@ static void run_sibling_view_case(void) {
 int main(void) {
     run_unshare_setns_case();
     run_clone3_into_cgroup_case();
+    run_invalid_parent_settid_case();
+    run_invalid_child_settid_case();
     run_sibling_view_case();
     printf("[PASS] cgroup_mvp_ns_clone\n");
     return 0;

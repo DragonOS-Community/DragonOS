@@ -851,29 +851,6 @@ impl ProcessManager {
             pcb.thread.write_irqsave().set_child_tid = Some(clone_args.child_tid);
         }
 
-        // 将子进程/线程的id存储在用户态传进的地址中
-        if clone_flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
-            let write_result = (|| -> Result<(), SystemError> {
-                let mut writer = UserBufferWriter::new(
-                    clone_args.parent_tid.data() as *mut i32,
-                    core::mem::size_of::<i32>(),
-                    true,
-                )?;
-
-                writer.copy_one_to_user(&(pcb.raw_pid().0 as i32), 0)?;
-                Ok(())
-            })();
-            //错误处理：如果写入失败，应该释放已经分配的PID，并从ProcessManager中移除pcb
-            if let Err(e) = write_result {
-                if pcb.raw_pid() > RawPid(0) {
-                    unsafe {
-                        ProcessManager::release(pcb.raw_pid());
-                    }
-                }
-                return Err(e);
-            }
-        }
-
         sched_cgroup_fork(pcb);
 
         // 处理 rseq 状态

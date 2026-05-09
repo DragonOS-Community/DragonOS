@@ -62,6 +62,7 @@ pub fn do_clone(
     clone_args.normalize_exit_signal();
     clone_args.verify()?;
     let flags = clone_args.flags;
+    let parent_tid = clone_args.parent_tid;
 
     let vfork = Arc::new(Completion::new());
 
@@ -77,18 +78,22 @@ pub fn do_clone(
     // 克隆pcb
     ProcessManager::copy_process(&current_pcb, &pcb, clone_args, frame)?;
 
+    if flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
+        // 对齐 Linux：fork 已成功，不因 parent_tid 写回失败而撤销子任务。
+        if let Ok(mut writer) = UserBufferWriter::new(
+            parent_tid.as_ptr::<i32>(),
+            core::mem::size_of::<i32>(),
+            true,
+        ) {
+            let _ = writer.copy_one_to_user_checked(&(pcb.raw_pid().data() as i32), 0);
+        }
+    }
+
     // 新的 ProcFS 是动态的，进程目录会在访问时按需创建
     // 不再需要显式注册进程
 
     if flags.contains(CloneFlags::CLONE_VFORK) {
         pcb.thread.write_irqsave().vfork_done = Some(vfork.clone());
-    }
-
-    if pcb.thread.read_irqsave().set_child_tid.is_some() {
-        let addr = pcb.thread.read_irqsave().set_child_tid.unwrap();
-        let mut writer =
-            UserBufferWriter::new(addr.as_ptr::<i32>(), core::mem::size_of::<i32>(), true)?;
-        writer.copy_one_to_user(&(pcb.raw_pid().data() as i32), 0)?;
     }
 
     ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {

@@ -38,14 +38,16 @@ impl Syscall for SysClone {
     }
 
     fn handle(&self, args: &[usize], frame: &mut TrapFrame) -> Result<usize, SystemError> {
+        let flags = Self::flags(args);
         let parent_tid = Self::parent_tid(args);
         let child_tid = Self::child_tid(args);
 
-        // 地址校验
-        access_ok(parent_tid, core::mem::size_of::<i32>())?;
-        access_ok(child_tid, core::mem::size_of::<i32>())?;
+        // legacy clone() 只有 pidfd 复用 parent_tid 作为“必须成功”的输出参数。
+        // parent/child settid 按 Linux 语义属于 best-effort 写回，不应在入口提前失败。
+        if flags.contains(CloneFlags::CLONE_PIDFD) {
+            access_ok(parent_tid, core::mem::size_of::<i32>())?;
+        }
 
-        let flags = Self::flags(args);
         let stack = Self::stack(args);
         let tls = Self::tls(args);
 

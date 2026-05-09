@@ -68,7 +68,7 @@ use crate::{
         cpu::{AtomicProcessorId, ProcessorId},
         kick_cpu,
     },
-    syscall::user_access::clear_user_protected,
+    syscall::user_access::{clear_user_protected, UserBufferWriter},
 };
 use timer::AlarmTimer;
 
@@ -906,6 +906,17 @@ impl ProcessManager {
 
         next_pcb.arch_info.force_unlock();
         fence(Ordering::SeqCst);
+
+        let set_child_tid = next_pcb.thread.write_irqsave().set_child_tid.take();
+        if let Some(addr) = set_child_tid {
+            // 对齐 Linux schedule_tail 语义：子任务首次运行时 best-effort 写入 tid，
+            // 失败不影响线程继续执行。
+            if let Ok(mut writer) =
+                UserBufferWriter::new(addr.as_ptr::<i32>(), core::mem::size_of::<i32>(), true)
+            {
+                let _ = writer.copy_one_to_user_checked(&(next_pcb.raw_pid().data() as i32), 0);
+            }
+        }
     }
 
     /// 如果目标进程正在目标CPU上运行，那么就让这个cpu陷入内核态

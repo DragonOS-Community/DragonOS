@@ -19,10 +19,11 @@ pub struct CgroupNode {
     parent: Option<Weak<CgroupNode>>,
     children: RwLock<HashMap<String, Arc<CgroupNode>>>,
     tasks: RwLock<HashSet<RawPid>>,
-    //任务集合
     subtree_control: RwLock<HashSet<String>>,
     pids_max: RwLock<Option<usize>>,
     pids_events_max: AtomicU64,
+    local_pids_counter: AtomicUsize,
+    subtree_pids_counter: AtomicUsize,
     subtree_task_counter: AtomicUsize,
 }
 
@@ -37,6 +38,8 @@ impl CgroupNode {
             subtree_control: RwLock::new(HashSet::new()),
             pids_max: RwLock::new(None),
             pids_events_max: AtomicU64::new(0),
+            local_pids_counter: AtomicUsize::new(0),
+            subtree_pids_counter: AtomicUsize::new(0),
             subtree_task_counter: AtomicUsize::new(0),
         })
     }
@@ -51,6 +54,8 @@ impl CgroupNode {
             subtree_control: RwLock::new(HashSet::new()),
             pids_max: RwLock::new(None),
             pids_events_max: AtomicU64::new(0),
+            local_pids_counter: AtomicUsize::new(0),
+            subtree_pids_counter: AtomicUsize::new(0),
             subtree_task_counter: AtomicUsize::new(0),
         })
     }
@@ -68,7 +73,10 @@ impl CgroupNode {
     }
 
     pub fn add_task(&self, pid: RawPid) {
-        self.tasks.write().insert(pid);
+        if !self.tasks.write().insert(pid) {
+            debug_assert!(false, "cgroup task {:?} already exists", pid);
+            return;
+        }
         let mut cur = self.parent();
         while let Some(node) = cur {
             node.subtree_task_counter.fetch_add(1, Ordering::Release);
@@ -77,12 +85,29 @@ impl CgroupNode {
     }
 
     pub fn remove_task(&self, pid: RawPid) {
-        self.tasks.write().remove(&pid);
+        if !self.tasks.write().remove(&pid) {
+            debug_assert!(false, "cgroup task {:?} does not exist", pid);
+            return;
+        }
         let mut cur = self.parent();
         while let Some(node) = cur {
             node.subtree_task_counter.fetch_sub(1, Ordering::Release);
             cur = node.parent();
         }
+    }
+
+    pub fn rename_task(&self, old_pid: RawPid, new_pid: RawPid) {
+        if old_pid == new_pid {
+            return;
+        }
+
+        let mut tasks = self.tasks.write();
+        if !tasks.remove(&old_pid) {
+            debug_assert!(false, "cgroup task {:?} does not exist", old_pid);
+            return;
+        }
+        let inserted = tasks.insert(new_pid);
+        debug_assert!(inserted, "cgroup task {:?} already exists", new_pid);
     }
 
     pub fn tasks(&self) -> Vec<RawPid> {
@@ -142,6 +167,62 @@ impl CgroupNode {
             .read()
             .len()
             .saturating_add(self.subtree_task_counter.load(Ordering::Acquire))
+    }
+
+    pub fn charge_pids(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+
+        self.local_pids_counter.fetch_add(count, Ordering::Release);
+        let mut cur = self.parent();
+        while let Some(node) = cur {
+            node.subtree_pids_counter
+                .fetch_add(count, Ordering::Release);
+            cur = node.parent();
+        }
+    }
+
+    pub fn uncharge_pids(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+
+        let old = self.local_pids_counter.fetch_sub(count, Ordering::Release);
+        debug_assert!(
+            old >= count,
+            "cgroup pids counter underflow: old={}, count={}",
+            old,
+            count
+        );
+        let mut cur = self.parent();
+        while let Some(node) = cur {
+            let old = node
+                .subtree_pids_counter
+                .fetch_sub(count, Ordering::Release);
+            debug_assert!(
+                old >= count,
+                "cgroup subtree pids counter underflow: old={}, count={}",
+                old,
+                count
+            );
+            cur = node.parent();
+        }
+    }
+
+    pub fn transfer_pids_charge(src: &Arc<Self>, dst: &Arc<Self>, count: usize) {
+        if count == 0 || Arc::ptr_eq(src, dst) {
+            return;
+        }
+
+        src.uncharge_pids(count);
+        dst.charge_pids(count);
+    }
+
+    pub fn pids_current_count(&self) -> usize {
+        self.local_pids_counter
+            .load(Ordering::Acquire)
+            .saturating_add(self.subtree_pids_counter.load(Ordering::Acquire))
     }
 
     pub fn is_ancestor_of(self: &Arc<Self>, other: &Arc<Self>) -> bool {
@@ -379,7 +460,7 @@ pub fn cgroup_can_fork_in(node: &Arc<CgroupNode>, new_tasks: usize) -> Result<()
     let mut cur = Some(node.clone());
     while let Some(cg) = cur {
         if let Some(max) = cg.pids_max() {
-            let used = cg.subtree_task_count();
+            let used = cg.pids_current_count();
             if used.saturating_add(new_tasks) > max {
                 cg.inc_pids_events_max();
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
@@ -400,7 +481,7 @@ pub fn cgroup_migrate_vet_dst_with_src(
     let mut cur = Some(dst.clone());
     while let Some(cg) = cur {
         if let Some(max) = cg.pids_max() {
-            let used = cg.subtree_task_count();
+            let used = cg.pids_current_count();
             let delta = if cg.is_ancestor_of(src) {
                 0
             } else {

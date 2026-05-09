@@ -260,6 +260,7 @@ impl ProcessManager {
         left: &Arc<ProcessControlBlock>,
         right: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
+        let _cgroup_guard = crate::cgroup::cgroup_accounting_lock().lock();
         let mut all_proc = all_process().lock_irqsave();
         let map = all_proc.as_mut().ok_or(SystemError::EINVAL)?;
         let left_old_pid = left.raw_pid();
@@ -273,17 +274,21 @@ impl ProcessManager {
 
         let left_cgroup = left.task_cgroup_node();
         let right_cgroup = right.task_cgroup_node();
+        let left_alive = !left.is_exited();
+        let right_alive = !right.is_exited();
 
         left.exchange_tid_with(right)?;
         exchange_raw_pids_locked(map, left, right)?;
 
-        left_cgroup.remove_task(left_old_pid);
-        right_cgroup.remove_task(right_old_pid);
-        if !left.is_exited() {
-            left_cgroup.add_task(left.raw_pid());
+        // cgroup.procs 只展示仍存活的任务；exec 去线程化换 pid 时只重命名可见成员。
+        if Arc::ptr_eq(&left_cgroup, &right_cgroup) && left_alive && right_alive {
+            return Ok(());
         }
-        if !right.is_exited() {
-            right_cgroup.add_task(right.raw_pid());
+        if left_alive {
+            left_cgroup.rename_task(left_old_pid, left.raw_pid());
+        }
+        if right_alive {
+            right_cgroup.rename_task(right_old_pid, right.raw_pid());
         }
 
         Ok(())
@@ -865,7 +870,10 @@ impl ProcessManager {
     pub(super) unsafe fn release(pid: RawPid) {
         let pcb = ProcessManager::find(pid);
         if let Some(ref pcb) = pcb {
-            // remove_task 已在 do_exit 中完成，此处不再重复
+            {
+                let _cgroup_guard = crate::cgroup::cgroup_accounting_lock().lock();
+                pcb.task_cgroup_node().uncharge_pids(1);
+            }
             // 从父进程的 children 列表中移除
             if let Some(parent) = pcb.real_parent_pcb() {
                 let parent_ns = parent.active_pid_ns();
@@ -2198,10 +2206,12 @@ impl ProcessControlBlock {
             old
         }; // 释放读锁
 
-        // 在不持有 task_cgroup 锁的情况下执行迁移
-        // 调用者必须持有 cgroup_accounting_lock 以保证原子性
-        old.remove_task(self.raw_pid());
-        node.add_task(self.raw_pid());
+        // 在不持有 task_cgroup 锁的情况下执行迁移；调用者必须持有
+        // cgroup_accounting_lock，保证可见成员和 pids 计费一起切换。
+        let pid = self.raw_pid();
+        old.remove_task(pid);
+        node.add_task(pid);
+        CgroupNode::transfer_pids_charge(&old, &node, 1);
 
         // 使用写锁更新 task_cgroup
         let mut task_cgroup = self.task_cgroup.write();

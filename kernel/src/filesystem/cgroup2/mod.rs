@@ -635,7 +635,7 @@ impl Cgroup2Inode {
                 }
                 CgroupCoreFile::Type => b"domain\n".to_vec(),
                 CgroupCoreFile::PidsCurrent => {
-                    format!("{}\n", cgroup.subtree_task_count()).into_bytes()
+                    format!("{}\n", cgroup.pids_current_count()).into_bytes()
                 }
                 CgroupCoreFile::PidsMax => Self::encode_pids_max(cgroup.pids_max()),
                 CgroupCoreFile::PidsEvents => {

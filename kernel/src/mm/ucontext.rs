@@ -1532,6 +1532,9 @@ impl InnerAddressSpace {
             if inaccessible_locked_vma {
                 populate_error.get_or_insert(SystemError::ENOMEM);
             } else if wants_locked {
+                // TODO: Linux mlock() must fault in/populate missing pages before
+                // returning success. This currently only marks pages that already
+                // have PTEs, so lazy anonymous/file mappings are not made resident.
                 self.mlock_vma_pages_range(intersection.start(), intersection.end());
             } else {
                 self.munlock_vma_pages_range(intersection.start(), intersection.end())?;

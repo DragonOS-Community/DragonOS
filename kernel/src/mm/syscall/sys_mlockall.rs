@@ -4,8 +4,8 @@ use alloc::vec::Vec;
 use system_error::SystemError;
 
 use crate::{
-    arch::{interrupt::TrapFrame, syscall::nr::SYS_MLOCKALL, MMArch},
-    mm::{can_do_mlock, ucontext::AddressSpace, MemoryManagementArch},
+    arch::{interrupt::TrapFrame, syscall::nr::SYS_MLOCKALL},
+    mm::{can_do_mlock, ucontext::AddressSpace, VmFlags},
     syscall::table::{FormattedSyscallParam, Syscall},
 };
 
@@ -53,17 +53,26 @@ fn do_mlockall(flags: usize) -> Result<usize, SystemError> {
         return Err(SystemError::EPERM);
     }
 
-    if flags & MCL_CURRENT != 0 {
-        let vm = AddressSpace::current()?;
-        let guard = vm.read_interruptible()?;
-        let total_pages = guard.vma_usage_bytes() >> MMArch::PAGE_SHIFT;
-        let new_pages = total_pages.saturating_sub(guard.locked_vm);
-        check_mlock_rlimit(guard.locked_vm, new_pages)?;
+    let mut lock_flags = VmFlags::VM_LOCKED;
+    if flags & MCL_ONFAULT != 0 {
+        lock_flags |= VmFlags::VM_LOCKONFAULT;
     }
 
-    // TODO: implement real mlockall semantics. MCL_CURRENT should mark all current
-    // VMAs/pages locked; MCL_FUTURE and MCL_ONFAULT need address-space state so
-    // future mappings/faults inherit the requested locking behavior.
+    let vm = AddressSpace::current()?;
+    if flags & MCL_CURRENT != 0 {
+        let mut guard = vm.write_interruptible()?;
+        let new_pages = guard.count_unlocked_pages_for_mlockall()?;
+        check_mlock_rlimit(guard.locked_vm, new_pages)?;
+        guard.apply_mlockall_current(lock_flags)?;
+    }
+
+    if flags & MCL_FUTURE != 0 {
+        let mut guard = vm.write_interruptible()?;
+        guard.set_mlock_future(lock_flags);
+    }
+
+    // TODO: when fault-time page locking is implemented, VM_LOCKONFAULT should
+    // mark pages unevictable on demand instead of relying only on VMA state.
     Ok(0)
 }
 

@@ -5,6 +5,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_MUNLOCKALL},
+    mm::ucontext::AddressSpace,
     syscall::table::{FormattedSyscallParam, Syscall},
 };
 
@@ -16,8 +17,9 @@ impl Syscall for SysMunlockallHandle {
     }
 
     fn handle(&self, _args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        // TODO: implement real munlockall semantics by clearing VM_LOCKED/VM_LOCKONFAULT
-        // from all VMAs and clearing PG_UNEVICTABLE from pages that are no longer locked.
+        let vm = AddressSpace::current()?;
+        let mut guard = vm.write_interruptible()?;
+        guard.clear_all_vma_lock_flags()?;
         Ok(0)
     }
 

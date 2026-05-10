@@ -5,7 +5,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_MLOCK2},
-    mm::{access_ok, can_do_mlock, ucontext::AddressSpace, VirtAddr},
+    mm::{access_ok, can_do_mlock, ucontext::AddressSpace, VirtAddr, VmFlags},
     syscall::table::{FormattedSyscallParam, Syscall},
 };
 
@@ -65,12 +65,15 @@ fn do_mlock2(start: VirtAddr, len: usize, flags: usize) -> Result<usize, SystemE
     }
 
     let vm = AddressSpace::current()?;
-    let guard = vm.read_interruptible()?;
+    let mut guard = vm.write_interruptible()?;
     let new_pages = guard.count_unlocked_pages_for_mlock(start, len)?;
     check_mlock_rlimit(guard.locked_vm, new_pages)?;
 
-    // TODO: implement real mlock2 semantics by applying VM_LOCKED or VM_LOCKONFAULT
-    // to the selected VMA range and marking resident pages unevictable as needed.
+    let mut new_flags = VmFlags::VM_LOCKED;
+    if flags & MLOCK_ONFAULT != 0 {
+        new_flags |= VmFlags::VM_LOCKONFAULT;
+    }
+    guard.apply_vma_lock_flags(start, len, new_flags)?;
     Ok(0)
 }
 

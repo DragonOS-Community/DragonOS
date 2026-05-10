@@ -227,13 +227,17 @@ pub fn ksys_fchown(fd: i32, uid: usize, gid: usize) -> Result<usize, SystemError
     let fd_table = &ProcessManager::current_pcb().fd_table();
     let fd_table = fd_table.read();
 
-    let inode = fd_table.get_file_by_fd(fd).unwrap().inode();
+    let file = fd_table.get_file_by_fd(fd).ok_or(SystemError::EBADF)?;
 
-    let result = chown_common(inode, uid, gid);
+    // Linux 语义：对 O_PATH fd 执行 fchown 应返回 EBADF
+    if file.flags().contains(FileFlags::O_PATH) {
+        return Err(SystemError::EBADF);
+    }
+
+    let inode = file.inode();
 
     drop(fd_table);
-
-    return result;
+    return chown_common(inode, uid, gid);
 }
 
 pub fn do_sys_open(
@@ -411,13 +415,43 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
 /// - `Ok((Arc<File>, i32))`: 成功打开的文件和分配的文件描述符
 /// - `Err(SystemError)`: 错误
 pub fn do_open_execat(dirfd: i32, path: &str) -> Result<Arc<File>, SystemError> {
-    let path = path.trim();
-    if path.is_empty() {
+    do_open_execat_with_flags(dirfd, path, AtFlags::empty())
+}
+
+/// 为 execve/execveat 打开可执行文件，保留 `AT_EMPTY_PATH` / `AT_SYMLINK_NOFOLLOW` 语义。
+pub fn do_open_execat_with_flags(
+    dirfd: i32,
+    path: &str,
+    flags: AtFlags,
+) -> Result<Arc<File>, SystemError> {
+    if flags.contains(!(AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH)) {
+        return Err(SystemError::EINVAL);
+    }
+
+    if path.is_empty() && !flags.contains(AtFlags::AT_EMPTY_PATH) {
         return Err(SystemError::ENOENT);
     }
 
-    let (inode_begin, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
-    let inode = inode_begin.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    let inode = if path.is_empty() {
+        ProcessManager::current_pcb()
+            .fd_table()
+            .read()
+            .get_file_by_fd(dirfd)
+            .ok_or(SystemError::EBADF)?
+            .inode()
+    } else {
+        let (inode_begin, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
+        if flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW) {
+            let inode =
+                inode_begin.lookup_follow_symlink2(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES, false)?;
+            if inode.metadata()?.file_type == FileType::SymLink {
+                return Err(SystemError::ELOOP);
+            }
+            inode
+        } else {
+            inode_begin.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?
+        }
+    };
 
     let metadata = inode.metadata()?;
     let file_type = metadata.file_type;

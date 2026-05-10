@@ -7,7 +7,7 @@ use crate::arch::MMArch;
 use crate::mm::{MemoryManagementArch, VirtAddr};
 use crate::process::fork::{CloneFlags, KernelCloneArgs, MAX_PID_NS_LEVEL};
 use crate::process::{KernelStack, ProcessControlBlock, ProcessManager};
-use crate::sched::completion::Completion;
+use crate::sched::{completion::Completion, sched_set_new_task_cpu};
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
 use alloc::{string::ToString, sync::Arc};
 use system_error::SystemError;
@@ -76,7 +76,7 @@ pub fn do_clone(
 
     let pcb = ProcessControlBlock::new(name, new_kstack);
     // 克隆pcb
-    ProcessManager::copy_process(&current_pcb, &pcb, clone_args, frame)?;
+    let target_cpu = ProcessManager::copy_process(&current_pcb, &pcb, clone_args, frame)?;
 
     if flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
         // 对齐 Linux：fork 已成功，不因 parent_tid 写回失败而撤销子任务。
@@ -95,6 +95,8 @@ pub fn do_clone(
     if flags.contains(CloneFlags::CLONE_VFORK) {
         pcb.thread.write_irqsave().vfork_done = Some(vfork.clone());
     }
+
+    sched_set_new_task_cpu(&pcb, target_cpu);
 
     ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {
         panic!(

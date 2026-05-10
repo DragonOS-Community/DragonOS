@@ -717,7 +717,7 @@ impl IndexNode for LockedTmpfsInode {
 
             // 调整页缓存（会释放多余页，并截断最后一页）
             if let Some(pc) = inode.page_cache.clone() {
-                pc.lock().resize(len)?;
+                pc.manager().resize(len)?;
             }
 
             // 如果缩小，减少current_size

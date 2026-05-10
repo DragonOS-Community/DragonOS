@@ -82,6 +82,7 @@ impl Syscall for SysSetGroups {
         if size == 0 {
             // clear all supplementary groups
             cred.setgroups(Vec::new());
+            *pcb.cred.lock() = Cred::new_arc(cred);
             return Ok(0);
         }
         if size > NGROUPS_MAX {

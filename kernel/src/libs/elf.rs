@@ -5,7 +5,7 @@ use core::{
     ops::Range,
 };
 
-use alloc::vec::Vec;
+use alloc::{ffi::CString, vec::Vec};
 use elf::{
     abi::{ET_DYN, ET_EXEC, PT_GNU_PROPERTY, PT_INTERP, PT_LOAD},
     endian::AnyEndian,
@@ -29,7 +29,8 @@ use crate::{
     process::{
         abi::AtType,
         exec::{
-            BinaryLoader, BinaryLoaderResult, ExecError, ExecLoadMode, ExecParam, ExecParamFlags,
+            BinaryLoader, BinaryLoaderResult, ExecError, ExecInterpFlags, ExecLoadMode, ExecParam,
+            ExecParamFlags,
         },
         ProcessFlags, ProcessManager,
     },
@@ -920,6 +921,9 @@ impl BinaryLoader for ElfLoader {
                 interpreter_file,
                 param.vm().clone(),
                 ExecParamFlags::EXEC,
+                CString::new(interpreter_path).map_err(|_| ExecError::InvalidParemeter)?,
+                param.execfn().clone(),
+                ExecInterpFlags::empty(),
             ));
         }
         //TODO 缺少一部分逻辑 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#931

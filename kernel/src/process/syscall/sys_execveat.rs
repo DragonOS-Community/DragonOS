@@ -3,8 +3,8 @@ use system_error::SystemError;
 
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_EXECVEAT},
-    filesystem::vfs::{utils::user_path_at, FileType, VFS_MAX_FOLLOW_SYMLINK_TIMES},
-    process::{syscall::sys_execve::SysExecve, ProcessManager},
+    filesystem::vfs::fcntl::AtFlags,
+    process::{execve::do_execveat, syscall::sys_execve::SysExecve},
     syscall::table::{FormattedSyscallParam, Syscall},
 };
 
@@ -48,52 +48,8 @@ impl Syscall for SysExecveAt {
             return Err(SystemError::ENOENT);
         }
 
-        let resolved_path = if flags.contains(OpenFlags::AT_EMPTY_PATH) && path.is_empty() {
-            let binding = ProcessManager::current_pcb().fd_table();
-            let fd_table_guard = binding.read();
-
-            let file = fd_table_guard
-                .get_file_by_fd(dirfd as _)
-                .ok_or(SystemError::EBADF)?;
-
-            // 无法执行目录
-            if file.file_type() == FileType::Dir {
-                return Err(SystemError::EACCES);
-            }
-
-            // 获取文件的绝对路径
-            file.inode()
-                .absolute_path()
-                .map_err(|_| SystemError::ENOENT)?
-        } else {
-            let (inode_begin, path) =
-                user_path_at(&ProcessManager::current_pcb(), dirfd as _, &path)?;
-
-            let inode = if flags.contains(OpenFlags::AT_SYMLINK_NOFOLLOW) {
-                // AT_SYMLINK_NOFOLLOW: 不跟随最终的符号链接
-                // 使用 lookup_follow_symlink2 以便控制 follow_final_symlink 参数
-                let result_inode = inode_begin.lookup_follow_symlink2(
-                    &path,
-                    VFS_MAX_FOLLOW_SYMLINK_TIMES,
-                    false, // 不跟随最终符号链接
-                )?;
-
-                // Linux 语义：如果最终路径是符号链接且设置了 AT_SYMLINK_NOFOLLOW，返回 ELOOP
-                if result_inode.metadata()?.file_type == FileType::SymLink {
-                    return Err(SystemError::ELOOP);
-                }
-
-                result_inode
-            } else {
-                // AT_SYMLINK_NOFOLLOW 未设置：跟随所有符号链接
-                inode_begin.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?
-            };
-
-            // 获取解析后的绝对路径
-            inode.absolute_path().unwrap_or(path)
-        };
-
-        SysExecve::execve(&resolved_path, argv, envp, frame)?;
+        let at_flags = AtFlags::from_bits(flags.bits() as i32).ok_or(SystemError::EINVAL)?;
+        do_execveat(dirfd as i32, &path, argv, envp, at_flags, frame)?;
 
         Ok(0)
     }

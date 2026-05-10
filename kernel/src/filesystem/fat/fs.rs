@@ -103,6 +103,24 @@ pub struct FATFileSystem {
     root_inode: Arc<LockedFATInode>,
     /// FAT表查询缓存（LRU）
     fat_cache: Mutex<LruCache<ClusterID, ClusterID>>,
+    /// 目录项扇区读-改-写串行化锁。
+    ///
+    /// FAT 的 `ShortDirEntry`/`LongDirEntry` 只占 32 字节，而底层 gendisk 的写入粒度是
+    /// 一个 LBA 扇区（典型 512B，可容纳 16 个目录项）。`flush` 的实现是先把整扇区读入
+    /// 内存，修改其中 32 字节，再把整扇区写回磁盘。
+    ///
+    /// 在多线程 / 多 CPU 环境下，若下列两条路径并发触发：
+    /// - 主线程在父目录中新建文件（写入新的 long/short 目录项到扇区 S）
+    /// - 另一文件的 pagecache 异步回写 worker 触发 `ensure_len`，更新该文件短目录项
+    ///   (同样是扇区 S 的 RMW)
+    ///
+    /// 二者的 RMW 窗口若交错，后写入者会用自己先前读到的"旧扇区 + 自己的 32 字节"
+    /// 覆盖对方刚写入的新目录项，导致新文件的目录项在磁盘上被静默抹掉，后续 `find`
+    /// 返回 `ENOENT`。该问题在慢速 TCG 仿真下极易复现，在 KVM 下时序紧凑难以触发。
+    ///
+    /// 本锁用于把所有目录项扇区的 RMW 串行化，消除上述竞争。所有持锁位置都已确认
+    /// 不会同时持有 inode 锁的反向依赖，不存在死锁风险。
+    dirent_io_lock: Mutex<()>,
 }
 
 /// FAT文件系统的Inode
@@ -684,6 +702,7 @@ impl FATFileSystem {
             fat_cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(FAT_LRU_CACHE_SIZE).unwrap(),
             )),
+            dirent_io_lock: Mutex::new(()),
         });
 
         // 对root inode加锁，并继续完成初始化工作
@@ -702,6 +721,16 @@ impl FATFileSystem {
     #[inline]
     pub fn bytes_per_cluster(&self) -> u64 {
         return (self.bpb.bytes_per_sector as u64) * (self.bpb.sector_per_cluster as u64);
+    }
+
+    /// 锁定目录项扇区 RMW 串行化互斥量。
+    ///
+    /// 详见 `FATFileSystem::dirent_io_lock` 字段的注释。所有会触发
+    /// `ShortDirEntry::flush` / `LongDirEntry::flush` 的代码路径都必须在执行
+    /// "read sector -> modify 32B -> write sector" 前先持有该锁，直到 `write_at` 完成。
+    #[inline]
+    pub(super) fn lock_dirent_io(&self) -> MutexGuard<'_, ()> {
+        self.dirent_io_lock.lock()
     }
 
     #[inline]

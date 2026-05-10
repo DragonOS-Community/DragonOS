@@ -31,6 +31,7 @@ pub mod madvise;
 pub mod memblock;
 pub mod mincore;
 pub mod mmio_buddy;
+pub mod mmu_gather;
 pub mod no_init;
 pub mod page;
 pub mod page_cache_stats;
@@ -38,6 +39,7 @@ pub mod percpu;
 pub mod readahead;
 pub mod syscall;
 pub mod sysfs;
+pub mod tlb;
 pub mod truncate;
 pub mod ucontext;
 

@@ -15,8 +15,7 @@ use log::{error, info};
 use lru::LruCache;
 
 use crate::{
-    arch::{interrupt::ipi::send_ipi, mm::LockedFrameAllocator, MMArch},
-    exception::ipi::{IpiKind, IpiTarget},
+    arch::{mm::LockedFrameAllocator, MMArch},
     filesystem::{
         page_cache::{list_page_caches, PageCache},
         vfs::FilePrivateData,
@@ -112,8 +111,8 @@ impl PageManager {
         }
     }
 
-    pub fn remove_page(&mut self, paddr: &PhysAddr) {
-        self.phys2page.remove(paddr);
+    pub fn remove_page(&mut self, paddr: &PhysAddr) -> Option<Arc<Page>> {
+        self.phys2page.remove(paddr)
     }
 
     /// # 创建一个新页面并加入管理器
@@ -423,28 +422,9 @@ impl PageReclaimer {
         let inode = page_cache.inode().clone().unwrap().upgrade().unwrap();
         let backend = page_cache.backend();
 
-        for vma in guard.vma_set() {
-            let address_space = vma.lock().address_space().and_then(|x| x.upgrade());
-            if address_space.is_none() {
-                continue;
-            }
-            let address_space = address_space.unwrap();
-            let mut guard = address_space.write();
-            let mapper = &mut guard.user_mapper.utable;
-            let virt = vma.lock().page_address(page_index).unwrap();
-            if unmap {
-                unsafe {
-                    // 取消页表映射
-                    mapper.unmap(virt, false).unwrap().flush();
-                }
-            } else {
-                unsafe {
-                    // 保护位设为只读
-                    mapper.remap(
-                        virt,
-                        mapper.get_entry(virt, 0).unwrap().flags().set_write(false),
-                    )
-                };
+        if let Ok(unmapped_vmas) = page_cache.mkclean_page(page_index, unmap) {
+            for vma in unmapped_vmas {
+                guard.remove_vma(vma.as_ref());
             }
         }
 
@@ -1805,6 +1785,29 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
             .flatten();
     }
 
+    /// Modify the leaf PTE flags of an existing mapping without allocating or freeing any page-table pages.
+    ///
+    /// This variant only touches an already present leaf entry and therefore works with `&self`.
+    /// It is intended for reverse-mapping walkers such as `mkclean` / file truncate zap, which
+    /// run under a separate page-table edit lock and must not require `&mut PageMapper`.
+    pub unsafe fn remap_present(
+        &self,
+        virt: VirtAddr,
+        flags: EntryFlags<Arch>,
+    ) -> Option<PageFlush<Arch>> {
+        self.visit(virt, |p1, i| {
+            let mut entry = p1.entry(i)?;
+            if entry.empty() {
+                return None;
+            }
+
+            entry.set_flags(flags);
+            p1.set_entry(i, entry);
+            Some(PageFlush::new(virt))
+        })
+        .flatten()
+    }
+
     /// 根据虚拟地址，查找页表，获取对应的物理地址和页表项的flags
     ///
     /// ## 参数
@@ -1854,14 +1857,69 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         virt: VirtAddr,
         unmap_parents: bool,
     ) -> Option<(PhysAddr, EntryFlags<Arch>, PageFlush<Arch>)> {
+        self.unmap_phys_with_freed_tables(virt, unmap_parents)
+            .map(|(paddr, flags, flush, _freed)| (paddr, flags, flush))
+    }
+
+    /// Same as `unmap_phys`, but also returns whether intermediate page-table pages were freed during unmapping.
+    ///
+    /// Freed intermediate page-table pages (i.e. this unmap caused a page table level to become empty and
+    /// be returned to the allocator) means that other CPUs' TLBs may still cache intermediate-level translation
+    /// entries pointing to those pages (corresponding to `tlb->freed_tables` in Linux). The caller should
+    /// pass this information to [`MmuGather`] so that shootdown triggers a full-mm invalidation instead of
+    /// per-page invlpg, preventing Paging-Structure Cache from retaining stale entries.
+    ///
+    /// [`MmuGather`]: crate::mm::mmu_gather::MmuGather
+    pub unsafe fn unmap_phys_with_freed_tables(
+        &mut self,
+        virt: VirtAddr,
+        unmap_parents: bool,
+    ) -> Option<(PhysAddr, EntryFlags<Arch>, PageFlush<Arch>, bool)> {
         if !virt.check_aligned(Arch::PAGE_SIZE) {
             error!("Try to unmap unaligned page: virt={:?}", virt);
             return None;
         }
 
         let table = self.table();
-        return unmap_phys_inner(virt, &table, unmap_parents, self.allocator_mut())
-            .map(|(paddr, flags)| (paddr, flags, PageFlush::<Arch>::new(virt)));
+        let mut freed_tables = false;
+        unmap_phys_inner(
+            virt,
+            &table,
+            unmap_parents,
+            self.allocator_mut(),
+            &mut freed_tables,
+        )
+        .map(|(paddr, flags)| (paddr, flags, PageFlush::<Arch>::new(virt), freed_tables))
+    }
+
+    /// Clear an existing leaf PTE without freeing intermediate page-table pages.
+    ///
+    /// This is the non-allocating / non-freeing counterpart used by cross-mm file-rmap walkers.
+    /// Keeping parent page tables intact avoids needing access to the frame allocator and mirrors
+    /// Linux's `zap_pte_range()` style leaf-only invalidation.
+    pub unsafe fn unmap_phys_preserve_tables(
+        &self,
+        virt: VirtAddr,
+    ) -> Option<(PhysAddr, EntryFlags<Arch>, PageFlush<Arch>)> {
+        if !virt.check_aligned(Arch::PAGE_SIZE) {
+            error!("Try to unmap unaligned page: virt={:?}", virt);
+            return None;
+        }
+
+        self.visit(virt, |p1, i| {
+            let entry = p1.entry(i)?;
+            if entry.empty() {
+                return None;
+            }
+
+            p1.set_entry(i, PageEntry::from_usize(0));
+            Some((
+                entry.address().ok()?,
+                entry.flags(),
+                PageFlush::<Arch>::new(virt),
+            ))
+        })
+        .flatten()
     }
 
     /// 在页表中，访问虚拟地址对应的页表项，并调用传入的函数F
@@ -1901,6 +1959,7 @@ unsafe fn unmap_phys_inner<Arch: MemoryManagementArch>(
     table: &PageTable<Arch>,
     unmap_parents: bool,
     allocator: &mut impl FrameAllocator,
+    freed_tables: &mut bool,
 ) -> Option<(PhysAddr, EntryFlags<Arch>)> {
     // 获取页表项的索引
     let i = table.index_of(vaddr)?;
@@ -1914,7 +1973,7 @@ unsafe fn unmap_phys_inner<Arch: MemoryManagementArch>(
 
     let subtable = table.next_level_table(i)?;
     // 递归地取消映射
-    let result = unmap_phys_inner(vaddr, &subtable, unmap_parents, allocator)?;
+    let result = unmap_phys_inner(vaddr, &subtable, unmap_parents, allocator, freed_tables)?;
 
     // TODO: This is a bad idea for architectures where the kernel mappings are done in the process tables,
     // as these mappings may become out of sync
@@ -1930,6 +1989,8 @@ unsafe fn unmap_phys_inner<Arch: MemoryManagementArch>(
             table.set_entry(i, PageEntry::from_usize(0));
             // 释放子页表
             allocator.free_one(subtable.phys());
+            // Mark: intermediate page-table pages were freed; upper layer needs a heavier shootdown for this mm (`freed_tables`).
+            *freed_tables = true;
         }
     }
 
@@ -1985,8 +2046,25 @@ impl<Arch: MemoryManagementArch> Drop for PageFlush<Arch> {
     }
 }
 
-/// 用于刷新整个页表的刷新器。这个刷新器一经产生，就必须调用flush()方法，
-/// 否则会造成对页表的更改被忽略，这是不安全的
+/// A flusher for the entire page table. Once created, its `flush()` method must be called;
+/// otherwise, page table changes will be silently ignored, which is unsafe.
+///
+/// # Usage Constraints
+///
+/// **Only allowed for mappings not attached to any user `AddressSpace`**, for example:
+///
+/// - Kernel-mode fixed mappings (kernel mapper)
+/// - DMA / IO remap regions that are never loaded as a user mm by another CPU
+///
+/// Any user-mm PTE modification must go through [`MmuGather`] + [`AddressSpace::flush_tlb_range`],
+/// which perform synchronous shootdown on all `active_cpus`, preventing stale TLB hits on freed physical pages.
+///
+/// A flush initiated with `PageFlushAll` only takes effect on the current CPU (`invalidate_all`)
+/// and does not perform cross-core shootdown; using it in a user-mm scenario would break TLB
+/// consistency (risk 4).
+///
+/// [`MmuGather`]: crate::mm::mmu_gather::MmuGather
+/// [`AddressSpace::flush_tlb_range`]: crate::mm::ucontext::AddressSpace::flush_tlb_range
 #[must_use = "The flusher must call the 'flush()', or the changes to page table will be unsafely ignored."]
 pub struct PageFlushAll<Arch: MemoryManagementArch> {
     phantom: PhantomData<fn() -> Arch>,
@@ -2028,40 +2106,34 @@ impl<Arch: MemoryManagementArch> Flusher<Arch> for () {
     fn consume(&mut self, _flush: PageFlush<Arch>) {}
 }
 
+/// "Deferred" flusher: silently forgets `PageFlush` on consume;
+/// the caller is responsible for performing a unified mm-aware `AddressSpace::flush_tlb_range` flush later.
+///
+/// This kind of flusher performs no TLB invalidation; suitable for mprotect/mremap/madvise/munmap etc.
+/// where the pattern is "modify PTEs + unified shootdown afterwards".
+#[derive(Debug, Default)]
+pub struct DeferredFlusher;
+
+impl DeferredFlusher {
+    #[inline]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl<Arch: MemoryManagementArch> Flusher<Arch> for DeferredFlusher {
+    #[inline]
+    fn consume(&mut self, flush: PageFlush<Arch>) {
+        // SAFETY: caller guarantees that AddressSpace::flush_tlb_range will be called later for unified TLB flush.
+        unsafe { flush.ignore() };
+    }
+}
+
 impl<Arch: MemoryManagementArch> Drop for PageFlushAll<Arch> {
     fn drop(&mut self) {
         unsafe {
             Arch::invalidate_all();
         }
-    }
-}
-
-/// 未在当前CPU上激活的页表的刷新器
-///
-/// 如果页表没有在当前cpu上激活，那么需要发送ipi到其他核心，尝试在其他核心上刷新页表
-///
-/// TODO: 这个方式很暴力，也许把它改成在指定的核心上刷新页表会更好。（可以测试一下开销）
-#[derive(Debug)]
-pub struct InactiveFlusher;
-
-impl InactiveFlusher {
-    pub fn new() -> Self {
-        return Self {};
-    }
-}
-
-impl Flusher<MMArch> for InactiveFlusher {
-    fn consume(&mut self, flush: PageFlush<MMArch>) {
-        unsafe {
-            flush.ignore();
-        }
-    }
-}
-
-impl Drop for InactiveFlusher {
-    fn drop(&mut self) {
-        // 发送刷新页表的IPI
-        send_ipi(IpiKind::FlushTLB, IpiTarget::Other);
     }
 }
 

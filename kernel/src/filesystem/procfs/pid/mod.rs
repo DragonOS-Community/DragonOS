@@ -19,6 +19,7 @@ mod cmdline;
 mod exe;
 mod fd;
 mod fdinfo;
+mod limits;
 mod maps;
 mod mountinfo;
 mod mounts;
@@ -33,6 +34,7 @@ use cmdline::CmdlineFileOps;
 use exe::ExeSymOps;
 use fd::FdDirOps;
 use fdinfo::FdInfoDirOps;
+use limits::LimitsFile;
 use maps::MapsFileOps;
 use mountinfo::MountInfoFileOps;
 use mounts::PidMountsFileOps;
@@ -82,6 +84,9 @@ impl PidDirOps {
         }),
         ("maps", |ops, parent| {
             MapsFileOps::new_inode(ops.pid, parent)
+        }),
+        ("limits", |ops, parent| {
+            LimitsFile::new_inode(ops.pid, parent)
         }),
         ("mountinfo", |ops, parent| {
             MountInfoFileOps::new_inode(ops.pid, parent)

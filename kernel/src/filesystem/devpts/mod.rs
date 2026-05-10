@@ -281,7 +281,7 @@ impl IndexNode for LockedDevPtsFSInode {
         _buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
-        todo!()
+        Err(SystemError::EISDIR)
     }
 
     fn write_at(
@@ -291,7 +291,7 @@ impl IndexNode for LockedDevPtsFSInode {
         _buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
-        todo!()
+        Err(SystemError::EISDIR)
     }
 
     fn fs(&self) -> alloc::sync::Arc<dyn super::vfs::FileSystem> {

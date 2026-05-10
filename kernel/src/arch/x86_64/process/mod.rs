@@ -399,9 +399,34 @@ impl ProcessManager {
 
         // 切换地址空间（无锁快速路径）
         let next_addr_space = next.basic().user_vm().unwrap();
+        let prev_addr_space = prev.basic().user_vm();
+        let cpu = crate::smp::core::smp_get_processor_id();
         compiler_fence(Ordering::SeqCst);
 
+        // INV-1: clear prev mm's bit before switching hardware page table (if prev/next differ),
+        // set next mm's bit after switching.
+        // Order: clear(prev) → set CR3 → set(next) → update per-CPU TlbState.
+        //
+        // Note: if prev and next point to the same mm (same-address-space thread switch), keep the bit unchanged.
+        let same_mm = match prev_addr_space.as_ref() {
+            Some(p) => Arc::ptr_eq(p, &next_addr_space),
+            None => false,
+        };
+
+        if !same_mm {
+            if let Some(prev_mm) = prev_addr_space.as_ref() {
+                prev_mm.active_cpus_clear(cpu);
+            }
+        }
+
         next_addr_space.make_current();
+        compiler_fence(Ordering::SeqCst);
+
+        if !same_mm {
+            next_addr_space.active_cpus_set(cpu);
+        }
+        // Update per-CPU TlbState: hardware-loaded mm and generation
+        crate::mm::tlb::tlb_state_set_loaded_mm(next_addr_space.clone());
         compiler_fence(Ordering::SeqCst);
         // 切换内核栈
 

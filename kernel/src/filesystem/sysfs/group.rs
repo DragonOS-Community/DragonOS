@@ -97,7 +97,7 @@ impl SysFS {
 
         if let Err(e) = self.group_create_files(parent_inode.clone(), kobj, group, update) {
             if group.name().is_some() {
-                parent_inode.remove_recursive();
+                parent_inode.remove_inode_include_self();
             }
             return Err(e);
         }
@@ -148,7 +148,7 @@ impl SysFS {
         self.group_remove_files(&parent_inode, group);
 
         if group.name().is_some() {
-            parent_inode.remove_recursive();
+            parent_inode.remove_inode_include_self();
         }
 
         return Ok(());
@@ -214,7 +214,18 @@ impl SysFS {
         return Ok(());
     }
 
-    fn group_remove_files(&self, _parent: &Arc<KernFSInode>, _group: &'static dyn AttributeGroup) {
-        todo!("group_remove_files")
+    fn group_remove_files(&self, parent: &Arc<KernFSInode>, group: &'static dyn AttributeGroup) {
+        // visibility的正确性需要依赖is_visible的实现，为保证文件被彻底删除，这里跳过了对visibility的判断
+        for attr in group.attrs() {
+            if let Err(e) = parent.remove(attr.name()) {
+                if e != SystemError::ENOENT {
+                    warn!(
+                        "sysfs failed to remove attr '{}' in group '{}': {e:?}",
+                        attr.name(),
+                        group.name().unwrap_or("")
+                    );
+                }
+            }
+        }
     }
 }

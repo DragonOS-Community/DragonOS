@@ -13,6 +13,7 @@ pub mod syscall;
 
 use core::{
     intrinsics::{likely, unlikely},
+    panic::Location,
     sync::atomic::{compiler_fence, fence, AtomicUsize, Ordering},
 };
 
@@ -30,7 +31,9 @@ use crate::{
         ipi::{IpiKind, IpiTarget},
         InterruptArch,
     },
+    init::initial_kthread::{get_system_state, SystemState},
     libs::{
+        cpumask::{AtomicCpuMask, CpuMask},
         lazy_init::Lazy,
         spinlock::{SpinLock, SpinLockGuard},
     },
@@ -40,7 +43,10 @@ use crate::{
         SchedInfo,
     },
     sched::idle::IdleScheduler,
-    smp::{core::smp_get_processor_id, cpu::ProcessorId},
+    smp::{
+        core::smp_get_processor_id,
+        cpu::{smp_cpu_manager, smp_cpu_manager_initialized, ProcessorId},
+    },
     time::{clocksource::HZ, timer::clock},
 };
 
@@ -53,6 +59,7 @@ use self::{
 };
 
 static mut CPU_IRQ_TIME: Option<Vec<&'static mut IrqTime>> = None;
+pub static IDLE_CPUS: AtomicCpuMask = AtomicCpuMask::new();
 
 // 这里虽然rq是percpu的，但是在负载均衡的时候需要修改对端cpu的rq，所以仍需加锁
 static CPU_RUNQUEUE: Lazy<PerCpuVar<Arc<CpuRunQueue>>> = PerCpuVar::define_lazy();
@@ -79,6 +86,39 @@ pub fn cpu_rq(cpu: usize) -> Arc<CpuRunQueue> {
             .force_get(ProcessorId::new(cpu as u32))
             .clone()
     }
+}
+
+#[inline]
+fn task_is_idle(pcb: &Arc<ProcessControlBlock>) -> bool {
+    pcb.sched_info().policy() == SchedPolicy::IDLE
+}
+
+#[inline]
+fn rq_is_idle_cpu(rq: &CpuRunQueue) -> bool {
+    task_is_idle(&rq.current()) && rq.nr_running == 0
+}
+
+#[inline]
+pub fn cpu_is_online(cpu: ProcessorId) -> bool {
+    smp_cpu_manager().is_online_cpu(cpu)
+}
+
+#[inline]
+fn boot_in_progress() -> bool {
+    matches!(
+        get_system_state(),
+        SystemState::Booting | SystemState::Scheduling | SystemState::FreeingInitMem
+    )
+}
+
+pub fn pick_idle_cpu(allowed: &CpuMask) -> Option<ProcessorId> {
+    if !smp_cpu_manager_initialized() {
+        return IDLE_CPUS.first_and(allowed);
+    }
+
+    allowed
+        .iter_cpu()
+        .find(|&cpu| IDLE_CPUS.get(cpu) && cpu_is_online(cpu))
 }
 
 lazy_static! {
@@ -290,7 +330,6 @@ pub trait SchedArch {
 #[derive(Debug)]
 pub struct CpuRunQueue {
     lock: SpinLock<()>,
-    lock_on_who: AtomicUsize,
 
     cpu: ProcessorId,
     clock_task: u64,
@@ -337,10 +376,14 @@ pub struct CpuRunQueue {
 }
 
 impl CpuRunQueue {
+    #[inline]
+    pub fn cpu(&self) -> ProcessorId {
+        self.cpu
+    }
+
     pub fn new(cpu: ProcessorId) -> Self {
         Self {
             lock: SpinLock::new(()),
-            lock_on_who: AtomicUsize::new(usize::MAX),
             cpu,
             clock_task: 0,
             clock: 0,
@@ -366,45 +409,45 @@ impl CpuRunQueue {
     }
 
     /// 此函数只能在关中断的情况下使用！！！
-    /// 获取到rq的可变引用，需要注意的是返回的第二个值需要确保其生命周期
-    /// 所以可以说这个函数是unsafe的，需要确保正确性
-    /// 在中断上下文，关中断的情况下，此函数是安全的
+    /// 获取到 rq 的可变引用，并显式持有 rq 锁。
     #[allow(clippy::mut_from_ref)]
-    pub fn self_lock(&self) -> (&mut Self, Option<SpinLockGuard<'_, ()>>) {
-        if self.lock.is_locked()
-            && smp_get_processor_id().data() as usize == self.lock_on_who.load(Ordering::SeqCst)
-        {
-            // 在本cpu已上锁则可以直接拿
-            (
-                unsafe {
-                    (self as *const Self as usize as *mut Self)
-                        .as_mut()
-                        .unwrap()
-                },
-                None,
-            )
-        } else {
-            // 否则先上锁再拿
-            let guard = self.lock();
-            (
-                unsafe {
-                    (self as *const Self as usize as *mut Self)
-                        .as_mut()
-                        .unwrap()
-                },
-                Some(guard),
-            )
-        }
+    #[track_caller]
+    pub fn self_lock(&self) -> (&mut Self, SpinLockGuard<'_, ()>) {
+        let mut spins = 0usize;
+        let guard = loop {
+            if let Ok(guard) = self.lock.try_lock_irqsave() {
+                break guard;
+            }
+
+            spins += 1;
+            if spins >= 1_000_000 {
+                let caller = Location::caller();
+                panic!(
+                    "CpuRunQueue::self_lock spinout on cpu {:?}, caller {}:{}",
+                    self.cpu,
+                    caller.file(),
+                    caller.line()
+                );
+            }
+
+            core::hint::spin_loop();
+        };
+        (self.force_mut_locked(), guard)
     }
 
-    fn lock(&self) -> SpinLockGuard<'_, ()> {
-        let guard = self.lock.lock_irqsave();
+    #[allow(clippy::mut_from_ref)]
+    fn force_mut(&self) -> &mut Self {
+        unsafe { (self as *const Self as *mut Self).as_mut().unwrap() }
+    }
 
-        // 更新在哪一个cpu上锁
-        self.lock_on_who
-            .store(smp_get_processor_id().data() as usize, Ordering::SeqCst);
-
-        guard
+    /// 仅允许在已经持有 rq 锁的路径中使用。
+    #[allow(clippy::mut_from_ref)]
+    pub fn force_mut_locked(&self) -> &mut Self {
+        assert!(
+            self.lock.is_locked(),
+            "rq must be locked before mutable access"
+        );
+        self.force_mut()
     }
 
     pub fn enqueue_task(&mut self, pcb: Arc<ProcessControlBlock>, flags: EnqueueFlag) {
@@ -460,6 +503,8 @@ impl CpuRunQueue {
 
     /// 启用一个任务，将加入队列
     pub fn activate_task(&mut self, pcb: &Arc<ProcessControlBlock>, mut flags: EnqueueFlag) {
+        let was_idle_cpu = rq_is_idle_cpu(self);
+
         // 如果进程之前因 IO 等待而睡眠，现在被唤醒，减少 nr_iowait 计数
         if pcb.flags().contains(ProcessFlags::IN_IOWAIT) {
             self.nr_iowait.fetch_sub(1, Ordering::Relaxed);
@@ -477,6 +522,14 @@ impl CpuRunQueue {
 
         *pcb.sched_info().on_rq.lock_irqsave() = OnRq::Queued;
         pcb.sched_info().set_on_cpu(Some(self.cpu));
+
+        if was_idle_cpu && !rq_is_idle_cpu(self) {
+            IDLE_CPUS.clear(self.cpu);
+        }
+
+        debug_assert_eq!(*pcb.sched_info().on_rq.lock_irqsave(), OnRq::Queued);
+        debug_assert_eq!(pcb.sched_info().on_cpu(), Some(self.cpu));
+        pcb.debug_assert_fork_cpu_binding();
     }
 
     /// 检查对应的task是否可以抢占当前运行的task
@@ -494,6 +547,46 @@ impl CpuRunQueue {
         } else if pcb.sched_info().policy() < self.current().sched_info().policy() {
             // 调度优先级更高
             self.resched_current();
+        }
+
+        if *self.current().sched_info().on_rq.lock_irqsave() == OnRq::Queued
+            && self.current().flags().contains(ProcessFlags::NEED_SCHEDULE)
+        {
+            self.clock_updata_flags
+                .insert(ClockUpdataFlag::RQCF_REQ_SKIP);
+        }
+    }
+
+    /// 远端 wakeup/策略调整场景下的保守抢占检查。
+    ///
+    /// Linux 会在持有目标 rq 锁且目标 rq 时钟已更新后执行完整的 wakeup-preempt 检查。
+    /// 当前明确禁止跨核 `update_rq_clock()`，因此远端路径只能保留那些不依赖
+    /// `rq.clock_task` 最新值的抢占决策：
+    /// - 更高调度类抢占；
+    /// - FIFO 优先级抢占；
+    /// - idle 被非 idle 任务抢占。
+    ///
+    /// CFS 的 wakeup-preempt 需要像 Linux `check_preempt_wakeup()` 一样先更新当前实体，
+    /// 这在远端场景会重新引入“错误 CPU 更新目标 rq 时钟”的问题，因此这里故意跳过。
+    #[allow(clippy::comparison_chain)]
+    pub fn check_preempt_remote(&mut self, pcb: &Arc<ProcessControlBlock>, flags: WakeupFlags) {
+        let current = self.current();
+        let current_policy = current.sched_info().policy();
+        let next_policy = pcb.sched_info().policy();
+
+        if current.flags().contains(ProcessFlags::NEED_SCHEDULE) {
+            return;
+        }
+
+        if next_policy < current_policy {
+            self.resched_current();
+        } else if next_policy == current_policy {
+            match current_policy {
+                SchedPolicy::CFS => {}
+                SchedPolicy::FIFO => FifoScheduler::check_preempt_currnet(self, pcb, flags),
+                SchedPolicy::RT => todo!(),
+                SchedPolicy::IDLE => IdleScheduler::check_preempt_currnet(self, pcb, flags),
+            }
         }
 
         if *self.current().sched_info().on_rq.lock_irqsave() == OnRq::Queued
@@ -546,6 +639,17 @@ impl CpuRunQueue {
 
     /// 更新rq时钟
     pub fn update_rq_clock(&mut self) {
+        debug_assert_eq!(
+            self.cpu,
+            smp_get_processor_id(),
+            "update_rq_clock must run on its own cpu"
+        );
+
+        let clock = SchedClock::sched_clock_cpu(self.cpu);
+        self.update_rq_clock_from_clock(clock);
+    }
+
+    pub fn update_rq_clock_from_clock(&mut self, clock: u64) {
         // 需要跳过这次时钟更新
         if self
             .clock_updata_flags
@@ -554,7 +658,6 @@ impl CpuRunQueue {
             return;
         }
 
-        let clock = SchedClock::sched_clock_cpu(self.cpu);
         if clock < self.clock {
             return;
         }
@@ -615,6 +718,9 @@ impl CpuRunQueue {
     pub fn sub_nr_running(&mut self, count: usize) {
         self.nr_running -= count;
         loadavg::dec_nr_running(count);
+        if self.nr_running < 2 && self.overload {
+            self.overload = false;
+        }
     }
 
     pub fn dec_nr_uninterruptible(&mut self) {
@@ -682,6 +788,8 @@ impl CpuRunQueue {
 
     /// 选择下一个task
     pub fn pick_next_task(&mut self, prev: Arc<ProcessControlBlock>) -> Arc<ProcessControlBlock> {
+        debug_assert_eq!(prev.sched_info().on_cpu(), Some(self.cpu));
+
         let mut next: Option<Arc<ProcessControlBlock>> = None;
 
         if self.fifo.nr_running() > 0 {
@@ -884,7 +992,7 @@ pub fn __schedule(sched_mod: SchedMode) {
 
     // TODO: hrtick_clear(rq);
 
-    let (rq, _guard) = rq.self_lock();
+    let (rq, guard) = rq.self_lock();
 
     rq.clock_updata_flags = ClockUpdataFlag::from_bits_truncate(rq.clock_updata_flags.bits() << 1);
 
@@ -929,6 +1037,12 @@ pub fn __schedule(sched_mod: SchedMode) {
     }
 
     let next = rq.pick_next_task(prev.clone());
+
+    if task_is_idle(&next) {
+        IDLE_CPUS.set(rq.cpu);
+    } else if task_is_idle(&prev) {
+        IDLE_CPUS.clear(rq.cpu);
+    }
 
     // kBUG!(
     //     "after cfs rq pcbs {:?}\nvruntimes {:?}\n",
@@ -975,8 +1089,14 @@ pub fn __schedule(sched_mod: SchedMode) {
         // CurrentApic.send_eoi();
         compiler_fence(Ordering::SeqCst);
 
+        // This kernel does not hand off rq lock ownership across context switch.
+        // Drop it before switching so the incoming task's first tick/wakeup path
+        // can acquire the local rq lock normally.
+        drop(guard);
+
         unsafe { ProcessManager::switch_process(prev, next) };
     } else {
+        drop(guard);
         assert!(
             Arc::ptr_eq(&ProcessManager::current_pcb(), &prev),
             "{}",
@@ -1010,16 +1130,36 @@ pub fn sched_fork(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
 }
 
 pub fn sched_cgroup_fork(pcb: &Arc<ProcessControlBlock>) {
-    __set_task_cpu(pcb, smp_get_processor_id());
+    let fork_cpu = smp_get_processor_id();
+
+    __set_task_cpu(pcb, fork_cpu);
     match pcb.sched_info().policy() {
         SchedPolicy::RT => todo!(),
         SchedPolicy::FIFO => FifoScheduler::task_fork(pcb.clone()),
         SchedPolicy::CFS => CompletelyFairScheduler::task_fork(pcb.clone()),
         SchedPolicy::IDLE => todo!(),
     }
+
+    debug_assert_eq!(
+        pcb.sched_info().sched_entity().cfs_rq().rq().cpu(),
+        fork_cpu,
+        "fork-time task_fork must only charge the local rq clock"
+    );
+}
+
+pub fn sched_set_new_task_cpu(pcb: &Arc<ProcessControlBlock>, target_cpu: ProcessorId) {
+    __set_task_cpu(pcb, target_cpu);
+    pcb.sched_info().set_on_cpu(Some(target_cpu));
+    pcb.debug_assert_fork_cpu_binding();
 }
 
 fn __set_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {
+    debug_assert!(
+        cpu_is_online(cpu) || boot_in_progress(),
+        "__set_task_cpu target cpu {:?} must be online outside boot",
+        cpu
+    );
+
     // TODO: Fixme There is not implement group sched;
     let se = pcb.sched_info().sched_entity();
     let rq = cpu_rq(cpu.data() as usize);
@@ -1080,4 +1220,31 @@ pub fn sched_yield() {
     drop(preempt_guard);
 
     schedule(SchedMode::SM_NONE);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::loadavg;
+    use crate::sched::CpuRunQueue;
+    use crate::smp::cpu::ProcessorId;
+
+    #[test]
+    fn rq_overload_clears_after_nr_running_drops_below_two() {
+        let mut rq = CpuRunQueue::new(ProcessorId::new(0));
+        let global_before = loadavg::nr_running();
+
+        rq.add_nr_running(2);
+        assert!(rq.overload);
+        assert_eq!(rq.nr_running, 2);
+
+        rq.sub_nr_running(1);
+        assert!(!rq.overload);
+        assert_eq!(rq.nr_running, 1);
+
+        assert_eq!(loadavg::nr_running(), global_before + 1);
+
+        rq.sub_nr_running(1);
+        assert_eq!(rq.nr_running, 0);
+        assert_eq!(loadavg::nr_running(), global_before);
+    }
 }

@@ -30,11 +30,12 @@ use crate::{
     ipc::shm::{ShmFlags, ShmId},
     libs::{
         align::page_align_up,
+        cpumask::CpuMask,
         mutex::{Mutex, MutexGuard},
         rwsem::RwSem,
         spinlock::SpinLock,
     },
-    mm::{page::page_manager_lock, PhysAddr},
+    mm::{mmu_gather::MmuGather, page::page_manager_lock, PhysAddr},
     process::{resource::RLimitID, ProcessManager},
 };
 
@@ -42,7 +43,7 @@ use super::{
     allocator::page_frame::{
         deallocate_page_frames, PageFrameCount, PhysPageFrame, VirtPageFrame, VirtPageFrameIter,
     },
-    page::{EntryFlags, Flusher, InactiveFlusher, Page, PageFlags, PageFlushAll, PageType},
+    page::{EntryFlags, Flusher, Page, PageFlags, PageType},
     syscall::{MadvFlags, MapFlags, MremapFlags, ProtFlags},
     MemoryManagementArch, PageTableKind, VirtAddr, VirtRegion, VmFlags,
 };
@@ -77,21 +78,51 @@ pub struct AddressSpace {
     /// 页表物理地址（创建后不变，可无锁访问）
     /// 用于在调度器上下文中快速切换页表，无需获取RwSem锁
     table_paddr: PhysAddr,
+    /// The set of CPUs that may currently hold TLB entries for this mm.
+    ///
+    /// Maintained by context switch / exec / process exit paths; `flush_tlb_mm_range` uses this to determine shootdown targets.
+    /// Cf. Linux 6.6 `struct mm_struct::cpu_bitmap` semantics.
+    pub active_cpus: SpinLock<CpuMask>,
+    /// Monotonically increasing count of page table modifications for this mm.
+    ///
+    /// `flush_tlb_*` must increment this after publishing page table writes and before snapshotting `active_cpus`;
+    /// remote CPUs receiving IPI write this to per-CPU `TlbState::loaded_tlb_gen` as a "caught-up generation" marker.
+    pub tlb_gen: AtomicU64,
+    /// Serialize all user page-table edits for this mm.
+    ///
+    /// This is intentionally separate from `inner: RwSem<InnerAddressSpace>`:
+    /// file-rmap walkers need to edit remote PTEs under `mapping->i_mmap.read()`
+    /// without taking `mm.write()`, while fault/munmap/mprotect/mremap paths must
+    /// still synchronize with those edits.
+    page_table_edit_lock: Mutex<()>,
     /// 使用RwSem而非RwLock，因为地址空间操作可能需要进行I/O（如页缺失时的文件读取）
     inner: RwSem<InnerAddressSpace>,
 }
 
 impl AddressSpace {
     pub fn new(create_stack: bool) -> Result<Arc<Self>, SystemError> {
-        let inner = InnerAddressSpace::new(create_stack)?;
+        let inner = InnerAddressSpace::new(false)?;
         let table_paddr = inner.user_mapper.utable.table().phys();
         let id = ADDRESS_SPACE_ID_ALLOCATOR.fetch_add(1, Ordering::Relaxed);
-        let result = Self {
+        let result = Arc::new(Self {
             id,
             table_paddr,
+            active_cpus: SpinLock::new(CpuMask::new()),
+            tlb_gen: AtomicU64::new(0),
+            page_table_edit_lock: Mutex::new(()),
             inner: RwSem::new(inner),
-        };
-        return Ok(Arc::new(result));
+        });
+        // Back-fill the Weak<AddressSpace> so that InnerAddressSpace methods can obtain
+        // the outer Arc to construct MmuGather / initiate TLB shootdown.
+        {
+            let mut g = result.inner.write();
+            g.outer = Arc::downgrade(&result);
+            g.mappings.set_owner(Arc::downgrade(&result));
+            if create_stack {
+                g.new_user_stack(UserStack::DEFAULT_USER_STACK_SIZE)?;
+            }
+        }
+        return Ok(result);
     }
 
     /// 获取地址空间的全局唯一ID
@@ -134,6 +165,71 @@ impl AddressSpace {
     pub unsafe fn make_current(&self) {
         MMArch::set_table(PageTableKind::User, self.table_paddr);
     }
+
+    /// Add the specified CPU to this mm's `active_cpus`.
+    ///
+    /// The caller should invoke this after the hardware has loaded this mm's page table, or immediately before loading,
+    /// so that `flush_tlb_mm_range` can see this CPU after inc_tlb_gen.
+    #[inline]
+    pub fn active_cpus_set(&self, cpu: crate::smp::cpu::ProcessorId) {
+        let mut g = self.active_cpus.lock();
+        g.set(cpu, true);
+    }
+
+    /// Remove the specified CPU from `active_cpus`.
+    ///
+    /// The caller should invoke this before switching the hardware page table to a different mm,
+    /// ensuring that any subsequent shootdown will no longer consider this CPU a target.
+    #[inline]
+    pub fn active_cpus_clear(&self, cpu: crate::smp::cpu::ProcessorId) {
+        let mut g = self.active_cpus.lock();
+        g.set(cpu, false);
+    }
+
+    /// Issue a range-based TLB flush for this mm (including remote shootdown + local).
+    ///
+    /// See `crate::mm::tlb::flush_tlb_mm_range` for constraints.
+    #[inline]
+    pub fn flush_tlb_range(
+        self: &Arc<Self>,
+        start: VirtAddr,
+        end: VirtAddr,
+        stride_shift: u8,
+        freed_tables: bool,
+    ) {
+        crate::mm::tlb::flush_tlb_mm_range(self, start, end, stride_shift, freed_tables);
+    }
+
+    /// Issue a full-mm TLB flush.
+    #[inline]
+    pub fn flush_tlb_all(self: &Arc<Self>) {
+        crate::mm::tlb::flush_tlb_mm(self);
+    }
+
+    #[inline]
+    pub fn page_table_edit(&self) -> MutexGuard<'_, ()> {
+        debug_assert!(
+            CurrentIrqArch::is_irq_enabled(),
+            "page_table_edit_lock must not be taken with interrupts disabled"
+        );
+        self.page_table_edit_lock.lock()
+    }
+}
+
+impl Drop for AddressSpace {
+    fn drop(&mut self) {
+        // Assert that no CPUs still reference this mm when it is dropped in debug builds.
+        // In release builds, degrade gracefully to avoid false positives (a leak is better than a panic).
+        #[cfg(debug_assertions)]
+        {
+            let g = self.active_cpus.lock();
+            debug_assert!(
+                g.is_empty(),
+                "AddressSpace dropped with non-empty active_cpus; id={}",
+                self.id
+            );
+        }
+    }
 }
 
 impl core::ops::Deref for AddressSpace {
@@ -171,6 +267,13 @@ pub struct InnerAddressSpace {
     pub end_code: VirtAddr,
     pub start_data: VirtAddr,
     pub end_data: VirtAddr,
+
+    /// Weak reference back to the outer `AddressSpace`.
+    ///
+    /// Back-filled by `AddressSpace::new` after constructing the Arc; used by internal
+    /// `munmap`/`mprotect`/... to obtain `Arc<AddressSpace>` for constructing `MmuGather`
+    /// and initiating TLB shootdown.
+    outer: Weak<AddressSpace>,
 }
 
 impl InnerAddressSpace {
@@ -185,8 +288,8 @@ impl InnerAddressSpace {
             .sum()
     }
 
-    pub fn new(create_stack: bool) -> Result<Self, SystemError> {
-        let mut result = Self {
+    pub fn new(_create_stack: bool) -> Result<Self, SystemError> {
+        let result = Self {
             user_mapper: MMArch::setup_new_usermapper()?,
             mappings: UserMappings::new(),
             mmap_min: VirtAddr(DEFAULT_MMAP_MIN_ADDR),
@@ -199,11 +302,8 @@ impl InnerAddressSpace {
             end_code: VirtAddr(0),
             start_data: VirtAddr(0),
             end_data: VirtAddr(0),
+            outer: Weak::new(),
         };
-        if create_stack {
-            // debug!("to create user stack.");
-            result.new_user_stack(UserStack::DEFAULT_USER_STACK_SIZE)?;
-        }
 
         return Ok(result);
     }
@@ -215,9 +315,19 @@ impl InnerAddressSpace {
     /// 返回克隆后的，新的地址空间的Arc指针
     #[inline(never)]
     pub fn try_clone(&mut self) -> Result<Arc<AddressSpace>, SystemError> {
-        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let new_addr_space = AddressSpace::new(false)?;
         let mut new_guard = new_addr_space.write();
+
+        // 父 mm 可能是多线程共享的 mm（CLONE_VM / CLONE_THREAD），此时正在其他 CPU 上跑的线程
+        // 也可能在父页表上缓存了 writable 的 TLB。下面 COW 写保护父进程 PTE 时，
+        // 必须走 mm-aware shootdown：只做本地 invlpg 的话，远端 CPU 仍可能用旧的可写 TLB 写进去，
+        // 破坏 COW 语义（风险 4 残留）。这里用 MmuGather 累积整个被改写的范围，
+        // 循环结束后由 tlb.finish() 统一触发 flush_tlb_mm_range，对父 mm 的所有活跃 CPU 同步 shootdown。
+        let parent_mm = self
+            .outer
+            .upgrade()
+            .expect("InnerAddressSpace::try_clone called before AddressSpace::new finished");
+        let mut parent_tlb = MmuGather::gather(&parent_mm);
 
         // 仅拷贝用户栈的结构体信息（元数据），实际的用户栈页面内容会在下面的 VMA 循环中处理
         unsafe {
@@ -258,6 +368,7 @@ impl InnerAddressSpace {
 
             // 创建新的VMA
             let new_vma = LockedVMA::new(vma_guard.clone_info_only());
+            new_guard.mappings.attach_vma(&new_vma);
             new_guard.mappings.vmas.insert(new_vma.clone());
             drop(vma_guard);
 
@@ -290,57 +401,55 @@ impl InnerAddressSpace {
             let end_page = region.end();
             let mut current_page = start_page;
 
-            let old_mapper = &mut self.user_mapper.utable;
-            let new_mapper = &mut new_guard.user_mapper.utable;
-            let mut page_manager_guard = page_manager_lock();
+            {
+                let _parent_pt_edit = parent_mm.page_table_edit();
+                let old_mapper = &mut self.user_mapper.utable;
+                let new_mapper = &mut new_guard.user_mapper.utable;
+                let mut page_manager_guard = page_manager_lock();
 
-            while current_page < end_page {
-                if let Some((phys_addr, old_flags)) = old_mapper.translate(current_page) {
-                    unsafe {
-                        if is_shared {
-                            // 共享映射：直接映射到相同的物理页，不使用COW
-                            // 保持原有的flags
-                            if new_mapper
-                                .map_phys(current_page, phys_addr, page_flags)
-                                .is_none()
-                            {
-                                warn!("Failed to map shared page at {:?} to phys {:?} in child process (current_pid: {:?})",
-                                      current_page, phys_addr, ProcessManager::current_pcb().raw_pid());
-                            }
-                        } else {
-                            // 私有映射：使用COW机制
-                            // 将父进程和子进程的页表项都设置为只读
-                            let cow_flags = page_flags.set_write(false);
+                while current_page < end_page {
+                    if let Some((phys_addr, old_flags)) = old_mapper.translate(current_page) {
+                        unsafe {
+                            if is_shared {
+                                if new_mapper
+                                    .map_phys(current_page, phys_addr, page_flags)
+                                    .is_none()
+                                {
+                                    warn!("Failed to map shared page at {:?} to phys {:?} in child process (current_pid: {:?})",
+                                          current_page, phys_addr, ProcessManager::current_pcb().raw_pid());
+                                }
+                            } else {
+                                let cow_flags = page_flags.set_write(false);
 
-                            // 更新父进程的页表项为只读
-                            if old_flags.has_write() {
-                                if let Some(flush) = old_mapper.remap(current_page, cow_flags) {
-                                    flush.flush();
+                                if old_flags.has_write() {
+                                    if let Some(flush) = old_mapper.remap(current_page, cow_flags) {
+                                        flush.ignore();
+                                        parent_tlb.accumulate_range(current_page);
+                                    }
+                                }
+
+                                if new_mapper
+                                    .map_phys(current_page, phys_addr, cow_flags)
+                                    .is_none()
+                                {
+                                    warn!("Failed to map COW page at {:?} to phys {:?} in child process (current_pid: {:?})",
+                                          current_page, phys_addr, ProcessManager::current_pcb().raw_pid());
                                 }
                             }
-
-                            // 子进程也映射为只读
-                            if new_mapper
-                                .map_phys(current_page, phys_addr, cow_flags)
-                                .is_none()
-                            {
-                                warn!("Failed to map COW page at {:?} to phys {:?} in child process (current_pid: {:?})",
-                                      current_page, phys_addr, ProcessManager::current_pcb().raw_pid());
+                            if let Some(page) = page_manager_guard.get(&phys_addr) {
+                                page.write().insert_vma(new_vma.clone());
                             }
                         }
-                        // 为新进程的VMA添加反向映射
-                        if let Some(page) = page_manager_guard.get(&phys_addr) {
-                            page.write().insert_vma(new_vma.clone());
-                        }
                     }
+                    current_page = VirtAddr::new(current_page.data() + MMArch::PAGE_SIZE);
                 }
-                current_page = VirtAddr::new(current_page.data() + MMArch::PAGE_SIZE);
             }
-            drop(page_manager_guard);
         }
 
         drop(new_guard);
-        drop(irq_guard);
+        // 完成父 mm 的 mm-aware shootdown：INV-3 要求 TLB 生效完成后再继续后续逻辑，
+        // 此处没有 page 进入 pending_pages，因此实际只触发 flush_tlb_mm_range。
+        parent_tlb.finish();
         return Ok(new_addr_space);
     }
 
@@ -396,6 +505,15 @@ impl InnerAddressSpace {
     #[inline]
     pub fn is_current(&self) -> bool {
         return self.user_mapper.utable.is_current();
+    }
+
+    /// Obtain the outer `Arc<AddressSpace>`.
+    ///
+    /// Back-filled during `AddressSpace::new` construction; upgrade should always succeed on normal paths.
+    /// Returns `None` only in extreme scenarios (Weak not yet assigned / mm already destroyed).
+    #[inline]
+    pub fn outer_addr_space(&self) -> Option<Arc<AddressSpace>> {
+        self.outer.upgrade()
     }
 
     /// 进行匿名页映射
@@ -735,24 +853,26 @@ impl InnerAddressSpace {
         // debug!("mmap: page: {:?}, region={region:?}", page.virt_address());
 
         compiler_fence(Ordering::SeqCst);
-        let (mut active, mut inactive);
-        let flusher = if self.is_current() {
-            active = PageFlushAll::new();
-            &mut active as &mut dyn Flusher<MMArch>
-        } else {
-            inactive = InactiveFlusher::new();
-            &mut inactive as &mut dyn Flusher<MMArch>
-        };
+        // New mapping: the new region had no prior PTE, no TLB invalidation needed.
+        // Use DeferredFlusher to silently consume internal PageFlush tokens.
+        // If MAP_FIXED support for overwriting existing mappings is added in the future,
+        // the caller should first munmap via MmuGather to release old mappings.
+        let mut flusher = crate::mm::page::DeferredFlusher::new();
         compiler_fence(Ordering::SeqCst);
         // 映射页面，并将VMA插入到地址空间的VMA列表中
-        self.mappings.insert_vma(map_func(
-            page,
-            page_count,
-            vm_flags,
-            EntryFlags::from_prot_flags(prot_flags, true),
-            &mut self.user_mapper.utable,
-            flusher,
-        )?);
+        let new_vma = {
+            let mm = self.outer_addr_space().ok_or(SystemError::EFAULT)?;
+            let _pt_edit = mm.page_table_edit();
+            map_func(
+                page,
+                page_count,
+                vm_flags,
+                EntryFlags::from_prot_flags(prot_flags, true),
+                &mut self.user_mapper.utable,
+                &mut flusher,
+            )?
+        };
+        self.mappings.insert_vma(new_vma);
 
         return Ok(page);
     }
@@ -928,15 +1048,10 @@ impl InnerAddressSpace {
 
         let move_len = core::cmp::min(old_len, new_len);
 
-        // 选择合适的 flusher（与 mmap/munmap 的策略一致）。
-        let (mut active, mut inactive);
-        let flusher: &mut dyn Flusher<MMArch> = if self.is_current() {
-            active = PageFlushAll::new();
-            &mut active as &mut dyn Flusher<MMArch>
-        } else {
-            inactive = InactiveFlusher::new();
-            &mut inactive as &mut dyn Flusher<MMArch>
-        };
+        // mremap does not free physical pages (old VMA pages are moved to the new VMA, or dual-mapped under DONTUNMAP);
+        // using MmuGather here is solely for a unified cross-core TLB shootdown at the end.
+        let mm = self.outer_addr_space().ok_or(SystemError::EFAULT)?;
+        let mut tlb = MmuGather::gather(&mm);
 
         // 迁移/复制已存在的页表映射。
         // - DONTUNMAP：复制映射（旧映射仍保留）
@@ -945,35 +1060,45 @@ impl InnerAddressSpace {
         let mapper = &mut self.user_mapper.utable;
         let old_vma = old_vma.clone();
 
-        let mut page_manager_guard = page_manager_lock();
-        let mut off = 0usize;
-        while off < move_len {
-            let src = old_vaddr + off;
-            let dst = new_region.start() + off;
-            if let Some((paddr, src_flags)) = mapper.translate(src) {
-                if !dontunmap {
-                    if let Some((_paddr2, _flags2, flush)) = unsafe { mapper.unmap_phys(src, true) }
-                    {
-                        flusher.consume(flush);
+        {
+            let _pt_edit = mm.page_table_edit();
+            let mut page_manager_guard = page_manager_lock();
+            let mut off = 0usize;
+            while off < move_len {
+                let src = old_vaddr + off;
+                let dst = new_region.start() + off;
+                if let Some((paddr, src_flags)) = mapper.translate(src) {
+                    if !dontunmap {
+                        if let Some((_paddr2, _flags2, flush, freed_tables)) =
+                            unsafe { mapper.unmap_phys_with_freed_tables(src, true) }
+                        {
+                            unsafe { flush.ignore() };
+                            tlb.accumulate_range(src);
+                            if freed_tables {
+                                tlb.note_pt_table_freed();
+                            }
+                        }
                     }
-                }
 
-                if let Some(flush) = unsafe { mapper.map_phys(dst, paddr, src_flags) } {
-                    flusher.consume(flush);
-                } else {
-                    return Err(SystemError::ENOMEM);
-                }
+                    if let Some(flush) = unsafe { mapper.map_phys(dst, paddr, src_flags) } {
+                        unsafe { flush.ignore() };
+                        tlb.accumulate_range(dst);
+                    } else {
+                        return Err(SystemError::ENOMEM);
+                    }
 
-                // 更新物理页的 vma_set
-                let page = page_manager_guard.get_unwrap(&paddr);
-                let mut pg = page.write();
-                if !dontunmap {
-                    pg.remove_vma(old_vma.as_ref());
+                    // 更新物理页的 vma_set
+                    let page = page_manager_guard.get_unwrap(&paddr);
+                    let mut pg = page.write();
+                    if !dontunmap {
+                        pg.remove_vma(old_vma.as_ref());
+                    }
+                    pg.insert_vma(new_vma.clone());
                 }
-                pg.insert_vma(new_vma.clone());
+                off += MMArch::PAGE_SIZE;
             }
-            off += MMArch::PAGE_SIZE;
         }
+        tlb.finish();
 
         Ok(new_region.start())
     }
@@ -1003,7 +1128,10 @@ impl InnerAddressSpace {
         let region_to_unmap = VirtRegion::new(start_page.virt_address(), page_count.bytes());
         let vmas_related: Vec<Arc<LockedVMA>> =
             self.mappings.conflicts(region_to_unmap).collect::<Vec<_>>();
-        let mut flusher: PageFlushAll<MMArch> = PageFlushAll::new();
+
+        // Use MmuGather: clear PTEs + stash pages first, then unified shootdown, and finally free physical pages (INV-3)
+        let mm = self.outer_addr_space().ok_or(SystemError::EFAULT)?;
+        let mut tlb = MmuGather::gather(&mm);
 
         // 遍历每个相关的 VMA，将当前的 VMA 拆分为可能的三块 VMA，然后删除与需要删除的区域相交的部分。
         // 示意图：对每个与 region_to_unmap 相交的 VMA，按交集拆分成三段（before / intersection / after），
@@ -1028,24 +1156,28 @@ impl InnerAddressSpace {
                 .region()
                 .intersect(&region_to_unmap)
                 .ok_or(SystemError::EFAULT)?;
-            let split_result = cur_vma
-                .extract(intersection, &self.user_mapper.utable)
-                .ok_or(SystemError::EFAULT)?;
+            let (before, after) = {
+                let _pt_edit = mm.page_table_edit();
+                let split_result = cur_vma
+                    .extract(intersection, &self.user_mapper.utable)
+                    .ok_or(SystemError::EFAULT)?;
+                cur_vma.unmap(&mut self.user_mapper.utable, &mut tlb);
+                (split_result.prev, split_result.after)
+            };
 
             // TODO: 当引入后备页映射后，这里需要增加通知文件的逻辑
 
-            // 如果前面有VMA，则需要将前面的VMA重新插入到地址空间的VMA列表中
-            if let Some(before) = split_result.prev {
+            if let Some(before) = before {
                 self.mappings.insert_vma(before);
             }
 
-            // 如果后面有VMA，则需要将后面的VMA重新插入到地址空间的VMA列表中
-            if let Some(after) = split_result.after {
+            if let Some(after) = after {
                 self.mappings.insert_vma(after);
             }
-
-            cur_vma.unmap(&mut self.user_mapper.utable, &mut flusher);
         }
+
+        // Shootdown first, then free physical pages
+        tlb.finish();
 
         // TODO: 当引入后备页映射后，这里需要增加通知文件的逻辑
 
@@ -1063,14 +1195,8 @@ impl InnerAddressSpace {
         //     start_page,
         //     page_count
         // );
-        let (mut active, mut inactive);
-        let flusher = if self.is_current() {
-            active = PageFlushAll::new();
-            &mut active as &mut dyn Flusher<MMArch>
-        } else {
-            inactive = InactiveFlusher::new();
-            &mut inactive as &mut dyn Flusher<MMArch>
-        };
+        let mm = self.outer_addr_space().ok_or(SystemError::EFAULT)?;
+        let mut tlb = MmuGather::gather(&mm);
 
         let mapper = &mut self.user_mapper.utable;
         let region = VirtRegion::new(start_page.virt_address(), page_count.bytes());
@@ -1085,36 +1211,46 @@ impl InnerAddressSpace {
             let r = self.mappings.remove_vma(&r).unwrap();
 
             let intersection = r.lock().region().intersect(&region).unwrap();
-            let split_result = r
-                .extract(intersection, mapper)
-                .expect("Failed to extract VMA");
+            let remap_result: Result<VmaSplitSides, SystemError> = {
+                let _pt_edit = mm.page_table_edit();
+                let split_result = r
+                    .extract(intersection, mapper)
+                    .expect("Failed to extract VMA");
 
-            if let Some(before) = split_result.prev {
+                let mut r_guard = r.lock();
+                if !r_guard.can_have_flags(prot_flags) {
+                    Err(SystemError::EACCES)
+                } else {
+                    r_guard.set_vm_flags(VmFlags::from(prot_flags));
+
+                    let new_flags: EntryFlags<MMArch> = r_guard
+                        .flags()
+                        .set_execute(prot_flags.contains(ProtFlags::PROT_EXEC))
+                        .set_write(prot_flags.contains(ProtFlags::PROT_WRITE));
+
+                    r_guard.remap(new_flags, mapper, &mut tlb)?;
+                    Ok((split_result.prev, split_result.after))
+                }
+            };
+            let (before, after) = match remap_result {
+                Ok(result) => result,
+                Err(err) => {
+                    self.mappings.insert_vma(r);
+                    return Err(err);
+                }
+            };
+
+            if let Some(before) = before {
                 self.mappings.insert_vma(before);
             }
-            if let Some(after) = split_result.after {
+            if let Some(after) = after {
                 self.mappings.insert_vma(after);
             }
-
-            let mut r_guard = r.lock();
-            // 如果VMA的保护标志不允许指定的修改，则返回错误
-            if !r_guard.can_have_flags(prot_flags) {
-                drop(r_guard);
-                self.mappings.insert_vma(r.clone());
-                return Err(SystemError::EACCES);
-            }
-            r_guard.set_vm_flags(VmFlags::from(prot_flags));
-
-            let new_flags: EntryFlags<MMArch> = r_guard
-                .flags()
-                .set_execute(prot_flags.contains(ProtFlags::PROT_EXEC))
-                .set_write(prot_flags.contains(ProtFlags::PROT_WRITE));
-
-            r_guard.remap(new_flags, mapper, &mut *flusher)?;
-            drop(r_guard);
             self.mappings.insert_vma(r);
         }
 
+        // Unified shootdown. mprotect does not free physical pages; tlb.finish() mainly flushes the TLB.
+        tlb.finish();
         return Ok(());
     }
 
@@ -1163,14 +1299,8 @@ impl InnerAddressSpace {
         page_count: PageFrameCount,
         behavior: MadvFlags,
     ) -> Result<(), SystemError> {
-        let (mut active, mut inactive);
-        let flusher = if self.is_current() {
-            active = PageFlushAll::new();
-            &mut active as &mut dyn Flusher<MMArch>
-        } else {
-            inactive = InactiveFlusher::new();
-            &mut inactive as &mut dyn Flusher<MMArch>
-        };
+        let mm = self.outer_addr_space().ok_or(SystemError::EFAULT)?;
+        let mut tlb = MmuGather::gather(&mm);
 
         let mapper = &mut self.user_mapper.utable;
 
@@ -1182,19 +1312,23 @@ impl InnerAddressSpace {
             let r = self.mappings.remove_vma(&r).unwrap();
 
             let intersection = r.lock().region().intersect(&region).unwrap();
-            let split_result = r
-                .extract(intersection, mapper)
-                .expect("Failed to extract VMA");
-
-            if let Some(before) = split_result.prev {
+            let (before, after) = {
+                let _pt_edit = mm.page_table_edit();
+                let split_result = r
+                    .extract(intersection, mapper)
+                    .expect("Failed to extract VMA");
+                r.do_madvise(behavior, mapper, &mut tlb)?;
+                (split_result.prev, split_result.after)
+            };
+            if let Some(before) = before {
                 self.mappings.insert_vma(before);
             }
-            if let Some(after) = split_result.after {
+            if let Some(after) = after {
                 self.mappings.insert_vma(after);
             }
-            r.do_madvise(behavior, mapper, &mut *flusher)?;
             self.mappings.insert_vma(r);
         }
+        tlb.finish();
         Ok(())
     }
 
@@ -1210,10 +1344,13 @@ impl InnerAddressSpace {
             }
         }
 
-        let mut flusher: PageFlushAll<MMArch> = PageFlushAll::new();
+        let mm = self.outer_addr_space().ok_or(SystemError::EFAULT)?;
+        let _pt_edit = mm.page_table_edit();
+        let mut tlb = MmuGather::gather(&mm);
         for vma in targets {
-            vma.unmap(&mut self.user_mapper.utable, &mut flusher);
+            vma.unmap(&mut self.user_mapper.utable, &mut tlb);
         }
+        tlb.finish();
         Ok(())
     }
 
@@ -1236,12 +1373,28 @@ impl InnerAddressSpace {
 
     /// 取消用户空间内的所有映射
     pub unsafe fn unmap_all(&mut self) {
-        let mut flusher: PageFlushAll<MMArch> = PageFlushAll::new();
+        // 两种调用场景：
+        // 1) 显式调用（仍有 `Arc<AddressSpace>` 外部引用）：`outer.upgrade()` 返回 `Some`，
+        //    走正常的 mm-aware shootdown + 释放路径。
+        // 2) `Drop for InnerAddressSpace`：此时 `Arc<AddressSpace>` 正处于 `drop_slow`，
+        //    strong-count 已经是 0，`Weak::upgrade()` 必然返回 `None`。此路径下我们已经在
+        //    exit/switch_process 里清理过 `active_cpus`，不会有任何 CPU 还持有这个 mm 的 TLB，
+        //    因此使用 `MmuGather::gather_teardown()`，跳过跨核 shootdown，只把 PTE 拆掉、
+        //    按 INV-3 的 "先 flush，后释放" 顺序释放物理页。
+        let mm_arc = self.outer_addr_space();
+        let _pt_edit = mm_arc.as_ref().map(|mm| mm.page_table_edit());
+        let mut tlb = match mm_arc.as_ref() {
+            Some(mm) => MmuGather::gather(mm),
+            None => MmuGather::gather_teardown(),
+        };
+        // Full-mm flush (fullmm); no need to accumulate ranges.
+        tlb.set_fullmm();
         for vma in self.mappings.iter_vmas() {
             if vma.mapped() {
-                vma.unmap(&mut self.user_mapper.utable, &mut flusher);
+                vma.unmap(&mut self.user_mapper.utable, &mut tlb);
             }
         }
+        tlb.finish();
     }
 
     /// 设置进程的堆的内存空间
@@ -1426,6 +1579,8 @@ pub struct UserMappings {
     vmas: HashSet<Arc<LockedVMA>>,
     /// 当前用户空间的VMA空洞
     vm_holes: BTreeMap<VirtAddr, usize>,
+    /// 所属地址空间，用于在 VMA 生命周期变更时回填反向引用
+    owner: Weak<AddressSpace>,
 }
 
 impl UserMappings {
@@ -1434,7 +1589,39 @@ impl UserMappings {
             vmas: HashSet::new(),
             vm_holes: core::iter::once((VirtAddr::new(0), MMArch::USER_END_VADDR.data()))
                 .collect::<BTreeMap<_, _>>(),
+            owner: Weak::new(),
         };
+    }
+
+    pub fn set_owner(&mut self, owner: Weak<AddressSpace>) {
+        self.owner = owner;
+        for vma in self.vmas.iter() {
+            self.attach_vma(vma);
+        }
+    }
+
+    fn attach_vma(&self, vma: &Arc<LockedVMA>) {
+        let vm_file = {
+            let mut guard = vma.lock();
+            if guard.user_address_space.is_none() {
+                guard.user_address_space = Some(self.owner.clone());
+            }
+            guard.vm_file.clone()
+        };
+        if let Some(file) = vm_file {
+            if let Some(page_cache) = file.inode().page_cache() {
+                page_cache.register_file_vma(vma);
+            }
+        }
+    }
+
+    fn detach_vma(&self, vma: &Arc<LockedVMA>) {
+        let vm_file = { vma.lock().vm_file.clone() };
+        if let Some(file) = vm_file {
+            if let Some(page_cache) = file.inode().page_cache() {
+                page_cache.unregister_file_vma(vma.id());
+            }
+        }
     }
 
     /// 判断当前进程的VMA内，是否有包含指定的虚拟地址的VMA。
@@ -1573,6 +1760,7 @@ impl UserMappings {
         assert!(self.conflicts(region).next().is_none());
         self.reserve_hole(&region);
 
+        self.attach_vma(&vma);
         self.vmas.insert(vma);
     }
 
@@ -1597,6 +1785,7 @@ impl UserMappings {
             .drain_filter(|vma| vma.lock().region == *region)
             .next()?;
         self.unreserve_hole(region);
+        self.detach_vma(&vma);
 
         return Some(vma);
     }
@@ -1685,7 +1874,11 @@ impl LockedVMA {
         return Ok(());
     }
 
-    pub fn unmap(&self, mapper: &mut PageMapper, mut flusher: impl Flusher<MMArch>) {
+    /// Unmap the entire VMA, stashing physical pages pending release into `tlb` and accumulating the TLB flush range.
+    ///
+    /// The caller must complete all PTE clears before calling `tlb.finish()`, which uniformly
+    /// performs cross-core TLB shootdown first and then frees physical pages (INV-3).
+    pub fn unmap(&self, mapper: &mut PageMapper, tlb: &mut MmuGather<'_>) {
         // todo: 如果当前vma与文件相关，完善文件相关的逻辑
         let mut self_guard = self.lock();
 
@@ -1720,21 +1913,34 @@ impl LockedVMA {
             if mapper.translate(page.virt_address()).is_none() {
                 continue;
             }
-            let (paddr, _, flush) = unsafe { mapper.unmap_phys(page.virt_address(), true) }
-                .expect("Failed to unmap, beacuse of some page is not mapped");
+            let (paddr, _, flush, freed_tables) =
+                unsafe { mapper.unmap_phys_with_freed_tables(page.virt_address(), true) }
+                    .expect("Failed to unmap, beacuse of some page is not mapped");
 
             // 从anon_vma中删除当前VMA
-            let page = page_manager_guard.get_unwrap(&paddr);
-            let mut page_guard = page.write();
-            page_guard.remove_vma(self);
+            let page_arc = page_manager_guard.get_unwrap(&paddr);
+            let can_dealloc = {
+                let mut page_guard = page_arc.write();
+                page_guard.remove_vma(self);
+                // The physical page's VMA list length is 0 and it is not marked as non-reclaimable, so it can be freed.
+                // TODO: LRU-based physical page reclamation in the future
+                page_guard.can_deallocate()
+            };
 
-            // 如果物理页的vma链表长度为0并且未标记为不可回收，则释放物理页.
-            // TODO 后续由lru释放物理页面
-            if page_guard.can_deallocate() {
-                page_manager_guard.remove_page(&paddr);
+            if can_dealloc {
+                // Remove this `Arc<Page>` from page_manager, deferring the drop until after TLB shootdown.
+                // This guarantees INV-3: other cores can no longer reach the returned-to-buddy physical page via stale TLB.
+                if let Some(p) = page_manager_guard.remove_page(&paddr) {
+                    tlb.stash_page(p);
+                }
             }
 
-            flusher.consume(flush);
+            // Local PTE cleared; no immediate invlpg. Final TLB invalidation is performed uniformly by MmuGather.
+            unsafe { flush.ignore() };
+            tlb.accumulate_range(page.virt_address());
+            if freed_tables {
+                tlb.note_pt_table_freed();
+            }
         }
         self_guard.mapped = false;
 
@@ -1745,6 +1951,46 @@ impl LockedVMA {
                 .contains(VmFlags::VM_SHARED | VmFlags::VM_WRITE)
         {
             crate::mm::page::PageReclaimer::wakeup_claim_thread();
+        }
+    }
+
+    /// Unmap an intersecting sub-range of this VMA while keeping the VMA metadata itself alive.
+    ///
+    /// This is used by file truncate/invalidate paths: future access should fault back in against
+    /// the updated file size/content instead of tearing down the VMA object.
+    pub fn unmap_range(&self, region: VirtRegion, mapper: &PageMapper, tlb: &mut MmuGather<'_>) {
+        let self_guard = self.lock();
+        let Some(intersection) = self_guard.region().intersect(&region) else {
+            return;
+        };
+        drop(self_guard);
+
+        let mut page_manager_guard = page_manager_lock();
+        for page in intersection.pages() {
+            if mapper.translate(page.virt_address()).is_none() {
+                continue;
+            }
+
+            let Some((paddr, _, flush)) =
+                (unsafe { mapper.unmap_phys_preserve_tables(page.virt_address()) })
+            else {
+                continue;
+            };
+
+            let page_arc = page_manager_guard.get_unwrap(&paddr);
+            let can_dealloc = {
+                let mut page_guard = page_arc.write();
+                page_guard.remove_vma(self);
+                page_guard.can_deallocate()
+            };
+            if can_dealloc {
+                if let Some(p) = page_manager_guard.remove_page(&paddr) {
+                    tlb.stash_page(p);
+                }
+            }
+
+            unsafe { flush.ignore() };
+            tlb.accumulate_range(page.virt_address());
         }
     }
 
@@ -1916,6 +2162,32 @@ impl LockedVMA {
         //TODO: 实现巨页映射判断逻辑，目前不支持巨页映射
         false
     }
+
+    pub fn file_pgoff_intersection(
+        &self,
+        start_page_index: usize,
+        end_page_index_exclusive: Option<usize>,
+    ) -> Option<VirtRegion> {
+        let guard = self.lock();
+        let vma_pgoff = guard.backing_page_offset()?;
+        let vma_pages = guard.region().size() >> MMArch::PAGE_SHIFT;
+        let vma_end = vma_pgoff.saturating_add(vma_pages);
+        let intersect_start = core::cmp::max(start_page_index, vma_pgoff);
+        let intersect_end = match end_page_index_exclusive {
+            Some(end) => core::cmp::min(end, vma_end),
+            None => vma_end,
+        };
+        if intersect_start >= intersect_end {
+            return None;
+        }
+
+        let offset_pages = intersect_start - vma_pgoff;
+        let start = guard.region().start() + (offset_pages << MMArch::PAGE_SHIFT);
+        Some(VirtRegion::new(
+            start,
+            (intersect_end - intersect_start) << MMArch::PAGE_SHIFT,
+        ))
+    }
 }
 
 impl Drop for LockedVMA {
@@ -1931,6 +2203,8 @@ pub struct VMASplitResult {
     pub middle: Arc<LockedVMA>,
     pub after: Option<Arc<LockedVMA>>,
 }
+
+type VmaSplitSides = (Option<Arc<LockedVMA>>, Option<Arc<LockedVMA>>);
 
 impl VMASplitResult {
     pub fn new(
@@ -2186,11 +2460,16 @@ impl VMA {
         );
     }
 
+    /// Modify the flags of all existing PTEs covered by this VMA (without changing physical page ownership).
+    ///
+    /// Does not immediately perform TLB invalidation; the range is accumulated into the passed `MmuGather`,
+    /// and the upper layer performs unified shootdown after all modifications are complete
+    /// (TLB first, then free/modify, guaranteeing INV-3).
     pub fn remap(
         &mut self,
         flags: EntryFlags<MMArch>,
         mapper: &mut PageMapper,
-        mut flusher: impl Flusher<MMArch>,
+        tlb: &mut MmuGather<'_>,
     ) -> Result<(), SystemError> {
         for page in self.region.pages() {
             // debug!("remap page {:?}", page.virt_address());
@@ -2200,7 +2479,8 @@ impl VMA {
                         .remap(page.virt_address(), flags)
                         .expect("Failed to remap")
                 };
-                flusher.consume(r);
+                unsafe { r.ignore() };
+                tlb.accumulate_range(page.virt_address());
             }
             // debug!("consume page {:?}", page.virt_address());
             // debug!("remap page {:?} done", page.virt_address());

@@ -101,10 +101,11 @@ impl ArchIpiTarget {
 
     #[inline(always)]
     fn cpu_id_to_apic_id(cpu_id: ProcessorId) -> x86::apic::ApicId {
+        let apic_id = SMP_BOOT_DATA.phys_id(cpu_id.data() as usize) as u32;
         if CurrentApic.x2apic_enabled() {
-            x86::apic::ApicId::X2Apic(cpu_id.data())
+            x86::apic::ApicId::X2Apic(apic_id)
         } else {
-            x86::apic::ApicId::XApic(cpu_id.data() as u8)
+            x86::apic::ApicId::XApic(apic_id as u8)
         }
     }
 }
@@ -157,33 +158,70 @@ pub fn send_ipi(kind: IpiKind, target: IpiTarget) {
     CurrentApic.write_icr(icr);
 }
 
-/// 发送smp初始化IPI
-pub fn ipi_send_smp_init() {
-    let target = ArchIpiTarget::Other;
+/// 向目标CPU发送smp初始化IPI
+pub fn ipi_send_smp_init(target_cpu: ProcessorId) -> Result<(), SystemError> {
+    if target_cpu.data() as usize >= SMP_BOOT_DATA.cpu_count() {
+        return Err(SystemError::EINVAL);
+    }
+    let target: ArchIpiTarget = IpiTarget::Specified(target_cpu).into();
     let icr = if CurrentApic.x2apic_enabled() {
         x86::apic::Icr::for_x2apic(
             0,
             target.into(),
-            x86::apic::DestinationShorthand::AllExcludingSelf,
+            x86::apic::DestinationShorthand::NoShorthand,
             x86::apic::DeliveryMode::Init,
             x86::apic::DestinationMode::Physical,
             x86::apic::DeliveryStatus::Idle,
-            x86::apic::Level::Deassert,
-            x86::apic::TriggerMode::Edge,
+            x86::apic::Level::Assert,
+            x86::apic::TriggerMode::Level,
         )
     } else {
         x86::apic::Icr::for_xapic(
             0,
             target.into(),
-            x86::apic::DestinationShorthand::AllExcludingSelf,
+            x86::apic::DestinationShorthand::NoShorthand,
+            x86::apic::DeliveryMode::Init,
+            x86::apic::DestinationMode::Physical,
+            x86::apic::DeliveryStatus::Idle,
+            x86::apic::Level::Assert,
+            x86::apic::TriggerMode::Level,
+        )
+    };
+    CurrentApic.write_icr(icr);
+    return Ok(());
+}
+
+/// 向目标CPU发送smp初始化IPI的deassert阶段
+pub fn ipi_send_smp_init_deassert(target_cpu: ProcessorId) -> Result<(), SystemError> {
+    if target_cpu.data() as usize >= SMP_BOOT_DATA.cpu_count() {
+        return Err(SystemError::EINVAL);
+    }
+    let target: ArchIpiTarget = IpiTarget::Specified(target_cpu).into();
+    let icr = if CurrentApic.x2apic_enabled() {
+        x86::apic::Icr::for_x2apic(
+            0,
+            target.into(),
+            x86::apic::DestinationShorthand::NoShorthand,
             x86::apic::DeliveryMode::Init,
             x86::apic::DestinationMode::Physical,
             x86::apic::DeliveryStatus::Idle,
             x86::apic::Level::Deassert,
-            x86::apic::TriggerMode::Edge,
+            x86::apic::TriggerMode::Level,
+        )
+    } else {
+        x86::apic::Icr::for_xapic(
+            0,
+            target.into(),
+            x86::apic::DestinationShorthand::NoShorthand,
+            x86::apic::DeliveryMode::Init,
+            x86::apic::DestinationMode::Physical,
+            x86::apic::DeliveryStatus::Idle,
+            x86::apic::Level::Deassert,
+            x86::apic::TriggerMode::Level,
         )
     };
     CurrentApic.write_icr(icr);
+    return Ok(());
 }
 
 /// 发送smp启动IPI
@@ -205,7 +243,7 @@ pub fn ipi_send_smp_startup(target_cpu: ProcessorId) -> Result<(), SystemError> 
             x86::apic::DeliveryMode::StartUp,
             x86::apic::DestinationMode::Physical,
             x86::apic::DeliveryStatus::Idle,
-            x86::apic::Level::Deassert,
+            x86::apic::Level::Assert,
             x86::apic::TriggerMode::Edge,
         )
     } else {
@@ -216,7 +254,7 @@ pub fn ipi_send_smp_startup(target_cpu: ProcessorId) -> Result<(), SystemError> 
             x86::apic::DeliveryMode::StartUp,
             x86::apic::DestinationMode::Physical,
             x86::apic::DeliveryStatus::Idle,
-            x86::apic::Level::Deassert,
+            x86::apic::Level::Assert,
             x86::apic::TriggerMode::Edge,
         )
     };

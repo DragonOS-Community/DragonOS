@@ -88,7 +88,7 @@ unsafe extern "sysv64" fn smp_init_switch_stack(st: &ApStartStackInfo) -> ! {
 unsafe extern "C" fn smp_ap_start_stage1() -> ! {
     let id = smp_get_processor_id();
     debug!("smp_ap_start_stage1: id: {}\n", id.data());
-    X86_64MMArch::init_xd_rsvd();
+    X86_64MMArch::init_current_cpu_nxe();
 
     let current_idle = ProcessManager::idle_pcb()[smp_get_processor_id().data() as usize].clone();
 

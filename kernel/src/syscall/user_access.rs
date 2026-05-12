@@ -34,10 +34,7 @@ use super::{user_buffer::UserBuffer, SystemError};
 ///
 /// - `EFAULT`: Destination address is invalid
 pub unsafe fn clear_user_protected(dest: VirtAddr, len: usize) -> Result<usize, SystemError> {
-    let mut writer = UserBufferWriter::new(dest.data() as *mut u8, len, true)?;
-
-    // Clear user space data
-    writer.buffer_protected(0)?.clear()?;
+    clear_user_cow_protected(dest, len)?;
     compiler_fence(Ordering::SeqCst);
     return Ok(len);
 }
@@ -64,6 +61,24 @@ pub unsafe fn clear_user(dest: VirtAddr, len: usize) -> Result<usize, SystemErro
     p.write_bytes(0, len);
     compiler_fence(Ordering::SeqCst);
     return Ok(len);
+}
+
+/// 使用异常表保护清零用户空间，同时保持 CR0.WP，使只读/COW 用户页仍会触发正常缺页处理。
+pub unsafe fn clear_user_cow_protected(dest: VirtAddr, len: usize) -> Result<usize, SystemError> {
+    if len == 0 {
+        return Ok(0);
+    }
+
+    if user_accessible_len(dest, len, true) < len {
+        return Err(SystemError::EFAULT);
+    }
+
+    let result = MMArch::memset_with_exception_table(dest.data() as *mut u8, 0, len);
+    if result == 0 {
+        Ok(len)
+    } else {
+        Err(SystemError::EFAULT)
+    }
 }
 
 pub unsafe fn copy_to_user(dest: VirtAddr, src: &[u8]) -> Result<usize, SystemError> {
@@ -1009,6 +1024,45 @@ pub unsafe fn copy_to_user_protected(dest: VirtAddr, src: &[u8]) -> Result<usize
         0 => Ok(len),
         _ => Err(SystemError::EFAULT),
     }
+}
+
+/// 使用异常表保护写入用户空间，同时保持 CR0.WP，使只读/COW 用户页仍会触发正常缺页处理。
+///
+/// 这条路径用于需要严格遵守 Linux `put_user()` COW 语义的写回场景，
+/// 例如 `CLONE_PARENT_SETTID` 和 `CLONE_CHILD_SETTID`。
+pub unsafe fn copy_to_user_cow_protected(dest: VirtAddr, src: &[u8]) -> Result<usize, SystemError> {
+    let len = src.len();
+    if len == 0 {
+        return Ok(0);
+    }
+
+    let dst_ptr = dest.data() as *mut u8;
+    let src_ptr = src.as_ptr();
+
+    if user_accessible_len(dest, len, true) < len {
+        return Err(SystemError::EFAULT);
+    }
+
+    let result = MMArch::copy_with_exception_table(dst_ptr, src_ptr, len);
+
+    match result {
+        0 => Ok(len),
+        _ => Err(SystemError::EFAULT),
+    }
+}
+
+/// 使用异常表保护将单个 `Copy` 值写入用户空间。
+///
+/// 语义上对齐 Linux `put_user()`：
+/// 仅基于 VMA 做可写性预检查，真正写入阶段允许通过缺页处理补齐 COW/懒分配页；
+/// 若最终仍不可访问，则返回 `EFAULT`。
+pub unsafe fn write_one_to_user_protected<T: Copy>(
+    dest: VirtAddr,
+    value: &T,
+) -> Result<(), SystemError> {
+    let src =
+        core::slice::from_raw_parts((value as *const T).cast::<u8>(), core::mem::size_of::<T>());
+    copy_to_user_cow_protected(dest, src).map(|_| ())
 }
 
 /// Compute the contiguous accessible length starting at `addr`.

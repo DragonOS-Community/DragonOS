@@ -8,7 +8,7 @@ use crate::arch::syscall::nr::SYS_SCHED_GETAFFINITY;
 use crate::process::{ProcessManager, RawPid};
 use crate::sched::syscall::util::has_sched_permission;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
-use crate::syscall::user_access::UserBufferWriter;
+use crate::syscall::user_access::copy_to_user_protected;
 
 pub struct SysSchedGetaffinity;
 
@@ -17,7 +17,7 @@ impl Syscall for SysSchedGetaffinity {
         3
     }
 
-    fn handle(&self, args: &[usize], frame: &mut TrapFrame) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let pid = args[0] as i32;
         let size = args[1];
         let set_vaddr = args[2];
@@ -42,10 +42,7 @@ impl Syscall for SysSchedGetaffinity {
         let src = unsafe { mask.inner().as_bytes() };
         let copy_len = core::cmp::min(size, src.len());
 
-        let mut user_buffer_writer =
-            UserBufferWriter::new(set_vaddr as *mut u8, size, frame.is_from_user())?;
-        let set: &mut [u8] = user_buffer_writer.buffer(0)?;
-        set[..copy_len].copy_from_slice(&src[..copy_len]);
+        unsafe { copy_to_user_protected(crate::mm::VirtAddr::new(set_vaddr), &src[..copy_len])? };
 
         Ok(copy_len)
     }

@@ -525,22 +525,25 @@ const fn protection_map() -> [EntryFlags<MMArch>; 16] {
 }
 
 impl X86_64MMArch {
-    /// Initialize the per-CPU XD/NX capability state.
-    ///
-    /// EFER.NXE is an MSR bit, so every CPU that can run user tasks must enable it before
-    /// using page tables that contain `ENTRY_FLAG_NO_EXEC`. Otherwise hardware treats bit 63
-    /// in PTEs as reserved and raises an RSVD page fault.
-    pub(crate) fn init_xd_rsvd() {
-        // 读取并确保开启 NXE，使用户态 PROT_EXEC 正确受 NX 约束。
+    pub(crate) fn init_current_cpu_nxe() -> bool {
+        // EFER 是每 CPU 状态。BSP 在 mm 初始化时会开启 NXE，AP 也必须分别开启，
+        // 否则访问带 NX 位的用户页会触发 #PF.RSVD。
         let mut efer = x86_64::registers::model_specific::Efer::read();
         if !efer.contains(EferFlags::NO_EXECUTE_ENABLE) {
-            debug!("Enabling EFER.NXE for NX support");
+            debug!("Enabling EFER.NXE on current CPU");
             efer.insert(EferFlags::NO_EXECUTE_ENABLE);
             unsafe { x86_64::registers::model_specific::Efer::write(efer) };
         }
-        // 若硬件仍不支持（写入无效），标记为保留，否则可用
-        let efer_after = x86_64::registers::model_specific::Efer::read();
-        let xd_reserved = !efer_after.contains(EferFlags::NO_EXECUTE_ENABLE);
+
+        x86_64::registers::model_specific::Efer::read().contains(EferFlags::NO_EXECUTE_ENABLE)
+    }
+
+    /// 初始化当前 CPU 的 XD/NX 能力状态。
+    ///
+    /// BSP 在页表策略初始化前记录全局 XD_RESERVED；AP 只需要分别打开本地 EFER.NXE。
+    pub(crate) fn init_xd_rsvd() {
+        // BSP 在初始化页表策略前探测并开启 NXE，得到系统是否支持 NX 的结论。
+        let xd_reserved = !Self::init_current_cpu_nxe();
         XD_RESERVED.store(xd_reserved, Ordering::Relaxed);
         compiler_fence(Ordering::SeqCst);
     }

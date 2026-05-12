@@ -8,7 +8,7 @@ use crate::mm::{MemoryManagementArch, VirtAddr};
 use crate::process::fork::{CloneFlags, KernelCloneArgs, MAX_PID_NS_LEVEL};
 use crate::process::{KernelStack, ProcessControlBlock, ProcessManager};
 use crate::sched::completion::Completion;
-use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
+use crate::syscall::user_access::{write_one_to_user_protected, UserBufferReader};
 use alloc::{string::ToString, sync::Arc};
 use system_error::SystemError;
 
@@ -62,6 +62,7 @@ pub fn do_clone(
     clone_args.normalize_exit_signal();
     clone_args.verify()?;
     let flags = clone_args.flags;
+    let parent_tid = clone_args.parent_tid;
 
     let vfork = Arc::new(Completion::new());
 
@@ -77,18 +78,17 @@ pub fn do_clone(
     // 克隆pcb
     ProcessManager::copy_process(&current_pcb, &pcb, clone_args, frame)?;
 
+    if flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
+        // 对齐 Linux：fork 已成功，不因 parent_tid 写回失败而撤销子任务。
+        let child_tid = pcb.pid().pid_vnr().data() as i32;
+        let _ = unsafe { write_one_to_user_protected(parent_tid, &child_tid) };
+    }
+
     // 新的 ProcFS 是动态的，进程目录会在访问时按需创建
     // 不再需要显式注册进程
 
     if flags.contains(CloneFlags::CLONE_VFORK) {
         pcb.thread.write_irqsave().vfork_done = Some(vfork.clone());
-    }
-
-    if pcb.thread.read_irqsave().set_child_tid.is_some() {
-        let addr = pcb.thread.read_irqsave().set_child_tid.unwrap();
-        let mut writer =
-            UserBufferWriter::new(addr.as_ptr::<i32>(), core::mem::size_of::<i32>(), true)?;
-        writer.copy_one_to_user(&(pcb.raw_pid().data() as i32), 0)?;
     }
 
     ProcessManager::wakeup_new_task(&pcb).unwrap_or_else(|e| {

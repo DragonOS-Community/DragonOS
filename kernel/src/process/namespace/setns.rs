@@ -9,6 +9,46 @@ use crate::{
 
 use super::nsproxy::{switch_task_namespaces, NsProxy};
 
+fn can_setns_cgroup(target: &crate::process::namespace::cgroup_namespace::CgroupNamespace) -> bool {
+    let current = ProcessManager::current_pcb();
+    let cred = current.cred();
+    if !cred.has_cap_sys_admin() {
+        return false;
+    }
+
+    let current_user_ns = cred.user_ns.clone();
+    let target_user_ns = target.user_ns().clone();
+    current_user_ns.is_ancestor_of(&target_user_ns)
+}
+
+fn flags_match(flags: CloneFlags, expected: CloneFlags) -> bool {
+    flags.is_empty() || flags == expected
+}
+
+fn can_setns_target_userns(
+    target_user_ns: &Arc<crate::process::namespace::user_namespace::UserNamespace>,
+) -> bool {
+    let current = ProcessManager::current_pcb();
+    let cred = current.cred();
+    cred.has_cap_sys_admin() && cred.user_ns.is_ancestor_of(target_user_ns)
+}
+
+fn nsfd_target_userns(
+    ns_fd: &NamespaceFilePrivateData,
+) -> Option<Arc<crate::process::namespace::user_namespace::UserNamespace>> {
+    match ns_fd {
+        NamespaceFilePrivateData::Ipc(ns) => Some(ns.user_ns.clone()),
+        NamespaceFilePrivateData::Uts(ns) => Some(ns.user_ns().clone()),
+        NamespaceFilePrivateData::Mnt(ns) => Some(ns.user_ns().clone()),
+        NamespaceFilePrivateData::Net(ns) => Some(ns.user_ns().clone()),
+        NamespaceFilePrivateData::Pid(ns) | NamespaceFilePrivateData::PidForChildren(ns) => {
+            Some(ns.user_ns().clone())
+        }
+        NamespaceFilePrivateData::Cgroup(ns) => Some(ns.user_ns().clone()),
+        NamespaceFilePrivateData::User(_) => None,
+    }
+}
+
 /// 内核态 setns 实现（当前仅支持 pidfd + namespace flag 形式）
 ///
 /// - `fd`：必须是通过 `pidfd_open` 或 `clone(CLONE_PIDFD)` 获得的 pidfd
@@ -68,8 +108,9 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
 
         let target_pid = RawPid::new(pid as usize);
         let target = ProcessManager::find_task_by_vpid(target_pid).ok_or(SystemError::ESRCH)?;
-
-        // TODO: 权限模型（ptrace_may_access / user_ns 能力检查）
+        if !can_setns_target_userns(&target.cred().user_ns) {
+            return Err(SystemError::EPERM);
+        }
 
         // 基于当前任务的 NsProxy 构造新的代理，并按 flag 覆盖为目标的各命名空间
         let cur_nsproxy = current.nsproxy();
@@ -94,6 +135,9 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
             new_inner.pid_ns_for_children = target_nsproxy.pid_ns_for_children.clone();
         }
         if flags.contains(CloneFlags::CLONE_NEWCGROUP) {
+            if !can_setns_cgroup(&target_nsproxy.cgroup_ns) {
+                return Err(SystemError::EPERM);
+            }
             new_inner.cgroup_ns = target_nsproxy.cgroup_ns.clone();
         }
 
@@ -110,34 +154,39 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
 
     // 如果 flags 为空，则允许 “按 fd 类型推断”；否则必须与 fd 的 namespace 类型匹配。
     let mut new_inner: NsProxy = current.nsproxy().clone_inner();
+    if let Some(target_user_ns) = nsfd_target_userns(&ns_fd) {
+        if !can_setns_target_userns(&target_user_ns) {
+            return Err(SystemError::EPERM);
+        }
+    }
 
     match ns_fd {
         NamespaceFilePrivateData::Ipc(ns) => {
-            if !flags.is_empty() && !flags.contains(CloneFlags::CLONE_NEWIPC) {
+            if !flags_match(flags, CloneFlags::CLONE_NEWIPC) {
                 return Err(SystemError::EINVAL);
             }
             new_inner.ipc_ns = ns;
         }
         NamespaceFilePrivateData::Uts(ns) => {
-            if !flags.is_empty() && !flags.contains(CloneFlags::CLONE_NEWUTS) {
+            if !flags_match(flags, CloneFlags::CLONE_NEWUTS) {
                 return Err(SystemError::EINVAL);
             }
             new_inner.uts_ns = ns;
         }
         NamespaceFilePrivateData::Mnt(ns) => {
-            if !flags.is_empty() && !flags.contains(CloneFlags::CLONE_NEWNS) {
+            if !flags_match(flags, CloneFlags::CLONE_NEWNS) {
                 return Err(SystemError::EINVAL);
             }
             new_inner.mnt_ns = ns;
         }
         NamespaceFilePrivateData::Net(ns) => {
-            if !flags.is_empty() && !flags.contains(CloneFlags::CLONE_NEWNET) {
+            if !flags_match(flags, CloneFlags::CLONE_NEWNET) {
                 return Err(SystemError::EINVAL);
             }
             new_inner.net_ns = ns;
         }
         NamespaceFilePrivateData::Pid(ns) | NamespaceFilePrivateData::PidForChildren(ns) => {
-            if !flags.is_empty() && !flags.contains(CloneFlags::CLONE_NEWPID) {
+            if !flags_match(flags, CloneFlags::CLONE_NEWPID) {
                 return Err(SystemError::EINVAL);
             }
             // 仅影响子进程 PID namespace，保持与 Linux 语义一致
@@ -148,8 +197,11 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
             return Err(SystemError::EINVAL);
         }
         NamespaceFilePrivateData::Cgroup(ns) => {
-            if !flags.is_empty() && !flags.contains(CloneFlags::CLONE_NEWCGROUP) {
+            if !flags_match(flags, CloneFlags::CLONE_NEWCGROUP) {
                 return Err(SystemError::EINVAL);
+            }
+            if !can_setns_cgroup(&ns) {
+                return Err(SystemError::EPERM);
             }
             new_inner.cgroup_ns = ns;
         }

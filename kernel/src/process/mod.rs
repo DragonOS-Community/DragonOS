@@ -69,7 +69,7 @@ use crate::{
         cpu::{AtomicProcessorId, ProcessorId},
         kick_cpu,
     },
-    syscall::user_access::{clear_user_protected, UserBufferWriter},
+    syscall::user_access::{clear_user_protected, write_one_to_user_protected},
 };
 use timer::AlarmTimer;
 
@@ -981,11 +981,8 @@ impl ProcessManager {
         if let Some(addr) = set_child_tid {
             // 对齐 Linux schedule_tail 语义：子任务首次运行时 best-effort 写入 tid，
             // 失败不影响线程继续执行。
-            if let Ok(mut writer) =
-                UserBufferWriter::new(addr.as_ptr::<i32>(), core::mem::size_of::<i32>(), true)
-            {
-                let _ = writer.copy_one_to_user_checked(&(next_pcb.raw_pid().data() as i32), 0);
-            }
+            let child_tid = next_pcb.task_pid_vnr().data() as i32;
+            let _ = unsafe { write_one_to_user_protected(addr, &child_tid) };
         }
     }
 

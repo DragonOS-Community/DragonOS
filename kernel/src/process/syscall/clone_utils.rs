@@ -8,7 +8,7 @@ use crate::mm::{MemoryManagementArch, VirtAddr};
 use crate::process::fork::{CloneFlags, KernelCloneArgs, MAX_PID_NS_LEVEL};
 use crate::process::{KernelStack, ProcessControlBlock, ProcessManager};
 use crate::sched::{completion::Completion, sched_set_new_task_cpu};
-use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
+use crate::syscall::user_access::{write_one_to_user_protected, UserBufferReader};
 use alloc::{string::ToString, sync::Arc};
 use system_error::SystemError;
 
@@ -80,13 +80,8 @@ pub fn do_clone(
 
     if flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
         // 对齐 Linux：fork 已成功，不因 parent_tid 写回失败而撤销子任务。
-        if let Ok(mut writer) = UserBufferWriter::new(
-            parent_tid.as_ptr::<i32>(),
-            core::mem::size_of::<i32>(),
-            true,
-        ) {
-            let _ = writer.copy_one_to_user_checked(&(pcb.raw_pid().data() as i32), 0);
-        }
+        let child_tid = pcb.pid().pid_vnr().data() as i32;
+        let _ = unsafe { write_one_to_user_protected(parent_tid, &child_tid) };
     }
 
     // 新的 ProcFS 是动态的，进程目录会在访问时按需创建

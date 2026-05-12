@@ -23,6 +23,7 @@ mod limits;
 mod maps;
 mod mountinfo;
 mod mounts;
+mod mountstats;
 mod ns;
 pub mod stat;
 mod statm;
@@ -38,6 +39,7 @@ use limits::LimitsFile;
 use maps::MapsFileOps;
 use mountinfo::MountInfoFileOps;
 use mounts::PidMountsFileOps;
+use mountstats::MountStatsFileOps;
 use ns::NsDirOps;
 use stat::StatFileOps;
 use statm::StatmFileOps;
@@ -93,6 +95,9 @@ impl PidDirOps {
         }),
         ("mounts", |ops, parent| {
             PidMountsFileOps::new_inode(ops.pid, parent)
+        }),
+        ("mountstats", |ops, parent| {
+            MountStatsFileOps::new_inode(ops.pid, parent)
         }),
         ("ns", |ops, parent| NsDirOps::new_inode(ops.pid, parent)),
         ("stat", |ops, parent| {

@@ -66,6 +66,12 @@ impl<F: FileOps> ProcFile<F> {
 
 /// FileOps trait 定义了 procfs 文件需要实现的操作
 pub trait FileOps: Sync + Send + Sized + Debug {
+    /// 打开文件并初始化私有数据（默认初始化为 procfs 私有数据）。
+    fn open(&self, data: &mut FilePrivateData, _flags: &FileFlags) -> Result<(), SystemError> {
+        *data = FilePrivateData::Procfs(ProcfsFilePrivateData::new());
+        Ok(())
+    }
+
     /// 从文件的指定偏移量读取数据
     ///
     /// # 参数
@@ -161,11 +167,9 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
     fn open(
         &self,
         mut data: MutexGuard<FilePrivateData>,
-        _flags: &FileFlags,
+        flags: &FileFlags,
     ) -> Result<(), SystemError> {
-        // 设置 procfs 私有数据，使得 lseek(SEEK_END) 返回 EINVAL
-        *data = FilePrivateData::Procfs(ProcfsFilePrivateData::new());
-        Ok(())
+        self.inner.open(&mut data, flags)
     }
 
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {

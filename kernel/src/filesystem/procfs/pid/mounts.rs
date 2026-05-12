@@ -6,13 +6,12 @@ use crate::libs::mutex::MutexGuard;
 use crate::{
     filesystem::{
         procfs::{
-            mounts::generate_mounts_content,
+            mount_view::{open_pid_mount_file, read_cached_mount_file, ProcMountRenderKind},
             template::{Builder, FileOps, ProcFileBuilder},
-            utils::proc_read,
         },
-        vfs::{FilePrivateData, IndexNode, InodeMode},
+        vfs::{file::FileFlags, FilePrivateData, IndexNode, InodeMode},
     },
-    process::RawPid,
+    process::{ProcessManager, RawPid},
 };
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
@@ -34,14 +33,26 @@ impl PidMountsFileOps {
 }
 
 impl FileOps for PidMountsFileOps {
+    fn open(&self, data: &mut FilePrivateData, _flags: &FileFlags) -> Result<(), SystemError> {
+        open_pid_mount_file(self.pid, ProcMountRenderKind::Mounts, data)
+    }
+
     fn read_at(
         &self,
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: MutexGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let content = generate_mounts_content();
-        proc_read(offset, len, buf, content.as_bytes())
+        read_cached_mount_file(offset, len, buf, data)
+    }
+
+    fn owner(&self) -> Option<(usize, usize)> {
+        let pcb = ProcessManager::find(self.pid)?;
+        if pcb.is_kthread() {
+            return Some((0, 0));
+        }
+        let cred = pcb.cred();
+        Some((cred.euid.data(), cred.egid.data()))
     }
 }

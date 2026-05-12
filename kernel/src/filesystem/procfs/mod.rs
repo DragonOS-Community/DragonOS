@@ -17,6 +17,7 @@ pub mod kmsg;
 mod kmsg_file;
 mod loadavg;
 mod meminfo;
+mod mount_view;
 mod mounts;
 mod net;
 mod pid;

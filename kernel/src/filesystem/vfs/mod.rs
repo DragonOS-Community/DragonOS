@@ -14,7 +14,11 @@ pub mod utils;
 pub mod vcore;
 
 use alloc::{string::String, sync::Arc, vec::Vec};
-use core::{any::Any, fmt::Debug, fmt::Display, sync::atomic::AtomicUsize};
+use core::{
+    any::Any,
+    fmt::{Debug, Display, Write},
+    sync::atomic::AtomicUsize,
+};
 use derive_builder::Builder;
 use intertrait::CastFromSync;
 use mount::MountFlags;
@@ -1370,6 +1374,46 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     /// Default is `Dac` (local Unix DAC checks).
     fn permission_policy(&self) -> FsPermissionPolicy {
         FsPermissionPolicy::Dac
+    }
+
+    /// Render the device/source field used by procfs mount exports.
+    fn proc_show_devname(&self, mount: &MountFS, out: &mut dyn Write) -> Result<(), SystemError> {
+        if let Some(source) = mount.mount_source() {
+            out.write_str(&source).map_err(|_| SystemError::EINVAL)?;
+        } else {
+            out.write_str(self.name())
+                .map_err(|_| SystemError::EINVAL)?;
+        }
+        Ok(())
+    }
+
+    /// Render extra mount options for `/proc/*/mounts` and `mountinfo`.
+    fn proc_show_mount_options(
+        &self,
+        _mount: &MountFS,
+        _out: &mut dyn Write,
+    ) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    /// Render the mount root field used by `/proc/*/mountinfo`.
+    fn proc_show_mountinfo_root(
+        &self,
+        _mount: &MountFS,
+        out: &mut dyn Write,
+    ) -> Result<(), SystemError> {
+        out.write_char('/').map_err(|_| SystemError::EINVAL)
+    }
+
+    /// Render fs-specific stats for `/proc/*/mountstats`.
+    ///
+    /// Returns `true` if any fs-specific payload was written.
+    fn proc_show_mount_stats(
+        &self,
+        _mount: &MountFS,
+        _out: &mut dyn Write,
+    ) -> Result<bool, SystemError> {
+        Ok(false)
     }
 
     /// Called after a filesystem is successfully unmounted.

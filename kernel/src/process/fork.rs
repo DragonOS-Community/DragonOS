@@ -2,6 +2,8 @@ use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 use crate::arch::MMArch;
+use crate::cgroup::{cgroup_accounting_lock, cgroup_can_fork_in, cgroup_migrate_vet_dst_with_src};
+use crate::filesystem::cgroup2::{cgroup2_check_attach_permissions, cgroup2_inode_to_node};
 use crate::filesystem::vfs::file::File;
 use crate::filesystem::vfs::file::FileFlags;
 use crate::filesystem::vfs::file::FilePrivateData;
@@ -331,30 +333,23 @@ impl ProcessManager {
     ///
     /// ## Panic
     ///
-    /// - 如果当前进程没有用户地址空间，则panic
+    /// - 无
     #[inline(never)]
     fn copy_mm(
         clone_flags: &CloneFlags,
         current_pcb: &Arc<ProcessControlBlock>,
         new_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
-        let old_address_space = current_pcb.basic().user_vm().unwrap_or_else(|| {
-            panic!(
-                "copy_mm: Failed to get address space of current process, current pid: [{:?}]",
-                current_pcb.raw_pid()
-            )
-        });
+        let old_address_space = current_pcb.basic().user_vm().ok_or(SystemError::ENOMEM)?;
 
         if clone_flags.contains(CloneFlags::CLONE_VM) {
             unsafe { new_pcb.basic_mut().set_user_vm(Some(old_address_space)) };
             return Ok(());
         }
-        let new_address_space = old_address_space.write().try_clone().unwrap_or_else(|e| {
-            panic!(
-                "copy_mm: Failed to clone address space of current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.raw_pid(), new_pcb.raw_pid(), e
-            )
-        });
+        let new_address_space = old_address_space
+            .write()
+            .try_clone()
+            .map_err(|_| SystemError::ENOMEM)?;
         unsafe { new_pcb.basic_mut().set_user_vm(Some(new_address_space)) };
         return Ok(());
     }
@@ -529,7 +524,7 @@ impl ProcessManager {
 
         if (clone_flags & (CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_FS)
             == (CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_FS))
-            || (clone_flags & (CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_FS))
+            || (clone_flags & (CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_FS))
                 == (CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_FS)
         {
             return Err(SystemError::EINVAL);
@@ -792,11 +787,7 @@ impl ProcessManager {
                 let mut guard = file.private_data.lock();
                 *guard = FilePrivateData::Pid(PidPrivateData::new(pid));
             }
-            let r = current_pcb
-                .fd_table()
-                .write()
-                .alloc_fd(file, None, true)
-                .map(|fd| fd as usize);
+            let r = current_pcb.fd_table().write().alloc_fd(file, None, true)?;
 
             let mut writer = UserBufferWriter::new(
                 clone_args.parent_tid.data() as *mut i32,
@@ -804,7 +795,7 @@ impl ProcessManager {
                 true,
             )?;
 
-            writer.copy_one_to_user(&(r.unwrap() as i32), 0)?;
+            writer.copy_one_to_user(&(r as i32), 0)?;
         }
 
         let pid = pcb.pid();
@@ -903,24 +894,29 @@ impl ProcessManager {
             }
         }
 
+        let clone_into_cgroup_target = Self::resolve_clone_into_cgroup_target(&clone_args)?;
+
         if pcb.raw_pid() > RawPid(0) {
+            let charge_node = clone_into_cgroup_target
+                .as_ref()
+                .unwrap_or(&pcb.task_cgroup_node())
+                .clone();
+            let src_node = pcb.task_cgroup_node();
+            let _cgroup_guard = cgroup_accounting_lock().lock();
+            cgroup_can_fork_in(&charge_node, 1)?;
+            if let Some(target_node) = clone_into_cgroup_target {
+                cgroup_migrate_vet_dst_with_src(&src_node, &target_node, 1)?;
+                pcb.set_task_cgroup_node_for_fork(target_node);
+            }
+            let cgroup = pcb.task_cgroup_node();
+            cgroup.charge_pids(1);
+            cgroup.add_task(pcb.raw_pid());
             ProcessManager::add_pcb(pcb.clone());
         }
 
         // 设置child_tid，意味着子线程能够知道自己的id
         if clone_flags.contains(CloneFlags::CLONE_CHILD_SETTID) {
             pcb.thread.write_irqsave().set_child_tid = Some(clone_args.child_tid);
-        }
-
-        // 将子进程/线程的id存储在用户态传进的地址中
-        if clone_flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
-            let mut writer = UserBufferWriter::new(
-                clone_args.parent_tid.data() as *mut i32,
-                core::mem::size_of::<i32>(),
-                true,
-            )?;
-
-            writer.copy_one_to_user(&(pcb.raw_pid().0 as i32), 0)?;
         }
 
         // 对于 target_cpu=None，必须在 fork 长路径的末尾才解析默认 CPU，
@@ -949,6 +945,54 @@ impl ProcessManager {
             *guard = Arc::new(new_fs);
         }
         Ok(())
+    }
+
+    fn resolve_clone_into_cgroup_target(
+        clone_args: &KernelCloneArgs,
+    ) -> Result<Option<Arc<crate::cgroup::CgroupNode>>, SystemError> {
+        if !clone_args.flags.contains(CloneFlags::CLONE_INTO_CGROUP) {
+            return Ok(None);
+        }
+
+        if clone_args.cgroup < 0 {
+            return Err(SystemError::EBADF);
+        }
+
+        let current = ProcessManager::current_pcb();
+
+        let fd = clone_args.cgroup;
+        let file = current
+            .fd_table()
+            .read()
+            .get_file_by_fd(fd)
+            .ok_or(SystemError::EBADF)?;
+
+        if file.inode().fs().name() != "cgroup2" {
+            return Err(SystemError::EINVAL);
+        }
+        if file.inode().metadata()?.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+
+        let node = cgroup2_inode_to_node(&file.inode())?;
+        let ns_root = current.nsproxy().cgroup_ns.root_cgroup().clone();
+        if !ns_root.is_ancestor_of(&node) {
+            return Err(SystemError::ENOENT);
+        }
+        let src = current.task_cgroup_node();
+        if !ns_root.is_ancestor_of(&src) {
+            return Err(SystemError::ENOENT);
+        }
+        if Arc::ptr_eq(&src, &node) {
+            return Ok(None);
+        }
+        if clone_args.flags.contains(CloneFlags::CLONE_THREAD) {
+            return Err(SystemError::EINVAL);
+        }
+        cgroup2_check_attach_permissions(file.inode().fs().root_inode(), &src, &node)?;
+        cgroup_migrate_vet_dst_with_src(&src, &node, 1)?;
+
+        Ok(Some(node))
     }
 }
 

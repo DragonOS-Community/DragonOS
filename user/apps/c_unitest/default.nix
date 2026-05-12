@@ -1,4 +1,7 @@
-{ stdenv }:
+{
+  stdenv,
+  target ? "x86_64",
+}:
 
 stdenv.mkDerivation {
   pname = "c-unitest";
@@ -7,7 +10,7 @@ stdenv.mkDerivation {
   src = ./.;
 
   makeFlags = [
-    "ARCH=x86_64"
+    "ARCH=${target}"
     "CROSS_COMPILE=${stdenv.cc.targetPrefix}"
   ];
 

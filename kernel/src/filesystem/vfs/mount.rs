@@ -502,10 +502,11 @@ impl MountFSInode {
             None,
         );
 
+        let mount_path = Arc::new(MountPath::from(self.absolute_path()?));
+
         self.mount_fs
             .add_mount(metadata.inode_id, new_mount_fs.clone())?;
 
-        let mount_path = Arc::new(MountPath::from(self.absolute_path()?));
         ProcessManager::current_mntns().add_mount(
             Some(metadata.inode_id),
             mount_path.clone(),

@@ -68,7 +68,7 @@ in
 
   # Simple C utilities
   (static.callPackage ./about { })
-  (static.callPackage ./c_unitest { })
+  (static.callPackage ./c_unitest { inherit target; })
 
 ]
 ++ lib.optionals (target == "x86_64" && testOpt.syscall.enable) [

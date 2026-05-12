@@ -14,6 +14,7 @@ use crate::{
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
 
+mod cgroup;
 mod cmdline;
 mod exe;
 mod fd;
@@ -28,6 +29,7 @@ mod statm;
 mod status;
 mod task;
 
+use cgroup::CgroupFileOps;
 use cmdline::CmdlineFileOps;
 use exe::ExeSymOps;
 use fd::FdDirOps;
@@ -76,6 +78,9 @@ impl PidDirOps {
     )] = &[
         ("cmdline", |ops, parent| {
             CmdlineFileOps::new_inode(ops.pid, parent)
+        }),
+        ("cgroup", |ops, parent| {
+            CgroupFileOps::new_inode(ops.pid, parent)
         }),
         ("maps", |ops, parent| {
             MapsFileOps::new_inode(ops.pid, parent)

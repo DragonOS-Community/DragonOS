@@ -39,15 +39,29 @@ static mut HPET_INSTANCE: Option<Hpet> = None;
 
 #[inline(always)]
 pub fn hpet_instance() -> &'static Hpet {
-    unsafe { HPET_INSTANCE.as_ref().unwrap() }
+    hpet_instance_opt().expect("hpet_instance(): HPET is not initialized")
+}
+
+#[inline(always)]
+pub fn hpet_instance_opt() -> Option<&'static Hpet> {
+    unsafe { HPET_INSTANCE.as_ref() }
 }
 
 #[inline(always)]
 pub fn is_hpet_enabled() -> bool {
-    if unsafe { HPET_INSTANCE.as_ref().is_some() } {
-        return unsafe { HPET_INSTANCE.as_ref().unwrap().enabled() };
+    if let Some(hpet) = hpet_instance_opt() {
+        return hpet.enabled();
     }
     return false;
+}
+
+#[inline(always)]
+pub fn hpet_disable() {
+    let Some(hpet) = hpet_instance_opt() else {
+        return;
+    };
+
+    hpet.hpet_disable();
 }
 
 pub struct Hpet {
@@ -363,6 +377,8 @@ impl Hpet {
             let (_, regs) = unsafe { self.hpet_regs_mut() };
             unsafe { regs.write_general_config(self.boot_cfg) };
         }
+
+        self.enabled.store(false, Ordering::SeqCst);
     }
 }
 

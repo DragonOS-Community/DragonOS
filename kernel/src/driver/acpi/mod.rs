@@ -236,7 +236,9 @@ impl AcpiHandler for AcpiHandlerImpl {
 pub fn acpi_init() -> Result<(), SystemError> {
     #[cfg(target_arch = "x86_64")]
     {
-        acpi_manager().init()
+        acpi_manager().init()?;
+        reboot::register_acpi_poweroff_handler();
+        Ok(())
     }
 
     #[cfg(not(target_arch = "x86_64"))]

@@ -1,7 +1,7 @@
 use super::{
     driver::{
         apic::ioapic::IOAPIC,
-        hpet::hpet_instance,
+        hpet::hpet_disable,
         rtc::{write_cmos, RTC_LOCK},
     },
     process::stop_this_cpu,
@@ -9,8 +9,9 @@ use super::{
 };
 use crate::{
     arch::{driver::apic::CurrentApic, io::PortIOArch, CurrentPortIOArch, MMArch},
-    driver::acpi::reboot::{acpi_power_off, acpi_reboot},
+    driver::acpi::reboot::{acpi_poweroff_probe_status, acpi_reboot},
     exception::InterruptArch,
+    misc::reboot::do_machine_power_off,
     mm::{MemoryManagementArch, PhysAddr},
     time::{sleep::nanosleep, PosixTimeSpec},
 };
@@ -79,8 +80,15 @@ pub(crate) fn machine_power_off() -> ! {
         machine_shutdown();
     }
 
-    if let Err(e) = acpi_power_off() {
-        log::warn!("ACPI poweroff failed: {:?}, halt instead", e);
+    if let Err(e) = do_machine_power_off() {
+        log::warn!(
+            "ACPI poweroff probe status: {}",
+            acpi_poweroff_probe_status()
+        );
+        log::warn!(
+            "All power-off handlers returned or failed: {:?}, halt instead",
+            e
+        );
     }
 
     stop_this_cpu();
@@ -104,7 +112,7 @@ fn machine_shutdown() {
     CurrentApic.lapic_shutdown();
 
     // 禁用HPET
-    hpet_instance().hpet_disable();
+    hpet_disable();
 }
 
 /// # 功能

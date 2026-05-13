@@ -1530,6 +1530,9 @@ impl InnerAddressSpace {
                 && !committed_flags
                     .intersects(VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_EXEC);
             if inaccessible_locked_vma {
+                // Linux compatibility: mlock(PROT_NONE) reports ENOMEM because
+                // the range cannot be populated, but the VMA remains VM_LOCKED
+                // and accounted in locked_vm (see gVisor MlockTest.ProtNone).
                 populate_error.get_or_insert(SystemError::ENOMEM);
             } else if wants_locked {
                 // TODO: Linux mlock() must fault in/populate missing pages before

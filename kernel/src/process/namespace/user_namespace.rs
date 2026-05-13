@@ -5,7 +5,7 @@ use core::fmt::Debug;
 use core::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
 use crate::libs::spinlock::SpinLock;
-use crate::process::{cred::CAPFlags, Cred, ProcessManager};
+use crate::process::{Cred, ProcessManager};
 use system_error::SystemError;
 
 use super::nsproxy::NsCommon;
@@ -26,10 +26,7 @@ pub struct UidGidExtent {
 pub const UID_GID_MAP_MAX_BASE_EXTENTS: usize = 5;
 /// 最大 extent 数量（与 Linux 一致）
 pub const UID_GID_MAP_MAX_EXTENTS: usize = 340;
-/// 默认 overflow UID
-pub const DEFAULT_OVERFLOWUID: u32 = 65534;
-/// 默认 overflow GID
-pub const DEFAULT_OVERFLOWGID: u32 = 65534;
+
 /// 允许 setgroups 的标志位
 pub const USERNS_SETGROUPS_ALLOWED: u32 = 1;
 

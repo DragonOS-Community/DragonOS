@@ -123,9 +123,7 @@ impl IdMapFileOps {
         Ok(pcb.cred().user_ns.clone())
     }
 
-    fn open_cred_from_data(
-        data: &MutexGuard<FilePrivateData>,
-    ) -> Result<Arc<Cred>, SystemError> {
+    fn open_cred_from_data(data: &MutexGuard<FilePrivateData>) -> Result<Arc<Cred>, SystemError> {
         let FilePrivateData::Procfs(ProcfsFilePrivateData { open_cred, .. }) = &**data else {
             return Err(SystemError::EPERM);
         };

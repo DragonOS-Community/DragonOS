@@ -8,8 +8,7 @@ use crate::{
         cred::Cred,
         fork::CloneFlags,
         namespace::nsproxy::{
-            create_new_namespaces, switch_task_namespaces, switch_task_namespaces_with_fs,
-            NsProxy,
+            create_new_namespaces, switch_task_namespaces, switch_task_namespaces_with_fs, NsProxy,
         },
         ProcessManager,
     },
@@ -25,7 +24,8 @@ pub fn ksys_unshare(flags: CloneFlags) -> Result<(), SystemError> {
     let current_pcb = ProcessManager::current_pcb();
     let mut new_cred = unshare_user_cred(flags, &current_pcb)?;
     let new_fs = unshare_fs_struct(flags, &current_pcb)?;
-    let new_nsproxy = unshare_nsproxy_namespaces(flags, &current_pcb, new_cred.as_ref(), new_fs.as_ref())?;
+    let new_nsproxy =
+        unshare_nsproxy_namespaces(flags, &current_pcb, new_cred.as_ref(), new_fs.as_ref())?;
 
     if let Some(new_nsproxy) = new_nsproxy {
         if let Some(new_fs) = new_fs.as_ref() {

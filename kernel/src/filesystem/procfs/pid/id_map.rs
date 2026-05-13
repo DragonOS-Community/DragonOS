@@ -8,14 +8,15 @@ use crate::{
         procfs::{
             pid::find_process_by_vpid,
             template::{Builder, FileOps, ProcFileBuilder},
+            ProcfsFilePrivateData,
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
     process::{
-        cred::{ns_capable, CAPFlags},
+        cred::{cap_capable, CAPFlags, Cred},
         namespace::user_namespace::{
-            map_id_range_down, UidGidExtent, UidGidMap, UID_GID_MAP_MAX_BASE_EXTENTS,
-            UID_GID_MAP_MAX_EXTENTS, USERNS_SETGROUPS_ALLOWED,
+            map_id_down, map_id_range_down, map_id_up, UidGidExtent, UidGidMap, UserNamespace,
+            UID_GID_MAP_MAX_BASE_EXTENTS, UID_GID_MAP_MAX_EXTENTS, USERNS_SETGROUPS_ALLOWED,
         },
         RawPid,
     },
@@ -29,11 +30,56 @@ use alloc::{
 use core::sync::atomic::{AtomicU32, Ordering};
 use system_error::SystemError;
 
+const PROC_ID_MAP_MAX_WRITE: usize = 4096;
+
 /// 映射文件类型
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MapType {
     Uid,
     Gid,
+}
+
+impl MapType {
+    fn parent_cap(self) -> CAPFlags {
+        match self {
+            MapType::Uid => CAPFlags::CAP_SETUID,
+            MapType::Gid => CAPFlags::CAP_SETGID,
+        }
+    }
+
+    fn is_uid(self) -> bool {
+        matches!(self, MapType::Uid)
+    }
+}
+
+#[derive(Clone)]
+struct IdMapWriteContext {
+    map_type: MapType,
+    target_ns: Arc<UserNamespace>,
+    opener_cred: Arc<Cred>,
+    target_owner: usize,
+    target_flags: u32,
+    target_parent_could_setfcap: bool,
+}
+
+impl IdMapWriteContext {
+    fn opener_has_cap(&self, ns: &Arc<UserNamespace>, cap: CAPFlags) -> bool {
+        cap_capable(&self.opener_cred, ns, cap)
+    }
+
+    fn target_parent_ns(&self) -> Result<Arc<UserNamespace>, SystemError> {
+        self.target_ns.parent_ns().ok_or(SystemError::EPERM)
+    }
+
+    fn lower_ns_for_display(&self) -> Arc<UserNamespace> {
+        if Arc::ptr_eq(&self.opener_cred.user_ns, &self.target_ns) {
+            self.target_ns
+                .parent_ns()
+                .unwrap_or_else(|| self.target_ns.clone())
+        } else {
+            self.opener_cred.user_ns.clone()
+        }
+    }
 }
 
 /// /proc/[pid]/uid_map 和 /proc/[pid]/gid_map 的 FileOps
@@ -72,70 +118,54 @@ impl IdMapFileOps {
             .unwrap()
     }
 
-    fn get_user_ns(
-        &self,
-    ) -> Result<Arc<crate::process::namespace::user_namespace::UserNamespace>, SystemError> {
+    fn get_user_ns(&self) -> Result<Arc<UserNamespace>, SystemError> {
         let pcb = find_process_by_vpid(self.pid).ok_or(SystemError::ESRCH)?;
         Ok(pcb.cred().user_ns.clone())
     }
 
-    fn generate_content(
-        &self,
-        map: &UidGidMap,
-        user_ns: &crate::process::namespace::user_namespace::UserNamespace,
-    ) -> String {
+    fn open_cred_from_data(
+        data: &MutexGuard<FilePrivateData>,
+    ) -> Result<Arc<Cred>, SystemError> {
+        let FilePrivateData::Procfs(ProcfsFilePrivateData { open_cred, .. }) = &**data else {
+            return Err(SystemError::EPERM);
+        };
+        Ok(open_cred.clone())
+    }
+
+    fn generate_content(&self, map: &UidGidMap, ctx: &IdMapWriteContext) -> String {
         let nr = map.get_nr_extents() as usize;
         if nr == 0 {
             return String::new();
         }
 
-        let mut output = String::new();
         let extents = if nr <= UID_GID_MAP_MAX_BASE_EXTENTS {
             &map.extent[..nr]
         } else {
             map.forward.as_deref().unwrap_or(&[])
         };
 
-        for e in extents {
-            // lower_first 显示为对读者可见的值
-            let visible_lower = if let Some(parent) = user_ns.parent_ns() {
-                let parent_inner = parent.inner.lock();
-                let parent_map = match self.map_type {
-                    MapType::Uid => &parent_inner.uid_map,
-                    MapType::Gid => &parent_inner.gid_map,
-                };
-                crate::process::namespace::user_namespace::map_id_up(parent_map, e.lower_first)
-                    .unwrap_or(e.lower_first)
-            } else {
-                e.lower_first
-            };
+        let lower_ns = ctx.lower_ns_for_display();
+        let lower_map = {
+            let inner = lower_ns.inner.lock();
+            match self.map_type {
+                MapType::Uid => inner.uid_map.clone(),
+                MapType::Gid => inner.gid_map.clone(),
+            }
+        };
+
+        let mut output = String::new();
+        for extent in extents {
+            let visible_lower = map_id_up(&lower_map, extent.lower_first).unwrap_or(u32::MAX);
             output.push_str(&format!(
                 "{:10} {:10} {:10}\n",
-                e.first, visible_lower, e.count
+                extent.first, visible_lower, extent.count
             ));
         }
+
         output
     }
 
-    fn write_map(
-        &self,
-        buf: &[u8],
-        map: &mut UidGidMap,
-        parent_map: &UidGidMap,
-        cap_setid: CAPFlags,
-        user_ns: &Arc<crate::process::namespace::user_namespace::UserNamespace>,
-    ) -> Result<usize, SystemError> {
-        // 1. 只写一次检查
-        if map.is_written() {
-            return Err(SystemError::EPERM);
-        }
-
-        // 2. 权限检查：需要 CAP_SYS_ADMIN 在目标 ns
-        if !ns_capable(user_ns, CAPFlags::CAP_SYS_ADMIN) {
-            return Err(SystemError::EPERM);
-        }
-
-        // 3. 解析输入
+    fn parse_map(&self, buf: &[u8]) -> Result<Vec<UidGidExtent>, SystemError> {
         let input = core::str::from_utf8(buf).map_err(|_| SystemError::EINVAL)?;
         let mut new_extents: Vec<UidGidExtent> = Vec::new();
 
@@ -150,76 +180,184 @@ impl IdMapFileOps {
                 return Err(SystemError::EINVAL);
             }
 
-            let first = parts[0].parse::<u32>().map_err(|_| SystemError::EINVAL)?;
-            let lower_first = parts[1].parse::<u32>().map_err(|_| SystemError::EINVAL)?;
-            let count = parts[2].parse::<u32>().map_err(|_| SystemError::EINVAL)?;
+            let extent = UidGidExtent {
+                first: parts[0].parse::<u32>().map_err(|_| SystemError::EINVAL)?,
+                lower_first: parts[1].parse::<u32>().map_err(|_| SystemError::EINVAL)?,
+                count: parts[2].parse::<u32>().map_err(|_| SystemError::EINVAL)?,
+            };
 
-            if first == u32::MAX || lower_first == u32::MAX || count == 0 {
-                return Err(SystemError::EINVAL);
-            }
-
-            // 检查溢出
-            if first.checked_add(count).is_none() || lower_first.checked_add(count).is_none() {
-                return Err(SystemError::EINVAL);
-            }
-
-            // 检查 overlap
-            for e in &new_extents {
-                if (first >= e.first && first < e.first + e.count)
-                    || (e.first >= first && e.first < first + count)
-                {
-                    return Err(SystemError::EINVAL);
-                }
-            }
-
-            new_extents.push(UidGidExtent {
-                first,
-                lower_first,
-                count,
-            });
+            self.validate_new_extent(&new_extents, &extent)?;
+            new_extents.push(extent);
         }
 
-        if new_extents.is_empty() {
-            return Ok(buf.len());
-        }
-
-        if new_extents.len() > UID_GID_MAP_MAX_EXTENTS {
+        if new_extents.is_empty() || new_extents.len() > UID_GID_MAP_MAX_EXTENTS {
             return Err(SystemError::EINVAL);
         }
 
-        // 4. 验证 parent map
-        for e in &new_extents {
-            if map_id_range_down(parent_map, e.lower_first, e.count).is_none() {
+        Ok(new_extents)
+    }
+
+    fn validate_new_extent(
+        &self,
+        new_extents: &[UidGidExtent],
+        extent: &UidGidExtent,
+    ) -> Result<(), SystemError> {
+        if extent.first == u32::MAX || extent.lower_first == u32::MAX || extent.count == 0 {
+            return Err(SystemError::EINVAL);
+        }
+
+        let upper_last = extent
+            .first
+            .checked_add(extent.count - 1)
+            .ok_or(SystemError::EINVAL)?;
+        let lower_last = extent
+            .lower_first
+            .checked_add(extent.count - 1)
+            .ok_or(SystemError::EINVAL)?;
+
+        for prev in new_extents {
+            let prev_upper_last = prev.first + prev.count - 1;
+            let prev_lower_last = prev.lower_first + prev.count - 1;
+
+            if prev.first <= upper_last && prev_upper_last >= extent.first {
+                return Err(SystemError::EINVAL);
+            }
+
+            if prev.lower_first <= lower_last && prev_lower_last >= extent.lower_first {
+                return Err(SystemError::EINVAL);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn verify_root_map(
+        &self,
+        ctx: &IdMapWriteContext,
+        new_extents: &[UidGidExtent],
+    ) -> Result<(), SystemError> {
+        if !ctx.map_type.is_uid() {
+            return Ok(());
+        }
+
+        if !new_extents.iter().any(|extent| extent.lower_first == 0) {
+            return Ok(());
+        }
+
+        if Arc::ptr_eq(&ctx.opener_cred.user_ns, &ctx.target_ns) {
+            if !ctx.target_parent_could_setfcap {
+                return Err(SystemError::EPERM);
+            }
+        } else {
+            let parent_ns = ctx.target_parent_ns()?;
+            if !ctx.opener_has_cap(&parent_ns, CAPFlags::CAP_SETFCAP) {
                 return Err(SystemError::EPERM);
             }
         }
 
-        // 5. 对非特权的 multi-extent 映射，需要 parent ns 的 CAP_SETUID/CAP_SETGID
-        if let Some(parent_ns) = user_ns.parent_ns() {
-            if !ns_capable(&parent_ns, cap_setid) {
-                return Err(SystemError::EPERM);
-            }
+        Ok(())
+    }
+
+    fn restricted_single_extent_permitted(
+        &self,
+        ctx: &IdMapWriteContext,
+        new_extents: &[UidGidExtent],
+    ) -> Result<bool, SystemError> {
+        if new_extents.len() != 1 || new_extents[0].count != 1 {
+            return Ok(false);
         }
 
-        // 5. 安装映射
-        let nr = new_extents.len();
-        for (i, e) in new_extents.iter().enumerate() {
-            if i < UID_GID_MAP_MAX_BASE_EXTENTS {
-                map.extent[i] = *e;
-            }
+        if ctx.target_owner != ctx.opener_cred.euid.data() {
+            return Ok(false);
         }
 
-        if nr > UID_GID_MAP_MAX_BASE_EXTENTS {
-            // 排序并分配 forward/reverse 数组
-            let mut forward = new_extents.clone();
-            forward.sort_by_key(|a| a.first);
-            let mut reverse = new_extents.clone();
-            reverse.sort_by_key(|a| a.lower_first);
+        let parent_ns = ctx.target_parent_ns()?;
+        let lower_id = new_extents[0].lower_first;
+
+        match ctx.map_type {
+            MapType::Uid => {
+                let parent_uid = map_id_down(&parent_ns.inner.lock().uid_map, lower_id)
+                    .ok_or(SystemError::EPERM)?;
+                Ok(parent_uid as usize == ctx.opener_cred.euid.data())
+            }
+            MapType::Gid => {
+                let parent_gid = map_id_down(&parent_ns.inner.lock().gid_map, lower_id)
+                    .ok_or(SystemError::EPERM)?;
+                Ok((ctx.target_flags & USERNS_SETGROUPS_ALLOWED) == 0
+                    && parent_gid as usize == ctx.opener_cred.egid.data())
+            }
+        }
+    }
+
+    fn new_idmap_permitted(
+        &self,
+        ctx: &IdMapWriteContext,
+        new_extents: &[UidGidExtent],
+    ) -> Result<(), SystemError> {
+        self.verify_root_map(ctx, new_extents)?;
+
+        if self.restricted_single_extent_permitted(ctx, new_extents)? {
+            return Ok(());
+        }
+
+        let parent_ns = ctx.target_parent_ns()?;
+        let parent_cap = ctx.map_type.parent_cap();
+        if ctx.opener_has_cap(&parent_ns, parent_cap) {
+            return Ok(());
+        }
+
+        Err(SystemError::EPERM)
+    }
+
+    fn install_map(&self, map: &mut UidGidMap, mut extents: Vec<UidGidExtent>) {
+        map.forward = None;
+        map.reverse = None;
+        map.extent = [UidGidExtent {
+            first: 0,
+            lower_first: 0,
+            count: 0,
+        }; UID_GID_MAP_MAX_BASE_EXTENTS];
+
+        let nr = extents.len();
+        if nr <= UID_GID_MAP_MAX_BASE_EXTENTS {
+            extents.sort_by_key(|extent| extent.first);
+            for (index, extent) in extents.iter().enumerate() {
+                map.extent[index] = *extent;
+            }
+        } else {
+            let mut forward = extents.clone();
+            forward.sort_by_key(|extent| extent.first);
+            let mut reverse = extents;
+            reverse.sort_by_key(|extent| extent.lower_first);
             map.forward = Some(forward);
             map.reverse = Some(reverse);
         }
 
         map.nr_extents.store(nr as u32, Ordering::Release);
+    }
+
+    fn write_map(
+        &self,
+        offset: usize,
+        buf: &[u8],
+        map: &mut UidGidMap,
+        parent_map: &UidGidMap,
+        ctx: &IdMapWriteContext,
+    ) -> Result<usize, SystemError> {
+        if offset != 0 || buf.len() >= PROC_ID_MAP_MAX_WRITE {
+            return Err(SystemError::EINVAL);
+        }
+
+        let mut new_extents = self.parse_map(buf)?;
+        self.new_idmap_permitted(ctx, &new_extents)?;
+
+        for extent in &mut new_extents {
+            let mapped_lower = map_id_range_down(parent_map, extent.lower_first, extent.count)
+                .ok_or(SystemError::EPERM)?;
+            extent.lower_first = mapped_lower;
+        }
+
+        self.install_map(map, new_extents);
         Ok(buf.len())
     }
 }
@@ -230,21 +368,30 @@ impl FileOps for IdMapFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: MutexGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let pcb = find_process_by_vpid(self.pid).ok_or(SystemError::ESRCH)?;
-        let user_ns = pcb.cred().user_ns.clone();
+        let user_ns = self.get_user_ns()?;
+        let opener_cred = Self::open_cred_from_data(&data)?;
         let inner = user_ns.inner.lock();
+        let ctx = IdMapWriteContext {
+            map_type: self.map_type,
+            target_ns: user_ns.clone(),
+            opener_cred,
+            target_owner: inner.owner,
+            target_flags: inner.flags,
+            target_parent_could_setfcap: inner.parent_could_setfcap,
+        };
 
         let content = match self.map_type {
-            MapType::Uid => self.generate_content(&inner.uid_map, &user_ns),
-            MapType::Gid => self.generate_content(&inner.gid_map, &user_ns),
+            MapType::Uid => self.generate_content(&inner.uid_map, &ctx),
+            MapType::Gid => self.generate_content(&inner.gid_map, &ctx),
         };
 
         let content_bytes = content.as_bytes();
         if offset >= content_bytes.len() {
             return Ok(0);
         }
+
         let end = (offset + len).min(content_bytes.len());
         let to_copy = end - offset;
         buf[..to_copy].copy_from_slice(&content_bytes[offset..end]);
@@ -253,51 +400,50 @@ impl FileOps for IdMapFileOps {
 
     fn write_at(
         &self,
-        _offset: usize,
+        offset: usize,
         _len: usize,
         buf: &[u8],
-        _data: MutexGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let pcb = find_process_by_vpid(self.pid).ok_or(SystemError::ESRCH)?;
-        let user_ns = pcb.cred().user_ns.clone();
+        let opener_cred = Self::open_cred_from_data(&data)?;
+        let user_ns = self.get_user_ns()?;
+
+        if !cap_capable(&opener_cred, &user_ns, CAPFlags::CAP_SYS_ADMIN) {
+            return Err(SystemError::EPERM);
+        }
+
         let mut inner = user_ns.inner.lock();
+        let ctx = IdMapWriteContext {
+            map_type: self.map_type,
+            target_ns: user_ns.clone(),
+            opener_cred,
+            target_owner: inner.owner,
+            target_flags: inner.flags,
+            target_parent_could_setfcap: inner.parent_could_setfcap,
+        };
 
         match self.map_type {
             MapType::Uid => {
-                let parent_map = if let Some(ref parent) = user_ns.parent {
-                    if let Some(parent_ns) = parent.upgrade() {
-                        parent_ns.inner.lock().uid_map.clone()
-                    } else {
-                        return Err(SystemError::EPERM);
-                    }
-                } else {
+                if inner.uid_map.is_written() {
                     return Err(SystemError::EPERM);
+                }
+                let parent_map = {
+                    let parent_ns = ctx.target_parent_ns()?;
+                    let map = parent_ns.inner.lock().uid_map.clone();
+                    map
                 };
-                self.write_map(
-                    buf,
-                    &mut inner.uid_map,
-                    &parent_map,
-                    CAPFlags::CAP_SETUID,
-                    &user_ns,
-                )
+                self.write_map(offset, buf, &mut inner.uid_map, &parent_map, &ctx)
             }
             MapType::Gid => {
-                let parent_map = if let Some(ref parent) = user_ns.parent {
-                    if let Some(parent_ns) = parent.upgrade() {
-                        parent_ns.inner.lock().gid_map.clone()
-                    } else {
-                        return Err(SystemError::EPERM);
-                    }
-                } else {
+                if inner.gid_map.is_written() {
                     return Err(SystemError::EPERM);
+                }
+                let parent_map = {
+                    let parent_ns = ctx.target_parent_ns()?;
+                    let map = parent_ns.inner.lock().gid_map.clone();
+                    map
                 };
-                self.write_map(
-                    buf,
-                    &mut inner.gid_map,
-                    &parent_map,
-                    CAPFlags::CAP_SETGID,
-                    &user_ns,
-                )
+                self.write_map(offset, buf, &mut inner.gid_map, &parent_map, &ctx)
             }
         }
     }
@@ -352,28 +498,29 @@ impl FileOps for SetgroupsFileOps {
 
     fn write_at(
         &self,
-        _offset: usize,
+        offset: usize,
         _len: usize,
         buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        if offset != 0 || buf.len() >= PROC_ID_MAP_MAX_WRITE {
+            return Err(SystemError::EINVAL);
+        }
+
         let pcb = find_process_by_vpid(self.pid).ok_or(SystemError::ESRCH)?;
         let user_ns = pcb.cred().user_ns.clone();
         let mut inner = user_ns.inner.lock();
 
-        // 只能写入 "allow" 或 "deny"
         let input = core::str::from_utf8(buf).map_err(|_| SystemError::EINVAL)?;
         let input = input.trim();
 
         match input {
             "allow" => {
-                // 只能允许已经允许的情况（不能重新启用）
                 if (inner.flags & USERNS_SETGROUPS_ALLOWED) == 0 {
                     return Err(SystemError::EPERM);
                 }
             }
             "deny" => {
-                // 只能在 gid_map 未写入时拒绝
                 if inner.gid_map.is_written() {
                     return Err(SystemError::EPERM);
                 }
@@ -386,7 +533,6 @@ impl FileOps for SetgroupsFileOps {
     }
 }
 
-// UidGidMap 需要实现 Clone 以支持 parent_map 的复制
 impl Clone for UidGidMap {
     fn clone(&self) -> Self {
         Self {

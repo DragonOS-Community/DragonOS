@@ -16,14 +16,14 @@ use super::nsproxy::{switch_task_namespaces, NsProxy};
 /// 内核态 setns 实现（当前仅支持 pidfd + namespace flag 形式）
 ///
 /// - `fd`：必须是通过 `pidfd_open` 或 `clone(CLONE_PIDFD)` 获得的 pidfd
-/// - `nstype`：命名空间 flag 组合，仅允许 CLONE_NEWNS/CLONE_NEWUTS/CLONE_NEWIPC/
-///   CLONE_NEWNET/CLONE_NEWPID/CLONE_NEWCGROUP，且不能为空
+/// - `nstype`：命名空间 flag 组合。pidfd 路径当前仅支持 CLONE_NEWNS/CLONE_NEWUTS/
+///   CLONE_NEWIPC/CLONE_NEWNET/CLONE_NEWPID/CLONE_NEWCGROUP；namespace fd 路径额外支持 CLONE_NEWUSER
 ///
 /// 语义（与 Linux setns(pidfd, flags) 对齐的子集）：
 /// - 针对指定 flag，从目标任务的 `NsProxy` 中拷贝对应 namespace 引用，
 ///   在当前任务上构造新的 `NsProxy` 并通过 `switch_task_namespaces` 原子替换
 /// - CLONE_NEWPID 仅影响 `pid_ns_for_children`（与 DragonOS/ Linux 一致）
-/// - 不支持 USER/TIME namespace 以及 `/proc/<pid>/ns/*` 路径
+/// - user namespace 当前仅支持通过 `/proc/<pid>/ns/user` 这类 namespace fd 进入
 #[inline(never)]
 pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
     // 1. 解析并校验 flag
@@ -34,6 +34,7 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
             | CloneFlags::CLONE_NEWUTS.bits()
             | CloneFlags::CLONE_NEWIPC.bits()
             | CloneFlags::CLONE_NEWNET.bits()
+            | CloneFlags::CLONE_NEWUSER.bits()
             | CloneFlags::CLONE_NEWPID.bits()
             | CloneFlags::CLONE_NEWCGROUP.bits(),
     );
@@ -67,6 +68,9 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
             return Err(SystemError::EBADF);
         }
         if flags.is_empty() {
+            return Err(SystemError::EINVAL);
+        }
+        if flags.contains(CloneFlags::CLONE_NEWUSER) {
             return Err(SystemError::EINVAL);
         }
 
@@ -185,12 +189,17 @@ fn userns_install(
         return Err(SystemError::EINVAL);
     }
 
-    // 3. 需要 CAP_SYS_ADMIN 在目标 ns
+    // 3. 不能共享 fs_struct
+    if current.fs_struct_is_shared() {
+        return Err(SystemError::EINVAL);
+    }
+
+    // 4. 需要 CAP_SYS_ADMIN 在目标 ns
     if !ns_capable(&user_ns, CAPFlags::CAP_SYS_ADMIN) {
         return Err(SystemError::EPERM);
     }
 
-    // 4. 重置 credentials
+    // 5. 先准备新的 cred，全部校验通过后再提交
     let mut new_cred = (*current.cred()).clone();
     crate::process::cred::set_cred_user_ns(&mut new_cred, user_ns);
     current.set_cred(Cred::new_arc(new_cred))?;

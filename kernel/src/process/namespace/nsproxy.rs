@@ -3,7 +3,10 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use system_error::SystemError;
 
 use crate::{
-    filesystem::vfs::{IndexNode, VFS_MAX_FOLLOW_SYMLINK_TIMES},
+    filesystem::{
+        fs::FsStruct,
+        vfs::{IndexNode, VFS_MAX_FOLLOW_SYMLINK_TIMES},
+    },
     process::{
         cred::Cred,
         fork::CloneFlags,
@@ -291,33 +294,41 @@ pub fn switch_task_namespaces(
     tsk: &Arc<ProcessControlBlock>,
     new_nsproxy: Arc<NsProxy>,
 ) -> Result<(), SystemError> {
-    let rebound_paths = if Arc::ptr_eq(tsk.nsproxy().mnt_namespace(), &new_nsproxy.mnt_ns) {
-        None
-    } else {
-        Some(resolve_fs_paths_for_new_mntns(tsk, &new_nsproxy.mnt_ns)?)
-    };
+    let fs = tsk.fs_struct();
+    switch_task_namespaces_with_fs(tsk, &fs, new_nsproxy)
+}
 
-    tsk.set_nsproxy(new_nsproxy);
-
-    if let Some((new_root, new_pwd)) = rebound_paths {
-        let fs = tsk.fs_struct_mut();
-        fs.set_root(new_root);
-        fs.set_pwd(new_pwd);
+pub(crate) fn switch_task_namespaces_with_fs(
+    tsk: &Arc<ProcessControlBlock>,
+    fs: &Arc<FsStruct>,
+    new_nsproxy: Arc<NsProxy>,
+) -> Result<(), SystemError> {
+    if !Arc::ptr_eq(tsk.nsproxy().mnt_namespace(), &new_nsproxy.mnt_ns) {
+        prepare_fs_for_new_mntns(fs, &new_nsproxy.mnt_ns)?;
     }
 
+    tsk.set_nsproxy(new_nsproxy);
+    Ok(())
+}
+
+pub(crate) fn prepare_fs_for_new_mntns(
+    fs: &Arc<FsStruct>,
+    new_mntns: &Arc<MntNamespace>,
+) -> Result<(), SystemError> {
+    let (new_root, new_pwd) = resolve_fs_paths_for_new_mntns(fs, new_mntns)?;
+    fs.set_root(new_root);
+    fs.set_pwd(new_pwd);
     Ok(())
 }
 
 type ReboundFsPaths = (Arc<dyn IndexNode>, Arc<dyn IndexNode>);
 
 fn resolve_fs_paths_for_new_mntns(
-    tsk: &Arc<ProcessControlBlock>,
+    fs: &Arc<FsStruct>,
     new_mntns: &Arc<MntNamespace>,
 ) -> Result<ReboundFsPaths, SystemError> {
-    let fs = tsk.fs_struct();
     let old_root_path = fs.root().absolute_path()?;
     let old_pwd_path = fs.pwd().absolute_path()?;
-    drop(fs);
 
     let new_root = resolve_from_namespace_root(new_mntns, &old_root_path)?;
     let new_pwd = resolve_from_namespace_root(new_mntns, &old_pwd_path)?;

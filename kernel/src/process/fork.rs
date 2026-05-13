@@ -529,7 +529,7 @@ impl ProcessManager {
 
         if (clone_flags & (CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_FS)
             == (CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_FS))
-            || (clone_flags & (CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_FS))
+            || (clone_flags & (CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_FS))
                 == (CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_FS)
         {
             return Err(SystemError::EINVAL);

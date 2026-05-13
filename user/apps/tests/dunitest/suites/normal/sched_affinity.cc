@@ -1,9 +1,12 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <errno.h>
+#include <pthread.h>
 #include <sched.h>
 #include <signal.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -52,6 +55,31 @@ void ExpectCpuSetEq(const cpu_set_t& expected, const cpu_set_t& actual) {
     }
 }
 
+int SetOneCpu(pid_t tid, int cpu) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    return sched_setaffinity(tid, sizeof(set), &set);
+}
+
+int CurrentCpu() {
+    unsigned int cpu = 0;
+    if (syscall(SYS_getcpu, &cpu, nullptr, nullptr) != 0) {
+        return -1;
+    }
+    return static_cast<int>(cpu);
+}
+
+bool WaitUntil(const std::atomic<int>& value, int expected, int rounds) {
+    for (int i = 0; i < rounds; ++i) {
+        if (value.load(std::memory_order_acquire) == expected) {
+            return true;
+        }
+        sched_yield();
+    }
+    return false;
+}
+
 class SchedAffinityFixture : public ::testing::Test {
 protected:
     void SetUp() override {
@@ -77,6 +105,39 @@ protected:
 
     cpu_set_t original_ {};
 };
+
+struct BusyWorkerState {
+    std::atomic<int> ready {0};
+    std::atomic<int> done {0};
+    std::atomic<int> seen_dst {0};
+    std::atomic<int> tid {0};
+    std::atomic<int> last_cpu {-1};
+    std::atomic<int> setup_errno {0};
+    int src_cpu = -1;
+    int dst_cpu = -1;
+};
+
+void* BusyWorker(void* arg) {
+    auto* state = static_cast<BusyWorkerState*>(arg);
+    state->tid.store(static_cast<int>(syscall(SYS_gettid)), std::memory_order_release);
+
+    if (SetOneCpu(0, state->src_cpu) != 0) {
+        state->setup_errno.store(errno, std::memory_order_release);
+        state->done.store(1, std::memory_order_release);
+        return reinterpret_cast<void*>(1);
+    }
+
+    state->ready.store(1, std::memory_order_release);
+    while (state->done.load(std::memory_order_acquire) == 0) {
+        const int cpu = CurrentCpu();
+        state->last_cpu.store(cpu, std::memory_order_release);
+        if (cpu == state->dst_cpu) {
+            state->seen_dst.store(1, std::memory_order_release);
+        }
+    }
+
+    return nullptr;
+}
 
 }  // namespace
 
@@ -174,6 +235,69 @@ TEST_F(SchedAffinityFixture, ChildCanUpdateOwnAffinityRoundTrip) {
         << "waitpid failed: errno=" << errno << " (" << strerror(errno) << ")";
     ASSERT_TRUE(WIFEXITED(status)) << "child did not exit normally, status=" << status;
     EXPECT_EQ(0, WEXITSTATUS(status)) << "child exit status=" << WEXITSTATUS(status);
+}
+
+TEST_F(SchedAffinityFixture, CurrentRunningThreadCanBeMigratedByAnotherThread) {
+    const int src_cpu = FirstCpu(original_);
+    ASSERT_GE(src_cpu, 0);
+    const int dst_cpu = NextCpu(original_, src_cpu);
+    if (dst_cpu < 0) {
+        GTEST_SKIP() << "requires at least two allowed CPUs";
+    }
+
+    BusyWorkerState state;
+    state.src_cpu = src_cpu;
+    state.dst_cpu = dst_cpu;
+
+    pthread_t thread {};
+    ASSERT_EQ(0, pthread_create(&thread, nullptr, BusyWorker, &state));
+
+    if (!WaitUntil(state.ready, 1, 100000)) {
+        state.done.store(1, std::memory_order_release);
+        void* result = nullptr;
+        ASSERT_EQ(0, pthread_join(thread, &result));
+        FAIL() << "worker did not become ready, setup errno="
+               << state.setup_errno.load(std::memory_order_acquire);
+    }
+    const int worker_tid = state.tid.load(std::memory_order_acquire);
+    ASSERT_GT(worker_tid, 0);
+
+    ASSERT_EQ(0, SetOneCpu(worker_tid, dst_cpu))
+        << "sched_setaffinity(worker) failed: errno=" << errno << " (" << strerror(errno)
+        << ")";
+    EXPECT_TRUE(WaitUntil(state.seen_dst, 1, 200000))
+        << "worker did not reach destination CPU, last cpu="
+        << state.last_cpu.load(std::memory_order_acquire);
+
+    state.done.store(1, std::memory_order_release);
+    void* result = nullptr;
+    ASSERT_EQ(0, pthread_join(thread, &result));
+    EXPECT_EQ(nullptr, result);
+}
+
+TEST_F(SchedAffinityFixture, CurrentThreadCanMigrateItself) {
+    const int src_cpu = FirstCpu(original_);
+    ASSERT_GE(src_cpu, 0);
+    const int dst_cpu = NextCpu(original_, src_cpu);
+    if (dst_cpu < 0) {
+        GTEST_SKIP() << "requires at least two allowed CPUs";
+    }
+
+    ASSERT_EQ(0, SetOneCpu(0, src_cpu))
+        << "sched_setaffinity(src) failed: errno=" << errno << " (" << strerror(errno) << ")";
+    ASSERT_EQ(0, SetOneCpu(0, dst_cpu))
+        << "sched_setaffinity(dst) failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    bool reached_dst = false;
+    for (int i = 0; i < 200000; ++i) {
+        if (CurrentCpu() == dst_cpu) {
+            reached_dst = true;
+            break;
+        }
+        sched_yield();
+    }
+
+    EXPECT_TRUE(reached_dst) << "self migration did not reach destination CPU";
 }
 
 TEST_F(SchedAffinityFixture, SameUidParentCanUpdateChildAffinity) {

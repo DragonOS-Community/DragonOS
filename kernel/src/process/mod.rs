@@ -28,6 +28,7 @@ use crate::{
         process::ArchPCBInfo,
         CurrentIrqArch, SigStackArch,
     },
+    cgroup::{cgroup_root_node, CgroupNode, TaskCgroupRef},
     driver::tty::tty_core::TtyCore,
     exception::InterruptArch,
     filesystem::{
@@ -61,14 +62,14 @@ use crate::{
     process::resource::{RLimit64, RLimitID},
     sched::{
         DequeueFlag, EnqueueFlag, OnRq, SchedMode, WakeupFlags, __schedule, completion::Completion,
-        cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO,
+        cpu_rq, enqueue_task_on_cpu, fair::FairSchedEntity, prio::MAX_PRIO, select_task_rq,
     },
     smp::{
         core::smp_get_processor_id,
         cpu::{AtomicProcessorId, ProcessorId},
         kick_cpu,
     },
-    syscall::user_access::clear_user_protected,
+    syscall::user_access::{clear_user_protected, write_one_to_user_protected},
 };
 use timer::AlarmTimer;
 
@@ -142,6 +143,7 @@ static mut __PROCESS_MANAGEMENT_INIT_DONE: bool = false;
 pub struct SwitchResult {
     pub prev_pcb: Option<Arc<ProcessControlBlock>>,
     pub next_pcb: Option<Arc<ProcessControlBlock>>,
+    pub migrate_prev_to: Option<ProcessorId>,
 }
 
 impl SwitchResult {
@@ -149,6 +151,7 @@ impl SwitchResult {
         Self {
             prev_pcb: None,
             next_pcb: None,
+            migrate_prev_to: None,
         }
     }
 }
@@ -260,18 +263,38 @@ impl ProcessManager {
         left: &Arc<ProcessControlBlock>,
         right: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
+        let _cgroup_guard = crate::cgroup::cgroup_accounting_lock().lock();
         let mut all_proc = all_process().lock_irqsave();
         let map = all_proc.as_mut().ok_or(SystemError::EINVAL)?;
-        let left_pid = left.raw_pid();
-        let right_pid = right.raw_pid();
-        if left_pid == right_pid {
+        let left_old_pid = left.raw_pid();
+        let right_old_pid = right.raw_pid();
+        if left_old_pid == right_old_pid {
             return Err(SystemError::EINVAL);
         }
-        if !map.contains_key(&left_pid) || !map.contains_key(&right_pid) {
+        if !map.contains_key(&left_old_pid) || !map.contains_key(&right_old_pid) {
             return Err(SystemError::ESRCH);
         }
+
+        let left_cgroup = left.task_cgroup_node();
+        let right_cgroup = right.task_cgroup_node();
+        let left_alive = !left.is_exited();
+        let right_alive = !right.is_exited();
+
         left.exchange_tid_with(right)?;
-        exchange_raw_pids_locked(map, left, right)
+        exchange_raw_pids_locked(map, left, right)?;
+
+        // cgroup.procs 只展示仍存活的任务；exec 去线程化换 pid 时只重命名可见成员。
+        if Arc::ptr_eq(&left_cgroup, &right_cgroup) && left_alive && right_alive {
+            return Ok(());
+        }
+        if left_alive {
+            left_cgroup.rename_task(left_old_pid, left.raw_pid());
+        }
+        if right_alive {
+            right_cgroup.rename_task(right_old_pid, right.raw_pid());
+        }
+
+        Ok(())
     }
 
     /// ### 获取所有进程的pid
@@ -339,6 +362,43 @@ impl ProcessManager {
         } else {
             return Ok(());
         }
+    }
+
+    pub fn wakeup_new_task(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
+        let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+
+        let mut writer = pcb.sched_info().inner_lock_write_irqsave();
+        let state = writer.state();
+        if !state.is_blocked() {
+            if state.is_exited() {
+                return Err(SystemError::EINVAL);
+            }
+            return Ok(());
+        }
+
+        writer.set_state(ProcessState::Runnable);
+        writer.set_wakeup();
+        drop(writer);
+
+        debug_assert_eq!(*pcb.sched_info().on_rq.lock_irqsave(), OnRq::None);
+        debug_assert!(pcb.sched_info().is_new_task());
+        debug_assert!(pcb.sched_info().on_cpu().is_none());
+
+        let target_cpu =
+            pcb.sched_info()
+                .consume_new_task_target_cpu(smp_get_processor_id(), |allowed| {
+                    let cpu = select_task_rq(pcb, smp_get_processor_id(), WakeupFlags::WF_FORK);
+                    if allowed.get(cpu).unwrap_or(false) {
+                        Some(cpu)
+                    } else {
+                        None
+                    }
+                })?;
+
+        enqueue_task_on_cpu(pcb, target_cpu, WakeupFlags::WF_FORK);
+
+        debug_assert!(!pcb.sched_info().is_new_task());
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -659,6 +719,16 @@ impl ProcessManager {
         // 检查是否是init进程尝试退出，如果是则产生panic
         let current_pcb = ProcessManager::current_pcb();
 
+        if current_pcb.raw_pid() == RawPid(0) {
+            log::error!(
+                "Idle process (pid=0) attempted to exit with code {}. Halting current cpu.",
+                exit_code
+            );
+            loop {
+                spin_loop();
+            }
+        }
+
         if current_pcb.raw_pid() == RawPid(1) {
             log::error!(
                 "Init process (pid=1) attempted to exit with code {}. This should not happen and indicates a serious system error.",
@@ -733,6 +803,24 @@ impl ProcessManager {
             pcb.sched_info
                 .inner_lock_write_irqsave()
                 .set_state(ProcessState::Exited(exit_code));
+            // Linux 语义：zombie 不应出现在 cgroup.procs 中。
+            // 必须持有 cgroup_accounting_lock 以避免与 cgroup.procs 写入死锁
+            {
+                let _cgroup_guard = crate::cgroup::cgroup_accounting_lock().lock();
+                pcb.task_cgroup_node().remove_task(raw_pid);
+            }
+            if pcb.is_kthread() {
+                let exited_completion = {
+                    let worker_private = pcb.worker_private();
+                    worker_private
+                        .as_ref()
+                        .and_then(|x| x.kernel_thread())
+                        .map(|x| x.exited_completion())
+                };
+                if let Some(exited_completion) = exited_completion {
+                    exited_completion.complete_all();
+                }
+            }
 
             let rq = cpu_rq(smp_get_processor_id().data() as usize);
             let (rq, guard) = rq.self_lock();
@@ -883,6 +971,10 @@ impl ProcessManager {
     pub(super) unsafe fn release(pid: RawPid) {
         let pcb = ProcessManager::find(pid);
         if let Some(ref pcb) = pcb {
+            {
+                let _cgroup_guard = crate::cgroup::cgroup_accounting_lock().lock();
+                pcb.task_cgroup_node().uncharge_pids(1);
+            }
             // 从父进程的 children 列表中移除
             if let Some(parent) = pcb.real_parent_pcb() {
                 let parent_ns = parent.active_pid_ns();
@@ -923,6 +1015,27 @@ impl ProcessManager {
 
         next_pcb.arch_info.force_unlock();
         fence(Ordering::SeqCst);
+
+        let migrate_prev_to = PROCESS_SWITCH_RESULT
+            .as_mut()
+            .unwrap()
+            .get_mut()
+            .migrate_prev_to
+            .take();
+
+        if let Some(dest_cpu) = migrate_prev_to {
+            debug_assert!(!Arc::ptr_eq(&prev_pcb, &next_pcb));
+            prev_pcb.sched_info().set_on_cpu(None);
+            enqueue_task_on_cpu(&prev_pcb, dest_cpu, WakeupFlags::WF_MIGRATED);
+        }
+
+        let set_child_tid = next_pcb.thread.write_irqsave().set_child_tid.take();
+        if let Some(addr) = set_child_tid {
+            // 对齐 Linux schedule_tail 语义：子任务首次运行时 best-effort 写入 tid，
+            // 失败不影响线程继续执行。
+            let child_tid = next_pcb.task_pid_vnr().data() as i32;
+            let _ = unsafe { write_one_to_user_protected(addr, &child_tid) };
+        }
     }
 
     /// 如果目标进程正在目标CPU上运行，那么就让这个cpu陷入内核态
@@ -937,10 +1050,18 @@ impl ProcessManager {
 
         if let Some(cpu_id) = cpu_id {
             let current_cpu_id = smp_get_processor_id();
+            // DragonOS 目前没有 Linux `kick_process()` 那样的 lockless rq.current 约定，
+            // 远端 rq.current 必须在持目标 rq 锁时读取。
+            let should_kick = if cpu_id != current_cpu_id {
+                let rq = cpu_rq(cpu_id.data() as usize);
+                let (rq, _guard) = rq.self_lock();
+                Arc::ptr_eq(&rq.current(), pcb)
+            } else {
+                false
+            };
+
             // Do not kick the current CPU, as it is already running and cannot preempt itself.
-            if pcb.raw_pid() == cpu_rq(cpu_id.data() as usize).current().raw_pid()
-                && cpu_id != current_cpu_id
-            {
+            if should_kick {
                 kick_cpu(cpu_id).expect("ProcessManager::kick(): Failed to kick cpu");
             }
         }
@@ -1154,6 +1275,8 @@ pub struct ProcessControlBlock {
 
     /// namespace代理
     nsproxy: RwLock<Arc<NsProxy>>,
+    /// 任务所属 cgroup（v2）
+    task_cgroup: RwLock<TaskCgroupRef>,
 
     basic: RwLock<ProcessBasicInfo>,
     /// 当前进程的自旋锁持有计数
@@ -1289,6 +1412,11 @@ impl ProcessControlBlock {
             // 其他进程继承父进程的namespace
             ProcessManager::current_pcb().nsproxy().clone()
         };
+        let task_cgroup = if is_idle {
+            TaskCgroupRef::new(cgroup_root_node())
+        } else {
+            ProcessManager::current_pcb().task_cgroup_ref()
+        };
 
         let (raw_pid, ppid, cwd, cred, tty): (
             RawPid,
@@ -1333,6 +1461,7 @@ impl ProcessControlBlock {
                 thread_pid: RwLock::new(None),
                 pid_links: core::array::from_fn(|_| PidLink::default()),
                 nsproxy: RwLock::new(nsproxy),
+                task_cgroup: RwLock::new(task_cgroup),
                 basic: basic_info,
                 preempt_count,
                 flags,
@@ -1695,6 +1824,18 @@ impl ProcessControlBlock {
 
     pub fn fs_struct_mut(&self) -> RwLockWriteGuard<'_, Arc<FsStruct>> {
         self.fs.write()
+    }
+
+    #[inline(always)]
+    pub fn fs_struct_is_shared(&self) -> bool {
+        Arc::strong_count(&*self.fs.read()) > 1
+    }
+
+    pub fn set_fs_struct(&self, fs: Arc<FsStruct>) -> Arc<FsStruct> {
+        let mut guard = self.fs.write();
+        let old = guard.clone();
+        *guard = fs;
+        old
     }
 
     pub fn pwd_inode(&self) -> Arc<dyn IndexNode> {
@@ -2172,6 +2313,56 @@ impl ProcessControlBlock {
         return old;
     }
 
+    pub fn task_cgroup_ref(&self) -> TaskCgroupRef {
+        self.task_cgroup.read().clone()
+    }
+
+    pub fn task_cgroup_node(&self) -> Arc<CgroupNode> {
+        self.task_cgroup.read().node()
+    }
+
+    /// 设置任务所属的 cgroup 节点
+    ///
+    /// # 安全性
+    ///
+    /// 调用者必须持有 `cgroup_accounting_lock` 以避免死锁和竞态条件
+    pub fn set_task_cgroup_node(&self, node: Arc<CgroupNode>) {
+        // 先使用读锁获取 old 节点
+        let old = {
+            let task_cgroup = self.task_cgroup.read();
+            let old = task_cgroup.node();
+            if Arc::ptr_eq(&old, &node) {
+                return;
+            }
+            old
+        }; // 释放读锁
+
+        // 在不持有 task_cgroup 锁的情况下执行迁移；调用者必须持有
+        // cgroup_accounting_lock，保证可见成员和 pids 计费一起切换。
+        let pid = self.raw_pid();
+        old.remove_task(pid);
+        node.add_task(pid);
+        CgroupNode::transfer_pids_charge(&old, &node, 1);
+
+        // 使用写锁更新 task_cgroup
+        let mut task_cgroup = self.task_cgroup.write();
+        *task_cgroup = TaskCgroupRef::new(node);
+    }
+
+    /// 仅用于 fork 时设置任务的 cgroup 节点
+    ///
+    /// # 安全性
+    ///
+    /// 调用者必须持有 `cgroup_accounting_lock`
+    ///
+    /// # 注意
+    ///
+    /// 此函数只更新 task_cgroup 引用，不会调用 add_task()。
+    /// add_task() 会在后续的 ProcessManager::add_pcb() 中被调用。
+    pub fn set_task_cgroup_node_for_fork(&self, node: Arc<CgroupNode>) {
+        *self.task_cgroup.write() = TaskCgroupRef::new(node);
+    }
+
     pub fn is_thread_group_leader(&self) -> bool {
         self.exit_signal.load(Ordering::SeqCst) != Signal::INVALID
     }
@@ -2363,7 +2554,7 @@ pub struct ProcessSchedulerInfo {
     on_cpu: AtomicProcessorId,
     /// 如果当前进程等待被迁移到另一个cpu核心上（也就是flags中的PF_NEED_MIGRATE被置位），
     /// 该字段存储要被迁移到的目标处理器核心号
-    // migrate_to: AtomicProcessorId,
+    migrate_to: AtomicProcessorId,
     inner_locked: RwLock<InnerSchedInfo>,
     /// 进程的调度优先级
     // priority: SchedPriority,
@@ -2377,10 +2568,17 @@ pub struct ProcessSchedulerInfo {
     /// cfs调度实体
     pub sched_entity: Arc<FairSchedEntity>,
     pub on_rq: SpinLock<OnRq>,
+    placement: SpinLock<NewTaskPlacement>,
     pub cpus_allowed: SpinLock<CpuMask>,
     pub nr_cpus_allowed: AtomicUsize,
 
     pub prio_data: RwLock<PrioData>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct NewTaskPlacement {
+    is_new_task: bool,
+    target_cpu_hint: Option<ProcessorId>,
 }
 
 #[derive(Debug, Default)]
@@ -2462,7 +2660,7 @@ impl ProcessSchedulerInfo {
         let nr_cpus_allowed = cpus_allowed.iter_cpu().count();
         return Self {
             on_cpu: AtomicProcessorId::new(cpu_id),
-            // migrate_to: AtomicProcessorId::new(ProcessorId::INVALID),
+            migrate_to: AtomicProcessorId::new(ProcessorId::INVALID),
             inner_locked: RwLock::new(InnerSchedInfo {
                 state: ProcessState::Blocked(false),
                 sleep: false,
@@ -2474,6 +2672,7 @@ impl ProcessSchedulerInfo {
             sched_policy: RwLock::new(crate::sched::SchedPolicy::CFS),
             sched_entity: FairSchedEntity::new(),
             on_rq: SpinLock::new(OnRq::None),
+            placement: SpinLock::new(NewTaskPlacement::default()),
             cpus_allowed: SpinLock::new(cpus_allowed),
             nr_cpus_allowed: AtomicUsize::new(nr_cpus_allowed),
             prio_data: RwLock::new(PrioData::default()),
@@ -2501,23 +2700,93 @@ impl ProcessSchedulerInfo {
         }
     }
 
-    // pub fn migrate_to(&self) -> Option<ProcessorId> {
-    //     let migrate_to = self.migrate_to.load(Ordering::SeqCst);
-    //     if migrate_to == ProcessorId::INVALID {
-    //         return None;
-    //     } else {
-    //         return Some(migrate_to);
-    //     }
-    // }
+    pub(crate) fn placement_lock(&self) -> SpinLockGuard<'_, NewTaskPlacement> {
+        self.placement.lock_irqsave()
+    }
 
-    // pub fn set_migrate_to(&self, migrate_to: Option<ProcessorId>) {
-    //     if let Some(data) = migrate_to {
-    //         self.migrate_to.store(data, Ordering::SeqCst);
-    //     } else {
-    //         self.migrate_to
-    //             .store(ProcessorId::INVALID, Ordering::SeqCst)
-    //     }
-    // }
+    pub fn mark_new_task(&self, target_cpu_hint: Option<ProcessorId>) {
+        let mut guard = self.placement.lock_irqsave();
+        guard.is_new_task = true;
+        guard.target_cpu_hint = target_cpu_hint;
+    }
+
+    pub fn consume_new_task_target_cpu(
+        &self,
+        current_cpu: ProcessorId,
+        default_selector: impl FnOnce(&CpuMask) -> Option<ProcessorId>,
+    ) -> Result<ProcessorId, SystemError> {
+        let mut placement = self.placement.lock_irqsave();
+        if !placement.is_new_task {
+            return Err(SystemError::EINVAL);
+        }
+
+        let allowed = self.cpus_allowed();
+        let selected_cpu = default_selector(&allowed).filter(|&cpu| {
+            allowed.get(cpu).unwrap_or(false)
+                && (!crate::smp::cpu::smp_cpu_manager_initialized()
+                    || crate::sched::cpu_is_online(cpu))
+        });
+        let target_cpu = if let Some(target_cpu) = placement.target_cpu_hint {
+            if allowed.get(target_cpu).unwrap_or(false)
+                && (!crate::smp::cpu::smp_cpu_manager_initialized()
+                    || crate::sched::cpu_is_online(target_cpu))
+            {
+                target_cpu
+            } else if let Some(selected_cpu) = selected_cpu {
+                selected_cpu
+            } else if allowed.get(current_cpu).unwrap_or(false)
+                && (!crate::smp::cpu::smp_cpu_manager_initialized()
+                    || crate::sched::cpu_is_online(current_cpu))
+            {
+                current_cpu
+            } else {
+                allowed
+                    .iter_cpu()
+                    .find(|&cpu| {
+                        !crate::smp::cpu::smp_cpu_manager_initialized()
+                            || crate::sched::cpu_is_online(cpu)
+                    })
+                    .ok_or(SystemError::EINVAL)?
+            }
+        } else if let Some(selected_cpu) = selected_cpu {
+            selected_cpu
+        } else if allowed.get(current_cpu).unwrap_or(false)
+            && (!crate::smp::cpu::smp_cpu_manager_initialized()
+                || crate::sched::cpu_is_online(current_cpu))
+        {
+            current_cpu
+        } else {
+            allowed
+                .iter_cpu()
+                .find(|&cpu| {
+                    !crate::smp::cpu::smp_cpu_manager_initialized()
+                        || crate::sched::cpu_is_online(cpu)
+                })
+                .ok_or(SystemError::EINVAL)?
+        };
+
+        placement.is_new_task = false;
+        placement.target_cpu_hint = None;
+        Ok(target_cpu)
+    }
+
+    pub fn is_new_task(&self) -> bool {
+        self.placement.lock_irqsave().is_new_task
+    }
+
+    pub fn migrate_to(&self) -> Option<ProcessorId> {
+        let migrate_to = self.migrate_to.load(Ordering::SeqCst);
+        if migrate_to == ProcessorId::INVALID {
+            None
+        } else {
+            Some(migrate_to)
+        }
+    }
+
+    pub fn set_migrate_to(&self, migrate_to: Option<ProcessorId>) {
+        self.migrate_to
+            .store(migrate_to.unwrap_or(ProcessorId::INVALID), Ordering::SeqCst);
+    }
 
     pub fn inner_lock_write_irqsave(&self) -> RwLockWriteGuard<'_, InnerSchedInfo> {
         return self.inner_locked.write_irqsave();

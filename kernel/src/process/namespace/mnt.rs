@@ -92,6 +92,10 @@ impl MntNamespace {
         return result;
     }
 
+    pub fn user_ns(&self) -> &Arc<UserNamespace> {
+        &self._user_ns
+    }
+
     /// 强制替换本MountNamespace的根挂载文件系统
     ///
     /// 本方法仅供dragonos初始化时使用

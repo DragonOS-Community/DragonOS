@@ -121,6 +121,101 @@ pub fn pick_idle_cpu(allowed: &CpuMask) -> Option<ProcessorId> {
         .find(|&cpu| IDLE_CPUS.get(cpu) && cpu_is_online(cpu))
 }
 
+#[inline]
+fn cpu_allowed_and_online(allowed: &CpuMask, cpu: ProcessorId) -> bool {
+    allowed.get(cpu).unwrap_or(false) && (!smp_cpu_manager_initialized() || cpu_is_online(cpu))
+}
+
+#[inline]
+fn first_allowed_online_cpu(allowed: &CpuMask) -> Option<ProcessorId> {
+    allowed
+        .iter_cpu()
+        .find(|&cpu| !smp_cpu_manager_initialized() || cpu_is_online(cpu))
+}
+
+fn rq_nr_running(cpu: ProcessorId) -> usize {
+    let rq = cpu_rq(cpu.data() as usize);
+    let (rq, _guard) = rq.self_lock();
+    rq.nr_running
+}
+
+fn select_fork_idle_cpu(allowed: &CpuMask, fallback_cpu: ProcessorId) -> Option<ProcessorId> {
+    let idle_cpu = allowed
+        .iter_cpu()
+        .find(|&cpu| cpu_allowed_and_online(allowed, cpu) && IDLE_CPUS.get(cpu))?;
+
+    if idle_cpu == fallback_cpu || !cpu_allowed_and_online(allowed, fallback_cpu) {
+        return Some(idle_cpu);
+    }
+
+    // Linux does fork balancing at first wakeup, but it is still a load decision.
+    // If the parent rq has no extra queued work, placing the first child locally
+    // lets later fork bursts spread naturally as rq.nr_running changes. Once the
+    // parent rq has more queued work than the idle sibling, prefer the idle CPU.
+    if rq_nr_running(fallback_cpu) <= rq_nr_running(idle_cpu) {
+        return Some(fallback_cpu);
+    }
+
+    Some(idle_cpu)
+}
+
+fn select_least_loaded_cpu(allowed: &CpuMask, fallback_cpu: ProcessorId) -> ProcessorId {
+    let mut best_cpu = fallback_cpu;
+    let mut best_load = usize::MAX;
+
+    for cpu in allowed.iter_cpu() {
+        if !cpu_allowed_and_online(allowed, cpu) {
+            continue;
+        }
+
+        let load = rq_nr_running(cpu);
+        if load < best_load || (load == best_load && cpu == fallback_cpu) {
+            best_cpu = cpu;
+            best_load = load;
+        }
+    }
+
+    best_cpu
+}
+
+pub fn select_task_rq(
+    pcb: &Arc<ProcessControlBlock>,
+    prev_cpu: ProcessorId,
+    wake_flags: WakeupFlags,
+) -> ProcessorId {
+    let allowed = pcb.sched_info().cpus_allowed();
+    let current_cpu = smp_get_processor_id();
+    let fallback_cpu = if cpu_allowed_and_online(&allowed, prev_cpu) {
+        prev_cpu
+    } else if cpu_allowed_and_online(&allowed, current_cpu) {
+        current_cpu
+    } else {
+        first_allowed_online_cpu(&allowed)
+            .or_else(|| allowed.iter_cpu().next())
+            .unwrap_or(prev_cpu)
+    };
+
+    if pcb.flags().contains(ProcessFlags::KTHREAD) || pcb.sched_info().policy() != SchedPolicy::CFS
+    {
+        return fallback_cpu;
+    }
+
+    if wake_flags.contains(WakeupFlags::WF_FORK) {
+        return select_fork_idle_cpu(&allowed, fallback_cpu)
+            .unwrap_or_else(|| select_least_loaded_cpu(&allowed, fallback_cpu));
+    }
+
+    if wake_flags.contains(WakeupFlags::WF_TTWU) {
+        if let Some(idle_cpu) = pick_idle_cpu(&allowed) {
+            return idle_cpu;
+        }
+
+        return select_least_loaded_cpu(&allowed, fallback_cpu);
+    }
+
+    fallback_cpu
+}
+
 lazy_static! {
     pub static ref SCHED_FEATURES: SchedFeature = SchedFeature::GENTLE_FAIR_SLEEPERS
         | SchedFeature::START_DEBIT
@@ -999,6 +1094,43 @@ pub fn __schedule(sched_mod: SchedMode) {
     rq.update_rq_clock();
     rq.clock_updata_flags = ClockUpdataFlag::RQCF_UPDATE;
 
+    let mut migrate_prev_to = None;
+    if let Some(dest_cpu) = take_current_migration_target(&prev) {
+        debug_assert!(
+            !task_is_idle(&prev),
+            "idle task must not be migrated through current task migration"
+        );
+        debug_assert!(
+            cpu_is_online(dest_cpu),
+            "current task migration target {:?} must be online",
+            dest_cpu
+        );
+        debug_assert!(
+            prev.sched_info()
+                .cpus_allowed()
+                .get(dest_cpu)
+                .unwrap_or(false),
+            "current task migration target {:?} must be allowed by affinity",
+            dest_cpu
+        );
+
+        rq.deactivate_task(
+            prev.clone(),
+            DequeueFlag::DEQUEUE_MOVE | DequeueFlag::DEQUEUE_NOCLOCK,
+        );
+
+        if prev.sched_info().policy() == SchedPolicy::CFS {
+            let mut se = prev.sched_info().sched_entity();
+            crate::sched::fair::FairSchedEntity::for_each_in_group(&mut se, |se| {
+                se.cfs_rq().force_mut().set_current(Weak::default());
+                (true, true)
+            });
+        }
+
+        *prev.sched_info().on_rq.lock_irqsave() = OnRq::None;
+        migrate_prev_to = Some(dest_cpu);
+    }
+
     // kBUG!(
     //     "before cfs rq pcbs {:?}\nvruntimes {:?}\n",
     //     rq.cfs
@@ -1012,24 +1144,11 @@ pub fn __schedule(sched_mod: SchedMode) {
     //         .map(|x| { x.1.vruntime })
     //         .collect::<Vec<_>>(),
     // );
-    // warn!(
-    //     "before cfs rq {:?} prev {:?}",
-    //     rq.cfs
-    //         .entities
-    //         .iter()
-    //         .map(|x| { x.1.pcb().pid() })
-    //         .collect::<Vec<_>>(),
-    //     prev.pid()
-    // );
 
-    // error!("prev pid {:?} {:?}", prev.pid(), prev.sched_info().policy());
     if !sched_mod.contains(SchedMode::SM_MASK_PREEMPT)
         && prev.sched_info().policy() != SchedPolicy::IDLE
         && prev.sched_info().inner_lock_read_irqsave().is_mark_sleep()
     {
-        // warn!("deactivate_task prev {:?}", prev.pid());
-        // TODO: 这里需要处理信号
-        // https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/sched/core.c?r=&mo=172979&fi=6578#6630
         rq.deactivate_task(
             prev.clone(),
             DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
@@ -1044,58 +1163,33 @@ pub fn __schedule(sched_mod: SchedMode) {
         IDLE_CPUS.clear(rq.cpu);
     }
 
-    // kBUG!(
-    //     "after cfs rq pcbs {:?}\nvruntimes {:?}\n",
-    //     rq.cfs
-    //         .entities
-    //         .iter()
-    //         .map(|x| { x.1.pcb().pid() })
-    //         .collect::<Vec<_>>(),
-    //     rq.cfs
-    //         .entities
-    //         .iter()
-    //         .map(|x| { x.1.vruntime })
-    //         .collect::<Vec<_>>(),
-    // );
-
-    // error!("next {:?}", next.pid());
-
     prev.flags().remove(ProcessFlags::NEED_SCHEDULE);
     fence(Ordering::SeqCst);
     if likely(!Arc::ptr_eq(&prev, &next)) {
-        // 设置 rseq 事件：当 prev 被抢占时，标记 PREEMPT 事件
-        // 当 next 返回用户态时，需要更新 cpu_id
         crate::process::rseq::Rseq::on_preempt(&prev);
         if next.rseq_state().is_registered() {
             next.flags().insert(ProcessFlags::NEED_RSEQ);
         }
 
         rq.set_current(Arc::downgrade(&next));
-        // warn!(
-        //     "switch_process prev {:?} next {:?} sched_mode {sched_mod:?}",
-        //     prev.pid(),
-        //     next.pid()
-        // );
-
-        // send_to_default_serial8250_port(
-        //     format!(
-        //         "switch_process prev {:?} next {:?} sched_mode {sched_mod:?}\n",
-        //         prev.pid(),
-        //         next.pid()
-        //     )
-        //     .as_bytes(),
-        // );
-
-        // CurrentApic.send_eoi();
         compiler_fence(Ordering::SeqCst);
-
-        // This kernel does not hand off rq lock ownership across context switch.
-        // Drop it before switching so the incoming task's first tick/wakeup path
-        // can acquire the local rq lock normally.
+        if let Some(dest_cpu) = migrate_prev_to {
+            unsafe {
+                crate::process::PROCESS_SWITCH_RESULT
+                    .as_mut()
+                    .unwrap()
+                    .get_mut()
+                    .migrate_prev_to = Some(dest_cpu);
+            }
+        }
         drop(guard);
 
         unsafe { ProcessManager::switch_process(prev, next) };
     } else {
+        assert!(
+            migrate_prev_to.is_none(),
+            "current task migration must switch away from the migrated task"
+        );
         drop(guard);
         assert!(
             Arc::ptr_eq(&ProcessManager::current_pcb(), &prev),
@@ -1147,12 +1241,6 @@ pub fn sched_cgroup_fork(pcb: &Arc<ProcessControlBlock>) {
     );
 }
 
-pub fn sched_set_new_task_cpu(pcb: &Arc<ProcessControlBlock>, target_cpu: ProcessorId) {
-    __set_task_cpu(pcb, target_cpu);
-    pcb.sched_info().set_on_cpu(Some(target_cpu));
-    pcb.debug_assert_fork_cpu_binding();
-}
-
 fn __set_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {
     debug_assert!(
         cpu_is_online(cpu) || boot_in_progress(),
@@ -1164,6 +1252,99 @@ fn __set_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {
     let se = pcb.sched_info().sched_entity();
     let rq = cpu_rq(cpu.data() as usize);
     se.force_mut().set_cfs(Arc::downgrade(&rq.cfs));
+}
+
+pub fn rebind_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {
+    __set_task_cpu(pcb, cpu);
+    pcb.sched_info().set_on_cpu(Some(cpu));
+}
+
+pub fn enqueue_task_on_cpu(
+    pcb: &Arc<ProcessControlBlock>,
+    target_cpu: ProcessorId,
+    wake_flags: WakeupFlags,
+) {
+    __set_task_cpu(pcb, target_cpu);
+
+    let rq = cpu_rq(target_cpu.data() as usize);
+    let update_clock = target_cpu == smp_get_processor_id();
+    let (rq, _guard) = rq.self_lock();
+
+    if update_clock {
+        rq.update_rq_clock();
+    }
+
+    rq.activate_task(
+        pcb,
+        EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK,
+    );
+
+    if update_clock {
+        rq.check_preempt_currnet(pcb, wake_flags);
+    } else {
+        rq.check_preempt_remote(pcb, wake_flags);
+    }
+}
+
+pub fn request_task_migration(
+    pcb: &Arc<ProcessControlBlock>,
+    dest_cpu: ProcessorId,
+) -> Result<(), SystemError> {
+    let Some(src_cpu) = pcb.sched_info().on_cpu() else {
+        rebind_task_cpu(pcb, dest_cpu);
+        return Ok(());
+    };
+
+    if src_cpu == dest_cpu {
+        return Ok(());
+    }
+
+    let rq = cpu_rq(src_cpu.data() as usize);
+    let update_clock = src_cpu == smp_get_processor_id();
+    let (rq, _guard) = rq.self_lock();
+
+    if update_clock {
+        rq.update_rq_clock();
+    }
+
+    if Arc::ptr_eq(&rq.current(), pcb) {
+        pcb.sched_info().set_migrate_to(Some(dest_cpu));
+        pcb.flags()
+            .insert(ProcessFlags::NEED_MIGRATE | ProcessFlags::NEED_SCHEDULE);
+
+        if src_cpu != smp_get_processor_id() {
+            send_resched_ipi(src_cpu);
+        }
+
+        return Ok(());
+    }
+
+    if *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Queued {
+        rq.dequeue_task(
+            pcb.clone(),
+            DequeueFlag::DEQUEUE_MOVE | DequeueFlag::DEQUEUE_NOCLOCK,
+        );
+        *pcb.sched_info().on_rq.lock_irqsave() = OnRq::None;
+        pcb.sched_info().set_on_cpu(None);
+        drop(_guard);
+
+        enqueue_task_on_cpu(pcb, dest_cpu, WakeupFlags::WF_MIGRATED);
+        return Ok(());
+    }
+
+    rebind_task_cpu(pcb, dest_cpu);
+    Ok(())
+}
+
+pub fn take_current_migration_target(current: &Arc<ProcessControlBlock>) -> Option<ProcessorId> {
+    if !current.flags().contains(ProcessFlags::NEED_MIGRATE) {
+        return None;
+    }
+
+    let dest_cpu = current.sched_info().migrate_to()?;
+    current.sched_info().set_migrate_to(None);
+    current.flags().remove(ProcessFlags::NEED_MIGRATE);
+    Some(dest_cpu)
 }
 
 #[inline(never)]

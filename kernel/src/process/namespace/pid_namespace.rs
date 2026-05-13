@@ -88,6 +88,10 @@ impl PidNamespace {
         self.ns_common.level
     }
 
+    pub fn user_ns(&self) -> &Arc<UserNamespace> {
+        &self.user_ns
+    }
+
     pub fn alloc_pid_in_ns(&self, pid: Arc<Pid>) -> Result<RawPid, SystemError> {
         let mut inner = self.inner();
         let raw_pid = inner.do_alloc_pid_in_ns(pid)?;

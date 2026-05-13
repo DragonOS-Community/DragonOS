@@ -1,9 +1,8 @@
 use alloc::{string::String, sync::Arc};
-use core::hint::spin_loop;
 use system_error::SystemError;
 
 use crate::{
-    arch::reboot::{machine_halt, machine_restart},
+    arch::reboot::{machine_halt, machine_power_off, machine_restart},
     driver::base::device::device_shutdown,
     init::initial_kthread::{set_system_state, SystemState},
     libs::{
@@ -237,10 +236,7 @@ pub fn kernel_power_off() -> ! {
     do_kernel_power_off_prepare();
 
     log::warn!("Power down");
-    log::warn!("Currently, the system cannot be powered off, so we halt here.");
-    loop {
-        spin_loop();
-    }
+    machine_power_off();
 }
 
 /// # 功能

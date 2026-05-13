@@ -1,3 +1,4 @@
+pub mod cgroup2;
 pub mod devfs;
 pub mod devpts;
 pub mod epoll;

@@ -11,7 +11,11 @@ use raw_cpuid::CpuId;
 use system_error::SystemError;
 
 use crate::{
-    arch::{mm::LowAddressRemapping, process::table::TSSManager, CurrentTimeArch, MMArch},
+    arch::{
+        mm::{LowAddressRemapping, X86_64MMArch},
+        process::table::TSSManager,
+        CurrentTimeArch, MMArch,
+    },
     exception::InterruptArch,
     libs::cpumask::CpuMask,
     mm::{percpu::PerCpu, MemoryManagementArch, PhysAddr, VirtAddr, IDLE_PROCESS_ADDRESS_SPACE},
@@ -84,6 +88,8 @@ unsafe extern "sysv64" fn smp_init_switch_stack(st: &ApStartStackInfo) -> ! {
 unsafe extern "C" fn smp_ap_start_stage1() -> ! {
     let id = smp_get_processor_id();
     debug!("smp_ap_start_stage1: id: {}\n", id.data());
+    X86_64MMArch::init_current_cpu_nxe();
+
     let current_idle = ProcessManager::idle_pcb()[smp_get_processor_id().data() as usize].clone();
 
     let tss = TSSManager::current_tss();

@@ -311,6 +311,14 @@ impl KernelThreadCreateInfo {
             pcb.sched_info().set_cpus_allowed(CpuMask::from_cpu(cpu));
         }
     }
+
+    pub fn bound_cpu(&self) -> Option<ProcessorId> {
+        *self.bound_cpu.lock()
+    }
+
+    pub fn flags(&self) -> KernelThreadFlags {
+        *self.flags.lock()
+    }
 }
 
 pub struct KernelThreadMechanism;

@@ -649,6 +649,10 @@ struct fuse_daemon_args {
     struct simplefs fs;
 };
 
+static inline int fuse_daemon_read_should_stop(int err) {
+    return err == ENOTCONN || err == ENODEV || err == ECONNABORTED || err == EBADF;
+}
+
 static inline int simplefs_node_is_dir(const struct simplefs_node *n) {
     return n && (n->is_dir || simplefs_mode_is_dir(n->mode));
 }
@@ -1380,7 +1384,7 @@ static inline void *fuse_daemon_thread(void *arg) {
             FUSE_TEST_LOG("daemon read error n=%zd errno=%d", n, errno);
             if (errno == EINTR)
                 continue;
-            if (errno == ENOTCONN)
+            if (fuse_daemon_read_should_stop(errno))
                 break;
             continue;
         }

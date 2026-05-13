@@ -3,8 +3,12 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use system_error::SystemError;
 
 use crate::{
-    filesystem::vfs::{IndexNode, VFS_MAX_FOLLOW_SYMLINK_TIMES},
+    filesystem::{
+        fs::FsStruct,
+        vfs::{IndexNode, VFS_MAX_FOLLOW_SYMLINK_TIMES},
+    },
     process::{
+        cred::Cred,
         fork::CloneFlags,
         namespace::{
             cgroup_namespace::{CgroupNamespace, INIT_CGROUP_NAMESPACE},
@@ -148,8 +152,18 @@ impl ProcessManager {
             return Ok(());
         }
 
-        // todo: 这里要添加一个对user_namespace的处理
-        // https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/nsproxy.c?r=&mo=3770&fi=151#165
+        let user_ns = if clone_flags.contains(CloneFlags::CLONE_NEWUSER) {
+            let mut new_cred = (*child_pcb.cred()).clone();
+            let new_user_ns =
+                crate::process::namespace::user_namespace::UserNamespace::create_user_ns(
+                    &new_cred,
+                )?;
+            crate::process::cred::set_cred_user_ns(&mut new_cred, new_user_ns.clone());
+            child_pcb.set_cred(Cred::new_arc(new_cred))?;
+            new_user_ns
+        } else {
+            child_pcb.cred().user_ns.clone()
+        };
 
         /*
          * CLONE_NEWIPC must detach from the undolist: after switching
@@ -164,7 +178,6 @@ impl ProcessManager {
         {
             return Err(SystemError::EINVAL);
         }
-        let user_ns = child_pcb.cred().user_ns.clone();
         let new_ns = create_new_namespaces(clone_flags, child_pcb, user_ns)?;
         // 设置新的nsproxy
 
@@ -281,33 +294,41 @@ pub fn switch_task_namespaces(
     tsk: &Arc<ProcessControlBlock>,
     new_nsproxy: Arc<NsProxy>,
 ) -> Result<(), SystemError> {
-    let rebound_paths = if Arc::ptr_eq(tsk.nsproxy().mnt_namespace(), &new_nsproxy.mnt_ns) {
-        None
-    } else {
-        Some(resolve_fs_paths_for_new_mntns(tsk, &new_nsproxy.mnt_ns)?)
-    };
+    let fs = tsk.fs_struct();
+    switch_task_namespaces_with_fs(tsk, &fs, new_nsproxy)
+}
 
-    tsk.set_nsproxy(new_nsproxy);
-
-    if let Some((new_root, new_pwd)) = rebound_paths {
-        let fs = tsk.fs_struct_mut();
-        fs.set_root(new_root);
-        fs.set_pwd(new_pwd);
+pub(crate) fn switch_task_namespaces_with_fs(
+    tsk: &Arc<ProcessControlBlock>,
+    fs: &Arc<FsStruct>,
+    new_nsproxy: Arc<NsProxy>,
+) -> Result<(), SystemError> {
+    if !Arc::ptr_eq(tsk.nsproxy().mnt_namespace(), &new_nsproxy.mnt_ns) {
+        prepare_fs_for_new_mntns(fs, &new_nsproxy.mnt_ns)?;
     }
 
+    tsk.set_nsproxy(new_nsproxy);
+    Ok(())
+}
+
+pub(crate) fn prepare_fs_for_new_mntns(
+    fs: &Arc<FsStruct>,
+    new_mntns: &Arc<MntNamespace>,
+) -> Result<(), SystemError> {
+    let (new_root, new_pwd) = resolve_fs_paths_for_new_mntns(fs, new_mntns)?;
+    fs.set_root(new_root);
+    fs.set_pwd(new_pwd);
     Ok(())
 }
 
 type ReboundFsPaths = (Arc<dyn IndexNode>, Arc<dyn IndexNode>);
 
 fn resolve_fs_paths_for_new_mntns(
-    tsk: &Arc<ProcessControlBlock>,
+    fs: &Arc<FsStruct>,
     new_mntns: &Arc<MntNamespace>,
 ) -> Result<ReboundFsPaths, SystemError> {
-    let fs = tsk.fs_struct();
     let old_root_path = fs.root().absolute_path()?;
     let old_pwd_path = fs.pwd().absolute_path()?;
-    drop(fs);
 
     let new_root = resolve_from_namespace_root(new_mntns, &old_root_path)?;
     let new_pwd = resolve_from_namespace_root(new_mntns, &old_pwd_path)?;

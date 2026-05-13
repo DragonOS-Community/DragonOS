@@ -1826,6 +1826,18 @@ impl ProcessControlBlock {
         self.fs.write()
     }
 
+    #[inline(always)]
+    pub fn fs_struct_is_shared(&self) -> bool {
+        Arc::strong_count(&*self.fs.read()) > 1
+    }
+
+    pub fn set_fs_struct(&self, fs: Arc<FsStruct>) -> Arc<FsStruct> {
+        let mut guard = self.fs.write();
+        let old = guard.clone();
+        *guard = fs;
+        old
+    }
+
     pub fn pwd_inode(&self) -> Arc<dyn IndexNode> {
         self.fs.read().pwd()
     }

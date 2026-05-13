@@ -4,7 +4,11 @@ use system_error::SystemError;
 
 use crate::{
     filesystem::vfs::file::{FilePrivateData, NamespaceFilePrivateData},
-    process::{fork::CloneFlags, ProcessManager, RawPid},
+    process::{
+        cred::{ns_capable, CAPFlags, Cred},
+        fork::CloneFlags,
+        ProcessManager, RawPid,
+    },
 };
 
 use super::nsproxy::{switch_task_namespaces, NsProxy};
@@ -52,14 +56,14 @@ fn nsfd_target_userns(
 /// 内核态 setns 实现（当前仅支持 pidfd + namespace flag 形式）
 ///
 /// - `fd`：必须是通过 `pidfd_open` 或 `clone(CLONE_PIDFD)` 获得的 pidfd
-/// - `nstype`：命名空间 flag 组合，仅允许 CLONE_NEWNS/CLONE_NEWUTS/CLONE_NEWIPC/
-///   CLONE_NEWNET/CLONE_NEWPID/CLONE_NEWCGROUP，且不能为空
+/// - `nstype`：命名空间 flag 组合。pidfd 路径当前仅支持 CLONE_NEWNS/CLONE_NEWUTS/
+///   CLONE_NEWIPC/CLONE_NEWNET/CLONE_NEWPID/CLONE_NEWCGROUP；namespace fd 路径额外支持 CLONE_NEWUSER
 ///
 /// 语义（与 Linux setns(pidfd, flags) 对齐的子集）：
 /// - 针对指定 flag，从目标任务的 `NsProxy` 中拷贝对应 namespace 引用，
 ///   在当前任务上构造新的 `NsProxy` 并通过 `switch_task_namespaces` 原子替换
 /// - CLONE_NEWPID 仅影响 `pid_ns_for_children`（与 DragonOS/ Linux 一致）
-/// - 不支持 USER/TIME namespace 以及 `/proc/<pid>/ns/*` 路径
+/// - user namespace 当前仅支持通过 `/proc/<pid>/ns/user` 这类 namespace fd 进入
 #[inline(never)]
 pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
     // 1. 解析并校验 flag
@@ -70,6 +74,7 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
             | CloneFlags::CLONE_NEWUTS.bits()
             | CloneFlags::CLONE_NEWIPC.bits()
             | CloneFlags::CLONE_NEWNET.bits()
+            | CloneFlags::CLONE_NEWUSER.bits()
             | CloneFlags::CLONE_NEWPID.bits()
             | CloneFlags::CLONE_NEWCGROUP.bits(),
     );
@@ -103,6 +108,9 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
             return Err(SystemError::EBADF);
         }
         if flags.is_empty() {
+            return Err(SystemError::EINVAL);
+        }
+        if flags.contains(CloneFlags::CLONE_NEWUSER) {
             return Err(SystemError::EINVAL);
         }
 
@@ -192,9 +200,12 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
             // 仅影响子进程 PID namespace，保持与 Linux 语义一致
             new_inner.pid_ns_for_children = ns;
         }
-        NamespaceFilePrivateData::User(_ns) => {
-            // 暂未实现 user namespace 切换
-            return Err(SystemError::EINVAL);
+        NamespaceFilePrivateData::User(ns) => {
+            if !flags.is_empty() && !flags.contains(CloneFlags::CLONE_NEWUSER) {
+                return Err(SystemError::EINVAL);
+            }
+            userns_install(&current, ns)?;
+            return Ok(());
         }
         NamespaceFilePrivateData::Cgroup(ns) => {
             if !flags_match(flags, CloneFlags::CLONE_NEWCGROUP) {
@@ -211,6 +222,39 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
 
     // 5. 原子切换当前任务的 namespace 代理
     switch_task_namespaces(&current, new_nsproxy)?;
+
+    Ok(())
+}
+
+/// 安装（切换）user namespace（对应 Linux userns_install）
+fn userns_install(
+    current: &Arc<crate::process::ProcessControlBlock>,
+    user_ns: Arc<super::user_namespace::UserNamespace>,
+) -> Result<(), SystemError> {
+    // 1. 不能与当前 ns 相同（防止重复获得能力）
+    if Arc::ptr_eq(&current.cred().user_ns, &user_ns) {
+        return Err(SystemError::EINVAL);
+    }
+
+    // 2. 不能共享线程组
+    if !current.threads_read_irqsave().thread_group_empty() {
+        return Err(SystemError::EINVAL);
+    }
+
+    // 3. 不能共享 fs_struct
+    if current.fs_struct_is_shared() {
+        return Err(SystemError::EINVAL);
+    }
+
+    // 4. 需要 CAP_SYS_ADMIN 在目标 ns
+    if !ns_capable(&user_ns, CAPFlags::CAP_SYS_ADMIN) {
+        return Err(SystemError::EPERM);
+    }
+
+    // 5. 先准备新的 cred，全部校验通过后再提交
+    let mut new_cred = (*current.cred()).clone();
+    crate::process::cred::set_cred_user_ns(&mut new_cred, user_ns);
+    current.set_cred(Cred::new_arc(new_cred))?;
 
     Ok(())
 }

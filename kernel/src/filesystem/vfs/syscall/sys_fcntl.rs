@@ -1,5 +1,6 @@
 use crate::arch::ipc::signal::Signal;
 use crate::arch::syscall::nr::SYS_FCNTL;
+use crate::filesystem::vfs::fasync::set_file_fasync;
 use crate::filesystem::vfs::FileType;
 use crate::filesystem::vfs::InodeFlags;
 use crate::ipc::pipe::LockedPipeInode;
@@ -181,7 +182,12 @@ impl SysFcntlHandle {
                     {
                         return Err(SystemError::EPERM);
                     }
+                    let old_fasync = current_flags.contains(FileFlags::FASYNC);
+                    let new_fasync = new_flags.contains(FileFlags::FASYNC);
                     file.set_flags(new_flags)?;
+                    if old_fasync != new_fasync {
+                        set_file_fasync(&file, fd, new_fasync)?;
+                    }
 
                     // Keep socket object nonblocking state in sync with file flags.
                     // Some socket implementations consult an internal AtomicBool rather than
@@ -287,11 +293,6 @@ impl SysFcntlHandle {
                 return Ok(owner.data());
             }
             FcntlCommand::SetSig => {
-                // F_SETSIG: 设置异步 I/O 通知信号。
-                // arg == 0 表示使用默认 SIGIO。
-                // 与 Linux fs/fcntl.c 一致：先做 fd 查找（EBADF 优先于 EINVAL），
-                // 再对原始 `usize` 做上界比较——避免 64 位值低 32 位恰好落入
-                // [0, SIGRTMAX] 时被错误接受。
                 let binding = ProcessManager::current_pcb().fd_table();
                 let file = binding
                     .read()
@@ -300,17 +301,16 @@ impl SysFcntlHandle {
                 if arg > Signal::SIGRTMAX as usize {
                     return Err(SystemError::EINVAL);
                 }
-                file.set_fasync_signum(arg as i32);
+                file.set_owner_signum(arg as i32);
                 return Ok(0);
             }
             FcntlCommand::GetSig => {
-                // F_GETSIG: 获取异步 I/O 通知信号；0 表示默认 SIGIO。
                 let binding = ProcessManager::current_pcb().fd_table();
                 let file = binding
                     .read()
                     .get_file_by_fd(fd)
                     .ok_or(SystemError::EBADF)?;
-                return Ok(file.fasync_signum() as usize);
+                return Ok(file.owner_signum() as usize);
             }
             FcntlCommand::GetPipeSize => {
                 // F_GETPIPE_SZ: 获取管道缓冲区大小

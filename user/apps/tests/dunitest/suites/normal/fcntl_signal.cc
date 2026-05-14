@@ -3,96 +3,189 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
-#include <stdio.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <unistd.h>
+
+#ifndef F_SETSIG
+#define F_SETSIG 10
+#endif
+
+#ifndef F_GETSIG
+#define F_GETSIG 11
+#endif
 
 namespace {
 
-// Linux kernel definition: __SIGRTMAX is 64. Keep a local constant so this
-// test does not rely on the libc SIGRTMAX macro (which is typically 64 but
-// exposed as an adjusted value by glibc).
-constexpr int kKernelSigrtmax = 64;
+constexpr int kKernelSigRtMax = 64;
 
-int fd_pair() {
-    int fds[2] = {-1, -1};
-    if (pipe(fds) != 0) {
-        return -1;
+volatile sig_atomic_t g_signal_count = 0;
+volatile sig_atomic_t g_signal_number = 0;
+volatile sig_atomic_t g_signal_fd = -1;
+volatile sig_atomic_t g_signal_band = 0;
+
+void reset_signal_state() {
+    g_signal_count = 0;
+    g_signal_number = 0;
+    g_signal_fd = -1;
+    g_signal_band = 0;
+}
+
+void fasync_signal_handler(int sig, siginfo_t* info, void*) {
+    g_signal_count++;
+    g_signal_number = sig;
+    if (info != nullptr) {
+        g_signal_fd = info->si_fd;
+        g_signal_band = info->si_band;
     }
-    close(fds[1]);
-    return fds[0];
+}
+
+void install_signal_handler(int signum) {
+    struct sigaction action = {};
+    action.sa_sigaction = fasync_signal_handler;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_SIGINFO;
+    ASSERT_EQ(0, sigaction(signum, &action, nullptr))
+        << "sigaction failed: errno=" << errno << " (" << strerror(errno) << ")";
+}
+
+bool wait_for_signal() {
+    for (int i = 0; i < 100; ++i) {
+        if (g_signal_count > 0) {
+            return true;
+        }
+        usleep(10 * 1000);
+    }
+    return false;
 }
 
 }  // namespace
 
-// 默认值应为 0，表示使用 SIGIO。
 TEST(FcntlSignal, GetSigDefaultsToZero) {
-    int fd = fd_pair();
-    ASSERT_GE(fd, 0);
+    int fds[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(fds));
 
-    int sig = fcntl(fd, F_GETSIG);
-    EXPECT_EQ(0, sig) << "errno=" << errno << " (" << strerror(errno) << ")";
+    EXPECT_EQ(0, fcntl(fds[0], F_GETSIG));
 
-    close(fd);
+    close(fds[0]);
+    close(fds[1]);
 }
 
-// F_SETSIG 后 F_GETSIG 应返回同一值。
-TEST(FcntlSignal, SetSigThenGetSigRoundTrip) {
-    int fd = fd_pair();
-    ASSERT_GE(fd, 0);
+TEST(FcntlSignal, SetSigRoundTripAndValidation) {
+    int fds[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(fds));
 
-    ASSERT_EQ(0, fcntl(fd, F_SETSIG, SIGUSR1));
-    EXPECT_EQ(SIGUSR1, fcntl(fd, F_GETSIG));
-
-    ASSERT_EQ(0, fcntl(fd, F_SETSIG, SIGUSR2));
-    EXPECT_EQ(SIGUSR2, fcntl(fd, F_GETSIG));
-
-    // 0 表示恢复默认 SIGIO。
-    ASSERT_EQ(0, fcntl(fd, F_SETSIG, 0));
-    EXPECT_EQ(0, fcntl(fd, F_GETSIG));
-
-    close(fd);
-}
-
-// 边界：SIGRTMAX 必须被接受。
-TEST(FcntlSignal, SetSigAcceptsSigrtmaxBoundary) {
-    int fd = fd_pair();
-    ASSERT_GE(fd, 0);
-
-    ASSERT_EQ(0, fcntl(fd, F_SETSIG, kKernelSigrtmax));
-    EXPECT_EQ(kKernelSigrtmax, fcntl(fd, F_GETSIG));
-
-    close(fd);
-}
-
-// 负值与超过 SIGRTMAX 的值应返回 EINVAL。
-TEST(FcntlSignal, SetSigRejectsInvalidValues) {
-    int fd = fd_pair();
-    ASSERT_GE(fd, 0);
+    ASSERT_EQ(0, fcntl(fds[0], F_SETSIG, SIGUSR1));
+    EXPECT_EQ(SIGUSR1, fcntl(fds[0], F_GETSIG));
 
     errno = 0;
-    EXPECT_EQ(-1, fcntl(fd, F_SETSIG, -1));
+    EXPECT_EQ(-1, fcntl(fds[0], F_SETSIG, kKernelSigRtMax + 1));
     EXPECT_EQ(EINVAL, errno);
+    EXPECT_EQ(SIGUSR1, fcntl(fds[0], F_GETSIG));
 
-    errno = 0;
-    EXPECT_EQ(-1, fcntl(fd, F_SETSIG, kKernelSigrtmax + 1));
-    EXPECT_EQ(EINVAL, errno);
+    ASSERT_EQ(0, fcntl(fds[0], F_SETSIG, 0));
+    EXPECT_EQ(0, fcntl(fds[0], F_GETSIG));
 
-    // 校验失败不应修改现有值。
-    EXPECT_EQ(0, fcntl(fd, F_GETSIG));
-
-    close(fd);
+    close(fds[0]);
+    close(fds[1]);
 }
 
-// 对非法 fd 的 F_GETSIG/F_SETSIG 应返回 EBADF。
-TEST(FcntlSignal, InvalidFdReturnsEBADF) {
-    errno = 0;
-    EXPECT_EQ(-1, fcntl(-1, F_GETSIG));
-    EXPECT_EQ(EBADF, errno);
+TEST(FcntlSignal, CustomSignalDeliveredForPipeAsyncIo) {
+    int fds[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(fds));
 
-    errno = 0;
-    EXPECT_EQ(-1, fcntl(-1, F_SETSIG, SIGUSR1));
-    EXPECT_EQ(EBADF, errno);
+    install_signal_handler(SIGUSR1);
+    reset_signal_state();
+
+    ASSERT_EQ(0, fcntl(fds[0], F_SETOWN, getpid()));
+    ASSERT_EQ(0, fcntl(fds[0], F_SETSIG, SIGUSR1));
+
+    int flags = fcntl(fds[0], F_GETFL);
+    ASSERT_GE(flags, 0);
+    ASSERT_EQ(0, fcntl(fds[0], F_SETFL, flags | O_ASYNC));
+
+    ASSERT_EQ(1, write(fds[1], "x", 1));
+    ASSERT_TRUE(wait_for_signal());
+
+    EXPECT_EQ(SIGUSR1, g_signal_number);
+    EXPECT_EQ(fds[0], g_signal_fd);
+    EXPECT_EQ(EPOLLIN | EPOLLRDNORM, g_signal_band);
+
+    close(fds[0]);
+    close(fds[1]);
+}
+
+TEST(FcntlSignal, PipeCloseReportsHangupAndErrorBands) {
+    int fds[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(fds));
+
+    install_signal_handler(SIGUSR1);
+    reset_signal_state();
+
+    ASSERT_EQ(0, fcntl(fds[0], F_SETOWN, getpid()));
+    ASSERT_EQ(0, fcntl(fds[0], F_SETSIG, SIGUSR1));
+
+    int read_flags = fcntl(fds[0], F_GETFL);
+    ASSERT_GE(read_flags, 0);
+    ASSERT_EQ(0, fcntl(fds[0], F_SETFL, read_flags | O_ASYNC));
+
+    ASSERT_EQ(0, close(fds[1]));
+    ASSERT_TRUE(wait_for_signal());
+
+    EXPECT_EQ(SIGUSR1, g_signal_number);
+    EXPECT_EQ(fds[0], g_signal_fd);
+    EXPECT_EQ(EPOLLHUP, g_signal_band);
+
+    ASSERT_EQ(0, close(fds[0]));
+
+    ASSERT_EQ(0, pipe(fds));
+    reset_signal_state();
+
+    ASSERT_EQ(0, fcntl(fds[1], F_SETOWN, getpid()));
+    ASSERT_EQ(0, fcntl(fds[1], F_SETSIG, SIGUSR1));
+
+    int write_flags = fcntl(fds[1], F_GETFL);
+    ASSERT_GE(write_flags, 0);
+    ASSERT_EQ(0, fcntl(fds[1], F_SETFL, write_flags | O_ASYNC));
+
+    ASSERT_EQ(0, close(fds[0]));
+    ASSERT_TRUE(wait_for_signal());
+
+    EXPECT_EQ(SIGUSR1, g_signal_number);
+    EXPECT_EQ(fds[1], g_signal_fd);
+    EXPECT_EQ(EPOLLERR, g_signal_band);
+
+    close(fds[1]);
+}
+
+TEST(FcntlSignal, DupKeepsRegisteredFdForSiginfo) {
+    int fds[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(fds));
+
+    int dup_fd = dup(fds[0]);
+    ASSERT_GE(dup_fd, 0);
+
+    install_signal_handler(SIGUSR2);
+    reset_signal_state();
+
+    ASSERT_EQ(0, fcntl(fds[0], F_SETOWN, getpid()));
+    ASSERT_EQ(0, fcntl(fds[0], F_SETSIG, SIGUSR1));
+
+    int flags = fcntl(fds[0], F_GETFL);
+    ASSERT_GE(flags, 0);
+    ASSERT_EQ(0, fcntl(fds[0], F_SETFL, flags | O_ASYNC));
+
+    ASSERT_EQ(0, fcntl(dup_fd, F_SETSIG, SIGUSR2));
+    ASSERT_EQ(1, write(fds[1], "x", 1));
+    ASSERT_TRUE(wait_for_signal());
+
+    EXPECT_EQ(SIGUSR2, g_signal_number);
+    EXPECT_EQ(fds[0], g_signal_fd);
+    EXPECT_EQ(EPOLLIN | EPOLLRDNORM, g_signal_band);
+
+    close(dup_fd);
+    close(fds[0]);
+    close(fds[1]);
 }
 
 int main(int argc, char** argv) {

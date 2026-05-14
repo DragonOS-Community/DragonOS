@@ -56,6 +56,9 @@ fn do_mlock2(start: VirtAddr, len: usize, flags: usize) -> Result<usize, SystemE
     }
 
     let (start, len) = normalize_mlock_range(start, len)?;
+    if len == 0 {
+        return Ok(0);
+    }
     if access_ok(start, len).is_err() {
         return Err(SystemError::EINVAL);
     }
@@ -73,7 +76,7 @@ fn do_mlock2(start: VirtAddr, len: usize, flags: usize) -> Result<usize, SystemE
     if flags & MLOCK_ONFAULT != 0 {
         new_flags |= VmFlags::VM_LOCKONFAULT;
     }
-    guard.apply_vma_lock_flags(start, len, new_flags)?;
+    guard.apply_vma_lock_flags(start, len, new_flags, false)?;
     Ok(0)
 }
 

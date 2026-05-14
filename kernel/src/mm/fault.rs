@@ -12,7 +12,7 @@ use crate::{
     libs::align::align_down,
     mm::{
         page::{page_manager_lock, EntryFlags},
-        ucontext::{AddressSpace, LockedVMA},
+        ucontext::{AddressSpace, InnerAddressSpace, LockedVMA},
         VirtAddr, VmFaultReason, VmFlags,
     },
     process::{ProcessManager, ProcessState},
@@ -124,6 +124,22 @@ impl<'a> PageFaultMessage<'a> {
 pub struct PageFaultHandler;
 
 impl PageFaultHandler {
+    fn attach_fault_mapped_page(page: &Arc<Page>, vma: &Arc<LockedVMA>, mlocked: bool) {
+        let mut page_guard = page.write();
+        page_guard.insert_vma(vma.clone());
+        if mlocked {
+            page_guard.add_flags(PageFlags::PG_UNEVICTABLE);
+        }
+    }
+
+    fn detach_fault_mapped_page(page: &Arc<Page>, vma: &Arc<LockedVMA>) {
+        let mut page_guard = page.write();
+        page_guard.remove_vma(vma.as_ref());
+        if !InnerAddressSpace::page_should_remain_unevictable(&page_guard) {
+            page_guard.remove_flags(PageFlags::PG_UNEVICTABLE);
+        }
+    }
+
     fn file_page_cache(
         pfm: &PageFaultMessage<'_>,
     ) -> Option<Arc<crate::filesystem::page_cache::PageCache>> {
@@ -298,10 +314,10 @@ impl PageFaultHandler {
 
                     // Map the shared page into current process
                     let flags = vma.lock().flags();
+                    let mlocked = vma.lock().vm_flags().contains(VmFlags::VM_LOCKED);
                     if let Some(flush) = mapper.map_phys(address, page.phys_address(), flags) {
                         flush.flush();
-                        page.write().insert_vma(vma.clone());
-                        // TODO: mlock 缺页联动：若 VMA 带 VM_LOCKED，应标记 PG_UNEVICTABLE。
+                        Self::attach_fault_mapped_page(&page, &vma, mlocked);
                         return VmFaultReason::VM_FAULT_COMPLETED;
                     } else {
                         return VmFaultReason::VM_FAULT_OOM;
@@ -311,7 +327,10 @@ impl PageFaultHandler {
         }
 
         // Fallback: private anonymous page (MAP_PRIVATE or non-shared anon)
-        let flags = vma.lock().flags();
+        let guard = vma.lock();
+        let flags = guard.flags();
+        let mlocked = guard.vm_flags().contains(VmFlags::VM_LOCKED);
+        drop(guard);
         if let Some(flush) = mapper.map(address, flags) {
             flush.flush();
             crate::debug::klog::mm::mm_debug_log(
@@ -325,8 +344,8 @@ impl PageFaultHandler {
             let paddr = mapper.translate(address).unwrap().0;
             let mut page_manager_guard = page_manager_lock();
             let page = page_manager_guard.get_unwrap(&paddr);
-            page.write().insert_vma(vma.clone());
-            // TODO: mlock 缺页联动：若 VMA 带 VM_LOCKED，应标记 PG_UNEVICTABLE。
+            drop(page_manager_guard);
+            Self::attach_fault_mapped_page(&page, &vma, mlocked);
             VmFaultReason::VM_FAULT_COMPLETED
         } else {
             VmFaultReason::VM_FAULT_OOM
@@ -569,22 +588,27 @@ impl PageFaultHandler {
             } else if let Some(flush) = mapper.map(address, new_flags) {
                 let mut page_manager_guard = page_manager_lock();
                 let old_page = page_manager_guard.get_unwrap(&old_paddr);
-                old_page.write().remove_vma(&vma);
+                drop(page_manager_guard);
+                Self::detach_fault_mapped_page(&old_page, &vma);
 
                 // 替换为新的物理页：必须先让其他 CPU 的 TLB 失效，
                 // 才能保证它们不会再通过旧 TLB 访问旧物理页。
                 // SAFETY: 后续 mm.flush_tlb_range 会做 mm-aware 远端 + 本地 shootdown。
                 unsafe { flush.ignore() };
+                let mut page_manager_guard = page_manager_lock();
                 let paddr = mapper.translate(address).unwrap().0;
                 let page = page_manager_guard.get_unwrap(&paddr);
-                page.write().insert_vma(vma.clone());
+                drop(page_manager_guard);
+                Self::attach_fault_mapped_page(
+                    &page,
+                    &vma,
+                    vma.lock().vm_flags().contains(VmFlags::VM_LOCKED),
+                );
 
                 (MMArch::phys_2_virt(paddr).unwrap().data() as *mut u8).copy_from_nonoverlapping(
                     MMArch::phys_2_virt(old_paddr).unwrap().data() as *mut u8,
                     MMArch::PAGE_SIZE,
                 );
-
-                drop(page_manager_guard);
                 mm.flush_tlb_range(address, end, MMArch::PAGE_SHIFT as u8, false);
                 VmFaultReason::VM_FAULT_COMPLETED
             } else {
@@ -595,20 +619,25 @@ impl PageFaultHandler {
             if let Some(flush) = mapper.map(address, new_flags) {
                 let mut page_manager_guard = page_manager_lock();
                 let old_page = page_manager_guard.get_unwrap(&old_paddr);
-                old_page.write().remove_vma(&vma);
+                drop(page_manager_guard);
+                Self::detach_fault_mapped_page(&old_page, &vma);
 
                 // SAFETY: 后续 mm.flush_tlb_range 会做 mm-aware 远端 + 本地 shootdown。
                 unsafe { flush.ignore() };
+                let mut page_manager_guard = page_manager_lock();
                 let paddr = mapper.translate(address).unwrap().0;
                 let page = page_manager_guard.get_unwrap(&paddr);
-                page.write().insert_vma(vma.clone());
+                drop(page_manager_guard);
+                Self::attach_fault_mapped_page(
+                    &page,
+                    &vma,
+                    vma.lock().vm_flags().contains(VmFlags::VM_LOCKED),
+                );
 
                 (MMArch::phys_2_virt(paddr).unwrap().data() as *mut u8).copy_from_nonoverlapping(
                     MMArch::phys_2_virt(old_paddr).unwrap().data() as *mut u8,
                     MMArch::PAGE_SIZE,
                 );
-
-                drop(page_manager_guard);
                 mm.flush_tlb_range(address, end, MMArch::PAGE_SHIFT as u8, false);
                 VmFaultReason::VM_FAULT_COMPLETED
             } else {
@@ -722,6 +751,7 @@ impl PageFaultHandler {
         let mm = pfm.mm().clone();
         let _pt_edit = mm.page_table_edit();
         let mapper = &mut pfm.mapper;
+        let mlocked = vma_guard.vm_flags().contains(VmFlags::VM_LOCKED);
 
         // 起始页地址
         let addr = vma_guard.region().start
@@ -745,8 +775,8 @@ impl PageFaultHandler {
                             .unwrap()
                             .flush();
                     }
-                    page_guard.upgrade().insert_vma(vma.clone());
-                    // TODO: mlock 缺页联动：若 VMA 带 VM_LOCKED，应标记 PG_UNEVICTABLE。
+                    drop(page_guard);
+                    Self::attach_fault_mapped_page(&page, &vma, mlocked);
                 }
             }
         }
@@ -872,10 +902,10 @@ impl PageFaultHandler {
         };
 
         let page_phys = page_to_map.phys_address();
+        let mlocked = vma_guard.vm_flags().contains(VmFlags::VM_LOCKED);
 
         mapper.map_phys(address, page_phys, vma_guard.flags());
-        page_to_map.write().insert_vma(pfm.vma());
-        // TODO: mlock 缺页联动：若 VMA 带 VM_LOCKED，应标记 PG_UNEVICTABLE。
+        Self::attach_fault_mapped_page(&page_to_map, &pfm.vma(), mlocked);
         VmFaultReason::VM_FAULT_COMPLETED
     }
 
@@ -883,7 +913,10 @@ impl PageFaultHandler {
     pub unsafe fn zero_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
         let address = pfm.address_aligned_down();
         let vma = pfm.vma();
-        let flags = vma.lock().flags();
+        let guard = vma.lock();
+        let flags = guard.flags();
+        let mlocked = guard.vm_flags().contains(VmFlags::VM_LOCKED);
+        drop(guard);
         let mm = pfm.mm().clone();
         let _pt_edit = mm.page_table_edit();
         let mapper = &mut pfm.mapper;
@@ -893,8 +926,8 @@ impl PageFaultHandler {
             let mut pm = page_manager_lock();
             let paddr = mapper.translate(address).unwrap().0;
             let page = pm.get_unwrap(&paddr);
-            page.write().insert_vma(vma);
-            // TODO: mlock 缺页联动：若 VMA 带 VM_LOCKED，应标记 PG_UNEVICTABLE。
+            drop(pm);
+            Self::attach_fault_mapped_page(&page, &vma, mlocked);
             VmFaultReason::VM_FAULT_COMPLETED
         } else {
             VmFaultReason::VM_FAULT_OOM
@@ -915,6 +948,7 @@ impl PageFaultHandler {
         };
         let base = vma_guard.region().start();
         let flags = vma_guard.flags();
+        let mlocked = vma_guard.vm_flags().contains(VmFlags::VM_LOCKED);
         drop(vma_guard);
 
         let mm = pfm.mm().clone();
@@ -927,8 +961,8 @@ impl PageFaultHandler {
                 let mut pm = page_manager_lock();
                 let paddr = mapper.translate(addr).unwrap().0;
                 let page = pm.get_unwrap(&paddr);
-                page.write().insert_vma(vma.clone());
-                // TODO: mlock 缺页联动：若 VMA 带 VM_LOCKED，应标记 PG_UNEVICTABLE。
+                drop(pm);
+                Self::attach_fault_mapped_page(&page, &vma, mlocked);
             } else {
                 return VmFaultReason::VM_FAULT_OOM;
             }

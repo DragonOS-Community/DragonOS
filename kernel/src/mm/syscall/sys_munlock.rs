@@ -22,13 +22,16 @@ impl Syscall for SysMunlockHandle {
         let start = VirtAddr::new(Self::start(args));
         let len = Self::len(args);
         let (start, len) = normalize_mlock_range(start, len)?;
+        if len == 0 {
+            return Ok(0);
+        }
         if access_ok(start, len).is_err() {
             return Err(SystemError::EINVAL);
         }
 
         let vm = AddressSpace::current()?;
         let mut guard = vm.write_interruptible()?;
-        guard.apply_vma_lock_flags(start, len, VmFlags::VM_NONE)?;
+        guard.apply_vma_lock_flags(start, len, VmFlags::VM_NONE, false)?;
         Ok(0)
     }
 

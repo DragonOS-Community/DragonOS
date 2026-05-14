@@ -59,15 +59,18 @@ fn do_mlockall(flags: usize) -> Result<usize, SystemError> {
     }
 
     let vm = AddressSpace::current()?;
+    let mut guard = vm.write_interruptible()?;
     if flags & MCL_CURRENT != 0 {
-        let mut guard = vm.write_interruptible()?;
         let new_pages = guard.count_unlocked_pages_for_mlockall()?;
         check_mlock_rlimit(guard.locked_vm, new_pages)?;
+    }
+    guard.set_mlock_future(VmFlags::VM_NONE);
+
+    if flags & MCL_CURRENT != 0 {
         guard.apply_mlockall_current(lock_flags)?;
     }
 
     if flags & MCL_FUTURE != 0 {
-        let mut guard = vm.write_interruptible()?;
         guard.set_mlock_future(lock_flags);
     }
 

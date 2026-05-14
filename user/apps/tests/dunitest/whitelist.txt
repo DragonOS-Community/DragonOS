@@ -9,6 +9,7 @@ normal/test_pivot_root
 normal/test_mount_reconfigure
 normal/test_fchown_o_path
 normal/proc_self_limits
+normal/mlock_semantics
 normal/sched_affinity
 normal/test_tlb_shootdown
 normal/tcp_close_semantics

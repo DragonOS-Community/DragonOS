@@ -50,6 +50,9 @@ pub(super) fn do_mlock(
     new_flags: VmFlags,
 ) -> Result<usize, SystemError> {
     let (start, len) = normalize_mlock_range(start, len)?;
+    if len == 0 {
+        return Ok(0);
+    }
     if access_ok(start, len).is_err() {
         return Err(SystemError::EINVAL);
     }
@@ -64,7 +67,7 @@ pub(super) fn do_mlock(
     let new_pages = guard.count_unlocked_pages_for_mlock(start, len)?;
     check_mlock_rlimit(guard.locked_vm, new_pages)?;
 
-    guard.apply_vma_lock_flags(start, len, new_flags)?;
+    guard.apply_vma_lock_flags(start, len, new_flags, false)?;
     Ok(0)
 }
 
@@ -90,20 +93,17 @@ pub(super) fn normalize_mlock_range(
     start: VirtAddr,
     len: usize,
 ) -> Result<(VirtAddr, usize), SystemError> {
-    if len == 0 {
-        return Err(SystemError::EINVAL);
-    }
-
     let offset = start.data() & MMArch::PAGE_OFFSET_MASK;
     let aligned_start = VirtAddr::new(page_align_down(start.data()));
+    if len == 0 {
+        return Ok((aligned_start, 0));
+    }
+
     let len = len.checked_add(offset).ok_or(SystemError::EINVAL)?;
     let len = len
         .checked_add(MMArch::PAGE_SIZE - 1)
         .ok_or(SystemError::EINVAL)?
         & MMArch::PAGE_MASK;
-    if len == 0 {
-        return Err(SystemError::EINVAL);
-    }
 
     aligned_start
         .data()

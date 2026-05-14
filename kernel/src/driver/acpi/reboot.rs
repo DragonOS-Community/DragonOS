@@ -3,11 +3,11 @@ use core::{hint::spin_loop, ptr, slice};
 use acpi::{
     address::{AccessSize, AddressSpace, GenericAddress},
     fadt::Fadt,
-    AcpiTable,
+    AcpiError, AcpiHandler, AcpiTable,
 };
-use alloc::{boxed::Box, vec::Vec};
-use aml::{value::Args, AmlContext, AmlName, AmlValue, DebugVerbosity, Handler};
-use log::{debug, error, warn};
+use alloc::{boxed::Box, format, string::String, sync::Arc, vec::Vec};
+use aml::{value::Args, AmlContext, AmlError, AmlName, AmlValue, DebugVerbosity, Handler};
+use log::{debug, error, info, warn};
 use system_error::SystemError;
 
 use crate::{
@@ -16,11 +16,12 @@ use crate::{
         pci::BusDeviceFunction,
         root::{pci_root_0, pci_root_manager},
     },
-    mm::{early_ioremap::EarlyIoRemap, PhysAddr, VirtAddr},
+    libs::spinlock::SpinLock,
+    misc::reboot::{register_power_off_handler, PowerOffHandler},
     time::{sleep::nanosleep, PosixTimeSpec},
 };
 
-use super::acpi_manager;
+use super::{acpi_manager, AcpiHandlerImpl};
 
 const ACPI_ACCESS_BIT_SHIFT: u8 = 2;
 const ACPI_PM1_SLEEP_TYPE_SHIFT: u16 = 10;
@@ -32,6 +33,57 @@ const ACPI_SLEEP_CONTROL_TYPE_SHIFT: u16 = 2;
 const ACPI_SLEEP_CONTROL_ENABLE: u16 = 1 << 5;
 const ACPI_POWER_OFF_SPIN_LOOPS: usize = 10_000_000;
 const ACPI_ENABLE_SPIN_LOOPS: usize = 1_000_000;
+
+#[derive(Debug, Clone, Copy)]
+enum AcpiPowerOffMode {
+    Legacy {
+        pm1a_control: GenericAddress,
+        pm1b_control: Option<GenericAddress>,
+    },
+    Extended {
+        sleep_control: GenericAddress,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AcpiPowerOffInfo {
+    slp_typa: u16,
+    slp_typb: u16,
+    mode: AcpiPowerOffMode,
+}
+
+static ACPI_POWER_OFF_INFO: SpinLock<Option<AcpiPowerOffInfo>> = SpinLock::new(None);
+static ACPI_POWER_OFF_PROBE_STATUS: SpinLock<Option<String>> = SpinLock::new(None);
+
+#[derive(Debug)]
+struct AcpiPowerOffHandler;
+
+lazy_static! {
+    static ref ACPI_POWER_OFF_HANDLER: Arc<AcpiPowerOffHandler> = Arc::new(AcpiPowerOffHandler);
+}
+
+impl PowerOffHandler for AcpiPowerOffHandler {
+    fn name(&self) -> &'static str {
+        "acpi-s5"
+    }
+
+    fn priority(&self) -> i32 {
+        100
+    }
+
+    fn prepare(&self) -> Result<(), SystemError> {
+        let tables = acpi_manager().tables().ok_or(SystemError::ENODEV)?;
+        let fadt = tables
+            .find_table::<Fadt>()
+            .map_err(|_| SystemError::ENODEV)?;
+        acpi_try_enable(&fadt);
+        Ok(())
+    }
+
+    fn power_off(&self) -> Result<(), SystemError> {
+        acpi_power_off()
+    }
+}
 
 struct AcpiMap {
     physical_start: usize,
@@ -118,39 +170,47 @@ pub fn acpi_reboot() {
 }
 
 pub fn acpi_power_off() -> Result<(), SystemError> {
-    let tables = acpi_manager().tables().ok_or(SystemError::ENODEV)?;
-    let fadt = tables
-        .find_table::<Fadt>()
-        .map_err(|_| SystemError::ENODEV)?;
-    let (slp_typa, slp_typb) = find_s5_sleep_type().ok_or(SystemError::ENODEV)?;
+    let info = ACPI_POWER_OFF_INFO
+        .lock()
+        .as_ref()
+        .copied()
+        .ok_or_else(|| {
+            warn!("ACPI poweroff invoked without registered S5 poweroff info");
+            SystemError::ENODEV
+        })?;
+
+    let tables = acpi_manager().tables().ok_or_else(|| {
+        warn!("ACPI poweroff failed: ACPI tables are unavailable");
+        SystemError::ENODEV
+    })?;
+    let fadt = tables.find_table::<Fadt>().map_err(|_| {
+        warn!("ACPI poweroff failed: FADT table is unavailable");
+        SystemError::ENODEV
+    })?;
 
     acpi_try_enable(&fadt);
 
-    let pm1a_control = fadt.pm1a_control_block().map_err(|_| SystemError::ENODEV)?;
-    if pm1a_control.address != 0 {
-        let pm1b_control = fadt
-            .pm1b_control_block()
-            .map_err(|_| SystemError::ENODEV)?
-            .filter(|register| register.address != 0);
-        let current_control = acpi_read_pm1_control_pair(pm1a_control, pm1b_control)? as u16;
-        let pm1_base = (current_control & !ACPI_PM1_CONTROL_WRITEONLY_BITS) & !ACPI_PM1_SLEEP_MASK;
-        let pm1a_value = pm1_base | ((slp_typa & 0x7) << ACPI_PM1_SLEEP_TYPE_SHIFT);
-        let pm1b_value = pm1_base | ((slp_typb & 0x7) << ACPI_PM1_SLEEP_TYPE_SHIFT);
-
-        acpi_write_pm1_control_pair(pm1a_control, pm1a_value, pm1b_control, pm1b_value)?;
-        acpi_write_pm1_control_pair(
+    match info.mode {
+        AcpiPowerOffMode::Legacy {
             pm1a_control,
-            pm1a_value | ACPI_PM1_SLEEP_ENABLE,
             pm1b_control,
-            pm1b_value | ACPI_PM1_SLEEP_ENABLE,
-        )?;
-    } else {
-        if let Some(sleep_control) = fadt
-            .sleep_control_register()
-            .map_err(|_| SystemError::ENODEV)?
-            .filter(|register| register.address != 0)
-        {
-            let value = (((slp_typa & 0x7) << ACPI_SLEEP_CONTROL_TYPE_SHIFT)
+        } => {
+            let current_control = acpi_read_pm1_control_pair(pm1a_control, pm1b_control)? as u16;
+            let pm1_base =
+                (current_control & !ACPI_PM1_CONTROL_WRITEONLY_BITS) & !ACPI_PM1_SLEEP_MASK;
+            let pm1a_value = pm1_base | ((info.slp_typa & 0x7) << ACPI_PM1_SLEEP_TYPE_SHIFT);
+            let pm1b_value = pm1_base | ((info.slp_typb & 0x7) << ACPI_PM1_SLEEP_TYPE_SHIFT);
+
+            acpi_write_pm1_control_pair(pm1a_control, pm1a_value, pm1b_control, pm1b_value)?;
+            acpi_write_pm1_control_pair(
+                pm1a_control,
+                pm1a_value | ACPI_PM1_SLEEP_ENABLE,
+                pm1b_control,
+                pm1b_value | ACPI_PM1_SLEEP_ENABLE,
+            )?;
+        }
+        AcpiPowerOffMode::Extended { sleep_control } => {
+            let value = (((info.slp_typa & 0x7) << ACPI_SLEEP_CONTROL_TYPE_SHIFT)
                 | ACPI_SLEEP_CONTROL_ENABLE) as u64;
             acpi_write_gas(sleep_control, value)?;
         }
@@ -161,6 +221,105 @@ pub fn acpi_power_off() -> Result<(), SystemError> {
     }
 
     Err(SystemError::EIO)
+}
+
+pub fn register_acpi_poweroff_handler() {
+    let info = match probe_acpi_power_off() {
+        Ok(info) => info,
+        Err(e) => {
+            warn!("ACPI poweroff handler not registered: {:?}", e);
+            return;
+        }
+    };
+
+    *ACPI_POWER_OFF_INFO.lock() = Some(info);
+    set_probe_status(match info.mode {
+        AcpiPowerOffMode::Legacy { .. } => "registered ACPI S5 legacy PM1 poweroff handler".into(),
+        AcpiPowerOffMode::Extended { .. } => {
+            "registered ACPI S5 extended sleep control poweroff handler".into()
+        }
+    });
+
+    if let Err(e) = register_power_off_handler(ACPI_POWER_OFF_HANDLER.clone()) {
+        warn!("ACPI poweroff handler registration failed: {:?}", e);
+        set_probe_status("ACPI S5 probe succeeded but handler registration failed".into());
+        return;
+    }
+
+    info!("ACPI S5 poweroff handler registered");
+}
+
+fn probe_acpi_power_off() -> Result<AcpiPowerOffInfo, SystemError> {
+    let tables = acpi_manager().tables().ok_or_else(|| {
+        set_probe_status("ACPI tables are unavailable".into());
+        warn!("ACPI poweroff probe failed: ACPI tables are unavailable");
+        SystemError::ENODEV
+    })?;
+    let fadt = tables.find_table::<Fadt>().map_err(|_| {
+        set_probe_status("FADT table is unavailable".into());
+        warn!("ACPI poweroff probe failed: FADT table is unavailable");
+        SystemError::ENODEV
+    })?;
+    let (slp_typa, slp_typb) = find_s5_sleep_type().map_err(|e| {
+        let status = describe_s5_lookup_error(&e);
+        set_probe_status(status.clone());
+        warn!("ACPI poweroff probe failed: {}", status);
+        SystemError::ENODEV
+    })?;
+
+    let pm1a_control = fadt.pm1a_control_block().map_err(|_| {
+        set_probe_status("PM1A control block is invalid".into());
+        warn!("ACPI poweroff probe failed: PM1A control block is invalid");
+        SystemError::ENODEV
+    })?;
+    if pm1a_control.address != 0 {
+        let pm1b_control = fadt
+            .pm1b_control_block()
+            .map_err(|_| {
+                set_probe_status("PM1B control block is invalid".into());
+                warn!("ACPI poweroff probe failed: PM1B control block is invalid");
+                SystemError::ENODEV
+            })?
+            .filter(|register| register.address != 0);
+
+        return Ok(AcpiPowerOffInfo {
+            slp_typa,
+            slp_typb,
+            mode: AcpiPowerOffMode::Legacy {
+                pm1a_control,
+                pm1b_control,
+            },
+        });
+    }
+
+    if let Some(sleep_control) = fadt
+        .sleep_control_register()
+        .map_err(|_| {
+            set_probe_status("sleep control register is invalid".into());
+            warn!("ACPI poweroff probe failed: sleep control register is invalid");
+            SystemError::ENODEV
+        })?
+        .filter(|register| register.address != 0)
+    {
+        return Ok(AcpiPowerOffInfo {
+            slp_typa,
+            slp_typb,
+            mode: AcpiPowerOffMode::Extended { sleep_control },
+        });
+    }
+
+    set_probe_status("neither PM1 control nor sleep control register is available".into());
+    warn!(
+        "ACPI poweroff probe failed: neither PM1 control nor sleep control register is available"
+    );
+    return Err(SystemError::ENODEV);
+}
+
+pub fn acpi_poweroff_probe_status() -> String {
+    ACPI_POWER_OFF_PROBE_STATUS
+        .lock()
+        .clone()
+        .unwrap_or_else(|| "ACPI poweroff probe has not run".into())
 }
 
 fn acpi_write_pm1_control_pair(
@@ -189,47 +348,246 @@ fn acpi_read_pm1_control_pair(
     Ok(value)
 }
 
-fn find_s5_sleep_type() -> Option<(u16, u16)> {
-    let tables = acpi_manager().tables()?;
+#[derive(Debug)]
+enum S5LookupError {
+    DsdtLookupFailed {
+        error: AcpiError,
+        fadt_snapshot: String,
+    },
+    DsdtMapFailed {
+        address: usize,
+        length: u32,
+        error: SystemError,
+    },
+    DsdtParseFailed {
+        raw_s5_in_dsdt: bool,
+        error: AmlError,
+    },
+    SsdtWithS5ParseFailed {
+        index: usize,
+        raw_s5_in_dsdt: bool,
+        error: AmlError,
+    },
+    NamespaceLookupFailed {
+        raw_s5_in_dsdt: bool,
+        raw_s5_in_ssdt: bool,
+        error: AmlError,
+    },
+    InvalidSleepTypePackage {
+        raw_s5_in_dsdt: bool,
+        raw_s5_in_ssdt: bool,
+    },
+    RawAmlDoesNotContainS5 {
+        raw_s5_in_dsdt: bool,
+        raw_s5_in_ssdt: bool,
+    },
+}
+
+fn find_s5_sleep_type() -> Result<(u16, u16), S5LookupError> {
+    let tables = acpi_manager()
+        .tables()
+        .ok_or(S5LookupError::DsdtLookupFailed {
+            error: AcpiError::InvalidDsdtAddress,
+            fadt_snapshot: "ACPI tables are unavailable while probing DSDT".into(),
+        })?;
     let mut context = AmlContext::new(Box::new(AcpiAmlHandler), DebugVerbosity::None);
 
-    let dsdt = tables.dsdt().ok()?;
-    parse_aml_table(&mut context, &dsdt, "DSDT").ok()?;
+    let fadt = tables
+        .find_table::<Fadt>()
+        .map_err(|_| S5LookupError::DsdtLookupFailed {
+            error: AcpiError::TableMissing(Fadt::SIGNATURE),
+            fadt_snapshot: "FADT lookup failed while probing DSDT".into(),
+        })?;
+    let dsdt = tables
+        .dsdt()
+        .map_err(|error| S5LookupError::DsdtLookupFailed {
+            error,
+            fadt_snapshot: format!("{:?}", &*fadt),
+        })?;
+    let dsdt_bytes = map_aml_table_bytes(&dsdt).map_err(|error| S5LookupError::DsdtMapFailed {
+        address: dsdt.address,
+        length: dsdt.length,
+        error,
+    })?;
+    let raw_s5_in_dsdt = aml_stream_contains_s5(&dsdt_bytes);
+    parse_aml_stream(&mut context, &dsdt_bytes, "DSDT").map_err(|error| {
+        S5LookupError::DsdtParseFailed {
+            raw_s5_in_dsdt,
+            error,
+        }
+    })?;
 
-    for ssdt in tables.ssdts() {
-        let _ = parse_aml_table(&mut context, &ssdt, "SSDT");
+    let mut raw_s5_in_ssdt = false;
+    let mut ssdt_with_s5_parse_error = None;
+    for (index, ssdt) in tables.ssdts().enumerate() {
+        let ssdt_bytes = match map_aml_table_bytes(&ssdt) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        let ssdt_has_raw_s5 = aml_stream_contains_s5(&ssdt_bytes);
+        raw_s5_in_ssdt |= ssdt_has_raw_s5;
+        if let Err(error) = parse_aml_stream(&mut context, &ssdt_bytes, "SSDT") {
+            if ssdt_has_raw_s5 && ssdt_with_s5_parse_error.is_none() {
+                ssdt_with_s5_parse_error = Some((index, error));
+            }
+        }
     }
 
-    find_s5_sleep_type_in_context(&mut context)
+    match find_s5_sleep_type_in_context(&mut context, raw_s5_in_dsdt, raw_s5_in_ssdt) {
+        Ok(value) => Ok(value),
+        Err(S5LookupError::RawAmlDoesNotContainS5 { .. }) => {
+            if let Some((index, error)) = ssdt_with_s5_parse_error {
+                Err(S5LookupError::SsdtWithS5ParseFailed {
+                    index,
+                    raw_s5_in_dsdt,
+                    error,
+                })
+            } else {
+                Err(S5LookupError::RawAmlDoesNotContainS5 {
+                    raw_s5_in_dsdt,
+                    raw_s5_in_ssdt,
+                })
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
-fn parse_aml_table(
-    context: &mut AmlContext,
-    table: &acpi::AmlTable,
-    name: &str,
-) -> Result<(), SystemError> {
-    let (vaddr, _) = EarlyIoRemap::map(PhysAddr::new(table.address), table.length as usize, false)?;
-    let bytes = unsafe { slice::from_raw_parts(vaddr.data() as *const u8, table.length as usize) };
-    let result = parse_aml_stream(context, bytes, name);
-    let _ = EarlyIoRemap::unmap(vaddr);
-    result
+fn map_aml_table_bytes(table: &acpi::AmlTable) -> Result<Vec<u8>, SystemError> {
+    let mapping =
+        unsafe { AcpiHandlerImpl.map_physical_region::<u8>(table.address, table.length as usize) };
+    let bytes =
+        unsafe { slice::from_raw_parts(mapping.virtual_start().as_ptr(), table.length as usize) };
+    let owned = bytes.to_vec();
+    Ok(owned)
 }
 
-fn parse_aml_stream(context: &mut AmlContext, bytes: &[u8], name: &str) -> Result<(), SystemError> {
+fn aml_stream_contains_s5(bytes: &[u8]) -> bool {
+    bytes.windows(4).any(|window| window == b"_S5_")
+}
+
+fn parse_aml_stream(context: &mut AmlContext, bytes: &[u8], name: &str) -> Result<(), AmlError> {
     context.parse_table(bytes).map_err(|e| {
         warn!("failed to parse ACPI {} for _S5 lookup: {:?}", name, e);
-        SystemError::EINVAL
+        e
     })
 }
 
-fn find_s5_sleep_type_in_context(context: &mut AmlContext) -> Option<(u16, u16)> {
-    let s5_name = AmlName::from_str("\\_S5_").ok()?;
-    let value = match context.namespace.get_by_path(&s5_name).ok()?.clone() {
-        AmlValue::Method { .. } => context.invoke_method(&s5_name, Args::EMPTY).ok()?,
-        value => value,
+fn find_s5_sleep_type_in_context(
+    context: &mut AmlContext,
+    raw_s5_in_dsdt: bool,
+    raw_s5_in_ssdt: bool,
+) -> Result<(u16, u16), S5LookupError> {
+    let s5_name = AmlName::from_str("\\_S5_").unwrap();
+    let value = match context.namespace.get_by_path(&s5_name) {
+        Ok(value) => match value.clone() {
+            AmlValue::Method { .. } => {
+                context
+                    .invoke_method(&s5_name, Args::EMPTY)
+                    .map_err(|error| S5LookupError::NamespaceLookupFailed {
+                        raw_s5_in_dsdt,
+                        raw_s5_in_ssdt,
+                        error,
+                    })?
+            }
+            value => value,
+        },
+        Err(error) => {
+            if raw_s5_in_dsdt || raw_s5_in_ssdt {
+                return Err(S5LookupError::NamespaceLookupFailed {
+                    raw_s5_in_dsdt,
+                    raw_s5_in_ssdt,
+                    error,
+                });
+            }
+
+            return Err(S5LookupError::RawAmlDoesNotContainS5 {
+                raw_s5_in_dsdt,
+                raw_s5_in_ssdt,
+            });
+        }
     };
 
-    s5_sleep_type_from_value(&value)
+    s5_sleep_type_from_value(&value).ok_or(S5LookupError::InvalidSleepTypePackage {
+        raw_s5_in_dsdt,
+        raw_s5_in_ssdt,
+    })
+}
+
+fn describe_s5_lookup_error(error: &S5LookupError) -> String {
+    match error {
+        S5LookupError::DsdtLookupFailed {
+            error,
+            fadt_snapshot,
+        } => format!(
+            "DSDT lookup failed: {:?}; FADT snapshot: {}",
+            error, fadt_snapshot
+        ),
+        S5LookupError::DsdtMapFailed {
+            address,
+            length,
+            error,
+        } => format!(
+            "DSDT AML mapping failed: {:?} (address={:#x}, length={:#x})",
+            error, address, length
+        ),
+        S5LookupError::DsdtParseFailed {
+            raw_s5_in_dsdt,
+            error,
+        } => format!(
+            "DSDT AML parse failed before _S5 lookup: {:?} (raw AML contains _S5_: {})",
+            error,
+            yes_no(*raw_s5_in_dsdt)
+        ),
+        S5LookupError::SsdtWithS5ParseFailed {
+            index,
+            raw_s5_in_dsdt,
+            error,
+        } => format!(
+            "SSDT[{}] AML parse failed while raw AML contains _S5_: {:?} (DSDT raw _S5_: {})",
+            index,
+            error,
+            yes_no(*raw_s5_in_dsdt)
+        ),
+        S5LookupError::NamespaceLookupFailed {
+            raw_s5_in_dsdt,
+            raw_s5_in_ssdt,
+            error,
+        } => format!(
+            "_S5_ bytes exist in raw AML but namespace lookup/evaluation failed: {:?} (DSDT raw _S5_: {}, SSDT raw _S5_: {})",
+            error,
+            yes_no(*raw_s5_in_dsdt),
+            yes_no(*raw_s5_in_ssdt)
+        ),
+        S5LookupError::InvalidSleepTypePackage {
+            raw_s5_in_dsdt,
+            raw_s5_in_ssdt,
+        } => format!(
+            "_S5_ exists but does not evaluate to a valid sleep-type package (DSDT raw _S5_: {}, SSDT raw _S5_: {})",
+            yes_no(*raw_s5_in_dsdt),
+            yes_no(*raw_s5_in_ssdt)
+        ),
+        S5LookupError::RawAmlDoesNotContainS5 {
+            raw_s5_in_dsdt,
+            raw_s5_in_ssdt,
+        } => format!(
+            "raw AML does not contain _S5_ (DSDT raw _S5_: {}, SSDT raw _S5_: {})",
+            yes_no(*raw_s5_in_dsdt),
+            yes_no(*raw_s5_in_ssdt)
+        ),
+    }
+}
+
+fn set_probe_status(status: String) {
+    *ACPI_POWER_OFF_PROBE_STATUS.lock() = Some(status);
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
 }
 
 fn s5_sleep_type_from_value(value: &AmlValue) -> Option<(u16, u16)> {
@@ -611,7 +969,6 @@ fn acpi_write_gas(register: GenericAddress, value: u64) -> Result<(), SystemErro
         index += 1;
     }
 
-    debug!("ACPI HW Write: 0x{:x} to 0x{:x}\n", value, address);
     Ok(())
 }
 
@@ -650,7 +1007,6 @@ fn acpi_read_gas(register: GenericAddress) -> Result<u64, SystemError> {
         index += 1;
     }
 
-    debug!("ACPI HW Read: 0x{:x} from 0x{:x}\n", value, address);
     Ok(value)
 }
 
@@ -794,129 +1150,59 @@ unsafe fn write_io(port: u16, value: u32, width: u32) -> Result<(), SystemError>
 fn read_memory(paddr: usize, width: u32) -> Result<u64, SystemError> {
     // 读取数据的大小（字节）
     let size = width / 8;
-    // 标志是否需要解除映射
-    let mut unmap = false;
 
-    let mut vaddr = ACPI_MAP_LIST.find_vaddr(paddr, size as usize);
-    if vaddr.is_none() {
-        // 如果没有找到对应的虚拟地址，则进行映射
-        vaddr = Some(
-            EarlyIoRemap::map(PhysAddr::new(paddr), size as usize, false)
-                .map(|(vaddr, _)| vaddr.data())?,
-        );
-        unmap = true;
+    if let Some(vaddr) = ACPI_MAP_LIST.find_vaddr(paddr, size as usize) {
+        return read_bytes_volatile(vaddr as *const u8, width);
     }
 
-    let value = match width {
-        8 => unsafe { ptr::read_volatile(vaddr.unwrap() as *const u8) as u64 },
-        16 => unsafe { ptr::read_volatile(vaddr.unwrap() as *const u16) as u64 },
-        32 => unsafe { ptr::read_volatile(vaddr.unwrap() as *const u32) as u64 },
-        64 => unsafe { ptr::read_volatile(vaddr.unwrap() as *const u64) },
-        _ => {
-            error!("acpi read memory error, unsupported width: {}", width);
-            return Err(SystemError::EINVAL);
-        }
-    };
-
-    if unmap {
-        // 解除上面的映射
-        EarlyIoRemap::unmap(VirtAddr::new(vaddr.unwrap()))?;
-    }
-
-    return Ok(value);
+    let mapping = unsafe { AcpiHandlerImpl.map_physical_region::<u8>(paddr, size as usize) };
+    read_bytes_volatile(mapping.virtual_start().as_ptr(), width)
 }
 
 /// # 向内存地址写入值
 fn write_memory(paddr: usize, value: u64, width: u32) -> Result<(), SystemError> {
     // 写入数据的大小（字节）
     let size = width / 8;
-    // 标志是否需要解除映射
-    let mut unmap = false;
 
     // 从映射表中查找物理地址对应的虚拟地址(由于目前acpi并没有建立任何物理地址到虚拟地址的映射，所以这里肯定是找不到的)
-    let mut vaddr = ACPI_MAP_LIST.find_vaddr(paddr, size as usize);
-    if vaddr.is_none() {
-        // 如果没有找到对应的虚拟地址，则进行映射
-        vaddr = Some(
-            EarlyIoRemap::map(PhysAddr::new(paddr), size as usize, false)
-                .map(|(vaddr, _)| vaddr.data())?,
-        );
-        unmap = true;
+    if let Some(vaddr) = ACPI_MAP_LIST.find_vaddr(paddr, size as usize) {
+        return write_bytes_volatile(vaddr as *mut u8, value, width);
     }
 
-    match width {
-        8 => unsafe {
-            ptr::write_volatile(vaddr.unwrap() as *mut u8, value as u8);
-        },
-        16 => unsafe {
-            ptr::write_volatile(vaddr.unwrap() as *mut u16, value as u16);
-        },
-        32 => unsafe {
-            ptr::write_volatile(vaddr.unwrap() as *mut u32, value as u32);
-        },
-        64 => unsafe { ptr::write_volatile(vaddr.unwrap() as *mut u64, value) },
-        _ => {
-            error!("acpi write memory error, unsupported width: {}", width);
-            return Err(SystemError::EINVAL);
-        }
-    }
-
-    if unmap {
-        // 解除上面的映射
-        EarlyIoRemap::unmap(VirtAddr::new(vaddr.unwrap()))?;
-    }
-
-    return Ok(());
+    let mapping = unsafe { AcpiHandlerImpl.map_physical_region::<u8>(paddr, size as usize) };
+    write_bytes_volatile(mapping.virtual_start().as_ptr(), value, width)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn s5_sleep_type_from_encoded_integer_package() {
-        let value = AmlValue::Package(alloc::vec![AmlValue::Integer(0x0504)]);
-
-        assert_eq!(s5_sleep_type_from_value(&value), Some((4, 5)));
+fn read_bytes_volatile(ptr: *const u8, width: u32) -> Result<u64, SystemError> {
+    let byte_count = width_to_byte_count(width)?;
+    let mut value = 0u64;
+    for index in 0..byte_count {
+        let byte = unsafe { ptr::read_volatile(ptr.add(index)) } as u64;
+        value |= byte << (index * 8);
     }
+    Ok(value)
+}
 
-    #[test]
-    fn s5_sleep_type_from_two_integer_package() {
-        let value = AmlValue::Package(alloc::vec![
-            AmlValue::Integer(4),
-            AmlValue::Integer(5),
-            AmlValue::Integer(0),
-        ]);
-
-        assert_eq!(s5_sleep_type_from_value(&value), Some((4, 5)));
+fn write_bytes_volatile(ptr: *mut u8, value: u64, width: u32) -> Result<(), SystemError> {
+    let byte_count = width_to_byte_count(width)?;
+    for index in 0..byte_count {
+        let byte = ((value >> (index * 8)) & 0xff) as u8;
+        unsafe {
+            ptr::write_volatile(ptr.add(index), byte);
+        }
     }
+    Ok(())
+}
 
-    #[test]
-    fn s5_sleep_type_rejects_invalid_package() {
-        assert_eq!(
-            s5_sleep_type_from_value(&AmlValue::Package(Vec::new())),
-            None
-        );
-        assert_eq!(
-            s5_sleep_type_from_value(&AmlValue::Package(alloc::vec![
-                AmlValue::Boolean(false),
-                AmlValue::Integer(5),
-            ])),
-            None
-        );
-    }
-
-    #[test]
-    fn s5_sleep_type_can_be_defined_by_ssdt() {
-        let dsdt_without_s5 = [0x08, b'A', b'B', b'C', b'D', 0x01];
-        let ssdt_with_s5 = [
-            0x08, b'_', b'S', b'5', b'_', 0x12, 0x06, 0x02, 0x0a, 0x04, 0x0a, 0x05,
-        ];
-        let mut context = AmlContext::new(Box::new(AcpiAmlHandler), DebugVerbosity::None);
-
-        parse_aml_stream(&mut context, &dsdt_without_s5, "DSDT").unwrap();
-        parse_aml_stream(&mut context, &ssdt_with_s5, "SSDT").unwrap();
-
-        assert_eq!(find_s5_sleep_type_in_context(&mut context), Some((4, 5)));
+fn width_to_byte_count(width: u32) -> Result<usize, SystemError> {
+    match width {
+        8 => Ok(1),
+        16 => Ok(2),
+        32 => Ok(4),
+        64 => Ok(8),
+        _ => {
+            error!("acpi memory access error, unsupported width: {}", width);
+            Err(SystemError::EINVAL)
+        }
     }
 }

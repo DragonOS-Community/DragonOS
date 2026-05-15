@@ -80,6 +80,22 @@ where
     ptr: AtomicPtr<T>,
 }
 
+unsafe fn defer_drop_slot_arc_raw<T>(raw: *mut T)
+where
+    T: Send + Sync + 'static,
+{
+    if raw.is_null() {
+        return;
+    }
+
+    // SAFETY: callers pass a non-null pointer previously created by
+    // Arc::into_raw() for the slot-owned reference. Removing that pointer from
+    // an RCU-visible slot is a publication removal, so the reference must be
+    // released only after a grace period.
+    let old = unsafe { Arc::from_raw(raw) };
+    rcu_defer_drop(old);
+}
+
 impl<T> RcuArcSlot<T>
 where
     T: Send + Sync + 'static,
@@ -136,16 +152,119 @@ where
 {
     fn drop(&mut self) {
         let raw = self.ptr.swap(ptr::null_mut(), Ordering::AcqRel);
+        // SAFETY: `raw` was removed from this slot exactly once. Even though
+        // `Drop` has exclusive access to the slot, an RCU reader may have
+        // already dereferenced the old pointer and not yet pinned its own Arc.
+        unsafe { defer_drop_slot_arc_raw(raw) };
+    }
+}
+
+#[derive(Debug)]
+pub struct RcuOptionArcSlot<T>
+where
+    T: Send + Sync + 'static,
+{
+    ptr: AtomicPtr<T>,
+}
+
+impl<T> RcuOptionArcSlot<T>
+where
+    T: Send + Sync + 'static,
+{
+    pub const fn new_none() -> Self {
+        Self {
+            ptr: AtomicPtr::new(ptr::null_mut()),
+        }
+    }
+
+    pub fn new_some(initial: Arc<T>) -> Self {
+        Self {
+            ptr: AtomicPtr::new(Arc::into_raw(initial) as *mut T),
+        }
+    }
+
+    pub fn load(&self) -> Option<Arc<T>> {
+        let _guard = rcu_read_lock();
+        let raw = rcu_dereference(&self.ptr);
         if raw.is_null() {
-            return;
+            return None;
         }
 
-        // SAFETY: dropping the slot consumes the final slot-owned reference to
-        // the published Arc. Any reader that needed the object must already
-        // have pinned its own strong reference through `load()`.
+        // SAFETY: the non-null pointer is owned by the slot as an Arc raw
+        // pointer. RCU keeps the allocation alive while the read section is
+        // active, so it is safe to acquire a strong reference before leaving.
         unsafe {
-            drop(Arc::from_raw(raw));
+            Arc::increment_strong_count(raw);
+            Some(Arc::from_raw(raw))
         }
+    }
+
+    pub fn swap(&self, new: Option<Arc<T>>) -> Option<Arc<T>> {
+        let new_raw = new
+            .map(|value| Arc::into_raw(value) as *mut T)
+            .unwrap_or_default();
+        let old_raw = self.ptr.swap(new_raw, Ordering::AcqRel);
+
+        NonNull::new(old_raw).map(|old| {
+            // SAFETY: a non-null pointer in the slot was previously created by
+            // Arc::into_raw. The swap removes the slot-owned reference exactly
+            // once, so reconstructing the Arc transfers that ownership back.
+            unsafe { Arc::from_raw(old.as_ptr()) }
+        })
+    }
+
+    pub fn store_deferred(&self, new: Option<Arc<T>>) {
+        if let Some(old) = self.swap(new) {
+            rcu_defer_drop(old);
+        }
+    }
+
+    pub fn clear_if_deferred<F>(&self, mut pred: F) -> bool
+    where
+        F: FnMut(&T) -> bool,
+    {
+        loop {
+            let _guard = rcu_read_lock();
+            let raw = rcu_dereference(&self.ptr);
+            let Some(current) = NonNull::new(raw) else {
+                return false;
+            };
+
+            // SAFETY: the pointer is protected by the RCU read-side critical
+            // section. Writers that remove it must defer the final slot-owned
+            // Arc drop until after this read-side section completes.
+            let should_clear = pred(unsafe { current.as_ref() });
+            if !should_clear {
+                return false;
+            }
+
+            if self
+                .ptr
+                .compare_exchange(raw, ptr::null_mut(), Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                // SAFETY: the successful compare_exchange removed this exact
+                // slot-owned Arc reference, so reconstructing it transfers
+                // ownership for deferred drop exactly once.
+                let old = unsafe { Arc::from_raw(raw) };
+                drop(_guard);
+                rcu_defer_drop(old);
+                return true;
+            }
+        }
+    }
+}
+
+impl<T> Drop for RcuOptionArcSlot<T>
+where
+    T: Send + Sync + 'static,
+{
+    fn drop(&mut self) {
+        let raw = self.ptr.swap(ptr::null_mut(), Ordering::AcqRel);
+        // SAFETY: `raw` was removed from this slot exactly once. Dropping a
+        // slot is still a removal from an RCU-visible publication point, so the
+        // slot-owned Arc reference must be released after a grace period.
+        unsafe { defer_drop_slot_arc_raw(raw) };
     }
 }
 

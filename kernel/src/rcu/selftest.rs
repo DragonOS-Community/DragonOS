@@ -1,7 +1,7 @@
 use alloc::{boxed::Box, format, string::String, sync::Arc};
 use core::{
     ptr::{self, NonNull},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use crate::{
@@ -316,8 +316,9 @@ fn run_pr2_selftest() -> Result<(), &'static str> {
     }
 
     drop(slot);
+    rcu_barrier();
     if new_drops.load(Ordering::SeqCst) != 1 {
-        return Err("current slot object was not dropped when the slot was destroyed");
+        return Err("current slot object was not dropped after slot destruction grace period");
     }
 
     let sighand = SigHand::new();
@@ -354,10 +355,133 @@ fn run_pr2_selftest() -> Result<(), &'static str> {
     Ok(())
 }
 
+fn run_pr3_selftest() -> Result<(), &'static str> {
+    let option_drops = Arc::new(AtomicUsize::new(0));
+    let option_replacement_drops = Arc::new(AtomicUsize::new(0));
+    let option_clear_drops = Arc::new(AtomicUsize::new(0));
+    let option_race_old_drops = Arc::new(AtomicUsize::new(0));
+    let option_race_new_drops = Arc::new(AtomicUsize::new(0));
+    let option_drop_drops = Arc::new(AtomicUsize::new(0));
+
+    let option_slot = RcuOptionArcSlot::new_none();
+    if option_slot.load().is_some() {
+        return Err("RcuOptionArcSlot::new_none did not start empty");
+    }
+
+    option_slot.store_deferred(Some(Arc::new(RcuSelftestDropProbe {
+        id: 3,
+        drops: option_drops.clone(),
+    })));
+    let pinned_option = option_slot
+        .load()
+        .ok_or("RcuOptionArcSlot did not publish the first object")?;
+    if pinned_option.id != 3 {
+        return Err("RcuOptionArcSlot loaded the wrong first object");
+    }
+
+    option_slot.store_deferred(Some(Arc::new(RcuSelftestDropProbe {
+        id: 4,
+        drops: option_replacement_drops.clone(),
+    })));
+    rcu_barrier();
+    if option_drops.load(Ordering::SeqCst) != 0 {
+        return Err("RcuOptionArcSlot dropped a pinned old object");
+    }
+    if option_slot.load().map(|value| value.id) != Some(4) {
+        return Err("RcuOptionArcSlot did not publish the replacement object");
+    }
+
+    drop(pinned_option);
+    if option_drops.load(Ordering::SeqCst) != 1 {
+        return Err("RcuOptionArcSlot old object was not dropped after final pin");
+    }
+
+    option_slot.store_deferred(None);
+    rcu_barrier();
+    if option_slot.load().is_some() {
+        return Err("RcuOptionArcSlot did not clear to None");
+    }
+    if option_replacement_drops.load(Ordering::SeqCst) != 1 {
+        return Err("RcuOptionArcSlot replacement object was not dropped after clear");
+    }
+
+    option_slot.store_deferred(Some(Arc::new(RcuSelftestDropProbe {
+        id: 5,
+        drops: option_clear_drops.clone(),
+    })));
+    if !option_slot.clear_if_deferred(|value| value.id == 5) {
+        return Err("RcuOptionArcSlot clear_if_deferred did not clear a matching object");
+    }
+    rcu_barrier();
+    if option_slot.load().is_some() {
+        return Err("RcuOptionArcSlot clear_if_deferred left a matching object published");
+    }
+    if option_clear_drops.load(Ordering::SeqCst) != 1 {
+        return Err("RcuOptionArcSlot clear_if_deferred did not drop the cleared object");
+    }
+
+    option_slot.store_deferred(Some(Arc::new(RcuSelftestDropProbe {
+        id: 6,
+        drops: option_race_old_drops.clone(),
+    })));
+    let replaced_once = AtomicBool::new(false);
+    let cleared = option_slot.clear_if_deferred(|value| {
+        if value.id == 6 && !replaced_once.swap(true, Ordering::SeqCst) {
+            option_slot.store_deferred(Some(Arc::new(RcuSelftestDropProbe {
+                id: 7,
+                drops: option_race_new_drops.clone(),
+            })));
+            return true;
+        }
+
+        value.id == 6
+    });
+    if cleared {
+        return Err("RcuOptionArcSlot clear_if_deferred cleared after a racing replacement");
+    }
+    if option_slot.load().map(|value| value.id) != Some(7) {
+        return Err("RcuOptionArcSlot clear_if_deferred lost the racing replacement");
+    }
+    rcu_barrier();
+    if option_race_old_drops.load(Ordering::SeqCst) != 1 {
+        return Err("RcuOptionArcSlot racing old object was not dropped");
+    }
+    if option_race_new_drops.load(Ordering::SeqCst) != 0 {
+        return Err("RcuOptionArcSlot racing replacement was dropped unexpectedly");
+    }
+
+    option_slot.store_deferred(None);
+    rcu_barrier();
+    if option_race_new_drops.load(Ordering::SeqCst) != 1 {
+        return Err("RcuOptionArcSlot racing replacement was not dropped after final clear");
+    }
+
+    let drop_slot = RcuOptionArcSlot::new_some(Arc::new(RcuSelftestDropProbe {
+        id: 8,
+        drops: option_drop_drops.clone(),
+    }));
+    let pinned_drop_slot = drop_slot
+        .load()
+        .ok_or("RcuOptionArcSlot drop test did not publish an object")?;
+    drop(drop_slot);
+    rcu_barrier();
+    if option_drop_drops.load(Ordering::SeqCst) != 0 {
+        return Err("RcuOptionArcSlot drop released an object with a live reader pin");
+    }
+
+    drop(pinned_drop_slot);
+    if option_drop_drops.load(Ordering::SeqCst) != 1 {
+        return Err("RcuOptionArcSlot drop object was not released after final reader pin");
+    }
+
+    Ok(())
+}
+
 pub fn run_debug_selftests() -> String {
     let pr1 = run_pr1_selftest();
     let pr2 = run_pr2_selftest();
-    let overall_ok = pr1.is_ok() && pr2.is_ok();
+    let pr3 = run_pr3_selftest();
+    let overall_ok = pr1.is_ok() && pr2.is_ok() && pr3.is_ok();
 
     let mut report = String::new();
     report.push_str(if overall_ok {
@@ -374,6 +498,11 @@ pub fn run_debug_selftests() -> String {
     match pr2 {
         Ok(()) => report.push_str("pr2=ok\n"),
         Err(reason) => report.push_str(&format!("pr2=fail:{reason}\n")),
+    }
+
+    match pr3 {
+        Ok(()) => report.push_str("pr3=ok\n"),
+        Err(reason) => report.push_str(&format!("pr3=fail:{reason}\n")),
     }
 
     report

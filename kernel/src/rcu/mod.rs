@@ -8,7 +8,7 @@ use alloc::{
     sync::Arc,
 };
 use core::{
-    ptr,
+    ptr::{self, NonNull},
     sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize, Ordering},
 };
 
@@ -25,7 +25,17 @@ use crate::{
     },
 };
 
-pub type RcuCallback = unsafe fn(*mut RcuHead);
+pub(crate) type RcuRawCallback = unsafe fn(NonNull<RcuHead>);
+
+#[derive(Clone, Copy)]
+struct QueuedRcuHead(NonNull<RcuHead>);
+
+// SAFETY: the wrapped head is an opaque token that may be transferred to the
+// RCU worker thread after `call_rcu_raw()` publishes it. The caller must keep
+// the underlying allocation alive until the callback runs, and the token is not
+// dereferenced except when the worker invokes that callback after a grace
+// period.
+unsafe impl Send for QueuedRcuHead {}
 
 #[derive(Debug)]
 pub struct RcuHead {
@@ -143,7 +153,10 @@ where
 }
 
 enum CallbackKind {
-    Head { head: usize, func: RcuCallback },
+    RawHead {
+        head: QueuedRcuHead,
+        func: RcuRawCallback,
+    },
     Deferred(Box<dyn DeferredCall>),
 }
 
@@ -299,12 +312,12 @@ impl RcuState {
             };
 
             match callback.kind {
-                CallbackKind::Head { head, func } => {
-                    let head = head as *mut RcuHead;
+                CallbackKind::RawHead { head, func } => {
+                    let head = head.0;
                     // SAFETY: `head` is queued only once and the callback owns
                     // the right to recycle or requeue it after execution.
                     unsafe {
-                        (*head).queued.store(false, Ordering::Release);
+                        head.as_ref().queued.store(false, Ordering::Release);
                         func(head);
                     }
                 }
@@ -395,6 +408,17 @@ fn queue_callback(kind: CallbackKind) {
         RCU_STATE.wake_worker();
         RCU_STATE.maybe_process_ready_callbacks_inline();
     }
+}
+
+fn queue_raw_callback(head: NonNull<RcuHead>, func: RcuRawCallback) {
+    queue_callback(CallbackKind::RawHead {
+        head: QueuedRcuHead(head),
+        func,
+    });
+}
+
+fn queue_deferred_callback(call: Box<dyn DeferredCall>) {
+    queue_callback(CallbackKind::Deferred(call));
 }
 
 fn worker_main() -> i32 {
@@ -502,7 +526,7 @@ pub fn rcu_assign_pointer<T>(ptr: &AtomicPtr<T>, value: *mut T) {
     ptr.store(value, Ordering::Release);
 }
 
-pub unsafe fn call_rcu(head: *mut RcuHead, func: RcuCallback) {
+pub(crate) unsafe fn call_rcu_raw(head: NonNull<RcuHead>, func: RcuRawCallback) {
     if !rcu_enabled() {
         // SAFETY: before RCU init there is no concurrent reader relying on
         // grace-period semantics, so direct invocation is safe.
@@ -510,35 +534,35 @@ pub unsafe fn call_rcu(head: *mut RcuHead, func: RcuCallback) {
         return;
     }
 
-    if head.is_null() {
-        panic!("call_rcu received a null rcu_head");
-    }
-
     // SAFETY: the caller guarantees that `head` is valid until callback
     // completion and not queued twice concurrently.
-    let already = unsafe { (*head).queued.swap(true, Ordering::AcqRel) };
+    let already = unsafe { head.as_ref().queued.swap(true, Ordering::AcqRel) };
     if already {
-        panic!("call_rcu received a duplicated rcu_head enqueue");
+        panic!("call_rcu_raw received a duplicated rcu_head enqueue");
     }
 
-    queue_callback(CallbackKind::Head {
-        head: head as usize,
-        func,
-    });
+    queue_raw_callback(head, func);
+}
+
+pub fn rcu_defer<F>(f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    if !rcu_enabled() {
+        f();
+        return;
+    }
+
+    queue_deferred_callback(Box::new(f));
 }
 
 pub fn rcu_defer_drop<T>(value: T)
 where
     T: Send + 'static,
 {
-    if !rcu_enabled() {
+    rcu_defer(move || {
         drop(value);
-        return;
-    }
-
-    queue_callback(CallbackKind::Deferred(Box::new(move || {
-        drop(value);
-    })));
+    });
 }
 
 pub fn synchronize_rcu() {
@@ -708,11 +732,6 @@ pub fn debug_force_quiescent_state() {
     report_quiescent_state(smp_get_processor_id());
 }
 
-#[allow(dead_code)]
-pub fn null_rcu_head() -> *mut RcuHead {
-    ptr::null_mut()
-}
-
 #[derive(Debug)]
 struct RcuSelftestDropProbe {
     id: usize,
@@ -732,10 +751,10 @@ struct RcuSelftestCallbackProbe {
     hits: Arc<AtomicUsize>,
 }
 
-unsafe fn rcu_selftest_callback(head: *mut RcuHead) {
+unsafe fn rcu_selftest_callback(head: NonNull<RcuHead>) {
     // SAFETY: `head` points to the first field of `RcuSelftestCallbackProbe`,
     // which is allocated by `Box::into_raw()` in the selftest.
-    let probe = unsafe { Box::from_raw(head as *mut RcuSelftestCallbackProbe) };
+    let probe = unsafe { Box::from_raw(head.as_ptr() as *mut RcuSelftestCallbackProbe) };
     probe.hits.fetch_add(1, Ordering::SeqCst);
 }
 
@@ -776,8 +795,8 @@ fn run_pr1_selftest() -> Result<(), &'static str> {
     // SAFETY: `callback_probe` stays alive until `rcu_selftest_callback()`
     // reconstructs and consumes the allocation.
     unsafe {
-        call_rcu(
-            ptr::addr_of_mut!((*callback_probe).head),
+        call_rcu_raw(
+            NonNull::new_unchecked(ptr::addr_of_mut!((*callback_probe).head)),
             rcu_selftest_callback,
         );
     }
@@ -797,6 +816,19 @@ fn run_pr1_selftest() -> Result<(), &'static str> {
 
     if deferred_drops.load(Ordering::SeqCst) != 1 {
         return Err("rcu_defer_drop did not run after rcu_barrier");
+    }
+
+    let deferred_hits = Arc::new(AtomicUsize::new(0));
+    rcu_defer({
+        let deferred_hits = deferred_hits.clone();
+        move || {
+            deferred_hits.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    rcu_barrier();
+
+    if deferred_hits.load(Ordering::SeqCst) != 1 {
+        return Err("rcu_defer closure did not run after rcu_barrier");
     }
 
     Ok(())

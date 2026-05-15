@@ -21,6 +21,18 @@ use crate::{
 pub enum SigCode {
     /// sent by kill, sigsend, raise
     User = 0,
+    /// queued SIGIO/POLL_IN
+    PollIn = 1,
+    /// queued SIGIO/POLL_OUT
+    PollOut = 2,
+    /// queued SIGIO/POLL_MSG
+    PollMsg = 3,
+    /// queued SIGIO/POLL_ERR
+    PollErr = 4,
+    /// queued SIGIO/POLL_PRI
+    PollPri = 5,
+    /// queued SIGIO/POLL_HUP
+    PollHup = 6,
     /// sent by kernel from somewhere
     Kernel = 0x80,
     /// 通过sigqueue发送
@@ -41,6 +53,12 @@ impl SigCode {
     pub fn try_from_i32(x: i32) -> Option<SigCode> {
         match x {
             0 => Some(Self::User),
+            1 => Some(Self::PollIn),
+            2 => Some(Self::PollOut),
+            3 => Some(Self::PollMsg),
+            4 => Some(Self::PollErr),
+            5 => Some(Self::PollPri),
+            6 => Some(Self::PollHup),
             0x80 => Some(Self::Kernel),
             -1 => Some(Self::Queue),
             -2 => Some(Self::Timer),

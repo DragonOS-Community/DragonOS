@@ -8,10 +8,7 @@ use crate::{
             EPollEventType, EPollItem,
         },
         vfs::{
-            fasync::{
-                FAsyncItem, FAsyncItems, FASYNC_POLL_ERR, FASYNC_POLL_HUP, FASYNC_POLL_IN,
-                FASYNC_POLL_OUT,
-            },
+            fasync::{FAsyncItem, FAsyncItems, FASYNC_POLL_IN, FASYNC_POLL_OUT},
             file::FileFlags,
             vcore::generate_inode_id,
             FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, InodeFlags, InodeMode, Magic,
@@ -1367,13 +1364,10 @@ impl IndexNode for LockedPipeInode {
             guard.writer -= 1;
             // 如果已经没有写端了，则唤醒读端
             if guard.writer == 0 {
-                // 写端耗尽意味着读端应收到 POLLHUP，唤醒等待者与 epoll
-                // 注意：这里需要使用读端的flags来获取POLLHUP事件
-                // 因为poll()中只在!flags.is_write_only()时才设置EPOLLHUP
+                // poll/epoll 语义仍然是 HUP，但 Linux 的 SIGIO/fasync 在这里上报 POLL_IN
+                // （读端被唤醒后可读到 EOF）。
                 let poll_flags = FileFlags::O_RDONLY;
                 let poll_data = FilePrivateData::Pipefs(PipeFsPrivateData { flags: poll_flags });
-                // 忽略 poll 错误：状态已更新（writer已减为0），poll失败不应导致close失败
-                // 这与下面对 wakeup_epoll 错误的处理方式一致
                 let pollflag = guard
                     .poll(&poll_data)
                     .map(|v| EPollEventType::from_bits_truncate(v as u32))
@@ -1381,10 +1375,8 @@ impl IndexNode for LockedPipeInode {
                 drop(guard); // 先释放 inner 锁，避免潜在的死锁
                 self.read_wait_queue
                     .wakeup_all(Some(ProcessState::Blocked(true)));
-                // 唤醒所有依赖 epoll 的等待者，确保 HUP 事件可见
-                // 忽略错误：状态已更新（writer已减为0），wakeup_epoll失败不影响close操作的语义
                 let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
-                self.read_fasync_items.send_sigio(FASYNC_POLL_HUP);
+                self.read_fasync_items.send_sigio(FASYNC_POLL_IN);
                 return Ok(());
             }
         }
@@ -1395,9 +1387,8 @@ impl IndexNode for LockedPipeInode {
             guard.reader -= 1;
             // 如果已经没有读端了，则唤醒写端
             if guard.reader == 0 {
-                // 读端耗尽意味着写端应收到 POLLERR，唤醒等待者与 epoll。
-                // 注意：这里需要使用写端的flags来获取EPOLLERR事件
-                // 因为poll()中只在!flags.is_read_only()时才设置EPOLLERR
+                // poll/epoll 语义仍然是 ERR，但 Linux 的 SIGIO/fasync 在这里上报 POLL_OUT
+                // （写端被唤醒后下一次 write 再观察到 EPIPE）。
                 let poll_data = FilePrivateData::Pipefs(PipeFsPrivateData {
                     flags: FileFlags::O_WRONLY,
                 });
@@ -1407,11 +1398,9 @@ impl IndexNode for LockedPipeInode {
                     .unwrap_or(EPollEventType::EPOLLERR);
 
                 drop(guard); // 先释放 inner 锁，避免死锁
-                             // 唤醒所有等待的写端（不进行状态过滤，因为进程可能已经被其他操作唤醒但还未从队列中移除）
                 self.write_wait_queue.wakeup_all(None);
-                // 唤醒所有依赖 epoll 的等待者，确保 ERR 事件可见
                 let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
-                self.write_fasync_items.send_sigio(FASYNC_POLL_ERR);
+                self.write_fasync_items.send_sigio(FASYNC_POLL_OUT);
                 return Ok(());
             }
         }

@@ -1,7 +1,7 @@
 use crate::{
     filesystem::epoll::{event_poll::EventPoll, EPollEventType},
     filesystem::vfs::{
-        fasync::{FAsyncItems, FASYNC_POLL_IN, FASYNC_POLL_OUT},
+        fasync::{FAsyncItems, FASYNC_POLL_HUP, FASYNC_POLL_IN, FASYNC_POLL_OUT},
         vcore::generate_inode_id,
         InodeId,
     },
@@ -1495,7 +1495,7 @@ impl Socket for UnixStreamSocket {
                                 | EPollEventType::EPOLLOUT
                                 | EPollEventType::EPOLLWRNORM,
                         );
-                        peer.fasync_items.send_sigio(FASYNC_POLL_IN);
+                        peer.fasync_items.send_sigio(FASYNC_POLL_HUP);
                     }
                 }
             }

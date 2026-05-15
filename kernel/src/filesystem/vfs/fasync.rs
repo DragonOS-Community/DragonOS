@@ -11,7 +11,8 @@ use core::sync::atomic::compiler_fence;
 
 use crate::{
     arch::ipc::signal::Signal,
-    ipc::signal_types::{SigCode, SigInfo, SigType},
+    filesystem::epoll::EPollEventType,
+    ipc::signal_types::{SigCode, SigInfo, SigType, SIG_SPECIFIC_SICODES_MASK},
     libs::mutex::Mutex,
     process::pid::PidType,
 };
@@ -22,8 +23,42 @@ use super::file::{File, FileFlags};
 
 pub const FASYNC_POLL_IN: i64 = 0x00000001 | 0x00000040;
 pub const FASYNC_POLL_OUT: i64 = 0x00000004 | 0x00000100 | 0x00000200;
+pub const FASYNC_POLL_MSG: i64 = 0x00000001 | 0x00000040 | 0x00000400;
 pub const FASYNC_POLL_ERR: i64 = 0x00000008;
-pub const FASYNC_POLL_HUP: i64 = 0x00000010;
+pub const FASYNC_POLL_PRI: i64 = 0x00000002 | 0x00000080;
+pub const FASYNC_POLL_HUP: i64 = 0x00000010 | 0x00000008;
+
+fn poll_band_to_sig_code(band: i64) -> Option<SigCode> {
+    match band {
+        FASYNC_POLL_IN => Some(SigCode::PollIn),
+        FASYNC_POLL_OUT => Some(SigCode::PollOut),
+        FASYNC_POLL_MSG => Some(SigCode::PollMsg),
+        FASYNC_POLL_ERR => Some(SigCode::PollErr),
+        FASYNC_POLL_PRI => Some(SigCode::PollPri),
+        FASYNC_POLL_HUP => Some(SigCode::PollHup),
+        _ => None,
+    }
+}
+
+fn signal_has_specific_si_codes(sig: Signal) -> bool {
+    sig != Signal::SIGIO_OR_POLL && SIG_SPECIFIC_SICODES_MASK.contains(Signal::into_sigset(sig))
+}
+
+pub fn fasync_band_from_epoll(events: EPollEventType) -> Option<i64> {
+    if events.contains(EPollEventType::EPOLLHUP) {
+        Some(FASYNC_POLL_HUP)
+    } else if events.contains(EPollEventType::EPOLLERR) {
+        Some(FASYNC_POLL_ERR)
+    } else if events.contains(EPollEventType::EPOLLPRI) {
+        Some(FASYNC_POLL_PRI)
+    } else if events.contains(EPollEventType::EPOLLIN) {
+        Some(FASYNC_POLL_IN)
+    } else if events.contains(EPollEventType::EPOLLOUT) {
+        Some(FASYNC_POLL_OUT)
+    } else {
+        None
+    }
+}
 
 struct FAsyncSignalTarget {
     pcb: Arc<crate::process::ProcessControlBlock>,
@@ -170,7 +205,12 @@ impl FAsyncItems {
         if signum == 0 {
             let _ = sig.send_signal_info_to_pcb(None, pcb, PidType::TGID);
         } else {
-            let mut info = SigInfo::new(sig, 0, SigCode::SigIO, SigType::SigPoll { fd, band });
+            let sig_code = if signal_has_specific_si_codes(sig) {
+                SigCode::SigIO
+            } else {
+                poll_band_to_sig_code(band).unwrap_or(SigCode::SigIO)
+            };
+            let mut info = SigInfo::new(sig, 0, sig_code, SigType::SigPoll { fd, band });
             let _ = sig.send_signal_info_to_pcb(Some(&mut info), pcb, PidType::TGID);
         }
 

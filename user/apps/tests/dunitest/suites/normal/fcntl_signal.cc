@@ -5,7 +5,20 @@
 #include <signal.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/socket.h>
 #include <unistd.h>
+
+#ifndef POLL_IN
+#define POLL_IN 1
+#endif
+
+#ifndef POLL_OUT
+#define POLL_OUT 2
+#endif
+
+#ifndef POLL_HUP
+#define POLL_HUP 6
+#endif
 
 #ifndef F_SETSIG
 #define F_SETSIG 10
@@ -22,12 +35,14 @@ constexpr int kKernelSigRtMax = 64;
 volatile sig_atomic_t g_signal_count = 0;
 volatile sig_atomic_t g_signal_number = 0;
 volatile sig_atomic_t g_signal_fd = -1;
+volatile sig_atomic_t g_signal_code = 0;
 volatile sig_atomic_t g_signal_band = 0;
 
 void reset_signal_state() {
     g_signal_count = 0;
     g_signal_number = 0;
     g_signal_fd = -1;
+    g_signal_code = 0;
     g_signal_band = 0;
 }
 
@@ -36,6 +51,7 @@ void fasync_signal_handler(int sig, siginfo_t* info, void*) {
     g_signal_number = sig;
     if (info != nullptr) {
         g_signal_fd = info->si_fd;
+        g_signal_code = info->si_code;
         g_signal_band = info->si_band;
     }
 }
@@ -109,13 +125,14 @@ TEST(FcntlSignal, CustomSignalDeliveredForPipeAsyncIo) {
 
     EXPECT_EQ(SIGUSR1, g_signal_number);
     EXPECT_EQ(fds[0], g_signal_fd);
+    EXPECT_EQ(POLL_IN, g_signal_code);
     EXPECT_EQ(EPOLLIN | EPOLLRDNORM, g_signal_band);
 
     close(fds[0]);
     close(fds[1]);
 }
 
-TEST(FcntlSignal, PipeCloseReportsHangupAndErrorBands) {
+TEST(FcntlSignal, PipeCloseReportsLinuxBands) {
     int fds[2] = {-1, -1};
     ASSERT_EQ(0, pipe(fds));
 
@@ -134,7 +151,8 @@ TEST(FcntlSignal, PipeCloseReportsHangupAndErrorBands) {
 
     EXPECT_EQ(SIGUSR1, g_signal_number);
     EXPECT_EQ(fds[0], g_signal_fd);
-    EXPECT_EQ(EPOLLHUP, g_signal_band);
+    EXPECT_EQ(POLL_IN, g_signal_code);
+    EXPECT_EQ(EPOLLIN | EPOLLRDNORM, g_signal_band);
 
     ASSERT_EQ(0, close(fds[0]));
 
@@ -153,9 +171,35 @@ TEST(FcntlSignal, PipeCloseReportsHangupAndErrorBands) {
 
     EXPECT_EQ(SIGUSR1, g_signal_number);
     EXPECT_EQ(fds[1], g_signal_fd);
-    EXPECT_EQ(EPOLLERR, g_signal_band);
+    EXPECT_EQ(POLL_OUT, g_signal_code);
+    EXPECT_EQ(EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND, g_signal_band);
 
     close(fds[1]);
+}
+
+TEST(FcntlSignal, UnixStreamPeerCloseReportsPollHup) {
+    int fds[2] = {-1, -1};
+    ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
+
+    install_signal_handler(SIGUSR1);
+    reset_signal_state();
+
+    ASSERT_EQ(0, fcntl(fds[0], F_SETOWN, getpid()));
+    ASSERT_EQ(0, fcntl(fds[0], F_SETSIG, SIGUSR1));
+
+    int flags = fcntl(fds[0], F_GETFL);
+    ASSERT_GE(flags, 0);
+    ASSERT_EQ(0, fcntl(fds[0], F_SETFL, flags | O_ASYNC));
+
+    ASSERT_EQ(0, close(fds[1]));
+    ASSERT_TRUE(wait_for_signal());
+
+    EXPECT_EQ(SIGUSR1, g_signal_number);
+    EXPECT_EQ(fds[0], g_signal_fd);
+    EXPECT_EQ(POLL_HUP, g_signal_code);
+    EXPECT_EQ(EPOLLHUP | EPOLLERR, g_signal_band);
+
+    close(fds[0]);
 }
 
 TEST(FcntlSignal, DupKeepsRegisteredFdForSiginfo) {
@@ -181,6 +225,7 @@ TEST(FcntlSignal, DupKeepsRegisteredFdForSiginfo) {
 
     EXPECT_EQ(SIGUSR2, g_signal_number);
     EXPECT_EQ(fds[0], g_signal_fd);
+    EXPECT_EQ(POLL_IN, g_signal_code);
     EXPECT_EQ(EPOLLIN | EPOLLRDNORM, g_signal_band);
 
     close(dup_fd);

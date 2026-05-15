@@ -620,11 +620,11 @@ impl ProcessManager {
         let is_mt_exec_leader = current.is_thread_group_leader()
             && exec_task
                 .as_ref()
-                .map(|t| !Arc::ptr_eq(t, &current))
+                .map(|t| !Arc::ptr_eq(t, current))
                 .unwrap_or(false);
         if sighand.flags_contains(SignalFlags::GROUP_EXEC) {
             if let Some(exec_task) = exec_task.as_ref() {
-                if !Arc::ptr_eq(exec_task, &current) {
+                if !Arc::ptr_eq(exec_task, current) {
                     let notify_count = sighand.group_exec_notify_count();
                     if notify_count < 0 {
                         // mt-exec: exec 线程正在等待 leader 退出
@@ -636,7 +636,7 @@ impl ProcessManager {
             }
             let should_clear = exec_task
                 .as_ref()
-                .map(|t| Arc::ptr_eq(t, &current))
+                .map(|t| Arc::ptr_eq(t, current))
                 .unwrap_or(false);
             if should_clear {
                 sighand.finish_group_exec();

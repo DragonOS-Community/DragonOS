@@ -486,6 +486,6 @@ impl Drop for NetNamespace {
 
 impl ProcessManager {
     pub fn current_netns() -> Arc<NetNamespace> {
-        Self::current_pcb().nsproxy.read().net_ns.clone()
+        Self::current_pcb().nsproxy().net_ns.clone()
     }
 }

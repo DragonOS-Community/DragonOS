@@ -22,6 +22,7 @@ use crate::{
     filesystem::{
         epoll::{event_poll::EPollPrivateData, EPollItem},
         fuse::private_data::FuseFilePrivateData,
+        kernfs::callback::KernFilePrivateData,
         procfs::ProcfsFilePrivateData,
         vfs::FilldirContext,
     },
@@ -150,6 +151,8 @@ pub enum FilePrivateData {
     SocketCreate,
     /// FUSE file private data.
     Fuse(FuseFilePrivateData),
+    /// kernfs/debugfs per-open callback state.
+    Kernfs(Option<KernFilePrivateData>),
     /// 不需要文件私有信息
     Unused,
 }

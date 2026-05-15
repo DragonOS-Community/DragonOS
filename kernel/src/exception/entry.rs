@@ -19,6 +19,7 @@ unsafe extern "C" fn irqentry_exit(frame: &mut TrapFrame) {
 /// 必须保证所有的栈上的Arc/Box指针等，都已经被释放。否则，可能会导致内存泄漏。
 unsafe fn irqentry_exit_to_user_mode(frame: &mut TrapFrame) {
     exit_to_user_mode_prepare(frame);
+    crate::rcu::note_exit_to_user_mode();
 }
 
 /// # Safety

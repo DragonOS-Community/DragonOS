@@ -41,17 +41,17 @@ impl Syscall for SysSetResUid {
         id_utils::validate_id(suid)?;
 
         let pcb = ProcessManager::current_pcb();
-        let mut guard = pcb.cred.lock();
+        let old_cred = pcb.cred();
 
-        let old_ruid = guard.uid.data();
-        let old_euid = guard.euid.data();
-        let old_suid = guard.suid.data();
+        let old_ruid = old_cred.uid.data();
+        let old_euid = old_cred.euid.data();
+        let old_suid = old_cred.suid.data();
 
         let new_ruid = id_utils::resolve_id(ruid, old_ruid);
         let new_euid = id_utils::resolve_id(euid, old_euid);
         let new_suid = id_utils::resolve_id(suid, old_suid);
 
-        let is_privileged = guard.euid.data() == 0;
+        let is_privileged = old_cred.euid.data() == 0;
         id_utils::check_setres_permissions(
             old_ruid,
             old_euid,
@@ -62,7 +62,7 @@ impl Syscall for SysSetResUid {
             is_privileged,
         )?;
 
-        let mut new_cred = (**guard).clone();
+        let mut new_cred = (*old_cred).clone();
 
         // 设置新的 UID 值
         if !id_utils::is_no_change(ruid) {
@@ -94,7 +94,7 @@ impl Syscall for SysSetResUid {
             new_cred.setfsuid(new_euid);
         }
 
-        *guard = Cred::new_arc(new_cred);
+        pcb.set_cred(Cred::new_arc(new_cred))?;
 
         Ok(0)
     }

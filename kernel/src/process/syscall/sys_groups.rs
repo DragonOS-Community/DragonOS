@@ -25,7 +25,7 @@ impl Syscall for SysGetGroups {
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let pcb = ProcessManager::current_pcb();
-        let cred = pcb.cred.lock();
+        let cred = pcb.cred();
         let size = args[0];
         if size == 0 {
             return Ok(cred.getgroups().len());
@@ -82,12 +82,12 @@ impl Syscall for SysSetGroups {
             return Err(SystemError::EPERM);
         }
 
-        let mut cred = (**pcb.cred.lock()).clone();
+        let mut cred = (*pcb.cred()).clone();
         let size = args[0];
         if size == 0 {
             // clear all supplementary groups
             cred.setgroups(Vec::new());
-            *pcb.cred.lock() = Cred::new_arc(cred);
+            pcb.set_cred(Cred::new_arc(cred))?;
             return Ok(0);
         }
         if size > NGROUPS_MAX {
@@ -112,7 +112,7 @@ impl Syscall for SysSetGroups {
             .map(|g| Kgid::from(g as usize))
             .collect();
         cred.setgroups(groups);
-        *pcb.cred.lock() = Cred::new_arc(cred);
+        pcb.set_cred(Cred::new_arc(cred))?;
         Ok(0)
     }
 

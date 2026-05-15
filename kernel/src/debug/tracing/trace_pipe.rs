@@ -1,4 +1,4 @@
-use crate::filesystem::kernfs::callback::{KernCallbackData, KernFSCallback, KernInodePrivateData};
+use crate::filesystem::kernfs::callback::{KernCallbackData, KernFSCallback, KernFilePrivateData};
 use crate::filesystem::kernfs::{KernFSInodeArgs, KernInodeType};
 use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::vfs::PollStatus;
@@ -44,9 +44,9 @@ pub struct TraceCallBack;
 
 impl KernFSCallback for TraceCallBack {
     fn open(&self, mut data: KernCallbackData) -> Result<(), SystemError> {
-        let pri_data = data.private_data_mut();
+        let pri_data = data.file_private_data_mut();
         let snapshot = super::TRACE_RAW_PIPE.lock().snapshot();
-        pri_data.replace(KernInodePrivateData::TracePipe(snapshot));
+        pri_data.replace(KernFilePrivateData::TracePipe(snapshot));
         Ok(())
     }
 
@@ -56,7 +56,7 @@ impl KernFSCallback for TraceCallBack {
         buf: &mut [u8],
         offset: usize,
     ) -> Result<usize, SystemError> {
-        let pri_data = data.private_data_mut().as_mut().unwrap();
+        let pri_data = data.file_private_data_mut().as_mut().unwrap();
         let snapshot = pri_data.tracepipe().unwrap();
 
         let default_fmt_str = snapshot.default_fmt_str();
@@ -210,9 +210,9 @@ pub struct SavedCmdlinesSnapshotCallBack;
 
 impl KernFSCallback for SavedCmdlinesSnapshotCallBack {
     fn open(&self, mut data: KernCallbackData) -> Result<(), SystemError> {
-        let pri_data = data.private_data_mut();
+        let pri_data = data.file_private_data_mut();
         let snapshot = super::TRACE_CMDLINE_CACHE.lock().snapshot();
-        pri_data.replace(KernInodePrivateData::TraceSavedCmdlines(snapshot));
+        pri_data.replace(KernFilePrivateData::TraceSavedCmdlines(snapshot));
         Ok(())
     }
 
@@ -222,7 +222,7 @@ impl KernFSCallback for SavedCmdlinesSnapshotCallBack {
         buf: &mut [u8],
         _offset: usize,
     ) -> Result<usize, SystemError> {
-        let pri_data = data.private_data_mut().as_mut().unwrap();
+        let pri_data = data.file_private_data_mut().as_mut().unwrap();
         let snapshot = pri_data.trace_saved_cmdlines().unwrap();
 
         let mut copy_len = 0;

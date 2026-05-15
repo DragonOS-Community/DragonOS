@@ -166,12 +166,15 @@ impl IndexNode for KernFSInode {
 
     fn open(
         &self,
-        _data: MutexGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         if let Some(callback) = self.callback {
-            let callback_data =
-                KernCallbackData::new(self.self_ref.upgrade().unwrap(), self.private_data.lock());
+            let callback_data = KernCallbackData::new(
+                self.self_ref.upgrade().unwrap(),
+                self.private_data.lock(),
+                data,
+            );
             return callback.open(callback_data);
         }
 
@@ -393,11 +396,11 @@ impl IndexNode for KernFSInode {
             warn!("kernfs: callback is none");
             return Err(SystemError::ENOSYS);
         }
-        // release the private data lock before calling the callback
-        drop(data);
-
-        let callback_data =
-            KernCallbackData::new(self.self_ref.upgrade().unwrap(), self.private_data.lock());
+        let callback_data = KernCallbackData::new(
+            self.self_ref.upgrade().unwrap(),
+            self.private_data.lock(),
+            data,
+        );
         return self
             .callback
             .as_ref()
@@ -420,11 +423,11 @@ impl IndexNode for KernFSInode {
             return Err(SystemError::ENOSYS);
         }
 
-        // release the private data lock before calling the callback
-        drop(data);
-
-        let callback_data =
-            KernCallbackData::new(self.self_ref.upgrade().unwrap(), self.private_data.lock());
+        let callback_data = KernCallbackData::new(
+            self.self_ref.upgrade().unwrap(),
+            self.private_data.lock(),
+            data,
+        );
         return self
             .callback
             .as_ref()

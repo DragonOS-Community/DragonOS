@@ -62,7 +62,7 @@ impl IpcNamespace {
 impl ProcessManager {
     pub fn current_ipcns() -> Arc<IpcNamespace> {
         if Self::initialized() {
-            ProcessManager::current_pcb().nsproxy.read().ipc_ns.clone()
+            ProcessManager::current_pcb().nsproxy().ipc_ns.clone()
         } else {
             INIT_IPC_NAMESPACE.clone()
         }

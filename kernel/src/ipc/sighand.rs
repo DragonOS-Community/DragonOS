@@ -103,6 +103,17 @@ impl SigHand {
         &self.signalfd_epitems
     }
 
+    pub fn attach_task_ref(&self) {
+        let mut g = self.inner_mut();
+        g.cnt += 1;
+    }
+
+    pub fn detach_task_ref(&self) {
+        let mut g = self.inner_mut();
+        assert!(g.cnt > 0, "SigHand::detach_task_ref underflow");
+        g.cnt -= 1;
+    }
+
     pub fn wait_group_exec_event_interruptible<F, B>(
         &self,
         cond: F,

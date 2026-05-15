@@ -10,6 +10,7 @@ normal/test_mount_reconfigure
 normal/test_fchown_o_path
 normal/proc_self_limits
 normal/sched_affinity
+normal/rcu_selftest
 normal/test_tlb_shootdown
 normal/tcp_close_semantics
 fuse/fuse_core

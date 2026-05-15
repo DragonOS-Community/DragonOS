@@ -15,7 +15,7 @@ impl Syscall for SysGetUid {
 
     fn handle(&self, _args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let pcb = ProcessManager::current_pcb();
-        return Ok(pcb.cred.lock().uid.data());
+        return Ok(pcb.cred().uid.data());
     }
 
     fn entry_format(&self, _args: &[usize]) -> Vec<FormattedSyscallParam> {

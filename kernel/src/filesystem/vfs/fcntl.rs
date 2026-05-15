@@ -27,6 +27,10 @@ pub enum FcntlCommand {
     SetOwn = 8,
     /// get owner
     GetOwn = 9,
+    /// set signal to send on asynchronous I/O
+    SetSig = 10,
+    /// get signal to send on asynchronous I/O
+    GetSig = 11,
 
     SetLease = F_LINUX_SPECIFIC_BASE,
     GetLease = F_LINUX_SPECIFIC_BASE + 1,

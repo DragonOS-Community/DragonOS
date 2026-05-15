@@ -6,7 +6,7 @@ use crate::libs::mutex::MutexGuard;
 use crate::{
     filesystem::{
         procfs::{
-            pid::find_process_by_vpid,
+            pid::ProcPidTarget,
             template::{Builder, FileOps, ProcFileBuilder},
             ProcfsFilePrivateData,
         },
@@ -18,7 +18,6 @@ use crate::{
             map_id_down, map_id_range_down, map_id_up, UidGidExtent, UidGidMap, UserNamespace,
             UID_GID_MAP_MAX_BASE_EXTENTS, UID_GID_MAP_MAX_EXTENTS, USERNS_SETGROUPS_ALLOWED,
         },
-        RawPid,
     },
 };
 use alloc::{
@@ -85,41 +84,44 @@ impl IdMapWriteContext {
 /// /proc/[pid]/uid_map 和 /proc/[pid]/gid_map 的 FileOps
 #[derive(Debug)]
 pub struct IdMapFileOps {
-    pid: RawPid,
+    target: ProcPidTarget,
     map_type: MapType,
 }
 
 impl IdMapFileOps {
-    pub fn new_uid(pid: RawPid) -> Self {
+    pub fn new_uid(target: ProcPidTarget) -> Self {
         Self {
-            pid,
+            target,
             map_type: MapType::Uid,
         }
     }
 
-    pub fn new_gid(pid: RawPid) -> Self {
+    pub fn new_gid(target: ProcPidTarget) -> Self {
         Self {
-            pid,
+            target,
             map_type: MapType::Gid,
         }
     }
 
-    pub fn new_uid_inode(pid: RawPid, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcFileBuilder::new(Self::new_uid(pid), InodeMode::from_bits_truncate(0o644))
+    pub fn new_uid_inode(target: ProcPidTarget, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcFileBuilder::new(Self::new_uid(target), InodeMode::from_bits_truncate(0o644))
             .parent(parent)
             .build()
             .unwrap()
     }
 
-    pub fn new_gid_inode(pid: RawPid, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcFileBuilder::new(Self::new_gid(pid), InodeMode::from_bits_truncate(0o644))
+    pub fn new_gid_inode(target: ProcPidTarget, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcFileBuilder::new(Self::new_gid(target), InodeMode::from_bits_truncate(0o644))
             .parent(parent)
             .build()
             .unwrap()
     }
 
     fn get_user_ns(&self) -> Result<Arc<UserNamespace>, SystemError> {
-        let pcb = find_process_by_vpid(self.pid).ok_or(SystemError::ESRCH)?;
+        let pcb = self
+            .target
+            .thread_group_leader()
+            .ok_or(SystemError::ESRCH)?;
         Ok(pcb.cred().user_ns.clone())
     }
 
@@ -450,16 +452,16 @@ impl FileOps for IdMapFileOps {
 /// /proc/[pid]/setgroups 的 FileOps
 #[derive(Debug)]
 pub struct SetgroupsFileOps {
-    pid: RawPid,
+    target: ProcPidTarget,
 }
 
 impl SetgroupsFileOps {
-    pub fn new(pid: RawPid) -> Self {
-        Self { pid }
+    pub fn new(target: ProcPidTarget) -> Self {
+        Self { target }
     }
 
-    pub fn new_inode(pid: RawPid, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcFileBuilder::new(Self::new(pid), InodeMode::from_bits_truncate(0o644))
+    pub fn new_inode(target: ProcPidTarget, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcFileBuilder::new(Self::new(target), InodeMode::from_bits_truncate(0o644))
             .parent(parent)
             .build()
             .unwrap()
@@ -474,7 +476,10 @@ impl FileOps for SetgroupsFileOps {
         buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let pcb = find_process_by_vpid(self.pid).ok_or(SystemError::ESRCH)?;
+        let pcb = self
+            .target
+            .thread_group_leader()
+            .ok_or(SystemError::ESRCH)?;
         let user_ns = pcb.cred().user_ns.clone();
         let inner = user_ns.inner.lock();
 
@@ -505,7 +510,10 @@ impl FileOps for SetgroupsFileOps {
             return Err(SystemError::EINVAL);
         }
 
-        let pcb = find_process_by_vpid(self.pid).ok_or(SystemError::ESRCH)?;
+        let pcb = self
+            .target
+            .thread_group_leader()
+            .ok_or(SystemError::ESRCH)?;
         let user_ns = pcb.cred().user_ns.clone();
         let mut inner = user_ns.inner.lock();
 

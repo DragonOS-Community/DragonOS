@@ -5,12 +5,13 @@ use crate::{
     cgroup::cgroup_path_from_view,
     filesystem::{
         procfs::{
+            pid::ProcPidTarget,
             template::{Builder, FileOps, ProcFileBuilder},
             utils::proc_read,
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    process::{ProcessManager, RawPid},
+    process::ProcessManager,
 };
 use alloc::{
     format,
@@ -21,19 +22,22 @@ use system_error::SystemError;
 
 #[derive(Debug)]
 pub struct CgroupFileOps {
-    pid: RawPid,
+    target: ProcPidTarget,
 }
 
 impl CgroupFileOps {
-    pub fn new_inode(pid: RawPid, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcFileBuilder::new(Self { pid }, InodeMode::S_IRUGO)
+    pub fn new_inode(target: ProcPidTarget, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcFileBuilder::new(Self { target }, InodeMode::S_IRUGO)
             .parent(parent)
             .build()
             .unwrap()
     }
 
     fn generate_content(&self) -> Result<Vec<u8>, SystemError> {
-        let target = ProcessManager::find(self.pid).ok_or(SystemError::ESRCH)?;
+        let target = self
+            .target
+            .thread_group_leader()
+            .ok_or(SystemError::ESRCH)?;
         let viewer = ProcessManager::current_pcb();
 
         let target_cg = target.task_cgroup_node();

@@ -9,9 +9,13 @@ use crate::{
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
     libs::mutex::MutexGuard,
-    process::{pid::PidType, ProcessManager, ProcessState},
-    sched::cputime::{kcpustat_cpu, ns_to_clock_t, CpuUsageStat, NR_CPU_STATS},
-    smp::cpu::{smp_cpu_manager, ProcessorId},
+    process::{nr_context_switches, total_forks},
+    sched::{
+        cputime::{kcpustat_cpu, ns_to_clock_t, CpuUsageStat, NR_CPU_STATS},
+        loadavg, nr_iowait,
+    },
+    smp::cpu::smp_cpu_manager,
+    time::timekeeping::boottime_seconds,
 };
 use alloc::{borrow::ToOwned, format, sync::Arc, sync::Weak, vec::Vec};
 use system_error::SystemError;
@@ -31,24 +35,27 @@ impl StatFileOps {
     fn generate_stat_content() -> Vec<u8> {
         let mut data: Vec<u8> = Vec::new();
 
-        // 获取 CPU 数量
-        let cpu_count = smp_cpu_manager().present_cpus_count() as usize;
-        let cpu_count = if cpu_count == 0 { 1 } else { cpu_count };
+        let present_cpus = smp_cpu_manager()
+            .present_cpus()
+            .iter_cpu()
+            .collect::<Vec<_>>();
+        let cpu_ids = if present_cpus.is_empty() {
+            vec![crate::smp::cpu::ProcessorId::new(0)]
+        } else {
+            present_cpus
+        };
 
-        // 汇总所有 CPU 的统计
         let mut total_stats = [0u64; NR_CPU_STATS];
-        for cpu_id in 0..cpu_count {
-            let stat = kcpustat_cpu(ProcessorId::new(cpu_id as u32));
-            let snapshot = stat.snapshot();
+        for cpu_id in &cpu_ids {
+            let snapshot = kcpustat_cpu(*cpu_id).snapshot();
             for i in 0..NR_CPU_STATS {
                 total_stats[i] += snapshot[i];
             }
         }
 
-        // 输出总 CPU 行（8 个字段：user nice system idle iowait irq softirq steal）
         data.append(
             &mut format!(
-                "cpu {} {} {} {} {} {} {} {}\n",
+                "cpu {} {} {} {} {} {} {} {} {} {}\n",
                 ns_to_clock_t(total_stats[CpuUsageStat::User as usize]),
                 ns_to_clock_t(total_stats[CpuUsageStat::Nice as usize]),
                 ns_to_clock_t(total_stats[CpuUsageStat::System as usize]),
@@ -57,19 +64,19 @@ impl StatFileOps {
                 ns_to_clock_t(total_stats[CpuUsageStat::Irq as usize]),
                 ns_to_clock_t(total_stats[CpuUsageStat::Softirq as usize]),
                 ns_to_clock_t(total_stats[CpuUsageStat::Steal as usize]),
+                ns_to_clock_t(total_stats[CpuUsageStat::Guest as usize]),
+                ns_to_clock_t(total_stats[CpuUsageStat::GuestNice as usize]),
             )
             .as_bytes()
             .to_owned(),
         );
 
-        // 输出每个 CPU 的统计行
-        for cpu_id in 0..cpu_count {
-            let stat = kcpustat_cpu(ProcessorId::new(cpu_id as u32));
-            let snapshot = stat.snapshot();
+        for cpu_id in &cpu_ids {
+            let snapshot = kcpustat_cpu(*cpu_id).snapshot();
             data.append(
                 &mut format!(
-                    "cpu{} {} {} {} {} {} {} {} {}\n",
-                    cpu_id,
+                    "cpu{} {} {} {} {} {} {} {} {} {} {}\n",
+                    cpu_id.data(),
                     ns_to_clock_t(snapshot[CpuUsageStat::User as usize]),
                     ns_to_clock_t(snapshot[CpuUsageStat::Nice as usize]),
                     ns_to_clock_t(snapshot[CpuUsageStat::System as usize]),
@@ -78,46 +85,44 @@ impl StatFileOps {
                     ns_to_clock_t(snapshot[CpuUsageStat::Irq as usize]),
                     ns_to_clock_t(snapshot[CpuUsageStat::Softirq as usize]),
                     ns_to_clock_t(snapshot[CpuUsageStat::Steal as usize]),
+                    ns_to_clock_t(snapshot[CpuUsageStat::Guest as usize]),
+                    ns_to_clock_t(snapshot[CpuUsageStat::GuestNice as usize]),
                 )
                 .as_bytes()
                 .to_owned(),
             );
         }
 
-        data.append(&mut b"intr 0\n".to_vec());
-        data.append(&mut b"ctxt 0\n".to_vec());
-        data.append(&mut b"btime 0\n".to_vec());
-
-        let pidns = ProcessManager::current_pcb().active_pid_ns();
-        let processes = pidns.processes_created();
-        let pids = pidns.collect_pids();
-
-        let mut procs_running = 0u64;
-        let mut procs_blocked = 0u64;
-        for pid in pids {
-            if let Some(pcb) = pid.pid_task(PidType::PID) {
-                let state = pcb.sched_info().inner_lock_read_irqsave().state();
-                if state.is_runnable() {
-                    procs_running += 1;
-                } else if matches!(state, ProcessState::Blocked(false)) {
-                    procs_blocked += 1;
-                }
-            }
-        }
-
-        data.append(&mut format!("processes {}\n", processes).as_bytes().to_owned());
+        let intr_total = 0u64;
+        data.append(&mut format!("intr {}\n", intr_total).as_bytes().to_owned());
         data.append(
-            &mut format!("procs_running {}\n", procs_running)
+            &mut format!("ctxt {}\n", nr_context_switches())
                 .as_bytes()
                 .to_owned(),
         );
         data.append(
-            &mut format!("procs_blocked {}\n", procs_blocked)
+            &mut format!("btime {}\n", boottime_seconds())
+                .as_bytes()
+                .to_owned(),
+        );
+        data.append(
+            &mut format!("processes {}\n", total_forks())
+                .as_bytes()
+                .to_owned(),
+        );
+        data.append(
+            &mut format!("procs_running {}\n", loadavg::nr_running())
+                .as_bytes()
+                .to_owned(),
+        );
+        data.append(
+            &mut format!("procs_blocked {}\n", nr_iowait())
                 .as_bytes()
                 .to_owned(),
         );
 
-        data.append(&mut b"softirq 0\n".to_vec());
+        let softirq_total = 0u64;
+        data.append(&mut format!("softirq {}\n", softirq_total).as_bytes().to_owned());
 
         trim_string(&mut data);
         data

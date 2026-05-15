@@ -2,17 +2,14 @@
 //!
 //! 这个目录包含了进程打开的所有文件描述符的详细信息
 
-use crate::libs::mutex::MutexGuard;
-use crate::{
-    filesystem::{
-        procfs::{
-            pid::find_process_by_vpid,
-            template::{Builder, DirOps, FileOps, ProcDir, ProcDirBuilder, ProcFileBuilder},
-        },
-        vfs::{FilePrivateData, IndexNode, InodeMode},
+use crate::filesystem::{
+    procfs::{
+        pid::ProcPidTarget,
+        template::{Builder, DirOps, FileOps, ProcDir, ProcDirBuilder, ProcFileBuilder},
     },
-    process::RawPid,
+    vfs::{FilePrivateData, IndexNode, InodeMode},
 };
+use crate::libs::mutex::MutexGuard;
 use alloc::{
     string::ToString,
     sync::{Arc, Weak},
@@ -23,22 +20,20 @@ use system_error::SystemError;
 /// /proc/[pid]/fdinfo 目录的 DirOps 实现
 #[derive(Debug)]
 pub struct FdInfoDirOps {
-    /// 存储 PID，在需要时动态查找进程
-    pid: RawPid,
+    target: ProcPidTarget,
 }
 
 impl FdInfoDirOps {
-    pub fn new_inode(pid: RawPid, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcDirBuilder::new(Self { pid }, InodeMode::from_bits_truncate(0o555))
+    pub fn new_inode(target: ProcPidTarget, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcDirBuilder::new(Self { target }, InodeMode::from_bits_truncate(0o555))
             .parent(parent)
             .volatile()
             .build()
             .unwrap()
     }
 
-    /// 获取进程引用
     fn get_process(&self) -> Option<Arc<crate::process::ProcessControlBlock>> {
-        find_process_by_vpid(self.pid)
+        self.target.thread_group_leader()
     }
 }
 
@@ -72,7 +67,7 @@ impl DirOps for FdInfoDirOps {
         }
 
         // 创建新的 fdinfo 文件
-        let inode = FdInfoFileOps::new_inode(self.pid, fd, dir.self_ref_weak().clone());
+        let inode = FdInfoFileOps::new_inode(self.target.clone(), fd, dir.self_ref_weak().clone());
         cached_children.insert(name.to_string(), inode.clone());
 
         Ok(inode)
@@ -95,7 +90,7 @@ impl DirOps for FdInfoDirOps {
             for fd in fds {
                 let fd_str = fd.to_string();
                 cached_children.entry(fd_str.clone()).or_insert_with(|| {
-                    FdInfoFileOps::new_inode(self.pid, fd, dir.self_ref_weak().clone())
+                    FdInfoFileOps::new_inode(self.target.clone(), fd, dir.self_ref_weak().clone())
                 });
             }
         }
@@ -113,7 +108,11 @@ pub struct FdInfoFileOps {
 }
 
 impl FdInfoFileOps {
-    pub fn new_inode(_pid: RawPid, _fd: i32, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+    pub fn new_inode(
+        _target: ProcPidTarget,
+        _fd: i32,
+        parent: Weak<dyn IndexNode>,
+    ) -> Arc<dyn IndexNode> {
         ProcFileBuilder::new(
             Self {
                 phantom: core::marker::PhantomData,
@@ -134,33 +133,6 @@ impl FileOps for FdInfoFileOps {
         _buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        // // 动态查找进程
-        // let process = ProcessManager::find(self.pid).ok_or(SystemError::ESRCH)?;
-
-        // // 获取文件信息
-        // let file = {
-        //     let fd_table = process.fd_table();
-        //     let fd_table_guard = fd_table.read();
-        //     fd_table_guard
-        //         .get_file_by_fd(self.fd)
-        //         .ok_or(SystemError::EBADF)?
-        // };
-
-        // // 生成 fdinfo 内容
-        // let mut content = Vec::new();
-
-        // // pos: 当前文件偏移量
-        // let pos = file.offset;
-        // content.extend_from_slice(format!("pos:\t{}\n", pos).as_bytes());
-
-        // // flags: 文件打开标志（八进制）
-        // let flags = file.mode().bits();
-        // content.extend_from_slice(format!("flags:\t{:#o}\n", flags).as_bytes());
-
-        // // mnt_id: 挂载点 ID（简化实现，返回 0）
-        // content.extend_from_slice(b"mnt_id:\t0\n");
-
-        // proc_read(offset, len, buf, &content)
         Ok(0)
     }
 }

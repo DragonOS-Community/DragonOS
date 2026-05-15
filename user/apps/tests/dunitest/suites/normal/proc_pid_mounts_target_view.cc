@@ -1,0 +1,282 @@
+#include <gtest/gtest.h>
+
+#include <errno.h>
+#include <fcntl.h>
+#include <sched.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <string>
+
+#ifndef CLONE_NEWNS
+#define CLONE_NEWNS 0x00020000
+#endif
+
+namespace {
+
+struct ChildProcessGuard {
+    pid_t pid = -1;
+    int quit_fd = -1;
+    int detail_fd = -1;
+
+    ~ChildProcessGuard() {
+        if (quit_fd >= 0) {
+            char quit = 'Q';
+            const ssize_t ignored = write(quit_fd, &quit, 1);
+            (void)ignored;
+            close(quit_fd);
+        }
+
+        if (detail_fd >= 0) {
+            close(detail_fd);
+        }
+
+        if (pid > 0) {
+            int status = 0;
+            while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+            }
+        }
+    }
+};
+
+int ensure_dir(const char* path) {
+    struct stat st = {};
+
+    if (stat(path, &st) == 0) {
+        return S_ISDIR(st.st_mode) ? 0 : -1;
+    }
+
+    return mkdir(path, 0755);
+}
+
+void best_effort_rmdir(const char* path) {
+    if (rmdir(path) != 0 && errno != ENOENT && errno != ENOTEMPTY) {
+        ADD_FAILURE() << "rmdir failed for " << path << ": errno=" << errno << " ("
+                      << strerror(errno) << ")";
+    }
+}
+
+std::string read_all_from_fd(int fd) {
+    std::string out;
+    char buf[512];
+    ssize_t n = 0;
+
+    while ((n = read(fd, buf, sizeof(buf))) > 0) {
+        out.append(buf, static_cast<size_t>(n));
+    }
+
+    return out;
+}
+
+bool read_text_file(const char* path, std::string* out) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return false;
+    }
+
+    out->clear();
+    char buf[1024];
+    ssize_t n = 0;
+    while ((n = read(fd, buf, sizeof(buf))) > 0) {
+        out->append(buf, static_cast<size_t>(n));
+    }
+
+    const int saved_errno = errno;
+    close(fd);
+    errno = saved_errno;
+    return n >= 0;
+}
+
+void expect_contains(const char* path, const std::string& content, const char* needle) {
+    EXPECT_NE(std::string::npos, content.find(needle)) << path << " missing substring\nneedle="
+                                                       << needle << "\ncontent=" << content;
+}
+
+void expect_not_contains(const char* path, const std::string& content, const char* needle) {
+    EXPECT_EQ(std::string::npos, content.find(needle))
+        << path << " unexpectedly contains substring\nneedle=" << needle << "\ncontent="
+        << content;
+}
+
+[[noreturn]] void child_fail(int detail_fd, const char* step) {
+    dprintf(detail_fd,
+            "%s: errno=%d (%s)",
+            step,
+            errno,
+            errno == 0 ? "no error information" : strerror(errno));
+    _exit(1);
+}
+
+}  // namespace
+
+TEST(ProcPidMounts, UsesTargetTaskRootAndMountNamespace) {
+    char base[256] = {};
+    char rootfs[256] = {};
+    char inside_name[64] = {};
+    char inside[256] = {};
+    char outside[256] = {};
+    char proc_mounts_path[64] = {};
+    char proc_mountinfo_path[64] = {};
+    int ready_pipe[2] = {-1, -1};
+    int quit_pipe[2] = {-1, -1};
+    int detail_pipe[2] = {-1, -1};
+    std::string proc_mounts;
+    std::string proc_mountinfo;
+    std::string self_mounts;
+    std::string self_mountinfo;
+    char inside_mounts_needle[96] = {};
+    char inside_mountinfo_needle[96] = {};
+
+    ASSERT_EQ(0, ensure_dir("/tmp")) << "mkdir /tmp failed: errno=" << errno << " ("
+                                      << strerror(errno) << ")";
+
+    snprintf(base, sizeof(base), "/tmp/proc_pid_mounts_target_view_%d", getpid());
+    snprintf(rootfs, sizeof(rootfs), "%s/rootfs", base);
+    snprintf(inside_name, sizeof(inside_name), "inside_%d", getpid());
+    snprintf(inside, sizeof(inside), "%s/%s", rootfs, inside_name);
+    snprintf(outside, sizeof(outside), "%s/outside", base);
+    snprintf(inside_mounts_needle, sizeof(inside_mounts_needle), " /%s ramfs ", inside_name);
+    snprintf(inside_mountinfo_needle, sizeof(inside_mountinfo_needle), " /%s ", inside_name);
+
+    ASSERT_EQ(0, ensure_dir(base)) << "mkdir base failed: errno=" << errno << " ("
+                                   << strerror(errno) << ")";
+    ASSERT_EQ(0, ensure_dir(rootfs)) << "mkdir rootfs failed: errno=" << errno << " ("
+                                     << strerror(errno) << ")";
+    ASSERT_EQ(0, ensure_dir(outside)) << "mkdir outside failed: errno=" << errno << " ("
+                                      << strerror(errno) << ")";
+
+    ASSERT_EQ(0, pipe(ready_pipe)) << "pipe ready failed: errno=" << errno << " ("
+                                   << strerror(errno) << ")";
+    ASSERT_EQ(0, pipe(quit_pipe)) << "pipe quit failed: errno=" << errno << " ("
+                                  << strerror(errno) << ")";
+    ASSERT_EQ(0, pipe(detail_pipe)) << "pipe detail failed: errno=" << errno << " ("
+                                    << strerror(errno) << ")";
+
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    if (child == 0) {
+        close(ready_pipe[0]);
+        close(quit_pipe[1]);
+        close(detail_pipe[0]);
+
+        if (unshare(CLONE_NEWNS) != 0) {
+            child_fail(detail_pipe[1], "unshare(CLONE_NEWNS)");
+        }
+        if (mount("", "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) {
+            child_fail(detail_pipe[1], "mount(/, MS_PRIVATE)");
+        }
+        if (mount("", rootfs, "ramfs", 0, nullptr) != 0) {
+            child_fail(detail_pipe[1], "mount(rootfs, ramfs)");
+        }
+        if (ensure_dir(inside) != 0) {
+            child_fail(detail_pipe[1], "mkdir(inside)");
+        }
+        if (mount("", inside, "ramfs", 0, nullptr) != 0) {
+            child_fail(detail_pipe[1], "mount(inside, ramfs)");
+        }
+        if (mount("", outside, "ramfs", 0, nullptr) != 0) {
+            child_fail(detail_pipe[1], "mount(outside, ramfs)");
+        }
+        if (chdir(rootfs) != 0) {
+            child_fail(detail_pipe[1], "chdir(rootfs)");
+        }
+        if (chroot(rootfs) != 0) {
+            child_fail(detail_pipe[1], "chroot(rootfs)");
+        }
+        if (chdir("/") != 0) {
+            child_fail(detail_pipe[1], "chdir(/)");
+        }
+
+        const char ready = 'R';
+        if (write(ready_pipe[1], &ready, 1) != 1) {
+            child_fail(detail_pipe[1], "notify parent ready");
+        }
+
+        char quit = 0;
+        if (read(quit_pipe[0], &quit, 1) != 1) {
+            child_fail(detail_pipe[1], "wait parent quit");
+        }
+
+        close(ready_pipe[1]);
+        close(quit_pipe[0]);
+        close(detail_pipe[1]);
+        _exit(0);
+    }
+
+    close(ready_pipe[1]);
+    close(quit_pipe[0]);
+    close(detail_pipe[1]);
+
+    ChildProcessGuard guard;
+    guard.pid = child;
+    guard.quit_fd = quit_pipe[1];
+    guard.detail_fd = detail_pipe[0];
+
+    char ready = 0;
+    ASSERT_EQ(1, read(ready_pipe[0], &ready, 1)) << "read child ready failed: errno=" << errno
+                                                 << " (" << strerror(errno) << ")";
+    EXPECT_EQ('R', ready);
+    close(ready_pipe[0]);
+
+    snprintf(proc_mounts_path, sizeof(proc_mounts_path), "/proc/%d/mounts", child);
+    ASSERT_TRUE(read_text_file(proc_mounts_path, &proc_mounts))
+        << "read " << proc_mounts_path << " failed: errno=" << errno << " (" << strerror(errno)
+        << ")";
+    expect_contains(proc_mounts_path, proc_mounts, " / ramfs ");
+    expect_contains(proc_mounts_path, proc_mounts, inside_mounts_needle);
+    expect_not_contains(proc_mounts_path, proc_mounts, "/outside");
+
+    snprintf(proc_mountinfo_path, sizeof(proc_mountinfo_path), "/proc/%d/mountinfo", child);
+    ASSERT_TRUE(read_text_file(proc_mountinfo_path, &proc_mountinfo))
+        << "read " << proc_mountinfo_path << " failed: errno=" << errno << " ("
+        << strerror(errno) << ")";
+    expect_contains(proc_mountinfo_path, proc_mountinfo, inside_mountinfo_needle);
+    expect_not_contains(proc_mountinfo_path, proc_mountinfo, outside);
+
+    ASSERT_TRUE(read_text_file("/proc/self/mounts", &self_mounts))
+        << "read /proc/self/mounts failed: errno=" << errno << " (" << strerror(errno) << ")";
+    expect_not_contains("/proc/self/mounts", self_mounts, inside_mountinfo_needle);
+    expect_not_contains("/proc/self/mounts", self_mounts, outside);
+
+    ASSERT_TRUE(read_text_file("/proc/self/mountinfo", &self_mountinfo))
+        << "read /proc/self/mountinfo failed: errno=" << errno << " (" << strerror(errno)
+        << ")";
+    expect_not_contains("/proc/self/mountinfo", self_mountinfo, inside_mountinfo_needle);
+    expect_not_contains("/proc/self/mountinfo", self_mountinfo, outside);
+
+    char quit = 'Q';
+    ASSERT_EQ(1, write(guard.quit_fd, &quit, 1)) << "write child quit failed: errno=" << errno
+                                                 << " (" << strerror(errno) << ")";
+    close(guard.quit_fd);
+    guard.quit_fd = -1;
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << "waitpid failed: errno=" << errno << " ("
+                                                 << strerror(errno) << ")";
+
+    const std::string detail = read_all_from_fd(guard.detail_fd);
+    close(guard.detail_fd);
+    guard.detail_fd = -1;
+
+    ASSERT_TRUE(WIFEXITED(status)) << "child terminated abnormally, status=0x" << std::hex
+                                   << status;
+    EXPECT_EQ(0, WEXITSTATUS(status)) << detail;
+
+    guard.pid = -1;
+
+    best_effort_rmdir(inside);
+    best_effort_rmdir(rootfs);
+    best_effort_rmdir(outside);
+    best_effort_rmdir(base);
+}
+
+int main(int argc, char** argv) {
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
+}

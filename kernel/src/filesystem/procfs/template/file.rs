@@ -106,6 +106,11 @@ pub trait FileOps: Sync + Send + Sized + Debug {
         Err(SystemError::EPERM)
     }
 
+    /// 打开文件时调用，可用于按 open 时上下文初始化 procfs 私有数据
+    fn open(&self, _data: &mut MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
+        Ok(())
+    }
+
     /// 返回动态 owner（用于 /proc/<pid> 等需要实时 UID/GID 的场景）
     fn owner(&self) -> Option<(usize, usize)> {
         None
@@ -165,7 +170,7 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
     ) -> Result<(), SystemError> {
         // 设置 procfs 私有数据，使得 lseek(SEEK_END) 返回 EINVAL
         *data = FilePrivateData::Procfs(ProcfsFilePrivateData::new());
-        Ok(())
+        self.inner.open(&mut data)
     }
 
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {

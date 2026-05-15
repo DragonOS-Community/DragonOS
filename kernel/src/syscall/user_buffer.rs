@@ -235,8 +235,7 @@ impl<'a> UserBuffer<'a> {
     /// buffer.clear_range(0, 64)?; // 清零前64字节
     /// ```
     pub fn clear_range(&mut self, offset: usize, len: usize) -> Result<(), SystemError> {
-        use crate::arch::MMArch;
-        use crate::mm::MemoryManagementArch;
+        use crate::syscall::user_access::clear_user_cow_protected;
 
         if len == 0 {
             return Ok(());
@@ -253,21 +252,8 @@ impl<'a> UserBuffer<'a> {
             return Ok(());
         }
 
-        let dst_addr = (self.user_addr.data() + offset) as *mut u8;
-
-        // 使用架构相关的带异常表保护的 memset。
-        // 注意：用户页可能以 PAGE_COPY（COW）形式映射为只读 PTE，
-        // 此时内核直接写会被 CR0.WP 拦截。
-        // 与 copy_to_user_protected 保持一致，清零时也临时关闭内核写保护。
-        MMArch::disable_kernel_wp();
-        let result = unsafe { MMArch::memset_with_exception_table(dst_addr, 0, clear_len) };
-        MMArch::enable_kernel_wp();
-
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(SystemError::EFAULT)
-        }
+        let dst_addr = crate::mm::VirtAddr::new(self.user_addr.data() + offset);
+        unsafe { clear_user_cow_protected(dst_addr, clear_len) }.map(|_| ())
     }
 
     /// 将整个用户缓冲区清零

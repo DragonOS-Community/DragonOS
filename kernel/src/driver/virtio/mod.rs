@@ -53,6 +53,10 @@ pub trait VirtIODevice: Device {
 pub trait VirtIODriver: Driver {
     fn probe(&self, device: &Arc<dyn VirtIODevice>) -> Result<(), SystemError>;
 
+    fn shutdown(&self, _device: &Arc<dyn VirtIODevice>) -> Result<(), SystemError> {
+        Ok(())
+    }
+
     fn virtio_id_table(&self) -> Vec<VirtioDeviceId>;
 
     fn add_virtio_id(&self, id: VirtioDeviceId);

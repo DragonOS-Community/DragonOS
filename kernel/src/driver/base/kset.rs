@@ -123,6 +123,22 @@ impl KSet {
         }
     }
 
+    /// 从当前kset的遍历列表尾部弹出一个仍然存活的kobject。
+    ///
+    /// 该函数只移除kset内部列表项，不修改kobject自身的kset指针，也不移除sysfs节点。
+    /// 这用于关机路径模拟Linux `device_shutdown()` 先从全局设备列表摘除设备，
+    /// 再在不持有列表锁的情况下调用shutdown回调的语义。
+    pub fn pop_last_live_kobject(&self) -> Option<Arc<dyn KObject>> {
+        let mut kobjects = self.kobjects.write();
+        while let Some(weak_kobj) = kobjects.pop() {
+            if let Some(kobj) = weak_kobj.upgrade() {
+                return Some(kobj);
+            }
+        }
+
+        None
+    }
+
     /// 清除所有已经被释放的kobject
     #[allow(dead_code)]
     pub fn cleanup_weak(&self) {

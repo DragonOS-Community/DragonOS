@@ -106,8 +106,41 @@ impl Bus for VirtIOBus {
         todo!()
     }
 
-    fn shutdown(&self, _device: &Arc<dyn Device>) {
-        // do nothing
+    fn shutdown(&self, device: &Arc<dyn Device>) {
+        let drv = match device.driver() {
+            Some(drv) => drv,
+            None => return,
+        };
+
+        let virtio_drv = match drv.cast::<dyn VirtIODriver>() {
+            Ok(virtio_drv) => virtio_drv,
+            Err(_) => {
+                error!(
+                    "VirtIOBus::shutdown() failed: device.driver() is not a VirtioDriver. Device: '{:?}'",
+                    device.name()
+                );
+                return;
+            }
+        };
+
+        let virtio_dev = match device.clone().cast::<dyn VirtIODevice>() {
+            Ok(virtio_dev) => virtio_dev,
+            Err(_) => {
+                error!(
+                    "VirtIOBus::shutdown() failed: device is not a VirtIODevice. Device: '{:?}'",
+                    device.name()
+                );
+                return;
+            }
+        };
+
+        if let Err(e) = virtio_drv.shutdown(&virtio_dev) {
+            error!(
+                "VirtIOBus::shutdown() failed: driver shutdown failed. Device: '{:?}', error: {:?}",
+                device.name(),
+                e
+            );
+        }
     }
 
     fn resume(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError> {

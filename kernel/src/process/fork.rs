@@ -2,6 +2,8 @@ use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 use crate::arch::MMArch;
+use crate::cgroup::{cgroup_accounting_lock, cgroup_can_fork_in, cgroup_migrate_vet_dst_with_src};
+use crate::filesystem::cgroup2::{cgroup2_check_attach_permissions, cgroup2_inode_to_node};
 use crate::filesystem::vfs::file::File;
 use crate::filesystem::vfs::file::FileFlags;
 use crate::filesystem::vfs::file::FilePrivateData;
@@ -20,11 +22,8 @@ use crate::{
     libs::{cpumask::CpuMask, rwsem::RwSem},
     mm::VirtAddr,
     process::ProcessFlags,
-    sched::{cpu_is_online, sched_cgroup_fork, sched_fork, sched_set_new_task_cpu},
-    smp::{
-        core::smp_get_processor_id,
-        cpu::{smp_cpu_manager_initialized, ProcessorId},
-    },
+    sched::{cpu_is_online, sched_cgroup_fork, sched_fork},
+    smp::cpu::{smp_cpu_manager_initialized, ProcessorId},
     syscall::user_access::UserBufferWriter,
 };
 
@@ -105,6 +104,7 @@ bitflags! {
 pub struct KernelCloneArgs {
     pub flags: CloneFlags,
     pub target_cpu: Option<ProcessorId>,
+    pub cpus_allowed: Option<CpuMask>,
 
     // 下列属性均来自用户空间
     pub pidfd: VirtAddr,
@@ -137,6 +137,7 @@ impl KernelCloneArgs {
         Self {
             flags: unsafe { CloneFlags::from_bits_unchecked(0) },
             target_cpu: None,
+            cpus_allowed: None,
             pidfd: null_addr,
             child_tid: null_addr,
             parent_tid: null_addr,
@@ -192,6 +193,7 @@ impl KernelCloneArgs {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn resolve_target_cpu(
         &mut self,
         default_cpu: ProcessorId,
@@ -251,27 +253,33 @@ impl ProcessManager {
         current_trapframe: &TrapFrame,
         clone_flags: CloneFlags,
     ) -> Result<RawPid, SystemError> {
+        let mut args = KernelCloneArgs::new();
+        args.flags = clone_flags;
+        args.exit_signal = Signal::SIGCHLD;
+        Self::fork_with_args(current_trapframe, args)
+    }
+
+    pub fn fork_with_args(
+        current_trapframe: &TrapFrame,
+        args: KernelCloneArgs,
+    ) -> Result<RawPid, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
 
         let new_kstack: KernelStack = KernelStack::new()?;
 
         let name = current_pcb.basic().name().to_string();
 
-        let mut args = KernelCloneArgs::new();
-        args.flags = clone_flags;
-        args.exit_signal = Signal::SIGCHLD;
         args.verify()?;
         let pcb = ProcessControlBlock::new(name, new_kstack);
-        let target_cpu =
-            Self::copy_process(&current_pcb, &pcb, args, current_trapframe).map_err(|e| {
-                error!(
-                    "fork: Failed to copy process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                    current_pcb.raw_pid(),
-                    pcb.raw_pid(),
-                    e
-                );
+        Self::copy_process(&current_pcb, &pcb, args, current_trapframe).map_err(|e| {
+            error!(
+                "fork: Failed to copy process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
+                current_pcb.raw_pid(),
+                pcb.raw_pid(),
                 e
-            })?;
+            );
+            e
+        })?;
         // if pcb.raw_pid().data() > 1 {
         //     log::debug!(
         //         "fork done, pid: {}, pgid: {:?}, tgid: {:?}, sid: {}",
@@ -282,9 +290,7 @@ impl ProcessManager {
         //     );
         // }
 
-        sched_set_new_task_cpu(&pcb, target_cpu);
-
-        ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {
+        ProcessManager::wakeup_new_task(&pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to wakeup new process, pid: [{:?}]. Error: {:?}",
                 pcb.raw_pid(),
@@ -331,30 +337,23 @@ impl ProcessManager {
     ///
     /// ## Panic
     ///
-    /// - 如果当前进程没有用户地址空间，则panic
+    /// - 无
     #[inline(never)]
     fn copy_mm(
         clone_flags: &CloneFlags,
         current_pcb: &Arc<ProcessControlBlock>,
         new_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
-        let old_address_space = current_pcb.basic().user_vm().unwrap_or_else(|| {
-            panic!(
-                "copy_mm: Failed to get address space of current process, current pid: [{:?}]",
-                current_pcb.raw_pid()
-            )
-        });
+        let old_address_space = current_pcb.basic().user_vm().ok_or(SystemError::ENOMEM)?;
 
         if clone_flags.contains(CloneFlags::CLONE_VM) {
             unsafe { new_pcb.basic_mut().set_user_vm(Some(old_address_space)) };
             return Ok(());
         }
-        let new_address_space = old_address_space.write().try_clone().unwrap_or_else(|e| {
-            panic!(
-                "copy_mm: Failed to clone address space of current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.raw_pid(), new_pcb.raw_pid(), e
-            )
-        });
+        let new_address_space = old_address_space
+            .write()
+            .try_clone()
+            .map_err(|_| SystemError::ENOMEM)?;
         unsafe { new_pcb.basic_mut().set_user_vm(Some(new_address_space)) };
         return Ok(());
     }
@@ -503,7 +502,7 @@ impl ProcessManager {
     /// - pcb 目标pcb
     ///
     /// ## return
-    /// - 成功时返回本次 fork 最终解析出的目标 CPU
+    /// - 成功时返回Ok(())
     /// - 发生错误时返回Err(SystemError)
     #[inline(never)]
     pub fn copy_process(
@@ -511,7 +510,7 @@ impl ProcessManager {
         pcb: &Arc<ProcessControlBlock>,
         mut clone_args: KernelCloneArgs,
         current_trapframe: &TrapFrame,
-    ) -> Result<ProcessorId, SystemError> {
+    ) -> Result<(), SystemError> {
         let clone_flags = clone_args.flags;
         // 不允许与不同namespace的进程共享根目录
 
@@ -529,7 +528,7 @@ impl ProcessManager {
 
         if (clone_flags & (CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_FS)
             == (CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_FS))
-            || (clone_flags & (CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_FS))
+            || (clone_flags & (CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_FS))
                 == (CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_FS)
         {
             return Err(SystemError::EINVAL);
@@ -611,6 +610,9 @@ impl ProcessManager {
         if current_pcb.raw_pid() != RawPid(0) {
             pcb.sched_info()
                 .set_cpus_allowed(current_pcb.sched_info().cpus_allowed());
+        }
+        if let Some(cpus_allowed) = clone_args.cpus_allowed.take() {
+            pcb.sched_info().set_cpus_allowed(cpus_allowed);
         }
         clone_args.validate_requested_target_cpu(&pcb.sched_info().cpus_allowed())?;
 
@@ -792,11 +794,7 @@ impl ProcessManager {
                 let mut guard = file.private_data.lock();
                 *guard = FilePrivateData::Pid(PidPrivateData::new(pid));
             }
-            let r = current_pcb
-                .fd_table()
-                .write()
-                .alloc_fd(file, None, true)
-                .map(|fd| fd as usize);
+            let r = current_pcb.fd_table().write().alloc_fd(file, None, true)?;
 
             let mut writer = UserBufferWriter::new(
                 clone_args.parent_tid.data() as *mut i32,
@@ -804,7 +802,7 @@ impl ProcessManager {
                 true,
             )?;
 
-            writer.copy_one_to_user(&(r.unwrap() as i32), 0)?;
+            writer.copy_one_to_user(&(r as i32), 0)?;
         }
 
         let pid = pcb.pid();
@@ -903,36 +901,41 @@ impl ProcessManager {
             }
         }
 
+        let clone_into_cgroup_target = Self::resolve_clone_into_cgroup_target(&clone_args)?;
+
         if pcb.raw_pid() > RawPid(0) {
+            let charge_node = clone_into_cgroup_target
+                .as_ref()
+                .unwrap_or(&pcb.task_cgroup_node())
+                .clone();
+            let src_node = pcb.task_cgroup_node();
+            let _cgroup_guard = cgroup_accounting_lock().lock();
+            cgroup_can_fork_in(&charge_node, 1)?;
+            if let Some(target_node) = clone_into_cgroup_target {
+                cgroup_migrate_vet_dst_with_src(&src_node, &target_node, 1)?;
+                pcb.set_task_cgroup_node_for_fork(target_node);
+            }
+            let cgroup = pcb.task_cgroup_node();
+            cgroup.charge_pids(1);
+            cgroup.add_task(pcb.raw_pid());
             ProcessManager::add_pcb(pcb.clone());
         }
 
-        // 设置child_tid，意味着子线程能够知道自己的id
+        // 设置child_tid，意味着子线程能够知道自己的id。
+        // 按 Linux schedule_tail 语义，在子任务首次运行时再 best-effort 写入。
         if clone_flags.contains(CloneFlags::CLONE_CHILD_SETTID) {
             pcb.thread.write_irqsave().set_child_tid = Some(clone_args.child_tid);
         }
 
-        // 将子进程/线程的id存储在用户态传进的地址中
-        if clone_flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
-            let mut writer = UserBufferWriter::new(
-                clone_args.parent_tid.data() as *mut i32,
-                core::mem::size_of::<i32>(),
-                true,
-            )?;
-
-            writer.copy_one_to_user(&(pcb.raw_pid().0 as i32), 0)?;
-        }
-
-        // 对于 target_cpu=None，必须在 fork 长路径的末尾才解析默认 CPU，
-        // 否则父任务在 copy_process() 期间迁移后，会把子任务错误地绑定到过早采样的 CPU。
-        let target_cpu = clone_args
-            .resolve_target_cpu(smp_get_processor_id(), &pcb.sched_info().cpus_allowed())?;
+        // 新任务的默认落点 CPU 应在 wakeup_new_task() 时再选择；这里只保留显式 hint，
+        // 以避免 fork 长路径内父任务迁移导致的“过早采样当前 CPU”问题。
+        pcb.sched_info().mark_new_task(clone_args.target_cpu);
         sched_cgroup_fork(pcb);
 
         // 处理 rseq 状态
         crate::process::rseq::rseq_fork(pcb, clone_flags.contains(CloneFlags::CLONE_VM));
 
-        Ok(target_cpu)
+        Ok(())
     }
 
     fn copy_fs(
@@ -949,6 +952,54 @@ impl ProcessManager {
             *guard = Arc::new(new_fs);
         }
         Ok(())
+    }
+
+    fn resolve_clone_into_cgroup_target(
+        clone_args: &KernelCloneArgs,
+    ) -> Result<Option<Arc<crate::cgroup::CgroupNode>>, SystemError> {
+        if !clone_args.flags.contains(CloneFlags::CLONE_INTO_CGROUP) {
+            return Ok(None);
+        }
+
+        if clone_args.cgroup < 0 {
+            return Err(SystemError::EBADF);
+        }
+
+        let current = ProcessManager::current_pcb();
+
+        let fd = clone_args.cgroup;
+        let file = current
+            .fd_table()
+            .read()
+            .get_file_by_fd(fd)
+            .ok_or(SystemError::EBADF)?;
+
+        if file.inode().fs().name() != "cgroup2" {
+            return Err(SystemError::EINVAL);
+        }
+        if file.inode().metadata()?.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+
+        let node = cgroup2_inode_to_node(&file.inode())?;
+        let ns_root = current.nsproxy().cgroup_ns.root_cgroup().clone();
+        if !ns_root.is_ancestor_of(&node) {
+            return Err(SystemError::ENOENT);
+        }
+        let src = current.task_cgroup_node();
+        if !ns_root.is_ancestor_of(&src) {
+            return Err(SystemError::ENOENT);
+        }
+        if Arc::ptr_eq(&src, &node) {
+            return Ok(None);
+        }
+        if clone_args.flags.contains(CloneFlags::CLONE_THREAD) {
+            return Err(SystemError::EINVAL);
+        }
+        cgroup2_check_attach_permissions(file.inode().fs().root_inode(), &src, &node)?;
+        cgroup_migrate_vet_dst_with_src(&src, &node, 1)?;
+
+        Ok(Some(node))
     }
 }
 

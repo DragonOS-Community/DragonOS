@@ -459,6 +459,11 @@ pub struct File {
 }
 
 impl File {
+    #[inline]
+    pub fn cred(&self) -> Arc<Cred> {
+        self.cred.clone()
+    }
+
     fn maybe_kill_suid_sgid_after_write(&self) -> Result<(), SystemError> {
         // 仅对普通文件生效。
         if self.file_type != FileType::File {

@@ -167,18 +167,32 @@ impl IrqManager {
         e: SystemError,
         mut action_guard: SpinLockGuard<'_, InnerIrqAction>,
     ) -> SystemError {
+        let mut thread_to_stop = None;
+        let mut secondary_thread_to_stop = None;
+
         if let Some(thread_pcb) = action_guard.thread() {
             action_guard.set_thread(None);
-            KernelThreadMechanism::stop(&thread_pcb).ok();
+            thread_to_stop = Some(thread_pcb);
         }
 
         if let Some(secondary) = action_guard.secondary() {
             let mut secondary_guard = secondary.inner();
             if let Some(thread_pcb) = secondary_guard.thread() {
                 secondary_guard.set_thread(None);
-                KernelThreadMechanism::stop(&thread_pcb).ok();
+                secondary_thread_to_stop = Some(thread_pcb);
             }
         }
+
+        drop(action_guard);
+
+        if let Some(thread_pcb) = thread_to_stop {
+            KernelThreadMechanism::stop(&thread_pcb).ok();
+        }
+
+        if let Some(thread_pcb) = secondary_thread_to_stop {
+            KernelThreadMechanism::stop(&thread_pcb).ok();
+        }
+
         e
     }
 

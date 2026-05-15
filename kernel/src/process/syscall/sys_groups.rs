@@ -71,9 +71,14 @@ impl Syscall for SysSetGroups {
         let pcb = ProcessManager::current_pcb();
 
         // Linux: requires CAP_SETGID in the current user namespace.
-        // For now we treat "root" or CAP_SETGID in effective set as privileged.
         let current_cred = pcb.cred();
-        if current_cred.euid.data() != 0 && !current_cred.has_capability(CAPFlags::CAP_SETGID) {
+        let user_ns = current_cred.user_ns.clone();
+        if !crate::process::cred::ns_capable_setid(&user_ns, CAPFlags::CAP_SETGID) {
+            return Err(SystemError::EPERM);
+        }
+
+        // 在 user namespace 中，setgroups 还受 gid_map 和 setgroups flag 限制
+        if !crate::process::namespace::user_namespace::userns_may_setgroups(&user_ns) {
             return Err(SystemError::EPERM);
         }
 

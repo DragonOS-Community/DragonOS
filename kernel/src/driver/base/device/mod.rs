@@ -4,7 +4,7 @@ use alloc::{
     sync::{Arc, Weak},
 };
 use intertrait::cast::CastArc;
-use log::{debug, error, warn};
+use log::{error, warn};
 
 use crate::{
     driver::{
@@ -984,30 +984,26 @@ pub fn device_unregister<T: Device>(_device: Arc<T>) {
 ///
 /// 参考: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/core.c#4611
 pub fn device_shutdown() {
-    // 遍历/sys/devices下的所有设备，关闭设备
     let devices_kset = sys_devices_kset();
-    let kobjects = devices_kset.kobjects();
-    for weak_kobj in kobjects.iter() {
-        // 尝试升级weak指针
-        if let Some(kobj) = weak_kobj.upgrade() {
-            debug!("Found kobject: {}", kobj.name());
 
-            // 执行设备的shutdown回调
-            let dev = kobj
-                .cast::<dyn Device>()
-                .expect("Failed to cast kobj to Device");
+    loop {
+        let Some(kobj) = devices_kset.pop_last_live_kobject() else {
+            break;
+        };
 
-            if let Some(dev_bus) = dev.bus() {
-                if let Some(dev_bus) = dev_bus.upgrade() {
-                    // 执行设备的shutdown回调
-                    dev_bus.shutdown(&dev.clone());
-                } else {
-                    debug!("{} has been released", dev.clone().name());
-                }
+        let dev = match kobj.cast::<dyn Device>() {
+            Ok(dev) => dev,
+            Err(kobj) => {
+                warn!(
+                    "device_shutdown: non-device kobject '{}' in /sys/devices, skipping",
+                    kobj.name()
+                );
+                continue;
             }
-        } else {
-            // Weak指针已经过期，表示kobject已经被释放
-            debug!("Weak pointer expired");
+        };
+
+        if let Some(dev_bus) = dev.bus().and_then(|bus| bus.upgrade()) {
+            dev_bus.shutdown(&dev);
         }
     }
 }

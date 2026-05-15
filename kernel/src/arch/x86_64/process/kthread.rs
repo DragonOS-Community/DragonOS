@@ -1,13 +1,14 @@
 use alloc::sync::Arc;
 use system_error::SystemError;
 
+use crate::libs::cpumask::CpuMask;
 use crate::{
     arch::{
         interrupt::TrapFrame,
         process::table::{KERNEL_CS, KERNEL_DS},
     },
     process::{
-        fork::CloneFlags,
+        fork::{CloneFlags, KernelCloneArgs},
         kthread::{kernel_thread_bootstrap_stage2, KernelThreadCreateInfo, KernelThreadMechanism},
         ProcessManager, RawPid,
     },
@@ -40,7 +41,20 @@ impl KernelThreadMechanism {
         frame.rip = kernel_thread_bootstrap_stage1 as usize as u64;
 
         // fork失败的话，子线程不会执行。否则将导致内存安全问题。
-        let pid = ProcessManager::fork(&frame, clone_flags).inspect_err(|_e| {
+        let mut clone_args = KernelCloneArgs::new();
+        clone_args.flags = clone_flags;
+        if info
+            .flags()
+            .contains(crate::process::kthread::KernelThreadFlags::IS_PER_CPU)
+        {
+            let cpu = info
+                .bound_cpu()
+                .expect("kthread create: per-cpu thread missing target cpu");
+            clone_args.target_cpu = Some(cpu);
+            clone_args.cpus_allowed = Some(CpuMask::from_cpu(cpu));
+        }
+
+        let pid = ProcessManager::fork_with_args(&frame, clone_args).inspect_err(|_e| {
             unsafe { KernelThreadCreateInfo::parse_unsafe_arc_ptr(create_info) };
         })?;
 

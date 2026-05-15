@@ -7,14 +7,13 @@ use crate::{
     arch::MMArch,
     filesystem::{
         procfs::{
-            pid::find_process_by_vpid,
+            pid::ProcPidTarget,
             template::{Builder, FileOps, ProcFileBuilder},
             utils::proc_read,
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
     mm::MemoryManagementArch,
-    process::RawPid,
 };
 use alloc::{
     format,
@@ -25,12 +24,12 @@ use system_error::SystemError;
 /// /proc/[pid]/statm 文件的 FileOps 实现
 #[derive(Debug)]
 pub struct StatmFileOps {
-    pid: RawPid,
+    target: ProcPidTarget,
 }
 
 impl StatmFileOps {
-    pub fn new_inode(pid: RawPid, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcFileBuilder::new(Self { pid }, InodeMode::S_IRUGO)
+    pub fn new_inode(target: ProcPidTarget, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcFileBuilder::new(Self { target }, InodeMode::S_IRUGO)
             .parent(parent)
             .build()
             .unwrap()
@@ -45,8 +44,10 @@ impl FileOps for StatmFileOps {
         buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        // 查找进程
-        let pcb = find_process_by_vpid(self.pid).ok_or(SystemError::ESRCH)?;
+        let pcb = self
+            .target
+            .thread_group_leader()
+            .ok_or(SystemError::ESRCH)?;
 
         // 获取进程内存信息（简化实现）
         let size_pages = pcb

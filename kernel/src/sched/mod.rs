@@ -40,8 +40,8 @@ use crate::{
     },
     mm::percpu::{PerCpu, PerCpuVar},
     process::{
-        preempt::PreemptGuard, ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState,
-        SchedInfo,
+        account_context_switch, preempt::PreemptGuard, ProcessControlBlock, ProcessFlags,
+        ProcessManager, ProcessState, SchedInfo,
     },
     sched::idle::IdleScheduler,
     smp::{
@@ -102,6 +102,14 @@ fn rq_is_idle_cpu(rq: &CpuRunQueue) -> bool {
 #[inline]
 pub fn cpu_is_online(cpu: ProcessorId) -> bool {
     smp_cpu_manager().is_online_cpu(cpu)
+}
+
+pub fn nr_iowait() -> u32 {
+    smp_cpu_manager()
+        .present_cpus()
+        .iter_cpu()
+        .map(|cpu| cpu_rq(cpu.data() as usize).nr_iowait() as u32)
+        .sum()
 }
 
 #[inline]
@@ -1204,6 +1212,7 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
 
         rq.set_current(Arc::downgrade(&next));
         compiler_fence(Ordering::SeqCst);
+        account_context_switch();
         if let Some(dest_cpu) = migrate_prev_to {
             unsafe {
                 crate::process::PROCESS_SWITCH_RESULT

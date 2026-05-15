@@ -2,6 +2,8 @@
 //!
 //! 这个文件实现了 /proc 的根目录，包含静态条目和动态的进程目录
 
+use core::{any::Any, fmt};
+
 use crate::{
     filesystem::{
         procfs::{
@@ -20,7 +22,7 @@ use crate::{
                 lookup_child_from_table, populate_children_from_table, DirOps, ProcDir,
                 ProcDirBuilder,
             },
-            thread_self::ThreadSelfDirOps,
+            thread_self::ThreadSelfSymOps,
             version::VersionFileOps,
             version_signature::VersionSignatureFileOps,
             vmstat::VmstatFileOps,
@@ -28,7 +30,7 @@ use crate::{
         },
         vfs::{FileSystemMakerData, IndexNode, InodeMode, FSMAKER},
     },
-    process::{pid::PidType, ProcessManager, RawPid},
+    process::{namespace::pid_namespace::PidNamespace, ProcessManager, RawPid},
     register_mountable_fs,
 };
 use alloc::{
@@ -39,15 +41,38 @@ use alloc::{
 use system_error::SystemError;
 
 /// /proc 根目录的 DirOps 实现
-#[derive(Debug)]
-pub struct RootDirOps;
+pub struct RootDirOps {
+    pid_ns: Arc<PidNamespace>,
+}
+
+impl fmt::Debug for RootDirOps {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RootDirOps").finish()
+    }
+}
+
+struct ProcMountData {
+    pid_ns: Arc<PidNamespace>,
+}
+
+impl fmt::Debug for ProcMountData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProcMountData").finish()
+    }
+}
+
+impl FileSystemMakerData for ProcMountData {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
 
 //  drop 的时候把对应pid的文件夹删除
 impl RootDirOps {
-    pub fn new_inode(fs: Weak<ProcFS>) -> Arc<dyn IndexNode> {
+    pub fn new_inode(fs: Weak<ProcFS>, pid_ns: Arc<PidNamespace>) -> Arc<dyn IndexNode> {
         //todo 这里要注册一个observer，用于动态创建进程目录
 
-        ProcDirBuilder::new(Self, InodeMode::from_bits_truncate(0o555))
+        ProcDirBuilder::new(Self { pid_ns }, InodeMode::from_bits_truncate(0o555))
             .fs(fs)
             .build()
             .expect("Failed to create RootDirOps")
@@ -70,7 +95,7 @@ impl RootDirOps {
         ("self", SelfSymOps::new_inode),
         ("stat", StatFileOps::new_inode),
         ("sys", SysDirOps::new_inode),
-        ("thread-self", ThreadSelfDirOps::new_inode),
+        ("thread-self", ThreadSelfSymOps::new_inode),
         ("version", VersionFileOps::new_inode),
         ("version_signature", VersionSignatureFileOps::new_inode),
         ("vmstat", VmstatFileOps::new_inode),
@@ -86,7 +111,10 @@ impl DirOps for RootDirOps {
         // 首先检查是否是 PID 目录
         if let Ok(pid) = name.parse::<RawPid>() {
             // 检查进程是否存在
-            if ProcessManager::find_task_by_vpid(pid).is_some() {
+            if let Some(target) = crate::filesystem::procfs::pid::ProcPidTarget::from_tgid_in_ns(
+                self.pid_ns.clone(),
+                pid,
+            ) {
                 let mut cached_children = dir.cached_children().write();
 
                 // 检查缓存中是否已存在
@@ -95,7 +123,7 @@ impl DirOps for RootDirOps {
                 }
 
                 // 创建新的 PID 目录（只传递 PID，不传递进程引用）
-                let inode = PidDirOps::new_inode(pid, dir.self_ref_weak().clone());
+                let inode = PidDirOps::new_inode(target, dir.self_ref_weak().clone());
                 cached_children.insert(name.to_string(), inode.clone());
                 return Ok(inode);
             } else {
@@ -118,23 +146,28 @@ impl DirOps for RootDirOps {
     }
 
     fn populate_children(&self, dir: &ProcDir<Self>) {
-        let active_pid_ns = ProcessManager::current_pcb().active_pid_ns();
-        let pid_list = active_pid_ns
+        let pid_targets = self
+            .pid_ns
             .collect_pids()
             .into_iter()
-            .filter(|pid| pid.pid_task(PidType::PID).is_some())
-            .map(|pid| pid.pid_nr_ns(&active_pid_ns))
-            .filter(|pid| pid.data() != 0)
+            .filter_map(|pid| {
+                crate::filesystem::procfs::pid::ProcPidTarget::from_tgid_in_ns(
+                    self.pid_ns.clone(),
+                    pid.pid_nr_ns(&self.pid_ns),
+                )
+            })
             .collect::<Vec<_>>();
 
         // 获取缓存写锁并填充
         let mut cached_children = dir.cached_children().write();
 
         // 填充进程目录（只传递 PID）
-        for pid in pid_list {
+        for target in pid_targets {
             cached_children
-                .entry(pid.to_string())
-                .or_insert_with(|| PidDirOps::new_inode(pid, dir.self_ref_weak().clone()));
+                .entry(target.vpid().to_string())
+                .or_insert_with(|| {
+                    PidDirOps::new_inode(target.clone(), dir.self_ref_weak().clone())
+                });
         }
 
         // 填充静态条目
@@ -150,15 +183,21 @@ use crate::libs::rwsem::RwSem;
 use linkme::distributed_slice;
 
 /// ProcFS 文件系统
-#[derive(Debug)]
 pub struct ProcFS {
+    pid_ns: Arc<PidNamespace>,
     /// procfs 的 root inode
     root_inode: Arc<dyn IndexNode>,
     super_block: RwSem<SuperBlock>,
 }
 
+impl fmt::Debug for ProcFS {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProcFS").finish()
+    }
+}
+
 impl ProcFS {
-    pub fn new() -> Arc<Self> {
+    pub fn new(pid_ns: Arc<PidNamespace>) -> Arc<Self> {
         let super_block = SuperBlock::new(
             Magic::PROC_MAGIC,
             PROCFS_BLOCK_SIZE,
@@ -166,11 +205,16 @@ impl ProcFS {
         );
 
         let fs: Arc<ProcFS> = Arc::new_cyclic(|weak_fs| ProcFS {
+            pid_ns: pid_ns.clone(),
             super_block: RwSem::new(super_block),
-            root_inode: RootDirOps::new_inode(weak_fs.clone()),
+            root_inode: RootDirOps::new_inode(weak_fs.clone(), pid_ns.clone()),
         });
 
         fs
+    }
+
+    pub fn pid_ns(&self) -> &Arc<PidNamespace> {
+        &self.pid_ns
     }
 }
 
@@ -210,14 +254,18 @@ impl MountableFileSystem for ProcFS {
         _source: &str,
     ) -> Result<Option<Arc<dyn crate::filesystem::vfs::FileSystemMakerData + 'static>>, SystemError>
     {
-        // procfs 不需要任何额外的挂载数据
-        Ok(None)
+        Ok(Some(Arc::new(ProcMountData {
+            pid_ns: ProcessManager::current_pcb().active_pid_ns(),
+        })))
     }
 
     fn make_fs(
-        _data: Option<&dyn crate::filesystem::vfs::FileSystemMakerData>,
+        data: Option<&dyn crate::filesystem::vfs::FileSystemMakerData>,
     ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
-        let fs = ProcFS::new();
+        let mount_data = data
+            .and_then(|d| d.as_any().downcast_ref::<ProcMountData>())
+            .ok_or(SystemError::EINVAL)?;
+        let fs = ProcFS::new(mount_data.pid_ns.clone());
         Ok(fs)
     }
 }

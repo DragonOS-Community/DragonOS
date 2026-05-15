@@ -5,7 +5,7 @@ use core::{
     intrinsics::unlikely,
     mem::ManuallyDrop,
     str::FromStr,
-    sync::atomic::{compiler_fence, fence, AtomicBool, AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{compiler_fence, fence, AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -108,10 +108,48 @@ pub use cputime::ProcessCpuTime;
 /// 系统中所有进程的pcb
 static ALL_PROCESS: SpinLock<Option<HashMap<RawPid, Arc<ProcessControlBlock>>>> =
     SpinLock::new(None);
+static NR_VISIBLE_THREADS: AtomicUsize = AtomicUsize::new(0);
+static TOTAL_FORKS: AtomicU64 = AtomicU64::new(0);
+static TOTAL_CONTEXT_SWITCHES: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn all_process() -> &'static SpinLock<Option<HashMap<RawPid, Arc<ProcessControlBlock>>>>
 {
     &ALL_PROCESS
+}
+
+#[inline]
+pub(crate) fn inc_visible_thread_count() {
+    NR_VISIBLE_THREADS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub(crate) fn dec_visible_thread_count() {
+    NR_VISIBLE_THREADS.fetch_sub(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub(crate) fn account_successful_fork() {
+    TOTAL_FORKS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn nr_threads() -> u32 {
+    NR_VISIBLE_THREADS.load(Ordering::Relaxed) as u32
+}
+
+#[inline]
+pub fn total_forks() -> u64 {
+    TOTAL_FORKS.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub(crate) fn account_context_switch() {
+    TOTAL_CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn nr_context_switches() -> u64 {
+    TOTAL_CONTEXT_SWITCHES.load(Ordering::Relaxed)
 }
 
 fn exchange_raw_pids_locked(

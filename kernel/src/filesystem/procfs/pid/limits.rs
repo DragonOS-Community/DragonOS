@@ -8,13 +8,13 @@ use crate::libs::mutex::MutexGuard;
 use crate::{
     filesystem::{
         procfs::{
-            pid::find_process_by_vpid,
+            pid::ProcPidTarget,
             template::{Builder, FileOps, ProcFileBuilder},
             utils::proc_read,
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    process::{resource::RLimitID, RawPid},
+    process::resource::RLimitID,
 };
 use alloc::{
     string::{String, ToString},
@@ -25,7 +25,7 @@ use system_error::SystemError;
 /// /proc/[pid]/limits 文件的 FileOps 实现
 #[derive(Debug)]
 pub struct LimitsFile {
-    pid: RawPid,
+    target: ProcPidTarget,
 }
 
 #[derive(Clone, Copy)]
@@ -102,8 +102,8 @@ impl LimitsFile {
         },
     ];
 
-    pub fn new_inode(pid: RawPid, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcFileBuilder::new(Self { pid }, InodeMode::S_IRUGO)
+    pub fn new_inode(target: ProcPidTarget, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcFileBuilder::new(Self { target }, InodeMode::S_IRUGO)
             .parent(parent)
             .build()
             .unwrap()
@@ -119,7 +119,10 @@ impl LimitsFile {
     }
 
     fn generate_limits_content(&self) -> Result<String, SystemError> {
-        let pcb = find_process_by_vpid(self.pid).ok_or(SystemError::ESRCH)?;
+        let pcb = self
+            .target
+            .thread_group_leader()
+            .ok_or(SystemError::ESRCH)?;
 
         // 与 Linux fs/proc/base.c 的表头保持一致。
         let mut content = String::from(

@@ -2,15 +2,12 @@
 //!
 //! 这个符号链接指向进程的可执行文件路径
 
-use crate::{
-    filesystem::{
-        procfs::{
-            pid::find_process_by_vpid,
-            template::{Builder, ProcSymBuilder, SymOps},
-        },
-        vfs::{IndexNode, InodeMode},
+use crate::filesystem::{
+    procfs::{
+        pid::ProcPidTarget,
+        template::{Builder, ProcSymBuilder, SymOps},
     },
-    process::RawPid,
+    vfs::{IndexNode, InodeMode},
 };
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
@@ -18,17 +15,12 @@ use system_error::SystemError;
 /// /proc/[pid]/exe 符号链接的 SymOps 实现
 #[derive(Debug)]
 pub struct ExeSymOps {
-    /// 存储 PID，在读取时动态查找进程
-    pid: RawPid,
+    target: ProcPidTarget,
 }
 
 impl ExeSymOps {
-    pub fn new(pid: RawPid) -> Self {
-        Self { pid }
-    }
-
-    pub fn new_inode(pid: RawPid, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcSymBuilder::new(Self::new(pid), InodeMode::S_IRWXUGO) // 0777 - 符号链接权限
+    pub fn new_inode(target: ProcPidTarget, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcSymBuilder::new(Self { target }, InodeMode::S_IRWXUGO) // 0777 - 符号链接权限
             .parent(parent)
             .build()
             .unwrap()
@@ -37,8 +29,10 @@ impl ExeSymOps {
 
 impl SymOps for ExeSymOps {
     fn read_link(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
-        // 动态查找进程，获取目标进程的可执行文件路径
-        let pcb = find_process_by_vpid(self.pid).ok_or(SystemError::ESRCH)?;
+        let pcb = self
+            .target
+            .thread_group_leader()
+            .ok_or(SystemError::ESRCH)?;
         let exe = pcb.execute_path();
         let exe_bytes = exe.as_bytes();
         let len = exe_bytes.len().min(buf.len());

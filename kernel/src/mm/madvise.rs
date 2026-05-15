@@ -19,6 +19,12 @@ impl LockedVMA {
         let mut new_flags = *vma.vm_flags();
         match behavior {
             MadvFlags::MADV_DONTNEED | MadvFlags::MADV_DONTNEED_LOCKED => {
+                if behavior == MadvFlags::MADV_DONTNEED
+                    && vma.vm_flags().contains(VmFlags::VM_LOCKED)
+                {
+                    return Err(SystemError::EINVAL);
+                }
+
                 // MADV_DONTNEED: 释放指定范围内的页面
                 // 这是glibc在pthread_create时用来管理线程栈的关键操作
                 // 参考: https://code.dragonos.org.cn/xref/linux-6.6.21/mm/madvise.c#madvise_dontneed_single_vma

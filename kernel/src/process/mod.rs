@@ -1581,6 +1581,13 @@ impl ProcessControlBlock {
             rlim_max: u64::MAX,
         };
 
+        // Linux commonly defaults RLIMIT_MEMLOCK to 64 KiB. Keeping the hard
+        // limit non-zero also allows unprivileged tests to lower the soft limit.
+        arr[RLimitID::Memlock as usize] = RLimit64 {
+            rlim_cur: 64 * 1024,
+            rlim_max: 64 * 1024,
+        };
+
         arr
     }
 

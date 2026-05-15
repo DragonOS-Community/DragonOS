@@ -64,6 +64,7 @@ mod mm;
 mod net;
 mod perf;
 mod process;
+mod rcu;
 mod sched;
 mod smp;
 mod syscall;

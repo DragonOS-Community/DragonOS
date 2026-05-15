@@ -40,7 +40,7 @@ impl Syscall for SysGetResGid {
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let pcb = ProcessManager::current_pcb();
-        let cred = pcb.cred.lock();
+        let cred = pcb.cred();
 
         let rgid: u32 = cred.gid.data() as u32;
         let egid: u32 = cred.egid.data() as u32;

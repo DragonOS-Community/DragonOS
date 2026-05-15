@@ -39,16 +39,16 @@ impl Syscall for SysSetReGid {
         id_utils::validate_id(egid)?;
 
         let pcb = ProcessManager::current_pcb();
-        let mut guard = pcb.cred.lock();
+        let old_cred = pcb.cred();
 
-        let old_rgid = guard.gid.data();
-        let old_egid = guard.egid.data();
-        let old_sgid = guard.sgid.data();
+        let old_rgid = old_cred.gid.data();
+        let old_egid = old_cred.egid.data();
+        let old_sgid = old_cred.sgid.data();
 
         let new_rgid = id_utils::resolve_id(rgid, old_rgid);
         let new_egid = id_utils::resolve_id(egid, old_egid);
 
-        let is_privileged = guard.euid.data() == 0;
+        let is_privileged = old_cred.euid.data() == 0;
         id_utils::check_setre_permissions(
             old_rgid,
             old_egid,
@@ -58,7 +58,7 @@ impl Syscall for SysSetReGid {
             is_privileged,
         )?;
 
-        let mut new_cred = (**guard).clone();
+        let mut new_cred = (*old_cred).clone();
 
         if !id_utils::is_no_change(rgid) {
             new_cred.setgid(new_rgid);
@@ -90,7 +90,7 @@ impl Syscall for SysSetReGid {
             new_sgid,
         );
 
-        *guard = Cred::new_arc(new_cred);
+        pcb.set_cred(Cred::new_arc(new_cred))?;
         Ok(0)
     }
 

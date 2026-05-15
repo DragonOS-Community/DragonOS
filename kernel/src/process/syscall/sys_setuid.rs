@@ -27,21 +27,24 @@ impl Syscall for SysSetUid {
         id_utils::validate_setuid_id(uid)?;
 
         let pcb = ProcessManager::current_pcb();
-        let mut guard = pcb.cred.lock();
+        let old_cred = pcb.cred();
 
-        let old_ruid = guard.uid.data();
-        let old_euid = guard.euid.data();
-        let old_suid = guard.suid.data();
+        let old_ruid = old_cred.uid.data();
+        let old_euid = old_cred.euid.data();
+        let old_suid = old_cred.suid.data();
 
-        let mut new_cred = (**guard).clone();
+        let mut new_cred = (*old_cred).clone();
 
-        if guard.euid.data() == 0 {
+        if old_cred.euid.data() == 0 {
             // 特权进程：设置所有 UID
             new_cred.setuid(uid);
             new_cred.seteuid(uid);
             new_cred.setsuid(uid);
             new_cred.setfsuid(uid);
-        } else if uid == guard.uid.data() || uid == guard.euid.data() || uid == guard.suid.data() {
+        } else if uid == old_cred.uid.data()
+            || uid == old_cred.euid.data()
+            || uid == old_cred.suid.data()
+        {
             // 非特权进程：只能设置 euid 为当前 ruid/euid/suid 之一
             new_cred.seteuid(uid);
             new_cred.setfsuid(uid);
@@ -67,7 +70,7 @@ impl Syscall for SysSetUid {
             keepcaps,
         );
 
-        *guard = Cred::new_arc(new_cred);
+        pcb.set_cred(Cred::new_arc(new_cred))?;
 
         Ok(0)
     }

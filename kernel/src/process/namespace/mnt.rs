@@ -403,7 +403,7 @@ impl ProcessManager {
     /// 获取当前进程的挂载namespace
     pub fn current_mntns() -> Arc<MntNamespace> {
         if Self::initialized() {
-            ProcessManager::current_pcb().nsproxy.read().mnt_ns.clone()
+            ProcessManager::current_pcb().nsproxy().mnt_ns.clone()
         } else {
             root_mnt_namespace()
         }

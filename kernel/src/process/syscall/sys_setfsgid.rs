@@ -1,5 +1,3 @@
-use alloc::sync::Arc;
-
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SETFSGID;
 use crate::process::cred::Cred;
@@ -28,13 +26,13 @@ impl Syscall for SysSetFsgid {
         let fsgid = Kgid::new(fsgid);
 
         let pcb = ProcessManager::current_pcb();
-        let mut guard: crate::libs::spinlock::SpinLockGuard<'_, Arc<Cred>> = pcb.cred.lock();
-        let old_fsgid = guard.fsgid;
+        let old_cred = pcb.cred();
+        let old_fsgid = old_cred.fsgid;
 
-        if fsgid == guard.gid || fsgid == guard.egid || fsgid == guard.sgid {
-            let mut new_cred: Cred = (**guard).clone();
+        if fsgid == old_cred.gid || fsgid == old_cred.egid || fsgid == old_cred.sgid {
+            let mut new_cred: Cred = (*old_cred).clone();
             new_cred.setfsgid(fsgid.data());
-            *guard = Cred::new_arc(new_cred);
+            pcb.set_cred(Cred::new_arc(new_cred))?;
         }
 
         Ok(old_fsgid.data())

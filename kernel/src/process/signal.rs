@@ -23,10 +23,19 @@ impl ProcessManager {
 
 impl ProcessControlBlock {
     pub fn sighand(&self) -> Arc<SigHand> {
-        self.sighand.read_irqsave().clone()
+        self.sighand.load()
     }
 
     pub fn replace_sighand(&self, new: Arc<SigHand>) {
-        *self.sighand.write_irqsave() = new;
+        let _task_guard = self.task_lock.lock_irqsave();
+        new.attach_task_ref();
+        let old = self.sighand.swap(new.clone());
+        if Arc::ptr_eq(&old, &new) {
+            new.detach_task_ref();
+            return;
+        }
+
+        old.detach_task_ref();
+        crate::rcu::rcu_defer_drop(old);
     }
 }

@@ -242,7 +242,7 @@ impl<'a> Deref for ReadOnlyUtsNameWrapper<'a> {
 impl ProcessManager {
     pub fn current_utsns() -> Arc<UtsNamespace> {
         if Self::initialized() {
-            ProcessManager::current_pcb().nsproxy.read().uts_ns.clone()
+            ProcessManager::current_pcb().nsproxy().uts_ns.clone()
         } else {
             INIT_UTS_NAMESPACE.clone()
         }

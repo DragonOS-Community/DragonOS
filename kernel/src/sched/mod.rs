@@ -1076,6 +1076,7 @@ pub fn io_schedule() {
 /// 此函数与schedule的区别为，该函数不会检查preempt_count
 /// 适用于时钟中断等场景
 pub fn __schedule(sched_mod: SchedMode) {
+    crate::rcu::note_context_switch();
     let cpu = smp_get_processor_id().data() as usize;
     let rq = cpu_rq(cpu);
     let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };

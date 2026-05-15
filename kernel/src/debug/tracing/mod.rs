@@ -3,7 +3,9 @@ pub mod trace_pipe;
 
 use crate::debug::sysfs::debugfs_kobj;
 use crate::driver::base::kobject::KObject;
-use crate::filesystem::kernfs::callback::{KernCallbackData, KernFSCallback, KernInodePrivateData};
+use crate::filesystem::kernfs::callback::{
+    KernCallbackData, KernFSCallback, KernFilePrivateData, KernInodePrivateData,
+};
 use crate::filesystem::kernfs::KernFSInode;
 use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::vfs::PollStatus;
@@ -85,17 +87,19 @@ impl KernInodePrivateData {
             _ => None,
         };
     }
+}
 
+impl KernFilePrivateData {
     pub fn tracepipe(&mut self) -> Option<&mut crate::tracepoint::TracePipeSnapshot> {
         return match self {
-            KernInodePrivateData::TracePipe(snapshot) => Some(snapshot),
+            KernFilePrivateData::TracePipe(snapshot) => Some(snapshot),
             _ => None,
         };
     }
 
     pub fn trace_saved_cmdlines(&mut self) -> Option<&mut TraceCmdLineCacheSnapshot> {
         return match self {
-            KernInodePrivateData::TraceSavedCmdlines(cache) => Some(cache),
+            KernFilePrivateData::TraceSavedCmdlines(cache) => Some(cache),
             _ => None,
         };
     }

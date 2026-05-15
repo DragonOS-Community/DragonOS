@@ -3,11 +3,8 @@ use core::intrinsics::likely;
 use crate::{
     arch::driver::apic::{apic_timer::APIC_TIMER_IRQ_NUM, CurrentApic, LocalAPIC},
     exception::{irqdesc::irq_desc_manager, softirq::do_softirq, IrqNumber},
-    process::{
-        utils::{current_pcb_flags, current_pcb_preempt_count},
-        ProcessFlags,
-    },
-    sched::{SchedMode, __schedule},
+    process::{utils::current_pcb_flags, ProcessFlags, ProcessManager},
+    sched::{SchedMode, SchedPolicy, __schedule},
 };
 
 use super::TrapFrame;
@@ -19,6 +16,8 @@ unsafe extern "C" fn x86_64_do_irq(trap_frame: &mut TrapFrame, vector: u32) {
     if trap_frame.is_from_user() {
         x86_64::registers::segmentation::GS::swap();
     }
+
+    crate::rcu::irq_enter();
 
     // 由于x86上面，虚拟中断号与物理中断号是一一对应的，所以这里直接使用vector作为中断号来查询irqdesc
 
@@ -38,13 +37,14 @@ unsafe extern "C" fn x86_64_do_irq(trap_frame: &mut TrapFrame, vector: u32) {
 
     do_softirq();
 
-    if current_pcb_preempt_count() > 0 {
-        return;
-    }
     // 检测当前进程是否可被调度
-    if (current_pcb_flags().contains(ProcessFlags::NEED_SCHEDULE))
-        || vector == APIC_TIMER_IRQ_NUM.data()
-    {
+    let should_schedule = current_pcb_flags().contains(ProcessFlags::NEED_SCHEDULE)
+        || vector == APIC_TIMER_IRQ_NUM.data();
+    let resume_idle_eqs = !should_schedule
+        && ProcessManager::current_pcb().sched_info().policy() == SchedPolicy::IDLE;
+    crate::rcu::irq_exit(resume_idle_eqs);
+
+    if should_schedule {
         __schedule(SchedMode::SM_PREEMPT);
     }
 }

@@ -4,7 +4,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::interrupt::TrapFrame,
-    driver::clocksource::timer_riscv::{riscv_sbi_timer_irq_desc_init, RiscVSbiTimer},
+    driver::clocksource::timer_riscv::riscv_sbi_timer_irq_desc_init,
     exception::{
         handle::PerCpuDevIdIrqHandler,
         irqchip::{IrqChip, IrqChipFlags},
@@ -15,7 +15,6 @@ use crate::{
         HardwareIrqNumber, IrqNumber,
     },
     libs::spinlock::{SpinLock, SpinLockGuard},
-    sched::{SchedMode, __schedule},
 };
 
 use super::riscv_sifive_plic::do_plic_irq;
@@ -224,7 +223,4 @@ pub fn riscv_intc_irq(trap_frame: &mut TrapFrame) {
         .ok();
     }
     do_softirq();
-    if hwirq.data() == RiscVSbiTimer::TIMER_IRQ.data() {
-        __schedule(SchedMode::SM_PREEMPT);
-    }
 }

@@ -1076,6 +1076,16 @@ pub fn io_schedule() {
 /// 此函数与schedule的区别为，该函数不会检查preempt_count
 /// 适用于时钟中断等场景
 pub fn __schedule(sched_mod: SchedMode) {
+    // 中断/IPI 路径上的抢占调度请求在 preempt_count 非零时不能直接切走当前任务，
+    // 否则会破坏依赖 preempt_disable() 的临界区（例如当前 RCU 实现的读侧临界区）。
+    if sched_mod.contains(SchedMode::SM_MASK_PREEMPT) {
+        let current = ProcessManager::current_pcb();
+        if current.preempt_count() > 0 {
+            current.flags().insert(ProcessFlags::NEED_SCHEDULE);
+            return;
+        }
+    }
+
     crate::rcu::note_context_switch();
     let cpu = smp_get_processor_id().data() as usize;
     let rq = cpu_rq(cpu);

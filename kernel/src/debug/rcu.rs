@@ -2,7 +2,7 @@ use alloc::string::ToString;
 
 use crate::debug::sysfs::debugfs_kobj;
 use crate::driver::base::kobject::KObject;
-use crate::filesystem::kernfs::callback::{KernCallbackData, KernFSCallback};
+use crate::filesystem::kernfs::callback::{KernCallbackData, KernFSCallback, KernFilePrivateData};
 use crate::filesystem::vfs::{InodeMode, PollStatus};
 use system_error::SystemError;
 
@@ -41,17 +41,23 @@ impl KernFSCallback for RcuDirCallBack {
 struct RcuSelftestCallBack;
 
 impl KernFSCallback for RcuSelftestCallBack {
-    fn open(&self, _data: KernCallbackData) -> Result<(), SystemError> {
+    fn open(&self, mut data: KernCallbackData) -> Result<(), SystemError> {
+        let report = crate::rcu::run_debug_selftests();
+        data.file_private_data_mut()
+            .replace(KernFilePrivateData::RcuSelftestReport(report));
         Ok(())
     }
 
     fn read(
         &self,
-        _data: KernCallbackData,
+        data: KernCallbackData,
         buf: &mut [u8],
         offset: usize,
     ) -> Result<usize, SystemError> {
-        let report = crate::rcu::run_debug_selftests();
+        let report = match data.file_private_data() {
+            Some(KernFilePrivateData::RcuSelftestReport(report)) => report,
+            _ => return Err(SystemError::EINVAL),
+        };
         let bytes = report.as_bytes();
         if offset >= bytes.len() {
             return Ok(0);

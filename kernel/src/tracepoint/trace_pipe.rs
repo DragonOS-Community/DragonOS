@@ -77,7 +77,7 @@ impl TracePipeOps for TracePipeRaw {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TracePipeSnapshot(Vec<Vec<u8>>);
 
 impl TracePipeSnapshot {
@@ -191,7 +191,7 @@ impl TraceCmdLineCache {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TraceCmdLineCacheSnapshot(Vec<(u32, [u8; 16])>);
 impl TraceCmdLineCacheSnapshot {
     pub fn new(cmdline: Vec<(u32, [u8; 16])>) -> Self {

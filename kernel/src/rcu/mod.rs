@@ -1,29 +1,26 @@
 #![allow(dead_code)]
 
-use alloc::{
-    boxed::Box,
-    collections::VecDeque,
-    format,
-    string::{String, ToString},
-    sync::Arc,
-};
+use alloc::{boxed::Box, collections::VecDeque, string::ToString, sync::Arc};
 use core::{
     ptr::{self, NonNull},
-    sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize, Ordering},
+    sync::atomic::{fence, AtomicBool, AtomicPtr, Ordering},
 };
 
 use log::{error, warn};
 
 use crate::{
-    ipc::sighand::SigHand,
     libs::{cpumask::CpuMask, spinlock::SpinLock, wait_queue::WaitQueue},
     mm::percpu::PerCpu,
     process::{kthread::KernelThreadClosure, kthread::KernelThreadMechanism, ProcessManager},
+    sched::SchedPolicy,
     smp::{
         core::smp_get_processor_id,
         cpu::{smp_cpu_manager, smp_cpu_manager_initialized, ProcessorId},
     },
 };
+
+mod selftest;
+pub use selftest::run_debug_selftests;
 
 pub(crate) type RcuRawCallback = unsafe fn(NonNull<RcuHead>);
 
@@ -169,6 +166,8 @@ struct CallbackItem {
 #[derive(Clone, Copy, Debug, Default)]
 struct RcuCpuState {
     in_idle_eqs: bool,
+    irq_nesting: usize,
+    irq_from_idle_eqs: bool,
 }
 
 struct RcuStateInner {
@@ -353,7 +352,7 @@ fn online_non_idle_cpus(cpu_states: &[RcuCpuState; PerCpu::MAX_CPU_NUM as usize]
                 continue;
             }
 
-            if cpu_states[cpu.data() as usize].in_idle_eqs {
+            if cpu_in_idle_eqs(&cpu_states[cpu.data() as usize]) {
                 continue;
             }
 
@@ -364,6 +363,34 @@ fn online_non_idle_cpus(cpu_states: &[RcuCpuState; PerCpu::MAX_CPU_NUM as usize]
     }
 
     waiting
+}
+
+#[inline]
+fn current_task_is_idle() -> bool {
+    ProcessManager::current_pcb().sched_info().policy() == SchedPolicy::IDLE
+}
+
+#[inline]
+fn cpu_in_idle_eqs(cpu_state: &RcuCpuState) -> bool {
+    cpu_state.in_idle_eqs && cpu_state.irq_nesting == 0
+}
+
+fn enter_cpu_idle_eqs(inner: &mut RcuStateInner, cpu: ProcessorId) -> bool {
+    let cpu_idx = cpu.data() as usize;
+    debug_assert_eq!(inner.cpu_states[cpu_idx].irq_nesting, 0);
+
+    inner.cpu_states[cpu_idx].in_idle_eqs = true;
+    let ready_changed = if inner.gp_active && inner.waiting_cpus.get(cpu).unwrap_or(false) {
+        inner.waiting_cpus.set(cpu, false);
+        RcuState::pump_grace_periods(inner)
+    } else {
+        false
+    };
+    ready_changed || inner.has_ready_work()
+}
+
+fn exit_cpu_idle_eqs(inner: &mut RcuStateInner, cpu: ProcessorId) {
+    inner.cpu_states[cpu.data() as usize].in_idle_eqs = false;
 }
 
 fn report_quiescent_state(cpu: ProcessorId) {
@@ -638,9 +665,11 @@ pub fn note_context_switch() {
         return;
     }
 
-    if ProcessManager::current_pcb().rcu_read_depth() != 0 {
+    let current = ProcessManager::current_pcb();
+    if current.rcu_read_depth() != 0 {
         warn!("context switch observed while still inside rcu_read_lock()");
-        debug_assert_eq!(ProcessManager::current_pcb().rcu_read_depth(), 0);
+        debug_assert_eq!(current.rcu_read_depth(), 0);
+        return;
     }
 
     report_quiescent_state(smp_get_processor_id());
@@ -659,22 +688,16 @@ pub fn enter_idle() {
         return;
     }
 
+    if !current_task_is_idle() {
+        warn!("rcu::enter_idle() must only be called from the idle task");
+        debug_assert!(current_task_is_idle());
+        return;
+    }
+
     let cpu = smp_get_processor_id();
     let wake_worker = {
         let mut inner = RCU_STATE.inner.lock_irqsave();
-        let cpu_state = &mut inner.cpu_states[cpu.data() as usize];
-        if cpu_state.in_idle_eqs {
-            false
-        } else {
-            cpu_state.in_idle_eqs = true;
-            let ready_changed = if inner.gp_active && inner.waiting_cpus.get(cpu).unwrap_or(false) {
-                inner.waiting_cpus.set(cpu, false);
-                RcuState::pump_grace_periods(&mut inner)
-            } else {
-                false
-            };
-            ready_changed || inner.has_ready_work()
-        }
+        enter_cpu_idle_eqs(&mut inner, cpu)
     };
 
     RCU_STATE.wake_state_waiters();
@@ -689,9 +712,64 @@ pub fn exit_idle() {
         return;
     }
 
+    if !current_task_is_idle() {
+        warn!("rcu::exit_idle() must only be called from the idle task");
+        debug_assert!(current_task_is_idle());
+        return;
+    }
+
     let cpu = smp_get_processor_id();
     let mut inner = RCU_STATE.inner.lock_irqsave();
-    inner.cpu_states[cpu.data() as usize].in_idle_eqs = false;
+    exit_cpu_idle_eqs(&mut inner, cpu);
+}
+
+pub fn irq_enter() {
+    if !rcu_enabled() {
+        return;
+    }
+
+    let cpu = smp_get_processor_id();
+    let mut inner = RCU_STATE.inner.lock_irqsave();
+    let cpu_state = &mut inner.cpu_states[cpu.data() as usize];
+    if cpu_state.irq_nesting == 0 {
+        cpu_state.irq_from_idle_eqs = cpu_in_idle_eqs(cpu_state);
+    }
+    cpu_state.irq_nesting += 1;
+}
+
+pub fn irq_exit(resume_idle_eqs: bool) {
+    if !rcu_enabled() {
+        return;
+    }
+
+    let cpu = smp_get_processor_id();
+    let wake_worker = {
+        let mut inner = RCU_STATE.inner.lock_irqsave();
+        let cpu_idx = cpu.data() as usize;
+        assert!(
+            inner.cpu_states[cpu_idx].irq_nesting > 0,
+            "rcu::irq_exit without irq_enter"
+        );
+        inner.cpu_states[cpu_idx].irq_nesting -= 1;
+        if inner.cpu_states[cpu_idx].irq_nesting != 0 {
+            false
+        } else {
+            let resume_idle_eqs = inner.cpu_states[cpu_idx].irq_from_idle_eqs && resume_idle_eqs;
+            inner.cpu_states[cpu_idx].irq_from_idle_eqs = false;
+            if resume_idle_eqs {
+                enter_cpu_idle_eqs(&mut inner, cpu)
+            } else {
+                inner.cpu_states[cpu_idx].in_idle_eqs = false;
+                false
+            }
+        }
+    };
+
+    RCU_STATE.wake_state_waiters();
+    if wake_worker {
+        RCU_STATE.wake_worker();
+        RCU_STATE.maybe_process_ready_callbacks_inline();
+    }
 }
 
 pub fn cpu_offline(cpu: ProcessorId) {
@@ -732,200 +810,9 @@ pub fn debug_force_quiescent_state() {
     report_quiescent_state(smp_get_processor_id());
 }
 
-#[derive(Debug)]
-struct RcuSelftestDropProbe {
-    id: usize,
-    drops: Arc<AtomicUsize>,
-}
-
-impl Drop for RcuSelftestDropProbe {
-    fn drop(&mut self) {
-        let _ = self.id;
-        self.drops.fetch_add(1, Ordering::SeqCst);
-    }
-}
-
-#[repr(C)]
-struct RcuSelftestCallbackProbe {
-    head: RcuHead,
-    hits: Arc<AtomicUsize>,
-}
-
-unsafe fn rcu_selftest_callback(head: NonNull<RcuHead>) {
-    // SAFETY: `head` points to the first field of `RcuSelftestCallbackProbe`,
-    // which is allocated by `Box::into_raw()` in the selftest.
-    let probe = unsafe { Box::from_raw(head.as_ptr() as *mut RcuSelftestCallbackProbe) };
-    probe.hits.fetch_add(1, Ordering::SeqCst);
-}
-
-fn run_pr1_selftest() -> Result<(), &'static str> {
-    if ProcessManager::current_pcb().rcu_read_depth() != 0 {
-        return Err("initial rcu_read_depth was not zero");
-    }
-
-    {
-        let _outer = rcu_read_lock();
-        if ProcessManager::current_pcb().rcu_read_depth() != 1 {
-            return Err("outer rcu_read_lock depth mismatch");
-        }
-
-        {
-            let _inner = rcu_read_lock();
-            if ProcessManager::current_pcb().rcu_read_depth() != 2 {
-                return Err("nested rcu_read_lock depth mismatch");
-            }
-        }
-
-        if ProcessManager::current_pcb().rcu_read_depth() != 1 {
-            return Err("nested rcu_read_unlock depth mismatch");
-        }
-    }
-
-    if ProcessManager::current_pcb().rcu_read_depth() != 0 {
-        return Err("final rcu_read_depth was not zero");
-    }
-
-    let callback_hits = Arc::new(AtomicUsize::new(0));
-    let callback_probe = Box::new(RcuSelftestCallbackProbe {
-        head: RcuHead::new(),
-        hits: callback_hits.clone(),
-    });
-    let callback_probe = Box::into_raw(callback_probe);
-
-    // SAFETY: `callback_probe` stays alive until `rcu_selftest_callback()`
-    // reconstructs and consumes the allocation.
-    unsafe {
-        call_rcu_raw(
-            NonNull::new_unchecked(ptr::addr_of_mut!((*callback_probe).head)),
-            rcu_selftest_callback,
-        );
-    }
-
-    rcu_barrier();
-
-    if callback_hits.load(Ordering::SeqCst) != 1 {
-        return Err("call_rcu callback was not executed exactly once");
-    }
-
-    let deferred_drops = Arc::new(AtomicUsize::new(0));
-    rcu_defer_drop(RcuSelftestDropProbe {
-        id: 1,
-        drops: deferred_drops.clone(),
-    });
-    rcu_barrier();
-
-    if deferred_drops.load(Ordering::SeqCst) != 1 {
-        return Err("rcu_defer_drop did not run after rcu_barrier");
-    }
-
-    let deferred_hits = Arc::new(AtomicUsize::new(0));
-    rcu_defer({
-        let deferred_hits = deferred_hits.clone();
-        move || {
-            deferred_hits.fetch_add(1, Ordering::SeqCst);
-        }
-    });
-    rcu_barrier();
-
-    if deferred_hits.load(Ordering::SeqCst) != 1 {
-        return Err("rcu_defer closure did not run after rcu_barrier");
-    }
-
-    Ok(())
-}
-
-fn run_pr2_selftest() -> Result<(), &'static str> {
-    let old_drops = Arc::new(AtomicUsize::new(0));
-    let new_drops = Arc::new(AtomicUsize::new(0));
-
-    let slot = RcuArcSlot::new(Arc::new(RcuSelftestDropProbe {
-        id: 1,
-        drops: old_drops.clone(),
-    }));
-    let pinned_old = slot.load();
-    if pinned_old.id != 1 {
-        return Err("RcuArcSlot::load did not return the published object");
-    }
-
-    slot.store_deferred(Arc::new(RcuSelftestDropProbe {
-        id: 2,
-        drops: new_drops.clone(),
-    }));
-    rcu_barrier();
-
-    if old_drops.load(Ordering::SeqCst) != 0 {
-        return Err("old slot object dropped while a pinned Arc was still alive");
-    }
-
-    if slot.load().id != 2 {
-        return Err("RcuArcSlot did not publish the replacement object");
-    }
-
-    drop(pinned_old);
-    if old_drops.load(Ordering::SeqCst) != 1 {
-        return Err("old slot object was not dropped after the final pin was released");
-    }
-
-    drop(slot);
-    if new_drops.load(Ordering::SeqCst) != 1 {
-        return Err("current slot object was not dropped when the slot was destroyed");
-    }
-
-    let sighand = SigHand::new();
-    if sighand.is_shared() {
-        return Err("fresh sighand unexpectedly reported shared");
-    }
-
-    sighand.attach_task_ref();
-    if sighand.load_count() != 1 || sighand.is_shared() {
-        return Err("single task sighand reference tracking is broken");
-    }
-
-    let transient_pin = sighand.clone();
-    drop(transient_pin);
-    if sighand.load_count() != 1 {
-        return Err("temporary Arc pin changed sighand task reference count");
-    }
-
-    sighand.attach_task_ref();
-    if !sighand.is_shared() {
-        return Err("double-attached sighand did not report shared");
-    }
-
-    sighand.detach_task_ref();
-    if sighand.is_shared() || sighand.load_count() != 1 {
-        return Err("sighand detach did not restore single-task state");
-    }
-
-    sighand.detach_task_ref();
-    if sighand.load_count() != 0 {
-        return Err("sighand task reference count did not return to zero");
-    }
-
-    Ok(())
-}
-
-pub fn run_debug_selftests() -> String {
-    let pr1 = run_pr1_selftest();
-    let pr2 = run_pr2_selftest();
-    let overall_ok = pr1.is_ok() && pr2.is_ok();
-
-    let mut report = String::new();
-    report.push_str(if overall_ok {
-        "status=ok\n"
-    } else {
-        "status=fail\n"
-    });
-
-    match pr1 {
-        Ok(()) => report.push_str("pr1=ok\n"),
-        Err(reason) => report.push_str(&format!("pr1=fail:{reason}\n")),
-    }
-
-    match pr2 {
-        Ok(()) => report.push_str("pr2=ok\n"),
-        Err(reason) => report.push_str(&format!("pr2=fail:{reason}\n")),
-    }
-
-    report
+#[allow(dead_code)]
+pub fn debug_current_cpu_in_idle_eqs() -> bool {
+    let cpu = smp_get_processor_id();
+    let inner = RCU_STATE.inner.lock_irqsave();
+    cpu_in_idle_eqs(&inner.cpu_states[cpu.data() as usize])
 }

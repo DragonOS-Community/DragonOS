@@ -2,6 +2,7 @@ pub mod clock;
 pub mod completion;
 pub mod cputime;
 pub mod fair;
+pub mod fair_tree;
 pub mod fifo;
 #[cfg(feature = "fifo_demo")]
 pub mod fifo_demo;

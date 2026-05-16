@@ -1,10 +1,20 @@
 #![allow(dead_code)]
 use core::fmt::Debug;
 
-use crate::libs::{rwlock::RwLock, spinlock::SpinLock};
 use alloc::{sync::Arc, vec::Vec};
 use log::warn;
 use system_error::SystemError;
+
+use crate::{
+    libs::{rwlock::RwLock, spinlock::SpinLock},
+    rcu::{rcu_read_lock_held, synchronize_rcu, RcuArcSlot},
+};
+
+pub const NOTIFY_DONE: i32 = 0x0000;
+pub const NOTIFY_OK: i32 = 0x0001;
+pub const NOTIFY_STOP_MASK: i32 = 0x8000;
+pub const NOTIFY_BAD: i32 = NOTIFY_STOP_MASK | 0x0002;
+pub const NOTIFY_STOP: i32 = NOTIFY_OK | NOTIFY_STOP_MASK;
 
 /// @brief 通知链节点
 pub trait NotifierBlock<V: Clone + Copy, T>: Debug + Send + Sync {
@@ -18,6 +28,12 @@ pub trait NotifierBlock<V: Clone + Copy, T>: Debug + Send + Sync {
 // TODO: 考虑使用红黑树封装
 #[derive(Debug)]
 struct NotifierChain<V: Clone + Copy, T>(Vec<Arc<dyn NotifierBlock<V, T>>>);
+
+impl<V: Clone + Copy, T> Clone for NotifierChain<V, T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
 
 impl<V: Clone + Copy, T> NotifierChain<V, T> {
     pub fn new() -> Self {
@@ -79,8 +95,6 @@ impl<V: Clone + Copy, T> NotifierChain<V, T> {
     /// ## 返回
     ///
     /// (最后一次回调函数的返回值，回调次数)
-    ///
-    /// TODO: 增加 NOTIFIER_STOP_MASK 相关功能
     pub fn call_chain(
         &self,
         action: V,
@@ -96,42 +110,81 @@ impl<V: Clone + Copy, T> NotifierChain<V, T> {
             }
             ret = b.notifier_call(action, data);
             nr_calls += 1;
+            if ret & NOTIFY_STOP_MASK != 0 {
+                break;
+            }
         }
         return (ret, nr_calls);
     }
 }
 
-/// @brief 原子的通知链，使用 SpinLock 进行同步
+/// @brief 原子的通知链，更新侧使用 SpinLock 串行化，调用侧使用 RCU 快照遍历
 #[derive(Debug)]
-pub struct AtomicNotifierChain<V: Clone + Copy, T>(SpinLock<NotifierChain<V, T>>);
+pub struct AtomicNotifierChain<V, T>
+where
+    V: Clone + Copy + Send + Sync + 'static,
+    T: Send + Sync + 'static,
+{
+    update_lock: SpinLock<()>,
+    chain: RcuArcSlot<NotifierChain<V, T>>,
+}
 
-impl<V: Clone + Copy, T> Default for AtomicNotifierChain<V, T> {
+impl<V, T> Default for AtomicNotifierChain<V, T>
+where
+    V: Clone + Copy + Send + Sync + 'static,
+    T: Send + Sync + 'static,
+{
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<V: Clone + Copy, T> AtomicNotifierChain<V, T> {
+impl<V, T> AtomicNotifierChain<V, T>
+where
+    V: Clone + Copy + Send + Sync + 'static,
+    T: Send + Sync + 'static,
+{
     pub fn new() -> Self {
-        Self(SpinLock::new(NotifierChain::<V, T>::new()))
+        Self {
+            update_lock: SpinLock::new(()),
+            chain: RcuArcSlot::new(Arc::new(NotifierChain::<V, T>::new())),
+        }
     }
 
-    pub fn register(&mut self, block: Arc<dyn NotifierBlock<V, T>>) -> Result<(), SystemError> {
-        let mut notifier_chain_guard = self.0.lock();
-        return notifier_chain_guard.register(block, false);
+    pub fn register(&self, block: Arc<dyn NotifierBlock<V, T>>) -> Result<(), SystemError> {
+        let _guard = self.update_lock.lock_irqsave();
+        let mut new_chain = (*self.chain.load()).clone();
+        new_chain.register(block, false)?;
+        self.chain.store_deferred(Arc::new(new_chain));
+        return Ok(());
     }
 
     pub fn register_unique_prio(
-        &mut self,
+        &self,
         block: Arc<dyn NotifierBlock<V, T>>,
     ) -> Result<(), SystemError> {
-        let mut notifier_chain_guard = self.0.lock();
-        return notifier_chain_guard.register(block, true);
+        let _guard = self.update_lock.lock_irqsave();
+        let mut new_chain = (*self.chain.load()).clone();
+        new_chain.register(block, true)?;
+        self.chain.store_deferred(Arc::new(new_chain));
+        return Ok(());
     }
 
-    pub fn unregister(&mut self, block: Arc<dyn NotifierBlock<V, T>>) -> Result<(), SystemError> {
-        let mut notifier_chain_guard = self.0.lock();
-        return notifier_chain_guard.unregister(block);
+    pub fn unregister(&self, block: Arc<dyn NotifierBlock<V, T>>) -> Result<(), SystemError> {
+        if rcu_read_lock_held() {
+            warn!("atomic notifier unregister called from an RCU read-side section");
+            return Err(SystemError::EDEADLK_OR_EDEADLOCK);
+        }
+
+        {
+            let _guard = self.update_lock.lock_irqsave();
+            let mut new_chain = (*self.chain.load()).clone();
+            new_chain.unregister(block)?;
+            self.chain.store_deferred(Arc::new(new_chain));
+        }
+
+        synchronize_rcu();
+        return Ok(());
     }
 
     pub fn call_chain(
@@ -140,8 +193,9 @@ impl<V: Clone + Copy, T> AtomicNotifierChain<V, T> {
         data: Option<&T>,
         nr_to_call: Option<usize>,
     ) -> (i32, usize) {
-        let notifier_chain_guard = self.0.lock();
-        return notifier_chain_guard.call_chain(action, data, nr_to_call);
+        return self
+            .chain
+            .with_read(|chain| chain.call_chain(action, data, nr_to_call));
     }
 }
 

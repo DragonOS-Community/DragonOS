@@ -120,6 +120,22 @@ where
         }
     }
 
+    pub fn with_read<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        if !rcu_enabled() {
+            let pinned = self.load();
+            return f(&pinned);
+        }
+
+        let _guard = rcu_read_lock();
+        let raw = rcu_dereference(&self.ptr);
+        assert!(!raw.is_null(), "RcuArcSlot::with_read saw a null pointer");
+
+        // SAFETY: RCU keeps the slot-owned Arc allocation alive for the whole
+        // read-side section. The closure receives only a shared reference and
+        // cannot outlive the guard held in this function.
+        f(unsafe { &*raw })
+    }
+
     pub fn swap(&self, new: Arc<T>) -> Arc<T> {
         let new_raw = Arc::into_raw(new) as *mut T;
         let old_raw = self.ptr.swap(new_raw, Ordering::AcqRel);

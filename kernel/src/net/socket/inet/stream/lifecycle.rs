@@ -1,6 +1,9 @@
 use crate::net::socket::common::ShutdownBit;
 use crate::net::socket::inet::InetSocket;
 use crate::net::socket::inet::Types;
+use crate::net::tcp_close_defer::{
+    DeferredTcpCloseKind, DeferredTcpCloseReason, DeferredTcpCloseRequest,
+};
 use alloc::sync::Arc;
 use system_error::SystemError;
 
@@ -15,17 +18,10 @@ struct CloseObservation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EstablishedCloseDisposition {
-    Abort,
-    GracefulPendingDecision,
-    PreserveGracefulState,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EstablishedCloseStateClass {
-    PendingDecision,
-    GracefulInProgress,
-    Closed,
+struct CloseAction {
+    kind: DeferredTcpCloseKind,
+    reason: DeferredTcpCloseReason,
+    abort_on_post_close_data: bool,
 }
 
 impl TcpSocket {
@@ -37,77 +33,35 @@ impl TcpSocket {
         })
     }
 
-    fn decide_established_close(
-        &self,
-        established: &inner::Established,
-    ) -> EstablishedCloseDisposition {
-        let initial = Self::observe_established_close(established);
+    fn decide_established_close(&self, established: &inner::Established) -> CloseAction {
+        let observation = Self::observe_established_close(established);
 
-        if initial.unread > 0 {
-            return EstablishedCloseDisposition::Abort;
+        if observation.unread > 0 {
+            return CloseAction {
+                kind: DeferredTcpCloseKind::Reset,
+                reason: DeferredTcpCloseReason::UnreadDataOnClose,
+                abort_on_post_close_data: false,
+            };
         }
 
-        if self.should_abort_established_zero_linger(initial.state) {
-            return EstablishedCloseDisposition::Abort;
+        if self.should_abort_established_zero_linger(observation.state) {
+            return CloseAction {
+                kind: DeferredTcpCloseKind::Reset,
+                reason: DeferredTcpCloseReason::ZeroLinger,
+                abort_on_post_close_data: false,
+            };
         }
 
-        if matches!(
-            Self::classify_established_close_state(initial.state),
-            EstablishedCloseStateClass::GracefulInProgress | EstablishedCloseStateClass::Closed
-        ) {
-            return EstablishedCloseDisposition::PreserveGracefulState;
+        let abort_on_post_close_data = matches!(
+            observation.state,
+            smoltcp::socket::tcp::State::Established | smoltcp::socket::tcp::State::SynReceived
+        );
+
+        CloseAction {
+            kind: DeferredTcpCloseKind::GracefulFin,
+            reason: DeferredTcpCloseReason::NormalClose,
+            abort_on_post_close_data,
         }
-
-        // Linux `__tcp_close()` decides between FIN and active reset based on whether unread
-        // data is discarded. DragonOS loopback can race with in-flight protocol progress around
-        // close time, so a single `recv_queue()` snapshot is too weak. Require two consecutive
-        // identical zero-unread observations after quiescent polls; otherwise fall back to abort.
-        // Only apply this when `close(fd)` is still deciding whether to initiate graceful close
-        // or abort. If the socket is already in graceful-closing states, preserve that path.
-        let iface = established.iface().clone();
-        let mut last: Option<CloseObservation> = Some(initial);
-        let mut stable_zero_observations = 0usize;
-        const MAX_CLOSE_SAMPLING_ROUNDS: usize = 4;
-
-        for round in 0..MAX_CLOSE_SAMPLING_ROUNDS {
-            if let Some(netns) = iface.common().net_namespace() {
-                netns.wakeup_poll_thread();
-            }
-            poll_util::poll_iface_until_quiescent(iface.as_ref());
-
-            let observation = Self::observe_established_close(established);
-            if observation.unread > 0 {
-                return EstablishedCloseDisposition::Abort;
-            }
-
-            if self.should_abort_established_zero_linger(observation.state) {
-                return EstablishedCloseDisposition::Abort;
-            }
-
-            match Self::classify_established_close_state(observation.state) {
-                EstablishedCloseStateClass::GracefulInProgress
-                | EstablishedCloseStateClass::Closed => {
-                    return EstablishedCloseDisposition::PreserveGracefulState;
-                }
-                EstablishedCloseStateClass::PendingDecision => {}
-            }
-
-            if last == Some(observation) {
-                stable_zero_observations += 1;
-                if stable_zero_observations >= 1 {
-                    return EstablishedCloseDisposition::GracefulPendingDecision;
-                }
-            } else {
-                stable_zero_observations = 0;
-            }
-            last = Some(observation);
-
-            if round + 1 < MAX_CLOSE_SAMPLING_ROUNDS {
-                crate::sched::sched_yield();
-            }
-        }
-
-        EstablishedCloseDisposition::Abort
     }
 
     #[inline]
@@ -138,28 +92,14 @@ impl TcpSocket {
     }
 
     #[inline]
-    fn classify_established_close_state(
-        state: smoltcp::socket::tcp::State,
-    ) -> EstablishedCloseStateClass {
-        match state {
-            smoltcp::socket::tcp::State::FinWait1
-            | smoltcp::socket::tcp::State::FinWait2
-            | smoltcp::socket::tcp::State::Closing
-            | smoltcp::socket::tcp::State::LastAck
-            | smoltcp::socket::tcp::State::TimeWait => {
-                EstablishedCloseStateClass::GracefulInProgress
-            }
-            smoltcp::socket::tcp::State::Closed => EstablishedCloseStateClass::Closed,
-            smoltcp::socket::tcp::State::SynReceived
-            | smoltcp::socket::tcp::State::Established
-            | smoltcp::socket::tcp::State::CloseWait => EstablishedCloseStateClass::PendingDecision,
-            unexpected => {
-                debug_assert!(
-                    false,
-                    "unexpected established close state: {:?}",
-                    unexpected
-                );
-                EstablishedCloseStateClass::PendingDecision
+    fn apply_close_action(socket: &mut smoltcp::socket::tcp::Socket, action: CloseAction) {
+        match action.kind {
+            DeferredTcpCloseKind::Reset => socket.abort(),
+            DeferredTcpCloseKind::GracefulFin => {
+                if action.abort_on_post_close_data {
+                    socket.shutdown_recv();
+                }
+                socket.close();
             }
         }
     }
@@ -667,11 +607,20 @@ impl TcpSocket {
                     let local_port = conn.get_name().port;
                     let iface = conn.iface().clone();
                     let me: alloc::sync::Weak<dyn InetSocket> = self.self_ref.clone();
-                    conn.with_mut(|socket| socket.close());
+                    conn.with_mut(|socket| socket.abort());
+                    let initial_state = conn.with(|socket| socket.state());
                     if conn.owns_port() {
                         iface.port_manager().unbind_port(Types::Tcp, local_port);
                     }
-                    iface.common().defer_tcp_close(handle, local_port, me);
+                    iface.common().defer_tcp_close(DeferredTcpCloseRequest {
+                        handle,
+                        local_port,
+                        sock: me,
+                        initial_state,
+                        kind: DeferredTcpCloseKind::Reset,
+                        reason: DeferredTcpCloseReason::ConnectingClose,
+                        abort_on_post_close_data: false,
+                    });
                     post_poll_iface = Some(iface);
                     writer.replace(inner::Inner::Established(conn));
                 }
@@ -681,27 +630,21 @@ impl TcpSocket {
                 let local_port = es.get_name().port;
                 let iface = es.iface().clone();
                 let me: alloc::sync::Weak<dyn InetSocket> = self.self_ref.clone();
-                let close_disposition = self.decide_established_close(&es);
-                match close_disposition {
-                    EstablishedCloseDisposition::Abort => {
-                        es.with_mut(|socket| socket.abort());
-                    }
-                    EstablishedCloseDisposition::GracefulPendingDecision
-                    | EstablishedCloseDisposition::PreserveGracefulState => {
-                        let final_observation = Self::observe_established_close(&es);
-                        if final_observation.unread > 0
-                            || self.should_abort_established_zero_linger(final_observation.state)
-                        {
-                            es.with_mut(|socket| socket.abort());
-                        } else {
-                            es.with_mut(|socket| socket.close());
-                        }
-                    }
-                }
+                let close_action = self.decide_established_close(&es);
+                es.with_mut(|socket| Self::apply_close_action(socket, close_action));
+                let initial_state = es.with(|socket| socket.state());
                 if es.owns_port() {
                     iface.port_manager().unbind_port(Types::Tcp, local_port);
                 }
-                iface.common().defer_tcp_close(handle, local_port, me);
+                iface.common().defer_tcp_close(DeferredTcpCloseRequest {
+                    handle,
+                    local_port,
+                    sock: me,
+                    initial_state,
+                    kind: close_action.kind,
+                    reason: close_action.reason,
+                    abort_on_post_close_data: close_action.abort_on_post_close_data,
+                });
                 post_poll_iface = Some(iface);
                 writer.replace(inner::Inner::Established(es));
             }

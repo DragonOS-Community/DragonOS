@@ -12,6 +12,4 @@
    rwlock
    mutex
    rwsem
-   rcu_implementation_plan
-   container_rcu_design
 

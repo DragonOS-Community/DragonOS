@@ -45,7 +45,7 @@
     "hash": "9a5c0ec57bae0576c30fbab60407f178"
   },
   "en:kernel/locking/index.rst": {
-    "hash": "0e0e7cde9860a5e3b0cba2e026a06b51"
+    "hash": "25a5a16457e920a6ef211d39c82a34b0"
   },
   "en:kernel/sched/index.rst": {
     "hash": "261678cb50d23aa9879632de029f60ba"
@@ -382,5 +382,11 @@
   },
   "en:kernel/filesystem/fuse.md": {
     "hash": "00061bdbcbf1be7230dfdc619e3a25f1"
+  },
+  "en:kernel/locking/container_rcu_design.md": {
+    "hash": "56cf4a64129f3d1b957f1950f6308f0e"
+  },
+  "en:kernel/locking/rcu_implementation_plan.md": {
+    "hash": "4269889cfba85632855f281a016d2bd9"
   }
 }

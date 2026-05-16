@@ -4,7 +4,7 @@
 
    - Source document: kernel/locking/index.rst
 
-   - Translation time: 2026-01-05 12:00:59
+   - Translation time: 2026-05-16 09:39:15
 
    - Translation model: `hunyuan-turbos-latest`
 
@@ -25,3 +25,5 @@ Locks
    rwlock
    mutex
    rwsem
+   rcu_implementation_plan
+   container_rcu_design

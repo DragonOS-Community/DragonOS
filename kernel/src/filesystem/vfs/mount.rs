@@ -120,6 +120,20 @@ bitflags! {
         /// Old magic mount flag and mask
         const MGC_VAL = 0xC0ED0000; // Magic value for mount flags
         const MGC_MASK = 0xFFFF0000; // Mask for magic mount flags
+
+        /// 用户空间可通过 MS_REMOUNT 修改的 mount flags 集合。
+        const MNT_USER_SETTABLE_MASK = MountFlags::RDONLY.bits()
+            | MountFlags::NOSUID.bits()
+            | MountFlags::NODEV.bits()
+            | MountFlags::NOEXEC.bits()
+            | MountFlags::NOATIME.bits()
+            | MountFlags::NODIRATIME.bits()
+            | MountFlags::RELATIME.bits()
+            | MountFlags::NOSYMFOLLOW.bits();
+
+        const MNT_ATIME_MASK = MountFlags::NOATIME.bits()
+            | MountFlags::NODIRATIME.bits()
+            | MountFlags::RELATIME.bits();
     }
 }
 
@@ -375,6 +389,11 @@ impl MountFS {
         self.namespace.try_get().and_then(|ns| ns.upgrade())
     }
 
+    /// check_mnt()：检查当前 MountFS 是否属于指定 mount namespace。
+    pub fn is_belongs_to_mntns(&self, mntns: &Arc<MntNamespace>) -> bool {
+        self.namespace().is_some_and(|ns| Arc::ptr_eq(&ns, mntns))
+    }
+
     pub fn fs_type(&self) -> &str {
         self.inner_filesystem.name()
     }
@@ -480,8 +499,17 @@ impl MountFSInode {
         root_inner_inode: Arc<dyn IndexNode>,
         mount_flags: MountFlags,
     ) -> Result<Arc<MountFS>, SystemError> {
+        // Linux do_add_mount：父挂载点必须属于当前 mount namespace。
+        let current_mntns = ProcessManager::current_mntns();
+        if !self.mount_fs.is_belongs_to_mntns(&current_mntns) {
+            return Err(SystemError::EINVAL);
+        }
+
         let metadata = self.inner_inode.metadata()?;
-        if metadata.file_type != FileType::Dir {
+        let root_metadata = root_inner_inode.metadata()?;
+        let is_dir = metadata.file_type == FileType::Dir;
+        let root_is_dir = root_metadata.file_type == FileType::Dir;
+        if is_dir != root_is_dir {
             return Err(SystemError::ENOTDIR);
         }
 
@@ -634,10 +662,7 @@ impl MountFSInode {
 
     /// 移除挂载点下的文件系统
     fn do_umount(&self) -> Result<Arc<MountFS>, SystemError> {
-        if self.metadata()?.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
-
+        // 允许 umount 目录和文件的 bind mount
         let mountpoint_id = self.inner_inode.metadata()?.inode_id;
 
         // Detach first. Follow-up bookkeeping (peer registry and propagation)

@@ -186,39 +186,27 @@ fn path_mount(
         return Err(SystemError::EINVAL);
     }
 
-    if flags.intersection(MountFlags::REMOUNT | MountFlags::BIND)
-        == (MountFlags::REMOUNT | MountFlags::BIND)
-    {
-        return do_reconfigure_bind_mount(target_inode, bind_remount_requested_flags(flags));
-    }
-
     let mut mnt_flags = MountFlags::empty();
 
     // Default to relatime unless overriden
     if !flags.contains(MountFlags::NOATIME) {
         mnt_flags.insert(MountFlags::RELATIME);
     }
-
     if flags.contains(MountFlags::NOSUID) {
         mnt_flags.insert(MountFlags::NOSUID);
     }
-
     if flags.contains(MountFlags::NODEV) {
         mnt_flags.insert(MountFlags::NODEV);
     }
-
     if flags.contains(MountFlags::NOEXEC) {
         mnt_flags.insert(MountFlags::NOEXEC);
     }
-
     if flags.contains(MountFlags::NOATIME) {
         mnt_flags.insert(MountFlags::NOATIME);
     }
-
     if flags.contains(MountFlags::NODIRATIME) {
         mnt_flags.insert(MountFlags::NODIRATIME);
     }
-
     if flags.contains(MountFlags::STRICTATIME) {
         mnt_flags.remove(MountFlags::RELATIME);
         mnt_flags.remove(MountFlags::NOATIME);
@@ -230,9 +218,32 @@ fn path_mount(
         mnt_flags.insert(MountFlags::NOSYMFOLLOW);
     }
 
+    // MS_REMOUNT|MS_BIND 和 MS_REMOUNT 共用此 atime 保留逻辑。
+    if flags.contains(MountFlags::REMOUNT)
+        && !flags.intersects(
+            MountFlags::NOATIME
+                | MountFlags::NODIRATIME
+                | MountFlags::RELATIME
+                | MountFlags::STRICTATIME,
+        )
+    {
+        let target_mfs = target_inode
+            .fs()
+            .downcast_arc::<MountFS>()
+            .ok_or(SystemError::EINVAL)?;
+        let current_atime = target_mfs.mount_flags() & MountFlags::MNT_ATIME_MASK;
+        mnt_flags.remove(MountFlags::MNT_ATIME_MASK);
+        mnt_flags.insert(current_atime);
+    }
+
+    if flags.intersection(MountFlags::REMOUNT | MountFlags::BIND)
+        == (MountFlags::REMOUNT | MountFlags::BIND)
+    {
+        return do_reconfigure_bind_mount(target_inode, mnt_flags);
+    }
+
     if flags.contains(MountFlags::REMOUNT) {
-        log::warn!("todo: remount");
-        return Err(SystemError::ENOSYS);
+        return do_reconfigure_bind_mount(target_inode, mnt_flags);
     }
 
     if flags.contains(MountFlags::BIND) {
@@ -252,60 +263,41 @@ fn path_mount(
     return do_new_mount(source, target_inode, filesystemtype, data, mnt_flags).map(|_| ());
 }
 
-fn bind_remount_requested_flags(flags: MountFlags) -> MountFlags {
-    let reconfigurable_flags = MountFlags::RDONLY
-        | MountFlags::NOSUID
-        | MountFlags::NODEV
-        | MountFlags::NOEXEC
-        | MountFlags::NOATIME
-        | MountFlags::NODIRATIME
-        | MountFlags::RELATIME
-        | MountFlags::STRICTATIME
-        | MountFlags::NOSYMFOLLOW;
-
-    flags & reconfigurable_flags
-}
-
+/// 修改已有挂载的 mount flags
+///
+/// Linux 两条独立路径：
+/// - do_reconfigure_mnt()：MS_REMOUNT|MS_BIND, down_read(sb), 只改 mount flags ← 本函数
+/// - do_remount()：MS_REMOUNT alone, down_write(sb) + reconfigure_super() + set_mount_attributes() ← TODO
 fn do_reconfigure_bind_mount(
     target_inode: Arc<dyn IndexNode>,
     requested_flags: MountFlags,
 ) -> Result<(), SystemError> {
     if !is_mountpoint_root(&target_inode) {
-        log::warn!("do_reconfigure_bind_mount: target is not a mount root");
         return Err(SystemError::EINVAL);
     }
 
-    let target_mfs = target_inode.fs().downcast_arc::<MountFS>().ok_or_else(|| {
-        log::warn!("do_reconfigure_bind_mount: target is not on a mount");
-        SystemError::EINVAL
-    })?;
+    let target_mfs = target_inode
+        .fs()
+        .downcast_arc::<MountFS>()
+        .ok_or(SystemError::EINVAL)?;
 
-    let reconfigurable_flags = MountFlags::RDONLY
-        | MountFlags::NOSUID
-        | MountFlags::NODEV
-        | MountFlags::NOEXEC
-        | MountFlags::NOATIME
-        | MountFlags::NODIRATIME
-        | MountFlags::RELATIME
-        | MountFlags::NOSYMFOLLOW;
-    let atime_flags = MountFlags::NOATIME | MountFlags::NODIRATIME | MountFlags::RELATIME;
-    let requested_atime_flags = requested_flags & atime_flags;
-    let strict_atime = requested_flags.contains(MountFlags::STRICTATIME);
+    // 目标 mount 必须属于当前进程的 mount namespace。
+    let current_mntns = ProcessManager::current_mntns();
+    if !target_mfs.is_belongs_to_mntns(&current_mntns) {
+        return Err(SystemError::EINVAL);
+    }
 
+    // 保留不可修改的 flags，只覆盖 SETTABLE 位。
     target_mfs.update_mount_flags(|mount_flags| {
-        mount_flags.remove(reconfigurable_flags & !atime_flags);
-        mount_flags.insert(requested_flags & (reconfigurable_flags & !atime_flags));
-
-        if strict_atime {
-            mount_flags.remove(atime_flags);
-        } else if !requested_atime_flags.is_empty() {
-            mount_flags.remove(atime_flags);
-            mount_flags.insert(requested_atime_flags);
-        }
+        let preserved = *mount_flags & !MountFlags::MNT_USER_SETTABLE_MASK;
+        let new_settable = requested_flags & MountFlags::MNT_USER_SETTABLE_MASK;
+        *mount_flags = preserved | new_settable;
     });
 
     Ok(())
 }
+
+// TODO: do_remount() DragonOS 无 superblock reconfigure 基础设施。
 
 fn do_new_mount(
     source: Option<String>,
@@ -400,11 +392,9 @@ fn do_bind_mount(
     let source_inode =
         current_node.lookup_follow_symlink(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
-    // Both source and target must be directories
-    if source_inode.metadata()?.file_type != FileType::Dir {
-        return Err(SystemError::ENOTDIR);
-    }
-    if target_inode.metadata()?.file_type != FileType::Dir {
+    let source_is_dir = source_inode.metadata()?.file_type == FileType::Dir;
+    let target_is_dir = target_inode.metadata()?.file_type == FileType::Dir;
+    if source_is_dir != target_is_dir {
         return Err(SystemError::ENOTDIR);
     }
 
@@ -413,6 +403,14 @@ fn do_bind_mount(
 
     // Check if source is on a MountFS
     let source_mfs = source_fs.clone().downcast_arc::<MountFS>();
+
+    // 源挂载必须属于当前 mount namespace。
+    if let Some(ref mfs) = source_mfs {
+        let current_mntns = ProcessManager::current_mntns();
+        if !mfs.is_belongs_to_mntns(&current_mntns) {
+            return Err(SystemError::EINVAL);
+        }
+    }
 
     // Check if source is unbindable - if so, reject the bind mount
     if let Some(ref mfs) = source_mfs {
@@ -436,6 +434,16 @@ fn do_bind_mount(
         .map(|mfs| mfs.inner_filesystem())
         .unwrap_or(source_fs);
 
+    // do_loopback：目标挂载点必须属于当前 mount namespace。
+    let current_mntns = ProcessManager::current_mntns();
+    let target_mount_fs = target_inode
+        .fs()
+        .downcast_arc::<MountFS>()
+        .ok_or(SystemError::EINVAL)?;
+    if !target_mount_fs.is_belongs_to_mntns(&current_mntns) {
+        return Err(SystemError::EINVAL);
+    }
+
     let target_mfs = target_inode
         .clone()
         .downcast_arc::<crate::filesystem::vfs::mount::MountFSInode>()
@@ -446,9 +454,22 @@ fn do_bind_mount(
     // If MS_REC is set, recursively bind all submounts from source to target
     if flags.contains(MountFlags::REC) {
         if let Some(ref mfs) = source_mfs_for_recursive {
-            let source_path = source_inode.absolute_path()?;
-            let target_path = target_inode.absolute_path()?;
-            do_recursive_bind_mount(mfs, &target_mfs, &source_path, &target_path)?;
+            let target_path = match target_inode.absolute_path() {
+                Ok(p) => p,
+                Err(_) => {
+                    // absolute_path 失败（如 devfs 设备节点）。
+                    // 文件型 bind mount 没有子挂载，跳过递归是安全的。
+                    // 目录型不应走到这里，属于内部错误。仍然返回 Ok，与 Linux 行为一致（不会因路径问题失败）。
+                    return Ok(());
+                }
+            };
+            if let Err(e) = do_recursive_bind_mount(mfs, &target_mfs, &source_path, &target_path) {
+                // Linux copy_tree/do_loopback：失败时 umount_tree 递归回滚整棵树。
+                // 当前仅回滚根挂载，已挂载的子挂载在 mount_list 中残留。
+                // TODO: 实现递归 umount_tree 以完全匹配 Linux all-or-nothing 语义。
+                let _ = target_mfs.umount();
+                return Err(e);
+            }
         }
     }
 
@@ -466,8 +487,14 @@ fn do_bind_mount(
 /// # Returns
 /// * `Ok(())` on success
 /// * `Err(SystemError)` on failure
+///
+/// namespace 隔离由 VFS 路径查找隐式保证。
 fn do_change_type(target_inode: Arc<dyn IndexNode>, flags: MountFlags) -> Result<(), SystemError> {
-    // Get the propagation type from flags
+    // 目标必须是挂载点根
+    if !is_mountpoint_root(&target_inode) {
+        return Err(SystemError::EINVAL);
+    }
+
     let prop_type = match flags_to_propagation_type(flags) {
         Some(t) => t,
         None => {
@@ -480,8 +507,7 @@ fn do_change_type(target_inode: Arc<dyn IndexNode>, flags: MountFlags) -> Result
     let recursive = flags.contains(MountFlags::REC);
 
     // Get the MountFS from the inode
-    let fs = target_inode.fs();
-    let mount_fs = fs.downcast_arc::<MountFS>().ok_or_else(|| {
+    let mount_fs = target_inode.fs().downcast_arc::<MountFS>().ok_or_else(|| {
         log::warn!("do_change_type: target is not a mounted filesystem");
         SystemError::EINVAL
     })?;
@@ -593,22 +619,19 @@ fn do_recursive_bind_mount(
         {
             Ok(inode) => inode,
             Err(e) => {
-                log::warn!(
-                    "do_recursive_bind_mount: failed to lookup target path {}: {:?}",
-                    target_child_path,
-                    e
-                );
-                continue;
+                return Err(e);
             }
         };
 
-        // Skip if not a directory
-        if target_child_inode.metadata()?.file_type != FileType::Dir {
+        let source_child_is_dir =
+            info.source_mfs.root_inner_inode().metadata()?.file_type == FileType::Dir;
+        let target_child_is_dir = target_child_inode.metadata()?.file_type == FileType::Dir;
+        if source_child_is_dir != target_child_is_dir {
             log::warn!(
-                "do_recursive_bind_mount: target {} is not a directory",
+                "do_recursive_bind_mount: source and target type mismatch for {}",
                 target_child_path
             );
-            continue;
+            return Err(SystemError::ENOTDIR);
         }
 
         // Get the inner filesystem for mounting
@@ -636,7 +659,7 @@ fn do_recursive_bind_mount(
                     target_child_path,
                     e
                 );
-                continue;
+                return Err(e);
             }
         }
 

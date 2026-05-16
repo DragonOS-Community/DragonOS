@@ -8,10 +8,7 @@ use core::{
 use crate::{
     ipc::sighand::SigHand,
     libs::{
-        notifier::{
-            AtomicNotifierChain, NotifierBlock, NOTIFY_DONE, NOTIFY_OK, NOTIFY_STOP,
-            NOTIFY_STOP_MASK,
-        },
+        notifier::{AtomicNotifierChain, NotifierBlock, NotifyResult},
         spinlock::SpinLock,
     },
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
@@ -56,7 +53,7 @@ impl RcuSelftestNotifier {
 impl NotifierBlock<RcuSelftestNotifyEvent, usize> for RcuSelftestNotifier {
     fn notifier_call(&self, _action: RcuSelftestNotifyEvent, data: Option<&usize>) -> i32 {
         if data != Some(&42) {
-            return NOTIFY_STOP;
+            return NotifyResult::STOP.bits();
         }
 
         self.order.lock_irqsave().push(self.id);
@@ -88,7 +85,7 @@ impl NotifierBlock<RcuSelftestNotifyEvent, usize> for RcuSelftestReentrantUnregi
         let target = self.target.lock_irqsave().clone();
         let Some(target) = target else {
             self.result.store(3, Ordering::SeqCst);
-            return NOTIFY_DONE;
+            return NotifyResult::DONE.bits();
         };
 
         match self.chain.unregister(target) {
@@ -96,7 +93,7 @@ impl NotifierBlock<RcuSelftestNotifyEvent, usize> for RcuSelftestReentrantUnregi
             _ => self.result.store(3, Ordering::SeqCst),
         }
 
-        NOTIFY_DONE
+        NotifyResult::DONE.bits()
     }
 
     fn priority(&self) -> i32 {
@@ -620,14 +617,30 @@ fn run_pr5_selftest() -> Result<(), &'static str> {
     let order = Arc::new(SpinLock::new(Vec::new()));
     let data = 42;
 
-    let high: Arc<RcuSelftestNotifierBlock> =
-        Arc::new(RcuSelftestNotifier::new(1, 20, NOTIFY_OK, order.clone()));
-    let low: Arc<RcuSelftestNotifierBlock> =
-        Arc::new(RcuSelftestNotifier::new(2, 10, NOTIFY_DONE, order.clone()));
-    let same_prio: Arc<RcuSelftestNotifierBlock> =
-        Arc::new(RcuSelftestNotifier::new(3, 20, NOTIFY_DONE, order.clone()));
-    let stop: Arc<RcuSelftestNotifierBlock> =
-        Arc::new(RcuSelftestNotifier::new(4, 15, NOTIFY_STOP, order.clone()));
+    let high: Arc<RcuSelftestNotifierBlock> = Arc::new(RcuSelftestNotifier::new(
+        1,
+        20,
+        NotifyResult::OK.bits(),
+        order.clone(),
+    ));
+    let low: Arc<RcuSelftestNotifierBlock> = Arc::new(RcuSelftestNotifier::new(
+        2,
+        10,
+        NotifyResult::DONE.bits(),
+        order.clone(),
+    ));
+    let same_prio: Arc<RcuSelftestNotifierBlock> = Arc::new(RcuSelftestNotifier::new(
+        3,
+        20,
+        NotifyResult::DONE.bits(),
+        order.clone(),
+    ));
+    let stop: Arc<RcuSelftestNotifierBlock> = Arc::new(RcuSelftestNotifier::new(
+        4,
+        15,
+        NotifyResult::STOP.bits(),
+        order.clone(),
+    ));
 
     chain
         .register(low.clone())
@@ -647,7 +660,7 @@ fn run_pr5_selftest() -> Result<(), &'static str> {
     }
 
     let (ret, nr_calls) = chain.call_chain(RcuSelftestNotifyEvent::Ping, Some(&data), None);
-    if ret != NOTIFY_DONE || nr_calls != 2 {
+    if ret != NotifyResult::DONE.bits() || nr_calls != 2 {
         return Err("atomic notifier full call_chain returned the wrong result");
     }
     check_notifier_order(
@@ -658,7 +671,7 @@ fn run_pr5_selftest() -> Result<(), &'static str> {
 
     clear_notifier_order(&order);
     let (ret, nr_calls) = chain.call_chain(RcuSelftestNotifyEvent::Ping, Some(&data), Some(1));
-    if ret != NOTIFY_OK || nr_calls != 1 {
+    if ret != NotifyResult::OK.bits() || nr_calls != 1 {
         return Err("atomic notifier nr_to_call did not stop after one callback");
     }
     check_notifier_order(
@@ -673,7 +686,10 @@ fn run_pr5_selftest() -> Result<(), &'static str> {
 
     clear_notifier_order(&order);
     let (ret, nr_calls) = chain.call_chain(RcuSelftestNotifyEvent::Ping, Some(&data), None);
-    if ret & NOTIFY_STOP_MASK == 0 || ret != NOTIFY_STOP || nr_calls != 2 {
+    if !NotifyResult::from_bits_truncate(ret).contains(NotifyResult::STOP_MASK)
+        || ret != NotifyResult::STOP.bits()
+        || nr_calls != 2
+    {
         return Err("atomic notifier did not honor NOTIFY_STOP_MASK");
     }
     check_notifier_order(
@@ -688,7 +704,7 @@ fn run_pr5_selftest() -> Result<(), &'static str> {
 
     clear_notifier_order(&order);
     let (ret, nr_calls) = chain.call_chain(RcuSelftestNotifyEvent::Ping, Some(&data), None);
-    if ret != NOTIFY_DONE || nr_calls != 2 {
+    if ret != NotifyResult::DONE.bits() || nr_calls != 2 {
         return Err("atomic notifier unregister did not publish the replacement snapshot");
     }
     check_notifier_order(

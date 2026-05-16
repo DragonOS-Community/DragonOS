@@ -10,11 +10,16 @@ use crate::{
     rcu::{rcu_read_lock_held, synchronize_rcu, RcuArcSlot},
 };
 
-pub const NOTIFY_DONE: i32 = 0x0000;
-pub const NOTIFY_OK: i32 = 0x0001;
-pub const NOTIFY_STOP_MASK: i32 = 0x8000;
-pub const NOTIFY_BAD: i32 = NOTIFY_STOP_MASK | 0x0002;
-pub const NOTIFY_STOP: i32 = NOTIFY_OK | NOTIFY_STOP_MASK;
+bitflags! {
+    /// Linux notifier callback return values.
+    pub struct NotifyResult: i32 {
+        const DONE = 0x0000;
+        const OK = 0x0001;
+        const STOP_MASK = 0x8000;
+        const BAD = Self::STOP_MASK.bits | 0x0002;
+        const STOP = Self::OK.bits | Self::STOP_MASK.bits;
+    }
+}
 
 /// @brief 通知链节点
 pub trait NotifierBlock<V: Clone + Copy, T>: Debug + Send + Sync {
@@ -110,7 +115,7 @@ impl<V: Clone + Copy, T> NotifierChain<V, T> {
             }
             ret = b.notifier_call(action, data);
             nr_calls += 1;
-            if ret & NOTIFY_STOP_MASK != 0 {
+            if NotifyResult::from_bits_truncate(ret).contains(NotifyResult::STOP_MASK) {
                 break;
             }
         }

@@ -4,7 +4,7 @@
 
    - Source document: kernel/locking/index.rst
 
-   - Translation time: 2026-01-05 12:00:59
+   - Translation time: 2026-05-16 09:49:56
 
    - Translation model: `hunyuan-turbos-latest`
 

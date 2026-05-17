@@ -70,6 +70,10 @@ impl Syscall {
         args: &[usize],
         frame: &mut TrapFrame,
     ) -> Result<usize, SystemError> {
+        // Seccomp check — must run before syscall dispatch
+        let seccomp_args = [args[0], args[1], args[2], args[3], args[4], args[5]];
+        crate::process::seccomp::secure_computing(syscall_num, &seccomp_args, frame.rip() as u64)?;
+
         defer::defer!({
             if ProcessManager::current_pcb()
                 .flags()

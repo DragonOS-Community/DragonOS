@@ -104,19 +104,24 @@ impl Ext4FileSystem {
         let fs = another_ext4::Ext4::load(mount_data.clone())?;
         let root_inode: Arc<LockedExt4Inode> =
             Arc::new_cyclic(|self_ref: &Weak<LockedExt4Inode>| {
-                LockedExt4Inode(Mutex::new(Ext4Inode {
-                    inner_inode_num: another_ext4::EXT4_ROOT_INO,
-                    fs_ptr: Weak::default(),
-                    page_cache: None,
-                    children: BTreeMap::new(),
-                    dname: DName::from("/"),
-                    vfs_inode_id: generate_inode_id(),
-                    parent: self_ref.clone(),
-                    self_ref: self_ref.clone(),
-                    special_node: None,
-                    cached_file_size: None,
-                    metadata_dirty: false,
-                }))
+                LockedExt4Inode(
+                    Mutex::new(Ext4Inode {
+                        inner_inode_num: another_ext4::EXT4_ROOT_INO,
+                        fs_ptr: Weak::default(),
+                        page_cache: None,
+                        children: BTreeMap::new(),
+                        dname: DName::from("/"),
+                        vfs_inode_id: generate_inode_id(),
+                        parent: self_ref.clone(),
+                        self_ref: self_ref.clone(),
+                        special_node: None,
+                        cached_file_size: None,
+                        cached_mtime: None,
+                        size_dirty: false,
+                        mtime_dirty: false,
+                    }),
+                    Mutex::new(()),
+                )
             });
 
         let fs = Arc::new(Ext4FileSystem {

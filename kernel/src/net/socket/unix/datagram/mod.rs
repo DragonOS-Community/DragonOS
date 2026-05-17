@@ -1,7 +1,12 @@
 use crate::{
     filesystem::epoll::{event_poll::EventPoll, EPollEventType},
     filesystem::vfs::iov::IoVecs,
-    filesystem::vfs::{fasync::FAsyncItems, utils::DName, vcore::generate_inode_id, InodeId},
+    filesystem::vfs::{
+        fasync::{FAsyncItems, FASYNC_POLL_IN},
+        utils::DName,
+        vcore::generate_inode_id,
+        InodeId,
+    },
     libs::mutex::Mutex,
     libs::rwsem::RwSem,
     libs::wait_queue::WaitQueue,
@@ -539,7 +544,7 @@ impl UnixDatagramSocket {
         );
 
         // 发送 fasync 信号
-        target_socket.fasync_items.send_sigio();
+        target_socket.fasync_items.send_sigio(FASYNC_POLL_IN);
 
         Ok(buf_len)
     }

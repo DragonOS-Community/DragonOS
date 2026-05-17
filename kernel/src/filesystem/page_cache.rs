@@ -558,6 +558,7 @@ impl PageCacheManager {
             inner.dirty_pages.remove(&page_index);
         }
 
+        let _invalidate = cache.invalidate_read();
         let inode = cache
             .inode()
             .and_then(|inode| inode.upgrade())
@@ -582,8 +583,12 @@ impl PageCacheManager {
                 guard.remove_flags(PageFlags::PG_DIRTY);
             }
             let result = if let Some(backend) = backend {
-                let waiter = backend.write_page_async(page_index, &page, len);
-                waiter.wait().map(|_| len)
+                let data = {
+                    let guard = page.read();
+                    let src = unsafe { guard.as_slice() };
+                    src[..len].to_vec()
+                };
+                backend.write_page(page_index, &data).map(|_| len)
             } else {
                 let data = unsafe {
                     core::slice::from_raw_parts(
@@ -599,9 +604,14 @@ impl PageCacheManager {
                 )
             };
             if let Err(e) = result {
-                page.write().add_flags(PageFlags::PG_ERROR);
-                cache.account_state_transition(PageState::Writeback, PageState::Error);
-                entry.set_state(PageState::Error);
+                {
+                    let mut guard = page.write();
+                    guard.add_flags(PageFlags::PG_ERROR | PageFlags::PG_DIRTY);
+                }
+                cache.account_state_transition(PageState::Writeback, PageState::Dirty);
+                entry.set_state(PageState::Dirty);
+                let mut inner = cache.inner.lock();
+                inner.dirty_pages.insert(page_index);
                 entry.wait_queue.wake_all();
                 return Err(e);
             }
@@ -1381,12 +1391,37 @@ impl PageCache {
         if let Some(current) = guard.get_entry(page_index) {
             if Arc::ptr_eq(&current, entry) {
                 guard.pages.remove(&page_index);
+                guard.dirty_pages.remove(&page_index);
                 if let Some(cache) = guard.page_cache_ref.upgrade() {
                     cache.account_entry_remove(entry.state());
                 }
             }
         }
         self.discard_unlinked_page(&entry.page);
+    }
+
+    fn discard_error_entry(&self, page_index: usize) {
+        let removed = {
+            let mut guard = self.inner.lock();
+            let Some(entry) = guard.get_entry(page_index) else {
+                return;
+            };
+            if entry.state() != PageState::Error {
+                return;
+            }
+            guard.dirty_pages.remove(&page_index);
+            let removed = guard.pages.remove(&page_index);
+            if let Some(entry) = removed.as_ref() {
+                if let Some(cache) = guard.page_cache_ref.upgrade() {
+                    cache.account_entry_remove(entry.state());
+                }
+            }
+            removed
+        };
+
+        if let Some(entry) = removed {
+            self.discard_unlinked_page(&entry.page);
+        }
     }
 
     fn discard_unlinked_page(&self, page: &Arc<Page>) {
@@ -1643,6 +1678,7 @@ impl PageCache {
             let full_page_overwrite =
                 write_start == page_start && page_write_len == MMArch::PAGE_SIZE;
             let populate_backend = !self.is_shmem() && !full_page_overwrite;
+            self.discard_error_entry(page_index);
             let entry = self.get_or_create_entry(page_index, populate_backend)?;
             copies.push(CopyItem {
                 entry,

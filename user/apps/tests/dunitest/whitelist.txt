@@ -3,6 +3,7 @@
 demo/gtest_demo
 normal/capability
 normal/fcntl_lock
+normal/fcntl_signal
 normal/epoll_timeout_budget
 normal/devpts_dir_read
 normal/test_pivot_root

@@ -1085,6 +1085,14 @@ pub fn io_schedule() {
 /// 此函数与schedule的区别为，该函数不会检查preempt_count
 /// 适用于时钟中断等场景
 pub fn __schedule(sched_mod: SchedMode) {
+    __schedule_inner(sched_mod, None);
+}
+
+pub(crate) fn __schedule_with_current(sched_mod: SchedMode, current: Arc<ProcessControlBlock>) {
+    __schedule_inner(sched_mod, Some(current));
+}
+
+fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBlock>>) {
     // 中断/IPI 路径上的抢占调度请求在 preempt_count 非零时不能直接切走当前任务，
     // 否则会破坏依赖 preempt_disable() 的临界区（例如当前 RCU 实现的读侧临界区）。
     if sched_mod.contains(SchedMode::SM_MASK_PREEMPT) {
@@ -1099,11 +1107,20 @@ pub fn __schedule(sched_mod: SchedMode) {
     let cpu = smp_get_processor_id().data() as usize;
     let rq = cpu_rq(cpu);
     let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-    let mut prev = rq.current();
-    if let ProcessState::Exited(_) = prev.clone().sched_info().inner_lock_read_irqsave().state() {
-        // 从exit进的Schedule
-        prev = ProcessManager::current_pcb();
-    }
+    let prev = match current {
+        Some(current) => current,
+        None => {
+            let prev = rq.current();
+            if let ProcessState::Exited(_) =
+                prev.clone().sched_info().inner_lock_read_irqsave().state()
+            {
+                // 从exit进的Schedule
+                ProcessManager::current_pcb()
+            } else {
+                prev
+            }
+        }
+    };
 
     // TODO: hrtick_clear(rq);
 

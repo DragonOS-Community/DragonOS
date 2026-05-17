@@ -298,7 +298,7 @@ pub trait PollableInode: Any + Sync + Send + Debug + CastFromSync {
     /// Add a fasync item for SIGIO notification
     fn add_fasync(
         &self,
-        _fasync_item: Arc<fasync::FAsyncItem>,
+        _fasync_item: fasync::FAsyncItem,
         _private_data: &FilePrivateData,
     ) -> Result<(), SystemError> {
         // Default implementation: not supported

@@ -62,8 +62,9 @@ use crate::{
     process::resource::{RLimit64, RLimitID},
     rcu::RcuArcSlot,
     sched::{
-        DequeueFlag, EnqueueFlag, OnRq, SchedMode, WakeupFlags, __schedule, completion::Completion,
-        cpu_rq, enqueue_task_on_cpu, fair::FairSchedEntity, prio::MAX_PRIO, select_task_rq,
+        DequeueFlag, EnqueueFlag, OnRq, SchedMode, WakeupFlags, __schedule_with_current,
+        completion::Completion, cpu_rq, enqueue_task_on_cpu, fair::FairSchedEntity, prio::MAX_PRIO,
+        select_task_rq,
     },
     smp::{
         core::smp_get_processor_id,
@@ -647,8 +648,7 @@ impl ProcessManager {
 
     /// 当子进程退出后向父进程发送通知
     #[inline(never)]
-    fn exit_notify() {
-        let current = ProcessManager::current_pcb();
+    fn exit_notify(current: &Arc<ProcessControlBlock>) {
         let sighand = current.sighand();
         let exec_task = if sighand.flags_contains(SignalFlags::GROUP_EXEC) {
             sighand.group_exec_task()
@@ -658,11 +658,11 @@ impl ProcessManager {
         let is_mt_exec_leader = current.is_thread_group_leader()
             && exec_task
                 .as_ref()
-                .map(|t| !Arc::ptr_eq(t, &current))
+                .map(|t| !Arc::ptr_eq(t, current))
                 .unwrap_or(false);
         if sighand.flags_contains(SignalFlags::GROUP_EXEC) {
             if let Some(exec_task) = exec_task.as_ref() {
-                if !Arc::ptr_eq(exec_task, &current) {
+                if !Arc::ptr_eq(exec_task, current) {
                     let notify_count = sighand.group_exec_notify_count();
                     if notify_count < 0 {
                         // mt-exec: exec 线程正在等待 leader 退出
@@ -674,7 +674,7 @@ impl ProcessManager {
             }
             let should_clear = exec_task
                 .as_ref()
-                .map(|t| Arc::ptr_eq(t, &current))
+                .map(|t| Arc::ptr_eq(t, current))
                 .unwrap_or(false);
             if should_clear {
                 sighand.finish_group_exec();
@@ -777,15 +777,14 @@ impl ProcessManager {
                 spin_loop();
             }
         }
-        drop(current_pcb);
 
         // 关中断
         let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let pid: Arc<Pid>;
-        let raw_pid = ProcessManager::current_pid();
+        let raw_pid = current_pcb.raw_pid();
         // log::debug!("[exit: {}]", raw_pid.data());
         {
-            let pcb = ProcessManager::current_pcb();
+            let pcb = current_pcb.clone();
             pcb.mark_exiting();
             pid = pcb.pid();
             pcb.wait_queue.mark_dead();
@@ -891,12 +890,10 @@ impl ProcessManager {
 
             unsafe { pcb.basic_mut().set_user_vm(None) };
 
-            drop(pcb);
-
-            ProcessManager::exit_notify();
+            ProcessManager::exit_notify(&pcb);
         }
 
-        __schedule(SchedMode::SM_NONE);
+        __schedule_with_current(SchedMode::SM_NONE, current_pcb);
         error!("raw_pid {raw_pid:?} exited but sched again!");
         #[allow(clippy::empty_loop)]
         loop {

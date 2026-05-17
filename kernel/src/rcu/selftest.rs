@@ -1,13 +1,22 @@
-use alloc::{boxed::Box, format, string::String, sync::Arc};
+use alloc::{boxed::Box, format, string::String, sync::Arc, vec::Vec};
 use core::{
+    fmt::Debug,
     ptr::{self, NonNull},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use crate::{
+    arch::CurrentIrqArch,
+    exception::InterruptArch,
     ipc::sighand::SigHand,
+    libs::{
+        notifier::{AtomicNotifierChain, NotifierBlock, NotifyResult},
+        spinlock::SpinLock,
+    },
+    process::preempt::PreemptGuard,
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
 };
+use system_error::SystemError;
 
 use super::*;
 
@@ -15,6 +24,84 @@ use super::*;
 struct RcuSelftestDropProbe {
     id: usize,
     drops: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RcuSelftestNotifyEvent {
+    Ping,
+}
+
+type RcuSelftestAtomicNotifierChain = AtomicNotifierChain<RcuSelftestNotifyEvent, usize>;
+type RcuSelftestNotifierBlock = dyn NotifierBlock<RcuSelftestNotifyEvent, usize>;
+
+#[derive(Debug)]
+struct RcuSelftestNotifier {
+    id: usize,
+    priority: i32,
+    ret: i32,
+    order: Arc<SpinLock<Vec<usize>>>,
+}
+
+impl RcuSelftestNotifier {
+    fn new(id: usize, priority: i32, ret: i32, order: Arc<SpinLock<Vec<usize>>>) -> Self {
+        Self {
+            id,
+            priority,
+            ret,
+            order,
+        }
+    }
+}
+
+impl NotifierBlock<RcuSelftestNotifyEvent, usize> for RcuSelftestNotifier {
+    fn notifier_call(&self, _action: RcuSelftestNotifyEvent, data: Option<&usize>) -> i32 {
+        if data != Some(&42) {
+            return NotifyResult::STOP.bits();
+        }
+
+        self.order.lock_irqsave().push(self.id);
+        self.ret
+    }
+
+    fn priority(&self) -> i32 {
+        self.priority
+    }
+}
+
+struct RcuSelftestReentrantUnregisterNotifier {
+    priority: i32,
+    chain: Arc<RcuSelftestAtomicNotifierChain>,
+    target: SpinLock<Option<Arc<RcuSelftestNotifierBlock>>>,
+    result: Arc<AtomicUsize>,
+}
+
+impl Debug for RcuSelftestReentrantUnregisterNotifier {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RcuSelftestReentrantUnregisterNotifier")
+            .field("priority", &self.priority)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NotifierBlock<RcuSelftestNotifyEvent, usize> for RcuSelftestReentrantUnregisterNotifier {
+    fn notifier_call(&self, _action: RcuSelftestNotifyEvent, _data: Option<&usize>) -> i32 {
+        let target = self.target.lock_irqsave().clone();
+        let Some(target) = target else {
+            self.result.store(3, Ordering::SeqCst);
+            return NotifyResult::DONE.bits();
+        };
+
+        match self.chain.unregister(target) {
+            Err(SystemError::EDEADLK_OR_EDEADLOCK) => self.result.store(1, Ordering::SeqCst),
+            _ => self.result.store(3, Ordering::SeqCst),
+        }
+
+        NotifyResult::DONE.bits()
+    }
+
+    fn priority(&self) -> i32 {
+        self.priority
+    }
 }
 
 impl Drop for RcuSelftestDropProbe {
@@ -37,13 +124,34 @@ unsafe fn rcu_selftest_callback(head: NonNull<RcuHead>) {
     probe.hits.fetch_add(1, Ordering::SeqCst);
 }
 
-fn force_current_cpu_active_for_selftest(cpu: ProcessorId) {
-    let wake_worker = {
+struct RcuSelftestCpuStateGuard {
+    cpu: ProcessorId,
+    saved: RcuCpuState,
+}
+
+impl RcuSelftestCpuStateGuard {
+    fn new_active(cpu: ProcessorId) -> Self {
         let mut inner = RCU_STATE.inner.lock_irqsave();
         let cpu_idx = cpu.data() as usize;
+        let saved = inner.cpu_states[cpu_idx];
         inner.cpu_states[cpu_idx].in_idle_eqs = false;
         inner.cpu_states[cpu_idx].irq_nesting = 0;
         inner.cpu_states[cpu_idx].irq_from_idle_eqs = false;
+        Self { cpu, saved }
+    }
+}
+
+impl Drop for RcuSelftestCpuStateGuard {
+    fn drop(&mut self) {
+        restore_cpu_state_after_selftest(self.cpu, self.saved);
+    }
+}
+
+fn restore_cpu_state_after_selftest(cpu: ProcessorId, saved: RcuCpuState) {
+    let wake_worker = {
+        let mut inner = RCU_STATE.inner.lock_irqsave();
+        let cpu_idx = cpu.data() as usize;
+        inner.cpu_states[cpu_idx] = saved;
         if inner.gp_active && inner.waiting_cpus.get(cpu).unwrap_or(false) {
             inner.waiting_cpus.set(cpu, false);
         }
@@ -66,6 +174,10 @@ fn run_idle_irq_wakeup_selftest() -> Result<(), &'static str> {
     if pending_before != 0 || ready_before != 0 {
         return Err("rcu callback queues were not empty before idle IRQ selftest");
     }
+
+    let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+    let _preempt_guard = PreemptGuard::new();
+    let cpu_state_guard = RcuSelftestCpuStateGuard::new_active(cpu);
 
     let wake_worker = {
         let mut inner = RCU_STATE.inner.lock_irqsave();
@@ -111,7 +223,6 @@ fn run_idle_irq_wakeup_selftest() -> Result<(), &'static str> {
         }
     };
     if let Some(error) = pre_exit_error {
-        force_current_cpu_active_for_selftest(cpu);
         return Err(error);
     }
 
@@ -129,7 +240,6 @@ fn run_idle_irq_wakeup_selftest() -> Result<(), &'static str> {
     let wake_worker = match idle_irq_exit_result {
         Ok(wake_worker) => wake_worker,
         Err(error) => {
-            force_current_cpu_active_for_selftest(cpu);
             return Err(error);
         }
     };
@@ -145,12 +255,14 @@ fn run_idle_irq_wakeup_selftest() -> Result<(), &'static str> {
         inner.waiting_cpus.get(cpu).unwrap_or(false)
     };
     if post_exit_waiting {
-        force_current_cpu_active_for_selftest(cpu);
         return Err("idle IRQ exit left the current CPU in waiting_cpus");
     }
 
+    drop(cpu_state_guard);
+    drop(_preempt_guard);
+    drop(_irq_guard);
+
     rcu_barrier();
-    force_current_cpu_active_for_selftest(cpu);
 
     if idle_hits.load(Ordering::SeqCst) != 1 {
         return Err("callback did not execute after the idle IRQ wakeup selftest finished");
@@ -316,8 +428,43 @@ fn run_pr2_selftest() -> Result<(), &'static str> {
     }
 
     drop(slot);
+    rcu_barrier();
     if new_drops.load(Ordering::SeqCst) != 1 {
-        return Err("current slot object was not dropped when the slot was destroyed");
+        return Err("current slot object was not dropped after slot destruction grace period");
+    }
+
+    let with_read_old_drops = Arc::new(AtomicUsize::new(0));
+    let with_read_new_drops = Arc::new(AtomicUsize::new(0));
+    let with_read_slot = RcuArcSlot::new(Arc::new(RcuSelftestDropProbe {
+        id: 9,
+        drops: with_read_old_drops.clone(),
+    }));
+
+    let observed_id = with_read_slot.with_read(|old| {
+        with_read_slot.store_deferred(Arc::new(RcuSelftestDropProbe {
+            id: 10,
+            drops: with_read_new_drops.clone(),
+        }));
+
+        if with_read_old_drops.load(Ordering::SeqCst) != 0 {
+            return 0;
+        }
+
+        old.id
+    });
+    if observed_id != 9 {
+        return Err("RcuArcSlot::with_read did not pin the old snapshot during replacement");
+    }
+
+    rcu_barrier();
+    if with_read_old_drops.load(Ordering::SeqCst) != 1 {
+        return Err("RcuArcSlot::with_read old snapshot was not dropped after the read section");
+    }
+
+    drop(with_read_slot);
+    rcu_barrier();
+    if with_read_new_drops.load(Ordering::SeqCst) != 1 {
+        return Err("RcuArcSlot::with_read replacement snapshot was not dropped after slot drop");
     }
 
     let sighand = SigHand::new();
@@ -354,10 +501,284 @@ fn run_pr2_selftest() -> Result<(), &'static str> {
     Ok(())
 }
 
+fn run_pr3_selftest() -> Result<(), &'static str> {
+    let option_drops = Arc::new(AtomicUsize::new(0));
+    let option_replacement_drops = Arc::new(AtomicUsize::new(0));
+    let option_clear_drops = Arc::new(AtomicUsize::new(0));
+    let option_race_old_drops = Arc::new(AtomicUsize::new(0));
+    let option_race_new_drops = Arc::new(AtomicUsize::new(0));
+    let option_drop_drops = Arc::new(AtomicUsize::new(0));
+
+    let option_slot = RcuOptionArcSlot::new_none();
+    if option_slot.load().is_some() {
+        return Err("RcuOptionArcSlot::new_none did not start empty");
+    }
+
+    option_slot.store_deferred(Some(Arc::new(RcuSelftestDropProbe {
+        id: 3,
+        drops: option_drops.clone(),
+    })));
+    let pinned_option = option_slot
+        .load()
+        .ok_or("RcuOptionArcSlot did not publish the first object")?;
+    if pinned_option.id != 3 {
+        return Err("RcuOptionArcSlot loaded the wrong first object");
+    }
+
+    option_slot.store_deferred(Some(Arc::new(RcuSelftestDropProbe {
+        id: 4,
+        drops: option_replacement_drops.clone(),
+    })));
+    rcu_barrier();
+    if option_drops.load(Ordering::SeqCst) != 0 {
+        return Err("RcuOptionArcSlot dropped a pinned old object");
+    }
+    if option_slot.load().map(|value| value.id) != Some(4) {
+        return Err("RcuOptionArcSlot did not publish the replacement object");
+    }
+
+    drop(pinned_option);
+    if option_drops.load(Ordering::SeqCst) != 1 {
+        return Err("RcuOptionArcSlot old object was not dropped after final pin");
+    }
+
+    option_slot.store_deferred(None);
+    rcu_barrier();
+    if option_slot.load().is_some() {
+        return Err("RcuOptionArcSlot did not clear to None");
+    }
+    if option_replacement_drops.load(Ordering::SeqCst) != 1 {
+        return Err("RcuOptionArcSlot replacement object was not dropped after clear");
+    }
+
+    option_slot.store_deferred(Some(Arc::new(RcuSelftestDropProbe {
+        id: 5,
+        drops: option_clear_drops.clone(),
+    })));
+    if !option_slot.clear_if_deferred(|value| value.id == 5) {
+        return Err("RcuOptionArcSlot clear_if_deferred did not clear a matching object");
+    }
+    rcu_barrier();
+    if option_slot.load().is_some() {
+        return Err("RcuOptionArcSlot clear_if_deferred left a matching object published");
+    }
+    if option_clear_drops.load(Ordering::SeqCst) != 1 {
+        return Err("RcuOptionArcSlot clear_if_deferred did not drop the cleared object");
+    }
+
+    option_slot.store_deferred(Some(Arc::new(RcuSelftestDropProbe {
+        id: 6,
+        drops: option_race_old_drops.clone(),
+    })));
+    let replaced_once = AtomicBool::new(false);
+    let cleared = option_slot.clear_if_deferred(|value| {
+        if value.id == 6 && !replaced_once.swap(true, Ordering::SeqCst) {
+            option_slot.store_deferred(Some(Arc::new(RcuSelftestDropProbe {
+                id: 7,
+                drops: option_race_new_drops.clone(),
+            })));
+            return true;
+        }
+
+        value.id == 6
+    });
+    if cleared {
+        return Err("RcuOptionArcSlot clear_if_deferred cleared after a racing replacement");
+    }
+    if option_slot.load().map(|value| value.id) != Some(7) {
+        return Err("RcuOptionArcSlot clear_if_deferred lost the racing replacement");
+    }
+    rcu_barrier();
+    if option_race_old_drops.load(Ordering::SeqCst) != 1 {
+        return Err("RcuOptionArcSlot racing old object was not dropped");
+    }
+    if option_race_new_drops.load(Ordering::SeqCst) != 0 {
+        return Err("RcuOptionArcSlot racing replacement was dropped unexpectedly");
+    }
+
+    option_slot.store_deferred(None);
+    rcu_barrier();
+    if option_race_new_drops.load(Ordering::SeqCst) != 1 {
+        return Err("RcuOptionArcSlot racing replacement was not dropped after final clear");
+    }
+
+    let drop_slot = RcuOptionArcSlot::new_some(Arc::new(RcuSelftestDropProbe {
+        id: 8,
+        drops: option_drop_drops.clone(),
+    }));
+    let pinned_drop_slot = drop_slot
+        .load()
+        .ok_or("RcuOptionArcSlot drop test did not publish an object")?;
+    drop(drop_slot);
+    rcu_barrier();
+    if option_drop_drops.load(Ordering::SeqCst) != 0 {
+        return Err("RcuOptionArcSlot drop released an object with a live reader pin");
+    }
+
+    drop(pinned_drop_slot);
+    if option_drop_drops.load(Ordering::SeqCst) != 1 {
+        return Err("RcuOptionArcSlot drop object was not released after final reader pin");
+    }
+
+    Ok(())
+}
+
+fn check_notifier_order(
+    order: &Arc<SpinLock<Vec<usize>>>,
+    expected: &[usize],
+    reason: &'static str,
+) -> Result<(), &'static str> {
+    let observed = order.lock_irqsave().clone();
+    if observed.as_slice() != expected {
+        return Err(reason);
+    }
+
+    Ok(())
+}
+
+fn clear_notifier_order(order: &Arc<SpinLock<Vec<usize>>>) {
+    order.lock_irqsave().clear();
+}
+
+fn run_pr5_selftest() -> Result<(), &'static str> {
+    let chain = Arc::new(RcuSelftestAtomicNotifierChain::new());
+    let order = Arc::new(SpinLock::new(Vec::new()));
+    let data = 42;
+
+    let high: Arc<RcuSelftestNotifierBlock> = Arc::new(RcuSelftestNotifier::new(
+        1,
+        20,
+        NotifyResult::OK.bits(),
+        order.clone(),
+    ));
+    let low: Arc<RcuSelftestNotifierBlock> = Arc::new(RcuSelftestNotifier::new(
+        2,
+        10,
+        NotifyResult::DONE.bits(),
+        order.clone(),
+    ));
+    let same_prio: Arc<RcuSelftestNotifierBlock> = Arc::new(RcuSelftestNotifier::new(
+        3,
+        20,
+        NotifyResult::DONE.bits(),
+        order.clone(),
+    ));
+    let stop: Arc<RcuSelftestNotifierBlock> = Arc::new(RcuSelftestNotifier::new(
+        4,
+        15,
+        NotifyResult::STOP.bits(),
+        order.clone(),
+    ));
+
+    chain
+        .register(low.clone())
+        .map_err(|_| "atomic notifier failed to register the low-priority block")?;
+    chain
+        .register(high.clone())
+        .map_err(|_| "atomic notifier failed to register the high-priority block")?;
+
+    match chain.register(high.clone()) {
+        Err(SystemError::EEXIST) => {}
+        _ => return Err("atomic notifier accepted a duplicated block registration"),
+    }
+
+    match chain.register_unique_prio(same_prio.clone()) {
+        Err(SystemError::EBUSY) => {}
+        _ => return Err("atomic notifier accepted a duplicate unique priority"),
+    }
+
+    let (ret, nr_calls) = chain.call_chain(RcuSelftestNotifyEvent::Ping, Some(&data), None);
+    if ret != NotifyResult::DONE.bits() || nr_calls != 2 {
+        return Err("atomic notifier full call_chain returned the wrong result");
+    }
+    check_notifier_order(
+        &order,
+        &[1, 2],
+        "atomic notifier did not dispatch in priority order",
+    )?;
+
+    clear_notifier_order(&order);
+    let (ret, nr_calls) = chain.call_chain(RcuSelftestNotifyEvent::Ping, Some(&data), Some(1));
+    if ret != NotifyResult::OK.bits() || nr_calls != 1 {
+        return Err("atomic notifier nr_to_call did not stop after one callback");
+    }
+    check_notifier_order(
+        &order,
+        &[1],
+        "atomic notifier nr_to_call dispatched the wrong callbacks",
+    )?;
+
+    chain
+        .register(stop.clone())
+        .map_err(|_| "atomic notifier failed to register the stop block")?;
+
+    clear_notifier_order(&order);
+    let (ret, nr_calls) = chain.call_chain(RcuSelftestNotifyEvent::Ping, Some(&data), None);
+    if !NotifyResult::from_bits_truncate(ret).contains(NotifyResult::STOP_MASK)
+        || ret != NotifyResult::STOP.bits()
+        || nr_calls != 2
+    {
+        return Err("atomic notifier did not honor NOTIFY_STOP_MASK");
+    }
+    check_notifier_order(
+        &order,
+        &[1, 4],
+        "atomic notifier continued after a NOTIFY_STOP result",
+    )?;
+
+    chain
+        .unregister(stop.clone())
+        .map_err(|_| "atomic notifier failed to unregister the stop block")?;
+
+    clear_notifier_order(&order);
+    let (ret, nr_calls) = chain.call_chain(RcuSelftestNotifyEvent::Ping, Some(&data), None);
+    if ret != NotifyResult::DONE.bits() || nr_calls != 2 {
+        return Err("atomic notifier unregister did not publish the replacement snapshot");
+    }
+    check_notifier_order(
+        &order,
+        &[1, 2],
+        "atomic notifier still dispatched an unregistered block",
+    )?;
+
+    let reentrant_result = Arc::new(AtomicUsize::new(0));
+    let reentrant = Arc::new(RcuSelftestReentrantUnregisterNotifier {
+        priority: 30,
+        chain: chain.clone(),
+        target: SpinLock::new(None),
+        result: reentrant_result.clone(),
+    });
+    let reentrant_block: Arc<RcuSelftestNotifierBlock> = reentrant.clone();
+    *reentrant.target.lock_irqsave() = Some(reentrant_block.clone());
+
+    chain
+        .register(reentrant_block.clone())
+        .map_err(|_| "atomic notifier failed to register the reentrant block")?;
+
+    let _ = chain.call_chain(RcuSelftestNotifyEvent::Ping, Some(&data), Some(1));
+    if reentrant_result.load(Ordering::SeqCst) != 1 {
+        return Err("atomic notifier unregister from call_chain did not return EDEADLK");
+    }
+
+    chain
+        .unregister(reentrant_block)
+        .map_err(|_| "atomic notifier failed to unregister the reentrant block afterward")?;
+    chain
+        .unregister(high)
+        .map_err(|_| "atomic notifier failed to unregister the high-priority block")?;
+    chain
+        .unregister(low)
+        .map_err(|_| "atomic notifier failed to unregister the low-priority block")?;
+
+    Ok(())
+}
+
 pub fn run_debug_selftests() -> String {
     let pr1 = run_pr1_selftest();
     let pr2 = run_pr2_selftest();
-    let overall_ok = pr1.is_ok() && pr2.is_ok();
+    let pr3 = run_pr3_selftest();
+    let pr5 = run_pr5_selftest();
+    let overall_ok = pr1.is_ok() && pr2.is_ok() && pr3.is_ok() && pr5.is_ok();
 
     let mut report = String::new();
     report.push_str(if overall_ok {
@@ -374,6 +795,16 @@ pub fn run_debug_selftests() -> String {
     match pr2 {
         Ok(()) => report.push_str("pr2=ok\n"),
         Err(reason) => report.push_str(&format!("pr2=fail:{reason}\n")),
+    }
+
+    match pr3 {
+        Ok(()) => report.push_str("pr3=ok\n"),
+        Err(reason) => report.push_str(&format!("pr3=fail:{reason}\n")),
+    }
+
+    match pr5 {
+        Ok(()) => report.push_str("pr5=ok\n"),
+        Err(reason) => report.push_str(&format!("pr5=fail:{reason}\n")),
     }
 
     report

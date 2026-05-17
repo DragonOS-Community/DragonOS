@@ -4,16 +4,18 @@
 
 use crate::libs::mutex::MutexGuard;
 use crate::{
+    driver::base::device::device_number::DeviceNumber,
     filesystem::{
         procfs::{
             template::{Builder, FileOps, ProcFileBuilder},
             utils::proc_read,
         },
-        vfs::{FilePrivateData, IndexNode, InodeMode},
+        vfs::{mount::MountFS, FilePrivateData, IndexNode, InodeMode},
     },
-    process::ProcessManager,
+    process::{namespace::mnt::MntNamespace, ProcessControlBlock, ProcessManager},
 };
 use alloc::{
+    format,
     string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
@@ -26,112 +28,10 @@ pub struct MountsFileOps;
 
 impl MountsFileOps {
     pub fn new_inode(parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcFileBuilder::new(Self, InodeMode::S_IRUGO) // 0444 - 所有用户可读
+        ProcFileBuilder::new(Self, InodeMode::S_IRUGO)
             .parent(parent)
             .build()
             .unwrap()
-    }
-}
-
-/// 生成 mounts 内容
-#[inline(never)]
-fn generate_mounts_like_content(fmt: MountsFormat) -> String {
-    let mntns = ProcessManager::current_mntns();
-    let mounts = mntns.mount_list().clone_inner();
-
-    // 以进程 fs root 为基准做 chroot 视图裁剪/重写
-    let pcb = ProcessManager::current_pcb();
-    let root_inode = pcb.fs_struct().root();
-    let root_prefix = root_inode
-        .absolute_path()
-        .unwrap_or_else(|_| "/".to_string());
-    let is_chrooted = root_prefix != "/";
-    let root_prefix_with_slash = if root_prefix.ends_with('/') {
-        root_prefix.clone()
-    } else {
-        root_prefix.clone() + "/"
-    };
-
-    let mut lines = Vec::with_capacity(mounts.len());
-    let mut cap = 0;
-    let mut mid: usize = 1;
-
-    for (mp, mfs) in mounts {
-        let mut line = String::new();
-        let fs_type = mfs.fs_type();
-        let source = mfs.mount_source().unwrap_or_else(|| match fs_type {
-            // 特殊文件系统，直接显示文件系统名称
-            "devfs" | "devpts" | "sysfs" | "procfs" | "tmpfs" | "ramfs" | "rootfs" | "debugfs"
-            | "configfs" => fs_type.to_string(),
-            // 其他文件系统：source 元数据缺失时回退为 fs type，避免错误显示挂载点名
-            _ => fs_type.to_string(),
-        });
-
-        // 过滤/改写 mountpoint（chroot 后应只暴露 root 下的挂载点，并重写为 chroot 视角）
-        let mut mountpoint = mp.as_str().to_string();
-        if is_chrooted {
-            if mountpoint == root_prefix {
-                mountpoint = "/".to_string();
-            } else if mountpoint.starts_with(&root_prefix_with_slash) {
-                // strip_prefix 会得到 "child/.."；保持以 '/' 开头
-                let stripped = &mountpoint[root_prefix.len()..];
-                mountpoint = if stripped.is_empty() {
-                    "/".to_string()
-                } else {
-                    stripped.to_string()
-                };
-            } else {
-                continue;
-            }
-        }
-
-        match fmt {
-            MountsFormat::Mounts => {
-                line.push_str(&format!("{source} {m} {fs_type}", m = mountpoint));
-                line.push(' ');
-                line.push_str(&mfs.mount_flags().options_string());
-                line.push_str(" 0 0\n");
-            }
-            MountsFormat::MountInfo => {
-                // 极简 mountinfo：只保证 mountpoint 字段正确且不泄露 chroot 前缀
-                // mount ID / parent ID / major:minor / root / mountpoint / options / - / fstype / source / superopts
-                line.push_str(&format!(
-                    "{id} {pid} 0:0 / {mp} {opts} - {fst} {src} {opts}\n",
-                    id = mid,
-                    pid = if mid == 1 { 0 } else { 1 },
-                    mp = mountpoint,
-                    opts = mfs.mount_flags().options_string(),
-                    fst = fs_type,
-                    src = source
-                ));
-            }
-        }
-
-        cap += line.len();
-        lines.push(line);
-        mid += 1;
-    }
-
-    let mut content = String::with_capacity(cap);
-    for line in lines {
-        content.push_str(&line);
-    }
-
-    return content;
-}
-
-impl FileOps for MountsFileOps {
-    fn read_at(
-        &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        let mounts_content = generate_mounts_like_content(MountsFormat::Mounts);
-        let bytes = mounts_content.as_bytes();
-
-        proc_read(offset, len, buf, bytes)
     }
 }
 
@@ -141,12 +41,229 @@ enum MountsFormat {
     MountInfo,
 }
 
-/// 为 /proc/<pid>/mountinfo 生成内容（极简版，满足 gVisor chroot_test）。
-pub(super) fn generate_mountinfo_content() -> String {
-    generate_mounts_like_content(MountsFormat::MountInfo)
+fn escape_mount_field(raw: &str) -> String {
+    let mut escaped = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            ' ' => escaped.push_str("\\040"),
+            '\t' => escaped.push_str("\\011"),
+            '\n' => escaped.push_str("\\012"),
+            '\\' => escaped.push_str("\\\\"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn mount_source_display(mfs: &Arc<MountFS>, fs_type: &str) -> String {
+    mfs.mount_source().unwrap_or_else(|| match fs_type {
+        "devfs" | "devpts" | "sysfs" | "procfs" | "tmpfs" | "ramfs" | "rootfs" | "debugfs"
+        | "configfs" => fs_type.to_string(),
+        _ => fs_type.to_string(),
+    })
+}
+
+fn mount_root_display(mfs: &Arc<MountFS>) -> String {
+    let root = mfs
+        .root_inner_inode()
+        .absolute_path()
+        .unwrap_or_else(|_| "/".to_string());
+
+    if root.is_empty() {
+        "/".to_string()
+    } else {
+        root
+    }
+}
+
+fn mount_dev_display(mfs: &Arc<MountFS>) -> DeviceNumber {
+    mfs.mountpoint_root_inode()
+        .metadata()
+        .map(|md| DeviceNumber::from(md.dev_id as u32))
+        .unwrap_or_default()
+}
+
+fn rewrite_mountpoint_for_root(mountpoint: &str, root_prefix: &str) -> Option<String> {
+    if root_prefix == "/" {
+        return Some(mountpoint.to_string());
+    }
+
+    let root_prefix_with_slash = if root_prefix.ends_with('/') {
+        root_prefix.to_string()
+    } else {
+        format!("{root_prefix}/")
+    };
+
+    if mountpoint == root_prefix {
+        Some("/".to_string())
+    } else if let Some(stripped) = mountpoint.strip_prefix(&root_prefix_with_slash) {
+        if stripped.is_empty() {
+            Some("/".to_string())
+        } else {
+            Some(format!("/{stripped}"))
+        }
+    } else {
+        None
+    }
+}
+
+fn mountinfo_optional_fields(mfs: &Arc<MountFS>) -> String {
+    let propagation = mfs.propagation();
+    let mut fields = Vec::new();
+    let info = propagation.info_string();
+
+    if !info.is_empty() {
+        fields.push(info);
+    }
+    if propagation.is_unbindable() {
+        fields.push("unbindable".to_string());
+    }
+
+    if fields.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", fields.join(" "))
+    }
+}
+
+fn collect_mounts(mntns: &Arc<MntNamespace>) -> Vec<(String, Arc<MountFS>)> {
+    let mut mounts = mntns
+        .mount_list()
+        .clone_inner()
+        .into_iter()
+        .map(|(path, mfs)| (path.as_str().to_string(), mfs))
+        .collect::<Vec<_>>();
+
+    mounts.sort_by_key(|(_, mfs)| {
+        let mount_id: usize = mfs.mount_id().into();
+        mount_id
+    });
+    mounts
+}
+
+#[inline(never)]
+fn generate_mounts_like_content_for_view(
+    mntns: &Arc<MntNamespace>,
+    root_inode: Arc<dyn IndexNode>,
+    fmt: MountsFormat,
+) -> String {
+    let mounts = collect_mounts(mntns);
+    let root_prefix = root_inode
+        .absolute_path()
+        .unwrap_or_else(|_| "/".to_string());
+
+    let mut lines = Vec::with_capacity(mounts.len());
+    let mut cap = 0;
+
+    for (mount_path, mfs) in mounts {
+        let Some(mountpoint) = rewrite_mountpoint_for_root(&mount_path, &root_prefix) else {
+            continue;
+        };
+
+        let fs_type = mfs.fs_type();
+        let source = escape_mount_field(&mount_source_display(&mfs, fs_type));
+        let fs_type = escape_mount_field(fs_type);
+        let mountpoint = escape_mount_field(&mountpoint);
+        let mount_opts = mfs.mount_flags().options_string();
+
+        let line = match fmt {
+            MountsFormat::Mounts => {
+                format!("{source} {mountpoint} {fs_type} {mount_opts} 0 0\n")
+            }
+            MountsFormat::MountInfo => {
+                let mount_id: usize = mfs.mount_id().into();
+                let parent_id: usize = mfs
+                    .self_mountpoint()
+                    .map(|mountpoint_inode| {
+                        let parent_id: usize = mountpoint_inode.mount_fs().mount_id().into();
+                        parent_id
+                    })
+                    .unwrap_or(mount_id);
+                let dev = mount_dev_display(&mfs);
+                let root = escape_mount_field(&mount_root_display(&mfs));
+                let optional_fields = mountinfo_optional_fields(&mfs);
+
+                format!(
+                    "{mount_id} {parent_id} {}:{} {root} {mountpoint} {mount_opts}{optional_fields} - {fs_type} {source} {mount_opts}\n",
+                    dev.major().data(),
+                    dev.minor()
+                )
+            }
+        };
+
+        cap += line.len();
+        lines.push(line);
+    }
+
+    let mut content = String::with_capacity(cap);
+    for line in lines {
+        content.push_str(&line);
+    }
+    content
+}
+
+fn generate_mounts_like_content_for_task(
+    task: &Arc<ProcessControlBlock>,
+    fmt: MountsFormat,
+) -> String {
+    let nsproxy = task.nsproxy();
+    let fs = task.fs_struct();
+    generate_mounts_like_content_for_view(nsproxy.mnt_namespace(), fs.root(), fmt)
+}
+
+pub(super) fn cache_procfs_file_content(
+    data: &mut MutexGuard<FilePrivateData>,
+    content: String,
+) -> Result<(), SystemError> {
+    let FilePrivateData::Procfs(pdata) = &mut **data else {
+        return Err(SystemError::EIO);
+    };
+    pdata.data = content.into_bytes();
+    Ok(())
+}
+
+pub(super) fn read_cached_procfs_file_content(
+    offset: usize,
+    len: usize,
+    buf: &mut [u8],
+    data: MutexGuard<FilePrivateData>,
+) -> Result<usize, SystemError> {
+    let bytes = match &*data {
+        FilePrivateData::Procfs(pdata) => pdata.data.as_slice(),
+        _ => return Err(SystemError::EIO),
+    };
+
+    proc_read(offset, len, buf, bytes)
+}
+
+impl FileOps for MountsFileOps {
+    fn open(&self, data: &mut MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
+        cache_procfs_file_content(data, generate_mounts_content())
+    }
+
+    fn read_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        read_cached_procfs_file_content(offset, len, buf, data)
+    }
+}
+
+/// 为 /proc/<pid>/mountinfo 生成内容（目标任务视角）。
+pub(super) fn generate_mountinfo_content_for_task(task: &Arc<ProcessControlBlock>) -> String {
+    generate_mounts_like_content_for_task(task, MountsFormat::MountInfo)
 }
 
 /// 为 /proc/<pid>/mounts 生成内容。
 pub(super) fn generate_mounts_content() -> String {
-    generate_mounts_like_content(MountsFormat::Mounts)
+    let current = ProcessManager::current_pcb();
+    generate_mounts_like_content_for_task(&current, MountsFormat::Mounts)
+}
+
+/// 为 /proc/<pid>/mounts 生成内容（目标任务视角）。
+pub(super) fn generate_mounts_content_for_task(task: &Arc<ProcessControlBlock>) -> String {
+    generate_mounts_like_content_for_task(task, MountsFormat::Mounts)
 }

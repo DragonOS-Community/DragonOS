@@ -12,8 +12,8 @@ use crate::{
 };
 
 use super::{
-    abi::WaitOption, resource::RUsage, ProcessControlBlock, ProcessFlags, ProcessManager,
-    ProcessState, RawPid,
+    abi::WaitOption, dec_visible_thread_count, resource::RUsage, ProcessControlBlock, ProcessFlags,
+    ProcessManager, ProcessState, RawPid,
 };
 
 /// 将内核中保存的 wstatus（已经按 wait4 语义左移过的编码值）
@@ -1049,6 +1049,9 @@ impl ProcessControlBlock {
         if should_defer_unhash_for_group_exec(self, group_dead) {
             self.flags().insert(ProcessFlags::DEFER_UNHASH);
         } else {
+            if self.raw_pid() > RawPid(0) {
+                dec_visible_thread_count();
+            }
             self.detach_pid(PidType::PID);
             if group_dead {
                 self.detach_pid(PidType::TGID);
@@ -1073,6 +1076,9 @@ impl ProcessControlBlock {
             return;
         }
         self.flags().remove(ProcessFlags::DEFER_UNHASH);
+        if self.raw_pid() > RawPid(0) {
+            dec_visible_thread_count();
+        }
         self.detach_pid(PidType::PID);
         if self.is_thread_group_leader() {
             self.detach_pid(PidType::TGID);

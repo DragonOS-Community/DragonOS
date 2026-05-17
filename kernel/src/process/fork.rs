@@ -28,7 +28,7 @@ use crate::{
 };
 
 use super::{
-    alloc_pid,
+    account_successful_fork, alloc_pid, inc_visible_thread_count,
     kthread::{KernelThreadPcbPrivate, WorkerPrivate},
     pid::{Pid, PidType},
     KernelStack, ProcessControlBlock, ProcessManager, RawPid,
@@ -919,6 +919,8 @@ impl ProcessManager {
             cgroup.charge_pids(1);
             cgroup.add_task(pcb.raw_pid());
             ProcessManager::add_pcb(pcb.clone());
+            inc_visible_thread_count();
+            account_successful_fork();
         }
 
         // 设置child_tid，意味着子线程能够知道自己的id。

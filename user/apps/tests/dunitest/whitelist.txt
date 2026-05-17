@@ -18,4 +18,5 @@ normal/tcp_close_semantics
 fuse/fuse_core
 fuse/fuse_extended
 normal/test_procfs_link
+normal/proc_pid_mounts_target_view
 normal/user_namespace_id_map

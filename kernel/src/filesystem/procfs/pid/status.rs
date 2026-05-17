@@ -6,13 +6,13 @@ use crate::libs::mutex::MutexGuard;
 use crate::{
     filesystem::{
         procfs::{
-            pid::find_process_by_vpid,
+            pid::ProcPidTarget,
             template::{Builder, FileOps, ProcFileBuilder},
             utils::{proc_read, trim_string},
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    process::RawPid,
+    process::pid::PidType,
 };
 use alloc::{
     borrow::ToOwned,
@@ -26,17 +26,16 @@ use system_error::SystemError;
 /// /proc/[pid]/status 文件的 FileOps 实现
 #[derive(Debug)]
 pub struct StatusFileOps {
-    /// 存储 PID，在读取时动态查找进程
-    pid: RawPid,
+    target: ProcPidTarget,
 }
 
 impl StatusFileOps {
-    pub fn new(pid: RawPid) -> Self {
-        Self { pid }
+    pub fn new(target: ProcPidTarget) -> Self {
+        Self { target }
     }
 
-    pub fn new_inode(pid: RawPid, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcFileBuilder::new(Self::new(pid), InodeMode::S_IRUGO)
+    pub fn new_inode(target: ProcPidTarget, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcFileBuilder::new(Self::new(target), InodeMode::S_IRUGO)
             .parent(parent)
             .build()
             .unwrap()
@@ -44,8 +43,11 @@ impl StatusFileOps {
 
     /// 生成 status 文件内容
     fn generate_status_content(&self) -> Result<Vec<u8>, SystemError> {
-        // 动态查找进程，确保获取最新状态
-        let pcb = find_process_by_vpid(self.pid).ok_or(SystemError::ESRCH)?;
+        let pcb = self
+            .target
+            .thread_group_leader()
+            .ok_or(SystemError::ESRCH)?;
+        let view_pid_ns = self.target.view_pid_ns();
         let mut pdata = Vec::new();
 
         // Name
@@ -71,19 +73,11 @@ impl StatusFileOps {
         pdata.append(&mut format!("\nState:\t{:?}", state).as_bytes().to_owned());
 
         // Tgid
-        pdata.append(
-            &mut format!(
-                "\nTgid:\t{}",
-                pcb.task_tgid_vnr()
-                    .unwrap_or(crate::process::RawPid::new(0))
-                    .into()
-            )
-            .into(),
-        );
+        pdata.append(&mut format!("\nTgid:\t{}", self.target.tgid().data()).into());
 
         // Pid
         pdata.append(
-            &mut format!("\nPid:\t{}", pcb.task_pid_vnr().data())
+            &mut format!("\nPid:\t{}", self.target.vpid().data())
                 .as_bytes()
                 .to_owned(),
         );
@@ -93,8 +87,9 @@ impl StatusFileOps {
             &mut format!(
                 "\nPpid:\t{}",
                 pcb.parent_pcb()
-                    .map(|p| p.task_pid_vnr().data() as isize)
-                    .unwrap_or(-1)
+                    .and_then(|p| p.task_pid_ptr(PidType::TGID))
+                    .map(|pid| pid.pid_nr_ns(view_pid_ns).data() as isize)
+                    .unwrap_or(0)
             )
             .as_bytes()
             .to_owned(),

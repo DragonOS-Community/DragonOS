@@ -9,7 +9,7 @@ use crate::{
     arch::MMArch,
     filesystem::{
         procfs::{
-            pid::find_process_by_vpid,
+            pid::ProcPidTarget,
             template::{Builder, FileOps, ProcFileBuilder},
             utils::proc_read,
         },
@@ -29,12 +29,12 @@ use system_error::SystemError;
 /// /proc/[pid]/stat 文件的 FileOps 实现
 #[derive(Debug)]
 pub struct StatFileOps {
-    pid: RawPid,
+    target: ProcPidTarget,
 }
 
 impl StatFileOps {
-    pub fn new_inode(pid: RawPid, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcFileBuilder::new(Self { pid }, InodeMode::S_IRUGO)
+    pub fn new_inode(target: ProcPidTarget, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcFileBuilder::new(Self { target }, InodeMode::S_IRUGO)
             .parent(parent)
             .build()
             .unwrap()
@@ -150,7 +150,7 @@ impl FileOps for StatFileOps {
         buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let pcb = find_process_by_vpid(self.pid).ok_or(SystemError::ESRCH)?;
+        let pcb = self.target.task().ok_or(SystemError::ESRCH)?;
 
         let comm = pcb.basic().name().to_string();
         let sched = pcb.sched_info();
@@ -158,10 +158,11 @@ impl FileOps for StatFileOps {
 
         let ppid = pcb
             .parent_pcb()
-            .map(|p| p.raw_pid())
+            .and_then(|p| p.task_pid_ptr(PidType::TGID))
+            .map(|pid| pid.pid_nr_ns(self.target.view_pid_ns()))
             .unwrap_or(RawPid::new(0));
 
-        let content = generate_linux_proc_stat_line(self.pid, &comm, state, ppid, &pcb);
+        let content = generate_linux_proc_stat_line(self.target.vpid(), &comm, state, ppid, &pcb);
         proc_read(offset, len, buf, content.as_bytes())
     }
 }

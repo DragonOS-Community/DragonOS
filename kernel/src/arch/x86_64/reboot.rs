@@ -10,12 +10,27 @@ use super::{
 use crate::{
     arch::{driver::apic::CurrentApic, io::PortIOArch, CurrentPortIOArch, MMArch},
     driver::acpi::reboot::{acpi_poweroff_probe_status, acpi_reboot},
-    exception::InterruptArch,
+    exception::{
+        ipi::{IpiKind, IpiTarget},
+        InterruptArch,
+    },
+    libs::cpumask::CpuMask,
     misc::reboot::do_machine_power_off,
     mm::{MemoryManagementArch, PhysAddr},
+    process::ProcessManager,
+    sched::{request_task_migration, schedule, SchedMode},
+    smp::{
+        core::smp_get_processor_id,
+        cpu::{smp_cpu_manager, ProcessorId},
+    },
     time::{sleep::nanosleep, PosixTimeSpec},
 };
-use core::{arch::asm, ptr};
+use core::{
+    arch::asm,
+    hint::spin_loop,
+    ptr,
+    sync::atomic::{AtomicBool, Ordering},
+};
 use log::debug;
 use x86::dtables::{lidt, DescriptorTablePointer};
 
@@ -49,6 +64,8 @@ enum RebootMode {
 
 static mut REBOOT_FORCE: bool = false;
 static mut REBOOT_MODE: RebootMode = RebootMode::RebootUndefined;
+static STOPPING_CPUS: AtomicBool = AtomicBool::new(false);
+const STOP_OTHER_CPUS_TIMEOUT_LOOPS: usize = 10_000_000;
 
 /// # 功能
 ///
@@ -109,10 +126,84 @@ fn machine_shutdown() {
         CurrentIrqArch::interrupt_disable();
     }
 
+    stop_other_cpus();
     CurrentApic.lapic_shutdown();
 
     // 禁用HPET
     hpet_disable();
+}
+
+/// Migrate the current shutdown task to the reboot CPU.
+///
+/// Linux pins the shutdown task to reboot_cpu before syscore_shutdown, so the
+/// later shutdown sequence does not run on an AP that is about to be stopped.
+pub(crate) fn migrate_to_reboot_cpu() {
+    let reboot_cpu = ProcessorId::new(0);
+    let dest_cpu = if smp_cpu_manager().is_online_cpu(reboot_cpu) {
+        reboot_cpu
+    } else {
+        smp_cpu_manager()
+            .present_cpus()
+            .iter_cpu()
+            .find(|&cpu| smp_cpu_manager().is_online_cpu(cpu))
+            .unwrap_or_else(smp_get_processor_id)
+    };
+
+    let current = ProcessManager::current_pcb();
+    current
+        .sched_info()
+        .set_cpus_allowed(CpuMask::from_cpu(dest_cpu));
+
+    if smp_get_processor_id() != dest_cpu {
+        if let Err(e) = request_task_migration(&current, dest_cpu) {
+            log::warn!(
+                "migrate_to_reboot_cpu: failed to migrate to CPU {}: {e:?}",
+                dest_cpu.data()
+            );
+            return;
+        }
+        schedule(SchedMode::SM_NONE);
+    }
+}
+
+fn stop_other_cpus() {
+    if STOPPING_CPUS.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let this_cpu = smp_get_processor_id();
+    let mut targets = CpuMask::new();
+
+    for cpu in smp_cpu_manager().present_cpus().iter_cpu() {
+        if cpu != this_cpu && smp_cpu_manager().is_online_cpu(cpu) {
+            targets.set(cpu, true);
+        }
+    }
+
+    if targets.is_empty() {
+        return;
+    }
+
+    crate::arch::interrupt::ipi::send_ipi(IpiKind::StopCpu, IpiTarget::Other);
+
+    for _ in 0..STOP_OTHER_CPUS_TIMEOUT_LOOPS {
+        if targets
+            .iter_cpu()
+            .all(|cpu| !smp_cpu_manager().is_online_cpu(cpu))
+        {
+            return;
+        }
+        spin_loop();
+    }
+
+    for cpu in targets.iter_cpu() {
+        if smp_cpu_manager().is_online_cpu(cpu) {
+            log::warn!(
+                "stop_other_cpus: CPU {} did not stop before timeout",
+                cpu.data()
+            );
+        }
+    }
 }
 
 /// # 功能

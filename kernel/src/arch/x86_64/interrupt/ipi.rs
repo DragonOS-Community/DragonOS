@@ -6,6 +6,7 @@ use x86::apic::ApicId;
 use crate::{
     arch::{
         driver::apic::{lapic_vector::local_apic_chip, CurrentApic, LocalAPIC},
+        process::stop_this_cpu,
         smp::SMP_BOOT_DATA,
     },
     exception::{
@@ -21,12 +22,14 @@ use super::TrapFrame;
 
 pub const IPI_NUM_KICK_CPU: IrqNumber = IrqNumber::new(200);
 pub const IPI_NUM_FLUSH_TLB: IrqNumber = IrqNumber::new(201);
+pub const IPI_NUM_STOP_CPU: IrqNumber = IrqNumber::new(202);
 /// IPI的种类(架构相关，指定了向量号)
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[repr(u32)]
 pub enum ArchIpiKind {
     KickCpu = IPI_NUM_KICK_CPU.data(),
     FlushTLB = IPI_NUM_FLUSH_TLB.data(),
+    StopCpu = IPI_NUM_STOP_CPU.data(),
     SpecVector(HardwareIrqNumber),
 }
 
@@ -35,6 +38,7 @@ impl From<IpiKind> for ArchIpiKind {
         match kind {
             IpiKind::KickCpu => ArchIpiKind::KickCpu,
             IpiKind::FlushTLB => ArchIpiKind::FlushTLB,
+            IpiKind::StopCpu => ArchIpiKind::StopCpu,
             IpiKind::SpecVector(vec) => ArchIpiKind::SpecVector(vec),
         }
     }
@@ -45,6 +49,7 @@ impl From<ArchIpiKind> for u8 {
         match value {
             ArchIpiKind::KickCpu => IPI_NUM_KICK_CPU.data() as u8,
             ArchIpiKind::FlushTLB => IPI_NUM_FLUSH_TLB.data() as u8,
+            ArchIpiKind::StopCpu => IPI_NUM_STOP_CPU.data() as u8,
             ArchIpiKind::SpecVector(vec) => (vec.data() & 0xFF) as u8,
         }
     }
@@ -267,6 +272,7 @@ pub fn ipi_send_smp_startup(target_cpu: ProcessorId) -> Result<(), SystemError> 
 pub fn arch_ipi_handler_init() {
     do_init_irq_handler(IPI_NUM_KICK_CPU);
     do_init_irq_handler(IPI_NUM_FLUSH_TLB);
+    do_init_irq_handler(IPI_NUM_STOP_CPU);
 }
 
 fn do_init_irq_handler(irq: IrqNumber) {
@@ -293,6 +299,10 @@ impl IrqFlowHandler for X86_64IpiIrqFlowHandler {
             IPI_NUM_FLUSH_TLB => {
                 FlushTLBIpiHandler.handle(irq, None, None).ok();
                 CurrentApic.send_eoi();
+            }
+            IPI_NUM_STOP_CPU => {
+                CurrentApic.send_eoi();
+                stop_this_cpu();
             }
             _ => {
                 error!("Unknown IPI: {}", irq.data());

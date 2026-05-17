@@ -22,6 +22,7 @@ pub fn send_ipi(kind: IpiKind, target: IpiTarget) {
     let mask = Into::into(target);
     match kind {
         IpiKind::KickCpu => todo!(),
+        IpiKind::StopCpu => todo!(),
         IpiKind::FlushTLB => RiscV64MMArch::remote_invalidate_all_with_mask(mask).ok(),
         IpiKind::SpecVector(_) => todo!(),
     };

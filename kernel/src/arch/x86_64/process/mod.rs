@@ -655,7 +655,7 @@ unsafe extern "sysv64" fn ready_to_switch_to_user(
 /// # 功能
 ///
 /// 停止当前CPU的运行，系统进入最终的停机状态
-pub(super) fn stop_this_cpu() -> ! {
+pub(crate) fn stop_this_cpu() -> ! {
     let cpu_id = current_cpu_id();
 
     unsafe {

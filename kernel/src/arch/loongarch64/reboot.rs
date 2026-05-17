@@ -23,3 +23,5 @@ pub(crate) fn machine_power_off() -> ! {
         spin_loop();
     }
 }
+
+pub(crate) fn migrate_to_reboot_cpu() {}

@@ -126,20 +126,27 @@ pub struct XApic {
 }
 
 impl XApic {
+    /// Read the register at the specified APIC MMIO offset.
+    pub(super) unsafe fn read_offset(&self, reg: u32) -> u32 {
+        read_volatile((self.apic_vaddr.data() + reg as usize) as *const u32)
+    }
+
+    /// Write the register at the specified APIC MMIO offset.
+    pub(super) unsafe fn write_offset(&self, reg: u32, value: u32) {
+        write_volatile((self.apic_vaddr.data() + reg as usize) as *mut u32, value);
+        self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ID);
+    }
+
     /// 读取指定寄存器的值
     #[allow(dead_code)]
     pub unsafe fn read(&self, reg: XApicOffset) -> u32 {
-        read_volatile((self.apic_vaddr.data() + reg as usize) as *const u32)
+        self.read_offset(reg as u32)
     }
 
     /// 将指定的值写入寄存器
     #[allow(dead_code)]
     pub unsafe fn write(&self, reg: XApicOffset, value: u32) {
-        write_volatile(
-            (self.apic_vaddr.data() + (reg as u32) as usize) as *mut u32,
-            value,
-        );
-        self.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ID); // 等待写操作完成，通过读取进行同步
+        self.write_offset(reg as u32, value);
     }
 }
 

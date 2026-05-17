@@ -40,6 +40,26 @@ impl SetAttr {
 }
 
 impl Ext4 {
+    fn read_extent_or_hole(
+        &self,
+        file: &InodeRef,
+        iblock: LBlockId,
+        block_offset: usize,
+        buf: &mut [u8],
+    ) -> Result<()> {
+        match self.extent_query(file, iblock) {
+            Ok(fblock) => {
+                let block = self.read_block(fblock)?;
+                buf.copy_from_slice(block.read_offset(block_offset, buf.len()));
+            }
+            Err(err) if err.code() == ErrCode::ENOENT => {
+                buf.fill(0);
+            }
+            Err(err) => return Err(err),
+        }
+        Ok(())
+    }
+
     /// Get file attributes.
     ///
     /// # Params
@@ -94,6 +114,7 @@ impl Ext4 {
     ///
     /// `EINVAL` if the inode is invalid (mode == 0).
     pub fn setattr(&self, id: InodeId, attr: SetAttr) -> Result<()> {
+        let _mutation_guard = self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
         let mut inode = self.read_inode(id)?;
         if inode.inode.mode().bits() == 0 {
             return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
@@ -108,36 +129,6 @@ impl Ext4 {
             inode.inode.set_gid(gid);
         }
         if let Some(size) = attr.size {
-            // If size increases, allocate new blocks if needed.
-            // Use BLOCK_SIZE (4096) units, consistent with inode_append_block.
-            let required_fs_blocks = (size as usize).div_ceil(BLOCK_SIZE) as u64;
-            // Compute data-only block count from extent tree (not from i_blocks,
-            // which may include tree metadata blocks).
-            let data_fs_blocks = self.extent_next_data_lblock(&inode)? as u64;
-            if required_fs_blocks > data_fs_blocks {
-                // debug!(
-                //     "setattr grow: ino={} size={} cur_fsblk={} req_fsblk={}",
-                //     id, size, data_fs_blocks, required_fs_blocks
-                // );
-                for i in data_fs_blocks..required_fs_blocks {
-                    if let Err(e) = self.inode_append_block(&mut inode) {
-                        debug!(
-                            "setattr: inode_append_block FAILED at block {}/{}: ino={} err={:?}",
-                            i, required_fs_blocks, id, e
-                        );
-                        return Err(e);
-                    }
-                }
-                // Recompute i_blocks: data blocks + tree metadata blocks
-                let tree_blocks = self.extent_all_tree_blocks(&inode)?.len() as u64;
-                let data_sectors = required_fs_blocks * (BLOCK_SIZE / INODE_BLOCK_SIZE) as u64;
-                let tree_sectors = tree_blocks * (BLOCK_SIZE / INODE_BLOCK_SIZE) as u64;
-                inode.inode.set_block_count(data_sectors + tree_sectors);
-                // debug!(
-                //     "setattr done: ino={} final_fsblk={}",
-                //     id, inode.inode.fs_block_count()
-                // );
-            }
             inode.inode.set_size(size);
         }
         if let Some(atime) = attr.atime {
@@ -156,54 +147,125 @@ impl Ext4 {
         Ok(())
     }
 
-    /// Pre-allocate disk blocks so that the inode can hold at least `size`
-    /// bytes, **without** updating `i_size`.
-    ///
-    /// This is the first half of a two-phase write protocol:
-    ///   1. `allocate_blocks_for_write` – ensure extents exist (before page-cache write)
-    ///   2. `commit_inode_size`         – update `i_size` (after page-cache write succeeds)
-    ///
-    /// If the required blocks are already allocated this is a no-op.
-    pub fn allocate_blocks_for_write(&self, id: InodeId, size: u64) -> Result<()> {
+    fn recompute_inode_block_count(&self, inode: &mut InodeRef) -> Result<()> {
+        let data_blocks = self.extent_all_data_blocks(inode)?.len() as u64;
+        let tree_blocks = self.extent_all_tree_blocks(inode)?.len() as u64;
+        let sectors_per_block = (BLOCK_SIZE / INODE_BLOCK_SIZE) as u64;
+        inode
+            .inode
+            .set_block_count((data_blocks + tree_blocks) * sectors_per_block);
+        Ok(())
+    }
+
+    fn ensure_blocks_for_write_range_locked(
+        &self,
+        inode: &mut InodeRef,
+        offset: usize,
+        len: usize,
+    ) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let end = offset.checked_add(len).ok_or(format_error!(
+            ErrCode::EFBIG,
+            "write range overflow: offset={} len={}",
+            offset,
+            len
+        ))?;
+        let start_iblock = (offset / BLOCK_SIZE) as LBlockId;
+        let end_iblock = ((end - 1) / BLOCK_SIZE) as LBlockId;
+        let mut changed = false;
+        for iblock in start_iblock..=end_iblock {
+            match self.extent_query(inode, iblock) {
+                Ok(_) => {}
+                Err(err) if err.code() == ErrCode::ENOENT => {
+                    self.extent_query_or_create(inode, iblock, 1)?;
+                    self.extent_query(inode, iblock).map_err(|err| {
+                        format_error!(
+                            ErrCode::EIO,
+                            "extent allocation invariant failed: inode {} iblock {} missing after create: {:?}",
+                            inode.id,
+                            iblock,
+                            err
+                        )
+                    })?;
+                    changed = true;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        if changed {
+            self.recompute_inode_block_count(inode)?;
+            self.write_inode_with_csum(inode)?;
+        }
+        Ok(())
+    }
+
+    /// Ensure extents exist for the bytes that will actually be written.
+    pub fn allocate_blocks_for_write_range(
+        &self,
+        id: InodeId,
+        offset: usize,
+        len: usize,
+    ) -> Result<()> {
+        let _mutation_guard = self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
         let mut inode = self.read_inode(id)?;
         if inode.inode.mode().bits() == 0 {
             return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
         }
-        let required_fs_blocks = (size as usize).div_ceil(BLOCK_SIZE) as u64;
-        let data_fs_blocks = self.extent_next_data_lblock(&inode)? as u64;
-        if required_fs_blocks > data_fs_blocks {
-            for i in data_fs_blocks..required_fs_blocks {
-                if let Err(e) = self.inode_append_block(&mut inode) {
-                    debug!(
-                        "allocate_blocks_for_write: FAILED at block {}/{}: ino={} err={:?}",
-                        i, required_fs_blocks, id, e
-                    );
-                    return Err(e);
-                }
-            }
-            // Recompute i_blocks: data blocks + extent-tree metadata blocks
-            let tree_blocks = self.extent_all_tree_blocks(&inode)?.len() as u64;
-            let data_sectors = required_fs_blocks * (BLOCK_SIZE / INODE_BLOCK_SIZE) as u64;
-            let tree_sectors = tree_blocks * (BLOCK_SIZE / INODE_BLOCK_SIZE) as u64;
-            inode.inode.set_block_count(data_sectors + tree_sectors);
-            self.write_inode_with_csum(&mut inode)?;
+        self.ensure_blocks_for_write_range_locked(&mut inode, offset, len)
+    }
+
+    /// Prepare a buffered write by allocating only the written range.
+    ///
+    /// The caller owns the in-memory visible size used by page-cache writeback
+    /// and should call `commit_inode_size()` at fsync/truncate-style sync
+    /// boundaries.
+    pub fn prepare_buffered_write(
+        &self,
+        id: InodeId,
+        offset: usize,
+        len: usize,
+        _size: u64,
+        _mtime: Option<u32>,
+    ) -> Result<()> {
+        let _mutation_guard = self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
+        let mut inode = self.read_inode(id)?;
+        if inode.inode.mode().bits() == 0 {
+            return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
         }
+        self.ensure_blocks_for_write_range_locked(&mut inode, offset, len)?;
+        Ok(())
+    }
+
+    /// Commit cached inode metadata to disk without allocating data blocks.
+    pub fn commit_inode_metadata(
+        &self,
+        id: InodeId,
+        size: Option<u64>,
+        mtime: Option<u32>,
+    ) -> Result<()> {
+        let _mutation_guard = self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
+        let mut inode = self.read_inode(id)?;
+        if inode.inode.mode().bits() == 0 {
+            return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
+        }
+        if let Some(size) = size {
+            inode.inode.set_size(size);
+        }
+        if let Some(mtime) = mtime {
+            inode.inode.set_mtime(mtime);
+        }
+        self.write_inode_with_csum(&mut inode)?;
         Ok(())
     }
 
     /// Commit the file size (`i_size`) and optionally `mtime` to disk,
     /// **without** allocating any blocks.
     ///
-    /// Call this after `allocate_blocks_for_write` + successful page-cache
-    /// write to finalise the new file size.
+    /// Call this after successful page-cache write to finalise the new file size.
     pub fn commit_inode_size(&self, id: InodeId, size: u64, mtime: Option<u32>) -> Result<()> {
-        let mut inode = self.read_inode(id)?;
-        inode.inode.set_size(size);
-        if let Some(mtime) = mtime {
-            inode.inode.set_mtime(mtime);
-        }
-        self.write_inode_with_csum(&mut inode)?;
-        Ok(())
+        self.commit_inode_metadata(id, Some(size), mtime)
     }
 
     /// Link a newly created inode into `parent`.
@@ -340,8 +402,12 @@ impl Ext4 {
         if buf.is_empty() {
             return Ok(0);
         }
+        let file_size = file.inode.size() as usize;
+        if offset >= file_size {
+            return Ok(0);
+        }
         // Calc the actual size to read
-        let read_size = min(buf.len(), file.inode.size() as usize - offset);
+        let read_size = min(buf.len(), file_size - offset);
         // Calc the start block of reading
         let start_iblock = (offset / BLOCK_SIZE) as LBlockId;
         // Calc the length that is not aligned to the block size
@@ -352,27 +418,19 @@ impl Ext4 {
         // Read first block
         if misaligned > 0 {
             let read_len = min(BLOCK_SIZE - misaligned, read_size);
-            let fblock = self.extent_query(&file, start_iblock)?;
-            let block = self.read_block(fblock)?;
-            // Copy data from block to the user buffer
-            buf[cursor..cursor + read_len].copy_from_slice(block.read_offset(misaligned, read_len));
+            self.read_extent_or_hole(
+                &file,
+                start_iblock,
+                misaligned,
+                &mut buf[cursor..cursor + read_len],
+            )?;
             cursor += read_len;
             iblock += 1;
         }
         // Continue with full block reads
         while cursor < read_size {
             let read_len = min(BLOCK_SIZE, read_size - cursor);
-            match self.extent_query(&file, iblock) {
-                Ok(fblock) => {
-                    // normal
-                    let block = self.read_block(fblock)?;
-                    buf[cursor..cursor + read_len].copy_from_slice(block.read_offset(0, read_len));
-                }
-                Err(_) => {
-                    // hole
-                    buf[cursor..cursor + read_len].fill(0);
-                }
-            }
+            self.read_extent_or_hole(&file, iblock, 0, &mut buf[cursor..cursor + read_len])?;
             cursor += read_len;
             iblock += 1;
         }
@@ -416,24 +474,18 @@ impl Ext4 {
         let mut iblock = start_iblock;
         if misaligned > 0 {
             let read_len = min(BLOCK_SIZE - misaligned, read_size);
-            let fblock = self.extent_query(&inode_ref, start_iblock)?;
-            let block = self.read_block(fblock)?;
-            buf[cursor..cursor + read_len].copy_from_slice(block.read_offset(misaligned, read_len));
+            self.read_extent_or_hole(
+                &inode_ref,
+                start_iblock,
+                misaligned,
+                &mut buf[cursor..cursor + read_len],
+            )?;
             cursor += read_len;
             iblock += 1;
         }
         while cursor < read_size {
             let read_len = min(BLOCK_SIZE, read_size - cursor);
-            match self.extent_query(&inode_ref, iblock) {
-                Ok(fblock) => {
-                    let block = self.read_block(fblock)?;
-                    buf[cursor..cursor + read_len].copy_from_slice(block.read_offset(0, read_len));
-                }
-                Err(_) => {
-                    // hole
-                    buf[cursor..cursor + read_len].fill(0);
-                }
-            }
+            self.read_extent_or_hole(&inode_ref, iblock, 0, &mut buf[cursor..cursor + read_len])?;
             cursor += read_len;
             iblock += 1;
         }
@@ -458,25 +510,23 @@ impl Ext4 {
     /// * `EISDIR` - `file` is not a regular file
     /// * `ENOSPC` - no space left on device
     pub fn write(&self, file: InodeId, offset: usize, data: &[u8]) -> Result<usize> {
+        let write_size = data.len();
+        if write_size == 0 {
+            return Ok(0);
+        }
         // Get the inode of the file
+        let _mutation_guard =
+            self.inode_mutation_locks[self.inode_mutation_lock_index(file)].lock();
         let mut file = self.read_inode(file)?;
         if !file.inode.is_file() {
             return_error!(ErrCode::EISDIR, "Inode {} is not a file", file.id);
         }
 
-        let write_size = data.len();
-        // Calc the start and end block of writing
-        let start_iblock = (offset / BLOCK_SIZE) as LBlockId;
-        let end_iblock = ((offset + write_size) / BLOCK_SIZE) as LBlockId;
-        // Append enough block for writing
-        let append_block_count = end_iblock as i64 + 1 - file.inode.fs_block_count() as i64;
-        for _ in 0..append_block_count {
-            self.inode_append_block(&mut file)?;
-        }
+        self.ensure_blocks_for_write_range_locked(&mut file, offset, write_size)?;
 
         // Write data
         let mut cursor = 0;
-        let mut iblock = start_iblock;
+        let mut iblock = (offset / BLOCK_SIZE) as LBlockId;
         while cursor < write_size {
             let block_offset = (offset + cursor) % BLOCK_SIZE;
             let write_len = min(BLOCK_SIZE - block_offset, write_size - cursor);
@@ -487,8 +537,14 @@ impl Ext4 {
             cursor += write_len;
             iblock += 1;
         }
-        if offset + cursor > file.inode.size() as usize {
-            file.inode.set_size((offset + cursor) as u64);
+        let new_end = offset.checked_add(cursor).ok_or(format_error!(
+            ErrCode::EFBIG,
+            "write end overflow: offset={} len={}",
+            offset,
+            cursor
+        ))?;
+        if new_end > file.inode.size() as usize {
+            file.inode.set_size(new_end as u64);
         }
         self.write_inode_with_csum(&mut file)?;
 
@@ -498,7 +554,7 @@ impl Ext4 {
     /// Write data to pre-allocated blocks without modifying inode metadata.
     ///
     /// This is used by page cache writeback: blocks are already allocated by
-    /// `setattr(size=...)` in the foreground `write_at` path; the writeback
+    /// `prepare_buffered_write` in the foreground `write_at` path; the writeback
     /// thread only needs to push dirty page data to the corresponding
     /// physical blocks.
     ///
@@ -511,37 +567,46 @@ impl Ext4 {
     /// and background writeback, which can corrupt the extent tree when both
     /// operate on cloned `InodeRef` snapshots from the inode cache.
     pub fn write_data_only(&self, file: InodeId, offset: usize, data: &[u8]) -> Result<usize> {
-        let file = self.read_inode(file)?;
-        if !file.inode.is_file() {
-            return_error!(ErrCode::EISDIR, "Inode {} is not a file", file.id);
-        }
-
         let write_size = data.len();
-        let mut cursor = 0;
-        let mut iblock = (offset / BLOCK_SIZE) as LBlockId;
-        while cursor < write_size {
-            let block_offset = (offset + cursor) % BLOCK_SIZE;
-            let write_len = min(BLOCK_SIZE - block_offset, write_size - cursor);
-            match self.extent_query(&file, iblock) {
-                Ok(fblock) => {
-                    let mut block = self.read_block(fblock)?;
-                    block.write_offset(block_offset, &data[cursor..cursor + write_len]);
-                    self.write_block(&block)?;
-                }
-                Err(e) => {
-                    debug!(
-                        "write_data_only: extent_query FAILED ino={} iblock={} offset={} len={} fs_blkcnt={} size={} err={:?}",
-                        file.id, iblock, offset, write_size,
-                        file.inode.fs_block_count(), file.inode.size(), e
-                    );
-                    return Err(e);
-                }
+        let mut chunks = Vec::new();
+        {
+            let _mutation_guard =
+                self.inode_mutation_locks[self.inode_mutation_lock_index(file)].lock();
+            let file = self.read_inode(file)?;
+            if !file.inode.is_file() {
+                return_error!(ErrCode::EISDIR, "Inode {} is not a file", file.id);
             }
-            cursor += write_len;
-            iblock += 1;
+
+            let mut cursor = 0;
+            let mut iblock = (offset / BLOCK_SIZE) as LBlockId;
+            while cursor < write_size {
+                let block_offset = (offset + cursor) % BLOCK_SIZE;
+                let write_len = min(BLOCK_SIZE - block_offset, write_size - cursor);
+                match self.extent_query(&file, iblock) {
+                    Ok(fblock) => {
+                        chunks.push((fblock, block_offset, cursor, write_len));
+                    }
+                    Err(e) => {
+                        debug!(
+                            "write_data_only: extent_query FAILED ino={} iblock={} offset={} len={} fs_blkcnt={} size={} err={:?}",
+                            file.id, iblock, offset, write_size,
+                            file.inode.fs_block_count(), file.inode.size(), e
+                        );
+                        return Err(e);
+                    }
+                }
+                cursor += write_len;
+                iblock += 1;
+            }
         }
 
-        Ok(cursor)
+        for (fblock, block_offset, cursor, write_len) in chunks {
+            let mut block = self.read_block(fblock)?;
+            block.write_offset(block_offset, &data[cursor..cursor + write_len]);
+            self.write_block(&block)?;
+        }
+
+        Ok(write_size)
     }
 
     /// Create a hard link. This function will not check name conflict,
@@ -1160,5 +1225,82 @@ impl Ext4 {
         }
         let xattr_block = XattrBlock::new(self.read_block(xattr_block_id)?);
         Ok(xattr_block.list())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct StubBlockDevice {
+        sb_block: Block,
+    }
+
+    impl StubBlockDevice {
+        fn with_block_count(block_count: u32) -> Self {
+            let mut data = [0u8; BLOCK_SIZE];
+            let off = BASE_OFFSET;
+            data[off..off + 4].copy_from_slice(&block_count.to_le_bytes());
+            Self {
+                sb_block: Block::new(0, Box::new(data)),
+            }
+        }
+    }
+
+    impl BlockDevice for StubBlockDevice {
+        fn read_block(&self, block_id: PBlockId) -> Result<Block> {
+            if block_id == 0 {
+                Ok(self.sb_block.clone())
+            } else {
+                Ok(Block::new(block_id, Box::new([0u8; BLOCK_SIZE])))
+            }
+        }
+
+        fn write_block(&self, _block: &Block) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn make_test_fs(block_count: u32) -> Ext4 {
+        let block_device = Arc::new(StubBlockDevice::with_block_count(block_count));
+        let block = block_device.read_block(0).unwrap();
+        let sb = block.read_offset_as::<SuperBlock>(BASE_OFFSET);
+        Ext4 {
+            block_device,
+            cached_super_block: spin::Mutex::new(sb),
+            cached_block_groups: Vec::new(),
+            inode_cache: spin::Mutex::new(crate::ext4::InodeCache::new(16)),
+            alloc_lock: spin::Mutex::new(()),
+            inode_mutation_locks: (0..crate::ext4::INODE_MUTATION_LOCK_SHARDS)
+                .map(|_| spin::Mutex::new(()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn read_extent_or_hole_zero_fills_only_missing_extent() {
+        let fs = make_test_fs(16);
+        let mut inode = Inode::default();
+        inode.extent_init();
+        let inode = InodeRef::new(2, Box::new(inode));
+        let mut buf = [0x5a; 16];
+
+        fs.read_extent_or_hole(&inode, 0, 0, &mut buf).unwrap();
+
+        assert_eq!(buf, [0; 16]);
+    }
+
+    #[test]
+    fn read_extent_or_hole_propagates_extent_corruption() {
+        let fs = make_test_fs(16);
+        let inode = InodeRef::new(2, Box::new(Inode::default()));
+        let mut buf = [0x5a; 16];
+
+        let err = fs
+            .read_extent_or_hole(&inode, 0, 0, &mut buf)
+            .expect_err("invalid extent root must not be treated as a hole");
+
+        assert_eq!(err.code(), ErrCode::EIO);
+        assert_eq!(buf, [0x5a; 16]);
     }
 }

@@ -6,6 +6,19 @@ use crate::prelude::*;
 use crate::return_error;
 
 impl Ext4 {
+    fn block_group_first_block(sb: &SuperBlock, bgid: BlockGroupId) -> PBlockId {
+        bgid as PBlockId * sb.blocks_per_group() as PBlockId
+    }
+
+    fn block_group_block_count(sb: &SuperBlock, bgid: BlockGroupId) -> usize {
+        let first = Self::block_group_first_block(sb, bgid);
+        let total = sb.block_count();
+        if first >= total {
+            return 0;
+        }
+        core::cmp::min(sb.blocks_per_group() as u64, total - first) as usize
+    }
+
     /// Create a new inode, returning the inode and its number
     #[inline(never)]
     pub(super) fn create_inode(&self, mode: InodeMode) -> Result<InodeRef> {
@@ -148,52 +161,69 @@ impl Ext4 {
     pub(super) fn alloc_block(&self, inode: &mut InodeRef) -> Result<PBlockId> {
         let _alloc_guard = self.alloc_lock.lock();
         let mut sb = self.read_super_block_cached();
-
-        // Calc block group id
         let inodes_per_group = sb.inodes_per_group();
-        let bgid = ((inode.id - 1) / inodes_per_group) as BlockGroupId;
+        let preferred_bgid = ((inode.id - 1) / inodes_per_group) as BlockGroupId;
+        let bg_count = sb.block_group_count();
 
-        // Load block group descriptor
-        let mut bg = self.read_block_group(bgid)?;
+        for i in 0..bg_count {
+            let bgid = (preferred_bgid + i) % bg_count;
+            let blocks_in_group = Self::block_group_block_count(&sb, bgid);
+            if blocks_in_group == 0 {
+                continue;
+            }
 
-        // Load block bitmap
-        let bitmap_block_id = bg.desc.block_bitmap_block();
-        let mut bitmap_block = self.read_block(bitmap_block_id)?;
-        let mut bitmap = Bitmap::new(&mut *bitmap_block.data, 8 * BLOCK_SIZE);
+            // Load block group descriptor
+            let mut bg = self.read_block_group(bgid)?;
+            if bg.desc.get_free_blocks_count() == 0 {
+                continue;
+            }
 
-        // Find the first free block
-        let fblock = bitmap
-            .find_and_set_first_clear_bit(0, 8 * BLOCK_SIZE)
-            .ok_or(format_error!(
-                ErrCode::ENOSPC,
-                "No free blocks in block group {}",
-                bgid
-            ))? as PBlockId;
-        // Set block group checksum
-        bg.desc.set_block_bitmap_csum(&sb.uuid(), &bitmap);
-        self.write_block(&bitmap_block)?;
+            // Load block bitmap. Bits are relative to the start of this block group;
+            // extent physical block numbers are absolute filesystem block numbers.
+            let bitmap_block_id = bg.desc.block_bitmap_block();
+            let mut bitmap_block = self.read_block(bitmap_block_id)?;
+            let mut bitmap = Bitmap::new(&mut *bitmap_block.data, blocks_in_group);
 
-        // Update block group counters
-        bg.desc
-            .set_free_blocks_count(bg.desc.get_free_blocks_count() - 1);
-        self.write_block_group_with_csum(&mut bg)?;
+            let bit = match bitmap.find_and_set_first_clear_bit(0, blocks_in_group) {
+                Some(bit) => bit,
+                None => continue,
+            };
+            let fblock = Self::block_group_first_block(&sb, bgid) + bit as PBlockId;
 
-        // Update superblock counters
-        sb.set_free_blocks_count(sb.free_blocks_count() - 1);
-        self.write_super_block(&sb)?;
+            // Set block group checksum
+            bg.desc.set_block_bitmap_csum(&sb.uuid(), &bitmap);
+            self.write_block(&bitmap_block)?;
 
-        trace!("Alloc block {} ok", fblock);
-        Ok(fblock)
+            // Update block group counters
+            bg.desc
+                .set_free_blocks_count(bg.desc.get_free_blocks_count() - 1);
+            self.write_block_group_with_csum(&mut bg)?;
+
+            // Update superblock counters
+            sb.set_free_blocks_count(sb.free_blocks_count() - 1);
+            self.write_super_block(&sb)?;
+
+            trace!("Alloc block {} ok", fblock);
+            return Ok(fblock);
+        }
+
+        return_error!(ErrCode::ENOSPC, "No free blocks in filesystem");
     }
 
     /// Deallocate a physical block allocated for an inode
-    pub(super) fn dealloc_block(&self, inode: &mut InodeRef, pblock: PBlockId) -> Result<()> {
+    pub(super) fn dealloc_block(&self, _inode: &mut InodeRef, pblock: PBlockId) -> Result<()> {
         let _alloc_guard = self.alloc_lock.lock();
         let mut sb = self.read_super_block_cached();
+        if pblock >= sb.block_count() {
+            return_error!(ErrCode::EINVAL, "Invalid block {}", pblock);
+        }
 
-        // Calc block group id
-        let inodes_per_group = sb.inodes_per_group();
-        let bgid = ((inode.id - 1) / inodes_per_group) as BlockGroupId;
+        let bgid = (pblock / sb.blocks_per_group() as PBlockId) as BlockGroupId;
+        let bit = (pblock - Self::block_group_first_block(&sb, bgid)) as usize;
+        let blocks_in_group = Self::block_group_block_count(&sb, bgid);
+        if bit >= blocks_in_group {
+            return_error!(ErrCode::EINVAL, "Invalid block {}", pblock);
+        }
 
         // Load block group descriptor
         let mut bg = self.read_block_group(bgid)?;
@@ -201,13 +231,13 @@ impl Ext4 {
         // Load block bitmap
         let bitmap_block_id = bg.desc.block_bitmap_block();
         let mut bitmap_block = self.read_block(bitmap_block_id)?;
-        let mut bitmap = Bitmap::new(&mut *bitmap_block.data, 8 * BLOCK_SIZE);
+        let mut bitmap = Bitmap::new(&mut *bitmap_block.data, blocks_in_group);
 
         // Free the block
-        if bitmap.is_bit_clear(pblock as usize) {
+        if bitmap.is_bit_clear(bit) {
             return_error!(ErrCode::EINVAL, "Block {} is already free", pblock);
         }
-        bitmap.clear_bit(pblock as usize);
+        bitmap.clear_bit(bit);
         // Set block group checksum
         bg.desc.set_block_bitmap_csum(&sb.uuid(), &bitmap);
         self.write_block(&bitmap_block)?;

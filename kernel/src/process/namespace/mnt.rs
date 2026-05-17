@@ -273,13 +273,6 @@ impl MntNamespace {
         }
 
         let new_mntns = self.copy_with_mountfs(new_root_mntfs, user_ns);
-        new_mntns
-            .add_mount(
-                None,
-                Arc::new(MountPath::from("/")),
-                new_mntns.root_mntfs().clone(),
-            )
-            .expect("Failed to add root mount");
 
         for x in inner.mount_list.clone_inner().values() {
             if Arc::ptr_eq(x, new_mntns.root_mntfs()) {

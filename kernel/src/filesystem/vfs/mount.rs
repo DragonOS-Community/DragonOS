@@ -389,6 +389,10 @@ impl MountFS {
         self.namespace.try_get().and_then(|ns| ns.upgrade())
     }
 
+    pub fn clear_namespace(&self) {
+        self.namespace.take();
+    }
+
     /// check_mnt()：检查当前 MountFS 是否属于指定 mount namespace。
     pub fn is_belongs_to_mntns(&self, mntns: &Arc<MntNamespace>) -> bool {
         self.namespace().is_some_and(|ns| Arc::ptr_eq(&ns, mntns))
@@ -469,6 +473,7 @@ impl MountFS {
         if result.is_ok() {
             self.self_mountpoint.write().take();
             self.inner_filesystem.on_umount();
+            self.clear_namespace();
         }
 
         return result;
@@ -1164,6 +1169,8 @@ impl IndexNode for MountFSInode {
             });
 
         mntns.mount_list().remove(mount_path.as_str());
+        // umount() 清除了 namespace，迁移后需要重新设置。
+        new_mount_fs.set_namespace(Arc::downgrade(&mntns));
         ProcessManager::current_mntns()
             .add_mount(Some(metadata.inode_id), mount_path, new_mount_fs.clone())
             .expect("MountFS::mount_from: failed to add mount.");

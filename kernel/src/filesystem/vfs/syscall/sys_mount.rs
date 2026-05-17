@@ -454,20 +454,33 @@ fn do_bind_mount(
     // If MS_REC is set, recursively bind all submounts from source to target
     if flags.contains(MountFlags::REC) {
         if let Some(ref mfs) = source_mfs_for_recursive {
-            let target_path = match target_inode.absolute_path() {
+            // Linux kern_path() 将用户路径解析为 struct path，后续 copy_tree 基于
+            // 内核 mount/dentry 数据结构遍历子挂载，不涉及字符串路径匹配。
+            // DragonOS 使用 strip_prefix 做路径匹配，因此必须将 source_path 规范化为
+            // 与 mount_list 存储格式（absolute_path 产生的规范化绝对路径）一致。
+            // 直接传用户原始字符串会在相对路径、含 .. 的路径、符号链接路径下导致
+            // strip_prefix 匹配失败，静默跳过所有子挂载。
+            let resolved_source_path = match source_inode.absolute_path() {
                 Ok(p) => p,
                 Err(_) => {
                     // absolute_path 失败（如 devfs 设备节点）。
                     // 文件型 bind mount 没有子挂载，跳过递归是安全的。
-                    // 目录型不应走到这里，属于内部错误。仍然返回 Ok，与 Linux 行为一致（不会因路径问题失败）。
                     return Ok(());
                 }
             };
-            if let Err(e) = do_recursive_bind_mount(mfs, &target_mfs, &source_path, &target_path) {
-                // Linux copy_tree/do_loopback：失败时 umount_tree 递归回滚整棵树。
-                // 当前仅回滚根挂载，已挂载的子挂载在 mount_list 中残留。
-                // TODO: 实现递归 umount_tree 以完全匹配 Linux all-or-nothing 语义。
-                let _ = target_mfs.umount();
+            let target_path = match target_inode.absolute_path() {
+                Ok(p) => p,
+                Err(_) => {
+                    return Ok(());
+                }
+            };
+            if let Err(e) =
+                do_recursive_bind_mount(mfs, &target_mfs, &resolved_source_path, &target_path)
+            {
+                // Linux copy_tree 失败时调用 umount_tree(res, UMOUNT_SYNC) 递归回滚整棵子树。
+                // Linux do_loopback 中 graft_tree 失败时同样调用 umount_tree 回滚。
+                // 保证 all-or-nothing 原子语义。
+                MountFS::umount_tree(&target_mfs);
                 return Err(e);
             }
         }

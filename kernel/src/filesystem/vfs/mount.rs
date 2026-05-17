@@ -473,6 +473,44 @@ impl MountFS {
 
         return result;
     }
+
+    /// 递归卸载一个挂载及其所有子挂载，并从 namespace 的 mount_list 中移除。
+    ///
+    /// 用于递归 bind mount 失败时的原子回滚，保证 all-or-nothing 语义。
+    pub fn umount_tree(root: &Arc<MountFS>) {
+        let mntns = ProcessManager::current_mntns();
+
+        // 1. DFS 收集所有后代 MountFS
+        let mut all_descendants: Vec<Arc<MountFS>> = Vec::new();
+        let mut stack: Vec<Arc<MountFS>> = Vec::new();
+
+        for (_, child_mfs) in root.mountpoints().iter() {
+            stack.push(child_mfs.clone());
+        }
+
+        while let Some(mfs) = stack.pop() {
+            for (_, child_mfs) in mfs.mountpoints().iter() {
+                stack.push(child_mfs.clone());
+            }
+            all_descendants.push(mfs);
+        }
+
+        // 2. 逆序处理（最深的子挂载先卸载），确保子挂载在父挂载之前被清理
+        all_descendants.reverse();
+
+        for child_mfs in &all_descendants {
+            if let Some(path) = mntns.mount_list().get_mount_path_by_mountfs(child_mfs) {
+                mntns.remove_mount(path.as_str());
+            }
+            let _ = child_mfs.umount();
+        }
+
+        // 3. 最后卸载根挂载本身
+        if let Some(path) = mntns.mount_list().get_mount_path_by_mountfs(root) {
+            mntns.remove_mount(path.as_str());
+        }
+        let _ = root.umount();
+    }
 }
 
 impl Drop for MountFS {

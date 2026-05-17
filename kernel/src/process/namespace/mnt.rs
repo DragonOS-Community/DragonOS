@@ -315,6 +315,9 @@ impl MntNamespace {
             let new_self_mp = old_self_mp.clone_with_new_mount_fs(data.parent_mount_fs.clone());
             let new_mount_fs = data.old_mount_fs.deepcopy(Some(new_self_mp));
 
+            // copy_mnt_ns 第二遍遍历
+            new_mount_fs.set_namespace(Arc::downgrade(&new_mntns));
+
             // If the old mount was shared, register the new mount in the same peer group
             // This establishes the peer relationship for cross-namespace propagation
             let old_propagation = data.old_mount_fs.propagation();

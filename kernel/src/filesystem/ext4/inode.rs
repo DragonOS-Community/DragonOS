@@ -1,4 +1,5 @@
 use crate::{
+    arch::MMArch,
     driver::base::device::device_number::DeviceNumber,
     filesystem::{
         page_cache::{AsyncPageCacheBackend, PageCache},
@@ -12,7 +13,7 @@ use crate::{
         casting::DowncastArc,
         mutex::{Mutex, MutexGuard},
     },
-    mm::truncate::truncate_inode_pages,
+    mm::{truncate::truncate_inode_pages, MemoryManagementArch},
     time::PosixTimeSpec,
 };
 use alloc::{
@@ -53,12 +54,16 @@ pub struct Ext4Inode {
     /// 缓存的文件大小，避免频繁调用 getattr/setattr。
     /// None 表示未初始化（第一次写时从磁盘读取并缓存）。
     pub(super) cached_file_size: Option<u64>,
-    /// 标记是否有未刷回磁盘的元数据变更（file_size/mtime）
-    pub(super) metadata_dirty: bool,
+    /// 缓存的 mtime。普通 buffered write 先更新内存态，fsync/O_SYNC 再刷到磁盘。
+    pub(super) cached_mtime: Option<u32>,
+    /// 标记是否有未刷回磁盘的文件大小变更。
+    pub(super) size_dirty: bool,
+    /// 标记是否有未刷回磁盘的 mtime 变更。
+    pub(super) mtime_dirty: bool,
 }
 
 #[derive(Debug)]
-pub struct LockedExt4Inode(pub(super) Mutex<Ext4Inode>);
+pub struct LockedExt4Inode(pub(super) Mutex<Ext4Inode>, pub(super) Mutex<()>);
 
 impl IndexNode for LockedExt4Inode {
     fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
@@ -182,71 +187,71 @@ impl IndexNode for LockedExt4Inode {
         data: PrivateData,
     ) -> Result<usize, SystemError> {
         let len = core::cmp::min(len, buf.len());
+        if len == 0 {
+            return Ok(0);
+        }
         let buf = &buf[0..len];
 
-        let (fs, inode_num, page_cache, old_cached_size) = {
+        let (fs, inode_num, page_cache) = {
             let guard = self.0.lock();
             (
                 guard.concret_fs(),
                 guard.inner_inode_num,
                 guard.page_cache.clone(),
-                guard.cached_file_size,
             )
         };
 
         if let Some(page_cache) = page_cache {
+            let _invalidate = page_cache.invalidate_write();
+            let _io_guard = self.1.lock();
+
             // 使用缓存的文件大小，避免 getattr 磁盘 I/O
-            let old_file_size = match old_cached_size {
-                Some(size) => size,
-                None => {
-                    let size = fs.fs.getattr(inode_num)?.size;
-                    self.0.lock().cached_file_size = Some(size);
-                    size
+            let old_file_size = {
+                let cached_size = self.0.lock().cached_file_size;
+                match cached_size {
+                    Some(size) => size,
+                    None => {
+                        let size = fs.fs.getattr(inode_num)?.size;
+                        self.0.lock().cached_file_size = Some(size);
+                        size
+                    }
                 }
             };
 
-            let new_end = (offset + len) as u64;
-            let current_file_size = core::cmp::max(old_file_size, new_end);
+            let new_end = offset.checked_add(len).ok_or(SystemError::EFBIG)?;
+            let alloc_start = (offset >> MMArch::PAGE_SHIFT) << MMArch::PAGE_SHIFT;
+            let alloc_end = new_end
+                .checked_add(MMArch::PAGE_SIZE - 1)
+                .ok_or(SystemError::EFBIG)?
+                & !(MMArch::PAGE_SIZE - 1);
+            let alloc_len = alloc_end
+                .checked_sub(alloc_start)
+                .ok_or(SystemError::EFBIG)?;
 
-            // Two-phase write protocol that decouples block allocation from i_size:
-            //
-            // Phase 1 – Pre-allocate disk blocks WITHOUT updating i_size.
-            //   Ensures the async writeback thread can always find extent
-            //   mappings, avoiding the EIO that would occur if page-cache pages
-            //   were dirtied before blocks existed.
-            //
-            // Phase 2 – Commit i_size BEFORE writing page cache.
-            //   Must complete before PageCache::write so that concurrent
-            //   writeback (flush_dirty_pages / writeback_entry) sees the
-            //   correct file size and does not race with our disk I/O.
-            //   If commit_inode_size fails, no dirty pages exist yet → clean.
-            //   If PageCache::write later fails, i_size is already extended
-            //   but the extended region reads as zeros – same as old setattr
-            //   behaviour and acceptable since PageCache::write only fails on
-            //   OOM.
-            let extending = new_end > old_file_size;
-            if extending {
-                fs.fs
-                    .allocate_blocks_for_write(inode_num, current_file_size)
-                    .map_err(SystemError::from)?;
+            let time = PosixTimeSpec::now().tv_sec.to_u32().unwrap_or_else(|| {
+                log::warn!("Failed to get current time, using 0");
+                0
+            });
+            fs.fs
+                .prepare_buffered_write(
+                    inode_num,
+                    alloc_start,
+                    alloc_len,
+                    new_end as u64,
+                    Some(time),
+                )
+                .map_err(SystemError::from)?;
 
-                let time = PosixTimeSpec::now().tv_sec.to_u32().unwrap_or_else(|| {
-                    log::warn!("Failed to get current time, using 0");
-                    0
-                });
-                fs.fs
-                    .commit_inode_size(inode_num, current_file_size, Some(time))
-                    .map_err(SystemError::from)?;
-            }
-
-            // 磁盘块已就绪、i_size 已更新，现在安全写入 page cache
+            // 写入范围的磁盘块已就绪，现在安全写入 page cache。
             let write_len = PageCache::write(&page_cache, offset, buf)?;
-
-            // 更新内存中的缓存大小
-            {
+            if write_len > 0 {
+                let written_end = offset.checked_add(write_len).ok_or(SystemError::EFBIG)?;
+                let current_file_size = core::cmp::max(old_file_size, written_end as u64);
                 let mut guard = self.0.lock();
                 guard.cached_file_size = Some(current_file_size);
-                guard.metadata_dirty = true;
+                guard.cached_mtime = Some(time);
+                guard.size_dirty = true;
+                guard.mtime_dirty = true;
             }
 
             Ok(write_len)
@@ -256,6 +261,7 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn write_sync(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        let _io_guard = self.1.lock();
         let (fs, inode_num) = {
             let guard = self.0.lock();
             (guard.concret_fs(), guard.inner_inode_num)
@@ -263,7 +269,7 @@ impl IndexNode for LockedExt4Inode {
         match fs.fs.getattr(inode_num)?.ftype {
             FileType::Directory => Err(SystemError::EISDIR),
             FileType::Unknown => Err(SystemError::EROFS),
-            // Use write_data_only: blocks are pre-allocated by allocate_blocks_for_write() in write_at().
+            // Use write_data_only: blocks are pre-allocated by prepare_buffered_write() in write_at().
             // Using Ext4::write() here would cause it to call write_inode_with_csum()
             // which overwrites the inode's block_count/extent tree with a stale
             // snapshot, causing setattr to re-allocate blocks endlessly until
@@ -386,15 +392,19 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn metadata(&self) -> Result<vfs::Metadata, SystemError> {
-        let (fs, inode_num, vfs_inode_id) = {
+        let (fs, inode_num, vfs_inode_id, cached_size, cached_mtime) = {
             let guard = self.0.lock();
             (
                 guard.concret_fs(),
                 guard.inner_inode_num,
                 guard.vfs_inode_id,
+                guard.cached_file_size,
+                guard.cached_mtime,
             )
         };
         let attr = fs.fs.getattr(inode_num)?;
+        let size = cached_size.unwrap_or(attr.size);
+        let mtime = cached_mtime.unwrap_or(attr.mtime);
 
         // dev_id: filesystem device number (st_dev)
         let dev_id = fs.raw_dev.data() as usize;
@@ -412,12 +422,12 @@ impl IndexNode for LockedExt4Inode {
 
         Ok(vfs::Metadata {
             inode_id: vfs_inode_id,
-            size: attr.size as i64,
+            size: size as i64,
             blk_size: another_ext4::BLOCK_SIZE,
             blocks: attr.blocks as usize,
             atime: PosixTimeSpec::new(attr.atime.into(), 0),
             btime: PosixTimeSpec::new(attr.atime.into(), 0),
-            mtime: PosixTimeSpec::new(attr.mtime.into(), 0),
+            mtime: PosixTimeSpec::new(mtime.into(), 0),
             ctime: PosixTimeSpec::new(attr.ctime.into(), 0),
             file_type: Self::file_type(attr.ftype),
             mode: InodeMode::from_bits_truncate(attr.perm.bits() as u32),
@@ -431,41 +441,29 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn close(&self, _: PrivateData) -> Result<(), SystemError> {
-        // 在 close 时刷回延迟的元数据更新（mtime 等）
-        let (fs, inode_num, dirty, cached_size) = {
-            let mut guard = self.0.lock();
-            let dirty = guard.metadata_dirty;
-            let cached_size = guard.cached_file_size;
-            if dirty {
-                guard.metadata_dirty = false;
-            }
-            (
-                guard.concret_fs(),
-                guard.inner_inode_num,
-                dirty,
-                cached_size,
-            )
-        };
-        if dirty {
-            let time = PosixTimeSpec::now().tv_sec.to_u32().unwrap_or_else(|| {
-                log::warn!("Failed to get current time, using 0");
-                0
-            });
-            let _ = fs.fs.setattr(
-                inode_num,
-                another_ext4::SetAttr {
-                    mode: None,
-                    uid: None,
-                    gid: None,
-                    size: cached_size,
-                    atime: None,
-                    mtime: Some(time),
-                    ctime: None,
-                    crtime: None,
-                },
-            );
-        }
         Ok(())
+    }
+
+    fn sync(&self) -> Result<(), SystemError> {
+        if let Some(page_cache) = self.page_cache() {
+            page_cache.manager().sync()?;
+        }
+        self.flush_metadata(false)
+    }
+
+    fn datasync(&self) -> Result<(), SystemError> {
+        if let Some(page_cache) = self.page_cache() {
+            page_cache.manager().sync()?;
+        }
+        self.flush_metadata(true)
+    }
+
+    fn sync_file(&self, datasync: bool, _data: PrivateData) -> Result<(), SystemError> {
+        if datasync {
+            self.datasync()
+        } else {
+            self.sync()
+        }
     }
 
     fn page_cache(&self) -> Option<Arc<PageCache>> {
@@ -478,10 +476,13 @@ impl IndexNode for LockedExt4Inode {
         let to_ext4_time =
             |time: &PosixTimeSpec| -> u32 { time.tv_sec.max(0).min(u32::MAX as i64) as u32 };
 
-        let guard = self.0.lock();
-        let ext4 = &guard.concret_fs().fs;
+        let (fs, inode_num) = {
+            let guard = self.0.lock();
+            (guard.concret_fs(), guard.inner_inode_num)
+        };
+        let ext4 = &fs.fs;
         ext4.setattr(
-            guard.inner_inode_num,
+            inode_num,
             another_ext4::SetAttr {
                 mode: Some(another_ext4::InodeMode::from_bits_truncate(
                     mode.bits() as u16
@@ -495,6 +496,13 @@ impl IndexNode for LockedExt4Inode {
                 crtime: Some(to_ext4_time(&metadata.btime)),
             },
         )?;
+        {
+            let mut guard = self.0.lock();
+            guard.cached_file_size = Some(metadata.size as u64);
+            guard.cached_mtime = Some(to_ext4_time(&metadata.mtime));
+            guard.size_dirty = false;
+            guard.mtime_dirty = false;
+        }
 
         Ok(())
     }
@@ -519,7 +527,12 @@ impl IndexNode for LockedExt4Inode {
         .map_err(SystemError::from)?;
         drop(guard);
         // 更新缓存的文件大小
-        self.0.lock().cached_file_size = Some(len as u64);
+        {
+            let mut guard = self.0.lock();
+            guard.cached_file_size = Some(len as u64);
+            guard.size_dirty = false;
+            guard.mtime_dirty = false;
+        }
         Ok(())
     }
 
@@ -845,12 +858,10 @@ impl LockedExt4Inode {
         parent: Option<Weak<LockedExt4Inode>>,
     ) -> Arc<Self> {
         let inode = Arc::new({
-            LockedExt4Inode(Mutex::new(Ext4Inode::new(
-                inode_num,
-                fs_ptr.clone(),
-                dname,
-                parent,
-            )))
+            LockedExt4Inode(
+                Mutex::new(Ext4Inode::new(inode_num, fs_ptr.clone(), dname, parent)),
+                Mutex::new(()),
+            )
         });
         let mut guard = inode.0.lock();
 
@@ -922,8 +933,57 @@ impl Ext4Inode {
             self_ref: Weak::new(), // 将在LockedExt4Inode::new()中设置
             special_node: None,
             cached_file_size: None,
-            metadata_dirty: false,
+            cached_mtime: None,
+            size_dirty: false,
+            mtime_dirty: false,
         }
+    }
+}
+
+impl LockedExt4Inode {
+    fn flush_metadata(&self, datasync: bool) -> Result<(), SystemError> {
+        let _io_guard = self.1.lock();
+        let (fs, inode_num, size_dirty, mtime_dirty, cached_size, cached_mtime) = {
+            let guard = self.0.lock();
+            (
+                guard.concret_fs(),
+                guard.inner_inode_num,
+                guard.size_dirty,
+                guard.mtime_dirty,
+                guard.cached_file_size,
+                guard.cached_mtime,
+            )
+        };
+
+        if !size_dirty && (!mtime_dirty || datasync) {
+            return Ok(());
+        }
+
+        let size = if size_dirty {
+            Some(match cached_size {
+                Some(size) => size,
+                None => fs.fs.getattr(inode_num)?.size,
+            })
+        } else {
+            None
+        };
+        let mtime = if !datasync && mtime_dirty {
+            cached_mtime
+        } else {
+            None
+        };
+        fs.fs
+            .commit_inode_metadata(inode_num, size, mtime)
+            .map_err(SystemError::from)?;
+
+        let mut guard = self.0.lock();
+        if size_dirty && guard.cached_file_size == cached_size {
+            guard.size_dirty = false;
+        }
+        if !datasync && mtime_dirty && guard.cached_mtime == cached_mtime {
+            guard.mtime_dirty = false;
+        }
+        Ok(())
     }
 }
 

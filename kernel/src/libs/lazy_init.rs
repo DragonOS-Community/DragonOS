@@ -88,21 +88,6 @@ impl<T> Lazy<T> {
         return unsafe { self.get_unchecked() };
     }
 
-    /// 取出已初始化的值，Lazy 回到未初始化状态，可再次调用 init()。
-    /// 若尚未初始化则返回 None。
-    pub fn take(&self) -> Option<T> {
-        if !self.initialized.load(Ordering::Acquire) {
-            return None;
-        }
-        let _guard = self.init_lock.lock();
-        if !self.initialized.load(Ordering::Acquire) {
-            return None;
-        }
-        let value = unsafe { (*self.value.get()).as_ptr().read() };
-        self.initialized.store(false, Ordering::Release);
-        Some(value)
-    }
-
     /// Returns a reference to the value if it has been initialized.
     /// Otherwise, returns `None`.
     pub fn try_get(&self) -> Option<&T> {

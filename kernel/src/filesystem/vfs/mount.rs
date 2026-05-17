@@ -23,7 +23,7 @@ use crate::{
         page_cache::PageCache,
         vfs::{fcntl::AtFlags, syscall::RenameFlags, vcore::do_mkdir_at},
     },
-    libs::{casting::DowncastArc, lazy_init::Lazy, rwsem::RwSem},
+    libs::{casting::DowncastArc, rwsem::RwSem},
     mm::{fault::PageFaultMessage, VmFaultReason},
     process::{
         namespace::{
@@ -249,7 +249,7 @@ pub struct MountFS {
     /// 指向当前MountFS的弱引用
     self_ref: Weak<MountFS>,
 
-    namespace: Lazy<Weak<MntNamespace>>,
+    namespace: RwSem<Option<Weak<MntNamespace>>>,
     propagation: Arc<MountPropagation>,
     mount_id: MountId,
 
@@ -308,7 +308,7 @@ impl MountFS {
             mountpoints: Mutex::new(BTreeMap::new()),
             self_mountpoint: RwSem::new(self_mountpoint),
             self_ref: self_ref.clone(),
-            namespace: Lazy::new(),
+            namespace: RwSem::new(None),
             propagation,
             mount_id: MountId::alloc(),
             mount_flags: RwSem::new(mount_flags),
@@ -333,7 +333,7 @@ impl MountFS {
             mountpoints: Mutex::new(BTreeMap::new()),
             self_mountpoint: RwSem::new(self_mountpoint),
             self_ref: self_ref.clone(),
-            namespace: Lazy::new(),
+            namespace: RwSem::new(None),
             propagation: new_propagation,
             mount_id: MountId::alloc(),
             mount_flags: RwSem::new(self.mount_flags()),
@@ -382,15 +382,15 @@ impl MountFS {
     }
 
     pub fn set_namespace(&self, namespace: Weak<MntNamespace>) {
-        self.namespace.init(namespace);
+        *self.namespace.write() = Some(namespace);
     }
 
     pub fn namespace(&self) -> Option<Arc<MntNamespace>> {
-        self.namespace.try_get().and_then(|ns| ns.upgrade())
+        self.namespace.read().as_ref().and_then(|ns| ns.upgrade())
     }
 
     pub fn clear_namespace(&self) {
-        self.namespace.take();
+        *self.namespace.write() = None;
     }
 
     /// check_mnt()：检查当前 MountFS 是否属于指定 mount namespace。
@@ -469,14 +469,37 @@ impl MountFS {
             .ok_or(SystemError::EINVAL)?
             .do_umount();
 
-        // Only clear mountpoint state and notify filesystem after successful detach.
         if result.is_ok() {
-            self.self_mountpoint.write().take();
             self.inner_filesystem.on_umount();
             self.clear_namespace();
         }
 
         return result;
+    }
+
+    /// 仅将当前挂载从父挂载点摘除
+    fn detach(&self) -> Result<Arc<MountFS>, SystemError> {
+        let mountpoint_inode = self.self_mountpoint().ok_or(SystemError::EINVAL)?;
+        let mountpoint_id = mountpoint_inode.inner_inode.metadata()?.inode_id;
+        // 从父挂载的 mountpoints 中移除当前挂载。
+        mountpoint_inode
+            .mount_fs
+            .mountpoints
+            .lock()
+            .remove(&mountpoint_id)
+            .ok_or_else(|| {
+                log::warn!(
+                    "detach: mountpoint id {:?} not found in parent fs '{}'",
+                    mountpoint_id,
+                    mountpoint_inode.mount_fs.name()
+                );
+                SystemError::ENOENT
+            })?;
+
+        // 清除 self_mountpoint，使挂载成为独立树根。
+        self.self_mountpoint.write().take();
+
+        Ok(self.self_ref())
     }
 
     /// 递归卸载一个挂载及其所有子挂载，并从 namespace 的 mount_list 中移除。
@@ -1147,8 +1170,15 @@ impl IndexNode for MountFSInode {
         if self.is_mountpoint_root()? {
             return Err(SystemError::EBUSY);
         }
-        // debug!("from {:?}, to {:?}", from, self);
-        let new_mount_fs = from.umount()?;
+
+        // 对应 Linux do_move_mount → attach_recursive_mnt(MNT_TREE_MOVE)：
+        // unhash_mnt（detach）后直接 attach 到新位置，不清理 mnt_ns，不通知文件系统。
+        let from_mfs = from
+            .fs()
+            .downcast_arc::<MountFS>()
+            .ok_or(SystemError::EINVAL)?;
+        let new_mount_fs = from_mfs.detach()?;
+
         self.mount_fs
             .add_mount(metadata.inode_id, new_mount_fs.clone())?;
         // 更新当前挂载点的self_mountpoint
@@ -1156,24 +1186,15 @@ impl IndexNode for MountFSInode {
             .self_mountpoint
             .write()
             .replace(self.self_ref.upgrade().unwrap());
+
+        // move 不改变 namespace 归属，只需更新 mount_list 中的路径记录。
         let mntns = ProcessManager::current_mntns();
+        if let Some(mount_path) = mntns.mount_list().get_mount_path_by_mountfs(&new_mount_fs) {
+            mntns.mount_list().remove(mount_path.as_str());
+        }
+        let mount_path = Arc::new(MountPath::from(self.absolute_path()?));
+        mntns.add_mount(Some(metadata.inode_id), mount_path, new_mount_fs.clone())?;
 
-        let mount_path = mntns
-            .mount_list()
-            .get_mount_path_by_mountfs(&new_mount_fs)
-            .unwrap_or_else(|| {
-                panic!(
-                    "MountFS::mount_from: failed to get mount path for {:?}",
-                    self.mount_fs.name()
-                );
-            });
-
-        mntns.mount_list().remove(mount_path.as_str());
-        // umount() 清除了 namespace，迁移后需要重新设置。
-        new_mount_fs.set_namespace(Arc::downgrade(&mntns));
-        ProcessManager::current_mntns()
-            .add_mount(Some(metadata.inode_id), mount_path, new_mount_fs.clone())
-            .expect("MountFS::mount_from: failed to add mount.");
         return Ok(new_mount_fs);
     }
 
@@ -1544,6 +1565,15 @@ impl MountList {
             .iter()
             .map(|(p, stack)| (p.clone(), stack.last().unwrap().fs.clone()))
             .collect()
+    }
+
+    pub fn get<T: Into<MountPath>>(&self, path: T) -> Option<Arc<MountFS>> {
+        let inner = self.inner.read();
+        let path: MountPath = path.into();
+        inner
+            .mounts
+            .get(&path)
+            .and_then(|stack| stack.last().map(|rec| rec.fs.clone()))
     }
 
     #[inline(never)]

@@ -6,11 +6,14 @@ use core::{
 };
 
 use crate::{
+    arch::CurrentIrqArch,
+    exception::InterruptArch,
     ipc::sighand::SigHand,
     libs::{
         notifier::{AtomicNotifierChain, NotifierBlock, NotifyResult},
         spinlock::SpinLock,
     },
+    process::preempt::PreemptGuard,
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
 };
 use system_error::SystemError;
@@ -121,13 +124,34 @@ unsafe fn rcu_selftest_callback(head: NonNull<RcuHead>) {
     probe.hits.fetch_add(1, Ordering::SeqCst);
 }
 
-fn force_current_cpu_active_for_selftest(cpu: ProcessorId) {
-    let wake_worker = {
+struct RcuSelftestCpuStateGuard {
+    cpu: ProcessorId,
+    saved: RcuCpuState,
+}
+
+impl RcuSelftestCpuStateGuard {
+    fn new_active(cpu: ProcessorId) -> Self {
         let mut inner = RCU_STATE.inner.lock_irqsave();
         let cpu_idx = cpu.data() as usize;
+        let saved = inner.cpu_states[cpu_idx];
         inner.cpu_states[cpu_idx].in_idle_eqs = false;
         inner.cpu_states[cpu_idx].irq_nesting = 0;
         inner.cpu_states[cpu_idx].irq_from_idle_eqs = false;
+        Self { cpu, saved }
+    }
+}
+
+impl Drop for RcuSelftestCpuStateGuard {
+    fn drop(&mut self) {
+        restore_cpu_state_after_selftest(self.cpu, self.saved);
+    }
+}
+
+fn restore_cpu_state_after_selftest(cpu: ProcessorId, saved: RcuCpuState) {
+    let wake_worker = {
+        let mut inner = RCU_STATE.inner.lock_irqsave();
+        let cpu_idx = cpu.data() as usize;
+        inner.cpu_states[cpu_idx] = saved;
         if inner.gp_active && inner.waiting_cpus.get(cpu).unwrap_or(false) {
             inner.waiting_cpus.set(cpu, false);
         }
@@ -150,6 +174,10 @@ fn run_idle_irq_wakeup_selftest() -> Result<(), &'static str> {
     if pending_before != 0 || ready_before != 0 {
         return Err("rcu callback queues were not empty before idle IRQ selftest");
     }
+
+    let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+    let _preempt_guard = PreemptGuard::new();
+    let cpu_state_guard = RcuSelftestCpuStateGuard::new_active(cpu);
 
     let wake_worker = {
         let mut inner = RCU_STATE.inner.lock_irqsave();
@@ -195,7 +223,6 @@ fn run_idle_irq_wakeup_selftest() -> Result<(), &'static str> {
         }
     };
     if let Some(error) = pre_exit_error {
-        force_current_cpu_active_for_selftest(cpu);
         return Err(error);
     }
 
@@ -213,7 +240,6 @@ fn run_idle_irq_wakeup_selftest() -> Result<(), &'static str> {
     let wake_worker = match idle_irq_exit_result {
         Ok(wake_worker) => wake_worker,
         Err(error) => {
-            force_current_cpu_active_for_selftest(cpu);
             return Err(error);
         }
     };
@@ -229,12 +255,14 @@ fn run_idle_irq_wakeup_selftest() -> Result<(), &'static str> {
         inner.waiting_cpus.get(cpu).unwrap_or(false)
     };
     if post_exit_waiting {
-        force_current_cpu_active_for_selftest(cpu);
         return Err("idle IRQ exit left the current CPU in waiting_cpus");
     }
 
+    drop(cpu_state_guard);
+    drop(_preempt_guard);
+    drop(_irq_guard);
+
     rcu_barrier();
-    force_current_cpu_active_for_selftest(cpu);
 
     if idle_hits.load(Ordering::SeqCst) != 1 {
         return Err("callback did not execute after the idle IRQ wakeup selftest finished");

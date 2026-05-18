@@ -3,8 +3,8 @@ use crate::filesystem::devfs::LockedDevFSInode;
 use crate::filesystem::vfs::file::FileFlags;
 use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::vfs::{
-    vcore::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode, InodeFlags,
-    Metadata,
+    utils::DName, vcore::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode,
+    InodeFlags, Metadata,
 };
 use crate::libs::mutex::MutexGuard;
 use crate::{libs::mutex::Mutex, time::PosixTimeSpec};
@@ -151,5 +151,9 @@ impl IndexNode for LockedNullInode {
             return Ok(parent);
         }
         Err(SystemError::ENOENT)
+    }
+
+    fn dname(&self) -> Result<DName, SystemError> {
+        Ok(DName::from("null"))
     }
 }

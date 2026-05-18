@@ -606,6 +606,47 @@ impl LockedPipeInode {
         Ok(to_write)
     }
 
+    /// Wait for space before file->pipe splice reads from the input file.
+    ///
+    /// DragonOS pipes are byte-ring based, so this follows the same write
+    /// atomicity rule as pipe writes: writes up to PIPE_BUF wait for the full
+    /// request; larger writes wait for any space and may complete partially.
+    pub fn wait_writable_for_splice(&self, len: usize) -> Result<usize, SystemError> {
+        if len == 0 {
+            return Ok(0);
+        }
+
+        let need_atomic = len <= PIPE_BUF;
+        loop {
+            let guard = self.inner.lock();
+            if guard.reader == 0 {
+                drop(guard);
+                let _ = send_kernel_signal_to_current(Signal::SIGPIPE);
+                return Err(SystemError::EPIPE);
+            }
+
+            let used = guard.valid_cnt.max(0) as usize;
+            let space = guard.buf_size.saturating_sub(used);
+            if (need_atomic && space >= len) || (!need_atomic && space > 0) {
+                return Ok(if need_atomic { len } else { len.min(space) });
+            }
+
+            drop(guard);
+            let wait_result = if need_atomic {
+                wq_wait_event_interruptible!(
+                    self.write_wait_queue,
+                    self.writeable_len_at_least(len),
+                    {}
+                )
+            } else {
+                wq_wait_event_interruptible!(self.write_wait_queue, self.writeable(), {})
+            };
+            if wait_result.is_err() {
+                return Err(SystemError::ERESTARTSYS);
+            }
+        }
+    }
+
     /// 从管道中“窥视”最多 `len` 字节数据到 `buf`，但不消耗管道数据。
     ///
     /// 返回实际拷贝的字节数（可能小于 `len`）。不会睡眠。

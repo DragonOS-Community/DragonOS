@@ -949,14 +949,14 @@ fn umount_at_peer(peer_mnt: &Arc<MountFS>, mountpoint_id: InodeId) -> Result<(),
         }
 
         child.set_self_mountpoint(None);
-        child.clear_namespace();
 
-        // Synchronize: also remove from the peer namespace's mount_list
-        if let Some(ns) = peer_mnt.namespace() {
+        // 先从 mount_list 移除，再清 namespace，避免 "namespace=None 但 mount_list 仍有记录" 的 TOCTOU 中间态。
+        if let Some(ns) = child.namespace() {
             if let Some(mp) = ns.mount_list().get_mount_path_by_ino(mountpoint_id) {
                 ns.remove_mount(mp.as_str());
             }
         }
+        child.clear_namespace();
         // log::debug!("umount_at_peer: removed mount at {:?}", mountpoint_id);
     }
     Ok(())

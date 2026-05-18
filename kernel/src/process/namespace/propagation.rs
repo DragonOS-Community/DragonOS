@@ -948,6 +948,7 @@ fn umount_at_peer(peer_mnt: &Arc<MountFS>, mountpoint_id: InodeId) -> Result<(),
             unregister_peer(child_prop.peer_group_id(), &child);
         }
 
+        child.set_self_mountpoint(None);
         child.clear_namespace();
 
         // Synchronize: also remove from the peer namespace's mount_list

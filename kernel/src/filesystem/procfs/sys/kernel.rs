@@ -201,11 +201,16 @@ impl FileOps for OverflowIdFileOps {
 
     fn write_at(
         &self,
-        _offset: usize,
+        offset: usize,
         _len: usize,
         buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        // offset > 0 时静默忽略写入，返回成功但数据不生效。
+        if offset > 0 {
+            return Ok(buf.len());
+        }
+
         let input = core::str::from_utf8(buf).map_err(|_| SystemError::EINVAL)?;
         let val: u32 = input.trim().parse().map_err(|_| SystemError::EINVAL)?;
         if val > MAX_OVERFLOW_ID {

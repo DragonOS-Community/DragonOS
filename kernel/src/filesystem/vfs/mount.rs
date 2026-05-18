@@ -470,6 +470,9 @@ impl MountFS {
             .do_umount();
 
         if result.is_ok() {
+            // 清除 self_mountpoint，断开与旧父挂载点的反向引用。
+            // 将 mnt_parent 设为自身、mnt_mountpoint 设为自身 root 的语义。
+            self.self_mountpoint.write().take();
             self.inner_filesystem.on_umount();
             self.clear_namespace();
         }

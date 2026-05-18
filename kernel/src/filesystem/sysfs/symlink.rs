@@ -38,8 +38,15 @@ impl SysFS {
     ///
     ///
     /// 参考：https://code.dragonos.org.cn/xref/linux-6.1.9/fs/sysfs/symlink.c#143
-    pub fn remove_link(&self, _kobj: &Arc<dyn KObject>, _name: String) {
-        todo!("sysfs remove link")
+    pub fn remove_link(&self, kobj: &Arc<dyn KObject>, name: String) {
+        let parent = kobj.inode();
+
+        if let Some(parent) = parent {
+            let r = parent.remove(&name);
+            if r.is_err() {
+                warn!("failed to remove link '{}' from '{}'", name, kobj.name());
+            }
+        }
     }
 
     fn do_create_link(

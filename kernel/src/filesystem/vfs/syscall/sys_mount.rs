@@ -231,8 +231,7 @@ fn path_mount(
     }
 
     if flags.contains(MountFlags::REMOUNT) {
-        log::warn!("todo: remount");
-        return Err(SystemError::ENOSYS);
+        return do_remount(target_inode, mnt_flags);
     }
 
     if flags.contains(MountFlags::BIND) {
@@ -378,6 +377,16 @@ fn copy_mount_path_string(raw: Option<*const u8>) -> Result<Option<String>, Syst
 /// # Returns
 /// * `Ok(())` on success
 /// * `Err(SystemError)` on failure
+fn do_remount(target_inode: Arc<dyn IndexNode>, new_flags: MountFlags) -> Result<(), SystemError> {
+    let fs = target_inode.fs();
+    let mount_fs = fs
+        .as_any_ref()
+        .downcast_ref::<MountFS>()
+        .ok_or(SystemError::EINVAL)?;
+    mount_fs.set_mount_flags(new_flags);
+    Ok(())
+}
+
 fn do_bind_mount(
     source: Option<String>,
     target_inode: Arc<dyn IndexNode>,

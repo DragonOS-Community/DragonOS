@@ -4,6 +4,7 @@ use system_error::SystemError;
 use super::{
     fcntl::AtFlags,
     file::{File, FileFlags},
+    mount::{MountFS, MountFlags},
     permission::PermissionMask,
     syscall::{OpenHow, OpenHowResolve},
     utils::{rsplit_path, should_remove_sgid_on_chown, user_path_at},
@@ -314,6 +315,15 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
     let metadata = inode.metadata()?;
     let file_type: FileType = metadata.file_type;
 
+    if file_type == FileType::CharDevice || file_type == FileType::BlockDevice {
+        let fs = inode.fs();
+        if let Some(mount_fs) = fs.as_any_ref().downcast_ref::<MountFS>() {
+            if mount_fs.mount_flags().contains(MountFlags::NODEV) {
+                return Err(SystemError::EACCES);
+            }
+        }
+    }
+
     if how.o_flags.contains(FileFlags::O_NOFOLLOW)
         && !how.o_flags.contains(FileFlags::O_PATH)
         && file_type == FileType::SymLink
@@ -455,6 +465,13 @@ pub fn do_open_execat_with_flags(
 
     let metadata = inode.metadata()?;
     let file_type = metadata.file_type;
+
+    let fs = inode.fs();
+    if let Some(mount_fs) = fs.as_any_ref().downcast_ref::<MountFS>() {
+        if mount_fs.mount_flags().contains(MountFlags::NOEXEC) {
+            return Err(SystemError::EACCES);
+        }
+    }
 
     // 必须是普通文件
     if file_type != FileType::File {

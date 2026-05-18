@@ -314,19 +314,29 @@ impl Device for VirtIOConsoleDevice {
 
 impl VirtIODevice for VirtIOConsoleDevice {
     fn handle_irq(&self, _irq: IrqNumber) -> Result<IrqReturn, SystemError> {
-        let mut buf = [0u8; 8];
+        let mut buf = [0u8; 256];
         let mut index = 0;
-        // Read up to the size of the buffer
-        while index < buf.len() {
-            if let Ok(Some(c)) = self.inner().device_inner.recv(true) {
-                buf[index] = c;
-                index += 1;
-            } else {
-                break; // No more bytes to read
+
+        // 不能只取固定前缀：virtio-console 驱动会在本地缓存一个已完成的 rx buffer，
+        // 若中断上半部只消费其中一部分，剩余字节不会自动产生新中断，后续输入会错位。
+        loop {
+            match self.inner().device_inner.recv(true) {
+                Ok(Some(c)) => {
+                    buf[index] = c;
+                    index += 1;
+                    if index == buf.len() {
+                        enqueue_tty_rx_from_irq(&buf);
+                        index = 0;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
             }
         }
 
-        enqueue_tty_rx_from_irq(&buf[0..index]);
+        if index > 0 {
+            enqueue_tty_rx_from_irq(&buf[0..index]);
+        }
         Ok(IrqReturn::Handled)
     }
 

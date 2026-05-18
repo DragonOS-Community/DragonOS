@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// XSAVE area 的最大大小
 /// 对于 AVX: 约 832 字节 (512 + 64 header + 256 YMM)
@@ -15,6 +15,9 @@ static XSAVE_FEATURE_MASK: AtomicU64 = AtomicU64::new(0);
 
 /// 全局变量：XSAVE area 大小
 static XSAVE_AREA_SIZE: AtomicUsize = AtomicUsize::new(512);
+
+/// 全局变量：当前 CPU 支持的 MXCSR 特性位掩码
+static MXCSR_FEATURE_MASK: AtomicU32 = AtomicU32::new(0x0000_ffbf);
 
 /// XSAVE 特性位
 pub const XFEATURE_X87: u64 = 1 << 0;
@@ -56,6 +59,7 @@ impl FpState {
         use raw_cpuid::CpuId;
 
         let cpuid = CpuId::new();
+        MXCSR_FEATURE_MASK.store(Self::detect_mxcsr_feature_mask(), Ordering::SeqCst);
 
         // 检查 XSAVE 支持
         let has_xsave = cpuid
@@ -120,6 +124,29 @@ impl FpState {
     #[inline]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn detect_mxcsr_feature_mask() -> u32 {
+        let mut state = Self {
+            data: [0u8; MAX_XSAVE_SIZE],
+        };
+
+        unsafe {
+            core::arch::asm!(
+                "fxsave64 [{}]",
+                in(reg) state.data.as_mut_ptr(),
+                options(nostack)
+            );
+        }
+
+        let mask = u32::from_le_bytes(state.data[28..32].try_into().unwrap());
+        if mask == 0 {
+            // 与 Linux 一致：旧 CPU 可能在 FXSAVE 的 mxcsr_mask 字段返回 0，
+            // 此时使用除 DAZ(bit 6) 之外的默认 MXCSR 特性掩码。
+            0x0000_ffbf
+        } else {
+            mask
+        }
     }
 
     /// 初始化为默认的 FPU 状态
@@ -259,5 +286,15 @@ impl FpState {
     /// 返回 XSAVE area 大小
     pub fn xsave_area_size() -> usize {
         XSAVE_AREA_SIZE.load(Ordering::Relaxed)
+    }
+
+    /// 返回当前 CPU 支持的 XSAVE 用户特性位
+    pub fn xsave_feature_mask() -> u64 {
+        XSAVE_FEATURE_MASK.load(Ordering::Relaxed)
+    }
+
+    /// 返回当前 CPU 支持的 MXCSR 特性位
+    pub fn mxcsr_feature_mask() -> u32 {
+        MXCSR_FEATURE_MASK.load(Ordering::Relaxed)
     }
 }

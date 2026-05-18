@@ -278,7 +278,7 @@ fn get_ephemeral_iface(
     let loopback_dst = is_loopback_destination(remote_ip_addr);
 
     if let Some(iface) = get_iface_to_bind(remote_ip_addr, netns.clone()) {
-        if !loopback_dst || iface.flags().contains(InterfaceFlags::LOOPBACK) {
+        if iface_allowed_for_remote(&iface, loopback_dst) {
             if let Some(local_addr) = pick_configured_source_addr(&iface, remote_ip_addr) {
                 return Ok((iface, local_addr));
             }
@@ -286,7 +286,7 @@ fn get_ephemeral_iface(
     }
 
     if let Some(iface) = default_iface {
-        if !loopback_dst || iface.flags().contains(InterfaceFlags::LOOPBACK) {
+        if iface_allowed_for_remote(&iface, loopback_dst) {
             if let Some(local_addr) = pick_configured_source_addr(&iface, remote_ip_addr) {
                 return Ok((iface, local_addr));
             }
@@ -294,7 +294,7 @@ fn get_ephemeral_iface(
     }
 
     for (_, iface) in netns.device_list().iter() {
-        if loopback_dst && !iface.flags().contains(InterfaceFlags::LOOPBACK) {
+        if !iface_allowed_for_remote(iface, loopback_dst) {
             continue;
         }
 
@@ -310,10 +310,14 @@ fn get_ephemeral_iface(
     Err(no_source_error)
 }
 
+fn iface_allowed_for_remote(iface: &Arc<dyn Iface>, loopback_dst: bool) -> bool {
+    iface.flags().contains(InterfaceFlags::LOOPBACK) == loopback_dst
+}
+
 fn no_source_addr_error(remote_ip_addr: &smoltcp::wire::IpAddress) -> SystemError {
     match remote_ip_addr {
         smoltcp::wire::IpAddress::Ipv4(_) => SystemError::ENETUNREACH,
-        smoltcp::wire::IpAddress::Ipv6(_) => SystemError::EADDRNOTAVAIL,
+        smoltcp::wire::IpAddress::Ipv6(_) => SystemError::ENETUNREACH,
     }
 }
 

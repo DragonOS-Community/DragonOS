@@ -266,7 +266,7 @@ fn page_reclaim_thread() -> i32 {
             PageReclaimer::shrink_list(PageFrameCount::new(page_to_free));
         } else {
             //TODO 暂时让页面回收线程负责脏页回写任务，后续需要分离
-            page_reclaimer_lock().flush_dirty_pages();
+            PageReclaimer::flush_dirty_pages();
             // 休眠5秒
             // log::info!("sleep");
             let _ = nanosleep(PosixTimeSpec::new(0, 500_000_000));
@@ -348,8 +348,23 @@ impl PageReclaimer {
                 let paddr = guard.phys_address();
 
                 if guard.flags().contains(PageFlags::PG_DIRTY) {
-                    // 先回写脏页
-                    Self::page_writeback(&mut guard, true);
+                    let writeback_target = match guard.page_type() {
+                        PageType::File(info) => info
+                            .page_cache
+                            .upgrade()
+                            .map(|page_cache| (page_cache, info.index)),
+                        _ => None,
+                    };
+                    drop(guard);
+
+                    if let Some((page_cache, page_index)) = writeback_target {
+                        let _ = page_cache.manager().writeback_page(page_index);
+                    } else {
+                        let mut guard = page.write();
+                        Self::page_writeback(&mut guard, true);
+                    }
+
+                    guard = page.write();
                     if guard.flags().contains(PageFlags::PG_DIRTY) {
                         drop(guard);
                         page_reclaimer_lock().insert_page(paddr, &page);
@@ -481,13 +496,45 @@ impl PageReclaimer {
     }
 
     /// lru脏页刷新
-    pub fn flush_dirty_pages(&mut self) {
-        // log::info!("flush_dirty_pages");
-        let iter = self.lru.iter();
-        for (_paddr, page) in iter {
+    fn dirty_pages_snapshot(&self) -> Vec<Arc<Page>> {
+        self.lru
+            .iter()
+            .filter_map(|(_paddr, page)| {
+                let guard = page.read();
+                if guard.flags().contains(PageFlags::PG_DIRTY) {
+                    Some(page.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub fn flush_dirty_pages() {
+        let pages = {
+            let reclaimer = page_reclaimer_lock();
+            reclaimer.dirty_pages_snapshot()
+        };
+        Self::flush_dirty_pages_snapshot(pages);
+    }
+
+    fn flush_dirty_pages_snapshot(pages: Vec<Arc<Page>>) {
+        for page in pages {
             let mut guard = page.write();
             if guard.flags().contains(PageFlags::PG_DIRTY) {
-                Self::page_writeback(&mut guard, false);
+                let writeback_target = match guard.page_type() {
+                    PageType::File(info) => info
+                        .page_cache
+                        .upgrade()
+                        .map(|page_cache| (page_cache, info.index)),
+                    _ => None,
+                };
+                if let Some((page_cache, page_index)) = writeback_target {
+                    drop(guard);
+                    let _ = page_cache.manager().writeback_page(page_index);
+                } else {
+                    Self::page_writeback(&mut guard, false);
+                }
             }
         }
     }

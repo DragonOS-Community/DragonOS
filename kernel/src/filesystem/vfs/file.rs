@@ -1,6 +1,6 @@
 use core::{
     fmt,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 use alloc::{string::String, sync::Arc, vec::Vec};
@@ -22,6 +22,8 @@ use crate::{
     filesystem::{
         epoll::{event_poll::EPollPrivateData, EPollItem},
         fuse::private_data::FuseFilePrivateData,
+        kernfs::callback::KernFilePrivateData,
+        page_cache::PageCache,
         procfs::ProcfsFilePrivateData,
         vfs::FilldirContext,
     },
@@ -75,6 +77,34 @@ enum OffsetUpdate {
     Add,
     /// Append path: set file offset to end-of-write (actual_offset + written_len).
     StoreEnd,
+}
+
+#[derive(Clone, Debug)]
+pub struct FileOwnerSnapshot {
+    pub pcb: Option<Arc<ProcessControlBlock>>,
+    pub signum: i32,
+}
+
+#[derive(Debug)]
+struct FileOwner {
+    pcb: Option<Arc<ProcessControlBlock>>,
+    signum: i32,
+}
+
+impl FileOwner {
+    fn new() -> Self {
+        Self {
+            pcb: None,
+            signum: 0,
+        }
+    }
+
+    fn snapshot(&self) -> FileOwnerSnapshot {
+        FileOwnerSnapshot {
+            pcb: self.pcb.clone(),
+            signum: self.signum,
+        }
+    }
 }
 
 /// 写操作的配置参数
@@ -150,6 +180,8 @@ pub enum FilePrivateData {
     SocketCreate,
     /// FUSE file private data.
     Fuse(FuseFilePrivateData),
+    /// kernfs/debugfs per-open callback state.
+    Kernfs(Option<KernFilePrivateData>),
     /// 不需要文件私有信息
     Unused,
 }
@@ -162,8 +194,14 @@ impl Default for FilePrivateData {
 
 impl FilePrivateData {
     pub fn update_flags(&mut self, flags: FileFlags) {
-        if let FilePrivateData::Pipefs(pdata) = self {
-            pdata.set_flags(flags);
+        match self {
+            FilePrivateData::Pipefs(pdata) => {
+                pdata.set_flags(flags);
+            }
+            FilePrivateData::Tty(pdata) => {
+                pdata.flags = flags;
+            }
+            _ => {}
         }
     }
 
@@ -421,19 +459,33 @@ pub struct File {
     pub private_data: Mutex<FilePrivateData>,
     /// 文件的凭证
     cred: Arc<Cred>,
-    /// owner
-    pid: Mutex<Option<Arc<ProcessControlBlock>>>,
+    /// Owner state for asynchronous I/O notifications.
+    owner: Mutex<FileOwner>,
     /// Stable key for POSIX record locks. Cached at open time to avoid metadata fetch
     /// in close/drop_fd path (which can deadlock with user-space FUSE daemon).
     posix_lock_key: (usize, InodeId),
     /// 预读状态
     ra_state: Mutex<FileReadaheadState>,
+    /// 当前 open file description 已观测到的 page cache 写回错误序列。
+    wb_error_seq: AtomicU64,
 }
 
 impl File {
     #[inline]
     pub fn cred(&self) -> Arc<Cred> {
         self.cred.clone()
+    }
+
+    pub fn check_and_advance_wb_error(
+        &self,
+        page_cache: &Arc<PageCache>,
+    ) -> Result<(), SystemError> {
+        let since = self.wb_error_seq.load(Ordering::Acquire);
+        let Some((seq, error)) = page_cache.check_writeback_error_since(since) else {
+            return Ok(());
+        };
+        self.wb_error_seq.store(seq, Ordering::Release);
+        Err(error)
     }
 
     fn maybe_kill_suid_sgid_after_write(&self) -> Result<(), SystemError> {
@@ -644,6 +696,11 @@ impl File {
             mode = FileMode::FMODE_PATH | FileMode::FMODE_OPENED;
         }
 
+        let wb_error_seq = inode
+            .page_cache()
+            .map(|page_cache| page_cache.sample_writeback_error())
+            .unwrap_or(0);
+
         let f = File {
             open_file_id: alloc_open_file_id(),
             inode,
@@ -654,9 +711,10 @@ impl File {
             readdir_subdirs_name: Mutex::new(Vec::default()),
             private_data,
             cred: ProcessManager::current_pcb().cred(),
-            pid: Mutex::new(None),
+            owner: Mutex::new(FileOwner::new()),
             posix_lock_key,
             ra_state: Mutex::new(FileReadaheadState::new()),
+            wb_error_seq: AtomicU64::new(wb_error_seq),
         };
 
         return Ok(f);
@@ -1183,9 +1241,10 @@ impl File {
             readdir_subdirs_name: Mutex::new(self.readdir_subdirs_name.lock().clone()),
             private_data: Mutex::new(self.private_data.lock().clone()),
             cred: self.cred.clone(),
-            pid: Mutex::new(None),
+            owner: Mutex::new(FileOwner::new()),
             posix_lock_key: self.posix_lock_key,
             ra_state: Mutex::new(self.ra_state.lock().clone()),
+            wb_error_seq: AtomicU64::new(self.wb_error_seq.load(Ordering::Acquire)),
         };
         // 调用inode的open方法，让inode知道有新的文件打开了这个inode
         // TODO: reopen is not a good idea for some inodes, need a better design
@@ -1360,12 +1419,20 @@ impl File {
     }
 
     pub fn owner(&self) -> Option<RawPid> {
-        self.pid.lock().as_ref().map(|pcb| pcb.pid().pid_vnr())
+        self.owner
+            .lock()
+            .pcb
+            .as_ref()
+            .map(|pcb| pcb.pid().pid_vnr())
     }
 
     /// Get the owner process control block
     pub fn get_owner(&self) -> Option<Arc<ProcessControlBlock>> {
-        self.pid.lock().clone()
+        self.owner.lock().pcb.clone()
+    }
+
+    pub fn owner_snapshot(&self) -> FileOwnerSnapshot {
+        self.owner.lock().snapshot()
     }
 
     /// Set a process (group) as owner of the file descriptor.
@@ -1374,14 +1441,16 @@ impl File {
     /// for I/O events on the file descriptor, if `O_ASYNC` status flag is set
     /// on this file.
     pub fn set_owner(&self, pid: Option<Arc<ProcessControlBlock>>) -> Result<(), SystemError> {
-        let Some(pcb) = pid else {
-            *self.pid.lock() = None;
-            return Ok(());
-        };
-
-        self.pid.lock().replace(pcb);
-        // todo: update inode owner
+        self.owner.lock().pcb = pid;
         Ok(())
+    }
+
+    pub fn owner_signum(&self) -> i32 {
+        self.owner.lock().signum
+    }
+
+    pub fn set_owner_signum(&self, signum: i32) {
+        self.owner.lock().signum = signum;
     }
 
     pub fn get_inode_flags(&self) -> Result<InodeFlags, SystemError> {

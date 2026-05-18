@@ -69,10 +69,19 @@ pub struct Ext4 {
     /// concurrent modification, which would cause two inodes to receive the
     /// same physical block (corrupting extent trees and data).
     alloc_lock: spin::Mutex<()>,
+    /// Serializes inode metadata and extent-tree mutations per inode shard.
+    ///
+    /// another_ext4 stores inodes as value snapshots in a small cache. Without
+    /// this lock, two writers can clone the same cached inode, mutate disjoint
+    /// fields, then write stale extent roots or sizes back over each other. Use
+    /// sharding so unrelated apt download files do not serialize on one global
+    /// filesystem-wide spin lock.
+    inode_mutation_locks: Vec<spin::Mutex<()>>,
 }
 
 /// Maximum number of inodes to cache in memory.
 const INODE_CACHE_SIZE: usize = 512;
+pub(super) const INODE_MUTATION_LOCK_SHARDS: usize = 64;
 
 impl Ext4 {
     /// Opens and loads an Ext4 from the `block_device`.
@@ -112,12 +121,17 @@ impl Ext4 {
         }
 
         // Create Ext4 instance
+        let mut inode_mutation_locks = Vec::with_capacity(INODE_MUTATION_LOCK_SHARDS);
+        for _ in 0..INODE_MUTATION_LOCK_SHARDS {
+            inode_mutation_locks.push(spin::Mutex::new(()));
+        }
         Ok(Self {
             block_device,
             cached_super_block: spin::Mutex::new(sb),
             cached_block_groups,
             inode_cache: spin::Mutex::new(InodeCache::new(INODE_CACHE_SIZE)),
             alloc_lock: spin::Mutex::new(()),
+            inode_mutation_locks,
         })
     }
 
@@ -130,5 +144,10 @@ impl Ext4 {
     /// Returns the current on-disk superblock.
     pub fn super_block(&self) -> Result<SuperBlock> {
         Ok(self.read_super_block_cached())
+    }
+
+    #[inline]
+    fn inode_mutation_lock_index(&self, inode_id: InodeId) -> usize {
+        inode_id as usize % self.inode_mutation_locks.len()
     }
 }

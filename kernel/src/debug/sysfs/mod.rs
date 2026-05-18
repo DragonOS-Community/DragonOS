@@ -21,6 +21,7 @@ fn debugfs_init() -> Result<(), SystemError> {
         SYS_KERNEL_DEBUG_KOBJECT_INSTANCE = Some(debug_kobj);
     }
     super::tracing::init_debugfs_tracing()?;
+    super::rcu::init_debugfs_rcu()?;
     return Ok(());
 }
 

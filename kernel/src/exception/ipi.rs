@@ -5,7 +5,7 @@ use system_error::SystemError;
 use crate::arch::driver::apic::{CurrentApic, LocalAPIC};
 
 use crate::{
-    sched::{SchedMode, __schedule},
+    process::{ProcessFlags, ProcessManager},
     smp::cpu::ProcessorId,
 };
 
@@ -19,6 +19,7 @@ use super::{
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum IpiKind {
     KickCpu,
+    StopCpu,
     /// TLB shootdown IPI.
     ///
     /// Do NOT directly `send_ipi(IpiKind::FlushTLB, ..)` in new code:
@@ -67,8 +68,11 @@ impl IrqHandler for KickCpuIpiHandler {
         #[cfg(target_arch = "x86_64")]
         CurrentApic.send_eoi();
 
-        // 被其他cpu kick时应该是抢占调度
-        __schedule(SchedMode::SM_PREEMPT);
+        // 被其他 CPU kick 时只挂起抢占请求，实际调度由顶层中断出口在
+        // RCU IRQ 上下文结束后统一执行。
+        ProcessManager::current_pcb()
+            .flags()
+            .insert(ProcessFlags::NEED_SCHEDULE);
         Ok(IrqReturn::Handled)
     }
 }

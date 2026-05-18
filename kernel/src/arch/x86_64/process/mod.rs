@@ -596,6 +596,7 @@ pub unsafe fn arch_switch_to_user(trap_frame: TrapFrame) -> ! {
     // 重要！在这里之后，一定要保证上面的引用计数变量、动态申请的变量、锁的守卫都被drop了，否则可能导致内存安全问题！
 
     compiler_fence(Ordering::SeqCst);
+    crate::rcu::note_exit_to_user_mode();
     ready_to_switch_to_user(trap_frame, trap_frame_vaddr.data(), new_rip.data());
 }
 
@@ -654,13 +655,14 @@ unsafe extern "sysv64" fn ready_to_switch_to_user(
 /// # 功能
 ///
 /// 停止当前CPU的运行，系统进入最终的停机状态
-pub(super) fn stop_this_cpu() -> ! {
+pub(crate) fn stop_this_cpu() -> ! {
     let cpu_id = current_cpu_id();
 
     unsafe {
         CurrentIrqArch::interrupt_disable();
     }
 
+    crate::rcu::cpu_offline(cpu_id);
     // 将当前cpu标记为offline
     smp_cpu_manager().set_online_cpu(cpu_id, false);
     CurrentApic.disable_local_apic();

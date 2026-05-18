@@ -21,6 +21,7 @@ use crate::{
     },
     mm::init::mm_init,
     process::{kthread::kthread_init, process_init, ProcessManager},
+    rcu,
     sched::SchedArch,
     smp::{early_smp_init, SMPArch},
     syscall::{syscall_init, Syscall},
@@ -82,6 +83,7 @@ fn do_start_kernel() {
     acpi_init().expect("acpi init failed");
     crate::sched::sched_init();
     process_init();
+    rcu::init();
     if let Err(e) = cgroup2_init() {
         warn!("cgroup2 init failed: {:?}", e);
     }

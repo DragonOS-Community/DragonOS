@@ -690,9 +690,26 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     if sigaction.is_none() {
         return;
     }
-    *got_signal = true;
 
     let mut sigaction = sigaction.unwrap();
+    match sigaction.action() {
+        SigactionType::SaHandler(SaHandlerType::Default) => {
+            *got_signal = true;
+            sig_number.handle_default();
+            return;
+        }
+        SigactionType::SaHandler(SaHandlerType::Customized(_)) => {}
+        SigactionType::SaHandler(SaHandlerType::Ignore) => return,
+        _ => {
+            error!(
+                "Unsupported signal action for signal: {}, pid={:?}",
+                sig_number as i32,
+                ProcessManager::current_pcb().raw_pid()
+            );
+            return;
+        }
+    }
+    *got_signal = true;
 
     // 注意！由于handle_signal里面可能会退出进程，
     // 因此这里需要检查清楚：上面所有的锁、arc指针都被释放了。否则会产生资源泄露的问题！
@@ -700,6 +717,11 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
         handle_signal(sig_number, &mut sigaction, &info.unwrap(), &oldset, frame);
     compiler_fence(Ordering::SeqCst);
     if let Err(e) = res {
+        let _ = if sig_number == Signal::SIGSEGV {
+            crate::ipc::signal::force_kernel_default_signal_to_current(Signal::SIGSEGV)
+        } else {
+            crate::ipc::signal::force_kernel_signal_to_current(Signal::SIGSEGV)
+        };
         if e != SystemError::EFAULT {
             error!(
                 "Error occurred when handling signal: {}, pid={:?}, errcode={:?}",
@@ -874,10 +896,6 @@ fn setup_frame(
 
     match sigaction.action() {
         SigactionType::SaHandler(handler_type) => match handler_type {
-            SaHandlerType::Default => {
-                sig.handle_default();
-                return Ok(0);
-            }
             SaHandlerType::Customized(handler) => {
                 // 如果handler地址大于等于用户空间末尾，说明它在内核空间，这是非法的。
                 if handler >= MMArch::USER_END_VADDR {
@@ -905,9 +923,6 @@ fn setup_frame(
                     }
                     handler_addr = handler.data();
                 }
-            }
-            SaHandlerType::Ignore => {
-                return Ok(0);
             }
             _ => {
                 return Err(SystemError::EINVAL);

@@ -143,10 +143,15 @@ impl TtyOperation for Unix98PtyDriverInner {
     }
 
     fn flush_buffer(&self, tty: &TtyCoreData) -> Result<(), SystemError> {
-        let to = tty.checked_link()?;
+        let Some(to) = tty.link() else {
+            return Ok(());
+        };
 
-        let mut ctrl = to.core().contorl_info_irqsave();
-        ctrl.pktstatus.insert(TtyPacketStatus::TIOCPKT_FLUSHWRITE);
+        if to.core().contorl_info_irqsave().packet {
+            tty.contorl_info_irqsave()
+                .pktstatus
+                .insert(TtyPacketStatus::TIOCPKT_FLUSHWRITE);
+        }
 
         to.core().read_wq().wakeup_all();
 

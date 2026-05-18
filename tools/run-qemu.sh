@@ -7,6 +7,8 @@
 #   0: EMERG   1: ALERT   2: CRIT   3: ERR
 #   4: WARN    5: NOTICE  6: INFO   7: DEBUG
 #   示例: export DRAGONOS_LOGLEVEL=4  # 只显示WARN及以上级别的日志
+# - DRAGONOS_QEMU_ACCEL: 覆盖 QEMU 加速器选择，可选 kvm/tcg/hvf
+#   示例: DRAGONOS_QEMU_ACCEL=tcg make run-nographic
 #
 # - AUTO_TEST: 自动测试选项
 # - SYSCALL_TEST_DIR: 系统调用测试目录
@@ -88,6 +90,19 @@ if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
     fi
   fi
 fi
+
+if [ -n "${DRAGONOS_QEMU_ACCEL:-}" ]; then
+  case "${DRAGONOS_QEMU_ACCEL}" in
+    kvm|tcg|hvf)
+      qemu_accel="${DRAGONOS_QEMU_ACCEL}"
+      ;;
+    *)
+      echo "[错误] 不支持的 DRAGONOS_QEMU_ACCEL=${DRAGONOS_QEMU_ACCEL}，可选值: kvm/tcg/hvf"
+      exit 1
+      ;;
+  esac
+fi
+echo "QEMU accel=${qemu_accel}"
 
 # uboot版本
 UBOOT_VERSION="v2023.10"

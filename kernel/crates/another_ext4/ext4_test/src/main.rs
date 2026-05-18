@@ -223,12 +223,11 @@ fn xattr_test(ext4: &mut Ext4) {
     assert_eq!(names, vec!["user.testtwo"]);
 }
 
-/// Simulate the apt update scenario: multiple files being grown via setattr
-/// in an interleaved pattern, then verified via extent_query (write_data_only).
-/// This reproduces the ENOENT bug where extent_query cannot find blocks that
-/// setattr already allocated.
+/// Simulate the apt update scenario: multiple files grow and dirty page-cache
+/// ranges in an interleaved pattern, then writeback verifies the prepared
+/// extent mappings via write_data_only.
 fn interleaved_setattr_writeback_test() {
-    use another_ext4::{FileAttr, SetAttr};
+    use another_ext4::SetAttr;
 
     make_ext4();
     let ext4 = load_ext4();
@@ -263,7 +262,7 @@ fn interleaved_setattr_writeback_test() {
             all_done = false;
             let new_size = core::cmp::min(file_sizes[i] + chunk_size, target_size);
 
-            // setattr to grow file (allocate blocks)
+            // Grow visible size without allocating holes.
             ext4.setattr(
                 ino,
                 SetAttr {
@@ -284,8 +283,18 @@ fn interleaved_setattr_writeback_test() {
                 )
             });
 
-            // Simulate writeback: write_data_only for all blocks in the
-            // newly allocated region
+            // Simulate buffered-write preparation followed by writeback for
+            // the newly dirtied region.
+            let write_offset = file_sizes[i] as usize;
+            let write_len = (new_size - file_sizes[i]) as usize;
+            ext4.prepare_buffered_write(ino, write_offset, write_len, new_size, None)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "prepare_buffered_write FAILED: ino={} round={} old_size={} \
+                         new_size={} err={:?}",
+                        ino, round, file_sizes[i], new_size, e
+                    )
+                });
             let old_block = (file_sizes[i] as usize) / 4096;
             let new_block = ((new_size as usize) + 4095) / 4096;
             for blk in old_block..new_block {
@@ -335,6 +344,142 @@ fn interleaved_setattr_writeback_test() {
     println!("interleaved setattr+writeback test done");
 }
 
+fn sparse_growth_and_range_writeback_test() {
+    use another_ext4::SetAttr;
+
+    make_ext4();
+    let ext4 = load_ext4();
+    let file_mode: InodeMode = InodeMode::FILE | InodeMode::ALL_RWX;
+    let ino = ext4
+        .generic_create(ROOT_INO, "sparse.dat", file_mode)
+        .expect("create sparse.dat failed");
+
+    let sparse_size = 2 * 1024 * 1024u64;
+    ext4.setattr(
+        ino,
+        SetAttr {
+            mode: None,
+            uid: None,
+            gid: None,
+            size: Some(sparse_size),
+            atime: None,
+            mtime: None,
+            ctime: None,
+            crtime: None,
+        },
+    )
+    .expect("sparse grow setattr failed");
+
+    let attr = ext4.getattr(ino).expect("getattr sparse file failed");
+    assert_eq!(attr.size, sparse_size);
+    assert_eq!(attr.blocks, 0, "sparse growth must not allocate data blocks");
+
+    let mut hole = vec![0x5Au8; 8192];
+    let n = ext4.read(ino, 123, &mut hole).expect("read sparse hole failed");
+    assert_eq!(n, hole.len());
+    assert!(hole.iter().all(|&b| b == 0), "hole read must return zeros");
+
+    let missing = ext4
+        .write_data_only(ino, 4096, &[0x11; 512])
+        .expect_err("writeback into unallocated hole must fail");
+    assert_eq!(missing.code(), ErrCode::ENOENT);
+
+    let write_offset = 1024 * 1024 + 123;
+    let data = vec![0xC3u8; 7000];
+    ext4.prepare_buffered_write(
+        ino,
+        write_offset,
+        data.len(),
+        sparse_size,
+        None,
+    )
+    .expect("prepare buffered sparse write failed");
+    ext4.write_data_only(ino, write_offset, &data)
+        .expect("write_data_only after prepare failed");
+
+    let attr = ext4.getattr(ino).expect("getattr sparse file failed");
+    assert_eq!(attr.size, sparse_size);
+    assert!(attr.blocks > 0, "range write must allocate written blocks");
+    assert!(
+        attr.blocks < sparse_size / 512,
+        "range write must not allocate the entire sparse file"
+    );
+
+    let mut read_back = vec![0u8; data.len()];
+    let n = ext4
+        .read(ino, write_offset, &mut read_back)
+        .expect("read sparse written range failed");
+    assert_eq!(n, data.len());
+    assert_eq!(read_back, data);
+
+    drop(ext4);
+    let output = std::process::Command::new("e2fsck")
+        .args(["-fn", "ext4.img"])
+        .output()
+        .expect("e2fsck failed");
+    assert!(
+        output.status.success(),
+        "e2fsck FAILED:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    println!("sparse growth and range writeback test done");
+}
+
+fn prepare_buffered_write_does_not_commit_size_test() {
+    make_ext4();
+    let ext4 = load_ext4();
+    let file_mode: InodeMode = InodeMode::FILE | InodeMode::ALL_RWX;
+    let ino = ext4
+        .generic_create(ROOT_INO, "prepared.dat", file_mode)
+        .expect("create prepared.dat failed");
+
+    let write_offset = 1024 * 1024;
+    let data = vec![0x7Eu8; 4096];
+    ext4.prepare_buffered_write(
+        ino,
+        write_offset,
+        data.len(),
+        (write_offset + data.len()) as u64,
+        None,
+    )
+    .expect("prepare buffered write failed");
+
+    let attr = ext4.getattr(ino).expect("getattr prepared file failed");
+    assert_eq!(attr.size, 0, "prepare must not commit visible size");
+    assert!(attr.blocks > 0, "prepare must allocate the written range");
+
+    ext4.write_data_only(ino, write_offset, &data)
+        .expect("write_data_only after prepare failed");
+    let mut hidden = vec![0u8; data.len()];
+    assert_eq!(
+        ext4.read(ino, write_offset, &mut hidden)
+            .expect("read beyond uncommitted size failed"),
+        0,
+        "uncommitted size must keep prepared data outside EOF hidden"
+    );
+
+    ext4.commit_inode_size(ino, (write_offset + data.len()) as u64, None)
+        .expect("commit prepared size failed");
+    let mut read_back = vec![0u8; data.len()];
+    let n = ext4
+        .read(ino, write_offset, &mut read_back)
+        .expect("read committed prepared range failed");
+    assert_eq!(n, data.len());
+    assert_eq!(read_back, data);
+
+    drop(ext4);
+    let output = std::process::Command::new("e2fsck")
+        .args(["-fn", "ext4.img"])
+        .output()
+        .expect("e2fsck failed");
+    assert!(
+        output.status.success(),
+        "e2fsck FAILED:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    println!("prepare buffered write size boundary test done");
+}
+
 fn main() {
     SimpleLogger::new().init().unwrap();
     log::set_max_level(log::LevelFilter::Off);
@@ -362,6 +507,10 @@ fn main() {
 
     // Interleaved setattr + writeback test
     interleaved_setattr_writeback_test();
+
+    sparse_growth_and_range_writeback_test();
+
+    prepare_buffered_write_does_not_commit_size_test();
 
     // Cache correctness tests — run on a fresh image
     // Use load_ext4 (not open_ext4) to avoid init() corrupting mkfs.ext4 checksums

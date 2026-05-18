@@ -14,6 +14,7 @@ use crate::process::kthread::{KernelThreadClosure, KernelThreadMechanism};
 use crate::process::namespace::{nsproxy::NsProxy, NamespaceOps, NamespaceType};
 use crate::process::ProcessControlBlock;
 use crate::process::ProcessManager;
+use crate::rcu::RcuOptionArcSlot;
 use crate::time::{Duration, Instant};
 use crate::{
     driver::net::napi::napi_schedule,
@@ -90,16 +91,34 @@ pub struct NetNamespace {
     unix_abstract_table: Arc<UnixAbstractTable>,
     /// Per-netns IPv4 ephemeral port range (ip_local_port_range)
     local_port_range: AtomicU32,
+    /// 当前网络命名空间的 loopback 网卡。
+    loopback_iface: RcuOptionArcSlot<LoopbackInterface>,
+    /// 当前网络命名空间的默认网卡。
+    default_iface: RcuOptionArcSlot<DefaultIfaceRef>,
 }
 
 #[derive(Debug)]
 pub struct InnerNetNamespace {
     router: Arc<Router>,
-    /// 当前网络命名空间的loopback网卡
-    loopback_iface: Option<Arc<LoopbackInterface>>,
-    /// 当前网络命名空间的默认网卡
-    /// 这个网卡会在没有指定网卡的情况下使用
-    default_iface: Option<Arc<dyn Iface>>,
+}
+
+struct DefaultIfaceRef {
+    iface: Arc<dyn Iface>,
+}
+
+impl DefaultIfaceRef {
+    fn new(iface: Arc<dyn Iface>) -> Arc<Self> {
+        Arc::new(Self { iface })
+    }
+}
+
+impl core::fmt::Debug for DefaultIfaceRef {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DefaultIfaceRef")
+            .field("nic_id", &self.iface.nic_id())
+            .field("iface_name", &self.iface.iface_name())
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -260,10 +279,6 @@ impl InnerNetNamespace {
     pub fn router(&self) -> &Arc<Router> {
         &self.router
     }
-
-    pub fn loopback_iface(&self) -> Option<Arc<LoopbackInterface>> {
-        self.loopback_iface.clone()
-    }
 }
 
 impl NetNamespace {
@@ -271,8 +286,6 @@ impl NetNamespace {
         let inner = InnerNetNamespace {
             // 这里没有直接创建 router，而是留到 init 函数中创建
             router: Router::new_empty(),
-            loopback_iface: None,
-            default_iface: None,
         };
 
         let ns_common = NsCommon::new(0, NamespaceType::Net);
@@ -292,6 +305,8 @@ impl NetNamespace {
             local_port_range: AtomicU32::new(
                 crate::net::socket::inet::common::port::DEFAULT_LOCAL_PORT_RANGE,
             ),
+            loopback_iface: RcuOptionArcSlot::new_none(),
+            default_iface: RcuOptionArcSlot::new_none(),
         });
 
         log::info!("Initialized root net namespace");
@@ -304,8 +319,6 @@ impl NetNamespace {
 
         let inner = InnerNetNamespace {
             router: Router::new(format!("netns_router_{}", counter)),
-            loopback_iface: Some(loopback.clone()),
-            default_iface: None,
         };
 
         let ns_common = NsCommon::new(0, NamespaceType::Net);
@@ -325,6 +338,8 @@ impl NetNamespace {
             local_port_range: AtomicU32::new(
                 crate::net::socket::inet::common::port::DEFAULT_LOCAL_PORT_RANGE,
             ),
+            loopback_iface: RcuOptionArcSlot::new_some(loopback.clone()),
+            default_iface: RcuOptionArcSlot::new_none(),
         });
 
         // Linux 语义：每个 netns 都需要一个可被唤醒的轮询线程来推进协议栈。
@@ -395,19 +410,22 @@ impl NetNamespace {
     }
 
     pub fn set_loopback_iface(&self, loopback: Arc<LoopbackInterface>) {
-        self.inner_mut().loopback_iface = Some(loopback);
+        self.loopback_iface.store_deferred(Some(loopback));
     }
 
     pub fn loopback_iface(&self) -> Option<Arc<LoopbackInterface>> {
-        self.inner().loopback_iface()
+        self.loopback_iface.load()
     }
 
     pub fn set_default_iface(&self, iface: Arc<dyn Iface>) {
-        self.inner_mut().default_iface = Some(iface);
+        self.default_iface
+            .store_deferred(Some(DefaultIfaceRef::new(iface)));
     }
 
     pub fn default_iface(&self) -> Option<Arc<dyn Iface>> {
-        self.inner().default_iface.clone()
+        self.default_iface
+            .load()
+            .map(|current| current.iface.clone())
     }
 
     pub fn router(&self) -> Arc<Router> {
@@ -441,7 +459,15 @@ impl NetNamespace {
     }
 
     pub fn remove_device(&self, nic_id: &usize) {
-        self.device_list_mut().remove(nic_id);
+        let removed = self.device_list_mut().remove(nic_id);
+        if removed.is_none() {
+            return;
+        }
+
+        self.default_iface
+            .clear_if_deferred(|current| current.iface.nic_id() == *nic_id);
+        self.loopback_iface
+            .clear_if_deferred(|current| current.nic_id() == *nic_id);
     }
 
     pub fn insert_bridge(&self, bridge: Arc<BridgeDriver>) {
@@ -486,6 +512,6 @@ impl Drop for NetNamespace {
 
 impl ProcessManager {
     pub fn current_netns() -> Arc<NetNamespace> {
-        Self::current_pcb().nsproxy.read().net_ns.clone()
+        Self::current_pcb().nsproxy().net_ns.clone()
     }
 }

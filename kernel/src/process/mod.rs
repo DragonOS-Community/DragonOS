@@ -60,9 +60,11 @@ use crate::{
         PhysAddr, VirtAddr,
     },
     process::resource::{RLimit64, RLimitID},
+    rcu::RcuArcSlot,
     sched::{
-        DequeueFlag, EnqueueFlag, OnRq, SchedMode, WakeupFlags, __schedule, completion::Completion,
-        cpu_rq, enqueue_task_on_cpu, fair::FairSchedEntity, prio::MAX_PRIO, select_task_rq,
+        DequeueFlag, EnqueueFlag, OnRq, SchedMode, WakeupFlags, __schedule_with_current,
+        completion::Completion, cpu_rq, enqueue_task_on_cpu, fair::FairSchedEntity, prio::MAX_PRIO,
+        select_task_rq,
     },
     smp::{
         core::smp_get_processor_id,
@@ -608,8 +610,7 @@ impl ProcessManager {
 
     /// 当子进程退出后向父进程发送通知
     #[inline(never)]
-    fn exit_notify() {
-        let current = ProcessManager::current_pcb();
+    fn exit_notify(current: &Arc<ProcessControlBlock>) {
         let sighand = current.sighand();
         let exec_task = if sighand.flags_contains(SignalFlags::GROUP_EXEC) {
             sighand.group_exec_task()
@@ -619,11 +620,11 @@ impl ProcessManager {
         let is_mt_exec_leader = current.is_thread_group_leader()
             && exec_task
                 .as_ref()
-                .map(|t| !Arc::ptr_eq(t, &current))
+                .map(|t| !Arc::ptr_eq(t, current))
                 .unwrap_or(false);
         if sighand.flags_contains(SignalFlags::GROUP_EXEC) {
             if let Some(exec_task) = exec_task.as_ref() {
-                if !Arc::ptr_eq(exec_task, &current) {
+                if !Arc::ptr_eq(exec_task, current) {
                     let notify_count = sighand.group_exec_notify_count();
                     if notify_count < 0 {
                         // mt-exec: exec 线程正在等待 leader 退出
@@ -635,7 +636,7 @@ impl ProcessManager {
             }
             let should_clear = exec_task
                 .as_ref()
-                .map(|t| Arc::ptr_eq(t, &current))
+                .map(|t| Arc::ptr_eq(t, current))
                 .unwrap_or(false);
             if should_clear {
                 sighand.finish_group_exec();
@@ -738,15 +739,14 @@ impl ProcessManager {
                 spin_loop();
             }
         }
-        drop(current_pcb);
 
         // 关中断
         let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let pid: Arc<Pid>;
-        let raw_pid = ProcessManager::current_pid();
+        let raw_pid = current_pcb.raw_pid();
         // log::debug!("[exit: {}]", raw_pid.data());
         {
-            let pcb = ProcessManager::current_pcb();
+            let pcb = current_pcb.clone();
             pcb.mark_exiting();
             pid = pcb.pid();
             pcb.wait_queue.mark_dead();
@@ -852,12 +852,10 @@ impl ProcessManager {
 
             unsafe { pcb.basic_mut().set_user_vm(None) };
 
-            drop(pcb);
-
-            ProcessManager::exit_notify();
+            ProcessManager::exit_notify(&pcb);
         }
 
-        __schedule(SchedMode::SM_NONE);
+        __schedule_with_current(SchedMode::SM_NONE, current_pcb);
         error!("raw_pid {raw_pid:?} exited but sched again!");
         #[allow(clippy::empty_loop)]
         loop {
@@ -1274,15 +1272,20 @@ pub struct ProcessControlBlock {
     pid_links: [PidLink; PidType::PIDTYPE_MAX],
 
     /// namespace代理
-    nsproxy: RwLock<Arc<NsProxy>>,
+    nsproxy: RcuArcSlot<NsProxy>,
     /// 任务所属 cgroup（v2）
     task_cgroup: RwLock<TaskCgroupRef>,
 
     basic: RwLock<ProcessBasicInfo>,
     /// 当前进程的自旋锁持有计数
     preempt_count: AtomicUsize,
+    /// 当前进程的 RCU 读侧嵌套层数
+    rcu_read_depth: AtomicUsize,
 
     flags: LockFreeFlags<ProcessFlags>,
+    /// Serializes task-local pointer publication for RCU-protected metadata
+    /// such as `cred`, `nsproxy`, and `sighand`.
+    task_lock: SpinLock<()>,
     worker_private: SpinLock<Option<WorkerPrivate>>,
     /// 进程的内核栈
     kernel_stack: RwLock<KernelStack>,
@@ -1296,7 +1299,7 @@ pub struct ProcessControlBlock {
     arch_info: SpinLock<ArchPCBInfo>,
     /// 与信号处理相关的信息(似乎可以是无锁的)
     sig_info: RwLock<ProcessSignalInfo>,
-    sighand: RwLock<Arc<SigHand>>,
+    sighand: RcuArcSlot<SigHand>,
     /// 备用信号栈
     sig_altstack: RwLock<SigStackArch>,
     /// 退出状态（Running/Zombie/Dead）
@@ -1355,7 +1358,7 @@ pub struct ProcessControlBlock {
     rseq_state: RwLock<rseq::RseqState>,
 
     /// 进程作为主体的凭证集
-    cred: SpinLock<Arc<Cred>>,
+    cred: RcuArcSlot<Cred>,
     self_ref: Weak<ProcessControlBlock>,
 
     restart_block: SpinLock<Option<RestartBlock>>,
@@ -1443,7 +1446,10 @@ impl ProcessControlBlock {
 
         let basic_info = ProcessBasicInfo::new(ppid, name.clone(), cwd, None);
         let preempt_count = AtomicUsize::new(0);
+        let rcu_read_depth = AtomicUsize::new(0);
         let flags = unsafe { LockFreeFlags::new(ProcessFlags::empty()) };
+        let initial_sighand = SigHand::new();
+        initial_sighand.attach_task_ref();
 
         let sched_info = ProcessSchedulerInfo::new(None);
 
@@ -1460,18 +1466,20 @@ impl ProcessControlBlock {
                 tgid: raw_pid,
                 thread_pid: RwLock::new(None),
                 pid_links: core::array::from_fn(|_| PidLink::default()),
-                nsproxy: RwLock::new(nsproxy),
+                nsproxy: RcuArcSlot::new(nsproxy),
                 task_cgroup: RwLock::new(task_cgroup),
                 basic: basic_info,
                 preempt_count,
+                rcu_read_depth,
                 flags,
+                task_lock: SpinLock::new(()),
                 kernel_stack: RwLock::new(kstack),
                 syscall_stack: RwLock::new(KernelStack::new().unwrap()),
                 worker_private: SpinLock::new(None),
                 sched_info,
                 arch_info,
                 sig_info: RwLock::new(ProcessSignalInfo::default()),
-                sighand: RwLock::new(SigHand::new()),
+                sighand: RcuArcSlot::new(initial_sighand.clone()),
                 sig_altstack: RwLock::new(SigStackArch::new()),
                 exit_state: AtomicU8::new(ExitState::Running as u8),
                 exit_signal: AtomicSignal::new(Signal::SIGCHLD),
@@ -1495,7 +1503,7 @@ impl ProcessControlBlock {
                 cpu_time: Arc::new(ProcessCpuTime::default()),
                 robust_list: RwLock::new(None),
                 rseq_state: RwLock::new(rseq::RseqState::new()),
-                cred: SpinLock::new(cred),
+                cred: RcuArcSlot::new(cred),
                 self_ref: weak.clone(),
                 restart_block: SpinLock::new(None),
                 executable_path: RwLock::new(name),
@@ -1568,6 +1576,13 @@ impl ProcessControlBlock {
         arr[RLimitID::Fsize as usize] = RLimit64 {
             rlim_cur: u64::MAX,
             rlim_max: u64::MAX,
+        };
+
+        // Linux commonly defaults RLIMIT_MEMLOCK to 64 KiB. Keeping the hard
+        // limit non-zero also allows unprivileged tests to lower the soft limit.
+        arr[RLimitID::Memlock as usize] = RLimit64 {
+            rlim_cur: 64 * 1024,
+            rlim_max: 64 * 1024,
         };
 
         arr
@@ -1663,6 +1678,11 @@ impl ProcessControlBlock {
         return self.preempt_count.load(Ordering::SeqCst);
     }
 
+    #[inline(always)]
+    pub fn rcu_read_depth(&self) -> usize {
+        self.rcu_read_depth.load(Ordering::SeqCst)
+    }
+
     /// 增加当前进程的锁持有计数
     #[inline(always)]
     pub fn preempt_disable(&self) {
@@ -1673,6 +1693,28 @@ impl ProcessControlBlock {
     #[inline(always)]
     pub fn preempt_enable(&self) {
         self.preempt_count.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    #[inline(always)]
+    pub fn rcu_read_lock(&self) {
+        self.rcu_read_depth.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[inline(always)]
+    pub fn rcu_read_unlock(&self) {
+        let mut current = self.rcu_read_depth.load(Ordering::SeqCst);
+        loop {
+            assert!(current > 0, "rcu_read_unlock underflow");
+            match self.rcu_read_depth.compare_exchange(
+                current,
+                current - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     #[inline(always)]
@@ -1850,7 +1892,7 @@ impl ProcessControlBlock {
 
     #[inline(always)]
     pub fn cred(&self) -> Arc<Cred> {
-        self.cred.lock().clone()
+        self.cred.load()
     }
 
     /// 原子替换当前进程的凭据集（cred）
@@ -1858,7 +1900,8 @@ impl ProcessControlBlock {
     /// - 使用 irqsave 写锁保证并发安全
     /// - 返回 Result 以便调用方在需要时扩展错误处理
     pub fn set_cred(&self, new: Arc<Cred>) -> Result<(), SystemError> {
-        *self.cred.lock_irqsave() = new;
+        let _task_guard = self.task_lock.lock_irqsave();
+        self.cred.store_deferred(new);
         Ok(())
     }
 
@@ -2296,21 +2339,16 @@ impl ProcessControlBlock {
 
     /// 获取进程的namespace代理
     pub fn nsproxy(&self) -> Arc<NsProxy> {
-        self.nsproxy.read().clone()
+        self.nsproxy.load()
     }
 
     /// 设置进程的namespace代理
     ///
     /// ## 参数
     /// - `nsproxy` : 新的namespace代理
-    ///
-    /// ## 返回值
-    /// 返回旧的namespace代理
-    pub fn set_nsproxy(&self, nsproxy: Arc<NsProxy>) -> Arc<NsProxy> {
-        let mut guard = self.nsproxy.write();
-        let old = guard.clone();
-        *guard = nsproxy;
-        return old;
+    pub fn set_nsproxy(&self, nsproxy: Arc<NsProxy>) {
+        let _task_guard = self.task_lock.lock_irqsave();
+        self.nsproxy.store_deferred(nsproxy);
     }
 
     pub fn task_cgroup_ref(&self) -> TaskCgroupRef {
@@ -2379,6 +2417,7 @@ impl Drop for ProcessControlBlock {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         // log::debug!("Drop ProcessControlBlock: pid: {}", self.raw_pid(),);
         self.__exit_signal();
+        self.sighand().detach_task_ref();
         // 新的 ProcFS 是动态的，进程目录会在访问时按需创建
         // 不再需要显式注册/注销进程
         if let Some(ppcb) = self.parent_pcb.read_irqsave().upgrade() {

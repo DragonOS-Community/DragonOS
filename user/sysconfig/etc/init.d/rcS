@@ -11,6 +11,38 @@ if [ ! -d /tmp ]; then
 fi
 mount -t tmpfs tmpfs /tmp || /bin/busybox mount -t tmpfs tmpfs /tmp
 
+# 如果 rootfs 中带有 apt，则按 Ubuntu 24.04 的 deb822 sources 格式切换到 USTC HTTP 源。
+if command -v apt >/dev/null 2>&1 || command -v apt-get >/dev/null 2>&1; then
+    echo "[rcS] apt detected, switching Ubuntu 24.04 apt sources to USTC..."
+
+    if [ -f /etc/apt/sources.list ] && [ ! -f /etc/apt/sources.list.dragonos.bak ]; then
+        cp /etc/apt/sources.list /etc/apt/sources.list.dragonos.bak
+    fi
+
+    if [ -f /etc/apt/sources.list.d/ubuntu.sources ] && [ ! -f /etc/apt/sources.list.d/ubuntu.sources.dragonos.bak ]; then
+        cp /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.dragonos.bak
+    fi
+
+    mkdir -p /etc/apt/sources.list.d
+    cat > /etc/apt/sources.list.d/ubuntu.sources <<'EOF'
+Types: deb
+URIs: http://mirrors.ustc.edu.cn/ubuntu
+Suites: noble noble-updates noble-backports
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb
+URIs: http://mirrors.ustc.edu.cn/ubuntu
+Suites: noble-security
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+EOF
+
+    if [ -f /etc/apt/sources.list ]; then
+        : > /etc/apt/sources.list
+    fi
+fi
+
 # 根据环境变量AUTO_TEST决定是否进行自动测试
 if [ "$AUTO_TEST" = "syscall" ]; then
     /bin/busybox sh $SYSCALL_TEST_DIR/run_tests.sh

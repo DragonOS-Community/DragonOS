@@ -27,16 +27,19 @@ impl Syscall for SysSetGid {
         id_utils::validate_setuid_id(gid)?;
 
         let pcb = ProcessManager::current_pcb();
-        let mut guard = pcb.cred.lock();
-        let mut new_cred: Cred = (**guard).clone();
+        let old_cred = pcb.cred();
+        let mut new_cred: Cred = (*old_cred).clone();
 
-        if guard.euid.data() == 0 {
+        if old_cred.euid.data() == 0 {
             // 特权进程：设置所有 GID
             new_cred.setgid(gid);
             new_cred.setegid(gid);
             new_cred.setsgid(gid);
             new_cred.setfsgid(gid);
-        } else if guard.gid.data() == gid || guard.egid.data() == gid || guard.sgid.data() == gid {
+        } else if old_cred.gid.data() == gid
+            || old_cred.egid.data() == gid
+            || old_cred.sgid.data() == gid
+        {
             // 非特权进程：只能设置 egid 为当前 rgid/egid/sgid 之一
             new_cred.setegid(gid);
             new_cred.setfsgid(gid);
@@ -46,9 +49,9 @@ impl Syscall for SysSetGid {
 
         // 注意：GID 变化不直接影响 capability，但为了代码一致性保留此调用
         // 目前 handle_gid_capabilities 是空实现
-        let old_rgid = guard.gid.data();
-        let old_egid = guard.egid.data();
-        let old_sgid = guard.sgid.data();
+        let old_rgid = old_cred.gid.data();
+        let old_egid = old_cred.egid.data();
+        let old_sgid = old_cred.sgid.data();
         let new_rgid = new_cred.gid.data();
         let new_egid = new_cred.egid.data();
         let new_sgid = new_cred.sgid.data();
@@ -62,7 +65,7 @@ impl Syscall for SysSetGid {
             new_sgid,
         );
 
-        *guard = Cred::new_arc(new_cred);
+        pcb.set_cred(Cred::new_arc(new_cred))?;
 
         Ok(0)
     }

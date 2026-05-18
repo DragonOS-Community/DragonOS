@@ -1,8 +1,9 @@
 use super::KernFSInode;
+use crate::filesystem::vfs::file::FilePrivateData;
 use crate::filesystem::{sysfs::SysFSKernPrivateData, vfs::PollStatus};
 use crate::libs::mutex::MutexGuard;
 use crate::tracepoint::{TraceCmdLineCacheSnapshot, TracePipeSnapshot, TracePointInfo};
-use alloc::sync::Arc;
+use alloc::{string::String, sync::Arc};
 use core::fmt::Debug;
 use system_error::SystemError;
 
@@ -33,18 +34,24 @@ pub trait KernFSCallback: Send + Sync + Debug {
 #[derive(Debug)]
 pub struct KernCallbackData<'a> {
     kern_inode: Arc<KernFSInode>,
-    private_data: MutexGuard<'a, Option<KernInodePrivateData>>,
+    inode_private_data: MutexGuard<'a, Option<KernInodePrivateData>>,
+    file_private_data: MutexGuard<'a, FilePrivateData>,
 }
 
 #[allow(dead_code)]
 impl<'a> KernCallbackData<'a> {
     pub fn new(
         kern_inode: Arc<KernFSInode>,
-        private_data: MutexGuard<'a, Option<KernInodePrivateData>>,
+        inode_private_data: MutexGuard<'a, Option<KernInodePrivateData>>,
+        mut file_private_data: MutexGuard<'a, FilePrivateData>,
     ) -> Self {
+        if !matches!(*file_private_data, FilePrivateData::Kernfs(_)) {
+            *file_private_data = FilePrivateData::Kernfs(None);
+        }
         Self {
             kern_inode,
-            private_data,
+            inode_private_data,
+            file_private_data,
         }
     }
 
@@ -55,12 +62,28 @@ impl<'a> KernCallbackData<'a> {
 
     #[inline(always)]
     pub fn private_data(&self) -> &Option<KernInodePrivateData> {
-        return &self.private_data;
+        return &self.inode_private_data;
     }
 
     #[inline(always)]
     pub fn private_data_mut(&mut self) -> &mut Option<KernInodePrivateData> {
-        return &mut self.private_data;
+        return &mut self.inode_private_data;
+    }
+
+    #[inline(always)]
+    pub fn file_private_data(&self) -> Option<&KernFilePrivateData> {
+        match &*self.file_private_data {
+            FilePrivateData::Kernfs(private_data) => private_data.as_ref(),
+            _ => None,
+        }
+    }
+
+    #[inline(always)]
+    pub fn file_private_data_mut(&mut self) -> &mut Option<KernFilePrivateData> {
+        match &mut *self.file_private_data {
+            FilePrivateData::Kernfs(private_data) => private_data,
+            _ => panic!("kernfs callback file private data is not initialized"),
+        }
     }
 
     pub fn callback_read(&self, buf: &mut [u8], offset: usize) -> Result<usize, SystemError> {
@@ -85,8 +108,14 @@ impl<'a> KernCallbackData<'a> {
 pub enum KernInodePrivateData {
     SysFS(SysFSKernPrivateData),
     DebugFS(Arc<TracePointInfo>),
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub enum KernFilePrivateData {
     TracePipe(TracePipeSnapshot),
     TraceSavedCmdlines(TraceCmdLineCacheSnapshot),
+    RcuSelftestReport(String),
 }
 
 impl KernInodePrivateData {

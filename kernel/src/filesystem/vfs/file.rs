@@ -194,8 +194,14 @@ impl Default for FilePrivateData {
 
 impl FilePrivateData {
     pub fn update_flags(&mut self, flags: FileFlags) {
-        if let FilePrivateData::Pipefs(pdata) = self {
-            pdata.set_flags(flags);
+        match self {
+            FilePrivateData::Pipefs(pdata) => {
+                pdata.set_flags(flags);
+            }
+            FilePrivateData::Tty(pdata) => {
+                pdata.flags = flags;
+            }
+            _ => {}
         }
     }
 

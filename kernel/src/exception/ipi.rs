@@ -19,6 +19,7 @@ use super::{
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum IpiKind {
     KickCpu,
+    StopCpu,
     /// TLB shootdown IPI.
     ///
     /// Do NOT directly `send_ipi(IpiKind::FlushTLB, ..)` in new code:

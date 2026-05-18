@@ -13,7 +13,10 @@ use crate::{
         },
         interrupt::{
             entry::arch_setup_interrupt_gate,
-            ipi::{arch_ipi_handler_init, send_ipi, IPI_NUM_FLUSH_TLB, IPI_NUM_KICK_CPU},
+            ipi::{
+                arch_ipi_handler_init, send_ipi, IPI_NUM_FLUSH_TLB, IPI_NUM_KICK_CPU,
+                IPI_NUM_STOP_CPU,
+            },
             msi::{X86MsiAddrHi, X86MsiAddrLoNormal, X86MsiDataNormal, X86_MSI_BASE_ADDRESS_LOW},
         },
     },
@@ -260,7 +263,12 @@ pub fn arch_early_irq_init() -> Result<(), SystemError> {
     CurrentApic.init_current_cpu();
     if smp_get_processor_id().data() == 0 {
         unsafe { arch_setup_interrupt_gate() };
-        ioapic_init(&[APIC_TIMER_IRQ_NUM, IPI_NUM_KICK_CPU, IPI_NUM_FLUSH_TLB]);
+        ioapic_init(&[
+            APIC_TIMER_IRQ_NUM,
+            IPI_NUM_KICK_CPU,
+            IPI_NUM_FLUSH_TLB,
+            IPI_NUM_STOP_CPU,
+        ]);
     }
     return Ok(());
 }

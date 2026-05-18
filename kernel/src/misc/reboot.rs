@@ -2,7 +2,7 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
 use crate::{
-    arch::reboot::{machine_halt, machine_power_off, machine_restart},
+    arch::reboot::{machine_halt, machine_power_off, machine_restart, migrate_to_reboot_cpu},
     driver::base::device::device_shutdown,
     init::initial_kthread::{set_system_state, SystemState},
     libs::{
@@ -255,6 +255,7 @@ pub(super) fn do_sys_reboot(
 pub fn kernel_restart(cmd: Option<&str>) -> ! {
     kernel_restart_prepare(cmd);
     do_kernel_restart_prepare();
+    migrate_to_reboot_cpu();
     syscore_shutdown();
 
     if let Some(cmd) = cmd {
@@ -297,6 +298,7 @@ pub fn kernel_power_off() -> ! {
     kernel_shutdown_prepare(SystemState::PowerOff);
     do_kernel_power_off_prepare();
     do_power_off_handlers_prepare();
+    migrate_to_reboot_cpu();
     syscore_shutdown();
 
     log::warn!("Power down");
@@ -382,6 +384,7 @@ pub fn do_machine_power_off() -> Result<(), SystemError> {
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/reboot.c#293
 pub fn kernel_halt() -> ! {
     kernel_shutdown_prepare(SystemState::Halt);
+    migrate_to_reboot_cpu();
     syscore_shutdown();
 
     machine_halt();

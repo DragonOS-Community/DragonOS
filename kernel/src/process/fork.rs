@@ -712,12 +712,12 @@ impl ProcessManager {
             // 分层PID分配：在父进程的子PID namespace中为新任务分配PID
             let ns = pcb.nsproxy().pid_namespace_for_children().clone();
 
-            let main_pid_arc = alloc_pid(&ns).expect("alloc_pid failed");
+            let main_pid_arc = alloc_pid(&ns)?;
 
             // 根namespace中的PID号作为RawPid
             let root_pid_nr = main_pid_arc
                 .first_upid()
-                .expect("UPid list empty")
+                .ok_or(SystemError::EINVAL)?
                 .nr
                 .data();
             // log::debug!("fork: root_pid_nr: {}", root_pid_nr);

@@ -578,7 +578,7 @@ impl Rseq {
             if let Err(e) = Self::ip_fixup(frame, &access, sig, user_end, &pcb) {
                 log::debug!("rseq ip_fixup failed: {:?}", e);
                 pcb.flags().remove(ProcessFlags::NEED_RSEQ);
-                let _ = crate::ipc::signal::send_kernel_signal_to_current(
+                let _ = crate::ipc::signal::force_kernel_signal_to_current(
                     crate::arch::ipc::signal::Signal::SIGSEGV,
                 );
                 return Err(());
@@ -590,7 +590,7 @@ impl Rseq {
         if let Err(_e) = unsafe { access.update_cpu_node_id(cpu_id, 0, 0) } {
             // log::debug!("rseq update_cpu_node_id failed: {:?}", e);
             pcb.flags().remove(ProcessFlags::NEED_RSEQ);
-            let _ = crate::ipc::signal::send_kernel_signal_to_current(
+            let _ = crate::ipc::signal::force_kernel_signal_to_current(
                 crate::arch::ipc::signal::Signal::SIGSEGV,
             );
             return Err(());

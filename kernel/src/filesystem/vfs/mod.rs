@@ -1287,6 +1287,13 @@ pub struct SuperBlock {
     pub flags: u64,
 }
 
+pub struct FsReconfigureRequest<'a> {
+    pub sb_flags: MountFlags,
+    pub sb_flags_mask: MountFlags,
+    pub raw_data: Option<&'a str>,
+    pub oldapi: bool,
+}
+
 impl SuperBlock {
     pub fn new(magic: Magic, bsize: u64, namelen: u64) -> Self {
         Self {
@@ -1363,6 +1370,13 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     /// 默认实现直接返回 super_block。需要自定义 statfs 行为的文件系统可覆写此方法。
     fn statfs(&self, _inode: &Arc<dyn IndexNode>) -> Result<SuperBlock, SystemError> {
         Ok(self.super_block())
+    }
+
+    fn reconfigure(&self, request: FsReconfigureRequest<'_>) -> Result<MountFlags, SystemError> {
+        if request.raw_data.is_some_and(|raw| !raw.trim().is_empty()) {
+            return Err(SystemError::EINVAL);
+        }
+        Ok(request.sb_flags & request.sb_flags_mask)
     }
 
     /// VFS permission checking policy for this filesystem instance.

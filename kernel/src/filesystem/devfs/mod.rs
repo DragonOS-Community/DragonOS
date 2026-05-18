@@ -1,4 +1,5 @@
 /// 导出devfs的模块
+pub mod full_dev;
 pub mod null_dev;
 pub mod random_dev;
 pub mod zero_dev;
@@ -10,16 +11,21 @@ use super::{
         FileType, FsInfo, IndexNode, InodeFlags, InodeMode, Magic, Metadata, SuperBlock,
     },
 };
-use crate::filesystem::devfs::zero_dev::LockedZeroInode;
-use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
-use crate::mm::VmFaultReason;
+
 use crate::{
     driver::base::{block::gendisk::GenDisk, device::device_number::DeviceNumber},
-    filesystem::vfs::{mount::MountFlags, produce_fs},
+    filesystem::{
+        devfs::zero_dev::LockedZeroInode,
+        vfs::{mount::MountFlags, produce_fs},
+    },
     libs::{
         casting::DowncastArc,
         mutex::{Mutex, MutexGuard},
         once::Once,
+    },
+    mm::{
+        fault::{PageFaultHandler, PageFaultMessage},
+        VmFaultReason,
     },
     process::ProcessManager,
     time::PosixTimeSpec,
@@ -152,23 +158,37 @@ impl DevFS {
 
     /// @brief 注册系统内部自带的设备
     fn register_bultinin_device(&self) {
+        use crate::driver::base::device::device_number::{DeviceNumber, Major};
         use crate::filesystem::fuse::dev::LockedFuseDevInode;
+        use full_dev::LockedFullInode;
         use null_dev::LockedNullInode;
         use random_dev::LockedRandomInode;
         use zero_dev::LockedZeroInode;
         let dev_root: Arc<LockedDevFSInode> = self.root_inode.clone();
         dev_root
-            .add_dev("null", LockedNullInode::new())
-            .expect("DevFS: Failed to register /dev/null");
-        dev_root
-            .add_dev("zero", LockedZeroInode::new())
-            .expect("DevFS: Failed to register /dev/zero");
-        dev_root
-            .add_dev("random", LockedRandomInode::new())
-            .expect("DevFS: Failed to register /dev/random");
+            .add_dev("full", LockedFullInode::new())
+            .expect("DevFS: Failed to register /dev/full");
         dev_root
             .add_dev("fuse", LockedFuseDevInode::new())
             .expect("DevFS: Failed to register /dev/fuse");
+        dev_root
+            .add_dev("null", LockedNullInode::new())
+            .expect("DevFS: Failed to register /dev/null");
+        dev_root
+            .add_dev(
+                "random",
+                LockedRandomInode::new(DeviceNumber::new(Major::new(1), 8)),
+            )
+            .expect("DevFS: Failed to register /dev/random");
+        dev_root
+            .add_dev(
+                "urandom",
+                LockedRandomInode::new(DeviceNumber::new(Major::new(1), 9)),
+            )
+            .expect("DevFS: Failed to register /dev/urandom");
+        dev_root
+            .add_dev("zero", LockedZeroInode::new())
+            .expect("DevFS: Failed to register /dev/zero");
     }
 
     /// @brief 在devfs内注册设备

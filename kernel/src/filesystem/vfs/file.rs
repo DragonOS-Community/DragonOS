@@ -696,6 +696,13 @@ impl File {
             mode = FileMode::FMODE_PATH | FileMode::FMODE_OPENED;
         }
 
+        if mode.contains(FileMode::FMODE_WRITE) {
+            if let Some(mnt_inode) = inode.clone().downcast_arc::<MountFSInode>() {
+                mnt_inode.mount_fs().inc_write_count();
+                mode.insert(FileMode::FMODE_WRITER);
+            }
+        }
+
         let wb_error_seq = inode
             .page_cache()
             .map(|page_cache| page_cache.sample_writeback_error())
@@ -1486,6 +1493,11 @@ impl File {
 impl Drop for File {
     fn drop(&mut self) {
         super::flock::release_all_for_file(self);
+        if self.mode.read().contains(FileMode::FMODE_WRITER) {
+            if let Some(mnt_inode) = self.inode.clone().downcast_arc::<MountFSInode>() {
+                mnt_inode.mount_fs().dec_write_count();
+            }
+        }
         let r: Result<(), SystemError> = self.inode.close(self.private_data.lock());
         // 打印错误信息
         if let Err(e) = r {

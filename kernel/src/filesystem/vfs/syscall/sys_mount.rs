@@ -7,7 +7,8 @@ use crate::{
         mount::{is_mountpoint_root, MountFlags},
         produce_fs,
         utils::user_path_at,
-        FileType, IndexNode, InodeId, MountFS, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        FileType, FsReconfigureRequest, IndexNode, InodeId, MountFS, MAX_PATHLEN,
+        VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
     libs::casting::DowncastArc,
     process::{
@@ -217,6 +218,15 @@ fn path_mount(
     if flags.contains(MountFlags::NOSYMFOLLOW) {
         mnt_flags.insert(MountFlags::NOSYMFOLLOW);
     }
+    let sb_flags = flags
+        & (MountFlags::RDONLY
+            | MountFlags::SYNCHRONOUS
+            | MountFlags::MANDLOCK
+            | MountFlags::DIRSYNC
+            | MountFlags::SILENT
+            | MountFlags::POSIXACL
+            | MountFlags::LAZYTIME
+            | MountFlags::I_VERSION);
 
     // MS_REMOUNT|MS_BIND 和 MS_REMOUNT 共用此 atime 保留逻辑。
     if flags.contains(MountFlags::REMOUNT)
@@ -243,7 +253,7 @@ fn path_mount(
     }
 
     if flags.contains(MountFlags::REMOUNT) {
-        return do_reconfigure_bind_mount(target_inode, mnt_flags);
+        return do_remount(target_inode, sb_flags, mnt_flags, data);
     }
 
     if flags.contains(MountFlags::BIND) {
@@ -297,7 +307,119 @@ fn do_reconfigure_bind_mount(
     Ok(())
 }
 
-// TODO: do_remount() DragonOS 无 superblock reconfigure 基础设施。
+fn do_remount(
+    target_inode: Arc<dyn IndexNode>,
+    requested_sb_flags: MountFlags,
+    requested_mnt_flags: MountFlags,
+    data: Option<String>,
+) -> Result<(), SystemError> {
+    if !is_mountpoint_root(&target_inode) {
+        return Err(SystemError::EINVAL);
+    }
+
+    let target_mfs = target_inode
+        .fs()
+        .downcast_arc::<MountFS>()
+        .ok_or(SystemError::EINVAL)?;
+
+    let current_mntns = ProcessManager::current_mntns();
+    if !target_mfs.is_belongs_to_mntns(&current_mntns) {
+        return Err(SystemError::EINVAL);
+    }
+
+    let old_sb_flags = target_mfs.super_block_flags();
+    let (data_sb_flags, data_sb_flags_mask, fs_private_data) = parse_remount_data(data.as_deref())?;
+    let sb_flags_mask = MountFlags::RMT_MASK | data_sb_flags_mask;
+    let requested_sb_flags = (requested_sb_flags & !data_sb_flags_mask) | data_sb_flags;
+    let new_sb_flags = (old_sb_flags & !sb_flags_mask) | (requested_sb_flags & sb_flags_mask);
+
+    if new_sb_flags.contains(MountFlags::RDONLY)
+        && !old_sb_flags.contains(MountFlags::RDONLY)
+        && target_mfs.has_writers()
+    {
+        return Err(SystemError::EBUSY);
+    }
+
+    let effective_sb_flags = target_mfs
+        .inner_filesystem()
+        .reconfigure(FsReconfigureRequest {
+            sb_flags: new_sb_flags,
+            sb_flags_mask,
+            raw_data: fs_private_data.as_deref(),
+            oldapi: true,
+        })?;
+
+    target_mfs.set_super_block_flags(effective_sb_flags);
+    target_mfs.update_mount_flags(|mount_flags| {
+        let preserved = *mount_flags & !MountFlags::MNT_USER_SETTABLE_MASK;
+        let new_settable = requested_mnt_flags & MountFlags::MNT_USER_SETTABLE_MASK;
+        *mount_flags = preserved | new_settable;
+    });
+
+    Ok(())
+}
+
+fn parse_remount_data(
+    data: Option<&str>,
+) -> Result<(MountFlags, MountFlags, Option<String>), SystemError> {
+    let Some(data) = data else {
+        return Ok((MountFlags::empty(), MountFlags::empty(), None));
+    };
+
+    let mut sb_flags = MountFlags::empty();
+    let mut sb_flags_mask = MountFlags::empty();
+    let mut private_data = String::new();
+
+    for opt in data.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        match opt {
+            "ro" => {
+                sb_flags.insert(MountFlags::RDONLY);
+                sb_flags_mask.insert(MountFlags::RDONLY);
+            }
+            "rw" => {
+                sb_flags.remove(MountFlags::RDONLY);
+                sb_flags_mask.insert(MountFlags::RDONLY);
+            }
+            "sync" => {
+                sb_flags.insert(MountFlags::SYNCHRONOUS);
+                sb_flags_mask.insert(MountFlags::SYNCHRONOUS);
+            }
+            "async" => {
+                sb_flags.remove(MountFlags::SYNCHRONOUS);
+                sb_flags_mask.insert(MountFlags::SYNCHRONOUS);
+            }
+            "lazytime" => {
+                sb_flags.insert(MountFlags::LAZYTIME);
+                sb_flags_mask.insert(MountFlags::LAZYTIME);
+            }
+            "nolazytime" => {
+                sb_flags.remove(MountFlags::LAZYTIME);
+                sb_flags_mask.insert(MountFlags::LAZYTIME);
+            }
+            "mand" => {
+                sb_flags.insert(MountFlags::MANDLOCK);
+                sb_flags_mask.insert(MountFlags::MANDLOCK);
+            }
+            "nomand" => {
+                sb_flags.remove(MountFlags::MANDLOCK);
+                sb_flags_mask.insert(MountFlags::MANDLOCK);
+            }
+            _ => {
+                if !private_data.is_empty() {
+                    private_data.push(',');
+                }
+                private_data.push_str(opt);
+            }
+        }
+    }
+
+    let private_data = if private_data.is_empty() {
+        None
+    } else {
+        Some(private_data)
+    };
+    Ok((sb_flags, sb_flags_mask, private_data))
+}
 
 fn do_new_mount(
     source: Option<String>,
@@ -448,7 +570,14 @@ fn do_bind_mount(
         .clone()
         .downcast_arc::<crate::filesystem::vfs::mount::MountFSInode>()
         .ok_or(SystemError::EINVAL)?
-        .mount_subtree(inner_fs, root_inner_inode, MountFlags::empty())?;
+        .mount_subtree_with_state(
+            inner_fs,
+            root_inner_inode,
+            MountFlags::empty(),
+            source_mfs_for_recursive
+                .as_ref()
+                .map(|mfs| mfs.super_block_state()),
+        )?;
     target_mfs.set_mount_source(Some(source_path.clone()));
 
     // If MS_REC is set, recursively bind all submounts from source to target
@@ -657,8 +786,12 @@ fn do_recursive_bind_mount(
             .clone()
             .downcast_arc::<crate::filesystem::vfs::mount::MountFSInode>()
             .ok_or(SystemError::EINVAL)?
-            .mount_subtree(child_inner_fs, child_root_inner_inode, MountFlags::empty())
-        {
+            .mount_subtree_with_state(
+                child_inner_fs,
+                child_root_inner_inode,
+                MountFlags::empty(),
+                Some(info.source_mfs.super_block_state()),
+            ) {
             Ok(new_child_mnt) => {
                 let source = info
                     .source_mfs

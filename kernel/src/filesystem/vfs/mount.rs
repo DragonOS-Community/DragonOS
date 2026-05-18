@@ -3,7 +3,7 @@ use core::{
     fmt::Debug,
     hash::Hash,
     mem,
-    sync::atomic::{compiler_fence, Ordering},
+    sync::atomic::{compiler_fence, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -116,6 +116,15 @@ bitflags! {
             MountFlags::MANDLOCK.bits() |
             MountFlags::I_VERSION.bits() |
             MountFlags::LAZYTIME.bits();
+
+        const SB_SETTABLE_MASK = MountFlags::RDONLY.bits()
+            | MountFlags::SYNCHRONOUS.bits()
+            | MountFlags::MANDLOCK.bits()
+            | MountFlags::DIRSYNC.bits()
+            | MountFlags::SILENT.bits()
+            | MountFlags::POSIXACL.bits()
+            | MountFlags::I_VERSION.bits()
+            | MountFlags::LAZYTIME.bits();
 
         /// Old magic mount flag and mask
         const MGC_VAL = 0xC0ED0000; // Magic value for mount flags
@@ -254,7 +263,48 @@ pub struct MountFS {
     mount_id: MountId,
 
     mount_flags: RwSem<MountFlags>,
+    super_block_state: Arc<SuperBlockState>,
     mount_source: RwSem<Option<String>>,
+}
+
+#[derive(Debug)]
+pub struct SuperBlockState {
+    flags: RwSem<MountFlags>,
+    write_count: AtomicUsize,
+}
+
+struct MountStateInit {
+    super_block_state: Arc<SuperBlockState>,
+    mount_source: Option<String>,
+}
+
+impl SuperBlockState {
+    pub fn new(flags: MountFlags) -> Self {
+        Self {
+            flags: RwSem::new(flags & MountFlags::SB_SETTABLE_MASK),
+            write_count: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn flags(&self) -> MountFlags {
+        *self.flags.read()
+    }
+
+    pub fn set_flags(&self, flags: MountFlags) {
+        *self.flags.write() = flags & MountFlags::SB_SETTABLE_MASK;
+    }
+
+    pub fn inc_write_count(&self) {
+        self.write_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn dec_write_count(&self) {
+        self.write_count.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn has_writers(&self) -> bool {
+        self.write_count.load(Ordering::Acquire) != 0
+    }
 }
 
 impl Debug for MountFS {
@@ -301,6 +351,29 @@ impl MountFS {
         mount_flags: MountFlags,
         mount_source: Option<String>,
     ) -> Arc<Self> {
+        Self::new_with_super_block_state(
+            inner_filesystem,
+            root_inner_inode,
+            self_mountpoint,
+            propagation,
+            mnt_ns,
+            mount_flags,
+            MountStateInit {
+                super_block_state: Arc::new(SuperBlockState::new(mount_flags)),
+                mount_source,
+            },
+        )
+    }
+
+    fn new_with_super_block_state(
+        inner_filesystem: Arc<dyn FileSystem>,
+        root_inner_inode: Option<Arc<dyn IndexNode>>,
+        self_mountpoint: Option<Arc<MountFSInode>>,
+        propagation: Arc<MountPropagation>,
+        mnt_ns: Option<&Arc<MntNamespace>>,
+        mount_flags: MountFlags,
+        state_init: MountStateInit,
+    ) -> Arc<Self> {
         let root_inner_inode = root_inner_inode.unwrap_or_else(|| inner_filesystem.root_inode());
         let result = Arc::new_cyclic(|self_ref| MountFS {
             inner_filesystem,
@@ -312,7 +385,8 @@ impl MountFS {
             propagation,
             mount_id: MountId::alloc(),
             mount_flags: RwSem::new(mount_flags),
-            mount_source: RwSem::new(mount_source),
+            super_block_state: state_init.super_block_state,
+            mount_source: RwSem::new(state_init.mount_source),
         });
 
         if let Some(mnt_ns) = mnt_ns {
@@ -337,6 +411,7 @@ impl MountFS {
             propagation: new_propagation,
             mount_id: MountId::alloc(),
             mount_flags: RwSem::new(self.mount_flags()),
+            super_block_state: self.super_block_state.clone(),
             mount_source: RwSem::new(mount_source),
         });
 
@@ -345,6 +420,38 @@ impl MountFS {
 
     pub fn mount_flags(&self) -> MountFlags {
         *self.mount_flags.read()
+    }
+
+    pub fn super_block_flags(&self) -> MountFlags {
+        self.super_block_state.flags()
+    }
+
+    pub fn set_super_block_flags(&self, flags: MountFlags) {
+        self.super_block_state.set_flags(flags);
+    }
+
+    pub fn combined_flags(&self) -> MountFlags {
+        self.mount_flags() | self.super_block_flags()
+    }
+
+    pub fn is_readonly(&self) -> bool {
+        self.combined_flags().contains(MountFlags::RDONLY)
+    }
+
+    pub fn has_writers(&self) -> bool {
+        self.super_block_state.has_writers()
+    }
+
+    pub fn inc_write_count(&self) {
+        self.super_block_state.inc_write_count();
+    }
+
+    pub fn dec_write_count(&self) {
+        self.super_block_state.dec_write_count();
+    }
+
+    pub fn super_block_state(&self) -> Arc<SuperBlockState> {
+        self.super_block_state.clone()
     }
 
     pub fn set_mount_flags(&self, mount_flags: MountFlags) {
@@ -556,7 +663,7 @@ impl Drop for MountFS {
 impl MountFSInode {
     #[inline]
     fn ensure_mount_writable(&self) -> Result<(), SystemError> {
-        if self.mount_fs.mount_flags().contains(MountFlags::RDONLY) {
+        if self.mount_fs.is_readonly() {
             return Err(SystemError::EROFS);
         }
         Ok(())
@@ -567,6 +674,16 @@ impl MountFSInode {
         inner_fs: Arc<dyn FileSystem>,
         root_inner_inode: Arc<dyn IndexNode>,
         mount_flags: MountFlags,
+    ) -> Result<Arc<MountFS>, SystemError> {
+        self.mount_subtree_with_state(inner_fs, root_inner_inode, mount_flags, None)
+    }
+
+    pub(crate) fn mount_subtree_with_state(
+        &self,
+        inner_fs: Arc<dyn FileSystem>,
+        root_inner_inode: Arc<dyn IndexNode>,
+        mount_flags: MountFlags,
+        super_block_state: Option<Arc<SuperBlockState>>,
     ) -> Result<Arc<MountFS>, SystemError> {
         // Linux do_add_mount：父挂载点必须属于当前 mount namespace。
         let current_mntns = ProcessManager::current_mntns();
@@ -589,14 +706,19 @@ impl MountFSInode {
             MountPropagation::new_private()
         };
 
-        let new_mount_fs = MountFS::new(
+        let super_block_state =
+            super_block_state.unwrap_or_else(|| Arc::new(SuperBlockState::new(mount_flags)));
+        let new_mount_fs = MountFS::new_with_super_block_state(
             inner_fs,
             Some(root_inner_inode),
             Some(self.self_ref.upgrade().unwrap()),
             new_propagation,
             Some(&ProcessManager::current_mntns()),
             mount_flags,
-            None,
+            MountStateInit {
+                super_block_state,
+                mount_source: None,
+            },
         );
 
         let mount_path = Arc::new(MountPath::from(self.absolute_path()?));
@@ -865,6 +987,14 @@ impl IndexNode for MountFSInode {
         data: MutexGuard<FilePrivateData>,
         flags: &FileFlags,
     ) -> Result<(), SystemError> {
+        let access = flags.access_flags();
+        if (access == FileFlags::O_WRONLY
+            || access == FileFlags::O_RDWR
+            || flags.contains(FileFlags::O_TRUNC))
+            && self.mount_fs.is_readonly()
+        {
+            return Err(SystemError::EROFS);
+        }
         return self.inner_inode.open(data, flags);
     }
 
@@ -1302,7 +1432,7 @@ impl FileSystem for MountFS {
     }
     fn super_block(&self) -> SuperBlock {
         let mut sb = self.inner_filesystem.super_block();
-        sb.flags = self.mount_flags().bits() as u64;
+        sb.flags = self.combined_flags().bits() as u64;
         sb
     }
 
@@ -1313,7 +1443,7 @@ impl FileSystem for MountFS {
             .map(|mnt| mnt.inner_inode.clone())
             .unwrap_or_else(|| inode.clone());
         let mut sb = self.inner_filesystem.statfs(&inner_inode)?;
-        sb.flags = self.mount_flags().bits() as u64;
+        sb.flags = self.combined_flags().bits() as u64;
         Ok(sb)
     }
 

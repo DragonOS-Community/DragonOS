@@ -14,7 +14,7 @@ pub use crate::ipc::generic_signal::GenericSignal as Signal;
 use crate::process::rseq::Rseq;
 use crate::{
     arch::{
-        fpu::FpState,
+        fpu::{FpState, XFEATURE_AVX, XFEATURE_SSE, XFEATURE_X87},
         interrupt::TrapFrame,
         process::table::{USER_CS, USER_DS},
         syscall::nr::SYS_RESTART_SYSCALL,
@@ -194,6 +194,46 @@ const _: () = {
 };
 
 impl UserXState {
+    fn validate_for_sigreturn(&self) -> Result<(), SystemError> {
+        let mxcsr_mask = FpState::mxcsr_feature_mask();
+        if self.fpstate.mxcsr & !mxcsr_mask != 0 {
+            error!(
+                "invalid signal fpstate mxcsr: value={:#x}, supported_mask={:#x}",
+                self.fpstate.mxcsr, mxcsr_mask
+            );
+            return Err(SystemError::EINVAL);
+        }
+
+        if !FpState::is_xsave_enabled() {
+            return Ok(());
+        }
+
+        let supported_user_xfeatures =
+            FpState::xsave_feature_mask() & (XFEATURE_X87 | XFEATURE_SSE | XFEATURE_AVX);
+        if self.header.xfeatures & !supported_user_xfeatures != 0 {
+            error!(
+                "invalid signal xstate features: value={:#x}, supported_mask={:#x}",
+                self.header.xfeatures, supported_user_xfeatures
+            );
+            return Err(SystemError::EINVAL);
+        }
+
+        if self.header.xcomp_bv != 0 {
+            error!(
+                "invalid signal xstate compacted format: xcomp_bv={:#x}",
+                self.header.xcomp_bv
+            );
+            return Err(SystemError::EINVAL);
+        }
+
+        if self.header.reserved.iter().any(|value| *value != 0) {
+            error!("invalid signal xstate header: reserved bits are non-zero");
+            return Err(SystemError::EINVAL);
+        }
+
+        Ok(())
+    }
+
     /// 从内核 FpState 转换到用户态完整的 XSAVE 状态
     ///
     /// 包含：
@@ -260,7 +300,9 @@ impl UserXState {
     /// 从用户态 XSAVE 状态转换回内核 FpState
     ///
     /// 恢复完整的 XSAVE 状态，包括 AVX
-    pub fn to_kernel_fpstate(self) -> FpState {
+    pub fn to_kernel_fpstate(self) -> Result<FpState, SystemError> {
+        self.validate_for_sigreturn()?;
+
         let mut result = FpState::new();
 
         // 写入 FXSAVE 兼容区域（前 512 字节）
@@ -299,7 +341,7 @@ impl UserXState {
             }
         }
 
-        result
+        Ok(result)
     }
 }
 
@@ -567,9 +609,9 @@ impl SigFrame {
 
     /// 从栈帧恢复 fpstate，包含安全性检查（防止 SROP 攻击）
     /// 返回包含完整 XSAVE 状态（包括 AVX）的 FpState
-    pub fn restore_fpstate(&self) -> Option<FpState> {
+    pub fn restore_fpstate(&self) -> Result<Option<FpState>, SystemError> {
         if self.ucontext.uc_mcontext.fpstate.is_null() {
-            return None;
+            return Ok(None);
         }
 
         // 验证指针确实指向 ucontext 内的 __fpregs_mem.fpstate
@@ -580,11 +622,11 @@ impl SigFrame {
                 "fpstate pointer mismatch: expected={:p}, got={:p}, possible SROP attack",
                 expected_addr, self.ucontext.uc_mcontext.fpstate
             );
-            return None;
+            return Err(SystemError::EFAULT);
         }
 
         // 使用 UserXState::to_kernel_fpstate 恢复完整的 XSAVE 状态（包括 AVX）
-        Some(self.ucontext.__fpregs_mem.to_kernel_fpstate())
+        self.ucontext.__fpregs_mem.to_kernel_fpstate().map(Some)
     }
 }
 
@@ -801,11 +843,22 @@ impl SignalArch for X86_64SignalArch {
         let mut sigmask = frame.ucontext.uc_sigmask.to_kernel_sigset();
         set_current_blocked(&mut sigmask);
 
-        // 2. 恢复通用寄存器
+        // 2. 先校验并构造 FP 状态。失败时按 Linux badframe 语义强制 SIGSEGV，
+        // 避免把用户篡改的状态交给 FXRSTOR/XRSTOR 触发内核 #GP。
+        let kernel_fp = match frame.restore_fpstate() {
+            Ok(kernel_fp) => kernel_fp,
+            Err(err) => {
+                error!("sys_rt_sigreturn: failed to restore fpstate: {:?}", err);
+                let _ = crate::ipc::signal::force_kernel_default_signal_to_current(Signal::SIGSEGV);
+                return 0;
+            }
+        };
+
+        // 3. 恢复通用寄存器
         frame.ucontext.restore_to_trapframe(trap_frame);
 
-        // 3. 恢复 FP 状态（包含安全性检查）
-        if let Some(kernel_fp) = frame.restore_fpstate() {
+        // 4. 恢复 FP 状态
+        if let Some(kernel_fp) = kernel_fp {
             let pcb = ProcessManager::current_pcb();
             let mut archinfo_guard = pcb.arch_info_irqsave();
             *archinfo_guard.fp_state_mut() = Some(kernel_fp);
@@ -813,8 +866,6 @@ impl SignalArch for X86_64SignalArch {
 
             // 恢复 cr2
             *archinfo_guard.cr2_mut() = frame.ucontext.uc_mcontext.cr2 as usize;
-        } else {
-            error!("sys_rt_sigreturn: failed to restore fpstate");
         }
 
         // 返回恢复后的 rax 值

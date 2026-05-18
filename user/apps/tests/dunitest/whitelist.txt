@@ -21,3 +21,4 @@ fuse/fuse_extended
 normal/test_procfs_link
 normal/user_namespace_id_map
 normal/tty_tcflush
+normal/signal_fpstate_sigreturn

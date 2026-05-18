@@ -254,7 +254,10 @@ fn splice_file_to_pipe(
 ) -> Result<usize, SystemError> {
     let pipe_inode = get_pipe_inode(pipe)?;
 
-    let buf_size = len.min(4096);
+    let mut buf_size = len.min(4096);
+    if !flags.contains(SpliceFlags::SPLICE_F_NONBLOCK) {
+        buf_size = pipe_inode.wait_writable_for_splice(buf_size)?;
+    }
     let mut buffer = vec![0u8; buf_size];
 
     // 从文件读取

@@ -537,7 +537,11 @@ impl Rseq {
         unsafe { access.reset() }.map_err(|_| SystemError::EFAULT)?;
 
         // 清除注册
-        pcb.rseq_state_mut().registration = None;
+        let mut rseq_state = pcb.rseq_state_mut();
+        rseq_state.registration = None;
+        rseq_state.event_mask.store(0, Ordering::SeqCst);
+        drop(rseq_state);
+        pcb.flags().remove(ProcessFlags::NEED_RSEQ);
 
         Ok(0)
     }
@@ -573,7 +577,7 @@ impl Rseq {
         if let Some(frame) = frame {
             if let Err(e) = Self::ip_fixup(frame, &access, sig, user_end, &pcb) {
                 log::debug!("rseq ip_fixup failed: {:?}", e);
-                Self::disable_current_rseq_after_fault(&pcb);
+                pcb.flags().remove(ProcessFlags::NEED_RSEQ);
                 let _ = crate::ipc::signal::send_kernel_signal_to_current(
                     crate::arch::ipc::signal::Signal::SIGSEGV,
                 );
@@ -585,7 +589,7 @@ impl Rseq {
         let cpu_id = smp_get_processor_id().data() as u32;
         if let Err(_e) = unsafe { access.update_cpu_node_id(cpu_id, 0, 0) } {
             // log::debug!("rseq update_cpu_node_id failed: {:?}", e);
-            Self::disable_current_rseq_after_fault(&pcb);
+            pcb.flags().remove(ProcessFlags::NEED_RSEQ);
             let _ = crate::ipc::signal::send_kernel_signal_to_current(
                 crate::arch::ipc::signal::Signal::SIGSEGV,
             );
@@ -594,14 +598,6 @@ impl Rseq {
 
         pcb.flags().remove(ProcessFlags::NEED_RSEQ);
         Ok(())
-    }
-
-    fn disable_current_rseq_after_fault(pcb: &ProcessControlBlock) {
-        let mut rseq_state = pcb.rseq_state_mut();
-        rseq_state.registration = None;
-        rseq_state.event_mask.store(0, Ordering::SeqCst);
-        drop(rseq_state);
-        pcb.flags().remove(ProcessFlags::NEED_RSEQ);
     }
 
     /// 执行 IP 修正
@@ -629,9 +625,8 @@ impl Rseq {
 
         // 在临界区内，检查是否需要重启
         let event_mask = pcb.rseq_state().fetch_clear_event_mask();
-        let cs_flags = RseqCsFlags::from_bits_truncate(rseq_cs.flags);
 
-        if !Self::need_restart(access, cs_flags, event_mask)? {
+        if !Self::need_restart(access, rseq_cs.flags, event_mask)? {
             return Ok(());
         }
 
@@ -645,41 +640,42 @@ impl Rseq {
     /// 判断是否需要重启
     fn need_restart(
         access: &UserRseqAccess,
-        cs_flags: RseqCsFlags,
+        cs_flags: u32,
         event_mask: RseqEventMask,
     ) -> Result<bool, RseqError> {
         // 检查用户态 flags
         let user_flags = unsafe { access.read_flags() }?;
-        let user_rseq_flags = RseqCsFlags::from_bits_truncate(user_flags);
 
-        Self::warn_flags("rseq", user_rseq_flags)?;
+        Self::warn_flags("rseq", user_flags)?;
         Self::warn_flags("rseq_cs", cs_flags)?;
 
         Ok(!event_mask.is_empty())
     }
 
     /// 检查并警告已弃用的 flags
-    fn warn_flags(name: &str, flags: RseqCsFlags) -> Result<(), RseqError> {
-        if flags.is_empty() {
+    fn warn_flags(name: &str, flags: u32) -> Result<(), RseqError> {
+        if flags == 0 {
             return Ok(());
         }
 
         let no_restart = RseqCsFlags::NO_RESTART_ON_PREEMPT
             | RseqCsFlags::NO_RESTART_ON_SIGNAL
             | RseqCsFlags::NO_RESTART_ON_MIGRATE;
+        let no_restart_bits = no_restart.bits();
 
-        if flags.intersects(no_restart) {
+        let deprecated = flags & no_restart_bits;
+        if deprecated != 0 {
             log::warn!(
-                "rseq: deprecated flags ({:?}) in {} ABI structure",
-                flags & no_restart,
+                "rseq: deprecated flags ({:#x}) in {} ABI structure",
+                deprecated,
                 name
             );
         }
 
-        let unknown = flags & !no_restart;
-        if !unknown.is_empty() {
+        let unknown = flags & !no_restart_bits;
+        if unknown != 0 {
             log::warn!(
-                "rseq: unknown flags ({:?}) in {} ABI structure",
+                "rseq: unknown flags ({:#x}) in {} ABI structure",
                 unknown,
                 name
             );
@@ -728,23 +724,39 @@ impl Rseq {
 pub fn rseq_fork(child: &ProcessControlBlock, clone_vm: bool) {
     if clone_vm {
         // 线程共享地址空间，子线程需要重新注册
-        child.rseq_state_mut().registration = None;
+        let mut child_state = child.rseq_state_mut();
+        child_state.registration = None;
+        child_state.event_mask.store(0, Ordering::SeqCst);
+        drop(child_state);
+        child.flags().remove(ProcessFlags::NEED_RSEQ);
     } else {
         // 进程 fork，继承父进程的 rseq 状态
         // 先获取父进程的注册信息副本，然后释放读锁
-        let parent_reg = {
+        let (parent_reg, parent_event_mask) = {
             let pcb = ProcessManager::current_pcb();
             let parent_state = pcb.rseq_state();
-            parent_state.registration().copied()
+            (
+                parent_state.registration().copied(),
+                parent_state.event_mask.load(Ordering::SeqCst),
+            )
         };
-        if let Some(reg) = parent_reg {
-            child.rseq_state_mut().registration = Some(reg);
+        let mut child_state = child.rseq_state_mut();
+        child_state.registration = parent_reg;
+        child_state
+            .event_mask
+            .store(parent_event_mask, Ordering::SeqCst);
+        drop(child_state);
+        if parent_reg.is_some() {
+            child.flags().insert(ProcessFlags::NEED_RSEQ);
         }
     }
 }
 
 /// exec 时清除 rseq 状态
 pub fn rseq_execve(pcb: &ProcessControlBlock) {
-    pcb.rseq_state_mut().registration = None;
-    pcb.rseq_state_mut().event_mask.store(0, Ordering::SeqCst);
+    let mut rseq_state = pcb.rseq_state_mut();
+    rseq_state.registration = None;
+    rseq_state.event_mask.store(0, Ordering::SeqCst);
+    drop(rseq_state);
+    pcb.flags().remove(ProcessFlags::NEED_RSEQ);
 }

@@ -1125,6 +1125,10 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
 
     let mut migrate_prev_to = None;
     if let Some(dest_cpu) = take_current_migration_target(&prev) {
+        // 当前任务迁移在真正切出当前 CPU 时才标记 rseq migrate，
+        // 避免在迁移请求发起后、任务仍运行在旧 CPU 时过早处理 NEED_RSEQ。
+        crate::process::rseq::Rseq::on_migrate(&prev);
+
         debug_assert!(
             !task_is_idle(&prev),
             "idle task must not be migrated through current task migration"
@@ -1196,9 +1200,6 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
     fence(Ordering::SeqCst);
     if likely(!Arc::ptr_eq(&prev, &next)) {
         crate::process::rseq::Rseq::on_preempt(&prev);
-        if next.rseq_state().is_registered() {
-            next.flags().insert(ProcessFlags::NEED_RSEQ);
-        }
 
         rq.set_current(Arc::downgrade(&next));
         compiler_fence(Ordering::SeqCst);
@@ -1320,6 +1321,12 @@ pub fn request_task_migration(
     dest_cpu: ProcessorId,
 ) -> Result<(), SystemError> {
     let Some(src_cpu) = pcb.sched_info().on_cpu() else {
+        // on_cpu == None can mean either first placement of a new task or
+        // migration of an existing off-rq task. Only the latter is an rseq
+        // migration event.
+        if !pcb.sched_info().is_new_task() {
+            crate::process::rseq::Rseq::on_migrate(pcb);
+        }
         rebind_task_cpu(pcb, dest_cpu);
         return Ok(());
     };
@@ -1353,6 +1360,7 @@ pub fn request_task_migration(
             pcb.clone(),
             DequeueFlag::DEQUEUE_MOVE | DequeueFlag::DEQUEUE_NOCLOCK,
         );
+        crate::process::rseq::Rseq::on_migrate(pcb);
         *pcb.sched_info().on_rq.lock_irqsave() = OnRq::None;
         pcb.sched_info().set_on_cpu(None);
         drop(_guard);
@@ -1361,6 +1369,7 @@ pub fn request_task_migration(
         return Ok(());
     }
 
+    crate::process::rseq::Rseq::on_migrate(pcb);
     rebind_task_cpu(pcb, dest_cpu);
     Ok(())
 }

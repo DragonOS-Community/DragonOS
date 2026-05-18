@@ -77,6 +77,7 @@ pub mod sys_mount;
 mod sys_sendfile;
 mod sys_splice;
 mod sys_sync;
+mod sys_sync_file_range;
 mod sys_tee;
 pub mod sys_umount2;
 

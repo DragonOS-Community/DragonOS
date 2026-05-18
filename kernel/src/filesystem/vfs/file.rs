@@ -1,6 +1,6 @@
 use core::{
     fmt,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 use alloc::{string::String, sync::Arc, vec::Vec};
@@ -23,6 +23,7 @@ use crate::{
         epoll::{event_poll::EPollPrivateData, EPollItem},
         fuse::private_data::FuseFilePrivateData,
         kernfs::callback::KernFilePrivateData,
+        page_cache::PageCache,
         procfs::ProcfsFilePrivateData,
         vfs::FilldirContext,
     },
@@ -459,12 +460,26 @@ pub struct File {
     posix_lock_key: (usize, InodeId),
     /// 预读状态
     ra_state: Mutex<FileReadaheadState>,
+    /// 当前 open file description 已观测到的 page cache 写回错误序列。
+    wb_error_seq: AtomicU64,
 }
 
 impl File {
     #[inline]
     pub fn cred(&self) -> Arc<Cred> {
         self.cred.clone()
+    }
+
+    pub fn check_and_advance_wb_error(
+        &self,
+        page_cache: &Arc<PageCache>,
+    ) -> Result<(), SystemError> {
+        let since = self.wb_error_seq.load(Ordering::Acquire);
+        let Some((seq, error)) = page_cache.check_writeback_error_since(since) else {
+            return Ok(());
+        };
+        self.wb_error_seq.store(seq, Ordering::Release);
+        Err(error)
     }
 
     fn maybe_kill_suid_sgid_after_write(&self) -> Result<(), SystemError> {
@@ -675,6 +690,11 @@ impl File {
             mode = FileMode::FMODE_PATH | FileMode::FMODE_OPENED;
         }
 
+        let wb_error_seq = inode
+            .page_cache()
+            .map(|page_cache| page_cache.sample_writeback_error())
+            .unwrap_or(0);
+
         let f = File {
             open_file_id: alloc_open_file_id(),
             inode,
@@ -688,6 +708,7 @@ impl File {
             owner: Mutex::new(FileOwner::new()),
             posix_lock_key,
             ra_state: Mutex::new(FileReadaheadState::new()),
+            wb_error_seq: AtomicU64::new(wb_error_seq),
         };
 
         return Ok(f);
@@ -1217,6 +1238,7 @@ impl File {
             owner: Mutex::new(FileOwner::new()),
             posix_lock_key: self.posix_lock_key,
             ra_state: Mutex::new(self.ra_state.lock().clone()),
+            wb_error_seq: AtomicU64::new(self.wb_error_seq.load(Ordering::Acquire)),
         };
         // 调用inode的open方法，让inode知道有新的文件打开了这个inode
         // TODO: reopen is not a good idea for some inodes, need a better design

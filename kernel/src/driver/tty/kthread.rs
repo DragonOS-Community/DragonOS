@@ -15,8 +15,16 @@ use crate::{
     sched::{schedule, SchedMode},
 };
 
-/// 用于缓存键盘输入的缓冲区
-static KEYBUF: StaticThingBuf<u8, 512> = StaticThingBuf::new();
+/// 用于缓存 IRQ 上下文投递的 TTY 输入。
+///
+/// N_TTY 规范模式按 Linux 语义支持 4096 字节行缓冲；这里的 IRQ 暂存队列必须
+/// 大于该长度，避免输入还没进入行规程就被提前截断。
+const TTY_RX_IRQ_BUF_SIZE: usize = 8192;
+
+/// 单次从 IRQ 暂存队列投递给行规程的最大字节数。
+const TTY_RX_DEQUEUE_MAX: usize = 256;
+
+static KEYBUF: StaticThingBuf<u8, TTY_RX_IRQ_BUF_SIZE> = StaticThingBuf::new();
 
 static mut TTY_REFRESH_THREAD: Option<Arc<ProcessControlBlock>> = None;
 
@@ -37,7 +45,6 @@ pub(super) fn tty_flush_thread_init() {
 }
 
 fn tty_refresh_thread() -> i32 {
-    const TO_DEQUEUE_MAX: usize = 256;
     loop {
         if KEYBUF.is_empty() {
             // 如果缓冲区为空，就休眠
@@ -46,11 +53,11 @@ fn tty_refresh_thread() -> i32 {
             schedule(SchedMode::SM_NONE);
         }
 
-        let to_dequeue = core::cmp::min(KEYBUF.len(), TO_DEQUEUE_MAX);
+        let to_dequeue = core::cmp::min(KEYBUF.len(), TTY_RX_DEQUEUE_MAX);
         if to_dequeue == 0 {
             continue;
         }
-        let mut data = [0u8; TO_DEQUEUE_MAX];
+        let mut data = [0u8; TTY_RX_DEQUEUE_MAX];
         for item in data.iter_mut().take(to_dequeue) {
             *item = KEYBUF.pop().unwrap();
         }

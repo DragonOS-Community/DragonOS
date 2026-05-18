@@ -10,6 +10,7 @@ normal/test_pivot_root
 normal/test_mount_reconfigure
 normal/test_fchown_o_path
 normal/proc_self_limits
+normal/proc_fd_devfs_readlink
 normal/mlock_semantics
 normal/sched_affinity
 normal/sync_file_range

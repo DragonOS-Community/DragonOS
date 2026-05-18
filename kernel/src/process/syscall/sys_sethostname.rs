@@ -39,8 +39,13 @@ impl Syscall for SysSethostname {
         }
 
         // 检查长度是否合法
-        if len == 0 || len >= NewUtsName::MAXLEN {
+        if len >= NewUtsName::MAXLEN {
             return Err(SystemError::EINVAL);
+        }
+
+        if len == 0 {
+            uts_ns.set_hostname(&[])?;
+            return Ok(0);
         }
 
         let reader = UserBufferReader::new_checked(name_ptr, len, true)?;

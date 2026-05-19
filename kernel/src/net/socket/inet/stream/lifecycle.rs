@@ -477,31 +477,50 @@ impl TcpSocket {
                 }
             }
             inner::Inner::Connecting(connecting) => {
-                if how.contains(ShutdownBit::SHUT_RD) {
-                    connecting.with_mut(|socket| {
-                        socket.abort();
-                    });
+                if connecting.is_transport_established() {
+                    let established = unsafe { connecting.into_established() };
+
+                    if how.contains(ShutdownBit::SHUT_RD) {
+                        let queued = established.with(|socket| socket.recv_queue());
+                        self.recv_shutdown.init(queued);
+                    }
+
+                    if how.contains(ShutdownBit::SHUT_WR) {
+                        let pending = established.with(|socket| socket.send_queue());
+                        if pending > 0 {
+                            self.send_fin_deferred
+                                .store(true, core::sync::atomic::Ordering::Relaxed);
+                        } else if self
+                            .send_fin_deferred
+                            .load(core::sync::atomic::Ordering::Relaxed)
+                        {
+                            // FIN will be sent once deferred bytes are fully flushed.
+                        } else {
+                            established.with_mut(|socket| socket.close());
+                        }
+                        post_poll_rounds = core::cmp::max(post_poll_rounds, 8);
+                        post_poll_iface = Some(established.iface().clone());
+                    }
+
+                    (inner::Inner::Established(established), how)
+                } else {
+                    connecting.set_shutdown_reset();
+                    connecting.with_mut(|socket| socket.abort());
                     post_poll_rounds = core::cmp::max(post_poll_rounds, 128);
                     post_poll_iface = Some(connecting.iface().clone());
-                }
 
-                if how.contains(ShutdownBit::SHUT_WR) {
-                    connecting.with_mut(|socket| socket.close());
-                    post_poll_rounds = core::cmp::max(post_poll_rounds, 8);
-                    post_poll_iface = Some(connecting.iface().clone());
+                    // For still-connecting sockets, only SHUT_WR is meaningful for
+                    // user-visible send() behavior (EPIPE). Recording SHUT_RD would
+                    // incorrectly make recv() return EOF on an unconnected stream socket.
+                    (
+                        inner::Inner::Connecting(connecting),
+                        if how.contains(ShutdownBit::SHUT_WR) {
+                            ShutdownBit::SHUT_WR
+                        } else {
+                            ShutdownBit::from_bits_truncate(0)
+                        },
+                    )
                 }
-
-                // For Connecting sockets, only SHUT_WR is meaningful for user-visible
-                // send() behavior (EPIPE). Recording SHUT_RD would incorrectly make
-                // recv() return EOF on an unconnected stream socket.
-                (
-                    inner::Inner::Connecting(connecting),
-                    if how.contains(ShutdownBit::SHUT_WR) {
-                        ShutdownBit::SHUT_WR
-                    } else {
-                        ShutdownBit::from_bits_truncate(0)
-                    },
-                )
             }
             inner::Inner::SelfConnected(sc) => {
                 // SelfConnected: shutdown affects only the user-visible data path.
@@ -599,6 +618,9 @@ impl TcpSocket {
 
                 if conn.failure_reason().is_some() {
                     conn.consume_error();
+                    let (new_inner, _) = conn.into_result();
+                    writer.replace(new_inner);
+                } else if conn.is_refused_consumed() {
                     let (new_inner, _) = conn.into_result();
                     writer.replace(new_inner);
                 } else {

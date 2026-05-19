@@ -563,10 +563,14 @@ impl ProcessManager {
         // 如果新进程使用不同的 pid 或 namespace，
         // 则不允许它与分叉任务共享线程组。
         if clone_flags.contains(CloneFlags::CLONE_THREAD)
-            && !((clone_flags & (CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWPID)).is_empty())
+            && (!((clone_flags & (CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWPID))
+                .is_empty())
+                || !Arc::ptr_eq(
+                    &current_pcb.active_pid_ns(),
+                    current_pcb.nsproxy().pid_namespace_for_children(),
+                ))
         {
             return Err(SystemError::EINVAL);
-            // TODO: 判断新进程与当前进程namespace是否相同，不同则返回错误
         }
 
         // 如果新进程将处于不同的time namespace，

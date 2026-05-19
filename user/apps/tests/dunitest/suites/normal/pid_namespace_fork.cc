@@ -45,8 +45,7 @@ TEST(PidNamespaceFork, DeadPidNamespaceForChildrenDoesNotPanic) {
     pthread_t thread;
     int rc = pthread_create(&thread, nullptr, fork_worker, nullptr);
     ASSERT_NE(rc, 0) << "pthread_create unexpectedly succeeded in a dead child PID namespace";
-    EXPECT_TRUE(rc == ENOMEM || rc == EAGAIN)
-        << "unexpected pthread_create error: " << strerror(rc);
+    EXPECT_EQ(rc, EINVAL) << "unexpected pthread_create error: " << strerror(rc);
 }
 
 int main(int argc, char** argv) {

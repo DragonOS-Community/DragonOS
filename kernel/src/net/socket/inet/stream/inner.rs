@@ -429,6 +429,15 @@ impl Connecting {
         matches!(*self.result.read(), ConnectResult::Connected)
     }
 
+    pub fn is_transport_established(&self) -> bool {
+        self.with(|socket| {
+            matches!(
+                socket.state(),
+                tcp::State::Established | tcp::State::CloseWait
+            )
+        })
+    }
+
     /// Transmutes the Connecting state to Established state.
     ///
     /// # Safety

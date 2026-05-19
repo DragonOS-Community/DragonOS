@@ -2,19 +2,45 @@ use num_traits::FromPrimitive;
 use system_error::SystemError;
 
 use alloc::sync::Arc;
-use core::sync::atomic::Ordering;
-
-use crate::time::syscall::PosixTimeval;
+use core::{ffi::c_long, sync::atomic::Ordering};
 
 use super::{ProcessControlBlock, ProcessManager};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(C)]
+pub struct RUsageTimeval {
+    pub tv_sec: c_long,
+    pub tv_usec: c_long,
+}
+
+impl RUsageTimeval {
+    #[inline]
+    pub fn from_ns(ns: u64) -> Self {
+        Self {
+            tv_sec: (ns / 1_000_000_000) as c_long,
+            tv_usec: ((ns % 1_000_000_000) / 1000) as c_long,
+        }
+    }
+
+    #[inline]
+    pub fn to_ns(self) -> u64 {
+        if self.tv_usec < 0 || self.tv_usec >= 1_000_000 {
+            (self.tv_sec as u64).saturating_mul(1_000_000_000)
+        } else {
+            let sec_ns = (self.tv_sec as u64).saturating_mul(1_000_000_000);
+            let usec_ns = (self.tv_usec as u64).saturating_mul(1000);
+            sec_ns.saturating_add(usec_ns)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(C)]
 pub struct RUsage {
     /// User time used
-    pub ru_utime: PosixTimeval,
+    pub ru_utime: RUsageTimeval,
     /// System time used
-    pub ru_stime: PosixTimeval,
+    pub ru_stime: RUsageTimeval,
 
     // 以下是linux的rusage结构体扩展
     /// Maximum resident set size
@@ -49,8 +75,8 @@ pub struct RUsage {
 
 impl RUsage {
     #[inline]
-    fn add_time(lhs: &mut PosixTimeval, rhs: PosixTimeval) {
-        *lhs = PosixTimeval::from_ns(lhs.to_ns().saturating_add(rhs.to_ns()));
+    fn add_time(lhs: &mut RUsageTimeval, rhs: RUsageTimeval) {
+        *lhs = RUsageTimeval::from_ns(lhs.to_ns().saturating_add(rhs.to_ns()));
     }
 
     pub fn add_assign_saturating(&mut self, rhs: &RUsage) {
@@ -184,22 +210,31 @@ impl ProcessControlBlock {
     fn task_rusage(&self) -> RUsage {
         let ct = self.cputime();
         RUsage {
-            ru_utime: PosixTimeval::from_ns(ct.utime.load(Ordering::Relaxed)),
-            ru_stime: PosixTimeval::from_ns(ct.stime.load(Ordering::Relaxed)),
+            ru_utime: RUsageTimeval::from_ns(ct.utime.load(Ordering::Relaxed)),
+            ru_stime: RUsageTimeval::from_ns(ct.stime.load(Ordering::Relaxed)),
             ..RUsage::default()
         }
     }
 
     fn thread_group_rusage(&self) -> RUsage {
         let leader = self.leader_for_rusage();
-        let mut usage = leader.task_rusage();
         let ti = leader.threads_read_irqsave();
+        let mut usage = *leader.exited_thread_group_rusage.lock();
+        usage.add_assign_saturating(&leader.task_rusage());
         for task in &ti.group_tasks {
             if let Some(task) = task.upgrade() {
                 usage.add_assign_saturating(&task.task_rusage());
             }
         }
         usage
+    }
+
+    pub fn add_exited_thread_group_rusage(&self, rusage: &RUsage) {
+        let leader = self.leader_for_rusage();
+        leader
+            .exited_thread_group_rusage
+            .lock()
+            .add_assign_saturating(rusage);
     }
 
     pub fn add_child_rusage(&self, rusage: &RUsage) {

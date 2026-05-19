@@ -1092,11 +1092,16 @@ impl ProcessControlBlock {
             }
         }
 
-        // 从线程组中移除
+        // 从线程组中移除。非组长线程离开 group_tasks 后，线程组 rusage 仍需保留其 CPU 时间。
         let thread_group_leader = self.threads_read_irqsave().group_leader();
         if let Some(leader) = thread_group_leader {
-            leader
-                .threads_write_irqsave()
+            let mut leader_threads = leader.threads_write_irqsave();
+            if !group_dead {
+                if let Some(rusage) = self.get_rusage(RUsageWho::RusageThread) {
+                    leader.add_exited_thread_group_rusage(&rusage);
+                }
+            }
+            leader_threads
                 .group_tasks
                 .retain(|pcb| !Weak::ptr_eq(pcb, &self.self_ref));
         }

@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <string.h>
@@ -30,7 +31,7 @@ uint64_t MonotonicUsec() {
          static_cast<uint64_t>(ts.tv_nsec) / 1000ULL;
 }
 
-void BusyForUsec(uint64_t usec) {
+uint64_t BurnCpuForUsec(uint64_t usec) {
   const uint64_t start = MonotonicUsec();
   volatile uint64_t sink = 0;
   while (MonotonicUsec() - start < usec) {
@@ -38,7 +39,17 @@ void BusyForUsec(uint64_t usec) {
       sink += static_cast<uint64_t>(i);
     }
   }
+  return sink;
+}
+
+void BusyForUsec(uint64_t usec) {
+  uint64_t sink = BurnCpuForUsec(usec);
   _exit(static_cast<int>(sink & 0));
+}
+
+void* ThreadBurn(void* arg) {
+  BurnCpuForUsec(reinterpret_cast<uintptr_t>(arg));
+  return nullptr;
 }
 
 }  // namespace
@@ -83,6 +94,29 @@ TEST(WaitRusage, WNowaitDoesNotReapAndWait4AccountsChildUsage) {
   errno = 0;
   EXPECT_EQ(-1, wait4(child, nullptr, WNOHANG, nullptr));
   EXPECT_EQ(ECHILD, errno);
+}
+
+TEST(WaitRusage, Wait4IncludesExitedThreadCpuTime) {
+  pid_t child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    pthread_t worker {};
+    if (pthread_create(&worker, nullptr, ThreadBurn,
+                       reinterpret_cast<void*>(static_cast<uintptr_t>(600000))) != 0) {
+      _exit(2);
+    }
+    if (pthread_join(worker, nullptr) != 0) {
+      _exit(3);
+    }
+    _exit(0);
+  }
+
+  int status = 0;
+  struct rusage usage {};
+  ASSERT_EQ(child, wait4(child, &status, 0, &usage)) << strerror(errno);
+  ASSERT_TRUE(WIFEXITED(status));
+  ASSERT_EQ(0, WEXITSTATUS(status));
+  EXPECT_GE(RusageCpuUsec(usage), 100000u);
 }
 
 int main(int argc, char** argv) {

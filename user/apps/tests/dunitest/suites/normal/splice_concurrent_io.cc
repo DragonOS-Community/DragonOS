@@ -254,6 +254,35 @@ TEST(SpliceConcurrentIo, NonblockFileToPipeShortReadUsesAvailableSpace) {
     close(pipe_fds[1]);
 }
 
+TEST(SpliceConcurrentIo, NonblockFileToPipePipeBufNeedsCompleteSpace) {
+    if (!IsDragonOS()) {
+        GTEST_SKIP() << "DragonOS byte-ring pipe regression test";
+    }
+
+    TempFile file;
+    ASSERT_TRUE(file.valid()) << strerror(errno);
+    std::vector<char> bytes(4096, kByte);
+    ASSERT_EQ(static_cast<ssize_t>(bytes.size()),
+              write(file.fd(), bytes.data(), bytes.size()))
+        << strerror(errno);
+    ASSERT_EQ(0, lseek(file.fd(), 0, SEEK_SET)) << strerror(errno);
+
+    int pipe_fds[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(pipe_fds)) << strerror(errno);
+    const int capacity = fcntl(pipe_fds[1], F_GETPIPE_SZ);
+    ASSERT_GT(capacity, 1) << strerror(errno);
+    FillPipeLeavingSpace(pipe_fds[1], capacity, 1);
+
+    errno = 0;
+    EXPECT_EQ(-1,
+              splice(file.fd(), nullptr, pipe_fds[1], nullptr, bytes.size(),
+                     SPLICE_F_NONBLOCK));
+    EXPECT_EQ(EAGAIN, errno);
+
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+}
+
 TEST(SpliceConcurrentIo, ProcfsZeroSizeRegularFileCanSpliceData) {
     const int file_fd = open("/proc/cpuinfo", O_RDONLY);
     ASSERT_GE(file_fd, 0) << strerror(errno);

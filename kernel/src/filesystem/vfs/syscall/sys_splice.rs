@@ -3,7 +3,7 @@ use crate::filesystem::vfs::file::FileMode;
 use crate::filesystem::vfs::FileFlags;
 use crate::filesystem::vfs::{file::File, syscall::SpliceFlags, FileType};
 use crate::ipc::kill::send_signal_to_pid;
-use crate::ipc::pipe::LockedPipeInode;
+use crate::ipc::pipe::{LockedPipeInode, PIPE_BUF};
 use crate::process::resource::RLimitID;
 use crate::process::ProcessManager;
 use crate::syscall::table::Syscall;
@@ -262,6 +262,9 @@ fn splice_file_to_pipe(
     let space = if flags.contains(SpliceFlags::SPLICE_F_NONBLOCK) {
         let space = pipe_inode.writable_len();
         if space == 0 && pipe_inode.has_readers() {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        if wanted <= PIPE_BUF && space < wanted && pipe_inode.has_readers() {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
         space

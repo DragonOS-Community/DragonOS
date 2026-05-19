@@ -20,7 +20,7 @@ use crate::{
         serial::{AtomicBaudRate, BaudRate, DivisorFraction, UartPort},
         tty::{
             console::ConsoleSwitch,
-            kthread::enqueue_tty_rx_from_irq,
+            kthread::enqueue_tty_rx_to_vc_from_irq,
             termios::WindowSize,
             tty_core::{TtyCore, TtyCoreData},
             tty_driver::{TtyDriver, TtyDriverManager, TtyOperation},
@@ -44,6 +44,7 @@ static mut PIO_PORTS: [Option<Serial8250PIOPort>; 8] =
     [None, None, None, None, None, None, None, None];
 
 const SERIAL_8250_PIO_IRQ: IrqNumber = IrqNumber::new(IoApic::VECTOR_BASE as u32 + 4);
+const SERIAL_8250_RX_IRQ_LIMIT: usize = 256;
 
 impl Serial8250Manager {
     #[allow(static_mut_refs)]
@@ -267,21 +268,23 @@ impl UartPort for Serial8250PIOPort {
     }
 
     fn handle_irq(&self) -> Result<(), SystemError> {
-        let mut buf = [0; 256];
+        let mut buf = [0; SERIAL_8250_RX_IRQ_LIMIT];
         let mut index = 0;
+        let target_vc_index = self.inner.read().input_vc_index;
 
-        // 排空当前可读的硬件 FIFO，避免粘贴长输入时只投递固定前缀。
-        while let Some(c) = self.read_one_byte() {
+        // Linux serial8250_rx_chars 同样保留 256 字节上限，避免 RX IRQ 无界占用 CPU。
+        while index < SERIAL_8250_RX_IRQ_LIMIT {
+            let Some(c) = self.read_one_byte() else {
+                break;
+            };
             buf[index] = c;
             index += 1;
-            if index == buf.len() {
-                enqueue_tty_rx_from_irq(&buf);
-                index = 0;
-            }
         }
 
         if index > 0 {
-            enqueue_tty_rx_from_irq(&buf[0..index]);
+            if let Some(vc_index) = target_vc_index {
+                enqueue_tty_rx_to_vc_from_irq(vc_index, &buf[0..index]);
+            }
         }
         Ok(())
     }
@@ -297,11 +300,15 @@ struct Serial8250PIOPortInner {
     ///
     /// ps: 存储weak以避免循环引用
     device: Option<Weak<Serial8250ISADevices>>,
+    input_vc_index: Option<usize>,
 }
 
 impl Serial8250PIOPortInner {
     pub const fn new() -> Self {
-        Self { device: None }
+        Self {
+            device: None,
+            input_vc_index: None,
+        }
     }
 
     #[allow(dead_code)]
@@ -397,7 +404,8 @@ impl TtyOperation for Serial8250PIOTtyDriverInner {
     }
 
     fn install(&self, driver: Arc<TtyDriver>, tty: Arc<TtyCore>) -> Result<(), SystemError> {
-        if tty.core().index() >= unsafe { PIO_PORTS.len() } {
+        let tty_index = tty.core().index();
+        if tty_index >= unsafe { PIO_PORTS.len() } {
             return Err(SystemError::ENODEV);
         }
 
@@ -413,8 +421,16 @@ impl TtyOperation for Serial8250PIOTtyDriverInner {
         drop(vc_data_guard);
         let vc = VirtConsole::new(Some(vc_data));
         let vc_index = vc_manager().alloc(vc.clone()).ok_or(SystemError::EBUSY)?;
+        unsafe { PIO_PORTS[tty_index].as_ref() }
+            .ok_or(SystemError::ENODEV)?
+            .inner
+            .write()
+            .input_vc_index = Some(vc_index);
         self.do_install(driver, tty, vc.clone()).inspect_err(|_| {
             vc_manager().free(vc_index);
+            if let Some(port) = unsafe { PIO_PORTS[tty_index].as_ref() } {
+                port.inner.write().input_vc_index = None;
+            }
         })?;
 
         Ok(())

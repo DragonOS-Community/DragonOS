@@ -477,19 +477,10 @@ impl TcpSocket {
                 }
             }
             inner::Inner::Connecting(connecting) => {
-                if how.contains(ShutdownBit::SHUT_RD) {
-                    connecting.with_mut(|socket| {
-                        socket.abort();
-                    });
-                    post_poll_rounds = core::cmp::max(post_poll_rounds, 128);
-                    post_poll_iface = Some(connecting.iface().clone());
-                }
-
-                if how.contains(ShutdownBit::SHUT_WR) {
-                    connecting.with_mut(|socket| socket.close());
-                    post_poll_rounds = core::cmp::max(post_poll_rounds, 8);
-                    post_poll_iface = Some(connecting.iface().clone());
-                }
+                connecting.set_shutdown_reset();
+                connecting.with_mut(|socket| socket.abort());
+                post_poll_rounds = core::cmp::max(post_poll_rounds, 128);
+                post_poll_iface = Some(connecting.iface().clone());
 
                 // For Connecting sockets, only SHUT_WR is meaningful for user-visible
                 // send() behavior (EPIPE). Recording SHUT_RD would incorrectly make
@@ -599,6 +590,9 @@ impl TcpSocket {
 
                 if conn.failure_reason().is_some() {
                     conn.consume_error();
+                    let (new_inner, _) = conn.into_result();
+                    writer.replace(new_inner);
+                } else if conn.is_refused_consumed() {
                     let (new_inner, _) = conn.into_result();
                     writer.replace(new_inner);
                 } else {

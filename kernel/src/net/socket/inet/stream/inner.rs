@@ -336,6 +336,8 @@ enum ConnectResult {
     Connecting,
     Refused,
     RefusedConsumed,
+    ShutdownReset,
+    ShutdownResetConsumed,
 }
 
 #[derive(Debug)]
@@ -392,7 +394,10 @@ impl Connecting {
                 Inner::Established(Established::new(self.inner, true)),
                 Ok(()),
             ),
-            ConnectResult::Refused | ConnectResult::RefusedConsumed => {
+            ConnectResult::Refused
+            | ConnectResult::RefusedConsumed
+            | ConnectResult::ShutdownReset
+            | ConnectResult::ShutdownResetConsumed => {
                 // unbind port
                 self.inner
                     .port_manager()
@@ -406,9 +411,15 @@ impl Connecting {
                     smoltcp::wire::IpAddress::Ipv4(_) => smoltcp::wire::IpVersion::Ipv4,
                     smoltcp::wire::IpAddress::Ipv6(_) => smoltcp::wire::IpVersion::Ipv6,
                 };
+                let err = match result {
+                    ConnectResult::ShutdownReset | ConnectResult::ShutdownResetConsumed => {
+                        SystemError::ECONNRESET
+                    }
+                    _ => SystemError::ECONNREFUSED,
+                };
                 (
                     Inner::Init(Init::Unbound((Box::new(socket), ver))),
-                    Err(SystemError::ECONNREFUSED),
+                    Err(err),
                 )
             }
         }
@@ -465,6 +476,8 @@ impl Connecting {
                     ConnectResult::Refused
                         | ConnectResult::Connected
                         | ConnectResult::RefusedConsumed
+                        | ConnectResult::ShutdownReset
+                        | ConnectResult::ShutdownResetConsumed
                 ) {
                     if matches!(state, tcp::State::Established | tcp::State::CloseWait) {
                         // log::debug!(
@@ -528,7 +541,10 @@ impl Connecting {
                             Ordering::Relaxed,
                         );
                     }
-                    ConnectResult::Refused | ConnectResult::RefusedConsumed => {
+                    ConnectResult::Refused
+                    | ConnectResult::RefusedConsumed
+                    | ConnectResult::ShutdownReset
+                    | ConnectResult::ShutdownResetConsumed => {
                         // Connection attempt refused (or reset during handshake).
                         // This is equivalent to a closed socket with error.
                         // Should be readable, writable, and have HUP/ERR set.
@@ -541,14 +557,20 @@ impl Connecting {
                             | EPollEventType::EPOLLRDHUP;
 
                         // If error not consumed yet, set EPOLLERR
-                        if matches!(*result, ConnectResult::Refused) {
+                        if matches!(
+                            *result,
+                            ConnectResult::Refused | ConnectResult::ShutdownReset
+                        ) {
                             events_to_set |= EPollEventType::EPOLLERR;
                         }
 
                         pollee.fetch_or(events_to_set.bits() as usize, Ordering::Relaxed);
 
                         // If error IS consumed, clear EPOLLERR (if it was set previously)
-                        if matches!(*result, ConnectResult::RefusedConsumed) {
+                        if matches!(
+                            *result,
+                            ConnectResult::RefusedConsumed | ConnectResult::ShutdownResetConsumed
+                        ) {
                             pollee.fetch_and(
                                 !(EPollEventType::EPOLLERR).bits() as usize,
                                 Ordering::Relaxed,
@@ -576,6 +598,8 @@ impl Connecting {
                     ConnectResult::Refused
                         | ConnectResult::Connected
                         | ConnectResult::RefusedConsumed
+                        | ConnectResult::ShutdownReset
+                        | ConnectResult::ShutdownResetConsumed
                 )
             })
     }
@@ -589,22 +613,31 @@ impl Connecting {
     }
 
     pub fn failure_reason(&self) -> Option<SystemError> {
-        if matches!(*self.result.read(), ConnectResult::Refused) {
-            Some(SystemError::ECONNREFUSED)
-        } else {
-            None
+        match *self.result.read() {
+            ConnectResult::Refused => Some(SystemError::ECONNREFUSED),
+            ConnectResult::ShutdownReset => Some(SystemError::ECONNRESET),
+            _ => None,
         }
     }
 
     pub fn consume_error(&self) {
         let mut guard = self.result.write();
-        if matches!(*guard, ConnectResult::Refused) {
-            *guard = ConnectResult::RefusedConsumed;
+        match *guard {
+            ConnectResult::Refused => *guard = ConnectResult::RefusedConsumed,
+            ConnectResult::ShutdownReset => *guard = ConnectResult::ShutdownResetConsumed,
+            _ => {}
         }
     }
 
     pub fn is_refused_consumed(&self) -> bool {
-        matches!(*self.result.read(), ConnectResult::RefusedConsumed)
+        matches!(
+            *self.result.read(),
+            ConnectResult::RefusedConsumed | ConnectResult::ShutdownResetConsumed
+        )
+    }
+
+    pub fn set_shutdown_reset(&self) {
+        *self.result.write() = ConnectResult::ShutdownReset;
     }
 }
 

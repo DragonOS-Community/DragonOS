@@ -66,6 +66,24 @@ TEST(UdpIpv6SendSemantics, UnspecifiedIpv6DestinationUsesIpv6Loopback) {
     EXPECT_EQ(ret, 4) << "sendto(::) failed: " << ErrnoString(errno);
 }
 
+TEST(UdpIpv6SendSemantics, ConnectToUnspecifiedIpv6UsesIpv6Loopback) {
+    FdGuard fd(socket(AF_INET6, SOCK_DGRAM, 0));
+    ASSERT_GE(fd.Get(), 0) << "socket(AF_INET6, SOCK_DGRAM) failed: " << ErrnoString(errno);
+
+    sockaddr_in6 dst = MakeIpv6Addr("::", 12345);
+    errno = 0;
+    int ret = connect(fd.Get(), reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
+
+    EXPECT_EQ(ret, 0) << "connect(::) failed: " << ErrnoString(errno);
+
+    sockaddr_in6 peer {};
+    socklen_t peer_len = sizeof(peer);
+    ASSERT_EQ(getpeername(fd.Get(), reinterpret_cast<sockaddr*>(&peer), &peer_len), 0)
+        << "getpeername failed: " << ErrnoString(errno);
+    EXPECT_TRUE(IN6_IS_ADDR_LOOPBACK(&peer.sin6_addr));
+    EXPECT_EQ(ntohs(peer.sin6_port), 12345);
+}
+
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

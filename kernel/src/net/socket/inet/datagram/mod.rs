@@ -1382,6 +1382,7 @@ impl Socket for UdpSocket {
                     return Ok(());
                 }
 
+                let remote = Self::normalize_unspecified_dest(remote);
                 if !self.is_bound() {
                     self.bind_ephemeral(remote.addr)?;
                 }

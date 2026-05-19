@@ -423,7 +423,7 @@ fn parse_remount_data(
 
 fn do_new_mount(
     source: Option<String>,
-    mut target_inode: Arc<dyn IndexNode>,
+    target_inode: Arc<dyn IndexNode>,
     filesystemtype: Option<String>,
     data: Option<String>,
     mount_flags: MountFlags,
@@ -434,17 +434,9 @@ fn do_new_mount(
         log::warn!("Failed to produce filesystem: {:?}", e);
     })?;
 
-    // 若目标是挂载点根，则尝试在其父目录挂载，避免 EBUSY 并与 Linux 叠加语义接近
-    if is_mountpoint_root(&target_inode) {
-        if let Ok(parent) = target_inode.parent() {
-            target_inode = parent;
-        }
-    }
-
     let _abs_path = target_inode.absolute_path()?;
 
-    // 允许在已有挂载点上再次挂载（符合 Linux 允许叠加挂载的语义）
-    // MountList::insert 会替换同一路径的记录，无需提前返回 EBUSY。
+    // Linux lock_mount() 会保留用户指定 mountpoint，并在其栈顶继续叠加挂载。
     let new_mount = target_inode.mount(fs, mount_flags)?;
     new_mount.set_mount_source(Some(source));
     Ok(new_mount)

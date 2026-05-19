@@ -48,6 +48,11 @@ static int write_file(const char *path) {
     return ret == 1 ? 0 : -1;
 }
 
+static bool path_exists(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
 static bool mount_has_option(const char *mountpoint, const char *option) {
     FILE *fp;
     char *line = NULL;
@@ -665,6 +670,44 @@ TEST(MountReconfigure, BindRemountStrictatimeNotPersisted) {
 
     umount(target);
     cleanup_mount(source);
+}
+
+TEST(MountReconfigure, StackedMountKeepsOriginalTarget) {
+    const char *base = "/tmp/test_stacked_mount_target";
+    const char *target = "/tmp/test_stacked_mount_target/target";
+    const char *sibling = "/tmp/test_stacked_mount_target/sibling_marker";
+    const char *lower_marker = "/tmp/test_stacked_mount_target/target/lower_marker";
+    const char *upper_marker = "/tmp/test_stacked_mount_target/target/upper_marker";
+
+    ensure_dir("/tmp");
+    ensure_dir(base);
+    ensure_dir(target);
+    ASSERT_EQ(0, write_file(sibling)) << strerror(errno);
+
+    if (unshare(CLONE_NEWNS) != 0) {
+        GTEST_SKIP() << strerror(errno);
+    }
+
+    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+
+    ASSERT_EQ(0, mount("", target, "ramfs", 0, NULL)) << strerror(errno);
+    ASSERT_EQ(0, write_file(lower_marker)) << strerror(errno);
+    ASSERT_TRUE(path_exists(sibling));
+
+    ASSERT_EQ(0, mount("", target, "ramfs", 0, NULL)) << strerror(errno);
+    EXPECT_FALSE(path_exists(lower_marker));
+    EXPECT_TRUE(path_exists(sibling));
+    ASSERT_EQ(0, write_file(upper_marker)) << strerror(errno);
+
+    ASSERT_EQ(0, umount(target)) << strerror(errno);
+    EXPECT_TRUE(path_exists(lower_marker));
+    EXPECT_FALSE(path_exists(upper_marker));
+    EXPECT_TRUE(path_exists(sibling));
+
+    ASSERT_EQ(0, umount(target)) << strerror(errno);
+    unlink(sibling);
+    rmdir(target);
+    rmdir(base);
 }
 
 int main(int argc, char **argv) {

@@ -2,8 +2,8 @@ use super::{DevFS, DeviceINode, LockedDevFSInode};
 use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::{
-        file::FileFlags, vcore::generate_inode_id, FilePrivateData, FileSystem, FileType,
-        IndexNode, InodeFlags, InodeMode, Metadata,
+        file::FileFlags, utils::DName, vcore::generate_inode_id, FilePrivateData, FileSystem,
+        FileType, IndexNode, InodeFlags, InodeMode, Metadata,
     },
     libs::{
         mutex::{Mutex, MutexGuard},
@@ -24,6 +24,7 @@ pub struct RandomInode {
     self_ref: Weak<LockedRandomInode>,
     fs: Weak<DevFS>,
     parent: Weak<LockedDevFSInode>,
+    dname: DName,
     metadata: Metadata,
 }
 
@@ -31,11 +32,12 @@ pub struct RandomInode {
 pub struct LockedRandomInode(Mutex<RandomInode>);
 
 impl LockedRandomInode {
-    pub fn new(raw_dev: DeviceNumber) -> Arc<Self> {
+    pub fn new(name: &str, raw_dev: DeviceNumber) -> Arc<Self> {
         let inode = RandomInode {
             self_ref: Weak::default(),
             fs: Weak::default(),
             parent: Weak::default(),
+            dname: DName::from(name),
             metadata: Metadata {
                 dev_id: 1,
                 inode_id: generate_inode_id(),
@@ -158,5 +160,9 @@ impl IndexNode for LockedRandomInode {
             return Ok(parent);
         }
         Err(SystemError::ENOENT)
+    }
+
+    fn dname(&self) -> Result<DName, SystemError> {
+        Ok(self.0.lock().dname.clone())
     }
 }

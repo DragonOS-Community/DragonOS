@@ -2,8 +2,8 @@ use super::{DevFS, DeviceINode, LockedDevFSInode};
 use crate::{
     driver::base::device::device_number::{DeviceNumber, Major},
     filesystem::vfs::{
-        file::FileFlags, vcore::generate_inode_id, FilePrivateData, FileSystem, FileType,
-        IndexNode, InodeFlags, InodeMode, Metadata,
+        file::FileFlags, utils::DName, vcore::generate_inode_id, FilePrivateData, FileSystem,
+        FileType, IndexNode, InodeFlags, InodeMode, Metadata,
     },
     libs::mutex::{Mutex, MutexGuard},
     time::PosixTimeSpec,
@@ -145,5 +145,9 @@ impl IndexNode for LockedFullInode {
             return Ok(parent as Arc<dyn IndexNode>);
         }
         Err(SystemError::ENOENT)
+    }
+
+    fn dname(&self) -> Result<DName, SystemError> {
+        Ok(DName::from("full"))
     }
 }

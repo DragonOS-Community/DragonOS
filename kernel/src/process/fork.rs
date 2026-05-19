@@ -563,10 +563,14 @@ impl ProcessManager {
         // 如果新进程使用不同的 pid 或 namespace，
         // 则不允许它与分叉任务共享线程组。
         if clone_flags.contains(CloneFlags::CLONE_THREAD)
-            && !((clone_flags & (CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWPID)).is_empty())
+            && (!((clone_flags & (CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWPID))
+                .is_empty())
+                || !Arc::ptr_eq(
+                    &current_pcb.active_pid_ns(),
+                    current_pcb.nsproxy().pid_namespace_for_children(),
+                ))
         {
             return Err(SystemError::EINVAL);
-            // TODO: 判断新进程与当前进程namespace是否相同，不同则返回错误
         }
 
         // 如果新进程将处于不同的time namespace，
@@ -712,12 +716,12 @@ impl ProcessManager {
             // 分层PID分配：在父进程的子PID namespace中为新任务分配PID
             let ns = pcb.nsproxy().pid_namespace_for_children().clone();
 
-            let main_pid_arc = alloc_pid(&ns).expect("alloc_pid failed");
+            let main_pid_arc = alloc_pid(&ns)?;
 
             // 根namespace中的PID号作为RawPid
             let root_pid_nr = main_pid_arc
                 .first_upid()
-                .expect("UPid list empty")
+                .ok_or(SystemError::EINVAL)?
                 .nr
                 .data();
             // log::debug!("fork: root_pid_nr: {}", root_pid_nr);

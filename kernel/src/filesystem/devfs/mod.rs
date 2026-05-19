@@ -164,31 +164,36 @@ impl DevFS {
         use null_dev::LockedNullInode;
         use random_dev::LockedRandomInode;
         use zero_dev::LockedZeroInode;
-        let dev_root: Arc<LockedDevFSInode> = self.root_inode.clone();
-        dev_root
-            .add_dev("full", LockedFullInode::new())
-            .expect("DevFS: Failed to register /dev/full");
-        dev_root
-            .add_dev("fuse", LockedFuseDevInode::new())
-            .expect("DevFS: Failed to register /dev/fuse");
-        dev_root
-            .add_dev("null", LockedNullInode::new())
+
+        self.register_builtin_root_device("null", LockedNullInode::new())
             .expect("DevFS: Failed to register /dev/null");
-        dev_root
-            .add_dev(
-                "random",
-                LockedRandomInode::new(DeviceNumber::new(Major::new(1), 8)),
-            )
-            .expect("DevFS: Failed to register /dev/random");
-        dev_root
-            .add_dev(
-                "urandom",
-                LockedRandomInode::new(DeviceNumber::new(Major::new(1), 9)),
-            )
-            .expect("DevFS: Failed to register /dev/urandom");
-        dev_root
-            .add_dev("zero", LockedZeroInode::new())
+        self.register_builtin_root_device("zero", LockedZeroInode::new())
             .expect("DevFS: Failed to register /dev/zero");
+        self.register_builtin_root_device("full", LockedFullInode::new())
+            .expect("DevFS: Failed to register /dev/full");
+        self.register_builtin_root_device(
+            "random",
+            LockedRandomInode::new("random", DeviceNumber::new(Major::new(1), 8)),
+        )
+        .expect("DevFS: Failed to register /dev/random");
+        self.register_builtin_root_device(
+            "urandom",
+            LockedRandomInode::new("urandom", DeviceNumber::new(Major::new(1), 9)),
+        )
+        .expect("DevFS: Failed to register /dev/urandom");
+        self.register_builtin_root_device("fuse", LockedFuseDevInode::new())
+            .expect("DevFS: Failed to register /dev/fuse");
+    }
+
+    fn register_builtin_root_device<T: DeviceINode + 'static>(
+        &self,
+        name: &str,
+        device: Arc<T>,
+    ) -> Result<(), SystemError> {
+        let dev_root = self.root_inode.clone();
+        device.set_fs(dev_root.0.lock().fs.clone());
+        device.set_parent(Arc::downgrade(&dev_root));
+        dev_root.add_dev(name, device)
     }
 
     /// @brief 在devfs内注册设备

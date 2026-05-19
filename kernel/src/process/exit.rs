@@ -1045,6 +1045,12 @@ fn do_waitpid(
 }
 
 impl ProcessControlBlock {
+    fn dec_visible_thread_count_if_accounted(&self) {
+        if self.take_visible_thread_accounted() {
+            dec_visible_thread_count();
+        }
+    }
+
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/exit.c#143
     pub(super) fn __exit_signal(&mut self) {
         let sighand = self.sighand();
@@ -1085,9 +1091,7 @@ impl ProcessControlBlock {
         if should_defer_unhash_for_group_exec(self, group_dead) {
             self.flags().insert(ProcessFlags::DEFER_UNHASH);
         } else {
-            if self.raw_pid() > RawPid(0) {
-                dec_visible_thread_count();
-            }
+            self.dec_visible_thread_count_if_accounted();
             self.detach_pid(PidType::PID);
             if group_dead {
                 self.detach_pid(PidType::TGID);
@@ -1117,9 +1121,7 @@ impl ProcessControlBlock {
             return;
         }
         self.flags().remove(ProcessFlags::DEFER_UNHASH);
-        if self.raw_pid() > RawPid(0) {
-            dec_visible_thread_count();
-        }
+        self.dec_visible_thread_count_if_accounted();
         self.detach_pid(PidType::PID);
         if self.is_thread_group_leader() {
             self.detach_pid(PidType::TGID);

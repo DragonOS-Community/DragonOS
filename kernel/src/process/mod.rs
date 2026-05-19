@@ -1324,6 +1324,8 @@ pub struct ProcessControlBlock {
     rcu_read_depth: AtomicUsize,
 
     flags: LockFreeFlags<ProcessFlags>,
+    /// 当前任务是否已经计入全局可见线程数。
+    visible_thread_accounted: AtomicBool,
     /// Serializes task-local pointer publication for RCU-protected metadata
     /// such as `cred`, `nsproxy`, and `sighand`.
     task_lock: SpinLock<()>,
@@ -1517,6 +1519,7 @@ impl ProcessControlBlock {
                 preempt_count,
                 rcu_read_depth,
                 flags,
+                visible_thread_accounted: AtomicBool::new(false),
                 task_lock: SpinLock::new(()),
                 kernel_stack: RwLock::new(kstack),
                 syscall_stack: RwLock::new(KernelStack::new().unwrap()),
@@ -1778,6 +1781,16 @@ impl ProcessControlBlock {
     #[inline(always)]
     pub fn flags(&self) -> &mut ProcessFlags {
         return self.flags.get_mut();
+    }
+
+    #[inline(always)]
+    pub(crate) fn mark_visible_thread_accounted(&self) {
+        self.visible_thread_accounted.store(true, Ordering::Release);
+    }
+
+    #[inline(always)]
+    pub(crate) fn take_visible_thread_accounted(&self) -> bool {
+        self.visible_thread_accounted.swap(false, Ordering::AcqRel)
     }
 
     /// 请注意，这个值能在中断上下文中读取，但不能被中断上下文修改

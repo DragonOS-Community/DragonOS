@@ -923,6 +923,7 @@ impl ProcessManager {
             cgroup.charge_pids(1);
             cgroup.add_task(pcb.raw_pid());
             ProcessManager::add_pcb(pcb.clone());
+            pcb.mark_visible_thread_accounted();
             inc_visible_thread_count();
             account_successful_fork();
         }

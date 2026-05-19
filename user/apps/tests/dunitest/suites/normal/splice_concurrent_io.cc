@@ -13,10 +13,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/utsname.h>
 #include <unistd.h>
 
 #include <atomic>
+#include <string>
 #include <vector>
 
 namespace {
@@ -250,6 +252,31 @@ TEST(SpliceConcurrentIo, NonblockFileToPipeShortReadUsesAvailableSpace) {
 
     close(pipe_fds[0]);
     close(pipe_fds[1]);
+}
+
+TEST(SpliceConcurrentIo, ProcfsZeroSizeRegularFileCanSpliceData) {
+    const int file_fd = open("/proc/cpuinfo", O_RDONLY);
+    ASSERT_GE(file_fd, 0) << strerror(errno);
+
+    struct stat st {};
+    ASSERT_EQ(0, fstat(file_fd, &st)) << strerror(errno);
+    ASSERT_TRUE(S_ISREG(st.st_mode));
+    ASSERT_EQ(0, st.st_size);
+
+    int pipe_fds[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(pipe_fds)) << strerror(errno);
+
+    const ssize_t spliced = splice(file_fd, nullptr, pipe_fds[1], nullptr, 4096, 0);
+    ASSERT_GT(spliced, 0) << strerror(errno);
+
+    std::vector<char> bytes(static_cast<size_t>(spliced));
+    ASSERT_EQ(spliced, read(pipe_fds[0], bytes.data(), bytes.size())) << strerror(errno);
+    const std::string text(bytes.begin(), bytes.end());
+    EXPECT_NE(std::string::npos, text.find("processor"));
+
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+    close(file_fd);
 }
 
 int main(int argc, char** argv) {

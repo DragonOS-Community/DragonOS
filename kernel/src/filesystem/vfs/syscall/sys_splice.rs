@@ -314,7 +314,7 @@ fn splice_file_read_limit(file: &File, offset: Option<usize>, limit: usize) -> u
         return 0;
     }
 
-    if matches!(file.file_type(), FileType::File) {
+    if matches!(file.file_type(), FileType::File) && splice_regular_file_has_trusted_size(file) {
         if let Ok(metadata) = file.metadata() {
             let size = metadata.size.max(0) as usize;
             let pos = offset.unwrap_or_else(|| file.pos());
@@ -323,6 +323,10 @@ fn splice_file_read_limit(file: &File, offset: Option<usize>, limit: usize) -> u
     }
 
     limit
+}
+
+fn splice_regular_file_has_trusted_size(file: &File) -> bool {
+    matches!(file.inode().fs().name(), "ext4" | "fat" | "tmpfs" | "ramfs")
 }
 
 /// pipe 到 file 的数据传输

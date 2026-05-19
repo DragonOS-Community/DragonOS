@@ -16,6 +16,7 @@ normal/sync_file_range
 normal/splice_concurrent_io
 normal/rcu_selftest
 normal/test_tlb_shootdown
+normal/pid_namespace_fork
 normal/tcp_close_semantics
 fuse/fuse_core
 fuse/fuse_extended

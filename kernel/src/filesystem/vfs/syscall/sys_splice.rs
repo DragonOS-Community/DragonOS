@@ -254,25 +254,33 @@ fn splice_file_to_pipe(
 ) -> Result<usize, SystemError> {
     let pipe_inode = get_pipe_inode(pipe)?;
 
-    let wanted = splice_file_read_limit(file, offset, len.min(4096));
-    if wanted == 0 {
+    let limit = len.min(4096);
+    let trusted_read_limit = splice_trusted_file_read_limit(file, offset, limit);
+    if trusted_read_limit == Some(0) {
         return Ok(0);
     }
+    let wanted = trusted_read_limit.unwrap_or(limit);
 
     let space = if flags.contains(SpliceFlags::SPLICE_F_NONBLOCK) {
         let space = pipe_inode.writable_len();
         if space == 0 && pipe_inode.has_readers() {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
-        if wanted <= PIPE_BUF && space < wanted && pipe_inode.has_readers() {
+        if trusted_read_limit.is_some()
+            && wanted <= PIPE_BUF
+            && space < wanted
+            && pipe_inode.has_readers()
+        {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
         space
-    } else {
+    } else if trusted_read_limit.is_some() {
         pipe_inode.wait_writable_for_splice(wanted)?
+    } else {
+        pipe_inode.wait_writable_any_for_splice()?
     };
 
-    let buf_size = if space == 0 {
+    let buf_size = if trusted_read_limit.is_some() && space == 0 {
         wanted
     } else {
         wanted.min(space)
@@ -312,20 +320,24 @@ fn splice_file_to_pipe(
     }
 }
 
-fn splice_file_read_limit(file: &File, offset: Option<usize>, limit: usize) -> usize {
+fn splice_trusted_file_read_limit(
+    file: &File,
+    offset: Option<usize>,
+    limit: usize,
+) -> Option<usize> {
     if limit == 0 {
-        return 0;
+        return Some(0);
     }
 
     if matches!(file.file_type(), FileType::File) && splice_regular_file_has_trusted_size(file) {
         if let Ok(metadata) = file.metadata() {
             let size = metadata.size.max(0) as usize;
             let pos = offset.unwrap_or_else(|| file.pos());
-            return limit.min(size.saturating_sub(pos));
+            return Some(limit.min(size.saturating_sub(pos)));
         }
     }
 
-    limit
+    None
 }
 
 fn splice_regular_file_has_trusted_size(file: &File) -> bool {

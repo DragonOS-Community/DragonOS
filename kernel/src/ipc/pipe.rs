@@ -648,6 +648,33 @@ impl LockedPipeInode {
         }
     }
 
+    /// Wait until the pipe has any writable byte for file->pipe splice.
+    ///
+    /// This matches Linux `wait_for_space()` for inputs whose exact readable
+    /// length is not known before calling into the file. The caller can then
+    /// cap the read by the returned byte space.
+    pub fn wait_writable_any_for_splice(&self) -> Result<usize, SystemError> {
+        loop {
+            let guard = self.inner.lock();
+            if guard.reader == 0 {
+                drop(guard);
+                let _ = send_kernel_signal_to_current(Signal::SIGPIPE);
+                return Err(SystemError::EPIPE);
+            }
+
+            let used = guard.valid_cnt.max(0) as usize;
+            let space = guard.buf_size.saturating_sub(used);
+            if space > 0 {
+                return Ok(space);
+            }
+
+            drop(guard);
+            if wq_wait_event_interruptible!(self.write_wait_queue, self.writeable(), {}).is_err() {
+                return Err(SystemError::ERESTARTSYS);
+            }
+        }
+    }
+
     /// 从管道中“窥视”最多 `len` 字节数据到 `buf`，但不消耗管道数据。
     ///
     /// 返回实际拷贝的字节数（可能小于 `len`）。不会睡眠。

@@ -145,6 +145,21 @@ bool IsDragonOS() {
            strstr(uts.nodename, "dragonos") != nullptr;
 }
 
+std::string ReadSmallFile(const char* path) {
+    const int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return "";
+    }
+
+    char buf[256] = {};
+    const ssize_t n = read(fd, buf, sizeof(buf));
+    close(fd);
+    if (n <= 0 || n >= static_cast<ssize_t>(sizeof(buf))) {
+        return "";
+    }
+    return std::string(buf, static_cast<size_t>(n));
+}
+
 }  // namespace
 
 TEST(SpliceConcurrentIo, FileToPipeNotStarvedByMadvise) {
@@ -302,6 +317,79 @@ TEST(SpliceConcurrentIo, ProcfsZeroSizeRegularFileCanSpliceData) {
     ASSERT_EQ(spliced, read(pipe_fds[0], bytes.data(), bytes.size())) << strerror(errno);
     const std::string text(bytes.begin(), bytes.end());
     EXPECT_NE(std::string::npos, text.find("processor"));
+
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+    close(file_fd);
+}
+
+TEST(SpliceConcurrentIo, ProcfsShortReadNeedsOnlyActualPipeSpace) {
+    if (!IsDragonOS()) {
+        GTEST_SKIP() << "DragonOS procfs splice regression test";
+    }
+
+    struct sigaction sa {};
+    sa.sa_handler = AlarmHandler;
+    ASSERT_EQ(0, sigaction(SIGALRM, &sa, nullptr)) << strerror(errno);
+    alarm(5);
+
+    constexpr const char* kPath = "/proc/loadavg";
+    const std::string expected = ReadSmallFile(kPath);
+    ASSERT_GT(expected.size(), 0U);
+    ASSERT_LT(expected.size(), 4096U);
+
+    const int file_fd = open(kPath, O_RDONLY);
+    ASSERT_GE(file_fd, 0) << strerror(errno);
+
+    struct stat st {};
+    ASSERT_EQ(0, fstat(file_fd, &st)) << strerror(errno);
+    ASSERT_TRUE(S_ISREG(st.st_mode));
+    ASSERT_EQ(0, st.st_size);
+
+    int pipe_fds[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(pipe_fds)) << strerror(errno);
+    const int capacity = fcntl(pipe_fds[1], F_GETPIPE_SZ);
+    ASSERT_GT(capacity, static_cast<int>(expected.size())) << strerror(errno);
+    FillPipeLeavingSpace(pipe_fds[1], capacity, expected.size());
+
+    ASSERT_EQ(static_cast<ssize_t>(expected.size()),
+              splice(file_fd, nullptr, pipe_fds[1], nullptr, 4096, 0))
+        << strerror(errno);
+
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+    close(file_fd);
+    alarm(0);
+}
+
+TEST(SpliceConcurrentIo, NonblockProcfsShortReadUsesAvailablePipeSpace) {
+    if (!IsDragonOS()) {
+        GTEST_SKIP() << "DragonOS procfs splice regression test";
+    }
+
+    constexpr const char* kPath = "/proc/loadavg";
+    const std::string expected = ReadSmallFile(kPath);
+    ASSERT_GT(expected.size(), 0U);
+    ASSERT_LT(expected.size(), 4096U);
+
+    const int file_fd = open(kPath, O_RDONLY);
+    ASSERT_GE(file_fd, 0) << strerror(errno);
+
+    struct stat st {};
+    ASSERT_EQ(0, fstat(file_fd, &st)) << strerror(errno);
+    ASSERT_TRUE(S_ISREG(st.st_mode));
+    ASSERT_EQ(0, st.st_size);
+
+    int pipe_fds[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(pipe_fds)) << strerror(errno);
+    const int capacity = fcntl(pipe_fds[1], F_GETPIPE_SZ);
+    ASSERT_GT(capacity, static_cast<int>(expected.size())) << strerror(errno);
+    FillPipeLeavingSpace(pipe_fds[1], capacity, expected.size());
+
+    ASSERT_EQ(static_cast<ssize_t>(expected.size()),
+              splice(file_fd, nullptr, pipe_fds[1], nullptr, 4096,
+                     SPLICE_F_NONBLOCK))
+        << strerror(errno);
 
     close(pipe_fds[0]);
     close(pipe_fds[1]);

@@ -32,8 +32,9 @@ void ExpectProcFdTarget(const char* path) {
     std::array<char, 1> dummy {};
     errno = 0;
     ssize_t len = readlink(proc_path.c_str(), dummy.data(), 0);
-    EXPECT_EQ(0, len) << "zero-sized readlink failed: errno=" << errno << " ("
-                      << std::strerror(errno) << ")";
+    EXPECT_EQ(-1, len);
+    EXPECT_EQ(EINVAL, errno) << "zero-sized readlink failed with errno=" << errno
+                             << " (" << std::strerror(errno) << ")";
 
     EXPECT_EQ(0, close(fd));
 }

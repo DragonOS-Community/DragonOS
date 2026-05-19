@@ -13,6 +13,7 @@ normal/proc_self_limits
 normal/mlock_semantics
 normal/sched_affinity
 normal/sync_file_range
+normal/splice_concurrent_io
 normal/rcu_selftest
 normal/test_tlb_shootdown
 normal/tcp_close_semantics

@@ -77,7 +77,7 @@ impl Syscall for SysSchedGetscheduler {
         }
 
         // 获取调度策略
-        let policy = *target_pcb.sched_info().sched_policy.read_irqsave();
+        let policy = target_pcb.sched_info().policy();
 
         // 将 DragonOS 的 SchedPolicy 映射到 Linux 的调度策略值
         // Linux 调度策略值：

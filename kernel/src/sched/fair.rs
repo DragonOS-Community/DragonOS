@@ -1582,7 +1582,7 @@ impl Scheduler for CompletelyFairScheduler {
         }
     }
 
-    fn check_preempt_currnet(
+    fn check_preempt_current(
         rq: &mut CpuRunQueue,
         pcb: &Arc<crate::process::ProcessControlBlock>,
         wake_flags: WakeupFlags,

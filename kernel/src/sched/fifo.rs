@@ -29,7 +29,7 @@ impl FifoRunQueue {
 
     #[inline]
     fn prio_index(pcb: &ProcessControlBlock) -> usize {
-        let prio = pcb.sched_info().prio_data.read_irqsave().prio;
+        let prio = pcb.sched_info().prio();
         let prio = prio.clamp(0, MAX_RT_PRIO - 1);
         prio as usize
     }
@@ -95,7 +95,18 @@ pub struct FifoScheduler;
 impl FifoScheduler {
     #[inline]
     fn rt_prio(pcb: &ProcessControlBlock) -> i32 {
-        pcb.sched_info().prio_data.read_irqsave().prio
+        pcb.sched_info().prio()
+    }
+
+    /// 对标 Linux set_next_task_rt：将 FIFO 任务设为当前运行任务。
+    ///
+    /// FIFO 不像 CFS 那样维护 per-class current entity，
+    /// 但需要在 running 任务修改策略/优先级后被调用以保持与 Linux 一致的流程。
+    pub fn set_next_task(
+        _rq: &mut super::CpuRunQueue,
+        _pcb: alloc::sync::Arc<crate::process::ProcessControlBlock>,
+    ) {
+        // FIFO 不维护 per-class 调度实体状态，无需额外操作
     }
 }
 
@@ -120,7 +131,7 @@ impl Scheduler for FifoScheduler {
         rq.resched_current();
     }
 
-    fn check_preempt_currnet(
+    fn check_preempt_current(
         rq: &mut CpuRunQueue,
         pcb: &Arc<ProcessControlBlock>,
         _flags: WakeupFlags,

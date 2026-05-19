@@ -476,11 +476,7 @@ fn sig_stop(sig: Signal) {
 fn sig_continue(_sig: Signal) {
     // 默认处理改为最小化：仅在已处于 Stopped 时唤醒停止，让进程继续运行。
     let pcb = ProcessManager::current_pcb();
-    let is_stopped = pcb
-        .sched_info()
-        .inner_lock_read_irqsave()
-        .state()
-        .is_stopped();
+    let is_stopped = pcb.sched_info().state().is_stopped();
     if is_stopped {
         let _ = ProcessManager::wakeup_stop(&pcb);
     }

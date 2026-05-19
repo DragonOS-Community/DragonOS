@@ -56,11 +56,6 @@ let
         "cpu_reset,guest_errors,trace:virtio*,trace:e1000e_rx*,trace:e1000e_tx*,trace:e1000e_irq*"
         "-trace"
         "fw_cfg*"
-      ]
-      ++ lib.optionals debug [
-        # GDB Stub
-        "-s"
-        "-S"
       ];
       nographicArgs = lib.optionals isNographic (
         [
@@ -199,6 +194,7 @@ let
 
       # 动态分配端口
       HOST_PORT=$(find_available_port 12580)
+      GDB_PORT=$(find_available_port $((HOST_PORT + 1)))
 
       ACCEL="tcg"
       if [ -e /dev/kvm ] && [ -w /dev/kvm ]; then ACCEL="kvm"; fi
@@ -328,6 +324,7 @@ let
             mkdir -p "$VMSTATE_DIR"
             rm -f "$VMSTATE_DIR/pid" "$VMSTATE_DIR/vsock_cid"
             echo "$HOST_PORT" > "$VMSTATE_DIR/port"
+            echo "$GDB_PORT" > "$VMSTATE_DIR/gdb"
             if [ -n "$VSOCK_GUEST_CID" ]; then
               echo "$VSOCK_GUEST_CID" > "$VMSTATE_DIR/vsock_cid"
             fi
@@ -338,7 +335,7 @@ let
 
       cleanup() {
         sudo rm -f /dev/shm/${baseConfig.shmId}
-        ${if hasVmstateDir then ''rm -f "$VMSTATE_DIR/pid" "$VMSTATE_DIR/vsock_cid"'' else ""}
+        ${if hasVmstateDir then ''rm -f "$VMSTATE_DIR/pid" "$VMSTATE_DIR/vsock_cid" "$VMSTATE_DIR/port" "$VMSTATE_DIR/gdb"'' else ""}
       }
       trap cleanup EXIT
       # FIXED: 既然用了 sudo 运行 qemu，这里创建 shm 也需要权限，
@@ -348,7 +345,7 @@ let
       EXTRA_CMDLINE="${qemuConfig.cmdlineExtra}"
 
       # FIXED: 补全缺失的默认内核参数 AUTO_TEST 和 SYSCALL_TEST_DIR
-      FINAL_CMDLINE="init=${initProgram} AUTO_TEST=${testOpt.autotest} SYSCALL_TEST_DIR=${testOpt.syscall.testDir} $EXTRA_CMDLINE"
+      FINAL_CMDLINE="init=${initProgram} AUTO_TEST=${testOpt.autotest} SYSCALL_TEST_DIR=${testOpt.syscall.testDir} DUNITEST_DIR=${testOpt.dunitest.testDir} $EXTRA_CMDLINE"
 
       ARCH_FLAGS=( ${lib.escapeShellArgs commonArchArgs} )
       ${archSpecificBash}
@@ -380,15 +377,27 @@ let
       ${
         if hasVmstateDir then
           ''
+            ${lib.optionalString debug ''
+            GDB_ARGS=( "-gdb" "tcp::$GDB_PORT" )
+            if [ "''${QEMU_GDB_WAIT:-0}" = "1" ]; then
+              GDB_ARGS+=( "-S" )
+            fi
+            ''}
             sudo bash -c 'pidfile="$1"; shift; echo $$ > "$pidfile"; exec "$@"' bash "$VMSTATE_DIR/pid" ${qemuBin} ${qemuFlagsStr} "''${NET_ARGS[@]}" ${
               if qemuFirmware != null then "-L ${qemuFirmware}" else ""
-            } "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "''${VSOCK_ARGS[@]}" "$@"
+            } "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "''${VSOCK_ARGS[@]}" ${lib.optionalString debug ''"''${GDB_ARGS[@]}"''} "$@"
           ''
         else
           ''
+            ${lib.optionalString debug ''
+            GDB_ARGS=( "-gdb" "tcp::$GDB_PORT" )
+            if [ "''${QEMU_GDB_WAIT:-0}" = "1" ]; then
+              GDB_ARGS+=( "-S" )
+            fi
+            ''}
             sudo ${qemuBin} ${qemuFlagsStr} "''${NET_ARGS[@]}" ${
               if qemuFirmware != null then "-L ${qemuFirmware}" else ""
-            } "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "''${VSOCK_ARGS[@]}" "$@"
+            } "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "''${VSOCK_ARGS[@]}" ${lib.optionalString debug ''"''${GDB_ARGS[@]}"''} "$@"
           ''
       }
     '';

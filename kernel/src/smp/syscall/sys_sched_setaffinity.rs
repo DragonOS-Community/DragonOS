@@ -58,8 +58,8 @@ impl Syscall for SysSchedSetaffinity {
         }
 
         {
-            let _placement_guard = target_pcb.sched_info().placement_lock();
-            target_pcb.sched_info().set_cpus_allowed(mask.clone());
+            let mut pi_guard = target_pcb.sched_info().pi_lock_irqsave();
+            pi_guard.set_cpus_allowed(mask.clone());
         }
 
         if target_pcb.sched_info().is_new_task() {
@@ -68,7 +68,8 @@ impl Syscall for SysSchedSetaffinity {
 
         if let Some(cpu) = target_pcb.sched_info().on_cpu() {
             if !mask.get(cpu).unwrap_or(false) {
-                let dest_cpu = select_task_rq(&target_pcb, cpu, crate::sched::WakeupFlags::WF_TTWU);
+                let dest_cpu =
+                    select_task_rq(&target_pcb, cpu, crate::sched::WakeupFlags::WF_TTWU, &mask);
                 request_task_migration(&target_pcb, dest_cpu)?;
             }
         }

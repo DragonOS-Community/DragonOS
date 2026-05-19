@@ -170,13 +170,13 @@ impl KernelCloneArgs {
     }
 
     #[inline]
-    fn target_cpu_is_allowed(allowed: &CpuMask, cpu: ProcessorId) -> bool {
+    fn target_cpu_is_allowed(cpu: ProcessorId, allowed: &CpuMask) -> bool {
         allowed.get(cpu).unwrap_or(false)
     }
 
     #[inline]
     fn validate_target_cpu(cpu: ProcessorId, allowed: &CpuMask) -> Result<(), SystemError> {
-        if Self::target_cpu_is_allowed(allowed, cpu) && Self::target_cpu_is_online(cpu) {
+        if Self::target_cpu_is_allowed(cpu, allowed) && Self::target_cpu_is_online(cpu) {
             Ok(())
         } else {
             Err(SystemError::EINVAL)
@@ -202,7 +202,7 @@ impl KernelCloneArgs {
         let target_cpu = if let Some(target_cpu) = self.target_cpu {
             Self::validate_target_cpu(target_cpu, allowed)?;
             target_cpu
-        } else if Self::target_cpu_is_allowed(allowed, default_cpu)
+        } else if Self::target_cpu_is_allowed(default_cpu, allowed)
             && Self::target_cpu_is_online(default_cpu)
         {
             default_cpu
@@ -290,7 +290,7 @@ impl ProcessManager {
         //     );
         // }
 
-        ProcessManager::wakeup_new_task(&pcb).unwrap_or_else(|e| {
+        ProcessManager::wake_up_new_task(&pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to wakeup new process, pid: [{:?}]. Error: {:?}",
                 pcb.raw_pid(),
@@ -307,10 +307,19 @@ impl ProcessManager {
 
     fn copy_flags(
         clone_flags: &CloneFlags,
+        kthread: bool,
         new_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
         // 先复制父进程的 flags
-        *new_pcb.flags.get_mut() = *ProcessManager::current_pcb().flags();
+        let parent_flags = *ProcessManager::current_pcb().flags();
+
+        // DragonOS 无 SUPERPRIV/WQ_WORKER/IDLE/NO_SETAFFINITY 的对应，暂时只清 KTHREAD。
+        *new_pcb.flags.get_mut() = parent_flags & !ProcessFlags::KTHREAD;
+
+        // KTHREAD 不通过继承传递，而是由创建参数显式赋予。
+        if kthread {
+            new_pcb.flags().insert(ProcessFlags::KTHREAD);
+        }
 
         // 然后根据 clone_flags 设置需要的标志
         if clone_flags.contains(CloneFlags::CLONE_VFORK) {
@@ -621,7 +630,7 @@ impl ProcessManager {
         clone_args.validate_requested_target_cpu(&pcb.sched_info().cpus_allowed())?;
 
         // 拷贝标志位
-        Self::copy_flags(&clone_flags, pcb).unwrap_or_else(|e| {
+        Self::copy_flags(&clone_flags, clone_args.kthread, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy flags from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.raw_pid(), pcb.raw_pid(), e
@@ -943,7 +952,7 @@ impl ProcessManager {
             pcb.thread.write_irqsave().set_child_tid = Some(clone_args.child_tid);
         }
 
-        // 新任务的默认落点 CPU 应在 wakeup_new_task() 时再选择；这里只保留显式 hint，
+        // 新任务的默认落点 CPU 应在 wake_up_new_task() 时再选择；这里只保留显式 hint，
         // 以避免 fork 长路径内父任务迁移导致的“过早采样当前 CPU”问题。
         pcb.sched_info().mark_new_task(clone_args.target_cpu);
         sched_cgroup_fork(pcb);

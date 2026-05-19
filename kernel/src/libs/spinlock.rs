@@ -33,10 +33,11 @@ pub struct SpinLockGuard<'a, T: 'a> {
 
 /// `spin_lock_bh` 风格的守卫：持锁期间屏蔽本 CPU 的 softirq/tasklet 执行（不关硬中断）。
 ///
-/// Drop 顺序：先解锁，再恢复 BH（等价于 Linux 的 `spin_unlock_bh`）。
+/// Drop 顺序：先解锁(guard)，再恢复 BH。等价于 Linux 的 `spin_unlock_bh`。
+/// Rust 按字段声明顺序 drop，因此 guard 必须在 bh 前面。
 pub struct SpinLockBhGuard<'a, T: 'a> {
-    bh: LocalBhDisableGuard,
     guard: SpinLockGuard<'a, T>,
+    bh: LocalBhDisableGuard,
 }
 
 impl<'a, T: 'a> SpinLockGuard<'a, T> {
@@ -152,7 +153,6 @@ impl<T> SpinLock<T> {
 
     fn unlock(&self) {
         self.lock.store(false, Ordering::Release);
-        ProcessManager::preempt_enable();
     }
 
     pub fn is_locked(&self) -> bool {
@@ -180,8 +180,9 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
 impl<T> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.unlock();
-        // restore irq
+        // 先恢复中断，再启用抢占
         self.irq_flag.take();
+        ProcessManager::preempt_enable();
     }
 }
 

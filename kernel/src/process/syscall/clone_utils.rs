@@ -91,7 +91,7 @@ pub fn do_clone(
         pcb.thread.write_irqsave().vfork_done = Some(vfork.clone());
     }
 
-    ProcessManager::wakeup_new_task(&pcb).unwrap_or_else(|e| {
+    ProcessManager::wake_up_new_task(&pcb).unwrap_or_else(|e| {
         panic!(
             "fork: Failed to wakeup new process, pid: [{:?}]. Error: {:?}",
             pcb.raw_pid(),

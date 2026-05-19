@@ -163,8 +163,7 @@ impl PageFaultHandler {
         let vma = pfm.vma();
         let current_pcb = ProcessManager::current_pcb();
         {
-            let mut guard = current_pcb.sched_info().inner_lock_write_irqsave();
-            guard.set_state(ProcessState::Runnable);
+            current_pcb.sched_info().set_state(ProcessState::Runnable);
         }
 
         if !MMArch::vma_access_permitted(

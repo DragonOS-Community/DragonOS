@@ -115,6 +115,9 @@ fn kenrel_init_freeable() -> Result<(), SystemError> {
 }
 
 /// 切换到用户态
+///
+/// DragonOS 的 init 进程以 BSP idle task 身份创建（调度策略为 IDLE），
+/// 此处清除 kthread 标志并将策略改为 CFS，使其作为普通用户进程被调度。
 #[inline(never)]
 fn switch_to_user() -> ! {
     let current_pcb = ProcessManager::current_pcb();
@@ -123,7 +126,10 @@ fn switch_to_user() -> ! {
     current_pcb.flags().remove(ProcessFlags::KTHREAD);
     current_pcb.worker_private().take();
 
-    *current_pcb.sched_info().sched_policy.write_irqsave() = crate::sched::SchedPolicy::CFS;
+    // BSP idle task 的调度策略为 IDLE，必须切换为 CFS 才能被正常调度
+    current_pcb
+        .sched_info()
+        .set_policy(crate::sched::SchedPolicy::CFS);
     drop(current_pcb);
 
     let mut proc_init_info = ProcInitInfo::new("");

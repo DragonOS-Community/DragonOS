@@ -62,7 +62,7 @@ pub struct FifoRunQueue {
 
 ### 3.2 Preemption Mechanism
 
-**check_preempt_currnet()**: When a new process is awakened, check whether the current process needs to be preempted.
+**check_preempt_current()**: When a new process is awakened, check whether the current process needs to be preempted.
 - If the new process has a higher priority, trigger preemption.
 - Supports preemption between real-time tasks and normal tasks.
 

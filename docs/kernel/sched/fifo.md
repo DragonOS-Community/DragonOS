@@ -47,7 +47,7 @@ pub struct FifoRunQueue {
 
 ### 3.2 抢占机制
 
-**check_preempt_currnet()**：当有新进程被唤醒时，检查是否需要抢占当前进程
+**check_preempt_current()**：当有新进程被唤醒时，检查是否需要抢占当前进程
 - 如果新进程优先级更高，触发抢占
 - 支持实时任务与普通任务之间的抢占
 

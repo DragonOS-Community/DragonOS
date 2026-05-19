@@ -221,8 +221,7 @@ impl CpuTimeFunc {
         } else if user_tick {
             // 用户态时间：区分 NICE
             // 获取进程的 nice 值（通过 static_prio 计算）
-            let prio_data = pcb.sched_info().prio_data();
-            let static_prio = prio_data.static_prio;
+            let static_prio = pcb.sched_info().static_prio();
             // 使用 PrioUtil 将 prio 转换为 nice 值
             let nice = PrioUtil::prio_to_nice(static_prio);
 

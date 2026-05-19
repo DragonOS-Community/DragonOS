@@ -41,6 +41,7 @@ impl KernelThreadMechanism {
         // fork失败的话，子线程不会执行。否则将导致内存安全问题。
         let mut clone_args = KernelCloneArgs::new();
         clone_args.flags = clone_flags;
+        clone_args.kthread = true;
         if info
             .flags()
             .contains(crate::process::kthread::KernelThreadFlags::IS_PER_CPU)

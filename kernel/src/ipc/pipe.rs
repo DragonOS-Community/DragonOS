@@ -606,11 +606,12 @@ impl LockedPipeInode {
         Ok(to_write)
     }
 
-    /// Wait for space before file->pipe splice reads from the input file.
+    /// Wait for pipe space before file->pipe splice reads from the input file.
     ///
-    /// DragonOS pipes are byte-ring based, so this follows the same write
-    /// atomicity rule as pipe writes: writes up to PIPE_BUF wait for the full
-    /// request; larger writes wait for any space and may complete partially.
+    /// The caller must pass the maximum number of bytes it can actually read
+    /// from the input file for this splice attempt. DragonOS pipes are byte-ring
+    /// based, so requests up to PIPE_BUF wait for the complete readable chunk;
+    /// larger requests wait for any space and may complete partially.
     pub fn wait_writable_for_splice(&self, len: usize) -> Result<usize, SystemError> {
         if len == 0 {
             return Ok(0);

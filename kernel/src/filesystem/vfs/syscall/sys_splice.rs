@@ -254,10 +254,26 @@ fn splice_file_to_pipe(
 ) -> Result<usize, SystemError> {
     let pipe_inode = get_pipe_inode(pipe)?;
 
-    let mut buf_size = len.min(4096);
-    if !flags.contains(SpliceFlags::SPLICE_F_NONBLOCK) {
-        buf_size = pipe_inode.wait_writable_for_splice(buf_size)?;
+    let wanted = splice_file_read_limit(file, offset, len.min(4096));
+    if wanted == 0 {
+        return Ok(0);
     }
+
+    let space = if flags.contains(SpliceFlags::SPLICE_F_NONBLOCK) {
+        let space = pipe_inode.writable_len();
+        if space == 0 && pipe_inode.has_readers() {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        space
+    } else {
+        pipe_inode.wait_writable_for_splice(wanted)?
+    };
+
+    let buf_size = if space == 0 {
+        wanted
+    } else {
+        wanted.min(space)
+    };
     let mut buffer = vec![0u8; buf_size];
 
     // 从文件读取
@@ -275,26 +291,6 @@ fn splice_file_to_pipe(
 
     buffer.truncate(read_len);
 
-    // Linux-like nonblocking semantics for file->pipe splice:
-    // - SPLICE_F_NONBLOCK makes the splice nonblocking regardless of the pipe fd's O_NONBLOCK.
-    // - When "atomic" (<= PIPE_BUF), lack of space yields EAGAIN (no partial write).
-    // - When non-atomic, write as much as fits and return partial.
-    if flags.contains(SpliceFlags::SPLICE_F_NONBLOCK) {
-        let space = pipe_inode.writable_len();
-        if space == 0 && pipe_inode.has_readers() {
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-        }
-        if buffer.len() <= crate::ipc::pipe::PIPE_BUF && space < buffer.len() {
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-        }
-        let to_write = if space == 0 {
-            buffer.len()
-        } else {
-            buffer.len().min(space)
-        };
-        buffer.truncate(to_write);
-    }
-
     // 写入 pipe
     let written = if flags.contains(SpliceFlags::SPLICE_F_NONBLOCK) {
         pipe_inode.write_from_splice_nonblock(&buffer)
@@ -311,6 +307,22 @@ fn splice_file_to_pipe(
         }
         Err(e) => Err(e),
     }
+}
+
+fn splice_file_read_limit(file: &File, offset: Option<usize>, limit: usize) -> usize {
+    if limit == 0 {
+        return 0;
+    }
+
+    if matches!(file.file_type(), FileType::File) {
+        if let Ok(metadata) = file.metadata() {
+            let size = metadata.size.max(0) as usize;
+            let pos = offset.unwrap_or_else(|| file.pos());
+            return limit.min(size.saturating_sub(pos));
+        }
+    }
+
+    limit
 }
 
 /// pipe 到 file 的数据传输

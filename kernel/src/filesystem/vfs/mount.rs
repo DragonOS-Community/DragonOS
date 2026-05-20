@@ -1108,6 +1108,11 @@ impl IndexNode for MountFSInode {
     }
 
     #[inline]
+    fn mount_flags(&self) -> MountFlags {
+        self.mount_fs.mount_flags()
+    }
+
+    #[inline]
     fn as_any_ref(&self) -> &dyn core::any::Any {
         return self.inner_inode.as_any_ref();
     }

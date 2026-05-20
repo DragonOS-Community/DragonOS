@@ -8,6 +8,7 @@ normal/epoll_timeout_budget
 normal/devpts_dir_read
 normal/test_pivot_root
 normal/mount_reconfigure
+normal/overlayfs_semantics
 normal/test_fchown_o_path
 normal/proc_self_limits
 normal/proc_fd_devfs_readlink

@@ -59,7 +59,7 @@ use crate::{
         ucontext::AddressSpace,
         PhysAddr, VirtAddr,
     },
-    process::resource::{RLimit64, RLimitID},
+    process::resource::{RLimit64, RLimitID, RUsage},
     rcu::RcuArcSlot,
     sched::{
         DequeueFlag, EnqueueFlag, OnRq, SchedMode, WakeupFlags, __schedule_with_current,
@@ -1350,6 +1350,10 @@ pub struct ProcessControlBlock {
 
     /// CPU时间片
     cpu_time: Arc<ProcessCpuTime>,
+    /// 已退出线程的线程组级资源累计。对齐 Linux signal_struct 的已退出线程统计。
+    exited_thread_group_rusage: SpinLock<RUsage>,
+    /// 已被 wait 系列成功回收的子进程资源累计，对齐 getrusage(RUSAGE_CHILDREN)。
+    children_rusage: SpinLock<RUsage>,
 
     /// 进程的robust lock列表
     robust_list: RwLock<Option<RobustListHead>>,
@@ -1501,6 +1505,8 @@ impl ProcessControlBlock {
                 itimers: SpinLock::new(ProcessItimers::default()),
                 posix_timers: SpinLock::new(posix_timer::ProcessPosixTimers::default()),
                 cpu_time: Arc::new(ProcessCpuTime::default()),
+                exited_thread_group_rusage: SpinLock::new(RUsage::default()),
+                children_rusage: SpinLock::new(RUsage::default()),
                 robust_list: RwLock::new(None),
                 rseq_state: RwLock::new(rseq::RseqState::new()),
                 cred: RcuArcSlot::new(cred),

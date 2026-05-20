@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -113,6 +114,29 @@ TEST(Fdatasync, InvalidFdReturnsEbadf) {
     ASSERT_EQ(0, file.close_fd());
 
     ExpectFdatasyncErrno(fd, EBADF);
+}
+
+TEST(Fdatasync, PipeReturnsEinval) {
+    int pipefd[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(pipefd)) << "pipe failed: " << strerror(errno);
+
+    ExpectFdatasyncErrno(pipefd[0], EINVAL);
+    ExpectFdatasyncErrno(pipefd[1], EINVAL);
+
+    close(pipefd[0]);
+    close(pipefd[1]);
+}
+
+TEST(Fdatasync, SocketPairReturnsEinval) {
+    int fds[2] = {-1, -1};
+    ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds))
+            << "socketpair failed: " << strerror(errno);
+
+    ExpectFdatasyncErrno(fds[0], EINVAL);
+    ExpectFdatasyncErrno(fds[1], EINVAL);
+
+    close(fds[0]);
+    close(fds[1]);
 }
 
 int main(int argc, char** argv) {

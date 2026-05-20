@@ -782,17 +782,17 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
 
     /// @brief 基于打开文件上下文执行同步（可使用文件句柄等私有信息）
     ///
-    /// 默认实现回退到 inode 级 `sync/datasync`。
+    /// 默认实现表示该 inode 没有提供 file-level fsync 操作。
+    ///
+    /// Linux 在 `file_operations.fsync` 缺失时返回 EINVAL。具体文件系统
+    /// 需要显式覆盖该方法，避免 pipe/socket/eventfd 等特殊 fd 被错误放行。
     fn sync_file(
         &self,
         datasync: bool,
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<(), SystemError> {
-        if datasync {
-            self.datasync()
-        } else {
-            self.sync()
-        }
+        let _ = datasync;
+        Err(SystemError::EINVAL)
     }
 
     /// @brief 仅同步数据到磁盘（不包括元数据）

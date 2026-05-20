@@ -200,6 +200,23 @@ impl IndexNode for LockedRamFSInode {
         return Ok(());
     }
 
+    fn sync_file(
+        &self,
+        datasync: bool,
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        match self.metadata()?.file_type {
+            FileType::File | FileType::Dir => {
+                if datasync {
+                    self.datasync()
+                } else {
+                    self.sync()
+                }
+            }
+            _ => Err(SystemError::EINVAL),
+        }
+    }
+
     fn open(
         &self,
         _data: MutexGuard<FilePrivateData>,

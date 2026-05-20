@@ -1793,6 +1793,23 @@ impl IndexNode for LockedFATInode {
         Ok(())
     }
 
+    fn sync_file(
+        &self,
+        datasync: bool,
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        match self.metadata()?.file_type {
+            FileType::File | FileType::Dir => {
+                if datasync {
+                    self.datasync()
+                } else {
+                    self.sync()
+                }
+            }
+            _ => Err(SystemError::EINVAL),
+        }
+    }
+
     fn read_sync(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
         let guard: MutexGuard<FATInode> = self.0.lock();
         match &guard.inode_type {

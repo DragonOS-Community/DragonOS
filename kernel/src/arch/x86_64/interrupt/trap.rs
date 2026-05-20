@@ -10,8 +10,9 @@ use super::{
 use crate::exception::debug::DebugException;
 use crate::exception::ebreak::EBreak;
 use crate::{
-    arch::{CurrentIrqArch, MMArch},
+    arch::{ipc::signal::Signal, CurrentIrqArch, MMArch},
     exception::InterruptArch,
+    ipc::signal::force_kernel_signal_to_current,
     mm::VirtAddr,
     process::ProcessManager,
     smp::core::smp_get_processor_id,
@@ -319,6 +320,20 @@ unsafe extern "C" fn do_stack_segment_fault(regs: &'static TrapFrame, error_code
 /// 处理一般保护异常 13 #GP
 #[no_mangle]
 unsafe extern "C" fn do_general_protection(regs: &'static TrapFrame, error_code: u64) {
+    if regs.is_from_user() {
+        CurrentIrqArch::interrupt_enable();
+        if let Err(err) = force_kernel_signal_to_current(Signal::SIGSEGV) {
+            error!(
+                "failed to send SIGSEGV for user general protection fault, pid: {:?}, rip: {:#x}, error_code: {:#x}, err: {:?}",
+                ProcessManager::current_pid(),
+                regs.rip,
+                error_code,
+                err
+            );
+        }
+        return;
+    }
+
     const ERR_MSG_1: &str = "The exception occurred during delivery of an event external to the program, such as an interrupt or an earlier exception.";
     const ERR_MSG_2: &str = "Refers to a gate descriptor in the IDT;\n";
     const ERR_MSG_3: &str = "Refers to a descriptor in the GDT or the current LDT;\n";

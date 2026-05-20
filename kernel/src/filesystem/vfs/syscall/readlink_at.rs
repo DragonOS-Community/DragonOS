@@ -15,6 +15,10 @@ pub fn do_readlink_at(
     user_buf: *mut u8,
     buf_size: usize,
 ) -> Result<usize, SystemError> {
+    if buf_size == 0 || buf_size > i32::MAX as usize {
+        return Err(SystemError::EINVAL);
+    }
+
     let path = check_and_clone_cstr(path, Some(MAX_PATHLEN))?
         .into_string()
         .map_err(|_| SystemError::EINVAL)?;

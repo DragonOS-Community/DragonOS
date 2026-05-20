@@ -15,7 +15,9 @@ use core::{
 use alloc::rc::Rc;
 use system_error::SystemError;
 
-use super::wait_queue::WaitQueue;
+use crate::process::ProcessManager;
+
+use super::wait_queue::{WaitQueue, Waiter};
 
 /// A mutex that provides data access to either one writer or many readers.
 ///
@@ -47,6 +49,7 @@ use super::wait_queue::WaitQueue;
 #[derive(Debug)]
 pub struct RwSem<T: ?Sized> {
     lock: AtomicUsize,
+    waiters: AtomicUsize,
     queue: WaitQueue,
     val: UnsafeCell<T>,
 }
@@ -95,6 +98,7 @@ impl<T> RwSem<T> {
         Self {
             val: UnsafeCell::new(val),
             lock: AtomicUsize::new(0),
+            waiters: AtomicUsize::new(0),
             queue: WaitQueue::default(),
         }
     }
@@ -107,7 +111,11 @@ impl<T: ?Sized> RwSem<T> {
     /// upreaders present.
     #[track_caller]
     pub fn read(&self) -> RwSemReadGuard<'_, T> {
-        self.queue.wait_until(|| self.try_read())
+        if let Some(guard) = self.try_read() {
+            return guard;
+        }
+
+        self.wait_read(false).unwrap()
     }
 
     /// Acquires a write mutex and sleep until it can be acquired.
@@ -116,7 +124,13 @@ impl<T: ?Sized> RwSem<T> {
     /// or readers present.
     #[track_caller]
     pub fn write(&self) -> RwSemWriteGuard<'_, T> {
-        self.queue.wait_until(|| self.try_write())
+        if self.waiters.load(Acquire) == 0 || ProcessManager::current_pcb().preempt_count() != 0 {
+            if let Some(guard) = self.try_write() {
+                return guard;
+            }
+        }
+
+        self.wait_write(false).unwrap()
     }
 
     /// Acquires a upread mutex and sleep until it can be acquired.
@@ -124,17 +138,31 @@ impl<T: ?Sized> RwSem<T> {
     /// The calling thread will sleep until there are no writers or upreaders present.
     #[track_caller]
     pub fn upread(&self) -> RwSemUpgradeableGuard<'_, T> {
-        self.queue.wait_until(|| self.try_upread())
+        if let Some(guard) = self.try_upread() {
+            return guard;
+        }
+
+        self.wait_upread(false).unwrap()
     }
 
     /// Blocking read acquire (interruptible).
     pub fn read_interruptible(&self) -> Result<RwSemReadGuard<'_, T>, SystemError> {
-        self.queue.wait_until_interruptible(|| self.try_read())
+        if let Some(guard) = self.try_read() {
+            return Ok(guard);
+        }
+
+        self.wait_read(true)
     }
 
     /// Blocking write acquire (interruptible).
     pub fn write_interruptible(&self) -> Result<RwSemWriteGuard<'_, T>, SystemError> {
-        self.queue.wait_until_interruptible(|| self.try_write())
+        if self.waiters.load(Acquire) == 0 || ProcessManager::current_pcb().preempt_count() != 0 {
+            if let Some(guard) = self.try_write() {
+                return Ok(guard);
+            }
+        }
+
+        self.wait_write(true)
     }
 
     /// Attempts to acquire a read lock.
@@ -193,6 +221,97 @@ impl<T: ?Sized> RwSem<T> {
     /// already statically guaranteed that access to the data is exclusive.
     pub fn get_mut(&mut self) -> &mut T {
         self.val.get_mut()
+    }
+
+    fn wait_read(&self, interruptible: bool) -> Result<RwSemReadGuard<'_, T>, SystemError> {
+        self.waiters.fetch_add(1, AcqRel);
+        let (waiter, waker) = Waiter::new_pair();
+
+        loop {
+            if let Err(e) = self.queue.register_waker(waker.clone()) {
+                self.waiters.fetch_sub(1, Release);
+                return Err(e);
+            }
+
+            if let Some(guard) = self.try_read() {
+                self.queue.remove_waker(&waker);
+                self.waiters.fetch_sub(1, Release);
+                return Ok(guard);
+            }
+
+            if let Err(e) = waiter.wait(interruptible) {
+                self.queue.remove_waker(&waker);
+                self.waiters.fetch_sub(1, Release);
+                return Err(e);
+            }
+        }
+    }
+
+    fn wait_write(&self, interruptible: bool) -> Result<RwSemWriteGuard<'_, T>, SystemError> {
+        let had_waiters = self.waiters.fetch_add(1, AcqRel) != 0;
+        let mut must_sleep_once = had_waiters;
+        let (waiter, waker) = Waiter::new_pair();
+
+        loop {
+            if let Err(e) = self.queue.register_waker(waker.clone()) {
+                self.waiters.fetch_sub(1, Release);
+                return Err(e);
+            }
+
+            if must_sleep_once && self.waiters.load(Acquire) == 1 {
+                must_sleep_once = false;
+            }
+
+            if !must_sleep_once {
+                if let Some(guard) = self.try_write() {
+                    self.queue.remove_waker(&waker);
+                    self.waiters.fetch_sub(1, Release);
+                    return Ok(guard);
+                }
+            }
+            must_sleep_once = false;
+
+            if let Err(e) = waiter.wait(interruptible) {
+                self.queue.remove_waker(&waker);
+                self.waiters.fetch_sub(1, Release);
+                return Err(e);
+            }
+        }
+    }
+
+    fn wait_upread(
+        &self,
+        interruptible: bool,
+    ) -> Result<RwSemUpgradeableGuard<'_, T>, SystemError> {
+        let had_waiters = self.waiters.fetch_add(1, AcqRel) != 0;
+        let mut must_sleep_once = had_waiters;
+        let (waiter, waker) = Waiter::new_pair();
+
+        loop {
+            if let Err(e) = self.queue.register_waker(waker.clone()) {
+                self.waiters.fetch_sub(1, Release);
+                return Err(e);
+            }
+
+            if must_sleep_once && self.waiters.load(Acquire) == 1 {
+                must_sleep_once = false;
+            }
+
+            if !must_sleep_once {
+                if let Some(guard) = self.try_upread() {
+                    self.queue.remove_waker(&waker);
+                    self.waiters.fetch_sub(1, Release);
+                    return Ok(guard);
+                }
+            }
+            must_sleep_once = false;
+
+            if let Err(e) = waiter.wait(interruptible) {
+                self.queue.remove_waker(&waker);
+                self.waiters.fetch_sub(1, Release);
+                return Err(e);
+            }
+        }
     }
 }
 

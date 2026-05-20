@@ -43,6 +43,7 @@ unsafe fn exit_to_user_mode_loop(frame: &mut TrapFrame, mut process_flags_work: 
         // rseq 的 IP fixup 必须在信号递送之前完成
         if process_flags_work.contains(ProcessFlags::NEED_RSEQ) {
             let _ = Rseq::handle_notify_resume(Some(frame));
+            process_flags_work = *ProcessManager::current_pcb().flags();
         }
 
         if process_flags_work.contains(ProcessFlags::HAS_PENDING_SIGNAL) {

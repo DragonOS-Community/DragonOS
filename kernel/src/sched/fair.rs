@@ -514,26 +514,31 @@ impl CfsRunQueue {
 
     /// ## 在时间片到期时检查当前任务是否需要被抢占，
     /// 如果需要，则抢占当前任务，并确保不会由于与其他任务的“好友偏爱（buddy favours）”而重新选举为下一个运行的任务。
-    #[allow(dead_code)]
     pub fn check_preempt_tick(&mut self, curr: Arc<FairSchedEntity>) {
-        // 计算理想状态下该调度实体的理想运行时间
-        let ideal_runtime = self.sched_slice(curr.clone());
-
-        let delta_exec = curr.sum_exec_runtime - curr.prev_sum_exec_runtime;
-
-        if delta_exec > ideal_runtime {
-            // 表明实际运行时间长于理想运行时间
-            self.rq().resched_current();
-
-            self.clear_buddies(&curr);
-            return;
-        }
-
+        let delta_exec = curr
+            .sum_exec_runtime
+            .saturating_sub(curr.prev_sum_exec_runtime);
         if delta_exec < SYSCTL_SHCED_MIN_GRANULARITY.load(Ordering::SeqCst) {
             return;
         }
 
-        todo!()
+        if self.nr_running <= 1 {
+            // rseq critical sections need a bounded preempt notification even
+            // when the scheduler ultimately has no other CFS entity to select.
+            if curr.pcb().rseq_state().is_registered() {
+                self.rq().resched_current();
+            }
+            return;
+        }
+
+        let Some(next) = self.pick_eevdf_entity(Some(&curr)) else {
+            return;
+        };
+
+        if !Arc::ptr_eq(&next, &curr) {
+            self.rq().resched_current();
+            self.clear_buddies(&curr);
+        }
     }
 
     pub fn clear_buddies(&mut self, se: &Arc<FairSchedEntity>) {
@@ -558,6 +563,8 @@ impl CfsRunQueue {
             self.rq().resched_current();
             return;
         }
+
+        self.check_preempt_tick(curr);
     }
 
     /// 更新当前调度实体的运行时间统计信息

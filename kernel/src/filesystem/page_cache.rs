@@ -1287,10 +1287,20 @@ impl PageCache {
                     _ => {}
                 }
 
-                if let Some(page) = self.inner.lock().remove_page(page_index) {
+                let removed_page = {
+                    let mut guard = self.inner.lock();
+                    guard.remove_page(page_index)
+                };
+                if let Some(page) = removed_page {
                     let paddr = page.phys_address();
-                    page_manager_lock().remove_page(&paddr);
+                    let can_remove_from_manager = page.read().can_deallocate();
+                    // The page is no longer reachable from this page cache, so it must not
+                    // remain on the file-page reclaimer LRU even if existing mappings still
+                    // keep its Page metadata alive via page_manager.
                     let _ = page_reclaimer_lock().remove_page(&paddr);
+                    if can_remove_from_manager {
+                        page_manager_lock().remove_page(&paddr);
+                    }
                 }
                 break;
             }

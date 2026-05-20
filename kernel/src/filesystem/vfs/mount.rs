@@ -3,7 +3,7 @@ use core::{
     fmt::Debug,
     hash::Hash,
     mem,
-    sync::atomic::{compiler_fence, Ordering},
+    sync::atomic::{compiler_fence, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -23,7 +23,7 @@ use crate::{
         page_cache::PageCache,
         vfs::{fcntl::AtFlags, syscall::RenameFlags, vcore::do_mkdir_at},
     },
-    libs::{casting::DowncastArc, lazy_init::Lazy, rwsem::RwSem},
+    libs::{casting::DowncastArc, rwsem::RwSem},
     mm::{fault::PageFaultMessage, VmFaultReason},
     process::{
         namespace::{
@@ -117,9 +117,32 @@ bitflags! {
             MountFlags::I_VERSION.bits() |
             MountFlags::LAZYTIME.bits();
 
+        const SB_SETTABLE_MASK = MountFlags::RDONLY.bits()
+            | MountFlags::SYNCHRONOUS.bits()
+            | MountFlags::MANDLOCK.bits()
+            | MountFlags::DIRSYNC.bits()
+            | MountFlags::SILENT.bits()
+            | MountFlags::POSIXACL.bits()
+            | MountFlags::I_VERSION.bits()
+            | MountFlags::LAZYTIME.bits();
+
         /// Old magic mount flag and mask
         const MGC_VAL = 0xC0ED0000; // Magic value for mount flags
         const MGC_MASK = 0xFFFF0000; // Mask for magic mount flags
+
+        /// 用户空间可通过 MS_REMOUNT 修改的 mount flags 集合。
+        const MNT_USER_SETTABLE_MASK = MountFlags::RDONLY.bits()
+            | MountFlags::NOSUID.bits()
+            | MountFlags::NODEV.bits()
+            | MountFlags::NOEXEC.bits()
+            | MountFlags::NOATIME.bits()
+            | MountFlags::NODIRATIME.bits()
+            | MountFlags::RELATIME.bits()
+            | MountFlags::NOSYMFOLLOW.bits();
+
+        const MNT_ATIME_MASK = MountFlags::NOATIME.bits()
+            | MountFlags::NODIRATIME.bits()
+            | MountFlags::RELATIME.bits();
     }
 }
 
@@ -235,12 +258,53 @@ pub struct MountFS {
     /// 指向当前MountFS的弱引用
     self_ref: Weak<MountFS>,
 
-    namespace: Lazy<Weak<MntNamespace>>,
+    namespace: RwSem<Option<Weak<MntNamespace>>>,
     propagation: Arc<MountPropagation>,
     mount_id: MountId,
 
     mount_flags: RwSem<MountFlags>,
+    super_block_state: Arc<SuperBlockState>,
     mount_source: RwSem<Option<String>>,
+}
+
+#[derive(Debug)]
+pub struct SuperBlockState {
+    flags: RwSem<MountFlags>,
+    write_count: AtomicUsize,
+}
+
+struct MountStateInit {
+    super_block_state: Arc<SuperBlockState>,
+    mount_source: Option<String>,
+}
+
+impl SuperBlockState {
+    pub fn new(flags: MountFlags) -> Self {
+        Self {
+            flags: RwSem::new(flags & MountFlags::SB_SETTABLE_MASK),
+            write_count: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn flags(&self) -> MountFlags {
+        *self.flags.read()
+    }
+
+    pub fn set_flags(&self, flags: MountFlags) {
+        *self.flags.write() = flags & MountFlags::SB_SETTABLE_MASK;
+    }
+
+    pub fn inc_write_count(&self) {
+        self.write_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn dec_write_count(&self) {
+        self.write_count.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn has_writers(&self) -> bool {
+        self.write_count.load(Ordering::Acquire) != 0
+    }
 }
 
 impl Debug for MountFS {
@@ -287,6 +351,29 @@ impl MountFS {
         mount_flags: MountFlags,
         mount_source: Option<String>,
     ) -> Arc<Self> {
+        Self::new_with_super_block_state(
+            inner_filesystem,
+            root_inner_inode,
+            self_mountpoint,
+            propagation,
+            mnt_ns,
+            mount_flags,
+            MountStateInit {
+                super_block_state: Arc::new(SuperBlockState::new(mount_flags)),
+                mount_source,
+            },
+        )
+    }
+
+    fn new_with_super_block_state(
+        inner_filesystem: Arc<dyn FileSystem>,
+        root_inner_inode: Option<Arc<dyn IndexNode>>,
+        self_mountpoint: Option<Arc<MountFSInode>>,
+        propagation: Arc<MountPropagation>,
+        mnt_ns: Option<&Arc<MntNamespace>>,
+        mount_flags: MountFlags,
+        state_init: MountStateInit,
+    ) -> Arc<Self> {
         let root_inner_inode = root_inner_inode.unwrap_or_else(|| inner_filesystem.root_inode());
         let result = Arc::new_cyclic(|self_ref| MountFS {
             inner_filesystem,
@@ -294,11 +381,12 @@ impl MountFS {
             mountpoints: Mutex::new(BTreeMap::new()),
             self_mountpoint: RwSem::new(self_mountpoint),
             self_ref: self_ref.clone(),
-            namespace: Lazy::new(),
+            namespace: RwSem::new(None),
             propagation,
             mount_id: MountId::alloc(),
             mount_flags: RwSem::new(mount_flags),
-            mount_source: RwSem::new(mount_source),
+            super_block_state: state_init.super_block_state,
+            mount_source: RwSem::new(state_init.mount_source),
         });
 
         if let Some(mnt_ns) = mnt_ns {
@@ -319,10 +407,11 @@ impl MountFS {
             mountpoints: Mutex::new(BTreeMap::new()),
             self_mountpoint: RwSem::new(self_mountpoint),
             self_ref: self_ref.clone(),
-            namespace: Lazy::new(),
+            namespace: RwSem::new(None),
             propagation: new_propagation,
             mount_id: MountId::alloc(),
             mount_flags: RwSem::new(self.mount_flags()),
+            super_block_state: self.super_block_state.clone(),
             mount_source: RwSem::new(mount_source),
         });
 
@@ -331,6 +420,38 @@ impl MountFS {
 
     pub fn mount_flags(&self) -> MountFlags {
         *self.mount_flags.read()
+    }
+
+    pub fn super_block_flags(&self) -> MountFlags {
+        self.super_block_state.flags()
+    }
+
+    pub fn set_super_block_flags(&self, flags: MountFlags) {
+        self.super_block_state.set_flags(flags);
+    }
+
+    pub fn combined_flags(&self) -> MountFlags {
+        self.mount_flags() | self.super_block_flags()
+    }
+
+    pub fn is_readonly(&self) -> bool {
+        self.combined_flags().contains(MountFlags::RDONLY)
+    }
+
+    pub fn has_writers(&self) -> bool {
+        self.super_block_state.has_writers()
+    }
+
+    pub fn inc_write_count(&self) {
+        self.super_block_state.inc_write_count();
+    }
+
+    pub fn dec_write_count(&self) {
+        self.super_block_state.dec_write_count();
+    }
+
+    pub fn super_block_state(&self) -> Arc<SuperBlockState> {
+        self.super_block_state.clone()
     }
 
     pub fn set_mount_flags(&self, mount_flags: MountFlags) {
@@ -368,11 +489,20 @@ impl MountFS {
     }
 
     pub fn set_namespace(&self, namespace: Weak<MntNamespace>) {
-        self.namespace.init(namespace);
+        *self.namespace.write() = Some(namespace);
     }
 
     pub fn namespace(&self) -> Option<Arc<MntNamespace>> {
-        self.namespace.try_get().and_then(|ns| ns.upgrade())
+        self.namespace.read().as_ref().and_then(|ns| ns.upgrade())
+    }
+
+    pub fn clear_namespace(&self) {
+        *self.namespace.write() = None;
+    }
+
+    /// check_mnt()：检查当前 MountFS 是否属于指定 mount namespace。
+    pub fn is_belongs_to_mntns(&self, mntns: &Arc<MntNamespace>) -> bool {
+        self.namespace().is_some_and(|ns| Arc::ptr_eq(&ns, mntns))
     }
 
     pub fn fs_type(&self) -> &str {
@@ -446,13 +576,78 @@ impl MountFS {
             .ok_or(SystemError::EINVAL)?
             .do_umount();
 
-        // Only clear mountpoint state and notify filesystem after successful detach.
         if result.is_ok() {
+            // 清除 self_mountpoint，断开与旧父挂载点的反向引用。
+            // 将 mnt_parent 设为自身、mnt_mountpoint 设为自身 root 的语义。
             self.self_mountpoint.write().take();
             self.inner_filesystem.on_umount();
+            self.clear_namespace();
         }
 
         return result;
+    }
+
+    /// 仅将当前挂载从父挂载点摘除
+    fn detach(&self) -> Result<Arc<MountFS>, SystemError> {
+        let mountpoint_inode = self.self_mountpoint().ok_or(SystemError::EINVAL)?;
+        let mountpoint_id = mountpoint_inode.inner_inode.metadata()?.inode_id;
+        // 从父挂载的 mountpoints 中移除当前挂载。
+        mountpoint_inode
+            .mount_fs
+            .mountpoints
+            .lock()
+            .remove(&mountpoint_id)
+            .ok_or_else(|| {
+                log::warn!(
+                    "detach: mountpoint id {:?} not found in parent fs '{}'",
+                    mountpoint_id,
+                    mountpoint_inode.mount_fs.name()
+                );
+                SystemError::ENOENT
+            })?;
+
+        // 清除 self_mountpoint，使挂载成为独立树根。
+        self.self_mountpoint.write().take();
+
+        Ok(self.self_ref())
+    }
+
+    /// 递归卸载一个挂载及其所有子挂载，并从 namespace 的 mount_list 中移除。
+    ///
+    /// 用于递归 bind mount 失败时的原子回滚，保证 all-or-nothing 语义。
+    pub fn umount_tree(root: &Arc<MountFS>) {
+        let mntns = ProcessManager::current_mntns();
+
+        // 1. DFS 收集所有后代 MountFS
+        let mut all_descendants: Vec<Arc<MountFS>> = Vec::new();
+        let mut stack: Vec<Arc<MountFS>> = Vec::new();
+
+        for (_, child_mfs) in root.mountpoints().iter() {
+            stack.push(child_mfs.clone());
+        }
+
+        while let Some(mfs) = stack.pop() {
+            for (_, child_mfs) in mfs.mountpoints().iter() {
+                stack.push(child_mfs.clone());
+            }
+            all_descendants.push(mfs);
+        }
+
+        // 2. 逆序处理（最深的子挂载先卸载），确保子挂载在父挂载之前被清理
+        all_descendants.reverse();
+
+        for child_mfs in &all_descendants {
+            if let Some(path) = mntns.mount_list().get_mount_path_by_mountfs(child_mfs) {
+                mntns.remove_mount(path.as_str());
+            }
+            let _ = child_mfs.umount();
+        }
+
+        // 3. 最后卸载根挂载本身
+        if let Some(path) = mntns.mount_list().get_mount_path_by_mountfs(root) {
+            mntns.remove_mount(path.as_str());
+        }
+        let _ = root.umount();
     }
 }
 
@@ -468,7 +663,7 @@ impl Drop for MountFS {
 impl MountFSInode {
     #[inline]
     fn ensure_mount_writable(&self) -> Result<(), SystemError> {
-        if self.mount_fs.mount_flags().contains(MountFlags::RDONLY) {
+        if self.mount_fs.is_readonly() {
             return Err(SystemError::EROFS);
         }
         Ok(())
@@ -480,8 +675,27 @@ impl MountFSInode {
         root_inner_inode: Arc<dyn IndexNode>,
         mount_flags: MountFlags,
     ) -> Result<Arc<MountFS>, SystemError> {
+        self.mount_subtree_with_state(inner_fs, root_inner_inode, mount_flags, None)
+    }
+
+    pub(crate) fn mount_subtree_with_state(
+        &self,
+        inner_fs: Arc<dyn FileSystem>,
+        root_inner_inode: Arc<dyn IndexNode>,
+        mount_flags: MountFlags,
+        super_block_state: Option<Arc<SuperBlockState>>,
+    ) -> Result<Arc<MountFS>, SystemError> {
+        // Linux do_add_mount：父挂载点必须属于当前 mount namespace。
+        let current_mntns = ProcessManager::current_mntns();
+        if !self.mount_fs.is_belongs_to_mntns(&current_mntns) {
+            return Err(SystemError::EINVAL);
+        }
+
         let metadata = self.inner_inode.metadata()?;
-        if metadata.file_type != FileType::Dir {
+        let root_metadata = root_inner_inode.metadata()?;
+        let is_dir = metadata.file_type == FileType::Dir;
+        let root_is_dir = root_metadata.file_type == FileType::Dir;
+        if is_dir != root_is_dir {
             return Err(SystemError::ENOTDIR);
         }
 
@@ -492,14 +706,19 @@ impl MountFSInode {
             MountPropagation::new_private()
         };
 
-        let new_mount_fs = MountFS::new(
+        let super_block_state =
+            super_block_state.unwrap_or_else(|| Arc::new(SuperBlockState::new(mount_flags)));
+        let new_mount_fs = MountFS::new_with_super_block_state(
             inner_fs,
             Some(root_inner_inode),
             Some(self.self_ref.upgrade().unwrap()),
             new_propagation,
             Some(&ProcessManager::current_mntns()),
             mount_flags,
-            None,
+            MountStateInit {
+                super_block_state,
+                mount_source: None,
+            },
         );
 
         let mount_path = Arc::new(MountPath::from(self.absolute_path()?));
@@ -573,24 +792,33 @@ impl MountFSInode {
     ///
     /// @return Arc<MountFSInode>
     fn overlaid_inode(&self) -> Arc<MountFSInode> {
-        // 某些情况下，底层 inode 可能已被删除或失效，此时 metadata() 可能返回错误
-        // 为避免因 unwrap 导致内核 panic，这里将错误视作“非挂载点”，直接返回自身
-        let inode_id = match self.metadata() {
-            Ok(md) => md.inode_id,
-            Err(e) => {
-                log::warn!(
-                    "MountFSInode::overlaid_inode: metadata() failed: {:?}; treat as non-mountpoint",
-                    e
-                );
-                return self.self_ref.upgrade().unwrap();
-            }
-        };
+        let mut current = self.self_ref.upgrade().unwrap();
+        for _ in 0..1024 {
+            let inode_id = match current.metadata() {
+                Ok(md) => md.inode_id,
+                Err(e) => {
+                    log::warn!(
+                        "MountFSInode::overlaid_inode: metadata() failed: {:?}; treat as non-mountpoint",
+                        e
+                    );
+                    return current;
+                }
+            };
 
-        if let Some(sub_mountfs) = self.mount_fs.mountpoints.lock().get(&inode_id) {
-            return sub_mountfs.mountpoint_root_inode();
-        } else {
-            return self.self_ref.upgrade().unwrap();
+            let Some(sub_mountfs) = current.mount_fs.mountpoints.lock().get(&inode_id).cloned()
+            else {
+                return current;
+            };
+
+            let next = sub_mountfs.mountpoint_root_inode();
+            if Arc::ptr_eq(&next, &current) {
+                return current;
+            }
+            current = next;
         }
+
+        log::warn!("MountFSInode::overlaid_inode: overlay depth exceeds 1024");
+        current
     }
 
     fn do_find(&self, name: &str) -> Result<Arc<MountFSInode>, SystemError> {
@@ -634,10 +862,7 @@ impl MountFSInode {
 
     /// 移除挂载点下的文件系统
     fn do_umount(&self) -> Result<Arc<MountFS>, SystemError> {
-        if self.metadata()?.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
-
+        // 允许 umount 目录和文件的 bind mount
         let mountpoint_id = self.inner_inode.metadata()?.inode_id;
 
         // Detach first. Follow-up bookkeeping (peer registry and propagation)
@@ -771,6 +996,14 @@ impl IndexNode for MountFSInode {
         data: MutexGuard<FilePrivateData>,
         flags: &FileFlags,
     ) -> Result<(), SystemError> {
+        let access = flags.access_flags();
+        if (access == FileFlags::O_WRONLY
+            || access == FileFlags::O_RDWR
+            || flags.contains(FileFlags::O_TRUNC))
+            && self.mount_fs.is_readonly()
+        {
+            return Err(SystemError::EROFS);
+        }
         return self.inner_inode.open(data, flags);
     }
 
@@ -1079,8 +1312,15 @@ impl IndexNode for MountFSInode {
         if self.is_mountpoint_root()? {
             return Err(SystemError::EBUSY);
         }
-        // debug!("from {:?}, to {:?}", from, self);
-        let new_mount_fs = from.umount()?;
+
+        // 对应 Linux do_move_mount → attach_recursive_mnt(MNT_TREE_MOVE)：
+        // unhash_mnt（detach）后直接 attach 到新位置，不清理 mnt_ns，不通知文件系统。
+        let from_mfs = from
+            .fs()
+            .downcast_arc::<MountFS>()
+            .ok_or(SystemError::EINVAL)?;
+        let new_mount_fs = from_mfs.detach()?;
+
         self.mount_fs
             .add_mount(metadata.inode_id, new_mount_fs.clone())?;
         // 更新当前挂载点的self_mountpoint
@@ -1088,22 +1328,15 @@ impl IndexNode for MountFSInode {
             .self_mountpoint
             .write()
             .replace(self.self_ref.upgrade().unwrap());
+
+        // move 不改变 namespace 归属，只需更新 mount_list 中的路径记录。
         let mntns = ProcessManager::current_mntns();
+        if let Some(mount_path) = mntns.mount_list().get_mount_path_by_mountfs(&new_mount_fs) {
+            mntns.mount_list().remove(mount_path.as_str());
+        }
+        let mount_path = Arc::new(MountPath::from(self.absolute_path()?));
+        mntns.add_mount(Some(metadata.inode_id), mount_path, new_mount_fs.clone())?;
 
-        let mount_path = mntns
-            .mount_list()
-            .get_mount_path_by_mountfs(&new_mount_fs)
-            .unwrap_or_else(|| {
-                panic!(
-                    "MountFS::mount_from: failed to get mount path for {:?}",
-                    self.mount_fs.name()
-                );
-            });
-
-        mntns.mount_list().remove(mount_path.as_str());
-        ProcessManager::current_mntns()
-            .add_mount(Some(metadata.inode_id), mount_path, new_mount_fs.clone())
-            .expect("MountFS::mount_from: failed to add mount.");
         return Ok(new_mount_fs);
     }
 
@@ -1208,7 +1441,7 @@ impl FileSystem for MountFS {
     }
     fn super_block(&self) -> SuperBlock {
         let mut sb = self.inner_filesystem.super_block();
-        sb.flags = self.mount_flags().bits() as u64;
+        sb.flags = self.combined_flags().bits() as u64;
         sb
     }
 
@@ -1219,7 +1452,7 @@ impl FileSystem for MountFS {
             .map(|mnt| mnt.inner_inode.clone())
             .unwrap_or_else(|| inode.clone());
         let mut sb = self.inner_filesystem.statfs(&inner_inode)?;
-        sb.flags = self.mount_flags().bits() as u64;
+        sb.flags = self.combined_flags().bits() as u64;
         Ok(sb)
     }
 
@@ -1474,6 +1707,15 @@ impl MountList {
             .iter()
             .map(|(p, stack)| (p.clone(), stack.last().unwrap().fs.clone()))
             .collect()
+    }
+
+    pub fn get<T: Into<MountPath>>(&self, path: T) -> Option<Arc<MountFS>> {
+        let inner = self.inner.read();
+        let path: MountPath = path.into();
+        inner
+            .mounts
+            .get(&path)
+            .and_then(|stack| stack.last().map(|rec| rec.fs.clone()))
     }
 
     #[inline(never)]

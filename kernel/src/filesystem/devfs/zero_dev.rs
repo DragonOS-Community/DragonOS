@@ -1,4 +1,4 @@
-use crate::driver::base::device::device_number::DeviceNumber;
+use crate::driver::base::device::device_number::{DeviceNumber, Major};
 use crate::filesystem::devfs::LockedDevFSInode;
 use crate::filesystem::vfs::file::FileFlags;
 use crate::filesystem::vfs::InodeMode;
@@ -56,7 +56,7 @@ impl LockedZeroInode {
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
-                raw_dev: DeviceNumber::default(), // 这里用来作为device number
+                raw_dev: DeviceNumber::new(Major::new(1), 5), // /dev/zero
             },
         };
 

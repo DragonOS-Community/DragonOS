@@ -7,6 +7,7 @@
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/types.h>
 #include <sys/xattr.h>
 #include <unistd.h>
@@ -32,6 +33,24 @@ static int ensure_dir(const char *path) {
 static void cleanup_mount(const char *path) {
     umount(path);
     rmdir(path);
+}
+
+static int write_file(const char *path) {
+    int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0) {
+        return -1;
+    }
+
+    int ret = write(fd, "x", 1);
+    int saved_errno = errno;
+    close(fd);
+    errno = saved_errno;
+    return ret == 1 ? 0 : -1;
+}
+
+static bool path_exists(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0;
 }
 
 static bool mount_has_option(const char *mountpoint, const char *option) {
@@ -147,6 +166,162 @@ TEST(MountReconfigure, BindRemountReadonly) {
 
     umount(target);
     cleanup_mount(source);
+}
+
+TEST(MountReconfigure, OrdinaryRemountReadonlyAffectsSharedSuperblock) {
+    const char *source = "/tmp/test_mount_remount_superblock/source";
+    const char *target = "/tmp/test_mount_remount_superblock/target";
+    char path[256];
+    struct statfs st;
+
+    ensure_dir("/tmp");
+    ensure_dir("/tmp/test_mount_remount_superblock");
+    ensure_dir(source);
+    ensure_dir(target);
+
+    if (unshare(CLONE_NEWNS) != 0) {
+        GTEST_SKIP() << strerror(errno);
+    }
+
+    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+
+    if (mount("", source, "ramfs", 0, NULL) != 0) {
+        GTEST_SKIP() << strerror(errno);
+    }
+
+    snprintf(path, sizeof(path), "%s/file", source);
+    ASSERT_EQ(write_file(path), 0) << strerror(errno);
+
+    ASSERT_EQ(mount(source, target, NULL, MS_BIND, NULL), 0) << strerror(errno);
+
+    int held = open(path, O_RDWR);
+    ASSERT_GE(held, 0) << strerror(errno);
+    errno = 0;
+    EXPECT_EQ(mount("", source, "ramfs", MS_REMOUNT | MS_RDONLY, NULL), -1);
+    EXPECT_EQ(errno, EBUSY);
+    close(held);
+
+    ASSERT_EQ(mount("", source, "ramfs", MS_REMOUNT | MS_RDONLY, NULL), 0) << strerror(errno);
+
+    snprintf(path, sizeof(path), "%s/source_ro", source);
+    errno = 0;
+    EXPECT_EQ(write_file(path), -1);
+    EXPECT_EQ(errno, EROFS);
+
+    snprintf(path, sizeof(path), "%s/bind_ro", target);
+    errno = 0;
+    EXPECT_EQ(write_file(path), -1);
+    EXPECT_EQ(errno, EROFS);
+
+    ASSERT_EQ(statfs(target, &st), 0) << strerror(errno);
+    EXPECT_NE(static_cast<unsigned long>(st.f_flags & MS_RDONLY), 0UL);
+
+    ASSERT_EQ(mount("", source, "ramfs", MS_REMOUNT, NULL), 0) << strerror(errno);
+
+    snprintf(path, sizeof(path), "%s/source_rw", source);
+    EXPECT_EQ(write_file(path), 0) << strerror(errno);
+
+    umount(target);
+    cleanup_mount(source);
+}
+
+TEST(MountReconfigure, BindRemountReadonlyDoesNotChangeSourceSuperblock) {
+    const char *source = "/tmp/test_bind_remount_scope/source";
+    const char *target = "/tmp/test_bind_remount_scope/target";
+    char path[256];
+
+    ensure_dir("/tmp");
+    ensure_dir("/tmp/test_bind_remount_scope");
+    ensure_dir(source);
+    ensure_dir(target);
+
+    if (unshare(CLONE_NEWNS) != 0) {
+        GTEST_SKIP() << strerror(errno);
+    }
+
+    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+
+    if (mount("", source, "ramfs", 0, NULL) != 0) {
+        GTEST_SKIP() << strerror(errno);
+    }
+
+    ASSERT_EQ(mount(source, target, NULL, MS_BIND, NULL), 0) << strerror(errno);
+    ASSERT_EQ(mount(NULL, target, NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL), 0)
+        << strerror(errno);
+
+    snprintf(path, sizeof(path), "%s/bind_ro", target);
+    errno = 0;
+    EXPECT_EQ(write_file(path), -1);
+    EXPECT_EQ(errno, EROFS);
+
+    snprintf(path, sizeof(path), "%s/source_rw", source);
+    EXPECT_EQ(write_file(path), 0) << strerror(errno);
+
+    umount(target);
+    cleanup_mount(source);
+}
+
+TEST(MountReconfigure, TmpfsRemountModeCanReturnToDefaultPermissions) {
+    const char *target = "/tmp/test_tmpfs_remount_mode";
+    struct stat st;
+
+    ensure_dir("/tmp");
+    ensure_dir(target);
+
+    if (unshare(CLONE_NEWNS) != 0) {
+        GTEST_SKIP() << strerror(errno);
+    }
+
+    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+
+    if (mount("tmpfs", target, "tmpfs", 0, "mode=777,size=8m") != 0) {
+        GTEST_SKIP() << strerror(errno);
+    }
+
+    ASSERT_EQ(mount("tmpfs", target, "tmpfs", MS_REMOUNT, "mode=755"), 0) << strerror(errno);
+    ASSERT_EQ(stat(target, &st), 0) << strerror(errno);
+    EXPECT_EQ(st.st_mode & 0777, 0755U);
+
+    ASSERT_EQ(mount("tmpfs", target, "tmpfs", MS_REMOUNT, "mode=777"), 0) << strerror(errno);
+    ASSERT_EQ(stat(target, &st), 0) << strerror(errno);
+    EXPECT_EQ(st.st_mode & 0777, 0777U);
+
+    cleanup_mount(target);
+}
+
+TEST(MountReconfigure, DefaultReconfigureAcceptsOnlyCommonOptions) {
+    const char *target = "/tmp/test_default_reconfigure_proc";
+    struct statfs st;
+
+    ensure_dir("/tmp");
+    ensure_dir(target);
+
+    if (unshare(CLONE_NEWNS) != 0) {
+        GTEST_SKIP() << strerror(errno);
+    }
+
+    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+
+    if (mount("proc", target, "proc", 0, NULL) != 0) {
+        GTEST_SKIP() << strerror(errno);
+    }
+
+    ASSERT_EQ(mount("proc", target, "proc", MS_REMOUNT, "ro"), 0) << strerror(errno);
+    ASSERT_EQ(statfs(target, &st), 0) << strerror(errno);
+    EXPECT_NE(static_cast<unsigned long>(st.f_flags & MS_RDONLY), 0UL);
+
+    ASSERT_EQ(mount("proc", target, "proc", MS_REMOUNT, "rw"), 0) << strerror(errno);
+    ASSERT_EQ(statfs(target, &st), 0) << strerror(errno);
+    EXPECT_EQ(static_cast<unsigned long>(st.f_flags & MS_RDONLY), 0UL);
+
+    errno = 0;
+    EXPECT_EQ(mount("proc", target, "proc", MS_REMOUNT | MS_RDONLY, "unknown_private=1"), -1);
+    EXPECT_EQ(errno, EINVAL);
+
+    ASSERT_EQ(statfs(target, &st), 0) << strerror(errno);
+    EXPECT_EQ(static_cast<unsigned long>(st.f_flags & MS_RDONLY), 0UL);
+
+    cleanup_mount(target);
 }
 
 TEST(MountReconfigure, SelfBindSubdirRemountReadonly) {
@@ -495,6 +670,44 @@ TEST(MountReconfigure, BindRemountStrictatimeNotPersisted) {
 
     umount(target);
     cleanup_mount(source);
+}
+
+TEST(MountReconfigure, StackedMountKeepsOriginalTarget) {
+    const char *base = "/tmp/test_stacked_mount_target";
+    const char *target = "/tmp/test_stacked_mount_target/target";
+    const char *sibling = "/tmp/test_stacked_mount_target/sibling_marker";
+    const char *lower_marker = "/tmp/test_stacked_mount_target/target/lower_marker";
+    const char *upper_marker = "/tmp/test_stacked_mount_target/target/upper_marker";
+
+    ensure_dir("/tmp");
+    ensure_dir(base);
+    ensure_dir(target);
+    ASSERT_EQ(0, write_file(sibling)) << strerror(errno);
+
+    if (unshare(CLONE_NEWNS) != 0) {
+        GTEST_SKIP() << strerror(errno);
+    }
+
+    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+
+    ASSERT_EQ(0, mount("", target, "ramfs", 0, NULL)) << strerror(errno);
+    ASSERT_EQ(0, write_file(lower_marker)) << strerror(errno);
+    ASSERT_TRUE(path_exists(sibling));
+
+    ASSERT_EQ(0, mount("", target, "ramfs", 0, NULL)) << strerror(errno);
+    EXPECT_FALSE(path_exists(lower_marker));
+    EXPECT_TRUE(path_exists(sibling));
+    ASSERT_EQ(0, write_file(upper_marker)) << strerror(errno);
+
+    ASSERT_EQ(0, umount(target)) << strerror(errno);
+    EXPECT_TRUE(path_exists(lower_marker));
+    EXPECT_FALSE(path_exists(upper_marker));
+    EXPECT_TRUE(path_exists(sibling));
+
+    ASSERT_EQ(0, umount(target)) << strerror(errno);
+    unlink(sibling);
+    rmdir(target);
+    rmdir(base);
 }
 
 int main(int argc, char **argv) {

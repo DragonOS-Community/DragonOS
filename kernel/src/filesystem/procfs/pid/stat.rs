@@ -64,10 +64,9 @@ fn sanitize_comm_for_proc_stat(comm: &str) -> String {
         .collect()
 }
 
-/// 生成 Linux 风格的 /proc/[pid]/stat 行
-fn generate_linux_proc_stat_line(
+struct ProcStatSnapshot {
     pid: RawPid,
-    comm: &str,
+    comm: String,
     state: ProcessState,
     ppid: RawPid,
     tty_nr: i32,
@@ -79,9 +78,12 @@ fn generate_linux_proc_stat_line(
     processor: i32,
     utime: u64,
     stime: u64,
-) -> String {
-    let comm = sanitize_comm_for_proc_stat(comm);
-    let state_ch = state_to_linux_char(state);
+}
+
+/// 生成 Linux 风格的 /proc/[pid]/stat 行
+fn generate_linux_proc_stat_line(snapshot: ProcStatSnapshot) -> String {
+    let comm = sanitize_comm_for_proc_stat(&snapshot.comm);
+    let state_ch = state_to_linux_char(snapshot.state);
 
     // 尽量填真实值；拿不到的先填 0
     let pgrp: usize = 0;
@@ -105,8 +107,17 @@ fn generate_linux_proc_stat_line(
         "{pid} ({comm}) {state_ch} {ppid} {pgrp} {session} {tty_nr} {tpgid} {flags} \
 {minflt} {cminflt} {majflt} {cmajflt} {utime} {stime} {cutime} {cstime} {priority} {nice} \
 {num_threads} {itrealvalue} {starttime} {vsize_bytes} {rss_pages} 0 0 0 0 0 0 0 0 0 0 0 0 0 {processor} 0 0 0 0 0\n",
-        pid = pid.data(),
-        ppid = ppid.data(),
+        pid = snapshot.pid.data(),
+        ppid = snapshot.ppid.data(),
+        tty_nr = snapshot.tty_nr,
+        utime = snapshot.utime,
+        stime = snapshot.stime,
+        priority = snapshot.priority,
+        nice = snapshot.nice,
+        num_threads = snapshot.num_threads,
+        vsize_bytes = snapshot.vsize_bytes,
+        rss_pages = snapshot.rss_pages,
+        processor = snapshot.processor,
     )
 }
 
@@ -152,8 +163,7 @@ impl FileOps for StatFileOps {
             .map(|vm| {
                 let guard = vm.read();
                 let bytes = guard.vma_usage_bytes();
-                let pages =
-                    (bytes.saturating_add(MMArch::PAGE_SIZE - 1)) >> MMArch::PAGE_SHIFT;
+                let pages = (bytes.saturating_add(MMArch::PAGE_SIZE - 1)) >> MMArch::PAGE_SHIFT;
                 (bytes as u64, pages as u64)
             })
             .unwrap_or((0, 0));
@@ -169,9 +179,9 @@ impl FileOps for StatFileOps {
             .map(|pid| pid.pid_nr_ns(self.target.view_pid_ns()))
             .unwrap_or(RawPid::new(0));
 
-        let content = generate_linux_proc_stat_line(
-            self.target.vpid(),
-            &comm,
+        let content = generate_linux_proc_stat_line(ProcStatSnapshot {
+            pid: self.target.vpid(),
+            comm,
             state,
             ppid,
             tty_nr,
@@ -183,7 +193,7 @@ impl FileOps for StatFileOps {
             processor,
             utime,
             stime,
-        );
+        });
         proc_read(offset, len, buf, content.as_bytes())
     }
 }

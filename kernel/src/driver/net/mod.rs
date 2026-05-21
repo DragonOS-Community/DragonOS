@@ -2,11 +2,12 @@ use alloc::sync::Weak;
 use alloc::{fmt, vec::Vec};
 use alloc::{string::String, sync::Arc};
 use core::net::Ipv4Addr;
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use sysfs::netdev_register_kobject;
 
 use crate::driver::net::napi::NapiStruct;
 use crate::driver::net::types::{InterfaceFlags, InterfaceType};
-use crate::libs::rwsem::RwSemReadGuard;
+use crate::libs::rwsem::{RwSem, RwSemReadGuard};
 use crate::net::routing::RouterEnableDeviceCommon;
 use crate::net::socket::packet::PacketSocket;
 use crate::process::namespace::net_namespace::NetNamespace;
@@ -209,6 +210,26 @@ impl Default for NetDeviceCommonData {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct NetlinkRouteEntry {
+    pub destination: smoltcp::wire::IpCidr,
+    pub source: Option<smoltcp::wire::IpCidr>,
+    pub gateway: Option<smoltcp::wire::IpAddress>,
+    pub priority: u32,
+    pub table: u8,
+    pub protocol: u8,
+    pub scope: u8,
+    pub kind: u8,
+}
+
+#[derive(Debug, Clone)]
+pub struct StaticNeighborEntry {
+    pub ip_addr: smoltcp::wire::IpAddress,
+    pub hw_addr: smoltcp::wire::HardwareAddress,
+    pub state: u16,
+    pub flags: u8,
+}
+
 /// 将网络设备注册到sysfs中
 /// 参考：https://code.dragonos.org.cn/xref/linux-2.6.39/net/core/dev.c?fi=register_netdev#5373
 fn register_netdevice(dev: Arc<dyn Iface>) -> Result<(), SystemError> {
@@ -223,7 +244,9 @@ fn register_netdevice(dev: Arc<dyn Iface>) -> Result<(), SystemError> {
 
 pub struct IfaceCommon {
     iface_id: usize,
-    flags: InterfaceFlags,
+    name: RwLock<String>,
+    flags: AtomicU32,
+    mtu: AtomicUsize,
     type_: InterfaceType,
     smol_iface: Mutex<smoltcp::iface::Interface>,
     /// 存smoltcp网卡的套接字集
@@ -242,6 +265,8 @@ pub struct IfaceCommon {
     napi_struct: RwLock<Option<Arc<NapiStruct>>>,
     /// Packet sockets registered to receive raw frames
     packet_sockets: RwLock<Vec<Weak<PacketSocket>>>,
+    netlink_routes: RwSem<Vec<NetlinkRouteEntry>>,
+    static_neighbors: RwSem<Vec<StaticNeighborEntry>>,
     /// TCP close(2) 语义辅助：延迟回收 smoltcp TCP socket（Linux-like）。
     tcp_close_defer: crate::net::tcp_close_defer::TcpCloseDefer,
     /// TCP listener/backlog 语义辅助（Linux-like 丢 SYN 等）。
@@ -262,6 +287,8 @@ impl IfaceCommon {
     pub fn new(
         iface_id: usize,
         type_: InterfaceType,
+        name: String,
+        mtu: usize,
         flags: InterfaceFlags,
         iface: smoltcp::iface::Interface,
     ) -> Self {
@@ -272,6 +299,7 @@ impl IfaceCommon {
             .extend_from_slice(iface.ip_addrs());
         IfaceCommon {
             iface_id,
+            name: RwLock::new(name),
             smol_iface: Mutex::new(iface),
             sockets: Mutex::new(smoltcp::iface::SocketSet::new(Vec::new())),
             bounds: RwLock::new(Vec::new()),
@@ -279,10 +307,13 @@ impl IfaceCommon {
             poll_at_us: core::sync::atomic::AtomicU64::new(0),
             net_namespace: RwLock::new(Weak::new()),
             router_common_data,
-            flags,
+            flags: AtomicU32::new(flags.bits()),
+            mtu: AtomicUsize::new(mtu),
             type_,
             napi_struct: RwLock::new(None),
             packet_sockets: RwLock::new(Vec::new()),
+            netlink_routes: RwSem::new(Vec::new()),
+            static_neighbors: RwSem::new(Vec::new()),
             tcp_close_defer: crate::net::tcp_close_defer::TcpCloseDefer::new(),
             tcp_listener_backlog: crate::net::tcp_listener_backlog::TcpListenerBacklog::new(),
             ipv4_multicast_refcnt: Mutex::new(Vec::new()),
@@ -622,12 +653,101 @@ impl IfaceCommon {
         *guard = Arc::downgrade(&ns);
     }
 
+    pub fn name(&self) -> String {
+        self.name.read().clone()
+    }
+
+    pub fn set_name(&self, name: String) {
+        *self.name.write() = name;
+    }
+
     pub fn flags(&self) -> InterfaceFlags {
-        self.flags
+        InterfaceFlags::from_bits_truncate(self.flags.load(Ordering::Relaxed))
+    }
+
+    pub fn set_flags(&self, flags: InterfaceFlags) {
+        self.flags.store(flags.bits(), Ordering::Relaxed);
     }
 
     pub fn type_(&self) -> InterfaceType {
         self.type_
+    }
+
+    pub fn mtu(&self) -> usize {
+        self.mtu.load(Ordering::Relaxed)
+    }
+
+    pub fn set_mtu(&self, mtu: usize) {
+        self.mtu.store(mtu, Ordering::Relaxed);
+    }
+
+    pub fn netlink_routes(&self) -> RwSemReadGuard<'_, Vec<NetlinkRouteEntry>> {
+        self.netlink_routes.read()
+    }
+
+    pub fn upsert_netlink_route(&self, route: NetlinkRouteEntry) {
+        let mut routes = self.netlink_routes.write();
+        if let Some(existing) = routes.iter_mut().find(|existing| {
+            existing.destination == route.destination
+                && existing.table == route.table
+                && existing
+                    .source
+                    .as_ref()
+                    .map(|cidr| (cidr.address(), cidr.prefix_len()))
+                    == route
+                        .source
+                        .as_ref()
+                        .map(|cidr| (cidr.address(), cidr.prefix_len()))
+        }) {
+            *existing = route;
+        } else {
+            routes.push(route);
+        }
+    }
+
+    pub fn remove_netlink_route(
+        &self,
+        destination: smoltcp::wire::IpCidr,
+        source: Option<smoltcp::wire::IpCidr>,
+        table: u8,
+    ) -> bool {
+        let mut routes = self.netlink_routes.write();
+        let before = routes.len();
+        routes.retain(|existing| {
+            !(existing.destination == destination
+                && existing.table == table
+                && existing
+                    .source
+                    .as_ref()
+                    .map(|cidr| (cidr.address(), cidr.prefix_len()))
+                    == source
+                        .as_ref()
+                        .map(|cidr| (cidr.address(), cidr.prefix_len())))
+        });
+        routes.len() != before
+    }
+
+    pub fn static_neighbors(&self) -> RwSemReadGuard<'_, Vec<StaticNeighborEntry>> {
+        self.static_neighbors.read()
+    }
+
+    pub fn set_static_neighbor(&self, entry: StaticNeighborEntry) {
+        let mut neighbors = self.static_neighbors.write();
+        if let Some(existing) = neighbors
+            .iter_mut()
+            .find(|existing| existing.ip_addr == entry.ip_addr)
+        {
+            *existing = entry;
+        } else {
+            neighbors.push(entry);
+        }
+    }
+
+    pub fn remove_static_neighbor(&self, ip_addr: smoltcp::wire::IpAddress) -> bool {
+        let mut neighbors = self.static_neighbors.write();
+        let before = neighbors.len();
+        neighbors.retain(|existing| existing.ip_addr != ip_addr);
+        neighbors.len() != before
     }
 
     /// 注册 packet socket 以接收原始数据包

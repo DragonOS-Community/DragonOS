@@ -1,5 +1,6 @@
 pub mod addr;
 pub mod link;
+pub mod neigh;
 pub mod route;
 
 use crate::net::socket::netlink::{
@@ -12,10 +13,11 @@ use crate::net::socket::netlink::{
         ProtocolSegment,
     },
     route::message::{
-        attr::{addr::AddrAttr, link::LinkAttr, route::RouteAttr},
+        attr::{addr::AddrAttr, link::LinkAttr, neigh::NeighAttr, route::RouteAttr},
         segment::{
             addr::{AddrMessageFlags, AddrSegment, AddrSegmentBody, CIfaddrMsg, RtScope},
             link::{CIfinfoMsg, LinkMessageFlags, LinkSegment, LinkSegmentBody},
+            neigh::{CNdMsg, NeighSegment, NeighSegmentBody, NeighState},
             route::{
                 CRtMsg, RouteFlags, RouteProtocol, RouteScope, RouteSegment, RouteSegmentBody,
                 RouteTable, RouteType,
@@ -30,9 +32,10 @@ use crate::{
 use alloc::vec::Vec;
 use system_error::SystemError;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum RouteNlSegment {
     NewLink(LinkSegment),
+    SetLink(LinkSegment),
     GetLink(LinkSegment),
     NewAddr(AddrSegment),
     DelAddr(AddrSegment),
@@ -42,6 +45,9 @@ pub enum RouteNlSegment {
     NewRoute(RouteSegment),
     DelRoute(RouteSegment),
     GetRoute(RouteSegment),
+    NewNeigh(NeighSegment),
+    DelNeigh(NeighSegment),
+    GetNeigh(NeighSegment),
 }
 
 impl ProtocolSegment for RouteNlSegment {
@@ -56,6 +62,10 @@ impl ProtocolSegment for RouteNlSegment {
             RouteNlSegment::NewLink(link_segment) | RouteNlSegment::GetLink(link_segment) => {
                 link_segment.header()
             }
+            RouteNlSegment::SetLink(link_segment) => link_segment.header(),
+            RouteNlSegment::NewNeigh(neigh_segment)
+            | RouteNlSegment::DelNeigh(neigh_segment)
+            | RouteNlSegment::GetNeigh(neigh_segment) => neigh_segment.header(),
             RouteNlSegment::Done(done_segment) => done_segment.header(),
             RouteNlSegment::Error(error_segment) => error_segment.header(),
         }
@@ -74,6 +84,10 @@ impl ProtocolSegment for RouteNlSegment {
             RouteNlSegment::NewLink(link_segment) | RouteNlSegment::GetLink(link_segment) => {
                 link_segment.header_mut()
             }
+            RouteNlSegment::SetLink(link_segment) => link_segment.header_mut(),
+            RouteNlSegment::NewNeigh(neigh_segment)
+            | RouteNlSegment::DelNeigh(neigh_segment)
+            | RouteNlSegment::GetNeigh(neigh_segment) => neigh_segment.header_mut(),
             RouteNlSegment::Done(done_segment) => done_segment.header_mut(),
             RouteNlSegment::Error(error_segment) => error_segment.header_mut(),
         }
@@ -118,11 +132,40 @@ impl ProtocolSegment for RouteNlSegment {
                     RouteNlSegment::GetRoute(RouteSegment::read_from_buf(header, payload_buf)?)
                 }
             }
+            CSegmentType::NEWROUTE => {
+                RouteNlSegment::NewRoute(RouteSegment::read_from_buf(header, payload_buf)?)
+            }
+            CSegmentType::DELROUTE => {
+                RouteNlSegment::DelRoute(RouteSegment::read_from_buf(header, payload_buf)?)
+            }
             CSegmentType::GETLINK => {
                 if payload_len < size_of::<CIfinfoMsg>() {
                     RouteNlSegment::GetLink(read_short_getlink_segment(header, payload_buf)?)
                 } else {
                     RouteNlSegment::GetLink(LinkSegment::read_from_buf(header, payload_buf)?)
+                }
+            }
+            CSegmentType::SETLINK | CSegmentType::NEWLINK | CSegmentType::DELLINK => {
+                RouteNlSegment::SetLink(LinkSegment::read_from_buf(header, payload_buf)?)
+            }
+            CSegmentType::GETRULE => {
+                if payload_len < size_of::<CRtMsg>() {
+                    RouteNlSegment::GetRoute(read_short_getroute_segment(header, payload_buf)?)
+                } else {
+                    RouteNlSegment::GetRoute(RouteSegment::read_from_buf(header, payload_buf)?)
+                }
+            }
+            CSegmentType::NEWNEIGH => {
+                RouteNlSegment::NewNeigh(NeighSegment::read_from_buf(header, payload_buf)?)
+            }
+            CSegmentType::DELNEIGH => {
+                RouteNlSegment::DelNeigh(NeighSegment::read_from_buf(header, payload_buf)?)
+            }
+            CSegmentType::GETNEIGH => {
+                if payload_len < size_of::<CNdMsg>() {
+                    RouteNlSegment::GetNeigh(read_short_getneigh_segment(header, payload_buf)?)
+                } else {
+                    RouteNlSegment::GetNeigh(NeighSegment::read_from_buf(header, payload_buf)?)
                 }
             }
             _ => return Err(SystemError::EINVAL),
@@ -137,8 +180,15 @@ impl ProtocolSegment for RouteNlSegment {
             RouteNlSegment::NewAddr(addr_segment) | RouteNlSegment::DelAddr(addr_segment) => {
                 addr_segment.write_to_buf(buf)?
             }
-            RouteNlSegment::NewRoute(route_segment) => route_segment.write_to_buf(buf)?,
+            RouteNlSegment::NewRoute(route_segment) | RouteNlSegment::DelRoute(route_segment) => {
+                route_segment.write_to_buf(buf)?
+            }
             RouteNlSegment::NewLink(link_segment) => link_segment.write_to_buf(buf)?,
+            RouteNlSegment::NewNeigh(neigh_segment)
+            | RouteNlSegment::DelNeigh(neigh_segment)
+            | RouteNlSegment::GetNeigh(neigh_segment) => {
+                neigh_segment.write_to_buf(buf)?
+            }
             RouteNlSegment::Done(done_segment) => done_segment.write_to_buf(buf)?,
             RouteNlSegment::Error(error_segment) => error_segment.write_to_buf(buf)?,
             _ => {
@@ -207,6 +257,24 @@ fn read_short_getroute_segment(
         flags: RouteFlags::empty(),
     };
     let mut segment = RouteSegment::new(header, body, Vec::<RouteAttr>::new());
+    segment.header_mut().len = header.len;
+    Ok(segment)
+}
+
+#[allow(dead_code)]
+fn read_short_getneigh_segment(
+    header: CMsgSegHdr,
+    payload: &[u8],
+) -> Result<NeighSegment, SystemError> {
+    let family = read_rtgen_family(payload)?;
+    let body = NeighSegmentBody {
+        family,
+        ifindex: 0,
+        state: NeighState::empty(),
+        flags: 0,
+        kind: RouteType::Unspec,
+    };
+    let mut segment = NeighSegment::new(header, body, Vec::<NeighAttr>::new());
     segment.header_mut().len = header.len;
     Ok(segment)
 }

@@ -21,7 +21,7 @@ use hashbrown::HashMap;
 use system_error::SystemError;
 
 pub const MAX_ALLOWED_PROTOCOL_ID: u32 = 32;
-const MAX_GROUPS: u32 = 32;
+const MAX_GROUPS: u32 = 64;
 
 #[derive(Debug)]
 pub struct NetlinkSocketTable {
@@ -95,7 +95,8 @@ impl<Message: 'static + Debug> ProtocolSocketTable<Message> {
 
     fn unicast(&self, dst_port: u32, message: Message) -> Result<(), SystemError> {
         let Some(receiver) = self.unicast_sockets.get(&dst_port) else {
-            return Ok(());
+            log::warn!("netlink unicast: destination port {} is not bound", dst_port);
+            return Err(SystemError::ECONNREFUSED);
         };
         receiver.enqueue_message(message)
     }
@@ -201,6 +202,8 @@ impl<Message: 'static + Debug> Drop for BoundHandle<Message> {
 pub trait SupportedNetlinkProtocol: Debug {
     type Message: 'static + Send + Debug;
 
+    fn multicast_group_count() -> u32;
+
     fn socket_table(netns: Arc<NetNamespace>) -> Arc<RwSem<ProtocolSocketTable<Self::Message>>>;
 
     fn bind(
@@ -243,6 +246,10 @@ pub struct NetlinkRouteProtocol;
 impl SupportedNetlinkProtocol for NetlinkRouteProtocol {
     type Message = RouteNlMessage;
 
+    fn multicast_group_count() -> u32 {
+        33
+    }
+
     fn socket_table(netns: Arc<NetNamespace>) -> Arc<RwSem<ProtocolSocketTable<Self::Message>>> {
         netns.netlink_socket_table().route()
     }
@@ -253,6 +260,10 @@ pub struct NetlinkKobjectUeventProtocol;
 
 impl SupportedNetlinkProtocol for NetlinkKobjectUeventProtocol {
     type Message = KobjectUeventMessage;
+
+    fn multicast_group_count() -> u32 {
+        1
+    }
 
     fn socket_table(netns: Arc<NetNamespace>) -> Arc<RwSem<ProtocolSocketTable<Self::Message>>> {
         netns.netlink_socket_table().kobject_uevent()

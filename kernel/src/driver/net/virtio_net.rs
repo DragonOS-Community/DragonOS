@@ -432,7 +432,6 @@ impl Debug for VirtIONicDeviceInner {
 #[derive(Debug)]
 pub struct VirtioInterface {
     device_inner: VirtIONicDeviceInnerWrapper,
-    iface_name: String,
     iface_common: super::IfaceCommon,
     inner: SpinLock<InnerVirtIOInterface>,
     locked_kobj_state: LockedKObjectState,
@@ -447,6 +446,8 @@ struct InnerVirtIOInterface {
 
 impl VirtioInterface {
     pub fn new(mut device_inner: VirtIONicDeviceInner) -> Arc<Self> {
+        use smoltcp::phy::Device;
+
         let iface_id = generate_iface_id();
         let mut iface_config = iface::Config::new(wire::HardwareAddress::Ethernet(
             wire::EthernetAddress(device_inner.inner.lock_irqsave().mac_address()),
@@ -460,14 +461,17 @@ impl VirtioInterface {
             | InterfaceFlags::RUNNING
             | InterfaceFlags::MULTICAST
             | InterfaceFlags::LOWER_UP;
+        let iface_name = format!("eth{}", iface_id);
+        let mtu = device_inner.capabilities().max_transmission_unit;
 
         let iface = Arc::new(VirtioInterface {
             device_inner: VirtIONicDeviceInnerWrapper(UnsafeCell::new(device_inner)),
             locked_kobj_state: LockedKObjectState::default(),
-            iface_name: format!("eth{}", iface_id),
             iface_common: super::IfaceCommon::new(
                 iface_id,
                 crate::driver::net::types::InterfaceType::EETHER,
+                iface_name,
+                mtu,
                 flags,
                 iface,
             ),
@@ -495,11 +499,6 @@ impl VirtioInterface {
         return self.inner.lock();
     }
 
-    /// 获取网卡接口的名称
-    #[allow(dead_code)]
-    pub fn iface_name(&self) -> String {
-        self.iface_name.clone()
-    }
 }
 
 impl Drop for VirtioInterface {
@@ -771,7 +770,7 @@ impl Iface for VirtioInterface {
 
     #[inline]
     fn iface_name(&self) -> String {
-        return self.iface_name.clone();
+        return self.iface_common.name();
     }
 
     fn poll(&self) -> bool {
@@ -814,11 +813,7 @@ impl Iface for VirtioInterface {
     }
 
     fn mtu(&self) -> usize {
-        use smoltcp::phy::Device;
-        self.device_inner
-            .force_get_mut()
-            .capabilities()
-            .max_transmission_unit
+        self.iface_common.mtu()
     }
 }
 
@@ -856,11 +851,11 @@ impl KObject for VirtioInterface {
     }
 
     fn name(&self) -> String {
-        self.iface_name.clone()
+        self.iface_common.name()
     }
 
-    fn set_name(&self, _name: String) {
-        // do nothing
+    fn set_name(&self, name: String) {
+        self.iface_common.set_name(name);
     }
 
     fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {

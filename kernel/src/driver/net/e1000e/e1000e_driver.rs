@@ -92,7 +92,6 @@ impl Debug for E1000EDriverWrapper {
 pub struct E1000EInterface {
     driver: E1000EDriverWrapper,
     common: IfaceCommon,
-    name: String,
     inner: SpinLock<InnerE1000EInterface>,
     locked_kobj_state: LockedKObjectState,
 }
@@ -252,6 +251,8 @@ impl phy::Device for E1000EDriver {
 
 impl E1000EInterface {
     pub fn new(mut driver: E1000EDriver) -> Arc<Self> {
+        use smoltcp::phy::Device;
+
         let iface_id = generate_iface_id();
         let mut iface_config = smoltcp::iface::Config::new(HardwareAddress::Ethernet(
             smoltcp::wire::EthernetAddress(driver.inner.lock().mac_address()),
@@ -266,16 +267,19 @@ impl E1000EInterface {
             | InterfaceFlags::RUNNING
             | InterfaceFlags::MULTICAST
             | InterfaceFlags::LOWER_UP;
+        let name = format!("eth{}", iface_id);
+        let mtu = driver.capabilities().max_transmission_unit;
 
         let iface = Arc::new(E1000EInterface {
             driver: E1000EDriverWrapper(UnsafeCell::new(driver)),
             common: IfaceCommon::new(
                 iface_id,
                 crate::driver::net::types::InterfaceType::EETHER,
+                name,
+                mtu,
                 flags,
                 iface,
             ),
-            name: format!("eth{}", iface_id),
             inner: SpinLock::new(InnerE1000EInterface {
                 netdevice_common: NetDeviceCommonData::default(),
                 device_common: DeviceCommonData::default(),
@@ -383,7 +387,7 @@ impl Iface for E1000EInterface {
 
     #[inline]
     fn iface_name(&self) -> String {
-        return self.name.clone();
+        return self.common.name();
     }
 
     fn poll(&self) -> bool {
@@ -420,12 +424,7 @@ impl Iface for E1000EInterface {
     }
 
     fn mtu(&self) -> usize {
-        use smoltcp::phy::Device;
-
-        self.driver
-            .force_get_mut()
-            .capabilities()
-            .max_transmission_unit
+        self.common.mtu()
     }
 }
 
@@ -463,11 +462,11 @@ impl KObject for E1000EInterface {
     }
 
     fn name(&self) -> String {
-        self.name.clone()
+        self.common.name()
     }
 
-    fn set_name(&self, _name: String) {
-        // do nothing
+    fn set_name(&self, name: String) {
+        self.common.set_name(name);
     }
 
     fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {

@@ -392,6 +392,8 @@ impl VethInterface {
     }
 
     pub fn new(driver: VethDriver) -> Arc<Self> {
+        use smoltcp::phy::Device;
+
         let iface_id = generate_iface_id();
         let name = driver.name();
         let mac = [
@@ -417,11 +419,19 @@ impl VethInterface {
             | InterfaceFlags::UP
             | InterfaceFlags::RUNNING
             | InterfaceFlags::LOWER_UP;
+        let mtu = driver.capabilities().max_transmission_unit;
 
         let device = Arc::new(VethInterface {
             name,
             driver: VethDriverWarpper(UnsafeCell::new(driver.clone())),
-            common: IfaceCommon::new(iface_id, super::types::InterfaceType::EETHER, flags, iface),
+            common: IfaceCommon::new(
+                iface_id,
+                super::types::InterfaceType::EETHER,
+                driver.name(),
+                mtu,
+                flags,
+                iface,
+            ),
             inner: SpinLock::new(VethCommonData::default()),
             locked_kobj_state: LockedKObjectState::default(),
         });
@@ -563,10 +573,12 @@ impl KObject for VethInterface {
     }
 
     fn name(&self) -> String {
-        self.name.clone()
+        self.common.name()
     }
 
-    fn set_name(&self, _name: String) {}
+    fn set_name(&self, name: String) {
+        self.common.set_name(name);
+    }
     fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.locked_kobj_state.read()
     }
@@ -590,7 +602,7 @@ impl device::Device for VethInterface {
     }
 
     fn id_table(&self) -> IdTable {
-        IdTable::new(self.name.clone(), None)
+        IdTable::new(self.common.name(), None)
     }
 
     fn bus(&self) -> Option<Weak<dyn Bus>> {
@@ -657,7 +669,7 @@ impl Iface for VethInterface {
     }
 
     fn iface_name(&self) -> String {
-        self.name.clone()
+        self.common.name()
     }
 
     fn mac(&self) -> EthernetAddress {
@@ -704,11 +716,7 @@ impl Iface for VethInterface {
     }
 
     fn mtu(&self) -> usize {
-        use smoltcp::phy::Device;
-        self.driver
-            .force_get_mut()
-            .capabilities()
-            .max_transmission_unit
+        self.common.mtu()
     }
 }
 

@@ -125,8 +125,9 @@ pub trait Attribute: core::fmt::Debug + Send + Sync {
                 return Err(SystemError::EINVAL);
             }
 
+            let attr_total_with_padding = attr_header.total_len_with_padding();
             total_len = total_len
-                .checked_sub(attr_header.total_len())
+                .checked_sub(attr_total_with_padding)
                 .ok_or(SystemError::EINVAL)?;
 
             if buf.len() - offset < attr_header.total_len() {
@@ -143,12 +144,7 @@ pub trait Attribute: core::fmt::Debug + Send + Sync {
                 attrs.push(attr);
             }
 
-            // 移动到下一个属性（考虑对齐）
-            let attr_total_with_padding = attr_header.total_len_with_padding();
             offset += attr_total_with_padding;
-
-            let padding_len = total_len.min(attr_header.padding_len());
-            total_len -= padding_len;
         }
 
         Ok(attrs)

@@ -62,6 +62,18 @@ pub fn get_arp_entries() -> Vec<ArpEntry> {
                 });
             }
         }
+
+        for neighbor in iface.common().static_neighbors().iter() {
+            if let IpAddress::Ipv4(ipv4) = neighbor.ip_addr {
+                entries.push(ArpEntry {
+                    ip_addr: IpAddress::Ipv4(ipv4),
+                    hw_type: ArpHrd::Ethernet,
+                    flags: ArpFlags::COM,
+                    hw_addr: neighbor.hw_addr,
+                    device: dev_name.clone(),
+                });
+            }
+        }
     }
 
     entries

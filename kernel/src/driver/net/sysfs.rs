@@ -34,6 +34,16 @@ pub fn netdev_register_kobject(dev: Arc<dyn Iface>) -> Result<(), SystemError> {
     dev.set_name(dev.iface_name().clone());
 
     device_manager().add_device(dev.clone() as Arc<dyn Device>)?;
+    let ifname = dev.iface_name();
+    <dyn KObject>::kobject_uevent(
+        &(dev.clone() as Arc<dyn KObject>),
+        "add",
+        &[
+            ("SUBSYSTEM", "net".into()),
+            ("DEVNAME", ifname.clone()),
+            ("INTERFACE", ifname),
+        ],
+    )?;
 
     return Ok(());
 }

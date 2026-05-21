@@ -615,8 +615,21 @@ impl DeviceManager {
             );
         }
 
-        // todo: 发送uevent: KOBJ_ADD
-        // kobject_uevent();
+        if let Some(subsystem) = device
+            .class()
+            .map(|class| class.name().to_string())
+            .or_else(|| device.bus().and_then(|bus| bus.upgrade()).map(|bus| bus.name()))
+        {
+            if subsystem != "net" {
+                let devname = device.name();
+                let _ = <dyn KObject>::kobject_uevent(
+                    &(device.clone() as Arc<dyn KObject>),
+                    "add",
+                    &[("SUBSYSTEM", subsystem), ("DEVNAME", devname)],
+                );
+            }
+        }
+
         // probe drivers for a new device
         bus_probe_device(&device);
 

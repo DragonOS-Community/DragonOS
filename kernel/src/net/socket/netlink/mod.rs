@@ -11,7 +11,7 @@ use system_error::SystemError;
 
 pub mod addr;
 mod common;
-mod kobject;
+pub(crate) mod kobject;
 mod message;
 mod receiver;
 mod route;

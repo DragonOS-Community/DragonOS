@@ -1,8 +1,16 @@
-use core::{any::Any, fmt::Debug, hash::Hash, ops::Deref};
+use core::{
+    any::Any,
+    fmt::Debug,
+    hash::Hash,
+    ops::Deref,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use alloc::{
+    format,
     string::String,
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use driver_base_macros::get_weak_or_clear;
 use intertrait::CastFromSync;
@@ -18,11 +26,19 @@ use crate::{
         rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
         spinlock::SpinLock,
     },
+    net::socket::netlink::{
+        addr::multicast::GroupIdSet,
+        kobject::message::KobjectUeventMessage,
+        table::{NetlinkKobjectUeventProtocol, SupportedNetlinkProtocol},
+    },
+    process::{namespace::net_namespace::INIT_NET_NAMESPACE, ProcessManager},
 };
 
 use system_error::SystemError;
 
 use super::kset::KSet;
+
+static UEVENT_SEQNUM: AtomicU64 = AtomicU64::new(1);
 
 pub trait KObject: Any + Send + Sync + Debug + CastFromSync {
     fn as_any_ref(&self) -> &dyn core::any::Any;
@@ -67,12 +83,92 @@ impl dyn KObject {
         let mut state = self.kobj_state_mut();
         *state = (*state | insert) & !remove;
     }
+
+    pub fn kobject_uevent(
+        kobj: &Arc<dyn KObject>,
+        action: &str,
+        extra_env: &[(&str, String)],
+    ) -> Result<(), SystemError> {
+        let devpath = Self::devpath(kobj)?;
+        Self::emit_uevent(action, &devpath, extra_env)
+    }
+
+    pub fn emit_uevent(
+        action: &str,
+        devpath: &str,
+        extra_env: &[(&str, String)],
+    ) -> Result<(), SystemError> {
+        let mut payload = Vec::new();
+        push_env_field(&mut payload, &format!("{action}@{devpath}"));
+        push_env_field(&mut payload, &format!("ACTION={action}"));
+        push_env_field(&mut payload, &format!("DEVPATH={devpath}"));
+        for (key, value) in extra_env {
+            push_env_field(&mut payload, &format!("{key}={value}"));
+        }
+        let seqnum = UEVENT_SEQNUM.fetch_add(1, Ordering::Relaxed);
+        push_env_field(&mut payload, &format!("SEQNUM={seqnum}"));
+
+        let netns = if ProcessManager::initialized() {
+            ProcessManager::current_netns()
+        } else {
+            INIT_NET_NAMESPACE.clone()
+        };
+        NetlinkKobjectUeventProtocol::multicast(
+            GroupIdSet::new(1),
+            KobjectUeventMessage::new(&payload),
+            netns,
+        )
+    }
+
+    pub fn devpath(kobj: &Arc<dyn KObject>) -> Result<String, SystemError> {
+        kobject_devpath(kobj)
+    }
 }
 
 impl DowncastArc for dyn KObject {
     fn as_any_arc(self: Arc<Self>) -> Arc<dyn Any> {
         self
     }
+}
+
+fn push_env_field(payload: &mut Vec<u8>, field: &str) {
+    payload.extend_from_slice(field.as_bytes());
+    payload.push(0);
+}
+
+fn kobject_devpath(kobj: &Arc<dyn KObject>) -> Result<String, SystemError> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = Some(kobj.clone());
+
+    while let Some(node) = current {
+        let name = node.name();
+        if !name.is_empty() {
+            parts.push(name);
+        }
+
+        let Some(parent) = node.parent().and_then(|parent| parent.upgrade()) else {
+            break;
+        };
+
+        if Arc::ptr_eq(&parent, &node) {
+            break;
+        }
+
+        current = Some(parent);
+    }
+
+    parts.reverse();
+    let mut path = String::new();
+    for part in parts {
+        path.push('/');
+        path.push_str(&part);
+    }
+
+    if path.is_empty() {
+        return Err(SystemError::ENOENT);
+    }
+
+    Ok(path)
 }
 
 /// kobject的公共数据

@@ -229,6 +229,19 @@ impl UdpSocket {
         }
     }
 
+    #[inline]
+    fn normalize_unspecified_dest(dest: IpEndpoint) -> IpEndpoint {
+        if !dest.addr.is_unspecified() {
+            return dest;
+        }
+
+        let addr = match dest.addr {
+            Ipv4(_) => smoltcp::wire::IpAddress::v4(127, 0, 0, 1),
+            Ipv6(_) => smoltcp::wire::IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 1),
+        };
+        IpEndpoint::new(addr, dest.port)
+    }
+
     pub fn is_nonblock(&self) -> bool {
         self.nonblock.load(core::sync::atomic::Ordering::Relaxed)
     }
@@ -831,7 +844,8 @@ impl UdpSocket {
 
             // If unbound, bind to ephemeral port
             if let UdpInner::Unbound(_) = inner {
-                let to_addr = to.ok_or(SystemError::EDESTADDRREQ)?.addr;
+                let to_addr =
+                    Self::normalize_unspecified_dest(to.ok_or(SystemError::EDESTADDRREQ)?).addr;
                 let unbound = match inner_guard.take().unwrap() {
                     UdpInner::Unbound(unbound) => unbound,
                     _ => unreachable!(),
@@ -878,6 +892,7 @@ impl UdpSocket {
                     let dest = to
                         .or_else(|| bound.remote_endpoint().ok())
                         .ok_or(SystemError::EDESTADDRREQ)?;
+                    let dest = Self::normalize_unspecified_dest(dest);
                     self.validate_bound_send_dest(bound, dest)?;
                     let bound_iface = bound.inner().iface().clone();
                     let is_multicast = dest.addr.is_multicast();
@@ -958,7 +973,7 @@ impl UdpSocket {
                             }
                         }
 
-                        let ret = bound.try_send(buf, to);
+                        let ret = bound.try_send(buf, Some(dest));
                         (
                             ret,
                             send_iface,
@@ -1367,6 +1382,7 @@ impl Socket for UdpSocket {
                     return Ok(());
                 }
 
+                let remote = Self::normalize_unspecified_dest(remote);
                 if !self.is_bound() {
                     self.bind_ephemeral(remote.addr)?;
                 }

@@ -7,6 +7,7 @@ use crate::{
         interrupt::TrapFrame,
         syscall::nr::{SYS_FDATASYNC, SYS_FSYNC},
     },
+    filesystem::vfs::file::FileFlags,
     process::ProcessManager,
     syscall::table::{FormattedSyscallParam, Syscall},
 };
@@ -19,6 +20,10 @@ fn do_fsync(fd: i32, datasync: bool) -> Result<usize, SystemError> {
         .get_file_by_fd(fd)
         .ok_or(SystemError::EBADF)?;
     drop(fd_table_guard);
+
+    if file.flags().contains(FileFlags::O_PATH) {
+        return Err(SystemError::EBADF);
+    }
 
     file.inode().sync_file(datasync, file.private_data.lock())?;
     Ok(0)

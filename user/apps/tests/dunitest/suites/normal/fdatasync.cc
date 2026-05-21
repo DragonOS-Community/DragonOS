@@ -116,6 +116,34 @@ TEST(Fdatasync, InvalidFdReturnsEbadf) {
     ExpectFdatasyncErrno(fd, EBADF);
 }
 
+#ifdef O_PATH
+TEST(Fdatasync, OPathFdReturnsEbadf) {
+    TempFile file;
+    ASSERT_TRUE(file.valid()) << "mkstemp failed: " << strerror(errno);
+
+    int path_fd = open(file.path(), O_PATH);
+    ASSERT_GE(path_fd, 0) << "open O_PATH failed: " << strerror(errno);
+
+    ExpectFdatasyncErrno(path_fd, EBADF);
+
+    close(path_fd);
+}
+
+TEST(Fsync, OPathFdReturnsEbadf) {
+    TempFile file;
+    ASSERT_TRUE(file.valid()) << "mkstemp failed: " << strerror(errno);
+
+    int path_fd = open(file.path(), O_PATH);
+    ASSERT_GE(path_fd, 0) << "open O_PATH failed: " << strerror(errno);
+
+    errno = 0;
+    EXPECT_EQ(-1, fsync(path_fd));
+    EXPECT_EQ(EBADF, errno) << "got errno=" << errno << " (" << strerror(errno) << ")";
+
+    close(path_fd);
+}
+#endif
+
 TEST(Fdatasync, PipeReturnsEinval) {
     int pipefd[2] = {-1, -1};
     ASSERT_EQ(0, pipe(pipefd)) << "pipe failed: " << strerror(errno);

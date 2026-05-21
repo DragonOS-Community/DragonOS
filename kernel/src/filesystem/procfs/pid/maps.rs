@@ -106,7 +106,11 @@ fn format_dev_inode_and_path(
 fn generate_maps_content(target: &ProcPidTarget) -> Result<Vec<u8>, SystemError> {
     let target_pcb = target.thread_group_leader().ok_or(SystemError::ESRCH)?;
 
-    let vm = target_pcb.basic().user_vm().ok_or(SystemError::EINVAL)?;
+    let vm = {
+        let basic = target_pcb.basic();
+        basic.user_vm()
+    }
+    .ok_or(SystemError::EINVAL)?;
     let root_prefix = target_pcb
         .fs_struct()
         .root()

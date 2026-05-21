@@ -16,7 +16,7 @@ use crate::{
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
     mm::MemoryManagementArch,
-    process::{pid::PidType, ProcessControlBlock, ProcessState, RawPid},
+    process::{pid::PidType, ProcessState, RawPid},
     sched::{cputime::ns_to_clock_t, prio::PrioUtil},
 };
 use alloc::{
@@ -70,7 +70,15 @@ fn generate_linux_proc_stat_line(
     comm: &str,
     state: ProcessState,
     ppid: RawPid,
-    pcb: &Arc<ProcessControlBlock>,
+    tty_nr: i32,
+    priority: i64,
+    nice: i64,
+    num_threads: i64,
+    vsize_bytes: u64,
+    rss_pages: u64,
+    processor: i32,
+    utime: u64,
+    stime: u64,
 ) -> String {
     let comm = sanitize_comm_for_proc_stat(comm);
     let state_ch = state_to_linux_char(state);
@@ -78,11 +86,6 @@ fn generate_linux_proc_stat_line(
     // 尽量填真实值；拿不到的先填 0
     let pgrp: usize = 0;
     let session: usize = 0;
-    let tty_nr: i32 = pcb
-        .sig_info_irqsave()
-        .tty()
-        .map(|tty| tty.core().device_number().new_encode_dev() as i32)
-        .unwrap_or(0);
     let tpgid: i32 = 0;
     let flags: u64 = 0;
     let minflt: u64 = 0;
@@ -90,48 +93,13 @@ fn generate_linux_proc_stat_line(
     let majflt: u64 = 0;
     let cmajflt: u64 = 0;
 
-    // === 读取真实的 CPU 时间 ===
-    let cpu_time = pcb.cputime();
-    let utime = ns_to_clock_t(cpu_time.utime.load(Ordering::Relaxed));
-    let stime = ns_to_clock_t(cpu_time.stime.load(Ordering::Relaxed));
-
     let cutime: i64 = 0;
     let cstime: i64 = 0;
 
-    // === 读取真实的 priority 和 nice 值 ===
-    let prio_data = pcb.sched_info().prio_data();
-    let priority: i64 = prio_data.prio as i64;
-    let nice: i64 = PrioUtil::prio_to_nice(prio_data.static_prio) as i64;
-    drop(prio_data);
-
-    // 线程组中的线程数量
-    let num_threads: i64 = pcb
-        .task_pid_ptr(PidType::TGID)
-        .map(|tgid_pid| tgid_pid.tasks_iter(PidType::TGID).count() as i64)
-        .unwrap_or(1);
     let itrealvalue: i64 = 0;
 
     // starttime: 进程启动时间（暂时为 0，需要 PCB 添加 start_time 字段）
     let starttime: u64 = 0;
-
-    // vsize: bytes, rss: pages
-    let (vsize_bytes, rss_pages) = pcb
-        .basic()
-        .user_vm()
-        .map(|vm| {
-            let guard = vm.read();
-            let bytes = guard.vma_usage_bytes();
-            let pages = (bytes.saturating_add(MMArch::PAGE_SIZE - 1)) >> MMArch::PAGE_SHIFT;
-            (bytes as u64, pages as u64)
-        })
-        .unwrap_or((0, 0));
-
-    // processor: 进程最后运行的 CPU ID
-    let processor: i32 = pcb
-        .sched_info()
-        .on_cpu()
-        .map(|cpu| cpu.data() as i32)
-        .unwrap_or(0);
 
     format!(
         "{pid} ({comm}) {state_ch} {ppid} {pgrp} {session} {tty_nr} {tpgid} {flags} \
@@ -152,9 +120,48 @@ impl FileOps for StatFileOps {
     ) -> Result<usize, SystemError> {
         let pcb = self.target.task().ok_or(SystemError::ESRCH)?;
 
-        let comm = pcb.basic().name().to_string();
-        let sched = pcb.sched_info();
-        let state = sched.inner_lock_read_irqsave().state();
+        let (comm, user_vm) = {
+            let basic = pcb.basic();
+            (basic.name().to_string(), basic.user_vm())
+        };
+        let state = {
+            let sched = pcb.sched_info();
+            sched.inner_lock_read_irqsave().state()
+        };
+        let tty_nr = {
+            pcb.sig_info_irqsave()
+                .tty()
+                .map(|tty| tty.core().device_number().new_encode_dev() as i32)
+                .unwrap_or(0)
+        };
+        let cpu_time = pcb.cputime();
+        let utime = ns_to_clock_t(cpu_time.utime.load(Ordering::Relaxed));
+        let stime = ns_to_clock_t(cpu_time.stime.load(Ordering::Relaxed));
+        let (priority, nice) = {
+            let prio_data = pcb.sched_info().prio_data();
+            (
+                prio_data.prio as i64,
+                PrioUtil::prio_to_nice(prio_data.static_prio) as i64,
+            )
+        };
+        let num_threads = pcb
+            .task_pid_ptr(PidType::TGID)
+            .map(|tgid_pid| tgid_pid.tasks_iter(PidType::TGID).count() as i64)
+            .unwrap_or(1);
+        let (vsize_bytes, rss_pages) = user_vm
+            .map(|vm| {
+                let guard = vm.read();
+                let bytes = guard.vma_usage_bytes();
+                let pages =
+                    (bytes.saturating_add(MMArch::PAGE_SIZE - 1)) >> MMArch::PAGE_SHIFT;
+                (bytes as u64, pages as u64)
+            })
+            .unwrap_or((0, 0));
+        let processor = pcb
+            .sched_info()
+            .on_cpu()
+            .map(|cpu| cpu.data() as i32)
+            .unwrap_or(0);
 
         let ppid = pcb
             .parent_pcb()
@@ -162,7 +169,21 @@ impl FileOps for StatFileOps {
             .map(|pid| pid.pid_nr_ns(self.target.view_pid_ns()))
             .unwrap_or(RawPid::new(0));
 
-        let content = generate_linux_proc_stat_line(self.target.vpid(), &comm, state, ppid, &pcb);
+        let content = generate_linux_proc_stat_line(
+            self.target.vpid(),
+            &comm,
+            state,
+            ppid,
+            tty_nr,
+            priority,
+            nice,
+            num_threads,
+            vsize_bytes,
+            rss_pages,
+            processor,
+            utime,
+            stime,
+        );
         proc_read(offset, len, buf, content.as_bytes())
     }
 }

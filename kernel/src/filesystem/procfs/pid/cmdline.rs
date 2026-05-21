@@ -47,7 +47,10 @@ impl FileOps for CmdlineFileOps {
 
         // 如果 cmdline 为空，返回进程名
         let mut content = if cmdline_bytes.is_empty() {
-            let name = pcb.basic().name().as_bytes().to_vec();
+            let name = {
+                let basic = pcb.basic();
+                basic.name().as_bytes().to_vec()
+            };
             let mut result = name;
             result.push(0); // 以 \0 结尾
             result

@@ -49,10 +49,13 @@ impl FileOps for StatmFileOps {
             .thread_group_leader()
             .ok_or(SystemError::ESRCH)?;
 
+        let user_vm = {
+            let basic = pcb.basic();
+            basic.user_vm()
+        };
+
         // 获取进程内存信息（简化实现）
-        let size_pages = pcb
-            .basic()
-            .user_vm()
+        let size_pages = user_vm
             .map(|vm| {
                 let guard = vm.read();
                 // statm 第一列为总虚拟内存页数

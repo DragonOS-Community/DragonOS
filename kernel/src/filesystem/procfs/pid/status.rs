@@ -50,24 +50,32 @@ impl StatusFileOps {
         let view_pid_ns = self.target.view_pid_ns();
         let mut pdata = Vec::new();
 
-        // Name
-        pdata.append(
-            &mut format!("Name:\t{}", pcb.basic().name())
-                .as_bytes()
-                .to_owned(),
-        );
+        let (name, user_vm, fd_table) = {
+            let basic = pcb.basic();
+            (
+                basic.name().to_string(),
+                basic.user_vm(),
+                basic.try_fd_table(),
+            )
+        };
 
-        let sched_info_guard = pcb.sched_info();
-        let state = sched_info_guard.inner_lock_read_irqsave().state();
-        let cpu_id = sched_info_guard
+        let state = {
+            let sched_info = pcb.sched_info();
+            sched_info.inner_lock_read_irqsave().state()
+        };
+        let cpu_id = pcb
+            .sched_info()
             .on_cpu()
             .map(|cpu| cpu.data() as i32)
             .unwrap_or(-1);
+        let priority = pcb.sched_info().policy();
+        let vrtime = pcb.sched_info().sched_entity.vruntime;
+        let time = pcb.sched_info().sched_entity.sum_exec_runtime;
+        let start_time = pcb.sched_info().sched_entity.exec_start;
+        let tty = { pcb.sig_info_irqsave().tty() };
 
-        let priority = sched_info_guard.policy();
-        let vrtime = sched_info_guard.sched_entity.vruntime;
-        let time = sched_info_guard.sched_entity.sum_exec_runtime;
-        let start_time = sched_info_guard.sched_entity.exec_start;
+        // Name
+        pdata.append(&mut format!("Name:\t{}", name).as_bytes().to_owned());
 
         // State
         pdata.append(&mut format!("\nState:\t{:?}", state).as_bytes().to_owned());
@@ -100,12 +108,18 @@ impl StatusFileOps {
             pdata.append(&mut format!("\nFDSize:\t{}", 0).into());
         } else {
             pdata.append(
-                &mut format!("\nFDSize:\t{}", pcb.fd_table().read().fd_open_count()).into(),
+                &mut format!(
+                    "\nFDSize:\t{}",
+                    fd_table
+                        .map(|fd_table| fd_table.read().fd_open_count())
+                        .unwrap_or(0)
+                )
+                .into(),
             );
         }
 
         // Tty
-        let name = if let Some(tty) = pcb.sig_info_irqsave().tty() {
+        let name = if let Some(tty) = tty {
             tty.core().name().clone()
         } else {
             "none".to_string()
@@ -128,7 +142,7 @@ impl StatusFileOps {
 
         pdata.append(&mut format!("\nvrtime:\t{}", vrtime).as_bytes().to_owned());
 
-        if let Some(user_vm) = pcb.basic().user_vm() {
+        if let Some(user_vm) = user_vm {
             let address_space_guard = user_vm.read();
             // todo: 当前进程运行过程中占用内存的峰值
             let hiwater_vm: u64 = 0;

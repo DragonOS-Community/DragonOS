@@ -55,6 +55,13 @@ let
       version = testOpt.syscall.version;
     }
   );
+
+  dunitest = (
+    pkgs.callPackage ./tests/dunitest {
+      inherit fenix system;
+      installDir = testOpt.dunitest.testDir;
+    }
+  );
 in
 [
   (static.busybox.override {
@@ -75,4 +82,7 @@ in
   # gvisor test case only included on x86_64
   gvisor-syscall-tests
   # TODO: Add debian libcxx deps or FHS
+]
+++ lib.optionals (target == "x86_64" && testOpt.dunitest.enable) [
+  dunitest
 ]

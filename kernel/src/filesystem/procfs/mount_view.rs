@@ -10,7 +10,7 @@ use system_error::SystemError;
 use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::{
-        procfs::{utils::proc_read, ProcfsFilePrivateData},
+        procfs::{pid::find_process_by_vpid, utils::proc_read, ProcfsFilePrivateData},
         vfs::{mount::MountList, FilePrivateData, IndexNode, MountFS},
     },
     libs::mutex::MutexGuard,
@@ -35,7 +35,7 @@ pub(crate) fn open_current_mount_file(
     kind: ProcMountRenderKind,
     data: &mut FilePrivateData,
 ) -> Result<(), SystemError> {
-    open_pid_mount_file(ProcessManager::current_pid(), kind, data)
+    open_pid_mount_file(ProcessManager::current_pcb().task_pid_vnr(), kind, data)
 }
 
 pub(crate) fn open_pid_mount_file(
@@ -44,7 +44,10 @@ pub(crate) fn open_pid_mount_file(
     data: &mut FilePrivateData,
 ) -> Result<(), SystemError> {
     let rendered = render_mount_file(pid, kind)?;
-    *data = FilePrivateData::Procfs(ProcfsFilePrivateData { data: rendered });
+    *data = FilePrivateData::Procfs(ProcfsFilePrivateData {
+        data: rendered,
+        open_cred: ProcessManager::current_pcb().cred(),
+    });
     Ok(())
 }
 
@@ -61,7 +64,7 @@ pub(crate) fn read_cached_mount_file(
 }
 
 fn render_mount_file(pid: RawPid, kind: ProcMountRenderKind) -> Result<Vec<u8>, SystemError> {
-    let target = ProcessManager::find(pid).ok_or(SystemError::ESRCH)?;
+    let target = find_process_by_vpid(pid).ok_or(SystemError::ESRCH)?;
     let entries = collect_visible_mounts(&target)?;
     let mut rendered = String::new();
 

@@ -456,14 +456,14 @@ impl IndexNode for OvlInode {
     fn sync_file(
         &self,
         datasync: bool,
-        data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
+        _data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
     ) -> Result<(), SystemError> {
         if let Some(ref upper_inode) = *self.upper_inode.lock() {
-            return upper_inode.sync_file(datasync, data);
+            return upper_inode.sync_file(datasync, _data);
         }
 
-        if let Some(lower_inode) = &self.lower_inode {
-            return lower_inode.sync_file(datasync, data);
+        if !self.lower_inodes.is_empty() {
+            return Ok(());
         }
 
         Err(SystemError::ENOENT)

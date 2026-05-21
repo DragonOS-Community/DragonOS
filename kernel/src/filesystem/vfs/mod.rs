@@ -662,6 +662,11 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @brief 获取inode所在的文件系统的指针
     fn fs(&self) -> Arc<dyn FileSystem>;
 
+    /// @brief 获取当前 inode 所在挂载点的挂载标志
+    fn mount_flags(&self) -> MountFlags {
+        MountFlags::empty()
+    }
+
     /// @brief 本函数用于实现动态转换。
     /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
     fn as_any_ref(&self) -> &dyn Any;
@@ -1326,6 +1331,7 @@ bitflags! {
         const MOUNT_MAGIC = 61267;
         const PIPEFS_MAGIC = 0x50495045;
         const EVENTFD_MAGIC = 0x45564446; // "EVDF" in ASCII
+        const OVERLAYFS_MAGIC = 0x794c7630;
     }
 }
 

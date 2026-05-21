@@ -4,13 +4,12 @@ use core::mem::swap;
 use core::sync::atomic::fence;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::libs::rbtree::RBTree;
 use crate::libs::spinlock::SpinLock;
 use crate::process::ProcessControlBlock;
 use crate::process::ProcessFlags;
 use crate::sched::clock::ClockUpdataFlag;
-use crate::sched::{cpu_rq, SchedFeature, SCHED_FEATURES};
-use crate::smp::core::smp_get_processor_id;
+use crate::sched::fair_tree::FairTimeline;
+use crate::sched::{SchedFeature, SCHED_FEATURES};
 use crate::time::jiffies::TICK_NESC;
 use crate::time::timer::clock;
 use crate::time::NSEC_PER_MSEC;
@@ -318,8 +317,8 @@ pub struct CfsRunQueue {
     /// remain runtime
     runtime_remaining: u64,
 
-    /// 存放调度实体的红黑树
-    pub(super) entities: RBTree<u64, Arc<FairSchedEntity>>,
+    /// 按 vruntime 排序并维护子树最小 deadline 的 EEVDF timeline。
+    pub(super) entities: FairTimeline,
 
     /// IDLE
     idle: usize,
@@ -378,7 +377,7 @@ impl CfsRunQueue {
             h_nr_running: 0,
             exec_clock: 0,
             min_vruntime: 1 << 20,
-            entities: RBTree::new(),
+            entities: FairTimeline::default(),
             idle: 0,
             idle_nr_running: 0,
             idle_h_nr_running: 0,
@@ -515,26 +514,31 @@ impl CfsRunQueue {
 
     /// ## 在时间片到期时检查当前任务是否需要被抢占，
     /// 如果需要，则抢占当前任务，并确保不会由于与其他任务的“好友偏爱（buddy favours）”而重新选举为下一个运行的任务。
-    #[allow(dead_code)]
     pub fn check_preempt_tick(&mut self, curr: Arc<FairSchedEntity>) {
-        // 计算理想状态下该调度实体的理想运行时间
-        let ideal_runtime = self.sched_slice(curr.clone());
-
-        let delta_exec = curr.sum_exec_runtime - curr.prev_sum_exec_runtime;
-
-        if delta_exec > ideal_runtime {
-            // 表明实际运行时间长于理想运行时间
-            self.rq().resched_current();
-
-            self.clear_buddies(&curr);
-            return;
-        }
-
+        let delta_exec = curr
+            .sum_exec_runtime
+            .saturating_sub(curr.prev_sum_exec_runtime);
         if delta_exec < SYSCTL_SHCED_MIN_GRANULARITY.load(Ordering::SeqCst) {
             return;
         }
 
-        todo!()
+        if self.nr_running <= 1 {
+            // rseq critical sections need a bounded preempt notification even
+            // when the scheduler ultimately has no other CFS entity to select.
+            if curr.pcb().rseq_state().is_registered() {
+                self.rq().resched_current();
+            }
+            return;
+        }
+
+        let Some(next) = self.pick_eevdf_entity(Some(&curr)) else {
+            return;
+        };
+
+        if !Arc::ptr_eq(&next, &curr) {
+            self.rq().resched_current();
+            self.clear_buddies(&curr);
+        }
     }
 
     pub fn clear_buddies(&mut self, se: &Arc<FairSchedEntity>) {
@@ -559,6 +563,8 @@ impl CfsRunQueue {
             self.rq().resched_current();
             return;
         }
+
+        self.check_preempt_tick(curr);
     }
 
     /// 更新当前调度实体的运行时间统计信息
@@ -652,10 +658,7 @@ impl CfsRunQueue {
         }
 
         // 找到最小虚拟运行时间的调度实体
-        let leftmost = self.entities.get_first();
-        if let Some(leftmost) = leftmost {
-            let se = leftmost.1;
-
+        if let Some(se) = self.entities.leftmost() {
             if curr.is_none() {
                 vruntime = se.vruntime;
             } else {
@@ -1105,7 +1108,7 @@ impl CfsRunQueue {
 
         if se.is_task() {
             let rq = self.rq();
-            let (rq, _guard) = rq.self_lock();
+            let rq = rq.force_mut_locked();
             // TODO:numa
             rq.cfs_tasks.push_back(se.clone());
         }
@@ -1120,7 +1123,7 @@ impl CfsRunQueue {
 
         if se.is_task() {
             let rq = self.rq();
-            let (rq, _guard) = rq.self_lock();
+            let rq = rq.force_mut_locked();
 
             // TODO:numa
             let _ = rq.cfs_tasks.extract_if(|x| Arc::ptr_eq(x, se));
@@ -1134,8 +1137,7 @@ impl CfsRunQueue {
 
     pub fn inner_enqueue_entity(&mut self, se: &Arc<FairSchedEntity>) {
         self.avg_vruntime_add(se);
-        se.force_mut().min_deadline = se.deadline;
-        self.entities.insert(se.vruntime, se.clone());
+        self.entities.insert(se.clone());
         // warn!(
         //     "enqueue pcb {:?} cfsrq {:?}",
         //     se.pcb().pid(),
@@ -1179,16 +1181,7 @@ impl CfsRunQueue {
         //     .as_bytes(),
         // );
 
-        let mut i = 1;
-        while let Some(rm) = self.entities.remove(&se.vruntime) {
-            if Arc::ptr_eq(&rm, se) {
-                break;
-            }
-            rm.force_mut().vruntime += i;
-            self.entities.insert(rm.vruntime, rm);
-
-            i += 1;
-        }
+        self.entities.remove(se);
         // send_to_default_serial8250_port(
         //     format!(
         //         "after dequeue pcb {:?}(real: {:?}) cfsrq {:?}\n",
@@ -1342,15 +1335,27 @@ impl CfsRunQueue {
             .max((self.avg.load_avg * PELT_MIN_DIVIDER) as u64);
     }
 
+    fn pick_eevdf_entity(
+        &self,
+        curr: Option<&Arc<FairSchedEntity>>,
+    ) -> Option<Arc<FairSchedEntity>> {
+        self.entities
+            .pick_eevdf(curr.filter(|se| se.on_rq()), |se| self.entity_eligible(se))
+    }
+
     /// pick下一个运行的task
     pub fn pick_next_entity(&self) -> Option<Arc<FairSchedEntity>> {
-        if SCHED_FEATURES.contains(SchedFeature::NEXT_BUDDY)
-            && self.next().is_some()
-            && self.entity_eligible(&self.next().unwrap())
-        {
-            return self.next();
+        if SCHED_FEATURES.contains(SchedFeature::NEXT_BUDDY) {
+            if let Some(next) = self.next() {
+                if self.entity_eligible(&next) {
+                    return Some(next);
+                }
+            }
         }
-        self.entities.get_first().map(|val| val.1.clone())
+
+        let curr = self.current();
+        self.pick_eevdf_entity(curr.as_ref())
+            .or_else(|| self.entities.leftmost())
     }
 
     pub fn entity_eligible(&self, se: &Arc<FairSchedEntity>) -> bool {
@@ -1417,6 +1422,10 @@ impl Scheduler for CompletelyFairScheduler {
         mut flags: EnqueueFlag,
     ) {
         let mut se = pcb.sched_info().sched_entity();
+        debug_assert!(
+            Arc::ptr_eq(&se.cfs_rq(), &rq.cfs_rq()),
+            "enqueue: SE's cfs_rq must match target rq's cfs_rq"
+        );
         let mut idle_h_nr_running = pcb.sched_info().policy() == SchedPolicy::IDLE;
         let (should_continue, se) = FairSchedEntity::for_each_in_group(&mut se, |se| {
             if se.on_rq() {
@@ -1635,10 +1644,11 @@ impl Scheduler for CompletelyFairScheduler {
         }
 
         let cfs_rq = se.cfs_rq();
-        cfs_rq.force_mut().update_current();
+        let cfs_rq = cfs_rq.force_mut();
+        cfs_rq.update_current();
 
-        if let Some((_, pick_se)) = cfs_rq.entities.get_first() {
-            if Arc::ptr_eq(pick_se, &pse) {
+        if let Some(pick_se) = cfs_rq.pick_eevdf_entity(Some(&se)) {
+            if Arc::ptr_eq(&pick_se, &pse) {
                 rq.resched_current();
                 return;
             }
@@ -1694,15 +1704,15 @@ impl Scheduler for CompletelyFairScheduler {
     }
 
     fn task_fork(pcb: Arc<ProcessControlBlock>) {
-        let rq = cpu_rq(smp_get_processor_id().data() as usize);
         let se = pcb.sched_info().sched_entity();
+        let cfs_rq = se.cfs_rq();
+        let rq = cfs_rq.rq();
 
         let (rq, _guard) = rq.self_lock();
 
         rq.update_rq_clock();
 
-        let binding = se.cfs_rq();
-        let cfs_rq = binding.force_mut();
+        let cfs_rq = cfs_rq.force_mut();
 
         if cfs_rq.current().is_some() {
             cfs_rq.update_current();
@@ -1713,51 +1723,16 @@ impl Scheduler for CompletelyFairScheduler {
 
     fn pick_next_task(
         rq: &mut CpuRunQueue,
-        prev: Option<Arc<ProcessControlBlock>>,
+        _prev: Option<Arc<ProcessControlBlock>>,
     ) -> Option<Arc<ProcessControlBlock>> {
         let mut cfs_rq = rq.cfs_rq();
         if rq.nr_running == 0 {
             return None;
         }
 
-        let prev_cfs_valid = if let Some(p) = &prev {
-            if p.sched_info().policy() == SchedPolicy::CFS {
-                // Check if prev is still running (not blocked)
-                let state = p.sched_info().inner_lock_read_irqsave().state();
-                state.is_runnable()
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
         loop {
             let curr = cfs_rq.current();
-            let next = cfs_rq.pick_next_entity();
-
-            // Determine winner between curr (if valid) and next (from tree)
-            let winner = if let Some(c) = curr.clone() {
-                // If curr is valid (prev is running CFS), we compare.
-                // Note: c is an ancestor of prev.
-                if prev_cfs_valid {
-                    if let Some(n) = &next {
-                        // Simple vruntime comparison
-                        if n.vruntime < c.vruntime {
-                            n.clone()
-                        } else {
-                            c
-                        }
-                    } else {
-                        c
-                    }
-                } else {
-                    // curr is invalid (blocked or not CFS), must pick next
-                    next?
-                }
-            } else {
-                next?
-            };
+            let winner = cfs_rq.pick_next_entity()?;
 
             // If winner is curr, descend into curr's group
             if let Some(c) = curr {

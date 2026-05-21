@@ -25,7 +25,7 @@ impl Syscall for SysGetGroups {
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let pcb = ProcessManager::current_pcb();
-        let cred = pcb.cred.lock();
+        let cred = pcb.cred();
         let size = args[0];
         if size == 0 {
             return Ok(cred.getgroups().len());
@@ -71,17 +71,23 @@ impl Syscall for SysSetGroups {
         let pcb = ProcessManager::current_pcb();
 
         // Linux: requires CAP_SETGID in the current user namespace.
-        // For now we treat "root" or CAP_SETGID in effective set as privileged.
         let current_cred = pcb.cred();
-        if current_cred.euid.data() != 0 && !current_cred.has_capability(CAPFlags::CAP_SETGID) {
+        let user_ns = current_cred.user_ns.clone();
+        if !crate::process::cred::ns_capable_setid(&user_ns, CAPFlags::CAP_SETGID) {
             return Err(SystemError::EPERM);
         }
 
-        let mut cred = (**pcb.cred.lock()).clone();
+        // 在 user namespace 中，setgroups 还受 gid_map 和 setgroups flag 限制
+        if !crate::process::namespace::user_namespace::userns_may_setgroups(&user_ns) {
+            return Err(SystemError::EPERM);
+        }
+
+        let mut cred = (*pcb.cred()).clone();
         let size = args[0];
         if size == 0 {
             // clear all supplementary groups
             cred.setgroups(Vec::new());
+            pcb.set_cred(Cred::new_arc(cred))?;
             return Ok(0);
         }
         if size > NGROUPS_MAX {
@@ -106,7 +112,7 @@ impl Syscall for SysSetGroups {
             .map(|g| Kgid::from(g as usize))
             .collect();
         cred.setgroups(groups);
-        *pcb.cred.lock() = Cred::new_arc(cred);
+        pcb.set_cred(Cred::new_arc(cred))?;
         Ok(0)
     }
 

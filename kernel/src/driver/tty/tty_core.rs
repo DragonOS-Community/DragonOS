@@ -10,6 +10,7 @@ use alloc::{
 use system_error::SystemError;
 
 use crate::{
+    arch::ipc::signal::Signal,
     driver::{base::device::device_number::DeviceNumber, tty::pty::ptm_driver},
     filesystem::epoll::{event_poll::LockedEPItemLinkedList, EPollEventType, EPollItem},
     libs::{
@@ -206,6 +207,34 @@ impl TtyCore {
                 return Err(SystemError::ENOIOCTLCMD);
             }
         }
+    }
+
+    pub fn tty_perform_flush(tty: Arc<TtyCore>, arg: usize) -> Result<usize, SystemError> {
+        TtyJobCtrlManager::tty_check_change(tty.clone(), Signal::SIGTTOU)?;
+
+        match arg {
+            TtyFlushArg::TCIFLUSH => {
+                tty.ldisc().flush_buffer(tty.clone())?;
+            }
+            TtyFlushArg::TCIOFLUSH => {
+                tty.ldisc().flush_buffer(tty.clone())?;
+                let ret = tty.core().driver().driver_funcs().flush_buffer(tty.core());
+                if ret != Err(SystemError::ENOSYS) {
+                    ret?;
+                }
+            }
+            TtyFlushArg::TCOFLUSH => {
+                let ret = tty.core().driver().driver_funcs().flush_buffer(tty.core());
+                if ret != Err(SystemError::ENOSYS) {
+                    ret?;
+                }
+            }
+            _ => {
+                return Err(SystemError::EINVAL);
+            }
+        }
+
+        Ok(0)
     }
 
     pub fn core_set_termios(
@@ -844,4 +873,16 @@ impl TtyIoctlCmd {
     pub const TIOCGPKT: u32 = 0x80045438;
     /// 获取pts index
     pub const TIOCGPTN: u32 = 0x80045430;
+}
+
+pub struct TtyFlushArg;
+
+#[allow(dead_code)]
+impl TtyFlushArg {
+    /// 丢弃已收到但尚未读取的数据
+    pub const TCIFLUSH: usize = 0;
+    /// 丢弃已写入但尚未发送的数据
+    pub const TCOFLUSH: usize = 1;
+    /// 丢弃所有待处理输入和输出数据
+    pub const TCIOFLUSH: usize = 2;
 }

@@ -14,10 +14,13 @@ use crate::{
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
 
+mod cgroup;
 mod cmdline;
 mod exe;
 mod fd;
 mod fdinfo;
+mod id_map;
+mod limits;
 mod maps;
 mod mountinfo;
 mod mounts;
@@ -28,10 +31,13 @@ mod statm;
 mod status;
 mod task;
 
+use cgroup::CgroupFileOps;
 use cmdline::CmdlineFileOps;
 use exe::ExeSymOps;
 use fd::FdDirOps;
 use fdinfo::FdInfoDirOps;
+use id_map::{IdMapFileOps, SetgroupsFileOps};
+use limits::LimitsFile;
 use maps::MapsFileOps;
 use mountinfo::MountInfoFileOps;
 use mounts::PidMountsFileOps;
@@ -77,8 +83,14 @@ impl PidDirOps {
         ("cmdline", |ops, parent| {
             CmdlineFileOps::new_inode(ops.pid, parent)
         }),
+        ("cgroup", |ops, parent| {
+            CgroupFileOps::new_inode(ops.pid, parent)
+        }),
         ("maps", |ops, parent| {
             MapsFileOps::new_inode(ops.pid, parent)
+        }),
+        ("limits", |ops, parent| {
+            LimitsFile::new_inode(ops.pid, parent)
         }),
         ("mountinfo", |ops, parent| {
             MountInfoFileOps::new_inode(ops.pid, parent)
@@ -98,6 +110,15 @@ impl PidDirOps {
         }),
         ("status", |ops, parent| {
             StatusFileOps::new_inode(ops.pid, parent)
+        }),
+        ("uid_map", |ops, parent| {
+            IdMapFileOps::new_uid_inode(ops.pid, parent)
+        }),
+        ("gid_map", |ops, parent| {
+            IdMapFileOps::new_gid_inode(ops.pid, parent)
+        }),
+        ("setgroups", |ops, parent| {
+            SetgroupsFileOps::new_inode(ops.pid, parent)
         }),
         ("task", |ops, parent| TaskDirOps::new_inode(ops.pid, parent)),
         ("exe", |ops, parent| ExeSymOps::new_inode(ops.pid, parent)),

@@ -18,9 +18,11 @@ impl ProcessManager {
                 __schedule(SchedMode::SM_NONE);
             }
             if CurrentIrqArch::is_irq_enabled() {
+                crate::rcu::enter_idle();
                 unsafe {
                     x86::halt();
                 }
+                crate::rcu::exit_idle();
             } else {
                 error!("Idle process should not be scheduled with IRQs disabled.");
                 spin_loop();

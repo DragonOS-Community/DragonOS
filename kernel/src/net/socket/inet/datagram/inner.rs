@@ -622,10 +622,17 @@ impl BoundUdp {
             return Err(SystemError::EINVAL);
         }
 
-        // Linux treats sending to 0.0.0.0 (INADDR_ANY) as sending to localhost
-        // smoltcp rejects it as "Unaddressable", so we translate it here
+        // Linux treats an unspecified UDP destination as loopback for the same
+        // address family. Keep the destination family unchanged before passing
+        // it to smoltcp; mixing an IPv6 local endpoint with 127.0.0.1 would
+        // violate smoltcp's IP version invariant and panic.
         if remote.addr.is_unspecified() {
-            remote.addr = smoltcp::wire::IpAddress::v4(127, 0, 0, 1);
+            remote.addr = match remote.addr {
+                smoltcp::wire::IpAddress::Ipv4(_) => smoltcp::wire::IpAddress::v4(127, 0, 0, 1),
+                smoltcp::wire::IpAddress::Ipv6(_) => {
+                    smoltcp::wire::IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 1)
+                }
+            };
         }
 
         // log::debug!(

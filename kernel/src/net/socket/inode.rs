@@ -437,11 +437,7 @@ impl<T: Socket + 'static> PollableInode for T {
         return Ok(());
     }
 
-    fn add_fasync(
-        &self,
-        fasync_item: Arc<FAsyncItem>,
-        _: &FilePrivateData,
-    ) -> Result<(), SystemError> {
+    fn add_fasync(&self, fasync_item: FAsyncItem, _: &FilePrivateData) -> Result<(), SystemError> {
         self.fasync_items().add(fasync_item);
         Ok(())
     }

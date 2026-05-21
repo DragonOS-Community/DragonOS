@@ -3,7 +3,8 @@ use system_error::SystemError;
 use crate::arch::{mm::PageMapper, MMArch};
 
 use super::{
-    page::Flusher, syscall::MadvFlags, ucontext::LockedVMA, MemoryManagementArch, VirtAddr, VmFlags,
+    mmu_gather::MmuGather, syscall::MadvFlags, ucontext::LockedVMA, MemoryManagementArch, VirtAddr,
+    VmFlags,
 };
 
 impl LockedVMA {
@@ -11,13 +12,19 @@ impl LockedVMA {
         &self,
         behavior: MadvFlags,
         mapper: &mut PageMapper,
-        mut flusher: impl Flusher<MMArch>,
+        tlb: &mut MmuGather<'_>,
     ) -> Result<(), SystemError> {
         //TODO https://code.dragonos.org.cn/xref/linux-6.6.21/mm/madvise.c?fi=madvise#do_madvise
         let mut vma = self.lock();
         let mut new_flags = *vma.vm_flags();
         match behavior {
             MadvFlags::MADV_DONTNEED | MadvFlags::MADV_DONTNEED_LOCKED => {
+                if behavior == MadvFlags::MADV_DONTNEED
+                    && vma.vm_flags().contains(VmFlags::VM_LOCKED)
+                {
+                    return Err(SystemError::EINVAL);
+                }
+
                 // MADV_DONTNEED: 释放指定范围内的页面
                 // 这是glibc在pthread_create时用来管理线程栈的关键操作
                 // 参考: https://code.dragonos.org.cn/xref/linux-6.6.21/mm/madvise.c#madvise_dontneed_single_vma
@@ -32,12 +39,16 @@ impl LockedVMA {
 
                 while current_page < end_page {
                     let virt_addr = VirtAddr::new(current_page.data());
-                    if let Some((_phys_addr, _)) = mapper.translate(virt_addr) {
+                    if let Some((_paddr, _)) = mapper.translate(virt_addr) {
                         // 只有当页面已经映射时才需要解除映射
                         unsafe {
                             if let Some((_, _, flush)) = mapper.unmap_phys(virt_addr, false) {
-                                // 刷新TLB
-                                flusher.consume(flush);
+                                // Local PTE cleared; actual TLB invalidation is performed uniformly by MmuGather.
+                                // Note: the current implementation does not reclaim physical pages (keeping legacy
+                                // behavior). To support real reclamation of anon pages in the future, call
+                                // `tlb.stash_paddr(_paddr)` here.
+                                flush.ignore();
+                                tlb.accumulate_range(virt_addr);
                             }
                         }
                     }

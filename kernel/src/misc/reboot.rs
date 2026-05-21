@@ -1,15 +1,15 @@
-use alloc::{string::String, sync::Arc};
-use core::hint::spin_loop;
+use alloc::{string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
 use crate::{
-    arch::reboot::{machine_halt, machine_restart},
+    arch::reboot::{machine_halt, machine_power_off, machine_restart, migrate_to_reboot_cpu},
     driver::base::device::device_shutdown,
     init::initial_kthread::{set_system_state, SystemState},
     libs::{
         mutex::Mutex,
         notifier::{BlockingNotifierChain, NotifierBlock},
     },
+    misc::syscore::syscore_shutdown,
     syscall::user_access::check_and_clone_cstr,
 };
 
@@ -36,6 +36,66 @@ lazy_static! {
     /// 注册此通知链的回调函数通常是与硬件相关的重启准备处理程序
     static ref POWER_OFF_PREP_HANDLER_LIST: Mutex<BlockingNotifierChain<RebootNotifyEvent, String>> =
         Mutex::new(BlockingNotifierChain::new());
+}
+lazy_static! {
+    static ref POWER_OFF_HANDLER_LIST: Mutex<Vec<Arc<dyn PowerOffHandler>>> =
+        Mutex::new(Vec::new());
+}
+
+pub trait PowerOffHandler: Send + Sync {
+    fn name(&self) -> &'static str;
+
+    fn priority(&self) -> i32 {
+        0
+    }
+
+    fn prepare(&self) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    /// 成功的关机通常不会返回；如果返回，调用方会将其视为失败并继续尝试后备路径。
+    fn power_off(&self) -> Result<(), SystemError>;
+}
+
+pub fn register_power_off_handler(handler: Arc<dyn PowerOffHandler>) -> Result<(), SystemError> {
+    let mut handlers = POWER_OFF_HANDLER_LIST.lock();
+
+    if handlers
+        .iter()
+        .any(|existing| Arc::ptr_eq(existing, &handler))
+    {
+        return Err(SystemError::EEXIST);
+    }
+
+    let mut index = 0;
+    for existing in handlers.iter() {
+        if handler.priority() > existing.priority() {
+            break;
+        }
+        index += 1;
+    }
+
+    handlers.insert(index, handler);
+    return Ok(());
+}
+
+#[allow(dead_code)]
+pub fn unregister_power_off_handler(handler: &Arc<dyn PowerOffHandler>) -> Result<(), SystemError> {
+    let mut handlers = POWER_OFF_HANDLER_LIST.lock();
+    let index = handlers
+        .iter()
+        .position(|existing| Arc::ptr_eq(existing, handler))
+        .ok_or(SystemError::ENOENT)?;
+    handlers.remove(index);
+    return Ok(());
+}
+
+pub fn kernel_can_power_off() -> bool {
+    return !POWER_OFF_HANDLER_LIST.lock().is_empty();
+}
+
+fn power_off_handlers_snapshot() -> Vec<Arc<dyn PowerOffHandler>> {
+    POWER_OFF_HANDLER_LIST.lock().clone()
 }
 
 /// # 功能
@@ -195,6 +255,8 @@ pub(super) fn do_sys_reboot(
 pub fn kernel_restart(cmd: Option<&str>) -> ! {
     kernel_restart_prepare(cmd);
     do_kernel_restart_prepare();
+    migrate_to_reboot_cpu();
+    syscore_shutdown();
 
     if let Some(cmd) = cmd {
         log::warn!("Restarting system with command: '{}'", cmd);
@@ -235,12 +297,12 @@ fn do_kernel_restart_prepare() {
 pub fn kernel_power_off() -> ! {
     kernel_shutdown_prepare(SystemState::PowerOff);
     do_kernel_power_off_prepare();
+    do_power_off_handlers_prepare();
+    migrate_to_reboot_cpu();
+    syscore_shutdown();
 
     log::warn!("Power down");
-    log::warn!("Currently, the system cannot be powered off, so we halt here.");
-    loop {
-        spin_loop();
-    }
+    machine_power_off();
 }
 
 /// # 功能
@@ -267,6 +329,54 @@ fn do_kernel_power_off_prepare() {
         .call_chain(RebootNotifyEvent::PowerOff, None, None);
 }
 
+fn do_power_off_handlers_prepare() {
+    if !kernel_can_power_off() {
+        log::warn!("kernel_power_off: no power-off handler is registered");
+        return;
+    }
+
+    let handlers = power_off_handlers_snapshot();
+    for handler in handlers {
+        if let Err(e) = handler.prepare() {
+            log::warn!(
+                "kernel_power_off: power-off handler '{}' prepare failed: {:?}",
+                handler.name(),
+                e
+            );
+        }
+    }
+}
+
+pub fn do_machine_power_off() -> Result<(), SystemError> {
+    let handlers = power_off_handlers_snapshot();
+    if handlers.is_empty() {
+        return Err(SystemError::ENODEV);
+    }
+
+    let mut last_error = SystemError::ENODEV;
+    for handler in handlers {
+        match handler.power_off() {
+            Ok(()) => {
+                log::warn!(
+                    "machine_power_off: power-off handler '{}' returned without powering off",
+                    handler.name()
+                );
+                last_error = SystemError::EIO;
+            }
+            Err(e) => {
+                log::warn!(
+                    "machine_power_off: power-off handler '{}' failed: {:?}",
+                    handler.name(),
+                    e
+                );
+                last_error = e;
+            }
+        }
+    }
+
+    return Err(last_error);
+}
+
 /// # 功能
 ///
 /// 执行内核停止操作
@@ -274,6 +384,8 @@ fn do_kernel_power_off_prepare() {
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/reboot.c#293
 pub fn kernel_halt() -> ! {
     kernel_shutdown_prepare(SystemState::Halt);
+    migrate_to_reboot_cpu();
+    syscore_shutdown();
 
     machine_halt();
 }

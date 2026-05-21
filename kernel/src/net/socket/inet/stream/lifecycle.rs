@@ -1,6 +1,9 @@
 use crate::net::socket::common::ShutdownBit;
 use crate::net::socket::inet::InetSocket;
 use crate::net::socket::inet::Types;
+use crate::net::tcp_close_defer::{
+    DeferredTcpCloseKind, DeferredTcpCloseReason, DeferredTcpCloseRequest,
+};
 use alloc::sync::Arc;
 use system_error::SystemError;
 
@@ -8,7 +11,99 @@ use super::inner;
 use super::poll_util;
 use super::TcpSocket;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CloseObservation {
+    state: smoltcp::socket::tcp::State,
+    unread: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CloseAction {
+    kind: DeferredTcpCloseKind,
+    reason: DeferredTcpCloseReason,
+    abort_on_post_close_data: bool,
+}
+
 impl TcpSocket {
+    #[inline]
+    fn observe_established_close(established: &inner::Established) -> CloseObservation {
+        established.with(|socket| CloseObservation {
+            state: socket.state(),
+            unread: socket.recv_queue(),
+        })
+    }
+
+    fn decide_established_close(&self, established: &inner::Established) -> CloseAction {
+        let observation = Self::observe_established_close(established);
+
+        if observation.unread > 0 {
+            return CloseAction {
+                kind: DeferredTcpCloseKind::Reset,
+                reason: DeferredTcpCloseReason::UnreadDataOnClose,
+                abort_on_post_close_data: false,
+            };
+        }
+
+        if self.should_abort_established_zero_linger(observation.state) {
+            return CloseAction {
+                kind: DeferredTcpCloseKind::Reset,
+                reason: DeferredTcpCloseReason::ZeroLinger,
+                abort_on_post_close_data: false,
+            };
+        }
+
+        let abort_on_post_close_data = matches!(
+            observation.state,
+            smoltcp::socket::tcp::State::Established | smoltcp::socket::tcp::State::SynReceived
+        );
+
+        CloseAction {
+            kind: DeferredTcpCloseKind::GracefulFin,
+            reason: DeferredTcpCloseReason::NormalClose,
+            abort_on_post_close_data,
+        }
+    }
+
+    #[inline]
+    fn is_zero_linger_close(&self) -> bool {
+        self.linger_onoff()
+            .load(core::sync::atomic::Ordering::Relaxed)
+            != 0
+            && self
+                .linger_linger()
+                .load(core::sync::atomic::Ordering::Relaxed)
+                == 0
+    }
+
+    #[inline]
+    fn should_abort_established_zero_linger(&self, state: smoltcp::socket::tcp::State) -> bool {
+        if !self.is_zero_linger_close() {
+            return false;
+        }
+
+        matches!(
+            state,
+            smoltcp::socket::tcp::State::SynReceived
+                | smoltcp::socket::tcp::State::Established
+                | smoltcp::socket::tcp::State::CloseWait
+                | smoltcp::socket::tcp::State::FinWait1
+                | smoltcp::socket::tcp::State::FinWait2
+        )
+    }
+
+    #[inline]
+    fn apply_close_action(socket: &mut smoltcp::socket::tcp::Socket, action: CloseAction) {
+        match action.kind {
+            DeferredTcpCloseKind::Reset => socket.abort(),
+            DeferredTcpCloseKind::GracefulFin => {
+                if action.abort_on_post_close_data {
+                    socket.shutdown_recv();
+                }
+                socket.close();
+            }
+        }
+    }
+
     pub fn do_bind(&self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
         let mut writer = self.inner.write();
         match writer.take().expect("Tcp inner::Inner is None") {
@@ -382,31 +477,50 @@ impl TcpSocket {
                 }
             }
             inner::Inner::Connecting(connecting) => {
-                if how.contains(ShutdownBit::SHUT_RD) {
-                    connecting.with_mut(|socket| {
-                        socket.abort();
-                    });
+                if connecting.is_transport_established() {
+                    let established = unsafe { connecting.into_established() };
+
+                    if how.contains(ShutdownBit::SHUT_RD) {
+                        let queued = established.with(|socket| socket.recv_queue());
+                        self.recv_shutdown.init(queued);
+                    }
+
+                    if how.contains(ShutdownBit::SHUT_WR) {
+                        let pending = established.with(|socket| socket.send_queue());
+                        if pending > 0 {
+                            self.send_fin_deferred
+                                .store(true, core::sync::atomic::Ordering::Relaxed);
+                        } else if self
+                            .send_fin_deferred
+                            .load(core::sync::atomic::Ordering::Relaxed)
+                        {
+                            // FIN will be sent once deferred bytes are fully flushed.
+                        } else {
+                            established.with_mut(|socket| socket.close());
+                        }
+                        post_poll_rounds = core::cmp::max(post_poll_rounds, 8);
+                        post_poll_iface = Some(established.iface().clone());
+                    }
+
+                    (inner::Inner::Established(established), how)
+                } else {
+                    connecting.set_shutdown_reset();
+                    connecting.with_mut(|socket| socket.abort());
                     post_poll_rounds = core::cmp::max(post_poll_rounds, 128);
                     post_poll_iface = Some(connecting.iface().clone());
-                }
 
-                if how.contains(ShutdownBit::SHUT_WR) {
-                    connecting.with_mut(|socket| socket.close());
-                    post_poll_rounds = core::cmp::max(post_poll_rounds, 8);
-                    post_poll_iface = Some(connecting.iface().clone());
+                    // For still-connecting sockets, only SHUT_WR is meaningful for
+                    // user-visible send() behavior (EPIPE). Recording SHUT_RD would
+                    // incorrectly make recv() return EOF on an unconnected stream socket.
+                    (
+                        inner::Inner::Connecting(connecting),
+                        if how.contains(ShutdownBit::SHUT_WR) {
+                            ShutdownBit::SHUT_WR
+                        } else {
+                            ShutdownBit::from_bits_truncate(0)
+                        },
+                    )
                 }
-
-                // For Connecting sockets, only SHUT_WR is meaningful for user-visible
-                // send() behavior (EPIPE). Recording SHUT_RD would incorrectly make
-                // recv() return EOF on an unconnected stream socket.
-                (
-                    inner::Inner::Connecting(connecting),
-                    if how.contains(ShutdownBit::SHUT_WR) {
-                        ShutdownBit::SHUT_WR
-                    } else {
-                        ShutdownBit::from_bits_truncate(0)
-                    },
-                )
             }
             inner::Inner::SelfConnected(sc) => {
                 // SelfConnected: shutdown affects only the user-visible data path.
@@ -506,17 +620,29 @@ impl TcpSocket {
                     conn.consume_error();
                     let (new_inner, _) = conn.into_result();
                     writer.replace(new_inner);
+                } else if conn.is_refused_consumed() {
+                    let (new_inner, _) = conn.into_result();
+                    writer.replace(new_inner);
                 } else {
                     let conn = unsafe { conn.into_established() };
                     let handle = conn.handle();
                     let local_port = conn.get_name().port;
                     let iface = conn.iface().clone();
                     let me: alloc::sync::Weak<dyn InetSocket> = self.self_ref.clone();
-                    conn.with_mut(|socket| socket.close());
+                    conn.with_mut(|socket| socket.abort());
+                    let initial_state = conn.with(|socket| socket.state());
                     if conn.owns_port() {
                         iface.port_manager().unbind_port(Types::Tcp, local_port);
                     }
-                    iface.common().defer_tcp_close(handle, local_port, me);
+                    iface.common().defer_tcp_close(DeferredTcpCloseRequest {
+                        handle,
+                        local_port,
+                        sock: me,
+                        initial_state,
+                        kind: DeferredTcpCloseKind::Reset,
+                        reason: DeferredTcpCloseReason::ConnectingClose,
+                        abort_on_post_close_data: false,
+                    });
                     post_poll_iface = Some(iface);
                     writer.replace(inner::Inner::Established(conn));
                 }
@@ -526,24 +652,21 @@ impl TcpSocket {
                 let local_port = es.get_name().port;
                 let iface = es.iface().clone();
                 let me: alloc::sync::Weak<dyn InetSocket> = self.self_ref.clone();
-                let linger_abort = self
-                    .linger_onoff()
-                    .load(core::sync::atomic::Ordering::Relaxed)
-                    != 0
-                    && self
-                        .linger_linger()
-                        .load(core::sync::atomic::Ordering::Relaxed)
-                        == 0;
-                let unread = es.with(|socket| socket.recv_queue());
-                if linger_abort || unread > 0 {
-                    es.with_mut(|socket| socket.abort());
-                } else {
-                    es.with_mut(|socket| socket.close());
-                }
+                let close_action = self.decide_established_close(&es);
+                es.with_mut(|socket| Self::apply_close_action(socket, close_action));
+                let initial_state = es.with(|socket| socket.state());
                 if es.owns_port() {
                     iface.port_manager().unbind_port(Types::Tcp, local_port);
                 }
-                iface.common().defer_tcp_close(handle, local_port, me);
+                iface.common().defer_tcp_close(DeferredTcpCloseRequest {
+                    handle,
+                    local_port,
+                    sock: me,
+                    initial_state,
+                    kind: close_action.kind,
+                    reason: close_action.reason,
+                    abort_on_post_close_data: close_action.abort_on_post_close_data,
+                });
                 post_poll_iface = Some(iface);
                 writer.replace(inner::Inner::Established(es));
             }

@@ -97,22 +97,30 @@ pub fn do_umount2(
     let target_inode = work.lookup_follow_symlink(&rest, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
     let path = visible_umount_path(&target_inode)?;
 
-    let result = ProcessManager::current_mntns().remove_mount(&path);
-    if let Some(fs) = result {
-        // Todo: 占用检测
-        if let Err(err) = fs.umount() {
-            log::warn!(
-                "do_umount2: fs.umount failed for resolved='{}', fs='{}': {:?}",
-                path,
-                fs.name(),
-                err
-            );
-            return Err(err);
-        }
-        return Ok(fs);
+    let current_mntns = ProcessManager::current_mntns();
+    let Some(fs) = current_mntns.mount_list().get(path.as_str()) else {
+        log::warn!("do_umount2: mount_list miss for resolved='{}'", path);
+        return Err(SystemError::EINVAL);
+    };
+    if !fs.is_belongs_to_mntns(&current_mntns) {
+        return Err(SystemError::EINVAL);
     }
-    log::warn!("do_umount2: mount_list miss for resolved='{}'", path);
-    return Err(SystemError::EINVAL);
+
+    // 检查通过后再实际移除
+    let Some(fs) = current_mntns.remove_mount(&path) else {
+        log::warn!("do_umount2: mount_list race for resolved='{}'", path);
+        return Err(SystemError::EINVAL);
+    };
+    if let Err(err) = fs.umount() {
+        log::warn!(
+            "do_umount2: fs.umount failed for resolved='{}', fs='{}': {:?}",
+            path,
+            fs.name(),
+            err
+        );
+        return Err(err);
+    }
+    Ok(fs)
 }
 
 fn visible_umount_path(target_inode: &Arc<dyn IndexNode>) -> Result<String, SystemError> {

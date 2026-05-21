@@ -183,6 +183,10 @@ impl UtsNamespace {
         }
     }
 
+    pub fn user_ns(&self) -> &Arc<UserNamespace> {
+        &self._user_ns
+    }
+
     pub fn set_hostname(&self, hostname: &[u8]) -> Result<(), SystemError> {
         // 验证长度
         if !NewUtsName::validate_len(hostname.len()) {
@@ -238,7 +242,7 @@ impl<'a> Deref for ReadOnlyUtsNameWrapper<'a> {
 impl ProcessManager {
     pub fn current_utsns() -> Arc<UtsNamespace> {
         if Self::initialized() {
-            ProcessManager::current_pcb().nsproxy.read().uts_ns.clone()
+            ProcessManager::current_pcb().nsproxy().uts_ns.clone()
         } else {
             INIT_UTS_NAMESPACE.clone()
         }

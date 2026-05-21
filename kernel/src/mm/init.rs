@@ -60,6 +60,8 @@ pub unsafe fn mm_init() {
     page_manager_init();
     // enable PAGE_RECLAIMER
     page_reclaimer_init();
+    // init per-CPU TLB state / CSD slots
+    crate::mm::tlb::tlb_init();
 
     MM_INIT
         .compare_exchange(

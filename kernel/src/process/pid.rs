@@ -99,7 +99,7 @@ impl Pid {
     }
 
     pub fn first_upid(&self) -> Option<UPid> {
-        self.numbers.lock().first().cloned().unwrap()
+        self.numbers.lock().first().cloned().flatten()
     }
 
     pub fn tasks_iter(&self, pid_type: PidType) -> PidTaskIterator<'_> {

@@ -1161,6 +1161,11 @@ impl LongDirEntry {
         fs: Arc<FATFileSystem>,
         gendisk_bytes_offset: u64,
     ) -> Result<(), SystemError> {
+        // 目录项扇区 RMW 必须串行化，否则与并发的短/长目录项 flush 交错时，
+        // 后写入者会以自己先前读到的旧扇区覆盖对方的新目录项。详见
+        // `FATFileSystem::dirent_io_lock` 的注释。
+        let _dirent_guard = fs.lock_dirent_io();
+
         // 从磁盘读取数据
         let blk_offset = fs.get_in_block_offset(gendisk_bytes_offset);
         let lba = fs.gendisk_lba_from_offset(fs.bytes_to_sector(gendisk_bytes_offset));
@@ -1374,6 +1379,12 @@ impl ShortDirEntry {
         fs: &Arc<FATFileSystem>,
         gendisk_bytes_offset: u64,
     ) -> Result<(), SystemError> {
+        // 目录项扇区 RMW 必须串行化。典型 race：`FATFile::ensure_len` 触发的 pagecache
+        // 异步回写在扇区 S 上做 RMW；同时主线程在同扇区 S 里新建文件写入长/短目录项。
+        // 若不加锁，后写入者会用自己 read 阶段读到的旧扇区覆盖对方的新目录项，
+        // 导致新建的文件立刻“消失”，后续 `find` 返回 `ENOENT`。
+        let _dirent_guard = fs.lock_dirent_io();
+
         // 从磁盘读取数据
         let blk_offset = fs.get_in_block_offset(gendisk_bytes_offset);
         let lba = fs.gendisk_lba_from_offset(fs.bytes_to_sector(gendisk_bytes_offset));

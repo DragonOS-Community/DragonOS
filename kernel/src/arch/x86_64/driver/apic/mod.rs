@@ -1,7 +1,4 @@
-use core::{
-    ptr::{read_volatile, write_volatile},
-    sync::atomic::Ordering,
-};
+use core::sync::atomic::Ordering;
 
 use atomic_enum::atomic_enum;
 use log::{debug, info};
@@ -18,7 +15,7 @@ use crate::{
         io::PortIOArch,
         CurrentPortIOArch,
     },
-    mm::{early_ioremap::EarlyIoRemap, PhysAddr},
+    mm::PhysAddr,
     smp::core::smp_get_processor_id,
 };
 
@@ -41,8 +38,6 @@ const APIC_SPIV: u32 = 0xF0;
 // 参考：https://code.dragonos.org.cn/xref/linux-6.1.9/tools/testing/selftests/kvm/include/x86_64/apic.h#35
 const APIC_SPIV_APIC_ENABLED: u32 = 1 << 8;
 const APIC_BASE_MSR: u32 = 0x800;
-// 参考: https://elixir.bootlin.com/linux/v6.6/source/arch/x86/include/asm/fixmap.h#L95
-const FIX_APIC_BASE: usize = 0x2;
 
 /// 当前启用的APIC类型
 #[atomic_enum]
@@ -537,6 +532,10 @@ impl CurrentApic {
 
     fn apic_soft_disable(&mut self) {
         debug!("apic soft disable");
+        if !apic_accessible() {
+            return;
+        }
+
         self.clear_local_apic();
 
         // 软禁用APIC（意味着清除 82489DX 寄存器）
@@ -548,6 +547,10 @@ impl CurrentApic {
     /// 确保Local APIC的状态没有残留信息
     fn clear_local_apic(&mut self) {
         debug!("clear local apic");
+        if !apic_accessible() {
+            return;
+        }
+
         // 获取Local APIC的最多支持的LVT项数量
         let max_lvt = self.max_lvt_entry();
         let mut lvt;
@@ -753,16 +756,25 @@ impl LocalAPIC for CurrentApic {
 }
 
 #[inline(always)]
+fn apic_accessible() -> bool {
+    if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
+        true
+    } else {
+        current_xapic_instance().borrow().is_some()
+    }
+}
+
+#[inline(always)]
 fn apic_read(reg: u32) -> u32 {
     if LOCAL_APIC_ENABLE_TYPE.load(Ordering::SeqCst) == LocalApicEnableType::X2Apic {
         return unsafe { rdmsr(APIC_BASE_MSR + (reg >> 4)) as u32 };
-    } else {
-        return unsafe {
-            read_volatile(
-                (EarlyIoRemap::idx_to_virt(FIX_APIC_BASE).data() + reg as usize) as *const u32,
-            ) as u32
-        };
     }
+
+    current_xapic_instance()
+        .borrow()
+        .as_ref()
+        .map(|xapic| unsafe { xapic.read_offset(reg) })
+        .unwrap_or(0)
 }
 
 #[inline(always)]
@@ -771,12 +783,7 @@ fn apic_write(reg: u32, value: u32) {
         unsafe {
             wrmsr(APIC_BASE_MSR + (reg >> 4), value as u64);
         };
-    } else {
-        unsafe {
-            write_volatile(
-                (EarlyIoRemap::idx_to_virt(FIX_APIC_BASE).data() + reg as usize) as *mut u32,
-                value,
-            );
-        }
+    } else if let Some(xapic) = current_xapic_instance().borrow().as_ref() {
+        unsafe { xapic.write_offset(reg, value) };
     }
 }

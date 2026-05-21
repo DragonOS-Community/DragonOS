@@ -120,8 +120,7 @@ impl SysFS {
         kobj.set_inode(None);
 
         if let Some(inode) = kobj_inode {
-            let parent = inode.parent().unwrap();
-            parent.remove_recursive()
+            inode.remove_inode_include_self()
         }
     }
 }

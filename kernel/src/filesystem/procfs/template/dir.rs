@@ -230,7 +230,7 @@ impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
     }
 
     fn link(&self, _name: &str, _other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
-        todo!("procfs dir link not implemented");
+        Err(SystemError::EPERM)
     }
 }
 

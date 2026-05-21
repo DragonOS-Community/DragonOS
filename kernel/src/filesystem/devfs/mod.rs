@@ -1,4 +1,5 @@
 /// 导出devfs的模块
+pub mod full_dev;
 pub mod null_dev;
 pub mod random_dev;
 pub mod zero_dev;
@@ -10,16 +11,21 @@ use super::{
         FileType, FsInfo, IndexNode, InodeFlags, InodeMode, Magic, Metadata, SuperBlock,
     },
 };
-use crate::filesystem::devfs::zero_dev::LockedZeroInode;
-use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
-use crate::mm::VmFaultReason;
+
 use crate::{
     driver::base::{block::gendisk::GenDisk, device::device_number::DeviceNumber},
-    filesystem::vfs::{mount::MountFlags, produce_fs},
+    filesystem::{
+        devfs::zero_dev::LockedZeroInode,
+        vfs::{mount::MountFlags, produce_fs},
+    },
     libs::{
         casting::DowncastArc,
         mutex::{Mutex, MutexGuard},
         once::Once,
+    },
+    mm::{
+        fault::{PageFaultHandler, PageFaultMessage},
+        VmFaultReason,
     },
     process::ProcessManager,
     time::PosixTimeSpec,
@@ -140,6 +146,10 @@ impl DevFS {
             .expect("DevFS: Failed to create /dev/block");
         // 预创建 /dev/ptmx 符号链接指向 devpts 内部节点，避免早期 ENOENT
         let _ = root.add_dev_symlink("pts/ptmx", "ptmx");
+        // Linux 用户态会通过 /dev/fd/N[/path] 重新访问 fd 派生的可见路径。
+        // DragonOS 的真实对象解析能力在 /proc/self/fd，因此这里补兼容入口。
+        root.add_dev_symlink("/proc/self/fd", "fd")
+            .expect("DevFS: Failed to create /dev/fd");
         devfs.register_bultinin_device();
 
         // debug!("ls /dev: {:?}", root.list());
@@ -148,23 +158,42 @@ impl DevFS {
 
     /// @brief 注册系统内部自带的设备
     fn register_bultinin_device(&self) {
+        use crate::driver::base::device::device_number::{DeviceNumber, Major};
         use crate::filesystem::fuse::dev::LockedFuseDevInode;
+        use full_dev::LockedFullInode;
         use null_dev::LockedNullInode;
         use random_dev::LockedRandomInode;
         use zero_dev::LockedZeroInode;
-        let dev_root: Arc<LockedDevFSInode> = self.root_inode.clone();
-        dev_root
-            .add_dev("null", LockedNullInode::new())
+
+        self.register_builtin_root_device("null", LockedNullInode::new())
             .expect("DevFS: Failed to register /dev/null");
-        dev_root
-            .add_dev("zero", LockedZeroInode::new())
+        self.register_builtin_root_device("zero", LockedZeroInode::new())
             .expect("DevFS: Failed to register /dev/zero");
-        dev_root
-            .add_dev("random", LockedRandomInode::new())
-            .expect("DevFS: Failed to register /dev/random");
-        dev_root
-            .add_dev("fuse", LockedFuseDevInode::new())
+        self.register_builtin_root_device("full", LockedFullInode::new())
+            .expect("DevFS: Failed to register /dev/full");
+        self.register_builtin_root_device(
+            "random",
+            LockedRandomInode::new("random", DeviceNumber::new(Major::new(1), 8)),
+        )
+        .expect("DevFS: Failed to register /dev/random");
+        self.register_builtin_root_device(
+            "urandom",
+            LockedRandomInode::new("urandom", DeviceNumber::new(Major::new(1), 9)),
+        )
+        .expect("DevFS: Failed to register /dev/urandom");
+        self.register_builtin_root_device("fuse", LockedFuseDevInode::new())
             .expect("DevFS: Failed to register /dev/fuse");
+    }
+
+    fn register_builtin_root_device<T: DeviceINode + 'static>(
+        &self,
+        name: &str,
+        device: Arc<T>,
+    ) -> Result<(), SystemError> {
+        let dev_root = self.root_inode.clone();
+        device.set_fs(dev_root.0.lock().fs.clone());
+        device.set_parent(Arc::downgrade(&dev_root));
+        dev_root.add_dev(name, device)
     }
 
     /// @brief 在devfs内注册设备

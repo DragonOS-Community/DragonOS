@@ -3,6 +3,7 @@ use page::EntryFlags;
 use system_error::SystemError;
 
 use crate::arch::MMArch;
+use crate::process::{cred::CAPFlags, resource::RLimitID, ProcessManager};
 
 use core::{
     cmp,
@@ -31,6 +32,7 @@ pub mod madvise;
 pub mod memblock;
 pub mod mincore;
 pub mod mmio_buddy;
+pub mod mmu_gather;
 pub mod no_init;
 pub mod page;
 pub mod page_cache_stats;
@@ -38,6 +40,7 @@ pub mod percpu;
 pub mod readahead;
 pub mod syscall;
 pub mod sysfs;
+pub mod tlb;
 pub mod truncate;
 pub mod ucontext;
 
@@ -81,6 +84,8 @@ bitflags! {
         const VM_ARCH_1 = 0x01000000;
         const VM_WIPEONFORK = 0x02000000;
         const VM_DONTDUMP = 0x04000000;
+
+        const VM_LOCKED_CLEAR_MASK = !(Self::VM_LOCKED.bits | Self::VM_LOCKONFAULT.bits);
     }
 
     /// 描述页面错误处理过程中发生的不同情况或结果
@@ -122,6 +127,18 @@ impl core::ops::IndexMut<VmFlags> for [usize] {
     fn index_mut(&mut self, index: VmFlags) -> &mut Self::Output {
         &mut self[index.bits]
     }
+}
+
+pub fn can_do_mlock() -> bool {
+    let pcb = ProcessManager::current_pcb();
+    let rlim = pcb.get_rlimit(RLimitID::Memlock);
+    if rlim.rlim_cur != 0 {
+        return true;
+    }
+    if pcb.cred().has_capability(CAPFlags::CAP_IPC_LOCK) {
+        return true;
+    }
+    false
 }
 
 /// 获取内核IDLE进程的用户地址空间结构体

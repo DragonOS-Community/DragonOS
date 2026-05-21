@@ -208,7 +208,7 @@ impl CfsRunQueue {
         }
 
         let rq = self.rq();
-        let (rq, _guard) = rq.self_lock();
+        let rq = rq.force_mut_locked();
 
         return rq.rq_clock_pelt() - self.throttled_clock_pelt_time;
     }

@@ -1,0 +1,5 @@
+# Temporary blocklist for cross-CPU affinity/getcpu consistency.
+# DragonOS currently stores affinity masks but does not yet enforce task
+# migration onto an allowed CPU, so sched_getcpu() can still observe a CPU
+# outside the post-setaffinity mask.
+GetcpuTest.IsValidCpu

@@ -8,8 +8,11 @@ use crate::{
             EPollEventType, EPollItem,
         },
         vfs::{
-            file::FileFlags, vcore::generate_inode_id, FilePrivateData, FileSystem, FileType,
-            FsInfo, IndexNode, InodeFlags, InodeMode, Magic, Metadata, PollableInode, SuperBlock,
+            fasync::{FAsyncItem, FAsyncItems, FASYNC_POLL_IN, FASYNC_POLL_OUT},
+            file::FileFlags,
+            vcore::generate_inode_id,
+            FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, InodeFlags, InodeMode, Magic,
+            Metadata, PollableInode, SuperBlock,
         },
     },
     ipc::signal::send_kernel_signal_to_current,
@@ -110,6 +113,8 @@ pub struct LockedPipeInode {
     /// 用于 FIFO 打开时的阻塞等待（等待另一端打开）
     open_wait_queue: WaitQueue,
     epitems: LockedEPItemLinkedList,
+    read_fasync_items: FAsyncItems,
+    write_fasync_items: FAsyncItems,
 }
 
 /// @brief 管道文件i节点(无锁)
@@ -360,6 +365,8 @@ impl LockedPipeInode {
             write_wait_queue: WaitQueue::default(),
             open_wait_queue: WaitQueue::default(),
             epitems: LockedEPItemLinkedList::default(),
+            read_fasync_items: FAsyncItems::default(),
+            write_fasync_items: FAsyncItems::default(),
         });
         let mut guard = result.inner.lock();
         guard.self_ref = Arc::downgrade(&result);
@@ -594,8 +601,78 @@ impl LockedPipeInode {
         let pollflag = inner_guard.poll_both_ends();
         drop(inner_guard);
         let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
+        self.read_fasync_items.send_sigio(FASYNC_POLL_IN);
 
         Ok(to_write)
+    }
+
+    /// Wait for pipe space before file->pipe splice reads from the input file.
+    ///
+    /// The caller must pass the maximum number of bytes it can actually read
+    /// from the input file for this splice attempt. DragonOS pipes are byte-ring
+    /// based, so requests up to PIPE_BUF wait for the complete readable chunk;
+    /// larger requests wait for any space and may complete partially.
+    pub fn wait_writable_for_splice(&self, len: usize) -> Result<usize, SystemError> {
+        if len == 0 {
+            return Ok(0);
+        }
+
+        let need_atomic = len <= PIPE_BUF;
+        loop {
+            let guard = self.inner.lock();
+            if guard.reader == 0 {
+                drop(guard);
+                let _ = send_kernel_signal_to_current(Signal::SIGPIPE);
+                return Err(SystemError::EPIPE);
+            }
+
+            let used = guard.valid_cnt.max(0) as usize;
+            let space = guard.buf_size.saturating_sub(used);
+            if (need_atomic && space >= len) || (!need_atomic && space > 0) {
+                return Ok(if need_atomic { len } else { len.min(space) });
+            }
+
+            drop(guard);
+            let wait_result = if need_atomic {
+                wq_wait_event_interruptible!(
+                    self.write_wait_queue,
+                    self.writeable_len_at_least(len),
+                    {}
+                )
+            } else {
+                wq_wait_event_interruptible!(self.write_wait_queue, self.writeable(), {})
+            };
+            if wait_result.is_err() {
+                return Err(SystemError::ERESTARTSYS);
+            }
+        }
+    }
+
+    /// Wait until the pipe has any writable byte for file->pipe splice.
+    ///
+    /// This matches Linux `wait_for_space()` for inputs whose exact readable
+    /// length is not known before calling into the file. The caller can then
+    /// cap the read by the returned byte space.
+    pub fn wait_writable_any_for_splice(&self) -> Result<usize, SystemError> {
+        loop {
+            let guard = self.inner.lock();
+            if guard.reader == 0 {
+                drop(guard);
+                let _ = send_kernel_signal_to_current(Signal::SIGPIPE);
+                return Err(SystemError::EPIPE);
+            }
+
+            let used = guard.valid_cnt.max(0) as usize;
+            let space = guard.buf_size.saturating_sub(used);
+            if space > 0 {
+                return Ok(space);
+            }
+
+            drop(guard);
+            if wq_wait_event_interruptible!(self.write_wait_queue, self.writeable(), {}).is_err() {
+                return Err(SystemError::ERESTARTSYS);
+            }
+        }
     }
 
     /// 从管道中“窥视”最多 `len` 字节数据到 `buf`，但不消耗管道数据。
@@ -717,6 +794,7 @@ impl LockedPipeInode {
         let pollflag = guard.poll_both_ends();
         drop(guard);
         let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
+        self.write_fasync_items.send_sigio(FASYNC_POLL_OUT);
     }
 
     /// Helper: Wait until the pipe is readable (has data).
@@ -851,6 +929,10 @@ impl LockedPipeInode {
 
         let _ = EventPoll::wakeup_epoll(&src.epitems, in_poll);
         let _ = EventPoll::wakeup_epoll(&dst.epitems, out_poll);
+        if consume {
+            src.write_fasync_items.send_sigio(FASYNC_POLL_OUT);
+        }
+        dst.read_fasync_items.send_sigio(FASYNC_POLL_IN);
 
         Ok(copied)
     }
@@ -1053,6 +1135,45 @@ impl PollableInode for LockedPipeInode {
         }
         Err(SystemError::ENOENT)
     }
+
+    fn add_fasync(
+        &self,
+        fasync_item: FAsyncItem,
+        private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        let FilePrivateData::Pipefs(pipe_data) = private_data else {
+            return Err(SystemError::EBADF);
+        };
+
+        let flags = pipe_data.flags;
+        if !flags.is_write_only() {
+            self.read_fasync_items.add(fasync_item.clone());
+        }
+        if !flags.is_read_only() {
+            self.write_fasync_items.add(fasync_item);
+        }
+        Ok(())
+    }
+
+    fn remove_fasync(
+        &self,
+        file: &Weak<crate::filesystem::vfs::file::File>,
+        private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        if let FilePrivateData::Pipefs(pipe_data) = private_data {
+            let flags = pipe_data.flags;
+            if !flags.is_write_only() {
+                self.read_fasync_items.remove(file);
+            }
+            if !flags.is_read_only() {
+                self.write_fasync_items.remove(file);
+            }
+        } else {
+            self.read_fasync_items.remove(file);
+            self.write_fasync_items.remove(file);
+        }
+        Ok(())
+    }
 }
 
 impl IndexNode for LockedPipeInode {
@@ -1136,6 +1257,7 @@ impl IndexNode for LockedPipeInode {
         drop(inner_guard);
         // 唤醒epoll中等待的进程（忽略错误，因为状态已更新，这是尽力而为的通知）
         let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
+        self.write_fasync_items.send_sigio(FASYNC_POLL_OUT);
 
         //返回读取的字节数
         return Ok(num);
@@ -1311,13 +1433,10 @@ impl IndexNode for LockedPipeInode {
             guard.writer -= 1;
             // 如果已经没有写端了，则唤醒读端
             if guard.writer == 0 {
-                // 写端耗尽意味着读端应收到 POLLHUP，唤醒等待者与 epoll
-                // 注意：这里需要使用读端的flags来获取POLLHUP事件
-                // 因为poll()中只在!flags.is_write_only()时才设置EPOLLHUP
+                // poll/epoll 语义仍然是 HUP，但 Linux 的 SIGIO/fasync 在这里上报 POLL_IN
+                // （读端被唤醒后可读到 EOF）。
                 let poll_flags = FileFlags::O_RDONLY;
                 let poll_data = FilePrivateData::Pipefs(PipeFsPrivateData { flags: poll_flags });
-                // 忽略 poll 错误：状态已更新（writer已减为0），poll失败不应导致close失败
-                // 这与下面对 wakeup_epoll 错误的处理方式一致
                 let pollflag = guard
                     .poll(&poll_data)
                     .map(|v| EPollEventType::from_bits_truncate(v as u32))
@@ -1325,9 +1444,8 @@ impl IndexNode for LockedPipeInode {
                 drop(guard); // 先释放 inner 锁，避免潜在的死锁
                 self.read_wait_queue
                     .wakeup_all(Some(ProcessState::Blocked(true)));
-                // 唤醒所有依赖 epoll 的等待者，确保 HUP 事件可见
-                // 忽略错误：状态已更新（writer已减为0），wakeup_epoll失败不影响close操作的语义
                 let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
+                self.read_fasync_items.send_sigio(FASYNC_POLL_IN);
                 return Ok(());
             }
         }
@@ -1338,9 +1456,8 @@ impl IndexNode for LockedPipeInode {
             guard.reader -= 1;
             // 如果已经没有读端了，则唤醒写端
             if guard.reader == 0 {
-                // 读端耗尽意味着写端应收到 POLLERR，唤醒等待者与 epoll。
-                // 注意：这里需要使用写端的flags来获取EPOLLERR事件
-                // 因为poll()中只在!flags.is_read_only()时才设置EPOLLERR
+                // poll/epoll 语义仍然是 ERR，但 Linux 的 SIGIO/fasync 在这里上报 POLL_OUT
+                // （写端被唤醒后下一次 write 再观察到 EPIPE）。
                 let poll_data = FilePrivateData::Pipefs(PipeFsPrivateData {
                     flags: FileFlags::O_WRONLY,
                 });
@@ -1350,10 +1467,9 @@ impl IndexNode for LockedPipeInode {
                     .unwrap_or(EPollEventType::EPOLLERR);
 
                 drop(guard); // 先释放 inner 锁，避免死锁
-                             // 唤醒所有等待的写端（不进行状态过滤，因为进程可能已经被其他操作唤醒但还未从队列中移除）
                 self.write_wait_queue.wakeup_all(None);
-                // 唤醒所有依赖 epoll 的等待者，确保 ERR 事件可见
                 let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
+                self.write_fasync_items.send_sigio(FASYNC_POLL_OUT);
                 return Ok(());
             }
         }
@@ -1538,6 +1654,7 @@ impl IndexNode for LockedPipeInode {
         drop(inner_guard);
         // 唤醒epoll中等待的进程（忽略错误，因为数据已写入，这是尽力而为的通知）
         let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
+        self.read_fasync_items.send_sigio(FASYNC_POLL_IN);
 
         // 返回写入的字节数
         return Ok(total_written);

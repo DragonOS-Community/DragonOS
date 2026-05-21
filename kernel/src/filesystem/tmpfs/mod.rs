@@ -32,8 +32,8 @@ use alloc::{
 use system_error::SystemError;
 
 use super::vfs::{
-    file::FilePrivateData, utils::DName, FileSystem, FsInfo, IndexNode, InodeFlags, InodeId,
-    InodeMode, Metadata, SpecialNodeData,
+    file::FilePrivateData, mount::MountFlags, utils::DName, FileSystem, FsInfo,
+    FsReconfigureRequest, IndexNode, InodeFlags, InodeId, InodeMode, Metadata, SpecialNodeData,
 };
 
 use linkme::distributed_slice;
@@ -181,7 +181,7 @@ pub struct LockedTmpfsInode(pub Mutex<TmpfsInode>);
 pub struct Tmpfs {
     root_inode: Arc<LockedTmpfsInode>,
     super_block: RwSem<SuperBlock>,
-    size_limit: Option<u64>,
+    size_limit: RwSem<Option<u64>>,
     current_size: AtomicU64,
 }
 
@@ -231,13 +231,13 @@ impl TmpfsInode {
 
 #[derive(Debug)]
 pub struct TmpfsMountData {
-    mode: InodeMode,
+    mode: Option<InodeMode>,
     size_bytes: Option<u64>,
 }
 
 impl TmpfsMountData {
     fn parse(raw: Option<&str>) -> Result<Self, SystemError> {
-        let mut mode = InodeMode::S_IRWXUGO;
+        let mut mode = None;
         let mut size_bytes = None;
 
         if let Some(raw) = raw {
@@ -245,7 +245,7 @@ impl TmpfsMountData {
                 if let Some(v) = opt.strip_prefix("mode=").map(|s| s.trim()) {
                     // mode 参数按八进制解析（mount 的习惯用法，如 755 = rwxr-xr-x）
                     let parsed = u32::from_str_radix(v, 8).map_err(|_| SystemError::EINVAL)?;
-                    mode = InodeMode::from_bits_truncate(parsed);
+                    mode = Some(InodeMode::from_bits_truncate(parsed));
                 } else if let Some(v) = opt.strip_prefix("size=").map(|s| s.trim()) {
                     // 支持大小写后缀：g/G, m/M, k/K
                     let v_lower = v.to_lowercase();
@@ -318,6 +318,26 @@ impl FileSystem for Tmpfs {
         // tmpfs 是内存文件系统，数据已经在 page_cache 中，不需要 readahead
         false
     }
+
+    fn reconfigure(&self, request: FsReconfigureRequest<'_>) -> Result<MountFlags, SystemError> {
+        let parsed = TmpfsMountData::parse(request.raw_data)?;
+
+        if let Some(new_limit) = parsed.size_bytes {
+            let current = self.current_size.load(Ordering::Acquire);
+            if new_limit < current {
+                return Err(SystemError::EINVAL);
+            }
+            *self.size_limit.write() = Some(new_limit);
+            self.update_superblock_free(current);
+        }
+
+        if let Some(mode) = parsed.mode {
+            let mut root = self.root_inode.0.lock();
+            root.metadata.mode = mode;
+        }
+
+        Ok(request.sb_flags & request.sb_flags_mask)
+    }
 }
 
 impl Tmpfs {
@@ -336,7 +356,7 @@ impl Tmpfs {
 
     fn update_superblock_free(&self, current_bytes: u64) {
         // 只在启用 size_limit 时输出可用容量；否则保持现有行为（0-sized）。
-        let Some(limit) = self.size_limit else {
+        let Some(limit) = *self.size_limit.read() else {
             return;
         };
         let total_blocks = limit / TMPFS_BLOCK_SIZE;
@@ -374,7 +394,7 @@ impl Tmpfs {
         let result: Arc<Tmpfs> = Arc::new(Tmpfs {
             root_inode: root,
             super_block: RwSem::new(sb),
-            size_limit,
+            size_limit: RwSem::new(size_limit),
             current_size: AtomicU64::new(0),
         });
 
@@ -382,7 +402,7 @@ impl Tmpfs {
         root_guard.parent = Arc::downgrade(&result.root_inode);
         root_guard.self_ref = Arc::downgrade(&result.root_inode);
         root_guard.fs = Arc::downgrade(&result);
-        root_guard.metadata.mode = mount_data.mode;
+        root_guard.metadata.mode = mount_data.mode.unwrap_or(InodeMode::S_IRWXUGO);
         drop(root_guard);
 
         result
@@ -392,7 +412,7 @@ impl Tmpfs {
     /// 返回Ok(())如果更新成功，Err(SystemError::ENOSPC)如果超过限制
     /// 使用compare_exchange_weak循环确保并发安全
     fn increase_size(&self, size_diff: u64) -> Result<(), SystemError> {
-        if let Some(limit) = self.size_limit {
+        if let Some(limit) = *self.size_limit.read() {
             // 使用compare_exchange_weak循环确保原子性
             loop {
                 let current = self.current_size.load(Ordering::Acquire);
@@ -424,7 +444,7 @@ impl Tmpfs {
     /// 原子地减少文件系统当前使用的大小（用于文件删除或缩小）
     /// 使用fetch_sub确保并发安全
     fn decrease_size(&self, size: usize) {
-        if self.size_limit.is_some() {
+        if self.size_limit.read().is_some() {
             let size_to_decrease = size as u64;
             // 使用fetch_sub原子地减少大小
             let prev = self
@@ -476,6 +496,23 @@ impl IndexNode for LockedTmpfsInode {
 
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         Ok(())
+    }
+
+    fn sync_file(
+        &self,
+        datasync: bool,
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        match self.metadata()?.file_type {
+            FileType::File | FileType::Dir => {
+                if datasync {
+                    self.datasync()
+                } else {
+                    self.sync()
+                }
+            }
+            _ => Err(SystemError::EINVAL),
+        }
     }
 
     fn open(
@@ -717,7 +754,7 @@ impl IndexNode for LockedTmpfsInode {
 
             // 调整页缓存（会释放多余页，并截断最后一页）
             if let Some(pc) = inode.page_cache.clone() {
-                pc.lock().resize(len)?;
+                pc.manager().resize(len)?;
             }
 
             // 如果缩小，减少current_size

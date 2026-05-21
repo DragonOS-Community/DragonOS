@@ -92,6 +92,10 @@ impl MntNamespace {
         return result;
     }
 
+    pub fn user_ns(&self) -> &Arc<UserNamespace> {
+        &self._user_ns
+    }
+
     /// 强制替换本MountNamespace的根挂载文件系统
     ///
     /// 本方法仅供dragonos初始化时使用
@@ -269,13 +273,6 @@ impl MntNamespace {
         }
 
         let new_mntns = self.copy_with_mountfs(new_root_mntfs, user_ns);
-        new_mntns
-            .add_mount(
-                None,
-                Arc::new(MountPath::from("/")),
-                new_mntns.root_mntfs().clone(),
-            )
-            .expect("Failed to add root mount");
 
         for x in inner.mount_list.clone_inner().values() {
             if Arc::ptr_eq(x, new_mntns.root_mntfs()) {
@@ -310,6 +307,9 @@ impl MntNamespace {
             let old_self_mp = data.old_mount_fs.self_mountpoint().unwrap();
             let new_self_mp = old_self_mp.clone_with_new_mount_fs(data.parent_mount_fs.clone());
             let new_mount_fs = data.old_mount_fs.deepcopy(Some(new_self_mp));
+
+            // copy_mnt_ns 第二遍遍历
+            new_mount_fs.set_namespace(Arc::downgrade(&new_mntns));
 
             // If the old mount was shared, register the new mount in the same peer group
             // This establishes the peer relationship for cross-namespace propagation
@@ -399,7 +399,7 @@ impl ProcessManager {
     /// 获取当前进程的挂载namespace
     pub fn current_mntns() -> Arc<MntNamespace> {
         if Self::initialized() {
-            ProcessManager::current_pcb().nsproxy.read().mnt_ns.clone()
+            ProcessManager::current_pcb().nsproxy().mnt_ns.clone()
         } else {
             root_mnt_namespace()
         }

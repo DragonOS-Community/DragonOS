@@ -1,6 +1,7 @@
 pub mod hook;
 use alloc::boxed::Box;
 use cfg_if::cfg_if;
+use core::hint::spin_loop;
 
 use log::error;
 
@@ -74,11 +75,26 @@ pub fn panic(info: &PanicInfo) -> ! {
         let _res = unwinding::panic::begin_panic(guard);
         // log::error!("panic unreachable: {:?}", _res.0);
     }
-    println!(
-        "Current PCB:\n\t{:?}",
-        process::ProcessManager::current_pcb()
-    );
-    process::ProcessManager::exit(usize::MAX);
+    if process::ProcessManager::initialized() {
+        let current_pid = process::ProcessManager::current_pid();
+        if current_pid.data() == 0 {
+            println!("Current PCB:\n\t<idle task pid=0, cannot exit>");
+            loop {
+                spin_loop();
+            }
+        }
+
+        println!(
+            "Current PCB:\n\t{:?}",
+            process::ProcessManager::current_pcb()
+        );
+        process::ProcessManager::exit(usize::MAX);
+    } else {
+        println!("Current PCB:\n\t<unavailable before process manager init>");
+        loop {
+            spin_loop();
+        }
+    }
 }
 
 /// The wrapper of `unwinding::panic::begin_panic`. If the panic is

@@ -1,17 +1,46 @@
 use num_traits::FromPrimitive;
 use system_error::SystemError;
 
-use crate::time::PosixTimeSpec;
+use alloc::sync::Arc;
+use core::{ffi::c_long, sync::atomic::Ordering};
 
-use super::ProcessControlBlock;
+use super::{ProcessControlBlock, ProcessManager};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(C)]
+pub struct RUsageTimeval {
+    pub tv_sec: c_long,
+    pub tv_usec: c_long,
+}
+
+impl RUsageTimeval {
+    #[inline]
+    pub fn from_ns(ns: u64) -> Self {
+        Self {
+            tv_sec: (ns / 1_000_000_000) as c_long,
+            tv_usec: ((ns % 1_000_000_000) / 1000) as c_long,
+        }
+    }
+
+    #[inline]
+    pub fn to_ns(self) -> u64 {
+        if self.tv_usec < 0 || self.tv_usec >= 1_000_000 {
+            (self.tv_sec as u64).saturating_mul(1_000_000_000)
+        } else {
+            let sec_ns = (self.tv_sec as u64).saturating_mul(1_000_000_000);
+            let usec_ns = (self.tv_usec as u64).saturating_mul(1000);
+            sec_ns.saturating_add(usec_ns)
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(C)]
 pub struct RUsage {
     /// User time used
-    pub ru_utime: PosixTimeSpec,
+    pub ru_utime: RUsageTimeval,
     /// System time used
-    pub ru_stime: PosixTimeSpec,
+    pub ru_stime: RUsageTimeval,
 
     // 以下是linux的rusage结构体扩展
     /// Maximum resident set size
@@ -42,6 +71,32 @@ pub struct RUsage {
     pub ru_nvcsw: usize,
     /// Involuntary context switches
     pub ru_nivcsw: usize,
+}
+
+impl RUsage {
+    #[inline]
+    fn add_time(lhs: &mut RUsageTimeval, rhs: RUsageTimeval) {
+        *lhs = RUsageTimeval::from_ns(lhs.to_ns().saturating_add(rhs.to_ns()));
+    }
+
+    pub fn add_assign_saturating(&mut self, rhs: &RUsage) {
+        Self::add_time(&mut self.ru_utime, rhs.ru_utime);
+        Self::add_time(&mut self.ru_stime, rhs.ru_stime);
+        self.ru_maxrss = self.ru_maxrss.max(rhs.ru_maxrss);
+        self.ru_ixrss = self.ru_ixrss.saturating_add(rhs.ru_ixrss);
+        self.ru_idrss = self.ru_idrss.saturating_add(rhs.ru_idrss);
+        self.ru_isrss = self.ru_isrss.saturating_add(rhs.ru_isrss);
+        self.ru_minflt = self.ru_minflt.saturating_add(rhs.ru_minflt);
+        self.ru_majflt = self.ru_majflt.saturating_add(rhs.ru_majflt);
+        self.ru_nswap = self.ru_nswap.saturating_add(rhs.ru_nswap);
+        self.ru_inblock = self.ru_inblock.saturating_add(rhs.ru_inblock);
+        self.ru_oublock = self.ru_oublock.saturating_add(rhs.ru_oublock);
+        self.ru_msgsnd = self.ru_msgsnd.saturating_add(rhs.ru_msgsnd);
+        self.ru_msgrcv = self.ru_msgrcv.saturating_add(rhs.ru_msgrcv);
+        self.ru_nsignals = self.ru_nsignals.saturating_add(rhs.ru_nsignals);
+        self.ru_nvcsw = self.ru_nvcsw.saturating_add(rhs.ru_nvcsw);
+        self.ru_nivcsw = self.ru_nivcsw.saturating_add(rhs.ru_nivcsw);
+    }
 }
 
 ///
@@ -138,14 +193,72 @@ impl TryFrom<usize> for RLimitID {
 }
 
 impl ProcessControlBlock {
-    /// 获取进程资源使用情况
-    ///
-    /// ## TODO
-    ///
-    /// 当前函数尚未实现，只是返回了一个默认的RUsage结构体
-    pub fn get_rusage(&self, _who: RUsageWho) -> Option<RUsage> {
-        let rusage = RUsage::default();
+    fn leader_for_rusage(&self) -> Arc<ProcessControlBlock> {
+        if self.is_thread_group_leader() {
+            return self
+                .self_ref
+                .upgrade()
+                .unwrap_or_else(ProcessManager::current_pcb);
+        }
 
-        Some(rusage)
+        self.threads_read_irqsave()
+            .group_leader()
+            .or_else(|| self.self_ref.upgrade())
+            .unwrap_or_else(ProcessManager::current_pcb)
+    }
+
+    fn task_rusage(&self) -> RUsage {
+        let ct = self.cputime();
+        RUsage {
+            ru_utime: RUsageTimeval::from_ns(ct.utime.load(Ordering::Relaxed)),
+            ru_stime: RUsageTimeval::from_ns(ct.stime.load(Ordering::Relaxed)),
+            ..RUsage::default()
+        }
+    }
+
+    fn thread_group_rusage(&self) -> RUsage {
+        let leader = self.leader_for_rusage();
+        let ti = leader.threads_read_irqsave();
+        let mut usage = *leader.exited_thread_group_rusage.lock();
+        usage.add_assign_saturating(&leader.task_rusage());
+        for task in &ti.group_tasks {
+            if let Some(task) = task.upgrade() {
+                usage.add_assign_saturating(&task.task_rusage());
+            }
+        }
+        usage
+    }
+
+    pub fn add_exited_thread_group_rusage(&self, rusage: &RUsage) {
+        let leader = self.leader_for_rusage();
+        leader
+            .exited_thread_group_rusage
+            .lock()
+            .add_assign_saturating(rusage);
+    }
+
+    pub fn add_child_rusage(&self, rusage: &RUsage) {
+        let leader = self.leader_for_rusage();
+        leader.children_rusage.lock().add_assign_saturating(rusage);
+    }
+
+    /// 获取进程资源使用情况
+    pub fn get_rusage(&self, who: RUsageWho) -> Option<RUsage> {
+        match who {
+            RUsageWho::RUsageSelf => Some(self.thread_group_rusage()),
+            RUsageWho::RUsageBoth => {
+                let mut rusage = self.thread_group_rusage();
+                let leader = self.leader_for_rusage();
+                let children = *leader.children_rusage.lock();
+                rusage.add_assign_saturating(&children);
+                Some(rusage)
+            }
+            RUsageWho::RusageThread => Some(self.task_rusage()),
+            RUsageWho::RUsageChildren => {
+                let leader = self.leader_for_rusage();
+                let rusage = *leader.children_rusage.lock();
+                Some(rusage)
+            }
+        }
     }
 }

@@ -24,8 +24,8 @@ use alloc::{
 use system_error::SystemError;
 
 use super::vfs::{
-    file::FilePrivateData, utils::DName, FileSystem, FsInfo, IndexNode, InodeFlags, InodeId,
-    InodeMode, Metadata, SpecialNodeData,
+    file::FilePrivateData, utils::DName, FileSystem, FsInfo, FsReconfigureRequest, IndexNode,
+    InodeFlags, InodeId, InodeMode, Metadata, SpecialNodeData,
 };
 
 use linkme::distributed_slice;
@@ -129,6 +129,20 @@ impl FileSystem for RamFS {
     fn super_block(&self) -> SuperBlock {
         self.super_block.read().clone()
     }
+
+    fn reconfigure(
+        &self,
+        request: FsReconfigureRequest<'_>,
+    ) -> Result<super::vfs::mount::MountFlags, SystemError> {
+        if let Some(raw) = request.raw_data {
+            for opt in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                if let Some(v) = opt.strip_prefix("mode=").map(|s| s.trim()) {
+                    let _ = u32::from_str_radix(v, 8).map_err(|_| SystemError::EINVAL)?;
+                }
+            }
+        }
+        Ok(request.sb_flags & request.sb_flags_mask)
+    }
 }
 
 impl RamFS {
@@ -198,6 +212,23 @@ impl IndexNode for LockedRamFSInode {
 
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
+    }
+
+    fn sync_file(
+        &self,
+        datasync: bool,
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        match self.metadata()?.file_type {
+            FileType::File | FileType::Dir => {
+                if datasync {
+                    self.datasync()
+                } else {
+                    self.sync()
+                }
+            }
+            _ => Err(SystemError::EINVAL),
+        }
     }
 
     fn open(

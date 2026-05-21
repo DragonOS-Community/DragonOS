@@ -56,10 +56,7 @@ impl NTtyLinediscipline {
             TtyIoctlCmd::TCXONC => {
                 todo!()
             }
-            TtyIoctlCmd::TCFLSH => {
-                log::warn!("NTTY TCFLSH has not been implemented yet");
-                Ok(0)
-            }
+            TtyIoctlCmd::TCFLSH => TtyCore::tty_perform_flush(tty, arg),
             _ => {
                 return TtyCore::tty_mode_ioctl(tty.clone(), cmd, arg);
             }
@@ -1575,11 +1572,17 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         ldata.read_flags.set_all(false);
         ldata.pushing = false;
         ldata.lookahead_count = 0;
+        ldata.no_room = false;
 
-        // todo: kick worker?
-        // packet mode?
         if core.link().is_some() {
             ldata.packet_mode_flush(core);
+        }
+
+        core.read_wq().wakeup_all();
+        core.write_wq().wakeup_all();
+
+        if let Some(link) = core.link() {
+            link.core().write_wq().wakeup_all();
         }
 
         Ok(())

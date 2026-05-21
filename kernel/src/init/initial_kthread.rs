@@ -18,6 +18,7 @@ use crate::{
         exec::ProcInitInfo, execve::do_execve, kthread::KernelThreadMechanism, stdio::stdio_init,
         ProcessFlags, ProcessManager,
     },
+    rcu,
     smp::smp_init,
 };
 
@@ -69,6 +70,7 @@ pub fn initial_kernel_thread() -> i32 {
 
 fn kernel_init() -> Result<(), SystemError> {
     KernelThreadMechanism::init_stage2();
+    rcu::start_worker();
     kenrel_init_freeable()?;
     set_system_state(SystemState::FreeingInitMem);
     #[cfg(target_arch = "x86_64")]

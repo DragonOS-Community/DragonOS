@@ -15,7 +15,7 @@ impl Syscall for SysGetEgid {
 
     fn handle(&self, _args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let pcb = ProcessManager::current_pcb();
-        return Ok(pcb.cred.lock().egid.data());
+        return Ok(pcb.cred().egid.data());
     }
 
     fn entry_format(&self, _args: &[usize]) -> Vec<FormattedSyscallParam> {

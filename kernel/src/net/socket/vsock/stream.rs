@@ -13,7 +13,12 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use system_error::SystemError;
 
 use crate::filesystem::epoll::{event_poll::EventPoll, EPollEventType};
-use crate::filesystem::vfs::{fasync::FAsyncItems, iov::IoVecs, vcore::generate_inode_id, InodeId};
+use crate::filesystem::vfs::{
+    fasync::{fasync_band_from_epoll, FAsyncItems},
+    iov::IoVecs,
+    vcore::generate_inode_id,
+    InodeId,
+};
 use crate::libs::mutex::Mutex;
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::socket::common::{EPollItems, ShutdownBit};
@@ -262,7 +267,9 @@ impl VsockStreamSocket {
 
         let events = self.check_io_event();
         let _ = EventPoll::wakeup_epoll(self.epoll_items.as_ref(), events);
-        self.fasync_items.send_sigio();
+        if let Some(band) = fasync_band_from_epoll(events) {
+            self.fasync_items.send_sigio(band);
+        }
     }
 
     /// 判断当前连接是否应报告可写。

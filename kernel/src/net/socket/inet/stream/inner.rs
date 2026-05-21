@@ -336,6 +336,8 @@ enum ConnectResult {
     Connecting,
     Refused,
     RefusedConsumed,
+    ShutdownReset,
+    ShutdownResetConsumed,
 }
 
 #[derive(Debug)]
@@ -392,7 +394,10 @@ impl Connecting {
                 Inner::Established(Established::new(self.inner, true)),
                 Ok(()),
             ),
-            ConnectResult::Refused | ConnectResult::RefusedConsumed => {
+            ConnectResult::Refused
+            | ConnectResult::RefusedConsumed
+            | ConnectResult::ShutdownReset
+            | ConnectResult::ShutdownResetConsumed => {
                 // unbind port
                 self.inner
                     .port_manager()
@@ -406,9 +411,15 @@ impl Connecting {
                     smoltcp::wire::IpAddress::Ipv4(_) => smoltcp::wire::IpVersion::Ipv4,
                     smoltcp::wire::IpAddress::Ipv6(_) => smoltcp::wire::IpVersion::Ipv6,
                 };
+                let err = match result {
+                    ConnectResult::ShutdownReset | ConnectResult::ShutdownResetConsumed => {
+                        SystemError::ECONNRESET
+                    }
+                    _ => SystemError::ECONNREFUSED,
+                };
                 (
                     Inner::Init(Init::Unbound((Box::new(socket), ver))),
-                    Err(SystemError::ECONNREFUSED),
+                    Err(err),
                 )
             }
         }
@@ -416,6 +427,15 @@ impl Connecting {
 
     pub fn is_connected(&self) -> bool {
         matches!(*self.result.read(), ConnectResult::Connected)
+    }
+
+    pub fn is_transport_established(&self) -> bool {
+        self.with(|socket| {
+            matches!(
+                socket.state(),
+                tcp::State::Established | tcp::State::CloseWait
+            )
+        })
     }
 
     /// Transmutes the Connecting state to Established state.
@@ -465,6 +485,8 @@ impl Connecting {
                     ConnectResult::Refused
                         | ConnectResult::Connected
                         | ConnectResult::RefusedConsumed
+                        | ConnectResult::ShutdownReset
+                        | ConnectResult::ShutdownResetConsumed
                 ) {
                     if matches!(state, tcp::State::Established | tcp::State::CloseWait) {
                         // log::debug!(
@@ -528,7 +550,10 @@ impl Connecting {
                             Ordering::Relaxed,
                         );
                     }
-                    ConnectResult::Refused | ConnectResult::RefusedConsumed => {
+                    ConnectResult::Refused
+                    | ConnectResult::RefusedConsumed
+                    | ConnectResult::ShutdownReset
+                    | ConnectResult::ShutdownResetConsumed => {
                         // Connection attempt refused (or reset during handshake).
                         // This is equivalent to a closed socket with error.
                         // Should be readable, writable, and have HUP/ERR set.
@@ -541,14 +566,20 @@ impl Connecting {
                             | EPollEventType::EPOLLRDHUP;
 
                         // If error not consumed yet, set EPOLLERR
-                        if matches!(*result, ConnectResult::Refused) {
+                        if matches!(
+                            *result,
+                            ConnectResult::Refused | ConnectResult::ShutdownReset
+                        ) {
                             events_to_set |= EPollEventType::EPOLLERR;
                         }
 
                         pollee.fetch_or(events_to_set.bits() as usize, Ordering::Relaxed);
 
                         // If error IS consumed, clear EPOLLERR (if it was set previously)
-                        if matches!(*result, ConnectResult::RefusedConsumed) {
+                        if matches!(
+                            *result,
+                            ConnectResult::RefusedConsumed | ConnectResult::ShutdownResetConsumed
+                        ) {
                             pollee.fetch_and(
                                 !(EPollEventType::EPOLLERR).bits() as usize,
                                 Ordering::Relaxed,
@@ -576,6 +607,8 @@ impl Connecting {
                     ConnectResult::Refused
                         | ConnectResult::Connected
                         | ConnectResult::RefusedConsumed
+                        | ConnectResult::ShutdownReset
+                        | ConnectResult::ShutdownResetConsumed
                 )
             })
     }
@@ -589,22 +622,31 @@ impl Connecting {
     }
 
     pub fn failure_reason(&self) -> Option<SystemError> {
-        if matches!(*self.result.read(), ConnectResult::Refused) {
-            Some(SystemError::ECONNREFUSED)
-        } else {
-            None
+        match *self.result.read() {
+            ConnectResult::Refused => Some(SystemError::ECONNREFUSED),
+            ConnectResult::ShutdownReset => Some(SystemError::ECONNRESET),
+            _ => None,
         }
     }
 
     pub fn consume_error(&self) {
         let mut guard = self.result.write();
-        if matches!(*guard, ConnectResult::Refused) {
-            *guard = ConnectResult::RefusedConsumed;
+        match *guard {
+            ConnectResult::Refused => *guard = ConnectResult::RefusedConsumed,
+            ConnectResult::ShutdownReset => *guard = ConnectResult::ShutdownResetConsumed,
+            _ => {}
         }
     }
 
     pub fn is_refused_consumed(&self) -> bool {
-        matches!(*self.result.read(), ConnectResult::RefusedConsumed)
+        matches!(
+            *self.result.read(),
+            ConnectResult::RefusedConsumed | ConnectResult::ShutdownResetConsumed
+        )
+    }
+
+    pub fn set_shutdown_reset(&self) {
+        *self.result.write() = ConnectResult::ShutdownReset;
     }
 }
 
@@ -913,12 +955,20 @@ impl Established {
 pub struct SelfConnected {
     inner: socket::inet::BoundInner,
     local: smoltcp::wire::IpEndpoint,
+    state: Mutex<SelfConnectedState>,
+}
+
+#[derive(Debug)]
+struct SelfConnectedState {
     /// Effective receive capacity for the loopback queue (bytes).
-    rx_cap: AtomicUsize,
-    buf: Mutex<VecDeque<u8>>,
-    /// SHUT_WR flag for this self-connected socket. Stored here to avoid TOCTOU
-    /// race between checking shutdown and checking queue emptiness.
-    send_shutdown: AtomicBool,
+    rx_cap: usize,
+    buf: VecDeque<u8>,
+    /// Ordered EOF marker for the self-connected byte stream.
+    ///
+    /// This must be protected by the same lock as `buf`: a concurrent
+    /// `send()` and `shutdown(SHUT_WR)` must linearize as either
+    /// data-before-FIN or FIN-before-send, never as an independently visible EOF.
+    send_shutdown: bool,
 }
 
 impl SelfConnected {
@@ -930,9 +980,11 @@ impl SelfConnected {
         Self {
             inner,
             local,
-            rx_cap: AtomicUsize::new(rx_cap),
-            buf: Mutex::new(VecDeque::new()),
-            send_shutdown: AtomicBool::new(false),
+            state: Mutex::new(SelfConnectedState {
+                rx_cap,
+                buf: VecDeque::new(),
+                send_shutdown: false,
+            }),
         }
     }
 
@@ -958,24 +1010,24 @@ impl SelfConnected {
 
     #[inline]
     pub fn recv_queue(&self) -> usize {
-        self.buf.lock().len()
+        self.state.lock().buf.len()
     }
 
     pub fn discard_all(&self) {
-        self.buf.lock().clear();
+        self.state.lock().buf.clear();
     }
 
     pub fn set_recv_buffer_size(&self, rx_size: usize) {
-        self.rx_cap.store(rx_size, Ordering::Relaxed);
+        self.state.lock().rx_cap = rx_size;
     }
 
     pub fn recv_capacity(&self) -> usize {
-        self.rx_cap.load(Ordering::Relaxed)
+        self.state.lock().rx_cap
     }
 
     pub fn send_capacity(&self) -> usize {
         // For self-connect, use the same capacity for "send" as the local receive queue.
-        self.rx_cap.load(Ordering::Relaxed)
+        self.state.lock().rx_cap
     }
 
     pub fn send_slice(&self, data: &[u8], send_shutdown: bool) -> Result<usize, SystemError> {
@@ -986,53 +1038,55 @@ impl SelfConnected {
             return Ok(0);
         }
 
-        let cap = self.rx_cap.load(Ordering::Relaxed);
-        let mut q = self.buf.lock();
-        let free = cap.saturating_sub(q.len());
+        let mut state = self.state.lock();
+        if state.send_shutdown {
+            return Err(SystemError::EPIPE);
+        }
+
+        let free = state.rx_cap.saturating_sub(state.buf.len());
         if free == 0 {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
         let n = core::cmp::min(free, data.len());
-        q.extend(&data[..n]);
+        state.buf.extend(data[..n].iter().copied());
         Ok(n)
     }
 
     /// Set the send_shutdown flag (called when SHUT_WR is performed).
     pub fn set_send_shutdown(&self) {
-        self.send_shutdown.store(true, Ordering::Release);
+        self.state.lock().send_shutdown = true;
     }
 
     /// Check if send_shutdown flag is set.
     #[inline]
     #[allow(dead_code)]
     pub fn is_send_shutdown(&self) -> bool {
-        self.send_shutdown.load(Ordering::Acquire)
+        self.state.lock().send_shutdown
     }
 
     pub fn recv_into(&self, out: &mut [u8], peek: bool, trunc: bool) -> Result<usize, SystemError> {
         if out.is_empty() {
             return Ok(0);
         }
-        let mut q = self.buf.lock();
-        if q.is_empty() {
+        let mut state = self.state.lock();
+        if state.buf.is_empty() {
             // EOF after SHUT_WR once all queued data is drained.
-            // Check send_shutdown inside the lock to avoid TOCTOU race.
-            if self.send_shutdown.load(Ordering::Acquire) {
+            if state.send_shutdown {
                 return Ok(0);
             }
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
 
-        let n = core::cmp::min(out.len(), q.len());
+        let n = core::cmp::min(out.len(), state.buf.len());
         if !trunc {
-            for (i, b) in q.iter().take(n).enumerate() {
+            for (i, b) in state.buf.iter().take(n).enumerate() {
                 out[i] = *b;
             }
         }
 
         if !peek {
             for _ in 0..n {
-                let _ = q.pop_front();
+                let _ = state.buf.pop_front();
             }
         }
         Ok(n)
@@ -1052,23 +1106,22 @@ impl SelfConnected {
             return Ok(0);
         }
 
-        let mut q = self.buf.lock();
-        if q.is_empty() {
-            // Check send_shutdown inside the lock to avoid TOCTOU race.
-            if self.send_shutdown.load(Ordering::Acquire) {
+        let mut state = self.state.lock();
+        if state.buf.is_empty() {
+            if state.send_shutdown {
                 return Ok(0);
             }
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
 
-        let n = core::cmp::min(available, q.len());
+        let n = core::cmp::min(available, state.buf.len());
         let mut tmp = Vec::with_capacity(n);
-        tmp.extend(q.iter().take(n).copied());
+        tmp.extend(state.buf.iter().take(n).copied());
 
         match out.write_to_user(offset, &tmp) {
             Ok(_) => {
                 for _ in 0..n {
-                    let _ = q.pop_front();
+                    let _ = state.buf.pop_front();
                 }
                 Ok(n)
             }
@@ -1078,11 +1131,10 @@ impl SelfConnected {
     }
 
     pub fn update_io_events(&self, pollee: &AtomicUsize) {
-        let send_shutdown = self.send_shutdown.load(Ordering::Acquire);
-        let queued = self.recv_queue();
-        let cap = self.rx_cap.load(Ordering::Relaxed);
-        let writable = !send_shutdown && queued < cap;
-        let readable = queued > 0 || send_shutdown; // readable after FIN to signal EOF
+        let state = self.state.lock();
+        let writable = !state.send_shutdown && state.buf.len() < state.rx_cap;
+        let readable = !state.buf.is_empty() || state.send_shutdown;
+        drop(state);
 
         if writable {
             pollee.fetch_or(

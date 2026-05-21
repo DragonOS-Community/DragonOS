@@ -2,7 +2,7 @@
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_IOCTL;
-use crate::filesystem::vfs::fasync::FAsyncItem;
+use crate::filesystem::vfs::fasync::set_file_fasync;
 use crate::filesystem::vfs::file::File;
 use crate::filesystem::vfs::file::FileFlags;
 use crate::syscall::table::FormattedSyscallParam;
@@ -79,7 +79,7 @@ impl Syscall for SysIoctlHandle {
                 return Ok(0);
             }
             FIOASYNC => {
-                return Self::handle_fioasync(&file, data);
+                return Self::handle_fioasync(&file, fd as i32, data);
             }
             FIOSETOWN | SIOCSPGRP => {
                 return Self::handle_fiosetown(&file, data);
@@ -157,7 +157,7 @@ impl SysIoctlHandle {
     }
 
     /// Handle FIOASYNC command: set/clear asynchronous I/O
-    fn handle_fioasync(file: &Arc<File>, data: usize) -> Result<usize, SystemError> {
+    fn handle_fioasync(file: &Arc<File>, fd: i32, data: usize) -> Result<usize, SystemError> {
         // 检查data指针是否为null
         if data == 0 {
             return Err(SystemError::EFAULT);
@@ -168,29 +168,7 @@ impl SysIoctlHandle {
             UserBufferReader::new(data as *const i32, core::mem::size_of::<i32>(), true)?;
         let value = user_reader.buffer_protected(0)?.read_one::<i32>(0)?;
 
-        // 获取当前文件模式
-        let mut flags = file.flags();
-        if value != 0 {
-            flags.insert(FileFlags::FASYNC);
-
-            // 通过 PollableInode 接口注册 FAsyncItem
-            if let Ok(pollable) = file.inode().as_pollable_inode() {
-                let fasync_item = Arc::new(FAsyncItem::new(Arc::downgrade(file)));
-                // 忽略不支持 fasync 的 inode
-                let _ = pollable.add_fasync(fasync_item, &file.private_data.lock());
-            }
-        } else {
-            flags.remove(FileFlags::FASYNC);
-
-            // 通过 PollableInode 接口移除 FAsyncItem
-            if let Ok(pollable) = file.inode().as_pollable_inode() {
-                // 忽略不支持 fasync 的 inode
-                let _ = pollable.remove_fasync(&Arc::downgrade(file), &file.private_data.lock());
-            }
-        }
-
-        // 更新文件标志
-        file.set_flags(flags)?;
+        set_file_fasync(file, fd, value != 0)?;
         Ok(0)
     }
 

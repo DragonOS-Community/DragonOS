@@ -25,14 +25,14 @@ impl Syscall for SysSetFsuid {
         let fsuid = Kuid::new(fsuid);
 
         let pcb = ProcessManager::current_pcb();
-        let mut guard = pcb.cred.lock();
+        let old_cred = pcb.cred();
 
-        let old_fsuid = guard.fsuid;
+        let old_fsuid = old_cred.fsuid;
 
-        if fsuid == guard.uid || fsuid == guard.euid || fsuid == guard.suid {
-            let mut new_cred: Cred = (**guard).clone();
+        if fsuid == old_cred.uid || fsuid == old_cred.euid || fsuid == old_cred.suid {
+            let mut new_cred: Cred = (*old_cred).clone();
             new_cred.setfsuid(fsuid.data());
-            *guard = Cred::new_arc(new_cred);
+            pcb.set_cred(Cred::new_arc(new_cred))?;
         }
 
         Ok(old_fsuid.data())

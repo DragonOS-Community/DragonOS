@@ -1,13 +1,16 @@
-use crate::driver::base::device::device_number::{DeviceNumber, Major};
-use crate::filesystem::devfs::LockedDevFSInode;
-use crate::filesystem::vfs::file::FileFlags;
-use crate::filesystem::vfs::{
-    vcore::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode, InodeFlags,
-    InodeMode, Metadata,
+use super::{DevFS, DeviceINode, LockedDevFSInode};
+use crate::{
+    driver::base::device::device_number::DeviceNumber,
+    filesystem::vfs::{
+        file::FileFlags, utils::DName, vcore::generate_inode_id, FilePrivateData, FileSystem,
+        FileType, IndexNode, InodeFlags, InodeMode, Metadata,
+    },
+    libs::{
+        mutex::{Mutex, MutexGuard},
+        rand::rand_bytes,
+    },
+    time::PosixTimeSpec,
 };
-use crate::libs::mutex::MutexGuard;
-use crate::libs::rand::rand_bytes;
-use crate::{filesystem::devfs::DevFS, libs::mutex::Mutex, time::PosixTimeSpec};
 use alloc::{
     string::String,
     sync::{Arc, Weak},
@@ -16,13 +19,12 @@ use alloc::{
 use core::{cmp::min, mem::size_of};
 use system_error::SystemError;
 
-use super::DeviceINode;
-
 #[derive(Debug)]
 pub struct RandomInode {
     self_ref: Weak<LockedRandomInode>,
     fs: Weak<DevFS>,
     parent: Weak<LockedDevFSInode>,
+    dname: DName,
     metadata: Metadata,
 }
 
@@ -30,11 +32,12 @@ pub struct RandomInode {
 pub struct LockedRandomInode(Mutex<RandomInode>);
 
 impl LockedRandomInode {
-    pub fn new() -> Arc<Self> {
+    pub fn new(name: &str, raw_dev: DeviceNumber) -> Arc<Self> {
         let inode = RandomInode {
             self_ref: Weak::default(),
             fs: Weak::default(),
             parent: Weak::default(),
+            dname: DName::from(name),
             metadata: Metadata {
                 dev_id: 1,
                 inode_id: generate_inode_id(),
@@ -51,7 +54,7 @@ impl LockedRandomInode {
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
-                raw_dev: DeviceNumber::new(Major::new(1), 8),
+                raw_dev,
             },
         };
 
@@ -157,5 +160,9 @@ impl IndexNode for LockedRandomInode {
             return Ok(parent);
         }
         Err(SystemError::ENOENT)
+    }
+
+    fn dname(&self) -> Result<DName, SystemError> {
+        Ok(self.0.lock().dname.clone())
     }
 }

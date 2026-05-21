@@ -82,7 +82,7 @@ impl ShebangLoader {
         // 5. 提取解释器路径 (到第一个空白字符)
         let interp_end = line
             .iter()
-            .position(|&c| c == b' ' || c == b'\t')
+            .position(|&c| c == b' ' || c == b'\t' || c == b'\0')
             .unwrap_or(line.len());
 
         let interpreter_path = core::str::from_utf8(&line[..interp_end])
@@ -101,13 +101,18 @@ impl ShebangLoader {
 
             if let Some(start) = arg_start {
                 let arg_line = &remaining[start..];
-                // 提取参数 (到下一个空白或行尾)
-                let arg_end = arg_line
+                // Linux/gVisor 语义：解释器路径后的其余内容是一个完整参数，内部空格需要保留。
+                let arg_line = &arg_line[..arg_line
                     .iter()
-                    .position(|&c| c == b' ' || c == b'\t')
-                    .unwrap_or(arg_line.len());
+                    .position(|&c| c == b'\0')
+                    .unwrap_or(arg_line.len())];
+                let arg_line = &arg_line[..arg_line
+                    .iter()
+                    .rposition(|&c| c != b' ' && c != b'\t')
+                    .map(|idx| idx + 1)
+                    .unwrap_or(0)];
 
-                let arg = core::str::from_utf8(&arg_line[..arg_end])
+                let arg = core::str::from_utf8(arg_line)
                     .map_err(|_| ExecError::ParseError)?
                     .to_string();
 

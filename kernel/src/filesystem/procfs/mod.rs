@@ -5,7 +5,10 @@
 use alloc::{sync::Arc, vec::Vec};
 use system_error::SystemError;
 
-use crate::{libs::once::Once, process::ProcessManager};
+use crate::{
+    libs::once::Once,
+    process::{cred::Cred, ProcessManager},
+};
 
 use super::vfs::mount::{MountFlags, MountPath};
 use super::vfs::InodeMode;
@@ -48,11 +51,15 @@ pub(super) use template::Builder;
 #[derive(Debug, Clone)]
 pub struct ProcfsFilePrivateData {
     pub data: Vec<u8>,
+    pub open_cred: Arc<Cred>,
 }
 
 impl ProcfsFilePrivateData {
     pub fn new() -> Self {
-        ProcfsFilePrivateData { data: Vec::new() }
+        ProcfsFilePrivateData {
+            data: Vec::new(),
+            open_cred: ProcessManager::current_pcb().cred(),
+        }
     }
 }
 

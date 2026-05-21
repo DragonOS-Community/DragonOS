@@ -340,14 +340,9 @@ impl IfaceCommon {
     }
 
     /// Defer removing a TCP socket from the SocketSet until it reaches Closed.
-    pub fn defer_tcp_close(
-        &self,
-        handle: smoltcp::iface::SocketHandle,
-        local_port: u16,
-        sock: alloc::sync::Weak<dyn crate::net::socket::inet::InetSocket>,
-    ) {
-        self.tcp_close_defer
-            .defer_tcp_close(handle, local_port, sock);
+    pub fn defer_tcp_close(&self, request: crate::net::tcp_close_defer::DeferredTcpCloseRequest) {
+        let now = crate::time::Instant::now().into();
+        self.tcp_close_defer.defer_tcp_close(now, request);
     }
 
     pub fn poll<D>(&self, device: &mut D) -> bool
@@ -365,6 +360,11 @@ impl IfaceCommon {
         let (has_events, poll_at) = {
             let poll_result = interface.poll(timestamp, device, &mut sockets);
 
+            // Reclaim/advance orphaned TCP sockets after smoltcp has processed ingress.
+            // If this aborts an orphan, compute poll_at afterwards so the pending RST is
+            // scheduled immediately instead of waiting for an unrelated future poll.
+            self.tcp_close_defer.reap_closed(timestamp, &mut sockets);
+
             (
                 matches!(poll_result, smoltcp::iface::PollResult::SocketStateChanged),
                 {
@@ -381,10 +381,6 @@ impl IfaceCommon {
                 },
             )
         };
-
-        // Reclaim TCP sockets that have fully closed.
-        // Lock order: sockets -> tcp_close_defer (matches close path, which may touch sockets then defer close).
-        self.tcp_close_defer.reap_closed(&mut sockets);
 
         // drop sockets here to avoid deadlock
         drop(interface);

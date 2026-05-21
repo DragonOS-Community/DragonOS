@@ -9,7 +9,9 @@ impl ProcessManager {
     pub fn arch_idle_func() -> ! {
         loop {
             if CurrentIrqArch::is_irq_enabled() {
+                crate::rcu::enter_idle();
                 riscv::asm::wfi();
+                crate::rcu::exit_idle();
             } else {
                 error!("Idle process should not be scheduled with IRQs disabled.");
                 spin_loop();

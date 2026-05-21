@@ -1,9 +1,6 @@
-WaitTest.Wait4Rusage
-WaitTest.WaitidRusage
 # 缺少 SYS_PTRACE
 WaitTest.TraceeWALL
 # 卡死
-Waiters/WaitAnyChildTest.WaitedChildRusage/*
 Waiters/WaitAnyChildTest.IgnoredChildRusage/*
 
 # 缺少 /bin/true

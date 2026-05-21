@@ -5,9 +5,10 @@ use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SCHED_GETAFFINITY;
-use crate::smp::cpu::smp_cpu_manager;
+use crate::process::{ProcessManager, RawPid};
+use crate::sched::syscall::util::has_sched_permission;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
-use crate::syscall::user_access::UserBufferWriter;
+use crate::syscall::user_access::copy_to_user_protected;
 
 pub struct SysSchedGetaffinity;
 
@@ -16,30 +17,39 @@ impl Syscall for SysSchedGetaffinity {
         3
     }
 
-    fn handle(&self, args: &[usize], frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        let _pid = args[0] as i32;
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
+        let pid = args[0] as i32;
         let size = args[1];
         let set_vaddr = args[2];
 
-        // 验证用户空间地址
-        let mut user_buffer_writer =
-            UserBufferWriter::new(set_vaddr as *mut u8, size, frame.is_from_user())?;
-        let set: &mut [u8] = user_buffer_writer.buffer(0)?;
+        if size == 0 {
+            return Err(SystemError::EINVAL);
+        }
 
-        // 获取CPU亲和性掩码
-        let cpu_manager = smp_cpu_manager();
-        let src = unsafe { cpu_manager.possible_cpus().inner().as_bytes() };
+        let target_pcb = if pid == 0 {
+            ProcessManager::current_pcb()
+        } else {
+            ProcessManager::find_task_by_vpid(RawPid::from(pid as usize))
+                .ok_or(SystemError::ESRCH)?
+        };
 
-        // 确保不会越界
+        let current_pcb = ProcessManager::current_pcb();
+        if !has_sched_permission(&current_pcb, &target_pcb) {
+            return Err(SystemError::EPERM);
+        }
+
+        let mask = target_pcb.sched_info().cpus_allowed();
+        let src = unsafe { mask.inner().as_bytes() };
         let copy_len = core::cmp::min(size, src.len());
-        set[..copy_len].copy_from_slice(&src[..copy_len]);
 
-        Ok(0)
+        unsafe { copy_to_user_protected(crate::mm::VirtAddr::new(set_vaddr), &src[..copy_len])? };
+
+        Ok(copy_len)
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
         vec![
-            FormattedSyscallParam::new("pid", args[0].to_string()),
+            FormattedSyscallParam::new("pid", (args[0] as i32).to_string()),
             FormattedSyscallParam::new("size", args[1].to_string()),
             FormattedSyscallParam::new("set", format!("0x{:x}", args[2])),
         ]

@@ -9,7 +9,7 @@ use crate::{
         video::VideoRefreshManager,
     },
     exception::{bottom_half::irq_bottom_half_init, init::irq_init, InterruptArch},
-    filesystem::vfs::vcore::vfs_init,
+    filesystem::{cgroup2::cgroup2_init, vfs::vcore::vfs_init},
     init::init_intertrait,
     libs::{
         futex::futex::Futex,
@@ -21,6 +21,7 @@ use crate::{
     },
     mm::init::mm_init,
     process::{kthread::kthread_init, process_init, ProcessManager},
+    rcu,
     sched::SchedArch,
     smp::{early_smp_init, SMPArch},
     syscall::{syscall_init, Syscall},
@@ -82,6 +83,10 @@ fn do_start_kernel() {
     acpi_init().expect("acpi init failed");
     crate::sched::sched_init();
     process_init();
+    rcu::init();
+    if let Err(e) = cgroup2_init() {
+        warn!("cgroup2 init failed: {:?}", e);
+    }
     early_smp_init().expect("early smp init failed");
     irq_init().expect("irq init failed");
     #[cfg(not(target_arch = "riscv64"))]

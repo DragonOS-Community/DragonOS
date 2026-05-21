@@ -302,7 +302,7 @@ pub trait PollableInode: Any + Sync + Send + Debug + CastFromSync {
     /// Add a fasync item for SIGIO notification
     fn add_fasync(
         &self,
-        _fasync_item: Arc<fasync::FAsyncItem>,
+        _fasync_item: fasync::FAsyncItem,
         _private_data: &FilePrivateData,
     ) -> Result<(), SystemError> {
         // Default implementation: not supported
@@ -666,6 +666,11 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @brief 获取inode所在的文件系统的指针
     fn fs(&self) -> Arc<dyn FileSystem>;
 
+    /// @brief 获取当前 inode 所在挂载点的挂载标志
+    fn mount_flags(&self) -> MountFlags {
+        MountFlags::empty()
+    }
+
     /// @brief 本函数用于实现动态转换。
     /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
     fn as_any_ref(&self) -> &dyn Any;
@@ -786,17 +791,17 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
 
     /// @brief 基于打开文件上下文执行同步（可使用文件句柄等私有信息）
     ///
-    /// 默认实现回退到 inode 级 `sync/datasync`。
+    /// 默认实现表示该 inode 没有提供 file-level fsync 操作。
+    ///
+    /// Linux 在 `file_operations.fsync` 缺失时返回 EINVAL。具体文件系统
+    /// 需要显式覆盖该方法，避免 pipe/socket/eventfd 等特殊 fd 被错误放行。
     fn sync_file(
         &self,
         datasync: bool,
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<(), SystemError> {
-        if datasync {
-            self.datasync()
-        } else {
-            self.sync()
-        }
+        let _ = datasync;
+        Err(SystemError::EINVAL)
     }
 
     /// @brief 仅同步数据到磁盘（不包括元数据）
@@ -1291,6 +1296,13 @@ pub struct SuperBlock {
     pub flags: u64,
 }
 
+pub struct FsReconfigureRequest<'a> {
+    pub sb_flags: MountFlags,
+    pub sb_flags_mask: MountFlags,
+    pub raw_data: Option<&'a str>,
+    pub oldapi: bool,
+}
+
 impl SuperBlock {
     pub fn new(magic: Magic, bsize: u64, namelen: u64) -> Self {
         Self {
@@ -1316,12 +1328,14 @@ bitflags! {
         const FUSE_MAGIC = 0x65735546;
         const TMPFS_MAGIC = 0x01021994;
         const KER_MAGIC = 0x3153464b;
+        const CGROUP2_SUPER_MAGIC = 0x63677270;
         const PROC_MAGIC = 0x9fa0;
         const RAMFS_MAGIC = 0x858458f6;
         const DEVPTS_MAGIC = 0x1cd1;
         const MOUNT_MAGIC = 61267;
         const PIPEFS_MAGIC = 0x50495045;
         const EVENTFD_MAGIC = 0x45564446; // "EVDF" in ASCII
+        const OVERLAYFS_MAGIC = 0x794c7630;
     }
 }
 
@@ -1366,6 +1380,13 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     /// 默认实现直接返回 super_block。需要自定义 statfs 行为的文件系统可覆写此方法。
     fn statfs(&self, _inode: &Arc<dyn IndexNode>) -> Result<SuperBlock, SystemError> {
         Ok(self.super_block())
+    }
+
+    fn reconfigure(&self, request: FsReconfigureRequest<'_>) -> Result<MountFlags, SystemError> {
+        if request.raw_data.is_some_and(|raw| !raw.trim().is_empty()) {
+            return Err(SystemError::EINVAL);
+        }
+        Ok(request.sb_flags & request.sb_flags_mask)
     }
 
     /// VFS permission checking policy for this filesystem instance.

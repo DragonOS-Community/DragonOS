@@ -485,8 +485,19 @@ impl IndexNode for FuseNode {
     }
 
     fn close(&self, data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
-        match &*data {
-            FilePrivateData::Fuse(FuseFilePrivateData::File(p)) => {
+        // `IndexNode::close()` is called from `File::drop()`, i.e. after the
+        // last `Arc<File>` reference is gone.  FUSE file/dir private data is
+        // immutable after open, so taking a snapshot here is not a TOCTOU
+        // window; it prevents holding the private-data mutex while waiting for
+        // userspace to reply to FLUSH/RELEASE.
+        let fuse_data = match &*data {
+            FilePrivateData::Fuse(data) => data.clone(),
+            _ => return Ok(()),
+        };
+        drop(data);
+
+        match fuse_data {
+            FuseFilePrivateData::File(p) => {
                 if p.no_open {
                     return Ok(());
                 }
@@ -501,14 +512,14 @@ impl IndexNode for FuseNode {
                     .request(FUSE_FLUSH, self.nodeid, fuse_pack_struct(&flush_in));
                 self.release_common(FUSE_RELEASE, p.fh, p.open_flags)
             }
-            FilePrivateData::Fuse(FuseFilePrivateData::Dir(p)) => {
+            FuseFilePrivateData::Dir(p) => {
                 if p.no_open {
                     Ok(())
                 } else {
                     self.release_common(FUSE_RELEASEDIR, p.fh, p.open_flags)
                 }
             }
-            _ => Ok(()),
+            FuseFilePrivateData::Dev(_) => Ok(()),
         }
     }
 

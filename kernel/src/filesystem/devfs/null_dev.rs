@@ -1,10 +1,10 @@
-use crate::driver::base::device::device_number::DeviceNumber;
+use crate::driver::base::device::device_number::{DeviceNumber, Major};
 use crate::filesystem::devfs::LockedDevFSInode;
 use crate::filesystem::vfs::file::FileFlags;
 use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::vfs::{
-    vcore::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode, InodeFlags,
-    Metadata,
+    utils::DName, vcore::generate_inode_id, FilePrivateData, FileSystem, FileType, IndexNode,
+    InodeFlags, Metadata,
 };
 use crate::libs::mutex::MutexGuard;
 use crate::{libs::mutex::Mutex, time::PosixTimeSpec};
@@ -56,7 +56,7 @@ impl LockedNullInode {
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
-                raw_dev: DeviceNumber::default(), // 这里用来作为device number
+                raw_dev: DeviceNumber::new(Major::new(1), 3), // /dev/null
             },
         };
 
@@ -151,5 +151,9 @@ impl IndexNode for LockedNullInode {
             return Ok(parent);
         }
         Err(SystemError::ENOENT)
+    }
+
+    fn dname(&self) -> Result<DName, SystemError> {
+        Ok(DName::from("null"))
     }
 }

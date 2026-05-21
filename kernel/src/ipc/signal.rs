@@ -11,8 +11,8 @@ use system_error::SystemError;
 use crate::{
     arch::ipc::signal::{SigSet, Signal},
     ipc::signal_types::{
-        SigCode, SigInfo, SigType, SigactionType, SignalFlags, SIG_KERNEL_IGNORE_MASK,
-        SIG_KERNEL_ONLY_MASK, SIG_KERNEL_STOP_MASK,
+        SaHandlerType, SigCode, SigInfo, SigType, SigactionType, SignalFlags,
+        SIG_KERNEL_IGNORE_MASK, SIG_KERNEL_ONLY_MASK, SIG_KERNEL_STOP_MASK,
     },
     libs::rwlock::RwLockWriteGuard,
     mm::VirtAddr,
@@ -46,6 +46,86 @@ pub fn send_kernel_signal_to_current(sig: Signal) -> Result<(), SystemError> {
 
     compiler_fence(Ordering::SeqCst);
     let ret = sig.send_signal_info(Some(&mut info), pid);
+    compiler_fence(Ordering::SeqCst);
+    ret.map(|_| ())
+}
+
+/// Force a kernel-originated signal to the current thread.
+///
+/// This mirrors Linux's force-signal behavior used by rseq error handling:
+/// a blocked or ignored fatal signal must be made deliverable instead of being
+/// left pending forever.
+pub fn force_kernel_signal_to_current(sig: Signal) -> Result<(), SystemError> {
+    let pcb = ProcessManager::current_pcb();
+
+    if let Some(mut action) = pcb.sighand().handler(sig) {
+        let blocked = pcb
+            .sig_info_irqsave()
+            .sig_blocked()
+            .contains(sig.into_sigset());
+        if blocked || action.is_ignore() {
+            action.set_action(SigactionType::SaHandler(SaHandlerType::Default));
+            pcb.sighand().set_handler(sig, action);
+        }
+
+        if action.is_default() {
+            pcb.sighand().flags_remove(SignalFlags::UNKILLABLE);
+        }
+    }
+
+    {
+        let mut siginfo = pcb.sig_info_mut();
+        siginfo.sig_block_mut().remove(sig.into_sigset());
+        siginfo.saved_sigmask_mut().remove(sig.into_sigset());
+    }
+    pcb.recalc_sigpending();
+
+    let mut info = SigInfo::new(
+        sig,
+        0,
+        SigCode::Kernel,
+        SigType::Kill {
+            pid: RawPid::new(0),
+            uid: 0,
+        },
+    );
+
+    compiler_fence(Ordering::SeqCst);
+    let ret = sig.send_signal_info_to_pcb(Some(&mut info), pcb, PidType::PID);
+    compiler_fence(Ordering::SeqCst);
+    ret.map(|_| ())
+}
+
+/// Force a kernel-originated signal to the current thread with its default
+/// disposition, even if userspace installed a handler.
+pub fn force_kernel_default_signal_to_current(sig: Signal) -> Result<(), SystemError> {
+    let pcb = ProcessManager::current_pcb();
+
+    if let Some(mut action) = pcb.sighand().handler(sig) {
+        action.set_action(SigactionType::SaHandler(SaHandlerType::Default));
+        pcb.sighand().set_handler(sig, action);
+    }
+    pcb.sighand().flags_remove(SignalFlags::UNKILLABLE);
+
+    {
+        let mut siginfo = pcb.sig_info_mut();
+        siginfo.sig_block_mut().remove(sig.into_sigset());
+        siginfo.saved_sigmask_mut().remove(sig.into_sigset());
+    }
+    pcb.recalc_sigpending();
+
+    let mut info = SigInfo::new(
+        sig,
+        0,
+        SigCode::Kernel,
+        SigType::Kill {
+            pid: RawPid::new(0),
+            uid: 0,
+        },
+    );
+
+    compiler_fence(Ordering::SeqCst);
+    let ret = sig.send_signal_info_to_pcb(Some(&mut info), pcb, PidType::PID);
     compiler_fence(Ordering::SeqCst);
     ret.map(|_| ())
 }

@@ -481,17 +481,16 @@ impl<'a> ExtentNodeMut<'a> {
         if pos < self.header().entries_count() as usize && self.extent_at(pos).is_unwritten() {
             // The position has an uninitialized extent
             *self.extent_mut_at(pos) = *extent;
-            self.header_mut().entries_count += 1;
             return Ok(());
         }
         // The position has a valid extent or is at the end
         if self.header().entries_count() < self.header().max_entries_count() {
             // The extent node is not full
             // Insert the extent and move the following extents
-            let mut i = pos;
-            while i < self.header().entries_count() as usize {
-                *self.extent_mut_at(i + 1) = *self.extent_at(i);
-                i += 1;
+            let mut i = self.header().entries_count() as usize;
+            while i > pos {
+                *self.extent_mut_at(i) = *self.extent_at(i - 1);
+                i -= 1;
             }
             *self.extent_mut_at(pos) = *extent;
             self.header_mut().entries_count += 1;
@@ -518,14 +517,13 @@ impl<'a> ExtentNodeMut<'a> {
                 }
             } else {
                 // Move the extents from `pos` to `unwritten`
-                let mut i = pos;
-                while i < unwritten {
-                    *self.extent_mut_at(i + 1) = *self.extent_at(i);
-                    i += 1;
+                let mut i = unwritten;
+                while i > pos {
+                    *self.extent_mut_at(i) = *self.extent_at(i - 1);
+                    i -= 1;
                 }
             }
             *self.extent_mut_at(pos) = *extent;
-            self.header_mut().entries_count += 1;
             return Ok(());
         }
         // The extent node is full and all extents are valid
@@ -567,10 +565,10 @@ impl<'a> ExtentNodeMut<'a> {
         if self.header().entries_count() < self.header().max_entries_count() {
             // The extent node is not full
             // Insert the extent index and move the following extent indexs
-            let mut i = pos;
-            while i < self.header().entries_count() as usize {
-                *self.extent_index_mut_at(i + 1) = *self.extent_index_at(i);
-                i += 1;
+            let mut i = self.header().entries_count() as usize;
+            while i > pos {
+                *self.extent_index_mut_at(i) = *self.extent_index_at(i - 1);
+                i -= 1;
             }
             *self.extent_index_mut_at(pos) = *extent_index;
             self.header_mut().entries_count += 1;
@@ -612,6 +610,41 @@ mod tests {
         assert!(header.check_magic());
         header.magic = 0;
         assert!(!header.check_magic());
+    }
+
+    #[test]
+    fn insert_extent_preserves_entries_after_insert_pos() {
+        let mut raw = [0u8; 60];
+        let mut node = ExtentNodeMut::from_bytes(&mut raw);
+        node.init(0, 0);
+        node.insert_extent(&Extent::new(0, 100, 1), 0).unwrap();
+        node.insert_extent(&Extent::new(2, 200, 1), 1).unwrap();
+        node.insert_extent(&Extent::new(1, 150, 1), 1).unwrap();
+
+        assert_eq!(node.header().entries_count(), 3);
+        assert_eq!(node.extent_at(0).start_lblock(), 0);
+        assert_eq!(node.extent_at(1).start_lblock(), 1);
+        assert_eq!(node.extent_at(2).start_lblock(), 2);
+        assert_eq!(node.extent_at(2).start_pblock(), 200);
+    }
+
+    #[test]
+    fn insert_extent_index_preserves_entries_after_insert_pos() {
+        let mut raw = [0u8; 60];
+        let mut node = ExtentNodeMut::from_bytes(&mut raw);
+        node.init(1, 0);
+        node.insert_extent_index(&ExtentIndex::new(0, 100), 0)
+            .unwrap();
+        node.insert_extent_index(&ExtentIndex::new(2, 200), 1)
+            .unwrap();
+        node.insert_extent_index(&ExtentIndex::new(1, 150), 1)
+            .unwrap();
+
+        assert_eq!(node.header().entries_count(), 3);
+        assert_eq!(node.extent_index_at(0).start_lblock(), 0);
+        assert_eq!(node.extent_index_at(1).start_lblock(), 1);
+        assert_eq!(node.extent_index_at(2).start_lblock(), 2);
+        assert_eq!(node.extent_index_at(2).leaf(), 200);
     }
 
     #[test]

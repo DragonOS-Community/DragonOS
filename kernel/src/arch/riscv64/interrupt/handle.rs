@@ -8,7 +8,12 @@ use system_error::SystemError;
 
 use super::TrapFrame;
 use crate::exception::ebreak::EBreak;
-use crate::{arch::syscall::syscall_handler, driver::irqchip::riscv_intc::riscv_intc_irq};
+use crate::{
+    arch::syscall::syscall_handler,
+    driver::{clocksource::timer_riscv::RiscVSbiTimer, irqchip::riscv_intc::riscv_intc_irq},
+    process::{utils::current_pcb_flags, ProcessFlags, ProcessManager},
+    sched::{SchedMode, SchedPolicy, __schedule},
+};
 
 type ExceptionHandler = fn(&mut TrapFrame) -> Result<(), SystemError>;
 
@@ -34,7 +39,17 @@ static EXCEPTION_HANDLERS: [ExceptionHandler; 16] = [
 #[no_mangle]
 unsafe extern "C" fn riscv64_do_irq(trap_frame: &mut TrapFrame) {
     if trap_frame.cause.is_interrupt() {
+        crate::rcu::irq_enter();
         riscv64_do_interrupt(trap_frame);
+        let should_schedule = current_pcb_flags().contains(ProcessFlags::NEED_SCHEDULE)
+            || trap_frame.cause.code() as u32 == RiscVSbiTimer::TIMER_IRQ.data();
+        let resume_idle_eqs = !should_schedule
+            && ProcessManager::current_pcb().sched_info().policy() == SchedPolicy::IDLE;
+        crate::rcu::irq_exit(resume_idle_eqs);
+
+        if should_schedule {
+            __schedule(SchedMode::SM_PREEMPT);
+        }
     } else if trap_frame.cause.is_exception() {
         riscv64_do_exception(trap_frame);
     }

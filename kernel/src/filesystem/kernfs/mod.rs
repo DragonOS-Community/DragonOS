@@ -21,8 +21,8 @@ use crate::{
 use self::callback::{KernCallbackData, KernFSCallback, KernInodePrivateData};
 
 use super::vfs::{
-    file::FileFlags, vcore::generate_inode_id, FilePrivateData, FileSystem, FileType, FsInfo,
-    IndexNode, InodeFlags, InodeId, InodeMode, Magic, Metadata, SuperBlock,
+    file::FileFlags, utils::DName, vcore::generate_inode_id, FilePrivateData, FileSystem, FileType,
+    FsInfo, IndexNode, InodeFlags, InodeId, InodeMode, Magic, Metadata, SuperBlock,
 };
 
 pub mod callback;
@@ -166,12 +166,15 @@ impl IndexNode for KernFSInode {
 
     fn open(
         &self,
-        _data: MutexGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         if let Some(callback) = self.callback {
-            let callback_data =
-                KernCallbackData::new(self.self_ref.upgrade().unwrap(), self.private_data.lock());
+            let callback_data = KernCallbackData::new(
+                self.self_ref.upgrade().unwrap(),
+                self.private_data.lock(),
+                data,
+            );
             return callback.open(callback_data);
         }
 
@@ -355,6 +358,10 @@ impl IndexNode for KernFSInode {
         return Ok(keys);
     }
 
+    fn dname(&self) -> Result<DName, SystemError> {
+        Ok(self.name.clone().into())
+    }
+
     fn read_at(
         &self,
         offset: usize,
@@ -389,11 +396,11 @@ impl IndexNode for KernFSInode {
             warn!("kernfs: callback is none");
             return Err(SystemError::ENOSYS);
         }
-        // release the private data lock before calling the callback
-        drop(data);
-
-        let callback_data =
-            KernCallbackData::new(self.self_ref.upgrade().unwrap(), self.private_data.lock());
+        let callback_data = KernCallbackData::new(
+            self.self_ref.upgrade().unwrap(),
+            self.private_data.lock(),
+            data,
+        );
         return self
             .callback
             .as_ref()
@@ -416,11 +423,11 @@ impl IndexNode for KernFSInode {
             return Err(SystemError::ENOSYS);
         }
 
-        // release the private data lock before calling the callback
-        drop(data);
-
-        let callback_data =
-            KernCallbackData::new(self.self_ref.upgrade().unwrap(), self.private_data.lock());
+        let callback_data = KernCallbackData::new(
+            self.self_ref.upgrade().unwrap(),
+            self.private_data.lock(),
+            data,
+        );
         return self
             .callback
             .as_ref()
@@ -430,7 +437,10 @@ impl IndexNode for KernFSInode {
 }
 
 impl KernFSInode {
-    pub fn new(
+    /// Create a new KernFSInode with a parent.
+    /// Uses Arc::new_cyclic to safely initialize self_ref without unsafe code.
+    /// After construction, sets the fs reference from parent if available.
+    pub fn new_with_parent(
         parent: Option<Arc<KernFSInode>>,
         name: String,
         mut metadata: Metadata,
@@ -439,17 +449,16 @@ impl KernFSInode {
         callback: Option<&'static dyn KernFSCallback>,
     ) -> Arc<KernFSInode> {
         metadata.file_type = inode_type.into();
-        let parent: Weak<KernFSInode> = parent.map(|x| Arc::downgrade(&x)).unwrap_or_default();
 
-        let inode = Arc::new(KernFSInode {
+        let inode = Arc::new_cyclic(|self_ref| KernFSInode {
             name,
             inner: RwSem::new(InnerKernFSInode {
-                parent: parent.clone(),
+                parent: parent.as_ref().map_or(Weak::new(), Arc::downgrade),
                 metadata,
                 symlink_target: None,
                 symlink_target_absolute_path: None,
             }),
-            self_ref: Weak::new(),
+            self_ref: self_ref.clone(),
             fs: RwSem::new(Weak::new()),
             private_data: Mutex::new(private_data),
             callback,
@@ -458,22 +467,29 @@ impl KernFSInode {
             lazy_list: Mutex::new(HashMap::new()),
         });
 
-        {
-            let ptr = inode.as_ref() as *const KernFSInode as *mut KernFSInode;
-            unsafe {
-                (*ptr).self_ref = Arc::downgrade(&inode);
+        // Set fs reference from parent if available
+        // This is done after construction to work within Arc::new_cyclic constraints
+        if let Some(ref parent) = parent {
+            if let Some(kernfs) = parent.fs().downcast_arc::<KernFS>() {
+                *inode.fs.write() = Arc::downgrade(&kernfs);
             }
         }
-        if parent.strong_count() > 0 {
-            let kernfs = parent
-                .upgrade()
-                .unwrap()
-                .fs()
-                .downcast_arc::<KernFS>()
-                .expect("KernFSInode::new: parent is not a KernFS instance");
-            *inode.fs.write() = Arc::downgrade(&kernfs);
-        }
-        return inode;
+
+        inode
+    }
+
+    /// Create a new KernFSInode (legacy interface).
+    /// This is an alias for new_with_parent.
+    #[deprecated(note = "Use new_with_parent instead")]
+    pub fn new(
+        parent: Option<Arc<KernFSInode>>,
+        name: String,
+        metadata: Metadata,
+        inode_type: KernInodeType,
+        private_data: Option<KernInodePrivateData>,
+        callback: Option<&'static dyn KernFSCallback>,
+    ) -> Arc<KernFSInode> {
+        Self::new_with_parent(parent, name, metadata, inode_type, private_data, callback)
     }
 
     /// 在当前inode下增加子目录
@@ -592,7 +608,7 @@ impl KernFSInode {
             flags: InodeFlags::empty(),
         };
 
-        let new_inode: Arc<KernFSInode> = Self::new(
+        let new_inode: Arc<KernFSInode> = Self::new_with_parent(
             Some(self.self_ref.upgrade().unwrap()),
             name.clone(),
             metadata,

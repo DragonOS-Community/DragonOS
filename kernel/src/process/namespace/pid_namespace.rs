@@ -88,6 +88,10 @@ impl PidNamespace {
         self.ns_common.level
     }
 
+    pub fn user_ns(&self) -> &Arc<UserNamespace> {
+        &self.user_ns
+    }
+
     pub fn alloc_pid_in_ns(&self, pid: Arc<Pid>) -> Result<RawPid, SystemError> {
         let mut inner = self.inner();
         let raw_pid = inner.do_alloc_pid_in_ns(pid)?;
@@ -208,7 +212,7 @@ impl PidNamespace {
 impl InnerPidNamespace {
     pub fn do_alloc_pid_in_ns(&mut self, pid: Arc<Pid>) -> Result<RawPid, SystemError> {
         if self.dead {
-            return Err(SystemError::ESRCH);
+            return Err(SystemError::ENOMEM);
         }
         let raw_pid = self.ida.alloc().ok_or(SystemError::ENOMEM)?;
         let raw_pid = RawPid(raw_pid);

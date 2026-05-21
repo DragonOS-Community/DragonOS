@@ -6,6 +6,7 @@ use x86::apic::ApicId;
 use crate::{
     arch::{
         driver::apic::{lapic_vector::local_apic_chip, CurrentApic, LocalAPIC},
+        process::stop_this_cpu,
         smp::SMP_BOOT_DATA,
     },
     exception::{
@@ -21,12 +22,14 @@ use super::TrapFrame;
 
 pub const IPI_NUM_KICK_CPU: IrqNumber = IrqNumber::new(200);
 pub const IPI_NUM_FLUSH_TLB: IrqNumber = IrqNumber::new(201);
+pub const IPI_NUM_STOP_CPU: IrqNumber = IrqNumber::new(202);
 /// IPI的种类(架构相关，指定了向量号)
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[repr(u32)]
 pub enum ArchIpiKind {
     KickCpu = IPI_NUM_KICK_CPU.data(),
     FlushTLB = IPI_NUM_FLUSH_TLB.data(),
+    StopCpu = IPI_NUM_STOP_CPU.data(),
     SpecVector(HardwareIrqNumber),
 }
 
@@ -35,6 +38,7 @@ impl From<IpiKind> for ArchIpiKind {
         match kind {
             IpiKind::KickCpu => ArchIpiKind::KickCpu,
             IpiKind::FlushTLB => ArchIpiKind::FlushTLB,
+            IpiKind::StopCpu => ArchIpiKind::StopCpu,
             IpiKind::SpecVector(vec) => ArchIpiKind::SpecVector(vec),
         }
     }
@@ -45,6 +49,7 @@ impl From<ArchIpiKind> for u8 {
         match value {
             ArchIpiKind::KickCpu => IPI_NUM_KICK_CPU.data() as u8,
             ArchIpiKind::FlushTLB => IPI_NUM_FLUSH_TLB.data() as u8,
+            ArchIpiKind::StopCpu => IPI_NUM_STOP_CPU.data() as u8,
             ArchIpiKind::SpecVector(vec) => (vec.data() & 0xFF) as u8,
         }
     }
@@ -101,10 +106,11 @@ impl ArchIpiTarget {
 
     #[inline(always)]
     fn cpu_id_to_apic_id(cpu_id: ProcessorId) -> x86::apic::ApicId {
+        let apic_id = SMP_BOOT_DATA.phys_id(cpu_id.data() as usize) as u32;
         if CurrentApic.x2apic_enabled() {
-            x86::apic::ApicId::X2Apic(cpu_id.data())
+            x86::apic::ApicId::X2Apic(apic_id)
         } else {
-            x86::apic::ApicId::XApic(cpu_id.data() as u8)
+            x86::apic::ApicId::XApic(apic_id as u8)
         }
     }
 }
@@ -157,33 +163,70 @@ pub fn send_ipi(kind: IpiKind, target: IpiTarget) {
     CurrentApic.write_icr(icr);
 }
 
-/// 发送smp初始化IPI
-pub fn ipi_send_smp_init() {
-    let target = ArchIpiTarget::Other;
+/// 向目标CPU发送smp初始化IPI
+pub fn ipi_send_smp_init(target_cpu: ProcessorId) -> Result<(), SystemError> {
+    if target_cpu.data() as usize >= SMP_BOOT_DATA.cpu_count() {
+        return Err(SystemError::EINVAL);
+    }
+    let target: ArchIpiTarget = IpiTarget::Specified(target_cpu).into();
     let icr = if CurrentApic.x2apic_enabled() {
         x86::apic::Icr::for_x2apic(
             0,
             target.into(),
-            x86::apic::DestinationShorthand::AllExcludingSelf,
+            x86::apic::DestinationShorthand::NoShorthand,
             x86::apic::DeliveryMode::Init,
             x86::apic::DestinationMode::Physical,
             x86::apic::DeliveryStatus::Idle,
-            x86::apic::Level::Deassert,
-            x86::apic::TriggerMode::Edge,
+            x86::apic::Level::Assert,
+            x86::apic::TriggerMode::Level,
         )
     } else {
         x86::apic::Icr::for_xapic(
             0,
             target.into(),
-            x86::apic::DestinationShorthand::AllExcludingSelf,
+            x86::apic::DestinationShorthand::NoShorthand,
+            x86::apic::DeliveryMode::Init,
+            x86::apic::DestinationMode::Physical,
+            x86::apic::DeliveryStatus::Idle,
+            x86::apic::Level::Assert,
+            x86::apic::TriggerMode::Level,
+        )
+    };
+    CurrentApic.write_icr(icr);
+    return Ok(());
+}
+
+/// 向目标CPU发送smp初始化IPI的deassert阶段
+pub fn ipi_send_smp_init_deassert(target_cpu: ProcessorId) -> Result<(), SystemError> {
+    if target_cpu.data() as usize >= SMP_BOOT_DATA.cpu_count() {
+        return Err(SystemError::EINVAL);
+    }
+    let target: ArchIpiTarget = IpiTarget::Specified(target_cpu).into();
+    let icr = if CurrentApic.x2apic_enabled() {
+        x86::apic::Icr::for_x2apic(
+            0,
+            target.into(),
+            x86::apic::DestinationShorthand::NoShorthand,
             x86::apic::DeliveryMode::Init,
             x86::apic::DestinationMode::Physical,
             x86::apic::DeliveryStatus::Idle,
             x86::apic::Level::Deassert,
-            x86::apic::TriggerMode::Edge,
+            x86::apic::TriggerMode::Level,
+        )
+    } else {
+        x86::apic::Icr::for_xapic(
+            0,
+            target.into(),
+            x86::apic::DestinationShorthand::NoShorthand,
+            x86::apic::DeliveryMode::Init,
+            x86::apic::DestinationMode::Physical,
+            x86::apic::DeliveryStatus::Idle,
+            x86::apic::Level::Deassert,
+            x86::apic::TriggerMode::Level,
         )
     };
     CurrentApic.write_icr(icr);
+    return Ok(());
 }
 
 /// 发送smp启动IPI
@@ -205,7 +248,7 @@ pub fn ipi_send_smp_startup(target_cpu: ProcessorId) -> Result<(), SystemError> 
             x86::apic::DeliveryMode::StartUp,
             x86::apic::DestinationMode::Physical,
             x86::apic::DeliveryStatus::Idle,
-            x86::apic::Level::Deassert,
+            x86::apic::Level::Assert,
             x86::apic::TriggerMode::Edge,
         )
     } else {
@@ -216,7 +259,7 @@ pub fn ipi_send_smp_startup(target_cpu: ProcessorId) -> Result<(), SystemError> 
             x86::apic::DeliveryMode::StartUp,
             x86::apic::DestinationMode::Physical,
             x86::apic::DeliveryStatus::Idle,
-            x86::apic::Level::Deassert,
+            x86::apic::Level::Assert,
             x86::apic::TriggerMode::Edge,
         )
     };
@@ -229,6 +272,7 @@ pub fn ipi_send_smp_startup(target_cpu: ProcessorId) -> Result<(), SystemError> 
 pub fn arch_ipi_handler_init() {
     do_init_irq_handler(IPI_NUM_KICK_CPU);
     do_init_irq_handler(IPI_NUM_FLUSH_TLB);
+    do_init_irq_handler(IPI_NUM_STOP_CPU);
 }
 
 fn do_init_irq_handler(irq: IrqNumber) {
@@ -255,6 +299,10 @@ impl IrqFlowHandler for X86_64IpiIrqFlowHandler {
             IPI_NUM_FLUSH_TLB => {
                 FlushTLBIpiHandler.handle(irq, None, None).ok();
                 CurrentApic.send_eoi();
+            }
+            IPI_NUM_STOP_CPU => {
+                CurrentApic.send_eoi();
+                stop_this_cpu();
             }
             _ => {
                 error!("Unknown IPI: {}", irq.data());

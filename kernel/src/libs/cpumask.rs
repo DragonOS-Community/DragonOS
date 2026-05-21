@@ -1,4 +1,7 @@
-use core::ops::BitAnd;
+use core::{
+    ops::BitAnd,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use bitmap::{traits::BitMapOps, AllocBitmap};
 
@@ -158,5 +161,51 @@ impl core::fmt::Debug for CpuMask {
         f.debug_struct("CpuMask")
             .field("bmp", &format!("size: {}", self.bmp.size()))
             .finish()
+    }
+}
+
+const BITS_PER_WORD: usize = u64::BITS as usize;
+const ATOMIC_CPUMASK_WORDS: usize = (PerCpu::MAX_CPU_NUM as usize).div_ceil(BITS_PER_WORD);
+
+pub struct AtomicCpuMask {
+    words: [AtomicU64; ATOMIC_CPUMASK_WORDS],
+}
+
+impl AtomicCpuMask {
+    pub const fn new() -> Self {
+        Self {
+            words: [const { AtomicU64::new(0) }; ATOMIC_CPUMASK_WORDS],
+        }
+    }
+
+    #[inline]
+    fn bit(cpu: ProcessorId) -> (usize, u64) {
+        let cpu = cpu.data() as usize;
+        let word = cpu / BITS_PER_WORD;
+        let bit = 1u64 << (cpu % BITS_PER_WORD);
+        (word, bit)
+    }
+
+    #[inline]
+    pub fn set(&self, cpu: ProcessorId) {
+        let (word, bit) = Self::bit(cpu);
+        self.words[word].fetch_or(bit, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn clear(&self, cpu: ProcessorId) {
+        let (word, bit) = Self::bit(cpu);
+        self.words[word].fetch_and(!bit, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn get(&self, cpu: ProcessorId) -> bool {
+        let (word, bit) = Self::bit(cpu);
+        (self.words[word].load(Ordering::Relaxed) & bit) != 0
+    }
+
+    #[allow(dead_code)]
+    pub fn first_and(&self, rhs: &CpuMask) -> Option<ProcessorId> {
+        rhs.iter_cpu().find(|&cpu| self.get(cpu))
     }
 }

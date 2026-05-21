@@ -13,7 +13,7 @@ use crate::{
         },
         tty::{
             console::ConsoleSwitch,
-            kthread::enqueue_tty_rx_from_irq,
+            kthread::enqueue_tty_rx_to_vc_from_irq,
             termios::{WindowSize, TTY_STD_TERMIOS},
             tty_core::{TtyCore, TtyCoreData},
             tty_driver::{TtyDriver, TtyDriverManager, TtyDriverType, TtyOperation},
@@ -38,6 +38,7 @@ use crate::{
         rwsem::{RwSemReadGuard, RwSemWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
+    mm::page::PAGE_4K_SIZE,
 };
 use alloc::string::String;
 use alloc::string::ToString;
@@ -56,6 +57,7 @@ use virtio_drivers::device::console::VirtIOConsole;
 
 const VIRTIO_CONSOLE_BASENAME: &str = "virtio_console";
 const HVC_MINOR: u32 = 0;
+const VIRTIO_CONSOLE_RX_IRQ_LIMIT: usize = PAGE_4K_SIZE;
 
 static mut VIRTIO_CONSOLE_DRIVER: Option<Arc<VirtIOConsoleDriver>> = None;
 static mut TTY_HVC_DRIVER: Option<Arc<TtyDriver>> = None;
@@ -153,6 +155,7 @@ impl VirtIOConsoleDevice {
                 device_common: DeviceCommonData::default(),
                 kobject_common: KObjectCommonData::default(),
                 irq,
+                input_vc_index: None,
             }),
         });
 
@@ -171,6 +174,7 @@ struct InnerVirtIOConsoleDevice {
     device_common: DeviceCommonData,
     kobject_common: KObjectCommonData,
     irq: Option<IrqNumber>,
+    input_vc_index: Option<usize>,
 }
 
 impl Debug for InnerVirtIOConsoleDevice {
@@ -181,6 +185,7 @@ impl Debug for InnerVirtIOConsoleDevice {
             .field("device_common", &self.device_common)
             .field("kobject_common", &self.kobject_common)
             .field("irq", &self.irq)
+            .field("input_vc_index", &self.input_vc_index)
             .finish()
     }
 }
@@ -314,19 +319,37 @@ impl Device for VirtIOConsoleDevice {
 
 impl VirtIODevice for VirtIOConsoleDevice {
     fn handle_irq(&self, _irq: IrqNumber) -> Result<IrqReturn, SystemError> {
-        let mut buf = [0u8; 8];
+        let mut buf = [0u8; 256];
         let mut index = 0;
-        // Read up to the size of the buffer
-        while index < buf.len() {
-            if let Ok(Some(c)) = self.inner().device_inner.recv(true) {
-                buf[index] = c;
-                index += 1;
-            } else {
-                break; // No more bytes to read
+        let mut received = 0;
+        let target_vc_index = self.inner().input_vc_index;
+
+        // 不能只取固定前缀：virtio-console 驱动会在本地缓存一个已完成的 rx buffer，
+        // 若中断上半部只消费其中一部分，剩余字节不会自动产生新中断，后续输入会错位。
+        // 同时限制单次 IRQ 的处理量，避免宿主持续写入时 hardirq 长时间不返回。
+        while received < VIRTIO_CONSOLE_RX_IRQ_LIMIT {
+            match self.inner().device_inner.recv(true) {
+                Ok(Some(c)) => {
+                    buf[index] = c;
+                    index += 1;
+                    received += 1;
+                    if index == buf.len() {
+                        if let Some(vc_index) = target_vc_index {
+                            enqueue_tty_rx_to_vc_from_irq(vc_index, &buf);
+                        }
+                        index = 0;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
             }
         }
 
-        enqueue_tty_rx_from_irq(&buf[0..index]);
+        if index > 0 {
+            if let Some(vc_index) = target_vc_index {
+                enqueue_tty_rx_to_vc_from_irq(vc_index, &buf[0..index]);
+            }
+        }
         Ok(IrqReturn::Handled)
     }
 
@@ -526,8 +549,10 @@ impl TtyOperation for VirtIOConsoleDriver {
 
         let vc = VirtConsole::new(Some(vc_data));
         let vc_index = vc_manager().alloc(vc.clone()).ok_or(SystemError::EBUSY)?;
+        dev.inner().input_vc_index = Some(vc_index);
         self.do_install(driver, tty, vc.clone()).inspect_err(|_| {
             vc_manager().free(vc_index);
+            dev.inner().input_vc_index = None;
         })?;
 
         Ok(())

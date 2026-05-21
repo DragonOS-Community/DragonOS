@@ -341,7 +341,7 @@ impl LoopbackInterface {
     ///
     /// ## 返回值
     /// 返回一个 `Arc<Self>`，即一个指向新创建的 `LoopbackInterface` 实例的智能指针。
-    pub fn new(mut driver: LoopbackDriver) -> Arc<Self> {
+    pub fn new(driver: LoopbackDriver) -> Arc<Self> {
         Self::new_with_ifindex(driver, generate_iface_id())
     }
 

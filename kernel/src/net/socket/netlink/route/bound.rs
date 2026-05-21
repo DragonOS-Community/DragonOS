@@ -78,8 +78,7 @@ impl datagram_common::Bound for BoundNetlink<RouteNlMessage> {
             }
 
             // SAFETY: `slice` has at least `size_of::<CMsgSegHdr>()` bytes.
-            let header =
-                unsafe { core::ptr::read_unaligned(slice.as_ptr() as *const CMsgSegHdr) };
+            let header = unsafe { core::ptr::read_unaligned(slice.as_ptr() as *const CMsgSegHdr) };
             let msg_len = header.len as usize;
             if msg_len < size_of::<CMsgSegHdr>() || offset + msg_len > buf.len() {
                 return Err(SystemError::EINVAL);
@@ -94,7 +93,12 @@ impl datagram_common::Bound for BoundNetlink<RouteNlMessage> {
             }
 
             if CSegmentType::try_from(header.type_).is_err() {
-                send_route_error_ack(&header, SystemError::EOPNOTSUPP_OR_ENOTSUP, local_port, netns.clone());
+                send_route_error_ack(
+                    &header,
+                    SystemError::EOPNOTSUPP_OR_ENOTSUP,
+                    local_port,
+                    netns.clone(),
+                );
                 continue;
             }
 

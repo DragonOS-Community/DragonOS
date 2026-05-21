@@ -186,9 +186,7 @@ impl ProtocolSegment for RouteNlSegment {
             RouteNlSegment::NewLink(link_segment) => link_segment.write_to_buf(buf)?,
             RouteNlSegment::NewNeigh(neigh_segment)
             | RouteNlSegment::DelNeigh(neigh_segment)
-            | RouteNlSegment::GetNeigh(neigh_segment) => {
-                neigh_segment.write_to_buf(buf)?
-            }
+            | RouteNlSegment::GetNeigh(neigh_segment) => neigh_segment.write_to_buf(buf)?,
             RouteNlSegment::Done(done_segment) => done_segment.write_to_buf(buf)?,
             RouteNlSegment::Error(error_segment) => error_segment.write_to_buf(buf)?,
             _ => {

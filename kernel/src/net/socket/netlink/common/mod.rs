@@ -373,15 +373,9 @@ where
                             .addr()
                             .map_or(0, |addr| addr.groups().as_u64());
                         let needed = self.list_memberships_needed_bytes();
-                        let groups_array = [
-                            groups as u32,
-                            (groups >> 32) as u32,
-                        ];
+                        let groups_array = [groups as u32, (groups >> 32) as u32];
                         let bytes = unsafe {
-                            core::slice::from_raw_parts(
-                                groups_array.as_ptr() as *const u8,
-                                needed,
-                            )
+                            core::slice::from_raw_parts(groups_array.as_ptr() as *const u8, needed)
                         };
                         let copy_len = core::cmp::min(value.len(), bytes.len());
                         value[..copy_len].copy_from_slice(&bytes[..copy_len]);

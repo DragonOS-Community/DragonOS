@@ -498,7 +498,6 @@ impl VirtioInterface {
     fn inner(&self) -> SpinLockGuard<'_, InnerVirtIOInterface> {
         return self.inner.lock();
     }
-
 }
 
 impl Drop for VirtioInterface {

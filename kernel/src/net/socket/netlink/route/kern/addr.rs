@@ -257,12 +257,7 @@ fn iface_to_new_addr(request_header: &CMsgSegHdr, iface: &Arc<dyn Iface>) -> Vec
     };
 
     for cidr in &ip_addrs {
-        if let Ok(segment) = addr_to_segment(
-            request_header,
-            iface,
-            *cidr,
-            CSegmentType::NEWADDR,
-        ) {
+        if let Ok(segment) = addr_to_segment(request_header, iface, *cidr, CSegmentType::NEWADDR) {
             segments.push(segment);
         }
     }

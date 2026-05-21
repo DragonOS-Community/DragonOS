@@ -10,7 +10,9 @@ use crate::{
                 CSegmentType,
             },
             route::{
-                kern::utils::{finish_response, kernel_notify_header, multicast_notify, RTMGRP_LINK},
+                kern::utils::{
+                    finish_response, kernel_notify_header, multicast_notify, RTMGRP_LINK,
+                },
                 message::{
                     attr::link::LinkAttr,
                     segment::{
@@ -177,9 +179,10 @@ pub(super) fn do_set_link(
     let updates = validate_setlink_request(request_segment, iface.as_ref())?;
 
     if let Some(ref name) = updates.name {
-        let duplicate = netns.device_list().iter().any(|(_, other)| {
-            !Arc::ptr_eq(other, &iface) && other.name() == *name
-        });
+        let duplicate = netns
+            .device_list()
+            .iter()
+            .any(|(_, other)| !Arc::ptr_eq(other, &iface) && other.name() == *name);
         if duplicate {
             return Err(SystemError::EEXIST);
         }

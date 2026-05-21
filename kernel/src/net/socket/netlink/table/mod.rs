@@ -95,7 +95,10 @@ impl<Message: 'static + Debug> ProtocolSocketTable<Message> {
 
     fn unicast(&self, dst_port: u32, message: Message) -> Result<(), SystemError> {
         let Some(receiver) = self.unicast_sockets.get(&dst_port) else {
-            log::warn!("netlink unicast: destination port {} is not bound", dst_port);
+            log::warn!(
+                "netlink unicast: destination port {} is not bound",
+                dst_port
+            );
             return Err(SystemError::ECONNREFUSED);
         };
         receiver.enqueue_message(message)

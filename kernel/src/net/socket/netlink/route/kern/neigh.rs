@@ -1,6 +1,10 @@
 use crate::{
     driver::net::StaticNeighborEntry,
     net::socket::{
+        netlink::route::message::{
+            attr::neigh::NeighAttr,
+            segment::{neigh::NeighSegment, RouteNlSegment},
+        },
         netlink::{
             message::segment::{
                 header::{CMsgSegHdr, GetRequestFlags, SegHdrCommonFlags},
@@ -12,10 +16,6 @@ use crate::{
                 },
                 message::segment::neigh::{NeighSegmentBody, NeighState},
             },
-        },
-        netlink::route::message::{
-            attr::neigh::NeighAttr,
-            segment::{neigh::NeighSegment, RouteNlSegment},
         },
         AddressFamily,
     },

@@ -149,11 +149,9 @@ pub(super) fn do_new_route(
     iface.common().upsert_netlink_route(entry);
 
     if let Err(err) = sync_iface_route_table(&iface, &parsed) {
-        iface.common().remove_netlink_route(
-            parsed.destination,
-            parsed.source,
-            parsed.table,
-        );
+        iface
+            .common()
+            .remove_netlink_route(parsed.destination, parsed.source, parsed.table);
         return Err(err);
     }
     multicast_notify(
@@ -449,7 +447,7 @@ fn sync_iface_route_table(
     let mut push_failed = false;
     iface.smol_iface().lock().routes_mut().update(|routes| {
         routes.retain(|existing| {
-            !(existing.cidr == route.destination && !is_local_connected_route(existing))
+            existing.cidr != route.destination || is_local_connected_route(existing)
         });
 
         if let Some(gateway) = route.gateway {
@@ -568,7 +566,10 @@ fn route_destination_prefix(cidr: IpCidr) -> IpAddress {
             if partial_bits != 0 && full_bytes < octets.len() {
                 octets[full_bytes] &= 0xffu8 << (8 - partial_bits);
             }
-            for byte in octets.iter_mut().skip(full_bytes + usize::from(partial_bits != 0)) {
+            for byte in octets
+                .iter_mut()
+                .skip(full_bytes + usize::from(partial_bits != 0))
+            {
                 *byte = 0;
             }
 

@@ -216,8 +216,10 @@ impl RawSocket {
                 } else {
                     self.options.read().ipv6_checksum
                 };
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(4)
+                // Linux do_rawv6_getsockopt: len = min(sizeof(int), user_len)
+                let len = core::cmp::min(value.len(), 4);
+                value[..len].copy_from_slice(&v.to_ne_bytes()[..len]);
+                Ok(len)
             }
             Ok(PIPV6::UNICAST_HOPS) => {
                 if value.len() < 4 {

@@ -1336,10 +1336,12 @@ pub fn rebind_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {
     pcb.sched_info().set_on_cpu(Some(cpu));
 }
 
+/// 对标 Linux ttwu_queue + ttwu_do_activate
 pub fn enqueue_task_on_cpu(
     pcb: &Arc<ProcessControlBlock>,
     target_cpu: ProcessorId,
     wake_flags: WakeupFlags,
+    was_uninterruptible: bool,
 ) {
     __set_task_cpu(pcb, target_cpu);
     pcb.sched_info().set_on_cpu(Some(target_cpu));
@@ -1350,6 +1352,10 @@ pub fn enqueue_task_on_cpu(
 
     if update_clock {
         rq.update_rq_clock();
+    }
+
+    if was_uninterruptible {
+        rq.dec_nr_uninterruptible();
     }
 
     let was_idle = rq_is_idle_cpu(rq);
@@ -1419,7 +1425,7 @@ pub fn request_task_migration(
         pcb.sched_info().set_on_cpu(None);
         drop(_guard);
 
-        enqueue_task_on_cpu(pcb, dest_cpu, WakeupFlags::WF_MIGRATED);
+        enqueue_task_on_cpu(pcb, dest_cpu, WakeupFlags::WF_MIGRATED, false);
         return Ok(());
     }
 

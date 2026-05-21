@@ -378,43 +378,17 @@ impl ProcessManager {
 
         pcb.debug_assert_fork_cpu_binding();
 
+        // TODO: select_task_rq 负载均衡
+        // let prev_cpu = pcb.sched_info().on_cpu().unwrap_or(current_cpu_id());
+        // let allowed = pi_guard.cpus_allowed.clone();
+        // let target_cpu = select_task_rq(pcb, prev_cpu, WakeupFlags::WF_TTWU, &allowed);
         let target_cpu = pcb.sched_info().on_cpu().unwrap_or(current_cpu_id());
-        let update_clock = target_cpu == smp_get_processor_id();
-        let rq = cpu_rq(target_cpu.data() as usize);
-
-        let (rq, _guard) = rq.self_lock();
-        debug_assert_eq!(
-            pcb.sched_info().on_cpu(),
-            Some(rq.cpu()),
-            "wakeup: on_cpu mismatch with rq.cpu"
-        );
-        if update_clock {
-            rq.update_rq_clock();
-        }
-        if was_uninterruptible {
-            rq.dec_nr_uninterruptible();
-        }
 
         if pcb.flags().contains(ProcessFlags::IN_IOWAIT) {
-            rq.dec_nr_iowait();
+            cpu_rq(target_cpu.data() as usize).dec_nr_iowait();
         }
 
-        let was_idle = rq_is_idle_cpu(rq);
-
-        rq.activate_task(
-            pcb,
-            EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK,
-        );
-
-        if was_idle && !rq_is_idle_cpu(rq) {
-            crate::sched::IDLE_CPUS.clear(target_cpu);
-        }
-
-        if update_clock {
-            rq.check_preempt_current(pcb, WakeupFlags::empty());
-        } else {
-            rq.check_preempt_remote(pcb, WakeupFlags::empty());
-        }
+        enqueue_task_on_cpu(pcb, target_cpu, WakeupFlags::empty(), was_uninterruptible);
 
         Ok(())
     }
@@ -444,7 +418,7 @@ impl ProcessManager {
             },
         )?;
 
-        enqueue_task_on_cpu(pcb, target_cpu, WakeupFlags::WF_FORK);
+        enqueue_task_on_cpu(pcb, target_cpu, WakeupFlags::WF_FORK, false);
 
         debug_assert!(!pcb.sched_info().is_new_task());
         Ok(())
@@ -562,36 +536,14 @@ impl ProcessManager {
                 pcb.sched_info().set_state(ProcessState::Runnable);
                 fence(Ordering::SeqCst);
 
-                let target_cpu = pcb.sched_info().on_cpu().unwrap_or(smp_get_processor_id());
-                let update_clock = target_cpu == smp_get_processor_id();
-                let rq = cpu_rq(target_cpu.data() as usize);
+                // TODO: select_task_rq 负载均衡
+                // let prev_cpu = pcb.sched_info().on_cpu().unwrap_or(smp_get_processor_id());
+                // let allowed = pi_guard.cpus_allowed.clone();
+                // let target_cpu = select_task_rq(pcb, prev_cpu, WakeupFlags::WF_TTWU, &allowed);
+                let target_cpu = pcb.sched_info().on_cpu().unwrap_or(current_cpu_id());
 
-                let (rq, _guard) = rq.self_lock();
-                debug_assert_eq!(
-                    pcb.sched_info().on_cpu(),
-                    Some(rq.cpu()),
-                    "wakeup_stop: on_cpu mismatch with rq.cpu"
-                );
-                if update_clock {
-                    rq.update_rq_clock();
-                }
-
-                let was_idle = rq_is_idle_cpu(rq);
-
-                rq.activate_task(
-                    pcb,
-                    EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK,
-                );
-
-                if was_idle && !rq_is_idle_cpu(rq) {
-                    crate::sched::IDLE_CPUS.clear(target_cpu);
-                }
-
-                if update_clock {
-                    rq.check_preempt_current(pcb, WakeupFlags::empty());
-                } else {
-                    rq.check_preempt_remote(pcb, WakeupFlags::empty());
-                }
+                // stop task
+                enqueue_task_on_cpu(pcb, target_cpu, WakeupFlags::empty(), false);
 
                 return Ok(());
             } else if state.is_runnable() {
@@ -1124,7 +1076,7 @@ impl ProcessManager {
         if let Some(dest_cpu) = migrate_prev_to {
             debug_assert!(!Arc::ptr_eq(&prev_pcb, &next_pcb));
             prev_pcb.sched_info().set_on_cpu(None);
-            enqueue_task_on_cpu(&prev_pcb, dest_cpu, WakeupFlags::WF_MIGRATED);
+            enqueue_task_on_cpu(&prev_pcb, dest_cpu, WakeupFlags::WF_MIGRATED, false);
         }
 
         let set_child_tid = next_pcb.thread.write_irqsave().set_child_tid.take();

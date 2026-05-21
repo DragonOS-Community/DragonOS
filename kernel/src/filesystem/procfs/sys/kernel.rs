@@ -2,7 +2,6 @@
 //!
 //! 提供内核参数配置接口
 
-use crate::libs::mutex::MutexGuard;
 use crate::{
     debug::klog::loglevel::KERNEL_LOG_LEVEL,
     filesystem::{
@@ -12,6 +11,7 @@ use crate::{
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
+    libs::mutex::MutexGuard,
 };
 use alloc::{
     format,
@@ -19,7 +19,14 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use core::sync::atomic::{AtomicU32, Ordering};
 use system_error::SystemError;
+
+static OVERFLOW_UID: AtomicU32 = AtomicU32::new(DEFAULT_OVERFLOW_ID);
+static OVERFLOW_GID: AtomicU32 = AtomicU32::new(DEFAULT_OVERFLOW_ID);
+
+const DEFAULT_OVERFLOW_ID: u32 = 65534;
+const MAX_OVERFLOW_ID: u32 = 65535;
 
 /// /proc/sys/kernel 目录的 DirOps 实现
 #[derive(Debug)]
@@ -40,18 +47,34 @@ impl DirOps for KernelDirOps {
         dir: &ProcDir<Self>,
         name: &str,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        if name == "printk" {
-            let mut cached_children = dir.cached_children().write();
-            if let Some(child) = cached_children.get(name) {
-                return Ok(child.clone());
+        match name {
+            "printk" => {
+                let mut cached_children = dir.cached_children().write();
+                if let Some(child) = cached_children.get(name) {
+                    return Ok(child.clone());
+                }
+
+                let inode = PrintkFileOps::new_inode(dir.self_ref_weak().clone());
+                cached_children.insert(name.to_string(), inode.clone());
+                return Ok(inode);
             }
+            "overflowuid" | "overflowgid" => {
+                let mut cached_children = dir.cached_children().write();
+                if let Some(child) = cached_children.get(name) {
+                    return Ok(child.clone());
+                }
 
-            let inode = PrintkFileOps::new_inode(dir.self_ref_weak().clone());
-            cached_children.insert(name.to_string(), inode.clone());
-            return Ok(inode);
+                let kind = if name == "overflowuid" {
+                    OverflowIdKind::Uid
+                } else {
+                    OverflowIdKind::Gid
+                };
+                let inode = OverflowIdFileOps::new_inode(dir.self_ref_weak().clone(), kind);
+                cached_children.insert(name.to_string(), inode.clone());
+                return Ok(inode);
+            }
+            _ => Err(SystemError::ENOENT),
         }
-
-        Err(SystemError::ENOENT)
     }
 
     fn populate_children(&self, dir: &ProcDir<Self>) {
@@ -59,6 +82,16 @@ impl DirOps for KernelDirOps {
         cached_children
             .entry("printk".to_string())
             .or_insert_with(|| PrintkFileOps::new_inode(dir.self_ref_weak().clone()));
+        cached_children
+            .entry("overflowuid".to_string())
+            .or_insert_with(|| {
+                OverflowIdFileOps::new_inode(dir.self_ref_weak().clone(), OverflowIdKind::Uid)
+            });
+        cached_children
+            .entry("overflowgid".to_string())
+            .or_insert_with(|| {
+                OverflowIdFileOps::new_inode(dir.self_ref_weak().clone(), OverflowIdKind::Gid)
+            });
     }
 }
 
@@ -127,5 +160,66 @@ impl FileOps for PrintkFileOps {
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Self::write_config(buf)
+    }
+}
+
+#[derive(Debug)]
+pub struct OverflowIdFileOps {
+    which: OverflowIdKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OverflowIdKind {
+    Uid,
+    Gid,
+}
+
+impl OverflowIdFileOps {
+    fn new_inode(parent: Weak<dyn IndexNode>, which: OverflowIdKind) -> Arc<dyn IndexNode> {
+        ProcFileBuilder::new(Self { which }, InodeMode::from_bits_truncate(0o644))
+            .parent(parent)
+            .build()
+            .unwrap()
+    }
+}
+
+impl FileOps for OverflowIdFileOps {
+    fn read_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        let val = match self.which {
+            OverflowIdKind::Uid => OVERFLOW_UID.load(Ordering::Relaxed),
+            OverflowIdKind::Gid => OVERFLOW_GID.load(Ordering::Relaxed),
+        };
+        let content = alloc::format!("{}\n", val);
+        proc_read(offset, len, buf, content.as_bytes())
+    }
+
+    fn write_at(
+        &self,
+        offset: usize,
+        _len: usize,
+        buf: &[u8],
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        // offset > 0 时静默忽略写入，返回成功但数据不生效。
+        if offset > 0 {
+            return Ok(buf.len());
+        }
+
+        let input = core::str::from_utf8(buf).map_err(|_| SystemError::EINVAL)?;
+        let val: u32 = input.trim().parse().map_err(|_| SystemError::EINVAL)?;
+        if val > MAX_OVERFLOW_ID {
+            return Err(SystemError::EINVAL);
+        }
+        match self.which {
+            OverflowIdKind::Uid => OVERFLOW_UID.store(val, Ordering::Relaxed),
+            OverflowIdKind::Gid => OVERFLOW_GID.store(val, Ordering::Relaxed),
+        }
+        Ok(buf.len())
     }
 }

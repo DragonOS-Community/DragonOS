@@ -830,10 +830,15 @@ fn propagate_one(
     // Add the cloned mount to the target's mountpoints
     target_mnt.add_mount(mountpoint_id, cloned_child.clone())?;
 
-    // Synchronize: also add to the target namespace's mount_list so that
-    // copy_mnt_ns can find the mount_path for every entry in mountpoints().
+    // 传播子挂载必须继承目标挂载点的 namespace，
+    // 否则后续 is_belongs_to_mntns() 检查会因 namespace 为 None 而误判 EINVAL。
     if let Some(ns) = target_mnt.namespace() {
-        let _ = ns.add_mount(Some(mountpoint_id), mount_path.clone(), cloned_child);
+        cloned_child.set_namespace(Arc::downgrade(&ns));
+        ns.add_mount(Some(mountpoint_id), mount_path.clone(), cloned_child)
+            .inspect_err(|_e| {
+                // 回滚 mountpoints 中已插入的克隆挂载。
+                target_mnt.mountpoints().remove(&mountpoint_id);
+            })?;
     }
 
     Ok(())
@@ -943,12 +948,15 @@ fn umount_at_peer(peer_mnt: &Arc<MountFS>, mountpoint_id: InodeId) -> Result<(),
             unregister_peer(child_prop.peer_group_id(), &child);
         }
 
-        // Synchronize: also remove from the peer namespace's mount_list
-        if let Some(ns) = peer_mnt.namespace() {
+        child.set_self_mountpoint(None);
+
+        // 先从 mount_list 移除，再清 namespace，避免 "namespace=None 但 mount_list 仍有记录" 的 TOCTOU 中间态。
+        if let Some(ns) = child.namespace() {
             if let Some(mp) = ns.mount_list().get_mount_path_by_ino(mountpoint_id) {
                 ns.remove_mount(mp.as_str());
             }
         }
+        child.clear_namespace();
         // log::debug!("umount_at_peer: removed mount at {:?}", mountpoint_id);
     }
     Ok(())

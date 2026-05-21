@@ -1,4 +1,5 @@
 /// 导出devfs的模块
+pub mod full_dev;
 pub mod null_dev;
 pub mod random_dev;
 pub mod zero_dev;
@@ -10,16 +11,21 @@ use super::{
         FileType, FsInfo, IndexNode, InodeFlags, InodeMode, Magic, Metadata, SuperBlock,
     },
 };
-use crate::filesystem::devfs::zero_dev::LockedZeroInode;
-use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
-use crate::mm::VmFaultReason;
+
 use crate::{
     driver::base::{block::gendisk::GenDisk, device::device_number::DeviceNumber},
-    filesystem::vfs::{mount::MountFlags, produce_fs},
+    filesystem::{
+        devfs::zero_dev::LockedZeroInode,
+        vfs::{mount::MountFlags, produce_fs},
+    },
     libs::{
         casting::DowncastArc,
         mutex::{Mutex, MutexGuard},
         once::Once,
+    },
+    mm::{
+        fault::{PageFaultHandler, PageFaultMessage},
+        VmFaultReason,
     },
     process::ProcessManager,
     time::PosixTimeSpec,
@@ -152,16 +158,29 @@ impl DevFS {
 
     /// @brief 注册系统内部自带的设备
     fn register_bultinin_device(&self) {
+        use crate::driver::base::device::device_number::{DeviceNumber, Major};
         use crate::filesystem::fuse::dev::LockedFuseDevInode;
+        use full_dev::LockedFullInode;
         use null_dev::LockedNullInode;
         use random_dev::LockedRandomInode;
         use zero_dev::LockedZeroInode;
+
         self.register_builtin_root_device("null", LockedNullInode::new())
             .expect("DevFS: Failed to register /dev/null");
         self.register_builtin_root_device("zero", LockedZeroInode::new())
             .expect("DevFS: Failed to register /dev/zero");
-        self.register_builtin_root_device("random", LockedRandomInode::new())
-            .expect("DevFS: Failed to register /dev/random");
+        self.register_builtin_root_device("full", LockedFullInode::new())
+            .expect("DevFS: Failed to register /dev/full");
+        self.register_builtin_root_device(
+            "random",
+            LockedRandomInode::new("random", DeviceNumber::new(Major::new(1), 8)),
+        )
+        .expect("DevFS: Failed to register /dev/random");
+        self.register_builtin_root_device(
+            "urandom",
+            LockedRandomInode::new("urandom", DeviceNumber::new(Major::new(1), 9)),
+        )
+        .expect("DevFS: Failed to register /dev/urandom");
         self.register_builtin_root_device("fuse", LockedFuseDevInode::new())
             .expect("DevFS: Failed to register /dev/fuse");
     }

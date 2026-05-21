@@ -37,10 +37,7 @@ impl FileOps for CmdlineFileOps {
         buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let pcb = self
-            .target
-            .thread_group_leader()
-            .ok_or(SystemError::ESRCH)?;
+        let pcb = self.target.task().ok_or(SystemError::ESRCH)?;
 
         // 获取 cmdline 字节
         let cmdline_bytes = pcb.cmdline_bytes();

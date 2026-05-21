@@ -29,10 +29,7 @@ impl ExeSymOps {
 
 impl SymOps for ExeSymOps {
     fn read_link(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let pcb = self
-            .target
-            .thread_group_leader()
-            .ok_or(SystemError::ESRCH)?;
+        let pcb = self.target.task().ok_or(SystemError::ESRCH)?;
         let exe = pcb.execute_path();
         let exe_bytes = exe.as_bytes();
         let len = exe_bytes.len().min(buf.len());

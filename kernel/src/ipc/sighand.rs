@@ -164,6 +164,16 @@ impl SigHand {
         self_guard.handlers = other_guard.handlers.clone();
     }
 
+    pub fn copy_process_state_from(&self, other: &Arc<SigHand>) {
+        let other_guard = other.inner();
+        let mut self_guard = self.inner_mut();
+        self_guard.flags = other_guard.flags;
+        self_guard.group_exit_code = other_guard.group_exit_code;
+        self_guard.group_exec_task = other_guard.group_exec_task.clone();
+        self_guard.group_exec_notify_count = other_guard.group_exec_notify_count;
+        self_guard.pids = other_guard.pids.clone();
+    }
+
     // ===== Shared pending helpers =====
     pub fn shared_pending_signal(&self) -> SigSet {
         let g = self.inner();

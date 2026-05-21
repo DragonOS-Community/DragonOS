@@ -5,15 +5,16 @@
 #include <sys/utsname.h>
 #include <errno.h>
 
-// Since setdomainname might not be in libc, we define it manually
-#ifdef __x86_64__
+// Since setdomainname might not be in libc, define the syscall number when
+// libc headers do not provide it.
+#ifndef __NR_setdomainname
+#if defined(__x86_64__)
 #define __NR_setdomainname 171
-#elif defined(__riscv)
-#define __NR_setdomainname 171
-#elif defined(__aarch64__)
-#define __NR_setdomainname 171
+#elif defined(__riscv) || defined(__loongarch64)
+#define __NR_setdomainname 162
 #else
 #define __NR_setdomainname 171
+#endif
 #endif
 
 static inline int sys_setdomainname(const char *name, size_t len)
@@ -26,6 +27,7 @@ int main() {
     char test_domain1[] = "test.domain.com";
     char test_domain2[] = "dragonos.test";
     char long_domain[256];
+    int failed = 0;
     
     printf("=== Testing setdomainname syscall ===\n\n");
     
@@ -93,10 +95,17 @@ int main() {
     
     // Test 4: Test with zero length
     printf("Test 4: Test with zero length\n");
-    if (sys_setdomainname("test", 0) == -1 && errno == EINVAL) {
-        printf("✓ Correctly returned EINVAL for zero length\n");
+    if (sys_setdomainname("test", 0) == 0) {
+        printf("✓ setdomainname accepted zero length\n");
+        if (uname(&uts) == 0 && strcmp(uts.__domainname, "") == 0) {
+            printf("✓ Domainname is empty\n");
+        } else {
+            printf("✗ Domainname should be empty after zero length set\n");
+            failed = 1;
+        }
     } else {
-        printf("✗ Should have failed with EINVAL for zero length\n");
+        perror("✗ setdomainname should accept zero length");
+        failed = 1;
     }
     printf("\n");
     
@@ -128,6 +137,6 @@ int main() {
         perror("✗ Failed to restore domainname");
     }
     
-    printf("\n=== Test completed ===\n");
-    return 0;
+    printf("\n=== Test %s ===\n", failed ? "failed" : "completed");
+    return failed ? 1 : 0;
 }

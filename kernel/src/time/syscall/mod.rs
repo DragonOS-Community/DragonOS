@@ -27,7 +27,7 @@ pub type PosixTimeT = c_longlong;
 pub type PosixSusecondsT = c_int;
 
 #[repr(C)]
-#[derive(Default, Debug, Copy, Clone)]
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
 pub struct PosixTimeval {
     pub tv_sec: PosixTimeT,
     pub tv_usec: PosixSusecondsT,

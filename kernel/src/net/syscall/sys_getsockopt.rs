@@ -228,7 +228,7 @@ pub(super) fn do_getsockopt(
     // 其它 level（如 SOL_IP/SOL_IPV6/SOL_RAW 等）交给具体 socket 实现。
     // gVisor raw_socket_test: getsockopt(SOL_IPV6, IPV6_CHECKSUM) 等
     {
-        let kbuf_len = user_len.clamp(64, MAX_OPTVAL_LEN);
+        let kbuf_len = user_len.min(MAX_OPTVAL_LEN);
         let mut kbuf = vec![0u8; kbuf_len];
         let written = socket.option(level, optname, &mut kbuf)?;
         let out_len = calc_out_len(optval, user_len, written);
@@ -238,6 +238,7 @@ pub(super) fn do_getsockopt(
             optval_writer.copy_to_user_protected(&kbuf[..out_len], 0)?;
         }
 
+        // Linux 语义：optlen 回写实际拷贝长度 min(user_len, option_size)。
         let mut optlen_writer =
             UserBufferWriter::new(optlen, core::mem::size_of::<u32>(), from_user)?;
         optlen_writer

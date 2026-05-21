@@ -291,8 +291,10 @@ impl RawSocket {
                 core::mem::size_of_val(&filt.icmp6_filt),
             )
         };
-        value[..bytes.len()].copy_from_slice(bytes);
-        Ok(bytes.len())
+        // Linux rawv6_geticmpfilter: 仅拷贝 min(用户缓冲区, filter) 字节。
+        let len = core::cmp::min(value.len(), bytes.len());
+        value[..len].copy_from_slice(&bytes[..len]);
+        Ok(len)
     }
 
     // ========================================================================

@@ -67,7 +67,7 @@ use crate::{
     sched::{
         DequeueFlag, EnqueueFlag, OnRq, SchedMode, SchedPolicy, Scheduler, WakeupFlags,
         __schedule_with_current, completion::Completion, cpu_is_online, cpu_rq,
-        enqueue_task_on_cpu, fair::FairSchedEntity, prio::MAX_PRIO, rq_is_idle_cpu, select_task_rq,
+        enqueue_task_on_cpu, fair::FairSchedEntity, prio::MAX_PRIO, select_task_rq,
     },
     smp::{
         core::smp_get_processor_id,
@@ -597,18 +597,23 @@ impl ProcessManager {
 
         let is_current = Arc::ptr_eq(&rq.current(), pcb);
 
-        // 排队中且非 current → 主动 dequeue。
-        // 使用 DEQUEUE_STOPPED 让 on_rq 进入 None（而非 Migrating），
-        if *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Queued && !is_current {
-            rq.deactivate_task(
-                pcb.clone(),
-                DequeueFlag::DEQUEUE_STOPPED | DequeueFlag::DEQUEUE_NOCLOCK,
-            );
-        }
-
-        // 正在远端 CPU 运行 → 发 IPI 让其尽快进 __schedule()，在那里 deactivate
-        if is_current && !update_clock {
-            kick_cpu(target_cpu).ok();
+        if *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Queued {
+            // 排队中且非current → 主动 dequeue
+            if !is_current {
+                rq.deactivate_task(
+                    pcb.clone(),
+                    DequeueFlag::DEQUEUE_STOPPED | DequeueFlag::DEQUEUE_NOCLOCK,
+                );
+            } else if !update_clock {
+                // 正在远端 CPU 运行：dequeue + kick
+                // 此处异步 dequeue，远端 CPU 收到 kick 后 __schedule(SM_PREEMPT) 时
+                // stopped task 已不在红黑树中，pick_next_task 不会选中它
+                rq.deactivate_task(
+                    pcb.clone(),
+                    DequeueFlag::DEQUEUE_STOPPED | DequeueFlag::DEQUEUE_NOCLOCK,
+                );
+                kick_cpu(target_cpu).ok();
+            }
         }
 
         drop(rq_guard);

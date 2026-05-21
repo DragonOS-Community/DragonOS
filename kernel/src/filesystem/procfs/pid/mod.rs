@@ -116,6 +116,10 @@ impl ProcPidTarget {
             .map(|pid| pid.pid_nr_ns(&self.view_pid_ns))
             .unwrap_or(RawPid::new(0))
     }
+
+    fn same_pid_object(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.pid, &other.pid) && Arc::ptr_eq(&self.view_pid_ns, &other.view_pid_ns)
+    }
 }
 
 /// /proc/[pid] 目录的 DirOps 实现
@@ -135,6 +139,12 @@ impl PidDirOps {
 
     fn get_process(&self) -> Option<Arc<ProcessControlBlock>> {
         self.target.thread_group_leader()
+    }
+
+    pub(super) fn is_current_target(&self) -> bool {
+        ProcPidTarget::from_tgid_in_ns(self.target.view_pid_ns().clone(), self.target.vpid())
+            .map(|target| self.target.same_pid_object(&target))
+            .unwrap_or(false)
     }
 
     #[expect(clippy::type_complexity)]

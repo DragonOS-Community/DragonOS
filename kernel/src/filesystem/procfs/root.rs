@@ -117,12 +117,12 @@ impl DirOps for RootDirOps {
             ) {
                 let mut cached_children = dir.cached_children().write();
 
-                // 检查缓存中是否已存在
                 if let Some(child) = cached_children.get(name) {
-                    return Ok(child.clone());
+                    if self.validate_child(child.as_ref()) {
+                        return Ok(child.clone());
+                    }
                 }
 
-                // 创建新的 PID 目录（只传递 PID，不传递进程引用）
                 let inode = PidDirOps::new_inode(target, dir.self_ref_weak().clone());
                 cached_children.insert(name.to_string(), inode.clone());
                 return Ok(inode);
@@ -161,13 +161,23 @@ impl DirOps for RootDirOps {
         // 获取缓存写锁并填充
         let mut cached_children = dir.cached_children().write();
 
+        cached_children.retain(|name, child| {
+            name.parse::<RawPid>().is_err() || self.validate_child(child.as_ref())
+        });
+
         // 填充进程目录（只传递 PID）
         for target in pid_targets {
-            cached_children
-                .entry(target.vpid().to_string())
-                .or_insert_with(|| {
-                    PidDirOps::new_inode(target.clone(), dir.self_ref_weak().clone())
-                });
+            let name = target.vpid().to_string();
+            let needs_refresh = cached_children
+                .get(&name)
+                .map(|child| !self.validate_child(child.as_ref()))
+                .unwrap_or(true);
+            if needs_refresh {
+                cached_children.insert(
+                    name,
+                    PidDirOps::new_inode(target.clone(), dir.self_ref_weak().clone()),
+                );
+            }
         }
 
         // 填充静态条目
@@ -175,6 +185,13 @@ impl DirOps for RootDirOps {
             (f)(dir.self_ref_weak().clone())
         });
         // 写锁在这里自动释放
+    }
+
+    fn validate_child(&self, child: &dyn IndexNode) -> bool {
+        if let Some(pid_dir) = child.downcast_ref::<ProcDir<PidDirOps>>() {
+            return pid_dir.ops().is_current_target();
+        }
+        true
     }
 }
 

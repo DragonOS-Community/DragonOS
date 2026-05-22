@@ -96,6 +96,8 @@ impl RawSocket {
                 if self.protocol != IpProtocol::Icmp {
                     return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
                 }
+                // Linux raw_geticmpfilter copies sizeof(struct icmp_filter)==32 bytes;
+                // DragonOS exposes a 32-bit mask for ICMP types 0–31 (see options::IcmpFilter).
                 let mask = self.options.read().icmp_filter.get_mask();
                 Ok(write_u32_getsockopt(value, mask))
             }
@@ -275,7 +277,7 @@ impl RawSocket {
                 opts.linger_linger = l_linger;
                 Ok(())
             }
-            _ => Ok(()),
+            _ => Err(SystemError::ENOPROTOOPT),
         }
     }
 
@@ -345,7 +347,7 @@ impl RawSocket {
                 let opt = IpOption::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
                 apply_ipv4_membership(&self.netns, opt, val, &self.ip_multicast_groups)
             }
-            _ => Ok(()),
+            _ => Err(SystemError::ENOPROTOOPT),
         }
     }
 
@@ -404,7 +406,7 @@ impl RawSocket {
                 self.options.write().recv_tclass = enable;
                 Ok(())
             }
-            _ => Ok(()),
+            _ => Err(SystemError::ENOPROTOOPT),
         }
     }
 

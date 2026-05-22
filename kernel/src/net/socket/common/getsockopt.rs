@@ -1,4 +1,6 @@
 //! Linux-aligned getsockopt value writers (truncate to user buffer length).
+//!
+//! Returns the number of bytes written into `value` (may be less than the option size).
 
 /// Write an `i32` socket option value.
 ///

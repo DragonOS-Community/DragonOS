@@ -552,14 +552,14 @@ impl super::TcpSocket {
                     .send_timeout_us()
                     .load(core::sync::atomic::Ordering::Relaxed);
                 let us = if us == u64::MAX { 0 } else { us };
-                write_timeval_opt(value, us)
+                Ok(write_timeval_opt(value, us))
             }
             PSO::RCVTIMEO_OLD | PSO::RCVTIMEO_NEW => {
                 let us = self
                     .recv_timeout_us()
                     .load(core::sync::atomic::Ordering::Relaxed);
                 let us = if us == u64::MAX { 0 } else { us };
-                write_timeval_opt(value, us)
+                Ok(write_timeval_opt(value, us))
             }
             PSO::RCVLOWAT => {
                 let v = self

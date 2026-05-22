@@ -218,12 +218,12 @@ impl UdpSocket {
             PSO::SNDTIMEO_OLD | PSO::SNDTIMEO_NEW => {
                 let us = self.send_timeout_us.load(Ordering::Relaxed);
                 let us = if us == u64::MAX { 0 } else { us };
-                write_timeval_opt(value, us)
+                Ok(write_timeval_opt(value, us))
             }
             PSO::RCVTIMEO_OLD | PSO::RCVTIMEO_NEW => {
                 let us = self.recv_timeout_us.load(Ordering::Relaxed);
                 let us = if us == u64::MAX { 0 } else { us };
-                write_timeval_opt(value, us)
+                Ok(write_timeval_opt(value, us))
             }
             PSO::REUSEADDR => Ok(write_i32_getsockopt(
                 value,
@@ -255,7 +255,7 @@ impl UdpSocket {
                 Ok(write_linger_getsockopt(value, on, linger))
             }
             PSO::ACCEPTCONN => Ok(write_i32_getsockopt(value, 0)),
-            PSO::ERROR => Ok(write_i32_getsockopt(value, 0)),
+            PSO::ERROR => Ok(write_i32_getsockopt(value, self.take_so_error())),
             PSO::NO_CHECK => Ok(write_i32_getsockopt(
                 value,
                 self.no_check.load(Ordering::Acquire) as i32,
@@ -355,38 +355,37 @@ impl UdpSocket {
                 use super::multicast_loopback::multicast_registry;
                 use crate::net::socket::inet::common::multicast::parse_mreqn_for_membership;
 
-                if let Ok((multiaddr, ifaddr, ifindex)) = parse_mreqn_for_membership(val) {
-                    // Determine the interface index
-                    let resolved_ifindex = if ifindex != 0 {
-                        ifindex
-                    } else if ifaddr != 0 {
-                        // Find interface by address
-                        use crate::net::socket::inet::common::multicast::find_iface_by_ipv4;
-                        find_iface_by_ipv4(&self.netns, ifaddr)
-                            .map(|iface| iface.nic_id() as i32)
-                            .unwrap_or(0)
-                    } else {
-                        // Use default interface
-                        use crate::net::socket::inet::common::multicast::choose_default_ipv4_iface;
-                        choose_default_ipv4_iface(&self.netns)
-                            .map(|iface| iface.nic_id() as i32)
-                            .unwrap_or(0)
-                    };
+                let (multiaddr, ifaddr, ifindex) = parse_mreqn_for_membership(val)?;
+                // Determine the interface index
+                let resolved_ifindex = if ifindex != 0 {
+                    ifindex
+                } else if ifaddr != 0 {
+                    // Find interface by address
+                    use crate::net::socket::inet::common::multicast::find_iface_by_ipv4;
+                    find_iface_by_ipv4(&self.netns, ifaddr)
+                        .map(|iface| iface.nic_id() as i32)
+                        .unwrap_or(0)
+                } else {
+                    // Use default interface
+                    use crate::net::socket::inet::common::multicast::choose_default_ipv4_iface;
+                    choose_default_ipv4_iface(&self.netns)
+                        .map(|iface| iface.nic_id() as i32)
+                        .unwrap_or(0)
+                };
 
-                    if resolved_ifindex != 0 {
-                        if opt == IpOption::ADD_MEMBERSHIP {
-                            multicast_registry().register(
-                                self.self_ref.clone(),
-                                multiaddr,
-                                resolved_ifindex,
-                            );
-                        } else {
-                            multicast_registry().unregister(
-                                &self.self_ref,
-                                multiaddr,
-                                resolved_ifindex,
-                            );
-                        }
+                if resolved_ifindex != 0 {
+                    if opt == IpOption::ADD_MEMBERSHIP {
+                        multicast_registry().register(
+                            self.self_ref.clone(),
+                            multiaddr,
+                            resolved_ifindex,
+                        );
+                    } else {
+                        multicast_registry().unregister(
+                            &self.self_ref,
+                            multiaddr,
+                            resolved_ifindex,
+                        );
                     }
                 }
 

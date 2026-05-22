@@ -191,7 +191,8 @@ impl TcpCloseDefer {
                     .get::<smoltcp::socket::tcp::Socket>(handle)
                     .remote_endpoint()
                     .is_some();
-                if rst_pending && !orphan_timed_out {
+                let is_reset_close = closing[i]._kind == DeferredTcpCloseKind::Reset;
+                if rst_pending && !is_reset_close && !orphan_timed_out {
                     i += 1;
                     continue;
                 }

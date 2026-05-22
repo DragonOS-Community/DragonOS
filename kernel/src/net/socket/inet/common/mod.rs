@@ -254,6 +254,13 @@ pub fn get_iface_to_bind(
         });
     }
 
+    // IPv6 loopback destinations (::1 etc.) are delivered via the loopback interface.
+    if let smoltcp::wire::IpAddress::Ipv6(v6_addr) = ip_addr {
+        return device_list.iter().find_map(|(_, iface)| {
+            loopback_iface_contains_v6(iface, *v6_addr).then(|| iface.clone())
+        });
+    }
+
     None
 }
 
@@ -279,6 +286,21 @@ fn loopback_iface_contains_v4(iface: &Arc<dyn Iface>, v4_addr: smoltcp::wire::Ip
     let smol_iface = iface.smol_iface().lock();
     smol_iface.ip_addrs().iter().any(|cidr| match cidr {
         smoltcp::wire::IpCidr::Ipv4(v4_cidr) => v4_cidr.contains_addr(&v4_addr),
+        _ => false,
+    })
+}
+
+#[inline]
+fn loopback_iface_contains_v6(iface: &Arc<dyn Iface>, v6_addr: smoltcp::wire::Ipv6Address) -> bool {
+    if !iface.flags().contains(InterfaceFlags::LOOPBACK) {
+        return false;
+    }
+    if v6_addr.is_loopback() {
+        return true;
+    }
+    let smol_iface = iface.smol_iface().lock();
+    smol_iface.ip_addrs().iter().any(|cidr| match cidr {
+        smoltcp::wire::IpCidr::Ipv6(v6_cidr) => v6_cidr.contains_addr(&v6_addr),
         _ => false,
     })
 }
@@ -332,6 +354,10 @@ fn iface_allowed_for_remote(iface: &Arc<dyn Iface>, loopback_dst: bool) -> bool 
 }
 
 fn no_source_addr_error(remote_ip_addr: &smoltcp::wire::IpAddress) -> SystemError {
+    // gVisor socket_ip_unbound_netlink / Linux 6.6:
+    // - IPv6 connect to ::1 without a local source on lo -> EADDRNOTAVAIL
+    // - IPv4 connect to 127.0.0.1 after removing 127.0.0.0/8 from lo -> ENETUNREACH
+    //   (ip_route_connect style "no route", not address-unavailable)
     match remote_ip_addr {
         smoltcp::wire::IpAddress::Ipv4(_) => SystemError::ENETUNREACH,
         // Linux IPv6 connect() distinguishes "no route to a remote network"

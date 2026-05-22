@@ -2,12 +2,24 @@
 
 /// Write an `i32` socket option value.
 ///
-/// Matches Linux `do_ipv6_getsockopt` / `do_ip_getsockopt` truncation:
-/// - empty buffer → 0 bytes
-/// - `0 < len < 4` and `0 <= v <= 255` → 1 byte (IPv4 path)
-/// - otherwise → `min(len, 4)` bytes of the integer representation
+/// Matches Linux `do_ipv6_getsockopt`, `sk_getsockopt`, and `tcp_getsockopt`:
+/// copy `min(user_len, sizeof(int))` bytes without the IPv4-only 1-byte shortcut.
 #[inline]
 pub fn write_i32_getsockopt(value: &mut [u8], v: i32) -> usize {
+    if value.is_empty() {
+        return 0;
+    }
+    let len = core::cmp::min(value.len(), core::mem::size_of::<i32>());
+    value[..len].copy_from_slice(&v.to_ne_bytes()[..len]);
+    len
+}
+
+/// Write an `i32` SOL_IP option value.
+///
+/// Matches Linux `do_ip_getsockopt` `copyval`: when `0 < len < 4` and `0 <= v <= 255`,
+/// only one byte is copied and returned.
+#[inline]
+pub fn write_i32_getsockopt_ipv4(value: &mut [u8], v: i32) -> usize {
     if value.is_empty() {
         return 0;
     }
@@ -15,9 +27,7 @@ pub fn write_i32_getsockopt(value: &mut [u8], v: i32) -> usize {
         value[0] = v as u8;
         return 1;
     }
-    let len = core::cmp::min(value.len(), core::mem::size_of::<i32>());
-    value[..len].copy_from_slice(&v.to_ne_bytes()[..len]);
-    len
+    write_i32_getsockopt(value, v)
 }
 
 /// Write a `u32` socket option value (`min(len, 4)` bytes).

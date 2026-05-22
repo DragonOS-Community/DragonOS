@@ -11,8 +11,8 @@ use super::inner::{DEFAULT_RX_BUF_SIZE, DEFAULT_TX_BUF_SIZE};
 use super::UdpSocket;
 use crate::libs::byte_parser;
 use crate::net::socket::common::{
-    parse_timeval_opt, write_i32_getsockopt, write_linger_getsockopt, write_timeval_opt,
-    write_u32_getsockopt,
+    parse_timeval_opt, write_i32_getsockopt, write_i32_getsockopt_ipv4, write_linger_getsockopt,
+    write_timeval_opt, write_u32_getsockopt,
 };
 use crate::net::socket::inet::common::{apply_ipv4_membership, apply_ipv4_multicast_if};
 use crate::net::socket::{AddressFamily, IpOption, PIPV6, PSO, PSOCK, PSOL};
@@ -450,7 +450,7 @@ impl UdpSocket {
             _ => return Err(SystemError::ENOPROTOOPT),
         };
 
-        Ok(write_i32_getsockopt(value, v))
+        Ok(write_i32_getsockopt_ipv4(value, v))
     }
 
     /// 处理 SOL_IPV6 级别的 setsockopt。

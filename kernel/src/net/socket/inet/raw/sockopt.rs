@@ -9,7 +9,7 @@ use super::constants::{
 use super::options::DEFAULT_IP_TTL;
 use super::{Icmp6Filter, RawSocket};
 use crate::net::socket::common::{
-    write_i32_getsockopt, write_linger_getsockopt, write_u32_getsockopt,
+    write_i32_getsockopt, write_i32_getsockopt_ipv4, write_linger_getsockopt, write_u32_getsockopt,
 };
 use crate::net::socket::inet::common::{apply_ipv4_membership, apply_ipv4_multicast_if};
 use crate::net::socket::{IpOption, IFNAMSIZ, PIPV6, PRAW, PSO};
@@ -109,27 +109,27 @@ impl RawSocket {
         value: &mut [u8],
     ) -> Result<usize, SystemError> {
         match IpOption::try_from(name as u32) {
-            Ok(IpOption::HDRINCL) => Ok(write_i32_getsockopt(
+            Ok(IpOption::HDRINCL) => Ok(write_i32_getsockopt_ipv4(
                 value,
                 self.options.read().ip_hdrincl as i32,
             )),
-            Ok(IpOption::TOS) => Ok(write_i32_getsockopt(
+            Ok(IpOption::TOS) => Ok(write_i32_getsockopt_ipv4(
                 value,
                 self.options.read().ip_tos as i32,
             )),
-            Ok(IpOption::TTL) => Ok(write_i32_getsockopt(
+            Ok(IpOption::TTL) => Ok(write_i32_getsockopt_ipv4(
                 value,
                 self.options.read().ip_ttl as i32,
             )),
-            Ok(IpOption::PKTINFO) => Ok(write_i32_getsockopt(
+            Ok(IpOption::PKTINFO) => Ok(write_i32_getsockopt_ipv4(
                 value,
                 self.options.read().recv_pktinfo_v4 as i32,
             )),
-            Ok(IpOption::RECVTTL) => Ok(write_i32_getsockopt(
+            Ok(IpOption::RECVTTL) => Ok(write_i32_getsockopt_ipv4(
                 value,
                 self.options.read().recv_ttl as i32,
             )),
-            Ok(IpOption::RECVTOS) => Ok(write_i32_getsockopt(
+            Ok(IpOption::RECVTOS) => Ok(write_i32_getsockopt_ipv4(
                 value,
                 self.options.read().recv_tos as i32,
             )),

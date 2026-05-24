@@ -224,6 +224,10 @@ impl TcpSocket {
         &self,
         remote_endpoint: smoltcp::wire::IpEndpoint,
     ) -> Result<(), SystemError> {
+        let remote_endpoint =
+            crate::net::socket::inet::common::normalize_unspecified_endpoint_to_loopback(
+                remote_endpoint,
+            );
         let mut writer = self.inner.write();
         let inner = writer.take().expect("Tcp inner::Inner is None");
         let (init, result) = match inner {

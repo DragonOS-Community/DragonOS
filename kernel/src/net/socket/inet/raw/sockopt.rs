@@ -83,12 +83,16 @@ impl RawSocket {
             }
             Ok(PSO::ACCEPTCONN) => Ok(write_i32_getsockopt(value, 0)),
             Ok(PSO::SNDTIMEO_OLD | PSO::SNDTIMEO_NEW) => {
-                let us = self.send_timeout_us.load(core::sync::atomic::Ordering::Relaxed);
+                let us = self
+                    .send_timeout_us
+                    .load(core::sync::atomic::Ordering::Relaxed);
                 let us = if us == u64::MAX { 0 } else { us };
                 Ok(write_timeval_opt(value, us))
             }
             Ok(PSO::RCVTIMEO_OLD | PSO::RCVTIMEO_NEW) => {
-                let us = self.recv_timeout_us.load(core::sync::atomic::Ordering::Relaxed);
+                let us = self
+                    .recv_timeout_us
+                    .load(core::sync::atomic::Ordering::Relaxed);
                 let us = if us == u64::MAX { 0 } else { us };
                 Ok(write_timeval_opt(value, us))
             }

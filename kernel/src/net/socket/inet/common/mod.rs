@@ -197,6 +197,23 @@ pub fn ensure_bound_dual_stack_remote_compatible(
     }
 }
 
+/// Linux treats connect/send destinations of INADDR_ANY/IN6ADDR_ANY as
+/// loopback in the same address family.
+#[inline]
+pub fn normalize_unspecified_endpoint_to_loopback(
+    endpoint: smoltcp::wire::IpEndpoint,
+) -> smoltcp::wire::IpEndpoint {
+    if !endpoint.addr.is_unspecified() {
+        return endpoint;
+    }
+
+    let addr = match endpoint.addr {
+        smoltcp::wire::IpAddress::Ipv4(_) => smoltcp::wire::IpAddress::v4(127, 0, 0, 1),
+        smoltcp::wire::IpAddress::Ipv6(_) => smoltcp::wire::IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 1),
+    };
+    smoltcp::wire::IpEndpoint::new(addr, endpoint.port)
+}
+
 #[inline]
 pub fn get_iface_to_bind(
     ip_addr: &smoltcp::wire::IpAddress,
@@ -317,6 +334,11 @@ fn iface_allowed_for_remote(iface: &Arc<dyn Iface>, loopback_dst: bool) -> bool 
 fn no_source_addr_error(remote_ip_addr: &smoltcp::wire::IpAddress) -> SystemError {
     match remote_ip_addr {
         smoltcp::wire::IpAddress::Ipv4(_) => SystemError::ENETUNREACH,
+        // Linux IPv6 connect() distinguishes "no route to a remote network"
+        // from "the local/loopback destination exists but no source address can
+        // be selected".  After ::1 is removed from lo, connecting to ::1 fails
+        // from ipv6_get_saddr() with EADDRNOTAVAIL.
+        smoltcp::wire::IpAddress::Ipv6(addr) if addr.is_loopback() => SystemError::EADDRNOTAVAIL,
         smoltcp::wire::IpAddress::Ipv6(_) => SystemError::ENETUNREACH,
     }
 }

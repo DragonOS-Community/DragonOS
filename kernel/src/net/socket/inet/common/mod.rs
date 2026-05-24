@@ -317,6 +317,11 @@ fn iface_allowed_for_remote(iface: &Arc<dyn Iface>, loopback_dst: bool) -> bool 
 fn no_source_addr_error(remote_ip_addr: &smoltcp::wire::IpAddress) -> SystemError {
     match remote_ip_addr {
         smoltcp::wire::IpAddress::Ipv4(_) => SystemError::ENETUNREACH,
+        // Linux IPv6 connect() distinguishes "no route to a remote network"
+        // from "the local/loopback destination exists but no source address can
+        // be selected".  After ::1 is removed from lo, connecting to ::1 fails
+        // from ipv6_get_saddr() with EADDRNOTAVAIL.
+        smoltcp::wire::IpAddress::Ipv6(addr) if addr.is_loopback() => SystemError::EADDRNOTAVAIL,
         smoltcp::wire::IpAddress::Ipv6(_) => SystemError::ENETUNREACH,
     }
 }

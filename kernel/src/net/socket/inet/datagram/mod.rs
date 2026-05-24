@@ -25,7 +25,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{
     AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
 };
-use smoltcp::wire::{IpAddress::*, IpEndpoint, IpListenEndpoint, IpVersion};
+use smoltcp::wire::{IpAddress::*, IpEndpoint, IpListenEndpoint, IpVersion, Ipv4Address};
 
 use super::{
     common::ensure_bound_dual_stack_remote_compatible, InetSocket, UNSPECIFIED_LOCAL_ENDPOINT_V4,
@@ -481,13 +481,21 @@ impl UdpSocket {
 
                 let reuseaddr = self.so_reuseaddr.load(Ordering::Relaxed);
                 let reuseport = self.so_reuseport.load(Ordering::Relaxed);
-                match inner.bind_ephemeral(
-                    remote,
-                    self.netns(),
-                    reuseaddr,
-                    reuseport,
-                    self.bind_id(),
-                ) {
+                let bound_result = if let Some((iface, local_addr)) =
+                    self.ipv4_multicast_ephemeral_bind_target(remote)
+                {
+                    inner.bind_ephemeral_on_iface(
+                        iface,
+                        local_addr,
+                        self.netns(),
+                        reuseaddr,
+                        reuseport,
+                        self.bind_id(),
+                    )
+                } else {
+                    inner.bind_ephemeral(remote, self.netns(), reuseaddr, reuseport, self.bind_id())
+                };
+                match bound_result {
                     Ok(bound) => {
                         newly_bound_iface = Some(bound.inner().iface().clone());
                         let local = bound.endpoint();
@@ -792,6 +800,48 @@ impl UdpSocket {
         }
     }
 
+    fn ipv4_multicast_ephemeral_bind_target(
+        &self,
+        dest: smoltcp::wire::IpAddress,
+    ) -> Option<(Arc<dyn Iface>, smoltcp::wire::IpAddress)> {
+        if !matches!(dest, Ipv4(addr) if addr.is_multicast()) {
+            return None;
+        }
+
+        let ifindex = self.ip_multicast_ifindex.load(Ordering::Relaxed);
+        let ifaddr = self.ip_multicast_addr.load(Ordering::Relaxed);
+        if ifindex == 0 && ifaddr == 0 {
+            return None;
+        }
+
+        let iface = if ifindex != 0 {
+            crate::net::socket::inet::common::multicast::find_iface_by_ifindex(&self.netns, ifindex)
+        } else {
+            crate::net::socket::inet::common::multicast::find_iface_by_ipv4(&self.netns, ifaddr)
+        }?;
+
+        if ifaddr != 0 {
+            let octets = ifaddr.to_ne_bytes();
+            return Some((
+                iface,
+                Ipv4(Ipv4Address::new(octets[0], octets[1], octets[2], octets[3])),
+            ));
+        }
+
+        let local_addr = {
+            let smol_iface = iface.smol_iface().lock();
+            smol_iface
+                .ip_addrs()
+                .iter()
+                .find_map(|cidr| match cidr.address() {
+                    Ipv4(addr) => Some(Ipv4(addr)),
+                    _ => None,
+                })
+        }?;
+
+        Some((iface, local_addr))
+    }
+
     fn enqueue_errqueue(
         &self,
         err: SockExtendedErr,
@@ -852,13 +902,27 @@ impl UdpSocket {
                 };
                 let reuseaddr = self.so_reuseaddr.load(Ordering::Relaxed);
                 let reuseport = self.so_reuseport.load(Ordering::Relaxed);
-                match unbound.bind_ephemeral(
-                    to_addr,
-                    self.netns(),
-                    reuseaddr,
-                    reuseport,
-                    self.bind_id(),
-                ) {
+                let bound_result = if let Some((iface, local_addr)) =
+                    self.ipv4_multicast_ephemeral_bind_target(to_addr)
+                {
+                    unbound.bind_ephemeral_on_iface(
+                        iface,
+                        local_addr,
+                        self.netns(),
+                        reuseaddr,
+                        reuseport,
+                        self.bind_id(),
+                    )
+                } else {
+                    unbound.bind_ephemeral(
+                        to_addr,
+                        self.netns(),
+                        reuseaddr,
+                        reuseport,
+                        self.bind_id(),
+                    )
+                };
+                match bound_result {
                     Ok(bound) => {
                         // Register for iface notifications on implicit bind via sendto().
                         bound

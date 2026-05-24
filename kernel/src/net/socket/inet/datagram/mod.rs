@@ -227,7 +227,7 @@ impl UdpSocket {
     /// Record a pending socket error for `getsockopt(SO_ERROR)` (Linux `sk->sk_err`).
     #[inline]
     pub(super) fn store_so_error(&self, err: &SystemError) {
-        let code = -(err.to_posix_errno() as i32);
+        let code = -err.to_posix_errno();
         if code != 0 {
             self.so_error.store(code, Ordering::Relaxed);
         }

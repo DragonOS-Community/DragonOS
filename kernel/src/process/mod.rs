@@ -1221,7 +1221,10 @@ bitflags! {
 
 impl ProcessFlags {
     pub const fn exit_to_user_mode_work(&self) -> Self {
-        Self::from_bits_truncate(self.bits & (Self::HAS_PENDING_SIGNAL.bits | Self::NEED_RSEQ.bits))
+        Self::from_bits_truncate(
+            self.bits
+                & (Self::NEED_SCHEDULE.bits | Self::HAS_PENDING_SIGNAL.bits | Self::NEED_RSEQ.bits),
+        )
     }
 
     /// 测试并清除标志位

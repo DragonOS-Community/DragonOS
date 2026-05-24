@@ -86,6 +86,8 @@ impl RawSocket {
             ip_multicast_ifindex: core::sync::atomic::AtomicI32::new(0),
             ip_multicast_addr: core::sync::atomic::AtomicU32::new(0),
             ip_multicast_groups: crate::libs::mutex::Mutex::new(Vec::new()),
+            send_timeout_us: core::sync::atomic::AtomicU64::new(u64::MAX),
+            recv_timeout_us: core::sync::atomic::AtomicU64::new(u64::MAX),
         });
 
         // Linux 语义：raw socket 未 bind 也应能被 poll/epoll 正确唤醒。
@@ -102,6 +104,28 @@ impl RawSocket {
 
     pub fn is_nonblock(&self) -> bool {
         self.nonblock.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(super) fn recv_timeout(&self) -> Option<crate::time::Duration> {
+        let us = self
+            .recv_timeout_us
+            .load(core::sync::atomic::Ordering::Relaxed);
+        if us == u64::MAX {
+            None
+        } else {
+            Some(crate::time::Duration::from_micros(us))
+        }
+    }
+
+    pub(super) fn send_timeout(&self) -> Option<crate::time::Duration> {
+        let us = self
+            .send_timeout_us
+            .load(core::sync::atomic::Ordering::Relaxed);
+        if us == u64::MAX {
+            None
+        } else {
+            Some(crate::time::Duration::from_micros(us))
+        }
     }
 
     #[inline]

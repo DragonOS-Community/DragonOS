@@ -9,7 +9,8 @@ use super::constants::{
 use super::options::DEFAULT_IP_TTL;
 use super::{Icmp6Filter, RawSocket};
 use crate::net::socket::common::{
-    write_i32_getsockopt, write_i32_getsockopt_ipv4, write_linger_getsockopt, write_u32_getsockopt,
+    parse_timeval_opt, write_i32_getsockopt, write_i32_getsockopt_ipv4, write_linger_getsockopt,
+    write_timeval_opt, write_u32_getsockopt,
 };
 use crate::net::socket::inet::common::{apply_ipv4_membership, apply_ipv4_multicast_if};
 use crate::net::socket::{IpOption, IFNAMSIZ, PIPV6, PRAW, PSO};
@@ -81,6 +82,16 @@ impl RawSocket {
                 ))
             }
             Ok(PSO::ACCEPTCONN) => Ok(write_i32_getsockopt(value, 0)),
+            Ok(PSO::SNDTIMEO_OLD | PSO::SNDTIMEO_NEW) => {
+                let us = self.send_timeout_us.load(core::sync::atomic::Ordering::Relaxed);
+                let us = if us == u64::MAX { 0 } else { us };
+                Ok(write_timeval_opt(value, us))
+            }
+            Ok(PSO::RCVTIMEO_OLD | PSO::RCVTIMEO_NEW) => {
+                let us = self.recv_timeout_us.load(core::sync::atomic::Ordering::Relaxed);
+                let us = if us == u64::MAX { 0 } else { us };
+                Ok(write_timeval_opt(value, us))
+            }
             Ok(PSO::DETACH_FILTER) => Err(SystemError::ENOPROTOOPT),
             _ => Err(SystemError::ENOPROTOOPT),
         }
@@ -275,6 +286,20 @@ impl RawSocket {
                 let mut opts = self.options.write();
                 opts.linger_onoff = if l_onoff != 0 { 1 } else { 0 };
                 opts.linger_linger = l_linger;
+                Ok(())
+            }
+            Ok(PSO::SNDTIMEO_OLD | PSO::SNDTIMEO_NEW) => {
+                let d = parse_timeval_opt(val)?;
+                let us = d.map(|v| v.total_micros()).unwrap_or(u64::MAX);
+                self.send_timeout_us
+                    .store(us, core::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Ok(PSO::RCVTIMEO_OLD | PSO::RCVTIMEO_NEW) => {
+                let d = parse_timeval_opt(val)?;
+                let us = d.map(|v| v.total_micros()).unwrap_or(u64::MAX);
+                self.recv_timeout_us
+                    .store(us, core::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
             _ => Err(SystemError::ENOPROTOOPT),

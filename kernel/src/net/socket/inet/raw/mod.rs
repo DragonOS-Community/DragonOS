@@ -4,7 +4,7 @@
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize};
 
 use smoltcp::wire::{IpProtocol, IpVersion};
 
@@ -86,4 +86,9 @@ pub struct RawSocket {
     ip_multicast_addr: AtomicU32,
     /// IP_ADD_MEMBERSHIP/IP_DROP_MEMBERSHIP state (best-effort, no actual IGMP)
     ip_multicast_groups: Mutex<Vec<crate::net::socket::inet::common::Ipv4MulticastMembership>>,
+
+    /// SO_SNDTIMEO (microseconds). u64::MAX means "no timeout".
+    send_timeout_us: AtomicU64,
+    /// SO_RCVTIMEO (microseconds). u64::MAX means "no timeout".
+    recv_timeout_us: AtomicU64,
 }

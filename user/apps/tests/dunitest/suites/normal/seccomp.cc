@@ -5,6 +5,8 @@
 #include <errno.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
+#include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -15,6 +17,8 @@
 #include <sys/wait.h>
 #include <ucontext.h>
 #include <unistd.h>
+
+#include <atomic>
 
 #include <gtest/gtest.h>
 
@@ -34,13 +38,19 @@ namespace {
 
 constexpr int kOk = 42;
 constexpr long kTrapReturn = 424242;
+constexpr int kTrapData = 0xdead;
 
-int InstallFilter(const struct sock_filter* filter, unsigned short len) {
+int InstallFilterWithFlags(const struct sock_filter* filter, unsigned short len,
+                           unsigned int flags) {
   struct sock_fprog prog = {
       .len = len,
       .filter = const_cast<struct sock_filter*>(filter),
   };
-  return syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog);
+  return syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, flags, &prog);
+}
+
+int InstallFilter(const struct sock_filter* filter, unsigned short len) {
+  return InstallFilterWithFlags(filter, len, 0);
 }
 
 int ChildStatus(void (*child)()) {
@@ -65,7 +75,7 @@ void InstallGetpidTrapFilter() {
   struct sock_filter filter[] = {
       BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
       BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_getpid, 0, 1),
-      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP | 123),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP | kTrapData),
       BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
   };
   if (InstallFilter(filter, sizeof(filter) / sizeof(filter[0])) != 0) {
@@ -77,7 +87,8 @@ void SeccompTrapHandler(int signo, siginfo_t* info, void* raw_ucontext) {
   if (signo != SIGSYS || info == nullptr || raw_ucontext == nullptr) {
     _exit(10);
   }
-  if (info->si_signo != SIGSYS || info->si_code != SYS_SECCOMP || info->si_errno != 123) {
+  if (info->si_signo != SIGSYS || info->si_code != SYS_SECCOMP ||
+      info->si_errno != kTrapData) {
     _exit(11);
   }
   if (info->si_call_addr == nullptr || info->si_syscall != __NR_getpid ||
@@ -90,6 +101,18 @@ void SeccompTrapHandler(int signo, siginfo_t* info, void* raw_ucontext) {
     _exit(13);
   }
   ctx->uc_mcontext.gregs[REG_RAX] = kTrapReturn;
+}
+
+void* SeccompTsyncThread(void* arg) {
+  auto* ready = reinterpret_cast<std::atomic<int>*>(arg);
+  while (ready->load(std::memory_order_acquire) == 0) {
+    sched_yield();
+  }
+
+  errno = 0;
+  long ret = syscall(__NR_getpid);
+  return reinterpret_cast<void*>(
+      static_cast<intptr_t>(ret == -1 && errno == ENOTNAM ? kOk : 3));
 }
 
 }  // namespace
@@ -213,6 +236,61 @@ TEST(SeccompTest, TrapDeliversSysSeccompSiginfoAndCanEmulateReturn) {
     errno = 0;
     long ret = syscall(__NR_getpid);
     _exit(ret == kTrapReturn && errno == 0 ? kOk : 3);
+  });
+
+  ASSERT_TRUE(WIFEXITED(status)) << "status=" << status;
+  EXPECT_EQ(WEXITSTATUS(status), kOk);
+}
+
+TEST(SeccompTest, TraceWithoutPtracerReturnsEnosys) {
+  int status = ChildStatus([] {
+    RequireNoNewPrivs();
+    struct sock_filter filter[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_getpid, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    if (InstallFilter(filter, sizeof(filter) / sizeof(filter[0])) != 0) {
+      _exit(2);
+    }
+
+    errno = 0;
+    long ret = syscall(__NR_getpid);
+    _exit(ret == -1 && errno == ENOSYS ? kOk : 3);
+  });
+
+  ASSERT_TRUE(WIFEXITED(status)) << "status=" << status;
+  EXPECT_EQ(WEXITSTATUS(status), kOk);
+}
+
+TEST(SeccompTest, TsyncAppliesFilterToSiblingThread) {
+  int status = ChildStatus([] {
+    RequireNoNewPrivs();
+
+    std::atomic<int> ready{0};
+    pthread_t thread;
+    if (pthread_create(&thread, nullptr, SeccompTsyncThread, &ready) != 0) {
+      _exit(2);
+    }
+
+    struct sock_filter filter[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_getpid, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOTNAM),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    if (InstallFilterWithFlags(filter, sizeof(filter) / sizeof(filter[0]),
+                               SECCOMP_FILTER_FLAG_TSYNC) != 0) {
+      _exit(3);
+    }
+
+    ready.store(1, std::memory_order_release);
+    void* result = nullptr;
+    if (pthread_join(thread, &result) != 0) {
+      _exit(4);
+    }
+    _exit(reinterpret_cast<intptr_t>(result) == kOk ? kOk : 5);
   });
 
   ASSERT_TRUE(WIFEXITED(status)) << "status=" << status;

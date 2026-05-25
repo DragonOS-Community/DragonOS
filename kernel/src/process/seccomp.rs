@@ -15,7 +15,7 @@ use crate::{
     arch::{interrupt::TrapFrame, ipc::signal::Signal},
     ipc::signal_types::{SaHandlerType, SigCode, SigInfo, SigType, SigactionType, SignalFlags},
     libs::spinlock::SpinLock,
-    process::{pid::PidType, ProcessManager},
+    process::{pid::PidType, ProcessControlBlock, ProcessManager},
     syscall::user_access::UserBufferReader,
 };
 
@@ -30,6 +30,8 @@ pub const SECCOMP_RET_KILL_THREAD: u32 = 0x00000000;
 pub const SECCOMP_RET_TRAP: u32 = 0x00030000;
 /// 返回 -errno
 pub const SECCOMP_RET_ERRNO: u32 = 0x00050000;
+/// 通知 ptracer；无 ptracer 时返回 -ENOSYS
+pub const SECCOMP_RET_TRACE: u32 = 0x7ff00000;
 /// 允许但记录日志
 pub const SECCOMP_RET_LOG: u32 = 0x7ffc0000;
 /// 允许
@@ -612,6 +614,9 @@ pub fn secure_computing(
                     let errno = data_val.min(MAX_ERRNO);
                     Ok(SeccompDecision::Skip((-(errno as i32)) as usize))
                 }
+                SECCOMP_RET_TRACE => Ok(SeccompDecision::Skip(
+                    SystemError::ENOSYS.to_posix_errno() as usize,
+                )),
                 SECCOMP_RET_LOG => {
                     log::info!(
                         "seccomp: pid={:?} syscall={} action=LOG",
@@ -632,9 +637,6 @@ pub fn secure_computing(
 }
 
 /// 发送 SIGSYS 信号给当前进程（TRAP 动作）
-///
-/// TODO: 扩展 SigCode/SigType，让用户态 siginfo 携带 Linux 的
-/// SYS_SECCOMP、call_addr、syscall 和 arch 字段。
 fn send_seccomp_sigsys(data: &SeccompData, errno: u32) {
     let pcb = ProcessManager::current_pcb();
     let sig = Signal::SIGSYS;
@@ -649,7 +651,7 @@ fn send_seccomp_sigsys(data: &SeccompData, errno: u32) {
 
     let mut info = SigInfo::new(
         sig,
-        errno.min(MAX_ERRNO) as i32,
+        errno as i32,
         SigCode::SysSeccomp,
         SigType::SigSys {
             call_addr: data.instruction_pointer,
@@ -823,7 +825,7 @@ pub fn seccomp_set_mode_strict() -> Result<(), SystemError> {
 ///
 /// # 参数
 /// - `fprog_ptr`: 用户态 sock_fprog 结构指针
-/// - `flags`: 安装标志（目前仅支持 SECCOMP_FILTER_FLAG_LOG）
+/// - `flags`: 安装标志（支持 LOG 和 TSYNC）
 pub fn seccomp_set_mode_filter(fprog_ptr: u64, flags: u32) -> Result<(), SystemError> {
     let current = ProcessManager::current_pcb();
 
@@ -843,12 +845,14 @@ pub fn seccomp_set_mode_filter(fprog_ptr: u64, flags: u32) -> Result<(), SystemE
     }
 
     // 解析 flags
+    const SECCOMP_FILTER_FLAG_TSYNC: u32 = 1 << 0;
     const SECCOMP_FILTER_FLAG_LOG: u32 = 1 << 1;
-    const SUPPORTED_FLAGS: u32 = SECCOMP_FILTER_FLAG_LOG;
+    const SUPPORTED_FLAGS: u32 = SECCOMP_FILTER_FLAG_TSYNC | SECCOMP_FILTER_FLAG_LOG;
     if flags & !SUPPORTED_FLAGS != 0 {
         return Err(SystemError::EINVAL);
     }
     let log = (flags & SECCOMP_FILTER_FLAG_LOG) != 0;
+    let tsync = (flags & SECCOMP_FILTER_FLAG_TSYNC) != 0;
 
     // 从用户空间读取 sock_fprog
     let fprog = read_sock_fprog(fprog_ptr)?;
@@ -863,16 +867,24 @@ pub fn seccomp_set_mode_filter(fprog_ptr: u64, flags: u32) -> Result<(), SystemE
     // 获取当前 filter 链头作为 prev
     let prev = current.seccomp_filter.lock().clone();
 
+    if tsync {
+        seccomp_can_sync_threads(&current, &prev)?;
+    }
+
     // 创建新 filter
-    let filter = SeccompFilter::new(insns, log, prev)?;
+    let filter = Arc::new(SeccompFilter::new(insns, log, prev)?);
 
     // 安装到链头
-    *current.seccomp_filter.lock() = Some(Arc::new(filter));
+    *current.seccomp_filter.lock() = Some(filter.clone());
 
     // 设置模式为 Filter（如果是第一次安装）
     current
         .seccomp_mode
         .store(SeccompMode::Filter as u8, Ordering::SeqCst);
+
+    if tsync {
+        seccomp_sync_threads(&current, filter);
+    }
 
     Ok(())
 }
@@ -888,10 +900,90 @@ pub fn seccomp_get_action_avail(action_ptr: u64) -> Result<(), SystemError> {
         | SECCOMP_RET_KILL_THREAD
         | SECCOMP_RET_TRAP
         | SECCOMP_RET_ERRNO
+        | SECCOMP_RET_TRACE
         | SECCOMP_RET_LOG
         | SECCOMP_RET_ALLOW => Ok(()),
         _ => Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
     }
+}
+
+fn seccomp_can_sync_threads(
+    current: &Arc<ProcessControlBlock>,
+    current_filter: &Option<Arc<SeccompFilter>>,
+) -> Result<(), SystemError> {
+    for thread in thread_group_tasks(current) {
+        if Arc::ptr_eq(&thread, current) || thread.is_exited() || thread.is_dead() {
+            continue;
+        }
+
+        match thread.seccomp_mode() {
+            SeccompMode::Disabled => continue,
+            SeccompMode::Filter => {
+                let thread_filter = thread.seccomp_filter.lock().clone();
+                if is_filter_ancestor(&thread_filter, current_filter) {
+                    continue;
+                }
+            }
+            _ => {}
+        }
+
+        return Err(SystemError::EINVAL);
+    }
+
+    Ok(())
+}
+
+fn seccomp_sync_threads(current: &Arc<ProcessControlBlock>, filter: Arc<SeccompFilter>) {
+    for thread in thread_group_tasks(current) {
+        if Arc::ptr_eq(&thread, current) || thread.is_exited() || thread.is_dead() {
+            continue;
+        }
+
+        *thread.seccomp_filter.lock() = Some(filter.clone());
+        thread
+            .seccomp_mode
+            .store(SeccompMode::Filter as u8, Ordering::SeqCst);
+        if current.no_new_privs() != 0 {
+            thread.set_no_new_privs(true);
+        }
+    }
+}
+
+fn thread_group_tasks(current: &Arc<ProcessControlBlock>) -> Vec<Arc<ProcessControlBlock>> {
+    let leader = current
+        .threads_read_irqsave()
+        .group_leader()
+        .unwrap_or_else(|| current.clone());
+    let mut tasks = Vec::new();
+    tasks.push(leader.clone());
+
+    let weak_tasks = leader.threads_read_irqsave().group_tasks_clone();
+    for weak in weak_tasks {
+        if let Some(task) = weak.upgrade() {
+            tasks.push(task);
+        }
+    }
+
+    tasks
+}
+
+fn is_filter_ancestor(
+    descendant: &Option<Arc<SeccompFilter>>,
+    ancestor: &Option<Arc<SeccompFilter>>,
+) -> bool {
+    let Some(ancestor) = ancestor else {
+        return false;
+    };
+
+    let mut current = descendant.clone();
+    while let Some(filter) = current {
+        if Arc::ptr_eq(&filter, ancestor) {
+            return true;
+        }
+        current = filter.prev().clone();
+    }
+
+    false
 }
 
 /// 从用户空间读取 sock_fprog 结构

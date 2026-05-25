@@ -1935,19 +1935,19 @@ impl InnerAddressSpace {
             return Err(SystemError::EINVAL);
         }
 
-        let intersect_vma = self.mappings.conflicts(requested).next();
-        if let Some(vma) = intersect_vma {
+        let has_conflict = self.mappings.conflicts(requested).next().is_some();
+        if has_conflict {
             if flags.contains(MapFlags::MAP_FIXED_NOREPLACE) {
                 // 如果指定了 MAP_FIXED_NOREPLACE 标志，由于所指定的地址无法成功建立映射，则放弃映射，不对地址做修正
                 return Err(SystemError::EEXIST);
             }
 
             if flags.contains(MapFlags::MAP_FIXED) {
-                // 对已有的VMA进行覆盖
-                let intersect_region = vma.lock().region.intersect(&requested).unwrap();
+                // Linux mmap_region() unmaps the whole requested range for MAP_FIXED,
+                // because the new mapping may overlap more than the first conflicting VMA.
                 self.munmap(
-                    VirtPageFrame::new(intersect_region.start),
-                    PageFrameCount::from_bytes(intersect_region.size).unwrap(),
+                    VirtPageFrame::new(requested.start()),
+                    PageFrameCount::from_bytes(requested.size()).unwrap(),
                 )?;
                 return Ok(requested);
             }

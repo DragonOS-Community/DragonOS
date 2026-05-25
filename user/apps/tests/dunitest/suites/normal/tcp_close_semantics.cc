@@ -6,15 +6,20 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <poll.h>
+#include <sched.h>
+#include <setjmp.h>
 #include <signal.h>
+#include <stdint.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
-#include <vector>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -220,6 +225,119 @@ struct WriterArgs {
     size_t len = 0;
     WriteResult* result = nullptr;
 };
+
+thread_local sigjmp_buf g_mm_signal_jmp;
+thread_local volatile sig_atomic_t g_mm_signal_active = 0;
+
+void MmSignalHandler(int sig, siginfo_t* si, void* uc) {
+    (void)sig;
+    (void)si;
+    (void)uc;
+    if (g_mm_signal_active) {
+        siglongjmp(g_mm_signal_jmp, 1);
+    }
+    _exit(99);
+}
+
+struct MmSmokeCtx {
+    volatile uint8_t* base = nullptr;
+    size_t len = 0;
+    std::atomic<int>* run = nullptr;
+};
+
+void* MmSmokeWriter(void* arg) {
+    auto* ctx = reinterpret_cast<MmSmokeCtx*>(arg);
+    size_t off = 0;
+    size_t spins = 0;
+
+    if (sigsetjmp(g_mm_signal_jmp, 1) != 0) {
+        sched_yield();
+    }
+    g_mm_signal_active = 1;
+
+    while (ctx->run->load(std::memory_order_acquire)) {
+        ctx->base[off] = static_cast<uint8_t>(off);
+        off += 13;
+        if (off >= ctx->len) {
+            off = 0;
+        }
+        if ((++spins & 0xff) == 0) {
+            sched_yield();
+        }
+    }
+
+    g_mm_signal_active = 0;
+    return nullptr;
+}
+
+void ExpectMmSignalPathResponsiveAfterTcpStorm() {
+    constexpr size_t kPageSize = 4096;
+    constexpr size_t kPages = 4;
+    constexpr size_t kLen = kPages * kPageSize;
+    constexpr int kIters = 128;
+
+    struct sigaction old_segv {};
+    struct sigaction old_bus {};
+    struct sigaction sa {};
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sa.sa_sigaction = MmSignalHandler;
+    sigemptyset(&sa.sa_mask);
+
+    ASSERT_EQ(0, sigaction(SIGSEGV, &sa, &old_segv))
+        << "sigaction(SIGSEGV) failed: " << ErrnoString(errno);
+    ASSERT_EQ(0, sigaction(SIGBUS, &sa, &old_bus))
+        << "sigaction(SIGBUS) failed: " << ErrnoString(errno);
+
+    auto restore_handlers = [&]() {
+        sigaction(SIGSEGV, &old_segv, nullptr);
+        sigaction(SIGBUS, &old_bus, nullptr);
+    };
+
+    auto* buf = static_cast<uint8_t*>(
+        mmap(nullptr, kLen, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    ASSERT_NE(MAP_FAILED, buf) << "mmap failed: " << ErrnoString(errno);
+    std::memset(buf, 0, kLen);
+
+    std::atomic<int> run{1};
+    MmSmokeCtx ctx {
+        .base = buf,
+        .len = kLen,
+        .run = &run,
+    };
+    pthread_t writer {};
+    ASSERT_EQ(0, pthread_create(&writer, nullptr, MmSmokeWriter, &ctx))
+        << "pthread_create failed: " << ErrnoString(errno);
+
+    int rc = 0;
+    for (int i = 0; i < kIters; ++i) {
+        if (mprotect(buf, kLen, PROT_READ) != 0) {
+            rc = errno;
+            break;
+        }
+
+        if (sigsetjmp(g_mm_signal_jmp, 1) == 0) {
+            g_mm_signal_active = 1;
+            *reinterpret_cast<volatile uint8_t*>(buf) = 0x5a;
+            rc = EFAULT;
+            break;
+        }
+        g_mm_signal_active = 0;
+
+        if (mprotect(buf, kLen, PROT_READ | PROT_WRITE) != 0) {
+            rc = errno;
+            break;
+        }
+    }
+    g_mm_signal_active = 0;
+
+    run.store(0, std::memory_order_release);
+    ASSERT_EQ(0, pthread_join(writer, nullptr))
+        << "pthread_join failed: " << ErrnoString(errno);
+    EXPECT_EQ(0, munmap(buf, kLen)) << "munmap failed: " << ErrnoString(errno);
+    restore_handlers();
+
+    EXPECT_EQ(0, rc) << "post TCP-storm mm/signal smoke failed: " << ErrnoString(rc);
+}
 
 void* WriterThread(void* arg) {
     auto* args = reinterpret_cast<WriterArgs*>(arg);
@@ -513,6 +631,8 @@ TEST(TcpCloseSemantics, ConcurrentResetDuringCloseDoesNotStall) {
             << "pthread_join failed: " << ErrnoString(errno);
         EXPECT_EQ(nullptr, result) << "worker " << i << " failed";
     }
+
+    ExpectMmSignalPathResponsiveAfterTcpStorm();
 }
 
 TEST(TcpCloseSemantics, ReversedDualStackResetDuringCloseDoesNotStall) {
@@ -534,6 +654,8 @@ TEST(TcpCloseSemantics, ReversedDualStackResetDuringCloseDoesNotStall) {
             << "pthread_join failed: " << ErrnoString(errno);
         EXPECT_EQ(nullptr, result) << "worker " << i << " failed";
     }
+
+    ExpectMmSignalPathResponsiveAfterTcpStorm();
 }
 
 }  // namespace

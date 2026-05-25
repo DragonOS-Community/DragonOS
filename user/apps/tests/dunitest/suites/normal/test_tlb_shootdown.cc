@@ -4,6 +4,7 @@
 #include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -58,15 +59,21 @@ struct ThreadCtx {
 void* hammer_writer(void* arg) {
     auto* ctx = static_cast<ThreadCtx*>(arg);
     size_t off = 0;
+    size_t spins = 0;
 
+    if (sigsetjmp(g_segv_jmp, 1) != 0) {
+        sched_yield();
+    }
     g_segv_active = 1;
-    (void)sigsetjmp(g_segv_jmp, 1);
 
     while (ctx->run->load(std::memory_order_acquire)) {
         ctx->base[off] = static_cast<uint8_t>(off);
         off += 13;
         if (off >= ctx->len) {
             off = 0;
+        }
+        if ((++spins & 0xff) == 0) {
+            sched_yield();
         }
     }
 
@@ -119,7 +126,6 @@ int case_mprotect_downgrade() {
     }
 
     int rc = 0;
-    g_segv_active = 1;
 
     for (int i = 0; i < kIters; ++i) {
         if (mprotect(buf, len, PROT_READ) < 0) {
@@ -129,11 +135,13 @@ int case_mprotect_downgrade() {
         }
 
         if (sigsetjmp(g_segv_jmp, 1) == 0) {
+            g_segv_active = 1;
             *reinterpret_cast<volatile uint8_t*>(buf) = 0xAA;
             fprintf(stderr, "FAIL: write to RO buf succeeded at iter %d\n", i);
             rc = -1;
             break;
         }
+        g_segv_active = 0;
 
         if (mprotect(buf, len, PROT_READ | PROT_WRITE) < 0) {
             perror("mprotect(RW)");
@@ -176,9 +184,9 @@ int case_munmap_while_writing() {
             return -1;
         }
 
-        g_segv_active = 1;
         int ok = 0;
         if (sigsetjmp(g_segv_jmp, 1) == 0) {
+            g_segv_active = 1;
             *reinterpret_cast<volatile uint8_t*>(buf) = 0xBB;
             fprintf(stderr, "FAIL: write to unmapped buf succeeded (iter %d)\n", i);
         } else {
@@ -212,15 +220,21 @@ void* hammer_writer_whole(void* arg) {
     auto* ctx = static_cast<HammerCtx*>(arg);
     size_t off = 0;
     uint8_t v = ctx->mark;
+    size_t spins = 0;
 
+    if (sigsetjmp(g_segv_jmp, 1) != 0) {
+        sched_yield();
+    }
     g_segv_active = 1;
-    (void)sigsetjmp(g_segv_jmp, 1);
 
     while (ctx->run->load(std::memory_order_acquire)) {
         ctx->base[off] = v++;
         off += 13;
         if (off >= ctx->len) {
             off = 0;
+        }
+        if ((++spins & 0xff) == 0) {
+            sched_yield();
         }
     }
 
@@ -326,7 +340,7 @@ int case_fork_cow_stale_tlb() {
                     _exit(10);
                 }
             }
-            usleep(500);
+            sched_yield();
         }
         delete[] snap;
         _exit(0);

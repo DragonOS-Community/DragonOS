@@ -166,6 +166,24 @@ impl StatusFileOps {
                 .to_owned(),
         );
 
+        pdata.append(
+            &mut format!("\nNoNewPrivs:\t{}", pcb.no_new_privs())
+                .as_bytes()
+                .to_owned(),
+        );
+        pdata.append(
+            &mut format!("\nSeccomp:\t{}", pcb.seccomp_mode() as u8)
+                .as_bytes()
+                .to_owned(),
+        );
+        let seccomp_filters =
+            crate::process::seccomp::SeccompFilter::chain_len(&pcb.seccomp_filter_lock());
+        pdata.append(
+            &mut format!("\nSeccomp_filters:\t{}", seccomp_filters)
+                .as_bytes()
+                .to_owned(),
+        );
+
         // 去除多余的 \0 并在结尾添加 \0
         trim_string(&mut pdata);
 

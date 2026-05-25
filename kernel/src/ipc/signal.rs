@@ -242,7 +242,7 @@ impl Signal {
         // signal的信息为空
 
         if let Some(ref siginfo) = info {
-            force_send = matches!(siginfo.sig_code(), SigCode::Kernel);
+            force_send = matches!(siginfo.sig_code(), SigCode::Kernel | SigCode::SysSeccomp);
         } else {
             // todo: 判断signal是否来自于一个祖先进程的namespace，如果是，则强制发送信号
             //详见 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/signal.c?r=&mo=32170&fi=1220#1226

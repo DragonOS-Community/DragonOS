@@ -9,6 +9,7 @@ use crate::{
 
 const SECCOMP_SET_MODE_STRICT: u32 = 0;
 const SECCOMP_SET_MODE_FILTER: u32 = 1;
+const SECCOMP_GET_ACTION_AVAIL: u32 = 2;
 
 pub struct SysSeccomp;
 
@@ -24,7 +25,7 @@ impl Syscall for SysSeccomp {
 
         match op {
             SECCOMP_SET_MODE_STRICT => {
-                if flags != 0 {
+                if flags != 0 || uargs != 0 {
                     return Err(SystemError::EINVAL);
                 }
                 seccomp::seccomp_set_mode_strict()?;
@@ -32,6 +33,13 @@ impl Syscall for SysSeccomp {
             }
             SECCOMP_SET_MODE_FILTER => {
                 seccomp::seccomp_set_mode_filter(uargs, flags)?;
+                Ok(0)
+            }
+            SECCOMP_GET_ACTION_AVAIL => {
+                if flags != 0 {
+                    return Err(SystemError::EINVAL);
+                }
+                seccomp::seccomp_get_action_avail(uargs)?;
                 Ok(0)
             }
             _ => Err(SystemError::EINVAL),
@@ -43,6 +51,7 @@ impl Syscall for SysSeccomp {
         let op_str = match op_val as u32 {
             SECCOMP_SET_MODE_STRICT => "SET_MODE_STRICT".to_string(),
             SECCOMP_SET_MODE_FILTER => "SET_MODE_FILTER".to_string(),
+            SECCOMP_GET_ACTION_AVAIL => "GET_ACTION_AVAIL".to_string(),
             _ => format!("{:#x}", op_val),
         };
 

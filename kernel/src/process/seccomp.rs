@@ -12,8 +12,8 @@ use log::warn;
 use system_error::SystemError;
 
 use crate::{
-    arch::ipc::signal::Signal,
-    ipc::signal_types::{SigCode, SigInfo, SigType},
+    arch::{interrupt::TrapFrame, ipc::signal::Signal},
+    ipc::signal_types::{SaHandlerType, SigCode, SigInfo, SigType, SigactionType, SignalFlags},
     libs::spinlock::SpinLock,
     process::{pid::PidType, ProcessManager},
     syscall::user_access::UserBufferReader,
@@ -76,7 +76,7 @@ impl From<u8> for SeccompMode {
 pub struct SeccompData {
     /// 系统调用号
     pub nr: i32,
-    /// 架构标识 (AUDIT_ARCH_X86_64 = 0xC000003E)
+    /// 架构标识（AUDIT_ARCH_*）
     pub arch: u32,
     /// 用户态指令指针
     pub instruction_pointer: u64,
@@ -86,8 +86,15 @@ pub struct SeccompData {
 
 const SECCOMP_DATA_SIZE: usize = core::mem::size_of::<SeccompData>();
 
-/// AUDIT_ARCH_X86_64 常量
-const AUDIT_ARCH_X86_64: u32 = 0xC000003E;
+const MAX_ERRNO: u32 = SystemError::MAXERRNO as u32;
+const AUDIT_ARCH_64BIT: u32 = 0x80000000;
+const AUDIT_ARCH_LE: u32 = 0x40000000;
+#[cfg(target_arch = "x86_64")]
+const AUDIT_ARCH_X86_64: u32 = 62 | AUDIT_ARCH_64BIT | AUDIT_ARCH_LE;
+#[cfg(target_arch = "riscv64")]
+const AUDIT_ARCH_RISCV64: u32 = 243 | AUDIT_ARCH_64BIT | AUDIT_ARCH_LE;
+#[cfg(target_arch = "loongarch64")]
+const AUDIT_ARCH_LOONGARCH64: u32 = 258 | AUDIT_ARCH_64BIT | AUDIT_ARCH_LE;
 
 // ============ Sock Filter / Sock Fprog ============
 
@@ -135,6 +142,8 @@ const BPF_LEN: u16 = 0x80;
 // 数据源
 const BPF_K: u16 = 0x00;
 const BPF_X: u16 = 0x08;
+const BPF_A: u16 = 0x10;
+const BPF_RVAL_MASK: u16 = 0x18;
 
 // ALU 操作
 const BPF_ADD: u16 = 0x00;
@@ -170,22 +179,29 @@ const BPF_MEMWORDS: usize = 16;
 
 /// SECCOMP_MODE_STRICT 允许的系统调用白名单 (x86_64)
 #[cfg(target_arch = "x86_64")]
-const SECCOMP_STRICT_WHITELIST: [i32; 5] = [
-    0,   // read
-    1,   // write
-    60,  // exit
-    15,  // rt_sigreturn
-    231, // exit_group
+const SECCOMP_STRICT_WHITELIST: [i32; 4] = [
+    0,  // read
+    1,  // write
+    60, // exit
+    15, // rt_sigreturn
 ];
 
 /// SECCOMP_MODE_STRICT 允许的系统调用白名单 (riscv64)
 #[cfg(target_arch = "riscv64")]
 const SECCOMP_STRICT_WHITELIST: [i32; 4] = [
-    63, // read
-    64, // write
-    93, // exit
-    // riscv64 的 rt_sigreturn 通过特殊机制处理
-    0, // 在某些架构上可能不需要
+    63,  // read
+    64,  // write
+    93,  // exit
+    139, // rt_sigreturn
+];
+
+/// SECCOMP_MODE_STRICT 允许的系统调用白名单 (loongarch64)
+#[cfg(target_arch = "loongarch64")]
+const SECCOMP_STRICT_WHITELIST: [i32; 4] = [
+    63,  // read
+    64,  // write
+    93,  // exit
+    139, // rt_sigreturn
 ];
 
 // ============ Seccomp Filter ============
@@ -217,6 +233,16 @@ impl SeccompFilter {
     #[inline]
     pub fn prev(&self) -> &Option<Arc<SeccompFilter>> {
         &self.prev
+    }
+
+    pub fn chain_len(head: &Option<Arc<SeccompFilter>>) -> usize {
+        let mut len = 0;
+        let mut current = head.clone();
+        while let Some(filter) = current {
+            len += 1;
+            current = filter.prev().clone();
+        }
+        len
     }
 
     /// 执行此过滤器
@@ -353,8 +379,8 @@ fn run_cbpf(insns: &[SockFilter], data: &SeccompData) -> u32 {
                 }
             }
             BPF_RET => {
-                let src = insn.code & 0x08;
-                return if src == BPF_K { insn.k } else { a };
+                let rval = insn.code & BPF_RVAL_MASK;
+                return if rval == BPF_K { insn.k } else { a };
             }
             BPF_MISC => {
                 let op = insn.code & 0xf8;
@@ -391,95 +417,87 @@ fn validate_seccomp_filter(insns: &[SockFilter]) -> Result<(), SystemError> {
     if insns.len() > BPF_MAXINSNS {
         return Err(SystemError::EINVAL);
     }
+    if (insns[insns.len() - 1].code & 0x07) != BPF_RET {
+        return Err(SystemError::EINVAL);
+    }
 
     for (pc, insn) in insns.iter().enumerate() {
-        let class = insn.code & 0x07;
-
-        match class {
-            BPF_LD => {
-                let mode = insn.code & 0xe0;
-                match mode {
-                    BPF_IMM | BPF_LEN => {}
-                    BPF_ABS => {
-                        let offset = insn.k as usize;
-                        if !offset.is_multiple_of(4) || offset.saturating_add(4) > SECCOMP_DATA_SIZE
-                        {
-                            return Err(SystemError::EINVAL);
-                        }
-                    }
-                    BPF_MEM => {
-                        if insn.k as usize >= BPF_MEMWORDS {
-                            return Err(SystemError::EINVAL);
-                        }
-                    }
-                    _ => return Err(SystemError::EINVAL),
+        match insn.code {
+            code if code == (BPF_LD | BPF_W | BPF_ABS) => {
+                let offset = insn.k as usize;
+                if !offset.is_multiple_of(4) || offset.saturating_add(4) > SECCOMP_DATA_SIZE {
+                    return Err(SystemError::EINVAL);
                 }
             }
-            BPF_LDX => {
-                let mode = insn.code & 0xe0;
-                match mode {
-                    BPF_IMM | BPF_LEN => {}
-                    BPF_MEM => {
-                        if insn.k as usize >= BPF_MEMWORDS {
-                            return Err(SystemError::EINVAL);
-                        }
-                    }
-                    _ => return Err(SystemError::EINVAL),
-                }
-            }
-            BPF_ST | BPF_STX => {
+            code if code == (BPF_LD | BPF_W | BPF_LEN) => {}
+            code if code == (BPF_LDX | BPF_W | BPF_LEN) => {}
+            code if code == (BPF_LD | BPF_IMM) => {}
+            code if code == (BPF_LDX | BPF_IMM) => {}
+            code if code == (BPF_LD | BPF_MEM) || code == (BPF_LDX | BPF_MEM) => {
                 if insn.k as usize >= BPF_MEMWORDS {
                     return Err(SystemError::EINVAL);
                 }
             }
-            BPF_ALU => {
-                let op = insn.code & 0xf0;
-                match op {
-                    BPF_ADD | BPF_SUB | BPF_MUL | BPF_DIV | BPF_OR | BPF_AND | BPF_LSH
-                    | BPF_RSH | BPF_NEG | BPF_MOD | BPF_XOR => {}
-                    _ => return Err(SystemError::EINVAL),
-                }
-                let src = insn.code & 0x08;
-                if src != BPF_K && src != BPF_X {
+            code if code == BPF_ST || code == BPF_STX => {
+                if insn.k as usize >= BPF_MEMWORDS {
                     return Err(SystemError::EINVAL);
                 }
             }
-            BPF_JMP => {
-                let op = insn.code & 0xf0;
-                if op == BPF_JA {
-                    let target = pc.wrapping_add(1).wrapping_add(insn.k as usize);
-                    if target >= insns.len() {
-                        return Err(SystemError::EINVAL);
-                    }
-                } else {
-                    match op {
-                        BPF_JEQ | BPF_JGT | BPF_JGE | BPF_JSET => {}
-                        _ => return Err(SystemError::EINVAL),
-                    }
-                    let jt_target = pc + 1 + insn.jt as usize;
-                    let jf_target = pc + 1 + insn.jf as usize;
-                    if jt_target >= insns.len() || jf_target >= insns.len() {
-                        return Err(SystemError::EINVAL);
-                    }
-                    let src = insn.code & 0x08;
-                    if src != BPF_K && src != BPF_X {
-                        return Err(SystemError::EINVAL);
-                    }
-                }
-            }
-            BPF_RET => {
-                let src = insn.code & 0x08;
-                if src != BPF_K && src != BPF_X {
+            code if code == (BPF_ALU | BPF_ADD | BPF_K)
+                || code == (BPF_ALU | BPF_ADD | BPF_X)
+                || code == (BPF_ALU | BPF_SUB | BPF_K)
+                || code == (BPF_ALU | BPF_SUB | BPF_X)
+                || code == (BPF_ALU | BPF_MUL | BPF_K)
+                || code == (BPF_ALU | BPF_MUL | BPF_X)
+                || code == (BPF_ALU | BPF_DIV | BPF_K)
+                || code == (BPF_ALU | BPF_DIV | BPF_X)
+                || code == (BPF_ALU | BPF_OR | BPF_K)
+                || code == (BPF_ALU | BPF_OR | BPF_X)
+                || code == (BPF_ALU | BPF_AND | BPF_K)
+                || code == (BPF_ALU | BPF_AND | BPF_X)
+                || code == (BPF_ALU | BPF_LSH | BPF_K)
+                || code == (BPF_ALU | BPF_LSH | BPF_X)
+                || code == (BPF_ALU | BPF_RSH | BPF_K)
+                || code == (BPF_ALU | BPF_RSH | BPF_X)
+                || code == (BPF_ALU | BPF_NEG)
+                || code == (BPF_ALU | BPF_XOR | BPF_K)
+                || code == (BPF_ALU | BPF_XOR | BPF_X) =>
+            {
+                if code == (BPF_ALU | BPF_DIV | BPF_K) && insn.k == 0 {
                     return Err(SystemError::EINVAL);
                 }
             }
-            BPF_MISC => {
-                let op = insn.code & 0xf8;
-                if op != BPF_TAX && op != BPF_TXA {
+            code if code == (BPF_JMP | BPF_JA) => {
+                let Some(target) = pc
+                    .checked_add(1)
+                    .and_then(|x| x.checked_add(insn.k as usize))
+                else {
+                    return Err(SystemError::EINVAL);
+                };
+                if target >= insns.len() {
                     return Err(SystemError::EINVAL);
                 }
             }
-            _ => return Err(SystemError::EINVAL),
+            code if code == (BPF_JMP | BPF_JEQ | BPF_K)
+                || code == (BPF_JMP | BPF_JEQ | BPF_X)
+                || code == (BPF_JMP | BPF_JGT | BPF_K)
+                || code == (BPF_JMP | BPF_JGT | BPF_X)
+                || code == (BPF_JMP | BPF_JGE | BPF_K)
+                || code == (BPF_JMP | BPF_JGE | BPF_X)
+                || code == (BPF_JMP | BPF_JSET | BPF_K)
+                || code == (BPF_JMP | BPF_JSET | BPF_X) =>
+            {
+                let jt_target = pc + 1 + insn.jt as usize;
+                let jf_target = pc + 1 + insn.jf as usize;
+                if jt_target >= insns.len() || jf_target >= insns.len() {
+                    return Err(SystemError::EINVAL);
+                }
+            }
+            code if code == (BPF_RET | BPF_K) || code == (BPF_RET | BPF_A) => {}
+            code if code == (BPF_MISC | BPF_TAX) || code == (BPF_MISC | BPF_TXA) => {}
+            _ => {
+                return Err(SystemError::EINVAL);
+            }
         }
     }
 
@@ -502,7 +520,7 @@ fn seccomp_run_filters(data: &SeccompData, filter: &Option<Arc<SeccompFilter>>) 
 
     while let Some(f) = current {
         let cur_ret = f.run(data);
-        if (cur_ret & SECCOMP_RET_ACTION_FULL) < (ret & SECCOMP_RET_ACTION_FULL) {
+        if action_priority(cur_ret) < action_priority(ret) {
             ret = cur_ret;
         }
         current = f.prev().clone();
@@ -511,52 +529,59 @@ fn seccomp_run_filters(data: &SeccompData, filter: &Option<Arc<SeccompFilter>>) 
     ret
 }
 
+#[inline(always)]
+fn action_priority(ret: u32) -> i32 {
+    (ret & SECCOMP_RET_ACTION_FULL) as i32
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeccompDecision {
+    Allow,
+    Skip(usize),
+}
+
 // ============ Secure Computing ============
 
 /// Seccomp 系统调用检查入口
 ///
 /// 在系统调用分发之前调用。根据当前进程的 seccomp 模式执行相应检查。
 ///
-/// # 参数
-/// - `syscall_num`: 系统调用号
-/// - `args`: 系统调用参数（6个）
-/// - `ip`: 用户态指令指针（rip）
-///
 /// # 返回值
-/// - `Ok(())`: 允许继续执行系统调用
-/// - `Err(SystemError)`: 系统调用被拒绝（ERRNO / TRAP / KILL）
+/// - `Allow`: 允许继续执行系统调用
+/// - `Skip(ret)`: 跳过系统调用并直接返回 `ret`
 ///
-/// 对于 KILL 动作，此函数会发送 SIGSYS 并返回错误。
-/// 进程将在返回用户态时处理该信号（默认终止）。
-pub fn secure_computing(syscall_num: usize, args: &[usize; 6], ip: u64) -> Result<(), SystemError> {
+/// 对于 KILL 动作，此函数不会返回，而是按 Linux seccomp 语义终止线程/线程组。
+pub fn secure_computing(
+    syscall_num: usize,
+    args: &[usize; 6],
+    frame: &mut TrapFrame,
+) -> Result<SeccompDecision, SystemError> {
     let pcb = ProcessManager::current_pcb();
     let mode_val = pcb.seccomp_mode.load(Ordering::Relaxed);
     let mode = SeccompMode::from(mode_val);
 
     match mode {
-        SeccompMode::Disabled => Ok(()),
+        SeccompMode::Disabled => Ok(SeccompDecision::Allow),
 
         SeccompMode::Dead => {
-            // 进程已被标记为 Dead，拒绝所有 syscall
-            send_seccomp_sigsys(syscall_num as i32, SECCOMP_RET_KILL_THREAD);
-            Err(SystemError::EPERM)
+            // Surviving SECCOMP_RET_KILL_* must be proactively impossible.
+            ProcessManager::exit(Signal::SIGKILL as usize);
         }
 
         SeccompMode::Strict => {
             // 检查白名单
             if SECCOMP_STRICT_WHITELIST.contains(&(syscall_num as i32)) {
-                Ok(())
+                Ok(SeccompDecision::Allow)
             } else {
-                send_seccomp_sigsys(syscall_num as i32, SECCOMP_RET_KILL_THREAD);
-                Err(SystemError::EPERM)
+                kill_current_strict();
             }
         }
 
         SeccompMode::Filter => {
             let data = SeccompData {
                 nr: syscall_num as i32,
-                arch: AUDIT_ARCH_X86_64,
-                instruction_pointer: ip,
+                arch: seccomp_arch(),
+                instruction_pointer: instruction_pointer(frame),
                 args: [
                     args[0] as u64,
                     args[1] as u64,
@@ -572,23 +597,20 @@ pub fn secure_computing(syscall_num: usize, args: &[usize; 6], ip: u64) -> Resul
             drop(filter_guard);
 
             let action = result & SECCOMP_RET_ACTION_FULL;
-            let data_val = (result & SECCOMP_RET_DATA) as i32;
+            let data_val = result & SECCOMP_RET_DATA;
 
             match action {
                 SECCOMP_RET_KILL_PROCESS | SECCOMP_RET_KILL_THREAD => {
-                    pcb.seccomp_mode
-                        .store(SeccompMode::Dead as u8, Ordering::Relaxed);
-                    send_seccomp_sigsys(data.nr, action);
-                    Err(SystemError::EPERM)
+                    kill_current(action);
                 }
                 SECCOMP_RET_TRAP => {
-                    send_seccomp_sigsys(data.nr, action);
-                    let errno_val = -data_val;
-                    SystemError::from_posix_errno(errno_val).map_or(Err(SystemError::EPERM), Err)
+                    rollback_syscall(frame, syscall_num);
+                    send_seccomp_sigsys(&data, data_val);
+                    Ok(SeccompDecision::Skip(frame_syscall_return(frame)))
                 }
                 SECCOMP_RET_ERRNO => {
-                    let errno_val = -data_val;
-                    SystemError::from_posix_errno(errno_val).map_or(Err(SystemError::EPERM), Err)
+                    let errno = data_val.min(MAX_ERRNO);
+                    Ok(SeccompDecision::Skip((-(errno as i32)) as usize))
                 }
                 SECCOMP_RET_LOG => {
                     log::info!(
@@ -596,37 +618,43 @@ pub fn secure_computing(syscall_num: usize, args: &[usize; 6], ip: u64) -> Resul
                         pcb.raw_pid(),
                         syscall_num
                     );
-                    Ok(())
+                    Ok(SeccompDecision::Allow)
                 }
-                SECCOMP_RET_ALLOW => Ok(()),
+                SECCOMP_RET_ALLOW => Ok(SeccompDecision::Allow),
 
                 _ => {
                     // 未知动作，默认 KILL
-                    pcb.seccomp_mode
-                        .store(SeccompMode::Dead as u8, Ordering::Relaxed);
-                    send_seccomp_sigsys(data.nr, SECCOMP_RET_KILL_THREAD);
-                    Err(SystemError::EPERM)
+                    kill_current(SECCOMP_RET_KILL_PROCESS);
                 }
             }
         }
     }
 }
 
-/// 发送 SIGSYS 信号给当前进程（内核强制）
+/// 发送 SIGSYS 信号给当前进程（TRAP 动作）
 ///
-/// si_code = SI_KERNEL (0x80)
-/// si_errno = seccomp action
-fn send_seccomp_sigsys(_syscall_nr: i32, action: u32) {
+/// TODO: 扩展 SigCode/SigType，让用户态 siginfo 携带 Linux 的
+/// SYS_SECCOMP、call_addr、syscall 和 arch 字段。
+fn send_seccomp_sigsys(data: &SeccompData, errno: u32) {
     let pcb = ProcessManager::current_pcb();
     let sig = Signal::SIGSYS;
+    log::debug!(
+        "seccomp: SIGSYS trap pid={:?} syscall={} arch={:#x}",
+        pcb.raw_pid(),
+        data.nr,
+        data.arch
+    );
+
+    force_current_seccomp_sigsys();
 
     let mut info = SigInfo::new(
         sig,
-        action as i32,
-        SigCode::Kernel,
-        SigType::Kill {
-            pid: pcb.raw_pid(),
-            uid: pcb.cred().uid.data() as u32,
+        errno.min(MAX_ERRNO) as i32,
+        SigCode::SysSeccomp,
+        SigType::SigSys {
+            call_addr: data.instruction_pointer,
+            syscall: data.nr,
+            arch: data.arch,
         },
     );
 
@@ -639,21 +667,139 @@ fn send_seccomp_sigsys(_syscall_nr: i32, action: u32) {
     }
 }
 
+fn force_current_seccomp_sigsys() {
+    let pcb = ProcessManager::current_pcb();
+    let sig = Signal::SIGSYS;
+
+    if let Some(mut action) = pcb.sighand().handler(sig) {
+        let blocked = pcb
+            .sig_info_irqsave()
+            .sig_blocked()
+            .contains(sig.into_sigset());
+        if blocked || action.is_ignore() {
+            action.set_action(SigactionType::SaHandler(SaHandlerType::Default));
+            pcb.sighand().set_handler(sig, action);
+        }
+        if action.is_default() {
+            pcb.sighand().flags_remove(SignalFlags::UNKILLABLE);
+        }
+    }
+
+    {
+        let mut siginfo = pcb.sig_info_mut();
+        siginfo.sig_block_mut().remove(sig.into_sigset());
+        siginfo.saved_sigmask_mut().remove(sig.into_sigset());
+    }
+    pcb.recalc_sigpending();
+}
+
+fn kill_current(action: u32) -> ! {
+    match action {
+        SECCOMP_RET_KILL_THREAD => kill_current_thread(),
+        _ => kill_current_process(),
+    }
+}
+
+fn kill_current_thread() -> ! {
+    let pcb = ProcessManager::current_pcb();
+    pcb.seccomp_mode
+        .store(SeccompMode::Dead as u8, Ordering::SeqCst);
+    ProcessManager::exit(Signal::SIGSYS as usize);
+}
+
+fn kill_current_strict() -> ! {
+    let pcb = ProcessManager::current_pcb();
+    pcb.seccomp_mode
+        .store(SeccompMode::Dead as u8, Ordering::SeqCst);
+    ProcessManager::exit(Signal::SIGKILL as usize);
+}
+
+fn kill_current_process() -> ! {
+    let pcb = ProcessManager::current_pcb();
+    pcb.seccomp_mode
+        .store(SeccompMode::Dead as u8, Ordering::SeqCst);
+    ProcessManager::group_exit(Signal::SIGSYS as usize);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn seccomp_arch() -> u32 {
+    AUDIT_ARCH_X86_64
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+fn seccomp_arch() -> u32 {
+    AUDIT_ARCH_RISCV64
+}
+
+#[cfg(target_arch = "loongarch64")]
+#[inline(always)]
+fn seccomp_arch() -> u32 {
+    AUDIT_ARCH_LOONGARCH64
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn instruction_pointer(frame: &TrapFrame) -> u64 {
+    frame.rip() as u64
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+fn instruction_pointer(frame: &TrapFrame) -> u64 {
+    frame.epc as u64
+}
+
+#[cfg(target_arch = "loongarch64")]
+#[inline(always)]
+fn instruction_pointer(frame: &TrapFrame) -> u64 {
+    frame.csr_era as u64
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn rollback_syscall(frame: &mut TrapFrame, _syscall_num: usize) {
+    frame.rax = frame.errcode;
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+fn rollback_syscall(frame: &mut TrapFrame, syscall_num: usize) {
+    frame.a0 = syscall_num;
+}
+
+#[cfg(target_arch = "loongarch64")]
+#[inline(always)]
+fn rollback_syscall(frame: &mut TrapFrame, syscall_num: usize) {
+    frame.a0 = syscall_num;
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn frame_syscall_return(frame: &TrapFrame) -> usize {
+    frame.rax as usize
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+fn frame_syscall_return(frame: &TrapFrame) -> usize {
+    frame.a0
+}
+
+#[cfg(target_arch = "loongarch64")]
+#[inline(always)]
+fn frame_syscall_return(frame: &TrapFrame) -> usize {
+    frame.a0
+}
+
 // ============ Seccomp 模式操作 ============
 
 /// 设置 strict 模式
 ///
-/// 要求 CAP_SYS_ADMIN 权限。只能从 Disabled 切换（不可逆）。
+/// 只能从 Disabled 切换（不可逆）。
 pub fn seccomp_set_mode_strict() -> Result<(), SystemError> {
     let current = ProcessManager::current_pcb();
-
-    // Linux: 需要 CAP_SYS_ADMIN
-    if !current
-        .cred()
-        .has_capability(crate::process::cred::CAPFlags::CAP_SYS_ADMIN)
-    {
-        return Err(SystemError::EACCES);
-    }
 
     // 只能从 Disabled 切换（不可逆）
     let prev = current.seccomp_mode.compare_exchange(
@@ -731,6 +877,23 @@ pub fn seccomp_set_mode_filter(fprog_ptr: u64, flags: u32) -> Result<(), SystemE
     Ok(())
 }
 
+pub fn seccomp_get_action_avail(action_ptr: u64) -> Result<(), SystemError> {
+    let mut buf = [0u8; core::mem::size_of::<u32>()];
+    let reader = UserBufferReader::new(action_ptr as *const u8, buf.len(), true)?;
+    reader.copy_from_user_protected(&mut buf, 0)?;
+    let action = u32::from_ne_bytes(buf);
+
+    match action {
+        SECCOMP_RET_KILL_PROCESS
+        | SECCOMP_RET_KILL_THREAD
+        | SECCOMP_RET_TRAP
+        | SECCOMP_RET_ERRNO
+        | SECCOMP_RET_LOG
+        | SECCOMP_RET_ALLOW => Ok(()),
+        _ => Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
+    }
+}
+
 /// 从用户空间读取 sock_fprog 结构
 fn read_sock_fprog(ptr: u64) -> Result<SockFprog, SystemError> {
     let size = core::mem::size_of::<SockFprog>();
@@ -754,15 +917,22 @@ fn read_sock_fprog(ptr: u64) -> Result<SockFprog, SystemError> {
 /// 从用户空间读取 filter 指令数组
 fn read_filter_insns(ptr: u64, count: usize) -> Result<Vec<SockFilter>, SystemError> {
     let insn_size = core::mem::size_of::<SockFilter>();
-    let byte_len = count * insn_size;
+    let byte_len = count.checked_mul(insn_size).ok_or(SystemError::EINVAL)?;
 
     let mut buf = alloc::vec![0u8; byte_len];
 
     let reader = UserBufferReader::new(ptr as *const u8, byte_len, true)?;
     reader.copy_from_user_protected(&mut buf, 0)?;
 
-    let ptr = buf.as_ptr() as *const SockFilter;
-    let insns = unsafe { core::slice::from_raw_parts(ptr, count) }.to_vec();
+    let mut insns = Vec::with_capacity(count);
+    for chunk in buf.chunks_exact(insn_size) {
+        insns.push(SockFilter {
+            code: u16::from_ne_bytes([chunk[0], chunk[1]]),
+            jt: chunk[2],
+            jf: chunk[3],
+            k: u32::from_ne_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]),
+        });
+    }
 
     Ok(insns)
 }

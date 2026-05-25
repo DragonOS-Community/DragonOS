@@ -128,6 +128,77 @@ bool InitTcpPair(TcpPair* pair) {
     return true;
 }
 
+bool InitDualStackTcpPair(TcpPair* pair) {
+    pair->listen_fd.Reset();
+    pair->client_fd.Reset();
+    pair->server_fd.Reset();
+
+    int listen_fd = socket(AF_INET6, SOCK_STREAM, 0);
+    if (listen_fd < 0) {
+        ADD_FAILURE() << "socket(AF_INET6 listen) failed: " << ErrnoString(errno);
+        return false;
+    }
+    pair->listen_fd.Reset(listen_fd);
+
+    int v6only = 0;
+    if (setsockopt(pair->listen_fd.Get(), IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only)) !=
+        0) {
+        ADD_FAILURE() << "setsockopt(IPV6_V6ONLY) failed: " << ErrnoString(errno);
+        return false;
+    }
+
+    int reuse = 1;
+    if (setsockopt(pair->listen_fd.Get(), SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) != 0) {
+        ADD_FAILURE() << "setsockopt(SO_REUSEADDR) failed: " << ErrnoString(errno);
+        return false;
+    }
+
+    sockaddr_in6 addr {};
+    addr.sin6_family = AF_INET6;
+    addr.sin6_port = htons(0);
+    if (inet_pton(AF_INET6, "::ffff:127.0.0.1", &addr.sin6_addr) != 1) {
+        ADD_FAILURE() << "inet_pton(::ffff:127.0.0.1) failed";
+        return false;
+    }
+
+    if (bind(pair->listen_fd.Get(), reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        ADD_FAILURE() << "bind(AF_INET6 dual-stack listen) failed: " << ErrnoString(errno);
+        return false;
+    }
+
+    socklen_t addr_len = sizeof(addr);
+    if (getsockname(pair->listen_fd.Get(), reinterpret_cast<sockaddr*>(&addr), &addr_len) != 0) {
+        ADD_FAILURE() << "getsockname(AF_INET6 listen) failed: " << ErrnoString(errno);
+        return false;
+    }
+
+    if (listen(pair->listen_fd.Get(), 5) != 0) {
+        ADD_FAILURE() << "listen(AF_INET6 dual-stack) failed: " << ErrnoString(errno);
+        return false;
+    }
+
+    int client_fd = socket(AF_INET6, SOCK_STREAM, 0);
+    if (client_fd < 0) {
+        ADD_FAILURE() << "socket(AF_INET6 client) failed: " << ErrnoString(errno);
+        return false;
+    }
+    pair->client_fd.Reset(client_fd);
+
+    if (connect(pair->client_fd.Get(), reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        ADD_FAILURE() << "connect(AF_INET6 dual-stack) failed: " << ErrnoString(errno);
+        return false;
+    }
+
+    int server_fd = accept(pair->listen_fd.Get(), nullptr, nullptr);
+    if (server_fd < 0) {
+        ADD_FAILURE() << "accept(AF_INET6 dual-stack) failed: " << ErrnoString(errno);
+        return false;
+    }
+    pair->server_fd.Reset(server_fd);
+
+    return true;
+}
+
 void ExpectPeerEofAfterShutdownWr(int fd) {
     char byte = '\0';
     errno = 0;
@@ -173,6 +244,68 @@ void* WriterThread(void* arg) {
 void* ResetDuringCloseWorker(void*) {
     TcpPair pair;
     if (!InitTcpPair(&pair)) {
+        return reinterpret_cast<void*>(1);
+    }
+
+    struct PollCloseArgs {
+        int fd = -1;
+        int result = 0;
+    } poll_args {
+        .fd = pair.client_fd.Get(),
+        .result = 0,
+    };
+
+    auto poll_and_close = [](void* arg) -> void* {
+        auto* args = reinterpret_cast<PollCloseArgs*>(arg);
+        pollfd pfd {
+            .fd = args->fd,
+            .events = POLLIN | POLLHUP,
+            .revents = 0,
+        };
+        const int poll_ret = poll(&pfd, 1, 5000);
+        if (poll_ret != 1) {
+            args->result = 1;
+            return nullptr;
+        }
+        if (close(args->fd) != 0) {
+            args->result = 2;
+            return nullptr;
+        }
+        args->fd = -1;
+        return nullptr;
+    };
+
+    pthread_t closer {};
+    if (pthread_create(&closer, nullptr, poll_and_close, &poll_args) != 0) {
+        return reinterpret_cast<void*>(2);
+    }
+
+    constexpr char kData[] = "abc";
+    if (write(pair.server_fd.Get(), kData, 3) != 3) {
+        pthread_join(closer, nullptr);
+        return reinterpret_cast<void*>(3);
+    }
+
+    usleep(10000);
+
+    if (close(pair.server_fd.Release()) != 0) {
+        pthread_join(closer, nullptr);
+        return reinterpret_cast<void*>(4);
+    }
+
+    if (pthread_join(closer, nullptr) != 0) {
+        return reinterpret_cast<void*>(5);
+    }
+    if (poll_args.result != 0) {
+        return reinterpret_cast<void*>(6 + poll_args.result);
+    }
+    pair.client_fd.Release();
+    return nullptr;
+}
+
+void* ReversedDualStackResetDuringCloseWorker(void*) {
+    TcpPair pair;
+    if (!InitDualStackTcpPair(&pair)) {
         return reinterpret_cast<void*>(1);
     }
 
@@ -371,6 +504,27 @@ TEST(TcpCloseSemantics, ConcurrentResetDuringCloseDoesNotStall) {
 
     for (int i = 0; i < kThreadCount; ++i) {
         ASSERT_EQ(0, pthread_create(&threads[i], nullptr, ResetDuringCloseWorker, nullptr))
+            << "pthread_create failed: " << ErrnoString(errno);
+    }
+
+    for (int i = 0; i < kThreadCount; ++i) {
+        void* result = nullptr;
+        ASSERT_EQ(0, pthread_join(threads[i], &result))
+            << "pthread_join failed: " << ErrnoString(errno);
+        EXPECT_EQ(nullptr, result) << "worker " << i << " failed";
+    }
+}
+
+TEST(TcpCloseSemantics, ReversedDualStackResetDuringCloseDoesNotStall) {
+    signal(SIGPIPE, SIG_IGN);
+
+    constexpr int kThreadCount = 100;
+    std::vector<pthread_t> threads(kThreadCount);
+
+    for (int i = 0; i < kThreadCount; ++i) {
+        ASSERT_EQ(0,
+                  pthread_create(
+                      &threads[i], nullptr, ReversedDualStackResetDuringCloseWorker, nullptr))
             << "pthread_create failed: " << ErrnoString(errno);
     }
 

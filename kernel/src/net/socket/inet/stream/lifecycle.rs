@@ -10,8 +10,6 @@ use system_error::SystemError;
 use super::inner;
 use super::TcpSocket;
 
-const TCP_CLOSE_POST_POLL_ROUNDS: usize = 8;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CloseObservation {
     state: smoltcp::socket::tcp::State,
@@ -26,6 +24,18 @@ struct CloseAction {
 }
 
 impl TcpSocket {
+    fn kick_iface_after_tcp_state_change(iface: &Arc<dyn crate::net::Iface>) {
+        if let Some(netns) = iface.common().net_namespace() {
+            netns.wakeup_poll_thread();
+        }
+
+        super::poll_util::poll_iface_until_quiescent(iface.as_ref());
+
+        // The state change may have completed before the last poll round reports a fresh
+        // SocketStateChanged event. Refresh all bound sockets so waiters observe the final state.
+        iface.common().notify_all_bound_sockets();
+    }
+
     #[inline]
     fn observe_established_close(established: &inner::Established) -> CloseObservation {
         established.with(|socket| CloseObservation {
@@ -382,7 +392,6 @@ impl TcpSocket {
         }
 
         let mut post_poll_iface: Option<Arc<dyn crate::net::Iface>> = None;
-        let mut post_poll_rounds: usize = 0;
 
         // Linux/gVisor 语义：TIME_WAIT/Closed 的 stream socket 上 shutdown 应返回 ENOTCONN。
         // 但 Listening 和 Connecting 状态下的 shutdown 是允许的。
@@ -419,7 +428,6 @@ impl TcpSocket {
                     } else {
                         established.with_mut(|socket| socket.close());
                     }
-                    post_poll_rounds = core::cmp::max(post_poll_rounds, 8);
                     post_poll_iface = Some(established.iface().clone());
                 }
 
@@ -428,7 +436,6 @@ impl TcpSocket {
             }
             inner::Inner::Listening(mut listening) => {
                 if how.contains(ShutdownBit::SHUT_RD) {
-                    let original_listen_sockets = listening.inners.len();
                     let local = listening.get_name();
                     let port = local.port;
 
@@ -461,10 +468,6 @@ impl TcpSocket {
                         bound.release();
                     }
 
-                    post_poll_rounds = core::cmp::max(
-                        post_poll_rounds,
-                        original_listen_sockets.saturating_mul(8).clamp(128, 8192),
-                    );
                     post_poll_iface = Some(keep.iface().clone());
 
                     // Linux: shutdown(SHUT_RD) on a listening socket stops listening.
@@ -503,7 +506,6 @@ impl TcpSocket {
                         } else {
                             established.with_mut(|socket| socket.close());
                         }
-                        post_poll_rounds = core::cmp::max(post_poll_rounds, 8);
                         post_poll_iface = Some(established.iface().clone());
                     }
 
@@ -511,7 +513,6 @@ impl TcpSocket {
                 } else {
                     connecting.set_shutdown_reset();
                     connecting.with_mut(|socket| socket.abort());
-                    post_poll_rounds = core::cmp::max(post_poll_rounds, 128);
                     post_poll_iface = Some(connecting.iface().clone());
 
                     // For still-connecting sockets, only SHUT_WR is meaningful for
@@ -559,17 +560,7 @@ impl TcpSocket {
 
         // 唤醒等待者（含 poll/epoll），让状态变化可见。
         if let Some(iface) = post_poll_iface {
-            if let Some(netns) = iface.common().net_namespace() {
-                netns.wakeup_poll_thread();
-            }
-            for _ in 0..post_poll_rounds {
-                iface.poll();
-            }
-            // After shutdown, explicitly notify all bound sockets on this interface.
-            // This ensures that client sockets waiting for connection completion
-            // are woken up even if the last poll() didn't detect state changes
-            // (e.g., RST was already sent and received in earlier polls).
-            iface.common().notify_all_bound_sockets();
+            Self::kick_iface_after_tcp_state_change(&iface);
         }
         self.notify();
         Ok(())
@@ -716,17 +707,7 @@ impl TcpSocket {
         };
         drop(writer);
         if let Some(iface) = post_poll_iface {
-            if let Some(netns) = iface.common().net_namespace() {
-                netns.wakeup_poll_thread();
-            }
-            // close(2) must not drain unrelated sockets on the whole interface. Linux
-            // queues FIN/RST work and returns without waiting for global TCP quiescence.
-            // A small bounded push is enough to expose the close to smoltcp/loopback
-            // immediately while keeping syscall latency independent of orphan backlog.
-            for _ in 0..TCP_CLOSE_POST_POLL_ROUNDS {
-                iface.poll();
-            }
-            iface.common().notify_all_bound_sockets();
+            Self::kick_iface_after_tcp_state_change(&iface);
         }
         self.notify();
         Ok(())

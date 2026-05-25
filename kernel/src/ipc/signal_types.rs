@@ -33,7 +33,7 @@ pub enum SigCode {
     /// queued SIGIO/POLL_HUP
     PollHup = 6,
     /// sent by kernel from somewhere
-    Kernel,
+    Kernel = 0x80,
     /// SIGSYS sent by seccomp filter action SECCOMP_RET_TRAP.
     SysSeccomp,
     /// 通过sigqueue发送

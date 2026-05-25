@@ -2,15 +2,12 @@
 //!
 //! 这个目录包含了进程打开的所有文件描述符的符号链接
 
-use crate::{
-    filesystem::{
-        procfs::{
-            pid::find_process_by_vpid,
-            template::{Builder, DirOps, ProcDir, ProcDirBuilder, ProcSymBuilder, SymOps},
-        },
-        vfs::{IndexNode, InodeMode, SpecialNodeData},
+use crate::filesystem::{
+    procfs::{
+        pid::ProcPidTarget,
+        template::{Builder, DirOps, ProcDir, ProcDirBuilder, ProcSymBuilder, SymOps},
     },
-    process::RawPid,
+    vfs::{IndexNode, InodeMode, SpecialNodeData},
 };
 use alloc::{
     format,
@@ -23,22 +20,20 @@ use system_error::SystemError;
 /// /proc/[pid]/fd 目录的 DirOps 实现
 #[derive(Debug)]
 pub struct FdDirOps {
-    /// 存储 PID，在需要时动态查找进程
-    pid: RawPid,
+    target: ProcPidTarget,
 }
 
 impl FdDirOps {
-    pub fn new_inode(pid: RawPid, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcDirBuilder::new(Self { pid }, InodeMode::from_bits_truncate(0o500)) // dr-x------
+    pub fn new_inode(target: ProcPidTarget, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcDirBuilder::new(Self { target }, InodeMode::from_bits_truncate(0o500)) // dr-x------
             .parent(parent)
             .volatile() // fd 是易失的，因为它们与特定进程关联
             .build()
             .unwrap()
     }
 
-    /// 获取进程引用
     fn get_process(&self) -> Option<Arc<crate::process::ProcessControlBlock>> {
-        find_process_by_vpid(self.pid)
+        self.target.thread_group_leader()
     }
 }
 
@@ -72,7 +67,7 @@ impl DirOps for FdDirOps {
         }
 
         // 创建新的符号链接（传递 PID 和 fd）
-        let inode = FdSymOps::new_inode(self.pid, fd, dir.self_ref_weak().clone());
+        let inode = FdSymOps::new_inode(self.target.clone(), fd, dir.self_ref_weak().clone());
         cached_children.insert(name.to_string(), inode.clone());
 
         Ok(inode)
@@ -99,7 +94,7 @@ impl DirOps for FdDirOps {
 
                 // 创建或获取缓存的符号链接（传递 PID 和 fd）
                 cached_children.entry(fd_str.clone()).or_insert_with(|| {
-                    FdSymOps::new_inode(self.pid, fd, dir.self_ref_weak().clone())
+                    FdSymOps::new_inode(self.target.clone(), fd, dir.self_ref_weak().clone())
                 });
             }
         }
@@ -110,14 +105,17 @@ impl DirOps for FdDirOps {
 /// /proc/[pid]/fd/[fd] 符号链接的 SymOps 实现
 #[derive(Debug)]
 pub struct FdSymOps {
-    /// 存储 PID，在需要时动态查找进程
-    pid: RawPid,
+    target: ProcPidTarget,
     fd: i32,
 }
 
 impl FdSymOps {
-    pub fn new_inode(pid: RawPid, fd: i32, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcSymBuilder::new(Self { pid, fd }, InodeMode::from_bits_truncate(0o700)) // lrwx------
+    pub fn new_inode(
+        target: ProcPidTarget,
+        fd: i32,
+        parent: Weak<dyn IndexNode>,
+    ) -> Arc<dyn IndexNode> {
+        ProcSymBuilder::new(Self { target, fd }, InodeMode::from_bits_truncate(0o700)) // lrwx------
             .parent(parent)
             .volatile()
             .build()
@@ -127,8 +125,10 @@ impl FdSymOps {
 
 impl SymOps for FdSymOps {
     fn read_link(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
-        // 动态查找进程
-        let process = find_process_by_vpid(self.pid).ok_or(SystemError::ESRCH)?;
+        let process = self
+            .target
+            .thread_group_leader()
+            .ok_or(SystemError::ESRCH)?;
 
         // 先获取文件对象的 clone，然后立即释放 fd_table 锁
         // 避免在持有锁时调用可能获取其他锁的方法（如 absolute_path）
@@ -179,8 +179,7 @@ impl SymOps for FdSymOps {
     }
 
     fn special_node(&self) -> Option<SpecialNodeData> {
-        // 动态查找进程
-        let process = find_process_by_vpid(self.pid)?;
+        let process = self.target.thread_group_leader()?;
 
         // 获取文件对象
         let file = {

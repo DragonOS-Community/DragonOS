@@ -5,7 +5,7 @@
 use crate::{
     filesystem::{
         procfs::{
-            pid::{find_process_by_vpid, stat::StatFileOps},
+            pid::{ns::NsDirOps, stat::StatFileOps, ProcPidTarget},
             template::{
                 lookup_child_from_table, populate_children_from_table, DirOps, ProcDir,
                 ProcDirBuilder,
@@ -14,27 +14,60 @@ use crate::{
         },
         vfs::{IndexNode, InodeMode},
     },
-    process::RawPid,
+    process::ProcessControlBlock,
 };
 use alloc::{
     string::ToString,
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use system_error::SystemError;
 
 /// /proc/[pid]/task 目录的 DirOps 实现
 #[derive(Debug)]
 pub struct TaskDirOps {
-    pid: RawPid,
+    target: ProcPidTarget,
 }
 
 impl TaskDirOps {
-    pub fn new_inode(pid: RawPid, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcDirBuilder::new(Self { pid }, InodeMode::from_bits_truncate(0o555))
+    pub fn new_inode(target: ProcPidTarget, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcDirBuilder::new(Self { target }, InodeMode::from_bits_truncate(0o555))
             .parent(parent)
             .volatile()
             .build()
             .unwrap()
+    }
+
+    fn thread_group_leader(&self) -> Option<Arc<ProcessControlBlock>> {
+        self.target.thread_group_leader()
+    }
+
+    fn thread_targets(&self) -> Vec<ProcPidTarget> {
+        let Some(leader) = self.thread_group_leader() else {
+            return Vec::new();
+        };
+
+        let mut targets = Vec::new();
+        if let Some(target) =
+            ProcPidTarget::from_task(self.target.view_pid_ns().clone(), leader.clone())
+        {
+            targets.push(target);
+        }
+
+        let group_tasks = leader.threads_read_irqsave().group_tasks_clone();
+        for weak in group_tasks {
+            if let Some(task) = weak.upgrade() {
+                if let Some(target) =
+                    ProcPidTarget::from_task(self.target.view_pid_ns().clone(), task)
+                {
+                    targets.push(target);
+                }
+            }
+        }
+
+        targets.sort_by_key(|target| target.vpid().data());
+        targets.dedup_by_key(|target| target.vpid().data());
+        targets
     }
 }
 
@@ -45,58 +78,51 @@ impl DirOps for TaskDirOps {
         name: &str,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 解析 tid
-        let tid = name.parse::<usize>().map_err(|_| SystemError::ENOENT)?;
-        let tid_pid = RawPid::new(tid);
-
-        // 目前简化实现：只支持 tid == pid（主线程）
-        // TODO: 支持真正的多线程
-        if tid_pid != self.pid {
-            return Err(SystemError::ENOENT);
-        }
-
-        // 检查进程是否存在
-        if find_process_by_vpid(self.pid).is_none() {
+        if self.thread_group_leader().is_none() {
             return Err(SystemError::ESRCH);
         }
+
+        let tid = name.parse::<usize>().map_err(|_| SystemError::ENOENT)?;
+        let target = self
+            .thread_targets()
+            .into_iter()
+            .find(|target| target.vpid().data() == tid)
+            .ok_or(SystemError::ENOENT)?;
 
         let mut cached_children = dir.cached_children().write();
         if let Some(child) = cached_children.get(name) {
             return Ok(child.clone());
         }
 
-        // 创建 tid 目录
-        let inode = TidDirOps::new_inode(self.pid, tid_pid, dir.self_ref_weak().clone());
+        let inode = TidDirOps::new_inode(target, dir.self_ref_weak().clone());
         cached_children.insert(name.to_string(), inode.clone());
         Ok(inode)
     }
 
     fn populate_children(&self, dir: &ProcDir<Self>) {
-        // 检查进程是否存在
-        if find_process_by_vpid(self.pid).is_none() {
+        if self.thread_group_leader().is_none() {
             return;
         }
 
         let mut cached_children = dir.cached_children().write();
-        let tid_str = self.pid.to_string();
-
-        // 目前只添加主线程
-        cached_children.entry(tid_str).or_insert_with(|| {
-            TidDirOps::new_inode(self.pid, self.pid, dir.self_ref_weak().clone())
-        });
+        for target in self.thread_targets() {
+            let tid_str = target.vpid().to_string();
+            cached_children.entry(tid_str).or_insert_with(|| {
+                TidDirOps::new_inode(target.clone(), dir.self_ref_weak().clone())
+            });
+        }
     }
 }
 
 /// /proc/[pid]/task/[tid] 目录的 DirOps 实现
 #[derive(Debug)]
 pub struct TidDirOps {
-    pid: RawPid,
-    #[allow(dead_code)]
-    tid: RawPid,
+    target: ProcPidTarget,
 }
 
 impl TidDirOps {
-    pub fn new_inode(pid: RawPid, tid: RawPid, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcDirBuilder::new(Self { pid, tid }, InodeMode::from_bits_truncate(0o555))
+    pub fn new_inode(target: ProcPidTarget, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcDirBuilder::new(Self { target }, InodeMode::from_bits_truncate(0o555))
             .parent(parent)
             .volatile()
             .build()
@@ -108,9 +134,14 @@ impl TidDirOps {
     const STATIC_ENTRIES: &'static [(
         &'static str,
         fn(&TidDirOps, Weak<dyn IndexNode>) -> Arc<dyn IndexNode>,
-    )] = &[("stat", |ops, parent| {
-        StatFileOps::new_inode(ops.pid, parent)
-    })];
+    )] = &[
+        ("stat", |ops, parent| {
+            StatFileOps::new_inode(ops.target.clone(), parent)
+        }),
+        ("ns", |ops, parent| {
+            NsDirOps::new_inode(ops.target.clone(), parent)
+        }),
+    ];
 }
 
 impl DirOps for TidDirOps {

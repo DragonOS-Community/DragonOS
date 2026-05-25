@@ -8,8 +8,9 @@ use alloc::sync::Arc;
 use system_error::SystemError;
 
 use super::inner;
-use super::poll_util;
 use super::TcpSocket;
+
+const TCP_CLOSE_POST_POLL_ROUNDS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CloseObservation {
@@ -575,22 +576,6 @@ impl TcpSocket {
     }
 
     pub fn close_socket(&self) -> Result<(), SystemError> {
-        // 先把 iface 推进到稳定态，再决定 close(2) 是走 FIN 还是 RST。
-        // 否则 loopback 上尚未被 poll 到接收队列的数据会让 unread 误判为 0，
-        // 导致本应 abort(RST) 的场景被错误地当成 graceful close(FIN)。
-        if let Some(iface) = self
-            .inner
-            .read()
-            .as_ref()
-            .and_then(|inner| inner.iface())
-            .cloned()
-        {
-            if let Some(netns) = iface.common().net_namespace() {
-                netns.wakeup_poll_thread();
-            }
-            poll_util::poll_iface_until_quiescent(iface.as_ref());
-        }
-
         let mut writer = self.inner.write();
         let Some(inner) = writer.take() else {
             log::warn!("TcpSocket::close: already closed, unexpected");
@@ -734,7 +719,13 @@ impl TcpSocket {
             if let Some(netns) = iface.common().net_namespace() {
                 netns.wakeup_poll_thread();
             }
-            poll_util::poll_iface_until_quiescent(iface.as_ref());
+            // close(2) must not drain unrelated sockets on the whole interface. Linux
+            // queues FIN/RST work and returns without waiting for global TCP quiescence.
+            // A small bounded push is enough to expose the close to smoltcp/loopback
+            // immediately while keeping syscall latency independent of orphan backlog.
+            for _ in 0..TCP_CLOSE_POST_POLL_ROUNDS {
+                iface.poll();
+            }
             iface.common().notify_all_bound_sockets();
         }
         self.notify();

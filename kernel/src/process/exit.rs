@@ -13,6 +13,7 @@ use crate::{
 
 use super::{
     abi::WaitOption,
+    dec_visible_thread_count,
     resource::{RUsage, RUsageWho},
     ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState, RawPid,
 };
@@ -292,31 +293,35 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                 return Err(SystemError::ECHILD);
             }
 
-            let child_pcb = pid.pid_task(PidType::PID).ok_or(SystemError::ECHILD)?;
-
             let current = ProcessManager::current_pcb();
-
-            // 检查子进程是否可以被当前线程等待
-            // 根据 Linux 语义：
-            // - 默认情况下，线程组中的任何线程都可以等待同一线程组中任何线程 fork 的子进程
-            // - 如果指定了 __WNOTHREAD，则只能等待当前线程自己创建的子进程
-            if !is_eligible_child(&child_pcb, kwo.options) {
-                return Err(SystemError::ECHILD);
-            }
-
-            // 检查子进程是否匹配等待选项（__WALL/__WCLONE）
-            if !child_matches_wait_options(&child_pcb, kwo.options) {
-                return Err(SystemError::ECHILD);
-            }
-
             // 获取用于等待的 PCB（线程组 leader 或当前线程，取决于 WNOTHREAD）
             let parent = get_thread_group_leader(&current);
+            let check_child = |kwo: &mut KernelWaitOption| -> Option<Result<usize, SystemError>> {
+                let child_pcb = match pid.pid_task(PidType::PID) {
+                    Some(child_pcb) => child_pcb,
+                    None => return Some(Err(SystemError::ECHILD)),
+                };
+                // 检查子进程是否可以被当前线程等待
+                // 根据 Linux 语义：
+                // - 默认情况下，线程组中的任何线程可以等待同一线程组中任何线程 fork 的子进程
+                // - 如果指定了 __WNOTHREAD，则只能等待当前线程自己创建的子进程
+                if !is_eligible_child(&child_pcb, kwo.options) {
+                    return Some(Err(SystemError::ECHILD));
+                }
+
+                // 检查子进程是否匹配等待选项（__WALL/__WCLONE）
+                if !child_matches_wait_options(&child_pcb, kwo.options) {
+                    return Some(Err(SystemError::ECHILD));
+                }
+
+                do_waitpid(child_pcb, kwo)
+            };
 
             // 等待指定子进程：睡眠在父进程自己的 wait_queue 上
             // 子进程退出时会发送信号并唤醒父进程的 wait_queue
             loop {
                 // Fast path: check without sleeping
-                if let Some(r) = do_waitpid(child_pcb.clone(), kwo) {
+                if let Some(r) = check_child(kwo) {
                     break r;
                 }
                 if kwo.options.contains(WaitOption::WNOHANG) {
@@ -326,7 +331,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                 let mut ready: Option<Result<usize, SystemError>> = None;
                 let wait_res = parent.wait_queue.wait_event_interruptible(
                     || {
-                        if let Some(r) = do_waitpid(child_pcb.clone(), kwo) {
+                        if let Some(r) = check_child(kwo) {
                             ready = Some(r);
                             true
                         } else {
@@ -1044,6 +1049,12 @@ fn do_waitpid(
 }
 
 impl ProcessControlBlock {
+    fn dec_visible_thread_count_if_accounted(&self) {
+        if self.take_visible_thread_accounted() {
+            dec_visible_thread_count();
+        }
+    }
+
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/exit.c#143
     pub(super) fn __exit_signal(&mut self) {
         let sighand = self.sighand();
@@ -1084,6 +1095,7 @@ impl ProcessControlBlock {
         if should_defer_unhash_for_group_exec(self, group_dead) {
             self.flags().insert(ProcessFlags::DEFER_UNHASH);
         } else {
+            self.dec_visible_thread_count_if_accounted();
             self.detach_pid(PidType::PID);
             if group_dead {
                 self.detach_pid(PidType::TGID);
@@ -1113,6 +1125,7 @@ impl ProcessControlBlock {
             return;
         }
         self.flags().remove(ProcessFlags::DEFER_UNHASH);
+        self.dec_visible_thread_count_if_accounted();
         self.detach_pid(PidType::PID);
         if self.is_thread_group_leader() {
             self.detach_pid(PidType::TGID);

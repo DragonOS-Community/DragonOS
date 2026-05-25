@@ -296,6 +296,19 @@ pub fn timekeeper() -> &'static Timekeeper {
     return r;
 }
 
+pub fn boottime_seconds() -> i64 {
+    let tk = timekeeper().inner.read_irqsave();
+    let nsec_per_sec = NSEC_PER_SEC as i128;
+    let boottime_ns = (tk.xtime.tv_sec as i128) * nsec_per_sec
+        + (tk.xtime.tv_nsec as i128)
+        + (tk.wall_to_monotonic.tv_sec as i128) * nsec_per_sec
+        + (tk.wall_to_monotonic.tv_nsec as i128)
+        + (tk.total_sleep_time.tv_sec as i128) * nsec_per_sec
+        + (tk.total_sleep_time.tv_nsec as i128);
+
+    boottime_ns.div_euclid(nsec_per_sec) as i64
+}
+
 pub fn timekeeping_is_initialized() -> bool {
     unsafe { __TIMEKEEPER.is_some() }
 }

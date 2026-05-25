@@ -2,31 +2,30 @@
 //!
 //! 显示进程的挂载点信息
 
-use crate::libs::mutex::MutexGuard;
-use crate::{
-    filesystem::{
-        procfs::{
-            mounts::generate_mounts_content,
-            template::{Builder, FileOps, ProcFileBuilder},
-            utils::proc_read,
+use crate::filesystem::{
+    procfs::{
+        mounts::{
+            cache_procfs_file_content, generate_mounts_content_for_task,
+            read_cached_procfs_file_content,
         },
-        vfs::{FilePrivateData, IndexNode, InodeMode},
+        pid::ProcPidTarget,
+        template::{Builder, FileOps, ProcFileBuilder},
     },
-    process::RawPid,
+    vfs::{FilePrivateData, IndexNode, InodeMode},
 };
+use crate::libs::mutex::MutexGuard;
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
 
 /// /proc/[pid]/mounts 文件的 FileOps 实现
 #[derive(Debug)]
 pub struct PidMountsFileOps {
-    #[allow(dead_code)]
-    pid: RawPid,
+    target: ProcPidTarget,
 }
 
 impl PidMountsFileOps {
-    pub fn new_inode(pid: RawPid, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcFileBuilder::new(Self { pid }, InodeMode::S_IRUGO)
+    pub fn new_inode(target: ProcPidTarget, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcFileBuilder::new(Self { target }, InodeMode::S_IRUGO)
             .parent(parent)
             .build()
             .unwrap()
@@ -34,14 +33,24 @@ impl PidMountsFileOps {
 }
 
 impl FileOps for PidMountsFileOps {
+    fn open(&self, data: &mut MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
+        let target = self
+            .target
+            .thread_group_leader()
+            .ok_or(SystemError::ESRCH)?;
+        cache_procfs_file_content(data, generate_mounts_content_for_task(&target))
+    }
+
     fn read_at(
         &self,
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: MutexGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let content = generate_mounts_content();
-        proc_read(offset, len, buf, content.as_bytes())
+        self.target
+            .thread_group_leader()
+            .ok_or(SystemError::ESRCH)?;
+        read_cached_procfs_file_content(offset, len, buf, data)
     }
 }

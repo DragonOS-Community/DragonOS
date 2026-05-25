@@ -414,21 +414,21 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
 
         // 非 leader exec：等待 leader 进入 zombie 后再交换 tid/raw_pid
         if !Arc::ptr_eq(&leader, &current) {
-            // 标记等待 leader 退出（notify_count < 0），由 exit_notify 唤醒
-            if !leader.is_zombie() && !leader.is_dead() {
-                sighand.set_group_exec_notify_count(-1);
-                let wait_res = sighand.wait_group_exec_event_killable(
-                    || {
-                        if Signal::fatal_signal_pending(&current) {
-                            return true;
-                        }
-                        leader.is_zombie() || leader.is_dead()
-                    },
-                    None::<fn()>,
-                );
-                if wait_res.is_err() || Signal::fatal_signal_pending(&current) {
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                }
+            // 标记等待 leader 退出（notify_count < 0），由 exit_notify 唤醒。
+            // 必须先发布等待状态再检查 leader，否则 leader 可能在检查与设置之间
+            // 退出，导致 exit_notify 看不到 notify_count < 0 而丢失唤醒。
+            sighand.set_group_exec_notify_count(-1);
+            let wait_res = sighand.wait_group_exec_event_killable(
+                || {
+                    if Signal::fatal_signal_pending(&current) {
+                        return true;
+                    }
+                    leader.is_zombie() || leader.is_dead()
+                },
+                None::<fn()>,
+            );
+            if wait_res.is_err() || Signal::fatal_signal_pending(&current) {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
 
             ProcessManager::exchange_tid_and_raw_pids(&current, &leader)?;
@@ -492,7 +492,6 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
             current.exit_signal.store(Signal::SIGCHLD, Ordering::SeqCst);
         }
 
-        // log::info!("de_thread: done pid={:?}", current.raw_pid());
         Ok(())
     })();
 

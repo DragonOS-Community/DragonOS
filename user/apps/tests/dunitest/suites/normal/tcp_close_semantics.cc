@@ -5,6 +5,7 @@
 #include <limits.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -12,6 +13,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 #include <string>
 
 namespace {
@@ -168,6 +170,68 @@ void* WriterThread(void* arg) {
     return nullptr;
 }
 
+void* ResetDuringCloseWorker(void*) {
+    TcpPair pair;
+    if (!InitTcpPair(&pair)) {
+        return reinterpret_cast<void*>(1);
+    }
+
+    struct PollCloseArgs {
+        int fd = -1;
+        int result = 0;
+    } poll_args {
+        .fd = pair.client_fd.Get(),
+        .result = 0,
+    };
+
+    auto poll_and_close = [](void* arg) -> void* {
+        auto* args = reinterpret_cast<PollCloseArgs*>(arg);
+        pollfd pfd {
+            .fd = args->fd,
+            .events = POLLIN | POLLHUP,
+            .revents = 0,
+        };
+        const int poll_ret = poll(&pfd, 1, 5000);
+        if (poll_ret != 1) {
+            args->result = 1;
+            return nullptr;
+        }
+        if (close(args->fd) != 0) {
+            args->result = 2;
+            return nullptr;
+        }
+        args->fd = -1;
+        return nullptr;
+    };
+
+    pthread_t closer {};
+    if (pthread_create(&closer, nullptr, poll_and_close, &poll_args) != 0) {
+        return reinterpret_cast<void*>(2);
+    }
+
+    constexpr char kData[] = "abc";
+    if (write(pair.server_fd.Get(), kData, 3) != 3) {
+        pthread_join(closer, nullptr);
+        return reinterpret_cast<void*>(3);
+    }
+
+    usleep(10000);
+
+    if (close(pair.server_fd.Release()) != 0) {
+        pthread_join(closer, nullptr);
+        return reinterpret_cast<void*>(4);
+    }
+
+    if (pthread_join(closer, nullptr) != 0) {
+        return reinterpret_cast<void*>(5);
+    }
+    if (poll_args.result != 0) {
+        return reinterpret_cast<void*>(6 + poll_args.result);
+    }
+    pair.client_fd.Release();
+    return nullptr;
+}
+
 TEST(TcpCloseSemantics, BlockPartialWriteClosedReturnsReset) {
     signal(SIGPIPE, SIG_IGN);
     TcpPair pair;
@@ -297,6 +361,25 @@ TEST(TcpCloseSemantics, ShutdownWrThenUnreadDataCloseAborts) {
     EXPECT_EQ(-1, second_send) << "peer close with unread data should abort";
     EXPECT_TRUE(saved_errno == EPIPE || saved_errno == ECONNRESET)
         << "expected EPIPE/ECONNRESET, got " << ErrnoString(saved_errno);
+}
+
+TEST(TcpCloseSemantics, ConcurrentResetDuringCloseDoesNotStall) {
+    signal(SIGPIPE, SIG_IGN);
+
+    constexpr int kThreadCount = 100;
+    std::vector<pthread_t> threads(kThreadCount);
+
+    for (int i = 0; i < kThreadCount; ++i) {
+        ASSERT_EQ(0, pthread_create(&threads[i], nullptr, ResetDuringCloseWorker, nullptr))
+            << "pthread_create failed: " << ErrnoString(errno);
+    }
+
+    for (int i = 0; i < kThreadCount; ++i) {
+        void* result = nullptr;
+        ASSERT_EQ(0, pthread_join(threads[i], &result))
+            << "pthread_join failed: " << ErrnoString(errno);
+        EXPECT_EQ(nullptr, result) << "worker " << i << " failed";
+    }
 }
 
 }  // namespace

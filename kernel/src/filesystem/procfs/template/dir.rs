@@ -88,13 +88,20 @@ impl<Ops: DirOps> ProcDir<Ops> {
     pub fn cached_children(&self) -> &RwSem<BTreeMap<String, Arc<dyn IndexNode>>> {
         &self.cached_children
     }
+
+    pub(crate) fn ops(&self) -> &Ops {
+        &self.inner
+    }
 }
 
 #[inherit_methods(from = "self.common")]
 impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
     fn fs(&self) -> Arc<dyn FileSystem>;
-    fn as_any_ref(&self) -> &dyn core::any::Any;
     fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError>;
+
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
         let mut metadata = self.common.metadata()?;

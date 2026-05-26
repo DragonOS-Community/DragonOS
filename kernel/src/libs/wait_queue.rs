@@ -719,6 +719,9 @@ impl Waker {
                         )
                         .is_ok()
                     {
+                        if let Some(pcb) = self.target.upgrade() {
+                            let _ = ProcessManager::wakeup(&pcb);
+                        }
                         return true;
                     }
                 }

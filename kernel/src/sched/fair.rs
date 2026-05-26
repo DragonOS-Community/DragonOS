@@ -1356,6 +1356,7 @@ impl CfsRunQueue {
         let curr = self.current();
         self.pick_eevdf_entity(curr.as_ref())
             .or_else(|| self.entities.leftmost())
+            .or_else(|| curr.filter(|se| se.on_rq()))
     }
 
     pub fn entity_eligible(&self, se: &Arc<FairSchedEntity>) -> bool {
@@ -1573,7 +1574,12 @@ impl Scheduler for CompletelyFairScheduler {
 
         rq.clock_updata_flags |= ClockUpdataFlag::RQCF_REQ_SKIP;
 
-        se.force_mut().deadline += se.calculate_delta_fair(se.slice);
+        if cfs_rq.entity_eligible(&se) {
+            let se_mut = se.force_mut();
+            se_mut.vruntime = se_mut.deadline;
+            se_mut.deadline += se_mut.calculate_delta_fair(se_mut.slice);
+            cfs_rq.update_min_vruntime();
+        }
     }
 
     fn check_preempt_currnet(

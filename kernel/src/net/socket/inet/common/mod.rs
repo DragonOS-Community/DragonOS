@@ -54,7 +54,7 @@ impl BoundInner {
                 netns,
             });
         } else {
-            let iface = get_iface_to_bind(address, netns.clone())
+            let iface = get_iface_for_local_bind(address, &netns)
                 .ok_or_else(|| bind_addr_not_found_error(address, &netns))?;
             // log::debug!(
             //     "BoundInner::bind: binding to iface {} for address {:?}",
@@ -212,6 +212,43 @@ pub fn normalize_unspecified_endpoint_to_loopback(
         smoltcp::wire::IpAddress::Ipv6(_) => smoltcp::wire::IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 1),
     };
     smoltcp::wire::IpEndpoint::new(addr, endpoint.port)
+}
+
+#[inline]
+fn get_iface_for_local_bind(
+    ip_addr: &smoltcp::wire::IpAddress,
+    netns: &Arc<NetNamespace>,
+) -> Option<Arc<dyn Iface>> {
+    let device_list = netns.device_list();
+
+    // Preserve existing Linux-compatible bind behavior for multicast and
+    // broadcast addresses, where the address is not configured as a unicast
+    // address on an interface.
+    if ip_addr.is_multicast() || ip_addr.is_broadcast() {
+        return netns
+            .default_iface()
+            .or_else(|| device_list.values().next().cloned());
+    }
+
+    if let Some(iface) = device_list
+        .iter()
+        .find(|(_, iface)| iface.smol_iface().lock().has_ip_addr(*ip_addr))
+        .map(|(_, iface)| iface.clone())
+    {
+        return Some(iface);
+    }
+
+    // Linux treats IPv4 addresses in a loopback interface's configured subnet
+    // as local for bind(2). IPv6 does not have this loopback-subnet exception:
+    // binding to an unassigned IPv6 address in an on-link prefix fails with
+    // EADDRNOTAVAIL.
+    if let smoltcp::wire::IpAddress::Ipv4(v4_addr) = ip_addr {
+        return device_list.iter().find_map(|(_, iface)| {
+            loopback_iface_contains_v4(iface, *v4_addr).then(|| iface.clone())
+        });
+    }
+
+    None
 }
 
 #[inline]

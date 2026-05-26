@@ -124,10 +124,6 @@ pub(super) fn do_new_route(
         .cloned()
         .ok_or(SystemError::ENODEV)?;
 
-    if parsed.destination.prefix_len() == 0 && parsed.gateway.is_none() {
-        return Err(SystemError::EINVAL);
-    }
-
     let table = effective_route_table(parsed.table);
     let entry = NetlinkRouteEntry {
         destination: parsed.destination,
@@ -151,7 +147,7 @@ pub(super) fn do_new_route(
     if let Err(err) = sync_iface_route_table(&iface, &parsed) {
         iface
             .common()
-            .remove_netlink_route(parsed.destination, parsed.source, parsed.table);
+            .remove_netlink_route(parsed.destination, parsed.source, table);
         return Err(err);
     }
     multicast_notify(
@@ -440,28 +436,31 @@ fn route_to_segment(
     Ok(RouteSegment::new(header, body, attrs))
 }
 
+fn smoltcp_via_router(destination: IpCidr, gateway: Option<IpAddress>) -> IpAddress {
+    gateway.unwrap_or_else(|| route_destination_prefix(destination))
+}
+
 fn sync_iface_route_table(
     iface: &Arc<dyn Iface>,
     route: &ParsedRouteRequest,
 ) -> Result<(), SystemError> {
+    let via_router = smoltcp_via_router(route.destination, route.gateway);
     let mut push_failed = false;
     iface.smol_iface().lock().routes_mut().update(|routes| {
         routes.retain(|existing| {
             existing.cidr != route.destination || is_local_connected_route(existing)
         });
 
-        if let Some(gateway) = route.gateway {
-            if routes
-                .push(smoltcp::iface::Route {
-                    cidr: route.destination,
-                    via_router: gateway,
-                    preferred_until: None,
-                    expires_at: None,
-                })
-                .is_err()
-            {
-                push_failed = true;
-            }
+        if routes
+            .push(smoltcp::iface::Route {
+                cidr: route.destination,
+                via_router,
+                preferred_until: None,
+                expires_at: None,
+            })
+            .is_err()
+        {
+            push_failed = true;
         }
     });
     if push_failed {

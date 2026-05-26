@@ -255,7 +255,7 @@ impl UdpSocket {
                 Ok(write_linger_getsockopt(value, on, linger))
             }
             PSO::ACCEPTCONN => Ok(write_i32_getsockopt(value, 0)),
-            PSO::ERROR => Ok(write_i32_getsockopt(value, self.take_so_error())),
+            PSO::ERROR => Ok(write_i32_getsockopt(value, 0)),
             PSO::NO_CHECK => Ok(write_i32_getsockopt(
                 value,
                 self.no_check.load(Ordering::Acquire) as i32,
@@ -431,7 +431,10 @@ impl UdpSocket {
                     0i32
                 }
             }
-            IpOption::MULTICAST_IF => self.ip_multicast_addr.load(Ordering::Relaxed) as i32,
+            IpOption::MULTICAST_IF => {
+                let v = self.ip_multicast_addr.load(Ordering::Relaxed);
+                return Ok(write_u32_getsockopt(value, v));
+            }
             IpOption::PKTINFO => {
                 if self.recv_pktinfo_v4.load(Ordering::Relaxed) {
                     1i32

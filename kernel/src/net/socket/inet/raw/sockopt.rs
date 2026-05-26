@@ -59,19 +59,19 @@ impl RawSocket {
                     .bind_to_device
                     .clone()
                     .unwrap_or_default();
-                let need = core::cmp::min(name.len() + 1, IFNAMSIZ);
-                if need == 0 || value.is_empty() {
+                if name.is_empty() {
                     return Ok(0);
                 }
+                if value.len() < IFNAMSIZ {
+                    return Err(SystemError::EINVAL);
+                }
+                let need = core::cmp::min(name.len() + 1, IFNAMSIZ);
                 let bytes = name.as_bytes();
                 let name_len = core::cmp::min(bytes.len(), need.saturating_sub(1));
-                let len = core::cmp::min(value.len(), need);
-                let copy_len = core::cmp::min(name_len, len.saturating_sub(1));
+                let copy_len = core::cmp::min(name_len, need.saturating_sub(1));
                 value[..copy_len].copy_from_slice(&bytes[..copy_len]);
-                if copy_len < len {
-                    value[copy_len] = 0;
-                }
-                Ok(len)
+                value[copy_len] = 0;
+                Ok(need)
             }
             Ok(PSO::LINGER) => {
                 let opts = self.options.read();

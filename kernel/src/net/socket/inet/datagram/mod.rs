@@ -139,8 +139,6 @@ pub struct UdpSocket {
     send_timeout_us: AtomicU64,
     /// SO_RCVTIMEO (microseconds). u64::MAX means "no timeout".
     recv_timeout_us: AtomicU64,
-    /// SO_ERROR: pending async socket error (negative POSIX errno, 0 = none).
-    so_error: AtomicI32,
     /// SO_NO_CHECK: disable UDP checksum (0=off, 1=on)
     ///
     /// NOTE: This is currently a stub implementation. The value can be set/get via
@@ -213,7 +211,6 @@ impl UdpSocket {
             send_timeout_us: AtomicU64::new(u64::MAX),
             recv_timeout_us: AtomicU64::new(u64::MAX),
             no_check: AtomicBool::new(false), // checksums enabled by default
-            so_error: AtomicI32::new(0),
             ip_version: version,
             multicast_loopback_rx: Mutex::new(VecDeque::new()),
         })
@@ -222,21 +219,6 @@ impl UdpSocket {
     #[inline]
     fn bind_id(&self) -> usize {
         self as *const UdpSocket as usize
-    }
-
-    /// Record a pending socket error for `getsockopt(SO_ERROR)` (Linux `sk->sk_err`).
-    #[inline]
-    pub(super) fn store_so_error(&self, err: &SystemError) {
-        let code = -err.to_posix_errno();
-        if code != 0 {
-            self.so_error.store(code, Ordering::Relaxed);
-        }
-    }
-
-    /// Read and clear `SO_ERROR` (negative POSIX errno, 0 if none).
-    #[inline]
-    pub(super) fn take_so_error(&self) -> i32 {
-        self.so_error.swap(0, Ordering::Relaxed)
     }
 
     #[inline]
@@ -1466,10 +1448,7 @@ impl Socket for UdpSocket {
 
                 let remote = Self::normalize_unspecified_dest(remote);
                 if !self.is_bound() {
-                    if let Err(e) = self.bind_ephemeral(remote.addr) {
-                        self.store_so_error(&e);
-                        return Err(e);
-                    }
+                    self.bind_ephemeral(remote.addr)?;
                 }
                 match self.inner.read().as_ref() {
                     Some(UdpInner::Bound(inner)) => {

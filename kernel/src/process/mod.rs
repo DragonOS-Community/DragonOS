@@ -529,33 +529,62 @@ impl ProcessManager {
     pub fn wakeup_stop(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let state = pcb.sched_info().state();
-        if let ProcessState::Stopped = state {
-            let _pi_guard = pcb.sched_info().pi_lock_irqsave();
-            let state = pcb.sched_info().state();
-            if let ProcessState::Stopped = state {
-                pcb.sched_info().set_state(ProcessState::Runnable);
-                fence(Ordering::SeqCst);
-
-                // TODO: select_task_rq 负载均衡
-                // let prev_cpu = pcb.sched_info().on_cpu().unwrap_or(smp_get_processor_id());
-                // let allowed = pi_guard.cpus_allowed.clone();
-                // let target_cpu = select_task_rq(pcb, prev_cpu, WakeupFlags::WF_TTWU, &allowed);
-                let target_cpu = pcb.sched_info().on_cpu().unwrap_or(current_cpu_id());
-
-                // stop task
-                enqueue_task_on_cpu(pcb, target_cpu, WakeupFlags::empty(), false);
-
-                return Ok(());
-            } else if state.is_runnable() {
-                return Ok(());
+        if !state.is_stopped() {
+            return if state.is_runnable() {
+                Ok(())
             } else {
-                return Err(SystemError::EINVAL);
-            }
-        } else if state.is_runnable() {
-            return Ok(());
-        } else {
-            return Err(SystemError::EINVAL);
+                Err(SystemError::EINVAL)
+            };
         }
+
+        let _pi_guard = pcb.sched_info().pi_lock_irqsave();
+        let state = pcb.sched_info().state();
+        if !state.is_stopped() {
+            return if state.is_runnable() {
+                Ok(())
+            } else {
+                Err(SystemError::EINVAL)
+            };
+        }
+
+        pcb.sched_info().set_state(ProcessState::Runnable);
+        fence(Ordering::SeqCst);
+
+        // TODO: select_task_rq 负载均衡
+        // let prev_cpu = pcb.sched_info().on_cpu().unwrap_or(smp_get_processor_id());
+        // let allowed = pi_guard.cpus_allowed.clone();
+        // let target_cpu = select_task_rq(pcb, prev_cpu, WakeupFlags::WF_TTWU, &allowed);
+        let target_cpu = pcb.sched_info().on_cpu().unwrap_or(current_cpu_id());
+        let update_clock = target_cpu == smp_get_processor_id();
+        let rq = cpu_rq(target_cpu.data() as usize);
+
+        let should_enqueue = {
+            let (rq, _rq_guard) = rq.self_lock();
+            match *pcb.sched_info().on_rq.lock_irqsave() {
+                OnRq::Queued => {
+                    let is_current = Arc::ptr_eq(&rq.current(), pcb);
+                    if !is_current {
+                        if update_clock {
+                            rq.update_rq_clock();
+                            rq.check_preempt_current(pcb, WakeupFlags::empty());
+                        } else {
+                            rq.check_preempt_remote(pcb, WakeupFlags::empty());
+                        }
+                    } else if !update_clock {
+                        kick_cpu(target_cpu).ok();
+                    }
+                    false
+                }
+                OnRq::None => true,
+                OnRq::Migrating => false,
+            }
+        };
+
+        if should_enqueue {
+            enqueue_task_on_cpu(pcb, target_cpu, WakeupFlags::empty(), false);
+        }
+
+        Ok(())
     }
 
     /// 异步将目标进程置为停止状态（用于 SIGSTOP/SIGTSTP 等作业控制停止）
@@ -1320,6 +1349,10 @@ bitflags! {
 }
 
 impl ProcessFlags {
+    pub const fn fork_inherited(&self) -> Self {
+        Self::from_bits_truncate(self.bits & Self::RANDOMIZE.bits)
+    }
+
     pub const fn exit_to_user_mode_work(&self) -> Self {
         Self::from_bits_truncate(
             self.bits

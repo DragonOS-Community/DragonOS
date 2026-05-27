@@ -310,24 +310,20 @@ impl ProcessManager {
         kthread: bool,
         new_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
-        // 先复制父进程的 flags
         let parent_flags = *ProcessManager::current_pcb().flags();
-
-        // DragonOS 无 SUPERPRIV/WQ_WORKER/IDLE/NO_SETAFFINITY 的对应，暂时只清 KTHREAD。
-        *new_pcb.flags.get_mut() = parent_flags & !ProcessFlags::KTHREAD;
+        let mut child_flags = parent_flags.fork_inherited();
 
         // KTHREAD 不通过继承传递，而是由创建参数显式赋予。
         if kthread {
-            new_pcb.flags().insert(ProcessFlags::KTHREAD);
+            child_flags.insert(ProcessFlags::KTHREAD);
         }
 
-        // 然后根据 clone_flags 设置需要的标志
         if clone_flags.contains(CloneFlags::CLONE_VFORK) {
-            new_pcb.flags().insert(ProcessFlags::VFORK);
+            child_flags.insert(ProcessFlags::VFORK);
         }
+        child_flags.insert(ProcessFlags::FORKNOEXEC);
 
-        // 标记新进程还未执行 exec
-        new_pcb.flags().insert(ProcessFlags::FORKNOEXEC);
+        *new_pcb.flags.get_mut() = child_flags;
 
         return Ok(());
     }

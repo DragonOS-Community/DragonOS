@@ -18,7 +18,7 @@ use crate::{
     arch::{mm::LockedFrameAllocator, MMArch},
     filesystem::{
         page_cache::{list_page_caches, PageCache},
-        vfs::FilePrivateData,
+        vfs::{FilePrivateData, FileSystem},
     },
     init::initcall::INITCALL_CORE,
     libs::{
@@ -269,6 +269,17 @@ fn page_reclaim_thread() -> i32 {
             PageReclaimer::flush_dirty_pages();
             // 休眠5秒
             // log::info!("sleep");
+            // 本路径通过 writeback_page() 逐页写回，不经过 PageCacheManager::sync()，
+            // 因此 write_inode 不会被触发。此处通过 sync_fs 补充两部分：
+            // 1) per-page writeback 路径的 inode 元数据回写
+            // 2) metadata-only dirty inode（无 page cache，如 chmod/truncate）
+            let mounts = ProcessManager::current_mntns().mount_list().clone_inner();
+            for (_path, mountfs) in mounts {
+                if !mountfs.is_readonly() {
+                    let _ = mountfs.sync_fs(true);
+                }
+            }
+
             let _ = nanosleep(PosixTimeSpec::new(0, 500_000_000));
         }
     }

@@ -1,21 +1,28 @@
-use crate::driver::base::block::gendisk::GenDisk;
-use crate::driver::base::device::device_number::DeviceNumber;
-use crate::filesystem::ext4::inode::Ext4Inode;
-use crate::filesystem::vfs::fcntl::AtFlags;
-use crate::filesystem::vfs::utils::{user_path_at, DName};
-use crate::filesystem::vfs::vcore::{generate_inode_id, try_find_gendisk};
-use crate::filesystem::vfs::{
-    self, FileSystem, FileSystemMakerData, IndexNode, Magic, MountableFileSystem, FSMAKER,
-    VFS_MAX_FOLLOW_SYMLINK_TIMES,
+use crate::{
+    driver::base::{block::gendisk::GenDisk, device::device_number::DeviceNumber},
+    filesystem::{
+        ext4::inode::Ext4Inode,
+        vfs::{
+            self,
+            fcntl::AtFlags,
+            utils::{user_path_at, DName},
+            vcore::{generate_inode_id, try_find_gendisk},
+            FileSystem, FileSystemMakerData, IndexNode, Magic, MountableFileSystem, FSMAKER,
+            VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        },
+    },
+    libs::mutex::Mutex,
+    mm::{
+        fault::{PageFaultHandler, PageFaultMessage},
+        VmFaultReason,
+    },
+    process::ProcessManager,
+    register_mountable_fs,
 };
-use crate::libs::mutex::Mutex;
-use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
-use crate::mm::VmFaultReason;
-use crate::process::ProcessManager;
-use crate::register_mountable_fs;
 use alloc::{
     collections::BTreeMap,
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use kdepends::another_ext4;
 use linkme::distributed_slice;
@@ -31,6 +38,9 @@ pub struct Ext4FileSystem {
 
     /// 根 inode
     root_inode: Arc<LockedExt4Inode>,
+
+    /// 元数据（size/mtime）脏但尚未刷盘的 inode 列表。
+    dirty_inodes: Mutex<Vec<Weak<LockedExt4Inode>>>,
 }
 
 impl FileSystem for Ext4FileSystem {
@@ -70,9 +80,65 @@ impl FileSystem for Ext4FileSystem {
     ) -> VmFaultReason {
         PageFaultHandler::filemap_map_pages(pfm, start_pgoff, end_pgoff)
     }
+
+    fn sync_fs(&self, _wait: bool) -> Result<(), SystemError> {
+        self.flush_dirty_inodes()
+    }
 }
 
 impl Ext4FileSystem {
+    pub(super) fn mark_inode_dirty(inode: &Arc<LockedExt4Inode>) {
+        {
+            let guard = inode.0.lock();
+            if guard.on_dirty_list {
+                return;
+            }
+        }
+
+        if let Some(fs) = inode.filesystem() {
+            let mut guard = fs.dirty_inodes.lock();
+            {
+                let mut inode_guard = inode.0.lock();
+                if inode_guard.on_dirty_list {
+                    return;
+                }
+                inode_guard.on_dirty_list = true;
+            }
+            guard.push(Arc::downgrade(inode));
+        }
+    }
+
+    fn flush_dirty_inodes(&self) -> Result<(), SystemError> {
+        let dirty: Vec<Weak<LockedExt4Inode>> = {
+            let mut guard = self.dirty_inodes.lock();
+            if guard.is_empty() {
+                return Ok(());
+            }
+            core::mem::take(&mut *guard)
+        };
+
+        let mut last_err = Ok(());
+        let mut failed: Vec<Weak<LockedExt4Inode>> = Vec::new();
+        for weak in dirty {
+            if let Some(inode) = weak.upgrade() {
+                if let Err(e) = inode.flush_metadata(false) {
+                    log::warn!("flush_dirty_inodes: 元数据刷盘失败: {:?}", e);
+                    last_err = Err(e);
+                    // on_dirty_list 保持 true，防止 mark_inode_dirty 重复添加
+                    failed.push(Arc::downgrade(&inode));
+                } else {
+                    // 成功才标记为不在脏列表
+                    inode.0.lock().on_dirty_list = false;
+                }
+            }
+        }
+        if !failed.is_empty() {
+            let mut guard = self.dirty_inodes.lock();
+            guard.extend(failed);
+        }
+        last_err
+    }
+
     fn read_statfs_from_superblock(&self) -> Result<vfs::SuperBlock, SystemError> {
         let ext4_sb = self.fs.super_block()?;
         let block_size = ext4_sb.block_size();
@@ -82,7 +148,7 @@ impl Ext4FileSystem {
         let reserved = ext4_sb.reserved_blocks_count();
 
         let mut sb = vfs::SuperBlock::new(Magic::EXT4_MAGIC, block_size, 255);
-        // Keep Linux ext4 semantics: f_blocks excludes metadata overhead.
+        // Linux ext4 语义：f_blocks 不包含元数据开销。
         sb.blocks = blocks.saturating_sub(overhead_blocks);
         sb.bfree = bfree;
         sb.bavail = bfree.saturating_sub(reserved);
@@ -119,6 +185,7 @@ impl Ext4FileSystem {
                         cached_mtime: None,
                         size_dirty: false,
                         mtime_dirty: false,
+                        on_dirty_list: false,
                     }),
                     Mutex::new(()),
                 )
@@ -128,6 +195,7 @@ impl Ext4FileSystem {
             fs,
             raw_dev,
             root_inode,
+            dirty_inodes: Mutex::new(Vec::new()),
         });
 
         let mut guard = fs.root_inode.0.lock();

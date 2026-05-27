@@ -1023,6 +1023,10 @@ impl IndexNode for MountFSInode {
         self.inner_inode.sync_file(datasync, data)
     }
 
+    fn write_inode(&self) -> Result<(), SystemError> {
+        self.inner_inode.write_inode()
+    }
+
     fn fadvise(
         &self,
         file: &Arc<super::file::File>,
@@ -1476,6 +1480,10 @@ impl FileSystem for MountFS {
         end_pgoff: usize,
     ) -> VmFaultReason {
         self.inner_filesystem.map_pages(pfm, start_pgoff, end_pgoff)
+    }
+
+    fn sync_fs(&self, wait: bool) -> Result<(), SystemError> {
+        self.inner_filesystem.sync_fs(wait)
     }
 }
 

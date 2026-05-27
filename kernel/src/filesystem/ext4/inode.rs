@@ -60,6 +60,15 @@ pub struct Ext4Inode {
     pub(super) size_dirty: bool,
     /// 标记是否有未刷回磁盘的 mtime 变更。
     pub(super) mtime_dirty: bool,
+
+    /// 该 inode 是否已在 Ext4FileSystem::dirty_inodes 列表中。
+    /// 用于在 `mark_inode_dirty` 中实现 O(1) 快速路径，避免 O(n) 遍历脏列表做去重。
+    ///
+    /// 这是一个性能提示而非正确性保证：
+    /// - false positive（在列表中但不脏）→ flush_metadata 的 `!size_dirty && !mtime_dirty`
+    ///   检查会 early return，无害
+    /// - false negative（脏但不在列表中）→ 下次 write_at 的 mark_inode_dirty 会重新添加
+    pub(super) on_dirty_list: bool,
 }
 
 #[derive(Debug)]
@@ -247,11 +256,15 @@ impl IndexNode for LockedExt4Inode {
             if write_len > 0 {
                 let written_end = offset.checked_add(write_len).ok_or(SystemError::EFBIG)?;
                 let current_file_size = core::cmp::max(old_file_size, written_end as u64);
-                let mut guard = self.0.lock();
-                guard.cached_file_size = Some(current_file_size);
-                guard.cached_mtime = Some(time);
-                guard.size_dirty = true;
-                guard.mtime_dirty = true;
+                let self_arc = {
+                    let mut guard = self.0.lock();
+                    guard.cached_file_size = Some(current_file_size);
+                    guard.cached_mtime = Some(time);
+                    guard.size_dirty = true;
+                    guard.mtime_dirty = true;
+                    guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?
+                };
+                Ext4FileSystem::mark_inode_dirty(&self_arc);
             }
 
             Ok(write_len)
@@ -464,6 +477,10 @@ impl IndexNode for LockedExt4Inode {
         } else {
             self.sync()
         }
+    }
+
+    fn write_inode(&self) -> Result<(), SystemError> {
+        self.flush_metadata(false)
     }
 
     fn page_cache(&self) -> Option<Arc<PageCache>> {
@@ -936,12 +953,17 @@ impl Ext4Inode {
             cached_mtime: None,
             size_dirty: false,
             mtime_dirty: false,
+            on_dirty_list: false,
         }
     }
 }
 
 impl LockedExt4Inode {
-    fn flush_metadata(&self, datasync: bool) -> Result<(), SystemError> {
+    pub(super) fn filesystem(&self) -> Option<Arc<Ext4FileSystem>> {
+        self.0.lock().fs_ptr.upgrade()
+    }
+
+    pub(super) fn flush_metadata(&self, datasync: bool) -> Result<(), SystemError> {
         let _io_guard = self.1.lock();
         let (fs, inode_num, size_dirty, mtime_dirty, cached_size, cached_mtime) = {
             let guard = self.0.lock();

@@ -460,6 +460,13 @@ impl PageCacheManager {
             Self::writeback_entry(&cache, page_index, entry)?;
         }
 
+        // 脏页写完后调 write_inode 回写元数据
+        if let Some(inode) = cache.inode().and_then(|w| w.upgrade()) {
+            if let Err(e) = inode.write_inode() {
+                log::warn!("write_inode failed: {:?}", e);
+            }
+        }
+
         Ok(())
     }
 

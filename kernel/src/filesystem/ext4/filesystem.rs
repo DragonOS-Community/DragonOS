@@ -129,7 +129,6 @@ impl Ext4FileSystem {
                 if let Err(e) = inode.flush_metadata(false) {
                     log::warn!("flush_dirty_inodes: 元数据刷盘失败: {:?}", e);
                     last_err = Err(e);
-                    // on_dirty_list 保持 true，防止 mark_inode_dirty 重复添加
                     failed.push(Arc::downgrade(&inode));
                 } else {
                     // 成功才标记为不在脏列表

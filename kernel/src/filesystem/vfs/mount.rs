@@ -1,29 +1,19 @@
-use core::{
-    any::Any,
-    fmt::Debug,
-    hash::Hash,
-    mem,
-    sync::atomic::{compiler_fence, AtomicUsize, Ordering},
+use super::{
+    file::FileFlags, utils::DName, FilePrivateData, FileSystem, FileType, IndexNode, InodeId,
+    InodeMode, PollableInode, SuperBlock,
 };
-
-use alloc::{
-    collections::BTreeMap,
-    string::{String, ToString},
-    sync::{Arc, Weak},
-    vec::Vec,
-};
-use hashbrown::HashMap;
-use ida::IdAllocator;
-use system_error::SystemError;
-
-use crate::libs::mutex::{Mutex, MutexGuard};
 use crate::{
     driver::base::device::device_number::{DeviceNumber, Major},
     filesystem::{
+        page_cache::list_page_caches,
         page_cache::PageCache,
         vfs::{fcntl::AtFlags, syscall::RenameFlags, vcore::do_mkdir_at},
     },
-    libs::{casting::DowncastArc, rwsem::RwSem},
+    libs::{
+        casting::DowncastArc,
+        mutex::{Mutex, MutexGuard},
+        rwsem::RwSem,
+    },
     mm::{fault::PageFaultMessage, VmFaultReason},
     process::{
         namespace::{
@@ -35,11 +25,22 @@ use crate::{
         ProcessManager,
     },
 };
-
-use super::{
-    file::FileFlags, utils::DName, FilePrivateData, FileSystem, FileType, IndexNode, InodeId,
-    InodeMode, PollableInode, SuperBlock,
+use alloc::{
+    collections::BTreeMap,
+    string::{String, ToString},
+    sync::{Arc, Weak},
+    vec::Vec,
 };
+use core::{
+    any::Any,
+    fmt::Debug,
+    hash::Hash,
+    mem,
+    sync::atomic::{compiler_fence, AtomicUsize, Ordering},
+};
+use hashbrown::HashMap;
+use ida::IdAllocator;
+use system_error::SystemError;
 
 bitflags! {
     /// Mount flags for filesystem independent mount options
@@ -577,6 +578,7 @@ impl MountFS {
             .do_umount();
 
         if result.is_ok() {
+            let _ = self.sync_filesystem();
             // 清除 self_mountpoint，断开与旧父挂载点的反向引用。
             // 将 mnt_parent 设为自身、mnt_mountpoint 设为自身 root 的语义。
             self.self_mountpoint.write().take();
@@ -648,6 +650,51 @@ impl MountFS {
             mntns.remove_mount(path.as_str());
         }
         let _ = root.umount();
+    }
+
+    /// 对应 Linux `sync_inodes_sb()`：回写指定 mount 下所有脏 page cache。
+    /// DragonOS 无 per-sb 脏 inode 列表，通过全局 `PAGECACHE_REGISTRY` 遍历匹配。
+    pub(crate) fn sync_inodes_of_mount(&self) -> Result<(), SystemError> {
+        let inner_fs = self.inner_filesystem();
+        let caches = list_page_caches();
+        let mut last_err = Ok(());
+        for page_cache in caches {
+            let belongs = page_cache
+                .inode()
+                .and_then(|weak| weak.upgrade())
+                .is_some_and(|inode| Arc::ptr_eq(&inode.fs(), &inner_fs));
+
+            if belongs {
+                if let Err(e) = page_cache.manager().sync() {
+                    log::warn!("sync_inodes_of_mount: page cache sync failed: {:?}", e);
+                    last_err = Err(e);
+                }
+            }
+        }
+        last_err
+    }
+
+    /// sync() 将所有挂起的文件系统元数据和缓存文件数据写入底层文件系统。
+    pub fn sync_filesystem(&self) -> Result<(), SystemError> {
+        if self.is_readonly() {
+            return Ok(());
+        }
+
+        // writeback_inodes_sb(sb) — void
+        let _ = self.sync_inodes_of_mount();
+        // sync_fs(sb, 0)
+        self.sync_fs(false)?;
+
+        // TODO: sync_blockdev_nowait(sb->s_bdev)
+
+        // sync_inodes_sb(sb) — void
+        let _ = self.sync_inodes_of_mount();
+        // sync_fs(sb, 1)
+        self.sync_fs(true)?;
+
+        // TODO: sync_blockdev(sb->s_bdev)
+
+        Ok(())
     }
 }
 

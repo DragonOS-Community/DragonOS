@@ -269,10 +269,9 @@ fn page_reclaim_thread() -> i32 {
             PageReclaimer::flush_dirty_pages();
             // 休眠5秒
             // log::info!("sleep");
-            // 本路径通过 writeback_page() 逐页写回，不经过 PageCacheManager::sync()，
-            // 因此 write_inode 不会被触发。此处通过 sync_fs 补充两部分：
-            // 1) per-page writeback 路径的 inode 元数据回写
-            // 2) metadata-only dirty inode（无 page cache，如 chmod/truncate）
+            // Linux 的 __writeback_single_inode 在 do_writepages 后调 write_inode 回写元数据，
+            // 脏页和元数据在同一次遍历中完成。DragonOS 的 flush_dirty_pages 不触发 write_inode，
+            // 此处通过 sync_fs 刷回 dirty_inodes 中的脏元数据。
             let mounts = ProcessManager::current_mntns().mount_list().clone_inner();
             for (_path, mountfs) in mounts {
                 if !mountfs.is_readonly() {

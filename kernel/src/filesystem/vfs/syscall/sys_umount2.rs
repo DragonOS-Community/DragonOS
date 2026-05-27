@@ -106,11 +106,6 @@ pub fn do_umount2(
         return Err(SystemError::EINVAL);
     }
 
-    // 检查通过后再实际移除
-    let Some(fs) = current_mntns.remove_mount(&path) else {
-        log::warn!("do_umount2: mount_list race for resolved='{}'", path);
-        return Err(SystemError::EINVAL);
-    };
     if let Err(err) = fs.umount() {
         log::warn!(
             "do_umount2: fs.umount failed for resolved='{}', fs='{}': {:?}",
@@ -120,6 +115,7 @@ pub fn do_umount2(
         );
         return Err(err);
     }
+    let _ = current_mntns.remove_mount(&path);
     Ok(fs)
 }
 

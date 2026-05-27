@@ -1,24 +1,17 @@
-use alloc::string::ToString;
-
-use alloc::vec::Vec;
-
 use crate::{
     arch::{
         interrupt::TrapFrame,
         syscall::nr::{SYS_SYNC, SYS_SYNCFS},
     },
-    filesystem::vfs::file::FileFlags,
+    filesystem::vfs::{file::FileFlags, mount::list_unique_mounted_superblocks},
+    libs::casting::DowncastArc,
     mm::page::PageReclaimer,
     process::ProcessManager,
     syscall::table::{FormattedSyscallParam, Syscall},
 };
-
+use alloc::{string::ToString, vec::Vec};
 use system_error::SystemError;
 
-/// sync() causes all pending modifications to filesystem metadata and
-/// cached file data to be written to the underlying filesystems.
-///
-/// See https://man7.org/linux/man-pages/man2/sync.2.html
 pub struct SysSyncHandle;
 
 impl Syscall for SysSyncHandle {
@@ -31,7 +24,34 @@ impl Syscall for SysSyncHandle {
         _args: &[usize],
         _frame: &mut TrapFrame,
     ) -> Result<usize, system_error::SystemError> {
+        // 唤醒回写线程，异步刷回所有脏页
         PageReclaimer::flush_dirty_pages();
+
+        let mounts = list_unique_mounted_superblocks();
+
+        // 逐 superblock 同步回写脏 inode
+        for mountfs in &mounts {
+            let _ = mountfs.sync_inodes_with_umount_read();
+        }
+
+        // 逐 superblock 调 sync_fs(nowait)，提交元数据但不等待
+        for mountfs in &mounts {
+            let _ = mountfs.sync_fs_with_umount_read(false);
+        }
+
+        // 逐 superblock 调 sync_fs(wait)，等待元数据落盘
+        for mountfs in &mounts {
+            let _ = mountfs.sync_fs_with_umount_read(true);
+        }
+
+        for mountfs in &mounts {
+            let _ = mountfs.sync_blockdev_with_umount_read(false);
+        }
+
+        for mountfs in &mounts {
+            let _ = mountfs.sync_blockdev_with_umount_read(true);
+        }
+
         Ok(0)
     }
 
@@ -45,8 +65,7 @@ impl Syscall for SysSyncHandle {
 
 syscall_table_macros::declare_syscall!(SYS_SYNC, SysSyncHandle);
 
-/// syncfs() is like sync(), but synchronizes just the filesystem
-/// containing file referred to by the open file descriptor fd.
+/// syncfs() 与 sync() 类似，但只同步文件描述符 fd 所在的文件系统。
 pub struct SysSyncFsHandle;
 
 impl Syscall for SysSyncFsHandle {
@@ -61,27 +80,40 @@ impl Syscall for SysSyncFsHandle {
     ) -> Result<usize, system_error::SystemError> {
         let fd = args[0] as i32;
 
-        // Get the file descriptor table
         let binding = ProcessManager::current_pcb().fd_table();
         let fd_table_guard = binding.read();
 
-        // Validate that the fd exists
+        // fdget(fd): EBADF if invalid fd
         let file = fd_table_guard
             .get_file_by_fd(fd)
             .ok_or(SystemError::EBADF)?;
 
-        // drop guard 以避免无法调度的问题
         drop(fd_table_guard);
 
-        // Check if the file descriptor was opened with O_PATH
+        // fdget() 通过 FMODE_PATH 掩码过滤 O_PATH fd
         if file.flags().contains(FileFlags::O_PATH) {
             return Err(SystemError::EBADF);
         }
 
-        // TODO: now, we ignore the fd and sync all filesystems.
-        // In the future, we should sync only the filesystem of the given fd.
-        PageReclaimer::flush_dirty_pages();
-        Ok(0)
+        let inode = file.inode();
+        // 非 VFS fd（pipe/socket 等）：其 sb 为只读伪文件系统（pipefs/sockfs），
+        let mount_inode = match inode
+            .clone()
+            .downcast_arc::<crate::filesystem::vfs::mount::MountFSInode>()
+        {
+            Some(mi) => mi,
+            None => return Ok(0),
+        };
+
+        let mount_fs = mount_inode.mount_fs();
+
+        let sync_result = mount_fs.sync_filesystem();
+        let errseq_result = file.check_and_advance_sb_wb_error(&mount_fs);
+
+        match sync_result {
+            Err(e) => Err(e),
+            Ok(()) => errseq_result.map(|_| 0),
+        }
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

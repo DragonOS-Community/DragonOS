@@ -3,6 +3,7 @@
 demo/gtest_demo
 normal/capability
 normal/fdatasync
+normal/syncfs_semantics
 normal/fcntl_lock
 normal/fcntl_signal
 normal/epoll_timeout_budget

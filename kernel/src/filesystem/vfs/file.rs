@@ -468,6 +468,8 @@ pub struct File {
     ra_state: Mutex<FileReadaheadState>,
     /// 当前 open file description 已观测到的 page cache 写回错误序列。
     wb_error_seq: AtomicU64,
+    /// 当前 open file description 已观测到的 superblock 写回错误序列。
+    sb_error_seq: AtomicU64,
 }
 
 impl File {
@@ -486,6 +488,22 @@ impl File {
         };
         self.wb_error_seq.store(seq, Ordering::Release);
         Err(error)
+    }
+
+    pub fn check_and_advance_sb_wb_error(
+        &self,
+        mount_fs: &Arc<super::mount::MountFS>,
+    ) -> Result<(), SystemError> {
+        let since = self.sb_error_seq.load(Ordering::Acquire);
+        let (seq, error) = mount_fs.check_and_advance_wb_error(since);
+        if seq != since {
+            self.sb_error_seq.store(seq, Ordering::Release);
+        }
+        if let Some(error) = error {
+            Err(error)
+        } else {
+            Ok(())
+        }
     }
 
     fn maybe_kill_suid_sgid_after_write(&self) -> Result<(), SystemError> {
@@ -707,6 +725,11 @@ impl File {
             .page_cache()
             .map(|page_cache| page_cache.sample_writeback_error())
             .unwrap_or(0);
+        let sb_error_seq = inode
+            .clone()
+            .downcast_arc::<MountFSInode>()
+            .map(|mnt_inode| mnt_inode.mount_fs().sample_wb_error())
+            .unwrap_or(0);
 
         let f = File {
             open_file_id: alloc_open_file_id(),
@@ -722,6 +745,7 @@ impl File {
             posix_lock_key,
             ra_state: Mutex::new(FileReadaheadState::new()),
             wb_error_seq: AtomicU64::new(wb_error_seq),
+            sb_error_seq: AtomicU64::new(sb_error_seq),
         };
 
         return Ok(f);
@@ -1252,6 +1276,7 @@ impl File {
             posix_lock_key: self.posix_lock_key,
             ra_state: Mutex::new(self.ra_state.lock().clone()),
             wb_error_seq: AtomicU64::new(self.wb_error_seq.load(Ordering::Acquire)),
+            sb_error_seq: AtomicU64::new(self.sb_error_seq.load(Ordering::Acquire)),
         };
         // 调用inode的open方法，让inode知道有新的文件打开了这个inode
         // TODO: reopen is not a good idea for some inodes, need a better design

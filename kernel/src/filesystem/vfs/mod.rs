@@ -812,6 +812,17 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         Ok(())
     }
 
+    /// 将 inode 元数据（size/mtime 等）写入磁盘。
+    ///
+    /// 对齐 Linux `super_operations.write_inode`：在脏页回写完成后，
+    /// 如果 inode 有脏元数据（I_DIRTY_SYNC / I_DIRTY_DATASYNC），
+    /// VFS 调用此方法将元数据持久化。
+    ///
+    /// 默认 no-op——procfs/sysfs/pipe/socket 等无磁盘元数据的 inode 不需要覆盖。
+    fn write_inode(&self, _wbc: &WritebackControl) -> Result<(), SystemError> {
+        Ok(())
+    }
+
     /// ## 创建一个特殊文件节点
     /// - _filename: 文件名
     /// - _mode: 权限信息
@@ -1347,6 +1358,34 @@ pub enum FsPermissionPolicy {
     Remote,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WritebackSyncMode {
+    None,
+    All,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WritebackControl {
+    pub sync_mode: WritebackSyncMode,
+    pub for_sync: bool,
+}
+
+impl WritebackControl {
+    pub const fn sync_all_for_sync() -> Self {
+        Self {
+            sync_mode: WritebackSyncMode::All,
+            for_sync: true,
+        }
+    }
+
+    pub const fn sync_none() -> Self {
+        Self {
+            sync_mode: WritebackSyncMode::None,
+            for_sync: false,
+        }
+    }
+}
+
 /// @brief 所有文件系统都应该实现的trait
 pub trait FileSystem: Any + Sync + Send + Debug {
     /// @brief 获取当前文件系统的root inode的指针
@@ -1395,6 +1434,12 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     /// Called after a filesystem is successfully unmounted.
     /// Default is no-op.
     fn on_umount(&self) {}
+
+    /// super_operations.sync_fs 在 sync() 回写脏页后调用，刷新文件系统元数据。
+    fn sync_fs(&self, wait: bool) -> Result<(), SystemError> {
+        let _ = wait;
+        Ok(())
+    }
 
     unsafe fn fault(&self, _pfm: &mut PageFaultMessage) -> VmFaultReason {
         VmFaultReason::VM_FAULT_SIGBUS

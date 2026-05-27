@@ -899,11 +899,7 @@ impl CpuRunQueue {
 
         if next.is_none()
             && !task_is_idle(&prev)
-            && prev
-                .sched_info()
-                .inner_lock_read_irqsave()
-                .state()
-                .is_runnable()
+            && prev.sched_info().state().is_runnable()
             && *prev.sched_info().on_rq.lock_irqsave() == OnRq::Queued
         {
             next = Some(prev.clone());

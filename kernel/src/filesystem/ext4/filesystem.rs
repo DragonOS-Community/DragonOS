@@ -40,7 +40,7 @@ pub struct Ext4FileSystem {
     root_inode: Arc<LockedExt4Inode>,
 
     /// 元数据（size/mtime）脏但尚未刷盘的 inode 列表。
-    dirty_inodes: Mutex<Vec<Weak<LockedExt4Inode>>>,
+    dirty_inodes: Mutex<Vec<Arc<LockedExt4Inode>>>,
 }
 
 impl FileSystem for Ext4FileSystem {
@@ -87,34 +87,28 @@ impl FileSystem for Ext4FileSystem {
 }
 
 impl Ext4FileSystem {
-    pub(super) fn mark_inode_dirty(inode: &Arc<LockedExt4Inode>) {
-        {
-            let guard = inode.0.lock();
-            if guard.dirty_state.contains(InodeDirtyState::ON_DIRTY_LIST) {
-                return;
+    pub(super) fn mark_inode_dirty(inode: &Arc<LockedExt4Inode>, dirty: InodeDirtyState) {
+        let (fs, should_queue) = {
+            let mut guard = inode.0.lock();
+            guard.dirty_state.insert(dirty);
+            let should_queue = !guard
+                .dirty_state
+                .intersects(InodeDirtyState::QUEUED | InodeDirtyState::WRITEBACK);
+            if should_queue {
+                guard.dirty_state.insert(InodeDirtyState::QUEUED);
             }
-        }
+            (guard.fs_ptr.upgrade(), should_queue)
+        };
 
-        if let Some(fs) = inode.filesystem() {
-            let mut guard = fs.dirty_inodes.lock();
-            {
-                let mut inode_guard = inode.0.lock();
-                if inode_guard
-                    .dirty_state
-                    .contains(InodeDirtyState::ON_DIRTY_LIST)
-                {
-                    return;
-                }
-                inode_guard
-                    .dirty_state
-                    .insert(InodeDirtyState::ON_DIRTY_LIST);
+        if should_queue {
+            if let Some(fs) = fs {
+                fs.dirty_inodes.lock().push(inode.clone());
             }
-            guard.push(Arc::downgrade(inode));
         }
     }
 
     fn flush_dirty_inodes(&self) -> Result<(), SystemError> {
-        let dirty: Vec<Weak<LockedExt4Inode>> = {
+        let dirty: Vec<Arc<LockedExt4Inode>> = {
             let mut guard = self.dirty_inodes.lock();
             if guard.is_empty() {
                 return Ok(());
@@ -123,26 +117,92 @@ impl Ext4FileSystem {
         };
 
         let mut last_err = Ok(());
-        let mut failed: Vec<Weak<LockedExt4Inode>> = Vec::new();
-        for weak in dirty {
-            if let Some(inode) = weak.upgrade() {
-                if let Err(e) = inode.flush_metadata(false) {
-                    log::warn!("flush_dirty_inodes: 元数据刷盘失败: {:?}", e);
-                    last_err = Err(e);
-                    failed.push(Arc::downgrade(&inode));
-                } else {
-                    // 成功才标记为不在脏列表
-                    inode
-                        .0
-                        .lock()
+        let mut requeue: Vec<Arc<LockedExt4Inode>> = Vec::new();
+        for inode in dirty {
+            let mut should_requeue = false;
+            let result = {
+                let _io_guard = inode.1.lock();
+                let (fs, inode_num, snapshot_dirty, cached_size, cached_mtime) = {
+                    let mut guard = inode.0.lock();
+                    guard.dirty_state.remove(InodeDirtyState::QUEUED);
+                    let snapshot_dirty = guard
                         .dirty_state
-                        .remove(InodeDirtyState::ON_DIRTY_LIST);
+                        .intersection(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY);
+                    if snapshot_dirty.is_empty() {
+                        guard.dirty_state.remove(InodeDirtyState::WRITEBACK);
+                        continue;
+                    }
+                    guard.dirty_state.insert(InodeDirtyState::WRITEBACK);
+                    (
+                        guard.fs_ptr.upgrade(),
+                        guard.inner_inode_num,
+                        snapshot_dirty,
+                        guard.cached_file_size,
+                        guard.cached_mtime,
+                    )
+                };
+
+                let result = if let Some(fs) = fs {
+                    let size = if snapshot_dirty.contains(InodeDirtyState::SIZE_DIRTY) {
+                        match cached_size {
+                            Some(size) => Ok(Some(size)),
+                            None => fs
+                                .fs
+                                .getattr(inode_num)
+                                .map(|attr| Some(attr.size))
+                                .map_err(SystemError::from),
+                        }
+                    } else {
+                        Ok(None)
+                    };
+                    size.and_then(|size| {
+                        let mtime = if snapshot_dirty.contains(InodeDirtyState::MTIME_DIRTY) {
+                            cached_mtime
+                        } else {
+                            None
+                        };
+                        fs.fs
+                            .commit_inode_metadata(inode_num, size, mtime)
+                            .map_err(SystemError::from)
+                    })
+                } else {
+                    Err(SystemError::EIO)
+                };
+
+                let mut guard = inode.0.lock();
+                if result.is_ok() {
+                    if snapshot_dirty.contains(InodeDirtyState::SIZE_DIRTY)
+                        && guard.cached_file_size == cached_size
+                    {
+                        guard.dirty_state.remove(InodeDirtyState::SIZE_DIRTY);
+                    }
+                    if snapshot_dirty.contains(InodeDirtyState::MTIME_DIRTY)
+                        && guard.cached_mtime == cached_mtime
+                    {
+                        guard.dirty_state.remove(InodeDirtyState::MTIME_DIRTY);
+                    }
                 }
+                guard.dirty_state.remove(InodeDirtyState::WRITEBACK);
+                if guard
+                    .dirty_state
+                    .intersects(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY)
+                {
+                    guard.dirty_state.insert(InodeDirtyState::QUEUED);
+                    should_requeue = true;
+                }
+                result
+            };
+
+            if let Err(e) = result {
+                log::warn!("flush_dirty_inodes: 元数据刷盘失败: {:?}", e);
+                last_err = Err(e);
+            }
+            if should_requeue {
+                requeue.push(inode);
             }
         }
-        if !failed.is_empty() {
-            let mut guard = self.dirty_inodes.lock();
-            guard.extend(failed);
+        if !requeue.is_empty() {
+            self.dirty_inodes.lock().extend(requeue);
         }
         last_err
     }

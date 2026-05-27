@@ -819,7 +819,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// VFS 调用此方法将元数据持久化。
     ///
     /// 默认 no-op——procfs/sysfs/pipe/socket 等无磁盘元数据的 inode 不需要覆盖。
-    fn write_inode(&self) -> Result<(), SystemError> {
+    fn write_inode(&self, _wbc: &WritebackControl) -> Result<(), SystemError> {
         Ok(())
     }
 
@@ -1356,6 +1356,34 @@ bitflags! {
 pub enum FsPermissionPolicy {
     Dac,
     Remote,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WritebackSyncMode {
+    None,
+    All,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WritebackControl {
+    pub sync_mode: WritebackSyncMode,
+    pub for_sync: bool,
+}
+
+impl WritebackControl {
+    pub const fn sync_all_for_sync() -> Self {
+        Self {
+            sync_mode: WritebackSyncMode::All,
+            for_sync: true,
+        }
+    }
+
+    pub const fn sync_none() -> Self {
+        Self {
+            sync_mode: WritebackSyncMode::None,
+            for_sync: false,
+        }
+    }
 }
 
 /// @brief 所有文件系统都应该实现的trait

@@ -941,7 +941,12 @@ pub fn propagate_umount(
 
 /// Umount at a specific peer mount.
 fn umount_at_peer(peer_mnt: &Arc<MountFS>, mountpoint_id: InodeId) -> Result<(), SystemError> {
-    if let Some(child) = peer_mnt.mountpoints().remove(&mountpoint_id) {
+    let child = peer_mnt.mountpoints().get(&mountpoint_id).cloned();
+    if let Some(child) = child {
+        child.sync_filesystem()?;
+        let Some(child) = peer_mnt.mountpoints().remove(&mountpoint_id) else {
+            return Ok(());
+        };
         // Unregister the child from its peer group if shared
         let child_prop = child.propagation();
         if child_prop.is_shared() {

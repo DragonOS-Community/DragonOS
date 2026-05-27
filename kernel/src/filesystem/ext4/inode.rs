@@ -36,12 +36,10 @@ bitflags! {
         const SIZE_DIRTY    = 1 << 0;
         /// mtime 变更未刷盘，对应 I_DIRTY_DATASYNC (1 << 1)
         const MTIME_DIRTY   = 1 << 1;
-        /// inode 有脏页，对应 I_DIRTY_PAGES (1 << 2)
-        /// DragonOS 脏页由 per-PageCache 的 `dirty_pages: BTreeSet` 追踪，暂不需要此位。
-        #[allow(dead_code)]
-        const PAGES_DIRTY   = 1 << 2;
-        /// 该 inode 是否在 dirty_inodes 列表中。Linux 无此位，隐含在 `i_state & I_DIRTY != 0`，DragonOS 简化合并。
-        const ON_DIRTY_LIST = 1 << 3;
+        /// 该 inode 已在文件系统 dirty_inodes 队列中。
+        const QUEUED        = 1 << 3;
+        /// 该 inode 正在执行元数据写回。
+        const WRITEBACK     = 1 << 4;
         /// 仅时间戳脏（lazytime），对应 I_DIRTY_TIME (1 << 11)
         #[allow(dead_code)]
         const TIME_DIRTY    = 1 << 11;
@@ -268,12 +266,12 @@ impl IndexNode for LockedExt4Inode {
                     let mut guard = self.0.lock();
                     guard.cached_file_size = Some(current_file_size);
                     guard.cached_mtime = Some(time);
-                    guard
-                        .dirty_state
-                        .insert(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY);
                     guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?
                 };
-                Ext4FileSystem::mark_inode_dirty(&self_arc);
+                Ext4FileSystem::mark_inode_dirty(
+                    &self_arc,
+                    InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY,
+                );
             }
 
             Ok(write_len)
@@ -488,7 +486,7 @@ impl IndexNode for LockedExt4Inode {
         }
     }
 
-    fn write_inode(&self) -> Result<(), SystemError> {
+    fn write_inode(&self, _wbc: &vfs::WritebackControl) -> Result<(), SystemError> {
         self.flush_metadata(false)
     }
 
@@ -968,10 +966,6 @@ impl Ext4Inode {
 }
 
 impl LockedExt4Inode {
-    pub(super) fn filesystem(&self) -> Option<Arc<Ext4FileSystem>> {
-        self.0.lock().fs_ptr.upgrade()
-    }
-
     pub(super) fn flush_metadata(&self, datasync: bool) -> Result<(), SystemError> {
         let _io_guard = self.1.lock();
         let (fs, inode_num, dirty, cached_size, cached_mtime) = {

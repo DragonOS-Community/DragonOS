@@ -8,7 +8,9 @@ use alloc::{
 use hashbrown::HashMap;
 use system_error::SystemError;
 
-use super::vfs::{FilePrivateData, IndexNode};
+use super::vfs::{
+    mount::record_writeback_error_for_fs, FilePrivateData, IndexNode, WritebackControl,
+};
 use crate::exception::workqueue::{schedule_work, Work, WorkQueue};
 use crate::libs::mutex::MutexGuard;
 use crate::libs::rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard};
@@ -460,10 +462,14 @@ impl PageCacheManager {
             Self::writeback_entry(&cache, page_index, entry)?;
         }
 
-        // 脏页写完后调 write_inode 回写元数据
+        // 脏页写完后调 write_inode 回写元数据。
         if let Some(inode) = cache.inode().and_then(|w| w.upgrade()) {
-            if let Err(e) = inode.write_inode() {
+            let wbc = WritebackControl::sync_all_for_sync();
+            if let Err(e) = inode.write_inode(&wbc) {
                 log::warn!("write_inode failed: {:?}", e);
+                cache.record_writeback_error(e.clone());
+                record_writeback_error_for_fs(&inode.fs(), e.clone());
+                return Err(e);
             }
         }
 
@@ -677,6 +683,9 @@ impl PageCacheManager {
     ) -> Result<(), SystemError> {
         if let Err(e) = result {
             cache.record_writeback_error(e.clone());
+            if let Some(inode) = cache.inode().and_then(|w| w.upgrade()) {
+                record_writeback_error_for_fs(&inode.fs(), e.clone());
+            }
             {
                 let mut guard = page.write();
                 guard.add_flags(PageFlags::PG_ERROR | PageFlags::PG_DIRTY);

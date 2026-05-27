@@ -13,6 +13,7 @@ use crate::{
         casting::DowncastArc,
         mutex::{Mutex, MutexGuard},
         rwsem::RwSem,
+        spinlock::SpinLock,
     },
     mm::{fault::PageFaultMessage, VmFaultReason},
     process::{
@@ -40,6 +41,7 @@ use core::{
 };
 use hashbrown::HashMap;
 use ida::IdAllocator;
+use lazy_static::lazy_static;
 use system_error::SystemError;
 
 bitflags! {
@@ -233,6 +235,16 @@ int_like!(MountId, usize);
 static MOUNT_ID_ALLOCATOR: Mutex<IdAllocator> =
     Mutex::new(IdAllocator::new(0, usize::MAX).unwrap());
 
+lazy_static! {
+    static ref MOUNTED_SUPERBLOCKS: SpinLock<Vec<Weak<MountFS>>> = SpinLock::new(Vec::new());
+}
+
+#[derive(Debug, Default)]
+struct WritebackErrorState {
+    seq: u64,
+    error: Option<SystemError>,
+}
+
 impl MountId {
     fn alloc() -> Self {
         let id = MOUNT_ID_ALLOCATOR.lock().alloc().unwrap();
@@ -272,6 +284,8 @@ pub struct MountFS {
 pub struct SuperBlockState {
     flags: RwSem<MountFlags>,
     write_count: AtomicUsize,
+    wb_error: SpinLock<WritebackErrorState>,
+    umount_lock: RwSem<()>,
 }
 
 struct MountStateInit {
@@ -284,6 +298,8 @@ impl SuperBlockState {
         Self {
             flags: RwSem::new(flags & MountFlags::SB_SETTABLE_MASK),
             write_count: AtomicUsize::new(0),
+            wb_error: SpinLock::new(WritebackErrorState::default()),
+            umount_lock: RwSem::new(()),
         }
     }
 
@@ -305,6 +321,33 @@ impl SuperBlockState {
 
     pub fn has_writers(&self) -> bool {
         self.write_count.load(Ordering::Acquire) != 0
+    }
+
+    pub fn sample_wb_error(&self) -> u64 {
+        self.wb_error.lock_irqsave().seq
+    }
+
+    pub fn check_and_advance_wb_error(&self, since: u64) -> (u64, Option<SystemError>) {
+        let guard = self.wb_error.lock_irqsave();
+        if guard.seq == since {
+            (since, None)
+        } else {
+            (guard.seq, guard.error.clone())
+        }
+    }
+
+    pub fn record_wb_error(&self, error: SystemError) {
+        let mut guard = self.wb_error.lock_irqsave();
+        guard.seq = guard.seq.wrapping_add(1).max(1);
+        guard.error = Some(error);
+    }
+
+    pub fn umount_read(&self) -> crate::libs::rwsem::RwSemReadGuard<'_, ()> {
+        self.umount_lock.read()
+    }
+
+    pub fn umount_write(&self) -> crate::libs::rwsem::RwSemWriteGuard<'_, ()> {
+        self.umount_lock.write()
     }
 }
 
@@ -394,6 +437,7 @@ impl MountFS {
             result.set_namespace(Arc::downgrade(mnt_ns));
         }
 
+        register_mounted_superblock(&result);
         result
     }
 
@@ -416,6 +460,7 @@ impl MountFS {
             mount_source: RwSem::new(mount_source),
         });
 
+        register_mounted_superblock(&mountfs);
         return mountfs;
     }
 
@@ -437,6 +482,10 @@ impl MountFS {
 
     pub fn is_readonly(&self) -> bool {
         self.combined_flags().contains(MountFlags::RDONLY)
+    }
+
+    pub fn is_sb_readonly(&self) -> bool {
+        self.super_block_flags().contains(MountFlags::RDONLY)
     }
 
     pub fn has_writers(&self) -> bool {
@@ -572,13 +621,15 @@ impl MountFS {
     /// # Errors
     /// 如果当前文件系统是根文件系统，那么将会返回`EINVAL`
     pub fn umount(&self) -> Result<Arc<MountFS>, SystemError> {
-        let result = self
-            .self_mountpoint()
-            .ok_or(SystemError::EINVAL)?
-            .do_umount();
+        let mountpoint = self.self_mountpoint().ok_or(SystemError::EINVAL)?;
+        let sb_state = self.super_block_state();
+        let _umount_guard = sb_state.umount_write();
+
+        self.sync_filesystem_locked()?;
+
+        let result = mountpoint.do_umount();
 
         if result.is_ok() {
-            let _ = self.sync_filesystem();
             // 清除 self_mountpoint，断开与旧父挂载点的反向引用。
             // 将 mnt_parent 设为自身、mnt_mountpoint 设为自身 root 的语义。
             self.self_mountpoint.write().take();
@@ -654,7 +705,7 @@ impl MountFS {
 
     /// 对应 Linux `sync_inodes_sb()`：回写指定 mount 下所有脏 page cache。
     /// DragonOS 无 per-sb 脏 inode 列表，通过全局 `PAGECACHE_REGISTRY` 遍历匹配。
-    pub(crate) fn sync_inodes_of_mount(&self) -> Result<(), SystemError> {
+    fn sync_inodes_of_mount(&self) -> Result<(), SystemError> {
         let inner_fs = self.inner_filesystem();
         let caches = list_page_caches();
         let mut last_err = Ok(());
@@ -667,6 +718,7 @@ impl MountFS {
             if belongs {
                 if let Err(e) = page_cache.manager().sync() {
                     log::warn!("sync_inodes_of_mount: page cache sync failed: {:?}", e);
+                    self.record_wb_error(e.clone());
                     last_err = Err(e);
                 }
             }
@@ -674,27 +726,146 @@ impl MountFS {
         last_err
     }
 
+    pub fn sync_inodes_with_umount_read(&self) -> Result<(), SystemError> {
+        let sb_state = self.super_block_state();
+        let _umount_guard = sb_state.umount_read();
+
+        if self.is_sb_readonly() {
+            return Ok(());
+        }
+
+        self.sync_inodes_of_mount()
+    }
+
+    pub fn sync_fs_with_umount_read(&self, wait: bool) -> Result<(), SystemError> {
+        let sb_state = self.super_block_state();
+        let _umount_guard = sb_state.umount_read();
+
+        if self.is_sb_readonly() {
+            return Ok(());
+        }
+
+        if let Err(e) = self.sync_fs(wait) {
+            self.record_wb_error(e.clone());
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
+    pub fn sync_blockdev_with_umount_read(&self, wait: bool) -> Result<(), SystemError> {
+        let sb_state = self.super_block_state();
+        let _umount_guard = sb_state.umount_read();
+
+        if self.is_sb_readonly() {
+            return Ok(());
+        }
+
+        if let Err(e) = self.sync_blockdev(wait) {
+            self.record_wb_error(e.clone());
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
     /// sync() 将所有挂起的文件系统元数据和缓存文件数据写入底层文件系统。
     pub fn sync_filesystem(&self) -> Result<(), SystemError> {
-        if self.is_readonly() {
+        let sb_state = self.super_block_state();
+        let _umount_guard = sb_state.umount_read();
+
+        self.sync_filesystem_locked()
+    }
+
+    /// 同步当前 superblock，要求调用方已经持有 `umount_lock`。
+    ///
+    /// Linux 的 `sync_filesystem(sb)` 要求调用方已持有 `s_umount`。DragonOS
+    /// 在 `sync_filesystem()` 外部入口中获取读锁，而 `umount()` 已经持有写锁，
+    /// 因此 teardown 路径必须调用这个 locked 版本，避免同线程重入读锁。
+    pub fn sync_filesystem_locked(&self) -> Result<(), SystemError> {
+        if self.is_sb_readonly() {
             return Ok(());
         }
 
         // writeback_inodes_sb(sb) — void
-        let _ = self.sync_inodes_of_mount();
+        let mut last_err = self.sync_inodes_of_mount();
         // sync_fs(sb, 0)
-        self.sync_fs(false)?;
+        if let Err(e) = self.sync_fs(false) {
+            self.record_wb_error(e.clone());
+            return Err(e);
+        }
 
-        // TODO: sync_blockdev_nowait(sb->s_bdev)
+        if let Err(e) = self.sync_blockdev(false) {
+            self.record_wb_error(e.clone());
+            return Err(e);
+        }
 
         // sync_inodes_sb(sb) — void
-        let _ = self.sync_inodes_of_mount();
+        if let Err(e) = self.sync_inodes_of_mount() {
+            last_err = Err(e);
+        }
         // sync_fs(sb, 1)
-        self.sync_fs(true)?;
+        if let Err(e) = self.sync_fs(true) {
+            self.record_wb_error(e.clone());
+            return Err(e);
+        }
 
-        // TODO: sync_blockdev(sb->s_bdev)
+        if let Err(e) = self.sync_blockdev(true) {
+            self.record_wb_error(e.clone());
+            return Err(e);
+        }
 
+        last_err
+    }
+
+    pub fn sync_blockdev(&self, _wait: bool) -> Result<(), SystemError> {
         Ok(())
+    }
+
+    pub fn record_wb_error(&self, error: SystemError) {
+        self.super_block_state.record_wb_error(error);
+    }
+
+    pub fn sample_wb_error(&self) -> u64 {
+        self.super_block_state.sample_wb_error()
+    }
+
+    pub fn check_and_advance_wb_error(&self, since: u64) -> (u64, Option<SystemError>) {
+        self.super_block_state.check_and_advance_wb_error(since)
+    }
+}
+
+fn register_mounted_superblock(mount: &Arc<MountFS>) {
+    MOUNTED_SUPERBLOCKS
+        .lock_irqsave()
+        .push(Arc::downgrade(mount));
+}
+
+pub fn list_unique_mounted_superblocks() -> Vec<Arc<MountFS>> {
+    let mut guard = MOUNTED_SUPERBLOCKS.lock_irqsave();
+    let mut mounts: Vec<Arc<MountFS>> = Vec::new();
+    guard.retain(|weak| {
+        if let Some(mount) = weak.upgrade() {
+            let state = mount.super_block_state();
+            if !mounts
+                .iter()
+                .any(|existing| Arc::ptr_eq(&existing.super_block_state(), &state))
+            {
+                mounts.push(mount);
+            }
+            true
+        } else {
+            false
+        }
+    });
+    mounts
+}
+
+pub fn record_writeback_error_for_fs(inner_fs: &Arc<dyn FileSystem>, error: SystemError) {
+    for mount in list_unique_mounted_superblocks() {
+        if Arc::ptr_eq(&mount.inner_filesystem(), inner_fs) {
+            mount.record_wb_error(error.clone());
+        }
     }
 }
 
@@ -1070,8 +1241,8 @@ impl IndexNode for MountFSInode {
         self.inner_inode.sync_file(datasync, data)
     }
 
-    fn write_inode(&self) -> Result<(), SystemError> {
-        self.inner_inode.write_inode()
+    fn write_inode(&self, wbc: &super::WritebackControl) -> Result<(), SystemError> {
+        self.inner_inode.write_inode(wbc)
     }
 
     fn fadvise(

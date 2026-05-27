@@ -3,7 +3,7 @@ use crate::{
         interrupt::TrapFrame,
         syscall::nr::{SYS_SYNC, SYS_SYNCFS},
     },
-    filesystem::vfs::{file::FileFlags, FileSystem},
+    filesystem::vfs::{file::FileFlags, mount::list_unique_mounted_superblocks},
     libs::casting::DowncastArc,
     mm::page::PageReclaimer,
     process::ProcessManager,
@@ -27,30 +27,30 @@ impl Syscall for SysSyncHandle {
         // 唤醒回写线程，异步刷回所有脏页
         PageReclaimer::flush_dirty_pages();
 
-        let mounts = ProcessManager::current_mntns().mount_list().clone_inner();
+        let mounts = list_unique_mounted_superblocks();
 
         // 逐 superblock 同步回写脏 inode
-        for (_path, mountfs) in &mounts {
-            if !mountfs.is_readonly() {
-                let _ = mountfs.sync_inodes_of_mount();
-            }
+        for mountfs in &mounts {
+            let _ = mountfs.sync_inodes_with_umount_read();
         }
 
         // 逐 superblock 调 sync_fs(nowait)，提交元数据但不等待
-        for (_path, mountfs) in &mounts {
-            if !mountfs.is_readonly() {
-                let _ = mountfs.sync_fs(false);
-            }
+        for mountfs in &mounts {
+            let _ = mountfs.sync_fs_with_umount_read(false);
         }
 
         // 逐 superblock 调 sync_fs(wait)，等待元数据落盘
-        for (_path, mountfs) in &mounts {
-            if !mountfs.is_readonly() {
-                let _ = mountfs.sync_fs(true);
-            }
+        for mountfs in &mounts {
+            let _ = mountfs.sync_fs_with_umount_read(true);
         }
 
-        // TODO: sync_bdevs(false) + sync_bdevs(true)
+        for mountfs in &mounts {
+            let _ = mountfs.sync_blockdev_with_umount_read(false);
+        }
+
+        for mountfs in &mounts {
+            let _ = mountfs.sync_blockdev_with_umount_read(true);
+        }
 
         Ok(0)
     }
@@ -107,19 +107,13 @@ impl Syscall for SysSyncFsHandle {
 
         let mount_fs = mount_inode.mount_fs();
 
-        // TODO: down_read(&sb->s_umount) — 防止 sync 期间 umount
+        let sync_result = mount_fs.sync_filesystem();
+        let errseq_result = file.check_and_advance_sb_wb_error(&mount_fs);
 
-        // sync_filesystem(sb)
-        let ret = mount_fs.sync_filesystem();
-
-        // TODO: up_read(&sb->s_umount)
-
-        // TODO: errseq_check_and_advance(&sb->s_wb_err, &f.file->f_sb_err)
-        //       Linux syncfs 检查 per-sb 的 s_wb_err（异步写回错误）。
-        //       DragonOS 已有 per-page-cache 的 errseq（PageCache::writeback_error + File::wb_error_seq），
-        //       但缺少 per-sb 的聚合 errseq，后续可在 FileSystem trait 中添加。
-
-        ret.map(|_| 0)
+        match sync_result {
+            Err(e) => Err(e),
+            Ok(()) => errseq_result.map(|_| 0),
+        }
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

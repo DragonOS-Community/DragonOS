@@ -99,10 +99,18 @@ impl Syscall for SysMsyncHandle {
 
                 if flags.contains(MsFlags::MS_SYNC) && vm_flags.contains(VmFlags::VM_SHARED) {
                     if let Some(file) = file {
-                        // 对于文件映射的 msync，我们只需要触发文件系统的同步操作
-                        // 实际的脏页回写由页面管理系统和文件系统处理
-                        // 这里调用 sync 来确保文件系统的缓存被刷新到磁盘
-                        let _ = file.inode().sync();
+                        let sync_result = file.inode().sync_file(true, file.private_data.lock());
+                        let wb_result = match file.inode().page_cache() {
+                            Some(page_cache) => file.check_and_advance_wb_error(&page_cache),
+                            None => Ok(()),
+                        };
+                        err = match sync_result {
+                            Err(e) => Err(e),
+                            Ok(()) => wb_result.map(|_| 0),
+                        };
+                        if err.is_err() {
+                            break;
+                        }
                     }
                 }
 

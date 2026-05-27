@@ -12,6 +12,7 @@ use super::vfs::{
     mount::record_writeback_error_for_fs, FilePrivateData, IndexNode, WritebackControl,
 };
 use crate::exception::workqueue::{schedule_work, Work, WorkQueue};
+use crate::libs::errseq::{ErrSeq, ErrSeqValue};
 use crate::libs::mutex::MutexGuard;
 use crate::libs::rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard};
 use crate::libs::spinlock::SpinLock;
@@ -42,12 +43,6 @@ static PAGECACHE_IO_RR: AtomicUsize = AtomicUsize::new(0);
 #[derive(Debug, Default)]
 struct FileVmaIndex {
     vmas: HashMap<usize, Weak<LockedVMA>>,
-}
-
-#[derive(Debug, Default)]
-struct WritebackErrorState {
-    seq: u64,
-    error: Option<SystemError>,
 }
 
 impl FileVmaIndex {
@@ -266,7 +261,7 @@ pub struct PageCache {
     invalidate_lock: RwSem<()>,
     file_vma_seq: AtomicU64,
     file_vmas: SpinLock<FileVmaIndex>,
-    writeback_error: SpinLock<WritebackErrorState>,
+    writeback_error: ErrSeq,
     unevictable: AtomicBool,
     is_shmem: AtomicBool,
     manager: PageCacheManager,
@@ -1065,7 +1060,7 @@ impl PageCache {
             invalidate_lock: RwSem::new(()),
             file_vma_seq: AtomicU64::new(0),
             file_vmas: SpinLock::new(FileVmaIndex::default()),
-            writeback_error: SpinLock::new(WritebackErrorState::default()),
+            writeback_error: ErrSeq::new(),
             unevictable: AtomicBool::new(false),
             is_shmem: AtomicBool::new(false),
             manager: PageCacheManager::new(weak.clone()),
@@ -1074,22 +1069,23 @@ impl PageCache {
         cache
     }
 
-    pub fn sample_writeback_error(&self) -> u64 {
-        self.writeback_error.lock_irqsave().seq
+    pub fn sample_writeback_error(&self) -> ErrSeqValue {
+        self.writeback_error.sample()
     }
 
-    pub fn check_writeback_error_since(&self, since: u64) -> Option<(u64, SystemError)> {
-        let guard = self.writeback_error.lock_irqsave();
-        if guard.seq == since {
-            return None;
-        }
-        guard.error.clone().map(|err| (guard.seq, err))
+    pub fn check_writeback_error_since(&self, since: ErrSeqValue) -> Option<SystemError> {
+        self.writeback_error.check(since)
+    }
+
+    pub fn check_and_advance_writeback_error(
+        &self,
+        since: &mut ErrSeqValue,
+    ) -> Option<SystemError> {
+        self.writeback_error.check_and_advance(since)
     }
 
     fn record_writeback_error(&self, error: SystemError) {
-        let mut guard = self.writeback_error.lock_irqsave();
-        guard.seq = guard.seq.wrapping_add(1).max(1);
-        guard.error = Some(error);
+        self.writeback_error.set(error);
     }
 
     /// # 获取页缓存的ID

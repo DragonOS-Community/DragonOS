@@ -116,6 +116,7 @@ pub enum KernFilePrivateData {
     TracePipe(TracePipeSnapshot),
     TraceSavedCmdlines(TraceCmdLineCacheSnapshot),
     RcuSelftestReport(String),
+    ErrSeqSelftestReport(String),
 }
 
 impl KernInodePrivateData {

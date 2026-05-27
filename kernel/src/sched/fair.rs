@@ -1130,7 +1130,10 @@ impl CfsRunQueue {
         }
 
         self.nr_running -= 1;
-        debug_assert!(self.nr_running < i64::MAX as u64, "cfs_rq nr_running underflow");
+        debug_assert!(
+            self.nr_running < i64::MAX as u64,
+            "cfs_rq nr_running underflow"
+        );
         if se.is_idle() {
             self.idle_nr_running -= 1;
         }

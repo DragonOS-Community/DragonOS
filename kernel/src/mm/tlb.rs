@@ -359,10 +359,6 @@ fn flush_tlb_multi(target_cpus: &CpuMask, info: &FlushTlbInfo) {
 
     #[cfg(target_arch = "x86_64")]
     {
-        // Global lock serialization: ensures only one shootdown uses per-CPU CSD slots at a time.
-        // Can be refined to per-target dedicated channels in the future.
-        let _g = FLUSH_TLB_GLOBAL_LOCK.lock();
-
         // Prepare CSD slots for each target CPU
         for cpu in active.iter_cpu() {
             if cpu == my_cpu {
@@ -431,6 +427,18 @@ pub fn flush_tlb_mm_range(
     stride_shift: u8,
     freed_tables: bool,
 ) {
+    // Serialize before disabling local interrupts. If a CPU spins for the
+    // shootdown CSD slots with IRQs disabled, it cannot service another CPU's
+    // TLB IPI, and two concurrent flush initiators can deadlock.
+    #[cfg(target_arch = "x86_64")]
+    let irq_was_enabled = CurrentIrqArch::is_irq_enabled();
+    #[cfg(target_arch = "x86_64")]
+    if !irq_was_enabled {
+        unsafe { CurrentIrqArch::interrupt_enable() };
+    }
+    #[cfg(target_arch = "x86_64")]
+    let _flush_guard = FLUSH_TLB_GLOBAL_LOCK.lock();
+
     // Disable interrupts to protect the entire initiation process:
     // - Prevent migration during inc_tlb_gen and snapshot of active_cpus;
     // - Prevent being scheduled out while waiting for IPI ack.
@@ -477,6 +485,11 @@ pub fn flush_tlb_mm_range(
 
     compiler_fence(Ordering::SeqCst);
     drop(irq_guard);
+
+    #[cfg(target_arch = "x86_64")]
+    if !irq_was_enabled {
+        unsafe { CurrentIrqArch::interrupt_disable() };
+    }
 }
 
 /// Convenience wrapper for full-mm flush

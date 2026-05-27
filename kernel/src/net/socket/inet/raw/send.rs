@@ -277,7 +277,10 @@ impl RawSocket {
         loop {
             match self.try_send(buffer, None) {
                 Err(SystemError::ENOBUFS) => {
-                    wq_wait_event_interruptible!(self.wait_queue, self.can_send(), {})?;
+                    self.wait_queue.wait_event_io_interruptible_timeout(
+                        || self.can_send(),
+                        self.send_timeout(),
+                    )?;
                 }
                 result => return result,
             }
@@ -298,7 +301,10 @@ impl RawSocket {
             loop {
                 match self.try_send(buffer, Some(remote.addr)) {
                     Err(SystemError::ENOBUFS) => {
-                        wq_wait_event_interruptible!(self.wait_queue, self.can_send(), {})?;
+                        self.wait_queue.wait_event_io_interruptible_timeout(
+                            || self.can_send(),
+                            self.send_timeout(),
+                        )?;
                     }
                     result => return result,
                 }

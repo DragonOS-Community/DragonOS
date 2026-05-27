@@ -679,6 +679,9 @@ impl CpuRunQueue {
         let next_policy = pcb.sched_info().policy();
 
         if current.flags().contains(ProcessFlags::NEED_SCHEDULE) {
+            if current_policy == SchedPolicy::IDLE {
+                self.resched_current();
+            }
             return;
         }
 
@@ -864,25 +867,17 @@ impl CpuRunQueue {
     /// 重新调度当前进程
     pub fn resched_current(&self) {
         let current = self.current();
+        let cpu = self.cpu;
+        let already_requested = current.flags().contains(ProcessFlags::NEED_SCHEDULE);
+        current.flags().insert(ProcessFlags::NEED_SCHEDULE);
 
-        // 又需要被调度？
-        if unlikely(current.flags().contains(ProcessFlags::NEED_SCHEDULE)) {
+        if cpu == smp_get_processor_id() {
             return;
         }
 
-        let cpu = self.cpu;
-
-        if cpu == smp_get_processor_id() {
-            // assert!(
-            //     Arc::ptr_eq(&current, &ProcessManager::current_pcb()),
-            //     "rq current name {} process current {}",
-            //     current.basic().name().to_string(),
-            //     ProcessManager::current_pcb().basic().name().to_string(),
-            // );
-            // 设置需要调度
-            ProcessManager::current_pcb()
-                .flags()
-                .insert(ProcessFlags::NEED_SCHEDULE);
+        // A remote idle CPU may be halted; kick it even if the flag was already
+        // set so it observes the pending reschedule promptly.
+        if already_requested && current.sched_info().policy() != SchedPolicy::IDLE {
             return;
         }
 
@@ -902,6 +897,18 @@ impl CpuRunQueue {
 
         if next.is_none() {
             next = CompletelyFairScheduler::pick_next_task(self, Some(prev.clone()));
+        }
+
+        if next.is_none()
+            && !task_is_idle(&prev)
+            && prev
+                .sched_info()
+                .inner_lock_read_irqsave()
+                .state()
+                .is_runnable()
+            && *prev.sched_info().on_rq.lock_irqsave() == OnRq::Queued
+        {
+            next = Some(prev.clone());
         }
 
         let next = next.unwrap_or_else(|| self.idle.upgrade().unwrap());

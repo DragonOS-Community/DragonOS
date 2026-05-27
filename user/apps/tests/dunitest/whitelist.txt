@@ -22,6 +22,7 @@ normal/test_tlb_shootdown
 normal/pid_namespace_fork
 normal/tcp_close_semantics
 normal/udp_ipv6_send_semantics
+normal/socket_getsockopt_semantics
 fuse/fuse_core
 fuse/fuse_extended
 normal/test_procfs_link

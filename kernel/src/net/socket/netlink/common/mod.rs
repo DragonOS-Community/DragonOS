@@ -7,7 +7,7 @@ use crate::{
     net::{
         posix::SockAddr,
         socket::{
-            common::{parse_timeval_opt, write_timeval_opt},
+            common::{parse_timeval_opt, write_i32_getsockopt, write_timeval_opt},
             endpoint::Endpoint,
             netlink::{
                 addr::{multicast::GroupIdSet, NetlinkSocketAddr},
@@ -283,28 +283,16 @@ where
         let opt = PSO::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
         match opt {
             PSO::TYPE => {
-                if value.len() < core::mem::size_of::<i32>() {
-                    return Err(SystemError::EINVAL);
-                }
                 let v = self.socket_type as i32;
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(4)
+                Ok(write_i32_getsockopt(value, v))
             }
             PSO::DOMAIN => {
-                if value.len() < core::mem::size_of::<i32>() {
-                    return Err(SystemError::EINVAL);
-                }
                 let v = AddressFamily::Netlink as i32;
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(4)
+                Ok(write_i32_getsockopt(value, v))
             }
             PSO::PROTOCOL => {
-                if value.len() < core::mem::size_of::<i32>() {
-                    return Err(SystemError::EINVAL);
-                }
                 let v = self.protocol as i32;
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(4)
+                Ok(write_i32_getsockopt(value, v))
             }
             PSO::SNDTIMEO_OLD | PSO::SNDTIMEO_NEW => {
                 let us = self.send_timeout_us.load(Ordering::Relaxed);

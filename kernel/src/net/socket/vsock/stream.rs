@@ -21,7 +21,7 @@ use crate::filesystem::vfs::{
 };
 use crate::libs::mutex::Mutex;
 use crate::libs::wait_queue::WaitQueue;
-use crate::net::socket::common::{EPollItems, ShutdownBit};
+use crate::net::socket::common::{write_i32_getsockopt, EPollItems, ShutdownBit};
 use crate::net::socket::endpoint::Endpoint;
 use crate::net::socket::{RecvFromAddrBehavior, Socket, PMSG, PSO, PSOL};
 
@@ -1421,15 +1421,6 @@ impl Socket for VsockStreamSocket {
     /// - `PSOL::VSOCK` 当前返回 `ENOPROTOOPT`
     /// - 其他层级返回 `ENOSYS`
     fn option(&self, level: PSOL, name: usize, value: &mut [u8]) -> Result<usize, SystemError> {
-        #[inline]
-        fn write_i32_opt(value: &mut [u8], v: i32) -> Result<usize, SystemError> {
-            if value.len() < core::mem::size_of::<i32>() {
-                return Err(SystemError::EINVAL);
-            }
-            value[..4].copy_from_slice(&v.to_ne_bytes());
-            Ok(core::mem::size_of::<i32>())
-        }
-
         match level {
             PSOL::SOCKET => {
                 let opt = PSO::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
@@ -1442,7 +1433,7 @@ impl Socket for VsockStreamSocket {
                             .take()
                             .map(|e| -e.to_posix_errno())
                             .unwrap_or(0);
-                        write_i32_opt(value, err)
+                        Ok(write_i32_getsockopt(value, err))
                     }
                     _ => Err(SystemError::ENOPROTOOPT),
                 }

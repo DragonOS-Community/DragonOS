@@ -14,7 +14,10 @@ use crate::{
     net::{
         posix::MsgHdr,
         socket::{
-            common::{parse_timeval_opt, write_timeval_opt, EPollItems},
+            common::{
+                parse_timeval_opt, write_i32_getsockopt, write_linger_getsockopt,
+                write_timeval_opt, write_u32_getsockopt, EPollItems,
+            },
             endpoint::Endpoint,
             unix::{
                 stream::inner::{get_backlog, Backlog},
@@ -65,13 +68,8 @@ impl Linger {
         Ok(Self { l_onoff, l_linger })
     }
 
-    fn write_to(&self, out: &mut [u8]) -> Result<usize, SystemError> {
-        if out.len() < Self::SIZE {
-            return Err(SystemError::EINVAL);
-        }
-        out[..4].copy_from_slice(&self.l_onoff.to_ne_bytes());
-        out[4..8].copy_from_slice(&self.l_linger.to_ne_bytes());
-        Ok(Self::SIZE)
+    fn write_to(&self, out: &mut [u8]) -> usize {
+        write_linger_getsockopt(out, self.l_onoff, self.l_linger)
     }
 }
 
@@ -1351,48 +1349,28 @@ impl Socket for UnixStreamSocket {
             crate::net::socket::PSO::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
         match opt {
             crate::net::socket::PSO::TYPE => {
-                if value.len() < 4 {
-                    return Err(SystemError::EINVAL);
-                }
                 let v = if self.is_seqpacket {
                     PSOCK::SeqPacket as i32
                 } else {
                     PSOCK::Stream as i32
                 };
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(4)
+                Ok(write_i32_getsockopt(value, v))
             }
             crate::net::socket::PSO::DOMAIN => {
-                if value.len() < 4 {
-                    return Err(SystemError::EINVAL);
-                }
                 let v = AddressFamily::Unix as i32;
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(4)
+                Ok(write_i32_getsockopt(value, v))
             }
             crate::net::socket::PSO::PROTOCOL => {
-                if value.len() < 4 {
-                    return Err(SystemError::EINVAL);
-                }
                 let v: i32 = 0;
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(4)
+                Ok(write_i32_getsockopt(value, v))
             }
             crate::net::socket::PSO::SNDBUF => {
-                if value.len() < 4 {
-                    return Err(SystemError::EINVAL);
-                }
                 let v = self.send_buffer_size() as u32;
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(4)
+                Ok(write_u32_getsockopt(value, v))
             }
             crate::net::socket::PSO::RCVBUF => {
-                if value.len() < 4 {
-                    return Err(SystemError::EINVAL);
-                }
                 let v = self.recv_buffer_size() as u32;
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(4)
+                Ok(write_u32_getsockopt(value, v))
             }
             crate::net::socket::PSO::SNDTIMEO_OLD | crate::net::socket::PSO::SNDTIMEO_NEW => {
                 let us = self.send_timeout_us.load(Ordering::Relaxed);
@@ -1405,33 +1383,22 @@ impl Socket for UnixStreamSocket {
                 Ok(write_timeval_opt(value, us))
             }
             crate::net::socket::PSO::RCVLOWAT => {
-                if value.len() < 4 {
-                    return Err(SystemError::EINVAL);
-                }
                 let v = self.rcvlowat.load(Ordering::Relaxed);
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(4)
+                Ok(write_i32_getsockopt(value, v))
             }
             crate::net::socket::PSO::PASSCRED => {
-                if value.len() < 4 {
-                    return Err(SystemError::EINVAL);
-                }
                 let v: i32 = if self.passcred.load(Ordering::Relaxed) {
                     1
                 } else {
                     0
                 };
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(4)
+                Ok(write_i32_getsockopt(value, v))
             }
             crate::net::socket::PSO::LINGER => {
                 let linger = *self.linger.lock();
-                linger.write_to(value)
+                Ok(linger.write_to(value))
             }
             crate::net::socket::PSO::ACCEPTCONN => {
-                if value.len() < 4 {
-                    return Err(SystemError::EINVAL);
-                }
                 let is_listening = matches!(
                     self.inner
                         .read()
@@ -1440,8 +1407,7 @@ impl Socket for UnixStreamSocket {
                     Inner::Listener(_)
                 );
                 let v: i32 = if is_listening { 1 } else { 0 };
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(4)
+                Ok(write_i32_getsockopt(value, v))
             }
             _ => Err(SystemError::ENOPROTOOPT),
         }

@@ -2,11 +2,13 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <linux/if_addr.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <cstring>
@@ -55,6 +57,8 @@ struct DumpedRoute {
     uint32_t oif = 0;
     bool has_gateway = false;
 };
+
+uint32_t Ipv4(const char* text);
 
 int OpenRouteSocket() {
     int fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
@@ -134,6 +138,32 @@ int SendRouteRequest(int fd, uint16_t type, uint16_t flags, const RouteSpec& rou
         uint32_t gw = *route.gateway;
         AddAttr(nlh, sizeof(buf), RTA_GATEWAY, &gw, sizeof(gw));
     }
+
+    if (send(fd, nlh, nlh->nlmsg_len, 0) != static_cast<ssize_t>(nlh->nlmsg_len)) {
+        return errno;
+    }
+    return RecvAck(fd, seq);
+}
+
+int SendAddrRequest(int fd, uint16_t type, uint16_t flags, uint32_t ifindex, const char* addr,
+                    uint8_t prefix_len, uint32_t seq) {
+    alignas(nlmsghdr) char buf[512] = {};
+    auto* nlh = reinterpret_cast<nlmsghdr*>(buf);
+    auto* ifa = reinterpret_cast<ifaddrmsg*>(NLMSG_DATA(nlh));
+
+    nlh->nlmsg_len = NLMSG_LENGTH(sizeof(ifaddrmsg));
+    nlh->nlmsg_type = type;
+    nlh->nlmsg_flags = flags;
+    nlh->nlmsg_seq = seq;
+
+    ifa->ifa_family = AF_INET;
+    ifa->ifa_prefixlen = prefix_len;
+    ifa->ifa_scope = RT_SCOPE_HOST;
+    ifa->ifa_index = ifindex;
+
+    uint32_t ip = Ipv4(addr);
+    AddAttr(nlh, sizeof(buf), IFA_LOCAL, &ip, sizeof(ip));
+    AddAttr(nlh, sizeof(buf), IFA_ADDRESS, &ip, sizeof(ip));
 
     if (send(fd, nlh, nlh->nlmsg_len, 0) != static_cast<ssize_t>(nlh->nlmsg_len)) {
         return errno;
@@ -222,6 +252,12 @@ std::optional<DumpedRoute> FindRoute(int fd, const RouteSpec& spec, uint32_t seq
 
 void DeleteRouteIfPresent(int fd, const RouteSpec& spec, uint32_t* seq) {
     (void)SendRouteRequest(fd, RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, spec, ++(*seq));
+}
+
+void DeleteAddrIfPresent(int fd, uint32_t ifindex, const char* addr, uint8_t prefix_len,
+                         uint32_t* seq) {
+    (void)SendAddrRequest(fd, RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, ifindex, addr, prefix_len,
+                          ++(*seq));
 }
 
 uint32_t Ipv4(const char* text) {
@@ -352,6 +388,62 @@ TEST(RtnetlinkRouteSemantics, OnLinkRouteAllowsUdpSendWithoutNoRoute) {
 
     EXPECT_EQ(SendRouteRequest(netlink_fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, route,
                                ++seq),
+              0);
+}
+
+TEST(RtnetlinkRouteSemantics, LoopbackIpv4SubnetRoutesAreLocalForUdp) {
+    FdGuard netlink_fd(OpenRouteSocket());
+    ASSERT_GE(netlink_fd.Get(), 0) << "socket(AF_NETLINK, NETLINK_ROUTE) failed: "
+                                   << ErrnoString(errno);
+    uint32_t seq = 5000;
+    uint32_t lo = if_nametoindex("lo");
+    ASSERT_NE(lo, 0u);
+
+    DeleteAddrIfPresent(netlink_fd.Get(), lo, "192.0.2.1", 24, &seq);
+    ASSERT_EQ(SendAddrRequest(netlink_fd.Get(), RTM_NEWADDR,
+                              NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, lo,
+                              "192.0.2.1", 24, ++seq),
+              0);
+
+    FdGuard snd(socket(AF_INET, SOCK_DGRAM, 0));
+    ASSERT_GE(snd.Get(), 0) << "sender socket failed: " << ErrnoString(errno);
+    FdGuard rcv(socket(AF_INET, SOCK_DGRAM, 0));
+    ASSERT_GE(rcv.Get(), 0) << "receiver socket failed: " << ErrnoString(errno);
+
+    timeval timeout = {};
+    timeout.tv_sec = 2;
+    ASSERT_EQ(setsockopt(rcv.Get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)), 0)
+            << "setsockopt(SO_RCVTIMEO) failed: " << ErrnoString(errno);
+
+    sockaddr_in sender = {};
+    sender.sin_family = AF_INET;
+    sender.sin_addr.s_addr = Ipv4("192.0.2.2");
+    ASSERT_EQ(bind(snd.Get(), reinterpret_cast<sockaddr*>(&sender), sizeof(sender)), 0)
+            << "bind sender failed: " << ErrnoString(errno);
+
+    sockaddr_in receiver = {};
+    receiver.sin_family = AF_INET;
+    receiver.sin_addr.s_addr = Ipv4("192.0.2.254");
+    ASSERT_EQ(bind(rcv.Get(), reinterpret_cast<sockaddr*>(&receiver), sizeof(receiver)), 0)
+            << "bind receiver failed: " << ErrnoString(errno);
+
+    socklen_t receiver_len = sizeof(receiver);
+    ASSERT_EQ(getsockname(rcv.Get(), reinterpret_cast<sockaddr*>(&receiver), &receiver_len), 0)
+            << "getsockname receiver failed: " << ErrnoString(errno);
+
+    const char payload[] = "loopback-subnet";
+    ASSERT_EQ(sendto(snd.Get(), payload, sizeof(payload), 0,
+                     reinterpret_cast<sockaddr*>(&receiver), receiver_len),
+              static_cast<ssize_t>(sizeof(payload)))
+            << "sendto failed: " << ErrnoString(errno);
+
+    char buf[sizeof(payload)] = {};
+    ASSERT_EQ(recv(rcv.Get(), buf, sizeof(buf), 0), static_cast<ssize_t>(sizeof(payload)))
+            << "recv failed: " << ErrnoString(errno);
+    EXPECT_EQ(std::memcmp(payload, buf, sizeof(payload)), 0);
+
+    EXPECT_EQ(SendAddrRequest(netlink_fd.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, lo,
+                              "192.0.2.1", 24, ++seq),
               0);
 }
 

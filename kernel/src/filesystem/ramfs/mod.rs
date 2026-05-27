@@ -6,11 +6,13 @@ use crate::filesystem::vfs::{FileSystemMakerData, FSMAKER};
 use crate::libs::rwsem::RwSem;
 use crate::register_mountable_fs;
 use crate::{
+    arch::MMArch,
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::{vcore::generate_inode_id, FileType},
     ipc::pipe::LockedPipeInode,
     libs::casting::DowncastArc,
     libs::mutex::{Mutex, MutexGuard},
+    mm::MemoryManagementArch,
     time::PosixTimeSpec,
 };
 
@@ -226,6 +228,28 @@ impl IndexNode for LockedRamFSInode {
                 } else {
                     self.sync()
                 }
+            }
+            _ => Err(SystemError::EINVAL),
+        }
+    }
+
+    fn sync_file_range(
+        &self,
+        start: usize,
+        end: usize,
+        _datasync: bool,
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        match self.metadata()?.file_type {
+            FileType::File | FileType::Dir => {
+                if let Some(page_cache) = self.page_cache() {
+                    let start_index = start >> MMArch::PAGE_SHIFT;
+                    let end_index = end >> MMArch::PAGE_SHIFT;
+                    page_cache
+                        .manager()
+                        .writeback_range(start_index, end_index)?;
+                }
+                Ok(())
             }
             _ => Err(SystemError::EINVAL),
         }

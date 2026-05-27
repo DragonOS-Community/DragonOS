@@ -462,8 +462,7 @@ impl PageCacheManager {
             let wbc = WritebackControl::sync_all_for_sync();
             if let Err(e) = inode.write_inode(&wbc) {
                 log::warn!("write_inode failed: {:?}", e);
-                cache.record_writeback_error(e.clone());
-                record_writeback_error_for_fs(&inode.fs(), e.clone());
+                cache.record_writeback_error_with_superblock(e.clone());
                 return Err(e);
             }
         }
@@ -677,10 +676,7 @@ impl PageCacheManager {
         result: Result<(), SystemError>,
     ) -> Result<(), SystemError> {
         if let Err(e) = result {
-            cache.record_writeback_error(e.clone());
-            if let Some(inode) = cache.inode().and_then(|w| w.upgrade()) {
-                record_writeback_error_for_fs(&inode.fs(), e.clone());
-            }
+            cache.record_writeback_error_with_superblock(e.clone());
             {
                 let mut guard = page.write();
                 guard.add_flags(PageFlags::PG_ERROR | PageFlags::PG_DIRTY);
@@ -1086,6 +1082,15 @@ impl PageCache {
 
     fn record_writeback_error(&self, error: SystemError) {
         self.writeback_error.set(error);
+    }
+
+    /// Record a writeback error in both the page cache mapping and its
+    /// mounted superblock, matching Linux mapping_set_error() semantics.
+    pub fn record_writeback_error_with_superblock(&self, error: SystemError) {
+        self.record_writeback_error(error.clone());
+        if let Some(inode) = self.inode().and_then(|w| w.upgrade()) {
+            record_writeback_error_for_fs(&inode.fs(), error);
+        }
     }
 
     /// # 获取页缓存的ID
@@ -1797,8 +1802,8 @@ impl PageCache {
         }
     }
 
-    pub fn mark_page_error(&self, page_index: usize) {
-        self.record_writeback_error(SystemError::EIO);
+    pub fn mark_page_error(&self, page_index: usize, error: SystemError) {
+        self.record_writeback_error_with_superblock(error);
         let mut guard = self.inner.lock();
         if let Some(entry) = guard.get_entry(page_index) {
             let old_state = entry.state();

@@ -68,13 +68,14 @@ impl Syscall for SysMsyncHandle {
         loop {
             if let Some(vma) = next_vma.clone() {
                 // 读取VMA信息，确保在调用find_nearest前释放锁
-                let (vm_start, vm_end, vm_flags, file);
+                let (vm_start, vm_end, vm_flags, file, backing_pgoff);
                 {
                     let guard = vma.lock();
                     vm_start = guard.region().start().data();
                     vm_end = guard.region().end().data();
                     vm_flags = *guard.vm_flags();
                     file = guard.vm_file();
+                    backing_pgoff = guard.backing_page_offset();
 
                     if start < vm_start {
                         if flags == MsFlags::MS_ASYNC {
@@ -95,21 +96,27 @@ impl Syscall for SysMsyncHandle {
                     }
                 }
 
+                let sync_start = start;
+                let sync_end = end.min(vm_end);
                 start = vm_end;
 
                 if flags.contains(MsFlags::MS_SYNC) && vm_flags.contains(VmFlags::VM_SHARED) {
                     if let Some(file) = file {
-                        let sync_result = file.inode().sync_file(true, file.private_data.lock());
-                        let wb_result = match file.inode().page_cache() {
-                            Some(page_cache) => file.check_and_advance_wb_error(&page_cache),
-                            None => Ok(()),
-                        };
-                        err = match sync_result {
-                            Err(e) => Err(e),
-                            Ok(()) => wb_result.map(|_| 0),
-                        };
-                        if err.is_err() {
-                            break;
+                        if sync_start < sync_end {
+                            let file_start = backing_pgoff
+                                .unwrap_or(0)
+                                .checked_shl(MMArch::PAGE_SHIFT as u32)
+                                .and_then(|base| base.checked_add(sync_start - vm_start))
+                                .ok_or(SystemError::EINVAL)?;
+                            let file_end = file_start
+                                .checked_add(sync_end - sync_start - 1)
+                                .ok_or(SystemError::EINVAL)?;
+                            err = file
+                                .sync_range_and_check_wb_error(file_start, file_end, true)
+                                .map(|_| 0);
+                            if err.is_err() {
+                                break;
+                            }
                         }
                     }
                 }

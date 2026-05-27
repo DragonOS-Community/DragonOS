@@ -20,6 +20,7 @@ normal/sync_file_range
 normal/splice_concurrent_io
 normal/rcu_selftest
 normal/errseq_selftest
+normal/errseq_writeback_reporting
 normal/test_tlb_shootdown
 normal/pid_namespace_fork
 normal/tcp_close_semantics

@@ -1229,6 +1229,16 @@ impl IndexNode for MountFSInode {
         self.inner_inode.sync_file(datasync, data)
     }
 
+    fn sync_file_range(
+        &self,
+        start: usize,
+        end: usize,
+        datasync: bool,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        self.inner_inode.sync_file_range(start, end, datasync, data)
+    }
+
     fn write_inode(&self, wbc: &super::WritebackControl) -> Result<(), SystemError> {
         self.inner_inode.write_inode(wbc)
     }

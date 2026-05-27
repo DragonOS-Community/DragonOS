@@ -505,6 +505,25 @@ impl File {
         }
     }
 
+    pub fn sync_range_and_check_wb_error(
+        &self,
+        start: usize,
+        end: usize,
+        datasync: bool,
+    ) -> Result<(), SystemError> {
+        let inode = self.inode();
+        let sync_result = inode.sync_file_range(start, end, datasync, self.private_data.lock());
+        let wb_result = match inode.page_cache() {
+            Some(page_cache) => self.check_and_advance_wb_error(&page_cache),
+            None => Ok(()),
+        };
+
+        match sync_result {
+            Err(e) => Err(e),
+            Ok(()) => wb_result,
+        }
+    }
+
     fn maybe_kill_suid_sgid_after_write(&self) -> Result<(), SystemError> {
         // 仅对普通文件生效。
         if self.file_type != FileType::File {

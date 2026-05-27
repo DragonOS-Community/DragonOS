@@ -45,6 +45,10 @@ void ExpectReportOk(const std::string& report) {
     EXPECT_NE(std::string::npos, report.find("unseen_sample=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("multi_watcher=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("late_sample=ok\n")) << report;
+    EXPECT_NE(std::string::npos, report.find("pagecache_multi_fd=ok\n")) << report;
+    EXPECT_NE(std::string::npos, report.find("syncfs_sb_cursor=ok\n")) << report;
+    EXPECT_NE(std::string::npos, report.find("sync_file_range_wait=ok\n")) << report;
+    EXPECT_NE(std::string::npos, report.find("msync_range=ok\n")) << report;
 }
 
 }  // namespace

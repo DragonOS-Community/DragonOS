@@ -486,6 +486,23 @@ impl IndexNode for LockedExt4Inode {
         }
     }
 
+    fn sync_file_range(
+        &self,
+        start: usize,
+        end: usize,
+        datasync: bool,
+        _data: PrivateData,
+    ) -> Result<(), SystemError> {
+        if let Some(page_cache) = self.page_cache() {
+            let start_index = start >> MMArch::PAGE_SHIFT;
+            let end_index = end >> MMArch::PAGE_SHIFT;
+            page_cache
+                .manager()
+                .writeback_range(start_index, end_index)?;
+        }
+        self.flush_metadata(datasync)
+    }
+
     fn write_inode(&self, _wbc: &vfs::WritebackControl) -> Result<(), SystemError> {
         self.flush_metadata(false)
     }

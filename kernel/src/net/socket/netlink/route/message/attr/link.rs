@@ -3,6 +3,7 @@ use crate::net::socket::netlink::message::attr::CAttrHeader;
 use crate::net::socket::netlink::route::message::attr::convert_one_from_raw_buf;
 use crate::net::socket::netlink::route::message::attr::IFNAME_SIZE;
 use alloc::ffi::CString;
+use alloc::vec::Vec;
 use num_traits::FromPrimitive;
 use system_error::SystemError;
 
@@ -86,8 +87,9 @@ impl TryFrom<u16> for LinkAttrClass {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum LinkAttr {
+    Address(Vec<u8>),
     Name(CString),
     Mtu(u32),
     TxqLen(u32),
@@ -98,6 +100,7 @@ pub enum LinkAttr {
 impl LinkAttr {
     fn class(&self) -> LinkAttrClass {
         match self {
+            LinkAttr::Address(_) => LinkAttrClass::ADDRESS,
             LinkAttr::Name(_) => LinkAttrClass::IFNAME,
             LinkAttr::Mtu(_) => LinkAttrClass::MTU,
             LinkAttr::TxqLen(_) => LinkAttrClass::TXQLEN,
@@ -126,6 +129,7 @@ impl Attribute for LinkAttr {
 
     fn payload_as_bytes(&self) -> &[u8] {
         match self {
+            LinkAttr::Address(address) => address.as_slice(),
             LinkAttr::Name(name) => name.as_bytes_with_nul(),
             LinkAttr::Mtu(mtu) => unsafe {
                 core::slice::from_raw_parts(mtu as *const u32 as *const u8, 4)

@@ -28,8 +28,8 @@ use core::sync::atomic::{
 use smoltcp::wire::{IpAddress::*, IpEndpoint, IpListenEndpoint, IpVersion, Ipv4Address};
 
 use super::{
-    common::ensure_bound_dual_stack_remote_compatible, InetSocket, UNSPECIFIED_LOCAL_ENDPOINT_V4,
-    UNSPECIFIED_LOCAL_ENDPOINT_V6,
+    common::{ensure_bound_dual_stack_remote_compatible, loopback_iface_contains_v4},
+    InetSocket, UNSPECIFIED_LOCAL_ENDPOINT_V4, UNSPECIFIED_LOCAL_ENDPOINT_V6,
 };
 
 mod option;
@@ -991,6 +991,10 @@ impl UdpSocket {
                         Ipv4(v4) => v4.is_loopback(),
                         Ipv6(v6) => v6.is_loopback(),
                     };
+                    let is_loopback_local_subnet = match dest.addr {
+                        Ipv4(v4) => loopback_iface_contains_v4(&bound_iface, v4),
+                        Ipv6(_) => false,
+                    };
                     let loopback_broadcast = self
                         .netns
                         .loopback_iface()
@@ -1004,6 +1008,7 @@ impl UdpSocket {
                                 .inner
                                 .is_broadcast(&dest.addr));
                     let should_loopback_send = is_loopback
+                        || is_loopback_local_subnet
                         || ((is_multicast || is_broadcast)
                             && (send_iface_is_loopback || loopback_broadcast));
                     if should_loopback_send {

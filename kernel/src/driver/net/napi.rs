@@ -1,4 +1,4 @@
-use crate::driver::net::Iface;
+use crate::driver::net::{types::InterfaceFlags, Iface};
 use crate::init::initcall::INITCALL_SUBSYS;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::libs::wait_queue::WaitQueue;
@@ -46,6 +46,9 @@ impl NapiStruct {
         // log::info!("NAPI instance {} polling", self.napi_id);
         // 获取网卡的强引用
         if let Some(iface) = self.net_device.upgrade() {
+            if !iface.flags().contains(InterfaceFlags::UP) {
+                return false;
+            }
             // Linux NAPI 语义：每次 poll 处理有限工作量（budget/weight），避免无界处理导致 DoS/长时间关中断。
             // smoltcp 的 Interface::poll() 会在一次调用内处理 device 队列中所有包，因此这里必须走 bounded poll。
             //

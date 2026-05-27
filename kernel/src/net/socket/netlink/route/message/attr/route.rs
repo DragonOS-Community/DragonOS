@@ -1,21 +1,22 @@
-use crate::net::socket::netlink::message::attr::Attribute;
+use crate::net::socket::netlink::message::attr::{Attribute, CAttrHeader};
+use crate::net::socket::netlink::route::message::attr::convert_one_from_raw_buf;
+use alloc::vec::Vec;
 use system_error::SystemError;
 
-/// 路由相关属性
 #[derive(Debug, Clone, Copy)]
 #[repr(u16)]
 enum RouteAttrClass {
     UNSPEC = 0,
-    DST = 1,       // 目标地址
-    SRC = 2,       // 源地址
-    IIF = 3,       // 输入接口
-    OIF = 4,       // 输出接口
-    GATEWAY = 5,   // 网关地址
-    PRIORITY = 6,  // 路由优先级
-    PREFSRC = 7,   // 首选源地址
-    METRICS = 8,   // 路由度量
-    MULTIPATH = 9, // 多路径信息
-    TABLE = 15,    // 路由表ID
+    DST = 1,
+    SRC = 2,
+    IIF = 3,
+    OIF = 4,
+    GATEWAY = 5,
+    PRIORITY = 6,
+    PREFSRC = 7,
+    METRICS = 8,
+    MULTIPATH = 9,
+    TABLE = 15,
 }
 
 impl TryFrom<u16> for RouteAttrClass {
@@ -39,16 +40,16 @@ impl TryFrom<u16> for RouteAttrClass {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum RouteAttr {
-    Dst([u8; 4]),     // 目标地址 (IPv4)
-    Src([u8; 4]),     // 源地址 (IPv4)
-    Gateway([u8; 4]), // 网关地址 (IPv4)
-    Oif(u32),         // 输出接口索引
-    Iif(u32),         // 输入接口索引
-    Priority(u32),    // 路由优先级
-    Prefsrc([u8; 4]), // 首选源地址 (IPv4)
-    Table(u32),       // 路由表ID
+    Dst(Vec<u8>),
+    Src(Vec<u8>),
+    Gateway(Vec<u8>),
+    Oif(u32),
+    Iif(u32),
+    Priority(u32),
+    Prefsrc(Vec<u8>),
+    Table(u32),
 }
 
 impl RouteAttr {
@@ -70,26 +71,68 @@ impl Attribute for RouteAttr {
     fn type_(&self) -> u16 {
         self.class() as u16
     }
+
     fn payload_as_bytes(&self) -> &[u8] {
-        // match self {
-        //     RouteAttr::Dst(addr)
-        //     | RouteAttr::Src(addr)
-        //     | RouteAttr::Gateway(addr)
-        //     | RouteAttr::Prefsrc(addr) => addr,
-        //     RouteAttr::Oif(idx) | RouteAttr::Iif(idx) => idx.as_bytes(),
-        //     RouteAttr::Priority(pri) => pri.as_bytes(),
-        //     RouteAttr::Table(table) => table.as_bytes(),
-        // }
-        todo!()
+        match self {
+            RouteAttr::Dst(addr)
+            | RouteAttr::Src(addr)
+            | RouteAttr::Gateway(addr)
+            | RouteAttr::Prefsrc(addr) => addr.as_slice(),
+            RouteAttr::Oif(idx)
+            | RouteAttr::Iif(idx)
+            | RouteAttr::Priority(idx)
+            | RouteAttr::Table(idx) => unsafe {
+                core::slice::from_raw_parts(idx as *const u32 as *const u8, 4)
+            },
+        }
     }
 
-    fn read_from_buf(
-        _header: &crate::net::socket::netlink::message::attr::CAttrHeader,
-        _payload_buf: &[u8],
-    ) -> Result<Option<Self>, SystemError>
+    fn read_from_buf(header: &CAttrHeader, payload_buf: &[u8]) -> Result<Option<Self>, SystemError>
     where
         Self: Sized,
     {
-        todo!()
+        let payload_len = header.payload_len();
+        let Ok(class) = RouteAttrClass::try_from(header.type_()) else {
+            return Ok(None);
+        };
+
+        let attr = match class {
+            RouteAttrClass::DST
+            | RouteAttrClass::SRC
+            | RouteAttrClass::GATEWAY
+            | RouteAttrClass::PREFSRC
+                if matches!(payload_len, 4 | 16) =>
+            {
+                let bytes = payload_buf.to_vec();
+                match class {
+                    RouteAttrClass::DST => RouteAttr::Dst(bytes),
+                    RouteAttrClass::SRC => RouteAttr::Src(bytes),
+                    RouteAttrClass::GATEWAY => RouteAttr::Gateway(bytes),
+                    RouteAttrClass::PREFSRC => RouteAttr::Prefsrc(bytes),
+                    _ => unreachable!(),
+                }
+            }
+            RouteAttrClass::OIF | RouteAttrClass::IIF | RouteAttrClass::PRIORITY
+                if payload_len == 4 =>
+            {
+                let value = *convert_one_from_raw_buf::<u32>(payload_buf)?;
+                match class {
+                    RouteAttrClass::OIF => RouteAttr::Oif(value),
+                    RouteAttrClass::IIF => RouteAttr::Iif(value),
+                    RouteAttrClass::PRIORITY => RouteAttr::Priority(value),
+                    _ => unreachable!(),
+                }
+            }
+            RouteAttrClass::TABLE if payload_len == 1 => RouteAttr::Table(payload_buf[0] as u32),
+            RouteAttrClass::TABLE if payload_len == 4 => {
+                RouteAttr::Table(*convert_one_from_raw_buf::<u32>(payload_buf)?)
+            }
+            RouteAttrClass::METRICS | RouteAttrClass::MULTIPATH | RouteAttrClass::UNSPEC => {
+                return Ok(None);
+            }
+            _ => return Err(SystemError::EINVAL),
+        };
+
+        Ok(Some(attr))
     }
 }

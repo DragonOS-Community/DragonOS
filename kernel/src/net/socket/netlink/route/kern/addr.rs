@@ -7,7 +7,10 @@ use crate::{
                 CSegmentType,
             },
             route::{
-                kern::utils::finish_response,
+                kern::utils::{
+                    finish_response, kernel_notify_header, multicast_notify, RTMGRP_IPV4_IFADDR,
+                    RTMGRP_IPV6_IFADDR,
+                },
                 message::{
                     attr::addr::AddrAttr,
                     segment::{
@@ -42,12 +45,31 @@ pub(super) fn do_get_addr(
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
+    let requested_index = request_segment.body().index.map(NonZeroU32::get);
+    let requested_family = AddressFamily::try_from(request_segment.body().family as u16)
+        .ok()
+        .filter(|family| *family != AddressFamily::Unspecified);
+
     let mut responce: Vec<RouteNlSegment> = netns
         .device_list()
         .iter()
+        .filter(|(_, iface)| requested_index.is_none_or(|index| iface.nic_id() as u32 == index))
         .flat_map(|(_, iface)| iface_to_new_addr(request_segment.header(), iface))
+        .filter(|segment| {
+            requested_family.is_none_or(|family| {
+                AddressFamily::try_from(segment.body().family as u16)
+                    .ok()
+                    .is_some_and(|segment_family| segment_family == family)
+            })
+        })
         .map(RouteNlSegment::NewAddr)
         .collect();
+
+    // getifaddrs(3) 期望全局地址列表按族排序：IPv4 在前、IPv6 在后。
+    responce.sort_by_key(|segment| match segment {
+        RouteNlSegment::NewAddr(addr) => addr.body().family,
+        _ => 0,
+    });
 
     finish_response(request_segment.header(), dump_all, &mut responce);
 
@@ -58,7 +80,19 @@ pub(super) fn do_new_addr(
     request_segment: &AddrSegment,
     netns: Arc<NetNamespace>,
 ) -> Result<Vec<RouteNlSegment>, SystemError> {
-    add_addr(request_segment, netns)?;
+    let (iface, cidr, changed) = add_addr(request_segment, netns.clone())?;
+    if changed {
+        multicast_notify(
+            netns,
+            addr_notify_group(cidr.address()),
+            RouteNlSegment::NewAddr(addr_to_segment(
+                &kernel_notify_header(CSegmentType::NEWADDR),
+                &iface,
+                cidr,
+                CSegmentType::NEWADDR,
+            )?),
+        );
+    }
     Ok(Vec::new())
 }
 
@@ -66,11 +100,24 @@ pub(super) fn do_del_addr(
     request_segment: &AddrSegment,
     netns: Arc<NetNamespace>,
 ) -> Result<Vec<RouteNlSegment>, SystemError> {
-    del_addr(request_segment, netns)?;
+    let (iface, cidr) = del_addr(request_segment, netns.clone())?;
+    multicast_notify(
+        netns,
+        addr_notify_group(cidr.address()),
+        RouteNlSegment::DelAddr(addr_to_segment(
+            &kernel_notify_header(CSegmentType::DELADDR),
+            &iface,
+            cidr,
+            CSegmentType::DELADDR,
+        )?),
+    );
     Ok(Vec::new())
 }
 
-fn add_addr(request_segment: &AddrSegment, netns: Arc<NetNamespace>) -> Result<(), SystemError> {
+fn add_addr(
+    request_segment: &AddrSegment,
+    netns: Arc<NetNamespace>,
+) -> Result<(Arc<dyn Iface>, IpCidr, bool), SystemError> {
     let iface = lookup_iface_by_index(request_segment, netns)?;
     let cidr = parse_cidr(request_segment)?;
     let flags = NewRequestFlags::from_bits_truncate(request_segment.header().flags);
@@ -97,7 +144,7 @@ fn add_addr(request_segment: &AddrSegment, netns: Arc<NetNamespace>) -> Result<(
 
     if exists {
         if flags.contains(NewRequestFlags::REPLACE) {
-            return Ok(());
+            return Ok((iface, cidr, false));
         }
         return Err(SystemError::EEXIST);
     }
@@ -113,10 +160,13 @@ fn add_addr(request_segment: &AddrSegment, netns: Arc<NetNamespace>) -> Result<(
 
     sync_router_ip_addrs(&iface);
 
-    Ok(())
+    Ok((iface, cidr, true))
 }
 
-fn del_addr(request_segment: &AddrSegment, netns: Arc<NetNamespace>) -> Result<(), SystemError> {
+fn del_addr(
+    request_segment: &AddrSegment,
+    netns: Arc<NetNamespace>,
+) -> Result<(Arc<dyn Iface>, IpCidr), SystemError> {
     let iface = lookup_iface_by_index(request_segment, netns)?;
     let cidr = parse_cidr(request_segment)?;
 
@@ -136,7 +186,7 @@ fn del_addr(request_segment: &AddrSegment, netns: Arc<NetNamespace>) -> Result<(
     remove_local_route(&iface, cidr);
     sync_router_ip_addrs(&iface);
 
-    Ok(())
+    Ok((iface, cidr))
 }
 
 fn lookup_iface_by_index(
@@ -200,7 +250,6 @@ fn parse_cidr(request_segment: &AddrSegment) -> Result<IpCidr, SystemError> {
 }
 
 fn iface_to_new_addr(request_header: &CMsgSegHdr, iface: &Arc<dyn Iface>) -> Vec<AddrSegment> {
-    let ifname = CString::new(iface.iface_name()).unwrap();
     let mut segments = Vec::new();
     let ip_addrs: Vec<IpCidr> = {
         let smol_iface = iface.smol_iface().lock();
@@ -208,37 +257,52 @@ fn iface_to_new_addr(request_header: &CMsgSegHdr, iface: &Arc<dyn Iface>) -> Vec
     };
 
     for cidr in &ip_addrs {
-        let (family, octets): (i32, Vec<u8>) = match cidr.address() {
-            IpAddress::Ipv4(addr) => (AddressFamily::INet as i32, addr.octets().to_vec()),
-            IpAddress::Ipv6(addr) => (AddressFamily::INet6 as i32, addr.octets().to_vec()),
-        };
-
-        let header = CMsgSegHdr {
-            len: 0,
-            type_: CSegmentType::NEWADDR as _,
-            flags: SegHdrCommonFlags::empty().bits(),
-            seq: request_header.seq,
-            pid: request_header.pid,
-        };
-
-        let addr_message = AddrSegmentBody {
-            family,
-            prefix_len: cidr.prefix_len(),
-            flags: AddrMessageFlags::PERMANENT,
-            scope: RtScope::HOST,
-            index: NonZeroU32::new(iface.nic_id() as u32),
-        };
-
-        let attrs = vec![
-            AddrAttr::Address(octets.clone()),
-            AddrAttr::Label(ifname.clone()),
-            AddrAttr::Local(octets),
-        ];
-
-        segments.push(AddrSegment::new(header, addr_message, attrs));
+        if let Ok(segment) = addr_to_segment(request_header, iface, *cidr, CSegmentType::NEWADDR) {
+            segments.push(segment);
+        }
     }
 
     segments
+}
+
+fn addr_to_segment(
+    request_header: &CMsgSegHdr,
+    iface: &Arc<dyn Iface>,
+    cidr: IpCidr,
+    msg_type: CSegmentType,
+) -> Result<AddrSegment, SystemError> {
+    let (family, octets): (i32, Vec<u8>) = match cidr.address() {
+        IpAddress::Ipv4(addr) => (AddressFamily::INet as i32, addr.octets().to_vec()),
+        IpAddress::Ipv6(addr) => (AddressFamily::INet6 as i32, addr.octets().to_vec()),
+    };
+
+    let header = CMsgSegHdr {
+        len: 0,
+        type_: msg_type as _,
+        flags: SegHdrCommonFlags::empty().bits(),
+        seq: request_header.seq,
+        pid: request_header.pid,
+    };
+
+    let addr_message = AddrSegmentBody {
+        family,
+        prefix_len: cidr.prefix_len(),
+        flags: AddrMessageFlags::PERMANENT,
+        scope: if iface.name() == "lo" {
+            RtScope::HOST
+        } else {
+            RtScope::UNIVERSE
+        },
+        index: NonZeroU32::new(iface.nic_id() as u32),
+    };
+
+    let attrs = vec![
+        AddrAttr::Address(octets.clone()),
+        AddrAttr::Label(CString::new(iface.iface_name()).map_err(|_| SystemError::EINVAL)?),
+        AddrAttr::Local(octets),
+    ];
+
+    Ok(AddrSegment::new(header, addr_message, attrs))
 }
 
 fn sync_router_ip_addrs(iface: &Arc<dyn Iface>) {
@@ -254,12 +318,9 @@ fn sync_router_ip_addrs(iface: &Arc<dyn Iface>) {
 
 fn add_local_route(iface: &Arc<dyn Iface>, cidr: IpCidr) -> Result<(), SystemError> {
     let mut pushed = false;
-    let via_router = cidr.address();
 
     iface.smol_iface().lock().routes_mut().update(|routes| {
-        let exists = routes
-            .iter()
-            .any(|route| is_same_local_route(route, cidr, via_router));
+        let exists = routes.iter().any(|route| is_same_local_route(route, cidr));
         if exists {
             pushed = true;
             return;
@@ -268,7 +329,7 @@ fn add_local_route(iface: &Arc<dyn Iface>, cidr: IpCidr) -> Result<(), SystemErr
         pushed = routes
             .push(smoltcp::iface::Route {
                 cidr,
-                via_router,
+                via_router: None,
                 preferred_until: None,
                 expires_at: None,
             })
@@ -277,9 +338,8 @@ fn add_local_route(iface: &Arc<dyn Iface>, cidr: IpCidr) -> Result<(), SystemErr
 
     if !pushed {
         log::warn!(
-            "netlink add_addr: route table full while adding local route {} via {}",
-            cidr,
-            via_router
+            "netlink add_addr: route table full while adding local route {}",
+            cidr
         );
         return Err(SystemError::ENOSPC);
     }
@@ -288,11 +348,10 @@ fn add_local_route(iface: &Arc<dyn Iface>, cidr: IpCidr) -> Result<(), SystemErr
 }
 
 fn remove_local_route(iface: &Arc<dyn Iface>, cidr: IpCidr) {
-    let via_router = cidr.address();
     iface.smol_iface().lock().routes_mut().update(|routes| {
         if let Some(index) = routes
             .iter()
-            .position(|route| is_same_local_route(route, cidr, via_router))
+            .position(|route| is_same_local_route(route, cidr))
         {
             routes.remove(index);
         }
@@ -309,6 +368,13 @@ fn rollback_added_addr(iface: &Arc<dyn Iface>, cidr: IpCidr) {
 }
 
 #[inline]
-fn is_same_local_route(route: &smoltcp::iface::Route, cidr: IpCidr, via_router: IpAddress) -> bool {
-    route.cidr == cidr && route.via_router == via_router
+fn is_same_local_route(route: &smoltcp::iface::Route, cidr: IpCidr) -> bool {
+    route.cidr == cidr && route.via_router.is_none()
+}
+
+fn addr_notify_group(ip: IpAddress) -> u32 {
+    match ip {
+        IpAddress::Ipv4(_) => RTMGRP_IPV4_IFADDR,
+        IpAddress::Ipv6(_) => RTMGRP_IPV6_IFADDR,
+    }
 }

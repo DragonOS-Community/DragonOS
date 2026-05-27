@@ -7,6 +7,7 @@ use crate::{
     net::{
         posix::SockAddr,
         socket::{
+            common::EPollItems,
             common::{parse_timeval_opt, write_i32_getsockopt, write_timeval_opt},
             endpoint::Endpoint,
             netlink::{
@@ -27,18 +28,41 @@ use system_error::SystemError;
 pub(super) mod bound;
 mod unbound;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+enum NetlinkSockOpt {
+    AddMembership = 1,
+    DropMembership = 2,
+    ListMemberships = 9,
+}
+
+impl TryFrom<u32> for NetlinkSockOpt {
+    type Error = SystemError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::AddMembership),
+            2 => Ok(Self::DropMembership),
+            9 => Ok(Self::ListMemberships),
+            _ => Err(SystemError::ENOPROTOOPT),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct NetlinkSocket<P: SupportedNetlinkProtocol> {
     inner: RwSem<Inner<UnboundNetlink<P>, BoundNetlink<P::Message>>>,
 
     is_nonblocking: AtomicBool,
     wait_queue: Arc<WaitQueue>,
+    epoll_items: Arc<EPollItems>,
     netns: Arc<NetNamespace>,
     socket_type: PSOCK,
     protocol: u32,
+    group_count: AtomicUsize,
     send_timeout_us: AtomicU64,
     recv_timeout_us: AtomicU64,
-    fasync_items: FAsyncItems,
+    fasync_items: Arc<FAsyncItems>,
     inode_id: InodeId,
     open_files: AtomicUsize,
 }
@@ -48,17 +72,22 @@ where
     BoundNetlink<P::Message>: Bound<Endpoint = NetlinkSocketAddr>,
 {
     pub fn new(is_nonblocking: bool, socket_type: PSOCK, protocol: u32) -> Arc<Self> {
-        let unbound = UnboundNetlink::new();
+        let wait_queue = Arc::new(WaitQueue::default());
+        let epoll_items = Arc::new(EPollItems::default());
+        let fasync_items = Arc::new(FAsyncItems::default());
+        let unbound = UnboundNetlink::new(epoll_items.clone(), fasync_items.clone());
         Arc::new(Self {
             inner: RwSem::new(Inner::Unbound(unbound)),
             is_nonblocking: AtomicBool::new(is_nonblocking),
-            wait_queue: Arc::new(WaitQueue::default()),
+            wait_queue,
+            epoll_items,
             netns: ProcessManager::current_netns(),
             socket_type,
             protocol,
+            group_count: AtomicUsize::new(0),
             send_timeout_us: AtomicU64::new(u64::MAX),
             recv_timeout_us: AtomicU64::new(u64::MAX),
-            fasync_items: FAsyncItems::default(),
+            fasync_items,
             inode_id: generate_inode_id(),
             open_files: AtomicUsize::new(0),
         })
@@ -155,6 +184,33 @@ where
     pub fn netns(&self) -> Arc<NetNamespace> {
         self.netns.clone()
     }
+
+    fn ensure_membership_capacity(&self) {
+        let target = P::multicast_group_count() as usize;
+        let mut current = self.group_count.load(Ordering::Relaxed);
+        while current < target {
+            match self.group_count.compare_exchange(
+                current,
+                target,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn update_membership_capacity_for_bind(&self, addr: &NetlinkSocketAddr) {
+        if !addr.groups().is_empty() {
+            self.ensure_membership_capacity();
+        }
+    }
+
+    fn list_memberships_needed_bytes(&self) -> usize {
+        let groups = self.group_count.load(Ordering::Relaxed);
+        groups.div_ceil(32) * core::mem::size_of::<u32>()
+    }
 }
 
 impl<P: SupportedNetlinkProtocol + 'static> Socket for NetlinkSocket<P>
@@ -181,6 +237,7 @@ where
         endpoint: crate::net::socket::endpoint::Endpoint,
     ) -> Result<(), system_error::SystemError> {
         let endpoint = endpoint.try_into()?;
+        self.update_membership_capacity_for_bind(&endpoint);
 
         self.inner
             .write()
@@ -276,33 +333,56 @@ where
     }
 
     fn option(&self, level: PSOL, name: usize, value: &mut [u8]) -> Result<usize, SystemError> {
-        if !matches!(level, PSOL::SOCKET) {
-            return Err(SystemError::ENOPROTOOPT);
-        }
-
-        let opt = PSO::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
-        match opt {
-            PSO::TYPE => {
-                let v = self.socket_type as i32;
-                Ok(write_i32_getsockopt(value, v))
+        match level {
+            PSOL::SOCKET => {
+                let opt = PSO::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
+                match opt {
+                    PSO::TYPE => {
+                        let v = self.socket_type as i32;
+                        Ok(write_i32_getsockopt(value, v))
+                    }
+                    PSO::DOMAIN => {
+                        let v = AddressFamily::Netlink as i32;
+                        Ok(write_i32_getsockopt(value, v))
+                    }
+                    PSO::PROTOCOL => {
+                        let v = self.protocol as i32;
+                        Ok(write_i32_getsockopt(value, v))
+                    }
+                    PSO::SNDTIMEO_OLD | PSO::SNDTIMEO_NEW => {
+                        let us = self.send_timeout_us.load(Ordering::Relaxed);
+                        let us = if us == u64::MAX { 0 } else { us };
+                        Ok(write_timeval_opt(value, us))
+                    }
+                    PSO::RCVTIMEO_OLD | PSO::RCVTIMEO_NEW => {
+                        let us = self.recv_timeout_us.load(Ordering::Relaxed);
+                        let us = if us == u64::MAX { 0 } else { us };
+                        Ok(write_timeval_opt(value, us))
+                    }
+                    _ => Err(SystemError::ENOPROTOOPT),
+                }
             }
-            PSO::DOMAIN => {
-                let v = AddressFamily::Netlink as i32;
-                Ok(write_i32_getsockopt(value, v))
-            }
-            PSO::PROTOCOL => {
-                let v = self.protocol as i32;
-                Ok(write_i32_getsockopt(value, v))
-            }
-            PSO::SNDTIMEO_OLD | PSO::SNDTIMEO_NEW => {
-                let us = self.send_timeout_us.load(Ordering::Relaxed);
-                let us = if us == u64::MAX { 0 } else { us };
-                Ok(write_timeval_opt(value, us))
-            }
-            PSO::RCVTIMEO_OLD | PSO::RCVTIMEO_NEW => {
-                let us = self.recv_timeout_us.load(Ordering::Relaxed);
-                let us = if us == u64::MAX { 0 } else { us };
-                Ok(write_timeval_opt(value, us))
+            PSOL::NETLINK => {
+                let opt =
+                    NetlinkSockOpt::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
+                match opt {
+                    NetlinkSockOpt::ListMemberships => {
+                        let groups: u64 = self
+                            .inner
+                            .read()
+                            .addr()
+                            .map_or(0, |addr| addr.groups().as_u64());
+                        let needed = self.list_memberships_needed_bytes();
+                        let groups_array = [groups as u32, (groups >> 32) as u32];
+                        let bytes = unsafe {
+                            core::slice::from_raw_parts(groups_array.as_ptr() as *const u8, needed)
+                        };
+                        let copy_len = core::cmp::min(value.len(), bytes.len());
+                        value[..copy_len].copy_from_slice(&bytes[..copy_len]);
+                        Ok(needed)
+                    }
+                    _ => Err(SystemError::ENOPROTOOPT),
+                }
             }
             _ => Err(SystemError::ENOPROTOOPT),
         }
@@ -321,23 +401,43 @@ where
     }
 
     fn set_option(&self, level: PSOL, name: usize, val: &[u8]) -> Result<(), SystemError> {
-        if !matches!(level, PSOL::SOCKET) {
-            return Err(SystemError::ENOPROTOOPT);
-        }
-
-        let opt = PSO::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
-        match opt {
-            PSO::SNDTIMEO_OLD | PSO::SNDTIMEO_NEW => {
-                let d = parse_timeval_opt(val)?;
-                let us = d.map(|v| v.total_micros()).unwrap_or(u64::MAX);
-                self.send_timeout_us.store(us, Ordering::Relaxed);
-                Ok(())
+        match level {
+            PSOL::SOCKET => {
+                let opt = PSO::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
+                match opt {
+                    PSO::SNDTIMEO_OLD | PSO::SNDTIMEO_NEW => {
+                        let d = parse_timeval_opt(val)?;
+                        let us = d.map(|v| v.total_micros()).unwrap_or(u64::MAX);
+                        self.send_timeout_us.store(us, Ordering::Relaxed);
+                        Ok(())
+                    }
+                    PSO::RCVTIMEO_OLD | PSO::RCVTIMEO_NEW => {
+                        let d = parse_timeval_opt(val)?;
+                        let us = d.map(|v| v.total_micros()).unwrap_or(u64::MAX);
+                        self.recv_timeout_us.store(us, Ordering::Relaxed);
+                        Ok(())
+                    }
+                    _ => Err(SystemError::ENOPROTOOPT),
+                }
             }
-            PSO::RCVTIMEO_OLD | PSO::RCVTIMEO_NEW => {
-                let d = parse_timeval_opt(val)?;
-                let us = d.map(|v| v.total_micros()).unwrap_or(u64::MAX);
-                self.recv_timeout_us.store(us, Ordering::Relaxed);
-                Ok(())
+            PSOL::NETLINK => {
+                let opt =
+                    NetlinkSockOpt::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
+                match opt {
+                    NetlinkSockOpt::AddMembership => {
+                        let groups = read_group_membership_sockopt::<P>(val)?;
+                        self.ensure_membership_capacity();
+                        self.inner.write().add_groups(groups);
+                        Ok(())
+                    }
+                    NetlinkSockOpt::DropMembership => {
+                        let groups = read_group_membership_sockopt::<P>(val)?;
+                        self.ensure_membership_capacity();
+                        self.inner.write().drop_groups(groups);
+                        Ok(())
+                    }
+                    NetlinkSockOpt::ListMemberships => Err(SystemError::ENOPROTOOPT),
+                }
             }
             _ => Err(SystemError::ENOPROTOOPT),
         }
@@ -349,11 +449,11 @@ where
     }
 
     fn epoll_items(&self) -> &crate::net::socket::common::EPollItems {
-        todo!("implement epoll_items for netlink socket");
+        self.epoll_items.as_ref()
     }
 
     fn fasync_items(&self) -> &FAsyncItems {
-        &self.fasync_items
+        self.fasync_items.as_ref()
     }
 
     fn local_endpoint(&self) -> Result<Endpoint, SystemError> {
@@ -387,6 +487,27 @@ impl<P: SupportedNetlinkProtocol> NetlinkSocket<P> {
     pub fn set_nonblocking(&self, nonblocking: bool) {
         self.is_nonblocking.store(nonblocking, Ordering::Relaxed);
     }
+}
+
+fn read_u32_sockopt(val: &[u8]) -> Result<u32, SystemError> {
+    if val.len() < size_of::<u32>() {
+        return Err(SystemError::EINVAL);
+    }
+
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(&val[..4]);
+    Ok(u32::from_ne_bytes(bytes))
+}
+
+fn read_group_membership_sockopt<P: SupportedNetlinkProtocol>(
+    val: &[u8],
+) -> Result<GroupIdSet, SystemError> {
+    let group_id = read_u32_sockopt(val)?;
+    if group_id == 0 || group_id > P::multicast_group_count() {
+        return Err(SystemError::EINVAL);
+    }
+
+    GroupIdSet::from_group_id(group_id).ok_or(SystemError::EINVAL)
 }
 
 // 多播消息的时候会用到，比如uevent

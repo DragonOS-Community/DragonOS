@@ -605,13 +605,13 @@ impl ProcessManager {
                     DequeueFlag::DEQUEUE_STOPPED | DequeueFlag::DEQUEUE_NOCLOCK,
                 );
             } else if !update_clock {
-                // 正在远端 CPU 运行：dequeue + kick
-                // 此处异步 dequeue，远端 CPU 收到 kick 后 __schedule(SM_PREEMPT) 时
-                // stopped task 已不在红黑树中，pick_next_task 不会选中它
-                rq.deactivate_task(
-                    pcb.clone(),
-                    DequeueFlag::DEQUEUE_STOPPED | DequeueFlag::DEQUEUE_NOCLOCK,
-                );
+                // 远端 CPU 上的 current：只设状态 + kick，不在发送端 dequeue。
+                //
+                // 对标 Linux signal_wake_up_state() + kick_process()：
+                //   发送端仅设 TIF_SIGPENDING / NEED_SCHEDULE 并 kick，不做 dequeue。
+                //   远端 CPU 的 __schedule() 看到非 runnable 的 prev 后自行完成唯一一次出队。
+                //
+                // 现在由 __schedule_inner 统一出队路径 + on_rq 守卫保证幂等。
                 kick_cpu(target_cpu).ok();
             }
         }

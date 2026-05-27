@@ -1192,19 +1192,35 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
     //         .collect::<Vec<_>>(),
     // );
 
-    if !sched_mod.contains(SchedMode::SM_MASK_PREEMPT) {
+    // 对标 Linux __schedule() 的 prev_state 检查：
+    //   Linux 条件: (!(sched_mode & SM_MASK_PREEMPT) && prev_state)
+    //   ——非抢占 + prev 非 RUNNING 时进入 deactivate 分支。
+    //
+    // DragonOS 扩展：SM_PREEMPT 路径也需处理非 runnable 的 prev，
+    // 因为异步 stop_task() 可在发送端上下文将远端 current 设为 Stopped（仅 kick 不 dequeue），
+    // 导致远端 IPI 退出时 prev 已非 runnable 但仍在 runqueue 上。
+    // 此时必须在这里完成唯一一次出队。
+    //
+    // on_rq == Queued 守卫保证 deactivate 幂等：
+    //   若 stop_task 已出队（!is_current 分支），此处 on_rq != Queued，跳过。
+    //   若 stop_task 未出队（远端 current 分支），此处 on_rq == Queued，执行出队。
+    {
         let prev_state = prev.sched_info().state();
         if !prev_state.is_runnable() {
-            // 对齐 Linux __schedule() signal_pending_state(prev_state, prev):
-            //   TASK_INTERRUPTIBLE              → 有任意信号 → 恢复 RUNNING
-            //   TASK_STOPPED (含 TASK_WAKEKILL) → 只有 SIGKILL → 恢复 RUNNING
-            //   TASK_UNINTERRUPTIBLE            → 不检查信号，直接 deactivate
             let interruptible = prev_state.is_blocked_interruptable();
             let wake_kill = prev_state.is_stopped();
 
-            if Signal::signal_pending_state(interruptible, wake_kill, &prev) {
+            // signal_pending_state 仅对 SM_NONE（自愿调度）生效：
+            //   TASK_INTERRUPTIBLE → 有任意信号 → 恢复 RUNNING
+            //   TASK_STOPPED       → 仅 SIGKILL → 恢复 RUNNING
+            //   TASK_UNINTERRUPTIBLE → 不检查信号，直接 deactivate
+            // SM_PREEMPT（被抢占）不检查信号，因为异步 stop 不应被信号恢复。
+            let signal_wake = !sched_mod.contains(SchedMode::SM_MASK_PREEMPT)
+                && Signal::signal_pending_state(interruptible, wake_kill, &prev);
+
+            if signal_wake {
                 prev.sched_info().set_state(ProcessState::Runnable);
-            } else {
+            } else if *prev.sched_info().on_rq.lock_irqsave() == OnRq::Queued {
                 // sched_contributes_to_load 在 deactivate_task 之前
                 if matches!(prev_state, ProcessState::Blocked(false)) {
                     rq.nr_uninterruptible += 1;

@@ -318,12 +318,9 @@ fn sync_router_ip_addrs(iface: &Arc<dyn Iface>) {
 
 fn add_local_route(iface: &Arc<dyn Iface>, cidr: IpCidr) -> Result<(), SystemError> {
     let mut pushed = false;
-    let via_router = cidr.address();
 
     iface.smol_iface().lock().routes_mut().update(|routes| {
-        let exists = routes
-            .iter()
-            .any(|route| is_same_local_route(route, cidr, via_router));
+        let exists = routes.iter().any(|route| is_same_local_route(route, cidr));
         if exists {
             pushed = true;
             return;
@@ -332,7 +329,7 @@ fn add_local_route(iface: &Arc<dyn Iface>, cidr: IpCidr) -> Result<(), SystemErr
         pushed = routes
             .push(smoltcp::iface::Route {
                 cidr,
-                via_router,
+                via_router: None,
                 preferred_until: None,
                 expires_at: None,
             })
@@ -341,9 +338,8 @@ fn add_local_route(iface: &Arc<dyn Iface>, cidr: IpCidr) -> Result<(), SystemErr
 
     if !pushed {
         log::warn!(
-            "netlink add_addr: route table full while adding local route {} via {}",
-            cidr,
-            via_router
+            "netlink add_addr: route table full while adding local route {}",
+            cidr
         );
         return Err(SystemError::ENOSPC);
     }
@@ -352,11 +348,10 @@ fn add_local_route(iface: &Arc<dyn Iface>, cidr: IpCidr) -> Result<(), SystemErr
 }
 
 fn remove_local_route(iface: &Arc<dyn Iface>, cidr: IpCidr) {
-    let via_router = cidr.address();
     iface.smol_iface().lock().routes_mut().update(|routes| {
         if let Some(index) = routes
             .iter()
-            .position(|route| is_same_local_route(route, cidr, via_router))
+            .position(|route| is_same_local_route(route, cidr))
         {
             routes.remove(index);
         }
@@ -373,8 +368,8 @@ fn rollback_added_addr(iface: &Arc<dyn Iface>, cidr: IpCidr) {
 }
 
 #[inline]
-fn is_same_local_route(route: &smoltcp::iface::Route, cidr: IpCidr, via_router: IpAddress) -> bool {
-    route.cidr == cidr && route.via_router == via_router
+fn is_same_local_route(route: &smoltcp::iface::Route, cidr: IpCidr) -> bool {
+    route.cidr == cidr && route.via_router.is_none()
 }
 
 fn addr_notify_group(ip: IpAddress) -> u32 {

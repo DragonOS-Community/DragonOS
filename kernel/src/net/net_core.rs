@@ -71,7 +71,7 @@ fn dhcp_query() -> Result<(), SystemError> {
                                 smoltcp::wire::Ipv4Address::new(127, 0, 0, 0),
                                 8,
                             )),
-                            via_router: smoltcp::wire::IpAddress::v4(127, 0, 0, 1),
+                            via_router: None,
                             preferred_until: None,
                             expires_at: None,
                         });

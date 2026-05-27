@@ -516,7 +516,7 @@ impl VethInterface {
             routes_map
                 .push(smoltcp::iface::Route {
                     cidr: IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
-                    via_router: peer_ip,
+                    via_router: Some(peer_ip),
                     preferred_until: None,
                     expires_at: None,
                 })
@@ -530,7 +530,7 @@ impl VethInterface {
     //         routes_map
     //             .push(smoltcp::iface::Route {
     //                 cidr,
-    //                 via_router,
+    //                 via_router: Some(via_router),
     //                 preferred_until: None,
     //                 expires_at: None,
     //             })

@@ -162,7 +162,7 @@ pub(super) fn do_new_route(
                 source: parsed.source,
                 gateway: parsed.gateway,
                 priority: parsed.priority,
-                table: parsed.table,
+                table,
                 protocol: request_segment.body().protocol as u8,
                 scope: request_segment.body().scope as u8,
                 kind: request_segment.body().type_ as u8,
@@ -211,7 +211,7 @@ pub(super) fn do_del_route(
                 source: parsed.source,
                 gateway: parsed.gateway,
                 priority: parsed.priority,
-                table: parsed.table,
+                table,
                 protocol: request_segment.body().protocol as u8,
                 scope: request_segment.body().scope as u8,
                 kind: request_segment.body().type_ as u8,
@@ -436,25 +436,20 @@ fn route_to_segment(
     Ok(RouteSegment::new(header, body, attrs))
 }
 
-fn smoltcp_via_router(destination: IpCidr, gateway: Option<IpAddress>) -> IpAddress {
-    gateway.unwrap_or_else(|| route_destination_prefix(destination))
-}
-
 fn sync_iface_route_table(
     iface: &Arc<dyn Iface>,
     route: &ParsedRouteRequest,
 ) -> Result<(), SystemError> {
-    let via_router = smoltcp_via_router(route.destination, route.gateway);
     let mut push_failed = false;
     iface.smol_iface().lock().routes_mut().update(|routes| {
         routes.retain(|existing| {
-            existing.cidr != route.destination || is_local_connected_route(existing)
+            existing.cidr != route.destination || is_local_connected_route(iface, existing)
         });
 
         if routes
             .push(smoltcp::iface::Route {
                 cidr: route.destination,
-                via_router,
+                via_router: route.gateway,
                 preferred_until: None,
                 expires_at: None,
             })
@@ -479,17 +474,13 @@ fn sync_iface_route_table_remove(
 ) {
     iface.smol_iface().lock().routes_mut().update(|routes| {
         routes.retain(|existing| {
-            if is_local_connected_route(existing) {
+            if is_local_connected_route(iface, existing) {
                 return true;
             }
             if existing.cidr != destination {
                 return true;
             }
-            if let Some(gw) = gateway {
-                existing.via_router != gw
-            } else {
-                false
-            }
+            existing.via_router != gateway
         });
     });
     let _ = (source, table);
@@ -577,8 +568,8 @@ fn route_destination_prefix(cidr: IpCidr) -> IpAddress {
     }
 }
 
-fn is_local_connected_route(route: &smoltcp::iface::Route) -> bool {
-    route.via_router == route.cidr.address()
+fn is_local_connected_route(iface: &Arc<dyn Iface>, route: &smoltcp::iface::Route) -> bool {
+    route.via_router.is_none() && iface.common().ip_addrs().contains(&route.cidr)
 }
 
 fn route_notify_group(ip: IpAddress) -> u32 {

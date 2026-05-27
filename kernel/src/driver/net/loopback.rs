@@ -383,7 +383,7 @@ impl LoopbackInterface {
             routes_map
                 .push(smoltcp::iface::Route {
                     cidr,
-                    via_router: addr,
+                    via_router: None,
                     preferred_until: None,
                     expires_at: None,
                 })
@@ -392,7 +392,7 @@ impl LoopbackInterface {
             routes_map
                 .push(smoltcp::iface::Route {
                     cidr: cidr6,
-                    via_router: addr6,
+                    via_router: None,
                     preferred_until: None,
                     expires_at: None,
                 })

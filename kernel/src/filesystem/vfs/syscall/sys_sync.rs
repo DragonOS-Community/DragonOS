@@ -62,7 +62,7 @@ impl Syscall for SysSyncHandle {
         // 阶段2: sync_inodes + sync_fs(nowait)
         for (_path, mountfs) in &mounts {
             if !mountfs.is_readonly() {
-                let _ = sync_inodes_of_mount(&mountfs);
+                let _ = sync_inodes_of_mount(mountfs);
             }
         }
 

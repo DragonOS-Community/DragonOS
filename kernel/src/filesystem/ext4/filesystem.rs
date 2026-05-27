@@ -1,7 +1,7 @@
 use crate::{
     driver::base::{block::gendisk::GenDisk, device::device_number::DeviceNumber},
     filesystem::{
-        ext4::inode::Ext4Inode,
+        ext4::inode::{Ext4Inode, InodeDirtyState},
         vfs::{
             self,
             fcntl::AtFlags,
@@ -90,7 +90,7 @@ impl Ext4FileSystem {
     pub(super) fn mark_inode_dirty(inode: &Arc<LockedExt4Inode>) {
         {
             let guard = inode.0.lock();
-            if guard.on_dirty_list {
+            if guard.dirty_state.contains(InodeDirtyState::ON_DIRTY_LIST) {
                 return;
             }
         }
@@ -99,10 +99,15 @@ impl Ext4FileSystem {
             let mut guard = fs.dirty_inodes.lock();
             {
                 let mut inode_guard = inode.0.lock();
-                if inode_guard.on_dirty_list {
+                if inode_guard
+                    .dirty_state
+                    .contains(InodeDirtyState::ON_DIRTY_LIST)
+                {
                     return;
                 }
-                inode_guard.on_dirty_list = true;
+                inode_guard
+                    .dirty_state
+                    .insert(InodeDirtyState::ON_DIRTY_LIST);
             }
             guard.push(Arc::downgrade(inode));
         }
@@ -128,7 +133,11 @@ impl Ext4FileSystem {
                     failed.push(Arc::downgrade(&inode));
                 } else {
                     // 成功才标记为不在脏列表
-                    inode.0.lock().on_dirty_list = false;
+                    inode
+                        .0
+                        .lock()
+                        .dirty_state
+                        .remove(InodeDirtyState::ON_DIRTY_LIST);
                 }
             }
         }
@@ -183,9 +192,7 @@ impl Ext4FileSystem {
                         special_node: None,
                         cached_file_size: None,
                         cached_mtime: None,
-                        size_dirty: false,
-                        mtime_dirty: false,
-                        on_dirty_list: false,
+                        dirty_state: super::inode::InodeDirtyState::empty(),
                     }),
                     Mutex::new(()),
                 )

@@ -391,6 +391,54 @@ pub struct PageCacheManager {
     owner: Weak<PageCache>,
 }
 
+/// RAII guard: ensures that a page entering Writeback state always calls
+/// `finish_writeback_entry` on any early-exit path, preventing pages from
+/// permanently stuck in Writeback.
+struct WritebackGuard {
+    cache: Arc<PageCache>,
+    page_index: usize,
+    entry: Arc<PageEntry>,
+    page: Arc<Page>,
+    disarmed: bool,
+}
+
+impl WritebackGuard {
+    fn new(
+        cache: Arc<PageCache>,
+        page_index: usize,
+        entry: Arc<PageEntry>,
+        page: Arc<Page>,
+    ) -> Self {
+        Self {
+            cache,
+            page_index,
+            entry,
+            page,
+            disarmed: false,
+        }
+    }
+
+    /// Called on successful writeback completion to prevent Drop from re-processing.
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for WritebackGuard {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            // Page stuck in Writeback due to unexpected error; revert to Dirty for retry.
+            let _ = PageCacheManager::finish_writeback_entry(
+                self.cache.clone(),
+                self.page_index,
+                self.entry.clone(),
+                self.page.clone(),
+                Err(SystemError::EIO),
+            );
+        }
+    }
+}
+
 impl PageCacheManager {
     fn new(owner: Weak<PageCache>) -> Self {
         Self { owner }
@@ -719,10 +767,21 @@ impl PageCacheManager {
 
         let page = entry.page.clone();
         let _invalidate = cache.invalidate_read();
-        let inode = cache
-            .inode()
-            .and_then(|inode| inode.upgrade())
-            .ok_or(SystemError::EIO)?;
+
+        // If the inode has been freed, restore page state via finish_writeback_entry and return error.
+        let inode = match cache.inode().and_then(|inode| inode.upgrade()) {
+            Some(inode) => inode,
+            None => {
+                Self::finish_writeback_entry(
+                    cache.clone(),
+                    page_index,
+                    entry,
+                    page,
+                    Err(SystemError::EIO),
+                )?;
+                return Err(SystemError::EIO);
+            }
+        };
         let backend = cache.backend();
         let page_start = page_index * MMArch::PAGE_SIZE;
         let len = if let Ok(metadata) = inode.metadata() {
@@ -789,6 +848,10 @@ impl PageCacheManager {
         }
 
         let page = entry.page.clone();
+        // RAII: if any subsequent path exits early, WritebackGuard ensures the page reverts to Dirty.
+        let mut wb_guard =
+            WritebackGuard::new(cache.clone(), page_index, entry.clone(), page.clone());
+
         let _invalidate = cache.invalidate_read();
         let inode = cache
             .inode()
@@ -834,8 +897,10 @@ impl PageCacheManager {
                     Mutex::new(FilePrivateData::Unused).lock(),
                 )
             };
+            wb_guard.disarm();
             Self::finish_writeback_entry(cache.clone(), page_index, entry, page, result.map(|_| ()))
         } else {
+            wb_guard.disarm();
             Self::finish_writeback_entry(cache.clone(), page_index, entry, page, Ok(()))
         }
     }
@@ -1098,6 +1163,11 @@ impl PageCache {
     #[allow(unused)]
     pub fn id(&self) -> usize {
         self.id
+    }
+
+    /// Fast check for dirty pages (no full dirty-set traversal, just emptiness test).
+    pub fn has_dirty_pages(&self) -> bool {
+        !self.inner.lock().dirty_pages.is_empty()
     }
 
     pub fn inode(&self) -> Option<Weak<dyn IndexNode>> {

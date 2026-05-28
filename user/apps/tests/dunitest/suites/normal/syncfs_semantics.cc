@@ -40,6 +40,14 @@ namespace {
 #define MS_REC 16384
 #endif
 
+#ifndef MS_PRIVATE
+#define MS_PRIVATE (1 << 18)
+#endif
+
+#ifndef MS_SHARED
+#define MS_SHARED (1 << 20)
+#endif
+
 int EnsureDir(const char* path) {
     struct stat st;
     if (stat(path, &st) == 0) {
@@ -232,6 +240,71 @@ TEST(SyncUmountLifetime, ConcurrentSyncAndUnmountPrivateRamfs) {
         ASSERT_EQ(0, umount_ret) << "umount failed: " << strerror(errno);
     }
 
+    rmdir(mountpoint);
+    rmdir(root);
+}
+
+// Verify that umount under shared mount propagation does not deadlock.
+// Call chain triggered by this test:
+//   umount() -> propagate_umount() -> umount_at_peer()
+// Before the fix, umount_at_peer called sync_filesystem() on a child sharing the
+// same umount_lock, causing a same-thread self-deadlock (writer trying to acquire reader).
+TEST(SyncUmountLifetime, SharedMountPropagationUmountNoDeadlock) {
+    const char* root = "/tmp/dunitest_shared_umount";
+    const char* mountpoint = "/tmp/dunitest_shared_umount/mnt";
+    const char* file_path = "/tmp/dunitest_shared_umount/mnt/file";
+
+    ASSERT_EQ(0, EnsureDir("/tmp")) << strerror(errno);
+    ASSERT_EQ(0, EnsureDir(root)) << strerror(errno);
+    ASSERT_EQ(0, EnsureDir(mountpoint)) << strerror(errno);
+
+    // Enter a new mount namespace to avoid affecting other tests.
+    if (unshare(CLONE_NEWNS) != 0) {
+        GTEST_SKIP() << "unshare(CLONE_NEWNS) failed: " << strerror(errno);
+    }
+
+    // Mark root as shared so subsequent mounts inherit shared propagation.
+    if (mount(NULL, "/", NULL, MS_REC | MS_SHARED, NULL) != 0) {
+        // Skip (not fail) if MS_SHARED is unsupported.
+        GTEST_SKIP() << "mount --make-rshared failed: " << strerror(errno);
+    }
+
+    for (int i = 0; i < 4; ++i) {
+        if (mount("", mountpoint, "ramfs", 0, NULL) != 0) {
+            GTEST_SKIP() << "mount ramfs failed: " << strerror(errno);
+        }
+
+        // Write data to produce dirty pages, ensuring sync has real work during umount.
+        int fd = open(file_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        if (fd >= 0) {
+            write(fd, "shared-propagation-test", 23);
+            close(fd);
+        }
+
+        // Concurrent sync + umount: if a deadlock exists, this will hang forever.
+        std::atomic<bool> stop{false};
+        std::thread sync_thread([&stop]() {
+            while (!stop.load(std::memory_order_relaxed)) {
+                sync();
+                sched_yield();
+            }
+        });
+
+        usleep(500);
+        int ret = umount(mountpoint);
+        int saved = errno;
+        stop.store(true, std::memory_order_relaxed);
+        sync_thread.join();
+
+        // umount should succeed (or EINVAL if already removed by propagation).
+        if (ret != 0 && saved != EINVAL) {
+            errno = saved;
+            FAIL() << "umount failed on iteration " << i << ": " << strerror(errno);
+        }
+    }
+
+    // Restore to private to avoid affecting subsequent tests.
+    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
     rmdir(mountpoint);
     rmdir(root);
 }

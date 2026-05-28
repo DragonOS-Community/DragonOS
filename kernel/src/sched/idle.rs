@@ -20,7 +20,7 @@ impl Scheduler for IdleScheduler {
 
     fn yield_task(_rq: &mut super::CpuRunQueue) {}
 
-    fn check_preempt_currnet(
+    fn check_preempt_current(
         rq: &mut super::CpuRunQueue,
         _pcb: &alloc::sync::Arc<crate::process::ProcessControlBlock>,
         _flags: super::WakeupFlags,

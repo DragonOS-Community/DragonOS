@@ -466,7 +466,7 @@ impl KernelThreadMechanism {
 
         ProcessManager::wakeup(pcb).ok();
 
-        if let ProcessState::Exited(code) = pcb.sched_info().inner_lock_read_irqsave().state() {
+        if let ProcessState::Exited(code) = pcb.sched_info().state() {
             return Ok(code);
         }
 
@@ -477,13 +477,7 @@ impl KernelThreadMechanism {
             .as_ref()
             .and_then(|x| x.kernel_thread())
             .map(|x| x.result())
-            .unwrap_or_else(|| {
-                pcb.sched_info()
-                    .inner_lock_read_irqsave()
-                    .state()
-                    .exit_code()
-                    .unwrap_or(0)
-            });
+            .unwrap_or_else(|| pcb.sched_info().state().exit_code().unwrap_or(0));
         Ok(result)
     }
 

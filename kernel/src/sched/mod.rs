@@ -27,7 +27,7 @@ use alloc::{
 use system_error::SystemError;
 
 use crate::{
-    arch::{cpu::current_cpu_id, interrupt::ipi::send_ipi, CurrentIrqArch},
+    arch::{cpu::current_cpu_id, interrupt::ipi::send_ipi, ipc::signal::Signal, CurrentIrqArch},
     exception::{
         ipi::{IpiKind, IpiTarget},
         InterruptArch,
@@ -95,7 +95,7 @@ fn task_is_idle(pcb: &Arc<ProcessControlBlock>) -> bool {
 }
 
 #[inline]
-fn rq_is_idle_cpu(rq: &CpuRunQueue) -> bool {
+pub(crate) fn rq_is_idle_cpu(rq: &CpuRunQueue) -> bool {
     task_is_idle(&rq.current()) && rq.nr_running == 0
 }
 
@@ -187,19 +187,20 @@ fn select_least_loaded_cpu(allowed: &CpuMask, fallback_cpu: ProcessorId) -> Proc
     best_cpu
 }
 
+/// 选择目标 CPU。调用者必须在 pi_lock 保护下读取 cpus_allowed 并传入，
 pub fn select_task_rq(
     pcb: &Arc<ProcessControlBlock>,
     prev_cpu: ProcessorId,
     wake_flags: WakeupFlags,
+    allowed: &CpuMask,
 ) -> ProcessorId {
-    let allowed = pcb.sched_info().cpus_allowed();
     let current_cpu = smp_get_processor_id();
-    let fallback_cpu = if cpu_allowed_and_online(&allowed, prev_cpu) {
+    let fallback_cpu = if cpu_allowed_and_online(allowed, prev_cpu) {
         prev_cpu
-    } else if cpu_allowed_and_online(&allowed, current_cpu) {
+    } else if cpu_allowed_and_online(allowed, current_cpu) {
         current_cpu
     } else {
-        first_allowed_online_cpu(&allowed)
+        first_allowed_online_cpu(allowed)
             .or_else(|| allowed.iter_cpu().next())
             .unwrap_or(prev_cpu)
     };
@@ -210,16 +211,16 @@ pub fn select_task_rq(
     }
 
     if wake_flags.contains(WakeupFlags::WF_FORK) {
-        return select_fork_idle_cpu(&allowed, fallback_cpu)
-            .unwrap_or_else(|| select_least_loaded_cpu(&allowed, fallback_cpu));
+        return select_fork_idle_cpu(allowed, fallback_cpu)
+            .unwrap_or_else(|| select_least_loaded_cpu(allowed, fallback_cpu));
     }
 
     if wake_flags.contains(WakeupFlags::WF_TTWU) {
-        if let Some(idle_cpu) = pick_idle_cpu(&allowed) {
+        if let Some(idle_cpu) = pick_idle_cpu(allowed) {
             return idle_cpu;
         }
 
-        return select_least_loaded_cpu(&allowed, fallback_cpu);
+        return select_least_loaded_cpu(allowed, fallback_cpu);
     }
 
     fallback_cpu
@@ -252,7 +253,7 @@ pub trait Scheduler {
     fn yield_task(rq: &mut CpuRunQueue);
 
     /// ## 检查进入可运行状态的任务能否抢占当前正在运行的任务
-    fn check_preempt_currnet(
+    fn check_preempt_current(
         rq: &mut CpuRunQueue,
         pcb: &Arc<ProcessControlBlock>,
         flags: WakeupFlags,
@@ -278,17 +279,38 @@ pub trait Scheduler {
 }
 
 /// 调度策略
+///
+/// 裸字段，由调用者持 rq_lock 或 pi_lock 保护。
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
 pub enum SchedPolicy {
     /// 实时进程
-    RT,
+    RT = 0,
     /// 先进先出调度
-    FIFO,
+    FIFO = 1,
     /// 完全公平调度
-    CFS,
+    CFS = 2,
     /// IDLE
-    IDLE,
+    IDLE = 3,
+}
+
+impl SchedPolicy {
+    #[inline]
+    pub fn to_u8(self) -> u8 {
+        self as u8
+    }
+
+    #[inline]
+    pub fn from_u8(val: u8) -> Self {
+        match val {
+            0 => SchedPolicy::RT,
+            1 => SchedPolicy::FIFO,
+            2 => SchedPolicy::CFS,
+            3 => SchedPolicy::IDLE,
+            _ => panic!("Invalid SchedPolicy value: {val}"),
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -605,15 +627,9 @@ impl CpuRunQueue {
         }
     }
 
-    /// 启用一个任务，将加入队列
+    /// 将任务加入运行队列，设置 on_rq = Queued。
     pub fn activate_task(&mut self, pcb: &Arc<ProcessControlBlock>, mut flags: EnqueueFlag) {
-        let was_idle_cpu = rq_is_idle_cpu(self);
-
-        // 如果进程之前因 IO 等待而睡眠，现在被唤醒，减少 nr_iowait 计数
-        if pcb.flags().contains(ProcessFlags::IN_IOWAIT) {
-            self.nr_iowait.fetch_sub(1, Ordering::Relaxed);
-        }
-
+        // 1. 迁移标志处理
         if *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Migrating {
             flags |= EnqueueFlag::ENQUEUE_MIGRATED;
         }
@@ -622,31 +638,24 @@ impl CpuRunQueue {
             todo!()
         }
 
+        // 2. enqueue_task
         self.enqueue_task(pcb.clone(), flags);
 
+        // 3. 设置 on_rq = Queued
         *pcb.sched_info().on_rq.lock_irqsave() = OnRq::Queued;
-        pcb.sched_info().set_on_cpu(Some(self.cpu));
-
-        if was_idle_cpu && !rq_is_idle_cpu(self) {
-            IDLE_CPUS.clear(self.cpu);
-        }
-
-        debug_assert_eq!(*pcb.sched_info().on_rq.lock_irqsave(), OnRq::Queued);
-        debug_assert_eq!(pcb.sched_info().on_cpu(), Some(self.cpu));
-        pcb.debug_assert_fork_cpu_binding();
     }
 
     /// 检查对应的task是否可以抢占当前运行的task
     #[allow(clippy::comparison_chain)]
-    pub fn check_preempt_currnet(&mut self, pcb: &Arc<ProcessControlBlock>, flags: WakeupFlags) {
+    pub fn check_preempt_current(&mut self, pcb: &Arc<ProcessControlBlock>, flags: WakeupFlags) {
         if pcb.sched_info().policy() == self.current().sched_info().policy() {
             match self.current().sched_info().policy() {
                 SchedPolicy::CFS => {
-                    CompletelyFairScheduler::check_preempt_currnet(self, pcb, flags)
+                    CompletelyFairScheduler::check_preempt_current(self, pcb, flags)
                 }
-                SchedPolicy::FIFO => FifoScheduler::check_preempt_currnet(self, pcb, flags),
+                SchedPolicy::FIFO => FifoScheduler::check_preempt_current(self, pcb, flags),
                 SchedPolicy::RT => todo!(),
-                SchedPolicy::IDLE => IdleScheduler::check_preempt_currnet(self, pcb, flags),
+                SchedPolicy::IDLE => IdleScheduler::check_preempt_current(self, pcb, flags),
             }
         } else if pcb.sched_info().policy() < self.current().sched_info().policy() {
             // 调度优先级更高
@@ -690,9 +699,9 @@ impl CpuRunQueue {
         } else if next_policy == current_policy {
             match current_policy {
                 SchedPolicy::CFS => {}
-                SchedPolicy::FIFO => FifoScheduler::check_preempt_currnet(self, pcb, flags),
+                SchedPolicy::FIFO => FifoScheduler::check_preempt_current(self, pcb, flags),
                 SchedPolicy::RT => todo!(),
-                SchedPolicy::IDLE => IdleScheduler::check_preempt_currnet(self, pcb, flags),
+                SchedPolicy::IDLE => IdleScheduler::check_preempt_current(self, pcb, flags),
             }
         }
 
@@ -704,25 +713,9 @@ impl CpuRunQueue {
         }
     }
 
-    /// 禁用一个任务，将离开队列
+    /// 设置 on_rq，将任务移出运行队列
     pub fn deactivate_task(&mut self, pcb: Arc<ProcessControlBlock>, flags: DequeueFlag) {
-        if flags.contains(DequeueFlag::DEQUEUE_SLEEP)
-            && matches!(
-                pcb.sched_info().inner_lock_read_irqsave().state(),
-                ProcessState::Blocked(false)
-            )
-        {
-            self.nr_uninterruptible += 1;
-            loadavg::inc_nr_uninterruptible(1);
-        }
-
-        // 如果进程因 IO 等待而睡眠，增加 nr_iowait 计数
-        if flags.contains(DequeueFlag::DEQUEUE_SLEEP)
-            && pcb.flags().contains(ProcessFlags::IN_IOWAIT)
-        {
-            self.nr_iowait.fetch_add(1, Ordering::Relaxed);
-        }
-
+        // 1. 根据标志设置 on_rq 状态
         *pcb.sched_info().on_rq.lock_irqsave() =
             if flags.intersects(DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_STOPPED) {
                 OnRq::None
@@ -730,6 +723,7 @@ impl CpuRunQueue {
                 OnRq::Migrating
             };
 
+        // 2. dequeue_task
         self.dequeue_task(pcb, flags);
     }
 
@@ -742,6 +736,10 @@ impl CpuRunQueue {
     #[inline]
     pub fn nr_iowait(&self) -> usize {
         self.nr_iowait.load(Ordering::Relaxed)
+    }
+
+    pub fn dec_nr_iowait(&self) {
+        self.nr_iowait.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// 更新rq时钟
@@ -901,11 +899,7 @@ impl CpuRunQueue {
 
         if next.is_none()
             && !task_is_idle(&prev)
-            && prev
-                .sched_info()
-                .inner_lock_read_irqsave()
-                .state()
-                .is_runnable()
+            && prev.sched_info().state().is_runnable()
             && *prev.sched_info().on_rq.lock_irqsave() == OnRq::Queued
         {
             next = Some(prev.clone());
@@ -1118,9 +1112,7 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
         Some(current) => current,
         None => {
             let prev = rq.current();
-            if let ProcessState::Exited(_) =
-                prev.clone().sched_info().inner_lock_read_irqsave().state()
-            {
+            if let ProcessState::Exited(_) = prev.clone().sched_info().state() {
                 // 从exit进的Schedule
                 ProcessManager::current_pcb()
             } else {
@@ -1132,6 +1124,9 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
     // TODO: hrtick_clear(rq);
 
     let (rq, guard) = rq.self_lock();
+    // 对标 Linux __schedule() rq_lock 后的 smp_mb__after_spinlock()：
+    // x86_64 (TSO) 上 spinlock 已含 full barrier，此处为冗余；RISC-V 上必要。
+    fence(Ordering::SeqCst);
 
     rq.clock_updata_flags = ClockUpdataFlag::from_bits_truncate(rq.clock_updata_flags.bits() << 1);
 
@@ -1193,14 +1188,52 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
     //         .collect::<Vec<_>>(),
     // );
 
-    if !sched_mod.contains(SchedMode::SM_MASK_PREEMPT)
-        && prev.sched_info().policy() != SchedPolicy::IDLE
-        && prev.sched_info().inner_lock_read_irqsave().is_mark_sleep()
+    // 对标 Linux __schedule() 的 prev_state 检查：
+    //   Linux 条件: (!(sched_mode & SM_MASK_PREEMPT) && prev_state)
+    //   ——非抢占 + prev 非 RUNNING 时进入 deactivate 分支。
+    //
+    // DragonOS 扩展：SM_PREEMPT 路径也需处理非 runnable 的 prev，
+    // 因为异步 stop_task() 可在发送端上下文将远端 current 设为 Stopped（仅 kick 不 dequeue），
+    // 导致远端 IPI 退出时 prev 已非 runnable 但仍在 runqueue 上。
+    // 此时必须在这里完成唯一一次出队。
+    //
+    // on_rq == Queued 守卫保证 deactivate 幂等：
+    //   若 stop_task 已出队（!is_current 分支），此处 on_rq != Queued，跳过。
+    //   若 stop_task 未出队（远端 current 分支），此处 on_rq == Queued，执行出队。
     {
-        rq.deactivate_task(
-            prev.clone(),
-            DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
-        );
+        let prev_state = prev.sched_info().state();
+        if !prev_state.is_runnable() {
+            let interruptible = prev_state.is_blocked_interruptable();
+            let wake_kill = prev_state.is_stopped();
+
+            // signal_pending_state 仅对 SM_NONE（自愿调度）生效：
+            //   TASK_INTERRUPTIBLE → 有任意信号 → 恢复 RUNNING
+            //   TASK_STOPPED       → 仅 SIGKILL → 恢复 RUNNING
+            //   TASK_UNINTERRUPTIBLE → 不检查信号，直接 deactivate
+            // SM_PREEMPT（被抢占）不检查信号，因为异步 stop 不应被信号恢复。
+            let signal_wake = !sched_mod.contains(SchedMode::SM_MASK_PREEMPT)
+                && Signal::signal_pending_state(interruptible, wake_kill, &prev);
+
+            if signal_wake {
+                prev.sched_info().set_state(ProcessState::Runnable);
+            } else if *prev.sched_info().on_rq.lock_irqsave() == OnRq::Queued {
+                // sched_contributes_to_load 在 deactivate_task 之前
+                if matches!(prev_state, ProcessState::Blocked(false)) {
+                    rq.nr_uninterruptible += 1;
+                    loadavg::inc_nr_uninterruptible(1);
+                }
+
+                rq.deactivate_task(
+                    prev.clone(),
+                    DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
+                );
+
+                // nr_iowait++ 在 deactivate_task 之后
+                if prev.flags().contains(ProcessFlags::IN_IOWAIT) {
+                    rq.nr_iowait.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
     }
 
     let next = rq.pick_next_task(prev.clone());
@@ -1252,19 +1285,23 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
 }
 
 pub fn sched_fork(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
-    let mut prio_guard = pcb.sched_info().prio_data.write_irqsave();
     let current = ProcessManager::current_pcb();
+    let fork_prio = current.sched_info().normal_prio();
 
-    prio_guard.prio = current.sched_info().prio_data.read_irqsave().normal_prio;
+    // 子进程是 TASK_NEW，不可见。可以直接写裸字段
+    // 子进程继承父进程的 prio、static_prio、normal_prio
+    pcb.sched_info().set_prio(fork_prio);
+    pcb.sched_info()
+        .set_static_prio(current.sched_info().static_prio());
+    pcb.sched_info().set_normal_prio(fork_prio);
 
-    if PrioUtil::dl_prio(prio_guard.prio) {
+    if PrioUtil::dl_prio(fork_prio) {
         return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-    } else if PrioUtil::rt_prio(prio_guard.prio) {
-        let policy = &pcb.sched_info().sched_policy;
-        *policy.write_irqsave() = SchedPolicy::RT;
+    } else if PrioUtil::rt_prio(fork_prio) {
+        // 子进程继承父进程的调度策略（FIFO/RR），而非统一设为 RT
+        pcb.sched_info().set_policy(current.sched_info().policy());
     } else {
-        let policy = &pcb.sched_info().sched_policy;
-        *policy.write_irqsave() = SchedPolicy::CFS;
+        pcb.sched_info().set_policy(SchedPolicy::CFS);
     }
 
     pcb.sched_info()
@@ -1311,12 +1348,15 @@ pub fn rebind_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {
     pcb.sched_info().set_on_cpu(Some(cpu));
 }
 
+/// 对标 Linux ttwu_queue + ttwu_do_activate
 pub fn enqueue_task_on_cpu(
     pcb: &Arc<ProcessControlBlock>,
     target_cpu: ProcessorId,
     wake_flags: WakeupFlags,
+    was_uninterruptible: bool,
 ) {
     __set_task_cpu(pcb, target_cpu);
+    pcb.sched_info().set_on_cpu(Some(target_cpu));
 
     let rq = cpu_rq(target_cpu.data() as usize);
     let update_clock = target_cpu == smp_get_processor_id();
@@ -1326,13 +1366,23 @@ pub fn enqueue_task_on_cpu(
         rq.update_rq_clock();
     }
 
+    if was_uninterruptible {
+        rq.dec_nr_uninterruptible();
+    }
+
+    let was_idle = rq_is_idle_cpu(rq);
+
     rq.activate_task(
         pcb,
         EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK,
     );
 
+    if was_idle && !rq_is_idle_cpu(rq) {
+        IDLE_CPUS.clear(target_cpu);
+    }
+
     if update_clock {
-        rq.check_preempt_currnet(pcb, wake_flags);
+        rq.check_preempt_current(pcb, wake_flags);
     } else {
         rq.check_preempt_remote(pcb, wake_flags);
     }
@@ -1387,7 +1437,7 @@ pub fn request_task_migration(
         pcb.sched_info().set_on_cpu(None);
         drop(_guard);
 
-        enqueue_task_on_cpu(pcb, dest_cpu, WakeupFlags::WF_MIGRATED);
+        enqueue_task_on_cpu(pcb, dest_cpu, WakeupFlags::WF_MIGRATED, false);
         return Ok(());
     }
 

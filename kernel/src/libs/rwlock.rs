@@ -176,10 +176,13 @@ impl<T> RwLock<T> {
     }
 
     /// 关中断并获取读者守卫
+    ///
+    /// 等价于 Linux `__raw_read_lock_irqsave`：先关 IRQ 再关抢占，自旋期间两者始终关闭。
     pub fn read_irqsave(&self) -> RwLockReadGuard<'_, T> {
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        ProcessManager::preempt_disable();
         loop {
-            let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-            match self.try_read() {
+            match self.inner_try_read() {
                 Some(mut guard) => {
                     guard.irq_guard = Some(irq_guard);
                     return guard;
@@ -240,8 +243,8 @@ impl<T> RwLock<T> {
     #[allow(dead_code)]
     #[inline]
     pub fn try_write_irqsave(&self) -> Option<RwLockWriteGuard<'_, T>> {
-        ProcessManager::preempt_disable();
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        ProcessManager::preempt_disable();
         let r = self.inner_try_write().map(|mut g| {
             g.irq_guard = Some(irq_guard);
             g
@@ -286,10 +289,13 @@ impl<T> RwLock<T> {
     #[allow(dead_code)]
     #[inline]
     /// @brief 获取WRITER守卫并关中断
+    ///
+    /// 等价于 Linux `__raw_write_lock_irqsave`：先关 IRQ 再关抢占，自旋期间两者始终关闭。
     pub fn write_irqsave(&self) -> RwLockWriteGuard<'_, T> {
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        ProcessManager::preempt_disable();
         loop {
-            let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-            match self.try_write() {
+            match self.inner_try_write() {
                 Some(mut guard) => {
                     guard.irq_guard = Some(irq_guard);
                     return guard;
@@ -353,11 +359,14 @@ impl<T> RwLock<T> {
     }
 
     #[inline]
-    /// @brief 获得UPGRADER守卫
+    /// @brief 获得UPGRADER守卫并关中断
+    ///
+    /// 等价于 Linux irqsave 模式：先关 IRQ 再关抢占，自旋期间两者始终关闭。
     pub fn upgradeable_read_irqsave(&self) -> RwLockUpgradableGuard<'_, T> {
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        ProcessManager::preempt_disable();
         loop {
-            let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-            match self.try_upgradeable_read() {
+            match self.inner_try_upgradeable_read() {
                 Some(mut guard) => {
                     guard.irq_guard = Some(irq_guard);
                     return guard;
@@ -507,8 +516,13 @@ impl<'rwlock, T> RwLockUpgradableGuard<'rwlock, T> {
 
         let inner: &RwLock<T> = self.inner;
         let irq_guard = self.irq_guard.take();
-        // 自动移去UPGRADED比特位
-        mem::drop(self);
+
+        // 手动清除 UPGRADED 位（UpgradableGuard::drop 会做这件事）
+        inner.lock.fetch_and(!UPGRADED, Ordering::Release);
+
+        // forget self 以跳过 UpgradableGuard::drop 中的 preempt_enable
+        // 新的 ReadGuard 接管 preempt_count 所有权
+        mem::forget(self);
 
         RwLockReadGuard {
             data: unsafe { &*inner.data.get() },
@@ -558,11 +572,18 @@ impl<'rwlock, T> RwLockWriteGuard<'rwlock, T> {
         while self.inner.current_reader().is_err() {
             spin_loop();
         }
-        //本质上来说绝对保证没有任何读者
 
         let inner = self.inner;
         let irq_guard = self.irq_guard.take();
-        mem::drop(self);
+
+        // 手动清除 WRITER | UPGRADED 位（WriteGuard::drop 会做这件事）
+        inner
+            .lock
+            .fetch_and(!(WRITER | UPGRADED), Ordering::Release);
+
+        // forget self 以跳过 WriteGuard::drop 中的 preempt_enable
+        // 新的 ReadGuard 接管 preempt_count 所有权
+        mem::forget(self);
 
         return RwLockReadGuard {
             data: unsafe { &*inner.data.get() },
@@ -629,6 +650,8 @@ impl<T> Drop for RwLockReadGuard<'_, T> {
     fn drop(&mut self) {
         debug_assert!(self.lock.load(Ordering::Relaxed) & !(WRITER | UPGRADED) > 0);
         self.lock.fetch_sub(READER, Ordering::Release);
+        // 先恢复中断，再启用抢占
+        self.irq_guard.take();
         ProcessManager::preempt_enable();
     }
 }
@@ -639,9 +662,10 @@ impl<T> Drop for RwLockUpgradableGuard<'_, T> {
             self.inner.lock.load(Ordering::Relaxed) & (WRITER | UPGRADED),
             UPGRADED
         );
-        self.inner.lock.fetch_sub(UPGRADED, Ordering::AcqRel);
+        self.inner.lock.fetch_and(!UPGRADED, Ordering::Release);
+        // 先恢复中断，再启用抢占
+        self.irq_guard.take();
         ProcessManager::preempt_enable();
-        //这里为啥要AcqRel? Release应该就行了?
     }
 }
 
@@ -651,6 +675,7 @@ impl<T> Drop for RwLockWriteGuard<'_, T> {
         self.inner
             .lock
             .fetch_and(!(WRITER | UPGRADED), Ordering::Release);
+        // 先恢复中断，再启用抢占
         self.irq_guard.take();
         ProcessManager::preempt_enable();
     }

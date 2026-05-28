@@ -59,12 +59,9 @@ impl StatusFileOps {
             )
         };
 
-        let state = {
-            let sched_info = pcb.sched_info();
-            sched_info.inner_lock_read_irqsave().state()
-        };
-        let cpu_id = pcb
-            .sched_info()
+        let sched_info_guard = pcb.sched_info();
+        let state = sched_info_guard.state();
+        let cpu_id = sched_info_guard
             .on_cpu()
             .map(|cpu| cpu.data() as i32)
             .unwrap_or(-1);
@@ -134,11 +131,6 @@ impl StatusFileOps {
         pdata.append(&mut format!("\nKthread:\t{}", pcb.is_kthread() as usize).into());
         pdata.append(&mut format!("\ncpu_id:\t{}", cpu_id).as_bytes().to_owned());
         pdata.append(&mut format!("\npriority:\t{:?}", priority).as_bytes().to_owned());
-        pdata.append(
-            &mut format!("\npreempt:\t{}", pcb.preempt_count())
-                .as_bytes()
-                .to_owned(),
-        );
 
         pdata.append(&mut format!("\nvrtime:\t{}", vrtime).as_bytes().to_owned());
 

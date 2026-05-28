@@ -36,3 +36,4 @@ normal/tty_tcflush
 normal/signal_fpstate_sigreturn
 normal/general_protection_signal
 normal/seccomp
+normal/process_signal_fork

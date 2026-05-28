@@ -18,9 +18,9 @@ SERIAL_FILE="serial_opt.txt"
 # 超时配置（秒）
 BOOT_TIMEOUT=300        # DragonOS开机超时（5分钟）
 TEST_START_TIMEOUT=600  # 测试程序启动超时（10分钟）
-TEST_TIMEOUT=${TEST_TIMEOUT:-1800}              # 整个测试超时（30分钟）
-IDLE_TIMEOUT=${IDLE_TIMEOUT:-300}               # 无输出超时（5分钟）
-SINGLE_TEST_TIMEOUT=${SINGLE_TEST_TIMEOUT:-300} # 单个测试用例超时（5分钟）
+TEST_TIMEOUT=1800       # 整个测试超时（30分钟）
+IDLE_TIMEOUT=120        # 无输出超时（5分钟）
+SINGLE_TEST_TIMEOUT=60 # 单个测试用例超时（1分钟）
 
 # 从PID文件读取QEMU进程
 get_qemu_pid() {

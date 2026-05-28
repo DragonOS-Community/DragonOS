@@ -1211,7 +1211,6 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
         IDLE_CPUS.clear(rq.cpu);
     }
 
-    let had_need_schedule = prev.flags().contains(ProcessFlags::NEED_SCHEDULE);
     prev.flags().remove(ProcessFlags::NEED_SCHEDULE);
     fence(Ordering::SeqCst);
     if likely(!Arc::ptr_eq(&prev, &next)) {
@@ -1237,9 +1236,10 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
             migrate_prev_to.is_none(),
             "current task migration must switch away from the migrated task"
         );
-        // A tick preempt request may pick the same task again. Preserve rseq's
-        // preempt notification semantics for that return-to-user boundary.
-        if sched_mod.contains(SchedMode::SM_MASK_PREEMPT) && had_need_schedule {
+        // A tick preempt request may pick the same task again. It still reached
+        // the scheduler from a preemptible return-to-user boundary, so rseq must
+        // observe a bounded preempt event even when no other entity is chosen.
+        if sched_mod.contains(SchedMode::SM_MASK_PREEMPT) {
             crate::process::rseq::Rseq::on_preempt(&prev);
         }
         drop(guard);

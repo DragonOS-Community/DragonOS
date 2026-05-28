@@ -476,7 +476,10 @@ impl RawSocket {
             loop {
                 match self.try_recv(&mut tmp) {
                     Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                        wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
+                        self.wait_queue.wait_event_io_interruptible_timeout(
+                            || self.can_recv(),
+                            self.recv_timeout(),
+                        )?;
                     }
                     other => break other,
                 }
@@ -535,7 +538,10 @@ impl RawSocket {
             loop {
                 match self.try_recv_user(buffer) {
                     Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                        wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
+                        self.wait_queue.wait_event_io_interruptible_timeout(
+                            || self.can_recv(),
+                            self.recv_timeout(),
+                        )?;
                     }
                     result => return result.map(|(len, _)| len),
                 }
@@ -564,7 +570,10 @@ impl RawSocket {
             loop {
                 match self.try_recv_user(buffer) {
                     Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                        wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
+                        self.wait_queue.wait_event_io_interruptible_timeout(
+                            || self.can_recv(),
+                            self.recv_timeout(),
+                        )?;
                     }
                     result => {
                         return result.map(|(len, addr)| {

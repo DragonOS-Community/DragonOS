@@ -7,7 +7,7 @@ use system_error::SystemError;
 
 use crate::{
     libs::once::Once,
-    process::{cred::Cred, ProcessManager},
+    process::{cred::Cred, namespace::pid_namespace::INIT_PID_NAMESPACE, ProcessManager},
 };
 
 use super::vfs::mount::{MountFlags, MountPath};
@@ -76,7 +76,7 @@ pub fn procfs_init() -> Result<(), SystemError> {
     INIT.call_once(|| {
         ::log::info!("Initializing ProcFS...");
         // 创建 procfs 实例
-        let procfs: Arc<ProcFS> = ProcFS::new();
+        let procfs: Arc<ProcFS> = ProcFS::new(INIT_PID_NAMESPACE.clone());
         let root_inode = ProcessManager::current_mntns().root_inode();
         // procfs 挂载
         let mntfs = root_inode

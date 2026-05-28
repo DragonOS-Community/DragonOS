@@ -17,7 +17,6 @@ use crate::{
 /// siginfo中的si_code的可选值
 /// 请注意，当这个值小于0时，表示siginfo来自用户态，否则来自内核态
 #[derive(Copy, Debug, Clone, PartialEq, Eq)]
-#[repr(i32)]
 pub enum SigCode {
     /// sent by kill, sigsend, raise
     User = 0,
@@ -35,6 +34,8 @@ pub enum SigCode {
     PollHup = 6,
     /// sent by kernel from somewhere
     Kernel = 0x80,
+    /// SIGSYS sent by seccomp filter action SECCOMP_RET_TRAP.
+    SysSeccomp,
     /// 通过sigqueue发送
     Queue = -1,
     /// 定时器过期时发送
@@ -50,6 +51,26 @@ pub enum SigCode {
 }
 
 impl SigCode {
+    pub fn as_i32(self) -> i32 {
+        match self {
+            Self::User => 0,
+            Self::PollIn => 1,
+            Self::PollOut => 2,
+            Self::PollMsg => 3,
+            Self::PollErr => 4,
+            Self::PollPri => 5,
+            Self::PollHup => 6,
+            Self::Kernel => 0x80,
+            Self::SysSeccomp => 1,
+            Self::Queue => -1,
+            Self::Timer => -2,
+            Self::Mesgq => -3,
+            Self::AsyncIO => -4,
+            Self::SigIO => -5,
+            Self::Tkill => -6,
+        }
+    }
+
     pub fn try_from_i32(x: i32) -> Option<SigCode> {
         match x {
             0 => Some(Self::User),
@@ -517,7 +538,7 @@ impl SigInfo {
             SigType::Kill { pid, uid } => PosixSigInfo {
                 si_signo: self.sig_no,
                 si_errno: self.errno,
-                si_code: self.sig_code as i32,
+                si_code: self.sig_code.as_i32(),
                 _sifields: PosixSiginfoFields {
                     _kill: PosixSiginfoKill {
                         si_pid: pid.data() as i32,
@@ -528,7 +549,7 @@ impl SigInfo {
             SigType::Rt { pid, uid, sigval } => PosixSigInfo {
                 si_signo: self.sig_no,
                 si_errno: self.errno,
-                si_code: self.sig_code as i32,
+                si_code: self.sig_code.as_i32(),
                 _sifields: PosixSiginfoFields {
                     _rt: PosixSiginfoRt {
                         si_pid: pid.data() as i32,
@@ -540,7 +561,7 @@ impl SigInfo {
             SigType::Alarm(pid) => PosixSigInfo {
                 si_signo: self.sig_no,
                 si_errno: self.errno,
-                si_code: self.sig_code as i32,
+                si_code: self.sig_code.as_i32(),
                 _sifields: PosixSiginfoFields {
                     _timer: PosixSiginfoTimer {
                         si_tid: pid.data() as i32,
@@ -556,7 +577,7 @@ impl SigInfo {
             } => PosixSigInfo {
                 si_signo: self.sig_no,
                 si_errno: self.errno,
-                si_code: self.sig_code as i32,
+                si_code: self.sig_code.as_i32(),
                 _sifields: PosixSiginfoFields {
                     _timer: PosixSiginfoTimer {
                         si_tid: timerid,
@@ -568,11 +589,27 @@ impl SigInfo {
             SigType::SigPoll { fd, band } => PosixSigInfo {
                 si_signo: self.sig_no,
                 si_errno: self.errno,
-                si_code: self.sig_code as i32,
+                si_code: self.sig_code.as_i32(),
                 _sifields: PosixSiginfoFields {
                     _sigpoll: PosixSiginfoSigpoll {
                         si_band: band,
                         si_fd: fd,
+                    },
+                },
+            },
+            SigType::SigSys {
+                call_addr,
+                syscall,
+                arch,
+            } => PosixSigInfo {
+                si_signo: self.sig_no,
+                si_errno: self.errno,
+                si_code: self.sig_code.as_i32(),
+                _sifields: PosixSiginfoFields {
+                    _sigsys: PosixSiginfoSigsys {
+                        _call_addr: call_addr,
+                        _syscall: syscall,
+                        _arch: arch,
                     },
                 },
             },
@@ -629,6 +666,12 @@ pub enum SigType {
     SigPoll {
         fd: i32,
         band: i64,
+    },
+    /// SIGSYS/SYS_SECCOMP seccomp trap siginfo payload.
+    SigSys {
+        call_addr: u64,
+        syscall: i32,
+        arch: u32,
     },
     // 后续完善下列中的具体字段
     // Timer,

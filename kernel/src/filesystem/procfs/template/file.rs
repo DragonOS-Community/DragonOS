@@ -66,12 +66,6 @@ impl<F: FileOps> ProcFile<F> {
 
 /// FileOps trait 定义了 procfs 文件需要实现的操作
 pub trait FileOps: Sync + Send + Sized + Debug {
-    /// 打开文件并初始化私有数据（默认初始化为 procfs 私有数据）。
-    fn open(&self, data: &mut FilePrivateData, _flags: &FileFlags) -> Result<(), SystemError> {
-        *data = FilePrivateData::Procfs(ProcfsFilePrivateData::new());
-        Ok(())
-    }
-
     /// 从文件的指定偏移量读取数据
     ///
     /// # 参数
@@ -112,6 +106,11 @@ pub trait FileOps: Sync + Send + Sized + Debug {
         Err(SystemError::EPERM)
     }
 
+    /// 打开文件时调用，可用于按 open 时上下文初始化 procfs 私有数据
+    fn open(&self, _data: &mut MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
+        Ok(())
+    }
+
     /// 返回动态 owner（用于 /proc/<pid> 等需要实时 UID/GID 的场景）
     fn owner(&self) -> Option<(usize, usize)> {
         None
@@ -142,7 +141,6 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
         buf: &mut [u8],
         data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        // log::info!("ProcFile read_at called");
         self.inner.read_at(offset, len, buf, data)
     }
 
@@ -167,9 +165,11 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
     fn open(
         &self,
         mut data: MutexGuard<FilePrivateData>,
-        flags: &FileFlags,
+        _flags: &FileFlags,
     ) -> Result<(), SystemError> {
-        self.inner.open(&mut data, flags)
+        // 设置 procfs 私有数据，使得 lseek(SEEK_END) 返回 EINVAL
+        *data = FilePrivateData::Procfs(ProcfsFilePrivateData::new());
+        self.inner.open(&mut data)
     }
 
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {

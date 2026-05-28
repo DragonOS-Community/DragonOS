@@ -151,28 +151,21 @@ impl super::TcpSocket {
     /// Helper to write a u32 value to an option buffer.
     #[inline]
     fn write_u32_opt(value: &mut [u8], v: u32) -> Result<usize, SystemError> {
-        if value.len() < 4 {
-            return Err(SystemError::EINVAL);
-        }
-        value[..4].copy_from_slice(&v.to_ne_bytes());
-        Ok(4)
+        Ok(crate::net::socket::common::write_u32_getsockopt(value, v))
     }
 
     /// Helper to write an i32 value to an option buffer.
     #[inline]
     fn write_i32_opt(value: &mut [u8], v: i32) -> Result<usize, SystemError> {
-        Self::write_u32_opt(value, v as u32)
+        Ok(crate::net::socket::common::write_i32_getsockopt(value, v))
     }
 
     /// Helper to write a linger struct (two i32 fields) to an option buffer.
     #[inline]
     fn write_linger_opt(value: &mut [u8], onoff: i32, linger: i32) -> Result<usize, SystemError> {
-        if value.len() < 8 {
-            return Err(SystemError::EINVAL);
-        }
-        value[..4].copy_from_slice(&onoff.to_ne_bytes());
-        value[4..8].copy_from_slice(&linger.to_ne_bytes());
-        Ok(8)
+        Ok(crate::net::socket::common::write_linger_getsockopt(
+            value, onoff, linger,
+        ))
     }
 
     /// Helper to read an atomic usize value and write as u32 to an option buffer.
@@ -559,14 +552,14 @@ impl super::TcpSocket {
                     .send_timeout_us()
                     .load(core::sync::atomic::Ordering::Relaxed);
                 let us = if us == u64::MAX { 0 } else { us };
-                write_timeval_opt(value, us)
+                Ok(write_timeval_opt(value, us))
             }
             PSO::RCVTIMEO_OLD | PSO::RCVTIMEO_NEW => {
                 let us = self
                     .recv_timeout_us()
                     .load(core::sync::atomic::Ordering::Relaxed);
                 let us = if us == u64::MAX { 0 } else { us };
-                write_timeval_opt(value, us)
+                Ok(write_timeval_opt(value, us))
             }
             PSO::RCVLOWAT => {
                 let v = self

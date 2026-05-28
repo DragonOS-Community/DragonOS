@@ -1,3 +1,5 @@
+use core::fmt;
+
 use crate::{
     filesystem::{
         procfs::{
@@ -9,7 +11,11 @@ use crate::{
         },
         vfs::{IndexNode, InodeMode},
     },
-    process::{ProcessControlBlock, ProcessManager, RawPid},
+    process::{
+        namespace::pid_namespace::PidNamespace,
+        pid::{Pid, PidType},
+        ProcessControlBlock, RawPid,
+    },
 };
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
@@ -48,86 +54,158 @@ use statm::StatmFileOps;
 use status::StatusFileOps;
 use task::TaskDirOps;
 
-pub(super) fn find_process_by_vpid(pid: RawPid) -> Option<Arc<ProcessControlBlock>> {
-    ProcessManager::find_task_by_vpid(pid)
+#[derive(Clone)]
+pub(super) struct ProcPidTarget {
+    view_pid_ns: Arc<PidNamespace>,
+    pid: Arc<Pid>,
+}
+
+impl fmt::Debug for ProcPidTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProcPidTarget")
+            .field("vpid", &self.vpid())
+            .field("tgid", &self.tgid())
+            .finish()
+    }
+}
+
+impl ProcPidTarget {
+    pub fn new(view_pid_ns: Arc<PidNamespace>, pid: Arc<Pid>) -> Self {
+        Self { view_pid_ns, pid }
+    }
+
+    pub fn from_tgid_in_ns(view_pid_ns: Arc<PidNamespace>, pid: RawPid) -> Option<Self> {
+        let target_pid = view_pid_ns.find_pid_in_ns(pid)?;
+        target_pid.pid_task(PidType::TGID)?;
+        Some(Self::new(view_pid_ns, target_pid))
+    }
+
+    pub fn from_task(
+        view_pid_ns: Arc<PidNamespace>,
+        task: Arc<ProcessControlBlock>,
+    ) -> Option<Self> {
+        let pid = task.task_pid_ptr(PidType::PID)?;
+        if pid.pid_nr_ns(&view_pid_ns).data() == 0 {
+            return None;
+        }
+        Some(Self::new(view_pid_ns, pid))
+    }
+
+    pub fn view_pid_ns(&self) -> &Arc<PidNamespace> {
+        &self.view_pid_ns
+    }
+
+    pub fn vpid(&self) -> RawPid {
+        self.pid.pid_nr_ns(&self.view_pid_ns)
+    }
+
+    pub fn task(&self) -> Option<Arc<ProcessControlBlock>> {
+        self.pid.pid_task(PidType::PID)
+    }
+
+    pub fn thread_group_leader(&self) -> Option<Arc<ProcessControlBlock>> {
+        let task = self.task()?;
+        let tgid = task.task_pid_ptr(PidType::TGID)?;
+        tgid.pid_task(PidType::TGID)
+    }
+
+    pub fn thread_group_pid(&self) -> Option<Arc<Pid>> {
+        self.thread_group_leader()?.task_pid_ptr(PidType::TGID)
+    }
+
+    pub fn tgid(&self) -> RawPid {
+        self.thread_group_pid()
+            .map(|pid| pid.pid_nr_ns(&self.view_pid_ns))
+            .unwrap_or(RawPid::new(0))
+    }
+
+    fn same_pid_object(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.pid, &other.pid) && Arc::ptr_eq(&self.view_pid_ns, &other.view_pid_ns)
+    }
 }
 
 /// /proc/[pid] 目录的 DirOps 实现
 #[derive(Debug)]
 pub struct PidDirOps {
-    // 存储 PID，用于在需要时查找进程
-    pid: RawPid,
+    target: ProcPidTarget,
 }
 
 impl PidDirOps {
-    pub fn new_inode(pid: RawPid, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcDirBuilder::new(Self { pid }, InodeMode::from_bits_truncate(0o555))
+    pub fn new_inode(target: ProcPidTarget, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcDirBuilder::new(Self { target }, InodeMode::from_bits_truncate(0o555))
             .parent(parent)
-            .volatile() // PID 目录是易失的，因为它们与特定进程关联
+            .volatile()
             .build()
             .unwrap()
     }
 
-    /// 获取进程引用
     fn get_process(&self) -> Option<Arc<ProcessControlBlock>> {
-        find_process_by_vpid(self.pid)
+        self.target.thread_group_leader()
     }
 
-    /// 静态条目表
-    /// 包含 /proc/[pid] 目录下的所有静态文件和目录
+    pub(super) fn is_current_target(&self) -> bool {
+        ProcPidTarget::from_tgid_in_ns(self.target.view_pid_ns().clone(), self.target.vpid())
+            .map(|target| self.target.same_pid_object(&target))
+            .unwrap_or(false)
+    }
+
     #[expect(clippy::type_complexity)]
     const STATIC_ENTRIES: &'static [(
         &'static str,
         fn(&PidDirOps, Weak<dyn IndexNode>) -> Arc<dyn IndexNode>,
     )] = &[
         ("cmdline", |ops, parent| {
-            CmdlineFileOps::new_inode(ops.pid, parent)
+            CmdlineFileOps::new_inode(ops.target.clone(), parent)
         }),
         ("cgroup", |ops, parent| {
-            CgroupFileOps::new_inode(ops.pid, parent)
+            CgroupFileOps::new_inode(ops.target.clone(), parent)
         }),
         ("maps", |ops, parent| {
-            MapsFileOps::new_inode(ops.pid, parent)
+            MapsFileOps::new_inode(ops.target.clone(), parent)
         }),
         ("limits", |ops, parent| {
-            LimitsFile::new_inode(ops.pid, parent)
+            LimitsFile::new_inode(ops.target.clone(), parent)
         }),
         ("mountinfo", |ops, parent| {
-            MountInfoFileOps::new_inode(ops.pid, parent)
+            MountInfoFileOps::new_inode(ops.target.clone(), parent)
         }),
         ("mounts", |ops, parent| {
-            PidMountsFileOps::new_inode(ops.pid, parent)
+            PidMountsFileOps::new_inode(ops.target.clone(), parent)
         }),
         ("mountstats", |ops, parent| {
-            MountStatsFileOps::new_inode(ops.pid, parent)
+            MountStatsFileOps::new_inode(ops.target.clone(), parent)
         }),
-        ("ns", |ops, parent| NsDirOps::new_inode(ops.pid, parent)),
+        ("ns", |ops, parent| {
+            NsDirOps::new_inode(ops.target.clone(), parent)
+        }),
         ("stat", |ops, parent| {
-            StatFileOps::new_inode(ops.pid, parent)
+            StatFileOps::new_inode(ops.target.clone(), parent)
         }),
         ("statm", |ops, parent| {
-            StatmFileOps::new_inode(ops.pid, parent)
+            StatmFileOps::new_inode(ops.target.clone(), parent)
         }),
         ("status", |ops, parent| {
-            StatusFileOps::new_inode(ops.pid, parent)
+            StatusFileOps::new_inode(ops.target.clone(), parent)
         }),
         ("uid_map", |ops, parent| {
-            IdMapFileOps::new_uid_inode(ops.pid, parent)
+            IdMapFileOps::new_uid_inode(ops.target.clone(), parent)
         }),
         ("gid_map", |ops, parent| {
-            IdMapFileOps::new_gid_inode(ops.pid, parent)
+            IdMapFileOps::new_gid_inode(ops.target.clone(), parent)
         }),
         ("setgroups", |ops, parent| {
-            SetgroupsFileOps::new_inode(ops.pid, parent)
+            SetgroupsFileOps::new_inode(ops.target.clone(), parent)
         }),
-        ("task", |ops, parent| TaskDirOps::new_inode(ops.pid, parent)),
-        ("exe", |ops, parent| ExeSymOps::new_inode(ops.pid, parent)),
+        ("task", |ops, parent| {
+            TaskDirOps::new_inode(ops.target.clone(), parent)
+        }),
+        ("exe", |ops, parent| {
+            ExeSymOps::new_inode(ops.target.clone(), parent)
+        }),
         ("fd", |ops, parent| {
-            // fd 目录仍然需要进程引用来列出文件描述符
             if ops.get_process().is_some() {
-                FdDirOps::new_inode(ops.pid, parent)
+                FdDirOps::new_inode(ops.target.clone(), parent)
             } else {
-                // 进程已退出，创建空目录
                 use crate::filesystem::procfs::template::ProcDirBuilder;
 
                 #[derive(Debug)]
@@ -141,9 +219,7 @@ impl PidDirOps {
                         Err(SystemError::ENOENT)
                     }
 
-                    fn populate_children(&self, _dir: &ProcDir<Self>) {
-                        // 空目录，无需填充
-                    }
+                    fn populate_children(&self, _dir: &ProcDir<Self>) {}
                 }
 
                 ProcDirBuilder::new(EmptyDirOps, InodeMode::from_bits_truncate(0o500))
@@ -153,11 +229,9 @@ impl PidDirOps {
             }
         }),
         ("fdinfo", |ops, parent| {
-            // fdinfo 目录也需要进程引用来列出文件描述符
             if ops.get_process().is_some() {
-                FdInfoDirOps::new_inode(ops.pid, parent)
+                FdInfoDirOps::new_inode(ops.target.clone(), parent)
             } else {
-                // 进程已退出，创建空目录
                 use crate::filesystem::procfs::template::ProcDirBuilder;
 
                 #[derive(Debug)]
@@ -171,9 +245,7 @@ impl PidDirOps {
                         Err(SystemError::ENOENT)
                     }
 
-                    fn populate_children(&self, _dir: &ProcDir<Self>) {
-                        // 空目录，无需填充
-                    }
+                    fn populate_children(&self, _dir: &ProcDir<Self>) {}
                 }
 
                 ProcDirBuilder::new(EmptyDirOps, InodeMode::from_bits_truncate(0o500))
@@ -187,7 +259,7 @@ impl PidDirOps {
 
 impl DirOps for PidDirOps {
     fn owner(&self) -> Option<(usize, usize)> {
-        let pcb = find_process_by_vpid(self.pid)?;
+        let pcb = self.target.thread_group_leader()?;
         if pcb.is_kthread() {
             return Some((0, 0));
         }
@@ -202,7 +274,6 @@ impl DirOps for PidDirOps {
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let mut cached_children = dir.cached_children().write();
 
-        // 处理静态条目（包括 fd）
         if let Some(child) =
             lookup_child_from_table(name, &mut cached_children, Self::STATIC_ENTRIES, |f| {
                 (f)(self, dir.self_ref_weak().clone())
@@ -216,11 +287,8 @@ impl DirOps for PidDirOps {
 
     fn populate_children(&self, dir: &ProcDir<Self>) {
         let mut cached_children = dir.cached_children().write();
-
-        // 填充静态条目（包括 fd）
         populate_children_from_table(&mut cached_children, Self::STATIC_ENTRIES, |f| {
             (f)(self, dir.self_ref_weak().clone())
         });
-        // 写锁在这里自动释放
     }
 }

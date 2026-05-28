@@ -4,7 +4,7 @@ use smoltcp;
 use system_error::SystemError;
 
 use crate::{
-    libs::mutex::Mutex, net::socket::inet::common::BoundInner,
+    libs::mutex::Mutex, net::socket::inet::common::BoundInner, net::Iface,
     process::namespace::net_namespace::NetNamespace,
 };
 
@@ -145,9 +145,16 @@ impl UnboundUdp {
         bind_id: usize,
     ) -> Result<BoundUdp, SystemError> {
         let (inner, local_addr) = BoundInner::bind_ephemeral(self.socket, remote, netns)?;
-        let bound_port = inner
+        let bound_port = match inner
             .port_manager()
-            .bind_udp_ephemeral_port(local_addr, reuseaddr, reuseport, bind_id)?;
+            .bind_udp_ephemeral_port(local_addr, reuseaddr, reuseport, bind_id)
+        {
+            Ok(port) => port,
+            Err(e) => {
+                inner.release();
+                return Err(e);
+            }
+        };
         // log::debug!(
         //     "UnboundUdp::bind_ephemeral: allocated ephemeral port {} for remote {:?}",
         //     bound_port,
@@ -161,6 +168,7 @@ impl UnboundUdp {
                 .is_err()
             {
                 inner.port_manager().unbind_udp_port(bound_port, bind_id);
+                inner.release();
                 return Err(SystemError::EINVAL);
             }
         } else if inner
@@ -170,6 +178,50 @@ impl UnboundUdp {
             .is_err()
         {
             inner.port_manager().unbind_udp_port(bound_port, bind_id);
+            inner.release();
+            return Err(SystemError::EINVAL);
+        }
+
+        let port_mgr_ifindex = inner.iface().nic_id();
+        Ok(BoundUdp {
+            inner,
+            remote: Mutex::new(None),
+            explicitly_bound: false,
+            has_preconnect_data: Mutex::new(false),
+            bind_id,
+            port_mgr_ifindex,
+        })
+    }
+
+    pub fn bind_ephemeral_on_iface(
+        self,
+        iface: Arc<dyn Iface>,
+        local_addr: smoltcp::wire::IpAddress,
+        netns: Arc<NetNamespace>,
+        reuseaddr: bool,
+        reuseport: bool,
+        bind_id: usize,
+    ) -> Result<BoundUdp, SystemError> {
+        let inner = BoundInner::bind_on_iface(self.socket, iface, netns)?;
+        let bound_port = match inner
+            .port_manager()
+            .bind_udp_ephemeral_port(local_addr, reuseaddr, reuseport, bind_id)
+        {
+            Ok(port) => port,
+            Err(e) => {
+                inner.release();
+                return Err(e);
+            }
+        };
+
+        if inner
+            .with_mut::<smoltcp::socket::udp::Socket, _, _>(|socket| {
+                socket.bind(smoltcp::wire::IpEndpoint::new(local_addr, bound_port))
+            })
+            .is_err()
+        {
+            inner.port_manager().unbind_udp_port(bound_port, bind_id);
+            inner.release();
             return Err(SystemError::EINVAL);
         }
 

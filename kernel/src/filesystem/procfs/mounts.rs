@@ -5,7 +5,7 @@ use crate::filesystem::{
         mount_view::{open_current_mount_file, read_cached_mount_file, ProcMountRenderKind},
         template::{Builder, FileOps, ProcFileBuilder},
     },
-    vfs::{file::FileFlags, FilePrivateData, IndexNode, InodeMode},
+    vfs::{FilePrivateData, IndexNode, InodeMode},
 };
 use crate::libs::mutex::MutexGuard;
 use alloc::sync::{Arc, Weak};
@@ -17,7 +17,7 @@ pub struct MountsFileOps;
 
 impl MountsFileOps {
     pub fn new_inode(parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcFileBuilder::new(Self, InodeMode::S_IRUGO) // 0444 - 所有用户可读
+        ProcFileBuilder::new(Self, InodeMode::S_IRUGO)
             .parent(parent)
             .build()
             .unwrap()
@@ -25,7 +25,7 @@ impl MountsFileOps {
 }
 
 impl FileOps for MountsFileOps {
-    fn open(&self, data: &mut FilePrivateData, _flags: &FileFlags) -> Result<(), SystemError> {
+    fn open(&self, data: &mut MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         open_current_mount_file(ProcMountRenderKind::Mounts, data)
     }
 

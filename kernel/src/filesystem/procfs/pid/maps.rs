@@ -7,14 +7,13 @@ use crate::{
     arch::MMArch,
     filesystem::{
         procfs::{
-            pid::find_process_by_vpid,
+            pid::ProcPidTarget,
             template::{Builder, FileOps, ProcFileBuilder},
             utils::proc_read,
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
     mm::{ucontext::LockedVMA, MemoryManagementArch, VmFlags},
-    process::RawPid,
 };
 use alloc::{
     format,
@@ -27,12 +26,12 @@ use system_error::SystemError;
 /// /proc/[pid]/maps 文件的 FileOps 实现
 #[derive(Debug)]
 pub struct MapsFileOps {
-    pid: RawPid,
+    target: ProcPidTarget,
 }
 
 impl MapsFileOps {
-    pub fn new_inode(pid: RawPid, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcFileBuilder::new(Self { pid }, InodeMode::S_IRUGO)
+    pub fn new_inode(target: ProcPidTarget, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcFileBuilder::new(Self { target }, InodeMode::S_IRUGO)
             .parent(parent)
             .build()
             .unwrap()
@@ -104,10 +103,14 @@ fn format_dev_inode_and_path(
 }
 
 /// 生成 /proc/[pid]/maps 内容
-fn generate_maps_content(pid: RawPid) -> Result<Vec<u8>, SystemError> {
-    let target_pcb = find_process_by_vpid(pid).ok_or(SystemError::ESRCH)?;
+fn generate_maps_content(target: &ProcPidTarget) -> Result<Vec<u8>, SystemError> {
+    let target_pcb = target.thread_group_leader().ok_or(SystemError::ESRCH)?;
 
-    let vm = target_pcb.basic().user_vm().ok_or(SystemError::EINVAL)?;
+    let vm = {
+        let basic = target_pcb.basic();
+        basic.user_vm()
+    }
+    .ok_or(SystemError::EINVAL)?;
     let root_prefix = target_pcb
         .fs_struct()
         .root()
@@ -171,7 +174,7 @@ impl FileOps for MapsFileOps {
         buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let content = generate_maps_content(self.pid)?;
+        let content = generate_maps_content(&self.target)?;
         proc_read(offset, len, buf, &content)
     }
 }

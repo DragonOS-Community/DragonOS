@@ -1,27 +1,25 @@
 //! /proc/[pid]/mountstats - 进程挂载统计信息
 
-use crate::libs::mutex::MutexGuard;
-use crate::{
-    filesystem::{
-        procfs::{
-            mount_view::{open_pid_mount_file, read_cached_mount_file, ProcMountRenderKind},
-            template::{Builder, FileOps, ProcFileBuilder},
-        },
-        vfs::{file::FileFlags, FilePrivateData, IndexNode, InodeMode},
+use crate::filesystem::{
+    procfs::{
+        mount_view::{open_mount_file_for_target, read_cached_mount_file, ProcMountRenderKind},
+        pid::ProcPidTarget,
+        template::{Builder, FileOps, ProcFileBuilder},
     },
-    process::{ProcessManager, RawPid},
+    vfs::{FilePrivateData, IndexNode, InodeMode},
 };
+use crate::libs::mutex::MutexGuard;
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
 
 #[derive(Debug)]
 pub struct MountStatsFileOps {
-    pid: RawPid,
+    target: ProcPidTarget,
 }
 
 impl MountStatsFileOps {
-    pub fn new_inode(pid: RawPid, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcFileBuilder::new(Self { pid }, InodeMode::S_IRUSR)
+    pub fn new_inode(target: ProcPidTarget, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcFileBuilder::new(Self { target }, InodeMode::S_IRUSR)
             .parent(parent)
             .build()
             .unwrap()
@@ -29,8 +27,8 @@ impl MountStatsFileOps {
 }
 
 impl FileOps for MountStatsFileOps {
-    fn open(&self, data: &mut FilePrivateData, _flags: &FileFlags) -> Result<(), SystemError> {
-        open_pid_mount_file(self.pid, ProcMountRenderKind::MountStats, data)
+    fn open(&self, data: &mut MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
+        open_mount_file_for_target(&self.target, ProcMountRenderKind::MountStats, data)
     }
 
     fn read_at(
@@ -40,15 +38,9 @@ impl FileOps for MountStatsFileOps {
         buf: &mut [u8],
         data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        self.target
+            .thread_group_leader()
+            .ok_or(SystemError::ESRCH)?;
         read_cached_mount_file(offset, len, buf, data)
-    }
-
-    fn owner(&self) -> Option<(usize, usize)> {
-        let pcb = ProcessManager::find(self.pid)?;
-        if pcb.is_kthread() {
-            return Some((0, 0));
-        }
-        let cred = pcb.cred();
-        Some((cred.euid.data(), cred.egid.data()))
     }
 }

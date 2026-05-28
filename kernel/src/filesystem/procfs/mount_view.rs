@@ -10,11 +10,11 @@ use system_error::SystemError;
 use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::{
-        procfs::{pid::find_process_by_vpid, utils::proc_read, ProcfsFilePrivateData},
+        procfs::{pid::ProcPidTarget, utils::proc_read},
         vfs::{mount::MountList, FilePrivateData, IndexNode, MountFS},
     },
     libs::mutex::MutexGuard,
-    process::{ProcessControlBlock, ProcessManager, RawPid},
+    process::{ProcessControlBlock, ProcessManager},
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -33,21 +33,33 @@ struct ProcMountEntry {
 
 pub(crate) fn open_current_mount_file(
     kind: ProcMountRenderKind,
-    data: &mut FilePrivateData,
+    data: &mut MutexGuard<FilePrivateData>,
 ) -> Result<(), SystemError> {
-    open_pid_mount_file(ProcessManager::current_pcb().task_pid_vnr(), kind, data)
+    let current = ProcessManager::current_pcb();
+    open_mount_file_for_task(&current, kind, data)
 }
 
-pub(crate) fn open_pid_mount_file(
-    pid: RawPid,
+pub(crate) fn open_mount_file_for_target(
+    target: &ProcPidTarget,
     kind: ProcMountRenderKind,
-    data: &mut FilePrivateData,
+    data: &mut MutexGuard<FilePrivateData>,
 ) -> Result<(), SystemError> {
-    let rendered = render_mount_file(pid, kind)?;
-    *data = FilePrivateData::Procfs(ProcfsFilePrivateData {
-        data: rendered,
-        open_cred: ProcessManager::current_pcb().cred(),
-    });
+    let task = target
+        .thread_group_leader()
+        .ok_or(SystemError::ESRCH)?;
+    open_mount_file_for_task(&task, kind, data)
+}
+
+fn open_mount_file_for_task(
+    task: &Arc<ProcessControlBlock>,
+    kind: ProcMountRenderKind,
+    data: &mut MutexGuard<FilePrivateData>,
+) -> Result<(), SystemError> {
+    let rendered = render_mount_file_for_task(task, kind)?;
+    let FilePrivateData::Procfs(pdata) = &mut **data else {
+        return Err(SystemError::EIO);
+    };
+    pdata.data = rendered;
     Ok(())
 }
 
@@ -63,9 +75,11 @@ pub(crate) fn read_cached_mount_file(
     }
 }
 
-fn render_mount_file(pid: RawPid, kind: ProcMountRenderKind) -> Result<Vec<u8>, SystemError> {
-    let target = find_process_by_vpid(pid).ok_or(SystemError::ESRCH)?;
-    let entries = collect_visible_mounts(&target)?;
+fn render_mount_file_for_task(
+    target: &Arc<ProcessControlBlock>,
+    kind: ProcMountRenderKind,
+) -> Result<Vec<u8>, SystemError> {
+    let entries = collect_visible_mounts(target)?;
     let mut rendered = String::new();
 
     for entry in &entries {

@@ -2,30 +2,27 @@
 //!
 //! 返回进程的完整命令行，各参数之间以 \0 分隔
 
-use crate::libs::mutex::MutexGuard;
-use crate::{
-    filesystem::{
-        procfs::{
-            pid::find_process_by_vpid,
-            template::{Builder, FileOps, ProcFileBuilder},
-            utils::proc_read,
-        },
-        vfs::{FilePrivateData, IndexNode, InodeMode},
+use crate::filesystem::{
+    procfs::{
+        pid::ProcPidTarget,
+        template::{Builder, FileOps, ProcFileBuilder},
+        utils::proc_read,
     },
-    process::RawPid,
+    vfs::{FilePrivateData, IndexNode, InodeMode},
 };
+use crate::libs::mutex::MutexGuard;
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
 
 /// /proc/[pid]/cmdline 文件的 FileOps 实现
 #[derive(Debug)]
 pub struct CmdlineFileOps {
-    pid: RawPid,
+    target: ProcPidTarget,
 }
 
 impl CmdlineFileOps {
-    pub fn new_inode(pid: RawPid, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcFileBuilder::new(Self { pid }, InodeMode::S_IRUGO)
+    pub fn new_inode(target: ProcPidTarget, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcFileBuilder::new(Self { target }, InodeMode::S_IRUGO)
             .parent(parent)
             .build()
             .unwrap()
@@ -40,15 +37,17 @@ impl FileOps for CmdlineFileOps {
         buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        // 查找进程
-        let pcb = find_process_by_vpid(self.pid).ok_or(SystemError::ESRCH)?;
+        let pcb = self.target.task().ok_or(SystemError::ESRCH)?;
 
         // 获取 cmdline 字节
         let cmdline_bytes = pcb.cmdline_bytes();
 
         // 如果 cmdline 为空，返回进程名
         let mut content = if cmdline_bytes.is_empty() {
-            let name = pcb.basic().name().as_bytes().to_vec();
+            let name = {
+                let basic = pcb.basic();
+                basic.name().as_bytes().to_vec()
+            };
             let mut result = name;
             result.push(0); // 以 \0 结尾
             result

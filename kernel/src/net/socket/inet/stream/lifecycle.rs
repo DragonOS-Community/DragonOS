@@ -8,8 +8,13 @@ use alloc::sync::Arc;
 use system_error::SystemError;
 
 use super::inner;
-use super::poll_util;
 use super::TcpSocket;
+
+const TCP_ESTABLISHED_POST_POLL_ROUNDS: usize = 8;
+const TCP_CONNECTING_ABORT_POST_POLL_ROUNDS: usize = 128;
+const TCP_LISTEN_POST_POLL_MIN_ROUNDS: usize = 128;
+const TCP_LISTEN_POST_POLL_MAX_ROUNDS: usize = 8192;
+const TCP_LISTEN_POST_POLL_ROUNDS_PER_SOCKET: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CloseObservation {
@@ -25,6 +30,36 @@ struct CloseAction {
 }
 
 impl TcpSocket {
+    fn kick_iface_after_tcp_state_change(
+        iface: &Arc<dyn crate::net::Iface>,
+        poll_rounds: usize,
+        notify_bound_sockets: bool,
+    ) {
+        if let Some(netns) = iface.common().net_namespace() {
+            netns.wakeup_poll_thread();
+        }
+
+        for _ in 0..poll_rounds {
+            let _ = iface.poll();
+        }
+
+        if notify_bound_sockets {
+            // Listener shutdown/close changes a shared endpoint. Refresh all bound sockets so
+            // blocked accept/connect users observe the final state without requiring a new packet.
+            iface.common().notify_all_bound_sockets();
+        }
+    }
+
+    #[inline]
+    fn listen_post_poll_rounds(socket_count: usize) -> usize {
+        socket_count
+            .saturating_mul(TCP_LISTEN_POST_POLL_ROUNDS_PER_SOCKET)
+            .clamp(
+                TCP_LISTEN_POST_POLL_MIN_ROUNDS,
+                TCP_LISTEN_POST_POLL_MAX_ROUNDS,
+            )
+    }
+
     #[inline]
     fn observe_established_close(established: &inner::Established) -> CloseObservation {
         established.with(|socket| CloseObservation {
@@ -224,6 +259,10 @@ impl TcpSocket {
         &self,
         remote_endpoint: smoltcp::wire::IpEndpoint,
     ) -> Result<(), SystemError> {
+        let remote_endpoint =
+            crate::net::socket::inet::common::normalize_unspecified_endpoint_to_loopback(
+                remote_endpoint,
+            );
         let mut writer = self.inner.write();
         let inner = writer.take().expect("Tcp inner::Inner is None");
         let (init, result) = match inner {
@@ -377,7 +416,8 @@ impl TcpSocket {
         }
 
         let mut post_poll_iface: Option<Arc<dyn crate::net::Iface>> = None;
-        let mut post_poll_rounds: usize = 0;
+        let mut post_poll_rounds = 0usize;
+        let mut post_notify_bound_sockets = false;
 
         // Linux/gVisor 语义：TIME_WAIT/Closed 的 stream socket 上 shutdown 应返回 ENOTCONN。
         // 但 Listening 和 Connecting 状态下的 shutdown 是允许的。
@@ -414,7 +454,8 @@ impl TcpSocket {
                     } else {
                         established.with_mut(|socket| socket.close());
                     }
-                    post_poll_rounds = core::cmp::max(post_poll_rounds, 8);
+                    post_poll_rounds =
+                        core::cmp::max(post_poll_rounds, TCP_ESTABLISHED_POST_POLL_ROUNDS);
                     post_poll_iface = Some(established.iface().clone());
                 }
 
@@ -458,8 +499,9 @@ impl TcpSocket {
 
                     post_poll_rounds = core::cmp::max(
                         post_poll_rounds,
-                        original_listen_sockets.saturating_mul(8).clamp(128, 8192),
+                        Self::listen_post_poll_rounds(original_listen_sockets),
                     );
+                    post_notify_bound_sockets = true;
                     post_poll_iface = Some(keep.iface().clone());
 
                     // Linux: shutdown(SHUT_RD) on a listening socket stops listening.
@@ -498,7 +540,8 @@ impl TcpSocket {
                         } else {
                             established.with_mut(|socket| socket.close());
                         }
-                        post_poll_rounds = core::cmp::max(post_poll_rounds, 8);
+                        post_poll_rounds =
+                            core::cmp::max(post_poll_rounds, TCP_ESTABLISHED_POST_POLL_ROUNDS);
                         post_poll_iface = Some(established.iface().clone());
                     }
 
@@ -506,7 +549,8 @@ impl TcpSocket {
                 } else {
                     connecting.set_shutdown_reset();
                     connecting.with_mut(|socket| socket.abort());
-                    post_poll_rounds = core::cmp::max(post_poll_rounds, 128);
+                    post_poll_rounds =
+                        core::cmp::max(post_poll_rounds, TCP_CONNECTING_ABORT_POST_POLL_ROUNDS);
                     post_poll_iface = Some(connecting.iface().clone());
 
                     // For still-connecting sockets, only SHUT_WR is meaningful for
@@ -554,39 +598,17 @@ impl TcpSocket {
 
         // 唤醒等待者（含 poll/epoll），让状态变化可见。
         if let Some(iface) = post_poll_iface {
-            if let Some(netns) = iface.common().net_namespace() {
-                netns.wakeup_poll_thread();
-            }
-            for _ in 0..post_poll_rounds {
-                iface.poll();
-            }
-            // After shutdown, explicitly notify all bound sockets on this interface.
-            // This ensures that client sockets waiting for connection completion
-            // are woken up even if the last poll() didn't detect state changes
-            // (e.g., RST was already sent and received in earlier polls).
-            iface.common().notify_all_bound_sockets();
+            Self::kick_iface_after_tcp_state_change(
+                &iface,
+                post_poll_rounds,
+                post_notify_bound_sockets,
+            );
         }
         self.notify();
         Ok(())
     }
 
     pub fn close_socket(&self) -> Result<(), SystemError> {
-        // 先把 iface 推进到稳定态，再决定 close(2) 是走 FIN 还是 RST。
-        // 否则 loopback 上尚未被 poll 到接收队列的数据会让 unread 误判为 0，
-        // 导致本应 abort(RST) 的场景被错误地当成 graceful close(FIN)。
-        if let Some(iface) = self
-            .inner
-            .read()
-            .as_ref()
-            .and_then(|inner| inner.iface())
-            .cloned()
-        {
-            if let Some(netns) = iface.common().net_namespace() {
-                netns.wakeup_poll_thread();
-            }
-            poll_util::poll_iface_until_quiescent(iface.as_ref());
-        }
-
         let mut writer = self.inner.write();
         let Some(inner) = writer.take() else {
             log::warn!("TcpSocket::close: already closed, unexpected");
@@ -594,6 +616,8 @@ impl TcpSocket {
         };
 
         let mut post_poll_iface: Option<Arc<dyn crate::net::Iface>> = None;
+        let mut post_poll_rounds = 0usize;
+        let mut post_notify_bound_sockets = false;
 
         // close(fd) must not break in-flight syscalls that already hold a
         // reference to this socket object (gVisor ClosedWriteBlockingSocket).
@@ -684,7 +708,9 @@ impl TcpSocket {
             }
             inner::Inner::Listening(mut ls) => {
                 // close(listen_fd) should stop listening on the port.
+                let original_listen_sockets = ls.inners.len();
                 let port = ls.get_name().port;
+                let post_close_iface = ls.inners.first().map(|b| b.iface().clone());
                 // Unregister listen port and unbind socket from all unique interfaces.
                 // For INADDR_ANY listeners, listen sockets span multiple interfaces,
                 // so we must clean up each one.
@@ -715,6 +741,12 @@ impl TcpSocket {
                     _ => smoltcp::wire::IpVersion::Ipv4,
                 };
                 writer.replace(inner::Inner::Closed(inner::Closed::new(ver)));
+                post_poll_rounds = core::cmp::max(
+                    post_poll_rounds,
+                    Self::listen_post_poll_rounds(original_listen_sockets),
+                );
+                post_notify_bound_sockets = true;
+                post_poll_iface = post_close_iface;
             }
             inner::Inner::Init(init) => {
                 init.close();
@@ -727,11 +759,11 @@ impl TcpSocket {
         };
         drop(writer);
         if let Some(iface) = post_poll_iface {
-            if let Some(netns) = iface.common().net_namespace() {
-                netns.wakeup_poll_thread();
-            }
-            poll_util::poll_iface_until_quiescent(iface.as_ref());
-            iface.common().notify_all_bound_sockets();
+            Self::kick_iface_after_tcp_state_change(
+                &iface,
+                post_poll_rounds,
+                post_notify_bound_sockets,
+            );
         }
         self.notify();
         Ok(())

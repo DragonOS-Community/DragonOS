@@ -585,64 +585,56 @@ impl PageFaultHandler {
 
                 mm.flush_tlb_range(address, end, MMArch::PAGE_SHIFT as u8, false);
                 VmFaultReason::VM_FAULT_COMPLETED
-            } else if let Some(flush) = mapper.map(address, new_flags) {
-                let mut page_manager_guard = page_manager_lock();
-                let old_page = page_manager_guard.get_unwrap(&old_paddr);
-                drop(page_manager_guard);
-                Self::detach_fault_mapped_page(&old_page, &vma);
+            } else {
+                let new_page = {
+                    let mut page_manager_guard = page_manager_lock();
+                    match page_manager_guard.copy_page(&old_paddr, mapper.allocator_mut()) {
+                        Ok(page) => page,
+                        Err(_) => return VmFaultReason::VM_FAULT_OOM,
+                    }
+                };
+                let new_paddr = new_page.phys_address();
 
-                // 替换为新的物理页：必须先让其他 CPU 的 TLB 失效，
-                // 才能保证它们不会再通过旧 TLB 访问旧物理页。
-                // SAFETY: 后续 mm.flush_tlb_range 会做 mm-aware 远端 + 本地 shootdown。
-                unsafe { flush.ignore() };
-                let mut page_manager_guard = page_manager_lock();
-                let paddr = mapper.translate(address).unwrap().0;
-                let page = page_manager_guard.get_unwrap(&paddr);
-                drop(page_manager_guard);
+                let table = mapper.get_table(address, 0).unwrap();
+                let i = table.index_of(address).unwrap();
+
+                // Copy before publishing the writable PTE. DragonOS does not yet
+                // hold a Linux-style per-PTE lock while every fault reader checks
+                // the PTE, so do not create a transient empty PTE here.
+                table.set_entry(i, super::page::PageEntry::new(new_paddr, new_flags));
+                mm.flush_tlb_range(address, end, MMArch::PAGE_SHIFT as u8, false);
+
                 Self::attach_fault_mapped_page(
-                    &page,
+                    &new_page,
                     &vma,
                     vma.lock().vm_flags().contains(VmFlags::VM_LOCKED),
                 );
-
-                (MMArch::phys_2_virt(paddr).unwrap().data() as *mut u8).copy_from_nonoverlapping(
-                    MMArch::phys_2_virt(old_paddr).unwrap().data() as *mut u8,
-                    MMArch::PAGE_SIZE,
-                );
-                mm.flush_tlb_range(address, end, MMArch::PAGE_SHIFT as u8, false);
+                Self::detach_fault_mapped_page(&old_page, &vma);
                 VmFaultReason::VM_FAULT_COMPLETED
-            } else {
-                VmFaultReason::VM_FAULT_OOM
             }
         } else {
             // 私有文件映射，必须拷贝页面
-            if let Some(flush) = mapper.map(address, new_flags) {
+            let new_page = {
                 let mut page_manager_guard = page_manager_lock();
-                let old_page = page_manager_guard.get_unwrap(&old_paddr);
-                drop(page_manager_guard);
-                Self::detach_fault_mapped_page(&old_page, &vma);
+                match page_manager_guard.copy_page(&old_paddr, mapper.allocator_mut()) {
+                    Ok(page) => page,
+                    Err(_) => return VmFaultReason::VM_FAULT_OOM,
+                }
+            };
+            let new_paddr = new_page.phys_address();
 
-                // SAFETY: 后续 mm.flush_tlb_range 会做 mm-aware 远端 + 本地 shootdown。
-                unsafe { flush.ignore() };
-                let mut page_manager_guard = page_manager_lock();
-                let paddr = mapper.translate(address).unwrap().0;
-                let page = page_manager_guard.get_unwrap(&paddr);
-                drop(page_manager_guard);
-                Self::attach_fault_mapped_page(
-                    &page,
-                    &vma,
-                    vma.lock().vm_flags().contains(VmFlags::VM_LOCKED),
-                );
+            let table = mapper.get_table(address, 0).unwrap();
+            let i = table.index_of(address).unwrap();
+            table.set_entry(i, super::page::PageEntry::new(new_paddr, new_flags));
+            mm.flush_tlb_range(address, end, MMArch::PAGE_SHIFT as u8, false);
 
-                (MMArch::phys_2_virt(paddr).unwrap().data() as *mut u8).copy_from_nonoverlapping(
-                    MMArch::phys_2_virt(old_paddr).unwrap().data() as *mut u8,
-                    MMArch::PAGE_SIZE,
-                );
-                mm.flush_tlb_range(address, end, MMArch::PAGE_SHIFT as u8, false);
-                VmFaultReason::VM_FAULT_COMPLETED
-            } else {
-                VmFaultReason::VM_FAULT_OOM
-            }
+            Self::attach_fault_mapped_page(
+                &new_page,
+                &vma,
+                vma.lock().vm_flags().contains(VmFlags::VM_LOCKED),
+            );
+            Self::detach_fault_mapped_page(&old_page, &vma);
+            VmFaultReason::VM_FAULT_COMPLETED
         }
     }
 

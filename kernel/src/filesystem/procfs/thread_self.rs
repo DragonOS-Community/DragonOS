@@ -1,28 +1,24 @@
-//! /proc/thread-self 目录
+//! /proc/thread-self - 指向当前线程目录的符号链接
 //!
-//! 这个模块实现了 /proc/thread-self 目录，它包含当前线程的信息。
-//! 主要提供 /proc/thread-self/ns/ 子目录用于访问当前线程的命名空间。
+//! Linux 中 /proc/thread-self 是一个魔法符号链接，目标为
+//! /proc/<tgid>/task/<tid>，其中数字必须按当前 proc mount 绑定的 pid namespace
+//! 生成。真正的命名空间文件语义则由 /proc/<tgid>/task/<tid>/ns/* 提供。
 
-use crate::libs::mutex::MutexGuard;
 use crate::{
     filesystem::{
-        procfs::template::{Builder, DirOps, ProcDir, ProcDirBuilder, ProcSymBuilder, SymOps},
-        vfs::{
-            file::{FilePrivateData, NamespaceFilePrivateData},
-            IndexNode, InodeId, InodeMode,
+        procfs::{
+            root::ProcFS,
+            template::{Builder, ProcSymBuilder, SymOps},
         },
+        vfs::{IndexNode, InodeMode},
     },
-    process::{
-        namespace::{nsproxy::NamespaceId, NamespaceOps},
-        ProcessManager,
-    },
+    process::{namespace::pid_namespace::PidNamespace, pid::PidType, ProcessManager},
 };
 use alloc::{
     format,
-    string::ToString,
     sync::{Arc, Weak},
 };
-use core::convert::TryFrom;
+use core::{convert::TryFrom, fmt};
 use system_error::SystemError;
 
 /// 命名空间文件类型
@@ -92,187 +88,55 @@ impl TryFrom<&str> for NsFileType {
     }
 }
 
-/// 获取当前线程的命名空间 ID
-fn current_thread_self_ns_ino(ns_type: NsFileType) -> usize {
-    let pcb = ProcessManager::current_pcb();
-    let nsproxy = pcb.nsproxy();
-
-    let ino: NamespaceId = match ns_type {
-        NsFileType::Ipc => nsproxy.ipc_ns.ns_common().nsid,
-        NsFileType::Uts => nsproxy.uts_ns.ns_common().nsid,
-        NsFileType::Mnt => nsproxy.mnt_ns.ns_common().nsid,
-        NsFileType::Net => nsproxy.net_ns.ns_common().nsid,
-        NsFileType::Pid => pcb.active_pid_ns().ns_common().nsid,
-        NsFileType::PidForChildren => nsproxy.pid_ns_for_children.ns_common().nsid,
-        NsFileType::Time | NsFileType::TimeForChildren => {
-            // Time namespace 尚未实现
-            NamespaceId::new(0)
-        }
-        NsFileType::User => pcb.cred().user_ns.ns_common().nsid,
-        NsFileType::Cgroup => nsproxy.cgroup_ns.ns_common().nsid,
-    };
-
-    ino.data()
+/// /proc/thread-self 符号链接的 SymOps 实现
+pub struct ThreadSelfSymOps {
+    view_pid_ns: Arc<PidNamespace>,
 }
 
-// ============================================================================
-// /proc/thread-self 目录
-// ============================================================================
+impl fmt::Debug for ThreadSelfSymOps {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ThreadSelfSymOps").finish()
+    }
+}
 
-/// /proc/thread-self 目录的 DirOps 实现
-#[derive(Debug)]
-pub struct ThreadSelfDirOps;
-
-impl ThreadSelfDirOps {
+impl ThreadSelfSymOps {
     pub fn new_inode(parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcDirBuilder::new(Self, InodeMode::from_bits_truncate(0o555))
+        let view_pid_ns = parent
+            .upgrade()
+            .expect("proc thread-self parent should exist")
+            .fs()
+            .as_any_ref()
+            .downcast_ref::<ProcFS>()
+            .expect("/proc/thread-self must belong to procfs")
+            .pid_ns()
+            .clone();
+
+        ProcSymBuilder::new(Self { view_pid_ns }, InodeMode::S_IRWXUGO)
             .parent(parent)
             .build()
             .unwrap()
     }
 }
 
-impl DirOps for ThreadSelfDirOps {
-    fn lookup_child(
-        &self,
-        dir: &ProcDir<Self>,
-        name: &str,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        if name == "ns" {
-            let mut cached_children = dir.cached_children().write();
-            if let Some(child) = cached_children.get(name) {
-                return Ok(child.clone());
-            }
-
-            let inode = ThreadSelfNsDirOps::new_inode(dir.self_ref_weak().clone());
-            cached_children.insert(name.to_string(), inode.clone());
-            return Ok(inode);
-        }
-
-        Err(SystemError::ENOENT)
-    }
-
-    fn populate_children(&self, dir: &ProcDir<Self>) {
-        let mut cached_children = dir.cached_children().write();
-        cached_children
-            .entry("ns".to_string())
-            .or_insert_with(|| ThreadSelfNsDirOps::new_inode(dir.self_ref_weak().clone()));
-    }
-}
-
-// ============================================================================
-// /proc/thread-self/ns 目录
-// ============================================================================
-
-/// /proc/thread-self/ns 目录的 DirOps 实现
-#[derive(Debug)]
-pub struct ThreadSelfNsDirOps;
-
-impl ThreadSelfNsDirOps {
-    pub fn new_inode(parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcDirBuilder::new(Self, InodeMode::from_bits_truncate(0o555))
-            .parent(parent)
-            .build()
-            .unwrap()
-    }
-}
-
-impl DirOps for ThreadSelfNsDirOps {
-    fn lookup_child(
-        &self,
-        dir: &ProcDir<Self>,
-        name: &str,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        // 解析命名空间类型
-        let ns_type = NsFileType::try_from(name)?;
-
-        let mut cached_children = dir.cached_children().write();
-        if let Some(child) = cached_children.get(name) {
-            return Ok(child.clone());
-        }
-
-        // 创建命名空间符号链接
-        let inode = ThreadSelfNsSymOps::new_inode(ns_type, dir.self_ref_weak().clone());
-        cached_children.insert(name.to_string(), inode.clone());
-        Ok(inode)
-    }
-
-    fn populate_children(&self, dir: &ProcDir<Self>) {
-        let mut cached_children = dir.cached_children().write();
-
-        for name in NsFileType::ALL_NAMES {
-            if let Ok(ns_type) = NsFileType::try_from(name) {
-                cached_children.entry(name.to_string()).or_insert_with(|| {
-                    ThreadSelfNsSymOps::new_inode(ns_type, dir.self_ref_weak().clone())
-                });
-            }
-        }
-    }
-}
-
-// ============================================================================
-// /proc/thread-self/ns/* 符号链接
-// ============================================================================
-
-/// /proc/thread-self/ns/[type] 符号链接的 SymOps 实现
-#[derive(Debug)]
-pub struct ThreadSelfNsSymOps {
-    ns_type: NsFileType,
-}
-
-impl ThreadSelfNsSymOps {
-    pub fn new_inode(ns_type: NsFileType, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcSymBuilder::new(Self { ns_type }, InodeMode::S_IRWXUGO)
-            .parent(parent)
-            .build()
-            .unwrap()
-    }
-}
-
-impl SymOps for ThreadSelfNsSymOps {
+impl SymOps for ThreadSelfSymOps {
     fn read_link(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let ino = current_thread_self_ns_ino(self.ns_type);
-        let target = format!("{}:[{}]", self.ns_type.name(), ino);
+        let current_pcb = ProcessManager::current_pcb();
+        let tgid = current_pcb
+            .task_pid_ptr(PidType::TGID)
+            .map(|pid| pid.pid_nr_ns(&self.view_pid_ns))
+            .ok_or(SystemError::ESRCH)?;
+        let tid = current_pcb
+            .task_pid_ptr(PidType::PID)
+            .map(|pid| pid.pid_nr_ns(&self.view_pid_ns))
+            .ok_or(SystemError::ESRCH)?;
+
+        if tgid.data() == 0 || tid.data() == 0 {
+            return Err(SystemError::ENOENT);
+        }
+
+        let target = format!("{}/task/{}", tgid.data(), tid.data());
         let len = target.len().min(buf.len());
         buf[..len].copy_from_slice(&target.as_bytes()[..len]);
         Ok(len)
-    }
-
-    fn is_self_reference(&self) -> bool {
-        // 命名空间符号链接是自引用的魔法链接
-        true
-    }
-
-    fn dynamic_inode_id(&self) -> Option<InodeId> {
-        // 命名空间文件的 inode ID 应该是命名空间的 ID
-        // 这样 stat() 返回的 st_ino 就是命名空间 ID
-        Some(InodeId::new(current_thread_self_ns_ino(self.ns_type)))
-    }
-
-    fn open(&self, data: &mut MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
-        // 当打开命名空间文件时，设置命名空间私有数据
-        // 这使得 setns() 可以使用这个 fd
-        let pcb = ProcessManager::current_pcb();
-        let nsproxy = pcb.nsproxy();
-
-        let ns_data = match self.ns_type {
-            NsFileType::Ipc => NamespaceFilePrivateData::Ipc(nsproxy.ipc_ns.clone()),
-            NsFileType::Uts => NamespaceFilePrivateData::Uts(nsproxy.uts_ns.clone()),
-            NsFileType::Mnt => NamespaceFilePrivateData::Mnt(nsproxy.mnt_ns.clone()),
-            NsFileType::Net => NamespaceFilePrivateData::Net(nsproxy.net_ns.clone()),
-            NsFileType::Pid => NamespaceFilePrivateData::Pid(pcb.active_pid_ns()),
-            NsFileType::PidForChildren => {
-                NamespaceFilePrivateData::PidForChildren(nsproxy.pid_ns_for_children.clone())
-            }
-            NsFileType::Time | NsFileType::TimeForChildren => {
-                // Time namespace 尚未实现
-                return Err(SystemError::ENOSYS);
-            }
-            NsFileType::User => NamespaceFilePrivateData::User(pcb.cred().user_ns.clone()),
-            NsFileType::Cgroup => NamespaceFilePrivateData::Cgroup(nsproxy.cgroup_ns.clone()),
-        };
-
-        **data = FilePrivateData::Namespace(ns_data);
-        Ok(())
     }
 }

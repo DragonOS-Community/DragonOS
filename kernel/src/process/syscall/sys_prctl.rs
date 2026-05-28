@@ -48,6 +48,8 @@ enum PrctlOption {
     SetKeepCaps = 8,
     SetName = 15,
     GetName = 16,
+    GetSeccomp = 21,
+    SetSeccomp = 22,
     CapBsetRead = 23,
     CapBsetDrop = 24,
 
@@ -231,6 +233,23 @@ impl Syscall for SysPrctl {
                 current.set_cred(new_cred)?;
                 Ok(0)
             }
+
+            PrctlOption::GetSeccomp => {
+                let mode = current.seccomp_mode();
+                Ok(mode as usize)
+            }
+            PrctlOption::SetSeccomp => match arg2 {
+                1 => {
+                    crate::process::seccomp::seccomp_set_mode_strict()?;
+                    Ok(0)
+                }
+                2 => {
+                    let fprog_ptr = args[2] as u64;
+                    crate::process::seccomp::seccomp_set_mode_filter(fprog_ptr, 0)?;
+                    Ok(0)
+                }
+                _ => Err(SystemError::EINVAL),
+            },
 
             PrctlOption::SetNoNewPrivs => {
                 // Linux: arg2 必须为 1；no_new_privs 一旦置位不可清除。

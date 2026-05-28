@@ -1,8 +1,12 @@
 mod epoll_items;
+mod getsockopt;
 mod shutdown;
 mod timeval;
 
 pub use epoll_items::EPollItems;
+pub use getsockopt::{
+    write_i32_getsockopt, write_i32_getsockopt_ipv4, write_linger_getsockopt, write_u32_getsockopt,
+};
 pub use shutdown::ShutdownBit;
 pub use timeval::{parse_timeval_opt, write_timeval_opt};
 

@@ -28,7 +28,7 @@ use crate::{
 };
 
 use super::{
-    alloc_pid,
+    account_successful_fork, alloc_pid, inc_visible_thread_count,
     kthread::{KernelThreadPcbPrivate, WorkerPrivate},
     pid::{Pid, PidType},
     KernelStack, ProcessControlBlock, ProcessManager, RawPid,
@@ -636,6 +636,15 @@ impl ProcessManager {
             )
         });
 
+        crate::process::seccomp::copy_seccomp(
+            current_pcb
+                .seccomp_mode
+                .load(core::sync::atomic::Ordering::Relaxed),
+            &current_pcb.seccomp_filter,
+            &pcb.seccomp_mode,
+            &pcb.seccomp_filter,
+        );
+
         // 拷贝文件描述符表
         Self::copy_files(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
@@ -923,6 +932,9 @@ impl ProcessManager {
             cgroup.charge_pids(1);
             cgroup.add_task(pcb.raw_pid());
             ProcessManager::add_pcb(pcb.clone());
+            pcb.mark_visible_thread_accounted();
+            inc_visible_thread_count();
+            account_successful_fork();
         }
 
         // 设置child_tid，意味着子线程能够知道自己的id。

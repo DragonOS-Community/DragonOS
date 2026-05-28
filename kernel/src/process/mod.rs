@@ -5,7 +5,7 @@ use core::{
     intrinsics::unlikely,
     mem::ManuallyDrop,
     str::FromStr,
-    sync::atomic::{compiler_fence, fence, AtomicBool, AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{compiler_fence, fence, AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -95,6 +95,7 @@ pub mod preempt;
 pub mod process_group;
 pub mod resource;
 pub mod rseq;
+pub mod seccomp;
 pub mod session;
 pub mod shebang;
 pub mod signal;
@@ -108,10 +109,48 @@ pub use cputime::ProcessCpuTime;
 /// 系统中所有进程的pcb
 static ALL_PROCESS: SpinLock<Option<HashMap<RawPid, Arc<ProcessControlBlock>>>> =
     SpinLock::new(None);
+static NR_VISIBLE_THREADS: AtomicUsize = AtomicUsize::new(0);
+static TOTAL_FORKS: AtomicU64 = AtomicU64::new(0);
+static TOTAL_CONTEXT_SWITCHES: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn all_process() -> &'static SpinLock<Option<HashMap<RawPid, Arc<ProcessControlBlock>>>>
 {
     &ALL_PROCESS
+}
+
+#[inline]
+pub(crate) fn inc_visible_thread_count() {
+    NR_VISIBLE_THREADS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub(crate) fn dec_visible_thread_count() {
+    NR_VISIBLE_THREADS.fetch_sub(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub(crate) fn account_successful_fork() {
+    TOTAL_FORKS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn nr_threads() -> u32 {
+    NR_VISIBLE_THREADS.load(Ordering::Relaxed) as u32
+}
+
+#[inline]
+pub fn total_forks() -> u64 {
+    TOTAL_FORKS.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub(crate) fn account_context_switch() {
+    TOTAL_CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn nr_context_switches() -> u64 {
+    TOTAL_CONTEXT_SWITCHES.load(Ordering::Relaxed)
 }
 
 fn exchange_raw_pids_locked(
@@ -1221,7 +1260,10 @@ bitflags! {
 
 impl ProcessFlags {
     pub const fn exit_to_user_mode_work(&self) -> Self {
-        Self::from_bits_truncate(self.bits & (Self::HAS_PENDING_SIGNAL.bits | Self::NEED_RSEQ.bits))
+        Self::from_bits_truncate(
+            self.bits
+                & (Self::NEED_SCHEDULE.bits | Self::HAS_PENDING_SIGNAL.bits | Self::NEED_RSEQ.bits),
+        )
     }
 
     /// 测试并清除标志位
@@ -1283,6 +1325,8 @@ pub struct ProcessControlBlock {
     rcu_read_depth: AtomicUsize,
 
     flags: LockFreeFlags<ProcessFlags>,
+    /// 当前任务是否已经计入全局可见线程数。
+    visible_thread_accounted: AtomicBool,
     /// Serializes task-local pointer publication for RCU-protected metadata
     /// such as `cred`, `nsproxy`, and `sighand`.
     task_lock: SpinLock<()>,
@@ -1320,6 +1364,9 @@ pub struct ProcessControlBlock {
     /// prctl(PR_SET/GET_DUMPABLE) 状态。
     /// Linux: 0=SUID_DUMP_DISABLE, 1=SUID_DUMP_USER；2(SUID_DUMP_ROOT) 不允许通过 PR_SET_DUMPABLE 设置。
     dumpable: AtomicU8,
+
+    pub(crate) seccomp_mode: AtomicU8,
+    pub(crate) seccomp_filter: SpinLock<Option<Arc<seccomp::SeccompFilter>>>,
 
     /// 父进程指针
     pub(crate) parent_pcb: RwLock<Weak<ProcessControlBlock>>,
@@ -1476,6 +1523,7 @@ impl ProcessControlBlock {
                 preempt_count,
                 rcu_read_depth,
                 flags,
+                visible_thread_accounted: AtomicBool::new(false),
                 task_lock: SpinLock::new(()),
                 kernel_stack: RwLock::new(kstack),
                 syscall_stack: RwLock::new(KernelStack::new().unwrap()),
@@ -1493,6 +1541,8 @@ impl ProcessControlBlock {
                 keepcaps: AtomicBool::new(false),
                 // 默认设置为 SUID_DUMP_USER(=1)，满足 gVisor 的 SetGetDumpability 预期。
                 dumpable: AtomicU8::new(1),
+                seccomp_mode: AtomicU8::new(seccomp::SeccompMode::Disabled as u8),
+                seccomp_filter: SpinLock::new(None),
                 parent_pcb: RwLock::new(ppcb.clone()),
                 real_parent_pcb: RwLock::new(ppcb.clone()),
                 fork_parent_pcb: RwLock::new(ppcb),
@@ -1739,6 +1789,16 @@ impl ProcessControlBlock {
         return self.flags.get_mut();
     }
 
+    #[inline(always)]
+    pub(crate) fn mark_visible_thread_accounted(&self) {
+        self.visible_thread_accounted.store(true, Ordering::Release);
+    }
+
+    #[inline(always)]
+    pub(crate) fn take_visible_thread_accounted(&self) -> bool {
+        self.visible_thread_accounted.swap(false, Ordering::AcqRel)
+    }
+
     /// 请注意，这个值能在中断上下文中读取，但不能被中断上下文修改
     /// 否则会导致死锁
     #[inline(always)]
@@ -1796,6 +1856,21 @@ impl ProcessControlBlock {
     #[inline(always)]
     pub fn set_dumpable(&self, value: u8) {
         self.dumpable.store(value, Ordering::SeqCst)
+    }
+
+    #[inline(always)]
+    pub fn seccomp_mode(&self) -> seccomp::SeccompMode {
+        seccomp::SeccompMode::from(self.seccomp_mode.load(Ordering::Relaxed))
+    }
+
+    #[inline(always)]
+    pub fn set_seccomp_mode(&self, mode: seccomp::SeccompMode) {
+        self.seccomp_mode.store(mode as u8, Ordering::SeqCst);
+    }
+
+    #[inline(always)]
+    pub fn seccomp_filter_lock(&self) -> SpinLockGuard<'_, Option<Arc<seccomp::SeccompFilter>>> {
+        self.seccomp_filter.lock()
     }
 
     #[inline(always)]

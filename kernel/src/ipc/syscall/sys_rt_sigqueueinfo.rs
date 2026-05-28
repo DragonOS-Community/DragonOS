@@ -83,7 +83,7 @@ impl Syscall for SysRtSigqueueinfoHandle {
 
         // Linux 6.6: do_rt_sigqueueinfo 权限校验
         let si_code = user_info.si_code;
-        if (si_code >= 0 || si_code == (SigCode::Tkill as i32)) && current_pid != target_pid {
+        if (si_code >= 0 || si_code == SigCode::Tkill.as_i32()) && current_pid != target_pid {
             return Err(SystemError::EPERM);
         }
 

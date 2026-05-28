@@ -55,14 +55,17 @@ pub fn parse_timeval_opt(optval: &[u8]) -> Result<Option<crate::time::Duration>,
     Err(SystemError::EINVAL)
 }
 
-/// Write timeval-like socket option payload (64-bit timeval layout).
-pub fn write_timeval_opt(value: &mut [u8], micros: u64) -> Result<usize, SystemError> {
-    if value.len() < 16 {
-        return Err(SystemError::EINVAL);
+/// Write timeval-like socket option payload (64-bit timeval layout, truncated to `value.len()`).
+pub fn write_timeval_opt(value: &mut [u8], micros: u64) -> usize {
+    if value.is_empty() {
+        return 0;
     }
     let sec = (micros / 1_000_000) as i64;
     let usec = (micros % 1_000_000) as i64;
-    value[..8].copy_from_slice(&sec.to_ne_bytes());
-    value[8..16].copy_from_slice(&usec.to_ne_bytes());
-    Ok(16)
+    let mut buf = [0u8; 16];
+    buf[..8].copy_from_slice(&sec.to_ne_bytes());
+    buf[8..16].copy_from_slice(&usec.to_ne_bytes());
+    let len = core::cmp::min(value.len(), buf.len());
+    value[..len].copy_from_slice(&buf[..len]);
+    len
 }

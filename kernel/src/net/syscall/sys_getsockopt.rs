@@ -193,7 +193,8 @@ pub(super) fn do_getsockopt(
             _ => {
                 // 其它 SOL_SOCKET 选项交给具体 socket 实现。
                 // 这里采用"内核缓冲区 -> copy_to_user"的方式，避免假设 optval 是 u32。
-                let mut kbuf = [0u8; 64];
+                let kbuf_len = user_len.min(MAX_OPTVAL_LEN);
+                let mut kbuf = vec![0u8; kbuf_len];
                 let written = socket.option(level, optname, &mut kbuf)?;
                 let out_len = calc_out_len(optval, user_len, written);
 
@@ -228,7 +229,7 @@ pub(super) fn do_getsockopt(
     // 其它 level（如 SOL_IP/SOL_IPV6/SOL_RAW 等）交给具体 socket 实现。
     // gVisor raw_socket_test: getsockopt(SOL_IPV6, IPV6_CHECKSUM) 等
     {
-        let kbuf_len = user_len.clamp(64, MAX_OPTVAL_LEN);
+        let kbuf_len = user_len.min(MAX_OPTVAL_LEN);
         let mut kbuf = vec![0u8; kbuf_len];
         let written = socket.option(level, optname, &mut kbuf)?;
         let out_len = calc_out_len(optval, user_len, written);
@@ -238,6 +239,8 @@ pub(super) fn do_getsockopt(
             optval_writer.copy_to_user_protected(&kbuf[..out_len], 0)?;
         }
 
+        // Linux 语义：*optlen 回写实际输出长度；optval != NULL 时为 min(user_len, written)，
+        // optval == NULL 时为 written（用于探测选项大小）。
         let mut optlen_writer =
             UserBufferWriter::new(optlen, core::mem::size_of::<u32>(), from_user)?;
         optlen_writer

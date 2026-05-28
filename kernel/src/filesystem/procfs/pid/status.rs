@@ -6,13 +6,13 @@ use crate::libs::mutex::MutexGuard;
 use crate::{
     filesystem::{
         procfs::{
-            pid::find_process_by_vpid,
+            pid::ProcPidTarget,
             template::{Builder, FileOps, ProcFileBuilder},
             utils::{proc_read, trim_string},
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    process::RawPid,
+    process::pid::PidType,
 };
 use alloc::{
     borrow::ToOwned,
@@ -26,17 +26,16 @@ use system_error::SystemError;
 /// /proc/[pid]/status 文件的 FileOps 实现
 #[derive(Debug)]
 pub struct StatusFileOps {
-    /// 存储 PID，在读取时动态查找进程
-    pid: RawPid,
+    target: ProcPidTarget,
 }
 
 impl StatusFileOps {
-    pub fn new(pid: RawPid) -> Self {
-        Self { pid }
+    pub fn new(target: ProcPidTarget) -> Self {
+        Self { target }
     }
 
-    pub fn new_inode(pid: RawPid, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcFileBuilder::new(Self::new(pid), InodeMode::S_IRUGO)
+    pub fn new_inode(target: ProcPidTarget, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcFileBuilder::new(Self::new(target), InodeMode::S_IRUGO)
             .parent(parent)
             .build()
             .unwrap()
@@ -44,46 +43,49 @@ impl StatusFileOps {
 
     /// 生成 status 文件内容
     fn generate_status_content(&self) -> Result<Vec<u8>, SystemError> {
-        // 动态查找进程，确保获取最新状态
-        let pcb = find_process_by_vpid(self.pid).ok_or(SystemError::ESRCH)?;
+        let pcb = self
+            .target
+            .thread_group_leader()
+            .ok_or(SystemError::ESRCH)?;
+        let view_pid_ns = self.target.view_pid_ns();
         let mut pdata = Vec::new();
 
-        // Name
-        pdata.append(
-            &mut format!("Name:\t{}", pcb.basic().name())
-                .as_bytes()
-                .to_owned(),
-        );
+        let (name, user_vm, fd_table) = {
+            let basic = pcb.basic();
+            (
+                basic.name().to_string(),
+                basic.user_vm(),
+                basic.try_fd_table(),
+            )
+        };
 
-        let sched_info_guard = pcb.sched_info();
-        let state = sched_info_guard.inner_lock_read_irqsave().state();
-        let cpu_id = sched_info_guard
+        let state = {
+            let sched_info = pcb.sched_info();
+            sched_info.inner_lock_read_irqsave().state()
+        };
+        let cpu_id = pcb
+            .sched_info()
             .on_cpu()
             .map(|cpu| cpu.data() as i32)
             .unwrap_or(-1);
+        let priority = pcb.sched_info().policy();
+        let vrtime = pcb.sched_info().sched_entity.vruntime;
+        let time = pcb.sched_info().sched_entity.sum_exec_runtime;
+        let start_time = pcb.sched_info().sched_entity.exec_start;
+        let tty = { pcb.sig_info_irqsave().tty() };
 
-        let priority = sched_info_guard.policy();
-        let vrtime = sched_info_guard.sched_entity.vruntime;
-        let time = sched_info_guard.sched_entity.sum_exec_runtime;
-        let start_time = sched_info_guard.sched_entity.exec_start;
+        // Name
+        pdata.append(&mut format!("Name:\t{}", name).as_bytes().to_owned());
 
         // State
         pdata.append(&mut format!("\nState:\t{:?}", state).as_bytes().to_owned());
 
         // Tgid
-        pdata.append(
-            &mut format!(
-                "\nTgid:\t{}",
-                pcb.task_tgid_vnr()
-                    .unwrap_or(crate::process::RawPid::new(0))
-                    .into()
-            )
-            .into(),
-        );
+        pdata.append(&mut format!("\nTgid:\t{}", self.target.tgid().data()).into());
 
         // Pid
         pdata.append(
-            &mut format!("\nPid:\t{}", pcb.task_pid_vnr().data())
+            &mut format!("\nPid:\t{}", self.target.vpid().data())
                 .as_bytes()
                 .to_owned(),
         );
@@ -93,8 +95,9 @@ impl StatusFileOps {
             &mut format!(
                 "\nPpid:\t{}",
                 pcb.parent_pcb()
-                    .map(|p| p.task_pid_vnr().data() as isize)
-                    .unwrap_or(-1)
+                    .and_then(|p| p.task_pid_ptr(PidType::TGID))
+                    .map(|pid| pid.pid_nr_ns(view_pid_ns).data() as isize)
+                    .unwrap_or(0)
             )
             .as_bytes()
             .to_owned(),
@@ -105,12 +108,18 @@ impl StatusFileOps {
             pdata.append(&mut format!("\nFDSize:\t{}", 0).into());
         } else {
             pdata.append(
-                &mut format!("\nFDSize:\t{}", pcb.fd_table().read().fd_open_count()).into(),
+                &mut format!(
+                    "\nFDSize:\t{}",
+                    fd_table
+                        .map(|fd_table| fd_table.read().fd_open_count())
+                        .unwrap_or(0)
+                )
+                .into(),
             );
         }
 
         // Tty
-        let name = if let Some(tty) = pcb.sig_info_irqsave().tty() {
+        let name = if let Some(tty) = tty {
             tty.core().name().clone()
         } else {
             "none".to_string()
@@ -133,7 +142,7 @@ impl StatusFileOps {
 
         pdata.append(&mut format!("\nvrtime:\t{}", vrtime).as_bytes().to_owned());
 
-        if let Some(user_vm) = pcb.basic().user_vm() {
+        if let Some(user_vm) = user_vm {
             let address_space_guard = user_vm.read();
             // todo: 当前进程运行过程中占用内存的峰值
             let hiwater_vm: u64 = 0;
@@ -153,6 +162,24 @@ impl StatusFileOps {
 
         pdata.append(
             &mut format!("\nflags: {:?}\n", pcb.flags().clone())
+                .as_bytes()
+                .to_owned(),
+        );
+
+        pdata.append(
+            &mut format!("\nNoNewPrivs:\t{}", pcb.no_new_privs())
+                .as_bytes()
+                .to_owned(),
+        );
+        pdata.append(
+            &mut format!("\nSeccomp:\t{}", pcb.seccomp_mode() as u8)
+                .as_bytes()
+                .to_owned(),
+        );
+        let seccomp_filters =
+            crate::process::seccomp::SeccompFilter::chain_len(&pcb.seccomp_filter_lock());
+        pdata.append(
+            &mut format!("\nSeccomp_filters:\t{}", seccomp_filters)
                 .as_bytes()
                 .to_owned(),
         );

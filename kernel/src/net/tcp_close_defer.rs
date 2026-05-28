@@ -148,7 +148,10 @@ impl TcpCloseDefer {
         }
         let max_scan = closing.len().min(TCP_CLOSE_REAP_BUDGET);
         let mut scanned = 0usize;
-        let mut i = self.reap_cursor.load(Ordering::Relaxed).min(closing.len() - 1);
+        let mut i = self
+            .reap_cursor
+            .load(Ordering::Relaxed)
+            .min(closing.len() - 1);
         while scanned < max_scan && !closing.is_empty() {
             if i >= closing.len() {
                 i = 0;

@@ -694,10 +694,8 @@ impl TcpSocket {
                     reason: close_action.reason,
                     abort_on_post_close_data: close_action.abort_on_post_close_data,
                 });
-                post_poll_rounds = core::cmp::max(
-                    post_poll_rounds,
-                    TCP_ESTABLISHED_CLOSE_POST_POLL_ROUNDS,
-                );
+                post_poll_rounds =
+                    core::cmp::max(post_poll_rounds, TCP_ESTABLISHED_CLOSE_POST_POLL_ROUNDS);
                 post_poll_iface = Some(iface);
                 writer.replace(inner::Inner::Established(es));
             }

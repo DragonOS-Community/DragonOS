@@ -569,6 +569,7 @@ fn do_bind_mount(
             source_mfs_for_recursive
                 .as_ref()
                 .map(|mfs| mfs.super_block_state()),
+            source_mfs_for_recursive.as_ref(),
         )?;
     target_mfs.set_mount_source(Some(source_path.clone()));
 
@@ -783,6 +784,7 @@ fn do_recursive_bind_mount(
                 child_root_inner_inode,
                 MountFlags::empty(),
                 Some(info.source_mfs.super_block_state()),
+                Some(&info.source_mfs),
             ) {
             Ok(new_child_mnt) => {
                 let source = info

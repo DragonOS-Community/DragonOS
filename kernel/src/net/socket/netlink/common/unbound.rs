@@ -1,7 +1,9 @@
 use crate::{
     filesystem::epoll::EPollEventType,
+    filesystem::vfs::fasync::FAsyncItems,
     libs::wait_queue::WaitQueue,
     net::socket::{
+        common::EPollItems,
         netlink::{
             addr::{multicast::GroupIdSet, NetlinkSocketAddr},
             common::bound::BoundNetlink,
@@ -19,13 +21,17 @@ use system_error::SystemError;
 #[derive(Debug)]
 pub struct UnboundNetlink<P: SupportedNetlinkProtocol> {
     groups: GroupIdSet,
+    epoll_items: Arc<EPollItems>,
+    fasync_items: Arc<FAsyncItems>,
     phantom: PhantomData<BoundNetlink<P::Message>>,
 }
 
 impl<P: SupportedNetlinkProtocol> UnboundNetlink<P> {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(epoll_items: Arc<EPollItems>, fasync_items: Arc<FAsyncItems>) -> Self {
         Self {
             groups: GroupIdSet::new_empty(),
+            epoll_items,
+            fasync_items,
             phantom: PhantomData,
         }
     }
@@ -60,7 +66,12 @@ impl<P: SupportedNetlinkProtocol> datagram_common::Unbound for UnboundNetlink<P>
                 endpoint.add_groups(self.groups);
                 endpoint
             };
-            let receiver = MessageReceiver::new(message_queue.clone(), wait_queue);
+            let receiver = MessageReceiver::new(
+                message_queue.clone(),
+                wait_queue,
+                self.epoll_items.clone(),
+                self.fasync_items.clone(),
+            );
             <P as SupportedNetlinkProtocol>::bind(&endpoint, receiver, netns.clone())?
         };
 
@@ -81,7 +92,12 @@ impl<P: SupportedNetlinkProtocol> datagram_common::Unbound for UnboundNetlink<P>
                 endpoint.add_groups(self.groups);
                 endpoint
             };
-            let receiver = MessageReceiver::new(message_queue.clone(), wait_queue);
+            let receiver = MessageReceiver::new(
+                message_queue.clone(),
+                wait_queue,
+                self.epoll_items.clone(),
+                self.fasync_items.clone(),
+            );
             <P as SupportedNetlinkProtocol>::bind(&endpoint, receiver, netns.clone())?
         };
 

@@ -5,7 +5,7 @@ use crate::net::socket::netlink::message::{
 use alloc::vec::Vec;
 use system_error::SystemError;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SegmentCommon<Body, Attr> {
     header: CMsgSegHdr,
     body: Body,

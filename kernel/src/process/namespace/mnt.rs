@@ -14,7 +14,7 @@ use system_error::SystemError;
 
 use super::{
     nsproxy::NsCommon,
-    propagation::{register_peer, MountPropagation},
+    propagation::{register_peer, register_slave_with_master, MountPropagation},
     user_namespace::UserNamespace,
     NamespaceOps,
 };
@@ -271,6 +271,9 @@ impl MntNamespace {
                 group_id.data()
             );
         }
+        if old_root_propagation.is_slave() {
+            register_slave_with_master(&new_root_mntfs);
+        }
 
         let new_mntns = self.copy_with_mountfs(new_root_mntfs, user_ns);
 
@@ -317,6 +320,9 @@ impl MntNamespace {
             if old_propagation.is_shared() {
                 let group_id = old_propagation.peer_group_id();
                 register_peer(group_id, &new_mount_fs);
+            }
+            if old_propagation.is_slave() {
+                register_slave_with_master(&new_mount_fs);
             }
 
             data.parent_mount_fs

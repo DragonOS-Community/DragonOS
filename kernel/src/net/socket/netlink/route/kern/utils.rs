@@ -1,14 +1,25 @@
 use crate::net::socket::netlink::{
+    addr::multicast::GroupIdSet,
     message::{
         segment::{
             ack::DoneSegment,
             header::{CMsgSegHdr, SegHdrCommonFlags},
+            CSegmentType,
         },
-        ProtocolSegment,
+        Message, ProtocolSegment,
     },
     route::message::segment::RouteNlSegment,
+    table::{NetlinkRouteProtocol, SupportedNetlinkProtocol},
 };
-use alloc::vec::Vec;
+use crate::process::namespace::net_namespace::NetNamespace;
+use alloc::{sync::Arc, vec::Vec};
+
+pub const RTMGRP_LINK: u32 = 0x1;
+pub const RTMGRP_NEIGH: u32 = 0x4;
+pub const RTMGRP_IPV4_IFADDR: u32 = 0x10;
+pub const RTMGRP_IPV4_ROUTE: u32 = 0x40;
+pub const RTMGRP_IPV6_IFADDR: u32 = 0x100;
+pub const RTMGRP_IPV6_ROUTE: u32 = 0x400;
 
 pub fn finish_response(
     request_header: &CMsgSegHdr,
@@ -16,7 +27,12 @@ pub fn finish_response(
     response_segments: &mut Vec<RouteNlSegment>,
 ) {
     if !dump_all {
-        assert_eq!(response_segments.len(), 1);
+        if response_segments.len() != 1 {
+            log::warn!(
+                "netlink route: expected exactly one response segment, got {}",
+                response_segments.len()
+            );
+        }
         return;
     }
 
@@ -35,5 +51,25 @@ fn add_multi_flag(responce_segment: &mut [RouteNlSegment]) {
         let mut flags = SegHdrCommonFlags::from_bits_truncate(header.flags);
         flags |= SegHdrCommonFlags::MULTI;
         header.flags = flags.bits();
+    }
+}
+
+pub fn kernel_notify_header(type_: CSegmentType) -> CMsgSegHdr {
+    CMsgSegHdr {
+        len: 0,
+        type_: type_ as u16,
+        flags: SegHdrCommonFlags::empty().bits(),
+        seq: 0,
+        pid: 0,
+    }
+}
+
+pub fn multicast_notify(netns: Arc<NetNamespace>, group_mask: u32, segment: RouteNlSegment) {
+    if let Err(e) = NetlinkRouteProtocol::multicast(
+        GroupIdSet::new(group_mask),
+        Message::new(vec![segment]),
+        netns,
+    ) {
+        log::warn!("netlink route: multicast notify failed: {:?}", e);
     }
 }

@@ -3,6 +3,7 @@ use system_error::SystemError;
 
 pub mod addr;
 pub mod link;
+pub mod neigh;
 pub mod route;
 
 /// 网卡名字长度

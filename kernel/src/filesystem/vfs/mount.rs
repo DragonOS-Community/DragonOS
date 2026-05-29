@@ -1,3 +1,39 @@
+use super::{
+    file::FileFlags, utils::DName, FilePrivateData, FileSystem, FileType, IndexNode, InodeId,
+    InodeMode, PollableInode, SuperBlock,
+};
+use crate::{
+    driver::base::device::device_number::{DeviceNumber, Major},
+    filesystem::{
+        page_cache::list_page_caches,
+        page_cache::PageCache,
+        vfs::{fcntl::AtFlags, syscall::RenameFlags, vcore::do_mkdir_at},
+    },
+    libs::{
+        casting::DowncastArc,
+        errseq::{ErrSeq, ErrSeqValue},
+        mutex::{Mutex, MutexGuard},
+        rwsem::RwSem,
+        spinlock::SpinLock,
+    },
+    mm::{fault::PageFaultMessage, VmFaultReason},
+    process::{
+        namespace::{
+            mnt::MntNamespace,
+            propagation::{
+                inherit_bind_mount_propagation, propagate_mount, propagate_umount, register_peer,
+                register_slave_with_master, unregister_peer, MountPropagation,
+            },
+        },
+        ProcessManager,
+    },
+};
+use alloc::{
+    collections::BTreeMap,
+    string::{String, ToString},
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use core::{
     any::Any,
     fmt::Debug,
@@ -5,41 +41,10 @@ use core::{
     mem,
     sync::atomic::{compiler_fence, AtomicUsize, Ordering},
 };
-
-use alloc::{
-    collections::BTreeMap,
-    string::{String, ToString},
-    sync::{Arc, Weak},
-    vec::Vec,
-};
 use hashbrown::HashMap;
 use ida::IdAllocator;
+use lazy_static::lazy_static;
 use system_error::SystemError;
-
-use crate::libs::mutex::{Mutex, MutexGuard};
-use crate::{
-    driver::base::device::device_number::{DeviceNumber, Major},
-    filesystem::{
-        page_cache::PageCache,
-        vfs::{fcntl::AtFlags, syscall::RenameFlags, vcore::do_mkdir_at},
-    },
-    libs::{casting::DowncastArc, rwsem::RwSem},
-    mm::{fault::PageFaultMessage, VmFaultReason},
-    process::{
-        namespace::{
-            mnt::MntNamespace,
-            propagation::{
-                propagate_mount, propagate_umount, register_peer, unregister_peer, MountPropagation,
-            },
-        },
-        ProcessManager,
-    },
-};
-
-use super::{
-    file::FileFlags, utils::DName, FilePrivateData, FileSystem, FileType, IndexNode, InodeId,
-    InodeMode, PollableInode, SuperBlock,
-};
 
 bitflags! {
     /// Mount flags for filesystem independent mount options
@@ -218,6 +223,10 @@ int_like!(MountId, usize);
 static MOUNT_ID_ALLOCATOR: Mutex<IdAllocator> =
     Mutex::new(IdAllocator::new(0, usize::MAX).unwrap());
 
+lazy_static! {
+    static ref MOUNTED_SUPERBLOCKS: SpinLock<Vec<Weak<MountFS>>> = SpinLock::new(Vec::new());
+}
+
 impl MountId {
     fn alloc() -> Self {
         let id = MOUNT_ID_ALLOCATOR.lock().alloc().unwrap();
@@ -257,6 +266,8 @@ pub struct MountFS {
 pub struct SuperBlockState {
     flags: RwSem<MountFlags>,
     write_count: AtomicUsize,
+    wb_error: ErrSeq,
+    umount_lock: RwSem<()>,
 }
 
 struct MountStateInit {
@@ -269,6 +280,8 @@ impl SuperBlockState {
         Self {
             flags: RwSem::new(flags & MountFlags::SB_SETTABLE_MASK),
             write_count: AtomicUsize::new(0),
+            wb_error: ErrSeq::new(),
+            umount_lock: RwSem::new(()),
         }
     }
 
@@ -290,6 +303,26 @@ impl SuperBlockState {
 
     pub fn has_writers(&self) -> bool {
         self.write_count.load(Ordering::Acquire) != 0
+    }
+
+    pub fn sample_wb_error(&self) -> ErrSeqValue {
+        self.wb_error.sample()
+    }
+
+    pub fn check_and_advance_wb_error(&self, since: &mut ErrSeqValue) -> Option<SystemError> {
+        self.wb_error.check_and_advance(since)
+    }
+
+    pub fn record_wb_error(&self, error: SystemError) {
+        self.wb_error.set(error);
+    }
+
+    pub fn umount_read(&self) -> crate::libs::rwsem::RwSemReadGuard<'_, ()> {
+        self.umount_lock.read()
+    }
+
+    pub fn umount_write(&self) -> crate::libs::rwsem::RwSemWriteGuard<'_, ()> {
+        self.umount_lock.write()
     }
 }
 
@@ -379,6 +412,7 @@ impl MountFS {
             result.set_namespace(Arc::downgrade(mnt_ns));
         }
 
+        register_mounted_superblock(&result);
         result
     }
 
@@ -401,6 +435,7 @@ impl MountFS {
             mount_source: RwSem::new(mount_source),
         });
 
+        register_mounted_superblock(&mountfs);
         return mountfs;
     }
 
@@ -422,6 +457,10 @@ impl MountFS {
 
     pub fn is_readonly(&self) -> bool {
         self.combined_flags().contains(MountFlags::RDONLY)
+    }
+
+    pub fn is_sb_readonly(&self) -> bool {
+        self.super_block_flags().contains(MountFlags::RDONLY)
     }
 
     pub fn has_writers(&self) -> bool {
@@ -561,10 +600,13 @@ impl MountFS {
     /// # Errors
     /// 如果当前文件系统是根文件系统，那么将会返回`EINVAL`
     pub fn umount(&self) -> Result<Arc<MountFS>, SystemError> {
-        let result = self
-            .self_mountpoint()
-            .ok_or(SystemError::EINVAL)?
-            .do_umount();
+        let mountpoint = self.self_mountpoint().ok_or(SystemError::EINVAL)?;
+        let sb_state = self.super_block_state();
+        let _umount_guard = sb_state.umount_write();
+
+        self.sync_filesystem_locked()?;
+
+        let result = mountpoint.do_umount();
 
         if result.is_ok() {
             // 清除 self_mountpoint，断开与旧父挂载点的反向引用。
@@ -639,6 +681,171 @@ impl MountFS {
         }
         let _ = root.umount();
     }
+
+    /// 对应 Linux `sync_inodes_sb()`：回写指定 mount 下所有脏 page cache。
+    /// DragonOS 无 per-sb 脏 inode 列表，通过全局 `PAGECACHE_REGISTRY` 遍历匹配。
+    fn sync_inodes_of_mount(&self) -> Result<(), SystemError> {
+        let inner_fs = self.inner_filesystem();
+        let caches = list_page_caches();
+        let mut last_err = Ok(());
+        for page_cache in caches {
+            let belongs = page_cache
+                .inode()
+                .and_then(|weak| weak.upgrade())
+                .is_some_and(|inode| Arc::ptr_eq(&inode.fs(), &inner_fs));
+
+            if belongs {
+                if let Err(e) = page_cache.manager().sync() {
+                    log::warn!("sync_inodes_of_mount: page cache sync failed: {:?}", e);
+                    self.record_wb_error(e.clone());
+                    last_err = Err(e);
+                }
+            }
+        }
+        last_err
+    }
+
+    pub fn sync_inodes_with_umount_read(&self) -> Result<(), SystemError> {
+        let sb_state = self.super_block_state();
+        let _umount_guard = sb_state.umount_read();
+
+        if self.is_sb_readonly() {
+            return Ok(());
+        }
+
+        self.sync_inodes_of_mount()
+    }
+
+    pub fn sync_fs_with_umount_read(&self, wait: bool) -> Result<(), SystemError> {
+        let sb_state = self.super_block_state();
+        let _umount_guard = sb_state.umount_read();
+
+        if self.is_sb_readonly() {
+            return Ok(());
+        }
+
+        if let Err(e) = self.sync_fs(wait) {
+            self.record_wb_error(e.clone());
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
+    pub fn sync_blockdev_with_umount_read(&self, wait: bool) -> Result<(), SystemError> {
+        let sb_state = self.super_block_state();
+        let _umount_guard = sb_state.umount_read();
+
+        if self.is_sb_readonly() {
+            return Ok(());
+        }
+
+        if let Err(e) = self.sync_blockdev(wait) {
+            self.record_wb_error(e.clone());
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
+    /// sync() 将所有挂起的文件系统元数据和缓存文件数据写入底层文件系统。
+    pub fn sync_filesystem(&self) -> Result<(), SystemError> {
+        let sb_state = self.super_block_state();
+        let _umount_guard = sb_state.umount_read();
+
+        self.sync_filesystem_locked()
+    }
+
+    /// 同步当前 superblock，要求调用方已经持有 `umount_lock`。
+    ///
+    /// Linux 的 `sync_filesystem(sb)` 要求调用方已持有 `s_umount`。DragonOS
+    /// 在 `sync_filesystem()` 外部入口中获取读锁，而 `umount()` 已经持有写锁，
+    /// 因此 teardown 路径必须调用这个 locked 版本，避免同线程重入读锁。
+    pub fn sync_filesystem_locked(&self) -> Result<(), SystemError> {
+        if self.is_sb_readonly() {
+            return Ok(());
+        }
+
+        // writeback_inodes_sb(sb) — void
+        let mut last_err = self.sync_inodes_of_mount();
+        // sync_fs(sb, 0)
+        if let Err(e) = self.sync_fs(false) {
+            self.record_wb_error(e.clone());
+            return Err(e);
+        }
+
+        if let Err(e) = self.sync_blockdev(false) {
+            self.record_wb_error(e.clone());
+            return Err(e);
+        }
+
+        // sync_inodes_sb(sb) — void
+        if let Err(e) = self.sync_inodes_of_mount() {
+            last_err = Err(e);
+        }
+        // sync_fs(sb, 1)
+        if let Err(e) = self.sync_fs(true) {
+            self.record_wb_error(e.clone());
+            return Err(e);
+        }
+
+        if let Err(e) = self.sync_blockdev(true) {
+            self.record_wb_error(e.clone());
+            return Err(e);
+        }
+
+        last_err
+    }
+
+    pub fn sync_blockdev(&self, _wait: bool) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    pub fn record_wb_error(&self, error: SystemError) {
+        self.super_block_state.record_wb_error(error);
+    }
+
+    pub fn sample_wb_error(&self) -> ErrSeqValue {
+        self.super_block_state.sample_wb_error()
+    }
+
+    pub fn check_and_advance_wb_error(&self, since: &mut ErrSeqValue) -> Option<SystemError> {
+        self.super_block_state.check_and_advance_wb_error(since)
+    }
+}
+
+fn register_mounted_superblock(mount: &Arc<MountFS>) {
+    MOUNTED_SUPERBLOCKS
+        .lock_irqsave()
+        .push(Arc::downgrade(mount));
+}
+
+pub fn list_unique_mounted_superblocks() -> Vec<Arc<MountFS>> {
+    let mut guard = MOUNTED_SUPERBLOCKS.lock_irqsave();
+    let mut mounts: Vec<Arc<MountFS>> = Vec::new();
+    guard.retain(|weak| {
+        if let Some(mount) = weak.upgrade() {
+            let state = mount.super_block_state();
+            if !mounts
+                .iter()
+                .any(|existing| Arc::ptr_eq(&existing.super_block_state(), &state))
+            {
+                mounts.push(mount);
+            }
+            true
+        } else {
+            false
+        }
+    });
+    mounts
+}
+
+pub fn record_writeback_error_for_fs(inner_fs: &Arc<dyn FileSystem>, error: SystemError) {
+    for mount in list_unique_mounted_superblocks() {
+        if Arc::ptr_eq(&mount.inner_filesystem(), inner_fs) {
+            mount.record_wb_error(error.clone());
+        }
+    }
 }
 
 impl Drop for MountFS {
@@ -665,7 +872,7 @@ impl MountFSInode {
         root_inner_inode: Arc<dyn IndexNode>,
         mount_flags: MountFlags,
     ) -> Result<Arc<MountFS>, SystemError> {
-        self.mount_subtree_with_state(inner_fs, root_inner_inode, mount_flags, None)
+        self.mount_subtree_with_state(inner_fs, root_inner_inode, mount_flags, None, None)
     }
 
     pub(crate) fn mount_subtree_with_state(
@@ -674,6 +881,7 @@ impl MountFSInode {
         root_inner_inode: Arc<dyn IndexNode>,
         mount_flags: MountFlags,
         super_block_state: Option<Arc<SuperBlockState>>,
+        bind_source: Option<&Arc<MountFS>>,
     ) -> Result<Arc<MountFS>, SystemError> {
         // Linux do_add_mount：父挂载点必须属于当前 mount namespace。
         let current_mntns = ProcessManager::current_mntns();
@@ -713,6 +921,10 @@ impl MountFSInode {
 
         let mount_path = Arc::new(MountPath::from(self.absolute_path()?));
 
+        if let Some(source) = bind_source {
+            inherit_bind_mount_propagation(source, &new_mount_fs);
+        }
+
         self.mount_fs
             .add_mount(metadata.inode_id, new_mount_fs.clone())?;
 
@@ -721,11 +933,6 @@ impl MountFSInode {
             mount_path.clone(),
             new_mount_fs.clone(),
         )?;
-
-        if new_mount_fs.propagation().is_shared() {
-            let group_id = new_mount_fs.propagation().peer_group_id();
-            register_peer(group_id, &new_mount_fs);
-        }
 
         if parent_propagation.is_shared() {
             if let Err(e) = propagate_mount(
@@ -736,6 +943,14 @@ impl MountFSInode {
             ) {
                 log::warn!("mount: propagation failed: {:?}", e);
             }
+        }
+
+        let new_mount_prop = new_mount_fs.propagation();
+        if new_mount_prop.is_shared() {
+            register_peer(new_mount_prop.peer_group_id(), &new_mount_fs);
+        }
+        if bind_source.is_some() && new_mount_prop.is_slave() {
+            register_slave_with_master(&new_mount_fs);
         }
 
         Ok(new_mount_fs)
@@ -1011,6 +1226,20 @@ impl IndexNode for MountFSInode {
         data: MutexGuard<FilePrivateData>,
     ) -> Result<(), SystemError> {
         self.inner_inode.sync_file(datasync, data)
+    }
+
+    fn sync_file_range(
+        &self,
+        start: usize,
+        end: usize,
+        datasync: bool,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        self.inner_inode.sync_file_range(start, end, datasync, data)
+    }
+
+    fn write_inode(&self, wbc: &super::WritebackControl) -> Result<(), SystemError> {
+        self.inner_inode.write_inode(wbc)
     }
 
     fn fadvise(
@@ -1467,6 +1696,10 @@ impl FileSystem for MountFS {
     ) -> VmFaultReason {
         self.inner_filesystem.map_pages(pfm, start_pgoff, end_pgoff)
     }
+
+    fn sync_fs(&self, wait: bool) -> Result<(), SystemError> {
+        self.inner_filesystem.sync_fs(wait)
+    }
 }
 
 /// MountList
@@ -1542,6 +1775,8 @@ struct InnerMountList {
     mounts: HashMap<Arc<MountPath>, Vec<MountRecord>>,
     /// 便于通过 fs 反查挂载点 inode。
     mfs2ino: HashMap<Arc<MountFS>, InodeId>,
+    /// Reverse lookup from a specific mount to its mount path. The same inode may correspond to multiple propagation replica paths.
+    mfs2mp: HashMap<Arc<MountFS>, Arc<MountPath>>,
     /// inode 到路径的映射，用于子挂载查找。
     ino2mp: HashMap<InodeId, Arc<MountPath>>,
 }
@@ -1560,6 +1795,7 @@ impl MountList {
                 mounts: HashMap::new(),
                 ino2mp: HashMap::new(),
                 mfs2ino: HashMap::new(),
+                mfs2mp: HashMap::new(),
             }),
         })
     }
@@ -1588,6 +1824,7 @@ impl MountList {
             inner.ino2mp.insert(ino, path.clone());
             inner.mfs2ino.insert(fs.clone(), ino);
         }
+        inner.mfs2mp.insert(fs.clone(), path.clone());
         // 若 ino 为 None（如根挂载），仍然保留 mounts 栈用于后续 pop。
     }
 
@@ -1654,6 +1891,7 @@ impl MountList {
                 if let Some(ino) = inner.mfs2ino.remove(&rec_fs) {
                     inner.ino2mp.remove(&ino);
                 }
+                inner.mfs2mp.remove(&rec_fs);
                 if let Some(ino) = rec_ino {
                     inner.ino2mp.remove(&ino);
                 }
@@ -1672,6 +1910,7 @@ impl MountList {
         let mut new_mounts = HashMap::new();
         let mut new_ino2mp = HashMap::new();
         let mut new_mfs2ino = HashMap::new();
+        let mut new_mfs2mp = HashMap::new();
 
         for (old_path, stack) in old_mounts {
             let Some(new_path) = rewrite(old_path.as_str()) else {
@@ -1685,6 +1924,7 @@ impl MountList {
                     new_ino2mp.insert(ino, new_path.clone());
                     new_mfs2ino.insert(rec.fs.clone(), ino);
                 }
+                new_mfs2mp.insert(rec.fs.clone(), new_path.clone());
                 entry.push(rec);
             }
         }
@@ -1692,6 +1932,7 @@ impl MountList {
         inner.mounts = new_mounts;
         inner.ino2mp = new_ino2mp;
         inner.mfs2ino = new_mfs2ino;
+        inner.mfs2mp = new_mfs2mp;
     }
 
     /// # clone_inner - 克隆内部挂载点列表
@@ -1720,11 +1961,7 @@ impl MountList {
 
     #[inline(never)]
     pub fn get_mount_path_by_mountfs(&self, mountfs: &Arc<MountFS>) -> Option<Arc<MountPath>> {
-        let inner = self.inner.read();
-        inner
-            .mfs2ino
-            .get(mountfs)
-            .and_then(|ino| inner.ino2mp.get(ino).cloned())
+        self.inner.read().mfs2mp.get(mountfs).cloned()
     }
 }
 

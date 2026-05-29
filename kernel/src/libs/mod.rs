@@ -3,6 +3,7 @@ pub mod byte_parser;
 pub mod casting;
 pub mod cpumask;
 pub mod elf;
+pub mod errseq;
 #[macro_use]
 pub mod int_like;
 pub mod keyboard_parser;

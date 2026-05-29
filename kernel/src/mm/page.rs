@@ -18,7 +18,7 @@ use crate::{
     arch::{mm::LockedFrameAllocator, MMArch},
     filesystem::{
         page_cache::{list_page_caches, PageCache},
-        vfs::FilePrivateData,
+        vfs::{mount::list_unique_mounted_superblocks, FilePrivateData},
     },
     init::initcall::INITCALL_CORE,
     libs::{
@@ -269,6 +269,14 @@ fn page_reclaim_thread() -> i32 {
             PageReclaimer::flush_dirty_pages();
             // 休眠5秒
             // log::info!("sleep");
+            // Linux 的 __writeback_single_inode 在 do_writepages 后调 write_inode 回写元数据，
+            // 脏页和元数据在同一次遍历中完成。DragonOS 的 flush_dirty_pages 不触发 write_inode，
+            // 此处通过 sync_fs 刷回 dirty_inodes 中的脏元数据。
+            let mounts = list_unique_mounted_superblocks();
+            for mountfs in mounts {
+                let _ = mountfs.sync_fs_with_umount_read(true);
+            }
+
             let _ = nanosleep(PosixTimeSpec::new(0, 500_000_000));
         }
     }
@@ -482,7 +490,7 @@ impl PageReclaimer {
                     e
                 );
                 guard.add_flags(PageFlags::PG_ERROR);
-                page_cache.mark_page_error(page_index);
+                page_cache.mark_page_error(page_index, e);
                 return;
             }
         }

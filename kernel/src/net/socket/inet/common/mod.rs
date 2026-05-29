@@ -316,7 +316,10 @@ fn iface_matches_directed_broadcast(
 }
 
 #[inline]
-fn loopback_iface_contains_v4(iface: &Arc<dyn Iface>, v4_addr: smoltcp::wire::Ipv4Address) -> bool {
+pub(super) fn loopback_iface_contains_v4(
+    iface: &Arc<dyn Iface>,
+    v4_addr: smoltcp::wire::Ipv4Address,
+) -> bool {
     if !iface.flags().contains(InterfaceFlags::LOOPBACK) {
         return false;
     }

@@ -109,11 +109,15 @@
 
           testOpt = {
             # 自动测试项目，指定内核启动环境变量参数 AUTO_TEST
-            autotest = "none";
+            autotest = "none"; # syscall / dunit
             syscall = {
               enable = true;
               testDir = "/opt/gvisor";
               version = "20251218";
+            };
+            dunitest = {
+              enable = true;
+              testDir = "/opt/tests/dunitest";
             };
           };
 
@@ -138,7 +142,7 @@
                 # QEMU 相关参数：
                 # 内核位置
                 kernel = "${buildDir}/kernel/kernel.elf"; # TODO: make it a drv 用nix构建内核，避免指定相对目录
-                # -s -S
+                # 不开 GDB stub，普通启动
                 debug = false;
                 enableVsock = vsockConfig.enable;
                 vsockGuestCid = vsockConfig.guestCid;
@@ -166,9 +170,28 @@
                 # 优先使用系统 QEMU，避免 Nix 下载 QEMU 依赖
                 preferSystemQemu = true;
               };
+              qemuScriptsDebug = import ./tools/qemu/default.nix {
+                inherit
+                  lib
+                  pkgs
+                  testOpt
+                  diskPath
+                  ;
+                # QEMU 相关参数：
+                # 内核位置
+                kernel = "${buildDir}/kernel/kernel.elf";
+                # 开启 GDB stub，用于调试
+                debug = true;
+                enableVsock = vsockConfig.enable;
+                vsockGuestCid = vsockConfig.guestCid;
+                vsockDeviceModel = vsockConfig.deviceModel;
+                # 启用 VM 状态管理，与 make qemu 行为保持一致
+                vmstateDir = "${buildDir}/vmstate";
+              };
 
               startPkg = qemuScripts.${target};
               startSystemPkg = qemuScriptsSystem.${target};
+              startDebugPkg = qemuScriptsDebug.${target};
               rootfsPkg = pkgs.callPackage ./user/default.nix {
                 inherit
                   lib
@@ -183,6 +206,23 @@
                   diskPath
                   ;
               };
+
+              gdbBin = if target == "x86_64" then "rust-gdb" else "gdb-multiarch";
+              gdbScript = pkgs.writeScriptBin "dragonos-gdb" ''
+                #!${pkgs.runtimeShell}
+                GDB_PORT_FILE="${buildDir}/vmstate/gdb"
+                if [ ! -f "$GDB_PORT_FILE" ]; then
+                  echo "Error: VM not running or GDB port not allocated"
+                  echo "Start VM first: nix run .#start-debug-''${target}"
+                  exit 1
+                fi
+                GDB_PORT=$(cat "$GDB_PORT_FILE")
+                GDB_INIT_TMP=$(mktemp)
+                trap "rm -f $GDB_INIT_TMP" EXIT
+                sed "s/{{GDB_PORT}}/$GDB_PORT/" ${./tools/.gdbinit} > "$GDB_INIT_TMP"
+                echo "Connecting to GDB port: $GDB_PORT"
+                exec ${gdbBin} -n -x "$GDB_INIT_TMP"
+              '';
 
               # 一键化构建启动脚本 (yolo: You Only Live Once - 一条命令跑通全部)
               runApp = pkgs.writeScriptBin "dragonos-yolo" ''
@@ -221,6 +261,11 @@
                   program = "${startSystemPkg}/bin/dragonos-run";
                   meta.description = "以系统 QEMU 启动DragonOS (${target})";
                 };
+                "start-debug-${target}" = {
+                  type = "app";
+                  program = "${startDebugPkg}/bin/dragonos-run";
+                  meta.description = "以调试模式启动DragonOS (开启GDB stub, ${target})";
+                };
                 # rootfs 中涉及到基于docker镜像的rootfs构建，修改了 user/ 下软件包相关内容后，
                 # rootfs 的docker镜像会重复构建，并且由于nix特性，副本会全部保留
                 # 因此可能会占很多空间，如果要清理空间请执行 nix store gc
@@ -229,12 +274,19 @@
                   program = "${rootfsPkg}/bin/dragonos-rootfs";
                   meta.description = "构建 ${target} rootfs 镜像";
                 };
+                "gdb-${target}" = {
+                  type = "app";
+                  program = "${gdbScript}/bin/dragonos-gdb";
+                  meta.description = "Connect GDB to running DragonOS (${target})";
+                };
               };
               packages = {
                 "yolo-${target}" = runApp;
                 "start-${target}" = startPkg;
                 "start-system-${target}" = startSystemPkg;
+                "start-debug-${target}" = startDebugPkg;
                 "rootfs-${target}" = rootfsPkg;
+                "gdb-${target}" = gdbScript;
               };
             };
 

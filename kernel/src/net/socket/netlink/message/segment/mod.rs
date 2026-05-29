@@ -30,7 +30,13 @@ pub enum CSegmentType {
     NEWROUTE = 24,
     DELROUTE = 25,
     GETROUTE = 26,
-    // TODO 补充
+    NEWNEIGH = 28,
+    DELNEIGH = 29,
+    GETNEIGH = 30,
+
+    NEWRULE = 32,
+    DELRULE = 33,
+    GETRULE = 34,
 }
 
 impl TryFrom<u16> for CSegmentType {
@@ -52,6 +58,12 @@ impl TryFrom<u16> for CSegmentType {
             24 => Ok(CSegmentType::NEWROUTE),
             25 => Ok(CSegmentType::DELROUTE),
             26 => Ok(CSegmentType::GETROUTE),
+            28 => Ok(CSegmentType::NEWNEIGH),
+            29 => Ok(CSegmentType::DELNEIGH),
+            30 => Ok(CSegmentType::GETNEIGH),
+            32 => Ok(CSegmentType::NEWRULE),
+            33 => Ok(CSegmentType::DELRULE),
+            34 => Ok(CSegmentType::GETRULE),
             _ => Err(SystemError::EINVAL),
         }
     }

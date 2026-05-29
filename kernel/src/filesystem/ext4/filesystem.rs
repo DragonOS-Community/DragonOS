@@ -1,21 +1,28 @@
-use crate::driver::base::block::gendisk::GenDisk;
-use crate::driver::base::device::device_number::DeviceNumber;
-use crate::filesystem::ext4::inode::Ext4Inode;
-use crate::filesystem::vfs::fcntl::AtFlags;
-use crate::filesystem::vfs::utils::{user_path_at, DName};
-use crate::filesystem::vfs::vcore::{generate_inode_id, try_find_gendisk};
-use crate::filesystem::vfs::{
-    self, FileSystem, FileSystemMakerData, IndexNode, Magic, MountableFileSystem, FSMAKER,
-    VFS_MAX_FOLLOW_SYMLINK_TIMES,
+use crate::{
+    driver::base::{block::gendisk::GenDisk, device::device_number::DeviceNumber},
+    filesystem::{
+        ext4::inode::{Ext4Inode, InodeDirtyState},
+        vfs::{
+            self,
+            fcntl::AtFlags,
+            utils::{user_path_at, DName},
+            vcore::{generate_inode_id, try_find_gendisk},
+            FileSystem, FileSystemMakerData, IndexNode, Magic, MountableFileSystem, FSMAKER,
+            VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        },
+    },
+    libs::mutex::Mutex,
+    mm::{
+        fault::{PageFaultHandler, PageFaultMessage},
+        VmFaultReason,
+    },
+    process::ProcessManager,
+    register_mountable_fs,
 };
-use crate::libs::mutex::Mutex;
-use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
-use crate::mm::VmFaultReason;
-use crate::process::ProcessManager;
-use crate::register_mountable_fs;
 use alloc::{
     collections::BTreeMap,
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use kdepends::another_ext4;
 use linkme::distributed_slice;
@@ -31,6 +38,9 @@ pub struct Ext4FileSystem {
 
     /// 根 inode
     root_inode: Arc<LockedExt4Inode>,
+
+    /// 元数据（size/mtime）脏但尚未刷盘的 inode 列表。
+    dirty_inodes: Mutex<Vec<Arc<LockedExt4Inode>>>,
 }
 
 impl FileSystem for Ext4FileSystem {
@@ -70,9 +80,133 @@ impl FileSystem for Ext4FileSystem {
     ) -> VmFaultReason {
         PageFaultHandler::filemap_map_pages(pfm, start_pgoff, end_pgoff)
     }
+
+    fn sync_fs(&self, _wait: bool) -> Result<(), SystemError> {
+        self.flush_dirty_inodes()
+    }
 }
 
 impl Ext4FileSystem {
+    pub(super) fn mark_inode_dirty(inode: &Arc<LockedExt4Inode>, dirty: InodeDirtyState) {
+        let (fs, should_queue) = {
+            let mut guard = inode.0.lock();
+            guard.dirty_state.insert(dirty);
+            let should_queue = !guard
+                .dirty_state
+                .intersects(InodeDirtyState::QUEUED | InodeDirtyState::WRITEBACK);
+            if should_queue {
+                guard.dirty_state.insert(InodeDirtyState::QUEUED);
+            }
+            (guard.fs_ptr.upgrade(), should_queue)
+        };
+
+        if should_queue {
+            if let Some(fs) = fs {
+                fs.dirty_inodes.lock().push(inode.clone());
+            }
+        }
+    }
+
+    fn flush_dirty_inodes(&self) -> Result<(), SystemError> {
+        let dirty: Vec<Arc<LockedExt4Inode>> = {
+            let mut guard = self.dirty_inodes.lock();
+            if guard.is_empty() {
+                return Ok(());
+            }
+            core::mem::take(&mut *guard)
+        };
+
+        let mut last_err = Ok(());
+        let mut requeue: Vec<Arc<LockedExt4Inode>> = Vec::new();
+        for inode in dirty {
+            let mut should_requeue = false;
+            let result = {
+                let _io_guard = inode.1.lock();
+                let (fs, inode_num, snapshot_dirty, cached_size, cached_mtime) = {
+                    let mut guard = inode.0.lock();
+                    guard.dirty_state.remove(InodeDirtyState::QUEUED);
+                    let snapshot_dirty = guard
+                        .dirty_state
+                        .intersection(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY);
+                    if snapshot_dirty.is_empty() {
+                        guard.dirty_state.remove(InodeDirtyState::WRITEBACK);
+                        continue;
+                    }
+                    guard.dirty_state.insert(InodeDirtyState::WRITEBACK);
+                    (
+                        guard.fs_ptr.upgrade(),
+                        guard.inner_inode_num,
+                        snapshot_dirty,
+                        guard.cached_file_size,
+                        guard.cached_mtime,
+                    )
+                };
+
+                let result = if let Some(fs) = fs {
+                    let size = if snapshot_dirty.contains(InodeDirtyState::SIZE_DIRTY) {
+                        match cached_size {
+                            Some(size) => Ok(Some(size)),
+                            None => fs
+                                .fs
+                                .getattr(inode_num)
+                                .map(|attr| Some(attr.size))
+                                .map_err(SystemError::from),
+                        }
+                    } else {
+                        Ok(None)
+                    };
+                    size.and_then(|size| {
+                        let mtime = if snapshot_dirty.contains(InodeDirtyState::MTIME_DIRTY) {
+                            cached_mtime
+                        } else {
+                            None
+                        };
+                        fs.fs
+                            .commit_inode_metadata(inode_num, size, mtime)
+                            .map_err(SystemError::from)
+                    })
+                } else {
+                    Err(SystemError::EIO)
+                };
+
+                let mut guard = inode.0.lock();
+                if result.is_ok() {
+                    if snapshot_dirty.contains(InodeDirtyState::SIZE_DIRTY)
+                        && guard.cached_file_size == cached_size
+                    {
+                        guard.dirty_state.remove(InodeDirtyState::SIZE_DIRTY);
+                    }
+                    if snapshot_dirty.contains(InodeDirtyState::MTIME_DIRTY)
+                        && guard.cached_mtime == cached_mtime
+                    {
+                        guard.dirty_state.remove(InodeDirtyState::MTIME_DIRTY);
+                    }
+                }
+                guard.dirty_state.remove(InodeDirtyState::WRITEBACK);
+                if guard
+                    .dirty_state
+                    .intersects(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY)
+                {
+                    guard.dirty_state.insert(InodeDirtyState::QUEUED);
+                    should_requeue = true;
+                }
+                result
+            };
+
+            if let Err(e) = result {
+                log::warn!("flush_dirty_inodes: 元数据刷盘失败: {:?}", e);
+                last_err = Err(e);
+            }
+            if should_requeue {
+                requeue.push(inode);
+            }
+        }
+        if !requeue.is_empty() {
+            self.dirty_inodes.lock().extend(requeue);
+        }
+        last_err
+    }
+
     fn read_statfs_from_superblock(&self) -> Result<vfs::SuperBlock, SystemError> {
         let ext4_sb = self.fs.super_block()?;
         let block_size = ext4_sb.block_size();
@@ -82,7 +216,7 @@ impl Ext4FileSystem {
         let reserved = ext4_sb.reserved_blocks_count();
 
         let mut sb = vfs::SuperBlock::new(Magic::EXT4_MAGIC, block_size, 255);
-        // Keep Linux ext4 semantics: f_blocks excludes metadata overhead.
+        // Linux ext4 语义：f_blocks 不包含元数据开销。
         sb.blocks = blocks.saturating_sub(overhead_blocks);
         sb.bfree = bfree;
         sb.bavail = bfree.saturating_sub(reserved);
@@ -117,8 +251,7 @@ impl Ext4FileSystem {
                         special_node: None,
                         cached_file_size: None,
                         cached_mtime: None,
-                        size_dirty: false,
-                        mtime_dirty: false,
+                        dirty_state: super::inode::InodeDirtyState::empty(),
                     }),
                     Mutex::new(()),
                 )
@@ -128,6 +261,7 @@ impl Ext4FileSystem {
             fs,
             raw_dev,
             root_inode,
+            dirty_inodes: Mutex::new(Vec::new()),
         });
 
         let mut guard = fs.root_inode.0.lock();

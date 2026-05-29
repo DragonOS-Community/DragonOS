@@ -1,5 +1,8 @@
+use crate::filesystem::epoll::{event_poll::EventPoll, EPollEventType};
+use crate::filesystem::vfs::fasync::{FAsyncItems, FASYNC_POLL_IN};
 use crate::libs::mutex::Mutex;
 use crate::libs::wait_queue::WaitQueue;
+use crate::net::socket::common::EPollItems;
 use crate::process::ProcessState;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -32,13 +35,22 @@ impl<Message> MessageQueue<Message> {
 pub struct MessageReceiver<Message> {
     message_queue: MessageQueue<Message>,
     wait_queue: Arc<WaitQueue>,
+    epoll_items: Arc<EPollItems>,
+    fasync_items: Arc<FAsyncItems>,
 }
 
 impl<Message> MessageReceiver<Message> {
-    pub fn new(message_queue: MessageQueue<Message>, wait_queue: Arc<WaitQueue>) -> Self {
+    pub fn new(
+        message_queue: MessageQueue<Message>,
+        wait_queue: Arc<WaitQueue>,
+        epoll_items: Arc<EPollItems>,
+        fasync_items: Arc<FAsyncItems>,
+    ) -> Self {
         Self {
             message_queue,
             wait_queue,
+            epoll_items,
+            fasync_items,
         }
     }
 
@@ -46,6 +58,9 @@ impl<Message> MessageReceiver<Message> {
         self.message_queue.enqueue(message)?;
         // 唤醒等待队列中的线程
         self.wait_queue.wakeup(Some(ProcessState::Blocked(true)));
+        let _ =
+            EventPoll::wakeup_epoll(self.epoll_items.as_ref().as_ref(), EPollEventType::EPOLLIN);
+        self.fasync_items.send_sigio(FASYNC_POLL_IN);
         Ok(())
     }
 }

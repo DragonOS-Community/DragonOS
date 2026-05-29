@@ -1,6 +1,6 @@
 use core::{
     fmt,
-    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use alloc::{string::String, sync::Arc, vec::Vec};
@@ -28,7 +28,7 @@ use crate::{
         vfs::FilldirContext,
     },
     ipc::{kill::send_signal_to_pid, pipe::PipeFsPrivateData},
-    libs::{casting::DowncastArc, mutex::Mutex, rwsem::RwSem},
+    libs::{casting::DowncastArc, errseq::ErrSeqValue, mutex::Mutex, rwsem::RwSem},
     mm::{
         page::PageFlags,
         readahead::{page_cache_async_readahead, page_cache_sync_readahead, FileReadaheadState},
@@ -467,7 +467,9 @@ pub struct File {
     /// 预读状态
     ra_state: Mutex<FileReadaheadState>,
     /// 当前 open file description 已观测到的 page cache 写回错误序列。
-    wb_error_seq: AtomicU64,
+    wb_error_seq: Mutex<ErrSeqValue>,
+    /// 当前 open file description 已观测到的 superblock 写回错误序列。
+    sb_error_seq: Mutex<ErrSeqValue>,
 }
 
 impl File {
@@ -480,12 +482,46 @@ impl File {
         &self,
         page_cache: &Arc<PageCache>,
     ) -> Result<(), SystemError> {
-        let since = self.wb_error_seq.load(Ordering::Acquire);
-        let Some((seq, error)) = page_cache.check_writeback_error_since(since) else {
+        let since = *self.wb_error_seq.lock();
+        if page_cache.check_writeback_error_since(since).is_none() {
             return Ok(());
+        }
+
+        let mut since = self.wb_error_seq.lock();
+        match page_cache.check_and_advance_writeback_error(&mut since) {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    pub fn check_and_advance_sb_wb_error(
+        &self,
+        mount_fs: &Arc<super::mount::MountFS>,
+    ) -> Result<(), SystemError> {
+        let mut since = self.sb_error_seq.lock();
+        match mount_fs.check_and_advance_wb_error(&mut since) {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    pub fn sync_range_and_check_wb_error(
+        &self,
+        start: usize,
+        end: usize,
+        datasync: bool,
+    ) -> Result<(), SystemError> {
+        let inode = self.inode();
+        let sync_result = inode.sync_file_range(start, end, datasync, self.private_data.lock());
+        let wb_result = match inode.page_cache() {
+            Some(page_cache) => self.check_and_advance_wb_error(&page_cache),
+            None => Ok(()),
         };
-        self.wb_error_seq.store(seq, Ordering::Release);
-        Err(error)
+
+        match sync_result {
+            Err(e) => Err(e),
+            Ok(()) => wb_result,
+        }
     }
 
     fn maybe_kill_suid_sgid_after_write(&self) -> Result<(), SystemError> {
@@ -707,6 +743,11 @@ impl File {
             .page_cache()
             .map(|page_cache| page_cache.sample_writeback_error())
             .unwrap_or(0);
+        let sb_error_seq = inode
+            .clone()
+            .downcast_arc::<MountFSInode>()
+            .map(|mnt_inode| mnt_inode.mount_fs().sample_wb_error())
+            .unwrap_or(0);
 
         let f = File {
             open_file_id: alloc_open_file_id(),
@@ -721,7 +762,8 @@ impl File {
             owner: Mutex::new(FileOwner::new()),
             posix_lock_key,
             ra_state: Mutex::new(FileReadaheadState::new()),
-            wb_error_seq: AtomicU64::new(wb_error_seq),
+            wb_error_seq: Mutex::new(wb_error_seq),
+            sb_error_seq: Mutex::new(sb_error_seq),
         };
 
         return Ok(f);
@@ -1251,7 +1293,8 @@ impl File {
             owner: Mutex::new(FileOwner::new()),
             posix_lock_key: self.posix_lock_key,
             ra_state: Mutex::new(self.ra_state.lock().clone()),
-            wb_error_seq: AtomicU64::new(self.wb_error_seq.load(Ordering::Acquire)),
+            wb_error_seq: Mutex::new(*self.wb_error_seq.lock()),
+            sb_error_seq: Mutex::new(*self.sb_error_seq.lock()),
         };
         // 调用inode的open方法，让inode知道有新的文件打开了这个inode
         // TODO: reopen is not a good idea for some inodes, need a better design

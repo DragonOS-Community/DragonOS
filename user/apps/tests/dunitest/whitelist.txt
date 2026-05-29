@@ -3,12 +3,14 @@
 demo/gtest_demo
 normal/capability
 normal/fdatasync
+normal/syncfs_semantics
 normal/fcntl_lock
 normal/fcntl_signal
 normal/epoll_timeout_budget
 normal/devpts_dir_read
 normal/test_pivot_root
 normal/mount_reconfigure
+normal/mount_propagation
 normal/overlayfs_semantics
 normal/test_fchown_o_path
 normal/proc_self_limits
@@ -18,6 +20,8 @@ normal/sched_affinity
 normal/sync_file_range
 normal/splice_concurrent_io
 normal/rcu_selftest
+normal/errseq_selftest
+normal/errseq_writeback_reporting
 normal/test_tlb_shootdown
 normal/pid_namespace_fork
 normal/tcp_close_semantics
@@ -35,3 +39,4 @@ normal/tty_tcflush
 normal/signal_fpstate_sigreturn
 normal/general_protection_signal
 normal/seccomp
+normal/process_signal_fork

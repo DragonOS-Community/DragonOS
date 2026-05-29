@@ -135,10 +135,7 @@ impl FileOps for StatFileOps {
             let basic = pcb.basic();
             (basic.name().to_string(), basic.user_vm())
         };
-        let state = {
-            let sched = pcb.sched_info();
-            sched.inner_lock_read_irqsave().state()
-        };
+        let state = pcb.sched_info().state();
         let tty_nr = {
             pcb.sig_info_irqsave()
                 .tty()
@@ -148,13 +145,8 @@ impl FileOps for StatFileOps {
         let cpu_time = pcb.cputime();
         let utime = ns_to_clock_t(cpu_time.utime.load(Ordering::Relaxed));
         let stime = ns_to_clock_t(cpu_time.stime.load(Ordering::Relaxed));
-        let (priority, nice) = {
-            let prio_data = pcb.sched_info().prio_data();
-            (
-                prio_data.prio as i64,
-                PrioUtil::prio_to_nice(prio_data.static_prio) as i64,
-            )
-        };
+        let priority = pcb.sched_info().prio() as i64;
+        let nice = PrioUtil::prio_to_nice(pcb.sched_info().static_prio()) as i64;
         let num_threads = pcb
             .task_pid_ptr(PidType::TGID)
             .map(|tgid_pid| tgid_pid.tasks_iter(PidType::TGID).count() as i64)

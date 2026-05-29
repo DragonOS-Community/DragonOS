@@ -42,7 +42,7 @@ impl TryFrom<u16> for AddrAttrClass {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum AddrAttr {
     Address(Vec<u8>),
     Local(Vec<u8>),

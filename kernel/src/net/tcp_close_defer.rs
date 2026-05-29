@@ -11,11 +11,13 @@
 
 use alloc::sync::Weak;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::libs::mutex::Mutex;
 use crate::net::socket::inet::InetSocket;
 
 const TCP_ORPHAN_MAX_LIFETIME_SECS: u64 = 60;
+const TCP_CLOSE_REAP_BUDGET: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeferredTcpCloseKind {
@@ -80,6 +82,7 @@ struct ClosingTcpSocket {
 #[derive(Debug)]
 pub struct TcpCloseDefer {
     closing: Mutex<Vec<ClosingTcpSocket>>,
+    reap_cursor: AtomicUsize,
     stats: Mutex<TcpCloseDeferStats>,
 }
 
@@ -87,6 +90,7 @@ impl TcpCloseDefer {
     pub fn new() -> Self {
         Self {
             closing: Mutex::new(Vec::new()),
+            reap_cursor: AtomicUsize::new(0),
             stats: Mutex::new(TcpCloseDeferStats::default()),
         }
     }
@@ -142,8 +146,18 @@ impl TcpCloseDefer {
         if closing.is_empty() {
             return;
         }
-        let mut i = 0;
-        while i < closing.len() {
+        let max_scan = closing.len().min(TCP_CLOSE_REAP_BUDGET);
+        let mut scanned = 0usize;
+        let mut i = self
+            .reap_cursor
+            .load(Ordering::Relaxed)
+            .min(closing.len() - 1);
+        while scanned < max_scan && !closing.is_empty() {
+            if i >= closing.len() {
+                i = 0;
+            }
+            scanned += 1;
+
             let handle = closing[i].handle;
             let state = sockets.get::<smoltcp::socket::tcp::Socket>(handle).state();
             if state != closing[i].last_state {
@@ -186,11 +200,19 @@ impl TcpCloseDefer {
                 continue;
             }
 
-            if matches!(state, smoltcp::socket::tcp::State::Closed) {
-                let rst_pending = sockets
-                    .get::<smoltcp::socket::tcp::Socket>(handle)
-                    .remote_endpoint()
-                    .is_some();
+            // Linux moves TIME-WAIT into a lightweight inet_timewait_sock.  Keeping
+            // fd-less smoltcp TIME-WAIT sockets in SocketSet makes every iface.poll()
+            // scan historical closes, so reclaim the full socket once no TcpSocket
+            // user can observe the handle any more.
+            if matches!(
+                state,
+                smoltcp::socket::tcp::State::Closed | smoltcp::socket::tcp::State::TimeWait
+            ) {
+                let rst_pending = matches!(state, smoltcp::socket::tcp::State::Closed)
+                    && sockets
+                        .get::<smoltcp::socket::tcp::Socket>(handle)
+                        .remote_endpoint()
+                        .is_some();
                 let is_reset_close = closing[i]._kind == DeferredTcpCloseKind::Reset;
                 if rst_pending && !is_reset_close && !orphan_timed_out {
                     i += 1;
@@ -214,6 +236,12 @@ impl TcpCloseDefer {
                 continue;
             }
             i += 1;
+        }
+
+        if closing.is_empty() {
+            self.reap_cursor.store(0, Ordering::Relaxed);
+        } else {
+            self.reap_cursor.store(i % closing.len(), Ordering::Relaxed);
         }
     }
 }

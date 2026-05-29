@@ -1,6 +1,6 @@
 use core::{fmt::Formatter, sync::atomic::AtomicU32};
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{string::ToString, sync::Arc, vec::Vec};
 use hashbrown::HashMap;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
@@ -9,6 +9,7 @@ use crate::{
     driver::base::{
         block::gendisk::GenDisk,
         device::{device_number::Major, DevName},
+        kobject::KObject,
     },
     filesystem::{
         devfs::{devfs_register, devfs_unregister},
@@ -162,6 +163,7 @@ impl BlockDevManager {
             );
             e
         })?;
+        self.emit_gendisk_uevent(dev, dname.as_ref(), "add");
         Ok(())
     }
 
@@ -222,9 +224,30 @@ impl BlockDevManager {
         }
         drop(inner);
 
+        for gendisk in &gendisks {
+            let dname = gendisk.dname()?;
+            self.emit_gendisk_uevent(dev, dname.as_ref(), "remove");
+        }
+
         let mut meta_inner = blk_meta.inner();
         meta_inner.gendisks.clear();
         Ok(())
+    }
+
+    fn emit_gendisk_uevent(&self, dev: &Arc<dyn BlockDevice>, devname: &str, action: &str) {
+        let kobj = dev.device() as Arc<dyn KObject>;
+        let Ok(parent_devpath) = <dyn KObject>::devpath(&kobj) else {
+            return;
+        };
+        let devpath = format!("{parent_devpath}/block/{devname}");
+        let _ = <dyn KObject>::emit_uevent(
+            action,
+            &devpath,
+            &[
+                ("SUBSYSTEM", "block".into()),
+                ("DEVNAME", devname.to_string()),
+            ],
+        );
     }
     /// 通过路径查找gendisk
     ///

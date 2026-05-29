@@ -1130,6 +1130,10 @@ impl CfsRunQueue {
         }
 
         self.nr_running -= 1;
+        debug_assert!(
+            self.nr_running < i64::MAX as u64,
+            "cfs_rq nr_running underflow"
+        );
         if se.is_idle() {
             self.idle_nr_running -= 1;
         }
@@ -1582,7 +1586,7 @@ impl Scheduler for CompletelyFairScheduler {
         }
     }
 
-    fn check_preempt_currnet(
+    fn check_preempt_current(
         rq: &mut CpuRunQueue,
         pcb: &Arc<crate::process::ProcessControlBlock>,
         wake_flags: WakeupFlags,

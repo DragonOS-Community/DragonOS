@@ -341,8 +341,15 @@ impl LoopbackInterface {
     ///
     /// ## 返回值
     /// 返回一个 `Arc<Self>`，即一个指向新创建的 `LoopbackInterface` 实例的智能指针。
-    pub fn new(mut driver: LoopbackDriver) -> Arc<Self> {
-        let iface_id = generate_iface_id();
+    pub fn new(driver: LoopbackDriver) -> Arc<Self> {
+        Self::new_with_ifindex(driver, generate_iface_id())
+    }
+
+    /// 在指定网络命名空间中创建 loopback，使用给定的 per-netns ifindex（Linux 新 netns 中 lo 通常为 1）。
+    pub fn new_with_ifindex(mut driver: LoopbackDriver, ifindex: usize) -> Arc<Self> {
+        use smoltcp::phy::Device;
+
+        let iface_id = ifindex;
 
         // let hardware_addr = HardwareAddress::Ethernet(smoltcp::wire::EthernetAddress([
         //     0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -376,7 +383,7 @@ impl LoopbackInterface {
             routes_map
                 .push(smoltcp::iface::Route {
                     cidr,
-                    via_router: addr,
+                    via_router: None,
                     preferred_until: None,
                     expires_at: None,
                 })
@@ -385,7 +392,7 @@ impl LoopbackInterface {
             routes_map
                 .push(smoltcp::iface::Route {
                     cidr: cidr6,
-                    via_router: addr6,
+                    via_router: None,
                     preferred_until: None,
                     expires_at: None,
                 })
@@ -396,12 +403,15 @@ impl LoopbackInterface {
             | InterfaceFlags::UP
             | InterfaceFlags::RUNNING
             | InterfaceFlags::LOWER_UP;
+        let mtu = driver.capabilities().max_transmission_unit;
 
         let iface = Arc::new(LoopbackInterface {
             driver: LoopbackDriverWapper(UnsafeCell::new(driver)),
             common: IfaceCommon::new(
                 iface_id,
                 super::types::InterfaceType::LOOPBACK,
+                Self::DEVICE_NAME.to_string(),
+                mtu,
                 flags,
                 iface,
             ),
@@ -467,11 +477,11 @@ impl KObject for LoopbackInterface {
     }
 
     fn name(&self) -> String {
-        Self::DEVICE_NAME.to_string()
+        self.common.name()
     }
 
-    fn set_name(&self, _name: String) {
-        // do nothing
+    fn set_name(&self, name: String) {
+        self.common.set_name(name);
     }
 
     fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
@@ -566,7 +576,7 @@ impl Iface for LoopbackInterface {
     }
 
     fn iface_name(&self) -> String {
-        Self::DEVICE_NAME.to_string()
+        self.common.name()
     }
 
     /// 由于lo网卡设备不是实际的物理设备，其mac地址需要手动设置为一个默认值，这里默认为00:00:00:00:00
@@ -620,12 +630,7 @@ impl Iface for LoopbackInterface {
     }
 
     fn mtu(&self) -> usize {
-        use smoltcp::phy::Device;
-
-        self.driver
-            .force_get_mut()
-            .capabilities()
-            .max_transmission_unit
+        self.common.mtu()
     }
 }
 

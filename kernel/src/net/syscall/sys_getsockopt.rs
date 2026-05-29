@@ -14,8 +14,9 @@ use alloc::vec::Vec;
 
 /// getsockopt optval 最大长度限制（一页）
 const MAX_OPTVAL_LEN: usize = MMArch::PAGE_SIZE;
+const NETLINK_LIST_MEMBERSHIPS: usize = 9;
 
-/// 计算实际输出长度：若 optval 为 null 则返回 need，否则返回 min(user_len, need)
+/// 计算实际拷贝长度：若 optval 为 null 则返回 need，否则返回 min(user_len, need)
 #[inline]
 fn calc_out_len(optval: *mut u8, user_len: usize, need: usize) -> usize {
     if optval.is_null() {
@@ -163,12 +164,12 @@ pub(super) fn do_getsockopt(
                     optval_writer.copy_to_user_protected(&bytes[..out_len], 0)?;
                 }
 
-                // 写回实际需要的长度
+                // 写回选项值的实际长度（Linux ABI），而不是截断后的拷贝长度。
                 let mut optlen_writer =
                     UserBufferWriter::new(optlen, core::mem::size_of::<u32>(), from_user)?;
                 optlen_writer
                     .buffer_protected(0)?
-                    .write_one::<u32>(0, &(out_len as u32))?;
+                    .write_one::<u32>(0, &(need as u32))?;
                 return Ok(0);
             }
             PSO::RCVBUF => {
@@ -182,12 +183,12 @@ pub(super) fn do_getsockopt(
                     optval_writer.copy_to_user_protected(&bytes[..out_len], 0)?;
                 }
 
-                // 写回实际需要的长度
+                // 写回选项值的实际长度（Linux ABI），而不是截断后的拷贝长度。
                 let mut optlen_writer =
                     UserBufferWriter::new(optlen, core::mem::size_of::<u32>(), from_user)?;
                 optlen_writer
                     .buffer_protected(0)?
-                    .write_one::<u32>(0, &(out_len as u32))?;
+                    .write_one::<u32>(0, &(need as u32))?;
                 return Ok(0);
             }
             _ => {
@@ -203,12 +204,12 @@ pub(super) fn do_getsockopt(
                     optval_writer.copy_to_user_protected(&kbuf[..out_len], 0)?;
                 }
 
-                // 写回实际需要的长度
+                // 写回选项值的实际长度（Linux ABI），而不是截断后的拷贝长度。
                 let mut optlen_writer =
                     UserBufferWriter::new(optlen, core::mem::size_of::<u32>(), from_user)?;
                 optlen_writer
                     .buffer_protected(0)?
-                    .write_one::<u32>(0, &(out_len as u32))?;
+                    .write_one::<u32>(0, &(written as u32))?;
                 return Ok(0);
             }
         }
@@ -224,6 +225,31 @@ pub(super) fn do_getsockopt(
         let _optname = TcpOption::try_from(optname as i32).map_err(|_| SystemError::ENOPROTOOPT)?;
         // TcpOption::Congestion => return Ok(0),
         // Other TCP options are delegated to the socket implementation below.
+    }
+
+    if matches!(level, PSOL::NETLINK) && optname == NETLINK_LIST_MEMBERSHIPS {
+        let mut kbuf = vec![0u8; MAX_OPTVAL_LEN];
+        let written = socket.option(level, optname, &mut kbuf)?;
+        let out_len = if optval.is_null() {
+            0
+        } else {
+            core::cmp::min(
+                (user_len / core::mem::size_of::<u32>()) * core::mem::size_of::<u32>(),
+                written,
+            )
+        };
+
+        if !optval.is_null() && out_len != 0 {
+            let mut optval_writer = UserBufferWriter::new(optval, out_len, from_user)?;
+            optval_writer.copy_to_user_protected(&kbuf[..out_len], 0)?;
+        }
+
+        let mut optlen_writer =
+            UserBufferWriter::new(optlen, core::mem::size_of::<u32>(), from_user)?;
+        optlen_writer
+            .buffer_protected(0)?
+            .write_one::<u32>(0, &(written as u32))?;
+        return Ok(0);
     }
 
     // 其它 level（如 SOL_IP/SOL_IPV6/SOL_RAW 等）交给具体 socket 实现。
@@ -245,7 +271,7 @@ pub(super) fn do_getsockopt(
             UserBufferWriter::new(optlen, core::mem::size_of::<u32>(), from_user)?;
         optlen_writer
             .buffer_protected(0)?
-            .write_one::<u32>(0, &(out_len as u32))?;
+            .write_one::<u32>(0, &(written as u32))?;
         Ok(0)
     }
 }

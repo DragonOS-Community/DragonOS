@@ -29,6 +29,23 @@ use system_error::SystemError;
 
 use super::filesystem::Ext4FileSystem;
 
+bitflags! {
+    /// Inode 脏状态标志位，对应 Linux `inode->i_state` 中的 `I_DIRTY_*` 位。
+    pub(super) struct InodeDirtyState: u32 {
+        /// 文件大小变更未刷盘，对应 I_DIRTY_SYNC (1 << 0)
+        const SIZE_DIRTY    = 1 << 0;
+        /// mtime 变更未刷盘，对应 I_DIRTY_DATASYNC (1 << 1)
+        const MTIME_DIRTY   = 1 << 1;
+        /// 该 inode 已在文件系统 dirty_inodes 队列中。
+        const QUEUED        = 1 << 3;
+        /// 该 inode 正在执行元数据写回。
+        const WRITEBACK     = 1 << 4;
+        /// 仅时间戳脏（lazytime），对应 I_DIRTY_TIME (1 << 11)
+        #[allow(dead_code)]
+        const TIME_DIRTY    = 1 << 11;
+    }
+}
+
 type PrivateData<'a> = crate::libs::mutex::MutexGuard<'a, vfs::FilePrivateData>;
 
 pub struct Ext4Inode {
@@ -56,10 +73,8 @@ pub struct Ext4Inode {
     pub(super) cached_file_size: Option<u64>,
     /// 缓存的 mtime。普通 buffered write 先更新内存态，fsync/O_SYNC 再刷到磁盘。
     pub(super) cached_mtime: Option<u32>,
-    /// 标记是否有未刷回磁盘的文件大小变更。
-    pub(super) size_dirty: bool,
-    /// 标记是否有未刷回磁盘的 mtime 变更。
-    pub(super) mtime_dirty: bool,
+    /// 脏状态标志位，对应 Linux `inode->i_state & I_DIRTY_*`。
+    pub(super) dirty_state: InodeDirtyState,
 }
 
 #[derive(Debug)]
@@ -247,11 +262,16 @@ impl IndexNode for LockedExt4Inode {
             if write_len > 0 {
                 let written_end = offset.checked_add(write_len).ok_or(SystemError::EFBIG)?;
                 let current_file_size = core::cmp::max(old_file_size, written_end as u64);
-                let mut guard = self.0.lock();
-                guard.cached_file_size = Some(current_file_size);
-                guard.cached_mtime = Some(time);
-                guard.size_dirty = true;
-                guard.mtime_dirty = true;
+                let self_arc = {
+                    let mut guard = self.0.lock();
+                    guard.cached_file_size = Some(current_file_size);
+                    guard.cached_mtime = Some(time);
+                    guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?
+                };
+                Ext4FileSystem::mark_inode_dirty(
+                    &self_arc,
+                    InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY,
+                );
             }
 
             Ok(write_len)
@@ -466,6 +486,27 @@ impl IndexNode for LockedExt4Inode {
         }
     }
 
+    fn sync_file_range(
+        &self,
+        start: usize,
+        end: usize,
+        datasync: bool,
+        _data: PrivateData,
+    ) -> Result<(), SystemError> {
+        if let Some(page_cache) = self.page_cache() {
+            let start_index = start >> MMArch::PAGE_SHIFT;
+            let end_index = end >> MMArch::PAGE_SHIFT;
+            page_cache
+                .manager()
+                .writeback_range(start_index, end_index)?;
+        }
+        self.flush_metadata(datasync)
+    }
+
+    fn write_inode(&self, _wbc: &vfs::WritebackControl) -> Result<(), SystemError> {
+        self.flush_metadata(false)
+    }
+
     fn page_cache(&self) -> Option<Arc<PageCache>> {
         self.0.lock().page_cache.clone()
     }
@@ -500,8 +541,9 @@ impl IndexNode for LockedExt4Inode {
             let mut guard = self.0.lock();
             guard.cached_file_size = Some(metadata.size as u64);
             guard.cached_mtime = Some(to_ext4_time(&metadata.mtime));
-            guard.size_dirty = false;
-            guard.mtime_dirty = false;
+            guard
+                .dirty_state
+                .remove(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY);
         }
 
         Ok(())
@@ -530,8 +572,9 @@ impl IndexNode for LockedExt4Inode {
         {
             let mut guard = self.0.lock();
             guard.cached_file_size = Some(len as u64);
-            guard.size_dirty = false;
-            guard.mtime_dirty = false;
+            guard
+                .dirty_state
+                .remove(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY);
         }
         Ok(())
     }
@@ -934,26 +977,27 @@ impl Ext4Inode {
             special_node: None,
             cached_file_size: None,
             cached_mtime: None,
-            size_dirty: false,
-            mtime_dirty: false,
+            dirty_state: InodeDirtyState::empty(),
         }
     }
 }
 
 impl LockedExt4Inode {
-    fn flush_metadata(&self, datasync: bool) -> Result<(), SystemError> {
+    pub(super) fn flush_metadata(&self, datasync: bool) -> Result<(), SystemError> {
         let _io_guard = self.1.lock();
-        let (fs, inode_num, size_dirty, mtime_dirty, cached_size, cached_mtime) = {
+        let (fs, inode_num, dirty, cached_size, cached_mtime) = {
             let guard = self.0.lock();
             (
                 guard.concret_fs(),
                 guard.inner_inode_num,
-                guard.size_dirty,
-                guard.mtime_dirty,
+                guard.dirty_state,
                 guard.cached_file_size,
                 guard.cached_mtime,
             )
         };
+
+        let size_dirty = dirty.contains(InodeDirtyState::SIZE_DIRTY);
+        let mtime_dirty = dirty.contains(InodeDirtyState::MTIME_DIRTY);
 
         if !size_dirty && (!mtime_dirty || datasync) {
             return Ok(());
@@ -978,10 +1022,10 @@ impl LockedExt4Inode {
 
         let mut guard = self.0.lock();
         if size_dirty && guard.cached_file_size == cached_size {
-            guard.size_dirty = false;
+            guard.dirty_state.remove(InodeDirtyState::SIZE_DIRTY);
         }
         if !datasync && mtime_dirty && guard.cached_mtime == cached_mtime {
-            guard.mtime_dirty = false;
+            guard.dirty_state.remove(InodeDirtyState::MTIME_DIRTY);
         }
         Ok(())
     }

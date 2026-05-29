@@ -1,5 +1,5 @@
 use crate::driver::net::bridge::BridgeDriver;
-use crate::driver::net::loopback::{generate_loopback_iface_default, LoopbackInterface};
+use crate::driver::net::loopback::LoopbackInterface;
 use crate::init::initcall::INITCALL_SUBSYS;
 use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::libs::rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard};
@@ -315,7 +315,10 @@ impl NetNamespace {
 
     pub fn new_empty(user_ns: Arc<UserNamespace>) -> Result<Arc<Self>, SystemError> {
         let counter = get_next_netns_counter();
-        let loopback = generate_loopback_iface_default();
+        let loopback = crate::driver::net::loopback::LoopbackInterface::new_with_ifindex(
+            crate::driver::net::loopback::LoopbackDriver::default(),
+            1,
+        );
 
         let inner = InnerNetNamespace {
             router: Router::new(format!("netns_router_{}", counter)),

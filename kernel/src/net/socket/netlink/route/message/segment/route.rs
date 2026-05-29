@@ -167,6 +167,8 @@ bitflags::bitflags! {
         const CLONED = 0x200;
         const EQUALIZE = 0x400;
         const PREFIX = 0x800;
+        /// `RTM_F_LOOKUP_TABLE` — fib lookup (Linux 6.6).
+        const LOOKUP_TABLE = 0x1000;
     }
 }
 

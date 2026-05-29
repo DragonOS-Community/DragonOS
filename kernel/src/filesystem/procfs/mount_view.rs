@@ -44,9 +44,7 @@ pub(crate) fn open_mount_file_for_target(
     kind: ProcMountRenderKind,
     data: &mut MutexGuard<FilePrivateData>,
 ) -> Result<(), SystemError> {
-    let task = target
-        .thread_group_leader()
-        .ok_or(SystemError::ESRCH)?;
+    let task = target.thread_group_leader().ok_or(SystemError::ESRCH)?;
     open_mount_file_for_task(&task, kind, data)
 }
 

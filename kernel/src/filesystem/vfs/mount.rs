@@ -1776,6 +1776,8 @@ struct InnerMountList {
     mounts: HashMap<Arc<MountPath>, Vec<MountRecord>>,
     /// 便于通过 fs 反查挂载点 inode。
     mfs2ino: HashMap<Arc<MountFS>, InodeId>,
+    /// Reverse lookup from a specific mount to its mount path. The same inode may correspond to multiple propagation replica paths.
+    mfs2mp: HashMap<Arc<MountFS>, Arc<MountPath>>,
     /// inode 到路径的映射，用于子挂载查找。
     ino2mp: HashMap<InodeId, Arc<MountPath>>,
 }
@@ -1794,6 +1796,7 @@ impl MountList {
                 mounts: HashMap::new(),
                 ino2mp: HashMap::new(),
                 mfs2ino: HashMap::new(),
+                mfs2mp: HashMap::new(),
             }),
         })
     }
@@ -1822,6 +1825,7 @@ impl MountList {
             inner.ino2mp.insert(ino, path.clone());
             inner.mfs2ino.insert(fs.clone(), ino);
         }
+        inner.mfs2mp.insert(fs.clone(), path.clone());
         // 若 ino 为 None（如根挂载），仍然保留 mounts 栈用于后续 pop。
     }
 
@@ -1888,6 +1892,7 @@ impl MountList {
                 if let Some(ino) = inner.mfs2ino.remove(&rec_fs) {
                     inner.ino2mp.remove(&ino);
                 }
+                inner.mfs2mp.remove(&rec_fs);
                 if let Some(ino) = rec_ino {
                     inner.ino2mp.remove(&ino);
                 }
@@ -1906,6 +1911,7 @@ impl MountList {
         let mut new_mounts = HashMap::new();
         let mut new_ino2mp = HashMap::new();
         let mut new_mfs2ino = HashMap::new();
+        let mut new_mfs2mp = HashMap::new();
 
         for (old_path, stack) in old_mounts {
             let Some(new_path) = rewrite(old_path.as_str()) else {
@@ -1919,6 +1925,7 @@ impl MountList {
                     new_ino2mp.insert(ino, new_path.clone());
                     new_mfs2ino.insert(rec.fs.clone(), ino);
                 }
+                new_mfs2mp.insert(rec.fs.clone(), new_path.clone());
                 entry.push(rec);
             }
         }
@@ -1926,6 +1933,7 @@ impl MountList {
         inner.mounts = new_mounts;
         inner.ino2mp = new_ino2mp;
         inner.mfs2ino = new_mfs2ino;
+        inner.mfs2mp = new_mfs2mp;
     }
 
     /// # clone_inner - 克隆内部挂载点列表
@@ -1954,11 +1962,7 @@ impl MountList {
 
     #[inline(never)]
     pub fn get_mount_path_by_mountfs(&self, mountfs: &Arc<MountFS>) -> Option<Arc<MountPath>> {
-        let inner = self.inner.read();
-        inner
-            .mfs2ino
-            .get(mountfs)
-            .and_then(|ino| inner.ino2mp.get(ino).cloned())
+        self.inner.read().mfs2mp.get(mountfs).cloned()
     }
 }
 

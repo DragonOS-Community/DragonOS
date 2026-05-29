@@ -18,9 +18,9 @@
 //!                           ▼
 //! ┌─────────────────────────────────────────────────────────────┐
 //! │                   MountPropagation                          │
-//! │  - prop_type: PropagationType                               │
+//! │  - flags: shared/unbindable flags                           │
 //! │  - peer_group_id: PropagationGroupId                        │
-//! │  - master/slaves relationships                              │
+//! │  - master/slaves relationships (slave state)                 │
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 //!
@@ -333,7 +333,21 @@ pub fn get_all_peers(group_id: PropagationGroupId) -> Vec<Arc<MountFS>> {
     PEER_GROUP_REGISTRY.get_all_peers(group_id)
 }
 
-/// Defines the propagation type for mount points, controlling how mount events are shared.
+bitflags! {
+    /// Mount propagation flags.
+    ///
+    /// Linux treats shared and slave as orthogonal state: shared is a flag,
+    /// while slave is represented by the presence of a master mount.  Keep the
+    /// same model here so a mount can be both shared and slave.
+    pub struct PropagationFlags: u32 {
+        /// Mount events propagate bidirectionally with peers.
+        const SHARED = 1 << 0;
+        /// Mount cannot be bind mounted.
+        const UNBINDABLE = 1 << 1;
+    }
+}
+
+/// Defines requested propagation type for mount point change operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PropagationType {
     /// Mount events do not propagate to or from this mount (default)
@@ -357,9 +371,9 @@ pub struct MountPropagation {
 
 /// Inner state protected by lock
 struct MountPropagationInner {
-    /// The type of propagation behavior for this mount
-    prop_type: PropagationType,
-    /// Peer group ID for shared mounts (valid when prop_type is Shared or Slave)
+    /// Propagation flags. Slave state is represented by `master`.
+    flags: PropagationFlags,
+    /// Peer group ID for shared mounts.
     peer_group_id: PropagationGroupId,
     /// Reference to the master mount for slave mounts
     master: Option<Weak<MountFS>>,
@@ -372,7 +386,7 @@ impl MountPropagation {
     pub fn new_private() -> Arc<Self> {
         Arc::new(Self {
             inner: SpinLock::new(MountPropagationInner {
-                prop_type: PropagationType::Private,
+                flags: PropagationFlags::empty(),
                 peer_group_id: PropagationGroupId::NONE,
                 master: None,
                 slaves: Vec::new(),
@@ -384,7 +398,7 @@ impl MountPropagation {
     pub fn new_shared() -> Arc<Self> {
         Arc::new(Self {
             inner: SpinLock::new(MountPropagationInner {
-                prop_type: PropagationType::Shared,
+                flags: PropagationFlags::SHARED,
                 peer_group_id: PropagationGroupId::alloc(),
                 master: None,
                 slaves: Vec::new(),
@@ -396,7 +410,7 @@ impl MountPropagation {
     pub fn new_shared_with_group(group_id: PropagationGroupId) -> Arc<Self> {
         Arc::new(Self {
             inner: SpinLock::new(MountPropagationInner {
-                prop_type: PropagationType::Shared,
+                flags: PropagationFlags::SHARED,
                 peer_group_id: group_id,
                 master: None,
                 slaves: Vec::new(),
@@ -408,7 +422,7 @@ impl MountPropagation {
     pub fn new_slave(master: Weak<MountFS>) -> Arc<Self> {
         Arc::new(Self {
             inner: SpinLock::new(MountPropagationInner {
-                prop_type: PropagationType::Slave,
+                flags: PropagationFlags::empty(),
                 peer_group_id: PropagationGroupId::NONE,
                 master: Some(master),
                 slaves: Vec::new(),
@@ -420,7 +434,7 @@ impl MountPropagation {
     pub fn new_unbindable() -> Arc<Self> {
         Arc::new(Self {
             inner: SpinLock::new(MountPropagationInner {
-                prop_type: PropagationType::Unbindable,
+                flags: PropagationFlags::UNBINDABLE,
                 peer_group_id: PropagationGroupId::NONE,
                 master: None,
                 slaves: Vec::new(),
@@ -430,7 +444,16 @@ impl MountPropagation {
 
     /// Get the current propagation type
     pub fn prop_type(&self) -> PropagationType {
-        self.inner.lock().prop_type
+        let inner = self.inner.lock();
+        if inner.flags.contains(PropagationFlags::UNBINDABLE) {
+            PropagationType::Unbindable
+        } else if inner.flags.contains(PropagationFlags::SHARED) {
+            PropagationType::Shared
+        } else if inner.master.is_some() {
+            PropagationType::Slave
+        } else {
+            PropagationType::Private
+        }
     }
 
     /// Get the peer group ID (0 if not in a shared group)
@@ -440,22 +463,28 @@ impl MountPropagation {
 
     /// Check if this mount is shared
     pub fn is_shared(&self) -> bool {
-        self.inner.lock().prop_type == PropagationType::Shared
+        self.inner.lock().flags.contains(PropagationFlags::SHARED)
     }
 
     /// Check if this mount is private
     pub fn is_private(&self) -> bool {
-        self.inner.lock().prop_type == PropagationType::Private
+        let inner = self.inner.lock();
+        !inner.flags.contains(PropagationFlags::SHARED)
+            && !inner.flags.contains(PropagationFlags::UNBINDABLE)
+            && inner.master.is_none()
     }
 
     /// Check if this mount is a slave
     pub fn is_slave(&self) -> bool {
-        self.inner.lock().prop_type == PropagationType::Slave
+        self.inner.lock().master.is_some()
     }
 
     /// Check if this mount is unbindable
     pub fn is_unbindable(&self) -> bool {
-        self.inner.lock().prop_type == PropagationType::Unbindable
+        self.inner
+            .lock()
+            .flags
+            .contains(PropagationFlags::UNBINDABLE)
     }
 
     /// Get the master mount reference (for slave mounts)
@@ -468,27 +497,34 @@ impl MountPropagation {
     /// Allocates a new peer group ID if not already shared.
     pub fn set_shared(&self) {
         let mut inner = self.inner.lock();
-        if inner.prop_type != PropagationType::Shared {
-            // If transitioning from slave, disconnect from master
-            if inner.prop_type == PropagationType::Slave {
-                inner.master = None;
-            }
-            // Allocate new group ID if needed
-            if !inner.peer_group_id.is_valid() {
-                inner.peer_group_id = PropagationGroupId::alloc();
-            }
-            inner.prop_type = PropagationType::Shared;
+        inner.flags.remove(PropagationFlags::UNBINDABLE);
+        if !inner.peer_group_id.is_valid() {
+            inner.peer_group_id = PropagationGroupId::alloc();
         }
+        inner.flags.insert(PropagationFlags::SHARED);
     }
 
     /// Set shared with a specific group ID (used for propagation)
     pub fn set_shared_with_group(&self, group_id: PropagationGroupId) {
         let mut inner = self.inner.lock();
-        if inner.prop_type == PropagationType::Slave {
-            inner.master = None;
-        }
+        inner.flags.remove(PropagationFlags::UNBINDABLE);
         inner.peer_group_id = group_id;
-        inner.prop_type = PropagationType::Shared;
+        inner.flags.insert(PropagationFlags::SHARED);
+    }
+
+    /// Clear the shared flag without changing slave/master relationships.
+    pub fn clear_shared(&self) {
+        self.inner.lock().flags.remove(PropagationFlags::SHARED);
+    }
+
+    /// Clear the peer group ID.
+    pub fn clear_group_id(&self) {
+        self.inner.lock().peer_group_id = PropagationGroupId::NONE;
+    }
+
+    /// Set the master mount. `Some` makes this mount a slave.
+    pub fn set_master(&self, master: Option<Weak<MountFS>>) {
+        self.inner.lock().master = master;
     }
 
     /// Change propagation type to private
@@ -496,11 +532,11 @@ impl MountPropagation {
     /// Disconnects from peer group and master relationships.
     pub fn set_private(&self) {
         let mut inner = self.inner.lock();
-        if inner.prop_type == PropagationType::Slave {
-            inner.master = None;
-        }
-        // Note: We keep peer_group_id for potential reuse, but mark as private
-        inner.prop_type = PropagationType::Private;
+        inner
+            .flags
+            .remove(PropagationFlags::SHARED | PropagationFlags::UNBINDABLE);
+        inner.peer_group_id = PropagationGroupId::NONE;
+        inner.master = None;
     }
 
     /// Change propagation type to slave
@@ -508,37 +544,43 @@ impl MountPropagation {
     /// If currently shared, becomes a slave of the peer group.
     /// This is typically used when doing `mount --make-slave`.
     pub fn set_slave(&self, master: Option<Weak<MountFS>>) {
-        let mut inner = self.inner.lock();
-        inner.prop_type = PropagationType::Slave;
-        inner.master = master;
-        // Keep peer_group_id so slaves can still receive events from the group
+        self.inner.lock().master = master;
     }
 
     /// Change propagation type to unbindable
     pub fn set_unbindable(&self) {
         let mut inner = self.inner.lock();
-        if inner.prop_type == PropagationType::Slave {
-            inner.master = None;
-        }
-        inner.prop_type = PropagationType::Unbindable;
+        inner.flags.remove(PropagationFlags::SHARED);
+        inner.flags.insert(PropagationFlags::UNBINDABLE);
         inner.peer_group_id = PropagationGroupId::NONE;
+        inner.master = None;
     }
 
     /// Add a slave mount
     pub fn add_slave(&self, slave: Weak<MountFS>) {
         let mut inner = self.inner.lock();
+        inner.slaves.retain(|s| {
+            if s.upgrade().is_some() {
+                !Weak::ptr_eq(s, &slave)
+            } else {
+                false
+            }
+        });
         inner.slaves.push(slave);
     }
 
     /// Remove a slave mount
     pub fn remove_slave(&self, slave: &Weak<MountFS>) {
         let mut inner = self.inner.lock();
-        inner.slaves.retain(|s| !Weak::ptr_eq(s, slave));
+        inner
+            .slaves
+            .retain(|s| s.upgrade().is_some() && !Weak::ptr_eq(s, slave));
     }
 
     /// Get all valid slave mounts
     pub fn slaves(&self) -> Vec<Arc<MountFS>> {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
+        inner.slaves.retain(|s| s.upgrade().is_some());
         inner.slaves.iter().filter_map(|s| s.upgrade()).collect()
     }
 
@@ -546,6 +588,14 @@ impl MountPropagation {
     pub fn cleanup_stale_slaves(&self) {
         let mut inner = self.inner.lock();
         inner.slaves.retain(|s| s.upgrade().is_some());
+    }
+
+    /// Take all currently registered slaves, leaving the slave list empty.
+    pub fn take_slaves(&self) -> Vec<Arc<MountFS>> {
+        let mut inner = self.inner.lock();
+        let slaves = inner.slaves.iter().filter_map(|s| s.upgrade()).collect();
+        inner.slaves.clear();
+        slaves
     }
 
     /// Clone the propagation state for a new mount copy.
@@ -556,7 +606,7 @@ impl MountPropagation {
         let inner = self.inner.lock();
         Arc::new(Self {
             inner: SpinLock::new(MountPropagationInner {
-                prop_type: inner.prop_type,
+                flags: inner.flags,
                 peer_group_id: inner.peer_group_id,
                 master: inner.master.clone(),
                 slaves: Vec::new(), // New copy starts with no slaves
@@ -568,26 +618,18 @@ impl MountPropagation {
     ///
     /// Returns a string like "shared:1" or "master:2" or empty for private.
     pub fn info_string(&self) -> alloc::string::String {
-        use alloc::string::String;
-
         let inner = self.inner.lock();
-        match inner.prop_type {
-            PropagationType::Shared => {
-                if inner.peer_group_id.is_valid() {
-                    alloc::format!("shared:{}", inner.peer_group_id.0)
-                } else {
-                    String::new()
-                }
-            }
-            PropagationType::Slave => {
-                if inner.peer_group_id.is_valid() {
-                    alloc::format!("master:{}", inner.peer_group_id.0)
-                } else {
-                    String::new()
-                }
-            }
-            PropagationType::Private | PropagationType::Unbindable => String::new(),
+        let mut parts = Vec::new();
+        if inner.flags.contains(PropagationFlags::SHARED) && inner.peer_group_id.is_valid() {
+            parts.push(alloc::format!("shared:{}", inner.peer_group_id.0));
         }
+        if let Some(master) = inner.master.as_ref().and_then(|w| w.upgrade()) {
+            let master_group = master.propagation().peer_group_id();
+            if master_group.is_valid() {
+                parts.push(alloc::format!("master:{}", master_group.0));
+            }
+        }
+        parts.join(" ")
     }
 }
 
@@ -596,7 +638,7 @@ impl Clone for MountPropagation {
         let inner = self.inner.lock();
         Self {
             inner: SpinLock::new(MountPropagationInner {
-                prop_type: inner.prop_type,
+                flags: inner.flags,
                 peer_group_id: inner.peer_group_id,
                 master: inner.master.clone(),
                 slaves: inner.slaves.clone(),
@@ -646,37 +688,114 @@ pub fn change_mnt_propagation(
     prop_type: PropagationType,
 ) -> Result<(), SystemError> {
     let propagation = mount.propagation();
-    let old_type = propagation.prop_type();
-    let old_group_id = propagation.peer_group_id();
-
-    // If transitioning FROM shared, unregister from the peer group first
-    if old_type == PropagationType::Shared && prop_type != PropagationType::Shared {
-        unregister_peer(old_group_id, mount);
-    }
 
     match prop_type {
         PropagationType::Shared => {
+            let was_shared = propagation.is_shared();
             propagation.set_shared();
-            // Register in peer group if newly shared
-            if old_type != PropagationType::Shared {
-                let new_group_id = propagation.peer_group_id();
-                register_peer(new_group_id, mount);
+            if !was_shared {
+                register_peer(propagation.peer_group_id(), mount);
             }
         }
         PropagationType::Private => {
+            do_make_slave(mount);
+            detach_from_master(mount);
             propagation.set_private();
         }
         PropagationType::Slave => {
-            // When making a mount a slave, it should become a slave of its
-            // current peer group (if any). For simplicity, we just set it as slave.
-            propagation.set_slave(None);
+            do_make_slave(mount);
         }
         PropagationType::Unbindable => {
+            do_make_slave(mount);
+            detach_from_master(mount);
             propagation.set_unbindable();
         }
     }
 
     Ok(())
+}
+
+/// Convert a mount to Linux slave semantics.
+///
+/// This mirrors Linux `do_make_slave()`:
+/// - if the mount has peers, remove it from the peer group and choose one peer
+///   as the new master;
+/// - if it has no peers but already has a master, keep that master;
+/// - if it has neither peers nor master, orphan its existing slaves and leave
+///   it private;
+/// - otherwise reparent its existing slaves to the new master and make the
+///   mount itself a slave of that master.
+fn do_make_slave(mount: &Arc<MountFS>) {
+    let propagation = mount.propagation();
+    let old_group_id = propagation.peer_group_id();
+    let was_shared = propagation.is_shared();
+    let peers = if was_shared {
+        get_peers(old_group_id, mount)
+    } else {
+        Vec::new()
+    };
+
+    if was_shared {
+        unregister_peer(old_group_id, mount);
+        propagation.clear_shared();
+        propagation.clear_group_id();
+    }
+
+    let master = if peers.is_empty() {
+        propagation.master()
+    } else {
+        choose_slave_master(mount, peers)
+    };
+
+    let Some(master) = master else {
+        for slave in propagation.take_slaves() {
+            slave.propagation().set_master(None);
+        }
+        propagation.set_master(None);
+        return;
+    };
+
+    let mount_weak = Arc::downgrade(mount);
+    if let Some(old_master) = propagation.master() {
+        if !Arc::ptr_eq(&old_master, &master) {
+            old_master.propagation().remove_slave(&mount_weak);
+        }
+    }
+
+    for slave in propagation.take_slaves() {
+        slave
+            .propagation()
+            .set_master(Some(Arc::downgrade(&master)));
+        master.propagation().add_slave(Arc::downgrade(&slave));
+    }
+
+    propagation.set_master(Some(Arc::downgrade(&master)));
+    master.propagation().add_slave(mount_weak);
+}
+
+fn choose_slave_master(mount: &Arc<MountFS>, peers: Vec<Arc<MountFS>>) -> Option<Arc<MountFS>> {
+    let mount_root = mount.root_inner_inode();
+    let fallback = peers.first().cloned();
+    peers
+        .into_iter()
+        .find(|peer| Arc::ptr_eq(&peer.root_inner_inode(), &mount_root))
+        .or(fallback)
+}
+
+fn detach_from_master(mount: &Arc<MountFS>) {
+    let propagation = mount.propagation();
+    if let Some(master) = propagation.master() {
+        master.propagation().remove_slave(&Arc::downgrade(mount));
+    }
+    propagation.set_master(None);
+}
+
+/// Register a copied mount in its master's slave list when it already carries
+/// a master pointer cloned from another mount.
+pub fn register_slave_with_master(mount: &Arc<MountFS>) {
+    if let Some(master) = mount.propagation().master() {
+        master.propagation().add_slave(Arc::downgrade(mount));
+    }
 }
 
 /// Change the propagation type of a mount tree (recursive).
@@ -739,6 +858,9 @@ pub fn propagate_mount(
 ) -> Result<(), SystemError> {
     let propagation = source_mnt.propagation();
     let group_id = propagation.peer_group_id();
+    let source_parent_path = source_mnt
+        .namespace()
+        .and_then(|ns| ns.mount_list().get_mount_path_by_mountfs(source_mnt));
 
     // Only propagate for shared mounts
     if !propagation.is_shared() {
@@ -756,6 +878,7 @@ pub fn propagate_mount(
     // Track which mounts we've already propagated to (to avoid duplicates)
     let mut propagated: HashSet<usize> = HashSet::new();
     propagated.insert(source_mnt.mount_id().into());
+    let mut slave_child_groups = BTreeMap::new();
 
     // Propagate to each peer
     for peer in peers {
@@ -765,7 +888,15 @@ pub fn propagate_mount(
         }
         propagated.insert(peer_id);
 
-        if let Err(e) = propagate_one(&peer, mountpoint_id, new_child, mount_path) {
+        if let Err(e) = propagate_one(
+            &peer,
+            group_id,
+            mountpoint_id,
+            new_child,
+            mount_path,
+            &source_parent_path,
+            &mut slave_child_groups,
+        ) {
             log::warn!("propagate_mount: failed to propagate to peer: {:?}", e);
             // Continue with other peers even if one fails
         }
@@ -779,7 +910,15 @@ pub fn propagate_mount(
         }
         propagated.insert(slave_id);
 
-        if let Err(e) = propagate_one(&slave, mountpoint_id, new_child, mount_path) {
+        if let Err(e) = propagate_one(
+            &slave,
+            group_id,
+            mountpoint_id,
+            new_child,
+            mount_path,
+            &source_parent_path,
+            &mut slave_child_groups,
+        ) {
             log::warn!("propagate_mount: failed to propagate to slave: {:?}", e);
         }
 
@@ -789,7 +928,9 @@ pub fn propagate_mount(
             mountpoint_id,
             new_child,
             mount_path,
+            &source_parent_path,
             &mut propagated,
+            &mut slave_child_groups,
         );
     }
 
@@ -802,9 +943,12 @@ pub fn propagate_mount(
 /// so that all propagated children can propagate events to each other.
 fn propagate_one(
     target_mnt: &Arc<MountFS>,
+    source_group_id: PropagationGroupId,
     mountpoint_id: InodeId,
     source_child: &Arc<MountFS>,
     mount_path: &Arc<MountPath>,
+    source_parent_path: &Option<Arc<MountPath>>,
+    slave_child_groups: &mut BTreeMap<usize, PropagationGroupId>,
 ) -> Result<(), SystemError> {
     // Check if the target has the same mountpoint
     let target_mountpoints = target_mnt.mountpoints();
@@ -817,24 +961,50 @@ fn propagate_one(
     // Clone the child mount for this target
     let cloned_child = source_child.deepcopy(None);
 
-    // The cloned child should join the SAME peer group as source_child,
-    // NOT the target parent's group. This way, all propagated children
-    // form a peer group and can propagate events to each other.
+    // Peer targets receive a peer of the propagated child. Slave targets
+    // receive a slave of the propagated child; joining the master's peer group
+    // would incorrectly allow reverse propagation back to the master side.
     let source_child_prop = source_child.propagation();
-    if source_child_prop.is_shared() {
+    let target_prop = target_mnt.propagation();
+    let target_is_source_peer =
+        target_prop.is_shared() && target_prop.peer_group_id() == source_group_id;
+    if target_is_source_peer && source_child_prop.is_shared() {
         let group_id = source_child_prop.peer_group_id();
         cloned_child.propagation().set_shared_with_group(group_id);
         register_peer(group_id, &cloned_child);
+    } else {
+        let cloned_prop = cloned_child.propagation();
+        if cloned_prop.is_shared() {
+            unregister_peer(cloned_prop.peer_group_id(), &cloned_child);
+        }
+        cloned_prop.set_private();
+        cloned_prop.set_slave(Some(Arc::downgrade(source_child)));
+        source_child_prop.add_slave(Arc::downgrade(&cloned_child));
+
+        if target_prop.is_shared() {
+            let target_group_id = target_prop.peer_group_id();
+            let child_group_id = *slave_child_groups
+                .entry(target_group_id.data())
+                .or_insert_with(PropagationGroupId::alloc);
+            cloned_prop.set_shared_with_group(child_group_id);
+            register_peer(child_group_id, &cloned_child);
+        }
     }
 
     // Add the cloned mount to the target's mountpoints
+    if let Some(source_mountpoint) = source_child.self_mountpoint() {
+        cloned_child.set_self_mountpoint(Some(
+            source_mountpoint.clone_with_new_mount_fs(target_mnt.clone()),
+        ));
+    }
     target_mnt.add_mount(mountpoint_id, cloned_child.clone())?;
 
     // 传播子挂载必须继承目标挂载点的 namespace，
     // 否则后续 is_belongs_to_mntns() 检查会因 namespace 为 None 而误判 EINVAL。
     if let Some(ns) = target_mnt.namespace() {
         cloned_child.set_namespace(Arc::downgrade(&ns));
-        ns.add_mount(Some(mountpoint_id), mount_path.clone(), cloned_child)
+        let target_mount_path = propagated_mount_path(source_parent_path, mount_path, target_mnt);
+        ns.add_mount(Some(mountpoint_id), target_mount_path, cloned_child)
             .inspect_err(|_e| {
                 // 回滚 mountpoints 中已插入的克隆挂载。
                 target_mnt.mountpoints().remove(&mountpoint_id);
@@ -850,7 +1020,9 @@ fn propagate_to_slaves(
     mountpoint_id: InodeId,
     source_child: &Arc<MountFS>,
     mount_path: &Arc<MountPath>,
+    source_parent_path: &Option<Arc<MountPath>>,
     propagated: &mut HashSet<usize>,
+    slave_child_groups: &mut BTreeMap<usize, PropagationGroupId>,
 ) {
     let prop = mnt.propagation();
     for slave in prop.slaves() {
@@ -860,13 +1032,77 @@ fn propagate_to_slaves(
         }
         propagated.insert(slave_id);
 
-        if let Err(e) = propagate_one(&slave, mountpoint_id, source_child, mount_path) {
+        let source_group_id = source_child.propagation().peer_group_id();
+        if let Err(e) = propagate_one(
+            &slave,
+            source_group_id,
+            mountpoint_id,
+            source_child,
+            mount_path,
+            source_parent_path,
+            slave_child_groups,
+        ) {
             log::warn!("propagate_to_slaves: failed: {:?}", e);
         }
 
         // Recurse
-        propagate_to_slaves(&slave, mountpoint_id, source_child, mount_path, propagated);
+        propagate_to_slaves(
+            &slave,
+            mountpoint_id,
+            source_child,
+            mount_path,
+            source_parent_path,
+            propagated,
+            slave_child_groups,
+        );
     }
+}
+
+fn propagated_mount_path(
+    source_parent_path: &Option<Arc<MountPath>>,
+    source_child_path: &Arc<MountPath>,
+    target_mnt: &Arc<MountFS>,
+) -> Arc<MountPath> {
+    let Some(target_parent_path) = target_mnt
+        .namespace()
+        .and_then(|ns| ns.mount_list().get_mount_path_by_mountfs(target_mnt))
+    else {
+        return source_child_path.clone();
+    };
+    let Some(suffix) = source_parent_path
+        .as_ref()
+        .and_then(|parent| mount_path_suffix(parent.as_str(), source_child_path.as_str()))
+    else {
+        return source_child_path.clone();
+    };
+
+    Arc::new(MountPath::from(join_mount_path(
+        target_parent_path.as_str(),
+        suffix,
+    )))
+}
+
+fn mount_path_suffix<'a>(parent: &str, child: &'a str) -> Option<&'a str> {
+    if parent == "/" {
+        return child
+            .strip_prefix('/')
+            .map(|suffix| if suffix.is_empty() { "/" } else { child });
+    }
+
+    child
+        .strip_prefix(parent)
+        .filter(|suffix| suffix.starts_with('/'))
+}
+
+fn join_mount_path(parent: &str, suffix: &str) -> alloc::string::String {
+    if suffix == "/" || suffix.is_empty() {
+        return parent.into();
+    }
+    if parent == "/" {
+        return suffix.into();
+    }
+
+    alloc::format!("{}{}", parent.trim_end_matches('/'), suffix)
 }
 
 /// Propagate an umount event to all peers and slaves.
@@ -941,9 +1177,7 @@ pub fn propagate_umount(
 
 /// Umount at a specific peer mount.
 fn umount_at_peer(peer_mnt: &Arc<MountFS>, mountpoint_id: InodeId) -> Result<(), SystemError> {
-    let child = peer_mnt.mountpoints().get(&mountpoint_id).cloned();
-    if let Some(child) = child {
-        child.sync_filesystem()?;
+    if peer_mnt.mountpoints().contains_key(&mountpoint_id) {
         let Some(child) = peer_mnt.mountpoints().remove(&mountpoint_id) else {
             return Ok(());
         };
@@ -952,12 +1186,16 @@ fn umount_at_peer(peer_mnt: &Arc<MountFS>, mountpoint_id: InodeId) -> Result<(),
         if child_prop.is_shared() {
             unregister_peer(child_prop.peer_group_id(), &child);
         }
+        if let Some(master) = child_prop.master() {
+            master.propagation().remove_slave(&Arc::downgrade(&child));
+            child_prop.set_master(None);
+        }
 
         child.set_self_mountpoint(None);
 
         // 先从 mount_list 移除，再清 namespace，避免 "namespace=None 但 mount_list 仍有记录" 的 TOCTOU 中间态。
         if let Some(ns) = child.namespace() {
-            if let Some(mp) = ns.mount_list().get_mount_path_by_ino(mountpoint_id) {
+            if let Some(mp) = ns.mount_list().get_mount_path_by_mountfs(&child) {
                 ns.remove_mount(mp.as_str());
             }
         }
@@ -993,6 +1231,7 @@ fn propagate_umount_to_slaves(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filesystem::ramfs::RamFS;
 
     #[test]
     fn test_propagation_type_default() {
@@ -1013,5 +1252,144 @@ mod tests {
 
         prop.set_unbindable();
         assert!(prop.is_unbindable());
+    }
+
+    fn new_test_mount(propagation: Arc<MountPropagation>) -> Arc<MountFS> {
+        MountFS::new(
+            RamFS::new(),
+            None,
+            None,
+            propagation,
+            None,
+            MountFlags::empty(),
+            None,
+        )
+    }
+
+    #[test]
+    fn test_make_slave_selects_peer_as_master() {
+        let prop_a = MountPropagation::new_shared();
+        let group_id = prop_a.peer_group_id();
+        let prop_b = MountPropagation::new_shared_with_group(group_id);
+        let mount_a = new_test_mount(prop_a);
+        let mount_b = new_test_mount(prop_b);
+
+        register_peer(group_id, &mount_a);
+        register_peer(group_id, &mount_b);
+
+        change_mnt_propagation(&mount_a, PropagationType::Slave).unwrap();
+
+        let prop_a = mount_a.propagation();
+        assert!(prop_a.is_slave());
+        assert!(!prop_a.is_shared());
+        assert!(prop_a
+            .master()
+            .is_some_and(|master| Arc::ptr_eq(&master, &mount_b)));
+        assert!(mount_b
+            .propagation()
+            .slaves()
+            .iter()
+            .any(|slave| Arc::ptr_eq(slave, &mount_a)));
+    }
+
+    #[test]
+    fn test_make_shared_preserves_slave_master() {
+        let master = new_test_mount(MountPropagation::new_shared());
+        let slave = new_test_mount(MountPropagation::new_slave(Arc::downgrade(&master)));
+        master.propagation().add_slave(Arc::downgrade(&slave));
+
+        change_mnt_propagation(&slave, PropagationType::Shared).unwrap();
+
+        let slave_prop = slave.propagation();
+        assert!(slave_prop.is_shared());
+        assert!(slave_prop.is_slave());
+        assert!(slave_prop.info_string().contains("shared:"));
+        assert!(slave_prop.info_string().contains("master:"));
+    }
+
+    #[test]
+    fn test_make_slave_without_master_orphans_existing_slaves() {
+        let parent = new_test_mount(MountPropagation::new_private());
+        let child = new_test_mount(MountPropagation::new_slave(Arc::downgrade(&parent)));
+        parent.propagation().add_slave(Arc::downgrade(&child));
+
+        change_mnt_propagation(&parent, PropagationType::Slave).unwrap();
+
+        assert!(parent.propagation().is_private());
+        assert!(!child.propagation().is_slave());
+        assert!(parent.propagation().slaves().is_empty());
+    }
+
+    #[test]
+    fn test_slaves_prunes_stale_entries() {
+        let master = new_test_mount(MountPropagation::new_private());
+        {
+            let child = new_test_mount(MountPropagation::new_slave(Arc::downgrade(&master)));
+            master.propagation().add_slave(Arc::downgrade(&child));
+            assert_eq!(master.propagation().slaves().len(), 1);
+        }
+
+        assert!(master.propagation().slaves().is_empty());
+    }
+
+    #[test]
+    fn test_umount_at_peer_detaches_slave_from_master() {
+        let master = new_test_mount(MountPropagation::new_private());
+        let peer = new_test_mount(MountPropagation::new_private());
+        let child = new_test_mount(MountPropagation::new_slave(Arc::downgrade(&master)));
+        let mountpoint_id = InodeId::new(7);
+
+        master.propagation().add_slave(Arc::downgrade(&child));
+        peer.add_mount(mountpoint_id, child.clone()).unwrap();
+
+        umount_at_peer(&peer, mountpoint_id).unwrap();
+
+        assert!(peer.mountpoints().get(&mountpoint_id).is_none());
+        assert!(!child.propagation().is_slave());
+        assert!(master.propagation().slaves().is_empty());
+    }
+
+    #[test]
+    fn test_propagate_to_shared_slave_keeps_child_shared_slave() {
+        let master = new_test_mount(MountPropagation::new_shared());
+        let source_child = new_test_mount(MountPropagation::new_shared());
+        let source_child_group = source_child.propagation().peer_group_id();
+
+        let slave_group = PropagationGroupId::alloc();
+        let slave_a_prop = MountPropagation::new_slave(Arc::downgrade(&master));
+        slave_a_prop.set_shared_with_group(slave_group);
+        let slave_b_prop = MountPropagation::new_slave(Arc::downgrade(&master));
+        slave_b_prop.set_shared_with_group(slave_group);
+        let slave_a = new_test_mount(slave_a_prop);
+        let slave_b = new_test_mount(slave_b_prop);
+
+        register_peer(slave_group, &slave_a);
+        register_peer(slave_group, &slave_b);
+        master.propagation().add_slave(Arc::downgrade(&slave_a));
+        master.propagation().add_slave(Arc::downgrade(&slave_b));
+
+        let mountpoint_id = InodeId::new(42);
+        let mount_path = Arc::new(MountPath::from("/propagated"));
+        propagate_mount(&master, mountpoint_id, &source_child, &mount_path).unwrap();
+
+        let child_a = slave_a
+            .mountpoints()
+            .get(&mountpoint_id)
+            .expect("slave_a should receive propagated child")
+            .clone();
+        let child_b = slave_b
+            .mountpoints()
+            .get(&mountpoint_id)
+            .expect("slave_b should receive propagated child")
+            .clone();
+        let child_a_prop = child_a.propagation();
+        let child_b_prop = child_b.propagation();
+
+        assert!(child_a_prop.is_slave());
+        assert!(child_a_prop.is_shared());
+        assert!(child_b_prop.is_slave());
+        assert!(child_b_prop.is_shared());
+        assert_eq!(child_a_prop.peer_group_id(), child_b_prop.peer_group_id());
+        assert_ne!(child_a_prop.peer_group_id(), source_child_group);
     }
 }

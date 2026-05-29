@@ -14,6 +14,7 @@ use crate::{
     process::{
         namespace::propagation::{
             change_mnt_propagation_recursive, flags_to_propagation_type, is_propagation_change,
+            register_peer, register_slave_with_master, unregister_peer,
         },
         ProcessManager,
     },
@@ -571,6 +572,9 @@ fn do_bind_mount(
                 .map(|mfs| mfs.super_block_state()),
         )?;
     target_mfs.set_mount_source(Some(source_path.clone()));
+    if let Some(ref source_mfs) = source_mfs_for_recursive {
+        configure_bind_clone_propagation(source_mfs, &target_mfs);
+    }
 
     // If MS_REC is set, recursively bind all submounts from source to target
     if flags.contains(MountFlags::REC) {
@@ -608,6 +612,28 @@ fn do_bind_mount(
     }
 
     Ok(())
+}
+
+fn configure_bind_clone_propagation(source_mfs: &Arc<MountFS>, target_mfs: &Arc<MountFS>) {
+    let source_prop = source_mfs.propagation();
+    if !source_prop.is_shared() && !source_prop.is_slave() {
+        return;
+    }
+
+    let target_prop = target_mfs.propagation();
+    if source_prop.is_shared() {
+        if target_prop.is_shared() {
+            unregister_peer(target_prop.peer_group_id(), target_mfs);
+        }
+        let group_id = source_prop.peer_group_id();
+        target_prop.set_shared_with_group(group_id);
+        register_peer(group_id, target_mfs);
+    }
+
+    if source_prop.is_slave() {
+        target_prop.set_slave(source_prop.master().map(|master| Arc::downgrade(&master)));
+        register_slave_with_master(target_mfs);
+    }
 }
 
 /// Change the propagation type of a mount point.

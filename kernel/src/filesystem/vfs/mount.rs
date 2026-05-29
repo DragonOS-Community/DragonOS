@@ -21,7 +21,8 @@ use crate::{
         namespace::{
             mnt::MntNamespace,
             propagation::{
-                propagate_mount, propagate_umount, register_peer, unregister_peer, MountPropagation,
+                inherit_bind_mount_propagation, propagate_mount, propagate_umount, register_peer,
+                register_slave_with_master, unregister_peer, MountPropagation,
             },
         },
         ProcessManager,
@@ -881,7 +882,7 @@ impl MountFSInode {
         root_inner_inode: Arc<dyn IndexNode>,
         mount_flags: MountFlags,
     ) -> Result<Arc<MountFS>, SystemError> {
-        self.mount_subtree_with_state(inner_fs, root_inner_inode, mount_flags, None)
+        self.mount_subtree_with_state(inner_fs, root_inner_inode, mount_flags, None, None)
     }
 
     pub(crate) fn mount_subtree_with_state(
@@ -890,6 +891,7 @@ impl MountFSInode {
         root_inner_inode: Arc<dyn IndexNode>,
         mount_flags: MountFlags,
         super_block_state: Option<Arc<SuperBlockState>>,
+        bind_source: Option<&Arc<MountFS>>,
     ) -> Result<Arc<MountFS>, SystemError> {
         // Linux do_add_mount：父挂载点必须属于当前 mount namespace。
         let current_mntns = ProcessManager::current_mntns();
@@ -929,6 +931,10 @@ impl MountFSInode {
 
         let mount_path = Arc::new(MountPath::from(self.absolute_path()?));
 
+        if let Some(source) = bind_source {
+            inherit_bind_mount_propagation(source, &new_mount_fs);
+        }
+
         self.mount_fs
             .add_mount(metadata.inode_id, new_mount_fs.clone())?;
 
@@ -937,11 +943,6 @@ impl MountFSInode {
             mount_path.clone(),
             new_mount_fs.clone(),
         )?;
-
-        if new_mount_fs.propagation().is_shared() {
-            let group_id = new_mount_fs.propagation().peer_group_id();
-            register_peer(group_id, &new_mount_fs);
-        }
 
         if parent_propagation.is_shared() {
             if let Err(e) = propagate_mount(
@@ -952,6 +953,14 @@ impl MountFSInode {
             ) {
                 log::warn!("mount: propagation failed: {:?}", e);
             }
+        }
+
+        let new_mount_prop = new_mount_fs.propagation();
+        if new_mount_prop.is_shared() {
+            register_peer(new_mount_prop.peer_group_id(), &new_mount_fs);
+        }
+        if bind_source.is_some() && new_mount_prop.is_slave() {
+            register_slave_with_master(&new_mount_fs);
         }
 
         Ok(new_mount_fs)

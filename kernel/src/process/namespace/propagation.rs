@@ -798,6 +798,33 @@ pub fn register_slave_with_master(mount: &Arc<MountFS>) {
     }
 }
 
+/// Apply Linux bind-clone propagation inheritance before the clone is
+/// propagated from the destination parent.
+///
+/// This only prepares the clone's propagation flags and master pointer. Peer
+/// and slave registration is intentionally deferred until after destination
+/// parent propagation, otherwise the new child could be observed as a peer of
+/// its own parent when both happen to use the same peer group.
+pub fn inherit_bind_mount_propagation(source: &Arc<MountFS>, clone: &Arc<MountFS>) {
+    let source_prop = source.propagation();
+    if !source_prop.is_shared() && !source_prop.is_slave() {
+        return;
+    }
+
+    let clone_prop = clone.propagation();
+    if source_prop.is_shared() {
+        if clone_prop.is_shared() {
+            unregister_peer(clone_prop.peer_group_id(), clone);
+        }
+        let group_id = source_prop.peer_group_id();
+        clone_prop.set_shared_with_group(group_id);
+    }
+
+    if source_prop.is_slave() {
+        clone_prop.set_slave(source_prop.master().map(|master| Arc::downgrade(&master)));
+    }
+}
+
 /// Change the propagation type of a mount tree (recursive).
 ///
 /// This implements `mount --make-r{shared,private,slave,unbindable}`.
@@ -972,6 +999,9 @@ fn propagate_one(
         let group_id = source_child_prop.peer_group_id();
         cloned_child.propagation().set_shared_with_group(group_id);
         register_peer(group_id, &cloned_child);
+        if source_child_prop.is_slave() {
+            register_slave_with_master(&cloned_child);
+        }
     } else {
         let cloned_prop = cloned_child.propagation();
         if cloned_prop.is_shared() {

@@ -335,6 +335,10 @@ impl SuperBlockState {
         self.umount_lock.read()
     }
 
+    pub fn try_umount_read(&self) -> Option<crate::libs::rwsem::RwSemReadGuard<'_, ()>> {
+        self.umount_lock.try_read()
+    }
+
     pub fn umount_write(&self) -> crate::libs::rwsem::RwSemWriteGuard<'_, ()> {
         self.umount_lock.write()
     }
@@ -758,6 +762,24 @@ impl MountFS {
         }
 
         Ok(())
+    }
+
+    pub fn try_sync_fs_with_umount_read(&self, wait: bool) -> Result<bool, SystemError> {
+        let sb_state = self.super_block_state();
+        let Some(_umount_guard) = sb_state.try_umount_read() else {
+            return Ok(false);
+        };
+
+        if self.is_sb_readonly() {
+            return Ok(true);
+        }
+
+        if let Err(e) = self.sync_fs(wait) {
+            self.record_wb_error(e.clone());
+            return Err(e);
+        }
+
+        Ok(true)
     }
 
     pub fn sync_blockdev_with_umount_read(&self, wait: bool) -> Result<(), SystemError> {

@@ -12,6 +12,7 @@ pub mod stat;
 pub mod syscall;
 pub mod utils;
 pub mod vcore;
+pub mod writeback;
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::{any::Any, fmt::Debug, fmt::Display, sync::atomic::AtomicUsize};

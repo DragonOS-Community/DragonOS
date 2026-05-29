@@ -265,13 +265,12 @@ fn page_reclaim_thread() -> i32 {
             // page_manager/page_cache 的锁顺序反转。
             PageReclaimer::shrink_list(PageFrameCount::new(page_to_free));
         } else {
-            //TODO Temporarily let page reclaim thread handle dirty writeback; should be separated later.
+            //TODO Temporarily let page reclaim thread handle dirty page writeback; should be separated later.
             PageReclaimer::flush_dirty_pages();
 
             // Sleep 5 seconds, matching the Linux dirty_writeback_centisecs default.
-            // Metadata sync (flush_dirty_inodes) is the responsibility of sync()/fsync()/umount(),
-            // not the page reclaim thread — calling it here would frequently contend on io_guard
-            // and hold umount_lock.read(), blocking umount.
+            // Metadata writeback is handled by the VFS writeback thread. Keeping
+            // sync_fs out of reclaim avoids coupling page reclaim to umount_lock.
             let _ = nanosleep(PosixTimeSpec::new(5, 0));
         }
     }

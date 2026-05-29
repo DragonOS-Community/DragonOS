@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sched.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
@@ -14,6 +15,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -48,12 +50,56 @@ namespace {
 #define MS_SHARED (1 << 20)
 #endif
 
+#ifndef MNT_DETACH
+#define MNT_DETACH 2
+#endif
+
 int EnsureDir(const char* path) {
     struct stat st;
     if (stat(path, &st) == 0) {
         return S_ISDIR(st.st_mode) ? 0 : -1;
     }
     return mkdir(path, 0755);
+}
+
+bool MountInfoContains(const char* path) {
+    FILE* f = fopen("/proc/self/mountinfo", "r");
+    if (f == nullptr) {
+        return false;
+    }
+
+    char line[4096];
+    bool found = false;
+    while (fgets(line, sizeof(line), f) != nullptr) {
+        if (strstr(line, path) != nullptr) {
+            found = true;
+            break;
+        }
+    }
+
+    fclose(f);
+    return found;
+}
+
+bool ReadOneByte(int fd) {
+    char c;
+    return read(fd, &c, 1) == 1;
+}
+
+bool ReadByte(int fd, char* c) {
+    return read(fd, c, 1) == 1;
+}
+
+bool WriteOneByte(int fd, char c) {
+    return write(fd, &c, 1) == 1;
+}
+
+void CleanupSharedUmountPaths(const char* child, const char* parent, const char* root) {
+    umount2(child, MNT_DETACH);
+    umount2(parent, MNT_DETACH);
+    rmdir(child);
+    rmdir(parent);
+    rmdir(root);
 }
 
 long RawSyncfs(int fd) {
@@ -200,7 +246,13 @@ TEST(SyncUmountLifetime, ConcurrentSyncAndUnmountPrivateRamfs) {
         GTEST_SKIP() << "unshare(CLONE_NEWNS) failed: " << strerror(errno);
     }
 
-    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
+        int saved_errno = errno;
+        rmdir(mountpoint);
+        rmdir(root);
+        errno = saved_errno;
+        GTEST_SKIP() << "mount --make-rprivate / failed: " << strerror(errno);
+    }
 
     for (int i = 0; i < 8; ++i) {
         if (mount("", mountpoint, "ramfs", 0, NULL) != 0) {
@@ -251,62 +303,134 @@ TEST(SyncUmountLifetime, ConcurrentSyncAndUnmountPrivateRamfs) {
 // same umount_lock, causing a same-thread self-deadlock (writer trying to acquire reader).
 TEST(SyncUmountLifetime, SharedMountPropagationUmountNoDeadlock) {
     const char* root = "/tmp/dunitest_shared_umount";
-    const char* mountpoint = "/tmp/dunitest_shared_umount/mnt";
-    const char* file_path = "/tmp/dunitest_shared_umount/mnt/file";
+    const char* parent = "/tmp/dunitest_shared_umount/parent";
+    const char* child = "/tmp/dunitest_shared_umount/parent/child";
+    const char* file_path = "/tmp/dunitest_shared_umount/parent/child/file";
 
     ASSERT_EQ(0, EnsureDir("/tmp")) << strerror(errno);
     ASSERT_EQ(0, EnsureDir(root)) << strerror(errno);
-    ASSERT_EQ(0, EnsureDir(mountpoint)) << strerror(errno);
+    ASSERT_EQ(0, EnsureDir(parent)) << strerror(errno);
 
-    // Enter a new mount namespace to avoid affecting other tests.
+    // Enter a new mount namespace first so propagation setup cannot affect other tests.
     if (unshare(CLONE_NEWNS) != 0) {
         GTEST_SKIP() << "unshare(CLONE_NEWNS) failed: " << strerror(errno);
     }
 
-    // Mark root as shared so subsequent mounts inherit shared propagation.
-    if (mount(NULL, "/", NULL, MS_REC | MS_SHARED, NULL) != 0) {
-        // Skip (not fail) if MS_SHARED is unsupported.
-        GTEST_SKIP() << "mount --make-rshared failed: " << strerror(errno);
+    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
+        int saved_errno = errno;
+        CleanupSharedUmountPaths(child, parent, root);
+        errno = saved_errno;
+        GTEST_SKIP() << "mount --make-rprivate / failed: " << strerror(errno);
     }
 
-    for (int i = 0; i < 4; ++i) {
-        if (mount("", mountpoint, "ramfs", 0, NULL) != 0) {
-            GTEST_SKIP() << "mount ramfs failed: " << strerror(errno);
-        }
+    if (mount("", parent, "ramfs", 0, NULL) != 0) {
+        GTEST_SKIP() << "mount parent ramfs failed: " << strerror(errno);
+    }
+    ASSERT_EQ(0, EnsureDir(child)) << strerror(errno);
 
-        // Write data to produce dirty pages, ensuring sync has real work during umount.
-        int fd = open(file_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
-        if (fd >= 0) {
-            write(fd, "shared-propagation-test", 23);
-            close(fd);
-        }
+    if (mount(NULL, parent, NULL, MS_SHARED, NULL) != 0) {
+        umount2(parent, MNT_DETACH);
+        GTEST_SKIP() << "mount --make-shared parent failed: " << strerror(errno);
+    }
 
-        // Concurrent sync + umount: if a deadlock exists, this will hang forever.
-        std::atomic<bool> stop{false};
-        std::thread sync_thread([&stop]() {
-            while (!stop.load(std::memory_order_relaxed)) {
-                sync();
-                sched_yield();
+    int mounted_pipe[2];
+    int go_pipe[2];
+    int done_pipe[2];
+    ASSERT_EQ(0, pipe(mounted_pipe)) << strerror(errno);
+    ASSERT_EQ(0, pipe(go_pipe)) << strerror(errno);
+    ASSERT_EQ(0, pipe(done_pipe)) << strerror(errno);
+
+    pid_t pid = fork();
+    ASSERT_GE(pid, 0) << strerror(errno);
+    if (pid == 0) {
+        close(mounted_pipe[0]);
+        close(go_pipe[1]);
+        close(done_pipe[0]);
+
+        int exit_code = 1;
+        do {
+            if (unshare(CLONE_NEWNS) != 0) {
+                exit_code = 10;
+                WriteOneByte(mounted_pipe[1], 'e');
+                break;
             }
-        });
+            if (mount("", child, "ramfs", 0, NULL) != 0) {
+                exit_code = 11;
+                WriteOneByte(mounted_pipe[1], 'e');
+                break;
+            }
 
-        usleep(500);
-        int ret = umount(mountpoint);
-        int saved = errno;
-        stop.store(true, std::memory_order_relaxed);
-        sync_thread.join();
+            int fd = open(file_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+            if (fd >= 0) {
+                if (write(fd, "shared-propagation-test", 23) != 23) {
+                    close(fd);
+                    exit_code = 14;
+                    break;
+                }
+                close(fd);
+            }
 
-        // umount should succeed (or EINVAL if already removed by propagation).
-        if (ret != 0 && saved != EINVAL) {
-            errno = saved;
-            FAIL() << "umount failed on iteration " << i << ": " << strerror(errno);
-        }
+            if (!WriteOneByte(mounted_pipe[1], 'm')) {
+                exit_code = 12;
+                break;
+            }
+            if (!ReadOneByte(go_pipe[0])) {
+                exit_code = 13;
+                break;
+            }
+
+            std::atomic<bool> stop{false};
+            std::thread sync_thread([&stop]() {
+                while (!stop.load(std::memory_order_relaxed)) {
+                    sync();
+                    sched_yield();
+                }
+            });
+
+            usleep(500);
+            int ret = umount(child);
+            int saved = errno;
+            stop.store(true, std::memory_order_relaxed);
+            sync_thread.join();
+
+            if (ret != 0 && saved != EINVAL) {
+                exit_code = 20;
+                break;
+            }
+            exit_code = 0;
+        } while (false);
+
+        WriteOneByte(done_pipe[1], static_cast<char>(exit_code));
+        _exit(exit_code);
     }
 
-    // Restore to private to avoid affecting subsequent tests.
-    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
-    rmdir(mountpoint);
-    rmdir(root);
+    close(mounted_pipe[1]);
+    close(go_pipe[0]);
+    close(done_pipe[1]);
+
+    char mounted_signal = 0;
+    ASSERT_TRUE(ReadByte(mounted_pipe[0], &mounted_signal));
+    if (mounted_signal != 'm') {
+        int status = 0;
+        waitpid(pid, &status, 0);
+        FAIL() << "child failed before creating propagated mount";
+    }
+    bool propagated_to_parent = MountInfoContains(child);
+
+    ASSERT_TRUE(WriteOneByte(go_pipe[1], 'u'));
+    ASSERT_TRUE(ReadOneByte(done_pipe[0]));
+
+    int status = 0;
+    ASSERT_EQ(pid, waitpid(pid, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status)) << "child terminated abnormally";
+    ASSERT_EQ(0, WEXITSTATUS(status)) << "child failed";
+
+    ASSERT_TRUE(propagated_to_parent)
+        << "child mount was not propagated into the peer namespace";
+    ASSERT_FALSE(MountInfoContains(child))
+        << "propagated child mount remained in peer namespace after umount";
+
+    CleanupSharedUmountPaths(child, parent, root);
 }
 
 int main(int argc, char** argv) {

@@ -11,6 +11,7 @@ use crate::{
     },
     libs::{
         casting::DowncastArc,
+        errseq::{ErrSeq, ErrSeqValue},
         mutex::{Mutex, MutexGuard},
         rwsem::RwSem,
         spinlock::SpinLock,
@@ -239,12 +240,6 @@ lazy_static! {
     static ref MOUNTED_SUPERBLOCKS: SpinLock<Vec<Weak<MountFS>>> = SpinLock::new(Vec::new());
 }
 
-#[derive(Debug, Default)]
-struct WritebackErrorState {
-    seq: u64,
-    error: Option<SystemError>,
-}
-
 impl MountId {
     fn alloc() -> Self {
         let id = MOUNT_ID_ALLOCATOR.lock().alloc().unwrap();
@@ -284,7 +279,7 @@ pub struct MountFS {
 pub struct SuperBlockState {
     flags: RwSem<MountFlags>,
     write_count: AtomicUsize,
-    wb_error: SpinLock<WritebackErrorState>,
+    wb_error: ErrSeq,
     umount_lock: RwSem<()>,
 }
 
@@ -298,7 +293,7 @@ impl SuperBlockState {
         Self {
             flags: RwSem::new(flags & MountFlags::SB_SETTABLE_MASK),
             write_count: AtomicUsize::new(0),
-            wb_error: SpinLock::new(WritebackErrorState::default()),
+            wb_error: ErrSeq::new(),
             umount_lock: RwSem::new(()),
         }
     }
@@ -323,23 +318,16 @@ impl SuperBlockState {
         self.write_count.load(Ordering::Acquire) != 0
     }
 
-    pub fn sample_wb_error(&self) -> u64 {
-        self.wb_error.lock_irqsave().seq
+    pub fn sample_wb_error(&self) -> ErrSeqValue {
+        self.wb_error.sample()
     }
 
-    pub fn check_and_advance_wb_error(&self, since: u64) -> (u64, Option<SystemError>) {
-        let guard = self.wb_error.lock_irqsave();
-        if guard.seq == since {
-            (since, None)
-        } else {
-            (guard.seq, guard.error.clone())
-        }
+    pub fn check_and_advance_wb_error(&self, since: &mut ErrSeqValue) -> Option<SystemError> {
+        self.wb_error.check_and_advance(since)
     }
 
     pub fn record_wb_error(&self, error: SystemError) {
-        let mut guard = self.wb_error.lock_irqsave();
-        guard.seq = guard.seq.wrapping_add(1).max(1);
-        guard.error = Some(error);
+        self.wb_error.set(error);
     }
 
     pub fn umount_read(&self) -> crate::libs::rwsem::RwSemReadGuard<'_, ()> {
@@ -826,11 +814,11 @@ impl MountFS {
         self.super_block_state.record_wb_error(error);
     }
 
-    pub fn sample_wb_error(&self) -> u64 {
+    pub fn sample_wb_error(&self) -> ErrSeqValue {
         self.super_block_state.sample_wb_error()
     }
 
-    pub fn check_and_advance_wb_error(&self, since: u64) -> (u64, Option<SystemError>) {
+    pub fn check_and_advance_wb_error(&self, since: &mut ErrSeqValue) -> Option<SystemError> {
         self.super_block_state.check_and_advance_wb_error(since)
     }
 }
@@ -1239,6 +1227,16 @@ impl IndexNode for MountFSInode {
         data: MutexGuard<FilePrivateData>,
     ) -> Result<(), SystemError> {
         self.inner_inode.sync_file(datasync, data)
+    }
+
+    fn sync_file_range(
+        &self,
+        start: usize,
+        end: usize,
+        datasync: bool,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        self.inner_inode.sync_file_range(start, end, datasync, data)
     }
 
     fn write_inode(&self, wbc: &super::WritebackControl) -> Result<(), SystemError> {

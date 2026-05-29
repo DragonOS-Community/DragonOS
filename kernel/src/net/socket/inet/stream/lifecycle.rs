@@ -11,6 +11,7 @@ use super::inner;
 use super::TcpSocket;
 
 const TCP_ESTABLISHED_POST_POLL_ROUNDS: usize = 8;
+const TCP_ESTABLISHED_CLOSE_POST_POLL_ROUNDS: usize = 1;
 const TCP_CONNECTING_ABORT_POST_POLL_ROUNDS: usize = 128;
 const TCP_LISTEN_POST_POLL_MIN_ROUNDS: usize = 128;
 const TCP_LISTEN_POST_POLL_MAX_ROUNDS: usize = 8192;
@@ -667,6 +668,8 @@ impl TcpSocket {
                         reason: DeferredTcpCloseReason::ConnectingClose,
                         abort_on_post_close_data: false,
                     });
+                    post_poll_rounds =
+                        core::cmp::max(post_poll_rounds, TCP_CONNECTING_ABORT_POST_POLL_ROUNDS);
                     post_poll_iface = Some(iface);
                     writer.replace(inner::Inner::Established(conn));
                 }
@@ -691,6 +694,8 @@ impl TcpSocket {
                     reason: close_action.reason,
                     abort_on_post_close_data: close_action.abort_on_post_close_data,
                 });
+                post_poll_rounds =
+                    core::cmp::max(post_poll_rounds, TCP_ESTABLISHED_CLOSE_POST_POLL_ROUNDS);
                 post_poll_iface = Some(iface);
                 writer.replace(inner::Inner::Established(es));
             }

@@ -469,6 +469,24 @@ impl IndexNode for OvlInode {
         Err(SystemError::ENOENT)
     }
 
+    fn sync_file_range(
+        &self,
+        start: usize,
+        end: usize,
+        datasync: bool,
+        data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        if let Some(ref upper_inode) = *self.upper_inode.lock() {
+            return upper_inode.sync_file_range(start, end, datasync, data);
+        }
+
+        if !self.lower_inodes.is_empty() {
+            return Ok(());
+        }
+
+        Err(SystemError::ENOENT)
+    }
+
     fn fs(&self) -> Arc<dyn FileSystem> {
         self.fs.lock().upgrade().unwrap()
     }

@@ -800,6 +800,21 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         Err(SystemError::EINVAL)
     }
 
+    /// 基于打开文件上下文同步指定文件字节范围（end 为包含端）。
+    ///
+    /// 默认回退到 whole-file fsync；支持页缓存范围写回的文件系统应覆盖此方法，
+    /// 以匹配 Linux `vfs_fsync_range()` 在 msync/sync_file_range 场景下的范围语义。
+    fn sync_file_range(
+        &self,
+        start: usize,
+        end: usize,
+        datasync: bool,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        let _ = (start, end);
+        self.sync_file(datasync, data)
+    }
+
     /// @brief 仅同步数据到磁盘（不包括元数据）
     ///
     /// O_DSYNC 语义：确保数据写入完成，但不保证元数据（如 mtime）更新

@@ -1810,6 +1810,28 @@ impl IndexNode for LockedFATInode {
         }
     }
 
+    fn sync_file_range(
+        &self,
+        start: usize,
+        end: usize,
+        _datasync: bool,
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        match self.metadata()?.file_type {
+            FileType::File | FileType::Dir => {
+                if let Some(page_cache) = self.page_cache() {
+                    let start_index = start >> MMArch::PAGE_SHIFT;
+                    let end_index = end >> MMArch::PAGE_SHIFT;
+                    page_cache
+                        .manager()
+                        .writeback_range(start_index, end_index)?;
+                }
+                Ok(())
+            }
+            _ => Err(SystemError::EINVAL),
+        }
+    }
+
     fn read_sync(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
         let guard: MutexGuard<FATInode> = self.0.lock();
         match &guard.inode_type {

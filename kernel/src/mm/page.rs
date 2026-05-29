@@ -490,7 +490,7 @@ impl PageReclaimer {
                     e
                 );
                 guard.add_flags(PageFlags::PG_ERROR);
-                page_cache.mark_page_error(page_index);
+                page_cache.mark_page_error(page_index, e);
                 return;
             }
         }

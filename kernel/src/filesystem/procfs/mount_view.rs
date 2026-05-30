@@ -1,3 +1,8 @@
+//! Unified rendering for `/proc/mounts`, `/proc/[pid]/mounts`, `/proc/[pid]/mountinfo`,
+//! and `/proc/[pid]/mountstats`.
+//!
+//! Content is generated once at `open()` and cached in `FilePrivateData` until the fd is closed.
+
 use alloc::{
     string::{String, ToString},
     sync::Arc,
@@ -11,7 +16,7 @@ use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::{
         procfs::{pid::ProcPidTarget, utils::proc_read},
-        vfs::{mount::MountList, FilePrivateData, IndexNode, MountFS},
+        vfs::{FilePrivateData, IndexNode, MountFS},
     },
     libs::mutex::MutexGuard,
     process::{ProcessControlBlock, ProcessManager},
@@ -101,58 +106,37 @@ fn collect_visible_mounts(
         .root()
         .absolute_path()
         .unwrap_or_else(|_| "/".to_string());
-    let root_prefix_with_slash = root_prefix_with_slash(&root_path);
+
+    let mut mounts = mount_list
+        .clone_inner()
+        .into_iter()
+        .map(|(path, mfs)| (path.as_str().to_string(), mfs))
+        .collect::<Vec<_>>();
+
+    mounts.sort_by_key(|(_, mfs)| {
+        let mount_id: usize = mfs.mount_id().into();
+        mount_id
+    });
 
     let mut entries = Vec::new();
-    collect_mounts_preorder(
-        nsproxy.mnt_ns.root_mntfs().clone(),
-        "/".to_string(),
-        &mount_list,
-        &root_path,
-        &root_prefix_with_slash,
-        &mut entries,
-    )?;
-    Ok(entries)
-}
+    for (mount_path, mount) in mounts {
+        let Some(mountpoint_display) = visible_mountpoint(&mount_path, &root_path) else {
+            continue;
+        };
 
-fn collect_mounts_preorder(
-    mount: Arc<MountFS>,
-    mountpoint: String,
-    mount_list: &Arc<MountList>,
-    root_path: &str,
-    root_prefix_with_slash: &str,
-    out: &mut Vec<ProcMountEntry>,
-) -> Result<(), SystemError> {
-    if let Some(display) = visible_mountpoint(&mountpoint, root_path, root_prefix_with_slash) {
         let parent_mount_id: usize = mount
-            .parent_mount()
-            .map(|parent| parent.mount_id().into())
+            .self_mountpoint()
+            .map(|mountpoint_inode| mountpoint_inode.mount_fs().mount_id().into())
             .unwrap_or_else(|| mount.mount_id().into());
 
-        out.push(ProcMountEntry {
-            mount: mount.clone(),
-            mountpoint_display: display,
+        entries.push(ProcMountEntry {
+            mount,
+            mountpoint_display,
             parent_mount_id,
         });
     }
 
-    let children: Vec<Arc<MountFS>> = mount.mountpoints().values().cloned().collect();
-    for child in children {
-        let Some(child_path) = mount_list.get_mount_path_by_mountfs(&child) else {
-            continue;
-        };
-
-        collect_mounts_preorder(
-            child,
-            child_path.as_str().to_string(),
-            mount_list,
-            root_path,
-            root_prefix_with_slash,
-            out,
-        )?;
-    }
-
-    Ok(())
+    Ok(entries)
 }
 
 fn render_mounts_line(entry: &ProcMountEntry, out: &mut String) -> Result<(), SystemError> {
@@ -166,7 +150,12 @@ fn render_mounts_line(entry: &ProcMountEntry, out: &mut String) -> Result<(), Sy
 
 fn render_mountinfo_line(entry: &ProcMountEntry, out: &mut String) -> Result<(), SystemError> {
     let mount_id: usize = entry.mount.mount_id().into();
-    let dev = DeviceNumber::from(entry.mount.mountpoint_root_inode().metadata()?.dev_id as u32);
+    let dev = entry
+        .mount
+        .mountpoint_root_inode()
+        .metadata()
+        .map(|md| DeviceNumber::from(md.dev_id as u32))
+        .unwrap_or_default();
     let root = escape_path_token(&render_mountinfo_root(&entry.mount)?);
     let mountpoint = escape_path_token(&entry.mountpoint_display);
     let mount_options = render_mount_options(&entry.mount)?;
@@ -196,10 +185,21 @@ fn render_mountstats_line(entry: &ProcMountEntry, out: &mut String) -> Result<()
     let mountpoint = escape_path_token(&entry.mountpoint_display);
     let fstype = escape_mount_token(entry.mount.fs_type(), true);
     let mut stats = String::new();
-    let has_stats = entry
+    let has_stats = match entry
         .mount
         .inner_filesystem()
-        .proc_show_mount_stats(&entry.mount, &mut stats)?;
+        .proc_show_mount_stats(&entry.mount, &mut stats)
+    {
+        Ok(value) => value,
+        Err(err) => {
+            log::warn!(
+                "proc_show_mount_stats failed for {}: {:?}",
+                entry.mountpoint_display,
+                err
+            );
+            false
+        }
+    };
 
     write!(
         out,
@@ -247,62 +247,41 @@ fn render_mountinfo_root(mount: &Arc<MountFS>) -> Result<String, SystemError> {
 
 fn render_mountinfo_tags(mount: &Arc<MountFS>) -> String {
     let propagation = mount.propagation();
-    if propagation.is_shared() {
-        return format!("shared:{}", propagation.peer_group_id().data());
+    let mut fields = Vec::new();
+    let info = propagation.info_string();
+    if !info.is_empty() {
+        fields.push(info);
     }
-
-    if propagation.is_slave() {
-        if let Some(master) = propagation.master() {
-            let master_group_id = master.propagation().peer_group_id();
-            if master_group_id.is_valid() {
-                return format!("master:{}", master_group_id.data());
-            }
-        }
-
-        let peer_group_id = propagation.peer_group_id();
-        if peer_group_id.is_valid() {
-            return format!("master:{}", peer_group_id.data());
-        }
-    }
-
     if propagation.is_unbindable() {
-        return "unbindable".to_string();
+        fields.push("unbindable".to_string());
     }
-
-    String::new()
+    fields.join(" ")
 }
 
-fn visible_mountpoint(
-    mountpoint: &str,
-    root_path: &str,
-    root_prefix_with_slash: &str,
-) -> Option<String> {
+fn visible_mountpoint(mountpoint: &str, root_path: &str) -> Option<String> {
     if root_path == "/" {
         return Some(mountpoint.to_string());
     }
+
+    let root_prefix_with_slash = if root_path.ends_with('/') {
+        root_path.to_string()
+    } else {
+        format!("{root_path}/")
+    };
 
     if mountpoint == root_path {
         return Some("/".to_string());
     }
 
-    if mountpoint.starts_with(root_prefix_with_slash) {
-        let stripped = &mountpoint[root_path.len()..];
+    if let Some(stripped) = mountpoint.strip_prefix(&root_prefix_with_slash) {
         return Some(if stripped.is_empty() {
             "/".to_string()
         } else {
-            stripped.to_string()
+            format!("/{stripped}")
         });
     }
 
     None
-}
-
-fn root_prefix_with_slash(root_path: &str) -> String {
-    if root_path == "/" || root_path.ends_with('/') {
-        root_path.to_string()
-    } else {
-        format!("{root_path}/")
-    }
 }
 
 fn escape_mount_token(input: &str, escape_hash: bool) -> String {

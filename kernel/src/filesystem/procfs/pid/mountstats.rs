@@ -19,7 +19,7 @@ pub struct MountStatsFileOps {
 
 impl MountStatsFileOps {
     pub fn new_inode(target: ProcPidTarget, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcFileBuilder::new(Self { target }, InodeMode::S_IRUSR)
+        ProcFileBuilder::new(Self { target }, InodeMode::S_IRUGO)
             .parent(parent)
             .build()
             .unwrap()

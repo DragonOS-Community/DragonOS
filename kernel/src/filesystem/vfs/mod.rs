@@ -1473,10 +1473,13 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     /// Render the mount root field used by `/proc/*/mountinfo`.
     fn proc_show_mountinfo_root(
         &self,
-        _mount: &MountFS,
+        mount: &MountFS,
         out: &mut dyn Write,
     ) -> Result<(), SystemError> {
-        out.write_char('/').map_err(|_| SystemError::EINVAL)
+        match mount.root_inner_inode().absolute_path() {
+            Ok(root) if !root.is_empty() => out.write_str(&root).map_err(|_| SystemError::EINVAL),
+            _ => out.write_char('/').map_err(|_| SystemError::EINVAL),
+        }
     }
 
     /// Render fs-specific stats for `/proc/*/mountstats`.

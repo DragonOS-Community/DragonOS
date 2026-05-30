@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <regex>
 #include <sched.h>
 #include <stdio.h>
 #include <string.h>
@@ -12,6 +13,7 @@
 #include <unistd.h>
 
 #include <string>
+#include <vector>
 
 #ifndef CLONE_NEWNS
 #define CLONE_NEWNS 0x00020000
@@ -92,6 +94,25 @@ bool read_text_file(const char* path, std::string* out) {
     return n >= 0;
 }
 
+size_t count_nonempty_lines(const std::string& content) {
+    size_t count = 0;
+    size_t start = 0;
+
+    while (start <= content.size()) {
+        const size_t end = content.find('\n', start);
+        const size_t line_end = end == std::string::npos ? content.size() : end;
+        if (line_end > start) {
+            ++count;
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+
+    return count;
+}
+
 void expect_contains(const char* path, const std::string& content, const char* needle) {
     EXPECT_NE(std::string::npos, content.find(needle)) << path << " missing substring\nneedle="
                                                        << needle << "\ncontent=" << content;
@@ -112,9 +133,92 @@ void expect_not_contains(const char* path, const std::string& content, const cha
     _exit(1);
 }
 
+bool can_use_mount_namespaces() {
+    if (geteuid() == 0) {
+        return true;
+    }
+
+    const pid_t probe = fork();
+    if (probe < 0) {
+        return false;
+    }
+
+    if (probe == 0) {
+        _exit(unshare(CLONE_NEWNS) == 0 ? 0 : 1);
+    }
+
+    int status = 0;
+    if (waitpid(probe, &status, 0) != probe) {
+        return false;
+    }
+
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
 }  // namespace
 
-TEST(ProcPidMounts, UsesTargetTaskRootAndMountNamespace) {
+TEST(ProcMountExports, ProcMountsMatchesSelf) {
+    std::string proc_mounts;
+    std::string self_mounts;
+
+    ASSERT_TRUE(read_text_file("/proc/mounts", &proc_mounts))
+        << "read /proc/mounts failed: errno=" << errno << " (" << strerror(errno) << ")";
+    ASSERT_TRUE(read_text_file("/proc/self/mounts", &self_mounts))
+        << "read /proc/self/mounts failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    EXPECT_EQ(proc_mounts, self_mounts);
+}
+
+TEST(ProcMountExports, SelfMountExportLineCountsMatch) {
+    std::string mounts;
+    std::string mountinfo;
+    std::string mountstats;
+
+    ASSERT_TRUE(read_text_file("/proc/self/mounts", &mounts))
+        << "read /proc/self/mounts failed: errno=" << errno << " (" << strerror(errno) << ")";
+    ASSERT_TRUE(read_text_file("/proc/self/mountinfo", &mountinfo))
+        << "read /proc/self/mountinfo failed: errno=" << errno << " (" << strerror(errno)
+        << ")";
+    ASSERT_TRUE(read_text_file("/proc/self/mountstats", &mountstats))
+        << "read /proc/self/mountstats failed: errno=" << errno << " (" << strerror(errno)
+        << ")";
+
+    EXPECT_GT(count_nonempty_lines(mounts), 0U);
+    EXPECT_EQ(count_nonempty_lines(mounts), count_nonempty_lines(mountinfo));
+    EXPECT_EQ(count_nonempty_lines(mounts), count_nonempty_lines(mountstats));
+}
+
+TEST(ProcMountExports, SelfMountstatsLineFormat) {
+    std::string mountstats;
+
+    ASSERT_TRUE(read_text_file("/proc/self/mountstats", &mountstats))
+        << "read /proc/self/mountstats failed: errno=" << errno << " (" << strerror(errno)
+        << ")";
+
+    const std::regex line_re(
+        R"(^device \S+ mounted on \S+ with fstype \S+( .*)?$)",
+        std::regex::ECMAScript);
+
+    size_t start = 0;
+    while (start <= mountstats.size()) {
+        const size_t end = mountstats.find('\n', start);
+        const size_t line_end = end == std::string::npos ? mountstats.size() : end;
+        if (line_end > start) {
+            const std::string line = mountstats.substr(start, line_end - start);
+            EXPECT_TRUE(std::regex_match(line, line_re)) << "bad mountstats line: " << line;
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+}
+
+TEST(ProcMountExports, UsesTargetTaskRootAndMountNamespace) {
+    if (!can_use_mount_namespaces()) {
+        GTEST_SKIP() << "requires CAP_SYS_ADMIN or unprivileged mount namespaces";
+    }
+
     char base[256] = {};
     char rootfs[256] = {};
     char inside_name[64] = {};
@@ -122,26 +226,32 @@ TEST(ProcPidMounts, UsesTargetTaskRootAndMountNamespace) {
     char outside[256] = {};
     char proc_mounts_path[64] = {};
     char proc_mountinfo_path[64] = {};
+    char proc_mountstats_path[64] = {};
     int ready_pipe[2] = {-1, -1};
     int quit_pipe[2] = {-1, -1};
     int detail_pipe[2] = {-1, -1};
     std::string proc_mounts;
     std::string proc_mountinfo;
+    std::string proc_mountstats;
     std::string self_mounts;
     std::string self_mountinfo;
+    std::string self_mountstats;
     char inside_mounts_needle[96] = {};
     char inside_mountinfo_needle[96] = {};
+    char inside_mountstats_needle[96] = {};
 
     ASSERT_EQ(0, ensure_dir("/tmp")) << "mkdir /tmp failed: errno=" << errno << " ("
                                       << strerror(errno) << ")";
 
-    snprintf(base, sizeof(base), "/tmp/proc_pid_mounts_target_view_%d", getpid());
+    snprintf(base, sizeof(base), "/tmp/proc_mount_exports_%d", getpid());
     snprintf(rootfs, sizeof(rootfs), "%s/rootfs", base);
     snprintf(inside_name, sizeof(inside_name), "inside_%d", getpid());
     snprintf(inside, sizeof(inside), "%s/%s", rootfs, inside_name);
     snprintf(outside, sizeof(outside), "%s/outside", base);
     snprintf(inside_mounts_needle, sizeof(inside_mounts_needle), " /%s ramfs ", inside_name);
     snprintf(inside_mountinfo_needle, sizeof(inside_mountinfo_needle), " /%s ", inside_name);
+    snprintf(inside_mountstats_needle, sizeof(inside_mountstats_needle),
+             " mounted on /%s with fstype ramfs", inside_name);
 
     ASSERT_EQ(0, ensure_dir(base)) << "mkdir base failed: errno=" << errno << " ("
                                    << strerror(errno) << ")";
@@ -239,6 +349,15 @@ TEST(ProcPidMounts, UsesTargetTaskRootAndMountNamespace) {
     expect_contains(proc_mountinfo_path, proc_mountinfo, inside_mountinfo_needle);
     expect_not_contains(proc_mountinfo_path, proc_mountinfo, outside);
 
+    snprintf(proc_mountstats_path, sizeof(proc_mountstats_path), "/proc/%d/mountstats", child);
+    ASSERT_TRUE(read_text_file(proc_mountstats_path, &proc_mountstats))
+        << "read " << proc_mountstats_path << " failed: errno=" << errno << " ("
+        << strerror(errno) << ")";
+    expect_contains(proc_mountstats_path, proc_mountstats, inside_mountstats_needle);
+    expect_not_contains(proc_mountstats_path, proc_mountstats, outside);
+    EXPECT_EQ(count_nonempty_lines(proc_mounts), count_nonempty_lines(proc_mountinfo));
+    EXPECT_EQ(count_nonempty_lines(proc_mounts), count_nonempty_lines(proc_mountstats));
+
     ASSERT_TRUE(read_text_file("/proc/self/mounts", &self_mounts))
         << "read /proc/self/mounts failed: errno=" << errno << " (" << strerror(errno) << ")";
     expect_not_contains("/proc/self/mounts", self_mounts, inside_mountinfo_needle);
@@ -249,6 +368,12 @@ TEST(ProcPidMounts, UsesTargetTaskRootAndMountNamespace) {
         << ")";
     expect_not_contains("/proc/self/mountinfo", self_mountinfo, inside_mountinfo_needle);
     expect_not_contains("/proc/self/mountinfo", self_mountinfo, outside);
+
+    ASSERT_TRUE(read_text_file("/proc/self/mountstats", &self_mountstats))
+        << "read /proc/self/mountstats failed: errno=" << errno << " (" << strerror(errno)
+        << ")";
+    expect_not_contains("/proc/self/mountstats", self_mountstats, inside_mountstats_needle);
+    expect_not_contains("/proc/self/mountstats", self_mountstats, outside);
 
     char quit = 'Q';
     ASSERT_EQ(1, write(guard.quit_fd, &quit, 1)) << "write child quit failed: errno=" << errno

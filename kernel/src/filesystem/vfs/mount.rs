@@ -612,26 +612,26 @@ impl MountFS {
 
     /// Unmount the filesystem.
     ///
-    /// Modeled after Linux `generic_shutdown_super()`: sync completes before
-    /// acquiring `umount_write`, preventing a self-deadlock where the
-    /// propagation path attempts to take a read lock while the write lock is held.
-    /// All propagation clones share the same `super_block_state` (via `Arc::clone`
-    /// in `deepcopy`), so a single top-level sync covers every peer.
+    /// Modeled after Linux `deactivate_super()` + `generic_shutdown_super()`:
+    /// take the superblock write lock first, then run the sync body without
+    /// trying to recursively acquire `umount_read`. All propagation clones share
+    /// the same `super_block_state` (via `Arc::clone` in `deepcopy`), so a single
+    /// top-level sync covers every peer.
     ///
     /// # Errors
     /// Returns `EINVAL` if this is the root filesystem.
     pub fn umount(&self) -> Result<Arc<MountFS>, SystemError> {
         let mountpoint = self.self_mountpoint().ok_or(SystemError::EINVAL)?;
 
-        // Phase 1: Sync BEFORE acquiring exclusive lock.
-        // Errors during pre-umount sync are non-fatal (warn only).
-        if let Err(e) = self.sync_filesystem() {
-            log::warn!("umount: pre-sync failed: {:?}, proceeding with umount", e);
-        }
-
-        // Phase 2: Exclusive lock — excludes concurrent sync/IO during teardown.
+        // Phase 1: Exclusive lock — excludes concurrent sync/IO during teardown.
         let sb_state = self.super_block_state();
         let _umount_guard = sb_state.umount_write();
+
+        // Phase 2: Sync while the superblock lock is already held.
+        // Errors during pre-umount sync are non-fatal (warn only).
+        if let Err(e) = self.sync_filesystem_locked() {
+            log::warn!("umount: pre-sync failed: {:?}, proceeding with umount", e);
+        }
 
         // Phase 3: Detach and propagate (no syncing under the lock).
         let result = mountpoint.do_umount();
@@ -800,12 +800,10 @@ impl MountFS {
 
     /// Flush all pending filesystem metadata and cached file data to the underlying filesystem.
     ///
-    /// Modeled after Linux `sync_filesystem(sb)`: callers need not hold `umount_lock`;
-    /// this function acquires a read lock internally to exclude concurrent umount.
-    pub fn sync_filesystem(&self) -> Result<(), SystemError> {
-        let sb_state = self.super_block_state();
-        let _umount_guard = sb_state.umount_read();
-
+    /// Modeled after Linux `sync_filesystem(sb)`: the caller must already hold
+    /// this mount's superblock `umount_lock`, either for read (`syncfs`) or write
+    /// (`umount`).
+    fn sync_filesystem_locked(&self) -> Result<(), SystemError> {
         if self.is_sb_readonly() {
             return Ok(());
         }
@@ -839,6 +837,15 @@ impl MountFS {
         }
 
         last_err
+    }
+
+    /// Public read-locked wrapper for callers that do not already hold the
+    /// superblock `umount_lock`.
+    pub fn sync_filesystem(&self) -> Result<(), SystemError> {
+        let sb_state = self.super_block_state();
+        let _umount_guard = sb_state.umount_read();
+
+        self.sync_filesystem_locked()
     }
 
     pub fn sync_blockdev(&self, _wait: bool) -> Result<(), SystemError> {

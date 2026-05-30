@@ -1209,8 +1209,8 @@ pub fn propagate_umount(
 ///
 /// Does NOT call `sync_filesystem()` here: all propagation clones share the same
 /// `super_block_state` (including `umount_lock`) via `deepcopy()`. The top-level
-/// `umount()` already synced before acquiring the write lock; syncing again here
-/// would be redundant and cause a RwSem self-deadlock.
+/// `umount()` already holds the write lock while running the sync body; syncing
+/// again here would be redundant and cause a RwSem self-deadlock.
 fn umount_at_peer(peer_mnt: &Arc<MountFS>, mountpoint_id: InodeId) -> Result<(), SystemError> {
     let Some(child) = peer_mnt.mountpoints().remove(&mountpoint_id) else {
         return Ok(());

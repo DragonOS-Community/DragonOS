@@ -275,20 +275,32 @@ TEST(SyncUmountLifetime, ConcurrentSyncAndUnmountPrivateRamfs) {
         }
         close(fd);
 
-        std::atomic<bool> stop{false};
-        std::thread sync_thread([&stop]() {
-            while (!stop.load(std::memory_order_relaxed)) {
+        std::atomic<bool> sync_started{false};
+        std::atomic<bool> umount_started{false};
+        std::atomic<int> sync_after_umount_started{0};
+        std::thread sync_thread([&]() {
+            sync_started.store(true, std::memory_order_release);
+            while (!umount_started.load(std::memory_order_acquire)) {
+                sync();
+                sched_yield();
+            }
+            for (int n = 0; n < 64; ++n) {
+                sync_after_umount_started.fetch_add(1, std::memory_order_relaxed);
                 sync();
                 sched_yield();
             }
         });
 
+        while (!sync_started.load(std::memory_order_acquire)) {
+            sched_yield();
+        }
         usleep(1000);
+        umount_started.store(true, std::memory_order_release);
         int umount_ret = umount(mountpoint);
         int saved_errno = errno;
-        stop.store(true, std::memory_order_relaxed);
         sync_thread.join();
         errno = saved_errno;
+        ASSERT_GT(sync_after_umount_started.load(std::memory_order_relaxed), 0);
         ASSERT_EQ(0, umount_ret) << "umount failed: " << strerror(errno);
     }
 

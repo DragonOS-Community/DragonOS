@@ -161,7 +161,7 @@ impl MountFlags {
     ///
     /// A String containing the mount options in comma-separated format.
     #[inline(never)]
-    pub fn proc_mount_options_string(&self) -> String {
+    pub fn options_string(&self) -> String {
         let mut options = Vec::new();
 
         // Check read/write flag
@@ -212,9 +212,6 @@ impl MountFlags {
         options.join(",")
     }
 
-    pub fn options_string(&self) -> String {
-        self.proc_mount_options_string()
-    }
 }
 
 // MountId类型

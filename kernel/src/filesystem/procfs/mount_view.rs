@@ -221,7 +221,7 @@ fn render_devname(mount: &Arc<MountFS>) -> Result<String, SystemError> {
 }
 
 fn render_mount_options(mount: &Arc<MountFS>) -> Result<String, SystemError> {
-    let mut options = mount.mount_flags().proc_mount_options_string();
+    let mut options = mount.mount_flags().options_string();
     let mut extra = String::new();
     mount
         .inner_filesystem()

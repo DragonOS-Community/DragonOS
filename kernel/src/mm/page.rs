@@ -18,7 +18,7 @@ use crate::{
     arch::{mm::LockedFrameAllocator, MMArch},
     filesystem::{
         page_cache::{list_page_caches, PageCache},
-        vfs::{mount::list_unique_mounted_superblocks, FilePrivateData},
+        vfs::FilePrivateData,
     },
     init::initcall::INITCALL_CORE,
     libs::{
@@ -265,19 +265,13 @@ fn page_reclaim_thread() -> i32 {
             // page_manager/page_cache 的锁顺序反转。
             PageReclaimer::shrink_list(PageFrameCount::new(page_to_free));
         } else {
-            //TODO 暂时让页面回收线程负责脏页回写任务，后续需要分离
+            //TODO Temporarily let page reclaim thread handle dirty page writeback; should be separated later.
             PageReclaimer::flush_dirty_pages();
-            // 休眠5秒
-            // log::info!("sleep");
-            // Linux 的 __writeback_single_inode 在 do_writepages 后调 write_inode 回写元数据，
-            // 脏页和元数据在同一次遍历中完成。DragonOS 的 flush_dirty_pages 不触发 write_inode，
-            // 此处通过 sync_fs 刷回 dirty_inodes 中的脏元数据。
-            let mounts = list_unique_mounted_superblocks();
-            for mountfs in mounts {
-                let _ = mountfs.sync_fs_with_umount_read(true);
-            }
 
-            let _ = nanosleep(PosixTimeSpec::new(0, 500_000_000));
+            // Sleep 5 seconds, matching the Linux dirty_writeback_centisecs default.
+            // Metadata writeback is handled by the VFS writeback thread. Keeping
+            // sync_fs out of reclaim avoids coupling page reclaim to umount_lock.
+            let _ = nanosleep(PosixTimeSpec::new(5, 0));
         }
     }
 }

@@ -335,6 +335,10 @@ impl SuperBlockState {
         self.umount_lock.read()
     }
 
+    pub fn try_umount_read(&self) -> Option<crate::libs::rwsem::RwSemReadGuard<'_, ()>> {
+        self.umount_lock.try_read()
+    }
+
     pub fn umount_write(&self) -> crate::libs::rwsem::RwSemWriteGuard<'_, ()> {
         self.umount_lock.write()
     }
@@ -606,21 +610,34 @@ impl MountFS {
         self.self_ref.upgrade().unwrap()
     }
 
-    /// 卸载文件系统
+    /// Unmount the filesystem.
+    ///
+    /// Modeled after Linux `deactivate_super()` + `generic_shutdown_super()`:
+    /// take the superblock write lock first, then run the sync body without
+    /// trying to recursively acquire `umount_read`. All propagation clones share
+    /// the same `super_block_state` (via `Arc::clone` in `deepcopy`), so a single
+    /// top-level sync covers every peer.
+    ///
     /// # Errors
-    /// 如果当前文件系统是根文件系统，那么将会返回`EINVAL`
+    /// Returns `EINVAL` if this is the root filesystem.
     pub fn umount(&self) -> Result<Arc<MountFS>, SystemError> {
         let mountpoint = self.self_mountpoint().ok_or(SystemError::EINVAL)?;
+
+        // Phase 1: Exclusive lock — excludes concurrent sync/IO during teardown.
         let sb_state = self.super_block_state();
         let _umount_guard = sb_state.umount_write();
 
-        self.sync_filesystem_locked()?;
+        // Phase 2: Sync while the superblock lock is already held.
+        // Errors during pre-umount sync are non-fatal (warn only).
+        if let Err(e) = self.sync_filesystem_locked() {
+            log::warn!("umount: pre-sync failed: {:?}, proceeding with umount", e);
+        }
 
+        // Phase 3: Detach and propagate (no syncing under the lock).
         let result = mountpoint.do_umount();
 
         if result.is_ok() {
-            // 清除 self_mountpoint，断开与旧父挂载点的反向引用。
-            // 将 mnt_parent 设为自身、mnt_mountpoint 设为自身 root 的语义。
+            // Clear self_mountpoint to drop the back-reference to the old parent mountpoint.
             self.self_mountpoint.write().take();
             self.inner_filesystem.on_umount();
             self.clear_namespace();
@@ -699,6 +716,11 @@ impl MountFS {
         let caches = list_page_caches();
         let mut last_err = Ok(());
         for page_cache in caches {
+            // Fast-skip page caches with no dirty pages, avoiding unnecessary inode.upgrade() and Arc::ptr_eq.
+            if !page_cache.has_dirty_pages() {
+                continue;
+            }
+
             let belongs = page_cache
                 .inode()
                 .and_then(|weak| weak.upgrade())
@@ -742,6 +764,24 @@ impl MountFS {
         Ok(())
     }
 
+    pub fn try_sync_fs_with_umount_read(&self, wait: bool) -> Result<bool, SystemError> {
+        let sb_state = self.super_block_state();
+        let Some(_umount_guard) = sb_state.try_umount_read() else {
+            return Ok(false);
+        };
+
+        if self.is_sb_readonly() {
+            return Ok(true);
+        }
+
+        if let Err(e) = self.sync_fs(wait) {
+            self.record_wb_error(e.clone());
+            return Err(e);
+        }
+
+        Ok(true)
+    }
+
     pub fn sync_blockdev_with_umount_read(&self, wait: bool) -> Result<(), SystemError> {
         let sb_state = self.super_block_state();
         let _umount_guard = sb_state.umount_read();
@@ -758,20 +798,12 @@ impl MountFS {
         Ok(())
     }
 
-    /// sync() 将所有挂起的文件系统元数据和缓存文件数据写入底层文件系统。
-    pub fn sync_filesystem(&self) -> Result<(), SystemError> {
-        let sb_state = self.super_block_state();
-        let _umount_guard = sb_state.umount_read();
-
-        self.sync_filesystem_locked()
-    }
-
-    /// 同步当前 superblock，要求调用方已经持有 `umount_lock`。
+    /// Flush all pending filesystem metadata and cached file data to the underlying filesystem.
     ///
-    /// Linux 的 `sync_filesystem(sb)` 要求调用方已持有 `s_umount`。DragonOS
-    /// 在 `sync_filesystem()` 外部入口中获取读锁，而 `umount()` 已经持有写锁，
-    /// 因此 teardown 路径必须调用这个 locked 版本，避免同线程重入读锁。
-    pub fn sync_filesystem_locked(&self) -> Result<(), SystemError> {
+    /// Modeled after Linux `sync_filesystem(sb)`: the caller must already hold
+    /// this mount's superblock `umount_lock`, either for read (`syncfs`) or write
+    /// (`umount`).
+    fn sync_filesystem_locked(&self) -> Result<(), SystemError> {
         if self.is_sb_readonly() {
             return Ok(());
         }
@@ -805,6 +837,15 @@ impl MountFS {
         }
 
         last_err
+    }
+
+    /// Public read-locked wrapper for callers that do not already hold the
+    /// superblock `umount_lock`.
+    pub fn sync_filesystem(&self) -> Result<(), SystemError> {
+        let sb_state = self.super_block_state();
+        let _umount_guard = sb_state.umount_read();
+
+        self.sync_filesystem_locked()
     }
 
     pub fn sync_blockdev(&self, _wait: bool) -> Result<(), SystemError> {

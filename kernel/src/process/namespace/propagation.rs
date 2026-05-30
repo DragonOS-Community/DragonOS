@@ -1206,32 +1206,36 @@ pub fn propagate_umount(
 }
 
 /// Umount at a specific peer mount.
+///
+/// Does NOT call `sync_filesystem()` here: all propagation clones share the same
+/// `super_block_state` (including `umount_lock`) via `deepcopy()`. The top-level
+/// `umount()` already holds the write lock while running the sync body; syncing
+/// again here would be redundant and cause a RwSem self-deadlock.
 fn umount_at_peer(peer_mnt: &Arc<MountFS>, mountpoint_id: InodeId) -> Result<(), SystemError> {
-    if peer_mnt.mountpoints().contains_key(&mountpoint_id) {
-        let Some(child) = peer_mnt.mountpoints().remove(&mountpoint_id) else {
-            return Ok(());
-        };
-        // Unregister the child from its peer group if shared
-        let child_prop = child.propagation();
-        if child_prop.is_shared() {
-            unregister_peer(child_prop.peer_group_id(), &child);
-        }
-        if let Some(master) = child_prop.master() {
-            master.propagation().remove_slave(&Arc::downgrade(&child));
-            child_prop.set_master(None);
-        }
+    let Some(child) = peer_mnt.mountpoints().remove(&mountpoint_id) else {
+        return Ok(());
+    };
 
-        child.set_self_mountpoint(None);
-
-        // 先从 mount_list 移除，再清 namespace，避免 "namespace=None 但 mount_list 仍有记录" 的 TOCTOU 中间态。
-        if let Some(ns) = child.namespace() {
-            if let Some(mp) = ns.mount_list().get_mount_path_by_mountfs(&child) {
-                ns.remove_mount(mp.as_str());
-            }
-        }
-        child.clear_namespace();
-        // log::debug!("umount_at_peer: removed mount at {:?}", mountpoint_id);
+    // Unregister the child from its peer group if shared
+    let child_prop = child.propagation();
+    if child_prop.is_shared() {
+        unregister_peer(child_prop.peer_group_id(), &child);
     }
+    if let Some(master) = child_prop.master() {
+        master.propagation().remove_slave(&Arc::downgrade(&child));
+        child_prop.set_master(None);
+    }
+
+    child.set_self_mountpoint(None);
+
+    // 先从 mount_list 移除，再清 namespace，避免 "namespace=None 但 mount_list 仍有记录" 的 TOCTOU 中间态。
+    if let Some(ns) = child.namespace() {
+        if let Some(mp) = ns.mount_list().get_mount_path_by_mountfs(&child) {
+            ns.remove_mount(mp.as_str());
+        }
+    }
+    child.clear_namespace();
+
     Ok(())
 }
 

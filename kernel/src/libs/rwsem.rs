@@ -189,8 +189,11 @@ impl<T: ?Sized> RwSem<T> {
                 _nosend: PhantomData,
             })
         } else {
+            // Rollback the transient READER increment. If this was the last
+            // active reader (lock transitions to 0), wake all waiters so a
+            // pending writer is not missed — same rationale as ReadGuard::drop.
             if self.lock.fetch_sub(READER, Release) == READER {
-                self.queue.wake_one();
+                self.queue.wake_all();
             }
             None
         }
@@ -346,9 +349,13 @@ impl<T: ?Sized> Deref for RwSemReadGuard<'_, T> {
 
 impl<T: ?Sized> Drop for RwSemReadGuard<'_, T> {
     fn drop(&mut self) {
-        // When there are no readers, wake up a waiting writer.
+        // When the last reader releases, wake ALL waiters (both readers and
+        // writers). Using wake_all() instead of wake_one() prevents a
+        // lost-wakeup deadlock: if a writer is queued (writer_waiters > 0),
+        // wake_one() might wake a different reader who then fails try_read()
+        // and goes back to sleep, leaving the writer permanently un-woken.
         if self.inner.lock.fetch_sub(READER, Release) == READER {
-            self.inner.queue.wake_one();
+            self.inner.queue.wake_all();
         }
     }
 }

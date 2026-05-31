@@ -163,7 +163,7 @@ impl MountFlags {
     ///
     /// A String containing the mount options in comma-separated format.
     #[inline(never)]
-    pub fn options_string(&self) -> String {
+    pub fn proc_mount_options_string(&self) -> String {
         let mut options = Vec::new();
 
         // Check read/write flag
@@ -211,25 +211,15 @@ impl MountFlags {
             options.push("lazytime");
         }
 
-        // Mount propagation flags
-        if self.contains(MountFlags::UNBINDABLE) {
-            options.push("unbindable");
-        }
-        if self.contains(MountFlags::PRIVATE) {
-            options.push("private");
-        }
-        if self.contains(MountFlags::SLAVE) {
-            options.push("slave");
-        }
-        if self.contains(MountFlags::SHARED) {
-            options.push("shared");
-        }
-
         // Internal flags (typically not shown in /proc/mounts)
         // We'll skip flags like BIND, MOVE, REC, REMOUNT, etc. as they're
         // not typically displayed in mount options
 
         options.join(",")
+    }
+
+    pub fn options_string(&self) -> String {
+        self.proc_mount_options_string()
     }
 }
 
@@ -1978,6 +1968,21 @@ impl MountList {
             .mounts
             .iter()
             .map(|(p, stack)| (p.clone(), stack.last().unwrap().fs.clone()))
+            .collect()
+    }
+
+    /// Clone every mount record, including lower entries in a same-path mount stack.
+    pub fn clone_records(&self) -> Vec<(Arc<MountPath>, Arc<MountFS>)> {
+        self.inner
+            .read()
+            .mounts
+            .iter()
+            .flat_map(|(path, stack)| {
+                stack
+                    .iter()
+                    .map(|rec| (path.clone(), rec.fs.clone()))
+                    .collect::<Vec<_>>()
+            })
             .collect()
     }
 

@@ -4,10 +4,7 @@
 
 use crate::filesystem::{
     procfs::{
-        mounts::{
-            cache_procfs_file_content, generate_mounts_content_for_task,
-            read_cached_procfs_file_content,
-        },
+        mount_view::{open_mount_file_for_target, read_cached_mount_file, ProcMountRenderKind},
         pid::ProcPidTarget,
         template::{Builder, FileOps, ProcFileBuilder},
     },
@@ -34,11 +31,7 @@ impl PidMountsFileOps {
 
 impl FileOps for PidMountsFileOps {
     fn open(&self, data: &mut MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
-        let target = self
-            .target
-            .thread_group_leader()
-            .ok_or(SystemError::ESRCH)?;
-        cache_procfs_file_content(data, generate_mounts_content_for_task(&target))
+        open_mount_file_for_target(&self.target, ProcMountRenderKind::Mounts, data)
     }
 
     fn read_at(
@@ -48,9 +41,10 @@ impl FileOps for PidMountsFileOps {
         buf: &mut [u8],
         data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        self.target
-            .thread_group_leader()
-            .ok_or(SystemError::ESRCH)?;
-        read_cached_procfs_file_content(offset, len, buf, data)
+        read_cached_mount_file(offset, len, buf, data)
+    }
+
+    fn owner(&self) -> Option<(usize, usize)> {
+        self.target.owner_uid_gid()
     }
 }

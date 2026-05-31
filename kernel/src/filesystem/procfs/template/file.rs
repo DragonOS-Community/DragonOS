@@ -141,7 +141,6 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
         buf: &mut [u8],
         data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        // log::info!("ProcFile read_at called");
         self.inner.read_at(offset, len, buf, data)
     }
 

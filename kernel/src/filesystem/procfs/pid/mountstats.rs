@@ -1,6 +1,4 @@
-//! /proc/[pid]/mountinfo - 进程挂载点详细信息
-//!
-//! 显示进程的挂载点详细信息
+//! /proc/[pid]/mountstats - 进程挂载统计信息
 
 use crate::filesystem::{
     procfs::{
@@ -14,24 +12,23 @@ use crate::libs::mutex::MutexGuard;
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
 
-/// /proc/[pid]/mountinfo 文件的 FileOps 实现
 #[derive(Debug)]
-pub struct MountInfoFileOps {
+pub struct MountStatsFileOps {
     target: ProcPidTarget,
 }
 
-impl MountInfoFileOps {
+impl MountStatsFileOps {
     pub fn new_inode(target: ProcPidTarget, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcFileBuilder::new(Self { target }, InodeMode::S_IRUGO)
+        ProcFileBuilder::new(Self { target }, InodeMode::S_IRUSR)
             .parent(parent)
             .build()
             .unwrap()
     }
 }
 
-impl FileOps for MountInfoFileOps {
+impl FileOps for MountStatsFileOps {
     fn open(&self, data: &mut MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
-        open_mount_file_for_target(&self.target, ProcMountRenderKind::MountInfo, data)
+        open_mount_file_for_target(&self.target, ProcMountRenderKind::MountStats, data)
     }
 
     fn read_at(

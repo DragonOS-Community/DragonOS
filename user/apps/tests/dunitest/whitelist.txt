@@ -32,7 +32,7 @@ normal/socket_getsockopt_semantics
 fuse/fuse_core
 fuse/fuse_extended
 normal/test_procfs_link
-normal/proc_pid_mounts_target_view
+normal/proc_mount_exports
 normal/proc_pid_reuse_cache
 normal/proc_self_exec_cmdline
 normal/proc_thread_accounting

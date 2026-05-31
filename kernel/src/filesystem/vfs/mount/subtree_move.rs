@@ -8,7 +8,8 @@
 use alloc::{string::String, string::ToString, sync::Arc, vec::Vec};
 use core::mem;
 
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
+use system_error::SystemError;
 
 use super::{InodeId, MountFS, MountList, MountPath, MountRecord};
 
@@ -58,41 +59,87 @@ impl MountList {
     pub fn move_subtree(
         &self,
         root_mount: &Arc<MountFS>,
+        moving_mounts: &HashSet<Arc<MountFS>>,
         new_root_ino: InodeId,
         old_base: &str,
         new_base: &str,
-    ) {
+    ) -> Result<(), SystemError> {
         let mut inner = self.inner.write();
+
+        for (old_path, stack) in inner.mounts.iter() {
+            for rec in stack {
+                if moving_mounts.contains(&rec.fs)
+                    && old_path.relocate(old_base, new_base).is_none()
+                {
+                    log::warn!(
+                        "move_subtree: moving mount {:?} path '{}' is not under old base '{}'",
+                        rec.fs.mount_id(),
+                        old_path.as_str(),
+                        old_base
+                    );
+                    return Err(SystemError::EINVAL);
+                }
+            }
+        }
+
         let old_mounts = mem::take(&mut inner.mounts);
         let mut new_mounts: HashMap<Arc<MountPath>, Vec<MountRecord>> = HashMap::new();
         let mut new_ino2mp = HashMap::new();
         let mut new_mfs2ino = HashMap::new();
         let mut new_mfs2mp = HashMap::new();
+        let mut stationary: Vec<(Arc<MountPath>, usize, MountRecord)> = Vec::new();
+        let mut moved: Vec<(Arc<MountPath>, usize, MountRecord)> = Vec::new();
 
         for (old_path, stack) in old_mounts {
-            let new_path = match old_path.relocate(old_base, new_base) {
-                Some(p) => Arc::new(p),
-                None => old_path.clone(),
-            };
-
-            let entry = new_mounts.entry(new_path.clone()).or_insert_with(Vec::new);
-            for mut rec in stack {
-                // The root mount's mount point inode changes with the move; child mounts keep their original inode.
-                if Arc::ptr_eq(&rec.fs, root_mount) {
-                    rec.ino = Some(new_root_ino);
+            for (idx, rec) in stack.into_iter().enumerate() {
+                if moving_mounts.contains(&rec.fs) {
+                    moved.push((old_path.clone(), idx, rec));
+                } else {
+                    stationary.push((old_path.clone(), idx, rec));
                 }
-                if let Some(ino) = rec.ino {
-                    new_ino2mp.insert(ino, new_path.clone());
-                    new_mfs2ino.insert(rec.fs.clone(), ino);
-                }
-                new_mfs2mp.insert(rec.fs.clone(), new_path.clone());
-                entry.push(rec);
             }
+        }
+
+        stationary.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()).then(a.1.cmp(&b.1)));
+        moved.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()).then(a.1.cmp(&b.1)));
+
+        let mut ordered_records: Vec<(Arc<MountPath>, MountRecord)> =
+            Vec::with_capacity(stationary.len() + moved.len());
+        for (path, _, rec) in stationary {
+            ordered_records.push((path, rec));
+        }
+        for (old_path, _, mut rec) in moved {
+            let new_path = Arc::new(old_path.relocate(old_base, new_base).ok_or_else(|| {
+                log::warn!(
+                    "move_subtree: moving mount {:?} path '{}' is not under old base '{}'",
+                    rec.fs.mount_id(),
+                    old_path.as_str(),
+                    old_base
+                );
+                SystemError::EINVAL
+            })?);
+
+            // The root mount's mount point inode changes with the move; child mounts keep their original inode.
+            if Arc::ptr_eq(&rec.fs, root_mount) {
+                rec.ino = Some(new_root_ino);
+            }
+            ordered_records.push((new_path, rec));
+        }
+
+        for (path, rec) in ordered_records {
+            if let Some(ino) = rec.ino {
+                new_ino2mp.insert(ino, path.clone());
+                new_mfs2ino.insert(rec.fs.clone(), ino);
+            }
+            new_mfs2mp.insert(rec.fs.clone(), path.clone());
+            new_mounts.entry(path).or_insert_with(Vec::new).push(rec);
         }
 
         inner.mounts = new_mounts;
         inner.ino2mp = new_ino2mp;
         inner.mfs2ino = new_mfs2ino;
         inner.mfs2mp = new_mfs2mp;
+
+        Ok(())
     }
 }

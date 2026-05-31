@@ -1582,9 +1582,12 @@ impl IndexNode for MountFSInode {
             .downcast_arc::<MountFS>()
             .ok_or(SystemError::EINVAL)?;
 
-        let old_source_path = from.absolute_path()?;
-        let new_target_path = self.absolute_path()?;
         let target_mountpoint = self.self_ref.upgrade().unwrap();
+        let old_source_path = from_mfs
+            .self_mountpoint()
+            .ok_or(SystemError::EINVAL)?
+            .absolute_path()?;
+        let new_target_path = target_mountpoint.absolute_path()?;
         let mntns = ProcessManager::current_mntns();
         mntns.move_mount(
             &from_mfs,

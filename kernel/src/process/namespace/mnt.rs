@@ -10,6 +10,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
+use hashbrown::HashSet;
 use system_error::SystemError;
 
 use super::{
@@ -228,6 +229,7 @@ impl MntNamespace {
         old_source_path: &str,
         new_target_path: &str,
     ) -> Result<(), SystemError> {
+        let moving_mounts = collect_mount_subtree(source_mfs);
         let old_mountpoint = source_mfs.self_mountpoint().ok_or(SystemError::EINVAL)?;
         let old_parent = old_mountpoint.mount_fs();
         let old_mp_id = old_mountpoint.inode_id()?;
@@ -256,9 +258,21 @@ impl MntNamespace {
         //    otherwise copy_mnt_ns() will fail when traversing mountpoints and looking up
         //    target_mp_id in ino2mp.
         let inner = self.inner.lock();
-        inner
-            .mount_list
-            .move_subtree(source_mfs, target_mp_id, old_source_path, new_target_path);
+        let move_result = inner.mount_list.move_subtree(
+            source_mfs,
+            &moving_mounts,
+            target_mp_id,
+            old_source_path,
+            new_target_path,
+        );
+        drop(inner);
+
+        if let Err(e) = move_result {
+            target_parent.mountpoints().remove(&target_mp_id);
+            old_parent.mountpoints().insert(old_mp_id, removed);
+            source_mfs.set_self_mountpoint(Some(old_mountpoint));
+            return Err(e);
+        }
 
         Ok(())
     }
@@ -458,6 +472,23 @@ impl MntNamespace {
     ) -> Option<(Arc<MountPath>, String, Arc<MountFS>)> {
         self.inner.lock().mount_list.get_mount_point(mount_point)
     }
+}
+
+fn collect_mount_subtree(root: &Arc<MountFS>) -> HashSet<Arc<MountFS>> {
+    let mut visited = HashSet::new();
+    let mut stack = Vec::new();
+    stack.push(root.clone());
+
+    while let Some(mnt) = stack.pop() {
+        if !visited.insert(mnt.clone()) {
+            continue;
+        }
+
+        let children: Vec<Arc<MountFS>> = mnt.mountpoints().values().cloned().collect();
+        stack.extend(children);
+    }
+
+    visited
 }
 
 impl ProcessManager {

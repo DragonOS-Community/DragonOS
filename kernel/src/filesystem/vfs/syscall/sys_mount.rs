@@ -755,10 +755,15 @@ fn do_move_mount(
         .ok_or(SystemError::EINVAL)?;
     let target_mp_id = target_mountpoint.inode_id()?;
 
-    let old_source_path = source_inode.absolute_path()?;
-    let new_target_path = target_inode.absolute_path()?;
-
     // Perform topology move + mount_list subtree path rewrite.
+    //
+    // The source inode is the root inode inside the visible mounted filesystem.
+    // For stacked mounts, its absolute_path() may describe the mounted root from
+    // inside that filesystem rather than the parent-side mountpoint path stored
+    // in MountList. Use self_mountpoint() to get the actual namespace path where
+    // this mount is attached.
+    let old_source_path = source_mountpoint.absolute_path()?;
+    let new_target_path = target_mountpoint.absolute_path()?;
     current_mntns.move_mount(
         &source_mfs,
         &target_mountpoint,

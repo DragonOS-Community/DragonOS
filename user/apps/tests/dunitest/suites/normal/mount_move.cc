@@ -65,14 +65,14 @@ bool marker_exists(const char* mount_point, const char* name) {
     return path_exists(path);
 }
 
-// Read /proc/self/mountinfo and check whether a given mount path appears as a mount point.
-bool mountinfo_has_mountpoint(const char* mount_point) {
+// Read /proc/self/mountinfo and count how many times a path appears as a mount point.
+int mountinfo_count_mountpoint(const char* mount_point) {
     FILE* fp = fopen("/proc/self/mountinfo", "r");
     if (fp == nullptr) {
-        return false;
+        return -1;
     }
     char line[1024] = {};
-    bool found = false;
+    int count = 0;
     while (fgets(line, sizeof(line), fp) != nullptr) {
         // mountinfo format: mnt_id parent_id major:minor root mount_point ...
         // The 5th field (index 4) is the mount point path.
@@ -82,19 +82,20 @@ bool mountinfo_has_mountpoint(const char* mount_point) {
         while (tok != nullptr) {
             if (field == 4) {
                 if (strcmp(tok, mount_point) == 0) {
-                    found = true;
+                    count++;
                 }
                 break;
             }
             tok = strtok_r(nullptr, " ", &saveptr);
             field++;
         }
-        if (found) {
-            break;
-        }
     }
     fclose(fp);
-    return found;
+    return count;
+}
+
+bool mountinfo_has_mountpoint(const char* mount_point) {
+    return mountinfo_count_mountpoint(mount_point) > 0;
 }
 
 void best_effort_umount(const char* path) {
@@ -102,6 +103,21 @@ void best_effort_umount(const char* path) {
         ADD_FAILURE() << "umount failed for " << path << ": errno=" << errno << " ("
                       << strerror(errno) << ")";
     }
+}
+
+void best_effort_umount_all(const char* path) {
+    for (int i = 0; i < 16; ++i) {
+        if (umount(path) == 0) {
+            continue;
+        }
+        if (errno == EINVAL || errno == ENOENT) {
+            return;
+        }
+        ADD_FAILURE() << "umount failed for " << path << ": errno=" << errno << " ("
+                      << strerror(errno) << ")";
+        return;
+    }
+    ADD_FAILURE() << "too many stacked mounts while cleaning " << path;
 }
 
 void best_effort_rmdir(const char* path) {
@@ -112,7 +128,7 @@ void best_effort_rmdir(const char* path) {
 }
 
 void cleanup_path(const char* path) {
-    umount(path);
+    best_effort_umount_all(path);
     rmdir(path);
 }
 
@@ -141,6 +157,12 @@ protected:
         };
         for (const char* suffix : suffixes) {
             snprintf(path, sizeof(path), "%s%s", root_, suffix);
+            cleanup_path(path);
+        }
+        for (int i = 0; i < 16; ++i) {
+            snprintf(path, sizeof(path), "%s/src_%d", root_, i);
+            cleanup_path(path);
+            snprintf(path, sizeof(path), "%s/dst_%d", root_, i);
             cleanup_path(path);
         }
         // dst_file is a regular file, not a directory.
@@ -173,6 +195,66 @@ TEST_F(MountMoveTest, BasicMoveRelocatesMount) {
     EXPECT_FALSE(mountinfo_has_mountpoint(src));
 
     best_effort_umount(dst);
+}
+
+// Linux moves only the currently visible top mount at the source path. Lower stacked mounts
+// at the same source path must stay behind and become visible again.
+TEST_F(MountMoveTest, MoveOnlyTopOfStackKeepsLowerAtSource) {
+    char src[160] = {};
+    char dst[160] = {};
+    snprintf(src, sizeof(src), "%s/src", root_);
+    snprintf(dst, sizeof(dst), "%s/dst", root_);
+
+    ASSERT_EQ(0, ensure_dir(src)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(dst)) << strerror(errno);
+    ASSERT_EQ(0, mount("", src, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, create_marker(src, "lower_marker")) << strerror(errno);
+    ASSERT_EQ(0, mount("", src, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, create_marker(src, "upper_marker")) << strerror(errno);
+
+    ASSERT_EQ(0, mount(src, dst, nullptr, MS_MOVE, nullptr)) << strerror(errno);
+
+    EXPECT_TRUE(marker_exists(dst, "upper_marker"));
+    EXPECT_FALSE(marker_exists(dst, "lower_marker"));
+    EXPECT_TRUE(marker_exists(src, "lower_marker"));
+    EXPECT_FALSE(marker_exists(src, "upper_marker"));
+    EXPECT_EQ(1, mountinfo_count_mountpoint(src));
+    EXPECT_EQ(1, mountinfo_count_mountpoint(dst));
+
+    best_effort_umount_all(dst);
+    best_effort_umount_all(src);
+}
+
+// Moving onto an already-mounted target must place the moved mount above the old target mount.
+TEST_F(MountMoveTest, MoveOntoMountedTargetBecomesTop) {
+    for (int i = 0; i < 8; ++i) {
+        char src[160] = {};
+        char dst[160] = {};
+        snprintf(src, sizeof(src), "%s/src_%d", root_, i);
+        snprintf(dst, sizeof(dst), "%s/dst_%d", root_, i);
+
+        ASSERT_EQ(0, ensure_dir(src)) << strerror(errno);
+        ASSERT_EQ(0, ensure_dir(dst)) << strerror(errno);
+        ASSERT_EQ(0, mount("", dst, "ramfs", 0, nullptr)) << strerror(errno);
+        ASSERT_EQ(0, create_marker(dst, "target_marker")) << strerror(errno);
+        ASSERT_EQ(0, mount("", src, "ramfs", 0, nullptr)) << strerror(errno);
+        ASSERT_EQ(0, create_marker(src, "source_marker")) << strerror(errno);
+
+        ASSERT_EQ(0, mount(src, dst, nullptr, MS_MOVE, nullptr)) << strerror(errno);
+
+        EXPECT_TRUE(marker_exists(dst, "source_marker"));
+        EXPECT_FALSE(marker_exists(dst, "target_marker"));
+        EXPECT_EQ(1, mountinfo_count_mountpoint(dst));
+
+        best_effort_umount(dst);
+        EXPECT_TRUE(marker_exists(dst, "target_marker"));
+        EXPECT_FALSE(marker_exists(dst, "source_marker"));
+
+        best_effort_umount_all(dst);
+        best_effort_umount_all(src);
+        best_effort_rmdir(dst);
+        best_effort_rmdir(src);
+    }
 }
 
 // Move a subtree with child mounts: child mounts migrate with the parent and mount_list path prefixes are updated.

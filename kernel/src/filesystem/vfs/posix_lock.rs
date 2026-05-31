@@ -1,6 +1,6 @@
 use alloc::{sync::Arc, vec::Vec};
 
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use jhash::jhash2;
 use system_error::SystemError;
 
@@ -219,16 +219,24 @@ struct PosixLockShard {
 
 #[derive(Default)]
 struct WaitGraph {
+    /// waiter_owner -> {blocker_owner -> edge_count}
     edges: HashMap<usize, HashMap<usize, usize>>,
+    /// Reverse index: (blocker_owner, file_key) -> set of waiters blocked on this file.
+    /// Used for O(1) per-file cleanup when a blocker releases locks.
+    file_blockers: HashMap<(usize, PosixLockKey), HashSet<usize>>,
 }
 
 impl WaitGraph {
-    fn add_edge(&mut self, src_owner: usize, dst_owner: usize) {
+    fn add_edge(&mut self, src_owner: usize, dst_owner: usize, key: PosixLockKey) {
         let dsts = self.edges.entry(src_owner).or_default();
         *dsts.entry(dst_owner).or_insert(0) += 1;
+        self.file_blockers
+            .entry((dst_owner, key))
+            .or_default()
+            .insert(src_owner);
     }
 
-    fn remove_edge(&mut self, src_owner: usize, dst_owner: usize) {
+    fn remove_edge(&mut self, src_owner: usize, dst_owner: usize, key: PosixLockKey) {
         let mut need_remove_src = false;
         if let Some(dsts) = self.edges.get_mut(&src_owner) {
             let mut need_remove_dst = false;
@@ -249,6 +257,14 @@ impl WaitGraph {
         if need_remove_src {
             self.edges.remove(&src_owner);
         }
+
+        // Clean up reverse index
+        if let Some(waiters) = self.file_blockers.get_mut(&(dst_owner, key)) {
+            waiters.remove(&src_owner);
+            if waiters.is_empty() {
+                self.file_blockers.remove(&(dst_owner, key));
+            }
+        }
     }
 
     fn has_path(&self, from_owner: usize, target_owner: usize) -> bool {
@@ -258,7 +274,7 @@ impl WaitGraph {
 
         let mut stack = Vec::with_capacity(1);
         stack.push(from_owner);
-        let mut visited = hashbrown::HashSet::new();
+        let mut visited = HashSet::new();
 
         while let Some(curr) = stack.pop() {
             if !visited.insert(curr) {
@@ -278,6 +294,30 @@ impl WaitGraph {
             }
         }
         false
+    }
+
+    /// Remove all edges where `owner_id` is the blocker on the given file key.
+    ///
+    /// Uses count-aware removal to respect the reference counting in `edges`.
+    /// Only safe to call when the owner has no remaining locks on the file;
+    /// otherwise still-valid edges would be incorrectly removed.
+    fn cleanup_blocker_edges(&mut self, owner_id: usize, key: PosixLockKey) {
+        if let Some(waiters) = self.file_blockers.remove(&(owner_id, key)) {
+            for waiter in &waiters {
+                if let Some(dsts) = self.edges.get_mut(waiter) {
+                    if let Some(cnt) = dsts.get_mut(&owner_id) {
+                        if *cnt <= 1 {
+                            dsts.remove(&owner_id);
+                        } else {
+                            *cnt -= 1;
+                        }
+                    }
+                    if dsts.is_empty() {
+                        self.edges.remove(waiter);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -356,6 +396,20 @@ impl PosixLockManager {
         }
     }
 
+    /// Check if an owner has any remaining locks on a file entry.
+    /// Used to guard cleanup_blocker_edges: cleanup is only safe when the
+    /// owner has no remaining locks after an unlock (full unlock), to avoid
+    /// removing still-valid edges during partial unlocks.
+    #[inline]
+    fn owner_has_locks_on_entry(&self, entry: &PosixLockEntry, owner_id: usize) -> bool {
+        entry
+            .state
+            .lock()
+            .locks
+            .iter()
+            .any(|rec| rec.owner_id == owner_id)
+    }
+
     fn lock_or_wait(
         &self,
         entry: &Arc<PosixLockEntry>,
@@ -363,6 +417,7 @@ impl PosixLockManager {
         owner_pid: i32,
         req: ParsedRangeLock,
         blocking: bool,
+        key: PosixLockKey,
     ) -> Result<bool, SystemError> {
         let req_type = req
             .req_type
@@ -389,7 +444,7 @@ impl PosixLockManager {
                 if graph.has_path(conflict_owner, owner_id) {
                     return Err(SystemError::EDEADLK_OR_EDEADLOCK);
                 }
-                graph.add_edge(owner_id, conflict_owner);
+                graph.add_edge(owner_id, conflict_owner, key);
             }
 
             // Recheck once after edge insertion. If conflict already disappeared,
@@ -403,13 +458,17 @@ impl PosixLockManager {
 
                 match conflict_after_edge {
                     None => {
-                        self.wait_graph.lock().remove_edge(owner_id, conflict_owner);
+                        self.wait_graph
+                            .lock()
+                            .remove_edge(owner_id, conflict_owner, key);
                         continue;
                     }
                     Some(new_conflict_owner) if new_conflict_owner != conflict_owner => {
                         // Blocker changed before sleeping. Rebuild edge in next loop
                         // so deadlock detection is checked against the new blocker.
-                        self.wait_graph.lock().remove_edge(owner_id, conflict_owner);
+                        self.wait_graph
+                            .lock()
+                            .remove_edge(owner_id, conflict_owner, key);
                         continue;
                     }
                     Some(_) => {}
@@ -427,7 +486,9 @@ impl PosixLockManager {
                     Some(_) => None,
                 }
             });
-            self.wait_graph.lock().remove_edge(owner_id, conflict_owner);
+            self.wait_graph
+                .lock()
+                .remove_edge(owner_id, conflict_owner, key);
             wait_result?;
         }
     }
@@ -515,12 +576,23 @@ impl PosixLockManager {
         };
 
         let changed = if matches!(req.req_type, PosixLockRequestType::Unlock) {
-            entry
+            let changed = entry
                 .state
                 .lock()
-                .apply_owner_request(owner_id, owner_pid, req)
+                .apply_owner_request(owner_id, owner_pid, req);
+            if changed {
+                // Clean up stale wait graph edges for the unlocking owner.
+                // Guard: only cleanup when owner has no remaining locks on this file.
+                // For partial unlocks (owner still holds other locks), skip cleanup:
+                // the existing lock_or_wait wakeup path handles edge removal when
+                // the waiter confirms its blocker changed.
+                if !self.owner_has_locks_on_entry(&entry, owner_id) {
+                    self.wait_graph.lock().cleanup_blocker_edges(owner_id, key);
+                }
+            }
+            changed
         } else {
-            self.lock_or_wait(&entry, owner_id, owner_pid, req, blocking)?
+            self.lock_or_wait(&entry, owner_id, owner_pid, req, blocking, key)?
         };
 
         if changed {
@@ -539,6 +611,9 @@ impl PosixLockManager {
 
         let changed = entry.state.lock().remove_all_for_owner(owner_id);
         if changed {
+            // Owner has no remaining locks on this file after remove_all_for_owner,
+            // so all edges pointing to this owner on this file are stale.
+            self.wait_graph.lock().cleanup_blocker_edges(owner_id, key);
             entry.waitq.wakeup_all(None);
         }
 

@@ -3043,9 +3043,8 @@ impl VMA {
             //     "VMA::zeroed: cur_dest={cur_dest:?}, vaddr = {:?}",
             //     cur_dest.virt_address()
             // );
-            let r = unsafe { mapper.map(cur_dest.virt_address(), flags) }
-                .expect("Failed to map zero, may be OOM error");
-            // todo: 增加OOM处理
+            let r =
+                unsafe { mapper.map(cur_dest.virt_address(), flags) }.ok_or(SystemError::ENOMEM)?;
 
             // 稍后再刷新TLB，这里取消刷新
             flusher.consume(r);

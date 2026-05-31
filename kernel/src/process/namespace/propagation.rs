@@ -964,6 +964,86 @@ pub fn propagate_mount(
     Ok(())
 }
 
+/// Propagate a moved mount subtree into a shared destination parent.
+///
+/// This mirrors Linux `attach_recursive_mnt(MNT_TREE_MOVE)` when the destination
+/// is shared:
+/// - the whole moved subtree becomes shared (Linux `set_mnt_shared(p)` for every
+///   mount in the subtree);
+/// - the subtree is replicated into every peer (and slave) of the destination
+///   parent (Linux `propagate_mnt`).
+///
+/// The subtree is processed top-down (BFS). For each mount we first mark it
+/// shared and register it in its peer group, then call [`propagate_mount`] with
+/// its in-tree parent. Because the parent has already been made shared and
+/// replicated into the destination peers in an earlier iteration, propagating a
+/// child naturally clones it into the parent's replicas, reconstructing the full
+/// subtree in every peer namespace. This reuses the existing propagation
+/// primitives instead of duplicating copy logic.
+///
+/// # Arguments
+/// * `target_parent` - The shared destination parent the subtree was moved under.
+/// * `moved_root` - The root of the moved subtree.
+/// * `moved_root_mp_id` - The mountpoint inode id of `moved_root` in `target_parent`.
+/// * `moved_root_path` - The mount path of `moved_root` after the move.
+pub fn propagate_moved_tree(
+    target_parent: &Arc<MountFS>,
+    moved_root: &Arc<MountFS>,
+    moved_root_mp_id: InodeId,
+    moved_root_path: &Arc<MountPath>,
+) -> Result<(), SystemError> {
+    struct Pending {
+        parent: Arc<MountFS>,
+        mp_id: InodeId,
+        mnt: Arc<MountFS>,
+        path: Arc<MountPath>,
+    }
+
+    let mut queue: Vec<Pending> = Vec::new();
+    queue.push(Pending {
+        parent: target_parent.clone(),
+        mp_id: moved_root_mp_id,
+        mnt: moved_root.clone(),
+        path: moved_root_path.clone(),
+    });
+
+    let mut idx = 0;
+    while idx < queue.len() {
+        let parent = queue[idx].parent.clone();
+        let mp_id = queue[idx].mp_id;
+        let mnt = queue[idx].mnt.clone();
+        let path = queue[idx].path.clone();
+        idx += 1;
+
+        // Make this mount shared so its replicas in the destination peers join its
+        // peer group. Previously-shared mounts keep their existing group.
+        let prop = mnt.propagation();
+        if !prop.is_shared() {
+            prop.set_shared();
+            register_peer(prop.peer_group_id(), &mnt);
+        }
+
+        // Replicate this mount into the (now shared) parent's peers/slaves.
+        propagate_mount(&parent, mp_id, &mnt, &path)?;
+
+        // Enqueue children for top-down processing.
+        for (child_mp_id, child) in mnt.mountpoints().iter() {
+            let child_path = child
+                .namespace()
+                .and_then(|ns| ns.mount_list().get_mount_path_by_mountfs(child))
+                .unwrap_or_else(|| path.clone());
+            queue.push(Pending {
+                parent: mnt.clone(),
+                mp_id: *child_mp_id,
+                mnt: child.clone(),
+                path: child_path,
+            });
+        }
+    }
+
+    Ok(())
+}
+
 /// Propagate mount to a single target mount.
 ///
 /// The cloned child mount joins the SAME peer group as the source child,
@@ -1029,14 +1109,14 @@ fn propagate_one(
     }
     target_mnt.add_mount(mountpoint_id, cloned_child.clone())?;
 
-    // 传播子挂载必须继承目标挂载点的 namespace，
-    // 否则后续 is_belongs_to_mntns() 检查会因 namespace 为 None 而误判 EINVAL。
+    // Propagated child mounts must inherit the target mount's namespace,
+    // otherwise subsequent is_belongs_to_mntns() checks would incorrectly return EINVAL.
     if let Some(ns) = target_mnt.namespace() {
         cloned_child.set_namespace(Arc::downgrade(&ns));
         let target_mount_path = propagated_mount_path(source_parent_path, mount_path, target_mnt);
         ns.add_mount(Some(mountpoint_id), target_mount_path, cloned_child)
             .inspect_err(|_e| {
-                // 回滚 mountpoints 中已插入的克隆挂载。
+                // Roll back the cloned mount inserted into mountpoints.
                 target_mnt.mountpoints().remove(&mountpoint_id);
             })?;
     }
@@ -1206,32 +1286,36 @@ pub fn propagate_umount(
 }
 
 /// Umount at a specific peer mount.
+///
+/// Does NOT call `sync_filesystem()` here: all propagation clones share the same
+/// `super_block_state` (including `umount_lock`) via `deepcopy()`. The top-level
+/// `umount()` already holds the write lock while running the sync body; syncing
+/// again here would be redundant and cause a RwSem self-deadlock.
 fn umount_at_peer(peer_mnt: &Arc<MountFS>, mountpoint_id: InodeId) -> Result<(), SystemError> {
-    if peer_mnt.mountpoints().contains_key(&mountpoint_id) {
-        let Some(child) = peer_mnt.mountpoints().remove(&mountpoint_id) else {
-            return Ok(());
-        };
-        // Unregister the child from its peer group if shared
-        let child_prop = child.propagation();
-        if child_prop.is_shared() {
-            unregister_peer(child_prop.peer_group_id(), &child);
-        }
-        if let Some(master) = child_prop.master() {
-            master.propagation().remove_slave(&Arc::downgrade(&child));
-            child_prop.set_master(None);
-        }
+    let Some(child) = peer_mnt.mountpoints().remove(&mountpoint_id) else {
+        return Ok(());
+    };
 
-        child.set_self_mountpoint(None);
-
-        // 先从 mount_list 移除，再清 namespace，避免 "namespace=None 但 mount_list 仍有记录" 的 TOCTOU 中间态。
-        if let Some(ns) = child.namespace() {
-            if let Some(mp) = ns.mount_list().get_mount_path_by_mountfs(&child) {
-                ns.remove_mount(mp.as_str());
-            }
-        }
-        child.clear_namespace();
-        // log::debug!("umount_at_peer: removed mount at {:?}", mountpoint_id);
+    // Unregister the child from its peer group if shared
+    let child_prop = child.propagation();
+    if child_prop.is_shared() {
+        unregister_peer(child_prop.peer_group_id(), &child);
     }
+    if let Some(master) = child_prop.master() {
+        master.propagation().remove_slave(&Arc::downgrade(&child));
+        child_prop.set_master(None);
+    }
+
+    child.set_self_mountpoint(None);
+
+    // 先从 mount_list 移除，再清 namespace，避免 "namespace=None 但 mount_list 仍有记录" 的 TOCTOU 中间态。
+    if let Some(ns) = child.namespace() {
+        if let Some(mp) = ns.mount_list().get_mount_path_by_mountfs(&child) {
+            ns.remove_mount(mp.as_str());
+        }
+    }
+    child.clear_namespace();
+
     Ok(())
 }
 

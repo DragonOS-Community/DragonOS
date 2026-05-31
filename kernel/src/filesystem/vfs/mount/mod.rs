@@ -46,6 +46,8 @@ use ida::IdAllocator;
 use lazy_static::lazy_static;
 use system_error::SystemError;
 
+mod subtree_move;
+
 bitflags! {
     /// Mount flags for filesystem independent mount options
     /// These flags correspond to the MS_* constants in Linux
@@ -135,7 +137,7 @@ bitflags! {
         const MGC_VAL = 0xC0ED0000; // Magic value for mount flags
         const MGC_MASK = 0xFFFF0000; // Mask for magic mount flags
 
-        /// 用户空间可通过 MS_REMOUNT 修改的 mount flags 集合。
+        /// Set of mount flags that userspace can modify via MS_REMOUNT.
         const MNT_USER_SETTABLE_MASK = MountFlags::RDONLY.bits()
             | MountFlags::NOSUID.bits()
             | MountFlags::NODEV.bits()
@@ -231,7 +233,7 @@ impl MountFlags {
     }
 }
 
-// MountId类型
+// MountId type
 int_like!(MountId, usize);
 
 static MOUNT_ID_ALLOCATOR: Mutex<IdAllocator> =
@@ -253,18 +255,18 @@ impl MountId {
     }
 }
 
-/// @brief 挂载文件系统
-/// 挂载文件系统的时候，套了MountFS这一层，以实现文件系统的递归挂载
+/// @brief Mount filesystem
+/// When mounting a filesystem, a MountFS wrapper layer is applied to support recursive mounting.
 pub struct MountFS {
-    // MountFS内部的文件系统
+    // The inner filesystem wrapped by MountFS
     inner_filesystem: Arc<dyn FileSystem>,
-    /// 当前挂载暴露的根 inode。对 bind-mount 子目录时，这不是底层文件系统的全局根。
+    /// The root inode exposed by this mount. For bind-mount subdirectories, this is not the global root of the underlying filesystem.
     root_inner_inode: Arc<dyn IndexNode>,
-    /// 用来存储InodeID->挂载点的MountFS的B树
+    /// B-tree mapping InodeId -> MountFS at that mount point
     mountpoints: Mutex<BTreeMap<InodeId, Arc<MountFS>>>,
-    /// 当前文件系统挂载到的那个挂载点的Inode
+    /// The inode of the mount point where this filesystem is mounted
     self_mountpoint: RwSem<Option<Arc<MountFSInode>>>,
-    /// 指向当前MountFS的弱引用
+    /// Weak reference to this MountFS
     self_ref: Weak<MountFS>,
 
     namespace: RwSem<Option<Weak<MntNamespace>>>,
@@ -366,15 +368,16 @@ impl Hash for MountFS {
 
 impl Eq for MountFS {}
 
-/// @brief MountFS的Index Node 注意，这个IndexNode只是一个中间层。它的目的是将具体文件系统的Inode与挂载机制连接在一起。
+/// @brief The Index Node of MountFS. Note that this IndexNode is merely an intermediary layer.
+/// Its purpose is to connect the concrete filesystem's Inode with the mount mechanism.
 #[derive(Debug)]
 #[cast_to([sync] IndexNode)]
 pub struct MountFSInode {
-    /// 当前挂载点对应到具体的文件系统的Inode
+    /// The concrete filesystem's Inode corresponding to this mount point
     inner_inode: Arc<dyn IndexNode>,
-    /// 当前Inode对应的MountFS
+    /// The MountFS this Inode belongs to
     mount_fs: Arc<MountFS>,
-    /// 指向自身的弱引用
+    /// Weak reference to self
     self_ref: Weak<MountFSInode>,
 }
 
@@ -507,12 +510,12 @@ impl MountFS {
     }
 
     pub fn add_mount(&self, inode_id: InodeId, mount_fs: Arc<MountFS>) -> Result<(), SystemError> {
-        // 检查是否已经存在同名的挂载点
+        // Check if a mount point with the same name already exists
         if self.mountpoints.lock().contains_key(&inode_id) {
             return Err(SystemError::EEXIST);
         }
 
-        // 将新的挂载点添加到当前MountFS的挂载点列表中
+        // Add the new mount point to the current MountFS's mount point list
         self.mountpoints.lock().insert(inode_id, mount_fs.clone());
 
         Ok(())
@@ -543,7 +546,7 @@ impl MountFS {
         *self.namespace.write() = None;
     }
 
-    /// check_mnt()：检查当前 MountFS 是否属于指定 mount namespace。
+    /// check_mnt(): Check whether the current MountFS belongs to the specified mount namespace.
     pub fn is_belongs_to_mntns(&self, mntns: &Arc<MntNamespace>) -> bool {
         self.namespace().is_some_and(|ns| Arc::ptr_eq(&ns, mntns))
     }
@@ -569,27 +572,27 @@ impl MountFS {
         *self.self_mountpoint.write() = mountpoint;
     }
 
-    /// @brief 用Arc指针包裹MountFS对象。
-    /// 本函数的主要功能为，初始化MountFS对象中的自引用Weak指针
-    /// 本函数只应在构造器中被调用
+    /// @brief Wrap a MountFS object in an Arc pointer.
+    /// The main purpose of this function is to initialize the self-referencing Weak pointer within the MountFS object.
+    /// This function should only be called in constructors.
     #[allow(dead_code)]
     #[deprecated]
     fn wrap(self) -> Arc<Self> {
-        // 创建Arc指针
+        // Create Arc pointer
         let mount_fs: Arc<MountFS> = Arc::new(self);
-        // 创建weak指针
+        // Create weak pointer
         let weak: Weak<MountFS> = Arc::downgrade(&mount_fs);
 
-        // 将Arc指针转为Raw指针并对其内部的self_ref字段赋值
+        // Convert the Arc pointer to a raw pointer and assign to its internal self_ref field
         let ptr: *mut MountFS = mount_fs.as_ref() as *const Self as *mut Self;
         unsafe {
             (*ptr).self_ref = weak;
-            // 返回初始化好的MountFS对象
+            // Return the initialized MountFS object
             return mount_fs;
         }
     }
 
-    /// @brief 获取挂载点的文件系统的root inode
+    /// @brief Get the root inode of the filesystem at this mount point
     pub fn mountpoint_root_inode(&self) -> Arc<MountFSInode> {
         return Arc::new_cyclic(|self_ref| MountFSInode {
             inner_inode: self.root_inner_inode.clone(),
@@ -646,38 +649,13 @@ impl MountFS {
         return result;
     }
 
-    /// 仅将当前挂载从父挂载点摘除
-    fn detach(&self) -> Result<Arc<MountFS>, SystemError> {
-        let mountpoint_inode = self.self_mountpoint().ok_or(SystemError::EINVAL)?;
-        let mountpoint_id = mountpoint_inode.inner_inode.metadata()?.inode_id;
-        // 从父挂载的 mountpoints 中移除当前挂载。
-        mountpoint_inode
-            .mount_fs
-            .mountpoints
-            .lock()
-            .remove(&mountpoint_id)
-            .ok_or_else(|| {
-                log::warn!(
-                    "detach: mountpoint id {:?} not found in parent fs '{}'",
-                    mountpoint_id,
-                    mountpoint_inode.mount_fs.name()
-                );
-                SystemError::ENOENT
-            })?;
-
-        // 清除 self_mountpoint，使挂载成为独立树根。
-        self.self_mountpoint.write().take();
-
-        Ok(self.self_ref())
-    }
-
-    /// 递归卸载一个挂载及其所有子挂载，并从 namespace 的 mount_list 中移除。
+    /// Recursively unmount a mount and all its child mounts, removing them from the namespace's mount_list.
     ///
-    /// 用于递归 bind mount 失败时的原子回滚，保证 all-or-nothing 语义。
+    /// Used for atomic rollback on recursive bind mount failure, ensuring all-or-nothing semantics.
     pub fn umount_tree(root: &Arc<MountFS>) {
         let mntns = ProcessManager::current_mntns();
 
-        // 1. DFS 收集所有后代 MountFS
+        // 1. DFS collect all descendant MountFS
         let mut all_descendants: Vec<Arc<MountFS>> = Vec::new();
         let mut stack: Vec<Arc<MountFS>> = Vec::new();
 
@@ -692,7 +670,7 @@ impl MountFS {
             all_descendants.push(mfs);
         }
 
-        // 2. 逆序处理（最深的子挂载先卸载），确保子挂载在父挂载之前被清理
+        // 2. Process in reverse order (deepest child mounts first), ensuring child mounts are cleaned up before parent mounts
         all_descendants.reverse();
 
         for child_mfs in &all_descendants {
@@ -702,15 +680,15 @@ impl MountFS {
             let _ = child_mfs.umount();
         }
 
-        // 3. 最后卸载根挂载本身
+        // 3. Finally unmount the root mount itself
         if let Some(path) = mntns.mount_list().get_mount_path_by_mountfs(root) {
             mntns.remove_mount(path.as_str());
         }
         let _ = root.umount();
     }
 
-    /// 对应 Linux `sync_inodes_sb()`：回写指定 mount 下所有脏 page cache。
-    /// DragonOS 无 per-sb 脏 inode 列表，通过全局 `PAGECACHE_REGISTRY` 遍历匹配。
+    /// Corresponds to Linux `sync_inodes_sb()`: write back all dirty page caches under the specified mount.
+    /// DragonOS has no per-sb dirty inode list, so it iterates the global `PAGECACHE_REGISTRY` to find matches.
     fn sync_inodes_of_mount(&self) -> Result<(), SystemError> {
         let inner_fs = self.inner_filesystem();
         let caches = list_page_caches();
@@ -901,7 +879,7 @@ pub fn record_writeback_error_for_fs(inner_fs: &Arc<dyn FileSystem>, error: Syst
 
 impl Drop for MountFS {
     fn drop(&mut self) {
-        // 释放MountId
+        // Release MountId
         unsafe {
             self.mount_id.free();
         }
@@ -934,7 +912,7 @@ impl MountFSInode {
         super_block_state: Option<Arc<SuperBlockState>>,
         bind_source: Option<&Arc<MountFS>>,
     ) -> Result<Arc<MountFS>, SystemError> {
-        // Linux do_add_mount：父挂载点必须属于当前 mount namespace。
+        // Linux do_add_mount: the parent mount point must belong to the current mount namespace.
         let current_mntns = ProcessManager::current_mntns();
         if !self.mount_fs.is_belongs_to_mntns(&current_mntns) {
             return Err(SystemError::EINVAL);
@@ -1007,23 +985,23 @@ impl MountFSInode {
         Ok(new_mount_fs)
     }
 
-    /// 返回被挂载包装器包裹的底层 inode。
+    /// Return the underlying inode wrapped by the mount wrapper.
     #[inline]
     pub(crate) fn underlying_inode(&self) -> Arc<dyn IndexNode> {
         self.inner_inode.clone()
     }
 
-    /// @brief 用Arc指针包裹MountFSInode对象。
-    /// 本函数的主要功能为，初始化MountFSInode对象中的自引用Weak指针
-    /// 本函数只应在构造器中被调用
+    /// @brief Wrap a MountFSInode object in an Arc pointer.
+    /// The main purpose of this function is to initialize the self-referencing Weak pointer within the MountFSInode object.
+    /// This function should only be called in constructors.
     #[allow(dead_code)]
     #[deprecated]
     fn wrap(self) -> Arc<Self> {
-        // 创建Arc指针
+        // Create Arc pointer
         let inode: Arc<MountFSInode> = Arc::new(self);
-        // 创建Weak指针
+        // Create Weak pointer
         let weak: Weak<MountFSInode> = Arc::downgrade(&inode);
-        // 将Arc指针转为Raw指针并对其内部的self_ref字段赋值
+        // Convert the Arc pointer to a raw pointer and assign to its internal self_ref field
         compiler_fence(Ordering::SeqCst);
         let ptr: *mut MountFSInode = inode.as_ref() as *const Self as *mut Self;
         compiler_fence(Ordering::SeqCst);
@@ -1031,20 +1009,22 @@ impl MountFSInode {
             (*ptr).self_ref = weak;
             compiler_fence(Ordering::SeqCst);
 
-            // 返回初始化好的MountFSInode对象
+            // Return the initialized MountFSInode object
             return inode;
         }
     }
 
-    /// @brief 判断当前inode是否为它所在的文件系统的root inode
+    /// @brief Determine whether the current inode is the root inode of its filesystem
     fn is_mountpoint_root(&self) -> Result<bool, SystemError> {
         return Ok(self.mount_fs.root_inner_inode().metadata()?.inode_id
             == self.inner_inode.metadata()?.inode_id);
     }
 
-    /// @brief 在挂载树上进行inode替换。
-    /// 如果当前inode是父MountFS内的一个挂载点，那么，本函数将会返回挂载到这个挂载点下的文件系统的root inode.
-    /// 如果当前inode在父MountFS内，但不是挂载点，那么说明在这里不需要进行inode替换，因此直接返回当前inode。
+    /// @brief Perform inode replacement on the mount tree.
+    /// If the current inode is a mount point within the parent MountFS, this function returns
+    /// the root inode of the filesystem mounted at that mount point.
+    /// If the current inode is within the parent MountFS but is not a mount point, no inode
+    /// replacement is needed, so the current inode is returned directly.
     ///
     /// @return Arc<MountFSInode>
     fn overlaid_inode(&self) -> Arc<MountFSInode> {
@@ -1078,8 +1058,8 @@ impl MountFSInode {
     }
 
     fn do_find(&self, name: &str) -> Result<Arc<MountFSInode>, SystemError> {
-        // 直接调用当前inode所在的文件系统的find方法进行查找
-        // 由于向下查找可能会跨越文件系统的边界，因此需要尝试替换inode
+        // Directly call the find method of the filesystem the current inode belongs to.
+        // Since downward lookups may cross filesystem boundaries, we need to attempt inode replacement.
         let inner_inode = self.inner_inode.find(name)?;
         return Ok(Arc::new_cyclic(|self_ref| MountFSInode {
             inner_inode,
@@ -1091,14 +1071,15 @@ impl MountFSInode {
 
     pub(super) fn do_parent(&self) -> Result<Arc<MountFSInode>, SystemError> {
         if self.is_mountpoint_root()? {
-            // 当前inode是它所在的文件系统的root inode
+            // The current inode is the root inode of its filesystem
             match self.mount_fs.self_mountpoint() {
                 Some(inode) => {
-                    // `inode` 是“父挂载树中”的挂载点 inode。
-                    // Linux 语义：从被挂载文件系统的根目录向上（..）应当回到挂载点的父目录，
-                    // 并且后续路径遍历应当发生在父挂载（inode.mount_fs）上。
+                    // `inode` is the mount point inode in the “parent mount tree”.
+                    // Linux semantics: going up (..) from the root of a mounted filesystem should
+                    // return to the parent directory of the mount point, and subsequent path traversal
+                    // should occur on the parent mount (inode.mount_fs).
                     //
-                    // 这里直接复用挂载点 inode 的 do_parent()，确保 mount_fs 正确切换。
+                    // Here we directly reuse the mount point inode's do_parent() to ensure mount_fs is switched correctly.
                     return inode.do_parent();
                 }
                 None => {
@@ -1107,7 +1088,7 @@ impl MountFSInode {
             }
         } else {
             let inner_inode = self.inner_inode.parent()?;
-            // 向上查找时，不会跨过文件系统的边界，因此直接调用当前inode所在的文件系统的find方法进行查找
+            // When looking up parent, we don't cross filesystem boundaries, so directly call the parent method of the current inode's filesystem
             return Ok(Arc::new_cyclic(|self_ref| MountFSInode {
                 inner_inode,
                 mount_fs: self.mount_fs.clone(),
@@ -1116,9 +1097,9 @@ impl MountFSInode {
         }
     }
 
-    /// 移除挂载点下的文件系统
+    /// Remove the filesystem mounted at this mount point
     fn do_umount(&self) -> Result<Arc<MountFS>, SystemError> {
-        // 允许 umount 目录和文件的 bind mount
+        // Allow umount for both directory and file bind mounts
         let mountpoint_id = self.inner_inode.metadata()?.inode_id;
 
         // Detach first. Follow-up bookkeeping (peer registry and propagation)
@@ -1165,10 +1146,10 @@ impl MountFSInode {
 
         let mut path_parts = Vec::new();
 
-        // 注意：不同文件系统的 inode_id 空间可能互相独立，不能用“全局根 inode_id”作为终止条件。
-        // 正确做法应当按挂载树向上走，直到到达“命名空间根”（即 rootfs 的 mount，self_mountpoint 为 None）。
+        // Note: different filesystems may have independent inode_id spaces, so “global root inode_id” cannot be used as a termination condition.
+        // The correct approach is to walk up the mount tree until reaching the “namespace root” (i.e., the rootfs mount where self_mountpoint is None).
         loop {
-            // 到达当前命名空间根：结束。
+            // Reached the current namespace root: stop.
             if current.is_mountpoint_root()?
                 && current
                     .mount_fs
@@ -1178,7 +1159,7 @@ impl MountFSInode {
                 break;
             }
 
-            // 兼容旧模型：若 mount 没有挂载点，也将其视为根。
+            // Compatibility with the old model: if the mount has no mount point, treat it as root.
             if current.is_mountpoint_root()? && current.mount_fs.self_mountpoint().is_none() {
                 break;
             }
@@ -1186,7 +1167,7 @@ impl MountFSInode {
             let name = current.dname()?;
             path_parts.push(name.0);
 
-            // 防循环检查：如果路径深度超过1024，抛出警告
+            // Loop prevention: if path depth exceeds 1024, emit a warning
             if path_parts.len() > 1024 {
                 #[inline(never)]
                 fn __log_warn(cur: usize) {
@@ -1201,7 +1182,7 @@ impl MountFSInode {
 
             let parent = current.do_parent()?;
             if Arc::ptr_eq(&parent, &current) {
-                // parent == self 但还没达到全局根，说明挂载树信息不完整或出现环
+                // parent == self but haven't reached the global root, indicating incomplete mount tree info or a cycle
                 log::warn!(
                     "absolute_path: parent == self before reaching namespace root, inode_id={}",
                     current.metadata().unwrap().inode_id.data()
@@ -1211,10 +1192,10 @@ impl MountFSInode {
             current = parent;
         }
 
-        // 由于我们从叶子节点向上遍历到根节点，所以需要反转路径部分
+        // Since we traversed from leaf to root, reverse the path parts
         path_parts.reverse();
 
-        // 构建最终的绝对路径字符串
+        // Build the final absolute path string
         let mut absolute_path = String::with_capacity(
             path_parts.iter().map(|s| s.len()).sum::<usize>() + path_parts.len(),
         );
@@ -1391,8 +1372,8 @@ impl IndexNode for MountFSInode {
     fn metadata(&self) -> Result<super::Metadata, SystemError> {
         let mut md = self.inner_inode.metadata()?;
 
-        // 为每个挂载点提供稳定且唯一的 st_dev（通过 metadata.dev_id）。
-        // 这里针对的是底层文件系统没有提供dev_id的情况
+        // Provide a stable and unique st_dev for each mount point (via metadata.dev_id).
+        // This handles the case where the underlying filesystem does not provide a dev_id.
         if md.dev_id == 0 {
             let mnt_id: usize = self.mount_fs.mount_id().into();
             let minor = (mnt_id as u32) & DeviceNumber::MINOR_MASK;
@@ -1432,10 +1413,11 @@ impl IndexNode for MountFSInode {
 
     fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
         self.ensure_mount_writable()?;
-        // 文件系统实现期望 `other` 是同一具体文件系统的 inode（例如 LockedExt4Inode）。当启用 VFS 挂载包装时，
-        // `other` 通常是 `MountFSInode`，这会导致文件系统层面的向下转换失败并错误地返回 EINVAL。
+        // Filesystem implementations expect `other` to be an inode of the same concrete filesystem (e.g. LockedExt4Inode).
+        // When VFS mount wrapping is enabled, `other` is typically a `MountFSInode`, which causes
+        // filesystem-level downcasts to fail and incorrectly return EINVAL.
         //
-        // 因此在link之前，我们需要解包挂载包装器（与 move_to 相同）。
+        // Therefore, before linking, we need to unwrap the mount wrapper (same as move_to).
         let other_inner: Arc<dyn IndexNode> = other
             .clone()
             .downcast_arc::<MountFSInode>()
@@ -1455,17 +1437,17 @@ impl IndexNode for MountFSInode {
         }))
     }
 
-    /// @brief 在挂载文件系统中删除文件/文件夹
+    /// @brief Delete a file/directory in the mounted filesystem
     #[inline]
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
         self.ensure_mount_writable()?;
         let inode_id = self.inner_inode.find(name)?.metadata()?.inode_id;
 
-        // 先检查这个inode是否为一个挂载点，如果当前inode是一个挂载点，那么就不能删除这个inode
+        // First check if this inode is a mount point; if so, it cannot be deleted
         if self.mount_fs.mountpoints.lock().contains_key(&inode_id) {
             return Err(SystemError::EBUSY);
         }
-        // 调用内层的inode的方法来删除这个inode
+        // Delegate to the inner inode's unlink method to delete this inode
         return self.inner_inode.unlink(name);
     }
 
@@ -1474,11 +1456,11 @@ impl IndexNode for MountFSInode {
         self.ensure_mount_writable()?;
         let inode_id = self.inner_inode.find(name)?.metadata()?.inode_id;
 
-        // 先检查这个inode是否为一个挂载点，如果当前inode是一个挂载点，那么就不能删除这个inode
+        // First check if this inode is a mount point; if so, it cannot be deleted
         if self.mount_fs.mountpoints.lock().contains_key(&inode_id) {
             return Err(SystemError::EBUSY);
         }
-        // 调用内层的rmdir的方法来删除这个inode
+        // Delegate to the inner inode's rmdir method to delete this inode
         let r = self.inner_inode.rmdir(name);
 
         return r;
@@ -1519,17 +1501,17 @@ impl IndexNode for MountFSInode {
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
         match name {
-            // 查找的是当前目录
+            // Looking up the current directory
             "" | "." => self
                 .self_ref
                 .upgrade()
                 .map(|inode| inode as Arc<dyn IndexNode>)
                 .ok_or(SystemError::ENOENT),
-            // 往父级查找
+            // Looking up the parent directory
             ".." => self.parent(),
-            // 在当前目录下查找
-            // 直接调用当前inode所在的文件系统的find方法进行查找
-            // 由于向下查找可能会跨越文件系统的边界，因此需要尝试替换inode
+            // Looking up within the current directory
+            // Directly call the find method of the filesystem the current inode belongs to.
+            // Since downward lookups may cross filesystem boundaries, we need to attempt inode replacement.
             _ => self.do_find(name).map(|inode| inode as Arc<dyn IndexNode>),
         }
     }
@@ -1588,31 +1570,30 @@ impl IndexNode for MountFSInode {
             return Err(SystemError::EBUSY);
         }
 
-        // 对应 Linux do_move_mount → attach_recursive_mnt(MNT_TREE_MOVE)：
-        // unhash_mnt（detach）后直接 attach 到新位置，不清理 mnt_ns，不通知文件系统。
+        // Corresponds to Linux do_move_mount → attach_recursive_mnt(MNT_TREE_MOVE):
+        // unhash_mnt (detach) then attach directly to the new location, without clearing mnt_ns or notifying the filesystem.
+        //
+        // Reuse the core topology move logic of MS_MOVE (detach + attach + mount_list subtree path rewrite)
+        // to avoid maintaining two separate move implementations. This path is only used for system initialization
+        // migration of proc/dev/sys, where the target parent mount is private and the moved mount has no child mounts,
+        // so propagation is not needed.
         let from_mfs = from
             .fs()
             .downcast_arc::<MountFS>()
             .ok_or(SystemError::EINVAL)?;
-        let new_mount_fs = from_mfs.detach()?;
 
-        self.mount_fs
-            .add_mount(metadata.inode_id, new_mount_fs.clone())?;
-        // 更新当前挂载点的self_mountpoint
-        new_mount_fs
-            .self_mountpoint
-            .write()
-            .replace(self.self_ref.upgrade().unwrap());
-
-        // move 不改变 namespace 归属，只需更新 mount_list 中的路径记录。
+        let old_source_path = from.absolute_path()?;
+        let new_target_path = self.absolute_path()?;
+        let target_mountpoint = self.self_ref.upgrade().unwrap();
         let mntns = ProcessManager::current_mntns();
-        if let Some(mount_path) = mntns.mount_list().get_mount_path_by_mountfs(&new_mount_fs) {
-            mntns.mount_list().remove(mount_path.as_str());
-        }
-        let mount_path = Arc::new(MountPath::from(self.absolute_path()?));
-        mntns.add_mount(Some(metadata.inode_id), mount_path, new_mount_fs.clone())?;
+        mntns.move_mount(
+            &from_mfs,
+            &target_mountpoint,
+            &old_source_path,
+            &new_target_path,
+        )?;
 
-        return Ok(new_mount_fs);
+        return Ok(from_mfs);
     }
 
     fn umount(&self) -> Result<Arc<MountFS>, SystemError> {
@@ -1647,10 +1628,10 @@ impl IndexNode for MountFSInode {
         self.inner_inode.special_node()
     }
 
-    /// 若不支持，则调用第二种情况来从父目录获取文件名
+    /// If not supported, fall back to getting the filename from the parent directory.
     /// # Performance
-    /// 应尽可能引入DName，
-    /// 在默认情况下，性能非常差！！！
+    /// DName should be introduced wherever possible;
+    /// by default, performance is very poor!
     fn dname(&self) -> Result<DName, SystemError> {
         if self.is_mountpoint_root()? {
             if let Some(inode) = self.mount_fs.self_mountpoint() {
@@ -1705,8 +1686,8 @@ impl FileSystem for MountFS {
         return self.inner_filesystem.info();
     }
 
-    /// @brief 本函数用于实现动态转换。
-    /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
+    /// @brief This function is used for dynamic casting.
+    /// The simplest implementation for concrete filesystems is to return self directly.
     fn as_any_ref(&self) -> &dyn Any {
         self
     }
@@ -1794,11 +1775,11 @@ impl Ord for MountPath {
         let self_dep = self.0.chars().filter(|c| *c == '/').count();
         let othe_dep = other.0.chars().filter(|c| *c == '/').count();
         if self_dep == othe_dep {
-            // 深度一样时反序来排
-            // 根目录和根目录下的文件的绝对路径都只有一个'/'
+            // Same depth: sort in reverse order
+            // Both the root directory and files directly under root have only one '/' in their absolute path
             other.0.cmp(&self.0)
         } else {
-            // 根据深度，深度
+            // Sort by depth (deeper first)
             othe_dep.cmp(&self_dep)
         }
     }
@@ -1810,7 +1791,7 @@ impl MountPath {
     }
 }
 
-// 维护一个挂载点的记录，以支持特定于文件系统的索引
+// Maintain mount point records to support filesystem-specific indexing
 pub struct MountList {
     inner: RwSem<InnerMountList>,
 }
@@ -1822,24 +1803,24 @@ struct MountRecord {
 }
 
 struct InnerMountList {
-    /// 同一路径可能被重复挂载，按栈保存，栈顶为当前可见挂载。
+    /// The same path may be mounted multiple times; stored as a stack with the top being the currently visible mount.
     mounts: HashMap<Arc<MountPath>, Vec<MountRecord>>,
-    /// 便于通过 fs 反查挂载点 inode。
+    /// Reverse lookup from MountFS to mount point inode.
     mfs2ino: HashMap<Arc<MountFS>, InodeId>,
     /// Reverse lookup from a specific mount to its mount path. The same inode may correspond to multiple propagation replica paths.
     mfs2mp: HashMap<Arc<MountFS>, Arc<MountPath>>,
-    /// inode 到路径的映射，用于子挂载查找。
+    /// Mapping from inode to path, used for child mount lookup.
     ino2mp: HashMap<InodeId, Arc<MountPath>>,
 }
 
 impl MountList {
-    /// # new - 创建新的MountList实例
+    /// # new — Create a new MountList instance
     ///
-    /// 创建一个空的挂载点列表。
+    /// Creates an empty mount point list.
     ///
-    /// ## 返回值
+    /// ## Returns
     ///
-    /// - `MountList`: 新的挂载点列表实例
+    /// - `MountList`: A new mount point list instance
     pub fn new() -> Arc<Self> {
         Arc::new(MountList {
             inner: RwSem::new(InnerMountList {
@@ -1876,22 +1857,23 @@ impl MountList {
             inner.mfs2ino.insert(fs.clone(), ino);
         }
         inner.mfs2mp.insert(fs.clone(), path.clone());
-        // 若 ino 为 None（如根挂载），仍然保留 mounts 栈用于后续 pop。
+        // If ino is None (e.g. root mount), still keep the mounts stack for subsequent pop.
     }
 
-    /// # get_mount_point - 获取挂载点的路径
+    /// # get_mount_point — Get the mount point path
     ///
-    /// 这个函数用于查找给定路径的挂载点。它搜索一个内部映射，找到与路径匹配的挂载点。
+    /// This function looks up the mount point for a given path. It searches an internal map
+    /// to find a mount point matching the path.
     ///
-    /// ## 参数
+    /// ## Arguments
     ///
-    /// - `path: T`: 这是一个可转换为字符串的引用，表示要查找其挂载点的路径。
+    /// - `path: T`: A reference convertible to a string, representing the path whose mount point to look up.
     ///
-    /// ## 返回值
+    /// ## Returns
     ///
     /// - `Option<(String, String, Arc<MountFS>)>`:
-    ///   - `Some((mount_point, rest_path, fs))`: 如果找到了匹配的挂载点，返回一个包含挂载点路径、剩余路径和挂载文件系统的元组。
-    ///   - `None`: 如果没有找到匹配的挂载点，返回 None。
+    ///   - `Some((mount_point, rest_path, fs))`: If a matching mount point is found, returns a tuple of mount point path, remaining path, and mounted filesystem.
+    ///   - `None`: If no matching mount point is found.
     #[inline(never)]
     #[allow(dead_code)]
     pub fn get_mount_point<T: AsRef<str>>(
@@ -1914,19 +1896,19 @@ impl MountList {
             .next()
     }
 
-    /// # remove - 移除挂载点
+    /// # remove — Remove a mount point
     ///
-    /// 从挂载点管理器中移除一个挂载点。
+    /// Removes a mount point from the mount point manager.
     ///
-    /// 此函数用于从挂载点管理器中移除一个已经存在的挂载点。如果挂载点不存在，则不进行任何操作。
+    /// This function removes an existing mount point from the manager. If the mount point does not exist, no action is taken.
     ///
-    /// ## 参数
+    /// ## Arguments
     ///
-    /// - `path: T`: `T` 实现了 `Into<MountPath>`  trait，代表要移除的挂载点的路径。
+    /// - `path: T`: `T` implements `Into<MountPath>`, representing the path of the mount point to remove.
     ///
-    /// ## 返回值
+    /// ## Returns
     ///
-    /// - `Option<Arc<MountFS>>`: 返回一个 `Arc<MountFS>` 类型的可选值，表示被移除的挂载点，如果挂载点不存在则返回 `None`。
+    /// - `Option<Arc<MountFS>>`: Returns an optional `Arc<MountFS>` representing the removed mount point, or `None` if the mount point does not exist.
     #[inline(never)]
     pub fn remove<T: Into<MountPath>>(&self, path: T) -> Option<Arc<MountFS>> {
         let mut inner = self.inner.write();
@@ -1986,7 +1968,7 @@ impl MountList {
         inner.mfs2mp = new_mfs2mp;
     }
 
-    /// # clone_inner - 克隆内部挂载点列表
+    /// # clone_inner — Clone the internal mount point list
     pub fn clone_inner(&self) -> HashMap<Arc<MountPath>, Arc<MountFS>> {
         self.inner
             .read()
@@ -2023,12 +2005,12 @@ impl Debug for MountList {
     }
 }
 
-/// 判断给定的inode是否为其所在文件系统的根inode
+/// Determine whether the given inode is the root inode of its filesystem
 ///
-/// ## 返回值
+/// ## Returns
 ///
-/// - `true`: 是根inode
-/// - `false`: 不是根inode或者传入的inode不是MountFSInode类型，或者调用inode的metadata方法时报错了。
+/// - `true`: is the root inode
+/// - `false`: is not the root inode, the given inode is not a MountFSInode, or calling the inode's metadata method failed.
 pub fn is_mountpoint_root(inode: &Arc<dyn IndexNode>) -> bool {
     let mnt_inode = inode.clone().downcast_arc::<MountFSInode>();
     if let Some(mnt) = mnt_inode {
@@ -2038,20 +2020,21 @@ pub fn is_mountpoint_root(inode: &Arc<dyn IndexNode>) -> bool {
     return false;
 }
 
-/// # do_mount_mkdir - 在指定挂载点创建目录并挂载文件系统
+/// # do_mount_mkdir — Create a directory at the specified mount point and mount a filesystem
 ///
-/// 在指定的挂载点创建一个目录，并将其挂载到文件系统中。如果挂载点已经存在，并且不是空的，
-/// 则会返回错误。成功时，会返回一个新的挂载文件系统的引用。
+/// Creates a directory at the specified mount point and mounts it into the filesystem.
+/// If the mount point already exists and is not empty, an error is returned.
+/// On success, returns a reference to the newly mounted filesystem.
 ///
-/// ## 参数
+/// ## Arguments
 ///
-/// - `fs`: FileSystem - 文件系统的引用，用于创建和挂载目录。
-/// - `mount_point`: &str - 挂载点路径，用于创建和挂载目录。
+/// - `fs`: FileSystem — Reference to the filesystem, used for creating and mounting the directory.
+/// - `mount_point`: &str — The mount point path, used for creating and mounting the directory.
 ///
-/// ## 返回值
+/// ## Returns
 ///
-/// - `Ok(Arc<MountFS>)`: 成功挂载文件系统后，返回挂载文件系统的共享引用。
-/// - `Err(SystemError)`: 挂载失败时，返回系统错误。
+/// - `Ok(Arc<MountFS>)`: On successful mount, returns a shared reference to the mounted filesystem.
+/// - `Err(SystemError)`: On mount failure, returns a system error.
 pub fn do_mount_mkdir(
     fs: Arc<dyn FileSystem>,
     mount_point: &str,

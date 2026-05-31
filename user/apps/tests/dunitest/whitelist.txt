@@ -25,6 +25,7 @@ normal/errseq_selftest
 normal/errseq_writeback_reporting
 normal/test_tlb_shootdown
 normal/pid_namespace_fork
+normal/tcp_bind_semantics
 normal/tcp_close_semantics
 normal/udp_ipv6_send_semantics
 normal/socket_getsockopt_semantics

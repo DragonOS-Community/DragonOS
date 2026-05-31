@@ -143,17 +143,22 @@ impl TcpSocket {
     pub fn do_bind(&self, local_endpoint: smoltcp::wire::IpEndpoint) -> Result<(), SystemError> {
         let mut writer = self.inner.write();
         match writer.take().expect("Tcp inner::Inner is None") {
-            inner::Inner::Init(inner) => {
-                let bound = inner.bind(local_endpoint, self.netns())?;
-                if let inner::Init::Bound((ref bound, _)) = bound {
-                    bound
-                        .iface()
-                        .common()
-                        .bind_socket(self.self_ref.upgrade().unwrap());
+            inner::Inner::Init(inner) => match inner.bind(local_endpoint, self.netns()) {
+                Ok(bound) => {
+                    if let inner::Init::Bound((ref bound, _)) = bound {
+                        bound
+                            .iface()
+                            .common()
+                            .bind_socket(self.self_ref.upgrade().unwrap());
+                    }
+                    writer.replace(inner::Inner::Init(bound));
+                    Ok(())
                 }
-                writer.replace(inner::Inner::Init(bound));
-                Ok(())
-            }
+                Err((inner, err)) => {
+                    writer.replace(inner::Inner::Init(inner));
+                    Err(err)
+                }
+            },
             any => {
                 writer.replace(any);
                 log::error!("TcpSocket::do_bind: not Init");

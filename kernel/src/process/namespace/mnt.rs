@@ -10,6 +10,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
+use hashbrown::HashSet;
 use system_error::SystemError;
 
 use super::{
@@ -21,7 +22,7 @@ use super::{
 
 static mut INIT_MNT_NAMESPACE: Option<Arc<MntNamespace>> = None;
 
-/// 初始化root mount namespace
+/// Initialize the root mount namespace
 pub fn mnt_namespace_init() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| unsafe {
@@ -29,7 +30,7 @@ pub fn mnt_namespace_init() {
     });
 }
 
-/// 获取全局的根挂载namespace
+/// Get the global root mount namespace
 pub fn root_mnt_namespace() -> Arc<MntNamespace> {
     unsafe {
         INIT_MNT_NAMESPACE
@@ -96,9 +97,9 @@ impl MntNamespace {
         &self._user_ns
     }
 
-    /// 强制替换本MountNamespace的根挂载文件系统
+    /// Forcibly replace the root mount filesystem of this MountNamespace.
     ///
-    /// 本方法仅供dragonos初始化时使用
+    /// This method is only for use during DragonOS initialization.
     pub unsafe fn force_change_root_mountfs(&self, new_root: Arc<MountFS>) {
         let inner_guard = self.inner.lock();
         let ptr = self as *const Self as *mut Self;
@@ -204,6 +205,78 @@ impl MntNamespace {
         Ok(())
     }
 
+    /// Implement the topology move and mount_list subtree path rewrite for mount(MS_MOVE).
+    ///
+    /// Aligns with Linux `attach_recursive_mnt(MNT_TREE_MOVE)`: detaches `source_mfs`
+    /// (along with its entire child mount subtree) from the old parent mount, attaches it
+    /// to the target parent mount where `target_mountpoint` resides, and rewrites all
+    /// mount_list paths prefixed with `old_source_path` to `new_target_path`.
+    ///
+    /// Child mounts' parent-child relationships (`mountpoints`) and their respective
+    /// `self_mountpoint` remain unchanged, so only the moved mount's own `self_mountpoint`
+    /// and the path records of the entire subtree in mount_list need updating.
+    ///
+    /// On attach failure, rolls back to the original mount position, ensuring all-or-nothing.
+    /// Propagation is handled by the caller after success.
+    ///
+    /// Pre-checks (belongs to current mntns, source is mount root, type match, cycle prevention,
+    /// parent mount not shared, etc.) are performed by the caller (syscall layer); this method
+    /// only handles the topology changes.
+    pub fn move_mount(
+        &self,
+        source_mfs: &Arc<MountFS>,
+        target_mountpoint: &Arc<MountFSInode>,
+        old_source_path: &str,
+        new_target_path: &str,
+    ) -> Result<(), SystemError> {
+        let moving_mounts = collect_mount_subtree(source_mfs);
+        let old_mountpoint = source_mfs.self_mountpoint().ok_or(SystemError::EINVAL)?;
+        let old_parent = old_mountpoint.mount_fs();
+        let old_mp_id = old_mountpoint.inode_id()?;
+
+        let target_parent = target_mountpoint.mount_fs();
+        let target_mp_id = target_mountpoint.inode_id()?;
+
+        // 1. Detach from the old parent mount.
+        let removed = old_parent
+            .mountpoints()
+            .remove(&old_mp_id)
+            .ok_or(SystemError::ENOENT)?;
+
+        // 2. Attach to the target parent mount; on failure, roll back by reattaching source to its original position.
+        if let Err(e) = target_parent.add_mount(target_mp_id, source_mfs.clone()) {
+            old_parent.mountpoints().insert(old_mp_id, removed);
+            return Err(e);
+        }
+        source_mfs.set_self_mountpoint(Some(target_mountpoint.clone()));
+
+        // 3. mount_list subtree path rewrite + root mount point inode update (rebuilt atomically
+        //    within the ns lock, keeping mountpoints and mount_list's four tables consistent).
+        //
+        //    Critical: the moved subtree root's mount point inode has changed from old_mp_id to
+        //    target_mp_id. The ino in the mount_list root record must be updated accordingly,
+        //    otherwise copy_mnt_ns() will fail when traversing mountpoints and looking up
+        //    target_mp_id in ino2mp.
+        let inner = self.inner.lock();
+        let move_result = inner.mount_list.move_subtree(
+            source_mfs,
+            &moving_mounts,
+            target_mp_id,
+            old_source_path,
+            new_target_path,
+        );
+        drop(inner);
+
+        if let Err(e) = move_result {
+            target_parent.mountpoints().remove(&target_mp_id);
+            old_parent.mountpoints().insert(old_mp_id, removed);
+            source_mfs.set_self_mountpoint(Some(old_mountpoint));
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
     fn copy_with_mountfs(&self, new_root: Arc<MountFS>, _user_ns: Arc<UserNamespace>) -> Arc<Self> {
         let mut ns_common = self.ns_common.clone();
         ns_common.level += 1;
@@ -258,7 +331,7 @@ impl MntNamespace {
         let old_root_mntfs = self.root_mntfs().clone();
         let mut queue: Vec<MountFSCopyInfo> = Vec::new();
 
-        // 由于root mntfs比较特殊，因此单独复制。
+        // The root mntfs is special, so it is copied separately.
         let new_root_mntfs = old_root_mntfs.deepcopy(None);
 
         // If root mount was shared, register the new root in the same peer group
@@ -283,7 +356,7 @@ impl MntNamespace {
             }
         }
 
-        // 将root mntfs下的所有挂载点复制到新的mntns中
+        // Copy all mount points under root mntfs into the new mntns
         for (ino, mfs) in old_root_mntfs.mountpoints().iter() {
             let mount_path = inner
                 .mount_list
@@ -305,13 +378,13 @@ impl MntNamespace {
             });
         }
 
-        // 处理队列中的挂载点
+        // Process mount points in the queue
         while let Some(data) = queue.pop() {
             let old_self_mp = data.old_mount_fs.self_mountpoint().unwrap();
             let new_self_mp = old_self_mp.clone_with_new_mount_fs(data.parent_mount_fs.clone());
             let new_mount_fs = data.old_mount_fs.deepcopy(Some(new_self_mp));
 
-            // copy_mnt_ns 第二遍遍历
+            // copy_mnt_ns second pass
             new_mount_fs.set_namespace(Arc::downgrade(&new_mntns));
 
             // If the old mount was shared, register the new mount in the same peer group
@@ -336,7 +409,7 @@ impl MntNamespace {
                 )
                 .expect("Failed to add mount to mount namespace");
 
-            // 原有的挂载点的子挂载点加入队列中
+            // Add child mounts of the original mount point to the queue
 
             for (child_ino, child_mfs) in data.old_mount_fs.mountpoints().iter() {
                 let child_mount_path = inner
@@ -360,9 +433,9 @@ impl MntNamespace {
             }
         }
 
-        // todo: 注册到procfs
+        // todo: register in procfs
 
-        // 返回新创建的mount namespace
+        // Return the newly created mount namespace
         Ok(new_mntns)
     }
 
@@ -370,7 +443,7 @@ impl MntNamespace {
         &self.root_mountfs
     }
 
-    /// 获取该挂载命名空间的根inode
+    /// Get the root inode of this mount namespace
     pub fn root_inode(&self) -> Arc<dyn IndexNode> {
         self.root_mountfs.root_inode()
     }
@@ -401,8 +474,25 @@ impl MntNamespace {
     }
 }
 
+fn collect_mount_subtree(root: &Arc<MountFS>) -> HashSet<Arc<MountFS>> {
+    let mut visited = HashSet::new();
+    let mut stack = Vec::new();
+    stack.push(root.clone());
+
+    while let Some(mnt) = stack.pop() {
+        if !visited.insert(mnt.clone()) {
+            continue;
+        }
+
+        let children: Vec<Arc<MountFS>> = mnt.mountpoints().values().cloned().collect();
+        stack.extend(children);
+    }
+
+    visited
+}
+
 impl ProcessManager {
-    /// 获取当前进程的挂载namespace
+    /// Get the mount namespace of the current process
     pub fn current_mntns() -> Arc<MntNamespace> {
         if Self::initialized() {
             ProcessManager::current_pcb().nsproxy().mnt_ns.clone()

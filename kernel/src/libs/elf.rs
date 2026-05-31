@@ -523,22 +523,25 @@ impl ElfLoader {
                     load_addr_set = true;
                 }
                 let addr = load_addr + TryInto::<usize>::try_into(section.p_vaddr).unwrap();
-                if addr >= MMArch::USER_END_VADDR
+                // Validate segment parameters (aligned with main load() function)
+                let seg_end = section.p_vaddr.checked_add(section.p_memsz);
+                if seg_end.is_none()
+                    || addr >= MMArch::USER_END_VADDR
                     || section.p_filesz > section.p_memsz
-                    || TryInto::<usize>::try_into(section.p_memsz).unwrap()
-                        > MMArch::USER_END_VADDR.data()
-                    || MMArch::USER_END_VADDR - TryInto::<usize>::try_into(section.p_memsz).unwrap()
-                        < addr
+                    || (section.p_memsz as usize) > MMArch::USER_END_VADDR.data()
+                    || MMArch::USER_END_VADDR.data() - (section.p_memsz as usize) < addr.data()
                 {
                     return Err(ExecError::OutOfMemory);
                 }
 
+                // Safety: validation above ensures p_vaddr + p_filesz <= p_vaddr + p_memsz does not overflow
                 let addr = load_addr
                     + TryInto::<usize>::try_into(section.p_vaddr + section.p_filesz).unwrap();
                 if addr > elf_bss {
                     elf_bss = addr;
                 }
 
+                // Safety: validation above ensures p_vaddr + p_memsz does not overflow u64
                 let addr = load_addr
                     + TryInto::<usize>::try_into(section.p_vaddr + section.p_memsz).unwrap();
                 if addr > last_bss {
@@ -637,7 +640,10 @@ impl ElfLoader {
         return Ok(());
     }
 
-    /// 参考https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#1158，获取要加载的total_size
+    /// Compute total mapping size for all PT_LOAD segments.
+    /// Ref: https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#1158
+    ///
+    /// Returns 0 if any PT_LOAD segment has `p_vaddr + p_memsz` overflow (malformed ELF).
     fn total_mapping_size(ehdr_table: &SegmentTable<'_, AnyEndian>) -> usize {
         let mut has_load = false;
         let mut min_address = VirtAddr::new(usize::MAX);
@@ -646,18 +652,15 @@ impl ElfLoader {
             .into_iter()
             .filter(|seg| seg.p_type == elf::abi::PT_LOAD);
         for seg_to_load in loadable_sections {
-            min_address = min(
-                min_address,
-                Self::elf_page_start(VirtAddr::new(seg_to_load.p_vaddr.try_into().unwrap())),
-            );
-            max_address = max(
-                max_address,
-                VirtAddr::new(
-                    (seg_to_load.p_vaddr + seg_to_load.p_memsz)
-                        .try_into()
-                        .unwrap(),
-                ),
-            );
+            // On 64-bit platforms, u64 -> usize never overflows
+            let vaddr: usize = seg_to_load.p_vaddr.try_into().unwrap();
+            // Detect u64 overflow in p_vaddr + p_memsz (malformed ELF)
+            let end = match seg_to_load.p_vaddr.checked_add(seg_to_load.p_memsz) {
+                Some(v) => v,
+                None => return 0, // overflow -> invalid ELF, return 0 so loader rejects it
+            };
+            min_address = min(min_address, Self::elf_page_start(VirtAddr::new(vaddr)));
+            max_address = max(max_address, VirtAddr::new(end.try_into().unwrap()));
             has_load = true;
         }
         let total_size = if has_load {
@@ -1008,6 +1011,25 @@ impl BinaryLoader for ElfLoader {
 
             let vaddr = VirtAddr::new(seg_to_load.p_vaddr.try_into().unwrap());
 
+            // Validate segment parameters before loading to prevent malformed ELF
+            // from triggering kernel panic. Ref: Linux 6.6.139 fs/binfmt_elf.c:1243-1249
+            //
+            // Checks:
+            // 1. p_vaddr + p_memsz does not overflow u64 (checked_add)
+            // 2. p_vaddr is within user address space
+            // 3. p_filesz <= p_memsz
+            // 4. p_memsz <= USER_END_VADDR (TASK_SIZE)
+            // 5. p_vaddr + p_memsz <= USER_END_VADDR (range check without overflow)
+            let seg_end = seg_to_load.p_vaddr.checked_add(seg_to_load.p_memsz);
+            if seg_end.is_none()
+                || !vaddr.check_user()
+                || seg_to_load.p_filesz > seg_to_load.p_memsz
+                || (seg_to_load.p_memsz as usize) > MMArch::USER_END_VADDR.data()
+                || MMArch::USER_END_VADDR.data() - (seg_to_load.p_memsz as usize) < vaddr.data()
+            {
+                return Err(ExecError::InvalidParemeter);
+            }
+
             #[allow(clippy::if_same_then_else)]
             if !first_pt_load {
                 elf_map_flags.insert(MapFlags::MAP_FIXED_NOREPLACE);
@@ -1102,17 +1124,9 @@ impl BinaryLoader for ElfLoader {
                 start_data = Some(p_vaddr);
             }
 
-            // 如果程序段要加载的目标地址不在用户空间内，或者是其他不合法的情况，那么就报错
-            if !p_vaddr.check_user()
-                || seg_to_load.p_filesz > seg_to_load.p_memsz
-                || Self::elf_page_align_up(p_vaddr + seg_to_load.p_memsz as usize)
-                    >= MMArch::USER_END_VADDR
-            {
-                // debug!("ERR:     p_vaddr={p_vaddr:?}");
-                return Err(ExecError::InvalidParemeter);
-            }
-
-            // 文件部分结束的“字节端点”（用于 BSS/padzero 语义）
+            // Byte endpoint of the file portion (for BSS/padzero semantics)
+            // Safety: validation above ensures p_vaddr + p_filesz <= p_vaddr + p_memsz <= USER_END_VADDR,
+            // so this addition cannot overflow.
             let seg_file_end = VirtAddr::new((seg_to_load.p_vaddr + seg_to_load.p_filesz) as usize);
             if seg_file_end > elf_bss {
                 elf_bss = seg_file_end;
@@ -1134,6 +1148,7 @@ impl BinaryLoader for ElfLoader {
                 end_data = Some(seg_end_vaddr_f);
             }
 
+            // Safety: validation above ensures p_vaddr + p_memsz does not overflow u64
             let seg_end_vaddr = VirtAddr::new((seg_to_load.p_vaddr + seg_to_load.p_memsz) as usize);
 
             if seg_end_vaddr > elf_brk {

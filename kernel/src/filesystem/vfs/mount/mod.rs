@@ -154,26 +154,19 @@ bitflags! {
 }
 
 impl MountFlags {
-    /// Convert mount flags to a comma-separated string representation
-    ///
-    /// This function converts MountFlags to a string format similar to /proc/mounts,
-    /// such as "rw,nosuid,nodev,noexec,relatime".
-    ///
-    /// # Returns
-    ///
-    /// A String containing the mount options in comma-separated format.
-    #[inline(never)]
-    pub fn options_string(&self) -> String {
+    /// `ro` or `rw` token for proc mount options.
+    pub fn proc_rw_token(&self) -> &'static str {
+        if self.contains(MountFlags::RDONLY) {
+            "ro"
+        } else {
+            "rw"
+        }
+    }
+
+    /// Per-mount options excluding rw and super-block flags.
+    pub fn proc_per_mount_options(&self) -> String {
         let mut options = Vec::new();
 
-        // Check read/write flag
-        if self.contains(MountFlags::RDONLY) {
-            options.push("ro");
-        } else {
-            options.push("rw");
-        }
-
-        // Check other flags
         if self.contains(MountFlags::NOSUID) {
             options.push("nosuid");
         }
@@ -182,15 +175,6 @@ impl MountFlags {
         }
         if self.contains(MountFlags::NOEXEC) {
             options.push("noexec");
-        }
-        if self.contains(MountFlags::SYNCHRONOUS) {
-            options.push("sync");
-        }
-        if self.contains(MountFlags::MANDLOCK) {
-            options.push("mand");
-        }
-        if self.contains(MountFlags::DIRSYNC) {
-            options.push("dirsync");
         }
         if self.contains(MountFlags::NOSYMFOLLOW) {
             options.push("nosymfollow");
@@ -207,6 +191,23 @@ impl MountFlags {
         if self.contains(MountFlags::STRICTATIME) {
             options.push("strictatime");
         }
+
+        options.join(",")
+    }
+
+    /// Super-block options excluding rw and per-mount flags.
+    pub fn proc_super_block_options(&self) -> String {
+        let mut options = Vec::new();
+
+        if self.contains(MountFlags::SYNCHRONOUS) {
+            options.push("sync");
+        }
+        if self.contains(MountFlags::MANDLOCK) {
+            options.push("mand");
+        }
+        if self.contains(MountFlags::DIRSYNC) {
+            options.push("dirsync");
+        }
         if self.contains(MountFlags::LAZYTIME) {
             options.push("lazytime");
         }
@@ -214,6 +215,27 @@ impl MountFlags {
         options.join(",")
     }
 
+    /// Convert mount flags to a comma-separated string representation
+    ///
+    /// This function converts MountFlags to a string format similar to /proc/mounts,
+    /// such as "rw,nosuid,nodev,noexec,relatime".
+    #[inline(never)]
+    pub fn options_string(&self) -> String {
+        let mut options = self.proc_rw_token().to_string();
+        append_comma_options(&mut options, self.proc_per_mount_options());
+        append_comma_options(&mut options, self.proc_super_block_options());
+        options
+    }
+}
+
+pub(crate) fn append_comma_options(base: &mut String, extra: String) {
+    if extra.is_empty() {
+        return;
+    }
+    if !base.is_empty() {
+        base.push(',');
+    }
+    base.push_str(&extra);
 }
 
 // MountId type

@@ -157,6 +157,15 @@ bool can_use_mount_namespaces() {
 
 }  // namespace
 
+TEST(ProcMountExports, ProcMountsSymlinkTarget) {
+    char target[256] = {};
+    const ssize_t len = readlink("/proc/mounts", target, sizeof(target) - 1);
+    ASSERT_GE(len, 0) << "readlink /proc/mounts failed: errno=" << errno << " ("
+                      << strerror(errno) << ")";
+    target[len] = '\0';
+    EXPECT_STREQ(target, "self/mounts");
+}
+
 TEST(ProcMountExports, ProcMountsMatchesSelf) {
     std::string proc_mounts;
     std::string self_mounts;

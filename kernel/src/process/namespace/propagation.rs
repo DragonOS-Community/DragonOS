@@ -618,6 +618,11 @@ impl MountPropagation {
     ///
     /// Returns a string like "shared:1" or "master:2" or empty for private.
     pub fn info_string(&self) -> alloc::string::String {
+        self.proc_mountinfo_tags()
+    }
+
+    /// Optional mountinfo fields: `shared:N`, `master:N`, `propagate_from:N`, `unbindable`.
+    pub fn proc_mountinfo_tags(&self) -> alloc::string::String {
         let inner = self.inner.lock();
         let mut parts = Vec::new();
         if inner.flags.contains(PropagationFlags::SHARED) && inner.peer_group_id.is_valid() {
@@ -627,10 +632,31 @@ impl MountPropagation {
             let master_group = master.propagation().peer_group_id();
             if master_group.is_valid() {
                 parts.push(alloc::format!("master:{}", master_group.0));
+                if let Some(dom) = dominating_peer_group_id(&master) {
+                    if dom != master_group.0 {
+                        parts.push(alloc::format!("propagate_from:{dom}"));
+                    }
+                }
             }
+        }
+        if inner.flags.contains(PropagationFlags::UNBINDABLE) {
+            parts.push("unbindable".into());
         }
         parts.join(" ")
     }
+}
+
+fn dominating_peer_group_id(immediate_master: &Arc<MountFS>) -> Option<usize> {
+    let mut dominating = None;
+    let mut current = immediate_master.propagation().master();
+    while let Some(master) = current {
+        let group = master.propagation().peer_group_id();
+        if group.is_valid() {
+            dominating = Some(group.0);
+        }
+        current = master.propagation().master();
+    }
+    dominating
 }
 
 impl Clone for MountPropagation {

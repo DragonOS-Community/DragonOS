@@ -24,7 +24,12 @@ impl MountProcFileOps {
         kind: ProcMountRenderKind,
         parent: Weak<dyn IndexNode>,
     ) -> Arc<dyn IndexNode> {
-        ProcFileBuilder::new(Self { target, kind }, InodeMode::S_IRUGO)
+        // Linux: mounts/mountinfo are world-readable; mountstats is owner-read only (0400).
+        let mode = match kind {
+            ProcMountRenderKind::MountStats => InodeMode::S_IRUSR,
+            _ => InodeMode::S_IRUGO,
+        };
+        ProcFileBuilder::new(Self { target, kind }, mode)
             .parent(parent)
             .build()
             .unwrap()

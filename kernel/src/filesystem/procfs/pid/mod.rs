@@ -108,6 +108,15 @@ impl ProcPidTarget {
         self.thread_group_leader()?.task_pid_ptr(PidType::TGID)
     }
 
+    pub(super) fn owner_uid_gid(&self) -> Option<(usize, usize)> {
+        let pcb = self.thread_group_leader()?;
+        if pcb.is_kthread() {
+            return Some((0, 0));
+        }
+        let cred = pcb.cred();
+        Some((cred.euid.data(), cred.egid.data()))
+    }
+
     pub fn tgid(&self) -> RawPid {
         self.thread_group_pid()
             .map(|pid| pid.pid_nr_ns(&self.view_pid_ns))
@@ -266,12 +275,7 @@ impl PidDirOps {
 
 impl DirOps for PidDirOps {
     fn owner(&self) -> Option<(usize, usize)> {
-        let pcb = self.target.thread_group_leader()?;
-        if pcb.is_kthread() {
-            return Some((0, 0));
-        }
-        let cred = pcb.cred();
-        Some((cred.euid.data(), cred.egid.data()))
+        self.target.owner_uid_gid()
     }
 
     fn lookup_child(

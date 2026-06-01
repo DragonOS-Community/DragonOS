@@ -112,18 +112,41 @@ impl Init {
         self,
         local_endpoint: smoltcp::wire::IpEndpoint,
         netns: Arc<NetNamespace>,
-    ) -> Result<Self, SystemError> {
+    ) -> Result<Self, (Self, SystemError)> {
         match self {
-            Init::Unbound((socket, _)) => {
-                let bound = socket::inet::BoundInner::bind(*socket, &local_endpoint.addr, netns)?;
+            Init::Unbound((socket, ver)) => {
+                let bound = match socket::inet::BoundInner::bind_recoverable(
+                    *socket,
+                    &local_endpoint.addr,
+                    netns,
+                ) {
+                    Ok(bound) => bound,
+                    Err((socket, err)) => {
+                        return Err((Init::Unbound((Box::new(socket), ver)), err))
+                    }
+                };
 
                 // Handle ephemeral port assignment (port 0)
                 let bind_port = if local_endpoint.port == 0 {
-                    bound.port_manager().bind_ephemeral_port(Types::Tcp)?
+                    match bound.port_manager().bind_ephemeral_port(Types::Tcp) {
+                        Ok(port) => port,
+                        Err(err) => {
+                            let smoltcp::socket::Socket::Tcp(socket) = bound.into_socket() else {
+                                unreachable!("TCP BoundInner should contain a TCP socket");
+                            };
+                            return Err((Init::Unbound((Box::new(socket), ver)), err));
+                        }
+                    }
                 } else {
-                    bound
+                    if let Err(err) = bound
                         .port_manager()
-                        .bind_port(Types::Tcp, local_endpoint.port)?;
+                        .bind_port(Types::Tcp, local_endpoint.port)
+                    {
+                        let smoltcp::socket::Socket::Tcp(socket) = bound.into_socket() else {
+                            unreachable!("TCP BoundInner should contain a TCP socket");
+                        };
+                        return Err((Init::Unbound((Box::new(socket), ver)), err));
+                    }
                     local_endpoint.port
                 };
 
@@ -133,7 +156,7 @@ impl Init {
             }
             Init::Bound(_) => {
                 log::debug!("Already Bound");
-                Err(SystemError::EINVAL)
+                Err((self, SystemError::EINVAL))
             }
         }
     }
@@ -145,13 +168,25 @@ impl Init {
     ) -> Result<(socket::inet::BoundInner, smoltcp::wire::IpEndpoint), (Self, SystemError)> {
         match self {
             Init::Unbound((socket, ver)) => {
-                let (bound, address) =
-                    socket::inet::BoundInner::bind_ephemeral(*socket, remote_endpoint.addr, netns)
-                        .map_err(|err| (Self::new(ver), err))?;
-                let bound_port = bound
-                    .port_manager()
-                    .bind_ephemeral_port(Types::Tcp)
-                    .map_err(|err| (Self::new(ver), err))?;
+                let (bound, address) = match socket::inet::BoundInner::bind_ephemeral_recoverable(
+                    *socket,
+                    remote_endpoint.addr,
+                    netns,
+                ) {
+                    Ok(result) => result,
+                    Err((socket, err)) => {
+                        return Err((Self::Unbound((Box::new(socket), ver)), err))
+                    }
+                };
+                let bound_port = match bound.port_manager().bind_ephemeral_port(Types::Tcp) {
+                    Ok(port) => port,
+                    Err(err) => {
+                        let smoltcp::socket::Socket::Tcp(socket) = bound.into_socket() else {
+                            unreachable!("TCP BoundInner should contain a TCP socket");
+                        };
+                        return Err((Self::Unbound((Box::new(socket), ver)), err));
+                    }
+                };
                 let endpoint = smoltcp::wire::IpEndpoint::new(address, bound_port);
                 Ok((bound, endpoint))
             }
@@ -213,7 +248,7 @@ impl Init {
             let auto_bind_ep = smoltcp::wire::IpEndpoint::new(unspec_addr, 0);
             match self.bind(auto_bind_ep, netns.clone()) {
                 Ok(bound) => bound,
-                Err(err) => return Err((Init::new(ver), err)),
+                Err((init, err)) => return Err((init, err)),
             }
         } else {
             self

@@ -1990,6 +1990,21 @@ impl MountList {
             .collect()
     }
 
+    /// Clone every mount record, including lower entries in a same-path mount stack.
+    pub fn clone_records(&self) -> Vec<(Arc<MountPath>, Arc<MountFS>)> {
+        self.inner
+            .read()
+            .mounts
+            .iter()
+            .flat_map(|(path, stack)| {
+                stack
+                    .iter()
+                    .map(|rec| (path.clone(), rec.fs.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     pub fn get<T: Into<MountPath>>(&self, path: T) -> Option<Arc<MountFS>> {
         let inner = self.inner.read();
         let path: MountPath = path.into();

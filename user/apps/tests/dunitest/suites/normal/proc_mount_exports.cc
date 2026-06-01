@@ -113,6 +113,28 @@ size_t count_nonempty_lines(const std::string& content) {
     return count;
 }
 
+size_t count_mountstats_entries(const std::string& content) {
+    size_t count = 0;
+    size_t start = 0;
+
+    while (start <= content.size()) {
+        const size_t end = content.find('\n', start);
+        const size_t line_end = end == std::string::npos ? content.size() : end;
+        if (line_end > start) {
+            const std::string line = content.substr(start, line_end - start);
+            if (line.rfind("device ", 0) == 0 || line.rfind("no device ", 0) == 0) {
+                ++count;
+            }
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+
+    return count;
+}
+
 void expect_contains(const char* path, const std::string& content, const char* needle) {
     EXPECT_NE(std::string::npos, content.find(needle)) << path << " missing substring\nneedle="
                                                        << needle << "\ncontent=" << content;
@@ -194,7 +216,33 @@ TEST(ProcMountExports, SelfMountExportLineCountsMatch) {
 
     EXPECT_GT(count_nonempty_lines(mounts), 0U);
     EXPECT_EQ(count_nonempty_lines(mounts), count_nonempty_lines(mountinfo));
-    EXPECT_EQ(count_nonempty_lines(mounts), count_nonempty_lines(mountstats));
+    EXPECT_EQ(count_nonempty_lines(mounts), count_mountstats_entries(mountstats));
+}
+
+TEST(ProcMountExports, SelfMountExportOwnershipAndModes) {
+    struct stat mounts = {};
+    struct stat mountinfo = {};
+    struct stat mountstats = {};
+
+    ASSERT_EQ(0, stat("/proc/self/mounts", &mounts))
+        << "stat /proc/self/mounts failed: errno=" << errno << " (" << strerror(errno) << ")";
+    ASSERT_EQ(0, stat("/proc/self/mountinfo", &mountinfo))
+        << "stat /proc/self/mountinfo failed: errno=" << errno << " (" << strerror(errno)
+        << ")";
+    ASSERT_EQ(0, stat("/proc/self/mountstats", &mountstats))
+        << "stat /proc/self/mountstats failed: errno=" << errno << " (" << strerror(errno)
+        << ")";
+
+    EXPECT_EQ(static_cast<uid_t>(geteuid()), mounts.st_uid);
+    EXPECT_EQ(static_cast<gid_t>(getegid()), mounts.st_gid);
+    EXPECT_EQ(static_cast<uid_t>(geteuid()), mountinfo.st_uid);
+    EXPECT_EQ(static_cast<gid_t>(getegid()), mountinfo.st_gid);
+    EXPECT_EQ(static_cast<uid_t>(geteuid()), mountstats.st_uid);
+    EXPECT_EQ(static_cast<gid_t>(getegid()), mountstats.st_gid);
+
+    EXPECT_EQ(0444U, static_cast<unsigned>(mounts.st_mode & 0777));
+    EXPECT_EQ(0444U, static_cast<unsigned>(mountinfo.st_mode & 0777));
+    EXPECT_EQ(0400U, static_cast<unsigned>(mountstats.st_mode & 0777));
 }
 
 TEST(ProcMountExports, SelfMountstatsLineFormat) {
@@ -205,7 +253,7 @@ TEST(ProcMountExports, SelfMountstatsLineFormat) {
         << ")";
 
     const std::regex line_re(
-        R"(^device \S+ mounted on \S+ with fstype \S+( .*)?$)",
+        R"(^(device \S+|no device) mounted on \S+ with fstype \S+( .*)?$)",
         std::regex::ECMAScript);
 
     size_t start = 0;
@@ -365,7 +413,7 @@ TEST(ProcMountExports, UsesTargetTaskRootAndMountNamespace) {
     expect_contains(proc_mountstats_path, proc_mountstats, inside_mountstats_needle);
     expect_not_contains(proc_mountstats_path, proc_mountstats, outside);
     EXPECT_EQ(count_nonempty_lines(proc_mounts), count_nonempty_lines(proc_mountinfo));
-    EXPECT_EQ(count_nonempty_lines(proc_mounts), count_nonempty_lines(proc_mountstats));
+    EXPECT_EQ(count_nonempty_lines(proc_mounts), count_mountstats_entries(proc_mountstats));
 
     ASSERT_TRUE(read_text_file("/proc/self/mounts", &self_mounts))
         << "read /proc/self/mounts failed: errno=" << errno << " (" << strerror(errno) << ")";

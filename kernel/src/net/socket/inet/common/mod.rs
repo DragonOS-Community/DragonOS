@@ -45,8 +45,22 @@ impl BoundInner {
     where
         T: smoltcp::socket::AnySocket<'static>,
     {
+        Self::bind_recoverable(socket, address, netns).map_err(|(_, err)| err)
+    }
+
+    pub fn bind_recoverable<T>(
+        socket: T,
+        address: &smoltcp::wire::IpAddress,
+        netns: Arc<NetNamespace>,
+    ) -> Result<Self, (T, SystemError)>
+    where
+        T: smoltcp::socket::AnySocket<'static>,
+    {
         if address.is_unspecified() {
-            let iface = select_iface_for_unspecified(address, &netns)?;
+            let iface = match select_iface_for_unspecified(address, &netns) {
+                Ok(iface) => iface,
+                Err(err) => return Err((socket, err)),
+            };
             let handle = iface.sockets().lock().add(socket);
             return Ok(Self {
                 handle,
@@ -54,8 +68,10 @@ impl BoundInner {
                 netns,
             });
         } else {
-            let iface = get_iface_for_local_bind(address, &netns)
-                .ok_or_else(|| bind_addr_not_found_error(address, &netns))?;
+            let iface = match get_iface_for_local_bind(address, &netns) {
+                Some(iface) => iface,
+                None => return Err((socket, bind_addr_not_found_error(address, &netns))),
+            };
             // log::debug!(
             //     "BoundInner::bind: binding to iface {} for address {:?}",
             //     iface.iface_name(),
@@ -100,7 +116,21 @@ impl BoundInner {
     where
         T: smoltcp::socket::AnySocket<'static>,
     {
-        let (iface, address) = get_ephemeral_iface(&remote, netns.clone())?;
+        Self::bind_ephemeral_recoverable(socket, remote, netns).map_err(|(_, err)| err)
+    }
+
+    pub fn bind_ephemeral_recoverable<T>(
+        socket: T,
+        remote: smoltcp::wire::IpAddress,
+        netns: Arc<NetNamespace>,
+    ) -> Result<(Self, smoltcp::wire::IpAddress), (T, SystemError)>
+    where
+        T: smoltcp::socket::AnySocket<'static>,
+    {
+        let (iface, address) = match get_ephemeral_iface(&remote, netns.clone()) {
+            Ok(result) => result,
+            Err(err) => return Err((socket, err)),
+        };
         // let bound_port = iface.port_manager().bind_ephemeral_port(socket_type)?;
         let handle = iface.sockets().lock().add(socket);
         // let endpoint = smoltcp::wire::IpEndpoint::new(local_addr, bound_port);

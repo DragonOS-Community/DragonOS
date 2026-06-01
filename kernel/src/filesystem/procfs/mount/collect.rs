@@ -2,10 +2,7 @@ use alloc::{string::String, string::ToString, sync::Arc, vec::Vec};
 
 use system_error::SystemError;
 
-use crate::{
-    filesystem::vfs::MountFS,
-    process::ProcessControlBlock,
-};
+use crate::{filesystem::vfs::MountFS, process::ProcessControlBlock};
 
 #[derive(Debug)]
 pub(crate) struct ProcMountEntry {

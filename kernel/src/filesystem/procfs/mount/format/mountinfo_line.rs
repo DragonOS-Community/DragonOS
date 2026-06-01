@@ -3,7 +3,9 @@ use core::fmt::Write;
 
 use system_error::SystemError;
 
-use super::super::{escape::escape_mount_token, escape::escape_path_token, fields::MountProcFields};
+use super::super::{
+    escape::escape_mount_token, escape::escape_path_token, fields::MountProcFields,
+};
 
 pub(crate) fn render(fields: &MountProcFields, out: &mut String) -> Result<(), SystemError> {
     let root = escape_path_token(&fields.mountinfo_root);

@@ -89,7 +89,10 @@ impl RootDirOps {
         ("kmsg", KmsgFileOps::new_inode),
         ("loadavg", LoadavgFileOps::new_inode),
         ("meminfo", MeminfoFileOps::new_inode),
-        ("mounts", crate::filesystem::procfs::mount::inode::MountsSymOps::new_inode),
+        (
+            "mounts",
+            crate::filesystem::procfs::mount::inode::MountsSymOps::new_inode,
+        ),
         ("net", NetDirOps::new_inode),
         ("self", SelfSymOps::new_inode),
         ("stat", StatFileOps::new_inode),

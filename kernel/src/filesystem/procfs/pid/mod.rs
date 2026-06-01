@@ -34,6 +34,7 @@ mod statm;
 mod status;
 mod task;
 
+use crate::filesystem::procfs::mount::{inode::MountProcFileOps, ProcMountRenderKind};
 use cgroup::CgroupFileOps;
 use cmdline::CmdlineFileOps;
 use exe::ExeSymOps;
@@ -42,7 +43,6 @@ use fdinfo::FdInfoDirOps;
 use id_map::{IdMapFileOps, SetgroupsFileOps};
 use limits::LimitsFile;
 use maps::MapsFileOps;
-use crate::filesystem::procfs::mount::{inode::MountProcFileOps, ProcMountRenderKind};
 use ns::NsDirOps;
 use stat::StatFileOps;
 use statm::StatmFileOps;
@@ -171,25 +171,13 @@ impl PidDirOps {
             LimitsFile::new_inode(ops.target.clone(), parent)
         }),
         ("mountinfo", |ops, parent| {
-            MountProcFileOps::new_inode(
-                ops.target.clone(),
-                ProcMountRenderKind::MountInfo,
-                parent,
-            )
+            MountProcFileOps::new_inode(ops.target.clone(), ProcMountRenderKind::MountInfo, parent)
         }),
         ("mounts", |ops, parent| {
-            MountProcFileOps::new_inode(
-                ops.target.clone(),
-                ProcMountRenderKind::Mounts,
-                parent,
-            )
+            MountProcFileOps::new_inode(ops.target.clone(), ProcMountRenderKind::Mounts, parent)
         }),
         ("mountstats", |ops, parent| {
-            MountProcFileOps::new_inode(
-                ops.target.clone(),
-                ProcMountRenderKind::MountStats,
-                parent,
-            )
+            MountProcFileOps::new_inode(ops.target.clone(), ProcMountRenderKind::MountStats, parent)
         }),
         ("ns", |ops, parent| {
             NsDirOps::new_inode(ops.target.clone(), parent)

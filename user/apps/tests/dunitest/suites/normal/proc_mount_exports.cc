@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -243,6 +244,78 @@ TEST(ProcMountExports, SelfMountExportOwnershipAndModes) {
     EXPECT_EQ(0444U, static_cast<unsigned>(mounts.st_mode & 0777));
     EXPECT_EQ(0444U, static_cast<unsigned>(mountinfo.st_mode & 0777));
     EXPECT_EQ(0400U, static_cast<unsigned>(mountstats.st_mode & 0777));
+}
+
+TEST(ProcMountExports, NonRootCanReadOwnMountstats) {
+    if (geteuid() != 0) {
+        GTEST_SKIP() << "requires root to drop credentials";
+    }
+
+    int detail_pipe[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(detail_pipe)) << "pipe detail failed: errno=" << errno << " ("
+                                    << strerror(errno) << ")";
+
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    if (child == 0) {
+        close(detail_pipe[0]);
+
+        if (setgid(1000) != 0) {
+            child_fail(detail_pipe[1], "setgid(1000)");
+        }
+        if (setuid(1000) != 0) {
+            child_fail(detail_pipe[1], "setuid(1000)");
+        }
+        if (prctl(PR_SET_DUMPABLE, 1) != 0) {
+            child_fail(detail_pipe[1], "prctl(PR_SET_DUMPABLE)");
+        }
+
+        struct stat mountstats = {};
+        if (stat("/proc/self/mountstats", &mountstats) != 0) {
+            child_fail(detail_pipe[1], "stat(/proc/self/mountstats)");
+        }
+        if (mountstats.st_uid != geteuid() || mountstats.st_gid != getegid()) {
+            dprintf(detail_pipe[1],
+                    "mountstats owner mismatch: st_uid=%u st_gid=%u euid=%u egid=%u",
+                    static_cast<unsigned>(mountstats.st_uid),
+                    static_cast<unsigned>(mountstats.st_gid),
+                    static_cast<unsigned>(geteuid()),
+                    static_cast<unsigned>(getegid()));
+            _exit(1);
+        }
+        if ((mountstats.st_mode & 0777) != 0400) {
+            dprintf(detail_pipe[1],
+                    "mountstats mode mismatch: mode=%o",
+                    static_cast<unsigned>(mountstats.st_mode & 0777));
+            _exit(1);
+        }
+
+        std::string content;
+        if (!read_text_file("/proc/self/mountstats", &content)) {
+            child_fail(detail_pipe[1], "read(/proc/self/mountstats)");
+        }
+        if (content.empty()) {
+            dprintf(detail_pipe[1], "mountstats content is empty");
+            _exit(1);
+        }
+
+        close(detail_pipe[1]);
+        _exit(0);
+    }
+
+    close(detail_pipe[1]);
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << "waitpid failed: errno=" << errno << " ("
+                                                 << strerror(errno) << ")";
+
+    const std::string detail = read_all_from_fd(detail_pipe[0]);
+    close(detail_pipe[0]);
+
+    ASSERT_TRUE(WIFEXITED(status)) << "child terminated abnormally, status=0x" << std::hex
+                                   << status;
+    EXPECT_EQ(0, WEXITSTATUS(status)) << detail;
 }
 
 TEST(ProcMountExports, SelfMountstatsLineFormat) {

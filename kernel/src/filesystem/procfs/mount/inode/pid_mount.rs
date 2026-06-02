@@ -37,6 +37,10 @@ impl MountProcFileOps {
 }
 
 impl FileOps for MountProcFileOps {
+    fn owner(&self) -> Option<(usize, usize)> {
+        self.target.owner_uid_gid()
+    }
+
     fn open(&self, data: &mut MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         open_mount_file_for_target(&self.target, self.kind, data)
     }

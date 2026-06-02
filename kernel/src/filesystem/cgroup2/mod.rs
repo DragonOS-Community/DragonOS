@@ -15,13 +15,15 @@ use crate::{
         cgroup_accounting_lock, cgroup_common_ancestor, cgroup_migrate_vet_dst_with_src,
         cgroup_root, CgroupNode,
     },
-    filesystem::kernfs::KernFSInode,
-    filesystem::vfs::{
-        file::{FileFlags, FilePrivateData},
-        permission::PermissionMask,
-        vcore::generate_inode_id,
-        FileSystem, FileSystemMakerData, FileType, FsInfo, IndexNode, InodeFlags, InodeMode, Magic,
-        Metadata, MountableFileSystem, SuperBlock,
+    filesystem::{
+        sysfs::sysfs_instance,
+        vfs::{
+            file::{FileFlags, FilePrivateData},
+            permission::PermissionMask,
+            vcore::generate_inode_id,
+            FileSystem, FileSystemMakerData, FileType, FsInfo, IndexNode, InodeFlags, InodeMode,
+            Magic, Metadata, MountableFileSystem, SuperBlock,
+        },
     },
     libs::{mutex::MutexGuard, once::Once, rwsem::RwSem, spinlock::SpinLock},
     process::ProcessManager,
@@ -118,10 +120,13 @@ pub fn cgroup2_init() -> Result<(), SystemError> {
     let mut result = None;
     INIT.call_once(|| {
         result = Some((|| -> Result<(), SystemError> {
+            sysfs_instance()
+                .ensure_mount_point_path(&["fs", "cgroup"], InodeMode::from_bits_truncate(0o755))?;
+
             let root_inode = ProcessManager::current_mntns().root_inode();
             let sys = root_inode.find("sys")?;
-            let fs_dir = ensure_dir(&sys, "fs", InodeMode::from_bits_truncate(0o755))?;
-            let cgroup_dir = ensure_dir(&fs_dir, "cgroup", InodeMode::from_bits_truncate(0o755))?;
+            let fs_dir = sys.find("fs")?;
+            let cgroup_dir = fs_dir.find("cgroup")?;
 
             let cgroup_fs = Cgroup2Fs::new(cgroup_root().root(), false);
             cgroup_dir.mount(
@@ -134,30 +139,6 @@ pub fn cgroup2_init() -> Result<(), SystemError> {
         })());
     });
     result.unwrap_or(Ok(()))
-}
-
-fn ensure_dir(
-    parent: &Arc<dyn IndexNode>,
-    name: &str,
-    mode: InodeMode,
-) -> Result<Arc<dyn IndexNode>, SystemError> {
-    if let Ok(inode) = parent.find(name) {
-        return Ok(inode);
-    }
-
-    if let Some(kernfs_parent) = parent.as_any_ref().downcast_ref::<KernFSInode>() {
-        return match kernfs_parent.add_dir(name.to_string(), mode, None, None) {
-            Ok(_) => parent.find(name),
-            Err(SystemError::EEXIST) => parent.find(name),
-            Err(e) => Err(e),
-        };
-    }
-
-    match parent.mkdir(name, mode) {
-        Ok(inode) => Ok(inode),
-        Err(SystemError::EEXIST) => parent.find(name),
-        Err(e) => Err(e),
-    }
 }
 
 impl Cgroup2Inode {

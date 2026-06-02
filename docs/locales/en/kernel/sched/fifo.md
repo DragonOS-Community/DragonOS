@@ -5,7 +5,7 @@ This document was automatically translated by `hunyuan-turbos-latest` model, for
 
 - Source document: kernel/sched/fifo.md
 
-- Translation time: 2026-01-05 12:01:34
+- Translation time: 2026-06-02 17:27:47
 
 - Translation model: `hunyuan-turbos-latest`
 
@@ -62,13 +62,13 @@ pub struct FifoRunQueue {
 
 ### 3.2 Preemption Mechanism
 
-**check_preempt_current()**: When a new process is awakened, check whether the current process needs to be preempted.
-- If the new process has a higher priority, trigger preemption.
+**check_preempt_current()**: When a new process is awakened, checks whether the current process needs to be preempted.
+- If the new process has a higher priority, preemption is triggered.
 - Supports preemption between real-time tasks and normal tasks.
 
 **tick()**: Clock interrupt handling.
-- Check whether a higher-priority task has entered the queue.
-- If so, trigger rescheduling.
+- Checks whether a higher-priority task has entered the queue.
+- If so, triggers rescheduling.
 
 ### 3.3 Scheduling Priority
 
@@ -84,7 +84,7 @@ pub const MAX_RT_PRIO: i32 = 100;  // 实时优先级范围 0-99
 
 ### 3.4 Policy Switching
 
-Through the `ProcessManager::set_fifo_policy()` interface, it supports switching kernel threads to the FIFO scheduling policy at runtime:
+Through the `ProcessManager::set_fifo_policy()` interface, supports switching kernel threads to the FIFO scheduling policy at runtime:
 
 ```rust
 pub fn set_fifo_policy(pcb: &Arc<ProcessControlBlock>, prio: i32) -> Result<(), SystemError>
@@ -147,12 +147,12 @@ Enabling method: Add the feature in `Cargo.toml` and call `fifo_demo_init()`.
 
 ### 6.1 Multi-core Support
 
-- [ ] Implement FIFO task load balancing between multiple CPUs.
+- [ ] Implement FIFO task load balancing among multiple CPUs.
 - [ ] Support setting and migrating CPU affinity for tasks.
 
 ### 6.2 Scheduling Enhancements
 
-- [ ] Implement the SCHED_RR (round-robin) scheduling policy.
+- [ ] Implement the SCHED_RR (time-slice round-robin) scheduling policy.
 - [ ] Support dynamic priority adjustment.
 - [ ] Add scheduling latency statistics and monitoring.
 

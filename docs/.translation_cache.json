@@ -45,7 +45,7 @@
     "hash": "9a5c0ec57bae0576c30fbab60407f178"
   },
   "en:kernel/locking/index.rst": {
-    "hash": "0e0e7cde9860a5e3b0cba2e026a06b51"
+    "hash": "e9c62b1181325a25f39e3c4976f9c5cc"
   },
   "en:kernel/sched/index.rst": {
     "hash": "261678cb50d23aa9879632de029f60ba"
@@ -60,7 +60,7 @@
     "hash": "5d21aad4640544ad49348d3cd2e8a386"
   },
   "en:kernel/filesystem/index.rst": {
-    "hash": "a732adec7c8ab12c3ca317c351ef673c"
+    "hash": "febbb1c56928a30d0b128a98c661390e"
   },
   "en:kernel/ktest/index.rst": {
     "hash": "1adde2246ad2b63fd8d2916ce9772075"
@@ -357,7 +357,7 @@
     "hash": "8728e5478056362db9deca9b27089be1"
   },
   "en:kernel/sched/fifo.md": {
-    "hash": "7193f93fd9af38c8b7d2ad0ad9453ce5"
+    "hash": "75c9f6adf7c440aac6ca5adac9719079"
   },
   "en:kernel/interrupt/index.rst": {
     "hash": "5a42df4211e7c59aba311c9523bd529d"
@@ -382,5 +382,11 @@
   },
   "en:kernel/filesystem/fuse.md": {
     "hash": "00061bdbcbf1be7230dfdc619e3a25f1"
+  },
+  "en:kernel/filesystem/proc/index.rst": {
+    "hash": "2d72bdd95f5fe717449869759323fd64"
+  },
+  "en:kernel/filesystem/proc/mounts.md": {
+    "hash": "2c443e63a66376037ea05786cee01b0e"
   }
 }

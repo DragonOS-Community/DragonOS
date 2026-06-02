@@ -20,7 +20,7 @@ pub mod kmsg;
 mod kmsg_file;
 mod loadavg;
 mod meminfo;
-mod mounts;
+mod mount;
 mod net;
 mod pid;
 pub mod root;

@@ -28,14 +28,13 @@ mod fdinfo;
 mod id_map;
 mod limits;
 mod maps;
-mod mountinfo;
-mod mounts;
 mod ns;
 pub mod stat;
 mod statm;
 mod status;
 mod task;
 
+use crate::filesystem::procfs::mount::{inode::MountProcFileOps, ProcMountRenderKind};
 use cgroup::CgroupFileOps;
 use cmdline::CmdlineFileOps;
 use exe::ExeSymOps;
@@ -44,8 +43,6 @@ use fdinfo::FdInfoDirOps;
 use id_map::{IdMapFileOps, SetgroupsFileOps};
 use limits::LimitsFile;
 use maps::MapsFileOps;
-use mountinfo::MountInfoFileOps;
-use mounts::PidMountsFileOps;
 use ns::NsDirOps;
 use stat::StatFileOps;
 use statm::StatmFileOps;
@@ -111,6 +108,15 @@ impl ProcPidTarget {
         self.thread_group_leader()?.task_pid_ptr(PidType::TGID)
     }
 
+    pub(super) fn owner_uid_gid(&self) -> Option<(usize, usize)> {
+        let pcb = self.thread_group_leader()?;
+        if pcb.is_kthread() {
+            return Some((0, 0));
+        }
+        let cred = pcb.cred();
+        Some((cred.euid.data(), cred.egid.data()))
+    }
+
     pub fn tgid(&self) -> RawPid {
         self.thread_group_pid()
             .map(|pid| pid.pid_nr_ns(&self.view_pid_ns))
@@ -165,10 +171,13 @@ impl PidDirOps {
             LimitsFile::new_inode(ops.target.clone(), parent)
         }),
         ("mountinfo", |ops, parent| {
-            MountInfoFileOps::new_inode(ops.target.clone(), parent)
+            MountProcFileOps::new_inode(ops.target.clone(), ProcMountRenderKind::MountInfo, parent)
         }),
         ("mounts", |ops, parent| {
-            PidMountsFileOps::new_inode(ops.target.clone(), parent)
+            MountProcFileOps::new_inode(ops.target.clone(), ProcMountRenderKind::Mounts, parent)
+        }),
+        ("mountstats", |ops, parent| {
+            MountProcFileOps::new_inode(ops.target.clone(), ProcMountRenderKind::MountStats, parent)
         }),
         ("ns", |ops, parent| {
             NsDirOps::new_inode(ops.target.clone(), parent)
@@ -254,12 +263,7 @@ impl PidDirOps {
 
 impl DirOps for PidDirOps {
     fn owner(&self) -> Option<(usize, usize)> {
-        let pcb = self.target.thread_group_leader()?;
-        if pcb.is_kthread() {
-            return Some((0, 0));
-        }
-        let cred = pcb.cred();
-        Some((cred.euid.data(), cred.egid.data()))
+        self.target.owner_uid_gid()
     }
 
     fn lookup_child(

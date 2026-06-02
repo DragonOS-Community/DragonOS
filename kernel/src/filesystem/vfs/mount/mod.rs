@@ -154,26 +154,19 @@ bitflags! {
 }
 
 impl MountFlags {
-    /// Convert mount flags to a comma-separated string representation
-    ///
-    /// This function converts MountFlags to a string format similar to /proc/mounts,
-    /// such as "rw,nosuid,nodev,noexec,relatime".
-    ///
-    /// # Returns
-    ///
-    /// A String containing the mount options in comma-separated format.
-    #[inline(never)]
-    pub fn options_string(&self) -> String {
+    /// `ro` or `rw` token for proc mount options.
+    pub fn proc_rw_token(&self) -> &'static str {
+        if self.contains(MountFlags::RDONLY) {
+            "ro"
+        } else {
+            "rw"
+        }
+    }
+
+    /// Per-mount options excluding rw and super-block flags.
+    pub fn proc_per_mount_options(&self) -> String {
         let mut options = Vec::new();
 
-        // Check read/write flag
-        if self.contains(MountFlags::RDONLY) {
-            options.push("ro");
-        } else {
-            options.push("rw");
-        }
-
-        // Check other flags
         if self.contains(MountFlags::NOSUID) {
             options.push("nosuid");
         }
@@ -182,15 +175,6 @@ impl MountFlags {
         }
         if self.contains(MountFlags::NOEXEC) {
             options.push("noexec");
-        }
-        if self.contains(MountFlags::SYNCHRONOUS) {
-            options.push("sync");
-        }
-        if self.contains(MountFlags::MANDLOCK) {
-            options.push("mand");
-        }
-        if self.contains(MountFlags::DIRSYNC) {
-            options.push("dirsync");
         }
         if self.contains(MountFlags::NOSYMFOLLOW) {
             options.push("nosymfollow");
@@ -207,30 +191,51 @@ impl MountFlags {
         if self.contains(MountFlags::STRICTATIME) {
             options.push("strictatime");
         }
+
+        options.join(",")
+    }
+
+    /// Super-block options excluding rw and per-mount flags.
+    pub fn proc_super_block_options(&self) -> String {
+        let mut options = Vec::new();
+
+        if self.contains(MountFlags::SYNCHRONOUS) {
+            options.push("sync");
+        }
+        if self.contains(MountFlags::MANDLOCK) {
+            options.push("mand");
+        }
+        if self.contains(MountFlags::DIRSYNC) {
+            options.push("dirsync");
+        }
         if self.contains(MountFlags::LAZYTIME) {
             options.push("lazytime");
         }
 
-        // Mount propagation flags
-        if self.contains(MountFlags::UNBINDABLE) {
-            options.push("unbindable");
-        }
-        if self.contains(MountFlags::PRIVATE) {
-            options.push("private");
-        }
-        if self.contains(MountFlags::SLAVE) {
-            options.push("slave");
-        }
-        if self.contains(MountFlags::SHARED) {
-            options.push("shared");
-        }
-
-        // Internal flags (typically not shown in /proc/mounts)
-        // We'll skip flags like BIND, MOVE, REC, REMOUNT, etc. as they're
-        // not typically displayed in mount options
-
         options.join(",")
     }
+
+    /// Convert mount flags to a comma-separated string representation
+    ///
+    /// This function converts MountFlags to a string format similar to /proc/mounts,
+    /// such as "rw,nosuid,nodev,noexec,relatime".
+    #[inline(never)]
+    pub fn options_string(&self) -> String {
+        let mut options = self.proc_rw_token().to_string();
+        append_comma_options(&mut options, self.proc_per_mount_options());
+        append_comma_options(&mut options, self.proc_super_block_options());
+        options
+    }
+}
+
+pub(crate) fn append_comma_options(base: &mut String, extra: String) {
+    if extra.is_empty() {
+        return;
+    }
+    if !base.is_empty() {
+        base.push(',');
+    }
+    base.push_str(&extra);
 }
 
 // MountId type
@@ -566,6 +571,10 @@ impl MountFS {
     #[inline(never)]
     pub fn self_mountpoint(&self) -> Option<Arc<MountFSInode>> {
         self.self_mountpoint.read().as_ref().cloned()
+    }
+
+    pub fn parent_mount(&self) -> Option<Arc<MountFS>> {
+        self.self_mountpoint().map(|inode| inode.mount_fs.clone())
     }
 
     pub fn set_self_mountpoint(&self, mountpoint: Option<Arc<MountFSInode>>) {
@@ -1978,6 +1987,21 @@ impl MountList {
             .mounts
             .iter()
             .map(|(p, stack)| (p.clone(), stack.last().unwrap().fs.clone()))
+            .collect()
+    }
+
+    /// Clone every mount record, including lower entries in a same-path mount stack.
+    pub fn clone_records(&self) -> Vec<(Arc<MountPath>, Arc<MountFS>)> {
+        self.inner
+            .read()
+            .mounts
+            .iter()
+            .flat_map(|(path, stack)| {
+                stack
+                    .iter()
+                    .map(|rec| (path.clone(), rec.fs.clone()))
+                    .collect::<Vec<_>>()
+            })
             .collect()
     }
 

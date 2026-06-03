@@ -54,6 +54,8 @@ mod sys_getpgrp;
 #[cfg(target_arch = "x86_64")]
 mod sys_getrlimit;
 #[cfg(target_arch = "x86_64")]
+mod sys_ioperm;
+#[cfg(target_arch = "x86_64")]
 mod sys_setrlimit;
 #[cfg(target_arch = "x86_64")]
 mod sys_vfork;

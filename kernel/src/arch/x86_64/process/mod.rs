@@ -17,7 +17,7 @@ use x86::{controlregs::Cr4, segmentation::SegmentSelector};
 use crate::{
     arch::process::table::TSSManager,
     exception::InterruptArch,
-    libs::spinlock::SpinLockGuard,
+    libs::spinlock::{SpinLock, SpinLockGuard},
     mm::VirtAddr,
     process::{
         fork::{CloneFlags, KernelCloneArgs},
@@ -28,6 +28,7 @@ use crate::{
 };
 
 use self::{
+    io_bitmap::TaskIoBitmap,
     kthread::kernel_thread_bootstrap_stage1,
     syscall::ARCH_SET_FS,
     table::{switch_fs_and_gs, KERNEL_DS, USER_DS},
@@ -39,6 +40,7 @@ use super::{
 };
 
 pub mod idle;
+pub mod io_bitmap;
 pub mod kthread;
 pub mod syscall;
 pub mod table;
@@ -83,6 +85,8 @@ pub struct ArchPCBInfo {
     gsdata: X86_64GSData,
     /// 浮点寄存器的状态
     fp_state: Option<FpState>,
+    /// x86 I/O permission bitmap shared with forked user tasks.
+    io_bitmap: Option<Arc<SpinLock<TaskIoBitmap>>>,
 }
 
 #[allow(dead_code)]
@@ -118,6 +122,7 @@ impl ArchPCBInfo {
             fs: KERNEL_DS,
             gs: KERNEL_DS,
             fp_state: None,
+            io_bitmap: None,
         };
 
         r.rsp = kstack.stack_max_address().data() - 8;
@@ -242,6 +247,18 @@ impl ArchPCBInfo {
         &mut self.fp_state
     }
 
+    pub fn io_bitmap(&self) -> Option<Arc<SpinLock<TaskIoBitmap>>> {
+        self.io_bitmap.clone()
+    }
+
+    pub fn io_bitmap_ref(&self) -> Option<&Arc<SpinLock<TaskIoBitmap>>> {
+        self.io_bitmap.as_ref()
+    }
+
+    pub fn set_io_bitmap(&mut self, bitmap: Option<Arc<SpinLock<TaskIoBitmap>>>) {
+        self.io_bitmap = bitmap;
+    }
+
     /// ### 克隆ArchPCBInfo,需要注意gsdata也是对应clone的
     pub fn clone_all(&self) -> Self {
         Self {
@@ -261,6 +278,7 @@ impl ArchPCBInfo {
             gs: self.gs,
             gsdata: self.gsdata.clone(),
             fp_state: self.fp_state,
+            io_bitmap: self.io_bitmap.clone(),
         }
     }
 
@@ -352,6 +370,7 @@ impl ProcessManager {
         new_arch_guard.fs = current_arch_guard.fs;
         new_arch_guard.gs = current_arch_guard.gs;
         new_arch_guard.fp_state = current_arch_guard.fp_state;
+        new_arch_guard.io_bitmap = current_arch_guard.io_bitmap.clone();
 
         // 拷贝浮点寄存器的状态
         if let Some(fp_state) = current_arch_guard.fp_state.as_ref() {
@@ -361,6 +380,7 @@ impl ProcessManager {
 
         // 设置返回地址（子进程开始执行的指令地址）
         if new_pcb.flags().contains(ProcessFlags::KTHREAD) {
+            new_arch_guard.io_bitmap = None;
             let kthread_bootstrap_stage1_func_addr = kernel_thread_bootstrap_stage1 as usize;
             new_arch_guard.rip = kthread_bootstrap_stage1_func_addr;
         } else {
@@ -445,6 +465,7 @@ impl ProcessManager {
             x86::Ring::Ring0,
             next.kernel_stack().stack_max_address().data() as u64,
         );
+        TSSManager::invalidate_io_bitmap();
         PROCESS_SWITCH_RESULT.as_mut().unwrap().get_mut().prev_pcb = Some(prev);
         PROCESS_SWITCH_RESULT.as_mut().unwrap().get_mut().next_pcb = Some(next);
         // debug!("switch tss ok");
@@ -596,6 +617,7 @@ pub unsafe fn arch_switch_to_user(trap_frame: TrapFrame) -> ! {
     // 重要！在这里之后，一定要保证上面的引用计数变量、动态申请的变量、锁的守卫都被drop了，否则可能导致内存安全问题！
 
     compiler_fence(Ordering::SeqCst);
+    TSSManager::update_io_bitmap_from_current();
     crate::rcu::note_exit_to_user_mode();
     ready_to_switch_to_user(trap_frame, trap_frame_vaddr.data(), new_rip.data());
 }

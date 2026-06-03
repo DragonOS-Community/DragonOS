@@ -293,6 +293,15 @@ pub fn ns_capable(ns: &Arc<UserNamespace>, cap: CAPFlags) -> bool {
     cap_capable(&pcb.cred(), ns, cap)
 }
 
+/// Check whether the current process has a capability in the initial user namespace.
+///
+/// Linux `capable(cap)` is equivalent to `ns_capable(&init_user_ns, cap)`.
+/// Hardware-level capabilities such as `CAP_SYS_RAWIO` must use this semantic
+/// instead of checking the current process user namespace.
+pub fn capable(cap: CAPFlags) -> bool {
+    ns_capable(&INIT_USER_NAMESPACE, cap)
+}
+
 /// 检查当前进程在指定 ns 中是否有某 capability（setid 上下文）
 pub fn ns_capable_setid(ns: &Arc<UserNamespace>, cap: CAPFlags) -> bool {
     ns_capable(ns, cap)

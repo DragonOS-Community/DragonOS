@@ -4,7 +4,7 @@
 
    - Source document: kernel/filesystem/index.rst
 
-   - Translation time: 2026-02-16 08:59:38
+   - Translation time: 2026-06-02 17:27:12
 
    - Translation model: `hunyuan-turbos-latest`
 
@@ -14,7 +14,7 @@
 File System
 ====================================
 
-The file system module of DragonOS consists of the VFS (Virtual File System) and specific file systems.
+The file system module of DragonOS consists of VFS (Virtual File System) and specific file systems.
 
 todo: Due to the file system module reconstruction, the documentation is temporarily unavailable and is expected to be completed by April 10, 2023.
 
@@ -25,6 +25,7 @@ todo: Due to the file system module reconstruction, the documentation is tempora
    overview
    fuse
    vfs/index
+   proc/index
    sysfs
    kernfs
    unionfs/index

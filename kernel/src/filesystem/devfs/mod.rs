@@ -109,6 +109,27 @@ impl FileSystem for DevFS {
 }
 
 impl DevFS {
+    fn char_device_uses_root(name: &str) -> bool {
+        (name.starts_with("tty") && name.len() >= 3)
+            || (name.starts_with("hvc") && name.len() > 3)
+            || name == "console"
+            || name == "ptmx"
+            || name == "loop-control"
+    }
+
+    fn is_loop_block_device(name: &str) -> bool {
+        name.starts_with("loop") && name.len() > 4 && name[4..].chars().all(|c| c.is_ascii_digit())
+    }
+
+    fn block_device_uses_root(name: &str) -> bool {
+        (name.starts_with("vd") && name.len() > 2)
+            || name.starts_with("nvme")
+            || Self::is_loop_block_device(name)
+            || (name.starts_with("pmem")
+                && name.len() > 4
+                && name[4..].chars().all(|c| c.is_ascii_digit()))
+    }
+
     pub fn new() -> Arc<Self> {
         let super_block = SuperBlock::new(
             Magic::DEVFS_MAGIC,
@@ -230,18 +251,7 @@ impl DevFS {
                 device.set_fs(dev_root_inode.0.lock().fs.clone());
                 device.set_parent(Arc::downgrade(&dev_root_inode));
                 // 特殊处理 tty 设备，挂载在 /dev 下
-                if name.starts_with("tty") && name.len() >= 3 {
-                    dev_root_inode.add_dev(name, device.clone())?;
-                } else if name.starts_with("hvc") && name.len() > 3 {
-                    // 特殊处理 hvc 设备，挂载在 /dev 下
-                    dev_root_inode.add_dev(name, device.clone())?;
-                } else if name == "console" {
-                    dev_root_inode.add_dev(name, device.clone())?;
-                } else if name == "ptmx" {
-                    // ptmx设备
-                    dev_root_inode.add_dev(name, device.clone())?;
-                } else if name == "loop-control" {
-                    // loop-control设备
+                if Self::char_device_uses_root(name) {
                     dev_root_inode.add_dev(name, device.clone())?;
                 } else {
                     // 在 /dev/char 下创建设备节点
@@ -265,33 +275,19 @@ impl DevFS {
                 device.set_parent(Arc::downgrade(&dev_root_inode));
                 device.set_fs(dev_root_inode.0.lock().fs.clone());
 
-                if name.starts_with("vd") && name.len() > 2 {
-                    // 虚拟磁盘设备挂载在 /dev 下
+                if Self::block_device_uses_root(name) {
+                    // 部分块设备挂载在 /dev 下
                     dev_root_inode.add_dev(name, device.clone())?;
-                    let path = format!("/dev/{}", name);
-                    let symlink_name = device
-                        .as_any_ref()
-                        .downcast_ref::<GenDisk>()
-                        .unwrap()
-                        .symlink_name();
+                    if name.starts_with("vd") && name.len() > 2 {
+                        let path = format!("/dev/{}", name);
+                        let symlink_name = device
+                            .as_any_ref()
+                            .downcast_ref::<GenDisk>()
+                            .unwrap()
+                            .symlink_name();
 
-                    dev_block_inode.add_dev_symlink(&path, &symlink_name)?;
-                } else if name.starts_with("nvme") {
-                    // NVMe设备挂载在 /dev 下
-                    dev_root_inode.add_dev(name, device.clone())?;
-                } else if name.starts_with("loop")
-                    && name.len() > 4
-                    && name[4..].chars().all(|c| c.is_ascii_digit())
-                {
-                    // loop块设备 (loop0, loop1, ...) 挂载在 /dev 下
-                    // 注意：不能简单用 starts_with("loop")，因为会与网络 loopback 设备冲突
-                    dev_root_inode.add_dev(name, device.clone())?;
-                } else if name.starts_with("pmem")
-                    && name.len() > 4
-                    && name[4..].chars().all(|c| c.is_ascii_digit())
-                {
-                    // PMEM 块设备 (pmem0, pmem1, ...) 挂载在 /dev 下
-                    dev_root_inode.add_dev(name, device.clone())?;
+                        dev_block_inode.add_dev_symlink(&path, &symlink_name)?;
+                    }
                 } else {
                     dev_block_inode.add_dev(name, device.clone())?;
                     device.set_parent(Arc::downgrade(&dev_block_inode));
@@ -320,29 +316,50 @@ impl DevFS {
         device: Arc<T>,
     ) -> Result<(), SystemError> {
         let dev_root_inode: Arc<LockedDevFSInode> = self.root_inode.clone();
+        let expected: Arc<dyn IndexNode> = device.clone();
         match device.metadata().unwrap().file_type {
             // 字节设备挂载在 /dev/char
             FileType::CharDevice => {
-                if dev_root_inode.find("char").is_err() {
-                    return Err(SystemError::ENOENT);
-                }
+                if Self::char_device_uses_root(name) {
+                    if name == "ptmx" {
+                        dev_root_inode.remove_kernel_managed_if_exists(name)?;
+                    } else {
+                        dev_root_inode.remove_if_same(name, &expected)?;
+                    }
+                } else {
+                    if dev_root_inode.find("char").is_err() {
+                        return Err(SystemError::ENOENT);
+                    }
 
-                let any_char_inode = dev_root_inode.find("char")?;
-                let dev_char_inode = any_char_inode
-                    .as_any_ref()
-                    .downcast_ref::<LockedDevFSInode>()
-                    .unwrap();
-                // TODO： 调用设备的卸载接口（当引入卸载接口之后）
-                dev_char_inode.remove(name)?;
+                    let any_char_inode = dev_root_inode.find("char")?;
+                    let dev_char_inode = any_char_inode
+                        .as_any_ref()
+                        .downcast_ref::<LockedDevFSInode>()
+                        .unwrap();
+                    // TODO： 调用设备的卸载接口（当引入卸载接口之后）
+                    dev_char_inode.remove_if_same(name, &expected)?;
+                }
             }
             FileType::BlockDevice => {
-                // 检查是否是 loop 块设备 (loop0, loop1, ...)
-                let is_loop_block_device = name.starts_with("loop")
-                    && name.len() > 4
-                    && name[4..].chars().all(|c| c.is_ascii_digit());
+                if Self::block_device_uses_root(name) {
+                    if name.starts_with("vd") && name.len() > 2 {
+                        if dev_root_inode.find("block").is_err() {
+                            return Err(SystemError::ENOENT);
+                        }
 
-                if is_loop_block_device {
-                    dev_root_inode.remove(name)?;
+                        let any_block_inode = dev_root_inode.find("block")?;
+                        let dev_block_inode = any_block_inode
+                            .as_any_ref()
+                            .downcast_ref::<LockedDevFSInode>()
+                            .unwrap();
+                        let symlink_name = device
+                            .as_any_ref()
+                            .downcast_ref::<GenDisk>()
+                            .unwrap()
+                            .symlink_name();
+                        dev_block_inode.remove_kernel_managed_if_exists(&symlink_name)?;
+                    }
+                    dev_root_inode.remove_if_same(name, &expected)?;
                 } else {
                     if dev_root_inode.find("block").is_err() {
                         return Err(SystemError::ENOENT);
@@ -354,7 +371,7 @@ impl DevFS {
                         .downcast_ref::<LockedDevFSInode>()
                         .unwrap();
 
-                    dev_block_inode.remove(name)?;
+                    dev_block_inode.remove_if_same(name, &expected)?;
                 }
             }
             _ => {
@@ -379,6 +396,8 @@ pub struct DevFSInode {
     self_ref: Weak<LockedDevFSInode>,
     /// 子Inode的B树
     children: BTreeMap<DName, Arc<dyn IndexNode>>,
+    /// Whether this devfs-owned inode was created by kernel device management.
+    kernel_managed: bool,
     /// 指向inode所在的文件系统对象的指针
     fs: Weak<DevFS>,
     /// INode 元数据
@@ -404,6 +423,7 @@ impl DevFSInode {
             parent,
             self_ref: Weak::default(),
             children: BTreeMap::new(),
+            kernel_managed: false,
             metadata: Metadata {
                 dev_id: 1,
                 inode_id: generate_inode_id(),
@@ -475,23 +495,42 @@ impl LockedDevFSInode {
 
         let buf = path.as_bytes();
         let len = buf.len();
-        new_inode
-            .downcast_ref::<LockedDevFSInode>()
-            .unwrap()
-            .write_at(0, len, buf, Mutex::new(FilePrivateData::Unused).lock())?;
+        let devfs_inode = new_inode.downcast_ref::<LockedDevFSInode>().unwrap();
+        devfs_inode.write_at(0, len, buf, Mutex::new(FilePrivateData::Unused).lock())?;
+        devfs_inode.0.lock().kernel_managed = true;
         Ok(())
     }
 
-    pub fn remove(&self, name: &str) -> Result<(), SystemError> {
-        let x = self
-            .0
-            .lock()
+    fn remove_if_same(&self, name: &str, expected: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
+        let mut inode = self.0.lock();
+        let dname = DName::from(name);
+        let should_remove = inode
             .children
-            .remove(&DName::from(name))
-            .ok_or(SystemError::ENOENT)?;
+            .get(&dname)
+            .is_some_and(|child| Arc::ptr_eq(child, expected));
 
-        drop(x);
-        return Ok(());
+        if should_remove {
+            inode.children.remove(&dname);
+        }
+
+        Ok(())
+    }
+
+    fn remove_kernel_managed_if_exists(&self, name: &str) -> Result<(), SystemError> {
+        let mut inode = self.0.lock();
+        let dname = DName::from(name);
+        let should_remove = inode.children.get(&dname).is_some_and(|child| {
+            child
+                .as_any_ref()
+                .downcast_ref::<LockedDevFSInode>()
+                .is_some_and(|child| child.0.lock().kernel_managed)
+        });
+
+        if should_remove {
+            inode.children.remove(&dname);
+        }
+
+        Ok(())
     }
 
     fn do_create_with_data(
@@ -516,6 +555,7 @@ impl LockedDevFSInode {
             parent: guard.self_ref.clone(),
             self_ref: Weak::default(),
             children: BTreeMap::new(),
+            kernel_managed: false,
             metadata: Metadata {
                 dev_id: 0,
                 inode_id: generate_inode_id(),
@@ -601,6 +641,50 @@ impl IndexNode for LockedDevFSInode {
                     .clone());
             }
         }
+    }
+
+    fn unlink(&self, name: &str) -> Result<(), SystemError> {
+        let mut inode = self.0.lock();
+        if inode.metadata.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+
+        if name.is_empty() {
+            return Err(SystemError::ENOENT);
+        }
+        if name == "." || name == ".." {
+            return Err(SystemError::EISDIR);
+        }
+
+        let dname = DName::from(name);
+        let child = inode
+            .children
+            .get(&dname)
+            .cloned()
+            .ok_or(SystemError::ENOENT)?;
+
+        if let Some(child) = child.as_any_ref().downcast_ref::<LockedDevFSInode>() {
+            let mut child_inode = child.0.lock();
+            if child_inode.metadata.file_type == FileType::Dir {
+                return Err(SystemError::EISDIR);
+            }
+
+            child_inode.metadata.nlinks = child_inode
+                .metadata
+                .nlinks
+                .checked_sub(1)
+                .ok_or(SystemError::EINVAL)?;
+            child_inode.metadata.ctime = PosixTimeSpec::now();
+        } else if child.metadata()?.file_type == FileType::Dir {
+            return Err(SystemError::EISDIR);
+        }
+
+        inode.children.remove(&dname);
+        let now = PosixTimeSpec::now();
+        inode.metadata.mtime = now;
+        inode.metadata.ctime = now;
+
+        Ok(())
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {

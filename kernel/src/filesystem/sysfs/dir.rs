@@ -10,8 +10,9 @@ use crate::{
     driver::base::kobject::KObject,
     filesystem::{
         kernfs::{callback::KernInodePrivateData, KernFSInode},
-        vfs::InodeMode,
+        vfs::{FileType, IndexNode, InodeMode},
     },
+    libs::casting::DowncastArc,
 };
 
 use super::{SysFS, SysFSKernPrivateData};
@@ -74,6 +75,57 @@ impl SysFS {
         kobj.set_inode(Some(dir.clone()));
 
         return Ok(dir);
+    }
+
+    pub fn ensure_mount_point_path(
+        &self,
+        components: &[&str],
+        mode: InodeMode,
+    ) -> Result<Arc<KernFSInode>, SystemError> {
+        let mut current = self.root_inode.clone();
+
+        for component in components {
+            current = self.ensure_mount_point_component(&current, component, mode)?;
+        }
+
+        Ok(current)
+    }
+
+    fn ensure_mount_point_component(
+        &self,
+        parent: &Arc<KernFSInode>,
+        name: &str,
+        mode: InodeMode,
+    ) -> Result<Arc<KernFSInode>, SystemError> {
+        Self::validate_mount_point_component(name)?;
+
+        match parent.add_dir(name.to_string(), mode, None, None) {
+            Ok(inode) => Ok(inode),
+            Err(SystemError::EEXIST) => Self::existing_mount_point_dir(parent, name),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn validate_mount_point_component(name: &str) -> Result<(), SystemError> {
+        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+            return Err(SystemError::EINVAL);
+        }
+
+        Ok(())
+    }
+
+    fn existing_mount_point_dir(
+        parent: &Arc<KernFSInode>,
+        name: &str,
+    ) -> Result<Arc<KernFSInode>, SystemError> {
+        let inode = parent.find(name)?;
+        if inode.metadata()?.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+
+        inode
+            .downcast_arc::<KernFSInode>()
+            .ok_or(SystemError::EINVAL)
     }
 
     /// 获取指定的kernfs inode在sysfs中的路径（不包含`/sys`）

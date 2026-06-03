@@ -22,13 +22,17 @@ pub mod group;
 pub mod symlink;
 
 /// 全局的sysfs实例
-static mut SYSFS_INSTANCE: Option<SysFS> = None;
+static mut SYSFS_INSTANCE: Option<Arc<SysFS>> = None;
 
 #[inline(always)]
 pub fn sysfs_instance() -> &'static SysFS {
     unsafe {
-        return SYSFS_INSTANCE.as_ref().unwrap();
+        return SYSFS_INSTANCE.as_deref().unwrap();
     }
+}
+
+pub fn sysfs_filesystem() -> Result<Arc<SysFS>, SystemError> {
+    unsafe { SYSFS_INSTANCE.as_ref().cloned().ok_or(SystemError::ENODEV) }
 }
 
 pub fn sysfs_init() -> Result<(), SystemError> {
@@ -39,14 +43,15 @@ pub fn sysfs_init() -> Result<(), SystemError> {
 
         // 创建 sysfs 实例
         // let sysfs: Arc<OldSysFS> = OldSysFS::new();
-        let sysfs = SysFS::new();
-        unsafe { SYSFS_INSTANCE = Some(sysfs) };
+        let sysfs = Arc::new(SysFS::new());
+        unsafe { SYSFS_INSTANCE = Some(sysfs.clone()) };
         let root_inode = ProcessManager::current_mntns().root_inode();
+        let fs: Arc<dyn FileSystem> = sysfs;
         // sysfs 挂载
         root_inode
             .mkdir("sys", InodeMode::from_bits_truncate(0o755))
             .expect("Unabled to find /sys")
-            .mount(sysfs_instance().fs().clone(), MountFlags::empty())
+            .mount(fs, MountFlags::empty())
             .expect("Failed to mount at /sys");
         info!("SysFS mounted.");
 
@@ -221,10 +226,6 @@ impl SysFS {
         return &self.root_inode;
     }
 
-    pub fn fs(&self) -> &Arc<KernFS> {
-        return &self.kernfs;
-    }
-
     /// 警告：重复的sysfs entry
     pub(self) fn warn_duplicate(&self, parent: &Arc<KernFSInode>, name: &str) {
         let path = self.kernfs_path(parent);
@@ -271,8 +272,7 @@ impl MountableFileSystem for SysFS {
     fn make_fs(
         _data: Option<&dyn FileSystemMakerData>,
     ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
-        let fs = SysFS::new();
-        Ok(Arc::new(fs))
+        Ok(sysfs_filesystem()?)
     }
 }
 

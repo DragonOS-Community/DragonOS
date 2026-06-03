@@ -438,7 +438,8 @@ impl VirtIOConsoleDriver {
         driver.standard_install(tty.clone())?;
         vc.port().setup_internal_tty(Arc::downgrade(&tty));
         tty.set_port(vc.port());
-        vc.devfs_setup()?;
+        tty.core()
+            .set_vc_index(vc.index().ok_or(SystemError::ENODEV)?);
 
         Ok(())
     }

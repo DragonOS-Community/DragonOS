@@ -113,6 +113,7 @@ impl KernFS {
             children: Mutex::new(HashMap::new()),
             inode_type: KernInodeType::Dir,
             lazy_list: Mutex::new(HashMap::new()),
+            lazy_build_lock: Mutex::new(()),
         });
 
         return root_inode;
@@ -138,6 +139,8 @@ pub struct KernFSInode {
     name: String,
     /// lazy list
     lazy_list: Mutex<HashMap<String, fn() -> KernFSInodeArgs>>,
+    /// Serializes lazy entry materialization without holding entry maps.
+    lazy_build_lock: Mutex<()>,
 }
 
 pub struct KernFSInodeArgs {
@@ -273,26 +276,13 @@ impl IndexNode for KernFSInode {
                     .ok_or(SystemError::ENOENT)?);
             }
             name => {
-                // 在子目录项中查找
-                let child = self.children.lock().get(name).cloned();
-                if let Some(child) = child {
+                if let Some(child) = self.children.lock().get(name).cloned() {
                     return Ok(child);
                 }
-                let lazy_list = self.lazy_list.lock();
-                if let Some(provider) = lazy_list.get(name) {
-                    // 如果存在lazy list，则调用提供者函数创建
-                    let args = provider();
-                    let inode = self.inner_create(
-                        name.to_string(),
-                        args.inode_type,
-                        args.mode,
-                        args.size.unwrap_or(4096),
-                        args.private_data,
-                        args.callback,
-                    )?;
-                    return Ok(inode);
-                }
-                Err(SystemError::ENOENT)
+
+                return self
+                    .materialize_lazy_child(name)
+                    .map(|child| child as Arc<dyn IndexNode>);
             }
         }
     }
@@ -465,6 +455,7 @@ impl KernFSInode {
             children: Mutex::new(HashMap::new()),
             inode_type,
             lazy_list: Mutex::new(HashMap::new()),
+            lazy_build_lock: Mutex::new(()),
         });
 
         // Set fs reference from parent if available
@@ -569,8 +560,53 @@ impl KernFSInode {
         if unlikely(self.inode_type != KernInodeType::Dir) {
             return Err(SystemError::ENOTDIR);
         }
-        self.lazy_list.lock().insert(name, provider);
+
+        let children = self.children.lock();
+        let mut lazy_list = self.lazy_list.lock();
+        if children.contains_key(&name) || lazy_list.contains_key(&name) {
+            return Err(SystemError::EEXIST);
+        }
+
+        lazy_list.insert(name, provider);
         Ok(())
+    }
+
+    fn materialize_lazy_child(&self, name: &str) -> Result<Arc<KernFSInode>, SystemError> {
+        let _build_guard = self.lazy_build_lock.lock();
+
+        if let Some(child) = self.children.lock().get(name).cloned() {
+            return Ok(child);
+        }
+
+        let provider = self
+            .lazy_list
+            .lock()
+            .get(name)
+            .copied()
+            .ok_or(SystemError::ENOENT)?;
+
+        let args = provider();
+        let inode = self.new_child_inode(
+            name.to_string(),
+            args.inode_type,
+            args.mode,
+            args.size.unwrap_or(4096),
+            args.private_data,
+            args.callback,
+        );
+
+        let mut children = self.children.lock();
+        if let Some(child) = children.get(name).cloned() {
+            return Ok(child);
+        }
+
+        let mut lazy_list = self.lazy_list.lock();
+        if lazy_list.remove(name).is_none() {
+            return children.get(name).cloned().ok_or(SystemError::ENOENT);
+        }
+
+        children.insert(name.to_string(), inode.clone());
+        Ok(inode)
     }
 
     fn inner_create(
@@ -578,10 +614,33 @@ impl KernFSInode {
         name: String,
         file_type: KernInodeType,
         mode: InodeMode,
-        mut size: usize,
+        size: usize,
         private_data: Option<KernInodePrivateData>,
         callback: Option<&'static dyn KernFSCallback>,
     ) -> Result<Arc<KernFSInode>, SystemError> {
+        let mut children = self.children.lock();
+        let lazy_list = self.lazy_list.lock();
+        if children.contains_key(&name) || lazy_list.contains_key(&name) {
+            return Err(SystemError::EEXIST);
+        }
+
+        let new_inode =
+            self.new_child_inode(name.clone(), file_type, mode, size, private_data, callback);
+
+        children.insert(name, new_inode.clone());
+
+        return Ok(new_inode);
+    }
+
+    fn new_child_inode(
+        &self,
+        name: String,
+        file_type: KernInodeType,
+        mode: InodeMode,
+        mut size: usize,
+        private_data: Option<KernInodePrivateData>,
+        callback: Option<&'static dyn KernFSCallback>,
+    ) -> Arc<KernFSInode> {
         match file_type {
             KernInodeType::Dir | KernInodeType::SymLink => {
                 size = 0;
@@ -608,18 +667,14 @@ impl KernFSInode {
             flags: InodeFlags::empty(),
         };
 
-        let new_inode: Arc<KernFSInode> = Self::new_with_parent(
+        Self::new_with_parent(
             Some(self.self_ref.upgrade().unwrap()),
-            name.clone(),
+            name,
             metadata,
             file_type,
             private_data,
             callback,
-        );
-
-        self.children.lock().insert(name, new_inode.clone());
-
-        return Ok(new_inode);
+        )
     }
 
     /// 在当前inode下删除子目录或者文件

@@ -449,7 +449,7 @@ impl KernelCmdlineManager {
             let Some((node, option, value)) = self.split_arg(argument) else {
                 continue;
             };
-            if node.is_none() && value.is_none() && names.iter().any(|name| *name == option) {
+            if node.is_none() && value.is_none() && names.contains(&option) {
                 last = Some(String::from(option));
             }
         }

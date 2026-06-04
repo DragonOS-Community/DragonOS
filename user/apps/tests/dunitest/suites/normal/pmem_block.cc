@@ -13,25 +13,34 @@ namespace {
 constexpr const char* kPmem0 = "/dev/pmem0";
 constexpr size_t kSectorSize = 512;
 
-void SkipIfNoPmem() {
-    struct stat st = {};
-    if (stat(kPmem0, &st) != 0) {
-        if (errno == ENOENT) {
-            GTEST_SKIP() << kPmem0 << " is not present in this boot configuration";
-        }
-        FAIL() << "stat(" << kPmem0 << ") failed: errno=" << errno << " ("
-               << std::strerror(errno) << ")";
+enum class PmemProbeResult {
+    Present,
+    Missing,
+    Error,
+};
+
+PmemProbeResult ProbePmem(struct stat* st, int* err) {
+    if (stat(kPmem0, st) == 0) {
+        return PmemProbeResult::Present;
     }
+    *err = errno;
+    return errno == ENOENT ? PmemProbeResult::Missing : PmemProbeResult::Error;
 }
 
 }  // namespace
 
 TEST(PmemBlock, ExposesWholeDiskBlockDevice) {
-    SkipIfNoPmem();
-
     struct stat st = {};
-    ASSERT_EQ(0, stat(kPmem0, &st)) << "stat(" << kPmem0 << ") failed: errno=" << errno
-                                    << " (" << std::strerror(errno) << ")";
+    int err = 0;
+    switch (ProbePmem(&st, &err)) {
+        case PmemProbeResult::Missing:
+            GTEST_SKIP() << kPmem0 << " is not present in this boot configuration";
+        case PmemProbeResult::Error:
+            FAIL() << "stat(" << kPmem0 << ") failed: errno=" << err << " ("
+                   << std::strerror(err) << ")";
+        case PmemProbeResult::Present:
+            break;
+    }
 
     EXPECT_TRUE(S_ISBLK(st.st_mode)) << kPmem0 << " is not a block device";
     EXPECT_EQ(259U, major(st.st_rdev)) << kPmem0 << " major mismatch";
@@ -40,7 +49,17 @@ TEST(PmemBlock, ExposesWholeDiskBlockDevice) {
 }
 
 TEST(PmemBlock, SupportsAlignedAndPartialReads) {
-    SkipIfNoPmem();
+    struct stat st = {};
+    int err = 0;
+    switch (ProbePmem(&st, &err)) {
+        case PmemProbeResult::Missing:
+            GTEST_SKIP() << kPmem0 << " is not present in this boot configuration";
+        case PmemProbeResult::Error:
+            FAIL() << "stat(" << kPmem0 << ") failed: errno=" << err << " ("
+                   << std::strerror(err) << ")";
+        case PmemProbeResult::Present:
+            break;
+    }
 
     int fd = open(kPmem0, O_RDONLY);
     ASSERT_GE(fd, 0) << "open(" << kPmem0 << ") failed: errno=" << errno << " ("

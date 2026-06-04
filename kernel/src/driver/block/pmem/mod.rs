@@ -1,21 +1,132 @@
 mod device;
 
 use alloc::{string::ToString, sync::Arc, vec::Vec};
-use core::convert::TryFrom;
+use core::{
+    convert::TryFrom,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use crate::{
     driver::base::block::{block_device::BlockDevice, manager::block_dev_manager},
     init::initcall::INITCALL_DEVICE,
+    libs::spinlock::SpinLock,
+    mm::{memblock::mem_block_manager, PhysAddr},
 };
 
-use self::device::PmemBlockDevice;
+pub use self::device::PmemBlockDevice;
 
 const E820_TYPE_PMEM: u32 = 7;
 const E820_TYPE_PRAM: u32 = 12;
 const MAX_E820_ENTRIES: usize = 128;
 const PMEM_BLOCK_SIZE: usize = crate::driver::base::block::block_device::LBA_SIZE;
+static PMEM_NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+static PMEM_REGISTERED_REGIONS: SpinLock<Vec<PmemRegisteredRegion>> = SpinLock::new(Vec::new());
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmemRegionSource {
+    Platform,
+    Virtio,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmemAccessMode {
+    ReadOnly,
+    ReadWrite,
+}
+
+pub trait PmemFlushOps: Send + Sync {
+    fn flush(&self) -> Result<(), SystemError>;
+}
+
+#[derive(Clone)]
+pub struct PmemRegion {
+    pub start: PhysAddr,
+    pub size: usize,
+    pub source: PmemRegionSource,
+    pub access: PmemAccessMode,
+    pub flush: Option<Arc<dyn PmemFlushOps>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PmemRegisteredRegion {
+    start: PhysAddr,
+    size: usize,
+}
+
+fn ranges_overlap(start_a: usize, size_a: usize, start_b: usize, size_b: usize) -> bool {
+    let Some(end_a) = start_a.checked_add(size_a) else {
+        return true;
+    };
+    let Some(end_b) = start_b.checked_add(size_b) else {
+        return true;
+    };
+    start_a < end_b && start_b < end_a
+}
+
+fn validate_pmem_region_against_memory(start: PhysAddr, size: usize) -> Result<(), SystemError> {
+    if size == 0 {
+        return Err(SystemError::EINVAL);
+    }
+
+    let start_data = start.data();
+    start_data.checked_add(size).ok_or(SystemError::EOVERFLOW)?;
+
+    for area in mem_block_manager().to_iter() {
+        if ranges_overlap(start_data, size, area.base.data(), area.size) {
+            return Err(SystemError::EBUSY);
+        }
+    }
+    Ok(())
+}
+
+fn reserve_pmem_region(start: PhysAddr, size: usize) -> Result<PmemRegisteredRegion, SystemError> {
+    validate_pmem_region_against_memory(start, size)?;
+
+    let start_data = start.data();
+    let mut regions = PMEM_REGISTERED_REGIONS.lock_irqsave();
+    for region in regions.iter() {
+        if ranges_overlap(start_data, size, region.start.data(), region.size) {
+            return Err(SystemError::EBUSY);
+        }
+    }
+
+    let reservation = PmemRegisteredRegion { start, size };
+    regions.push(reservation);
+    Ok(reservation)
+}
+
+fn release_pmem_region(reservation: PmemRegisteredRegion) {
+    let mut regions = PMEM_REGISTERED_REGIONS.lock_irqsave();
+    if let Some(idx) = regions.iter().position(|region| *region == reservation) {
+        regions.remove(idx);
+    }
+}
+
+pub fn register_pmem_region(mut region: PmemRegion) -> Result<Arc<PmemBlockDevice>, SystemError> {
+    region.size = trim_to_block_aligned(region.size);
+    let reservation = reserve_pmem_region(region.start, region.size)?;
+
+    let id = PMEM_NEXT_ID.fetch_add(1, Ordering::SeqCst);
+    let dev = PmemBlockDevice::new(region.clone(), id);
+    let dev_name = dev.dev_name().to_string();
+    let registered = dev.clone() as Arc<dyn BlockDevice>;
+    if let Err(e) = block_dev_manager().register(registered) {
+        release_pmem_region(reservation);
+        return Err(e);
+    }
+
+    log::info!(
+        "PMEM block device registered: /dev/{} source={:?} start={:?} size={:#x}",
+        dev_name,
+        region.source,
+        dev.region_start(),
+        dev.usable_size()
+    );
+
+    Ok(dev)
+}
 
 #[cfg(target_arch = "x86_64")]
 const NFIT_SUBTABLE_HEADER_SIZE: usize = 4;
@@ -308,17 +419,14 @@ fn pmem_init() -> Result<(), SystemError> {
         return Ok(());
     }
 
-    for (id, (start, size)) in regions.into_iter().enumerate() {
-        let dev = PmemBlockDevice::new(start, size, id);
-        let dev_name = dev.dev_name().to_string();
-        let registered = dev.clone() as Arc<dyn BlockDevice>;
-        block_dev_manager().register(registered)?;
-        log::info!(
-            "PMEM block device registered: /dev/{} start={:?} size={:#x}",
-            dev_name,
-            dev.region_start(),
-            dev.usable_size()
-        );
+    for (start, size) in regions {
+        register_pmem_region(PmemRegion {
+            start,
+            size,
+            source: PmemRegionSource::Platform,
+            access: PmemAccessMode::ReadWrite,
+            flush: None,
+        })?;
     }
 
     Ok(())

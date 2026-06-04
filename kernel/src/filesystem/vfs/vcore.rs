@@ -1,6 +1,6 @@
 use core::{hint::spin_loop, sync::atomic::Ordering};
 
-use alloc::{string::ToString, sync::Arc};
+use alloc::{string::ToString, sync::Arc, vec::Vec};
 use log::{error, info, warn};
 use system_error::SystemError;
 
@@ -11,15 +11,16 @@ use crate::{
     filesystem::{
         devfs::devfs_init,
         devpts::devpts_init,
-        ext4::filesystem::Ext4FileSystem,
+        ext4::filesystem::{Ext4DaxMode, Ext4ErrorsBehavior, Ext4FileSystem, Ext4MountOptions},
         fat::fs::FATFileSystem,
         procfs::procfs_init,
         sysfs::sysfs_init,
         vfs::{
-            permission::PermissionMask, AtomicInodeId, FileSystem, FileType, InodeFlags, InodeMode,
-            MountFS,
+            mount::MountFlags, permission::PermissionMask, AtomicInodeId, FileSystem, FileType,
+            InodeFlags, InodeMode, MountFS,
         },
     },
+    init::cmdline::kenrel_cmdline_param_manager,
     mm::truncate::truncate_inode_pages,
     process::{cred::CAPFlags, namespace::mnt::mnt_namespace_init, ProcessManager},
 };
@@ -40,6 +41,10 @@ const ROOTFS_TRY_LIST: [&str; 6] = [
     "/dev/sdio1",
 ];
 kernel_cmdline_param_kv!(ROOTFS_PATH_PARAM, root, "");
+kernel_cmdline_param_arg!(ROOTFS_RO_PARAM, ro, false, false);
+kernel_cmdline_param_arg!(ROOTFS_RW_PARAM, rw, false, false);
+kernel_cmdline_param_kv!(ROOTFS_TYPE_PARAM, rootfstype, "");
+kernel_cmdline_param_kv!(ROOTFS_FLAGS_PARAM, rootflags, "");
 
 /// @brief 原子地生成新的Inode号。
 /// 请注意，所有的inode号都需要通过该函数来生成.全局的inode号，除了以下两个特殊的以外，都是唯一的
@@ -79,7 +84,10 @@ pub fn vfs_init() -> Result<(), SystemError> {
 
 /// @brief 迁移伪文件系统的inode
 /// 请注意，为了避免删掉了伪文件系统内的信息，因此没有在原root inode那里调用unlink.
-fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemError> {
+fn migrate_virtual_filesystem(
+    new_fs: Arc<dyn FileSystem>,
+    root_mount_flags: MountFlags,
+) -> Result<(), SystemError> {
     info!("VFS: Migrating filesystems...");
 
     let current_mntns = ProcessManager::current_mntns();
@@ -91,7 +99,7 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
         None,
         old_mntfs.propagation(),
         Some(&current_mntns),
-        old_mntfs.mount_flags(),
+        root_mount_flags,
         old_mntfs.mount_source(),
     );
 
@@ -151,6 +159,154 @@ enum RootFsKind {
     Fat,
 }
 
+impl RootFsKind {
+    fn from_cmdline_name(name: &str) -> Option<Self> {
+        match name {
+            "ext4" => Some(Self::Ext4),
+            "fat" | "vfat" => Some(Self::Fat),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Ext4 => "ext4",
+            Self::Fat => "fat",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootMountMode {
+    ReadOnly,
+    ReadWrite,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RootMountOptions {
+    mount_flags: MountFlags,
+    ext4_options: Ext4MountOptions,
+}
+
+impl RootMountOptions {
+    fn has_ext4_specific_options(&self) -> bool {
+        self.ext4_options != Ext4MountOptions::default()
+    }
+}
+
+fn root_mount_mode() -> RootMountMode {
+    if ROOTFS_RO_PARAM.was_supplied() && ROOTFS_RW_PARAM.was_supplied() {
+        warn!("rootfs: both ro and rw are supplied; using the last pre-`--` option");
+    }
+
+    match kenrel_cmdline_param_manager()
+        .last_bare_option_before_init_args(&["ro", "rw"])
+        .as_deref()
+    {
+        Some("rw") => RootMountMode::ReadWrite,
+        _ => RootMountMode::ReadOnly,
+    }
+}
+
+fn rootfstype_candidates() -> Result<Vec<RootFsKind>, SystemError> {
+    let Some(rootfstype) = ROOTFS_TYPE_PARAM.value_str() else {
+        return Ok(Vec::new());
+    };
+    if rootfstype.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut result = Vec::new();
+    for name in rootfstype
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        let Some(kind) = RootFsKind::from_cmdline_name(name) else {
+            error!("rootfs: unsupported rootfstype '{}'", name);
+            return Err(SystemError::EINVAL);
+        };
+        result.push(kind);
+    }
+
+    if result.is_empty() {
+        return Err(SystemError::EINVAL);
+    }
+    Ok(result)
+}
+
+fn parse_ext4_dax_option(opt: &str) -> Result<Ext4DaxMode, SystemError> {
+    match opt {
+        "dax" | "dax=always" => Ok(Ext4DaxMode::Always),
+        "dax=inode" => Ok(Ext4DaxMode::Inode),
+        "dax=never" => Ok(Ext4DaxMode::Never),
+        _ => Err(SystemError::EINVAL),
+    }
+}
+
+fn parse_ext4_errors_option(value: &str) -> Result<Ext4ErrorsBehavior, SystemError> {
+    match value {
+        "continue" => Ok(Ext4ErrorsBehavior::Continue),
+        "remount-ro" => Ok(Ext4ErrorsBehavior::RemountRo),
+        "panic" => Ok(Ext4ErrorsBehavior::Panic),
+        _ => Err(SystemError::EINVAL),
+    }
+}
+
+fn parse_rootflags(mode: RootMountMode) -> Result<RootMountOptions, SystemError> {
+    let mut mount_flags = match mode {
+        RootMountMode::ReadOnly => MountFlags::RDONLY,
+        RootMountMode::ReadWrite => MountFlags::empty(),
+    };
+    let mut ext4_options = Ext4MountOptions::default();
+
+    let Some(rootflags) = ROOTFS_FLAGS_PARAM.value_str() else {
+        return Ok(RootMountOptions {
+            mount_flags,
+            ext4_options,
+        });
+    };
+    if rootflags.is_empty() {
+        return Ok(RootMountOptions {
+            mount_flags,
+            ext4_options,
+        });
+    }
+
+    for opt in rootflags
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        match opt {
+            "ro" => mount_flags.insert(MountFlags::RDONLY),
+            "rw" => mount_flags.remove(MountFlags::RDONLY),
+            "sync" => mount_flags.insert(MountFlags::SYNCHRONOUS),
+            "async" => mount_flags.remove(MountFlags::SYNCHRONOUS),
+            "lazytime" => mount_flags.insert(MountFlags::LAZYTIME),
+            "nolazytime" => mount_flags.remove(MountFlags::LAZYTIME),
+            "mand" => mount_flags.insert(MountFlags::MANDLOCK),
+            "nomand" => mount_flags.remove(MountFlags::MANDLOCK),
+            _ if opt == "dax" || opt.starts_with("dax=") => {
+                ext4_options.dax = Some(parse_ext4_dax_option(opt)?);
+            }
+            _ if opt.starts_with("errors=") => {
+                let value = opt.split_once('=').ok_or(SystemError::EINVAL)?.1;
+                ext4_options.errors = parse_ext4_errors_option(value)?;
+            }
+            _ => {
+                error!("rootfs: unsupported rootflags option '{}'", opt);
+                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            }
+        }
+    }
+
+    Ok(RootMountOptions {
+        mount_flags,
+        ext4_options,
+    })
+}
+
 fn probe_rootfs_kind(gendisk: &Arc<GenDisk>) -> Option<RootFsKind> {
     match Ext4FileSystem::probe(gendisk) {
         Ok(true) => return Some(RootFsKind::Ext4),
@@ -171,7 +327,10 @@ fn probe_rootfs_kind(gendisk: &Arc<GenDisk>) -> Option<RootFsKind> {
 pub fn mount_root_fs() -> Result<(), SystemError> {
     info!("Try to mount root fs...");
     block_dev_manager().print_gendisks();
-    let gendisk = if let Some(rootfs_dev_path) = ROOTFS_PATH_PARAM.value_str() {
+    let gendisk = if let Some(rootfs_dev_path) = ROOTFS_PATH_PARAM
+        .value_str()
+        .filter(|path| !path.is_empty())
+    {
         try_find_gendisk(rootfs_dev_path)
             .unwrap_or_else(|| panic!("Failed to find rootfs device {}", rootfs_dev_path))
     } else {
@@ -181,17 +340,55 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
             .ok_or(SystemError::ENODEV)?
     };
 
-    let kind = probe_rootfs_kind(&gendisk);
+    let mode = root_mount_mode();
+    let root_options = parse_rootflags(mode)?;
+    let configured_kinds = rootfstype_candidates()?;
+    let probed_kind = if configured_kinds.is_empty() {
+        probe_rootfs_kind(&gendisk)
+    } else {
+        None
+    };
 
-    let rootfs: Result<Arc<dyn FileSystem>, SystemError> = match kind {
-        Some(RootFsKind::Ext4) => Ext4FileSystem::from_gendisk(gendisk.clone()),
-        Some(RootFsKind::Fat) => Ok(FATFileSystem::new(gendisk.clone())?),
+    let init_rootfs = |kind: RootFsKind| -> Result<Arc<dyn FileSystem>, SystemError> {
+        match kind {
+            RootFsKind::Ext4 => Ext4FileSystem::from_gendisk_with_options(
+                gendisk.clone(),
+                root_options.ext4_options,
+            ),
+            RootFsKind::Fat => {
+                if root_options.has_ext4_specific_options() {
+                    error!("rootfs: ext4-specific rootflags cannot be used with FAT rootfs");
+                    return Err(SystemError::EINVAL);
+                }
+                Ok(FATFileSystem::new(gendisk.clone())?)
+            }
+        }
+    };
+
+    let rootfs: Result<Arc<dyn FileSystem>, SystemError> = match probed_kind {
+        Some(kind) => init_rootfs(kind),
         None => {
-            // 兜底：按常见顺序尝试初始化（ext4 -> fat），便于未来扩展 probe 或处理特殊镜像。
-            Ext4FileSystem::from_gendisk(gendisk.clone()).or_else(|_| {
-                let fat: Arc<FATFileSystem> = FATFileSystem::new(gendisk.clone())?;
-                Ok(fat)
-            })
+            let candidates = if configured_kinds.is_empty() {
+                Vec::from([RootFsKind::Ext4, RootFsKind::Fat])
+            } else {
+                configured_kinds
+            };
+
+            let mut last_err = SystemError::EINVAL;
+            let mut mounted = None;
+            for kind in candidates {
+                match init_rootfs(kind) {
+                    Ok(fs) => {
+                        mounted = Some(fs);
+                        break;
+                    }
+                    Err(e) => {
+                        warn!("rootfs: failed to initialize {}: {:?}", kind.name(), e);
+                        last_err = e;
+                    }
+                }
+            }
+            mounted.ok_or(last_err)
         }
     };
 
@@ -206,7 +403,7 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
     };
 
     let fs_name = rootfs.name().to_string();
-    let r = migrate_virtual_filesystem(rootfs.clone());
+    let r = migrate_virtual_filesystem(rootfs.clone(), root_options.mount_flags);
     if r.is_err() {
         error!(
             "Failed to migrate virtual filesystem to rootfs ({}).",
@@ -225,7 +422,7 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
 pub fn change_root_fs() -> Result<(), SystemError> {
     info!("Try to change root fs to initramfs...");
     let initramfs = crate::init::initram::INIT_ROOT_INODE().fs();
-    let r = migrate_virtual_filesystem(initramfs);
+    let r = migrate_virtual_filesystem(initramfs, MountFlags::empty());
 
     if r.is_err() {
         error!("Failed to migrate virtual filesystem to initramfs!");

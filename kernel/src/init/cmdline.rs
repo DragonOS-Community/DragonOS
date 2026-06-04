@@ -3,7 +3,7 @@ use core::{
     sync::atomic::{fence, Ordering},
 };
 
-use alloc::{ffi::CString, vec::Vec};
+use alloc::{ffi::CString, string::String, vec::Vec};
 
 use crate::libs::spinlock::SpinLock;
 
@@ -77,6 +77,7 @@ impl KernelCmdlineParamBuilder {
                 value: [0; KernelCmdlineEarlyKV::VALUE_MAX_LEN],
                 index: 0,
                 initialized: false,
+                supplied: false,
                 default: self.default_str,
             })
         } else {
@@ -90,6 +91,7 @@ impl KernelCmdlineParamBuilder {
                 name: self.name,
                 value: self.default_bool,
                 initialized: false,
+                supplied: false,
                 inv: self.inv,
                 default: self.default_bool,
             })),
@@ -97,6 +99,7 @@ impl KernelCmdlineParamBuilder {
                 name: self.name,
                 value: None,
                 initialized: false,
+                supplied: false,
                 default: self.default_str,
             })),
             _ => None,
@@ -153,6 +156,14 @@ impl KernelCmdlineParameter {
         matches!(self, KernelCmdlineParameter::EarlyKV(_))
     }
 
+    pub fn was_supplied(&self) -> bool {
+        match self {
+            KernelCmdlineParameter::Arg(v) => v.was_supplied(),
+            KernelCmdlineParameter::KV(v) => v.supplied,
+            KernelCmdlineParameter::EarlyKV(v) => v.supplied,
+        }
+    }
+
     /// 强行获取可变引用
     ///
     /// # Safety
@@ -170,6 +181,7 @@ pub struct KernelCmdlineArg {
     name: &'static str,
     value: bool,
     initialized: bool,
+    supplied: bool,
     /// 是否反转
     inv: bool,
     default: bool,
@@ -179,12 +191,17 @@ impl KernelCmdlineArg {
     pub fn value(&self) -> bool {
         volatile_read!(self.value)
     }
+
+    pub fn was_supplied(&self) -> bool {
+        volatile_read!(self.supplied)
+    }
 }
 
 pub struct KernelCmdlineKV {
     pub name: &'static str,
     pub value: Option<CString>,
     pub initialized: bool,
+    pub supplied: bool,
     pub default: &'static str,
 }
 
@@ -194,6 +211,7 @@ pub struct KernelCmdlineEarlyKV {
     pub value: [u8; Self::VALUE_MAX_LEN],
     pub index: usize,
     pub initialized: bool,
+    pub supplied: bool,
     pub default: &'static str,
 }
 
@@ -277,6 +295,7 @@ impl KernelCmdlineManager {
                             p.index = len;
                         }
                         p.initialized = true;
+                        p.supplied = true;
                     }
                     _ => unreachable!(),
                 }
@@ -345,13 +364,18 @@ impl KernelCmdlineManager {
                 let param = unsafe { param.force_mut() };
                 match param {
                     KernelCmdlineParameter::KV(p) => {
+                        let Some(value) = value else {
+                            log::warn!("cmdline: key-value parameter {} has no value", p.name);
+                            continue;
+                        };
                         if p.value.is_some() {
                             log::warn!("cmdline: parameter {} is set twice", p.name);
                             continue;
                         }
 
-                        p.value = Some(CString::new(value.unwrap()).unwrap());
+                        p.value = Some(CString::new(value).unwrap());
                         p.initialized = true;
+                        p.supplied = true;
                     }
                     _ => unreachable!(),
                 }
@@ -366,6 +390,7 @@ impl KernelCmdlineManager {
                         }
                         p.value = !p.inv;
                         p.initialized = true;
+                        p.supplied = true;
                     }
                     _ => unreachable!(),
                 }
@@ -410,6 +435,26 @@ impl KernelCmdlineManager {
             }
             fence(Ordering::SeqCst);
         });
+    }
+
+    pub fn last_bare_option_before_init_args(&self, names: &[&str]) -> Option<String> {
+        let boot_params = boot_params().read();
+        let mut last = None;
+
+        for argument in self.split_args(boot_params.boot_cmdline_str()) {
+            if argument == "--" {
+                break;
+            }
+
+            let Some((node, option, value)) = self.split_arg(argument) else {
+                continue;
+            };
+            if node.is_none() && value.is_none() && names.iter().any(|name| *name == option) {
+                last = Some(String::from(option));
+            }
+        }
+
+        last
     }
 
     fn find_param(

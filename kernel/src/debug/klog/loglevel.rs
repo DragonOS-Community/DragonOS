@@ -169,6 +169,7 @@ static LOGLEVEL_PARAM: KernelCmdlineParameter = KernelCmdlineParameter::KV(Kerne
     name: "loglevel",
     value: None,
     initialized: false,
+    supplied: false,
     default: "7", // 默认DEBUG级别
 });
 

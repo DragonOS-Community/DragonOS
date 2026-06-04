@@ -3,11 +3,14 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::{any::Any, fmt::Debug};
+use core::{
+    any::Any,
+    fmt::Debug,
+    sync::atomic::{compiler_fence, Ordering},
+};
 use system_error::SystemError;
 
 use crate::{
-    arch::MMArch,
     driver::base::{
         block::{
             block_device::{BlockDevice, BlockId, GeneralBlockRange, LBA_SIZE},
@@ -36,13 +39,13 @@ use crate::{
         rwsem::{RwSemReadGuard, RwSemWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
-    mm::{
-        mmio_buddy::{mmio_pool, MMIOSpaceGuard},
-        MemoryManagementArch, PhysAddr, VirtAddr,
-    },
+    mm::{mmio_buddy::mmio_pool, PhysAddr},
 };
 
+use super::{PmemAccessMode, PmemFlushOps, PmemRegion};
+
 const PMEM_BASENAME: &str = "pmem";
+const PMEM_WINDOW_CHUNK_SIZE: usize = 1024 * 1024;
 
 #[derive(Debug)]
 struct InnerPmemBlockDevice {
@@ -61,8 +64,8 @@ pub struct PmemBlockDevice {
     metadata: Metadata,
     region_start: PhysAddr,
     usable_size: usize,
-    mapped_start: Option<VirtAddr>,
-    _mmio_guard: Option<MMIOSpaceGuard>,
+    access: PmemAccessMode,
+    flush: Option<Arc<dyn PmemFlushOps>>,
 }
 
 impl Debug for PmemBlockDevice {
@@ -71,19 +74,15 @@ impl Debug for PmemBlockDevice {
             .field("devname", &self.blkdev_meta.devname)
             .field("region_start", &self.region_start)
             .field("usable_size", &self.usable_size)
-            .field("mapped_start", &self.mapped_start)
+            .field("access", &self.access)
             .finish()
     }
 }
 
 impl PmemBlockDevice {
-    pub fn new(region_start: PhysAddr, region_size: usize, id: usize) -> Arc<Self> {
-        let usable_size = region_size / LBA_SIZE * LBA_SIZE;
+    pub(super) fn new(region: PmemRegion, id: usize) -> Arc<Self> {
+        let usable_size = region.size / LBA_SIZE * LBA_SIZE;
         let devname = DevName::new(format!("{PMEM_BASENAME}{id}"), id);
-        let (mmio_guard, mapped_start) = match Self::try_map_region(region_start, usable_size) {
-            Ok((guard, start)) => (Some(guard), Some(start)),
-            Err(_) => (None, None),
-        };
 
         Arc::new_cyclic(|self_ref| {
             let blkdev_meta = BlockDevMeta::new(devname, Major::PMEM_BLK_MAJOR);
@@ -117,33 +116,12 @@ impl PmemBlockDevice {
                     gid: 0,
                     raw_dev,
                 },
-                region_start,
+                region_start: region.start,
                 usable_size,
-                mapped_start,
-                _mmio_guard: mmio_guard,
+                access: region.access,
+                flush: region.flush,
             }
         })
-    }
-
-    fn try_map_region(
-        region_start: PhysAddr,
-        usable_size: usize,
-    ) -> Result<(MMIOSpaceGuard, VirtAddr), SystemError> {
-        if usable_size == 0 {
-            return Err(SystemError::EINVAL);
-        }
-
-        let paddr_base = page_align_down(region_start.data());
-        let offset = region_start.data() - paddr_base;
-        let map_size = page_align_up(
-            usable_size
-                .checked_add(offset)
-                .ok_or(SystemError::EOVERFLOW)?,
-        );
-
-        let mmio_guard = mmio_pool().create_mmio(map_size)?;
-        let mapped_start = unsafe { mmio_guard.map_any_phys(region_start, usable_size)? };
-        Ok((mmio_guard, mapped_start))
     }
 
     pub fn region_start(&self) -> PhysAddr {
@@ -156,6 +134,79 @@ impl PmemBlockDevice {
 
     fn inner(&self) -> SpinLockGuard<'_, InnerPmemBlockDevice> {
         self.inner.lock_irqsave()
+    }
+
+    fn checked_io_range(&self, offset: usize, len: usize) -> Result<(), SystemError> {
+        let end = offset.checked_add(len).ok_or(SystemError::EOVERFLOW)?;
+        if end > self.usable_size {
+            return Err(SystemError::ENOSPC);
+        }
+        Ok(())
+    }
+
+    fn copy_from_pmem(&self, offset: usize, buf: &mut [u8]) -> Result<(), SystemError> {
+        self.copy_pmem_window(offset, buf, true)
+    }
+
+    fn copy_to_pmem(&self, offset: usize, buf: &[u8]) -> Result<(), SystemError> {
+        let mut owned = buf;
+        let mut copied = 0;
+        while !owned.is_empty() {
+            let phys = self.region_start.add(offset + copied);
+            let page_base = page_align_down(phys.data());
+            let page_offset = phys.data() - page_base;
+            let chunk_len = owned.len().min(PMEM_WINDOW_CHUNK_SIZE - page_offset);
+            let map_size = page_align_up(page_offset + chunk_len);
+            let guard = mmio_pool().create_mmio(map_size)?;
+            let mapped = unsafe { guard.map_any_phys(PhysAddr::new(page_base), map_size)? };
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    owned.as_ptr(),
+                    (mapped.data() + page_offset) as *mut u8,
+                    chunk_len,
+                );
+            }
+            compiler_fence(Ordering::SeqCst);
+            owned = &owned[chunk_len..];
+            copied += chunk_len;
+        }
+        Ok(())
+    }
+
+    fn copy_pmem_window(
+        &self,
+        offset: usize,
+        buf: &mut [u8],
+        from_pmem: bool,
+    ) -> Result<(), SystemError> {
+        let mut copied = 0;
+        while copied < buf.len() {
+            let phys = self.region_start.add(offset + copied);
+            let page_base = page_align_down(phys.data());
+            let page_offset = phys.data() - page_base;
+            let chunk_len = (buf.len() - copied).min(PMEM_WINDOW_CHUNK_SIZE - page_offset);
+            let map_size = page_align_up(page_offset + chunk_len);
+            let guard = mmio_pool().create_mmio(map_size)?;
+            let mapped = unsafe { guard.map_any_phys(PhysAddr::new(page_base), map_size)? };
+            unsafe {
+                if from_pmem {
+                    core::ptr::copy_nonoverlapping(
+                        (mapped.data() + page_offset) as *const u8,
+                        buf[copied..].as_mut_ptr(),
+                        chunk_len,
+                    );
+                } else {
+                    core::ptr::copy_nonoverlapping(
+                        buf[copied..].as_ptr(),
+                        (mapped.data() + page_offset) as *mut u8,
+                        chunk_len,
+                    );
+                    compiler_fence(Ordering::SeqCst);
+                }
+            }
+            copied += chunk_len;
+        }
+        Ok(())
     }
 }
 
@@ -275,35 +326,41 @@ impl BlockDevice for PmemBlockDevice {
             return Err(SystemError::ENOSPC);
         }
 
-        let src = if let Some(mapped_start) = self.mapped_start {
-            let src_vaddr = VirtAddr::new(
-                mapped_start
-                    .data()
-                    .checked_add(offset)
-                    .ok_or(SystemError::EOVERFLOW)?,
-            );
-            src_vaddr
-        } else {
-            let paddr = self.region_start.add(offset);
-            unsafe { MMArch::phys_2_virt(paddr) }.ok_or(SystemError::EFAULT)?
-        };
-        unsafe {
-            core::ptr::copy_nonoverlapping(src.data() as *const u8, buf.as_mut_ptr(), len);
-        }
+        self.copy_from_pmem(offset, &mut buf[..len])?;
 
         Ok(len)
     }
 
     fn write_at_sync(
         &self,
-        _lba_id_start: BlockId,
-        _count: usize,
-        _buf: &[u8],
+        lba_id_start: BlockId,
+        count: usize,
+        buf: &[u8],
     ) -> Result<usize, SystemError> {
-        Err(SystemError::EROFS)
+        if count == 0 {
+            return Ok(0);
+        }
+        if self.access == PmemAccessMode::ReadOnly {
+            return Err(SystemError::EROFS);
+        }
+
+        let offset = lba_id_start
+            .checked_mul(LBA_SIZE)
+            .ok_or(SystemError::EOVERFLOW)?;
+        let len = count.checked_mul(LBA_SIZE).ok_or(SystemError::EOVERFLOW)?;
+
+        if len > buf.len() {
+            return Err(SystemError::EINVAL);
+        }
+        self.checked_io_range(offset, len)?;
+        self.copy_to_pmem(offset, &buf[..len])?;
+        Ok(len)
     }
 
     fn sync(&self) -> Result<(), SystemError> {
+        if let Some(flush) = &self.flush {
+            flush.flush()?;
+        }
         Ok(())
     }
 

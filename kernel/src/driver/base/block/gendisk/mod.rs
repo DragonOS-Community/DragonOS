@@ -257,14 +257,13 @@ impl IndexNode for GenDisk {
 
     fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
         let mut meta = self.metadata.clone();
-        let bdev = self.block_device();
-        let range = bdev.disk_range();
-        let blocks = range.lba_end.saturating_sub(range.lba_start);
+        let blocks = self.range.lba_end.saturating_sub(self.range.lba_start);
         let size_in_bytes = blocks.saturating_mul(LBA_SIZE);
 
         meta.size = i64::try_from(size_in_bytes).unwrap_or(i64::MAX);
         meta.blocks = blocks;
         meta.blk_size = LBA_SIZE;
+        meta.raw_dev = self.device_num;
         Ok(meta)
     }
 

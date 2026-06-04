@@ -66,58 +66,77 @@ impl BlockDevManager {
 
     /// 注册磁盘设备
     pub fn register(&self, dev: Arc<dyn BlockDevice>) -> Result<(), SystemError> {
-        let mut inner = self.inner();
         let dev_name = dev.dev_name();
-        if inner.disks.contains_key(dev_name) {
-            return Err(SystemError::EEXIST);
+        {
+            let inner = self.inner();
+            if inner.disks.contains_key(dev_name) {
+                return Err(SystemError::EEXIST);
+            }
         }
-        inner.disks.insert(dev_name.clone(), dev.clone());
 
-        // 检测分区表，并创建gendisk
-        let res = self.check_partitions(&dev);
-        if res.is_err() {
+        let gendisks = self.prepare_gendisks(&dev)?;
+
+        {
+            let mut inner = self.inner();
+            if inner.disks.contains_key(dev_name) {
+                return Err(SystemError::EEXIST);
+            }
+            inner.disks.insert(dev_name.clone(), dev.clone());
+        }
+
+        if let Err(e) = self.publish_gendisks(&dev, &gendisks) {
+            let mut inner = self.inner();
             inner.disks.remove(dev_name);
-        };
-        res?;
+            drop(inner);
+            dev.blkdev_meta().inner().gendisks.clear();
+            return Err(e);
+        }
+
         Ok(())
     }
 
-    /// 检测分区表，并创建gendisk
-    fn check_partitions(&self, dev: &Arc<dyn BlockDevice>) -> Result<(), SystemError> {
-        if self.try_register_disk_by_mbr(dev).is_ok() {
-            return Ok(());
-        }
-
-        // use entire disk as a gendisk
-        self.register_entire_disk_as_gendisk(dev)
-    }
-
-    fn try_register_disk_by_mbr(&self, dev: &Arc<dyn BlockDevice>) -> Result<(), SystemError> {
-        let mbr = MbrDiskPartionTable::from_disk(dev.clone())?;
-        let piter = mbr.partitions_raw();
-        let mut idx;
-        for p in piter {
-            idx = dev.blkdev_meta().inner().gendisks.alloc_idx();
-            self.register_gendisk_with_range(dev, p.try_into()?, idx)?;
-        }
-        Ok(())
-    }
-
-    /// 将整个磁盘注册为gendisk
-    fn register_entire_disk_as_gendisk(
+    /// Detect partitions without holding the global block manager lock.
+    fn prepare_gendisks(
         &self,
         dev: &Arc<dyn BlockDevice>,
-    ) -> Result<(), SystemError> {
-        let range = dev.disk_range();
-        self.register_gendisk_with_range(dev, range, GenDisk::ENTIRE_DISK_IDX)
+    ) -> Result<Vec<Arc<GenDisk>>, SystemError> {
+        if let Ok(gendisks) = self.prepare_gendisks_by_mbr(dev) {
+            if !gendisks.is_empty() {
+                return Ok(gendisks);
+            }
+        }
+
+        let gendisks =
+            vec![self.create_gendisk_with_range(dev, dev.disk_range(), GenDisk::ENTIRE_DISK_IDX)];
+        Ok(gendisks)
     }
 
-    fn register_gendisk_with_range(
+    fn prepare_gendisks_by_mbr(
+        &self,
+        dev: &Arc<dyn BlockDevice>,
+    ) -> Result<Vec<Arc<GenDisk>>, SystemError> {
+        let mbr = MbrDiskPartionTable::from_disk(dev.clone())?;
+        let mut gendisks = Vec::new();
+        for p in mbr.partitions_raw() {
+            let idx = dev.blkdev_meta().inner().gendisks.alloc_idx();
+            let range = p.try_into()?;
+            if gendisks
+                .iter()
+                .any(|gendisk: &Arc<GenDisk>| gendisk.range().intersects_with(&range).is_some())
+            {
+                return Err(SystemError::EEXIST);
+            }
+            gendisks.push(self.create_gendisk_with_range(dev, range, idx));
+        }
+        Ok(gendisks)
+    }
+
+    fn create_gendisk_with_range(
         &self,
         dev: &Arc<dyn BlockDevice>,
         range: GeneralBlockRange,
         idx: u32,
-    ) -> Result<(), SystemError> {
+    ) -> Arc<GenDisk> {
         let weak_dev = Arc::downgrade(dev);
 
         // 这里先拿到硬盘的设备名，然后在根据idx来生成gendisk的名字
@@ -130,32 +149,56 @@ impl BlockDevManager {
             id => (Some(id), DName::from(format!("{}{}", dev_name.name(), idx))),
         };
 
-        let gendisk = GenDisk::new(weak_dev, range, idx, dev_name);
-        // log::info!("Registering gendisk");
-        self.register_gendisk(dev, gendisk)
+        GenDisk::new(weak_dev, range, idx, dev_name)
     }
 
-    fn register_gendisk(
+    fn publish_gendisks(
+        &self,
+        dev: &Arc<dyn BlockDevice>,
+        gendisks: &[Arc<GenDisk>],
+    ) -> Result<(), SystemError> {
+        let mut registered: Vec<Arc<GenDisk>> = Vec::new();
+        for gendisk in gendisks {
+            if let Err(e) = self.publish_gendisk(dev, gendisk.clone()) {
+                for rg in registered.into_iter() {
+                    if let Ok(name) = rg.dname() {
+                        let _ = devfs_unregister(name.as_ref(), rg.clone());
+                    }
+                    dev.blkdev_meta().inner().gendisks.remove(&rg.idx());
+                }
+                return Err(e);
+            }
+            registered.push(gendisk.clone());
+        }
+        Ok(())
+    }
+
+    fn publish_gendisk(
         &self,
         dev: &Arc<dyn BlockDevice>,
         gendisk: Arc<GenDisk>,
     ) -> Result<(), SystemError> {
         let blk_meta = dev.blkdev_meta();
         let idx = gendisk.idx();
-        let mut meta_inner = blk_meta.inner();
-        // 检查是否重复
-        if meta_inner.gendisks.intersects(gendisk.range()) {
-            return Err(SystemError::EEXIST);
+        {
+            let mut meta_inner = blk_meta.inner();
+            // 检查是否重复
+            if meta_inner.gendisks.intersects(gendisk.range()) {
+                return Err(SystemError::EEXIST);
+            }
+
+            meta_inner.gendisks.insert(idx, gendisk.clone());
         }
 
-        meta_inner.gendisks.insert(idx, gendisk.clone());
-        dev.callback_gendisk_registered(&gendisk).inspect_err(|_| {
-            meta_inner.gendisks.remove(&idx);
-        })?;
+        if let Err(e) = dev.callback_gendisk_registered(&gendisk) {
+            blk_meta.inner().gendisks.remove(&idx);
+            return Err(e);
+        }
 
         // 注册到devfs
         let dname = gendisk.dname()?;
         devfs_register(dname.as_ref(), gendisk.clone()).map_err(|e| {
+            blk_meta.inner().gendisks.remove(&idx);
             log::error!(
                 "Failed to register gendisk {:?} to devfs: {:?}",
                 dname.as_ref(),

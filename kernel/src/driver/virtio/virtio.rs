@@ -13,6 +13,7 @@ use crate::driver::pci::pci::{
 };
 use crate::driver::pci::subsys::pci_bus;
 use crate::driver::virtio::transport::VirtIOTransport;
+use crate::driver::virtio::virtio_pmem::virtio_pmem;
 use crate::driver::virtio::virtio_vsock::virtio_vsock;
 use crate::init::initcall::INITCALL_DEVICE;
 
@@ -79,6 +80,7 @@ pub(super) fn virtio_device_init(
         }
         DeviceType::Network => virtio_net(transport, dev_id, dev_parent),
         DeviceType::FileSystem => virtio_fs(transport, dev_id, dev_parent),
+        DeviceType::Pmem => virtio_pmem(transport, dev_id, dev_parent),
         DeviceType::Socket => virtio_vsock(transport, dev_id, dev_parent),
         t => {
             warn!("Unrecognized virtio device: {:?}", t);

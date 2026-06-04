@@ -546,11 +546,11 @@ impl KObject for VirtIOPmemDevice {
         self.inner().kobject_common.parent = parent;
     }
 
-    fn kset(&self) -> Option<Arc<KSet>> {
+    fn kset(&self) -> Option<Arc<dyn KSet>> {
         self.inner().kobject_common.kset.clone()
     }
 
-    fn set_kset(&self, kset: Option<Arc<KSet>>) {
+    fn set_kset(&self, kset: Option<Arc<dyn KSet>>) {
         self.inner().kobject_common.kset = kset;
     }
 
@@ -697,11 +697,11 @@ impl KObject for VirtIOPmemDriver {
         self.inner().kobj_common.parent = parent;
     }
 
-    fn kset(&self) -> Option<Arc<KSet>> {
+    fn kset(&self) -> Option<Arc<dyn KSet>> {
         self.inner().kobj_common.kset.clone()
     }
 
-    fn set_kset(&self, kset: Option<Arc<KSet>>) {
+    fn set_kset(&self, kset: Option<Arc<dyn KSet>>) {
         self.inner().kobj_common.kset = kset;
     }
 

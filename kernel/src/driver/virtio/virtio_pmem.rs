@@ -234,6 +234,9 @@ impl VirtIOPmemDevice {
 
     fn flush(&self) -> Result<(), SystemError> {
         let _guard = self.flush_mutex.lock();
+
+        self.wait_for_pending_flush()?;
+
         let mut request = FlushRequest {
             token: 0,
             req: Box::new(VirtioPmemReq {
@@ -280,31 +283,43 @@ impl VirtIOPmemDevice {
             }
         }
 
+        self.wait_for_pending_flush()
+    }
+
+    fn wait_for_pending_flush(&self) -> Result<(), SystemError> {
         for _ in 0..VIRTIO_PMEM_FLUSH_POLL_RETRIES {
             {
                 let mut inner = self.inner();
-                self.complete_flush_locked(&mut inner);
+                if let Some(result) = self.take_completed_flush_locked(&mut inner) {
+                    return result;
+                }
                 if inner.state >= VirtIOPmemState::Quiescing {
-                    inner.pending_flush.take();
                     return Err(SystemError::EIO);
                 }
-                let done = inner
-                    .pending_flush
-                    .as_ref()
-                    .is_some_and(|request| request.done);
-                if done {
-                    return inner
-                        .pending_flush
-                        .take()
-                        .map(|request| request.result)
-                        .unwrap_or(Err(SystemError::EIO));
+                if inner.pending_flush.is_none() {
+                    return Ok(());
                 }
             }
             nanosleep(PosixTimeSpec::new(0, VIRTIO_PMEM_FLUSH_POLL_INTERVAL_NS))?;
         }
 
-        self.inner().pending_flush.take();
-        Err(SystemError::EIO)
+        warn!("VirtIOPmem: flush timed out while descriptor is still owned by the device");
+        Err(SystemError::ETIMEDOUT)
+    }
+
+    fn take_completed_flush_locked(
+        &self,
+        inner: &mut InnerVirtIOPmemDevice,
+    ) -> Option<Result<(), SystemError>> {
+        self.complete_flush_locked(inner);
+        if inner
+            .pending_flush
+            .as_ref()
+            .is_some_and(|request| request.done)
+        {
+            return Some(inner.pending_flush.take().unwrap().result);
+        }
+        None
     }
 
     fn complete_flush_locked(&self, inner: &mut InnerVirtIOPmemDevice) -> bool {
@@ -361,12 +376,13 @@ impl VirtIOPmemDevice {
             let _ = block_dev_manager().unregister(&block_device);
         }
 
+        let _guard = self.flush_mutex.lock();
         let mut inner = self.inner();
-        inner.pending_flush = None;
         if let Some(transport) = inner.transport.as_mut() {
-            transport.queue_unset(VIRTIO_PMEM_FLUSH_QUEUE);
             transport.set_status(DeviceStatus::empty());
+            transport.queue_unset(VIRTIO_PMEM_FLUSH_QUEUE);
         }
+        inner.pending_flush = None;
         inner.state = VirtIOPmemState::Dead;
         Ok(())
     }

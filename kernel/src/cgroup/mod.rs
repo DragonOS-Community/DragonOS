@@ -1,5 +1,8 @@
+pub mod controllers;
 pub mod core;
 
+#[allow(unused_imports)]
+pub use controllers::{CgroupCpuState, CgroupFreezerState, CgroupMemoryState};
 #[allow(unused_imports)]
 pub use core::{
     cgroup_accounting_lock, cgroup_can_fork_in, cgroup_common_ancestor, cgroup_migrate_vet_dst,

@@ -34,8 +34,8 @@ use linkme::distributed_slice;
 
 const CGROUP2_MAX_NAMELEN: usize = 255;
 const CGROUP2_BLOCK_SIZE: u64 = 512;
-const AVAILABLE_CONTROLLERS: [&str; 1] = ["pids"];
-const DOMAIN_CONTROLLERS: [&str; 0] = [];
+const AVAILABLE_CONTROLLERS: [&str; 3] = ["cpu", "memory", "pids"];
+const DOMAIN_CONTROLLERS: [&str; 1] = ["memory"];
 
 #[derive(Debug)]
 pub struct Cgroup2Fs {
@@ -90,9 +90,241 @@ enum CgroupCoreFile {
     SubtreeControl,
     Events,
     Type,
+    Freeze,
+    CpuStat,
+    CpuWeight,
+    CpuMax,
+    MemoryCurrent,
+    MemoryPeak,
+    MemoryMin,
+    MemoryLow,
+    MemoryHigh,
+    MemoryMax,
+    MemoryEvents,
+    MemoryStat,
+    MemorySwapCurrent,
+    MemorySwapPeak,
+    MemorySwapHigh,
+    MemorySwapMax,
+    MemorySwapEvents,
     PidsCurrent,
     PidsMax,
     PidsEvents,
+}
+
+#[derive(Clone, Copy)]
+struct CgroupFileSpec {
+    name: &'static str,
+    ty: CgroupCoreFile,
+    init: &'static [u8],
+    mode: u16,
+}
+
+const BASE_FILE_SPECS: [CgroupFileSpec; 3] = [
+    CgroupFileSpec {
+        name: "cgroup.procs",
+        ty: CgroupCoreFile::Procs,
+        init: b"",
+        mode: 0o644,
+    },
+    CgroupFileSpec {
+        name: "cgroup.controllers",
+        ty: CgroupCoreFile::Controllers,
+        init: b"\n",
+        mode: 0o444,
+    },
+    CgroupFileSpec {
+        name: "cgroup.subtree_control",
+        ty: CgroupCoreFile::SubtreeControl,
+        init: b"\n",
+        mode: 0o644,
+    },
+];
+
+const NON_ROOT_CORE_FILE_SPECS: [CgroupFileSpec; 3] = [
+    CgroupFileSpec {
+        name: "cgroup.events",
+        ty: CgroupCoreFile::Events,
+        init: b"",
+        mode: 0o444,
+    },
+    CgroupFileSpec {
+        name: "cgroup.type",
+        ty: CgroupCoreFile::Type,
+        init: b"domain\n",
+        mode: 0o444,
+    },
+    CgroupFileSpec {
+        name: "cgroup.freeze",
+        ty: CgroupCoreFile::Freeze,
+        init: b"0\n",
+        mode: 0o644,
+    },
+];
+
+const ROOT_CONTROLLER_FILE_SPECS: [CgroupFileSpec; 2] = [
+    CgroupFileSpec {
+        name: "cpu.stat",
+        ty: CgroupCoreFile::CpuStat,
+        init: b"",
+        mode: 0o444,
+    },
+    CgroupFileSpec {
+        name: "memory.stat",
+        ty: CgroupCoreFile::MemoryStat,
+        init: b"",
+        mode: 0o444,
+    },
+];
+
+const CPU_FILE_SPECS: [CgroupFileSpec; 3] = [
+    CgroupFileSpec {
+        name: "cpu.stat",
+        ty: CgroupCoreFile::CpuStat,
+        init: b"",
+        mode: 0o444,
+    },
+    CgroupFileSpec {
+        name: "cpu.weight",
+        ty: CgroupCoreFile::CpuWeight,
+        init: b"100\n",
+        mode: 0o644,
+    },
+    CgroupFileSpec {
+        name: "cpu.max",
+        ty: CgroupCoreFile::CpuMax,
+        init: b"max 100000\n",
+        mode: 0o644,
+    },
+];
+
+const MEMORY_FILE_SPECS: [CgroupFileSpec; 13] = [
+    CgroupFileSpec {
+        name: "memory.current",
+        ty: CgroupCoreFile::MemoryCurrent,
+        init: b"0\n",
+        mode: 0o444,
+    },
+    CgroupFileSpec {
+        name: "memory.peak",
+        ty: CgroupCoreFile::MemoryPeak,
+        init: b"0\n",
+        mode: 0o444,
+    },
+    CgroupFileSpec {
+        name: "memory.min",
+        ty: CgroupCoreFile::MemoryMin,
+        init: b"0\n",
+        mode: 0o644,
+    },
+    CgroupFileSpec {
+        name: "memory.low",
+        ty: CgroupCoreFile::MemoryLow,
+        init: b"0\n",
+        mode: 0o644,
+    },
+    CgroupFileSpec {
+        name: "memory.high",
+        ty: CgroupCoreFile::MemoryHigh,
+        init: b"max\n",
+        mode: 0o644,
+    },
+    CgroupFileSpec {
+        name: "memory.max",
+        ty: CgroupCoreFile::MemoryMax,
+        init: b"max\n",
+        mode: 0o644,
+    },
+    CgroupFileSpec {
+        name: "memory.events",
+        ty: CgroupCoreFile::MemoryEvents,
+        init: b"",
+        mode: 0o444,
+    },
+    CgroupFileSpec {
+        name: "memory.stat",
+        ty: CgroupCoreFile::MemoryStat,
+        init: b"",
+        mode: 0o444,
+    },
+    CgroupFileSpec {
+        name: "memory.swap.current",
+        ty: CgroupCoreFile::MemorySwapCurrent,
+        init: b"0\n",
+        mode: 0o444,
+    },
+    CgroupFileSpec {
+        name: "memory.swap.peak",
+        ty: CgroupCoreFile::MemorySwapPeak,
+        init: b"0\n",
+        mode: 0o444,
+    },
+    CgroupFileSpec {
+        name: "memory.swap.high",
+        ty: CgroupCoreFile::MemorySwapHigh,
+        init: b"max\n",
+        mode: 0o644,
+    },
+    CgroupFileSpec {
+        name: "memory.swap.max",
+        ty: CgroupCoreFile::MemorySwapMax,
+        init: b"max\n",
+        mode: 0o644,
+    },
+    CgroupFileSpec {
+        name: "memory.swap.events",
+        ty: CgroupCoreFile::MemorySwapEvents,
+        init: b"",
+        mode: 0o444,
+    },
+];
+
+const PIDS_FILE_SPECS: [CgroupFileSpec; 3] = [
+    CgroupFileSpec {
+        name: "pids.current",
+        ty: CgroupCoreFile::PidsCurrent,
+        init: b"0\n",
+        mode: 0o444,
+    },
+    CgroupFileSpec {
+        name: "pids.max",
+        ty: CgroupCoreFile::PidsMax,
+        init: b"max\n",
+        mode: 0o644,
+    },
+    CgroupFileSpec {
+        name: "pids.events",
+        ty: CgroupCoreFile::PidsEvents,
+        init: b"max 0\n",
+        mode: 0o444,
+    },
+];
+
+impl CgroupCoreFile {
+    fn controller(self) -> Option<&'static str> {
+        match self {
+            CgroupCoreFile::CpuStat | CgroupCoreFile::CpuWeight | CgroupCoreFile::CpuMax => {
+                Some("cpu")
+            }
+            CgroupCoreFile::MemoryCurrent
+            | CgroupCoreFile::MemoryPeak
+            | CgroupCoreFile::MemoryMin
+            | CgroupCoreFile::MemoryLow
+            | CgroupCoreFile::MemoryHigh
+            | CgroupCoreFile::MemoryMax
+            | CgroupCoreFile::MemoryEvents
+            | CgroupCoreFile::MemoryStat
+            | CgroupCoreFile::MemorySwapCurrent
+            | CgroupCoreFile::MemorySwapPeak
+            | CgroupCoreFile::MemorySwapHigh
+            | CgroupCoreFile::MemorySwapMax
+            | CgroupCoreFile::MemorySwapEvents => Some("memory"),
+            CgroupCoreFile::PidsCurrent | CgroupCoreFile::PidsMax | CgroupCoreFile::PidsEvents => {
+                Some("pids")
+            }
+            _ => None,
+        }
+    }
 }
 
 impl Cgroup2Fs {
@@ -272,6 +504,31 @@ impl Cgroup2Inode {
             .collect()
     }
 
+    fn is_known_controller(name: &str) -> bool {
+        AVAILABLE_CONTROLLERS.contains(&name)
+    }
+
+    fn controller_specs(name: &str) -> &'static [CgroupFileSpec] {
+        match name {
+            "cpu" => &CPU_FILE_SPECS,
+            "memory" => &MEMORY_FILE_SPECS,
+            "pids" => &PIDS_FILE_SPECS,
+            _ => &[],
+        }
+    }
+
+    fn desired_controller_specs(cgroup: &Arc<CgroupNode>) -> Vec<CgroupFileSpec> {
+        if cgroup.parent().is_none() {
+            return ROOT_CONTROLLER_FILE_SPECS.to_vec();
+        }
+
+        let mut specs = Vec::new();
+        for controller in Self::available_controllers_for(cgroup) {
+            specs.extend_from_slice(Self::controller_specs(controller));
+        }
+        specs
+    }
+
     fn encode_controller_list(items: &[String]) -> Vec<u8> {
         if items.is_empty() {
             return b"\n".to_vec();
@@ -307,6 +564,17 @@ impl Cgroup2Inode {
         Ok(ops)
     }
 
+    fn fold_subtree_control_ops(input: &str) -> Result<HashMap<String, bool>, SystemError> {
+        let mut folded = HashMap::new();
+        for (enable, name) in Self::parse_subtree_control_ops(input)? {
+            if !Self::is_known_controller(name) {
+                return Err(SystemError::EINVAL);
+            }
+            folded.insert(name.to_string(), enable);
+        }
+        Ok(folded)
+    }
+
     fn encode_pids_max(limit: Option<usize>) -> Vec<u8> {
         match limit {
             Some(v) => format!("{}\n", v).into_bytes(),
@@ -324,15 +592,92 @@ impl Cgroup2Inode {
         Ok(Some(value))
     }
 
+    fn encode_max_u64(value: Option<u64>) -> Vec<u8> {
+        match value {
+            Some(v) => format!("{}\n", v).into_bytes(),
+            None => b"max\n".to_vec(),
+        }
+    }
+
+    fn parse_max_u64(input: &str) -> Result<Option<u64>, SystemError> {
+        let trimmed = input.trim();
+        if trimmed == "max" {
+            return Ok(None);
+        }
+        let value = trimmed.parse::<u64>().map_err(|_| SystemError::EINVAL)?;
+        Ok(Some(value))
+    }
+
+    fn encode_cpu_max(quota: Option<u64>, period_us: u64) -> Vec<u8> {
+        match quota {
+            Some(quota) => format!("{} {}\n", quota, period_us).into_bytes(),
+            None => format!("max {}\n", period_us).into_bytes(),
+        }
+    }
+
+    fn parse_cpu_max(
+        input: &str,
+        current_period_us: u64,
+    ) -> Result<(Option<u64>, u64), SystemError> {
+        let mut parts = input.split_whitespace();
+        let quota_raw = parts.next().ok_or(SystemError::EINVAL)?;
+        let quota = if quota_raw == "max" {
+            None
+        } else {
+            Some(quota_raw.parse::<u64>().map_err(|_| SystemError::EINVAL)?)
+        };
+        let period = match parts.next() {
+            Some(raw) => raw.parse::<u64>().map_err(|_| SystemError::EINVAL)?,
+            None => current_period_us,
+        };
+        if parts.next().is_some() || period == 0 {
+            return Err(SystemError::EINVAL);
+        }
+        Ok((quota, period))
+    }
+
+    fn cpu_stat() -> Vec<u8> {
+        // P1 exposes Linux-compatible cgroup v2 files, but CPU accounting
+        // and bandwidth enforcement are not wired to the scheduler yet.
+        b"usage_usec 0\nuser_usec 0\nsystem_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\n"
+            .to_vec()
+    }
+
+    fn memory_events() -> Vec<u8> {
+        b"low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n".to_vec()
+    }
+
+    fn memory_stat() -> Vec<u8> {
+        // P1 keeps memory controller knobs as compat state only. The keys
+        // mirror common Linux v2 memory.stat names while all counters stay 0.
+        b"anon 0\nfile 0\nkernel_stack 0\npagetables 0\npercpu 0\nsock 0\nshmem 0\nfile_mapped 0\nfile_dirty 0\nfile_writeback 0\nswapcached 0\nanon_thp 0\nfile_thp 0\nshmem_thp 0\ninactive_anon 0\nactive_anon 0\ninactive_file 0\nactive_file 0\nunevictable 0\nslab_reclaimable 0\nslab_unreclaimable 0\nslab 0\nworkingset_refault_anon 0\nworkingset_refault_file 0\nworkingset_activate_anon 0\nworkingset_activate_file 0\nworkingset_restore_anon 0\nworkingset_restore_file 0\nworkingset_nodereclaim 0\npgfault 0\npgmajfault 0\npgrefill 0\npgscan 0\npgsteal 0\npgactivate 0\npgdeactivate 0\npglazyfree 0\npglazyfreed 0\nthp_fault_alloc 0\nthp_collapse_alloc 0\n"
+            .to_vec()
+    }
+
+    fn memory_swap_events() -> Vec<u8> {
+        b"high 0\nmax 0\nfail 0\n".to_vec()
+    }
+
+    fn replace_file_data(this: &Arc<Cgroup2Inode>, new_data: &[u8]) -> Result<(), SystemError> {
+        let mut inner = this.inner.lock();
+        match &mut inner.kind {
+            Cgroup2InodeKind::File { data, .. } => {
+                data.clear();
+                data.extend_from_slice(new_data);
+                inner.metadata.size = data.len() as i64;
+                Ok(())
+            }
+            _ => Err(SystemError::EISDIR),
+        }
+    }
+
     fn validate_enable_controller(cgroup: &Arc<CgroupNode>, name: &str) -> Result<(), SystemError> {
         let available = Self::available_controllers_for(cgroup);
         if !available.contains(&name) {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::ENOENT);
         }
 
-        // no-internal-process 框架：仅对 domain controller 生效。
-        // 当前阶段未启用 controller，DOMAIN_CONTROLLERS 为空，不会误拒绝。
-        if DOMAIN_CONTROLLERS.contains(&name) && cgroup.has_tasks() && cgroup.has_children() {
+        if DOMAIN_CONTROLLERS.contains(&name) && cgroup.parent().is_some() && cgroup.has_tasks() {
             return Err(SystemError::EBUSY);
         }
         Ok(())
@@ -342,20 +687,23 @@ impl Cgroup2Inode {
         cgroup: &Arc<CgroupNode>,
         input: &str,
     ) -> Result<Vec<u8>, SystemError> {
-        let ops = Self::parse_subtree_control_ops(input)?;
+        let ops = Self::fold_subtree_control_ops(input)?;
         let mut enabled: HashSet<String> = cgroup.subtree_control().into_iter().collect();
 
-        for (is_enable, name) in ops {
+        for (name, is_enable) in ops {
             if is_enable {
-                Self::validate_enable_controller(cgroup, name)?;
-                enabled.insert(name.to_string());
+                if enabled.contains(&name) {
+                    continue;
+                }
+                Self::validate_enable_controller(cgroup, &name)?;
+                enabled.insert(name);
             } else {
                 for child in cgroup.children() {
-                    if child.subtree_control().iter().any(|ctrl| ctrl == name) {
+                    if child.subtree_control().iter().any(|ctrl| ctrl == &name) {
                         return Err(SystemError::EBUSY);
                     }
                 }
-                enabled.remove(name);
+                enabled.remove(&name);
             }
         }
 
@@ -403,6 +751,7 @@ impl Cgroup2Inode {
         cgroup: Arc<CgroupNode>,
         ty: CgroupCoreFile,
         init: &[u8],
+        mode: u16,
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak| Self {
             self_ref: weak.clone(),
@@ -411,7 +760,7 @@ impl Cgroup2Inode {
                 parent: Weak::new(),
                 metadata: Metadata {
                     size: init.len() as i64,
-                    mode: InodeMode::from_bits_truncate(0o644),
+                    mode: InodeMode::from_bits_truncate(mode as u32),
                     uid: 0,
                     gid: 0,
                     blk_size: CGROUP2_BLOCK_SIZE as usize,
@@ -456,6 +805,84 @@ impl Cgroup2Inode {
         }
     }
 
+    fn add_file_from_spec(
+        dir: &Arc<Cgroup2Inode>,
+        cgroup: Arc<CgroupNode>,
+        spec: CgroupFileSpec,
+    ) -> Result<(), SystemError> {
+        let file =
+            Cgroup2Inode::new_file(spec.name.to_string(), cgroup, spec.ty, spec.init, spec.mode);
+        Self::add_child(dir, spec.name, file)
+    }
+
+    fn sync_controller_files(dir: &Arc<Cgroup2Inode>) -> Result<(), SystemError> {
+        let (cgroup, desired) = {
+            let inner = dir.inner.lock();
+            match &inner.kind {
+                Cgroup2InodeKind::Dir { cgroup, .. } => {
+                    (cgroup.clone(), Self::desired_controller_specs(cgroup))
+                }
+                _ => return Err(SystemError::ENOTDIR),
+            }
+        };
+
+        let desired_names: HashSet<String> =
+            desired.iter().map(|spec| spec.name.to_string()).collect();
+        {
+            let mut inner = dir.inner.lock();
+            if let Cgroup2InodeKind::Dir { children, .. } = &mut inner.kind {
+                children.retain(|_, child| {
+                    let child_inner = child.inner.lock();
+                    match &child_inner.kind {
+                        Cgroup2InodeKind::File { ty, .. } => {
+                            ty.controller().is_none() || desired_names.contains(&child_inner.name)
+                        }
+                        Cgroup2InodeKind::Dir { .. } => true,
+                    }
+                });
+            } else {
+                return Err(SystemError::ENOTDIR);
+            }
+        }
+
+        for spec in desired {
+            let exists = {
+                let inner = dir.inner.lock();
+                match &inner.kind {
+                    Cgroup2InodeKind::Dir { children, .. } => children.contains_key(spec.name),
+                    _ => return Err(SystemError::ENOTDIR),
+                }
+            };
+            if !exists {
+                Self::add_file_from_spec(dir, cgroup.clone(), spec)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn sync_cached_child_controller_files(dir: &Arc<Cgroup2Inode>) -> Result<(), SystemError> {
+        let cached_dirs = {
+            let inner = dir.inner.lock();
+            match &inner.kind {
+                Cgroup2InodeKind::Dir { children, .. } => children
+                    .values()
+                    .filter(|child| {
+                        let child_inner = child.inner.lock();
+                        matches!(&child_inner.kind, Cgroup2InodeKind::Dir { .. })
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                _ => return Err(SystemError::ENOTDIR),
+            }
+        };
+
+        for child in cached_dirs {
+            Self::sync_controller_files(&child)?;
+        }
+        Ok(())
+    }
+
     fn lookup_child(
         parent: &Arc<Cgroup2Inode>,
         name: &str,
@@ -473,6 +900,7 @@ impl Cgroup2Inode {
         }
 
         Self::prune_stale_dir_cache(parent)?;
+        Self::sync_controller_files(parent)?;
 
         {
             let inner = parent.inner.lock();
@@ -517,56 +945,17 @@ impl Cgroup2Inode {
             }
         };
 
-        let base_files = [
-            ("cgroup.procs", CgroupCoreFile::Procs, b"".as_slice()),
-            (
-                "cgroup.controllers",
-                CgroupCoreFile::Controllers,
-                b"\n".as_slice(),
-            ),
-            (
-                "cgroup.subtree_control",
-                CgroupCoreFile::SubtreeControl,
-                b"\n".as_slice(),
-            ),
-        ];
-        for (name, ty, init) in base_files {
-            let file = Cgroup2Inode::new_file(name.to_string(), cgroup.clone(), ty, init);
-            Self::add_child(dir, name, file)?;
+        for spec in BASE_FILE_SPECS {
+            Self::add_file_from_spec(dir, cgroup.clone(), spec)?;
         }
 
         if cgroup.parent().is_some() {
-            let pids_files = [
-                (
-                    "pids.current",
-                    CgroupCoreFile::PidsCurrent,
-                    //初始内容占位
-                    b"0\n".as_slice(),
-                ),
-                ("pids.max", CgroupCoreFile::PidsMax, b"max\n".as_slice()),
-                (
-                    "pids.events",
-                    CgroupCoreFile::PidsEvents,
-                    b"max 0\n".as_slice(),
-                ),
-            ];
-            for (name, ty, init) in pids_files {
-                let file = Cgroup2Inode::new_file(name.to_string(), cgroup.clone(), ty, init);
-                Self::add_child(dir, name, file)?;
+            for spec in NON_ROOT_CORE_FILE_SPECS {
+                Self::add_file_from_spec(dir, cgroup.clone(), spec)?;
             }
         }
 
-        // Linux 语义：cgroup.type/cgroup.events 仅存在于 non-root cgroup。
-        if cgroup.parent().is_some() {
-            let extra_files = [
-                ("cgroup.events", CgroupCoreFile::Events, b"".as_slice()),
-                ("cgroup.type", CgroupCoreFile::Type, b"domain\n".as_slice()),
-            ];
-            for (name, ty, init) in extra_files {
-                let file = Cgroup2Inode::new_file(name.to_string(), cgroup.clone(), ty, init);
-                Self::add_child(dir, name, file)?;
-            }
-        }
+        Self::sync_controller_files(dir)?;
 
         Ok(())
     }
@@ -615,6 +1004,34 @@ impl Cgroup2Inode {
                     format!("populated {}\nfrozen 0\n", populated).into_bytes()
                 }
                 CgroupCoreFile::Type => b"domain\n".to_vec(),
+                CgroupCoreFile::Freeze => {
+                    format!("{}\n", if cgroup.freeze_requested() { 1 } else { 0 }).into_bytes()
+                }
+                CgroupCoreFile::CpuStat => Self::cpu_stat(),
+                CgroupCoreFile::CpuWeight => {
+                    format!("{}\n", cgroup.cpu_state().weight()).into_bytes()
+                }
+                CgroupCoreFile::CpuMax => {
+                    let (quota, period) = cgroup.cpu_state().max();
+                    Self::encode_cpu_max(quota, period)
+                }
+                CgroupCoreFile::MemoryCurrent | CgroupCoreFile::MemoryPeak => b"0\n".to_vec(),
+                CgroupCoreFile::MemoryMin => Self::encode_max_u64(cgroup.memory_state().min()),
+                CgroupCoreFile::MemoryLow => Self::encode_max_u64(cgroup.memory_state().low()),
+                CgroupCoreFile::MemoryHigh => Self::encode_max_u64(cgroup.memory_state().high()),
+                CgroupCoreFile::MemoryMax => Self::encode_max_u64(cgroup.memory_state().max()),
+                CgroupCoreFile::MemoryEvents => Self::memory_events(),
+                CgroupCoreFile::MemoryStat => Self::memory_stat(),
+                CgroupCoreFile::MemorySwapCurrent | CgroupCoreFile::MemorySwapPeak => {
+                    b"0\n".to_vec()
+                }
+                CgroupCoreFile::MemorySwapHigh => {
+                    Self::encode_max_u64(cgroup.memory_state().swap_high())
+                }
+                CgroupCoreFile::MemorySwapMax => {
+                    Self::encode_max_u64(cgroup.memory_state().swap_max())
+                }
+                CgroupCoreFile::MemorySwapEvents => Self::memory_swap_events(),
                 CgroupCoreFile::PidsCurrent => {
                     format!("{}\n", cgroup.pids_current_count()).into_bytes()
                 }
@@ -725,17 +1142,87 @@ impl Cgroup2Inode {
                 if !ProcessManager::current_pcb().cred().has_cap_sys_admin() {
                     return Err(SystemError::EPERM);
                 }
+                let dir = this
+                    .inner
+                    .lock()
+                    .parent
+                    .upgrade()
+                    .ok_or(SystemError::ENOENT)?;
+                let _cgroup_guard = cgroup_accounting_lock().lock();
                 let new_data = Self::apply_subtree_control(&cgroup, input)?;
-                let mut inner = this.inner.lock();
-                match &mut inner.kind {
-                    Cgroup2InodeKind::File { data, .. } => {
-                        data.clear();
-                        data.extend_from_slice(&new_data);
-                        inner.metadata.size = data.len() as i64;
-                        Ok(buf.len())
-                    }
-                    _ => Err(SystemError::EISDIR),
+                Self::replace_file_data(this, &new_data)?;
+                Self::sync_cached_child_controller_files(&dir)?;
+                Ok(buf.len())
+            }
+            CgroupCoreFile::Freeze => {
+                if offset != 0 {
+                    return Err(SystemError::EINVAL);
                 }
+                let input = core::str::from_utf8(buf).map_err(|_| SystemError::EINVAL)?;
+                let value = input
+                    .trim()
+                    .parse::<u32>()
+                    .map_err(|_| SystemError::EINVAL)?;
+                if value > 1 {
+                    return Err(SystemError::ERANGE);
+                }
+                cgroup.set_freeze_requested(value == 1);
+                let new_data = format!("{}\n", value).into_bytes();
+                Self::replace_file_data(this, &new_data)?;
+                Ok(buf.len())
+            }
+            CgroupCoreFile::CpuWeight => {
+                if offset != 0 {
+                    return Err(SystemError::EINVAL);
+                }
+                let input = core::str::from_utf8(buf).map_err(|_| SystemError::EINVAL)?;
+                let weight = input
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|_| SystemError::EINVAL)?;
+                if !(1..=10_000).contains(&weight) {
+                    return Err(SystemError::ERANGE);
+                }
+                cgroup.set_cpu_weight(weight);
+                let new_data = format!("{}\n", weight).into_bytes();
+                Self::replace_file_data(this, &new_data)?;
+                Ok(buf.len())
+            }
+            CgroupCoreFile::CpuMax => {
+                if offset != 0 {
+                    return Err(SystemError::EINVAL);
+                }
+                let input = core::str::from_utf8(buf).map_err(|_| SystemError::EINVAL)?;
+                let (_, current_period) = cgroup.cpu_state().max();
+                let (quota, period) = Self::parse_cpu_max(input, current_period)?;
+                cgroup.set_cpu_max(quota, period);
+                let new_data = Self::encode_cpu_max(quota, period);
+                Self::replace_file_data(this, &new_data)?;
+                Ok(buf.len())
+            }
+            CgroupCoreFile::MemoryMin
+            | CgroupCoreFile::MemoryLow
+            | CgroupCoreFile::MemoryHigh
+            | CgroupCoreFile::MemoryMax
+            | CgroupCoreFile::MemorySwapHigh
+            | CgroupCoreFile::MemorySwapMax => {
+                if offset != 0 {
+                    return Err(SystemError::EINVAL);
+                }
+                let input = core::str::from_utf8(buf).map_err(|_| SystemError::EINVAL)?;
+                let value = Self::parse_max_u64(input)?;
+                match ty {
+                    CgroupCoreFile::MemoryMin => cgroup.set_memory_min(value),
+                    CgroupCoreFile::MemoryLow => cgroup.set_memory_low(value),
+                    CgroupCoreFile::MemoryHigh => cgroup.set_memory_high(value),
+                    CgroupCoreFile::MemoryMax => cgroup.set_memory_max(value),
+                    CgroupCoreFile::MemorySwapHigh => cgroup.set_memory_swap_high(value),
+                    CgroupCoreFile::MemorySwapMax => cgroup.set_memory_swap_max(value),
+                    _ => unreachable!(),
+                }
+                let new_data = Self::encode_max_u64(value);
+                Self::replace_file_data(this, &new_data)?;
+                Ok(buf.len())
             }
             CgroupCoreFile::PidsMax => {
                 if offset != 0 {
@@ -745,22 +1232,22 @@ impl Cgroup2Inode {
                 let new_limit = Self::parse_pids_max(input)?;
                 cgroup.set_pids_max(new_limit);
                 let new_data = Self::encode_pids_max(new_limit);
-                let mut inner = this.inner.lock();
-                match &mut inner.kind {
-                    Cgroup2InodeKind::File { data, .. } => {
-                        data.clear();
-                        data.extend_from_slice(&new_data);
-                        inner.metadata.size = data.len() as i64;
-                        Ok(buf.len())
-                    }
-                    _ => Err(SystemError::EISDIR),
-                }
+                Self::replace_file_data(this, &new_data)?;
+                Ok(buf.len())
             }
             CgroupCoreFile::Controllers
             | CgroupCoreFile::Events
             | CgroupCoreFile::Type
+            | CgroupCoreFile::CpuStat
+            | CgroupCoreFile::MemoryCurrent
+            | CgroupCoreFile::MemoryPeak
+            | CgroupCoreFile::MemoryEvents
+            | CgroupCoreFile::MemoryStat
+            | CgroupCoreFile::MemorySwapCurrent
+            | CgroupCoreFile::MemorySwapPeak
+            | CgroupCoreFile::MemorySwapEvents
             | CgroupCoreFile::PidsCurrent
-            | CgroupCoreFile::PidsEvents => Err(SystemError::EINVAL),
+            | CgroupCoreFile::PidsEvents => Err(SystemError::EPERM),
         }
     }
 }
@@ -894,6 +1381,14 @@ impl IndexNode for Cgroup2Inode {
         Cgroup2Inode::write_file(&this, offset, &buf[..n])
     }
 
+    fn resize(&self, len: usize) -> Result<(), SystemError> {
+        match &self.inner.lock().kind {
+            Cgroup2InodeKind::File { .. } if len == 0 => Ok(()),
+            Cgroup2InodeKind::File { .. } => Err(SystemError::EINVAL),
+            Cgroup2InodeKind::Dir { .. } => Err(SystemError::EISDIR),
+        }
+    }
+
     fn metadata(&self) -> Result<Metadata, SystemError> {
         Ok(self.inner.lock().metadata.clone())
     }
@@ -1010,6 +1505,7 @@ impl IndexNode for Cgroup2Inode {
     fn list(&self) -> Result<Vec<String>, SystemError> {
         let this = self.self_ref.upgrade().unwrap();
         Cgroup2Inode::prune_stale_dir_cache(&this)?;
+        Cgroup2Inode::sync_controller_files(&this)?;
         let inner = self.inner.lock();
         match &inner.kind {
             Cgroup2InodeKind::Dir { cgroup, children } => {

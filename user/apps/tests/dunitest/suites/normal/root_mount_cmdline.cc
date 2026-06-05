@@ -11,6 +11,21 @@
 
 namespace {
 
+struct ExpectedRootMountOptions {
+    std::string mode = "ro";
+    bool sync = false;
+    bool dirsync = false;
+    bool lazytime = false;
+    bool mand = false;
+    bool nosuid = false;
+    bool nodev = false;
+    bool noexec = false;
+    bool noatime = false;
+    bool nodiratime = false;
+    bool relatime = true;
+    bool nosymfollow = false;
+};
+
 bool read_text_file(const char* path, std::string* out) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
@@ -40,21 +55,90 @@ std::vector<std::string> split_whitespace(const std::string& input) {
     return out;
 }
 
-void apply_rw_token(const std::string& token, std::string* mode) {
+std::vector<std::string> split_commas(const std::string& input) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    while (start <= input.size()) {
+        const size_t end = input.find(',', start);
+        const size_t len = (end == std::string::npos) ? input.size() - start : end - start;
+        out.push_back(input.substr(start, len));
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+    return out;
+}
+
+bool has_option(const std::vector<std::string>& options, const char* expected) {
+    for (const std::string& option : options) {
+        if (option == expected) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void apply_rootflag_option(const std::string& token, ExpectedRootMountOptions* expected) {
     if (token == "ro" || token == "rw") {
-        *mode = token;
+        expected->mode = token;
+    } else if (token == "sync") {
+        expected->sync = true;
+    } else if (token == "async") {
+        expected->sync = false;
+    } else if (token == "dirsync") {
+        expected->dirsync = true;
+    } else if (token == "lazytime") {
+        expected->lazytime = true;
+    } else if (token == "nolazytime") {
+        expected->lazytime = false;
+    } else if (token == "mand") {
+        expected->mand = true;
+    } else if (token == "nomand") {
+        expected->mand = false;
+    } else if (token == "nosuid") {
+        expected->nosuid = true;
+    } else if (token == "suid") {
+        expected->nosuid = false;
+    } else if (token == "nodev") {
+        expected->nodev = true;
+    } else if (token == "dev") {
+        expected->nodev = false;
+    } else if (token == "noexec") {
+        expected->noexec = true;
+    } else if (token == "exec") {
+        expected->noexec = false;
+    } else if (token == "noatime") {
+        expected->noatime = true;
+        expected->relatime = false;
+    } else if (token == "atime" || token == "strictatime") {
+        expected->noatime = false;
+        expected->relatime = false;
+    } else if (token == "relatime") {
+        expected->noatime = false;
+        expected->relatime = true;
+    } else if (token == "nodiratime") {
+        expected->nodiratime = true;
+    } else if (token == "diratime") {
+        expected->nodiratime = false;
+    } else if (token == "nosymfollow") {
+        expected->nosymfollow = true;
+    } else if (token == "symfollow") {
+        expected->nosymfollow = false;
     }
 }
 
-std::string expected_root_mode_from_cmdline(const std::string& cmdline) {
-    std::string mode = "ro";
+ExpectedRootMountOptions expected_root_options_from_cmdline(const std::string& cmdline) {
+    ExpectedRootMountOptions expected;
 
     for (const std::string& token : split_whitespace(cmdline)) {
         if (token == "--") {
             break;
         }
 
-        apply_rw_token(token, &mode);
+        if (token == "ro" || token == "rw") {
+            expected.mode = token;
+        }
 
         constexpr const char* kRootflags = "rootflags=";
         if (token.rfind(kRootflags, 0) != 0) {
@@ -62,19 +146,12 @@ std::string expected_root_mode_from_cmdline(const std::string& cmdline) {
         }
 
         std::string flags = token.substr(strlen(kRootflags));
-        size_t start = 0;
-        while (start <= flags.size()) {
-            const size_t end = flags.find(',', start);
-            const size_t len = (end == std::string::npos) ? flags.size() - start : end - start;
-            apply_rw_token(flags.substr(start, len), &mode);
-            if (end == std::string::npos) {
-                break;
-            }
-            start = end + 1;
+        for (const std::string& option : split_commas(flags)) {
+            apply_rootflag_option(option, &expected);
         }
     }
 
-    return mode;
+    return expected;
 }
 
 bool find_root_mount_options(const std::string& mounts, std::string* options) {
@@ -95,6 +172,14 @@ bool find_root_mount_options(const std::string& mounts, std::string* options) {
     return false;
 }
 
+void expect_option(const std::vector<std::string>& options, const char* option) {
+    EXPECT_TRUE(has_option(options, option)) << "missing mount option: " << option;
+}
+
+void expect_no_option(const std::vector<std::string>& options, const char* option) {
+    EXPECT_FALSE(has_option(options, option)) << "unexpected mount option: " << option;
+}
+
 }  // namespace
 
 TEST(RootMountCmdline, RootMountModeFollowsKernelCommandLine) {
@@ -109,10 +194,28 @@ TEST(RootMountCmdline, RootMountModeFollowsKernelCommandLine) {
     std::string options;
     ASSERT_TRUE(find_root_mount_options(mounts, &options)) << "/proc/self/mounts:\n" << mounts;
 
-    const std::string expected = expected_root_mode_from_cmdline(cmdline);
-    ASSERT_GE(options.size(), expected.size()) << "root mount options: " << options;
-    EXPECT_EQ(expected, options.substr(0, expected.size()))
+    const ExpectedRootMountOptions expected = expected_root_options_from_cmdline(cmdline);
+    ASSERT_GE(options.size(), expected.mode.size()) << "root mount options: " << options;
+    EXPECT_EQ(expected.mode, options.substr(0, expected.mode.size()))
         << "cmdline:\n" << cmdline << "\n/proc/self/mounts:\n" << mounts;
+
+    const std::vector<std::string> option_tokens = split_commas(options);
+    if (expected.sync) expect_option(option_tokens, "sync");
+    if (expected.dirsync) expect_option(option_tokens, "dirsync");
+    if (expected.lazytime) expect_option(option_tokens, "lazytime");
+    if (expected.mand) expect_option(option_tokens, "mand");
+    if (expected.nosuid) expect_option(option_tokens, "nosuid");
+    if (expected.nodev) expect_option(option_tokens, "nodev");
+    if (expected.noexec) expect_option(option_tokens, "noexec");
+    if (expected.noatime) expect_option(option_tokens, "noatime");
+    if (expected.nodiratime) expect_option(option_tokens, "nodiratime");
+    if (expected.relatime) expect_option(option_tokens, "relatime");
+    if (expected.nosymfollow) expect_option(option_tokens, "nosymfollow");
+    if (expected.noatime) expect_no_option(option_tokens, "relatime");
+    if (!expected.noatime && !expected.relatime) {
+        expect_no_option(option_tokens, "noatime");
+        expect_no_option(option_tokens, "relatime");
+    }
 }
 
 int main(int argc, char** argv) {

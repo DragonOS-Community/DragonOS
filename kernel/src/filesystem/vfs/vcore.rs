@@ -253,10 +253,50 @@ fn parse_ext4_errors_option(value: &str) -> Result<Ext4ErrorsBehavior, SystemErr
     }
 }
 
+fn apply_common_rootflag(opt: &str, mount_flags: &mut MountFlags) -> bool {
+    match opt {
+        "defaults" => {}
+        "ro" => mount_flags.insert(MountFlags::RDONLY),
+        "rw" => mount_flags.remove(MountFlags::RDONLY),
+        "sync" => mount_flags.insert(MountFlags::SYNCHRONOUS),
+        "async" => mount_flags.remove(MountFlags::SYNCHRONOUS),
+        "dirsync" => mount_flags.insert(MountFlags::DIRSYNC),
+        "lazytime" => mount_flags.insert(MountFlags::LAZYTIME),
+        "nolazytime" => mount_flags.remove(MountFlags::LAZYTIME),
+        "mand" => mount_flags.insert(MountFlags::MANDLOCK),
+        "nomand" => mount_flags.remove(MountFlags::MANDLOCK),
+        "nosuid" => mount_flags.insert(MountFlags::NOSUID),
+        "suid" => mount_flags.remove(MountFlags::NOSUID),
+        "nodev" => mount_flags.insert(MountFlags::NODEV),
+        "dev" => mount_flags.remove(MountFlags::NODEV),
+        "noexec" => mount_flags.insert(MountFlags::NOEXEC),
+        "exec" => mount_flags.remove(MountFlags::NOEXEC),
+        "noatime" => {
+            mount_flags.remove(MountFlags::RELATIME | MountFlags::STRICTATIME);
+            mount_flags.insert(MountFlags::NOATIME);
+        }
+        "atime" | "strictatime" => {
+            mount_flags.remove(MountFlags::RELATIME | MountFlags::NOATIME);
+        }
+        "relatime" => {
+            mount_flags.remove(MountFlags::NOATIME | MountFlags::STRICTATIME);
+            mount_flags.insert(MountFlags::RELATIME);
+        }
+        "nodiratime" => mount_flags.insert(MountFlags::NODIRATIME),
+        "diratime" => mount_flags.remove(MountFlags::NODIRATIME),
+        "nosymfollow" => mount_flags.insert(MountFlags::NOSYMFOLLOW),
+        "symfollow" => mount_flags.remove(MountFlags::NOSYMFOLLOW),
+        "iversion" => mount_flags.insert(MountFlags::I_VERSION),
+        "noiversion" => mount_flags.remove(MountFlags::I_VERSION),
+        _ => return false,
+    }
+    true
+}
+
 fn parse_rootflags(mode: RootMountMode) -> Result<RootMountOptions, SystemError> {
     let mut mount_flags = match mode {
-        RootMountMode::ReadOnly => MountFlags::RDONLY,
-        RootMountMode::ReadWrite => MountFlags::empty(),
+        RootMountMode::ReadOnly => MountFlags::RDONLY | MountFlags::RELATIME,
+        RootMountMode::ReadWrite => MountFlags::RELATIME,
     };
     let mut ext4_options = Ext4MountOptions::default();
 
@@ -278,15 +318,11 @@ fn parse_rootflags(mode: RootMountMode) -> Result<RootMountOptions, SystemError>
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
     {
+        if apply_common_rootflag(opt, &mut mount_flags) {
+            continue;
+        }
+
         match opt {
-            "ro" => mount_flags.insert(MountFlags::RDONLY),
-            "rw" => mount_flags.remove(MountFlags::RDONLY),
-            "sync" => mount_flags.insert(MountFlags::SYNCHRONOUS),
-            "async" => mount_flags.remove(MountFlags::SYNCHRONOUS),
-            "lazytime" => mount_flags.insert(MountFlags::LAZYTIME),
-            "nolazytime" => mount_flags.remove(MountFlags::LAZYTIME),
-            "mand" => mount_flags.insert(MountFlags::MANDLOCK),
-            "nomand" => mount_flags.remove(MountFlags::MANDLOCK),
             _ if opt == "dax" || opt.starts_with("dax=") => {
                 ext4_options.dax = Some(parse_ext4_dax_option(opt)?);
             }

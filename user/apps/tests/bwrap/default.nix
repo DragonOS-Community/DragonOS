@@ -8,7 +8,7 @@
 let
   testsArchive = pkgs.fetchurl {
     url = "https://cnb.cool/DragonOS-Community/test-suites/-/releases/download/release_${version}/bwrap-tests.tar.xz";
-    sha256 = "sha256-TODO-update=";
+    sha256 = "sha256-lN8OpxA7xMC4nVBIK82+NmUtjr6jc3IBM95g7GgFDOI=";
   };
 
 in

@@ -204,6 +204,18 @@ void expect_file(int detail_fd, const char* path) {
     }
 }
 
+void expect_missing(int detail_fd, const char* path) {
+    struct stat st = {};
+    errno = 0;
+    if (stat(path, &st) == 0) {
+        errno = EEXIST;
+        child_fail(detail_fd, path);
+    }
+    if (errno != ENOENT) {
+        child_fail(detail_fd, path);
+    }
+}
+
 void expect_text_has(int detail_fd, const char* path, const char* needle) {
     std::string content;
     if (!read_text_file(path, &content)) {
@@ -255,6 +267,24 @@ bool mounts_has_exact_entry(const char* mountpoint, const char* fstype) {
     }
 
     return false;
+}
+
+void expect_root_p1_visibility(int detail_fd) {
+    expect_file(detail_fd, "/sys/fs/cgroup/cgroup.procs");
+    expect_file(detail_fd, "/sys/fs/cgroup/cgroup.controllers");
+    expect_file(detail_fd, "/sys/fs/cgroup/cgroup.subtree_control");
+    expect_file(detail_fd, "/sys/fs/cgroup/cpu.stat");
+    expect_file(detail_fd, "/sys/fs/cgroup/memory.stat");
+
+    expect_missing(detail_fd, "/sys/fs/cgroup/cgroup.events");
+    expect_missing(detail_fd, "/sys/fs/cgroup/cgroup.type");
+    expect_missing(detail_fd, "/sys/fs/cgroup/cgroup.freeze");
+    expect_missing(detail_fd, "/sys/fs/cgroup/cpu.weight");
+    expect_missing(detail_fd, "/sys/fs/cgroup/cpu.max");
+    expect_missing(detail_fd, "/sys/fs/cgroup/memory.current");
+    expect_missing(detail_fd, "/sys/fs/cgroup/memory.max");
+    expect_missing(detail_fd, "/sys/fs/cgroup/pids.current");
+    expect_missing(detail_fd, "/sys/fs/cgroup/pids.max");
 }
 
 }  // namespace
@@ -325,11 +355,13 @@ TEST(SysfsCgroup2Mount, Cgroup2P1ControllerFilesFollowSubtreeControl) {
         expect_text_not_has(detail_fd, "/sys/fs/cgroup/cgroup.controllers", "net_cls");
         expect_text_not_has(detail_fd, "/sys/fs/cgroup/cgroup.controllers", "net_prio");
         expect_text_not_has(detail_fd, "/sys/fs/cgroup/cgroup.controllers", "oom");
+        expect_root_p1_visibility(detail_fd);
 
         if (!write_text_file("/sys/fs/cgroup/cgroup.subtree_control",
                              "+cpu +memory +pids")) {
             child_fail(detail_fd, "enable root subtree controllers");
         }
+        expect_root_p1_visibility(detail_fd);
 
         std::string parent = "/sys/fs/cgroup/dunit_cgv2_p1_";
         parent += std::to_string(getpid());
@@ -347,6 +379,8 @@ TEST(SysfsCgroup2Mount, Cgroup2P1ControllerFilesFollowSubtreeControl) {
             errno = EEXIST;
             child_fail(detail_fd, "child cpu.max before parent enable");
         }
+        std::string child_cpu_stat = child + "/cpu.stat";
+        expect_file(detail_fd, child_cpu_stat.c_str());
 
         std::string parent_subtree = parent + "/cgroup.subtree_control";
         if (!write_text_file(parent_subtree.c_str(), "+cpu +memory +pids")) {
@@ -403,13 +437,13 @@ TEST(SysfsCgroup2Mount, Cgroup2P1ControllerFilesFollowSubtreeControl) {
         std::string swap_max = child + "/memory.swap.max";
         if (!write_text_file(memory_max.c_str(), "max") ||
             !write_text_file(memory_high.c_str(), "4096") ||
-            !write_text_file(memory_low.c_str(), "1024") ||
+            !write_text_file(memory_low.c_str(), "4096") ||
             !write_text_file(memory_min.c_str(), "0") ||
             !write_text_file(swap_max.c_str(), "max")) {
             child_fail(detail_fd, "write memory limits");
         }
         expect_text_has(detail_fd, memory_high.c_str(), "4096\n");
-        expect_text_has(detail_fd, memory_low.c_str(), "1024\n");
+        expect_text_has(detail_fd, memory_low.c_str(), "4096\n");
 
         std::string freeze = child + "/cgroup.freeze";
         if (!write_text_file(freeze.c_str(), "1")) {
@@ -437,6 +471,7 @@ TEST(SysfsCgroup2Mount, Cgroup2P1ControllerFilesFollowSubtreeControl) {
             errno = EEXIST;
             child_fail(detail_fd, "child cpu.max after parent disable");
         }
+        expect_file(detail_fd, child_cpu_stat.c_str());
 
         rmdir(child.c_str());
         rmdir(parent.c_str());

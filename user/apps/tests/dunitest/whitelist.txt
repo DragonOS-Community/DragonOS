@@ -34,6 +34,7 @@ fuse/fuse_extended
 normal/test_procfs_link
 normal/proc_mount_exports
 normal/root_mount_cmdline
+normal/kernel_cmdline_compat
 normal/proc_pid_reuse_cache
 normal/proc_self_exec_cmdline
 normal/proc_thread_accounting

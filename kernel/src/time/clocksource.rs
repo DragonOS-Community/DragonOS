@@ -34,6 +34,8 @@ use super::{
     NSEC_PER_SEC, NSEC_PER_USEC,
 };
 
+kernel_cmdline_param_kv!(CLOCKSOURCE_PARAM, clocksource, "");
+
 lazy_static! {
     /// linked list with the registered clocksources
     pub static ref CLOCKSOURCE_LIST: SpinLock<LinkedList<Arc<dyn Clocksource>>> =
@@ -47,6 +49,22 @@ lazy_static! {
     pub static ref OVERRIDE_NAME: SpinLock<String> = SpinLock::new(String::from(""));
 
 
+}
+
+pub fn handle_clocksource_cmdline_param() {
+    if !CLOCKSOURCE_PARAM.was_supplied() {
+        return;
+    }
+
+    let Some(name) = CLOCKSOURCE_PARAM.value_str() else {
+        return;
+    };
+    if name.is_empty() {
+        return;
+    }
+
+    *OVERRIDE_NAME.lock() = String::from(name);
+    debug!("clocksource: boot override set to {}", name);
 }
 
 static mut WATCHDOG_KTHREAD: Option<Arc<ProcessControlBlock>> = None;

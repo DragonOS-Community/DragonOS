@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 # bubblewrap测试套件下载和校验脚本
 # 用于DragonOS项目

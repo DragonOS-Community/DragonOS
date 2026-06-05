@@ -41,6 +41,38 @@ pub struct Ext4FileSystem {
 
     /// 元数据（size/mtime）脏但尚未刷盘的 inode 列表。
     dirty_inodes: Mutex<Vec<Arc<LockedExt4Inode>>>,
+
+    /// Mount-time ext4 options parsed from user/kernel mount data.
+    _mount_options: Ext4MountOptions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ext4DaxMode {
+    Never,
+    Always,
+    Inode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ext4ErrorsBehavior {
+    Continue,
+    RemountRo,
+    Panic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ext4MountOptions {
+    pub dax: Option<Ext4DaxMode>,
+    pub errors: Ext4ErrorsBehavior,
+}
+
+impl Default for Ext4MountOptions {
+    fn default() -> Self {
+        Self {
+            dax: None,
+            errors: Ext4ErrorsBehavior::Continue,
+        }
+    }
 }
 
 impl FileSystem for Ext4FileSystem {
@@ -234,6 +266,13 @@ impl Ext4FileSystem {
     }
 
     pub fn from_gendisk(mount_data: Arc<GenDisk>) -> Result<Arc<dyn FileSystem>, SystemError> {
+        Self::from_gendisk_with_options(mount_data, Ext4MountOptions::default())
+    }
+
+    pub fn from_gendisk_with_options(
+        mount_data: Arc<GenDisk>,
+        mount_options: Ext4MountOptions,
+    ) -> Result<Arc<dyn FileSystem>, SystemError> {
         let raw_dev = mount_data.device_num();
         let fs = another_ext4::Ext4::load(mount_data.clone())?;
         let root_inode: Arc<LockedExt4Inode> =
@@ -262,6 +301,7 @@ impl Ext4FileSystem {
             raw_dev,
             root_inode,
             dirty_inodes: Mutex::new(Vec::new()),
+            _mount_options: mount_options,
         });
 
         let mut guard = fs.root_inode.0.lock();

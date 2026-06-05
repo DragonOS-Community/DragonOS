@@ -373,7 +373,7 @@ check_dependencies
 # 设置无图形界面模式
 QEMU_NOGRAPHIC=false
 
-KERNEL_CMDLINE=" "
+KERNEL_CMDLINE=" rw "
 
 # 自动测试选项，支持的选项：
 # - none: 不进行自动测试

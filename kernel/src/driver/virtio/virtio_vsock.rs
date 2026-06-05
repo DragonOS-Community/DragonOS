@@ -207,6 +207,20 @@ impl VsockTransport for VirtioVsockTransport {
                     {
                         Ok(read_len) => {
                             data.truncate(read_len);
+                            if read_len > 0 {
+                                if let Err(error) = manager
+                                    .0
+                                    .update_credit(Self::endpoint_to_vsock_addr(peer), local.port)
+                                {
+                                    log::warn!(
+                                        "vsock: credit update failed after receiving {} bytes for {:?}->{:?}: {:?}",
+                                        read_len,
+                                        peer,
+                                        local,
+                                        map_vsock_error(error)
+                                    );
+                                }
+                            }
                             events.push(VsockTransportEvent {
                                 local,
                                 peer,

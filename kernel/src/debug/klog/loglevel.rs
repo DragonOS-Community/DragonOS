@@ -7,7 +7,12 @@ use core::sync::atomic::{AtomicU8, Ordering};
 
 use system_error::SystemError;
 
-use crate::init::cmdline::{KernelCmdlineKV, KernelCmdlineParameter, KCMDLINE_PARAM_KV};
+use crate::init::{
+    boot_params,
+    cmdline::{
+        kenrel_cmdline_param_manager, KernelCmdlineKV, KernelCmdlineParameter, KCMDLINE_PARAM_KV,
+    },
+};
 
 /// 全局内核日志级别配置
 ///
@@ -17,6 +22,8 @@ use crate::init::cmdline::{KernelCmdlineKV, KernelCmdlineParameter, KCMDLINE_PAR
 /// - minimum_console_loglevel: 最小控制台级别
 /// - default_console_loglevel: 默认控制台级别
 pub static KERNEL_LOG_LEVEL: KernelLogLevel = KernelLogLevel::new();
+
+const QUIET_CONSOLE_LOGLEVEL: u8 = 4;
 
 /// 日志级别
 #[derive(Default, Clone, PartialEq, Debug)]
@@ -173,16 +180,41 @@ static LOGLEVEL_PARAM: KernelCmdlineParameter = KernelCmdlineParameter::KV(Kerne
     default: "7", // 默认DEBUG级别
 });
 
+kernel_cmdline_param_arg!(QUIET_PARAM, quiet, false, false);
+
 /// 处理loglevel参数
 ///
 /// 在cmdline参数解析完成后调用，设置全局日志级别
 pub fn handle_loglevel_param() {
-    if let Some(param) = KCMDLINE_PARAM_KV.iter().find(|x| x.name() == "loglevel") {
-        if let Some(value_str) = param.value_str() {
+    let manager = kenrel_cmdline_param_manager();
+    let boot_params = boot_params().read();
+    let mut selected_level = None;
+
+    for argument in manager.split_args(boot_params.boot_cmdline_str()) {
+        if argument == "--" {
+            break;
+        }
+
+        let Some((node, option, value)) = manager.split_arg(argument) else {
+            continue;
+        };
+        if node.is_some() {
+            continue;
+        }
+
+        if option == "quiet" && value.is_none() {
+            selected_level = Some(QUIET_CONSOLE_LOGLEVEL);
+            continue;
+        }
+
+        if option == "loglevel" {
+            let Some(value_str) = value else {
+                log::warn!("loglevel: missing value, must be a number");
+                continue;
+            };
             if let Ok(level) = value_str.parse::<u8>() {
                 if level <= 7 {
-                    let _ = KERNEL_LOG_LEVEL.set_console_level(level);
-                    log::info!("loglevel: set console log level to {} via cmdline", level);
+                    selected_level = Some(level);
                 } else {
                     log::warn!("loglevel: invalid level {}, must be 0-7", level);
                 }
@@ -190,5 +222,10 @@ pub fn handle_loglevel_param() {
                 log::warn!("loglevel: invalid value '{}', must be a number", value_str);
             }
         }
+    }
+
+    if let Some(level) = selected_level {
+        let _ = KERNEL_LOG_LEVEL.set_console_level(level);
+        log::info!("loglevel: set console log level to {} via cmdline", level);
     }
 }

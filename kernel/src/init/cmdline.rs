@@ -410,6 +410,7 @@ impl KernelCmdlineManager {
         self.default_initialize();
         // 处理loglevel参数
         crate::debug::klog::loglevel::handle_loglevel_param();
+        crate::time::clocksource::handle_clocksource_cmdline_param();
         fence(Ordering::SeqCst);
     }
 
@@ -470,19 +471,54 @@ impl KernelCmdlineManager {
         };
 
         list.iter().find(|x| {
-            let name = x.name();
-            if let Some(node) = node {
-                // 加1是因为有一个点号
-                name.len() == (node.len() + option.len() + 1)
-                    && name.starts_with(node)
-                    && name[node.len() + 1..].starts_with(option)
-            } else {
-                name == option
-            }
+            Self::split_registered_param_name(x.name())
+                .map(|(param_node, param_option)| match (node, param_node) {
+                    (Some(node), Some(param_node)) => {
+                        Self::cmdline_param_name_eq(node, param_node)
+                            && Self::cmdline_param_name_eq(option, param_option)
+                    }
+                    (None, None) => Self::cmdline_param_name_eq(option, param_option),
+                    _ => false,
+                })
+                .unwrap_or(false)
         })
     }
 
-    fn split_arg<'a>(&self, arg: &'a str) -> Option<(Option<&'a str>, &'a str, Option<&'a str>)> {
+    fn split_registered_param_name(name: &str) -> Option<(Option<&str>, &str)> {
+        let mut iter = name.splitn(2, '.');
+        let v1 = iter.next().map(|v| v.trim());
+        let v2 = iter.next().map(|v| v.trim());
+        let v3 = iter.next().map(|v| v.trim());
+        let v = [v1, v2, v3];
+
+        let mut key_split_len = 0;
+        v.iter().for_each(|x| {
+            if x.is_some() {
+                key_split_len += 1
+            }
+        });
+
+        match key_split_len {
+            1 => Some((None, v[0].unwrap())),
+            2 => Some((Some(v[0].unwrap()), v[1].unwrap())),
+            _ => None,
+        }
+    }
+
+    fn cmdline_param_name_eq(a: &str, b: &str) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+
+        a.bytes()
+            .zip(b.bytes())
+            .all(|(a, b)| a == b || matches!((a, b), (b'-', b'_') | (b'_', b'-')))
+    }
+
+    pub(crate) fn split_arg<'a>(
+        &self,
+        arg: &'a str,
+    ) -> Option<(Option<&'a str>, &'a str, Option<&'a str>)> {
         let mut iter = arg.splitn(2, '=');
         let key = iter.next().unwrap();
         let value = iter.next();
@@ -517,7 +553,7 @@ impl KernelCmdlineManager {
         Some((node, option, value))
     }
 
-    fn split_args<'a>(&self, cmdline: &'a str) -> impl Iterator<Item = &'a str> {
+    pub(crate) fn split_args<'a>(&self, cmdline: &'a str) -> impl Iterator<Item = &'a str> {
         // 是否在引号内
         let mut in_quote = false;
         cmdline.split(move |c: char| {

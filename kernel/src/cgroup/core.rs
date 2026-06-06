@@ -8,6 +8,7 @@ use hashbrown::{HashMap, HashSet};
 use system_error::SystemError;
 
 use crate::{
+    cgroup::{CgroupCpuState, CgroupFreezerState, CgroupMemoryState},
     libs::{rwlock::RwLock, spinlock::SpinLock},
     process::RawPid,
 };
@@ -20,6 +21,9 @@ pub struct CgroupNode {
     children: RwLock<HashMap<String, Arc<CgroupNode>>>,
     tasks: RwLock<HashSet<RawPid>>,
     subtree_control: RwLock<HashSet<String>>,
+    cpu: RwLock<CgroupCpuState>,
+    memory: RwLock<CgroupMemoryState>,
+    freezer: RwLock<CgroupFreezerState>,
     pids_max: RwLock<Option<usize>>,
     pids_events_max: AtomicU64,
     local_pids_counter: AtomicUsize,
@@ -36,6 +40,9 @@ impl CgroupNode {
             children: RwLock::new(HashMap::new()),
             tasks: RwLock::new(HashSet::new()),
             subtree_control: RwLock::new(HashSet::new()),
+            cpu: RwLock::new(CgroupCpuState::default()),
+            memory: RwLock::new(CgroupMemoryState::default()),
+            freezer: RwLock::new(CgroupFreezerState::default()),
             pids_max: RwLock::new(None),
             pids_events_max: AtomicU64::new(0),
             local_pids_counter: AtomicUsize::new(0),
@@ -52,6 +59,9 @@ impl CgroupNode {
             children: RwLock::new(HashMap::new()),
             tasks: RwLock::new(HashSet::new()),
             subtree_control: RwLock::new(HashSet::new()),
+            cpu: RwLock::new(CgroupCpuState::default()),
+            memory: RwLock::new(CgroupMemoryState::default()),
+            freezer: RwLock::new(CgroupFreezerState::default()),
             pids_max: RwLock::new(None),
             pids_events_max: AtomicU64::new(0),
             local_pids_counter: AtomicUsize::new(0),
@@ -140,6 +150,54 @@ impl CgroupNode {
 
     pub fn set_subtree_control(&self, controllers: HashSet<String>) {
         *self.subtree_control.write() = controllers;
+    }
+
+    pub fn cpu_state(&self) -> CgroupCpuState {
+        *self.cpu.read()
+    }
+
+    pub fn set_cpu_weight(&self, weight: u64) {
+        self.cpu.write().set_weight(weight);
+    }
+
+    pub fn set_cpu_max(&self, quota: Option<u64>, period_us: u64) {
+        self.cpu.write().set_max(quota, period_us);
+    }
+
+    pub fn memory_state(&self) -> CgroupMemoryState {
+        *self.memory.read()
+    }
+
+    pub fn set_memory_min(&self, value: Option<u64>) {
+        self.memory.write().set_min(value);
+    }
+
+    pub fn set_memory_low(&self, value: Option<u64>) {
+        self.memory.write().set_low(value);
+    }
+
+    pub fn set_memory_high(&self, value: Option<u64>) {
+        self.memory.write().set_high(value);
+    }
+
+    pub fn set_memory_max(&self, value: Option<u64>) {
+        self.memory.write().set_max(value);
+    }
+
+    pub fn set_memory_swap_high(&self, value: Option<u64>) {
+        self.memory.write().set_swap_high(value);
+    }
+
+    pub fn set_memory_swap_max(&self, value: Option<u64>) {
+        self.memory.write().set_swap_max(value);
+    }
+
+    pub fn freeze_requested(&self) -> bool {
+        self.freezer.read().freeze_requested()
+    }
+
+    pub fn set_freeze_requested(&self, value: bool) {
+        self.freezer.write().set_freeze_requested(value);
     }
 
     pub fn pids_max(&self) -> Option<usize> {
@@ -449,8 +507,7 @@ pub fn cgroup_common_ancestor(left: &Arc<CgroupNode>, right: &Arc<CgroupNode>) -
 }
 //一个已经作为管理节点的node不能同时作为迁移目的地承载普通节点
 pub fn cgroup_migrate_vet_dst(dst: &Arc<CgroupNode>) -> Result<(), SystemError> {
-    // v2 no-internal-process 约束：只要启用了 subtree_control 就禁止迁移进程
-    if !dst.subtree_control().is_empty() {
+    if dst.parent().is_some() && dst.subtree_control().iter().any(|ctrl| ctrl == "memory") {
         return Err(SystemError::EBUSY);
     }
     Ok(())

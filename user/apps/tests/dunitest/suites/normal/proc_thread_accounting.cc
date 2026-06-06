@@ -59,6 +59,10 @@ void write_text_or_die(const char* path, const char* text) {
     }
 }
 
+void enable_pids_controller_for_children() {
+    write_text_or_die("/sys/fs/cgroup/cgroup.subtree_control", "+pids\n");
+}
+
 unsigned long read_loadavg_thread_total() {
     std::string loadavg;
     if (!read_text_file("/proc/loadavg", &loadavg)) {
@@ -89,6 +93,8 @@ TEST(ProcThreadAccounting, RejectedForkDoesNotDecrementVisibleThreads) {
     snprintf(cgroup_dir, sizeof(cgroup_dir), "/sys/fs/cgroup/proc_thread_accounting_%d", getpid());
     snprintf(cgroup_procs, sizeof(cgroup_procs), "%s/cgroup.procs", cgroup_dir);
     snprintf(pids_max, sizeof(pids_max), "%s/pids.max", cgroup_dir);
+
+    enable_pids_controller_for_children();
 
     ASSERT_EQ(0, mkdir(cgroup_dir, 0755)) << "mkdir cgroup failed: errno=" << errno << " ("
                                           << strerror(errno) << ")";

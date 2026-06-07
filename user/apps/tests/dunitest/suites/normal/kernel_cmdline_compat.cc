@@ -51,6 +51,21 @@ std::vector<std::string> kernel_param_tokens(const std::string& cmdline) {
     return out;
 }
 
+std::vector<std::string> init_arg_tokens_from_kernel_cmdline(const std::string& cmdline) {
+    std::vector<std::string> out;
+    bool after_double_dash = false;
+    for (const std::string& token : split_whitespace(cmdline)) {
+        if (after_double_dash) {
+            out.push_back(token);
+            continue;
+        }
+        if (token == "--") {
+            after_double_dash = true;
+        }
+    }
+    return out;
+}
+
 std::vector<std::string> split_nul(const std::string& input) {
     std::vector<std::string> out;
     size_t start = 0;
@@ -84,6 +99,10 @@ bool has_prefix_token(const std::vector<std::string>& tokens, const std::string&
         }
     }
     return false;
+}
+
+bool has_init_parameter(const std::vector<std::string>& kernel_tokens) {
+    return has_prefix_token(kernel_tokens, "init=");
 }
 
 }  // namespace
@@ -153,6 +172,78 @@ TEST(KernelCmdlineCompat, AgentDottedParametersStayOutOfInitArgv) {
     if (!saw_agent_param) {
         GTEST_SKIP() << "kernel cmdline does not contain CubeSandbox agent dotted parameters";
     }
+}
+
+TEST(KernelCmdlineCompat, DoubleDashArgsDoNotRequireInitParameter) {
+    std::string kernel_cmdline;
+    ASSERT_TRUE(read_file("/proc/cmdline", &kernel_cmdline))
+        << "read /proc/cmdline failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    const std::vector<std::string> kernel_tokens = kernel_param_tokens(kernel_cmdline);
+    const std::vector<std::string> init_arg_tokens =
+        init_arg_tokens_from_kernel_cmdline(kernel_cmdline);
+    constexpr char kAfterDashMarker[] = "dragonos_after_dash_marker";
+
+    if (!contains_token(init_arg_tokens, kAfterDashMarker)) {
+        GTEST_SKIP() << "kernel cmdline does not contain the after-dash marker";
+    }
+    if (has_init_parameter(kernel_tokens)) {
+        GTEST_SKIP() << "kernel cmdline contains init=; this case validates default init";
+    }
+
+    std::string init_cmdline;
+    ASSERT_TRUE(read_file("/proc/1/cmdline", &init_cmdline))
+        << "read /proc/1/cmdline failed: errno=" << errno << " (" << strerror(errno) << ")";
+    const std::vector<std::string> init_argv = split_nul(init_cmdline);
+
+    EXPECT_TRUE(contains_token(init_argv, kAfterDashMarker))
+        << kAfterDashMarker << " did not reach init argv";
+}
+
+TEST(KernelCmdlineCompat, InitParameterClearsEarlierUnknownBareArgs) {
+    std::string kernel_cmdline;
+    ASSERT_TRUE(read_file("/proc/cmdline", &kernel_cmdline))
+        << "read /proc/cmdline failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    const std::vector<std::string> kernel_tokens = kernel_param_tokens(kernel_cmdline);
+    constexpr char kPreInitMarker[] = "dragonos_pre_init_marker";
+
+    if (!contains_token(kernel_tokens, kPreInitMarker)) {
+        GTEST_SKIP() << "kernel cmdline does not contain the pre-init marker";
+    }
+    if (!has_init_parameter(kernel_tokens)) {
+        GTEST_SKIP() << "kernel cmdline does not contain init=";
+    }
+
+    std::string init_cmdline;
+    ASSERT_TRUE(read_file("/proc/1/cmdline", &init_cmdline))
+        << "read /proc/1/cmdline failed: errno=" << errno << " (" << strerror(errno) << ")";
+    const std::vector<std::string> init_argv = split_nul(init_cmdline);
+
+    EXPECT_FALSE(contains_token(init_argv, kPreInitMarker))
+        << kPreInitMarker << " leaked into init argv before init= cleanup";
+}
+
+TEST(KernelCmdlineCompat, DoubleDashArgsSurviveInitParameterCleanup) {
+    std::string kernel_cmdline;
+    ASSERT_TRUE(read_file("/proc/cmdline", &kernel_cmdline))
+        << "read /proc/cmdline failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    const std::vector<std::string> init_arg_tokens =
+        init_arg_tokens_from_kernel_cmdline(kernel_cmdline);
+    constexpr char kAfterDashMarker[] = "dragonos_after_dash_marker";
+
+    if (!contains_token(init_arg_tokens, kAfterDashMarker)) {
+        GTEST_SKIP() << "kernel cmdline does not contain the after-dash marker";
+    }
+
+    std::string init_cmdline;
+    ASSERT_TRUE(read_file("/proc/1/cmdline", &init_cmdline))
+        << "read /proc/1/cmdline failed: errno=" << errno << " (" << strerror(errno) << ")";
+    const std::vector<std::string> init_argv = split_nul(init_cmdline);
+
+    EXPECT_TRUE(contains_token(init_argv, kAfterDashMarker))
+        << kAfterDashMarker << " was removed while handling init=";
 }
 
 int main(int argc, char** argv) {

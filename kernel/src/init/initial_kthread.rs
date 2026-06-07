@@ -135,15 +135,16 @@ fn switch_to_user() -> ! {
 
     let mut proc_init_info = ProcInitInfo::new("");
     // 设置默认环境变量
-    proc_init_info.envs.push(CString::new("HOME=/").unwrap());
-    proc_init_info
-        .envs
-        .push(CString::new("TERM=linux").unwrap());
+    set_init_env(&mut proc_init_info.envs, CString::new("HOME=/").unwrap());
+    set_init_env(
+        &mut proc_init_info.envs,
+        CString::new("TERM=linux").unwrap(),
+    );
     proc_init_info.args = kenrel_cmdline_param_manager().init_proc_args();
     // 命令行管理器提供的环境变量会追加到默认环境变量之后
-    proc_init_info
-        .envs
-        .extend(kenrel_cmdline_param_manager().init_proc_envs());
+    for env in kenrel_cmdline_param_manager().init_proc_envs() {
+        set_init_env(&mut proc_init_info.envs, env);
+    }
 
     let mut trap_frame = TrapFrame::new();
 
@@ -224,6 +225,28 @@ fn try_to_run_init_process(
 
     Ok(())
 }
+
+fn set_init_env(envs: &mut alloc::vec::Vec<CString>, env: CString) {
+    let key_len = env
+        .as_bytes()
+        .iter()
+        .position(|&byte| byte == b'=')
+        .unwrap_or(env.as_bytes().len());
+    if let Some(slot) = envs
+        .iter_mut()
+        .find(|candidate| init_env_key_matches(candidate, &env.as_bytes()[..key_len]))
+    {
+        *slot = env;
+    } else {
+        envs.push(env);
+    }
+}
+
+fn init_env_key_matches(env: &CString, key: &[u8]) -> bool {
+    let bytes = env.as_bytes();
+    bytes.len() > key.len() && bytes.starts_with(key) && bytes[key.len()] == b'='
+}
+
 fn run_init_process(
     proc_init_info: &ProcInitInfo,
     trap_frame: &mut TrapFrame,

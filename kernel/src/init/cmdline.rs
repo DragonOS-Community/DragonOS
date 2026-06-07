@@ -326,9 +326,7 @@ impl KernelCmdlineManager {
         let mut kernel_cmdline_end = false;
         for argument in self.split_args(boot_params.boot_cmdline_str()) {
             if kernel_cmdline_end {
-                if !argument.is_empty() {
-                    inner.init_args.push(CString::new(argument).unwrap());
-                }
+                Self::push_init_arg(&mut inner, argument);
                 continue;
             }
 
@@ -342,12 +340,9 @@ impl KernelCmdlineManager {
                 Some(v) => v,
                 None => continue,
             };
-            if option == "init" && value.is_some() {
-                if inner.init_path.is_some() {
-                    panic!("cmdline: init proc path is set twice");
-                }
+            if node.is_none() && option == "init" && value.is_some() {
                 if let Some(val) = value {
-                    inner.init_path = Some(CString::new(val).unwrap());
+                    Self::set_init_path(&mut inner, val);
                 }
                 continue;
             }
@@ -394,11 +389,9 @@ impl KernelCmdlineManager {
                 fence(Ordering::SeqCst);
             } else if node.is_none() {
                 if let Some(val) = value {
-                    inner
-                        .init_envs
-                        .push(CString::new(format!("{}={}", option, val)).unwrap());
+                    Self::set_init_env(&mut inner, option, val);
                 } else if !option.is_empty() {
-                    inner.init_args.push(CString::new(option).unwrap());
+                    Self::push_init_arg(&mut inner, option);
                 }
             }
         }
@@ -409,6 +402,36 @@ impl KernelCmdlineManager {
         crate::debug::klog::loglevel::handle_loglevel_param();
         crate::time::clocksource::handle_clocksource_cmdline_param();
         fence(Ordering::SeqCst);
+    }
+
+    fn set_init_path(inner: &mut InnerKernelCmdlineManager, path: &str) {
+        inner.init_path = Some(CString::new(path).unwrap());
+        inner.init_args.clear();
+    }
+
+    fn push_init_arg(inner: &mut InnerKernelCmdlineManager, arg: &str) {
+        if !arg.is_empty() {
+            inner.init_args.push(CString::new(arg).unwrap());
+        }
+    }
+
+    fn set_init_env(inner: &mut InnerKernelCmdlineManager, key: &str, value: &str) {
+        let env = CString::new(format!("{}={}", key, value)).unwrap();
+        if let Some(slot) = inner
+            .init_envs
+            .iter_mut()
+            .find(|env| Self::cstring_key_matches_env(env, key))
+        {
+            *slot = env;
+        } else {
+            inner.init_envs.push(env);
+        }
+    }
+
+    fn cstring_key_matches_env(env: &CString, key: &str) -> bool {
+        let bytes = env.as_bytes();
+        let key = key.as_bytes();
+        bytes.len() > key.len() && bytes.starts_with(key) && bytes[key.len()] == b'='
     }
 
     fn default_initialize(&self) {

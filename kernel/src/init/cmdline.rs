@@ -326,9 +326,6 @@ impl KernelCmdlineManager {
         let mut kernel_cmdline_end = false;
         for argument in self.split_args(boot_params.boot_cmdline_str()) {
             if kernel_cmdline_end {
-                if inner.init_path.is_none() {
-                    panic!("cmdline: init proc path is not set while init proc args are set");
-                }
                 if !argument.is_empty() {
                     inner.init_args.push(CString::new(argument).unwrap());
                 }

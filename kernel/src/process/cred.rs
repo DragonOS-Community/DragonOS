@@ -110,12 +110,9 @@ pub struct Cred {
 
 impl Cred {
     fn init() -> Arc<Self> {
-        // 默认 init 进程能力集：
-        // - CAP_FSETID 会影响写/截断时是否清除 suid/sgid 位（Linux: CAP_FSETID 可阻止清理）。
-        //   gVisor syscall 测试假设该能力不启用，否则会观察到 setuid/setgid 位被保留。
-        // - cap_ambient 默认应为空（Linux init 的 ambient 也是空）。
-        let mut init_caps = CAPFlags::CAP_FULL_SET;
-        init_caps.remove(CAPFlags::CAP_FSETID);
+        // 默认 init 进程能力集对齐 Linux init_cred：
+        // permitted/effective/bset 为 full set，ambient 为空。
+        let init_caps = CAPFlags::CAP_FULL_SET;
         Arc::new_cyclic(|weak_self| Self {
             self_ref: weak_self.clone(),
             uid: GLOBAL_ROOT_UID,

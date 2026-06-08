@@ -355,9 +355,10 @@ impl DevFS {
         self.register_device_dyn(name, device).map(|_| ())
     }
 
-    /// @brief 在devfs内注册一个动态设备节点
+    /// @brief Register a dynamic device node in devfs
     ///
-    /// 该接口用于设备核心层从 `Arc<dyn Device>` 动态转换后注册节点。
+    /// This interface is used by the device core layer to register a node after
+    /// dynamic conversion from `Arc<dyn Device>`.
     pub fn register_device_dyn(
         &self,
         name: &str,
@@ -395,7 +396,7 @@ impl DevFS {
         self.unregister_device_dyn(name, device)
     }
 
-    /// @brief 卸载一个动态设备节点
+    /// @brief Unregister a dynamic device node
     pub fn unregister_device_dyn(
         &self,
         name: &str,
@@ -1003,6 +1004,7 @@ impl IndexNode for LockedDevFSInode {
             FileType::CharDevice => FileType::CharDevice,
             FileType::BlockDevice => FileType::BlockDevice,
             FileType::Pipe => FileType::Pipe,
+            FileType::Socket => FileType::Socket,
             _ => return Err(SystemError::EINVAL),
         };
 
@@ -1044,7 +1046,7 @@ pub trait DeviceINode: IndexNode {
     // TODO: 增加 unregister 方法
 }
 
-/// @brief devfs的设备注册函数
+/// @brief devfs device registration function
 pub fn devfs_register<T: DeviceINode + 'static>(
     name: &str,
     device: Arc<T>,
@@ -1052,12 +1054,12 @@ pub fn devfs_register<T: DeviceINode + 'static>(
     return devfs_global_instance().register_device(name, device);
 }
 
-/// @brief devfs的动态设备卸载函数
+/// @brief devfs dynamic device unregistration function
 pub fn devfs_unregister_dyn(name: &str, device: Arc<dyn DeviceINode>) -> Result<(), SystemError> {
     return devfs_global_instance().unregister_device_dyn(name, device);
 }
 
-/// @brief devfs的动态设备创建函数，返回本次调用是否真实插入目录项
+/// @brief devfs dynamic device creation function; returns whether this call actually inserted a directory entry
 pub fn devfs_create_node_dyn(
     name: &str,
     device: Arc<dyn DeviceINode>,

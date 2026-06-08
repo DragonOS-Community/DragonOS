@@ -1178,6 +1178,7 @@ impl IndexNode for LockedTmpfsInode {
             FileType::Pipe => FileType::Pipe,
             FileType::CharDevice => FileType::CharDevice,
             FileType::BlockDevice => FileType::BlockDevice,
+            FileType::Socket => FileType::Socket,
             _ => return Err(SystemError::EINVAL),
         };
 

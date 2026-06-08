@@ -2338,6 +2338,8 @@ impl IndexNode for LockedFATInode {
             pipe_inode.set_fifo();
             // 设置special_node
             nod.0.lock().special_node = Some(SpecialNodeData::Pipe(pipe_inode));
+        } else if file_type == FileType::Socket {
+            nod.0.lock().metadata.file_type = FileType::Socket;
         } else if file_type == FileType::BlockDevice {
             nod.0.lock().metadata.file_type = FileType::BlockDevice;
             unimplemented!()

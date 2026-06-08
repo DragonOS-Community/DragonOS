@@ -676,6 +676,7 @@ impl IndexNode for LockedRamFSInode {
             FileType::Pipe => FileType::Pipe,
             FileType::CharDevice => FileType::CharDevice,
             FileType::BlockDevice => FileType::BlockDevice,
+            FileType::Socket => FileType::Socket,
             _ => return Err(SystemError::EINVAL),
         };
 

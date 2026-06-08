@@ -777,7 +777,7 @@ impl DeviceManager {
     /// core containers are removed, so a failing driver callback cannot leave driver-private state
     /// alive while sysfs/notifier state says the device is unbound.
     ///
-    /// 参考 Linux 6.6.139:
+    /// Reference: Linux 6.6.139:
     /// - drivers/base/core.c:device_del()
     /// - drivers/base/bus.c:bus_remove_device()
     #[inline(never)]
@@ -1032,10 +1032,10 @@ impl DeviceManager {
         return sysfs_instance().create_file(&kobj, attr);
     }
 
-    /// 从设备对应的 sysfs 目录中删除属性文件。
+    /// Remove an attribute file from the device's sysfs directory.
     ///
-    /// Linux 的 `device_remove_file()` 是 void/best-effort 语义；DragonOS 这里沿用同样策略，
-    /// 因为删除路径可能来自部分初始化失败后的回滚。
+    /// Linux's `device_remove_file()` uses void/best-effort semantics; DragonOS follows the same strategy,
+    /// because the removal path may be triggered during rollback after a partial initialization failure.
     pub fn remove_file(&self, dev: &Arc<dyn Device>, attr: &'static dyn Attribute) {
         let kobj = dev.clone() as Arc<dyn KObject>;
         sysfs_instance().remove_file(&kobj, attr);

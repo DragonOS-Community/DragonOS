@@ -174,7 +174,7 @@ impl MouseState {
 }
 
 #[derive(Debug)]
-#[cast_to([sync] Device, SerioDevice)]
+#[cast_to([sync] Device, DeviceINode, SerioDevice)]
 pub struct Ps2MouseDevice {
     inner: SpinLock<InnerPs2MouseDevice>,
     kobj_state: LockedKObjectState,

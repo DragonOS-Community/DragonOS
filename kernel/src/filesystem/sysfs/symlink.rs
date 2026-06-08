@@ -3,6 +3,7 @@ use alloc::{
     string::{String, ToString},
     sync::Arc,
 };
+use log::warn;
 use system_error::SystemError;
 
 use crate::{driver::base::kobject::KObject, filesystem::kernfs::KernFSInode};
@@ -38,8 +39,22 @@ impl SysFS {
     ///
     ///
     /// 参考：https://code.dragonos.org.cn/xref/linux-6.1.9/fs/sysfs/symlink.c#143
-    pub fn remove_link(&self, _kobj: &Arc<dyn KObject>, _name: String) {
-        todo!("sysfs remove link")
+    pub fn remove_link(&self, kobj: &Arc<dyn KObject>, name: String) {
+        let Some(parent) = kobj.inode() else {
+            return;
+        };
+
+        match parent.remove(&name) {
+            Ok(()) | Err(SystemError::ENOENT) => {}
+            Err(err) => {
+                warn!(
+                    "sysfs: failed to remove symlink '{}' under '{}': {:?}",
+                    name,
+                    kobj.name(),
+                    err
+                );
+            }
+        }
     }
 
     fn do_create_link(

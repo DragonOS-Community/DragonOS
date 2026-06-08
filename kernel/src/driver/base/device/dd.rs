@@ -62,7 +62,7 @@ impl DeviceManager {
             // todo!("do_device_attach: allow_async")
             warn!("do_device_attach: allow_async is true, but currently not supported");
         }
-        if dev.is_dead() {
+        if dev.is_dead() || device_manager().is_device_removing(dev) {
             return Ok(false);
         }
 
@@ -359,7 +359,10 @@ impl DriverManager {
         driver: &Arc<dyn Driver>,
         device: &Arc<dyn Device>,
     ) -> Result<(), SystemError> {
-        if device.is_dead() || (!device.is_registered()) {
+        if device.is_dead()
+            || device_manager().is_device_removing(device)
+            || (!device.is_registered())
+        {
             return Err(SystemError::ENODEV);
         }
         if device.driver().is_some() {
@@ -393,12 +396,12 @@ impl DriverManager {
             }
         };
 
-        let probe_failed = || {
+        let remove_driver_sysfs = || {
             self.remove_from_sysfs(device);
         };
 
-        let dev_groups_failed = || {
-            device_manager().remove(device);
+        let remove_probed_driver = || {
+            self.remove_probed_driver(device);
         };
 
         device.set_driver(Some(Arc::downgrade(driver)));
@@ -421,7 +424,7 @@ impl DriverManager {
                 e
             );
 
-            probe_failed();
+            remove_driver_sysfs();
             sysfs_failed();
             bind_failed();
             e
@@ -435,8 +438,8 @@ impl DriverManager {
                     device.name(),
                     e
                 );
-                dev_groups_failed();
-                probe_failed();
+                remove_probed_driver();
+                remove_driver_sysfs();
                 sysfs_failed();
                 bind_failed();
                 e
@@ -451,8 +454,9 @@ impl DriverManager {
                     device.name(),
                     e
                 );
-                dev_groups_failed();
-                probe_failed();
+                device_manager().remove_groups(device, driver.dev_groups());
+                remove_probed_driver();
+                remove_driver_sysfs();
                 sysfs_failed();
                 bind_failed();
                 e
@@ -501,8 +505,33 @@ impl DriverManager {
     }
 
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#469
-    fn remove_from_sysfs(&self, _device: &Arc<dyn Device>) {
-        todo!("remove_from_sysfs")
+    fn remove_from_sysfs(&self, device: &Arc<dyn Device>) {
+        let Some(driver) = device.driver() else {
+            return;
+        };
+
+        let driver_kobj = driver.clone() as Arc<dyn KObject>;
+        let device_kobj = device.clone() as Arc<dyn KObject>;
+
+        sysfs_instance().remove_file(&device_kobj, &DeviceAttrCoredump);
+        sysfs_instance().remove_file(&device_kobj, &DeviceAttrStateSynced);
+        sysfs_instance().remove_link(&device_kobj, "driver".to_string());
+        sysfs_instance().remove_link(&driver_kobj, device.name());
+    }
+
+    fn remove_probed_driver(&self, device: &Arc<dyn Device>) {
+        let Some(bus) = device.bus().and_then(|bus| bus.upgrade()) else {
+            return;
+        };
+
+        if let Err(err) = bus.remove(device) {
+            warn!(
+                "probe rollback: failed to remove device '{}' from bus '{}': {:?}",
+                device.name(),
+                bus.name(),
+                err
+            );
+        }
     }
 
     fn call_driver_probe(

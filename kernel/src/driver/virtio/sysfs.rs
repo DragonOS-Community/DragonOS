@@ -98,8 +98,25 @@ impl Bus for VirtIOBus {
         return virtio_drv.probe(&virtio_dev);
     }
 
-    fn remove(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError> {
-        todo!()
+    fn remove(&self, device: &Arc<dyn Device>) -> Result<(), SystemError> {
+        let drv = device.driver().ok_or(SystemError::EINVAL)?;
+        let virtio_drv = drv.cast::<dyn VirtIODriver>().map_err(|_| {
+            error!(
+                "VirtIOBus::remove() failed: device.driver() is not a VirtioDriver. Device: '{:?}'",
+                device.name()
+            );
+            SystemError::EINVAL
+        })?;
+
+        let virtio_dev = device.clone().cast::<dyn VirtIODevice>().map_err(|_| {
+            error!(
+                "VirtIOBus::remove() failed: device is not a VirtIODevice. Device: '{:?}'",
+                device.name()
+            );
+            SystemError::EINVAL
+        })?;
+
+        return virtio_drv.remove(&virtio_dev);
     }
 
     fn sync_state(&self, _device: &Arc<dyn Device>) {

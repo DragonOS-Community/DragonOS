@@ -462,7 +462,7 @@ impl PlatformDriver for Serial8250ISADriver {
     }
 
     fn remove(&self, _device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError> {
-        todo!()
+        Err(SystemError::ENOSYS)
     }
 
     fn shutdown(&self, _device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError> {

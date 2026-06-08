@@ -4,9 +4,8 @@
 #include <fcntl.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
-
-#include <string>
 
 namespace {
 
@@ -14,14 +13,8 @@ constexpr const char* kDevPtmx = "/dev/ptmx";
 constexpr const char* kDevPtsPtmx = "/dev/pts/ptmx";
 constexpr const char* kScratchLink = "/dev/dunitest_devfs_unlink_link";
 
-std::string readlink_string(const char* path) {
-    char buf[256];
-    ssize_t len = readlink(path, buf, sizeof(buf) - 1);
-    if (len < 0) {
-        return {};
-    }
-    buf[len] = '\0';
-    return std::string(buf, static_cast<size_t>(len));
+bool is_ptmx_char_device(const struct stat& st) {
+    return S_ISCHR(st.st_mode) && major(st.st_rdev) == 5 && minor(st.st_rdev) == 2;
 }
 
 void expect_open_ptmx(const char* path) {
@@ -38,10 +31,8 @@ public:
         struct stat st = {};
         existed_ = lstat(kDevPtmx, &st) == 0;
         if (existed_) {
-            was_symlink_ = S_ISLNK(st.st_mode);
-            if (was_symlink_) {
-                target_ = readlink_string(kDevPtmx);
-            }
+            mode_ = st.st_mode;
+            rdev_ = st.st_rdev;
         }
     }
 
@@ -49,14 +40,11 @@ public:
         restore();
     }
 
-    void require_original_symlink() const {
+    void require_original_ptmx() const {
         ASSERT_TRUE(existed_) << "/dev/ptmx must exist before this test";
-        ASSERT_TRUE(was_symlink_) << "/dev/ptmx must be a symlink before this test";
-        ASSERT_FALSE(target_.empty()) << "failed to capture original /dev/ptmx target";
-    }
-
-    const std::string& target() const {
-        return target_;
+        ASSERT_TRUE(S_ISCHR(mode_)) << "/dev/ptmx must be a character device before this test";
+        ASSERT_EQ(5u, major(rdev_)) << "/dev/ptmx major mismatch";
+        ASSERT_EQ(2u, minor(rdev_)) << "/dev/ptmx minor mismatch";
     }
 
     void restore() const {
@@ -65,20 +53,20 @@ public:
         }
 
         unlink(kDevPtmx);
-        if (existed_ && was_symlink_ && !target_.empty()) {
-            int ret = symlink(target_.c_str(), kDevPtmx);
+        if (existed_) {
+            int ret = mknod(kDevPtmx, (mode_ & 07777) | S_IFCHR, rdev_);
             (void)ret;
         }
     }
 
 private:
     bool can_restore() const {
-        return !existed_ || (was_symlink_ && !target_.empty());
+        return !existed_ || S_ISCHR(mode_);
     }
 
     bool existed_ = false;
-    bool was_symlink_ = false;
-    std::string target_;
+    mode_t mode_ = 0;
+    dev_t rdev_ = 0;
 };
 
 void remove_scratch_link() {
@@ -100,8 +88,9 @@ public:
 
 TEST(DevfsPtmxUnlink, UnlinkDevPtmxRemovesOnlyDevfsEntry) {
     DevPtmxRestorer restorer;
-    restorer.require_original_symlink();
+    restorer.require_original_ptmx();
 
+    expect_open_ptmx(kDevPtmx);
     expect_open_ptmx(kDevPtsPtmx);
 
     ASSERT_EQ(0, unlink(kDevPtmx)) << "unlink(/dev/ptmx) failed: errno=" << errno << " ("
@@ -116,34 +105,37 @@ TEST(DevfsPtmxUnlink, UnlinkDevPtmxRemovesOnlyDevfsEntry) {
     expect_open_ptmx(kDevPtsPtmx);
 
     restorer.restore();
-    ASSERT_EQ(restorer.target(), readlink_string(kDevPtmx));
+    ASSERT_EQ(0, lstat(kDevPtmx, &st)) << "lstat(/dev/ptmx) failed after restore: errno="
+                                      << errno << " (" << strerror(errno) << ")";
+    ASSERT_TRUE(is_ptmx_char_device(st)) << "/dev/ptmx should be restored as c 5:2";
     expect_open_ptmx(kDevPtmx);
 }
 
-TEST(DevfsPtmxUnlink, RecreateDevPtmxSymlinkAfterUnlink) {
+TEST(DevfsPtmxUnlink, RecreateDevPtmxSpecialNodeAfterUnlink) {
     DevPtmxRestorer restorer;
-    restorer.require_original_symlink();
+    restorer.require_original_ptmx();
 
-    ASSERT_EQ(-1, symlink(kDevPtsPtmx, kDevPtmx))
-        << "symlink unexpectedly replaced existing /dev/ptmx";
+    ASSERT_EQ(-1, mknod(kDevPtmx, S_IFCHR | 0666, makedev(5, 2)))
+        << "mknod unexpectedly replaced existing /dev/ptmx";
     ASSERT_EQ(EEXIST, errno) << "unexpected errno for existing /dev/ptmx: " << strerror(errno);
 
     ASSERT_EQ(0, unlink(kDevPtmx)) << "unlink(/dev/ptmx) failed: errno=" << errno << " ("
                                   << strerror(errno) << ")";
-    ASSERT_EQ(0, symlink(kDevPtsPtmx, kDevPtmx))
-        << "symlink(/dev/pts/ptmx, /dev/ptmx) failed: errno=" << errno << " ("
+    ASSERT_EQ(0, mknod(kDevPtmx, S_IFCHR | 0666, makedev(5, 2)))
+        << "mknod(/dev/ptmx) failed: errno=" << errno << " ("
         << strerror(errno) << ")";
 
     struct stat st = {};
     ASSERT_EQ(0, lstat(kDevPtmx, &st)) << "lstat(/dev/ptmx) failed: errno=" << errno << " ("
                                       << strerror(errno) << ")";
-    ASSERT_TRUE(S_ISLNK(st.st_mode)) << "/dev/ptmx should be a symlink";
-    ASSERT_EQ(std::string(kDevPtsPtmx), readlink_string(kDevPtmx));
+    ASSERT_TRUE(is_ptmx_char_device(st)) << "/dev/ptmx should be c 5:2";
 
     expect_open_ptmx(kDevPtmx);
 
     restorer.restore();
-    ASSERT_EQ(restorer.target(), readlink_string(kDevPtmx));
+    ASSERT_EQ(0, lstat(kDevPtmx, &st)) << "lstat(/dev/ptmx) failed after restore: errno="
+                                      << errno << " (" << strerror(errno) << ")";
+    ASSERT_TRUE(is_ptmx_char_device(st)) << "/dev/ptmx should be restored as c 5:2";
     expect_open_ptmx(kDevPtmx);
 }
 

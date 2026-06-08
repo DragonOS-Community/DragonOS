@@ -100,7 +100,7 @@ pub enum PtyType {
     Pts,
 }
 
-#[cast_to([sync] Device)]
+#[cast_to([sync] Device, DeviceINode)]
 pub struct TtyDevice {
     name: String,
     id_table: IdTable,

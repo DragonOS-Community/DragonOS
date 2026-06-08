@@ -94,6 +94,7 @@ impl<'a> Drop for IoGuard<'a> {
 }
 
 /// Loop 设备
+#[cast_to([sync] Device, DeviceINode)]
 pub struct LoopDevice {
     id: usize,
     minor: u32,

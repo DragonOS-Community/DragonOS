@@ -765,7 +765,7 @@ impl Attribute for DriverAttrUnbind {
         let dev = bus.find_device_by_name(s).ok_or(SystemError::ENODEV)?;
         let p = dev.driver().ok_or(SystemError::ENODEV)?;
         if Arc::ptr_eq(&p, &driver) {
-            device_manager().device_driver_detach(&dev);
+            device_manager().device_driver_detach(&dev)?;
             return Ok(buf.len());
         }
         return Err(SystemError::ENODEV);

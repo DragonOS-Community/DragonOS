@@ -53,7 +53,7 @@ struct InnerPmemBlockDevice {
     kobject_common: KObjectCommonData,
 }
 
-#[cast_to([sync] Device)]
+#[cast_to([sync] Device, DeviceINode)]
 pub struct PmemBlockDevice {
     blkdev_meta: BlockDevMeta,
     inner: SpinLock<InnerPmemBlockDevice>,

@@ -2314,8 +2314,9 @@ impl IndexNode for LockedFATInode {
             .umask();
         let final_mode = mode & !umask;
 
+        let file_type = FileType::from(final_mode);
         // 判断需要创建的类型
-        if unlikely(final_mode.contains(InodeMode::S_IFREG)) {
+        if unlikely(file_type == FileType::File) {
             // 普通文件
             drop(inode);
             return self.create(filename, FileType::File, mode);
@@ -2329,7 +2330,7 @@ impl IndexNode for LockedFATInode {
             FATDirEntry::File(FATFile::default()),
         );
 
-        if final_mode.contains(InodeMode::S_IFIFO) {
+        if file_type == FileType::Pipe {
             nod.0.lock().metadata.file_type = FileType::Pipe;
             // 创建pipe文件
             let pipe_inode = LockedPipeInode::new();
@@ -2337,10 +2338,12 @@ impl IndexNode for LockedFATInode {
             pipe_inode.set_fifo();
             // 设置special_node
             nod.0.lock().special_node = Some(SpecialNodeData::Pipe(pipe_inode));
-        } else if final_mode.contains(InodeMode::S_IFBLK) {
+        } else if file_type == FileType::Socket {
+            nod.0.lock().metadata.file_type = FileType::Socket;
+        } else if file_type == FileType::BlockDevice {
             nod.0.lock().metadata.file_type = FileType::BlockDevice;
             unimplemented!()
-        } else if final_mode.contains(InodeMode::S_IFCHR) {
+        } else if file_type == FileType::CharDevice {
             nod.0.lock().metadata.file_type = FileType::CharDevice;
             unimplemented!()
         } else {

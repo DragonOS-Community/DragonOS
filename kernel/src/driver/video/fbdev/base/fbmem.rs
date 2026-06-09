@@ -212,7 +212,7 @@ impl FrameBufferManager {
 ///
 /// 该设备的父设备为真实的帧缓冲区设备
 #[derive(Debug)]
-#[cast_to([sync] Device)]
+#[cast_to([sync] Device, DeviceINode)]
 pub struct FbDevice {
     inner: SpinLock<InnerFbDevice>,
     kobj_state: LockedKObjectState,

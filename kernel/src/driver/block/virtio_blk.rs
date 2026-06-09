@@ -383,7 +383,7 @@ impl VirtIOBlkManager {
 
 /// virtio block device
 #[cast_to([sync] VirtIODevice)]
-#[cast_to([sync] Device)]
+#[cast_to([sync] Device, DeviceINode)]
 pub struct VirtIOBlkDevice {
     blkdev_meta: BlockDevMeta,
     dev_id: Arc<DeviceId>,

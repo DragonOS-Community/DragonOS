@@ -49,7 +49,7 @@ use super::{
 /// - 设备分配和查找
 /// - 设备绑定和解绑
 /// - 设备状态查询和配置（配置设备参数，如偏移量、大小限制等）
-#[cast_to([sync] Device)]
+#[cast_to([sync] Device, DeviceINode)]
 pub struct LoopControlDevice {
     inner: SpinLock<LoopControlDeviceInner>,
     locked_kobj_state: LockedKObjectState,

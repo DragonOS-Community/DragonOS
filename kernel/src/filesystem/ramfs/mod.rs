@@ -663,7 +663,8 @@ impl IndexNode for LockedRamFSInode {
         }
 
         // Regular file: delegate to create(), must drop lock first to avoid deadlock
-        if unlikely(mode.contains(InodeMode::S_IFREG)) {
+        let file_type = FileType::from(mode);
+        if unlikely(file_type == FileType::File) {
             drop(inode);
             return self.create(filename, FileType::File, mode);
         }
@@ -671,14 +672,12 @@ impl IndexNode for LockedRamFSInode {
         let filename = DName::from(filename);
 
         // Determine file type from mode
-        let file_type = if mode.contains(InodeMode::S_IFIFO) {
-            FileType::Pipe
-        } else if mode.contains(InodeMode::S_IFCHR) {
-            FileType::CharDevice
-        } else if mode.contains(InodeMode::S_IFBLK) {
-            FileType::BlockDevice
-        } else {
-            FileType::File
+        let file_type = match file_type {
+            FileType::Pipe => FileType::Pipe,
+            FileType::CharDevice => FileType::CharDevice,
+            FileType::BlockDevice => FileType::BlockDevice,
+            FileType::Socket => FileType::Socket,
+            _ => return Err(SystemError::EINVAL),
         };
 
         let nod = Arc::new(LockedRamFSInode(Mutex::new(RamFSInode {

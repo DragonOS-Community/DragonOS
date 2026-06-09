@@ -79,7 +79,7 @@ impl PlatformDriver for I8042Driver {
 
     // TODO: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/input/serio/i8042.c#1587
     fn remove(&self, _device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError> {
-        todo!()
+        Err(SystemError::ENOSYS)
     }
 
     // TODO: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/input/serio/i8042.c#1322

@@ -47,4 +47,6 @@ normal/seccomp
 normal/process_signal_fork
 normal/sysfs_cgroup2_mount
 normal/devfs_ptmx_unlink
+normal/devtmpfs_semantics
+normal/mknod_socket
 normal/pmem_block

@@ -15,16 +15,35 @@ use crate::{
     filesystem::{
         devpts::DevPtsFs,
         epoll::{event_poll::EventPoll, EPollEventType},
-        vfs::{file::FileFlags, FilePrivateData, FileSystem, FileType, IndexNode, InodeMode},
+        vfs::{
+            file::FileFlags, FilePrivateData, FileSystem, FileType, IndexNode, InodeMode, MountFS,
+        },
     },
     libs::{casting::DowncastArc, mutex::MutexGuard},
     mm::VirtAddr,
+    process::ProcessManager,
     syscall::user_access::UserBufferWriter,
 };
 
 use super::{ptm_driver, pts_driver, PtyCommon};
 
 pub const NR_UNIX98_PTY_MAX: u32 = 128;
+
+fn current_devpts() -> Result<Arc<DevPtsFs>, SystemError> {
+    let fs = ProcessManager::current_mntns()
+        .root_inode()
+        .find("dev")?
+        .find("pts")?
+        .fs();
+
+    if let Some(devpts) = fs.clone().downcast_arc::<DevPtsFs>() {
+        return Ok(devpts);
+    }
+
+    fs.downcast_arc::<MountFS>()
+        .and_then(|mount_fs| mount_fs.inner_filesystem().downcast_arc::<DevPtsFs>())
+        .ok_or(SystemError::ENODEV)
+}
 
 #[derive(Debug)]
 struct PtyDevPtsLink {
@@ -371,13 +390,12 @@ pub fn ptmx_open(
         return Ok(());
     }
     // 根据当前节点所属的文件系统决定 devpts 根
-    let (pts_root_inode, fsinfo) =
-        if let Some(devpts) = this.fs().clone().downcast_arc::<DevPtsFs>() {
-            let root_inode = devpts.root_inode();
-            (root_inode, devpts)
-        } else {
-            return Err(SystemError::ENODEV);
-        };
+    let fsinfo = if let Some(devpts) = this.fs().clone().downcast_arc::<DevPtsFs>() {
+        devpts
+    } else {
+        current_devpts()?
+    };
+    let pts_root_inode = fsinfo.root_inode();
 
     let index = fsinfo.alloc_index()?;
 

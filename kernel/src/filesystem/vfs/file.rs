@@ -20,11 +20,16 @@ use crate::{
         tty::tty_device::TtyFilePrivateData,
     },
     filesystem::{
+        devfs::{devfs_lookup_device_by_devnum, LockedDevFSInode},
         epoll::{event_poll::EPollPrivateData, EPollItem},
+        ext4::inode::LockedExt4Inode,
+        fat::fs::LockedFATInode,
         fuse::private_data::FuseFilePrivateData,
         kernfs::callback::KernFilePrivateData,
         page_cache::PageCache,
         procfs::ProcfsFilePrivateData,
+        ramfs::LockedRamFSInode,
+        tmpfs::LockedTmpfsInode,
         vfs::FilldirContext,
     },
     ipc::{kill::send_signal_to_pid, pipe::PipeFsPrivateData},
@@ -69,6 +74,53 @@ fn canonical_inode_for_posix_lock(mut inode: Arc<dyn IndexNode>) -> Arc<dyn Inde
             None => return inode,
         }
     }
+}
+
+fn is_plain_special_inode(inode: &Arc<dyn IndexNode>) -> bool {
+    inode
+        .as_any_ref()
+        .downcast_ref::<LockedDevFSInode>()
+        .is_some()
+        || inode
+            .as_any_ref()
+            .downcast_ref::<LockedTmpfsInode>()
+            .is_some()
+        || inode
+            .as_any_ref()
+            .downcast_ref::<LockedRamFSInode>()
+            .is_some()
+        || inode
+            .as_any_ref()
+            .downcast_ref::<LockedExt4Inode>()
+            .is_some()
+        || inode
+            .as_any_ref()
+            .downcast_ref::<LockedFATInode>()
+            .is_some()
+}
+
+fn resolve_device_special_inode(
+    inode: Arc<dyn IndexNode>,
+    file_type: FileType,
+) -> Result<Arc<dyn IndexNode>, SystemError> {
+    if !matches!(file_type, FileType::CharDevice | FileType::BlockDevice) {
+        return Ok(inode);
+    }
+
+    let raw_dev = inode.metadata()?.raw_dev;
+    if raw_dev == Default::default() {
+        return Ok(inode);
+    }
+
+    if is_plain_special_inode(&inode) {
+        if let Some(device_inode) = devfs_lookup_device_by_devnum(file_type, raw_dev) {
+            return Ok(device_inode);
+        }
+
+        return Err(SystemError::ENXIO);
+    }
+
+    Ok(inode)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -661,11 +713,12 @@ impl File {
         private_data_init: FilePrivateData,
     ) -> Result<Self, SystemError> {
         let mut inode = inode;
-        let file_type = inode.metadata()?.file_type;
+        let mut file_type = inode.metadata()?.file_type;
         // 检查是否为命名管道（FIFO）
         let is_named_pipe = if file_type == FileType::Pipe {
             if let Some(SpecialNodeData::Pipe(pipe_inode)) = inode.special_node() {
                 inode = pipe_inode;
+                file_type = inode.metadata()?.file_type;
                 true
             } else {
                 false
@@ -677,6 +730,10 @@ impl File {
         // 对于命名管道，自动添加 O_LARGEFILE 标志（符合 Linux 行为）
         if is_named_pipe {
             flags.insert(FileFlags::O_LARGEFILE);
+        }
+
+        if !flags.contains(FileFlags::O_PATH) {
+            inode = resolve_device_special_inode(inode, file_type)?;
         }
 
         let metadata = inode.metadata()?;

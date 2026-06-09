@@ -656,7 +656,8 @@ impl IndexNode for LockedExt4Inode {
         mode: InodeMode,
         dev_t: DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        if mode.contains(InodeMode::S_IFREG) {
+        let file_type = vfs::FileType::from(mode);
+        if file_type == vfs::FileType::File {
             return self.create(filename, vfs::FileType::File, mode);
         }
 
@@ -672,7 +673,10 @@ impl IndexNode for LockedExt4Inode {
         let file_mode = another_ext4::InodeMode::from_bits_truncate(mode.bits() as u16);
 
         // Create inode based on file type
-        let id = if mode.contains(InodeMode::S_IFCHR) || mode.contains(InodeMode::S_IFBLK) {
+        let id = if matches!(
+            file_type,
+            vfs::FileType::CharDevice | vfs::FileType::BlockDevice
+        ) {
             // Character/block device: use mknod to store device number in i_block
             ext4.mknod(
                 inode_num,

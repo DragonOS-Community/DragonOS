@@ -54,6 +54,10 @@ pub trait VirtIODevice: Device {
 pub trait VirtIODriver: Driver {
     fn probe(&self, device: &Arc<dyn VirtIODevice>) -> Result<(), SystemError>;
 
+    fn remove(&self, _device: &Arc<dyn VirtIODevice>) -> Result<(), SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+
     fn shutdown(&self, _device: &Arc<dyn VirtIODevice>) -> Result<(), SystemError> {
         Ok(())
     }

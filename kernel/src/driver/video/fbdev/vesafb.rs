@@ -748,7 +748,7 @@ impl PlatformDriver for VesaFbDriver {
     }
 
     fn remove(&self, _device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError> {
-        todo!()
+        Err(SystemError::ENOSYS)
     }
 
     fn shutdown(&self, _device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError> {

@@ -1163,7 +1163,8 @@ impl IndexNode for LockedTmpfsInode {
             return Err(SystemError::ENOTDIR);
         }
 
-        if unlikely(mode.contains(InodeMode::S_IFREG)) {
+        let file_type = FileType::from(mode);
+        if unlikely(file_type == FileType::File) {
             // Regular file creation must not recurse while holding the directory lock,
             // otherwise self.create() will try to lock the same Mutex and deadlock.
             drop(inode);
@@ -1173,14 +1174,12 @@ impl IndexNode for LockedTmpfsInode {
         let filename = DName::from(filename);
 
         // 确定文件类型
-        let file_type = if mode.contains(InodeMode::S_IFIFO) {
-            FileType::Pipe
-        } else if mode.contains(InodeMode::S_IFCHR) {
-            FileType::CharDevice
-        } else if mode.contains(InodeMode::S_IFBLK) {
-            FileType::BlockDevice
-        } else {
-            FileType::File
+        let file_type = match file_type {
+            FileType::Pipe => FileType::Pipe,
+            FileType::CharDevice => FileType::CharDevice,
+            FileType::BlockDevice => FileType::BlockDevice,
+            FileType::Socket => FileType::Socket,
+            _ => return Err(SystemError::EINVAL),
         };
 
         let nod = Arc::new(LockedTmpfsInode(Mutex::new(TmpfsInode {

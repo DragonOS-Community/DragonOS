@@ -108,8 +108,23 @@ impl Bus for PciBus {
         pci_drv.probe(&pci_dev, &id)
     }
 
-    fn remove(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError> {
-        todo!()
+    fn remove(&self, device: &Arc<dyn Device>) -> Result<(), SystemError> {
+        let drv = device.driver().ok_or(SystemError::EINVAL)?;
+        let pci_drv = drv.cast::<dyn PciDriver>().map_err(|_| {
+            error!(
+                "PciBus::remove() failed: device.driver() is not a PciDriver. Device: '{:?}'",
+                device.name()
+            );
+            SystemError::EINVAL
+        })?;
+        let pci_dev = device.clone().cast::<dyn PciDevice>().map_err(|_| {
+            error!(
+                "PciBus::remove() failed: device is not a PciDevice. Device: '{:?}'",
+                device.name()
+            );
+            SystemError::EINVAL
+        })?;
+        pci_drv.remove(&pci_dev)
     }
 
     fn sync_state(&self, _device: &Arc<dyn Device>) {

@@ -19,36 +19,42 @@ use crate::{
 #[derive(Copy, Debug, Clone, PartialEq, Eq)]
 pub enum SigCode {
     /// sent by kill, sigsend, raise
-    User = 0,
+    User,
     /// queued SIGIO/POLL_IN
-    PollIn = 1,
+    PollIn,
     /// queued SIGIO/POLL_OUT
-    PollOut = 2,
+    PollOut,
     /// queued SIGIO/POLL_MSG
-    PollMsg = 3,
+    PollMsg,
     /// queued SIGIO/POLL_ERR
-    PollErr = 4,
+    PollErr,
     /// queued SIGIO/POLL_PRI
-    PollPri = 5,
+    PollPri,
     /// queued SIGIO/POLL_HUP
-    PollHup = 6,
+    PollHup,
     /// sent by kernel from somewhere
-    Kernel = 0x80,
+    Kernel,
     /// SIGSYS sent by seccomp filter action SECCOMP_RET_TRAP.
     SysSeccomp,
     /// 通过sigqueue发送
-    Queue = -1,
+    Queue,
     /// 定时器过期时发送
-    Timer = -2,
+    Timer,
     /// 当实时消息队列的状态发生改变时发送
-    Mesgq = -3,
+    Mesgq,
     /// 当异步IO完成时发送
-    AsyncIO = -4,
+    AsyncIO,
     /// sent by queued SIGIO
-    SigIO = -5,
+    SigIO,
     /// sent by tgkill/tkill
-    Tkill = -6,
+    Tkill,
+    /// Linux 的正数 si_code 是按 signal 复用的，保留 raw 值避免错误归类。
+    Raw(i32),
 }
+
+pub const SEGV_MAPERR: i32 = 1;
+pub const SEGV_ACCERR: i32 = 2;
+pub const BUS_ADRERR: i32 = 2;
 
 impl SigCode {
     pub fn as_i32(self) -> i32 {
@@ -68,6 +74,7 @@ impl SigCode {
             Self::AsyncIO => -4,
             Self::SigIO => -5,
             Self::Tkill => -6,
+            Self::Raw(code) => code,
         }
     }
 
@@ -87,7 +94,7 @@ impl SigCode {
             -4 => Some(Self::AsyncIO),
             -5 => Some(Self::SigIO),
             -6 => Some(Self::Tkill),
-            _ => None,
+            _ => Some(Self::Raw(x)),
         }
     }
 }
@@ -613,6 +620,19 @@ impl SigInfo {
                     },
                 },
             },
+            SigType::Fault { addr, addr_lsb } => PosixSigInfo {
+                si_signo: self.sig_no,
+                si_errno: self.errno,
+                si_code: self.sig_code.as_i32(),
+                _sifields: PosixSiginfoFields {
+                    _sigfault: PosixSiginfoSigfault {
+                        si_addr: addr,
+                        si_addr_lsb: addr_lsb,
+                        si_band: 0,
+                        si_fd: 0,
+                    },
+                },
+            },
         }
     }
 
@@ -672,6 +692,11 @@ pub enum SigType {
         call_addr: u64,
         syscall: i32,
         arch: u32,
+    },
+    /// synchronous fault signal carrying siginfo_t::si_addr.
+    Fault {
+        addr: u64,
+        addr_lsb: u16,
     },
     // 后续完善下列中的具体字段
     // Timer,

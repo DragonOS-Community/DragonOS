@@ -203,6 +203,66 @@ impl SwitchResult {
 #[derive(Debug)]
 pub struct ProcessManager;
 impl ProcessManager {
+    pub fn is_current(pcb: &Arc<ProcessControlBlock>) -> bool {
+        Arc::ptr_eq(pcb, &Self::current_pcb())
+    }
+
+    pub fn thread_group_leader_of(pcb: &Arc<ProcessControlBlock>) -> Arc<ProcessControlBlock> {
+        pcb.threads_read_irqsave()
+            .group_leader()
+            .unwrap_or_else(|| pcb.clone())
+    }
+
+    /// 遍历 `pcb` 所在线程组中的线程。
+    ///
+    /// 遍历顺序为线程组组长优先，随后遍历组长维护的其他线程列表；
+    /// 回调返回 `false` 时提前停止遍历。
+    pub fn for_each_thread_in_group<F>(pcb: Arc<ProcessControlBlock>, mut func: F)
+    where
+        F: FnMut(Arc<ProcessControlBlock>) -> bool,
+    {
+        let thread_group_leader = Self::thread_group_leader_of(&pcb);
+        if !func(thread_group_leader.clone()) {
+            return;
+        }
+
+        let group_tasks = thread_group_leader
+            .threads_read_irqsave()
+            .group_tasks_clone();
+        for weak in group_tasks {
+            let Some(task) = weak.upgrade() else {
+                continue;
+            };
+            if Arc::ptr_eq(&task, &thread_group_leader) {
+                continue;
+            }
+            if !func(task) {
+                break;
+            }
+        }
+    }
+
+    pub fn thread_group_tasks_snapshot(
+        pcb: Arc<ProcessControlBlock>,
+    ) -> Vec<Arc<ProcessControlBlock>> {
+        let leader = Self::thread_group_leader_of(&pcb);
+        let mut tasks = Vec::new();
+        tasks.push(leader.clone());
+
+        let group_tasks = leader.threads_read_irqsave().group_tasks_clone();
+        for weak in group_tasks {
+            let Some(task) = weak.upgrade() else {
+                continue;
+            };
+            if tasks.iter().any(|existing| Arc::ptr_eq(existing, &task)) {
+                continue;
+            }
+            tasks.push(task);
+        }
+
+        tasks
+    }
+
     #[inline(never)]
     fn init() {
         static INIT_FLAG: AtomicBool = AtomicBool::new(false);

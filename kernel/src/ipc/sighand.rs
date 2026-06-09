@@ -47,6 +47,8 @@ pub struct InnerSigHand {
     pub handlers: Vec<Sigaction>,
     /// 当前线程所属进程要处理的信号
     pub shared_pending: SigPending,
+    /// 进程级信号投递的轮转游标，对应 Linux `signal_struct::curr_target`。
+    pub curr_target: Option<Weak<ProcessControlBlock>>,
     pub flags: SignalFlags,
     /// 线程组退出码（仿照 Linux 的 signal_struct::group_exit_code）
     /// 仅当 flags 中包含 GROUP_EXIT 时才有效
@@ -256,6 +258,18 @@ impl SigHand {
         g.shared_pending.signal_mut().insert(sig.into());
     }
 
+    pub fn curr_target(&self) -> Option<Arc<ProcessControlBlock>> {
+        self.inner().curr_target.as_ref().and_then(Weak::upgrade)
+    }
+
+    pub fn set_curr_target(&self, task: &Arc<ProcessControlBlock>) {
+        self.inner_mut().curr_target = Some(Arc::downgrade(task));
+    }
+
+    pub fn clear_curr_target(&self) {
+        self.inner_mut().curr_target = None;
+    }
+
     // ===== Signal flags helpers =====
     pub fn flags(&self) -> SignalFlags {
         self.inner().flags
@@ -410,6 +424,7 @@ impl Default for InnerSigHand {
             handlers: default_sighandlers(),
             pids: core::array::from_fn(|_| None),
             shared_pending: SigPending::default(),
+            curr_target: None,
             flags: SignalFlags::empty(),
             group_exit_code: 0,
             group_exec_task: None,

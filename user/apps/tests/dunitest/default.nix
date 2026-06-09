@@ -26,8 +26,6 @@ let
     sha256 = "sha256-HIHMxAUR4bjmFLoltJeIAVSulVQ6kVuIT2Ku+lwAx/4=";
   };
 
-  suites = [ "demo" "normal" "fuse" ];
-
   # 1. Build the Rust runner separately
   # This ensures that changes to test scripts or data don't trigger a Rust rebuild.
   runner = rustPlatform.buildRustPackage {
@@ -61,6 +59,7 @@ let
     src = lib.sourceByRegex ./. [
       "^suites$"
       "^suites/.*"
+      "^Makefile$"
       "^whitelist\\.txt$"
       "^scripts$"
       "^scripts/run_tests\\.sh$"
@@ -73,17 +72,10 @@ let
     buildPhase = ''
       runHook preBuild
 
-      for suite in ${lib.concatStringsSep " " suites}; do
-        mkdir -p bin/$suite
-        for f in suites/$suite/*.cc; do
-          name=$(basename "$f" .cc)
-          echo "编译测例: $f -> bin/$suite/''${name}_test"
-          $CXX -Wall -O2 -std=c++17 -pthread \
-            -I${gtest}/googletest -I${gtest}/googletest/include \
-            "$f" ${gtest}/googletest/src/gtest-all.cc \
-            -o bin/$suite/''${name}_test
-        done
-      done
+      make -j"''${NIX_BUILD_CORES:-1}" build-suites \
+        GTEST_ROOT=${gtest} \
+        CXX="$CXX" \
+        CXXFLAGS="-Wall -O2 -std=c++17 -pthread"
 
       runHook postBuild
     '';

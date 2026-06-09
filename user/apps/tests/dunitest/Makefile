@@ -18,6 +18,7 @@ RUNNER_DIR = runner
 RUNNER_BIN = $(RUNNER_DIR)/target/$(RUST_TARGET)/release/dunitest-runner
 RESULTS_DIR = results
 BIN_DIR = bin
+BUILD_DIR = build
 
 # 要编译的测试套件目录列表（suites/ 下的子目录名）
 SUITES = demo normal fuse
@@ -26,6 +27,7 @@ GTEST_ROOT = third_party/googletest
 GTEST_REPO = https://git.mirrors.dragonos.org.cn/DragonOS-Community/googletest
 GTEST_TAG = v1.17.0
 GTEST_SRC = $(GTEST_ROOT)/googletest/src/gtest-all.cc
+GTEST_OBJ = $(BUILD_DIR)/gtest/gtest-all.o
 GTEST_TMP_ROOT = $(GTEST_ROOT).tmp
 CXX ?= g++
 CXXFLAGS ?= -Wall -O2 -std=c++17 -pthread
@@ -57,10 +59,15 @@ $(GTEST_SRC):
 
 build-suites: $(TEST_BINS)
 
-$(BIN_DIR)/%_test: suites/%.cc $(GTEST_SRC)
+$(GTEST_OBJ): $(GTEST_SRC)
+	@mkdir -p "$(dir $@)"
+	@echo "编译 googletest: $(GTEST_SRC) -> $@"
+	@$(CXX) $(CXXFLAGS) $(GTEST_INCLUDES) -c "$(GTEST_SRC)" -o "$@"
+
+$(BIN_DIR)/%_test: suites/%.cc $(GTEST_OBJ)
 	@mkdir -p "$(dir $@)"
 	@echo "编译测例: $< -> $@"
-	@$(CXX) $(CXXFLAGS) $(GTEST_INCLUDES) "$<" $(GTEST_SRC) -o "$@"
+	@$(CXX) $(CXXFLAGS) $(GTEST_INCLUDES) "$<" $(GTEST_OBJ) -o "$@"
 
 run: build
 	@$(RUNNER_BIN) --bin-dir $(BIN_DIR) --results-dir $(RESULTS_DIR)
@@ -83,7 +90,7 @@ install: build
 	@echo "安装完成"
 
 clean:
-	@rm -rf $(RESULTS_DIR) install $(BIN_DIR)
+	@rm -rf $(RESULTS_DIR) install $(BIN_DIR) $(BUILD_DIR)
 	@cd $(RUNNER_DIR) && cargo clean
 
 fmt:

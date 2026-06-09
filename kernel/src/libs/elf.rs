@@ -129,7 +129,7 @@ impl ElfLoader {
     /// - `user_vm_guard` - 用户虚拟地址空间
     /// - `start` - 本次映射的起始地址
     /// - `end` - 本次映射的结束地址（不包含）
-    /// - `prot_flags` - 本次映射的权限
+    /// - `prot_flags` - BSS 所属 PT_LOAD 段的权限
     fn set_elf_brk(
         &self,
         user_vm_guard: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
@@ -144,7 +144,7 @@ impl ElfLoader {
             let r = user_vm_guard.map_anonymous(
                 start,
                 end - start,
-                prot_flags,
+                Self::elf_brk_prot_flags(prot_flags),
                 MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED_NOREPLACE,
                 false,
                 true,
@@ -174,6 +174,18 @@ impl ElfLoader {
             (addr.data() + CurrentElfArch::ELF_PAGE_SIZE - 1)
                 & (!(CurrentElfArch::ELF_PAGE_SIZE - 1)),
         )
+    }
+
+    /// 生成 ELF brk/BSS 匿名映射权限。
+    ///
+    /// Linux `vm_brk_flags()` 只从 PT_LOAD 权限中额外透传 exec 位；
+    /// 基础 data VMA 权限来自 `VM_DATA_DEFAULT_FLAGS`，这里显式表达为可读写。
+    fn elf_brk_prot_flags(load_prot_flags: ProtFlags) -> ProtFlags {
+        let mut prot = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
+        if load_prot_flags.contains(ProtFlags::PROT_EXEC) {
+            prot |= ProtFlags::PROT_EXEC;
+        }
+        prot
     }
 
     /// 映射只读ELF段（文件映射）
@@ -452,7 +464,7 @@ impl ElfLoader {
     fn load_elf_interp(
         interp_elf_ex: &mut ExecParam,
         load_bias: usize,
-    ) -> Result<BinaryLoaderResult, ExecError> {
+    ) -> Result<(BinaryLoaderResult, VirtAddr), ExecError> {
         // log::debug!("loading elf interp");
         // defer!({
         //     log::debug!("load_elf_interp done");
@@ -557,12 +569,7 @@ impl ElfLoader {
             if bss_prot.is_none() {
                 return Err(ExecError::InvalidParemeter);
             }
-            let mut bss_prot = bss_prot.unwrap();
-            if bss_prot.contains(ProtFlags::PROT_EXEC) {
-                bss_prot = ProtFlags::PROT_EXEC;
-            } else {
-                bss_prot = ProtFlags::PROT_NONE;
-            }
+            let bss_prot = Self::elf_brk_prot_flags(bss_prot.unwrap());
             interp_elf_ex
                 .vm()
                 .clone()
@@ -581,14 +588,13 @@ impl ElfLoader {
                     _ => return ExecError::InvalidParemeter,
                 })?;
         }
-        load_addr += TryInto::<usize>::try_into(interp_hdr.e_entry).unwrap();
-        if load_addr > MMArch::USER_END_VADDR {
-            return Err(ExecError::BadAddress(Some(
-                load_addr + TryInto::<usize>::try_into(interp_hdr.e_entry).unwrap(),
-            )));
+        let interp_base = load_addr;
+        let entry = load_addr + TryInto::<usize>::try_into(interp_hdr.e_entry).unwrap();
+        if entry > MMArch::USER_END_VADDR {
+            return Err(ExecError::BadAddress(Some(entry)));
         }
         // log::debug!("sucessfully load elf interp");
-        return Ok(BinaryLoaderResult::new(load_addr));
+        return Ok((BinaryLoaderResult::new(entry), interp_base));
     }
 
     /// 加载ELF文件到用户空间
@@ -684,6 +690,7 @@ impl ElfLoader {
         param: &mut ExecParam,
         entrypoint_vaddr: VirtAddr,
         phdr_vaddr: Option<VirtAddr>,
+        interpreter_base: Option<VirtAddr>,
         ehdr: &elf::file::FileHeader<AnyEndian>,
     ) -> Result<(), ExecError> {
         use crate::process::rseq::{ORIG_RSEQ_SIZE, RSEQ_ALIGN};
@@ -704,6 +711,10 @@ impl ElfLoader {
         init_info
             .auxv
             .insert(AtType::Entry as u8, entrypoint_vaddr.data());
+        init_info.auxv.insert(
+            AtType::Base as u8,
+            interpreter_base.unwrap_or(VirtAddr::new(0)).data(),
+        );
 
         // 添加 rseq 相关的 auxv
         init_info
@@ -1167,6 +1178,7 @@ impl BinaryLoader for ElfLoader {
         start_data = start_data.map(|v| v + load_bias);
         end_data = end_data.map(|v| v + load_bias);
         let mut interp_load_addr: Option<VirtAddr> = None;
+        let mut interpreter_base: Option<VirtAddr> = None;
         // debug!(
         //     "to set brk: elf_bss: {:?}, elf_brk: {:?}, bss_prot_flags: {:?}",
         //     elf_bss,
@@ -1189,15 +1201,23 @@ impl BinaryLoader for ElfLoader {
         drop(user_vm);
         if let Some(mut interpreter) = interpreter {
             // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#1249
-            let elf_entry = Self::load_elf_interp(&mut interpreter, load_bias)?.entry_point();
+            let interp = Self::load_elf_interp(&mut interpreter, load_bias)?;
+            let elf_entry = interp.0.entry_point();
             interp_load_addr = Some(elf_entry);
+            interpreter_base = Some(interp.1);
             _reloc_func_desc = elf_entry.data();
             //参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#1269
             //TODO allow_write_access(interpreter);
         }
         // debug!("to create auxv");
         let mut user_vm = binding.write();
-        self.create_auxv(param, program_entrypoint, phdr_vaddr, &ehdr)?;
+        self.create_auxv(
+            param,
+            program_entrypoint,
+            phdr_vaddr,
+            interpreter_base,
+            &ehdr,
+        )?;
 
         // debug!("auxv create ok");
         user_vm.start_code = start_code.unwrap_or(VirtAddr::new(0));

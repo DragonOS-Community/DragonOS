@@ -105,11 +105,9 @@ impl Syscall for SysCapset {
 
         // 获取旧凭据
         let old = pcb.cred();
-        let p_e_old = old.cap_effective;
         let p_p_old = old.cap_permitted.bits();
         let p_i_old = old.cap_inheritable.bits();
         let bset = old.cap_bset.bits();
-        let _ambient_old = old.cap_ambient.bits();
 
         // 规则 1：pE_new ⊆ pP_new
         if (p_e_new & !p_p_new) != 0 {
@@ -121,22 +119,13 @@ impl Syscall for SysCapset {
             return Err(SystemError::EPERM);
         }
 
-        // 规则 3：pI_new 限幅（对齐 Linux：受 CAP_SETPCAP 与 bset 约束）
-        // - 拥有 CAP_SETPCAP：pI_new ⊆ (pI_old ∪ pP_old) ∩ bset
-        // - 不拥有：pI_new ⊆ (pI_old ∪ pP_old) 且 pI_new ⊆ (pI_old ∪ bset)
-        // 使用公开常量 CAP_SETPCAP_BIT 判定是否拥有 CAP_SETPCAP
-        let has_setpcap = p_e_old.contains(CAPFlags::CAP_SETPCAP);
-        if has_setpcap {
-            let inh_cap_allow = (p_i_old | p_p_old) & bset;
-            if (p_i_new & !inh_cap_allow) != 0 {
-                return Err(SystemError::EPERM);
-            }
-        } else {
-            let inh_cap_allow_1 = p_i_old | p_p_old;
-            let inh_cap_allow_2 = p_i_old | bset;
-            if (p_i_new & !inh_cap_allow_1) != 0 || (p_i_new & !inh_cap_allow_2) != 0 {
-                return Err(SystemError::EPERM);
-            }
+        // 规则 3：pI_new 限幅（对齐 Linux 6.6 security/commoncap.c cap_capset）
+        let inh_capped = !old.has_capability(CAPFlags::CAP_SETPCAP);
+        if inh_capped && (p_i_new & !(p_i_old | p_p_old)) != 0 {
+            return Err(SystemError::EPERM);
+        }
+        if (p_i_new & !(p_i_old | bset)) != 0 {
+            return Err(SystemError::EPERM);
         }
 
         // 构造新 cred（克隆老 cred，更新能力集）
@@ -144,7 +133,9 @@ impl Syscall for SysCapset {
         new_cred.cap_effective = CAPFlags::from_bits_truncate(p_e_new);
         new_cred.cap_permitted = CAPFlags::from_bits_truncate(p_p_new);
         new_cred.cap_inheritable = CAPFlags::from_bits_truncate(p_i_new);
-        // ambient 能力不由 capset 修改，保持不变
+        // ambient：与 Linux 一致，裁剪为 permitted ∩ inheritable 的子集
+        new_cred.cap_ambient &= CAPFlags::from_bits_truncate(p_p_new);
+        new_cred.cap_ambient &= CAPFlags::from_bits_truncate(p_i_new);
 
         // 原子替换 cred（需要 PCB 暴露 set_cred）
         pcb.set_cred(Cred::new_arc(new_cred))?;

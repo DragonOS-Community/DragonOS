@@ -81,12 +81,6 @@ impl SigCode {
     pub fn try_from_i32(x: i32) -> Option<SigCode> {
         match x {
             0 => Some(Self::User),
-            1 => Some(Self::PollIn),
-            2 => Some(Self::PollOut),
-            3 => Some(Self::PollMsg),
-            4 => Some(Self::PollErr),
-            5 => Some(Self::PollPri),
-            6 => Some(Self::PollHup),
             0x80 => Some(Self::Kernel),
             -1 => Some(Self::Queue),
             -2 => Some(Self::Timer),

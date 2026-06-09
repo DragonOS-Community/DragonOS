@@ -780,6 +780,12 @@ fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
     }
 }
 
+fn recalc_sigpending_and_wake(pcb: Arc<ProcessControlBlock>) {
+    if pcb.recalc_sigpending_tsk() {
+        signal_wake_up(pcb, false);
+    }
+}
+
 fn has_pending_signals(sigset: &SigSet, blocked: &SigSet) -> bool {
     sigset.bits() & (!blocked.bits()) != 0
 }
@@ -886,10 +892,7 @@ fn __set_task_blocked(pcb: &Arc<ProcessControlBlock>, new_set: &SigSet) {
         newblocked.remove(*guard.sig_blocked());
         drop(guard);
 
-        // 从主线程开始去遍历
-        if let Some(group_leader) = pcb.threads_read_irqsave().group_leader() {
-            retarget_shared_pending(group_leader, newblocked);
-        }
+        retarget_shared_pending(pcb.clone(), newblocked);
     }
     *pcb.sig_info_mut().sig_block_mut() = *new_set;
     pcb.recalc_sigpending();
@@ -916,26 +919,40 @@ fn retarget_shared_pending(pcb: Arc<ProcessControlBlock>, which: SigSet) {
         return;
     }
 
-    ProcessManager::for_each_thread_in_group(pcb, |task| {
+    let tasks = ProcessManager::thread_group_tasks_snapshot(pcb.clone());
+    if tasks.len() <= 1 {
+        return;
+    }
+
+    let start_index = tasks
+        .iter()
+        .position(|task| Arc::ptr_eq(task, &pcb))
+        .unwrap_or(0);
+
+    for offset in 1..tasks.len() {
+        let idx = (start_index + offset) % tasks.len();
+        let task = tasks[idx].clone();
         if task.flags().contains(ProcessFlags::EXITING) {
-            return true;
+            continue;
         }
 
         // 若该线程把 retarget 中的信号全部屏蔽，则它无法处理这些 shared_pending 信号
         let blocked = *task.sig_info_irqsave().sig_blocked();
         if retarget.difference(blocked).is_empty() {
-            return true;
+            continue;
         }
 
         // 当前线程能处理的信号不需要再重定向给后续线程。
         retarget = retarget.intersection(blocked);
 
         if !task.has_pending_signal_fast() {
-            signal_wake_up(task.clone(), false);
+            recalc_sigpending_and_wake(task.clone());
         }
 
-        !retarget.is_empty()
-    });
+        if retarget.is_empty() {
+            break;
+        }
+    }
     // debug!("retarget_shared_pending done!");
 }
 

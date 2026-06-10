@@ -58,7 +58,7 @@ use crate::{
     },
     mm::{
         percpu::{PerCpu, PerCpuVar},
-        set_IDLE_PROCESS_ADDRESS_SPACE,
+        set_IDLE_PROCESS_ADDRESS_SPACE, IDLE_PROCESS_ADDRESS_SPACE,
         ucontext::AddressSpace,
         PhysAddr, VirtAddr,
     },
@@ -888,8 +888,6 @@ impl ProcessManager {
             }
         }
 
-        // 关中断
-        let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let pid: Arc<Pid>;
         let raw_pid = current_pcb.raw_pid();
         // log::debug!("[exit: {}]", raw_pid.data());
@@ -947,13 +945,6 @@ impl ProcessManager {
             }
             pcb.sig_info_mut().set_tty(None);
 
-            // 在最后，调用 exit_notify 之前，设置调度状态为 Exited
-            // 对标 Linux do_task_dead() 中 set_special_state(TASK_DEAD)：
-            // 在 pi_lock 保护下完成状态写入，序列化与 wakeup() 中 pi_lock 保护的并发唤醒。
-            {
-                let _pi_guard = pcb.sched_info.pi_lock_irqsave();
-                pcb.sched_info.set_state(ProcessState::Exited(exit_code));
-            }
             // Linux 语义：zombie 不应出现在 cgroup.procs 中。
             // 必须持有 cgroup_accounting_lock 以避免与 cgroup.procs 写入死锁
             {
@@ -985,27 +976,45 @@ impl ProcessManager {
             // will remain, and subsequent flushes by other threads on the same mm would still target
             // this CPU and send spurious IPIs.
             //
-            // Note that this CPU's hardware page table still points to this mm, but __schedule will
-            // immediately switch to idle, whose IDLE_PROCESS_ADDRESS_SPACE will re-set this CPU's
-            // active_cpus bit and write the correct per-CPU TlbState. So clearing the old mm's bit
-            // here is sufficient.
-            {
+            // Switch this exiting task to the idle address space before dropping the old user mm.
+            // This mirrors Linux's lazy-TLB exit boundary: the expensive mm teardown runs in a
+            // sleepable context, while the task still has a safe kernel-only mm if it is scheduled
+            // during teardown.
+            let old_user_vm = {
+                let idle_vm = IDLE_PROCESS_ADDRESS_SPACE();
+                let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
                 let cpu = smp_get_processor_id();
-                if let Some(old_vm) = pcb.basic().user_vm() {
+                let mut basic = pcb.basic_mut();
+                let old_vm = unsafe { basic.replace_user_vm(Some(idle_vm.clone())) };
+                unsafe { idle_vm.make_current() };
+                if let Some(old_vm) = old_vm.as_ref() {
                     old_vm.active_cpus_clear(cpu);
                 }
+                idle_vm.active_cpus_set(cpu);
+                unsafe { crate::mm::tlb::tlb_state_set_loaded_mm(idle_vm) };
+                drop(basic);
+                drop(irq_guard);
+                old_vm
+            };
+
+            drop(old_user_vm);
+
+            let _final_irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+            // 在最后，调用 exit_notify 之前，设置调度状态为 Exited
+            // 对标 Linux do_task_dead() 中 set_special_state(TASK_DEAD)：
+            // 在 pi_lock 保护下完成状态写入，序列化与 wakeup() 中 pi_lock 保护的并发唤醒。
+            {
+                let _pi_guard = pcb.sched_info.pi_lock_irqsave();
+                pcb.sched_info.set_state(ProcessState::Exited(exit_code));
             }
-
-            unsafe { pcb.basic_mut().set_user_vm(None) };
-
             ProcessManager::exit_notify(&pcb);
-        }
 
-        __schedule_with_current(SchedMode::SM_NONE, current_pcb);
-        error!("raw_pid {raw_pid:?} exited but sched again!");
-        #[allow(clippy::empty_loop)]
-        loop {
-            spin_loop();
+            __schedule_with_current(SchedMode::SM_NONE, current_pcb);
+            error!("raw_pid {raw_pid:?} exited but sched again!");
+            #[allow(clippy::empty_loop)]
+            loop {
+                spin_loop();
+            }
         }
     }
 
@@ -2792,6 +2801,18 @@ impl ProcessBasicInfo {
 
     pub unsafe fn set_user_vm(&mut self, user_vm: Option<Arc<AddressSpace>>) {
         self.user_vm = user_vm;
+    }
+
+    /// Replace the task's user address space and return the old one without
+    /// dropping it while this lock is still held. The caller must preserve the
+    /// active_cpus and TLB-state ordering required by the mm switch/exit path.
+    pub unsafe fn replace_user_vm(
+        &mut self,
+        user_vm: Option<Arc<AddressSpace>>,
+    ) -> Option<Arc<AddressSpace>> {
+        let old = self.user_vm.take();
+        self.user_vm = user_vm;
+        old
     }
 
     pub fn try_fd_table(&self) -> Option<Arc<RwSem<FileDescriptorVec>>> {

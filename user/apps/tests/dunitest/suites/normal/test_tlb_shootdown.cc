@@ -54,26 +54,38 @@ struct ThreadCtx {
     volatile uint8_t* base;
     size_t len;
     std::atomic<int>* run;
+    std::atomic<int>* ready;
 };
+
+void cpu_pause_loop(int rounds) {
+    for (volatile int i = 0; i < rounds; ++i) {
+#if defined(__x86_64__) || defined(__i386__)
+        __asm__ __volatile__("pause" ::: "memory");
+#else
+        __asm__ __volatile__("" ::: "memory");
+#endif
+    }
+}
 
 void* hammer_writer(void* arg) {
     auto* ctx = static_cast<ThreadCtx*>(arg);
     size_t off = 0;
-    size_t spins = 0;
 
     if (sigsetjmp(g_segv_jmp, 1) != 0) {
-        sched_yield();
+        cpu_pause_loop(1024);
     }
     g_segv_active = 1;
 
+    bool published_ready = false;
     while (ctx->run->load(std::memory_order_acquire)) {
         ctx->base[off] = static_cast<uint8_t>(off);
+        if (!published_ready && ctx->ready != nullptr) {
+            ctx->ready->fetch_add(1, std::memory_order_release);
+            published_ready = true;
+        }
         off += 13;
         if (off >= ctx->len) {
             off = 0;
-        }
-        if ((++spins & 0xff) == 0) {
-            sched_yield();
         }
     }
 
@@ -82,12 +94,13 @@ void* hammer_writer(void* arg) {
 }
 
 int start_workers(uint8_t* buf, size_t len, std::atomic<int>* run, pthread_t* threads,
-                  ThreadCtx* ctxs) {
+                  ThreadCtx* ctxs, std::atomic<int>* ready = nullptr) {
     int created = 0;
     for (; created < kNrThreads; ++created) {
         ctxs[created].base = buf + created * kPageSize;
         ctxs[created].len = len / kNrPages;
         ctxs[created].run = run;
+        ctxs[created].ready = ready;
         if (pthread_create(&threads[created], nullptr, hammer_writer, &ctxs[created]) != 0) {
             fprintf(stderr, "pthread_create failed\n");
             run->store(0, std::memory_order_release);
@@ -98,6 +111,18 @@ int start_workers(uint8_t* buf, size_t len, std::atomic<int>* run, pthread_t* th
         }
     }
     return 0;
+}
+
+int wait_for_workers_ready(std::atomic<int>* ready) {
+    constexpr int kMaxSpins = 2000000;
+    for (int i = 0; i < kMaxSpins; ++i) {
+        if (ready->load(std::memory_order_acquire) >= kNrThreads) {
+            return 0;
+        }
+        cpu_pause_loop(64);
+    }
+    fprintf(stderr, "workers did not become ready\n");
+    return -1;
 }
 
 void stop_workers(std::atomic<int>* run, pthread_t* threads) {
@@ -117,10 +142,17 @@ int case_mprotect_downgrade() {
     }
     memset(buf, 0, len);
 
+    // Writer state: nonzero = write, 0 = stop.
     std::atomic<int> run{1};
+    std::atomic<int> ready{0};
     pthread_t threads[kNrThreads];
     ThreadCtx ctxs[kNrThreads];
-    if (start_workers(buf, len, &run, threads, ctxs) != 0) {
+    if (start_workers(buf, len, &run, threads, ctxs, &ready) != 0) {
+        munmap(buf, len);
+        return -1;
+    }
+    if (wait_for_workers_ready(&ready) != 0) {
+        stop_workers(&run, threads);
         munmap(buf, len);
         return -1;
     }
@@ -169,14 +201,19 @@ int case_munmap_while_writing() {
         memset(buf, 0, len);
 
         std::atomic<int> run{1};
+        std::atomic<int> ready{0};
         pthread_t threads[kNrThreads];
         ThreadCtx ctxs[kNrThreads];
-        if (start_workers(buf, len, &run, threads, ctxs) != 0) {
+        if (start_workers(buf, len, &run, threads, ctxs, &ready) != 0) {
             munmap(buf, len);
             return -1;
         }
 
-        usleep(2000);
+        if (wait_for_workers_ready(&ready) != 0) {
+            stop_workers(&run, threads);
+            munmap(buf, len);
+            return -1;
+        }
         stop_workers(&run, threads);
 
         if (munmap(buf, len) < 0) {
@@ -213,6 +250,7 @@ struct HammerCtx {
     volatile uint8_t* base;
     size_t len;
     std::atomic<int>* run;
+    std::atomic<int>* ready;
     uint8_t mark;
 };
 
@@ -220,21 +258,24 @@ void* hammer_writer_whole(void* arg) {
     auto* ctx = static_cast<HammerCtx*>(arg);
     size_t off = 0;
     uint8_t v = ctx->mark;
-    size_t spins = 0;
 
     if (sigsetjmp(g_segv_jmp, 1) != 0) {
-        sched_yield();
+        _exit(12);
     }
     g_segv_active = 1;
 
-    while (ctx->run->load(std::memory_order_acquire)) {
+    if (ctx->ready != nullptr) {
+        for (size_t off = 0; off < ctx->len; off += kPageSize) {
+            ctx->base[off] = v++;
+        }
+        ctx->ready->fetch_add(1, std::memory_order_release);
+    }
+
+    while (ctx->run->load(std::memory_order_acquire) != 0) {
         ctx->base[off] = v++;
         off += 13;
         if (off >= ctx->len) {
             off = 0;
-        }
-        if ((++spins & 0xff) == 0) {
-            sched_yield();
         }
     }
 
@@ -268,6 +309,11 @@ void* hammer_writer_whole(void* arg) {
 //     pages for the parent mm. The child's physical pages stay pristine.
 int case_fork_cow_stale_tlb() {
     const size_t len = kNrPages * kPageSize;
+    constexpr size_t kSnapStride = 256;
+    constexpr size_t kSnapCount = (kNrPages * kPageSize) / kSnapStride;
+    constexpr size_t kSnapMapLen = kPageSize;
+    static_assert(kSnapCount <= kSnapMapLen, "snapshot mapping too small");
+
     auto* buf = static_cast<uint8_t*>(
         mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     if (buf == MAP_FAILED) {
@@ -276,7 +322,24 @@ int case_fork_cow_stale_tlb() {
     }
     memset(buf, 0, len);
 
+    auto* snap = static_cast<uint8_t*>(
+        mmap(nullptr, kSnapMapLen, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (snap == MAP_FAILED) {
+        perror("mmap snapshot");
+        munmap(buf, len);
+        return -1;
+    }
+
+    int snapshot_pipe[2];
+    if (pipe(snapshot_pipe) != 0) {
+        perror("pipe");
+        munmap(snap, kSnapMapLen);
+        munmap(buf, len);
+        return -1;
+    }
+
     std::atomic<int> run{1};
+    std::atomic<int> ready{0};
     pthread_t threads[kNrThreads];
     HammerCtx ctxs[kNrThreads];
     int created = 0;
@@ -284,6 +347,7 @@ int case_fork_cow_stale_tlb() {
         ctxs[created].base = buf;
         ctxs[created].len = len;
         ctxs[created].run = &run;
+        ctxs[created].ready = &ready;
         ctxs[created].mark = static_cast<uint8_t>(0x10 + created);
         if (pthread_create(&threads[created], nullptr, hammer_writer_whole, &ctxs[created]) != 0) {
             fprintf(stderr, "pthread_create failed\n");
@@ -291,14 +355,29 @@ int case_fork_cow_stale_tlb() {
             for (int i = 0; i < created; ++i) {
                 pthread_join(threads[i], nullptr);
             }
+            close(snapshot_pipe[0]);
+            close(snapshot_pipe[1]);
+            munmap(snap, kSnapMapLen);
             munmap(buf, len);
             return -1;
         }
     }
 
-    // Give the hammer threads a chance to spread across multiple CPUs so they
-    // really populate writable TLB entries everywhere.
-    usleep(5000);
+    // Wait until each hammer has touched the full buffer once. Keep them active
+    // across fork so the parent mm is still active on remote CPUs when
+    // try_clone() write-protects parent PTEs and performs the parent-side
+    // shootdown.
+    if (wait_for_workers_ready(&ready) != 0) {
+        run.store(0, std::memory_order_release);
+        for (int i = 0; i < kNrThreads; ++i) {
+            pthread_join(threads[i], nullptr);
+        }
+        close(snapshot_pipe[0]);
+        close(snapshot_pipe[1]);
+        munmap(snap, kSnapMapLen);
+        munmap(buf, len);
+        return -1;
+    }
 
     pid_t pid = fork();
     if (pid < 0) {
@@ -307,51 +386,83 @@ int case_fork_cow_stale_tlb() {
         for (int i = 0; i < kNrThreads; ++i) {
             pthread_join(threads[i], nullptr);
         }
+        close(snapshot_pipe[0]);
+        close(snapshot_pipe[1]);
+        munmap(snap, kSnapMapLen);
         munmap(buf, len);
         return -1;
     }
 
     if (pid == 0) {
+        close(snapshot_pipe[0]);
+        volatile uint8_t* child_buf = buf;
         // Child. Snapshot `buf` immediately so we know what the post-fork
         // COW-shared physical pages look like from our point of view. Any
         // subsequent divergence in a sampled byte must be a stale-TLB leak
         // from the parent mm: the child has only one thread and it never
         // writes `buf` itself.
         //
-        // Sample every 256 bytes (16 samples/page). That's 1 KiB per page of
-        // buf state captured, which is more than enough to notice a leak.
-        constexpr size_t kSnapStride = 256;
-        const size_t snap_count = len / kSnapStride;
-        uint8_t* snap = new uint8_t[snap_count];
-        for (size_t i = 0; i < snap_count; ++i) {
-            snap[i] = buf[i * kSnapStride];
+        // Sample every 256 bytes (16 samples/page). `snap` was mmap'ed before
+        // creating worker threads so the post-fork child does not enter
+        // malloc/free or stdio paths while only one thread survived fork().
+        for (size_t i = 0; i < kSnapCount; ++i) {
+            snap[i] = child_buf[i * kSnapStride];
         }
+
+        const uint8_t token = 1;
+        if (write(snapshot_pipe[1], &token, sizeof(token)) != sizeof(token)) {
+            _exit(11);
+        }
+        close(snapshot_pipe[1]);
 
         constexpr int kRounds = 400;
         for (int r = 0; r < kRounds; ++r) {
-            for (size_t i = 0; i < snap_count; ++i) {
-                const uint8_t v = buf[i * kSnapStride];
+            for (size_t i = 0; i < kSnapCount; ++i) {
+                const uint8_t v = child_buf[i * kSnapStride];
                 if (v != snap[i]) {
-                    fprintf(stderr,
-                            "FAIL: child observed parent's stale-TLB write: "
-                            "buf[%zu]: 0x%02x -> 0x%02x (round %d)\n",
-                            i * kSnapStride, snap[i], v, r);
-                    delete[] snap;
                     _exit(10);
                 }
             }
-            sched_yield();
         }
-        delete[] snap;
         _exit(0);
     }
 
-    int status = 0;
-    const pid_t wp = waitpid(pid, &status, 0);
+    close(snapshot_pipe[1]);
+    uint8_t token = 0;
+    ssize_t nread = 0;
+    do {
+        nread = read(snapshot_pipe[0], &token, sizeof(token));
+    } while (nread < 0 && errno == EINTR);
+    close(snapshot_pipe[0]);
+    if (nread != sizeof(token) || token != 1) {
+        fprintf(stderr, "child did not publish COW snapshot\n");
+        run.store(0, std::memory_order_release);
+        for (int i = 0; i < kNrThreads; ++i) {
+            pthread_join(threads[i], nullptr);
+        }
+        int status = 0;
+        waitpid(pid, &status, 0);
+        munmap(snap, kSnapMapLen);
+        munmap(buf, len);
+        return -1;
+    }
+
+    // Keep parent writes active for a bounded post-snapshot window without
+    // relying on sched_yield() or nanosleep() progress semantics.
+    volatile uint8_t* parent_buf = buf;
+    for (int round = 0; round < 128; ++round) {
+        for (size_t i = 0; i < kSnapCount; ++i) {
+            parent_buf[i * kSnapStride] = static_cast<uint8_t>(round + i);
+        }
+    }
     run.store(0, std::memory_order_release);
     for (int i = 0; i < kNrThreads; ++i) {
         pthread_join(threads[i], nullptr);
     }
+
+    int status = 0;
+    const pid_t wp = waitpid(pid, &status, 0);
+    munmap(snap, kSnapMapLen);
     munmap(buf, len);
 
     if (wp != pid) {
@@ -390,5 +501,6 @@ int main(int argc, char** argv) {
     }
 
     ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
+    const int rc = RUN_ALL_TESTS();
+    _exit(rc == 0 ? 0 : 1);
 }

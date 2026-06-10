@@ -14,7 +14,11 @@ use std::{
 };
 
 #[derive(Debug, Parser)]
-#[command(name = "dunitest-runner", version, about = "DragonOS dunitest runner (M1)")]
+#[command(
+    name = "dunitest-runner",
+    version,
+    about = "DragonOS dunitest runner (M1)"
+)]
 struct Cli {
     #[arg(long, default_value = "bin")]
     bin_dir: PathBuf,
@@ -49,14 +53,7 @@ fn main() -> Result<()> {
 
     if cli.list {
         for t in &manifest.tests {
-            if select_test(
-                t,
-                &cli.patterns,
-                whitelist.as_ref(),
-                blocklist.as_ref(),
-            )
-            .is_none()
-            {
+            if select_test(t, &cli.patterns, whitelist.as_ref(), blocklist.as_ref()).is_none() {
                 println!("{}", t.name);
             }
         }
@@ -68,12 +65,9 @@ fn main() -> Result<()> {
 
     let mut results: Vec<CaseResult> = Vec::new();
     for test in &manifest.tests {
-        if let Some(skip_reason) = select_test(
-            test,
-            &cli.patterns,
-            whitelist.as_ref(),
-            blocklist.as_ref(),
-        ) {
+        if let Some(skip_reason) =
+            select_test(test, &cli.patterns, whitelist.as_ref(), blocklist.as_ref())
+        {
             let skipped = CaseResult {
                 name: test.name.clone(),
                 status: CaseStatus::Skipped,
@@ -86,10 +80,7 @@ fn main() -> Result<()> {
                 gtest_failed: 0,
                 gtest_skipped: 0,
             };
-            println!(
-                "[RUNNER] SKIP: {} reason={}",
-                skipped.name, skipped.message
-            );
+            println!("[RUNNER] SKIP: {} reason={}", skipped.name, skipped.message);
             results.push(skipped);
             continue;
         }

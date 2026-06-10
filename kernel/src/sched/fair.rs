@@ -90,7 +90,10 @@ impl FairSchedEntity {
             my_cfs_rq: None,
             on_rq: OnRq::None,
             slice: SYSCTL_SHCED_BASE_SLICE.load(Ordering::SeqCst),
-            load: Default::default(),
+            load: LoadWeight {
+                weight: LoadWeight::NICE_0_LOAD,
+                inv_weight: 0,
+            },
             deadline: Default::default(),
             min_deadline: Default::default(),
             exec_start: Default::default(),
@@ -182,11 +185,11 @@ impl FairSchedEntity {
     }
 
     pub fn calculate_delta_fair(&self, delta: u64) -> u64 {
-        if unlikely(self.load.weight != LoadWeight::NICE_0_LOAD_SHIFT as u64) {
+        if unlikely(self.load.weight != LoadWeight::NICE_0_LOAD) {
             return self
                 .force_mut()
                 .load
-                .calculate_delta(delta, LoadWeight::NICE_0_LOAD_SHIFT as u64);
+                .calculate_delta(delta, LoadWeight::NICE_0_LOAD);
         };
 
         delta
@@ -518,6 +521,7 @@ impl CfsRunQueue {
         let delta_exec = curr
             .sum_exec_runtime
             .saturating_sub(curr.prev_sum_exec_runtime);
+
         if delta_exec < SYSCTL_SHCED_MIN_GRANULARITY.load(Ordering::SeqCst) {
             return;
         }
@@ -576,6 +580,10 @@ impl CfsRunQueue {
 
         let now = self.rq().clock_task();
         let curr = curr.unwrap();
+        if unlikely(!curr.on_rq()) {
+            self.set_current(Weak::default());
+            return;
+        }
 
         fence(Ordering::SeqCst);
         if unlikely(now <= curr.exec_start) {
@@ -648,10 +656,12 @@ impl CfsRunQueue {
         let curr = self.current();
 
         let mut vruntime = self.min_vruntime;
+        let mut curr_on_rq = false;
 
         if let Some(curr) = curr.as_ref() {
             if curr.on_rq() {
                 vruntime = curr.vruntime;
+                curr_on_rq = true;
             } else {
                 self.set_current(Weak::default());
             }
@@ -659,7 +669,7 @@ impl CfsRunQueue {
 
         // 找到最小虚拟运行时间的调度实体
         if let Some(se) = self.entities.leftmost() {
-            if curr.is_none() {
+            if !curr_on_rq {
                 vruntime = se.vruntime;
             } else {
                 vruntime = vruntime.min(se.vruntime);
@@ -806,6 +816,7 @@ impl CfsRunQueue {
 
     /// 为调度实体计算初始vruntime等信息
     fn place_entity(&mut self, se: Arc<FairSchedEntity>, flags: EnqueueFlag) {
+        let current_entity = self.current();
         let vruntime = self.avg_vruntime();
         let mut lag = 0;
 
@@ -814,14 +825,12 @@ impl CfsRunQueue {
 
         let mut vslice = se.calculate_delta_fair(se.slice);
 
-        if self.nr_running > 0 {
-            let curr = self.current();
-
+        if SCHED_FEATURES.contains(SchedFeature::PLACE_LAG) && self.nr_running > 0 {
             lag = se.vlag;
 
             let mut load = self.avg_load;
 
-            if let Some(curr) = curr {
+            if let Some(curr) = current_entity {
                 if curr.on_rq() {
                     load += LoadWeight::scale_load_down(curr.load.weight) as i64;
                 }
@@ -836,9 +845,11 @@ impl CfsRunQueue {
             lag /= load;
         }
 
-        se.vruntime = vruntime - lag as u64;
+        se.vruntime = vruntime.wrapping_sub(lag as u64);
 
-        if flags.contains(EnqueueFlag::ENQUEUE_INITIAL) {
+        if SCHED_FEATURES.contains(SchedFeature::PLACE_DEADLINE_INITIAL)
+            && flags.contains(EnqueueFlag::ENQUEUE_INITIAL)
+        {
             vslice /= 2;
         }
 
@@ -1071,9 +1082,13 @@ impl CfsRunQueue {
         if se.on_rq() {
             self.inner_dequeue_entity(se);
             self.update_load_avg(se, UpdateAvgFlags::UPDATE_TG);
+            // Match Linux EEVDF: stash the picked deadline in vlag so
+            // RUN_TO_PARITY can keep the selected entity running until it
+            // becomes ineligible or receives a new slice.
             se.force_mut().vlag = se.deadline as i64;
         }
 
+        se.force_mut().exec_start = self.rq().clock_task();
         self.set_current(Arc::downgrade(se));
 
         se.force_mut().prev_sum_exec_runtime = se.sum_exec_runtime;
@@ -1343,6 +1358,14 @@ impl CfsRunQueue {
         &self,
         curr: Option<&Arc<FairSchedEntity>>,
     ) -> Option<Arc<FairSchedEntity>> {
+        if SCHED_FEATURES.contains(SchedFeature::RUN_TO_PARITY) {
+            if let Some(curr) = curr.filter(|se| se.on_rq() && self.entity_eligible(se)) {
+                if curr.vlag == curr.deadline as i64 {
+                    return Some(curr.clone());
+                }
+            }
+        }
+
         self.entities
             .pick_eevdf(curr.filter(|se| se.on_rq()), |se| self.entity_eligible(se))
     }
@@ -1358,9 +1381,11 @@ impl CfsRunQueue {
         }
 
         let curr = self.current();
-        self.pick_eevdf_entity(curr.as_ref())
+        let picked = self
+            .pick_eevdf_entity(curr.as_ref())
             .or_else(|| self.entities.leftmost())
-            .or_else(|| curr.filter(|se| se.on_rq()))
+            .or_else(|| curr.clone().filter(|se| se.on_rq()));
+        picked
     }
 
     pub fn entity_eligible(&self, se: &Arc<FairSchedEntity>) -> bool {
@@ -1434,7 +1459,7 @@ impl Scheduler for CompletelyFairScheduler {
         let mut idle_h_nr_running = pcb.sched_info().policy() == SchedPolicy::IDLE;
         let (should_continue, se) = FairSchedEntity::for_each_in_group(&mut se, |se| {
             if se.on_rq() {
-                return (false, true);
+                return (false, false);
             }
 
             let binding = se.cfs_rq();
@@ -1741,6 +1766,15 @@ impl Scheduler for CompletelyFairScheduler {
         }
 
         loop {
+            {
+                let cfs = cfs_rq.force_mut();
+                if cfs.current().is_some() {
+                    // Linux updates curr before EEVDF pick on the path that has
+                    // not put_prev_entity() yet, so eligibility sees fresh runtime.
+                    cfs.update_current();
+                }
+            }
+
             let curr = cfs_rq.current();
             let winner = cfs_rq.pick_next_entity()?;
 

@@ -56,7 +56,7 @@ use self::{
     cputime::{irq_time_read, CpuTimeFunc, IrqTime},
     fair::{CfsRunQueue, CompletelyFairScheduler, FairSchedEntity},
     fifo::FifoScheduler,
-    prio::PrioUtil,
+    prio::{PrioUtil, MAX_RT_PRIO},
 };
 
 static mut CPU_IRQ_TIME: Option<Vec<&'static mut IrqTime>> = None;
@@ -64,6 +64,7 @@ pub static IDLE_CPUS: AtomicCpuMask = AtomicCpuMask::new();
 
 // 这里虽然rq是percpu的，但是在负载均衡的时候需要修改对端cpu的rq，所以仍需加锁
 static CPU_RUNQUEUE: Lazy<PerCpuVar<Arc<CpuRunQueue>>> = PerCpuVar::define_lazy();
+
 
 pub const SCHED_FIXEDPOINT_SHIFT: u64 = 10;
 #[allow(dead_code)]
@@ -236,6 +237,9 @@ lazy_static! {
         | SchedFeature::TTWU_QUEUE
         | SchedFeature::SIS_UTIL
         | SchedFeature::RT_PUSH_IPI
+        | SchedFeature::PLACE_LAG
+        | SchedFeature::PLACE_DEADLINE_INITIAL
+        | SchedFeature::RUN_TO_PARITY
         | SchedFeature::ALT_PERIOD
         | SchedFeature::BASE_SLICE
         | SchedFeature::UTIL_EST
@@ -341,6 +345,12 @@ impl LoadWeight {
     pub const WMULT_CONST: u32 = !0;
 
     pub const NICE_0_LOAD_SHIFT: u32 = Self::SCHED_FIXEDPOINT_SHIFT + Self::SCHED_FIXEDPOINT_SHIFT;
+    pub const NICE_0_LOAD: u64 = 1u64 << Self::NICE_0_LOAD_SHIFT;
+    pub const SCHED_PRIO_TO_WEIGHT: [u64; 40] = [
+        88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916, 9548, 7620, 6100,
+        4904, 3906, 3121, 2501, 1991, 1586, 1277, 1024, 820, 655, 526, 423, 335, 272, 215, 172,
+        137, 110, 87, 70, 56, 45, 36, 29, 23, 18, 15,
+    ];
 
     pub fn update_load_add(&mut self, inc: u64) {
         self.weight += inc;
@@ -355,6 +365,13 @@ impl LoadWeight {
     pub fn update_load_set(&mut self, weight: u64) {
         self.weight = weight;
         self.inv_weight = 0;
+    }
+
+    pub fn set_load_weight_from_prio(&mut self, prio: i32) {
+        let index = (prio - MAX_RT_PRIO).clamp(0, Self::SCHED_PRIO_TO_WEIGHT.len() as i32 - 1);
+        self.update_load_set(Self::scale_load(
+            Self::SCHED_PRIO_TO_WEIGHT[index as usize],
+        ));
     }
 
     /// ## 更新负载权重的倒数
@@ -744,12 +761,10 @@ impl CpuRunQueue {
 
     /// 更新rq时钟
     pub fn update_rq_clock(&mut self) {
-        debug_assert_eq!(
-            self.cpu,
-            smp_get_processor_id(),
-            "update_rq_clock must run on its own cpu"
-        );
-
+        // Match Linux rq clock rules: callers may update a remote rq while
+        // holding that rq's lock. DragonOS sched_clock_cpu() returns a
+        // globally comparable clock on supported architectures, and irq time is
+        // tracked per CPU inside update_rq_clock_task().
         let clock = SchedClock::sched_clock_cpu(self.cpu);
         self.update_rq_clock_from_clock(clock);
     }
@@ -868,7 +883,6 @@ impl CpuRunQueue {
         let cpu = self.cpu;
         let already_requested = current.flags().contains(ProcessFlags::NEED_SCHEDULE);
         current.flags().insert(ProcessFlags::NEED_SCHEDULE);
-
         if cpu == smp_get_processor_id() {
             return;
         }
@@ -953,6 +967,12 @@ bitflags! {
         const ALT_PERIOD = 1 << 12;
         /// 启用基本时间片
         const BASE_SLICE = 1 << 13;
+        /// EEVDF: once picked, keep running until ineligible or it gets a new slice.
+        const RUN_TO_PARITY = 1 << 14;
+        /// EEVDF: preserve virtual lag when placing entities.
+        const PLACE_LAG = 1 << 15;
+        /// EEVDF: give initial forked entities half a slice.
+        const PLACE_DEADLINE_INITIAL = 1 << 16;
     }
 
     pub struct EnqueueFlag: u8 {
@@ -1041,7 +1061,6 @@ pub fn scheduler_tick() {
 
     // 更新请求队列时钟
     rq.update_rq_clock();
-
     match current.sched_info().policy() {
         SchedPolicy::CFS => CompletelyFairScheduler::tick(rq, current, false),
         SchedPolicy::FIFO => FifoScheduler::tick(rq, current, false),
@@ -1237,7 +1256,6 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
     }
 
     let next = rq.pick_next_task(prev.clone());
-
     if task_is_idle(&next) {
         IDLE_CPUS.set(rq.cpu);
     } else if task_is_idle(&prev) {
@@ -1307,6 +1325,12 @@ pub fn sched_fork(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
     pcb.sched_info()
         .sched_entity()
         .force_mut()
+        .load
+        .set_load_weight_from_prio(current.sched_info().static_prio());
+
+    pcb.sched_info()
+        .sched_entity()
+        .force_mut()
         .init_entity_runnable_average();
 
     Ok(())
@@ -1359,12 +1383,9 @@ pub fn enqueue_task_on_cpu(
     pcb.sched_info().set_on_cpu(Some(target_cpu));
 
     let rq = cpu_rq(target_cpu.data() as usize);
-    let update_clock = target_cpu == smp_get_processor_id();
     let (rq, _guard) = rq.self_lock();
 
-    if update_clock {
-        rq.update_rq_clock();
-    }
+    rq.update_rq_clock();
 
     if was_uninterruptible {
         rq.dec_nr_uninterruptible();
@@ -1381,11 +1402,7 @@ pub fn enqueue_task_on_cpu(
         IDLE_CPUS.clear(target_cpu);
     }
 
-    if update_clock {
-        rq.check_preempt_current(pcb, wake_flags);
-    } else {
-        rq.check_preempt_remote(pcb, wake_flags);
-    }
+    rq.check_preempt_current(pcb, wake_flags);
 }
 
 pub fn request_task_migration(

@@ -426,9 +426,11 @@ impl ProcessManager {
         let cpu = crate::smp::core::smp_get_processor_id();
         compiler_fence(Ordering::SeqCst);
 
-        // INV-1: clear prev mm's bit before switching hardware page table to a different user mm,
-        // set next mm's bit after switching.
-        // Order: clear(prev) → set CR3 → set(next) → update per-CPU TlbState.
+        // INV-1: before loading a different user mm, mark this CPU active in the
+        // next mm so concurrent remote shootdowns cannot miss the CPU after CR3
+        // changes. Keep the previous bit until after the hardware switch; the
+        // temporary double membership is safe and may only cause an extra IPI.
+        // Order: set(next) → set CR3 → clear(prev) → update per-CPU TlbState.
         //
         // If next has no user mm, keep the current loaded mm in lazy-TLB mode.
         let same_mm = match (prev_active_mm.as_ref(), next_addr_space.as_ref()) {
@@ -438,16 +440,16 @@ impl ProcessManager {
 
         if let Some(next_mm) = next_addr_space {
             if !same_mm {
-                if let Some(prev_mm) = prev_active_mm.as_ref() {
-                    prev_mm.active_cpus_clear(cpu);
-                }
+                next_mm.active_cpus_set(cpu);
             }
 
             next_mm.make_current();
             compiler_fence(Ordering::SeqCst);
 
             if !same_mm {
-                next_mm.active_cpus_set(cpu);
+                if let Some(prev_mm) = prev_active_mm.as_ref() {
+                    prev_mm.active_cpus_clear(cpu);
+                }
             }
             // Update per-CPU TlbState: hardware-loaded mm and generation
             crate::mm::tlb::tlb_state_set_loaded_mm(next_mm.clone());

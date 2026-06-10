@@ -422,7 +422,7 @@ impl ProcessManager {
         }
 
         // 在 pi_lock 保护下读取状态并决定 sched_contributes_to_load
-        let _pi_guard = pcb.sched_info().pi_lock_irqsave();
+        let pi_guard = pcb.sched_info().pi_lock_irqsave();
         fence(Ordering::SeqCst); // smp_mb__after_spinlock()
         let state = pcb.sched_info().state();
         if !state.is_blocked() {
@@ -438,17 +438,54 @@ impl ProcessManager {
 
         pcb.debug_assert_fork_cpu_binding();
 
-        // TODO: select_task_rq 负载均衡
-        // let prev_cpu = pcb.sched_info().on_cpu().unwrap_or(current_cpu_id());
-        // let allowed = pi_guard.cpus_allowed.clone();
-        // let target_cpu = select_task_rq(pcb, prev_cpu, WakeupFlags::WF_TTWU, &allowed);
-        let target_cpu = pcb.sched_info().on_cpu().unwrap_or(current_cpu_id());
+        let mut schedule_dequeue_race = false;
+        if *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Queued {
+            if let Some(target_cpu) = pcb.sched_info().on_cpu() {
+                let rq = cpu_rq(target_cpu.data() as usize);
+                let (rq, _rq_guard) = rq.self_lock();
 
-        if pcb.flags().contains(ProcessFlags::IN_IOWAIT) {
-            cpu_rq(target_cpu.data() as usize).dec_nr_iowait();
+                // Linux ttwu_runnable(): a blocked-but-still-queued task has
+                // not yet been dequeued by schedule(). Recheck on_rq under the
+                // target rq lock; if schedule() won the race and dequeued it,
+                // fall through to the full enqueue path below.
+                if *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Queued {
+                    if !Arc::ptr_eq(&rq.current(), pcb) {
+                        rq.update_rq_clock();
+                        rq.check_preempt_current(pcb, WakeupFlags::WF_TTWU);
+                    }
+                    return Ok(());
+                }
+
+                // DragonOS currently tracks task_cpu, but not Linux's
+                // separate p->on_cpu "still switching out" flag. If schedule()
+                // won the race and just dequeued this task, keep the wakeup on
+                // the previous rq instead of migrating it to another CPU where
+                // the same PCB/kernel stack could run before the old CPU
+                // finishes switch_process().
+                schedule_dequeue_race = true;
+            }
         }
 
-        enqueue_task_on_cpu(pcb, target_cpu, WakeupFlags::empty(), was_uninterruptible);
+        let prev_cpu = pcb.sched_info().on_cpu().unwrap_or(current_cpu_id());
+        let allowed = pi_guard.cpus_allowed.clone();
+        let target_cpu = if schedule_dequeue_race {
+            prev_cpu
+        } else {
+            select_task_rq(pcb, prev_cpu, WakeupFlags::WF_TTWU, &allowed)
+        };
+
+        if was_uninterruptible || pcb.flags().contains(ProcessFlags::IN_IOWAIT) {
+            let prev_rq = cpu_rq(prev_cpu.data() as usize);
+            let (prev_rq, _prev_rq_guard) = prev_rq.self_lock();
+            if was_uninterruptible {
+                prev_rq.dec_nr_uninterruptible();
+            }
+            if pcb.flags().contains(ProcessFlags::IN_IOWAIT) {
+                prev_rq.dec_nr_iowait();
+            }
+        }
+
+        enqueue_task_on_cpu(pcb, target_cpu, WakeupFlags::WF_TTWU, false);
 
         Ok(())
     }
@@ -935,6 +972,31 @@ impl ProcessManager {
                 vd.complete_all();
             }
 
+            // Linux exit_mm() happens before exit_files(): after clear_child_tid
+            // and robust-list cleanup have consumed user memory, the exiting task
+            // must stop exposing a user-visible mm even if file close blocks.
+            //
+            // The CPU-visible active mm is switched to idle here and tracked by
+            // per-CPU TlbState. The PCB-visible user_vm becomes None, matching
+            // Linux task->mm == NULL after exit_mm().
+            let old_user_vm = {
+                let idle_vm = IDLE_PROCESS_ADDRESS_SPACE();
+                let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+                let cpu = smp_get_processor_id();
+                let mut basic = pcb.basic_mut();
+                let old_vm = unsafe { basic.replace_user_vm(None) };
+                idle_vm.active_cpus_set(cpu);
+                unsafe { idle_vm.make_current() };
+                if let Some(old_vm) = old_vm.as_ref() {
+                    old_vm.active_cpus_clear(cpu);
+                }
+                unsafe { crate::mm::tlb::tlb_state_set_loaded_mm(idle_vm) };
+                drop(basic);
+                drop(irq_guard);
+                old_vm
+            };
+            drop(old_user_vm);
+
             pcb.exit_files();
             pcb.exit_timers();
             // TODO 由于未实现进程组，tty记录的前台进程组等于当前进程，故退出前要置空
@@ -970,36 +1032,6 @@ impl ProcessManager {
             // 对标 Linux do_task_dead()：不在此处手动 deactivate_task。
             // 任务仍留在 rq 上，由后续 __schedule() 检测到 Exited 状态后
             // 执行唯一的 deactivate_task，避免双重 dequeue 导致 nr_running 下溢。
-
-            // 注意：exit_files() 可能会触发阻塞（例如关闭 FUSE fd 需要等待 daemon 回复），
-            // 因此不能在它之前清空 user_vm，否则后续调度切换会遇到 user_vm==None 的普通进程并崩溃。
-            //
-            // INV-1: Before releasing the hold on user_vm, clear this CPU from the mm's active_cpus,
-            // otherwise after the mm is freed (Arc count reaches zero) a stale per-CPU cpumask bit
-            // will remain, and subsequent flushes by other threads on the same mm would still target
-            // this CPU and send spurious IPIs.
-            //
-            // Switch this exiting task to the idle address space before dropping the old user mm.
-            // The PCB-visible user_vm becomes None, matching Linux's task->mm == NULL after exit;
-            // the CPU-visible active mm is tracked by the per-CPU TLB state instead.
-            let old_user_vm = {
-                let idle_vm = IDLE_PROCESS_ADDRESS_SPACE();
-                let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-                let cpu = smp_get_processor_id();
-                let mut basic = pcb.basic_mut();
-                let old_vm = unsafe { basic.replace_user_vm(None) };
-                if let Some(old_vm) = old_vm.as_ref() {
-                    old_vm.active_cpus_clear(cpu);
-                }
-                unsafe { idle_vm.make_current() };
-                idle_vm.active_cpus_set(cpu);
-                unsafe { crate::mm::tlb::tlb_state_set_loaded_mm(idle_vm) };
-                drop(basic);
-                drop(irq_guard);
-                old_vm
-            };
-
-            drop(old_user_vm);
 
             let _final_irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
             // 在最后，调用 exit_notify 之前，设置调度状态为 Exited
@@ -1127,6 +1159,7 @@ impl ProcessManager {
         let pcb = ProcessManager::find(pid);
         if let Some(ref pcb) = pcb {
             let parent_child_vpid = pcb.real_parent_pcb().and_then(|parent| {
+                let parent = ProcessManager::thread_group_leader_of(&parent);
                 let parent_ns = parent.active_pid_ns();
                 pcb.task_pid_nr_ns(PidType::PID, Some(parent_ns))
                     .map(|vpid| (parent, vpid))

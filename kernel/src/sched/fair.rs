@@ -1151,73 +1151,12 @@ impl CfsRunQueue {
     pub fn inner_enqueue_entity(&mut self, se: &Arc<FairSchedEntity>) {
         self.avg_vruntime_add(se);
         self.entities.insert(se.clone());
-        // warn!(
-        //     "enqueue pcb {:?} cfsrq {:?}",
-        //     se.pcb().pid(),
-        //     self.entities
-        //         .iter()
-        //         .map(|x| (x.0, x.1.pcb().pid()))
-        //         .collect::<Vec<_>>()
-        // );
-        // send_to_default_serial8250_port(
-        //     format!(
-        //         "enqueue pcb {:?} cfsrq {:?}\n",
-        //         se.pcb().pid(),
-        //         self.entities
-        //             .iter()
-        //             .map(|x| (x.0, x.1.pcb().pid()))
-        //             .collect::<Vec<_>>()
-        //     )
-        //     .as_bytes(),
-        // );
     }
 
     fn inner_dequeue_entity(&mut self, se: &Arc<FairSchedEntity>) {
-        // warn!(
-        //     "before dequeue pcb {:?} cfsrq {:?}",
-        //     se.pcb().pid(),
-        //     self.entities
-        //         .iter()
-        //         .map(|x| (x.0, x.1.pcb().pid()))
-        //         .collect::<Vec<_>>()
-        // );
-
-        // send_to_default_serial8250_port(
-        //     format!(
-        //         "before dequeue pcb {:?} cfsrq {:?}\n",
-        //         se.pcb().pid(),
-        //         self.entities
-        //             .iter()
-        //             .map(|x| (x.0, x.1.pcb().pid()))
-        //             .collect::<Vec<_>>()
-        //     )
-        //     .as_bytes(),
-        // );
-
         if self.entities.remove(se).is_none() {
             panic!("dequeue entity that is not present in CFS timeline");
         }
-        // send_to_default_serial8250_port(
-        //     format!(
-        //         "after dequeue pcb {:?}(real: {:?}) cfsrq {:?}\n",
-        //         se.pcb().pid(),
-        //         remove.pcb().pid(),
-        //         self.entities
-        //             .iter()
-        //             .map(|x| (x.0, x.1.pcb().pid()))
-        //             .collect::<Vec<_>>()
-        //     )
-        //     .as_bytes(),
-        // );
-        // warn!(
-        //     "after dequeue pcb {:?}(real: {:?}) cfsrq {:?}",
-        //     se.pcb().pid(),
-        //     remove.pcb().pid(),
-        //     self.entities
-        //         .iter()
-        //         .map(|x| (x.0, x.1.pcb().pid()))
-        //         .collect::<Vec<_>>()
-        // );
         self.avg_vruntime_sub(se);
     }
 

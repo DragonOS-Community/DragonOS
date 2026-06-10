@@ -359,8 +359,6 @@ impl Futex {
     /// - `Err(SystemError::EDEADLK_OR_EDEADLOCK)`: 当前线程已持有该锁
     pub fn futex_trylock_pi(uaddr: VirtAddr, flags: FutexFlag) -> Result<usize, SystemError> {
         let current_tid = ProcessManager::current_pcb().task_pid_vnr().data() as u32;
-
-        // 获取futex key（虽然trylock不会阻塞，但还是需要验证地址）
         let key = Self::get_futex_key(
             uaddr,
             flags.contains(FutexFlag::FLAGS_SHARED),
@@ -369,33 +367,68 @@ impl Futex {
 
         let atomic_futex = unsafe { AtomicU32::from_ptr(uaddr.as_ptr::<u32>()) };
 
-        let uval = atomic_futex.load(Ordering::SeqCst);
-        let owner_tid = uval & FUTEX_TID_MASK;
+        loop {
+            let cur_val = atomic_futex.load(Ordering::SeqCst);
+            let cur_owner = cur_val & FUTEX_TID_MASK;
+            let owner_died = cur_val & FUTEX_OWNER_DIED;
 
-        // 检查死锁
-        if owner_tid == current_tid && owner_tid != 0 {
-            return Err(SystemError::EDEADLK_OR_EDEADLOCK);
-        }
+            if cur_owner == current_tid && cur_owner != 0 {
+                return Err(SystemError::EDEADLK_OR_EDEADLOCK);
+            }
 
-        let owner_died = uval & FUTEX_OWNER_DIED;
+            if cur_owner != 0 {
+                let mut futex_map_guard = FutexData::futex_map();
+                let bucket = futex_map_guard
+                    .entry(key.clone())
+                    .or_insert(FutexHashBucket::new());
+                if bucket.pi_owner == 0 {
+                    bucket.pi_owner = cur_owner;
+                }
+                drop(futex_map_guard);
 
-        if owner_tid == 0 && (uval & FUTEX_WAITERS) == 0 {
+                loop {
+                    let val = atomic_futex.load(Ordering::SeqCst);
+                    let owner = val & FUTEX_TID_MASK;
+                    if owner == 0 {
+                        break;
+                    }
+                    if owner == current_tid {
+                        return Err(SystemError::EDEADLK_OR_EDEADLOCK);
+                    }
+                    if (val & FUTEX_WAITERS) != 0
+                        || atomic_futex
+                            .compare_exchange(
+                                val,
+                                val | FUTEX_WAITERS,
+                                Ordering::SeqCst,
+                                Ordering::SeqCst,
+                            )
+                            .is_ok()
+                    {
+                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                    }
+                }
+                continue;
+            }
+
             let desired = current_tid | owner_died;
             if atomic_futex
-                .compare_exchange(uval, desired, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
+                .compare_exchange(cur_val, desired, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
             {
-                let mut futex_map_guard = FutexData::futex_map();
-                if let Some(bucket) = futex_map_guard.get_mut(&key) {
-                    bucket.pi_owner = current_tid;
-                }
-                if owner_died != 0 {
-                    return Err(SystemError::EOWNERDEAD);
-                }
-                return Ok(0);
+                continue;
             }
-        }
 
-        Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+            let mut futex_map_guard = FutexData::futex_map();
+            if let Some(bucket) = futex_map_guard.get_mut(&key) {
+                bucket.pi_owner = current_tid;
+            }
+            drop(futex_map_guard);
+
+            if owner_died != 0 {
+                return Err(SystemError::EOWNERDEAD);
+            }
+            return Ok(0);
+        }
     }
 }

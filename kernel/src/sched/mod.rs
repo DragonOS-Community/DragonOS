@@ -788,14 +788,6 @@ impl CpuRunQueue {
     /// 更新任务时钟
     pub fn update_rq_clock_task(&mut self, mut delta: u64) {
         let mut irq_delta = irq_time_read(self.cpu) - self.prev_irq_time;
-        // if self.cpu == 0 {
-        //     error!(
-        //         "cpu 0 delta {delta} irq_delta {} irq_time_read(self.cpu) {} self.prev_irq_time {}",
-        //         irq_delta,
-        //         irq_time_read(self.cpu),
-        //         self.prev_irq_time
-        //     );
-        // }
         compiler_fence(Ordering::SeqCst);
 
         if irq_delta > delta {
@@ -808,13 +800,9 @@ impl CpuRunQueue {
 
         // todo: psi?
 
-        // send_to_default_serial8250_port(format!("\n{delta}\n",).as_bytes());
         compiler_fence(Ordering::SeqCst);
         self.clock_task += delta;
         compiler_fence(Ordering::SeqCst);
-        // if self.cpu == 0 {
-        //     error!("cpu {} clock_task {}", self.cpu, self.clock_task);
-        // }
         // todo: pelt?
     }
 
@@ -1189,20 +1177,6 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
         *prev.sched_info().on_rq.lock_irqsave() = OnRq::None;
         migrate_prev_to = Some(dest_cpu);
     }
-
-    // kBUG!(
-    //     "before cfs rq pcbs {:?}\nvruntimes {:?}\n",
-    //     rq.cfs
-    //         .entities
-    //         .iter()
-    //         .map(|x| { x.1.pcb().pid() })
-    //         .collect::<Vec<_>>(),
-    //     rq.cfs
-    //         .entities
-    //         .iter()
-    //         .map(|x| { x.1.vruntime })
-    //         .collect::<Vec<_>>(),
-    // );
 
     // 对标 Linux __schedule() 的 prev_state 检查：
     //   Linux 条件: (!(sched_mode & SM_MASK_PREEMPT) && prev_state)

@@ -64,6 +64,7 @@ fn main() -> Result<()> {
         .with_context(|| format!("创建结果目录失败: {}", results_dir.display()))?;
 
     let mut results: Vec<CaseResult> = Vec::new();
+    let mut runnable_count = 0usize;
     for test in &manifest.tests {
         if let Some(skip_reason) =
             select_test(test, &cli.patterns, whitelist.as_ref(), blocklist.as_ref())
@@ -85,6 +86,7 @@ fn main() -> Result<()> {
             continue;
         }
 
+        runnable_count += 1;
         println!("[RUNNER] START: {}", test.name);
 
         let mut t = test.clone();
@@ -104,6 +106,11 @@ fn main() -> Result<()> {
     let summary = build_summary(results);
     write_reports(&results_dir, &summary)?;
     show_summary(&summary, &results_dir);
+
+    if runnable_count == 0 {
+        eprintln!("[RUNNER] ERROR: no runnable tests selected");
+        std::process::exit(1);
+    }
 
     if summary.failed > 0 || summary.timeout > 0 {
         std::process::exit(1);

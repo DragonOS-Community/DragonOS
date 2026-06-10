@@ -21,6 +21,7 @@ constexpr size_t kNrPages = 64;
 constexpr int kNrThreads = 4;
 constexpr int kIters = 2000;
 constexpr int kMunmapRounds = 16;
+constexpr size_t kCowSnapStride = 256;
 
 thread_local sigjmp_buf g_segv_jmp;
 thread_local volatile sig_atomic_t g_segv_active = 0;
@@ -251,6 +252,8 @@ struct HammerCtx {
     size_t len;
     std::atomic<int>* run;
     std::atomic<int>* ready;
+    std::atomic<int>* post_phase;
+    std::atomic<int>* post_done;
     uint8_t mark;
 };
 
@@ -271,7 +274,16 @@ void* hammer_writer_whole(void* arg) {
         ctx->ready->fetch_add(1, std::memory_order_release);
     }
 
+    bool published_post_done = false;
     while (ctx->run->load(std::memory_order_acquire) != 0) {
+        if (!published_post_done && ctx->post_phase != nullptr &&
+            ctx->post_phase->load(std::memory_order_acquire) != 0) {
+            for (size_t off = 0; off < ctx->len; off += kCowSnapStride) {
+                ctx->base[off] = v++;
+            }
+            ctx->post_done->fetch_add(1, std::memory_order_release);
+            published_post_done = true;
+        }
         ctx->base[off] = v++;
         off += 13;
         if (off >= ctx->len) {
@@ -309,8 +321,7 @@ void* hammer_writer_whole(void* arg) {
 //     pages for the parent mm. The child's physical pages stay pristine.
 int case_fork_cow_stale_tlb() {
     const size_t len = kNrPages * kPageSize;
-    constexpr size_t kSnapStride = 256;
-    constexpr size_t kSnapCount = (kNrPages * kPageSize) / kSnapStride;
+    constexpr size_t kSnapCount = (kNrPages * kPageSize) / kCowSnapStride;
     constexpr size_t kSnapMapLen = kPageSize;
     static_assert(kSnapCount <= kSnapMapLen, "snapshot mapping too small");
 
@@ -349,6 +360,8 @@ int case_fork_cow_stale_tlb() {
 
     std::atomic<int> run{1};
     std::atomic<int> ready{0};
+    std::atomic<int> post_phase{0};
+    std::atomic<int> post_done{0};
     pthread_t threads[kNrThreads];
     HammerCtx ctxs[kNrThreads];
     int created = 0;
@@ -357,6 +370,8 @@ int case_fork_cow_stale_tlb() {
         ctxs[created].len = len;
         ctxs[created].run = &run;
         ctxs[created].ready = &ready;
+        ctxs[created].post_phase = &post_phase;
+        ctxs[created].post_done = &post_done;
         ctxs[created].mark = static_cast<uint8_t>(0x10 + created);
         if (pthread_create(&threads[created], nullptr, hammer_writer_whole, &ctxs[created]) != 0) {
             fprintf(stderr, "pthread_create failed\n");
@@ -422,7 +437,7 @@ int case_fork_cow_stale_tlb() {
         // creating worker threads so the post-fork child does not enter
         // malloc/free or stdio paths while only one thread survived fork().
         for (size_t i = 0; i < kSnapCount; ++i) {
-            snap[i] = child_buf[i * kSnapStride];
+            snap[i] = child_buf[i * kCowSnapStride];
         }
 
         const uint8_t token = 1;
@@ -444,7 +459,7 @@ int case_fork_cow_stale_tlb() {
         constexpr int kRounds = 400;
         for (int r = 0; r < kRounds; ++r) {
             for (size_t i = 0; i < kSnapCount; ++i) {
-                const uint8_t v = child_buf[i * kSnapStride];
+                const uint8_t v = child_buf[i * kCowSnapStride];
                 if (v != snap[i]) {
                     _exit(10);
                 }
@@ -475,12 +490,30 @@ int case_fork_cow_stale_tlb() {
         return -1;
     }
 
+    // Force every worker to write all sampled offsets after the child snapshot
+    // has been published. This turns the remote writer part of the stale-TLB
+    // check into an explicit phase instead of relying on scheduler luck.
+    post_phase.store(1, std::memory_order_release);
+    if (wait_for_workers_ready(&post_done) != 0) {
+        fprintf(stderr, "workers did not complete post-snapshot writes\n");
+        run.store(0, std::memory_order_release);
+        for (int i = 0; i < kNrThreads; ++i) {
+            pthread_join(threads[i], nullptr);
+        }
+        close(verify_pipe[1]);
+        int status = 0;
+        waitpid(pid, &status, 0);
+        munmap(snap, kSnapMapLen);
+        munmap(buf, len);
+        return -1;
+    }
+
     // Keep parent writes active for a bounded post-snapshot window without
     // relying on sched_yield() or nanosleep() progress semantics.
     volatile uint8_t* parent_buf = buf;
     for (int round = 0; round < 128; ++round) {
         for (size_t i = 0; i < kSnapCount; ++i) {
-            parent_buf[i * kSnapStride] = static_cast<uint8_t>(round + i);
+            parent_buf[i * kCowSnapStride] = static_cast<uint8_t>(round + i);
         }
     }
     const uint8_t start_verify = 1;

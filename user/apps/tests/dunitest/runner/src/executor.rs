@@ -12,6 +12,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+const PIPE_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
@@ -125,8 +127,8 @@ pub fn run_test(spec: &TestSpec, results_dir: &Path, verbose: bool) -> Result<Ca
             if let Err(e) = kill_group_result {
                 message.push_str(&format!("; 进程组终止失败，跳过管道线程收尾: {e:#}"));
             } else {
-                let stdout_join = join_pipe_forwarder(stdout_thread);
-                let stderr_join = join_pipe_forwarder(stderr_thread);
+                let stdout_join = join_pipe_forwarder_bounded(stdout_thread, PIPE_JOIN_TIMEOUT);
+                let stderr_join = join_pipe_forwarder_bounded(stderr_thread, PIPE_JOIN_TIMEOUT);
                 if let Err(e) = stdout_join {
                     message.push_str(&format!("; stdout 日志收尾失败: {e:#}"));
                 }
@@ -135,6 +137,7 @@ pub fn run_test(spec: &TestSpec, results_dir: &Path, verbose: bool) -> Result<Ca
                 }
             }
 
+            let gtest = parse_gtest_counts(&log_path).unwrap_or((0, 0, 0, 0));
             let result = CaseResult {
                 name: spec.name.clone(),
                 status: CaseStatus::Timeout,
@@ -142,24 +145,48 @@ pub fn run_test(spec: &TestSpec, results_dir: &Path, verbose: bool) -> Result<Ca
                 exit_code: None,
                 message,
                 log_file: log_path.display().to_string(),
-                gtest_total: 0,
-                gtest_passed: 0,
-                gtest_failed: 0,
-                gtest_skipped: 0,
+                gtest_total: gtest.0,
+                gtest_passed: gtest.1,
+                gtest_failed: gtest.2,
+                gtest_skipped: gtest.3,
             };
             return Ok(result);
         }
         thread::sleep(Duration::from_millis(50));
     };
-    join_pipe_forwarder(stdout_thread)?;
-    join_pipe_forwarder(stderr_thread)?;
+    let cleanup_result = terminate_case_process_group(child.id());
+    let stdout_join = join_pipe_forwarder_bounded(stdout_thread, PIPE_JOIN_TIMEOUT);
+    let stderr_join = join_pipe_forwarder_bounded(stderr_thread, PIPE_JOIN_TIMEOUT);
+    let mut cleanup_message = String::new();
+    if let Err(e) = cleanup_result {
+        cleanup_message.push_str(&format!("; 进程组清理失败: {e:#}"));
+    }
+    if let Err(e) = stdout_join {
+        cleanup_message.push_str(&format!("; stdout 日志收尾失败: {e:#}"));
+    }
+    if let Err(e) = stderr_join {
+        cleanup_message.push_str(&format!("; stderr 日志收尾失败: {e:#}"));
+    }
 
     let elapsed = start.elapsed().as_millis();
     let code = status.code();
     let passed = status.success();
     let gtest = parse_gtest_counts(&log_path).unwrap_or((0, 0, 0, 0));
 
-    let result = if passed {
+    let result = if !cleanup_message.is_empty() {
+        CaseResult {
+            name: spec.name.clone(),
+            status: CaseStatus::Failed,
+            duration_ms: elapsed,
+            exit_code: code,
+            message: format!("测试进程退出后清理失败{cleanup_message}"),
+            log_file: log_path.display().to_string(),
+            gtest_total: gtest.0,
+            gtest_passed: gtest.1,
+            gtest_failed: gtest.2,
+            gtest_skipped: gtest.3,
+        }
+    } else if passed {
         CaseResult {
             name: spec.name.clone(),
             status: CaseStatus::Passed,
@@ -342,17 +369,17 @@ fn validate_gtest_binary(spec: &TestSpec) -> Result<GtestPrecheck> {
             if let Err(e) = kill_group_result {
                 message.push_str(&format!("; 进程组终止失败，跳过管道线程收尾: {e:#}"));
             } else {
-                let _ = join_pipe_collector(stdout_thread);
-                let _ = join_pipe_collector(stderr_thread);
+                let _ = join_pipe_collector_bounded(stdout_thread, PIPE_JOIN_TIMEOUT);
+                let _ = join_pipe_collector_bounded(stderr_thread, PIPE_JOIN_TIMEOUT);
             }
             return Ok(GtestPrecheck::Timeout(message));
         }
         thread::sleep(Duration::from_millis(20));
     };
 
-    let _ = terminate_case_process_group(child.id());
-    let stdout = join_pipe_collector(stdout_thread)?;
-    let stderr = join_pipe_collector(stderr_thread)?;
+    terminate_case_process_group(child.id())?;
+    let stdout = join_pipe_collector_bounded(stdout_thread, PIPE_JOIN_TIMEOUT)?;
+    let stderr = join_pipe_collector_bounded(stderr_thread, PIPE_JOIN_TIMEOUT)?;
     let stdout = String::from_utf8_lossy(&stdout);
     let stderr = String::from_utf8_lossy(&stderr);
     let merged = format!("{}\n{}", stdout, stderr);
@@ -396,6 +423,20 @@ fn join_pipe_collector(handle: JoinHandle<Result<Vec<u8>>>) -> Result<Vec<u8>> {
         Ok(inner) => inner,
         Err(_) => anyhow::bail!("预检查输出收集线程发生 panic"),
     }
+}
+
+fn join_pipe_collector_bounded(
+    handle: JoinHandle<Result<Vec<u8>>>,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    let start = Instant::now();
+    while !handle.is_finished() {
+        if start.elapsed() >= timeout {
+            anyhow::bail!("预检查输出收集线程未在 {:?} 内退出", timeout);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    join_pipe_collector(handle)
 }
 
 fn spawn_pipe_forwarder<R>(
@@ -444,6 +485,17 @@ fn join_pipe_forwarder(handle: JoinHandle<Result<()>>) -> Result<()> {
         Ok(inner) => inner,
         Err(_) => anyhow::bail!("输出转发线程发生 panic"),
     }
+}
+
+fn join_pipe_forwarder_bounded(handle: JoinHandle<Result<()>>, timeout: Duration) -> Result<()> {
+    let start = Instant::now();
+    while !handle.is_finished() {
+        if start.elapsed() >= timeout {
+            anyhow::bail!("输出转发线程在 {:?} 内未结束", timeout);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    join_pipe_forwarder(handle)
 }
 
 #[cfg(all(test, unix))]
@@ -592,6 +644,57 @@ echo "[  PASSED  ] 1 test."
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "precheck success path did not clean descendant pipe holders"
+        );
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn success_path_kills_forked_descendants_that_keep_pipes_open() {
+        let tmp = std::env::temp_dir().join(format!(
+            "dunitest-runner-success-pgrp-{}-{}",
+            std::process::id(),
+            unique_nanos()
+        ));
+        let results = tmp.join("results");
+        fs::create_dir_all(&results).unwrap();
+
+        let script = tmp.join("forking_gtest_success.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+if [ "$1" = "--gtest_help" ]; then
+  echo "This program contains tests written using Google Test"
+  exit 0
+fi
+echo "[==========] Running 1 test from 1 test suite."
+echo "[ RUN      ] Smoke.Pass"
+(sleep 30) &
+echo "[       OK ] Smoke.Pass"
+echo "[==========] 1 test from 1 test suite ran."
+echo "[  PASSED  ] 1 test."
+exit 0
+"#,
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).unwrap();
+
+        let spec = TestSpec {
+            name: "normal/forking_success".to_string(),
+            path: script.display().to_string(),
+            args: Vec::new(),
+            timeout_sec: 5,
+        };
+
+        let started = Instant::now();
+        let result = run_test(&spec, &results, false).unwrap();
+
+        assert!(matches!(result.status, CaseStatus::Passed));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "success path did not clean descendant pipe holders"
         );
 
         let _ = fs::remove_dir_all(tmp);

@@ -11,7 +11,10 @@ use crate::{
         CurrentIrqArch, MMArch,
     },
     exception::{extable::ExceptionTableManager, InterruptArch},
-    ipc::signal_types::{SigCode, SigInfo, SigType},
+    ipc::{
+        signal::force_sig_fault_to_current,
+        signal_types::{BUS_ADRERR, SEGV_ACCERR, SEGV_MAPERR},
+    },
     mm::{
         fault::{FaultFlags, PageFaultHandler, PageFaultMessage},
         ucontext::{AddressSpace, LockedVMA},
@@ -276,19 +279,21 @@ impl X86_64MMArch {
             flags |= FaultFlags::FAULT_FLAG_INSTRUCTION;
         }
 
-        let send_segv = || {
-            let pid = ProcessManager::current_pid();
-            let uid = ProcessManager::current_pcb().cred().uid.data() as u32;
-            let mut info = SigInfo::new(
-                Signal::SIGSEGV,
-                0,
-                SigCode::User,
-                SigType::Kill { pid, uid },
-            );
-            Signal::SIGSEGV
-                .send_signal_info(Some(&mut info), pid)
-                .expect("failed to send SIGSEGV to process");
+        let send_fault_signal = |sig: Signal, code: i32, addr: VirtAddr| {
+            if let Err(e) = force_sig_fault_to_current(sig, code, addr) {
+                error!(
+                    "failed to force {:?} fault to current process: pid={:?}, code={}, addr={:#x}, err={:?}",
+                    sig,
+                    ProcessManager::current_pid(),
+                    code,
+                    addr.data(),
+                    e
+                );
+            }
         };
+        let send_segv_maperr = || send_fault_signal(Signal::SIGSEGV, SEGV_MAPERR, address);
+        let send_segv_accerr = || send_fault_signal(Signal::SIGSEGV, SEGV_ACCERR, address);
+        let send_bus_adrerr = || send_fault_signal(Signal::SIGBUS, BUS_ADRERR, address);
 
         // 辅助函数：处理内核访问用户地址失败的情况
         let handle_kernel_access_failed = |r: &mut TrapFrame| {
@@ -330,7 +335,7 @@ impl X86_64MMArch {
                         return; // 已通过异常表修复
                     }
 
-                    send_segv();
+                    send_segv_maperr();
                     return;
                 }
             };
@@ -359,7 +364,7 @@ impl X86_64MMArch {
                             return; // 已通过异常表修复
                         }
 
-                        send_segv();
+                        send_segv_maperr();
                         return;
                     }
 
@@ -377,7 +382,7 @@ impl X86_64MMArch {
                             return; // 已通过异常表修复
                         }
 
-                        send_segv();
+                        send_segv_maperr();
                         return;
                     }
                     space_guard
@@ -405,7 +410,7 @@ impl X86_64MMArch {
                         return; // 已通过异常表修复
                     }
 
-                    send_segv();
+                    send_segv_maperr();
                     return;
                 }
             }
@@ -422,7 +427,7 @@ impl X86_64MMArch {
                 //     address.data(),
                 // );
 
-                send_segv();
+                send_segv_accerr();
                 return;
             }
             let mapper = &mut space_guard.user_mapper.utable;
@@ -468,24 +473,28 @@ impl X86_64MMArch {
                 );
             }
 
-            // 用户态 fault：发送对应信号
-            let sig = if fault.contains(VmFaultReason::VM_FAULT_SIGSEGV) {
-                Signal::SIGSEGV
+            if fault.contains(VmFaultReason::VM_FAULT_OOM) {
+                error!(
+                    "page fault OOM: pid={:?}, addr={:#x}, rip={:#x}, fault={:?}",
+                    ProcessManager::current_pid(),
+                    address.data(),
+                    regs.rip,
+                    fault
+                );
+                // TODO: OOM 处理
+                return;
+            } else if fault.contains(VmFaultReason::VM_FAULT_SIGBUS)
+                || fault.contains(VmFaultReason::VM_FAULT_HWPOISON)
+                || fault.contains(VmFaultReason::VM_FAULT_HWPOISON_LARGE)
+            {
+                // Linux x86 maps these fault handler errors to SIGBUS/BUS_ADRERR
+                // except for hwpoison's MCE-specific si_code, which DragonOS does not model yet.
+                send_bus_adrerr();
+            } else if fault.contains(VmFaultReason::VM_FAULT_SIGSEGV) {
+                send_segv_maperr();
             } else {
-                // 包括 SIGBUS / OOM / HWPOISON 等：目前统一 SIGBUS（后续可按 Linux 进一步细分）
-                Signal::SIGBUS
-            };
-
-            let mut info = SigInfo::new(
-                sig,
-                0,
-                SigCode::User,
-                SigType::Kill {
-                    pid: ProcessManager::current_pid(),
-                    uid: ProcessManager::current_pcb().cred().uid.data() as u32,
-                },
-            );
-            let _ = sig.send_signal_info(Some(&mut info), ProcessManager::current_pid());
+                panic!("unexpected fault error: {:?}", fault);
+            }
             return;
         }
 

@@ -5,13 +5,146 @@ use core::mem::size_of;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_RT_SIGQUEUEINFO;
-use crate::ipc::signal_types::{PosixSigInfo, SigCode, SigInfo, SigType};
+use crate::ipc::signal_types::{
+    PosixSigInfo, SigCode, SigInfo, SigType, SIG_SPECIFIC_SICODES_MASK,
+};
 use crate::ipc::syscall::sys_kill::check_signal_permission_pcb_with_sig;
 use crate::process::pid::PidType;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::UserBufferReader;
 use crate::{arch::ipc::signal::Signal, process::ProcessManager, process::RawPid};
 use system_error::SystemError;
+
+const NSIGPOLL: i32 = 6;
+const NSIGILL: i32 = 11;
+const NSIGFPE: i32 = 15;
+const NSIGSEGV: i32 = 10;
+const NSIGBUS: i32 = 5;
+const NSIGTRAP: i32 = 6;
+const NSIGSYS: i32 = 2;
+
+fn is_positive_sig_specific_code(si_code: i32) -> bool {
+    si_code > SigCode::User.as_i32() && si_code < SigCode::Kernel.as_i32()
+}
+
+fn is_fault_layout_signal(signal: Signal) -> bool {
+    matches!(
+        signal,
+        Signal::SIGILL | Signal::SIGFPE | Signal::SIGSEGV | Signal::SIGBUS | Signal::SIGTRAP
+    )
+}
+
+fn signal_specific_code_limit(signal: Signal) -> Option<i32> {
+    match signal {
+        Signal::SIGILL => Some(NSIGILL),
+        Signal::SIGFPE => Some(NSIGFPE),
+        Signal::SIGSEGV => Some(NSIGSEGV),
+        Signal::SIGBUS => Some(NSIGBUS),
+        Signal::SIGTRAP => Some(NSIGTRAP),
+        Signal::SIGSYS => Some(NSIGSYS),
+        Signal::SIGIO_OR_POLL => Some(NSIGPOLL),
+        _ => None,
+    }
+}
+
+fn signal_has_specific_si_codes(signal: Signal) -> bool {
+    SIG_SPECIFIC_SICODES_MASK.contains(Signal::into_sigset(signal))
+}
+
+fn raw_siginfo_pid(pid: i32) -> RawPid {
+    RawPid::new(pid as usize)
+}
+
+fn sig_type_from_user_siginfo(
+    signal: Signal,
+    code_enum: SigCode,
+    user_info: &PosixSigInfo,
+) -> SigType {
+    match code_enum {
+        SigCode::Timer => {
+            let timer = unsafe { user_info._sifields._timer };
+            SigType::PosixTimer {
+                timerid: timer.si_tid,
+                overrun: timer.si_overrun,
+                sigval: timer.si_sigval,
+            }
+        }
+        SigCode::SigIO => {
+            let sigpoll = unsafe { user_info._sifields._sigpoll };
+            SigType::SigPoll {
+                fd: sigpoll.si_fd,
+                band: sigpoll.si_band,
+            }
+        }
+        SigCode::Raw(code) if is_positive_sig_specific_code(code) => {
+            let specific_limit = signal_specific_code_limit(signal);
+            if is_fault_layout_signal(signal) && specific_limit.is_some_and(|limit| code <= limit) {
+                let fault = unsafe { user_info._sifields._sigfault };
+                SigType::Fault {
+                    addr: fault.si_addr,
+                    addr_lsb: fault.si_addr_lsb,
+                }
+            } else if signal == Signal::SIGSYS && specific_limit.is_some_and(|limit| code <= limit)
+            {
+                let sigsys = unsafe { user_info._sifields._sigsys };
+                SigType::SigSys {
+                    call_addr: sigsys._call_addr,
+                    syscall: sigsys._syscall,
+                    arch: sigsys._arch,
+                }
+            } else if code <= NSIGPOLL
+                && (signal == Signal::SIGIO_OR_POLL || !signal_has_specific_si_codes(signal))
+            {
+                let sigpoll = unsafe { user_info._sifields._sigpoll };
+                SigType::SigPoll {
+                    fd: sigpoll.si_fd,
+                    band: sigpoll.si_band,
+                }
+            } else {
+                let kill = unsafe { user_info._sifields._kill };
+                SigType::Kill {
+                    pid: raw_siginfo_pid(kill.si_pid),
+                    uid: kill.si_uid,
+                }
+            }
+        }
+        SigCode::Raw(code) if code < 0 => {
+            let rt = unsafe { user_info._sifields._rt };
+            SigType::Rt {
+                pid: raw_siginfo_pid(rt.si_pid),
+                uid: rt.si_uid,
+                sigval: rt.si_sigval,
+            }
+        }
+        SigCode::Queue | SigCode::Mesgq | SigCode::AsyncIO | SigCode::Tkill => {
+            let rt = unsafe { user_info._sifields._rt };
+            SigType::Rt {
+                pid: raw_siginfo_pid(rt.si_pid),
+                uid: rt.si_uid,
+                sigval: rt.si_sigval,
+            }
+        }
+        SigCode::PollIn
+        | SigCode::PollOut
+        | SigCode::PollMsg
+        | SigCode::PollErr
+        | SigCode::PollPri
+        | SigCode::PollHup => {
+            let sigpoll = unsafe { user_info._sifields._sigpoll };
+            SigType::SigPoll {
+                fd: sigpoll.si_fd,
+                band: sigpoll.si_band,
+            }
+        }
+        _ => {
+            let kill = unsafe { user_info._sifields._kill };
+            SigType::Kill {
+                pid: raw_siginfo_pid(kill.si_pid),
+                uid: kill.si_uid,
+            }
+        }
+    }
+}
 
 /// rt_sigqueueinfo 系统调用（最小兼容实现）
 ///
@@ -87,41 +220,8 @@ impl Syscall for SysRtSigqueueinfoHandle {
             return Err(SystemError::EPERM);
         }
 
-        // 解析 si_code（未知 code：尽量保持“来自用户态(负值)”的语义，不 panic）
-        let code_enum = SigCode::try_from_i32(si_code).unwrap_or({
-            if si_code < 0 {
-                SigCode::Queue
-            } else {
-                SigCode::User
-            }
-        });
-
-        let sender_uid = current_pcb.cred().uid.data() as u32;
-        let sender_pid = current_pid;
-
-        // 根据信号来源/布局构造内核 SigInfo
-        let sig_type = match code_enum {
-            SigCode::Queue => {
-                let sigval = unsafe { user_info._sifields._rt.si_sigval };
-                SigType::Rt {
-                    pid: sender_pid,
-                    uid: sender_uid,
-                    sigval,
-                }
-            }
-            SigCode::Timer => {
-                let timer = unsafe { user_info._sifields._timer };
-                SigType::PosixTimer {
-                    timerid: timer.si_tid,
-                    overrun: timer.si_overrun,
-                    sigval: timer.si_sigval,
-                }
-            }
-            _ => SigType::Kill {
-                pid: sender_pid,
-                uid: sender_uid,
-            },
-        };
+        let code_enum = SigCode::try_from_i32(si_code).unwrap_or(SigCode::Raw(si_code));
+        let sig_type = sig_type_from_user_siginfo(signal, code_enum, &user_info);
 
         let mut info = SigInfo::new(signal, user_info.si_errno, code_enum, sig_type);
 

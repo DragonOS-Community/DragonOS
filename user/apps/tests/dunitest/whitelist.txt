@@ -44,6 +44,7 @@ normal/signal_fpstate_sigreturn
 normal/general_protection_signal
 normal/ioperm_semantics
 normal/seccomp
+normal/signal_sigqueueinfo
 normal/process_signal_fork
 normal/sysfs_cgroup2_mount
 normal/devfs_ptmx_unlink

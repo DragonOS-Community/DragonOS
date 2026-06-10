@@ -710,11 +710,13 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
          * case, the signal cannot be dropped.
          */
         // todo: https://code.dragonos.org.cn/xref/linux-6.6.21/include/linux/signal.h?fi=sig_kernel_only#444
-        if ProcessManager::current_pcb()
-            .sighand()
-            .flags_contains(SignalFlags::UNKILLABLE)
+        let is_customized_action = sigaction
+            .as_ref()
+            .is_some_and(|action| action.action().is_customized());
+        let drop_for_unkillable = pcb.sighand().flags_contains(SignalFlags::UNKILLABLE)
             && !sig_number.kernel_only()
-        {
+            && !is_customized_action;
+        if drop_for_unkillable {
             continue;
         }
 

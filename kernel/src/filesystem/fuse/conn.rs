@@ -58,6 +58,7 @@ where
 #[derive(Debug)]
 pub struct FuseRequest {
     pub bytes: Vec<u8>,
+    opcode: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -561,6 +562,9 @@ impl FuseConn {
         }
 
         out[..req.bytes.len()].copy_from_slice(&req.bytes);
+        if req.opcode == FUSE_DESTROY {
+            self.abort();
+        }
         Ok(req.bytes.len())
     }
 
@@ -696,7 +700,7 @@ impl FuseConn {
         let mut bytes = Vec::with_capacity(hdr.len as usize);
         bytes.extend_from_slice(fuse_pack_struct(&hdr));
         bytes.extend_from_slice(payload);
-        Arc::new(FuseRequest { bytes })
+        Arc::new(FuseRequest { bytes, opcode })
     }
 
     fn push_request(

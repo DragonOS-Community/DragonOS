@@ -298,6 +298,11 @@ impl Futex {
                 Some(bucket) => bucket,
             };
 
+            bucket
+                .pi_waiters
+                .extract_if(|waiter| waiter.waker.is_closed())
+                .for_each(drop);
+
             if bucket.pi_waiters.is_empty() {
                 if atomic_futex
                     .compare_exchange(uval, owner_died, Ordering::SeqCst, Ordering::SeqCst)

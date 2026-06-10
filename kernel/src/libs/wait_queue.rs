@@ -752,6 +752,11 @@ impl Waker {
         self.state.store(Self::STATE_CLOSED, Ordering::Release);
     }
 
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        self.state.load(Ordering::Acquire) == Self::STATE_CLOSED
+    }
+
     fn consume_notification(&self) -> bool {
         loop {
             let state = self.state.load(Ordering::Acquire);

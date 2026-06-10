@@ -580,10 +580,6 @@ impl CfsRunQueue {
 
         let now = self.rq().clock_task();
         let curr = curr.unwrap();
-        if unlikely(!curr.on_rq()) {
-            self.set_current(Weak::default());
-            return;
-        }
 
         fence(Ordering::SeqCst);
         if unlikely(now <= curr.exec_start) {
@@ -662,8 +658,6 @@ impl CfsRunQueue {
             if curr.on_rq() {
                 vruntime = curr.vruntime;
                 curr_on_rq = true;
-            } else {
-                self.set_current(Weak::default());
             }
         }
 
@@ -1200,7 +1194,9 @@ impl CfsRunQueue {
         //     .as_bytes(),
         // );
 
-        self.entities.remove(se);
+        if self.entities.remove(se).is_none() {
+            panic!("dequeue entity that is not present in CFS timeline");
+        }
         // send_to_default_serial8250_port(
         //     format!(
         //         "after dequeue pcb {:?}(real: {:?}) cfsrq {:?}\n",
@@ -1370,8 +1366,10 @@ impl CfsRunQueue {
             .pick_eevdf(curr.filter(|se| se.on_rq()), |se| self.entity_eligible(se))
     }
 
-    /// pick下一个运行的task
-    pub fn pick_next_entity(&self) -> Option<Arc<FairSchedEntity>> {
+    pub fn pick_next_entity_with_curr(
+        &self,
+        curr: Option<&Arc<FairSchedEntity>>,
+    ) -> Option<Arc<FairSchedEntity>> {
         if SCHED_FEATURES.contains(SchedFeature::NEXT_BUDDY) {
             if let Some(next) = self.next() {
                 if self.entity_eligible(&next) {
@@ -1380,12 +1378,17 @@ impl CfsRunQueue {
             }
         }
 
-        let curr = self.current();
         let picked = self
-            .pick_eevdf_entity(curr.as_ref())
+            .pick_eevdf_entity(curr)
             .or_else(|| self.entities.leftmost())
-            .or_else(|| curr.clone().filter(|se| se.on_rq()));
+            .or_else(|| curr.cloned().filter(|se| se.on_rq()));
         picked
+    }
+
+    /// pick下一个运行的task
+    pub fn pick_next_entity(&self) -> Option<Arc<FairSchedEntity>> {
+        let curr = self.current();
+        self.pick_next_entity_with_curr(curr.as_ref().filter(|se| se.on_rq()))
     }
 
     pub fn entity_eligible(&self, se: &Arc<FairSchedEntity>) -> bool {
@@ -1701,15 +1704,18 @@ impl Scheduler for CompletelyFairScheduler {
             let cfs = cfs_rq.unwrap();
             let cfs = cfs.force_mut();
             let curr = cfs.current();
-            if let Some(curr) = curr {
+            let curr = if let Some(curr) = curr {
                 if curr.on_rq() {
                     cfs.update_current();
+                    Some(curr)
                 } else {
-                    cfs.set_current(Weak::default());
+                    None
                 }
-            }
+            } else {
+                None
+            };
 
-            se = cfs.pick_next_entity();
+            se = cfs.pick_next_entity_with_curr(curr.as_ref());
             match se.clone() {
                 Some(val) => cfs_rq = val.my_cfs_rq.clone(),
                 None => {
@@ -1766,17 +1772,18 @@ impl Scheduler for CompletelyFairScheduler {
         }
 
         loop {
+            let curr;
             {
                 let cfs = cfs_rq.force_mut();
-                if cfs.current().is_some() {
-                    // Linux updates curr before EEVDF pick on the path that has
-                    // not put_prev_entity() yet, so eligibility sees fresh runtime.
+                curr = cfs.current().filter(|se| se.on_rq());
+                if curr.is_some() {
+                    // Linux updates runnable curr before EEVDF pick on the path
+                    // that has not put_prev_entity() yet.
                     cfs.update_current();
                 }
             }
 
-            let curr = cfs_rq.current();
-            let winner = cfs_rq.pick_next_entity()?;
+            let winner = cfs_rq.pick_next_entity_with_curr(curr.as_ref())?;
 
             // If winner is curr, descend into curr's group
             if let Some(c) = curr {

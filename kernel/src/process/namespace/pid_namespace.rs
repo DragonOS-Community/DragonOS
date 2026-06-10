@@ -196,6 +196,10 @@ impl PidNamespace {
         self.inner().child_reaper = Some(child_reaper);
     }
 
+    pub fn disable_pid_allocation(&self) {
+        self.inner().dead = true;
+    }
+
     pub fn parent(&self) -> Option<Arc<PidNamespace>> {
         self.parent.as_ref().and_then(|p| p.upgrade())
     }

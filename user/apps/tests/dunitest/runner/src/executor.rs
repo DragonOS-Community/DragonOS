@@ -44,21 +44,40 @@ pub fn run_test(spec: &TestSpec, results_dir: &Path, verbose: bool) -> Result<Ca
     let mut precheck_log = File::create(&log_path)
         .with_context(|| format!("创建日志文件失败: {}", log_path.display()))?;
 
-    if let Some(msg) = validate_gtest_binary(spec)? {
-        writeln!(precheck_log, "{}", msg).with_context(|| "写入日志失败")?;
-        let result = CaseResult {
-            name: spec.name.clone(),
-            status: CaseStatus::Failed,
-            duration_ms: precheck_start.elapsed().as_millis(),
-            exit_code: None,
-            message: "非 gtest 测例，已拒绝执行".to_string(),
-            log_file: log_path.display().to_string(),
-            gtest_total: 0,
-            gtest_passed: 0,
-            gtest_failed: 0,
-            gtest_skipped: 0,
-        };
-        return Ok(result);
+    match validate_gtest_binary(spec)? {
+        GtestPrecheck::Valid => {}
+        GtestPrecheck::Invalid(msg) => {
+            writeln!(precheck_log, "{}", msg).with_context(|| "写入日志失败")?;
+            let result = CaseResult {
+                name: spec.name.clone(),
+                status: CaseStatus::Failed,
+                duration_ms: precheck_start.elapsed().as_millis(),
+                exit_code: None,
+                message: "非 gtest 测例，已拒绝执行".to_string(),
+                log_file: log_path.display().to_string(),
+                gtest_total: 0,
+                gtest_passed: 0,
+                gtest_failed: 0,
+                gtest_skipped: 0,
+            };
+            return Ok(result);
+        }
+        GtestPrecheck::Timeout(msg) => {
+            writeln!(precheck_log, "{}", msg).with_context(|| "写入日志失败")?;
+            let result = CaseResult {
+                name: spec.name.clone(),
+                status: CaseStatus::Timeout,
+                duration_ms: precheck_start.elapsed().as_millis(),
+                exit_code: None,
+                message: msg,
+                log_file: log_path.display().to_string(),
+                gtest_total: 0,
+                gtest_passed: 0,
+                gtest_failed: 0,
+                gtest_skipped: 0,
+            };
+            return Ok(result);
+        }
     }
     drop(precheck_log);
 
@@ -205,7 +224,7 @@ fn terminate_case_process_group(child_pid: u32) -> Result<()> {
 
 #[cfg(not(unix))]
 fn terminate_case_process_group(_child_pid: u32) -> Result<()> {
-    Ok(())
+    anyhow::bail!("process-group termination is unsupported on this platform")
 }
 
 fn parse_gtest_counts(log_path: &Path) -> Result<(usize, usize, usize, usize)> {
@@ -281,28 +300,102 @@ pub fn abs_or_join(base: &Path, path: &str) -> PathBuf {
     }
 }
 
-fn validate_gtest_binary(spec: &TestSpec) -> Result<Option<String>> {
-    let output = Command::new(&spec.path)
-        .arg("--gtest_help")
-        .output()
-        .with_context(|| format!("预检查 gtest 失败: {}", spec.path))?;
+enum GtestPrecheck {
+    Valid,
+    Invalid(String),
+    Timeout(String),
+}
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+fn validate_gtest_binary(spec: &TestSpec) -> Result<GtestPrecheck> {
+    let mut cmd = Command::new(&spec.path);
+    cmd.arg("--gtest_help")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_case_process_group(&mut cmd);
+
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("预检查 gtest 失败: {}", spec.path))?;
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .with_context(|| "获取预检查 stdout 管道失败")?;
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .with_context(|| "获取预检查 stderr 管道失败")?;
+    let stdout_thread = spawn_pipe_collector(stdout_pipe);
+    let stderr_thread = spawn_pipe_collector(stderr_pipe);
+
+    let timeout = Duration::from_secs(spec.timeout_sec.clamp(1, 5));
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().with_context(|| "等待预检查进程状态失败")? {
+            break status;
+        }
+        if start.elapsed() >= timeout {
+            let kill_group_result = terminate_case_process_group(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+
+            let mut message = format!("gtest 预检查超时: {} 秒", timeout.as_secs());
+            if let Err(e) = kill_group_result {
+                message.push_str(&format!("; 进程组终止失败，跳过管道线程收尾: {e:#}"));
+            } else {
+                let _ = join_pipe_collector(stdout_thread);
+                let _ = join_pipe_collector(stderr_thread);
+            }
+            return Ok(GtestPrecheck::Timeout(message));
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+
+    let _ = terminate_case_process_group(child.id());
+    let stdout = join_pipe_collector(stdout_thread)?;
+    let stderr = join_pipe_collector(stderr_thread)?;
+    let stdout = String::from_utf8_lossy(&stdout);
+    let stderr = String::from_utf8_lossy(&stderr);
     let merged = format!("{}\n{}", stdout, stderr);
     let marker = "This program contains tests written using Google Test";
 
-    if output.status.success() && merged.contains(marker) {
-        return Ok(None);
+    if status.success() && merged.contains(marker) {
+        return Ok(GtestPrecheck::Valid);
     }
 
-    Ok(Some(format!(
+    Ok(GtestPrecheck::Invalid(format!(
         "dunitest: '{}' 不是有效 gtest 测例，缺少 gtest 标识文本。\n预检查退出码: {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
         spec.path,
-        output.status.code(),
+        status.code(),
         stdout,
         stderr
     )))
+}
+
+fn spawn_pipe_collector<R>(mut reader: R) -> JoinHandle<Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut buf = [0_u8; 4096];
+        loop {
+            let n = reader
+                .read(&mut buf)
+                .with_context(|| "读取预检查管道失败")?;
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        Ok(out)
+    })
+}
+
+fn join_pipe_collector(handle: JoinHandle<Result<Vec<u8>>>) -> Result<Vec<u8>> {
+    match handle.join() {
+        Ok(inner) => inner,
+        Err(_) => anyhow::bail!("预检查输出收集线程发生 panic"),
+    }
 }
 
 fn spawn_pipe_forwarder<R>(
@@ -403,6 +496,102 @@ sleep 30
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "timeout path did not return promptly"
+        );
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn precheck_timeout_kills_forked_descendants_that_keep_pipes_open() {
+        let tmp = std::env::temp_dir().join(format!(
+            "dunitest-runner-precheck-pgrp-{}-{}",
+            std::process::id(),
+            unique_nanos()
+        ));
+        let results = tmp.join("results");
+        fs::create_dir_all(&results).unwrap();
+
+        let script = tmp.join("forking_gtest_help.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+if [ "$1" = "--gtest_help" ]; then
+  (sleep 30) &
+  sleep 30
+fi
+echo "[==========] Running 1 test from 1 test suite."
+echo "[  PASSED  ] 1 test."
+"#,
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).unwrap();
+
+        let spec = TestSpec {
+            name: "normal/forking_precheck_timeout".to_string(),
+            path: script.display().to_string(),
+            args: Vec::new(),
+            timeout_sec: 1,
+        };
+
+        let started = Instant::now();
+        let result = run_test(&spec, &results, false).unwrap();
+
+        assert!(matches!(result.status, CaseStatus::Timeout));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "precheck timeout path did not return promptly"
+        );
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn precheck_success_reaps_descendants_that_keep_pipes_open() {
+        let tmp = std::env::temp_dir().join(format!(
+            "dunitest-runner-precheck-success-pgrp-{}-{}",
+            std::process::id(),
+            unique_nanos()
+        ));
+        let results = tmp.join("results");
+        fs::create_dir_all(&results).unwrap();
+
+        let script = tmp.join("forking_gtest_help_success.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+if [ "$1" = "--gtest_help" ]; then
+  echo "This program contains tests written using Google Test"
+  (sleep 30) &
+  exit 0
+fi
+echo "[==========] Running 1 test from 1 test suite."
+echo "[ RUN      ] Smoke.Pass"
+echo "[       OK ] Smoke.Pass"
+echo "[==========] 1 test from 1 test suite ran."
+echo "[  PASSED  ] 1 test."
+"#,
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).unwrap();
+
+        let spec = TestSpec {
+            name: "normal/forking_precheck_success".to_string(),
+            path: script.display().to_string(),
+            args: Vec::new(),
+            timeout_sec: 1,
+        };
+
+        let started = Instant::now();
+        let result = run_test(&spec, &results, false).unwrap();
+
+        assert!(matches!(result.status, CaseStatus::Passed));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "precheck success path did not clean descendant pipe holders"
         );
 
         let _ = fs::remove_dir_all(tmp);

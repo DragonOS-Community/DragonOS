@@ -65,7 +65,6 @@ pub static IDLE_CPUS: AtomicCpuMask = AtomicCpuMask::new();
 // 这里虽然rq是percpu的，但是在负载均衡的时候需要修改对端cpu的rq，所以仍需加锁
 static CPU_RUNQUEUE: Lazy<PerCpuVar<Arc<CpuRunQueue>>> = PerCpuVar::define_lazy();
 
-
 pub const SCHED_FIXEDPOINT_SHIFT: u64 = 10;
 #[allow(dead_code)]
 pub const SCHED_FIXEDPOINT_SCALE: u64 = 1 << SCHED_FIXEDPOINT_SHIFT;
@@ -369,9 +368,7 @@ impl LoadWeight {
 
     pub fn set_load_weight_from_prio(&mut self, prio: i32) {
         let index = (prio - MAX_RT_PRIO).clamp(0, Self::SCHED_PRIO_TO_WEIGHT.len() as i32 - 1);
-        self.update_load_set(Self::scale_load(
-            Self::SCHED_PRIO_TO_WEIGHT[index as usize],
-        ));
+        self.update_load_set(Self::scale_load(Self::SCHED_PRIO_TO_WEIGHT[index as usize]));
     }
 
     /// ## 更新负载权重的倒数

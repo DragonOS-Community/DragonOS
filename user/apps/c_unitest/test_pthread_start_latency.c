@@ -86,9 +86,6 @@ int main(void) {
             int seen = atomic_load_explicit(&ready, memory_order_acquire);
             fprintf(stderr, "ready timeout at round=%d ready=%d/%d\n", round, seen, NR_THREADS);
             atomic_store_explicit(&run, 0, memory_order_release);
-            for (int i = 0; i < NR_THREADS; ++i) {
-                pthread_join(threads[i], NULL);
-            }
             return 2;
         }
 

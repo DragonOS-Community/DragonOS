@@ -58,9 +58,9 @@ use crate::{
     },
     mm::{
         percpu::{PerCpu, PerCpuVar},
-        set_IDLE_PROCESS_ADDRESS_SPACE, IDLE_PROCESS_ADDRESS_SPACE,
+        set_IDLE_PROCESS_ADDRESS_SPACE,
         ucontext::AddressSpace,
-        PhysAddr, VirtAddr,
+        PhysAddr, VirtAddr, IDLE_PROCESS_ADDRESS_SPACE,
     },
     process::resource::{RLimit64, RLimitID, RUsage},
     rcu::RcuArcSlot,
@@ -895,6 +895,9 @@ impl ProcessManager {
             let pcb = current_pcb.clone();
             pcb.mark_exiting();
             pid = pcb.pid();
+            if pid.is_child_reaper() {
+                pid.ns_of_pid().disable_pid_allocation();
+            }
             pcb.wait_queue.mark_dead();
 
             // 进行进程退出后的工作
@@ -977,19 +980,18 @@ impl ProcessManager {
             // this CPU and send spurious IPIs.
             //
             // Switch this exiting task to the idle address space before dropping the old user mm.
-            // This mirrors Linux's lazy-TLB exit boundary: the expensive mm teardown runs in a
-            // sleepable context, while the task still has a safe kernel-only mm if it is scheduled
-            // during teardown.
+            // The PCB-visible user_vm becomes None, matching Linux's task->mm == NULL after exit;
+            // the CPU-visible active mm is tracked by the per-CPU TLB state instead.
             let old_user_vm = {
                 let idle_vm = IDLE_PROCESS_ADDRESS_SPACE();
                 let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
                 let cpu = smp_get_processor_id();
                 let mut basic = pcb.basic_mut();
-                let old_vm = unsafe { basic.replace_user_vm(Some(idle_vm.clone())) };
-                unsafe { idle_vm.make_current() };
+                let old_vm = unsafe { basic.replace_user_vm(None) };
                 if let Some(old_vm) = old_vm.as_ref() {
                     old_vm.active_cpus_clear(cpu);
                 }
+                unsafe { idle_vm.make_current() };
                 idle_vm.active_cpus_set(cpu);
                 unsafe { crate::mm::tlb::tlb_state_set_loaded_mm(idle_vm) };
                 drop(basic);
@@ -1124,16 +1126,19 @@ impl ProcessManager {
     pub(super) unsafe fn release(pid: RawPid) {
         let pcb = ProcessManager::find(pid);
         if let Some(ref pcb) = pcb {
+            let parent_child_vpid = pcb.real_parent_pcb().and_then(|parent| {
+                let parent_ns = parent.active_pid_ns();
+                pcb.task_pid_nr_ns(PidType::PID, Some(parent_ns))
+                    .map(|vpid| (parent, vpid))
+            });
+
+            pcb.__exit_signal();
             {
                 let _cgroup_guard = crate::cgroup::cgroup_accounting_lock().lock();
                 pcb.task_cgroup_node().uncharge_pids(1);
             }
             // 从父进程的 children 列表中移除
-            if let Some(parent) = pcb.real_parent_pcb() {
-                let parent_ns = parent.active_pid_ns();
-                let vpid = pcb
-                    .task_pid_nr_ns(PidType::PID, Some(parent_ns))
-                    .unwrap_or(RawPid::new(0));
+            if let Some((parent, vpid)) = parent_child_vpid {
                 let mut children = parent.children.write();
                 children.retain(|&p| p != vpid);
             }
@@ -1414,6 +1419,8 @@ bitflags! {
         const IN_IOWAIT = 1 << 13;
         /// 线程组 exec 期间延迟 PID/TGID/PGID/SID 的 unhash
         const DEFER_UNHASH = 1 << 14;
+        /// PID links and visible-thread accounting have already been released.
+        const PID_UNHASHED = 1 << 15;
     }
 }
 

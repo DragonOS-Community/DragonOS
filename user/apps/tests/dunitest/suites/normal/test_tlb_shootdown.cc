@@ -337,6 +337,15 @@ int case_fork_cow_stale_tlb() {
         munmap(buf, len);
         return -1;
     }
+    int verify_pipe[2];
+    if (pipe(verify_pipe) != 0) {
+        perror("pipe verify");
+        close(snapshot_pipe[0]);
+        close(snapshot_pipe[1]);
+        munmap(snap, kSnapMapLen);
+        munmap(buf, len);
+        return -1;
+    }
 
     std::atomic<int> run{1};
     std::atomic<int> ready{0};
@@ -357,6 +366,8 @@ int case_fork_cow_stale_tlb() {
             }
             close(snapshot_pipe[0]);
             close(snapshot_pipe[1]);
+            close(verify_pipe[0]);
+            close(verify_pipe[1]);
             munmap(snap, kSnapMapLen);
             munmap(buf, len);
             return -1;
@@ -374,6 +385,8 @@ int case_fork_cow_stale_tlb() {
         }
         close(snapshot_pipe[0]);
         close(snapshot_pipe[1]);
+        close(verify_pipe[0]);
+        close(verify_pipe[1]);
         munmap(snap, kSnapMapLen);
         munmap(buf, len);
         return -1;
@@ -388,6 +401,8 @@ int case_fork_cow_stale_tlb() {
         }
         close(snapshot_pipe[0]);
         close(snapshot_pipe[1]);
+        close(verify_pipe[0]);
+        close(verify_pipe[1]);
         munmap(snap, kSnapMapLen);
         munmap(buf, len);
         return -1;
@@ -395,6 +410,7 @@ int case_fork_cow_stale_tlb() {
 
     if (pid == 0) {
         close(snapshot_pipe[0]);
+        close(verify_pipe[1]);
         volatile uint8_t* child_buf = buf;
         // Child. Snapshot `buf` immediately so we know what the post-fork
         // COW-shared physical pages look like from our point of view. Any
@@ -415,6 +431,16 @@ int case_fork_cow_stale_tlb() {
         }
         close(snapshot_pipe[1]);
 
+        uint8_t start_verify = 0;
+        ssize_t nread_verify = 0;
+        do {
+            nread_verify = read(verify_pipe[0], &start_verify, sizeof(start_verify));
+        } while (nread_verify < 0 && errno == EINTR);
+        close(verify_pipe[0]);
+        if (nread_verify != sizeof(start_verify) || start_verify != 1) {
+            _exit(12);
+        }
+
         constexpr int kRounds = 400;
         for (int r = 0; r < kRounds; ++r) {
             for (size_t i = 0; i < kSnapCount; ++i) {
@@ -428,6 +454,7 @@ int case_fork_cow_stale_tlb() {
     }
 
     close(snapshot_pipe[1]);
+    close(verify_pipe[0]);
     uint8_t token = 0;
     ssize_t nread = 0;
     do {
@@ -440,6 +467,7 @@ int case_fork_cow_stale_tlb() {
         for (int i = 0; i < kNrThreads; ++i) {
             pthread_join(threads[i], nullptr);
         }
+        close(verify_pipe[1]);
         int status = 0;
         waitpid(pid, &status, 0);
         munmap(snap, kSnapMapLen);
@@ -455,6 +483,21 @@ int case_fork_cow_stale_tlb() {
             parent_buf[i * kSnapStride] = static_cast<uint8_t>(round + i);
         }
     }
+    const uint8_t start_verify = 1;
+    if (write(verify_pipe[1], &start_verify, sizeof(start_verify)) != sizeof(start_verify)) {
+        perror("write verify token");
+        run.store(0, std::memory_order_release);
+        for (int i = 0; i < kNrThreads; ++i) {
+            pthread_join(threads[i], nullptr);
+        }
+        close(verify_pipe[1]);
+        int status = 0;
+        waitpid(pid, &status, 0);
+        munmap(snap, kSnapMapLen);
+        munmap(buf, len);
+        return -1;
+    }
+    close(verify_pipe[1]);
     run.store(0, std::memory_order_release);
     for (int i = 0; i < kNrThreads; ++i) {
         pthread_join(threads[i], nullptr);

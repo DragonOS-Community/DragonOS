@@ -1036,7 +1036,12 @@ impl ProcessControlBlock {
     }
 
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/exit.c#143
-    pub(super) fn __exit_signal(&mut self) {
+    pub(super) fn __exit_signal(&self) {
+        if self.flags().contains(ProcessFlags::PID_UNHASHED) {
+            return;
+        }
+        self.flags().insert(ProcessFlags::PID_UNHASHED);
+
         let sighand = self.sighand();
         if sighand.flags_contains(SignalFlags::GROUP_EXEC) {
             let this = self.self_ref.upgrade();

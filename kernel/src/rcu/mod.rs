@@ -872,13 +872,25 @@ pub fn irq_enter() {
     cpu_state.irq_nesting += 1;
 }
 
-pub fn irq_exit(resume_idle_eqs: bool) {
+/// Returns true when this call exits the outermost IRQ nesting level.
+pub fn irq_is_outermost() -> bool {
     if !rcu_enabled() {
-        return;
+        return true;
     }
 
     let cpu = smp_get_processor_id();
-    let wake_worker = {
+    let inner = RCU_STATE.inner.lock_irqsave();
+    inner.cpu_states[cpu.data() as usize].irq_nesting == 1
+}
+
+/// Returns true when this call exits the outermost IRQ nesting level.
+pub fn irq_exit(resume_idle_eqs: bool) -> bool {
+    if !rcu_enabled() {
+        return true;
+    }
+
+    let cpu = smp_get_processor_id();
+    let (outermost, wake_worker) = {
         let mut inner = RCU_STATE.inner.lock_irqsave();
         let cpu_idx = cpu.data() as usize;
         assert!(
@@ -887,15 +899,15 @@ pub fn irq_exit(resume_idle_eqs: bool) {
         );
         inner.cpu_states[cpu_idx].irq_nesting -= 1;
         if inner.cpu_states[cpu_idx].irq_nesting != 0 {
-            false
+            (false, false)
         } else {
             let resume_idle_eqs = inner.cpu_states[cpu_idx].irq_from_idle_eqs && resume_idle_eqs;
             inner.cpu_states[cpu_idx].irq_from_idle_eqs = false;
             if resume_idle_eqs {
-                enter_cpu_idle_eqs(&mut inner, cpu)
+                (true, enter_cpu_idle_eqs(&mut inner, cpu))
             } else {
                 inner.cpu_states[cpu_idx].in_idle_eqs = false;
-                false
+                (true, false)
             }
         }
     };
@@ -905,6 +917,8 @@ pub fn irq_exit(resume_idle_eqs: bool) {
         RCU_STATE.wake_worker();
         RCU_STATE.maybe_process_ready_callbacks_inline();
     }
+
+    outermost
 }
 
 pub fn cpu_offline(cpu: ProcessorId) {

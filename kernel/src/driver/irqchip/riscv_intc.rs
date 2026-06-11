@@ -11,7 +11,6 @@ use crate::{
         irqdata::IrqData,
         irqdesc::{irq_desc_manager, GenericIrqHandler},
         irqdomain::{irq_domain_manager, IrqDomain, IrqDomainOps},
-        softirq::do_softirq,
         HardwareIrqNumber, IrqNumber,
     },
     libs::spinlock::{SpinLock, SpinLockGuard},
@@ -222,5 +221,4 @@ pub fn riscv_intc_irq(trap_frame: &mut TrapFrame) {
         )
         .ok();
     }
-    do_softirq();
 }

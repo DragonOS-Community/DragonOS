@@ -35,16 +35,19 @@ unsafe extern "C" fn x86_64_do_irq(trap_frame: &mut TrapFrame, vector: u32) {
         CurrentApic.send_eoi();
     }
 
-    do_softirq();
+    let irq_outermost = crate::rcu::irq_is_outermost();
+    if irq_outermost {
+        do_softirq();
+    }
 
     // 检测当前进程是否可被调度
     let should_schedule = current_pcb_flags().contains(ProcessFlags::NEED_SCHEDULE)
         || vector == APIC_TIMER_IRQ_NUM.data();
     let resume_idle_eqs = !should_schedule
         && ProcessManager::current_pcb().sched_info().policy() == SchedPolicy::IDLE;
-    crate::rcu::irq_exit(resume_idle_eqs);
+    let irq_exited_outermost = crate::rcu::irq_exit(resume_idle_eqs);
 
-    if should_schedule {
+    if should_schedule && irq_exited_outermost {
         __schedule(SchedMode::SM_PREEMPT);
     }
 }

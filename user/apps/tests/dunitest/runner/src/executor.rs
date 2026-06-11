@@ -13,6 +13,7 @@ use std::{
 };
 
 const PIPE_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+const GTEST_PRECHECK_MAX_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -354,10 +355,11 @@ fn validate_gtest_binary(spec: &TestSpec) -> Result<GtestPrecheck> {
     let stdout_thread = spawn_pipe_collector(stdout_pipe);
     let stderr_thread = spawn_pipe_collector(stderr_pipe);
 
-    let timeout = Duration::from_secs(spec.timeout_sec.clamp(1, 5));
+    let timeout = gtest_precheck_timeout(spec.timeout_sec);
     let start = Instant::now();
     let status = loop {
-        if let Some(status) = child.try_wait().with_context(|| "等待预检查进程状态失败")? {
+        if let Some(status) = child.try_wait().with_context(|| "等待预检查进程状态失败")?
+        {
             break status;
         }
         if start.elapsed() >= timeout {
@@ -396,6 +398,10 @@ fn validate_gtest_binary(spec: &TestSpec) -> Result<GtestPrecheck> {
         stdout,
         stderr
     )))
+}
+
+fn gtest_precheck_timeout(case_timeout_sec: u64) -> Duration {
+    Duration::from_secs(case_timeout_sec.max(1)).min(GTEST_PRECHECK_MAX_TIMEOUT)
 }
 
 fn spawn_pipe_collector<R>(mut reader: R) -> JoinHandle<Result<Vec<u8>>>
@@ -504,6 +510,14 @@ mod tests {
     use crate::manifest::TestSpec;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn gtest_precheck_timeout_is_bounded_but_not_too_aggressive() {
+        assert_eq!(gtest_precheck_timeout(0), Duration::from_secs(1));
+        assert_eq!(gtest_precheck_timeout(1), Duration::from_secs(1));
+        assert_eq!(gtest_precheck_timeout(5), Duration::from_secs(5));
+        assert_eq!(gtest_precheck_timeout(60), Duration::from_secs(15));
+    }
 
     #[test]
     fn timeout_kills_forked_descendants_that_keep_pipes_open() {

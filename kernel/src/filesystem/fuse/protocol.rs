@@ -74,6 +74,20 @@ pub const FUSE_INIT_EXT: u64 = 1 << 30;
 /// fuse_attr.flags (Linux 6.6): directory is a submount root announced by virtiofsd.
 pub const FUSE_ATTR_SUBMOUNT: u32 = 1 << 0;
 
+// fuse_open_out.open_flags (Linux 6.6 uapi subset)
+pub const FOPEN_DIRECT_IO: u32 = 1 << 0;
+pub const FOPEN_KEEP_CACHE: u32 = 1 << 1;
+#[allow(dead_code)]
+pub const FOPEN_NONSEEKABLE: u32 = 1 << 2;
+#[allow(dead_code)]
+pub const FOPEN_CACHE_DIR: u32 = 1 << 3;
+#[allow(dead_code)]
+pub const FOPEN_STREAM: u32 = 1 << 4;
+#[allow(dead_code)]
+pub const FOPEN_NOFLUSH: u32 = 1 << 5;
+#[allow(dead_code)]
+pub const FOPEN_PARALLEL_DIRECT_WRITES: u32 = 1 << 6;
+
 // getattr/setattr valid bits (subset)
 pub const FATTR_MODE: u32 = 1 << 0;
 pub const FATTR_UID: u32 = 1 << 1;

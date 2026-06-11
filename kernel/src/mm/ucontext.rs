@@ -883,10 +883,16 @@ impl InnerAddressSpace {
             .mmap(start_page.virt_address().data(), len, offset)
         {
             Ok(_) => {
+                if let Some(vma) = self.mappings.contains(start_page.virt_address()) {
+                    self.mappings.attach_vma(&vma);
+                }
                 self.post_map_population(start_page.virt_address(), len, map_flags);
                 Ok(start_page)
             }
             Err(SystemError::ENOSYS) => {
+                if let Some(vma) = self.mappings.contains(start_page.virt_address()) {
+                    self.mappings.attach_vma(&vma);
+                }
                 self.post_map_population(start_page.virt_address(), len, map_flags);
                 Ok(start_page)
             } // 文件系统未实现 mmap，视为成功
@@ -1431,7 +1437,19 @@ impl InnerAddressSpace {
 
         for r in regions {
             // debug!("mprotect: r: {:?}", r);
-            let r = *r.lock().region();
+            let (r, new_vm_flags) = {
+                let guard = r.lock();
+                if !guard.can_have_flags(prot_flags) {
+                    return Err(SystemError::EACCES);
+                }
+                let old_vm_flags = *guard.vm_flags();
+                let access_flags = VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_EXEC;
+                let new_vm_flags = (old_vm_flags & !access_flags) | VmFlags::from(prot_flags);
+                if let Some(file) = guard.vm_file() {
+                    file.inode().fs().mprotect(old_vm_flags, new_vm_flags)?;
+                }
+                (*guard.region(), new_vm_flags)
+            };
             let r = self.mappings.remove_vma(&r).unwrap();
 
             let intersection = r.lock().region().intersect(&region).unwrap();
@@ -1442,19 +1460,12 @@ impl InnerAddressSpace {
                     .expect("Failed to extract VMA");
 
                 let mut r_guard = r.lock();
-                if !r_guard.can_have_flags(prot_flags) {
-                    Err(SystemError::EACCES)
-                } else {
-                    r_guard.set_vm_flags(VmFlags::from(prot_flags));
+                r_guard.set_vm_flags(new_vm_flags);
 
-                    let new_flags: EntryFlags<MMArch> = r_guard
-                        .flags()
-                        .set_execute(prot_flags.contains(ProtFlags::PROT_EXEC))
-                        .set_write(prot_flags.contains(ProtFlags::PROT_WRITE));
+                let new_flags: EntryFlags<MMArch> = MMArch::vm_get_page_prot(new_vm_flags);
 
-                    r_guard.remap(new_flags, mapper, &mut tlb)?;
-                    Ok((split_result.prev, split_result.after))
-                }
+                r_guard.remap(new_flags, mapper, &mut tlb)?;
+                Ok((split_result.prev, split_result.after))
             };
             let (before, after) = match remap_result {
                 Ok(result) => result,
@@ -2299,14 +2310,14 @@ impl LockedVMA {
     ) -> Result<(), SystemError> {
         let mut guard = self.lock();
         for page in guard.region.pages() {
-            // 暂时要求所有的页帧都已经映射到页表
-            // TODO: 引入Lazy Mapping, 通过缺页中断来映射页帧，这里就不必要求所有的页帧都已经映射到页表了
-            let r = unsafe {
-                mapper
-                    .remap(page.virt_address(), flags)
-                    .expect("Failed to remap, beacuse of some page is not mapped")
-            };
-            flusher.consume(r);
+            if mapper.translate(page.virt_address()).is_some() {
+                let r = unsafe {
+                    mapper
+                        .remap(page.virt_address(), flags)
+                        .expect("Failed to remap")
+                };
+                flusher.consume(r);
+            }
         }
         guard.flags = flags;
         return Ok(());

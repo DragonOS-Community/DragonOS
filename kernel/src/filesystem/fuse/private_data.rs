@@ -21,7 +21,10 @@ pub struct FuseOpenPrivateData {
     pub conn: Arc<dyn Any + Send + Sync>,
     pub node: Arc<FuseNode>,
     pub fh: u64,
+    /// User-visible file flags sent in FUSE_OPEN/FUSE_READ/FUSE_WRITE.
     pub open_flags: u32,
+    /// Daemon-returned FOPEN_* flags from fuse_open_out.
+    pub fopen_flags: u32,
     pub no_open: bool,
 }
 

@@ -7,11 +7,11 @@ use system_error::SystemError;
 
 use crate::{
     filesystem::vfs::{
-        FileSystem, FileSystemMakerData, FileType, FsInfo, IndexNode, InodeFlags, InodeId,
-        InodeMode, Magic, Metadata, MountableFileSystem, SuperBlock, FSMAKER,
+        FilePrivateData, FileSystem, FileSystemMakerData, FileType, FsInfo, IndexNode, InodeFlags,
+        InodeId, InodeMode, Magic, Metadata, MountableFileSystem, SuperBlock, FSMAKER,
     },
     libs::mutex::Mutex,
-    mm::{fault::PageFaultMessage, VmFaultReason},
+    mm::{fault::PageFaultMessage, VmFaultReason, VmFlags},
     process::ProcessManager,
     register_mountable_fs,
     time::PosixTimeSpec,
@@ -23,7 +23,10 @@ use super::{
     conn::FuseConn,
     inode::FuseNode,
     private_data::FuseFilePrivateData,
-    protocol::{fuse_read_struct, FuseStatfsOut, FUSE_ATTR_SUBMOUNT, FUSE_ROOT_ID, FUSE_STATFS},
+    protocol::{
+        fuse_read_struct, FuseStatfsOut, FOPEN_DIRECT_IO, FUSE_ATTR_SUBMOUNT, FUSE_ROOT_ID,
+        FUSE_STATFS,
+    },
 };
 
 #[derive(Debug)]
@@ -553,8 +556,54 @@ impl FileSystem for FuseFS {
     }
 
     unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
-        let _ = pfm;
-        VmFaultReason::VM_FAULT_SIGBUS
+        let vma = pfm.vma();
+        let vma_guard = vma.lock();
+        let vm_flags = *vma_guard.vm_flags();
+        if vm_flags.contains(VmFlags::VM_SHARED | VmFlags::VM_WRITE) {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        }
+        let Some(file) = vma_guard.vm_file() else {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        };
+        drop(vma_guard);
+
+        let (node, fh, file_flags, fopen_flags) = {
+            let data = file.private_data.lock();
+            let FilePrivateData::Fuse(FuseFilePrivateData::File(p)) = &*data else {
+                return VmFaultReason::VM_FAULT_SIGBUS;
+            };
+            (p.node.clone(), p.fh, p.open_flags, p.fopen_flags)
+        };
+        if (fopen_flags & FOPEN_DIRECT_IO) != 0 {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        }
+
+        let Some(page_index) = pfm.backing_pgoff() else {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        };
+        let major = node
+            .page_cache()
+            .map(|cache| !cache.is_page_ready(page_index))
+            .unwrap_or(true);
+
+        match node.fault_page_with_open(page_index, fh, file_flags) {
+            Ok(page) => {
+                pfm.set_page(page);
+                if major {
+                    VmFaultReason::VM_FAULT_MAJOR
+                } else {
+                    VmFaultReason::empty()
+                }
+            }
+            Err(_) => VmFaultReason::VM_FAULT_SIGBUS,
+        }
+    }
+
+    fn mprotect(&self, _old_vm_flags: VmFlags, new_vm_flags: VmFlags) -> Result<(), SystemError> {
+        if new_vm_flags.contains(VmFlags::VM_SHARED | VmFlags::VM_WRITE) {
+            return Err(SystemError::EACCES);
+        }
+        Ok(())
     }
 
     unsafe fn map_pages(

@@ -38,7 +38,7 @@ use crate::{
         casting::DowncastArc,
         mutex::{Mutex, MutexGuard},
     },
-    mm::{fault::PageFaultMessage, VmFaultReason},
+    mm::{fault::PageFaultMessage, VmFaultReason, VmFlags},
     net::socket::Socket,
     process::ProcessManager,
     syscall::user_buffer::UserBuffer,
@@ -1506,6 +1506,10 @@ pub trait FileSystem: Any + Sync + Send + Debug {
 
     unsafe fn fault(&self, _pfm: &mut PageFaultMessage) -> VmFaultReason {
         VmFaultReason::VM_FAULT_SIGBUS
+    }
+
+    fn mprotect(&self, _old_vm_flags: VmFlags, _new_vm_flags: VmFlags) -> Result<(), SystemError> {
+        Ok(())
     }
 
     unsafe fn map_pages(

@@ -452,6 +452,13 @@ impl PageCacheManager {
         self.upgrade()?.get_or_create_page_for_read(page_index)
     }
 
+    pub fn commit_page_with<F>(&self, page_index: usize, fill: F) -> Result<Arc<Page>, SystemError>
+    where
+        F: FnOnce(usize, &mut [u8]) -> Result<usize, SystemError>,
+    {
+        self.upgrade()?.get_or_create_page_with(page_index, fill)
+    }
+
     pub fn commit_overwrite(&self, page_index: usize) -> Result<Arc<Page>, SystemError> {
         self.upgrade()?.get_or_create_page_zero(page_index)
     }
@@ -599,6 +606,10 @@ impl PageCacheManager {
             .upgrade()?
             .lock()
             .invalidate_range(start_index, end_index))
+    }
+
+    pub fn invalidate_all_clean(&self) -> Result<usize, SystemError> {
+        Ok(self.upgrade()?.lock().evict_clean_pages())
     }
 
     pub fn pages_count(&self) -> Result<usize, SystemError> {
@@ -1833,6 +1844,100 @@ impl PageCache {
 
     pub fn get_or_create_page_for_read(&self, page_index: usize) -> Result<Arc<Page>, SystemError> {
         Ok(self.get_or_create_entry(page_index, true)?.page.clone())
+    }
+
+    pub fn get_or_create_page_with<F>(
+        &self,
+        page_index: usize,
+        fill: F,
+    ) -> Result<Arc<Page>, SystemError>
+    where
+        F: FnOnce(usize, &mut [u8]) -> Result<usize, SystemError>,
+    {
+        let mut page_cache_ref = None;
+        let mut existing_entry = None;
+        {
+            let guard = self.inner.lock();
+            if let Some(entry) = guard.get_entry(page_index) {
+                existing_entry = Some(entry);
+            } else {
+                page_cache_ref = Some(guard.page_cache_ref.clone());
+            }
+        }
+
+        if let Some(entry) = existing_entry {
+            let state = entry.state();
+            if state.is_ready() {
+                return Ok(entry.page.clone());
+            }
+            if state == PageState::Error {
+                return Err(SystemError::EIO);
+            }
+            let page = entry.wait_ready()?;
+            return Ok(page);
+        }
+
+        let mut page = Some(self.allocate_page(
+            page_cache_ref.expect("page_cache_ref should exist"),
+            page_index,
+        )?);
+
+        let (entry, need_populate) = {
+            let mut guard = self.inner.lock();
+            if let Some(entry) = guard.get_entry(page_index) {
+                (entry, false)
+            } else {
+                let entry = Arc::new(PageEntry::new(
+                    page.take().expect("allocated page must exist"),
+                    PageState::Loading,
+                ));
+                guard.insert_entry(page_index, entry.clone());
+                (entry, true)
+            }
+        };
+
+        if !need_populate {
+            if let Some(page) = page.take() {
+                self.discard_unlinked_page(&page);
+            }
+            let state = entry.state();
+            if state.is_ready() {
+                return Ok(entry.page.clone());
+            }
+            if state == PageState::Error {
+                return Err(SystemError::EIO);
+            }
+            return entry.wait_ready();
+        }
+
+        let populate_result = {
+            let mut tmp = vec![0; MMArch::PAGE_SIZE];
+            match fill(page_index, &mut tmp) {
+                Ok(read_len) if read_len <= MMArch::PAGE_SIZE => {
+                    let mut page_guard = entry.page.write();
+                    let dst = unsafe { page_guard.as_slice_mut() };
+                    dst.copy_from_slice(&tmp);
+                    page_guard.add_flags(PageFlags::PG_UPTODATE);
+                    Ok(())
+                }
+                Ok(_) => Err(SystemError::EIO),
+                Err(e) => Err(e),
+            }
+        };
+
+        match populate_result {
+            Ok(()) => {
+                entry.set_state(PageState::UpToDate);
+                entry.wait_queue.wake_all();
+                Ok(entry.page.clone())
+            }
+            Err(e) => {
+                entry.set_state(PageState::Error);
+                entry.wait_queue.wake_all();
+                self.remove_failed_entry(page_index, &entry);
+                Err(e)
+            }
+        }
     }
 
     pub fn get_or_create_page_zero(&self, page_index: usize) -> Result<Arc<Page>, SystemError> {

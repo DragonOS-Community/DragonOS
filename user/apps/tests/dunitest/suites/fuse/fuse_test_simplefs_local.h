@@ -664,6 +664,7 @@ struct fuse_daemon_args {
     volatile uint64_t *last_fsync_fh;
     volatile uint64_t *last_release_fh;
     volatile uint64_t *read_offsets;
+    volatile uint64_t *read_fhs;
     volatile uint32_t *read_sizes;
     uint32_t read_trace_capacity;
     volatile uint32_t *interrupt_count;
@@ -672,6 +673,7 @@ struct fuse_daemon_args {
     uint32_t access_deny_mask;
     uint32_t init_out_flags_override;
     uint64_t hello_open_fh_override;
+    uint64_t next_open_fh;
     uint64_t create_reuse_nodeid;
     uint64_t create_generation_override;
     uint64_t link_generation_override;
@@ -890,7 +892,11 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         }
         struct fuse_open_out out;
         memset(&out, 0, sizeof(out));
-        out.fh = node->open_fh;
+        if (h->opcode == FUSE_OPEN && a->next_open_fh != 0) {
+            out.fh = a->next_open_fh++;
+        } else {
+            out.fh = node->open_fh;
+        }
         out.open_flags = node->open_out_flags;
         if (h->opcode == FUSE_OPEN && a->last_open_fh) {
             *a->last_open_fh = out.fh;
@@ -934,6 +940,9 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
             *a->last_read_size = in->size;
         }
         if (read_index < a->read_trace_capacity) {
+            if (a->read_fhs) {
+                a->read_fhs[read_index] = in->fh;
+            }
             if (a->read_offsets) {
                 a->read_offsets[read_index] = in->offset;
             }

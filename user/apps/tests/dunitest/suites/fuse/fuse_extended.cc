@@ -1,11 +1,30 @@
 #include <gtest/gtest.h>
 
 #include <signal.h>
+#include <setjmp.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 
 #include "fuse_gtest_common.h"
+
+static sigjmp_buf g_fuse_sigbus_jmp;
+static volatile sig_atomic_t g_fuse_sigbus_seen = 0;
+static sigjmp_buf g_fuse_sigsegv_jmp;
+static volatile sig_atomic_t g_fuse_sigsegv_seen = 0;
+
+static void fuse_sigbus_longjmp_handler(int sig) {
+    (void)sig;
+    g_fuse_sigbus_seen = 1;
+    siglongjmp(g_fuse_sigbus_jmp, 1);
+}
+
+static void fuse_sigsegv_longjmp_handler(int sig) {
+    (void)sig;
+    g_fuse_sigsegv_seen = 1;
+    siglongjmp(g_fuse_sigsegv_jmp, 1);
+}
 
 #ifndef FUSE_DEV_IOC_CLONE
 #define FUSE_DEV_IOC_CLONE 0x8004e500
@@ -1438,7 +1457,7 @@ static int ext_test_large_read_over_max_write() {
         }
     }
     if (read_count != 2 || read_offsets[0] != 0 || read_offsets[1] != 4096 ||
-        read_sizes[0] != 4096 || read_sizes[1] != data_size - 4096) {
+        read_sizes[0] != 4096 || read_sizes[1] > 4096 || read_sizes[1] == 0) {
         printf("[FAIL] unexpected FUSE_READ split: count=%u off0=%llu size0=%u off1=%llu size1=%u\n",
                read_count, (unsigned long long)read_offsets[0], read_sizes[0],
                (unsigned long long)read_offsets[1], read_sizes[1]);
@@ -1462,6 +1481,1039 @@ fail:
     stop = 1;
     close(fd);
     pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_cached_read_uses_open_fh_without_extra_open() {
+    const char *mp = "/tmp/test_fuse_cached_read_fh";
+    char path[256];
+    char buf[32];
+    int f = -1;
+    ssize_t n = -1;
+    ssize_t first_n = -1;
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t open_count = 0;
+    volatile uint32_t read_count = 0;
+    volatile uint64_t read_fhs[4] = {0};
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.open_count = &open_count;
+    args.read_count = &read_count;
+    args.read_fhs = read_fhs;
+    args.read_trace_capacity = 4;
+    args.next_open_fh = 100;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0,max_read=4096",
+             fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    f = open(path, O_RDONLY);
+    if (f < 0) {
+        printf("[FAIL] open(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+    n = pread(f, buf, sizeof(buf), 0);
+    if (n <= 0) {
+        printf("[FAIL] first pread got=%zd errno=%d\n", n, errno);
+        close(f);
+        goto fail;
+    }
+    first_n = n;
+    memset(buf, 0, sizeof(buf));
+    n = pread(f, buf, sizeof(buf), 0);
+    close(f);
+    f = -1;
+    if (n != first_n) {
+        printf("[FAIL] second pread got=%zd errno=%d\n", n, errno);
+        goto fail;
+    }
+    if (open_count != 1 || read_count != 1 || read_fhs[0] != 100) {
+        printf("[FAIL] cached read counters open=%u read=%u fh0=%llu\n", open_count,
+               read_count, (unsigned long long)read_fhs[0]);
+        goto fail;
+    }
+
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (f >= 0) {
+        close(f);
+    }
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_mmap_fault_uses_open_fh_without_extra_open() {
+    const char *mp = "/tmp/test_fuse_mmap_fh";
+    char path[256];
+    int f = -1;
+    void *addr = MAP_FAILED;
+    volatile char c = 0;
+    pid_t child = -1;
+    struct mmap_shared_state {
+        volatile int stop;
+        volatile int init_done;
+        volatile uint32_t open_count;
+        volatile uint32_t read_count;
+        volatile uint64_t read_fhs[4];
+    };
+    struct mmap_shared_state *shared =
+        (struct mmap_shared_state *)mmap(NULL, sizeof(*shared), PROT_READ | PROT_WRITE,
+                                         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shared == MAP_FAILED) {
+        printf("[FAIL] mmap(shared counters): %s (errno=%d)\n", strerror(errno), errno);
+        return -1;
+    }
+    memset(shared, 0, sizeof(*shared));
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        munmap(shared, sizeof(*shared));
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        munmap(shared, sizeof(*shared));
+        rmdir(mp);
+        return -1;
+    }
+
+    child = fork();
+    if (child < 0) {
+        printf("[FAIL] fork fuse daemon: %s (errno=%d)\n", strerror(errno), errno);
+        close(fd);
+        munmap(shared, sizeof(*shared));
+        rmdir(mp);
+        return -1;
+    }
+    if (child == 0) {
+        struct fuse_daemon_args child_args;
+        memset(&child_args, 0, sizeof(child_args));
+        child_args.fd = fd;
+        child_args.stop = &shared->stop;
+        child_args.init_done = &shared->init_done;
+        child_args.stop_on_destroy = 1;
+        child_args.open_count = &shared->open_count;
+        child_args.read_count = &shared->read_count;
+        child_args.read_fhs = shared->read_fhs;
+        child_args.read_trace_capacity = 4;
+        child_args.next_open_fh = 200;
+        fuse_daemon_thread(&child_args);
+        _exit(0);
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0,max_read=4096",
+             fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        shared->stop = 1;
+        close(fd);
+        kill(child, SIGTERM);
+        waitpid(child, NULL, 0);
+        munmap(shared, sizeof(*shared));
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&shared->init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    f = open(path, O_RDONLY);
+    if (f < 0) {
+        printf("[FAIL] open(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+    addr = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, f, 0);
+    if (addr == MAP_FAILED) {
+        printf("[FAIL] mmap(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        close(f);
+        goto fail;
+    }
+    c = ((volatile char *)addr)[0];
+    if (c != 'h') {
+        printf("[FAIL] mmap first byte got=%d\n", c);
+        munmap(addr, 4096);
+        close(f);
+        goto fail;
+    }
+    munmap(addr, 4096);
+    addr = MAP_FAILED;
+    close(f);
+    f = -1;
+
+    if (shared->open_count != 1 || shared->read_count != 1 || shared->read_fhs[0] != 200) {
+        printf("[FAIL] mmap counters open=%u read=%u fh0=%llu\n", shared->open_count,
+               shared->read_count, (unsigned long long)shared->read_fhs[0]);
+        goto fail;
+    }
+
+    umount(mp);
+    shared->stop = 1;
+    close(fd);
+    waitpid(child, NULL, 0);
+    munmap(shared, sizeof(*shared));
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (addr != MAP_FAILED) {
+        munmap(addr, 4096);
+    }
+    if (f >= 0) {
+        close(f);
+    }
+    umount(mp);
+    shared->stop = 1;
+    close(fd);
+    if (child > 0) {
+        kill(child, SIGTERM);
+        waitpid(child, NULL, 0);
+    }
+    munmap(shared, sizeof(*shared));
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_shared_writable_mmap_fault_sigbus() {
+    const char *mp = "/tmp/test_fuse_mmap_shared_write";
+    char path[256];
+    int f = -1;
+    void *addr = MAP_FAILED;
+    pid_t daemon = -1;
+    struct sigaction old_bus;
+    bool bus_handler_installed = false;
+    struct mmap_shared_state {
+        volatile int stop;
+        volatile int init_done;
+        volatile uint32_t open_count;
+        volatile uint32_t read_count;
+    };
+    struct mmap_shared_state *shared =
+        (struct mmap_shared_state *)mmap(NULL, sizeof(*shared), PROT_READ | PROT_WRITE,
+                                         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shared == MAP_FAILED) {
+        printf("[FAIL] mmap(shared counters): %s (errno=%d)\n", strerror(errno), errno);
+        return -1;
+    }
+    memset(shared, 0, sizeof(*shared));
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        munmap(shared, sizeof(*shared));
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        munmap(shared, sizeof(*shared));
+        rmdir(mp);
+        return -1;
+    }
+
+    daemon = fork();
+    if (daemon < 0) {
+        printf("[FAIL] fork fuse daemon: %s (errno=%d)\n", strerror(errno), errno);
+        close(fd);
+        munmap(shared, sizeof(*shared));
+        rmdir(mp);
+        return -1;
+    }
+    if (daemon == 0) {
+        struct fuse_daemon_args child_args;
+        memset(&child_args, 0, sizeof(child_args));
+        child_args.fd = fd;
+        child_args.stop = &shared->stop;
+        child_args.init_done = &shared->init_done;
+        child_args.stop_on_destroy = 1;
+        child_args.open_count = &shared->open_count;
+        child_args.read_count = &shared->read_count;
+        fuse_daemon_thread(&child_args);
+        _exit(0);
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0,max_read=4096",
+             fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        shared->stop = 1;
+        close(fd);
+        kill(daemon, SIGTERM);
+        waitpid(daemon, NULL, 0);
+        munmap(shared, sizeof(*shared));
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&shared->init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    f = open(path, O_RDWR);
+    if (f < 0) {
+        printf("[FAIL] open(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+    addr = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, f, 0);
+    if (addr == MAP_FAILED) {
+        printf("[FAIL] mmap(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        close(f);
+        goto fail;
+    }
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = fuse_sigbus_longjmp_handler;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGBUS, &sa, &old_bus) != 0) {
+        printf("[FAIL] sigaction(SIGBUS): %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    bus_handler_installed = true;
+    g_fuse_sigbus_seen = 0;
+    if (sigsetjmp(g_fuse_sigbus_jmp, 1) == 0) {
+        volatile char c = ((volatile char *)addr)[0];
+        (void)c;
+    }
+    sigaction(SIGBUS, &old_bus, NULL);
+    bus_handler_installed = false;
+    if (!g_fuse_sigbus_seen) {
+        printf("[FAIL] shared writable mmap access did not SIGBUS open=%u read=%u\n",
+               shared->open_count, shared->read_count);
+        goto fail;
+    }
+    if (shared->open_count != 1 || shared->read_count != 0) {
+        printf("[FAIL] shared writable mmap counters open=%u read=%u\n", shared->open_count,
+               shared->read_count);
+        goto fail;
+    }
+
+    munmap(addr, 4096);
+    addr = MAP_FAILED;
+    close(f);
+    f = -1;
+    umount(mp);
+    shared->stop = 1;
+    close(fd);
+    waitpid(daemon, NULL, 0);
+    munmap(shared, sizeof(*shared));
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (bus_handler_installed) {
+        sigaction(SIGBUS, &old_bus, NULL);
+    }
+    if (addr != MAP_FAILED) {
+        munmap(addr, 4096);
+    }
+    if (f >= 0) {
+        close(f);
+    }
+    umount(mp);
+    shared->stop = 1;
+    close(fd);
+    if (daemon > 0) {
+        kill(daemon, SIGTERM);
+        waitpid(daemon, NULL, 0);
+    }
+    munmap(shared, sizeof(*shared));
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_shared_mmap_mprotect_write_denied() {
+    const char *mp = "/tmp/test_fuse_mmap_mprotect_write";
+    char path[256];
+    int f = -1;
+    void *addr = MAP_FAILED;
+    volatile char c = 0;
+    pid_t daemon = -1;
+    struct mmap_shared_state {
+        volatile int stop;
+        volatile int init_done;
+        volatile uint32_t open_count;
+        volatile uint32_t read_count;
+    };
+    struct mmap_shared_state *shared =
+        (struct mmap_shared_state *)mmap(NULL, sizeof(*shared), PROT_READ | PROT_WRITE,
+                                         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shared == MAP_FAILED) {
+        printf("[FAIL] mmap(shared counters): %s (errno=%d)\n", strerror(errno), errno);
+        return -1;
+    }
+    memset(shared, 0, sizeof(*shared));
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        munmap(shared, sizeof(*shared));
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        munmap(shared, sizeof(*shared));
+        rmdir(mp);
+        return -1;
+    }
+
+    daemon = fork();
+    if (daemon < 0) {
+        printf("[FAIL] fork fuse daemon: %s (errno=%d)\n", strerror(errno), errno);
+        close(fd);
+        munmap(shared, sizeof(*shared));
+        rmdir(mp);
+        return -1;
+    }
+    if (daemon == 0) {
+        struct fuse_daemon_args child_args;
+        memset(&child_args, 0, sizeof(child_args));
+        child_args.fd = fd;
+        child_args.stop = &shared->stop;
+        child_args.init_done = &shared->init_done;
+        child_args.stop_on_destroy = 1;
+        child_args.open_count = &shared->open_count;
+        child_args.read_count = &shared->read_count;
+        fuse_daemon_thread(&child_args);
+        _exit(0);
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0,max_read=4096",
+             fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        shared->stop = 1;
+        close(fd);
+        kill(daemon, SIGTERM);
+        waitpid(daemon, NULL, 0);
+        munmap(shared, sizeof(*shared));
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&shared->init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    f = open(path, O_RDWR);
+    if (f < 0) {
+        printf("[FAIL] open(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+    addr = mmap(NULL, 4096, PROT_READ, MAP_SHARED, f, 0);
+    if (addr == MAP_FAILED) {
+        printf("[FAIL] mmap(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        close(f);
+        goto fail;
+    }
+
+    c = ((volatile char *)addr)[0];
+    if (c != 'h') {
+        printf("[FAIL] mmap first byte got=%d\n", c);
+        goto fail;
+    }
+    if (shared->open_count != 1 || shared->read_count != 1) {
+        printf("[FAIL] before mprotect counters open=%u read=%u\n", shared->open_count,
+               shared->read_count);
+        goto fail;
+    }
+    errno = 0;
+    if (mprotect(addr, 4096, PROT_READ | PROT_WRITE) == 0) {
+        printf("[FAIL] mprotect unexpectedly allowed shared writable FUSE mapping\n");
+        goto fail;
+    }
+    if (shared->open_count != 1 || shared->read_count != 1) {
+        printf("[FAIL] after mprotect counters open=%u read=%u\n", shared->open_count,
+               shared->read_count);
+        goto fail;
+    }
+
+    munmap(addr, 4096);
+    addr = MAP_FAILED;
+    close(f);
+    f = -1;
+    umount(mp);
+    shared->stop = 1;
+    close(fd);
+    waitpid(daemon, NULL, 0);
+    munmap(shared, sizeof(*shared));
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (addr != MAP_FAILED) {
+        munmap(addr, 4096);
+    }
+    if (f >= 0) {
+        close(f);
+    }
+    umount(mp);
+    shared->stop = 1;
+    close(fd);
+    if (daemon > 0) {
+        kill(daemon, SIGTERM);
+        waitpid(daemon, NULL, 0);
+    }
+    munmap(shared, sizeof(*shared));
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_shared_mmap_subrange_mprotect_failure_preserves_vma() {
+    const char *mp = "/tmp/test_fuse_mmap_mprotect_subrange";
+    const size_t page_size = 4096;
+    const size_t map_len = page_size * 2;
+    char path[256];
+    int f = -1;
+    void *addr = MAP_FAILED;
+    volatile char c = 0;
+    pid_t daemon = -1;
+    struct sigaction old_segv;
+    bool segv_handler_installed = false;
+    struct mmap_shared_state {
+        volatile int stop;
+        volatile int init_done;
+        volatile uint32_t open_count;
+        volatile uint32_t read_count;
+    };
+    struct mmap_shared_state *shared =
+        (struct mmap_shared_state *)mmap(NULL, sizeof(*shared), PROT_READ | PROT_WRITE,
+                                         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shared == MAP_FAILED) {
+        printf("[FAIL] mmap(shared counters): %s (errno=%d)\n", strerror(errno), errno);
+        return -1;
+    }
+    memset(shared, 0, sizeof(*shared));
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        munmap(shared, sizeof(*shared));
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        munmap(shared, sizeof(*shared));
+        rmdir(mp);
+        return -1;
+    }
+
+    daemon = fork();
+    if (daemon < 0) {
+        printf("[FAIL] fork fuse daemon: %s (errno=%d)\n", strerror(errno), errno);
+        close(fd);
+        munmap(shared, sizeof(*shared));
+        rmdir(mp);
+        return -1;
+    }
+    if (daemon == 0) {
+        struct fuse_daemon_args child_args;
+        memset(&child_args, 0, sizeof(child_args));
+        child_args.fd = fd;
+        child_args.stop = &shared->stop;
+        child_args.init_done = &shared->init_done;
+        child_args.stop_on_destroy = 1;
+        child_args.open_count = &shared->open_count;
+        child_args.read_count = &shared->read_count;
+        child_args.hello_data_size_override = map_len;
+        fuse_daemon_thread(&child_args);
+        _exit(0);
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0,max_read=4096",
+             fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        shared->stop = 1;
+        close(fd);
+        kill(daemon, SIGTERM);
+        waitpid(daemon, NULL, 0);
+        munmap(shared, sizeof(*shared));
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&shared->init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    f = open(path, O_RDWR);
+    if (f < 0) {
+        printf("[FAIL] open(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+    addr = mmap(NULL, map_len, PROT_READ, MAP_SHARED, f, 0);
+    if (addr == MAP_FAILED) {
+        printf("[FAIL] mmap(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        close(f);
+        goto fail;
+    }
+
+    c = ((volatile char *)addr)[0];
+    if (c != 'A') {
+        printf("[FAIL] first page byte got=%d\n", c);
+        goto fail;
+    }
+    c = ((volatile char *)addr)[page_size];
+    if (c != 'O') {
+        printf("[FAIL] second page byte got=%d\n", c);
+        goto fail;
+    }
+    if (shared->open_count != 1 || shared->read_count != 2) {
+        printf("[FAIL] before subrange mprotect counters open=%u read=%u\n",
+               shared->open_count, shared->read_count);
+        goto fail;
+    }
+    if (mprotect((char *)addr + page_size, page_size, PROT_READ | PROT_WRITE) == 0) {
+        printf("[FAIL] subrange mprotect unexpectedly allowed shared writable FUSE mapping\n");
+        goto fail;
+    }
+    if (mprotect(addr, page_size, PROT_NONE) != 0) {
+        printf("[FAIL] mprotect(PROT_NONE first page): %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = fuse_sigsegv_longjmp_handler;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGSEGV, &sa, &old_segv) != 0) {
+        printf("[FAIL] sigaction(SIGSEGV): %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    segv_handler_installed = true;
+    g_fuse_sigsegv_seen = 0;
+    if (sigsetjmp(g_fuse_sigsegv_jmp, 1) == 0) {
+        c = ((volatile char *)addr)[0];
+        (void)c;
+    }
+    sigaction(SIGSEGV, &old_segv, NULL);
+    segv_handler_installed = false;
+    if (!g_fuse_sigsegv_seen) {
+        printf("[FAIL] first page remained readable after PROT_NONE\n");
+        goto fail;
+    }
+
+    munmap(addr, map_len);
+    addr = MAP_FAILED;
+    close(f);
+    f = -1;
+    umount(mp);
+    shared->stop = 1;
+    close(fd);
+    waitpid(daemon, NULL, 0);
+    munmap(shared, sizeof(*shared));
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (segv_handler_installed) {
+        sigaction(SIGSEGV, &old_segv, NULL);
+    }
+    if (addr != MAP_FAILED) {
+        munmap(addr, map_len);
+    }
+    if (f >= 0) {
+        close(f);
+    }
+    umount(mp);
+    shared->stop = 1;
+    close(fd);
+    if (daemon > 0) {
+        kill(daemon, SIGTERM);
+        waitpid(daemon, NULL, 0);
+    }
+    munmap(shared, sizeof(*shared));
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_shared_mmap_unfaulted_mprotect_prot_none() {
+    const char *mp = "/tmp/test_fuse_mmap_unfaulted_mprotect";
+    const size_t page_size = 4096;
+    char path[256];
+    int f = -1;
+    void *addr = MAP_FAILED;
+    volatile char c = 0;
+    pid_t daemon = -1;
+    struct sigaction old_segv;
+    bool segv_handler_installed = false;
+    struct mmap_shared_state {
+        volatile int stop;
+        volatile int init_done;
+        volatile uint32_t open_count;
+        volatile uint32_t read_count;
+    };
+    struct mmap_shared_state *shared =
+        (struct mmap_shared_state *)mmap(NULL, sizeof(*shared), PROT_READ | PROT_WRITE,
+                                         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shared == MAP_FAILED) {
+        printf("[FAIL] mmap(shared counters): %s (errno=%d)\n", strerror(errno), errno);
+        return -1;
+    }
+    memset(shared, 0, sizeof(*shared));
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        munmap(shared, sizeof(*shared));
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        munmap(shared, sizeof(*shared));
+        rmdir(mp);
+        return -1;
+    }
+
+    daemon = fork();
+    if (daemon < 0) {
+        printf("[FAIL] fork fuse daemon: %s (errno=%d)\n", strerror(errno), errno);
+        close(fd);
+        munmap(shared, sizeof(*shared));
+        rmdir(mp);
+        return -1;
+    }
+    if (daemon == 0) {
+        struct fuse_daemon_args child_args;
+        memset(&child_args, 0, sizeof(child_args));
+        child_args.fd = fd;
+        child_args.stop = &shared->stop;
+        child_args.init_done = &shared->init_done;
+        child_args.stop_on_destroy = 1;
+        child_args.open_count = &shared->open_count;
+        child_args.read_count = &shared->read_count;
+        child_args.hello_data_size_override = page_size;
+        fuse_daemon_thread(&child_args);
+        _exit(0);
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0,max_read=4096",
+             fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        shared->stop = 1;
+        close(fd);
+        kill(daemon, SIGTERM);
+        waitpid(daemon, NULL, 0);
+        munmap(shared, sizeof(*shared));
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&shared->init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    f = open(path, O_RDWR);
+    if (f < 0) {
+        printf("[FAIL] open(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+    addr = mmap(NULL, page_size, PROT_READ, MAP_SHARED, f, 0);
+    if (addr == MAP_FAILED) {
+        printf("[FAIL] mmap(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        close(f);
+        goto fail;
+    }
+    if (shared->open_count != 1 || shared->read_count != 0) {
+        printf("[FAIL] before unfaulted mprotect counters open=%u read=%u\n",
+               shared->open_count, shared->read_count);
+        goto fail;
+    }
+    if (mprotect(addr, page_size, PROT_NONE) != 0) {
+        printf("[FAIL] mprotect(PROT_NONE unfaulted): %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = fuse_sigsegv_longjmp_handler;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGSEGV, &sa, &old_segv) != 0) {
+        printf("[FAIL] sigaction(SIGSEGV): %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    segv_handler_installed = true;
+    g_fuse_sigsegv_seen = 0;
+    if (sigsetjmp(g_fuse_sigsegv_jmp, 1) == 0) {
+        c = ((volatile char *)addr)[0];
+        (void)c;
+    }
+    sigaction(SIGSEGV, &old_segv, NULL);
+    segv_handler_installed = false;
+    if (!g_fuse_sigsegv_seen) {
+        printf("[FAIL] unfaulted PROT_NONE mapping remained readable\n");
+        goto fail;
+    }
+    if (shared->read_count != 0) {
+        printf("[FAIL] unfaulted PROT_NONE triggered read_count=%u\n", shared->read_count);
+        goto fail;
+    }
+
+    munmap(addr, page_size);
+    addr = MAP_FAILED;
+    close(f);
+    f = -1;
+    umount(mp);
+    shared->stop = 1;
+    close(fd);
+    waitpid(daemon, NULL, 0);
+    munmap(shared, sizeof(*shared));
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (segv_handler_installed) {
+        sigaction(SIGSEGV, &old_segv, NULL);
+    }
+    if (addr != MAP_FAILED) {
+        munmap(addr, page_size);
+    }
+    if (f >= 0) {
+        close(f);
+    }
+    umount(mp);
+    shared->stop = 1;
+    close(fd);
+    if (daemon > 0) {
+        kill(daemon, SIGTERM);
+        waitpid(daemon, NULL, 0);
+    }
+    munmap(shared, sizeof(*shared));
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_mmap_truncate_unmaps_stale_page() {
+    const char *mp = "/tmp/test_fuse_mmap_truncate";
+    const size_t page_size = 4096;
+    const size_t map_len = page_size * 2;
+    char path[256];
+    int f = -1;
+    void *addr = MAP_FAILED;
+    volatile char c = 0;
+    pid_t daemon = -1;
+    struct sigaction old_bus;
+    bool bus_handler_installed = false;
+    struct mmap_shared_state {
+        volatile int stop;
+        volatile int init_done;
+        volatile uint32_t open_count;
+        volatile uint32_t read_count;
+    };
+    struct mmap_shared_state *shared =
+        (struct mmap_shared_state *)mmap(NULL, sizeof(*shared), PROT_READ | PROT_WRITE,
+                                         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shared == MAP_FAILED) {
+        printf("[FAIL] mmap(shared counters): %s (errno=%d)\n", strerror(errno), errno);
+        return -1;
+    }
+    memset(shared, 0, sizeof(*shared));
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        munmap(shared, sizeof(*shared));
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        munmap(shared, sizeof(*shared));
+        rmdir(mp);
+        return -1;
+    }
+
+    daemon = fork();
+    if (daemon < 0) {
+        printf("[FAIL] fork fuse daemon: %s (errno=%d)\n", strerror(errno), errno);
+        close(fd);
+        munmap(shared, sizeof(*shared));
+        rmdir(mp);
+        return -1;
+    }
+    if (daemon == 0) {
+        struct fuse_daemon_args child_args;
+        memset(&child_args, 0, sizeof(child_args));
+        child_args.fd = fd;
+        child_args.stop = &shared->stop;
+        child_args.init_done = &shared->init_done;
+        child_args.stop_on_destroy = 1;
+        child_args.enable_write_ops = 1;
+        child_args.open_count = &shared->open_count;
+        child_args.read_count = &shared->read_count;
+        child_args.hello_data_size_override = map_len;
+        fuse_daemon_thread(&child_args);
+        _exit(0);
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0,max_read=4096",
+             fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        shared->stop = 1;
+        close(fd);
+        kill(daemon, SIGTERM);
+        waitpid(daemon, NULL, 0);
+        munmap(shared, sizeof(*shared));
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&shared->init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    f = open(path, O_RDWR);
+    if (f < 0) {
+        printf("[FAIL] open(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+    addr = mmap(NULL, map_len, PROT_READ, MAP_PRIVATE, f, 0);
+    if (addr == MAP_FAILED) {
+        printf("[FAIL] mmap(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        close(f);
+        goto fail;
+    }
+
+    c = ((volatile char *)addr)[page_size];
+    if (c != 'O') {
+        printf("[FAIL] second page byte before truncate got=%d\n", c);
+        goto fail;
+    }
+    if (shared->open_count != 1 || shared->read_count != 1) {
+        printf("[FAIL] before truncate counters open=%u read=%u\n", shared->open_count,
+               shared->read_count);
+        goto fail;
+    }
+    if (ftruncate(f, page_size) != 0) {
+        printf("[FAIL] ftruncate: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = fuse_sigbus_longjmp_handler;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGBUS, &sa, &old_bus) != 0) {
+        printf("[FAIL] sigaction(SIGBUS): %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    bus_handler_installed = true;
+    g_fuse_sigbus_seen = 0;
+    if (sigsetjmp(g_fuse_sigbus_jmp, 1) == 0) {
+        c = ((volatile char *)addr)[page_size];
+        (void)c;
+    }
+    sigaction(SIGBUS, &old_bus, NULL);
+    bus_handler_installed = false;
+    if (!g_fuse_sigbus_seen) {
+        printf("[FAIL] truncated second page remained readable read=%u\n", shared->read_count);
+        goto fail;
+    }
+    if (shared->read_count != 1) {
+        printf("[FAIL] truncated EOF fault issued extra FUSE_READ count=%u\n", shared->read_count);
+        goto fail;
+    }
+
+    munmap(addr, map_len);
+    addr = MAP_FAILED;
+    close(f);
+    f = -1;
+    umount(mp);
+    shared->stop = 1;
+    close(fd);
+    waitpid(daemon, NULL, 0);
+    munmap(shared, sizeof(*shared));
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (bus_handler_installed) {
+        sigaction(SIGBUS, &old_bus, NULL);
+    }
+    if (addr != MAP_FAILED) {
+        munmap(addr, map_len);
+    }
+    if (f >= 0) {
+        close(f);
+    }
+    umount(mp);
+    shared->stop = 1;
+    close(fd);
+    if (daemon > 0) {
+        kill(daemon, SIGTERM);
+        waitpid(daemon, NULL, 0);
+    }
+    munmap(shared, sizeof(*shared));
     rmdir(mp);
     return -1;
 }
@@ -2278,6 +3330,34 @@ TEST(FuseExtended, OpenReturnsZeroFhIsValid) {
 
 TEST(FuseExtended, LargeReadSplitsOverMaxWrite) {
     ASSERT_EQ(0, ext_test_large_read_over_max_write());
+}
+
+TEST(FuseExtended, CachedReadUsesOpenFhWithoutExtraOpen) {
+    ASSERT_EQ(0, ext_test_cached_read_uses_open_fh_without_extra_open());
+}
+
+TEST(FuseExtended, MmapFaultUsesOpenFhWithoutExtraOpen) {
+    ASSERT_EQ(0, ext_test_mmap_fault_uses_open_fh_without_extra_open());
+}
+
+TEST(FuseExtended, SharedWritableMmapFaultSigbus) {
+    ASSERT_EQ(0, ext_test_shared_writable_mmap_fault_sigbus());
+}
+
+TEST(FuseExtended, SharedMmapMprotectWriteDenied) {
+    ASSERT_EQ(0, ext_test_shared_mmap_mprotect_write_denied());
+}
+
+TEST(FuseExtended, SharedMmapSubrangeMprotectFailurePreservesVma) {
+    ASSERT_EQ(0, ext_test_shared_mmap_subrange_mprotect_failure_preserves_vma());
+}
+
+TEST(FuseExtended, SharedMmapUnfaultedMprotectProtNone) {
+    ASSERT_EQ(0, ext_test_shared_mmap_unfaulted_mprotect_prot_none());
+}
+
+TEST(FuseExtended, MmapTruncateUnmapsStalePage) {
+    ASSERT_EQ(0, ext_test_mmap_truncate_unmaps_stale_page());
 }
 
 TEST(FuseExtended, FadviseWithoutPageCacheSucceeds) {

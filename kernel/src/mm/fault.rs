@@ -113,6 +113,16 @@ impl<'a> PageFaultMessage<'a> {
         self.flags
     }
 
+    #[inline(always)]
+    pub fn backing_pgoff(&self) -> Option<usize> {
+        self.backing_pgoff
+    }
+
+    #[inline(always)]
+    pub fn set_page(&mut self, page: Arc<Page>) {
+        self.page = Some(page);
+    }
+
     /// 缺页所属的地址空间。
     #[inline(always)]
     pub fn mm(&self) -> &Arc<AddressSpace> {
@@ -384,7 +394,8 @@ impl PageFaultHandler {
         let _invalidate = page_cache
             .as_ref()
             .map(|page_cache| page_cache.invalidate_read());
-        let mut ret = Self::filemap_fault(pfm);
+        let fs = pfm.vma().lock().vm_file().unwrap().inode().fs();
+        let mut ret = fs.fault(pfm);
 
         if unlikely(ret.intersects(
             VmFaultReason::VM_FAULT_ERROR
@@ -392,6 +403,9 @@ impl PageFaultHandler {
                 | VmFaultReason::VM_FAULT_RETRY
                 | VmFaultReason::VM_FAULT_DONE_COW,
         )) {
+            return ret;
+        }
+        if ret.contains(VmFaultReason::VM_FAULT_COMPLETED) {
             return ret;
         }
 
@@ -461,9 +475,13 @@ impl PageFaultHandler {
         let _invalidate = page_cache
             .as_ref()
             .map(|page_cache| page_cache.invalidate_read());
-        let mut ret = Self::filemap_fault(pfm);
+        let fs = pfm.vma().lock().vm_file().unwrap().inode().fs();
+        let mut ret = fs.fault(pfm);
 
         if ret.intersects(VmFaultReason::VM_FAULT_ERROR) {
+            return ret;
+        }
+        if ret.contains(VmFaultReason::VM_FAULT_COMPLETED) {
             return ret;
         }
 

@@ -10,6 +10,7 @@ use system_error::SystemError;
 
 use crate::time::timekeep::ktime_get_real_ns;
 use crate::{
+    arch::MMArch,
     driver::base::device::device_number::DeviceNumber,
     filesystem::{
         page_cache::PageCache,
@@ -23,6 +24,7 @@ use crate::{
         casting::DowncastArc,
         mutex::{Mutex, MutexGuard},
     },
+    mm::{page::PageFlags, MemoryManagementArch},
     time::PosixTimeSpec,
 };
 
@@ -35,12 +37,12 @@ use super::{
         FuseDirent, FuseDirentPlus, FuseEntryOut, FuseFlushIn, FuseFsyncIn, FuseGetattrIn,
         FuseLinkIn, FuseMkdirIn, FuseMknodIn, FuseOpenIn, FuseOpenOut, FuseReadIn, FuseReleaseIn,
         FuseRename2In, FuseRenameIn, FuseSetattrIn, FuseWriteIn, FuseWriteOut, FATTR_ATIME,
-        FATTR_CTIME, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_SIZE, FATTR_UID, FUSE_ACCESS,
-        FUSE_CREATE, FUSE_FLUSH, FUSE_FSYNC, FUSE_FSYNCDIR, FUSE_FSYNC_FDATASYNC, FUSE_GETATTR,
-        FUSE_LINK, FUSE_LOOKUP, FUSE_MKDIR, FUSE_MKNOD, FUSE_OPEN, FUSE_OPENDIR, FUSE_READ,
-        FUSE_READDIR, FUSE_READDIRPLUS, FUSE_READLINK, FUSE_RELEASE, FUSE_RELEASEDIR, FUSE_RENAME,
-        FUSE_RENAME2, FUSE_RMDIR, FUSE_ROOT_ID, FUSE_SETATTR, FUSE_SYMLINK, FUSE_UNLINK,
-        FUSE_WRITE,
+        FATTR_CTIME, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_SIZE, FATTR_UID, FOPEN_DIRECT_IO,
+        FOPEN_KEEP_CACHE, FUSE_ACCESS, FUSE_CREATE, FUSE_FLUSH, FUSE_FSYNC, FUSE_FSYNCDIR,
+        FUSE_FSYNC_FDATASYNC, FUSE_GETATTR, FUSE_LINK, FUSE_LOOKUP, FUSE_MKDIR, FUSE_MKNOD,
+        FUSE_OPEN, FUSE_OPENDIR, FUSE_READ, FUSE_READDIR, FUSE_READDIRPLUS, FUSE_READLINK,
+        FUSE_RELEASE, FUSE_RELEASEDIR, FUSE_RENAME, FUSE_RENAME2, FUSE_RMDIR, FUSE_ROOT_ID,
+        FUSE_SETATTR, FUSE_SYMLINK, FUSE_UNLINK, FUSE_WRITE,
     },
 };
 
@@ -53,6 +55,7 @@ pub struct FuseNode {
     parent_nodeid: Mutex<u64>,
     name: Mutex<Option<String>>,
     cached_metadata: Mutex<Option<Metadata>>,
+    page_cache: Mutex<Option<Arc<PageCache>>>,
     cached_metadata_deadline_ns: AtomicU64,
     lookup_count: AtomicU64,
     /// 最近一次 LOOKUP 回复中的 fuse_attr.flags（用于 announce-submounts）。
@@ -81,6 +84,7 @@ impl FuseNode {
             parent_nodeid: Mutex::new(parent_nodeid),
             name: Mutex::new(None),
             cached_metadata: Mutex::new(cached),
+            page_cache: Mutex::new(None),
             cached_metadata_deadline_ns: AtomicU64::new(if has_cached { u64::MAX } else { 0 }),
             lookup_count: AtomicU64::new(0),
             lookup_attr_flags: AtomicU32::new(0),
@@ -188,6 +192,28 @@ impl FuseNode {
         &self.conn
     }
 
+    fn ensure_page_cache(&self) -> Result<Arc<PageCache>, SystemError> {
+        let mut guard = self.page_cache.lock();
+        if let Some(cache) = guard.as_ref() {
+            return Ok(cache.clone());
+        }
+        let node = self.self_ref.upgrade().ok_or(SystemError::EIO)?;
+        let inode: Arc<dyn IndexNode> = node;
+        let cache = PageCache::new(Some(Arc::downgrade(&inode)), None);
+        *guard = Some(cache.clone());
+        Ok(cache)
+    }
+
+    fn cached_page_cache(&self) -> Option<Arc<PageCache>> {
+        self.page_cache.lock().clone()
+    }
+
+    fn invalidate_clean_page_cache(&self) {
+        if let Some(cache) = self.cached_page_cache() {
+            let _ = cache.manager().invalidate_all_clean();
+        }
+    }
+
     pub(crate) fn fuse_fs(&self) -> Option<Arc<FuseFS>> {
         self.fs.upgrade()
     }
@@ -247,12 +273,22 @@ impl FuseNode {
         }
     }
 
+    fn fuse_file_snapshot(data: &FilePrivateData) -> Result<(u64, u32, u32), SystemError> {
+        match data {
+            FilePrivateData::Fuse(FuseFilePrivateData::File(p)) => {
+                Ok((p.fh, p.open_flags, p.fopen_flags))
+            }
+            _ => Err(SystemError::EBADF),
+        }
+    }
+
     fn set_open_private_data(
         &self,
         data: &mut FilePrivateData,
         opcode: u32,
         fh: u64,
         open_flags: u32,
+        fopen_flags: u32,
         no_open: bool,
     ) -> Result<(), SystemError> {
         let conn_any: Arc<dyn core::any::Any + Send + Sync> = self.conn.clone();
@@ -263,6 +299,7 @@ impl FuseNode {
                 node: node.clone(),
                 fh,
                 open_flags,
+                fopen_flags,
                 no_open,
             })),
             FUSE_OPENDIR => FilePrivateData::Fuse(FuseFilePrivateData::Dir(FuseOpenPrivateData {
@@ -270,6 +307,7 @@ impl FuseNode {
                 node,
                 fh,
                 open_flags,
+                fopen_flags,
                 no_open,
             })),
             _ => return Err(SystemError::EINVAL),
@@ -446,7 +484,7 @@ impl FuseNode {
         self.check_not_stale()?;
         let file_flags = flags.bits();
         if self.conn.should_skip_open(opcode) {
-            return self.set_open_private_data(data, opcode, 0, file_flags, true);
+            return self.set_open_private_data(data, opcode, 0, file_flags, FOPEN_KEEP_CACHE, true);
         }
 
         let fuse_open_flags = self.fuse_open_in_flags(file_flags);
@@ -461,12 +499,22 @@ impl FuseNode {
             Ok(v) => v,
             Err(SystemError::ENOSYS) if self.conn.open_enosys_is_supported(opcode) => {
                 self.conn.mark_no_open(opcode);
-                return self.set_open_private_data(data, opcode, 0, file_flags, true);
+                return self.set_open_private_data(
+                    data,
+                    opcode,
+                    0,
+                    file_flags,
+                    FOPEN_KEEP_CACHE,
+                    true,
+                );
             }
             Err(e) => return Err(e),
         };
         let out: FuseOpenOut = fuse_read_struct(&payload)?;
-        self.set_open_private_data(data, opcode, out.fh, file_flags, false)
+        if opcode == FUSE_OPEN && (out.open_flags & FOPEN_KEEP_CACHE) == 0 {
+            self.invalidate_clean_page_cache();
+        }
+        self.set_open_private_data(data, opcode, out.fh, file_flags, out.open_flags, false)
     }
 
     fn release_common(&self, opcode: u32, fh: u64, file_flags: u32) -> Result<(), SystemError> {
@@ -583,6 +631,202 @@ impl FuseNode {
         );
         Ok(child)
     }
+
+    fn read_direct_with_open(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        fh: u64,
+        file_flags: u32,
+    ) -> Result<usize, SystemError> {
+        let max_read = self.conn().max_read();
+        if max_read == 0 {
+            return Err(SystemError::EIO);
+        }
+
+        let mut total_read = 0usize;
+        while total_read < len {
+            let chunk = core::cmp::min(max_read, len - total_read);
+            let Some(chunk_offset) = offset.checked_add(total_read) else {
+                return if total_read > 0 {
+                    Ok(total_read)
+                } else {
+                    Err(SystemError::EOVERFLOW)
+                };
+            };
+            if chunk_offset > i64::MAX as usize {
+                return if total_read > 0 {
+                    Ok(total_read)
+                } else {
+                    Err(SystemError::EINVAL)
+                };
+            }
+            let read_in = FuseReadIn {
+                fh,
+                offset: chunk_offset as u64,
+                size: chunk as u32,
+                read_flags: 0,
+                lock_owner: 0,
+                flags: file_flags,
+                padding: 0,
+            };
+            let payload =
+                match self
+                    .conn()
+                    .request(FUSE_READ, self.nodeid, fuse_pack_struct(&read_in))
+                {
+                    Ok(payload) => payload,
+                    Err(_) if total_read > 0 => return Ok(total_read),
+                    Err(err) => return Err(err),
+                };
+            if payload.len() > chunk {
+                return if total_read > 0 {
+                    Ok(total_read)
+                } else {
+                    Err(SystemError::EIO)
+                };
+            }
+            let n = payload.len();
+            buf[total_read..total_read + n].copy_from_slice(&payload);
+            total_read += n;
+            if n < chunk {
+                break;
+            }
+        }
+
+        Ok(total_read)
+    }
+
+    fn read_page_with_open(
+        &self,
+        page_index: usize,
+        page_buf: &mut [u8],
+        fh: u64,
+        file_flags: u32,
+    ) -> Result<usize, SystemError> {
+        page_buf.fill(0);
+        self.read_direct_with_open(
+            page_index
+                .checked_mul(MMArch::PAGE_SIZE)
+                .ok_or(SystemError::EOVERFLOW)?,
+            MMArch::PAGE_SIZE,
+            page_buf,
+            fh,
+            file_flags,
+        )
+    }
+
+    fn read_cached_with_open(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        fh: u64,
+        file_flags: u32,
+    ) -> Result<usize, SystemError> {
+        let md = self.cached_or_fetch_metadata()?;
+        let file_size = md.size.max(0) as usize;
+        if offset >= file_size || len == 0 {
+            return Ok(0);
+        }
+
+        let read_len = core::cmp::min(len, file_size - offset);
+        let start_page_index = offset >> MMArch::PAGE_SHIFT;
+        let end_page_index = (offset + read_len - 1) >> MMArch::PAGE_SHIFT;
+        let page_cache = self.ensure_page_cache()?;
+
+        let mut dst_offset = 0usize;
+        for page_index in start_page_index..=end_page_index {
+            let page_start = page_index << MMArch::PAGE_SHIFT;
+            let page_end = page_start + MMArch::PAGE_SIZE;
+            let copy_start = core::cmp::max(offset, page_start);
+            let copy_end = core::cmp::min(offset + read_len, page_end);
+            let copy_len = copy_end.saturating_sub(copy_start);
+            if copy_len == 0 {
+                continue;
+            }
+
+            let page = page_cache
+                .manager()
+                .commit_page_with(page_index, |idx, dst| {
+                    self.read_page_with_open(idx, dst, fh, file_flags)
+                })?;
+            let page_guard = page.read();
+            let page_offset = copy_start - page_start;
+            unsafe {
+                buf[dst_offset..dst_offset + copy_len]
+                    .copy_from_slice(&page_guard.as_slice()[page_offset..page_offset + copy_len]);
+            }
+            dst_offset += copy_len;
+        }
+
+        Ok(dst_offset)
+    }
+
+    pub(crate) fn fault_page_with_open(
+        &self,
+        page_index: usize,
+        fh: u64,
+        file_flags: u32,
+    ) -> Result<Arc<crate::mm::page::Page>, SystemError> {
+        let md = self.cached_or_fetch_metadata()?;
+        let file_size = md.size.max(0) as usize;
+        if file_size == 0 || page_index.saturating_mul(MMArch::PAGE_SIZE) >= file_size {
+            return Err(SystemError::EINVAL);
+        }
+        let page_cache = self.ensure_page_cache()?;
+        page_cache
+            .manager()
+            .commit_page_with(page_index, |idx, dst| {
+                self.read_page_with_open(idx, dst, fh, file_flags)
+            })
+    }
+
+    fn update_cached_pages_after_write(&self, offset: usize, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        let Some(page_cache) = self.cached_page_cache() else {
+            return;
+        };
+
+        let start_page_index = offset >> MMArch::PAGE_SHIFT;
+        let end_page_index = (offset + data.len() - 1) >> MMArch::PAGE_SHIFT;
+        for page_index in start_page_index..=end_page_index {
+            let Some(page) = page_cache.manager().peek_page(page_index) else {
+                continue;
+            };
+            let page_start = page_index << MMArch::PAGE_SHIFT;
+            let page_end = page_start + MMArch::PAGE_SIZE;
+            let write_start = core::cmp::max(offset, page_start);
+            let write_end = core::cmp::min(offset + data.len(), page_end);
+            let write_len = write_end.saturating_sub(write_start);
+            if write_len == 0 {
+                continue;
+            }
+
+            let mut guard = page.write();
+            let flags = guard.flags();
+            if flags.intersects(PageFlags::PG_DIRTY | PageFlags::PG_WRITEBACK) {
+                continue;
+            }
+            let src_offset = write_start - offset;
+            let page_offset = write_start - page_start;
+            unsafe {
+                guard.as_slice_mut()[page_offset..page_offset + write_len]
+                    .copy_from_slice(&data[src_offset..src_offset + write_len]);
+            }
+            guard.add_flags(PageFlags::PG_UPTODATE);
+        }
+
+        let end = offset.saturating_add(data.len());
+        if let Some(md) = self.cached_metadata.lock().as_mut() {
+            if end > md.size.max(0) as usize {
+                md.size = end as i64;
+            }
+        }
+    }
 }
 
 impl IndexNode for FuseNode {
@@ -608,7 +852,8 @@ impl IndexNode for FuseNode {
         let _ = (start, len, offset);
         self.check_not_stale()?;
         self.ensure_regular()?;
-        Err(SystemError::ENODEV)
+        self.ensure_page_cache()?;
+        Ok(())
     }
 
     fn open(
@@ -686,64 +931,14 @@ impl IndexNode for FuseNode {
             return Ok(n);
         }
         self.ensure_regular()?;
-        let fh = self.resolve_file_fh(&data)?;
-        let file_flags = Self::fuse_file_flags(&data)?;
-        let max_read = self.conn().max_read();
-        if max_read == 0 {
-            return Err(SystemError::EIO);
+        let (fh, file_flags, fopen_flags) = Self::fuse_file_snapshot(&data)?;
+        drop(data);
+
+        if (fopen_flags & FOPEN_DIRECT_IO) != 0 || (file_flags & FileFlags::O_DIRECT.bits()) != 0 {
+            return self.read_direct_with_open(offset, len, buf, fh, file_flags);
         }
 
-        let mut total_read = 0usize;
-        while total_read < len {
-            let chunk = core::cmp::min(max_read, len - total_read);
-            let Some(chunk_offset) = offset.checked_add(total_read) else {
-                return if total_read > 0 {
-                    Ok(total_read)
-                } else {
-                    Err(SystemError::EOVERFLOW)
-                };
-            };
-            if chunk_offset > i64::MAX as usize {
-                return if total_read > 0 {
-                    Ok(total_read)
-                } else {
-                    Err(SystemError::EINVAL)
-                };
-            }
-            let read_in = FuseReadIn {
-                fh,
-                offset: chunk_offset as u64,
-                size: chunk as u32,
-                read_flags: 0,
-                lock_owner: 0,
-                flags: file_flags,
-                padding: 0,
-            };
-            let payload =
-                match self
-                    .conn()
-                    .request(FUSE_READ, self.nodeid, fuse_pack_struct(&read_in))
-                {
-                    Ok(payload) => payload,
-                    Err(_) if total_read > 0 => return Ok(total_read),
-                    Err(err) => return Err(err),
-                };
-            if payload.len() > chunk {
-                return if total_read > 0 {
-                    Ok(total_read)
-                } else {
-                    Err(SystemError::EIO)
-                };
-            }
-            let n = payload.len();
-            buf[total_read..total_read + n].copy_from_slice(&payload);
-            total_read += n;
-            if n < chunk {
-                break;
-            }
-        }
-
-        Ok(total_read)
+        self.read_cached_with_open(offset, len, buf, fh, file_flags)
     }
 
     fn write_at(
@@ -783,7 +978,18 @@ impl IndexNode for FuseNode {
             payload_in.extend_from_slice(&buf[total_written..total_written + chunk]);
             let payload = self.conn().request(FUSE_WRITE, self.nodeid, &payload_in)?;
             let out: FuseWriteOut = fuse_read_struct(&payload)?;
-            let wrote = core::cmp::min(out.size as usize, chunk);
+            if out.size as usize > chunk {
+                return if total_written > 0 {
+                    Ok(total_written)
+                } else {
+                    Err(SystemError::EIO)
+                };
+            }
+            let wrote = out.size as usize;
+            self.update_cached_pages_after_write(
+                chunk_offset,
+                &buf[total_written..total_written + wrote],
+            );
             total_written += wrote;
             if wrote < chunk {
                 break;
@@ -904,7 +1110,7 @@ impl IndexNode for FuseNode {
     }
 
     fn page_cache(&self) -> Option<Arc<PageCache>> {
-        None
+        self.cached_page_cache()
     }
 
     fn sync_file(

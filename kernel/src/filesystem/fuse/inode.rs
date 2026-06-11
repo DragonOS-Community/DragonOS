@@ -214,6 +214,13 @@ impl FuseNode {
         }
     }
 
+    fn truncate_page_cache(&self, new_size: usize) -> Result<(), SystemError> {
+        if let Some(cache) = self.cached_page_cache() {
+            cache.truncate(new_size)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn fuse_fs(&self) -> Option<Arc<FuseFS>> {
         self.fs.upgrade()
     }
@@ -1068,7 +1075,11 @@ impl IndexNode for FuseNode {
             .request(FUSE_SETATTR, self.nodeid, fuse_pack_struct(&inarg))?;
         let out: FuseAttrOut = fuse_read_struct(&payload)?;
         let md = Self::attr_to_metadata(&out.attr);
+        let new_size = md.size.max(0) as usize;
         self.set_cached_metadata_with_valid(md, out.attr_valid, out.attr_valid_nsec);
+        if (valid & FATTR_SIZE) != 0 {
+            self.truncate_page_cache(new_size)?;
+        }
         Ok(())
     }
 
@@ -1097,7 +1108,9 @@ impl IndexNode for FuseNode {
             .request(FUSE_SETATTR, self.nodeid, fuse_pack_struct(&inarg))?;
         let out: FuseAttrOut = fuse_read_struct(&payload)?;
         let md = Self::attr_to_metadata(&out.attr);
+        let new_size = md.size.max(0) as usize;
         self.set_cached_metadata_with_valid(md, out.attr_valid, out.attr_valid_nsec);
+        self.truncate_page_cache(new_size)?;
         Ok(())
     }
 

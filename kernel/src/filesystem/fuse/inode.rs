@@ -4,16 +4,19 @@ use alloc::{
     vec::Vec,
 };
 use core::mem::size_of;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use system_error::SystemError;
 
 use crate::time::timekeep::ktime_get_real_ns;
 use crate::{
     driver::base::device::device_number::DeviceNumber,
-    filesystem::vfs::{
-        file::FileFlags, permission::PermissionMask, syscall::RenameFlags, FilePrivateData,
-        FileSystem, FileType, IndexNode, InodeFlags, InodeId, InodeMode, Metadata,
+    filesystem::{
+        page_cache::{AsyncPageCacheBackend, PageCache},
+        vfs::{
+            file::FileFlags, permission::PermissionMask, syscall::RenameFlags, FilePrivateData,
+            FileSystem, FileType, IndexNode, InodeFlags, InodeId, InodeMode, Metadata,
+        },
     },
     libs::mutex::{Mutex, MutexGuard},
     time::PosixTimeSpec,
@@ -41,11 +44,18 @@ use super::{
 pub struct FuseNode {
     fs: Weak<FuseFS>,
     conn: Arc<FuseConn>,
+    self_ref: Weak<FuseNode>,
     nodeid: u64,
     parent_nodeid: Mutex<u64>,
     cached_metadata: Mutex<Option<Metadata>>,
+    page_cache: Mutex<Option<Arc<PageCache>>>,
     cached_metadata_deadline_ns: AtomicU64,
     lookup_count: AtomicU64,
+    /// 最近一次 LOOKUP 回复中的 fuse_attr.flags（用于 announce-submounts）。
+    lookup_attr_flags: AtomicU32,
+    /// LOOKUP 返回的 generation，用于检测 virtiofsd 复用 nodeid。
+    generation: AtomicU64,
+    stale: AtomicBool,
 }
 
 impl FuseNode {
@@ -59,15 +69,43 @@ impl FuseNode {
         cached: Option<Metadata>,
     ) -> Arc<Self> {
         let has_cached = cached.is_some();
-        Arc::new(Self {
+        Arc::new_cyclic(|self_ref| Self {
             fs,
             conn,
+            self_ref: self_ref.clone(),
             nodeid,
             parent_nodeid: Mutex::new(parent_nodeid),
             cached_metadata: Mutex::new(cached),
+            page_cache: Mutex::new(None),
             cached_metadata_deadline_ns: AtomicU64::new(if has_cached { u64::MAX } else { 0 }),
             lookup_count: AtomicU64::new(0),
+            lookup_attr_flags: AtomicU32::new(0),
+            generation: AtomicU64::new(0),
+            stale: AtomicBool::new(false),
         })
+    }
+
+    pub fn lookup_attr_flags(&self) -> u32 {
+        self.lookup_attr_flags.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_generation(&self, gen: u64) {
+        self.generation.store(gen, Ordering::Relaxed);
+    }
+
+    pub(crate) fn mark_stale(&self) {
+        self.stale.store(true, Ordering::Release);
+    }
+
+    fn check_not_stale(&self) -> Result<(), SystemError> {
+        if self.stale.load(Ordering::Acquire) {
+            return Err(SystemError::ESTALE);
+        }
+        Ok(())
     }
 
     pub fn nodeid(&self) -> u64 {
@@ -90,6 +128,11 @@ impl FuseNode {
             .store(Self::cache_deadline(valid, valid_nsec), Ordering::Relaxed);
     }
 
+    /// 累计该 inode 在 userspace daemon 侧持有的 LOOKUP 引用。
+    ///
+    /// 对齐 Linux：每个成功的 LOOKUP/READDIRPLUS entry 都必须被记账，并在 inode
+    /// 释放或卸载时用对应的 `FUSE_FORGET(nlookup=...)` 归还。打开的文件句柄会在
+    /// `FuseOpenPrivateData` 中持有 `Arc<FuseNode>`，避免 fd 存活期间过早 FORGET。
     pub fn inc_lookup(&self, count: u64) {
         if self.nodeid == FUSE_ROOT_ID || count == 0 {
             return;
@@ -122,11 +165,20 @@ impl FuseNode {
         Self::now_ns().saturating_add(delta_ns)
     }
 
-    fn conn(&self) -> &Arc<FuseConn> {
+    pub(crate) fn conn(&self) -> &Arc<FuseConn> {
         &self.conn
     }
 
+    pub(crate) fn fuse_fs(&self) -> Option<Arc<FuseFS>> {
+        self.fs.upgrade()
+    }
+
+    pub(crate) fn parent_fuse_nodeid(&self) -> u64 {
+        *self.parent_nodeid.lock()
+    }
+
     fn request_name(&self, opcode: u32, nodeid: u64, name: &str) -> Result<Vec<u8>, SystemError> {
+        self.check_not_stale()?;
         let payload = Self::pack_name_payload(name);
         self.conn().request(opcode, nodeid, &payload)
     }
@@ -155,6 +207,27 @@ impl FuseNode {
         payload
     }
 
+    /// Linux `fuse_send_open()` forwards file flags except creation-only bits.
+    fn fuse_open_in_flags(&self, raw: u32) -> u32 {
+        let mut flags = raw
+            & !(FileFlags::O_CREAT.bits() | FileFlags::O_EXCL.bits() | FileFlags::O_NOCTTY.bits());
+        if !self
+            .conn
+            .has_init_flag(super::protocol::FUSE_ATOMIC_O_TRUNC)
+        {
+            flags &= !FileFlags::O_TRUNC.bits();
+        }
+        flags
+    }
+
+    fn fuse_file_flags(data: &FilePrivateData) -> Result<u32, SystemError> {
+        match data {
+            FilePrivateData::Fuse(FuseFilePrivateData::File(p)) => Ok(p.open_flags),
+            FilePrivateData::Fuse(FuseFilePrivateData::Dir(p)) => Ok(p.open_flags),
+            _ => Err(SystemError::EBADF),
+        }
+    }
+
     fn set_open_private_data(
         &self,
         data: &mut FilePrivateData,
@@ -164,15 +237,18 @@ impl FuseNode {
         no_open: bool,
     ) -> Result<(), SystemError> {
         let conn_any: Arc<dyn core::any::Any + Send + Sync> = self.conn.clone();
+        let node = self.self_ref.upgrade().ok_or(SystemError::EIO)?;
         *data = match opcode {
             FUSE_OPEN => FilePrivateData::Fuse(FuseFilePrivateData::File(FuseOpenPrivateData {
                 conn: conn_any,
+                node: node.clone(),
                 fh,
                 open_flags,
                 no_open,
             })),
             FUSE_OPENDIR => FilePrivateData::Fuse(FuseFilePrivateData::Dir(FuseOpenPrivateData {
                 conn: conn_any,
+                node,
                 fh,
                 open_flags,
                 no_open,
@@ -310,6 +386,7 @@ impl FuseNode {
     }
 
     fn fetch_attr(&self) -> Result<Metadata, SystemError> {
+        self.check_not_stale()?;
         let getattr_in = FuseGetattrIn {
             getattr_flags: 0,
             dummy: 0,
@@ -341,12 +418,15 @@ impl FuseNode {
         data: &mut FilePrivateData,
         flags: &FileFlags,
     ) -> Result<(), SystemError> {
+        self.check_not_stale()?;
+        let file_flags = flags.bits();
         if self.conn.should_skip_open(opcode) {
-            return self.set_open_private_data(data, opcode, 0, flags.bits(), true);
+            return self.set_open_private_data(data, opcode, 0, file_flags, true);
         }
 
+        let fuse_open_flags = self.fuse_open_in_flags(file_flags);
         let open_in = FuseOpenIn {
-            flags: flags.bits(),
+            flags: fuse_open_flags,
             open_flags: 0,
         };
         let payload = match self
@@ -356,18 +436,18 @@ impl FuseNode {
             Ok(v) => v,
             Err(SystemError::ENOSYS) if self.conn.open_enosys_is_supported(opcode) => {
                 self.conn.mark_no_open(opcode);
-                return self.set_open_private_data(data, opcode, 0, open_in.flags, true);
+                return self.set_open_private_data(data, opcode, 0, file_flags, true);
             }
             Err(e) => return Err(e),
         };
         let out: FuseOpenOut = fuse_read_struct(&payload)?;
-        self.set_open_private_data(data, opcode, out.fh, open_in.flags, false)
+        self.set_open_private_data(data, opcode, out.fh, file_flags, false)
     }
 
-    fn release_common(&self, opcode: u32, fh: u64, open_flags: u32) -> Result<(), SystemError> {
+    fn release_common(&self, opcode: u32, fh: u64, file_flags: u32) -> Result<(), SystemError> {
         let inarg = FuseReleaseIn {
             fh,
-            flags: open_flags,
+            flags: file_flags,
             release_flags: 0,
             lock_owner: 0,
         };
@@ -393,7 +473,76 @@ impl FuseNode {
         Ok(())
     }
 
+    fn ensure_page_cache(&self) -> Option<Arc<PageCache>> {
+        let md = self.cached_or_fetch_metadata().ok()?;
+        if md.file_type != FileType::File {
+            return None;
+        }
+
+        let mut guard = self.page_cache.lock();
+        if let Some(cache) = guard.clone() {
+            return Some(cache);
+        }
+
+        let inode = self.self_ref.upgrade()? as Arc<dyn IndexNode>;
+        let backend = Arc::new(AsyncPageCacheBackend::new(Arc::downgrade(&inode)));
+        let cache = PageCache::new(Some(Arc::downgrade(&inode)), Some(backend));
+        *guard = Some(cache.clone());
+        Some(cache)
+    }
+
+    fn read_with_temp_open(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let private = Mutex::new(FilePrivateData::Unused);
+        {
+            let mut data = private.lock();
+            self.open_common(FUSE_OPEN, &mut data, &FileFlags::O_RDONLY)?;
+        }
+
+        let result = self.read_at(offset, buf.len(), buf, private.lock());
+        let close_result = self.close(private.lock());
+        match result {
+            Ok(n) => {
+                if let Err(e) = close_result {
+                    log::warn!("fuse temporary close after successful read failed: {:?}", e);
+                }
+                Ok(n)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn write_with_temp_open(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        let private = Mutex::new(FilePrivateData::Unused);
+        {
+            let mut data = private.lock();
+            self.open_common(FUSE_OPEN, &mut data, &FileFlags::O_WRONLY)?;
+        }
+
+        let result = self.write_at(offset, buf.len(), buf, private.lock());
+        let close_result = self.close(private.lock());
+        match result {
+            Ok(n) => {
+                if let Err(e) = close_result {
+                    log::warn!(
+                        "fuse temporary close after successful write failed: {:?}",
+                        e
+                    );
+                }
+                Ok(n)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn resolve_file_fh(&self, data: &FilePrivateData) -> Result<u64, SystemError> {
+        let FilePrivateData::Fuse(FuseFilePrivateData::File(p)) = data else {
+            return Err(SystemError::EBADF);
+        };
+        Ok(p.fh)
+    }
+
     fn fsync_common(&self, datasync: bool) -> Result<(), SystemError> {
+        self.check_not_stale()?;
         let md = self.cached_or_fetch_metadata()?;
         let opcode = match md.file_type {
             FileType::File => FUSE_FSYNC,
@@ -416,16 +565,12 @@ impl FuseNode {
         datasync: bool,
         data: &FilePrivateData,
     ) -> Result<(), SystemError> {
-        let (opcode, fh, no_open) = match data {
-            FilePrivateData::Fuse(FuseFilePrivateData::File(p)) => (FUSE_FSYNC, p.fh, p.no_open),
-            FilePrivateData::Fuse(FuseFilePrivateData::Dir(p)) => (FUSE_FSYNCDIR, p.fh, p.no_open),
+        self.check_not_stale()?;
+        let (opcode, fh) = match data {
+            FilePrivateData::Fuse(FuseFilePrivateData::File(p)) => (FUSE_FSYNC, p.fh),
+            FilePrivateData::Fuse(FuseFilePrivateData::Dir(p)) => (FUSE_FSYNCDIR, p.fh),
             _ => return self.fsync_common(datasync),
         };
-
-        // Linux 对 no_open/no_opendir 语义允许缺省 open，fh 不可靠，直接成功返回。
-        if no_open {
-            return Ok(());
-        }
 
         let inarg = FuseFsyncIn {
             fh,
@@ -453,6 +598,7 @@ impl FuseNode {
         &self,
         entry: &FuseEntryOut,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.check_not_stale()?;
         let md = Self::attr_to_metadata(&entry.attr);
         let fs = self.fs.upgrade().ok_or(SystemError::ENOENT)?;
         let child = fs.get_or_create_node(entry.nodeid, self.nodeid, Some(md));
@@ -471,11 +617,24 @@ impl IndexNode for FuseNode {
         self
     }
 
+    fn read_sync(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        self.check_not_stale()?;
+        self.ensure_regular()?;
+        self.read_with_temp_open(offset, buf)
+    }
+
+    fn write_sync(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        self.check_not_stale()?;
+        self.ensure_regular()?;
+        self.write_with_temp_open(offset, buf)
+    }
+
     fn open(
         &self,
         mut data: MutexGuard<FilePrivateData>,
         flags: &FileFlags,
     ) -> Result<(), SystemError> {
+        self.check_not_stale()?;
         let md = self.cached_or_fetch_metadata()?;
         match md.file_type {
             FileType::Dir => self.open_common(FUSE_OPENDIR, &mut data, flags),
@@ -530,6 +689,7 @@ impl IndexNode for FuseNode {
         buf: &mut [u8],
         data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        self.check_not_stale()?;
         if buf.len() < len {
             return Err(SystemError::EINVAL);
         }
@@ -544,22 +704,22 @@ impl IndexNode for FuseNode {
             return Ok(n);
         }
         self.ensure_regular()?;
-        let FilePrivateData::Fuse(FuseFilePrivateData::File(p)) = &*data else {
-            return Err(SystemError::EBADF);
-        };
+        let fh = self.resolve_file_fh(&data)?;
+        let file_flags = Self::fuse_file_flags(&data)?;
+        let read_len = core::cmp::min(len, self.conn().max_write());
         let read_in = FuseReadIn {
-            fh: p.fh,
+            fh,
             offset: offset as u64,
-            size: len as u32,
+            size: read_len as u32,
             read_flags: 0,
             lock_owner: 0,
-            flags: 0,
+            flags: file_flags,
             padding: 0,
         };
         let payload = self
             .conn()
             .request(FUSE_READ, self.nodeid, fuse_pack_struct(&read_in))?;
-        let n = core::cmp::min(payload.len(), len);
+        let n = core::cmp::min(payload.len(), read_len);
         buf[..n].copy_from_slice(&payload[..n]);
         Ok(n)
     }
@@ -571,13 +731,13 @@ impl IndexNode for FuseNode {
         buf: &[u8],
         data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        self.check_not_stale()?;
         self.ensure_regular()?;
         if buf.len() < len {
             return Err(SystemError::EINVAL);
         }
-        let FilePrivateData::Fuse(FuseFilePrivateData::File(p)) = &*data else {
-            return Err(SystemError::EBADF);
-        };
+        let fh = self.resolve_file_fh(&data)?;
+        let file_flags = Self::fuse_file_flags(&data)?;
         let max_write = self.conn().max_write();
         let mut total_written = 0usize;
 
@@ -588,12 +748,12 @@ impl IndexNode for FuseNode {
                 .ok_or(SystemError::EOVERFLOW)?;
 
             let write_in = FuseWriteIn {
-                fh: p.fh,
+                fh,
                 offset: chunk_offset as u64,
                 size: chunk as u32,
                 write_flags: 0,
                 lock_owner: 0,
-                flags: 0,
+                flags: file_flags,
                 padding: 0,
             };
             let mut payload_in = Vec::with_capacity(size_of::<FuseWriteIn>() + chunk);
@@ -612,10 +772,12 @@ impl IndexNode for FuseNode {
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
+        self.check_not_stale()?;
         self.cached_or_fetch_metadata()
     }
 
     fn check_access(&self, mask: PermissionMask) -> Result<(), SystemError> {
+        self.check_not_stale()?;
         let inarg = FuseAccessIn {
             mask: mask.bits() & PermissionMask::MAY_RWX.bits(),
             padding: 0,
@@ -627,6 +789,7 @@ impl IndexNode for FuseNode {
     }
 
     fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
+        self.check_not_stale()?;
         let old = self.cached_or_fetch_metadata()?;
         let mut valid = 0u32;
         if metadata.mode != old.mode {
@@ -682,6 +845,7 @@ impl IndexNode for FuseNode {
     }
 
     fn resize(&self, len: usize) -> Result<(), SystemError> {
+        self.check_not_stale()?;
         let inarg = FuseSetattrIn {
             valid: FATTR_SIZE,
             padding: 0,
@@ -717,6 +881,13 @@ impl IndexNode for FuseNode {
         self.fsync_common(true)
     }
 
+    fn page_cache(&self) -> Option<Arc<PageCache>> {
+        if self.check_not_stale().is_err() {
+            return None;
+        }
+        self.ensure_page_cache()
+    }
+
     fn sync_file(
         &self,
         datasync: bool,
@@ -730,6 +901,7 @@ impl IndexNode for FuseNode {
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
+        self.check_not_stale()?;
         self.ensure_dir()?;
 
         // OPENDIR
@@ -753,7 +925,7 @@ impl IndexNode for FuseNode {
                 size: 64 * 1024,
                 read_flags: 0,
                 lock_owner: 0,
-                flags: 0,
+                flags: open_flags,
                 padding: 0,
             };
             let opcode = if use_readdirplus {
@@ -799,6 +971,7 @@ impl IndexNode for FuseNode {
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.check_not_stale()?;
         self.ensure_dir()?;
         if name == "." {
             let fs = self.fs.upgrade().ok_or(SystemError::ENOENT)?;
@@ -813,7 +986,15 @@ impl IndexNode for FuseNode {
         let md = Self::attr_to_metadata(&entry.attr);
 
         let fs = self.fs.upgrade().ok_or(SystemError::ENOENT)?;
-        let child = fs.get_or_create_node(entry.nodeid, self.nodeid, Some(md));
+        let child = fs.get_or_create_node_with_generation(
+            entry.nodeid,
+            self.nodeid,
+            Some(md),
+            Some(entry.generation),
+        );
+        child
+            .lookup_attr_flags
+            .store(entry.attr.flags, Ordering::Relaxed);
         child.inc_lookup(1);
         child.set_cached_metadata_with_valid(
             Self::attr_to_metadata(&entry.attr),
@@ -838,6 +1019,7 @@ impl IndexNode for FuseNode {
         file_type: FileType,
         mode: InodeMode,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.check_not_stale()?;
         self.ensure_dir()?;
         if file_type != FileType::File {
             return self.create_with_data(name, file_type, mode, 0);
@@ -867,6 +1049,7 @@ impl IndexNode for FuseNode {
         mode: InodeMode,
         _data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.check_not_stale()?;
         self.ensure_dir()?;
 
         match file_type {
@@ -908,6 +1091,7 @@ impl IndexNode for FuseNode {
     }
 
     fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.check_not_stale()?;
         self.ensure_dir()?;
         let payload_in = Self::pack_two_names_payload(target, name);
         let payload = self
@@ -918,6 +1102,7 @@ impl IndexNode for FuseNode {
     }
 
     fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
+        self.check_not_stale()?;
         self.ensure_dir()?;
         let target = other
             .as_any_ref()
@@ -933,12 +1118,14 @@ impl IndexNode for FuseNode {
     }
 
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
+        self.check_not_stale()?;
         self.ensure_dir()?;
         let _ = self.request_name(FUSE_UNLINK, self.nodeid, name)?;
         Ok(())
     }
 
     fn rmdir(&self, name: &str) -> Result<(), SystemError> {
+        self.check_not_stale()?;
         self.ensure_dir()?;
         let _ = self.request_name(FUSE_RMDIR, self.nodeid, name)?;
         Ok(())
@@ -951,6 +1138,7 @@ impl IndexNode for FuseNode {
         new_name: &str,
         flag: RenameFlags,
     ) -> Result<(), SystemError> {
+        self.check_not_stale()?;
         self.ensure_dir()?;
         let target_any = target
             .as_any_ref()

@@ -57,6 +57,7 @@ pub const FUSE_AUTO_INVAL_DATA: u64 = 1 << 12;
 pub const FUSE_DO_READDIRPLUS: u64 = 1 << 13;
 pub const FUSE_READDIRPLUS_AUTO: u64 = 1 << 14;
 pub const FUSE_ASYNC_DIO: u64 = 1 << 15;
+#[allow(dead_code)]
 pub const FUSE_WRITEBACK_CACHE: u64 = 1 << 16;
 pub const FUSE_NO_OPEN_SUPPORT: u64 = 1 << 17;
 pub const FUSE_PARALLEL_DIROPS: u64 = 1 << 18;
@@ -66,7 +67,12 @@ pub const FUSE_ABORT_ERROR: u64 = 1 << 21;
 pub const FUSE_MAX_PAGES: u64 = 1 << 22;
 pub const FUSE_NO_OPENDIR_SUPPORT: u64 = 1 << 24;
 pub const FUSE_EXPLICIT_INVAL_DATA: u64 = 1 << 25;
+/// Guest auto-mounts directories marked FUSE_ATTR_SUBMOUNT (Linux fuse.h: init->flags bit 27).
+pub const FUSE_SUBMOUNTS: u64 = 1 << 27;
 pub const FUSE_INIT_EXT: u64 = 1 << 30;
+
+/// fuse_attr.flags (Linux 6.6): directory is a submount root announced by virtiofsd.
+pub const FUSE_ATTR_SUBMOUNT: u32 = 1 << 0;
 
 // getattr/setattr valid bits (subset)
 pub const FATTR_MODE: u32 = 1 << 0;

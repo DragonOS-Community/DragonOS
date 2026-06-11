@@ -36,8 +36,8 @@ use super::{
     conn::FuseConn,
     fs::{FuseFS, FuseMountData},
     protocol::{
-        fuse_pack_struct, fuse_read_struct, FuseInHeader, FuseOutHeader, FUSE_DESTROY, FUSE_FORGET,
-        FUSE_INTERRUPT,
+        fuse_pack_struct, fuse_read_struct, FuseInHeader, FuseOutHeader, FuseReadIn, FUSE_DESTROY,
+        FUSE_FORGET, FUSE_INTERRUPT, FUSE_READ, FUSE_READDIR, FUSE_READDIRPLUS,
     },
 };
 
@@ -140,6 +140,21 @@ impl VirtioFsBridgeContext {
         }
     }
 
+    fn response_buffer_size(pending: &PendingReq) -> usize {
+        let default_size = VIRTIOFS_RSP_BUF_SIZE;
+        let read_like = matches!(pending.opcode, FUSE_READ | FUSE_READDIR | FUSE_READDIRPLUS);
+        if !read_like || pending.req.len() < core::mem::size_of::<FuseInHeader>() {
+            return default_size;
+        }
+
+        let payload = &pending.req[core::mem::size_of::<FuseInHeader>()..];
+        let Ok(read_in) = fuse_read_struct::<FuseReadIn>(payload) else {
+            return default_size;
+        };
+        let wanted = core::mem::size_of::<FuseOutHeader>().saturating_add(read_in.size as usize);
+        core::cmp::max(core::mem::size_of::<FuseOutHeader>(), wanted).min(default_size)
+    }
+
     fn take_inflight(&mut self, kind: QueueKind, token: u16) -> Result<InflightReq, SystemError> {
         match kind {
             QueueKind::Hiprio => self.hiprio_inflight.remove(&token).ok_or(SystemError::EIO),
@@ -233,7 +248,8 @@ impl VirtioFsBridgeContext {
         let mut rsp = if pending.noreply {
             None
         } else {
-            Some(vec![0u8; VIRTIOFS_RSP_BUF_SIZE])
+            let rsp_size = Self::response_buffer_size(&pending);
+            Some(vec![0u8; rsp_size])
         };
 
         let (token, should_notify) = match kind {

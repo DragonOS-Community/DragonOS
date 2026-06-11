@@ -168,11 +168,17 @@ static inline int fuse_test_log_enabled(void) {
 #ifndef FUSE_READDIRPLUS_AUTO
 #define FUSE_READDIRPLUS_AUTO (1u << 14)
 #endif
+#ifndef FUSE_WRITEBACK_CACHE
+#define FUSE_WRITEBACK_CACHE (1u << 16)
+#endif
 #ifndef FUSE_NO_OPEN_SUPPORT
 #define FUSE_NO_OPEN_SUPPORT (1u << 17)
 #endif
 #ifndef FUSE_NO_OPENDIR_SUPPORT
 #define FUSE_NO_OPENDIR_SUPPORT (1u << 24)
+#endif
+#ifndef FUSE_ATOMIC_O_TRUNC
+#define FUSE_ATOMIC_O_TRUNC (1u << 3)
 #endif
 #ifndef FUSE_FSYNC_FDATASYNC
 #define FUSE_FSYNC_FDATASYNC (1u << 0)
@@ -472,6 +478,8 @@ struct simplefs_node {
     int is_dir;
     int is_symlink;
     uint32_t mode; /* includes type bits */
+    uint64_t open_fh;
+    uint32_t open_out_flags;
     char name[SIMPLEFS_NAME_MAX];
     unsigned char data[SIMPLEFS_DATA_MAX];
     size_t size;
@@ -496,6 +504,7 @@ static inline void simplefs_init(struct simplefs *fs) {
     fs->nodes[0].is_dir = 1;
     fs->nodes[0].is_symlink = 0;
     fs->nodes[0].mode = 0040755;
+    fs->nodes[0].open_fh = 1;
     strcpy(fs->nodes[0].name, "");
     fs->nodes[0].size = 0;
 
@@ -507,6 +516,7 @@ static inline void simplefs_init(struct simplefs *fs) {
     fs->nodes[1].is_dir = 0;
     fs->nodes[1].is_symlink = 0;
     fs->nodes[1].mode = 0100644;
+    fs->nodes[1].open_fh = 2;
     strcpy(fs->nodes[1].name, "hello.txt");
     const char *msg = "hello from fuse\n";
     fs->nodes[1].size = strlen(msg);
@@ -564,6 +574,7 @@ static inline struct simplefs_node *simplefs_alloc(struct simplefs *fs) {
             n->used = 1;
             n->nodeid = fs->next_nodeid++;
             n->ino = fs->next_ino++;
+            n->open_fh = n->nodeid;
             return n;
         }
     }
@@ -638,11 +649,22 @@ struct fuse_daemon_args {
     volatile uint32_t *release_count;
     volatile uint32_t *releasedir_count;
     volatile uint32_t *readdirplus_count;
+    volatile uint32_t *read_count;
+    volatile uint32_t *write_count;
+    volatile uint32_t *last_open_in_flags;
+    volatile uint32_t *last_release_in_flags;
+    volatile uint64_t *last_open_fh;
+    volatile uint64_t *last_read_fh;
+    volatile uint64_t *last_write_fh;
+    volatile uint64_t *last_fsync_fh;
+    volatile uint64_t *last_release_fh;
     volatile uint32_t *interrupt_count;
     volatile uint64_t *blocked_read_unique;
     volatile uint64_t *last_interrupt_target;
     uint32_t access_deny_mask;
     uint32_t init_out_flags_override;
+    uint64_t hello_open_fh_override;
+    int has_hello_open_fh_override;
     int force_open_enosys;
     int force_opendir_enosys;
     int block_read_until_interrupt;
@@ -818,6 +840,10 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
     }
     case FUSE_OPENDIR:
     case FUSE_OPEN: {
+        if (payload_len < sizeof(struct fuse_open_in)) {
+            return -1;
+        }
+        const struct fuse_open_in *in = (const struct fuse_open_in *)payload;
         struct simplefs_node *node = simplefs_find_node(&a->fs, h->nodeid);
         if (!node) {
             return fuse_write_reply(a->fd, h->unique, -ENOENT, NULL, 0);
@@ -827,6 +853,9 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         }
         if (h->opcode == FUSE_OPENDIR && a->opendir_count) {
             (*a->opendir_count)++;
+        }
+        if (h->opcode == FUSE_OPEN && a->last_open_in_flags) {
+            *a->last_open_in_flags = in->flags;
         }
         if (h->opcode == FUSE_OPEN && a->force_open_enosys) {
             return fuse_write_reply(a->fd, h->unique, -ENOSYS, NULL, 0);
@@ -842,7 +871,11 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         }
         struct fuse_open_out out;
         memset(&out, 0, sizeof(out));
-        out.fh = node->nodeid;
+        out.fh = node->open_fh;
+        out.open_flags = node->open_out_flags;
+        if (h->opcode == FUSE_OPEN && a->last_open_fh) {
+            *a->last_open_fh = out.fh;
+        }
         return fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out));
     }
     case FUSE_READLINK: {
@@ -869,6 +902,12 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
                 *a->blocked_read_unique = h->unique;
             }
             usleep((useconds_t)a->block_read_until_interrupt * 1000);
+        }
+        if (a->read_count) {
+            (*a->read_count)++;
+        }
+        if (a->last_read_fh) {
+            *a->last_read_fh = in->fh;
         }
         if (in->offset >= node->size) {
             return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
@@ -1011,11 +1050,22 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
                       (unsigned long long)out.st.bavail);
         return fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out));
     }
-    case FUSE_RELEASE:
+    case FUSE_RELEASE: {
+        if (payload_len < sizeof(struct fuse_release_in)) {
+            return -1;
+        }
+        const struct fuse_release_in *in = (const struct fuse_release_in *)payload;
         if (a->release_count) {
             (*a->release_count)++;
         }
+        if (a->last_release_in_flags) {
+            *a->last_release_in_flags = in->flags;
+        }
+        if (a->last_release_fh) {
+            *a->last_release_fh = in->fh;
+        }
         return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
+    }
     case FUSE_RELEASEDIR:
         if (a->releasedir_count) {
             (*a->releasedir_count)++;
@@ -1039,11 +1089,19 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
             (*a->flush_count)++;
         }
         return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
-    case FUSE_FSYNC:
+    case FUSE_FSYNC: {
+        if (payload_len < sizeof(struct fuse_fsync_in)) {
+            return -1;
+        }
+        const struct fuse_fsync_in *in = (const struct fuse_fsync_in *)payload;
         if (a->fsync_count) {
             (*a->fsync_count)++;
         }
+        if (a->last_fsync_fh) {
+            *a->last_fsync_fh = in->fh;
+        }
         return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
+    }
     case FUSE_FSYNCDIR:
         if (a->fsyncdir_count) {
             (*a->fsyncdir_count)++;
@@ -1088,6 +1146,12 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (in->offset >= SIMPLEFS_DATA_MAX) {
             return fuse_write_reply(a->fd, h->unique, -EFBIG, NULL, 0);
         }
+        if (a->write_count) {
+            (*a->write_count)++;
+        }
+        if (a->last_write_fh) {
+            *a->last_write_fh = in->fh;
+        }
         size_t to_copy = in->size;
         if (in->offset + to_copy > SIMPLEFS_DATA_MAX) {
             to_copy = SIMPLEFS_DATA_MAX - (size_t)in->offset;
@@ -1131,6 +1195,7 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         nnode->is_dir = 0;
         nnode->is_symlink = 0;
         nnode->mode = in->mode;
+        nnode->open_fh = nnode->nodeid;
         strncpy(nnode->name, name, sizeof(nnode->name) - 1);
         nnode->name[sizeof(nnode->name) - 1] = '\0';
         nnode->size = 0;
@@ -1142,7 +1207,7 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         memset(&out, 0, sizeof(out));
         out.entry.nodeid = nnode->nodeid;
         simplefs_fill_attr(nnode, &out.entry.attr);
-        out.open_out.fh = nnode->nodeid;
+        out.open_out.fh = nnode->open_fh;
         return fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out));
     }
     case FUSE_SYMLINK: {
@@ -1178,6 +1243,7 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         nnode->is_dir = 0;
         nnode->is_symlink = 1;
         nnode->mode = 0120777;
+        nnode->open_fh = nnode->nodeid;
         strncpy(nnode->name, name, sizeof(nnode->name) - 1);
         nnode->name[sizeof(nnode->name) - 1] = '\0';
         nnode->size = (target_len < SIMPLEFS_DATA_MAX) ? target_len : SIMPLEFS_DATA_MAX;
@@ -1218,6 +1284,7 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         nnode->is_dir = 0;
         nnode->is_symlink = src->is_symlink;
         nnode->mode = src->mode;
+        nnode->open_fh = nnode->nodeid;
         strncpy(nnode->name, name, sizeof(nnode->name) - 1);
         nnode->name[sizeof(nnode->name) - 1] = '\0';
         nnode->size = src->size;
@@ -1267,6 +1334,7 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         nnode->is_dir = is_dir;
         nnode->is_symlink = 0;
         nnode->mode = mode;
+        nnode->open_fh = nnode->nodeid;
         strncpy(nnode->name, name, sizeof(nnode->name) - 1);
         nnode->name[sizeof(nnode->name) - 1] = '\0';
         nnode->size = 0;
@@ -1375,6 +1443,9 @@ static inline void *fuse_daemon_thread(void *arg) {
     }
     if (a->hello_mode_override) {
         a->fs.nodes[1].mode = a->hello_mode_override;
+    }
+    if (a->has_hello_open_fh_override) {
+        a->fs.nodes[1].open_fh = a->hello_open_fh_override;
     }
 
     while (!*a->stop) {

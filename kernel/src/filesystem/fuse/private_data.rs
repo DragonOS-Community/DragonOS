@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 use core::any::Any;
 use system_error::SystemError;
 
-use super::conn::FuseConn;
+use super::{conn::FuseConn, inode::FuseNode};
 
 #[derive(Debug, Clone)]
 pub struct FuseDevPrivateData {
@@ -19,6 +19,7 @@ impl FuseDevPrivateData {
 #[derive(Debug, Clone)]
 pub struct FuseOpenPrivateData {
     pub conn: Arc<dyn Any + Send + Sync>,
+    pub node: Arc<FuseNode>,
     pub fh: u64,
     pub open_flags: u32,
     pub no_open: bool,

@@ -551,6 +551,372 @@ fail_no_umount:
     return -1;
 }
 
+static int ext_test_open_zero_fh_valid() {
+    const char *mp = "/tmp/test_fuse_zero_fh";
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t open_count = 0;
+    volatile uint32_t read_count = 0;
+    volatile uint64_t last_open_fh = UINT64_MAX;
+    volatile uint64_t last_read_fh = UINT64_MAX;
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.stop_on_destroy = 1;
+    args.open_count = &open_count;
+    args.read_count = &read_count;
+    args.last_open_fh = &last_open_fh;
+    args.last_read_fh = &last_read_fh;
+    args.has_hello_open_fh_override = 1;
+    args.hello_open_fh_override = 0;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    char path[256];
+    char buf[128];
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    if (fuseg_read_file_cstr(path, buf, sizeof(buf)) < 0) {
+        printf("[FAIL] read(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+    if (strcmp(buf, "hello from fuse\n") != 0) {
+        printf("[FAIL] content mismatch: got='%s'\n", buf);
+        goto fail;
+    }
+
+    usleep(100 * 1000);
+    if (open_count == 0 || read_count == 0 || last_open_fh != 0 || last_read_fh != 0) {
+        printf("[FAIL] fh counters open=%u read=%u open_fh=%llu read_fh=%llu\n", open_count,
+               read_count, (unsigned long long)last_open_fh, (unsigned long long)last_read_fh);
+        goto fail;
+    }
+
+    if (umount(mp) != 0) {
+        printf("[FAIL] umount(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        goto fail_no_umount;
+    }
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    umount(mp);
+fail_no_umount:
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_noopen_fsync_uses_zero_fh() {
+    const char *mp = "/tmp/test_fuse_noopen_fsync";
+    int f = -1;
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t open_count = 0;
+    volatile uint32_t fsync_count = 0;
+    volatile uint32_t release_count = 0;
+    volatile uint64_t last_fsync_fh = UINT64_MAX;
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.stop_on_destroy = 1;
+    args.open_count = &open_count;
+    args.fsync_count = &fsync_count;
+    args.release_count = &release_count;
+    args.last_fsync_fh = &last_fsync_fh;
+    args.force_open_enosys = 1;
+    args.init_out_flags_override = FUSE_INIT_EXT | FUSE_MAX_PAGES | FUSE_NO_OPEN_SUPPORT;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    char path[256];
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    f = open(path, O_RDONLY);
+    if (f < 0) {
+        printf("[FAIL] open(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+    if (fsync(f) != 0) {
+        printf("[FAIL] fsync(no-open file): %s (errno=%d)\n", strerror(errno), errno);
+        close(f);
+        goto fail;
+    }
+    close(f);
+
+    usleep(100 * 1000);
+    if (open_count != 1 || fsync_count == 0 || release_count != 0 || last_fsync_fh != 0) {
+        printf("[FAIL] counters open=%u fsync=%u release=%u fsync_fh=%llu\n", open_count,
+               fsync_count, release_count, (unsigned long long)last_fsync_fh);
+        goto fail;
+    }
+
+    if (umount(mp) != 0) {
+        printf("[FAIL] umount(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        goto fail_no_umount;
+    }
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    umount(mp);
+fail_no_umount:
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_open_release_flags_match_linux() {
+    const char *mp = "/tmp/test_fuse_open_flags";
+    int requested = O_RDWR | O_NOCTTY | O_TRUNC | O_APPEND | O_NONBLOCK;
+    uint32_t expected_open = (uint32_t)(requested & ~(O_CREAT | O_EXCL | O_NOCTTY));
+    int f = -1;
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t last_open_flags = 0;
+    volatile uint32_t last_release_flags = 0;
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.enable_write_ops = 1;
+    args.stop_on_destroy = 1;
+    args.last_open_in_flags = &last_open_flags;
+    args.last_release_in_flags = &last_release_flags;
+    args.init_out_flags_override = FUSE_INIT_EXT | FUSE_MAX_PAGES | FUSE_ATOMIC_O_TRUNC;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    char path[256];
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    f = open(path, requested);
+    if (f < 0) {
+        printf("[FAIL] open(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+    close(f);
+
+    usleep(100 * 1000);
+    if (last_open_flags != expected_open) {
+        printf("[FAIL] open flags got=0%o expected=0%o\n", last_open_flags, expected_open);
+        goto fail;
+    }
+    if (last_release_flags != (uint32_t)requested) {
+        printf("[FAIL] release flags got=0%o expected=0%o\n", last_release_flags,
+               (uint32_t)requested);
+        goto fail;
+    }
+
+    if (umount(mp) != 0) {
+        printf("[FAIL] umount(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        goto fail_no_umount;
+    }
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    umount(mp);
+fail_no_umount:
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_init_requests_linux_no_open_support() {
+    const char *mp = "/tmp/test_fuse_init_flags";
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t init_flags = 0;
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.stop_on_destroy = 1;
+    args.init_in_flags = &init_flags;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    if ((init_flags & FUSE_NO_OPEN_SUPPORT) == 0 ||
+        (init_flags & FUSE_NO_OPENDIR_SUPPORT) == 0) {
+        printf("[FAIL] INIT flags missing no-open support bits: flags=0x%x\n", init_flags);
+        goto fail;
+    }
+
+    if (umount(mp) != 0) {
+        printf("[FAIL] umount(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        goto fail_no_umount;
+    }
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    umount(mp);
+fail_no_umount:
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
 static int ext_test_p4_subtype_mount() {
     const char *mp = "/tmp/test_fuse_p4_subtype";
     if (ensure_dir(mp) != 0) {
@@ -992,6 +1358,22 @@ TEST(FuseExtended, InterruptDeliversFuseInterrupt) {
 
 TEST(FuseExtended, NoOpenNoOpendirReaddirplusNotify) {
     ASSERT_EQ(0, ext_test_p3_noopen_readdirplus_notify());
+}
+
+TEST(FuseExtended, OpenReturnsZeroFhIsValid) {
+    ASSERT_EQ(0, ext_test_open_zero_fh_valid());
+}
+
+TEST(FuseExtended, NoOpenFsyncUsesZeroFh) {
+    ASSERT_EQ(0, ext_test_noopen_fsync_uses_zero_fh());
+}
+
+TEST(FuseExtended, OpenFlagsMatchLinuxMask) {
+    ASSERT_EQ(0, ext_test_open_release_flags_match_linux());
+}
+
+TEST(FuseExtended, InitRequestsLinuxNoOpenSupport) {
+    ASSERT_EQ(0, ext_test_init_requests_linux_no_open_support());
 }
 
 TEST(FuseExtended, SubtypeMountFuseDotSubtype) {

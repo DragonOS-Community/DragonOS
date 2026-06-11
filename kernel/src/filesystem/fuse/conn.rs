@@ -28,7 +28,7 @@ use super::protocol::{
     FUSE_KERNEL_VERSION, FUSE_LOOKUP, FUSE_MAX_PAGES, FUSE_MIN_READ_BUFFER, FUSE_NOTIFY_DELETE,
     FUSE_NOTIFY_INVAL_ENTRY, FUSE_NOTIFY_INVAL_INODE, FUSE_NOTIFY_POLL, FUSE_NOTIFY_RETRIEVE,
     FUSE_NOTIFY_STORE, FUSE_NO_OPENDIR_SUPPORT, FUSE_NO_OPEN_SUPPORT, FUSE_PARALLEL_DIROPS,
-    FUSE_POSIX_ACL, FUSE_POSIX_LOCKS, FUSE_READDIRPLUS_AUTO, FUSE_WRITEBACK_CACHE,
+    FUSE_POSIX_ACL, FUSE_POSIX_LOCKS, FUSE_READDIRPLUS_AUTO, FUSE_SUBMOUNTS,
 };
 
 fn wait_with_recheck<T, F>(waitq: &WaitQueue, mut check: F) -> Result<T, SystemError>
@@ -143,6 +143,7 @@ struct FuseConnInner {
     owner_uid: u32,
     owner_gid: u32,
     allow_other: bool,
+    init_flags: u64,
     init: FuseInitNegotiated,
     no_open: bool,
     no_opendir: bool,
@@ -169,7 +170,10 @@ impl FuseConn {
     const MIN_MAX_WRITE: usize = 4096;
 
     pub fn new() -> Arc<Self> {
-        Self::new_with_max_write_cap(Self::max_write_cap_for_user_read_chunk())
+        Self::new_with_max_write_cap(
+            Self::max_write_cap_for_user_read_chunk(),
+            Self::kernel_init_flags(),
+        )
     }
 
     pub fn new_for_virtiofs(max_message_size: usize) -> Arc<Self> {
@@ -179,10 +183,10 @@ impl FuseConn {
         } else {
             Self::MIN_MAX_WRITE
         };
-        Self::new_with_max_write_cap(cap)
+        Self::new_with_max_write_cap(cap, Self::virtiofs_init_flags())
     }
 
-    fn new_with_max_write_cap(max_write_cap: usize) -> Arc<Self> {
+    fn new_with_max_write_cap(max_write_cap: usize, init_flags: u64) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(FuseConnInner {
                 connected: true,
@@ -191,6 +195,7 @@ impl FuseConn {
                 owner_uid: 0,
                 owner_gid: 0,
                 allow_other: false,
+                init_flags,
                 init: FuseInitNegotiated::default(),
                 no_open: false,
                 no_opendir: false,
@@ -252,7 +257,7 @@ impl FuseConn {
         g.allow_other = allow_other;
     }
 
-    fn has_init_flag(&self, flag: u64) -> bool {
+    pub(crate) fn has_init_flag(&self, flag: u64) -> bool {
         let g = self.inner.lock();
         (g.init.flags & flag) != 0
     }
@@ -575,20 +580,29 @@ impl FuseConn {
             | FUSE_DO_READDIRPLUS
             | FUSE_READDIRPLUS_AUTO
             | FUSE_ASYNC_DIO
-            | FUSE_WRITEBACK_CACHE
             | FUSE_NO_OPEN_SUPPORT
+            | FUSE_NO_OPENDIR_SUPPORT
             | FUSE_PARALLEL_DIROPS
             | FUSE_HANDLE_KILLPRIV
             | FUSE_POSIX_ACL
             | FUSE_ABORT_ERROR
             | FUSE_MAX_PAGES
-            | FUSE_NO_OPENDIR_SUPPORT
             | FUSE_EXPLICIT_INVAL_DATA
             | FUSE_INIT_EXT
     }
 
+    /// virtiofs uses the normal FUSE capability request plus Linux's submount bit.
+    /// WRITEBACK_CACHE is not requested until DragonOS has complete writeback-cache semantics.
+    fn virtiofs_init_flags() -> u64 {
+        Self::kernel_init_flags() | FUSE_SUBMOUNTS
+    }
+
+    pub fn supports_submounts(&self) -> bool {
+        self.has_init_flag(FUSE_SUBMOUNTS)
+    }
+
     pub fn enqueue_init(&self) -> Result<(), SystemError> {
-        let flags = Self::kernel_init_flags();
+        let flags = self.inner.lock().init_flags;
         let init_in = FuseInitIn {
             major: FUSE_KERNEL_VERSION,
             minor: FUSE_KERNEL_MINOR_VERSION,
@@ -658,6 +672,7 @@ impl FuseConn {
         }
         let pid = pcb.task_tgid_vnr().map(|p| p.data() as u32).unwrap_or(0);
         let pending_state = Arc::new(FusePendingState::new(unique, opcode));
+
         let req = self.build_request(
             unique,
             opcode,
@@ -823,6 +838,10 @@ impl FuseConn {
             {
                 let mut g = self.inner.lock();
                 if g.connected {
+                    // 对齐 Linux：仅启用「daemon 支持 ∩ 本端请求」的特性位。
+                    // virtiofsd 常在 INIT 回复里带上 DO_READDIRPLUS 等位；若直接采纳，
+                    // 会走 READDIRPLUS + cache_child_from_entry，导致 inode 映射过期。
+                    let enabled_flags = negotiated_flags & g.init_flags;
                     g.initialized = true;
                     g.init = FuseInitNegotiated {
                         minor: negotiated_minor,
@@ -830,7 +849,7 @@ impl FuseConn {
                         max_write: capped_max_write as u32,
                         time_gran: init_out.time_gran,
                         max_pages: negotiated_max_pages,
-                        flags: negotiated_flags,
+                        flags: enabled_flags,
                     };
                 }
             }

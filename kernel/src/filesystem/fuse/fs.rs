@@ -3,7 +3,6 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-
 use system_error::SystemError;
 
 use crate::{
@@ -12,6 +11,7 @@ use crate::{
         InodeMode, Magic, Metadata, MountableFileSystem, SuperBlock, FSMAKER,
     },
     libs::mutex::Mutex,
+    mm::{fault::PageFaultHandler, fault::PageFaultMessage, VmFaultReason},
     process::ProcessManager,
     register_mountable_fs,
     time::PosixTimeSpec,
@@ -23,7 +23,7 @@ use super::{
     conn::FuseConn,
     inode::FuseNode,
     private_data::FuseFilePrivateData,
-    protocol::{fuse_read_struct, FuseStatfsOut, FUSE_ROOT_ID, FUSE_STATFS},
+    protocol::{fuse_read_struct, FuseStatfsOut, FUSE_ATTR_SUBMOUNT, FUSE_ROOT_ID, FUSE_STATFS},
 };
 
 #[derive(Debug)]
@@ -49,6 +49,7 @@ pub struct FuseFS {
     conn: Arc<FuseConn>,
     nodes: Mutex<BTreeMap<u64, Weak<FuseNode>>>,
     default_permissions: bool,
+    is_submount: bool,
 }
 
 impl FuseFS {
@@ -140,18 +141,44 @@ impl FuseFS {
         parent_nodeid: u64,
         cached: Option<Metadata>,
     ) -> Arc<FuseNode> {
-        if nodeid == FUSE_ROOT_ID {
+        self.get_or_create_node_with_generation(nodeid, parent_nodeid, cached, None)
+    }
+
+    pub fn get_or_create_node_with_generation(
+        self: &Arc<Self>,
+        nodeid: u64,
+        parent_nodeid: u64,
+        cached: Option<Metadata>,
+        generation: Option<u64>,
+    ) -> Arc<FuseNode> {
+        if nodeid == self.root.nodeid() {
             return self.root.clone();
         }
 
         let mut nodes = self.nodes.lock();
         if let Some(w) = nodes.get(&nodeid) {
             if let Some(n) = w.upgrade() {
-                n.set_parent_nodeid(parent_nodeid);
-                if let Some(md) = cached {
-                    n.set_cached_metadata(md);
+                if let Some(gen) = generation {
+                    let old_gen = n.generation();
+                    if old_gen != 0 && old_gen != gen {
+                        n.mark_stale();
+                        n.flush_forget();
+                        nodes.remove(&nodeid);
+                    } else {
+                        n.set_generation(gen);
+                        n.set_parent_nodeid(parent_nodeid);
+                        if let Some(md) = cached {
+                            n.set_cached_metadata(md);
+                        }
+                        return n;
+                    }
+                } else {
+                    n.set_parent_nodeid(parent_nodeid);
+                    if let Some(md) = cached {
+                        n.set_cached_metadata(md);
+                    }
+                    return n;
                 }
-                return n;
             }
         }
 
@@ -162,9 +189,104 @@ impl FuseFS {
             parent_nodeid,
             cached,
         );
+        if let Some(gen) = generation {
+            n.set_generation(gen);
+        }
         nodes.insert(nodeid, Arc::downgrade(&n));
         n
     }
+
+    /// 为 virtiofs announce-submounts 创建子挂载树（共享同一 FuseConn）。
+    pub fn new_submount(
+        parent: &Arc<Self>,
+        root_nodeid: u64,
+        parent_nodeid: u64,
+        root_md: Metadata,
+    ) -> Arc<Self> {
+        let conn = parent.conn.clone();
+        let fs = Arc::new_cyclic(|weak| FuseFS {
+            root: FuseNode::new(
+                weak.clone(),
+                conn.clone(),
+                root_nodeid,
+                parent_nodeid,
+                Some(root_md),
+            ),
+            super_block: parent.super_block.clone(),
+            conn,
+            nodes: Mutex::new(BTreeMap::new()),
+            default_permissions: parent.default_permissions,
+            is_submount: true,
+        });
+        fs.nodes
+            .lock()
+            .insert(root_nodeid, Arc::downgrade(&fs.root));
+        fs
+    }
+}
+
+/// DragonOS currently mounts announced FUSE submounts eagerly at lookup time.
+/// Linux uses dentry automount and only overlays the mountpoint; parent-tree
+/// nodes outside that mountpoint remain valid.
+///
+/// ## Arguments
+///
+/// - `fuse_node`: FUSE node whose lookup attributes may contain
+///   `FUSE_ATTR_SUBMOUNT`.
+/// - `mountpoint`: VFS mount inode corresponding to the looked-up node.
+///
+/// ## Returns
+///
+/// - `Ok(())`: no submount was needed, the connection does not support
+///   submounts, the submount already exists, or a new submount was attached.
+/// - `Err(SystemError)`: metadata lookup, path resolution, or mount attachment
+///   failed.
+pub fn fuse_try_automount_submount(
+    fuse_node: &Arc<FuseNode>,
+    mountpoint: &Arc<crate::filesystem::vfs::mount::MountFSInode>,
+) -> Result<(), SystemError> {
+    use crate::filesystem::vfs::mount::{MountFlags, MountPath};
+
+    let attr_flags = fuse_node.lookup_attr_flags();
+    if (attr_flags & FUSE_ATTR_SUBMOUNT) == 0 {
+        return Ok(());
+    }
+    if !fuse_node.conn().supports_submounts() {
+        return Ok(());
+    }
+
+    let md = mountpoint.metadata()?;
+    if mountpoint
+        .mount_fs()
+        .mountpoints()
+        .contains_key(&md.inode_id)
+    {
+        return Ok(());
+    }
+
+    let parent_fs = fuse_node.fuse_fs().ok_or(SystemError::ENOENT)?;
+    let sub_fs = FuseFS::new_submount(
+        &parent_fs,
+        fuse_node.nodeid(),
+        fuse_node.parent_fuse_nodeid(),
+        md,
+    );
+    let mount_path = Arc::new(MountPath::from(mountpoint.absolute_path()?));
+    let submount_flags = mountpoint.mount_fs().mount_flags() | MountFlags::SUBMOUNT;
+    let mount_res = mountpoint.mount_subtree_with_state(
+        sub_fs.clone(),
+        sub_fs.root_node(),
+        submount_flags,
+        None,
+        None,
+        Some(mount_path),
+    );
+    if let Err(e) = mount_res {
+        if e != SystemError::EEXIST {
+            return Err(e);
+        }
+    }
+    Ok(())
 }
 
 impl MountableFileSystem for FuseFS {
@@ -249,6 +371,7 @@ impl MountableFileSystem for FuseFS {
             conn: conn.clone(),
             nodes: Mutex::new(BTreeMap::new()),
             default_permissions: mount_data.default_permissions,
+            is_submount: false,
         });
 
         if let Err(e) = conn.enqueue_init() {
@@ -326,6 +449,25 @@ impl FileSystem for FuseFS {
         }
     }
 
+    fn support_readahead(&self) -> bool {
+        false
+    }
+
+    unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
+        // FUSE regular files use the shared page cache; page faults should fetch
+        // through the inode read path instead of SIGBUS/panicking on mmap access.
+        PageFaultHandler::filemap_fault(pfm)
+    }
+
+    unsafe fn map_pages(
+        &self,
+        pfm: &mut PageFaultMessage,
+        start_pgoff: usize,
+        end_pgoff: usize,
+    ) -> VmFaultReason {
+        PageFaultHandler::filemap_map_pages(pfm, start_pgoff, end_pgoff)
+    }
+
     fn on_umount(&self) {
         let live_nodes: Vec<Arc<FuseNode>> = {
             let nodes = self.nodes.lock();
@@ -334,6 +476,8 @@ impl FileSystem for FuseFS {
         for node in live_nodes {
             node.flush_forget();
         }
-        self.conn.on_umount();
+        if !self.is_submount {
+            self.conn.on_umount();
+        }
     }
 }

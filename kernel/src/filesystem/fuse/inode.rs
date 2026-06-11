@@ -12,7 +12,7 @@ use crate::time::timekeep::ktime_get_real_ns;
 use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::{
-        page_cache::{AsyncPageCacheBackend, PageCache},
+        page_cache::PageCache,
         vfs::{
             file::FileFlags, permission::PermissionMask, syscall::RenameFlags, FilePrivateData,
             FileSystem, FileType, IndexNode, InodeFlags, InodeId, InodeMode, Metadata,
@@ -48,7 +48,6 @@ pub struct FuseNode {
     nodeid: u64,
     parent_nodeid: Mutex<u64>,
     cached_metadata: Mutex<Option<Metadata>>,
-    page_cache: Mutex<Option<Arc<PageCache>>>,
     cached_metadata_deadline_ns: AtomicU64,
     lookup_count: AtomicU64,
     /// 最近一次 LOOKUP 回复中的 fuse_attr.flags（用于 announce-submounts）。
@@ -76,7 +75,6 @@ impl FuseNode {
             nodeid,
             parent_nodeid: Mutex::new(parent_nodeid),
             cached_metadata: Mutex::new(cached),
-            page_cache: Mutex::new(None),
             cached_metadata_deadline_ns: AtomicU64::new(if has_cached { u64::MAX } else { 0 }),
             lookup_count: AtomicU64::new(0),
             lookup_attr_flags: AtomicU32::new(0),
@@ -473,67 +471,6 @@ impl FuseNode {
         Ok(())
     }
 
-    fn ensure_page_cache(&self) -> Option<Arc<PageCache>> {
-        let md = self.cached_or_fetch_metadata().ok()?;
-        if md.file_type != FileType::File {
-            return None;
-        }
-
-        let mut guard = self.page_cache.lock();
-        if let Some(cache) = guard.clone() {
-            return Some(cache);
-        }
-
-        let inode = self.self_ref.upgrade()? as Arc<dyn IndexNode>;
-        let backend = Arc::new(AsyncPageCacheBackend::new(Arc::downgrade(&inode)));
-        let cache = PageCache::new(Some(Arc::downgrade(&inode)), Some(backend));
-        *guard = Some(cache.clone());
-        Some(cache)
-    }
-
-    fn read_with_temp_open(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let private = Mutex::new(FilePrivateData::Unused);
-        {
-            let mut data = private.lock();
-            self.open_common(FUSE_OPEN, &mut data, &FileFlags::O_RDONLY)?;
-        }
-
-        let result = self.read_at(offset, buf.len(), buf, private.lock());
-        let close_result = self.close(private.lock());
-        match result {
-            Ok(n) => {
-                if let Err(e) = close_result {
-                    log::warn!("fuse temporary close after successful read failed: {:?}", e);
-                }
-                Ok(n)
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    fn write_with_temp_open(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
-        let private = Mutex::new(FilePrivateData::Unused);
-        {
-            let mut data = private.lock();
-            self.open_common(FUSE_OPEN, &mut data, &FileFlags::O_WRONLY)?;
-        }
-
-        let result = self.write_at(offset, buf.len(), buf, private.lock());
-        let close_result = self.close(private.lock());
-        match result {
-            Ok(n) => {
-                if let Err(e) = close_result {
-                    log::warn!(
-                        "fuse temporary close after successful write failed: {:?}",
-                        e
-                    );
-                }
-                Ok(n)
-            }
-            Err(e) => Err(e),
-        }
-    }
-
     fn resolve_file_fh(&self, data: &FilePrivateData) -> Result<u64, SystemError> {
         let FilePrivateData::Fuse(FuseFilePrivateData::File(p)) = data else {
             return Err(SystemError::EBADF);
@@ -618,15 +555,24 @@ impl IndexNode for FuseNode {
     }
 
     fn read_sync(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let _ = (offset, buf);
         self.check_not_stale()?;
         self.ensure_regular()?;
-        self.read_with_temp_open(offset, buf)
+        Err(SystemError::ENOSYS)
     }
 
     fn write_sync(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        let _ = (offset, buf);
         self.check_not_stale()?;
         self.ensure_regular()?;
-        self.write_with_temp_open(offset, buf)
+        Err(SystemError::ENOSYS)
+    }
+
+    fn mmap(&self, start: usize, len: usize, offset: usize) -> Result<(), SystemError> {
+        let _ = (start, len, offset);
+        self.check_not_stale()?;
+        self.ensure_regular()?;
+        Err(SystemError::ENODEV)
     }
 
     fn open(
@@ -922,10 +868,7 @@ impl IndexNode for FuseNode {
     }
 
     fn page_cache(&self) -> Option<Arc<PageCache>> {
-        if self.check_not_stale().is_err() {
-            return None;
-        }
-        self.ensure_page_cache()
+        None
     }
 
     fn sync_file(

@@ -11,6 +11,10 @@
 #define FUSE_DEV_IOC_CLONE 0x8004e500
 #endif
 
+#ifndef POSIX_FADV_NOREUSE
+#define POSIX_FADV_NOREUSE 5
+#endif
+
 static int ext_test_p2_ops() {
     const char *mp = "/tmp/test_fuse_p2_ops";
     int f = -1;
@@ -1462,6 +1466,102 @@ fail:
     return -1;
 }
 
+static int ext_test_fadvise_without_page_cache() {
+    const char *mp = "/tmp/test_fuse_fadvise";
+    char path[256];
+    int f = -1;
+    const int advices[] = {
+        POSIX_FADV_NORMAL,     POSIX_FADV_RANDOM, POSIX_FADV_SEQUENTIAL,
+        POSIX_FADV_WILLNEED,   POSIX_FADV_DONTNEED,
+        POSIX_FADV_NOREUSE,
+    };
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.stop_on_destroy = 1;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    f = open(path, O_RDONLY);
+    if (f < 0) {
+        printf("[FAIL] open(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+
+    for (size_t i = 0; i < sizeof(advices) / sizeof(advices[0]); i++) {
+        int rc = posix_fadvise(f, 0, 0, advices[i]);
+        if (rc != 0) {
+            printf("[FAIL] posix_fadvise(advice=%d): rc=%d\n", advices[i], rc);
+            goto fail;
+        }
+    }
+
+    if (posix_fadvise(f, 0, -1, POSIX_FADV_NORMAL) != EINVAL) {
+        printf("[FAIL] posix_fadvise negative len should return EINVAL\n");
+        goto fail;
+    }
+
+    close(f);
+    f = -1;
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (f >= 0) {
+        close(f);
+    }
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
 TEST(FuseExtended, OpsAccessCreateSymlinkLinkRename2FlushFsync) {
     ASSERT_EQ(0, ext_test_p2_ops());
 }
@@ -1480,6 +1580,10 @@ TEST(FuseExtended, OpenReturnsZeroFhIsValid) {
 
 TEST(FuseExtended, LargeReadSplitsOverMaxWrite) {
     ASSERT_EQ(0, ext_test_large_read_over_max_write());
+}
+
+TEST(FuseExtended, FadviseWithoutPageCacheSucceeds) {
+    ASSERT_EQ(0, ext_test_fadvise_without_page_cache());
 }
 
 TEST(FuseExtended, NoOpenFsyncUsesZeroFh) {

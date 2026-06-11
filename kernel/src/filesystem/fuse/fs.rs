@@ -11,7 +11,7 @@ use crate::{
         InodeMode, Magic, Metadata, MountableFileSystem, SuperBlock, FSMAKER,
     },
     libs::mutex::Mutex,
-    mm::{fault::PageFaultHandler, fault::PageFaultMessage, VmFaultReason},
+    mm::{fault::PageFaultMessage, VmFaultReason},
     process::ProcessManager,
     register_mountable_fs,
     time::PosixTimeSpec,
@@ -469,9 +469,8 @@ impl FileSystem for FuseFS {
     }
 
     unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
-        // FUSE regular files use the shared page cache; page faults should fetch
-        // through the inode read path instead of SIGBUS/panicking on mmap access.
-        PageFaultHandler::filemap_fault(pfm)
+        let _ = pfm;
+        VmFaultReason::VM_FAULT_SIGBUS
     }
 
     unsafe fn map_pages(
@@ -480,7 +479,8 @@ impl FileSystem for FuseFS {
         start_pgoff: usize,
         end_pgoff: usize,
     ) -> VmFaultReason {
-        PageFaultHandler::filemap_map_pages(pfm, start_pgoff, end_pgoff)
+        let _ = (pfm, start_pgoff, end_pgoff);
+        VmFaultReason::VM_FAULT_SIGBUS
     }
 
     fn on_umount(&self) {

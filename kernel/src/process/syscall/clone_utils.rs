@@ -1,7 +1,6 @@
 use core::intrinsics::unlikely;
 
 use crate::arch::interrupt::TrapFrame;
-use crate::arch::ipc::signal::Signal;
 use crate::arch::ipc::signal::MAX_SIG_NUM;
 use crate::arch::MMArch;
 use crate::mm::{MemoryManagementArch, VirtAddr};
@@ -163,7 +162,7 @@ impl KernelCloneArgs {
         self.pidfd = VirtAddr::new(args.pidfd as usize);
         self.child_tid = VirtAddr::new(args.child_tid as usize);
         self.parent_tid = VirtAddr::new(args.parent_tid as usize);
-        self.exit_signal = Signal::from(args.exit_signal as i32);
+        self.exit_signal = args.exit_signal as i32;
         self.stack = args.stack as usize;
         self.stack_size = args.stack_size as usize;
         self.tls = args.tls as usize;

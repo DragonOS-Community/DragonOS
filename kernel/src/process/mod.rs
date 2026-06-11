@@ -863,10 +863,14 @@ impl ProcessManager {
             }
             let parent_pcb = r.unwrap();
 
-            // 检查子进程的exit_signal，只有在有效时才发送信号
+            // 检查子进程的 exit_signal，只有在正信号编号时才发送信号。
+            // Linux 语义中 exit_signal=0 表示不发信号但仍可 wait，-1 表示非 leader 线程。
             let exit_signal = current.exit_signal.load(Ordering::SeqCst);
-            if exit_signal != Signal::INVALID {
-                let r = crate::ipc::kill::send_signal_to_pcb(parent_pcb.clone(), exit_signal);
+            if exit_signal > 0 {
+                let r = crate::ipc::kill::send_signal_to_pcb(
+                    parent_pcb.clone(),
+                    Signal::from(exit_signal),
+                );
                 if let Err(e) = r {
                     warn!(
                         "failed to send kill signal to {:?}'s parent pcb {:?}: {:?}",
@@ -1568,8 +1572,11 @@ pub struct ProcessControlBlock {
     /// 退出状态（Running/Zombie/Dead）
     exit_state: AtomicU8,
 
-    /// 退出信号S
-    exit_signal: AtomicSignal,
+    /// Linux task_struct::exit_signal 语义：
+    /// - -1: 非线程组 leader（CLONE_THREAD）；
+    /// - 0: 不发退出信号，但仍是可等待的 clone 子进程；
+    /// - >0: 退出时通知父进程的信号编号。
+    exit_signal: AtomicI32,
     /// 父进程退出时要发送给当前进程的信号（PR_SET_PDEATHSIG）
     pdeath_signal: AtomicSignal,
 
@@ -1753,7 +1760,7 @@ impl ProcessControlBlock {
                 sighand: RcuArcSlot::new(initial_sighand.clone()),
                 sig_altstack: RwLock::new(SigStackArch::new()),
                 exit_state: AtomicU8::new(ExitState::Running as u8),
-                exit_signal: AtomicSignal::new(Signal::SIGCHLD),
+                exit_signal: AtomicI32::new(Signal::SIGCHLD as i32),
                 pdeath_signal: AtomicSignal::new(Signal::INVALID),
 
                 no_new_privs: AtomicBool::new(false),
@@ -2696,7 +2703,7 @@ impl ProcessControlBlock {
     }
 
     pub fn is_thread_group_leader(&self) -> bool {
-        self.exit_signal.load(Ordering::SeqCst) != Signal::INVALID
+        self.exit_signal.load(Ordering::SeqCst) >= 0
     }
 
     /// 唤醒等待在本进程 `wait_queue` 上的所有等待者

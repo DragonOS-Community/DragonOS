@@ -71,7 +71,7 @@ fn child_matches_wait_options(child_pcb: &Arc<ProcessControlBlock>, options: Wai
     }
 
     let child_exit_signal = child_pcb.exit_signal.load(Ordering::SeqCst);
-    let is_clone_child = child_exit_signal != Signal::SIGCHLD;
+    let is_clone_child = child_exit_signal != Signal::SIGCHLD as i32;
     let wants_clone = options.contains(WaitOption::WCLONE);
 
     // 子进程类型必须与等待选项匹配

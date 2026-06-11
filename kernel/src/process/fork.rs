@@ -112,8 +112,13 @@ pub struct KernelCloneArgs {
     pub parent_tid: VirtAddr,
     pub set_tid: Vec<usize>,
 
-    /// 进程退出时发送的信号
-    pub exit_signal: Signal,
+    /// 进程退出时发送给父进程的信号。
+    ///
+    /// Linux 的 task_struct::exit_signal 使用整数语义：
+    /// - -1: 非线程组 leader（CLONE_THREAD），不可被普通 wait 回收；
+    /// - 0: 退出时不发送信号，但仍是可被 __WCLONE 等待的 clone 子进程；
+    /// - >0: 退出时发送对应信号。
+    pub exit_signal: i32,
 
     pub stack: usize,
     // clone3用到
@@ -142,7 +147,7 @@ impl KernelCloneArgs {
             child_tid: null_addr,
             parent_tid: null_addr,
             set_tid: Vec::with_capacity(MAX_PID_NS_LEVEL),
-            exit_signal: Signal::SIGCHLD,
+            exit_signal: Signal::SIGCHLD as i32,
             stack: 0,
             stack_size: 0,
             tls: 0,
@@ -221,14 +226,14 @@ impl KernelCloneArgs {
     ///
     /// ## 规则
     ///
-    /// 1. 如果设置了 CLONE_THREAD，进程是线程组成员，不应发送 exit_signal（设为 INVALID）
+    /// 1. 如果设置了 CLONE_THREAD，进程是线程组成员，不应发送 exit_signal（设为 -1）
     /// 2. 其他情况保持 exit_signal 不变
     ///
     /// 这个方法应该在 do_clone() 之前调用，确保 exit_signal 的语义正确。
     pub fn normalize_exit_signal(&mut self) {
         if self.flags.contains(CloneFlags::CLONE_THREAD) {
-            // 线程组成员不发送 exit_signal
-            self.exit_signal = Signal::INVALID;
+            // 线程组成员不是线程组 leader，Linux 中 exit_signal 为 -1。
+            self.exit_signal = -1;
         }
     }
 }
@@ -255,7 +260,7 @@ impl ProcessManager {
     ) -> Result<RawPid, SystemError> {
         let mut args = KernelCloneArgs::new();
         args.flags = clone_flags;
-        args.exit_signal = Signal::SIGCHLD;
+        args.exit_signal = Signal::SIGCHLD as i32;
         Self::fork_with_args(current_trapframe, args)
     }
 
@@ -776,18 +781,22 @@ impl ProcessManager {
             *pcb.parent_pcb.write_irqsave() = current_pcb.parent_pcb.read_irqsave().clone();
             *pcb.real_parent_pcb.write_irqsave() =
                 current_pcb.real_parent_pcb.read_irqsave().clone();
-            pcb.exit_signal.store(Signal::INVALID, Ordering::SeqCst);
+            pcb.exit_signal.store(-1, Ordering::SeqCst);
         } else {
             if clone_flags.contains(CloneFlags::CLONE_PARENT) {
                 *pcb.parent_pcb.write_irqsave() = current_pcb.parent_pcb.read_irqsave().clone();
                 *pcb.real_parent_pcb.write_irqsave() =
                     current_pcb.real_parent_pcb.read_irqsave().clone();
+                pcb.exit_signal.store(
+                    current_leader.exit_signal.load(Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
             } else {
                 *pcb.parent_pcb.write_irqsave() = Arc::downgrade(&current_leader);
                 *pcb.real_parent_pcb.write_irqsave() = Arc::downgrade(&current_leader);
+                pcb.exit_signal
+                    .store(clone_args.exit_signal, Ordering::SeqCst);
             }
-            pcb.exit_signal
-                .store(clone_args.exit_signal, Ordering::SeqCst);
 
             if let Some(parent) = pcb.parent_pcb() {
                 let ppid_in_child_ns = parent

@@ -482,6 +482,33 @@ impl FuseNode {
         self.fetch_attr()
     }
 
+    fn finish_open_cache_state(
+        &self,
+        opcode: u32,
+        flags: &FileFlags,
+        fopen_flags: u32,
+    ) -> Result<(), SystemError> {
+        if opcode != FUSE_OPEN {
+            return Ok(());
+        }
+
+        if flags.contains(FileFlags::O_TRUNC)
+            && self
+                .conn
+                .has_init_flag(super::protocol::FUSE_ATOMIC_O_TRUNC)
+        {
+            self.truncate_page_cache(0)?;
+            let mut guard = self.cached_metadata.lock();
+            if let Some(md) = guard.as_mut() {
+                md.size = 0;
+            }
+        } else if (fopen_flags & FOPEN_KEEP_CACHE) == 0 {
+            self.invalidate_clean_page_cache();
+        }
+
+        Ok(())
+    }
+
     fn open_common(
         &self,
         opcode: u32,
@@ -491,6 +518,7 @@ impl FuseNode {
         self.check_not_stale()?;
         let file_flags = flags.bits();
         if self.conn.should_skip_open(opcode) {
+            self.finish_open_cache_state(opcode, flags, FOPEN_KEEP_CACHE)?;
             return self.set_open_private_data(data, opcode, 0, file_flags, FOPEN_KEEP_CACHE, true);
         }
 
@@ -506,6 +534,7 @@ impl FuseNode {
             Ok(v) => v,
             Err(SystemError::ENOSYS) if self.conn.open_enosys_is_supported(opcode) => {
                 self.conn.mark_no_open(opcode);
+                self.finish_open_cache_state(opcode, flags, FOPEN_KEEP_CACHE)?;
                 return self.set_open_private_data(
                     data,
                     opcode,
@@ -518,9 +547,7 @@ impl FuseNode {
             Err(e) => return Err(e),
         };
         let out: FuseOpenOut = fuse_read_struct(&payload)?;
-        if opcode == FUSE_OPEN && (out.open_flags & FOPEN_KEEP_CACHE) == 0 {
-            self.invalidate_clean_page_cache();
-        }
+        self.finish_open_cache_state(opcode, flags, out.open_flags)?;
         self.set_open_private_data(data, opcode, out.fh, file_flags, out.open_flags, false)
     }
 
@@ -861,6 +888,13 @@ impl IndexNode for FuseNode {
         self.ensure_regular()?;
         self.ensure_page_cache()?;
         Ok(())
+    }
+
+    fn truncate_before_open(&self, flags: &FileFlags) -> bool {
+        flags.contains(FileFlags::O_TRUNC)
+            && !self
+                .conn
+                .has_init_flag(super::protocol::FUSE_ATOMIC_O_TRUNC)
     }
 
     fn open(

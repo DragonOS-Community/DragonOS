@@ -394,7 +394,7 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
     // 注意：必须在创建 File 对象之前截断
     // 因为 O_TRUNC 的截断基于文件系统权限，而不是打开模式
     // 例如：open(file, O_RDONLY | O_TRUNC) 是合法的，只要用户对文件有写权限
-    if how.o_flags.contains(FileFlags::O_TRUNC) && file_type == FileType::File {
+    if file_type == FileType::File && inode.truncate_before_open(&how.o_flags) {
         inode.resize(0)?;
     }
     let file: File = File::new(inode, how.o_flags)?;

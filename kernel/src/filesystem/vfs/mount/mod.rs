@@ -1291,6 +1291,10 @@ impl IndexNode for MountFSInode {
         return self.inner_inode.mmap(start, len, offset);
     }
 
+    fn truncate_before_open(&self, flags: &FileFlags) -> bool {
+        self.inner_inode.truncate_before_open(flags)
+    }
+
     fn sync(&self) -> Result<(), SystemError> {
         return self.inner_inode.sync();
     }

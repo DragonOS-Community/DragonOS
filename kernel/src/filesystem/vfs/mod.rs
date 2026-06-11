@@ -367,6 +367,10 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         !self.is_stream()
     }
 
+    fn truncate_before_open(&self, flags: &FileFlags) -> bool {
+        flags.contains(FileFlags::O_TRUNC)
+    }
+
     fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
         return Err(SystemError::ENOSYS);
     }

@@ -650,6 +650,7 @@ struct fuse_daemon_args {
     volatile uint32_t *rename2_count;
     volatile uint32_t *open_count;
     volatile uint32_t *opendir_count;
+    volatile uint32_t *setattr_count;
     volatile uint32_t *release_count;
     volatile uint32_t *releasedir_count;
     volatile uint32_t *readdirplus_count;
@@ -889,6 +890,9 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         }
         if (h->opcode == FUSE_OPEN && simplefs_node_is_dir(node)) {
             return fuse_write_reply(a->fd, h->unique, -EISDIR, NULL, 0);
+        }
+        if (h->opcode == FUSE_OPEN && (in->flags & O_TRUNC)) {
+            node->size = 0;
         }
         struct fuse_open_out out;
         memset(&out, 0, sizeof(out));
@@ -1465,6 +1469,9 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         return simplefs_do_rename(a, h, in->newdir, in->flags, oldname, newname);
     }
     case FUSE_SETATTR: {
+        if (a->setattr_count) {
+            (*a->setattr_count)++;
+        }
         if (!a->enable_write_ops) {
             return fuse_write_reply(a->fd, h->unique, -ENOSYS, NULL, 0);
         }

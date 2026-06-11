@@ -1082,7 +1082,19 @@ impl MountFSInode {
         if let Some(fuse_node) =
             inner_inode.downcast_arc::<crate::filesystem::fuse::inode::FuseNode>()
         {
-            crate::filesystem::fuse::fs::fuse_try_automount_submount(&fuse_node, &mount_inode)?;
+            let mut submount_path = base.absolute_path()?;
+            if !submount_path.starts_with('/') {
+                return Err(SystemError::EINVAL);
+            }
+            if submount_path != "/" {
+                submount_path.push('/');
+            }
+            submount_path.push_str(name);
+            crate::filesystem::fuse::fs::fuse_try_automount_submount(
+                &fuse_node,
+                &mount_inode,
+                Some(Arc::new(MountPath::from(submount_path))),
+            )?;
         }
         Ok(mount_inode.overlaid_inode())
     }

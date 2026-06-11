@@ -14,11 +14,15 @@ use crate::{
     filesystem::{
         page_cache::PageCache,
         vfs::{
-            file::FileFlags, permission::PermissionMask, syscall::RenameFlags, FilePrivateData,
-            FileSystem, FileType, IndexNode, InodeFlags, InodeId, InodeMode, Metadata,
+            file::FileFlags, permission::PermissionMask, syscall::RenameFlags, utils::DName,
+            FilePrivateData, FileSystem, FileType, IndexNode, InodeFlags, InodeId, InodeMode,
+            Metadata,
         },
     },
-    libs::mutex::{Mutex, MutexGuard},
+    libs::{
+        casting::DowncastArc,
+        mutex::{Mutex, MutexGuard},
+    },
     time::PosixTimeSpec,
 };
 
@@ -47,6 +51,7 @@ pub struct FuseNode {
     self_ref: Weak<FuseNode>,
     nodeid: u64,
     parent_nodeid: Mutex<u64>,
+    name: Mutex<Option<String>>,
     cached_metadata: Mutex<Option<Metadata>>,
     cached_metadata_deadline_ns: AtomicU64,
     lookup_count: AtomicU64,
@@ -74,6 +79,7 @@ impl FuseNode {
             self_ref: self_ref.clone(),
             nodeid,
             parent_nodeid: Mutex::new(parent_nodeid),
+            name: Mutex::new(None),
             cached_metadata: Mutex::new(cached),
             cached_metadata_deadline_ns: AtomicU64::new(if has_cached { u64::MAX } else { 0 }),
             lookup_count: AtomicU64::new(0),
@@ -108,6 +114,21 @@ impl FuseNode {
 
     pub fn nodeid(&self) -> u64 {
         self.nodeid
+    }
+
+    pub(crate) fn set_dname(&self, name: &str) {
+        *self.name.lock() = Some(name.to_string());
+    }
+
+    pub(crate) fn has_dname(&self, name: &str) -> bool {
+        self.name.lock().as_deref() == Some(name)
+    }
+
+    pub(crate) fn clear_dname_if(&self, name: &str) {
+        let mut dname = self.name.lock();
+        if dname.as_deref() == Some(name) {
+            *dname = None;
+        }
     }
 
     pub fn set_parent_nodeid(&self, parent: u64) {
@@ -260,13 +281,19 @@ impl FuseNode {
         (base_len + Self::FUSE_DIRENT_ALIGN - 1) & !(Self::FUSE_DIRENT_ALIGN - 1)
     }
 
-    fn cache_child_from_entry(&self, entry: &FuseEntryOut) {
+    fn cache_child_from_entry(&self, entry: &FuseEntryOut, name: &str) {
         if entry.nodeid == 0 {
             return;
         }
         if let Some(fs) = self.fs.upgrade() {
             let md = Self::attr_to_metadata(&entry.attr);
-            let child = fs.get_or_create_node(entry.nodeid, self.nodeid, Some(md.clone()));
+            let child = fs.get_or_create_node_with_generation(
+                entry.nodeid,
+                self.nodeid,
+                Some(md.clone()),
+                Some(entry.generation),
+            );
+            child.set_dname(name);
             child.inc_lookup(1);
             child.set_cached_metadata_with_valid(md, entry.attr_valid, entry.attr_valid_nsec);
         }
@@ -292,7 +319,7 @@ impl FuseNode {
             if let Ok(name) = core::str::from_utf8(name_bytes) {
                 if !name.is_empty() && name != "." && name != ".." {
                     names.push(name.to_string());
-                    self.cache_child_from_entry(&plus.entry_out);
+                    self.cache_child_from_entry(&plus.entry_out, name);
                 }
             }
 
@@ -534,11 +561,20 @@ impl FuseNode {
     fn create_node_from_entry(
         &self,
         entry: &FuseEntryOut,
+        name: Option<&str>,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         self.check_not_stale()?;
         let md = Self::attr_to_metadata(&entry.attr);
         let fs = self.fs.upgrade().ok_or(SystemError::ENOENT)?;
-        let child = fs.get_or_create_node(entry.nodeid, self.nodeid, Some(md));
+        let child = fs.get_or_create_node_with_generation(
+            entry.nodeid,
+            self.nodeid,
+            Some(md),
+            Some(entry.generation),
+        );
+        if let Some(name) = name {
+            child.set_dname(name);
+        }
         child.inc_lookup(1);
         child.set_cached_metadata_with_valid(
             Self::attr_to_metadata(&entry.attr),
@@ -975,6 +1011,7 @@ impl IndexNode for FuseNode {
             Some(md),
             Some(entry.generation),
         );
+        child.set_dname(name);
         child
             .lookup_attr_flags
             .store(entry.attr.flags, Ordering::Relaxed);
@@ -1022,7 +1059,7 @@ impl IndexNode for FuseNode {
             Err(e) => return Err(e),
         };
         let (entry, _) = Self::parse_create_reply(&payload)?;
-        self.create_node_from_entry(&entry)
+        self.create_node_from_entry(&entry, Some(name))
     }
 
     fn create_with_data(
@@ -1044,7 +1081,7 @@ impl IndexNode for FuseNode {
                 let payload_in = Self::pack_struct_and_name_payload(&inarg, name);
                 let payload = self.conn().request(FUSE_MKDIR, self.nodeid, &payload_in)?;
                 let entry: FuseEntryOut = fuse_read_struct(&payload)?;
-                self.create_node_from_entry(&entry)
+                self.create_node_from_entry(&entry, Some(name))
             }
             FileType::File => {
                 let inarg = FuseMknodIn {
@@ -1056,7 +1093,7 @@ impl IndexNode for FuseNode {
                 let payload_in = Self::pack_struct_and_name_payload(&inarg, name);
                 let payload = self.conn().request(FUSE_MKNOD, self.nodeid, &payload_in)?;
                 let entry: FuseEntryOut = fuse_read_struct(&payload)?;
-                self.create_node_from_entry(&entry)
+                self.create_node_from_entry(&entry, Some(name))
             }
             FileType::SymLink => {
                 let mut payload_in = Vec::with_capacity(name.len() + 2);
@@ -1067,7 +1104,7 @@ impl IndexNode for FuseNode {
                     .conn()
                     .request(FUSE_SYMLINK, self.nodeid, &payload_in)?;
                 let entry: FuseEntryOut = fuse_read_struct(&payload)?;
-                self.create_node_from_entry(&entry)
+                self.create_node_from_entry(&entry, Some(name))
             }
             _ => Err(SystemError::ENOSYS),
         }
@@ -1081,7 +1118,7 @@ impl IndexNode for FuseNode {
             .conn()
             .request(FUSE_SYMLINK, self.nodeid, &payload_in)?;
         let entry: FuseEntryOut = fuse_read_struct(&payload)?;
-        self.create_node_from_entry(&entry)
+        self.create_node_from_entry(&entry, Some(name))
     }
 
     fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
@@ -1096,7 +1133,21 @@ impl IndexNode for FuseNode {
         };
         let payload_in = Self::pack_struct_and_name_payload(&inarg, name);
         let payload = self.conn().request(FUSE_LINK, self.nodeid, &payload_in)?;
-        let _entry: FuseEntryOut = fuse_read_struct(&payload)?;
+        let entry: FuseEntryOut = fuse_read_struct(&payload)?;
+        let md = Self::attr_to_metadata(&entry.attr);
+        let fs = self.fs.upgrade().ok_or(SystemError::ENOENT)?;
+        let child = fs.get_or_create_node_for_link(
+            entry.nodeid,
+            self.nodeid,
+            Some(md),
+            Some(entry.generation),
+        );
+        child.inc_lookup(1);
+        child.set_cached_metadata_with_valid(
+            Self::attr_to_metadata(&entry.attr),
+            entry.attr_valid,
+            entry.attr_valid_nsec,
+        );
         Ok(())
     }
 
@@ -1148,16 +1199,59 @@ impl IndexNode for FuseNode {
         payload_in.push(0);
         payload_in.extend_from_slice(new_name.as_bytes());
         payload_in.push(0);
+        let cached_old = self
+            .fs
+            .upgrade()
+            .and_then(|fs| fs.find_cached_child(self.nodeid, old_name))
+            .or_else(|| {
+                self.find(old_name)
+                    .ok()
+                    .and_then(|inode| inode.downcast_arc::<FuseNode>())
+            });
+        let cached_new = target_any
+            .fs
+            .upgrade()
+            .and_then(|fs| fs.find_cached_child(target_any.nodeid, new_name))
+            .or_else(|| {
+                if flag.contains(RenameFlags::EXCHANGE) {
+                    target_any
+                        .find(new_name)
+                        .ok()
+                        .and_then(|inode| inode.downcast_arc::<FuseNode>())
+                } else {
+                    None
+                }
+            });
         let r = self.conn().request(opcode, self.nodeid, &payload_in);
         if opcode == FUSE_RENAME2 && matches!(r, Err(SystemError::ENOSYS)) {
             return Err(SystemError::EINVAL);
         }
         let _ = r?;
+        if let Some(node) = cached_old {
+            node.set_parent_nodeid(target_any.nodeid);
+            node.set_dname(new_name);
+        }
+        if let Some(node) = cached_new {
+            if flag.contains(RenameFlags::EXCHANGE) {
+                node.set_parent_nodeid(self.nodeid);
+                node.set_dname(old_name);
+            } else {
+                node.clear_dname_if(new_name);
+            }
+        }
         Ok(())
     }
 
     fn absolute_path(&self) -> Result<String, SystemError> {
         Ok(format!("fuse:{}", self.nodeid))
+    }
+
+    fn dname(&self) -> Result<DName, SystemError> {
+        self.name
+            .lock()
+            .as_ref()
+            .map(|name| DName(Arc::new(name.clone())))
+            .ok_or(SystemError::ENOENT)
     }
 }
 

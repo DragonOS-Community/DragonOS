@@ -474,6 +474,7 @@ struct simplefs_node {
     int used;
     uint64_t nodeid;
     uint64_t ino;
+    uint64_t generation;
     uint64_t parent;
     int is_dir;
     int is_symlink;
@@ -500,6 +501,7 @@ static inline void simplefs_init(struct simplefs *fs) {
     fs->nodes[0].used = 1;
     fs->nodes[0].nodeid = 1;
     fs->nodes[0].ino = 1;
+    fs->nodes[0].generation = 1;
     fs->nodes[0].parent = 1;
     fs->nodes[0].is_dir = 1;
     fs->nodes[0].is_symlink = 0;
@@ -512,6 +514,7 @@ static inline void simplefs_init(struct simplefs *fs) {
     fs->nodes[1].used = 1;
     fs->nodes[1].nodeid = 2;
     fs->nodes[1].ino = 2;
+    fs->nodes[1].generation = 1;
     fs->nodes[1].parent = 1;
     fs->nodes[1].is_dir = 0;
     fs->nodes[1].is_symlink = 0;
@@ -574,6 +577,7 @@ static inline struct simplefs_node *simplefs_alloc(struct simplefs *fs) {
             n->used = 1;
             n->nodeid = fs->next_nodeid++;
             n->ino = fs->next_ino++;
+            n->generation = 1;
             n->open_fh = n->nodeid;
             return n;
         }
@@ -668,6 +672,12 @@ struct fuse_daemon_args {
     uint32_t access_deny_mask;
     uint32_t init_out_flags_override;
     uint64_t hello_open_fh_override;
+    uint64_t create_reuse_nodeid;
+    uint64_t create_generation_override;
+    uint64_t link_generation_override;
+    uint64_t hello_generation_override;
+    int link_reuse_old_nodeid;
+    int allow_rename_replace;
     int has_hello_open_fh_override;
     int force_open_enosys;
     int force_opendir_enosys;
@@ -703,6 +713,7 @@ static inline int simplefs_fill_entry_reply(struct fuse_daemon_args *a, const st
     struct fuse_entry_out out;
     memset(&out, 0, sizeof(out));
     out.nodeid = node->nodeid;
+    out.generation = node->generation;
     simplefs_fill_attr(node, &out.attr);
     return fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out));
 }
@@ -753,7 +764,9 @@ static inline int simplefs_do_rename(struct fuse_daemon_args *a, const struct fu
         if (flags & RENAME_NOREPLACE) {
             return fuse_write_reply(a->fd, h->unique, -EEXIST, NULL, 0);
         }
-        return fuse_write_reply(a->fd, h->unique, -EEXIST, NULL, 0);
+        if (!a->allow_rename_replace) {
+            return fuse_write_reply(a->fd, h->unique, -EEXIST, NULL, 0);
+        }
     }
     src->parent = newdir;
     strncpy(src->name, newname, sizeof(src->name) - 1);
@@ -829,6 +842,7 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         struct fuse_entry_out out;
         memset(&out, 0, sizeof(out));
         out.nodeid = child->nodeid;
+        out.generation = child->generation;
         simplefs_fill_attr(child, &out.attr);
         return fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out));
     }
@@ -972,6 +986,7 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
                 struct fuse_direntplus dp;
                 memset(&dp, 0, sizeof(dp));
                 dp.entry_out.nodeid = 1;
+                dp.entry_out.generation = a->fs.nodes[0].generation;
                 simplefs_fill_attr(&a->fs.nodes[0], &dp.entry_out.attr);
                 dp.dirent.ino = 1;
                 dp.dirent.off = idx + 1;
@@ -1016,6 +1031,7 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
                 struct fuse_direntplus dp;
                 memset(&dp, 0, sizeof(dp));
                 dp.entry_out.nodeid = c->nodeid;
+                dp.entry_out.generation = c->generation;
                 simplefs_fill_attr(c, &dp.entry_out.attr);
                 dp.dirent.ino = c->ino;
                 dp.dirent.off = child_base + 1;
@@ -1209,6 +1225,13 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (!nnode) {
             return fuse_write_reply(a->fd, h->unique, -ENOSPC, NULL, 0);
         }
+        if (a->create_reuse_nodeid != 0) {
+            nnode->nodeid = a->create_reuse_nodeid;
+            nnode->ino = a->create_reuse_nodeid;
+        }
+        if (a->create_generation_override != 0) {
+            nnode->generation = a->create_generation_override;
+        }
         nnode->parent = h->nodeid;
         nnode->is_dir = 0;
         nnode->is_symlink = 0;
@@ -1224,6 +1247,7 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         } out;
         memset(&out, 0, sizeof(out));
         out.entry.nodeid = nnode->nodeid;
+        out.entry.generation = nnode->generation;
         simplefs_fill_attr(nnode, &out.entry.attr);
         out.open_out.fh = nnode->open_fh;
         return fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out));
@@ -1256,6 +1280,9 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         struct simplefs_node *nnode = simplefs_alloc(&a->fs);
         if (!nnode) {
             return fuse_write_reply(a->fd, h->unique, -ENOSPC, NULL, 0);
+        }
+        if (a->create_generation_override != 0) {
+            nnode->generation = a->create_generation_override;
         }
         nnode->parent = h->nodeid;
         nnode->is_dir = 0;
@@ -1297,6 +1324,13 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         struct simplefs_node *nnode = simplefs_alloc(&a->fs);
         if (!nnode) {
             return fuse_write_reply(a->fd, h->unique, -ENOSPC, NULL, 0);
+        }
+        if (a->link_reuse_old_nodeid) {
+            nnode->nodeid = src->nodeid;
+            nnode->ino = src->ino;
+        }
+        if (a->link_generation_override != 0) {
+            nnode->generation = a->link_generation_override;
         }
         nnode->parent = h->nodeid;
         nnode->is_dir = 0;
@@ -1347,6 +1381,13 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         struct simplefs_node *nnode = simplefs_alloc(&a->fs);
         if (!nnode) {
             return fuse_write_reply(a->fd, h->unique, -ENOSPC, NULL, 0);
+        }
+        if (a->create_reuse_nodeid != 0) {
+            nnode->nodeid = a->create_reuse_nodeid;
+            nnode->ino = a->create_reuse_nodeid;
+        }
+        if (a->create_generation_override != 0) {
+            nnode->generation = a->create_generation_override;
         }
         nnode->parent = h->nodeid;
         nnode->is_dir = is_dir;
@@ -1461,6 +1502,9 @@ static inline void *fuse_daemon_thread(void *arg) {
     }
     if (a->hello_mode_override) {
         a->fs.nodes[1].mode = a->hello_mode_override;
+    }
+    if (a->hello_generation_override != 0) {
+        a->fs.nodes[1].generation = a->hello_generation_override;
     }
     if (a->has_hello_open_fh_override) {
         a->fs.nodes[1].open_fh = a->hello_open_fh_override;

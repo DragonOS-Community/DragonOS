@@ -1562,6 +1562,704 @@ fail:
     return -1;
 }
 
+static int ext_test_mount_on_fuse_dir_uses_namespace_path() {
+    const char *mp = "/tmp/test_fuse_mount_target";
+    char dir_path[512];
+    char marker_path[1024];
+    int ramfs_mounted = 0;
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.enable_write_ops = 1;
+    args.stop_on_destroy = 1;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(dir_path, sizeof(dir_path), "%s/ramfs_target", mp);
+    if (mkdir(dir_path, 0755) != 0) {
+        printf("[FAIL] mkdir(%s): %s (errno=%d)\n", dir_path, strerror(errno), errno);
+        goto fail;
+    }
+
+    if (mount("", dir_path, "ramfs", 0, NULL) != 0) {
+        printf("[FAIL] mount(ramfs on fuse dir): %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    ramfs_mounted = 1;
+
+    snprintf(marker_path, sizeof(marker_path), "%s/marker", dir_path);
+    if (fuseg_write_file(marker_path, "mounted") != 0) {
+        printf("[FAIL] write marker under ramfs: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+
+    if (umount(dir_path) != 0) {
+        printf("[FAIL] umount(%s): %s (errno=%d)\n", dir_path, strerror(errno), errno);
+        goto fail_no_ramfs_umount;
+    }
+    ramfs_mounted = 0;
+    if (rmdir(dir_path) != 0) {
+        printf("[FAIL] rmdir(%s): %s (errno=%d)\n", dir_path, strerror(errno), errno);
+        goto fail;
+    }
+
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (ramfs_mounted) {
+        umount(dir_path);
+    }
+fail_no_ramfs_umount:
+    rmdir(dir_path);
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_rename_updates_fuse_dir_cwd_path() {
+    const char *mp = "/tmp/test_fuse_rename_path";
+    char old_path[512];
+    char new_path[512];
+    char cwd[512];
+    int dir_fd = -1;
+    int ramfs_mounted = 0;
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.enable_write_ops = 1;
+    args.stop_on_destroy = 1;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(old_path, sizeof(old_path), "%s/old_dir", mp);
+    snprintf(new_path, sizeof(new_path), "%s/new_dir", mp);
+    if (mkdir(old_path, 0755) != 0) {
+        printf("[FAIL] mkdir(%s): %s (errno=%d)\n", old_path, strerror(errno), errno);
+        goto fail;
+    }
+    dir_fd = open(old_path, O_RDONLY | O_DIRECTORY);
+    if (dir_fd < 0) {
+        printf("[FAIL] open dir fd %s: %s (errno=%d)\n", old_path, strerror(errno), errno);
+        goto fail;
+    }
+    if (rename(old_path, new_path) != 0) {
+        printf("[FAIL] rename(%s -> %s): %s (errno=%d)\n", old_path, new_path, strerror(errno),
+               errno);
+        goto fail;
+    }
+    if (fchdir(dir_fd) != 0) {
+        printf("[FAIL] fchdir renamed dir fd: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    if (!getcwd(cwd, sizeof(cwd))) {
+        printf("[FAIL] getcwd after rename: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail_chdir_root;
+    }
+    if (strcmp(cwd, new_path) != 0) {
+        printf("[FAIL] getcwd after rename: got '%s', want '%s'\n", cwd, new_path);
+        goto fail_chdir_root;
+    }
+    if (chdir("/") != 0) {
+        printf("[FAIL] chdir(/): %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    close(dir_fd);
+    dir_fd = -1;
+
+    if (mount("", new_path, "ramfs", 0, NULL) != 0) {
+        printf("[FAIL] mount(ramfs on renamed fuse dir): %s (errno=%d)\n", strerror(errno),
+               errno);
+        goto fail;
+    }
+    ramfs_mounted = 1;
+    if (umount(new_path) != 0) {
+        printf("[FAIL] umount(%s): %s (errno=%d)\n", new_path, strerror(errno), errno);
+        goto fail_no_ramfs_umount;
+    }
+    ramfs_mounted = 0;
+    if (rmdir(new_path) != 0) {
+        printf("[FAIL] rmdir(%s): %s (errno=%d)\n", new_path, strerror(errno), errno);
+        goto fail;
+    }
+
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail_chdir_root:
+    {
+        int ignored_chdir = chdir("/");
+        (void)ignored_chdir;
+    }
+fail:
+    if (dir_fd >= 0) {
+        close(dir_fd);
+    }
+    if (ramfs_mounted) {
+        umount(new_path);
+    }
+fail_no_ramfs_umount:
+    rmdir(new_path);
+    rmdir(old_path);
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_readdirplus_generation_mismatch_stales_old_node() {
+    const char *mp = "/tmp/test_fuse_readdirplus_generation";
+    char file_path[512];
+    int old_fd = -1;
+    int new_fd = -1;
+    DIR *dir = NULL;
+    int saw = 0;
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t readdirplus_count = 0;
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.stop_on_destroy = 1;
+    args.readdirplus_count = &readdirplus_count;
+    args.force_opendir_enosys = 1;
+    args.init_out_flags_override =
+        FUSE_INIT_EXT | FUSE_MAX_PAGES | FUSE_NO_OPENDIR_SUPPORT | FUSE_DO_READDIRPLUS;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(file_path, sizeof(file_path), "%s/hello.txt", mp);
+    old_fd = open(file_path, O_RDONLY);
+    if (old_fd < 0) {
+        printf("[FAIL] open old hello: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    char buf[64];
+    if (read(old_fd, buf, sizeof(buf)) <= 0) {
+        printf("[FAIL] initial read old hello: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+
+    args.fs.nodes[1].generation = 2;
+    dir = opendir(mp);
+    if (!dir) {
+        printf("[FAIL] opendir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        goto fail;
+    }
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL) {
+        if (strcmp(de->d_name, "hello.txt") == 0) {
+            saw = 1;
+        }
+    }
+    closedir(dir);
+    dir = NULL;
+    if (!saw || readdirplus_count == 0) {
+        printf("[FAIL] expected hello.txt from READDIRPLUS, saw=%d count=%u\n", saw,
+               readdirplus_count);
+        goto fail;
+    }
+
+    errno = 0;
+    if (pread(old_fd, buf, sizeof(buf), 0) >= 0) {
+        printf("[FAIL] stale old fd read unexpectedly succeeded\n");
+        goto fail;
+    }
+    close(old_fd);
+    old_fd = -1;
+
+    new_fd = open(file_path, O_RDONLY);
+    if (new_fd < 0) {
+        printf("[FAIL] open fresh hello: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    if (read(new_fd, buf, sizeof(buf)) <= 0) {
+        printf("[FAIL] read fresh hello: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    close(new_fd);
+    new_fd = -1;
+
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (dir) {
+        closedir(dir);
+    }
+    if (new_fd >= 0) {
+        close(new_fd);
+    }
+    if (old_fd >= 0) {
+        close(old_fd);
+    }
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_create_generation_mismatch_stales_old_node() {
+    const char *mp = "/tmp/test_fuse_create_generation";
+    char old_path[512];
+    char new_path[512];
+    int old_fd = -1;
+    int new_fd = -1;
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.enable_write_ops = 1;
+    args.stop_on_destroy = 1;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(old_path, sizeof(old_path), "%s/hello.txt", mp);
+    snprintf(new_path, sizeof(new_path), "%s/reused.txt", mp);
+    old_fd = open(old_path, O_RDONLY);
+    if (old_fd < 0) {
+        printf("[FAIL] open old hello: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    if (unlink(old_path) != 0) {
+        printf("[FAIL] unlink old hello: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+
+    args.create_reuse_nodeid = 2;
+    args.create_generation_override = 2;
+    new_fd = open(new_path, O_CREAT | O_RDWR, 0644);
+    if (new_fd < 0) {
+        printf("[FAIL] create reused node: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+
+    char buf[64];
+    errno = 0;
+    if (pread(old_fd, buf, sizeof(buf), 0) >= 0) {
+        printf("[FAIL] stale old fd after create unexpectedly succeeded\n");
+        goto fail;
+    }
+    close(old_fd);
+    old_fd = -1;
+    close(new_fd);
+    new_fd = -1;
+
+    if (unlink(new_path) != 0) {
+        printf("[FAIL] unlink reused node: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (new_fd >= 0) {
+        close(new_fd);
+    }
+    if (old_fd >= 0) {
+        close(old_fd);
+    }
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_link_generation_mismatch_stales_old_node() {
+    const char *mp = "/tmp/test_fuse_link_generation";
+    char old_path[512];
+    char hard_path[512];
+    int old_fd = -1;
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.enable_write_ops = 1;
+    args.stop_on_destroy = 1;
+    args.link_reuse_old_nodeid = 1;
+    args.link_generation_override = 2;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(old_path, sizeof(old_path), "%s/hello.txt", mp);
+    snprintf(hard_path, sizeof(hard_path), "%s/hard.txt", mp);
+    old_fd = open(old_path, O_RDONLY);
+    if (old_fd < 0) {
+        printf("[FAIL] open old hello: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    if (link(old_path, hard_path) != 0) {
+        printf("[FAIL] link reused node: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+
+    char buf[64];
+    errno = 0;
+    if (pread(old_fd, buf, sizeof(buf), 0) >= 0) {
+        printf("[FAIL] stale old fd after link unexpectedly succeeded\n");
+        goto fail;
+    }
+    close(old_fd);
+    old_fd = -1;
+
+    unlink(hard_path);
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (old_fd >= 0) {
+        close(old_fd);
+    }
+    unlink(hard_path);
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_rename_replace_clears_old_target_path() {
+    const char *mp = "/tmp/test_fuse_rename_replace";
+    char old_path[512];
+    char victim_path[512];
+    char cwd[512];
+    int old_fd = -1;
+    int victim_fd = -1;
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.enable_write_ops = 1;
+    args.stop_on_destroy = 1;
+    args.allow_rename_replace = 1;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(old_path, sizeof(old_path), "%s/old_dir", mp);
+    snprintf(victim_path, sizeof(victim_path), "%s/victim_dir", mp);
+    if (mkdir(old_path, 0755) != 0 || mkdir(victim_path, 0755) != 0) {
+        printf("[FAIL] mkdir rename-replace dirs: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    old_fd = open(old_path, O_RDONLY | O_DIRECTORY);
+    victim_fd = open(victim_path, O_RDONLY | O_DIRECTORY);
+    if (old_fd < 0 || victim_fd < 0) {
+        printf("[FAIL] open rename-replace dirs: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    if (rename(old_path, victim_path) != 0) {
+        printf("[FAIL] rename replace: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    if (fchdir(old_fd) != 0 || !getcwd(cwd, sizeof(cwd)) || strcmp(cwd, victim_path) != 0) {
+        printf("[FAIL] source fd path after rename replace: cwd='%s' errno=%d (%s)\n", cwd, errno,
+               strerror(errno));
+        goto fail_chdir_root;
+    }
+    if (chdir("/") != 0) {
+        printf("[FAIL] chdir(/): %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    errno = 0;
+    if (fchdir(victim_fd) == 0) {
+        printf("[FAIL] replaced target fd still resolved to a path\n");
+        goto fail_chdir_root;
+    }
+    close(old_fd);
+    close(victim_fd);
+    old_fd = -1;
+    victim_fd = -1;
+
+    rmdir(victim_path);
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail_chdir_root:
+    {
+        int ignored_chdir = chdir("/");
+        (void)ignored_chdir;
+    }
+fail:
+    if (old_fd >= 0) {
+        close(old_fd);
+    }
+    if (victim_fd >= 0) {
+        close(victim_fd);
+    }
+    rmdir(victim_path);
+    rmdir(old_path);
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
 TEST(FuseExtended, OpsAccessCreateSymlinkLinkRename2FlushFsync) {
     ASSERT_EQ(0, ext_test_p2_ops());
 }
@@ -1584,6 +2282,30 @@ TEST(FuseExtended, LargeReadSplitsOverMaxWrite) {
 
 TEST(FuseExtended, FadviseWithoutPageCacheSucceeds) {
     ASSERT_EQ(0, ext_test_fadvise_without_page_cache());
+}
+
+TEST(FuseExtended, MountRamfsOnFuseDirectoryUsesNamespacePath) {
+    ASSERT_EQ(0, ext_test_mount_on_fuse_dir_uses_namespace_path());
+}
+
+TEST(FuseExtended, RenameUpdatesFuseDirectoryCwdPath) {
+    ASSERT_EQ(0, ext_test_rename_updates_fuse_dir_cwd_path());
+}
+
+TEST(FuseExtended, ReaddirplusGenerationMismatchStalesOldNode) {
+    ASSERT_EQ(0, ext_test_readdirplus_generation_mismatch_stales_old_node());
+}
+
+TEST(FuseExtended, CreateGenerationMismatchStalesOldNode) {
+    ASSERT_EQ(0, ext_test_create_generation_mismatch_stales_old_node());
+}
+
+TEST(FuseExtended, LinkGenerationMismatchStalesOldNode) {
+    ASSERT_EQ(0, ext_test_link_generation_mismatch_stales_old_node());
+}
+
+TEST(FuseExtended, RenameReplaceClearsOldTargetPath) {
+    ASSERT_EQ(0, ext_test_rename_replace_clears_old_target_path());
 }
 
 TEST(FuseExtended, NoOpenFsyncUsesZeroFh) {

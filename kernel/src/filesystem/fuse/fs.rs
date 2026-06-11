@@ -176,7 +176,6 @@ impl FuseFS {
                     let old_gen = n.generation();
                     if old_gen != 0 && old_gen != gen {
                         n.mark_stale();
-                        n.flush_forget();
                         nodes.remove(&nodeid);
                     } else {
                         n.set_generation(gen);
@@ -188,6 +187,81 @@ impl FuseFS {
                     }
                 } else {
                     n.set_parent_nodeid(parent_nodeid);
+                    if let Some(md) = cached {
+                        n.set_cached_metadata(md);
+                    }
+                    return n;
+                }
+            }
+        }
+
+        let n = FuseNode::new(
+            Arc::downgrade(self),
+            self.conn.clone(),
+            nodeid,
+            parent_nodeid,
+            cached,
+        );
+        if let Some(gen) = generation {
+            n.set_generation(gen);
+        }
+        nodes.insert(nodeid, Arc::downgrade(&n));
+        n
+    }
+
+    pub(crate) fn find_cached_child(
+        self: &Arc<Self>,
+        parent_nodeid: u64,
+        name: &str,
+    ) -> Option<Arc<FuseNode>> {
+        let mut stale = Vec::new();
+        let nodes = self.nodes.lock();
+        for (nodeid, weak) in nodes.iter() {
+            let Some(node) = weak.upgrade() else {
+                stale.push(*nodeid);
+                continue;
+            };
+            if node.parent_fuse_nodeid() == parent_nodeid && node.has_dname(name) {
+                return Some(node);
+            }
+        }
+        drop(nodes);
+        if !stale.is_empty() {
+            let mut nodes = self.nodes.lock();
+            for nodeid in stale {
+                nodes.remove(&nodeid);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn get_or_create_node_for_link(
+        self: &Arc<Self>,
+        nodeid: u64,
+        parent_nodeid: u64,
+        cached: Option<Metadata>,
+        generation: Option<u64>,
+    ) -> Arc<FuseNode> {
+        if nodeid == self.root.nodeid() {
+            return self.root.clone();
+        }
+
+        let mut nodes = self.nodes.lock();
+        if let Some(w) = nodes.get(&nodeid) {
+            if let Some(n) = w.upgrade() {
+                if let Some(gen) = generation {
+                    let old_gen = n.generation();
+                    if old_gen != 0 && old_gen != gen {
+                        n.mark_stale();
+                        nodes.remove(&nodeid);
+                    } else {
+                        n.set_generation(gen);
+                        if let Some(md) = cached {
+                            n.set_cached_metadata(md);
+                        }
+                        return n;
+                    }
+                } else {
                     if let Some(md) = cached {
                         n.set_cached_metadata(md);
                     }
@@ -258,6 +332,7 @@ impl FuseFS {
 pub fn fuse_try_automount_submount(
     fuse_node: &Arc<FuseNode>,
     mountpoint: &Arc<crate::filesystem::vfs::mount::MountFSInode>,
+    mount_path_override: Option<Arc<crate::filesystem::vfs::mount::MountPath>>,
 ) -> Result<(), SystemError> {
     use crate::filesystem::vfs::mount::{MountFlags, MountPath};
 
@@ -285,7 +360,16 @@ pub fn fuse_try_automount_submount(
         fuse_node.parent_fuse_nodeid(),
         md,
     );
-    let mount_path = Arc::new(MountPath::from(mountpoint.absolute_path()?));
+    let mount_path = match mount_path_override {
+        Some(path) => path,
+        None => {
+            let path = mountpoint.absolute_path()?;
+            if !path.starts_with('/') {
+                return Err(SystemError::EINVAL);
+            }
+            Arc::new(MountPath::from(path))
+        }
+    };
     let submount_flags = mountpoint.mount_fs().mount_flags() | MountFlags::SUBMOUNT;
     let mount_res = mountpoint.mount_subtree_with_state(
         sub_fs.clone(),

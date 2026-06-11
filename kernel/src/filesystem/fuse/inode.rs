@@ -227,6 +227,36 @@ impl FuseNode {
         Ok(())
     }
 
+    fn note_short_read_eof(
+        &self,
+        page_index: usize,
+        read_len: usize,
+        observed_size: usize,
+        truncate_cache: bool,
+    ) -> Result<usize, SystemError> {
+        let eof = page_index
+            .checked_mul(MMArch::PAGE_SIZE)
+            .and_then(|start| start.checked_add(read_len))
+            .ok_or(SystemError::EOVERFLOW)?;
+        let mut should_truncate = false;
+        {
+            let mut guard = self.cached_metadata.lock();
+            if let Some(md) = guard.as_mut() {
+                let current_size = md.size.max(0) as usize;
+                if current_size == observed_size && eof < current_size {
+                    md.size = eof as i64;
+                    self.cached_metadata_deadline_ns
+                        .store(u64::MAX, Ordering::Relaxed);
+                    should_truncate = true;
+                }
+            }
+        }
+        if should_truncate && truncate_cache {
+            self.truncate_page_cache(eof)?;
+        }
+        Ok(eof)
+    }
+
     pub(crate) fn fuse_fs(&self) -> Option<Arc<FuseFS>> {
         self.fs.upgrade()
     }
@@ -787,11 +817,33 @@ impl FuseNode {
                 continue;
             }
 
+            let mut filled_len = None;
             let page = page_cache
                 .manager()
                 .commit_page_with(page_index, |idx, dst| {
-                    self.read_page_with_open(idx, dst, fh, file_flags)
+                    let read_len = self.read_page_with_open(idx, dst, fh, file_flags)?;
+                    filled_len = Some(read_len);
+                    Ok(read_len)
                 })?;
+
+            let mut copy_end = copy_end;
+            if let Some(read_len) = filled_len {
+                if read_len < MMArch::PAGE_SIZE {
+                    let eof = self.note_short_read_eof(page_index, read_len, file_size, true)?;
+                    copy_end = core::cmp::min(copy_end, eof);
+                }
+            }
+
+            let current_size = self
+                .cached_metadata_snapshot()
+                .map(|md| md.size.max(0) as usize)
+                .unwrap_or(file_size);
+            copy_end = core::cmp::min(copy_end, current_size);
+            if copy_start >= copy_end {
+                break;
+            }
+
+            let copy_len = copy_end.saturating_sub(copy_start);
             let page_guard = page.read();
             let page_offset = copy_start - page_start;
             unsafe {
@@ -799,6 +851,12 @@ impl FuseNode {
                     .copy_from_slice(&page_guard.as_slice()[page_offset..page_offset + copy_len]);
             }
             dst_offset += copy_len;
+
+            if filled_len.is_some_and(|read_len| read_len < MMArch::PAGE_SIZE)
+                || current_size <= page_end
+            {
+                break;
+            }
         }
 
         Ok(dst_offset)
@@ -816,11 +874,34 @@ impl FuseNode {
             return Err(SystemError::EINVAL);
         }
         let page_cache = self.ensure_page_cache()?;
-        page_cache
+        let mut filled_len = None;
+        let page = page_cache
             .manager()
             .commit_page_with(page_index, |idx, dst| {
-                self.read_page_with_open(idx, dst, fh, file_flags)
-            })
+                let read_len = self.read_page_with_open(idx, dst, fh, file_flags)?;
+                filled_len = Some(read_len);
+                Ok(read_len)
+            })?;
+        if let Some(read_len) = filled_len {
+            if read_len < MMArch::PAGE_SIZE {
+                let eof = self.note_short_read_eof(page_index, read_len, file_size, false)?;
+                if page_index.saturating_mul(MMArch::PAGE_SIZE) >= eof {
+                    drop(page);
+                    page_cache.manager().discard_clean_page(page_index)?;
+                    return Err(SystemError::EINVAL);
+                }
+            }
+        }
+        let current_size = self
+            .cached_metadata_snapshot()
+            .map(|md| md.size.max(0) as usize)
+            .unwrap_or(file_size);
+        if page_index.saturating_mul(MMArch::PAGE_SIZE) >= current_size {
+            drop(page);
+            page_cache.manager().discard_clean_page(page_index)?;
+            return Err(SystemError::EINVAL);
+        }
+        Ok(page)
     }
 
     fn update_cached_pages_after_write(&self, offset: usize, data: &[u8]) {

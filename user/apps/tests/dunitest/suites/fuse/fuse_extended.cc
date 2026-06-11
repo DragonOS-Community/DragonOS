@@ -1692,6 +1692,115 @@ fail:
     return -1;
 }
 
+static int ext_test_cached_short_read_updates_eof() {
+    const char *mp = "/tmp/test_fuse_cached_short_read";
+    char path[256];
+    char buf[32];
+    int f = -1;
+    ssize_t n = -1;
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t read_count = 0;
+    volatile uint64_t read_offsets[4] = {0};
+    volatile uint32_t read_sizes[4] = {0};
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.read_count = &read_count;
+    args.read_offsets = read_offsets;
+    args.read_sizes = read_sizes;
+    args.read_trace_capacity = 4;
+    args.hello_data_size_override = 8192;
+    args.hello_read_size_override = 5;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0,max_read=4096",
+             fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    f = open(path, O_RDONLY);
+    if (f < 0) {
+        printf("[FAIL] open(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+
+    memset(buf, 0x7f, sizeof(buf));
+    n = pread(f, buf, sizeof(buf), 0);
+    if (n != 5 || memcmp(buf, "ABCDE", 5) != 0) {
+        printf("[FAIL] short cached pread got=%zd data='%.*s' read=%u errno=%d\n", n, 5, buf,
+               read_count, errno);
+        goto fail;
+    }
+    memset(buf, 0x7f, sizeof(buf));
+    n = pread(f, buf, sizeof(buf), 5);
+    if (n != 0) {
+        printf("[FAIL] EOF cached pread got=%zd read=%u errno=%d\n", n, read_count, errno);
+        goto fail;
+    }
+
+    if (read_count != 1 || read_offsets[0] != 0 || read_sizes[0] != 4096) {
+        printf("[FAIL] short read trace count=%u off0=%llu size0=%u\n", read_count,
+               (unsigned long long)read_offsets[0], read_sizes[0]);
+        goto fail;
+    }
+
+    close(f);
+    f = -1;
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (f >= 0) {
+        close(f);
+    }
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
 static int ext_test_cached_read_sees_write_through_update() {
     const char *mp = "/tmp/test_fuse_cached_read_write";
     char path[256];
@@ -3818,6 +3927,10 @@ TEST(FuseExtended, LargeReadSplitsOverMaxWrite) {
 
 TEST(FuseExtended, CachedReadUsesOpenFhWithoutExtraOpen) {
     ASSERT_EQ(0, ext_test_cached_read_uses_open_fh_without_extra_open());
+}
+
+TEST(FuseExtended, CachedShortReadUpdatesEof) {
+    ASSERT_EQ(0, ext_test_cached_short_read_updates_eof());
 }
 
 TEST(FuseExtended, CachedReadSeesWriteThroughUpdate) {

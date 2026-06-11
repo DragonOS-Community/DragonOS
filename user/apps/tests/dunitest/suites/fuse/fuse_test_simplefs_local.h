@@ -694,6 +694,7 @@ struct fuse_daemon_args {
     int force_opendir_enosys;
     int block_read_until_interrupt;
     size_t hello_data_size_override;
+    size_t hello_read_size_override;
     struct simplefs fs;
 };
 
@@ -965,14 +966,19 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
                 a->read_sizes[read_index] = in->size;
             }
         }
-        if (in->offset >= node->size) {
+        size_t effective_size = node->size;
+        if (h->nodeid == 2 && a->hello_read_size_override > 0
+            && a->hello_read_size_override < effective_size) {
+            effective_size = a->hello_read_size_override;
+        }
+        if (in->offset >= effective_size) {
             return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
         }
         if (h->nodeid == 2 && a->dynamic_hello_first_byte && *a->dynamic_hello_first_byte != 0
             && node->size > 0) {
             node->data[0] = *a->dynamic_hello_first_byte;
         }
-        size_t remain = node->size - (size_t)in->offset;
+        size_t remain = effective_size - (size_t)in->offset;
         size_t to_copy = in->size;
         if (to_copy > remain) {
             to_copy = remain;

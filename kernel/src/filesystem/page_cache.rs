@@ -612,6 +612,24 @@ impl PageCacheManager {
         Ok(self.upgrade()?.lock().evict_clean_pages())
     }
 
+    pub(crate) fn discard_clean_page(&self, page_index: usize) -> Result<(), SystemError> {
+        let cache = self.upgrade()?;
+        let removed = {
+            let mut guard = cache.lock();
+            let Some(entry) = guard.get_entry(page_index) else {
+                return Ok(());
+            };
+            if entry.state() != PageState::UpToDate {
+                return Ok(());
+            }
+            guard.remove_page(page_index)
+        };
+        if let Some(page) = removed {
+            cache.discard_unlinked_page(&page);
+        }
+        Ok(())
+    }
+
     pub fn pages_count(&self) -> Result<usize, SystemError> {
         Ok(self.upgrade()?.lock().pages_count())
     }

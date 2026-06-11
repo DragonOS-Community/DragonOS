@@ -81,6 +81,22 @@ pub fn run_test(spec: &TestSpec, results_dir: &Path, verbose: bool) -> Result<Ca
             };
             return Ok(result);
         }
+        GtestPrecheck::CleanupFailed(msg) => {
+            writeln!(precheck_log, "{}", msg).with_context(|| "写入日志失败")?;
+            let result = CaseResult {
+                name: spec.name.clone(),
+                status: CaseStatus::Failed,
+                duration_ms: precheck_start.elapsed().as_millis(),
+                exit_code: None,
+                message: msg,
+                log_file: log_path.display().to_string(),
+                gtest_total: 0,
+                gtest_passed: 0,
+                gtest_failed: 0,
+                gtest_skipped: 0,
+            };
+            return Ok(result);
+        }
     }
     drop(precheck_log);
 
@@ -332,6 +348,7 @@ enum GtestPrecheck {
     Valid,
     Invalid(String),
     Timeout(String),
+    CleanupFailed(String),
 }
 
 fn validate_gtest_binary(spec: &TestSpec) -> Result<GtestPrecheck> {
@@ -379,9 +396,28 @@ fn validate_gtest_binary(spec: &TestSpec) -> Result<GtestPrecheck> {
         thread::sleep(Duration::from_millis(20));
     };
 
-    terminate_case_process_group(child.id())?;
-    let stdout = join_pipe_collector_bounded(stdout_thread, PIPE_JOIN_TIMEOUT)?;
-    let stderr = join_pipe_collector_bounded(stderr_thread, PIPE_JOIN_TIMEOUT)?;
+    let cleanup_result = terminate_case_process_group(child.id());
+    let stdout_result = join_pipe_collector_bounded(stdout_thread, PIPE_JOIN_TIMEOUT);
+    let stderr_result = join_pipe_collector_bounded(stderr_thread, PIPE_JOIN_TIMEOUT);
+
+    let mut cleanup_message = String::new();
+    if let Err(e) = cleanup_result {
+        cleanup_message.push_str(&format!("; 进程组清理失败: {e:#}"));
+    }
+    if let Err(e) = stdout_result.as_ref() {
+        cleanup_message.push_str(&format!("; stdout 收集失败: {e:#}"));
+    }
+    if let Err(e) = stderr_result.as_ref() {
+        cleanup_message.push_str(&format!("; stderr 收集失败: {e:#}"));
+    }
+    if !cleanup_message.is_empty() {
+        return Ok(GtestPrecheck::CleanupFailed(format!(
+            "gtest 预检查清理失败{cleanup_message}"
+        )));
+    }
+
+    let stdout = stdout_result.expect("stdout precheck result checked above");
+    let stderr = stderr_result.expect("stderr precheck result checked above");
     let stdout = String::from_utf8_lossy(&stdout);
     let stderr = String::from_utf8_lossy(&stderr);
     let merged = format!("{}\n{}", stdout, stderr);

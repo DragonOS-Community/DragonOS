@@ -3,7 +3,6 @@ use crate::arch::syscall::nr::SYS_CLONE;
 use crate::mm::{access_ok, VirtAddr};
 use crate::process::fork::{CloneFlags, KernelCloneArgs};
 use crate::process::syscall::clone_utils::do_clone;
-use crate::process::Signal;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use alloc::vec::Vec;
 use system_error::SystemError;
@@ -60,7 +59,7 @@ impl Syscall for SysClone {
 
         // 旧版 clone() 系统调用中，flags 的低 8 位用于指定 exit_signal
         let exit_signal_num = (args[0] & 0xFF) as i32;
-        clone_args.exit_signal = Signal::from(exit_signal_num);
+        clone_args.exit_signal = exit_signal_num;
 
         do_clone(clone_args, frame)
     }

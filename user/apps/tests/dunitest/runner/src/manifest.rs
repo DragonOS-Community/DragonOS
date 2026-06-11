@@ -97,8 +97,8 @@ fn normalize_case_name(relative_path: &str) -> String {
 fn is_executable(path: &Path) -> Result<bool> {
     #[cfg(unix)]
     {
-        let metadata = fs::metadata(path)
-            .with_context(|| format!("读取文件属性失败: {}", path.display()))?;
+        let metadata =
+            fs::metadata(path).with_context(|| format!("读取文件属性失败: {}", path.display()))?;
         Ok(metadata.permissions().mode() & 0o111 != 0)
     }
     #[cfg(not(unix))]

@@ -129,6 +129,14 @@ impl TlbState {
     }
 }
 
+/// Return this CPU's hardware-loaded mm tracked by the lazy TLB state.
+///
+/// Context switch uses this when the previous task has already dropped its
+/// user-visible mm but the CPU is still running on an active mm.
+pub fn tlb_state_loaded_mm() -> Option<Arc<AddressSpace>> {
+    tlb_state_local_mut().loaded_mm()
+}
+
 /// Per-CPU CSD (Call Single Data) for synchronous ack during TLB shootdown.
 ///
 /// Currently only serves FlushTLB; not abstracted into a generic `smp_call_function`.

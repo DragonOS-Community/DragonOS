@@ -188,6 +188,12 @@ impl Softirq {
         }
         // 创建一个RunningCountGuard，当退出作用域时，会自动将cpu_running_count减1
         let _count_guard = RunningCountGuard::new(self.cpu_running_count());
+        // Match Linux softirq context accounting: softirq handlers run with a
+        // non-zero preempt count even though local IRQs may be enabled below.
+        // This prevents a timer IRQ nested inside task-context softirq handling
+        // from scheduling away before the softirq handler returns.
+        ProcessManager::preempt_disable();
+        let _preempt_guard = SoftirqPreemptGuard;
 
         // TODO pcb的flags未修改
         let end = clock() + 500 * 2;
@@ -282,6 +288,14 @@ impl<'a> RunningCountGuard<'a> {
 impl Drop for RunningCountGuard<'_> {
     fn drop(&mut self) {
         self.cpu_running_count.get().fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+struct SoftirqPreemptGuard;
+
+impl Drop for SoftirqPreemptGuard {
+    fn drop(&mut self) {
+        ProcessManager::preempt_enable();
     }
 }
 

@@ -11,6 +11,7 @@ use crate::exception::ebreak::EBreak;
 use crate::{
     arch::syscall::syscall_handler,
     driver::{clocksource::timer_riscv::RiscVSbiTimer, irqchip::riscv_intc::riscv_intc_irq},
+    exception::softirq::do_softirq,
     process::{utils::current_pcb_flags, ProcessFlags, ProcessManager},
     sched::{SchedMode, SchedPolicy, __schedule},
 };
@@ -41,13 +42,18 @@ unsafe extern "C" fn riscv64_do_irq(trap_frame: &mut TrapFrame) {
     if trap_frame.cause.is_interrupt() {
         crate::rcu::irq_enter();
         riscv64_do_interrupt(trap_frame);
+        let irq_outermost = crate::rcu::irq_is_outermost();
+        if irq_outermost {
+            do_softirq();
+        }
+
         let should_schedule = current_pcb_flags().contains(ProcessFlags::NEED_SCHEDULE)
             || trap_frame.cause.code() as u32 == RiscVSbiTimer::TIMER_IRQ.data();
         let resume_idle_eqs = !should_schedule
             && ProcessManager::current_pcb().sched_info().policy() == SchedPolicy::IDLE;
-        crate::rcu::irq_exit(resume_idle_eqs);
+        let irq_exited_outermost = crate::rcu::irq_exit(resume_idle_eqs);
 
-        if should_schedule {
+        if should_schedule && irq_exited_outermost {
             __schedule(SchedMode::SM_PREEMPT);
         }
     } else if trap_frame.cause.is_exception() {

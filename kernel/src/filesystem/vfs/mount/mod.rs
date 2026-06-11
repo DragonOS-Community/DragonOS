@@ -1804,6 +1804,10 @@ impl FileSystem for MountFS {
         self.inner_filesystem.fault(pfm)
     }
 
+    unsafe fn page_mkwrite(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
+        self.inner_filesystem.page_mkwrite(pfm)
+    }
+
     fn mprotect(&self, old_vm_flags: VmFlags, new_vm_flags: VmFlags) -> Result<(), SystemError> {
         self.inner_filesystem.mprotect(old_vm_flags, new_vm_flags)
     }

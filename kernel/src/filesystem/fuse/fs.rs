@@ -599,6 +599,10 @@ impl FileSystem for FuseFS {
         }
     }
 
+    unsafe fn page_mkwrite(&self, _pfm: &mut PageFaultMessage) -> VmFaultReason {
+        VmFaultReason::VM_FAULT_SIGBUS
+    }
+
     fn mprotect(&self, _old_vm_flags: VmFlags, new_vm_flags: VmFlags) -> Result<(), SystemError> {
         if new_vm_flags.contains(VmFlags::VM_SHARED | VmFlags::VM_WRITE) {
             return Err(SystemError::EACCES);

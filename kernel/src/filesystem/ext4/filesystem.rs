@@ -104,6 +104,10 @@ impl FileSystem for Ext4FileSystem {
         PageFaultHandler::filemap_fault(pfm)
     }
 
+    unsafe fn page_mkwrite(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
+        PageFaultHandler::filemap_page_mkwrite(pfm)
+    }
+
     unsafe fn map_pages(
         &self,
         pfm: &mut PageFaultMessage,

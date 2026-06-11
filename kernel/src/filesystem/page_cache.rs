@@ -628,6 +628,62 @@ impl PageCacheManager {
         Ok(())
     }
 
+    pub fn prepare_page_mkwrite(
+        &self,
+        page_index: usize,
+        page: &Arc<Page>,
+    ) -> Result<(), SystemError> {
+        let cache = self.upgrade()?;
+
+        loop {
+            let entry = {
+                let inner = cache.inner.lock();
+                let Some(entry) = inner.get_entry(page_index) else {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                };
+                if !Arc::ptr_eq(&entry.page, page) {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
+                entry
+            };
+
+            match entry.state() {
+                PageState::Loading => {
+                    let _ = entry.wait_ready()?;
+                    continue;
+                }
+                PageState::Writeback => {
+                    Self::wait_writeback_entry(entry)?;
+                    continue;
+                }
+                PageState::Error => return Err(SystemError::EIO),
+                PageState::UpToDate | PageState::Dirty => {}
+            }
+
+            page.write().add_flags(PageFlags::PG_DIRTY);
+
+            let mut inner = cache.inner.lock();
+            let Some(current) = inner.get_entry(page_index) else {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            };
+            if !Arc::ptr_eq(&current, &entry) || !Arc::ptr_eq(&current.page, page) {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+
+            match current.state() {
+                PageState::Loading | PageState::Writeback => continue,
+                PageState::Error => return Err(SystemError::EIO),
+                PageState::UpToDate | PageState::Dirty => {
+                    let old_state = current.state();
+                    inner.dirty_pages.insert(page_index);
+                    cache.account_state_transition(old_state, PageState::Dirty);
+                    current.set_state(PageState::Dirty);
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     pub fn start_writeback_range(
         &self,
         start_index: usize,

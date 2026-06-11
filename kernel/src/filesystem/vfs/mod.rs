@@ -1533,6 +1533,15 @@ pub trait FileSystem: Any + Sync + Send + Debug {
         VmFaultReason::VM_FAULT_SIGBUS
     }
 
+    /// Called before a shared writable file mapping is made writable and dirty.
+    ///
+    /// Filesystems that need writeback handles, size validation, or remote
+    /// permission checks should override this hook. Returning an error fault
+    /// keeps the PTE read-only and prevents the page from being marked dirty.
+    unsafe fn page_mkwrite(&self, _pfm: &mut PageFaultMessage) -> VmFaultReason {
+        VmFaultReason::VM_FAULT_SIGBUS
+    }
+
     fn mprotect(&self, _old_vm_flags: VmFlags, _new_vm_flags: VmFlags) -> Result<(), SystemError> {
         Ok(())
     }

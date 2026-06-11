@@ -95,6 +95,13 @@ impl FileSystem for DevFS {
         PageFaultHandler::zero_fault(pfm)
     }
 
+    unsafe fn page_mkwrite(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
+        if !is_zero_inode(pfm) {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        }
+        VmFaultReason::empty()
+    }
+
     unsafe fn map_pages(
         &self,
         pfm: &mut PageFaultMessage,

@@ -283,6 +283,13 @@ impl FileSystem for Tmpfs {
         PageFaultHandler::pagecache_fault_zero(pfm)
     }
 
+    unsafe fn page_mkwrite(
+        &self,
+        pfm: &mut crate::mm::fault::PageFaultMessage,
+    ) -> crate::mm::VmFaultReason {
+        PageFaultHandler::filemap_page_mkwrite(pfm)
+    }
+
     unsafe fn map_pages(
         &self,
         pfm: &mut crate::mm::fault::PageFaultMessage,

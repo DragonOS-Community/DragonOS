@@ -1938,6 +1938,280 @@ fail:
     return -1;
 }
 
+static int ext_test_direct_io_read_bypasses_page_cache() {
+    const char *mp = "/tmp/test_fuse_direct_read";
+    char path[256];
+    char buf[32];
+    int f = -1;
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t open_count = 0;
+    volatile uint32_t read_count = 0;
+    volatile uint64_t read_fhs[4] = {0};
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.open_count = &open_count;
+    args.read_count = &read_count;
+    args.read_fhs = read_fhs;
+    args.read_trace_capacity = 4;
+    args.next_open_fh = 700;
+    args.hello_open_out_flags = FOPEN_DIRECT_IO;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0,max_read=4096",
+             fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    f = open(path, O_RDONLY);
+    if (f < 0) {
+        printf("[FAIL] open(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+    memset(buf, 0, sizeof(buf));
+    if (pread(f, buf, 5, 0) != 5 || memcmp(buf, "hello", 5) != 0) {
+        printf("[FAIL] first direct pread got='%.*s' read=%u errno=%d\n", 5, buf, read_count,
+               errno);
+        goto fail;
+    }
+    memset(buf, 0, sizeof(buf));
+    if (pread(f, buf, 5, 0) != 5 || memcmp(buf, "hello", 5) != 0) {
+        printf("[FAIL] second direct pread got='%.*s' read=%u errno=%d\n", 5, buf, read_count,
+               errno);
+        goto fail;
+    }
+    close(f);
+    f = -1;
+
+    if (open_count != 1 || read_count != 2 || read_fhs[0] != 700 || read_fhs[1] != 700) {
+        printf("[FAIL] direct read counters open=%u read=%u fh0=%llu fh1=%llu\n", open_count,
+               read_count, (unsigned long long)read_fhs[0], (unsigned long long)read_fhs[1]);
+        goto fail;
+    }
+
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (f >= 0) {
+        close(f);
+    }
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_direct_io_mmap_policy() {
+    const char *mp = "/tmp/test_fuse_direct_mmap";
+    char path[256];
+    int f = -1;
+    void *addr = MAP_FAILED;
+    volatile char c = 0;
+    char warm = 0;
+    pid_t child = -1;
+    struct direct_mmap_shared_state {
+        volatile int stop;
+        volatile int init_done;
+        volatile uint32_t open_out_flags;
+        volatile unsigned char first_byte;
+        volatile uint32_t open_count;
+        volatile uint32_t read_count;
+        volatile uint64_t read_fhs[4];
+    };
+    struct direct_mmap_shared_state *shared =
+        (struct direct_mmap_shared_state *)mmap(NULL, sizeof(*shared), PROT_READ | PROT_WRITE,
+                                                MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shared == MAP_FAILED) {
+        printf("[FAIL] mmap(shared counters): %s (errno=%d)\n", strerror(errno), errno);
+        return -1;
+    }
+    memset(shared, 0, sizeof(*shared));
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        munmap(shared, sizeof(*shared));
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        munmap(shared, sizeof(*shared));
+        rmdir(mp);
+        return -1;
+    }
+
+    child = fork();
+    if (child < 0) {
+        printf("[FAIL] fork fuse daemon: %s (errno=%d)\n", strerror(errno), errno);
+        close(fd);
+        munmap(shared, sizeof(*shared));
+        rmdir(mp);
+        return -1;
+    }
+    if (child == 0) {
+        struct fuse_daemon_args child_args;
+        memset(&child_args, 0, sizeof(child_args));
+        child_args.fd = fd;
+        child_args.stop = &shared->stop;
+        child_args.init_done = &shared->init_done;
+        child_args.stop_on_destroy = 1;
+        child_args.open_count = &shared->open_count;
+        child_args.read_count = &shared->read_count;
+        child_args.read_fhs = shared->read_fhs;
+        child_args.read_trace_capacity = 4;
+        child_args.next_open_fh = 800;
+        child_args.dynamic_hello_open_out_flags = &shared->open_out_flags;
+        child_args.dynamic_hello_first_byte = &shared->first_byte;
+        fuse_daemon_thread(&child_args);
+        _exit(0);
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0,max_read=4096",
+             fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        shared->stop = 1;
+        close(fd);
+        kill(child, SIGTERM);
+        waitpid(child, NULL, 0);
+        munmap(shared, sizeof(*shared));
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&shared->init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    f = open(path, O_RDONLY);
+    if (f < 0) {
+        printf("[FAIL] open(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+    if (pread(f, &warm, 1, 0) != 1 || warm != 'h') {
+        printf("[FAIL] warm cached read got=%d read=%u errno=%d\n", warm, shared->read_count,
+               errno);
+        goto fail;
+    }
+    close(f);
+    f = -1;
+
+    shared->open_out_flags = FOPEN_DIRECT_IO;
+    shared->first_byte = 'Z';
+
+    f = open(path, O_RDONLY);
+    if (f < 0) {
+        printf("[FAIL] direct open(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+
+    errno = 0;
+    addr = mmap(NULL, 4096, PROT_READ, MAP_SHARED, f, 0);
+    if (addr != MAP_FAILED) {
+        printf("[FAIL] direct_io MAP_SHARED unexpectedly succeeded\n");
+        munmap(addr, 4096);
+        addr = MAP_FAILED;
+        goto fail;
+    }
+    if (errno != ENODEV) {
+        printf("[FAIL] direct_io MAP_SHARED errno=%d expected=%d\n", errno, ENODEV);
+        goto fail;
+    }
+
+    addr = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, f, 0);
+    if (addr == MAP_FAILED) {
+        printf("[FAIL] direct_io MAP_PRIVATE mmap: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    c = ((volatile char *)addr)[0];
+    if (c != 'Z') {
+        printf("[FAIL] direct_io MAP_PRIVATE first byte got=%d\n", c);
+        goto fail;
+    }
+    if (shared->open_count != 2 || shared->read_count != 2 || shared->read_fhs[1] != 801) {
+        printf("[FAIL] direct mmap counters open=%u read=%u fh0=%llu fh1=%llu\n",
+               shared->open_count, shared->read_count, (unsigned long long)shared->read_fhs[0],
+               (unsigned long long)shared->read_fhs[1]);
+        goto fail;
+    }
+
+    munmap(addr, 4096);
+    addr = MAP_FAILED;
+    close(f);
+    f = -1;
+    umount(mp);
+    shared->stop = 1;
+    close(fd);
+    waitpid(child, NULL, 0);
+    munmap(shared, sizeof(*shared));
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (addr != MAP_FAILED) {
+        munmap(addr, 4096);
+    }
+    if (f >= 0) {
+        close(f);
+    }
+    umount(mp);
+    shared->stop = 1;
+    close(fd);
+    if (child > 0) {
+        kill(child, SIGTERM);
+        waitpid(child, NULL, 0);
+    }
+    munmap(shared, sizeof(*shared));
+    rmdir(mp);
+    return -1;
+}
+
 static int ext_test_shared_writable_mmap_fault_sigbus() {
     const char *mp = "/tmp/test_fuse_mmap_shared_write";
     char path[256];
@@ -3552,6 +3826,14 @@ TEST(FuseExtended, CachedReadSeesWriteThroughUpdate) {
 
 TEST(FuseExtended, MmapFaultUsesOpenFhWithoutExtraOpen) {
     ASSERT_EQ(0, ext_test_mmap_fault_uses_open_fh_without_extra_open());
+}
+
+TEST(FuseExtended, DirectIoReadBypassesPageCache) {
+    ASSERT_EQ(0, ext_test_direct_io_read_bypasses_page_cache());
+}
+
+TEST(FuseExtended, DirectIoMmapPolicy) {
+    ASSERT_EQ(0, ext_test_direct_io_mmap_policy());
 }
 
 TEST(FuseExtended, SharedWritableMmapFaultSigbus) {

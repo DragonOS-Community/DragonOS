@@ -208,10 +208,16 @@ impl FuseNode {
         self.page_cache.lock().clone()
     }
 
-    fn invalidate_clean_page_cache(&self) {
+    fn cached_metadata_snapshot(&self) -> Option<Metadata> {
+        self.cached_metadata.lock().clone()
+    }
+
+    fn invalidate_clean_page_cache(&self) -> Result<(), SystemError> {
         if let Some(cache) = self.cached_page_cache() {
+            cache.unmap_mapping_pages(0, None)?;
             let _ = cache.manager().invalidate_all_clean();
         }
+        Ok(())
     }
 
     fn truncate_page_cache(&self, new_size: usize) -> Result<(), SystemError> {
@@ -503,7 +509,7 @@ impl FuseNode {
                 md.size = 0;
             }
         } else if (fopen_flags & FOPEN_KEEP_CACHE) == 0 {
-            self.invalidate_clean_page_cache();
+            self.invalidate_clean_page_cache()?;
         }
 
         Ok(())
@@ -804,7 +810,7 @@ impl FuseNode {
         fh: u64,
         file_flags: u32,
     ) -> Result<Arc<crate::mm::page::Page>, SystemError> {
-        let md = self.cached_or_fetch_metadata()?;
+        let md = self.cached_metadata_snapshot().ok_or(SystemError::EIO)?;
         let file_size = md.size.max(0) as usize;
         if file_size == 0 || page_index.saturating_mul(MMArch::PAGE_SIZE) >= file_size {
             return Err(SystemError::EINVAL);
@@ -886,6 +892,69 @@ impl IndexNode for FuseNode {
         let _ = (start, len, offset);
         self.check_not_stale()?;
         self.ensure_regular()?;
+        self.ensure_page_cache()?;
+        Ok(())
+    }
+
+    fn check_mmap_file(
+        &self,
+        file: &Arc<crate::filesystem::vfs::file::File>,
+        len: usize,
+        offset: usize,
+        vm_flags: crate::mm::VmFlags,
+    ) -> Result<(), SystemError> {
+        let _ = (len, offset);
+        self.check_not_stale()?;
+        if file.file_type() != FileType::File {
+            return Err(SystemError::EINVAL);
+        }
+
+        let fopen_flags = {
+            let data = file.private_data.lock();
+            let FilePrivateData::Fuse(FuseFilePrivateData::File(p)) = &*data else {
+                return Err(SystemError::EINVAL);
+            };
+            p.fopen_flags
+        };
+
+        if (fopen_flags & FOPEN_DIRECT_IO) != 0
+            && vm_flags.contains(crate::mm::VmFlags::VM_MAYSHARE)
+        {
+            return Err(SystemError::ENODEV);
+        }
+
+        Ok(())
+    }
+
+    fn mmap_file(
+        &self,
+        file: &Arc<crate::filesystem::vfs::file::File>,
+        start: usize,
+        len: usize,
+        offset: usize,
+        vm_flags: crate::mm::VmFlags,
+    ) -> Result<(), SystemError> {
+        let _ = (start, len, offset);
+        self.check_not_stale()?;
+        if file.file_type() != FileType::File {
+            return Err(SystemError::EINVAL);
+        }
+
+        let fopen_flags = {
+            let data = file.private_data.lock();
+            let FilePrivateData::Fuse(FuseFilePrivateData::File(p)) = &*data else {
+                return Err(SystemError::EINVAL);
+            };
+            p.fopen_flags
+        };
+
+        if (fopen_flags & FOPEN_DIRECT_IO) != 0 {
+            if vm_flags.contains(crate::mm::VmFlags::VM_MAYSHARE) {
+                return Err(SystemError::ENODEV);
+            }
+            self.invalidate_clean_page_cache()?;
+        }
+
         self.ensure_page_cache()?;
         Ok(())
     }

@@ -1291,6 +1291,29 @@ impl IndexNode for MountFSInode {
         return self.inner_inode.mmap(start, len, offset);
     }
 
+    fn check_mmap_file(
+        &self,
+        file: &Arc<super::file::File>,
+        len: usize,
+        offset: usize,
+        vm_flags: VmFlags,
+    ) -> Result<(), SystemError> {
+        self.inner_inode
+            .check_mmap_file(file, len, offset, vm_flags)
+    }
+
+    fn mmap_file(
+        &self,
+        file: &Arc<super::file::File>,
+        start: usize,
+        len: usize,
+        offset: usize,
+        vm_flags: VmFlags,
+    ) -> Result<(), SystemError> {
+        self.inner_inode
+            .mmap_file(file, start, len, offset, vm_flags)
+    }
+
     fn truncate_before_open(&self, flags: &FileFlags) -> bool {
         self.inner_inode.truncate_before_open(flags)
     }

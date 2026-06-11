@@ -574,7 +574,7 @@ impl FileSystem for FuseFS {
             };
             (p.node.clone(), p.fh, p.open_flags, p.fopen_flags)
         };
-        if (fopen_flags & FOPEN_DIRECT_IO) != 0 {
+        if (fopen_flags & FOPEN_DIRECT_IO) != 0 && vm_flags.contains(VmFlags::VM_MAYSHARE) {
             return VmFaultReason::VM_FAULT_SIGBUS;
         }
 

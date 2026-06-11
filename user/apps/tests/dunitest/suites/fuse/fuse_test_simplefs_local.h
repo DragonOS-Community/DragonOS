@@ -184,6 +184,11 @@ static inline int fuse_test_log_enabled(void) {
 #define FUSE_FSYNC_FDATASYNC (1u << 0)
 #endif
 
+/* fuse_open_out.open_flags (subset) */
+#ifndef FOPEN_DIRECT_IO
+#define FOPEN_DIRECT_IO (1u << 0)
+#endif
+
 #ifndef FUSE_NOTIFY_INVAL_INODE
 #define FUSE_NOTIFY_INVAL_INODE 2
 #endif
@@ -636,6 +641,9 @@ struct fuse_daemon_args {
     int stop_on_destroy;
     uint32_t root_mode_override;
     uint32_t hello_mode_override;
+    uint32_t hello_open_out_flags;
+    volatile uint32_t *dynamic_hello_open_out_flags;
+    volatile unsigned char *dynamic_hello_first_byte;
     volatile uint32_t *forget_count;
     volatile uint64_t *forget_nlookup_sum;
     volatile uint32_t *destroy_count;
@@ -894,6 +902,9 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (h->opcode == FUSE_OPEN && (in->flags & O_TRUNC)) {
             node->size = 0;
         }
+        if (h->opcode == FUSE_OPEN && h->nodeid == 2 && a->dynamic_hello_open_out_flags) {
+            node->open_out_flags = *a->dynamic_hello_open_out_flags;
+        }
         struct fuse_open_out out;
         memset(&out, 0, sizeof(out));
         if (h->opcode == FUSE_OPEN && a->next_open_fh != 0) {
@@ -956,6 +967,10 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         }
         if (in->offset >= node->size) {
             return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
+        }
+        if (h->nodeid == 2 && a->dynamic_hello_first_byte && *a->dynamic_hello_first_byte != 0
+            && node->size > 0) {
+            node->data[0] = *a->dynamic_hello_first_byte;
         }
         size_t remain = node->size - (size_t)in->offset;
         size_t to_copy = in->size;
@@ -1521,6 +1536,9 @@ static inline void *fuse_daemon_thread(void *arg) {
     }
     if (a->hello_generation_override != 0) {
         a->fs.nodes[1].generation = a->hello_generation_override;
+    }
+    if (a->hello_open_out_flags != 0) {
+        a->fs.nodes[1].open_out_flags = a->hello_open_out_flags;
     }
     if (a->has_hello_open_fh_override) {
         a->fs.nodes[1].open_fh = a->hello_open_fh_override;

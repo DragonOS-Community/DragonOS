@@ -833,8 +833,7 @@ impl InnerAddressSpace {
             }
         }
 
-        let meta = file.metadata()?;
-        if matches!(meta.file_type, FileType::Pipe | FileType::Dir) {
+        if matches!(file.file_type(), FileType::Pipe | FileType::Dir) {
             return Err(SystemError::ENODEV);
         }
 
@@ -845,6 +844,15 @@ impl InnerAddressSpace {
         let pgoff = offset >> MMArch::PAGE_SHIFT;
 
         let page_count = PageFrameCount::from_bytes(len).unwrap();
+        let precheck_vm_flags = VmFlags::from(prot_flags)
+            | VmFlags::from(map_flags)
+            | self.mlock_future
+            | VmFlags::VM_MAYREAD
+            | VmFlags::VM_MAYWRITE
+            | VmFlags::VM_MAYEXEC;
+        file.inode()
+            .check_mmap_file(&file, len, offset, precheck_vm_flags)?;
+
         let start_page: VirtPageFrame = self.mmap(
             round_hint_to_min(start_vaddr),
             page_count,
@@ -878,19 +886,28 @@ impl InnerAddressSpace {
         // todo!(impl mmap for other file)
         // https://github.com/DragonOS-Community/DragonOS/pull/912#discussion_r1765334272
         // 传入实际映射后的起始虚拟地址，而非用户传入的 hint
-        match file
-            .inode()
-            .mmap(start_page.virt_address().data(), len, offset)
-        {
+        let vma = self.mappings.contains(start_page.virt_address());
+        let vm_flags = vma
+            .as_ref()
+            .map(|vma| *vma.lock().vm_flags())
+            .unwrap_or(VmFlags::empty());
+
+        match file.inode().mmap_file(
+            &file,
+            start_page.virt_address().data(),
+            len,
+            offset,
+            vm_flags,
+        ) {
             Ok(_) => {
-                if let Some(vma) = self.mappings.contains(start_page.virt_address()) {
+                if let Some(vma) = vma {
                     self.mappings.attach_vma(&vma);
                 }
                 self.post_map_population(start_page.virt_address(), len, map_flags);
                 Ok(start_page)
             }
             Err(SystemError::ENOSYS) => {
-                if let Some(vma) = self.mappings.contains(start_page.virt_address()) {
+                if let Some(vma) = vma {
                     self.mappings.attach_vma(&vma);
                 }
                 self.post_map_population(start_page.virt_address(), len, map_flags);

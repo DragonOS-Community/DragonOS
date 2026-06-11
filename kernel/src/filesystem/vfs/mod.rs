@@ -375,6 +375,27 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
+    fn check_mmap_file(
+        &self,
+        _file: &Arc<File>,
+        _len: usize,
+        _offset: usize,
+        _vm_flags: VmFlags,
+    ) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn mmap_file(
+        &self,
+        _file: &Arc<File>,
+        start: usize,
+        len: usize,
+        offset: usize,
+        _vm_flags: VmFlags,
+    ) -> Result<(), SystemError> {
+        self.mmap(start, len, offset)
+    }
+
     fn read_sync(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize, SystemError> {
         return Err(SystemError::ENOSYS);
     }

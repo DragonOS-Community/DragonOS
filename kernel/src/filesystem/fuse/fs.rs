@@ -31,9 +31,20 @@ pub struct FuseMountData {
     pub rootmode: u32,
     pub user_id: u32,
     pub group_id: u32,
+    pub max_read: u32,
     pub allow_other: bool,
     pub default_permissions: bool,
     pub conn: Arc<FuseConn>,
+}
+
+struct FuseParsedMountOptions {
+    fd: i32,
+    rootmode: u32,
+    user_id: u32,
+    group_id: u32,
+    max_read: u32,
+    default_permissions: bool,
+    allow_other: bool,
 }
 
 impl FileSystemMakerData for FuseMountData {
@@ -69,13 +80,12 @@ impl FuseFS {
         v.is_empty() || v != "0"
     }
 
-    fn parse_mount_options(
-        raw: Option<&str>,
-    ) -> Result<(i32, u32, u32, u32, bool, bool), SystemError> {
+    fn parse_mount_options(raw: Option<&str>) -> Result<FuseParsedMountOptions, SystemError> {
         let mut fd: Option<i32> = None;
         let mut rootmode: Option<u32> = None;
         let mut user_id: Option<u32> = None;
         let mut group_id: Option<u32> = None;
+        let mut max_read = u32::MAX;
         let mut default_permissions = false;
         let mut allow_other = false;
 
@@ -103,6 +113,9 @@ impl FuseFS {
                 "group_id" => {
                     group_id = Some(Self::parse_opt_u32_decimal(v)?);
                 }
+                "max_read" => {
+                    max_read = Self::parse_opt_u32_decimal(v)?;
+                }
                 "default_permissions" => {
                     default_permissions = Self::parse_opt_bool_switch(v);
                 }
@@ -121,14 +134,15 @@ impl FuseFS {
         // Default root mode: directory 0755 (with type bit).
         let rootmode = rootmode.unwrap_or(0o040755);
 
-        Ok((
+        Ok(FuseParsedMountOptions {
             fd,
             rootmode,
             user_id,
             group_id,
+            max_read,
             default_permissions,
             allow_other,
-        ))
+        })
     }
 
     pub fn root_node(&self) -> Arc<FuseNode> {
@@ -294,13 +308,12 @@ impl MountableFileSystem for FuseFS {
         raw_data: Option<&str>,
         _source: &str,
     ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
-        let (fd, rootmode, user_id, group_id, default_permissions, allow_other) =
-            Self::parse_mount_options(raw_data)?;
+        let opts = Self::parse_mount_options(raw_data)?;
 
         let file = ProcessManager::current_pcb()
             .fd_table()
             .read()
-            .get_file_by_fd(fd)
+            .get_file_by_fd(opts.fd)
             .ok_or(SystemError::EBADF)?;
 
         let conn = {
@@ -314,11 +327,12 @@ impl MountableFileSystem for FuseFS {
         };
 
         Ok(Some(Arc::new(FuseMountData {
-            rootmode,
-            user_id,
-            group_id,
-            allow_other,
-            default_permissions,
+            rootmode: opts.rootmode,
+            user_id: opts.user_id,
+            group_id: opts.group_id,
+            max_read: opts.max_read,
+            allow_other: opts.allow_other,
+            default_permissions: opts.default_permissions,
             conn,
         })))
     }
@@ -357,6 +371,7 @@ impl MountableFileSystem for FuseFS {
             mount_data.user_id,
             mount_data.group_id,
             mount_data.allow_other,
+            mount_data.max_read,
         );
 
         let fs = Arc::new_cyclic(|weak_fs| FuseFS {

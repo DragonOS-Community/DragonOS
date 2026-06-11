@@ -655,9 +655,13 @@ struct fuse_daemon_args {
     volatile uint32_t *last_release_in_flags;
     volatile uint64_t *last_open_fh;
     volatile uint64_t *last_read_fh;
+    volatile uint32_t *last_read_size;
     volatile uint64_t *last_write_fh;
     volatile uint64_t *last_fsync_fh;
     volatile uint64_t *last_release_fh;
+    volatile uint64_t *read_offsets;
+    volatile uint32_t *read_sizes;
+    uint32_t read_trace_capacity;
     volatile uint32_t *interrupt_count;
     volatile uint64_t *blocked_read_unique;
     volatile uint64_t *last_interrupt_target;
@@ -668,6 +672,7 @@ struct fuse_daemon_args {
     int force_open_enosys;
     int force_opendir_enosys;
     int block_read_until_interrupt;
+    size_t hello_data_size_override;
     struct simplefs fs;
 };
 
@@ -903,11 +908,24 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
             }
             usleep((useconds_t)a->block_read_until_interrupt * 1000);
         }
+        uint32_t read_index = 0;
         if (a->read_count) {
+            read_index = *a->read_count;
             (*a->read_count)++;
         }
         if (a->last_read_fh) {
             *a->last_read_fh = in->fh;
+        }
+        if (a->last_read_size) {
+            *a->last_read_size = in->size;
+        }
+        if (read_index < a->read_trace_capacity) {
+            if (a->read_offsets) {
+                a->read_offsets[read_index] = in->offset;
+            }
+            if (a->read_sizes) {
+                a->read_sizes[read_index] = in->size;
+            }
         }
         if (in->offset >= node->size) {
             return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
@@ -1446,6 +1464,16 @@ static inline void *fuse_daemon_thread(void *arg) {
     }
     if (a->has_hello_open_fh_override) {
         a->fs.nodes[1].open_fh = a->hello_open_fh_override;
+    }
+    if (a->hello_data_size_override > 0) {
+        size_t size = a->hello_data_size_override;
+        if (size > SIMPLEFS_DATA_MAX) {
+            size = SIMPLEFS_DATA_MAX;
+        }
+        for (size_t i = 0; i < size; i++) {
+            a->fs.nodes[1].data[i] = (unsigned char)('A' + (i % 26));
+        }
+        a->fs.nodes[1].size = size;
     }
 
     while (!*a->stop) {

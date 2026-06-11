@@ -706,22 +706,62 @@ impl IndexNode for FuseNode {
         self.ensure_regular()?;
         let fh = self.resolve_file_fh(&data)?;
         let file_flags = Self::fuse_file_flags(&data)?;
-        let read_len = core::cmp::min(len, self.conn().max_write());
-        let read_in = FuseReadIn {
-            fh,
-            offset: offset as u64,
-            size: read_len as u32,
-            read_flags: 0,
-            lock_owner: 0,
-            flags: file_flags,
-            padding: 0,
-        };
-        let payload = self
-            .conn()
-            .request(FUSE_READ, self.nodeid, fuse_pack_struct(&read_in))?;
-        let n = core::cmp::min(payload.len(), read_len);
-        buf[..n].copy_from_slice(&payload[..n]);
-        Ok(n)
+        let max_read = self.conn().max_read();
+        if max_read == 0 {
+            return Err(SystemError::EIO);
+        }
+
+        let mut total_read = 0usize;
+        while total_read < len {
+            let chunk = core::cmp::min(max_read, len - total_read);
+            let Some(chunk_offset) = offset.checked_add(total_read) else {
+                return if total_read > 0 {
+                    Ok(total_read)
+                } else {
+                    Err(SystemError::EOVERFLOW)
+                };
+            };
+            if chunk_offset > i64::MAX as usize {
+                return if total_read > 0 {
+                    Ok(total_read)
+                } else {
+                    Err(SystemError::EINVAL)
+                };
+            }
+            let read_in = FuseReadIn {
+                fh,
+                offset: chunk_offset as u64,
+                size: chunk as u32,
+                read_flags: 0,
+                lock_owner: 0,
+                flags: file_flags,
+                padding: 0,
+            };
+            let payload =
+                match self
+                    .conn()
+                    .request(FUSE_READ, self.nodeid, fuse_pack_struct(&read_in))
+                {
+                    Ok(payload) => payload,
+                    Err(_) if total_read > 0 => return Ok(total_read),
+                    Err(err) => return Err(err),
+                };
+            if payload.len() > chunk {
+                return if total_read > 0 {
+                    Ok(total_read)
+                } else {
+                    Err(SystemError::EIO)
+                };
+            }
+            let n = payload.len();
+            buf[total_read..total_read + n].copy_from_slice(&payload);
+            total_read += n;
+            if n < chunk {
+                break;
+            }
+        }
+
+        Ok(total_read)
     }
 
     fn write_at(

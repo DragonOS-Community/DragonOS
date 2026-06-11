@@ -1348,6 +1348,120 @@ fail:
     return -1;
 }
 
+static int ext_test_large_read_over_max_write() {
+    const char *mp = "/tmp/test_fuse_large_read";
+    const size_t data_size = 6000;
+    char path[256];
+    char *buf = NULL;
+    int n = -1;
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t read_count = 0;
+    volatile uint64_t read_offsets[4] = {0};
+    volatile uint32_t read_sizes[4] = {0};
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.read_count = &read_count;
+    args.read_offsets = read_offsets;
+    args.read_sizes = read_sizes;
+    args.read_trace_capacity = 4;
+    args.hello_data_size_override = data_size;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0,max_read=4096",
+             fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    buf = (char *)malloc(data_size);
+    if (!buf) {
+        printf("[FAIL] malloc read buffer\n");
+        goto fail;
+    }
+
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    n = fuseg_read_file(path, buf, data_size);
+    if (n < 0) {
+        printf("[FAIL] read(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+    if ((size_t)n != data_size) {
+        printf("[FAIL] read size mismatch: got=%d expected=%zu read_count=%u\n", n, data_size,
+               read_count);
+        goto fail;
+    }
+    for (size_t i = 0; i < data_size; i++) {
+        char expected = (char)('A' + (i % 26));
+        if (buf[i] != expected) {
+            printf("[FAIL] read data mismatch at %zu: got=%d expected=%d\n", i, buf[i],
+                   expected);
+            goto fail;
+        }
+    }
+    if (read_count != 2 || read_offsets[0] != 0 || read_offsets[1] != 4096 ||
+        read_sizes[0] != 4096 || read_sizes[1] != data_size - 4096) {
+        printf("[FAIL] unexpected FUSE_READ split: count=%u off0=%llu size0=%u off1=%llu size1=%u\n",
+               read_count, (unsigned long long)read_offsets[0], read_sizes[0],
+               (unsigned long long)read_offsets[1], read_sizes[1]);
+        goto fail;
+    }
+
+    free(buf);
+    buf = NULL;
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (buf) {
+        free(buf);
+    }
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
 TEST(FuseExtended, OpsAccessCreateSymlinkLinkRename2FlushFsync) {
     ASSERT_EQ(0, ext_test_p2_ops());
 }
@@ -1362,6 +1476,10 @@ TEST(FuseExtended, NoOpenNoOpendirReaddirplusNotify) {
 
 TEST(FuseExtended, OpenReturnsZeroFhIsValid) {
     ASSERT_EQ(0, ext_test_open_zero_fh_valid());
+}
+
+TEST(FuseExtended, LargeReadSplitsOverMaxWrite) {
+    ASSERT_EQ(0, ext_test_large_read_over_max_write());
 }
 
 TEST(FuseExtended, NoOpenFsyncUsesZeroFh) {

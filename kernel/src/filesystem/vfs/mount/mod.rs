@@ -1961,21 +1961,25 @@ impl MountList {
     #[inline(never)]
     pub fn remove<T: Into<MountPath>>(&self, path: T) -> Option<Arc<MountFS>> {
         let mut inner = self.inner.write();
-        let path: MountPath = path.into();
-        if let Some(stack) = inner.mounts.get_mut(&path) {
+        let path = Arc::new(path.into());
+        if let Some(mut stack) = inner.mounts.remove(&path) {
             if let Some(rec) = stack.pop() {
-                let empty = stack.is_empty();
                 let rec_fs = rec.fs.clone();
-                let rec_ino = rec.ino;
-                if empty {
-                    inner.mounts.remove(&path);
-                }
                 if let Some(ino) = inner.mfs2ino.remove(&rec_fs) {
                     inner.ino2mp.remove(&ino);
                 }
                 inner.mfs2mp.remove(&rec_fs);
-                if let Some(ino) = rec_ino {
+                if let Some(ino) = rec.ino {
                     inner.ino2mp.remove(&ino);
+                }
+
+                if let Some(visible) = stack.last() {
+                    inner.mfs2mp.insert(visible.fs.clone(), path.clone());
+                    if let Some(ino) = visible.ino {
+                        inner.mfs2ino.insert(visible.fs.clone(), ino);
+                        inner.ino2mp.insert(ino, path.clone());
+                    }
+                    inner.mounts.insert(path.clone(), stack);
                 }
                 return Some(rec_fs);
             }

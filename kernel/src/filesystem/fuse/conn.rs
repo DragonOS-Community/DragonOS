@@ -143,6 +143,7 @@ struct FuseConnInner {
     owner_uid: u32,
     owner_gid: u32,
     allow_other: bool,
+    max_read: u32,
     init_flags: u64,
     init: FuseInitNegotiated,
     no_open: bool,
@@ -195,6 +196,7 @@ impl FuseConn {
                 owner_uid: 0,
                 owner_gid: 0,
                 allow_other: false,
+                max_read: u32::MAX,
                 init_flags,
                 init: FuseInitNegotiated::default(),
                 no_open: false,
@@ -250,11 +252,18 @@ impl FuseConn {
         self.inner.lock().initialized
     }
 
-    pub fn configure_mount(&self, owner_uid: u32, owner_gid: u32, allow_other: bool) {
+    pub fn configure_mount(
+        &self,
+        owner_uid: u32,
+        owner_gid: u32,
+        allow_other: bool,
+        max_read: u32,
+    ) {
         let mut g = self.inner.lock();
         g.owner_uid = owner_uid;
         g.owner_gid = owner_gid;
         g.allow_other = allow_other;
+        g.max_read = core::cmp::max(Self::MIN_MAX_WRITE as u32, max_read);
     }
 
     pub(crate) fn has_init_flag(&self, flag: u64) -> bool {
@@ -903,5 +912,10 @@ impl FuseConn {
     pub fn max_write(&self) -> usize {
         let g = self.inner.lock();
         core::cmp::max(4096usize, g.init.max_write as usize)
+    }
+
+    pub fn max_read(&self) -> usize {
+        let g = self.inner.lock();
+        core::cmp::max(Self::MIN_MAX_WRITE, g.max_read as usize)
     }
 }

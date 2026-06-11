@@ -857,6 +857,9 @@ impl MountableFileSystem for VirtioFsFs {
             rootmode: md.rootmode,
             user_id: md.user_id,
             group_id: md.group_id,
+            max_read: VIRTIOFS_RSP_BUF_SIZE
+                .saturating_sub(core::mem::size_of::<FuseOutHeader>())
+                .min(u32::MAX as usize) as u32,
             allow_other: md.allow_other,
             default_permissions: md.default_permissions,
             conn: md.conn.clone(),

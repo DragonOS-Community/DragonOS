@@ -24,7 +24,7 @@ use crate::{
         casting::DowncastArc,
         mutex::{Mutex, MutexGuard},
     },
-    mm::{page::PageFlags, MemoryManagementArch},
+    mm::MemoryManagementArch,
     time::PosixTimeSpec,
 };
 
@@ -232,8 +232,7 @@ impl FuseNode {
         page_index: usize,
         read_len: usize,
         observed_size: usize,
-        truncate_cache: bool,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<(usize, bool), SystemError> {
         let eof = page_index
             .checked_mul(MMArch::PAGE_SIZE)
             .and_then(|start| start.checked_add(read_len))
@@ -251,10 +250,7 @@ impl FuseNode {
                 }
             }
         }
-        if should_truncate && truncate_cache {
-            self.truncate_page_cache(eof)?;
-        }
-        Ok(eof)
+        Ok((eof, should_truncate))
     }
 
     pub(crate) fn fuse_fs(&self) -> Option<Arc<FuseFS>> {
@@ -306,14 +302,6 @@ impl FuseNode {
             flags &= !FileFlags::O_TRUNC.bits();
         }
         flags
-    }
-
-    fn fuse_file_flags(data: &FilePrivateData) -> Result<u32, SystemError> {
-        match data {
-            FilePrivateData::Fuse(FuseFilePrivateData::File(p)) => Ok(p.open_flags),
-            FilePrivateData::Fuse(FuseFilePrivateData::Dir(p)) => Ok(p.open_flags),
-            _ => Err(SystemError::EBADF),
-        }
     }
 
     fn fuse_file_snapshot(data: &FilePrivateData) -> Result<(u64, u32, u32), SystemError> {
@@ -616,13 +604,6 @@ impl FuseNode {
         Ok(())
     }
 
-    fn resolve_file_fh(&self, data: &FilePrivateData) -> Result<u64, SystemError> {
-        let FilePrivateData::Fuse(FuseFilePrivateData::File(p)) = data else {
-            return Err(SystemError::EBADF);
-        };
-        Ok(p.fh)
-    }
-
     fn fsync_common(&self, datasync: bool) -> Result<(), SystemError> {
         self.check_not_stale()?;
         let md = self.cached_or_fetch_metadata()?;
@@ -805,8 +786,10 @@ impl FuseNode {
         let start_page_index = offset >> MMArch::PAGE_SHIFT;
         let end_page_index = (offset + read_len - 1) >> MMArch::PAGE_SHIFT;
         let page_cache = self.ensure_page_cache()?;
+        let _invalidate = page_cache.invalidate_read();
 
         let mut dst_offset = 0usize;
+        let mut truncate_eof = None;
         for page_index in start_page_index..=end_page_index {
             let page_start = page_index << MMArch::PAGE_SHIFT;
             let page_end = page_start + MMArch::PAGE_SIZE;
@@ -829,8 +812,12 @@ impl FuseNode {
             let mut copy_end = copy_end;
             if let Some(read_len) = filled_len {
                 if read_len < MMArch::PAGE_SIZE {
-                    let eof = self.note_short_read_eof(page_index, read_len, file_size, true)?;
+                    let (eof, should_truncate) =
+                        self.note_short_read_eof(page_index, read_len, file_size)?;
                     copy_end = core::cmp::min(copy_end, eof);
+                    if should_truncate {
+                        truncate_eof = Some(eof);
+                    }
                 }
             }
 
@@ -858,6 +845,16 @@ impl FuseNode {
                 break;
             }
         }
+        drop(_invalidate);
+
+        if let Some(eof) = truncate_eof {
+            if matches!(
+                self.cached_metadata_snapshot(),
+                Some(md) if md.size.max(0) as usize == eof
+            ) {
+                self.truncate_page_cache(eof)?;
+            }
+        }
 
         Ok(dst_offset)
     }
@@ -874,6 +871,7 @@ impl FuseNode {
             return Err(SystemError::EINVAL);
         }
         let page_cache = self.ensure_page_cache()?;
+        let _invalidate = page_cache.invalidate_read();
         let mut filled_len = None;
         let page = page_cache
             .manager()
@@ -884,7 +882,7 @@ impl FuseNode {
             })?;
         if let Some(read_len) = filled_len {
             if read_len < MMArch::PAGE_SIZE {
-                let eof = self.note_short_read_eof(page_index, read_len, file_size, false)?;
+                let (eof, _) = self.note_short_read_eof(page_index, read_len, file_size)?;
                 if page_index.saturating_mul(MMArch::PAGE_SIZE) >= eof {
                     drop(page);
                     page_cache.manager().discard_clean_page(page_index)?;
@@ -904,49 +902,82 @@ impl FuseNode {
         Ok(page)
     }
 
-    fn update_cached_pages_after_write(&self, offset: usize, data: &[u8]) {
+    fn update_cached_pages_after_write(
+        &self,
+        offset: usize,
+        data: &[u8],
+    ) -> Result<(), SystemError> {
         if data.is_empty() {
-            return;
+            return Ok(());
         }
         let Some(page_cache) = self.cached_page_cache() else {
-            return;
+            return Ok(());
         };
+        let end = offset
+            .checked_add(data.len())
+            .ok_or(SystemError::EOVERFLOW)?;
+        let _invalidate = page_cache.invalidate_read();
 
         let start_page_index = offset >> MMArch::PAGE_SHIFT;
-        let end_page_index = (offset + data.len() - 1) >> MMArch::PAGE_SHIFT;
+        let end_page_index = (end - 1) >> MMArch::PAGE_SHIFT;
         for page_index in start_page_index..=end_page_index {
-            let Some(page) = page_cache.manager().peek_page(page_index) else {
-                continue;
-            };
             let page_start = page_index << MMArch::PAGE_SHIFT;
             let page_end = page_start + MMArch::PAGE_SIZE;
             let write_start = core::cmp::max(offset, page_start);
-            let write_end = core::cmp::min(offset + data.len(), page_end);
+            let write_end = core::cmp::min(end, page_end);
             let write_len = write_end.saturating_sub(write_start);
             if write_len == 0 {
                 continue;
             }
 
-            let mut guard = page.write();
-            let flags = guard.flags();
-            if flags.intersects(PageFlags::PG_DIRTY | PageFlags::PG_WRITEBACK) {
-                continue;
-            }
             let src_offset = write_start - offset;
             let page_offset = write_start - page_start;
-            unsafe {
-                guard.as_slice_mut()[page_offset..page_offset + write_len]
-                    .copy_from_slice(&data[src_offset..src_offset + write_len]);
-            }
-            guard.add_flags(PageFlags::PG_UPTODATE);
+            let _ = page_cache.manager().update_clean_page(
+                page_index,
+                page_offset,
+                &data[src_offset..src_offset + write_len],
+            )?;
         }
 
-        let end = offset.saturating_add(data.len());
+        Ok(())
+    }
+
+    fn note_successful_write(&self, offset: usize, len: usize) -> Result<(), SystemError> {
+        if len == 0 {
+            return Ok(());
+        }
+        let end = offset.checked_add(len).ok_or(SystemError::EOVERFLOW)?;
         if let Some(md) = self.cached_metadata.lock().as_mut() {
             if end > md.size.max(0) as usize {
                 md.size = end as i64;
             }
         }
+        Ok(())
+    }
+
+    fn invalidate_cached_pages_after_direct_write(
+        &self,
+        offset: usize,
+        len: usize,
+    ) -> Result<(), SystemError> {
+        if len == 0 {
+            return Ok(());
+        }
+        let Some(page_cache) = self.cached_page_cache() else {
+            return Ok(());
+        };
+        let end = offset.checked_add(len).ok_or(SystemError::EOVERFLOW)?;
+        let start_page_index = offset >> MMArch::PAGE_SHIFT;
+        let end_page_index = (end - 1) >> MMArch::PAGE_SHIFT;
+        let end_page_exclusive = end_page_index
+            .checked_add(1)
+            .ok_or(SystemError::EOVERFLOW)?;
+        let _invalidate = page_cache.invalidate_write();
+        page_cache.unmap_mapping_pages(start_page_index, Some(end_page_exclusive))?;
+        let _ = page_cache
+            .manager()
+            .discard_clean_range(start_page_index, end_page_index)?;
+        Ok(())
     }
 }
 
@@ -1144,9 +1175,17 @@ impl IndexNode for FuseNode {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
         }
-        let fh = self.resolve_file_fh(&data)?;
-        let file_flags = Self::fuse_file_flags(&data)?;
+        if len > 0 {
+            offset.checked_add(len).ok_or(SystemError::EOVERFLOW)?;
+        }
+        let (fh, file_flags, fopen_flags) = Self::fuse_file_snapshot(&data)?;
+        drop(data);
         let max_write = self.conn().max_write();
+        if max_write == 0 {
+            return Err(SystemError::EIO);
+        }
+        let cached_write =
+            (fopen_flags & FOPEN_DIRECT_IO) == 0 && (file_flags & FileFlags::O_DIRECT.bits()) == 0;
         let mut total_written = 0usize;
 
         while total_written < len {
@@ -1177,11 +1216,19 @@ impl IndexNode for FuseNode {
                 };
             }
             let wrote = out.size as usize;
-            self.update_cached_pages_after_write(
-                chunk_offset,
-                &buf[total_written..total_written + wrote],
-            );
+            self.note_successful_write(chunk_offset, wrote)?;
+            let cache_result = if cached_write {
+                self.update_cached_pages_after_write(
+                    chunk_offset,
+                    &buf[total_written..total_written + wrote],
+                )
+            } else {
+                self.invalidate_cached_pages_after_direct_write(chunk_offset, wrote)
+            };
             total_written += wrote;
+            if cache_result.is_err() {
+                break;
+            }
             if wrote < chunk {
                 break;
             }

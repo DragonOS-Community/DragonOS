@@ -497,6 +497,59 @@ impl PageCacheManager {
             .and_then(|cache| cache.lock().get_page(page_index))
     }
 
+    pub fn update_clean_page(
+        &self,
+        page_index: usize,
+        page_offset: usize,
+        data: &[u8],
+    ) -> Result<bool, SystemError> {
+        if data.is_empty() {
+            return Ok(false);
+        }
+        match page_offset.checked_add(data.len()) {
+            Some(end) if end <= MMArch::PAGE_SIZE => {}
+            _ => return Err(SystemError::EINVAL),
+        }
+
+        let cache = self.upgrade()?;
+        let Some(entry) = cache.inner.lock().get_entry(page_index) else {
+            return Ok(false);
+        };
+
+        loop {
+            match entry.state() {
+                PageState::Loading => {
+                    if entry.wait_ready().is_err() {
+                        return Ok(false);
+                    }
+                    let current = cache.inner.lock().get_entry(page_index);
+                    if !matches!(current.as_ref(), Some(current) if Arc::ptr_eq(current, &entry)) {
+                        return Ok(false);
+                    }
+                    continue;
+                }
+                PageState::Error | PageState::Dirty | PageState::Writeback => return Ok(false),
+                PageState::UpToDate => {
+                    let current = cache.inner.lock().get_entry(page_index);
+                    if !matches!(current.as_ref(), Some(current) if Arc::ptr_eq(current, &entry)) {
+                        return Ok(false);
+                    }
+                    let mut guard = entry.page.write();
+                    if guard
+                        .flags()
+                        .intersects(PageFlags::PG_DIRTY | PageFlags::PG_WRITEBACK)
+                    {
+                        return Ok(false);
+                    }
+                    let dst = unsafe { guard.as_slice_mut() };
+                    dst[page_offset..page_offset + data.len()].copy_from_slice(data);
+                    guard.add_flags(PageFlags::PG_UPTODATE);
+                    return Ok(true);
+                }
+            }
+        }
+    }
+
     pub fn sync(&self) -> Result<(), SystemError> {
         let cache = self.upgrade()?;
         let dirty_entries: Vec<(usize, Arc<PageEntry>)> = {
@@ -606,6 +659,68 @@ impl PageCacheManager {
             .upgrade()?
             .lock()
             .invalidate_range(start_index, end_index))
+    }
+
+    pub fn discard_clean_range(
+        &self,
+        start_index: usize,
+        end_index: usize,
+    ) -> Result<usize, SystemError> {
+        let cache = self.upgrade()?;
+        let indices: Vec<usize> = {
+            let guard = cache.inner.lock();
+            (start_index..=end_index)
+                .filter(|index| guard.get_entry(*index).is_some())
+                .collect()
+        };
+
+        let mut discarded = 0;
+        for page_index in indices {
+            loop {
+                let entry = {
+                    let guard = cache.inner.lock();
+                    guard.get_entry(page_index)
+                };
+                let Some(entry) = entry else {
+                    break;
+                };
+
+                match entry.state() {
+                    PageState::Loading => {
+                        let _ = entry.wait_ready();
+                        continue;
+                    }
+                    PageState::UpToDate | PageState::Error => {}
+                    PageState::Dirty | PageState::Writeback => break,
+                }
+
+                let removed = {
+                    let mut guard = cache.inner.lock();
+                    let Some(current) = guard.get_entry(page_index) else {
+                        break;
+                    };
+                    if !Arc::ptr_eq(&current, &entry)
+                        || !matches!(current.state(), PageState::UpToDate | PageState::Error)
+                    {
+                        continue;
+                    }
+                    guard.remove_page(page_index)
+                };
+
+                if let Some(page) = removed {
+                    let paddr = page.phys_address();
+                    let can_remove_from_manager = page.read().can_deallocate();
+                    let _ = page_reclaimer_lock().remove_page(&paddr);
+                    if can_remove_from_manager {
+                        page_manager_lock().remove_page(&paddr);
+                    }
+                    discarded += 1;
+                }
+                break;
+            }
+        }
+
+        Ok(discarded)
     }
 
     pub fn invalidate_all_clean(&self) -> Result<usize, SystemError> {

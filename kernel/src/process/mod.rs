@@ -705,14 +705,30 @@ impl ProcessManager {
         // DragonOS 采用异步方式（从发送方上下文停止目标线程），因此需要主动 dequeue
         // 并 kick 远端 CPU。这是与 Linux 的架构差异，但锁序和 dequeue 语义对标。
         let pi_guard = pcb.sched_info().pi_lock_irqsave();
-        if pcb.sched_info().state().is_exited() {
+        let prev_state = pcb.sched_info().state();
+        if prev_state.is_exited() {
             return Err(SystemError::EINTR);
         }
+        let target_cpu = pcb.sched_info().on_cpu().unwrap_or_else(current_cpu_id);
+        let update_clock = target_cpu == smp_get_processor_id();
+        let was_off_rq = *pcb.sched_info().on_rq.lock_irqsave() == OnRq::None;
+        let was_uninterruptible = matches!(prev_state, ProcessState::Blocked(false));
+        let was_iowait = pcb.flags().contains(ProcessFlags::IN_IOWAIT);
+
+        if was_off_rq && (was_uninterruptible || was_iowait) {
+            let prev_rq = cpu_rq(target_cpu.data() as usize);
+            let (prev_rq, _prev_rq_guard) = prev_rq.self_lock();
+            if was_uninterruptible {
+                prev_rq.dec_nr_uninterruptible();
+            }
+            if was_iowait {
+                prev_rq.dec_nr_iowait();
+            }
+        }
+
         pcb.sched_info().set_state(ProcessState::Stopped);
         pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
 
-        let target_cpu = pcb.sched_info().on_cpu().unwrap_or_else(current_cpu_id);
-        let update_clock = target_cpu == smp_get_processor_id();
         let rq = cpu_rq(target_cpu.data() as usize);
 
         // 锁序 pi_lock → rq_lock，与 wakeup() 一致

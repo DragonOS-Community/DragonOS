@@ -3,8 +3,10 @@
 //! 目标：提供类似 Linux `local_bh_disable/enable` 与 `*_bh` 锁语义的最小实现。
 //!
 //! ## 设计要点（对齐 Linux，适配 DragonOS 现状）
-//! - DragonOS 当前在硬中断退出路径无条件调用 `do_softirq()`，且 softirq 回调期间会重新打开本地中断。
-//! - 如果进程上下文持有普通自旋锁/读写锁时被中断打断，硬中断退出触发 softirq 再取同一把锁，会发生经典死锁。
+//! - DragonOS 会在最外层 IRQ 退出或 task context BH enable 时补跑 pending softirq，
+//!   且 softirq 回调期间会重新打开本地中断。
+//! - 如果进程上下文持有普通自旋锁/读写锁时被中断打断，IRQ 退出或 BH enable 触发 softirq
+//!   再取同一把锁，会发生经典死锁。
 //! - 因此，我们引入"本 CPU 的 BH 禁用计数"，在 IRQ 退出路径检测到 BH disabled 时跳过 softirq 执行；
 //!   在 BH enable（计数归零）且处于 task context 时补跑 pending softirq。
 //!

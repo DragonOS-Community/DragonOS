@@ -13,10 +13,11 @@ use crate::{
     exception::{extable::ExceptionTableManager, InterruptArch},
     ipc::{
         signal::force_sig_fault_to_current,
-        signal_types::{BUS_ADRERR, SEGV_ACCERR, SEGV_MAPERR},
+        signal_types::{SignalArch, BUS_ADRERR, SEGV_ACCERR, SEGV_MAPERR},
     },
     mm::{
         fault::{FaultFlags, PageFaultHandler, PageFaultMessage},
+        oom::{OomContext, OomOutcome},
         ucontext::{AddressSpace, LockedVMA},
         VirtAddr, VmFaultReason, VmFlags,
     },
@@ -481,8 +482,33 @@ impl X86_64MMArch {
                     regs.rip,
                     fault
                 );
-                // TODO: OOM 处理
-                return;
+                drop(space_guard);
+                let ctx = OomContext {
+                    trigger_pid: ProcessManager::current_pid(),
+                    trigger_tgid: ProcessManager::current_pcb().raw_tgid(),
+                    fault_address: address,
+                    fault_ip: regs.rip as usize,
+                    order: 1,
+                };
+                match crate::mm::oom::pagefault_out_of_memory(ctx) {
+                    OomOutcome::Retry => {
+                        Self::do_user_addr_fault(regs, error_code, address);
+                        return;
+                    }
+                    OomOutcome::CurrentTaskKilled => {
+                        <crate::arch::ipc::signal::X86_64SignalArch as SignalArch>::do_signal_or_restart(regs);
+                        return;
+                    }
+                    OomOutcome::NoVictim => {
+                        panic!(
+                            "fatal user page-fault OOM: pid={:?}, tgid={:?}, addr={:#x}, rip={:#x}",
+                            ProcessManager::current_pid(),
+                            ProcessManager::current_pcb().raw_tgid(),
+                            address.data(),
+                            regs.rip
+                        );
+                    }
+                }
             } else if fault.contains(VmFaultReason::VM_FAULT_SIGBUS)
                 || fault.contains(VmFaultReason::VM_FAULT_HWPOISON)
                 || fault.contains(VmFaultReason::VM_FAULT_HWPOISON_LARGE)

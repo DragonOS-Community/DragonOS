@@ -34,6 +34,7 @@ pub mod mincore;
 pub mod mmio_buddy;
 pub mod mmu_gather;
 pub mod no_init;
+pub mod oom;
 pub mod page;
 pub mod page_cache_stats;
 pub mod percpu;

@@ -124,6 +124,11 @@ impl<'a> PageFaultMessage<'a> {
 pub struct PageFaultHandler;
 
 impl PageFaultHandler {
+    #[inline(always)]
+    fn account_new_present_mapping(mm: &Arc<AddressSpace>) {
+        mm.account_present_page_add();
+    }
+
     fn attach_fault_mapped_page(page: &Arc<Page>, vma: &Arc<LockedVMA>, mlocked: bool) {
         let mut page_guard = page.write();
         page_guard.insert_vma(vma.clone());
@@ -280,6 +285,9 @@ impl PageFaultHandler {
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
     pub unsafe fn do_anonymous_page(pfm: &mut PageFaultMessage) -> VmFaultReason {
+        if crate::mm::oom::should_inject_fault_oom() {
+            return VmFaultReason::VM_FAULT_OOM;
+        }
         let address = pfm.address_aligned_down();
         let vma = pfm.vma.clone();
         let mm = pfm.mm().clone();
@@ -316,6 +324,7 @@ impl PageFaultHandler {
                     let mlocked = vma.lock().vm_flags().contains(VmFlags::VM_LOCKED);
                     if let Some(flush) = mapper.map_phys(address, page.phys_address(), flags) {
                         flush.flush();
+                        Self::account_new_present_mapping(pfm.mm());
                         Self::attach_fault_mapped_page(&page, &vma, mlocked);
                         return VmFaultReason::VM_FAULT_COMPLETED;
                     } else {
@@ -344,6 +353,7 @@ impl PageFaultHandler {
             let mut page_manager_guard = page_manager_lock();
             let page = page_manager_guard.get_unwrap(&paddr);
             drop(page_manager_guard);
+            Self::account_new_present_mapping(pfm.mm());
             Self::attach_fault_mapped_page(&page, &vma, mlocked);
             VmFaultReason::VM_FAULT_COMPLETED
         } else {
@@ -765,6 +775,7 @@ impl PageFaultHandler {
                             .map_phys(address, phys, vma_guard.flags())
                             .unwrap()
                             .flush();
+                        Self::account_new_present_mapping(&mm);
                     }
                     drop(page_guard);
                     Self::attach_fault_mapped_page(&page, &vma, mlocked);
@@ -872,6 +883,9 @@ impl PageFaultHandler {
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
     pub unsafe fn finish_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
+        if crate::mm::oom::should_inject_fault_oom() {
+            return VmFaultReason::VM_FAULT_OOM;
+        }
         let vma = pfm.vma();
         let vma_guard = vma.lock();
         let flags = pfm.flags();
@@ -896,12 +910,16 @@ impl PageFaultHandler {
         let mlocked = vma_guard.vm_flags().contains(VmFlags::VM_LOCKED);
 
         mapper.map_phys(address, page_phys, vma_guard.flags());
+        Self::account_new_present_mapping(pfm.mm());
         Self::attach_fault_mapped_page(&page_to_map, &pfm.vma(), mlocked);
         VmFaultReason::VM_FAULT_COMPLETED
     }
 
     /// Map a zeroed anonymous page for /dev/zero style mappings.
     pub unsafe fn zero_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
+        if crate::mm::oom::should_inject_fault_oom() {
+            return VmFaultReason::VM_FAULT_OOM;
+        }
         let address = pfm.address_aligned_down();
         let vma = pfm.vma();
         let guard = vma.lock();
@@ -918,6 +936,7 @@ impl PageFaultHandler {
             let paddr = mapper.translate(address).unwrap().0;
             let page = pm.get_unwrap(&paddr);
             drop(pm);
+            Self::account_new_present_mapping(pfm.mm());
             Self::attach_fault_mapped_page(&page, &vma, mlocked);
             VmFaultReason::VM_FAULT_COMPLETED
         } else {
@@ -931,6 +950,9 @@ impl PageFaultHandler {
         start_pgoff: usize,
         end_pgoff: usize,
     ) -> VmFaultReason {
+        if crate::mm::oom::should_inject_fault_oom() {
+            return VmFaultReason::VM_FAULT_OOM;
+        }
         let vma = pfm.vma();
         let vma_guard = vma.lock();
         let backing_pgoff = match vma_guard.backing_page_offset() {
@@ -953,6 +975,7 @@ impl PageFaultHandler {
                 let paddr = mapper.translate(addr).unwrap().0;
                 let page = pm.get_unwrap(&paddr);
                 drop(pm);
+                Self::account_new_present_mapping(&mm);
                 Self::attach_fault_mapped_page(&page, &vma, mlocked);
             } else {
                 return VmFaultReason::VM_FAULT_OOM;

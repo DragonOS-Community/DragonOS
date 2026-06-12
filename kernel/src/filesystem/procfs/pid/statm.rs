@@ -55,20 +55,20 @@ impl FileOps for StatmFileOps {
         };
 
         // 获取进程内存信息（简化实现）
-        let size_pages = user_vm
+        let (size_pages, resident_pages) = user_vm
             .map(|vm| {
                 let guard = vm.read();
-                // statm 第一列为总虚拟内存页数
-                (guard
+                let size_pages = (guard
                     .vma_usage_bytes()
                     .saturating_add(MMArch::PAGE_SIZE - 1))
-                    >> MMArch::PAGE_SHIFT
+                    >> MMArch::PAGE_SHIFT;
+                (size_pages, vm.resident_pages())
             })
-            .unwrap_or(0);
+            .unwrap_or((0, 0));
 
         // statm 格式: size resident shared text lib data dt
-        // 简化实现，只返回 size，其他字段为 0
-        let content = format!("{} 0 0 0 0 0 0\n", size_pages);
+        // 简化实现，只返回 size/resident，其他字段为 0
+        let content = format!("{} {} 0 0 0 0 0\n", size_pages, resident_pages);
 
         proc_read(offset, len, buf, content.as_bytes())
     }

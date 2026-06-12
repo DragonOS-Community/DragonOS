@@ -996,7 +996,11 @@ impl ProcessManager {
                 }
             }
 
+            let released_vm = pcb.basic().user_vm();
             unsafe { pcb.basic_mut().set_user_vm(None) };
+            if let Some(old_vm) = released_vm {
+                crate::mm::oom::notify_mm_released(&old_vm);
+            }
 
             ProcessManager::exit_notify(&pcb);
         }

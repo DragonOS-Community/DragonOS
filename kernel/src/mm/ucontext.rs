@@ -5,7 +5,7 @@ use core::{
     hash::Hasher,
     intrinsics::unlikely,
     ops::Add,
-    sync::atomic::{compiler_fence, AtomicU64, Ordering},
+    sync::atomic::{compiler_fence, AtomicU64, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -96,6 +96,8 @@ pub struct AddressSpace {
     /// without taking `mm.write()`, while fault/munmap/mprotect/mremap paths must
     /// still synchronize with those edits.
     page_table_edit_lock: Mutex<()>,
+    /// Per-mm resident user pages, counted by present user PTEs.
+    resident_user_pages: AtomicUsize,
     /// 使用RwSem而非RwLock，因为地址空间操作可能需要进行I/O（如页缺失时的文件读取）
     inner: RwSem<InnerAddressSpace>,
 }
@@ -111,12 +113,14 @@ impl AddressSpace {
             active_cpus: SpinLock::new(CpuMask::new()),
             tlb_gen: AtomicU64::new(0),
             page_table_edit_lock: Mutex::new(()),
+            resident_user_pages: AtomicUsize::new(0),
             inner: RwSem::new(inner),
         });
         // Back-fill the Weak<AddressSpace> so that InnerAddressSpace methods can obtain
         // the outer Arc to construct MmuGather / initiate TLB shootdown.
         {
             let mut g = result.inner.write();
+            g.mm_id = id;
             g.outer = Arc::downgrade(&result);
             g.mappings.set_owner(Arc::downgrade(&result));
             if create_stack {
@@ -215,6 +219,31 @@ impl AddressSpace {
         );
         self.page_table_edit_lock.lock()
     }
+
+    #[inline(always)]
+    pub fn resident_pages(&self) -> usize {
+        self.resident_user_pages.load(Ordering::Relaxed)
+    }
+
+    #[inline(always)]
+    pub fn account_present_page_add(&self) {
+        self.resident_user_pages.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn account_present_page_sub(&self) {
+        let prev = self
+            .resident_user_pages
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pages| {
+                Some(pages.saturating_sub(1))
+            })
+            .unwrap_or(0);
+        debug_assert!(
+            prev > 0,
+            "resident_user_pages underflow on mm id={}",
+            self.id()
+        );
+    }
 }
 
 impl Drop for AddressSpace {
@@ -250,6 +279,7 @@ impl core::ops::DerefMut for AddressSpace {
 /// @brief 用户地址空间结构体（每个进程都有一个）
 #[derive(Debug)]
 pub struct InnerAddressSpace {
+    mm_id: u64,
     pub user_mapper: UserMapper,
     pub mappings: UserMappings,
     /// 已锁定的用户页数量，以页为单位。
@@ -295,6 +325,7 @@ impl InnerAddressSpace {
 
     pub fn new(_create_stack: bool) -> Result<Self, SystemError> {
         let result = Self {
+            mm_id: 0,
             user_mapper: MMArch::setup_new_usermapper()?,
             mappings: UserMappings::new(),
             locked_vm: 0,
@@ -426,6 +457,8 @@ impl InnerAddressSpace {
                                 {
                                     warn!("Failed to map shared page at {:?} to phys {:?} in child process (current_pid: {:?})",
                                           current_page, phys_addr, ProcessManager::current_pcb().raw_pid());
+                                } else {
+                                    new_addr_space.account_present_page_add();
                                 }
                             } else {
                                 let cow_flags = page_flags.set_write(false);
@@ -443,6 +476,8 @@ impl InnerAddressSpace {
                                 {
                                     warn!("Failed to map COW page at {:?} to phys {:?} in child process (current_pid: {:?})",
                                           current_page, phys_addr, ProcessManager::current_pcb().raw_pid());
+                                } else {
+                                    new_addr_space.account_present_page_add();
                                 }
                             }
                             if let Some(page) = page_manager_guard.get(&phys_addr) {
@@ -1969,6 +2004,7 @@ impl Drop for InnerAddressSpace {
         unsafe {
             self.unmap_all();
         }
+        crate::mm::oom::notify_mm_drop(self.mm_id);
     }
 }
 
@@ -2319,6 +2355,7 @@ impl LockedVMA {
     pub fn unmap(&self, mapper: &mut PageMapper, tlb: &mut MmuGather<'_>) {
         // todo: 如果当前vma与文件相关，完善文件相关的逻辑
         let mut self_guard = self.lock();
+        let mm = self_guard.address_space().and_then(|mm| mm.upgrade());
 
         // 获取物理页的anon_vma的守卫
         let mut page_manager_guard = page_manager_lock();
@@ -2354,6 +2391,9 @@ impl LockedVMA {
             let (paddr, _, flush, freed_tables) =
                 unsafe { mapper.unmap_phys_with_freed_tables(page.virt_address(), true) }
                     .expect("Failed to unmap, beacuse of some page is not mapped");
+            if let Some(mm) = mm.as_ref() {
+                mm.account_present_page_sub();
+            }
 
             // 从anon_vma中删除当前VMA
             let page_arc = page_manager_guard.get_unwrap(&paddr);
@@ -2401,6 +2441,7 @@ impl LockedVMA {
         let Some(intersection) = self_guard.region().intersect(&region) else {
             return;
         };
+        let mm = self_guard.address_space().and_then(|mm| mm.upgrade());
         drop(self_guard);
 
         let mut page_manager_guard = page_manager_lock();
@@ -2414,6 +2455,9 @@ impl LockedVMA {
             else {
                 continue;
             };
+            if let Some(mm) = mm.as_ref() {
+                mm.account_present_page_sub();
+            }
 
             let page_arc = page_manager_guard.get_unwrap(&paddr);
             let can_dealloc = {

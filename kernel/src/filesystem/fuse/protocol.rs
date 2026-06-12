@@ -43,6 +43,7 @@ pub const FUSE_ACCESS: u32 = 34;
 pub const FUSE_CREATE: u32 = 35;
 pub const FUSE_INTERRUPT: u32 = 36;
 pub const FUSE_DESTROY: u32 = 38; // no reply
+pub const FUSE_FALLOCATE: u32 = 43;
 pub const FUSE_READDIRPLUS: u32 = 44;
 pub const FUSE_RENAME2: u32 = 45;
 
@@ -104,6 +105,7 @@ pub const FATTR_FH: u32 = 1 << 6;
 pub const FATTR_ATIME_NOW: u32 = 1 << 7;
 #[allow(dead_code)]
 pub const FATTR_MTIME_NOW: u32 = 1 << 8;
+pub const FATTR_LOCKOWNER: u32 = 1 << 9;
 pub const FATTR_CTIME: u32 = 1 << 10;
 
 pub const FUSE_FSYNC_FDATASYNC: u32 = 1 << 0;
@@ -269,6 +271,16 @@ pub struct FuseWriteIn {
 #[derive(Debug, Clone, Copy)]
 pub struct FuseWriteOut {
     pub size: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseFallocateIn {
+    pub fh: u64,
+    pub offset: u64,
+    pub length: u64,
+    pub mode: u32,
     pub padding: u32,
 }
 

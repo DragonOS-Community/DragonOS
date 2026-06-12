@@ -1553,9 +1553,19 @@ static int ext_test_ftruncate_setattr_uses_open_fh() {
     volatile int init_done = 0;
     volatile uint32_t open_count = 0;
     volatile uint32_t setattr_count = 0;
+    volatile uint32_t fallocate_count = 0;
+    volatile uint32_t write_count = 0;
+    volatile uint64_t last_open_fh = 0;
     volatile uint32_t last_setattr_valid = 0;
     volatile uint64_t last_setattr_fh = 0;
     volatile uint64_t last_setattr_size = 0;
+    volatile uint64_t last_setattr_lock_owner = 0;
+    volatile uint64_t last_fallocate_fh = 0;
+    volatile uint64_t last_fallocate_offset = 0;
+    volatile uint64_t last_fallocate_length = 0;
+    volatile uint32_t last_fallocate_mode = 0;
+    volatile uint64_t last_write_offset = 0;
+    volatile uint32_t last_write_size = 0;
 
     struct fuse_daemon_args args;
     memset(&args, 0, sizeof(args));
@@ -1566,9 +1576,19 @@ static int ext_test_ftruncate_setattr_uses_open_fh() {
     args.stop_on_destroy = 1;
     args.open_count = &open_count;
     args.setattr_count = &setattr_count;
+    args.fallocate_count = &fallocate_count;
+    args.write_count = &write_count;
+    args.last_open_fh = &last_open_fh;
     args.last_setattr_valid = &last_setattr_valid;
     args.last_setattr_fh = &last_setattr_fh;
     args.last_setattr_size = &last_setattr_size;
+    args.last_setattr_lock_owner = &last_setattr_lock_owner;
+    args.last_fallocate_fh = &last_fallocate_fh;
+    args.last_fallocate_offset = &last_fallocate_offset;
+    args.last_fallocate_length = &last_fallocate_length;
+    args.last_fallocate_mode = &last_fallocate_mode;
+    args.last_write_offset = &last_write_offset;
+    args.last_write_size = &last_write_size;
     args.next_open_fh = 940;
 
     pthread_t th;
@@ -1614,9 +1634,144 @@ static int ext_test_ftruncate_setattr_uses_open_fh() {
         goto fail;
     }
     if ((last_setattr_valid & FATTR_SIZE) == 0 || (last_setattr_valid & FATTR_FH) == 0 ||
-        last_setattr_fh != 940 || last_setattr_size != 7) {
-        printf("[FAIL] setattr valid=0x%x fh=%llu size=%llu\n", last_setattr_valid,
-               (unsigned long long)last_setattr_fh, (unsigned long long)last_setattr_size);
+        (last_setattr_valid & FATTR_LOCKOWNER) == 0 || last_setattr_fh != 940 ||
+        last_setattr_size != 7 || last_setattr_lock_owner == 0) {
+        printf("[FAIL] setattr valid=0x%x fh=%llu size=%llu lock_owner=%llu\n",
+               last_setattr_valid, (unsigned long long)last_setattr_fh,
+               (unsigned long long)last_setattr_size,
+               (unsigned long long)last_setattr_lock_owner);
+        goto fail;
+    }
+
+    last_setattr_valid = 0;
+    last_setattr_fh = 0;
+    last_setattr_size = 0;
+    last_setattr_lock_owner = 0;
+    if (truncate(path, 5) != 0) {
+        printf("[FAIL] truncate(path): %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    usleep(100 * 1000);
+    if (setattr_count != 2) {
+        printf("[FAIL] path truncate setattr_count=%u\n", setattr_count);
+        goto fail;
+    }
+    if ((last_setattr_valid & FATTR_SIZE) == 0 || (last_setattr_valid & FATTR_FH) != 0 ||
+        (last_setattr_valid & FATTR_LOCKOWNER) == 0 || last_setattr_size != 5 ||
+        last_setattr_lock_owner == 0) {
+        printf("[FAIL] path setattr valid=0x%x fh=%llu size=%llu lock_owner=%llu\n",
+               last_setattr_valid, (unsigned long long)last_setattr_fh,
+               (unsigned long long)last_setattr_size,
+               (unsigned long long)last_setattr_lock_owner);
+        goto fail;
+    }
+
+    last_setattr_valid = 0;
+    last_setattr_fh = 0;
+    last_setattr_size = 0;
+    last_setattr_lock_owner = 0;
+    f = open(path, O_RDWR | O_TRUNC);
+    if (f < 0) {
+        printf("[FAIL] open(O_TRUNC): %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    close(f);
+    f = -1;
+    usleep(100 * 1000);
+    if (setattr_count != 3) {
+        printf("[FAIL] open(O_TRUNC) setattr_count=%u\n", setattr_count);
+        goto fail;
+    }
+    if ((last_setattr_valid & FATTR_SIZE) == 0 || (last_setattr_valid & FATTR_FH) != 0 ||
+        (last_setattr_valid & FATTR_LOCKOWNER) == 0 || last_setattr_size != 0 ||
+        last_setattr_lock_owner == 0) {
+        printf("[FAIL] open truncate setattr valid=0x%x fh=%llu size=%llu lock_owner=%llu\n",
+               last_setattr_valid, (unsigned long long)last_setattr_fh,
+               (unsigned long long)last_setattr_size,
+               (unsigned long long)last_setattr_lock_owner);
+        goto fail;
+    }
+
+    setattr_count = 0;
+    fallocate_count = 0;
+    last_open_fh = 0;
+    last_fallocate_fh = 0;
+    last_fallocate_offset = 0;
+    last_fallocate_length = 0;
+    last_fallocate_mode = 0;
+    f = open(path, O_RDWR);
+    if (f < 0) {
+        printf("[FAIL] open for fallocate: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    if (syscall(SYS_fallocate, f, 0, 0, 16) != 0) {
+        printf("[FAIL] fallocate: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    close(f);
+    f = -1;
+    usleep(100 * 1000);
+    if (setattr_count != 0 || fallocate_count != 1 || last_fallocate_fh != last_open_fh ||
+        last_fallocate_offset != 0 || last_fallocate_length != 16 || last_fallocate_mode != 0) {
+        printf("[FAIL] fallocate counters setattr=%u fallocate=%u fh=%llu open_fh=%llu "
+               "offset=%llu length=%llu mode=%u\n",
+               setattr_count, fallocate_count, (unsigned long long)last_fallocate_fh,
+               (unsigned long long)last_open_fh, (unsigned long long)last_fallocate_offset,
+               (unsigned long long)last_fallocate_length, last_fallocate_mode);
+        goto fail;
+    }
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_size != 16) {
+        printf("[FAIL] stat after fallocate rc/size errno=%d (%s) size=%lld\n", errno,
+               strerror(errno), (long long)st.st_size);
+        goto fail;
+    }
+
+    setattr_count = 0;
+    fallocate_count = 0;
+    f = open(path, O_RDWR);
+    if (f < 0) {
+        printf("[FAIL] open for fallocate overflow: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    if (syscall(SYS_fallocate, f, 0, INT64_MAX - 1, 4) == 0 || errno != EFBIG) {
+        printf("[FAIL] fallocate overflow expected EFBIG, errno=%d (%s)\n", errno,
+               strerror(errno));
+        goto fail;
+    }
+    close(f);
+    f = -1;
+    usleep(100 * 1000);
+    if (setattr_count != 0 || fallocate_count != 0) {
+        printf("[FAIL] fallocate overflow sent requests setattr=%u fallocate=%u\n", setattr_count,
+               fallocate_count);
+        goto fail;
+    }
+
+    setattr_count = 0;
+    last_setattr_valid = 0;
+    last_setattr_fh = 0;
+    last_setattr_size = 0;
+    last_setattr_lock_owner = 0;
+    write_count = 0;
+    last_write_offset = 0;
+    last_write_size = 0;
+    f = open(path, O_RDWR);
+    if (f < 0) {
+        printf("[FAIL] open for pwrite: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    if (pwrite(f, "xy", 2, 9) != 2) {
+        printf("[FAIL] pwrite hole: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    close(f);
+    f = -1;
+    usleep(100 * 1000);
+    if (setattr_count != 0 || write_count != 1 || last_write_offset != 9 || last_write_size != 2) {
+        printf("[FAIL] pwrite hole counters setattr=%u write=%u offset=%llu size=%u\n",
+               setattr_count, write_count, (unsigned long long)last_write_offset,
+               last_write_size);
         goto fail;
     }
 

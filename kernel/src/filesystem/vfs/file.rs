@@ -1091,10 +1091,6 @@ impl File {
         let actual_offset = offset;
         let actual_len = self.limit_write_len_by_fsize(file_type, actual_offset, len)?;
 
-        if matches!(file_type, FileType::File) && actual_offset > md.size.max(0) as usize {
-            self.inode.resize(actual_offset)?;
-        }
-
         self.write_at_and_finalize(
             actual_offset,
             actual_len,
@@ -1445,9 +1441,12 @@ impl File {
         }
 
         // 统一通过 VFS 封装，复用类型/只读检查，同时保留 fd 上下文。
-        crate::filesystem::vfs::vcore::vfs_truncate_file(self.inode(), len, || {
-            self.private_data.lock()
-        })?;
+        crate::filesystem::vfs::vcore::vfs_truncate_file(
+            self.inode(),
+            len,
+            crate::filesystem::vfs::vcore::current_file_lock_owner_id(),
+            || self.private_data.lock(),
+        )?;
         return Ok(());
     }
 

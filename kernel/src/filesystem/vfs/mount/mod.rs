@@ -1472,13 +1472,35 @@ impl IndexNode for MountFSInode {
     }
 
     #[inline]
+    fn resize_with_lock_owner(&self, len: usize, lock_owner: u64) -> Result<(), SystemError> {
+        self.ensure_mount_writable()?;
+        return self.inner_inode.resize_with_lock_owner(len, lock_owner);
+    }
+
+    #[inline]
     fn resize_file(
         &self,
         len: usize,
+        lock_owner: u64,
         data: MutexGuard<FilePrivateData>,
     ) -> Result<(), SystemError> {
         self.ensure_mount_writable()?;
-        return self.inner_inode.resize_file(len, data);
+        return self.inner_inode.resize_file(len, lock_owner, data);
+    }
+
+    #[inline]
+    fn fallocate_file(
+        &self,
+        mode: i32,
+        offset: usize,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        self.ensure_mount_writable()?;
+        return self
+            .inner_inode
+            .fallocate_file(mode, offset, len, lock_owner, data);
     }
 
     #[inline]

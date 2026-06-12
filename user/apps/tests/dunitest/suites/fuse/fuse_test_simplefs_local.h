@@ -144,6 +144,9 @@ static inline int fuse_test_log_enabled(void) {
 #ifndef FUSE_DESTROY
 #define FUSE_DESTROY 38
 #endif
+#ifndef FUSE_FALLOCATE
+#define FUSE_FALLOCATE 43
+#endif
 #ifndef FUSE_READDIRPLUS
 #define FUSE_READDIRPLUS 44
 #endif
@@ -230,6 +233,9 @@ static inline int fuse_test_log_enabled(void) {
 #endif
 #ifndef FATTR_FH
 #define FATTR_FH (1u << 6)
+#endif
+#ifndef FATTR_LOCKOWNER
+#define FATTR_LOCKOWNER (1u << 9)
 #endif
 
 struct fuse_in_header {
@@ -364,6 +370,14 @@ struct fuse_write_in {
 
 struct fuse_write_out {
     uint32_t size;
+    uint32_t padding;
+};
+
+struct fuse_fallocate_in {
+    uint64_t fh;
+    uint64_t offset;
+    uint64_t length;
+    uint32_t mode;
     uint32_t padding;
 };
 
@@ -678,9 +692,15 @@ struct fuse_daemon_args {
     volatile uint32_t *open_count;
     volatile uint32_t *opendir_count;
     volatile uint32_t *setattr_count;
+    volatile uint32_t *fallocate_count;
     volatile uint32_t *last_setattr_valid;
     volatile uint64_t *last_setattr_fh;
     volatile uint64_t *last_setattr_size;
+    volatile uint64_t *last_setattr_lock_owner;
+    volatile uint64_t *last_fallocate_fh;
+    volatile uint64_t *last_fallocate_offset;
+    volatile uint64_t *last_fallocate_length;
+    volatile uint32_t *last_fallocate_mode;
     volatile uint32_t *release_count;
     volatile uint32_t *releasedir_count;
     volatile uint32_t *readdirplus_count;
@@ -1608,6 +1628,9 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (a->last_setattr_size) {
             *a->last_setattr_size = in->size;
         }
+        if (a->last_setattr_lock_owner) {
+            *a->last_setattr_lock_owner = in->lock_owner;
+        }
         struct simplefs_node *node = simplefs_find_node(&a->fs, h->nodeid);
         if (!node) {
             return fuse_write_reply(a->fd, h->unique, -ENOENT, NULL, 0);
@@ -1628,6 +1651,45 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         memset(&out, 0, sizeof(out));
         simplefs_fill_attr(node, &out.attr);
         return fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out));
+    }
+    case FUSE_FALLOCATE: {
+        if (!a->enable_write_ops) {
+            return fuse_write_reply(a->fd, h->unique, -ENOSYS, NULL, 0);
+        }
+        if (payload_len < sizeof(struct fuse_fallocate_in)) {
+            return -1;
+        }
+        const struct fuse_fallocate_in *in = (const struct fuse_fallocate_in *)payload;
+        if (a->fallocate_count) {
+            (*a->fallocate_count)++;
+        }
+        if (a->last_fallocate_fh) {
+            *a->last_fallocate_fh = in->fh;
+        }
+        if (a->last_fallocate_offset) {
+            *a->last_fallocate_offset = in->offset;
+        }
+        if (a->last_fallocate_length) {
+            *a->last_fallocate_length = in->length;
+        }
+        if (a->last_fallocate_mode) {
+            *a->last_fallocate_mode = in->mode;
+        }
+        struct simplefs_node *node = simplefs_find_node(&a->fs, h->nodeid);
+        if (!node || simplefs_node_is_dir(node) || simplefs_node_is_symlink(node)) {
+            return fuse_write_reply(a->fd, h->unique, -EINVAL, NULL, 0);
+        }
+        if (in->mode != 0) {
+            return fuse_write_reply(a->fd, h->unique, -EOPNOTSUPP, NULL, 0);
+        }
+        if (in->offset > SIMPLEFS_DATA_MAX || in->length > SIMPLEFS_DATA_MAX ||
+            in->offset + in->length > SIMPLEFS_DATA_MAX) {
+            return fuse_write_reply(a->fd, h->unique, -EFBIG, NULL, 0);
+        }
+        if (node->size < in->offset + in->length) {
+            node->size = (size_t)(in->offset + in->length);
+        }
+        return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
     }
     default:
         return fuse_write_reply(a->fd, h->unique, -ENOSYS, NULL, 0);

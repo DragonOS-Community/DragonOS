@@ -472,6 +472,21 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError>;
 
+    /// 基于打开文件上下文执行 fallocate。
+    ///
+    /// 默认不模拟预分配；只有真正支持 fallocate 语义的文件系统应覆盖此方法。
+    fn fallocate_file(
+        &self,
+        _mode: i32,
+        _offset: usize,
+        _len: usize,
+        _lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        drop(data);
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+    }
+
     /// # 在inode的指定偏移量开始，读取指定大小的数据，忽略PageCache
     ///
     /// ## 参数
@@ -548,6 +563,14 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
+    /// 基于当前 files_struct lock owner 重新设置文件大小。
+    ///
+    /// 默认回退到 inode 级 resize；需要 mandatory-locking 协议语义的文件系统
+    /// 可覆盖该方法。
+    fn resize_with_lock_owner(&self, len: usize, _lock_owner: u64) -> Result<(), SystemError> {
+        self.resize(len)
+    }
+
     /// 基于打开文件上下文重新设置文件大小。
     ///
     /// 默认回退到 inode 级 resize；需要文件句柄语义的文件系统（如 FUSE）
@@ -555,10 +578,11 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn resize_file(
         &self,
         len: usize,
+        lock_owner: u64,
         data: MutexGuard<FilePrivateData>,
     ) -> Result<(), SystemError> {
         drop(data);
-        self.resize(len)
+        self.resize_with_lock_owner(len, lock_owner)
     }
 
     /// @brief 在当前目录下创建一个新的inode

@@ -37,16 +37,16 @@ use super::{
     private_data::{FuseFilePrivateData, FuseOpenPrivateData, FuseWritebackHandle},
     protocol::{
         fuse_pack_struct, fuse_read_struct, FuseAccessIn, FuseAttr, FuseAttrOut, FuseCreateIn,
-        FuseDirent, FuseDirentPlus, FuseEntryOut, FuseFlushIn, FuseFsyncIn, FuseGetattrIn,
-        FuseLinkIn, FuseMkdirIn, FuseMknodIn, FuseOpenIn, FuseOpenOut, FuseReadIn, FuseReleaseIn,
-        FuseRename2In, FuseRenameIn, FuseSetattrIn, FuseWriteIn, FuseWriteOut, FATTR_ATIME,
-        FATTR_CTIME, FATTR_FH, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_SIZE, FATTR_UID,
-        FOPEN_DIRECT_IO, FOPEN_KEEP_CACHE, FOPEN_NOFLUSH, FOPEN_NONSEEKABLE, FOPEN_STREAM,
-        FUSE_ACCESS, FUSE_CREATE, FUSE_FLUSH, FUSE_FSYNC, FUSE_FSYNCDIR, FUSE_FSYNC_FDATASYNC,
-        FUSE_GETATTR, FUSE_LINK, FUSE_LOOKUP, FUSE_MKDIR, FUSE_MKNOD, FUSE_OPEN, FUSE_OPENDIR,
-        FUSE_READ, FUSE_READDIR, FUSE_READDIRPLUS, FUSE_READLINK, FUSE_RELEASE, FUSE_RELEASEDIR,
-        FUSE_RENAME, FUSE_RENAME2, FUSE_RMDIR, FUSE_ROOT_ID, FUSE_SETATTR, FUSE_SYMLINK,
-        FUSE_UNLINK, FUSE_WRITE, FUSE_WRITE_CACHE,
+        FuseDirent, FuseDirentPlus, FuseEntryOut, FuseFallocateIn, FuseFlushIn, FuseFsyncIn,
+        FuseGetattrIn, FuseLinkIn, FuseMkdirIn, FuseMknodIn, FuseOpenIn, FuseOpenOut, FuseReadIn,
+        FuseReleaseIn, FuseRename2In, FuseRenameIn, FuseSetattrIn, FuseWriteIn, FuseWriteOut,
+        FATTR_ATIME, FATTR_CTIME, FATTR_FH, FATTR_GID, FATTR_LOCKOWNER, FATTR_MODE, FATTR_MTIME,
+        FATTR_SIZE, FATTR_UID, FOPEN_DIRECT_IO, FOPEN_KEEP_CACHE, FOPEN_NOFLUSH, FOPEN_NONSEEKABLE,
+        FOPEN_STREAM, FUSE_ACCESS, FUSE_CREATE, FUSE_FALLOCATE, FUSE_FLUSH, FUSE_FSYNC,
+        FUSE_FSYNCDIR, FUSE_FSYNC_FDATASYNC, FUSE_GETATTR, FUSE_LINK, FUSE_LOOKUP, FUSE_MKDIR,
+        FUSE_MKNOD, FUSE_OPEN, FUSE_OPENDIR, FUSE_READ, FUSE_READDIR, FUSE_READDIRPLUS,
+        FUSE_READLINK, FUSE_RELEASE, FUSE_RELEASEDIR, FUSE_RENAME, FUSE_RENAME2, FUSE_RMDIR,
+        FUSE_ROOT_ID, FUSE_SETATTR, FUSE_SYMLINK, FUSE_UNLINK, FUSE_WRITE, FUSE_WRITE_CACHE,
     },
 };
 
@@ -271,9 +271,17 @@ impl FuseNode {
         Ok(())
     }
 
-    fn setattr_size(&self, len: usize, fh: Option<u64>) -> Result<(), SystemError> {
+    fn setattr_size(
+        &self,
+        len: usize,
+        lock_owner: Option<u64>,
+        fh: Option<u64>,
+    ) -> Result<(), SystemError> {
         self.check_not_stale()?;
         let mut valid = FATTR_SIZE;
+        if lock_owner.is_some() {
+            valid |= FATTR_LOCKOWNER;
+        }
         if fh.is_some() {
             valid |= FATTR_FH;
         }
@@ -282,7 +290,7 @@ impl FuseNode {
             padding: 0,
             fh: fh.unwrap_or(0),
             size: len as u64,
-            lock_owner: 0,
+            lock_owner: lock_owner.unwrap_or(0),
             atime: 0,
             mtime: 0,
             ctime: 0,
@@ -1521,26 +1529,87 @@ impl IndexNode for FuseNode {
     }
 
     fn resize(&self, len: usize) -> Result<(), SystemError> {
-        self.setattr_size(len, None)
+        self.setattr_size(len, None, None)
+    }
+
+    fn resize_with_lock_owner(&self, len: usize, lock_owner: u64) -> Result<(), SystemError> {
+        self.setattr_size(len, Some(lock_owner), None)
     }
 
     fn resize_file(
         &self,
         len: usize,
+        lock_owner: u64,
         data: MutexGuard<FilePrivateData>,
     ) -> Result<(), SystemError> {
         let fuse_data = match &*data {
             FilePrivateData::Fuse(data) => data.clone(),
             _ => {
                 drop(data);
-                return self.resize(len);
+                return self.resize_with_lock_owner(len, lock_owner);
             }
         };
         drop(data);
 
         match fuse_data {
-            FuseFilePrivateData::File(p) => self.setattr_size(len, Some(p.fh)),
-            _ => self.resize(len),
+            FuseFilePrivateData::File(p) => self.setattr_size(len, Some(lock_owner), Some(p.fh)),
+            _ => self.resize_with_lock_owner(len, lock_owner),
+        }
+    }
+
+    fn fallocate_file(
+        &self,
+        mode: i32,
+        offset: usize,
+        len: usize,
+        _lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        if mode != 0 {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        self.check_not_stale()?;
+        let new_size = offset.checked_add(len).ok_or(SystemError::EFBIG)?;
+        if self.conn().no_fallocate() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+
+        let fuse_data = match &*data {
+            FilePrivateData::Fuse(FuseFilePrivateData::File(data)) => data.clone(),
+            _ => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
+        };
+        drop(data);
+
+        let md = self.metadata()?;
+        if new_size > md.size.max(0) as usize {
+            crate::filesystem::vfs::vcore::check_file_size_limit(new_size)?;
+        }
+
+        let in_arg = FuseFallocateIn {
+            fh: fuse_data.fh,
+            offset: offset as u64,
+            length: len as u64,
+            mode: mode as u32,
+            padding: 0,
+        };
+        match self
+            .conn()
+            .request(FUSE_FALLOCATE, self.nodeid, fuse_pack_struct(&in_arg))
+        {
+            Ok(_) => {
+                if let Some(md) = self.cached_metadata.lock().as_mut() {
+                    if new_size > md.size.max(0) as usize {
+                        md.size = new_size as i64;
+                    }
+                }
+                self.cached_metadata_deadline_ns.store(0, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(SystemError::ENOSYS) => {
+                self.conn().mark_no_fallocate();
+                Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+            }
+            Err(e) => Err(e),
         }
     }
 

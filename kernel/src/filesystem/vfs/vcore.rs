@@ -16,15 +16,22 @@ use crate::{
         procfs::procfs_init,
         sysfs::sysfs_init,
         vfs::{
-            file::FilePrivateData, mount::MountFlags, permission::PermissionMask, AtomicInodeId,
-            FileSystem, FileType, InodeFlags, InodeMode, MountFS,
+            file::{File, FileMode, FilePrivateData},
+            mount::MountFlags,
+            permission::PermissionMask,
+            AtomicInodeId, FileSystem, FileType, InodeFlags, InodeMode, MountFS,
         },
     },
     init::cmdline::kenrel_cmdline_param_manager,
+    ipc::kill::send_signal_to_pid,
     libs::mutex::MutexGuard,
     mm::truncate::truncate_inode_pages,
-    process::{cred::CAPFlags, namespace::mnt::mnt_namespace_init, ProcessManager},
+    process::{
+        cred::CAPFlags, namespace::mnt::mnt_namespace_init, resource::RLimitID, ProcessManager,
+    },
 };
+
+use crate::arch::ipc::signal::Signal;
 
 use super::{
     stat::LookUpFlags,
@@ -702,6 +709,13 @@ pub(super) fn do_file_lookup_at(
     return inode.lookup_follow_symlink2(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES, follow_final);
 }
 
+#[inline]
+pub fn current_file_lock_owner_id() -> u64 {
+    let binding = ProcessManager::current_pcb().fd_table();
+    let fd_table_guard = binding.read();
+    fd_table_guard.lock_owner_id() as u64
+}
+
 #[inline(never)]
 fn vfs_truncate_inner<F>(
     inode: Arc<dyn IndexNode>,
@@ -786,7 +800,10 @@ where
 /// - 只读挂载返回 EROFS
 #[inline(never)]
 pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemError> {
-    vfs_truncate_inner(inode, len, |inode| inode.resize(len))
+    let lock_owner = current_file_lock_owner_id();
+    vfs_truncate_inner(inode, len, |inode| {
+        inode.resize_with_lock_owner(len, lock_owner)
+    })
 }
 
 /// 基于已打开文件执行 VFS 截断，保留公共检查，并把 fd 私有数据传给文件系统。
@@ -794,7 +811,120 @@ pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemE
 pub fn vfs_truncate_file<'a>(
     inode: Arc<dyn IndexNode>,
     len: usize,
+    lock_owner: u64,
     data: impl FnOnce() -> MutexGuard<'a, FilePrivateData>,
 ) -> Result<(), SystemError> {
-    vfs_truncate_inner(inode, len, |inode| inode.resize_file(len, data()))
+    vfs_truncate_inner(inode, len, |inode| {
+        inode.resize_file(len, lock_owner, data())
+    })
+}
+
+pub fn check_file_size_limit(new_size: usize) -> Result<(), SystemError> {
+    let current_pcb = ProcessManager::current_pcb();
+    let fsize_limit = current_pcb.get_rlimit(RLimitID::Fsize);
+    if fsize_limit.rlim_cur != u64::MAX && new_size as u64 > fsize_limit.rlim_cur {
+        let _ = send_signal_to_pid(current_pcb.raw_pid(), Signal::SIGXFSZ);
+        return Err(SystemError::EFBIG);
+    }
+    Ok(())
+}
+
+/// 基于已打开文件执行 VFS fallocate 公共检查，再分派给具体文件系统。
+#[inline(never)]
+pub fn vfs_fallocate_file(
+    file: Arc<File>,
+    mode: i32,
+    offset: usize,
+    len: usize,
+) -> Result<(), SystemError> {
+    const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
+    const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
+    const FALLOC_FL_COLLAPSE_RANGE: u32 = 0x08;
+    const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
+    const FALLOC_FL_INSERT_RANGE: u32 = 0x20;
+    const FALLOC_FL_UNSHARE_RANGE: u32 = 0x40;
+    const FALLOC_FL_SUPPORTED_MASK: u32 = FALLOC_FL_KEEP_SIZE
+        | FALLOC_FL_PUNCH_HOLE
+        | FALLOC_FL_COLLAPSE_RANGE
+        | FALLOC_FL_ZERO_RANGE
+        | FALLOC_FL_INSERT_RANGE
+        | FALLOC_FL_UNSHARE_RANGE;
+
+    if len == 0 || offset > isize::MAX as usize || len > isize::MAX as usize {
+        return Err(SystemError::EINVAL);
+    }
+
+    let mode_bits = mode as u32;
+    if mode < 0 || (mode_bits & !FALLOC_FL_SUPPORTED_MASK) != 0 {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+    if (mode_bits & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE))
+        == (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE)
+    {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+    if (mode_bits & FALLOC_FL_PUNCH_HOLE) != 0 && (mode_bits & FALLOC_FL_KEEP_SIZE) == 0 {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+    if (mode_bits & FALLOC_FL_COLLAPSE_RANGE) != 0 && (mode_bits & !FALLOC_FL_COLLAPSE_RANGE) != 0 {
+        return Err(SystemError::EINVAL);
+    }
+    if (mode_bits & FALLOC_FL_INSERT_RANGE) != 0 && (mode_bits & !FALLOC_FL_INSERT_RANGE) != 0 {
+        return Err(SystemError::EINVAL);
+    }
+    if (mode_bits & FALLOC_FL_UNSHARE_RANGE) != 0
+        && (mode_bits & !(FALLOC_FL_UNSHARE_RANGE | FALLOC_FL_KEEP_SIZE)) != 0
+    {
+        return Err(SystemError::EINVAL);
+    }
+
+    let mode_flags = file.mode();
+    if mode_flags.contains(FileMode::FMODE_PATH) {
+        return Err(SystemError::EBADF);
+    }
+    if !mode_flags.contains(FileMode::FMODE_WRITE) || !mode_flags.can_write() {
+        return Err(SystemError::EBADF);
+    }
+
+    let inode = file.inode();
+    let md = inode.metadata()?;
+    if md.flags.contains(InodeFlags::S_APPEND) && (mode_bits & !FALLOC_FL_KEEP_SIZE) != 0 {
+        return Err(SystemError::EPERM);
+    }
+    if md.flags.contains(InodeFlags::S_IMMUTABLE) {
+        return Err(SystemError::EPERM);
+    }
+    if md.flags.contains(InodeFlags::S_SWAPFILE) {
+        return Err(SystemError::ETXTBSY);
+    }
+
+    let fs = inode.fs();
+    if let Some(mfs) = fs.clone().downcast_arc::<MountFS>() {
+        if mfs
+            .mount_flags()
+            .contains(crate::filesystem::vfs::mount::MountFlags::RDONLY)
+        {
+            return Err(SystemError::EROFS);
+        }
+    }
+
+    match md.file_type {
+        FileType::File | FileType::BlockDevice => {}
+        FileType::Dir => return Err(SystemError::EISDIR),
+        FileType::Pipe => return Err(SystemError::ESPIPE),
+        _ => return Err(SystemError::ENODEV),
+    }
+
+    let new_size = offset.checked_add(len).ok_or(SystemError::EFBIG)?;
+    if new_size > isize::MAX as usize {
+        return Err(SystemError::EFBIG);
+    }
+
+    inode.fallocate_file(
+        mode,
+        offset,
+        len,
+        current_file_lock_owner_id(),
+        file.private_data.lock(),
+    )
 }

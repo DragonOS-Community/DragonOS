@@ -159,6 +159,7 @@ struct FuseConnInner {
     no_open: bool,
     no_opendir: bool,
     no_readdirplus: bool,
+    no_fallocate: bool,
     no_interrupt: bool,
     max_write_cap: usize,
     pending: VecDeque<Arc<FuseRequest>>,
@@ -214,6 +215,7 @@ impl FuseConn {
                 no_open: false,
                 no_opendir: false,
                 no_readdirplus: false,
+                no_fallocate: false,
                 no_interrupt: false,
                 max_write_cap,
                 pending: VecDeque::new(),
@@ -318,6 +320,14 @@ impl FuseConn {
     pub fn disable_readdirplus(&self) {
         let mut g = self.inner.lock();
         g.no_readdirplus = true;
+    }
+
+    pub fn no_fallocate(&self) -> bool {
+        self.inner.lock().no_fallocate
+    }
+
+    pub fn mark_no_fallocate(&self) {
+        self.inner.lock().no_fallocate = true;
     }
 
     fn alloc_unique(&self) -> u64 {

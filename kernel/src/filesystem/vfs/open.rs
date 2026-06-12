@@ -8,7 +8,7 @@ use super::{
     permission::PermissionMask,
     syscall::{OpenHow, OpenHowResolve},
     utils::{rsplit_path, should_remove_sgid_on_chown, user_path_at},
-    vcore::{check_parent_dir_permission_inode, resolve_parent_inode},
+    vcore::{check_parent_dir_permission_inode, resolve_parent_inode, vfs_truncate},
     FileType, FsPermissionPolicy, IndexNode, InodeMode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 use crate::{filesystem::vfs::syscall::UtimensFlags, process::cred::Kgid};
@@ -395,7 +395,7 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
     // 因为 O_TRUNC 的截断基于文件系统权限，而不是打开模式
     // 例如：open(file, O_RDONLY | O_TRUNC) 是合法的，只要用户对文件有写权限
     if file_type == FileType::File && inode.truncate_before_open(&how.o_flags) {
-        inode.resize(0)?;
+        vfs_truncate(inode.clone(), 0)?;
     }
     let file: File = File::new(inode, how.o_flags)?;
     let cloexec = how.o_flags.contains(FileFlags::O_CLOEXEC);

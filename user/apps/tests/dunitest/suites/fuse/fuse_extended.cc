@@ -313,6 +313,7 @@ static int ext_test_p3_interrupt() {
     volatile int init_done = 0;
     volatile uint32_t interrupt_count = 0;
     volatile uint64_t blocked_read_unique = 0;
+    volatile uint64_t last_interrupt_header_unique = 0;
     volatile uint64_t last_interrupt_target = 0;
 
     struct fuse_daemon_args args;
@@ -325,6 +326,7 @@ static int ext_test_p3_interrupt() {
     args.block_read_until_interrupt = 1000;
     args.interrupt_count = &interrupt_count;
     args.blocked_read_unique = &blocked_read_unique;
+    args.last_interrupt_header_unique = &last_interrupt_header_unique;
     args.last_interrupt_target = &last_interrupt_target;
 
     pthread_t daemon_th;
@@ -403,6 +405,12 @@ static int ext_test_p3_interrupt() {
     if (last_interrupt_target == 0 || last_interrupt_target != blocked_read_unique) {
         printf("[FAIL] interrupt target mismatch: blocked=%llu interrupt_target=%llu\n",
                (unsigned long long)blocked_read_unique, (unsigned long long)last_interrupt_target);
+        goto fail;
+    }
+    if (last_interrupt_header_unique != (blocked_read_unique | 1ULL)) {
+        printf("[FAIL] interrupt header unique mismatch: blocked=%llu header=%llu\n",
+               (unsigned long long)blocked_read_unique,
+               (unsigned long long)last_interrupt_header_unique);
         goto fail;
     }
 
@@ -890,11 +898,18 @@ static int ext_test_fsetfl_updates_fuse_io_flags() {
     volatile uint32_t open_count = 0;
     volatile uint32_t read_count = 0;
     volatile uint32_t write_count = 0;
+    volatile uint32_t flush_count = 0;
     volatile uint32_t release_count = 0;
     volatile uint32_t last_open_flags = 0;
     volatile uint32_t last_read_flags = 0;
     volatile uint32_t last_write_flags = 0;
+    volatile uint32_t last_flush_uid = UINT32_MAX;
+    volatile uint32_t last_flush_gid = UINT32_MAX;
+    volatile uint32_t last_flush_pid = 0;
     volatile uint32_t last_release_flags = 0;
+    volatile uint32_t last_release_uid = UINT32_MAX;
+    volatile uint32_t last_release_gid = UINT32_MAX;
+    volatile uint32_t last_release_pid = UINT32_MAX;
 
     struct fuse_daemon_args args;
     memset(&args, 0, sizeof(args));
@@ -906,11 +921,18 @@ static int ext_test_fsetfl_updates_fuse_io_flags() {
     args.open_count = &open_count;
     args.read_count = &read_count;
     args.write_count = &write_count;
+    args.flush_count = &flush_count;
     args.release_count = &release_count;
     args.last_open_in_flags = &last_open_flags;
     args.last_read_open_flags = &last_read_flags;
     args.last_write_open_flags = &last_write_flags;
+    args.last_flush_uid = &last_flush_uid;
+    args.last_flush_gid = &last_flush_gid;
+    args.last_flush_pid = &last_flush_pid;
     args.last_release_in_flags = &last_release_flags;
+    args.last_release_uid = &last_release_uid;
+    args.last_release_gid = &last_release_gid;
+    args.last_release_pid = &last_release_pid;
 
     pthread_t th;
     if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
@@ -967,9 +989,10 @@ static int ext_test_fsetfl_updates_fuse_io_flags() {
     usleep(100 * 1000);
 
     expected_setfl = (uint32_t)(old_flags | O_NONBLOCK);
-    if (open_count != 1 || read_count != 1 || write_count != 1 || release_count != 1) {
-        printf("[FAIL] counters open=%u read=%u write=%u release=%u\n", open_count, read_count,
-               write_count, release_count);
+    if (open_count != 1 || read_count != 1 || write_count != 1 || flush_count != 1 ||
+        release_count != 1) {
+        printf("[FAIL] counters open=%u read=%u write=%u flush=%u release=%u\n", open_count,
+               read_count, write_count, flush_count, release_count);
         goto fail;
     }
     if (last_open_flags != expected_open) {
@@ -980,6 +1003,16 @@ static int ext_test_fsetfl_updates_fuse_io_flags() {
         last_release_flags != expected_setfl) {
         printf("[FAIL] updated flags read=0%o write=0%o release=0%o expected=0%o\n",
                last_read_flags, last_write_flags, last_release_flags, expected_setfl);
+        goto fail;
+    }
+    if (last_flush_uid != 0 || last_flush_gid != 0 || last_flush_pid == 0) {
+        printf("[FAIL] flush should use caller credentials uid=%u gid=%u pid=%u\n",
+               last_flush_uid, last_flush_gid, last_flush_pid);
+        goto fail;
+    }
+    if (last_release_uid != 0 || last_release_gid != 0 || last_release_pid != 0) {
+        printf("[FAIL] release should use nocreds uid=%u gid=%u pid=%u\n", last_release_uid,
+               last_release_gid, last_release_pid);
         goto fail;
     }
 
@@ -1315,6 +1348,10 @@ static int ext_test_fopen_nonseekable_dir_mode(uint32_t open_out_flags, const ch
 
     volatile int stop = 0;
     volatile int init_done = 0;
+    volatile uint32_t releasedir_count = 0;
+    volatile uint32_t last_releasedir_uid = UINT32_MAX;
+    volatile uint32_t last_releasedir_gid = UINT32_MAX;
+    volatile uint32_t last_releasedir_pid = UINT32_MAX;
 
     struct fuse_daemon_args args;
     memset(&args, 0, sizeof(args));
@@ -1323,6 +1360,10 @@ static int ext_test_fopen_nonseekable_dir_mode(uint32_t open_out_flags, const ch
     args.init_done = &init_done;
     args.stop_on_destroy = 1;
     args.root_open_out_flags = open_out_flags;
+    args.releasedir_count = &releasedir_count;
+    args.last_releasedir_uid = &last_releasedir_uid;
+    args.last_releasedir_gid = &last_releasedir_gid;
+    args.last_releasedir_pid = &last_releasedir_pid;
 
     pthread_t th;
     if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
@@ -1361,6 +1402,15 @@ static int ext_test_fopen_nonseekable_dir_mode(uint32_t open_out_flags, const ch
 
     close(f);
     f = -1;
+    usleep(100 * 1000);
+
+    if (releasedir_count != 1 || last_releasedir_uid != 0 || last_releasedir_gid != 0 ||
+        last_releasedir_pid != 0) {
+        printf("[FAIL] releasedir nocreds count=%u uid=%u gid=%u pid=%u\n", releasedir_count,
+               last_releasedir_uid, last_releasedir_gid, last_releasedir_pid);
+        goto fail;
+    }
+
     if (umount(mp) != 0) {
         printf("[FAIL] umount(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
         goto fail_no_umount;
@@ -3149,6 +3199,9 @@ static int ext_test_shared_writable_mmap_msync_writeback() {
         volatile uint32_t last_write_size;
         volatile uint32_t last_write_flags;
         volatile uint32_t last_write_open_flags;
+        volatile uint32_t last_write_uid;
+        volatile uint32_t last_write_gid;
+        volatile uint32_t last_write_pid;
     };
     struct mmap_shared_state *shared =
         (struct mmap_shared_state *)mmap(NULL, sizeof(*shared), PROT_READ | PROT_WRITE,
@@ -3197,6 +3250,9 @@ static int ext_test_shared_writable_mmap_msync_writeback() {
         child_args.last_write_size = &shared->last_write_size;
         child_args.last_write_flags = &shared->last_write_flags;
         child_args.last_write_open_flags = &shared->last_write_open_flags;
+        child_args.last_write_uid = &shared->last_write_uid;
+        child_args.last_write_gid = &shared->last_write_gid;
+        child_args.last_write_pid = &shared->last_write_pid;
         child_args.next_open_fh = 900;
         fuse_daemon_thread(&child_args);
         _exit(0);
@@ -3246,12 +3302,14 @@ static int ext_test_shared_writable_mmap_msync_writeback() {
     if (shared->open_count != 1 || shared->read_count != 1 || shared->write_count != 1 ||
         shared->last_write_fh != 900 || shared->last_write_offset != 0 ||
         shared->last_write_size != 16 || shared->last_write_flags != FUSE_WRITE_CACHE ||
-        shared->last_write_open_flags != 0) {
-        printf("[FAIL] shared writable mmap counters open=%u read=%u write=%u wfh=%llu off=%llu size=%u wflags=%u oflags=%u\n",
+        shared->last_write_open_flags != 0 || shared->last_write_uid != 0 ||
+        shared->last_write_gid != 0 || shared->last_write_pid != 0) {
+        printf("[FAIL] shared writable mmap counters open=%u read=%u write=%u wfh=%llu off=%llu size=%u wflags=%u oflags=%u uid=%u gid=%u pid=%u\n",
                shared->open_count, shared->read_count, shared->write_count,
                (unsigned long long)shared->last_write_fh,
                (unsigned long long)shared->last_write_offset, shared->last_write_size,
-               shared->last_write_flags, shared->last_write_open_flags);
+               shared->last_write_flags, shared->last_write_open_flags, shared->last_write_uid,
+               shared->last_write_gid, shared->last_write_pid);
         goto fail;
     }
 

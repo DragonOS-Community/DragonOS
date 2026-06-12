@@ -665,6 +665,9 @@ struct fuse_daemon_args {
     volatile uint32_t *init_in_max_readahead;
     volatile uint32_t *access_count;
     volatile uint32_t *flush_count;
+    volatile uint32_t *last_flush_uid;
+    volatile uint32_t *last_flush_gid;
+    volatile uint32_t *last_flush_pid;
     volatile uint32_t *fsync_count;
     volatile uint32_t *fsyncdir_count;
     volatile uint32_t *create_count;
@@ -688,14 +691,24 @@ struct fuse_daemon_args {
     volatile uint32_t *last_write_size;
     volatile uint32_t *last_write_flags;
     volatile uint32_t *last_write_open_flags;
+    volatile uint32_t *last_write_uid;
+    volatile uint32_t *last_write_gid;
+    volatile uint32_t *last_write_pid;
     volatile uint64_t *last_fsync_fh;
     volatile uint64_t *last_release_fh;
+    volatile uint32_t *last_release_uid;
+    volatile uint32_t *last_release_gid;
+    volatile uint32_t *last_release_pid;
+    volatile uint32_t *last_releasedir_uid;
+    volatile uint32_t *last_releasedir_gid;
+    volatile uint32_t *last_releasedir_pid;
     volatile uint64_t *read_offsets;
     volatile uint64_t *read_fhs;
     volatile uint32_t *read_sizes;
     uint32_t read_trace_capacity;
     volatile uint32_t *interrupt_count;
     volatile uint64_t *blocked_read_unique;
+    volatile uint64_t *last_interrupt_header_unique;
     volatile uint64_t *last_interrupt_target;
     uint32_t access_deny_mask;
     uint32_t init_out_flags_override;
@@ -1153,11 +1166,29 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (a->last_release_fh) {
             *a->last_release_fh = in->fh;
         }
+        if (a->last_release_uid) {
+            *a->last_release_uid = h->uid;
+        }
+        if (a->last_release_gid) {
+            *a->last_release_gid = h->gid;
+        }
+        if (a->last_release_pid) {
+            *a->last_release_pid = h->pid;
+        }
         return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
     }
     case FUSE_RELEASEDIR:
         if (a->releasedir_count) {
             (*a->releasedir_count)++;
+        }
+        if (a->last_releasedir_uid) {
+            *a->last_releasedir_uid = h->uid;
+        }
+        if (a->last_releasedir_gid) {
+            *a->last_releasedir_gid = h->gid;
+        }
+        if (a->last_releasedir_pid) {
+            *a->last_releasedir_pid = h->pid;
         }
         return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
     case FUSE_INTERRUPT: {
@@ -1168,6 +1199,9 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (a->interrupt_count) {
             (*a->interrupt_count)++;
         }
+        if (a->last_interrupt_header_unique) {
+            *a->last_interrupt_header_unique = h->unique;
+        }
         if (a->last_interrupt_target) {
             *a->last_interrupt_target = in->unique;
         }
@@ -1176,6 +1210,15 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
     case FUSE_FLUSH:
         if (a->flush_count) {
             (*a->flush_count)++;
+        }
+        if (a->last_flush_uid) {
+            *a->last_flush_uid = h->uid;
+        }
+        if (a->last_flush_gid) {
+            *a->last_flush_gid = h->gid;
+        }
+        if (a->last_flush_pid) {
+            *a->last_flush_pid = h->pid;
         }
         return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
     case FUSE_FSYNC: {
@@ -1252,6 +1295,15 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         }
         if (a->last_write_open_flags) {
             *a->last_write_open_flags = in->flags;
+        }
+        if (a->last_write_uid) {
+            *a->last_write_uid = h->uid;
+        }
+        if (a->last_write_gid) {
+            *a->last_write_gid = h->gid;
+        }
+        if (a->last_write_pid) {
+            *a->last_write_pid = h->pid;
         }
         size_t to_copy = in->size;
         if (in->offset + to_copy > SIMPLEFS_DATA_MAX) {

@@ -444,7 +444,9 @@ impl FuseNode {
             let mut payload_in = Vec::with_capacity(size_of::<FuseWriteIn>() + chunk);
             payload_in.extend_from_slice(fuse_pack_struct(&write_in));
             payload_in.extend_from_slice(&buf[total..total + chunk]);
-            let payload = self.conn().request(FUSE_WRITE, self.nodeid, &payload_in)?;
+            let payload = self
+                .conn()
+                .request_nocreds(FUSE_WRITE, self.nodeid, &payload_in)?;
             let out: FuseWriteOut = fuse_read_struct(&payload)?;
             if out.size as usize != chunk {
                 return Err(SystemError::EIO);
@@ -734,7 +736,7 @@ impl FuseNode {
         };
         let _ = self
             .conn()
-            .request(opcode, self.nodeid, fuse_pack_struct(&inarg))?;
+            .request_nocreds(opcode, self.nodeid, fuse_pack_struct(&inarg))?;
         Ok(())
     }
 

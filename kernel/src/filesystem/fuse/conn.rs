@@ -67,6 +67,16 @@ struct FuseRequestCred {
     pid: u32,
 }
 
+impl FuseRequestCred {
+    fn nocreds() -> Self {
+        Self {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct FusePendingState {
     unique: u64,
@@ -149,6 +159,7 @@ struct FuseConnInner {
     no_open: bool,
     no_opendir: bool,
     no_readdirplus: bool,
+    no_interrupt: bool,
     max_write_cap: usize,
     pending: VecDeque<Arc<FuseRequest>>,
     processing: BTreeMap<u64, Arc<FusePendingState>>,
@@ -166,6 +177,7 @@ pub struct FuseConn {
 }
 
 impl FuseConn {
+    const FUSE_INT_REQ_BIT: u64 = 1;
     // Keep this in sync with `sys_read.rs` userspace chunking size.
     const USER_READ_CHUNK: usize = 64 * 1024;
     const MIN_MAX_WRITE: usize = 4096;
@@ -202,6 +214,7 @@ impl FuseConn {
                 no_open: false,
                 no_opendir: false,
                 no_readdirplus: false,
+                no_interrupt: false,
                 max_write_cap,
                 pending: VecDeque::new(),
                 processing: BTreeMap::new(),
@@ -433,14 +446,24 @@ impl FuseConn {
         }
         let can_send = {
             let g = self.inner.lock();
-            g.connected && g.mounted && g.initialized
+            g.connected
+                && g.mounted
+                && g.initialized
+                && !g.no_interrupt
+                && g.processing.contains_key(&unique)
         };
         if !can_send {
             return Ok(());
         }
         let inarg = FuseInterruptIn { unique };
-        let _ = self.enqueue_request(FUSE_INTERRUPT, 0, fuse_pack_struct(&inarg))?;
-        Ok(())
+        let req = self.build_request(
+            unique | Self::FUSE_INT_REQ_BIT,
+            FUSE_INTERRUPT,
+            0,
+            fuse_pack_struct(&inarg),
+            FuseRequestCred::nocreds(),
+        );
+        self.push_request(req, None, unique | Self::FUSE_INT_REQ_BIT)
     }
 
     /// Acquire a new `/dev/fuse` file handle reference to this connection.
@@ -638,6 +661,28 @@ impl FuseConn {
             self.wait_initialized()?;
         }
         let pending = self.enqueue_request(opcode, nodeid, payload)?;
+        self.wait_request_complete(opcode, pending)
+    }
+
+    pub fn request_nocreds(
+        &self,
+        opcode: u32,
+        nodeid: u64,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, SystemError> {
+        if opcode != FUSE_INIT {
+            self.wait_initialized()?;
+        }
+        let pending =
+            self.enqueue_request_with_cred(opcode, nodeid, payload, FuseRequestCred::nocreds())?;
+        self.wait_request_complete(opcode, pending)
+    }
+
+    fn wait_request_complete(
+        &self,
+        opcode: u32,
+        pending: Arc<FusePendingState>,
+    ) -> Result<Vec<u8>, SystemError> {
         match pending.wait_complete() {
             Err(SystemError::EINTR) | Err(SystemError::ERESTARTSYS) => {
                 if opcode != FUSE_INTERRUPT {
@@ -672,18 +717,13 @@ impl FuseConn {
         nodeid: u64,
         payload: &[u8],
     ) -> Result<Arc<FusePendingState>, SystemError> {
-        let unique = self.alloc_unique();
-
         let pcb = ProcessManager::current_pcb();
         let cred = pcb.cred();
         if !self.allow_current_process(&cred) {
             return Err(SystemError::EACCES);
         }
         let pid = pcb.task_tgid_vnr().map(|p| p.data() as u32).unwrap_or(0);
-        let pending_state = Arc::new(FusePendingState::new(unique, opcode));
-
-        let req = self.build_request(
-            unique,
+        self.enqueue_request_with_cred(
             opcode,
             nodeid,
             payload,
@@ -692,7 +732,20 @@ impl FuseConn {
                 gid: cred.fsgid.data() as u32,
                 pid,
             },
-        );
+        )
+    }
+
+    fn enqueue_request_with_cred(
+        &self,
+        opcode: u32,
+        nodeid: u64,
+        payload: &[u8],
+        req_cred: FuseRequestCred,
+    ) -> Result<Arc<FusePendingState>, SystemError> {
+        let unique = self.alloc_unique();
+        let pending_state = Arc::new(FusePendingState::new(unique, opcode));
+
+        let req = self.build_request(unique, opcode, nodeid, payload, req_cred);
         self.push_request(req, Some(pending_state.clone()), unique)?;
         Ok(pending_state)
     }
@@ -762,6 +815,10 @@ impl FuseConn {
             let payload = &data[core::mem::size_of::<FuseOutHeader>()..];
             self.handle_notify(out_hdr.error, payload)?;
             return Ok(data.len());
+        }
+
+        if (out_hdr.unique & Self::FUSE_INT_REQ_BIT) != 0 {
+            return self.write_interrupt_reply(&out_hdr, data.len());
         }
 
         let pending = {
@@ -867,6 +924,36 @@ impl FuseConn {
 
         pending.complete(Ok(payload.to_vec()));
         Ok(data.len())
+    }
+
+    fn write_interrupt_reply(
+        &self,
+        out_hdr: &FuseOutHeader,
+        data_len: usize,
+    ) -> Result<usize, SystemError> {
+        if data_len != core::mem::size_of::<FuseOutHeader>() {
+            return Err(SystemError::EINVAL);
+        }
+        if out_hdr.error <= -512 || out_hdr.error > 0 {
+            return Err(SystemError::EINVAL);
+        }
+
+        let target_unique = out_hdr.unique & !Self::FUSE_INT_REQ_BIT;
+        {
+            let mut g = self.inner.lock();
+            if !g.connected || !g.processing.contains_key(&target_unique) {
+                return Err(SystemError::ENOENT);
+            }
+            if out_hdr.error == -SystemError::ENOSYS.to_posix_errno() {
+                g.no_interrupt = true;
+            }
+        }
+
+        if out_hdr.error == -SystemError::EAGAIN_OR_EWOULDBLOCK.to_posix_errno() {
+            self.queue_interrupt(target_unique)?;
+        }
+
+        Ok(data_len)
     }
 
     fn handle_notify(&self, code: i32, payload: &[u8]) -> Result<(), SystemError> {

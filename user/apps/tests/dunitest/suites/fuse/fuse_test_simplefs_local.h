@@ -191,6 +191,12 @@ static inline int fuse_test_log_enabled(void) {
 #ifndef FOPEN_DIRECT_IO
 #define FOPEN_DIRECT_IO (1u << 0)
 #endif
+#ifndef FOPEN_NONSEEKABLE
+#define FOPEN_NONSEEKABLE (1u << 2)
+#endif
+#ifndef FOPEN_STREAM
+#define FOPEN_STREAM (1u << 4)
+#endif
 #ifndef FOPEN_NOFLUSH
 #define FOPEN_NOFLUSH (1u << 5)
 #endif
@@ -647,6 +653,7 @@ struct fuse_daemon_args {
     int stop_on_destroy;
     uint32_t root_mode_override;
     uint32_t hello_mode_override;
+    uint32_t root_open_out_flags;
     uint32_t hello_open_out_flags;
     volatile uint32_t *dynamic_hello_open_out_flags;
     volatile unsigned char *dynamic_hello_first_byte;
@@ -1558,6 +1565,9 @@ static inline void *fuse_daemon_thread(void *arg) {
     simplefs_init(&a->fs);
     if (a->root_mode_override) {
         a->fs.nodes[0].mode = a->root_mode_override;
+    }
+    if (a->root_open_out_flags != 0) {
+        a->fs.nodes[0].open_out_flags = a->root_open_out_flags;
     }
     if (a->hello_mode_override) {
         a->fs.nodes[1].mode = a->hello_mode_override;

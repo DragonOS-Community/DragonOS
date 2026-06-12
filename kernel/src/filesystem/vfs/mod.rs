@@ -45,8 +45,12 @@ use crate::{
     time::PosixTimeSpec,
 };
 
-use self::{file::FileFlags, utils::DName, vcore::generate_inode_id};
 pub use self::{file::FilePrivateData, mount::MountFS};
+use self::{
+    file::{FileFlags, FileMode},
+    utils::DName,
+    vcore::generate_inode_id,
+};
 
 use super::page_cache::PageCache;
 
@@ -416,6 +420,13 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         // 若文件系统没有实现此方法，则返回"不支持"
         return Err(SystemError::ENOSYS);
     }
+
+    /// Adjust per-open file mode bits after `open()` initialized private data.
+    ///
+    /// This models Linux helpers such as `nonseekable_open()` and
+    /// `stream_open()` without making VFS syscalls know filesystem-specific
+    /// protocol flags.
+    fn adjust_file_mode_after_open(&self, _data: &FilePrivateData, _mode: &mut FileMode) {}
 
     /// @brief 关闭文件
     ///

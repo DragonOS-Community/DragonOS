@@ -715,6 +715,8 @@ impl File {
             mode.insert(FileMode::FMODE_PWRITE);
         }
 
+        inode.adjust_file_mode_after_open(&private_data.lock(), &mut mode);
+
         // TODO: 检查inode是否有read/write方法,设置FMODE_CAN_READ/WRITE
         // 这需要在IndexNode trait中添加相应的检查方法
         if mode.contains(FileMode::FMODE_READ) {
@@ -787,22 +789,25 @@ impl File {
     /// - `Ok(usize)`: 成功读取的字节数
     /// - `Err(SystemError)`: 错误码
     pub fn read(&self, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
-        self.do_read(
-            self.offset.load(core::sync::atomic::Ordering::SeqCst),
-            len,
-            buf,
-            true,
-        )
+        let stream = self.mode.read().contains(FileMode::FMODE_STREAM);
+        let offset = if stream {
+            0
+        } else {
+            self.offset.load(Ordering::SeqCst)
+        };
+
+        self.do_read(offset, len, buf, !stream)
     }
 
     /// Read from the current file position without advancing it.
     pub fn read_noadv(&self, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
-        self.do_read(
-            self.offset.load(core::sync::atomic::Ordering::SeqCst),
-            len,
-            buf,
-            false,
-        )
+        let offset = if self.mode.read().contains(FileMode::FMODE_STREAM) {
+            0
+        } else {
+            self.offset.load(Ordering::SeqCst)
+        };
+
+        self.do_read(offset, len, buf, false)
     }
 
     /// ## 从buffer向文件写入指定的字节数的数据
@@ -816,13 +821,14 @@ impl File {
     /// - `Ok(usize)`: 成功写入的字节数
     /// - `Err(SystemError)`: 错误码
     pub fn write(&self, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
-        self.do_write(
-            self.offset.load(core::sync::atomic::Ordering::SeqCst),
-            len,
-            buf,
-            true,
-            false,
-        )
+        let stream = self.mode.read().contains(FileMode::FMODE_STREAM);
+        let offset = if stream {
+            0
+        } else {
+            self.offset.load(Ordering::SeqCst)
+        };
+
+        self.do_write(offset, len, buf, !stream, false)
     }
 
     /// ## 从文件中指定的偏移处读取指定的字节数到buf中

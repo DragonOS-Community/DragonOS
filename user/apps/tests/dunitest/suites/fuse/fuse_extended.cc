@@ -957,6 +957,222 @@ fail_no_umount:
     return -1;
 }
 
+static int ext_test_fopen_nonseekable_mode(uint32_t open_out_flags, const char *mp,
+                                           int expect_stream) {
+    int f = -1;
+    char buf[8];
+    ssize_t n = -1;
+    volatile uint64_t last_write_offset = UINT64_MAX;
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.enable_write_ops = 1;
+    args.stop_on_destroy = 1;
+    args.hello_open_out_flags = open_out_flags;
+    args.last_write_offset = &last_write_offset;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    char path[256];
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    f = open(path, O_RDWR);
+    if (f < 0) {
+        printf("[FAIL] open(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+
+    errno = 0;
+    if (lseek(f, 0, SEEK_SET) >= 0 || errno != ESPIPE) {
+        printf("[FAIL] lseek expected ESPIPE, ret errno=%d (%s)\n", errno, strerror(errno));
+        goto fail;
+    }
+    errno = 0;
+    if (pread(f, buf, 1, 0) >= 0 || errno != ESPIPE) {
+        printf("[FAIL] pread expected ESPIPE, errno=%d (%s)\n", errno, strerror(errno));
+        goto fail;
+    }
+    errno = 0;
+    if (pwrite(f, "x", 1, 0) >= 0 || errno != ESPIPE) {
+        printf("[FAIL] pwrite expected ESPIPE, errno=%d (%s)\n", errno, strerror(errno));
+        goto fail;
+    }
+
+    memset(buf, 0, sizeof(buf));
+    if (read(f, buf, 5) != 5 || memcmp(buf, "hello", 5) != 0) {
+        printf("[FAIL] ordinary read failed got='%.*s' errno=%d\n", 5, buf, errno);
+        goto fail;
+    }
+    memset(buf, 0, sizeof(buf));
+    n = read(f, buf, 5);
+    if (expect_stream) {
+        if (n != 5 || memcmp(buf, "hello", 5) != 0) {
+            printf("[FAIL] stream read did not restart at offset 0 got n=%zd data='%.*s' errno=%d\n",
+                   n, 5, buf, errno);
+            goto fail;
+        }
+        if (write(f, "Z", 1) != 1) {
+            printf("[FAIL] stream write failed: %s (errno=%d)\n", strerror(errno), errno);
+            goto fail;
+        }
+        if (last_write_offset != 0) {
+            printf("[FAIL] stream write offset expected 0 got %llu\n",
+                   (unsigned long long)last_write_offset);
+            goto fail;
+        }
+    } else if (n != 5 || memcmp(buf, " from", 5) != 0) {
+        printf("[FAIL] nonseekable sequential read should advance offset got n=%zd data='%.*s'\n", n,
+               5, buf);
+        goto fail;
+    }
+
+    close(f);
+    f = -1;
+    if (umount(mp) != 0) {
+        printf("[FAIL] umount(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        goto fail_no_umount;
+    }
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (f >= 0) {
+        close(f);
+    }
+    umount(mp);
+fail_no_umount:
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_fopen_nonseekable_dir_mode(uint32_t open_out_flags, const char *mp) {
+    int f = -1;
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.stop_on_destroy = 1;
+    args.root_open_out_flags = open_out_flags;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    f = open(mp, O_RDONLY | O_DIRECTORY);
+    if (f < 0) {
+        printf("[FAIL] open(%s, O_DIRECTORY): %s (errno=%d)\n", mp, strerror(errno), errno);
+        goto fail;
+    }
+
+    errno = 0;
+    if (lseek(f, 0, SEEK_SET) >= 0 || errno != ESPIPE) {
+        printf("[FAIL] dir lseek expected ESPIPE, errno=%d (%s)\n", errno, strerror(errno));
+        goto fail;
+    }
+
+    close(f);
+    f = -1;
+    if (umount(mp) != 0) {
+        printf("[FAIL] umount(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        goto fail_no_umount;
+    }
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (f >= 0) {
+        close(f);
+    }
+    umount(mp);
+fail_no_umount:
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
 static int ext_test_atomic_otrunc_uses_open_without_setattr() {
     const char *mp = "/tmp/test_fuse_atomic_otrunc";
     int requested = O_RDWR | O_TRUNC;
@@ -4738,6 +4954,20 @@ TEST(FuseExtended, OpenFlagsMatchLinuxMask) {
 
 TEST(FuseExtended, FopenNoFlushSkipsFlush) {
     ASSERT_EQ(0, ext_test_fopen_noflush_skips_flush());
+}
+
+TEST(FuseExtended, FopenNonseekableDisablesRandomIo) {
+    ASSERT_EQ(0,
+              ext_test_fopen_nonseekable_mode(FOPEN_NONSEEKABLE, "/tmp/test_fuse_nonseek", 0));
+}
+
+TEST(FuseExtended, FopenStreamDisablesRandomIo) {
+    ASSERT_EQ(0, ext_test_fopen_nonseekable_mode(FOPEN_STREAM, "/tmp/test_fuse_stream", 1));
+}
+
+TEST(FuseExtended, FopenNonseekableDirectoryDisablesLseek) {
+    ASSERT_EQ(0,
+              ext_test_fopen_nonseekable_dir_mode(FOPEN_NONSEEKABLE, "/tmp/test_fuse_dir_nonseek"));
 }
 
 TEST(FuseExtended, AtomicOTruncUsesOpenWithoutSetattr) {

@@ -1,6 +1,8 @@
 use super::{
-    file::FileFlags, utils::DName, FilePrivateData, FileSystem, FileType, IndexNode, InodeId,
-    InodeMode, PollableInode, SuperBlock,
+    file::{FileFlags, FileMode},
+    utils::DName,
+    FilePrivateData, FileSystem, FileType, IndexNode, InodeId, InodeMode, PollableInode,
+    SuperBlock,
 };
 use crate::{
     driver::base::device::device_number::{DeviceNumber, Major},
@@ -1285,6 +1287,10 @@ impl IndexNode for MountFSInode {
             return Err(SystemError::EROFS);
         }
         return self.inner_inode.open(data, flags);
+    }
+
+    fn adjust_file_mode_after_open(&self, data: &FilePrivateData, mode: &mut FileMode) {
+        self.inner_inode.adjust_file_mode_after_open(data, mode)
     }
 
     fn mmap(&self, start: usize, len: usize, offset: usize) -> Result<(), SystemError> {

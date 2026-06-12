@@ -15,7 +15,10 @@ use crate::{
     filesystem::{
         page_cache::{PageCache, PageCacheBackend},
         vfs::{
-            file::FileFlags, permission::PermissionMask, syscall::RenameFlags, utils::DName,
+            file::{FileFlags, FileMode},
+            permission::PermissionMask,
+            syscall::RenameFlags,
+            utils::DName,
             FilePrivateData, FileSystem, FileType, IndexNode, InodeFlags, InodeId, InodeMode,
             Metadata,
         },
@@ -38,11 +41,12 @@ use super::{
         FuseLinkIn, FuseMkdirIn, FuseMknodIn, FuseOpenIn, FuseOpenOut, FuseReadIn, FuseReleaseIn,
         FuseRename2In, FuseRenameIn, FuseSetattrIn, FuseWriteIn, FuseWriteOut, FATTR_ATIME,
         FATTR_CTIME, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_SIZE, FATTR_UID, FOPEN_DIRECT_IO,
-        FOPEN_KEEP_CACHE, FOPEN_NOFLUSH, FUSE_ACCESS, FUSE_CREATE, FUSE_FLUSH, FUSE_FSYNC,
-        FUSE_FSYNCDIR, FUSE_FSYNC_FDATASYNC, FUSE_GETATTR, FUSE_LINK, FUSE_LOOKUP, FUSE_MKDIR,
-        FUSE_MKNOD, FUSE_OPEN, FUSE_OPENDIR, FUSE_READ, FUSE_READDIR, FUSE_READDIRPLUS,
-        FUSE_READLINK, FUSE_RELEASE, FUSE_RELEASEDIR, FUSE_RENAME, FUSE_RENAME2, FUSE_RMDIR,
-        FUSE_ROOT_ID, FUSE_SETATTR, FUSE_SYMLINK, FUSE_UNLINK, FUSE_WRITE, FUSE_WRITE_CACHE,
+        FOPEN_KEEP_CACHE, FOPEN_NOFLUSH, FOPEN_NONSEEKABLE, FOPEN_STREAM, FUSE_ACCESS, FUSE_CREATE,
+        FUSE_FLUSH, FUSE_FSYNC, FUSE_FSYNCDIR, FUSE_FSYNC_FDATASYNC, FUSE_GETATTR, FUSE_LINK,
+        FUSE_LOOKUP, FUSE_MKDIR, FUSE_MKNOD, FUSE_OPEN, FUSE_OPENDIR, FUSE_READ, FUSE_READDIR,
+        FUSE_READDIRPLUS, FUSE_READLINK, FUSE_RELEASE, FUSE_RELEASEDIR, FUSE_RENAME, FUSE_RENAME2,
+        FUSE_RMDIR, FUSE_ROOT_ID, FUSE_SETATTR, FUSE_SYMLINK, FUSE_UNLINK, FUSE_WRITE,
+        FUSE_WRITE_CACHE,
     },
 };
 
@@ -1223,6 +1227,26 @@ impl IndexNode for FuseNode {
             FileType::Dir => self.open_common(FUSE_OPENDIR, &mut data, flags),
             FileType::File => self.open_common(FUSE_OPEN, &mut data, flags),
             _ => Err(SystemError::EINVAL),
+        }
+    }
+
+    fn adjust_file_mode_after_open(&self, data: &FilePrivateData, mode: &mut FileMode) {
+        let fopen_flags = match data {
+            FilePrivateData::Fuse(FuseFilePrivateData::File(p))
+            | FilePrivateData::Fuse(FuseFilePrivateData::Dir(p)) => p.fopen_flags,
+            _ => return,
+        };
+
+        if (fopen_flags & FOPEN_STREAM) != 0 {
+            mode.remove(
+                FileMode::FMODE_LSEEK
+                    | FileMode::FMODE_PREAD
+                    | FileMode::FMODE_PWRITE
+                    | FileMode::FMODE_ATOMIC_POS,
+            );
+            mode.insert(FileMode::FMODE_STREAM);
+        } else if (fopen_flags & FOPEN_NONSEEKABLE) != 0 {
+            mode.remove(FileMode::FMODE_LSEEK | FileMode::FMODE_PREAD | FileMode::FMODE_PWRITE);
         }
     }
 

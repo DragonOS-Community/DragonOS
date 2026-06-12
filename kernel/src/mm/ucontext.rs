@@ -281,6 +281,12 @@ pub struct InnerAddressSpace {
     outer: Weak<AddressSpace>,
 }
 
+struct VmaCloseNotification {
+    file: Arc<File>,
+    region: VirtRegion,
+    vm_flags: VmFlags,
+}
+
 impl InnerAddressSpace {
     /// 当前地址空间已占用的虚拟内存字节数（简单求和所有 VMA 尺寸）
     pub fn vma_usage_bytes(&self) -> usize {
@@ -844,12 +850,16 @@ impl InnerAddressSpace {
         let pgoff = offset >> MMArch::PAGE_SHIFT;
 
         let page_count = PageFrameCount::from_bytes(len).unwrap();
-        let precheck_vm_flags = VmFlags::from(prot_flags)
+        let may_write =
+            !map_flags.contains(MapFlags::MAP_SHARED) || file_mode.contains(FileMode::FMODE_WRITE);
+        let mut precheck_vm_flags = VmFlags::from(prot_flags)
             | VmFlags::from(map_flags)
             | self.mlock_future
             | VmFlags::VM_MAYREAD
-            | VmFlags::VM_MAYWRITE
             | VmFlags::VM_MAYEXEC;
+        if may_write {
+            precheck_vm_flags |= VmFlags::VM_MAYWRITE;
+        }
         file.inode()
             .check_mmap_file(&file, len, offset, precheck_vm_flags)?;
 
@@ -859,6 +869,11 @@ impl InnerAddressSpace {
             prot_flags,
             map_flags,
             |page, count, vm_flags, flags, mapper, flusher| {
+                let vm_flags = if may_write {
+                    vm_flags
+                } else {
+                    vm_flags & !VmFlags::VM_MAYWRITE
+                };
                 if allocate_at_once {
                     VMA::zeroed(
                         page,
@@ -1374,6 +1389,7 @@ impl InnerAddressSpace {
         // Use MmuGather: clear PTEs + stash pages first, then unified shootdown, and finally free physical pages (INV-3)
         let mm = self.outer_addr_space().ok_or(SystemError::EFAULT)?;
         let mut tlb = MmuGather::gather(&mm);
+        let mut vma_close_notifications: Vec<VmaCloseNotification> = Vec::new();
 
         // 遍历每个相关的 VMA，将当前的 VMA 拆分为可能的三块 VMA，然后删除与需要删除的区域相交的部分。
         // 示意图：对每个与 region_to_unmap 相交的 VMA，按交集拆分成三段（before / intersection / after），
@@ -1412,7 +1428,9 @@ impl InnerAddressSpace {
                 (split_result.prev, split_result.after)
             };
 
-            // TODO: 当引入后备页映射后，这里需要增加通知文件的逻辑
+            if let Some(notification) = Self::collect_vma_close(&cur_vma, intersection) {
+                vma_close_notifications.push(notification);
+            }
 
             if let Some(before) = before {
                 self.mappings.insert_vma(before);
@@ -1426,9 +1444,37 @@ impl InnerAddressSpace {
         // Shootdown first, then free physical pages
         tlb.finish();
 
-        // TODO: 当引入后备页映射后，这里需要增加通知文件的逻辑
+        for notification in vma_close_notifications {
+            Self::notify_vma_close(notification);
+        }
 
         return Ok(());
+    }
+
+    fn collect_vma_close(vma: &Arc<LockedVMA>, region: VirtRegion) -> Option<VmaCloseNotification> {
+        let (file, vm_flags) = {
+            let guard = vma.lock();
+            let file = guard.vm_file()?;
+            (file, *guard.vm_flags())
+        };
+
+        if vm_flags.contains(VmFlags::VM_SHARED | VmFlags::VM_WRITE) {
+            Some(VmaCloseNotification {
+                file,
+                region,
+                vm_flags,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn notify_vma_close(notification: VmaCloseNotification) {
+        notification.file.inode().fs().vma_close(
+            &notification.file,
+            notification.region,
+            notification.vm_flags,
+        );
     }
 
     pub fn mprotect(
@@ -1855,12 +1901,20 @@ impl InnerAddressSpace {
         };
         // Full-mm flush (fullmm); no need to accumulate ranges.
         tlb.set_fullmm();
+        let mut vma_close_notifications = Vec::new();
         for vma in self.mappings.iter_vmas() {
             if vma.mapped() {
+                let region = *vma.lock().region();
+                if let Some(notification) = Self::collect_vma_close(vma, region) {
+                    vma_close_notifications.push(notification);
+                }
                 vma.unmap(&mut self.user_mapper.utable, &mut tlb);
             }
         }
         tlb.finish();
+        for notification in vma_close_notifications {
+            Self::notify_vma_close(notification);
+        }
     }
 
     /// 设置进程的堆的内存空间
@@ -2937,12 +2991,21 @@ impl VMA {
         mapper: &mut PageMapper,
         tlb: &mut MmuGather<'_>,
     ) -> Result<(), SystemError> {
+        let pte_flags = if self.vm_file.is_some()
+            && self
+                .vm_flags
+                .contains(VmFlags::VM_SHARED | VmFlags::VM_WRITE)
+        {
+            flags.set_write(false)
+        } else {
+            flags
+        };
         for page in self.region.pages() {
             // debug!("remap page {:?}", page.virt_address());
             if mapper.translate(page.virt_address()).is_some() {
                 let r = unsafe {
                     mapper
-                        .remap(page.virt_address(), flags)
+                        .remap(page.virt_address(), pte_flags)
                         .expect("Failed to remap")
                 };
                 unsafe { r.ignore() };
@@ -2961,6 +3024,20 @@ impl VMA {
     ///
     /// - `prot_flags` 要检查的标志位
     pub fn can_have_flags(&self, prot_flags: ProtFlags) -> bool {
+        if prot_flags.contains(ProtFlags::PROT_READ) && !self.vm_flags.contains(VmFlags::VM_MAYREAD)
+        {
+            return false;
+        }
+        if prot_flags.contains(ProtFlags::PROT_WRITE)
+            && !self.vm_flags.contains(VmFlags::VM_MAYWRITE)
+        {
+            return false;
+        }
+        if prot_flags.contains(ProtFlags::PROT_EXEC) && !self.vm_flags.contains(VmFlags::VM_MAYEXEC)
+        {
+            return false;
+        }
+
         let is_downgrade = (self.flags.has_write() || !prot_flags.contains(ProtFlags::PROT_WRITE))
             && (self.flags.has_execute() || !prot_flags.contains(ProtFlags::PROT_EXEC));
 

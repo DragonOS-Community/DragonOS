@@ -38,7 +38,7 @@ use crate::{
         casting::DowncastArc,
         mutex::{Mutex, MutexGuard},
     },
-    mm::{fault::PageFaultMessage, VmFaultReason, VmFlags},
+    mm::{fault::PageFaultMessage, VirtRegion, VmFaultReason, VmFlags},
     net::socket::Socket,
     process::ProcessManager,
     syscall::user_buffer::UserBuffer,
@@ -1545,6 +1545,13 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     fn mprotect(&self, _old_vm_flags: VmFlags, _new_vm_flags: VmFlags) -> Result<(), SystemError> {
         Ok(())
     }
+
+    /// Called when a file-backed VMA range is genuinely detached from an address space.
+    ///
+    /// This is not called for VMA split/reinsert used by mprotect-like metadata
+    /// changes. Filesystems may use it to flush dirty shared mappings before
+    /// the last mapping reference disappears.
+    fn vma_close(&self, _file: &Arc<File>, _region: VirtRegion, _vm_flags: VmFlags) {}
 
     unsafe fn map_pages(
         &self,

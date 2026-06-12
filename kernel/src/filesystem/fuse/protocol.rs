@@ -88,6 +88,9 @@ pub const FOPEN_NOFLUSH: u32 = 1 << 5;
 #[allow(dead_code)]
 pub const FOPEN_PARALLEL_DIRECT_WRITES: u32 = 1 << 6;
 
+// fuse_write_in.write_flags (Linux 6.6 uapi subset)
+pub const FUSE_WRITE_CACHE: u32 = 1 << 0;
+
 // getattr/setattr valid bits (subset)
 pub const FATTR_MODE: u32 = 1 << 0;
 pub const FATTR_UID: u32 = 1 << 1;

@@ -16,7 +16,7 @@ use crate::{
         rwsem::RwSem,
         spinlock::SpinLock,
     },
-    mm::{fault::PageFaultMessage, VmFaultReason, VmFlags},
+    mm::{fault::PageFaultMessage, VirtRegion, VmFaultReason, VmFlags},
     process::{
         namespace::{
             mnt::MntNamespace,
@@ -1810,6 +1810,10 @@ impl FileSystem for MountFS {
 
     fn mprotect(&self, old_vm_flags: VmFlags, new_vm_flags: VmFlags) -> Result<(), SystemError> {
         self.inner_filesystem.mprotect(old_vm_flags, new_vm_flags)
+    }
+
+    fn vma_close(&self, file: &Arc<super::file::File>, region: VirtRegion, vm_flags: VmFlags) {
+        self.inner_filesystem.vma_close(file, region, vm_flags)
     }
 
     unsafe fn map_pages(

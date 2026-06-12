@@ -11,7 +11,10 @@ use crate::{
         InodeId, InodeMode, Magic, Metadata, MountableFileSystem, SuperBlock, FSMAKER,
     },
     libs::mutex::Mutex,
-    mm::{fault::PageFaultMessage, VmFaultReason, VmFlags},
+    mm::{
+        fault::{PageFaultHandler, PageFaultMessage},
+        VirtRegion, VmFaultReason, VmFlags,
+    },
     process::ProcessManager,
     register_mountable_fs,
     time::PosixTimeSpec,
@@ -559,9 +562,6 @@ impl FileSystem for FuseFS {
         let vma = pfm.vma();
         let vma_guard = vma.lock();
         let vm_flags = *vma_guard.vm_flags();
-        if vm_flags.contains(VmFlags::VM_SHARED | VmFlags::VM_WRITE) {
-            return VmFaultReason::VM_FAULT_SIGBUS;
-        }
         let Some(file) = vma_guard.vm_file() else {
             return VmFaultReason::VM_FAULT_SIGBUS;
         };
@@ -599,15 +599,58 @@ impl FileSystem for FuseFS {
         }
     }
 
-    unsafe fn page_mkwrite(&self, _pfm: &mut PageFaultMessage) -> VmFaultReason {
-        VmFaultReason::VM_FAULT_SIGBUS
+    unsafe fn page_mkwrite(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
+        let vma = pfm.vma();
+        let vma_guard = vma.lock();
+        let vm_flags = *vma_guard.vm_flags();
+        let Some(file) = vma_guard.vm_file() else {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        };
+        drop(vma_guard);
+
+        let node = {
+            let data = file.private_data.lock();
+            let FilePrivateData::Fuse(FuseFilePrivateData::File(p)) = &*data else {
+                return VmFaultReason::VM_FAULT_SIGBUS;
+            };
+            if (p.fopen_flags & FOPEN_DIRECT_IO) != 0 && vm_flags.contains(VmFlags::VM_MAYSHARE) {
+                return VmFaultReason::VM_FAULT_SIGBUS;
+            }
+            p.node.clone()
+        };
+
+        let Ok(_pin) = node.pin_writeback_handle() else {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        };
+        PageFaultHandler::filemap_page_mkwrite(pfm)
     }
 
     fn mprotect(&self, _old_vm_flags: VmFlags, new_vm_flags: VmFlags) -> Result<(), SystemError> {
-        if new_vm_flags.contains(VmFlags::VM_SHARED | VmFlags::VM_WRITE) {
-            return Err(SystemError::EACCES);
-        }
+        let _ = new_vm_flags;
         Ok(())
+    }
+
+    fn vma_close(
+        &self,
+        file: &Arc<crate::filesystem::vfs::file::File>,
+        _region: VirtRegion,
+        vm_flags: VmFlags,
+    ) {
+        if !vm_flags.contains(VmFlags::VM_SHARED | VmFlags::VM_WRITE) {
+            return;
+        }
+
+        let node = {
+            let data = file.private_data.lock();
+            let FilePrivateData::Fuse(FuseFilePrivateData::File(p)) = &*data else {
+                return;
+            };
+            p.node.clone()
+        };
+
+        if let Err(e) = node.sync_cached_pages() {
+            log::warn!("fuse: vma_close writeback failed: {:?}", e);
+        }
     }
 
     unsafe fn map_pages(

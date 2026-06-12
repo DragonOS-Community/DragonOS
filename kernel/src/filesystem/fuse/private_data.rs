@@ -1,6 +1,9 @@
 use alloc::sync::Arc;
 use core::any::Any;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use system_error::SystemError;
+
+use crate::{filesystem::vfs::file::FileFlags, libs::wait_queue::WaitQueue};
 
 use super::{conn::FuseConn, inode::FuseNode};
 
@@ -26,6 +29,104 @@ pub struct FuseOpenPrivateData {
     /// Daemon-returned FOPEN_* flags from fuse_open_out.
     pub fopen_flags: u32,
     pub no_open: bool,
+    pub writeback_handle: Option<Arc<FuseWritebackHandle>>,
+}
+
+pub struct FuseWritebackHandle {
+    pub fh: u64,
+    pub open_flags: u32,
+    pub fopen_flags: u32,
+    pub no_open: bool,
+    closing: AtomicBool,
+    inflight: AtomicUsize,
+    wait_queue: WaitQueue,
+}
+
+impl core::fmt::Debug for FuseWritebackHandle {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FuseWritebackHandle")
+            .field("fh", &self.fh)
+            .field("open_flags", &self.open_flags)
+            .field("fopen_flags", &self.fopen_flags)
+            .field("no_open", &self.no_open)
+            .field("closing", &self.is_closing())
+            .field("inflight", &self.inflight.load(Ordering::Acquire))
+            .finish()
+    }
+}
+
+impl FuseWritebackHandle {
+    pub fn new(fh: u64, open_flags: u32, fopen_flags: u32, no_open: bool) -> Self {
+        Self {
+            fh,
+            open_flags,
+            fopen_flags,
+            no_open,
+            closing: AtomicBool::new(false),
+            inflight: AtomicUsize::new(0),
+            wait_queue: WaitQueue::default(),
+        }
+    }
+
+    pub fn is_writable(&self) -> bool {
+        let flags = FileFlags::from_bits_truncate(self.open_flags);
+        let access = flags.access_flags();
+        access == FileFlags::O_WRONLY || access == FileFlags::O_RDWR
+    }
+
+    pub fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
+    }
+
+    pub fn mark_closing(&self) {
+        self.closing.store(true, Ordering::Release);
+    }
+
+    pub fn wait_inflight_zero(&self) {
+        self.wait_queue.wait_until(|| {
+            if self.inflight.load(Ordering::Acquire) == 0 {
+                Some(())
+            } else {
+                None
+            }
+        });
+    }
+
+    fn unpin_inflight(&self) {
+        if self.inflight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.wait_queue.wake_all();
+        }
+    }
+
+    pub fn try_pin(self: &Arc<Self>) -> Option<FuseWritebackHandlePin> {
+        if self.is_closing() || !self.is_writable() {
+            return None;
+        }
+        self.inflight.fetch_add(1, Ordering::AcqRel);
+        if self.is_closing() {
+            self.unpin_inflight();
+            return None;
+        }
+        Some(FuseWritebackHandlePin {
+            handle: self.clone(),
+        })
+    }
+}
+
+pub struct FuseWritebackHandlePin {
+    handle: Arc<FuseWritebackHandle>,
+}
+
+impl FuseWritebackHandlePin {
+    pub fn handle(&self) -> &FuseWritebackHandle {
+        &self.handle
+    }
+}
+
+impl Drop for FuseWritebackHandlePin {
+    fn drop(&mut self) {
+        self.handle.unpin_inflight();
+    }
 }
 
 #[derive(Debug, Clone)]

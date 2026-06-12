@@ -577,7 +577,11 @@ impl PageFaultHandler {
         drop(page_manager);
 
         if vma.lock().vm_flags().contains(VmFlags::VM_SHARED) {
-            if let Some(file) = vma.lock().vm_file() {
+            let file = {
+                let guard = vma.lock();
+                guard.vm_file()
+            };
+            if let Some(file) = file {
                 pfm.set_page(old_page.clone());
                 let ret = file.inode().fs().page_mkwrite(pfm);
                 if Self::mkwrite_finished(ret) {
@@ -810,10 +814,14 @@ impl PageFaultHandler {
                     let address =
                         VirtAddr::new(addr.data() + ((pgoff - start_pgoff) << MMArch::PAGE_SHIFT));
                     if mapper.get_entry(address, 0).is_none() {
-                        mapper
-                            .map_phys(address, phys, vma_guard.flags())
-                            .unwrap()
-                            .flush();
+                        let mut flags = vma_guard.flags();
+                        if vma_guard
+                            .vm_flags()
+                            .contains(VmFlags::VM_SHARED | VmFlags::VM_WRITE)
+                        {
+                            flags = flags.set_write(false);
+                        }
+                        mapper.map_phys(address, phys, flags).unwrap().flush();
                     }
                     drop(page_guard);
                     Self::attach_fault_mapped_page(&page, &vma, mlocked);
@@ -986,7 +994,16 @@ impl PageFaultHandler {
         let page_phys = page_to_map.phys_address();
         let mlocked = vma_guard.vm_flags().contains(VmFlags::VM_LOCKED);
 
-        mapper.map_phys(address, page_phys, vma_guard.flags());
+        let mut map_flags = vma_guard.flags();
+        if vma_guard
+            .vm_flags()
+            .contains(VmFlags::VM_SHARED | VmFlags::VM_WRITE)
+            && !flags.contains(FaultFlags::FAULT_FLAG_WRITE)
+        {
+            map_flags = map_flags.set_write(false);
+        }
+
+        mapper.map_phys(address, page_phys, map_flags);
         Self::attach_fault_mapped_page(&page_to_map, &pfm.vma(), mlocked);
         VmFaultReason::VM_FAULT_COMPLETED
     }

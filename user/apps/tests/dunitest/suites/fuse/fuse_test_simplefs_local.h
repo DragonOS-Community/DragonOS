@@ -171,6 +171,9 @@ static inline int fuse_test_log_enabled(void) {
 #ifndef FUSE_WRITEBACK_CACHE
 #define FUSE_WRITEBACK_CACHE (1u << 16)
 #endif
+#ifndef FUSE_WRITE_CACHE
+#define FUSE_WRITE_CACHE (1u << 0)
+#endif
 #ifndef FUSE_NO_OPEN_SUPPORT
 #define FUSE_NO_OPEN_SUPPORT (1u << 17)
 #endif
@@ -670,6 +673,10 @@ struct fuse_daemon_args {
     volatile uint64_t *last_read_fh;
     volatile uint32_t *last_read_size;
     volatile uint64_t *last_write_fh;
+    volatile uint64_t *last_write_offset;
+    volatile uint32_t *last_write_size;
+    volatile uint32_t *last_write_flags;
+    volatile uint32_t *last_write_open_flags;
     volatile uint64_t *last_fsync_fh;
     volatile uint64_t *last_release_fh;
     volatile uint64_t *read_offsets;
@@ -1219,6 +1226,18 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         }
         if (a->last_write_fh) {
             *a->last_write_fh = in->fh;
+        }
+        if (a->last_write_offset) {
+            *a->last_write_offset = in->offset;
+        }
+        if (a->last_write_size) {
+            *a->last_write_size = in->size;
+        }
+        if (a->last_write_flags) {
+            *a->last_write_flags = in->write_flags;
+        }
+        if (a->last_write_open_flags) {
+            *a->last_write_open_flags = in->flags;
         }
         size_t to_copy = in->size;
         if (in->offset + to_copy > SIMPLEFS_DATA_MAX) {

@@ -1012,7 +1012,11 @@ impl PageCacheManager {
             let result = match &data {
                 Some(data) => {
                     if let Some(backend) = &backend {
-                        backend.write_page(page_index, data).map(|_| ())
+                        match backend.write_page(page_index, data) {
+                            Ok(written) if written == data.len() => Ok(()),
+                            Ok(_) => Err(SystemError::EIO),
+                            Err(e) => Err(e),
+                        }
                     } else {
                         inode
                             .write_direct(
@@ -1082,7 +1086,11 @@ impl PageCacheManager {
                     let src = unsafe { guard.as_slice() };
                     src[..len].to_vec()
                 };
-                backend.write_page(page_index, &data).map(|_| len)
+                match backend.write_page(page_index, &data) {
+                    Ok(written) if written == data.len() => Ok(len),
+                    Ok(_) => Err(SystemError::EIO),
+                    Err(e) => Err(e),
+                }
             } else {
                 let data = unsafe {
                     core::slice::from_raw_parts(

@@ -13,7 +13,7 @@ use crate::{
     arch::MMArch,
     driver::base::device::device_number::DeviceNumber,
     filesystem::{
-        page_cache::PageCache,
+        page_cache::{PageCache, PageCacheBackend},
         vfs::{
             file::FileFlags, permission::PermissionMask, syscall::RenameFlags, utils::DName,
             FilePrivateData, FileSystem, FileType, IndexNode, InodeFlags, InodeId, InodeMode,
@@ -31,7 +31,7 @@ use crate::{
 use super::{
     conn::FuseConn,
     fs::FuseFS,
-    private_data::{FuseFilePrivateData, FuseOpenPrivateData},
+    private_data::{FuseFilePrivateData, FuseOpenPrivateData, FuseWritebackHandle},
     protocol::{
         fuse_pack_struct, fuse_read_struct, FuseAccessIn, FuseAttr, FuseAttrOut, FuseCreateIn,
         FuseDirent, FuseDirentPlus, FuseEntryOut, FuseFlushIn, FuseFsyncIn, FuseGetattrIn,
@@ -42,7 +42,7 @@ use super::{
         FUSE_FSYNC_FDATASYNC, FUSE_GETATTR, FUSE_LINK, FUSE_LOOKUP, FUSE_MKDIR, FUSE_MKNOD,
         FUSE_OPEN, FUSE_OPENDIR, FUSE_READ, FUSE_READDIR, FUSE_READDIRPLUS, FUSE_READLINK,
         FUSE_RELEASE, FUSE_RELEASEDIR, FUSE_RENAME, FUSE_RENAME2, FUSE_RMDIR, FUSE_ROOT_ID,
-        FUSE_SETATTR, FUSE_SYMLINK, FUSE_UNLINK, FUSE_WRITE,
+        FUSE_SETATTR, FUSE_SYMLINK, FUSE_UNLINK, FUSE_WRITE, FUSE_WRITE_CACHE,
     },
 };
 
@@ -56,6 +56,7 @@ pub struct FuseNode {
     name: Mutex<Option<String>>,
     cached_metadata: Mutex<Option<Metadata>>,
     page_cache: Mutex<Option<Arc<PageCache>>>,
+    writeback_handles: Mutex<Vec<Arc<FuseWritebackHandle>>>,
     cached_metadata_deadline_ns: AtomicU64,
     lookup_count: AtomicU64,
     /// 最近一次 LOOKUP 回复中的 fuse_attr.flags（用于 announce-submounts）。
@@ -63,6 +64,43 @@ pub struct FuseNode {
     /// LOOKUP 返回的 generation，用于检测 virtiofsd 复用 nodeid。
     generation: AtomicU64,
     stale: AtomicBool,
+}
+
+#[derive(Debug)]
+struct FusePageCacheBackend {
+    node: Weak<FuseNode>,
+}
+
+impl FusePageCacheBackend {
+    fn new(node: Weak<FuseNode>) -> Self {
+        Self { node }
+    }
+}
+
+impl PageCacheBackend for FusePageCacheBackend {
+    fn read_page(&self, _index: usize, _buf: &mut [u8]) -> Result<usize, SystemError> {
+        Err(SystemError::EIO)
+    }
+
+    fn write_page(&self, index: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        let node = self.node.upgrade().ok_or(SystemError::EIO)?;
+        node.writeback_page_with_handle(index, buf)
+    }
+
+    fn npages(&self) -> usize {
+        let Some(node) = self.node.upgrade() else {
+            return 0;
+        };
+        let Some(md) = node.cached_metadata_snapshot() else {
+            return 0;
+        };
+        let size = md.size.max(0) as usize;
+        if size == 0 {
+            0
+        } else {
+            (size + MMArch::PAGE_SIZE - 1) >> MMArch::PAGE_SHIFT
+        }
+    }
 }
 
 impl FuseNode {
@@ -85,6 +123,7 @@ impl FuseNode {
             name: Mutex::new(None),
             cached_metadata: Mutex::new(cached),
             page_cache: Mutex::new(None),
+            writeback_handles: Mutex::new(Vec::new()),
             cached_metadata_deadline_ns: AtomicU64::new(if has_cached { u64::MAX } else { 0 }),
             lookup_count: AtomicU64::new(0),
             lookup_attr_flags: AtomicU32::new(0),
@@ -199,7 +238,8 @@ impl FuseNode {
         }
         let node = self.self_ref.upgrade().ok_or(SystemError::EIO)?;
         let inode: Arc<dyn IndexNode> = node;
-        let cache = PageCache::new(Some(Arc::downgrade(&inode)), None);
+        let backend = Arc::new(FusePageCacheBackend::new(self.self_ref.clone()));
+        let cache = PageCache::new(Some(Arc::downgrade(&inode)), Some(backend));
         *guard = Some(cache.clone());
         Ok(cache)
     }
@@ -313,6 +353,105 @@ impl FuseNode {
         }
     }
 
+    fn open_flags_are_writable(open_flags: u32) -> bool {
+        let flags = FileFlags::from_bits_truncate(open_flags);
+        let access = flags.access_flags();
+        access == FileFlags::O_WRONLY || access == FileFlags::O_RDWR
+    }
+
+    fn register_writeback_handle(
+        &self,
+        open_flags: u32,
+        fh: u64,
+        fopen_flags: u32,
+        no_open: bool,
+    ) -> Option<Arc<FuseWritebackHandle>> {
+        if !Self::open_flags_are_writable(open_flags) {
+            return None;
+        }
+        let handle = Arc::new(FuseWritebackHandle::new(
+            fh,
+            open_flags,
+            fopen_flags,
+            no_open,
+        ));
+        self.writeback_handles.lock().push(handle.clone());
+        Some(handle)
+    }
+
+    fn unregister_writeback_handle(&self, handle: &Arc<FuseWritebackHandle>) {
+        handle.mark_closing();
+        self.writeback_handles
+            .lock()
+            .retain(|candidate| !Arc::ptr_eq(candidate, handle));
+        handle.wait_inflight_zero();
+    }
+
+    pub(crate) fn sync_cached_pages(&self) -> Result<(), SystemError> {
+        if let Some(page_cache) = self.cached_page_cache() {
+            page_cache.manager().sync()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn pin_writeback_handle(
+        &self,
+    ) -> Result<super::private_data::FuseWritebackHandlePin, SystemError> {
+        let handles = self.writeback_handles.lock().clone();
+        for handle in handles {
+            if let Some(pin) = handle.try_pin() {
+                return Ok(pin);
+            }
+        }
+        Err(SystemError::EIO)
+    }
+
+    fn writeback_page_with_handle(
+        &self,
+        page_index: usize,
+        buf: &[u8],
+    ) -> Result<usize, SystemError> {
+        self.check_not_stale()?;
+        let pin = self.pin_writeback_handle()?;
+        let handle = pin.handle();
+        let max_write = self.conn().max_write();
+        if max_write == 0 {
+            return Err(SystemError::EIO);
+        }
+
+        let base_offset = page_index
+            .checked_mul(MMArch::PAGE_SIZE)
+            .ok_or(SystemError::EOVERFLOW)?;
+        let mut total = 0usize;
+        while total < buf.len() {
+            let chunk = core::cmp::min(max_write, buf.len() - total);
+            let offset = base_offset
+                .checked_add(total)
+                .ok_or(SystemError::EOVERFLOW)?;
+            let write_in = FuseWriteIn {
+                fh: handle.fh,
+                offset: offset as u64,
+                size: chunk as u32,
+                write_flags: FUSE_WRITE_CACHE,
+                lock_owner: 0,
+                flags: 0,
+                padding: 0,
+            };
+            let mut payload_in = Vec::with_capacity(size_of::<FuseWriteIn>() + chunk);
+            payload_in.extend_from_slice(fuse_pack_struct(&write_in));
+            payload_in.extend_from_slice(&buf[total..total + chunk]);
+            let payload = self.conn().request(FUSE_WRITE, self.nodeid, &payload_in)?;
+            let out: FuseWriteOut = fuse_read_struct(&payload)?;
+            if out.size as usize != chunk {
+                return Err(SystemError::EIO);
+            }
+            self.note_successful_write(offset, chunk)?;
+            total += chunk;
+        }
+
+        Ok(total)
+    }
+
     fn set_open_private_data(
         &self,
         data: &mut FilePrivateData,
@@ -324,6 +463,11 @@ impl FuseNode {
     ) -> Result<(), SystemError> {
         let conn_any: Arc<dyn core::any::Any + Send + Sync> = self.conn.clone();
         let node = self.self_ref.upgrade().ok_or(SystemError::EIO)?;
+        let writeback_handle = if opcode == FUSE_OPEN {
+            self.register_writeback_handle(open_flags, fh, fopen_flags, no_open)
+        } else {
+            None
+        };
         *data = match opcode {
             FUSE_OPEN => FilePrivateData::Fuse(FuseFilePrivateData::File(FuseOpenPrivateData {
                 conn: conn_any,
@@ -332,6 +476,7 @@ impl FuseNode {
                 open_flags,
                 fopen_flags,
                 no_open,
+                writeback_handle,
             })),
             FUSE_OPENDIR => FilePrivateData::Fuse(FuseFilePrivateData::Dir(FuseOpenPrivateData {
                 conn: conn_any,
@@ -340,6 +485,7 @@ impl FuseNode {
                 open_flags,
                 fopen_flags,
                 no_open,
+                writeback_handle: None,
             })),
             _ => return Err(SystemError::EINVAL),
         };
@@ -623,18 +769,7 @@ impl FuseNode {
         Ok(())
     }
 
-    fn fsync_with_file_data(
-        &self,
-        datasync: bool,
-        data: &FilePrivateData,
-    ) -> Result<(), SystemError> {
-        self.check_not_stale()?;
-        let (opcode, fh) = match data {
-            FilePrivateData::Fuse(FuseFilePrivateData::File(p)) => (FUSE_FSYNC, p.fh),
-            FilePrivateData::Fuse(FuseFilePrivateData::Dir(p)) => (FUSE_FSYNCDIR, p.fh),
-            _ => return self.fsync_common(datasync),
-        };
-
+    fn fsync_with_fh(&self, opcode: u32, fh: u64, datasync: bool) -> Result<(), SystemError> {
         let inarg = FuseFsyncIn {
             fh,
             fsync_flags: if datasync { FUSE_FSYNC_FDATASYNC } else { 0 },
@@ -871,7 +1006,6 @@ impl FuseNode {
             return Err(SystemError::EINVAL);
         }
         let page_cache = self.ensure_page_cache()?;
-        let _invalidate = page_cache.invalidate_read();
         let mut filled_len = None;
         let page = page_cache
             .manager()
@@ -1106,8 +1240,16 @@ impl IndexNode for FuseNode {
 
         match fuse_data {
             FuseFilePrivateData::File(p) => {
+                let writeback_result = if p.writeback_handle.is_some() {
+                    self.sync_cached_pages()
+                } else {
+                    Ok(())
+                };
+                if let Some(handle) = &p.writeback_handle {
+                    self.unregister_writeback_handle(handle);
+                }
                 if p.no_open {
-                    return Ok(());
+                    return writeback_result;
                 }
                 let flush_in = FuseFlushIn {
                     fh: p.fh,
@@ -1118,7 +1260,8 @@ impl IndexNode for FuseNode {
                 let _ = self
                     .conn()
                     .request(FUSE_FLUSH, self.nodeid, fuse_pack_struct(&flush_in));
-                self.release_common(FUSE_RELEASE, p.fh, p.open_flags)
+                let release_result = self.release_common(FUSE_RELEASE, p.fh, p.open_flags);
+                writeback_result.and(release_result)
             }
             FuseFilePrivateData::Dir(p) => {
                 if p.no_open {
@@ -1362,7 +1505,53 @@ impl IndexNode for FuseNode {
         datasync: bool,
         data: MutexGuard<FilePrivateData>,
     ) -> Result<(), SystemError> {
-        self.fsync_with_file_data(datasync, &data)
+        let fuse_data = match &*data {
+            FilePrivateData::Fuse(data) => data.clone(),
+            _ => {
+                drop(data);
+                return self.fsync_common(datasync);
+            }
+        };
+        drop(data);
+
+        match fuse_data {
+            FuseFilePrivateData::File(p) => self.fsync_with_fh(FUSE_FSYNC, p.fh, datasync),
+            FuseFilePrivateData::Dir(p) => self.fsync_with_fh(FUSE_FSYNCDIR, p.fh, datasync),
+            FuseFilePrivateData::Dev(_) => self.fsync_common(datasync),
+        }
+    }
+
+    fn sync_file_range(
+        &self,
+        start: usize,
+        end: usize,
+        datasync: bool,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        let fuse_data = match &*data {
+            FilePrivateData::Fuse(data) => data.clone(),
+            _ => {
+                drop(data);
+                return self.fsync_common(datasync);
+            }
+        };
+        drop(data);
+
+        if let FuseFilePrivateData::File(_) = &fuse_data {
+            if let Some(page_cache) = self.cached_page_cache() {
+                let start_index = start >> MMArch::PAGE_SHIFT;
+                let end_index = end >> MMArch::PAGE_SHIFT;
+                page_cache
+                    .manager()
+                    .writeback_range(start_index, end_index)?;
+            }
+        }
+
+        match fuse_data {
+            FuseFilePrivateData::File(p) => self.fsync_with_fh(FUSE_FSYNC, p.fh, datasync),
+            FuseFilePrivateData::Dir(p) => self.fsync_with_fh(FUSE_FSYNCDIR, p.fh, datasync),
+            FuseFilePrivateData::Dev(_) => self.fsync_common(datasync),
+        }
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {

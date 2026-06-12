@@ -1543,7 +1543,10 @@ impl IndexNode for FuseNode {
         drop(data);
 
         match fuse_data {
-            FuseFilePrivateData::File(p) => self.fsync_with_fh(FUSE_FSYNC, p.fh, datasync),
+            FuseFilePrivateData::File(p) => {
+                self.sync_cached_pages()?;
+                self.fsync_with_fh(FUSE_FSYNC, p.fh, datasync)
+            }
             FuseFilePrivateData::Dir(p) => self.fsync_with_fh(FUSE_FSYNCDIR, p.fh, datasync),
             FuseFilePrivateData::Dev(_) => self.fsync_common(datasync),
         }

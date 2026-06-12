@@ -695,6 +695,8 @@ struct fuse_daemon_args {
     volatile uint32_t *last_write_gid;
     volatile uint32_t *last_write_pid;
     volatile uint64_t *last_fsync_fh;
+    volatile uint32_t *write_count_at_fsync;
+    volatile uint32_t *last_write_flags_at_fsync;
     volatile uint64_t *last_release_fh;
     volatile uint32_t *last_release_uid;
     volatile uint32_t *last_release_gid;
@@ -1231,6 +1233,12 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         }
         if (a->last_fsync_fh) {
             *a->last_fsync_fh = in->fh;
+        }
+        if (a->write_count_at_fsync && a->write_count) {
+            *a->write_count_at_fsync = *a->write_count;
+        }
+        if (a->last_write_flags_at_fsync && a->last_write_flags) {
+            *a->last_write_flags_at_fsync = *a->last_write_flags;
         }
         return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
     }

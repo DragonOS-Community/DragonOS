@@ -682,6 +682,7 @@ struct fuse_daemon_args {
     volatile uint64_t *last_open_fh;
     volatile uint64_t *last_read_fh;
     volatile uint32_t *last_read_size;
+    volatile uint32_t *last_read_open_flags;
     volatile uint64_t *last_write_fh;
     volatile uint64_t *last_write_offset;
     volatile uint32_t *last_write_size;
@@ -971,6 +972,9 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         }
         if (a->last_read_size) {
             *a->last_read_size = in->size;
+        }
+        if (a->last_read_open_flags) {
+            *a->last_read_open_flags = in->flags;
         }
         if (read_index < a->read_trace_capacity) {
             if (a->read_fhs) {

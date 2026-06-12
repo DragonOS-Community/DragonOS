@@ -865,6 +865,217 @@ fail_no_umount:
     return -1;
 }
 
+static int ext_test_fsetfl_updates_fuse_io_flags() {
+    const char *mp = "/tmp/test_fuse_fsetfl_flags";
+    int requested = O_RDWR;
+    int f = -1;
+    int old_flags = -1;
+    uint32_t expected_open = (uint32_t)requested;
+    uint32_t expected_setfl = 0;
+    char buf[8];
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t open_count = 0;
+    volatile uint32_t read_count = 0;
+    volatile uint32_t write_count = 0;
+    volatile uint32_t release_count = 0;
+    volatile uint32_t last_open_flags = 0;
+    volatile uint32_t last_read_flags = 0;
+    volatile uint32_t last_write_flags = 0;
+    volatile uint32_t last_release_flags = 0;
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.enable_write_ops = 1;
+    args.stop_on_destroy = 1;
+    args.open_count = &open_count;
+    args.read_count = &read_count;
+    args.write_count = &write_count;
+    args.release_count = &release_count;
+    args.last_open_in_flags = &last_open_flags;
+    args.last_read_open_flags = &last_read_flags;
+    args.last_write_open_flags = &last_write_flags;
+    args.last_release_in_flags = &last_release_flags;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    char path[256];
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    f = open(path, requested);
+    if (f < 0) {
+        printf("[FAIL] open(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+
+    old_flags = fcntl(f, F_GETFL);
+    if (old_flags < 0) {
+        printf("[FAIL] fcntl(F_GETFL): %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    if (fcntl(f, F_SETFL, old_flags | O_NONBLOCK) != 0) {
+        printf("[FAIL] fcntl(F_SETFL): %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+
+    memset(buf, 0, sizeof(buf));
+    if (read(f, buf, 5) != 5 || memcmp(buf, "hello", 5) != 0) {
+        printf("[FAIL] read after F_SETFL got='%.*s' errno=%d\n", 5, buf, errno);
+        goto fail;
+    }
+    if (write(f, "X", 1) != 1) {
+        printf("[FAIL] write after F_SETFL: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    close(f);
+    f = -1;
+    usleep(100 * 1000);
+
+    expected_setfl = (uint32_t)(old_flags | O_NONBLOCK);
+    if (open_count != 1 || read_count != 1 || write_count != 1 || release_count != 1) {
+        printf("[FAIL] counters open=%u read=%u write=%u release=%u\n", open_count, read_count,
+               write_count, release_count);
+        goto fail;
+    }
+    if (last_open_flags != expected_open) {
+        printf("[FAIL] open flags got=0%o expected=0%o\n", last_open_flags, expected_open);
+        goto fail;
+    }
+    if ((last_read_flags & O_NONBLOCK) == 0 || last_write_flags != expected_setfl ||
+        last_release_flags != expected_setfl) {
+        printf("[FAIL] updated flags read=0%o write=0%o release=0%o expected=0%o\n",
+               last_read_flags, last_write_flags, last_release_flags, expected_setfl);
+        goto fail;
+    }
+
+    if (umount(mp) != 0) {
+        printf("[FAIL] umount(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        goto fail_no_umount;
+    }
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (f >= 0) {
+        close(f);
+    }
+    umount(mp);
+fail_no_umount:
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_fsetfl_updates_fuse_dev_nonblock() {
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        return -1;
+    }
+
+    int old_flags = fcntl(fd, F_GETFL);
+    if (old_flags < 0) {
+        printf("[FAIL] fcntl(F_GETFL): %s (errno=%d)\n", strerror(errno), errno);
+        close(fd);
+        return -1;
+    }
+    if ((old_flags & O_NONBLOCK) != 0) {
+        printf("[FAIL] /dev/fuse unexpectedly opened nonblocking: flags=0%o\n", old_flags);
+        close(fd);
+        return -1;
+    }
+    if (fcntl(fd, F_SETFL, old_flags | O_NONBLOCK) != 0) {
+        printf("[FAIL] fcntl(F_SETFL O_NONBLOCK): %s (errno=%d)\n", strerror(errno), errno);
+        close(fd);
+        return -1;
+    }
+
+    pid_t child = fork();
+    if (child < 0) {
+        printf("[FAIL] fork: %s (errno=%d)\n", strerror(errno), errno);
+        close(fd);
+        return -1;
+    }
+    if (child == 0) {
+        unsigned char *buf = (unsigned char *)malloc(FUSE_TEST_BUF_SIZE);
+        if (!buf) {
+            _exit(11);
+        }
+        ssize_t n = read(fd, buf, FUSE_TEST_BUF_SIZE);
+        int saved_errno = errno;
+        free(buf);
+        if (n < 0 && (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK)) {
+            _exit(0);
+        }
+        _exit(12);
+    }
+
+    for (int i = 0; i < 50; i++) {
+        int status = 0;
+        pid_t got = waitpid(child, &status, WNOHANG);
+        if (got == child) {
+            close(fd);
+            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+                return 0;
+            }
+            printf("[FAIL] child read did not return EAGAIN, status=%d\n", status);
+            return -1;
+        }
+        if (got < 0) {
+            printf("[FAIL] waitpid: %s (errno=%d)\n", strerror(errno), errno);
+            close(fd);
+            return -1;
+        }
+        usleep(20 * 1000);
+    }
+
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+    close(fd);
+    printf("[FAIL] /dev/fuse read blocked after F_SETFL O_NONBLOCK\n");
+    return -1;
+}
+
 static int ext_test_fopen_noflush_skips_flush() {
     const char *mp = "/tmp/test_fuse_noflush";
     int f = -1;
@@ -4950,6 +5161,14 @@ TEST(FuseExtended, NoOpenFsyncUsesZeroFh) {
 
 TEST(FuseExtended, OpenFlagsMatchLinuxMask) {
     ASSERT_EQ(0, ext_test_open_release_flags_match_linux());
+}
+
+TEST(FuseExtended, FsetflUpdatesFuseIoFlags) {
+    ASSERT_EQ(0, ext_test_fsetfl_updates_fuse_io_flags());
+}
+
+TEST(FuseExtended, FsetflUpdatesFuseDevNonblock) {
+    ASSERT_EQ(0, ext_test_fsetfl_updates_fuse_dev_nonblock());
 }
 
 TEST(FuseExtended, FopenNoFlushSkipsFlush) {

@@ -1,6 +1,6 @@
 use alloc::sync::Arc;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use system_error::SystemError;
 
 use crate::{filesystem::vfs::file::FileFlags, libs::wait_queue::WaitQueue};
@@ -34,7 +34,7 @@ pub struct FuseOpenPrivateData {
 
 pub struct FuseWritebackHandle {
     pub fh: u64,
-    pub open_flags: u32,
+    open_flags: AtomicU32,
     pub fopen_flags: u32,
     pub no_open: bool,
     closing: AtomicBool,
@@ -42,11 +42,32 @@ pub struct FuseWritebackHandle {
     wait_queue: WaitQueue,
 }
 
+impl FuseOpenPrivateData {
+    pub fn set_open_flags(&mut self, flags: FileFlags) {
+        let bits = flags.bits();
+        self.open_flags = bits;
+        if let Some(handle) = &self.writeback_handle {
+            handle.set_open_flags(bits);
+        }
+    }
+}
+
+impl FuseFilePrivateData {
+    pub fn set_flags(&mut self, flags: FileFlags) {
+        match self {
+            FuseFilePrivateData::File(p) | FuseFilePrivateData::Dir(p) => p.set_open_flags(flags),
+            FuseFilePrivateData::Dev(p) => {
+                p.nonblock = flags.contains(FileFlags::O_NONBLOCK);
+            }
+        }
+    }
+}
+
 impl core::fmt::Debug for FuseWritebackHandle {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("FuseWritebackHandle")
             .field("fh", &self.fh)
-            .field("open_flags", &self.open_flags)
+            .field("open_flags", &self.open_flags())
             .field("fopen_flags", &self.fopen_flags)
             .field("no_open", &self.no_open)
             .field("closing", &self.is_closing())
@@ -59,7 +80,7 @@ impl FuseWritebackHandle {
     pub fn new(fh: u64, open_flags: u32, fopen_flags: u32, no_open: bool) -> Self {
         Self {
             fh,
-            open_flags,
+            open_flags: AtomicU32::new(open_flags),
             fopen_flags,
             no_open,
             closing: AtomicBool::new(false),
@@ -69,9 +90,17 @@ impl FuseWritebackHandle {
     }
 
     pub fn is_writable(&self) -> bool {
-        let flags = FileFlags::from_bits_truncate(self.open_flags);
+        let flags = FileFlags::from_bits_truncate(self.open_flags());
         let access = flags.access_flags();
         access == FileFlags::O_WRONLY || access == FileFlags::O_RDWR
+    }
+
+    pub fn open_flags(&self) -> u32 {
+        self.open_flags.load(Ordering::Acquire)
+    }
+
+    pub fn set_open_flags(&self, open_flags: u32) {
+        self.open_flags.store(open_flags, Ordering::Release);
     }
 
     pub fn is_closing(&self) -> bool {

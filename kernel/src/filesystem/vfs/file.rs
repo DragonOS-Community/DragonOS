@@ -201,6 +201,9 @@ impl FilePrivateData {
             FilePrivateData::Tty(pdata) => {
                 pdata.flags = flags;
             }
+            FilePrivateData::Fuse(pdata) => {
+                pdata.set_flags(flags);
+            }
             _ => {}
         }
     }

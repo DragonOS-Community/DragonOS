@@ -527,6 +527,11 @@ impl File {
         }
     }
 
+    pub fn flush_for_close(&self, lock_owner: u64) -> Result<(), SystemError> {
+        let inode = self.inode();
+        inode.flush_file(self.private_data.lock(), lock_owner)
+    }
+
     fn maybe_kill_suid_sgid_after_write(&self) -> Result<(), SystemError> {
         // 仅对普通文件生效。
         if self.file_type != FileType::File {
@@ -1564,6 +1569,27 @@ impl Drop for File {
     }
 }
 
+#[derive(Debug)]
+pub struct DroppedFd {
+    file: Arc<File>,
+    lock_owner_id: usize,
+}
+
+impl DroppedFd {
+    pub fn new(file: Arc<File>, lock_owner_id: usize) -> Self {
+        Self {
+            file,
+            lock_owner_id,
+        }
+    }
+
+    pub fn finish_close(self) -> Result<(), SystemError> {
+        let flush_result = self.file.flush_for_close(self.lock_owner_id as u64);
+        super::posix_lock::release_posix_for_file_owner(&self.file, self.lock_owner_id);
+        flush_result
+    }
+}
+
 /// @brief pcb里面的文件描述符数组
 #[derive(Debug)]
 pub struct FileDescriptorVec {
@@ -1809,6 +1835,38 @@ impl FileDescriptorVec {
         }
     }
 
+    /// Atomically install `file` at an exact fd, returning the old fd object if one existed.
+    ///
+    /// The table is resized before the old slot is removed, so allocation failure cannot
+    /// publish a half-replaced descriptor state.
+    pub fn replace_fd_arc(
+        &mut self,
+        file: Arc<File>,
+        fd: i32,
+        cloexec: bool,
+    ) -> Result<(i32, Option<DroppedFd>), SystemError> {
+        let nofile_limit = crate::process::ProcessManager::current_pcb()
+            .get_rlimit(crate::process::resource::RLimitID::Nofile)
+            .rlim_cur as usize;
+
+        if fd < 0 || fd as usize >= nofile_limit {
+            return Err(SystemError::EMFILE);
+        }
+
+        let fd_index = fd as usize;
+        if fd_index >= self.fds.len() {
+            self.resize_to_capacity(fd_index + 1)?;
+        }
+
+        let old = self.fds[fd_index].replace(file);
+        self.cloexec[fd_index] = cloexec;
+        if fd_index == self.next_fd {
+            self.next_fd = fd_index + 1;
+        }
+
+        Ok((fd, old.map(|file| DroppedFd::new(file, self.lock_owner_id))))
+    }
+
     /// 根据文件描述符序号，获取文件结构体的Arc指针
     ///
     /// ## 参数
@@ -1864,12 +1922,11 @@ impl FileDescriptorVec {
     /// ## 参数
     ///
     /// - `fd` 文件描述符序号
-    pub fn drop_fd(&mut self, fd: i32) -> Result<Arc<File>, SystemError> {
+    pub fn drop_fd(&mut self, fd: i32) -> Result<DroppedFd, SystemError> {
         self.get_file_by_fd(fd).ok_or(SystemError::EBADF)?;
 
         // 把文件描述符数组对应位置设置为空
         let file = self.fds[fd as usize].take().unwrap();
-        super::posix_lock::release_posix_for_file_owner(&file, self.lock_owner_id);
         // 清除 per-fd close_on_exec 标志
         self.cloexec[fd as usize] = false;
 
@@ -1880,7 +1937,7 @@ impl FileDescriptorVec {
             self.next_fd = fd as usize;
         }
 
-        return Ok(file);
+        return Ok(DroppedFd::new(file, self.lock_owner_id));
     }
 
     #[allow(dead_code)]
@@ -1911,26 +1968,34 @@ impl FileDescriptorVec {
     }
 
     /// 在 execve 时关闭所有设置了 close_on_exec 的文件描述符
-    pub fn close_on_exec(&mut self) {
+    pub fn close_on_exec(&mut self) -> Vec<DroppedFd> {
+        let mut dropped = Vec::new();
         for i in 0..self.fds.len() {
             if self.fds[i].is_some() && self.cloexec[i] {
-                if let Err(r) = self.drop_fd(i as i32) {
-                    error!(
-                        "Failed to close file: pid = {:?}, fd = {}, error = {:?}",
-                        ProcessManager::current_pcb().raw_pid(),
-                        i,
-                        r
-                    );
+                match self.drop_fd(i as i32) {
+                    Ok(fd) => dropped.push(fd),
+                    Err(r) => {
+                        error!(
+                            "Failed to close file: pid = {:?}, fd = {}, error = {:?}",
+                            ProcessManager::current_pcb().raw_pid(),
+                            i,
+                            r
+                        );
+                    }
                 }
             }
         }
+        dropped
     }
 }
 
 impl Drop for FileDescriptorVec {
     fn drop(&mut self) {
-        for file in self.fds.iter().filter_map(|f| f.as_ref()) {
-            super::posix_lock::release_posix_for_file_owner(file, self.lock_owner_id);
+        for file in self.fds.iter_mut().filter_map(|f| f.take()) {
+            let dropped = DroppedFd::new(file, self.lock_owner_id);
+            if let Err(err) = dropped.finish_close() {
+                log::warn!("fd table teardown close failed: {:?}", err);
+            }
         }
     }
 }

@@ -777,6 +777,119 @@ fail_no_umount:
     return -1;
 }
 
+static int ext_test_fsync_enosys_cached_success() {
+    const char *mp = "/tmp/test_fuse_fsync_enosys";
+    int f = -1;
+    int dfd = -1;
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t fsync_count = 0;
+    volatile uint32_t fsyncdir_count = 0;
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.stop_on_destroy = 1;
+    args.fsync_count = &fsync_count;
+    args.fsyncdir_count = &fsyncdir_count;
+    args.force_fsync_errno = ENOSYS;
+    args.force_fsyncdir_errno = ENOSYS;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    char path[256];
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    f = open(path, O_RDONLY);
+    if (f < 0) {
+        printf("[FAIL] open(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+    if (fsync(f) != 0 || fsync(f) != 0) {
+        printf("[FAIL] fsync(file ENOSYS cache): %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    close(f);
+    f = -1;
+
+    dfd = open(mp, O_RDONLY | O_DIRECTORY);
+    if (dfd < 0) {
+        printf("[FAIL] open dirfd(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        goto fail;
+    }
+    if (fsync(dfd) != 0 || fsync(dfd) != 0) {
+        printf("[FAIL] fsync(dir ENOSYS cache): %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    close(dfd);
+    dfd = -1;
+
+    if (fsync_count != 1 || fsyncdir_count != 1) {
+        printf("[FAIL] ENOSYS fsync cache counters fsync=%u fsyncdir=%u\n", fsync_count,
+               fsyncdir_count);
+        goto fail;
+    }
+
+    if (umount(mp) != 0) {
+        printf("[FAIL] umount(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        goto fail_no_umount;
+    }
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (f >= 0) {
+        close(f);
+    }
+    if (dfd >= 0) {
+        close(dfd);
+    }
+    umount(mp);
+fail_no_umount:
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
 static int ext_test_open_release_flags_match_linux() {
     const char *mp = "/tmp/test_fuse_open_flags";
     int requested = O_RDWR | O_NOCTTY | O_TRUNC | O_APPEND | O_NONBLOCK;
@@ -1175,6 +1288,210 @@ static int ext_test_fopen_noflush_skips_flush() {
     usleep(100 * 1000);
     if (flush_count != 0 || release_count != 1) {
         printf("[FAIL] noflush counters flush=%u release=%u\n", flush_count, release_count);
+        goto fail;
+    }
+
+    if (umount(mp) != 0) {
+        printf("[FAIL] umount(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        goto fail_no_umount;
+    }
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (f >= 0) {
+        close(f);
+    }
+    umount(mp);
+fail_no_umount:
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_close_returns_flush_error_and_closes_fd() {
+    const char *mp = "/tmp/test_fuse_close_flush_error";
+    int f = -1;
+    int oldfd = -1;
+    int rc = 0;
+    char tmp = 0;
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t flush_count = 0;
+    volatile uint32_t release_count = 0;
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.stop_on_destroy = 1;
+    args.flush_count = &flush_count;
+    args.release_count = &release_count;
+    args.force_flush_errno = EIO;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    char path[256];
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    f = open(path, O_RDONLY);
+    if (f < 0) {
+        printf("[FAIL] open(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+
+    errno = 0;
+    oldfd = f;
+    rc = close(f);
+    f = -1;
+    if (rc != -1 || errno != EIO) {
+        printf("[FAIL] close should return EIO rc=%d errno=%d\n", rc, errno);
+        goto fail;
+    }
+    errno = 0;
+    if (read(oldfd, &tmp, 1) != -1 || errno != EBADF) {
+        printf("[FAIL] close error must still close fd read_errno=%d\n", errno);
+        goto fail;
+    }
+
+    usleep(100 * 1000);
+    if (flush_count != 1 || release_count != 1) {
+        printf("[FAIL] close flush error counters flush=%u release=%u\n", flush_count,
+               release_count);
+        goto fail;
+    }
+
+    if (umount(mp) != 0) {
+        printf("[FAIL] umount(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        goto fail_no_umount;
+    }
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (f >= 0) {
+        close(f);
+    }
+    umount(mp);
+fail_no_umount:
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_flush_enosys_cached_success() {
+    const char *mp = "/tmp/test_fuse_flush_enosys";
+    int f = -1;
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t flush_count = 0;
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.stop_on_destroy = 1;
+    args.flush_count = &flush_count;
+    args.force_flush_errno = ENOSYS;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    char path[256];
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    for (int i = 0; i < 2; ++i) {
+        f = open(path, O_RDONLY);
+        if (f < 0) {
+            printf("[FAIL] open(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+            goto fail;
+        }
+        if (close(f) != 0) {
+            printf("[FAIL] close after FLUSH ENOSYS: %s (errno=%d)\n", strerror(errno), errno);
+            f = -1;
+            goto fail;
+        }
+        f = -1;
+    }
+
+    usleep(100 * 1000);
+    if (flush_count != 1) {
+        printf("[FAIL] FLUSH ENOSYS should be cached, flush_count=%u\n", flush_count);
         goto fail;
     }
 
@@ -3452,6 +3769,7 @@ static int ext_test_shared_writable_mmap_msync_writeback() {
     void *addr = MAP_FAILED;
     volatile char c = 0;
     pid_t daemon = -1;
+    const uint32_t expected_writeback_flags = FUSE_WRITE_CACHE;
     struct mmap_shared_state {
         volatile int stop;
         volatile int init_done;
@@ -3565,7 +3883,7 @@ static int ext_test_shared_writable_mmap_msync_writeback() {
     }
     if (shared->open_count != 1 || shared->read_count != 1 || shared->write_count != 1 ||
         shared->last_write_fh != 900 || shared->last_write_offset != 0 ||
-        shared->last_write_size != 16 || shared->last_write_flags != FUSE_WRITE_CACHE ||
+        shared->last_write_size != 16 || shared->last_write_flags != expected_writeback_flags ||
         shared->last_write_open_flags != 0 || shared->last_write_uid != 0 ||
         shared->last_write_gid != 0 || shared->last_write_pid != 0) {
         printf("[FAIL] shared writable mmap counters open=%u read=%u write=%u wfh=%llu off=%llu size=%u wflags=%u oflags=%u uid=%u gid=%u pid=%u\n",
@@ -3615,6 +3933,7 @@ static int ext_test_shared_writable_mmap_osync_writeback() {
     void *addr = MAP_FAILED;
     volatile char c = 0;
     pid_t daemon = -1;
+    const uint32_t expected_writeback_flags = FUSE_WRITE_CACHE;
     const size_t page_size = 4096;
     const size_t map_len = page_size * 2;
     const char marker = 'Z';
@@ -3736,9 +4055,9 @@ static int ext_test_shared_writable_mmap_osync_writeback() {
     if (shared->open_count != 1 || shared->read_count != 1 || shared->write_count != 2 ||
         shared->fsync_count != 1 || shared->last_write_fh != 930 || shared->last_fsync_fh != 930 ||
         shared->last_write_offset != 0 || shared->last_write_size != page_size ||
-        shared->last_write_flags != FUSE_WRITE_CACHE || shared->last_write_open_flags != 0 ||
+        shared->last_write_flags != expected_writeback_flags || shared->last_write_open_flags != 0 ||
         shared->write_count_at_fsync != 2 ||
-        shared->last_write_flags_at_fsync != FUSE_WRITE_CACHE) {
+        shared->last_write_flags_at_fsync != expected_writeback_flags) {
         printf("[FAIL] shared mmap osync counters open=%u read=%u write=%u fsync=%u wfh=%llu fsh=%llu off=%llu size=%u wflags=%u oflags=%u fsync_writes=%u fsync_wflags=%u\n",
                shared->open_count, shared->read_count, shared->write_count, shared->fsync_count,
                (unsigned long long)shared->last_write_fh,
@@ -4081,6 +4400,7 @@ static int ext_test_shared_writable_mmap_munmap_writeback_without_msync() {
     char path[256];
     int f = -1;
     void *addr = MAP_FAILED;
+    const uint32_t expected_writeback_flags = FUSE_WRITE_CACHE;
     pid_t daemon = -1;
     struct mmap_shared_state {
         volatile int stop;
@@ -4191,7 +4511,7 @@ static int ext_test_shared_writable_mmap_munmap_writeback_without_msync() {
 
     if (shared->open_count != 1 || shared->read_count != 1 || shared->write_count != 1 ||
         shared->last_write_fh != 940 || shared->last_write_offset != 0 ||
-        shared->last_write_size != 16 || shared->last_write_flags != FUSE_WRITE_CACHE ||
+        shared->last_write_size != 16 || shared->last_write_flags != expected_writeback_flags ||
         shared->last_write_open_flags != 0) {
         printf("[FAIL] munmap writeback counters open=%u read=%u write=%u wfh=%llu off=%llu size=%u wflags=%u oflags=%u\n",
                shared->open_count, shared->read_count, shared->write_count,
@@ -5657,6 +5977,10 @@ TEST(FuseExtended, NoOpenFsyncUsesZeroFh) {
     ASSERT_EQ(0, ext_test_noopen_fsync_uses_zero_fh());
 }
 
+TEST(FuseExtended, FsyncEnosysCachedSuccess) {
+    ASSERT_EQ(0, ext_test_fsync_enosys_cached_success());
+}
+
 TEST(FuseExtended, OpenFlagsMatchLinuxMask) {
     ASSERT_EQ(0, ext_test_open_release_flags_match_linux());
 }
@@ -5671,6 +5995,14 @@ TEST(FuseExtended, FsetflUpdatesFuseDevNonblock) {
 
 TEST(FuseExtended, FopenNoFlushSkipsFlush) {
     ASSERT_EQ(0, ext_test_fopen_noflush_skips_flush());
+}
+
+TEST(FuseExtended, CloseReturnsFlushErrorAndClosesFd) {
+    ASSERT_EQ(0, ext_test_close_returns_flush_error_and_closes_fd());
+}
+
+TEST(FuseExtended, FlushEnosysCachedSuccess) {
+    ASSERT_EQ(0, ext_test_flush_enosys_cached_success());
 }
 
 TEST(FuseExtended, FopenNonseekableDisablesRandomIo) {

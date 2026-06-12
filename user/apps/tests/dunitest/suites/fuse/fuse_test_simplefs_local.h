@@ -177,6 +177,12 @@ static inline int fuse_test_log_enabled(void) {
 #ifndef FUSE_WRITE_CACHE
 #define FUSE_WRITE_CACHE (1u << 0)
 #endif
+#ifndef FUSE_WRITE_LOCKOWNER
+#define FUSE_WRITE_LOCKOWNER (1u << 1)
+#endif
+#ifndef FUSE_READ_LOCKOWNER
+#define FUSE_READ_LOCKOWNER (1u << 1)
+#endif
 #ifndef FUSE_NO_OPEN_SUPPORT
 #define FUSE_NO_OPEN_SUPPORT (1u << 17)
 #endif
@@ -751,6 +757,9 @@ struct fuse_daemon_args {
     int has_hello_open_fh_override;
     int force_open_enosys;
     int force_opendir_enosys;
+    int force_flush_errno;
+    int force_fsync_errno;
+    int force_fsyncdir_errno;
     int block_read_until_interrupt;
     size_t hello_data_size_override;
     size_t hello_read_size_override;
@@ -1248,6 +1257,9 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (a->last_flush_pid) {
             *a->last_flush_pid = h->pid;
         }
+        if (a->force_flush_errno > 0) {
+            return fuse_write_reply(a->fd, h->unique, -a->force_flush_errno, NULL, 0);
+        }
         return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
     case FUSE_FSYNC: {
         if (payload_len < sizeof(struct fuse_fsync_in)) {
@@ -1266,11 +1278,17 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (a->last_write_flags_at_fsync && a->last_write_flags) {
             *a->last_write_flags_at_fsync = *a->last_write_flags;
         }
+        if (a->force_fsync_errno > 0) {
+            return fuse_write_reply(a->fd, h->unique, -a->force_fsync_errno, NULL, 0);
+        }
         return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
     }
     case FUSE_FSYNCDIR:
         if (a->fsyncdir_count) {
             (*a->fsyncdir_count)++;
+        }
+        if (a->force_fsyncdir_errno > 0) {
+            return fuse_write_reply(a->fd, h->unique, -a->force_fsyncdir_errno, NULL, 0);
         }
         return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
     case FUSE_ACCESS: {

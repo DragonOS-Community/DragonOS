@@ -432,6 +432,18 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
+    fn flush_file(
+        &self,
+        _data: MutexGuard<FilePrivateData>,
+        _lock_owner: u64,
+    ) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    /// @brief 释放最后一个 open file description 引用
+    ///
+    /// @return 成功：Ok()
+    ///         失败：Err(错误码)
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回"不支持"
         return Err(SystemError::ENOSYS);

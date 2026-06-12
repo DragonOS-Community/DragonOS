@@ -172,7 +172,16 @@ fn do_execve_internal(
             }
 
             // close-on-exec 必须属于成功 exec 的 commit 过程，不能留在 syscall wrapper 尾部。
-            pcb.fd_table().write().close_on_exec();
+            let dropped_fds = {
+                let fd_table = pcb.fd_table();
+                let dropped = fd_table.write().close_on_exec();
+                dropped
+            };
+            for dropped in dropped_fds {
+                if let Err(err) = dropped.finish_close() {
+                    log::error!("execve close_on_exec flush failed: {:?}", err);
+                }
+            }
 
             if pcb.sighand().is_shared() {
                 // Linux出于进程和线程隔离，要确保在execve时，对共享的 SigHand 进行深拷贝

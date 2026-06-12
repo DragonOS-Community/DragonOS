@@ -32,7 +32,14 @@ impl Syscall for SysDup3Handle {
 
         let binding = ProcessManager::current_pcb().fd_table();
         let mut fd_table_guard = binding.write();
-        return do_dup3(oldfd, newfd, flags, &mut fd_table_guard);
+        let (newfd, dropped) = do_dup3(oldfd, newfd, flags, &mut fd_table_guard)?;
+        drop(fd_table_guard);
+        if let Some(dropped) = dropped {
+            if let Err(err) = dropped.finish_close() {
+                log::warn!("dup3 implicit close failed after fd replacement: {:?}", err);
+            }
+        }
+        Ok(newfd)
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

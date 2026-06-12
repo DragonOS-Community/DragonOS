@@ -32,9 +32,11 @@ use crate::{
 };
 
 use super::{
-    conn::FuseConn,
+    conn::{FuseConn, FuseRequestCred},
     fs::FuseFS,
-    private_data::{FuseFilePrivateData, FuseOpenPrivateData, FuseWritebackHandle},
+    private_data::{
+        FuseFilePrivateData, FuseOpenContext, FuseOpenPrivateData, FuseWritebackHandle,
+    },
     protocol::{
         fuse_pack_struct, fuse_read_struct, FuseAccessIn, FuseAttr, FuseAttrOut, FuseCreateIn,
         FuseDirent, FuseDirentPlus, FuseEntryOut, FuseFallocateIn, FuseFlushIn, FuseFsyncIn,
@@ -45,8 +47,9 @@ use super::{
         FOPEN_STREAM, FUSE_ACCESS, FUSE_CREATE, FUSE_FALLOCATE, FUSE_FLUSH, FUSE_FSYNC,
         FUSE_FSYNCDIR, FUSE_FSYNC_FDATASYNC, FUSE_GETATTR, FUSE_LINK, FUSE_LOOKUP, FUSE_MKDIR,
         FUSE_MKNOD, FUSE_OPEN, FUSE_OPENDIR, FUSE_READ, FUSE_READDIR, FUSE_READDIRPLUS,
-        FUSE_READLINK, FUSE_RELEASE, FUSE_RELEASEDIR, FUSE_RENAME, FUSE_RENAME2, FUSE_RMDIR,
-        FUSE_ROOT_ID, FUSE_SETATTR, FUSE_SYMLINK, FUSE_UNLINK, FUSE_WRITE, FUSE_WRITE_CACHE,
+        FUSE_READLINK, FUSE_READ_LOCKOWNER, FUSE_RELEASE, FUSE_RELEASEDIR, FUSE_RENAME,
+        FUSE_RENAME2, FUSE_RMDIR, FUSE_ROOT_ID, FUSE_SETATTR, FUSE_SYMLINK, FUSE_UNLINK,
+        FUSE_WRITE, FUSE_WRITE_CACHE, FUSE_WRITE_LOCKOWNER,
     },
 };
 
@@ -61,6 +64,7 @@ pub struct FuseNode {
     cached_metadata: Mutex<Option<Metadata>>,
     page_cache: Mutex<Option<Arc<PageCache>>>,
     writeback_handles: Mutex<Vec<Arc<FuseWritebackHandle>>>,
+    direct_io_lock: Mutex<()>,
     cached_metadata_deadline_ns: AtomicU64,
     lookup_count: AtomicU64,
     /// 最近一次 LOOKUP 回复中的 fuse_attr.flags（用于 announce-submounts）。
@@ -128,6 +132,7 @@ impl FuseNode {
             cached_metadata: Mutex::new(cached),
             page_cache: Mutex::new(None),
             writeback_handles: Mutex::new(Vec::new()),
+            direct_io_lock: Mutex::new(()),
             cached_metadata_deadline_ns: AtomicU64::new(if has_cached { u64::MAX } else { 0 }),
             lookup_count: AtomicU64::new(0),
             lookup_attr_flags: AtomicU32::new(0),
@@ -391,11 +396,11 @@ impl FuseNode {
         flags
     }
 
-    fn fuse_file_snapshot(data: &FilePrivateData) -> Result<(u64, u32, u32), SystemError> {
+    fn fuse_file_private_snapshot(
+        data: &FilePrivateData,
+    ) -> Result<FuseOpenPrivateData, SystemError> {
         match data {
-            FilePrivateData::Fuse(FuseFilePrivateData::File(p)) => {
-                Ok((p.fh, p.open_flags, p.fopen_flags))
-            }
+            FilePrivateData::Fuse(FuseFilePrivateData::File(p)) => Ok(p.clone()),
             _ => Err(SystemError::EBADF),
         }
     }
@@ -412,6 +417,7 @@ impl FuseNode {
         fh: u64,
         fopen_flags: u32,
         no_open: bool,
+        open_context: FuseOpenContext,
     ) -> Option<Arc<FuseWritebackHandle>> {
         if !Self::open_flags_are_writable(open_flags) {
             return None;
@@ -421,6 +427,7 @@ impl FuseNode {
             open_flags,
             fopen_flags,
             no_open,
+            open_context,
         ));
         self.writeback_handles.lock().push(handle.clone());
         Some(handle)
@@ -439,6 +446,67 @@ impl FuseNode {
             page_cache.manager().sync()?;
         }
         Ok(())
+    }
+
+    fn sync_dirty_cached_pages(&self) -> Result<(), SystemError> {
+        let Some(page_cache) = self.cached_page_cache() else {
+            return Ok(());
+        };
+        if !page_cache.has_dirty_pages() {
+            return Ok(());
+        }
+        page_cache.manager().sync()
+    }
+
+    fn check_and_advance_open_wb_error(
+        &self,
+        data: &FuseOpenPrivateData,
+    ) -> Result<(), SystemError> {
+        let Some(page_cache) = self.cached_page_cache() else {
+            return Ok(());
+        };
+        let mut since = data.open_context.wb_errseq.lock();
+        match page_cache.check_and_advance_writeback_error(&mut since) {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn flush_open_file(
+        &self,
+        data: &FuseOpenPrivateData,
+        lock_owner: u64,
+    ) -> Result<(), SystemError> {
+        let writeback_result = if data.writeback_handle.is_some() {
+            self.sync_dirty_cached_pages()
+        } else {
+            Ok(())
+        };
+        let wb_error_result = self.check_and_advance_open_wb_error(data);
+
+        writeback_result?;
+        wb_error_result?;
+
+        if data.no_open || (data.fopen_flags & FOPEN_NOFLUSH) != 0 || self.conn().no_flush() {
+            return Ok(());
+        }
+
+        let flush_in = FuseFlushIn {
+            fh: data.fh,
+            unused: 0,
+            padding: 0,
+            lock_owner,
+        };
+        match self
+            .conn()
+            .request(FUSE_FLUSH, self.nodeid, fuse_pack_struct(&flush_in))
+        {
+            Err(SystemError::ENOSYS) => {
+                self.conn().mark_no_flush();
+                Ok(())
+            }
+            result => result.map(|_| ()),
+        }
     }
 
     pub(crate) fn pin_writeback_handle(
@@ -461,6 +529,13 @@ impl FuseNode {
         self.check_not_stale()?;
         let pin = self.pin_writeback_handle()?;
         let handle = pin.handle();
+        let current_generation = self.generation();
+        if handle.open_context.node_generation != 0
+            && current_generation != 0
+            && handle.open_context.node_generation != current_generation
+        {
+            return Err(SystemError::ESTALE);
+        }
         let max_write = self.conn().max_write();
         if max_write == 0 {
             return Err(SystemError::EIO);
@@ -471,6 +546,15 @@ impl FuseNode {
             .ok_or(SystemError::EOVERFLOW)?;
         let mut total = 0usize;
         while total < buf.len() {
+            self.check_not_stale()?;
+            let current_generation = self.generation();
+            if handle.open_context.node_generation != 0
+                && current_generation != 0
+                && handle.open_context.node_generation != current_generation
+            {
+                return Err(SystemError::ESTALE);
+            }
+
             let chunk = core::cmp::min(max_write, buf.len() - total);
             let offset = base_offset
                 .checked_add(total)
@@ -512,8 +596,24 @@ impl FuseNode {
     ) -> Result<(), SystemError> {
         let conn_any: Arc<dyn core::any::Any + Send + Sync> = self.conn.clone();
         let node = self.self_ref.upgrade().ok_or(SystemError::EIO)?;
+        let open_context = FuseOpenContext {
+            request_cred: FuseRequestCred::from_current(),
+            lock_owner: crate::filesystem::vfs::vcore::current_file_lock_owner_id(),
+            node_generation: self.generation(),
+            wb_errseq: Arc::new(Mutex::new(
+                self.cached_page_cache()
+                    .map(|page_cache| page_cache.sample_writeback_error())
+                    .unwrap_or(0),
+            )),
+        };
         let writeback_handle = if opcode == FUSE_OPEN {
-            self.register_writeback_handle(open_flags, fh, fopen_flags, no_open)
+            self.register_writeback_handle(
+                open_flags,
+                fh,
+                fopen_flags,
+                no_open,
+                open_context.clone(),
+            )
         } else {
             None
         };
@@ -525,6 +625,7 @@ impl FuseNode {
                 open_flags,
                 fopen_flags,
                 no_open,
+                open_context,
                 writeback_handle,
             })),
             FUSE_OPENDIR => FilePrivateData::Fuse(FuseFilePrivateData::Dir(FuseOpenPrivateData {
@@ -534,6 +635,7 @@ impl FuseNode {
                 open_flags,
                 fopen_flags,
                 no_open,
+                open_context,
                 writeback_handle: None,
             })),
             _ => return Err(SystemError::EINVAL),
@@ -770,17 +872,25 @@ impl FuseNode {
         self.set_open_private_data(data, opcode, out.fh, file_flags, out.open_flags, false)
     }
 
-    fn release_common(&self, opcode: u32, fh: u64, file_flags: u32) -> Result<(), SystemError> {
+    fn release_common(&self, opcode: u32, fh: u64, file_flags: u32, lock_owner: u64) {
         let inarg = FuseReleaseIn {
             fh,
             flags: file_flags,
             release_flags: 0,
-            lock_owner: 0,
+            lock_owner,
         };
-        let _ = self
-            .conn()
-            .request_nocreds(opcode, self.nodeid, fuse_pack_struct(&inarg))?;
-        Ok(())
+        let conn = self.conn.clone();
+        let nodeid = self.nodeid;
+        let payload = fuse_pack_struct(&inarg).to_vec();
+        if let Err(err) = conn.request_nocreds_background(opcode, nodeid, &payload) {
+            log::warn!(
+                "fuse: queue async release failed opcode={} nodeid={} fh={} err={:?}",
+                opcode,
+                nodeid,
+                fh,
+                err
+            );
+        }
     }
 
     fn ensure_dir(&self) -> Result<(), SystemError> {
@@ -807,27 +917,45 @@ impl FuseNode {
             FileType::Dir => FUSE_FSYNCDIR,
             _ => return Ok(()),
         };
+        if self.conn().no_fsync(opcode) {
+            return Ok(());
+        }
         let inarg = FuseFsyncIn {
             fh: 0,
             fsync_flags: if datasync { FUSE_FSYNC_FDATASYNC } else { 0 },
             padding: 0,
         };
-        let _ = self
+        match self
             .conn()
-            .request(opcode, self.nodeid, fuse_pack_struct(&inarg))?;
-        Ok(())
+            .request(opcode, self.nodeid, fuse_pack_struct(&inarg))
+        {
+            Err(SystemError::ENOSYS) => {
+                self.conn().mark_no_fsync(opcode);
+                Ok(())
+            }
+            result => result.map(|_| ()),
+        }
     }
 
     fn fsync_with_fh(&self, opcode: u32, fh: u64, datasync: bool) -> Result<(), SystemError> {
+        if self.conn().no_fsync(opcode) {
+            return Ok(());
+        }
         let inarg = FuseFsyncIn {
             fh,
             fsync_flags: if datasync { FUSE_FSYNC_FDATASYNC } else { 0 },
             padding: 0,
         };
-        let _ = self
+        match self
             .conn()
-            .request(opcode, self.nodeid, fuse_pack_struct(&inarg))?;
-        Ok(())
+            .request(opcode, self.nodeid, fuse_pack_struct(&inarg))
+        {
+            Err(SystemError::ENOSYS) => {
+                self.conn().mark_no_fsync(opcode);
+                Ok(())
+            }
+            result => result.map(|_| ()),
+        }
     }
 
     fn parse_create_reply(payload: &[u8]) -> Result<(FuseEntryOut, FuseOpenOut), SystemError> {
@@ -874,6 +1002,7 @@ impl FuseNode {
         buf: &mut [u8],
         fh: u64,
         file_flags: u32,
+        lock_owner: u64,
     ) -> Result<usize, SystemError> {
         let max_read = self.conn().max_read();
         if max_read == 0 {
@@ -901,8 +1030,12 @@ impl FuseNode {
                 fh,
                 offset: chunk_offset as u64,
                 size: chunk as u32,
-                read_flags: 0,
-                lock_owner: 0,
+                read_flags: if lock_owner != 0 {
+                    FUSE_READ_LOCKOWNER
+                } else {
+                    0
+                },
+                lock_owner,
                 flags: file_flags,
                 padding: 0,
             };
@@ -949,6 +1082,7 @@ impl FuseNode {
             page_buf,
             fh,
             file_flags,
+            0,
         )
     }
 
@@ -1162,6 +1296,56 @@ impl FuseNode {
             .discard_clean_range(start_page_index, end_page_index)?;
         Ok(())
     }
+
+    fn direct_io_page_range(
+        offset: usize,
+        len: usize,
+    ) -> Result<Option<(usize, usize, usize)>, SystemError> {
+        if len == 0 {
+            return Ok(None);
+        }
+        let end = offset.checked_add(len).ok_or(SystemError::EOVERFLOW)?;
+        let start_page_index = offset >> MMArch::PAGE_SHIFT;
+        let end_page_index = (end - 1) >> MMArch::PAGE_SHIFT;
+        let end_page_exclusive = end_page_index
+            .checked_add(1)
+            .ok_or(SystemError::EOVERFLOW)?;
+        Ok(Some((start_page_index, end_page_index, end_page_exclusive)))
+    }
+
+    fn prepare_direct_io_range(
+        &self,
+        offset: usize,
+        len: usize,
+        data: &FuseOpenPrivateData,
+        discard_clean: bool,
+    ) -> Result<(), SystemError> {
+        let Some((start_page_index, end_page_index, end_page_exclusive)) =
+            Self::direct_io_page_range(offset, len)?
+        else {
+            return Ok(());
+        };
+        let Some(page_cache) = self.cached_page_cache() else {
+            return Ok(());
+        };
+
+        page_cache
+            .manager()
+            .writeback_range(start_page_index, end_page_index)?;
+        page_cache
+            .manager()
+            .wait_writeback_range(start_page_index, end_page_index)?;
+        self.check_and_advance_open_wb_error(data)?;
+
+        if discard_clean {
+            let _invalidate = page_cache.invalidate_write();
+            page_cache.unmap_mapping_pages(start_page_index, Some(end_page_exclusive))?;
+            let _ = page_cache
+                .manager()
+                .discard_clean_range(start_page_index, end_page_index)?;
+        }
+        Ok(())
+    }
 }
 
 impl IndexNode for FuseNode {
@@ -1295,12 +1479,28 @@ impl IndexNode for FuseNode {
         }
     }
 
+    fn flush_file(
+        &self,
+        data: MutexGuard<FilePrivateData>,
+        lock_owner: u64,
+    ) -> Result<(), SystemError> {
+        let fuse_data = match &*data {
+            FilePrivateData::Fuse(data) => data.clone(),
+            _ => return Ok(()),
+        };
+        drop(data);
+
+        match fuse_data {
+            FuseFilePrivateData::File(p) => self.flush_open_file(&p, lock_owner),
+            FuseFilePrivateData::Dir(_) | FuseFilePrivateData::Dev(_) => Ok(()),
+        }
+    }
+
     fn close(&self, data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         // `IndexNode::close()` is called from `File::drop()`, i.e. after the
-        // last `Arc<File>` reference is gone.  FUSE file/dir private data is
-        // immutable after open, so taking a snapshot here is not a TOCTOU
-        // window; it prevents holding the private-data mutex while waiting for
-        // userspace to reply to FLUSH/RELEASE.
+        // last `Arc<File>` reference is gone.  User-visible FUSE_FLUSH errors
+        // are handled by `flush_file()` on fd close; this final close only
+        // drains dirty mappings and sends RELEASE.
         let fuse_data = match &*data {
             FilePrivateData::Fuse(data) => data.clone(),
             _ => return Ok(()),
@@ -1310,7 +1510,7 @@ impl IndexNode for FuseNode {
         match fuse_data {
             FuseFilePrivateData::File(p) => {
                 let writeback_result = if p.writeback_handle.is_some() {
-                    self.sync_cached_pages()
+                    self.sync_dirty_cached_pages()
                 } else {
                     Ok(())
                 };
@@ -1320,25 +1520,15 @@ impl IndexNode for FuseNode {
                 if p.no_open {
                     return writeback_result;
                 }
-                if (p.fopen_flags & FOPEN_NOFLUSH) == 0 {
-                    let flush_in = FuseFlushIn {
-                        fh: p.fh,
-                        unused: 0,
-                        padding: 0,
-                        lock_owner: 0,
-                    };
-                    let _ =
-                        self.conn()
-                            .request(FUSE_FLUSH, self.nodeid, fuse_pack_struct(&flush_in));
-                }
-                let release_result = self.release_common(FUSE_RELEASE, p.fh, p.open_flags);
-                writeback_result.and(release_result)
+                self.release_common(FUSE_RELEASE, p.fh, p.open_flags, 0);
+                writeback_result
             }
             FuseFilePrivateData::Dir(p) => {
                 if p.no_open {
                     Ok(())
                 } else {
-                    self.release_common(FUSE_RELEASEDIR, p.fh, p.open_flags)
+                    self.release_common(FUSE_RELEASEDIR, p.fh, p.open_flags, 0);
+                    Ok(())
                 }
             }
             FuseFilePrivateData::Dev(_) => Ok(()),
@@ -1367,11 +1557,16 @@ impl IndexNode for FuseNode {
             return Ok(n);
         }
         self.ensure_regular()?;
-        let (fh, file_flags, fopen_flags) = Self::fuse_file_snapshot(&data)?;
+        let private_data = Self::fuse_file_private_snapshot(&data)?;
         drop(data);
+        let fh = private_data.fh;
+        let file_flags = private_data.open_flags;
+        let fopen_flags = private_data.fopen_flags;
 
         if (fopen_flags & FOPEN_DIRECT_IO) != 0 || (file_flags & FileFlags::O_DIRECT.bits()) != 0 {
-            return self.read_direct_with_open(offset, len, buf, fh, file_flags);
+            self.prepare_direct_io_range(offset, len, &private_data, false)?;
+            let lock_owner = crate::filesystem::vfs::vcore::current_file_lock_owner_id();
+            return self.read_direct_with_open(offset, len, buf, fh, file_flags, lock_owner);
         }
 
         self.read_cached_with_open(offset, len, buf, fh, file_flags)
@@ -1392,15 +1587,31 @@ impl IndexNode for FuseNode {
         if len > 0 {
             offset.checked_add(len).ok_or(SystemError::EOVERFLOW)?;
         }
-        let (fh, file_flags, fopen_flags) = Self::fuse_file_snapshot(&data)?;
+        let private_data = Self::fuse_file_private_snapshot(&data)?;
         drop(data);
+        let fh = private_data.fh;
+        let file_flags = private_data.open_flags;
+        let fopen_flags = private_data.fopen_flags;
         let max_write = self.conn().max_write();
         if max_write == 0 {
             return Err(SystemError::EIO);
         }
         let cached_write =
             (fopen_flags & FOPEN_DIRECT_IO) == 0 && (file_flags & FileFlags::O_DIRECT.bits()) == 0;
+        let lock_owner = if cached_write {
+            0
+        } else {
+            crate::filesystem::vfs::vcore::current_file_lock_owner_id()
+        };
+        let _direct_write_guard = if cached_write {
+            None
+        } else {
+            Some(self.direct_io_lock.lock())
+        };
         let mut total_written = 0usize;
+        if !cached_write {
+            self.prepare_direct_io_range(offset, len, &private_data, true)?;
+        }
 
         while total_written < len {
             let chunk = core::cmp::min(max_write, len - total_written);
@@ -1412,8 +1623,12 @@ impl IndexNode for FuseNode {
                 fh,
                 offset: chunk_offset as u64,
                 size: chunk as u32,
-                write_flags: 0,
-                lock_owner: 0,
+                write_flags: if lock_owner != 0 {
+                    FUSE_WRITE_LOCKOWNER
+                } else {
+                    0
+                },
+                lock_owner,
                 flags: file_flags,
                 padding: 0,
             };
@@ -1641,7 +1856,10 @@ impl IndexNode for FuseNode {
 
         match fuse_data {
             FuseFilePrivateData::File(p) => {
-                self.sync_cached_pages()?;
+                let sync_result = self.sync_cached_pages();
+                let wb_error_result = self.check_and_advance_open_wb_error(&p);
+                sync_result?;
+                wb_error_result?;
                 self.fsync_with_fh(FUSE_FSYNC, p.fh, datasync)
             }
             FuseFilePrivateData::Dir(p) => self.fsync_with_fh(FUSE_FSYNCDIR, p.fh, datasync),
@@ -1676,7 +1894,10 @@ impl IndexNode for FuseNode {
         }
 
         match fuse_data {
-            FuseFilePrivateData::File(p) => self.fsync_with_fh(FUSE_FSYNC, p.fh, datasync),
+            FuseFilePrivateData::File(p) => {
+                self.check_and_advance_open_wb_error(&p)?;
+                self.fsync_with_fh(FUSE_FSYNC, p.fh, datasync)
+            }
             FuseFilePrivateData::Dir(p) => self.fsync_with_fh(FUSE_FSYNCDIR, p.fh, datasync),
             FuseFilePrivateData::Dev(_) => self.fsync_common(datasync),
         }
@@ -1751,7 +1972,7 @@ impl IndexNode for FuseNode {
 
         // RELEASEDIR (best-effort)
         if !dir_p.no_open {
-            let _ = self.release_common(FUSE_RELEASEDIR, fh, open_flags);
+            self.release_common(FUSE_RELEASEDIR, fh, open_flags, 0);
         }
         Ok(names)
     }

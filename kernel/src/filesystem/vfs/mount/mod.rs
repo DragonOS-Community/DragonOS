@@ -1360,6 +1360,14 @@ impl IndexNode for MountFSInode {
         return self.inner_inode.fadvise(file, offset, len, advise);
     }
 
+    fn flush_file(
+        &self,
+        data: MutexGuard<FilePrivateData>,
+        lock_owner: u64,
+    ) -> Result<(), SystemError> {
+        self.inner_inode.flush_file(data, lock_owner)
+    }
+
     fn close(&self, data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         self.inner_inode.close(data)
     }

@@ -3,9 +3,15 @@ use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use system_error::SystemError;
 
-use crate::{filesystem::vfs::file::FileFlags, libs::wait_queue::WaitQueue};
+use crate::{
+    filesystem::vfs::file::FileFlags,
+    libs::{errseq::ErrSeqValue, mutex::Mutex, wait_queue::WaitQueue},
+};
 
-use super::{conn::FuseConn, inode::FuseNode};
+use super::{
+    conn::{FuseConn, FuseRequestCred},
+    inode::FuseNode,
+};
 
 #[derive(Debug, Clone)]
 pub struct FuseDevPrivateData {
@@ -29,7 +35,20 @@ pub struct FuseOpenPrivateData {
     /// Daemon-returned FOPEN_* flags from fuse_open_out.
     pub fopen_flags: u32,
     pub no_open: bool,
+    pub open_context: FuseOpenContext,
     pub writeback_handle: Option<Arc<FuseWritebackHandle>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FuseOpenContext {
+    /// Request credential sampled at open time for asynchronous writeback.
+    pub request_cred: FuseRequestCred,
+    /// POSIX lock-owner id for requests whose semantics depend on the opener.
+    pub lock_owner: u64,
+    /// Node generation observed when this file was opened.
+    pub node_generation: u64,
+    /// Per-open-file writeback error cursor used by FUSE file-level sync paths.
+    pub wb_errseq: Arc<Mutex<ErrSeqValue>>,
 }
 
 pub struct FuseWritebackHandle {
@@ -37,6 +56,7 @@ pub struct FuseWritebackHandle {
     open_flags: AtomicU32,
     pub fopen_flags: u32,
     pub no_open: bool,
+    pub open_context: FuseOpenContext,
     closing: AtomicBool,
     inflight: AtomicUsize,
     wait_queue: WaitQueue,
@@ -70,6 +90,7 @@ impl core::fmt::Debug for FuseWritebackHandle {
             .field("open_flags", &self.open_flags())
             .field("fopen_flags", &self.fopen_flags)
             .field("no_open", &self.no_open)
+            .field("open_context", &self.open_context)
             .field("closing", &self.is_closing())
             .field("inflight", &self.inflight.load(Ordering::Acquire))
             .finish()
@@ -77,12 +98,19 @@ impl core::fmt::Debug for FuseWritebackHandle {
 }
 
 impl FuseWritebackHandle {
-    pub fn new(fh: u64, open_flags: u32, fopen_flags: u32, no_open: bool) -> Self {
+    pub fn new(
+        fh: u64,
+        open_flags: u32,
+        fopen_flags: u32,
+        no_open: bool,
+        open_context: FuseOpenContext,
+    ) -> Self {
         Self {
             fh,
             open_flags: AtomicU32::new(open_flags),
             fopen_flags,
             no_open,
+            open_context,
             closing: AtomicBool::new(false),
             inflight: AtomicUsize::new(0),
             wait_queue: WaitQueue::default(),

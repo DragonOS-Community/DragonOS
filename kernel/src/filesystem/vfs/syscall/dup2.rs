@@ -1,7 +1,7 @@
 use system_error::SystemError;
 
 use crate::{
-    filesystem::vfs::file::{FileDescriptorVec, FileFlags},
+    filesystem::vfs::file::{DroppedFd, FileDescriptorVec, FileFlags},
     libs::rwsem::RwSemWriteGuard,
 };
 
@@ -9,7 +9,7 @@ pub fn do_dup2(
     oldfd: i32,
     newfd: i32,
     fd_table_guard: &mut RwSemWriteGuard<'_, FileDescriptorVec>,
-) -> Result<usize, SystemError> {
+) -> Result<(usize, Option<DroppedFd>), SystemError> {
     do_dup3(oldfd, newfd, FileFlags::empty(), fd_table_guard)
 }
 
@@ -18,7 +18,7 @@ pub fn do_dup3(
     newfd: i32,
     flags: FileFlags,
     fd_table_guard: &mut RwSemWriteGuard<'_, FileDescriptorVec>,
-) -> Result<usize, SystemError> {
+) -> Result<(usize, Option<DroppedFd>), SystemError> {
     // 检查 RLIMIT_NOFILE：newfd 必须小于软限制（与 Linux ksys_dup3 一致，返回 EBADF）
     let nofile = crate::process::ProcessManager::current_pcb()
         .get_rlimit(crate::process::resource::RLimitID::Nofile)
@@ -33,7 +33,7 @@ pub fn do_dup3(
         fd_table_guard
             .get_file_by_fd(oldfd)
             .ok_or(SystemError::EBADF)?;
-        return Ok(newfd as usize);
+        return Ok((newfd as usize, None));
     }
 
     // 验证 oldfd 有效（必须在当前 fd 表范围内且已打开）
@@ -43,17 +43,9 @@ pub fn do_dup3(
         .get_file_by_fd(oldfd)
         .ok_or(SystemError::EBADF)?;
 
-    // 如果 newfd 已被占用，先关闭它
-    if fd_table_guard.get_file_by_fd(newfd).is_some() && fd_table_guard.drop_fd(newfd).is_err() {
-        // An I/O error occurred while attempting to close fildes2.
-        return Err(SystemError::EIO);
-    }
-
     let cloexec = flags.contains(FileFlags::O_CLOEXEC);
 
     // 共享同一个 open file description（Arc<File>），符合 POSIX dup 语义
-    let res = fd_table_guard
-        .alloc_fd_arc(old_file, Some(newfd), cloexec)
-        .map(|x| x as usize);
-    return res;
+    let (res, dropped) = fd_table_guard.replace_fd_arc(old_file, newfd, cloexec)?;
+    return Ok((res as usize, dropped));
 }

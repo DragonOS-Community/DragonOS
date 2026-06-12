@@ -71,6 +71,9 @@ pub const FUSE_EXPLICIT_INVAL_DATA: u64 = 1 << 25;
 /// Guest auto-mounts directories marked FUSE_ATTR_SUBMOUNT (Linux fuse.h: init->flags bit 27).
 pub const FUSE_SUBMOUNTS: u64 = 1 << 27;
 pub const FUSE_INIT_EXT: u64 = 1 << 30;
+/// Allow shared mmap for FOPEN_DIRECT_IO files (Linux 6.6 fuse.h bit 36).
+#[allow(dead_code)]
+pub const FUSE_DIRECT_IO_ALLOW_MMAP: u64 = 1 << 36;
 
 /// fuse_attr.flags (Linux 6.6): directory is a submount root announced by virtiofsd.
 pub const FUSE_ATTR_SUBMOUNT: u32 = 1 << 0;
@@ -91,6 +94,10 @@ pub const FOPEN_PARALLEL_DIRECT_WRITES: u32 = 1 << 6;
 
 // fuse_write_in.write_flags (Linux 6.6 uapi subset)
 pub const FUSE_WRITE_CACHE: u32 = 1 << 0;
+pub const FUSE_WRITE_LOCKOWNER: u32 = 1 << 1;
+
+// fuse_read_in.read_flags (Linux 6.6 uapi subset)
+pub const FUSE_READ_LOCKOWNER: u32 = 1 << 1;
 
 // getattr/setattr valid bits (subset)
 pub const FATTR_MODE: u32 = 1 << 0;

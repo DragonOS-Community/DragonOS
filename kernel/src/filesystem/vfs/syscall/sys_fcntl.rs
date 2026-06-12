@@ -101,16 +101,21 @@ impl SysFcntlHandle {
                 // 在RLIMIT_NOFILE范围内查找可用的文件描述符
                 for i in arg..nofile {
                     if fd_table_guard.get_file_by_fd(i as i32).is_none() {
-                        if cmd == FcntlCommand::DupFd {
-                            return do_dup2(fd, i as i32, &mut fd_table_guard);
+                        let (newfd, dropped) = if cmd == FcntlCommand::DupFd {
+                            do_dup2(fd, i as i32, &mut fd_table_guard)?
                         } else {
-                            return do_dup3(
-                                fd,
-                                i as i32,
-                                FileFlags::O_CLOEXEC,
-                                &mut fd_table_guard,
-                            );
+                            do_dup3(fd, i as i32, FileFlags::O_CLOEXEC, &mut fd_table_guard)?
+                        };
+                        drop(fd_table_guard);
+                        if let Some(dropped) = dropped {
+                            if let Err(err) = dropped.finish_close() {
+                                log::warn!(
+                                    "fcntl dup implicit close failed after fd replacement: {:?}",
+                                    err
+                                );
+                            }
                         }
+                        return Ok(newfd);
                     }
                 }
                 return Err(SystemError::EMFILE);

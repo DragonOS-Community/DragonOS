@@ -6,6 +6,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::MMArch,
+    exception::workqueue::{schedule_work, Work},
     filesystem::epoll::{
         event_poll::EventPoll, event_poll::LockedEPItemLinkedList, EPollEventType, EPollItem,
     },
@@ -24,11 +25,12 @@ use super::protocol::{
     FuseInterruptIn, FuseOutHeader, FuseWriteIn, FUSE_ABORT_ERROR, FUSE_ASYNC_DIO, FUSE_ASYNC_READ,
     FUSE_ATOMIC_O_TRUNC, FUSE_AUTO_INVAL_DATA, FUSE_BIG_WRITES, FUSE_DESTROY, FUSE_DONT_MASK,
     FUSE_DO_READDIRPLUS, FUSE_EXPLICIT_INVAL_DATA, FUSE_EXPORT_SUPPORT, FUSE_FLUSH, FUSE_FORGET,
-    FUSE_HANDLE_KILLPRIV, FUSE_INIT, FUSE_INIT_EXT, FUSE_INTERRUPT, FUSE_KERNEL_MINOR_VERSION,
-    FUSE_KERNEL_VERSION, FUSE_LOOKUP, FUSE_MAX_PAGES, FUSE_MIN_READ_BUFFER, FUSE_NOTIFY_DELETE,
-    FUSE_NOTIFY_INVAL_ENTRY, FUSE_NOTIFY_INVAL_INODE, FUSE_NOTIFY_POLL, FUSE_NOTIFY_RETRIEVE,
-    FUSE_NOTIFY_STORE, FUSE_NO_OPENDIR_SUPPORT, FUSE_NO_OPEN_SUPPORT, FUSE_PARALLEL_DIROPS,
-    FUSE_POSIX_ACL, FUSE_POSIX_LOCKS, FUSE_READDIRPLUS_AUTO, FUSE_SUBMOUNTS,
+    FUSE_FSYNC, FUSE_FSYNCDIR, FUSE_HANDLE_KILLPRIV, FUSE_INIT, FUSE_INIT_EXT, FUSE_INTERRUPT,
+    FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION, FUSE_LOOKUP, FUSE_MAX_PAGES,
+    FUSE_MIN_READ_BUFFER, FUSE_NOTIFY_DELETE, FUSE_NOTIFY_INVAL_ENTRY, FUSE_NOTIFY_INVAL_INODE,
+    FUSE_NOTIFY_POLL, FUSE_NOTIFY_RETRIEVE, FUSE_NOTIFY_STORE, FUSE_NO_OPENDIR_SUPPORT,
+    FUSE_NO_OPEN_SUPPORT, FUSE_PARALLEL_DIROPS, FUSE_POSIX_ACL, FUSE_POSIX_LOCKS,
+    FUSE_READDIRPLUS_AUTO, FUSE_SUBMOUNTS,
 };
 
 fn wait_with_recheck<T, F>(waitq: &WaitQueue, mut check: F) -> Result<T, SystemError>
@@ -61,18 +63,29 @@ pub struct FuseRequest {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct FuseRequestCred {
-    uid: u32,
-    gid: u32,
-    pid: u32,
+pub struct FuseRequestCred {
+    pub uid: u32,
+    pub gid: u32,
+    pub pid: u32,
 }
 
 impl FuseRequestCred {
-    fn nocreds() -> Self {
+    pub(crate) fn nocreds() -> Self {
         Self {
             uid: 0,
             gid: 0,
             pid: 0,
+        }
+    }
+
+    pub(crate) fn from_current() -> Self {
+        let pcb = ProcessManager::current_pcb();
+        let cred = pcb.cred();
+        let pid = pcb.task_tgid_vnr().map(|p| p.data() as u32).unwrap_or(0);
+        Self {
+            uid: cred.fsuid.data() as u32,
+            gid: cred.fsgid.data() as u32,
+            pid,
         }
     }
 }
@@ -160,6 +173,9 @@ struct FuseConnInner {
     no_opendir: bool,
     no_readdirplus: bool,
     no_fallocate: bool,
+    no_flush: bool,
+    no_fsync: bool,
+    no_fsyncdir: bool,
     no_interrupt: bool,
     max_write_cap: usize,
     pending: VecDeque<Arc<FuseRequest>>,
@@ -216,6 +232,9 @@ impl FuseConn {
                 no_opendir: false,
                 no_readdirplus: false,
                 no_fallocate: false,
+                no_flush: false,
+                no_fsync: false,
+                no_fsyncdir: false,
                 no_interrupt: false,
                 max_write_cap,
                 pending: VecDeque::new(),
@@ -328,6 +347,32 @@ impl FuseConn {
 
     pub fn mark_no_fallocate(&self) {
         self.inner.lock().no_fallocate = true;
+    }
+
+    pub fn no_flush(&self) -> bool {
+        self.inner.lock().no_flush
+    }
+
+    pub fn mark_no_flush(&self) {
+        self.inner.lock().no_flush = true;
+    }
+
+    pub fn no_fsync(&self, opcode: u32) -> bool {
+        let g = self.inner.lock();
+        match opcode {
+            FUSE_FSYNC => g.no_fsync,
+            FUSE_FSYNCDIR => g.no_fsyncdir,
+            _ => false,
+        }
+    }
+
+    pub fn mark_no_fsync(&self, opcode: u32) {
+        let mut g = self.inner.lock();
+        match opcode {
+            FUSE_FSYNC => g.no_fsync = true,
+            FUSE_FSYNCDIR => g.no_fsyncdir = true,
+            _ => {}
+        }
     }
 
     fn alloc_unique(&self) -> u64 {
@@ -688,6 +733,40 @@ impl FuseConn {
         self.wait_request_complete(opcode, pending)
     }
 
+    pub fn request_nocreds_background(
+        self: &Arc<Self>,
+        opcode: u32,
+        nodeid: u64,
+        payload: &[u8],
+    ) -> Result<(), SystemError> {
+        if opcode != FUSE_INIT {
+            self.wait_initialized()?;
+        }
+        let pending =
+            self.enqueue_request_with_cred(opcode, nodeid, payload, FuseRequestCred::nocreds())?;
+        let conn = self.clone();
+        schedule_work(Work::new(move || {
+            if let Err(err) = conn.wait_request_complete(opcode, pending.clone()) {
+                if matches!(err, SystemError::ENOTCONN | SystemError::ENOENT) {
+                    log::debug!(
+                        "fuse: background request aborted opcode={} nodeid={} err={:?}",
+                        opcode,
+                        nodeid,
+                        err
+                    );
+                } else {
+                    log::warn!(
+                        "fuse: background request failed opcode={} nodeid={} err={:?}",
+                        opcode,
+                        nodeid,
+                        err
+                    );
+                }
+            }
+        }));
+        Ok(())
+    }
+
     fn wait_request_complete(
         &self,
         opcode: u32,
@@ -732,17 +811,7 @@ impl FuseConn {
         if !self.allow_current_process(&cred) {
             return Err(SystemError::EACCES);
         }
-        let pid = pcb.task_tgid_vnr().map(|p| p.data() as u32).unwrap_or(0);
-        self.enqueue_request_with_cred(
-            opcode,
-            nodeid,
-            payload,
-            FuseRequestCred {
-                uid: cred.fsuid.data() as u32,
-                gid: cred.fsgid.data() as u32,
-                pid,
-            },
-        )
+        self.enqueue_request_with_cred(opcode, nodeid, payload, FuseRequestCred::from_current())
     }
 
     fn enqueue_request_with_cred(

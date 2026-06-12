@@ -38,11 +38,11 @@ use super::{
         FuseLinkIn, FuseMkdirIn, FuseMknodIn, FuseOpenIn, FuseOpenOut, FuseReadIn, FuseReleaseIn,
         FuseRename2In, FuseRenameIn, FuseSetattrIn, FuseWriteIn, FuseWriteOut, FATTR_ATIME,
         FATTR_CTIME, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_SIZE, FATTR_UID, FOPEN_DIRECT_IO,
-        FOPEN_KEEP_CACHE, FUSE_ACCESS, FUSE_CREATE, FUSE_FLUSH, FUSE_FSYNC, FUSE_FSYNCDIR,
-        FUSE_FSYNC_FDATASYNC, FUSE_GETATTR, FUSE_LINK, FUSE_LOOKUP, FUSE_MKDIR, FUSE_MKNOD,
-        FUSE_OPEN, FUSE_OPENDIR, FUSE_READ, FUSE_READDIR, FUSE_READDIRPLUS, FUSE_READLINK,
-        FUSE_RELEASE, FUSE_RELEASEDIR, FUSE_RENAME, FUSE_RENAME2, FUSE_RMDIR, FUSE_ROOT_ID,
-        FUSE_SETATTR, FUSE_SYMLINK, FUSE_UNLINK, FUSE_WRITE, FUSE_WRITE_CACHE,
+        FOPEN_KEEP_CACHE, FOPEN_NOFLUSH, FUSE_ACCESS, FUSE_CREATE, FUSE_FLUSH, FUSE_FSYNC,
+        FUSE_FSYNCDIR, FUSE_FSYNC_FDATASYNC, FUSE_GETATTR, FUSE_LINK, FUSE_LOOKUP, FUSE_MKDIR,
+        FUSE_MKNOD, FUSE_OPEN, FUSE_OPENDIR, FUSE_READ, FUSE_READDIR, FUSE_READDIRPLUS,
+        FUSE_READLINK, FUSE_RELEASE, FUSE_RELEASEDIR, FUSE_RENAME, FUSE_RENAME2, FUSE_RMDIR,
+        FUSE_ROOT_ID, FUSE_SETATTR, FUSE_SYMLINK, FUSE_UNLINK, FUSE_WRITE, FUSE_WRITE_CACHE,
     },
 };
 
@@ -1251,15 +1251,17 @@ impl IndexNode for FuseNode {
                 if p.no_open {
                     return writeback_result;
                 }
-                let flush_in = FuseFlushIn {
-                    fh: p.fh,
-                    unused: 0,
-                    padding: 0,
-                    lock_owner: 0,
-                };
-                let _ = self
-                    .conn()
-                    .request(FUSE_FLUSH, self.nodeid, fuse_pack_struct(&flush_in));
+                if (p.fopen_flags & FOPEN_NOFLUSH) == 0 {
+                    let flush_in = FuseFlushIn {
+                        fh: p.fh,
+                        unused: 0,
+                        padding: 0,
+                        lock_owner: 0,
+                    };
+                    let _ =
+                        self.conn()
+                            .request(FUSE_FLUSH, self.nodeid, fuse_pack_struct(&flush_in));
+                }
                 let release_result = self.release_common(FUSE_RELEASE, p.fh, p.open_flags);
                 writeback_result.and(release_result)
             }

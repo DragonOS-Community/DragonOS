@@ -865,6 +865,98 @@ fail_no_umount:
     return -1;
 }
 
+static int ext_test_fopen_noflush_skips_flush() {
+    const char *mp = "/tmp/test_fuse_noflush";
+    int f = -1;
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t flush_count = 0;
+    volatile uint32_t release_count = 0;
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.stop_on_destroy = 1;
+    args.flush_count = &flush_count;
+    args.release_count = &release_count;
+    args.hello_open_out_flags = FOPEN_NOFLUSH;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    char path[256];
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    f = open(path, O_RDONLY);
+    if (f < 0) {
+        printf("[FAIL] open(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+    close(f);
+    f = -1;
+
+    usleep(100 * 1000);
+    if (flush_count != 0 || release_count != 1) {
+        printf("[FAIL] noflush counters flush=%u release=%u\n", flush_count, release_count);
+        goto fail;
+    }
+
+    if (umount(mp) != 0) {
+        printf("[FAIL] umount(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        goto fail_no_umount;
+    }
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (f >= 0) {
+        close(f);
+    }
+    umount(mp);
+fail_no_umount:
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
 static int ext_test_atomic_otrunc_uses_open_without_setattr() {
     const char *mp = "/tmp/test_fuse_atomic_otrunc";
     int requested = O_RDWR | O_TRUNC;
@@ -4642,6 +4734,10 @@ TEST(FuseExtended, NoOpenFsyncUsesZeroFh) {
 
 TEST(FuseExtended, OpenFlagsMatchLinuxMask) {
     ASSERT_EQ(0, ext_test_open_release_flags_match_linux());
+}
+
+TEST(FuseExtended, FopenNoFlushSkipsFlush) {
+    ASSERT_EQ(0, ext_test_fopen_noflush_skips_flush());
 }
 
 TEST(FuseExtended, AtomicOTruncUsesOpenWithoutSetattr) {

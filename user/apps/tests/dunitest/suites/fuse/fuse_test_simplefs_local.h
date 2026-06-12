@@ -191,6 +191,9 @@ static inline int fuse_test_log_enabled(void) {
 #ifndef FOPEN_DIRECT_IO
 #define FOPEN_DIRECT_IO (1u << 0)
 #endif
+#ifndef FOPEN_NOFLUSH
+#define FOPEN_NOFLUSH (1u << 5)
+#endif
 
 #ifndef FUSE_NOTIFY_INVAL_INODE
 #define FUSE_NOTIFY_INVAL_INODE 2

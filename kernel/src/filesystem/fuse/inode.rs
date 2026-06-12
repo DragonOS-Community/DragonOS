@@ -40,13 +40,13 @@ use super::{
         FuseDirent, FuseDirentPlus, FuseEntryOut, FuseFlushIn, FuseFsyncIn, FuseGetattrIn,
         FuseLinkIn, FuseMkdirIn, FuseMknodIn, FuseOpenIn, FuseOpenOut, FuseReadIn, FuseReleaseIn,
         FuseRename2In, FuseRenameIn, FuseSetattrIn, FuseWriteIn, FuseWriteOut, FATTR_ATIME,
-        FATTR_CTIME, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_SIZE, FATTR_UID, FOPEN_DIRECT_IO,
-        FOPEN_KEEP_CACHE, FOPEN_NOFLUSH, FOPEN_NONSEEKABLE, FOPEN_STREAM, FUSE_ACCESS, FUSE_CREATE,
-        FUSE_FLUSH, FUSE_FSYNC, FUSE_FSYNCDIR, FUSE_FSYNC_FDATASYNC, FUSE_GETATTR, FUSE_LINK,
-        FUSE_LOOKUP, FUSE_MKDIR, FUSE_MKNOD, FUSE_OPEN, FUSE_OPENDIR, FUSE_READ, FUSE_READDIR,
-        FUSE_READDIRPLUS, FUSE_READLINK, FUSE_RELEASE, FUSE_RELEASEDIR, FUSE_RENAME, FUSE_RENAME2,
-        FUSE_RMDIR, FUSE_ROOT_ID, FUSE_SETATTR, FUSE_SYMLINK, FUSE_UNLINK, FUSE_WRITE,
-        FUSE_WRITE_CACHE,
+        FATTR_CTIME, FATTR_FH, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_SIZE, FATTR_UID,
+        FOPEN_DIRECT_IO, FOPEN_KEEP_CACHE, FOPEN_NOFLUSH, FOPEN_NONSEEKABLE, FOPEN_STREAM,
+        FUSE_ACCESS, FUSE_CREATE, FUSE_FLUSH, FUSE_FSYNC, FUSE_FSYNCDIR, FUSE_FSYNC_FDATASYNC,
+        FUSE_GETATTR, FUSE_LINK, FUSE_LOOKUP, FUSE_MKDIR, FUSE_MKNOD, FUSE_OPEN, FUSE_OPENDIR,
+        FUSE_READ, FUSE_READDIR, FUSE_READDIRPLUS, FUSE_READLINK, FUSE_RELEASE, FUSE_RELEASEDIR,
+        FUSE_RENAME, FUSE_RENAME2, FUSE_RMDIR, FUSE_ROOT_ID, FUSE_SETATTR, FUSE_SYMLINK,
+        FUSE_UNLINK, FUSE_WRITE, FUSE_WRITE_CACHE,
     },
 };
 
@@ -268,6 +268,41 @@ impl FuseNode {
         if let Some(cache) = self.cached_page_cache() {
             cache.truncate(new_size)?;
         }
+        Ok(())
+    }
+
+    fn setattr_size(&self, len: usize, fh: Option<u64>) -> Result<(), SystemError> {
+        self.check_not_stale()?;
+        let mut valid = FATTR_SIZE;
+        if fh.is_some() {
+            valid |= FATTR_FH;
+        }
+        let inarg = FuseSetattrIn {
+            valid,
+            padding: 0,
+            fh: fh.unwrap_or(0),
+            size: len as u64,
+            lock_owner: 0,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+            atimensec: 0,
+            mtimensec: 0,
+            ctimensec: 0,
+            mode: 0,
+            unused4: 0,
+            uid: 0,
+            gid: 0,
+            unused5: 0,
+        };
+        let payload = self
+            .conn()
+            .request(FUSE_SETATTR, self.nodeid, fuse_pack_struct(&inarg))?;
+        let out: FuseAttrOut = fuse_read_struct(&payload)?;
+        let md = Self::attr_to_metadata(&out.attr);
+        let new_size = md.size.max(0) as usize;
+        self.set_cached_metadata_with_valid(md, out.attr_valid, out.attr_valid_nsec);
+        self.truncate_page_cache(new_size)?;
         Ok(())
     }
 
@@ -1486,34 +1521,27 @@ impl IndexNode for FuseNode {
     }
 
     fn resize(&self, len: usize) -> Result<(), SystemError> {
-        self.check_not_stale()?;
-        let inarg = FuseSetattrIn {
-            valid: FATTR_SIZE,
-            padding: 0,
-            fh: 0,
-            size: len as u64,
-            lock_owner: 0,
-            atime: 0,
-            mtime: 0,
-            ctime: 0,
-            atimensec: 0,
-            mtimensec: 0,
-            ctimensec: 0,
-            mode: 0,
-            unused4: 0,
-            uid: 0,
-            gid: 0,
-            unused5: 0,
+        self.setattr_size(len, None)
+    }
+
+    fn resize_file(
+        &self,
+        len: usize,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        let fuse_data = match &*data {
+            FilePrivateData::Fuse(data) => data.clone(),
+            _ => {
+                drop(data);
+                return self.resize(len);
+            }
         };
-        let payload = self
-            .conn()
-            .request(FUSE_SETATTR, self.nodeid, fuse_pack_struct(&inarg))?;
-        let out: FuseAttrOut = fuse_read_struct(&payload)?;
-        let md = Self::attr_to_metadata(&out.attr);
-        let new_size = md.size.max(0) as usize;
-        self.set_cached_metadata_with_valid(md, out.attr_valid, out.attr_valid_nsec);
-        self.truncate_page_cache(new_size)?;
-        Ok(())
+        drop(data);
+
+        match fuse_data {
+            FuseFilePrivateData::File(p) => self.setattr_size(len, Some(p.fh)),
+            _ => self.resize(len),
+        }
     }
 
     fn sync(&self) -> Result<(), SystemError> {

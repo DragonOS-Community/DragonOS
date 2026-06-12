@@ -1444,8 +1444,10 @@ impl File {
             return Err(SystemError::EFBIG);
         }
 
-        // 统一通过 VFS 封装，复用类型/只读检查
-        crate::filesystem::vfs::vcore::vfs_truncate(self.inode(), len)?;
+        // 统一通过 VFS 封装，复用类型/只读检查，同时保留 fd 上下文。
+        crate::filesystem::vfs::vcore::vfs_truncate_file(self.inode(), len, || {
+            self.private_data.lock()
+        })?;
         return Ok(());
     }
 

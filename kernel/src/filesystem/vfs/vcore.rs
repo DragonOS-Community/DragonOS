@@ -16,11 +16,12 @@ use crate::{
         procfs::procfs_init,
         sysfs::sysfs_init,
         vfs::{
-            mount::MountFlags, permission::PermissionMask, AtomicInodeId, FileSystem, FileType,
-            InodeFlags, InodeMode, MountFS,
+            file::FilePrivateData, mount::MountFlags, permission::PermissionMask, AtomicInodeId,
+            FileSystem, FileType, InodeFlags, InodeMode, MountFS,
         },
     },
     init::cmdline::kenrel_cmdline_param_manager,
+    libs::mutex::MutexGuard,
     mm::truncate::truncate_inode_pages,
     process::{cred::CAPFlags, namespace::mnt::mnt_namespace_init, ProcessManager},
 };
@@ -701,12 +702,15 @@ pub(super) fn do_file_lookup_at(
     return inode.lookup_follow_symlink2(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES, follow_final);
 }
 
-/// 统一的 VFS 截断封装：对 inode 进行基本检查并调用 resize
-/// - 目录返回 EISDIR
-/// - 非普通文件返回 EINVAL
-/// - 只读挂载返回 EROFS
 #[inline(never)]
-pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemError> {
+fn vfs_truncate_inner<F>(
+    inode: Arc<dyn IndexNode>,
+    len: usize,
+    do_resize: F,
+) -> Result<(), SystemError>
+where
+    F: FnOnce(&Arc<dyn IndexNode>) -> Result<(), SystemError>,
+{
     let md = inode.metadata()?;
     let old_size = md.size;
 
@@ -746,7 +750,7 @@ pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemE
         }
     }
 
-    let result = inode.resize(len);
+    let result = do_resize(&inode);
 
     // Linux 语义：对普通文件进行截断（且确实改变 size）后，若无 CAP_FSETID，清理 suid/sgid。
     if result.is_ok() && old_size != len as i64 {
@@ -774,4 +778,23 @@ pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemE
     }
 
     result
+}
+
+/// 统一的 VFS 截断封装：对 inode 进行基本检查并调用 resize
+/// - 目录返回 EISDIR
+/// - 非普通文件返回 EINVAL
+/// - 只读挂载返回 EROFS
+#[inline(never)]
+pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemError> {
+    vfs_truncate_inner(inode, len, |inode| inode.resize(len))
+}
+
+/// 基于已打开文件执行 VFS 截断，保留公共检查，并把 fd 私有数据传给文件系统。
+#[inline(never)]
+pub fn vfs_truncate_file<'a>(
+    inode: Arc<dyn IndexNode>,
+    len: usize,
+    data: impl FnOnce() -> MutexGuard<'a, FilePrivateData>,
+) -> Result<(), SystemError> {
+    vfs_truncate_inner(inode, len, |inode| inode.resize_file(len, data()))
 }

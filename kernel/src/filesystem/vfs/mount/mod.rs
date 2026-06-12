@@ -1472,6 +1472,16 @@ impl IndexNode for MountFSInode {
     }
 
     #[inline]
+    fn resize_file(
+        &self,
+        len: usize,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        self.ensure_mount_writable()?;
+        return self.inner_inode.resize_file(len, data);
+    }
+
+    #[inline]
     fn create(
         &self,
         name: &str,

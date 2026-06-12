@@ -548,6 +548,19 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
+    /// 基于打开文件上下文重新设置文件大小。
+    ///
+    /// 默认回退到 inode 级 resize；需要文件句柄语义的文件系统（如 FUSE）
+    /// 可覆盖该方法，从 `FilePrivateData` 中取得 per-open 状态。
+    fn resize_file(
+        &self,
+        len: usize,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        drop(data);
+        self.resize(len)
+    }
+
     /// @brief 在当前目录下创建一个新的inode
     ///
     /// @param name 目录项的名字

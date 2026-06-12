@@ -228,6 +228,9 @@ static inline int fuse_test_log_enabled(void) {
 #ifndef FATTR_SIZE
 #define FATTR_SIZE (1u << 3)
 #endif
+#ifndef FATTR_FH
+#define FATTR_FH (1u << 6)
+#endif
 
 struct fuse_in_header {
     uint32_t len;
@@ -675,6 +678,9 @@ struct fuse_daemon_args {
     volatile uint32_t *open_count;
     volatile uint32_t *opendir_count;
     volatile uint32_t *setattr_count;
+    volatile uint32_t *last_setattr_valid;
+    volatile uint64_t *last_setattr_fh;
+    volatile uint64_t *last_setattr_size;
     volatile uint32_t *release_count;
     volatile uint32_t *releasedir_count;
     volatile uint32_t *readdirplus_count;
@@ -1593,6 +1599,15 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
             return -1;
         }
         const struct fuse_setattr_in *in = (const struct fuse_setattr_in *)payload;
+        if (a->last_setattr_valid) {
+            *a->last_setattr_valid = in->valid;
+        }
+        if (a->last_setattr_fh) {
+            *a->last_setattr_fh = in->fh;
+        }
+        if (a->last_setattr_size) {
+            *a->last_setattr_size = in->size;
+        }
         struct simplefs_node *node = simplefs_find_node(&a->fs, h->nodeid);
         if (!node) {
             return fuse_write_reply(a->fd, h->unique, -ENOENT, NULL, 0);

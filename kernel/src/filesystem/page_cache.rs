@@ -550,6 +550,92 @@ impl PageCacheManager {
         }
     }
 
+    /// Merge data into an existing ready cache page.
+    ///
+    /// This waits for an in-flight writeback before copying, but callers that need
+    /// backend write ordering must still hold the page cache invalidate write lock
+    /// around their full backend-write and cache-merge sequence.
+    pub fn update_ready_page(
+        &self,
+        page_index: usize,
+        page_offset: usize,
+        data: &[u8],
+    ) -> Result<bool, SystemError> {
+        if data.is_empty() {
+            return Ok(false);
+        }
+        match page_offset.checked_add(data.len()) {
+            Some(end) if end <= MMArch::PAGE_SIZE => {}
+            _ => return Err(SystemError::EINVAL),
+        }
+
+        let cache = self.upgrade()?;
+
+        loop {
+            let Some(entry) = cache.inner.lock().get_entry(page_index) else {
+                return Ok(false);
+            };
+
+            match entry.state() {
+                PageState::Loading => {
+                    if entry.wait_ready().is_err() {
+                        return Ok(false);
+                    }
+                    continue;
+                }
+                PageState::Writeback => {
+                    Self::wait_writeback_entry(entry)?;
+                    continue;
+                }
+                PageState::Error => return Ok(false),
+                PageState::UpToDate | PageState::Dirty => {}
+            }
+
+            let mut page = entry.page.write();
+            match entry.state() {
+                PageState::Loading | PageState::Writeback => {
+                    drop(page);
+                    continue;
+                }
+                PageState::Error => return Ok(false),
+                PageState::UpToDate | PageState::Dirty => {}
+            }
+
+            let keep_dirty =
+                entry.state() == PageState::Dirty || page.flags().contains(PageFlags::PG_DIRTY);
+            let dst = unsafe { page.as_slice_mut() };
+            dst[page_offset..page_offset + data.len()].copy_from_slice(data);
+            page.add_flags(PageFlags::PG_UPTODATE);
+            if keep_dirty {
+                page.add_flags(PageFlags::PG_DIRTY);
+            }
+            drop(page);
+
+            if keep_dirty {
+                let mut inner = cache.inner.lock();
+                let Some(current) = inner.get_entry(page_index) else {
+                    return Ok(false);
+                };
+                if !Arc::ptr_eq(&current, &entry) {
+                    return Ok(false);
+                }
+                match current.state() {
+                    PageState::Loading => continue,
+                    PageState::Writeback => return Ok(true),
+                    PageState::Error => return Ok(false),
+                    PageState::UpToDate | PageState::Dirty => {
+                        let old_state = current.state();
+                        inner.dirty_pages.insert(page_index);
+                        cache.account_state_transition(old_state, PageState::Dirty);
+                        current.set_state(PageState::Dirty);
+                    }
+                }
+            }
+
+            return Ok(true);
+        }
+    }
+
     pub fn sync(&self) -> Result<(), SystemError> {
         let cache = self.upgrade()?;
         let dirty_entries: Vec<(usize, Arc<PageEntry>)> = {
@@ -961,12 +1047,12 @@ impl PageCacheManager {
         page_index: usize,
         entry: Arc<PageEntry>,
     ) -> Result<(), SystemError> {
+        let _invalidate = cache.invalidate_read();
         if !Self::try_prepare_async_writeback_entry(cache, page_index, &entry)? {
             return Ok(());
         }
 
         let page = entry.page.clone();
-        let _invalidate = cache.invalidate_read();
 
         // If the inode has been freed, restore page state via finish_writeback_entry and return error.
         let inode = match cache.inode().and_then(|inode| inode.upgrade()) {
@@ -1047,6 +1133,7 @@ impl PageCacheManager {
         page_index: usize,
         entry: Arc<PageEntry>,
     ) -> Result<(), SystemError> {
+        let _invalidate = cache.invalidate_read();
         if !Self::prepare_writeback_entry(cache, page_index, &entry)? {
             return Ok(());
         }
@@ -1056,7 +1143,6 @@ impl PageCacheManager {
         let mut wb_guard =
             WritebackGuard::new(cache.clone(), page_index, entry.clone(), page.clone());
 
-        let _invalidate = cache.invalidate_read();
         let inode = cache
             .inode()
             .and_then(|inode| inode.upgrade())

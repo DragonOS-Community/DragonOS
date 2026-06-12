@@ -715,6 +715,7 @@ struct fuse_daemon_args {
     volatile uint32_t *last_open_in_flags;
     volatile uint32_t *last_release_in_flags;
     volatile uint64_t *last_open_fh;
+    volatile uint32_t *last_open_pid;
     volatile uint64_t *last_read_fh;
     volatile uint32_t *last_read_size;
     volatile uint32_t *last_read_open_flags;
@@ -726,6 +727,7 @@ struct fuse_daemon_args {
     volatile uint32_t *last_write_uid;
     volatile uint32_t *last_write_gid;
     volatile uint32_t *last_write_pid;
+    volatile unsigned char *last_write_watch_byte;
     volatile uint64_t *last_fsync_fh;
     volatile uint32_t *write_count_at_fsync;
     volatile uint32_t *last_write_flags_at_fsync;
@@ -746,6 +748,7 @@ struct fuse_daemon_args {
     volatile uint64_t *last_interrupt_target;
     uint32_t access_deny_mask;
     uint32_t init_out_flags_override;
+    uint64_t write_watch_offset;
     uint64_t hello_open_fh_override;
     uint64_t next_open_fh;
     uint64_t create_reuse_nodeid;
@@ -955,6 +958,9 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         }
         if (h->opcode == FUSE_OPEN && a->last_open_in_flags) {
             *a->last_open_in_flags = in->flags;
+        }
+        if (h->opcode == FUSE_OPEN && a->last_open_pid) {
+            *a->last_open_pid = h->pid;
         }
         if (h->opcode == FUSE_OPEN && a->force_open_enosys) {
             return fuse_write_reply(a->fd, h->unique, -ENOSYS, NULL, 0);
@@ -1360,6 +1366,13 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         size_t to_copy = in->size;
         if (in->offset + to_copy > SIMPLEFS_DATA_MAX) {
             to_copy = SIMPLEFS_DATA_MAX - (size_t)in->offset;
+        }
+        if (a->last_write_watch_byte) {
+            uint64_t watch = a->write_watch_offset;
+            uint64_t end = in->offset + to_copy;
+            if (watch >= in->offset && watch < end) {
+                *a->last_write_watch_byte = data[(size_t)(watch - in->offset)];
+            }
         }
         memcpy(node->data + in->offset, data, to_copy);
         if (node->size < in->offset + to_copy) {

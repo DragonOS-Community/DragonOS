@@ -571,9 +571,12 @@ impl FuseNode {
             let mut payload_in = Vec::with_capacity(size_of::<FuseWriteIn>() + chunk);
             payload_in.extend_from_slice(fuse_pack_struct(&write_in));
             payload_in.extend_from_slice(&buf[total..total + chunk]);
-            let payload = self
-                .conn()
-                .request_nocreds(FUSE_WRITE, self.nodeid, &payload_in)?;
+            let payload = self.conn().request_with_cred(
+                FUSE_WRITE,
+                self.nodeid,
+                &payload_in,
+                handle.open_context.request_cred,
+            )?;
             let out: FuseWriteOut = fuse_read_struct(&payload)?;
             if out.size as usize != chunk {
                 return Err(SystemError::EIO);
@@ -1221,19 +1224,16 @@ impl FuseNode {
 
     fn update_cached_pages_after_write(
         &self,
+        page_cache: &Arc<PageCache>,
         offset: usize,
         data: &[u8],
     ) -> Result<(), SystemError> {
         if data.is_empty() {
             return Ok(());
         }
-        let Some(page_cache) = self.cached_page_cache() else {
-            return Ok(());
-        };
         let end = offset
             .checked_add(data.len())
             .ok_or(SystemError::EOVERFLOW)?;
-        let _invalidate = page_cache.invalidate_read();
 
         let start_page_index = offset >> MMArch::PAGE_SHIFT;
         let end_page_index = (end - 1) >> MMArch::PAGE_SHIFT;
@@ -1249,7 +1249,7 @@ impl FuseNode {
 
             let src_offset = write_start - offset;
             let page_offset = write_start - page_start;
-            let _ = page_cache.manager().update_clean_page(
+            let _ = page_cache.manager().update_ready_page(
                 page_index,
                 page_offset,
                 &data[src_offset..src_offset + write_len],
@@ -1257,6 +1257,22 @@ impl FuseNode {
         }
 
         Ok(())
+    }
+
+    fn prepare_cached_write_range(
+        &self,
+        page_cache: &Arc<PageCache>,
+        offset: usize,
+        len: usize,
+    ) -> Result<(), SystemError> {
+        let Some((start_page_index, end_page_index, _)) = Self::direct_io_page_range(offset, len)?
+        else {
+            return Ok(());
+        };
+
+        page_cache
+            .manager()
+            .wait_writeback_range(start_page_index, end_page_index)
     }
 
     fn note_successful_write(&self, offset: usize, len: usize) -> Result<(), SystemError> {
@@ -1612,6 +1628,19 @@ impl IndexNode for FuseNode {
         if !cached_write {
             self.prepare_direct_io_range(offset, len, &private_data, true)?;
         }
+        let cached_page_cache = if cached_write {
+            self.cached_page_cache()
+        } else {
+            None
+        };
+        let _cached_write_guard = cached_page_cache
+            .as_ref()
+            .map(|page_cache| page_cache.invalidate_write());
+        if let Some(page_cache) = cached_page_cache.as_ref() {
+            // Serialize ordinary cached writes against page-cache writeback so an older
+            // dirty mmap page cannot be written back after the daemon sees this write.
+            self.prepare_cached_write_range(page_cache, offset, len)?;
+        }
 
         while total_written < len {
             let chunk = core::cmp::min(max_write, len - total_written);
@@ -1647,10 +1676,15 @@ impl IndexNode for FuseNode {
             let wrote = out.size as usize;
             self.note_successful_write(chunk_offset, wrote)?;
             let cache_result = if cached_write {
-                self.update_cached_pages_after_write(
-                    chunk_offset,
-                    &buf[total_written..total_written + wrote],
-                )
+                if let Some(page_cache) = cached_page_cache.as_ref() {
+                    self.update_cached_pages_after_write(
+                        page_cache,
+                        chunk_offset,
+                        &buf[total_written..total_written + wrote],
+                    )
+                } else {
+                    Ok(())
+                }
             } else {
                 self.invalidate_cached_pages_after_direct_write(chunk_offset, wrote)
             };

@@ -3777,6 +3777,7 @@ static int ext_test_shared_writable_mmap_msync_writeback() {
         volatile uint32_t read_count;
         volatile uint32_t write_count;
         volatile uint64_t last_write_fh;
+        volatile uint32_t last_open_pid;
         volatile uint64_t last_write_offset;
         volatile uint32_t last_write_size;
         volatile uint32_t last_write_flags;
@@ -3828,6 +3829,7 @@ static int ext_test_shared_writable_mmap_msync_writeback() {
         child_args.read_count = &shared->read_count;
         child_args.write_count = &shared->write_count;
         child_args.last_write_fh = &shared->last_write_fh;
+        child_args.last_open_pid = &shared->last_open_pid;
         child_args.last_write_offset = &shared->last_write_offset;
         child_args.last_write_size = &shared->last_write_size;
         child_args.last_write_flags = &shared->last_write_flags;
@@ -3885,13 +3887,172 @@ static int ext_test_shared_writable_mmap_msync_writeback() {
         shared->last_write_fh != 900 || shared->last_write_offset != 0 ||
         shared->last_write_size != 16 || shared->last_write_flags != expected_writeback_flags ||
         shared->last_write_open_flags != 0 || shared->last_write_uid != 0 ||
-        shared->last_write_gid != 0 || shared->last_write_pid != 0) {
-        printf("[FAIL] shared writable mmap counters open=%u read=%u write=%u wfh=%llu off=%llu size=%u wflags=%u oflags=%u uid=%u gid=%u pid=%u\n",
+        shared->last_write_gid != 0 || shared->last_open_pid == 0 ||
+        shared->last_write_pid != shared->last_open_pid) {
+        printf("[FAIL] shared writable mmap counters open=%u read=%u write=%u wfh=%llu open_pid=%u off=%llu size=%u wflags=%u oflags=%u uid=%u gid=%u pid=%u\n",
                shared->open_count, shared->read_count, shared->write_count,
-               (unsigned long long)shared->last_write_fh,
+               (unsigned long long)shared->last_write_fh, shared->last_open_pid,
                (unsigned long long)shared->last_write_offset, shared->last_write_size,
                shared->last_write_flags, shared->last_write_open_flags, shared->last_write_uid,
                shared->last_write_gid, shared->last_write_pid);
+        goto fail;
+    }
+
+    munmap(addr, 4096);
+    addr = MAP_FAILED;
+    close(f);
+    f = -1;
+    umount(mp);
+    shared->stop = 1;
+    close(fd);
+    waitpid(daemon, NULL, 0);
+    munmap(shared, sizeof(*shared));
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (addr != MAP_FAILED) {
+        munmap(addr, 4096);
+    }
+    if (f >= 0) {
+        close(f);
+    }
+    umount(mp);
+    shared->stop = 1;
+    close(fd);
+    if (daemon > 0) {
+        kill(daemon, SIGTERM);
+        waitpid(daemon, NULL, 0);
+    }
+    munmap(shared, sizeof(*shared));
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_shared_mmap_dirty_then_pwrite_keeps_latest_data() {
+    const char *mp = "/tmp/test_fuse_mmap_dirty_pwrite";
+    char path[256];
+    int f = -1;
+    void *addr = MAP_FAILED;
+    volatile char c = 0;
+    pid_t daemon = -1;
+    struct dirty_pwrite_shared_state {
+        volatile int stop;
+        volatile int init_done;
+        volatile uint32_t read_count;
+        volatile uint32_t write_count;
+        volatile uint64_t last_write_offset;
+        volatile uint32_t last_write_size;
+        volatile uint32_t last_write_flags;
+        volatile unsigned char last_write_watch_byte;
+    };
+    struct dirty_pwrite_shared_state *shared =
+        (struct dirty_pwrite_shared_state *)mmap(NULL, sizeof(*shared), PROT_READ | PROT_WRITE,
+                                                 MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shared == MAP_FAILED) {
+        printf("[FAIL] mmap(shared counters): %s (errno=%d)\n", strerror(errno), errno);
+        return -1;
+    }
+    memset(shared, 0, sizeof(*shared));
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        munmap(shared, sizeof(*shared));
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        munmap(shared, sizeof(*shared));
+        rmdir(mp);
+        return -1;
+    }
+
+    daemon = fork();
+    if (daemon < 0) {
+        printf("[FAIL] fork fuse daemon: %s (errno=%d)\n", strerror(errno), errno);
+        close(fd);
+        munmap(shared, sizeof(*shared));
+        rmdir(mp);
+        return -1;
+    }
+    if (daemon == 0) {
+        struct fuse_daemon_args child_args;
+        memset(&child_args, 0, sizeof(child_args));
+        child_args.fd = fd;
+        child_args.stop = &shared->stop;
+        child_args.init_done = &shared->init_done;
+        child_args.enable_write_ops = 1;
+        child_args.stop_on_destroy = 1;
+        child_args.read_count = &shared->read_count;
+        child_args.write_count = &shared->write_count;
+        child_args.last_write_offset = &shared->last_write_offset;
+        child_args.last_write_size = &shared->last_write_size;
+        child_args.last_write_flags = &shared->last_write_flags;
+        child_args.last_write_watch_byte = &shared->last_write_watch_byte;
+        child_args.write_watch_offset = 1;
+        child_args.next_open_fh = 901;
+        fuse_daemon_thread(&child_args);
+        _exit(0);
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0,max_read=4096",
+             fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        shared->stop = 1;
+        close(fd);
+        kill(daemon, SIGTERM);
+        waitpid(daemon, NULL, 0);
+        munmap(shared, sizeof(*shared));
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&shared->init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    f = open(path, O_RDWR);
+    if (f < 0) {
+        printf("[FAIL] open(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+    addr = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, f, 0);
+    if (addr == MAP_FAILED) {
+        printf("[FAIL] mmap(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+
+    c = ((volatile char *)addr)[0];
+    if (c != 'h') {
+        printf("[FAIL] shared writable mmap first byte got=%d\n", c);
+        goto fail;
+    }
+    ((volatile char *)addr)[1] = 'M';
+    if (pwrite(f, "P", 1, 1) != 1) {
+        printf("[FAIL] pwrite over dirty mmap byte: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    if (((volatile char *)addr)[1] != 'P') {
+        printf("[FAIL] mmap cache was not updated by overlapping pwrite got=%d\n",
+               ((volatile char *)addr)[1]);
+        goto fail;
+    }
+    if (msync(addr, 4096, MS_SYNC) != 0) {
+        printf("[FAIL] msync(shared dirty pwrite): %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    if (shared->write_count < 2 || shared->last_write_offset != 0 ||
+        shared->last_write_size != 16 || shared->last_write_flags != FUSE_WRITE_CACHE ||
+        shared->last_write_watch_byte != 'P') {
+        printf("[FAIL] dirty mmap pwrite counters read=%u write=%u off=%llu size=%u flags=%u watched=%u\n",
+               shared->read_count, shared->write_count,
+               (unsigned long long)shared->last_write_offset, shared->last_write_size,
+               shared->last_write_flags, shared->last_write_watch_byte);
         goto fail;
     }
 
@@ -5915,6 +6076,10 @@ TEST(FuseExtended, DirectIoMmapPolicy) {
 
 TEST(FuseExtended, SharedWritableMmapMsyncWriteback) {
     ASSERT_EQ(0, ext_test_shared_writable_mmap_msync_writeback());
+}
+
+TEST(FuseExtended, SharedMmapDirtyThenPwriteKeepsLatestData) {
+    ASSERT_EQ(0, ext_test_shared_mmap_dirty_then_pwrite_keeps_latest_data());
 }
 
 TEST(FuseExtended, SharedWritableMmapOSyncWriteback) {

@@ -733,6 +733,20 @@ impl FuseConn {
         self.wait_request_complete(opcode, pending)
     }
 
+    pub(crate) fn request_with_cred(
+        &self,
+        opcode: u32,
+        nodeid: u64,
+        payload: &[u8],
+        req_cred: FuseRequestCred,
+    ) -> Result<Vec<u8>, SystemError> {
+        if opcode != FUSE_INIT {
+            self.wait_initialized()?;
+        }
+        let pending = self.enqueue_request_with_cred(opcode, nodeid, payload, req_cred)?;
+        self.wait_request_complete(opcode, pending)
+    }
+
     pub fn request_nocreds_background(
         self: &Arc<Self>,
         opcode: u32,

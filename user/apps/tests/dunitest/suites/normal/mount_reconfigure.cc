@@ -841,6 +841,21 @@ TEST(MountReconfigure, StackedMountKeepsOriginalTarget) {
     EXPECT_FALSE(path_exists(upper_marker));
     EXPECT_TRUE(path_exists(sibling));
 
+    // Regression: popping the top mount must restore the lower mount's reverse
+    // mountpoint inode index. copy_mnt_ns() uses that index when cloning the
+    // namespace, so a second unshare should preserve the now-visible lower mount.
+    if (unshare(CLONE_NEWNS) != 0) {
+        int saved_errno = errno;
+        umount(target);
+        unlink(sibling);
+        rmdir(target);
+        rmdir(base);
+        FAIL() << strerror(saved_errno);
+    }
+    EXPECT_TRUE(path_exists(lower_marker));
+    EXPECT_FALSE(path_exists(upper_marker));
+    EXPECT_TRUE(path_exists(sibling));
+
     ASSERT_EQ(0, umount(target)) << strerror(errno);
     unlink(sibling);
     rmdir(target);

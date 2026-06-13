@@ -6,6 +6,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::MMArch,
+    exception::workqueue::{schedule_work, Work},
     filesystem::epoll::{
         event_poll::EventPoll, event_poll::LockedEPItemLinkedList, EPollEventType, EPollItem,
     },
@@ -24,11 +25,12 @@ use super::protocol::{
     FuseInterruptIn, FuseOutHeader, FuseWriteIn, FUSE_ABORT_ERROR, FUSE_ASYNC_DIO, FUSE_ASYNC_READ,
     FUSE_ATOMIC_O_TRUNC, FUSE_AUTO_INVAL_DATA, FUSE_BIG_WRITES, FUSE_DESTROY, FUSE_DONT_MASK,
     FUSE_DO_READDIRPLUS, FUSE_EXPLICIT_INVAL_DATA, FUSE_EXPORT_SUPPORT, FUSE_FLUSH, FUSE_FORGET,
-    FUSE_HANDLE_KILLPRIV, FUSE_INIT, FUSE_INIT_EXT, FUSE_INTERRUPT, FUSE_KERNEL_MINOR_VERSION,
-    FUSE_KERNEL_VERSION, FUSE_LOOKUP, FUSE_MAX_PAGES, FUSE_MIN_READ_BUFFER, FUSE_NOTIFY_DELETE,
-    FUSE_NOTIFY_INVAL_ENTRY, FUSE_NOTIFY_INVAL_INODE, FUSE_NOTIFY_POLL, FUSE_NOTIFY_RETRIEVE,
-    FUSE_NOTIFY_STORE, FUSE_NO_OPENDIR_SUPPORT, FUSE_NO_OPEN_SUPPORT, FUSE_PARALLEL_DIROPS,
-    FUSE_POSIX_ACL, FUSE_POSIX_LOCKS, FUSE_READDIRPLUS_AUTO, FUSE_WRITEBACK_CACHE,
+    FUSE_FSYNC, FUSE_FSYNCDIR, FUSE_HANDLE_KILLPRIV, FUSE_INIT, FUSE_INIT_EXT, FUSE_INTERRUPT,
+    FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION, FUSE_LOOKUP, FUSE_MAX_PAGES,
+    FUSE_MIN_READ_BUFFER, FUSE_NOTIFY_DELETE, FUSE_NOTIFY_INVAL_ENTRY, FUSE_NOTIFY_INVAL_INODE,
+    FUSE_NOTIFY_POLL, FUSE_NOTIFY_RETRIEVE, FUSE_NOTIFY_STORE, FUSE_NO_OPENDIR_SUPPORT,
+    FUSE_NO_OPEN_SUPPORT, FUSE_PARALLEL_DIROPS, FUSE_POSIX_ACL, FUSE_POSIX_LOCKS,
+    FUSE_READDIRPLUS_AUTO, FUSE_SUBMOUNTS,
 };
 
 fn wait_with_recheck<T, F>(waitq: &WaitQueue, mut check: F) -> Result<T, SystemError>
@@ -62,10 +64,31 @@ pub struct FuseRequest {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct FuseRequestCred {
-    uid: u32,
-    gid: u32,
-    pid: u32,
+pub struct FuseRequestCred {
+    pub uid: u32,
+    pub gid: u32,
+    pub pid: u32,
+}
+
+impl FuseRequestCred {
+    pub(crate) fn nocreds() -> Self {
+        Self {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        }
+    }
+
+    pub(crate) fn from_current() -> Self {
+        let pcb = ProcessManager::current_pcb();
+        let cred = pcb.cred();
+        let pid = pcb.task_tgid_vnr().map(|p| p.data() as u32).unwrap_or(0);
+        Self {
+            uid: cred.fsuid.data() as u32,
+            gid: cred.fsgid.data() as u32,
+            pid,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -144,10 +167,17 @@ struct FuseConnInner {
     owner_uid: u32,
     owner_gid: u32,
     allow_other: bool,
+    max_read: u32,
+    init_flags: u64,
     init: FuseInitNegotiated,
     no_open: bool,
     no_opendir: bool,
     no_readdirplus: bool,
+    no_fallocate: bool,
+    no_flush: bool,
+    no_fsync: bool,
+    no_fsyncdir: bool,
+    no_interrupt: bool,
     max_write_cap: usize,
     pending: VecDeque<Arc<FuseRequest>>,
     processing: BTreeMap<u64, Arc<FusePendingState>>,
@@ -165,12 +195,16 @@ pub struct FuseConn {
 }
 
 impl FuseConn {
+    const FUSE_INT_REQ_BIT: u64 = 1;
     // Keep this in sync with `sys_read.rs` userspace chunking size.
     const USER_READ_CHUNK: usize = 64 * 1024;
     const MIN_MAX_WRITE: usize = 4096;
 
     pub fn new() -> Arc<Self> {
-        Self::new_with_max_write_cap(Self::max_write_cap_for_user_read_chunk())
+        Self::new_with_max_write_cap(
+            Self::max_write_cap_for_user_read_chunk(),
+            Self::kernel_init_flags(),
+        )
     }
 
     pub fn new_for_virtiofs(max_message_size: usize) -> Arc<Self> {
@@ -180,10 +214,10 @@ impl FuseConn {
         } else {
             Self::MIN_MAX_WRITE
         };
-        Self::new_with_max_write_cap(cap)
+        Self::new_with_max_write_cap(cap, Self::virtiofs_init_flags())
     }
 
-    fn new_with_max_write_cap(max_write_cap: usize) -> Arc<Self> {
+    fn new_with_max_write_cap(max_write_cap: usize, init_flags: u64) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(FuseConnInner {
                 connected: true,
@@ -192,10 +226,17 @@ impl FuseConn {
                 owner_uid: 0,
                 owner_gid: 0,
                 allow_other: false,
+                max_read: u32::MAX,
+                init_flags,
                 init: FuseInitNegotiated::default(),
                 no_open: false,
                 no_opendir: false,
                 no_readdirplus: false,
+                no_fallocate: false,
+                no_flush: false,
+                no_fsync: false,
+                no_fsyncdir: false,
+                no_interrupt: false,
                 max_write_cap,
                 pending: VecDeque::new(),
                 processing: BTreeMap::new(),
@@ -246,14 +287,21 @@ impl FuseConn {
         self.inner.lock().initialized
     }
 
-    pub fn configure_mount(&self, owner_uid: u32, owner_gid: u32, allow_other: bool) {
+    pub fn configure_mount(
+        &self,
+        owner_uid: u32,
+        owner_gid: u32,
+        allow_other: bool,
+        max_read: u32,
+    ) {
         let mut g = self.inner.lock();
         g.owner_uid = owner_uid;
         g.owner_gid = owner_gid;
         g.allow_other = allow_other;
+        g.max_read = core::cmp::max(Self::MIN_MAX_WRITE as u32, max_read);
     }
 
-    fn has_init_flag(&self, flag: u64) -> bool {
+    pub(crate) fn has_init_flag(&self, flag: u64) -> bool {
         let g = self.inner.lock();
         (g.init.flags & flag) != 0
     }
@@ -292,6 +340,40 @@ impl FuseConn {
     pub fn disable_readdirplus(&self) {
         let mut g = self.inner.lock();
         g.no_readdirplus = true;
+    }
+
+    pub fn no_fallocate(&self) -> bool {
+        self.inner.lock().no_fallocate
+    }
+
+    pub fn mark_no_fallocate(&self) {
+        self.inner.lock().no_fallocate = true;
+    }
+
+    pub fn no_flush(&self) -> bool {
+        self.inner.lock().no_flush
+    }
+
+    pub fn mark_no_flush(&self) {
+        self.inner.lock().no_flush = true;
+    }
+
+    pub fn no_fsync(&self, opcode: u32) -> bool {
+        let g = self.inner.lock();
+        match opcode {
+            FUSE_FSYNC => g.no_fsync,
+            FUSE_FSYNCDIR => g.no_fsyncdir,
+            _ => false,
+        }
+    }
+
+    pub fn mark_no_fsync(&self, opcode: u32) {
+        let mut g = self.inner.lock();
+        match opcode {
+            FUSE_FSYNC => g.no_fsync = true,
+            FUSE_FSYNCDIR => g.no_fsyncdir = true,
+            _ => {}
+        }
     }
 
     fn alloc_unique(&self) -> u64 {
@@ -420,14 +502,24 @@ impl FuseConn {
         }
         let can_send = {
             let g = self.inner.lock();
-            g.connected && g.mounted && g.initialized
+            g.connected
+                && g.mounted
+                && g.initialized
+                && !g.no_interrupt
+                && g.processing.contains_key(&unique)
         };
         if !can_send {
             return Ok(());
         }
         let inarg = FuseInterruptIn { unique };
-        let _ = self.enqueue_request(FUSE_INTERRUPT, 0, fuse_pack_struct(&inarg))?;
-        Ok(())
+        let req = self.build_request(
+            unique | Self::FUSE_INT_REQ_BIT,
+            FUSE_INTERRUPT,
+            0,
+            fuse_pack_struct(&inarg),
+            FuseRequestCred::nocreds(),
+        );
+        self.push_request(req, None, unique | Self::FUSE_INT_REQ_BIT)
     }
 
     /// Acquire a new `/dev/fuse` file handle reference to this connection.
@@ -579,20 +671,29 @@ impl FuseConn {
             | FUSE_DO_READDIRPLUS
             | FUSE_READDIRPLUS_AUTO
             | FUSE_ASYNC_DIO
-            | FUSE_WRITEBACK_CACHE
             | FUSE_NO_OPEN_SUPPORT
+            | FUSE_NO_OPENDIR_SUPPORT
             | FUSE_PARALLEL_DIROPS
             | FUSE_HANDLE_KILLPRIV
             | FUSE_POSIX_ACL
             | FUSE_ABORT_ERROR
             | FUSE_MAX_PAGES
-            | FUSE_NO_OPENDIR_SUPPORT
             | FUSE_EXPLICIT_INVAL_DATA
             | FUSE_INIT_EXT
     }
 
+    /// virtiofs uses the normal FUSE capability request plus Linux's submount bit.
+    /// WRITEBACK_CACHE is not requested until DragonOS has complete writeback-cache semantics.
+    fn virtiofs_init_flags() -> u64 {
+        Self::kernel_init_flags() | FUSE_SUBMOUNTS
+    }
+
+    pub fn supports_submounts(&self) -> bool {
+        self.has_init_flag(FUSE_SUBMOUNTS)
+    }
+
     pub fn enqueue_init(&self) -> Result<(), SystemError> {
-        let flags = Self::kernel_init_flags();
+        let flags = self.inner.lock().init_flags;
         let init_in = FuseInitIn {
             major: FUSE_KERNEL_VERSION,
             minor: FUSE_KERNEL_MINOR_VERSION,
@@ -619,6 +720,76 @@ impl FuseConn {
             self.wait_initialized()?;
         }
         let pending = self.enqueue_request(opcode, nodeid, payload)?;
+        self.wait_request_complete(opcode, pending)
+    }
+
+    pub fn request_nocreds(
+        &self,
+        opcode: u32,
+        nodeid: u64,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, SystemError> {
+        if opcode != FUSE_INIT {
+            self.wait_initialized()?;
+        }
+        let pending =
+            self.enqueue_request_with_cred(opcode, nodeid, payload, FuseRequestCred::nocreds())?;
+        self.wait_request_complete(opcode, pending)
+    }
+
+    pub(crate) fn request_with_cred(
+        &self,
+        opcode: u32,
+        nodeid: u64,
+        payload: &[u8],
+        req_cred: FuseRequestCred,
+    ) -> Result<Vec<u8>, SystemError> {
+        if opcode != FUSE_INIT {
+            self.wait_initialized()?;
+        }
+        let pending = self.enqueue_request_with_cred(opcode, nodeid, payload, req_cred)?;
+        self.wait_request_complete(opcode, pending)
+    }
+
+    pub fn request_nocreds_background(
+        self: &Arc<Self>,
+        opcode: u32,
+        nodeid: u64,
+        payload: &[u8],
+    ) -> Result<(), SystemError> {
+        if opcode != FUSE_INIT {
+            self.wait_initialized()?;
+        }
+        let pending =
+            self.enqueue_request_with_cred(opcode, nodeid, payload, FuseRequestCred::nocreds())?;
+        let conn = self.clone();
+        schedule_work(Work::new(move || {
+            if let Err(err) = conn.wait_request_complete(opcode, pending.clone()) {
+                if matches!(err, SystemError::ENOTCONN | SystemError::ENOENT) {
+                    log::debug!(
+                        "fuse: background request aborted opcode={} nodeid={} err={:?}",
+                        opcode,
+                        nodeid,
+                        err
+                    );
+                } else {
+                    log::warn!(
+                        "fuse: background request failed opcode={} nodeid={} err={:?}",
+                        opcode,
+                        nodeid,
+                        err
+                    );
+                }
+            }
+        }));
+        Ok(())
+    }
+
+    fn wait_request_complete(
+        &self,
+        opcode: u32,
+        pending: Arc<FusePendingState>,
+    ) -> Result<Vec<u8>, SystemError> {
         match pending.wait_complete() {
             Err(SystemError::EINTR) | Err(SystemError::ERESTARTSYS) => {
                 if opcode != FUSE_INTERRUPT {
@@ -653,26 +824,25 @@ impl FuseConn {
         nodeid: u64,
         payload: &[u8],
     ) -> Result<Arc<FusePendingState>, SystemError> {
-        let unique = self.alloc_unique();
-
         let pcb = ProcessManager::current_pcb();
         let cred = pcb.cred();
         if !self.allow_current_process(&cred) {
             return Err(SystemError::EACCES);
         }
-        let pid = pcb.task_tgid_vnr().map(|p| p.data() as u32).unwrap_or(0);
+        self.enqueue_request_with_cred(opcode, nodeid, payload, FuseRequestCred::from_current())
+    }
+
+    fn enqueue_request_with_cred(
+        &self,
+        opcode: u32,
+        nodeid: u64,
+        payload: &[u8],
+        req_cred: FuseRequestCred,
+    ) -> Result<Arc<FusePendingState>, SystemError> {
+        let unique = self.alloc_unique();
         let pending_state = Arc::new(FusePendingState::new(unique, opcode));
-        let req = self.build_request(
-            unique,
-            opcode,
-            nodeid,
-            payload,
-            FuseRequestCred {
-                uid: cred.fsuid.data() as u32,
-                gid: cred.fsgid.data() as u32,
-                pid,
-            },
-        );
+
+        let req = self.build_request(unique, opcode, nodeid, payload, req_cred);
         self.push_request(req, Some(pending_state.clone()), unique)?;
         Ok(pending_state)
     }
@@ -742,6 +912,10 @@ impl FuseConn {
             let payload = &data[core::mem::size_of::<FuseOutHeader>()..];
             self.handle_notify(out_hdr.error, payload)?;
             return Ok(data.len());
+        }
+
+        if (out_hdr.unique & Self::FUSE_INT_REQ_BIT) != 0 {
+            return self.write_interrupt_reply(&out_hdr, data.len());
         }
 
         let pending = {
@@ -827,6 +1001,10 @@ impl FuseConn {
             {
                 let mut g = self.inner.lock();
                 if g.connected {
+                    // 对齐 Linux：仅启用「daemon 支持 ∩ 本端请求」的特性位。
+                    // virtiofsd 常在 INIT 回复里带上 DO_READDIRPLUS 等位；若直接采纳，
+                    // 会走 READDIRPLUS + cache_child_from_entry，导致 inode 映射过期。
+                    let enabled_flags = negotiated_flags & g.init_flags;
                     g.initialized = true;
                     g.init = FuseInitNegotiated {
                         minor: negotiated_minor,
@@ -834,7 +1012,7 @@ impl FuseConn {
                         max_write: capped_max_write as u32,
                         time_gran: init_out.time_gran,
                         max_pages: negotiated_max_pages,
-                        flags: negotiated_flags,
+                        flags: enabled_flags,
                     };
                 }
             }
@@ -843,6 +1021,36 @@ impl FuseConn {
 
         pending.complete(Ok(payload.to_vec()));
         Ok(data.len())
+    }
+
+    fn write_interrupt_reply(
+        &self,
+        out_hdr: &FuseOutHeader,
+        data_len: usize,
+    ) -> Result<usize, SystemError> {
+        if data_len != core::mem::size_of::<FuseOutHeader>() {
+            return Err(SystemError::EINVAL);
+        }
+        if out_hdr.error <= -512 || out_hdr.error > 0 {
+            return Err(SystemError::EINVAL);
+        }
+
+        let target_unique = out_hdr.unique & !Self::FUSE_INT_REQ_BIT;
+        {
+            let mut g = self.inner.lock();
+            if !g.connected || !g.processing.contains_key(&target_unique) {
+                return Err(SystemError::ENOENT);
+            }
+            if out_hdr.error == -SystemError::ENOSYS.to_posix_errno() {
+                g.no_interrupt = true;
+            }
+        }
+
+        if out_hdr.error == -SystemError::EAGAIN_OR_EWOULDBLOCK.to_posix_errno() {
+            self.queue_interrupt(target_unique)?;
+        }
+
+        Ok(data_len)
     }
 
     fn handle_notify(&self, code: i32, payload: &[u8]) -> Result<(), SystemError> {
@@ -888,5 +1096,10 @@ impl FuseConn {
     pub fn max_write(&self) -> usize {
         let g = self.inner.lock();
         core::cmp::max(4096usize, g.init.max_write as usize)
+    }
+
+    pub fn max_read(&self) -> usize {
+        let g = self.inner.lock();
+        core::cmp::max(Self::MIN_MAX_WRITE, g.max_read as usize)
     }
 }

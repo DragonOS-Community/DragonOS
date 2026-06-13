@@ -452,6 +452,13 @@ impl PageCacheManager {
         self.upgrade()?.get_or_create_page_for_read(page_index)
     }
 
+    pub fn commit_page_with<F>(&self, page_index: usize, fill: F) -> Result<Arc<Page>, SystemError>
+    where
+        F: FnOnce(usize, &mut [u8]) -> Result<usize, SystemError>,
+    {
+        self.upgrade()?.get_or_create_page_with(page_index, fill)
+    }
+
     pub fn commit_overwrite(&self, page_index: usize) -> Result<Arc<Page>, SystemError> {
         self.upgrade()?.get_or_create_page_zero(page_index)
     }
@@ -488,6 +495,145 @@ impl PageCacheManager {
         self.upgrade()
             .ok()
             .and_then(|cache| cache.lock().get_page(page_index))
+    }
+
+    pub fn update_clean_page(
+        &self,
+        page_index: usize,
+        page_offset: usize,
+        data: &[u8],
+    ) -> Result<bool, SystemError> {
+        if data.is_empty() {
+            return Ok(false);
+        }
+        match page_offset.checked_add(data.len()) {
+            Some(end) if end <= MMArch::PAGE_SIZE => {}
+            _ => return Err(SystemError::EINVAL),
+        }
+
+        let cache = self.upgrade()?;
+        let Some(entry) = cache.inner.lock().get_entry(page_index) else {
+            return Ok(false);
+        };
+
+        loop {
+            match entry.state() {
+                PageState::Loading => {
+                    if entry.wait_ready().is_err() {
+                        return Ok(false);
+                    }
+                    let current = cache.inner.lock().get_entry(page_index);
+                    if !matches!(current.as_ref(), Some(current) if Arc::ptr_eq(current, &entry)) {
+                        return Ok(false);
+                    }
+                    continue;
+                }
+                PageState::Error | PageState::Dirty | PageState::Writeback => return Ok(false),
+                PageState::UpToDate => {
+                    let current = cache.inner.lock().get_entry(page_index);
+                    if !matches!(current.as_ref(), Some(current) if Arc::ptr_eq(current, &entry)) {
+                        return Ok(false);
+                    }
+                    let mut guard = entry.page.write();
+                    if guard
+                        .flags()
+                        .intersects(PageFlags::PG_DIRTY | PageFlags::PG_WRITEBACK)
+                    {
+                        return Ok(false);
+                    }
+                    let dst = unsafe { guard.as_slice_mut() };
+                    dst[page_offset..page_offset + data.len()].copy_from_slice(data);
+                    guard.add_flags(PageFlags::PG_UPTODATE);
+                    return Ok(true);
+                }
+            }
+        }
+    }
+
+    /// Merge data into an existing ready cache page.
+    ///
+    /// This waits for an in-flight writeback before copying, but callers that need
+    /// backend write ordering must still hold the page cache invalidate write lock
+    /// around their full backend-write and cache-merge sequence.
+    pub fn update_ready_page(
+        &self,
+        page_index: usize,
+        page_offset: usize,
+        data: &[u8],
+    ) -> Result<bool, SystemError> {
+        if data.is_empty() {
+            return Ok(false);
+        }
+        match page_offset.checked_add(data.len()) {
+            Some(end) if end <= MMArch::PAGE_SIZE => {}
+            _ => return Err(SystemError::EINVAL),
+        }
+
+        let cache = self.upgrade()?;
+
+        loop {
+            let Some(entry) = cache.inner.lock().get_entry(page_index) else {
+                return Ok(false);
+            };
+
+            match entry.state() {
+                PageState::Loading => {
+                    if entry.wait_ready().is_err() {
+                        return Ok(false);
+                    }
+                    continue;
+                }
+                PageState::Writeback => {
+                    Self::wait_writeback_entry(entry)?;
+                    continue;
+                }
+                PageState::Error => return Ok(false),
+                PageState::UpToDate | PageState::Dirty => {}
+            }
+
+            let mut page = entry.page.write();
+            match entry.state() {
+                PageState::Loading | PageState::Writeback => {
+                    drop(page);
+                    continue;
+                }
+                PageState::Error => return Ok(false),
+                PageState::UpToDate | PageState::Dirty => {}
+            }
+
+            let keep_dirty =
+                entry.state() == PageState::Dirty || page.flags().contains(PageFlags::PG_DIRTY);
+            let dst = unsafe { page.as_slice_mut() };
+            dst[page_offset..page_offset + data.len()].copy_from_slice(data);
+            page.add_flags(PageFlags::PG_UPTODATE);
+            if keep_dirty {
+                page.add_flags(PageFlags::PG_DIRTY);
+            }
+            drop(page);
+
+            if keep_dirty {
+                let mut inner = cache.inner.lock();
+                let Some(current) = inner.get_entry(page_index) else {
+                    return Ok(false);
+                };
+                if !Arc::ptr_eq(&current, &entry) {
+                    return Ok(false);
+                }
+                match current.state() {
+                    PageState::Loading => continue,
+                    PageState::Writeback => return Ok(true),
+                    PageState::Error => return Ok(false),
+                    PageState::UpToDate | PageState::Dirty => {
+                        let old_state = current.state();
+                        inner.dirty_pages.insert(page_index);
+                        cache.account_state_transition(old_state, PageState::Dirty);
+                        current.set_state(PageState::Dirty);
+                    }
+                }
+            }
+
+            return Ok(true);
+        }
     }
 
     pub fn sync(&self) -> Result<(), SystemError> {
@@ -568,6 +714,62 @@ impl PageCacheManager {
         Ok(())
     }
 
+    pub fn prepare_page_mkwrite(
+        &self,
+        page_index: usize,
+        page: &Arc<Page>,
+    ) -> Result<(), SystemError> {
+        let cache = self.upgrade()?;
+
+        loop {
+            let entry = {
+                let inner = cache.inner.lock();
+                let Some(entry) = inner.get_entry(page_index) else {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                };
+                if !Arc::ptr_eq(&entry.page, page) {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
+                entry
+            };
+
+            match entry.state() {
+                PageState::Loading => {
+                    let _ = entry.wait_ready()?;
+                    continue;
+                }
+                PageState::Writeback => {
+                    Self::wait_writeback_entry(entry)?;
+                    continue;
+                }
+                PageState::Error => return Err(SystemError::EIO),
+                PageState::UpToDate | PageState::Dirty => {}
+            }
+
+            page.write().add_flags(PageFlags::PG_DIRTY);
+
+            let mut inner = cache.inner.lock();
+            let Some(current) = inner.get_entry(page_index) else {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            };
+            if !Arc::ptr_eq(&current, &entry) || !Arc::ptr_eq(&current.page, page) {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+
+            match current.state() {
+                PageState::Loading | PageState::Writeback => continue,
+                PageState::Error => return Err(SystemError::EIO),
+                PageState::UpToDate | PageState::Dirty => {
+                    let old_state = current.state();
+                    inner.dirty_pages.insert(page_index);
+                    cache.account_state_transition(old_state, PageState::Dirty);
+                    current.set_state(PageState::Dirty);
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     pub fn start_writeback_range(
         &self,
         start_index: usize,
@@ -599,6 +801,90 @@ impl PageCacheManager {
             .upgrade()?
             .lock()
             .invalidate_range(start_index, end_index))
+    }
+
+    pub fn discard_clean_range(
+        &self,
+        start_index: usize,
+        end_index: usize,
+    ) -> Result<usize, SystemError> {
+        let cache = self.upgrade()?;
+        let indices: Vec<usize> = {
+            let guard = cache.inner.lock();
+            (start_index..=end_index)
+                .filter(|index| guard.get_entry(*index).is_some())
+                .collect()
+        };
+
+        let mut discarded = 0;
+        for page_index in indices {
+            loop {
+                let entry = {
+                    let guard = cache.inner.lock();
+                    guard.get_entry(page_index)
+                };
+                let Some(entry) = entry else {
+                    break;
+                };
+
+                match entry.state() {
+                    PageState::Loading => {
+                        let _ = entry.wait_ready();
+                        continue;
+                    }
+                    PageState::UpToDate | PageState::Error => {}
+                    PageState::Dirty | PageState::Writeback => break,
+                }
+
+                let removed = {
+                    let mut guard = cache.inner.lock();
+                    let Some(current) = guard.get_entry(page_index) else {
+                        break;
+                    };
+                    if !Arc::ptr_eq(&current, &entry)
+                        || !matches!(current.state(), PageState::UpToDate | PageState::Error)
+                    {
+                        continue;
+                    }
+                    guard.remove_page(page_index)
+                };
+
+                if let Some(page) = removed {
+                    let paddr = page.phys_address();
+                    let can_remove_from_manager = page.read().can_deallocate();
+                    let _ = page_reclaimer_lock().remove_page(&paddr);
+                    if can_remove_from_manager {
+                        page_manager_lock().remove_page(&paddr);
+                    }
+                    discarded += 1;
+                }
+                break;
+            }
+        }
+
+        Ok(discarded)
+    }
+
+    pub fn invalidate_all_clean(&self) -> Result<usize, SystemError> {
+        Ok(self.upgrade()?.lock().evict_clean_pages())
+    }
+
+    pub(crate) fn discard_clean_page(&self, page_index: usize) -> Result<(), SystemError> {
+        let cache = self.upgrade()?;
+        let removed = {
+            let mut guard = cache.lock();
+            let Some(entry) = guard.get_entry(page_index) else {
+                return Ok(());
+            };
+            if entry.state() != PageState::UpToDate {
+                return Ok(());
+            }
+            guard.remove_page(page_index)
+        };
+        if let Some(page) = removed {
+            cache.discard_unlinked_page(&page);
+        }
+        Ok(())
     }
 
     pub fn pages_count(&self) -> Result<usize, SystemError> {
@@ -761,12 +1047,12 @@ impl PageCacheManager {
         page_index: usize,
         entry: Arc<PageEntry>,
     ) -> Result<(), SystemError> {
+        let _invalidate = cache.invalidate_read();
         if !Self::try_prepare_async_writeback_entry(cache, page_index, &entry)? {
             return Ok(());
         }
 
         let page = entry.page.clone();
-        let _invalidate = cache.invalidate_read();
 
         // If the inode has been freed, restore page state via finish_writeback_entry and return error.
         let inode = match cache.inode().and_then(|inode| inode.upgrade()) {
@@ -812,7 +1098,11 @@ impl PageCacheManager {
             let result = match &data {
                 Some(data) => {
                     if let Some(backend) = &backend {
-                        backend.write_page(page_index, data).map(|_| ())
+                        match backend.write_page(page_index, data) {
+                            Ok(written) if written == data.len() => Ok(()),
+                            Ok(_) => Err(SystemError::EIO),
+                            Err(e) => Err(e),
+                        }
                     } else {
                         inode
                             .write_direct(
@@ -843,6 +1133,7 @@ impl PageCacheManager {
         page_index: usize,
         entry: Arc<PageEntry>,
     ) -> Result<(), SystemError> {
+        let _invalidate = cache.invalidate_read();
         if !Self::prepare_writeback_entry(cache, page_index, &entry)? {
             return Ok(());
         }
@@ -852,7 +1143,6 @@ impl PageCacheManager {
         let mut wb_guard =
             WritebackGuard::new(cache.clone(), page_index, entry.clone(), page.clone());
 
-        let _invalidate = cache.invalidate_read();
         let inode = cache
             .inode()
             .and_then(|inode| inode.upgrade())
@@ -882,7 +1172,11 @@ impl PageCacheManager {
                     let src = unsafe { guard.as_slice() };
                     src[..len].to_vec()
                 };
-                backend.write_page(page_index, &data).map(|_| len)
+                match backend.write_page(page_index, &data) {
+                    Ok(written) if written == data.len() => Ok(len),
+                    Ok(_) => Err(SystemError::EIO),
+                    Err(e) => Err(e),
+                }
             } else {
                 let data = unsafe {
                     core::slice::from_raw_parts(
@@ -1833,6 +2127,100 @@ impl PageCache {
 
     pub fn get_or_create_page_for_read(&self, page_index: usize) -> Result<Arc<Page>, SystemError> {
         Ok(self.get_or_create_entry(page_index, true)?.page.clone())
+    }
+
+    pub fn get_or_create_page_with<F>(
+        &self,
+        page_index: usize,
+        fill: F,
+    ) -> Result<Arc<Page>, SystemError>
+    where
+        F: FnOnce(usize, &mut [u8]) -> Result<usize, SystemError>,
+    {
+        let mut page_cache_ref = None;
+        let mut existing_entry = None;
+        {
+            let guard = self.inner.lock();
+            if let Some(entry) = guard.get_entry(page_index) {
+                existing_entry = Some(entry);
+            } else {
+                page_cache_ref = Some(guard.page_cache_ref.clone());
+            }
+        }
+
+        if let Some(entry) = existing_entry {
+            let state = entry.state();
+            if state.is_ready() {
+                return Ok(entry.page.clone());
+            }
+            if state == PageState::Error {
+                return Err(SystemError::EIO);
+            }
+            let page = entry.wait_ready()?;
+            return Ok(page);
+        }
+
+        let mut page = Some(self.allocate_page(
+            page_cache_ref.expect("page_cache_ref should exist"),
+            page_index,
+        )?);
+
+        let (entry, need_populate) = {
+            let mut guard = self.inner.lock();
+            if let Some(entry) = guard.get_entry(page_index) {
+                (entry, false)
+            } else {
+                let entry = Arc::new(PageEntry::new(
+                    page.take().expect("allocated page must exist"),
+                    PageState::Loading,
+                ));
+                guard.insert_entry(page_index, entry.clone());
+                (entry, true)
+            }
+        };
+
+        if !need_populate {
+            if let Some(page) = page.take() {
+                self.discard_unlinked_page(&page);
+            }
+            let state = entry.state();
+            if state.is_ready() {
+                return Ok(entry.page.clone());
+            }
+            if state == PageState::Error {
+                return Err(SystemError::EIO);
+            }
+            return entry.wait_ready();
+        }
+
+        let populate_result = {
+            let mut tmp = vec![0; MMArch::PAGE_SIZE];
+            match fill(page_index, &mut tmp) {
+                Ok(read_len) if read_len <= MMArch::PAGE_SIZE => {
+                    let mut page_guard = entry.page.write();
+                    let dst = unsafe { page_guard.as_slice_mut() };
+                    dst.copy_from_slice(&tmp);
+                    page_guard.add_flags(PageFlags::PG_UPTODATE);
+                    Ok(())
+                }
+                Ok(_) => Err(SystemError::EIO),
+                Err(e) => Err(e),
+            }
+        };
+
+        match populate_result {
+            Ok(()) => {
+                entry.set_state(PageState::UpToDate);
+                entry.wait_queue.wake_all();
+                Ok(entry.page.clone())
+            }
+            Err(e) => {
+                entry.set_state(PageState::Error);
+                entry.wait_queue.wake_all();
+                self.remove_failed_entry(page_index, &entry);
+                Err(e)
+            }
+        }
     }
 
     pub fn get_or_create_page_zero(&self, page_index: usize) -> Result<Arc<Page>, SystemError> {

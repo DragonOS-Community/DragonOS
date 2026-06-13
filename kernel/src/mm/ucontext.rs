@@ -281,6 +281,12 @@ pub struct InnerAddressSpace {
     outer: Weak<AddressSpace>,
 }
 
+struct VmaCloseNotification {
+    file: Arc<File>,
+    region: VirtRegion,
+    vm_flags: VmFlags,
+}
+
 impl InnerAddressSpace {
     /// 当前地址空间已占用的虚拟内存字节数（简单求和所有 VMA 尺寸）
     pub fn vma_usage_bytes(&self) -> usize {
@@ -833,8 +839,7 @@ impl InnerAddressSpace {
             }
         }
 
-        let meta = file.metadata()?;
-        if matches!(meta.file_type, FileType::Pipe | FileType::Dir) {
+        if matches!(file.file_type(), FileType::Pipe | FileType::Dir) {
             return Err(SystemError::ENODEV);
         }
 
@@ -845,12 +850,30 @@ impl InnerAddressSpace {
         let pgoff = offset >> MMArch::PAGE_SHIFT;
 
         let page_count = PageFrameCount::from_bytes(len).unwrap();
+        let may_write =
+            !map_flags.contains(MapFlags::MAP_SHARED) || file_mode.contains(FileMode::FMODE_WRITE);
+        let mut precheck_vm_flags = VmFlags::from(prot_flags)
+            | VmFlags::from(map_flags)
+            | self.mlock_future
+            | VmFlags::VM_MAYREAD
+            | VmFlags::VM_MAYEXEC;
+        if may_write {
+            precheck_vm_flags |= VmFlags::VM_MAYWRITE;
+        }
+        file.inode()
+            .check_mmap_file(&file, len, offset, precheck_vm_flags)?;
+
         let start_page: VirtPageFrame = self.mmap(
             round_hint_to_min(start_vaddr),
             page_count,
             prot_flags,
             map_flags,
             |page, count, vm_flags, flags, mapper, flusher| {
+                let vm_flags = if may_write {
+                    vm_flags
+                } else {
+                    vm_flags & !VmFlags::VM_MAYWRITE
+                };
                 if allocate_at_once {
                     VMA::zeroed(
                         page,
@@ -878,15 +901,30 @@ impl InnerAddressSpace {
         // todo!(impl mmap for other file)
         // https://github.com/DragonOS-Community/DragonOS/pull/912#discussion_r1765334272
         // 传入实际映射后的起始虚拟地址，而非用户传入的 hint
-        match file
-            .inode()
-            .mmap(start_page.virt_address().data(), len, offset)
-        {
+        let vma = self.mappings.contains(start_page.virt_address());
+        let vm_flags = vma
+            .as_ref()
+            .map(|vma| *vma.lock().vm_flags())
+            .unwrap_or(VmFlags::empty());
+
+        match file.inode().mmap_file(
+            &file,
+            start_page.virt_address().data(),
+            len,
+            offset,
+            vm_flags,
+        ) {
             Ok(_) => {
+                if let Some(vma) = vma {
+                    self.mappings.attach_vma(&vma);
+                }
                 self.post_map_population(start_page.virt_address(), len, map_flags);
                 Ok(start_page)
             }
             Err(SystemError::ENOSYS) => {
+                if let Some(vma) = vma {
+                    self.mappings.attach_vma(&vma);
+                }
                 self.post_map_population(start_page.virt_address(), len, map_flags);
                 Ok(start_page)
             } // 文件系统未实现 mmap，视为成功
@@ -1351,6 +1389,7 @@ impl InnerAddressSpace {
         // Use MmuGather: clear PTEs + stash pages first, then unified shootdown, and finally free physical pages (INV-3)
         let mm = self.outer_addr_space().ok_or(SystemError::EFAULT)?;
         let mut tlb = MmuGather::gather(&mm);
+        let mut vma_close_notifications: Vec<VmaCloseNotification> = Vec::new();
 
         // 遍历每个相关的 VMA，将当前的 VMA 拆分为可能的三块 VMA，然后删除与需要删除的区域相交的部分。
         // 示意图：对每个与 region_to_unmap 相交的 VMA，按交集拆分成三段（before / intersection / after），
@@ -1389,7 +1428,9 @@ impl InnerAddressSpace {
                 (split_result.prev, split_result.after)
             };
 
-            // TODO: 当引入后备页映射后，这里需要增加通知文件的逻辑
+            if let Some(notification) = Self::collect_vma_close(&cur_vma, intersection) {
+                vma_close_notifications.push(notification);
+            }
 
             if let Some(before) = before {
                 self.mappings.insert_vma(before);
@@ -1403,9 +1444,37 @@ impl InnerAddressSpace {
         // Shootdown first, then free physical pages
         tlb.finish();
 
-        // TODO: 当引入后备页映射后，这里需要增加通知文件的逻辑
+        for notification in vma_close_notifications {
+            Self::notify_vma_close(notification);
+        }
 
         return Ok(());
+    }
+
+    fn collect_vma_close(vma: &Arc<LockedVMA>, region: VirtRegion) -> Option<VmaCloseNotification> {
+        let (file, vm_flags) = {
+            let guard = vma.lock();
+            let file = guard.vm_file()?;
+            (file, *guard.vm_flags())
+        };
+
+        if vm_flags.contains(VmFlags::VM_SHARED | VmFlags::VM_WRITE) {
+            Some(VmaCloseNotification {
+                file,
+                region,
+                vm_flags,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn notify_vma_close(notification: VmaCloseNotification) {
+        notification.file.inode().fs().vma_close(
+            &notification.file,
+            notification.region,
+            notification.vm_flags,
+        );
     }
 
     pub fn mprotect(
@@ -1431,7 +1500,19 @@ impl InnerAddressSpace {
 
         for r in regions {
             // debug!("mprotect: r: {:?}", r);
-            let r = *r.lock().region();
+            let (r, new_vm_flags) = {
+                let guard = r.lock();
+                if !guard.can_have_flags(prot_flags) {
+                    return Err(SystemError::EACCES);
+                }
+                let old_vm_flags = *guard.vm_flags();
+                let access_flags = VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_EXEC;
+                let new_vm_flags = (old_vm_flags & !access_flags) | VmFlags::from(prot_flags);
+                if let Some(file) = guard.vm_file() {
+                    file.inode().fs().mprotect(old_vm_flags, new_vm_flags)?;
+                }
+                (*guard.region(), new_vm_flags)
+            };
             let r = self.mappings.remove_vma(&r).unwrap();
 
             let intersection = r.lock().region().intersect(&region).unwrap();
@@ -1442,19 +1523,12 @@ impl InnerAddressSpace {
                     .expect("Failed to extract VMA");
 
                 let mut r_guard = r.lock();
-                if !r_guard.can_have_flags(prot_flags) {
-                    Err(SystemError::EACCES)
-                } else {
-                    r_guard.set_vm_flags(VmFlags::from(prot_flags));
+                r_guard.set_vm_flags(new_vm_flags);
 
-                    let new_flags: EntryFlags<MMArch> = r_guard
-                        .flags()
-                        .set_execute(prot_flags.contains(ProtFlags::PROT_EXEC))
-                        .set_write(prot_flags.contains(ProtFlags::PROT_WRITE));
+                let new_flags: EntryFlags<MMArch> = MMArch::vm_get_page_prot(new_vm_flags);
 
-                    r_guard.remap(new_flags, mapper, &mut tlb)?;
-                    Ok((split_result.prev, split_result.after))
-                }
+                r_guard.remap(new_flags, mapper, &mut tlb)?;
+                Ok((split_result.prev, split_result.after))
             };
             let (before, after) = match remap_result {
                 Ok(result) => result,
@@ -1827,12 +1901,20 @@ impl InnerAddressSpace {
         };
         // Full-mm flush (fullmm); no need to accumulate ranges.
         tlb.set_fullmm();
+        let mut vma_close_notifications = Vec::new();
         for vma in self.mappings.iter_vmas() {
             if vma.mapped() {
+                let region = *vma.lock().region();
+                if let Some(notification) = Self::collect_vma_close(vma, region) {
+                    vma_close_notifications.push(notification);
+                }
                 vma.unmap(&mut self.user_mapper.utable, &mut tlb);
             }
         }
         tlb.finish();
+        for notification in vma_close_notifications {
+            Self::notify_vma_close(notification);
+        }
     }
 
     /// 设置进程的堆的内存空间
@@ -2299,14 +2381,14 @@ impl LockedVMA {
     ) -> Result<(), SystemError> {
         let mut guard = self.lock();
         for page in guard.region.pages() {
-            // 暂时要求所有的页帧都已经映射到页表
-            // TODO: 引入Lazy Mapping, 通过缺页中断来映射页帧，这里就不必要求所有的页帧都已经映射到页表了
-            let r = unsafe {
-                mapper
-                    .remap(page.virt_address(), flags)
-                    .expect("Failed to remap, beacuse of some page is not mapped")
-            };
-            flusher.consume(r);
+            if mapper.translate(page.virt_address()).is_some() {
+                let r = unsafe {
+                    mapper
+                        .remap(page.virt_address(), flags)
+                        .expect("Failed to remap")
+                };
+                flusher.consume(r);
+            }
         }
         guard.flags = flags;
         return Ok(());
@@ -2909,12 +2991,21 @@ impl VMA {
         mapper: &mut PageMapper,
         tlb: &mut MmuGather<'_>,
     ) -> Result<(), SystemError> {
+        let pte_flags = if self.vm_file.is_some()
+            && self
+                .vm_flags
+                .contains(VmFlags::VM_SHARED | VmFlags::VM_WRITE)
+        {
+            flags.set_write(false)
+        } else {
+            flags
+        };
         for page in self.region.pages() {
             // debug!("remap page {:?}", page.virt_address());
             if mapper.translate(page.virt_address()).is_some() {
                 let r = unsafe {
                     mapper
-                        .remap(page.virt_address(), flags)
+                        .remap(page.virt_address(), pte_flags)
                         .expect("Failed to remap")
                 };
                 unsafe { r.ignore() };
@@ -2933,6 +3024,20 @@ impl VMA {
     ///
     /// - `prot_flags` 要检查的标志位
     pub fn can_have_flags(&self, prot_flags: ProtFlags) -> bool {
+        if prot_flags.contains(ProtFlags::PROT_READ) && !self.vm_flags.contains(VmFlags::VM_MAYREAD)
+        {
+            return false;
+        }
+        if prot_flags.contains(ProtFlags::PROT_WRITE)
+            && !self.vm_flags.contains(VmFlags::VM_MAYWRITE)
+        {
+            return false;
+        }
+        if prot_flags.contains(ProtFlags::PROT_EXEC) && !self.vm_flags.contains(VmFlags::VM_MAYEXEC)
+        {
+            return false;
+        }
+
         let is_downgrade = (self.flags.has_write() || !prot_flags.contains(ProtFlags::PROT_WRITE))
             && (self.flags.has_execute() || !prot_flags.contains(ProtFlags::PROT_EXEC));
 

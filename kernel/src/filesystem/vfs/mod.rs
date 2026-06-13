@@ -38,15 +38,19 @@ use crate::{
         casting::DowncastArc,
         mutex::{Mutex, MutexGuard},
     },
-    mm::{fault::PageFaultMessage, VmFaultReason},
+    mm::{fault::PageFaultMessage, VirtRegion, VmFaultReason, VmFlags},
     net::socket::Socket,
     process::ProcessManager,
     syscall::user_buffer::UserBuffer,
     time::PosixTimeSpec,
 };
 
-use self::{file::FileFlags, utils::DName, vcore::generate_inode_id};
 pub use self::{file::FilePrivateData, mount::MountFS};
+use self::{
+    file::{FileFlags, FileMode},
+    utils::DName,
+    vcore::generate_inode_id,
+};
 
 use super::page_cache::PageCache;
 
@@ -367,8 +371,33 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         !self.is_stream()
     }
 
+    fn truncate_before_open(&self, flags: &FileFlags) -> bool {
+        flags.contains(FileFlags::O_TRUNC)
+    }
+
     fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
         return Err(SystemError::ENOSYS);
+    }
+
+    fn check_mmap_file(
+        &self,
+        _file: &Arc<File>,
+        _len: usize,
+        _offset: usize,
+        _vm_flags: VmFlags,
+    ) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn mmap_file(
+        &self,
+        _file: &Arc<File>,
+        start: usize,
+        len: usize,
+        offset: usize,
+        _vm_flags: VmFlags,
+    ) -> Result<(), SystemError> {
+        self.mmap(start, len, offset)
     }
 
     fn read_sync(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize, SystemError> {
@@ -392,7 +421,26 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
+    /// Adjust per-open file mode bits after `open()` initialized private data.
+    ///
+    /// This models Linux helpers such as `nonseekable_open()` and
+    /// `stream_open()` without making VFS syscalls know filesystem-specific
+    /// protocol flags.
+    fn adjust_file_mode_after_open(&self, _data: &FilePrivateData, _mode: &mut FileMode) {}
+
     /// @brief 关闭文件
+    ///
+    /// @return 成功：Ok()
+    ///         失败：Err(错误码)
+    fn flush_file(
+        &self,
+        _data: MutexGuard<FilePrivateData>,
+        _lock_owner: u64,
+    ) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    /// @brief 释放最后一个 open file description 引用
     ///
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
@@ -435,6 +483,21 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError>;
+
+    /// 基于打开文件上下文执行 fallocate。
+    ///
+    /// 默认不模拟预分配；只有真正支持 fallocate 语义的文件系统应覆盖此方法。
+    fn fallocate_file(
+        &self,
+        _mode: i32,
+        _offset: usize,
+        _len: usize,
+        _lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        drop(data);
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+    }
 
     /// # 在inode的指定偏移量开始，读取指定大小的数据，忽略PageCache
     ///
@@ -510,6 +573,28 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn resize(&self, _len: usize) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回"不支持"
         return Err(SystemError::ENOSYS);
+    }
+
+    /// 基于当前 files_struct lock owner 重新设置文件大小。
+    ///
+    /// 默认回退到 inode 级 resize；需要 mandatory-locking 协议语义的文件系统
+    /// 可覆盖该方法。
+    fn resize_with_lock_owner(&self, len: usize, _lock_owner: u64) -> Result<(), SystemError> {
+        self.resize(len)
+    }
+
+    /// 基于打开文件上下文重新设置文件大小。
+    ///
+    /// 默认回退到 inode 级 resize；需要文件句柄语义的文件系统（如 FUSE）
+    /// 可覆盖该方法，从 `FilePrivateData` 中取得 per-open 状态。
+    fn resize_file(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        drop(data);
+        self.resize_with_lock_owner(len, lock_owner)
     }
 
     /// @brief 在当前目录下创建一个新的inode
@@ -1507,6 +1592,26 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     unsafe fn fault(&self, _pfm: &mut PageFaultMessage) -> VmFaultReason {
         VmFaultReason::VM_FAULT_SIGBUS
     }
+
+    /// Called before a shared writable file mapping is made writable and dirty.
+    ///
+    /// Filesystems that need writeback handles, size validation, or remote
+    /// permission checks should override this hook. Returning an error fault
+    /// keeps the PTE read-only and prevents the page from being marked dirty.
+    unsafe fn page_mkwrite(&self, _pfm: &mut PageFaultMessage) -> VmFaultReason {
+        VmFaultReason::VM_FAULT_SIGBUS
+    }
+
+    fn mprotect(&self, _old_vm_flags: VmFlags, _new_vm_flags: VmFlags) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    /// Called when a file-backed VMA range is genuinely detached from an address space.
+    ///
+    /// This is not called for VMA split/reinsert used by mprotect-like metadata
+    /// changes. Filesystems may use it to flush dirty shared mappings before
+    /// the last mapping reference disappears.
+    fn vma_close(&self, _file: &Arc<File>, _region: VirtRegion, _vm_flags: VmFlags) {}
 
     unsafe fn map_pages(
         &self,

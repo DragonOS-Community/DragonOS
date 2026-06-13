@@ -6,6 +6,7 @@ use core::{
 };
 
 use alloc::sync::Arc;
+use system_error::SystemError;
 
 use crate::{
     arch::{mm::PageMapper, MMArch},
@@ -113,6 +114,16 @@ impl<'a> PageFaultMessage<'a> {
         self.flags
     }
 
+    #[inline(always)]
+    pub fn backing_pgoff(&self) -> Option<usize> {
+        self.backing_pgoff
+    }
+
+    #[inline(always)]
+    pub fn set_page(&mut self, page: Arc<Page>) {
+        self.page = Some(page);
+    }
+
     /// 缺页所属的地址空间。
     #[inline(always)]
     pub fn mm(&self) -> &Arc<AddressSpace> {
@@ -124,6 +135,15 @@ impl<'a> PageFaultMessage<'a> {
 pub struct PageFaultHandler;
 
 impl PageFaultHandler {
+    fn mkwrite_finished(ret: VmFaultReason) -> bool {
+        ret.intersects(
+            VmFaultReason::VM_FAULT_ERROR
+                | VmFaultReason::VM_FAULT_NOPAGE
+                | VmFaultReason::VM_FAULT_RETRY
+                | VmFaultReason::VM_FAULT_COMPLETED,
+        )
+    }
+
     fn attach_fault_mapped_page(page: &Arc<Page>, vma: &Arc<LockedVMA>, mlocked: bool) {
         let mut page_guard = page.write();
         page_guard.insert_vma(vma.clone());
@@ -384,7 +404,8 @@ impl PageFaultHandler {
         let _invalidate = page_cache
             .as_ref()
             .map(|page_cache| page_cache.invalidate_read());
-        let mut ret = Self::filemap_fault(pfm);
+        let fs = pfm.vma().lock().vm_file().unwrap().inode().fs();
+        let mut ret = fs.fault(pfm);
 
         if unlikely(ret.intersects(
             VmFaultReason::VM_FAULT_ERROR
@@ -392,6 +413,9 @@ impl PageFaultHandler {
                 | VmFaultReason::VM_FAULT_RETRY
                 | VmFaultReason::VM_FAULT_DONE_COW,
         )) {
+            return ret;
+        }
+        if ret.contains(VmFaultReason::VM_FAULT_COMPLETED) {
             return ret;
         }
 
@@ -461,9 +485,18 @@ impl PageFaultHandler {
         let _invalidate = page_cache
             .as_ref()
             .map(|page_cache| page_cache.invalidate_read());
-        let mut ret = Self::filemap_fault(pfm);
+        let fs = pfm.vma().lock().vm_file().unwrap().inode().fs();
+        let mut ret = fs.fault(pfm);
 
         if ret.intersects(VmFaultReason::VM_FAULT_ERROR) {
+            return ret;
+        }
+        if ret.contains(VmFaultReason::VM_FAULT_COMPLETED) {
+            return ret;
+        }
+
+        ret = ret.union(fs.page_mkwrite(pfm));
+        if Self::mkwrite_finished(ret) {
             return ret;
         }
 
@@ -534,16 +567,37 @@ impl PageFaultHandler {
         let address = pfm.address_aligned_down();
         let vma = pfm.vma.clone();
         let mm = pfm.mm().clone();
-        let _pt_edit = mm.page_table_edit();
-        let mapper = &mut pfm.mapper;
 
-        let old_paddr = mapper.translate(address).unwrap().0;
+        let Some((old_paddr, _old_flags)) = pfm.mapper.translate(address) else {
+            return VmFaultReason::VM_FAULT_NOPAGE;
+        };
         let mut page_manager = page_manager_lock();
         let old_page = page_manager.get_unwrap(&old_paddr);
         let map_count = old_page.read().map_count();
         drop(page_manager);
 
-        let mut entry = mapper.get_entry(address, 0).unwrap();
+        if vma.lock().vm_flags().contains(VmFlags::VM_SHARED) {
+            let file = {
+                let guard = vma.lock();
+                guard.vm_file()
+            };
+            if let Some(file) = file {
+                pfm.set_page(old_page.clone());
+                let ret = file.inode().fs().page_mkwrite(pfm);
+                if Self::mkwrite_finished(ret) {
+                    return ret;
+                }
+            }
+        }
+
+        let _pt_edit = mm.page_table_edit();
+        let mapper = &mut pfm.mapper;
+        let Some(mut entry) = mapper.get_entry(address, 0) else {
+            return VmFaultReason::VM_FAULT_NOPAGE;
+        };
+        if entry.address() != Ok(old_paddr) {
+            return VmFaultReason::VM_FAULT_NOPAGE;
+        }
         let new_flags = entry.flags().set_write(true).set_dirty(true);
 
         // 统一为 do_wp_page 所有分支做 mm-aware shootdown：
@@ -557,15 +611,14 @@ impl PageFaultHandler {
             // 共享映射：原地升级 PTE 为可写，并标记脏。
             let table = mapper.get_table(address, 0).unwrap();
             let i = table.index_of(address).unwrap();
-            entry.set_flags(new_flags);
-            table.set_entry(i, entry);
-
             old_page.write().add_flags(PageFlags::PG_DIRTY);
             if let PageType::File(info) = old_page.read().page_type().clone() {
                 if let Some(page_cache) = info.page_cache.upgrade() {
                     page_cache.mark_page_dirty(info.index);
                 }
             }
+            entry.set_flags(new_flags);
+            table.set_entry(i, entry);
 
             // PTE 从 RO 升级为 RW：其他 CPU 持有的 RO 缓存会导致它们访问时触发虚假写保护 fault，
             // 必须 mm-aware shootdown 让其它 CPU 重新 walk 最新 PTE。
@@ -761,10 +814,14 @@ impl PageFaultHandler {
                     let address =
                         VirtAddr::new(addr.data() + ((pgoff - start_pgoff) << MMArch::PAGE_SHIFT));
                     if mapper.get_entry(address, 0).is_none() {
-                        mapper
-                            .map_phys(address, phys, vma_guard.flags())
-                            .unwrap()
-                            .flush();
+                        let mut flags = vma_guard.flags();
+                        if vma_guard
+                            .vm_flags()
+                            .contains(VmFlags::VM_SHARED | VmFlags::VM_WRITE)
+                        {
+                            flags = flags.set_write(false);
+                        }
+                        mapper.map_phys(address, phys, flags).unwrap().flush();
                     }
                     drop(page_guard);
                     Self::attach_fault_mapped_page(&page, &vma, mlocked);
@@ -820,6 +877,48 @@ impl PageFaultHandler {
             }
         }
         ret
+    }
+
+    pub unsafe fn filemap_page_mkwrite(pfm: &mut PageFaultMessage) -> VmFaultReason {
+        let vma = pfm.vma();
+        let vma_guard = vma.lock();
+        let file = vma_guard.vm_file().expect("no vm_file in vma");
+        drop(vma_guard);
+
+        let page = match pfm.page.clone() {
+            Some(page) => page,
+            None => return VmFaultReason::VM_FAULT_SIGBUS,
+        };
+        let (page_cache, page_index) = match page.read().page_type().clone() {
+            PageType::File(info) => match info.page_cache.upgrade() {
+                Some(page_cache) => (page_cache, info.index),
+                None => return VmFaultReason::VM_FAULT_SIGBUS,
+            },
+            _ => return VmFaultReason::VM_FAULT_SIGBUS,
+        };
+
+        let backing_pgoff = match pfm.backing_pgoff {
+            Some(backing_pgoff) => backing_pgoff,
+            None => return VmFaultReason::VM_FAULT_SIGBUS,
+        };
+        if page_index != backing_pgoff {
+            return VmFaultReason::VM_FAULT_RETRY;
+        }
+
+        if let Ok(md) = file.inode().metadata() {
+            let size = md.size.max(0) as usize;
+            if size == 0 || backing_pgoff.saturating_mul(MMArch::PAGE_SIZE) >= size {
+                return VmFaultReason::VM_FAULT_SIGBUS;
+            }
+        }
+
+        match page_cache.manager().prepare_page_mkwrite(page_index, &page) {
+            Ok(()) => {}
+            Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => return VmFaultReason::VM_FAULT_RETRY,
+            Err(_) => return VmFaultReason::VM_FAULT_SIGBUS,
+        }
+
+        VmFaultReason::empty()
     }
 
     /// 纯 page-cache 后端的缺页处理（不走 pread/磁盘 IO）。
@@ -895,7 +994,16 @@ impl PageFaultHandler {
         let page_phys = page_to_map.phys_address();
         let mlocked = vma_guard.vm_flags().contains(VmFlags::VM_LOCKED);
 
-        mapper.map_phys(address, page_phys, vma_guard.flags());
+        let mut map_flags = vma_guard.flags();
+        if vma_guard
+            .vm_flags()
+            .contains(VmFlags::VM_SHARED | VmFlags::VM_WRITE)
+            && !flags.contains(FaultFlags::FAULT_FLAG_WRITE)
+        {
+            map_flags = map_flags.set_write(false);
+        }
+
+        mapper.map_phys(address, page_phys, map_flags);
         Self::attach_fault_mapped_page(&page_to_map, &pfm.vma(), mlocked);
         VmFaultReason::VM_FAULT_COMPLETED
     }

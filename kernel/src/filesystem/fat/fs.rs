@@ -486,6 +486,10 @@ impl FileSystem for FATFileSystem {
         PageFaultHandler::filemap_fault(pfm)
     }
 
+    unsafe fn page_mkwrite(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
+        PageFaultHandler::filemap_page_mkwrite(pfm)
+    }
+
     unsafe fn map_pages(
         &self,
         pfm: &mut PageFaultMessage,
@@ -2077,6 +2081,18 @@ impl IndexNode for LockedFATInode {
                 return Err(SystemError::EROFS);
             }
         }
+    }
+
+    fn fallocate_file(
+        &self,
+        mode: i32,
+        offset: usize,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        drop(data);
+        crate::filesystem::vfs::vcore::resize_based_fallocate(self, mode, offset, len, lock_owner)
     }
 
     fn truncate(&self, len: usize) -> Result<(), SystemError> {

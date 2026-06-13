@@ -3,6 +3,7 @@
 demo/gtest_demo
 normal/capability
 normal/fdatasync
+normal/fallocate_semantics
 normal/syncfs_semantics
 normal/fcntl_lock
 normal/fcntl_signal

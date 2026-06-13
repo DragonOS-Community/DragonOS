@@ -283,6 +283,13 @@ impl FileSystem for Tmpfs {
         PageFaultHandler::pagecache_fault_zero(pfm)
     }
 
+    unsafe fn page_mkwrite(
+        &self,
+        pfm: &mut crate::mm::fault::PageFaultMessage,
+    ) -> crate::mm::VmFaultReason {
+        PageFaultHandler::filemap_page_mkwrite(pfm)
+    }
+
     unsafe fn map_pages(
         &self,
         pfm: &mut crate::mm::fault::PageFaultMessage,
@@ -790,6 +797,18 @@ impl IndexNode for LockedTmpfsInode {
         } else {
             Err(SystemError::EINVAL)
         }
+    }
+
+    fn fallocate_file(
+        &self,
+        mode: i32,
+        offset: usize,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        drop(data);
+        crate::filesystem::vfs::vcore::resize_based_fallocate(self, mode, offset, len, lock_owner)
     }
 
     fn create_with_data(

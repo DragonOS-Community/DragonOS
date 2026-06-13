@@ -344,6 +344,11 @@ impl FileSystem for PerfFakeFs {
         let res = PageFaultHandler::filemap_fault(pfm);
         res
     }
+
+    unsafe fn page_mkwrite(&self, _pfm: &mut PageFaultMessage) -> VmFaultReason {
+        VmFaultReason::empty()
+    }
+
     unsafe fn map_pages(
         &self,
         pfm: &mut PageFaultMessage,

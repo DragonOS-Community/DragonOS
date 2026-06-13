@@ -1,6 +1,8 @@
 use super::{
-    file::FileFlags, utils::DName, FilePrivateData, FileSystem, FileType, IndexNode, InodeId,
-    InodeMode, PollableInode, SuperBlock,
+    file::{FileFlags, FileMode},
+    utils::DName,
+    FilePrivateData, FileSystem, FileType, IndexNode, InodeId, InodeMode, PollableInode,
+    SuperBlock,
 };
 use crate::{
     driver::base::device::device_number::{DeviceNumber, Major},
@@ -16,7 +18,7 @@ use crate::{
         rwsem::RwSem,
         spinlock::SpinLock,
     },
-    mm::{fault::PageFaultMessage, VmFaultReason},
+    mm::{fault::PageFaultMessage, VirtRegion, VmFaultReason, VmFlags},
     process::{
         namespace::{
             mnt::MntNamespace,
@@ -515,14 +517,11 @@ impl MountFS {
     }
 
     pub fn add_mount(&self, inode_id: InodeId, mount_fs: Arc<MountFS>) -> Result<(), SystemError> {
-        // Check if a mount point with the same name already exists
-        if self.mountpoints.lock().contains_key(&inode_id) {
+        let mut mountpoints = self.mountpoints.lock();
+        if mountpoints.contains_key(&inode_id) {
             return Err(SystemError::EEXIST);
         }
-
-        // Add the new mount point to the current MountFS's mount point list
-        self.mountpoints.lock().insert(inode_id, mount_fs.clone());
-
+        mountpoints.insert(inode_id, mount_fs);
         Ok(())
     }
 
@@ -910,7 +909,7 @@ impl MountFSInode {
         root_inner_inode: Arc<dyn IndexNode>,
         mount_flags: MountFlags,
     ) -> Result<Arc<MountFS>, SystemError> {
-        self.mount_subtree_with_state(inner_fs, root_inner_inode, mount_flags, None, None)
+        self.mount_subtree_with_state(inner_fs, root_inner_inode, mount_flags, None, None, None)
     }
 
     pub(crate) fn mount_subtree_with_state(
@@ -920,6 +919,7 @@ impl MountFSInode {
         mount_flags: MountFlags,
         super_block_state: Option<Arc<SuperBlockState>>,
         bind_source: Option<&Arc<MountFS>>,
+        mount_path_override: Option<Arc<MountPath>>,
     ) -> Result<Arc<MountFS>, SystemError> {
         // Linux do_add_mount: the parent mount point must belong to the current mount namespace.
         let current_mntns = ProcessManager::current_mntns();
@@ -957,7 +957,12 @@ impl MountFSInode {
             },
         );
 
-        let mount_path = Arc::new(MountPath::from(self.absolute_path()?));
+        // 调用者可以传入已经按 VFS 解析过的命名空间路径，避免 FUSE/virtiofs 等
+        // 文件系统的 inner inode absolute_path() 返回合成路径或无法反查真实挂载点。
+        let mount_path = match mount_path_override {
+            Some(p) => p,
+            None => Arc::new(MountPath::from(self.absolute_path()?)),
+        };
 
         if let Some(source) = bind_source {
             inherit_bind_mount_propagation(source, &new_mount_fs);
@@ -1036,7 +1041,7 @@ impl MountFSInode {
     /// replacement is needed, so the current inode is returned directly.
     ///
     /// @return Arc<MountFSInode>
-    fn overlaid_inode(&self) -> Arc<MountFSInode> {
+    pub(crate) fn overlaid_inode(&self) -> Arc<MountFSInode> {
         let mut current = self.self_ref.upgrade().unwrap();
         for _ in 0..1024 {
             let inode_id = match current.metadata() {
@@ -1067,15 +1072,33 @@ impl MountFSInode {
     }
 
     fn do_find(&self, name: &str) -> Result<Arc<MountFSInode>, SystemError> {
+        let base = self.overlaid_inode();
         // Directly call the find method of the filesystem the current inode belongs to.
         // Since downward lookups may cross filesystem boundaries, we need to attempt inode replacement.
-        let inner_inode = self.inner_inode.find(name)?;
-        return Ok(Arc::new_cyclic(|self_ref| MountFSInode {
-            inner_inode,
-            mount_fs: self.mount_fs.clone(),
+        let inner_inode = base.inner_inode.find(name)?;
+        let mount_inode = Arc::new_cyclic(|self_ref| MountFSInode {
+            inner_inode: inner_inode.clone(),
+            mount_fs: base.mount_fs.clone(),
             self_ref: self_ref.clone(),
-        })
-        .overlaid_inode());
+        });
+        if let Some(fuse_node) =
+            inner_inode.downcast_arc::<crate::filesystem::fuse::inode::FuseNode>()
+        {
+            let mut submount_path = base.absolute_path()?;
+            if !submount_path.starts_with('/') {
+                return Err(SystemError::EINVAL);
+            }
+            if submount_path != "/" {
+                submount_path.push('/');
+            }
+            submount_path.push_str(name);
+            crate::filesystem::fuse::fs::fuse_try_automount_submount(
+                &fuse_node,
+                &mount_inode,
+                Some(Arc::new(MountPath::from(submount_path))),
+            )?;
+        }
+        Ok(mount_inode.overlaid_inode())
     }
 
     pub(super) fn do_parent(&self) -> Result<Arc<MountFSInode>, SystemError> {
@@ -1146,11 +1169,24 @@ impl MountFSInode {
 
     #[inline(never)]
     fn do_absolute_path(&self) -> Result<String, SystemError> {
+        // Prefer mount_list records: FUSE/virtiofs inodes may report synthetic paths
+        // such as "fuse:<nodeid>" from absolute_path(), which breaks MS_MOVE path rewrite.
+        if self.is_mountpoint_root()? {
+            if let Some(path) = ProcessManager::current_mntns()
+                .mount_list()
+                .get_mount_path_by_mountfs(&self.mount_fs)
+            {
+                return Ok(path.as_str().to_string());
+            }
+        }
+
         let mut current = self.self_ref.upgrade().unwrap();
 
-        // For special inode, we can directly get the absolute path
+        // Only accept filesystem-provided paths that look like real VFS paths.
         if let Ok(p) = current.inner_inode.absolute_path() {
-            return Ok(p);
+            if p.starts_with('/') {
+                return Ok(p);
+            }
         }
 
         let mut path_parts = Vec::new();
@@ -1253,8 +1289,39 @@ impl IndexNode for MountFSInode {
         return self.inner_inode.open(data, flags);
     }
 
+    fn adjust_file_mode_after_open(&self, data: &FilePrivateData, mode: &mut FileMode) {
+        self.inner_inode.adjust_file_mode_after_open(data, mode)
+    }
+
     fn mmap(&self, start: usize, len: usize, offset: usize) -> Result<(), SystemError> {
         return self.inner_inode.mmap(start, len, offset);
+    }
+
+    fn check_mmap_file(
+        &self,
+        file: &Arc<super::file::File>,
+        len: usize,
+        offset: usize,
+        vm_flags: VmFlags,
+    ) -> Result<(), SystemError> {
+        self.inner_inode
+            .check_mmap_file(file, len, offset, vm_flags)
+    }
+
+    fn mmap_file(
+        &self,
+        file: &Arc<super::file::File>,
+        start: usize,
+        len: usize,
+        offset: usize,
+        vm_flags: VmFlags,
+    ) -> Result<(), SystemError> {
+        self.inner_inode
+            .mmap_file(file, start, len, offset, vm_flags)
+    }
+
+    fn truncate_before_open(&self, flags: &FileFlags) -> bool {
+        self.inner_inode.truncate_before_open(flags)
     }
 
     fn sync(&self) -> Result<(), SystemError> {
@@ -1291,6 +1358,14 @@ impl IndexNode for MountFSInode {
         advise: i32,
     ) -> Result<usize, SystemError> {
         return self.inner_inode.fadvise(file, offset, len, advise);
+    }
+
+    fn flush_file(
+        &self,
+        data: MutexGuard<FilePrivateData>,
+        lock_owner: u64,
+    ) -> Result<(), SystemError> {
+        self.inner_inode.flush_file(data, lock_owner)
     }
 
     fn close(&self, data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
@@ -1364,7 +1439,7 @@ impl IndexNode for MountFSInode {
 
     #[inline]
     fn fs(&self) -> Arc<dyn FileSystem> {
-        return self.mount_fs.clone();
+        return self.overlaid_inode().mount_fs.clone();
     }
 
     #[inline]
@@ -1402,6 +1477,38 @@ impl IndexNode for MountFSInode {
     fn resize(&self, len: usize) -> Result<(), SystemError> {
         self.ensure_mount_writable()?;
         return self.inner_inode.resize(len);
+    }
+
+    #[inline]
+    fn resize_with_lock_owner(&self, len: usize, lock_owner: u64) -> Result<(), SystemError> {
+        self.ensure_mount_writable()?;
+        return self.inner_inode.resize_with_lock_owner(len, lock_owner);
+    }
+
+    #[inline]
+    fn resize_file(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        self.ensure_mount_writable()?;
+        return self.inner_inode.resize_file(len, lock_owner, data);
+    }
+
+    #[inline]
+    fn fallocate_file(
+        &self,
+        mode: i32,
+        offset: usize,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        self.ensure_mount_writable()?;
+        return self
+            .inner_inode
+            .fallocate_file(mode, offset, len, lock_owner, data);
     }
 
     #[inline]
@@ -1514,7 +1621,7 @@ impl IndexNode for MountFSInode {
             "" | "." => self
                 .self_ref
                 .upgrade()
-                .map(|inode| inode as Arc<dyn IndexNode>)
+                .map(|inode| inode.overlaid_inode() as Arc<dyn IndexNode>)
                 .ok_or(SystemError::ENOENT),
             // Looking up the parent directory
             ".." => self.parent(),
@@ -1592,12 +1699,23 @@ impl IndexNode for MountFSInode {
             .ok_or(SystemError::EINVAL)?;
 
         let target_mountpoint = self.self_ref.upgrade().unwrap();
-        let old_source_path = from_mfs
-            .self_mountpoint()
-            .ok_or(SystemError::EINVAL)?
-            .absolute_path()?;
-        let new_target_path = target_mountpoint.absolute_path()?;
         let mntns = ProcessManager::current_mntns();
+        let old_source_path = mntns
+            .mount_list()
+            .get_mount_path_by_mountfs(&from_mfs)
+            .map(|p| p.as_str().to_string())
+            .or_else(|| {
+                from_mfs
+                    .self_mountpoint()
+                    .and_then(|mp| mp.absolute_path().ok())
+            })
+            .filter(|p| p.starts_with('/'))
+            .ok_or(SystemError::EINVAL)?;
+        let new_target_path = target_mountpoint
+            .absolute_path()
+            .ok()
+            .filter(|p| p.starts_with('/'))
+            .ok_or(SystemError::EINVAL)?;
         mntns.move_mount(
             &from_mfs,
             &target_mountpoint,
@@ -1732,6 +1850,18 @@ impl FileSystem for MountFS {
         self.inner_filesystem.fault(pfm)
     }
 
+    unsafe fn page_mkwrite(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
+        self.inner_filesystem.page_mkwrite(pfm)
+    }
+
+    fn mprotect(&self, old_vm_flags: VmFlags, new_vm_flags: VmFlags) -> Result<(), SystemError> {
+        self.inner_filesystem.mprotect(old_vm_flags, new_vm_flags)
+    }
+
+    fn vma_close(&self, file: &Arc<super::file::File>, region: VirtRegion, vm_flags: VmFlags) {
+        self.inner_filesystem.vma_close(file, region, vm_flags)
+    }
+
     unsafe fn map_pages(
         &self,
         pfm: &mut PageFaultMessage,
@@ -1832,7 +1962,7 @@ impl MountList {
     ///
     /// ## Returns
     ///
-    /// - `MountList`: A new mount point list instance
+    /// - `Arc<MountList>`: A shared empty mount point list instance.
     pub fn new() -> Arc<Self> {
         Arc::new(MountList {
             inner: RwSem::new(InnerMountList {
@@ -1846,16 +1976,17 @@ impl MountList {
 
     /// Inserts a filesystem mount point into the mount list.
     ///
-    /// This function adds a new filesystem mount point to the mount list. If a mount point
-    /// already exists at the specified path, it will be updated with the new filesystem.
+    /// This function records a new mount at `path`. Multiple mounts may exist at
+    /// the same path; they are stored as a stack, and the newest entry is the
+    /// visible mount returned by lookup helpers.
     ///
     /// # Thread Safety
     /// This function is thread-safe as it uses a RwSem to ensure safe concurrent access.
     ///
     /// # Arguments
-    /// * `ino` - An optional InodeId representing the inode of the `fs` mounted at.
-    /// * `path` - The mount path where the filesystem will be mounted
-    /// * `fs` - The filesystem instance to be mounted at the specified path
+    /// * `ino` - Optional inode id of the parent-side mount point.
+    /// * `path` - Namespace path where the filesystem is mounted.
+    /// * `fs` - MountFS instance mounted at the specified path.
     #[inline(never)]
     pub fn insert(&self, ino: Option<InodeId>, path: Arc<MountPath>, fs: Arc<MountFS>) {
         let mut inner = self.inner.write();
@@ -1883,8 +2014,8 @@ impl MountList {
     ///
     /// ## Returns
     ///
-    /// - `Option<(String, String, Arc<MountFS>)>`:
-    ///   - `Some((mount_point, rest_path, fs))`: If a matching mount point is found, returns a tuple of mount point path, remaining path, and mounted filesystem.
+    /// - `Option<(Arc<MountPath>, String, Arc<MountFS>)>`:
+    ///   - `Some((mount_point, rest_path, fs))`: If a matching mount point is found, returns the recorded mount path, remaining path, and currently visible mounted filesystem.
     ///   - `None`: If no matching mount point is found.
     #[inline(never)]
     #[allow(dead_code)]
@@ -1910,9 +2041,11 @@ impl MountList {
 
     /// # remove — Remove a mount point
     ///
-    /// Removes a mount point from the mount point manager.
+    /// Removes the currently visible mount at `path`.
     ///
-    /// This function removes an existing mount point from the manager. If the mount point does not exist, no action is taken.
+    /// If multiple mounts are stacked on the same path, this function pops only
+    /// the top entry. Lower entries remain recorded and become visible again. If
+    /// the path has no mount stack, no action is taken.
     ///
     /// ## Arguments
     ///
@@ -1920,25 +2053,30 @@ impl MountList {
     ///
     /// ## Returns
     ///
-    /// - `Option<Arc<MountFS>>`: Returns an optional `Arc<MountFS>` representing the removed mount point, or `None` if the mount point does not exist.
+    /// - `Option<Arc<MountFS>>`: the removed visible mount, or `None` if the
+    ///   path does not exist in the mount list.
     #[inline(never)]
     pub fn remove<T: Into<MountPath>>(&self, path: T) -> Option<Arc<MountFS>> {
         let mut inner = self.inner.write();
-        let path: MountPath = path.into();
-        if let Some(stack) = inner.mounts.get_mut(&path) {
+        let path = Arc::new(path.into());
+        if let Some(mut stack) = inner.mounts.remove(&path) {
             if let Some(rec) = stack.pop() {
-                let empty = stack.is_empty();
                 let rec_fs = rec.fs.clone();
-                let rec_ino = rec.ino;
-                if empty {
-                    inner.mounts.remove(&path);
-                }
                 if let Some(ino) = inner.mfs2ino.remove(&rec_fs) {
                     inner.ino2mp.remove(&ino);
                 }
                 inner.mfs2mp.remove(&rec_fs);
-                if let Some(ino) = rec_ino {
+                if let Some(ino) = rec.ino {
                     inner.ino2mp.remove(&ino);
+                }
+
+                if let Some(visible) = stack.last() {
+                    inner.mfs2mp.insert(visible.fs.clone(), path.clone());
+                    if let Some(ino) = visible.ino {
+                        inner.mfs2ino.insert(visible.fs.clone(), ino);
+                        inner.ino2mp.insert(ino, path.clone());
+                    }
+                    inner.mounts.insert(path.clone(), stack);
                 }
                 return Some(rec_fs);
             }
@@ -2032,12 +2170,19 @@ impl Debug for MountList {
     }
 }
 
-/// Determine whether the given inode is the root inode of its filesystem
+/// Determine whether the given inode is the root inode of its mounted filesystem.
+///
+/// ## Arguments
+///
+/// - `inode`: inode to test. Non-`MountFSInode` values are treated as not being
+///   a mount root.
 ///
 /// ## Returns
 ///
-/// - `true`: is the root inode
-/// - `false`: is not the root inode, the given inode is not a MountFSInode, or calling the inode's metadata method failed.
+/// - `true`: `inode` is a `MountFSInode` whose inner inode is the root inode of
+///   its `MountFS`.
+/// - `false`: `inode` is not a mount root, is not a `MountFSInode`, or metadata
+///   lookup failed.
 pub fn is_mountpoint_root(inode: &Arc<dyn IndexNode>) -> bool {
     let mnt_inode = inode.clone().downcast_arc::<MountFSInode>();
     if let Some(mnt) = mnt_inode {
@@ -2049,18 +2194,18 @@ pub fn is_mountpoint_root(inode: &Arc<dyn IndexNode>) -> bool {
 
 /// # do_mount_mkdir — Create a directory at the specified mount point and mount a filesystem
 ///
-/// Creates a directory at the specified mount point and mounts it into the filesystem.
-/// If the mount point already exists and is not empty, an error is returned.
-/// On success, returns a reference to the newly mounted filesystem.
+/// Creates `mount_point` with mode `0755`, rejects it if it is already an
+/// existing mount point, and mounts `fs` there with the supplied mount flags.
 ///
 /// ## Arguments
 ///
-/// - `fs`: FileSystem — Reference to the filesystem, used for creating and mounting the directory.
-/// - `mount_point`: &str — The mount point path, used for creating and mounting the directory.
+/// - `fs`: filesystem instance to mount.
+/// - `mount_point`: path of the directory to create and use as mount point.
+/// - `mount_flags`: per-mount flags for the new mount.
 ///
 /// ## Returns
 ///
-/// - `Ok(Arc<MountFS>)`: On successful mount, returns a shared reference to the mounted filesystem.
+/// - `Ok(Arc<MountFS>)`: returns the newly mounted `MountFS`.
 /// - `Err(SystemError)`: On mount failure, returns a system error.
 pub fn do_mount_mkdir(
     fs: Arc<dyn FileSystem>,

@@ -24,25 +24,29 @@ use crate::{
     },
 };
 use alloc::string::String;
+use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use system_error::SystemError;
 
 /// # Mount filesystem
 ///
-/// Used to mount filesystems. Currently only ramfs mount is supported.
+/// Handles the Linux-compatible `mount(2)` syscall entry point.
+///
+/// Depending on `mountflags`, this may create a new mount, bind mount, remount,
+/// move an existing mount, or change mount propagation attributes.
 ///
 /// ## Parameters:
 ///
-/// - source       Mount device (currently only ext4 format hard disks supported)
-/// - target       Mount target directory
-/// - filesystemtype   Filesystem type
-/// - mountflags     Mount flags
-/// - data        Data mount
+/// - `source`: source path/device string, or the mount path being moved for `MS_MOVE`
+/// - `target`: target mount point path
+/// - `filesystemtype`: filesystem type for new mounts; ignored by bind/move/propagation changes
+/// - `mountflags`: Linux `MS_*` mount flags
+/// - `data`: filesystem-specific mount data
 ///
 /// ## Return value
-/// - Ok(0): Mount successful
-/// - Err(SystemError): Error occurred during mounting
+/// - `Ok(0)`: mount operation completed successfully
+/// - `Err(SystemError)`: mount operation failed
 pub struct SysMountHandle;
 
 impl Syscall for SysMountHandle {
@@ -141,21 +145,26 @@ impl SysMountHandle {
 
 syscall_table_macros::declare_syscall!(SYS_MOUNT, SysMountHandle);
 
-/// # do_mount - Mount a filesystem
+/// # do_mount - Dispatch a mount operation
 ///
-/// Mounts the given filesystem to the specified mount point.
+/// Resolves `target` in the current mount namespace and dispatches the request
+/// according to `mount_flags`.
 ///
-/// This function checks whether the same filesystem is already mounted; if so, returns an error.
-/// It also handles symbolic links and ensures the mount point is valid.
+/// The resolved target path is passed down so `MountList` records the namespace
+/// mount point rather than a filesystem-specific synthetic path such as
+/// `fuse:<nodeid>`.
 ///
 /// ## Arguments
 ///
-/// - `fs`: Arc<dyn FileSystem>, the filesystem to mount.
-/// - `mount_point`: &str, the mount point path.
+/// - `source`: source path/device string, or the mount path being moved for `MS_MOVE`.
+/// - `target`: target mount point path from userspace.
+/// - `filesystemtype`: filesystem type for new mounts.
+/// - `data`: filesystem-specific mount data.
+/// - `mount_flags`: Linux `MS_*` mount flags.
 ///
 /// ## Return value
 ///
-/// - `Ok(Arc<MountFS>)`: Returns the mounted filesystem on success.
+/// - `Ok(())`: mount operation completed successfully.
 /// - `Err(SystemError)`: Returns an error on failure.
 pub fn do_mount(
     source: Option<String>,
@@ -170,11 +179,20 @@ pub fn do_mount(
         target.as_deref().unwrap_or(""),
     )?;
     let inode = current_node.lookup_follow_symlink(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-    return path_mount(source, inode, filesystemtype, data, mount_flags);
+    let resolved_target_path = inode.absolute_path()?;
+    return path_mount(
+        source,
+        &resolved_target_path,
+        inode,
+        filesystemtype,
+        data,
+        mount_flags,
+    );
 }
 
 fn path_mount(
     source: Option<String>,
+    target_path: &str,
     target_inode: Arc<dyn IndexNode>,
     filesystemtype: Option<String>,
     data: Option<String>,
@@ -258,7 +276,7 @@ fn path_mount(
     }
 
     if flags.contains(MountFlags::BIND) {
-        return do_bind_mount(source, target_inode, flags);
+        return do_bind_mount(source, target_path, target_inode, flags);
     }
     // Handle propagation type changes (mount --make-{shared,private,slave,unbindable})
     if is_propagation_change(flags) {
@@ -270,7 +288,15 @@ fn path_mount(
     }
 
     // Create a new mount
-    return do_new_mount(source, target_inode, filesystemtype, data, mnt_flags).map(|_| ());
+    return do_new_mount(
+        source,
+        target_path,
+        target_inode,
+        filesystemtype,
+        data,
+        mnt_flags,
+    )
+    .map(|_| ());
 }
 
 /// Modify the mount flags of an existing mount.
@@ -423,6 +449,7 @@ fn parse_remount_data(
 
 fn do_new_mount(
     source: Option<String>,
+    target_path: &str,
     target_inode: Arc<dyn IndexNode>,
     filesystemtype: Option<String>,
     data: Option<String>,
@@ -434,11 +461,34 @@ fn do_new_mount(
         log::warn!("Failed to produce filesystem: {:?}", e);
     })?;
 
-    let _abs_path = target_inode.absolute_path()?;
+    // target_path 已由 do_mount() 解析为命名空间绝对路径；不要在这里反查
+    // target inner inode 的 absolute_path()，FUSE/virtiofs 可能返回合成路径。
+    let new_mount_res: Result<Arc<MountFS>, SystemError> =
+        if let Some(mnt_inode) = target_inode.clone().downcast_arc::<MountFSInode>() {
+            let (to_mount_fs, root_inner_inode) = fs
+                .clone()
+                .downcast_arc::<MountFS>()
+                .map(|it| (it.inner_filesystem(), it.root_inner_inode()))
+                .unwrap_or_else(|| {
+                    let root_inner_inode = fs.root_inode();
+                    (fs, root_inner_inode)
+                });
 
-    // Linux lock_mount() preserves the user-specified mountpoint and keeps stacking mounts on top of it.
-    let new_mount = target_inode.mount(fs, mount_flags)?;
+            mnt_inode.mount_subtree_with_state(
+                to_mount_fs,
+                root_inner_inode,
+                mount_flags,
+                None,
+                None,
+                Some(Arc::new(MountPath::from(target_path))),
+            )
+        } else {
+            target_inode.mount(fs, mount_flags)
+        };
+
+    let new_mount = new_mount_res?;
     new_mount.set_mount_source(Some(source));
+
     Ok(new_mount)
 }
 #[inline(never)]
@@ -478,7 +528,8 @@ fn copy_mount_path_string(raw: Option<*const u8>) -> Result<Option<String>, Syst
 ///
 /// # Arguments
 /// * `source` - The source path to bind from
-/// * `target_inode` - The target mount point
+/// * `target_path` - Resolved namespace path of the target mount point
+/// * `target_inode` - The target mount point inode
 /// * `flags` - Mount flags (MS_BIND, optionally MS_REC)
 ///
 /// # Returns
@@ -486,6 +537,7 @@ fn copy_mount_path_string(raw: Option<*const u8>) -> Result<Option<String>, Syst
 /// * `Err(SystemError)` on failure
 fn do_bind_mount(
     source: Option<String>,
+    target_path: &str,
     target_inode: Arc<dyn IndexNode>,
     flags: MountFlags,
 ) -> Result<(), SystemError> {
@@ -505,6 +557,13 @@ fn do_bind_mount(
     )?;
     let source_inode =
         current_node.lookup_follow_symlink(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+
+    // 穿越挂载点（含 FUSE announce-submounts 自动子挂载），避免 bind 仍绑定父 virtiofs 树上的 inode。
+    let source_inode: Arc<dyn IndexNode> = source_inode
+        .clone()
+        .downcast_arc::<MountFSInode>()
+        .map(|mnt| mnt.overlaid_inode() as Arc<dyn IndexNode>)
+        .unwrap_or(source_inode);
 
     let source_is_dir = source_inode.metadata()?.file_type == FileType::Dir;
     let target_is_dir = target_inode.metadata()?.file_type == FileType::Dir;
@@ -529,7 +588,6 @@ fn do_bind_mount(
     // Check if source is unbindable - if so, reject the bind mount
     if let Some(ref mfs) = source_mfs {
         if mfs.propagation().is_unbindable() {
-            // log::debug!("do_bind_mount: source is unbindable, rejecting bind mount");
             return Err(SystemError::EINVAL);
         }
     }
@@ -537,11 +595,18 @@ fn do_bind_mount(
     // Clone source_mfs for recursive bind mount (need to keep it for later use)
     let source_mfs_for_recursive = source_mfs.clone();
 
-    let root_inner_inode = source_inode
-        .clone()
-        .downcast_arc::<crate::filesystem::vfs::mount::MountFSInode>()
-        .map(|inode| inode.underlying_inode())
-        .unwrap_or_else(|| source_inode.clone());
+    let root_inner_inode = if is_mountpoint_root(&source_inode) {
+        source_mfs
+            .as_ref()
+            .map(|mfs| mfs.root_inner_inode())
+            .unwrap_or_else(|| source_inode.clone())
+    } else {
+        source_inode
+            .clone()
+            .downcast_arc::<MountFSInode>()
+            .map(|inode| inode.underlying_inode())
+            .unwrap_or_else(|| source_inode.clone())
+    };
 
     // Get the inner filesystem for mounting while preserving the source subtree root.
     let inner_fs = source_mfs
@@ -570,6 +635,7 @@ fn do_bind_mount(
                 .as_ref()
                 .map(|mfs| mfs.super_block_state()),
             source_mfs_for_recursive.as_ref(),
+            Some(Arc::new(MountPath::from(target_path))),
         )?;
     target_mfs.set_mount_source(Some(source_path.clone()));
 
@@ -669,6 +735,10 @@ fn do_change_type(target_inode: Arc<dyn IndexNode>, flags: MountFlags) -> Result
 /// # Arguments
 /// * `source` - The source path of the mount being moved.
 /// * `target_inode` - The target inode of the new mount point.
+///
+/// # Returns
+/// * `Ok(())` on success
+/// * `Err(SystemError)` on failure
 fn do_move_mount(
     source: Option<String>,
     target_inode: Arc<dyn IndexNode>,
@@ -757,13 +827,20 @@ fn do_move_mount(
 
     // Perform topology move + mount_list subtree path rewrite.
     //
-    // The source inode is the root inode inside the visible mounted filesystem.
-    // For stacked mounts, its absolute_path() may describe the mounted root from
-    // inside that filesystem rather than the parent-side mountpoint path stored
-    // in MountList. Use self_mountpoint() to get the actual namespace path where
-    // this mount is attached.
-    let old_source_path = source_mountpoint.absolute_path()?;
-    let new_target_path = target_mountpoint.absolute_path()?;
+    // Use mount_list paths: virtiofs/FUSE absolute_path() may return "fuse:<nodeid>"
+    // instead of the namespace mountpoint (e.g. /run/kata-containers/.../rootfs).
+    let old_source_path = current_mntns
+        .mount_list()
+        .get_mount_path_by_mountfs(&source_mfs)
+        .map(|p| p.as_str().to_string())
+        .or_else(|| source_mountpoint.absolute_path().ok())
+        .filter(|p| p.starts_with('/'))
+        .ok_or(SystemError::EINVAL)?;
+    let new_target_path = target_mountpoint
+        .absolute_path()
+        .ok()
+        .filter(|p| p.starts_with('/'))
+        .ok_or(SystemError::EINVAL)?;
     current_mntns.move_mount(
         &source_mfs,
         &target_mountpoint,
@@ -804,7 +881,9 @@ fn tree_contains_unbindable(root: &Arc<MountFS>) -> bool {
 ///
 /// # Arguments
 /// * `source_mfs` - The source MountFS to copy submounts from
-/// * `target_mfs` - The target MountFS to create submounts in
+/// * `_target_mfs` - The target MountFS for the recursive bind operation. The
+///   current implementation derives concrete child targets from
+///   `target_base_path`.
 /// * `source_base_path` - The absolute path of the source mount point
 /// * `target_base_path` - The absolute path of the target mount point
 ///
@@ -923,6 +1002,7 @@ fn do_recursive_bind_mount(
                 MountFlags::empty(),
                 Some(info.source_mfs.super_block_state()),
                 Some(&info.source_mfs),
+                None,
             ) {
             Ok(new_child_mnt) => {
                 let source = info

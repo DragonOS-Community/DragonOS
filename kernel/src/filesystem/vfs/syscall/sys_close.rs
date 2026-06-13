@@ -48,7 +48,8 @@ syscall_table_macros::declare_syscall!(SYS_CLOSE, SysCloseHandle);
 pub(super) fn do_close(fd: i32) -> Result<usize, SystemError> {
     let binding = ProcessManager::current_pcb().fd_table();
     let mut fd_table_guard = binding.write();
-    let _file = fd_table_guard.drop_fd(fd)?;
+    let dropped = fd_table_guard.drop_fd(fd)?;
     drop(fd_table_guard);
+    dropped.finish_close()?;
     Ok(0)
 }

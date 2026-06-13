@@ -2083,6 +2083,18 @@ impl IndexNode for LockedFATInode {
         }
     }
 
+    fn fallocate_file(
+        &self,
+        mode: i32,
+        offset: usize,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        drop(data);
+        crate::filesystem::vfs::vcore::resize_based_fallocate(self, mode, offset, len, lock_owner)
+    }
+
     fn truncate(&self, len: usize) -> Result<(), SystemError> {
         let guard: MutexGuard<FATInode> = self.0.lock();
         let old_size = guard.metadata.size as usize;

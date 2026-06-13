@@ -799,6 +799,18 @@ impl IndexNode for LockedTmpfsInode {
         }
     }
 
+    fn fallocate_file(
+        &self,
+        mode: i32,
+        offset: usize,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        drop(data);
+        crate::filesystem::vfs::vcore::resize_based_fallocate(self, mode, offset, len, lock_owner)
+    }
+
     fn create_with_data(
         &self,
         name: &str,

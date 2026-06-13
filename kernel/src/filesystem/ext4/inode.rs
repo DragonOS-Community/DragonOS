@@ -579,6 +579,18 @@ impl IndexNode for LockedExt4Inode {
         Ok(())
     }
 
+    fn fallocate_file(
+        &self,
+        mode: i32,
+        offset: usize,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        drop(data);
+        vfs::vcore::resize_based_fallocate(self, mode, offset, len, lock_owner)
+    }
+
     fn truncate(&self, len: usize) -> Result<(), SystemError> {
         // 复用 resize 的实现
         self.resize(len)

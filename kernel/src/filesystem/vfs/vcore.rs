@@ -766,23 +766,8 @@ where
 
     let result = do_resize(&inode);
 
-    // Linux 语义：对普通文件进行截断（且确实改变 size）后，若无 CAP_FSETID，清理 suid/sgid。
     if result.is_ok() && old_size != len as i64 {
-        let cred = ProcessManager::current_pcb().cred();
-        if !cred.has_capability(CAPFlags::CAP_FSETID) {
-            let mut md2 = inode.metadata()?;
-            if md2.file_type == FileType::File
-                && md2.mode.intersects(InodeMode::S_ISUID | InodeMode::S_ISGID)
-            {
-                md2.mode.remove(InodeMode::S_ISUID);
-
-                if should_remove_sgid(md2.mode, md2.gid, &cred) {
-                    md2.mode.remove(InodeMode::S_ISGID);
-                }
-
-                inode.set_metadata(&md2)?;
-            }
-        }
+        clear_suid_sgid_after_size_change(inode.as_ref())?;
     }
 
     if result.is_ok() && len < old_size as usize {
@@ -792,6 +777,27 @@ where
     }
 
     result
+}
+
+fn clear_suid_sgid_after_size_change(inode: &dyn IndexNode) -> Result<(), SystemError> {
+    let cred = ProcessManager::current_pcb().cred();
+    if cred.has_capability(CAPFlags::CAP_FSETID) {
+        return Ok(());
+    }
+
+    let mut md = inode.metadata()?;
+    if md.file_type == FileType::File && md.mode.intersects(InodeMode::S_ISUID | InodeMode::S_ISGID)
+    {
+        md.mode.remove(InodeMode::S_ISUID);
+
+        if should_remove_sgid(md.mode, md.gid, &cred) {
+            md.mode.remove(InodeMode::S_ISGID);
+        }
+
+        inode.set_metadata(&md)?;
+    }
+
+    Ok(())
 }
 
 /// 统一的 VFS 截断封装：对 inode 进行基本检查并调用 resize
@@ -827,6 +833,48 @@ pub fn check_file_size_limit(new_size: usize) -> Result<(), SystemError> {
         return Err(SystemError::EFBIG);
     }
     Ok(())
+}
+
+/// Generic resize-backed `fallocate(mode=0)` for real local regular files.
+///
+/// This helper provides DragonOS' compatibility guarantee that mode=0 makes the
+/// file size at least `offset + len`. It is intentionally opt-in: pseudo
+/// filesystems and protocol filesystems must keep returning EOPNOTSUPP or
+/// provide their own fallocate implementation.
+pub fn resize_based_fallocate(
+    inode: &dyn IndexNode,
+    mode: i32,
+    offset: usize,
+    len: usize,
+    lock_owner: u64,
+) -> Result<(), SystemError> {
+    if mode != 0 {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+
+    let new_size = offset.checked_add(len).ok_or(SystemError::EFBIG)?;
+    if new_size > isize::MAX as usize {
+        return Err(SystemError::EFBIG);
+    }
+
+    let md = inode.metadata()?;
+    if md.file_type != FileType::File {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+
+    let current_size = md.size.max(0) as usize;
+    if new_size <= current_size {
+        return Ok(());
+    }
+
+    check_file_size_limit(new_size)?;
+
+    let result = inode.resize_with_lock_owner(new_size, lock_owner);
+    if result.is_ok() && md.size != new_size as i64 {
+        clear_suid_sgid_after_size_change(inode)?;
+    }
+
+    result
 }
 
 /// 基于已打开文件执行 VFS fallocate 公共检查，再分派给具体文件系统。

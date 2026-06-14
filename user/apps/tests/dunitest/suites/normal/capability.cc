@@ -9,6 +9,11 @@
 
 #include "cap_common.h"
 
+template <typename T>
+static T* bad_user_ptr(uintptr_t addr) {
+    return reinterpret_cast<T*>(addr);
+}
+
 static void expect_capset_eperm_after_drop(uint64_t next_effective, uint64_t next_permitted,
                                            uint64_t next_inheritable) {
     pid_t child = fork();
@@ -65,10 +70,29 @@ TEST(CapGet, NullDataptrWithValidVersion) {
     cap_user_header_t hdr = {.version = _LINUX_CAPABILITY_VERSION_3, .pid = 0};
     errno = 0;
     int ret = syscall(SYS_capget, &hdr, nullptr);
-    int saved_errno = errno;
-    bool ok = (ret == 0) || (ret == -1 && saved_errno == EINVAL);
-    EXPECT_TRUE(ok) << "ret=" << ret << ", errno=" << saved_errno << " (" << strerror(saved_errno)
-                    << ")";
+    EXPECT_EQ(0, ret) << "errno=" << errno << " (" << strerror(errno) << ")";
+}
+
+TEST(CapGet, NullDataptrReturnsBeforePidRead) {
+    cap_user_header_t hdr = {.version = _LINUX_CAPABILITY_VERSION_3, .pid = -1};
+    errno = 0;
+    int ret = syscall(SYS_capget, &hdr, nullptr);
+    EXPECT_EQ(0, ret) << "errno=" << errno << " (" << strerror(errno) << ")";
+}
+
+TEST(CapGet, InvalidUserPointersReturnEfault) {
+    cap_user_data_t data[_LINUX_CAPABILITY_U32S_3] = {};
+
+    errno = 0;
+    int ret = syscall(SYS_capget, bad_user_ptr<cap_user_header_t>(0xdeadbeef), data);
+    ASSERT_EQ(-1, ret);
+    EXPECT_EQ(EFAULT, errno);
+
+    cap_user_header_t hdr = {.version = _LINUX_CAPABILITY_VERSION_3, .pid = 0};
+    errno = 0;
+    ret = syscall(SYS_capget, &hdr, bad_user_ptr<cap_user_data_t>(0xcafebabe));
+    ASSERT_EQ(-1, ret);
+    EXPECT_EQ(EFAULT, errno);
 }
 
 TEST(CapGet, PidNotExist) {
@@ -149,6 +173,34 @@ TEST(CapSet, InvalidVersionWithData) {
     EXPECT_EQ(EINVAL, capset_errno(0xCAFEBABEu, 0, data));
 }
 
+TEST(CapSet, InvalidVersionWritesBackKernelVersion) {
+    cap_user_header_t hdr = {.version = 0xCAFEBABEu, .pid = 0};
+    errno = 0;
+    int ret = syscall(SYS_capset, &hdr, bad_user_ptr<cap_user_data_t>(0xcafebabe));
+    ASSERT_EQ(-1, ret);
+    EXPECT_EQ(EINVAL, errno);
+    EXPECT_EQ(_LINUX_CAPABILITY_VERSION_3, hdr.version);
+}
+
+TEST(CapSet, InvalidUserPointersReturnEfault) {
+    errno = 0;
+    int ret = syscall(SYS_capset, nullptr, nullptr);
+    ASSERT_EQ(-1, ret);
+    EXPECT_EQ(EFAULT, errno);
+
+    errno = 0;
+    ret = syscall(SYS_capset, bad_user_ptr<cap_user_header_t>(0xdeadbeef),
+                  bad_user_ptr<cap_user_data_t>(0xcafebabe));
+    ASSERT_EQ(-1, ret);
+    EXPECT_EQ(EFAULT, errno);
+
+    cap_user_header_t hdr = {.version = _LINUX_CAPABILITY_VERSION_3, .pid = 0};
+    errno = 0;
+    ret = syscall(SYS_capset, &hdr, bad_user_ptr<cap_user_data_t>(0xcafebabe));
+    ASSERT_EQ(-1, ret);
+    EXPECT_EQ(EFAULT, errno);
+}
+
 TEST(CapSet, NegativePid) {
     cap_user_data_t data[_LINUX_CAPABILITY_U32S_3] = {};
     EXPECT_EQ(EPERM, capset_errno(_LINUX_CAPABILITY_VERSION_3, -1, data));
@@ -157,6 +209,14 @@ TEST(CapSet, NegativePid) {
 TEST(CapSet, NonCurrentPid) {
     cap_user_data_t data[_LINUX_CAPABILITY_U32S_3] = {};
     EXPECT_EQ(EPERM, capset_errno(_LINUX_CAPABILITY_VERSION_3, 999999, data));
+}
+
+TEST(CapSet, NonCurrentPidReturnsEpermBeforeDataRead) {
+    cap_user_header_t hdr = {.version = _LINUX_CAPABILITY_VERSION_3, .pid = 999999};
+    errno = 0;
+    int ret = syscall(SYS_capset, &hdr, bad_user_ptr<cap_user_data_t>(0xcafebabe));
+    ASSERT_EQ(-1, ret);
+    EXPECT_EQ(EPERM, errno);
 }
 
 TEST(CapSet, PermittedNotIncrease) {

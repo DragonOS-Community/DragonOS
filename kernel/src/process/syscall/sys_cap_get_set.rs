@@ -7,8 +7,8 @@ use crate::{
     },
 };
 use alloc::format;
-use alloc::vec::Vec;
 use core::ffi::c_int;
+use core::mem::size_of;
 use system_error::SystemError;
 
 use super::super::cred::{CAPFlags, Cred};
@@ -23,7 +23,7 @@ struct CapUserHeader {
 
 /// Linux 用户态结构: cap_user_data_t（数组元素）
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct CapUserData {
     effective: u32,
     permitted: u32,
@@ -42,6 +42,31 @@ const _U32S_2_3: usize = 2;
 // DragonOS 支持版本（对齐 Linux v3）
 const _KERNEL_CAPABILITY_VERSION: u32 = _LINUX_CAPABILITY_VERSION_3;
 
+fn cap_validate_magic_user(
+    header_ptr: *mut CapUserHeader,
+    from_user: bool,
+) -> Result<usize, SystemError> {
+    let version_reader = UserBufferReader::new(
+        header_ptr.cast::<u32>() as *const u32,
+        size_of::<u32>(),
+        from_user,
+    )?;
+    let version = version_reader.buffer_protected(0)?.read_one::<u32>(0)?;
+
+    match version {
+        _LINUX_CAPABILITY_VERSION_1 => Ok(_U32S_1),
+        _LINUX_CAPABILITY_VERSION_2 | _LINUX_CAPABILITY_VERSION_3 => Ok(_U32S_2_3),
+        _ => {
+            let mut version_writer =
+                UserBufferWriter::new(header_ptr.cast::<u32>(), size_of::<u32>(), from_user)?;
+            version_writer
+                .buffer_protected(0)?
+                .write_one(0, &_KERNEL_CAPABILITY_VERSION)?;
+            Err(SystemError::EINVAL)
+        }
+    }
+}
+
 struct SysCapset;
 
 impl Syscall for SysCapset {
@@ -57,51 +82,35 @@ impl Syscall for SysCapset {
     ) -> Result<usize, SystemError> {
         let header_ptr = args[0] as *mut CapUserHeader;
         let data_ptr = args[1] as *mut CapUserData;
+        let from_user = frame.is_from_user();
 
-        // 读取 header
-        let hdr_reader = UserBufferReader::new(
-            header_ptr as *const CapUserHeader,
-            core::mem::size_of::<CapUserHeader>(),
-            frame.is_from_user(),
-        )?;
-        let hdr = *hdr_reader.read_one_from_user::<CapUserHeader>(0)?;
-
-        // 版本协商
-        let (tocopy, version_ok) = match hdr.version {
-            _LINUX_CAPABILITY_VERSION_1 => (_U32S_1, true),
-            _LINUX_CAPABILITY_VERSION_2 | _LINUX_CAPABILITY_VERSION_3 => (_U32S_2_3, true),
-            _ => (_U32S_2_3, false),
-        };
-
-        if !version_ok {
-            // 未知版本：capset 不承担探测职责，直接返回 EINVAL（更贴近 Linux 行为）
-            return Err(SystemError::EINVAL);
-        }
-
-        // data 不能为空
-        if data_ptr.is_null() {
-            return Err(SystemError::EFAULT);
-        }
+        let tocopy = cap_validate_magic_user(header_ptr, from_user)?;
 
         // pid 仅允许当前进程
-        let pid = hdr.pid;
-        if pid < 0 {
-            // 与 Linux 语义一致：负 pid 视为不被允许的目标，返回 EPERM
-            return Err(SystemError::EPERM);
-        }
+        let pid_ptr = (header_ptr as usize + size_of::<u32>()) as *const c_int;
+        let pid_reader = UserBufferReader::new(pid_ptr, size_of::<c_int>(), from_user)?;
+        let pid = pid_reader.buffer_protected(0)?.read_one::<c_int>(0)?;
         let pcb = ProcessManager::current_pcb();
         if pid != 0 && pid as usize != pcb.raw_pid().data() {
             return Err(SystemError::EPERM);
         }
 
         // 读取用户数据
-        let data_reader = UserBufferReader::new(
-            data_ptr as *const CapUserData,
-            tocopy * core::mem::size_of::<CapUserData>(),
-            frame.is_from_user(),
-        )?;
-        let kdata = data_reader.read_from_user::<CapUserData>(0)?;
-        let (p_e_new, p_p_new, p_i_new) = aggregate_u32s_to_u64(kdata);
+        let mut kdata = [CapUserData::default(); _U32S_2_3];
+        let data_len = tocopy
+            .checked_mul(size_of::<CapUserData>())
+            .ok_or(SystemError::EINVAL)?;
+        let data_reader =
+            UserBufferReader::new(data_ptr as *const CapUserData, data_len, from_user)?;
+        let kdata_bytes =
+            unsafe { core::slice::from_raw_parts_mut(kdata.as_mut_ptr().cast::<u8>(), data_len) };
+        let read_len = data_reader
+            .buffer_protected(0)?
+            .read_from_user(0, kdata_bytes)?;
+        if read_len != data_len {
+            return Err(SystemError::EFAULT);
+        }
+        let (p_e_new, p_p_new, p_i_new) = aggregate_u32s_to_u64(&kdata);
 
         // 获取旧凭据
         let old = pcb.cred();
@@ -191,42 +200,22 @@ impl Syscall for SysCapget {
     ) -> Result<usize, SystemError> {
         let header_ptr = args[0] as *mut CapUserHeader;
         let data_ptr = args[1] as *mut CapUserData;
+        let from_user = frame.is_from_user();
 
-        // 读取 header
-        let reader = UserBufferReader::new(
-            header_ptr as *const CapUserHeader,
-            core::mem::size_of::<CapUserHeader>(),
-            frame.is_from_user(),
-        )?;
-        let hdr = *reader.read_one_from_user::<CapUserHeader>(0)?;
-
-        // 版本协商
-        let (tocopy, version_ok) = match hdr.version {
-            _LINUX_CAPABILITY_VERSION_1 => (_U32S_1, true),
-            _LINUX_CAPABILITY_VERSION_2 | _LINUX_CAPABILITY_VERSION_3 => (_U32S_2_3, true),
-            _ => (_U32S_2_3, false),
+        let tocopy = match cap_validate_magic_user(header_ptr, from_user) {
+            Ok(tocopy) => tocopy,
+            Err(SystemError::EINVAL) if data_ptr.is_null() => return Ok(0),
+            Err(err) => return Err(err),
         };
 
-        if !version_ok {
-            // 未知版本：写回支持的版本并返回 EINVAL
-            let mut writer = UserBufferWriter::new(
-                header_ptr,
-                core::mem::size_of::<CapUserHeader>(),
-                frame.is_from_user(),
-            )?;
-            let mut new_hdr = hdr;
-            new_hdr.version = _KERNEL_CAPABILITY_VERSION;
-            writer.copy_one_to_user(&new_hdr, 0)?;
-
-            // 探测模式：dataptr == NULL 且版本不合法时返回 0
-            if data_ptr.is_null() {
-                return Ok(0);
-            }
-            return Err(SystemError::EINVAL);
+        if data_ptr.is_null() {
+            return Ok(0);
         }
 
         // pid 检查
-        let pid = hdr.pid;
+        let pid_ptr = (header_ptr as usize + size_of::<u32>()) as *const c_int;
+        let pid_reader = UserBufferReader::new(pid_ptr, size_of::<c_int>(), from_user)?;
+        let pid = pid_reader.buffer_protected(0)?.read_one::<c_int>(0)?;
         if pid < 0 {
             return Err(SystemError::EINVAL);
         }
@@ -259,29 +248,25 @@ impl Syscall for SysCapget {
             inheritable: ((i >> 32) & 0xFFFF_FFFF) as u32,
         };
 
-        let mut kdata: Vec<CapUserData> = Vec::with_capacity(tocopy);
-        kdata.push(low);
-        if tocopy == _U32S_2_3 {
-            kdata.push(high);
-        }
+        let kdata = [low, high];
 
         // 写回用户缓冲区
-        if data_ptr.is_null() {
-            // 与当前 Linux 行为一致：版本合法且 dataptr==NULL 时返回 0
-            return Ok(0);
+        let data_len = tocopy
+            .checked_mul(size_of::<CapUserData>())
+            .ok_or(SystemError::EINVAL)?;
+        let mut writer = UserBufferWriter::new(data_ptr, data_len, from_user)?;
+        let kdata_bytes =
+            unsafe { core::slice::from_raw_parts(kdata.as_ptr().cast::<u8>(), data_len) };
+        let write_len = writer.buffer_protected(0)?.write_to_user(0, kdata_bytes)?;
+        if write_len != data_len {
+            return Err(SystemError::EFAULT);
         }
-        let mut writer = UserBufferWriter::new(
-            data_ptr,
-            tocopy * core::mem::size_of::<CapUserData>(),
-            frame.is_from_user(),
-        )?;
-        writer.copy_to_user(&kdata, 0)?;
 
         Ok(0)
     }
 
     fn entry_format(&self, args: &[usize]) -> alloc::vec::Vec<FormattedSyscallParam> {
-        vec![
+        alloc::vec![
             FormattedSyscallParam::new("header", format!("0x{:x}", args[0])),
             FormattedSyscallParam::new("data", format!("0x{:x}", args[1])),
         ]

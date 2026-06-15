@@ -1,9 +1,10 @@
 use crate::{
     arch::syscall::nr::{SYS_CAPGET, SYS_CAPSET},
+    mm::VirtAddr,
     process::ProcessManager,
     syscall::{
         table::{FormattedSyscallParam, Syscall},
-        user_access::{UserBufferReader, UserBufferWriter},
+        user_access::{copy_to_user_protected, write_one_to_user_protected, UserBufferReader},
     },
 };
 use alloc::format;
@@ -57,11 +58,18 @@ fn cap_validate_magic_user(
         _LINUX_CAPABILITY_VERSION_1 => Ok(_U32S_1),
         _LINUX_CAPABILITY_VERSION_2 | _LINUX_CAPABILITY_VERSION_3 => Ok(_U32S_2_3),
         _ => {
-            let mut version_writer =
-                UserBufferWriter::new(header_ptr.cast::<u32>(), size_of::<u32>(), from_user)?;
-            version_writer
-                .buffer_protected(0)?
-                .write_one(0, &_KERNEL_CAPABILITY_VERSION)?;
+            if from_user {
+                unsafe {
+                    write_one_to_user_protected(
+                        VirtAddr::new(header_ptr.cast::<u32>() as usize),
+                        &_KERNEL_CAPABILITY_VERSION,
+                    )?;
+                }
+            } else {
+                unsafe {
+                    header_ptr.cast::<u32>().write(_KERNEL_CAPABILITY_VERSION);
+                }
+            }
             Err(SystemError::EINVAL)
         }
     }
@@ -254,10 +262,20 @@ impl Syscall for SysCapget {
         let data_len = tocopy
             .checked_mul(size_of::<CapUserData>())
             .ok_or(SystemError::EINVAL)?;
-        let mut writer = UserBufferWriter::new(data_ptr, data_len, from_user)?;
         let kdata_bytes =
             unsafe { core::slice::from_raw_parts(kdata.as_ptr().cast::<u8>(), data_len) };
-        let write_len = writer.buffer_protected(0)?.write_to_user(0, kdata_bytes)?;
+        let write_len = if from_user {
+            unsafe { copy_to_user_protected(VirtAddr::new(data_ptr as usize), kdata_bytes)? }
+        } else {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    kdata_bytes.as_ptr(),
+                    data_ptr.cast::<u8>(),
+                    data_len,
+                );
+            }
+            data_len
+        };
         if write_len != data_len {
             return Err(SystemError::EFAULT);
         }

@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <errno.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -38,6 +39,17 @@ static void expect_capset_eperm_after_drop(uint64_t next_effective, uint64_t nex
     EXPECT_EQ(0, WEXITSTATUS(status));
 }
 
+static void signal_child_and_expect_success(int pipe_fd, pid_t child) {
+    const char done = 'x';
+    EXPECT_EQ(1, write(pipe_fd, &done, 1));
+    close(pipe_fd);
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0));
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
 TEST(CapGet, CurrentPidVersionV1V2V3) {
     cap_user_data_t data_v1[_LINUX_CAPABILITY_U32S_1] = {};
     EXPECT_EQ(0, capget_errno(_LINUX_CAPABILITY_VERSION_1, 0, data_v1));
@@ -54,6 +66,41 @@ TEST(CapGet, InvalidVersionProbe) {
     int ret = syscall(SYS_capget, &hdr, nullptr);
     EXPECT_EQ(0, ret) << "errno=" << errno << " (" << strerror(errno) << ")";
     EXPECT_EQ(_LINUX_CAPABILITY_VERSION_3, hdr.version);
+}
+
+TEST(CapGet, InvalidVersionWritebackPreservesChildCowHeader) {
+    void* mapping = mmap(nullptr, getpagesize(), PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(MAP_FAILED, mapping) << "mmap failed: errno=" << errno << " (" << strerror(errno)
+                                   << ")";
+    auto* hdr = static_cast<cap_user_header_t*>(mapping);
+    hdr->version = 0xDEADBEEFu;
+    hdr->pid = 0;
+
+    int sync_pipe[2];
+    ASSERT_EQ(0, pipe(sync_pipe));
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed: errno=" << errno << " (" << strerror(errno) << ")";
+    if (child == 0) {
+        close(sync_pipe[1]);
+        char done = 0;
+        if (read(sync_pipe[0], &done, 1) != 1) {
+            _exit(2);
+        }
+        close(sync_pipe[0]);
+        _exit(hdr->version == 0xDEADBEEFu ? 0 : 3);
+    }
+
+    close(sync_pipe[0]);
+    errno = 0;
+    int ret = syscall(SYS_capget, hdr, nullptr);
+    int saved_errno = errno;
+
+    EXPECT_EQ(0, ret) << "errno=" << saved_errno << " (" << strerror(saved_errno) << ")";
+    EXPECT_EQ(_LINUX_CAPABILITY_VERSION_3, hdr->version);
+    signal_child_and_expect_success(sync_pipe[1], child);
+    munmap(mapping, getpagesize());
 }
 
 TEST(CapGet, InvalidVersionWithData) {
@@ -151,6 +198,45 @@ TEST(CapGet, NonZeroPidBasicSuccess) {
     EXPECT_EQ(child, waitpid(child, &status, 0));
 }
 
+TEST(CapGet, DataWritePreservesChildCowPage) {
+    void* mapping = mmap(nullptr, getpagesize(), PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(MAP_FAILED, mapping) << "mmap failed: errno=" << errno << " (" << strerror(errno)
+                                   << ")";
+    auto* data = static_cast<cap_user_data_t*>(mapping);
+    const cap_user_data_t sentinel[2] = {
+        {.effective = 0xA5A5A5A5u, .permitted = 0x5A5A5A5Au, .inheritable = 0x13579BDFu},
+        {.effective = 0x2468ACE0u, .permitted = 0x11223344u, .inheritable = 0x55667788u},
+    };
+    memcpy(data, sentinel, sizeof(sentinel));
+
+    int sync_pipe[2];
+    ASSERT_EQ(0, pipe(sync_pipe));
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed: errno=" << errno << " (" << strerror(errno) << ")";
+    if (child == 0) {
+        close(sync_pipe[1]);
+        char done = 0;
+        if (read(sync_pipe[0], &done, 1) != 1) {
+            _exit(2);
+        }
+        close(sync_pipe[0]);
+        _exit(memcmp(data, sentinel, sizeof(sentinel)) == 0 ? 0 : 3);
+    }
+
+    close(sync_pipe[0]);
+    cap_user_header_t hdr = {.version = _LINUX_CAPABILITY_VERSION_3, .pid = 0};
+    errno = 0;
+    int ret = syscall(SYS_capget, &hdr, data);
+    int saved_errno = errno;
+
+    EXPECT_EQ(0, ret) << "errno=" << saved_errno << " (" << strerror(saved_errno) << ")";
+    EXPECT_NE(0, memcmp(data, sentinel, sizeof(sentinel)));
+    signal_child_and_expect_success(sync_pipe[1], child);
+    munmap(mapping, getpagesize());
+}
+
 TEST(CapSet, EffectiveMustBeSubsetOfPermitted) {
     cap_user_data_t data[2];
     fill_caps_v3(0x1ull, 0x0ull, 0x0ull, data);
@@ -180,6 +266,42 @@ TEST(CapSet, InvalidVersionWritesBackKernelVersion) {
     ASSERT_EQ(-1, ret);
     EXPECT_EQ(EINVAL, errno);
     EXPECT_EQ(_LINUX_CAPABILITY_VERSION_3, hdr.version);
+}
+
+TEST(CapSet, InvalidVersionWritebackPreservesChildCowHeader) {
+    void* mapping = mmap(nullptr, getpagesize(), PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(MAP_FAILED, mapping) << "mmap failed: errno=" << errno << " (" << strerror(errno)
+                                   << ")";
+    auto* hdr = static_cast<cap_user_header_t*>(mapping);
+    hdr->version = 0xCAFEBABEu;
+    hdr->pid = 0;
+
+    int sync_pipe[2];
+    ASSERT_EQ(0, pipe(sync_pipe));
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed: errno=" << errno << " (" << strerror(errno) << ")";
+    if (child == 0) {
+        close(sync_pipe[1]);
+        char done = 0;
+        if (read(sync_pipe[0], &done, 1) != 1) {
+            _exit(2);
+        }
+        close(sync_pipe[0]);
+        _exit(hdr->version == 0xCAFEBABEu ? 0 : 3);
+    }
+
+    close(sync_pipe[0]);
+    errno = 0;
+    int ret = syscall(SYS_capset, hdr, bad_user_ptr<cap_user_data_t>(0xcafebabe));
+    int saved_errno = errno;
+
+    EXPECT_EQ(-1, ret);
+    EXPECT_EQ(EINVAL, saved_errno);
+    EXPECT_EQ(_LINUX_CAPABILITY_VERSION_3, hdr->version);
+    signal_child_and_expect_success(sync_pipe[1], child);
+    munmap(mapping, getpagesize());
 }
 
 TEST(CapSet, InvalidUserPointersReturnEfault) {

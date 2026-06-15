@@ -991,7 +991,11 @@ pub unsafe fn copy_from_user_protected(
     }
 }
 
-/// 带异常保护的用户空间写入
+/// 带异常保护的用户空间写入。
+///
+/// 该路径保持 CPU 写保护开启，不绕过只读/COW PTE。对用户可写 VMA 的实际写入
+/// 允许触发缺页处理，由 fault handler 完成懒分配或 COW，语义对齐 Linux
+/// `copy_to_user()` / `put_user()`。
 ///
 /// ## 参数
 /// - `dest`: 目标地址(用户空间)
@@ -1001,35 +1005,12 @@ pub unsafe fn copy_from_user_protected(
 /// - `Ok(len)`: 成功写入的字节数
 /// - `Err(SystemError::EFAULT)`: 访问失败
 pub unsafe fn copy_to_user_protected(dest: VirtAddr, src: &[u8]) -> Result<usize, SystemError> {
-    let len = src.len();
-    if len == 0 {
-        return Ok(0);
-    }
-
-    let dst_ptr = dest.data() as *mut u8;
-    let src_ptr = src.as_ptr();
-
-    // 预检查：只基于 VMA 做权限/范围检查（不要求 PTE 已经存在）。
-    // 真实拷贝期间若遇到缺页，会进入 handle_mm_fault() 分配/映射页面；
-    // 若遇到不可访问区域（无 VMA / PROT_NONE / 无写权限），缺页处理会走异常表修复并返回 -EFAULT。
-    if user_accessible_len(dest, len, true) < len {
-        return Err(SystemError::EFAULT);
-    }
-
-    MMArch::disable_kernel_wp();
-    let result = MMArch::copy_with_exception_table(dst_ptr, src_ptr, len);
-    MMArch::enable_kernel_wp();
-
-    match result {
-        0 => Ok(len),
-        _ => Err(SystemError::EFAULT),
-    }
+    copy_to_user_cow_protected(dest, src)
 }
 
 /// 使用异常表保护写入用户空间，同时保持 CR0.WP，使只读/COW 用户页仍会触发正常缺页处理。
 ///
-/// 这条路径用于需要严格遵守 Linux `put_user()` COW 语义的写回场景，
-/// 例如 `CLONE_PARENT_SETTID` 和 `CLONE_CHILD_SETTID`。
+/// 这条路径用于需要明确表达 Linux `put_user()` COW 语义的写回场景。
 pub unsafe fn copy_to_user_cow_protected(dest: VirtAddr, src: &[u8]) -> Result<usize, SystemError> {
     let len = src.len();
     if len == 0 {

@@ -3528,6 +3528,9 @@ pub struct ProcessSignalInfo {
 
     /// boolean value for session group leader
     pub is_session_leader: bool,
+
+    /// OOM killer score adjustment exposed through `/proc/[pid]/oom_score_adj`.
+    oom_score_adj: i16,
 }
 
 impl ProcessSignalInfo {
@@ -3587,6 +3590,14 @@ impl ProcessSignalInfo {
     pub fn set_is_child_subreaper(&mut self, is_child_subreaper: bool) {
         self.is_child_subreaper = is_child_subreaper;
     }
+
+    pub fn oom_score_adj(&self) -> i16 {
+        self.oom_score_adj
+    }
+
+    pub fn set_oom_score_adj(&mut self, oom_score_adj: i16) {
+        self.oom_score_adj = oom_score_adj;
+    }
 }
 
 impl Default for ProcessSignalInfo {
@@ -3599,6 +3610,7 @@ impl Default for ProcessSignalInfo {
             has_child_subreaper: false,
             is_child_subreaper: false,
             is_session_leader: false,
+            oom_score_adj: 0,
         }
     }
 }

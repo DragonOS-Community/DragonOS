@@ -422,14 +422,18 @@ impl ProcessManager {
     ) -> Result<(), SystemError> {
         // 只复制信号掩码 - POSIX 要求 fork 和 execve 都保留信号掩码
         // 注意：先读取父进程的，然后释放锁，再写入子进程的，避免死锁
-        let sig_blocked = {
+        let sig_info_state = {
             let current_sig_info = current_pcb.sig_info_irqsave();
-            *current_sig_info.sig_blocked()
+            (
+                *current_sig_info.sig_blocked(),
+                current_sig_info.oom_score_adj(),
+            )
         };
 
         {
             let mut new_sig_info = new_pcb.sig_info_mut();
-            *new_sig_info.sig_block_mut() = sig_blocked;
+            *new_sig_info.sig_block_mut() = sig_info_state.0;
+            new_sig_info.set_oom_score_adj(sig_info_state.1);
         }
 
         Ok(())

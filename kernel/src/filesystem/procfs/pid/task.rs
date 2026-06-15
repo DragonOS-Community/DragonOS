@@ -2,6 +2,8 @@
 //!
 //! 列出进程的所有线程，每个线程对应一个子目录 /proc/[pid]/task/[tid]
 
+use super::oom_score_adj::OomScoreAdjFileOps;
+
 use crate::{
     filesystem::{
         procfs::{
@@ -140,6 +142,9 @@ impl TidDirOps {
         }),
         ("ns", |ops, parent| {
             NsDirOps::new_inode(ops.target.clone(), parent)
+        }),
+        ("oom_score_adj", |ops, parent| {
+            OomScoreAdjFileOps::new_inode(ops.target.clone(), parent)
         }),
     ];
 }

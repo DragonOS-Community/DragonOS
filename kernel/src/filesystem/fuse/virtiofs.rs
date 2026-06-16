@@ -24,9 +24,10 @@ use crate::{
         virtio_impl::HalImpl,
     },
     filesystem::vfs::{
-        FileSystem, FileSystemMakerData, FsInfo, IndexNode, MountableFileSystem, SuperBlock,
-        FSMAKER,
+        file::File, FileSystem, FileSystemMakerData, FsInfo, IndexNode, MountableFileSystem,
+        SuperBlock, FSMAKER,
     },
+    mm::{fault::PageFaultMessage, VirtRegion, VmFaultReason, VmFlags},
     process::{kthread::KernelThreadClosure, kthread::KernelThreadMechanism, ProcessManager},
     register_mountable_fs,
     time::{sleep::nanosleep, PosixTimeSpec},
@@ -809,6 +810,31 @@ impl FileSystem for VirtioFsFs {
 
     fn permission_policy(&self) -> crate::filesystem::vfs::FsPermissionPolicy {
         self.inner.permission_policy()
+    }
+
+    unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
+        self.inner.fault(pfm)
+    }
+
+    unsafe fn page_mkwrite(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
+        self.inner.page_mkwrite(pfm)
+    }
+
+    fn mprotect(&self, old_vm_flags: VmFlags, new_vm_flags: VmFlags) -> Result<(), SystemError> {
+        self.inner.mprotect(old_vm_flags, new_vm_flags)
+    }
+
+    fn vma_close(&self, file: &Arc<File>, region: VirtRegion, vm_flags: VmFlags) {
+        self.inner.vma_close(file, region, vm_flags)
+    }
+
+    unsafe fn map_pages(
+        &self,
+        pfm: &mut PageFaultMessage,
+        start_pgoff: usize,
+        end_pgoff: usize,
+    ) -> VmFaultReason {
+        self.inner.map_pages(pfm, start_pgoff, end_pgoff)
     }
 
     fn on_umount(&self) {

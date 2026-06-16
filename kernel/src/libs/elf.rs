@@ -810,8 +810,17 @@ impl ElfLoader {
         data_buf.clear();
         data_buf.resize(size, 0);
 
-        file.read(size, data_buf)
-            .expect("read program header table failed");
+        let read_len = file.read(size, data_buf).map_err(|e| {
+            error!("read program header table failed: {:?}", e);
+            elf::ParseError::BadOffset(phoff as u64)
+        })?;
+        if read_len != size {
+            error!(
+                "short read program header table: expected {}, got {}",
+                size, read_len
+            );
+            return Err(elf::ParseError::BadOffset(phoff as u64));
+        }
         let buf = data_buf.get_bytes(0..size)?;
 
         return Ok(Some(elf::segment::SegmentTable::new(

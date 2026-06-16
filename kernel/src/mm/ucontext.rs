@@ -862,6 +862,7 @@ impl InnerAddressSpace {
         }
         file.inode()
             .check_mmap_file(&file, len, offset, precheck_vm_flags)?;
+        let vma_file = file.inode().mmap_effective_file(&file)?;
 
         let start_page: VirtPageFrame = self.mmap(
             round_hint_to_min(start_vaddr),
@@ -882,7 +883,7 @@ impl InnerAddressSpace {
                         flags,
                         mapper,
                         flusher,
-                        Some(file.clone()),
+                        Some(vma_file.clone()),
                         Some(pgoff),
                     )
                 } else {
@@ -890,7 +891,7 @@ impl InnerAddressSpace {
                         VirtRegion::new(page.virt_address(), count.data() * MMArch::PAGE_SIZE),
                         vm_flags,
                         flags,
-                        Some(file.clone()),
+                        Some(vma_file.clone()),
                         Some(pgoff),
                         false,
                     )))

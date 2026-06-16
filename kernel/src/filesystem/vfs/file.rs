@@ -21,11 +21,15 @@ use crate::{
     },
     filesystem::{
         devfs::{devfs_lookup_device_by_devnum, LockedDevFSInode},
-        epoll::{event_poll::EPollPrivateData, EPollItem},
+        epoll::{
+            event_poll::{EPollPrivateData, EventPoll, LockedEPItemLinkedList},
+            EPollItem,
+        },
         ext4::inode::LockedExt4Inode,
         fat::fs::LockedFATInode,
         fuse::private_data::FuseFilePrivateData,
         kernfs::callback::KernFilePrivateData,
+        overlayfs::OverlayFilePrivateData,
         page_cache::PageCache,
         procfs::ProcfsFilePrivateData,
         ramfs::LockedRamFSInode,
@@ -232,6 +236,8 @@ pub enum FilePrivateData {
     SocketCreate,
     /// FUSE file private data.
     Fuse(FuseFilePrivateData),
+    /// OverlayFS per-open backing file private data.
+    Overlayfs(OverlayFilePrivateData),
     /// kernfs/debugfs per-open callback state.
     Kernfs(Option<KernFilePrivateData>),
     /// 不需要文件私有信息
@@ -245,7 +251,7 @@ impl Default for FilePrivateData {
 }
 
 impl FilePrivateData {
-    pub fn update_flags(&mut self, flags: FileFlags) {
+    pub fn update_flags(&mut self, flags: FileFlags) -> Result<(), SystemError> {
         match self {
             FilePrivateData::Pipefs(pdata) => {
                 pdata.set_flags(flags);
@@ -256,8 +262,12 @@ impl FilePrivateData {
             FilePrivateData::Fuse(pdata) => {
                 pdata.set_flags(flags);
             }
+            FilePrivateData::Overlayfs(pdata) => {
+                pdata.set_flags(flags)?;
+            }
             _ => {}
         }
+        Ok(())
     }
 
     pub fn is_pid(&self) -> bool {
@@ -525,6 +535,12 @@ pub struct File {
     wb_error_seq: Mutex<ErrSeqValue>,
     /// 当前 open file description 已观测到的 superblock 写回错误序列。
     sb_error_seq: Mutex<ErrSeqValue>,
+    /// epoll items that reference this open file description.
+    ///
+    /// Linux removes these from their owning epoll instances during `__fput()`
+    /// via `eventpoll_release(file)`.  DragonOS keeps the same lifetime edge
+    /// here so fd numbers can be safely reused after close.
+    epitems: Arc<LockedEPItemLinkedList>,
 }
 
 impl File {
@@ -831,6 +847,7 @@ impl File {
             ra_state: Mutex::new(FileReadaheadState::new()),
             wb_error_seq: Mutex::new(wb_error_seq),
             sb_error_seq: Mutex::new(sb_error_seq),
+            epitems: Arc::new(LockedEPItemLinkedList::default()),
         };
 
         return Ok(f);
@@ -1362,6 +1379,7 @@ impl File {
             ra_state: Mutex::new(self.ra_state.lock().clone()),
             wb_error_seq: Mutex::new(*self.wb_error_seq.lock()),
             sb_error_seq: Mutex::new(*self.sb_error_seq.lock()),
+            epitems: Arc::new(LockedEPItemLinkedList::default()),
         };
         // 调用inode的open方法，让inode知道有新的文件打开了这个inode
         // TODO: reopen is not a good idea for some inodes, need a better design
@@ -1463,9 +1481,9 @@ impl File {
         let new_bits = (new_flags.bits() & SETFL_MASK) | (old_flags.bits() & !SETFL_MASK);
         new_flags = FileFlags::from_bits_truncate(new_bits);
 
+        self.private_data.lock().update_flags(new_flags)?;
         // 更新文件的打开模式
         *self.flags.write() = new_flags;
-        self.private_data.lock().update_flags(new_flags);
         return Ok(());
     }
 
@@ -1517,15 +1535,22 @@ impl File {
         let private_data = self.private_data.lock();
         self.inode
             .as_pollable_inode()?
-            .add_epitem(epitem, &private_data)
+            .add_epitem(epitem.clone(), &private_data)?;
+        self.epitems.lock_irqsave().push_back(epitem);
+        Ok(())
     }
 
     /// Remove epitems associated with the epoll
     pub fn remove_epitem(&self, epitem: &Arc<EPollItem>) -> Result<(), SystemError> {
         let private_data = self.private_data.lock();
-        self.inode
+        let result = self
+            .inode
             .as_pollable_inode()?
-            .remove_epitem(epitem, &private_data)
+            .remove_epitem(epitem, &private_data);
+        self.epitems
+            .lock_irqsave()
+            .retain(|x| !Arc::ptr_eq(x, epitem));
+        result
     }
 
     /// Poll the file for events
@@ -1607,6 +1632,17 @@ impl File {
 
 impl Drop for File {
     fn drop(&mut self) {
+        let epitems = {
+            let mut guard = self.epitems.lock_irqsave();
+            let snapshot = guard.iter().cloned().collect::<Vec<_>>();
+            guard.clear();
+            snapshot
+        };
+        for epitem in epitems {
+            EventPoll::release_file_epitem(&epitem);
+            let _ = self.remove_epitem(&epitem);
+        }
+
         super::flock::release_all_for_file(self);
         if self.mode.read().contains(FileMode::FMODE_WRITER) {
             if let Some(mnt_inode) = self.inode.clone().downcast_arc::<MountFSInode>() {

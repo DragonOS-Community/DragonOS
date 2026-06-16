@@ -1308,6 +1308,13 @@ impl IndexNode for MountFSInode {
             .check_mmap_file(file, len, offset, vm_flags)
     }
 
+    fn mmap_effective_file(
+        &self,
+        file: &Arc<super::file::File>,
+    ) -> Result<Arc<super::file::File>, SystemError> {
+        self.inner_inode.mmap_effective_file(file)
+    }
+
     fn mmap_file(
         &self,
         file: &Arc<super::file::File>,

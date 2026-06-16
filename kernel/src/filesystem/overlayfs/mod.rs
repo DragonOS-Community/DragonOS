@@ -2,8 +2,11 @@
 pub mod copy_up;
 pub mod entry;
 
+use super::page_cache::PageCache;
 use super::ramfs::{LockedRamFSInode, RamFSInode};
+use super::vfs::file::{File, FileFlags, FilePrivateData};
 use super::vfs::utils::DName;
+use super::vfs::vcore;
 use super::vfs::FSMAKER;
 use super::vfs::{
     self, FileSystem, FileType, FsInfo, IndexNode, Metadata, MountableFileSystem, SuperBlock,
@@ -12,12 +15,14 @@ use crate::driver::base::device::device_number::DeviceNumber;
 use crate::driver::base::device::device_number::Major;
 use crate::filesystem::vfs::{FileSystemMaker, FileSystemMakerData};
 use crate::libs::mutex::Mutex;
+use crate::mm::VmFlags;
 use crate::process::ProcessManager;
 use crate::register_mountable_fs;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::sync::Weak;
 use alloc::vec::Vec;
+use core::mem;
 use entry::{OvlEntry, OvlLayer};
 use linkme::distributed_slice;
 use system_error::SystemError;
@@ -26,6 +31,39 @@ const WHITEOUT_MODE: u64 = 0o020000 | 0o600; // whiteout字符设备文件模式
 const WHITEOUT_DEV: DeviceNumber = DeviceNumber::new(Major::UNNAMED_MAJOR, 0); // Whiteout 文件设备号
 const WHITEOUT_FLAG: u64 = 0x1;
 type LowerRoot = (String, Arc<dyn IndexNode>);
+
+#[derive(Debug, Clone)]
+pub struct OverlayFilePrivateData {
+    inner: Arc<Mutex<OverlayFilePrivateDataInner>>,
+}
+
+#[derive(Debug)]
+struct OverlayFilePrivateDataInner {
+    backing_file: Arc<File>,
+    backing_is_upper: bool,
+    flags: FileFlags,
+}
+
+impl OverlayFilePrivateData {
+    fn new(backing_file: Arc<File>, backing_is_upper: bool, flags: FileFlags) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(OverlayFilePrivateDataInner {
+                backing_file,
+                backing_is_upper,
+                flags,
+            })),
+        }
+    }
+
+    pub fn set_flags(&mut self, flags: FileFlags) -> Result<(), SystemError> {
+        let mut inner = self.inner.lock();
+        inner
+            .backing_file
+            .set_flags(OvlInode::backing_open_flags(flags))?;
+        inner.flags = flags;
+        Ok(())
+    }
+}
 
 #[derive(Debug)]
 pub struct OverlayMountData {
@@ -422,9 +460,124 @@ impl OvlInode {
             None => Some(""),
         }
     }
+
+    fn open_flags_need_copy_up(flags: &FileFlags) -> bool {
+        let access = flags.access_flags();
+        access == FileFlags::O_WRONLY
+            || access == FileFlags::O_RDWR
+            || flags.contains(FileFlags::O_TRUNC)
+    }
+
+    fn backing_open_flags(mut flags: FileFlags) -> FileFlags {
+        flags.remove(
+            FileFlags::O_CREAT | FileFlags::O_EXCL | FileFlags::O_NOCTTY | FileFlags::O_TRUNC,
+        );
+        flags
+    }
+
+    fn current_realdata_inode(&self) -> Result<(Arc<dyn IndexNode>, bool), SystemError> {
+        if let Some(inode) = self.upper_inode.lock().clone() {
+            return Ok((inode, true));
+        }
+
+        let lower_inode = self.lower_inodes.first().ok_or(SystemError::ENOENT)?;
+        Ok((lower_inode.clone(), false))
+    }
+
+    fn open_backing_file(&self, flags: FileFlags) -> Result<OverlayFilePrivateData, SystemError> {
+        if Self::open_flags_need_copy_up(&flags) {
+            self.copy_up()?;
+        }
+
+        let (backing_inode, backing_is_upper) = self.current_realdata_inode()?;
+        let backing_file = Arc::new(File::new(backing_inode, Self::backing_open_flags(flags))?);
+        if flags.contains(FileFlags::O_TRUNC) && backing_is_upper {
+            vcore::vfs_truncate_file(
+                backing_file.inode(),
+                0,
+                vcore::current_file_lock_owner_id(),
+                || backing_file.private_data.lock(),
+            )?;
+        }
+        Ok(OverlayFilePrivateData::new(
+            backing_file,
+            backing_is_upper,
+            flags,
+        ))
+    }
+
+    fn same_inode(left: &Arc<dyn IndexNode>, right: &Arc<dyn IndexNode>) -> bool {
+        match (left.metadata(), right.metadata()) {
+            (Ok(left_md), Ok(right_md)) => {
+                left_md.dev_id == right_md.dev_id && left_md.inode_id == right_md.inode_id
+            }
+            _ => false,
+        }
+    }
+
+    fn backing_file_for_io(
+        &self,
+        data: crate::libs::mutex::MutexGuard<FilePrivateData>,
+    ) -> Result<(Arc<File>, bool), SystemError> {
+        let FilePrivateData::Overlayfs(overlay_data) = &*data else {
+            return Err(SystemError::EBADF);
+        };
+        let overlay_data = overlay_data.clone();
+        drop(data);
+
+        loop {
+            let (current_inode, current_is_upper) = self.current_realdata_inode()?;
+            let (backing_file, backing_is_upper, flags) = {
+                let inner = overlay_data.inner.lock();
+                (
+                    inner.backing_file.clone(),
+                    inner.backing_is_upper,
+                    inner.flags,
+                )
+            };
+
+            if Self::same_inode(&backing_file.inode(), &current_inode) {
+                return Ok((backing_file, backing_is_upper));
+            }
+
+            let new_backing_file = Arc::new(File::new(
+                current_inode.clone(),
+                Self::backing_open_flags(flags),
+            )?);
+            let installed_backing_file = new_backing_file.clone();
+            let old_backing_file = {
+                let mut inner = overlay_data.inner.lock();
+                if inner.flags != flags {
+                    continue;
+                }
+                if Self::same_inode(&inner.backing_file.inode(), &current_inode) {
+                    return Ok((inner.backing_file.clone(), inner.backing_is_upper));
+                }
+
+                inner.backing_is_upper = current_is_upper;
+                Some(mem::replace(&mut inner.backing_file, new_backing_file))
+            };
+            drop(old_backing_file);
+            return Ok((installed_backing_file, current_is_upper));
+        }
+    }
 }
 
 impl IndexNode for OvlInode {
+    fn open(
+        &self,
+        mut data: crate::libs::mutex::MutexGuard<FilePrivateData>,
+        flags: &FileFlags,
+    ) -> Result<(), SystemError> {
+        let overlay_data = self.open_backing_file(*flags)?;
+        *data = FilePrivateData::Overlayfs(overlay_data);
+        Ok(())
+    }
+
+    fn truncate_before_open(&self, _flags: &FileFlags) -> bool {
+        false
+    }
+
     fn read_at(
         &self,
         offset: usize,
@@ -432,28 +585,18 @@ impl IndexNode for OvlInode {
         buf: &mut [u8],
         data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
     ) -> Result<usize, system_error::SystemError> {
-        if let Some(ref upper_inode) = *self.upper_inode.lock() {
-            return upper_inode.read_at(offset, len, buf, data);
+        if self.file_type == FileType::SymLink {
+            drop(data);
+            let (backing_inode, _) = self.current_realdata_inode()?;
+            return backing_inode.read_at(
+                offset,
+                len,
+                buf,
+                crate::libs::mutex::Mutex::new(FilePrivateData::Unused).lock(),
+            );
         }
-
-        let mut lower_inodes = self.lower_inodes.iter();
-        if let Some(lower_inode) = lower_inodes.next() {
-            match lower_inode.read_at(offset, len, buf, data) {
-                Ok(read_len) => return Ok(read_len),
-                Err(mut err) => {
-                    for lower_inode in lower_inodes {
-                        let lock = Mutex::new(vfs::FilePrivateData::Unused);
-                        match lower_inode.read_at(offset, len, buf, lock.lock()) {
-                            Ok(read_len) => return Ok(read_len),
-                            Err(next_err) => err = next_err,
-                        }
-                    }
-                    return Err(err);
-                }
-            }
-        }
-
-        Err(SystemError::ENOENT)
+        let (backing_file, _) = self.backing_file_for_io(data)?;
+        backing_file.pread(offset, len, buf)
     }
 
     fn write_at(
@@ -463,30 +606,21 @@ impl IndexNode for OvlInode {
         buf: &[u8],
         data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        if (*self.upper_inode.lock()).is_none() {
-            self.copy_up()?;
-        }
-        if let Some(ref upper_inode) = *self.upper_inode.lock() {
-            return upper_inode.write_at(offset, len, buf, data);
-        }
-
-        Err(SystemError::EROFS)
+        let (backing_file, _) = self.backing_file_for_io(data)?;
+        backing_file.pwrite(offset, len, buf)
     }
 
     fn sync_file(
         &self,
         datasync: bool,
-        _data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
+        data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
     ) -> Result<(), SystemError> {
-        if let Some(ref upper_inode) = *self.upper_inode.lock() {
-            return upper_inode.sync_file(datasync, _data);
+        let (backing_file, backing_is_upper) = self.backing_file_for_io(data)?;
+        if backing_is_upper {
+            backing_file.sync_range_and_check_wb_error(0, usize::MAX, datasync)
+        } else {
+            Ok(())
         }
-
-        if !self.lower_inodes.is_empty() {
-            return Ok(());
-        }
-
-        Err(SystemError::ENOENT)
     }
 
     fn sync_file_range(
@@ -496,15 +630,69 @@ impl IndexNode for OvlInode {
         datasync: bool,
         data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
     ) -> Result<(), SystemError> {
-        if let Some(ref upper_inode) = *self.upper_inode.lock() {
-            return upper_inode.sync_file_range(start, end, datasync, data);
+        let (backing_file, backing_is_upper) = self.backing_file_for_io(data)?;
+        if backing_is_upper {
+            backing_file.sync_range_and_check_wb_error(start, end, datasync)
+        } else {
+            Ok(())
         }
+    }
 
-        if !self.lower_inodes.is_empty() {
-            return Ok(());
+    fn flush_file(
+        &self,
+        data: crate::libs::mutex::MutexGuard<FilePrivateData>,
+        lock_owner: u64,
+    ) -> Result<(), SystemError> {
+        let (backing_file, _) = self.backing_file_for_io(data)?;
+        backing_file.flush_for_close(lock_owner)
+    }
+
+    fn close(
+        &self,
+        mut data: crate::libs::mutex::MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        let old = mem::replace(&mut *data, FilePrivateData::Unused);
+        drop(data);
+        if let FilePrivateData::Overlayfs(overlay_data) = old {
+            drop(overlay_data);
         }
+        Ok(())
+    }
 
-        Err(SystemError::ENOENT)
+    fn check_mmap_file(
+        &self,
+        file: &Arc<File>,
+        len: usize,
+        offset: usize,
+        vm_flags: VmFlags,
+    ) -> Result<(), SystemError> {
+        let (backing_file, _) = self.backing_file_for_io(file.private_data.lock())?;
+        backing_file
+            .inode()
+            .check_mmap_file(&backing_file, len, offset, vm_flags)
+    }
+
+    fn mmap_effective_file(&self, file: &Arc<File>) -> Result<Arc<File>, SystemError> {
+        let (backing_file, _) = self.backing_file_for_io(file.private_data.lock())?;
+        Ok(backing_file)
+    }
+
+    fn mmap_file(
+        &self,
+        file: &Arc<File>,
+        start: usize,
+        len: usize,
+        offset: usize,
+        vm_flags: VmFlags,
+    ) -> Result<(), SystemError> {
+        let (backing_file, _) = self.backing_file_for_io(file.private_data.lock())?;
+        backing_file
+            .inode()
+            .mmap_file(&backing_file, start, len, offset, vm_flags)
+    }
+
+    fn page_cache(&self) -> Option<Arc<PageCache>> {
+        None
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {

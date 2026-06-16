@@ -389,6 +389,10 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         Ok(())
     }
 
+    fn mmap_effective_file(&self, file: &Arc<File>) -> Result<Arc<File>, SystemError> {
+        Ok(file.clone())
+    }
+
     fn mmap_file(
         &self,
         _file: &Arc<File>,

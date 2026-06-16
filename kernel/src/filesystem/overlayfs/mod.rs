@@ -14,7 +14,7 @@ use crate::filesystem::vfs::{FileSystemMaker, FileSystemMakerData};
 use crate::libs::mutex::Mutex;
 use crate::process::ProcessManager;
 use crate::register_mountable_fs;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::sync::Weak;
 use alloc::vec::Vec;
@@ -286,6 +286,15 @@ impl OvlInode {
         upper_inode.clone().ok_or(SystemError::EROFS)
     }
 
+    fn writable_upper_inode(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        if let Some(inode) = self.upper_inode.lock().clone() {
+            return Ok(inode);
+        }
+
+        self.copy_up()?;
+        self.upper_inode.lock().clone().ok_or(SystemError::EROFS)
+    }
+
     fn child_redirect(&self, name: &str) -> String {
         if self.redirect.is_empty() {
             String::from(name)
@@ -402,6 +411,17 @@ impl OvlInode {
     fn is_dir_empty(inode: &Arc<dyn IndexNode>) -> Result<bool, SystemError> {
         Ok(inode.list()?.iter().all(|entry| Self::is_dot_entry(entry)))
     }
+
+    fn parent_redirect(&self) -> Option<&str> {
+        if self.redirect.is_empty() {
+            return None;
+        }
+
+        match self.redirect.rsplit_once('/') {
+            Some((parent, _)) => Some(parent),
+            None => Some(""),
+        }
+    }
 }
 
 impl IndexNode for OvlInode {
@@ -509,7 +529,27 @@ impl IndexNode for OvlInode {
     }
 
     fn dname(&self) -> Result<DName, SystemError> {
-        Ok(DName::from(self.redirect.clone()))
+        Ok(DName::from(
+            self.redirect
+                .rsplit('/')
+                .next()
+                .unwrap_or(&self.redirect)
+                .to_string(),
+        ))
+    }
+
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let fs = self.overlay_fs()?;
+        let Some(parent_redirect) = self.parent_redirect() else {
+            return Ok(fs.root_inode.clone());
+        };
+
+        if parent_redirect.is_empty() {
+            return Ok(fs.root_inode.clone());
+        }
+
+        let root: Arc<dyn IndexNode> = fs.root_inode.clone();
+        root.lookup(parent_redirect)
     }
 
     fn list(&self) -> Result<Vec<String>, system_error::SystemError> {
@@ -563,11 +603,9 @@ impl IndexNode for OvlInode {
         name: &str,
         mode: vfs::InodeMode,
     ) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
-        if let Some(ref upper_inode) = *self.upper_inode.lock() {
-            upper_inode.mkdir(name, mode)
-        } else {
-            Err(SystemError::EROFS)
-        }
+        let upper_inode = self.writable_upper_inode()?;
+        self.remove_whiteout_if_present(name)?;
+        upper_inode.mkdir(name, mode)
     }
 
     fn rmdir(&self, name: &str) -> Result<(), SystemError> {
@@ -624,11 +662,9 @@ impl IndexNode for OvlInode {
         name: &str,
         other: &Arc<dyn IndexNode>,
     ) -> Result<(), system_error::SystemError> {
-        if let Some(ref upper_inode) = *self.upper_inode.lock() {
-            upper_inode.link(name, other)
-        } else {
-            Err(SystemError::EROFS)
-        }
+        let upper_inode = self.writable_upper_inode()?;
+        self.remove_whiteout_if_present(name)?;
+        upper_inode.link(name, other)
     }
 
     fn create(
@@ -637,7 +673,7 @@ impl IndexNode for OvlInode {
         file_type: vfs::FileType,
         mode: vfs::InodeMode,
     ) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
-        let upper_inode = self.upper_inode.lock().clone().ok_or(SystemError::EROFS)?;
+        let upper_inode = self.writable_upper_inode()?;
         self.remove_whiteout_if_present(name)?;
         upper_inode.create(name, file_type, mode)
     }
@@ -724,11 +760,8 @@ impl IndexNode for OvlInode {
         mode: vfs::InodeMode,
         dev_t: crate::driver::base::device::device_number::DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
-        let upper_inode = self.upper_inode.lock();
-        if let Some(ref inode) = *upper_inode {
-            inode.mknod(filename, mode, dev_t)
-        } else {
-            Err(SystemError::EROFS)
-        }
+        let upper_inode = self.writable_upper_inode()?;
+        self.remove_whiteout_if_present(filename)?;
+        upper_inode.mknod(filename, mode, dev_t)
     }
 }

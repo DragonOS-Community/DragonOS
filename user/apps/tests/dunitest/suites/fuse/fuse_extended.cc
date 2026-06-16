@@ -3293,7 +3293,6 @@ static int ext_test_mmap_fault_uses_open_fh_without_extra_open() {
         printf("[FAIL] init handshake timeout\n");
         goto fail;
     }
-
     snprintf(path, sizeof(path), "%s/hello.txt", mp);
     f = open(path, O_RDONLY);
     if (f < 0) {
@@ -5560,6 +5559,123 @@ fail_no_ramfs_umount:
     return -1;
 }
 
+static int ext_test_lookup_nodes_not_forgotten_before_umount() {
+    const char *mp = "/tmp/test_fuse_lookup_lifetime";
+    char parent_path[512];
+    char child_path[512];
+    struct stat st;
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t forget_count = 0;
+    volatile uint64_t forget_nlookup_sum = 0;
+    volatile uint32_t destroy_count = 0;
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.enable_write_ops = 1;
+    args.stop_on_destroy = 1;
+    args.forget_count = &forget_count;
+    args.forget_nlookup_sum = &forget_nlookup_sum;
+    args.destroy_count = &destroy_count;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(parent_path, sizeof(parent_path), "%s/parent", mp);
+    snprintf(child_path, sizeof(child_path), "%s/parent/child", mp);
+    if (mkdir(parent_path, 0755) != 0) {
+        printf("[FAIL] mkdir(%s): %s (errno=%d)\n", parent_path, strerror(errno), errno);
+        goto fail;
+    }
+    if (mkdir(child_path, 0755) != 0) {
+        printf("[FAIL] mkdir(%s): %s (errno=%d)\n", child_path, strerror(errno), errno);
+        goto fail;
+    }
+    if (stat(child_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        printf("[FAIL] stat(%s): %s (errno=%d)\n", child_path, strerror(errno), errno);
+        goto fail;
+    }
+    if (stat(parent_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        printf("[FAIL] stat(%s) after child lookup: %s (errno=%d)\n", parent_path,
+               strerror(errno), errno);
+        goto fail;
+    }
+
+    if (forget_count != 0 || forget_nlookup_sum != 0) {
+        printf("[FAIL] active FUSE nodes forgotten before umount: count=%u nlookup=%llu\n",
+               forget_count, (unsigned long long)forget_nlookup_sum);
+        goto fail;
+    }
+
+    umount(mp);
+    for (int i = 0; i < 200 && destroy_count == 0; i++) {
+        usleep(10 * 1000);
+    }
+    if (destroy_count == 0) {
+        printf("[FAIL] timed out waiting for FUSE_DESTROY after umount\n");
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    close(fd);
+    pthread_join(th, NULL);
+    if (forget_count == 0 || forget_nlookup_sum < 2 || destroy_count != 1) {
+        printf("[FAIL] FUSE teardown did not return lookups before destroy: forget=%u "
+               "nlookup=%llu destroy=%u\n",
+               forget_count, (unsigned long long)forget_nlookup_sum, destroy_count);
+        rmdir(mp);
+        return -1;
+    }
+    rmdir(mp);
+    return 0;
+
+fail:
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
 static int ext_test_readdirplus_generation_mismatch_stales_old_node() {
     const char *mp = "/tmp/test_fuse_readdirplus_generation";
     char file_path[512];
@@ -6116,6 +6232,10 @@ TEST(FuseExtended, FadviseWithoutPageCacheSucceeds) {
 
 TEST(FuseExtended, MountRamfsOnFuseDirectoryUsesNamespacePath) {
     ASSERT_EQ(0, ext_test_mount_on_fuse_dir_uses_namespace_path());
+}
+
+TEST(FuseExtended, LookupNodesNotForgottenBeforeUmount) {
+    ASSERT_EQ(0, ext_test_lookup_nodes_not_forgotten_before_umount());
 }
 
 TEST(FuseExtended, RenameUpdatesFuseDirectoryCwdPath) {

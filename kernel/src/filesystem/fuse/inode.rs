@@ -60,6 +60,7 @@ pub struct FuseNode {
     self_ref: Weak<FuseNode>,
     nodeid: u64,
     parent_nodeid: Mutex<u64>,
+    parent: Mutex<Option<Arc<FuseNode>>>,
     name: Mutex<Option<String>>,
     cached_metadata: Mutex<Option<Metadata>>,
     page_cache: Mutex<Option<Arc<PageCache>>>,
@@ -119,6 +120,7 @@ impl FuseNode {
         conn: Arc<FuseConn>,
         nodeid: u64,
         parent_nodeid: u64,
+        parent: Option<Arc<FuseNode>>,
         cached: Option<Metadata>,
     ) -> Arc<Self> {
         let has_cached = cached.is_some();
@@ -128,6 +130,7 @@ impl FuseNode {
             self_ref: self_ref.clone(),
             nodeid,
             parent_nodeid: Mutex::new(parent_nodeid),
+            parent: Mutex::new(parent),
             name: Mutex::new(None),
             cached_metadata: Mutex::new(cached),
             page_cache: Mutex::new(None),
@@ -185,6 +188,33 @@ impl FuseNode {
 
     pub fn set_parent_nodeid(&self, parent: u64) {
         *self.parent_nodeid.lock() = parent;
+    }
+
+    pub(crate) fn set_parent_if_absent(&self, parent: Option<Arc<FuseNode>>) {
+        let Some(parent) = parent else {
+            return;
+        };
+        if parent.nodeid() == self.nodeid {
+            return;
+        }
+        let mut guard = self.parent.lock();
+        if guard.is_none() {
+            *guard = Some(parent);
+        }
+    }
+
+    pub(crate) fn set_parent(&self, parent: Option<Arc<FuseNode>>) {
+        if parent
+            .as_ref()
+            .is_some_and(|parent| parent.nodeid() == self.nodeid)
+        {
+            return;
+        }
+        *self.parent.lock() = parent;
+    }
+
+    pub(crate) fn clear_parent(&self) {
+        *self.parent.lock() = None;
     }
 
     pub fn set_cached_metadata(&self, md: Metadata) {
@@ -267,6 +297,12 @@ impl FuseNode {
             let _ = cache.manager().invalidate_all_clean();
         }
         Ok(())
+    }
+
+    fn discard_clean_page_cache(&self) {
+        if let Some(cache) = self.cached_page_cache() {
+            let _ = cache.manager().invalidate_all_clean();
+        }
     }
 
     fn truncate_page_cache(&self, new_size: usize) -> Result<(), SystemError> {
@@ -650,18 +686,52 @@ impl FuseNode {
         (base_len + Self::FUSE_DIRENT_ALIGN - 1) & !(Self::FUSE_DIRENT_ALIGN - 1)
     }
 
-    fn cache_child_from_entry(&self, entry: &FuseEntryOut, name: &str) {
-        if entry.nodeid == 0 {
-            return;
+    fn entry_file_type(attr: &FuseAttr) -> Result<FileType, SystemError> {
+        let mode = InodeMode::from_bits_truncate(attr.mode);
+        match mode & InodeMode::S_IFMT {
+            t if t == InodeMode::S_IFDIR => Ok(FileType::Dir),
+            t if t == InodeMode::S_IFREG => Ok(FileType::File),
+            t if t == InodeMode::S_IFLNK => Ok(FileType::SymLink),
+            t if t == InodeMode::S_IFCHR => Ok(FileType::CharDevice),
+            t if t == InodeMode::S_IFBLK => Ok(FileType::BlockDevice),
+            t if t == InodeMode::S_IFSOCK => Ok(FileType::Socket),
+            t if t == InodeMode::S_IFIFO => Ok(FileType::Pipe),
+            _ => Err(SystemError::EIO),
         }
-        if let Some(fs) = self.fs.upgrade() {
-            let md = Self::attr_to_metadata(&entry.attr);
-            let child = fs.get_or_create_node_with_generation(
+    }
+
+    fn metadata_from_valid_entry(
+        entry: &FuseEntryOut,
+        zero_nodeid_error: SystemError,
+        expected_type: Option<FileType>,
+    ) -> Result<Metadata, SystemError> {
+        if entry.nodeid == 0 {
+            return Err(zero_nodeid_error);
+        }
+        let file_type = Self::entry_file_type(&entry.attr)?;
+        if expected_type.is_some_and(|expected| expected != file_type) {
+            return Err(SystemError::EIO);
+        }
+        Ok(Self::attr_to_metadata(&entry.attr))
+    }
+
+    fn cache_child_from_entry(&self, entry: &FuseEntryOut, name: &str) {
+        let Ok(md) = Self::metadata_from_valid_entry(entry, SystemError::EIO, None) else {
+            if entry.nodeid != 0 {
+                let _ = self.conn.queue_forget(entry.nodeid, 1);
+            }
+            return;
+        };
+        if let (Some(fs), Some(parent)) = (self.fs.upgrade(), self.self_ref.upgrade()) {
+            let Ok(child) = fs.get_or_create_node_with_generation(
                 entry.nodeid,
-                self.nodeid,
+                Some(parent),
                 Some(md.clone()),
                 Some(entry.generation),
-            );
+            ) else {
+                let _ = self.conn.queue_forget(entry.nodeid, 1);
+                return;
+            };
             child.set_dname(name);
             child.inc_lookup(1);
             child.set_cached_metadata_with_valid(md, entry.attr_valid, entry.attr_valid_nsec);
@@ -738,24 +808,7 @@ impl FuseNode {
 
     fn attr_to_metadata(attr: &FuseAttr) -> Metadata {
         let mode = InodeMode::from_bits_truncate(attr.mode);
-        let ifmt = mode.bits() & InodeMode::S_IFMT.bits();
-        let file_type = if ifmt == InodeMode::S_IFDIR.bits() {
-            FileType::Dir
-        } else if ifmt == InodeMode::S_IFREG.bits() {
-            FileType::File
-        } else if ifmt == InodeMode::S_IFLNK.bits() {
-            FileType::SymLink
-        } else if ifmt == InodeMode::S_IFCHR.bits() {
-            FileType::CharDevice
-        } else if ifmt == InodeMode::S_IFBLK.bits() {
-            FileType::BlockDevice
-        } else if ifmt == InodeMode::S_IFSOCK.bits() {
-            FileType::Socket
-        } else if ifmt == InodeMode::S_IFIFO.bits() {
-            FileType::Pipe
-        } else {
-            FileType::File
-        };
+        let file_type = Self::entry_file_type(attr).unwrap_or(FileType::File);
 
         let inode_id = InodeId::new(attr.ino as usize);
 
@@ -875,7 +928,14 @@ impl FuseNode {
         self.set_open_private_data(data, opcode, out.fh, file_flags, out.open_flags, false)
     }
 
-    fn release_common(&self, opcode: u32, fh: u64, file_flags: u32, lock_owner: u64) {
+    fn release_common_for_node(
+        &self,
+        opcode: u32,
+        nodeid: u64,
+        fh: u64,
+        file_flags: u32,
+        lock_owner: u64,
+    ) {
         let inarg = FuseReleaseIn {
             fh,
             flags: file_flags,
@@ -883,7 +943,6 @@ impl FuseNode {
             lock_owner,
         };
         let conn = self.conn.clone();
-        let nodeid = self.nodeid;
         let payload = fuse_pack_struct(&inarg).to_vec();
         if let Err(err) = conn.request_nocreds_background(opcode, nodeid, &payload) {
             log::warn!(
@@ -894,6 +953,10 @@ impl FuseNode {
                 err
             );
         }
+    }
+
+    fn release_common(&self, opcode: u32, fh: u64, file_flags: u32, lock_owner: u64) {
+        self.release_common_for_node(opcode, self.nodeid, fh, file_flags, lock_owner);
     }
 
     fn ensure_dir(&self) -> Result<(), SystemError> {
@@ -976,26 +1039,32 @@ impl FuseNode {
         &self,
         entry: &FuseEntryOut,
         name: Option<&str>,
+        expected_type: FileType,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        self.check_not_stale()?;
-        let md = Self::attr_to_metadata(&entry.attr);
-        let fs = self.fs.upgrade().ok_or(SystemError::ENOENT)?;
-        let child = fs.get_or_create_node_with_generation(
-            entry.nodeid,
-            self.nodeid,
-            Some(md),
-            Some(entry.generation),
-        );
-        if let Some(name) = name {
-            child.set_dname(name);
+        let mut consumed = false;
+        let result = (|| {
+            self.check_not_stale()?;
+            let md = Self::metadata_from_valid_entry(entry, SystemError::EIO, Some(expected_type))?;
+            let fs = self.fs.upgrade().ok_or(SystemError::ENOENT)?;
+            let parent = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+            let child = fs.get_or_create_node_with_generation(
+                entry.nodeid,
+                Some(parent),
+                Some(md.clone()),
+                Some(entry.generation),
+            )?;
+            if let Some(name) = name {
+                child.set_dname(name);
+            }
+            child.inc_lookup(1);
+            consumed = true;
+            child.set_cached_metadata_with_valid(md, entry.attr_valid, entry.attr_valid_nsec);
+            Ok(child as Arc<dyn IndexNode>)
+        })();
+        if result.is_err() && entry.nodeid != 0 && !consumed {
+            let _ = self.conn.queue_forget(entry.nodeid, 1);
         }
-        child.inc_lookup(1);
-        child.set_cached_metadata_with_valid(
-            Self::attr_to_metadata(&entry.attr),
-            entry.attr_valid,
-            entry.attr_valid_nsec,
-        );
-        Ok(child)
+        result
     }
 
     fn read_direct_with_open(
@@ -1447,7 +1516,7 @@ impl IndexNode for FuseNode {
             if vm_flags.contains(crate::mm::VmFlags::VM_MAYSHARE) {
                 return Err(SystemError::ENODEV);
             }
-            self.invalidate_clean_page_cache()?;
+            self.discard_clean_page_cache();
         }
 
         self.ensure_page_cache()?;
@@ -2015,8 +2084,8 @@ impl IndexNode for FuseNode {
         self.check_not_stale()?;
         self.ensure_dir()?;
         if name == "." {
-            let fs = self.fs.upgrade().ok_or(SystemError::ENOENT)?;
-            return Ok(fs.get_or_create_node(self.nodeid, *self.parent_nodeid.lock(), None));
+            let this = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+            return Ok(this);
         }
         if name == ".." {
             return self.parent();
@@ -2024,35 +2093,45 @@ impl IndexNode for FuseNode {
 
         let payload = self.request_name(FUSE_LOOKUP, self.nodeid, name)?;
         let entry: FuseEntryOut = fuse_read_struct(&payload)?;
-        let md = Self::attr_to_metadata(&entry.attr);
+        let md = Self::metadata_from_valid_entry(&entry, SystemError::ENOENT, None).inspect_err(
+            |_| {
+                if entry.nodeid != 0 {
+                    let _ = self.conn.queue_forget(entry.nodeid, 1);
+                }
+            },
+        )?;
 
         let fs = self.fs.upgrade().ok_or(SystemError::ENOENT)?;
-        let child = fs.get_or_create_node_with_generation(
-            entry.nodeid,
-            self.nodeid,
-            Some(md),
-            Some(entry.generation),
-        );
+        let parent = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+        let child = fs
+            .get_or_create_node_with_generation(
+                entry.nodeid,
+                Some(parent),
+                Some(md.clone()),
+                Some(entry.generation),
+            )
+            .inspect_err(|_| {
+                let _ = self.conn.queue_forget(entry.nodeid, 1);
+            })?;
         child.set_dname(name);
         child
             .lookup_attr_flags
             .store(entry.attr.flags, Ordering::Relaxed);
         child.inc_lookup(1);
-        child.set_cached_metadata_with_valid(
-            Self::attr_to_metadata(&entry.attr),
-            entry.attr_valid,
-            entry.attr_valid_nsec,
-        );
+        child.set_cached_metadata_with_valid(md, entry.attr_valid, entry.attr_valid_nsec);
         Ok(child)
     }
 
     fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
         let fs = self.fs.upgrade().ok_or(SystemError::ENOENT)?;
+        if let Some(parent) = self.parent.lock().clone() {
+            return Ok(parent);
+        }
         let parent_nodeid = *self.parent_nodeid.lock();
         if parent_nodeid == self.nodeid {
             return Ok(fs.root_node());
         }
-        Ok(fs.get_or_create_node(parent_nodeid, parent_nodeid, None))
+        Err(SystemError::ESTALE)
     }
 
     fn create(
@@ -2080,8 +2159,17 @@ impl IndexNode for FuseNode {
             Err(SystemError::ENOSYS) => return self.create_with_data(name, file_type, mode, 0),
             Err(e) => return Err(e),
         };
-        let (entry, _) = Self::parse_create_reply(&payload)?;
-        self.create_node_from_entry(&entry, Some(name))
+        let (entry, open_out) = Self::parse_create_reply(&payload)?;
+        if entry.nodeid != 0 {
+            self.release_common_for_node(
+                FUSE_RELEASE,
+                entry.nodeid,
+                open_out.fh,
+                FileFlags::O_RDONLY.bits(),
+                0,
+            );
+        }
+        self.create_node_from_entry(&entry, Some(name), FileType::File)
     }
 
     fn create_with_data(
@@ -2103,7 +2191,7 @@ impl IndexNode for FuseNode {
                 let payload_in = Self::pack_struct_and_name_payload(&inarg, name);
                 let payload = self.conn().request(FUSE_MKDIR, self.nodeid, &payload_in)?;
                 let entry: FuseEntryOut = fuse_read_struct(&payload)?;
-                self.create_node_from_entry(&entry, Some(name))
+                self.create_node_from_entry(&entry, Some(name), FileType::Dir)
             }
             FileType::File => {
                 let inarg = FuseMknodIn {
@@ -2115,7 +2203,7 @@ impl IndexNode for FuseNode {
                 let payload_in = Self::pack_struct_and_name_payload(&inarg, name);
                 let payload = self.conn().request(FUSE_MKNOD, self.nodeid, &payload_in)?;
                 let entry: FuseEntryOut = fuse_read_struct(&payload)?;
-                self.create_node_from_entry(&entry, Some(name))
+                self.create_node_from_entry(&entry, Some(name), FileType::File)
             }
             FileType::SymLink => {
                 let mut payload_in = Vec::with_capacity(name.len() + 2);
@@ -2126,7 +2214,7 @@ impl IndexNode for FuseNode {
                     .conn()
                     .request(FUSE_SYMLINK, self.nodeid, &payload_in)?;
                 let entry: FuseEntryOut = fuse_read_struct(&payload)?;
-                self.create_node_from_entry(&entry, Some(name))
+                self.create_node_from_entry(&entry, Some(name), FileType::SymLink)
             }
             _ => Err(SystemError::ENOSYS),
         }
@@ -2140,7 +2228,7 @@ impl IndexNode for FuseNode {
             .conn()
             .request(FUSE_SYMLINK, self.nodeid, &payload_in)?;
         let entry: FuseEntryOut = fuse_read_struct(&payload)?;
-        self.create_node_from_entry(&entry, Some(name))
+        self.create_node_from_entry(&entry, Some(name), FileType::SymLink)
     }
 
     fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
@@ -2150,27 +2238,34 @@ impl IndexNode for FuseNode {
             .as_any_ref()
             .downcast_ref::<FuseNode>()
             .ok_or(SystemError::EXDEV)?;
+        let expected_type = target.cached_or_fetch_metadata()?.file_type;
         let inarg = FuseLinkIn {
             oldnodeid: target.nodeid,
         };
         let payload_in = Self::pack_struct_and_name_payload(&inarg, name);
         let payload = self.conn().request(FUSE_LINK, self.nodeid, &payload_in)?;
         let entry: FuseEntryOut = fuse_read_struct(&payload)?;
-        let md = Self::attr_to_metadata(&entry.attr);
-        let fs = self.fs.upgrade().ok_or(SystemError::ENOENT)?;
-        let child = fs.get_or_create_node_for_link(
-            entry.nodeid,
-            self.nodeid,
-            Some(md),
-            Some(entry.generation),
-        );
-        child.inc_lookup(1);
-        child.set_cached_metadata_with_valid(
-            Self::attr_to_metadata(&entry.attr),
-            entry.attr_valid,
-            entry.attr_valid_nsec,
-        );
-        Ok(())
+        let mut consumed = false;
+        let result = (|| {
+            let md =
+                Self::metadata_from_valid_entry(&entry, SystemError::EIO, Some(expected_type))?;
+            let fs = self.fs.upgrade().ok_or(SystemError::ENOENT)?;
+            let parent = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+            let child = fs.get_or_create_node_for_link(
+                entry.nodeid,
+                Some(parent),
+                Some(md.clone()),
+                Some(entry.generation),
+            )?;
+            child.inc_lookup(1);
+            consumed = true;
+            child.set_cached_metadata_with_valid(md, entry.attr_valid, entry.attr_valid_nsec);
+            Ok(())
+        })();
+        if result.is_err() && entry.nodeid != 0 && !consumed {
+            let _ = self.conn.queue_forget(entry.nodeid, 1);
+        }
+        result
     }
 
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
@@ -2251,11 +2346,15 @@ impl IndexNode for FuseNode {
         let _ = r?;
         if let Some(node) = cached_old {
             node.set_parent_nodeid(target_any.nodeid);
+            node.set_parent(Some(
+                target_any.self_ref.upgrade().ok_or(SystemError::ENOENT)?,
+            ));
             node.set_dname(new_name);
         }
         if let Some(node) = cached_new {
             if flag.contains(RenameFlags::EXCHANGE) {
                 node.set_parent_nodeid(self.nodeid);
+                node.set_parent(Some(self.self_ref.upgrade().ok_or(SystemError::ENOENT)?));
                 node.set_dname(old_name);
             } else {
                 node.clear_dname_if(new_name);
@@ -2279,6 +2378,6 @@ impl IndexNode for FuseNode {
 
 impl Drop for FuseNode {
     fn drop(&mut self) {
-        self.flush_forget();
+        self.clear_parent();
     }
 }

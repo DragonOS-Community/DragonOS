@@ -417,8 +417,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
-        // 若文件系统没有实现此方法，则返回"不支持"
-        return Err(SystemError::ENOSYS);
+        Ok(())
     }
 
     /// Adjust per-open file mode bits after `open()` initialized private data.
@@ -1444,6 +1443,8 @@ bitflags! {
         const PROC_MAGIC = 0x9fa0;
         const RAMFS_MAGIC = 0x858458f6;
         const DEVPTS_MAGIC = 0x1cd1;
+        const DEBUGFS_MAGIC = 0x64626720;
+        const MQUEUE_MAGIC = 0x19800202;
         const MOUNT_MAGIC = 61267;
         const PIPEFS_MAGIC = 0x50495045;
         const EVENTFD_MAGIC = 0x45564446; // "EVDF" in ASCII

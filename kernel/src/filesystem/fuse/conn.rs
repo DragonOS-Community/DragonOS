@@ -459,7 +459,12 @@ impl FuseConn {
             let mut g = self.inner.lock();
             should_destroy = g.connected && g.initialized;
             g.mounted = false;
-            g.pending.clear();
+            // Filesystem teardown queues accumulated FORGET requests before
+            // the connection enters on_umount().  Preserve those no-reply
+            // requests so the daemon can release lookup references before
+            // it receives DESTROY; drop ordinary requests that can no longer
+            // complete after unmount.
+            g.pending.retain(|req| req.opcode == FUSE_FORGET);
             processing = g.processing.values().cloned().collect();
             g.processing.clear();
         }

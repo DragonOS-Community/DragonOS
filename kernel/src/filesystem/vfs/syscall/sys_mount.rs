@@ -173,13 +173,14 @@ pub fn do_mount(
     data: Option<String>,
     mount_flags: MountFlags,
 ) -> Result<(), SystemError> {
+    let requested_target = target.as_deref().unwrap_or("");
     let (current_node, rest_path) = user_path_at(
         &ProcessManager::current_pcb(),
         AtFlags::AT_FDCWD.bits(),
-        target.as_deref().unwrap_or(""),
+        requested_target,
     )?;
     let inode = current_node.lookup_follow_symlink(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-    let resolved_target_path = inode.absolute_path()?;
+    let resolved_target_path = resolved_mount_target_path(requested_target, &inode)?;
     return path_mount(
         source,
         &resolved_target_path,
@@ -188,6 +189,47 @@ pub fn do_mount(
         data,
         mount_flags,
     );
+}
+
+fn resolved_mount_target_path(
+    requested_path: &str,
+    inode: &Arc<dyn IndexNode>,
+) -> Result<String, SystemError> {
+    match inode.absolute_path() {
+        Ok(path) => Ok(path),
+        Err(SystemError::ENOSYS) => Ok(normalize_requested_mount_path(requested_path)),
+        Err(err) => Err(err),
+    }
+}
+
+fn normalize_requested_mount_path(path: &str) -> String {
+    let base = if path.starts_with('/') {
+        String::from("/")
+    } else {
+        ProcessManager::current_pcb().basic().cwd()
+    };
+
+    let mut components: Vec<&str> = base.split('/').filter(|part| !part.is_empty()).collect();
+    for component in path.split('/').filter(|part| !part.is_empty()) {
+        match component {
+            "." => {}
+            ".." => {
+                components.pop();
+            }
+            _ => components.push(component),
+        }
+    }
+
+    if components.is_empty() {
+        return String::from("/");
+    }
+
+    let mut normalized = String::new();
+    for component in components {
+        normalized.push('/');
+        normalized.push_str(component);
+    }
+    normalized
 }
 
 fn path_mount(

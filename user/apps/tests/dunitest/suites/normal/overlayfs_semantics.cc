@@ -332,6 +332,195 @@ TEST(OverlayFsSemantics, UnlinkLowerWhiteoutReturnsEnoent) {
     rmdir(root);
 }
 
+TEST(OverlayFsSemantics, MkdirUnderLowerOnlyDirCopiesUpParent) {
+    char root[128] = {};
+    char upper[160] = {};
+    char lower[160] = {};
+    char work[160] = {};
+    char merged[160] = {};
+    char lower_dev[192] = {};
+    char lower_pts[224] = {};
+    char upper_dev[192] = {};
+    char upper_pts[224] = {};
+    char merged_pts[224] = {};
+    char options[512] = {};
+
+    snprintf(root, sizeof(root), "/tmp/overlayfs_mkdir_lower_%d", getpid());
+    snprintf(upper, sizeof(upper), "%s/u", root);
+    snprintf(lower, sizeof(lower), "%s/l", root);
+    snprintf(work, sizeof(work), "%s/w", root);
+    snprintf(merged, sizeof(merged), "%s/m", root);
+    snprintf(lower_dev, sizeof(lower_dev), "%s/dev", lower);
+    snprintf(lower_pts, sizeof(lower_pts), "%s/pts", lower_dev);
+    snprintf(upper_dev, sizeof(upper_dev), "%s/dev", upper);
+    snprintf(upper_pts, sizeof(upper_pts), "%s/pts", upper_dev);
+    snprintf(merged_pts, sizeof(merged_pts), "%s/dev/pts", merged);
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(root));
+    ASSERT_EQ(0, ensure_dir(upper));
+    ASSERT_EQ(0, ensure_dir(lower));
+    ASSERT_EQ(0, ensure_dir(work));
+    ASSERT_EQ(0, ensure_dir(merged));
+    ASSERT_EQ(0, mkdir(lower_dev, 0755));
+
+    snprintf(options, sizeof(options), "lowerdir=%s,upperdir=%s,workdir=%s", lower, upper, work);
+    if (mount("overlay", merged, "overlay", 0, options) != 0) {
+        rmdir(merged);
+        rmdir(work);
+        rmdir(lower_dev);
+        rmdir(lower);
+        rmdir(upper);
+        rmdir(root);
+        GTEST_SKIP() << strerror(errno);
+    }
+
+    ASSERT_EQ(0, mkdir(merged_pts, 0755)) << strerror(errno);
+
+    struct stat st = {};
+    ASSERT_EQ(0, stat(merged_pts, &st)) << strerror(errno);
+    EXPECT_TRUE(S_ISDIR(st.st_mode));
+    ASSERT_EQ(0, stat(upper_dev, &st)) << strerror(errno);
+    EXPECT_TRUE(S_ISDIR(st.st_mode));
+    ASSERT_EQ(0, stat(upper_pts, &st)) << strerror(errno);
+    EXPECT_TRUE(S_ISDIR(st.st_mode));
+    ASSERT_EQ(-1, stat(lower_pts, &st));
+    EXPECT_EQ(ENOENT, errno);
+
+    umount(merged);
+    rmdir(merged);
+    rmdir(upper_pts);
+    rmdir(upper_dev);
+    rmdir(work);
+    rmdir(lower_dev);
+    rmdir(lower);
+    rmdir(upper);
+    rmdir(root);
+}
+
+TEST(OverlayFsSemantics, BindMountOnOverlayChildUsesNamespacePath) {
+    char root[128] = {};
+    char upper[160] = {};
+    char lower[160] = {};
+    char work[160] = {};
+    char merged[160] = {};
+    char lower_tmp[192] = {};
+    char source[160] = {};
+    char source_file[192] = {};
+    char merged_tmp[192] = {};
+    char mounted_file[224] = {};
+    char options[512] = {};
+
+    snprintf(root, sizeof(root), "/tmp/overlayfs_bind_child_%d", getpid());
+    snprintf(upper, sizeof(upper), "%s/u", root);
+    snprintf(lower, sizeof(lower), "%s/l", root);
+    snprintf(work, sizeof(work), "%s/w", root);
+    snprintf(merged, sizeof(merged), "%s/m", root);
+    snprintf(lower_tmp, sizeof(lower_tmp), "%s/tmp", lower);
+    snprintf(source, sizeof(source), "%s/src", root);
+    snprintf(source_file, sizeof(source_file), "%s/token", source);
+    snprintf(merged_tmp, sizeof(merged_tmp), "%s/tmp", merged);
+    snprintf(mounted_file, sizeof(mounted_file), "%s/token", merged_tmp);
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(root));
+    ASSERT_EQ(0, ensure_dir(upper));
+    ASSERT_EQ(0, ensure_dir(lower));
+    ASSERT_EQ(0, ensure_dir(work));
+    ASSERT_EQ(0, ensure_dir(merged));
+    ASSERT_EQ(0, ensure_dir(source));
+    ASSERT_EQ(0, mkdir(lower_tmp, 0755));
+
+    FILE* fp = fopen(source_file, "w");
+    ASSERT_NE(nullptr, fp) << strerror(errno);
+    ASSERT_EQ(5U, fwrite("token", 1, 5, fp));
+    fclose(fp);
+
+    snprintf(options, sizeof(options), "lowerdir=%s,upperdir=%s,workdir=%s", lower, upper, work);
+    if (mount("overlay", merged, "overlay", 0, options) != 0) {
+        unlink(source_file);
+        rmdir(source);
+        rmdir(merged);
+        rmdir(work);
+        rmdir(lower_tmp);
+        rmdir(lower);
+        rmdir(upper);
+        rmdir(root);
+        GTEST_SKIP() << strerror(errno);
+    }
+
+    ASSERT_EQ(0, mount(source, merged_tmp, nullptr, MS_BIND | MS_REC, nullptr)) << strerror(errno);
+
+    struct stat st = {};
+    ASSERT_EQ(0, stat(mounted_file, &st)) << strerror(errno);
+    EXPECT_TRUE(S_ISREG(st.st_mode));
+
+    umount(merged_tmp);
+    umount(merged);
+    unlink(source_file);
+    rmdir(source);
+    rmdir(merged);
+    rmdir(work);
+    rmdir(lower_tmp);
+    rmdir(lower);
+    rmdir(upper);
+    rmdir(root);
+}
+
+TEST(OverlayFsSemantics, OpenOverlayDirectoryWithoutFsOpenHook) {
+    char root[128] = {};
+    char upper[160] = {};
+    char lower[160] = {};
+    char work[160] = {};
+    char merged[160] = {};
+    char lower_dir[192] = {};
+    char merged_dir[192] = {};
+    char options[512] = {};
+
+    snprintf(root, sizeof(root), "/tmp/overlayfs_open_dir_%d", getpid());
+    snprintf(upper, sizeof(upper), "%s/u", root);
+    snprintf(lower, sizeof(lower), "%s/l", root);
+    snprintf(work, sizeof(work), "%s/w", root);
+    snprintf(merged, sizeof(merged), "%s/m", root);
+    snprintf(lower_dir, sizeof(lower_dir), "%s/dir", lower);
+    snprintf(merged_dir, sizeof(merged_dir), "%s/dir", merged);
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(root));
+    ASSERT_EQ(0, ensure_dir(upper));
+    ASSERT_EQ(0, ensure_dir(lower));
+    ASSERT_EQ(0, ensure_dir(work));
+    ASSERT_EQ(0, ensure_dir(merged));
+    ASSERT_EQ(0, mkdir(lower_dir, 0755));
+
+    snprintf(options, sizeof(options), "lowerdir=%s,upperdir=%s,workdir=%s", lower, upper, work);
+    if (mount("overlay", merged, "overlay", 0, options) != 0) {
+        rmdir(merged);
+        rmdir(work);
+        rmdir(lower_dir);
+        rmdir(lower);
+        rmdir(upper);
+        rmdir(root);
+        GTEST_SKIP() << strerror(errno);
+    }
+
+    int root_fd = open(merged, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    ASSERT_GE(root_fd, 0) << strerror(errno);
+    close(root_fd);
+
+    int child_fd = open(merged_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    ASSERT_GE(child_fd, 0) << strerror(errno);
+    close(child_fd);
+
+    umount(merged);
+    rmdir(merged);
+    rmdir(work);
+    rmdir(lower_dir);
+    rmdir(lower);
+    rmdir(upper);
+    rmdir(root);
+}
+
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

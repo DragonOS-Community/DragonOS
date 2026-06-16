@@ -170,8 +170,8 @@ fn resolve_pivot_root_targets(
         return Err(SystemError::EINVAL);
     }
 
-    let old_new_root_path = new_root_inode.absolute_path()?;
-    let put_old_path_before = put_old_inode.absolute_path()?;
+    let old_new_root_path = resolved_visible_path(&new_root_path, &new_root_inode)?;
+    let put_old_path_before = resolved_visible_path(&put_old_path, &put_old_inode)?;
     let new_put_old_path = put_old_path_before
         .strip_prefix(&old_new_root_path)
         .map(normalize_visible_path)
@@ -234,6 +234,47 @@ fn same_path_ref(left: &Arc<dyn IndexNode>, right: &Arc<dyn IndexNode>) -> bool 
     };
 
     Arc::ptr_eq(&left.fs(), &right.fs()) && left_meta.inode_id == right_meta.inode_id
+}
+
+fn resolved_visible_path(
+    requested_path: &str,
+    inode: &Arc<dyn IndexNode>,
+) -> Result<String, SystemError> {
+    match inode.absolute_path() {
+        Ok(path) => Ok(path),
+        Err(SystemError::ENOSYS) => Ok(normalize_requested_path(requested_path)),
+        Err(err) => Err(err),
+    }
+}
+
+fn normalize_requested_path(path: &str) -> String {
+    let base = if path.starts_with('/') {
+        String::from("/")
+    } else {
+        ProcessManager::current_pcb().basic().cwd()
+    };
+
+    let mut components: Vec<&str> = base.split('/').filter(|part| !part.is_empty()).collect();
+    for component in path.split('/').filter(|part| !part.is_empty()) {
+        match component {
+            "." => {}
+            ".." => {
+                components.pop();
+            }
+            _ => components.push(component),
+        }
+    }
+
+    if components.is_empty() {
+        return String::from("/");
+    }
+
+    let mut normalized = String::new();
+    for component in components {
+        normalized.push('/');
+        normalized.push_str(component);
+    }
+    normalized
 }
 
 fn repair_same_namespace_fs_refs(

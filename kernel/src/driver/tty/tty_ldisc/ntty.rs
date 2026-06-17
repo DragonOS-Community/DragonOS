@@ -1961,13 +1961,14 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         ldata.icanon = termios.local_mode.contains(LocalMode::ICANON);
 
         // 设置回显
-        if termios.local_mode.contains(LocalMode::ECHO) {
-            ldata.echo = true;
-        }
+        ldata.echo = termios.local_mode.contains(LocalMode::ECHO);
 
         if termios.input_mode.contains(InputMode::ISTRIP)
             || termios.input_mode.contains(InputMode::IUCLC)
             || termios.input_mode.contains(InputMode::IGNCR)
+            || termios.input_mode.contains(InputMode::ICRNL)
+            || termios.input_mode.contains(InputMode::INLCR)
+            || termios.local_mode.contains(LocalMode::ICANON)
             || termios.input_mode.contains(InputMode::IXON)
             || termios.local_mode.contains(LocalMode::ISIG)
             || termios.local_mode.contains(LocalMode::ECHO)
@@ -2047,7 +2048,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
 
             ldata
                 .char_map
-                .set(ControlCharIndex::DISABLE_CHAR as usize, true);
+                .set(ControlCharIndex::DISABLE_CHAR as usize, false);
             ldata.raw = false;
             ldata.real_raw = false;
         } else {

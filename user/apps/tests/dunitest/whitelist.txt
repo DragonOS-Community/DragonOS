@@ -54,6 +54,7 @@ normal/devtmpfs_semantics
 normal/mknod_socket
 normal/pmem_block
 normal/pipe_release_wakeup
+normal/pipe_waitqueue_wakeup
 normal/tty_pty_hangup
 normal/cubesandbox_pty_exec_chain
 normal/eventfd_pending_signal

@@ -18,6 +18,7 @@ normal/test_fchown_o_path
 normal/proc_self_limits
 normal/proc_fd_devfs_readlink
 normal/mlock_semantics
+normal/mmap_truncate_cow
 normal/sched_affinity
 normal/sync_file_range
 normal/splice_concurrent_io

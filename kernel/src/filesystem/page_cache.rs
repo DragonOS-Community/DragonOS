@@ -96,6 +96,17 @@ impl MmFilePageGroup {
     }
 }
 
+/// Policy for zapping page-cache backed file mappings.
+///
+/// This mirrors Linux's `unmap_mapping_pages(..., even_cows)`: cache invalidation
+/// must preserve private COW data, while truncate must also drop COWed private
+/// PTEs so future access faults against the new file size.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnmapMappingMode {
+    CacheOnly,
+    EvenCow,
+}
+
 lazy_static! {
     static ref PAGECACHE_IO_WQS: Vec<Arc<WorkQueue>> = {
         let mut wqs = Vec::new();
@@ -1584,6 +1595,31 @@ impl PageCache {
         start_page_index: usize,
         end_page_index_exclusive: Option<usize>,
     ) -> Result<(), SystemError> {
+        self.unmap_mapping_pages_with_mode(
+            start_page_index,
+            end_page_index_exclusive,
+            UnmapMappingMode::CacheOnly,
+        )
+    }
+
+    pub fn unmap_mapping_pages_even_cow(
+        &self,
+        start_page_index: usize,
+        end_page_index_exclusive: Option<usize>,
+    ) -> Result<(), SystemError> {
+        self.unmap_mapping_pages_with_mode(
+            start_page_index,
+            end_page_index_exclusive,
+            UnmapMappingMode::EvenCow,
+        )
+    }
+
+    fn unmap_mapping_pages_with_mode(
+        &self,
+        start_page_index: usize,
+        end_page_index_exclusive: Option<usize>,
+        mode: UnmapMappingMode,
+    ) -> Result<(), SystemError> {
         loop {
             let (seq, snapshot) =
                 self.collect_file_vmas_snapshot(Some((start_page_index, end_page_index_exclusive)));
@@ -1610,7 +1646,7 @@ impl PageCache {
                 let _pt_edit = group.mm.page_table_edit();
                 let mut tlb = MmuGather::gather(&group.mm);
                 for (vma, region) in group.ranges {
-                    vma.unmap_range(region, &mm_guard.user_mapper.utable, &mut tlb);
+                    vma.unmap_range(region, &mm_guard.user_mapper.utable, &mut tlb, mode);
                 }
                 tlb.finish();
             }
@@ -1630,7 +1666,7 @@ impl PageCache {
 
     fn truncate_locked(&self, new_size: usize) -> Result<(), SystemError> {
         let hole_start_page = page_align_up(new_size) >> MMArch::PAGE_SHIFT;
-        self.unmap_mapping_pages(hole_start_page, None)?;
+        self.unmap_mapping_pages_even_cow(hole_start_page, None)?;
 
         let first_full_truncate_page = page_align_up(new_size) >> MMArch::PAGE_SHIFT;
         let truncate_indices: Vec<usize> = {
@@ -1714,7 +1750,7 @@ impl PageCache {
             }
         }
 
-        self.unmap_mapping_pages(hole_start_page, None)?;
+        self.unmap_mapping_pages_even_cow(hole_start_page, None)?;
 
         Ok(())
     }

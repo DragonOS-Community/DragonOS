@@ -23,9 +23,12 @@ use system_error::SystemError;
 use crate::{
     arch::{mm::PageMapper, CurrentIrqArch, MMArch},
     exception::InterruptArch,
-    filesystem::vfs::{
-        file::{File, FileMode},
-        FileType, InodeId,
+    filesystem::{
+        page_cache::UnmapMappingMode,
+        vfs::{
+            file::{File, FileMode},
+            FileType, InodeId,
+        },
     },
     ipc::shm::{ShmFlags, ShmId},
     libs::{
@@ -2479,7 +2482,13 @@ impl LockedVMA {
     ///
     /// This is used by file truncate/invalidate paths: future access should fault back in against
     /// the updated file size/content instead of tearing down the VMA object.
-    pub fn unmap_range(&self, region: VirtRegion, mapper: &PageMapper, tlb: &mut MmuGather<'_>) {
+    pub fn unmap_range(
+        &self,
+        region: VirtRegion,
+        mapper: &PageMapper,
+        tlb: &mut MmuGather<'_>,
+        mode: UnmapMappingMode,
+    ) {
         let self_guard = self.lock();
         let Some(intersection) = self_guard.region().intersect(&region) else {
             return;
@@ -2505,15 +2514,19 @@ impl LockedVMA {
                 };
                 let pgoff = base_pgoff + ((virt.data() - vma_start.data()) >> MMArch::PAGE_SHIFT);
                 let page_guard = page_arc.read();
-                let is_file_cache_page = match page_guard.page_type() {
+                let is_target_page = match page_guard.page_type() {
                     PageType::File(info) if info.index == pgoff => info
                         .page_cache
                         .upgrade()
                         .is_some_and(|mapped_cache| Arc::ptr_eq(&mapped_cache, page_cache)),
+                    // Truncate must also zap private COW pages. For file VMAs those pages are
+                    // represented as normal pages, while shared file mappings remain page-cache
+                    // backed and are covered by the PageType::File branch above.
+                    PageType::Normal if mode == UnmapMappingMode::EvenCow => true,
                     _ => false,
                 };
                 drop(page_guard);
-                if !is_file_cache_page {
+                if !is_target_page {
                     continue;
                 }
             }

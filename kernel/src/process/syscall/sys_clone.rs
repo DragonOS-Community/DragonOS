@@ -53,6 +53,9 @@ impl Syscall for SysClone {
         let mut clone_args = KernelCloneArgs::new();
         clone_args.flags = flags;
         clone_args.stack = stack;
+        // legacy clone() 复用 parent_tid 作为 CLONE_PIDFD 的输出地址；
+        // clone3() 则通过独立的 pidfd 字段传入。
+        clone_args.pidfd = parent_tid;
         clone_args.parent_tid = parent_tid;
         clone_args.child_tid = child_tid;
         clone_args.tls = tls;

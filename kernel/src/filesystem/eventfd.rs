@@ -264,19 +264,22 @@ impl IndexNode for EventFdInode {
         if val == u64::MAX {
             return Err(SystemError::EINVAL);
         }
+        let pollflag;
         loop {
+            let mut eventfd = self.eventfd.lock();
+            // Allow write when count + val <= EVENTFD_MAX.
+            if EVENTFD_MAX.saturating_sub(eventfd.count) >= val {
+                eventfd.count += val;
+                pollflag =
+                    EPollEventType::from_bits_truncate(self.do_poll(&data, &eventfd)? as u32);
+                break;
+            }
+            if eventfd.flags.contains(EventFdFlags::EFD_NONBLOCK) {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+            drop(eventfd);
             if ProcessManager::current_pcb().has_pending_signal() {
                 return Err(SystemError::ERESTARTSYS);
-            }
-            {
-                let eventfd = self.eventfd.lock();
-                // Allow write when count + val <= EVENTFD_MAX.
-                if EVENTFD_MAX.saturating_sub(eventfd.count) >= val {
-                    break;
-                }
-                if eventfd.flags.contains(EventFdFlags::EFD_NONBLOCK) {
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                }
             }
             // 等待计数下降（被 read 消费）
             self.wait_queue.wait_event_interruptible(
@@ -287,14 +290,7 @@ impl IndexNode for EventFdInode {
                 None::<fn()>,
             )?;
         }
-        let mut eventfd = self.eventfd.lock();
-        eventfd.count += val;
-        drop(eventfd);
         self.wait_queue.wakeup_all(None);
-
-        let eventfd = self.eventfd.lock();
-        let pollflag = EPollEventType::from_bits_truncate(self.do_poll(&data, &eventfd)? as u32);
-        drop(eventfd);
 
         // 唤醒epoll中等待的进程
         EventPoll::wakeup_epoll(&self.epitems, pollflag)?;

@@ -636,6 +636,12 @@ impl FileSystem for FuseFS {
             .map(|cache| !cache.is_page_ready(page_index))
             .unwrap_or(true);
 
+        if major {
+            let mut ra_state = file.get_ra_state();
+            let _ = node.mmap_readahead_with_open(page_index, 1, &mut ra_state, fh, file_flags);
+            let _ = file.set_ra_state(ra_state);
+        }
+
         match node.fault_page_with_open(page_index, fh, file_flags) {
             Ok(page) => {
                 pfm.set_page(page);
@@ -709,8 +715,7 @@ impl FileSystem for FuseFS {
         start_pgoff: usize,
         end_pgoff: usize,
     ) -> VmFaultReason {
-        let _ = (pfm, start_pgoff, end_pgoff);
-        VmFaultReason::VM_FAULT_SIGBUS
+        PageFaultHandler::filemap_map_pages(pfm, start_pgoff, end_pgoff)
     }
 
     fn on_umount(&self) {

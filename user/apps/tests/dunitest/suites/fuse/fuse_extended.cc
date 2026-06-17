@@ -6,6 +6,7 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
 
 #include "fuse_gtest_common.h"
 
@@ -239,6 +240,332 @@ static int ext_test_p2_ops() {
 fail:
     umount(mp);
 fail_no_umount:
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_positive_lookup_cache_respects_entry_ttl() {
+    const char *mp = "/tmp/test_fuse_lookup_cache";
+    char hello[256];
+    char missing[256];
+    struct stat st;
+    char buf[32];
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t lookup_count = 0;
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.lookup_count = &lookup_count;
+    args.entry_valid_sec = 60;
+    args.attr_valid_sec = 60;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(hello, sizeof(hello), "%s/hello.txt", mp);
+    for (int i = 0; i < 3; ++i) {
+        if (stat(hello, &st) != 0) {
+            printf("[FAIL] stat hello iteration %d: %s (errno=%d)\n", i, strerror(errno), errno);
+            goto fail;
+        }
+        int f = open(hello, O_RDONLY);
+        if (f < 0) {
+            printf("[FAIL] open hello iteration %d: %s (errno=%d)\n", i, strerror(errno), errno);
+            goto fail;
+        }
+        ssize_t n = read(f, buf, sizeof(buf));
+        int saved_errno = errno;
+        close(f);
+        if (n <= 0) {
+            errno = saved_errno;
+            printf("[FAIL] read hello iteration %d: %s (errno=%d)\n", i, strerror(errno), errno);
+            goto fail;
+        }
+    }
+
+    if (lookup_count != 1) {
+        printf("[FAIL] positive lookup cache expected 1 lookup, got %u\n", lookup_count);
+        goto fail;
+    }
+
+    snprintf(missing, sizeof(missing), "%s/missing.txt", mp);
+    for (int i = 0; i < 2; ++i) {
+        if (stat(missing, &st) == 0 || errno != ENOENT) {
+            printf("[FAIL] stat missing iteration %d expected ENOENT, errno=%d (%s)\n", i,
+                   errno, strerror(errno));
+            goto fail;
+        }
+    }
+
+    if (lookup_count != 3) {
+        printf("[FAIL] ordinary ENOENT should not be long-term cached, lookup_count=%u\n",
+               lookup_count);
+        goto fail;
+    }
+
+    if (umount(mp) != 0) {
+        printf("[FAIL] umount(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        goto fail_no_umount;
+    }
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    umount(mp);
+fail_no_umount:
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_xattr_ops() {
+    const char *mp = "/tmp/test_fuse_xattr";
+    char path[256];
+    char list[64] = {};
+    char small[4] = {};
+    char value[64] = {};
+    ssize_t n = 0;
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t getxattr_count = 0;
+    volatile uint32_t setxattr_count = 0;
+    volatile uint32_t listxattr_count = 0;
+    volatile uint32_t removexattr_count = 0;
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.getxattr_count = &getxattr_count;
+    args.setxattr_count = &setxattr_count;
+    args.listxattr_count = &listxattr_count;
+    args.removexattr_count = &removexattr_count;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    errno = 0;
+    n = listxattr(path, NULL, 0);
+    if (n <= 0) {
+        printf("[FAIL] listxattr size returned %zd errno=%d (%s)\n", n, errno, strerror(errno));
+        goto fail;
+    }
+    n = listxattr(path, list, sizeof(list));
+    if (n <= 0 || memcmp(list, "user.dragonos", sizeof("user.dragonos")) != 0) {
+        printf("[FAIL] listxattr value n=%zd first='%s' errno=%d\n", n, list, errno);
+        goto fail;
+    }
+    if (listxattr_count != 2) {
+        printf("[FAIL] listxattr_count=%u expected=2\n", listxattr_count);
+        goto fail;
+    }
+
+    n = getxattr(path, "user.dragonos", NULL, 0);
+    if (n != (ssize_t)strlen("virtiofs-xattr")) {
+        printf("[FAIL] getxattr size n=%zd errno=%d (%s)\n", n, errno, strerror(errno));
+        goto fail;
+    }
+    errno = 0;
+    if (getxattr(path, "user.dragonos", small, sizeof(small)) != -1 || errno != ERANGE) {
+        printf("[FAIL] getxattr small buffer errno=%d expected=%d\n", errno, ERANGE);
+        goto fail;
+    }
+    n = getxattr(path, "user.dragonos", value, sizeof(value));
+    if (n != (ssize_t)strlen("virtiofs-xattr") ||
+        memcmp(value, "virtiofs-xattr", strlen("virtiofs-xattr")) != 0) {
+        printf("[FAIL] getxattr value n=%zd value='%s' errno=%d\n", n, value, errno);
+        goto fail;
+    }
+    if (getxattr_count != 3) {
+        printf("[FAIL] getxattr_count=%u expected=3\n", getxattr_count);
+        goto fail;
+    }
+
+    if (setxattr(path, "user.dragonos", "new", 3, 0) != 0) {
+        printf("[FAIL] setxattr failed errno=%d (%s)\n", errno, strerror(errno));
+        goto fail;
+    }
+    if (removexattr(path, "user.dragonos") != 0) {
+        printf("[FAIL] removexattr failed errno=%d (%s)\n", errno, strerror(errno));
+        goto fail;
+    }
+    if (setxattr_count != 1 || removexattr_count != 1) {
+        printf("[FAIL] set/remove counts set=%u remove=%u\n", setxattr_count, removexattr_count);
+        goto fail;
+    }
+
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_xattr_enosys_is_cached() {
+    const char *mp = "/tmp/test_fuse_xattr_enosys";
+    char path[256];
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t listxattr_count = 0;
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.listxattr_count = &listxattr_count;
+    args.force_xattr_enosys = 1;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    for (int i = 0; i < 2; ++i) {
+        errno = 0;
+        if (listxattr(path, NULL, 0) != -1 ||
+            (errno != EOPNOTSUPP && errno != ENOTSUP)) {
+            printf("[FAIL] listxattr ENOSYS cache iter=%d errno=%d (%s)\n", i, errno,
+                   strerror(errno));
+            goto fail;
+        }
+    }
+    if (listxattr_count != 1) {
+        printf("[FAIL] listxattr ENOSYS should be cached, count=%u\n", listxattr_count);
+        goto fail;
+    }
+
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    umount(mp);
     stop = 1;
     close(fd);
     pthread_join(th, NULL);
@@ -3350,6 +3677,131 @@ fail:
     return -1;
 }
 
+static int ext_test_mmap_fault_batches_readaround_pages() {
+    const char *mp = "/tmp/test_fuse_mmap_readaround";
+    const size_t page_size = 4096;
+    const size_t page_count = 8;
+    const size_t map_len = page_size * page_count;
+    char path[256];
+    int f = -1;
+    void *addr = MAP_FAILED;
+    volatile unsigned int checksum = 0;
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t read_count = 0;
+    volatile uint64_t read_offsets[8] = {0};
+    volatile uint32_t read_sizes[8] = {0};
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.read_count = &read_count;
+    args.read_offsets = read_offsets;
+    args.read_sizes = read_sizes;
+    args.read_trace_capacity = 8;
+    args.hello_generated_size_override = map_len;
+    args.init_out_max_write_override = map_len;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0,max_read=32768",
+             fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    f = open(path, O_RDONLY);
+    if (f < 0) {
+        printf("[FAIL] open(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+    addr = mmap(NULL, map_len, PROT_READ, MAP_PRIVATE, f, 0);
+    if (addr == MAP_FAILED) {
+        printf("[FAIL] mmap(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+
+    for (size_t i = 0; i < page_count; i++) {
+        size_t offset = i * page_size;
+        unsigned char c = ((volatile unsigned char *)addr)[offset];
+        unsigned char expected = (unsigned char)('A' + (offset % 26));
+        if (c != expected) {
+            printf("[FAIL] mmap data mismatch page=%zu got=%u expected=%u read_count=%u\n", i, c,
+                   expected, read_count);
+            goto fail;
+        }
+        checksum += c;
+    }
+    if (checksum == 0) {
+        printf("[FAIL] checksum unexpectedly zero\n");
+        goto fail;
+    }
+
+    if (read_count != 1 || read_offsets[0] != 0 || read_sizes[0] != map_len) {
+        printf("[FAIL] mmap readaround not batched: count=%u off0=%llu size0=%u off1=%llu size1=%u\n",
+               read_count, (unsigned long long)read_offsets[0], read_sizes[0],
+               (unsigned long long)read_offsets[1], read_sizes[1]);
+        goto fail;
+    }
+
+    munmap(addr, map_len);
+    addr = MAP_FAILED;
+    close(f);
+    f = -1;
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (addr != MAP_FAILED) {
+        munmap(addr, map_len);
+    }
+    if (f >= 0) {
+        close(f);
+    }
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
 static int ext_test_direct_io_read_bypasses_page_cache() {
     const char *mp = "/tmp/test_fuse_direct_read";
     char path[256];
@@ -6142,6 +6594,18 @@ TEST(FuseExtended, OpsAccessCreateSymlinkLinkRename2FlushFsync) {
     ASSERT_EQ(0, ext_test_p2_ops());
 }
 
+TEST(FuseExtended, PositiveLookupCacheRespectsEntryTtl) {
+    ASSERT_EQ(0, ext_test_positive_lookup_cache_respects_entry_ttl());
+}
+
+TEST(FuseExtended, XattrOps) {
+    ASSERT_EQ(0, ext_test_xattr_ops());
+}
+
+TEST(FuseExtended, XattrEnosysIsCached) {
+    ASSERT_EQ(0, ext_test_xattr_enosys_is_cached());
+}
+
 TEST(FuseExtended, InterruptDeliversFuseInterrupt) {
     ASSERT_EQ(0, ext_test_p3_interrupt());
 }
@@ -6176,6 +6640,10 @@ TEST(FuseExtended, MmapSeesWriteThroughUpdate) {
 
 TEST(FuseExtended, MmapFaultUsesOpenFhWithoutExtraOpen) {
     ASSERT_EQ(0, ext_test_mmap_fault_uses_open_fh_without_extra_open());
+}
+
+TEST(FuseExtended, DISABLED_MmapFaultBatchesReadaroundPages) {
+    ASSERT_EQ(0, ext_test_mmap_fault_batches_readaround_pages());
 }
 
 TEST(FuseExtended, DirectIoReadBypassesPageCache) {

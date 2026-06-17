@@ -403,8 +403,6 @@ impl X86_64MMArch {
                         address.data(),
                         flags
                     );
-                    log::error!("fault rip: {:#x}", regs.rip);
-
                     // 地址不在VMA范围内，检查是否需要异常表修复
                     if handle_kernel_access_failed(regs) {
                         return; // 已通过异常表修复

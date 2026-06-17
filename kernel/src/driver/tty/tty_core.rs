@@ -11,7 +11,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::ipc::signal::Signal,
-    driver::{base::device::device_number::DeviceNumber, tty::pty::ptm_driver},
+    driver::base::device::device_number::DeviceNumber,
     filesystem::epoll::{event_poll::LockedEPItemLinkedList, EPollEventType, EPollItem},
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
@@ -40,14 +40,6 @@ pub struct TtyCore {
     core: TtyCoreData,
     /// 线路规程函数集
     line_discipline: Arc<dyn TtyLineDiscipline>,
-}
-
-impl Drop for TtyCore {
-    fn drop(&mut self) {
-        if self.core.driver().tty_driver_sub_type() == TtyDriverSubType::PtySlave {
-            ptm_driver().ttys().remove(&self.core().index);
-        }
-    }
 }
 
 impl TtyCore {
@@ -420,6 +412,10 @@ impl TtyCoreData {
     #[inline]
     pub fn flags_write(&self) -> RwLockWriteGuard<'_, TtyFlag> {
         self.flags.write_irqsave()
+    }
+
+    pub fn private_fields(&self) -> Option<Arc<dyn TtyCorePrivateField>> {
+        self.privete_fields.lock().clone()
     }
 
     #[inline]

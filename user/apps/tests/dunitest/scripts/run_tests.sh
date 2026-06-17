@@ -13,7 +13,11 @@ BIN_DIR="$BASE_DIR/bin"
 RESULTS="$BASE_DIR/results"
 
 echo "[dunit] start running tests..."
-"$RUNNER" --bin-dir "$BIN_DIR" --results-dir "$RESULTS"
+if [ "${DUNITEST_PATTERN:-}" != "" ]; then
+    "$RUNNER" --bin-dir "$BIN_DIR" --results-dir "$RESULTS" --pattern "$DUNITEST_PATTERN"
+else
+    "$RUNNER" --bin-dir "$BIN_DIR" --results-dir "$RESULTS"
+fi
 status=$?
 echo "[dunit] 测试完成, status=$status"
 exit $status

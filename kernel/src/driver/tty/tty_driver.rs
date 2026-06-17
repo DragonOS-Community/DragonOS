@@ -336,7 +336,15 @@ impl TtyDriver {
             tty.set_port(ports[core.index()].clone());
         }
         // log::debug!("init_tty_device: to ldisc_setup");
-        TtyLdiscManager::ldisc_setup(tty.clone(), tty.core().link())?;
+        if let Err(err) = TtyLdiscManager::ldisc_setup(tty.clone(), tty.core().link()) {
+            if self.tty_driver_type == TtyDriverType::Pty {
+                self.ttys.lock().remove(&idx);
+                if let Some(other_driver) = self.other_pty_driver() {
+                    other_driver.ttys().remove(&idx);
+                }
+            }
+            return Err(err);
+        }
 
         // 对 PTY 来说，用户可见的设备节点由 devpts 挂载点下的动态节点提供，
         // 不应再向全局 devfs 注册（否则在新实例复用索引时会因已有的 ptm/ptsX 节点返回 EEXIST）。

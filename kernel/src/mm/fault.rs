@@ -423,8 +423,8 @@ impl PageFaultHandler {
         let mapper = &mut pfm.mapper;
 
         let mut page_manager_guard = page_manager_lock();
-        if let Ok(page) =
-            page_manager_guard.copy_page(&cache_page.phys_address(), mapper.allocator_mut())
+        if let Ok(page) = page_manager_guard
+            .copy_page_as_normal(&cache_page.phys_address(), mapper.allocator_mut())
         {
             pfm.cow_page = Some(page.clone());
         } else {
@@ -668,7 +668,7 @@ impl PageFaultHandler {
             // 私有文件映射，必须拷贝页面
             let new_page = {
                 let mut page_manager_guard = page_manager_lock();
-                match page_manager_guard.copy_page(&old_paddr, mapper.allocator_mut()) {
+                match page_manager_guard.copy_page_as_normal(&old_paddr, mapper.allocator_mut()) {
                     Ok(page) => page,
                     Err(_) => return VmFaultReason::VM_FAULT_OOM,
                 }
@@ -815,9 +815,12 @@ impl PageFaultHandler {
                         VirtAddr::new(addr.data() + ((pgoff - start_pgoff) << MMArch::PAGE_SHIFT));
                     if mapper.get_entry(address, 0).is_none() {
                         let mut flags = vma_guard.flags();
-                        if vma_guard
-                            .vm_flags()
-                            .contains(VmFlags::VM_SHARED | VmFlags::VM_WRITE)
+                        let is_private_file_vma = vma_guard.vm_file().is_some()
+                            && !vma_guard.vm_flags().contains(VmFlags::VM_SHARED);
+                        if is_private_file_vma
+                            || vma_guard
+                                .vm_flags()
+                                .contains(VmFlags::VM_SHARED | VmFlags::VM_WRITE)
                         {
                             flags = flags.set_write(false);
                         }
@@ -981,9 +984,9 @@ impl PageFaultHandler {
         let _pt_edit = mm.page_table_edit();
         let mapper = &mut pfm.mapper;
 
-        let page_to_map = if flags.contains(FaultFlags::FAULT_FLAG_WRITE)
-            && !vma_guard.vm_flags().contains(VmFlags::VM_SHARED)
-        {
+        let is_private_file_vma =
+            vma_guard.vm_file().is_some() && !vma_guard.vm_flags().contains(VmFlags::VM_SHARED);
+        let page_to_map = if flags.contains(FaultFlags::FAULT_FLAG_WRITE) && is_private_file_vma {
             // 私有文件映射的写时复制
             cow_page.expect("no cow_page in PageFaultMessage")
         } else {
@@ -995,9 +998,10 @@ impl PageFaultHandler {
         let mlocked = vma_guard.vm_flags().contains(VmFlags::VM_LOCKED);
 
         let mut map_flags = vma_guard.flags();
-        if vma_guard
-            .vm_flags()
-            .contains(VmFlags::VM_SHARED | VmFlags::VM_WRITE)
+        if (is_private_file_vma
+            || vma_guard
+                .vm_flags()
+                .contains(VmFlags::VM_SHARED | VmFlags::VM_WRITE))
             && !flags.contains(FaultFlags::FAULT_FLAG_WRITE)
         {
             map_flags = map_flags.set_write(false);

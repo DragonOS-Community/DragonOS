@@ -1,4 +1,5 @@
 use alloc::{
+    collections::BTreeMap,
     string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
@@ -27,7 +28,7 @@ use crate::{
         casting::DowncastArc,
         mutex::{Mutex, MutexGuard},
     },
-    mm::MemoryManagementArch,
+    mm::{readahead::FileReadaheadState, MemoryManagementArch},
     time::PosixTimeSpec,
 };
 
@@ -40,16 +41,17 @@ use super::{
     protocol::{
         fuse_pack_struct, fuse_read_struct, FuseAccessIn, FuseAttr, FuseAttrOut, FuseCreateIn,
         FuseDirent, FuseDirentPlus, FuseEntryOut, FuseFallocateIn, FuseFlushIn, FuseFsyncIn,
-        FuseGetattrIn, FuseLinkIn, FuseMkdirIn, FuseMknodIn, FuseOpenIn, FuseOpenOut, FuseReadIn,
-        FuseReleaseIn, FuseRename2In, FuseRenameIn, FuseSetattrIn, FuseWriteIn, FuseWriteOut,
-        FATTR_ATIME, FATTR_CTIME, FATTR_FH, FATTR_GID, FATTR_LOCKOWNER, FATTR_MODE, FATTR_MTIME,
-        FATTR_SIZE, FATTR_UID, FOPEN_DIRECT_IO, FOPEN_KEEP_CACHE, FOPEN_NOFLUSH, FOPEN_NONSEEKABLE,
-        FOPEN_STREAM, FUSE_ACCESS, FUSE_CREATE, FUSE_FALLOCATE, FUSE_FLUSH, FUSE_FSYNC,
-        FUSE_FSYNCDIR, FUSE_FSYNC_FDATASYNC, FUSE_GETATTR, FUSE_LINK, FUSE_LOOKUP, FUSE_MKDIR,
-        FUSE_MKNOD, FUSE_OPEN, FUSE_OPENDIR, FUSE_READ, FUSE_READDIR, FUSE_READDIRPLUS,
-        FUSE_READLINK, FUSE_READ_LOCKOWNER, FUSE_RELEASE, FUSE_RELEASEDIR, FUSE_RENAME,
-        FUSE_RENAME2, FUSE_RMDIR, FUSE_ROOT_ID, FUSE_SETATTR, FUSE_SYMLINK, FUSE_UNLINK,
-        FUSE_WRITE, FUSE_WRITE_CACHE, FUSE_WRITE_LOCKOWNER,
+        FuseGetattrIn, FuseGetxattrIn, FuseGetxattrOut, FuseLinkIn, FuseMkdirIn, FuseMknodIn,
+        FuseOpenIn, FuseOpenOut, FuseReadIn, FuseReleaseIn, FuseRename2In, FuseRenameIn,
+        FuseSetattrIn, FuseSetxattrInCompat, FuseWriteIn, FuseWriteOut, FATTR_ATIME, FATTR_CTIME,
+        FATTR_FH, FATTR_GID, FATTR_LOCKOWNER, FATTR_MODE, FATTR_MTIME, FATTR_SIZE, FATTR_UID,
+        FOPEN_DIRECT_IO, FOPEN_KEEP_CACHE, FOPEN_NOFLUSH, FOPEN_NONSEEKABLE, FOPEN_STREAM,
+        FUSE_ACCESS, FUSE_CREATE, FUSE_FALLOCATE, FUSE_FLUSH, FUSE_FSYNC, FUSE_FSYNCDIR,
+        FUSE_FSYNC_FDATASYNC, FUSE_GETATTR, FUSE_GETXATTR, FUSE_LINK, FUSE_LISTXATTR, FUSE_LOOKUP,
+        FUSE_MKDIR, FUSE_MKNOD, FUSE_OPEN, FUSE_OPENDIR, FUSE_READ, FUSE_READDIR, FUSE_READDIRPLUS,
+        FUSE_READLINK, FUSE_READ_LOCKOWNER, FUSE_RELEASE, FUSE_RELEASEDIR, FUSE_REMOVEXATTR,
+        FUSE_RENAME, FUSE_RENAME2, FUSE_RMDIR, FUSE_ROOT_ID, FUSE_SETATTR, FUSE_SETXATTR,
+        FUSE_SYMLINK, FUSE_UNLINK, FUSE_WRITE, FUSE_WRITE_CACHE, FUSE_WRITE_LOCKOWNER,
     },
 };
 
@@ -65,6 +67,7 @@ pub struct FuseNode {
     cached_metadata: Mutex<Option<Metadata>>,
     page_cache: Mutex<Option<Arc<PageCache>>>,
     writeback_handles: Mutex<Vec<Arc<FuseWritebackHandle>>>,
+    lookup_cache: Mutex<BTreeMap<String, FuseLookupCacheEntry>>,
     direct_io_lock: Mutex<()>,
     cached_metadata_deadline_ns: AtomicU64,
     lookup_count: AtomicU64,
@@ -73,6 +76,13 @@ pub struct FuseNode {
     /// LOOKUP 返回的 generation，用于检测 virtiofsd 复用 nodeid。
     generation: AtomicU64,
     stale: AtomicBool,
+}
+
+#[derive(Debug, Clone)]
+struct FuseLookupCacheEntry {
+    child: Weak<FuseNode>,
+    generation: u64,
+    deadline_ns: u64,
 }
 
 #[derive(Debug)]
@@ -114,6 +124,9 @@ impl PageCacheBackend for FusePageCacheBackend {
 
 impl FuseNode {
     const FUSE_DIRENT_ALIGN: usize = 8;
+    const LOOKUP_CACHE_MAX_ENTRIES: usize = 1024;
+    const XATTR_SIZE_MAX: usize = 65536;
+    const XATTR_LIST_MAX: usize = 65536;
 
     pub fn new(
         fs: Weak<FuseFS>,
@@ -135,6 +148,7 @@ impl FuseNode {
             cached_metadata: Mutex::new(cached),
             page_cache: Mutex::new(None),
             writeback_handles: Mutex::new(Vec::new()),
+            lookup_cache: Mutex::new(BTreeMap::new()),
             direct_io_lock: Mutex::new(()),
             cached_metadata_deadline_ns: AtomicU64::new(if has_cached { u64::MAX } else { 0 }),
             lookup_count: AtomicU64::new(0),
@@ -264,6 +278,73 @@ impl FuseNode {
             .saturating_mul(1_000_000_000)
             .saturating_add(valid_nsec as u64);
         Self::now_ns().saturating_add(delta_ns)
+    }
+
+    fn cache_lookup_child(
+        &self,
+        name: &str,
+        child: &Arc<FuseNode>,
+        generation: u64,
+        valid: u64,
+        valid_nsec: u32,
+    ) {
+        let deadline_ns = Self::cache_deadline(valid, valid_nsec);
+        let mut cache = self.lookup_cache.lock();
+        if deadline_ns == 0 {
+            cache.remove(name);
+            return;
+        }
+        if !cache.contains_key(name) && cache.len() >= Self::LOOKUP_CACHE_MAX_ENTRIES {
+            if let Some(victim) = cache.keys().next().cloned() {
+                cache.remove(&victim);
+            }
+        }
+        cache.insert(
+            name.to_string(),
+            FuseLookupCacheEntry {
+                child: Arc::downgrade(child),
+                generation,
+                deadline_ns,
+            },
+        );
+    }
+
+    fn invalidate_lookup_cache(&self, name: &str) {
+        self.lookup_cache.lock().remove(name);
+    }
+
+    fn invalidate_child_name(&self, name: &str) {
+        self.invalidate_lookup_cache(name);
+        if let Some(child) = self
+            .fs
+            .upgrade()
+            .and_then(|fs| fs.find_cached_child(self.nodeid, name))
+        {
+            child.clear_dname_if(name);
+        }
+    }
+
+    fn lookup_cached_child(&self, name: &str) -> Option<Arc<FuseNode>> {
+        let now = Self::now_ns();
+        let mut cache = self.lookup_cache.lock();
+        let entry = cache.get(name).cloned()?;
+        if entry.deadline_ns != u64::MAX && now >= entry.deadline_ns {
+            cache.remove(name);
+            return None;
+        }
+        let Some(child) = entry.child.upgrade() else {
+            cache.remove(name);
+            return None;
+        };
+        if child.check_not_stale().is_err()
+            || child.generation() != entry.generation
+            || child.parent_fuse_nodeid() != self.nodeid
+            || !child.has_dname(name)
+        {
+            cache.remove(name);
+            return None;
+        }
+        Some(child)
     }
 
     pub(crate) fn conn(&self) -> &Arc<FuseConn> {
@@ -408,6 +489,25 @@ impl FuseNode {
         payload.extend_from_slice(name.as_bytes());
         payload.push(0);
         payload
+    }
+
+    fn fuse_xattr_unsupported(&self, opcode: u32) -> SystemError {
+        self.conn.mark_no_xattr(opcode);
+        SystemError::EOPNOTSUPP_OR_ENOTSUP
+    }
+
+    fn verify_xattr_list(list: &[u8]) -> Result<(), SystemError> {
+        let mut idx = 0usize;
+        while idx < list.len() {
+            let Some(end) = list[idx..].iter().position(|b| *b == 0) else {
+                return Err(SystemError::EIO);
+            };
+            if end == 0 {
+                return Err(SystemError::EIO);
+            }
+            idx += end + 1;
+        }
+        Ok(())
     }
 
     fn pack_two_names_payload(first: &str, second: &str) -> Vec<u8> {
@@ -735,6 +835,13 @@ impl FuseNode {
             child.set_dname(name);
             child.inc_lookup(1);
             child.set_cached_metadata_with_valid(md, entry.attr_valid, entry.attr_valid_nsec);
+            self.cache_lookup_child(
+                name,
+                &child,
+                entry.generation,
+                entry.entry_valid,
+                entry.entry_valid_nsec,
+            );
         }
     }
 
@@ -1055,6 +1162,13 @@ impl FuseNode {
             )?;
             if let Some(name) = name {
                 child.set_dname(name);
+                self.cache_lookup_child(
+                    name,
+                    &child,
+                    entry.generation,
+                    entry.entry_valid,
+                    entry.entry_valid_nsec,
+                );
             }
             child.inc_lookup(1);
             consumed = true;
@@ -1158,6 +1272,133 @@ impl FuseNode {
         )
     }
 
+    fn fill_page_cache_range_with_open(
+        &self,
+        page_cache: &Arc<PageCache>,
+        start_page: usize,
+        end_page: usize,
+        file_size: usize,
+        fh: u64,
+        file_flags: u32,
+    ) -> Result<(usize, Option<usize>), SystemError> {
+        if start_page >= end_page || file_size == 0 {
+            return Ok((0, None));
+        }
+
+        let max_read = self.conn().max_read();
+        let max_pages_by_read = core::cmp::max(1, max_read >> MMArch::PAGE_SHIFT);
+        let max_pages = core::cmp::max(
+            1,
+            core::cmp::min(max_pages_by_read, self.conn().max_pages()),
+        );
+        let mut total_read = 0usize;
+        let mut truncate_eof = None;
+
+        let mut idx = start_page;
+        while idx < end_page {
+            if page_cache.is_page_ready(idx) {
+                idx += 1;
+                continue;
+            }
+
+            let run_start = idx;
+            let mut run_end = run_start + 1;
+            while run_end < end_page
+                && run_end - run_start < max_pages
+                && !page_cache.is_page_ready(run_end)
+            {
+                run_end += 1;
+            }
+
+            let read_offset = run_start
+                .checked_mul(MMArch::PAGE_SIZE)
+                .ok_or(SystemError::EOVERFLOW)?;
+            if read_offset >= file_size {
+                break;
+            }
+
+            let read_pages_len = (run_end - run_start)
+                .checked_mul(MMArch::PAGE_SIZE)
+                .ok_or(SystemError::EOVERFLOW)?;
+            let read_len = core::cmp::min(
+                core::cmp::min(read_pages_len, max_read),
+                file_size - read_offset,
+            );
+            if read_len == 0 {
+                break;
+            }
+
+            let mut read_buf = vec![0u8; read_len];
+            let bytes_read = self.read_direct_with_open(
+                read_offset,
+                read_len,
+                &mut read_buf,
+                fh,
+                file_flags,
+                0,
+            )?;
+            if bytes_read == 0 {
+                let (eof, should_truncate) = self.note_short_read_eof(run_start, 0, file_size)?;
+                if should_truncate {
+                    truncate_eof = Some(eof);
+                }
+                break;
+            }
+
+            let covered_pages = bytes_read.div_ceil(MMArch::PAGE_SIZE);
+            let pages_to_commit = core::cmp::min(run_end - run_start, covered_pages);
+            let mut saw_short_page = false;
+            for rel_page in 0..pages_to_commit {
+                let page_idx = run_start + rel_page;
+                let page_offset = rel_page * MMArch::PAGE_SIZE;
+                let page_read_len =
+                    core::cmp::min(MMArch::PAGE_SIZE, bytes_read.saturating_sub(page_offset));
+                if page_read_len == 0 {
+                    break;
+                }
+
+                let mut filled_len = None;
+                let page = page_cache.manager().commit_page_with(page_idx, |_, dst| {
+                    dst.fill(0);
+                    dst[..page_read_len]
+                        .copy_from_slice(&read_buf[page_offset..page_offset + page_read_len]);
+                    filled_len = Some(page_read_len);
+                    Ok(page_read_len)
+                })?;
+                drop(page);
+
+                if filled_len.is_some() {
+                    total_read += 1;
+                }
+
+                if page_read_len < MMArch::PAGE_SIZE {
+                    let (eof, should_truncate) =
+                        self.note_short_read_eof(page_idx, page_read_len, file_size)?;
+                    if should_truncate {
+                        truncate_eof = Some(eof);
+                    }
+                    saw_short_page = true;
+                    break;
+                }
+            }
+
+            if bytes_read < read_len && !saw_short_page {
+                let (eof, should_truncate) =
+                    self.note_short_read_eof(run_start, bytes_read, file_size)?;
+                if should_truncate {
+                    truncate_eof = Some(eof);
+                }
+            }
+
+            if saw_short_page || bytes_read < read_len {
+                break;
+            }
+            idx = run_end;
+        }
+
+        Ok((total_read, truncate_eof))
+    }
+
     fn read_cached_with_open(
         &self,
         offset: usize,
@@ -1177,9 +1418,27 @@ impl FuseNode {
         let end_page_index = (offset + read_len - 1) >> MMArch::PAGE_SHIFT;
         let page_cache = self.ensure_page_cache()?;
         let _invalidate = page_cache.invalidate_read();
+        let last_file_page = (file_size - 1) >> MMArch::PAGE_SHIFT;
+        let max_pages_by_read = core::cmp::max(1, self.conn().max_read() >> MMArch::PAGE_SHIFT);
+        let max_pages_by_conn = core::cmp::min(max_pages_by_read, self.conn().max_pages());
+        let readaround_pages = core::cmp::min(max_pages_by_conn, 16);
+        let prefetch_end = core::cmp::min(
+            last_file_page + 1,
+            core::cmp::max(
+                end_page_index + 1,
+                start_page_index.saturating_add(readaround_pages),
+            ),
+        );
+        let (_, mut truncate_eof) = self.fill_page_cache_range_with_open(
+            &page_cache,
+            start_page_index,
+            prefetch_end,
+            file_size,
+            fh,
+            file_flags,
+        )?;
 
         let mut dst_offset = 0usize;
-        let mut truncate_eof = None;
         for page_index in start_page_index..=end_page_index {
             let page_start = page_index << MMArch::PAGE_SHIFT;
             let page_end = page_start + MMArch::PAGE_SIZE;
@@ -1289,6 +1548,68 @@ impl FuseNode {
             return Err(SystemError::EINVAL);
         }
         Ok(page)
+    }
+
+    pub(crate) fn mmap_readahead_with_open(
+        &self,
+        page_index: usize,
+        req_pages: usize,
+        ra_state: &mut FileReadaheadState,
+        fh: u64,
+        file_flags: u32,
+    ) -> Result<usize, SystemError> {
+        if req_pages == 0 {
+            return Ok(0);
+        }
+
+        let md = self.cached_metadata_snapshot().ok_or(SystemError::EIO)?;
+        let file_size = md.size.max(0) as usize;
+        if file_size == 0 {
+            return Ok(0);
+        }
+
+        let last_file_page = (file_size - 1) >> MMArch::PAGE_SHIFT;
+        if page_index > last_file_page {
+            return Ok(0);
+        }
+
+        let page_cache = self.ensure_page_cache()?;
+        let max_pages_by_read = core::cmp::max(1, self.conn().max_read() >> MMArch::PAGE_SHIFT);
+        let max_pages_by_conn = core::cmp::min(max_pages_by_read, self.conn().max_pages());
+        let max_pages = core::cmp::max(
+            1,
+            core::cmp::min(
+                ra_state.ra_pages,
+                core::cmp::min(max_pages_by_conn, self.conn().max_readahead_pages()),
+            ),
+        );
+        let pages_to_read = core::cmp::min(max_pages, core::cmp::max(req_pages, 16));
+        let end_page = core::cmp::min(last_file_page + 1, page_index.saturating_add(pages_to_read));
+
+        let (total_read, truncate_eof) = self.fill_page_cache_range_with_open(
+            &page_cache,
+            page_index,
+            end_page,
+            file_size,
+            fh,
+            file_flags,
+        )?;
+
+        if let Some(eof) = truncate_eof {
+            if matches!(
+                self.cached_metadata_snapshot(),
+                Some(md) if md.size.max(0) as usize == eof
+            ) {
+                self.truncate_page_cache(eof)?;
+            }
+        }
+
+        ra_state.start = page_index;
+        ra_state.size = end_page.saturating_sub(page_index);
+        ra_state.async_size = ra_state.size.saturating_sub(req_pages);
+        ra_state.prev_index = end_page.saturating_sub(1) as i64;
+
+        Ok(total_read)
     }
 
     fn update_cached_pages_after_write(
@@ -1521,6 +1842,105 @@ impl IndexNode for FuseNode {
 
         self.ensure_page_cache()?;
         Ok(())
+    }
+
+    fn getxattr(&self, name: &str, buf: &mut [u8]) -> Result<usize, SystemError> {
+        self.check_not_stale()?;
+        if self.conn.no_xattr(FUSE_GETXATTR) {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        let requested = core::cmp::min(buf.len(), Self::XATTR_SIZE_MAX);
+        let inarg = FuseGetxattrIn {
+            size: requested as u32,
+            padding: 0,
+        };
+        let payload_in = Self::pack_struct_and_name_payload(&inarg, name);
+        let payload = match self.conn().request(FUSE_GETXATTR, self.nodeid, &payload_in) {
+            Ok(payload) => payload,
+            Err(SystemError::ENOSYS) => return Err(self.fuse_xattr_unsupported(FUSE_GETXATTR)),
+            Err(err) => return Err(err),
+        };
+
+        if buf.is_empty() {
+            let out: FuseGetxattrOut = fuse_read_struct(&payload)?;
+            return Ok(core::cmp::min(out.size as usize, Self::XATTR_SIZE_MAX));
+        }
+        if payload.len() > buf.len() {
+            return Err(SystemError::ERANGE);
+        }
+        if payload.len() > Self::XATTR_SIZE_MAX {
+            return Err(SystemError::E2BIG);
+        }
+        buf[..payload.len()].copy_from_slice(&payload);
+        Ok(payload.len())
+    }
+
+    fn setxattr(&self, name: &str, value: &[u8]) -> Result<usize, SystemError> {
+        self.check_not_stale()?;
+        if self.conn.no_xattr(FUSE_SETXATTR) {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        if value.len() > Self::XATTR_SIZE_MAX {
+            return Err(SystemError::E2BIG);
+        }
+        let inarg = FuseSetxattrInCompat {
+            size: value.len() as u32,
+            flags: 0,
+        };
+        let mut payload_in = Self::pack_struct_and_name_payload(&inarg, name);
+        payload_in.extend_from_slice(value);
+        match self.conn().request(FUSE_SETXATTR, self.nodeid, &payload_in) {
+            Ok(_) => Ok(0),
+            Err(SystemError::ENOSYS) => Err(self.fuse_xattr_unsupported(FUSE_SETXATTR)),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn listxattr(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
+        self.check_not_stale()?;
+        if self.conn.no_xattr(FUSE_LISTXATTR) {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        let requested = core::cmp::min(buf.len(), Self::XATTR_LIST_MAX);
+        let inarg = FuseGetxattrIn {
+            size: requested as u32,
+            padding: 0,
+        };
+        let payload =
+            match self
+                .conn()
+                .request(FUSE_LISTXATTR, self.nodeid, fuse_pack_struct(&inarg))
+            {
+                Ok(payload) => payload,
+                Err(SystemError::ENOSYS) => return Err(self.fuse_xattr_unsupported(FUSE_LISTXATTR)),
+                Err(err) => return Err(err),
+            };
+
+        if buf.is_empty() {
+            let out: FuseGetxattrOut = fuse_read_struct(&payload)?;
+            return Ok(core::cmp::min(out.size as usize, Self::XATTR_LIST_MAX));
+        }
+        if payload.len() > buf.len() {
+            return Err(SystemError::ERANGE);
+        }
+        if payload.len() > Self::XATTR_LIST_MAX {
+            return Err(SystemError::E2BIG);
+        }
+        Self::verify_xattr_list(&payload)?;
+        buf[..payload.len()].copy_from_slice(&payload);
+        Ok(payload.len())
+    }
+
+    fn removexattr(&self, name: &str) -> Result<usize, SystemError> {
+        self.check_not_stale()?;
+        if self.conn.no_xattr(FUSE_REMOVEXATTR) {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        match self.request_name(FUSE_REMOVEXATTR, self.nodeid, name) {
+            Ok(_) => Ok(0),
+            Err(SystemError::ENOSYS) => Err(self.fuse_xattr_unsupported(FUSE_REMOVEXATTR)),
+            Err(err) => Err(err),
+        }
     }
 
     fn truncate_before_open(&self, flags: &FileFlags) -> bool {
@@ -2091,7 +2511,17 @@ impl IndexNode for FuseNode {
             return self.parent();
         }
 
-        let payload = self.request_name(FUSE_LOOKUP, self.nodeid, name)?;
+        if let Some(child) = self.lookup_cached_child(name) {
+            return Ok(child);
+        }
+
+        let payload = match self.request_name(FUSE_LOOKUP, self.nodeid, name) {
+            Ok(payload) => payload,
+            Err(err) => {
+                self.invalidate_lookup_cache(name);
+                return Err(err);
+            }
+        };
         let entry: FuseEntryOut = fuse_read_struct(&payload)?;
         let md = Self::metadata_from_valid_entry(&entry, SystemError::ENOENT, None).inspect_err(
             |_| {
@@ -2119,6 +2549,13 @@ impl IndexNode for FuseNode {
             .store(entry.attr.flags, Ordering::Relaxed);
         child.inc_lookup(1);
         child.set_cached_metadata_with_valid(md, entry.attr_valid, entry.attr_valid_nsec);
+        self.cache_lookup_child(
+            name,
+            &child,
+            entry.generation,
+            entry.entry_valid,
+            entry.entry_valid_nsec,
+        );
         Ok(child)
     }
 
@@ -2265,6 +2702,9 @@ impl IndexNode for FuseNode {
         if result.is_err() && entry.nodeid != 0 && !consumed {
             let _ = self.conn.queue_forget(entry.nodeid, 1);
         }
+        if result.is_ok() {
+            self.invalidate_lookup_cache(name);
+        }
         result
     }
 
@@ -2272,6 +2712,7 @@ impl IndexNode for FuseNode {
         self.check_not_stale()?;
         self.ensure_dir()?;
         let _ = self.request_name(FUSE_UNLINK, self.nodeid, name)?;
+        self.invalidate_child_name(name);
         Ok(())
     }
 
@@ -2279,6 +2720,7 @@ impl IndexNode for FuseNode {
         self.check_not_stale()?;
         self.ensure_dir()?;
         let _ = self.request_name(FUSE_RMDIR, self.nodeid, name)?;
+        self.invalidate_child_name(name);
         Ok(())
     }
 
@@ -2344,6 +2786,8 @@ impl IndexNode for FuseNode {
             return Err(SystemError::EINVAL);
         }
         let _ = r?;
+        self.invalidate_lookup_cache(old_name);
+        target_any.invalidate_lookup_cache(new_name);
         if let Some(node) = cached_old {
             node.set_parent_nodeid(target_any.nodeid);
             node.set_parent(Some(

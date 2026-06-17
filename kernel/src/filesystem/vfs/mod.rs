@@ -1054,6 +1054,24 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
+    /// @brief 列出扩展属性名，返回实际列表长度。
+    fn listxattr(&self, _buf: &mut [u8]) -> Result<usize, SystemError> {
+        log::warn!(
+            "listxattr not implemented for {}",
+            crate::libs::name::get_type_name(&self)
+        );
+        return Err(SystemError::ENOSYS);
+    }
+
+    /// @brief 删除指定扩展属性。
+    fn removexattr(&self, _name: &str) -> Result<usize, SystemError> {
+        log::warn!(
+            "removexattr not implemented for {}",
+            crate::libs::name::get_type_name(&self)
+        );
+        return Err(SystemError::ENOSYS);
+    }
+
     /// # 将当前Inode转换为 Socket 引用
     ///
     /// # 返回值

@@ -130,10 +130,16 @@ mod sys_unlink;
 mod sys_utimes;
 
 mod sys_fgetxattr;
+mod sys_flistxattr;
+mod sys_fremovexattr;
 mod sys_fsetxattr;
 mod sys_getxattr;
 mod sys_lgetxattr;
+mod sys_listxattr;
+mod sys_llistxattr;
+mod sys_lremovexattr;
 mod sys_lsetxattr;
+mod sys_removexattr;
 mod sys_setxattr;
 mod xattr_utils;
 

@@ -9,6 +9,8 @@ use crate::{
 use alloc::{sync::Arc, vec::Vec};
 use system_error::SystemError;
 
+const XATTR_LIST_MAX: usize = 65536;
+
 /// Extended attribute GET operations
 pub(super) fn path_getxattr(
     path_ptr: *const u8,
@@ -45,6 +47,95 @@ pub(super) fn fd_getxattr(
 
     // 调用VFS接口获取扩展属性
     do_getxattr(inode, name_ptr, buf_ptr, size)
+}
+
+/// Extended attribute LIST operations
+pub(super) fn path_listxattr(
+    path_ptr: *const u8,
+    buf_ptr: *mut u8,
+    size: usize,
+    lookup_flags: usize,
+) -> Result<usize, SystemError> {
+    let path = vfs_check_and_clone_cstr(path_ptr, Some(MAX_PATHLEN))?
+        .into_string()
+        .map_err(|_| SystemError::EINVAL)?;
+
+    let pcb = ProcessManager::current_pcb();
+    let (current_node, rest_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), &path)?;
+    let inode = current_node.lookup_follow_symlink(&rest_path, lookup_flags)?;
+
+    do_listxattr(inode, buf_ptr, size)
+}
+
+pub(super) fn fd_listxattr(fd: i32, buf_ptr: *mut u8, size: usize) -> Result<usize, SystemError> {
+    let binding = ProcessManager::current_pcb().fd_table();
+    let fd_table_guard = binding.read();
+
+    let file = fd_table_guard
+        .get_file_by_fd(fd)
+        .ok_or(SystemError::EBADF)?;
+    let inode = file.inode();
+
+    do_listxattr(inode, buf_ptr, size)
+}
+
+fn do_listxattr(
+    inode: Arc<dyn IndexNode>,
+    buf_ptr: *mut u8,
+    size: usize,
+) -> Result<usize, SystemError> {
+    if size == 0 {
+        let mut temp_buf = Vec::new();
+        return inode.listxattr(&mut temp_buf);
+    }
+
+    let capped_size = core::cmp::min(size, XATTR_LIST_MAX);
+    let mut list = vec![0u8; capped_size];
+    let actual_size = inode.listxattr(&mut list)?;
+    if actual_size > capped_size {
+        return Err(SystemError::ERANGE);
+    }
+
+    let mut user_buffer_writer = UserBufferWriter::new(buf_ptr, actual_size, true)?;
+    user_buffer_writer.copy_to_user(&list[..actual_size], 0)?;
+    Ok(actual_size)
+}
+
+/// Extended attribute REMOVE operations
+pub(super) fn path_removexattr(
+    path_ptr: *const u8,
+    name_ptr: *const u8,
+    lookup_flags: usize,
+) -> Result<usize, SystemError> {
+    let path = vfs_check_and_clone_cstr(path_ptr, Some(MAX_PATHLEN))?
+        .into_string()
+        .map_err(|_| SystemError::EINVAL)?;
+
+    let pcb = ProcessManager::current_pcb();
+    let (current_node, rest_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), &path)?;
+    let inode = current_node.lookup_follow_symlink(&rest_path, lookup_flags)?;
+
+    do_removexattr(inode, name_ptr)
+}
+
+pub(super) fn fd_removexattr(fd: i32, name_ptr: *const u8) -> Result<usize, SystemError> {
+    let binding = ProcessManager::current_pcb().fd_table();
+    let fd_table_guard = binding.read();
+
+    let file = fd_table_guard
+        .get_file_by_fd(fd)
+        .ok_or(SystemError::EBADF)?;
+    let inode = file.inode();
+
+    do_removexattr(inode, name_ptr)
+}
+
+fn do_removexattr(inode: Arc<dyn IndexNode>, name_ptr: *const u8) -> Result<usize, SystemError> {
+    let name = check_and_clone_cstr(name_ptr, None)?
+        .into_string()
+        .map_err(|_| SystemError::EINVAL)?;
+
+    inode.removexattr(&name)
 }
 
 fn do_getxattr(

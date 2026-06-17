@@ -269,6 +269,11 @@ impl ProcessManager {
         args: KernelCloneArgs,
     ) -> Result<RawPid, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
+        let caller_pid_ns = if current_pcb.raw_pid().data() == 0 {
+            None
+        } else {
+            Some(current_pcb.active_pid_ns())
+        };
 
         let new_kstack: KernelStack = KernelStack::new()?;
 
@@ -307,7 +312,9 @@ impl ProcessManager {
             return Ok(pcb.raw_pid());
         }
 
-        return Ok(pcb.pid().pid_vnr());
+        return pcb
+            .task_pid_nr_ns(PidType::PID, caller_pid_ns)
+            .ok_or(SystemError::EINVAL);
     }
 
     fn copy_flags(
@@ -602,8 +609,12 @@ impl ProcessManager {
         // TODO: 克隆前应该锁信号处理，等待克隆完成后再处理
 
         // 克隆架构相关
-        let guard = current_pcb.arch_info_irqsave();
-        unsafe { pcb.arch_info().clone_from(&guard) };
+        let mut guard = current_pcb.arch_info_irqsave();
+        unsafe {
+            guard.save_fsbase();
+            guard.save_gsbase();
+            pcb.arch_info().clone_from(&guard);
+        }
         drop(guard);
 
         // 为内核线程设置WorkerPrivate

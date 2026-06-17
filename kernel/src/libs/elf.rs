@@ -704,6 +704,7 @@ impl ElfLoader {
         init_info
             .auxv
             .insert(AtType::PageSize as u8, MMArch::PAGE_SIZE);
+        init_info.auxv.insert(AtType::Flags as u8, 0);
         init_info.auxv.insert(AtType::Phdr as u8, phdr_vaddr.data());
         init_info
             .auxv
@@ -715,6 +716,15 @@ impl ElfLoader {
             AtType::Base as u8,
             interpreter_base.unwrap_or(VirtAddr::new(0)).data(),
         );
+        init_info.auxv.insert(AtType::Uid as u8, 0);
+        init_info.auxv.insert(AtType::EUid as u8, 0);
+        init_info.auxv.insert(AtType::Gid as u8, 0);
+        init_info.auxv.insert(AtType::EGid as u8, 0);
+        init_info.auxv.insert(AtType::HwCap as u8, 0);
+        init_info.auxv.insert(AtType::ClkTck as u8, 100);
+        init_info.auxv.insert(AtType::Secure as u8, 0);
+        init_info.auxv.insert(AtType::HwCap2 as u8, 0);
+        init_info.auxv.insert(AtType::MinSigStackSize as u8, 2048);
 
         // 添加 rseq 相关的 auxv
         init_info

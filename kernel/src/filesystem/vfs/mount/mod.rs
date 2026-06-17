@@ -1807,6 +1807,15 @@ impl IndexNode for MountFSInode {
         self.ensure_mount_writable()?;
         self.inner_inode.setxattr(name, value)
     }
+
+    fn listxattr(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
+        self.inner_inode.listxattr(buf)
+    }
+
+    fn removexattr(&self, name: &str) -> Result<usize, SystemError> {
+        self.ensure_mount_writable()?;
+        self.inner_inode.removexattr(name)
+    }
 }
 
 impl FileSystem for MountFS {

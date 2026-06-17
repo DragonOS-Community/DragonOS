@@ -98,6 +98,12 @@ impl PtyDevPtsLink {
         self.try_free_index_when_fully_closed();
     }
 
+    fn on_open(&self, subtype: TtyDriverSubType) {
+        if subtype == TtyDriverSubType::PtySlave {
+            self.slave_closed.store(false, Ordering::SeqCst);
+        }
+    }
+
     fn try_unlink_once(&self) {
         if self.unlinked.swap(true, Ordering::SeqCst) {
             return;
@@ -139,7 +145,16 @@ impl TtyOperation for Unix98PtyDriverInner {
     }
 
     fn open(&self, tty: &TtyCoreData) -> Result<(), SystemError> {
-        PtyCommon::pty_common_open(tty)
+        PtyCommon::pty_common_open(tty)?;
+
+        let subtype = tty.driver().tty_driver_sub_type();
+        if let Some(hook_arc) = tty.private_fields() {
+            if let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() {
+                hook.on_open(subtype);
+            }
+        }
+
+        Ok(())
     }
 
     fn write(&self, tty: &TtyCoreData, buf: &[u8], nr: usize) -> Result<usize, SystemError> {
@@ -323,17 +338,19 @@ impl TtyOperation for Unix98PtyDriverInner {
 
     fn close(&self, tty: Arc<TtyCore>) -> Result<(), SystemError> {
         let driver = tty.core().driver();
-        // 通过 hook 精确管理 devpts 目录项与索引生命周期
-        if let Some(hook_arc) = tty.private_fields() {
-            if let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() {
-                hook.on_close(driver.tty_driver_sub_type());
-            }
-        }
+        let core = tty.core();
+        let subtype = driver.tty_driver_sub_type();
 
-        if driver.tty_driver_sub_type() == TtyDriverSubType::PtySlave {
-            driver.ttys().remove(&tty.core().index());
-            if let Some(link) = tty.core().link() {
+        core.flags_write().insert(TtyFlag::IO_ERROR);
+        core.read_wq().wakeup_all();
+        core.write_wq().wakeup_all();
+        core.contorl_info_irqsave().packet = false;
+
+        if subtype == TtyDriverSubType::PtySlave {
+            let mut peer_closed = true;
+            if let Some(link) = core.link() {
                 let link_core = link.core();
+                peer_closed = link_core.flags().contains(TtyFlag::IO_ERROR);
                 // set OTHER_CLOSED flag to tell master side that the slave side is closed
                 link_core.flags_write().insert(TtyFlag::OTHER_CLOSED);
                 // wake up waiting read/write queues on master side
@@ -343,16 +360,31 @@ impl TtyOperation for Unix98PtyDriverInner {
                 let epitems = link_core.epitems();
                 let _ = EventPoll::wakeup_epoll(epitems, EPollEventType::EPOLLHUP);
             }
-        } else if driver.tty_driver_sub_type() == TtyDriverSubType::PtyMaster {
+            if peer_closed {
+                driver.ttys().remove(&core.index());
+            }
+        } else if subtype == TtyDriverSubType::PtyMaster {
             // master 侧最后关闭：从 driver 表移除自身（避免泄漏）；devpts 的释放由 hook 统一处理
-            driver.ttys().remove(&tty.core().index());
-            if let Some(link) = tty.core().link() {
+            driver.ttys().remove(&core.index());
+            core.flags_write().insert(TtyFlag::OTHER_CLOSED);
+            if let Some(link) = core.link() {
                 let link_core = link.core();
                 link_core.flags_write().insert(TtyFlag::OTHER_CLOSED);
                 link_core.read_wq().wakeup_all();
                 link_core.write_wq().wakeup_all();
                 let epitems = link_core.epitems();
                 let _ = EventPoll::wakeup_epoll(epitems, EPollEventType::EPOLLHUP);
+                if link_core.flags().contains(TtyFlag::IO_ERROR) {
+                    link_core.driver().ttys().remove(&link_core.index());
+                }
+            }
+        }
+
+        // 通过 hook 精确管理 devpts 目录项与索引生命周期。必须放在 driver 表
+        // 解绑之后，避免 index 释放后被新 PTY 复用又被旧 close 删除。
+        if let Some(hook_arc) = tty.private_fields() {
+            if let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() {
+                hook.on_close(subtype);
             }
         }
 
@@ -399,7 +431,13 @@ pub fn ptmx_open(
 
     let index = fsinfo.alloc_index()?;
 
-    let tty = ptm_driver().init_tty_device(Some(index))?;
+    let tty = match ptm_driver().init_tty_device(Some(index)) {
+        Ok(tty) => tty,
+        Err(err) => {
+            fsinfo.free_index(index);
+            return Err(err);
+        }
+    };
 
     // 设置privdata
     *data = FilePrivateData::Tty(TtyFilePrivateData {
@@ -410,11 +448,17 @@ pub fn ptmx_open(
     let core = tty.core();
     core.flags_write().insert(TtyFlag::PTY_LOCK);
 
-    let _ = pts_root_inode.create(
+    if let Err(err) = pts_root_inode.create(
         &index.to_string(),
         FileType::CharDevice,
         InodeMode::from_bits_truncate(0x666),
-    )?;
+    ) {
+        ptm_driver().ttys().remove(&index);
+        pts_driver().ttys().remove(&index);
+        fsinfo.free_index(index);
+        *data = FilePrivateData::Unused;
+        return Err(err);
+    }
 
     // 在 master/slave 两端记录 devpts 根目录与 fs，用于精确清理：
     // - master close: unlink /dev/pts/N
@@ -429,7 +473,14 @@ pub fn ptmx_open(
         slave.set_private_fields(hook);
     }
 
-    ptm_driver().driver_funcs().open(core)?;
+    if let Err(err) = ptm_driver().driver_funcs().open(core) {
+        ptm_driver().ttys().remove(&index);
+        pts_driver().ttys().remove(&index);
+        let _ = pts_root_inode.unlink(&index.to_string());
+        fsinfo.free_index(index);
+        *data = FilePrivateData::Unused;
+        return Err(err);
+    }
 
     Ok(())
 }

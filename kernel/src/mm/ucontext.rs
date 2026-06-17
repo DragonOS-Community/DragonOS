@@ -2484,21 +2484,45 @@ impl LockedVMA {
         let Some(intersection) = self_guard.region().intersect(&region) else {
             return;
         };
+        let vma_start = self_guard.region().start();
+        let backing_pgoff = self_guard.backing_page_offset();
+        let file_page_cache = self_guard
+            .vm_file()
+            .and_then(|file| file.inode().page_cache());
         drop(self_guard);
 
         let mut page_manager_guard = page_manager_lock();
         for page in intersection.pages() {
-            if mapper.translate(page.virt_address()).is_none() {
-                continue;
-            }
-
-            let Some((paddr, _, flush)) =
-                (unsafe { mapper.unmap_phys_preserve_tables(page.virt_address()) })
-            else {
+            let virt = page.virt_address();
+            let Some((paddr, _)) = mapper.translate(virt) else {
                 continue;
             };
 
             let page_arc = page_manager_guard.get_unwrap(&paddr);
+            if let Some(page_cache) = file_page_cache.as_ref() {
+                let Some(base_pgoff) = backing_pgoff else {
+                    continue;
+                };
+                let pgoff = base_pgoff + ((virt.data() - vma_start.data()) >> MMArch::PAGE_SHIFT);
+                let page_guard = page_arc.read();
+                let is_file_cache_page = match page_guard.page_type() {
+                    PageType::File(info) if info.index == pgoff => info
+                        .page_cache
+                        .upgrade()
+                        .is_some_and(|mapped_cache| Arc::ptr_eq(&mapped_cache, page_cache)),
+                    _ => false,
+                };
+                drop(page_guard);
+                if !is_file_cache_page {
+                    continue;
+                }
+            }
+
+            let Some((paddr, _, flush)) = (unsafe { mapper.unmap_phys_preserve_tables(virt) })
+            else {
+                continue;
+            };
+
             let can_dealloc = {
                 let mut page_guard = page_arc.write();
                 page_guard.remove_vma(self);
@@ -2511,7 +2535,7 @@ impl LockedVMA {
             }
 
             unsafe { flush.ignore() };
-            tlb.accumulate_range(page.virt_address());
+            tlb.accumulate_range(virt);
         }
     }
 

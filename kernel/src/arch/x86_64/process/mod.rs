@@ -288,6 +288,15 @@ impl ArchPCBInfo {
         *self = from.clone_all();
         self.gsdata = gsdata;
     }
+
+    /// Synchronize hardware-backed current-thread state before common fork code
+    /// clones `ArchPCBInfo`.
+    pub fn sync_current_state_before_fork(&mut self) {
+        unsafe {
+            self.save_fsbase();
+            self.save_gsbase();
+        }
+    }
 }
 
 impl ProcessControlBlock {

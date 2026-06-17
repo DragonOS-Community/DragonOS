@@ -610,9 +610,8 @@ impl ProcessManager {
 
         // 克隆架构相关
         let mut guard = current_pcb.arch_info_irqsave();
+        guard.sync_current_state_before_fork();
         unsafe {
-            guard.save_fsbase();
-            guard.save_gsbase();
             pcb.arch_info().clone_from(&guard);
         }
         drop(guard);

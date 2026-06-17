@@ -716,10 +716,11 @@ impl ElfLoader {
             AtType::Base as u8,
             interpreter_base.unwrap_or(VirtAddr::new(0)).data(),
         );
-        init_info.auxv.insert(AtType::Uid as u8, 0);
-        init_info.auxv.insert(AtType::EUid as u8, 0);
-        init_info.auxv.insert(AtType::Gid as u8, 0);
-        init_info.auxv.insert(AtType::EGid as u8, 0);
+        let cred = crate::process::ProcessManager::current_pcb().cred();
+        init_info.auxv.insert(AtType::Uid as u8, cred.uid.data());
+        init_info.auxv.insert(AtType::EUid as u8, cred.euid.data());
+        init_info.auxv.insert(AtType::Gid as u8, cred.gid.data());
+        init_info.auxv.insert(AtType::EGid as u8, cred.egid.data());
         init_info.auxv.insert(AtType::HwCap as u8, 0);
         init_info.auxv.insert(AtType::ClkTck as u8, 100);
         init_info.auxv.insert(AtType::Secure as u8, 0);

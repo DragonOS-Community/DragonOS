@@ -380,12 +380,6 @@ impl FuseNode {
         Ok(())
     }
 
-    fn discard_clean_page_cache(&self) {
-        if let Some(cache) = self.cached_page_cache() {
-            let _ = cache.manager().invalidate_all_clean();
-        }
-    }
-
     fn truncate_page_cache(&self, new_size: usize) -> Result<(), SystemError> {
         if let Some(cache) = self.cached_page_cache() {
             cache.truncate(new_size)?;
@@ -1837,7 +1831,7 @@ impl IndexNode for FuseNode {
             if vm_flags.contains(crate::mm::VmFlags::VM_MAYSHARE) {
                 return Err(SystemError::ENODEV);
             }
-            self.discard_clean_page_cache();
+            self.invalidate_clean_page_cache()?;
         }
 
         self.ensure_page_cache()?;

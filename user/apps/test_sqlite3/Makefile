@@ -17,7 +17,7 @@ install: all
 	mv test_sqlite3 $(DADK_CURRENT_BUILD_DIR)/test_sqlite3
 
 clean:
-	rm test_sqlite3 *.o
+	rm -f test_sqlite3 *.o
 
 __download_sqlite3:
 	@echo "Download sqlite3 from https://mirrors.dragonos.org.cn/pub/third_party/sqlite/$(SQLITE_FILENAME).zip"

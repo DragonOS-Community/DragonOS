@@ -506,15 +506,6 @@ impl OvlInode {
         ))
     }
 
-    fn same_inode(left: &Arc<dyn IndexNode>, right: &Arc<dyn IndexNode>) -> bool {
-        match (left.metadata(), right.metadata()) {
-            (Ok(left_md), Ok(right_md)) => {
-                left_md.dev_id == right_md.dev_id && left_md.inode_id == right_md.inode_id
-            }
-            _ => false,
-        }
-    }
-
     fn backing_file_for_io(
         &self,
         data: crate::libs::mutex::MutexGuard<FilePrivateData>,
@@ -525,41 +516,8 @@ impl OvlInode {
         let overlay_data = overlay_data.clone();
         drop(data);
 
-        loop {
-            let (current_inode, current_is_upper) = self.current_realdata_inode()?;
-            let (backing_file, backing_is_upper, flags) = {
-                let inner = overlay_data.inner.lock();
-                (
-                    inner.backing_file.clone(),
-                    inner.backing_is_upper,
-                    inner.flags,
-                )
-            };
-
-            if Self::same_inode(&backing_file.inode(), &current_inode) {
-                return Ok((backing_file, backing_is_upper));
-            }
-
-            let new_backing_file = Arc::new(File::new(
-                current_inode.clone(),
-                Self::backing_open_flags(flags),
-            )?);
-            let installed_backing_file = new_backing_file.clone();
-            let old_backing_file = {
-                let mut inner = overlay_data.inner.lock();
-                if inner.flags != flags {
-                    continue;
-                }
-                if Self::same_inode(&inner.backing_file.inode(), &current_inode) {
-                    return Ok((inner.backing_file.clone(), inner.backing_is_upper));
-                }
-
-                inner.backing_is_upper = current_is_upper;
-                Some(mem::replace(&mut inner.backing_file, new_backing_file))
-            };
-            drop(old_backing_file);
-            return Ok((installed_backing_file, current_is_upper));
-        }
+        let inner = overlay_data.inner.lock();
+        Ok((inner.backing_file.clone(), inner.backing_is_upper))
     }
 }
 

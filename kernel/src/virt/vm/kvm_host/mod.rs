@@ -74,8 +74,7 @@ impl LockedVm {
                 .basic()
                 .user_vm()
                 .unwrap()
-                .write()
-                .try_clone()?,
+                .try_clone_wait()?,
             max_vcpus: CurrentKvmManager::KVM_MAX_VCPUS,
             memslots_set,
             memslots,

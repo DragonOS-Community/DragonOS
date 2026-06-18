@@ -13,7 +13,7 @@ use defer::defer;
 
 use crate::{
     arch::MMArch,
-    mm::{access_ok, MemoryManagementArch, VirtAddr, VmFlags},
+    mm::{access_ok, MemoryManagementArch, VirtAddr, VirtRegion, VmFlags},
     process::ProcessManager,
 };
 
@@ -928,7 +928,10 @@ fn check_user_access_by_page_table(addr: VirtAddr, size: usize, check_write: boo
     // Calculate number of pages to check (rounded up)
     let pages = aligned_size / MMArch::PAGE_SIZE;
 
-    let guard = vm.read();
+    let guard = vm.read_guard_no_reservation_conflict(VirtRegion::new(
+        VirtAddr::new(aligned_addr),
+        aligned_size,
+    ));
     for i in 0..pages {
         let page_addr = aligned_addr + i * MMArch::PAGE_SIZE;
         let flags = match guard.user_mapper.utable.translate(VirtAddr::new(page_addr)) {
@@ -1061,13 +1064,14 @@ pub fn user_accessible_len(addr: VirtAddr, size: usize, check_write: bool) -> us
         None => return 0,
     };
 
-    let vma_read_guard = vm.read();
-    let mappings = &vma_read_guard.mappings;
-
     let mut checked = 0usize;
     let mut current = addr;
 
     while checked < size {
+        let current_page = VirtAddr::new(current.data() & !MMArch::PAGE_OFFSET_MASK);
+        let vma_read_guard =
+            vm.read_guard_no_reservation_conflict(VirtRegion::new(current_page, MMArch::PAGE_SIZE));
+        let mappings = &vma_read_guard.mappings;
         // 判断当前地址是否落在一个有效 VMA 中
         let Some(vma) = mappings.contains(current) else {
             break;

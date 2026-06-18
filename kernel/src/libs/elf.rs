@@ -213,12 +213,13 @@ impl ElfLoader {
     #[allow(clippy::too_many_arguments)]
     fn map_readonly_segment(
         user_vm_guard: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
-        param: &ExecParam,
+        param: &mut ExecParam,
         addr_to_map: VirtAddr,
         prot: ProtFlags,
         map_flags: MapFlags,
         file_offset: usize,
         beginning_page_offset: usize,
+        seg_in_file_size: usize,
         map_size: usize,
         total_size: usize,
         map_err_handler: impl FnOnce(SystemError) -> SystemError,
@@ -243,18 +244,13 @@ impl ElfLoader {
             return Err(SystemError::EINVAL);
         }
 
-        let file = param.file();
+        let tmp_prot = if !prot.contains(ProtFlags::PROT_WRITE) {
+            prot | ProtFlags::PROT_WRITE
+        } else {
+            prot
+        };
         let start_page = user_vm_guard
-            .file_mapping_with_file(
-                file,
-                addr_to_map,
-                map_len,
-                prot,
-                map_flags,
-                file_page_offset,
-                false,
-                false,
-            )
+            .map_anonymous(addr_to_map, map_len, tmp_prot, map_flags, false, true)
             .map_err(map_err_handler)?;
         let mapped = start_page.virt_address();
 
@@ -267,6 +263,20 @@ impl ElfLoader {
                     PageFrameCount::from_bytes(to_unmap_size).unwrap(),
                 )?;
             }
+        }
+
+        Self::do_load_file(
+            mapped + beginning_page_offset,
+            seg_in_file_size,
+            file_offset,
+            param,
+        )?;
+        if tmp_prot != prot {
+            user_vm_guard.mprotect(
+                VirtPageFrame::new(mapped),
+                PageFrameCount::from_bytes(page_align_up(map_size)).unwrap(),
+                prot,
+            )?;
         }
 
         Ok((mapped, true))
@@ -366,6 +376,7 @@ impl ElfLoader {
                 *map_flags,
                 file_offset,
                 beginning_page_offset,
+                seg_in_file_size,
                 map_size,
                 total_size,
                 map_err_handler,

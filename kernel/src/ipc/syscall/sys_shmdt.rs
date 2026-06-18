@@ -2,8 +2,8 @@ use crate::arch::interrupt::TrapFrame;
 use crate::mm::mmu_gather::MmuGather;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::{
-    arch::syscall::nr::SYS_SHMDT,
-    mm::{ucontext::AddressSpace, VirtAddr},
+    arch::{syscall::nr::SYS_SHMDT, MMArch},
+    mm::{ucontext::AddressSpace, MemoryManagementArch, VirtAddr, VirtRegion},
     syscall::table::Syscall,
 };
 use alloc::vec::Vec;
@@ -42,7 +42,8 @@ impl Syscall for SysShmdtHandle {
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let vaddr = Self::vaddr(args);
         let current_address_space = AddressSpace::current()?;
-        let mut address_write_guard = current_address_space.write();
+        let mut address_write_guard = current_address_space
+            .write_guard_no_reservation_conflict(VirtRegion::new(vaddr, MMArch::PAGE_SIZE));
 
         // 获取vma
         let vma = address_write_guard

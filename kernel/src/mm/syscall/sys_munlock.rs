@@ -5,7 +5,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_MUNLOCK},
-    mm::{access_ok, ucontext::AddressSpace, VirtAddr, VmFlags},
+    mm::{access_ok, ucontext::AddressSpace, VirtAddr, VirtRegion, VmFlags},
     syscall::table::{FormattedSyscallParam, Syscall},
 };
 
@@ -30,9 +30,17 @@ impl Syscall for SysMunlockHandle {
         }
 
         let vm = AddressSpace::current()?;
-        let mut guard = vm.write_interruptible()?;
-        guard.apply_vma_lock_flags(start, len, VmFlags::VM_NONE, false)?;
-        Ok(0)
+        let region = VirtRegion::new(start, len);
+        loop {
+            let mut guard = vm.write_interruptible()?;
+            if guard.mappings.first_reservation_conflict(region).is_some() {
+                drop(guard);
+                vm.wait_for_no_reservation_conflict_interruptible(region)?;
+                continue;
+            }
+            guard.apply_vma_lock_flags(start, len, VmFlags::VM_NONE, false)?;
+            return Ok(0);
+        }
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

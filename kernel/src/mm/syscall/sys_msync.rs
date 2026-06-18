@@ -5,7 +5,7 @@ use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_MSYNC, MMArch};
 use crate::mm::{
     syscall::{MsFlags, VmFlags},
     ucontext::AddressSpace,
-    MemoryManagementArch, VirtAddr,
+    MemoryManagementArch, VirtAddr, VirtRegion,
 };
 
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
@@ -61,8 +61,9 @@ impl Syscall for SysMsyncHandle {
         let current_address_space = AddressSpace::current()?;
         let mut err = Err(SystemError::ENOMEM);
         let mut unmapped_error = Ok(0);
+        let initial_region = VirtRegion::new(VirtAddr::new(start), end - start);
         let mut next_vma = current_address_space
-            .read()
+            .read_guard_no_reservation_conflict(initial_region)
             .mappings
             .find_nearest(VirtAddr::new(start));
         loop {
@@ -125,8 +126,9 @@ impl Syscall for SysMsyncHandle {
                     err = unmapped_error;
                     break;
                 }
+                let remaining = VirtRegion::new(VirtAddr::new(start), end - start);
                 next_vma = current_address_space
-                    .read()
+                    .read_guard_no_reservation_conflict(remaining)
                     .mappings
                     .find_nearest(VirtAddr::new(start));
             } else {

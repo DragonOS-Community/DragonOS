@@ -31,8 +31,9 @@ use crate::{
         epoll::EPollItem,
         kernfs::KernFSInode,
         vfs::{
-            file::FileFlags, utils::DName, FilePrivateData, FileType, IndexNode, InodeMode,
-            Metadata, PollableInode,
+            file::{File, FileFlags},
+            utils::DName,
+            FilePrivateData, FileType, IndexNode, InodeMode, Metadata, PollableInode,
         },
     },
     init::initcall::INITCALL_DEVICE,
@@ -44,7 +45,7 @@ use crate::{
 
 use super::{
     kthread::tty_flush_thread_init,
-    pty::unix98pty::ptmx_open,
+    pty::unix98pty::{ptm_peer_inode, ptmx_open, pty_file_close},
     sysfs::sys_class_tty_instance,
     termios::WindowSize,
     tty_core::{TtyCore, TtyFlag, TtyIoctlCmd},
@@ -443,7 +444,9 @@ impl IndexNode for TtyDevice {
         };
 
         drop(data);
-        tty.close(tty.clone())
+        let ret = tty.close(tty.clone());
+        pty_file_close(&tty);
+        ret
     }
 
     fn resize(&self, _len: usize) -> Result<(), SystemError> {
@@ -480,6 +483,27 @@ impl IndexNode for TtyDevice {
         }
 
         match cmd {
+            TtyIoctlCmd::TIOCGPTPEER => {
+                let flags = FileFlags::from_bits(arg as u32).ok_or(SystemError::EINVAL)?;
+                let cloexec = flags.contains(FileFlags::O_CLOEXEC);
+                let slave_inode = ptm_peer_inode(tty)?;
+                let fd_table = ProcessManager::current_pcb().fd_table();
+                let reserved_fd = fd_table.write().reserve_fd(cloexec)?;
+                let file = match File::new(slave_inode, flags) {
+                    Ok(file) => file,
+                    Err(err) => {
+                        fd_table.write().release_reserved_fd(reserved_fd);
+                        return Err(err);
+                    }
+                };
+                return match fd_table.write().install_reserved_fd(reserved_fd, file) {
+                    Ok(fd) => Ok(fd as usize),
+                    Err(err) => {
+                        fd_table.write().release_reserved_fd(reserved_fd);
+                        Err(err)
+                    }
+                };
+            }
             TtyIoctlCmd::TIOCGWINSZ => {
                 let core = tty.core();
                 let winsize = *core.window_size();

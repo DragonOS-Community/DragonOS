@@ -13,6 +13,9 @@
 #include <termios.h>
 #include <unistd.h>
 
+#include <string>
+#include <vector>
+
 namespace {
 
 #ifndef TIOCPKT
@@ -25,6 +28,18 @@ constexpr int kTiocpkt = TIOCPKT;
 constexpr int kTiocgptn = 0x80045430;
 #else
 constexpr int kTiocgptn = TIOCGPTN;
+#endif
+
+#ifndef TIOCSPTLCK
+constexpr int kTiocsptlck = 0x40045431;
+#else
+constexpr int kTiocsptlck = TIOCSPTLCK;
+#endif
+
+#ifndef TIOCGPTPEER
+constexpr int kTiocgptpeer = 0x5441;
+#else
+constexpr int kTiocgptpeer = TIOCGPTPEER;
 #endif
 
 #ifndef TIOCPKT_FLUSHWRITE
@@ -496,6 +511,136 @@ TEST(TtyPtyHangup, MasterOnlyCloseReleasesDevptsIndex) {
     }
 
     EXPECT_TRUE(saw_reuse) << "master-only open/close did not visibly reuse any devpts index";
+}
+
+TEST(TtyPtyHangup, TiocgptpeerFailsWhileSlaveLocked) {
+    UniqueFd master(open("/dev/ptmx", O_RDWR | O_NOCTTY));
+    ASSERT_GE(master.get(), 0) << "open(/dev/ptmx) failed: errno=" << errno << " ("
+                               << strerror(errno) << ")";
+
+    errno = 0;
+    EXPECT_EQ(-1, ioctl(master.get(), kTiocgptpeer, O_RDWR | O_NOCTTY));
+    EXPECT_EQ(EIO, errno) << "locked TIOCGPTPEER should fail with EIO, got errno=" << errno
+                          << " (" << strerror(errno) << ")";
+}
+
+TEST(TtyPtyHangup, TiocgptpeerOpensUnlockedSlave) {
+    UniqueFd master(open("/dev/ptmx", O_RDWR | O_NOCTTY));
+    ASSERT_GE(master.get(), 0) << "open(/dev/ptmx) failed: errno=" << errno << " ("
+                               << strerror(errno) << ")";
+
+    int unlock = 0;
+    ASSERT_EQ(0, ioctl(master.get(), kTiocsptlck, &unlock))
+        << "unlock slave failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    UniqueFd slave(ioctl(master.get(), kTiocgptpeer, O_RDWR | O_NOCTTY | O_CLOEXEC));
+    ASSERT_GE(slave.get(), 0) << "TIOCGPTPEER failed: errno=" << errno << " ("
+                              << strerror(errno) << ")";
+
+    int fd_flags = fcntl(slave.get(), F_GETFD);
+    ASSERT_GE(fd_flags, 0) << "fcntl(F_GETFD) failed: errno=" << errno << " (" << strerror(errno)
+                           << ")";
+    EXPECT_NE(0, fd_flags & FD_CLOEXEC);
+
+    struct termios term = {};
+    ASSERT_EQ(0, tcgetattr(slave.get(), &term))
+        << "tcgetattr(peer slave) failed: errno=" << errno << " (" << strerror(errno) << ")";
+    term.c_iflag = 0;
+    term.c_oflag = 0;
+    term.c_lflag = 0;
+    term.c_cflag |= CS8;
+    term.c_cc[VMIN] = 1;
+    term.c_cc[VTIME] = 0;
+    ASSERT_EQ(0, tcsetattr(slave.get(), TCSANOW, &term))
+        << "tcsetattr(peer slave) failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    ASSERT_EQ(1, write(slave.get(), "q", 1))
+        << "write(peer slave) failed: errno=" << errno << " (" << strerror(errno) << ")";
+    char ch = 0;
+    ASSERT_EQ(1, read(master.get(), &ch, 1))
+        << "read(master) failed: errno=" << errno << " (" << strerror(errno) << ")";
+    EXPECT_EQ('q', ch);
+}
+
+TEST(TtyPtyHangup, TiocgptpeerSurvivesVisibleDevptsUnlink) {
+    UniqueFd master(open("/dev/ptmx", O_RDWR | O_NOCTTY));
+    ASSERT_GE(master.get(), 0) << "open(/dev/ptmx) failed: errno=" << errno << " ("
+                               << strerror(errno) << ")";
+
+    uint32_t index = UINT32_MAX;
+    ASSERT_EQ(0, ioctl(master.get(), kTiocgptn, &index))
+        << "TIOCGPTN failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    int unlock = 0;
+    ASSERT_EQ(0, ioctl(master.get(), kTiocsptlck, &unlock))
+        << "unlock slave failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    std::string path = "/dev/pts/" + std::to_string(index);
+    ASSERT_EQ(0, unlink(path.c_str())) << "unlink(" << path << ") failed: errno=" << errno
+                                       << " (" << strerror(errno) << ")";
+
+    UniqueFd slave(ioctl(master.get(), kTiocgptpeer, O_RDWR | O_NOCTTY));
+    ASSERT_GE(slave.get(), 0) << "TIOCGPTPEER after unlink failed: errno=" << errno << " ("
+                              << strerror(errno) << ")";
+
+    struct termios term = {};
+    EXPECT_EQ(0, tcgetattr(slave.get(), &term))
+        << "tcgetattr(peer slave) failed: errno=" << errno << " (" << strerror(errno) << ")";
+}
+
+TEST(TtyPtyHangup, MultipleTiocgptpeerSlaveFdsKeepIndexReserved) {
+    UniqueFd master(open("/dev/ptmx", O_RDWR | O_NOCTTY));
+    ASSERT_GE(master.get(), 0) << "open(/dev/ptmx) failed: errno=" << errno << " ("
+                               << strerror(errno) << ")";
+
+    uint32_t first_index = UINT32_MAX;
+    ASSERT_EQ(0, ioctl(master.get(), kTiocgptn, &first_index))
+        << "TIOCGPTN failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    int unlock = 0;
+    ASSERT_EQ(0, ioctl(master.get(), kTiocsptlck, &unlock))
+        << "unlock slave failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    UniqueFd slave_a(ioctl(master.get(), kTiocgptpeer, O_RDWR | O_NOCTTY));
+    ASSERT_GE(slave_a.get(), 0) << "first TIOCGPTPEER failed: errno=" << errno << " ("
+                                << strerror(errno) << ")";
+    UniqueFd slave_b(ioctl(master.get(), kTiocgptpeer, O_RDWR | O_NOCTTY));
+    ASSERT_GE(slave_b.get(), 0) << "second TIOCGPTPEER failed: errno=" << errno << " ("
+                                << strerror(errno) << ")";
+
+    master.reset();
+    slave_a.reset();
+
+    UniqueFd second_master(open("/dev/ptmx", O_RDWR | O_NOCTTY));
+    ASSERT_GE(second_master.get(), 0) << "second open(/dev/ptmx) failed: errno=" << errno << " ("
+                                      << strerror(errno) << ")";
+    uint32_t second_index = UINT32_MAX;
+    ASSERT_EQ(0, ioctl(second_master.get(), kTiocgptn, &second_index))
+        << "second TIOCGPTN failed: errno=" << errno << " (" << strerror(errno) << ")";
+    EXPECT_NE(first_index, second_index)
+        << "pty index was reused while one TIOCGPTPEER slave fd was still alive";
+
+    second_master.reset();
+    slave_b.reset();
+
+    bool saw_reused_first_index = false;
+    std::vector<UniqueFd> masters;
+    for (uint32_t i = 0; i < 128; ++i) {
+        UniqueFd next(open("/dev/ptmx", O_RDWR | O_NOCTTY));
+        if (next.get() < 0) {
+            break;
+        }
+        uint32_t next_index = UINT32_MAX;
+        ASSERT_EQ(0, ioctl(next.get(), kTiocgptn, &next_index))
+            << "later TIOCGPTN failed: errno=" << errno << " (" << strerror(errno) << ")";
+        if (next_index == first_index) {
+            saw_reused_first_index = true;
+            break;
+        }
+        masters.push_back(std::move(next));
+    }
+    EXPECT_TRUE(saw_reused_first_index)
+        << "pty index should be reusable after all TIOCGPTPEER slave fds close";
 }
 
 TEST(TtyPtyHangup, ClosingOneOfMultipleSlaveFdsDoesNotHangupMaster) {

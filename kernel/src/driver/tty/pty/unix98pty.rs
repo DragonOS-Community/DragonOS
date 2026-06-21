@@ -53,6 +53,9 @@ struct PtyDevPtsLink {
     pts_root: Weak<dyn IndexNode>,
     /// devpts 文件系统本体，用于精确回收索引（避免再去 downcast/全局路径查找）
     devpts: Weak<DevPtsFs>,
+    /// slave 端 inode。TIOCGPTPEER 必须从 master 关联对象打开 peer，
+    /// 不能重新按 /dev/pts/N 路径查找，否则目录项被 unlink 后会偏离 Linux 语义。
+    slave_inode: Arc<dyn IndexNode>,
     index: usize,
     state: Mutex<PtyDevPtsState>,
 }
@@ -63,8 +66,8 @@ struct PtyDevPtsState {
     master_closed: bool,
     /// slave open 已经进入 driver open，但尚未提交为 active fd。
     slave_opening: usize,
-    /// 是否存在已成功打开的 userspace slave fd。
-    slave_active: bool,
+    /// 已成功打开的 userspace slave open file description 数量。
+    slave_active: usize,
     /// 目录项是否已经 unlink（通常在 master close 时执行）。
     unlinked: bool,
     /// 索引是否已经归还（仅在 master close 且无 opening/active slave 后允许归还）。
@@ -78,10 +81,16 @@ impl crate::driver::tty::tty_driver::TtyCorePrivateField for PtyDevPtsLink {
 }
 
 impl PtyDevPtsLink {
-    fn new(pts_root: Weak<dyn IndexNode>, devpts: Weak<DevPtsFs>, index: usize) -> Self {
+    fn new(
+        pts_root: Weak<dyn IndexNode>,
+        devpts: Weak<DevPtsFs>,
+        slave_inode: Arc<dyn IndexNode>,
+        index: usize,
+    ) -> Self {
         Self {
             pts_root,
             devpts,
+            slave_inode,
             index,
             state: Mutex::new(PtyDevPtsState::default()),
         }
@@ -96,7 +105,8 @@ impl PtyDevPtsLink {
                 self.try_unlink_once();
             }
             TtyDriverSubType::PtySlave => {
-                self.state.lock().slave_active = false;
+                // Slave file close is tracked by on_slave_file_close(), because driver close is
+                // only reached when the final tty reference is released.
             }
             _ => {}
         }
@@ -124,7 +134,22 @@ impl PtyDevPtsLink {
                 return;
             }
             state.slave_opening -= 1;
-            state.slave_active = true;
+            state.slave_active += 1;
+        }
+        self.try_free_index_when_fully_closed();
+    }
+
+    fn on_slave_file_close(&self) {
+        {
+            let mut state = self.state.lock();
+            if state.slave_active == 0 {
+                log::warn!(
+                    "PtyDevPtsLink: slave file close without active open, index={}",
+                    self.index
+                );
+            } else {
+                state.slave_active -= 1;
+            }
         }
         self.try_free_index_when_fully_closed();
     }
@@ -167,7 +192,7 @@ impl PtyDevPtsLink {
             let mut state = self.state.lock();
             if !state.master_closed
                 || state.slave_opening != 0
-                || state.slave_active
+                || state.slave_active != 0
                 || state.index_freed
             {
                 (false, false)
@@ -192,6 +217,10 @@ impl PtyDevPtsLink {
         if let Some(devpts) = self.devpts.upgrade() {
             devpts.free_index(self.index);
         }
+    }
+
+    fn slave_inode(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        Ok(self.slave_inode.clone())
     }
 }
 
@@ -526,17 +555,20 @@ pub fn ptmx_open(
     let core = tty.core();
     core.flags_write().insert(TtyFlag::PTY_LOCK);
 
-    if let Err(err) = pts_root_inode.create(
+    let slave_inode = match pts_root_inode.create(
         &index.to_string(),
         FileType::CharDevice,
         InodeMode::from_bits_truncate(0x666),
     ) {
-        ptm_driver().ttys().remove(&index);
-        pts_driver().ttys().remove(&index);
-        fsinfo.free_index(index);
-        *data = FilePrivateData::Unused;
-        return Err(err);
-    }
+        Ok(slave_inode) => slave_inode,
+        Err(err) => {
+            ptm_driver().ttys().remove(&index);
+            pts_driver().ttys().remove(&index);
+            fsinfo.free_index(index);
+            *data = FilePrivateData::Unused;
+            return Err(err);
+        }
+    };
 
     // 在 master/slave 两端记录 devpts 根目录与 fs，用于精确清理：
     // - master close: unlink /dev/pts/N
@@ -544,6 +576,7 @@ pub fn ptmx_open(
     let hook = Arc::new(PtyDevPtsLink::new(
         Arc::downgrade(&pts_root_inode),
         Arc::downgrade(&fsinfo),
+        slave_inode,
         index,
     ));
     tty.set_private_fields(hook.clone());
@@ -561,4 +594,31 @@ pub fn ptmx_open(
     }
 
     Ok(())
+}
+
+pub fn ptm_peer_inode(master: Arc<TtyCore>) -> Result<Arc<dyn IndexNode>, SystemError> {
+    let core = master.core();
+    if core.driver().tty_driver_sub_type() != TtyDriverSubType::PtyMaster {
+        return Err(SystemError::EIO);
+    }
+
+    let hook_arc = master.private_fields().ok_or(SystemError::EIO)?;
+    let hook = hook_arc
+        .as_any()
+        .downcast_ref::<PtyDevPtsLink>()
+        .ok_or(SystemError::EIO)?;
+    hook.slave_inode()
+}
+
+pub fn pty_file_close(tty: &TtyCore) {
+    let core = tty.core();
+    if core.driver().tty_driver_sub_type() != TtyDriverSubType::PtySlave {
+        return;
+    }
+
+    if let Some(hook_arc) = tty.private_fields() {
+        if let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() {
+            hook.on_slave_file_close();
+        }
+    }
 }

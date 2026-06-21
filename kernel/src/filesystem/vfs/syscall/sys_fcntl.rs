@@ -100,7 +100,7 @@ impl SysFcntlHandle {
 
                 // 在RLIMIT_NOFILE范围内查找可用的文件描述符
                 for i in arg..nofile {
-                    if fd_table_guard.get_file_by_fd(i as i32).is_none() {
+                    if fd_table_guard.fd_slot_available(i as i32) {
                         let (newfd, dropped) = if cmd == FcntlCommand::DupFd {
                             do_dup2(fd, i as i32, &mut fd_table_guard)?
                         } else {

@@ -869,6 +869,8 @@ impl TtyIoctlCmd {
     pub const TIOCGPKT: u32 = 0x80045438;
     /// 获取pts index
     pub const TIOCGPTN: u32 = 0x80045430;
+    /// Open the slave side of a Unix98 PTY from the master fd.
+    pub const TIOCGPTPEER: u32 = 0x5441;
 }
 
 pub struct TtyFlushArg;

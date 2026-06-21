@@ -9,7 +9,9 @@
 #include <sys/xattr.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -63,6 +65,53 @@ bool IsXattrUnsupported(int err) {
     return err == ENOTSUP || err == ENOSYS || err == EOPNOTSUPP;
 }
 
+std::vector<std::string> SplitXattrList(const std::vector<char>& list, ssize_t len) {
+    std::vector<std::string> names;
+    size_t start = 0;
+    for (size_t i = 0; i < static_cast<size_t>(len); ++i) {
+        if (list[i] == '\0') {
+            names.emplace_back(list.data() + start, i - start);
+            start = i + 1;
+        }
+    }
+    EXPECT_EQ(static_cast<size_t>(len), start) << "xattr list is not NUL terminated";
+    return names;
+}
+
+bool ContainsName(const std::vector<std::string>& names, const char* name) {
+    return std::find(names.begin(), names.end(), name) != names.end();
+}
+
+std::vector<std::string> ExpectListContains(const char* path, const char* name) {
+    errno = 0;
+    ssize_t needed = listxattr(path, nullptr, 0);
+    EXPECT_GT(needed, 0) << "listxattr size failed errno=" << errno << " (" << strerror(errno)
+                         << ")";
+    if (needed <= 0) {
+        return {};
+    }
+
+    if (needed > 1) {
+        std::vector<char> small(static_cast<size_t>(needed - 1));
+        errno = 0;
+        EXPECT_EQ(-1, listxattr(path, small.data(), small.size()));
+        EXPECT_EQ(ERANGE, errno);
+    }
+
+    std::vector<char> list(static_cast<size_t>(needed));
+    errno = 0;
+    ssize_t n = listxattr(path, list.data(), list.size());
+    EXPECT_EQ(needed, n) << "listxattr value failed errno=" << errno << " (" << strerror(errno)
+                         << ")";
+    if (n != needed) {
+        return {};
+    }
+
+    auto names = SplitXattrList(list, n);
+    EXPECT_TRUE(ContainsName(names, name)) << "xattr list does not contain " << name;
+    return names;
+}
+
 }  // namespace
 
 TEST(Ext4Xattr, CreateReplaceFlagsAndFailurePreserveValue) {
@@ -106,6 +155,26 @@ TEST(Ext4Xattr, CreateReplaceFlagsAndFailurePreserveValue) {
     ASSERT_EQ(0, setxattr(file.path(), kMissing, "created", 7, XATTR_CREATE))
         << "create missing failed errno=" << errno << " (" << strerror(errno) << ")";
     ExpectValue(file.path(), kMissing, "created");
+
+    auto names = ExpectListContains(file.path(), kName);
+    EXPECT_TRUE(ContainsName(names, kMissing)) << "xattr list does not contain " << kMissing;
+
+    errno = 0;
+    ASSERT_EQ(0, removexattr(file.path(), kName))
+        << "removexattr existing failed errno=" << errno << " (" << strerror(errno) << ")";
+
+    char buf[32] = {};
+    errno = 0;
+    EXPECT_EQ(-1, getxattr(file.path(), kName, buf, sizeof(buf)));
+    EXPECT_EQ(ENODATA, errno);
+    ExpectValue(file.path(), kMissing, "created");
+
+    names = ExpectListContains(file.path(), kMissing);
+    EXPECT_FALSE(ContainsName(names, kName)) << "removed xattr is still listed";
+
+    errno = 0;
+    EXPECT_EQ(-1, removexattr(file.path(), kName));
+    EXPECT_EQ(ENODATA, errno);
 }
 
 int main(int argc, char** argv) {

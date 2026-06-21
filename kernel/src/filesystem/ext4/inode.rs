@@ -666,6 +666,50 @@ impl IndexNode for LockedExt4Inode {
         Ok(0)
     }
 
+    fn listxattr(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let guard = self.0.lock();
+        let ext4 = &guard.concret_fs().fs;
+        let inode_num = guard.inner_inode_num;
+
+        let names = ext4.listxattr(inode_num)?;
+        let total_len = names.iter().try_fold(0usize, |acc, name| {
+            acc.checked_add(name.len())
+                .and_then(|len| len.checked_add(1))
+                .ok_or(SystemError::E2BIG)
+        })?;
+
+        if buf.is_empty() {
+            return Ok(total_len);
+        }
+        if buf.len() < total_len {
+            return Err(SystemError::ERANGE);
+        }
+
+        let mut offset = 0;
+        for name in names {
+            let name_bytes = name.as_bytes();
+            let next = offset + name_bytes.len();
+            buf[offset..next].copy_from_slice(name_bytes);
+            buf[next] = 0;
+            offset = next + 1;
+        }
+
+        Ok(total_len)
+    }
+
+    fn removexattr(&self, name: &str) -> Result<usize, SystemError> {
+        let guard = self.0.lock();
+        let ext4 = &guard.concret_fs().fs;
+        let inode_num = guard.inner_inode_num;
+
+        if ext4.getattr(inode_num)?.ftype == FileType::SymLink {
+            return Err(SystemError::EPERM);
+        }
+
+        ext4.removexattr(inode_num, name)?;
+        Ok(0)
+    }
+
     fn mknod(
         &self,
         filename: &str,

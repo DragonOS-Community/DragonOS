@@ -620,6 +620,12 @@ impl Signal {
             thread_group_leader
                 .sighand()
                 .flags_insert(SignalFlags::CLD_STOPPED);
+            if !thread_group_leader
+                .sighand()
+                .flags_contains(SignalFlags::STOP_STOPPED)
+            {
+                thread_group_leader.sighand().set_stop_signal(*self);
+            }
             thread_group_leader
                 .sighand()
                 .flags_insert(SignalFlags::STOP_STOPPED);

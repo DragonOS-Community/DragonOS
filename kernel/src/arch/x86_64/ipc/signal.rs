@@ -28,7 +28,7 @@ use crate::{
         },
     },
     mm::MemoryManagementArch,
-    process::ProcessManager,
+    process::{ProcessFlags, ProcessManager},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 
@@ -714,6 +714,11 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     let mut info: Option<SigInfo>;
     let mut sigaction: Option<Sigaction>;
     let sig_block: SigSet = *siginfo_read_guard.sig_blocked();
+    let frame_oldset = if pcb.flags().contains(ProcessFlags::RESTORE_SIG_MASK) {
+        *siginfo_read_guard.saved_sigmask()
+    } else {
+        sig_block
+    };
     drop(siginfo_read_guard);
 
     loop {
@@ -783,8 +788,8 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
         }
     }
 
-    let oldset = sig_block;
     // no sig_struct guard to drop
+    pcb.flags().remove(ProcessFlags::RESTORE_SIG_MASK);
     drop(pcb);
     // 做完上面的检查后，开中断
     CurrentIrqArch::interrupt_enable();
@@ -813,7 +818,8 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     }
     *got_signal = true;
 
-    let mut blocked = oldset | sigaction.mask();
+    let oldset = frame_oldset;
+    let mut blocked = sig_block | sigaction.mask();
     if !sigaction.flags().contains(SigFlags::SA_NODEFER) {
         blocked.insert(sig_number.into());
     }

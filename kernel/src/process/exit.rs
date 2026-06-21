@@ -402,7 +402,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             && kwo.options.contains(WaitOption::WSTOPPED)
                             && pcb.sighand().flags_contains(SignalFlags::CLD_STOPPED)
                         {
-                            let stopsig = Signal::SIGSTOP as i32;
+                            let stopsig = pcb.sighand().stop_signal() as i32;
                             kwo.no_task_error = None;
                             kwo.ret_info = Some(WaitIdInfo {
                                 pid: wait_visible_pid(&pcb),
@@ -517,7 +517,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 && kwo.options.contains(WaitOption::WSTOPPED)
                                 && pcb.sighand().flags_contains(SignalFlags::CLD_STOPPED)
                             {
-                                let stopsig = Signal::SIGSTOP as i32;
+                                let stopsig = pcb.sighand().stop_signal() as i32;
                                 kwo.no_task_error = None;
                                 kwo.ret_info = Some(WaitIdInfo {
                                     pid: wait_visible_pid(&pcb),
@@ -668,7 +668,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             && kwo.options.contains(WaitOption::WSTOPPED)
                             && pcb.sighand().flags_contains(SignalFlags::CLD_STOPPED)
                         {
-                            let stopsig = Signal::SIGSTOP as i32;
+                            let stopsig = pcb.sighand().stop_signal() as i32;
                             kwo.no_task_error = None;
                             kwo.ret_info = Some(WaitIdInfo {
                                 pid: wait_visible_pid(&pcb),
@@ -795,7 +795,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 && kwo.options.contains(WaitOption::WSTOPPED)
                                 && pcb.sighand().flags_contains(SignalFlags::CLD_STOPPED)
                             {
-                                let stopsig = Signal::SIGSTOP as i32;
+                                let stopsig = pcb.sighand().stop_signal() as i32;
                                 kwo.no_task_error = None;
                                 kwo.ret_info = Some(WaitIdInfo {
                                     pid: wait_visible_pid(&pcb),
@@ -962,7 +962,7 @@ fn do_waitpid(
         }
         ProcessState::Stopped => {
             // 非 ptrace 停止：报告 stopsig=SIGSTOP
-            let stopsig = Signal::SIGSTOP as i32;
+            let stopsig = child_pcb.sighand().stop_signal() as i32;
             // 由于目前不支持ptrace，因此这个值为false
             let ptrace = false;
 

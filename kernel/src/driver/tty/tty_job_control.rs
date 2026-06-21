@@ -244,6 +244,9 @@ impl TtyJobCtrlManager {
         )?;
 
         let pgrp_nr = *user_reader.read_one_from_user::<i32>(0)?;
+        if pgrp_nr < 0 {
+            return Err(SystemError::EINVAL);
+        }
 
         let current = ProcessManager::current_pcb();
 
@@ -312,21 +315,44 @@ impl TtyJobCtrlManager {
     /// Detach controlling tty from current process if it matches `real_tty`.
     fn tiocnotty(real_tty: Arc<TtyCore>) -> Result<usize, SystemError> {
         let pcb = ProcessManager::current_pcb();
-        let mut siginfo = pcb.sig_info_mut();
-        if let Some(cur) = siginfo.tty() {
-            if Arc::ptr_eq(&cur, &real_tty) {
-                Self::__proc_clear_tty(&mut siginfo);
-                drop(siginfo);
-                let mut ctrl = real_tty.core().contorl_info_irqsave();
-                ctrl.session = None;
-                ctrl.pgid = None;
-                return Ok(0);
-            }
+        let (current_tty, is_session_leader) = {
+            let siginfo = pcb.sig_info_irqsave();
+            (siginfo.tty(), siginfo.is_session_leader)
+        };
+
+        if current_tty.is_none() || !Arc::ptr_eq(&current_tty.unwrap(), &real_tty) {
+            return Err(SystemError::ENOTTY);
         }
-        Err(SystemError::ENOTTY)
+
+        if !is_session_leader {
+            Self::proc_clear_tty(&pcb);
+            return Ok(0);
+        }
+
+        let sid = pcb.task_session();
+        let tty_pgrp = real_tty.core().contorl_info_irqsave().pgid.clone();
+
+        if let Some(pgrp) = tty_pgrp {
+            let _ = crate::ipc::kill::send_signal_to_pgid(&pgrp, Signal::SIGHUP);
+            let _ = crate::ipc::kill::send_signal_to_pgid(&pgrp, Signal::SIGCONT);
+        }
+
+        {
+            let mut ctrl = real_tty.core().contorl_info_irqsave();
+            ctrl.session = None;
+            ctrl.pgid = None;
+        }
+
+        if let Some(sid) = sid {
+            Self::session_clear_tty(sid);
+        } else {
+            Self::proc_clear_tty(&pcb);
+        }
+
+        Ok(0)
     }
 
-    pub(super) fn session_clear_tty(sid: Arc<Pid>) {
+    pub fn session_clear_tty(sid: Arc<Pid>) {
         // 清除会话的tty
         for task in sid.tasks_iter(PidType::SID) {
             TtyJobCtrlManager::proc_clear_tty(&task);

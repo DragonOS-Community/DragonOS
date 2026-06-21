@@ -1,6 +1,8 @@
 use alloc::{
+    collections::VecDeque,
     string::ToString,
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use system_error::SystemError;
 
@@ -30,6 +32,8 @@ use crate::{
 use super::{ptm_driver, pts_driver, PtyCommon};
 
 pub const NR_UNIX98_PTY_MAX: u32 = 128;
+const PTY_BUFFER_LIMIT: usize = 16 * 1024;
+const PTY_DRAIN_CHUNK: usize = 256;
 
 fn current_devpts() -> Result<Arc<DevPtsFs>, SystemError> {
     let fs = ProcessManager::current_mntns()
@@ -58,6 +62,8 @@ struct PtyDevPtsLink {
     slave_inode: Arc<dyn IndexNode>,
     index: usize,
     state: Mutex<PtyDevPtsState>,
+    master_to_slave: Mutex<VecDeque<u8>>,
+    slave_to_master: Mutex<VecDeque<u8>>,
 }
 
 #[derive(Debug, Default)]
@@ -93,7 +99,99 @@ impl PtyDevPtsLink {
             slave_inode,
             index,
             state: Mutex::new(PtyDevPtsState::default()),
+            master_to_slave: Mutex::new(VecDeque::new()),
+            slave_to_master: Mutex::new(VecDeque::new()),
         }
+    }
+
+    fn queue_for_source(&self, subtype: TtyDriverSubType) -> Option<&Mutex<VecDeque<u8>>> {
+        match subtype {
+            TtyDriverSubType::PtyMaster => Some(&self.master_to_slave),
+            TtyDriverSubType::PtySlave => Some(&self.slave_to_master),
+            _ => None,
+        }
+    }
+
+    fn pending_write_room(&self, subtype: TtyDriverSubType) -> usize {
+        self.queue_for_source(subtype)
+            .map(|queue| PTY_BUFFER_LIMIT.saturating_sub(queue.lock().len()))
+            .unwrap_or(0)
+    }
+
+    fn clear_pending_from(&self, subtype: TtyDriverSubType) {
+        if let Some(queue) = self.queue_for_source(subtype) {
+            queue.lock().clear();
+        }
+    }
+
+    fn write_to_peer(
+        &self,
+        subtype: TtyDriverSubType,
+        to: Arc<TtyCore>,
+        buf: &[u8],
+        nr: usize,
+    ) -> Result<usize, SystemError> {
+        let Some(queue) = self.queue_for_source(subtype) else {
+            return Err(SystemError::ENODEV);
+        };
+
+        let accepted = {
+            let mut queue = queue.lock();
+            let room = PTY_BUFFER_LIMIT.saturating_sub(queue.len());
+            let accepted = nr.min(room);
+            for c in &buf[..accepted] {
+                queue.push_back(*c);
+            }
+            accepted
+        };
+
+        if accepted != 0 {
+            self.drain_to_peer(subtype, to)?;
+        }
+
+        Ok(accepted)
+    }
+
+    fn drain_to_peer(
+        &self,
+        subtype: TtyDriverSubType,
+        to: Arc<TtyCore>,
+    ) -> Result<(), SystemError> {
+        let Some(queue) = self.queue_for_source(subtype) else {
+            return Err(SystemError::ENODEV);
+        };
+
+        loop {
+            let mut chunk = Vec::new();
+            {
+                let mut queue = queue.lock();
+                while chunk.len() < PTY_DRAIN_CHUNK {
+                    let Some(c) = queue.pop_front() else {
+                        break;
+                    };
+                    chunk.push(c);
+                }
+            }
+
+            if chunk.is_empty() {
+                break;
+            }
+
+            let delivered = to
+                .core()
+                .port()
+                .unwrap()
+                .receive_buf(&chunk, &[], chunk.len())?;
+            if delivered < chunk.len() {
+                let mut queue = queue.lock();
+                for c in chunk[delivered..].iter().rev() {
+                    queue.push_front(*c);
+                }
+                break;
+            }
+        }
+
+        Ok(())
     }
 
     fn on_close(&self, subtype: TtyDriverSubType) {
@@ -271,22 +369,39 @@ impl TtyOperation for Unix98PtyDriverInner {
             return Ok(0);
         }
 
+        if let Some(hook_arc) = tty.private_fields() {
+            if let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() {
+                return hook.write_to_peer(tty.driver().tty_driver_sub_type(), to, buf, nr);
+            }
+        }
+
         to.core().port().unwrap().receive_buf(buf, &[], nr)
     }
 
     fn write_room(&self, tty: &TtyCoreData) -> usize {
-        // TODO 暂时
         if tty.flow_irqsave().stopped {
             return 0;
         }
 
-        8192
+        if let Some(hook_arc) = tty.private_fields() {
+            if let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() {
+                return hook.pending_write_room(tty.driver().tty_driver_sub_type());
+            }
+        }
+
+        PTY_BUFFER_LIMIT
     }
 
     fn flush_buffer(&self, tty: &TtyCoreData) -> Result<(), SystemError> {
         let Some(to) = tty.link() else {
             return Ok(());
         };
+
+        if let Some(hook_arc) = tty.private_fields() {
+            if let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() {
+                hook.clear_pending_from(tty.driver().tty_driver_sub_type());
+            }
+        }
 
         if to.core().contorl_info_irqsave().packet {
             tty.contorl_info_irqsave()
@@ -621,4 +736,18 @@ pub fn pty_file_close(tty: &TtyCore) {
             hook.on_slave_file_close();
         }
     }
+}
+
+pub fn pty_drain_pending_to(tty: Arc<TtyCore>) -> Result<(), SystemError> {
+    let Some(peer) = tty.core().link() else {
+        return Ok(());
+    };
+    let Some(hook_arc) = tty.private_fields() else {
+        return Ok(());
+    };
+    let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() else {
+        return Ok(());
+    };
+
+    hook.drain_to_peer(peer.core().driver().tty_driver_sub_type(), tty)
 }

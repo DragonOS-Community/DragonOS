@@ -596,6 +596,9 @@ impl File {
     }
 
     pub fn flush_for_close(&self, lock_owner: u64) -> Result<(), SystemError> {
+        if self.mode().contains(FileMode::FMODE_PATH) {
+            return Ok(());
+        }
         let inode = self.inode();
         inode.flush_file(self.private_data.lock(), lock_owner)
     }
@@ -738,30 +741,32 @@ impl File {
     ) -> Result<Self, SystemError> {
         let mut inode = inode;
         let mut file_type = inode.metadata()?.file_type;
-        // 检查是否为命名管道（FIFO）
-        let is_named_pipe = if file_type == FileType::Pipe {
-            if let Some(SpecialNodeData::Pipe(pipe_inode)) = inode.special_node() {
-                inode = pipe_inode;
-                file_type = inode.metadata()?.file_type;
-                true
+        let is_path = flags.contains(FileFlags::O_PATH);
+
+        if !is_path {
+            // 检查是否为命名管道（FIFO）
+            let is_named_pipe = if file_type == FileType::Pipe {
+                if let Some(SpecialNodeData::Pipe(pipe_inode)) = inode.special_node() {
+                    inode = pipe_inode;
+                    file_type = inode.metadata()?.file_type;
+                    true
+                } else {
+                    false
+                }
             } else {
                 false
+            };
+
+            // 对于命名管道，自动添加 O_LARGEFILE 标志（符合 Linux 行为）
+            if is_named_pipe {
+                flags.insert(FileFlags::O_LARGEFILE);
             }
-        } else {
-            false
-        };
 
-        // 对于命名管道，自动添加 O_LARGEFILE 标志（符合 Linux 行为）
-        if is_named_pipe {
-            flags.insert(FileFlags::O_LARGEFILE);
-        }
-
-        if !flags.contains(FileFlags::O_PATH) {
             inode = resolve_device_special_inode(inode, file_type)?;
         }
 
         let metadata = inode.metadata()?;
-        if metadata.flags.contains(InodeFlags::S_APPEND) {
+        if !is_path && metadata.flags.contains(InodeFlags::S_APPEND) {
             flags.insert(FileFlags::O_APPEND);
         }
 
@@ -780,39 +785,38 @@ impl File {
         let mut mode = FileMode::open_fmode(flags);
 
         let private_data = Mutex::new(private_data_init);
-        inode.open(private_data.lock(), &flags)?;
-
-        // 设置默认能力（由 inode 能力接口统一决定；避免 syscall 层/字符串特判）
-        if inode.is_stream() {
-            mode.insert(FileMode::FMODE_STREAM);
-        }
-        if inode.supports_seek() {
-            mode.insert(FileMode::FMODE_LSEEK | FileMode::FMODE_ATOMIC_POS);
-        }
-        if inode.supports_pread() {
-            mode.insert(FileMode::FMODE_PREAD);
-        }
-        if inode.supports_pwrite() {
-            mode.insert(FileMode::FMODE_PWRITE);
-        }
-
-        inode.adjust_file_mode_after_open(&private_data.lock(), &mut mode);
-
-        // TODO: 检查inode是否有read/write方法,设置FMODE_CAN_READ/WRITE
-        // 这需要在IndexNode trait中添加相应的检查方法
-        if mode.contains(FileMode::FMODE_READ) {
-            mode.insert(FileMode::FMODE_CAN_READ);
-        }
-        if mode.contains(FileMode::FMODE_WRITE) {
-            mode.insert(FileMode::FMODE_CAN_WRITE);
-        }
-
-        // 标记为已打开
-        mode.insert(FileMode::FMODE_OPENED);
-
-        // O_PATH特殊处理
-        if flags.contains(FileFlags::O_PATH) {
+        if is_path {
             mode = FileMode::FMODE_PATH | FileMode::FMODE_OPENED;
+        } else {
+            inode.open(private_data.lock(), &flags)?;
+
+            // 设置默认能力（由 inode 能力接口统一决定；避免 syscall 层/字符串特判）
+            if inode.is_stream() {
+                mode.insert(FileMode::FMODE_STREAM);
+            }
+            if inode.supports_seek() {
+                mode.insert(FileMode::FMODE_LSEEK | FileMode::FMODE_ATOMIC_POS);
+            }
+            if inode.supports_pread() {
+                mode.insert(FileMode::FMODE_PREAD);
+            }
+            if inode.supports_pwrite() {
+                mode.insert(FileMode::FMODE_PWRITE);
+            }
+
+            inode.adjust_file_mode_after_open(&private_data.lock(), &mut mode);
+
+            // TODO: 检查inode是否有read/write方法,设置FMODE_CAN_READ/WRITE
+            // 这需要在IndexNode trait中添加相应的检查方法
+            if mode.contains(FileMode::FMODE_READ) {
+                mode.insert(FileMode::FMODE_CAN_READ);
+            }
+            if mode.contains(FileMode::FMODE_WRITE) {
+                mode.insert(FileMode::FMODE_CAN_WRITE);
+            }
+
+            // 标记为已打开
+            mode.insert(FileMode::FMODE_OPENED);
         }
 
         if mode.contains(FileMode::FMODE_WRITE) {
@@ -1649,15 +1653,17 @@ impl Drop for File {
                 mnt_inode.mount_fs().dec_write_count();
             }
         }
-        let r: Result<(), SystemError> = self.inode.close(self.private_data.lock());
-        // 打印错误信息
-        if let Err(e) = r {
-            error!(
-                "pid: {:?} failed to close file: {:?}, errno={:?}",
-                ProcessManager::current_pcb().raw_pid(),
-                self,
-                e
-            );
+        if !self.mode.read().contains(FileMode::FMODE_PATH) {
+            let r: Result<(), SystemError> = self.inode.close(self.private_data.lock());
+            // 打印错误信息
+            if let Err(e) = r {
+                error!(
+                    "pid: {:?} failed to close file: {:?}, errno={:?}",
+                    ProcessManager::current_pcb().raw_pid(),
+                    self,
+                    e
+                );
+            }
         }
     }
 }

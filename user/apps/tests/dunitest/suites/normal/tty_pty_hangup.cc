@@ -8,6 +8,7 @@
 #include <signal.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <stdint.h>
 #include <termios.h>
@@ -40,6 +41,10 @@ constexpr int kTiocsptlck = TIOCSPTLCK;
 constexpr int kTiocgptpeer = 0x5441;
 #else
 constexpr int kTiocgptpeer = TIOCGPTPEER;
+#endif
+
+#ifndef O_PATH
+#define O_PATH 010000000
 #endif
 
 #ifndef TIOCPKT_FLUSHWRITE
@@ -513,6 +518,31 @@ TEST(TtyPtyHangup, MasterOnlyCloseReleasesDevptsIndex) {
     EXPECT_TRUE(saw_reuse) << "master-only open/close did not visibly reuse any devpts index";
 }
 
+TEST(TtyPtyHangup, OPathFifoKeepsPathInodeAndDoesNotBlock) {
+    std::string path = "/tmp/opath_fifo_" + std::to_string(getpid());
+    unlink(path.c_str());
+
+    ASSERT_EQ(0, mkfifo(path.c_str(), 0600))
+        << "mkfifo(" << path << ") failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    struct stat path_stat = {};
+    ASSERT_EQ(0, lstat(path.c_str(), &path_stat))
+        << "lstat(" << path << ") failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    UniqueFd fifo(open(path.c_str(), O_PATH | O_NONBLOCK | O_CLOEXEC));
+    int saved_errno = errno;
+    unlink(path.c_str());
+    ASSERT_GE(fifo.get(), 0) << "open(O_PATH) on FIFO failed or blocked: errno=" << saved_errno
+                             << " (" << strerror(saved_errno) << ")";
+
+    struct stat fd_stat = {};
+    ASSERT_EQ(0, fstat(fifo.get(), &fd_stat))
+        << "fstat(O_PATH FIFO fd) failed: errno=" << errno << " (" << strerror(errno) << ")";
+    EXPECT_EQ(path_stat.st_dev, fd_stat.st_dev);
+    EXPECT_EQ(path_stat.st_ino, fd_stat.st_ino);
+    EXPECT_EQ(path_stat.st_mode & S_IFMT, fd_stat.st_mode & S_IFMT);
+}
+
 TEST(TtyPtyHangup, TiocgptpeerFailsWhileSlaveLocked) {
     UniqueFd master(open("/dev/ptmx", O_RDWR | O_NOCTTY));
     ASSERT_GE(master.get(), 0) << "open(/dev/ptmx) failed: errno=" << errno << " ("
@@ -522,6 +552,21 @@ TEST(TtyPtyHangup, TiocgptpeerFailsWhileSlaveLocked) {
     EXPECT_EQ(-1, ioctl(master.get(), kTiocgptpeer, O_RDWR | O_NOCTTY));
     EXPECT_EQ(EIO, errno) << "locked TIOCGPTPEER should fail with EIO, got errno=" << errno
                           << " (" << strerror(errno) << ")";
+}
+
+TEST(TtyPtyHangup, TiocgptpeerOPathSucceedsWhileSlaveLocked) {
+    UniqueFd master(open("/dev/ptmx", O_RDWR | O_NOCTTY));
+    ASSERT_GE(master.get(), 0) << "open(/dev/ptmx) failed: errno=" << errno << " ("
+                               << strerror(errno) << ")";
+
+    UniqueFd peer(ioctl(master.get(), kTiocgptpeer, O_PATH | O_CLOEXEC));
+    ASSERT_GE(peer.get(), 0) << "locked TIOCGPTPEER(O_PATH) failed: errno=" << errno
+                             << " (" << strerror(errno) << ")";
+
+    int fd_flags = fcntl(peer.get(), F_GETFD);
+    ASSERT_GE(fd_flags, 0) << "fcntl(F_GETFD) failed: errno=" << errno << " (" << strerror(errno)
+                           << ")";
+    EXPECT_NE(0, fd_flags & FD_CLOEXEC);
 }
 
 TEST(TtyPtyHangup, TiocgptpeerOpensUnlockedSlave) {
@@ -560,6 +605,117 @@ TEST(TtyPtyHangup, TiocgptpeerOpensUnlockedSlave) {
     ASSERT_EQ(1, read(master.get(), &ch, 1))
         << "read(master) failed: errno=" << errno << " (" << strerror(errno) << ")";
     EXPECT_EQ('q', ch);
+}
+
+TEST(TtyPtyHangup, TiocgptpeerOPathRejectsTtyOperations) {
+    UniqueFd master(open("/dev/ptmx", O_RDWR | O_NOCTTY));
+    ASSERT_GE(master.get(), 0) << "open(/dev/ptmx) failed: errno=" << errno << " ("
+                               << strerror(errno) << ")";
+
+    UniqueFd peer(ioctl(master.get(), kTiocgptpeer, O_PATH | O_CLOEXEC));
+    ASSERT_GE(peer.get(), 0) << "TIOCGPTPEER(O_PATH) failed: errno=" << errno << " ("
+                             << strerror(errno) << ")";
+
+    char ch = 0;
+    errno = 0;
+    EXPECT_EQ(-1, read(peer.get(), &ch, 1));
+    EXPECT_EQ(EBADF, errno) << "read on O_PATH peer should fail with EBADF, got errno=" << errno
+                            << " (" << strerror(errno) << ")";
+
+    errno = 0;
+    EXPECT_EQ(-1, write(peer.get(), "x", 1));
+    EXPECT_EQ(EBADF, errno) << "write on O_PATH peer should fail with EBADF, got errno=" << errno
+                            << " (" << strerror(errno) << ")";
+
+    struct termios term = {};
+    errno = 0;
+    EXPECT_EQ(-1, tcgetattr(peer.get(), &term));
+    EXPECT_EQ(EBADF, errno) << "tcgetattr on O_PATH peer should fail with EBADF, got errno="
+                            << errno << " (" << strerror(errno) << ")";
+
+    uint32_t index = UINT32_MAX;
+    errno = 0;
+    EXPECT_EQ(-1, ioctl(peer.get(), kTiocgptn, &index));
+    EXPECT_EQ(EBADF, errno) << "ioctl(TIOCGPTN) on O_PATH peer should fail with EBADF, got errno="
+                            << errno << " (" << strerror(errno) << ")";
+}
+
+TEST(TtyPtyHangup, TiocgptpeerOPathCloseDoesNotAffectRealPeerOpen) {
+    UniqueFd master(open("/dev/ptmx", O_RDWR | O_NOCTTY));
+    ASSERT_GE(master.get(), 0) << "open(/dev/ptmx) failed: errno=" << errno << " ("
+                               << strerror(errno) << ")";
+
+    int unlock = 0;
+    ASSERT_EQ(0, ioctl(master.get(), kTiocsptlck, &unlock))
+        << "unlock slave failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    UniqueFd path_peer(ioctl(master.get(), kTiocgptpeer, O_PATH | O_CLOEXEC));
+    ASSERT_GE(path_peer.get(), 0) << "TIOCGPTPEER(O_PATH) failed: errno=" << errno << " ("
+                                  << strerror(errno) << ")";
+    path_peer.reset();
+
+    UniqueFd slave(ioctl(master.get(), kTiocgptpeer, O_RDWR | O_NOCTTY));
+    ASSERT_GE(slave.get(), 0) << "TIOCGPTPEER real peer failed after closing O_PATH peer: errno="
+                              << errno << " (" << strerror(errno) << ")";
+
+    struct termios term = {};
+    ASSERT_EQ(0, tcgetattr(slave.get(), &term))
+        << "tcgetattr(real peer slave) failed: errno=" << errno << " (" << strerror(errno)
+        << ")";
+    term.c_iflag = 0;
+    term.c_oflag = 0;
+    term.c_lflag = 0;
+    term.c_cflag |= CS8;
+    term.c_cc[VMIN] = 1;
+    term.c_cc[VTIME] = 0;
+    ASSERT_EQ(0, tcsetattr(slave.get(), TCSANOW, &term))
+        << "tcsetattr(real peer slave) failed: errno=" << errno << " (" << strerror(errno)
+        << ")";
+
+    ASSERT_EQ(1, write(slave.get(), "p", 1))
+        << "write(real peer slave) failed: errno=" << errno << " (" << strerror(errno) << ")";
+    char ch = 0;
+    ASSERT_EQ(1, read(master.get(), &ch, 1))
+        << "read(master) failed: errno=" << errno << " (" << strerror(errno) << ")";
+    EXPECT_EQ('p', ch);
+}
+
+TEST(TtyPtyHangup, TiocgptpeerOPathDoesNotKeepIndexReserved) {
+    UniqueFd master(open("/dev/ptmx", O_RDWR | O_NOCTTY));
+    ASSERT_GE(master.get(), 0) << "open(/dev/ptmx) failed: errno=" << errno << " ("
+                               << strerror(errno) << ")";
+
+    uint32_t first_index = UINT32_MAX;
+    ASSERT_EQ(0, ioctl(master.get(), kTiocgptn, &first_index))
+        << "TIOCGPTN failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    UniqueFd peer(ioctl(master.get(), kTiocgptpeer, O_PATH | O_CLOEXEC));
+    ASSERT_GE(peer.get(), 0) << "TIOCGPTPEER(O_PATH) failed: errno=" << errno << " ("
+                             << strerror(errno) << ")";
+
+    master.reset();
+
+    bool saw_reused_first_index = false;
+    std::vector<UniqueFd> masters;
+    for (uint32_t i = 0; i < 128; ++i) {
+        UniqueFd next(open("/dev/ptmx", O_RDWR | O_NOCTTY));
+        if (next.get() < 0) {
+            break;
+        }
+
+        uint32_t next_index = UINT32_MAX;
+        ASSERT_EQ(0, ioctl(next.get(), kTiocgptn, &next_index))
+            << "later TIOCGPTN failed: errno=" << errno << " (" << strerror(errno) << ")";
+        if (next_index == first_index) {
+            saw_reused_first_index = true;
+            break;
+        }
+
+        masters.push_back(std::move(next));
+    }
+
+    EXPECT_TRUE(saw_reused_first_index)
+        << "O_PATH TIOCGPTPEER peer should not keep the devpts index reserved";
 }
 
 TEST(TtyPtyHangup, TiocgptpeerSurvivesVisibleDevptsUnlink) {

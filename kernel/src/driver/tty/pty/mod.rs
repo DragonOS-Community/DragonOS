@@ -208,10 +208,7 @@ pub fn pty_init() -> Result<(), SystemError> {
     );
     pts_driver.set_subtype(TtyDriverSubType::PtySlave);
     let term = pts_driver.init_termios_mut();
-    term.input_mode = InputMode::empty();
-    term.output_mode = OutputMode::empty();
     term.control_mode = ControlMode::B38400 | ControlMode::CS8 | ControlMode::CREAD;
-    term.local_mode = LocalMode::empty();
     term.input_speed = 38400;
     term.output_speed = 38400;
     PTS_DRIVER.init(TtyDriverManager::tty_register_driver(pts_driver).unwrap());

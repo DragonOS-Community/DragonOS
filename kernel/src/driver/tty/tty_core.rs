@@ -195,6 +195,15 @@ impl TtyCore {
                     TtySetTermiosOpt::TERMIOS_WAIT | TtySetTermiosOpt::TERMIOS_OLD,
                 );
             }
+            TtyIoctlCmd::TCSETSF => {
+                return TtyCore::core_set_termios(
+                    real_tty,
+                    VirtAddr::new(arg),
+                    TtySetTermiosOpt::TERMIOS_FLUSH
+                        | TtySetTermiosOpt::TERMIOS_WAIT
+                        | TtySetTermiosOpt::TERMIOS_OLD,
+                );
+            }
             _ => {
                 return Err(SystemError::ENOIOCTLCMD);
             }

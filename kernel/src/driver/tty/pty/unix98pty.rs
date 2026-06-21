@@ -2,7 +2,6 @@ use alloc::{
     string::ToString,
     sync::{Arc, Weak},
 };
-use core::sync::atomic::{AtomicBool, Ordering};
 use system_error::SystemError;
 
 use crate::{
@@ -19,7 +18,10 @@ use crate::{
             file::FileFlags, FilePrivateData, FileSystem, FileType, IndexNode, InodeMode, MountFS,
         },
     },
-    libs::{casting::DowncastArc, mutex::MutexGuard},
+    libs::{
+        casting::DowncastArc,
+        mutex::{Mutex, MutexGuard},
+    },
     mm::VirtAddr,
     process::ProcessManager,
     syscall::user_access::UserBufferWriter,
@@ -52,14 +54,21 @@ struct PtyDevPtsLink {
     /// devpts 文件系统本体，用于精确回收索引（避免再去 downcast/全局路径查找）
     devpts: Weak<DevPtsFs>,
     index: usize,
-    /// master 侧（ptmx）最后一个 fd 已关闭
-    master_closed: AtomicBool,
-    /// slave 侧（/dev/pts/N）最后一个 fd 已关闭
-    slave_closed: AtomicBool,
-    /// 目录项是否已经 unlink（通常在 master close 时执行）
-    unlinked: AtomicBool,
-    /// 索引是否已经归还（仅在 master+slave 都关闭后才允许归还）
-    index_freed: AtomicBool,
+    state: Mutex<PtyDevPtsState>,
+}
+
+#[derive(Debug, Default)]
+struct PtyDevPtsState {
+    /// master 侧（ptmx）最后一个 fd 已关闭。
+    master_closed: bool,
+    /// slave open 已经进入 driver open，但尚未提交为 active fd。
+    slave_opening: usize,
+    /// 是否存在已成功打开的 userspace slave fd。
+    slave_active: bool,
+    /// 目录项是否已经 unlink（通常在 master close 时执行）。
+    unlinked: bool,
+    /// 索引是否已经归还（仅在 master close 且无 opening/active slave 后允许归还）。
+    index_freed: bool,
 }
 
 impl crate::driver::tty::tty_driver::TtyCorePrivateField for PtyDevPtsLink {
@@ -74,23 +83,20 @@ impl PtyDevPtsLink {
             pts_root,
             devpts,
             index,
-            master_closed: AtomicBool::new(false),
-            slave_closed: AtomicBool::new(false),
-            unlinked: AtomicBool::new(false),
-            index_freed: AtomicBool::new(false),
+            state: Mutex::new(PtyDevPtsState::default()),
         }
     }
 
     fn on_close(&self, subtype: TtyDriverSubType) {
         match subtype {
             TtyDriverSubType::PtyMaster => {
-                self.master_closed.store(true, Ordering::SeqCst);
+                self.state.lock().master_closed = true;
                 // Linux 语义：master 关闭后，/dev/pts/N 目录项应从 devpts 中消失；
                 // 但索引不能立即复用（slave 可能仍持有打开的 fd），因此 unlink 与 free_index 分离。
                 self.try_unlink_once();
             }
             TtyDriverSubType::PtySlave => {
-                self.slave_closed.store(true, Ordering::SeqCst);
+                self.state.lock().slave_active = false;
             }
             _ => {}
         }
@@ -98,14 +104,57 @@ impl PtyDevPtsLink {
         self.try_free_index_when_fully_closed();
     }
 
-    fn on_open(&self, subtype: TtyDriverSubType) {
-        if subtype == TtyDriverSubType::PtySlave {
-            self.slave_closed.store(false, Ordering::SeqCst);
+    fn begin_slave_open(&self) -> Result<(), SystemError> {
+        let mut state = self.state.lock();
+        if state.master_closed || state.index_freed {
+            return Err(SystemError::EIO);
         }
+        state.slave_opening += 1;
+        Ok(())
+    }
+
+    fn finish_slave_open(&self) {
+        {
+            let mut state = self.state.lock();
+            if state.slave_opening == 0 {
+                log::warn!(
+                    "PtyDevPtsLink: finish slave open without matching begin, index={}",
+                    self.index
+                );
+                return;
+            }
+            state.slave_opening -= 1;
+            state.slave_active = true;
+        }
+        self.try_free_index_when_fully_closed();
+    }
+
+    fn abort_slave_open(&self) {
+        {
+            let mut state = self.state.lock();
+            if state.slave_opening == 0 {
+                log::warn!(
+                    "PtyDevPtsLink: abort slave open without matching begin, index={}",
+                    self.index
+                );
+                return;
+            }
+            state.slave_opening -= 1;
+        }
+        self.try_free_index_when_fully_closed();
     }
 
     fn try_unlink_once(&self) {
-        if self.unlinked.swap(true, Ordering::SeqCst) {
+        let should_unlink = {
+            let mut state = self.state.lock();
+            if state.unlinked {
+                false
+            } else {
+                state.unlinked = true;
+                true
+            }
+        };
+        if !should_unlink {
             return;
         }
         if let Some(root) = self.pts_root.upgrade() {
@@ -114,16 +163,32 @@ impl PtyDevPtsLink {
     }
 
     fn try_free_index_when_fully_closed(&self) {
-        if !(self.master_closed.load(Ordering::SeqCst) && self.slave_closed.load(Ordering::SeqCst))
-        {
-            return;
-        }
-        if self.index_freed.swap(true, Ordering::SeqCst) {
+        let (should_unlink, should_free_index) = {
+            let mut state = self.state.lock();
+            if !state.master_closed
+                || state.slave_opening != 0
+                || state.slave_active
+                || state.index_freed
+            {
+                (false, false)
+            } else {
+                state.index_freed = true;
+                let should_unlink = !state.unlinked;
+                state.unlinked = true;
+                (should_unlink, true)
+            }
+        };
+
+        if !should_free_index {
             return;
         }
 
-        // 兜底：如果 master 未触发 unlink（异常路径），在最终回收时再尝试一次。
-        self.try_unlink_once();
+        if should_unlink {
+            if let Some(root) = self.pts_root.upgrade() {
+                let _ = root.unlink(&self.index.to_string());
+            }
+        }
+
         if let Some(devpts) = self.devpts.upgrade() {
             devpts.free_index(self.index);
         }
@@ -145,14 +210,27 @@ impl TtyOperation for Unix98PtyDriverInner {
     }
 
     fn open(&self, tty: &TtyCoreData) -> Result<(), SystemError> {
-        PtyCommon::pty_common_open(tty)?;
-
         let subtype = tty.driver().tty_driver_sub_type();
-        if let Some(hook_arc) = tty.private_fields() {
-            if let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() {
-                hook.on_open(subtype);
+
+        if subtype == TtyDriverSubType::PtySlave {
+            if let Some(hook_arc) = tty.private_fields() {
+                if let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() {
+                    hook.begin_slave_open()?;
+                    return match PtyCommon::pty_common_open(tty) {
+                        Ok(()) => {
+                            hook.finish_slave_open();
+                            Ok(())
+                        }
+                        Err(err) => {
+                            hook.abort_slave_open();
+                            Err(err)
+                        }
+                    };
+                }
             }
         }
+
+        PtyCommon::pty_common_open(tty)?;
 
         Ok(())
     }

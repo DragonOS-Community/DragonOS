@@ -9,20 +9,23 @@ use super::vfs::utils::DName;
 use super::vfs::vcore;
 use super::vfs::FSMAKER;
 use super::vfs::{
-    self, FileSystem, FileType, FsInfo, IndexNode, Metadata, MountableFileSystem, SuperBlock,
+    self, syscall::RenameFlags, FileSystem, FileType, FsInfo, IndexNode, Metadata,
+    MountableFileSystem, SuperBlock,
 };
 use crate::driver::base::device::device_number::DeviceNumber;
 use crate::driver::base::device::device_number::Major;
 use crate::filesystem::vfs::{FileSystemMaker, FileSystemMakerData};
-use crate::libs::mutex::Mutex;
+use crate::libs::{casting::DowncastArc, mutex::Mutex};
 use crate::mm::VmFlags;
 use crate::process::ProcessManager;
 use crate::register_mountable_fs;
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::sync::Weak;
 use alloc::vec::Vec;
 use core::mem;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use entry::{OvlEntry, OvlLayer};
 use linkme::distributed_slice;
 use system_error::SystemError;
@@ -30,7 +33,9 @@ use system_error::SystemError;
 const WHITEOUT_MODE: u64 = 0o020000 | 0o600; // whiteout字符设备文件模式与权限
 const WHITEOUT_DEV: DeviceNumber = DeviceNumber::new(Major::UNNAMED_MAJOR, 0); // Whiteout 文件设备号
 const WHITEOUT_FLAG: u64 = 0x1;
+static OVL_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 type LowerRoot = (String, Arc<dyn IndexNode>);
+type WorkdirTemp = (Arc<dyn IndexNode>, Arc<dyn IndexNode>, String);
 
 #[derive(Debug, Clone)]
 pub struct OverlayFilePrivateData {
@@ -117,9 +122,10 @@ struct OverlayFS {
     numfs: u32,
     numdatalayer: usize,
     layers: Vec<OvlLayer>, // 第0层为读写层，后面是只读层
-    workdir: Arc<OvlInode>,
+    workdir: Arc<dyn IndexNode>,
     root_inode: Arc<OvlInode>,
     super_block: SuperBlock,
+    mutation_lock: Mutex<()>,
 }
 
 #[derive(Debug)]
@@ -243,12 +249,18 @@ impl MountableFileSystem for OverlayFS {
 
         let lower_layers = lower_layers?;
 
-        let workdir = Arc::new(OvlInode::new(
-            mount_data.work_dir.clone(),
-            FileType::Dir,
-            None,
-            Vec::new(),
-        ));
+        let workdir_inode = root_inode
+            .lookup(&mount_data.work_dir)
+            .map_err(|_| SystemError::EINVAL)?;
+        if upper_file_type != FileType::Dir || workdir_inode.metadata()?.file_type != FileType::Dir
+        {
+            return Err(SystemError::EINVAL);
+        }
+        if Arc::ptr_eq(&upper_inode, &workdir_inode)
+            || !Arc::ptr_eq(&upper_inode.fs(), &workdir_inode.fs())
+        {
+            return Err(SystemError::EINVAL);
+        }
 
         if lower_roots.is_empty() {
             return Err(SystemError::EINVAL);
@@ -273,7 +285,6 @@ impl MountableFileSystem for OverlayFS {
             for layer in &layers {
                 layer.mnt.set_fs(weak_fs.clone());
             }
-            workdir.set_fs(weak_fs.clone());
             root_inode.set_fs(weak_fs.clone());
 
             OverlayFS {
@@ -281,9 +292,10 @@ impl MountableFileSystem for OverlayFS {
                 numfs: 1,
                 numdatalayer: lower_roots.len(),
                 layers,
-                workdir,
+                workdir: workdir_inode,
                 root_inode,
                 super_block: super_block.clone(),
+                mutation_lock: Mutex::new(()),
             }
         });
         Ok(fs)
@@ -331,6 +343,10 @@ impl OvlInode {
 
         self.copy_up()?;
         self.upper_inode.lock().clone().ok_or(SystemError::EROFS)
+    }
+
+    fn workdir_inode(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        Ok(self.overlay_fs()?.workdir.clone())
     }
 
     fn child_redirect(&self, name: &str) -> String {
@@ -442,12 +458,115 @@ impl OvlInode {
         }
     }
 
+    fn create_workdir_temp<F>(&self, create: F) -> Result<WorkdirTemp, SystemError>
+    where
+        F: Fn(&Arc<dyn IndexNode>, &str) -> Result<Arc<dyn IndexNode>, SystemError>,
+    {
+        let workdir = self.workdir_inode()?;
+        for _ in 0..32 {
+            let id = OVL_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+            let name = format!(".dragonos-ovl-{}", id);
+            match create(&workdir, &name) {
+                Ok(inode) => return Ok((workdir, inode, name)),
+                Err(SystemError::EEXIST) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+
+        Err(SystemError::EEXIST)
+    }
+
+    fn cleanup_workdir_temp(workdir: &Arc<dyn IndexNode>, name: &str) {
+        let Ok(inode) = workdir.find(name) else {
+            return;
+        };
+        let Ok(metadata) = inode.metadata() else {
+            return;
+        };
+
+        if metadata.file_type == FileType::Dir {
+            let _ = workdir.rmdir(name);
+        } else {
+            let _ = workdir.unlink(name);
+        }
+    }
+
+    fn create_over_whiteout<F>(
+        &self,
+        name: &str,
+        create_temp: F,
+        is_dir: bool,
+    ) -> Result<Arc<dyn IndexNode>, SystemError>
+    where
+        F: Fn(&Arc<dyn IndexNode>, &str) -> Result<Arc<dyn IndexNode>, SystemError>,
+    {
+        let upper_inode = self.writable_upper_inode()?;
+        match upper_inode.find(name) {
+            Ok(inode) if Self::is_whiteout_inode(&inode) => {}
+            Ok(_) => return Err(SystemError::EEXIST),
+            Err(SystemError::ENOENT) => return create_temp(&upper_inode, name),
+            Err(err) => return Err(err),
+        }
+
+        let (workdir, temp_inode, temp_name) = self.create_workdir_temp(create_temp)?;
+        let commit_result = if is_dir {
+            workdir.move_to(
+                &temp_name,
+                &upper_inode,
+                name,
+                vfs::syscall::RenameFlags::EXCHANGE,
+            )
+        } else {
+            workdir.move_to(
+                &temp_name,
+                &upper_inode,
+                name,
+                vfs::syscall::RenameFlags::empty(),
+            )
+        };
+
+        if let Err(err) = commit_result {
+            Self::cleanup_workdir_temp(&workdir, &temp_name);
+            return Err(err);
+        }
+
+        if is_dir {
+            Self::cleanup_workdir_temp(&workdir, &temp_name);
+        }
+
+        upper_inode.find(name).or(Ok(temp_inode))
+    }
+
     fn is_dot_entry(name: &str) -> bool {
         name == "." || name == ".."
     }
 
     fn is_dir_empty(inode: &Arc<dyn IndexNode>) -> Result<bool, SystemError> {
         Ok(inode.list()?.iter().all(|entry| Self::is_dot_entry(entry)))
+    }
+
+    fn downcast_overlay_inode(inode: Arc<dyn IndexNode>) -> Result<Arc<OvlInode>, SystemError> {
+        inode.downcast_arc::<OvlInode>().ok_or(SystemError::EXDEV)
+    }
+
+    fn lookup_overlay_child(&self, name: &str) -> Result<Arc<OvlInode>, SystemError> {
+        Self::downcast_overlay_inode(self.find(name)?)
+    }
+
+    fn has_upper(&self) -> bool {
+        self.upper_inode.lock().is_some()
+    }
+
+    fn has_lower(&self) -> bool {
+        !self.lower_inodes.is_empty()
+    }
+
+    fn is_pure_upper(&self) -> bool {
+        self.has_upper() && !self.has_lower()
+    }
+
+    fn is_dir(&self) -> bool {
+        self.file_type == FileType::Dir
     }
 
     fn parent_redirect(&self) -> Option<&str> {
@@ -749,12 +868,14 @@ impl IndexNode for OvlInode {
         name: &str,
         mode: vfs::InodeMode,
     ) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
-        let upper_inode = self.writable_upper_inode()?;
-        self.remove_whiteout_if_present(name)?;
-        upper_inode.mkdir(name, mode)
+        let fs = self.overlay_fs()?;
+        let _mutation_guard = fs.mutation_lock.lock();
+        self.create_over_whiteout(name, |dir, temp_name| dir.mkdir(temp_name, mode), true)
     }
 
     fn rmdir(&self, name: &str) -> Result<(), SystemError> {
+        let fs = self.overlay_fs()?;
+        let _mutation_guard = fs.mutation_lock.lock();
         if let Some(ref upper_inode) = *self.upper_inode.lock() {
             match upper_inode.rmdir(name) {
                 Ok(()) => return Ok(()),
@@ -781,6 +902,8 @@ impl IndexNode for OvlInode {
     }
 
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
+        let fs = self.overlay_fs()?;
+        let _mutation_guard = fs.mutation_lock.lock();
         if let Some(ref upper_inode) = *self.upper_inode.lock() {
             match upper_inode.unlink(name) {
                 Ok(()) => return Ok(()),
@@ -808,9 +931,17 @@ impl IndexNode for OvlInode {
         name: &str,
         other: &Arc<dyn IndexNode>,
     ) -> Result<(), system_error::SystemError> {
-        let upper_inode = self.writable_upper_inode()?;
-        self.remove_whiteout_if_present(name)?;
-        upper_inode.link(name, other)
+        let fs = self.overlay_fs()?;
+        let _mutation_guard = fs.mutation_lock.lock();
+        self.create_over_whiteout(
+            name,
+            |dir, temp_name| {
+                dir.link(temp_name, other)?;
+                dir.find(temp_name)
+            },
+            false,
+        )
+        .map(|_| ())
     }
 
     fn create(
@@ -819,9 +950,104 @@ impl IndexNode for OvlInode {
         file_type: vfs::FileType,
         mode: vfs::InodeMode,
     ) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
-        let upper_inode = self.writable_upper_inode()?;
-        self.remove_whiteout_if_present(name)?;
-        upper_inode.create(name, file_type, mode)
+        let fs = self.overlay_fs()?;
+        let _mutation_guard = fs.mutation_lock.lock();
+        self.create_over_whiteout(
+            name,
+            |dir, temp_name| dir.create(temp_name, file_type, mode),
+            file_type == FileType::Dir,
+        )
+    }
+
+    fn move_to(
+        &self,
+        old_name: &str,
+        target: &Arc<dyn IndexNode>,
+        new_name: &str,
+        flags: RenameFlags,
+    ) -> Result<(), SystemError> {
+        if flags.contains(RenameFlags::WHITEOUT) {
+            return Err(SystemError::EINVAL);
+        }
+
+        let fs = self.overlay_fs()?;
+        let _mutation_guard = fs.mutation_lock.lock();
+
+        let target_ovl = target
+            .clone()
+            .downcast_arc::<OvlInode>()
+            .ok_or(SystemError::EXDEV)?;
+
+        let source = self.lookup_overlay_child(old_name)?;
+        let target_had_whiteout = target_ovl.has_whiteout(new_name);
+        let target_child = match target_ovl.lookup_overlay_child(new_name) {
+            Ok(inode) => Some(inode),
+            Err(SystemError::ENOENT) => None,
+            Err(err) => return Err(err),
+        };
+
+        if flags.contains(RenameFlags::NOREPLACE) && target_child.is_some() {
+            return Err(SystemError::EEXIST);
+        }
+
+        if flags.contains(RenameFlags::EXCHANGE) {
+            let target_child = target_child.ok_or(SystemError::ENOENT)?;
+            if (source.is_dir() && source.has_lower())
+                || (target_child.is_dir() && target_child.has_lower())
+            {
+                return Err(SystemError::EXDEV);
+            }
+
+            source.copy_up()?;
+            target_child.copy_up()?;
+            let old_upper_dir = self.writable_upper_inode()?;
+            let new_upper_dir = target_ovl.writable_upper_inode()?;
+            return old_upper_dir.move_to(old_name, &new_upper_dir, new_name, flags);
+        }
+
+        if self.redirect == target_ovl.redirect && old_name == new_name {
+            return Ok(());
+        }
+
+        let source_needs_whiteout = source.has_lower();
+        if source_needs_whiteout && source.is_dir() {
+            return Err(SystemError::EXDEV);
+        }
+
+        if let Some(target_child) = target_child {
+            if source.is_dir() && !target_child.is_dir() {
+                return Err(SystemError::ENOTDIR);
+            }
+            if !source.is_dir() && target_child.is_dir() {
+                return Err(SystemError::EISDIR);
+            }
+            if source.is_dir() && target_child.is_dir() {
+                let target_node: Arc<dyn IndexNode> = target_child.clone();
+                if !Self::is_dir_empty(&target_node)? {
+                    return Err(SystemError::ENOTEMPTY);
+                }
+            }
+        }
+
+        if !source.is_pure_upper() {
+            source.copy_up()?;
+        }
+
+        let old_upper_dir = self.writable_upper_inode()?;
+        let new_upper_dir = target_ovl.writable_upper_inode()?;
+        let mut upper_flags = flags;
+        if target_had_whiteout {
+            upper_flags.remove(RenameFlags::NOREPLACE);
+            if source.is_dir() {
+                old_upper_dir.move_to(old_name, &new_upper_dir, new_name, RenameFlags::EXCHANGE)?;
+                Self::cleanup_workdir_temp(&old_upper_dir, old_name);
+                return Ok(());
+            }
+        }
+        if source_needs_whiteout {
+            upper_flags.insert(RenameFlags::WHITEOUT);
+        }
+        old_upper_dir.move_to(old_name, &new_upper_dir, new_name, upper_flags)
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
@@ -906,8 +1132,16 @@ impl IndexNode for OvlInode {
         mode: vfs::InodeMode,
         dev_t: crate::driver::base::device::device_number::DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
-        let upper_inode = self.writable_upper_inode()?;
-        self.remove_whiteout_if_present(filename)?;
-        upper_inode.mknod(filename, mode, dev_t)
+        let fs = self.overlay_fs()?;
+        let _mutation_guard = fs.mutation_lock.lock();
+        if FileType::from(mode) == FileType::CharDevice && dev_t == WHITEOUT_DEV {
+            return Err(SystemError::EPERM);
+        }
+
+        self.create_over_whiteout(
+            filename,
+            |dir, temp_name| dir.mknod(temp_name, mode, dev_t),
+            FileType::from(mode) == FileType::Dir,
+        )
     }
 }

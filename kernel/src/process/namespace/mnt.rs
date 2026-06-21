@@ -3,7 +3,7 @@ use crate::{
         mount::{MountFSInode, MountFlags, MountList, MountPath},
         FileSystem, IndexNode, InodeId, MountFS,
     },
-    libs::{once::Once, spinlock::SpinLock},
+    libs::{once::Once, rwsem::RwSem},
     process::{fork::CloneFlags, namespace::NamespaceType, ProcessManager},
 };
 use alloc::string::{String, ToString};
@@ -44,12 +44,12 @@ pub struct MntNamespace {
     ns_common: NsCommon,
     self_ref: Weak<MntNamespace>,
     _user_ns: Arc<UserNamespace>,
-    root_mountfs: Arc<MountFS>,
-    inner: SpinLock<InnerMntNamespace>,
+    inner: RwSem<InnerMntNamespace>,
 }
 
 pub struct InnerMntNamespace {
     _dead: bool,
+    root_mountfs: Arc<MountFS>,
     mount_list: Arc<MountList>,
 }
 
@@ -78,8 +78,8 @@ impl MntNamespace {
             ns_common: NsCommon::new(0, NamespaceType::Mount),
             self_ref: self_ref.clone(),
             _user_ns: super::user_namespace::INIT_USER_NAMESPACE.clone(),
-            root_mountfs: ramfs.clone(),
-            inner: SpinLock::new(InnerMntNamespace {
+            inner: RwSem::new(InnerMntNamespace {
+                root_mountfs: ramfs.clone(),
                 mount_list,
                 _dead: false,
             }),
@@ -100,12 +100,10 @@ impl MntNamespace {
     /// Forcibly replace the root mount filesystem of this MountNamespace.
     ///
     /// This method is only for use during DragonOS initialization.
-    pub unsafe fn force_change_root_mountfs(&self, new_root: Arc<MountFS>) {
-        let inner_guard = self.inner.lock();
-        let ptr = self as *const Self as *mut Self;
-        let self_mut = (ptr).as_mut().unwrap();
-        self_mut.root_mountfs = new_root.clone();
+    pub fn force_change_root_mountfs(&self, new_root: Arc<MountFS>) {
+        let mut inner_guard = self.inner.write();
         let (path, _, _) = inner_guard.mount_list.get_mount_point("/").unwrap();
+        inner_guard.root_mountfs = new_root.clone();
 
         inner_guard.mount_list.insert(None, path, new_root);
 
@@ -120,7 +118,8 @@ impl MntNamespace {
         old_put_old_path: &str,
         new_put_old_path: &str,
     ) -> Result<(), SystemError> {
-        let old_root = self.root_mountfs.clone();
+        let mut inner_guard = self.inner.write();
+        let old_root = Self::root_mntfs_locked(&inner_guard);
         let old_root_mountpoint = old_root.self_mountpoint();
         let new_root_mountpoint = new_root.self_mountpoint().ok_or(SystemError::EINVAL)?;
         let new_root_parent = new_root_mountpoint.mount_fs();
@@ -160,10 +159,7 @@ impl MntNamespace {
 
         new_root.set_self_mountpoint(None);
 
-        let inner_guard = self.inner.lock();
-        let ptr = self as *const Self as *mut Self;
-        let self_mut = unsafe { (ptr).as_mut().unwrap() };
-        self_mut.root_mountfs = new_root.clone();
+        inner_guard.root_mountfs = new_root.clone();
 
         inner_guard.mount_list.remove("/");
         if put_old_is_new_root {
@@ -229,6 +225,7 @@ impl MntNamespace {
         old_source_path: &str,
         new_target_path: &str,
     ) -> Result<(), SystemError> {
+        let inner = self.inner.write();
         let moving_mounts = collect_mount_subtree(source_mfs);
         let old_mountpoint = source_mfs.self_mountpoint().ok_or(SystemError::EINVAL)?;
         let old_parent = old_mountpoint.mount_fs();
@@ -257,7 +254,6 @@ impl MntNamespace {
         //    target_mp_id. The ino in the mount_list root record must be updated accordingly,
         //    otherwise copy_mnt_ns() will fail when traversing mountpoints and looking up
         //    target_mp_id in ino2mp.
-        let inner = self.inner.lock();
         let move_result = inner.mount_list.move_subtree(
             source_mfs,
             &moving_mounts,
@@ -265,7 +261,6 @@ impl MntNamespace {
             old_source_path,
             new_target_path,
         );
-        drop(inner);
 
         if let Err(e) = move_result {
             target_parent.mountpoints().remove(&target_mp_id);
@@ -285,9 +280,9 @@ impl MntNamespace {
             ns_common,
             self_ref: self_ref.clone(),
             _user_ns,
-            root_mountfs: new_root.clone(),
-            inner: SpinLock::new(InnerMntNamespace {
+            inner: RwSem::new(InnerMntNamespace {
                 _dead: false,
+                root_mountfs: new_root.clone(),
                 mount_list: MountList::new(),
             }),
         });
@@ -326,9 +321,9 @@ impl MntNamespace {
             // Return the current mount namespace if CLONE_NEWNS is not set
             return Ok(self.self_ref.upgrade().unwrap());
         }
-        let inner = self.inner.lock();
+        let inner = self.inner.read();
 
-        let old_root_mntfs = self.root_mntfs().clone();
+        let old_root_mntfs = Self::root_mntfs_locked(&inner);
         let mut queue: Vec<MountFSCopyInfo> = Vec::new();
 
         // The root mntfs is special, so it is copied separately.
@@ -349,9 +344,10 @@ impl MntNamespace {
         }
 
         let new_mntns = self.copy_with_mountfs(new_root_mntfs, user_ns);
+        let new_mntns_root = new_mntns.root_mntfs();
 
         for x in inner.mount_list.clone_inner().values() {
-            if Arc::ptr_eq(x, new_mntns.root_mntfs()) {
+            if Arc::ptr_eq(x, &new_mntns_root) {
                 continue; // Skip the root mountfs
             }
         }
@@ -372,7 +368,7 @@ impl MntNamespace {
 
             queue.push(MountFSCopyInfo {
                 old_mount_fs: mfs.clone(),
-                parent_mount_fs: new_mntns.root_mntfs().clone(),
+                parent_mount_fs: new_mntns_root.clone(),
                 self_mp_inode_id: *ino,
                 mount_path,
             });
@@ -439,13 +435,18 @@ impl MntNamespace {
         Ok(new_mntns)
     }
 
-    pub fn root_mntfs(&self) -> &Arc<MountFS> {
-        &self.root_mountfs
+    fn root_mntfs_locked(inner: &InnerMntNamespace) -> Arc<MountFS> {
+        inner.root_mountfs.clone()
+    }
+
+    pub fn root_mntfs(&self) -> Arc<MountFS> {
+        Self::root_mntfs_locked(&self.inner.read())
     }
 
     /// Get the root inode of this mount namespace
     pub fn root_inode(&self) -> Arc<dyn IndexNode> {
-        self.root_mountfs.root_inode()
+        let root = self.root_mntfs();
+        root.root_inode()
     }
 
     pub fn add_mount(
@@ -454,23 +455,27 @@ impl MntNamespace {
         mount_path: Arc<MountPath>,
         mntfs: Arc<MountFS>,
     ) -> Result<(), SystemError> {
-        self.inner.lock().mount_list.insert(ino, mount_path, mntfs);
+        self.inner.write().mount_list.insert(ino, mount_path, mntfs);
         Ok(())
     }
 
     pub fn mount_list(&self) -> Arc<MountList> {
-        self.inner.lock().mount_list.clone()
+        self.inner.read().mount_list.clone()
     }
 
     pub fn remove_mount(&self, mount_path: &str) -> Option<Arc<MountFS>> {
-        self.inner.lock().mount_list.remove(mount_path)
+        self.inner.write().mount_list.remove(mount_path)
+    }
+
+    pub fn remove_mount_exact(&self, mntfs: &Arc<MountFS>) -> Option<Arc<MountFS>> {
+        self.inner.write().mount_list.remove_exact(mntfs)
     }
 
     pub fn get_mount_point(
         &self,
         mount_point: &str,
     ) -> Option<(Arc<MountPath>, String, Arc<MountFS>)> {
-        self.inner.lock().mount_list.get_mount_point(mount_point)
+        self.inner.read().mount_list.get_mount_point(mount_point)
     }
 }
 

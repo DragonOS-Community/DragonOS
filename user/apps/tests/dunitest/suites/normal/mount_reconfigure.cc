@@ -862,6 +862,52 @@ TEST(MountReconfigure, StackedMountKeepsOriginalTarget) {
     rmdir(base);
 }
 
+TEST(MountReconfigure, StackedMountRepeatedUnmountKeepsLowerIndex) {
+    const char *base = "/tmp/test_stacked_mount_repeated";
+    const char *target = "/tmp/test_stacked_mount_repeated/target";
+    char lower_marker[256];
+    char upper_marker[256];
+
+    ensure_dir("/tmp");
+    ensure_dir(base);
+    ensure_dir(target);
+
+    if (unshare(CLONE_NEWNS) != 0) {
+        GTEST_SKIP() << strerror(errno);
+    }
+
+    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+
+    for (int i = 0; i < 16; ++i) {
+        snprintf(lower_marker, sizeof(lower_marker), "%s/lower_marker_%d", target, i);
+        snprintf(upper_marker, sizeof(upper_marker), "%s/upper_marker_%d", target, i);
+
+        ASSERT_EQ(0, mount("", target, "ramfs", 0, NULL)) << strerror(errno);
+        ASSERT_EQ(0, write_file(lower_marker)) << strerror(errno);
+
+        ASSERT_EQ(0, mount("", target, "ramfs", 0, NULL)) << strerror(errno);
+        ASSERT_EQ(0, write_file(upper_marker)) << strerror(errno);
+
+        ASSERT_EQ(0, umount(target)) << "top umount failed at round " << i << ": "
+                                     << strerror(errno);
+        EXPECT_TRUE(path_exists(lower_marker)) << "lower mount lost at round " << i;
+        EXPECT_FALSE(path_exists(upper_marker)) << "upper mount remained visible at round " << i;
+
+        ASSERT_EQ(0, unshare(CLONE_NEWNS)) << "copy_mnt_ns failed at round " << i << ": "
+                                           << strerror(errno);
+        EXPECT_TRUE(path_exists(lower_marker)) << "lower mount index lost after unshare at round "
+                                               << i;
+        EXPECT_FALSE(path_exists(upper_marker)) << "upper mount reappeared after unshare at round "
+                                                << i;
+
+        ASSERT_EQ(0, umount(target)) << "lower umount failed at round " << i << ": "
+                                     << strerror(errno);
+    }
+
+    rmdir(target);
+    rmdir(base);
+}
+
 int main(int argc, char **argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

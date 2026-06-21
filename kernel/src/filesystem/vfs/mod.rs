@@ -1046,7 +1046,12 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///
     /// @return 成功：Ok(0)
     ///         失败：Err(错误码)
-    fn setxattr(&self, _name: &str, _value: &[u8]) -> Result<usize, SystemError> {
+    fn setxattr(
+        &self,
+        _name: &str,
+        _value: &[u8],
+        _flags: XattrFlags,
+    ) -> Result<usize, SystemError> {
         log::warn!(
             "setxattr not implemented for {}",
             crate::libs::name::get_type_name(&self)
@@ -1490,6 +1495,14 @@ pub enum FsPermissionPolicy {
 pub enum WritebackSyncMode {
     None,
     All,
+}
+
+bitflags! {
+    /// Flags controlling Linux extended attribute set semantics.
+    pub struct XattrFlags: i32 {
+        const CREATE = 0x1;
+        const REPLACE = 0x2;
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

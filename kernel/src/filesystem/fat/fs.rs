@@ -345,7 +345,13 @@ impl LockedFATInode {
         new_name: &str,
         flags: RenameFlags,
     ) -> Result<(), SystemError> {
+        if flags.contains(RenameFlags::WHITEOUT) {
+            return Err(SystemError::EINVAL);
+        }
         if old_name == new_name {
+            if flags.contains(RenameFlags::NOREPLACE) {
+                return Err(SystemError::EEXIST);
+            }
             return Ok(());
         }
         let old_key = to_search_name(old_name);
@@ -353,6 +359,9 @@ impl LockedFATInode {
         let mut guard = self.0.lock();
         if old_key == new_key {
             guard.find(old_name)?;
+            if flags.contains(RenameFlags::NOREPLACE) {
+                return Err(SystemError::EEXIST);
+            }
             return Ok(());
         }
         let old_inode = guard.find(old_name)?;
@@ -401,6 +410,9 @@ impl LockedFATInode {
         target: &Arc<dyn IndexNode>,
         flags: RenameFlags,
     ) -> Result<(), SystemError> {
+        if flags.contains(RenameFlags::WHITEOUT) {
+            return Err(SystemError::EINVAL);
+        }
         let mut old_guard = self.0.lock();
         let other: &LockedFATInode = target
             .downcast_ref::<LockedFATInode>()

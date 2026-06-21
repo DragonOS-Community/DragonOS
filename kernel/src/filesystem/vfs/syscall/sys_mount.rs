@@ -12,6 +12,7 @@ use crate::{
     },
     libs::casting::DowncastArc,
     process::{
+        cred::{ns_capable, CAPFlags},
         namespace::propagation::{
             change_mnt_propagation_recursive, flags_to_propagation_type, is_propagation_change,
             propagate_moved_tree,
@@ -145,6 +146,13 @@ impl SysMountHandle {
 
 syscall_table_macros::declare_syscall!(SYS_MOUNT, SysMountHandle);
 
+/// Linux `may_mount()`: modifying the current mount namespace requires
+/// CAP_SYS_ADMIN in that namespace's owning user namespace.
+pub(super) fn may_mount() -> bool {
+    let current_mntns = ProcessManager::current_mntns();
+    ns_capable(current_mntns.user_ns(), CAPFlags::CAP_SYS_ADMIN)
+}
+
 /// # do_mount - Dispatch a mount operation
 ///
 /// Resolves `target` in the current mount namespace and dispatches the request
@@ -246,6 +254,10 @@ fn path_mount(
 
     if flags.contains(MountFlags::NOUSER) {
         return Err(SystemError::EINVAL);
+    }
+
+    if !may_mount() {
+        return Err(SystemError::EPERM);
     }
 
     let mut mnt_flags = MountFlags::empty();

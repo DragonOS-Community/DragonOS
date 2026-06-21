@@ -4,7 +4,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::mem::size_of;
+use core::mem::{replace, size_of, take};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use system_error::SystemError;
@@ -21,7 +21,7 @@ use crate::{
             syscall::RenameFlags,
             utils::DName,
             FilePrivateData, FileSystem, FileType, IndexNode, InodeFlags, InodeId, InodeMode,
-            Metadata,
+            Metadata, XattrFlags,
         },
     },
     libs::{
@@ -80,7 +80,7 @@ pub struct FuseNode {
 
 #[derive(Debug, Clone)]
 struct FuseLookupCacheEntry {
-    child: Weak<FuseNode>,
+    child: Arc<FuseNode>,
     generation: u64,
     deadline_ns: u64,
 }
@@ -174,7 +174,7 @@ impl FuseNode {
         self.stale.store(true, Ordering::Release);
     }
 
-    fn check_not_stale(&self) -> Result<(), SystemError> {
+    pub(crate) fn check_not_stale(&self) -> Result<(), SystemError> {
         if self.stale.load(Ordering::Acquire) {
             return Err(SystemError::ESTALE);
         }
@@ -229,6 +229,10 @@ impl FuseNode {
 
     pub(crate) fn clear_parent(&self) {
         *self.parent.lock() = None;
+    }
+
+    pub(crate) fn cached_file_type(&self) -> Option<FileType> {
+        self.cached_metadata.lock().as_ref().map(|md| md.file_type)
     }
 
     pub fn set_cached_metadata(&self, md: Metadata) {
@@ -288,63 +292,136 @@ impl FuseNode {
         valid: u64,
         valid_nsec: u32,
     ) {
-        let deadline_ns = Self::cache_deadline(valid, valid_nsec);
-        let mut cache = self.lookup_cache.lock();
-        if deadline_ns == 0 {
-            cache.remove(name);
+        if child.nodeid() == self.nodeid {
             return;
         }
-        if !cache.contains_key(name) && cache.len() >= Self::LOOKUP_CACHE_MAX_ENTRIES {
-            if let Some(victim) = cache.keys().next().cloned() {
-                cache.remove(&victim);
+        let deadline_ns = Self::cache_deadline(valid, valid_nsec);
+        self.prune_lookup_cache();
+
+        let mut removed = Vec::new();
+        {
+            let mut cache = self.lookup_cache.lock();
+            if deadline_ns == 0 {
+                if let Some(entry) = cache.remove(name) {
+                    removed.push(entry);
+                }
+            } else {
+                if !cache.contains_key(name) && cache.len() >= Self::LOOKUP_CACHE_MAX_ENTRIES {
+                    if let Some(victim) = cache.keys().next().cloned() {
+                        if let Some(entry) = cache.remove(&victim) {
+                            removed.push(entry);
+                        }
+                    }
+                }
+                if let Some(entry) = cache.get_mut(name) {
+                    if Arc::ptr_eq(&entry.child, child) {
+                        entry.generation = generation;
+                        entry.deadline_ns = deadline_ns;
+                    } else {
+                        let old_entry = replace(
+                            entry,
+                            FuseLookupCacheEntry {
+                                child: child.clone(),
+                                generation,
+                                deadline_ns,
+                            },
+                        );
+                        removed.push(old_entry);
+                    }
+                } else {
+                    cache.insert(
+                        name.to_string(),
+                        FuseLookupCacheEntry {
+                            child: child.clone(),
+                            generation,
+                            deadline_ns,
+                        },
+                    );
+                }
             }
         }
-        cache.insert(
-            name.to_string(),
-            FuseLookupCacheEntry {
-                child: Arc::downgrade(child),
-                generation,
-                deadline_ns,
-            },
-        );
+        Self::clear_removed_lookup_entries(removed);
     }
 
     fn invalidate_lookup_cache(&self, name: &str) {
-        self.lookup_cache.lock().remove(name);
+        if let Some(entry) = self.remove_lookup_cache_entry(name) {
+            Self::clear_removed_lookup_entries(vec![entry]);
+        }
     }
 
     fn invalidate_child_name(&self, name: &str) {
-        self.invalidate_lookup_cache(name);
-        if let Some(child) = self
-            .fs
-            .upgrade()
-            .and_then(|fs| fs.find_cached_child(self.nodeid, name))
-        {
+        let removed = self.remove_lookup_cache_entry(name);
+        if let Some(child) = removed.as_ref().map(|entry| entry.child.clone()) {
             child.clear_dname_if(name);
+        }
+        if let Some(entry) = removed {
+            Self::clear_removed_lookup_entries(vec![entry]);
         }
     }
 
     fn lookup_cached_child(&self, name: &str) -> Option<Arc<FuseNode>> {
-        let now = Self::now_ns();
-        let mut cache = self.lookup_cache.lock();
+        self.prune_lookup_cache();
+        let cache = self.lookup_cache.lock();
         let entry = cache.get(name).cloned()?;
-        if entry.deadline_ns != u64::MAX && now >= entry.deadline_ns {
-            cache.remove(name);
-            return None;
-        }
-        let Some(child) = entry.child.upgrade() else {
-            cache.remove(name);
-            return None;
+        Some(entry.child)
+    }
+
+    fn remove_lookup_cache_entry(&self, name: &str) -> Option<FuseLookupCacheEntry> {
+        self.lookup_cache.lock().remove(name)
+    }
+
+    fn lookup_cache_entry_expired_or_stale(
+        parent_nodeid: u64,
+        name: &str,
+        entry: &FuseLookupCacheEntry,
+        now: u64,
+    ) -> bool {
+        (entry.deadline_ns != u64::MAX && now >= entry.deadline_ns)
+            || entry.child.check_not_stale().is_err()
+            || entry.child.generation() != entry.generation
+            || entry.child.parent_fuse_nodeid() != parent_nodeid
+            || !entry.child.has_dname(name)
+    }
+
+    fn take_lookup_cache_entries(&self) -> Vec<FuseLookupCacheEntry> {
+        let mut cache = self.lookup_cache.lock();
+        take(&mut *cache).into_values().collect()
+    }
+
+    pub(crate) fn clear_lookup_cache_tree(&self) {
+        Self::clear_removed_lookup_entries(self.take_lookup_cache_entries());
+    }
+
+    fn prune_lookup_cache(&self) {
+        let now = Self::now_ns();
+        let removed = {
+            let mut cache = self.lookup_cache.lock();
+            let stale_keys: Vec<String> = cache
+                .iter()
+                .filter_map(|(name, entry)| {
+                    if Self::lookup_cache_entry_expired_or_stale(self.nodeid, name, entry, now) {
+                        Some(name.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let mut removed = Vec::new();
+            for key in stale_keys {
+                if let Some(entry) = cache.remove(&key) {
+                    removed.push(entry);
+                }
+            }
+            removed
         };
-        if child.check_not_stale().is_err()
-            || child.generation() != entry.generation
-            || child.parent_fuse_nodeid() != self.nodeid
-            || !child.has_dname(name)
-        {
-            cache.remove(name);
-            return None;
+        Self::clear_removed_lookup_entries(removed);
+    }
+
+    fn clear_removed_lookup_entries(entries: Vec<FuseLookupCacheEntry>) {
+        let mut stack = entries;
+        while let Some(entry) = stack.pop() {
+            stack.extend(entry.child.take_lookup_cache_entries());
         }
-        Some(child)
     }
 
     pub(crate) fn conn(&self) -> &Arc<FuseConn> {
@@ -802,6 +879,9 @@ impl FuseNode {
         if entry.nodeid == 0 {
             return Err(zero_nodeid_error);
         }
+        if entry.attr.size > i64::MAX as u64 {
+            return Err(SystemError::EIO);
+        }
         let file_type = Self::entry_file_type(&entry.attr)?;
         if expected_type.is_some_and(|expected| expected != file_type) {
             return Err(SystemError::EIO);
@@ -810,24 +890,23 @@ impl FuseNode {
     }
 
     fn cache_child_from_entry(&self, entry: &FuseEntryOut, name: &str) {
-        let Ok(md) = Self::metadata_from_valid_entry(entry, SystemError::EIO, None) else {
-            if entry.nodeid != 0 {
-                let _ = self.conn.queue_forget(entry.nodeid, 1);
+        let mut consumed = false;
+        let result = (|| {
+            let md = Self::metadata_from_valid_entry(entry, SystemError::EIO, None)?;
+            if entry.nodeid == self.nodeid {
+                return Err(SystemError::EIO);
             }
-            return;
-        };
-        if let (Some(fs), Some(parent)) = (self.fs.upgrade(), self.self_ref.upgrade()) {
-            let Ok(child) = fs.get_or_create_node_with_generation(
+            let fs = self.fs.upgrade().ok_or(SystemError::ENOENT)?;
+            let parent = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+            let child = fs.get_or_create_node_with_generation(
                 entry.nodeid,
                 Some(parent),
                 Some(md.clone()),
                 Some(entry.generation),
-            ) else {
-                let _ = self.conn.queue_forget(entry.nodeid, 1);
-                return;
-            };
+                1,
+            )?;
+            consumed = true;
             child.set_dname(name);
-            child.inc_lookup(1);
             child.set_cached_metadata_with_valid(md, entry.attr_valid, entry.attr_valid_nsec);
             self.cache_lookup_child(
                 name,
@@ -836,6 +915,10 @@ impl FuseNode {
                 entry.entry_valid,
                 entry.entry_valid_nsec,
             );
+            Ok::<(), SystemError>(())
+        })();
+        if result.is_err() && entry.nodeid != 0 && !consumed {
+            let _ = self.conn.queue_forget(entry.nodeid, 1);
         }
     }
 
@@ -861,6 +944,8 @@ impl FuseNode {
                     names.push(name.to_string());
                     self.cache_child_from_entry(&plus.entry_out, name);
                 }
+            } else if plus.entry_out.nodeid != 0 {
+                let _ = self.conn.queue_forget(plus.entry_out.nodeid, 1);
             }
 
             last_off = dirent.off;
@@ -1146,6 +1231,9 @@ impl FuseNode {
         let result = (|| {
             self.check_not_stale()?;
             let md = Self::metadata_from_valid_entry(entry, SystemError::EIO, Some(expected_type))?;
+            if entry.nodeid == self.nodeid {
+                return Err(SystemError::EIO);
+            }
             let fs = self.fs.upgrade().ok_or(SystemError::ENOENT)?;
             let parent = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
             let child = fs.get_or_create_node_with_generation(
@@ -1153,6 +1241,7 @@ impl FuseNode {
                 Some(parent),
                 Some(md.clone()),
                 Some(entry.generation),
+                1,
             )?;
             if let Some(name) = name {
                 child.set_dname(name);
@@ -1164,7 +1253,6 @@ impl FuseNode {
                     entry.entry_valid_nsec,
                 );
             }
-            child.inc_lookup(1);
             consumed = true;
             child.set_cached_metadata_with_valid(md, entry.attr_valid, entry.attr_valid_nsec);
             Ok(child as Arc<dyn IndexNode>)
@@ -1869,7 +1957,7 @@ impl IndexNode for FuseNode {
         Ok(payload.len())
     }
 
-    fn setxattr(&self, name: &str, value: &[u8]) -> Result<usize, SystemError> {
+    fn setxattr(&self, name: &str, value: &[u8], flags: XattrFlags) -> Result<usize, SystemError> {
         self.check_not_stale()?;
         if self.conn.no_xattr(FUSE_SETXATTR) {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
@@ -1879,7 +1967,7 @@ impl IndexNode for FuseNode {
         }
         let inarg = FuseSetxattrInCompat {
             size: value.len() as u32,
-            flags: 0,
+            flags: flags.bits() as u32,
         };
         let mut payload_in = Self::pack_struct_and_name_payload(&inarg, name);
         payload_in.extend_from_slice(value);
@@ -2524,24 +2612,38 @@ impl IndexNode for FuseNode {
                 }
             },
         )?;
+        if entry.nodeid == self.nodeid {
+            let _ = self.conn.queue_forget(entry.nodeid, 1);
+            return Err(SystemError::EIO);
+        }
 
-        let fs = self.fs.upgrade().ok_or(SystemError::ENOENT)?;
-        let parent = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
-        let child = fs
-            .get_or_create_node_with_generation(
+        let mut consumed = false;
+        let result = (|| {
+            let fs = self.fs.upgrade().ok_or(SystemError::ENOENT)?;
+            let parent = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+            let child = fs.get_or_create_node_with_generation(
                 entry.nodeid,
                 Some(parent),
                 Some(md.clone()),
                 Some(entry.generation),
-            )
-            .inspect_err(|_| {
-                let _ = self.conn.queue_forget(entry.nodeid, 1);
-            })?;
+                1,
+            )?;
+            consumed = true;
+            Ok(child)
+        })();
+        let child = match result {
+            Ok(child) => child,
+            Err(err) => {
+                if entry.nodeid != 0 && !consumed {
+                    let _ = self.conn.queue_forget(entry.nodeid, 1);
+                }
+                return Err(err);
+            }
+        };
         child.set_dname(name);
         child
             .lookup_attr_flags
             .store(entry.attr.flags, Ordering::Relaxed);
-        child.inc_lookup(1);
         child.set_cached_metadata_with_valid(md, entry.attr_valid, entry.attr_valid_nsec);
         self.cache_lookup_child(
             name,
@@ -2687,8 +2789,8 @@ impl IndexNode for FuseNode {
                 Some(parent),
                 Some(md.clone()),
                 Some(entry.generation),
+                1,
             )?;
-            child.inc_lookup(1);
             consumed = true;
             child.set_cached_metadata_with_valid(md, entry.attr_valid, entry.attr_valid_nsec);
             Ok(())
@@ -2752,29 +2854,17 @@ impl IndexNode for FuseNode {
         payload_in.push(0);
         payload_in.extend_from_slice(new_name.as_bytes());
         payload_in.push(0);
-        let cached_old = self
-            .fs
-            .upgrade()
-            .and_then(|fs| fs.find_cached_child(self.nodeid, old_name))
-            .or_else(|| {
-                self.find(old_name)
-                    .ok()
-                    .and_then(|inode| inode.downcast_arc::<FuseNode>())
-            });
-        let cached_new = target_any
-            .fs
-            .upgrade()
-            .and_then(|fs| fs.find_cached_child(target_any.nodeid, new_name))
-            .or_else(|| {
-                if flag.contains(RenameFlags::EXCHANGE) {
-                    target_any
-                        .find(new_name)
-                        .ok()
-                        .and_then(|inode| inode.downcast_arc::<FuseNode>())
-                } else {
-                    None
-                }
-            });
+        let cached_old = self.lookup_cached_child(old_name).or_else(|| {
+            self.find(old_name)
+                .ok()
+                .and_then(|inode| inode.downcast_arc::<FuseNode>())
+        });
+        let cached_new = target_any.lookup_cached_child(new_name).or_else(|| {
+            target_any
+                .find(new_name)
+                .ok()
+                .and_then(|inode| inode.downcast_arc::<FuseNode>())
+        });
         let r = self.conn().request(opcode, self.nodeid, &payload_in);
         if opcode == FUSE_RENAME2 && matches!(r, Err(SystemError::ENOSYS)) {
             return Err(SystemError::EINVAL);
@@ -2816,6 +2906,8 @@ impl IndexNode for FuseNode {
 
 impl Drop for FuseNode {
     fn drop(&mut self) {
+        self.clear_lookup_cache_tree();
+        self.flush_forget();
         self.clear_parent();
     }
 }

@@ -16,12 +16,14 @@ use crate::{
         FileSystem, FileType, IndexNode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
     libs::casting::DowncastArc,
-    process::{all_process, cred::CAPFlags, ProcessControlBlock, ProcessManager},
+    process::{all_process, ProcessControlBlock, ProcessManager},
     syscall::{
         table::{FormattedSyscallParam, Syscall},
         user_access::vfs_check_and_clone_cstr,
     },
 };
+
+use super::sys_mount::may_mount;
 
 pub struct SysPivotRootHandle;
 
@@ -90,6 +92,10 @@ fn resolve_pivot_root_targets(
     new_root_ptr: *const u8,
     put_old_ptr: *const u8,
 ) -> Result<PivotRootTargets, SystemError> {
+    if !may_mount() {
+        return Err(SystemError::EPERM);
+    }
+
     if new_root_ptr.is_null() || put_old_ptr.is_null() {
         return Err(SystemError::EFAULT);
     }
@@ -106,10 +112,6 @@ fn resolve_pivot_root_targets(
     }
 
     let current_pcb = ProcessManager::current_pcb();
-    if !current_pcb.cred().has_capability(CAPFlags::CAP_SYS_ADMIN) {
-        return Err(SystemError::EPERM);
-    }
-
     let current_mntns = ProcessManager::current_mntns();
     let namespace_root_inode = current_mntns.root_inode();
     let current_root_inode = namespace_root_inode.clone();

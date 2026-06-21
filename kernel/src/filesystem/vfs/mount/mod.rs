@@ -2,7 +2,7 @@ use super::{
     file::{FileFlags, FileMode},
     utils::DName,
     FilePrivateData, FileSystem, FileType, IndexNode, InodeId, InodeMode, PollableInode,
-    SuperBlock,
+    SuperBlock, XattrFlags,
 };
 use crate::{
     driver::base::device::device_number::{DeviceNumber, Major},
@@ -682,16 +682,12 @@ impl MountFS {
         all_descendants.reverse();
 
         for child_mfs in &all_descendants {
-            if let Some(path) = mntns.mount_list().get_mount_path_by_mountfs(child_mfs) {
-                mntns.remove_mount(path.as_str());
-            }
+            mntns.remove_mount_exact(child_mfs);
             let _ = child_mfs.umount();
         }
 
         // 3. Finally unmount the root mount itself
-        if let Some(path) = mntns.mount_list().get_mount_path_by_mountfs(root) {
-            mntns.remove_mount(path.as_str());
-        }
+        mntns.remove_mount_exact(root);
         let _ = root.umount();
     }
 
@@ -1196,10 +1192,10 @@ impl MountFSInode {
         loop {
             // Reached the current namespace root: stop.
             if current.is_mountpoint_root()?
-                && current
-                    .mount_fs
-                    .namespace()
-                    .is_some_and(|ns| Arc::ptr_eq(&current.mount_fs, ns.root_mntfs()))
+                && current.mount_fs.namespace().is_some_and(|ns| {
+                    let ns_root = ns.root_mntfs();
+                    Arc::ptr_eq(&current.mount_fs, &ns_root)
+                })
             {
                 break;
             }
@@ -1803,9 +1799,9 @@ impl IndexNode for MountFSInode {
         self.inner_inode.getxattr(name, buf)
     }
 
-    fn setxattr(&self, name: &str, value: &[u8]) -> Result<usize, SystemError> {
+    fn setxattr(&self, name: &str, value: &[u8], flags: XattrFlags) -> Result<usize, SystemError> {
         self.ensure_mount_writable()?;
-        self.inner_inode.setxattr(name, value)
+        self.inner_inode.setxattr(name, value, flags)
     }
 
     fn listxattr(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
@@ -2100,6 +2096,45 @@ impl MountList {
         None
     }
 
+    /// Remove a specific mount record by MountFS identity.
+    ///
+    /// The mount path is resolved from `mfs2mp` while holding the MountList write
+    /// lock, so callers that already hold the target `MountFS` do not lose object
+    /// identity by round-tripping through a path and popping the current top mount.
+    #[inline(never)]
+    pub fn remove_exact(&self, fs: &Arc<MountFS>) -> Option<Arc<MountFS>> {
+        let mut inner = self.inner.write();
+        let path = inner.mfs2mp.get(fs).cloned()?;
+        let Some(mut stack) = inner.mounts.remove(&path) else {
+            inner.mfs2mp.remove(fs);
+            inner.mfs2ino.remove(fs);
+            return None;
+        };
+
+        clear_mount_list_stack_indexes(&mut inner, &path, &stack);
+        let pos = stack.iter().rposition(|rec| Arc::ptr_eq(&rec.fs, fs));
+        let removed = match pos {
+            Some(pos) => stack.remove(pos),
+            None => {
+                inner.mfs2mp.remove(fs);
+                inner.mfs2ino.remove(fs);
+                reindex_mount_list_stack(&mut inner, &path, &stack);
+                if !stack.is_empty() {
+                    inner.mounts.insert(path, stack);
+                }
+                return None;
+            }
+        };
+        let removed_fs = removed.fs.clone();
+
+        reindex_mount_list_stack(&mut inner, &path, &stack);
+        if !stack.is_empty() {
+            inner.mounts.insert(path, stack);
+        }
+
+        Some(removed_fs)
+    }
+
     pub fn rewrite_paths<F>(&self, mut rewrite: F)
     where
         F: FnMut(&str) -> Option<String>,
@@ -2176,6 +2211,40 @@ impl MountList {
     #[inline(never)]
     pub fn get_mount_path_by_mountfs(&self, mountfs: &Arc<MountFS>) -> Option<Arc<MountPath>> {
         self.inner.read().mfs2mp.get(mountfs).cloned()
+    }
+}
+
+fn clear_mount_list_stack_indexes(
+    inner: &mut InnerMountList,
+    path: &Arc<MountPath>,
+    stack: &[MountRecord],
+) {
+    for rec in stack {
+        inner.mfs2mp.remove(&rec.fs);
+        if let Some(ino) = rec.ino {
+            inner.mfs2ino.remove(&rec.fs);
+            if inner
+                .ino2mp
+                .get(&ino)
+                .is_some_and(|mapped| Arc::ptr_eq(mapped, path))
+            {
+                inner.ino2mp.remove(&ino);
+            }
+        }
+    }
+}
+
+fn reindex_mount_list_stack(
+    inner: &mut InnerMountList,
+    path: &Arc<MountPath>,
+    stack: &[MountRecord],
+) {
+    for rec in stack {
+        inner.mfs2mp.insert(rec.fs.clone(), path.clone());
+        if let Some(ino) = rec.ino {
+            inner.mfs2ino.insert(rec.fs.clone(), ino);
+            inner.ino2mp.insert(ino, path.clone());
+        }
     }
 }
 

@@ -23,6 +23,7 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #define FUSE_TEST_LOG_PREFIX "[fuse-test] "
@@ -709,6 +710,9 @@ struct fuse_daemon_args {
     volatile unsigned char *dynamic_hello_first_byte;
     volatile uint32_t *forget_count;
     volatile uint64_t *forget_nlookup_sum;
+    volatile uint64_t *forget_trace_nodeids;
+    volatile uint64_t *forget_trace_nlookups;
+    uint32_t forget_trace_capacity;
     volatile uint32_t *destroy_count;
     volatile uint32_t *init_in_flags;
     volatile uint32_t *init_in_flags2;
@@ -731,6 +735,7 @@ struct fuse_daemon_args {
     volatile uint32_t *setxattr_count;
     volatile uint32_t *listxattr_count;
     volatile uint32_t *removexattr_count;
+    volatile uint32_t *last_setxattr_flags;
     volatile uint32_t *last_setattr_valid;
     volatile uint64_t *last_setattr_fh;
     volatile uint64_t *last_setattr_size;
@@ -790,7 +795,10 @@ struct fuse_daemon_args {
     uint64_t create_generation_override;
     uint64_t link_generation_override;
     uint64_t hello_generation_override;
+    const char *readdirplus_invalid_attr_name;
+    uint64_t readdirplus_invalid_attr_size;
     int link_reuse_old_nodeid;
+    int lookup_self_alias;
     int allow_rename_replace;
     int has_hello_open_fh_override;
     int force_open_enosys;
@@ -799,6 +807,8 @@ struct fuse_daemon_args {
     int force_fsync_errno;
     int force_fsyncdir_errno;
     int force_xattr_enosys;
+    int force_getxattr_erange_at_max;
+    int force_listxattr_erange_at_max;
     int block_read_until_interrupt;
     size_t hello_data_size_override;
     size_t hello_read_size_override;
@@ -942,10 +952,18 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (payload_len < sizeof(struct fuse_forget_in))
             return -1;
         const struct fuse_forget_in *in = (const struct fuse_forget_in *)payload;
+        uint32_t idx = 0;
+        if (a->forget_count)
+            idx = *a->forget_count;
         if (a->forget_count)
             (*a->forget_count)++;
         if (a->forget_nlookup_sum)
             (*a->forget_nlookup_sum) += in->nlookup;
+        if (a->forget_trace_nodeids && a->forget_trace_nlookups &&
+            idx < a->forget_trace_capacity) {
+            a->forget_trace_nodeids[idx] = h->nodeid;
+            a->forget_trace_nlookups[idx] = in->nlookup;
+        }
         return 0;
     }
     case FUSE_LOOKUP: {
@@ -958,6 +976,16 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         struct simplefs_node *parent = simplefs_find_node(&a->fs, h->nodeid);
         if (!parent || !simplefs_node_is_dir(parent)) {
             return fuse_write_reply(a->fd, h->unique, -ENOENT, NULL, 0);
+        }
+        if (a->lookup_self_alias && strcmp(name, "self_alias") == 0) {
+            struct fuse_entry_out out;
+            memset(&out, 0, sizeof(out));
+            out.nodeid = parent->nodeid;
+            out.generation = parent->generation;
+            out.entry_valid = a->entry_valid_sec;
+            out.attr_valid = a->attr_valid_sec;
+            simplefs_fill_attr(parent, &out.attr);
+            return fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out));
         }
         struct simplefs_node *child = simplefs_find_child(&a->fs, h->nodeid, name);
         if (!child) {
@@ -1204,6 +1232,10 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
                 dp.entry_out.nodeid = c->nodeid;
                 dp.entry_out.generation = c->generation;
                 simplefs_fill_attr(c, &dp.entry_out.attr);
+                if (a->readdirplus_invalid_attr_name &&
+                    strcmp(c->name, a->readdirplus_invalid_attr_name) == 0) {
+                    dp.entry_out.attr.size = a->readdirplus_invalid_attr_size;
+                }
                 dp.dirent.ino = c->ino;
                 dp.dirent.off = child_base + 1;
                 dp.dirent.namelen = (uint32_t)nmlen;
@@ -1770,6 +1802,9 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
             out.size = (uint32_t)value_len;
             return fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out));
         }
+        if (a->force_getxattr_erange_at_max && in->size == 65536) {
+            return fuse_write_reply(a->fd, h->unique, -ERANGE, NULL, 0);
+        }
         if (in->size < value_len) {
             return fuse_write_reply(a->fd, h->unique, -ERANGE, NULL, 0);
         }
@@ -1794,6 +1829,9 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
             out.size = (uint32_t)list_len;
             return fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out));
         }
+        if (a->force_listxattr_erange_at_max && in->size == 65536) {
+            return fuse_write_reply(a->fd, h->unique, -ERANGE, NULL, 0);
+        }
         if (in->size < list_len) {
             return fuse_write_reply(a->fd, h->unique, -ERANGE, NULL, 0);
         }
@@ -1808,6 +1846,22 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         }
         if (payload_len < sizeof(struct fuse_setxattr_in_compat) + 1) {
             return -1;
+        }
+        const struct fuse_setxattr_in_compat *in =
+            (const struct fuse_setxattr_in_compat *)payload;
+        if (a->last_setxattr_flags) {
+            *a->last_setxattr_flags = in->flags;
+        }
+        const char *name = (const char *)payload + sizeof(struct fuse_setxattr_in_compat);
+        size_t name_len = strnlen(name, payload_len - sizeof(struct fuse_setxattr_in_compat));
+        if (name_len >= payload_len - sizeof(struct fuse_setxattr_in_compat)) {
+            return -1;
+        }
+        if ((in->flags & XATTR_CREATE) && strcmp(name, "user.dragonos") == 0) {
+            return fuse_write_reply(a->fd, h->unique, -EEXIST, NULL, 0);
+        }
+        if ((in->flags & XATTR_REPLACE) && strcmp(name, "user.missing") == 0) {
+            return fuse_write_reply(a->fd, h->unique, -ENODATA, NULL, 0);
         }
         return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
     }

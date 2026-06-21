@@ -9,10 +9,28 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
+#include <string>
 #include <unistd.h>
 
 namespace {
+
+#ifndef __NR_renameat2
+#define __NR_renameat2 316
+#endif
+
+#ifndef RENAME_NOREPLACE
+#define RENAME_NOREPLACE (1U << 0)
+#endif
+
+#ifndef RENAME_EXCHANGE
+#define RENAME_EXCHANGE (1U << 1)
+#endif
+
+#ifndef RENAME_WHITEOUT
+#define RENAME_WHITEOUT (1U << 2)
+#endif
 
 int ensure_dir(const char* path) {
     struct stat st = {};
@@ -20,6 +38,119 @@ int ensure_dir(const char* path) {
         return S_ISDIR(st.st_mode) ? 0 : -1;
     }
     return mkdir(path, 0755);
+}
+
+std::string join_path(const std::string& dir, const char* name) {
+    return dir + "/" + name;
+}
+
+bool path_exists(const std::string& path) {
+    struct stat st = {};
+    return stat(path.c_str(), &st) == 0;
+}
+
+bool is_whiteout(const std::string& path) {
+    struct stat st = {};
+    if (lstat(path.c_str(), &st) != 0) {
+        return false;
+    }
+    return S_ISCHR(st.st_mode) && major(st.st_rdev) == 0 && minor(st.st_rdev) == 0;
+}
+
+int write_text(const std::string& path, const char* text) {
+    int fd = open(path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0) {
+        return -1;
+    }
+    size_t len = strlen(text);
+    ssize_t written = write(fd, text, len);
+    int saved_errno = errno;
+    close(fd);
+    errno = saved_errno;
+    return written == static_cast<ssize_t>(len) ? 0 : -1;
+}
+
+std::string read_text(const std::string& path) {
+    char buf[128] = {};
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        return {};
+    }
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    int saved_errno = errno;
+    close(fd);
+    errno = saved_errno;
+    if (n < 0) {
+        return {};
+    }
+    return std::string(buf, static_cast<size_t>(n));
+}
+
+long renameat2_call(const std::string& old_path, const std::string& new_path, unsigned flags) {
+    return syscall(__NR_renameat2, AT_FDCWD, old_path.c_str(), AT_FDCWD, new_path.c_str(), flags);
+}
+
+void remove_recursive(const std::string& path) {
+    struct stat st = {};
+    if (lstat(path.c_str(), &st) != 0) {
+        return;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        unlink(path.c_str());
+        return;
+    }
+
+    DIR* dir = opendir(path.c_str());
+    if (dir != nullptr) {
+        while (dirent* ent = readdir(dir)) {
+            if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+                continue;
+            }
+            remove_recursive(join_path(path, ent->d_name));
+        }
+        closedir(dir);
+    }
+    rmdir(path.c_str());
+}
+
+struct OverlayRenameEnv {
+    std::string root;
+    std::string upper;
+    std::string lower;
+    std::string work;
+    std::string merged;
+};
+
+OverlayRenameEnv make_overlay_env(const char* name) {
+    std::string root = std::string("/tmp/") + name + "_" + std::to_string(getpid());
+    OverlayRenameEnv env = {};
+    env.root = root;
+    env.upper = join_path(root, "u");
+    env.lower = join_path(root, "l");
+    env.work = join_path(root, "w");
+    env.merged = join_path(root, "m");
+    return env;
+}
+
+void cleanup_overlay_env(const OverlayRenameEnv& env) {
+    umount(env.merged.c_str());
+    remove_recursive(env.root);
+}
+
+bool setup_overlay_env(const OverlayRenameEnv& env) {
+    if (ensure_dir("/tmp") != 0 || ensure_dir(env.root.c_str()) != 0
+        || ensure_dir(env.upper.c_str()) != 0 || ensure_dir(env.lower.c_str()) != 0
+        || ensure_dir(env.work.c_str()) != 0 || ensure_dir(env.merged.c_str()) != 0) {
+        cleanup_overlay_env(env);
+        return false;
+    }
+    std::string options =
+        "lowerdir=" + env.lower + ",upperdir=" + env.upper + ",workdir=" + env.work;
+    if (mount("overlay", env.merged.c_str(), "overlay", 0, options.c_str()) != 0) {
+        cleanup_overlay_env(env);
+        return false;
+    }
+    return true;
 }
 
 void remove_tree(const char* root) {
@@ -157,6 +288,97 @@ TEST(OverlayFsSemantics, CreateOverWhiteoutAfterLowerUnlink) {
     ASSERT_EQ(0, stat(merged_x, &st)) << strerror(errno);
     EXPECT_TRUE(S_ISREG(st.st_mode));
     EXPECT_EQ(10, st.st_size);
+
+    remove_tree(root);
+}
+
+TEST(OverlayFsSemantics, MkdirOverWhiteoutAfterLowerUnlink) {
+    char root[128] = {};
+    char upper[160] = {};
+    char lower[160] = {};
+    char work[160] = {};
+    char merged[160] = {};
+    char lower_x[192] = {};
+    char merged_x[192] = {};
+    char options[512] = {};
+
+    snprintf(root, sizeof(root), "/tmp/overlayfs_whiteout_mkdir_%d", getpid());
+    snprintf(upper, sizeof(upper), "%s/u", root);
+    snprintf(lower, sizeof(lower), "%s/l", root);
+    snprintf(work, sizeof(work), "%s/w", root);
+    snprintf(merged, sizeof(merged), "%s/m", root);
+    snprintf(lower_x, sizeof(lower_x), "%s/x", lower);
+    snprintf(merged_x, sizeof(merged_x), "%s/x", merged);
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(root));
+    ASSERT_EQ(0, ensure_dir(upper));
+    ASSERT_EQ(0, ensure_dir(lower));
+    ASSERT_EQ(0, ensure_dir(work));
+    ASSERT_EQ(0, ensure_dir(merged));
+
+    FILE* lower_file = fopen(lower_x, "w");
+    ASSERT_NE(nullptr, lower_file) << strerror(errno);
+    fclose(lower_file);
+
+    snprintf(options, sizeof(options), "lowerdir=%s,upperdir=%s,workdir=%s", lower, upper, work);
+    if (mount("overlay", merged, "overlay", 0, options) != 0) {
+        remove_tree(root);
+        GTEST_SKIP() << strerror(errno);
+    }
+
+    ASSERT_EQ(0, unlink(merged_x)) << strerror(errno);
+    ASSERT_EQ(0, mkdir(merged_x, 0755)) << strerror(errno);
+
+    struct stat st = {};
+    ASSERT_EQ(0, stat(merged_x, &st)) << strerror(errno);
+    EXPECT_TRUE(S_ISDIR(st.st_mode));
+
+    remove_tree(root);
+}
+
+TEST(OverlayFsSemantics, MknodWhiteoutOnOverlayIsDenied) {
+    char root[128] = {};
+    char upper[160] = {};
+    char lower[160] = {};
+    char work[160] = {};
+    char merged[160] = {};
+    char lower_x[192] = {};
+    char merged_x[192] = {};
+    char options[512] = {};
+
+    snprintf(root, sizeof(root), "/tmp/overlayfs_whiteout_mknod_%d", getpid());
+    snprintf(upper, sizeof(upper), "%s/u", root);
+    snprintf(lower, sizeof(lower), "%s/l", root);
+    snprintf(work, sizeof(work), "%s/w", root);
+    snprintf(merged, sizeof(merged), "%s/m", root);
+    snprintf(lower_x, sizeof(lower_x), "%s/x", lower);
+    snprintf(merged_x, sizeof(merged_x), "%s/x", merged);
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(root));
+    ASSERT_EQ(0, ensure_dir(upper));
+    ASSERT_EQ(0, ensure_dir(lower));
+    ASSERT_EQ(0, ensure_dir(work));
+    ASSERT_EQ(0, ensure_dir(merged));
+
+    FILE* lower_file = fopen(lower_x, "w");
+    ASSERT_NE(nullptr, lower_file) << strerror(errno);
+    fclose(lower_file);
+
+    snprintf(options, sizeof(options), "lowerdir=%s,upperdir=%s,workdir=%s", lower, upper, work);
+    if (mount("overlay", merged, "overlay", 0, options) != 0) {
+        remove_tree(root);
+        GTEST_SKIP() << strerror(errno);
+    }
+
+    ASSERT_EQ(0, unlink(merged_x)) << strerror(errno);
+    ASSERT_EQ(-1, mknod(merged_x, S_IFCHR | 0600, makedev(0, 0)));
+    EXPECT_EQ(EPERM, errno);
+
+    struct stat st = {};
+    ASSERT_EQ(-1, stat(merged_x, &st));
+    EXPECT_EQ(ENOENT, errno);
 
     remove_tree(root);
 }
@@ -519,6 +741,447 @@ TEST(OverlayFsSemantics, OpenOverlayDirectoryWithoutFsOpenHook) {
     rmdir(lower);
     rmdir(upper);
     rmdir(root);
+}
+
+TEST(RenameAt2Semantics, RejectsUnknownWhiteoutAndInvalidFlagCombinations) {
+    std::string root = std::string("/tmp/renameat2_flags_") + std::to_string(getpid());
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(root.c_str()));
+    std::string old_path = join_path(root, "old");
+    std::string new_path = join_path(root, "new");
+
+    ASSERT_EQ(0, write_text(old_path, "old"));
+    errno = 0;
+    EXPECT_EQ(-1, renameat2_call(old_path, new_path, 0x80000000U));
+    EXPECT_EQ(EINVAL, errno);
+    EXPECT_EQ("old", read_text(old_path));
+    EXPECT_FALSE(path_exists(new_path));
+
+    errno = 0;
+    EXPECT_EQ(-1, renameat2_call(old_path, new_path, 0x80000000U | RENAME_NOREPLACE));
+    EXPECT_EQ(EINVAL, errno);
+    EXPECT_EQ("old", read_text(old_path));
+    EXPECT_FALSE(path_exists(new_path));
+
+    errno = 0;
+    EXPECT_EQ(-1, renameat2_call(join_path(root, "missing"), new_path, 0x80000000U));
+    EXPECT_EQ(EINVAL, errno);
+    EXPECT_EQ("old", read_text(old_path));
+    EXPECT_FALSE(path_exists(new_path));
+
+    ASSERT_EQ(0, write_text(new_path, "new"));
+    errno = 0;
+    EXPECT_EQ(-1, renameat2_call(old_path, new_path, RENAME_EXCHANGE | RENAME_NOREPLACE));
+    EXPECT_EQ(EINVAL, errno);
+    EXPECT_EQ("old", read_text(old_path));
+    EXPECT_EQ("new", read_text(new_path));
+
+    errno = 0;
+    EXPECT_EQ(-1, renameat2_call(old_path, new_path, RENAME_EXCHANGE | RENAME_WHITEOUT));
+    EXPECT_EQ(EINVAL, errno);
+    EXPECT_EQ("old", read_text(old_path));
+    EXPECT_EQ("new", read_text(new_path));
+
+    errno = 0;
+    EXPECT_EQ(-1, renameat2_call(old_path, old_path, RENAME_NOREPLACE));
+    EXPECT_EQ(EEXIST, errno);
+    EXPECT_EQ("old", read_text(old_path));
+
+    remove_recursive(root);
+}
+
+TEST(RenameAt2Semantics, WhiteoutRenamesAndLeavesCharZeroZero) {
+    std::string root = std::string("/tmp/renameat2_whiteout_") + std::to_string(getpid());
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(root.c_str()));
+    if (mount("tmpfs", root.c_str(), "tmpfs", 0, "") != 0) {
+        remove_recursive(root);
+        GTEST_SKIP() << strerror(errno);
+    }
+    std::string old_path = join_path(root, "old");
+    std::string new_path = join_path(root, "new");
+
+    ASSERT_EQ(0, write_text(old_path, "old"));
+    ASSERT_EQ(0, renameat2_call(old_path, new_path, RENAME_WHITEOUT)) << strerror(errno);
+
+    EXPECT_TRUE(is_whiteout(old_path));
+    EXPECT_EQ("old", read_text(new_path));
+    umount(root.c_str());
+    remove_recursive(root);
+}
+
+TEST(RenameAt2Semantics, TmpfsExchangeDirAndFileUpdatesParentNlink) {
+    std::string root = std::string("/tmp/tmpfs_exchange_nlink_") + std::to_string(getpid());
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(root.c_str()));
+    if (mount("tmpfs", root.c_str(), "tmpfs", 0, "") != 0) {
+        remove_recursive(root);
+        GTEST_SKIP() << strerror(errno);
+    }
+
+    std::string a = join_path(root, "a");
+    std::string b = join_path(root, "b");
+    std::string dir = join_path(a, "dir");
+    std::string file = join_path(b, "file");
+    ASSERT_EQ(0, mkdir(a.c_str(), 0755));
+    ASSERT_EQ(0, mkdir(b.c_str(), 0755));
+    ASSERT_EQ(0, mkdir(dir.c_str(), 0755));
+    ASSERT_EQ(0, write_text(file, "file"));
+
+    struct stat a_before = {};
+    struct stat b_before = {};
+    ASSERT_EQ(0, stat(a.c_str(), &a_before)) << strerror(errno);
+    ASSERT_EQ(0, stat(b.c_str(), &b_before)) << strerror(errno);
+
+    ASSERT_EQ(0, renameat2_call(dir, file, RENAME_EXCHANGE)) << strerror(errno);
+
+    struct stat a_after = {};
+    struct stat b_after = {};
+    ASSERT_EQ(0, stat(a.c_str(), &a_after)) << strerror(errno);
+    ASSERT_EQ(0, stat(b.c_str(), &b_after)) << strerror(errno);
+    EXPECT_EQ(a_before.st_nlink - 1, a_after.st_nlink);
+    EXPECT_EQ(b_before.st_nlink + 1, b_after.st_nlink);
+    EXPECT_EQ("file", read_text(join_path(a, "dir")));
+    struct stat moved_dir = {};
+    ASSERT_EQ(0, stat(join_path(b, "file").c_str(), &moved_dir)) << strerror(errno);
+    EXPECT_TRUE(S_ISDIR(moved_dir.st_mode));
+
+    umount(root.c_str());
+    remove_recursive(root);
+}
+
+TEST(RenameAt2Semantics, TmpfsSameDirDirReplaceUpdatesParentNlink) {
+    std::string root = std::string("/tmp/tmpfs_dir_replace_nlink_") + std::to_string(getpid());
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(root.c_str()));
+    if (mount("tmpfs", root.c_str(), "tmpfs", 0, "") != 0) {
+        remove_recursive(root);
+        GTEST_SKIP() << strerror(errno);
+    }
+
+    std::string old_dir = join_path(root, "old");
+    std::string new_dir = join_path(root, "new");
+    ASSERT_EQ(0, mkdir(old_dir.c_str(), 0755));
+    ASSERT_EQ(0, mkdir(new_dir.c_str(), 0755));
+    struct stat before = {};
+    ASSERT_EQ(0, stat(root.c_str(), &before)) << strerror(errno);
+
+    ASSERT_EQ(0, rename(old_dir.c_str(), new_dir.c_str())) << strerror(errno);
+
+    struct stat after = {};
+    ASSERT_EQ(0, stat(root.c_str(), &after)) << strerror(errno);
+    EXPECT_EQ(before.st_nlink - 1, after.st_nlink);
+    EXPECT_FALSE(path_exists(old_dir));
+    struct stat moved = {};
+    ASSERT_EQ(0, stat(new_dir.c_str(), &moved)) << strerror(errno);
+    EXPECT_TRUE(S_ISDIR(moved.st_mode));
+
+    umount(root.c_str());
+    remove_recursive(root);
+}
+
+TEST(RenameAt2Semantics, TmpfsExchangeAncestorDirectoryReturnsEinval) {
+    std::string root = std::string("/tmp/tmpfs_exchange_ancestor_") + std::to_string(getpid());
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(root.c_str()));
+    if (mount("tmpfs", root.c_str(), "tmpfs", 0, "") != 0) {
+        remove_recursive(root);
+        GTEST_SKIP() << strerror(errno);
+    }
+
+    std::string a = join_path(root, "a");
+    std::string b = join_path(a, "b");
+    std::string child = join_path(b, "child");
+    ASSERT_EQ(0, mkdir(a.c_str(), 0755));
+    ASSERT_EQ(0, mkdir(b.c_str(), 0755));
+    ASSERT_EQ(0, write_text(child, "child"));
+
+    errno = 0;
+    EXPECT_EQ(-1, renameat2_call(b, a, RENAME_EXCHANGE));
+    EXPECT_EQ(EINVAL, errno);
+    EXPECT_TRUE(path_exists(a));
+    EXPECT_TRUE(path_exists(b));
+    EXPECT_EQ("child", read_text(child));
+
+    umount(root.c_str());
+    remove_recursive(root);
+}
+
+TEST(OverlayFsSemantics, UpperOnlyRenameMovesEntry) {
+    auto env = make_overlay_env("overlayfs_rename_upper");
+    std::string upper_old = join_path(env.upper, "old");
+    std::string upper_new = join_path(env.upper, "new");
+    std::string merged_old = join_path(env.merged, "old");
+    std::string merged_new = join_path(env.merged, "new");
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_EQ(0, write_text(upper_old, "upper-old"));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+    ASSERT_EQ(0, rename(merged_old.c_str(), merged_new.c_str())) << strerror(errno);
+
+    EXPECT_FALSE(path_exists(merged_old));
+    EXPECT_EQ("upper-old", read_text(merged_new));
+    EXPECT_FALSE(path_exists(upper_old));
+    EXPECT_EQ("upper-old", read_text(upper_new));
+    cleanup_overlay_env(env);
+}
+
+TEST(OverlayFsSemantics, UpperOnlyRenameNoReplacePreservesState) {
+    auto env = make_overlay_env("overlayfs_rename_noreplace");
+    std::string upper_old = join_path(env.upper, "old");
+    std::string upper_new = join_path(env.upper, "new");
+    std::string merged_old = join_path(env.merged, "old");
+    std::string merged_new = join_path(env.merged, "new");
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_EQ(0, write_text(upper_old, "upper-old"));
+    ASSERT_EQ(0, write_text(upper_new, "upper-new"));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+    errno = 0;
+    EXPECT_EQ(-1, renameat2_call(merged_old, merged_new, RENAME_NOREPLACE));
+    EXPECT_EQ(EEXIST, errno);
+
+    EXPECT_EQ("upper-old", read_text(upper_old));
+    EXPECT_EQ("upper-new", read_text(upper_new));
+    EXPECT_EQ("upper-old", read_text(merged_old));
+    EXPECT_EQ("upper-new", read_text(merged_new));
+    cleanup_overlay_env(env);
+}
+
+TEST(OverlayFsSemantics, UserWhiteoutRenameIsRejected) {
+    auto env = make_overlay_env("overlayfs_user_whiteout_reject");
+    std::string upper_old = join_path(env.upper, "old");
+    std::string merged_old = join_path(env.merged, "old");
+    std::string merged_new = join_path(env.merged, "new");
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_EQ(0, write_text(upper_old, "upper-old"));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    errno = 0;
+    EXPECT_EQ(-1, renameat2_call(merged_old, merged_new, RENAME_WHITEOUT));
+    EXPECT_EQ(EINVAL, errno);
+    EXPECT_EQ("upper-old", read_text(merged_old));
+    EXPECT_FALSE(path_exists(merged_new));
+    cleanup_overlay_env(env);
+}
+
+TEST(OverlayFsSemantics, ExchangeCopiesUpLowerTarget) {
+    auto env = make_overlay_env("overlayfs_exchange_lower_target");
+    std::string upper_old = join_path(env.upper, "old");
+    std::string upper_new = join_path(env.upper, "new");
+    std::string lower_new = join_path(env.lower, "new");
+    std::string merged_old = join_path(env.merged, "old");
+    std::string merged_new = join_path(env.merged, "new");
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_EQ(0, write_text(upper_old, "upper-old"));
+    ASSERT_EQ(0, write_text(lower_new, "lower-new"));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    ASSERT_EQ(0, renameat2_call(merged_old, merged_new, RENAME_EXCHANGE)) << strerror(errno);
+
+    EXPECT_EQ("lower-new", read_text(merged_old));
+    EXPECT_EQ("upper-old", read_text(merged_new));
+    EXPECT_EQ("lower-new", read_text(upper_old));
+    EXPECT_EQ("upper-old", read_text(upper_new));
+    EXPECT_EQ("lower-new", read_text(lower_new));
+    cleanup_overlay_env(env);
+}
+
+TEST(OverlayFsSemantics, LowerOnlyFileRenameCopiesUpAndWhiteoutsOldPath) {
+    auto env = make_overlay_env("overlayfs_lower_rename_whiteout");
+    std::string lower_old = join_path(env.lower, "old");
+    std::string upper_old = join_path(env.upper, "old");
+    std::string upper_new = join_path(env.upper, "new");
+    std::string merged_old = join_path(env.merged, "old");
+    std::string merged_new = join_path(env.merged, "new");
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_EQ(0, write_text(lower_old, "lower-old"));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    ASSERT_EQ(0, rename(merged_old.c_str(), merged_new.c_str())) << strerror(errno);
+
+    EXPECT_EQ("lower-old", read_text(lower_old));
+    EXPECT_FALSE(path_exists(merged_old));
+    EXPECT_EQ("lower-old", read_text(merged_new));
+    EXPECT_TRUE(is_whiteout(upper_old));
+    EXPECT_EQ("lower-old", read_text(upper_new));
+    cleanup_overlay_env(env);
+}
+
+TEST(OverlayFsSemantics, RenameNoReplaceOverWhiteoutTargetTreatsTargetAsAbsent) {
+    auto env = make_overlay_env("overlayfs_rename_over_whiteout");
+    std::string upper_old = join_path(env.upper, "old");
+    std::string upper_new = join_path(env.upper, "new");
+    std::string lower_new = join_path(env.lower, "new");
+    std::string merged_old = join_path(env.merged, "old");
+    std::string merged_new = join_path(env.merged, "new");
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_EQ(0, write_text(upper_old, "upper-old"));
+    ASSERT_EQ(0, write_text(lower_new, "lower-new"));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+    ASSERT_EQ(0, unlink(merged_new.c_str())) << strerror(errno);
+    ASSERT_TRUE(is_whiteout(upper_new));
+    EXPECT_FALSE(path_exists(merged_new));
+
+    ASSERT_EQ(0, renameat2_call(merged_old, merged_new, RENAME_NOREPLACE)) << strerror(errno);
+    EXPECT_FALSE(path_exists(merged_old));
+    EXPECT_EQ("upper-old", read_text(merged_new));
+    EXPECT_FALSE(is_whiteout(upper_new));
+    EXPECT_EQ("upper-old", read_text(upper_new));
+    EXPECT_EQ("lower-new", read_text(lower_new));
+    cleanup_overlay_env(env);
+}
+
+TEST(OverlayFsSemantics, LowerFileRenameToDirectoryFailsWithoutCopyUp) {
+    auto env = make_overlay_env("overlayfs_lower_file_to_dir_no_copyup");
+    std::string lower_old = join_path(env.lower, "old");
+    std::string upper_old = join_path(env.upper, "old");
+    std::string upper_new = join_path(env.upper, "new");
+    std::string merged_old = join_path(env.merged, "old");
+    std::string merged_new = join_path(env.merged, "new");
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_EQ(0, write_text(lower_old, "lower-old"));
+    ASSERT_EQ(0, mkdir(upper_new.c_str(), 0755));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    errno = 0;
+    EXPECT_EQ(-1, rename(merged_old.c_str(), merged_new.c_str()));
+    EXPECT_EQ(EISDIR, errno);
+    EXPECT_EQ("lower-old", read_text(merged_old));
+    EXPECT_TRUE(path_exists(merged_new));
+    EXPECT_FALSE(path_exists(upper_old));
+    cleanup_overlay_env(env);
+}
+
+TEST(OverlayFsSemantics, ExchangeLowerDirReturnsExdevNoUpperHalfMove) {
+    auto env = make_overlay_env("overlayfs_exchange_lower_dir");
+    std::string lower_old = join_path(env.lower, "old");
+    std::string lower_child = join_path(lower_old, "child");
+    std::string upper_old = join_path(env.upper, "old");
+    std::string upper_new = join_path(env.upper, "new");
+    std::string merged_old = join_path(env.merged, "old");
+    std::string merged_new = join_path(env.merged, "new");
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_EQ(0, mkdir(lower_old.c_str(), 0755));
+    ASSERT_EQ(0, write_text(lower_child, "child"));
+    ASSERT_EQ(0, write_text(upper_new, "upper-new"));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    errno = 0;
+    EXPECT_EQ(-1, renameat2_call(merged_old, merged_new, RENAME_EXCHANGE));
+    EXPECT_EQ(EXDEV, errno);
+
+    EXPECT_FALSE(path_exists(upper_old));
+    EXPECT_EQ("upper-new", read_text(upper_new));
+    EXPECT_EQ("child", read_text(lower_child));
+    EXPECT_EQ("child", read_text(join_path(merged_old, "child")));
+    EXPECT_EQ("upper-new", read_text(merged_new));
+    cleanup_overlay_env(env);
+}
+
+TEST(OverlayFsSemantics, UpperDirRenameOverNonEmptyLowerDirReturnsEnotempty) {
+    auto env = make_overlay_env("overlayfs_upper_dir_over_nonempty_lower_dir");
+    std::string upper_old = join_path(env.upper, "old");
+    std::string upper_new = join_path(env.upper, "new");
+    std::string lower_new = join_path(env.lower, "new");
+    std::string lower_child = join_path(lower_new, "child");
+    std::string merged_old = join_path(env.merged, "old");
+    std::string merged_new = join_path(env.merged, "new");
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_EQ(0, mkdir(upper_old.c_str(), 0755));
+    ASSERT_EQ(0, mkdir(lower_new.c_str(), 0755));
+    ASSERT_EQ(0, write_text(lower_child, "child"));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    errno = 0;
+    EXPECT_EQ(-1, rename(merged_old.c_str(), merged_new.c_str()));
+    EXPECT_EQ(ENOTEMPTY, errno);
+
+    EXPECT_TRUE(path_exists(upper_old));
+    EXPECT_FALSE(path_exists(upper_new));
+    EXPECT_EQ("child", read_text(lower_child));
+    EXPECT_TRUE(path_exists(merged_old));
+    EXPECT_EQ("child", read_text(join_path(merged_new, "child")));
+    cleanup_overlay_env(env);
+}
+
+TEST(OverlayFsSemantics, UpperDirRenameOverEmptyLowerDirSucceeds) {
+    auto env = make_overlay_env("overlayfs_upper_dir_over_empty_lower_dir");
+    std::string upper_old = join_path(env.upper, "old");
+    std::string upper_new = join_path(env.upper, "new");
+    std::string lower_new = join_path(env.lower, "new");
+    std::string merged_old = join_path(env.merged, "old");
+    std::string merged_new = join_path(env.merged, "new");
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_EQ(0, mkdir(upper_old.c_str(), 0755));
+    ASSERT_EQ(0, mkdir(lower_new.c_str(), 0755));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    ASSERT_EQ(0, rename(merged_old.c_str(), merged_new.c_str())) << strerror(errno);
+
+    EXPECT_FALSE(path_exists(merged_old));
+    EXPECT_TRUE(path_exists(merged_new));
+    EXPECT_FALSE(path_exists(upper_old));
+    EXPECT_TRUE(path_exists(upper_new));
+    cleanup_overlay_env(env);
 }
 
 int main(int argc, char** argv) {

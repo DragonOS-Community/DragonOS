@@ -3,11 +3,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <pty.h>
 #include <signal.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
+#include <stdint.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -17,6 +19,12 @@ namespace {
 constexpr int kTiocpkt = 0x5420;
 #else
 constexpr int kTiocpkt = TIOCPKT;
+#endif
+
+#ifndef TIOCGPTN
+constexpr int kTiocgptn = 0x80045430;
+#else
+constexpr int kTiocgptn = TIOCGPTN;
 #endif
 
 #ifndef TIOCPKT_FLUSHWRITE
@@ -161,6 +169,30 @@ bool IsWouldBlock(int err) {
            || err == EWOULDBLOCK
 #endif
         ;
+}
+
+struct ConcurrentSlaveOpenArgs {
+    const char* slave_name;
+    int start_read_fd;
+    int opened_fd;
+    int open_errno;
+};
+
+void* ConcurrentSlaveOpen(void* raw) {
+    auto* args = static_cast<ConcurrentSlaveOpenArgs*>(raw);
+    char token = 0;
+    ssize_t n = read(args->start_read_fd, &token, 1);
+    close(args->start_read_fd);
+    if (n != 1) {
+        args->opened_fd = -1;
+        args->open_errno = errno == 0 ? EIO : errno;
+        return nullptr;
+    }
+
+    errno = 0;
+    args->opened_fd = open(args->slave_name, O_RDWR | O_NOCTTY);
+    args->open_errno = args->opened_fd >= 0 ? 0 : errno;
+    return nullptr;
 }
 
 bool WaitForChild(pid_t child, int* status, int rounds = 300) {
@@ -344,6 +376,77 @@ TEST(TtyPtyHangup, ReopenedSlaveKeepsIndexReservedAfterMasterClose) {
         << "pty index was reused while a reopened slave fd was still alive";
 }
 
+TEST(TtyPtyHangup, ConcurrentSlaveOpenAndMasterCloseNeverReusesLiveIndex) {
+    constexpr int kIterations = 64;
+    int reopened_success = 0;
+    int eio_failures = 0;
+    int enoent_failures = 0;
+    int other_failures = 0;
+
+    for (int i = 0; i < kIterations; ++i) {
+        SCOPED_TRACE(i);
+        char first_name[128] = {};
+        PtyPair pair = OpenRawPty(first_name);
+        ASSERT_GE(pair.master.get(), 0);
+        ASSERT_GE(pair.slave.get(), 0);
+        ASSERT_NE('\0', first_name[0]);
+
+        pair.slave.reset();
+
+        int start_pipe[2] = {-1, -1};
+        ASSERT_EQ(0, pipe(start_pipe)) << "pipe failed: errno=" << errno << " ("
+                                       << strerror(errno) << ")";
+        UniqueFd write_end(start_pipe[1]);
+
+        ConcurrentSlaveOpenArgs args = {
+            .slave_name = first_name,
+            .start_read_fd = start_pipe[0],
+            .opened_fd = -1,
+            .open_errno = 0,
+        };
+
+        pthread_t thread = {};
+        ASSERT_EQ(0, pthread_create(&thread, nullptr, ConcurrentSlaveOpen, &args))
+            << "pthread_create failed";
+
+        ASSERT_EQ(1, write(write_end.get(), "x", 1))
+            << "failed to release slave opener: errno=" << errno << " (" << strerror(errno)
+            << ")";
+        write_end.reset();
+        pair.master.reset();
+
+        ASSERT_EQ(0, pthread_join(thread, nullptr)) << "pthread_join failed";
+
+        if (args.opened_fd >= 0) {
+            ++reopened_success;
+            UniqueFd reopened(args.opened_fd);
+
+            char second_name[128] = {};
+            PtyPair second = OpenRawPty(second_name);
+            ASSERT_GE(second.master.get(), 0);
+            ASSERT_GE(second.slave.get(), 0);
+            ASSERT_NE('\0', second_name[0]);
+            EXPECT_NE(0, strcmp(first_name, second_name))
+                << "pty index was reused while concurrent reopened slave fd was still alive";
+            continue;
+        }
+
+        if (args.open_errno == EIO) {
+            ++eio_failures;
+        } else if (args.open_errno == ENOENT) {
+            ++enoent_failures;
+        } else {
+            ++other_failures;
+            ADD_FAILURE() << "unexpected concurrent slave open errno=" << args.open_errno << " ("
+                          << strerror(args.open_errno) << ")";
+        }
+    }
+
+    EXPECT_EQ(0, other_failures)
+        << "success=" << reopened_success << " eio=" << eio_failures
+        << " enoent=" << enoent_failures;
+}
+
 TEST(TtyPtyHangup, MasterThenSlaveCloseAllowsCleanIndexReuse) {
     char first_name[128] = {};
     PtyPair first = OpenRawPty(first_name);
@@ -367,6 +470,32 @@ TEST(TtyPtyHangup, MasterThenSlaveCloseAllowsCleanIndexReuse) {
     ASSERT_EQ(1, read(second.master.get(), &ch, 1))
         << "read from reused master failed: errno=" << errno << " (" << strerror(errno) << ")";
     EXPECT_EQ('z', ch);
+}
+
+TEST(TtyPtyHangup, MasterOnlyCloseReleasesDevptsIndex) {
+    constexpr uint32_t kPtyMax = 128;
+    constexpr int kIterations = 160;
+    bool seen[kPtyMax] = {};
+    bool saw_reuse = false;
+
+    for (int i = 0; i < kIterations; ++i) {
+        UniqueFd master(open("/dev/ptmx", O_RDWR | O_NOCTTY));
+        ASSERT_GE(master.get(), 0) << "open(/dev/ptmx) failed at iteration " << i
+                                   << ": errno=" << errno << " (" << strerror(errno) << ")";
+
+        uint32_t index = UINT32_MAX;
+        ASSERT_EQ(0, ioctl(master.get(), kTiocgptn, &index))
+            << "ioctl(TIOCGPTN) failed at iteration " << i << ": errno=" << errno << " ("
+            << strerror(errno) << ")";
+
+        ASSERT_LT(index, kPtyMax) << "unexpected PTY index " << index;
+        if (seen[index]) {
+            saw_reuse = true;
+        }
+        seen[index] = true;
+    }
+
+    EXPECT_TRUE(saw_reuse) << "master-only open/close did not visibly reuse any devpts index";
 }
 
 TEST(TtyPtyHangup, ClosingOneOfMultipleSlaveFdsDoesNotHangupMaster) {

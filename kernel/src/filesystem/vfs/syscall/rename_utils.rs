@@ -32,6 +32,14 @@ pub fn do_renameat2(
     filename_to: *const u8,
     flags: u32,
 ) -> Result<usize, SystemError> {
+    let flags = RenameFlags::from_bits(flags).ok_or(SystemError::EINVAL)?;
+
+    if flags.contains(RenameFlags::EXCHANGE)
+        && (flags.contains(RenameFlags::NOREPLACE) || flags.contains(RenameFlags::WHITEOUT))
+    {
+        return Err(SystemError::EINVAL);
+    }
+
     let filename_from = vfs_check_and_clone_cstr(filename_from, Some(MAX_PATHLEN))?
         .into_string()
         .map_err(|_| SystemError::EINVAL)?;
@@ -63,15 +71,6 @@ pub fn do_renameat2(
         return Err(SystemError::ENAMETOOLONG);
     }
 
-    let flags = RenameFlags::from_bits_truncate(flags);
-
-    // 标志互斥性检查（Linux 语义：EXCHANGE 与 NOREPLACE/WHITEOUT 互斥）
-    if flags.contains(RenameFlags::EXCHANGE)
-        && (flags.contains(RenameFlags::NOREPLACE) || flags.contains(RenameFlags::WHITEOUT))
-    {
-        return Err(SystemError::EINVAL);
-    }
-
     if flags.contains(RenameFlags::NOREPLACE) && (new_filename == "." || new_filename == "..") {
         return Err(SystemError::EEXIST);
     }
@@ -86,9 +85,19 @@ pub fn do_renameat2(
     }
 
     let old_inode = old_parent_inode.lookup(old_filename)?;
-    if old_inode.metadata()?.file_type == crate::filesystem::vfs::FileType::Dir {
+    let old_inode_type = old_inode.metadata()?.file_type;
+    if old_inode_type == crate::filesystem::vfs::FileType::Dir {
         // 仅当把目录移动到其自身或其子树下时拦截
         if is_ancestor(&old_inode, &new_parent_inode) {
+            return Err(SystemError::EINVAL);
+        }
+    }
+
+    if flags.contains(RenameFlags::EXCHANGE) {
+        let new_inode = new_parent_inode.lookup(new_filename)?;
+        if new_inode.metadata()?.file_type == crate::filesystem::vfs::FileType::Dir
+            && is_ancestor(&new_inode, &old_parent_inode)
+        {
             return Err(SystemError::EINVAL);
         }
     }

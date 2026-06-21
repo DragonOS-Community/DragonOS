@@ -3,12 +3,14 @@
 demo/gtest_demo
 normal/capability
 normal/fdatasync
+normal/ext4_xattr
 normal/fallocate_semantics
 normal/syncfs_semantics
 normal/fcntl_lock
 normal/fcntl_signal
 normal/epoll_timeout_budget
 normal/devpts_dir_read
+normal/debugfs_mount
 normal/test_pivot_root
 normal/mount_reconfigure
 normal/mount_propagation

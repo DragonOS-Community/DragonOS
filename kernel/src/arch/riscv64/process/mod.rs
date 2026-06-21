@@ -432,6 +432,10 @@ impl ArchPCBInfo {
         *self = from.clone();
     }
 
+    /// Synchronize hardware-backed current-thread state before common fork code
+    /// clones `ArchPCBInfo`.
+    pub fn sync_current_state_before_fork(&mut self) {}
+
     pub fn set_stack(&mut self, stack: VirtAddr) {
         self.ksp = stack.data();
     }

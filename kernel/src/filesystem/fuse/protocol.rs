@@ -33,6 +33,10 @@ pub const FUSE_WRITE: u32 = 16;
 pub const FUSE_STATFS: u32 = 17;
 pub const FUSE_RELEASE: u32 = 18;
 pub const FUSE_FSYNC: u32 = 20;
+pub const FUSE_SETXATTR: u32 = 21;
+pub const FUSE_GETXATTR: u32 = 22;
+pub const FUSE_LISTXATTR: u32 = 23;
+pub const FUSE_REMOVEXATTR: u32 = 24;
 pub const FUSE_FLUSH: u32 = 25;
 pub const FUSE_INIT: u32 = 26;
 pub const FUSE_OPENDIR: u32 = 27;
@@ -419,6 +423,27 @@ pub struct FuseFlushIn {
 pub struct FuseFsyncIn {
     pub fh: u64,
     pub fsync_flags: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseSetxattrInCompat {
+    pub size: u32,
+    pub flags: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseGetxattrIn {
+    pub size: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseGetxattrOut {
+    pub size: u32,
     pub padding: u32,
 }
 

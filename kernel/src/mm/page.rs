@@ -203,6 +203,23 @@ impl PageManager {
         old_phys: &PhysAddr,
         allocator: &mut dyn FrameAllocator,
     ) -> Result<Arc<Page>, SystemError> {
+        self.copy_page_with_type(old_phys, allocator, None)
+    }
+
+    pub fn copy_page_as_normal(
+        &mut self,
+        old_phys: &PhysAddr,
+        allocator: &mut dyn FrameAllocator,
+    ) -> Result<Arc<Page>, SystemError> {
+        self.copy_page_with_type(old_phys, allocator, Some(PageType::Normal))
+    }
+
+    fn copy_page_with_type(
+        &mut self,
+        old_phys: &PhysAddr,
+        allocator: &mut dyn FrameAllocator,
+        page_type: Option<PageType>,
+    ) -> Result<Arc<Page>, SystemError> {
         let old_page = self.get(old_phys).ok_or(SystemError::EINVAL)?;
         let paddr = unsafe { allocator.allocate_one().ok_or(SystemError::ENOMEM)? };
 
@@ -210,6 +227,9 @@ impl PageManager {
 
         let page = Page::copy(old_page.read(), paddr)
             .inspect_err(|_| unsafe { allocator.free_one(paddr) })?;
+        if let Some(page_type) = page_type {
+            page.write().set_page_type(page_type);
+        }
 
         self.insert(&page)?;
 
@@ -998,11 +1018,11 @@ impl<Arch: MemoryManagementArch> PageTable<Arch> {
                             entry.set_flags(new_flags);
                             new_table.set_entry(i, entry);
                         } else {
-                            let phys = allocator.allocate_one()?;
                             let mut page_manager_guard = page_manager_lock();
                             let old_phys = entry.address().unwrap();
-                            page_manager_guard.copy_page(&old_phys, allocator).ok()?;
-                            new_table.set_entry(i, PageEntry::new(phys, entry.flags()));
+                            let page = page_manager_guard.copy_page(&old_phys, allocator).ok()?;
+                            new_table
+                                .set_entry(i, PageEntry::new(page.phys_address(), entry.flags()));
                         }
                     }
                 }

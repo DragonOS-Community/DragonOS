@@ -288,6 +288,15 @@ impl ArchPCBInfo {
         *self = from.clone_all();
         self.gsdata = gsdata;
     }
+
+    /// Synchronize hardware-backed current-thread state before common fork code
+    /// clones `ArchPCBInfo`.
+    pub fn sync_current_state_before_fork(&mut self) {
+        unsafe {
+            self.save_fsbase();
+            self.save_gsbase();
+        }
+    }
 }
 
 impl ProcessControlBlock {
@@ -360,6 +369,11 @@ impl ProcessManager {
         // 获取并拷贝父进程的架构信息
         // 注意：需要使用mut guard以便保存FP状态
         let mut current_arch_guard = current_pcb.arch_info_irqsave();
+
+        unsafe {
+            current_arch_guard.save_fsbase();
+            current_arch_guard.save_gsbase();
+        }
 
         // 在拷贝FP状态之前，先从硬件寄存器保存当前的FP状态
         // 这样确保即使在信号处理函数中fork，子进程也能继承fork时刻的真实FP寄存器状态

@@ -25,12 +25,12 @@ use super::protocol::{
     FuseInterruptIn, FuseOutHeader, FuseWriteIn, FUSE_ABORT_ERROR, FUSE_ASYNC_DIO, FUSE_ASYNC_READ,
     FUSE_ATOMIC_O_TRUNC, FUSE_AUTO_INVAL_DATA, FUSE_BIG_WRITES, FUSE_DESTROY, FUSE_DONT_MASK,
     FUSE_DO_READDIRPLUS, FUSE_EXPLICIT_INVAL_DATA, FUSE_EXPORT_SUPPORT, FUSE_FLUSH, FUSE_FORGET,
-    FUSE_FSYNC, FUSE_FSYNCDIR, FUSE_HANDLE_KILLPRIV, FUSE_INIT, FUSE_INIT_EXT, FUSE_INTERRUPT,
-    FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION, FUSE_LOOKUP, FUSE_MAX_PAGES,
-    FUSE_MIN_READ_BUFFER, FUSE_NOTIFY_DELETE, FUSE_NOTIFY_INVAL_ENTRY, FUSE_NOTIFY_INVAL_INODE,
-    FUSE_NOTIFY_POLL, FUSE_NOTIFY_RETRIEVE, FUSE_NOTIFY_STORE, FUSE_NO_OPENDIR_SUPPORT,
-    FUSE_NO_OPEN_SUPPORT, FUSE_PARALLEL_DIROPS, FUSE_POSIX_ACL, FUSE_POSIX_LOCKS,
-    FUSE_READDIRPLUS_AUTO, FUSE_SUBMOUNTS,
+    FUSE_FSYNC, FUSE_FSYNCDIR, FUSE_GETXATTR, FUSE_HANDLE_KILLPRIV, FUSE_INIT, FUSE_INIT_EXT,
+    FUSE_INTERRUPT, FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION, FUSE_LISTXATTR, FUSE_LOOKUP,
+    FUSE_MAX_PAGES, FUSE_MIN_READ_BUFFER, FUSE_NOTIFY_DELETE, FUSE_NOTIFY_INVAL_ENTRY,
+    FUSE_NOTIFY_INVAL_INODE, FUSE_NOTIFY_POLL, FUSE_NOTIFY_RETRIEVE, FUSE_NOTIFY_STORE,
+    FUSE_NO_OPENDIR_SUPPORT, FUSE_NO_OPEN_SUPPORT, FUSE_PARALLEL_DIROPS, FUSE_POSIX_ACL,
+    FUSE_POSIX_LOCKS, FUSE_READDIRPLUS_AUTO, FUSE_REMOVEXATTR, FUSE_SETXATTR, FUSE_SUBMOUNTS,
 };
 
 fn wait_with_recheck<T, F>(waitq: &WaitQueue, mut check: F) -> Result<T, SystemError>
@@ -177,6 +177,10 @@ struct FuseConnInner {
     no_flush: bool,
     no_fsync: bool,
     no_fsyncdir: bool,
+    no_getxattr: bool,
+    no_setxattr: bool,
+    no_listxattr: bool,
+    no_removexattr: bool,
     no_interrupt: bool,
     max_write_cap: usize,
     pending: VecDeque<Arc<FuseRequest>>,
@@ -199,6 +203,7 @@ impl FuseConn {
     // Keep this in sync with `sys_read.rs` userspace chunking size.
     const USER_READ_CHUNK: usize = 64 * 1024;
     const MIN_MAX_WRITE: usize = 4096;
+    const DEFAULT_MAX_READAHEAD: usize = 128 * MMArch::PAGE_SIZE;
 
     pub fn new() -> Arc<Self> {
         Self::new_with_max_write_cap(
@@ -236,6 +241,10 @@ impl FuseConn {
                 no_flush: false,
                 no_fsync: false,
                 no_fsyncdir: false,
+                no_getxattr: false,
+                no_setxattr: false,
+                no_listxattr: false,
+                no_removexattr: false,
                 no_interrupt: false,
                 max_write_cap,
                 pending: VecDeque::new(),
@@ -376,6 +385,28 @@ impl FuseConn {
         }
     }
 
+    pub fn no_xattr(&self, opcode: u32) -> bool {
+        let g = self.inner.lock();
+        match opcode {
+            FUSE_GETXATTR => g.no_getxattr,
+            FUSE_SETXATTR => g.no_setxattr,
+            FUSE_LISTXATTR => g.no_listxattr,
+            FUSE_REMOVEXATTR => g.no_removexattr,
+            _ => false,
+        }
+    }
+
+    pub fn mark_no_xattr(&self, opcode: u32) {
+        let mut g = self.inner.lock();
+        match opcode {
+            FUSE_GETXATTR => g.no_getxattr = true,
+            FUSE_SETXATTR => g.no_setxattr = true,
+            FUSE_LISTXATTR => g.no_listxattr = true,
+            FUSE_REMOVEXATTR => g.no_removexattr = true,
+            _ => {}
+        }
+    }
+
     fn alloc_unique(&self) -> u64 {
         self.next_unique.fetch_add(2, Ordering::Relaxed)
     }
@@ -459,7 +490,12 @@ impl FuseConn {
             let mut g = self.inner.lock();
             should_destroy = g.connected && g.initialized;
             g.mounted = false;
-            g.pending.clear();
+            // Filesystem teardown queues accumulated FORGET requests before
+            // the connection enters on_umount().  Preserve those no-reply
+            // requests so the daemon can release lookup references before
+            // it receives DESTROY; drop ordinary requests that can no longer
+            // complete after unmount.
+            g.pending.retain(|req| req.opcode == FUSE_FORGET);
             processing = g.processing.values().cloned().collect();
             g.processing.clear();
         }
@@ -697,7 +733,7 @@ impl FuseConn {
         let init_in = FuseInitIn {
             major: FUSE_KERNEL_VERSION,
             minor: FUSE_KERNEL_MINOR_VERSION,
-            max_readahead: 0,
+            max_readahead: Self::DEFAULT_MAX_READAHEAD as u32,
             flags: flags as u32,
             flags2: (flags >> 32) as u32,
             unused: [0; 11],
@@ -1076,6 +1112,10 @@ impl FuseConn {
             (opcode, SystemError::from_i32(errno)),
             (FUSE_LOOKUP, Some(SystemError::ENOENT))
                 | (FUSE_FLUSH, Some(SystemError::ENOSYS))
+                | (FUSE_GETXATTR, Some(SystemError::ENOSYS))
+                | (FUSE_SETXATTR, Some(SystemError::ENOSYS))
+                | (FUSE_LISTXATTR, Some(SystemError::ENOSYS))
+                | (FUSE_REMOVEXATTR, Some(SystemError::ENOSYS))
                 | (FUSE_INTERRUPT, Some(SystemError::EAGAIN_OR_EWOULDBLOCK))
         )
     }
@@ -1101,5 +1141,20 @@ impl FuseConn {
     pub fn max_read(&self) -> usize {
         let g = self.inner.lock();
         core::cmp::max(Self::MIN_MAX_WRITE, g.max_read as usize)
+    }
+
+    pub fn max_pages(&self) -> usize {
+        let g = self.inner.lock();
+        core::cmp::max(1, g.init.max_pages as usize)
+    }
+
+    pub fn max_readahead_pages(&self) -> usize {
+        let g = self.inner.lock();
+        let bytes = if g.init.max_readahead == 0 {
+            Self::DEFAULT_MAX_READAHEAD
+        } else {
+            g.init.max_readahead as usize
+        };
+        core::cmp::max(1, bytes >> MMArch::PAGE_SHIFT)
     }
 }

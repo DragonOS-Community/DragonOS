@@ -1,11 +1,11 @@
 use crate::{
     arch::MMArch,
-    driver::base::device::device_number::DeviceNumber,
+    driver::base::device::device_number::{DeviceNumber, Major},
     filesystem::{
         page_cache::{AsyncPageCacheBackend, PageCache},
         vfs::{
             self, syscall::RenameFlags, utils::DName, vcore::generate_inode_id, FilePrivateData,
-            IndexNode, InodeFlags, InodeId, InodeMode, SpecialNodeData,
+            IndexNode, InodeFlags, InodeId, InodeMode, SpecialNodeData, XattrFlags,
         },
     },
     ipc::pipe::LockedPipeInode,
@@ -18,6 +18,7 @@ use crate::{
 };
 use alloc::{
     collections::BTreeMap,
+    format,
     string::String,
     sync::{Arc, Weak},
     vec::Vec,
@@ -28,6 +29,8 @@ use num::ToPrimitive;
 use system_error::SystemError;
 
 use super::filesystem::Ext4FileSystem;
+
+const WHITEOUT_DEV: DeviceNumber = DeviceNumber::new(Major::UNNAMED_MAJOR, 0);
 
 bitflags! {
     /// Inode 脏状态标志位，对应 Linux `inode->i_state` 中的 `I_DIRTY_*` 位。
@@ -643,7 +646,7 @@ impl IndexNode for LockedExt4Inode {
         Ok(copy_len)
     }
 
-    fn setxattr(&self, name: &str, value: &[u8]) -> Result<usize, SystemError> {
+    fn setxattr(&self, name: &str, value: &[u8], flags: XattrFlags) -> Result<usize, SystemError> {
         let guard = self.0.lock();
         let ext4 = &guard.concret_fs().fs;
         let inode_num = guard.inner_inode_num;
@@ -652,13 +655,58 @@ impl IndexNode for LockedExt4Inode {
             return Err(SystemError::EPERM);
         }
 
-        if ext4.getxattr(inode_num, name).is_ok() {
-            ext4.removexattr(inode_num, name)?;
+        ext4.setxattr_with_flags(
+            inode_num,
+            name,
+            value,
+            flags.contains(XattrFlags::CREATE),
+            flags.contains(XattrFlags::REPLACE),
+        )?;
+
+        Ok(0)
+    }
+
+    fn listxattr(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let guard = self.0.lock();
+        let ext4 = &guard.concret_fs().fs;
+        let inode_num = guard.inner_inode_num;
+
+        let names = ext4.listxattr(inode_num)?;
+        let total_len = names.iter().try_fold(0usize, |acc, name| {
+            acc.checked_add(name.len())
+                .and_then(|len| len.checked_add(1))
+                .ok_or(SystemError::E2BIG)
+        })?;
+
+        if buf.is_empty() {
+            return Ok(total_len);
+        }
+        if buf.len() < total_len {
+            return Err(SystemError::ERANGE);
         }
 
-        // 调用another_ext4库的setxattr接口
-        ext4.setxattr(inode_num, name, value)?;
+        let mut offset = 0;
+        for name in names {
+            let name_bytes = name.as_bytes();
+            let next = offset + name_bytes.len();
+            buf[offset..next].copy_from_slice(name_bytes);
+            buf[next] = 0;
+            offset = next + 1;
+        }
 
+        Ok(total_len)
+    }
+
+    fn removexattr(&self, name: &str) -> Result<usize, SystemError> {
+        let guard = self.0.lock();
+        let ext4 = &guard.concret_fs().fs;
+        let inode_num = guard.inner_inode_num;
+
+        if ext4.getattr(inode_num)?.ftype == FileType::SymLink {
+            return Err(SystemError::EPERM);
+        }
+
+        ext4.removexattr(inode_num, name)?;
         Ok(0)
     }
 
@@ -742,15 +790,15 @@ impl IndexNode for LockedExt4Inode {
         let old_dname = DName::from(old_name);
         let new_dname = DName::from(new_name);
 
-        // Same directory, same name -> no-op
-        if src_inode_num == target_inode_num && old_dname == new_dname {
-            return Ok(());
-        }
-
         // NOREPLACE check (VFS layer responsibility - ext4 lib doesn't know about flags)
         if flags.contains(RenameFlags::NOREPLACE) && ext4.lookup(target_inode_num, new_name).is_ok()
         {
             return Err(SystemError::EEXIST);
+        }
+
+        // Same directory, same name -> no-op
+        if src_inode_num == target_inode_num && old_dname == new_dname {
+            return Ok(());
         }
 
         // RENAME_EXCHANGE: 原子交换两个文件/目录
@@ -781,8 +829,44 @@ impl IndexNode for LockedExt4Inode {
             }
         }
 
-        // ext4 library now correctly handles atomic replace
-        ext4.rename(src_inode_num, old_name, target_inode_num, new_name)?;
+        if flags.contains(RenameFlags::WHITEOUT) {
+            let mut temp_name = String::new();
+            for _ in 0..32 {
+                let candidate = format!(".dragonos-whiteout-{}", generate_inode_id().data());
+                if ext4.lookup(src_inode_num, &candidate).is_ok() {
+                    continue;
+                }
+                ext4.mknod(
+                    src_inode_num,
+                    &candidate,
+                    another_ext4::InodeMode::CHARDEV
+                        | another_ext4::InodeMode::from_bits_retain(0o600),
+                    WHITEOUT_DEV.major().data(),
+                    WHITEOUT_DEV.minor(),
+                )?;
+                temp_name = candidate;
+                break;
+            }
+            if temp_name.is_empty() {
+                return Err(SystemError::EEXIST);
+            }
+
+            if let Err(err) =
+                ext4.rename_exchange(src_inode_num, old_name, src_inode_num, &temp_name)
+            {
+                let _ = ext4.unlink(src_inode_num, &temp_name);
+                return Err(err.into());
+            }
+
+            if let Err(err) = ext4.rename(src_inode_num, &temp_name, target_inode_num, new_name) {
+                let _ = ext4.rename_exchange(src_inode_num, old_name, src_inode_num, &temp_name);
+                let _ = ext4.unlink(src_inode_num, &temp_name);
+                return Err(err.into());
+            }
+        } else {
+            // ext4 library now correctly handles atomic replace
+            ext4.rename(src_inode_num, old_name, target_inode_num, new_name)?;
+        }
 
         // Update cache
         self.update_rename_cache(

@@ -13,7 +13,7 @@ use crate::register_mountable_fs;
 use crate::{
     arch::mm::LockedFrameAllocator,
     arch::MMArch,
-    driver::base::device::device_number::DeviceNumber,
+    driver::base::device::device_number::{DeviceNumber, Major},
     filesystem::vfs::{vcore::generate_inode_id, FileType},
     ipc::pipe::LockedPipeInode,
     libs::casting::DowncastArc,
@@ -45,6 +45,7 @@ const TMPFS_BLOCK_SIZE: u64 = 4096;
 
 const TMPFS_DEFAULT_MIN_SIZE_BYTES: usize = 16 * 1024 * 1024; // 16MiB
 const TMPFS_DEFAULT_MAX_SIZE_BYTES: usize = 4 * 1024 * 1024 * 1024; // 4GiB
+const WHITEOUT_DEV: DeviceNumber = DeviceNumber::new(Major::UNNAMED_MAJOR, 0);
 
 #[derive(Debug)]
 struct TmpfsPageCacheBackend {
@@ -106,18 +107,55 @@ fn tmpfs_move_entry_between_dirs(
         .ok_or(SystemError::ENOENT)?;
     let old_type = inode_to_move.0.lock().metadata.file_type;
 
-    if let Some(existing) = dst_dir.children.get(new_key) {
+    if flags.contains(RenameFlags::EXCHANGE) {
+        let existing = dst_dir
+            .children
+            .get(new_key)
+            .cloned()
+            .ok_or(SystemError::ENOENT)?;
+        if Arc::ptr_eq(&inode_to_move, &existing) {
+            return Ok(());
+        }
+        let existing_type = existing.0.lock().metadata.file_type;
+
+        src_dir.children.insert(old_key.clone(), existing.clone());
+        dst_dir
+            .children
+            .insert(new_key.clone(), inode_to_move.clone());
+        if old_type == FileType::Dir {
+            src_dir.metadata.nlinks = src_dir.metadata.nlinks.saturating_sub(1);
+            dst_dir.metadata.nlinks = dst_dir.metadata.nlinks.saturating_add(1);
+        }
+        if existing_type == FileType::Dir {
+            dst_dir.metadata.nlinks = dst_dir.metadata.nlinks.saturating_sub(1);
+            src_dir.metadata.nlinks = src_dir.metadata.nlinks.saturating_add(1);
+        }
+
+        {
+            let mut moved = inode_to_move.0.lock();
+            moved.parent = Arc::downgrade(&dst_self);
+            moved.name = new_key.clone();
+        }
+        {
+            let mut replaced = existing.0.lock();
+            replaced.parent = Arc::downgrade(&src_self);
+            replaced.name = old_key.clone();
+        }
+        return Ok(());
+    }
+
+    if let Some(existing) = dst_dir.children.get(new_key).cloned() {
         if flags.contains(RenameFlags::NOREPLACE) {
             return Err(SystemError::EEXIST);
         }
 
         // Avoid self-deadlock: `existing` may be `src_dir`/`dst_dir` itself.
-        if Arc::ptr_eq(existing, &src_self) {
+        if Arc::ptr_eq(&existing, &src_self) {
             // Example: rename("dir/subdir", "dir") -> ENOTEMPTY (dir not empty).
             // Linux expects ENOTEMPTY for this case (TargetIsAncestorOfSource).
             return Err(SystemError::ENOTEMPTY);
         }
-        if Arc::ptr_eq(existing, &dst_self) {
+        if Arc::ptr_eq(&existing, &dst_self) {
             // Shouldn't happen in normal tmpfs (no self entry), but treat as busy.
             return Err(SystemError::EBUSY);
         }
@@ -137,27 +175,32 @@ fn tmpfs_move_entry_between_dirs(
             return Ok(());
         }
 
-        if old_type != existing_type {
-            return Err(if old_type == FileType::Dir {
-                SystemError::ENOTDIR
-            } else {
-                SystemError::EISDIR
-            });
+        if old_type == FileType::Dir && existing_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
         }
-
+        if old_type != FileType::Dir && existing_type == FileType::Dir {
+            return Err(SystemError::EISDIR);
+        }
         if old_type == FileType::Dir && existing_dir_nonempty {
             return Err(SystemError::ENOTEMPTY);
         }
 
         // Remove existing destination entry (replacement).
         dst_dir.children.remove(new_key);
-        if old_type == FileType::Dir {
+        let mut existing_guard = existing.0.lock();
+        if existing_type == FileType::Dir {
             dst_dir.metadata.nlinks = dst_dir.metadata.nlinks.saturating_sub(1);
+            existing_guard.metadata.nlinks = 0;
+        } else {
+            existing_guard.metadata.nlinks = existing_guard.metadata.nlinks.saturating_sub(1);
         }
     }
 
     // Remove from source directory.
     src_dir.children.remove(old_key);
+    if flags.contains(RenameFlags::WHITEOUT) {
+        tmpfs_insert_whiteout(src_dir, old_key)?;
+    }
     if old_type == FileType::Dir {
         src_dir.metadata.nlinks = src_dir.metadata.nlinks.saturating_sub(1);
         dst_dir.metadata.nlinks = dst_dir.metadata.nlinks.saturating_add(1);
@@ -171,6 +214,43 @@ fn tmpfs_move_entry_between_dirs(
     moved.parent = Arc::downgrade(&dst_self);
     moved.name = new_key.clone();
 
+    Ok(())
+}
+
+fn tmpfs_insert_whiteout(dir: &mut TmpfsInode, name: &DName) -> Result<(), SystemError> {
+    if dir.children.contains_key(name) {
+        return Err(SystemError::EEXIST);
+    }
+
+    let whiteout = Arc::new(LockedTmpfsInode(Mutex::new(TmpfsInode {
+        parent: dir.self_ref.clone(),
+        self_ref: Weak::default(),
+        children: BTreeMap::new(),
+        page_cache: None,
+        metadata: Metadata {
+            dev_id: 0,
+            inode_id: generate_inode_id(),
+            size: 0,
+            blk_size: 0,
+            blocks: 0,
+            atime: PosixTimeSpec::default(),
+            mtime: PosixTimeSpec::default(),
+            ctime: PosixTimeSpec::default(),
+            btime: PosixTimeSpec::default(),
+            file_type: FileType::CharDevice,
+            mode: InodeMode::S_IFCHR | InodeMode::from_bits_truncate(0o600),
+            nlinks: 1,
+            uid: 0,
+            gid: 0,
+            raw_dev: WHITEOUT_DEV,
+            flags: InodeFlags::empty(),
+        },
+        fs: dir.fs.clone(),
+        special_node: None,
+        name: name.clone(),
+    })));
+    whiteout.0.lock().self_ref = Arc::downgrade(&whiteout);
+    dir.children.insert(name.clone(), whiteout);
     Ok(())
 }
 
@@ -1019,6 +1099,9 @@ impl IndexNode for LockedTmpfsInode {
         if Arc::ptr_eq(&(self.0.lock().self_ref.upgrade().unwrap()), &target_locked)
             && old_key == new_key
         {
+            if flags.contains(RenameFlags::NOREPLACE) {
+                return Err(SystemError::EEXIST);
+            }
             return Ok(());
         }
 
@@ -1036,7 +1119,26 @@ impl IndexNode for LockedTmpfsInode {
                 .ok_or(SystemError::ENOENT)?;
             let old_type = inode_to_move.0.lock().metadata.file_type;
 
-            if let Some(existing) = dir.children.get(&new_key) {
+            if flags.contains(RenameFlags::EXCHANGE) {
+                let existing = dir
+                    .children
+                    .get(&new_key)
+                    .cloned()
+                    .ok_or(SystemError::ENOENT)?;
+                let to_move_id = inode_to_move.0.lock().metadata.inode_id;
+                let existing_id = existing.0.lock().metadata.inode_id;
+                if existing_id == to_move_id {
+                    return Ok(());
+                }
+
+                dir.children.insert(old_key.clone(), existing.clone());
+                dir.children.insert(new_key.clone(), inode_to_move.clone());
+                existing.0.lock().name = old_key;
+                inode_to_move.0.lock().name = new_key;
+                return Ok(());
+            }
+
+            if let Some(existing) = dir.children.get(&new_key).cloned() {
                 if flags.contains(RenameFlags::NOREPLACE) {
                     return Err(SystemError::EEXIST);
                 }
@@ -1049,12 +1151,11 @@ impl IndexNode for LockedTmpfsInode {
                 }
 
                 let existing_type = existing.0.lock().metadata.file_type;
-                if old_type != existing_type {
-                    return Err(if old_type == FileType::Dir {
-                        SystemError::ENOTDIR
-                    } else {
-                        SystemError::EISDIR
-                    });
+                if old_type == FileType::Dir && existing_type != FileType::Dir {
+                    return Err(SystemError::ENOTDIR);
+                }
+                if old_type != FileType::Dir && existing_type == FileType::Dir {
+                    return Err(SystemError::EISDIR);
                 }
 
                 if old_type == FileType::Dir && !existing.0.lock().children.is_empty() {
@@ -1063,10 +1164,21 @@ impl IndexNode for LockedTmpfsInode {
 
                 // Remove existing destination entry (replacement).
                 dir.children.remove(&new_key);
+                let mut existing_guard = existing.0.lock();
+                if existing_type == FileType::Dir {
+                    dir.metadata.nlinks = dir.metadata.nlinks.saturating_sub(1);
+                    existing_guard.metadata.nlinks = 0;
+                } else {
+                    existing_guard.metadata.nlinks =
+                        existing_guard.metadata.nlinks.saturating_sub(1);
+                }
             }
 
             // Move entry within the same directory.
             dir.children.remove(&old_key);
+            if flags.contains(RenameFlags::WHITEOUT) {
+                tmpfs_insert_whiteout(&mut dir, &old_key)?;
+            }
             dir.children.insert(new_key.clone(), inode_to_move.clone());
             inode_to_move.0.lock().name = new_key;
             return Ok(());

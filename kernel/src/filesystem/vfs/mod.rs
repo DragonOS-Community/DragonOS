@@ -389,6 +389,10 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         Ok(())
     }
 
+    fn mmap_effective_file(&self, file: &Arc<File>) -> Result<Arc<File>, SystemError> {
+        Ok(file.clone())
+    }
+
     fn mmap_file(
         &self,
         _file: &Arc<File>,
@@ -417,8 +421,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
-        // 若文件系统没有实现此方法，则返回"不支持"
-        return Err(SystemError::ENOSYS);
+        Ok(())
     }
 
     /// Adjust per-open file mode bits after `open()` initialized private data.
@@ -1043,9 +1046,32 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///
     /// @return 成功：Ok(0)
     ///         失败：Err(错误码)
-    fn setxattr(&self, _name: &str, _value: &[u8]) -> Result<usize, SystemError> {
+    fn setxattr(
+        &self,
+        _name: &str,
+        _value: &[u8],
+        _flags: XattrFlags,
+    ) -> Result<usize, SystemError> {
         log::warn!(
             "setxattr not implemented for {}",
+            crate::libs::name::get_type_name(&self)
+        );
+        return Err(SystemError::ENOSYS);
+    }
+
+    /// @brief 列出扩展属性名，返回实际列表长度。
+    fn listxattr(&self, _buf: &mut [u8]) -> Result<usize, SystemError> {
+        log::warn!(
+            "listxattr not implemented for {}",
+            crate::libs::name::get_type_name(&self)
+        );
+        return Err(SystemError::ENOSYS);
+    }
+
+    /// @brief 删除指定扩展属性。
+    fn removexattr(&self, _name: &str) -> Result<usize, SystemError> {
+        log::warn!(
+            "removexattr not implemented for {}",
             crate::libs::name::get_type_name(&self)
         );
         return Err(SystemError::ENOSYS);
@@ -1444,6 +1470,8 @@ bitflags! {
         const PROC_MAGIC = 0x9fa0;
         const RAMFS_MAGIC = 0x858458f6;
         const DEVPTS_MAGIC = 0x1cd1;
+        const DEBUGFS_MAGIC = 0x64626720;
+        const MQUEUE_MAGIC = 0x19800202;
         const MOUNT_MAGIC = 61267;
         const PIPEFS_MAGIC = 0x50495045;
         const EVENTFD_MAGIC = 0x45564446; // "EVDF" in ASCII
@@ -1467,6 +1495,14 @@ pub enum FsPermissionPolicy {
 pub enum WritebackSyncMode {
     None,
     All,
+}
+
+bitflags! {
+    /// Flags controlling Linux extended attribute set semantics.
+    pub struct XattrFlags: i32 {
+        const CREATE = 0x1;
+        const REPLACE = 0x2;
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

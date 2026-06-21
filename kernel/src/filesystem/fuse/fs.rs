@@ -3,6 +3,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use core::sync::atomic::{AtomicU8, Ordering};
 use system_error::SystemError;
 
 use crate::{
@@ -65,11 +66,42 @@ pub struct FuseFS {
     super_block: SuperBlock,
     conn: Arc<FuseConn>,
     nodes: Mutex<BTreeMap<u64, Weak<FuseNode>>>,
+    retired_nodes: Mutex<Vec<Weak<FuseNode>>>,
+    state: AtomicU8,
     default_permissions: bool,
     is_submount: bool,
 }
 
 impl FuseFS {
+    const STATE_ACTIVE: u8 = 0;
+    const STATE_TEARING_DOWN: u8 = 1;
+    const STATE_DEAD: u8 = 2;
+
+    fn should_retire_node(
+        node: &Arc<FuseNode>,
+        generation: Option<u64>,
+        cached: Option<&Metadata>,
+    ) -> bool {
+        if let Some(gen) = generation {
+            let old_gen = node.generation();
+            if old_gen != 0 && old_gen != gen {
+                return true;
+            }
+        }
+        if let (Some(old_type), Some(md)) = (node.cached_file_type(), cached) {
+            if old_type != md.file_type {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn retire_stale_node(&self, node: Arc<FuseNode>) {
+        self.retired_nodes.lock().push(Arc::downgrade(&node));
+        node.clear_lookup_cache_tree();
+        node.clear_parent();
+    }
+
     fn parse_opt_u32_decimal(v: &str) -> Result<u32, SystemError> {
         v.parse::<u32>().map_err(|_| SystemError::EINVAL)
     }
@@ -158,157 +190,183 @@ impl FuseFS {
     pub fn get_or_create_node(
         self: &Arc<Self>,
         nodeid: u64,
-        parent_nodeid: u64,
+        parent: Option<Arc<FuseNode>>,
         cached: Option<Metadata>,
-    ) -> Arc<FuseNode> {
-        self.get_or_create_node_with_generation(nodeid, parent_nodeid, cached, None)
+    ) -> Result<Arc<FuseNode>, SystemError> {
+        self.get_or_create_node_with_generation(nodeid, parent, cached, None, 0)
     }
 
     pub fn get_or_create_node_with_generation(
         self: &Arc<Self>,
         nodeid: u64,
-        parent_nodeid: u64,
+        parent: Option<Arc<FuseNode>>,
         cached: Option<Metadata>,
         generation: Option<u64>,
-    ) -> Arc<FuseNode> {
+        lookup_refs: u64,
+    ) -> Result<Arc<FuseNode>, SystemError> {
         if nodeid == self.root.nodeid() {
-            return self.root.clone();
+            if parent.is_some() || lookup_refs != 0 {
+                return Err(SystemError::EIO);
+            }
+            return Ok(self.root.clone());
         }
+        let parent_nodeid = parent
+            .as_ref()
+            .map(|node| node.nodeid())
+            .unwrap_or(FUSE_ROOT_ID);
 
-        let mut nodes = self.nodes.lock();
-        if let Some(w) = nodes.get(&nodeid) {
-            if let Some(n) = w.upgrade() {
+        let mut stale_node = None;
+        let node = {
+            let mut nodes = self.nodes.lock();
+            if self.state.load(Ordering::Acquire) != Self::STATE_ACTIVE {
+                return Err(SystemError::ESHUTDOWN);
+            }
+            if let Some(n) = nodes.get(&nodeid).and_then(|node| node.upgrade()) {
                 if let Some(gen) = generation {
-                    let old_gen = n.generation();
-                    if old_gen != 0 && old_gen != gen {
+                    if Self::should_retire_node(&n, Some(gen), cached.as_ref()) {
                         n.mark_stale();
                         nodes.remove(&nodeid);
+                        stale_node = Some(n);
                     } else {
                         n.set_generation(gen);
                         n.set_parent_nodeid(parent_nodeid);
+                        n.set_parent_if_absent(parent);
                         if let Some(md) = cached {
                             n.set_cached_metadata(md);
                         }
-                        return n;
+                        n.inc_lookup(lookup_refs);
+                        return Ok(n);
                     }
                 } else {
                     n.set_parent_nodeid(parent_nodeid);
+                    n.set_parent_if_absent(parent);
                     if let Some(md) = cached {
                         n.set_cached_metadata(md);
                     }
-                    return n;
+                    n.inc_lookup(lookup_refs);
+                    return Ok(n);
                 }
-            }
-        }
-
-        let n = FuseNode::new(
-            Arc::downgrade(self),
-            self.conn.clone(),
-            nodeid,
-            parent_nodeid,
-            cached,
-        );
-        if let Some(gen) = generation {
-            n.set_generation(gen);
-        }
-        nodes.insert(nodeid, Arc::downgrade(&n));
-        n
-    }
-
-    pub(crate) fn find_cached_child(
-        self: &Arc<Self>,
-        parent_nodeid: u64,
-        name: &str,
-    ) -> Option<Arc<FuseNode>> {
-        let mut stale = Vec::new();
-        let nodes = self.nodes.lock();
-        for (nodeid, weak) in nodes.iter() {
-            let Some(node) = weak.upgrade() else {
-                stale.push(*nodeid);
-                continue;
-            };
-            if node.parent_fuse_nodeid() == parent_nodeid && node.has_dname(name) {
-                return Some(node);
-            }
-        }
-        drop(nodes);
-        if !stale.is_empty() {
-            let mut nodes = self.nodes.lock();
-            for nodeid in stale {
+            } else {
                 nodes.remove(&nodeid);
             }
+
+            let n = FuseNode::new(
+                Arc::downgrade(self),
+                self.conn.clone(),
+                nodeid,
+                parent_nodeid,
+                parent,
+                cached,
+            );
+            if let Some(gen) = generation {
+                n.set_generation(gen);
+            }
+            n.inc_lookup(lookup_refs);
+            nodes.insert(nodeid, Arc::downgrade(&n));
+            n
+        };
+        if let Some(stale_node) = stale_node {
+            self.retire_stale_node(stale_node);
         }
-        None
+        Ok(node)
     }
 
     pub(crate) fn get_or_create_node_for_link(
         self: &Arc<Self>,
         nodeid: u64,
-        parent_nodeid: u64,
+        parent: Option<Arc<FuseNode>>,
         cached: Option<Metadata>,
         generation: Option<u64>,
-    ) -> Arc<FuseNode> {
+        lookup_refs: u64,
+    ) -> Result<Arc<FuseNode>, SystemError> {
         if nodeid == self.root.nodeid() {
-            return self.root.clone();
+            if parent.is_some() || lookup_refs != 0 {
+                return Err(SystemError::EIO);
+            }
+            return Ok(self.root.clone());
         }
+        let parent_nodeid = parent
+            .as_ref()
+            .map(|node| node.nodeid())
+            .unwrap_or(FUSE_ROOT_ID);
 
-        let mut nodes = self.nodes.lock();
-        if let Some(w) = nodes.get(&nodeid) {
-            if let Some(n) = w.upgrade() {
+        let mut stale_node = None;
+        let node = {
+            let mut nodes = self.nodes.lock();
+            if self.state.load(Ordering::Acquire) != Self::STATE_ACTIVE {
+                return Err(SystemError::ESHUTDOWN);
+            }
+            if let Some(n) = nodes.get(&nodeid).and_then(|node| node.upgrade()) {
                 if let Some(gen) = generation {
-                    let old_gen = n.generation();
-                    if old_gen != 0 && old_gen != gen {
+                    if Self::should_retire_node(&n, Some(gen), cached.as_ref()) {
                         n.mark_stale();
                         nodes.remove(&nodeid);
+                        stale_node = Some(n);
                     } else {
                         n.set_generation(gen);
+                        n.set_parent_if_absent(parent);
                         if let Some(md) = cached {
                             n.set_cached_metadata(md);
                         }
-                        return n;
+                        n.inc_lookup(lookup_refs);
+                        return Ok(n);
                     }
                 } else {
+                    n.set_parent_if_absent(parent);
                     if let Some(md) = cached {
                         n.set_cached_metadata(md);
                     }
-                    return n;
+                    n.inc_lookup(lookup_refs);
+                    return Ok(n);
                 }
+            } else {
+                nodes.remove(&nodeid);
             }
-        }
 
-        let n = FuseNode::new(
-            Arc::downgrade(self),
-            self.conn.clone(),
-            nodeid,
-            parent_nodeid,
-            cached,
-        );
-        if let Some(gen) = generation {
-            n.set_generation(gen);
+            let n = FuseNode::new(
+                Arc::downgrade(self),
+                self.conn.clone(),
+                nodeid,
+                parent_nodeid,
+                parent,
+                cached,
+            );
+            if let Some(gen) = generation {
+                n.set_generation(gen);
+            }
+            n.inc_lookup(lookup_refs);
+            nodes.insert(nodeid, Arc::downgrade(&n));
+            n
+        };
+        if let Some(stale_node) = stale_node {
+            self.retire_stale_node(stale_node);
         }
-        nodes.insert(nodeid, Arc::downgrade(&n));
-        n
+        Ok(node)
     }
 
     /// 为 virtiofs announce-submounts 创建子挂载树（共享同一 FuseConn）。
     pub fn new_submount(
         parent: &Arc<Self>,
+        root_parent: Arc<FuseNode>,
         root_nodeid: u64,
-        parent_nodeid: u64,
         root_md: Metadata,
     ) -> Arc<Self> {
         let conn = parent.conn.clone();
+        let parent_nodeid = root_parent.nodeid();
         let fs = Arc::new_cyclic(|weak| FuseFS {
             root: FuseNode::new(
                 weak.clone(),
                 conn.clone(),
                 root_nodeid,
                 parent_nodeid,
+                Some(root_parent),
                 Some(root_md),
             ),
             super_block: parent.super_block.clone(),
             conn,
             nodes: Mutex::new(BTreeMap::new()),
+            retired_nodes: Mutex::new(Vec::new()),
+            state: AtomicU8::new(Self::STATE_ACTIVE),
             default_permissions: parent.default_permissions,
             is_submount: true,
         });
@@ -316,6 +374,66 @@ impl FuseFS {
             .lock()
             .insert(root_nodeid, Arc::downgrade(&fs.root));
         fs
+    }
+
+    fn teardown_nodes(&self) {
+        if self
+            .state
+            .compare_exchange(
+                Self::STATE_ACTIVE,
+                Self::STATE_TEARING_DOWN,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+
+        let live_nodes: Vec<Arc<FuseNode>> = {
+            let mut nodes = self.nodes.lock();
+            let mut live = Vec::new();
+            live.push(self.root.clone());
+            nodes.retain(|_, node| {
+                if let Some(node) = node.upgrade() {
+                    live.push(node);
+                    true
+                } else {
+                    false
+                }
+            });
+            live
+        };
+        let retired_nodes: Vec<Arc<FuseNode>> = {
+            let mut retired = self.retired_nodes.lock();
+            let mut live = Vec::new();
+            retired.retain(|node| {
+                if let Some(node) = node.upgrade() {
+                    live.push(node);
+                    true
+                } else {
+                    false
+                }
+            });
+            live
+        };
+
+        for node in live_nodes.iter().chain(retired_nodes.iter()) {
+            node.mark_stale();
+        }
+        for node in live_nodes.iter().chain(retired_nodes.iter()) {
+            node.clear_lookup_cache_tree();
+        }
+        for node in live_nodes.iter().chain(retired_nodes.iter()) {
+            node.flush_forget();
+        }
+        for node in live_nodes.iter().chain(retired_nodes.iter()) {
+            node.clear_parent();
+        }
+
+        self.nodes.lock().clear();
+        self.retired_nodes.lock().clear();
+        self.state.store(Self::STATE_DEAD, Ordering::Release);
     }
 }
 
@@ -360,12 +478,7 @@ pub fn fuse_try_automount_submount(
     }
 
     let parent_fs = fuse_node.fuse_fs().ok_or(SystemError::ENOENT)?;
-    let sub_fs = FuseFS::new_submount(
-        &parent_fs,
-        fuse_node.nodeid(),
-        fuse_node.parent_fuse_nodeid(),
-        md,
-    );
+    let sub_fs = FuseFS::new_submount(&parent_fs, fuse_node.clone(), fuse_node.nodeid(), md);
     let mount_path = match mount_path_override {
         Some(path) => path,
         None => {
@@ -470,14 +583,20 @@ impl MountableFileSystem for FuseFS {
                 conn.clone(),
                 FUSE_ROOT_ID,
                 FUSE_ROOT_ID,
+                None,
                 Some(root_md),
             ),
             super_block,
             conn: conn.clone(),
             nodes: Mutex::new(BTreeMap::new()),
+            retired_nodes: Mutex::new(Vec::new()),
+            state: AtomicU8::new(Self::STATE_ACTIVE),
             default_permissions: mount_data.default_permissions,
             is_submount: false,
         });
+        fs.nodes
+            .lock()
+            .insert(FUSE_ROOT_ID, Arc::downgrade(&fs.root));
 
         if let Err(e) = conn.enqueue_init() {
             conn.rollback_mount_setup();
@@ -586,6 +705,12 @@ impl FileSystem for FuseFS {
             .map(|cache| !cache.is_page_ready(page_index))
             .unwrap_or(true);
 
+        if major {
+            let mut ra_state = file.get_ra_state();
+            let _ = node.mmap_readahead_with_open(page_index, 1, &mut ra_state, fh, file_flags);
+            let _ = file.set_ra_state(ra_state);
+        }
+
         match node.fault_page_with_open(page_index, fh, file_flags) {
             Ok(page) => {
                 pfm.set_page(page);
@@ -659,18 +784,11 @@ impl FileSystem for FuseFS {
         start_pgoff: usize,
         end_pgoff: usize,
     ) -> VmFaultReason {
-        let _ = (pfm, start_pgoff, end_pgoff);
-        VmFaultReason::VM_FAULT_SIGBUS
+        PageFaultHandler::filemap_map_pages(pfm, start_pgoff, end_pgoff)
     }
 
     fn on_umount(&self) {
-        let live_nodes: Vec<Arc<FuseNode>> = {
-            let nodes = self.nodes.lock();
-            nodes.values().filter_map(|w| w.upgrade()).collect()
-        };
-        for node in live_nodes {
-            node.flush_forget();
-        }
+        self.teardown_nodes();
         if !self.is_submount {
             self.conn.on_umount();
         }

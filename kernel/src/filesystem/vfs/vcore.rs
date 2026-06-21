@@ -100,7 +100,7 @@ fn migrate_virtual_filesystem(
 
     let current_mntns = ProcessManager::current_mntns();
     let old_root_inode = current_mntns.root_inode();
-    let old_mntfs = current_mntns.root_mntfs().clone();
+    let old_mntfs = current_mntns.root_mntfs();
     let new_fs = MountFS::new(
         new_fs,
         None,
@@ -132,9 +132,7 @@ fn migrate_virtual_filesystem(
         .mount_from(old_root_inode.find("sys").expect("sys not mounted!"))
         .expect("Failed to migrate filesystem of sys");
 
-    unsafe {
-        current_mntns.force_change_root_mountfs(new_fs);
-    }
+    current_mntns.force_change_root_mountfs(new_fs);
 
     // 换根后需要同步更新“当前进程”的 fs root/pwd。
     // 我们的路径解析（绝对路径）以进程 fs root 为起点；若不更新，后续诸如 /dev/pts 的挂载、

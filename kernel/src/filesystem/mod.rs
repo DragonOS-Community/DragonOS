@@ -1,4 +1,5 @@
 pub mod cgroup2;
+pub mod debugfs;
 pub mod devfs;
 pub mod devpts;
 pub mod epoll;
@@ -9,6 +10,7 @@ pub mod fs;
 pub mod fuse;
 pub mod kernfs;
 pub mod mbr;
+pub mod mqueue;
 pub mod overlayfs;
 pub mod page_cache;
 pub mod poll;

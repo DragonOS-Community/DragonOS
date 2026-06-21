@@ -1146,8 +1146,7 @@ impl Ext4 {
         }
     }
 
-    /// Set extended attribute of a file. This function will not check name conflict,
-    /// call `getxattr` to check beforehand.
+    /// Set extended attribute of a file.
     ///
     /// # Params
     ///
@@ -1159,20 +1158,73 @@ impl Ext4 {
     ///
     /// `ENOSPC` - xattr block does not have enough space
     pub fn setxattr(&self, inode: InodeId, name: &str, value: &[u8]) -> Result<()> {
+        self.setxattr_with_flags(inode, name, value, false, false)
+    }
+
+    /// Set extended attribute of a file with Linux create/replace semantics.
+    ///
+    /// Existing xattr blocks are modified on a cloned candidate block first and
+    /// written back only after the whole operation succeeds. This preserves the
+    /// old value when replacing with a value that does not fit.
+    pub fn setxattr_with_flags(
+        &self,
+        inode: InodeId,
+        name: &str,
+        value: &[u8],
+        create: bool,
+        replace: bool,
+    ) -> Result<()> {
+        let _mutation_guard =
+            self.inode_mutation_locks[self.inode_mutation_lock_index(inode)].lock();
         let mut inode_ref = self.read_inode(inode)?;
         let xattr_block_id = inode_ref.inode.xattr_block();
         if xattr_block_id == 0 {
+            if replace {
+                return_error!(ErrCode::ENODATA, "Xattr {} does not exist", name);
+            }
             // lazy allocate xattr block
             let pblock = self.alloc_block(&mut inode_ref)?;
-            inode_ref.inode.set_xattr_block(pblock);
-            self.write_inode_with_csum(&mut inode_ref)?;
+            let old_xattr_block = xattr_block_id;
+            let result = (|| {
+                let mut xattr_block = XattrBlock::new(self.read_block(pblock)?);
+                xattr_block.init();
+                if !xattr_block.insert(name, value) {
+                    return_error!(
+                        ErrCode::ENOSPC,
+                        "Xattr block of Inode {} does not have enough space",
+                        inode
+                    );
+                }
+                self.write_block(&xattr_block.block())?;
+                inode_ref.inode.set_xattr_block(pblock);
+                self.write_inode_with_csum(&mut inode_ref)?;
+                Ok(())
+            })();
+            if let Err(err) = result {
+                inode_ref.inode.set_xattr_block(old_xattr_block);
+                return match self.dealloc_block(&mut inode_ref, pblock) {
+                    Ok(()) => Err(err),
+                    Err(rollback_err) => Err(rollback_err),
+                };
+            }
+            return Ok(());
         }
-        let mut xattr_block = XattrBlock::new(self.read_block(inode_ref.inode.xattr_block())?);
-        if xattr_block_id == 0 {
-            xattr_block.init();
+
+        let xattr_block = XattrBlock::new(self.read_block(xattr_block_id)?);
+        let exists = xattr_block.get(name).is_some();
+        if exists && create {
+            return_error!(ErrCode::EEXIST, "Xattr {} already exists", name);
         }
-        if xattr_block.insert(name, value) {
-            self.write_block(&xattr_block.block())?;
+        if !exists && replace {
+            return_error!(ErrCode::ENODATA, "Xattr {} does not exist", name);
+        }
+
+        let mut new_xattr_block = xattr_block;
+        if exists {
+            let _ = new_xattr_block.remove(name);
+        }
+        if new_xattr_block.insert(name, value) {
+            self.write_block(&new_xattr_block.block())?;
             Ok(())
         } else {
             return_error!(
@@ -1194,6 +1246,8 @@ impl Ext4 {
     ///
     /// `ENODATA` - the attribute does not exist
     pub fn removexattr(&self, inode: InodeId, name: &str) -> Result<()> {
+        let _mutation_guard =
+            self.inode_mutation_locks[self.inode_mutation_lock_index(inode)].lock();
         let inode_ref = self.read_inode(inode)?;
         let xattr_block_id = inode_ref.inode.xattr_block();
         if xattr_block_id == 0 {
@@ -1231,6 +1285,7 @@ impl Ext4 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FileType;
 
     struct StubBlockDevice {
         sb_block: Block,
@@ -1302,5 +1357,313 @@ mod tests {
 
         assert_eq!(err.code(), ErrCode::EIO);
         assert_eq!(buf, [0x5a; 16]);
+    }
+
+    const TEST_BLOCK_COUNT: usize = 16;
+    const TEST_BLOCK_BITMAP: PBlockId = 2;
+    const TEST_INODE_BITMAP: PBlockId = 3;
+    const TEST_INODE_TABLE: PBlockId = 4;
+    const TEST_XATTR_BLOCK: PBlockId = 5;
+    const TEST_INITIAL_FREE_BLOCKS: u64 = (TEST_BLOCK_COUNT as u64) - 5;
+
+    struct FailingBlockDevice {
+        blocks: spin::Mutex<BTreeMap<PBlockId, Block>>,
+        fail_reads: spin::Mutex<Vec<PBlockId>>,
+        fail_writes: spin::Mutex<Vec<PBlockId>>,
+    }
+
+    impl FailingBlockDevice {
+        fn new() -> Self {
+            let mut blocks = BTreeMap::new();
+            for block_id in 0..TEST_BLOCK_COUNT as PBlockId {
+                blocks.insert(block_id, Block::new(block_id, Box::new([0u8; BLOCK_SIZE])));
+            }
+
+            let mut sb_block = blocks.remove(&0).unwrap();
+            Self::write_u32(&mut sb_block, BASE_OFFSET + 4, TEST_BLOCK_COUNT as u32);
+            Self::write_u32(
+                &mut sb_block,
+                BASE_OFFSET + 12,
+                TEST_INITIAL_FREE_BLOCKS as u32,
+            );
+            Self::write_u32(&mut sb_block, BASE_OFFSET + 20, 0);
+            Self::write_u32(&mut sb_block, BASE_OFFSET + 24, 2);
+            Self::write_u32(&mut sb_block, BASE_OFFSET + 28, 2);
+            Self::write_u32(&mut sb_block, BASE_OFFSET + 32, TEST_BLOCK_COUNT as u32);
+            Self::write_u32(&mut sb_block, BASE_OFFSET + 40, 16);
+            Self::write_u16(&mut sb_block, BASE_OFFSET + 56, 0xef53);
+            Self::write_u32(&mut sb_block, BASE_OFFSET + 84, 1);
+            Self::write_u16(&mut sb_block, BASE_OFFSET + 88, SB_GOOD_INODE_SIZE as u16);
+            Self::write_u16(&mut sb_block, BASE_OFFSET + 254, SB_GOOD_DESC_SIZE as u16);
+            blocks.insert(0, sb_block);
+
+            let mut bgdt = blocks.remove(&1).unwrap();
+            Self::write_u32(&mut bgdt, 0, TEST_BLOCK_BITMAP as u32);
+            Self::write_u32(&mut bgdt, 4, TEST_INODE_BITMAP as u32);
+            Self::write_u32(&mut bgdt, 8, TEST_INODE_TABLE as u32);
+            Self::write_u16(&mut bgdt, 12, TEST_INITIAL_FREE_BLOCKS as u16);
+            blocks.insert(1, bgdt);
+
+            let mut bitmap = blocks.remove(&TEST_BLOCK_BITMAP).unwrap();
+            bitmap.data[0] = 0b0001_1111;
+            blocks.insert(TEST_BLOCK_BITMAP, bitmap);
+
+            let mut inode_table = blocks.remove(&TEST_INODE_TABLE).unwrap();
+            let mut inode = Inode::default();
+            inode.set_mode(InodeMode::from_type_and_perm(
+                FileType::RegularFile,
+                InodeMode::from_bits_retain(0o644),
+            ));
+            inode.set_link_count(1);
+            inode_table.write_offset_as(SB_GOOD_INODE_SIZE, &inode);
+            blocks.insert(TEST_INODE_TABLE, inode_table);
+
+            Self {
+                blocks: spin::Mutex::new(blocks),
+                fail_reads: spin::Mutex::new(Vec::new()),
+                fail_writes: spin::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn write_u16(block: &mut Block, offset: usize, value: u16) {
+            block.write_offset(offset, &value.to_le_bytes());
+        }
+
+        fn write_u32(block: &mut Block, offset: usize, value: u32) {
+            block.write_offset(offset, &value.to_le_bytes());
+        }
+
+        fn fail_once_on_read(&self, block_id: PBlockId) {
+            self.fail_reads.lock().push(block_id);
+        }
+
+        fn fail_once_on_write(&self, block_id: PBlockId) {
+            self.fail_writes.lock().push(block_id);
+        }
+
+        fn take_failure(list: &mut Vec<PBlockId>, block_id: PBlockId) -> bool {
+            if let Some(pos) = list.iter().position(|&id| id == block_id) {
+                list.remove(pos);
+                true
+            } else {
+                false
+            }
+        }
+
+        fn block_bitmap_bit_is_set(&self, bit: usize) -> bool {
+            let blocks = self.blocks.lock();
+            let block = blocks.get(&TEST_BLOCK_BITMAP).unwrap();
+            (block.data[bit / 8] & (1 << (bit % 8))) != 0
+        }
+
+        fn bg_free_blocks(&self) -> u64 {
+            let blocks = self.blocks.lock();
+            let block = blocks.get(&1).unwrap();
+            u16::from_le_bytes(block.data[12..14].try_into().unwrap()) as u64
+        }
+
+        fn sb_free_blocks(&self) -> u64 {
+            let blocks = self.blocks.lock();
+            let block = blocks.get(&0).unwrap();
+            u32::from_le_bytes(
+                block.data[BASE_OFFSET + 12..BASE_OFFSET + 16]
+                    .try_into()
+                    .unwrap(),
+            ) as u64
+        }
+
+        fn disk_inode_xattr_block(&self) -> PBlockId {
+            let blocks = self.blocks.lock();
+            let block = blocks.get(&TEST_INODE_TABLE).unwrap();
+            let inode: Inode = block.read_offset_as(SB_GOOD_INODE_SIZE);
+            inode.xattr_block()
+        }
+    }
+
+    impl BlockDevice for FailingBlockDevice {
+        fn read_block(&self, block_id: PBlockId) -> Result<Block> {
+            if Self::take_failure(&mut self.fail_reads.lock(), block_id) {
+                return Err(Ext4Error::new(ErrCode::EIO));
+            }
+            self.blocks
+                .lock()
+                .get(&block_id)
+                .cloned()
+                .ok_or_else(|| Ext4Error::new(ErrCode::EIO))
+        }
+
+        fn write_block(&self, block: &Block) -> Result<()> {
+            if Self::take_failure(&mut self.fail_writes.lock(), block.id) {
+                return Err(Ext4Error::new(ErrCode::EIO));
+            }
+            self.blocks.lock().insert(block.id, block.clone());
+            Ok(())
+        }
+    }
+
+    fn load_failing_test_fs() -> (Arc<FailingBlockDevice>, Ext4) {
+        let block_device = Arc::new(FailingBlockDevice::new());
+        let fs = Ext4::load(block_device.clone()).unwrap();
+        (block_device, fs)
+    }
+
+    fn assert_xattr_alloc_rolled_back(fs: &Ext4, block_device: &FailingBlockDevice) {
+        assert!(!block_device.block_bitmap_bit_is_set(TEST_XATTR_BLOCK as usize));
+        assert_eq!(block_device.bg_free_blocks(), TEST_INITIAL_FREE_BLOCKS);
+        assert_eq!(block_device.sb_free_blocks(), TEST_INITIAL_FREE_BLOCKS);
+        assert_eq!(
+            fs.read_block_group(0).unwrap().desc.get_free_blocks_count(),
+            TEST_INITIAL_FREE_BLOCKS
+        );
+        assert_eq!(
+            fs.read_super_block_cached().free_blocks_count(),
+            TEST_INITIAL_FREE_BLOCKS
+        );
+        assert_eq!(block_device.disk_inode_xattr_block(), 0);
+    }
+
+    fn assert_allocation_state(
+        fs: &Ext4,
+        block_device: &FailingBlockDevice,
+        allocated: bool,
+        free_blocks: u64,
+    ) {
+        assert_eq!(
+            block_device.block_bitmap_bit_is_set(TEST_XATTR_BLOCK as usize),
+            allocated
+        );
+        assert_eq!(block_device.bg_free_blocks(), free_blocks);
+        assert_eq!(block_device.sb_free_blocks(), free_blocks);
+        assert_eq!(
+            fs.read_block_group(0).unwrap().desc.get_free_blocks_count(),
+            free_blocks
+        );
+        assert_eq!(
+            fs.read_super_block_cached().free_blocks_count(),
+            free_blocks
+        );
+    }
+
+    #[test]
+    fn setxattr_rolls_back_when_new_xattr_block_read_fails() {
+        let (block_device, fs) = load_failing_test_fs();
+        block_device.fail_once_on_read(TEST_XATTR_BLOCK);
+
+        let err = fs
+            .setxattr_with_flags(2, "user.rollback", b"value", false, false)
+            .unwrap_err();
+
+        assert_eq!(err.code(), ErrCode::EIO);
+        assert_xattr_alloc_rolled_back(&fs, &block_device);
+    }
+
+    #[test]
+    fn setxattr_rolls_back_when_new_xattr_block_write_fails() {
+        let (block_device, fs) = load_failing_test_fs();
+        block_device.fail_once_on_write(TEST_XATTR_BLOCK);
+
+        let err = fs
+            .setxattr_with_flags(2, "user.rollback", b"value", false, false)
+            .unwrap_err();
+
+        assert_eq!(err.code(), ErrCode::EIO);
+        assert_xattr_alloc_rolled_back(&fs, &block_device);
+    }
+
+    #[test]
+    fn setxattr_rolls_back_when_inode_write_fails() {
+        let (block_device, fs) = load_failing_test_fs();
+        block_device.fail_once_on_write(TEST_INODE_TABLE);
+
+        let err = fs
+            .setxattr_with_flags(2, "user.rollback", b"value", false, false)
+            .unwrap_err();
+
+        assert_eq!(err.code(), ErrCode::EIO);
+        assert_xattr_alloc_rolled_back(&fs, &block_device);
+    }
+
+    #[test]
+    fn setxattr_rolls_back_when_new_xattr_does_not_fit() {
+        let (block_device, fs) = load_failing_test_fs();
+        let value = vec![0x5au8; BLOCK_SIZE];
+
+        let err = fs
+            .setxattr_with_flags(2, "user.rollback", &value, false, false)
+            .unwrap_err();
+
+        assert_eq!(err.code(), ErrCode::ENOSPC);
+        assert_xattr_alloc_rolled_back(&fs, &block_device);
+    }
+
+    #[test]
+    fn block_group_cache_updates_only_after_disk_write_succeeds() {
+        let (block_device, fs) = load_failing_test_fs();
+        let mut bg = fs.read_block_group(0).unwrap();
+        bg.desc.set_free_blocks_count(TEST_INITIAL_FREE_BLOCKS - 1);
+        block_device.fail_once_on_write(1);
+
+        let err = fs.write_block_group_with_csum(&mut bg).unwrap_err();
+
+        assert_eq!(err.code(), ErrCode::EIO);
+        assert_eq!(
+            fs.read_block_group(0).unwrap().desc.get_free_blocks_count(),
+            TEST_INITIAL_FREE_BLOCKS
+        );
+        assert_eq!(block_device.bg_free_blocks(), TEST_INITIAL_FREE_BLOCKS);
+    }
+
+    #[test]
+    fn alloc_block_rolls_back_when_block_group_write_fails() {
+        let (block_device, fs) = load_failing_test_fs();
+        let mut inode = fs.read_inode(2).unwrap();
+        block_device.fail_once_on_write(1);
+
+        let err = fs.alloc_block(&mut inode).unwrap_err();
+
+        assert_eq!(err.code(), ErrCode::EIO);
+        assert_allocation_state(&fs, &block_device, false, TEST_INITIAL_FREE_BLOCKS);
+    }
+
+    #[test]
+    fn alloc_block_rolls_back_when_superblock_write_fails() {
+        let (block_device, fs) = load_failing_test_fs();
+        let mut inode = fs.read_inode(2).unwrap();
+        block_device.fail_once_on_write(0);
+
+        let err = fs.alloc_block(&mut inode).unwrap_err();
+
+        assert_eq!(err.code(), ErrCode::EIO);
+        assert_allocation_state(&fs, &block_device, false, TEST_INITIAL_FREE_BLOCKS);
+    }
+
+    #[test]
+    fn dealloc_block_rolls_back_when_block_group_write_fails() {
+        let (block_device, fs) = load_failing_test_fs();
+        let mut inode = fs.read_inode(2).unwrap();
+        let pblock = fs.alloc_block(&mut inode).unwrap();
+        assert_eq!(pblock, TEST_XATTR_BLOCK);
+        assert_allocation_state(&fs, &block_device, true, TEST_INITIAL_FREE_BLOCKS - 1);
+        block_device.fail_once_on_write(1);
+
+        let err = fs.dealloc_block(&mut inode, pblock).unwrap_err();
+
+        assert_eq!(err.code(), ErrCode::EIO);
+        assert_allocation_state(&fs, &block_device, true, TEST_INITIAL_FREE_BLOCKS - 1);
+    }
+
+    #[test]
+    fn dealloc_block_rolls_back_when_superblock_write_fails() {
+        let (block_device, fs) = load_failing_test_fs();
+        let mut inode = fs.read_inode(2).unwrap();
+        let pblock = fs.alloc_block(&mut inode).unwrap();
+        assert_eq!(pblock, TEST_XATTR_BLOCK);
+        assert_allocation_state(&fs, &block_device, true, TEST_INITIAL_FREE_BLOCKS - 1);
+        block_device.fail_once_on_write(0);
+
+        let err = fs.dealloc_block(&mut inode, pblock).unwrap_err();
+
+        assert_eq!(err.code(), ErrCode::EIO);
+        assert_allocation_state(&fs, &block_device, true, TEST_INITIAL_FREE_BLOCKS - 1);
     }
 }

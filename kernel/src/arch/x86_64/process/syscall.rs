@@ -25,6 +25,10 @@ impl Syscall {
     ) -> Result<(), SystemError> {
         // debug!("write proc_init_info to user stack done");
 
+        // glibc treats %rdx at _start as rtld_fini and calls it on exit.
+        // It must not inherit execve's envp argument across a successful exec.
+        regs.rdx = 0;
+
         // （兼容旧版libc）把argv的指针写到寄存器内
         // TODO: 改写旧版libc，不再需要这个兼容
         regs.rdi = param.init_info().args.len() as u64;

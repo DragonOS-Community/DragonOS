@@ -18,7 +18,7 @@ use crate::{
     mm::{
         fault::{FaultFlags, PageFaultHandler, PageFaultMessage},
         ucontext::{AddressSpace, LockedVMA},
-        VirtAddr, VmFaultReason, VmFlags,
+        VirtAddr, VirtRegion, VmFaultReason, VmFlags,
     },
     process::ProcessManager,
 };
@@ -316,12 +316,27 @@ impl X86_64MMArch {
 
         let current_address_space: Arc<AddressSpace> = AddressSpace::current().unwrap();
         let mut space_guard = current_address_space.write();
+        let fault_region = VirtRegion::new(
+            VirtAddr::new(address.data() & !MMArch::PAGE_OFFSET_MASK),
+            MMArch::PAGE_SIZE,
+        );
         let mut fault;
         loop {
             let vma = space_guard.mappings.find_nearest(address);
             let vma = match vma {
                 Some(vma) => vma,
                 None => {
+                    if space_guard
+                        .mappings
+                        .first_reservation_conflict(fault_region)
+                        .is_some()
+                    {
+                        drop(space_guard);
+                        current_address_space.wait_for_no_reservation_conflict(fault_region);
+                        space_guard = current_address_space.write();
+                        continue;
+                    }
+
                     log::error!(
                         "pid:{}, can not find nearest vma, \n\terror_code: {:?}, address: {:#x}, rip: {:#x}",
                         ProcessManager::current_pid().data(),
@@ -345,8 +360,30 @@ impl X86_64MMArch {
             drop(guard);
 
             if !region.contains(address) {
+                if space_guard
+                    .mappings
+                    .first_reservation_conflict(fault_region)
+                    .is_some()
+                {
+                    drop(space_guard);
+                    current_address_space.wait_for_no_reservation_conflict(fault_region);
+                    space_guard = current_address_space.write();
+                    continue;
+                }
+
                 if vm_flags.contains(VmFlags::VM_GROWSDOWN) {
                     let extension_size = region.start() - address;
+                    let extension_region = VirtRegion::new(address, extension_size);
+                    if space_guard
+                        .mappings
+                        .first_reservation_conflict(extension_region)
+                        .is_some()
+                    {
+                        drop(space_guard);
+                        current_address_space.wait_for_no_reservation_conflict(extension_region);
+                        space_guard = current_address_space.write();
+                        continue;
+                    }
 
                     // 首先检查地址是否在栈的合理扩展范围内
                     // 如果地址距离栈底太远（超过最大栈限制），则这不是一个栈扩展请求，
@@ -403,8 +440,6 @@ impl X86_64MMArch {
                         address.data(),
                         flags
                     );
-                    log::error!("fault rip: {:#x}", regs.rip);
-
                     // 地址不在VMA范围内，检查是否需要异常表修复
                     if handle_kernel_access_failed(regs) {
                         return; // 已通过异常表修复

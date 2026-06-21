@@ -12,7 +12,7 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::{SYS_PROCESS_VM_READV, SYS_PROCESS_VM_WRITEV};
 use crate::arch::MMArch;
 use crate::filesystem::vfs::iov::IoVec;
-use crate::mm::{access_ok, KernelWpGuard, MemoryManagementArch, PhysAddr, VirtAddr};
+use crate::mm::{access_ok, KernelWpGuard, MemoryManagementArch, PhysAddr, VirtAddr, VirtRegion};
 use crate::process::cred::CAPFlags;
 use crate::process::{ProcessControlBlock, ProcessManager, RawPid};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
@@ -300,8 +300,10 @@ fn do_process_vm_readv(
             return Err(SystemError::EFAULT);
         }
 
+        let remote_page = VirtAddr::new(remote_addr.data() & !MMArch::PAGE_OFFSET_MASK);
         // Read from remote process's address space
-        let target_vm_guard = target_vm.read();
+        let target_vm_guard = target_vm
+            .read_guard_no_reservation_conflict(VirtRegion::new(remote_page, MMArch::PAGE_SIZE));
 
         // Check if remote address is valid in target's address space
         if target_vm_guard.mappings.contains(remote_addr).is_none() {
@@ -462,8 +464,10 @@ fn do_process_vm_writev(
             return Err(SystemError::EFAULT);
         }
 
+        let remote_page = VirtAddr::new(remote_addr.data() & !MMArch::PAGE_OFFSET_MASK);
         // Write to remote process's address space
-        let target_vm_guard = target_vm.read();
+        let target_vm_guard = target_vm
+            .read_guard_no_reservation_conflict(VirtRegion::new(remote_page, MMArch::PAGE_SIZE));
 
         // Check if remote address is valid in target's address space
         if target_vm_guard.mappings.contains(remote_addr).is_none() {

@@ -281,6 +281,14 @@ fn get_thread_group_leader(pcb: &Arc<ProcessControlBlock>) -> Arc<ProcessControl
     ti.group_leader().unwrap_or_else(|| pcb.clone())
 }
 
+fn wait_visible_pid(child_pcb: &Arc<ProcessControlBlock>) -> RawPid {
+    let current = ProcessManager::current_pcb();
+    let leader = get_thread_group_leader(&current);
+    child_pcb
+        .task_pid_nr_ns(PidType::PID, Some(leader.active_pid_ns()))
+        .unwrap_or(RawPid(0))
+}
+
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/exit.c#1573
 fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
     let mut tmp_child_pcb: Option<Arc<ProcessControlBlock>> = None;
@@ -397,7 +405,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             let stopsig = Signal::SIGSTOP as i32;
                             kwo.no_task_error = None;
                             kwo.ret_info = Some(WaitIdInfo {
-                                pid: pcb.task_pid_vnr(),
+                                pid: wait_visible_pid(&pcb),
                                 status: stopsig,
                                 cause: SigChildCode::Stopped.into(),
                             });
@@ -406,7 +414,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             if !kwo.options.contains(WaitOption::WNOWAIT) {
                                 pcb.sighand().flags_remove(SignalFlags::CLD_STOPPED);
                             }
-                            scan_result = Some(Ok((*pid).into()));
+                            scan_result = Some(Ok(wait_visible_pid(&pcb).into()));
 
                             break;
                         } else if kwo.options.contains(WaitOption::WCONTINUED)
@@ -414,7 +422,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                         {
                             kwo.no_task_error = None;
                             kwo.ret_info = Some(WaitIdInfo {
-                                pid: pcb.task_pid_vnr(),
+                                pid: wait_visible_pid(&pcb),
                                 status: Signal::SIGCONT as i32,
                                 cause: SigChildCode::Continued.into(),
                             });
@@ -423,7 +431,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             if !kwo.options.contains(WaitOption::WNOWAIT) {
                                 pcb.sighand().flags_remove(SignalFlags::CLD_CONTINUED);
                             }
-                            scan_result = Some(Ok((*pid).into()));
+                            scan_result = Some(Ok(wait_visible_pid(&pcb).into()));
 
                             break;
                         } else if pcb.is_zombie() && kwo.options.contains(WaitOption::WEXITED) {
@@ -438,7 +446,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             let status8 = wstatus_to_waitid_status(raw);
                             kwo.no_task_error = None;
                             kwo.ret_info = Some(WaitIdInfo {
-                                pid: pcb.task_pid_vnr(),
+                                pid: wait_visible_pid(&pcb),
                                 status: status8,
                                 cause: SigChildCode::Exited.into(),
                             });
@@ -451,7 +459,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 account_reaped_child_rusage(&child_rusage);
                                 pid_to_release = Some(pcb.raw_pid());
                             }
-                            scan_result = Some(Ok((*pid).into()));
+                            scan_result = Some(Ok(wait_visible_pid(&pcb).into()));
 
                             break;
                         }
@@ -512,7 +520,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 let stopsig = Signal::SIGSTOP as i32;
                                 kwo.no_task_error = None;
                                 kwo.ret_info = Some(WaitIdInfo {
-                                    pid: pcb.task_pid_vnr(),
+                                    pid: wait_visible_pid(&pcb),
                                     status: stopsig,
                                     cause: SigChildCode::Stopped.into(),
                                 });
@@ -521,7 +529,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 if !kwo.options.contains(WaitOption::WNOWAIT) {
                                     pcb.sighand().flags_remove(SignalFlags::CLD_STOPPED);
                                 }
-                                scan_result = Some(Ok((*pid).into()));
+                                scan_result = Some(Ok(wait_visible_pid(&pcb).into()));
 
                                 break;
                             } else if kwo.options.contains(WaitOption::WCONTINUED)
@@ -529,7 +537,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             {
                                 kwo.no_task_error = None;
                                 kwo.ret_info = Some(WaitIdInfo {
-                                    pid: pcb.task_pid_vnr(),
+                                    pid: wait_visible_pid(&pcb),
                                     status: Signal::SIGCONT as i32,
                                     cause: SigChildCode::Continued.into(),
                                 });
@@ -538,7 +546,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 if !kwo.options.contains(WaitOption::WNOWAIT) {
                                     pcb.sighand().flags_remove(SignalFlags::CLD_CONTINUED);
                                 }
-                                scan_result = Some(Ok((*pid).into()));
+                                scan_result = Some(Ok(wait_visible_pid(&pcb).into()));
 
                                 break;
                             } else if pcb.is_zombie() && kwo.options.contains(WaitOption::WEXITED) {
@@ -553,7 +561,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 let status8 = wstatus_to_waitid_status(raw);
                                 kwo.no_task_error = None;
                                 kwo.ret_info = Some(WaitIdInfo {
-                                    pid: pcb.task_pid_vnr(),
+                                    pid: wait_visible_pid(&pcb),
                                     status: status8,
                                     cause: SigChildCode::Exited.into(),
                                 });
@@ -566,7 +574,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                     account_reaped_child_rusage(&child_rusage);
                                     pid_to_release = Some(pcb.raw_pid());
                                 }
-                                scan_result = Some(Ok((*pid).into()));
+                                scan_result = Some(Ok(wait_visible_pid(&pcb).into()));
 
                                 break;
                             }
@@ -663,7 +671,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             let stopsig = Signal::SIGSTOP as i32;
                             kwo.no_task_error = None;
                             kwo.ret_info = Some(WaitIdInfo {
-                                pid: pcb.task_pid_vnr(),
+                                pid: wait_visible_pid(&pcb),
                                 status: stopsig,
                                 cause: SigChildCode::Stopped.into(),
                             });
@@ -673,14 +681,14 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 pcb.sighand().flags_remove(SignalFlags::CLD_STOPPED);
                             }
 
-                            scan_result = Some(Ok(pcb.task_pid_vnr().into()));
+                            scan_result = Some(Ok(wait_visible_pid(&pcb).into()));
                             break;
                         } else if kwo.options.contains(WaitOption::WCONTINUED)
                             && pcb.sighand().flags_contains(SignalFlags::CLD_CONTINUED)
                         {
                             kwo.no_task_error = None;
                             kwo.ret_info = Some(WaitIdInfo {
-                                pid: pcb.task_pid_vnr(),
+                                pid: wait_visible_pid(&pcb),
                                 status: Signal::SIGCONT as i32,
                                 cause: SigChildCode::Continued.into(),
                             });
@@ -690,7 +698,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 pcb.sighand().flags_remove(SignalFlags::CLD_CONTINUED);
                             }
 
-                            scan_result = Some(Ok(pcb.task_pid_vnr().into()));
+                            scan_result = Some(Ok(wait_visible_pid(&pcb).into()));
                             break;
                         } else if pcb.is_zombie() && kwo.options.contains(WaitOption::WEXITED) {
                             if reap_blocked_by_group_exec(&pcb) {
@@ -704,7 +712,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             let status8 = wstatus_to_waitid_status(raw);
                             kwo.no_task_error = None;
                             kwo.ret_info = Some(WaitIdInfo {
-                                pid: pcb.task_pid_vnr(),
+                                pid: wait_visible_pid(&pcb),
                                 status: status8,
                                 cause: SigChildCode::Exited.into(),
                             });
@@ -718,7 +726,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 pid_to_release = Some(pcb.raw_pid());
                             }
 
-                            scan_result = Some(Ok(pcb.task_pid_vnr().into()));
+                            scan_result = Some(Ok(wait_visible_pid(&pcb).into()));
                             break;
                         }
                     }
@@ -790,7 +798,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 let stopsig = Signal::SIGSTOP as i32;
                                 kwo.no_task_error = None;
                                 kwo.ret_info = Some(WaitIdInfo {
-                                    pid: pcb.task_pid_vnr(),
+                                    pid: wait_visible_pid(&pcb),
                                     status: stopsig,
                                     cause: SigChildCode::Stopped.into(),
                                 });
@@ -799,7 +807,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 if !kwo.options.contains(WaitOption::WNOWAIT) {
                                     pcb.sighand().flags_remove(SignalFlags::CLD_STOPPED);
                                 }
-                                scan_result = Some(Ok(pcb.task_pid_vnr().into()));
+                                scan_result = Some(Ok(wait_visible_pid(&pcb).into()));
 
                                 break;
                             } else if kwo.options.contains(WaitOption::WCONTINUED)
@@ -807,7 +815,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                             {
                                 kwo.no_task_error = None;
                                 kwo.ret_info = Some(WaitIdInfo {
-                                    pid: pcb.task_pid_vnr(),
+                                    pid: wait_visible_pid(&pcb),
                                     status: Signal::SIGCONT as i32,
                                     cause: SigChildCode::Continued.into(),
                                 });
@@ -816,7 +824,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 if !kwo.options.contains(WaitOption::WNOWAIT) {
                                     pcb.sighand().flags_remove(SignalFlags::CLD_CONTINUED);
                                 }
-                                scan_result = Some(Ok(pcb.task_pid_vnr().into()));
+                                scan_result = Some(Ok(wait_visible_pid(&pcb).into()));
 
                                 break;
                             } else if pcb.is_zombie() && kwo.options.contains(WaitOption::WEXITED) {
@@ -831,7 +839,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                 let status8 = wstatus_to_waitid_status(raw);
                                 kwo.no_task_error = None;
                                 kwo.ret_info = Some(WaitIdInfo {
-                                    pid: pcb.task_pid_vnr(),
+                                    pid: wait_visible_pid(&pcb),
                                     status: status8,
                                     cause: SigChildCode::Exited.into(),
                                 });
@@ -844,7 +852,7 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
                                     account_reaped_child_rusage(&child_rusage);
                                     pid_to_release = Some(pcb.raw_pid());
                                 }
-                                scan_result = Some(Ok(pcb.task_pid_vnr().into()));
+                                scan_result = Some(Ok(wait_visible_pid(&pcb).into()));
 
                                 break;
                             }
@@ -923,7 +931,7 @@ fn do_waitpid(
         //     child_pcb.raw_pid()
         // );
         kwo.ret_info = Some(WaitIdInfo {
-            pid: child_pcb.task_pid_vnr(),
+            pid: wait_visible_pid(&child_pcb),
             status: Signal::SIGCONT as i32,
             cause: SigChildCode::Continued.into(),
         });
@@ -936,7 +944,7 @@ fn do_waitpid(
         if !kwo.options.contains(WaitOption::WNOWAIT) {
             child_pcb.sighand().flags_remove(SignalFlags::CLD_CONTINUED);
         }
-        return Some(Ok(child_pcb.raw_pid().data()));
+        return Some(Ok(wait_visible_pid(&child_pcb).into()));
     }
 
     let state = child_pcb.sched_info().state();
@@ -967,7 +975,7 @@ fn do_waitpid(
             // 填充 waitid 信息
             // log::debug!("do_waitpid: report CLD_STOPPED for pid={:?}", child_pcb.raw_pid());
             kwo.ret_info = Some(WaitIdInfo {
-                pid: child_pcb.task_pid_vnr(),
+                pid: wait_visible_pid(&child_pcb),
                 status: stopsig,
                 cause: SigChildCode::Stopped.into(),
             });
@@ -982,7 +990,7 @@ fn do_waitpid(
                 child_pcb.sighand().flags_remove(SignalFlags::CLD_STOPPED);
             }
 
-            return Some(Ok(child_pcb.raw_pid().data()));
+            return Some(Ok(wait_visible_pid(&child_pcb).into()));
         }
         ProcessState::Exited(status) => {
             if !child_pcb.is_zombie() {
@@ -991,7 +999,7 @@ fn do_waitpid(
             if reap_blocked_by_group_exec(&child_pcb) {
                 return None;
             }
-            let pid = child_pcb.task_pid_vnr();
+            let pid = wait_visible_pid(&child_pcb);
             // Linux 语义：若等待集合未包含 WEXITED，则不报告退出事件
             if likely(!kwo.options.contains(WaitOption::WEXITED)) {
                 return None;

@@ -266,6 +266,8 @@ impl IndexNode for TtyDevice {
 
         let ret = tty.open(tty.core());
         if let Err(err) = ret {
+            tty.core().dec_count();
+            *data = FilePrivateData::Unused;
             if err == SystemError::ENOSYS {
                 return Err(SystemError::ENODEV);
             }

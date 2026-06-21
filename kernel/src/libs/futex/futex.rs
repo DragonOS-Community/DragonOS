@@ -22,7 +22,7 @@ use crate::{
         mutex::{Mutex, MutexGuard},
         wait_queue::{Waiter, Waker},
     },
-    mm::{ucontext::AddressSpace, MemoryManagementArch, VirtAddr},
+    mm::{ucontext::AddressSpace, MemoryManagementArch, VirtAddr, VirtRegion},
     process::{ProcessControlBlock, ProcessManager, RawPid},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
     time::{
@@ -586,7 +586,8 @@ impl Futex {
         // 共享：需要生成能跨进程匹配的键
         // 按照 Linux 语义，共享 futex 基于物理页帧号（PFN）或文件身份
         let address_space = AddressSpace::current()?;
-        let as_guard = address_space.read();
+        let as_guard = address_space
+            .read_guard_no_reservation_conflict(VirtRegion::new(uaddr, MMArch::PAGE_SIZE));
         let vma = as_guard
             .mappings
             .contains(uaddr)

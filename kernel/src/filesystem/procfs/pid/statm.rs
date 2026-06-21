@@ -57,7 +57,7 @@ impl FileOps for StatmFileOps {
         // 获取进程内存信息（简化实现）
         let size_pages = user_vm
             .map(|vm| {
-                let guard = vm.read();
+                let guard = vm.read_guard_no_reservations();
                 // statm 第一列为总虚拟内存页数
                 (guard
                     .vma_usage_bytes()

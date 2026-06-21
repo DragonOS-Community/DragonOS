@@ -2,7 +2,6 @@
 
 use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_BRK};
 use crate::mm::ucontext::AddressSpace;
-use crate::mm::MemoryManagementArch;
 use crate::mm::VirtAddr;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use system_error::SystemError;
@@ -30,23 +29,7 @@ impl Syscall for SysBrkHandle {
         let addr = Self::addr(args);
         let new_addr = VirtAddr::new(addr);
         let address_space = AddressSpace::current()?;
-        let mut address_space = address_space.write();
-
-        if new_addr < address_space.brk_start || new_addr >= crate::arch::MMArch::USER_END_VADDR {
-            return Ok(address_space.brk.data());
-        }
-        if new_addr == address_space.brk {
-            return Ok(address_space.brk.data());
-        }
-
-        unsafe {
-            address_space
-                .set_brk(VirtAddr::new(crate::libs::align::page_align_up(
-                    new_addr.data(),
-                )))
-                .ok();
-            return Ok(address_space.sbrk(0).unwrap().data());
-        }
+        return address_space.set_brk_wait(new_addr);
     }
 
     /// Formats the syscall arguments for display/debugging purposes.

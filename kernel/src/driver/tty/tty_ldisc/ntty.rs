@@ -12,7 +12,7 @@ use crate::{
     driver::tty::{
         termios::{ControlCharIndex, InputMode, LocalMode, OutputMode, Termios},
         tty_core::{EchoOperation, TtyCore, TtyCoreData, TtyFlag, TtyIoctlCmd, TtyPacketStatus},
-        tty_driver::{TtyDriverFlag, TtyOperation},
+        tty_driver::{TtyDriverFlag, TtyDriverSubType, TtyOperation},
         tty_job_control::TtyJobCtrlManager,
     },
     filesystem::{epoll::EPollEventType, vfs::file::FileFlags},
@@ -1680,8 +1680,10 @@ impl TtyLineDiscipline for NTtyLinediscipline {
             let core = tty.core();
             if !ldata.input_available(core.termios(), false) {
                 if core.flags().contains(TtyFlag::OTHER_CLOSED) {
-                    // 对端已关闭且无数据可读，返回EOF而不是EIO，符合常规PTY语义
-                    ret = Ok(0);
+                    if core.driver().tty_driver_sub_type() == TtyDriverSubType::PtyMaster {
+                        // Linux pty master read after the last slave close returns EIO.
+                        ret = Err(SystemError::EIO);
+                    }
                     break;
                 }
 
@@ -1709,14 +1711,16 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                 // let wakeup_helper = Timer::new(helper, timeout);
                 // wakeup_helper.activate();
                 // drop(termios);
-                drop(ldata);
-                core.read_wq()
-                    .sleep((EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM).bits() as u64);
+                core.read_wq().sleep_unlock_spinlock(
+                    (EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM).bits() as u64,
+                    ldata,
+                );
                 continue;
             }
 
             if ldata.icanon && !core.termios().local_mode.contains(LocalMode::EXTPROC) {
-                if ldata.canon_copy_from_read_buf(buf, &mut nr, &mut offset)? {
+                let more = ldata.canon_copy_from_read_buf(buf, &mut nr, &mut offset)?;
+                if more {
                     *cookie = true;
                     offset += len - nr;
                     return Ok(offset);
@@ -1780,7 +1784,8 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                 return Err(SystemError::ERESTARTSYS);
             }
             if core.flags().contains(TtyFlag::HUPPED)
-                || core.flags().contains(TtyFlag::OTHER_CLOSED)
+                || (core.flags().contains(TtyFlag::OTHER_CLOSED)
+                    && core.driver().tty_driver_sub_type() != TtyDriverSubType::PtyMaster)
                 || core.flags().contains(TtyFlag::HUPPING)
             {
                 return Err(SystemError::EIO);
@@ -1956,13 +1961,14 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         ldata.icanon = termios.local_mode.contains(LocalMode::ICANON);
 
         // 设置回显
-        if termios.local_mode.contains(LocalMode::ECHO) {
-            ldata.echo = true;
-        }
+        ldata.echo = termios.local_mode.contains(LocalMode::ECHO);
 
         if termios.input_mode.contains(InputMode::ISTRIP)
             || termios.input_mode.contains(InputMode::IUCLC)
             || termios.input_mode.contains(InputMode::IGNCR)
+            || termios.input_mode.contains(InputMode::ICRNL)
+            || termios.input_mode.contains(InputMode::INLCR)
+            || termios.local_mode.contains(LocalMode::ICANON)
             || termios.input_mode.contains(InputMode::IXON)
             || termios.local_mode.contains(LocalMode::ISIG)
             || termios.local_mode.contains(LocalMode::ECHO)
@@ -2042,7 +2048,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
 
             ldata
                 .char_map
-                .set(ControlCharIndex::DISABLE_CHAR as usize, true);
+                .set(ControlCharIndex::DISABLE_CHAR as usize, false);
             ldata.raw = false;
             ldata.real_raw = false;
         } else {

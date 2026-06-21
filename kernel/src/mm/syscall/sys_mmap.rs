@@ -140,7 +140,7 @@ impl Syscall for SysMmapHandle {
         let current_address_space = AddressSpace::current()?;
         let start_page = if map_flags.contains(MapFlags::MAP_ANONYMOUS) {
             // 匿名映射
-            current_address_space.write().map_anonymous(
+            current_address_space.map_anonymous_wait(
                 start_vaddr,
                 len,
                 prot_flags,
@@ -150,7 +150,7 @@ impl Syscall for SysMmapHandle {
             )?
         } else {
             // 文件映射
-            current_address_space.write().file_mapping(
+            current_address_space.file_mapping(
                 start_vaddr,
                 len,
                 prot_flags,

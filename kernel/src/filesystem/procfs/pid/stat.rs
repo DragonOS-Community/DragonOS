@@ -153,7 +153,7 @@ impl FileOps for StatFileOps {
             .unwrap_or(1);
         let (vsize_bytes, rss_pages) = user_vm
             .map(|vm| {
-                let guard = vm.read();
+                let guard = vm.read_guard_no_reservations();
                 let bytes = guard.vma_usage_bytes();
                 let pages = (bytes.saturating_add(MMArch::PAGE_SIZE - 1)) >> MMArch::PAGE_SHIFT;
                 (bytes as u64, pages as u64)

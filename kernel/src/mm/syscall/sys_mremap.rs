@@ -6,7 +6,7 @@ use crate::mm::syscall::sys_munmap::do_munmap;
 use crate::mm::syscall::MremapFlags;
 use crate::mm::ucontext::AddressSpace;
 use crate::mm::MemoryManagementArch;
-use crate::mm::{MMArch, VirtAddr, VmFlags};
+use crate::mm::{MMArch, VirtAddr, VirtRegion, VmFlags};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use system_error::SystemError;
 
@@ -71,11 +71,23 @@ impl Syscall for SysMremapHandle {
         }
 
         let current_address_space = AddressSpace::current()?;
-        let vma = current_address_space.read().mappings.contains(old_vaddr);
-        if vma.is_none() {
+        let vma = loop {
+            let guard = current_address_space.read();
+            if let Some(vma) = guard.mappings.contains(old_vaddr) {
+                break vma;
+            }
+            let probe_region = VirtRegion::new(old_vaddr, MMArch::PAGE_SIZE);
+            if guard
+                .mappings
+                .first_reservation_conflict(probe_region)
+                .is_some()
+            {
+                drop(guard);
+                current_address_space.wait_for_no_reservation_conflict(probe_region);
+                continue;
+            }
             return Err(SystemError::EINVAL);
-        }
-        let vma = vma.unwrap();
+        };
         let (vm_flags, vma_region) = {
             let g = vma.lock();
             (*g.vm_flags(), *g.region())
@@ -127,7 +139,7 @@ impl Syscall for SysMremapHandle {
         }
 
         // 重映射到新内存区域
-        let r = current_address_space.write().mremap(
+        let r = current_address_space.mremap_wait(
             old_vaddr,
             old_len,
             new_len,

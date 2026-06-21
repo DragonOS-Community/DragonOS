@@ -12,7 +12,7 @@ use crate::{
         page::{page_manager_lock, DeferredFlusher, EntryFlags},
         syscall::ProtFlags,
         ucontext::{AddressSpace, PhysmapParams, VMA},
-        VirtAddr, VmFlags,
+        VirtAddr, VirtRegion, VmFlags,
     },
     process::ProcessManager,
     syscall::{table::Syscall, user_access::UserBufferReader},
@@ -39,12 +39,22 @@ pub(super) fn do_kernel_shmat(
     shmflg: ShmFlags,
 ) -> Result<usize, SystemError> {
     let ipcns = ProcessManager::current_ipcns();
-    let mut shm_manager_guard = ipcns.shm.lock();
     let current_address_space = AddressSpace::current()?;
-    let mut address_write_guard = current_address_space.write();
 
+    let size = {
+        let mut shm_manager_guard = ipcns.shm.lock();
+        let kernel_shm = shm_manager_guard.get_mut(&id).ok_or(SystemError::EINVAL)?;
+        page_align_up(kernel_shm.size())
+    };
+
+    let mut address_write_guard = if vaddr.data() == 0 {
+        current_address_space.write()
+    } else {
+        current_address_space.write_guard_no_reservation_conflict(VirtRegion::new(vaddr, size))
+    };
+
+    let mut shm_manager_guard = ipcns.shm.lock();
     let kernel_shm = shm_manager_guard.get_mut(&id).ok_or(SystemError::EINVAL)?;
-    let size = page_align_up(kernel_shm.size());
     let mut phys = PhysPageFrame::new(kernel_shm.start_paddr());
     let count = PageFrameCount::from_bytes(size).unwrap();
     let r = match vaddr.data() {

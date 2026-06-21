@@ -71,8 +71,7 @@ impl Syscall for SysMadviseHandle {
         let page_count = PageFrameCount::new(aligned_len / MMArch::PAGE_SIZE);
 
         current_address_space
-            .write()
-            .madvise(start_frame, page_count, madv_flags)
+            .madvise_wait(start_frame, page_count, madv_flags)
             .map_err(|_| SystemError::EINVAL)?;
         return Ok(0);
     }

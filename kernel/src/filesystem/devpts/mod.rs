@@ -108,7 +108,6 @@ impl DevPtsFs {
 
     pub fn free_index(&self, idx: usize) {
         self.pts_ida.lock().free(idx);
-        self.pts_count.fetch_sub(1, Ordering::SeqCst);
     }
 
     fn install_ptmx_node(&self) {
@@ -382,7 +381,12 @@ impl IndexNode for LockedDevPtsFSInode {
 
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
         let mut guard = self.inner.lock();
-        guard.children_unchecked_mut().remove(name);
+        if guard.children_unchecked_mut().remove(name).is_some()
+            && name.as_bytes().iter().all(u8::is_ascii_digit)
+        {
+            let fs = guard.fs.upgrade().unwrap();
+            fs.pts_count.fetch_sub(1, Ordering::SeqCst);
+        }
         Ok(())
     }
 }

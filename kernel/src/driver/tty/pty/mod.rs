@@ -98,6 +98,13 @@ impl PtyCommon {
                 return Err(SystemError::EIO);
             }
 
+            if core.driver().tty_driver_sub_type() == TtyDriverSubType::PtySlave
+                && link_core.count() != 1
+            {
+                core.flags_write().insert(TtyFlag::IO_ERROR);
+                return Err(SystemError::EIO);
+            }
+
             core.flags_write().remove(TtyFlag::IO_ERROR);
             link_core.flags_write().remove(TtyFlag::OTHER_CLOSED);
             core.flags_write().insert(TtyFlag::THROTTLED);

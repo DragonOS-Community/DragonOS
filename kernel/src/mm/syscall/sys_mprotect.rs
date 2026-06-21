@@ -62,8 +62,7 @@ impl Syscall for SysMprotectHandle {
         let page_count = PageFrameCount::from_bytes(len_aligned).unwrap();
 
         current_address_space
-            .write()
-            .mprotect(start_frame, page_count, prot_flags)
+            .mprotect_wait(start_frame, page_count, prot_flags)
             .map_err(|_| SystemError::EINVAL)?;
         return Ok(0);
     }

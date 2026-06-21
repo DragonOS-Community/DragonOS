@@ -24,6 +24,10 @@ use crate::init::{
 pub static KERNEL_LOG_LEVEL: KernelLogLevel = KernelLogLevel::new();
 
 const QUIET_CONSOLE_LOGLEVEL: u8 = 4;
+const DEFAULT_CONSOLE_LOGLEVEL: u8 = 7;
+const DEFAULT_MESSAGE_LOGLEVEL: u8 = 4;
+const MINIMUM_CONSOLE_LOGLEVEL: u8 = 1;
+const MAXIMUM_CONSOLE_LOGLEVEL: u8 = 8;
 
 /// 日志级别
 #[derive(Default, Clone, PartialEq, Debug)]
@@ -86,16 +90,16 @@ impl KernelLogLevel {
     /// 创建新的内核日志级别配置
     ///
     /// 默认值遵循Linux内核标准：
-    /// - console_loglevel: 7 (DEBUG)
+    /// - console_loglevel: 7 (默认输出INFO及以上级别，不输出DEBUG)
     /// - default_message_loglevel: 4 (WARNING)
     /// - minimum_console_loglevel: 1 (ALERT)
-    /// - default_console_loglevel: 7 (DEBUG)
+    /// - default_console_loglevel: 7
     pub const fn new() -> Self {
         Self {
-            console_level: AtomicU8::new(7),         // DEBUG级别
-            default_message_level: AtomicU8::new(4), // WARNING级别
-            minimum_level: AtomicU8::new(1),         // ALERT级别
-            default_console_level: AtomicU8::new(7), // DEBUG级别
+            console_level: AtomicU8::new(DEFAULT_CONSOLE_LOGLEVEL),
+            default_message_level: AtomicU8::new(DEFAULT_MESSAGE_LOGLEVEL),
+            minimum_level: AtomicU8::new(MINIMUM_CONSOLE_LOGLEVEL),
+            default_console_level: AtomicU8::new(DEFAULT_CONSOLE_LOGLEVEL),
         }
     }
 
@@ -105,27 +109,28 @@ impl KernelLogLevel {
     /// - `message_level`: 消息级别 (0-7)
     ///
     /// # 返回值
-    /// - `true`: 消息级别 <= 控制台级别，应该输出
-    /// - `false`: 消息级别 > 控制台级别，应该过滤
+    /// - `true`: 消息级别 < 控制台级别，应该输出
+    /// - `false`: 消息级别 >= 控制台级别，应该过滤
     ///
     /// # Linux语义
-    /// 遵循Linux内核的过滤规则：message_level <= console_loglevel
+    /// 遵循Linux内核的过滤规则：message_level < console_loglevel
     pub fn should_print(&self, message_level: LogLevel) -> bool {
         let console_level = self.console_level.load(Ordering::Acquire);
-        // Linux语义：message_level <= console_loglevel 时输出
-        message_level as u8 <= console_level
+        // Linux语义：message_level >= console_loglevel 时抑制输出。
+        // 因此默认console_loglevel=7时，INFO(6)会输出，DEBUG(7)不会输出。
+        (message_level as u8) < console_level
     }
 
     /// 设置控制台日志级别
     ///
     /// # 参数
-    /// - `level`: 新的控制台级别 (0-7)
+    /// - `level`: 新的控制台级别 (0-8)
     ///
     /// # 返回值
     /// - `Ok(())`: 设置成功
     /// - `Err(SystemError::EINVAL)`: 级别值无效
     pub fn set_console_level(&self, level: u8) -> Result<(), SystemError> {
-        if level <= 7 {
+        if level <= MAXIMUM_CONSOLE_LOGLEVEL {
             self.console_level.store(level, Ordering::Release);
             Ok(())
         } else {
@@ -169,15 +174,16 @@ impl KernelLogLevel {
 
 /// loglevel命令行参数处理
 ///
-/// 支持格式：loglevel=N (N=0-7)
+/// 支持格式：loglevel=N (N=0-8)
 /// 示例：loglevel=4 只输出WARNING及以上级别的日志
+/// 示例：loglevel=8 输出DEBUG及以上级别的日志
 #[linkme::distributed_slice(KCMDLINE_PARAM_KV)]
 static LOGLEVEL_PARAM: KernelCmdlineParameter = KernelCmdlineParameter::KV(KernelCmdlineKV {
     name: "loglevel",
     value: None,
     initialized: false,
     supplied: false,
-    default: "7", // 默认DEBUG级别
+    default: "7",
 });
 
 kernel_cmdline_param_arg!(QUIET_PARAM, quiet, false, false);
@@ -213,10 +219,14 @@ pub fn handle_loglevel_param() {
                 continue;
             };
             if let Ok(level) = value_str.parse::<u8>() {
-                if level <= 7 {
+                if level <= MAXIMUM_CONSOLE_LOGLEVEL {
                     selected_level = Some(level);
                 } else {
-                    log::warn!("loglevel: invalid level {}, must be 0-7", level);
+                    log::warn!(
+                        "loglevel: invalid level {}, must be 0-{}",
+                        level,
+                        MAXIMUM_CONSOLE_LOGLEVEL
+                    );
                 }
             } else {
                 log::warn!("loglevel: invalid value '{}', must be a number", value_str);

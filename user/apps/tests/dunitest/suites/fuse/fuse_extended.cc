@@ -6,6 +6,7 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
 
 #include "fuse_gtest_common.h"
 
@@ -33,6 +34,20 @@ static void fuse_sigsegv_longjmp_handler(int sig) {
 #ifndef POSIX_FADV_NOREUSE
 #define POSIX_FADV_NOREUSE 5
 #endif
+
+#ifndef XATTR_NAME_MAX
+#define XATTR_NAME_MAX 255
+#endif
+
+#ifndef XATTR_SIZE_MAX
+#define XATTR_SIZE_MAX 65536
+#endif
+
+static void fill_user_xattr_name(char *buf, size_t len) {
+    memset(buf, 'a', len);
+    memcpy(buf, "user.", strlen("user."));
+    buf[len] = '\0';
+}
 
 static int ext_test_p2_ops() {
     const char *mp = "/tmp/test_fuse_p2_ops";
@@ -239,6 +254,475 @@ static int ext_test_p2_ops() {
 fail:
     umount(mp);
 fail_no_umount:
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_positive_lookup_cache_respects_entry_ttl() {
+    const char *mp = "/tmp/test_fuse_lookup_cache";
+    char hello[256];
+    char missing[256];
+    struct stat st;
+    char buf[32];
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t lookup_count = 0;
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.lookup_count = &lookup_count;
+    args.entry_valid_sec = 60;
+    args.attr_valid_sec = 60;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(hello, sizeof(hello), "%s/hello.txt", mp);
+    for (int i = 0; i < 3; ++i) {
+        if (stat(hello, &st) != 0) {
+            printf("[FAIL] stat hello iteration %d: %s (errno=%d)\n", i, strerror(errno), errno);
+            goto fail;
+        }
+        int f = open(hello, O_RDONLY);
+        if (f < 0) {
+            printf("[FAIL] open hello iteration %d: %s (errno=%d)\n", i, strerror(errno), errno);
+            goto fail;
+        }
+        ssize_t n = read(f, buf, sizeof(buf));
+        int saved_errno = errno;
+        close(f);
+        if (n <= 0) {
+            errno = saved_errno;
+            printf("[FAIL] read hello iteration %d: %s (errno=%d)\n", i, strerror(errno), errno);
+            goto fail;
+        }
+    }
+
+    if (lookup_count != 1) {
+        printf("[FAIL] positive lookup cache expected 1 lookup, got %u\n", lookup_count);
+        goto fail;
+    }
+
+    snprintf(missing, sizeof(missing), "%s/missing.txt", mp);
+    for (int i = 0; i < 2; ++i) {
+        if (stat(missing, &st) == 0 || errno != ENOENT) {
+            printf("[FAIL] stat missing iteration %d expected ENOENT, errno=%d (%s)\n", i,
+                   errno, strerror(errno));
+            goto fail;
+        }
+    }
+
+    if (lookup_count != 3) {
+        printf("[FAIL] ordinary ENOENT should not be long-term cached, lookup_count=%u\n",
+               lookup_count);
+        goto fail;
+    }
+
+    if (umount(mp) != 0) {
+        printf("[FAIL] umount(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        goto fail_no_umount;
+    }
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    umount(mp);
+fail_no_umount:
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_xattr_ops() {
+    const char *mp = "/tmp/test_fuse_xattr";
+    char path[256];
+    char list[64] = {};
+    char small[4] = {};
+    char value[64] = {};
+    char name_255[XATTR_NAME_MAX + 1] = {};
+    char name_256[XATTR_NAME_MAX + 2] = {};
+    static char value_too_large[XATTR_SIZE_MAX + 1];
+    static char max_xattr_buf[XATTR_SIZE_MAX + 1];
+    ssize_t n = 0;
+    uint32_t set_count_before = 0;
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t getxattr_count = 0;
+    volatile uint32_t setxattr_count = 0;
+    volatile uint32_t listxattr_count = 0;
+    volatile uint32_t removexattr_count = 0;
+    volatile uint32_t last_setxattr_flags = UINT32_MAX;
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.getxattr_count = &getxattr_count;
+    args.setxattr_count = &setxattr_count;
+    args.listxattr_count = &listxattr_count;
+    args.removexattr_count = &removexattr_count;
+    args.last_setxattr_flags = &last_setxattr_flags;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    errno = 0;
+    n = listxattr(path, NULL, 0);
+    if (n <= 0) {
+        printf("[FAIL] listxattr size returned %zd errno=%d (%s)\n", n, errno, strerror(errno));
+        goto fail;
+    }
+    n = listxattr(path, list, sizeof(list));
+    if (n <= 0 || memcmp(list, "user.dragonos", sizeof("user.dragonos")) != 0) {
+        printf("[FAIL] listxattr value n=%zd first='%s' errno=%d\n", n, list, errno);
+        goto fail;
+    }
+    if (listxattr_count != 2) {
+        printf("[FAIL] listxattr_count=%u expected=2\n", listxattr_count);
+        goto fail;
+    }
+
+    args.force_listxattr_erange_at_max = 1;
+    errno = 0;
+    if (listxattr(path, max_xattr_buf, sizeof(max_xattr_buf)) != -1 || errno != E2BIG) {
+        printf("[FAIL] listxattr max-size ERANGE errno=%d expected=%d\n", errno, E2BIG);
+        goto fail;
+    }
+    if (listxattr_count != 3) {
+        printf("[FAIL] listxattr max-size count=%u expected=3\n", listxattr_count);
+        goto fail;
+    }
+    args.force_listxattr_erange_at_max = 0;
+
+    n = getxattr(path, "user.dragonos", NULL, 0);
+    if (n != (ssize_t)strlen("virtiofs-xattr")) {
+        printf("[FAIL] getxattr size n=%zd errno=%d (%s)\n", n, errno, strerror(errno));
+        goto fail;
+    }
+    errno = 0;
+    if (getxattr(path, "user.dragonos", small, sizeof(small)) != -1 || errno != ERANGE) {
+        printf("[FAIL] getxattr small buffer errno=%d expected=%d\n", errno, ERANGE);
+        goto fail;
+    }
+    n = getxattr(path, "user.dragonos", value, sizeof(value));
+    if (n != (ssize_t)strlen("virtiofs-xattr") ||
+        memcmp(value, "virtiofs-xattr", strlen("virtiofs-xattr")) != 0) {
+        printf("[FAIL] getxattr value n=%zd value='%s' errno=%d\n", n, value, errno);
+        goto fail;
+    }
+    if (getxattr_count != 3) {
+        printf("[FAIL] getxattr_count=%u expected=3\n", getxattr_count);
+        goto fail;
+    }
+
+    args.force_getxattr_erange_at_max = 1;
+    errno = 0;
+    if (getxattr(path, "user.dragonos", max_xattr_buf, sizeof(max_xattr_buf)) != -1 ||
+        errno != E2BIG) {
+        printf("[FAIL] getxattr max-size ERANGE errno=%d expected=%d\n", errno, E2BIG);
+        goto fail;
+    }
+    if (getxattr_count != 4) {
+        printf("[FAIL] getxattr max-size count=%u expected=4\n", getxattr_count);
+        goto fail;
+    }
+    args.force_getxattr_erange_at_max = 0;
+
+    set_count_before = setxattr_count;
+    errno = 0;
+    if (setxattr(path, "user.dragonos", "new", 3, 0x4) != -1 || errno != EINVAL) {
+        printf("[FAIL] setxattr invalid flags errno=%d expected=%d\n", errno, EINVAL);
+        goto fail;
+    }
+    if (setxattr_count != set_count_before) {
+        printf("[FAIL] invalid flags reached fuse daemon count=%u before=%u\n", setxattr_count,
+               set_count_before);
+        goto fail;
+    }
+
+    errno = 0;
+    if (setxattr(path, "user.dragonos", value_too_large, sizeof(value_too_large), 0) != -1 ||
+        errno != E2BIG) {
+        printf("[FAIL] setxattr oversized value errno=%d expected=%d\n", errno, E2BIG);
+        goto fail;
+    }
+    if (setxattr_count != set_count_before) {
+        printf("[FAIL] oversized value reached fuse daemon count=%u before=%u\n", setxattr_count,
+               set_count_before);
+        goto fail;
+    }
+
+    errno = 0;
+    if (setxattr(path, "", "new", 3, 0) != -1 || errno != ERANGE) {
+        printf("[FAIL] setxattr empty name errno=%d expected=%d\n", errno, ERANGE);
+        goto fail;
+    }
+    if (setxattr_count != set_count_before) {
+        printf("[FAIL] empty name reached fuse daemon count=%u before=%u\n", setxattr_count,
+               set_count_before);
+        goto fail;
+    }
+
+    fill_user_xattr_name(name_255, XATTR_NAME_MAX);
+    if (setxattr(path, name_255, "new", 3, 0) != 0) {
+        printf("[FAIL] setxattr 255-byte name failed errno=%d (%s)\n", errno, strerror(errno));
+        goto fail;
+    }
+    if (last_setxattr_flags != 0) {
+        printf("[FAIL] setxattr 255-byte name flags=%u expected=0\n", last_setxattr_flags);
+        goto fail;
+    }
+    set_count_before = setxattr_count;
+
+    fill_user_xattr_name(name_256, XATTR_NAME_MAX + 1);
+    errno = 0;
+    if (setxattr(path, name_256, "new", 3, 0) != -1 || errno != ERANGE) {
+        printf("[FAIL] setxattr 256-byte name errno=%d expected=%d\n", errno, ERANGE);
+        goto fail;
+    }
+    if (setxattr_count != set_count_before) {
+        printf("[FAIL] 256-byte name reached fuse daemon count=%u before=%u\n", setxattr_count,
+               set_count_before);
+        goto fail;
+    }
+
+    if (setxattr(path, "user.zero", nullptr, 0, 0) != 0) {
+        printf("[FAIL] setxattr zero-size null value failed errno=%d (%s)\n", errno,
+               strerror(errno));
+        goto fail;
+    }
+    if (last_setxattr_flags != 0) {
+        printf("[FAIL] setxattr zero-size null flags=%u expected=0\n", last_setxattr_flags);
+        goto fail;
+    }
+
+    if (setxattr(path, "user.dragonos", "new", 3, 0) != 0) {
+        printf("[FAIL] setxattr failed errno=%d (%s)\n", errno, strerror(errno));
+        goto fail;
+    }
+    if (last_setxattr_flags != 0) {
+        printf("[FAIL] setxattr flags=%u expected=0\n", last_setxattr_flags);
+        goto fail;
+    }
+    errno = 0;
+    if (setxattr(path, "user.dragonos", "new", 3, XATTR_CREATE) != -1 || errno != EEXIST) {
+        printf("[FAIL] setxattr XATTR_CREATE errno=%d expected=%d\n", errno, EEXIST);
+        goto fail;
+    }
+    if (last_setxattr_flags != XATTR_CREATE) {
+        printf("[FAIL] setxattr flags=%u expected XATTR_CREATE=%d\n", last_setxattr_flags,
+               XATTR_CREATE);
+        goto fail;
+    }
+    if (setxattr(path, "user.created", "new", 3, XATTR_CREATE) != 0) {
+        printf("[FAIL] setxattr XATTR_CREATE missing failed errno=%d (%s)\n", errno,
+               strerror(errno));
+        goto fail;
+    }
+    if (last_setxattr_flags != XATTR_CREATE) {
+        printf("[FAIL] setxattr flags=%u expected missing XATTR_CREATE=%d\n",
+               last_setxattr_flags, XATTR_CREATE);
+        goto fail;
+    }
+    if (setxattr(path, "user.dragonos", "new", 3, XATTR_REPLACE) != 0) {
+        printf("[FAIL] setxattr XATTR_REPLACE failed errno=%d (%s)\n", errno, strerror(errno));
+        goto fail;
+    }
+    if (last_setxattr_flags != XATTR_REPLACE) {
+        printf("[FAIL] setxattr flags=%u expected XATTR_REPLACE=%d\n", last_setxattr_flags,
+               XATTR_REPLACE);
+        goto fail;
+    }
+    errno = 0;
+    if (setxattr(path, "user.missing", "new", 3, XATTR_REPLACE) != -1 || errno != ENODATA) {
+        printf("[FAIL] setxattr XATTR_REPLACE missing errno=%d expected=%d\n", errno, ENODATA);
+        goto fail;
+    }
+    if (last_setxattr_flags != XATTR_REPLACE) {
+        printf("[FAIL] setxattr flags=%u expected missing XATTR_REPLACE=%d\n",
+               last_setxattr_flags, XATTR_REPLACE);
+        goto fail;
+    }
+    if (removexattr(path, "user.dragonos") != 0) {
+        printf("[FAIL] removexattr failed errno=%d (%s)\n", errno, strerror(errno));
+        goto fail;
+    }
+    if (setxattr_count != 7 || removexattr_count != 1) {
+        printf("[FAIL] set/remove counts set=%u remove=%u\n", setxattr_count, removexattr_count);
+        goto fail;
+    }
+
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_xattr_enosys_is_cached() {
+    const char *mp = "/tmp/test_fuse_xattr_enosys";
+    char path[256];
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t listxattr_count = 0;
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.listxattr_count = &listxattr_count;
+    args.force_xattr_enosys = 1;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    for (int i = 0; i < 2; ++i) {
+        errno = 0;
+        if (listxattr(path, NULL, 0) != -1 ||
+            (errno != EOPNOTSUPP && errno != ENOTSUP)) {
+            printf("[FAIL] listxattr ENOSYS cache iter=%d errno=%d (%s)\n", i, errno,
+                   strerror(errno));
+            goto fail;
+        }
+    }
+    if (listxattr_count != 1) {
+        printf("[FAIL] listxattr ENOSYS should be cached, count=%u\n", listxattr_count);
+        goto fail;
+    }
+
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    umount(mp);
     stop = 1;
     close(fd);
     pthread_join(th, NULL);
@@ -3293,7 +3777,6 @@ static int ext_test_mmap_fault_uses_open_fh_without_extra_open() {
         printf("[FAIL] init handshake timeout\n");
         goto fail;
     }
-
     snprintf(path, sizeof(path), "%s/hello.txt", mp);
     f = open(path, O_RDONLY);
     if (f < 0) {
@@ -3347,6 +3830,131 @@ fail:
         waitpid(child, NULL, 0);
     }
     munmap(shared, sizeof(*shared));
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_mmap_fault_batches_readaround_pages() {
+    const char *mp = "/tmp/test_fuse_mmap_readaround";
+    const size_t page_size = 4096;
+    const size_t page_count = 8;
+    const size_t map_len = page_size * page_count;
+    char path[256];
+    int f = -1;
+    void *addr = MAP_FAILED;
+    volatile unsigned int checksum = 0;
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t read_count = 0;
+    volatile uint64_t read_offsets[8] = {0};
+    volatile uint32_t read_sizes[8] = {0};
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.read_count = &read_count;
+    args.read_offsets = read_offsets;
+    args.read_sizes = read_sizes;
+    args.read_trace_capacity = 8;
+    args.hello_generated_size_override = map_len;
+    args.init_out_max_write_override = map_len;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0,max_read=32768",
+             fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    f = open(path, O_RDONLY);
+    if (f < 0) {
+        printf("[FAIL] open(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+    addr = mmap(NULL, map_len, PROT_READ, MAP_PRIVATE, f, 0);
+    if (addr == MAP_FAILED) {
+        printf("[FAIL] mmap(%s): %s (errno=%d)\n", path, strerror(errno), errno);
+        goto fail;
+    }
+
+    for (size_t i = 0; i < page_count; i++) {
+        size_t offset = i * page_size;
+        unsigned char c = ((volatile unsigned char *)addr)[offset];
+        unsigned char expected = (unsigned char)('A' + (offset % 26));
+        if (c != expected) {
+            printf("[FAIL] mmap data mismatch page=%zu got=%u expected=%u read_count=%u\n", i, c,
+                   expected, read_count);
+            goto fail;
+        }
+        checksum += c;
+    }
+    if (checksum == 0) {
+        printf("[FAIL] checksum unexpectedly zero\n");
+        goto fail;
+    }
+
+    if (read_count != 1 || read_offsets[0] != 0 || read_sizes[0] != map_len) {
+        printf("[FAIL] mmap readaround not batched: count=%u off0=%llu size0=%u off1=%llu size1=%u\n",
+               read_count, (unsigned long long)read_offsets[0], read_sizes[0],
+               (unsigned long long)read_offsets[1], read_sizes[1]);
+        goto fail;
+    }
+
+    munmap(addr, map_len);
+    addr = MAP_FAILED;
+    close(f);
+    f = -1;
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (addr != MAP_FAILED) {
+        munmap(addr, map_len);
+    }
+    if (f >= 0) {
+        close(f);
+    }
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
     rmdir(mp);
     return -1;
 }
@@ -5560,6 +6168,704 @@ fail_no_ramfs_umount:
     return -1;
 }
 
+static int ext_test_lookup_nodes_forgotten_before_umount_when_unreferenced() {
+    const char *mp = "/tmp/test_fuse_lookup_lifetime";
+    char parent_path[512];
+    char child_path[512];
+    struct stat st;
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t forget_count = 0;
+    volatile uint64_t forget_nlookup_sum = 0;
+    volatile uint64_t forget_trace_nodeids[32] = {0};
+    volatile uint64_t forget_trace_nlookups[32] = {0};
+    volatile uint32_t destroy_count = 0;
+    uint32_t forget_count_before_umount = 0;
+    uint64_t forget_sum_before_umount = 0;
+    uint32_t distinct_nonroot_before_umount = 0;
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.enable_write_ops = 1;
+    args.stop_on_destroy = 1;
+    args.forget_count = &forget_count;
+    args.forget_nlookup_sum = &forget_nlookup_sum;
+    args.forget_trace_nodeids = forget_trace_nodeids;
+    args.forget_trace_nlookups = forget_trace_nlookups;
+    args.forget_trace_capacity = 32;
+    args.destroy_count = &destroy_count;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(parent_path, sizeof(parent_path), "%s/parent", mp);
+    snprintf(child_path, sizeof(child_path), "%s/parent/child", mp);
+    if (mkdir(parent_path, 0755) != 0) {
+        printf("[FAIL] mkdir(%s): %s (errno=%d)\n", parent_path, strerror(errno), errno);
+        goto fail;
+    }
+    if (mkdir(child_path, 0755) != 0) {
+        printf("[FAIL] mkdir(%s): %s (errno=%d)\n", child_path, strerror(errno), errno);
+        goto fail;
+    }
+    if (stat(child_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        printf("[FAIL] stat(%s): %s (errno=%d)\n", child_path, strerror(errno), errno);
+        goto fail;
+    }
+    if (stat(parent_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        printf("[FAIL] stat(%s) after child lookup: %s (errno=%d)\n", parent_path,
+               strerror(errno), errno);
+        goto fail;
+    }
+
+    for (int i = 0; i < 200 && forget_nlookup_sum < 2; i++) {
+        usleep(10 * 1000);
+    }
+    if (forget_count == 0 || forget_nlookup_sum < 2) {
+        printf("[FAIL] unreferenced FUSE lookup nodes not forgotten before umount: "
+               "count=%u nlookup=%llu\n",
+               forget_count, (unsigned long long)forget_nlookup_sum);
+        goto fail;
+    }
+    for (uint32_t i = 0; i < forget_count && i < 32; i++) {
+        if (forget_trace_nodeids[i] == 1) {
+            printf("[FAIL] root node unexpectedly forgotten before umount at index=%u "
+                   "nlookup=%llu\n",
+                   i, (unsigned long long)forget_trace_nlookups[i]);
+            goto fail;
+        }
+    }
+    distinct_nonroot_before_umount = 0;
+    for (uint32_t i = 0; i < forget_count && i < 32; i++) {
+        if (forget_trace_nodeids[i] == 0 || forget_trace_nodeids[i] == 1) {
+            continue;
+        }
+        bool seen = false;
+        for (uint32_t j = 0; j < i; j++) {
+            if (forget_trace_nodeids[j] == forget_trace_nodeids[i]) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) {
+            distinct_nonroot_before_umount++;
+        }
+    }
+    if (distinct_nonroot_before_umount < 2) {
+        printf("[FAIL] expected at least two distinct non-root nodes forgotten before umount, "
+               "got=%u count=%u nlookup=%llu\n",
+               distinct_nonroot_before_umount, forget_count,
+               (unsigned long long)forget_nlookup_sum);
+        goto fail;
+    }
+
+    forget_count_before_umount = forget_count;
+    forget_sum_before_umount = forget_nlookup_sum;
+
+    if (umount(mp) != 0) {
+        printf("[FAIL] umount(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        goto fail;
+    }
+    for (int i = 0; i < 200 && destroy_count == 0; i++) {
+        usleep(10 * 1000);
+    }
+    if (destroy_count == 0) {
+        printf("[FAIL] timed out waiting for FUSE_DESTROY after umount\n");
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    close(fd);
+    pthread_join(th, NULL);
+    if (destroy_count != 1 || forget_count < forget_count_before_umount ||
+        forget_nlookup_sum < forget_sum_before_umount) {
+        printf("[FAIL] FUSE teardown lost forget accounting or missed destroy: "
+               "forget=%u/%u nlookup=%llu/%llu destroy=%u\n",
+               forget_count, forget_count_before_umount, (unsigned long long)forget_nlookup_sum,
+               (unsigned long long)forget_sum_before_umount, destroy_count);
+        rmdir(mp);
+        return -1;
+    }
+    for (uint32_t i = 0; i < forget_count && i < 32; i++) {
+        if (forget_trace_nodeids[i] == 1) {
+            printf("[FAIL] root node unexpectedly forgotten at index=%u nlookup=%llu\n", i,
+                   (unsigned long long)forget_trace_nlookups[i]);
+            rmdir(mp);
+            return -1;
+        }
+    }
+    rmdir(mp);
+    return 0;
+
+fail:
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
+static bool forget_trace_contains(volatile uint64_t *nodeids, uint32_t count, uint64_t nodeid) {
+    for (uint32_t i = 0; i < count && i < 32; i++) {
+        if (nodeids[i] == nodeid) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool forget_trace_contains_pair(volatile uint64_t *nodeids,
+                                       volatile uint64_t *nlookups,
+                                       uint32_t count, uint64_t nodeid,
+                                       uint64_t nlookup) {
+    for (uint32_t i = 0; i < count && i < 32; i++) {
+        if (nodeids[i] == nodeid && nlookups[i] == nlookup) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int ext_test_positive_lookup_cache_expires_and_forgets_before_umount() {
+    const char *mp = "/tmp/test_fuse_positive_lookup_lifetime";
+    char parent_path[512];
+    char child_path[512];
+    char hello_path[512];
+    struct stat st;
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t forget_count = 0;
+    volatile uint64_t forget_nlookup_sum = 0;
+    volatile uint64_t forget_trace_nodeids[32] = {0};
+    volatile uint64_t forget_trace_nlookups[32] = {0};
+    volatile uint32_t destroy_count = 0;
+    uint32_t forget_count_before_umount = 0;
+    uint64_t forget_sum_before_umount = 0;
+    uint64_t parent_nodeid = 0;
+    uint64_t child_nodeid = 0;
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.enable_write_ops = 1;
+    args.stop_on_destroy = 1;
+    args.forget_count = &forget_count;
+    args.forget_nlookup_sum = &forget_nlookup_sum;
+    args.forget_trace_nodeids = forget_trace_nodeids;
+    args.forget_trace_nlookups = forget_trace_nlookups;
+    args.forget_trace_capacity = 32;
+    args.destroy_count = &destroy_count;
+    args.entry_valid_sec = 1;
+    args.attr_valid_sec = 1;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(parent_path, sizeof(parent_path), "%s/parent", mp);
+    snprintf(child_path, sizeof(child_path), "%s/parent/child", mp);
+    snprintf(hello_path, sizeof(hello_path), "%s/hello.txt", mp);
+    if (mkdir(parent_path, 0755) != 0) {
+        printf("[FAIL] mkdir(%s): %s (errno=%d)\n", parent_path, strerror(errno), errno);
+        goto fail;
+    }
+    if (stat(parent_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        printf("[FAIL] stat(%s): %s (errno=%d)\n", parent_path, strerror(errno), errno);
+        goto fail;
+    }
+    parent_nodeid = (uint64_t)st.st_ino;
+    if (mkdir(child_path, 0755) != 0) {
+        printf("[FAIL] mkdir(%s): %s (errno=%d)\n", child_path, strerror(errno), errno);
+        goto fail;
+    }
+    if (stat(child_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        printf("[FAIL] stat(%s): %s (errno=%d)\n", child_path, strerror(errno), errno);
+        goto fail;
+    }
+    child_nodeid = (uint64_t)st.st_ino;
+
+    usleep(2000 * 1000);
+    if (stat(hello_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        printf("[FAIL] stat(%s) after TTL: %s (errno=%d)\n", hello_path, strerror(errno), errno);
+        goto fail;
+    }
+
+    for (int i = 0; i < 200; i++) {
+        uint32_t count = forget_count;
+        if (forget_trace_contains(forget_trace_nodeids, count, parent_nodeid) &&
+            forget_trace_contains(forget_trace_nodeids, count, child_nodeid)) {
+            break;
+        }
+        usleep(10 * 1000);
+    }
+    if (!forget_trace_contains(forget_trace_nodeids, forget_count, parent_nodeid) ||
+        !forget_trace_contains(forget_trace_nodeids, forget_count, child_nodeid)) {
+        printf("[FAIL] positive TTL cache-only nodes were not forgotten before umount: "
+               "count=%u nlookup=%llu parent=%llu child=%llu saw_parent=%d saw_child=%d\n",
+               forget_count, (unsigned long long)forget_nlookup_sum,
+               (unsigned long long)parent_nodeid, (unsigned long long)child_nodeid,
+               forget_trace_contains(forget_trace_nodeids, forget_count, parent_nodeid),
+               forget_trace_contains(forget_trace_nodeids, forget_count, child_nodeid));
+        goto fail;
+    }
+    if (forget_trace_contains(forget_trace_nodeids, forget_count, 1)) {
+        printf("[FAIL] root node unexpectedly forgotten before umount\n");
+        goto fail;
+    }
+
+    forget_count_before_umount = forget_count;
+    forget_sum_before_umount = forget_nlookup_sum;
+    if (umount(mp) != 0) {
+        printf("[FAIL] umount(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        goto fail;
+    }
+    for (int i = 0; i < 200 && destroy_count == 0; i++) {
+        usleep(10 * 1000);
+    }
+    if (destroy_count == 0) {
+        printf("[FAIL] timed out waiting for FUSE_DESTROY after umount\n");
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    close(fd);
+    pthread_join(th, NULL);
+    if (destroy_count != 1 || forget_count < forget_count_before_umount ||
+        forget_nlookup_sum < forget_sum_before_umount ||
+        forget_trace_contains(forget_trace_nodeids, forget_count, 1)) {
+        printf("[FAIL] FUSE teardown regressed: forget=%u/%u nlookup=%llu/%llu destroy=%u "
+               "root_forget=%d\n",
+               forget_count, forget_count_before_umount, (unsigned long long)forget_nlookup_sum,
+               (unsigned long long)forget_sum_before_umount, destroy_count,
+               forget_trace_contains(forget_trace_nodeids, forget_count, 1));
+        rmdir(mp);
+        return -1;
+    }
+    rmdir(mp);
+    return 0;
+
+fail:
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_active_directory_parent_survives_lookup_cache_prune() {
+    const char *mp = "/tmp/test_fuse_active_parent_prune";
+    char parent_path[512];
+    char child_path[512];
+    char hello_path[512];
+    struct stat st;
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t destroy_count = 0;
+    volatile uint32_t lookup_count = 0;
+    uint32_t lookup_count_before_parent_relookup = 0;
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.enable_write_ops = 1;
+    args.stop_on_destroy = 1;
+    args.destroy_count = &destroy_count;
+    args.lookup_count = &lookup_count;
+    args.entry_valid_sec = 1;
+    args.attr_valid_sec = 1;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(parent_path, sizeof(parent_path), "%s/parent", mp);
+    snprintf(child_path, sizeof(child_path), "%s/parent/child", mp);
+    snprintf(hello_path, sizeof(hello_path), "%s/hello.txt", mp);
+    if (mkdir(parent_path, 0755) != 0 || mkdir(child_path, 0755) != 0) {
+        printf("[FAIL] mkdir active parent tree: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    if (chdir(child_path) != 0) {
+        printf("[FAIL] chdir(%s): %s (errno=%d)\n", child_path, strerror(errno), errno);
+        goto fail;
+    }
+    usleep(2000 * 1000);
+    if (stat(hello_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        printf("[FAIL] stat(%s) after TTL: %s (errno=%d)\n", hello_path, strerror(errno), errno);
+        goto fail_chdir;
+    }
+    lookup_count_before_parent_relookup = lookup_count;
+    if (stat(parent_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        printf("[FAIL] stat(%s) after prune: %s (errno=%d)\n", parent_path, strerror(errno),
+               errno);
+        goto fail_chdir;
+    }
+    if (lookup_count <= lookup_count_before_parent_relookup) {
+        printf("[FAIL] parent cache entry was not pruned: before=%u after=%u\n",
+               lookup_count_before_parent_relookup, lookup_count);
+        goto fail_chdir;
+    }
+    if (stat("..", &st) != 0 || !S_ISDIR(st.st_mode)) {
+        printf("[FAIL] stat(..) after cache prune: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail_chdir;
+    }
+
+    if (chdir("/") != 0) {
+        printf("[FAIL] chdir(/): %s (errno=%d)\n", strerror(errno), errno);
+        goto fail_chdir;
+    }
+    if (umount(mp) != 0) {
+        printf("[FAIL] umount(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        goto fail_no_umount;
+    }
+    for (int i = 0; i < 200 && destroy_count == 0; i++) {
+        usleep(10 * 1000);
+    }
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    if (destroy_count == 0) {
+        printf("[FAIL] timed out waiting for FUSE_DESTROY after umount\n");
+        return -1;
+    }
+    return 0;
+
+fail_chdir:
+    if (chdir("/") != 0) {
+        printf("[FAIL] cleanup chdir(/): %s (errno=%d)\n", strerror(errno), errno);
+    }
+fail:
+    umount(mp);
+fail_no_umount:
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_lookup_self_alias_rejected_and_forgotten() {
+    const char *mp = "/tmp/test_fuse_self_alias";
+    char parent_path[512];
+    char alias_path[512];
+    struct stat st;
+    uint64_t parent_nodeid = 0;
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t forget_count = 0;
+    volatile uint64_t forget_nlookup_sum = 0;
+    volatile uint64_t forget_trace_nodeids[32] = {0};
+    volatile uint64_t forget_trace_nlookups[32] = {0};
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.enable_write_ops = 1;
+    args.stop_on_destroy = 1;
+    args.lookup_self_alias = 1;
+    args.forget_count = &forget_count;
+    args.forget_nlookup_sum = &forget_nlookup_sum;
+    args.forget_trace_nodeids = forget_trace_nodeids;
+    args.forget_trace_nlookups = forget_trace_nlookups;
+    args.forget_trace_capacity = 32;
+    args.entry_valid_sec = 60;
+    args.attr_valid_sec = 60;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(parent_path, sizeof(parent_path), "%s/parent", mp);
+    snprintf(alias_path, sizeof(alias_path), "%s/parent/self_alias", mp);
+    if (mkdir(parent_path, 0755) != 0) {
+        printf("[FAIL] mkdir(%s): %s (errno=%d)\n", parent_path, strerror(errno), errno);
+        goto fail;
+    }
+    if (stat(parent_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        printf("[FAIL] stat(%s): %s (errno=%d)\n", parent_path, strerror(errno), errno);
+        goto fail;
+    }
+    parent_nodeid = (uint64_t)st.st_ino;
+
+    errno = 0;
+    if (stat(alias_path, &st) == 0 || errno != EIO) {
+        printf("[FAIL] self alias lookup expected EIO, ret_errno=%d\n", errno);
+        goto fail;
+    }
+    for (int i = 0; i < 200; i++) {
+        if (forget_trace_contains(forget_trace_nodeids, forget_count, parent_nodeid)) {
+            break;
+        }
+        usleep(10 * 1000);
+    }
+    if (!forget_trace_contains(forget_trace_nodeids, forget_count, parent_nodeid) ||
+        forget_nlookup_sum == 0) {
+        printf("[FAIL] self alias lookup ref was not forgotten: parent=%llu count=%u sum=%llu\n",
+               (unsigned long long)parent_nodeid, forget_count,
+               (unsigned long long)forget_nlookup_sum);
+        goto fail;
+    }
+
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_same_generation_type_mismatch_stales_old_node() {
+    const char *mp = "/tmp/test_fuse_type_mismatch";
+    char file_path[512];
+    int old_fd = -1;
+    struct stat st;
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.stop_on_destroy = 1;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    snprintf(file_path, sizeof(file_path), "%s/hello.txt", mp);
+    old_fd = open(file_path, O_RDONLY);
+    if (old_fd < 0) {
+        printf("[FAIL] open old hello: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    char buf[64];
+    if (read(old_fd, buf, sizeof(buf)) <= 0) {
+        printf("[FAIL] initial read old hello: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+
+    args.fs.nodes[1].is_dir = 1;
+    args.fs.nodes[1].mode = S_IFDIR | 0755;
+    args.fs.nodes[1].size = 0;
+    if (stat(file_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        printf("[FAIL] stat same-generation replacement dir: %s (errno=%d) mode=%o\n",
+               strerror(errno), errno, st.st_mode);
+        goto fail;
+    }
+
+    errno = 0;
+    if (pread(old_fd, buf, sizeof(buf), 0) >= 0 || errno != ESTALE) {
+        printf("[FAIL] old fd after type mismatch expected ESTALE, errno=%d\n", errno);
+        goto fail;
+    }
+    close(old_fd);
+    old_fd = -1;
+
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (old_fd >= 0) {
+        close(old_fd);
+    }
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
 static int ext_test_readdirplus_generation_mismatch_stales_old_node() {
     const char *mp = "/tmp/test_fuse_readdirplus_generation";
     char file_path[512];
@@ -5686,6 +6992,124 @@ fail:
     }
     if (old_fd >= 0) {
         close(old_fd);
+    }
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_readdirplus_invalid_attr_forgets_unconsumed_entry() {
+    const char *mp = "/tmp/test_fuse_readdirplus_invalid_attr";
+    DIR *dir = NULL;
+    int saw = 0;
+
+    if (ensure_dir(mp) != 0) {
+        printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        return -1;
+    }
+
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        printf("[FAIL] open(/dev/fuse): %s (errno=%d)\n", strerror(errno), errno);
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0;
+    volatile int init_done = 0;
+    volatile uint32_t readdirplus_count = 0;
+    volatile uint32_t forget_count = 0;
+    volatile uint64_t forget_trace_nodeids[32] = {0};
+    volatile uint64_t forget_trace_nlookups[32] = {0};
+
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.stop_on_destroy = 1;
+    args.force_opendir_enosys = 1;
+    args.init_out_flags_override =
+        FUSE_INIT_EXT | FUSE_MAX_PAGES | FUSE_NO_OPENDIR_SUPPORT | FUSE_DO_READDIRPLUS;
+    args.entry_valid_sec = 60;
+    args.attr_valid_sec = 60;
+    args.readdirplus_count = &readdirplus_count;
+    args.readdirplus_invalid_attr_name = "hello.txt";
+    args.readdirplus_invalid_attr_size = 0x8000000000000000ULL;
+    args.forget_count = &forget_count;
+    args.forget_trace_nodeids = forget_trace_nodeids;
+    args.forget_trace_nlookups = forget_trace_nlookups;
+    args.forget_trace_capacity = 32;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
+        printf("[FAIL] pthread_create\n");
+        close(fd);
+        rmdir(mp);
+        return -1;
+    }
+
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) {
+        printf("[FAIL] mount(fuse): %s (errno=%d)\n", strerror(errno), errno);
+        stop = 1;
+        close(fd);
+        pthread_join(th, NULL);
+        rmdir(mp);
+        return -1;
+    }
+    if (fuseg_wait_init(&init_done) != 0) {
+        printf("[FAIL] init handshake timeout\n");
+        goto fail;
+    }
+
+    dir = opendir(mp);
+    if (!dir) {
+        printf("[FAIL] opendir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
+        goto fail;
+    }
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL) {
+        if (strcmp(de->d_name, "hello.txt") == 0) {
+            saw = 1;
+        }
+    }
+    closedir(dir);
+    dir = NULL;
+    if (!saw || readdirplus_count == 0) {
+        printf("[FAIL] expected hello.txt from READDIRPLUS, saw=%d count=%u\n", saw,
+               readdirplus_count);
+        goto fail;
+    }
+
+    for (int i = 0; i < 200; i++) {
+        if (forget_trace_contains_pair(forget_trace_nodeids, forget_trace_nlookups, forget_count, 2,
+                                       1)) {
+            break;
+        }
+        usleep(10 * 1000);
+    }
+    if (!forget_trace_contains_pair(forget_trace_nodeids, forget_trace_nlookups, forget_count, 2,
+                                    1)) {
+        printf("[FAIL] invalid READDIRPLUS entry was not forgotten before umount: count=%u\n",
+               forget_count);
+        goto fail;
+    }
+
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (dir) {
+        closedir(dir);
     }
     umount(mp);
     stop = 1;
@@ -6026,6 +7450,18 @@ TEST(FuseExtended, OpsAccessCreateSymlinkLinkRename2FlushFsync) {
     ASSERT_EQ(0, ext_test_p2_ops());
 }
 
+TEST(FuseExtended, PositiveLookupCacheRespectsEntryTtl) {
+    ASSERT_EQ(0, ext_test_positive_lookup_cache_respects_entry_ttl());
+}
+
+TEST(FuseExtended, XattrOps) {
+    ASSERT_EQ(0, ext_test_xattr_ops());
+}
+
+TEST(FuseExtended, XattrEnosysIsCached) {
+    ASSERT_EQ(0, ext_test_xattr_enosys_is_cached());
+}
+
 TEST(FuseExtended, InterruptDeliversFuseInterrupt) {
     ASSERT_EQ(0, ext_test_p3_interrupt());
 }
@@ -6060,6 +7496,10 @@ TEST(FuseExtended, MmapSeesWriteThroughUpdate) {
 
 TEST(FuseExtended, MmapFaultUsesOpenFhWithoutExtraOpen) {
     ASSERT_EQ(0, ext_test_mmap_fault_uses_open_fh_without_extra_open());
+}
+
+TEST(FuseExtended, DISABLED_MmapFaultBatchesReadaroundPages) {
+    ASSERT_EQ(0, ext_test_mmap_fault_batches_readaround_pages());
 }
 
 TEST(FuseExtended, DirectIoReadBypassesPageCache) {
@@ -6118,12 +7558,36 @@ TEST(FuseExtended, MountRamfsOnFuseDirectoryUsesNamespacePath) {
     ASSERT_EQ(0, ext_test_mount_on_fuse_dir_uses_namespace_path());
 }
 
+TEST(FuseExtended, LookupNodesForgottenBeforeUmountWhenUnreferenced) {
+    ASSERT_EQ(0, ext_test_lookup_nodes_forgotten_before_umount_when_unreferenced());
+}
+
+TEST(FuseExtended, PositiveLookupCacheExpiresAndForgetsBeforeUmount) {
+    ASSERT_EQ(0, ext_test_positive_lookup_cache_expires_and_forgets_before_umount());
+}
+
+TEST(FuseExtended, ActiveDirectoryParentSurvivesLookupCachePrune) {
+    ASSERT_EQ(0, ext_test_active_directory_parent_survives_lookup_cache_prune());
+}
+
+TEST(FuseExtended, LookupSelfAliasRejectedAndForgotten) {
+    ASSERT_EQ(0, ext_test_lookup_self_alias_rejected_and_forgotten());
+}
+
 TEST(FuseExtended, RenameUpdatesFuseDirectoryCwdPath) {
     ASSERT_EQ(0, ext_test_rename_updates_fuse_dir_cwd_path());
 }
 
 TEST(FuseExtended, ReaddirplusGenerationMismatchStalesOldNode) {
     ASSERT_EQ(0, ext_test_readdirplus_generation_mismatch_stales_old_node());
+}
+
+TEST(FuseExtended, ReaddirplusInvalidAttrForgetsUnconsumedEntry) {
+    ASSERT_EQ(0, ext_test_readdirplus_invalid_attr_forgets_unconsumed_entry());
+}
+
+TEST(FuseExtended, SameGenerationTypeMismatchStalesOldNode) {
+    ASSERT_EQ(0, ext_test_same_generation_type_mismatch_stales_old_node());
 }
 
 TEST(FuseExtended, CreateGenerationMismatchStalesOldNode) {

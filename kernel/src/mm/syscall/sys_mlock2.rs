@@ -5,7 +5,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_MLOCK2},
-    mm::{access_ok, can_do_mlock, ucontext::AddressSpace, VirtAddr, VmFlags},
+    mm::{access_ok, can_do_mlock, ucontext::AddressSpace, VirtAddr, VirtRegion, VmFlags},
     syscall::table::{FormattedSyscallParam, Syscall},
 };
 
@@ -68,16 +68,25 @@ fn do_mlock2(start: VirtAddr, len: usize, flags: usize) -> Result<usize, SystemE
     }
 
     let vm = AddressSpace::current()?;
-    let mut guard = vm.write_interruptible()?;
-    let new_pages = guard.count_unlocked_pages_for_mlock(start, len)?;
-    check_mlock_rlimit(guard.locked_vm, new_pages)?;
-
     let mut new_flags = VmFlags::VM_LOCKED;
     if flags & MLOCK_ONFAULT != 0 {
         new_flags |= VmFlags::VM_LOCKONFAULT;
     }
-    guard.apply_vma_lock_flags(start, len, new_flags, false)?;
-    Ok(0)
+
+    let region = VirtRegion::new(start, len);
+    loop {
+        let mut guard = vm.write_interruptible()?;
+        if guard.mappings.first_reservation_conflict(region).is_some() {
+            drop(guard);
+            vm.wait_for_no_reservation_conflict_interruptible(region)?;
+            continue;
+        }
+
+        let new_pages = guard.count_unlocked_pages_for_mlock(start, len)?;
+        check_mlock_rlimit(guard.locked_vm, new_pages)?;
+        guard.apply_vma_lock_flags(start, len, new_flags, false)?;
+        return Ok(0);
+    }
 }
 
 syscall_table_macros::declare_syscall!(SYS_MLOCK2, SysMlock2Handle);

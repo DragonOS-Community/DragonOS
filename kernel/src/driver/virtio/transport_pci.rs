@@ -13,12 +13,13 @@ use crate::exception::IrqNumber;
 use crate::libs::volatile::{ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly};
 use crate::mm::VirtAddr;
 
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec, vec::Vec};
 use core::{
     fmt::{self, Display, Formatter},
     mem::{align_of, size_of},
     ptr::{self, addr_of_mut, NonNull},
 };
+use log::warn;
 use virtio_drivers::{
     transport::{DeviceStatus, DeviceType, Transport},
     Error, Hal, PhysAddr,
@@ -94,6 +95,8 @@ pub struct PciTransport {
     /// The start of the queue notification region within some BAR.
     notify_region: NonNull<[WriteOnly<u16>]>,
     notify_off_multiplier: u32,
+    /// Cached notify-region indices keyed by virtqueue index.
+    queue_notify_indices: Vec<Option<usize>>,
     /// The ISR status register within some BAR.
     isr_status: NonNull<Volatile<u8>>,
     /// The VirtIO device-specific configuration within some BAR.
@@ -185,7 +188,7 @@ impl PciTransport {
             }
         }
 
-        let common_cfg = get_bar_region::<_>(
+        let common_cfg = get_bar_region::<CommonCfg>(
             &device.standard_device_bar.read(),
             &common_cfg.ok_or(VirtioPciError::MissingCommonConfig)?,
         )?;
@@ -199,6 +202,8 @@ impl PciTransport {
         //debug!("notify.offset={},notify.length={}",notify_cfg.offset,notify_cfg.length);
         let notify_region =
             get_bar_region_slice::<_>(&device.standard_device_bar.read(), &notify_cfg)?;
+        let queue_count = unsafe { volread!(common_cfg, num_queues) as usize };
+        let queue_notify_indices = vec![None; queue_count];
         let isr_status = get_bar_region::<_>(
             &device.standard_device_bar.read(),
             &isr_cfg.ok_or(VirtioPciError::MissingIsrConfig)?,
@@ -217,6 +222,7 @@ impl PciTransport {
             common_cfg,
             notify_region,
             notify_off_multiplier,
+            queue_notify_indices,
             isr_status,
             config_space,
             irq,
@@ -231,6 +237,62 @@ impl PciTransport {
 
     pub fn irq(&self) -> IrqNumber {
         self.irq
+    }
+
+    fn cache_queue_notify_index(&mut self, queue: u16) -> Option<usize> {
+        let queue_index = queue as usize;
+        if queue_index >= self.queue_notify_indices.len() {
+            warn!(
+                "VirtIO PCI notify queue {} out of range, num_queues={}",
+                queue,
+                self.queue_notify_indices.len()
+            );
+            return None;
+        }
+
+        unsafe {
+            volwrite!(self.common_cfg, queue_select, queue);
+            let queue_notify_off = volread!(self.common_cfg, queue_notify_off);
+            let offset_bytes =
+                usize::from(queue_notify_off).checked_mul(self.notify_off_multiplier as usize);
+            let Some(offset_bytes) = offset_bytes else {
+                warn!(
+                    "VirtIO PCI notify offset overflow: queue={}, notify_off={}, multiplier={}",
+                    queue, queue_notify_off, self.notify_off_multiplier
+                );
+                return None;
+            };
+
+            let Some(end_offset_bytes) = offset_bytes.checked_add(size_of::<u16>()) else {
+                warn!(
+                    "VirtIO PCI notify offset end overflow: queue={}, offset_bytes={}",
+                    queue, offset_bytes
+                );
+                return None;
+            };
+            let notify_region_len_bytes = self.notify_region.len() * size_of::<u16>();
+            if end_offset_bytes > notify_region_len_bytes {
+                warn!(
+                    "VirtIO PCI notify offset out of range: queue={}, offset_bytes={}, notify_region_len_bytes={}",
+                    queue,
+                    offset_bytes,
+                    notify_region_len_bytes
+                );
+                return None;
+            }
+
+            let index = offset_bytes / size_of::<u16>();
+            self.queue_notify_indices[queue_index] = Some(index);
+            Some(index)
+        }
+    }
+
+    fn fail_bad_notify_config(&mut self, queue: u16) -> ! {
+        self.set_status(DeviceStatus::FAILED);
+        panic!(
+            "VirtIO PCI queue {} has invalid or missing notification register",
+            queue
+        );
     }
 }
 
@@ -274,17 +336,19 @@ impl Transport for PciTransport {
     }
 
     fn notify(&mut self, queue: u16) {
-        // Safe because the common config and notify region pointers are valid and we checked in
-        // get_bar_region that they were aligned.
-        unsafe {
-            volwrite!(self.common_cfg, queue_select, queue);
-            // TODO: Consider caching this somewhere (per queue).
-            let queue_notify_off = volread!(self.common_cfg, queue_notify_off);
+        let queue_index = queue as usize;
+        let Some(index) = self
+            .queue_notify_indices
+            .get(queue_index)
+            .copied()
+            .flatten()
+            .or_else(|| self.cache_queue_notify_index(queue))
+        else {
+            self.fail_bad_notify_config(queue);
+        };
 
-            let offset_bytes = usize::from(queue_notify_off) * self.notify_off_multiplier as usize;
-            let index = offset_bytes / size_of::<u16>();
-            addr_of_mut!((*self.notify_region.as_ptr())[index]).vwrite(queue);
-        }
+        // Safe because notify_region is a valid BAR mapping and the cached index is bounds-checked.
+        unsafe { addr_of_mut!((*self.notify_region.as_ptr())[index]).vwrite(queue) };
     }
 
     fn set_status(&mut self, status: DeviceStatus) {
@@ -323,6 +387,9 @@ impl Transport for PciTransport {
             volwrite!(self.common_cfg, queue_desc, descriptors as u64);
             volwrite!(self.common_cfg, queue_driver, driver_area as u64);
             volwrite!(self.common_cfg, queue_device, device_area as u64);
+            if self.cache_queue_notify_index(queue).is_none() {
+                self.fail_bad_notify_config(queue);
+            }
             // 这里设置队列中断对应的中断项
             if matches!(*self.device.irq_type.read(), IrqType::Msix { .. }) {
                 if queue == QUEUE_RECEIVE {
@@ -358,6 +425,9 @@ impl Transport for PciTransport {
             volwrite!(self.common_cfg, queue_desc, 0);
             volwrite!(self.common_cfg, queue_driver, 0);
             volwrite!(self.common_cfg, queue_device, 0);
+        }
+        if let Some(index) = self.queue_notify_indices.get_mut(queue as usize) {
+            *index = None;
         }
     }
 

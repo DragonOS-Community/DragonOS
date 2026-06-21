@@ -119,7 +119,7 @@ fn generate_maps_content(target: &ProcPidTarget) -> Result<Vec<u8>, SystemError>
         .absolute_path()
         .unwrap_or_default();
 
-    let as_guard = vm.read();
+    let as_guard = vm.read_guard_no_reservations();
 
     // 收集并按地址排序
     let mut vmas: Vec<Arc<LockedVMA>> = as_guard.mappings.iter_vmas().cloned().collect();

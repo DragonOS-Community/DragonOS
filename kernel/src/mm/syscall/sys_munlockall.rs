@@ -18,9 +18,16 @@ impl Syscall for SysMunlockallHandle {
 
     fn handle(&self, _args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let vm = AddressSpace::current()?;
-        let mut guard = vm.write_interruptible()?;
-        guard.clear_all_vma_lock_flags()?;
-        Ok(0)
+        loop {
+            let mut guard = vm.write_interruptible()?;
+            if guard.mappings.first_reservation_region().is_some() {
+                drop(guard);
+                vm.wait_for_no_reservations_interruptible()?;
+                continue;
+            }
+            guard.clear_all_vma_lock_flags()?;
+            return Ok(0);
+        }
     }
 
     fn entry_format(&self, _args: &[usize]) -> Vec<FormattedSyscallParam> {

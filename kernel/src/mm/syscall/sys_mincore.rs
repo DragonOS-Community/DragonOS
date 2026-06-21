@@ -50,9 +50,7 @@ impl Syscall for SysMincoreHandle {
         let mut writer = UserBufferWriter::new_checked(vec as *mut u8, page_count, true)?;
         let buf: &mut [u8] = writer.buffer(0)?;
         let page_count = PageFrameCount::new(page_count);
-        current_address_space
-            .read()
-            .mincore(start_frame, page_count, buf)?;
+        current_address_space.mincore_wait(start_frame, page_count, buf)?;
         return Ok(0);
     }
 

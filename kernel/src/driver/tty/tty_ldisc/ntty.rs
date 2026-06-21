@@ -115,6 +115,9 @@ pub struct NTtyData {
     cursor_column: u32,
     /// 规范模式下光标所在列
     canon_cursor_column: u32,
+    /// OPOST 处理后尚未被底层 driver 接收的输出字节。
+    opost_pending: Vec<u8>,
+    opost_pending_offset: usize,
     /// 回显缓冲区的尾指针
     echo_tail: usize,
 
@@ -150,6 +153,8 @@ impl NTtyData {
             echo: false,
             cursor_column: 0,
             canon_cursor_column: 0,
+            opost_pending: Vec::new(),
+            opost_pending_offset: 0,
             echo_tail: 0,
             read_buf: vec![0; NTTY_BUFSIZE].into_boxed_slice().try_into().unwrap(),
             echo_buf: vec![0; NTTY_BUFSIZE].into_boxed_slice().try_into().unwrap(),
@@ -157,6 +162,28 @@ impl NTtyData {
             char_map: StaticBitmap::new(),
             tty: Weak::default(),
             no_room: false,
+        }
+    }
+
+    fn opost_pending_bytes(&self) -> &[u8] {
+        if self.opost_pending_offset >= self.opost_pending.len() {
+            &[]
+        } else {
+            &self.opost_pending[self.opost_pending_offset..]
+        }
+    }
+
+    fn save_opost_pending(&mut self, bytes: &[u8]) {
+        self.opost_pending.clear();
+        self.opost_pending.extend_from_slice(bytes);
+        self.opost_pending_offset = 0;
+    }
+
+    fn advance_opost_pending(&mut self, count: usize) {
+        self.opost_pending_offset += count;
+        if self.opost_pending_offset >= self.opost_pending.len() {
+            self.opost_pending.clear();
+            self.opost_pending_offset = 0;
         }
     }
 
@@ -1570,6 +1597,8 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         ldata.pushing = false;
         ldata.lookahead_count = 0;
         ldata.no_room = false;
+        ldata.opost_pending.clear();
+        ldata.opost_pending_offset = 0;
 
         if core.link().is_some() {
             ldata.packet_mode_flush(core);
@@ -1791,42 +1820,83 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                 return Err(SystemError::EIO);
             }
             if termios.output_mode.contains(OutputMode::OPOST) {
-                out_buf.clear();
-                let space = tty.write_room(core);
-                let mut consumed = 0;
-                {
-                    let ldata = ldata.as_mut().unwrap();
-                    while consumed < nr {
-                        let c = buf[offset + consumed];
-                        match ldata.process_output_char_to_buf(&termios, c, &mut out_buf, space) {
-                            Ok(_) => {
-                                consumed += 1;
+                let mut made_progress = false;
+                let pending = ldata.as_ref().unwrap().opost_pending_bytes().to_vec();
+
+                if !pending.is_empty() {
+                    drop(ldata.take());
+                    let written = tty.write(core, &pending, pending.len())?;
+                    let mut guard = self.disc_data();
+                    if written != 0 {
+                        guard.advance_opost_pending(written);
+                        made_progress = true;
+                    }
+                    ldata = Some(guard);
+                    if written != 0 {
+                        tty.flush_chars(core);
+                    }
+                } else {
+                    out_buf.clear();
+                    let space = tty.write_room(core);
+                    let mut consumed = 0;
+                    let (cursor_column, canon_cursor_column) = {
+                        let ldata = ldata.as_ref().unwrap();
+                        (ldata.cursor_column, ldata.canon_cursor_column)
+                    };
+
+                    {
+                        let ldata = ldata.as_mut().unwrap();
+                        while consumed < nr {
+                            let c = buf[offset + consumed];
+                            match ldata.process_output_char_to_buf(&termios, c, &mut out_buf, space)
+                            {
+                                Ok(_) => {
+                                    consumed += 1;
+                                }
+                                Err(SystemError::ENOBUFS) => {
+                                    break;
+                                }
+                                Err(err) => {
+                                    return Err(err);
+                                }
                             }
-                            Err(SystemError::ENOBUFS) => {
-                                break;
+                        }
+                    }
+
+                    drop(ldata.take());
+
+                    if !out_buf.is_empty() {
+                        let written = tty.write(core, &out_buf, out_buf.len())?;
+                        let mut guard = self.disc_data();
+                        if written == 0 {
+                            guard.cursor_column = cursor_column;
+                            guard.canon_cursor_column = canon_cursor_column;
+                        } else {
+                            if written < out_buf.len() {
+                                guard.save_opost_pending(&out_buf[written..]);
                             }
-                            Err(err) => {
-                                return Err(err);
-                            }
+                            offset += consumed;
+                            nr -= consumed;
+                            made_progress = true;
+                        }
+                        ldata = Some(guard);
+                        if written != 0 {
+                            tty.flush_chars(core);
+                        }
+                    } else {
+                        ldata = Some(self.disc_data());
+                        if consumed != 0 {
+                            offset += consumed;
+                            nr -= consumed;
+                            made_progress = true;
+                            tty.flush_chars(core);
                         }
                     }
                 }
 
-                drop(ldata.take());
-
-                if !out_buf.is_empty() {
-                    let written = tty.write(core, &out_buf, out_buf.len())?;
-                    if written == 0 {
-                        consumed = 0;
-                    }
+                if made_progress {
+                    continue;
                 }
-
-                if consumed != 0 {
-                    offset += consumed;
-                    nr -= consumed;
-                }
-
-                tty.flush_chars(core);
             } else {
                 drop(ldata.take());
                 while nr > 0 {
@@ -1839,13 +1909,18 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                 }
             }
 
-            if nr == 0 {
+            let opost_pending = termios.output_mode.contains(OutputMode::OPOST)
+                && !ldata.as_ref().unwrap().opost_pending_bytes().is_empty();
+            if nr == 0 && !opost_pending {
                 break;
             }
 
             if _flags.contains(FileFlags::O_NONBLOCK)
                 || core.flags().contains(TtyFlag::LDISC_CHANGING)
             {
+                if offset != 0 {
+                    break;
+                }
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
 

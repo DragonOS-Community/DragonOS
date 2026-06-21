@@ -127,6 +127,36 @@ PtyPair OpenRawPty(char* name = nullptr) {
     return pair;
 }
 
+PtyPair OpenOpostPty() {
+    int master = -1;
+    int slave = -1;
+    if (openpty(&master, &slave, nullptr, nullptr, nullptr) < 0) {
+        ADD_FAILURE() << "openpty failed: errno=" << errno << " (" << strerror(errno) << ")";
+        return {};
+    }
+
+    PtyPair pair{UniqueFd(master), UniqueFd(slave)};
+
+    struct termios term = {};
+    if (tcgetattr(pair.slave.get(), &term) < 0) {
+        ADD_FAILURE() << "tcgetattr failed: errno=" << errno << " (" << strerror(errno) << ")";
+        return pair;
+    }
+
+    term.c_iflag = 0;
+    term.c_oflag = OPOST | ONLCR;
+    term.c_lflag = 0;
+    term.c_cflag |= CS8;
+    term.c_cc[VMIN] = 1;
+    term.c_cc[VTIME] = 0;
+
+    if (tcsetattr(pair.slave.get(), TCSANOW, &term) < 0) {
+        ADD_FAILURE() << "tcsetattr failed: errno=" << errno << " (" << strerror(errno) << ")";
+    }
+
+    return pair;
+}
+
 PtyPair OpenCanonicalNoEchoPty() {
     int master = -1;
     int slave = -1;
@@ -197,6 +227,38 @@ struct ConcurrentSlaveOpenArgs {
     int opened_fd;
     int open_errno;
 };
+
+struct WriteAllArgs {
+    int fd;
+    const char* data;
+    size_t len;
+    size_t written;
+    int error;
+};
+
+void* WriteAll(void* raw) {
+    auto* args = static_cast<WriteAllArgs*>(raw);
+    args->written = 0;
+    args->error = 0;
+
+    while (args->written < args->len) {
+        ssize_t n = write(args->fd, args->data + args->written, args->len - args->written);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n < 0) {
+            args->error = errno;
+            return nullptr;
+        }
+        if (n == 0) {
+            args->error = EIO;
+            return nullptr;
+        }
+        args->written += static_cast<size_t>(n);
+    }
+
+    return nullptr;
+}
 
 void* ConcurrentSlaveOpen(void* raw) {
     auto* args = static_cast<ConcurrentSlaveOpenArgs*>(raw);
@@ -904,6 +966,79 @@ TEST(TtyPtyHangup, ChildExitDrainsSlaveOutputBeforeMasterEio) {
     EXPECT_EQ(0, WEXITSTATUS(status));
 
     ExpectReadErrno(pair.master.get(), EIO);
+}
+
+TEST(TtyPtyHangup, LargeOpostSlaveWriteDrainsAndPreservesOnlcr) {
+    PtyPair pair = OpenOpostPty();
+    ASSERT_GE(pair.master.get(), 0);
+    ASSERT_GE(pair.slave.get(), 0);
+
+    constexpr size_t kInputBytes = 32 * 1024;
+    std::string input(kInputBytes, '\n');
+    std::vector<char> output(kInputBytes * 2);
+
+    WriteAllArgs args = {
+        .fd = pair.slave.get(),
+        .data = input.data(),
+        .len = input.size(),
+        .written = 0,
+        .error = 0,
+    };
+    pthread_t writer = {};
+    ASSERT_EQ(0, pthread_create(&writer, nullptr, WriteAll, &args)) << "pthread_create failed";
+
+    size_t total = 0;
+    int poll_error = 0;
+    bool read_ok = true;
+    while (total < output.size()) {
+        struct pollfd pfd = {
+            .fd = pair.master.get(),
+            .events = POLLIN | POLLHUP | POLLERR,
+            .revents = 0,
+        };
+        int ret = poll(&pfd, 1, 5000);
+        if (ret < 0 && errno == EINTR) {
+            continue;
+        }
+        if (ret <= 0) {
+            poll_error = ret < 0 ? errno : ETIMEDOUT;
+            read_ok = false;
+            break;
+        }
+        if ((pfd.revents & POLLIN) == 0) {
+            poll_error = EIO;
+            read_ok = false;
+            break;
+        }
+
+        ssize_t n = read(pair.master.get(), output.data() + total, output.size() - total);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            poll_error = n < 0 ? errno : EIO;
+            read_ok = false;
+            break;
+        }
+        total += static_cast<size_t>(n);
+    }
+
+    if (!read_ok) {
+        pair.slave.reset();
+        pair.master.reset();
+    }
+    ASSERT_EQ(0, pthread_join(writer, nullptr)) << "pthread_join failed";
+    ASSERT_TRUE(read_ok) << "timed out or failed while draining PTY output: errno=" << poll_error
+                         << " (" << strerror(poll_error) << ")";
+    ASSERT_EQ(0, args.error) << "writer failed after " << args.written << " bytes: errno="
+                             << args.error << " (" << strerror(args.error) << ")";
+    ASSERT_EQ(input.size(), args.written);
+    ASSERT_EQ(output.size(), total);
+
+    for (size_t i = 0; i < input.size(); ++i) {
+        EXPECT_EQ('\r', output[i * 2]) << "missing CR at converted newline " << i;
+        EXPECT_EQ('\n', output[i * 2 + 1]) << "missing LF at converted newline " << i;
+    }
 }
 
 }  // namespace

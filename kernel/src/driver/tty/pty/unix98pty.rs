@@ -749,5 +749,7 @@ pub fn pty_drain_pending_to(tty: Arc<TtyCore>) -> Result<(), SystemError> {
         return Ok(());
     };
 
-    hook.drain_to_peer(peer.core().driver().tty_driver_sub_type(), tty)
+    hook.drain_to_peer(peer.core().driver().tty_driver_sub_type(), tty)?;
+    peer.tty_wakeup();
+    Ok(())
 }

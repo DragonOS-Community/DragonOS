@@ -93,6 +93,32 @@ private:
     int fd_ = -1;
 };
 
+class ScopedSignalIgnore {
+public:
+    explicit ScopedSignalIgnore(int signum) : signum_(signum) {
+        struct sigaction action = {};
+        action.sa_handler = SIG_IGN;
+        sigemptyset(&action.sa_mask);
+        valid_ = sigaction(signum_, &action, &old_) == 0;
+    }
+
+    ScopedSignalIgnore(const ScopedSignalIgnore&) = delete;
+    ScopedSignalIgnore& operator=(const ScopedSignalIgnore&) = delete;
+
+    ~ScopedSignalIgnore() {
+        if (valid_) {
+            sigaction(signum_, &old_, nullptr);
+        }
+    }
+
+    bool valid() const { return valid_; }
+
+private:
+    int signum_;
+    struct sigaction old_ = {};
+    bool valid_ = false;
+};
+
 struct PtyPair {
     UniqueFd master;
     UniqueFd slave;
@@ -220,6 +246,69 @@ bool IsWouldBlock(int err) {
            || err == EWOULDBLOCK
 #endif
         ;
+}
+
+unsigned char ConfigureSignalFlushSlave(int fd, bool noflsh) {
+    struct termios term = {};
+    if (tcgetattr(fd, &term) < 0) {
+        ADD_FAILURE() << "tcgetattr failed: errno=" << errno << " (" << strerror(errno) << ")";
+        return 0;
+    }
+
+    term.c_lflag |= ICANON | ISIG;
+    term.c_lflag &= ~ECHO;
+    if (noflsh) {
+        term.c_lflag |= NOFLSH;
+    } else {
+        term.c_lflag &= ~NOFLSH;
+    }
+    term.c_cc[VMIN] = 1;
+    term.c_cc[VTIME] = 0;
+
+    if (tcsetattr(fd, TCSANOW, &term) < 0) {
+        ADD_FAILURE() << "tcsetattr failed: errno=" << errno << " (" << strerror(errno) << ")";
+        return 0;
+    }
+
+    return static_cast<unsigned char>(term.c_cc[VINTR]);
+}
+
+std::string ReadCanonicalLine(int fd) {
+    struct pollfd pfd = {
+        .fd = fd,
+        .events = POLLIN | POLLHUP | POLLERR,
+        .revents = 0,
+    };
+
+    int ret = 0;
+    do {
+        ret = poll(&pfd, 1, 5000);
+    } while (ret < 0 && errno == EINTR);
+
+    if (ret <= 0) {
+        ADD_FAILURE() << "poll waiting for canonical line failed: errno="
+                      << (ret < 0 ? errno : ETIMEDOUT) << " ("
+                      << strerror(ret < 0 ? errno : ETIMEDOUT) << ")";
+        return {};
+    }
+    if ((pfd.revents & POLLIN) == 0) {
+        ADD_FAILURE() << "poll returned without POLLIN, revents=" << pfd.revents;
+        return {};
+    }
+
+    char buf[512] = {};
+    ssize_t n = 0;
+    do {
+        n = read(fd, buf, sizeof(buf));
+    } while (n < 0 && errno == EINTR);
+
+    if (n <= 0) {
+        ADD_FAILURE() << "read canonical line failed: errno=" << (n < 0 ? errno : EIO)
+                      << " (" << strerror(n < 0 ? errno : EIO) << ")";
+        return {};
+    }
+
+    return std::string(buf, buf + n);
 }
 
 struct ConcurrentSlaveOpenArgs {
@@ -350,6 +439,66 @@ TEST(TtyPtyHangup, CanonicalReaderDoesNotMissLineWakeup) {
     }
     ASSERT_TRUE(WIFEXITED(status));
     EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+TEST(TtyPtyHangup, SignalFlushDiscardsPendingInputBacklog) {
+    ScopedSignalIgnore ignore_sigint(SIGINT);
+    ASSERT_TRUE(ignore_sigint.valid()) << "sigaction(SIGINT, SIG_IGN) failed: errno=" << errno
+                                       << " (" << strerror(errno) << ")";
+
+    PtyPair pair = OpenCanonicalNoEchoPty();
+    ASSERT_GE(pair.master.get(), 0);
+    ASSERT_GE(pair.slave.get(), 0);
+
+    unsigned char vintr = ConfigureSignalFlushSlave(pair.slave.get(), false);
+    ASSERT_NE(0, vintr) << "VINTR must be enabled for this regression test";
+
+    constexpr size_t kDragonOsPtyDrainChunk = 256;
+    std::string stale(kDragonOsPtyDrainChunk - 1, 'a');
+    stale.push_back(static_cast<char>(vintr));
+    stale.append("stale-backlog-should-be-flushed\n");
+    ASSERT_LT(stale.size(), static_cast<size_t>(16 * 1024));
+
+    ASSERT_EQ(static_cast<ssize_t>(stale.size()), write(pair.master.get(), stale.data(), stale.size()))
+        << "single stale write failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    const std::string fresh = "fresh-after-signal\n";
+    ASSERT_EQ(static_cast<ssize_t>(fresh.size()), write(pair.master.get(), fresh.data(), fresh.size()))
+        << "fresh marker write failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    EXPECT_EQ(fresh, ReadCanonicalLine(pair.slave.get()));
+}
+
+TEST(TtyPtyHangup, SignalNoflshPreservesPendingInputBacklog) {
+    ScopedSignalIgnore ignore_sigint(SIGINT);
+    ASSERT_TRUE(ignore_sigint.valid()) << "sigaction(SIGINT, SIG_IGN) failed: errno=" << errno
+                                       << " (" << strerror(errno) << ")";
+
+    PtyPair pair = OpenCanonicalNoEchoPty();
+    ASSERT_GE(pair.master.get(), 0);
+    ASSERT_GE(pair.slave.get(), 0);
+
+    unsigned char vintr = ConfigureSignalFlushSlave(pair.slave.get(), true);
+    ASSERT_NE(0, vintr) << "VINTR must be enabled for this regression test";
+
+    constexpr size_t kDragonOsPtyDrainChunk = 256;
+    std::string expected(kDragonOsPtyDrainChunk - 1, 'a');
+    expected.append("stale-backlog-must-survive\n");
+
+    std::string input(kDragonOsPtyDrainChunk - 1, 'a');
+    input.push_back(static_cast<char>(vintr));
+    input.append("stale-backlog-must-survive\n");
+    ASSERT_LT(input.size(), static_cast<size_t>(16 * 1024));
+
+    ASSERT_EQ(static_cast<ssize_t>(input.size()), write(pair.master.get(), input.data(), input.size()))
+        << "single NOFLSH write failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    const std::string fresh = "fresh-after-noflsh\n";
+    ASSERT_EQ(static_cast<ssize_t>(fresh.size()), write(pair.master.get(), fresh.data(), fresh.size()))
+        << "fresh marker write failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    EXPECT_EQ(expected, ReadCanonicalLine(pair.slave.get()));
+    EXPECT_EQ(fresh, ReadCanonicalLine(pair.slave.get()));
 }
 
 TEST(TtyPtyHangup, MasterPollAfterSlaveCloseReportsHupAndOut) {

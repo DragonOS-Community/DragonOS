@@ -10,7 +10,9 @@ use system_error::SystemError;
 use crate::{
     arch::ipc::signal::Signal,
     driver::tty::{
-        pty::unix98pty::{pty_discard_pending_to, pty_drain_pending_to},
+        pty::unix98pty::{
+            pty_discard_pending_to, pty_drain_pending_to, pty_request_discard_pending_to,
+        },
         termios::{ControlCharIndex, InputMode, LocalMode, OutputMode, Termios},
         tty_core::{EchoOperation, TtyCore, TtyCoreData, TtyFlag, TtyIoctlCmd, TtyPacketStatus},
         tty_driver::{TtyDriverFlag, TtyDriverSubType, TtyOperation},
@@ -877,6 +879,8 @@ impl NTtyData {
             self.read_flags.set_all(false);
             self.pushing = false;
             self.lookahead_count = 0;
+
+            let _ = pty_request_discard_pending_to(tty.clone());
 
             if tty.core().link().is_some() {
                 self.packet_mode_flush(tty.core());

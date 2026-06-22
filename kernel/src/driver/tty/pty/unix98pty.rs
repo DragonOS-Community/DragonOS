@@ -73,6 +73,8 @@ struct PtyDevPtsLink {
     slave_to_master_draining: AtomicBool,
     master_to_slave_drain_requested: AtomicBool,
     slave_to_master_drain_requested: AtomicBool,
+    master_to_slave_discarding: AtomicBool,
+    slave_to_master_discarding: AtomicBool,
     master_to_slave_flushing: AtomicBool,
     slave_to_master_flushing: AtomicBool,
 }
@@ -103,6 +105,7 @@ struct PtyByteQueue {
     buf: Box<[u8; PTY_BUFFER_LIMIT]>,
     head: usize,
     len: usize,
+    discard_len: usize,
 }
 
 impl PtyByteQueue {
@@ -114,6 +117,7 @@ impl PtyByteQueue {
                 .unwrap(),
             head: 0,
             len: 0,
+            discard_len: 0,
         }
     }
 
@@ -125,9 +129,16 @@ impl PtyByteQueue {
         PTY_BUFFER_LIMIT - self.len
     }
 
-    fn clear(&mut self) {
+    fn clear_count(&mut self) -> usize {
+        let cleared = self.len;
         self.head = 0;
         self.len = 0;
+        self.discard_len = 0;
+        cleared
+    }
+
+    fn clear(&mut self) {
+        self.clear_count();
     }
 
     fn push_slice(&mut self, buf: &[u8]) -> usize {
@@ -152,9 +163,21 @@ impl PtyByteQueue {
         let count = count.min(self.len);
         self.head = (self.head + count) % PTY_BUFFER_LIMIT;
         self.len -= count;
+        self.discard_len = self.discard_len.saturating_sub(count);
         if self.len == 0 {
             self.head = 0;
+            self.discard_len = 0;
         }
+    }
+
+    fn request_discard_prefix(&mut self) {
+        self.discard_len = self.len;
+    }
+
+    fn discard_requested_prefix(&mut self) -> usize {
+        let discard_len = self.discard_len.min(self.len);
+        self.advance_front(discard_len);
+        discard_len
     }
 }
 
@@ -183,6 +206,8 @@ impl PtyDevPtsLink {
             slave_to_master_draining: AtomicBool::new(false),
             master_to_slave_drain_requested: AtomicBool::new(false),
             slave_to_master_drain_requested: AtomicBool::new(false),
+            master_to_slave_discarding: AtomicBool::new(false),
+            slave_to_master_discarding: AtomicBool::new(false),
             master_to_slave_flushing: AtomicBool::new(false),
             slave_to_master_flushing: AtomicBool::new(false),
         }
@@ -199,16 +224,18 @@ impl PtyDevPtsLink {
     fn state_flags_for_source(
         &self,
         subtype: TtyDriverSubType,
-    ) -> Option<(&AtomicBool, &AtomicBool, &AtomicBool)> {
+    ) -> Option<(&AtomicBool, &AtomicBool, &AtomicBool, &AtomicBool)> {
         match subtype {
             TtyDriverSubType::PtyMaster => Some((
                 &self.master_to_slave_draining,
                 &self.master_to_slave_drain_requested,
+                &self.master_to_slave_discarding,
                 &self.master_to_slave_flushing,
             )),
             TtyDriverSubType::PtySlave => Some((
                 &self.slave_to_master_draining,
                 &self.slave_to_master_drain_requested,
+                &self.slave_to_master_discarding,
                 &self.slave_to_master_flushing,
             )),
             _ => None,
@@ -225,7 +252,8 @@ impl PtyDevPtsLink {
         let Some(queue) = self.queue_for_source(subtype) else {
             return Err(SystemError::ENODEV);
         };
-        let Some((draining, drain_requested, flushing)) = self.state_flags_for_source(subtype)
+        let Some((draining, drain_requested, discarding, flushing)) =
+            self.state_flags_for_source(subtype)
         else {
             return Err(SystemError::ENODEV);
         };
@@ -245,10 +273,57 @@ impl PtyDevPtsLink {
         }
 
         drain_requested.store(false, Ordering::Release);
+        discarding.store(false, Ordering::Release);
         queue.lock_irqsave().clear();
         draining.store(false, Ordering::Release);
         flushing.store(false, Ordering::Release);
         Ok(())
+    }
+
+    fn discard_requested_prefix(&self, queue: &SpinLock<PtyByteQueue>) -> usize {
+        queue.lock_irqsave().discard_requested_prefix()
+    }
+
+    fn request_discard_pending_from(
+        &self,
+        subtype: TtyDriverSubType,
+    ) -> Result<usize, SystemError> {
+        let Some(queue) = self.queue_for_source(subtype) else {
+            return Err(SystemError::ENODEV);
+        };
+        let Some((draining, drain_requested, discarding, flushing)) =
+            self.state_flags_for_source(subtype)
+        else {
+            return Err(SystemError::ENODEV);
+        };
+
+        if flushing.load(Ordering::Acquire) {
+            return Ok(0);
+        }
+
+        if discarding
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return Ok(0);
+        }
+
+        queue.lock_irqsave().request_discard_prefix();
+
+        if draining
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            discarding.store(false, Ordering::Release);
+            return Ok(0);
+        }
+
+        let discarded = self.discard_requested_prefix(queue);
+        drain_requested.store(false, Ordering::Release);
+        draining.store(false, Ordering::Release);
+        discarding.store(false, Ordering::Release);
+
+        Ok(discarded)
     }
 
     fn write_to_peer(
@@ -261,24 +336,38 @@ impl PtyDevPtsLink {
         let Some(queue) = self.queue_for_source(subtype) else {
             return Err(SystemError::ENODEV);
         };
-        let Some((_, _, flushing)) = self.state_flags_for_source(subtype) else {
+        let Some((_, _, discarding, flushing)) = self.state_flags_for_source(subtype) else {
             return Err(SystemError::ENODEV);
         };
 
-        while flushing.load(Ordering::Acquire) {
-            spin_loop();
-        }
+        let mut accepted = loop {
+            while flushing.load(Ordering::Acquire) || discarding.load(Ordering::Acquire) {
+                spin_loop();
+            }
 
-        let mut accepted = {
             let mut queue = queue.lock_irqsave();
-            queue.push_slice(&buf[..nr])
+            if flushing.load(Ordering::Acquire) || discarding.load(Ordering::Acquire) {
+                drop(queue);
+                spin_loop();
+                continue;
+            }
+            break queue.push_slice(&buf[..nr]);
         };
 
         if accepted == 0 {
             self.drain_to_peer(subtype, to.clone())?;
-            accepted = {
+            accepted = loop {
+                while flushing.load(Ordering::Acquire) || discarding.load(Ordering::Acquire) {
+                    spin_loop();
+                }
+
                 let mut queue = queue.lock_irqsave();
-                queue.push_slice(&buf[..nr])
+                if flushing.load(Ordering::Acquire) || discarding.load(Ordering::Acquire) {
+                    drop(queue);
+                    spin_loop();
+                    continue;
+                }
+                break queue.push_slice(&buf[..nr]);
             };
         }
 
@@ -297,13 +386,14 @@ impl PtyDevPtsLink {
         let Some(queue) = self.queue_for_source(subtype) else {
             return Err(SystemError::ENODEV);
         };
-        let Some((draining, drain_requested, flushing)) = self.state_flags_for_source(subtype)
+        let Some((draining, drain_requested, discarding, flushing)) =
+            self.state_flags_for_source(subtype)
         else {
             return Err(SystemError::ENODEV);
         };
 
         let mut result = DrainResult::default();
-        if flushing.load(Ordering::Acquire) {
+        if flushing.load(Ordering::Acquire) || discarding.load(Ordering::Acquire) {
             result.still_pending = !queue.lock_irqsave().is_empty();
             return Ok(result);
         }
@@ -320,6 +410,28 @@ impl PtyDevPtsLink {
             if flushing.load(Ordering::Acquire) {
                 result.still_pending = !queue.lock_irqsave().is_empty();
                 draining.store(false, Ordering::Release);
+                break;
+            }
+            if discarding.load(Ordering::Acquire) {
+                result.still_pending = !queue.lock_irqsave().is_empty();
+                draining.store(false, Ordering::Release);
+                break;
+            }
+
+            let discarded = self.discard_requested_prefix(queue);
+            if discarded != 0 {
+                result.freed_backlog += discarded;
+                if !queue.lock_irqsave().is_empty() {
+                    continue;
+                }
+                draining.store(false, Ordering::Release);
+                if drain_requested.swap(false, Ordering::AcqRel)
+                    && draining
+                        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    continue;
+                }
                 break;
             }
 
@@ -347,6 +459,7 @@ impl PtyDevPtsLink {
                 {
                     Ok(delivered) => delivered,
                     Err(err) => {
+                        let _ = self.discard_requested_prefix(queue);
                         draining.store(false, Ordering::Release);
                         return Err(err);
                     }
@@ -354,6 +467,22 @@ impl PtyDevPtsLink {
             queue.lock_irqsave().advance_front(delivered);
             result.delivered += delivered;
             result.freed_backlog += delivered;
+            let discarded = self.discard_requested_prefix(queue);
+            if discarded != 0 {
+                result.freed_backlog += discarded;
+                if !queue.lock_irqsave().is_empty() {
+                    continue;
+                }
+                draining.store(false, Ordering::Release);
+                if drain_requested.swap(false, Ordering::AcqRel)
+                    && draining
+                        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    continue;
+                }
+                break;
+            }
             if delivered < chunk_len {
                 result.still_pending = true;
                 draining.store(false, Ordering::Release);
@@ -943,5 +1072,24 @@ pub fn pty_discard_pending_to(tty: Arc<TtyCore>) -> Result<(), SystemError> {
 
     hook.clear_pending_from(peer.core().driver().tty_driver_sub_type())?;
     peer.tty_wakeup();
+    Ok(())
+}
+
+pub fn pty_request_discard_pending_to(tty: Arc<TtyCore>) -> Result<(), SystemError> {
+    let Some(peer) = tty.core().link() else {
+        return Ok(());
+    };
+    let Some(hook_arc) = tty.private_fields() else {
+        return Ok(());
+    };
+    let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() else {
+        return Ok(());
+    };
+
+    let discarded =
+        hook.request_discard_pending_from(peer.core().driver().tty_driver_sub_type())?;
+    if discarded != 0 {
+        peer.tty_wakeup();
+    }
     Ok(())
 }

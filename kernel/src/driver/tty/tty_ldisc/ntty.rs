@@ -14,7 +14,10 @@ use crate::{
             pty_discard_pending_to, pty_drain_pending_to, pty_request_discard_pending_to,
         },
         termios::{ControlCharIndex, InputMode, LocalMode, OutputMode, Termios},
-        tty_core::{EchoOperation, TtyCore, TtyCoreData, TtyFlag, TtyIoctlCmd, TtyPacketStatus},
+        tty_core::{
+            EchoOperation, TtyCore, TtyCoreData, TtyFlag, TtyIoctlCmd, TtyPacketStatus,
+            TtySleepLock,
+        },
         tty_driver::{TtyDriverFlag, TtyDriverSubType, TtyOperation},
         tty_job_control::TtyJobCtrlManager,
     },
@@ -50,6 +53,14 @@ fn output_mode_has_xtabs(termios: &Termios) -> bool {
 #[derive(Debug)]
 pub struct NTtyLinediscipline {
     pub data: SpinLock<NTtyData>,
+    pub(crate) output_lock: TtySleepLock,
+}
+
+struct EchoStep {
+    bytes: Vec<u8>,
+    tail: usize,
+    cursor_column: u32,
+    canon_cursor_column: u32,
 }
 
 impl NTtyLinediscipline {
@@ -73,6 +84,46 @@ impl NTtyLinediscipline {
                 return TtyCore::tty_mode_ioctl(tty.clone(), cmd, arg);
             }
         }
+    }
+
+    fn drain_echoes(&self, tty: Arc<TtyCore>) -> Result<(), SystemError> {
+        let core = tty.core();
+        loop {
+            let termios = *core.termios();
+            let space = tty.write_room(core);
+            let step = {
+                let guard = self.disc_data();
+                guard.next_echo_step(&termios, space)
+            };
+
+            let Some(step) = step else {
+                break;
+            };
+
+            if !step.bytes.is_empty() {
+                let mut sent = 0;
+                while sent < step.bytes.len() {
+                    let written = tty.write(core, &step.bytes[sent..], step.bytes.len() - sent)?;
+                    if written == 0 {
+                        if sent == 0 {
+                            return Ok(());
+                        }
+                        let _ = core.write_wq().wait_event_interruptible(
+                            EPollEventType::EPOLLOUT.bits() as u64,
+                            || tty.write_room(core) > 0,
+                        );
+                        continue;
+                    }
+                    sent += written;
+                }
+                tty.flush_chars(core);
+            }
+
+            let mut guard = self.disc_data();
+            guard.apply_echo_step(step);
+        }
+
+        Ok(())
     }
 }
 
@@ -178,12 +229,6 @@ impl NTtyData {
         } else {
             &self.opost_pending[self.opost_pending_offset..]
         }
-    }
-
-    fn save_opost_pending(&mut self, bytes: &[u8]) {
-        self.opost_pending.clear();
-        self.opost_pending.extend_from_slice(bytes);
-        self.opost_pending_offset = 0;
     }
 
     fn advance_opost_pending(&mut self, count: usize) {
@@ -396,8 +441,6 @@ impl NTtyData {
         }
 
         self.echo_commit = self.echo_head;
-        drop(termios);
-        let _ = self.echoes(tty);
     }
 
     pub fn receive_buf_standard(
@@ -935,7 +978,7 @@ impl NTtyData {
     }
 
     /// ## 提交echobuf里的数据显示
-    pub fn commit_echoes(&mut self, tty: Arc<TtyCore>) {
+    pub fn commit_echoes(&mut self, _tty: Arc<TtyCore>) {
         let head = self.echo_head;
         self.echo_mark = head;
         let old = self.echo_commit - self.echo_tail;
@@ -948,11 +991,6 @@ impl NTtyData {
         }
 
         self.echo_commit = head;
-        let echoed = self.echoes(tty.clone());
-
-        if echoed.is_ok() && echoed.unwrap() > 0 {
-            tty.flush_chars(tty.core());
-        }
     }
 
     pub fn add_echo_byte(&mut self, c: u8) {
@@ -1236,163 +1274,111 @@ impl NTtyData {
     }
 
     /// ## 处理回显
-    pub fn process_echoes(&mut self, tty: Arc<TtyCore>) {
-        if self.echo_mark == self.echo_tail {
-            return;
-        }
-        self.echo_commit = self.echo_mark;
-        let echoed = self.echoes(tty.clone());
-
-        if echoed.is_ok() && echoed.unwrap() > 0 {
-            tty.flush_chars(tty.core());
+    pub fn process_echoes(&mut self, _tty: Arc<TtyCore>) {
+        if self.echo_mark != self.echo_tail {
+            self.echo_commit = self.echo_mark;
         }
     }
 
-    #[inline(never)]
-    pub fn echoes(&mut self, tty: Arc<TtyCore>) -> Result<usize, SystemError> {
-        let mut space = tty.write_room(tty.core());
-        let ospace = space;
-        let termios = tty.core().termios();
-        let core = tty.core();
+    fn next_echo_step(&self, termios: &Termios, space: usize) -> Option<EchoStep> {
         let mut tail = self.echo_tail;
-
-        while ntty_buf_mask(self.echo_commit) != ntty_buf_mask(tail) {
-            let c = self.echo_buf[ntty_buf_mask(tail)];
-
-            if EchoOperation::from_u8(c) == EchoOperation::Start {
-                if ntty_buf_mask(self.echo_commit) == ntty_buf_mask(tail + 1) {
-                    self.echo_tail = tail;
-                    return Ok(ospace - space);
-                }
-
-                // 获取到start，之后取第一个作为op
-                let op = EchoOperation::from_u8(self.echo_buf[ntty_buf_mask(tail + 1)]);
-
-                match op {
-                    EchoOperation::Start => {
-                        if space == 0 {
-                            break;
-                        }
-
-                        if tty
-                            .put_char(tty.core(), EchoOperation::Start.to_u8())
-                            .is_err()
-                        {
-                            tty.write(core, &[EchoOperation::Start.to_u8()], 1)?;
-                        }
-
-                        self.cursor_column += 1;
-                        space -= 1;
-                        tail += 2;
-                    }
-                    EchoOperation::MoveBackCol => {
-                        if self.cursor_column > 0 {
-                            self.cursor_column -= 1;
-                        }
-                        tail += 2;
-                    }
-                    EchoOperation::SetCanonCol => {
-                        self.canon_cursor_column = self.cursor_column;
-                        tail += 2;
-                    }
-                    EchoOperation::EraseTab => {
-                        if ntty_buf_mask(self.echo_commit) == ntty_buf_mask(tail + 2) {
-                            self.echo_tail = tail;
-                            return Ok(ospace - space);
-                        }
-
-                        // 要擦除的制表符所占用的列数
-                        let mut char_num = self.echo_buf[ntty_buf_mask(tail + 2)] as usize;
-
-                        /*
-                           如果 num_chars 的最高位（0x80）未设置，
-                           表示这是从输入的起始位置而不是从先前的制表符开始计算的列数。
-                           在这种情况下，将 num_chars 与 ldata->canon_column 相加，否则，列数就是正常的制表符列数。
-                        */
-                        if char_num & 0x80 == 0 {
-                            char_num += self.canon_cursor_column as usize;
-                        }
-
-                        // 计算要回退的列数，即制表符宽度减去实际占用的列数
-                        let mut num_bs = 8 - (char_num & 7);
-                        if num_bs > space {
-                            // 表示左边没有足够空间回退
-                            break;
-                        }
-
-                        space -= num_bs;
-                        while num_bs != 0 {
-                            num_bs -= 1;
-                            // 8 => '\b'
-                            if tty.put_char(tty.core(), 8).is_err() {
-                                tty.write(core, &[8], 1)?;
-                            }
-
-                            if self.cursor_column > 0 {
-                                self.cursor_column -= 1;
-                            }
-                        }
-
-                        // 已经读取了 tail tail+1 tail+2,所以这里偏移加3
-                        tail += 3;
-                    }
-                    EchoOperation::Undefined(ch) => {
-                        match ch {
-                            8 => {
-                                if tty.put_char(tty.core(), 8).is_err() {
-                                    tty.write(core, &[8], 1)?;
-                                }
-                                if tty.put_char(tty.core(), b' ').is_err() {
-                                    tty.write(core, b" ", 1)?;
-                                }
-                                self.cursor_column -= 1;
-                                space -= 1;
-                                tail += 1;
-                            }
-                            _ => {
-                                // 不是特殊字节码，则表示控制字符 例如 ^C
-                                if space < 2 {
-                                    break;
-                                }
-
-                                if tty.put_char(tty.core(), b'^').is_err() {
-                                    tty.write(core, b"^", 1)?;
-                                }
-
-                                if tty.put_char(tty.core(), ch ^ 0o100).is_err() {
-                                    tty.write(core, &[ch ^ 0o100], 1)?;
-                                }
-
-                                self.cursor_column += 2;
-                                space -= 2;
-                                tail += 2;
-                            }
-                        }
-                    }
-                }
-            } else {
-                if termios.output_mode.contains(OutputMode::OPOST) {
-                    let ret = self.do_output_char(tty.clone(), c, space);
-
-                    if ret.is_err() {
-                        break;
-                    }
-                    space -= ret.unwrap();
-                } else {
-                    if space == 0 {
-                        break;
-                    }
-
-                    if tty.put_char(tty.core(), c).is_err() {
-                        tty.write(core, &[c], 1)?;
-                    }
-                    space -= 1;
-                }
-                tail += 1;
-            }
+        if ntty_buf_mask(self.echo_commit) == ntty_buf_mask(tail) {
+            return None;
         }
 
-        // 如果回显缓冲区接近满（在下一次提交之前可能会发生回显溢出的情况），则丢弃足够的尾部数据以防止随后的溢出。
+        let mut cursor_column = self.cursor_column;
+        let mut canon_cursor_column = self.canon_cursor_column;
+        let mut bytes = Vec::with_capacity(8);
+        let c = self.echo_buf[ntty_buf_mask(tail)];
+
+        if EchoOperation::from_u8(c) == EchoOperation::Start {
+            if ntty_buf_mask(self.echo_commit) == ntty_buf_mask(tail + 1) {
+                return None;
+            }
+
+            match EchoOperation::from_u8(self.echo_buf[ntty_buf_mask(tail + 1)]) {
+                EchoOperation::Start => {
+                    if space < 1 {
+                        return None;
+                    }
+                    bytes.push(EchoOperation::Start.to_u8());
+                    cursor_column += 1;
+                    tail += 2;
+                }
+                EchoOperation::MoveBackCol => {
+                    cursor_column = cursor_column.saturating_sub(1);
+                    tail += 2;
+                }
+                EchoOperation::SetCanonCol => {
+                    canon_cursor_column = cursor_column;
+                    tail += 2;
+                }
+                EchoOperation::EraseTab => {
+                    if ntty_buf_mask(self.echo_commit) == ntty_buf_mask(tail + 2) {
+                        return None;
+                    }
+                    let mut char_num = self.echo_buf[ntty_buf_mask(tail + 2)] as usize;
+                    if char_num & 0x80 == 0 {
+                        char_num += canon_cursor_column as usize;
+                    }
+                    let num_bs = 8 - (char_num & 7);
+                    if num_bs > space {
+                        return None;
+                    }
+                    bytes.resize(num_bs, 8);
+                    cursor_column = cursor_column.saturating_sub(num_bs as u32);
+                    tail += 3;
+                }
+                EchoOperation::Undefined(ch) => match ch {
+                    8 => {
+                        if space < 2 {
+                            return None;
+                        }
+                        bytes.extend_from_slice(&[8, b' ']);
+                        cursor_column = cursor_column.saturating_sub(1);
+                        tail += 1;
+                    }
+                    _ => {
+                        if space < 2 {
+                            return None;
+                        }
+                        bytes.extend_from_slice(&[b'^', ch ^ 0o100]);
+                        cursor_column += 2;
+                        tail += 2;
+                    }
+                },
+            }
+        } else if termios.output_mode.contains(OutputMode::OPOST) {
+            if Self::format_output_char(
+                termios,
+                c,
+                &mut bytes,
+                space,
+                &mut cursor_column,
+                &mut canon_cursor_column,
+            )
+            .is_err()
+            {
+                return None;
+            }
+            tail += 1;
+        } else {
+            if space < 1 {
+                return None;
+            }
+            bytes.push(c);
+            tail += 1;
+        }
+
+        Some(EchoStep {
+            bytes,
+            tail: self.echo_discard_tail(tail),
+            cursor_column,
+            canon_cursor_column,
+        })
+    }
+
+    fn echo_discard_tail(&self, mut tail: usize) -> usize {
         while self.echo_commit > tail && self.echo_commit - tail >= ECHO_DISCARD_WATERMARK {
             if self.echo_buf[ntty_buf_mask(tail)] == EchoOperation::Start.to_u8() {
                 if self.echo_buf[ntty_buf_mask(tail + 1)] == EchoOperation::EraseTab.to_u8() {
@@ -1404,111 +1390,94 @@ impl NTtyData {
                 tail += 1;
             }
         }
-
-        self.echo_tail = tail;
-        return Ok(ospace - space);
+        tail
     }
 
-    // ## 设置带有 OPOST 处理的tty输出一个字符
-    pub fn do_output_char(
-        &mut self,
-        tty: Arc<TtyCore>,
-        c: u8,
+    fn apply_echo_step(&mut self, step: EchoStep) {
+        self.echo_tail = step.tail;
+        self.cursor_column = step.cursor_column;
+        self.canon_cursor_column = step.canon_cursor_column;
+    }
+
+    fn format_output_char(
+        termios: &Termios,
+        mut c: u8,
+        out: &mut Vec<u8>,
         space: usize,
+        cursor_column: &mut u32,
+        canon_cursor_column: &mut u32,
     ) -> Result<usize, SystemError> {
-        if space == 0 {
+        let used = out.len();
+        if used >= space {
             return Err(SystemError::ENOBUFS);
         }
 
-        let termios = tty.core().termios();
-        let core = tty.core();
-        let mut c = c;
         if c as usize == 8 {
-            // 表示退格
-            if self.cursor_column > 0 {
-                self.cursor_column -= 1;
-            }
-            if tty.put_char(tty.core(), c).is_err() {
-                tty.write(core, &[c], 1)?;
-            }
+            *cursor_column = cursor_column.saturating_sub(1);
+            out.push(c);
             return Ok(1);
         }
+
         match c as char {
             '\n' => {
                 if termios.output_mode.contains(OutputMode::ONLRET) {
-                    // 回车符
-                    self.cursor_column = 0;
+                    *cursor_column = 0;
                 }
                 if termios.output_mode.contains(OutputMode::ONLCR) {
-                    // 映射为“\r\n”
-                    if space < 2 {
+                    if used + 2 > space {
                         return Err(SystemError::ENOBUFS);
                     }
-                    self.cursor_column = 0;
-                    self.canon_cursor_column = 0;
-
-                    // 通过驱动写入
-                    tty.write(core, "\r\n".as_bytes(), 2)?;
+                    *cursor_column = 0;
+                    *canon_cursor_column = 0;
+                    out.extend_from_slice(b"\r\n");
                     return Ok(2);
                 }
-
-                self.canon_cursor_column = self.cursor_column;
+                *canon_cursor_column = *cursor_column;
             }
             '\r' => {
-                if termios.output_mode.contains(OutputMode::ONOCR) && self.cursor_column == 0 {
-                    // 光标已经在第0列，则不输出回车符
+                if termios.output_mode.contains(OutputMode::ONOCR) && *cursor_column == 0 {
                     return Ok(0);
                 }
 
                 if termios.output_mode.contains(OutputMode::OCRNL) {
-                    // 输出的\r映射为\n
                     c = b'\n';
                     if termios.output_mode.contains(OutputMode::ONLRET) {
-                        // \r映射为\n,但是保留\r特性
-                        self.cursor_column = 0;
-                        self.canon_cursor_column = 0;
+                        *cursor_column = 0;
+                        *canon_cursor_column = 0;
                     }
                 } else {
-                    self.cursor_column = 0;
-                    self.canon_cursor_column = 0;
+                    *cursor_column = 0;
+                    *canon_cursor_column = 0;
                 }
             }
             '\t' => {
-                // 计算输出一个\t需要的空间
-                let spaces = 8 - (self.cursor_column & 7) as usize;
-                if output_mode_has_xtabs(&termios) {
-                    // 配置的tab选项是真正输出空格到驱动
-                    if space < spaces {
-                        // 空间不够
+                let spaces = 8 - (*cursor_column & 7) as usize;
+                if output_mode_has_xtabs(termios) {
+                    if used + spaces > space {
                         return Err(SystemError::ENOBUFS);
                     }
-                    self.cursor_column += spaces as u32;
-                    // 写入sapces个空格
-                    tty.write(core, "        ".as_bytes(), spaces)?;
+                    *cursor_column += spaces as u32;
+                    out.extend_from_slice(&b"        "[..spaces]);
                     return Ok(spaces);
                 }
-                self.cursor_column += spaces as u32;
+                *cursor_column += spaces as u32;
             }
             _ => {
-                // 判断是否为控制字符
                 if !is_ascii_control(c) {
                     if termios.output_mode.contains(OutputMode::OLCUC) {
                         c = c.to_ascii_uppercase();
                     }
 
-                    // 判断是否为utf8模式下的连续字符
                     if !(termios.input_mode.contains(InputMode::IUTF8)
                         && (c as usize) & 0xc0 == 0x80)
                     {
-                        self.cursor_column += 1;
+                        *cursor_column += 1;
                     }
                 }
             }
         }
 
-        if tty.put_char(tty.core(), c).is_err() {
-            tty.write(core, &[c], 1)?;
-        }
+        out.push(c);
         Ok(1)
     }
 
@@ -1593,6 +1562,38 @@ impl NTtyData {
 
         out.push(c);
         Ok(1)
+    }
+
+    fn simple_output_block_len(&self, termios: &Termios, buf: &[u8], limit: usize) -> usize {
+        let mut len = 0;
+        let limit = limit.min(buf.len());
+        while len < limit {
+            let c = buf[len];
+            match c as char {
+                '\n' | '\r' | '\t' => break,
+                _ => {
+                    if !is_ascii_control(c) && termios.output_mode.contains(OutputMode::OLCUC) {
+                        break;
+                    }
+                }
+            }
+            len += 1;
+        }
+        len
+    }
+
+    fn apply_simple_output_columns(&mut self, termios: &Termios, buf: &[u8]) {
+        for &c in buf {
+            if c as usize == 8 {
+                if self.cursor_column > 0 {
+                    self.cursor_column -= 1;
+                }
+            } else if !(is_ascii_control(c)
+                || termios.input_mode.contains(InputMode::IUTF8) && (c as usize) & 0xc0 == 0x80)
+            {
+                self.cursor_column += 1;
+            }
+        }
     }
 
     fn packet_mode_flush(&self, tty: &TtyCoreData) {
@@ -1846,17 +1847,19 @@ impl TtyLineDiscipline for NTtyLinediscipline {
     ) -> Result<usize, system_error::SystemError> {
         let mut nr = len;
         let mut out_buf = Vec::with_capacity(NTTY_BUFSIZE);
-        let mut ldata = Some(self.disc_data());
         let pcb = ProcessManager::current_pcb();
         let binding = tty.clone();
         let core = binding.core();
-        let termios = *core.termios();
+        let mut termios = *core.termios();
         if termios.local_mode.contains(LocalMode::TOSTOP) {
             TtyJobCtrlManager::tty_check_change(tty.clone(), Signal::SIGTTOU)?;
         }
 
-        ldata.as_mut().unwrap().process_echoes(tty.clone());
-        // drop(ldata);
+        let mut output_guard = Some(self.output_lock.lock());
+
+        self.disc_data().process_echoes(tty.clone());
+        self.drain_echoes(tty.clone())?;
+
         let mut offset = 0;
         loop {
             if pcb.has_pending_signal_fast() {
@@ -1878,78 +1881,97 @@ impl TtyLineDiscipline for NTtyLinediscipline {
             if termios.output_mode.contains(OutputMode::OPOST) {
                 let mut made_progress = false;
                 out_buf.clear();
-                {
-                    let pending = ldata.as_ref().unwrap().opost_pending_bytes();
-                    out_buf.extend_from_slice(pending);
-                }
+                let pending = self.disc_data().opost_pending_bytes().to_vec();
+                out_buf.extend_from_slice(&pending);
 
                 if !out_buf.is_empty() {
-                    drop(ldata.take());
                     let written = tty.write(core, &out_buf, out_buf.len())?;
-                    let mut guard = self.disc_data();
                     if written != 0 {
+                        let mut guard = self.disc_data();
                         guard.advance_opost_pending(written);
                         made_progress = true;
                     }
-                    ldata = Some(guard);
                     if written != 0 {
                         tty.flush_chars(core);
                     }
                 } else {
                     out_buf.clear();
                     let space = tty.write_room(core).min(out_buf.capacity());
-                    let mut consumed = 0;
-                    let (cursor_column, canon_cursor_column) = {
-                        let ldata = ldata.as_ref().unwrap();
-                        (ldata.cursor_column, ldata.canon_cursor_column)
+                    let simple_len = if space == 0 {
+                        0
+                    } else {
+                        let guard = self.disc_data();
+                        guard.simple_output_block_len(&termios, &buf[offset..], space.min(nr))
                     };
 
-                    {
-                        let ldata = ldata.as_mut().unwrap();
-                        while consumed < nr {
-                            let c = buf[offset + consumed];
-                            match ldata.process_output_char_to_buf(&termios, c, &mut out_buf, space)
-                            {
-                                Ok(_) => {
-                                    consumed += 1;
-                                }
-                                Err(SystemError::ENOBUFS) => {
-                                    break;
-                                }
-                                Err(err) => {
-                                    return Err(err);
-                                }
-                            }
-                        }
-                    }
-
-                    drop(ldata.take());
-
-                    if !out_buf.is_empty() {
-                        let written = tty.write(core, &out_buf, out_buf.len())?;
-                        let mut guard = self.disc_data();
-                        if written == 0 {
-                            guard.cursor_column = cursor_column;
-                            guard.canon_cursor_column = canon_cursor_column;
-                        } else {
-                            if written < out_buf.len() {
-                                guard.save_opost_pending(&out_buf[written..]);
-                            }
-                            offset += consumed;
-                            nr -= consumed;
-                            made_progress = true;
-                        }
-                        ldata = Some(guard);
+                    if simple_len != 0 {
+                        let written =
+                            tty.write(core, &buf[offset..offset + simple_len], simple_len)?;
                         if written != 0 {
-                            tty.flush_chars(core);
-                        }
-                    } else {
-                        ldata = Some(self.disc_data());
-                        if consumed != 0 {
-                            offset += consumed;
-                            nr -= consumed;
+                            self.disc_data().apply_simple_output_columns(
+                                &termios,
+                                &buf[offset..offset + written],
+                            );
+                            offset += written;
+                            nr -= written;
                             made_progress = true;
                             tty.flush_chars(core);
+                        }
+                    } else if space != 0 && nr != 0 {
+                        let mut guard = self.disc_data();
+                        let cursor_column = guard.cursor_column;
+                        let canon_cursor_column = guard.canon_cursor_column;
+                        match guard.process_output_char_to_buf(
+                            &termios,
+                            buf[offset],
+                            &mut out_buf,
+                            space,
+                        ) {
+                            Ok(_) => {}
+                            Err(SystemError::ENOBUFS) => {
+                                guard.cursor_column = cursor_column;
+                                guard.canon_cursor_column = canon_cursor_column;
+                            }
+                            Err(err) => {
+                                guard.cursor_column = cursor_column;
+                                guard.canon_cursor_column = canon_cursor_column;
+                                return Err(err);
+                            }
+                        }
+                        drop(guard);
+
+                        if out_buf.is_empty() {
+                            offset += 1;
+                            nr -= 1;
+                            made_progress = true;
+                        } else {
+                            let mut sent = 0;
+                            while sent < out_buf.len() {
+                                let written =
+                                    tty.write(core, &out_buf[sent..], out_buf.len() - sent)?;
+                                if written == 0 {
+                                    if sent == 0 {
+                                        let mut guard = self.disc_data();
+                                        guard.cursor_column = cursor_column;
+                                        guard.canon_cursor_column = canon_cursor_column;
+                                        break;
+                                    } else {
+                                        let _ = core.write_wq().wait_event_interruptible(
+                                            EPollEventType::EPOLLOUT.bits() as u64,
+                                            || tty.write_room(core) > 0,
+                                        );
+                                        continue;
+                                    }
+                                }
+                                sent += written;
+                                tty.flush_chars(core);
+                            }
+
+                            if sent == out_buf.len() {
+                                offset += 1;
+                                nr -= 1;
+                                made_progress = true;
+                            }
                         }
                     }
                 }
@@ -1958,7 +1980,6 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                     continue;
                 }
             } else {
-                drop(ldata.take());
                 while nr > 0 {
                     let write = tty.write(core, &buf[offset..], nr)?;
                     if write == 0 {
@@ -1970,7 +1991,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
             }
 
             let opost_pending = termios.output_mode.contains(OutputMode::OPOST)
-                && !ldata.as_ref().unwrap().opost_pending_bytes().is_empty();
+                && !self.disc_data().opost_pending_bytes().is_empty();
             if nr == 0 && !opost_pending {
                 break;
             }
@@ -1987,7 +2008,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
             // 到这里表明没位置可写了
             // 休眠一段时间
             // 获取到termios读锁，避免termios被更改导致行为异常
-            drop(ldata.take());
+            drop(output_guard.take());
             let wait_result = core.write_wq().wait_event_interruptible(
                 EPollEventType::EPOLLOUT.bits() as u64,
                 || {
@@ -2011,16 +2032,17 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                 },
             );
             if let Err(err) = wait_result {
+                output_guard = Some(self.output_lock.lock());
                 if offset != 0 {
                     break;
                 }
                 return Err(err);
             }
-            if termios.output_mode.contains(OutputMode::OPOST) {
-                ldata = Some(self.disc_data());
-            }
+            output_guard = Some(self.output_lock.lock());
+            termios = *core.termios();
         }
 
+        drop(output_guard);
         Ok(offset)
     }
 
@@ -2278,7 +2300,8 @@ impl TtyLineDiscipline for NTtyLinediscipline {
             event.insert(EPollEventType::EPOLLHUP);
         }
 
-        if core.driver().driver_funcs().chars_in_buffer(core) < 256
+        if !core.write_lock().is_locked()
+            && core.driver().driver_funcs().chars_in_buffer(core) < 256
             && core.driver().driver_funcs().write_room(core) > 0
         {
             event.insert(EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM);
@@ -2307,7 +2330,12 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         count: usize,
     ) -> Result<usize, SystemError> {
         let mut ldata = self.disc_data();
-        ldata.receive_buf_common(tty, buf, flags, count, false)
+        let ret = ldata.receive_buf_common(tty.clone(), buf, flags, count, false);
+        drop(ldata);
+        if let Some(_output_guard) = self.output_lock.try_lock() {
+            self.drain_echoes(tty)?;
+        }
+        ret
     }
 
     fn receive_buf2(
@@ -2318,6 +2346,11 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         count: usize,
     ) -> Result<usize, SystemError> {
         let mut ldata = self.disc_data();
-        ldata.receive_buf_common(tty, buf, flags, count, true)
+        let ret = ldata.receive_buf_common(tty.clone(), buf, flags, count, true);
+        drop(ldata);
+        if let Some(_output_guard) = self.output_lock.try_lock() {
+            self.drain_echoes(tty)?;
+        }
+        ret
     }
 }

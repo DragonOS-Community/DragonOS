@@ -3,7 +3,7 @@ use system_error::SystemError;
 
 use crate::arch::ipc::signal::SigSet;
 use crate::arch::syscall::nr::SYS_RT_SIGSUSPEND;
-use crate::ipc::signal::{set_sigprocmask, SigHow};
+use crate::ipc::signal::set_user_sigmask;
 use crate::process::ProcessManager;
 use crate::sched::{schedule, SchedMode};
 use crate::{
@@ -18,7 +18,7 @@ use crate::{
 pub struct SysRtSigSuspend;
 impl Syscall for SysRtSigSuspend {
     fn num_args(&self) -> usize {
-        1
+        2
     }
 
     fn handle(
@@ -44,14 +44,12 @@ impl Syscall for SysRtSigSuspend {
         mask -= SigSet::SIGSTOP;
 
         let pcb = ProcessManager::current_pcb();
-        let old_mask = *pcb.sig_info_irqsave().sig_blocked();
 
-        set_sigprocmask(SigHow::SetMask, mask).unwrap();
-        log::trace!("Process enter rt_sigsuspend, new mask: {mask:?}, old mask: {old_mask:?}");
+        set_user_sigmask(&mut mask);
+        log::trace!("Process enter rt_sigsuspend, new mask: {mask:?}");
         loop {
             if pcb.has_pending_signal_fast() && pcb.has_pending_not_masked_signal() {
-                set_sigprocmask(SigHow::SetMask, old_mask).unwrap();
-                return Err(SystemError::EINTR);
+                return Err(SystemError::ERESTARTNOHAND);
             }
             schedule(SchedMode::SM_NONE);
         }

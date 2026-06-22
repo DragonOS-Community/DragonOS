@@ -32,7 +32,7 @@ use crate::{
         CurrentIrqArch, SigStackArch,
     },
     cgroup::{cgroup_root_node, CgroupNode, TaskCgroupRef},
-    driver::tty::tty_core::TtyCore,
+    driver::tty::{tty_core::TtyCore, tty_job_control::TtyJobCtrlManager},
     exception::InterruptArch,
     filesystem::{
         fs::FsStruct,
@@ -1019,16 +1019,34 @@ impl ProcessManager {
 
             pcb.exit_files();
             pcb.exit_timers();
-            // TODO 由于未实现进程组，tty记录的前台进程组等于当前进程，故退出前要置空
-            // 后续相关逻辑需要在SYS_EXIT_GROUP系统调用中实现
-            if let Some(tty) = pcb.sig_info_irqsave().tty() {
-                // 临时解决方案！！！ 临时解决方案！！！ 引入进程组之后，要重写这个更新前台进程组的逻辑
-                let mut g = tty.core().contorl_info_irqsave();
-                if g.pgid == Some(pid) {
-                    g.pgid = None;
+
+            let (current_tty, is_session_leader, sid) = {
+                let siginfo = pcb.sig_info_irqsave();
+                (siginfo.tty(), siginfo.is_session_leader, pcb.task_session())
+            };
+            if let Some(tty) = current_tty {
+                if is_session_leader {
+                    let tty_pgrp = tty.core().contorl_info_irqsave().pgid.clone();
+                    if let Some(pgrp) = tty_pgrp {
+                        let _ = crate::ipc::kill::send_signal_to_pgid(&pgrp, Signal::SIGHUP);
+                    }
+                    TtyJobCtrlManager::remove_session_tty(&tty);
+                    if let Some(sid) = sid {
+                        TtyJobCtrlManager::session_clear_tty(sid);
+                    } else {
+                        pcb.sig_info_mut().set_tty(None);
+                    }
+                } else {
+                    let mut g = tty.core().contorl_info_irqsave();
+                    if g.pgid == Some(pid) {
+                        g.pgid = None;
+                    }
+                    drop(g);
+                    pcb.sig_info_mut().set_tty(None);
                 }
+            } else {
+                pcb.sig_info_mut().set_tty(None);
             }
-            pcb.sig_info_mut().set_tty(None);
 
             // Linux 语义：zombie 不应出现在 cgroup.procs 中。
             // 必须持有 cgroup_accounting_lock 以避免与 cgroup.procs 写入死锁

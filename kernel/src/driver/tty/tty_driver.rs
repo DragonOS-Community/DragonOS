@@ -520,7 +520,7 @@ pub trait TtyOperation: Sync + Send + Debug {
 
     fn ioctl(&self, tty: Arc<TtyCore>, cmd: u32, arg: usize) -> Result<(), SystemError>;
 
-    fn chars_in_buffer(&self) -> usize {
+    fn chars_in_buffer(&self, _tty: &TtyCoreData) -> usize {
         0
     }
 

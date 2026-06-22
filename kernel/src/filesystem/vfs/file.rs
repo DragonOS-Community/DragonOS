@@ -596,6 +596,9 @@ impl File {
     }
 
     pub fn flush_for_close(&self, lock_owner: u64) -> Result<(), SystemError> {
+        if self.mode().contains(FileMode::FMODE_PATH) {
+            return Ok(());
+        }
         let inode = self.inode();
         inode.flush_file(self.private_data.lock(), lock_owner)
     }
@@ -738,30 +741,32 @@ impl File {
     ) -> Result<Self, SystemError> {
         let mut inode = inode;
         let mut file_type = inode.metadata()?.file_type;
-        // 检查是否为命名管道（FIFO）
-        let is_named_pipe = if file_type == FileType::Pipe {
-            if let Some(SpecialNodeData::Pipe(pipe_inode)) = inode.special_node() {
-                inode = pipe_inode;
-                file_type = inode.metadata()?.file_type;
-                true
+        let is_path = flags.contains(FileFlags::O_PATH);
+
+        if !is_path {
+            // 检查是否为命名管道（FIFO）
+            let is_named_pipe = if file_type == FileType::Pipe {
+                if let Some(SpecialNodeData::Pipe(pipe_inode)) = inode.special_node() {
+                    inode = pipe_inode;
+                    file_type = inode.metadata()?.file_type;
+                    true
+                } else {
+                    false
+                }
             } else {
                 false
+            };
+
+            // 对于命名管道，自动添加 O_LARGEFILE 标志（符合 Linux 行为）
+            if is_named_pipe {
+                flags.insert(FileFlags::O_LARGEFILE);
             }
-        } else {
-            false
-        };
 
-        // 对于命名管道，自动添加 O_LARGEFILE 标志（符合 Linux 行为）
-        if is_named_pipe {
-            flags.insert(FileFlags::O_LARGEFILE);
-        }
-
-        if !flags.contains(FileFlags::O_PATH) {
             inode = resolve_device_special_inode(inode, file_type)?;
         }
 
         let metadata = inode.metadata()?;
-        if metadata.flags.contains(InodeFlags::S_APPEND) {
+        if !is_path && metadata.flags.contains(InodeFlags::S_APPEND) {
             flags.insert(FileFlags::O_APPEND);
         }
 
@@ -780,39 +785,38 @@ impl File {
         let mut mode = FileMode::open_fmode(flags);
 
         let private_data = Mutex::new(private_data_init);
-        inode.open(private_data.lock(), &flags)?;
-
-        // 设置默认能力（由 inode 能力接口统一决定；避免 syscall 层/字符串特判）
-        if inode.is_stream() {
-            mode.insert(FileMode::FMODE_STREAM);
-        }
-        if inode.supports_seek() {
-            mode.insert(FileMode::FMODE_LSEEK | FileMode::FMODE_ATOMIC_POS);
-        }
-        if inode.supports_pread() {
-            mode.insert(FileMode::FMODE_PREAD);
-        }
-        if inode.supports_pwrite() {
-            mode.insert(FileMode::FMODE_PWRITE);
-        }
-
-        inode.adjust_file_mode_after_open(&private_data.lock(), &mut mode);
-
-        // TODO: 检查inode是否有read/write方法,设置FMODE_CAN_READ/WRITE
-        // 这需要在IndexNode trait中添加相应的检查方法
-        if mode.contains(FileMode::FMODE_READ) {
-            mode.insert(FileMode::FMODE_CAN_READ);
-        }
-        if mode.contains(FileMode::FMODE_WRITE) {
-            mode.insert(FileMode::FMODE_CAN_WRITE);
-        }
-
-        // 标记为已打开
-        mode.insert(FileMode::FMODE_OPENED);
-
-        // O_PATH特殊处理
-        if flags.contains(FileFlags::O_PATH) {
+        if is_path {
             mode = FileMode::FMODE_PATH | FileMode::FMODE_OPENED;
+        } else {
+            inode.open(private_data.lock(), &flags)?;
+
+            // 设置默认能力（由 inode 能力接口统一决定；避免 syscall 层/字符串特判）
+            if inode.is_stream() {
+                mode.insert(FileMode::FMODE_STREAM);
+            }
+            if inode.supports_seek() {
+                mode.insert(FileMode::FMODE_LSEEK | FileMode::FMODE_ATOMIC_POS);
+            }
+            if inode.supports_pread() {
+                mode.insert(FileMode::FMODE_PREAD);
+            }
+            if inode.supports_pwrite() {
+                mode.insert(FileMode::FMODE_PWRITE);
+            }
+
+            inode.adjust_file_mode_after_open(&private_data.lock(), &mut mode);
+
+            // TODO: 检查inode是否有read/write方法,设置FMODE_CAN_READ/WRITE
+            // 这需要在IndexNode trait中添加相应的检查方法
+            if mode.contains(FileMode::FMODE_READ) {
+                mode.insert(FileMode::FMODE_CAN_READ);
+            }
+            if mode.contains(FileMode::FMODE_WRITE) {
+                mode.insert(FileMode::FMODE_CAN_WRITE);
+            }
+
+            // 标记为已打开
+            mode.insert(FileMode::FMODE_OPENED);
         }
 
         if mode.contains(FileMode::FMODE_WRITE) {
@@ -1649,15 +1653,17 @@ impl Drop for File {
                 mnt_inode.mount_fs().dec_write_count();
             }
         }
-        let r: Result<(), SystemError> = self.inode.close(self.private_data.lock());
-        // 打印错误信息
-        if let Err(e) = r {
-            error!(
-                "pid: {:?} failed to close file: {:?}, errno={:?}",
-                ProcessManager::current_pcb().raw_pid(),
-                self,
-                e
-            );
+        if !self.mode.read().contains(FileMode::FMODE_PATH) {
+            let r: Result<(), SystemError> = self.inode.close(self.private_data.lock());
+            // 打印错误信息
+            if let Err(e) = r {
+                error!(
+                    "pid: {:?} failed to close file: {:?}, errno={:?}",
+                    ProcessManager::current_pcb().raw_pid(),
+                    self,
+                    e
+                );
+            }
         }
     }
 }
@@ -1683,6 +1689,11 @@ impl DroppedFd {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ReservedFd {
+    fd: i32,
+}
+
 /// @brief pcb里面的文件描述符数组
 #[derive(Debug)]
 pub struct FileDescriptorVec {
@@ -1690,6 +1701,8 @@ pub struct FileDescriptorVec {
     fds: Vec<Option<Arc<File>>>,
     /// per-fd 的 close_on_exec 标志（与 fds 并行，对应 Linux fdtable.close_on_exec 位图）
     cloexec: Vec<bool>,
+    /// 已预留但尚未安装 File 的 fd 槽位。
+    reserved: Vec<bool>,
     /// POSIX record lock owner id，对齐 Linux current->files 语义。
     lock_owner_id: usize,
     /// 下一个可能空闲的文件描述符号（用于优化分配，避免O(n²)扫描）
@@ -1715,10 +1728,14 @@ impl FileDescriptorVec {
         let mut cloexec = Vec::with_capacity(FileDescriptorVec::INITIAL_CAPACITY);
         cloexec.resize(FileDescriptorVec::INITIAL_CAPACITY, false);
 
+        let mut reserved = Vec::with_capacity(FileDescriptorVec::INITIAL_CAPACITY);
+        reserved.resize(FileDescriptorVec::INITIAL_CAPACITY, false);
+
         // 初始化文件描述符数组结构体
         return FileDescriptorVec {
             fds: data,
             cloexec,
+            reserved,
             lock_owner_id: alloc_lock_owner_id(),
             next_fd: 0,
         };
@@ -1743,18 +1760,25 @@ impl FileDescriptorVec {
                 res.cloexec[i] = self.cloexec[i];
             }
         }
-        // 复制 next_fd 以保持相同的分配状态
-        res.next_fd = self.next_fd;
+        // reserved fd 不属于已经安装的 open file description，clone 时不复制。
+        // 因此 next_fd 必须按 clone 后的真实空闲槽重新计算。
+        res.next_fd = res.first_available_fd_from(0).unwrap_or(res.fds.len());
         // 新 fd table 必须拥有新的 record-lock owner（对齐 Linux 新 files_struct）。
         res.lock_owner_id = alloc_lock_owner_id();
         return res;
+    }
+
+    fn first_available_fd_from(&self, start: usize) -> Option<usize> {
+        (start..self.fds.len()).find(|&i| self.fds[i].is_none() && !self.reserved[i])
     }
 
     /// 返回当前已占用的最高文件描述符索引（若无则为None）
     #[inline]
     fn highest_open_index(&self) -> Option<usize> {
         // 从高到低查找第一个占用的槽位
-        (0..self.fds.len()).rev().find(|&i| self.fds[i].is_some())
+        (0..self.fds.len())
+            .rev()
+            .find(|&i| self.fds[i].is_some() || self.reserved[i])
     }
 
     /// 扩容文件描述符表到指定容量
@@ -1784,8 +1808,16 @@ impl FileDescriptorVec {
             {
                 return Err(SystemError::ENOMEM);
             }
+            if self
+                .reserved
+                .try_reserve(new_capacity - current_len)
+                .is_err()
+            {
+                return Err(SystemError::ENOMEM);
+            }
             self.fds.resize(new_capacity, None);
             self.cloexec.resize(new_capacity, false);
+            self.reserved.resize(new_capacity, false);
         } else if new_capacity < current_len {
             // 缩容：允许，但不能丢弃仍在使用的高位fd。
             // 若高位fd仍在使用，将缩容目标提升到 (最高已用fd + 1)。
@@ -1794,6 +1826,7 @@ impl FileDescriptorVec {
             if target < current_len {
                 self.fds.truncate(target);
                 self.cloexec.truncate(target);
+                self.reserved.truncate(target);
                 // 确保 next_fd 不超过新的容量
                 if self.next_fd > target {
                     self.next_fd = target;
@@ -1822,6 +1855,14 @@ impl FileDescriptorVec {
     #[inline]
     pub fn validate_fd(&self, fd: i32) -> bool {
         return !(fd < 0 || fd as usize >= self.fds.len());
+    }
+
+    pub fn fd_slot_available(&self, fd: i32) -> bool {
+        if fd < 0 {
+            return false;
+        }
+        let idx = fd as usize;
+        idx >= self.fds.len() || (self.fds[idx].is_none() && !self.reserved[idx])
     }
 
     /// 申请文件描述符，并把文件对象存入其中。
@@ -1877,7 +1918,7 @@ impl FileDescriptorVec {
             }
 
             let x = &mut self.fds[new_fd as usize];
-            if x.is_none() {
+            if x.is_none() && !self.reserved[new_fd as usize] {
                 *x = Some(file);
                 self.cloexec[new_fd as usize] = cloexec;
                 // 更新 next_fd：如果分配的是 next_fd 位置，则推进到下一个
@@ -1895,7 +1936,7 @@ impl FileDescriptorVec {
 
             // 从 next_fd 开始查找空位
             for i in self.next_fd..max_search {
-                if self.fds[i].is_none() {
+                if self.fds[i].is_none() && !self.reserved[i] {
                     self.fds[i] = Some(file);
                     self.cloexec[i] = cloexec;
                     // 更新 next_fd 为下一个位置
@@ -1928,6 +1969,91 @@ impl FileDescriptorVec {
         }
     }
 
+    /// 预留一个最低可用 fd 槽位，但暂不安装 File。
+    ///
+    /// 用于实现 Linux `get_unused_fd_flags -> open -> fd_install` 这类语义：
+    /// 如果 fd 预留失败，则后续 open 不应发生。
+    pub fn reserve_fd(&mut self, cloexec: bool) -> Result<ReservedFd, SystemError> {
+        let nofile_limit = crate::process::ProcessManager::current_pcb()
+            .get_rlimit(crate::process::resource::RLimitID::Nofile)
+            .rlim_cur as usize;
+
+        let max_search = core::cmp::min(self.fds.len(), nofile_limit);
+        for i in self.next_fd..max_search {
+            if self.fds[i].is_none() && !self.reserved[i] {
+                self.reserved[i] = true;
+                self.cloexec[i] = cloexec;
+                self.next_fd = i + 1;
+                return Ok(ReservedFd { fd: i as i32 });
+            }
+        }
+
+        let current_len = self.fds.len();
+        if current_len < nofile_limit {
+            let new_capacity = core::cmp::min(
+                core::cmp::max(current_len * 2, current_len + 1),
+                nofile_limit,
+            );
+            self.resize_to_capacity(new_capacity)?;
+
+            self.reserved[current_len] = true;
+            self.cloexec[current_len] = cloexec;
+            self.next_fd = current_len + 1;
+            return Ok(ReservedFd {
+                fd: current_len as i32,
+            });
+        }
+
+        Err(SystemError::EMFILE)
+    }
+
+    /// 在先前预留的 fd 槽位安装 File。
+    pub fn install_reserved_fd(
+        &mut self,
+        reservation: ReservedFd,
+        file: File,
+    ) -> Result<i32, SystemError> {
+        self.install_reserved_fd_arc(reservation, Arc::new(file))
+    }
+
+    /// 在先前预留的 fd 槽位安装共享 File。
+    pub fn install_reserved_fd_arc(
+        &mut self,
+        reservation: ReservedFd,
+        file: Arc<File>,
+    ) -> Result<i32, SystemError> {
+        let fd = reservation.fd;
+        if fd < 0 || fd as usize >= self.fds.len() {
+            return Err(SystemError::EBADF);
+        }
+
+        let idx = fd as usize;
+        if !self.reserved[idx] || self.fds[idx].is_some() {
+            return Err(SystemError::EBADF);
+        }
+
+        self.fds[idx] = Some(file);
+        self.reserved[idx] = false;
+        Ok(fd)
+    }
+
+    /// 释放一个尚未安装 File 的预留 fd。
+    pub fn release_reserved_fd(&mut self, reservation: ReservedFd) {
+        let fd = reservation.fd;
+        if fd < 0 || fd as usize >= self.fds.len() {
+            return;
+        }
+
+        let idx = fd as usize;
+        if self.reserved[idx] && self.fds[idx].is_none() {
+            self.reserved[idx] = false;
+            self.cloexec[idx] = false;
+            if idx < self.next_fd {
+                self.next_fd = idx;
+            }
+        }
+    }
+
     /// Atomically install `file` at an exact fd, returning the old fd object if one existed.
     ///
     /// The table is resized before the old slot is removed, so allocation failure cannot
@@ -1949,6 +2075,10 @@ impl FileDescriptorVec {
         let fd_index = fd as usize;
         if fd_index >= self.fds.len() {
             self.resize_to_capacity(fd_index + 1)?;
+        }
+
+        if self.reserved[fd_index] {
+            return Err(SystemError::EBUSY);
         }
 
         let old = self.fds[fd_index].replace(file);

@@ -138,6 +138,7 @@ pipe_test
 fifo_test
 unshare_test
 pty_root_test
+pty_test
 time_test
 timers_test
 clock_nanosleep_test

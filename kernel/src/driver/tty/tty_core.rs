@@ -1,5 +1,5 @@
 use core::{
-    fmt::Debug,
+    fmt::{self, Debug},
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
@@ -16,7 +16,7 @@ use crate::{
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
-        wait_queue::EventWaitQueue,
+        wait_queue::{EventWaitQueue, WaitQueue},
     },
     mm::VirtAddr,
     process::{pid::Pid, ProcessControlBlock},
@@ -42,6 +42,81 @@ pub struct TtyCore {
     line_discipline: Arc<dyn TtyLineDiscipline>,
 }
 
+pub struct TtySleepLock {
+    locked: AtomicBool,
+    wait_queue: WaitQueue,
+}
+
+impl Debug for TtySleepLock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TtySleepLock")
+            .field("locked", &self.locked.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+pub struct TtySleepLockGuard<'a> {
+    lock: &'a TtySleepLock,
+}
+
+impl !Send for TtySleepLockGuard<'_> {}
+
+impl TtySleepLock {
+    pub const fn new() -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+            wait_queue: WaitQueue::default(),
+        }
+    }
+
+    pub fn lock(&self) -> TtySleepLockGuard<'_> {
+        if let Some(guard) = self.try_lock() {
+            return guard;
+        }
+
+        self.wait_queue.wait_until(|| self.try_lock())
+    }
+
+    pub fn lock_interruptible(&self, nonblock: bool) -> Result<TtySleepLockGuard<'_>, SystemError> {
+        if let Some(guard) = self.try_lock() {
+            return Ok(guard);
+        }
+
+        if nonblock {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+
+        self.wait_queue.wait_until_interruptible(|| self.try_lock())
+    }
+
+    pub fn is_locked(&self) -> bool {
+        self.locked.load(Ordering::Acquire)
+    }
+
+    pub fn try_lock(&self) -> Option<TtySleepLockGuard<'_>> {
+        if self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            Some(TtySleepLockGuard { lock: self })
+        } else {
+            None
+        }
+    }
+
+    fn unlock(&self) {
+        self.locked.store(false, Ordering::Release);
+        self.wait_queue.wake_one();
+    }
+}
+
+impl Drop for TtySleepLockGuard<'_> {
+    fn drop(&mut self) {
+        self.lock.unlock();
+    }
+}
+
 impl TtyCore {
     #[inline(never)]
     pub fn new(driver: Arc<TtyDriver>, index: usize) -> Arc<Self> {
@@ -59,6 +134,7 @@ impl TtyCore {
             window_size: RwLock::new(WindowSize::default()),
             read_wq: EventWaitQueue::new(),
             write_wq: EventWaitQueue::new(),
+            write_lock: TtySleepLock::new(),
             port: RwLock::new(None),
             index,
             vc_index: AtomicUsize::new(usize::MAX),
@@ -74,6 +150,7 @@ impl TtyCore {
             core,
             line_discipline: Arc::new(NTtyLinediscipline {
                 data: SpinLock::new(NTtyData::new()),
+                output_lock: TtySleepLock::new(),
             }),
         });
     }
@@ -195,6 +272,15 @@ impl TtyCore {
                     TtySetTermiosOpt::TERMIOS_WAIT | TtySetTermiosOpt::TERMIOS_OLD,
                 );
             }
+            TtyIoctlCmd::TCSETSF => {
+                return TtyCore::core_set_termios(
+                    real_tty,
+                    VirtAddr::new(arg),
+                    TtySetTermiosOpt::TERMIOS_FLUSH
+                        | TtySetTermiosOpt::TERMIOS_WAIT
+                        | TtySetTermiosOpt::TERMIOS_OLD,
+                );
+            }
             _ => {
                 return Err(SystemError::ENOIOCTLCMD);
             }
@@ -210,16 +296,20 @@ impl TtyCore {
             }
             TtyFlushArg::TCIOFLUSH => {
                 tty.ldisc().flush_buffer(tty.clone())?;
+                tty.ldisc().flush_output(tty.clone())?;
                 let ret = tty.core().driver().driver_funcs().flush_buffer(tty.core());
                 if ret != Err(SystemError::ENOSYS) {
                     ret?;
                 }
+                tty.core().write_wq().wakeup_all();
             }
             TtyFlushArg::TCOFLUSH => {
+                tty.ldisc().flush_output(tty.clone())?;
                 let ret = tty.core().driver().driver_funcs().flush_buffer(tty.core());
                 if ret != Err(SystemError::ENOSYS) {
                     ret?;
                 }
+                tty.core().write_wq().wakeup_all();
             }
             _ => {
                 return Err(SystemError::EINVAL);
@@ -356,6 +446,8 @@ pub struct TtyCoreData {
     read_wq: EventWaitQueue,
     /// 写等待队列
     write_wq: EventWaitQueue,
+    /// 串行化整个 tty write 调用，等价于 Linux tty->atomic_write_lock。
+    write_lock: TtySleepLock,
     /// 端口
     port: RwLock<Option<Arc<dyn TtyPort>>>,
     /// 前台进程
@@ -464,6 +556,10 @@ impl TtyCoreData {
     #[inline]
     pub fn write_wq(&self) -> &EventWaitQueue {
         &self.write_wq
+    }
+
+    pub fn write_lock(&self) -> &TtySleepLock {
+        &self.write_lock
     }
 
     #[inline]
@@ -660,8 +756,8 @@ impl TtyOperation for TtyCore {
     }
 
     #[inline]
-    fn chars_in_buffer(&self) -> usize {
-        return self.core().tty_driver.driver_funcs().chars_in_buffer();
+    fn chars_in_buffer(&self, tty: &TtyCoreData) -> usize {
+        return tty.tty_driver.driver_funcs().chars_in_buffer(tty);
     }
 
     #[inline]
@@ -869,6 +965,8 @@ impl TtyIoctlCmd {
     pub const TIOCGPKT: u32 = 0x80045438;
     /// 获取pts index
     pub const TIOCGPTN: u32 = 0x80045430;
+    /// Open the slave side of a Unix98 PTY from the master fd.
+    pub const TIOCGPTPEER: u32 = 0x5441;
 }
 
 pub struct TtyFlushArg;

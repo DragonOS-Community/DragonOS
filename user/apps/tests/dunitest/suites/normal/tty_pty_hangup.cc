@@ -8,10 +8,15 @@
 #include <signal.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <stdint.h>
 #include <termios.h>
 #include <unistd.h>
+
+#include <algorithm>
+#include <string>
+#include <vector>
 
 namespace {
 
@@ -25,6 +30,22 @@ constexpr int kTiocpkt = TIOCPKT;
 constexpr int kTiocgptn = 0x80045430;
 #else
 constexpr int kTiocgptn = TIOCGPTN;
+#endif
+
+#ifndef TIOCSPTLCK
+constexpr int kTiocsptlck = 0x40045431;
+#else
+constexpr int kTiocsptlck = TIOCSPTLCK;
+#endif
+
+#ifndef TIOCGPTPEER
+constexpr int kTiocgptpeer = 0x5441;
+#else
+constexpr int kTiocgptpeer = TIOCGPTPEER;
+#endif
+
+#ifndef O_PATH
+#define O_PATH 010000000
 #endif
 
 #ifndef TIOCPKT_FLUSHWRITE
@@ -72,6 +93,32 @@ private:
     int fd_ = -1;
 };
 
+class ScopedSignalIgnore {
+public:
+    explicit ScopedSignalIgnore(int signum) : signum_(signum) {
+        struct sigaction action = {};
+        action.sa_handler = SIG_IGN;
+        sigemptyset(&action.sa_mask);
+        valid_ = sigaction(signum_, &action, &old_) == 0;
+    }
+
+    ScopedSignalIgnore(const ScopedSignalIgnore&) = delete;
+    ScopedSignalIgnore& operator=(const ScopedSignalIgnore&) = delete;
+
+    ~ScopedSignalIgnore() {
+        if (valid_) {
+            sigaction(signum_, &old_, nullptr);
+        }
+    }
+
+    bool valid() const { return valid_; }
+
+private:
+    int signum_;
+    struct sigaction old_ = {};
+    bool valid_ = false;
+};
+
 struct PtyPair {
     UniqueFd master;
     UniqueFd slave;
@@ -95,6 +142,36 @@ PtyPair OpenRawPty(char* name = nullptr) {
 
     term.c_iflag = 0;
     term.c_oflag = 0;
+    term.c_lflag = 0;
+    term.c_cflag |= CS8;
+    term.c_cc[VMIN] = 1;
+    term.c_cc[VTIME] = 0;
+
+    if (tcsetattr(pair.slave.get(), TCSANOW, &term) < 0) {
+        ADD_FAILURE() << "tcsetattr failed: errno=" << errno << " (" << strerror(errno) << ")";
+    }
+
+    return pair;
+}
+
+PtyPair OpenOpostPty() {
+    int master = -1;
+    int slave = -1;
+    if (openpty(&master, &slave, nullptr, nullptr, nullptr) < 0) {
+        ADD_FAILURE() << "openpty failed: errno=" << errno << " (" << strerror(errno) << ")";
+        return {};
+    }
+
+    PtyPair pair{UniqueFd(master), UniqueFd(slave)};
+
+    struct termios term = {};
+    if (tcgetattr(pair.slave.get(), &term) < 0) {
+        ADD_FAILURE() << "tcgetattr failed: errno=" << errno << " (" << strerror(errno) << ")";
+        return pair;
+    }
+
+    term.c_iflag = 0;
+    term.c_oflag = OPOST | ONLCR;
     term.c_lflag = 0;
     term.c_cflag |= CS8;
     term.c_cc[VMIN] = 1;
@@ -171,12 +248,107 @@ bool IsWouldBlock(int err) {
         ;
 }
 
+unsigned char ConfigureSignalFlushSlave(int fd, bool noflsh) {
+    struct termios term = {};
+    if (tcgetattr(fd, &term) < 0) {
+        ADD_FAILURE() << "tcgetattr failed: errno=" << errno << " (" << strerror(errno) << ")";
+        return 0;
+    }
+
+    term.c_lflag |= ICANON | ISIG;
+    term.c_lflag &= ~ECHO;
+    if (noflsh) {
+        term.c_lflag |= NOFLSH;
+    } else {
+        term.c_lflag &= ~NOFLSH;
+    }
+    term.c_cc[VMIN] = 1;
+    term.c_cc[VTIME] = 0;
+
+    if (tcsetattr(fd, TCSANOW, &term) < 0) {
+        ADD_FAILURE() << "tcsetattr failed: errno=" << errno << " (" << strerror(errno) << ")";
+        return 0;
+    }
+
+    return static_cast<unsigned char>(term.c_cc[VINTR]);
+}
+
+std::string ReadCanonicalLine(int fd) {
+    struct pollfd pfd = {
+        .fd = fd,
+        .events = POLLIN | POLLHUP | POLLERR,
+        .revents = 0,
+    };
+
+    int ret = 0;
+    do {
+        ret = poll(&pfd, 1, 5000);
+    } while (ret < 0 && errno == EINTR);
+
+    if (ret <= 0) {
+        ADD_FAILURE() << "poll waiting for canonical line failed: errno="
+                      << (ret < 0 ? errno : ETIMEDOUT) << " ("
+                      << strerror(ret < 0 ? errno : ETIMEDOUT) << ")";
+        return {};
+    }
+    if ((pfd.revents & POLLIN) == 0) {
+        ADD_FAILURE() << "poll returned without POLLIN, revents=" << pfd.revents;
+        return {};
+    }
+
+    char buf[512] = {};
+    ssize_t n = 0;
+    do {
+        n = read(fd, buf, sizeof(buf));
+    } while (n < 0 && errno == EINTR);
+
+    if (n <= 0) {
+        ADD_FAILURE() << "read canonical line failed: errno=" << (n < 0 ? errno : EIO)
+                      << " (" << strerror(n < 0 ? errno : EIO) << ")";
+        return {};
+    }
+
+    return std::string(buf, buf + n);
+}
+
 struct ConcurrentSlaveOpenArgs {
     const char* slave_name;
     int start_read_fd;
     int opened_fd;
     int open_errno;
 };
+
+struct WriteAllArgs {
+    int fd;
+    const char* data;
+    size_t len;
+    size_t written;
+    int error;
+};
+
+void* WriteAll(void* raw) {
+    auto* args = static_cast<WriteAllArgs*>(raw);
+    args->written = 0;
+    args->error = 0;
+
+    while (args->written < args->len) {
+        ssize_t n = write(args->fd, args->data + args->written, args->len - args->written);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n < 0) {
+            args->error = errno;
+            return nullptr;
+        }
+        if (n == 0) {
+            args->error = EIO;
+            return nullptr;
+        }
+        args->written += static_cast<size_t>(n);
+    }
+
+    return nullptr;
+}
 
 void* ConcurrentSlaveOpen(void* raw) {
     auto* args = static_cast<ConcurrentSlaveOpenArgs*>(raw);
@@ -267,6 +439,66 @@ TEST(TtyPtyHangup, CanonicalReaderDoesNotMissLineWakeup) {
     }
     ASSERT_TRUE(WIFEXITED(status));
     EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+TEST(TtyPtyHangup, SignalFlushDiscardsPendingInputBacklog) {
+    ScopedSignalIgnore ignore_sigint(SIGINT);
+    ASSERT_TRUE(ignore_sigint.valid()) << "sigaction(SIGINT, SIG_IGN) failed: errno=" << errno
+                                       << " (" << strerror(errno) << ")";
+
+    PtyPair pair = OpenCanonicalNoEchoPty();
+    ASSERT_GE(pair.master.get(), 0);
+    ASSERT_GE(pair.slave.get(), 0);
+
+    unsigned char vintr = ConfigureSignalFlushSlave(pair.slave.get(), false);
+    ASSERT_NE(0, vintr) << "VINTR must be enabled for this regression test";
+
+    constexpr size_t kDragonOsPtyDrainChunk = 256;
+    std::string stale(kDragonOsPtyDrainChunk - 1, 'a');
+    stale.push_back(static_cast<char>(vintr));
+    stale.append("stale-backlog-should-be-flushed\n");
+    ASSERT_LT(stale.size(), static_cast<size_t>(16 * 1024));
+
+    ASSERT_EQ(static_cast<ssize_t>(stale.size()), write(pair.master.get(), stale.data(), stale.size()))
+        << "single stale write failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    const std::string fresh = "fresh-after-signal\n";
+    ASSERT_EQ(static_cast<ssize_t>(fresh.size()), write(pair.master.get(), fresh.data(), fresh.size()))
+        << "fresh marker write failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    EXPECT_EQ(fresh, ReadCanonicalLine(pair.slave.get()));
+}
+
+TEST(TtyPtyHangup, SignalNoflshPreservesPendingInputBacklog) {
+    ScopedSignalIgnore ignore_sigint(SIGINT);
+    ASSERT_TRUE(ignore_sigint.valid()) << "sigaction(SIGINT, SIG_IGN) failed: errno=" << errno
+                                       << " (" << strerror(errno) << ")";
+
+    PtyPair pair = OpenCanonicalNoEchoPty();
+    ASSERT_GE(pair.master.get(), 0);
+    ASSERT_GE(pair.slave.get(), 0);
+
+    unsigned char vintr = ConfigureSignalFlushSlave(pair.slave.get(), true);
+    ASSERT_NE(0, vintr) << "VINTR must be enabled for this regression test";
+
+    constexpr size_t kDragonOsPtyDrainChunk = 256;
+    std::string expected(kDragonOsPtyDrainChunk - 1, 'a');
+    expected.append("stale-backlog-must-survive\n");
+
+    std::string input(kDragonOsPtyDrainChunk - 1, 'a');
+    input.push_back(static_cast<char>(vintr));
+    input.append("stale-backlog-must-survive\n");
+    ASSERT_LT(input.size(), static_cast<size_t>(16 * 1024));
+
+    ASSERT_EQ(static_cast<ssize_t>(input.size()), write(pair.master.get(), input.data(), input.size()))
+        << "single NOFLSH write failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    const std::string fresh = "fresh-after-noflsh\n";
+    ASSERT_EQ(static_cast<ssize_t>(fresh.size()), write(pair.master.get(), fresh.data(), fresh.size()))
+        << "fresh marker write failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    EXPECT_EQ(expected, ReadCanonicalLine(pair.slave.get()));
+    EXPECT_EQ(fresh, ReadCanonicalLine(pair.slave.get()));
 }
 
 TEST(TtyPtyHangup, MasterPollAfterSlaveCloseReportsHupAndOut) {
@@ -498,6 +730,287 @@ TEST(TtyPtyHangup, MasterOnlyCloseReleasesDevptsIndex) {
     EXPECT_TRUE(saw_reuse) << "master-only open/close did not visibly reuse any devpts index";
 }
 
+TEST(TtyPtyHangup, OPathFifoKeepsPathInodeAndDoesNotBlock) {
+    std::string path = "/tmp/opath_fifo_" + std::to_string(getpid());
+    unlink(path.c_str());
+
+    ASSERT_EQ(0, mkfifo(path.c_str(), 0600))
+        << "mkfifo(" << path << ") failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    struct stat path_stat = {};
+    ASSERT_EQ(0, lstat(path.c_str(), &path_stat))
+        << "lstat(" << path << ") failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    UniqueFd fifo(open(path.c_str(), O_PATH | O_NONBLOCK | O_CLOEXEC));
+    int saved_errno = errno;
+    unlink(path.c_str());
+    ASSERT_GE(fifo.get(), 0) << "open(O_PATH) on FIFO failed or blocked: errno=" << saved_errno
+                             << " (" << strerror(saved_errno) << ")";
+
+    struct stat fd_stat = {};
+    ASSERT_EQ(0, fstat(fifo.get(), &fd_stat))
+        << "fstat(O_PATH FIFO fd) failed: errno=" << errno << " (" << strerror(errno) << ")";
+    EXPECT_EQ(path_stat.st_dev, fd_stat.st_dev);
+    EXPECT_EQ(path_stat.st_ino, fd_stat.st_ino);
+    EXPECT_EQ(path_stat.st_mode & S_IFMT, fd_stat.st_mode & S_IFMT);
+}
+
+TEST(TtyPtyHangup, TiocgptpeerFailsWhileSlaveLocked) {
+    UniqueFd master(open("/dev/ptmx", O_RDWR | O_NOCTTY));
+    ASSERT_GE(master.get(), 0) << "open(/dev/ptmx) failed: errno=" << errno << " ("
+                               << strerror(errno) << ")";
+
+    errno = 0;
+    EXPECT_EQ(-1, ioctl(master.get(), kTiocgptpeer, O_RDWR | O_NOCTTY));
+    EXPECT_EQ(EIO, errno) << "locked TIOCGPTPEER should fail with EIO, got errno=" << errno
+                          << " (" << strerror(errno) << ")";
+}
+
+TEST(TtyPtyHangup, TiocgptpeerOPathSucceedsWhileSlaveLocked) {
+    UniqueFd master(open("/dev/ptmx", O_RDWR | O_NOCTTY));
+    ASSERT_GE(master.get(), 0) << "open(/dev/ptmx) failed: errno=" << errno << " ("
+                               << strerror(errno) << ")";
+
+    UniqueFd peer(ioctl(master.get(), kTiocgptpeer, O_PATH | O_CLOEXEC));
+    ASSERT_GE(peer.get(), 0) << "locked TIOCGPTPEER(O_PATH) failed: errno=" << errno
+                             << " (" << strerror(errno) << ")";
+
+    int fd_flags = fcntl(peer.get(), F_GETFD);
+    ASSERT_GE(fd_flags, 0) << "fcntl(F_GETFD) failed: errno=" << errno << " (" << strerror(errno)
+                           << ")";
+    EXPECT_NE(0, fd_flags & FD_CLOEXEC);
+}
+
+TEST(TtyPtyHangup, TiocgptpeerOpensUnlockedSlave) {
+    UniqueFd master(open("/dev/ptmx", O_RDWR | O_NOCTTY));
+    ASSERT_GE(master.get(), 0) << "open(/dev/ptmx) failed: errno=" << errno << " ("
+                               << strerror(errno) << ")";
+
+    int unlock = 0;
+    ASSERT_EQ(0, ioctl(master.get(), kTiocsptlck, &unlock))
+        << "unlock slave failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    UniqueFd slave(ioctl(master.get(), kTiocgptpeer, O_RDWR | O_NOCTTY | O_CLOEXEC));
+    ASSERT_GE(slave.get(), 0) << "TIOCGPTPEER failed: errno=" << errno << " ("
+                              << strerror(errno) << ")";
+
+    int fd_flags = fcntl(slave.get(), F_GETFD);
+    ASSERT_GE(fd_flags, 0) << "fcntl(F_GETFD) failed: errno=" << errno << " (" << strerror(errno)
+                           << ")";
+    EXPECT_NE(0, fd_flags & FD_CLOEXEC);
+
+    struct termios term = {};
+    ASSERT_EQ(0, tcgetattr(slave.get(), &term))
+        << "tcgetattr(peer slave) failed: errno=" << errno << " (" << strerror(errno) << ")";
+    term.c_iflag = 0;
+    term.c_oflag = 0;
+    term.c_lflag = 0;
+    term.c_cflag |= CS8;
+    term.c_cc[VMIN] = 1;
+    term.c_cc[VTIME] = 0;
+    ASSERT_EQ(0, tcsetattr(slave.get(), TCSANOW, &term))
+        << "tcsetattr(peer slave) failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    ASSERT_EQ(1, write(slave.get(), "q", 1))
+        << "write(peer slave) failed: errno=" << errno << " (" << strerror(errno) << ")";
+    char ch = 0;
+    ASSERT_EQ(1, read(master.get(), &ch, 1))
+        << "read(master) failed: errno=" << errno << " (" << strerror(errno) << ")";
+    EXPECT_EQ('q', ch);
+}
+
+TEST(TtyPtyHangup, TiocgptpeerOPathRejectsTtyOperations) {
+    UniqueFd master(open("/dev/ptmx", O_RDWR | O_NOCTTY));
+    ASSERT_GE(master.get(), 0) << "open(/dev/ptmx) failed: errno=" << errno << " ("
+                               << strerror(errno) << ")";
+
+    UniqueFd peer(ioctl(master.get(), kTiocgptpeer, O_PATH | O_CLOEXEC));
+    ASSERT_GE(peer.get(), 0) << "TIOCGPTPEER(O_PATH) failed: errno=" << errno << " ("
+                             << strerror(errno) << ")";
+
+    char ch = 0;
+    errno = 0;
+    EXPECT_EQ(-1, read(peer.get(), &ch, 1));
+    EXPECT_EQ(EBADF, errno) << "read on O_PATH peer should fail with EBADF, got errno=" << errno
+                            << " (" << strerror(errno) << ")";
+
+    errno = 0;
+    EXPECT_EQ(-1, write(peer.get(), "x", 1));
+    EXPECT_EQ(EBADF, errno) << "write on O_PATH peer should fail with EBADF, got errno=" << errno
+                            << " (" << strerror(errno) << ")";
+
+    struct termios term = {};
+    errno = 0;
+    EXPECT_EQ(-1, tcgetattr(peer.get(), &term));
+    EXPECT_EQ(EBADF, errno) << "tcgetattr on O_PATH peer should fail with EBADF, got errno="
+                            << errno << " (" << strerror(errno) << ")";
+
+    uint32_t index = UINT32_MAX;
+    errno = 0;
+    EXPECT_EQ(-1, ioctl(peer.get(), kTiocgptn, &index));
+    EXPECT_EQ(EBADF, errno) << "ioctl(TIOCGPTN) on O_PATH peer should fail with EBADF, got errno="
+                            << errno << " (" << strerror(errno) << ")";
+}
+
+TEST(TtyPtyHangup, TiocgptpeerOPathCloseDoesNotAffectRealPeerOpen) {
+    UniqueFd master(open("/dev/ptmx", O_RDWR | O_NOCTTY));
+    ASSERT_GE(master.get(), 0) << "open(/dev/ptmx) failed: errno=" << errno << " ("
+                               << strerror(errno) << ")";
+
+    int unlock = 0;
+    ASSERT_EQ(0, ioctl(master.get(), kTiocsptlck, &unlock))
+        << "unlock slave failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    UniqueFd path_peer(ioctl(master.get(), kTiocgptpeer, O_PATH | O_CLOEXEC));
+    ASSERT_GE(path_peer.get(), 0) << "TIOCGPTPEER(O_PATH) failed: errno=" << errno << " ("
+                                  << strerror(errno) << ")";
+    path_peer.reset();
+
+    UniqueFd slave(ioctl(master.get(), kTiocgptpeer, O_RDWR | O_NOCTTY));
+    ASSERT_GE(slave.get(), 0) << "TIOCGPTPEER real peer failed after closing O_PATH peer: errno="
+                              << errno << " (" << strerror(errno) << ")";
+
+    struct termios term = {};
+    ASSERT_EQ(0, tcgetattr(slave.get(), &term))
+        << "tcgetattr(real peer slave) failed: errno=" << errno << " (" << strerror(errno)
+        << ")";
+    term.c_iflag = 0;
+    term.c_oflag = 0;
+    term.c_lflag = 0;
+    term.c_cflag |= CS8;
+    term.c_cc[VMIN] = 1;
+    term.c_cc[VTIME] = 0;
+    ASSERT_EQ(0, tcsetattr(slave.get(), TCSANOW, &term))
+        << "tcsetattr(real peer slave) failed: errno=" << errno << " (" << strerror(errno)
+        << ")";
+
+    ASSERT_EQ(1, write(slave.get(), "p", 1))
+        << "write(real peer slave) failed: errno=" << errno << " (" << strerror(errno) << ")";
+    char ch = 0;
+    ASSERT_EQ(1, read(master.get(), &ch, 1))
+        << "read(master) failed: errno=" << errno << " (" << strerror(errno) << ")";
+    EXPECT_EQ('p', ch);
+}
+
+TEST(TtyPtyHangup, TiocgptpeerOPathDoesNotKeepIndexReserved) {
+    UniqueFd master(open("/dev/ptmx", O_RDWR | O_NOCTTY));
+    ASSERT_GE(master.get(), 0) << "open(/dev/ptmx) failed: errno=" << errno << " ("
+                               << strerror(errno) << ")";
+
+    uint32_t first_index = UINT32_MAX;
+    ASSERT_EQ(0, ioctl(master.get(), kTiocgptn, &first_index))
+        << "TIOCGPTN failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    UniqueFd peer(ioctl(master.get(), kTiocgptpeer, O_PATH | O_CLOEXEC));
+    ASSERT_GE(peer.get(), 0) << "TIOCGPTPEER(O_PATH) failed: errno=" << errno << " ("
+                             << strerror(errno) << ")";
+
+    master.reset();
+
+    bool saw_reused_first_index = false;
+    std::vector<UniqueFd> masters;
+    for (uint32_t i = 0; i < 128; ++i) {
+        UniqueFd next(open("/dev/ptmx", O_RDWR | O_NOCTTY));
+        if (next.get() < 0) {
+            break;
+        }
+
+        uint32_t next_index = UINT32_MAX;
+        ASSERT_EQ(0, ioctl(next.get(), kTiocgptn, &next_index))
+            << "later TIOCGPTN failed: errno=" << errno << " (" << strerror(errno) << ")";
+        if (next_index == first_index) {
+            saw_reused_first_index = true;
+            break;
+        }
+
+        masters.push_back(std::move(next));
+    }
+
+    EXPECT_TRUE(saw_reused_first_index)
+        << "O_PATH TIOCGPTPEER peer should not keep the devpts index reserved";
+}
+
+TEST(TtyPtyHangup, TiocgptpeerSurvivesVisibleDevptsUnlink) {
+    UniqueFd master(open("/dev/ptmx", O_RDWR | O_NOCTTY));
+    ASSERT_GE(master.get(), 0) << "open(/dev/ptmx) failed: errno=" << errno << " ("
+                               << strerror(errno) << ")";
+
+    uint32_t index = UINT32_MAX;
+    ASSERT_EQ(0, ioctl(master.get(), kTiocgptn, &index))
+        << "TIOCGPTN failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    int unlock = 0;
+    ASSERT_EQ(0, ioctl(master.get(), kTiocsptlck, &unlock))
+        << "unlock slave failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    std::string path = "/dev/pts/" + std::to_string(index);
+    ASSERT_EQ(0, unlink(path.c_str())) << "unlink(" << path << ") failed: errno=" << errno
+                                       << " (" << strerror(errno) << ")";
+
+    UniqueFd slave(ioctl(master.get(), kTiocgptpeer, O_RDWR | O_NOCTTY));
+    ASSERT_GE(slave.get(), 0) << "TIOCGPTPEER after unlink failed: errno=" << errno << " ("
+                              << strerror(errno) << ")";
+
+    struct termios term = {};
+    EXPECT_EQ(0, tcgetattr(slave.get(), &term))
+        << "tcgetattr(peer slave) failed: errno=" << errno << " (" << strerror(errno) << ")";
+}
+
+TEST(TtyPtyHangup, MultipleTiocgptpeerSlaveFdsKeepIndexReserved) {
+    UniqueFd master(open("/dev/ptmx", O_RDWR | O_NOCTTY));
+    ASSERT_GE(master.get(), 0) << "open(/dev/ptmx) failed: errno=" << errno << " ("
+                               << strerror(errno) << ")";
+
+    uint32_t first_index = UINT32_MAX;
+    ASSERT_EQ(0, ioctl(master.get(), kTiocgptn, &first_index))
+        << "TIOCGPTN failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    int unlock = 0;
+    ASSERT_EQ(0, ioctl(master.get(), kTiocsptlck, &unlock))
+        << "unlock slave failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    UniqueFd slave_a(ioctl(master.get(), kTiocgptpeer, O_RDWR | O_NOCTTY));
+    ASSERT_GE(slave_a.get(), 0) << "first TIOCGPTPEER failed: errno=" << errno << " ("
+                                << strerror(errno) << ")";
+    UniqueFd slave_b(ioctl(master.get(), kTiocgptpeer, O_RDWR | O_NOCTTY));
+    ASSERT_GE(slave_b.get(), 0) << "second TIOCGPTPEER failed: errno=" << errno << " ("
+                                << strerror(errno) << ")";
+
+    master.reset();
+    slave_a.reset();
+
+    UniqueFd second_master(open("/dev/ptmx", O_RDWR | O_NOCTTY));
+    ASSERT_GE(second_master.get(), 0) << "second open(/dev/ptmx) failed: errno=" << errno << " ("
+                                      << strerror(errno) << ")";
+    uint32_t second_index = UINT32_MAX;
+    ASSERT_EQ(0, ioctl(second_master.get(), kTiocgptn, &second_index))
+        << "second TIOCGPTN failed: errno=" << errno << " (" << strerror(errno) << ")";
+    EXPECT_NE(first_index, second_index)
+        << "pty index was reused while one TIOCGPTPEER slave fd was still alive";
+
+    second_master.reset();
+    slave_b.reset();
+
+    bool saw_reused_first_index = false;
+    std::vector<UniqueFd> masters;
+    for (uint32_t i = 0; i < 128; ++i) {
+        UniqueFd next(open("/dev/ptmx", O_RDWR | O_NOCTTY));
+        if (next.get() < 0) {
+            break;
+        }
+        uint32_t next_index = UINT32_MAX;
+        ASSERT_EQ(0, ioctl(next.get(), kTiocgptn, &next_index))
+            << "later TIOCGPTN failed: errno=" << errno << " (" << strerror(errno) << ")";
+        if (next_index == first_index) {
+            saw_reused_first_index = true;
+            break;
+        }
+        masters.push_back(std::move(next));
+    }
+    EXPECT_TRUE(saw_reused_first_index)
+        << "pty index should be reusable after all TIOCGPTPEER slave fds close";
+}
+
 TEST(TtyPtyHangup, ClosingOneOfMultipleSlaveFdsDoesNotHangupMaster) {
     PtyPair pair = OpenRawPty();
     ASSERT_GE(pair.master.get(), 0);
@@ -603,6 +1116,309 @@ TEST(TtyPtyHangup, ChildExitDrainsSlaveOutputBeforeMasterEio) {
     EXPECT_EQ(0, WEXITSTATUS(status));
 
     ExpectReadErrno(pair.master.get(), EIO);
+}
+
+TEST(TtyPtyHangup, LargeOpostSlaveWriteDrainsAndPreservesOnlcr) {
+    PtyPair pair = OpenOpostPty();
+    ASSERT_GE(pair.master.get(), 0);
+    ASSERT_GE(pair.slave.get(), 0);
+
+    constexpr size_t kInputBytes = 32 * 1024;
+    std::string input(kInputBytes, '\n');
+    std::vector<char> output(kInputBytes * 2);
+
+    WriteAllArgs args = {
+        .fd = pair.slave.get(),
+        .data = input.data(),
+        .len = input.size(),
+        .written = 0,
+        .error = 0,
+    };
+    pthread_t writer = {};
+    ASSERT_EQ(0, pthread_create(&writer, nullptr, WriteAll, &args)) << "pthread_create failed";
+
+    size_t total = 0;
+    int poll_error = 0;
+    bool read_ok = true;
+    while (total < output.size()) {
+        struct pollfd pfd = {
+            .fd = pair.master.get(),
+            .events = POLLIN | POLLHUP | POLLERR,
+            .revents = 0,
+        };
+        int ret = poll(&pfd, 1, 5000);
+        if (ret < 0 && errno == EINTR) {
+            continue;
+        }
+        if (ret <= 0) {
+            poll_error = ret < 0 ? errno : ETIMEDOUT;
+            read_ok = false;
+            break;
+        }
+        if ((pfd.revents & POLLIN) == 0) {
+            poll_error = EIO;
+            read_ok = false;
+            break;
+        }
+
+        ssize_t n = read(pair.master.get(), output.data() + total, output.size() - total);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            poll_error = n < 0 ? errno : EIO;
+            read_ok = false;
+            break;
+        }
+        total += static_cast<size_t>(n);
+    }
+
+    if (!read_ok) {
+        pair.slave.reset();
+        pair.master.reset();
+    }
+    ASSERT_EQ(0, pthread_join(writer, nullptr)) << "pthread_join failed";
+    ASSERT_TRUE(read_ok) << "timed out or failed while draining PTY output: errno=" << poll_error
+                         << " (" << strerror(poll_error) << "), total=" << total
+                         << ", expected=" << output.size()
+                         << ", writer_written=" << args.written
+                         << ", writer_errno=" << args.error;
+    ASSERT_EQ(0, args.error) << "writer failed after " << args.written << " bytes: errno="
+                             << args.error << " (" << strerror(args.error) << ")";
+    ASSERT_EQ(input.size(), args.written);
+    ASSERT_EQ(output.size(), total);
+
+    for (size_t i = 0; i < input.size(); ++i) {
+        EXPECT_EQ('\r', output[i * 2]) << "missing CR at converted newline " << i;
+        EXPECT_EQ('\n', output[i * 2 + 1]) << "missing LF at converted newline " << i;
+    }
+}
+
+TEST(TtyPtyHangup, LargeRawSlaveWriteDrainsWithSmallMasterReads) {
+    PtyPair pair = OpenRawPty();
+    ASSERT_GE(pair.master.get(), 0);
+    ASSERT_GE(pair.slave.get(), 0);
+
+    constexpr size_t kInputBytes = 32 * 1024;
+    std::string input(kInputBytes, 'x');
+    std::vector<char> output(kInputBytes);
+
+    WriteAllArgs args = {
+        .fd = pair.slave.get(),
+        .data = input.data(),
+        .len = input.size(),
+        .written = 0,
+        .error = 0,
+    };
+    pthread_t writer = {};
+    ASSERT_EQ(0, pthread_create(&writer, nullptr, WriteAll, &args)) << "pthread_create failed";
+
+    size_t total = 0;
+    int poll_error = 0;
+    bool read_ok = true;
+    while (total < output.size()) {
+        struct pollfd pfd = {
+            .fd = pair.master.get(),
+            .events = POLLIN | POLLHUP | POLLERR,
+            .revents = 0,
+        };
+        int ret = poll(&pfd, 1, 5000);
+        if (ret < 0 && errno == EINTR) {
+            continue;
+        }
+        if (ret <= 0) {
+            poll_error = ret < 0 ? errno : ETIMEDOUT;
+            read_ok = false;
+            break;
+        }
+        if ((pfd.revents & POLLIN) == 0) {
+            poll_error = EIO;
+            read_ok = false;
+            break;
+        }
+
+        const size_t chunk = std::min<size_t>(257, output.size() - total);
+        ssize_t n = read(pair.master.get(), output.data() + total, chunk);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            poll_error = n < 0 ? errno : EIO;
+            read_ok = false;
+            break;
+        }
+        total += static_cast<size_t>(n);
+    }
+
+    if (!read_ok) {
+        pair.slave.reset();
+        pair.master.reset();
+    }
+    ASSERT_EQ(0, pthread_join(writer, nullptr)) << "pthread_join failed";
+    ASSERT_TRUE(read_ok) << "timed out or failed while draining raw PTY output: errno="
+                         << poll_error << " (" << strerror(poll_error) << "), total=" << total
+                         << ", expected=" << output.size()
+                         << ", writer_written=" << args.written
+                         << ", writer_errno=" << args.error;
+    ASSERT_EQ(0, args.error) << "writer failed after " << args.written << " bytes: errno="
+                             << args.error << " (" << strerror(args.error) << ")";
+    ASSERT_EQ(input.size(), args.written);
+    ASSERT_EQ(output.size(), total);
+    EXPECT_EQ(input, std::string(output.begin(), output.end()));
+}
+
+TEST(TtyPtyHangup, LargeCanonicalMasterWriteDrainsWithSmallSlaveReads) {
+    PtyPair pair = OpenCanonicalNoEchoPty();
+    ASSERT_GE(pair.master.get(), 0);
+    ASSERT_GE(pair.slave.get(), 0);
+
+    std::string input;
+    for (int i = 0; i < 64; ++i) {
+        input.append(512, static_cast<char>('a' + (i % 26)));
+        input.push_back('\n');
+    }
+    std::vector<char> output(input.size());
+
+    WriteAllArgs args = {
+        .fd = pair.master.get(),
+        .data = input.data(),
+        .len = input.size(),
+        .written = 0,
+        .error = 0,
+    };
+    pthread_t writer = {};
+    ASSERT_EQ(0, pthread_create(&writer, nullptr, WriteAll, &args)) << "pthread_create failed";
+
+    size_t total = 0;
+    int poll_error = 0;
+    bool read_ok = true;
+    while (total < output.size()) {
+        struct pollfd pfd = {
+            .fd = pair.slave.get(),
+            .events = POLLIN | POLLHUP | POLLERR,
+            .revents = 0,
+        };
+        int ret = poll(&pfd, 1, 5000);
+        if (ret < 0 && errno == EINTR) {
+            continue;
+        }
+        if (ret <= 0) {
+            poll_error = ret < 0 ? errno : ETIMEDOUT;
+            read_ok = false;
+            break;
+        }
+        if ((pfd.revents & POLLIN) == 0) {
+            poll_error = EIO;
+            read_ok = false;
+            break;
+        }
+
+        const size_t chunk = std::min<size_t>(257, output.size() - total);
+        ssize_t n = read(pair.slave.get(), output.data() + total, chunk);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            poll_error = n < 0 ? errno : EIO;
+            read_ok = false;
+            break;
+        }
+        total += static_cast<size_t>(n);
+    }
+
+    if (!read_ok) {
+        pair.slave.reset();
+        pair.master.reset();
+    }
+    ASSERT_EQ(0, pthread_join(writer, nullptr)) << "pthread_join failed";
+    ASSERT_TRUE(read_ok) << "timed out or failed while draining canonical PTY input: errno="
+                         << poll_error << " (" << strerror(poll_error) << "), total=" << total
+                         << ", expected=" << output.size()
+                         << ", writer_written=" << args.written
+                         << ", writer_errno=" << args.error;
+    ASSERT_EQ(0, args.error) << "writer failed after " << args.written << " bytes: errno="
+                             << args.error << " (" << strerror(args.error) << ")";
+    ASSERT_EQ(input.size(), args.written);
+    ASSERT_EQ(output.size(), total);
+    EXPECT_EQ(input, std::string(output.begin(), output.end()));
+}
+
+TEST(TtyPtyHangup, TciflushDoesNotDiscardLargeOpostSlaveOutput) {
+    PtyPair pair = OpenOpostPty();
+    ASSERT_GE(pair.master.get(), 0);
+    ASSERT_GE(pair.slave.get(), 0);
+
+    constexpr size_t kInputLines = 24 * 1024;
+    std::string input(kInputLines, '\n');
+    std::vector<char> output(input.size() * 2);
+
+    WriteAllArgs args = {
+        .fd = pair.slave.get(),
+        .data = input.data(),
+        .len = input.size(),
+        .written = 0,
+        .error = 0,
+    };
+    pthread_t writer = {};
+    ASSERT_EQ(0, pthread_create(&writer, nullptr, WriteAll, &args)) << "pthread_create failed";
+
+    ASSERT_EQ(0, tcflush(pair.slave.get(), TCIFLUSH))
+        << "tcflush(TCIFLUSH) failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    size_t total = 0;
+    int poll_error = 0;
+    bool read_ok = true;
+    while (total < output.size()) {
+        struct pollfd pfd = {
+            .fd = pair.master.get(),
+            .events = POLLIN | POLLHUP | POLLERR,
+            .revents = 0,
+        };
+        int ret = poll(&pfd, 1, 5000);
+        if (ret < 0 && errno == EINTR) {
+            continue;
+        }
+        if (ret <= 0) {
+            poll_error = ret < 0 ? errno : ETIMEDOUT;
+            read_ok = false;
+            break;
+        }
+        if ((pfd.revents & POLLIN) == 0) {
+            poll_error = EIO;
+            read_ok = false;
+            break;
+        }
+
+        ssize_t n = read(pair.master.get(), output.data() + total, output.size() - total);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            poll_error = n < 0 ? errno : EIO;
+            read_ok = false;
+            break;
+        }
+        total += static_cast<size_t>(n);
+    }
+
+    if (!read_ok) {
+        pair.slave.reset();
+        pair.master.reset();
+    }
+    ASSERT_EQ(0, pthread_join(writer, nullptr)) << "pthread_join failed";
+    ASSERT_TRUE(read_ok) << "timed out or failed after TCIFLUSH while draining PTY output: errno="
+                         << poll_error << " (" << strerror(poll_error) << "), total=" << total
+                         << ", expected=" << output.size()
+                         << ", writer_written=" << args.written
+                         << ", writer_errno=" << args.error;
+    ASSERT_EQ(0, args.error) << "writer failed after " << args.written << " bytes: errno="
+                             << args.error << " (" << strerror(args.error) << ")";
+    ASSERT_EQ(input.size(), args.written);
+    ASSERT_EQ(output.size(), total);
+    for (size_t i = 0; i < output.size(); i += 2) {
+        EXPECT_EQ('\r', output[i]);
+        EXPECT_EQ('\n', output[i + 1]);
+    }
 }
 
 }  // namespace

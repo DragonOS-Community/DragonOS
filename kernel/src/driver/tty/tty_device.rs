@@ -28,11 +28,12 @@ use crate::{
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode, LockedDevFSInode},
         devpts::{DevPtsFs, LockedDevPtsFSInode},
-        epoll::EPollItem,
+        epoll::{EPollEventType, EPollItem},
         kernfs::KernFSInode,
         vfs::{
-            file::FileFlags, utils::DName, FilePrivateData, FileType, IndexNode, InodeMode,
-            Metadata, PollableInode,
+            file::{File, FileFlags},
+            utils::DName,
+            FilePrivateData, FileType, IndexNode, InodeMode, Metadata, PollableInode,
         },
     },
     init::initcall::INITCALL_DEVICE,
@@ -44,7 +45,7 @@ use crate::{
 
 use super::{
     kthread::tty_flush_thread_init,
-    pty::unix98pty::ptmx_open,
+    pty::unix98pty::{ptm_peer_inode, ptmx_open, pty_file_close},
     sysfs::sys_class_tty_instance,
     termios::WindowSize,
     tty_core::{TtyCore, TtyFlag, TtyIoctlCmd},
@@ -362,6 +363,9 @@ impl IndexNode for TtyDevice {
         drop(data);
         let ld = tty.ldisc();
         let core = tty.core();
+        let write_guard = core
+            .write_lock()
+            .lock_interruptible(flags.contains(FileFlags::O_NONBLOCK))?;
         let mut chunk = 2048;
         if core.flags().contains(TtyFlag::NO_WRITE_SPLIT) {
             chunk = 65536;
@@ -376,7 +380,22 @@ impl IndexNode for TtyDevice {
 
             // 将数据从buf拷贝到writebuf
 
-            let ret = ld.write(tty.clone(), &buf[written..], size, flags)?;
+            let ret = match ld.write(tty.clone(), &buf[written..], size, flags) {
+                Ok(ret) => ret,
+                Err(err) => {
+                    if written != 0 {
+                        break;
+                    }
+                    drop(write_guard);
+                    core.write_wq()
+                        .wakeup_any(EPollEventType::EPOLLOUT.bits() as u64);
+                    return Err(err);
+                }
+            };
+
+            if ret == 0 {
+                break;
+            }
 
             written += ret;
             count -= ret;
@@ -386,6 +405,12 @@ impl IndexNode for TtyDevice {
             }
 
             if pcb.has_pending_signal_fast() {
+                if written != 0 {
+                    break;
+                }
+                drop(write_guard);
+                core.write_wq()
+                    .wakeup_any(EPollEventType::EPOLLOUT.bits() as u64);
                 return Err(SystemError::ERESTARTSYS);
             }
         }
@@ -394,6 +419,9 @@ impl IndexNode for TtyDevice {
             // todo: 更新时间
         }
 
+        drop(write_guard);
+        core.write_wq()
+            .wakeup_any(EPollEventType::EPOLLOUT.bits() as u64);
         Ok(written)
     }
 
@@ -443,7 +471,9 @@ impl IndexNode for TtyDevice {
         };
 
         drop(data);
-        tty.close(tty.clone())
+        let ret = tty.close(tty.clone());
+        pty_file_close(&tty);
+        ret
     }
 
     fn resize(&self, _len: usize) -> Result<(), SystemError> {
@@ -480,6 +510,27 @@ impl IndexNode for TtyDevice {
         }
 
         match cmd {
+            TtyIoctlCmd::TIOCGPTPEER => {
+                let flags = FileFlags::from_bits(arg as u32).ok_or(SystemError::EINVAL)?;
+                let cloexec = flags.contains(FileFlags::O_CLOEXEC);
+                let slave_inode = ptm_peer_inode(tty)?;
+                let fd_table = ProcessManager::current_pcb().fd_table();
+                let reserved_fd = fd_table.write().reserve_fd(cloexec)?;
+                let file = match File::new(slave_inode, flags) {
+                    Ok(file) => file,
+                    Err(err) => {
+                        fd_table.write().release_reserved_fd(reserved_fd);
+                        return Err(err);
+                    }
+                };
+                return match fd_table.write().install_reserved_fd(reserved_fd, file) {
+                    Ok(fd) => Ok(fd as usize),
+                    Err(err) => {
+                        fd_table.write().release_reserved_fd(reserved_fd);
+                        Err(err)
+                    }
+                };
+            }
             TtyIoctlCmd::TIOCGWINSZ => {
                 let core = tty.core();
                 let winsize = *core.window_size();

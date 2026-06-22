@@ -53,6 +53,8 @@ pub struct InnerSigHand {
     /// 线程组退出码（仿照 Linux 的 signal_struct::group_exit_code）
     /// 仅当 flags 中包含 GROUP_EXIT 时才有效
     pub group_exit_code: usize,
+    /// 最近一次 job-control stop 的信号号，用于 wait(WSTOPPED) 填充 WSTOPSIG。
+    pub stop_signal: Signal,
     /// 线程组 exec（de-thread）当前执行者
     pub group_exec_task: Option<Weak<ProcessControlBlock>>,
     /// 线程组 exec（de-thread）等待计数（仿照 Linux 的 signal_struct::notify_count）
@@ -289,6 +291,15 @@ impl SigHand {
         g.flags.remove(flag);
     }
 
+    pub fn stop_signal(&self) -> Signal {
+        self.inner().stop_signal
+    }
+
+    pub fn set_stop_signal(&self, sig: Signal) {
+        let mut g = self.inner_mut();
+        g.stop_signal = sig;
+    }
+
     /// 尝试开始线程组 exec（去线程化）流程。
     ///
     /// - 若已经有 GROUP_EXIT 或 GROUP_EXEC 在进行中，则返回 EAGAIN。
@@ -427,6 +438,7 @@ impl Default for InnerSigHand {
             curr_target: None,
             flags: SignalFlags::empty(),
             group_exit_code: 0,
+            stop_signal: Signal::SIGSTOP,
             group_exec_task: None,
             group_exec_notify_count: 0,
             cnt: 0,

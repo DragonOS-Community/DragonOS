@@ -2038,7 +2038,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                     true,
                 )?;
 
-                let count = tty.chars_in_buffer();
+                let count = tty.chars_in_buffer(tty.core());
                 user_writer.copy_one_to_user::<i32>(&(count as i32), 0)?;
                 return Ok(0);
             }
@@ -2278,7 +2278,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
             event.insert(EPollEventType::EPOLLHUP);
         }
 
-        if core.driver().driver_funcs().chars_in_buffer() < 256
+        if core.driver().driver_funcs().chars_in_buffer(core) < 256
             && core.driver().driver_funcs().write_room(core) > 0
         {
             event.insert(EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM);

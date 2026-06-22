@@ -673,8 +673,8 @@ impl TtyOperation for TtyCore {
     }
 
     #[inline]
-    fn chars_in_buffer(&self) -> usize {
-        return self.core().tty_driver.driver_funcs().chars_in_buffer();
+    fn chars_in_buffer(&self, tty: &TtyCoreData) -> usize {
+        return tty.tty_driver.driver_funcs().chars_in_buffer(tty);
     }
 
     #[inline]

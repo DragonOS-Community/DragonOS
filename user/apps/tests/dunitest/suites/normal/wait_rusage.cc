@@ -13,6 +13,26 @@
 
 #include "gtest/gtest.h"
 
+#ifndef PTRACE_TRACEME
+#define PTRACE_TRACEME 0
+#endif
+
+#ifndef __WCLONE
+#define __WCLONE 0x80000000
+#endif
+
+#ifndef __WALL
+#define __WALL 0x40000000
+#endif
+
+#ifndef __WNOTHREAD
+#define __WNOTHREAD 0x20000000
+#endif
+
+#ifndef P_PIDFD
+#define P_PIDFD 3
+#endif
+
 namespace {
 
 uint64_t RusageCpuUsec(const struct rusage& ru) {
@@ -52,7 +72,520 @@ void* ThreadBurn(void* arg) {
   return nullptr;
 }
 
+void ExpectEncodedExitStatus(int status, int code) {
+  ASSERT_TRUE(WIFEXITED(status)) << status;
+  EXPECT_EQ(code, WEXITSTATUS(status));
+  EXPECT_NE(code, status);
+}
+
+struct ThreadForkArgs {
+  int ready_fd = -1;
+  int release_fd = -1;
+  pid_t child = -1;
+  int fork_errno = 0;
+  pid_t wait_result = -1;
+  int wait_errno = 0;
+  int wait_status = 0;
+};
+
+void* ForkChildFromThread(void* arg) {
+  auto* args = reinterpret_cast<ThreadForkArgs*>(arg);
+  pid_t child = fork();
+  if (child == 0) {
+    _exit(17);
+  }
+  if (child < 0) {
+    args->fork_errno = errno;
+  } else {
+    args->child = child;
+  }
+
+  char byte = child < 0 ? 'e' : 'x';
+  if (write(args->ready_fd, &byte, 1) != 1) {
+    args->fork_errno = errno;
+  }
+
+  if (child >= 0) {
+    char release = 0;
+    if (read(args->release_fd, &release, 1) != 1) {
+      args->fork_errno = errno;
+      return nullptr;
+    }
+    args->wait_result = wait4(child, &args->wait_status, __WNOTHREAD, nullptr);
+    if (args->wait_result < 0) {
+      args->wait_errno = errno;
+    }
+  }
+  return nullptr;
+}
+
+struct ThreadTidArgs {
+  int ready_fd = -1;
+  int release_fd = -1;
+  pid_t tid = -1;
+};
+
+void* ReportTidAndWait(void* arg) {
+  auto* args = reinterpret_cast<ThreadTidArgs*>(arg);
+  args->tid = static_cast<pid_t>(syscall(SYS_gettid));
+  char byte = 't';
+  if (write(args->ready_fd, &byte, 1) != 1) {
+    return nullptr;
+  }
+  char release = 0;
+  if (read(args->release_fd, &release, 1) != 1) {
+    return nullptr;
+  }
+  return nullptr;
+}
+
+struct BlockingThreadExitArgs {
+  int ready_fd = -1;
+  int release_fd = -1;
+};
+
+void* BlockThenExitThread(void* arg) {
+  auto* args = reinterpret_cast<BlockingThreadExitArgs*>(arg);
+  char byte = 'r';
+  if (write(args->ready_fd, &byte, 1) != 1) {
+    syscall(SYS_exit, 4);
+  }
+  char release = 0;
+  if (read(args->release_fd, &release, 1) != 1) {
+    syscall(SYS_exit, 5);
+  }
+  syscall(SYS_exit, 0);
+  return nullptr;
+}
+
+struct ThreadPtraceForkArgs {
+  int result = -1;
+  int err = 0;
+  int status = 0;
+};
+
+void* ForkTracemeAndWaitFromThread(void* arg) {
+  auto* args = reinterpret_cast<ThreadPtraceForkArgs*>(arg);
+  int fds[2] = {};
+  if (pipe(fds) != 0) {
+    args->err = errno;
+    return nullptr;
+  }
+
+  pid_t child = fork();
+  if (child == 0) {
+    close(fds[0]);
+    if (syscall(SYS_ptrace, PTRACE_TRACEME, 0, 0, 0) != 0) {
+      _exit(2);
+    }
+    if (write(fds[1], "x", 1) != 1) {
+      _exit(3);
+    }
+    close(fds[1]);
+    _exit(0);
+  }
+  if (child < 0) {
+    args->err = errno;
+    close(fds[0]);
+    close(fds[1]);
+    return nullptr;
+  }
+
+  close(fds[1]);
+  char byte = 0;
+  if (read(fds[0], &byte, 1) != 1) {
+    args->err = errno;
+    close(fds[0]);
+    return nullptr;
+  }
+  close(fds[0]);
+
+  args->result = wait4(child, &args->status, __WNOTHREAD | __WCLONE, nullptr);
+  if (args->result < 0) {
+    args->err = errno;
+  }
+  return nullptr;
+}
+
 }  // namespace
+
+TEST(WaitRusage, PtraceTracemeChildIsWaitableWithWclone) {
+  int fds[2] = {};
+  ASSERT_EQ(0, pipe(fds)) << strerror(errno);
+
+  pid_t child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    close(fds[0]);
+    if (syscall(SYS_ptrace, PTRACE_TRACEME, 0, 0, 0) != 0) {
+      _exit(2);
+    }
+    if (write(fds[1], "x", 1) != 1) {
+      _exit(3);
+    }
+    close(fds[1]);
+    _exit(0);
+  }
+
+  close(fds[1]);
+  char byte = 0;
+  ASSERT_EQ(1, read(fds[0], &byte, 1)) << strerror(errno);
+  close(fds[0]);
+
+  int status = 0;
+  ASSERT_EQ(child, wait4(child, &status, __WCLONE, nullptr)) << strerror(errno);
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(0, WEXITSTATUS(status));
+
+  errno = 0;
+  EXPECT_EQ(-1, wait4(child, nullptr, WNOHANG, nullptr));
+  EXPECT_EQ(ECHILD, errno);
+}
+
+TEST(WaitRusage, RepeatedPtraceTracemeFailsWithEperm) {
+  pid_t child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    if (syscall(SYS_ptrace, PTRACE_TRACEME, 0, 0, 0) != 0) {
+      _exit(2);
+    }
+    errno = 0;
+    if (syscall(SYS_ptrace, PTRACE_TRACEME, 0, 0, 0) != -1 ||
+        errno != EPERM) {
+      _exit(3);
+    }
+    _exit(0);
+  }
+
+  int status = 0;
+  ASSERT_EQ(child, wait4(child, &status, __WALL, nullptr)) << strerror(errno);
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+TEST(WaitRusage, WcloneDoesNotReapOrdinaryForkChild) {
+  pid_t child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    _exit(0);
+  }
+
+  int status = 0;
+  errno = 0;
+  EXPECT_EQ(-1, wait4(child, &status, WNOHANG | __WCLONE, nullptr));
+  EXPECT_EQ(ECHILD, errno);
+
+  ASSERT_EQ(child, wait4(child, &status, 0, nullptr)) << strerror(errno);
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+TEST(WaitRusage, Wait4AndWaitpidReturnEncodedExitStatus) {
+  pid_t child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    _exit(42);
+  }
+
+  int status = 0;
+  ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+  ExpectEncodedExitStatus(status, 42);
+
+  child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    _exit(21);
+  }
+
+  status = 0;
+  ASSERT_EQ(child, wait4(child, &status, 0, nullptr)) << strerror(errno);
+  ExpectEncodedExitStatus(status, 21);
+
+  child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    _exit(33);
+  }
+
+  status = 0;
+  ASSERT_EQ(child, wait4(-1, &status, 0, nullptr)) << strerror(errno);
+  ExpectEncodedExitStatus(status, 33);
+
+  child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    _exit(34);
+  }
+
+  status = 0;
+  ASSERT_EQ(child, wait4(0, &status, 0, nullptr)) << strerror(errno);
+  ExpectEncodedExitStatus(status, 34);
+
+  int fds[2] = {};
+  ASSERT_EQ(0, pipe(fds)) << strerror(errno);
+  child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    close(fds[1]);
+    char byte = 0;
+    if (read(fds[0], &byte, 1) < 0) {
+      _exit(2);
+    }
+    close(fds[0]);
+    _exit(35);
+  }
+
+  close(fds[0]);
+  ASSERT_EQ(0, setpgid(child, child)) << strerror(errno);
+  ASSERT_EQ(1, write(fds[1], "x", 1)) << strerror(errno);
+  close(fds[1]);
+
+  status = 0;
+  ASSERT_EQ(child, wait4(-child, &status, 0, nullptr)) << strerror(errno);
+  ExpectEncodedExitStatus(status, 35);
+}
+
+TEST(WaitRusage, WaitidPidExitedChildWithoutWexitedReturnsEchild) {
+  pid_t child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    _exit(7);
+  }
+
+  siginfo_t si {};
+  bool observed_exit = false;
+  for (int i = 0; i < 1000; ++i) {
+    memset(&si, 0, sizeof(si));
+    ASSERT_EQ(0, syscall(SYS_waitid, P_PID, child, &si,
+                         WEXITED | WNOWAIT | WNOHANG, nullptr))
+        << strerror(errno);
+    if (si.si_pid == child) {
+      observed_exit = true;
+      break;
+    }
+    usleep(1000);
+  }
+  ASSERT_TRUE(observed_exit);
+  EXPECT_EQ(CLD_EXITED, si.si_code);
+  EXPECT_EQ(7, si.si_status);
+
+  memset(&si, 0x5a, sizeof(si));
+  errno = 0;
+  EXPECT_EQ(-1,
+            syscall(SYS_waitid, P_PID, child, &si, WSTOPPED | WNOHANG, nullptr));
+  EXPECT_EQ(ECHILD, errno);
+
+  int status = 0;
+  ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+  ExpectEncodedExitStatus(status, 7);
+}
+
+TEST(WaitRusage, WnothreadWaitsForChildForkedByCurrentThread) {
+  int ready_pipe[2] = {};
+  int release_pipe[2] = {};
+  ASSERT_EQ(0, pipe(ready_pipe)) << strerror(errno);
+  ASSERT_EQ(0, pipe(release_pipe)) << strerror(errno);
+
+  ThreadForkArgs args;
+  args.ready_fd = ready_pipe[1];
+  args.release_fd = release_pipe[0];
+  pthread_t thread {};
+  ASSERT_EQ(0, pthread_create(&thread, nullptr, ForkChildFromThread, &args))
+      << strerror(errno);
+
+  char byte = 0;
+  ASSERT_EQ(1, read(ready_pipe[0], &byte, 1)) << strerror(errno);
+  close(ready_pipe[0]);
+  ASSERT_EQ(0, args.fork_errno) << strerror(args.fork_errno);
+  ASSERT_GT(args.child, 0);
+
+  int status = 0;
+  errno = 0;
+  EXPECT_EQ(-1, wait4(args.child, &status, WNOHANG | __WNOTHREAD, nullptr));
+  EXPECT_EQ(ECHILD, errno);
+
+  ASSERT_EQ(1, write(release_pipe[1], "x", 1)) << strerror(errno);
+  close(release_pipe[1]);
+  ASSERT_EQ(0, pthread_join(thread, nullptr)) << strerror(errno);
+  close(ready_pipe[1]);
+  close(release_pipe[0]);
+  EXPECT_EQ(args.child, args.wait_result) << strerror(args.wait_errno);
+  ExpectEncodedExitStatus(args.wait_status, 17);
+}
+
+TEST(WaitRusage, ThreadGroupLeaderWaitDelayedUntilSubthreadsExit) {
+  int ready_pipe[2] = {};
+  int release_pipe[2] = {};
+  ASSERT_EQ(0, pipe(ready_pipe)) << strerror(errno);
+  ASSERT_EQ(0, pipe(release_pipe)) << strerror(errno);
+
+  pid_t child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    close(ready_pipe[0]);
+    close(release_pipe[1]);
+    BlockingThreadExitArgs args;
+    args.ready_fd = ready_pipe[1];
+    args.release_fd = release_pipe[0];
+    pthread_t thread {};
+    if (pthread_create(&thread, nullptr, BlockThenExitThread, &args) != 0) {
+      syscall(SYS_exit, 2);
+    }
+    syscall(SYS_exit, 0);
+  }
+
+  close(ready_pipe[1]);
+  close(release_pipe[0]);
+  char byte = 0;
+  ASSERT_EQ(1, read(ready_pipe[0], &byte, 1)) << strerror(errno);
+  close(ready_pipe[0]);
+
+  usleep(50000);
+  siginfo_t si {};
+  ASSERT_EQ(0, syscall(SYS_waitid, P_PID, child, &si, WSTOPPED | WNOHANG,
+                       nullptr))
+      << strerror(errno);
+  EXPECT_EQ(0, si.si_pid);
+
+  int status = 0;
+  ASSERT_EQ(0, wait4(child, &status, WNOHANG, nullptr)) << strerror(errno);
+
+  ASSERT_EQ(1, write(release_pipe[1], "x", 1)) << strerror(errno);
+  close(release_pipe[1]);
+
+  ASSERT_EQ(child, wait4(child, &status, 0, nullptr)) << strerror(errno);
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+TEST(WaitRusage, ThreadForkedTracemeIsWaitableByForkingThreadWithWclone) {
+  ThreadPtraceForkArgs args;
+  pthread_t thread {};
+  ASSERT_EQ(0, pthread_create(&thread, nullptr, ForkTracemeAndWaitFromThread, &args))
+      << strerror(errno);
+  ASSERT_EQ(0, pthread_join(thread, nullptr)) << strerror(errno);
+
+  EXPECT_GT(args.result, 0) << strerror(args.err);
+  ASSERT_TRUE(WIFEXITED(args.status));
+  EXPECT_EQ(0, WEXITSTATUS(args.status));
+}
+
+TEST(WaitRusage, NaturalWaitCannotReapThreadTid) {
+  int ready_pipe[2] = {};
+  int release_pipe[2] = {};
+  ASSERT_EQ(0, pipe(ready_pipe)) << strerror(errno);
+  ASSERT_EQ(0, pipe(release_pipe)) << strerror(errno);
+
+  ThreadTidArgs args;
+  args.ready_fd = ready_pipe[1];
+  args.release_fd = release_pipe[0];
+  pthread_t thread {};
+  ASSERT_EQ(0, pthread_create(&thread, nullptr, ReportTidAndWait, &args))
+      << strerror(errno);
+
+  char byte = 0;
+  ASSERT_EQ(1, read(ready_pipe[0], &byte, 1)) << strerror(errno);
+  close(ready_pipe[0]);
+  ASSERT_GT(args.tid, 0);
+
+  int status = 0;
+  errno = 0;
+  EXPECT_EQ(-1, wait4(args.tid, &status, WNOHANG | __WCLONE, nullptr));
+  EXPECT_EQ(ECHILD, errno);
+
+  errno = 0;
+  EXPECT_EQ(-1, wait4(args.tid, &status, WNOHANG | __WALL, nullptr));
+  EXPECT_EQ(ECHILD, errno);
+
+  ASSERT_EQ(1, write(release_pipe[1], "x", 1)) << strerror(errno);
+  close(release_pipe[1]);
+  ASSERT_EQ(0, pthread_join(thread, nullptr)) << strerror(errno);
+  close(ready_pipe[1]);
+  close(release_pipe[0]);
+}
+
+TEST(WaitRusage, WaitidPidfdNegativeFdIsEinval) {
+  siginfo_t si {};
+  errno = 0;
+  EXPECT_EQ(-1,
+            syscall(SYS_waitid, P_PIDFD, -1, &si, WEXITED | WNOHANG, nullptr));
+  EXPECT_EQ(EINVAL, errno);
+}
+
+TEST(WaitRusage, Wait4RejectsWnowaitWithoutReapingChild) {
+  pid_t child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    _exit(0);
+  }
+
+  int status = 0;
+  errno = 0;
+  EXPECT_EQ(-1, wait4(child, &status, WNOWAIT, nullptr));
+  EXPECT_EQ(EINVAL, errno);
+
+  ASSERT_EQ(child, wait4(child, &status, 0, nullptr)) << strerror(errno);
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+TEST(WaitRusage, WnohangNoEventDoesNotTouchUserPointers) {
+  int fds[2] = {};
+  ASSERT_EQ(0, pipe(fds)) << strerror(errno);
+
+  pid_t child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    close(fds[1]);
+    char byte = 0;
+    if (read(fds[0], &byte, 1) < 0) {
+      _exit(2);
+    }
+    close(fds[0]);
+    _exit(0);
+  }
+  close(fds[0]);
+
+  errno = 0;
+  EXPECT_EQ(0, wait4(child, reinterpret_cast<int*>(1), WNOHANG,
+                     reinterpret_cast<struct rusage*>(1)))
+      << strerror(errno);
+
+  ASSERT_EQ(1, write(fds[1], "x", 1)) << strerror(errno);
+  close(fds[1]);
+
+  int status = 0;
+  ASSERT_EQ(child, wait4(child, &status, 0, nullptr)) << strerror(errno);
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+TEST(WaitRusage, ExplicitSigignSigchldAutoreapsWithoutChildRusage) {
+  struct sigaction old_action {};
+  struct sigaction ignore_action {};
+  ignore_action.sa_handler = SIG_IGN;
+  sigemptyset(&ignore_action.sa_mask);
+  ASSERT_EQ(0, sigaction(SIGCHLD, &ignore_action, &old_action)) << strerror(errno);
+
+  struct rusage before {};
+  ASSERT_EQ(0, getrusage(RUSAGE_CHILDREN, &before)) << strerror(errno);
+
+  pid_t child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    BusyForUsec(300000);
+  }
+
+  errno = 0;
+  EXPECT_EQ(-1, wait4(child, nullptr, 0, nullptr));
+  EXPECT_EQ(ECHILD, errno);
+
+  struct rusage after {};
+  ASSERT_EQ(0, getrusage(RUSAGE_CHILDREN, &after)) << strerror(errno);
+  EXPECT_EQ(RusageCpuUsec(before), RusageCpuUsec(after));
+
+  ASSERT_EQ(0, sigaction(SIGCHLD, &old_action, nullptr)) << strerror(errno);
+}
 
 TEST(WaitRusage, WNowaitDoesNotReapAndWait4AccountsChildUsage) {
   struct rusage before {};

@@ -44,17 +44,18 @@ impl Syscall for SysWait4 {
         // 权限校验
         // todo: 引入rusage之后，更正以下权限校验代码中，rusage的大小
 
-        let options = WaitOption::from_bits(options as u32).ok_or(SystemError::EINVAL)?;
-
-        let wstatus_buf = if wstatus.is_null() {
-            None
-        } else {
-            Some(UserBufferWriter::new(
-                wstatus,
-                core::mem::size_of::<i32>(),
-                true,
-            )?)
-        };
+        let options_bits = options as u32;
+        let valid_options = (WaitOption::WNOHANG
+            | WaitOption::WUNTRACED
+            | WaitOption::WCONTINUED
+            | WaitOption::WNOTHREAD
+            | WaitOption::WCLONE
+            | WaitOption::WALL)
+            .bits();
+        if options_bits & !valid_options != 0 {
+            return Err(SystemError::EINVAL);
+        }
+        let options = WaitOption::from_bits(options_bits).ok_or(SystemError::EINVAL)?;
 
         let mut tmp_rusage = if rusage.is_null() {
             None
@@ -62,15 +63,23 @@ impl Syscall for SysWait4 {
             Some(RUsage::default())
         };
 
-        let r = kernel_wait4(pid, wstatus_buf, options, tmp_rusage.as_mut())?;
+        let (r, status) = kernel_wait4(pid, options, tmp_rusage.as_mut())?;
 
-        if !rusage.is_null() {
-            let mut rusage_buf = UserBufferWriter::new::<RUsage>(
-                rusage as *mut RUsage,
-                core::mem::size_of::<RUsage>(),
-                true,
-            )?;
-            rusage_buf.copy_one_to_user(&tmp_rusage.unwrap(), 0)?;
+        if r > 0 {
+            if !wstatus.is_null() {
+                let mut wstatus_buf =
+                    UserBufferWriter::new(wstatus, core::mem::size_of::<i32>(), true)?;
+                wstatus_buf.copy_one_to_user(&status, 0)?;
+            }
+
+            if !rusage.is_null() {
+                let mut rusage_buf = UserBufferWriter::new::<RUsage>(
+                    rusage as *mut RUsage,
+                    core::mem::size_of::<RUsage>(),
+                    true,
+                )?;
+                rusage_buf.copy_one_to_user(&tmp_rusage.unwrap(), 0)?;
+            }
         }
         return Ok(r);
     }

@@ -14,6 +14,7 @@
 #include <termios.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -1029,7 +1030,10 @@ TEST(TtyPtyHangup, LargeOpostSlaveWriteDrainsAndPreservesOnlcr) {
     }
     ASSERT_EQ(0, pthread_join(writer, nullptr)) << "pthread_join failed";
     ASSERT_TRUE(read_ok) << "timed out or failed while draining PTY output: errno=" << poll_error
-                         << " (" << strerror(poll_error) << ")";
+                         << " (" << strerror(poll_error) << "), total=" << total
+                         << ", expected=" << output.size()
+                         << ", writer_written=" << args.written
+                         << ", writer_errno=" << args.error;
     ASSERT_EQ(0, args.error) << "writer failed after " << args.written << " bytes: errno="
                              << args.error << " (" << strerror(args.error) << ")";
     ASSERT_EQ(input.size(), args.written);
@@ -1038,6 +1042,233 @@ TEST(TtyPtyHangup, LargeOpostSlaveWriteDrainsAndPreservesOnlcr) {
     for (size_t i = 0; i < input.size(); ++i) {
         EXPECT_EQ('\r', output[i * 2]) << "missing CR at converted newline " << i;
         EXPECT_EQ('\n', output[i * 2 + 1]) << "missing LF at converted newline " << i;
+    }
+}
+
+TEST(TtyPtyHangup, LargeRawSlaveWriteDrainsWithSmallMasterReads) {
+    PtyPair pair = OpenRawPty();
+    ASSERT_GE(pair.master.get(), 0);
+    ASSERT_GE(pair.slave.get(), 0);
+
+    constexpr size_t kInputBytes = 32 * 1024;
+    std::string input(kInputBytes, 'x');
+    std::vector<char> output(kInputBytes);
+
+    WriteAllArgs args = {
+        .fd = pair.slave.get(),
+        .data = input.data(),
+        .len = input.size(),
+        .written = 0,
+        .error = 0,
+    };
+    pthread_t writer = {};
+    ASSERT_EQ(0, pthread_create(&writer, nullptr, WriteAll, &args)) << "pthread_create failed";
+
+    size_t total = 0;
+    int poll_error = 0;
+    bool read_ok = true;
+    while (total < output.size()) {
+        struct pollfd pfd = {
+            .fd = pair.master.get(),
+            .events = POLLIN | POLLHUP | POLLERR,
+            .revents = 0,
+        };
+        int ret = poll(&pfd, 1, 5000);
+        if (ret < 0 && errno == EINTR) {
+            continue;
+        }
+        if (ret <= 0) {
+            poll_error = ret < 0 ? errno : ETIMEDOUT;
+            read_ok = false;
+            break;
+        }
+        if ((pfd.revents & POLLIN) == 0) {
+            poll_error = EIO;
+            read_ok = false;
+            break;
+        }
+
+        const size_t chunk = std::min<size_t>(257, output.size() - total);
+        ssize_t n = read(pair.master.get(), output.data() + total, chunk);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            poll_error = n < 0 ? errno : EIO;
+            read_ok = false;
+            break;
+        }
+        total += static_cast<size_t>(n);
+    }
+
+    if (!read_ok) {
+        pair.slave.reset();
+        pair.master.reset();
+    }
+    ASSERT_EQ(0, pthread_join(writer, nullptr)) << "pthread_join failed";
+    ASSERT_TRUE(read_ok) << "timed out or failed while draining raw PTY output: errno="
+                         << poll_error << " (" << strerror(poll_error) << "), total=" << total
+                         << ", expected=" << output.size()
+                         << ", writer_written=" << args.written
+                         << ", writer_errno=" << args.error;
+    ASSERT_EQ(0, args.error) << "writer failed after " << args.written << " bytes: errno="
+                             << args.error << " (" << strerror(args.error) << ")";
+    ASSERT_EQ(input.size(), args.written);
+    ASSERT_EQ(output.size(), total);
+    EXPECT_EQ(input, std::string(output.begin(), output.end()));
+}
+
+TEST(TtyPtyHangup, LargeCanonicalMasterWriteDrainsWithSmallSlaveReads) {
+    PtyPair pair = OpenCanonicalNoEchoPty();
+    ASSERT_GE(pair.master.get(), 0);
+    ASSERT_GE(pair.slave.get(), 0);
+
+    std::string input;
+    for (int i = 0; i < 64; ++i) {
+        input.append(512, static_cast<char>('a' + (i % 26)));
+        input.push_back('\n');
+    }
+    std::vector<char> output(input.size());
+
+    WriteAllArgs args = {
+        .fd = pair.master.get(),
+        .data = input.data(),
+        .len = input.size(),
+        .written = 0,
+        .error = 0,
+    };
+    pthread_t writer = {};
+    ASSERT_EQ(0, pthread_create(&writer, nullptr, WriteAll, &args)) << "pthread_create failed";
+
+    size_t total = 0;
+    int poll_error = 0;
+    bool read_ok = true;
+    while (total < output.size()) {
+        struct pollfd pfd = {
+            .fd = pair.slave.get(),
+            .events = POLLIN | POLLHUP | POLLERR,
+            .revents = 0,
+        };
+        int ret = poll(&pfd, 1, 5000);
+        if (ret < 0 && errno == EINTR) {
+            continue;
+        }
+        if (ret <= 0) {
+            poll_error = ret < 0 ? errno : ETIMEDOUT;
+            read_ok = false;
+            break;
+        }
+        if ((pfd.revents & POLLIN) == 0) {
+            poll_error = EIO;
+            read_ok = false;
+            break;
+        }
+
+        const size_t chunk = std::min<size_t>(257, output.size() - total);
+        ssize_t n = read(pair.slave.get(), output.data() + total, chunk);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            poll_error = n < 0 ? errno : EIO;
+            read_ok = false;
+            break;
+        }
+        total += static_cast<size_t>(n);
+    }
+
+    if (!read_ok) {
+        pair.slave.reset();
+        pair.master.reset();
+    }
+    ASSERT_EQ(0, pthread_join(writer, nullptr)) << "pthread_join failed";
+    ASSERT_TRUE(read_ok) << "timed out or failed while draining canonical PTY input: errno="
+                         << poll_error << " (" << strerror(poll_error) << "), total=" << total
+                         << ", expected=" << output.size()
+                         << ", writer_written=" << args.written
+                         << ", writer_errno=" << args.error;
+    ASSERT_EQ(0, args.error) << "writer failed after " << args.written << " bytes: errno="
+                             << args.error << " (" << strerror(args.error) << ")";
+    ASSERT_EQ(input.size(), args.written);
+    ASSERT_EQ(output.size(), total);
+    EXPECT_EQ(input, std::string(output.begin(), output.end()));
+}
+
+TEST(TtyPtyHangup, TciflushDoesNotDiscardLargeOpostSlaveOutput) {
+    PtyPair pair = OpenOpostPty();
+    ASSERT_GE(pair.master.get(), 0);
+    ASSERT_GE(pair.slave.get(), 0);
+
+    constexpr size_t kInputLines = 24 * 1024;
+    std::string input(kInputLines, '\n');
+    std::vector<char> output(input.size() * 2);
+
+    WriteAllArgs args = {
+        .fd = pair.slave.get(),
+        .data = input.data(),
+        .len = input.size(),
+        .written = 0,
+        .error = 0,
+    };
+    pthread_t writer = {};
+    ASSERT_EQ(0, pthread_create(&writer, nullptr, WriteAll, &args)) << "pthread_create failed";
+
+    ASSERT_EQ(0, tcflush(pair.slave.get(), TCIFLUSH))
+        << "tcflush(TCIFLUSH) failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    size_t total = 0;
+    int poll_error = 0;
+    bool read_ok = true;
+    while (total < output.size()) {
+        struct pollfd pfd = {
+            .fd = pair.master.get(),
+            .events = POLLIN | POLLHUP | POLLERR,
+            .revents = 0,
+        };
+        int ret = poll(&pfd, 1, 5000);
+        if (ret < 0 && errno == EINTR) {
+            continue;
+        }
+        if (ret <= 0) {
+            poll_error = ret < 0 ? errno : ETIMEDOUT;
+            read_ok = false;
+            break;
+        }
+        if ((pfd.revents & POLLIN) == 0) {
+            poll_error = EIO;
+            read_ok = false;
+            break;
+        }
+
+        ssize_t n = read(pair.master.get(), output.data() + total, output.size() - total);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            poll_error = n < 0 ? errno : EIO;
+            read_ok = false;
+            break;
+        }
+        total += static_cast<size_t>(n);
+    }
+
+    if (!read_ok) {
+        pair.slave.reset();
+        pair.master.reset();
+    }
+    ASSERT_EQ(0, pthread_join(writer, nullptr)) << "pthread_join failed";
+    ASSERT_TRUE(read_ok) << "timed out or failed after TCIFLUSH while draining PTY output: errno="
+                         << poll_error << " (" << strerror(poll_error) << "), total=" << total
+                         << ", expected=" << output.size()
+                         << ", writer_written=" << args.written
+                         << ", writer_errno=" << args.error;
+    ASSERT_EQ(0, args.error) << "writer failed after " << args.written << " bytes: errno="
+                             << args.error << " (" << strerror(args.error) << ")";
+    ASSERT_EQ(input.size(), args.written);
+    ASSERT_EQ(output.size(), total);
+    for (size_t i = 0; i < output.size(); i += 2) {
+        EXPECT_EQ('\r', output[i]);
+        EXPECT_EQ('\n', output[i + 1]);
     }
 }
 

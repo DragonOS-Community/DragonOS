@@ -219,16 +219,20 @@ impl TtyCore {
             }
             TtyFlushArg::TCIOFLUSH => {
                 tty.ldisc().flush_buffer(tty.clone())?;
+                tty.ldisc().flush_output(tty.clone())?;
                 let ret = tty.core().driver().driver_funcs().flush_buffer(tty.core());
                 if ret != Err(SystemError::ENOSYS) {
                     ret?;
                 }
+                tty.core().write_wq().wakeup_all();
             }
             TtyFlushArg::TCOFLUSH => {
+                tty.ldisc().flush_output(tty.clone())?;
                 let ret = tty.core().driver().driver_funcs().flush_buffer(tty.core());
                 if ret != Err(SystemError::ENOSYS) {
                     ret?;
                 }
+                tty.core().write_wq().wakeup_all();
             }
             _ => {
                 return Err(SystemError::EINVAL);

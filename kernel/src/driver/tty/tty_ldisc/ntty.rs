@@ -10,7 +10,7 @@ use system_error::SystemError;
 use crate::{
     arch::ipc::signal::Signal,
     driver::tty::{
-        pty::unix98pty::pty_drain_pending_to,
+        pty::unix98pty::{pty_discard_pending_to, pty_drain_pending_to},
         termios::{ControlCharIndex, InputMode, LocalMode, OutputMode, Termios},
         tty_core::{EchoOperation, TtyCore, TtyCoreData, TtyFlag, TtyIoctlCmd, TtyPacketStatus},
         tty_driver::{TtyDriverFlag, TtyDriverSubType, TtyOperation},
@@ -38,6 +38,11 @@ fn ntty_buf_mask(idx: usize) -> usize {
 
 fn is_ascii_control(c: u8) -> bool {
     c < b' ' || c == 0x7f
+}
+
+fn output_mode_has_xtabs(termios: &Termios) -> bool {
+    OutputMode::from_bits_truncate(termios.output_mode.bits() & OutputMode::TABDLY.bits())
+        == OutputMode::XTABS
 }
 
 #[derive(Debug)]
@@ -153,7 +158,7 @@ impl NTtyData {
             echo: false,
             cursor_column: 0,
             canon_cursor_column: 0,
-            opost_pending: Vec::new(),
+            opost_pending: Vec::with_capacity(NTTY_BUFSIZE),
             opost_pending_offset: 0,
             echo_tail: 0,
             read_buf: vec![0; NTTY_BUFSIZE].into_boxed_slice().try_into().unwrap(),
@@ -185,6 +190,38 @@ impl NTtyData {
             self.opost_pending.clear();
             self.opost_pending_offset = 0;
         }
+    }
+
+    fn opost_char_space(&self, termios: &Termios, c: u8) -> usize {
+        if c as usize == 8 {
+            return 1;
+        }
+
+        match c as char {
+            '\n' if termios.output_mode.contains(OutputMode::ONLCR) => 2,
+            '\r' if termios.output_mode.contains(OutputMode::ONOCR) && self.cursor_column == 0 => 0,
+            '\t' if output_mode_has_xtabs(termios) => (8 - (self.cursor_column & 7)) as usize,
+            _ => 1,
+        }
+    }
+
+    fn opost_progress_possible(
+        &self,
+        termios: &Termios,
+        next_input: Option<u8>,
+        write_room: usize,
+    ) -> bool {
+        if !self.opost_pending_bytes().is_empty() {
+            return write_room > 0;
+        }
+
+        let Some(c) = next_input else {
+            return false;
+        };
+        if write_room == 0 {
+            return false;
+        }
+        self.opost_char_space(termios, c) <= write_room
     }
 
     #[inline]
@@ -1435,9 +1472,7 @@ impl NTtyData {
             '\t' => {
                 // 计算输出一个\t需要的空间
                 let spaces = 8 - (self.cursor_column & 7) as usize;
-                if termios.output_mode.contains(OutputMode::TABDLY)
-                    && OutputMode::TABDLY.bits() == OutputMode::XTABS.bits()
-                {
+                if output_mode_has_xtabs(&termios) {
                     // 配置的tab选项是真正输出空格到驱动
                     if space < spaces {
                         // 空间不够
@@ -1527,9 +1562,7 @@ impl NTtyData {
             }
             '\t' => {
                 let spaces = 8 - (self.cursor_column & 7) as usize;
-                if termios.output_mode.contains(OutputMode::TABDLY)
-                    && OutputMode::TABDLY.bits() == OutputMode::XTABS.bits()
-                {
+                if output_mode_has_xtabs(termios) {
                     if used + spaces > space {
                         return Err(SystemError::ENOBUFS);
                     }
@@ -1578,8 +1611,9 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         return self.set_termios(tty, None);
     }
 
-    fn close(&self, _tty: Arc<TtyCore>) -> Result<(), system_error::SystemError> {
-        todo!()
+    fn close(&self, tty: Arc<TtyCore>) -> Result<(), system_error::SystemError> {
+        self.flush_buffer(tty.clone())?;
+        self.flush_output(tty)
     }
 
     /// ## 重置缓冲区的基本信息
@@ -1597,12 +1631,13 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         ldata.pushing = false;
         ldata.lookahead_count = 0;
         ldata.no_room = false;
-        ldata.opost_pending.clear();
-        ldata.opost_pending_offset = 0;
 
         if core.link().is_some() {
             ldata.packet_mode_flush(core);
         }
+        drop(ldata);
+
+        let _ = pty_discard_pending_to(tty.clone());
 
         core.read_wq().wakeup_all();
         core.write_wq().wakeup_all();
@@ -1610,6 +1645,14 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         if let Some(link) = core.link() {
             link.core().write_wq().wakeup_all();
         }
+
+        Ok(())
+    }
+
+    fn flush_output(&self, _tty: Arc<TtyCore>) -> Result<(), system_error::SystemError> {
+        let mut ldata = self.disc_data();
+        ldata.opost_pending.clear();
+        ldata.opost_pending_offset = 0;
 
         Ok(())
     }
@@ -1642,24 +1685,28 @@ impl TtyLineDiscipline for NTtyLinediscipline {
 
         // 表示接着读
         if *cookie {
+            let tail = ldata.read_tail;
+            let is_canon = ldata.icanon && !termios.local_mode.contains(LocalMode::EXTPROC);
             // 规范且非拓展模式
-            if ldata.icanon && !termios.local_mode.contains(LocalMode::EXTPROC) {
+            if is_canon {
+                drop(termios);
                 // 跳过EOF字符
                 if len == 0 {
                     ldata.canon_skip_eof();
-                } else if ldata.canon_copy_from_read_buf(buf, &mut nr, &mut offset)? {
-                    return Ok(len - nr);
+                } else {
+                    let _ = ldata.canon_copy_from_read_buf(buf, &mut nr, &mut offset)?;
                 }
-            } else if ldata.copy_from_read_buf(termios, buf, &mut nr, &mut offset)? {
-                return Ok(len - nr);
+            } else {
+                let _ = ldata.copy_from_read_buf(termios, buf, &mut nr, &mut offset)?;
             }
 
-            // 没有数据可读
-
-            // todo: kick worker? or 关闭节流？
-
             *cookie = false;
-            return Ok(len - nr);
+            let read_tail_moved = tail != ldata.read_tail;
+            drop(ldata);
+            if read_tail_moved {
+                let _ = pty_drain_pending_to(tty.clone());
+            }
+            return Ok(offset);
         }
 
         drop(termios);
@@ -1748,8 +1795,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                 let more = ldata.canon_copy_from_read_buf(buf, &mut nr, &mut offset)?;
                 if more {
                     *cookie = true;
-                    offset += len - nr;
-                    return Ok(offset);
+                    break;
                 }
             } else {
                 // 非标准模式
@@ -1764,7 +1810,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                     && offset >= minimum
                 {
                     *cookie = true;
-                    return Ok(offset);
+                    break;
                 }
             }
 
@@ -1795,7 +1841,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         _flags: FileFlags,
     ) -> Result<usize, system_error::SystemError> {
         let mut nr = len;
-        let mut out_buf = Vec::with_capacity(len.saturating_mul(2).min(NTTY_BUFSIZE));
+        let mut out_buf = Vec::with_capacity(NTTY_BUFSIZE);
         let mut ldata = Some(self.disc_data());
         let pcb = ProcessManager::current_pcb();
         let binding = tty.clone();
@@ -1810,6 +1856,9 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         let mut offset = 0;
         loop {
             if pcb.has_pending_signal_fast() {
+                if offset != 0 {
+                    break;
+                }
                 return Err(SystemError::ERESTARTSYS);
             }
             if core.flags().contains(TtyFlag::HUPPED)
@@ -1817,15 +1866,22 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                     && core.driver().tty_driver_sub_type() != TtyDriverSubType::PtyMaster)
                 || core.flags().contains(TtyFlag::HUPPING)
             {
+                if offset != 0 {
+                    break;
+                }
                 return Err(SystemError::EIO);
             }
             if termios.output_mode.contains(OutputMode::OPOST) {
                 let mut made_progress = false;
-                let pending = ldata.as_ref().unwrap().opost_pending_bytes().to_vec();
+                out_buf.clear();
+                {
+                    let pending = ldata.as_ref().unwrap().opost_pending_bytes();
+                    out_buf.extend_from_slice(pending);
+                }
 
-                if !pending.is_empty() {
+                if !out_buf.is_empty() {
                     drop(ldata.take());
-                    let written = tty.write(core, &pending, pending.len())?;
+                    let written = tty.write(core, &out_buf, out_buf.len())?;
                     let mut guard = self.disc_data();
                     if written != 0 {
                         guard.advance_opost_pending(written);
@@ -1837,7 +1893,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                     }
                 } else {
                     out_buf.clear();
-                    let space = tty.write_room(core);
+                    let space = tty.write_room(core).min(out_buf.capacity());
                     let mut consumed = 0;
                     let (cursor_column, canon_cursor_column) = {
                         let ldata = ldata.as_ref().unwrap();
@@ -1928,8 +1984,34 @@ impl TtyLineDiscipline for NTtyLinediscipline {
             // 休眠一段时间
             // 获取到termios读锁，避免termios被更改导致行为异常
             drop(ldata.take());
-            core.write_wq()
-                .sleep(EPollEventType::EPOLLOUT.bits() as u64);
+            let wait_result = core.write_wq().wait_event_interruptible(
+                EPollEventType::EPOLLOUT.bits() as u64,
+                || {
+                    if core.flags().contains(TtyFlag::HUPPED)
+                        || (core.flags().contains(TtyFlag::OTHER_CLOSED)
+                            && core.driver().tty_driver_sub_type() != TtyDriverSubType::PtyMaster)
+                        || core.flags().contains(TtyFlag::HUPPING)
+                        || core.flags().contains(TtyFlag::LDISC_CHANGING)
+                    {
+                        return true;
+                    }
+
+                    let write_room = tty.write_room(core);
+                    if !termios.output_mode.contains(OutputMode::OPOST) {
+                        return write_room > 0;
+                    }
+
+                    let guard = self.disc_data();
+                    let next_input = if nr != 0 { Some(buf[offset]) } else { None };
+                    guard.opost_progress_possible(&termios, next_input, write_room)
+                },
+            );
+            if let Err(err) = wait_result {
+                if offset != 0 {
+                    break;
+                }
+                return Err(err);
+            }
             if termios.output_mode.contains(OutputMode::OPOST) {
                 ldata = Some(self.disc_data());
             }
@@ -2201,8 +2283,16 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         Ok(event.bits() as usize)
     }
 
-    fn hangup(&self, _tty: Arc<TtyCore>) -> Result<(), system_error::SystemError> {
-        todo!()
+    fn hangup(&self, tty: Arc<TtyCore>) -> Result<(), system_error::SystemError> {
+        self.flush_buffer(tty.clone())?;
+        self.flush_output(tty.clone())?;
+        tty.core().read_wq().wakeup_all();
+        tty.core().write_wq().wakeup_all();
+        if let Some(link) = tty.core().link() {
+            link.core().read_wq().wakeup_all();
+            link.core().write_wq().wakeup_all();
+        }
+        Ok(())
     }
 
     fn receive_buf(

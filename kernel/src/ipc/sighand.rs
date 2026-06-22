@@ -291,6 +291,17 @@ impl SigHand {
         g.flags.remove(flag);
     }
 
+    pub fn flags_test_and_clear(&self, flag: SignalFlags, clear: bool) -> bool {
+        let mut g = self.inner_mut();
+        if !g.flags.contains(flag) {
+            return false;
+        }
+        if clear {
+            g.flags.remove(flag);
+        }
+        true
+    }
+
     pub fn stop_signal(&self) -> Signal {
         self.inner().stop_signal
     }
@@ -450,11 +461,11 @@ fn default_sighandlers() -> Vec<Sigaction> {
     let mut r = vec![Sigaction::default(); MAX_SIG_NUM];
     let mut sig_ign = Sigaction::default();
     // 收到忽略的信号，重启系统调用
-    // Linux 对 SIGCHLD/SIGURG/SIGWINCH 默认忽略；这里显式设置 Ignore
+    // Linux ignores SIGURG/SIGWINCH by default; SIGCHLD is also ignored by default,
+    // but the handler must remain SIG_DFL to distinguish default ignore from explicit SIG_IGN.
     sig_ign.set_action(SigactionType::SaHandler(SaHandlerType::Ignore));
     sig_ign.flags_mut().insert(SigFlags::SA_RESTART);
 
-    r[Signal::SIGCHLD as usize - 1] = sig_ign;
     r[Signal::SIGURG as usize - 1] = sig_ign;
     r[Signal::SIGWINCH as usize - 1] = sig_ign;
 

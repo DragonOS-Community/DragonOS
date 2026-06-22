@@ -27,7 +27,7 @@ use system_error::SystemError;
 use crate::{
     arch::{
         cpu::current_cpu_id,
-        ipc::signal::{AtomicSignal, SigSet, Signal},
+        ipc::signal::{AtomicSignal, SigFlags, SigSet, Signal},
         process::ArchPCBInfo,
         CurrentIrqArch, SigStackArch,
     },
@@ -96,6 +96,7 @@ pub mod pid;
 pub mod posix_timer;
 pub mod preempt;
 pub mod process_group;
+pub mod ptrace;
 pub mod resource;
 pub mod rseq;
 pub mod seccomp;
@@ -106,12 +107,14 @@ pub mod stdio;
 pub mod syscall;
 pub mod timer;
 pub mod utils;
+pub mod wait;
 
 pub use cputime::ProcessCpuTime;
 
 /// 系统中所有进程的pcb
 static ALL_PROCESS: SpinLock<Option<HashMap<RawPid, Arc<ProcessControlBlock>>>> =
     SpinLock::new(None);
+static PTRACE_RELATION_LOCK: SpinLock<()> = SpinLock::new(());
 static NR_VISIBLE_THREADS: AtomicUsize = AtomicUsize::new(0);
 static TOTAL_FORKS: AtomicU64 = AtomicU64::new(0);
 static TOTAL_CONTEXT_SWITCHES: AtomicU64 = AtomicU64::new(0);
@@ -855,6 +858,7 @@ impl ProcessManager {
                     .adopt_childen()
                     .unwrap_or_else(|e| panic!("adopte_childen failed: error: {e:?}"))
             };
+            ProcessManager::exit_ptrace(current);
             // 在通知父进程之前，先标记为 Zombie，保证 wait 可见
             current.set_exit_state_zombie();
             let r = current.parent_pcb.read_irqsave().upgrade();
@@ -866,7 +870,24 @@ impl ProcessManager {
             // 检查子进程的 exit_signal，只有在正信号编号时才发送信号。
             // Linux 语义中 exit_signal=0 表示不发信号但仍可 wait，-1 表示非 leader 线程。
             let exit_signal = current.exit_signal.load(Ordering::SeqCst);
-            if exit_signal > 0 {
+            let sigchld_disposition = parent_pcb.sighand().handler(Signal::SIGCHLD);
+            let sigchld_ignored = sigchld_disposition
+                .as_ref()
+                .map(|sa| sa.is_ignore())
+                .unwrap_or(false);
+            let sigchld_no_cldwait = sigchld_disposition
+                .as_ref()
+                .map(|sa| sa.flags().contains(SigFlags::SA_NOCLDWAIT))
+                .unwrap_or(false);
+            let autoreap = !current.is_ptraced()
+                && exit_signal == Signal::SIGCHLD as i32
+                && (sigchld_ignored || sigchld_no_cldwait);
+            let is_kthread = current.is_kthread();
+            if autoreap && current.try_mark_dead_from_zombie() {
+                unsafe { ProcessManager::release(current.raw_pid()) };
+            }
+
+            if exit_signal > 0 && !(autoreap && sigchld_ignored) {
                 let r = crate::ipc::kill::send_signal_to_pcb(
                     parent_pcb.clone(),
                     Signal::from(exit_signal),
@@ -889,7 +910,7 @@ impl ProcessManager {
                 .wakeup_all(Some(ProcessState::Blocked(true)));
 
             // kthread 退出时显式唤醒 kthreadd，使其回收 zombie
-            if current.is_kthread() {
+            if is_kthread {
                 let _ = ProcessManager::wakeup(&parent_pcb);
             }
 
@@ -907,6 +928,7 @@ impl ProcessManager {
                         .wakeup_all(Some(ProcessState::Blocked(true)));
                 }
             }
+
             // todo: 这里还需要根据线程组的信息，决定信号的发送
         }
     }
@@ -1196,6 +1218,9 @@ impl ProcessManager {
     pub(super) unsafe fn release(pid: RawPid) {
         let pcb = ProcessManager::find(pid);
         if let Some(ref pcb) = pcb {
+            ProcessManager::exit_ptrace(pcb);
+            ProcessManager::ptrace_unlink_tracee(pcb);
+
             let parent_child_vpid = pcb.real_parent_pcb().and_then(|parent| {
                 let parent = ProcessManager::thread_group_leader_of(&parent);
                 let parent_ns = parent.active_pid_ns();
@@ -1216,6 +1241,14 @@ impl ProcessManager {
 
             ALL_PROCESS.lock_irqsave().as_mut().unwrap().remove(&pid);
         }
+    }
+
+    pub fn ptrace_unlink_tracee(tracee: &Arc<ProcessControlBlock>) {
+        ptrace::unlink_tracee(tracee)
+    }
+
+    pub fn exit_ptrace(tracer: &Arc<ProcessControlBlock>) {
+        ptrace::exit_ptrace(tracer)
     }
 
     /// 上下文切换完成后的钩子函数
@@ -1350,7 +1383,10 @@ pub enum ProcessState {
     Blocked(bool),
     /// 进程被信号终止
     Stopped,
-    /// 进程已经退出，usize表示进程的退出码
+    /// The process has exited; usize holds the raw wait status used by Linux wait(2) family.
+    ///
+    /// Normal exit: `(exit_code & 0xff) << 8`; signal termination: signal number in the low 7 bits.
+    /// wait4/waitpid return this value as-is; only waitid `si_status` needs decoding from it.
     Exited(usize),
 }
 
@@ -1412,13 +1448,23 @@ impl ProcessState {
         matches!(self, ProcessState::Stopped)
     }
 
-    /// Returns exit code if the process state is [`Exited`].
+    /// Returns raw wait status if the process state is [`Exited`].
     #[inline(always)]
-    pub fn exit_code(&self) -> Option<usize> {
+    pub fn raw_wstatus(&self) -> Option<usize> {
         match self {
             ProcessState::Exited(code) => Some(*code),
             _ => None,
         }
+    }
+
+    /// Returns raw wait status if the process state is [`Exited`].
+    ///
+    /// Kept for existing call sites; new wait code should prefer
+    /// [`ProcessState::raw_wstatus`] to avoid confusing raw wait status with
+    /// the user-visible exit code.
+    #[inline(always)]
+    pub fn exit_code(&self) -> Option<usize> {
+        self.raw_wstatus()
     }
 
     #[inline]
@@ -1492,6 +1538,8 @@ bitflags! {
         const DEFER_UNHASH = 1 << 14;
         /// PID links and visible-thread accounting have already been released.
         const PID_UNHASHED = 1 << 15;
+        /// Task is currently traced by another task.
+        const PTRACED = 1 << 16;
     }
 }
 
@@ -1620,6 +1668,10 @@ pub struct ProcessControlBlock {
 
     /// 子进程链表
     children: RwLock<Vec<RawPid>>,
+    /// Tasks currently traced by this process. Entries are global raw pids.
+    ptraced: RwLock<Vec<RawPid>>,
+    /// Current tracer if this process is ptraced.
+    ptracer_pcb: RwLock<Weak<ProcessControlBlock>>,
 
     /// 等待队列
     wait_queue: WaitQueue,
@@ -1791,6 +1843,8 @@ impl ProcessControlBlock {
                 real_parent_pcb: RwLock::new(ppcb.clone()),
                 fork_parent_pcb: RwLock::new(ppcb),
                 children: RwLock::new(Vec::new()),
+                ptraced: RwLock::new(Vec::new()),
+                ptracer_pcb: RwLock::new(Weak::new()),
                 wait_queue: WaitQueue::default(),
                 cputime_wait_queue: WaitQueue::default(),
                 thread: RwLock::new(ThreadInfo::new()),
@@ -2263,6 +2317,21 @@ impl ProcessControlBlock {
 
     pub fn real_parent_pcb(&self) -> Option<Arc<ProcessControlBlock>> {
         return self.real_parent_pcb.read_irqsave().upgrade();
+    }
+
+    pub fn ptracer_pcb(&self) -> Option<Arc<ProcessControlBlock>> {
+        ptrace::ptracer_of(&self.self_ref.upgrade()?)
+    }
+
+    pub fn is_ptraced(&self) -> bool {
+        ptrace::is_ptraced(self)
+    }
+
+    pub fn ptraced_pids(&self) -> Vec<RawPid> {
+        let Some(this) = self.self_ref.upgrade() else {
+            return Vec::new();
+        };
+        ptrace::tracees_of(&this)
     }
 
     pub fn fork_parent_pcb(&self) -> Option<Arc<ProcessControlBlock>> {

@@ -1,13 +1,14 @@
 use core::mem::size_of;
 
 use crate::arch::interrupt::TrapFrame;
+use crate::arch::syscall::nr::SYS_WAITID;
 use crate::ipc::signal_types::PosixSigInfo;
 use crate::process::abi::WaitOption;
 use crate::process::exit::kernel_waitid;
 use crate::process::resource::RUsage;
+use crate::process::wait::WaitSelector;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::UserBufferWriter;
-use crate::{arch::syscall::nr::SYS_WAITID, ipc::syscall::sys_kill::PidConverter};
 use alloc::vec::Vec;
 use system_error::SystemError;
 
@@ -65,7 +66,10 @@ impl Syscall for SysWaitId {
             return Err(SystemError::EINVAL);
         }
 
-        // 构造 infop writer（可选）
+        // which/upid → WaitSelector (P_ALL=0, P_PID=1, P_PGID=2, P_PIDFD=3)
+        let pid_selector = WaitSelector::from_waitid(which, upid)?;
+
+        // Build optional infop writer. Linux validates selector/options before touching user pointers.
         let infop_writer = if infop_ptr.is_null() {
             None
         } else {
@@ -83,30 +87,11 @@ impl Syscall for SysWaitId {
             Some(RUsage::default())
         };
 
-        // which/upid → PidConverter（约定：P_ALL=0, P_PID=1, P_PGID=2, P_PIDFD=3）
-        let pid_selector = match which {
-            0..=2 => {
-                match PidConverter::from_waitid(which, upid) {
-                    Some(converter) => converter,
-                    None => {
-                        // 根据POSIX标准，当进程不存在或已被回收时，应该返回ECHILD
-                        // 而不是ESRCH。这确保了与Linux行为的一致性。
-                        return Err(SystemError::ECHILD);
-                    }
-                }
-            }
-            3 => {
-                // P_PIDFD
-                return Err(SystemError::ENOSYS);
-            }
-            _ => return Err(SystemError::EINVAL),
-        };
-
         // 调用内核实现
-        let _ = kernel_waitid(pid_selector, infop_writer, options, tmp_rusage.as_mut())?;
+        let has_event = kernel_waitid(pid_selector, infop_writer, options, tmp_rusage.as_mut())?;
         // log::debug!("sys_waitid: kernel_waitid returned OK");
 
-        if !rusage_ptr.is_null() {
+        if has_event && !rusage_ptr.is_null() {
             let mut rusage_writer =
                 UserBufferWriter::new::<RUsage>(rusage_ptr, size_of::<RUsage>(), true)?;
             rusage_writer.copy_one_to_user(&tmp_rusage.unwrap(), 0)?;

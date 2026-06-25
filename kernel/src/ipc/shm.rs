@@ -628,10 +628,7 @@ impl ShmManager {
         }
     }
 
-    pub(crate) fn charge_memlock_for_shm(
-        size: usize,
-        _target_user_ns: &Arc<UserNamespace>,
-    ) -> Result<SysVShmMemlockToken, SystemError> {
+    pub(crate) fn charge_memlock_for_shm(size: usize) -> Result<SysVShmMemlockToken, SystemError> {
         let pcb = ProcessManager::current_pcb();
         let rlimit = pcb.get_rlimit(RLimitID::Memlock).rlim_cur;
         let bytes = size

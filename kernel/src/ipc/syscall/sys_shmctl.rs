@@ -95,13 +95,12 @@ pub(super) fn do_kernel_shmctl(
         }
         // 锁住共享内存段，不允许内存置换
         ShmCtlCmd::ShmLock => {
-            let target_user_ns = ProcessManager::current_ipcns().user_ns.clone();
             let begin = shm_manager_guard.shm_lock_begin(id)?;
             drop(shm_manager_guard);
             let reclassify = match begin {
                 ShmLockBegin::Done(reclassify) => reclassify,
                 ShmLockBegin::NeedCharge { size } => {
-                    let token = ShmManager::charge_memlock_for_shm(size, &target_user_ns)?;
+                    let token = ShmManager::charge_memlock_for_shm(size)?;
                     let ipcns = ProcessManager::current_ipcns();
                     let mut shm_manager_guard = ipcns.shm.lock();
                     shm_manager_guard.shm_lock_commit(id, token)?

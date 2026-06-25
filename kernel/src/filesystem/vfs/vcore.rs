@@ -768,12 +768,6 @@ where
         clear_suid_sgid_after_size_change(inode.as_ref())?;
     }
 
-    if result.is_ok() && len < old_size as usize {
-        if let Some(page_cache) = inode.page_cache() {
-            page_cache.truncate(len)?;
-        }
-    }
-
     result
 }
 

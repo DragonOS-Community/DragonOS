@@ -11,7 +11,7 @@ use crate::{
             VFS_MAX_FOLLOW_SYMLINK_TIMES,
         },
     },
-    libs::mutex::Mutex,
+    libs::{mutex::Mutex, rwsem::RwSem},
     mm::{
         fault::{PageFaultHandler, PageFaultMessage},
         VmFaultReason,
@@ -297,6 +297,7 @@ impl Ext4FileSystem {
                         dirty_state: super::inode::InodeDirtyState::empty(),
                     }),
                     Mutex::new(()),
+                    RwSem::new(()),
                 )
             });
 

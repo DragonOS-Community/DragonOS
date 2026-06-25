@@ -1,4 +1,5 @@
 pub mod generic_signal;
+pub mod id;
 pub mod kill;
 pub mod pipe;
 pub mod shm;

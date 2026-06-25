@@ -1,9 +1,8 @@
 use crate::arch::interrupt::TrapFrame;
-use crate::mm::mmu_gather::MmuGather;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::{
-    arch::{syscall::nr::SYS_SHMDT, MMArch},
-    mm::{ucontext::AddressSpace, MemoryManagementArch, VirtAddr, VirtRegion},
+    arch::syscall::nr::SYS_SHMDT,
+    mm::{ucontext::AddressSpace, VirtAddr},
     syscall::table::Syscall,
 };
 use alloc::vec::Vec;
@@ -42,28 +41,8 @@ impl Syscall for SysShmdtHandle {
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let vaddr = Self::vaddr(args);
         let current_address_space = AddressSpace::current()?;
-        let mut address_write_guard = current_address_space
-            .write_guard_no_reservation_conflict(VirtRegion::new(vaddr, MMArch::PAGE_SIZE));
-
-        // 获取vma
-        let vma = address_write_guard
-            .mappings
-            .contains(vaddr)
-            .ok_or(SystemError::EINVAL)?;
-
-        // 判断vaddr是否为起始地址
-        if vma.lock().region().start() != vaddr {
-            return Err(SystemError::EINVAL);
-        }
-
-        // Unmap via MmuGather: shootdown first, then free physical pages (INV-3).
-        {
-            let mut tlb = MmuGather::gather(&current_address_space);
-            vma.unmap(&mut address_write_guard.user_mapper.utable, &mut tlb);
-            tlb.finish();
-        }
-
-        return Ok(0);
+        current_address_space.detach_sysv_shm_wait(vaddr)?;
+        Ok(0)
     }
 }
 

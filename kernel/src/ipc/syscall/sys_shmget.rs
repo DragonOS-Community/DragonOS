@@ -3,7 +3,7 @@ use crate::arch::interrupt::TrapFrame;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::{
     arch::syscall::nr::SYS_SHMGET,
-    ipc::shm::{ShmFlags, ShmKey, IPC_PRIVATE},
+    ipc::shm::{ShmFlags, ShmKey, ShmManager, IPC_PRIVATE},
     process::ProcessManager,
     syscall::table::Syscall,
 };
@@ -34,37 +34,61 @@ pub(super) fn do_kernel_shmget(
         return Err(SystemError::ENOSYS);
     }
 
+    fn existing_segment_result(
+        shm_manager: &mut ShmManager,
+        id: crate::ipc::shm::ShmId,
+        size: usize,
+        shmflg: ShmFlags,
+    ) -> Result<usize, SystemError> {
+        if shmflg.contains(ShmFlags::IPC_CREAT | ShmFlags::IPC_EXCL) {
+            return Err(SystemError::EEXIST);
+        }
+
+        let kernel_shm = shm_manager.get_by_shmid_checked(id)?;
+        if size > kernel_shm.size() {
+            return Err(SystemError::EINVAL);
+        }
+
+        shm_manager.check_existing_key_permission(id, shmflg)?;
+        Ok(id.data())
+    }
+
     let ipcns = ProcessManager::current_ipcns();
-    let mut shm_manager_guard = ipcns.shm.lock();
 
     match key {
-        IPC_PRIVATE => shm_manager_guard.add(key, size, shmflg),
+        IPC_PRIVATE => {
+            let numpages = {
+                let shm_manager_guard = ipcns.shm.lock();
+                shm_manager_guard.validate_new_segment_size(size)?
+            };
+            let backing = ShmManager::create_default_backing(size)?;
+            let mut shm_manager_guard = ipcns.shm.lock();
+            shm_manager_guard.add_prepared(key, size, shmflg, backing, numpages)
+        }
         _ => {
-            let id = shm_manager_guard.contains_key(&key);
+            let create_numpages = {
+                let mut shm_manager_guard = ipcns.shm.lock();
+                let id = shm_manager_guard.contains_key(&key).copied();
 
-            if let Some(id) = id {
-                let id = *id;
-                if shmflg.contains(ShmFlags::IPC_CREAT | ShmFlags::IPC_EXCL) {
-                    // IPC_CREAT | IPC_EXCL with existing segment -> EEXIST (Linux semantics)
-                    return Err(SystemError::EEXIST);
+                if let Some(id) = id {
+                    return existing_segment_result(&mut shm_manager_guard, id, size, shmflg);
                 }
 
-                let kernel_shm = shm_manager_guard.get_mut(&id).ok_or(SystemError::EINVAL)?;
-
-                if size > kernel_shm.size() {
-                    // request_size > existing segment size -> EINVAL (Linux semantics)
-                    return Err(SystemError::EINVAL);
-                }
-
-                return Ok(id.data());
-            } else {
                 if !shmflg.contains(ShmFlags::IPC_CREAT) {
                     // no existing segment and no IPC_CREAT -> ENOENT (Linux semantics)
                     return Err(SystemError::ENOENT);
                 }
 
-                return shm_manager_guard.add(key, size, shmflg);
+                shm_manager_guard.validate_new_segment_size(size)?
+            };
+
+            let backing = ShmManager::create_default_backing(size)?;
+            let mut shm_manager_guard = ipcns.shm.lock();
+            if let Some(id) = shm_manager_guard.contains_key(&key).copied() {
+                return existing_segment_result(&mut shm_manager_guard, id, size, shmflg);
             }
+
+            shm_manager_guard.add_prepared(key, size, shmflg, backing, create_numpages)
         }
     }
 }
@@ -72,7 +96,7 @@ pub(super) fn do_kernel_shmget(
 impl SysShmgetHandle {
     #[inline(always)]
     fn key(args: &[usize]) -> ShmKey {
-        ShmKey::new(args[0])
+        ShmKey::new(args[0] as u32 as usize)
     }
 
     #[inline(always)]

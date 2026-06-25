@@ -12,6 +12,7 @@ use crate::{
     libs::{
         casting::DowncastArc,
         mutex::{Mutex, MutexGuard},
+        rwsem::RwSem,
     },
     mm::{truncate::truncate_inode_pages, MemoryManagementArch},
     time::PosixTimeSpec,
@@ -81,7 +82,11 @@ pub struct Ext4Inode {
 }
 
 #[derive(Debug)]
-pub struct LockedExt4Inode(pub(super) Mutex<Ext4Inode>, pub(super) Mutex<()>);
+pub struct LockedExt4Inode(
+    pub(super) Mutex<Ext4Inode>,
+    pub(super) Mutex<()>,
+    pub(super) RwSem<()>,
+);
 
 impl IndexNode for LockedExt4Inode {
     fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
@@ -208,6 +213,7 @@ impl IndexNode for LockedExt4Inode {
         if len == 0 {
             return Ok(0);
         }
+        let _size_guard = self.2.read();
         let buf = &buf[0..len];
 
         let (fs, inode_num, page_cache) = {
@@ -553,31 +559,51 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn resize(&self, len: usize) -> Result<(), SystemError> {
-        let guard = self.0.lock();
-        let ext4 = &guard.concret_fs().fs;
-        // 仅调整文件大小，其他属性保持不变
-        ext4.setattr(
-            guard.inner_inode_num,
-            another_ext4::SetAttr {
-                mode: None,
-                uid: None,
-                gid: None,
-                size: Some(len as u64),
-                atime: None,
-                mtime: None,
-                ctime: None,
-                crtime: None,
-            },
-        )
-        .map_err(SystemError::from)?;
-        drop(guard);
-        // 更新缓存的文件大小
+        let _size_guard = self.2.write();
+        let (fs, inode_num, page_cache, cached_size) = {
+            let guard = self.0.lock();
+            (
+                guard.concret_fs(),
+                guard.inner_inode_num,
+                guard.page_cache.clone(),
+                guard.cached_file_size,
+            )
+        };
+        let old_size = match cached_size {
+            Some(size) => size,
+            None => fs.fs.getattr(inode_num)?.size,
+        };
         {
-            let mut guard = self.0.lock();
-            guard.cached_file_size = Some(len as u64);
-            guard
-                .dirty_state
-                .remove(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY);
+            let _io_guard = self.1.lock();
+            let ext4 = &fs.fs;
+            // 仅调整文件大小，其他属性保持不变
+            ext4.setattr(
+                inode_num,
+                another_ext4::SetAttr {
+                    mode: None,
+                    uid: None,
+                    gid: None,
+                    size: Some(len as u64),
+                    atime: None,
+                    mtime: None,
+                    ctime: None,
+                    crtime: None,
+                },
+            )
+            .map_err(SystemError::from)?;
+            // 更新缓存的文件大小
+            {
+                let mut guard = self.0.lock();
+                guard.cached_file_size = Some(len as u64);
+                guard
+                    .dirty_state
+                    .remove(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY);
+            }
+        }
+        if len < old_size as usize {
+            if let Some(page_cache) = page_cache {
+                page_cache.truncate(len)?;
+            }
         }
         Ok(())
     }
@@ -1004,6 +1030,7 @@ impl LockedExt4Inode {
             LockedExt4Inode(
                 Mutex::new(Ext4Inode::new(inode_num, fs_ptr.clone(), dname, parent)),
                 Mutex::new(()),
+                RwSem::new(()),
             )
         });
         let mut guard = inode.0.lock();

@@ -63,6 +63,13 @@ struct EchoStep {
     canon_cursor_column: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpostCharResult {
+    Emitted,
+    ConsumedWithoutOutput,
+    NeedsMoreRoom,
+}
+
 impl NTtyLinediscipline {
     #[inline]
     pub fn disc_data(&self) -> SpinLockGuard<'_, NTtyData> {
@@ -1487,10 +1494,10 @@ impl NTtyData {
         mut c: u8,
         out: &mut Vec<u8>,
         space: usize,
-    ) -> Result<usize, SystemError> {
+    ) -> OpostCharResult {
         let used = out.len();
         if used >= space {
-            return Err(SystemError::ENOBUFS);
+            return OpostCharResult::NeedsMoreRoom;
         }
 
         if c as usize == 8 {
@@ -1498,7 +1505,7 @@ impl NTtyData {
                 self.cursor_column -= 1;
             }
             out.push(c);
-            return Ok(1);
+            return OpostCharResult::Emitted;
         }
 
         match c as char {
@@ -1508,18 +1515,18 @@ impl NTtyData {
                 }
                 if termios.output_mode.contains(OutputMode::ONLCR) {
                     if used + 2 > space {
-                        return Err(SystemError::ENOBUFS);
+                        return OpostCharResult::NeedsMoreRoom;
                     }
                     self.cursor_column = 0;
                     self.canon_cursor_column = 0;
                     out.extend_from_slice(b"\r\n");
-                    return Ok(2);
+                    return OpostCharResult::Emitted;
                 }
                 self.canon_cursor_column = self.cursor_column;
             }
             '\r' => {
                 if termios.output_mode.contains(OutputMode::ONOCR) && self.cursor_column == 0 {
-                    return Ok(0);
+                    return OpostCharResult::ConsumedWithoutOutput;
                 }
 
                 if termios.output_mode.contains(OutputMode::OCRNL) {
@@ -1537,11 +1544,11 @@ impl NTtyData {
                 let spaces = 8 - (self.cursor_column & 7) as usize;
                 if output_mode_has_xtabs(termios) {
                     if used + spaces > space {
-                        return Err(SystemError::ENOBUFS);
+                        return OpostCharResult::NeedsMoreRoom;
                     }
                     self.cursor_column += spaces as u32;
                     out.extend_from_slice(&b"        "[..spaces]);
-                    return Ok(spaces);
+                    return OpostCharResult::Emitted;
                 }
                 self.cursor_column += spaces as u32;
             }
@@ -1561,7 +1568,7 @@ impl NTtyData {
         }
 
         out.push(c);
-        Ok(1)
+        OpostCharResult::Emitted
     }
 
     fn simple_output_block_len(&self, termios: &Termios, buf: &[u8], limit: usize) -> usize {
@@ -1921,30 +1928,23 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                         let mut guard = self.disc_data();
                         let cursor_column = guard.cursor_column;
                         let canon_cursor_column = guard.canon_cursor_column;
-                        match guard.process_output_char_to_buf(
+                        let opost_result = guard.process_output_char_to_buf(
                             &termios,
                             buf[offset],
                             &mut out_buf,
                             space,
-                        ) {
-                            Ok(_) => {}
-                            Err(SystemError::ENOBUFS) => {
-                                guard.cursor_column = cursor_column;
-                                guard.canon_cursor_column = canon_cursor_column;
-                            }
-                            Err(err) => {
-                                guard.cursor_column = cursor_column;
-                                guard.canon_cursor_column = canon_cursor_column;
-                                return Err(err);
-                            }
+                        );
+                        if opost_result == OpostCharResult::NeedsMoreRoom {
+                            guard.cursor_column = cursor_column;
+                            guard.canon_cursor_column = canon_cursor_column;
                         }
                         drop(guard);
 
-                        if out_buf.is_empty() {
+                        if opost_result == OpostCharResult::ConsumedWithoutOutput {
                             offset += 1;
                             nr -= 1;
                             made_progress = true;
-                        } else {
+                        } else if opost_result == OpostCharResult::Emitted {
                             let mut sent = 0;
                             while sent < out_buf.len() {
                                 let written =

@@ -30,7 +30,7 @@ impl Syscall for SysMsyncHandle {
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let start = VirtAddr::new(Self::start_vaddr(args));
         let mut len = Self::len(args);
-        let flags = MsFlags::from_bits_truncate(Self::flags(args));
+        let flags = MsFlags::from_bits(Self::flags(args)).ok_or(SystemError::EINVAL)?;
 
         // 检查 start 地址是否页对齐
         if !start.check_aligned(MMArch::PAGE_SIZE) {

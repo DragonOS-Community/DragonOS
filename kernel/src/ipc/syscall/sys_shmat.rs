@@ -3,19 +3,14 @@ use crate::arch::interrupt::TrapFrame;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::{
     arch::syscall::nr::SYS_SHMAT,
-    arch::MMArch,
     ipc::shm::{ShmFlags, ShmId},
-    libs::align::page_align_up,
     mm::{
-        allocator::page_frame::{PageFrameCount, PhysPageFrame, VirtPageFrame},
-        mmu_gather::MmuGather,
-        page::{page_manager_lock, DeferredFlusher, EntryFlags},
-        syscall::ProtFlags,
-        ucontext::{AddressSpace, PhysmapParams, VMA},
-        VirtAddr, VirtRegion, VmFlags,
+        syscall::{MapFlags, ProtFlags},
+        ucontext::{AddressSpace, FileMappingWithFileArgs},
+        MemoryManagementArch, VirtAddr,
     },
     process::ProcessManager,
-    syscall::{table::Syscall, user_access::UserBufferReader},
+    syscall::table::Syscall,
 };
 use syscall_table_macros::declare_syscall;
 use system_error::SystemError;
@@ -38,127 +33,101 @@ pub(super) fn do_kernel_shmat(
     vaddr: VirtAddr,
     shmflg: ShmFlags,
 ) -> Result<usize, SystemError> {
+    let user_supplied_addr = vaddr.data() != 0;
+    let mut addr = vaddr;
+    let shmlba = crate::arch::MMArch::SHMLBA;
+
+    if user_supplied_addr {
+        if !addr.check_aligned(shmlba) {
+            if shmflg.contains(ShmFlags::SHM_RND) {
+                addr = VirtAddr::new(addr.data() & !(shmlba - 1));
+                if addr.data() == 0 && shmflg.contains(ShmFlags::SHM_REMAP) {
+                    return Err(SystemError::EINVAL);
+                }
+            } else {
+                return Err(SystemError::EINVAL);
+            }
+        }
+    } else if shmflg.contains(ShmFlags::SHM_REMAP) {
+        return Err(SystemError::EINVAL);
+    }
+
     let ipcns = ProcessManager::current_ipcns();
     let current_address_space = AddressSpace::current()?;
 
-    let size = {
+    let attach_guard = {
         let mut shm_manager_guard = ipcns.shm.lock();
-        let kernel_shm = shm_manager_guard.get_mut(&id).ok_or(SystemError::EINVAL)?;
-        page_align_up(kernel_shm.size())
+        shm_manager_guard.attach_begin(
+            ipcns.clone(),
+            id,
+            shmflg.contains(ShmFlags::SHM_RDONLY),
+            shmflg.contains(ShmFlags::SHM_EXEC),
+        )?
     };
-
-    let mut address_write_guard = if vaddr.data() == 0 {
-        current_address_space.write()
-    } else {
-        current_address_space.write_guard_no_reservation_conflict(VirtRegion::new(vaddr, size))
-    };
-
-    let mut shm_manager_guard = ipcns.shm.lock();
-    let kernel_shm = shm_manager_guard.get_mut(&id).ok_or(SystemError::EINVAL)?;
-    let mut phys = PhysPageFrame::new(kernel_shm.start_paddr());
-    let count = PageFrameCount::from_bytes(size).unwrap();
-    let r = match vaddr.data() {
-        // 找到空闲区域并映射到共享内存
-        0 => {
-            // 找到空闲区域
-            let region = address_write_guard
-                .mappings
-                .find_free(vaddr, size)
-                .ok_or(SystemError::EINVAL)?;
-            let vm_flags = VmFlags::from(shmflg);
-            let destination = VirtPageFrame::new(region.start());
-            let page_flags: EntryFlags<MMArch> =
-                EntryFlags::from_prot_flags(ProtFlags::from(vm_flags), true);
-            // New region mapping: no prior PTE, no TLB shootdown needed;
-            // use DeferredFlusher to silently consume internal PageFlush tokens.
-            let flusher = DeferredFlusher::new();
-
-            // 将共享内存映射到对应虚拟区域
-            let params = PhysmapParams {
-                phys,
-                destination,
-                count,
-                vm_flags,
-                flags: page_flags,
-                shm_id: Some(id),
-            };
-            let vma = VMA::physmap(params, &mut address_write_guard.user_mapper.utable, flusher)?;
-
-            // 将VMA加入到当前进程的VMA列表中
-            address_write_guard.mappings.insert_vma(vma);
-
-            region.start().data()
+    let size = attach_guard
+        .size()
+        .checked_add(crate::arch::MMArch::PAGE_SIZE - 1)
+        .ok_or(SystemError::EINVAL)?
+        & !(crate::arch::MMArch::PAGE_SIZE - 1);
+    if user_supplied_addr {
+        let end = addr.data().checked_add(size).ok_or(SystemError::EINVAL)?;
+        if end > crate::arch::MMArch::USER_END_VADDR.data() {
+            return Err(SystemError::EINVAL);
         }
-        // 指定虚拟地址
-        _ => {
-            // 获取对应vma
-            let vma = address_write_guard
-                .mappings
-                .contains(vaddr)
-                .ok_or(SystemError::EINVAL)?;
-            if vma.lock().region().start() != vaddr {
-                return Err(SystemError::EINVAL);
-            }
+    }
 
-            // 验证用户虚拟内存区域是否有效
-            let _ = UserBufferReader::new(vaddr.data() as *const u8, size, true)?;
+    let readonly = shmflg.contains(ShmFlags::SHM_RDONLY);
+    let sysv_attach = attach_guard.create_attach(readonly)?;
+    let attach_file = sysv_attach.attach_file();
+    let mut prot_flags = ProtFlags::PROT_READ;
+    if !readonly {
+        prot_flags |= ProtFlags::PROT_WRITE;
+    }
+    if shmflg.contains(ShmFlags::SHM_EXEC) {
+        prot_flags |= ProtFlags::PROT_EXEC;
+    }
+    let mut map_flags = MapFlags::MAP_SHARED;
+    if user_supplied_addr {
+        if shmflg.contains(ShmFlags::SHM_REMAP) {
+            map_flags |= MapFlags::MAP_FIXED;
+        } else {
+            // Linux checks the no-remap collision while holding mmap_write_lock.
+            // Use DragonOS' no-replace fixed mapping path so the conflict check
+            // and VMA insertion are performed atomically under the address-space
+            // write lock instead of relying on a syscall-layer pre-check.
+            map_flags |= MapFlags::MAP_FIXED_NOREPLACE;
+        }
+    }
 
-            // 必须在取消映射前获取到EntryFlags
-            let page_flags = address_write_guard
-                .user_mapper
-                .utable
-                .translate(vaddr)
-                .ok_or(SystemError::EINVAL)?
-                .1;
-
-            // Unmap the old mapping via MmuGather: cross-core shootdown first, then free physical pages (INV-3).
+    let mapped = current_address_space
+        .file_mapping_with_file_ext(FileMappingWithFileArgs {
+            file: attach_file,
+            start_vaddr: addr,
+            len: size,
+            prot_flags,
+            map_flags,
+            may_exec: true,
+            offset: 0,
+            round_to_min: !user_supplied_addr,
+            allocate_at_once: false,
+            sysv_shm: Some(sysv_attach),
+            fixed_noreplace_conflict_error_before_mmap_min: if user_supplied_addr
+                && !shmflg.contains(ShmFlags::SHM_REMAP)
             {
-                let mut tlb = MmuGather::gather(&current_address_space);
-                vma.unmap(&mut address_write_guard.user_mapper.utable, &mut tlb);
-                tlb.finish();
+                Some(SystemError::EINVAL)
+            } else {
+                None
+            },
+        })
+        .map_err(|err| {
+            if err == SystemError::EEXIST && map_flags.contains(MapFlags::MAP_FIXED_NOREPLACE) {
+                SystemError::EINVAL
+            } else {
+                err
             }
-
-            // 将该虚拟内存区域映射到共享内存区域
-            let mut page_manager_guard = page_manager_lock();
-            let mut virt = VirtPageFrame::new(vaddr);
-            for _ in 0..count.data() {
-                let r = unsafe {
-                    address_write_guard.user_mapper.utable.map_phys(
-                        virt.virt_address(),
-                        phys.phys_address(),
-                        page_flags,
-                    )
-                }
-                .expect("Failed to map zero, may be OOM error");
-                r.flush();
-
-                // 将vma加入到对应Page的anon_vma
-                page_manager_guard
-                    .get_unwrap(&phys.phys_address())
-                    .write()
-                    .insert_vma(vma.clone());
-
-                phys = phys.next();
-                virt = virt.next();
-            }
-
-            // 更新vma的映射状态
-            let mut vma_guard = vma.lock();
-            vma_guard.set_mapped(true);
-            vma_guard.set_shm_id(Some(id));
-            drop(vma_guard);
-
-            vaddr.data()
-        }
-    };
-
-    // 更新最后一次连接时间
-    kernel_shm.update_atim();
-
-    // 映射计数增加
-    kernel_shm.increase_count();
-
-    Ok(r)
+        })?;
+    attach_guard.finish();
+    Ok(mapped.virt_address().data())
 }
 
 impl SysShmatHandle {

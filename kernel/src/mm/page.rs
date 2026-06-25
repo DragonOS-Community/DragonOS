@@ -228,7 +228,9 @@ impl PageManager {
         let page = Page::copy(old_page.read(), paddr)
             .inspect_err(|_| unsafe { allocator.free_one(paddr) })?;
         if let Some(page_type) = page_type {
-            page.write().set_page_type(page_type);
+            let mut guard = page.write();
+            guard.set_page_type(page_type);
+            guard.clear_mapping_unevictable_source_for_cow();
         }
 
         self.insert(&page)?;
@@ -357,6 +359,10 @@ impl PageReclaimer {
         for page in victims {
             let mut guard = page.write();
             if let PageType::File(info) = guard.page_type().clone() {
+                if guard.flags().contains(PageFlags::PG_UNEVICTABLE) {
+                    continue;
+                }
+
                 // Never evict a file-backed page that is still mapped into any VMA.
                 // Our eviction path removes the page from page_cache/page_manager; dropping a
                 // still-mapped page will trip InnerPage::drop assertions and can crash userland.
@@ -383,11 +389,17 @@ impl PageReclaimer {
                         let _ = page_cache.manager().writeback_page(page_index);
                     } else {
                         let mut guard = page.write();
-                        Self::page_writeback(&mut guard, true);
+                        guard.remove_flags(PageFlags::PG_DIRTY | PageFlags::PG_WRITEBACK);
+                        drop(guard);
+                        page_manager_lock().remove_page(&paddr);
+                        continue;
                     }
 
                     guard = page.write();
-                    if guard.flags().contains(PageFlags::PG_DIRTY) {
+                    if guard.flags().intersects(
+                        PageFlags::PG_DIRTY | PageFlags::PG_WRITEBACK | PageFlags::PG_UNEVICTABLE,
+                    ) || guard.map_count() != 0
+                    {
                         drop(guard);
                         page_reclaimer_lock().insert_page(paddr, &page);
                         continue;
@@ -398,13 +410,22 @@ impl PageReclaimer {
                 //
                 // FileMapInfo 内保存 Weak<PageCache> 以避免 PageCache <-> Page 的强引用环。
                 // 如果此时 PageCache 已被释放（upgrade 失败），说明其 pages 映射也已销毁，无需再 remove。
-                if let Some(page_cache) = info.page_cache.upgrade() {
-                    if !page_cache.is_page_ready(page_index) {
-                        drop(guard);
+                let page_cache = info.page_cache.upgrade();
+                drop(guard);
+
+                if let Some(page_cache) = page_cache {
+                    if !page_cache.manager().supports_clean_reclaim() {
+                        continue;
+                    }
+                    let removed = page_cache
+                        .manager()
+                        .remove_clean_page_for_reclaim(page_index, &page)
+                        .ok()
+                        .flatten();
+                    if removed.is_none() {
                         page_reclaimer_lock().insert_page(paddr, &page);
                         continue;
                     }
-                    let _ = page_cache.manager().remove_page(page_index);
                 }
                 page_manager_lock().remove_page(&paddr);
             }
@@ -462,6 +483,10 @@ impl PageReclaimer {
         if let Ok(unmapped_vmas) = page_cache.mkclean_page(page_index, unmap) {
             for vma in unmapped_vmas {
                 guard.remove_vma(vma.as_ref());
+            }
+            if guard.flags().contains(PageFlags::PG_UNEVICTABLE) && !guard.has_unevictable_source()
+            {
+                guard.remove_flags(PageFlags::PG_UNEVICTABLE);
             }
         }
 
@@ -671,6 +696,19 @@ impl Page {
 pub struct InnerPage {
     /// 映射到当前page的VMA
     vma_set: HashSet<Arc<LockedVMA>>,
+    /// 当前对该页贡献 mlock/unevictable 原因的 VMA 子集。
+    ///
+    /// 该集合必须始终是 `vma_set` 的子集。它让 page-cache reclassify
+    /// 可以 O(1) 判断页是否仍因 VMA mlock 不可回收，而不需要反向锁住所有 VMA。
+    mlocked_vmas: HashSet<Arc<LockedVMA>>,
+    /// 内核子系统显式创建的 non-page-cache unevictable 页。
+    intrinsic_unevictable: bool,
+    /// Backing object lifetime pins.
+    ///
+    /// 这只表达“页面仍被 backing 对象拥有，不能从 page_manager 释放”，不表达
+    /// reclaim policy，也不应设置 `PG_UNEVICTABLE`。shared-anon backing 使用它
+    /// 替代旧的 `PG_UNEVICTABLE` lifetime workaround。
+    backing_lifetime_pins: usize,
     /// 标志
     flags: PageFlags,
     /// 页面所在物理地址
@@ -681,8 +719,13 @@ pub struct InnerPage {
 
 impl InnerPage {
     pub fn new(phys_addr: PhysAddr, page_type: PageType, flags: PageFlags) -> Self {
+        let intrinsic_unevictable =
+            flags.contains(PageFlags::PG_UNEVICTABLE) && !matches!(page_type, PageType::File(_));
         Self {
             vma_set: HashSet::new(),
+            mlocked_vmas: HashSet::new(),
+            intrinsic_unevictable,
+            backing_lifetime_pins: 0,
             flags,
             phys_addr,
             page_type,
@@ -690,18 +733,29 @@ impl InnerPage {
     }
 
     /// 将vma加入anon_vma
-    pub fn insert_vma(&mut self, vma: Arc<LockedVMA>) {
+    pub fn insert_vma(&mut self, vma: Arc<LockedVMA>, vma_mlocked: bool) {
         let was_mapped = self.map_count() > 0;
-        self.vma_set.insert(vma);
+        let inserted = self.vma_set.insert(vma.clone());
+        if inserted && vma_mlocked {
+            self.mlocked_vmas.insert(vma);
+            self.flags.insert(PageFlags::PG_UNEVICTABLE);
+        }
         if !was_mapped && matches!(self.page_type, PageType::File(_)) {
             pc_stats::inc_file_mapped();
         }
     }
 
     /// 将vma从anon_vma中删去
+    ///
+    /// This only removes the VMA from the page-level source sets.  Callers that
+    /// may have removed the last unevictable source must subsequently run
+    /// `InnerAddressSpace::remove_page_unevictable_if_unneeded`.
     pub fn remove_vma(&mut self, vma: &LockedVMA) {
         let was_mapped = self.map_count() > 0;
         let removed = self.vma_set.remove(vma);
+        if removed {
+            self.mlocked_vmas.remove(vma);
+        }
         if removed
             && was_mapped
             && self.map_count() == 0
@@ -713,11 +767,76 @@ impl InnerPage {
 
     /// 判断当前物理页是否能被回
     pub fn can_deallocate(&self) -> bool {
-        self.map_count() == 0 && !self.flags.contains(PageFlags::PG_UNEVICTABLE)
+        self.map_count() == 0
+            && !self.flags.contains(PageFlags::PG_UNEVICTABLE)
+            && self.backing_lifetime_pins == 0
+    }
+
+    /// Whether a VMA unmap may release this page from the global page manager.
+    ///
+    /// Page-cache backed pages are owned by their address_space/PageCache.  VMA
+    /// teardown only removes PTE/rmap state; the page cache eviction path is the
+    /// authority that unlinks and drops those pages from page_manager.
+    pub fn can_deallocate_after_vma_unmap(&self) -> bool {
+        self.can_deallocate() && !matches!(self.page_type, PageType::File(_))
     }
 
     pub fn shared(&self) -> bool {
         self.map_count() > 1
+    }
+
+    pub fn add_mlocked_vma_ref(&mut self, vma: &Arc<LockedVMA>) {
+        if self.vma_set.contains(vma) && self.mlocked_vmas.insert(vma.clone()) {
+            self.flags.insert(PageFlags::PG_UNEVICTABLE);
+        }
+    }
+
+    pub fn remove_mlocked_vma_ref(&mut self, vma: &Arc<LockedVMA>) {
+        self.mlocked_vmas.remove(vma);
+    }
+
+    pub fn clear_unlinked_file_mapping_unevictable(&mut self) {
+        if matches!(self.page_type, PageType::File(_))
+            && self.map_count() == 0
+            && !self.has_mlocked_vma_refs()
+        {
+            self.flags.remove(PageFlags::PG_UNEVICTABLE);
+        }
+    }
+
+    #[inline(always)]
+    pub fn has_mlocked_vma_refs(&self) -> bool {
+        !self.mlocked_vmas.is_empty()
+    }
+
+    pub fn has_unevictable_source(&self) -> bool {
+        self.intrinsic_unevictable
+            || self.has_mlocked_vma_refs()
+            || self
+                .page_cache()
+                .map(|page_cache| page_cache.mapping_unevictable())
+                .unwrap_or(false)
+    }
+
+    pub fn clear_mapping_unevictable_source_for_cow(&mut self) {
+        self.intrinsic_unevictable = false;
+        if !self.has_unevictable_source() {
+            self.flags.remove(PageFlags::PG_UNEVICTABLE);
+        }
+    }
+
+    pub fn add_backing_lifetime_pin(&mut self) {
+        self.backing_lifetime_pins = self
+            .backing_lifetime_pins
+            .checked_add(1)
+            .expect("backing lifetime pin count overflow");
+    }
+
+    pub fn remove_backing_lifetime_pin(&mut self) {
+        self.backing_lifetime_pins = self
+            .backing_lifetime_pins
+            .checked_sub(1)
+            .expect("backing lifetime pin count underflow");
     }
 
     pub fn page_cache(&self) -> Option<Arc<PageCache>> {
@@ -1587,7 +1706,11 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
             .ok()?;
         drop(page_manager_guard);
         let phys = page.phys_address();
-        return self.map_phys(virt, phys, flags);
+        let mapped = self.map_phys(virt, phys, flags);
+        if mapped.is_none() {
+            let _ = page_manager_lock().remove_page(&phys);
+        }
+        return mapped;
     }
 
     /// 映射一个物理页到指定的虚拟地址

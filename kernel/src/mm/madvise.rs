@@ -1,86 +1,31 @@
+use crate::arch::mm::PageMapper;
 use system_error::SystemError;
 
-use crate::arch::{mm::PageMapper, MMArch};
-
-use super::{
-    mmu_gather::MmuGather, syscall::MadvFlags, ucontext::LockedVMA, MemoryManagementArch, VirtAddr,
-    VmFlags,
-};
+use super::{mmu_gather::MmuGather, syscall::MadvFlags, ucontext::LockedVMA, VmFlags};
 
 impl LockedVMA {
-    pub fn do_madvise(
+    pub fn madvise_updated_flags(
         &self,
         behavior: MadvFlags,
-        mapper: &mut PageMapper,
-        tlb: &mut MmuGather<'_>,
-    ) -> Result<(), SystemError> {
-        //TODO https://code.dragonos.org.cn/xref/linux-6.6.21/mm/madvise.c?fi=madvise#do_madvise
-        let mut vma = self.lock();
+    ) -> Result<Option<VmFlags>, SystemError> {
+        let vma = self.lock();
         let mut new_flags = *vma.vm_flags();
         match behavior {
             MadvFlags::MADV_DONTNEED | MadvFlags::MADV_DONTNEED_LOCKED => {
-                if behavior == MadvFlags::MADV_DONTNEED
-                    && vma.vm_flags().contains(VmFlags::VM_LOCKED)
-                {
-                    return Err(SystemError::EINVAL);
-                }
-
-                // MADV_DONTNEED: 释放指定范围内的页面
-                // 这是glibc在pthread_create时用来管理线程栈的关键操作
-                // 参考: https://code.dragonos.org.cn/xref/linux-6.6.21/mm/madvise.c#madvise_dontneed_single_vma
-
-                let region = *vma.region();
-                drop(vma);
-
-                // 遍历VMA覆盖的所有页面，解除映射
-                let start_page = region.start();
-                let end_page = region.end();
-                let mut current_page = start_page;
-
-                while current_page < end_page {
-                    let virt_addr = VirtAddr::new(current_page.data());
-                    if let Some((_paddr, _)) = mapper.translate(virt_addr) {
-                        // 只有当页面已经映射时才需要解除映射
-                        unsafe {
-                            if let Some((_, _, flush)) = mapper.unmap_phys(virt_addr, false) {
-                                // Local PTE cleared; actual TLB invalidation is performed uniformly by MmuGather.
-                                // Note: the current implementation does not reclaim physical pages (keeping legacy
-                                // behavior). To support real reclamation of anon pages in the future, call
-                                // `tlb.stash_paddr(_paddr)` here.
-                                flush.ignore();
-                                tlb.accumulate_range(virt_addr);
-                            }
-                        }
-                    }
-                    current_page = VirtAddr::new(current_page.data() + MMArch::PAGE_SIZE);
-                }
-
-                return Ok(());
+                debug_assert!(
+                    false,
+                    "MADV_DONTNEED is a range operation, not a VMA flag update"
+                );
+                return Ok(None);
             }
 
-            MadvFlags::MADV_REMOVE => {
-                // TODO
-            }
-
-            MadvFlags::MADV_WILLNEED => {
-                // TODO
-            }
-
-            MadvFlags::MADV_COLD => {
-                // TODO
-            }
-
-            MadvFlags::MADV_PAGEOUT => {
-                // TODO
-            }
-
-            MadvFlags::MADV_FREE => {
-                // TODO
-            }
-
-            MadvFlags::MADV_POPULATE_READ | MadvFlags::MADV_POPULATE_WRITE => {
-                // TODO
-            }
+            MadvFlags::MADV_REMOVE
+            | MadvFlags::MADV_WILLNEED
+            | MadvFlags::MADV_COLD
+            | MadvFlags::MADV_PAGEOUT
+            | MadvFlags::MADV_FREE
+            | MadvFlags::MADV_POPULATE_READ
+            | MadvFlags::MADV_POPULATE_WRITE => {}
 
             MadvFlags::MADV_NORMAL => {
                 new_flags = new_flags & !VmFlags::VM_RAND_READ & !VmFlags::VM_SEQ_READ
@@ -97,6 +42,10 @@ impl LockedVMA {
 
             MadvFlags::MADV_DOFORK => {
                 if vma.vm_flags().contains(VmFlags::VM_IO) {
+                    debug_assert!(
+                        false,
+                        "MADV_DOFORK on VM_IO must be rejected before VMA split"
+                    );
                     return Err(SystemError::EINVAL);
                 }
                 new_flags &= !VmFlags::VM_DONTCOPY;
@@ -104,6 +53,9 @@ impl LockedVMA {
 
             MadvFlags::MADV_WIPEONFORK => {
                 //MADV_WIPEONFORK仅支持匿名映射，后续实现其他映射方式后要在此处添加判断条件
+                if vma.vm_file().is_some() || vma.vm_flags().contains(VmFlags::VM_SHARED) {
+                    return Err(SystemError::EINVAL);
+                }
                 new_flags |= VmFlags::VM_WIPEONFORK;
             }
 
@@ -112,7 +64,15 @@ impl LockedVMA {
             MadvFlags::MADV_DONTDUMP => new_flags |= VmFlags::VM_DONTDUMP,
 
             //MADV_DODUMP不支持巨页映射，后续需要添加判断条件
-            MadvFlags::MADV_DODUMP => new_flags &= !VmFlags::VM_DONTDUMP,
+            MadvFlags::MADV_DODUMP => {
+                let special_flags = VmFlags::VM_IO | VmFlags::VM_PFNMAP | VmFlags::VM_DONTEXPAND;
+                if !vma.vm_flags().contains(VmFlags::VM_HUGETLB)
+                    && vma.vm_flags().intersects(special_flags)
+                {
+                    return Err(SystemError::EINVAL);
+                }
+                new_flags &= !VmFlags::VM_DONTDUMP;
+            }
 
             MadvFlags::MADV_MERGEABLE | MadvFlags::MADV_UNMERGEABLE => {}
 
@@ -121,7 +81,19 @@ impl LockedVMA {
             MadvFlags::MADV_COLLAPSE => {}
             _ => {}
         }
-        vma.set_vm_flags(new_flags);
-        Ok(())
+        Ok(Some(new_flags))
+    }
+
+    pub fn do_madvise(
+        &self,
+        behavior: MadvFlags,
+        _mapper: &mut PageMapper,
+        _tlb: &mut MmuGather<'_>,
+    ) {
+        //TODO https://code.dragonos.org.cn/xref/linux-6.6.21/mm/madvise.c?fi=madvise#do_madvise
+        let Ok(Some(new_flags)) = self.madvise_updated_flags(behavior) else {
+            return;
+        };
+        self.lock().set_vm_flags(new_flags);
     }
 }

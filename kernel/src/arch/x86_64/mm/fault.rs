@@ -12,7 +12,7 @@ use crate::{
     },
     exception::{extable::ExceptionTableManager, InterruptArch},
     ipc::{
-        signal::force_sig_fault_to_current,
+        signal::{force_kernel_signal_to_current, force_sig_fault_to_current},
         signal_types::{BUS_ADRERR, SEGV_ACCERR, SEGV_MAPERR},
     },
     mm::{
@@ -516,7 +516,9 @@ impl X86_64MMArch {
                     regs.rip,
                     fault
                 );
-                // TODO: OOM 处理
+                if let Err(err) = force_kernel_signal_to_current(Signal::SIGKILL) {
+                    error!("failed to send SIGKILL for page fault OOM: {:?}", err);
+                }
                 return;
             } else if fault.contains(VmFaultReason::VM_FAULT_SIGBUS)
                 || fault.contains(VmFaultReason::VM_FAULT_HWPOISON)

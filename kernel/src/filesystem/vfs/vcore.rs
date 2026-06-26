@@ -16,14 +16,22 @@ use crate::{
         procfs::procfs_init,
         sysfs::sysfs_init,
         vfs::{
-            mount::MountFlags, permission::PermissionMask, AtomicInodeId, FileSystem, FileType,
-            InodeFlags, InodeMode, MountFS,
+            file::{File, FileMode, FilePrivateData},
+            mount::MountFlags,
+            permission::PermissionMask,
+            AtomicInodeId, FileSystem, FileType, InodeFlags, InodeMode, MountFS,
         },
     },
     init::cmdline::kenrel_cmdline_param_manager,
+    ipc::kill::send_signal_to_pid,
+    libs::mutex::MutexGuard,
     mm::truncate::truncate_inode_pages,
-    process::{cred::CAPFlags, namespace::mnt::mnt_namespace_init, ProcessManager},
+    process::{
+        cred::CAPFlags, namespace::mnt::mnt_namespace_init, resource::RLimitID, ProcessManager,
+    },
 };
+
+use crate::arch::ipc::signal::Signal;
 
 use super::{
     stat::LookUpFlags,
@@ -92,7 +100,7 @@ fn migrate_virtual_filesystem(
 
     let current_mntns = ProcessManager::current_mntns();
     let old_root_inode = current_mntns.root_inode();
-    let old_mntfs = current_mntns.root_mntfs().clone();
+    let old_mntfs = current_mntns.root_mntfs();
     let new_fs = MountFS::new(
         new_fs,
         None,
@@ -124,9 +132,7 @@ fn migrate_virtual_filesystem(
         .mount_from(old_root_inode.find("sys").expect("sys not mounted!"))
         .expect("Failed to migrate filesystem of sys");
 
-    unsafe {
-        current_mntns.force_change_root_mountfs(new_fs);
-    }
+    current_mntns.force_change_root_mountfs(new_fs);
 
     // 换根后需要同步更新“当前进程”的 fs root/pwd。
     // 我们的路径解析（绝对路径）以进程 fs root 为起点；若不更新，后续诸如 /dev/pts 的挂载、
@@ -701,12 +707,22 @@ pub(super) fn do_file_lookup_at(
     return inode.lookup_follow_symlink2(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES, follow_final);
 }
 
-/// 统一的 VFS 截断封装：对 inode 进行基本检查并调用 resize
-/// - 目录返回 EISDIR
-/// - 非普通文件返回 EINVAL
-/// - 只读挂载返回 EROFS
+#[inline]
+pub fn current_file_lock_owner_id() -> u64 {
+    let binding = ProcessManager::current_pcb().fd_table();
+    let fd_table_guard = binding.read();
+    fd_table_guard.lock_owner_id() as u64
+}
+
 #[inline(never)]
-pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemError> {
+fn vfs_truncate_inner<F>(
+    inode: Arc<dyn IndexNode>,
+    len: usize,
+    do_resize: F,
+) -> Result<(), SystemError>
+where
+    F: FnOnce(&Arc<dyn IndexNode>) -> Result<(), SystemError>,
+{
     let md = inode.metadata()?;
     let old_size = md.size;
 
@@ -746,32 +762,209 @@ pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemE
         }
     }
 
-    let result = inode.resize(len);
+    let result = do_resize(&inode);
 
-    // Linux 语义：对普通文件进行截断（且确实改变 size）后，若无 CAP_FSETID，清理 suid/sgid。
     if result.is_ok() && old_size != len as i64 {
-        let cred = ProcessManager::current_pcb().cred();
-        if !cred.has_capability(CAPFlags::CAP_FSETID) {
-            let mut md2 = inode.metadata()?;
-            if md2.file_type == FileType::File
-                && md2.mode.intersects(InodeMode::S_ISUID | InodeMode::S_ISGID)
-            {
-                md2.mode.remove(InodeMode::S_ISUID);
-
-                if should_remove_sgid(md2.mode, md2.gid, &cred) {
-                    md2.mode.remove(InodeMode::S_ISGID);
-                }
-
-                inode.set_metadata(&md2)?;
-            }
-        }
-    }
-
-    if result.is_ok() && len < old_size as usize {
-        if let Some(page_cache) = inode.page_cache() {
-            page_cache.truncate(len)?;
-        }
+        clear_suid_sgid_after_size_change(inode.as_ref())?;
     }
 
     result
+}
+
+fn clear_suid_sgid_after_size_change(inode: &dyn IndexNode) -> Result<(), SystemError> {
+    let cred = ProcessManager::current_pcb().cred();
+    if cred.has_capability(CAPFlags::CAP_FSETID) {
+        return Ok(());
+    }
+
+    let mut md = inode.metadata()?;
+    if md.file_type == FileType::File && md.mode.intersects(InodeMode::S_ISUID | InodeMode::S_ISGID)
+    {
+        md.mode.remove(InodeMode::S_ISUID);
+
+        if should_remove_sgid(md.mode, md.gid, &cred) {
+            md.mode.remove(InodeMode::S_ISGID);
+        }
+
+        inode.set_metadata(&md)?;
+    }
+
+    Ok(())
+}
+
+/// 统一的 VFS 截断封装：对 inode 进行基本检查并调用 resize
+/// - 目录返回 EISDIR
+/// - 非普通文件返回 EINVAL
+/// - 只读挂载返回 EROFS
+#[inline(never)]
+pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemError> {
+    let lock_owner = current_file_lock_owner_id();
+    vfs_truncate_inner(inode, len, |inode| {
+        inode.resize_with_lock_owner(len, lock_owner)
+    })
+}
+
+/// 基于已打开文件执行 VFS 截断，保留公共检查，并把 fd 私有数据传给文件系统。
+#[inline(never)]
+pub fn vfs_truncate_file<'a>(
+    inode: Arc<dyn IndexNode>,
+    len: usize,
+    lock_owner: u64,
+    data: impl FnOnce() -> MutexGuard<'a, FilePrivateData>,
+) -> Result<(), SystemError> {
+    vfs_truncate_inner(inode, len, |inode| {
+        inode.resize_file(len, lock_owner, data())
+    })
+}
+
+pub fn check_file_size_limit(new_size: usize) -> Result<(), SystemError> {
+    let current_pcb = ProcessManager::current_pcb();
+    let fsize_limit = current_pcb.get_rlimit(RLimitID::Fsize);
+    if fsize_limit.rlim_cur != u64::MAX && new_size as u64 > fsize_limit.rlim_cur {
+        let _ = send_signal_to_pid(current_pcb.raw_pid(), Signal::SIGXFSZ);
+        return Err(SystemError::EFBIG);
+    }
+    Ok(())
+}
+
+/// Generic resize-backed `fallocate(mode=0)` for real local regular files.
+///
+/// This helper provides DragonOS' compatibility guarantee that mode=0 makes the
+/// file size at least `offset + len`. It is intentionally opt-in: pseudo
+/// filesystems and protocol filesystems must keep returning EOPNOTSUPP or
+/// provide their own fallocate implementation.
+pub fn resize_based_fallocate(
+    inode: &dyn IndexNode,
+    mode: i32,
+    offset: usize,
+    len: usize,
+    lock_owner: u64,
+) -> Result<(), SystemError> {
+    if mode != 0 {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+
+    let new_size = offset.checked_add(len).ok_or(SystemError::EFBIG)?;
+    if new_size > isize::MAX as usize {
+        return Err(SystemError::EFBIG);
+    }
+
+    let md = inode.metadata()?;
+    if md.file_type != FileType::File {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+
+    let current_size = md.size.max(0) as usize;
+    if new_size <= current_size {
+        return Ok(());
+    }
+
+    check_file_size_limit(new_size)?;
+
+    let result = inode.resize_with_lock_owner(new_size, lock_owner);
+    if result.is_ok() && md.size != new_size as i64 {
+        clear_suid_sgid_after_size_change(inode)?;
+    }
+
+    result
+}
+
+/// 基于已打开文件执行 VFS fallocate 公共检查，再分派给具体文件系统。
+#[inline(never)]
+pub fn vfs_fallocate_file(
+    file: Arc<File>,
+    mode: i32,
+    offset: usize,
+    len: usize,
+) -> Result<(), SystemError> {
+    const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
+    const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
+    const FALLOC_FL_COLLAPSE_RANGE: u32 = 0x08;
+    const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
+    const FALLOC_FL_INSERT_RANGE: u32 = 0x20;
+    const FALLOC_FL_UNSHARE_RANGE: u32 = 0x40;
+    const FALLOC_FL_SUPPORTED_MASK: u32 = FALLOC_FL_KEEP_SIZE
+        | FALLOC_FL_PUNCH_HOLE
+        | FALLOC_FL_COLLAPSE_RANGE
+        | FALLOC_FL_ZERO_RANGE
+        | FALLOC_FL_INSERT_RANGE
+        | FALLOC_FL_UNSHARE_RANGE;
+
+    if len == 0 || offset > isize::MAX as usize || len > isize::MAX as usize {
+        return Err(SystemError::EINVAL);
+    }
+
+    let mode_bits = mode as u32;
+    if mode < 0 || (mode_bits & !FALLOC_FL_SUPPORTED_MASK) != 0 {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+    if (mode_bits & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE))
+        == (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE)
+    {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+    if (mode_bits & FALLOC_FL_PUNCH_HOLE) != 0 && (mode_bits & FALLOC_FL_KEEP_SIZE) == 0 {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+    if (mode_bits & FALLOC_FL_COLLAPSE_RANGE) != 0 && (mode_bits & !FALLOC_FL_COLLAPSE_RANGE) != 0 {
+        return Err(SystemError::EINVAL);
+    }
+    if (mode_bits & FALLOC_FL_INSERT_RANGE) != 0 && (mode_bits & !FALLOC_FL_INSERT_RANGE) != 0 {
+        return Err(SystemError::EINVAL);
+    }
+    if (mode_bits & FALLOC_FL_UNSHARE_RANGE) != 0
+        && (mode_bits & !(FALLOC_FL_UNSHARE_RANGE | FALLOC_FL_KEEP_SIZE)) != 0
+    {
+        return Err(SystemError::EINVAL);
+    }
+
+    let mode_flags = file.mode();
+    if mode_flags.contains(FileMode::FMODE_PATH) {
+        return Err(SystemError::EBADF);
+    }
+    if !mode_flags.contains(FileMode::FMODE_WRITE) || !mode_flags.can_write() {
+        return Err(SystemError::EBADF);
+    }
+
+    let inode = file.inode();
+    let md = inode.metadata()?;
+    if md.flags.contains(InodeFlags::S_APPEND) && (mode_bits & !FALLOC_FL_KEEP_SIZE) != 0 {
+        return Err(SystemError::EPERM);
+    }
+    if md.flags.contains(InodeFlags::S_IMMUTABLE) {
+        return Err(SystemError::EPERM);
+    }
+    if md.flags.contains(InodeFlags::S_SWAPFILE) {
+        return Err(SystemError::ETXTBSY);
+    }
+
+    let fs = inode.fs();
+    if let Some(mfs) = fs.clone().downcast_arc::<MountFS>() {
+        if mfs
+            .mount_flags()
+            .contains(crate::filesystem::vfs::mount::MountFlags::RDONLY)
+        {
+            return Err(SystemError::EROFS);
+        }
+    }
+
+    match md.file_type {
+        FileType::File | FileType::BlockDevice => {}
+        FileType::Dir => return Err(SystemError::EISDIR),
+        FileType::Pipe => return Err(SystemError::ESPIPE),
+        _ => return Err(SystemError::ENODEV),
+    }
+
+    let new_size = offset.checked_add(len).ok_or(SystemError::EFBIG)?;
+    if new_size > isize::MAX as usize {
+        return Err(SystemError::EFBIG);
+    }
+
+    inode.fallocate_file(
+        mode,
+        offset,
+        len,
+        current_file_lock_owner_id(),
+        file.private_data.lock(),
+    )
 }

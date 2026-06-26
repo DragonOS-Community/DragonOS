@@ -1426,72 +1426,40 @@ impl IndexNode for LockedPipeInode {
         }
 
         let mut guard = self.inner.lock();
-
-        // 写端关闭
-        if accflags == FileFlags::O_WRONLY {
-            assert!(guard.writer > 0);
-            guard.writer -= 1;
-            // 如果已经没有写端了，则唤醒读端
-            if guard.writer == 0 {
-                // poll/epoll 语义仍然是 HUP，但 Linux 的 SIGIO/fasync 在这里上报 POLL_IN
-                // （读端被唤醒后可读到 EOF）。
-                let poll_flags = FileFlags::O_RDONLY;
-                let poll_data = FilePrivateData::Pipefs(PipeFsPrivateData { flags: poll_flags });
-                let pollflag = guard
-                    .poll(&poll_data)
-                    .map(|v| EPollEventType::from_bits_truncate(v as u32))
-                    .unwrap_or(EPollEventType::EPOLLHUP);
-                drop(guard); // 先释放 inner 锁，避免潜在的死锁
-                self.read_wait_queue
-                    .wakeup_all(Some(ProcessState::Blocked(true)));
-                let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
-                self.read_fasync_items.send_sigio(FASYNC_POLL_IN);
-                return Ok(());
+        match accflags {
+            FileFlags::O_RDONLY => {
+                assert!(guard.reader > 0);
+                guard.reader -= 1;
             }
+            FileFlags::O_WRONLY => {
+                assert!(guard.writer > 0);
+                guard.writer -= 1;
+            }
+            FileFlags::O_RDWR => {
+                assert!(guard.reader > 0);
+                assert!(guard.writer > 0);
+                guard.reader -= 1;
+                guard.writer -= 1;
+            }
+            _ => {}
         }
 
-        // 读端关闭
-        if accflags == FileFlags::O_RDONLY {
-            assert!(guard.reader > 0);
-            guard.reader -= 1;
-            // 如果已经没有读端了，则唤醒写端
-            if guard.reader == 0 {
-                // poll/epoll 语义仍然是 ERR，但 Linux 的 SIGIO/fasync 在这里上报 POLL_OUT
-                // （写端被唤醒后下一次 write 再观察到 EPIPE）。
-                let poll_data = FilePrivateData::Pipefs(PipeFsPrivateData {
-                    flags: FileFlags::O_WRONLY,
-                });
-                let pollflag = guard
-                    .poll(&poll_data)
-                    .map(|v| EPollEventType::from_bits_truncate(v as u32))
-                    .unwrap_or(EPollEventType::EPOLLERR);
+        // Linux pipe_release() wakes both wait queues and notifies both fasync
+        // sides only when close leaves exactly one endpoint class present.
+        let release_notify = (guard.reader == 0) != (guard.writer == 0);
+        let pollflag = if release_notify {
+            guard.poll_both_ends()
+        } else {
+            EPollEventType::empty()
+        };
+        drop(guard);
 
-                drop(guard); // 先释放 inner 锁，避免死锁
-                self.write_wait_queue.wakeup_all(None);
-                let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
-                self.write_fasync_items.send_sigio(FASYNC_POLL_OUT);
-                return Ok(());
-            }
-        }
-
-        // O_RDWR 模式关闭：同时减少读写计数
-        if accflags == FileFlags::O_RDWR {
-            assert!(guard.reader > 0);
-            assert!(guard.writer > 0);
-            guard.reader -= 1;
-            guard.writer -= 1;
-            let wake_reader = guard.writer == 0;
-            let wake_writer = guard.reader == 0;
-            drop(guard); // 先释放 inner 锁
-
-            // 如果已经没有写端了，则唤醒读端
-            if wake_reader {
-                self.read_wait_queue.wakeup_all(None);
-            }
-            // 如果已经没有读端了，则唤醒写端
-            if wake_writer {
-                self.write_wait_queue.wakeup_all(None);
-            }
+        if release_notify {
+            self.read_wait_queue.wakeup_all(None);
+            self.write_wait_queue.wakeup_all(None);
+            let _ = EventPoll::wakeup_epoll(&self.epitems, pollflag);
+            self.read_fasync_items.send_sigio(FASYNC_POLL_IN);
+            self.write_fasync_items.send_sigio(FASYNC_POLL_OUT);
         }
 
         return Ok(());

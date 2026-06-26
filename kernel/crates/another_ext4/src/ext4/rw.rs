@@ -108,18 +108,17 @@ impl Ext4 {
     /// Write a block group descriptor to disk and update cache, without checksum.
     #[allow(unused)]
     pub(super) fn write_block_group_without_csum(&self, bg_ref: &BlockGroupRef) -> Result<()> {
-        // Update cache
-        if let Some(cached) = self.cached_block_groups.get(bg_ref.id as usize) {
-            *cached.lock() = bg_ref.desc;
-        }
-        // Write to disk
         let sb = self.read_super_block_cached();
         let desc_per_block = BLOCK_SIZE as u32 / sb.desc_size() as u32;
         let block_id = sb.first_data_block() + bg_ref.id / desc_per_block + 1;
         let offset = (bg_ref.id % desc_per_block) * sb.desc_size() as u32;
         let mut block = self.read_block(block_id as PBlockId)?;
         block.write_offset_as(offset as usize, &bg_ref.desc);
-        self.write_block(&block)
+        self.write_block(&block)?;
+        if let Some(cached) = self.cached_block_groups.get(bg_ref.id as usize) {
+            *cached.lock() = bg_ref.desc;
+        }
+        Ok(())
     }
 
     /// Get disk position of an inode. Return block id and offset within the block.

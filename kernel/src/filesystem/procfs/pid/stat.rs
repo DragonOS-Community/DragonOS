@@ -151,7 +151,7 @@ impl FileOps for StatFileOps {
             .unwrap_or(1);
         let (vsize_bytes, rss_pages) = user_vm
             .map(|vm| {
-                let guard = vm.read();
+                let guard = vm.read_guard_no_reservations();
                 let bytes = guard.vma_usage_bytes();
                 let pages = vm.resident_pages();
                 (bytes as u64, pages as u64)

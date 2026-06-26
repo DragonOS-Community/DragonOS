@@ -11,7 +11,7 @@ use crate::{
             VFS_MAX_FOLLOW_SYMLINK_TIMES,
         },
     },
-    libs::mutex::Mutex,
+    libs::{mutex::Mutex, rwsem::RwSem},
     mm::{
         fault::{PageFaultHandler, PageFaultMessage},
         VmFaultReason,
@@ -102,6 +102,10 @@ impl FileSystem for Ext4FileSystem {
 
     unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
         PageFaultHandler::filemap_fault(pfm)
+    }
+
+    unsafe fn page_mkwrite(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
+        PageFaultHandler::filemap_page_mkwrite(pfm)
     }
 
     unsafe fn map_pages(
@@ -293,6 +297,7 @@ impl Ext4FileSystem {
                         dirty_state: super::inode::InodeDirtyState::empty(),
                     }),
                     Mutex::new(()),
+                    RwSem::new(()),
                 )
             });
 

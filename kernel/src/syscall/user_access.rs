@@ -13,7 +13,7 @@ use defer::defer;
 
 use crate::{
     arch::MMArch,
-    mm::{access_ok, MemoryManagementArch, VirtAddr, VmFlags},
+    mm::{access_ok, MemoryManagementArch, VirtAddr, VirtRegion, VmFlags},
     process::ProcessManager,
 };
 
@@ -858,18 +858,18 @@ impl<'a> UserBufferWriter<'a> {
 }
 
 impl<'a> UserBufferWriter<'a> {
-    /// 使用异常保护的方式从内核空间拷贝数据到用户空间
+    /// Copy from kernel space to user space with exception-table protection.
     ///
-    /// 此方法使用异常表机制，即使在页错误时也能安全返回错误，
-    /// 而不是panic或无限循环。
+    /// Uses the exception table so page faults return an error safely instead of
+    /// panicking or looping indefinitely.
     ///
     /// # Arguments
-    /// * `src` - 源缓冲区(内核空间)
-    /// * `offset` - 用户缓冲区的字节偏移
+    /// * `src` - source buffer (kernel space)
+    /// * `offset` - byte offset into the user buffer
     ///
     /// # Returns
-    /// * `Ok(len)` - 成功拷贝的字节数
-    /// * `Err(SystemError::EFAULT)` - 访问失败
+    /// * `Ok(len)` - number of bytes copied
+    /// * `Err(SystemError::EFAULT)` - access failed
     #[allow(dead_code)]
     pub fn copy_to_user_protected(
         &'a mut self,
@@ -928,7 +928,10 @@ fn check_user_access_by_page_table(addr: VirtAddr, size: usize, check_write: boo
     // Calculate number of pages to check (rounded up)
     let pages = aligned_size / MMArch::PAGE_SIZE;
 
-    let guard = vm.read();
+    let guard = vm.read_guard_no_reservation_conflict(VirtRegion::new(
+        VirtAddr::new(aligned_addr),
+        aligned_size,
+    ));
     for i in 0..pages {
         let page_addr = aligned_addr + i * MMArch::PAGE_SIZE;
         let flags = match guard.user_mapper.utable.translate(VirtAddr::new(page_addr)) {
@@ -991,15 +994,20 @@ pub unsafe fn copy_from_user_protected(
     }
 }
 
-/// 带异常保护的用户空间写入
+/// Copy to user space with exception-table protection.
 ///
-/// ## 参数
-/// - `dest`: 目标地址(用户空间)
-/// - `src`: 源缓冲区(内核空间)
+/// Writes through the exception table while keeping CR0.WP enabled, so read-only/COW
+/// user pages still take the normal page-fault path. Writes to writable VMAs may fault;
+/// the fault handler performs lazy allocation or COW. Semantics match Linux
+/// `copy_to_user()` / `put_user()`.
 ///
-/// ## 返回值
-/// - `Ok(len)`: 成功写入的字节数
-/// - `Err(SystemError::EFAULT)`: 访问失败
+/// ## Arguments
+/// - `dest`: destination address (user space)
+/// - `src`: source buffer (kernel space)
+///
+/// ## Returns
+/// - `Ok(len)`: number of bytes written
+/// - `Err(SystemError::EFAULT)`: access failed
 pub unsafe fn copy_to_user_protected(dest: VirtAddr, src: &[u8]) -> Result<usize, SystemError> {
     let len = src.len();
     if len == 0 {
@@ -1009,36 +1017,6 @@ pub unsafe fn copy_to_user_protected(dest: VirtAddr, src: &[u8]) -> Result<usize
     let dst_ptr = dest.data() as *mut u8;
     let src_ptr = src.as_ptr();
 
-    // 预检查：只基于 VMA 做权限/范围检查（不要求 PTE 已经存在）。
-    // 真实拷贝期间若遇到缺页，会进入 handle_mm_fault() 分配/映射页面；
-    // 若遇到不可访问区域（无 VMA / PROT_NONE / 无写权限），缺页处理会走异常表修复并返回 -EFAULT。
-    if user_accessible_len(dest, len, true) < len {
-        return Err(SystemError::EFAULT);
-    }
-
-    MMArch::disable_kernel_wp();
-    let result = MMArch::copy_with_exception_table(dst_ptr, src_ptr, len);
-    MMArch::enable_kernel_wp();
-
-    match result {
-        0 => Ok(len),
-        _ => Err(SystemError::EFAULT),
-    }
-}
-
-/// 使用异常表保护写入用户空间，同时保持 CR0.WP，使只读/COW 用户页仍会触发正常缺页处理。
-///
-/// 这条路径用于需要严格遵守 Linux `put_user()` COW 语义的写回场景，
-/// 例如 `CLONE_PARENT_SETTID` 和 `CLONE_CHILD_SETTID`。
-pub unsafe fn copy_to_user_cow_protected(dest: VirtAddr, src: &[u8]) -> Result<usize, SystemError> {
-    let len = src.len();
-    if len == 0 {
-        return Ok(0);
-    }
-
-    let dst_ptr = dest.data() as *mut u8;
-    let src_ptr = src.as_ptr();
-
     if user_accessible_len(dest, len, true) < len {
         return Err(SystemError::EFAULT);
     }
@@ -1051,18 +1029,18 @@ pub unsafe fn copy_to_user_cow_protected(dest: VirtAddr, src: &[u8]) -> Result<u
     }
 }
 
-/// 使用异常表保护将单个 `Copy` 值写入用户空间。
+/// Write a single `Copy` value to user space with exception-table protection.
 ///
-/// 语义上对齐 Linux `put_user()`：
-/// 仅基于 VMA 做可写性预检查，真正写入阶段允许通过缺页处理补齐 COW/懒分配页；
-/// 若最终仍不可访问，则返回 `EFAULT`。
+/// Semantics match Linux `put_user()`: writable VMA is checked up front; the actual
+/// write may fault to resolve COW or lazy allocation. Returns `EFAULT` if the
+/// destination remains inaccessible.
 pub unsafe fn write_one_to_user_protected<T: Copy>(
     dest: VirtAddr,
     value: &T,
 ) -> Result<(), SystemError> {
     let src =
         core::slice::from_raw_parts((value as *const T).cast::<u8>(), core::mem::size_of::<T>());
-    copy_to_user_cow_protected(dest, src).map(|_| ())
+    copy_to_user_protected(dest, src).map(|_| ())
 }
 
 /// Compute the contiguous accessible length starting at `addr`.
@@ -1086,13 +1064,14 @@ pub fn user_accessible_len(addr: VirtAddr, size: usize, check_write: bool) -> us
         None => return 0,
     };
 
-    let vma_read_guard = vm.read();
-    let mappings = &vma_read_guard.mappings;
-
     let mut checked = 0usize;
     let mut current = addr;
 
     while checked < size {
+        let current_page = VirtAddr::new(current.data() & !MMArch::PAGE_OFFSET_MASK);
+        let vma_read_guard =
+            vm.read_guard_no_reservation_conflict(VirtRegion::new(current_page, MMArch::PAGE_SIZE));
+        let mappings = &vma_read_guard.mappings;
         // 判断当前地址是否落在一个有效 VMA 中
         let Some(vma) = mappings.contains(current) else {
             break;

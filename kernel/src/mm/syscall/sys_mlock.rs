@@ -7,7 +7,8 @@ use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_MLOCK, MMArch},
     libs::align::page_align_down,
     mm::{
-        access_ok, can_do_mlock, ucontext::AddressSpace, MemoryManagementArch, VirtAddr, VmFlags,
+        access_ok, can_do_mlock, ucontext::AddressSpace, MemoryManagementArch, VirtAddr,
+        VirtRegion, VmFlags,
     },
     process::{cred::CAPFlags, resource::RLimitID, ProcessManager},
     syscall::table::{FormattedSyscallParam, Syscall},
@@ -62,13 +63,21 @@ pub(super) fn do_mlock(
     }
 
     let vm = AddressSpace::current()?;
-    let mut guard = vm.write_interruptible()?;
+    let region = VirtRegion::new(start, len);
+    loop {
+        let mut guard = vm.write_interruptible()?;
+        if guard.mappings.first_reservation_conflict(region).is_some() {
+            drop(guard);
+            vm.wait_for_no_reservation_conflict_interruptible(region)?;
+            continue;
+        }
 
-    let new_pages = guard.count_unlocked_pages_for_mlock(start, len)?;
-    check_mlock_rlimit(guard.locked_vm, new_pages)?;
+        let new_pages = guard.count_unlocked_pages_for_mlock(start, len)?;
+        check_mlock_rlimit(guard.locked_vm, new_pages)?;
 
-    guard.apply_vma_lock_flags(start, len, new_flags, false)?;
-    Ok(0)
+        guard.apply_vma_lock_flags(start, len, new_flags, false)?;
+        return Ok(0);
+    }
 }
 
 pub(super) fn check_mlock_rlimit(locked_vm: usize, new_pages: usize) -> Result<(), SystemError> {

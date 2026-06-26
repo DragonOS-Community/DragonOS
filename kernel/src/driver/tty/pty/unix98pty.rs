@@ -1,8 +1,13 @@
 use alloc::{
+    boxed::Box,
     string::ToString,
     sync::{Arc, Weak},
+    vec,
 };
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::{
+    hint::spin_loop,
+    sync::atomic::{AtomicBool, Ordering},
+};
 use system_error::SystemError;
 
 use crate::{
@@ -19,7 +24,11 @@ use crate::{
             file::FileFlags, FilePrivateData, FileSystem, FileType, IndexNode, InodeMode, MountFS,
         },
     },
-    libs::{casting::DowncastArc, mutex::MutexGuard},
+    libs::{
+        casting::DowncastArc,
+        mutex::{Mutex, MutexGuard},
+        spinlock::SpinLock,
+    },
     mm::VirtAddr,
     process::ProcessManager,
     syscall::user_access::UserBufferWriter,
@@ -28,6 +37,8 @@ use crate::{
 use super::{ptm_driver, pts_driver, PtyCommon};
 
 pub const NR_UNIX98_PTY_MAX: u32 = 128;
+const PTY_BUFFER_LIMIT: usize = 16 * 1024;
+const PTY_DRAIN_CHUNK: usize = 256;
 
 fn current_devpts() -> Result<Arc<DevPtsFs>, SystemError> {
     let fs = ProcessManager::current_mntns()
@@ -51,15 +62,123 @@ struct PtyDevPtsLink {
     pts_root: Weak<dyn IndexNode>,
     /// devpts 文件系统本体，用于精确回收索引（避免再去 downcast/全局路径查找）
     devpts: Weak<DevPtsFs>,
+    /// slave 端 inode。TIOCGPTPEER 必须从 master 关联对象打开 peer，
+    /// 不能重新按 /dev/pts/N 路径查找，否则目录项被 unlink 后会偏离 Linux 语义。
+    slave_inode: Arc<dyn IndexNode>,
     index: usize,
-    /// master 侧（ptmx）最后一个 fd 已关闭
-    master_closed: AtomicBool,
-    /// slave 侧（/dev/pts/N）最后一个 fd 已关闭
-    slave_closed: AtomicBool,
-    /// 目录项是否已经 unlink（通常在 master close 时执行）
-    unlinked: AtomicBool,
-    /// 索引是否已经归还（仅在 master+slave 都关闭后才允许归还）
-    index_freed: AtomicBool,
+    state: Mutex<PtyDevPtsState>,
+    master_to_slave: SpinLock<PtyByteQueue>,
+    slave_to_master: SpinLock<PtyByteQueue>,
+    master_to_slave_draining: AtomicBool,
+    slave_to_master_draining: AtomicBool,
+    master_to_slave_drain_requested: AtomicBool,
+    slave_to_master_drain_requested: AtomicBool,
+    master_to_slave_discarding: AtomicBool,
+    slave_to_master_discarding: AtomicBool,
+    master_to_slave_flushing: AtomicBool,
+    slave_to_master_flushing: AtomicBool,
+}
+
+#[derive(Debug, Default)]
+struct PtyDevPtsState {
+    /// master 侧（ptmx）最后一个 fd 已关闭。
+    master_closed: bool,
+    /// slave open 已经进入 driver open，但尚未提交为 active fd。
+    slave_opening: usize,
+    /// 已成功打开的 userspace slave open file description 数量。
+    slave_active: usize,
+    /// 目录项是否已经 unlink（通常在 master close 时执行）。
+    unlinked: bool,
+    /// 索引是否已经归还（仅在 master close 且无 opening/active slave 后允许归还）。
+    index_freed: bool,
+}
+
+#[derive(Debug, Default)]
+struct DrainResult {
+    delivered: usize,
+    freed_backlog: usize,
+    still_pending: bool,
+}
+
+#[derive(Debug)]
+struct PtyByteQueue {
+    buf: Box<[u8; PTY_BUFFER_LIMIT]>,
+    head: usize,
+    len: usize,
+    discard_len: usize,
+}
+
+impl PtyByteQueue {
+    fn new() -> Self {
+        Self {
+            buf: vec![0; PTY_BUFFER_LIMIT]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap(),
+            head: 0,
+            len: 0,
+            discard_len: 0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn room(&self) -> usize {
+        PTY_BUFFER_LIMIT - self.len
+    }
+
+    fn clear_count(&mut self) -> usize {
+        let cleared = self.len;
+        self.head = 0;
+        self.len = 0;
+        self.discard_len = 0;
+        cleared
+    }
+
+    fn clear(&mut self) {
+        self.clear_count();
+    }
+
+    fn push_slice(&mut self, buf: &[u8]) -> usize {
+        let accepted = buf.len().min(self.room());
+        for (i, c) in buf[..accepted].iter().enumerate() {
+            let idx = (self.head + self.len + i) % PTY_BUFFER_LIMIT;
+            self.buf[idx] = *c;
+        }
+        self.len += accepted;
+        accepted
+    }
+
+    fn copy_front(&self, out: &mut [u8]) -> usize {
+        let copied = out.len().min(self.len);
+        for (i, slot) in out[..copied].iter_mut().enumerate() {
+            *slot = self.buf[(self.head + i) % PTY_BUFFER_LIMIT];
+        }
+        copied
+    }
+
+    fn advance_front(&mut self, count: usize) {
+        let count = count.min(self.len);
+        self.head = (self.head + count) % PTY_BUFFER_LIMIT;
+        self.len -= count;
+        self.discard_len = self.discard_len.saturating_sub(count);
+        if self.len == 0 {
+            self.head = 0;
+            self.discard_len = 0;
+        }
+    }
+
+    fn request_discard_prefix(&mut self) {
+        self.discard_len = self.len;
+    }
+
+    fn discard_requested_prefix(&mut self) -> usize {
+        let discard_len = self.discard_len.min(self.len);
+        self.advance_front(discard_len);
+        discard_len
+    }
 }
 
 impl crate::driver::tty::tty_driver::TtyCorePrivateField for PtyDevPtsLink {
@@ -69,28 +188,326 @@ impl crate::driver::tty::tty_driver::TtyCorePrivateField for PtyDevPtsLink {
 }
 
 impl PtyDevPtsLink {
-    fn new(pts_root: Weak<dyn IndexNode>, devpts: Weak<DevPtsFs>, index: usize) -> Self {
+    fn new(
+        pts_root: Weak<dyn IndexNode>,
+        devpts: Weak<DevPtsFs>,
+        slave_inode: Arc<dyn IndexNode>,
+        index: usize,
+    ) -> Self {
         Self {
             pts_root,
             devpts,
+            slave_inode,
             index,
-            master_closed: AtomicBool::new(false),
-            slave_closed: AtomicBool::new(false),
-            unlinked: AtomicBool::new(false),
-            index_freed: AtomicBool::new(false),
+            state: Mutex::new(PtyDevPtsState::default()),
+            master_to_slave: SpinLock::new(PtyByteQueue::new()),
+            slave_to_master: SpinLock::new(PtyByteQueue::new()),
+            master_to_slave_draining: AtomicBool::new(false),
+            slave_to_master_draining: AtomicBool::new(false),
+            master_to_slave_drain_requested: AtomicBool::new(false),
+            slave_to_master_drain_requested: AtomicBool::new(false),
+            master_to_slave_discarding: AtomicBool::new(false),
+            slave_to_master_discarding: AtomicBool::new(false),
+            master_to_slave_flushing: AtomicBool::new(false),
+            slave_to_master_flushing: AtomicBool::new(false),
         }
+    }
+
+    fn queue_for_source(&self, subtype: TtyDriverSubType) -> Option<&SpinLock<PtyByteQueue>> {
+        match subtype {
+            TtyDriverSubType::PtyMaster => Some(&self.master_to_slave),
+            TtyDriverSubType::PtySlave => Some(&self.slave_to_master),
+            _ => None,
+        }
+    }
+
+    fn state_flags_for_source(
+        &self,
+        subtype: TtyDriverSubType,
+    ) -> Option<(&AtomicBool, &AtomicBool, &AtomicBool, &AtomicBool)> {
+        match subtype {
+            TtyDriverSubType::PtyMaster => Some((
+                &self.master_to_slave_draining,
+                &self.master_to_slave_drain_requested,
+                &self.master_to_slave_discarding,
+                &self.master_to_slave_flushing,
+            )),
+            TtyDriverSubType::PtySlave => Some((
+                &self.slave_to_master_draining,
+                &self.slave_to_master_drain_requested,
+                &self.slave_to_master_discarding,
+                &self.slave_to_master_flushing,
+            )),
+            _ => None,
+        }
+    }
+
+    fn pending_write_room(&self, subtype: TtyDriverSubType) -> usize {
+        self.queue_for_source(subtype)
+            .map(|queue| queue.lock_irqsave().room())
+            .unwrap_or(0)
+    }
+
+    fn clear_pending_from(&self, subtype: TtyDriverSubType) -> Result<(), SystemError> {
+        let Some(queue) = self.queue_for_source(subtype) else {
+            return Err(SystemError::ENODEV);
+        };
+        let Some((draining, drain_requested, discarding, flushing)) =
+            self.state_flags_for_source(subtype)
+        else {
+            return Err(SystemError::ENODEV);
+        };
+
+        while flushing
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            spin_loop();
+        }
+
+        while draining
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            spin_loop();
+        }
+
+        drain_requested.store(false, Ordering::Release);
+        discarding.store(false, Ordering::Release);
+        queue.lock_irqsave().clear();
+        draining.store(false, Ordering::Release);
+        flushing.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    fn discard_requested_prefix(&self, queue: &SpinLock<PtyByteQueue>) -> usize {
+        queue.lock_irqsave().discard_requested_prefix()
+    }
+
+    fn request_discard_pending_from(
+        &self,
+        subtype: TtyDriverSubType,
+    ) -> Result<usize, SystemError> {
+        let Some(queue) = self.queue_for_source(subtype) else {
+            return Err(SystemError::ENODEV);
+        };
+        let Some((draining, drain_requested, discarding, flushing)) =
+            self.state_flags_for_source(subtype)
+        else {
+            return Err(SystemError::ENODEV);
+        };
+
+        if flushing.load(Ordering::Acquire) {
+            return Ok(0);
+        }
+
+        if discarding
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return Ok(0);
+        }
+
+        queue.lock_irqsave().request_discard_prefix();
+
+        if draining
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            discarding.store(false, Ordering::Release);
+            return Ok(0);
+        }
+
+        let discarded = self.discard_requested_prefix(queue);
+        drain_requested.store(false, Ordering::Release);
+        draining.store(false, Ordering::Release);
+        discarding.store(false, Ordering::Release);
+
+        Ok(discarded)
+    }
+
+    fn write_to_peer(
+        &self,
+        subtype: TtyDriverSubType,
+        to: Arc<TtyCore>,
+        buf: &[u8],
+        nr: usize,
+    ) -> Result<usize, SystemError> {
+        let Some(queue) = self.queue_for_source(subtype) else {
+            return Err(SystemError::ENODEV);
+        };
+        let Some((_, _, discarding, flushing)) = self.state_flags_for_source(subtype) else {
+            return Err(SystemError::ENODEV);
+        };
+
+        let mut accepted = loop {
+            while flushing.load(Ordering::Acquire) || discarding.load(Ordering::Acquire) {
+                spin_loop();
+            }
+
+            let mut queue = queue.lock_irqsave();
+            if flushing.load(Ordering::Acquire) || discarding.load(Ordering::Acquire) {
+                drop(queue);
+                spin_loop();
+                continue;
+            }
+            break queue.push_slice(&buf[..nr]);
+        };
+
+        if accepted == 0 {
+            self.drain_to_peer(subtype, to.clone())?;
+            accepted = loop {
+                while flushing.load(Ordering::Acquire) || discarding.load(Ordering::Acquire) {
+                    spin_loop();
+                }
+
+                let mut queue = queue.lock_irqsave();
+                if flushing.load(Ordering::Acquire) || discarding.load(Ordering::Acquire) {
+                    drop(queue);
+                    spin_loop();
+                    continue;
+                }
+                break queue.push_slice(&buf[..nr]);
+            };
+        }
+
+        if accepted != 0 {
+            self.drain_to_peer(subtype, to)?;
+        }
+
+        Ok(accepted)
+    }
+
+    fn drain_to_peer(
+        &self,
+        subtype: TtyDriverSubType,
+        to: Arc<TtyCore>,
+    ) -> Result<DrainResult, SystemError> {
+        let Some(queue) = self.queue_for_source(subtype) else {
+            return Err(SystemError::ENODEV);
+        };
+        let Some((draining, drain_requested, discarding, flushing)) =
+            self.state_flags_for_source(subtype)
+        else {
+            return Err(SystemError::ENODEV);
+        };
+
+        let mut result = DrainResult::default();
+        if flushing.load(Ordering::Acquire) || discarding.load(Ordering::Acquire) {
+            result.still_pending = !queue.lock_irqsave().is_empty();
+            return Ok(result);
+        }
+        if draining
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            drain_requested.store(true, Ordering::Release);
+            result.still_pending = !queue.lock_irqsave().is_empty();
+            return Ok(result);
+        }
+
+        loop {
+            if flushing.load(Ordering::Acquire) {
+                result.still_pending = !queue.lock_irqsave().is_empty();
+                draining.store(false, Ordering::Release);
+                break;
+            }
+            if discarding.load(Ordering::Acquire) {
+                result.still_pending = !queue.lock_irqsave().is_empty();
+                draining.store(false, Ordering::Release);
+                break;
+            }
+
+            let discarded = self.discard_requested_prefix(queue);
+            if discarded != 0 {
+                result.freed_backlog += discarded;
+                if !queue.lock_irqsave().is_empty() {
+                    continue;
+                }
+                draining.store(false, Ordering::Release);
+                if drain_requested.swap(false, Ordering::AcqRel)
+                    && draining
+                        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    continue;
+                }
+                break;
+            }
+
+            let mut chunk = [0u8; PTY_DRAIN_CHUNK];
+            let chunk_len = queue.lock_irqsave().copy_front(&mut chunk);
+
+            if chunk_len == 0 {
+                draining.store(false, Ordering::Release);
+                if drain_requested.swap(false, Ordering::AcqRel)
+                    && draining
+                        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    continue;
+                }
+                break;
+            }
+
+            let delivered =
+                match to
+                    .core()
+                    .port()
+                    .unwrap()
+                    .receive_buf(&chunk[..chunk_len], &[], chunk_len)
+                {
+                    Ok(delivered) => delivered,
+                    Err(err) => {
+                        let _ = self.discard_requested_prefix(queue);
+                        draining.store(false, Ordering::Release);
+                        return Err(err);
+                    }
+                };
+            queue.lock_irqsave().advance_front(delivered);
+            result.delivered += delivered;
+            result.freed_backlog += delivered;
+            let discarded = self.discard_requested_prefix(queue);
+            if discarded != 0 {
+                result.freed_backlog += discarded;
+                if !queue.lock_irqsave().is_empty() {
+                    continue;
+                }
+                draining.store(false, Ordering::Release);
+                if drain_requested.swap(false, Ordering::AcqRel)
+                    && draining
+                        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    continue;
+                }
+                break;
+            }
+            if delivered < chunk_len {
+                result.still_pending = true;
+                draining.store(false, Ordering::Release);
+                break;
+            }
+        }
+
+        if !result.still_pending {
+            result.still_pending = !queue.lock_irqsave().is_empty();
+        }
+
+        Ok(result)
     }
 
     fn on_close(&self, subtype: TtyDriverSubType) {
         match subtype {
             TtyDriverSubType::PtyMaster => {
-                self.master_closed.store(true, Ordering::SeqCst);
+                self.state.lock().master_closed = true;
                 // Linux 语义：master 关闭后，/dev/pts/N 目录项应从 devpts 中消失；
                 // 但索引不能立即复用（slave 可能仍持有打开的 fd），因此 unlink 与 free_index 分离。
                 self.try_unlink_once();
             }
             TtyDriverSubType::PtySlave => {
-                self.slave_closed.store(true, Ordering::SeqCst);
+                // Slave file close is tracked by on_slave_file_close(), because driver close is
+                // only reached when the final tty reference is released.
             }
             _ => {}
         }
@@ -98,8 +515,72 @@ impl PtyDevPtsLink {
         self.try_free_index_when_fully_closed();
     }
 
+    fn begin_slave_open(&self) -> Result<(), SystemError> {
+        let mut state = self.state.lock();
+        if state.master_closed || state.index_freed {
+            return Err(SystemError::EIO);
+        }
+        state.slave_opening += 1;
+        Ok(())
+    }
+
+    fn finish_slave_open(&self) {
+        {
+            let mut state = self.state.lock();
+            if state.slave_opening == 0 {
+                log::warn!(
+                    "PtyDevPtsLink: finish slave open without matching begin, index={}",
+                    self.index
+                );
+                return;
+            }
+            state.slave_opening -= 1;
+            state.slave_active += 1;
+        }
+        self.try_free_index_when_fully_closed();
+    }
+
+    fn on_slave_file_close(&self) {
+        {
+            let mut state = self.state.lock();
+            if state.slave_active == 0 {
+                log::warn!(
+                    "PtyDevPtsLink: slave file close without active open, index={}",
+                    self.index
+                );
+            } else {
+                state.slave_active -= 1;
+            }
+        }
+        self.try_free_index_when_fully_closed();
+    }
+
+    fn abort_slave_open(&self) {
+        {
+            let mut state = self.state.lock();
+            if state.slave_opening == 0 {
+                log::warn!(
+                    "PtyDevPtsLink: abort slave open without matching begin, index={}",
+                    self.index
+                );
+                return;
+            }
+            state.slave_opening -= 1;
+        }
+        self.try_free_index_when_fully_closed();
+    }
+
     fn try_unlink_once(&self) {
-        if self.unlinked.swap(true, Ordering::SeqCst) {
+        let should_unlink = {
+            let mut state = self.state.lock();
+            if state.unlinked {
+                false
+            } else {
+                state.unlinked = true;
+                true
+            }
+        };
+        if !should_unlink {
             return;
         }
         if let Some(root) = self.pts_root.upgrade() {
@@ -108,19 +589,39 @@ impl PtyDevPtsLink {
     }
 
     fn try_free_index_when_fully_closed(&self) {
-        if !(self.master_closed.load(Ordering::SeqCst) && self.slave_closed.load(Ordering::SeqCst))
-        {
-            return;
-        }
-        if self.index_freed.swap(true, Ordering::SeqCst) {
+        let (should_unlink, should_free_index) = {
+            let mut state = self.state.lock();
+            if !state.master_closed
+                || state.slave_opening != 0
+                || state.slave_active != 0
+                || state.index_freed
+            {
+                (false, false)
+            } else {
+                state.index_freed = true;
+                let should_unlink = !state.unlinked;
+                state.unlinked = true;
+                (should_unlink, true)
+            }
+        };
+
+        if !should_free_index {
             return;
         }
 
-        // 兜底：如果 master 未触发 unlink（异常路径），在最终回收时再尝试一次。
-        self.try_unlink_once();
+        if should_unlink {
+            if let Some(root) = self.pts_root.upgrade() {
+                let _ = root.unlink(&self.index.to_string());
+            }
+        }
+
         if let Some(devpts) = self.devpts.upgrade() {
             devpts.free_index(self.index);
         }
+    }
+
+    fn slave_inode(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        Ok(self.slave_inode.clone())
     }
 }
 
@@ -139,7 +640,29 @@ impl TtyOperation for Unix98PtyDriverInner {
     }
 
     fn open(&self, tty: &TtyCoreData) -> Result<(), SystemError> {
-        PtyCommon::pty_common_open(tty)
+        let subtype = tty.driver().tty_driver_sub_type();
+
+        if subtype == TtyDriverSubType::PtySlave {
+            if let Some(hook_arc) = tty.private_fields() {
+                if let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() {
+                    hook.begin_slave_open()?;
+                    return match PtyCommon::pty_common_open(tty) {
+                        Ok(()) => {
+                            hook.finish_slave_open();
+                            Ok(())
+                        }
+                        Err(err) => {
+                            hook.abort_slave_open();
+                            Err(err)
+                        }
+                    };
+                }
+            }
+        }
+
+        PtyCommon::pty_common_open(tty)?;
+
+        Ok(())
     }
 
     fn write(&self, tty: &TtyCoreData, buf: &[u8], nr: usize) -> Result<usize, SystemError> {
@@ -149,22 +672,39 @@ impl TtyOperation for Unix98PtyDriverInner {
             return Ok(0);
         }
 
+        if let Some(hook_arc) = tty.private_fields() {
+            if let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() {
+                return hook.write_to_peer(tty.driver().tty_driver_sub_type(), to, buf, nr);
+            }
+        }
+
         to.core().port().unwrap().receive_buf(buf, &[], nr)
     }
 
     fn write_room(&self, tty: &TtyCoreData) -> usize {
-        // TODO 暂时
         if tty.flow_irqsave().stopped {
             return 0;
         }
 
-        8192
+        if let Some(hook_arc) = tty.private_fields() {
+            if let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() {
+                return hook.pending_write_room(tty.driver().tty_driver_sub_type());
+            }
+        }
+
+        PTY_BUFFER_LIMIT
     }
 
     fn flush_buffer(&self, tty: &TtyCoreData) -> Result<(), SystemError> {
         let Some(to) = tty.link() else {
             return Ok(());
         };
+
+        if let Some(hook_arc) = tty.private_fields() {
+            if let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() {
+                hook.clear_pending_from(tty.driver().tty_driver_sub_type())?;
+            }
+        }
 
         if to.core().contorl_info_irqsave().packet {
             tty.contorl_info_irqsave()
@@ -323,17 +863,19 @@ impl TtyOperation for Unix98PtyDriverInner {
 
     fn close(&self, tty: Arc<TtyCore>) -> Result<(), SystemError> {
         let driver = tty.core().driver();
-        // 通过 hook 精确管理 devpts 目录项与索引生命周期
-        if let Some(hook_arc) = tty.private_fields() {
-            if let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() {
-                hook.on_close(driver.tty_driver_sub_type());
-            }
-        }
+        let core = tty.core();
+        let subtype = driver.tty_driver_sub_type();
 
-        if driver.tty_driver_sub_type() == TtyDriverSubType::PtySlave {
-            driver.ttys().remove(&tty.core().index());
-            if let Some(link) = tty.core().link() {
+        core.flags_write().insert(TtyFlag::IO_ERROR);
+        core.read_wq().wakeup_all();
+        core.write_wq().wakeup_all();
+        core.contorl_info_irqsave().packet = false;
+
+        if subtype == TtyDriverSubType::PtySlave {
+            let mut peer_closed = true;
+            if let Some(link) = core.link() {
                 let link_core = link.core();
+                peer_closed = link_core.flags().contains(TtyFlag::IO_ERROR);
                 // set OTHER_CLOSED flag to tell master side that the slave side is closed
                 link_core.flags_write().insert(TtyFlag::OTHER_CLOSED);
                 // wake up waiting read/write queues on master side
@@ -343,16 +885,31 @@ impl TtyOperation for Unix98PtyDriverInner {
                 let epitems = link_core.epitems();
                 let _ = EventPoll::wakeup_epoll(epitems, EPollEventType::EPOLLHUP);
             }
-        } else if driver.tty_driver_sub_type() == TtyDriverSubType::PtyMaster {
+            if peer_closed {
+                driver.ttys().remove(&core.index());
+            }
+        } else if subtype == TtyDriverSubType::PtyMaster {
             // master 侧最后关闭：从 driver 表移除自身（避免泄漏）；devpts 的释放由 hook 统一处理
-            driver.ttys().remove(&tty.core().index());
-            if let Some(link) = tty.core().link() {
+            driver.ttys().remove(&core.index());
+            core.flags_write().insert(TtyFlag::OTHER_CLOSED);
+            if let Some(link) = core.link() {
                 let link_core = link.core();
                 link_core.flags_write().insert(TtyFlag::OTHER_CLOSED);
                 link_core.read_wq().wakeup_all();
                 link_core.write_wq().wakeup_all();
                 let epitems = link_core.epitems();
                 let _ = EventPoll::wakeup_epoll(epitems, EPollEventType::EPOLLHUP);
+                if link_core.flags().contains(TtyFlag::IO_ERROR) {
+                    link_core.driver().ttys().remove(&link_core.index());
+                }
+            }
+        }
+
+        // 通过 hook 精确管理 devpts 目录项与索引生命周期。必须放在 driver 表
+        // 解绑之后，避免 index 释放后被新 PTY 复用又被旧 close 删除。
+        if let Some(hook_arc) = tty.private_fields() {
+            if let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() {
+                hook.on_close(subtype);
             }
         }
 
@@ -399,7 +956,13 @@ pub fn ptmx_open(
 
     let index = fsinfo.alloc_index()?;
 
-    let tty = ptm_driver().init_tty_device(Some(index))?;
+    let tty = match ptm_driver().init_tty_device(Some(index)) {
+        Ok(tty) => tty,
+        Err(err) => {
+            fsinfo.free_index(index);
+            return Err(err);
+        }
+    };
 
     // 设置privdata
     *data = FilePrivateData::Tty(TtyFilePrivateData {
@@ -410,11 +973,20 @@ pub fn ptmx_open(
     let core = tty.core();
     core.flags_write().insert(TtyFlag::PTY_LOCK);
 
-    let _ = pts_root_inode.create(
+    let slave_inode = match pts_root_inode.create(
         &index.to_string(),
         FileType::CharDevice,
         InodeMode::from_bits_truncate(0x666),
-    )?;
+    ) {
+        Ok(slave_inode) => slave_inode,
+        Err(err) => {
+            ptm_driver().ttys().remove(&index);
+            pts_driver().ttys().remove(&index);
+            fsinfo.free_index(index);
+            *data = FilePrivateData::Unused;
+            return Err(err);
+        }
+    };
 
     // 在 master/slave 两端记录 devpts 根目录与 fs，用于精确清理：
     // - master close: unlink /dev/pts/N
@@ -422,6 +994,7 @@ pub fn ptmx_open(
     let hook = Arc::new(PtyDevPtsLink::new(
         Arc::downgrade(&pts_root_inode),
         Arc::downgrade(&fsinfo),
+        slave_inode,
         index,
     ));
     tty.set_private_fields(hook.clone());
@@ -429,7 +1002,94 @@ pub fn ptmx_open(
         slave.set_private_fields(hook);
     }
 
-    ptm_driver().driver_funcs().open(core)?;
+    if let Err(err) = ptm_driver().driver_funcs().open(core) {
+        ptm_driver().ttys().remove(&index);
+        pts_driver().ttys().remove(&index);
+        let _ = pts_root_inode.unlink(&index.to_string());
+        fsinfo.free_index(index);
+        *data = FilePrivateData::Unused;
+        return Err(err);
+    }
 
+    Ok(())
+}
+
+pub fn ptm_peer_inode(master: Arc<TtyCore>) -> Result<Arc<dyn IndexNode>, SystemError> {
+    let core = master.core();
+    if core.driver().tty_driver_sub_type() != TtyDriverSubType::PtyMaster {
+        return Err(SystemError::EIO);
+    }
+
+    let hook_arc = master.private_fields().ok_or(SystemError::EIO)?;
+    let hook = hook_arc
+        .as_any()
+        .downcast_ref::<PtyDevPtsLink>()
+        .ok_or(SystemError::EIO)?;
+    hook.slave_inode()
+}
+
+pub fn pty_file_close(tty: &TtyCore) {
+    let core = tty.core();
+    if core.driver().tty_driver_sub_type() != TtyDriverSubType::PtySlave {
+        return;
+    }
+
+    if let Some(hook_arc) = tty.private_fields() {
+        if let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() {
+            hook.on_slave_file_close();
+        }
+    }
+}
+
+pub fn pty_drain_pending_to(tty: Arc<TtyCore>) -> Result<(), SystemError> {
+    let Some(peer) = tty.core().link() else {
+        return Ok(());
+    };
+    let Some(hook_arc) = tty.private_fields() else {
+        return Ok(());
+    };
+    let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() else {
+        return Ok(());
+    };
+
+    let result = hook.drain_to_peer(peer.core().driver().tty_driver_sub_type(), tty)?;
+    if result.freed_backlog != 0 {
+        peer.tty_wakeup();
+    }
+    Ok(())
+}
+
+pub fn pty_discard_pending_to(tty: Arc<TtyCore>) -> Result<(), SystemError> {
+    let Some(peer) = tty.core().link() else {
+        return Ok(());
+    };
+    let Some(hook_arc) = tty.private_fields() else {
+        return Ok(());
+    };
+    let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() else {
+        return Ok(());
+    };
+
+    hook.clear_pending_from(peer.core().driver().tty_driver_sub_type())?;
+    peer.tty_wakeup();
+    Ok(())
+}
+
+pub fn pty_request_discard_pending_to(tty: Arc<TtyCore>) -> Result<(), SystemError> {
+    let Some(peer) = tty.core().link() else {
+        return Ok(());
+    };
+    let Some(hook_arc) = tty.private_fields() else {
+        return Ok(());
+    };
+    let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() else {
+        return Ok(());
+    };
+
+    let discarded =
+        hook.request_discard_pending_from(peer.core().driver().tty_driver_sub_type())?;
+    if discarded != 0 {
+        peer.tty_wakeup();
+    }
     Ok(())
 }

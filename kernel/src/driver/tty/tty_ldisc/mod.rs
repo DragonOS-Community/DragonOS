@@ -16,6 +16,9 @@ pub trait TtyLineDiscipline: Sync + Send + Debug {
     fn open(&self, tty: Arc<TtyCore>) -> Result<(), SystemError>;
     fn close(&self, tty: Arc<TtyCore>) -> Result<(), SystemError>;
     fn flush_buffer(&self, tty: Arc<TtyCore>) -> Result<(), SystemError>;
+    fn flush_output(&self, _tty: Arc<TtyCore>) -> Result<(), SystemError> {
+        Ok(())
+    }
 
     /// ## tty行规程循环读取函数
     ///

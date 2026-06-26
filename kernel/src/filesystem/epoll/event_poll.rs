@@ -761,11 +761,39 @@ impl EventPoll {
         }
 
         if let Some(removed) = epoll.ep_items.remove(&fd) {
-            let mut rs = epoll.ready_state.lock_irqsave();
-            rs.ready_list.retain(|item| !Arc::ptr_eq(item, &removed));
+            Self::remove_ready_item(epoll, &removed);
         }
 
         Ok(())
+    }
+
+    /// Remove an epoll item when the referenced file is being released.
+    ///
+    /// This is the DragonOS equivalent of Linux `eventpoll_release_file()`,
+    /// called from the file cleanup path rather than from `epoll_ctl(DEL)`.
+    pub fn release_file_epitem(epitem: &Arc<EPollItem>) {
+        let Some(epoll) = epitem.epoll().upgrade() else {
+            return;
+        };
+        let mut epoll = epoll.lock();
+        let fd = epitem.fd();
+        let Some(current) = epoll.ep_items.get(&fd).cloned() else {
+            return;
+        };
+        if !Arc::ptr_eq(&current, epitem) {
+            return;
+        }
+
+        epoll.ep_items.remove(&fd);
+        Self::remove_ready_item(&mut epoll, &current);
+    }
+
+    fn remove_ready_item(epoll: &mut MutexGuard<EventPoll>, epitem: &Arc<EPollItem>) {
+        let mut rs = epoll.ready_state.lock_irqsave();
+        rs.ready_list.retain(|item| !Arc::ptr_eq(item, epitem));
+        if let Some(ovflist) = rs.ovflist.as_mut() {
+            ovflist.retain(|item| !Arc::ptr_eq(item, epitem));
+        }
     }
 
     /// ## 修改已经注册的监听事件

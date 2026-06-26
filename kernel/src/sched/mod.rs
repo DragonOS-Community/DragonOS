@@ -56,7 +56,7 @@ use self::{
     cputime::{irq_time_read, CpuTimeFunc, IrqTime},
     fair::{CfsRunQueue, CompletelyFairScheduler, FairSchedEntity},
     fifo::FifoScheduler,
-    prio::PrioUtil,
+    prio::{PrioUtil, MAX_RT_PRIO},
 };
 
 static mut CPU_IRQ_TIME: Option<Vec<&'static mut IrqTime>> = None;
@@ -236,6 +236,9 @@ lazy_static! {
         | SchedFeature::TTWU_QUEUE
         | SchedFeature::SIS_UTIL
         | SchedFeature::RT_PUSH_IPI
+        | SchedFeature::PLACE_LAG
+        | SchedFeature::PLACE_DEADLINE_INITIAL
+        | SchedFeature::RUN_TO_PARITY
         | SchedFeature::ALT_PERIOD
         | SchedFeature::BASE_SLICE
         | SchedFeature::UTIL_EST
@@ -341,6 +344,12 @@ impl LoadWeight {
     pub const WMULT_CONST: u32 = !0;
 
     pub const NICE_0_LOAD_SHIFT: u32 = Self::SCHED_FIXEDPOINT_SHIFT + Self::SCHED_FIXEDPOINT_SHIFT;
+    pub const NICE_0_LOAD: u64 = 1u64 << Self::NICE_0_LOAD_SHIFT;
+    pub const SCHED_PRIO_TO_WEIGHT: [u64; 40] = [
+        88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916, 9548, 7620, 6100,
+        4904, 3906, 3121, 2501, 1991, 1586, 1277, 1024, 820, 655, 526, 423, 335, 272, 215, 172,
+        137, 110, 87, 70, 56, 45, 36, 29, 23, 18, 15,
+    ];
 
     pub fn update_load_add(&mut self, inc: u64) {
         self.weight += inc;
@@ -355,6 +364,11 @@ impl LoadWeight {
     pub fn update_load_set(&mut self, weight: u64) {
         self.weight = weight;
         self.inv_weight = 0;
+    }
+
+    pub fn set_load_weight_from_prio(&mut self, prio: i32) {
+        let index = (prio - MAX_RT_PRIO).clamp(0, Self::SCHED_PRIO_TO_WEIGHT.len() as i32 - 1);
+        self.update_load_set(Self::scale_load(Self::SCHED_PRIO_TO_WEIGHT[index as usize]));
     }
 
     /// ## 更新负载权重的倒数
@@ -670,17 +684,18 @@ impl CpuRunQueue {
         }
     }
 
-    /// 远端 wakeup/策略调整场景下的保守抢占检查。
+    /// 远端策略调整场景下的保守抢占检查。
     ///
-    /// Linux 会在持有目标 rq 锁且目标 rq 时钟已更新后执行完整的 wakeup-preempt 检查。
-    /// 当前明确禁止跨核 `update_rq_clock()`，因此远端路径只能保留那些不依赖
-    /// `rq.clock_task` 最新值的抢占决策：
+    /// Linux wakeup path 会在持有目标 rq 锁且目标 rq 时钟已更新后执行完整的
+    /// wakeup-preempt 检查；DragonOS 的 `ProcessManager::wakeup()` queued fast path
+    /// 也遵循这个约束。该函数只用于没有先更新目标 rq clock 的裸远端路径，
+    /// 因此只能保留那些不依赖 `rq.clock_task` 最新值的抢占决策：
     /// - 更高调度类抢占；
     /// - FIFO 优先级抢占；
     /// - idle 被非 idle 任务抢占。
     ///
-    /// CFS 的 wakeup-preempt 需要像 Linux `check_preempt_wakeup()` 一样先更新当前实体，
-    /// 这在远端场景会重新引入“错误 CPU 更新目标 rq 时钟”的问题，因此这里故意跳过。
+    /// CFS 的 wakeup-preempt 需要像 Linux `check_preempt_wakeup()` 一样先更新当前实体；
+    /// 调用者若不能证明已持目标 rq lock 并更新 rq clock，就必须在这里跳过。
     #[allow(clippy::comparison_chain)]
     pub fn check_preempt_remote(&mut self, pcb: &Arc<ProcessControlBlock>, flags: WakeupFlags) {
         let current = self.current();
@@ -739,17 +754,18 @@ impl CpuRunQueue {
     }
 
     pub fn dec_nr_iowait(&self) {
-        self.nr_iowait.fetch_sub(1, Ordering::Relaxed);
+        let result = self
+            .nr_iowait
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |nr| nr.checked_sub(1));
+        debug_assert!(result.is_ok(), "nr_iowait underflow");
     }
 
     /// 更新rq时钟
     pub fn update_rq_clock(&mut self) {
-        debug_assert_eq!(
-            self.cpu,
-            smp_get_processor_id(),
-            "update_rq_clock must run on its own cpu"
-        );
-
+        // Match Linux rq clock rules: callers may update a remote rq while
+        // holding that rq's lock. DragonOS sched_clock_cpu() returns a
+        // globally comparable clock on supported architectures, and irq time is
+        // tracked per CPU inside update_rq_clock_task().
         let clock = SchedClock::sched_clock_cpu(self.cpu);
         self.update_rq_clock_from_clock(clock);
     }
@@ -776,14 +792,6 @@ impl CpuRunQueue {
     /// 更新任务时钟
     pub fn update_rq_clock_task(&mut self, mut delta: u64) {
         let mut irq_delta = irq_time_read(self.cpu) - self.prev_irq_time;
-        // if self.cpu == 0 {
-        //     error!(
-        //         "cpu 0 delta {delta} irq_delta {} irq_time_read(self.cpu) {} self.prev_irq_time {}",
-        //         irq_delta,
-        //         irq_time_read(self.cpu),
-        //         self.prev_irq_time
-        //     );
-        // }
         compiler_fence(Ordering::SeqCst);
 
         if irq_delta > delta {
@@ -796,13 +804,9 @@ impl CpuRunQueue {
 
         // todo: psi?
 
-        // send_to_default_serial8250_port(format!("\n{delta}\n",).as_bytes());
         compiler_fence(Ordering::SeqCst);
         self.clock_task += delta;
         compiler_fence(Ordering::SeqCst);
-        // if self.cpu == 0 {
-        //     error!("cpu {} clock_task {}", self.cpu, self.clock_task);
-        // }
         // todo: pelt?
     }
 
@@ -868,7 +872,6 @@ impl CpuRunQueue {
         let cpu = self.cpu;
         let already_requested = current.flags().contains(ProcessFlags::NEED_SCHEDULE);
         current.flags().insert(ProcessFlags::NEED_SCHEDULE);
-
         if cpu == smp_get_processor_id() {
             return;
         }
@@ -953,6 +956,12 @@ bitflags! {
         const ALT_PERIOD = 1 << 12;
         /// 启用基本时间片
         const BASE_SLICE = 1 << 13;
+        /// EEVDF: once picked, keep running until ineligible or it gets a new slice.
+        const RUN_TO_PARITY = 1 << 14;
+        /// EEVDF: preserve virtual lag when placing entities.
+        const PLACE_LAG = 1 << 15;
+        /// EEVDF: give initial forked entities half a slice.
+        const PLACE_DEADLINE_INITIAL = 1 << 16;
     }
 
     pub struct EnqueueFlag: u8 {
@@ -1041,7 +1050,6 @@ pub fn scheduler_tick() {
 
     // 更新请求队列时钟
     rq.update_rq_clock();
-
     match current.sched_info().policy() {
         SchedPolicy::CFS => CompletelyFairScheduler::tick(rq, current, false),
         SchedPolicy::FIFO => FifoScheduler::tick(rq, current, false),
@@ -1133,61 +1141,6 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
     rq.update_rq_clock();
     rq.clock_updata_flags = ClockUpdataFlag::RQCF_UPDATE;
 
-    let mut migrate_prev_to = None;
-    if let Some(dest_cpu) = take_current_migration_target(&prev) {
-        // 当前任务迁移在真正切出当前 CPU 时才标记 rseq migrate，
-        // 避免在迁移请求发起后、任务仍运行在旧 CPU 时过早处理 NEED_RSEQ。
-        crate::process::rseq::Rseq::on_migrate(&prev);
-
-        debug_assert!(
-            !task_is_idle(&prev),
-            "idle task must not be migrated through current task migration"
-        );
-        debug_assert!(
-            cpu_is_online(dest_cpu),
-            "current task migration target {:?} must be online",
-            dest_cpu
-        );
-        debug_assert!(
-            prev.sched_info()
-                .cpus_allowed()
-                .get(dest_cpu)
-                .unwrap_or(false),
-            "current task migration target {:?} must be allowed by affinity",
-            dest_cpu
-        );
-
-        rq.deactivate_task(
-            prev.clone(),
-            DequeueFlag::DEQUEUE_MOVE | DequeueFlag::DEQUEUE_NOCLOCK,
-        );
-
-        if prev.sched_info().policy() == SchedPolicy::CFS {
-            let mut se = prev.sched_info().sched_entity();
-            crate::sched::fair::FairSchedEntity::for_each_in_group(&mut se, |se| {
-                se.cfs_rq().force_mut().set_current(Weak::default());
-                (true, true)
-            });
-        }
-
-        *prev.sched_info().on_rq.lock_irqsave() = OnRq::None;
-        migrate_prev_to = Some(dest_cpu);
-    }
-
-    // kBUG!(
-    //     "before cfs rq pcbs {:?}\nvruntimes {:?}\n",
-    //     rq.cfs
-    //         .entities
-    //         .iter()
-    //         .map(|x| { x.1.pcb().pid() })
-    //         .collect::<Vec<_>>(),
-    //     rq.cfs
-    //         .entities
-    //         .iter()
-    //         .map(|x| { x.1.vruntime })
-    //         .collect::<Vec<_>>(),
-    // );
-
     // 对标 Linux __schedule() 的 prev_state 检查：
     //   Linux 条件: (!(sched_mode & SM_MASK_PREEMPT) && prev_state)
     //   ——非抢占 + prev 非 RUNNING 时进入 deactivate 分支。
@@ -1200,23 +1153,26 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
     // on_rq == Queued 守卫保证 deactivate 幂等：
     //   若 stop_task 已出队（!is_current 分支），此处 on_rq != Queued，跳过。
     //   若 stop_task 未出队（远端 current 分支），此处 on_rq == Queued，执行出队。
-    {
-        let prev_state = prev.sched_info().state();
-        if !prev_state.is_runnable() {
-            let interruptible = prev_state.is_blocked_interruptable();
-            let wake_kill = prev_state.is_stopped();
+    let mut prev_state = prev.sched_info().state();
+    if !prev_state.is_runnable() {
+        let interruptible = prev_state.is_blocked_interruptable();
+        let wake_kill = prev_state.is_stopped();
 
-            // signal_pending_state 仅对 SM_NONE（自愿调度）生效：
-            //   TASK_INTERRUPTIBLE → 有任意信号 → 恢复 RUNNING
-            //   TASK_STOPPED       → 仅 SIGKILL → 恢复 RUNNING
-            //   TASK_UNINTERRUPTIBLE → 不检查信号，直接 deactivate
-            // SM_PREEMPT（被抢占）不检查信号，因为异步 stop 不应被信号恢复。
-            let signal_wake = !sched_mod.contains(SchedMode::SM_MASK_PREEMPT)
-                && Signal::signal_pending_state(interruptible, wake_kill, &prev);
+        // signal_pending_state 仅对 SM_NONE（自愿调度）生效：
+        //   TASK_INTERRUPTIBLE → 有任意信号 → 恢复 RUNNING
+        //   TASK_STOPPED       → 仅 SIGKILL → 恢复 RUNNING
+        //   TASK_UNINTERRUPTIBLE → 不检查信号，直接 deactivate
+        // SM_PREEMPT（被抢占）不检查信号，因为异步 stop 不应被信号恢复。
+        let signal_wake = !sched_mod.contains(SchedMode::SM_MASK_PREEMPT)
+            && Signal::signal_pending_state(interruptible, wake_kill, &prev);
 
-            if signal_wake {
-                prev.sched_info().set_state(ProcessState::Runnable);
-            } else if *prev.sched_info().on_rq.lock_irqsave() == OnRq::Queued {
+        if signal_wake {
+            prev.sched_info().set_state(ProcessState::Runnable);
+            prev_state = ProcessState::Runnable;
+        } else {
+            let _ = take_current_migration_target(&prev);
+
+            if *prev.sched_info().on_rq.lock_irqsave() == OnRq::Queued {
                 // sched_contributes_to_load 在 deactivate_task 之前
                 if matches!(prev_state, ProcessState::Blocked(false)) {
                     rq.nr_uninterruptible += 1;
@@ -1236,8 +1192,50 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
         }
     }
 
-    let next = rq.pick_next_task(prev.clone());
+    let mut migrate_prev_to = None;
+    if prev_state.is_runnable() {
+        if let Some(dest_cpu) = take_current_migration_target(&prev) {
+            // 当前任务迁移在真正切出当前 CPU 时才标记 rseq migrate，
+            // 避免在迁移请求发起后、任务仍运行在旧 CPU 时过早处理 NEED_RSEQ。
+            crate::process::rseq::Rseq::on_migrate(&prev);
 
+            debug_assert!(
+                !task_is_idle(&prev),
+                "idle task must not be migrated through current task migration"
+            );
+            debug_assert!(
+                cpu_is_online(dest_cpu),
+                "current task migration target {:?} must be online",
+                dest_cpu
+            );
+            debug_assert!(
+                prev.sched_info()
+                    .cpus_allowed()
+                    .get(dest_cpu)
+                    .unwrap_or(false),
+                "current task migration target {:?} must be allowed by affinity",
+                dest_cpu
+            );
+
+            rq.deactivate_task(
+                prev.clone(),
+                DequeueFlag::DEQUEUE_MOVE | DequeueFlag::DEQUEUE_NOCLOCK,
+            );
+
+            if prev.sched_info().policy() == SchedPolicy::CFS {
+                let mut se = prev.sched_info().sched_entity();
+                crate::sched::fair::FairSchedEntity::for_each_in_group(&mut se, |se| {
+                    se.cfs_rq().force_mut().set_current(Weak::default());
+                    (true, true)
+                });
+            }
+
+            *prev.sched_info().on_rq.lock_irqsave() = OnRq::None;
+            migrate_prev_to = Some(dest_cpu);
+        }
+    }
+
+    let next = rq.pick_next_task(prev.clone());
     if task_is_idle(&next) {
         IDLE_CPUS.set(rq.cpu);
     } else if task_is_idle(&prev) {
@@ -1307,6 +1305,12 @@ pub fn sched_fork(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
     pcb.sched_info()
         .sched_entity()
         .force_mut()
+        .load
+        .set_load_weight_from_prio(current.sched_info().static_prio());
+
+    pcb.sched_info()
+        .sched_entity()
+        .force_mut()
         .init_entity_runnable_average();
 
     Ok(())
@@ -1343,11 +1347,6 @@ fn __set_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {
     se.force_mut().set_cfs(Arc::downgrade(&rq.cfs));
 }
 
-pub fn rebind_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {
-    __set_task_cpu(pcb, cpu);
-    pcb.sched_info().set_on_cpu(Some(cpu));
-}
-
 /// 对标 Linux ttwu_queue + ttwu_do_activate
 pub fn enqueue_task_on_cpu(
     pcb: &Arc<ProcessControlBlock>,
@@ -1359,12 +1358,9 @@ pub fn enqueue_task_on_cpu(
     pcb.sched_info().set_on_cpu(Some(target_cpu));
 
     let rq = cpu_rq(target_cpu.data() as usize);
-    let update_clock = target_cpu == smp_get_processor_id();
     let (rq, _guard) = rq.self_lock();
 
-    if update_clock {
-        rq.update_rq_clock();
-    }
+    rq.update_rq_clock();
 
     if was_uninterruptible {
         rq.dec_nr_uninterruptible();
@@ -1381,11 +1377,7 @@ pub fn enqueue_task_on_cpu(
         IDLE_CPUS.clear(target_cpu);
     }
 
-    if update_clock {
-        rq.check_preempt_current(pcb, wake_flags);
-    } else {
-        rq.check_preempt_remote(pcb, wake_flags);
-    }
+    rq.check_preempt_current(pcb, wake_flags);
 }
 
 pub fn request_task_migration(
@@ -1393,13 +1385,9 @@ pub fn request_task_migration(
     dest_cpu: ProcessorId,
 ) -> Result<(), SystemError> {
     let Some(src_cpu) = pcb.sched_info().on_cpu() else {
-        // on_cpu == None can mean either first placement of a new task or
-        // migration of an existing off-rq task. Only the latter is an rseq
-        // migration event.
-        if !pcb.sched_info().is_new_task() {
-            crate::process::rseq::Rseq::on_migrate(pcb);
-        }
-        rebind_task_cpu(pcb, dest_cpu);
+        // A new task consumes its placement hint in wake_up_new_task(). An
+        // existing off-rq task must keep its previous task_cpu until wakeup so
+        // sleep/iowait accounting is charged back to the rq that dequeued it.
         return Ok(());
     };
 
@@ -1441,8 +1429,10 @@ pub fn request_task_migration(
         return Ok(());
     }
 
-    crate::process::rseq::Rseq::on_migrate(pcb);
-    rebind_task_cpu(pcb, dest_cpu);
+    // Linux does not set_task_cpu() for blocked tasks directly. DragonOS
+    // wakeup() uses task_cpu as the previous rq for sleep/iowait accounting and
+    // then selects a legal target from cpus_allowed, so keep off-rq tasks bound
+    // to the rq that actually dequeued them.
     Ok(())
 }
 
@@ -1451,10 +1441,10 @@ pub fn take_current_migration_target(current: &Arc<ProcessControlBlock>) -> Opti
         return None;
     }
 
-    let dest_cpu = current.sched_info().migrate_to()?;
+    let dest_cpu = current.sched_info().migrate_to();
     current.sched_info().set_migrate_to(None);
     current.flags().remove(ProcessFlags::NEED_MIGRATE);
-    Some(dest_cpu)
+    dest_cpu
 }
 
 #[inline(never)]

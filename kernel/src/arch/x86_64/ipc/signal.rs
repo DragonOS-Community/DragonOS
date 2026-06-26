@@ -28,14 +28,44 @@ use crate::{
         },
     },
     mm::MemoryManagementArch,
-    process::ProcessManager,
-    syscall::user_access::UserBufferWriter,
+    process::{ProcessFlags, ProcessManager},
+    syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 
 /// 信号处理的栈的栈指针的最小对齐数量
 pub const STACK_ALIGN: u64 = 16;
 /// 信号最大值
 pub const MAX_SIG_NUM: usize = 64;
+
+const UC_FP_XSTATE: u64 = 0x1;
+const UC_SIGCONTEXT_SS: u64 = 0x2;
+const UC_STRICT_RESTORE_SS: u64 = 0x4;
+
+const FP_XSTATE_MAGIC1: u32 = 0x4650_5853;
+const FP_XSTATE_MAGIC2: u32 = 0x4650_5845;
+const FP_XSTATE_MAGIC2_SIZE: usize = size_of::<u32>();
+const FPSTATE_FRAME_SIZE: usize = size_of::<UserXState>() + FP_XSTATE_MAGIC2_SIZE;
+
+const X86_EFLAGS_CF: u64 = 1 << 0;
+const X86_EFLAGS_PF: u64 = 1 << 2;
+const X86_EFLAGS_AF: u64 = 1 << 4;
+const X86_EFLAGS_ZF: u64 = 1 << 6;
+const X86_EFLAGS_SF: u64 = 1 << 7;
+const X86_EFLAGS_TF: u64 = 1 << 8;
+const X86_EFLAGS_DF: u64 = 1 << 10;
+const X86_EFLAGS_OF: u64 = 1 << 11;
+const X86_EFLAGS_RF: u64 = 1 << 16;
+const X86_EFLAGS_AC: u64 = 1 << 18;
+const FIX_EFLAGS: u64 = X86_EFLAGS_AC
+    | X86_EFLAGS_OF
+    | X86_EFLAGS_DF
+    | X86_EFLAGS_TF
+    | X86_EFLAGS_SF
+    | X86_EFLAGS_ZF
+    | X86_EFLAGS_AF
+    | X86_EFLAGS_PF
+    | X86_EFLAGS_CF
+    | X86_EFLAGS_RF;
 
 // ===== Linux 兼容的信号栈帧结构 =====
 
@@ -76,6 +106,16 @@ struct UserFpState64 {
     pub xmm_space: [u32; 64], // 16个 XMM 寄存器，每个16字节
     pub reserved2: [u32; 12],
     pub reserved3: [u32; 12],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct FpxSwBytes {
+    magic1: u32,
+    extended_size: u32,
+    xfeatures: u64,
+    xstate_size: u32,
+    padding: [u32; 7],
 }
 
 /// 完整的 XSAVE 状态结构（包含 AVX 扩展）
@@ -162,11 +202,8 @@ impl UserSigSet {
     }
 }
 
-/// 与 Linux 兼容的 ucontext 结构
-/// 参考: /usr/include/bits/types/struct_ucontext.h
-///
-/// 注意：为了支持 AVX，我们扩展了 __fpregs_mem 以包含完整的 XSAVE 状态。
-/// 这与 Linux 的布局略有不同，但对用户态透明（通过 fpstate 指针访问）。
+/// 与 Linux x86_64 内核 sigframe 兼容的 ucontext 结构
+/// 参考: Linux arch/x86/include/uapi/asm/ucontext.h
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct UserUContext {
@@ -175,25 +212,43 @@ struct UserUContext {
     pub uc_stack: StackT,
     pub uc_mcontext: UserSigContext,
     pub uc_sigmask: UserSigSet, // 使用 Linux 兼容的 1024-bit sigset
-    /// 实际的 fpstate 数据（包含完整的 XSAVE 状态以支持 AVX）
-    pub __fpregs_mem: UserXState,
 }
 
 // 编译期校验关键字段偏移量与 Linux 的兼容性
-// 注意：uc_sigmask 之前的字段保持与 Linux 兼容
-// __fpregs_mem 由于 UserXState 需要 64 字节对齐，可能有填充
 const _: () = {
     assert!(core::mem::offset_of!(UserUContext, uc_stack) == 16);
     assert!(core::mem::offset_of!(UserUContext, uc_mcontext) == 40);
     assert!(core::mem::offset_of!(UserUContext, uc_sigmask) == 296);
-    // __fpregs_mem 需要 64 字节对齐，所以偏移量会被调整
-    // 424 + padding to 64-byte boundary = 448
-    assert!(core::mem::offset_of!(UserUContext, __fpregs_mem) % 64 == 0);
+    assert!(core::mem::size_of::<UserUContext>() == 424);
     // UserXState = 512 (FXSAVE) + 64 (header) + 256 (AVX) = 832 bytes
     assert!(core::mem::size_of::<UserXState>() == 832);
 };
 
 impl UserXState {
+    fn user_size() -> usize {
+        size_of::<UserXState>()
+    }
+
+    fn build_sw_bytes(&self) -> FpxSwBytes {
+        FpxSwBytes {
+            magic1: FP_XSTATE_MAGIC1,
+            extended_size: (Self::user_size() + FP_XSTATE_MAGIC2_SIZE) as u32,
+            xfeatures: self.header.xfeatures,
+            xstate_size: Self::user_size() as u32,
+            padding: [0; 7],
+        }
+    }
+
+    fn install_sw_bytes(&mut self) {
+        let sw_bytes = self.build_sw_bytes();
+        self.fpstate.reserved3[0] = sw_bytes.magic1;
+        self.fpstate.reserved3[1] = sw_bytes.extended_size;
+        self.fpstate.reserved3[2] = sw_bytes.xfeatures as u32;
+        self.fpstate.reserved3[3] = (sw_bytes.xfeatures >> 32) as u32;
+        self.fpstate.reserved3[4] = sw_bytes.xstate_size;
+        self.fpstate.reserved3[5..12].copy_from_slice(&sw_bytes.padding);
+    }
+
     fn validate_for_sigreturn(&self) -> Result<(), SystemError> {
         let mxcsr_mask = FpState::mxcsr_feature_mask();
         if self.fpstate.mxcsr & !mxcsr_mask != 0 {
@@ -290,11 +345,13 @@ impl UserXState {
             }
         }
 
-        Self {
+        let mut user_xstate = Self {
             fpstate,
             header,
             avx,
-        }
+        };
+        user_xstate.install_sw_bytes();
+        user_xstate
     }
 
     /// 从用户态 XSAVE 状态转换回内核 FpState
@@ -468,8 +525,13 @@ impl UserUContext {
     /// 从 TrapFrame 创建 UserUContext
     #[inline(never)]
     pub fn from_trapframe(frame: &TrapFrame, oldset: &SigSet, cr2: u64) -> Self {
+        let mut uc_flags = UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS;
+        if FpState::is_xsave_enabled() {
+            uc_flags |= UC_FP_XSTATE;
+        }
+
         Self {
-            uc_flags: 0,
+            uc_flags,
             uc_link: core::ptr::null_mut(),
             uc_stack: StackT {
                 ss_sp: core::ptr::null_mut(),
@@ -507,7 +569,6 @@ impl UserUContext {
                 reserved1: [0; 8],
             },
             uc_sigmask: UserSigSet::from_kernel_sigset(oldset),
-            __fpregs_mem: UserXState::default(),
         }
     }
 
@@ -530,7 +591,7 @@ impl UserUContext {
         frame.rcx = self.uc_mcontext.rcx;
         frame.rsp = self.uc_mcontext.rsp;
         frame.rip = self.uc_mcontext.rip;
-        frame.rflags = self.uc_mcontext.eflags;
+        frame.rflags = (frame.rflags & !FIX_EFLAGS) | (self.uc_mcontext.eflags & FIX_EFLAGS);
         // 注意: cs, ss 等段寄存器不恢复，由内核管理
     }
 }
@@ -582,52 +643,49 @@ impl Default for X86SigStack {
 }
 
 /// Linux 兼容的信号栈帧结构
-/// 这个结构布局与 Linux 完全兼容，用户态可以通过 ucontext 访问寄存器和 FP 状态
-#[repr(C, align(16))]
+/// x86_64 Linux 布局为 pretcode, ucontext, siginfo，FP/XSAVE 状态跟随在结构之后。
+#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct SigFrame {
     /// 指向restorer的地址的指针
     pub ret_code_ptr: *mut c_void,
+    /// ucontext_t 结构
+    pub ucontext: UserUContext,
     /// siginfo_t 结构
     pub siginfo: PosixSigInfo,
-    /// ucontext_t 结构（内含 fpstate 和 __ssp）
-    pub ucontext: UserUContext,
 }
 
 impl SigFrame {
-    /// 安全地设置 fpstate 指针，指向 ucontext 内的 __fpregs_mem 的 FXSAVE 兼容部分
-    pub fn setup_fpstate_pointer(&mut self) {
-        // fpstate 指针指向 UserXState 的 fpstate 字段（FXSAVE 兼容部分）
+    /// 设置 fpstate 指针，指向 sigframe 后方独立的 64 字节对齐 XSAVE 区域。
+    pub fn setup_fpstate_pointer(&mut self, fpstate_ptr: *mut UserXState) {
         self.ucontext.uc_mcontext.fpstate =
-            &mut self.ucontext.__fpregs_mem.fpstate as *mut UserFpState64;
+            unsafe { &mut (*fpstate_ptr).fpstate as *mut UserFpState64 };
     }
 
-    /// 安全地获取完整 fpstate (包含 AVX) 的可变引用
-    pub fn fpstate_mut(&mut self) -> &mut UserXState {
-        &mut self.ucontext.__fpregs_mem
-    }
-
-    /// 从栈帧恢复 fpstate，包含安全性检查（防止 SROP 攻击）
+    /// 从 sigcontext 指向的用户 fpstate 恢复完整 XSAVE 状态。
     /// 返回包含完整 XSAVE 状态（包括 AVX）的 FpState
     pub fn restore_fpstate(&self) -> Result<Option<FpState>, SystemError> {
         if self.ucontext.uc_mcontext.fpstate.is_null() {
             return Ok(None);
         }
 
-        // 验证指针确实指向 ucontext 内的 __fpregs_mem.fpstate
-        let expected_addr = &self.ucontext.__fpregs_mem.fpstate as *const UserFpState64;
-        if !core::ptr::eq(self.ucontext.uc_mcontext.fpstate as *const _, expected_addr) {
-            // 指针被篡改，这可能是 SROP 攻击
-            error!(
-                "fpstate pointer mismatch: expected={:p}, got={:p}, possible SROP attack",
-                expected_addr, self.ucontext.uc_mcontext.fpstate
-            );
-            return Err(SystemError::EFAULT);
-        }
-
-        // 使用 UserXState::to_kernel_fpstate 恢复完整的 XSAVE 状态（包括 AVX）
-        self.ucontext.__fpregs_mem.to_kernel_fpstate().map(Some)
+        let fpstate_ptr = self.ucontext.uc_mcontext.fpstate as *const UserXState;
+        let reader = UserBufferReader::new(fpstate_ptr, size_of::<UserXState>(), true)?;
+        let mut user_xstate = UserXState::default();
+        reader.copy_one_from_user(&mut user_xstate, 0)?;
+        user_xstate.to_kernel_fpstate().map(Some)
     }
+}
+
+const _: () = {
+    assert!(core::mem::offset_of!(SigFrame, ucontext) == 8);
+    assert!(core::mem::offset_of!(SigFrame, siginfo) == 432);
+    assert!(core::mem::size_of::<SigFrame>() == 560);
+};
+
+struct SignalFrameLocation {
+    frame: *mut SigFrame,
+    fpstate: *mut UserXState,
 }
 
 unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
@@ -656,6 +714,11 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     let mut info: Option<SigInfo>;
     let mut sigaction: Option<Sigaction>;
     let sig_block: SigSet = *siginfo_read_guard.sig_blocked();
+    let frame_oldset = if pcb.flags().contains(ProcessFlags::RESTORE_SIG_MASK) {
+        *siginfo_read_guard.saved_sigmask()
+    } else {
+        sig_block
+    };
     drop(siginfo_read_guard);
 
     loop {
@@ -725,8 +788,8 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
         }
     }
 
-    let oldset = sig_block;
     // no sig_struct guard to drop
+    pcb.flags().remove(ProcessFlags::RESTORE_SIG_MASK);
     drop(pcb);
     // 做完上面的检查后，开中断
     CurrentIrqArch::interrupt_enable();
@@ -754,6 +817,13 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
         }
     }
     *got_signal = true;
+
+    let oldset = frame_oldset;
+    let mut blocked = sig_block | sigaction.mask();
+    if !sigaction.flags().contains(SigFlags::SA_NODEFER) {
+        blocked.insert(sig_number.into());
+    }
+    set_current_blocked(&mut blocked);
 
     // 注意！由于handle_signal里面可能会退出进程，
     // 因此这里需要检查清楚：上面所有的锁、arc指针都被释放了。否则会产生资源泄露的问题！
@@ -840,7 +910,6 @@ impl SignalArch for X86_64SignalArch {
         }
 
         let frame = unsafe { &*frame_ptr };
-
         // 1. 恢复信号掩码（从 1024-bit 用户态格式转换到 64-bit 内核格式）
         let mut sigmask = frame.ucontext.uc_sigmask.to_kernel_sigset();
         set_current_blocked(&mut sigmask);
@@ -988,11 +1057,20 @@ fn setup_frame(
     }
 
     // 分配新的信号栈帧
-    let frame_ptr: *mut SigFrame = get_stack(sigaction, trap_frame, size_of::<SigFrame>());
+    let frame_location = get_stack(sigaction, trap_frame, size_of::<SigFrame>());
+    let frame_ptr = frame_location.frame;
 
     // 验证地址位于用户空间
     UserBufferWriter::new(frame_ptr, size_of::<SigFrame>(), true).map_err(|_| {
         error!("In setup_frame: access check failed");
+        let _ = crate::ipc::kill::send_signal_to_pid(
+            ProcessManager::current_pcb().raw_pid(),
+            Signal::SIGSEGV,
+        );
+        SystemError::EFAULT
+    })?;
+    UserBufferWriter::new(frame_location.fpstate, FPSTATE_FRAME_SIZE, true).map_err(|_| {
+        error!("In setup_frame: fpstate access check failed");
         let _ = crate::ipc::kill::send_signal_to_pid(
             ProcessManager::current_pcb().raw_pid(),
             Signal::SIGSEGV,
@@ -1022,10 +1100,18 @@ fn setup_frame(
     // 3. 写入用户栈（可能触发缺页，必须在释放锁后进行）
     frame.ucontext = user_ucontext;
     if let Some(fpstate) = user_fpstate {
-        *frame.fpstate_mut() = fpstate;
+        let mut fp_writer =
+            UserBufferWriter::new(frame_location.fpstate, size_of::<UserXState>(), true)?;
+        fp_writer.copy_one_to_user(&fpstate, 0)?;
+        let mut magic_writer = UserBufferWriter::new(
+            unsafe { (frame_location.fpstate as *mut u8).add(size_of::<UserXState>()) as *mut u32 },
+            FP_XSTATE_MAGIC2_SIZE,
+            true,
+        )?;
+        magic_writer.copy_one_to_user(&FP_XSTATE_MAGIC2, 0)?;
     }
     // 设置 fpstate 指针指向栈帧内的 fpstate
-    frame.setup_fpstate_pointer();
+    frame.setup_fpstate_pointer(frame_location.fpstate);
 
     // 4. 复制 siginfo
     info.copy_posix_siginfo_to_user(&mut frame.siginfo as *mut PosixSigInfo)
@@ -1042,18 +1128,20 @@ fn setup_frame(
 
     // 6. 设置 trap_frame，准备进入信号处理函数
     trap_frame.rdi = sig as u64; // 参数1: 信号编号
+    trap_frame.rax = 0; // Linux x86_64: support handlers declared without prototypes
     trap_frame.rsi = &frame.siginfo as *const _ as u64; // 参数2: siginfo_t*
     trap_frame.rdx = &frame.ucontext as *const _ as u64; // 参数3: ucontext_t*
     trap_frame.rsp = frame_ptr as u64;
     trap_frame.rip = handler_addr as u64;
     trap_frame.cs = (USER_CS.bits() | 0x3) as u64;
     trap_frame.ds = (USER_DS.bits() | 0x3) as u64;
+    trap_frame.rflags &= !(X86_EFLAGS_DF | X86_EFLAGS_RF | X86_EFLAGS_TF);
 
     Ok(0)
 }
 
 #[inline(always)]
-fn get_stack(sigaction: &mut Sigaction, frame: &TrapFrame, size: usize) -> *mut SigFrame {
+fn get_stack(sigaction: &mut Sigaction, frame: &TrapFrame, size: usize) -> SignalFrameLocation {
     let pcb = ProcessManager::current_pcb();
     let stack = pcb.sig_altstack();
 
@@ -1064,14 +1152,20 @@ fn get_stack(sigaction: &mut Sigaction, frame: &TrapFrame, size: usize) -> *mut 
         && !stack.flags.contains(SigStackFlags::SS_DISABLE)
         && !stack.on_sig_stack(frame.rsp as usize)
     {
-        rsp = stack.sp + stack.size as usize - size;
+        rsp = stack.sp + stack.size as usize;
     } else {
-        // 默认使用用户栈：rsp - 红区(128) - size
-        rsp = (frame.rsp as usize) - 128 - size;
+        // 默认使用用户栈：先跳过 x86_64 ABI red zone。
+        rsp = (frame.rsp as usize) - 128;
     }
 
-    // 16字节对齐，减8是为了保持 x86_64 ABI 的栈对齐约定
+    let fpstate = (rsp - FPSTATE_FRAME_SIZE) & !(64 - 1);
+    rsp = fpstate - size;
+
+    // 16字节对齐，减8是为了保持 x86_64 ABI 的栈对齐约定。
     rsp = (rsp & !(STACK_ALIGN - 1) as usize) - 8;
 
-    rsp as *mut SigFrame
+    SignalFrameLocation {
+        frame: rsp as *mut SigFrame,
+        fpstate: fpstate as *mut UserXState,
+    }
 }

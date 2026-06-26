@@ -7,7 +7,7 @@ use crate::libs::rwsem::RwSem;
 use crate::register_mountable_fs;
 use crate::{
     arch::MMArch,
-    driver::base::device::device_number::DeviceNumber,
+    driver::base::device::device_number::{DeviceNumber, Major},
     filesystem::vfs::{vcore::generate_inode_id, FileType},
     ipc::pipe::LockedPipeInode,
     libs::casting::DowncastArc,
@@ -37,6 +37,157 @@ use super::vfs::{Magic, MountableFileSystem, SuperBlock};
 /// RamFS的inode名称的最大长度
 const RAMFS_MAX_NAMELEN: usize = 64;
 const RAMFS_BLOCK_SIZE: u64 = 512;
+const WHITEOUT_DEV: DeviceNumber = DeviceNumber::new(Major::UNNAMED_MAJOR, 0);
+
+fn ramfs_move_entry_between_dirs(
+    src_dir: &mut RamFSInode,
+    dst_dir: &mut RamFSInode,
+    old_key: &DName,
+    new_key: &DName,
+    flags: RenameFlags,
+) -> Result<(), SystemError> {
+    if src_dir.metadata.file_type != FileType::Dir || dst_dir.metadata.file_type != FileType::Dir {
+        return Err(SystemError::ENOTDIR);
+    }
+
+    let src_self = src_dir.self_ref.upgrade().ok_or(SystemError::EIO)?;
+    let dst_self = dst_dir.self_ref.upgrade().ok_or(SystemError::EIO)?;
+    let inode_to_move = src_dir
+        .children
+        .get(old_key)
+        .cloned()
+        .ok_or(SystemError::ENOENT)?;
+    let old_type = inode_to_move.0.lock().metadata.file_type;
+
+    if flags.contains(RenameFlags::EXCHANGE) {
+        let existing = dst_dir
+            .children
+            .get(new_key)
+            .cloned()
+            .ok_or(SystemError::ENOENT)?;
+        if Arc::ptr_eq(&inode_to_move, &existing) {
+            return Ok(());
+        }
+        let existing_type = existing.0.lock().metadata.file_type;
+
+        src_dir.children.insert(old_key.clone(), existing.clone());
+        dst_dir
+            .children
+            .insert(new_key.clone(), inode_to_move.clone());
+        if old_type == FileType::Dir {
+            src_dir.metadata.nlinks = src_dir.metadata.nlinks.saturating_sub(1);
+            dst_dir.metadata.nlinks = dst_dir.metadata.nlinks.saturating_add(1);
+        }
+        if existing_type == FileType::Dir {
+            dst_dir.metadata.nlinks = dst_dir.metadata.nlinks.saturating_sub(1);
+            src_dir.metadata.nlinks = src_dir.metadata.nlinks.saturating_add(1);
+        }
+
+        {
+            let mut moved = inode_to_move.0.lock();
+            moved.parent = Arc::downgrade(&dst_self);
+            moved.name = new_key.clone();
+        }
+        {
+            let mut replaced = existing.0.lock();
+            replaced.parent = Arc::downgrade(&src_self);
+            replaced.name = old_key.clone();
+        }
+        return Ok(());
+    }
+
+    if let Some(existing) = dst_dir.children.get(new_key).cloned() {
+        if flags.contains(RenameFlags::NOREPLACE) {
+            return Err(SystemError::EEXIST);
+        }
+
+        let (existing_id, existing_type, existing_dir_nonempty) = {
+            let guard = existing.0.lock();
+            let t = guard.metadata.file_type;
+            let nonempty = t == FileType::Dir && !guard.children.is_empty();
+            (guard.metadata.inode_id, t, nonempty)
+        };
+        let to_move_id = inode_to_move.0.lock().metadata.inode_id;
+        if existing_id == to_move_id {
+            src_dir.children.remove(old_key);
+            return Ok(());
+        }
+
+        if old_type == FileType::Dir && existing_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+        if old_type != FileType::Dir && existing_type == FileType::Dir {
+            return Err(SystemError::EISDIR);
+        }
+        if old_type == FileType::Dir && existing_dir_nonempty {
+            return Err(SystemError::ENOTEMPTY);
+        }
+
+        dst_dir.children.remove(new_key);
+        let mut existing_guard = existing.0.lock();
+        if existing_type == FileType::Dir {
+            dst_dir.metadata.nlinks = dst_dir.metadata.nlinks.saturating_sub(1);
+            existing_guard.metadata.nlinks = 0;
+        } else {
+            existing_guard.metadata.nlinks = existing_guard.metadata.nlinks.saturating_sub(1);
+        }
+    }
+
+    src_dir.children.remove(old_key);
+    if flags.contains(RenameFlags::WHITEOUT) {
+        ramfs_insert_whiteout(src_dir, old_key)?;
+    }
+    if old_type == FileType::Dir {
+        src_dir.metadata.nlinks = src_dir.metadata.nlinks.saturating_sub(1);
+        dst_dir.metadata.nlinks = dst_dir.metadata.nlinks.saturating_add(1);
+    }
+    dst_dir
+        .children
+        .insert(new_key.clone(), inode_to_move.clone());
+
+    let mut moved = inode_to_move.0.lock();
+    moved.parent = Arc::downgrade(&dst_self);
+    moved.name = new_key.clone();
+    Ok(())
+}
+
+fn ramfs_insert_whiteout(dir: &mut RamFSInode, name: &DName) -> Result<(), SystemError> {
+    if dir.children.contains_key(name) {
+        return Err(SystemError::EEXIST);
+    }
+
+    let whiteout = Arc::new(LockedRamFSInode(Mutex::new(RamFSInode {
+        parent: dir.self_ref.clone(),
+        self_ref: Weak::default(),
+        children: BTreeMap::new(),
+        data: Vec::new(),
+        metadata: Metadata {
+            dev_id: 0,
+            inode_id: generate_inode_id(),
+            size: 0,
+            blk_size: 0,
+            blocks: 0,
+            atime: PosixTimeSpec::default(),
+            mtime: PosixTimeSpec::default(),
+            ctime: PosixTimeSpec::default(),
+            btime: PosixTimeSpec::default(),
+            file_type: FileType::CharDevice,
+            mode: InodeMode::S_IFCHR | InodeMode::from_bits_truncate(0o600),
+            nlinks: 1,
+            uid: 0,
+            gid: 0,
+            raw_dev: WHITEOUT_DEV,
+            flags: InodeFlags::empty(),
+        },
+        fs: dir.fs.clone(),
+        special_node: None,
+        name: name.clone(),
+    })));
+    whiteout.0.lock().self_ref = Arc::downgrade(&whiteout);
+    dir.children.insert(name.clone(), whiteout);
+    Ok(())
+}
+
 /// @brief 内存文件系统的Inode结构体
 #[derive(Debug)]
 pub struct LockedRamFSInode(pub Mutex<RamFSInode>);
@@ -365,6 +516,18 @@ impl IndexNode for LockedRamFSInode {
         }
     }
 
+    fn fallocate_file(
+        &self,
+        mode: i32,
+        offset: usize,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        drop(data);
+        super::vfs::vcore::resize_based_fallocate(self, mode, offset, len, lock_owner)
+    }
+
     fn create_with_data(
         &self,
         name: &str,
@@ -511,49 +674,95 @@ impl IndexNode for LockedRamFSInode {
         new_name: &str,
         flags: RenameFlags,
     ) -> Result<(), SystemError> {
-        let inode_to_move = self
-            .find(old_name)?
+        let old_key = DName::from(old_name);
+        let new_name = DName::from(new_name);
+        let target_locked = target
+            .clone()
             .downcast_arc::<LockedRamFSInode>()
             .ok_or(SystemError::EINVAL)?;
 
-        let new_name = DName::from(new_name);
+        let self_id = self.0.lock().metadata.inode_id;
+        let target_id = target_locked.0.lock().metadata.inode_id;
 
-        inode_to_move.0.lock().name = new_name.clone();
+        if self_id == target_id {
+            let mut dir = self.0.lock();
+            let inode_to_move = dir
+                .children
+                .get(&old_key)
+                .cloned()
+                .ok_or(SystemError::ENOENT)?;
+            let old_type = inode_to_move.0.lock().metadata.file_type;
 
-        let target_id = target.metadata()?.inode_id;
+            if flags.contains(RenameFlags::EXCHANGE) {
+                let existing = dir
+                    .children
+                    .get(&new_name)
+                    .cloned()
+                    .ok_or(SystemError::ENOENT)?;
+                let to_move_id = inode_to_move.0.lock().metadata.inode_id;
+                let existing_id = existing.0.lock().metadata.inode_id;
+                if existing_id == to_move_id {
+                    return Ok(());
+                }
 
-        let mut self_inode = self.0.lock();
-        // 判断是否在同一目录下, 是则进行重命名
-        if target_id == self_inode.metadata.inode_id {
-            if flags.contains(RenameFlags::NOREPLACE) && self_inode.children.contains_key(&new_name)
-            {
-                return Err(SystemError::EEXIST);
+                dir.children.insert(old_key.clone(), existing.clone());
+                dir.children.insert(new_name.clone(), inode_to_move.clone());
+                existing.0.lock().name = old_key;
+                inode_to_move.0.lock().name = new_name;
+                return Ok(());
             }
-            self_inode.children.remove(&DName::from(old_name));
-            self_inode.children.insert(new_name, inode_to_move);
+
+            if let Some(existing) = dir.children.get(&new_name).cloned() {
+                if flags.contains(RenameFlags::NOREPLACE) {
+                    return Err(SystemError::EEXIST);
+                }
+
+                let existing_id = existing.0.lock().metadata.inode_id;
+                let to_move_id = inode_to_move.0.lock().metadata.inode_id;
+                if existing_id == to_move_id {
+                    return Ok(());
+                }
+
+                let existing_type = existing.0.lock().metadata.file_type;
+                if old_type == FileType::Dir && existing_type != FileType::Dir {
+                    return Err(SystemError::ENOTDIR);
+                }
+                if old_type != FileType::Dir && existing_type == FileType::Dir {
+                    return Err(SystemError::EISDIR);
+                }
+                if old_type == FileType::Dir && !existing.0.lock().children.is_empty() {
+                    return Err(SystemError::ENOTEMPTY);
+                }
+
+                dir.children.remove(&new_name);
+                let mut existing_guard = existing.0.lock();
+                if existing_type == FileType::Dir {
+                    dir.metadata.nlinks = dir.metadata.nlinks.saturating_sub(1);
+                    existing_guard.metadata.nlinks = 0;
+                } else {
+                    existing_guard.metadata.nlinks =
+                        existing_guard.metadata.nlinks.saturating_sub(1);
+                }
+            }
+
+            dir.children.remove(&old_key);
+            if flags.contains(RenameFlags::WHITEOUT) {
+                ramfs_insert_whiteout(&mut dir, &old_key)?;
+            }
+            dir.children.insert(new_name.clone(), inode_to_move.clone());
+            inode_to_move.0.lock().name = new_name;
             return Ok(());
         }
-        drop(self_inode);
 
-        // 修改其对父节点的引用
-        inode_to_move.0.lock().parent = Arc::downgrade(
-            &target
-                .clone()
-                .downcast_arc::<LockedRamFSInode>()
-                .ok_or(SystemError::EINVAL)?,
-        );
-
-        // 在新的目录下创建一个硬链接
-        target.link(new_name.as_ref(), &(inode_to_move as Arc<dyn IndexNode>))?;
-
-        // 取消现有的目录下的这个硬链接
-        if let Err(e) = self.unlink(old_name) {
-            // 当操作失败时回退操作
-            target.unlink(new_name.as_ref())?;
-            return Err(e);
+        if self_id < target_id {
+            let mut src_dir = self.0.lock();
+            let mut dst_dir = target_locked.0.lock();
+            ramfs_move_entry_between_dirs(&mut src_dir, &mut dst_dir, &old_key, &new_name, flags)
+        } else {
+            let mut dst_dir = target_locked.0.lock();
+            let mut src_dir = self.0.lock();
+            ramfs_move_entry_between_dirs(&mut src_dir, &mut dst_dir, &old_key, &new_name, flags)
         }
-
-        return Ok(());
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {

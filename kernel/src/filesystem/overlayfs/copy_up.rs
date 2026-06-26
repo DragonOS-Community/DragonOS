@@ -1,10 +1,15 @@
 use super::OvlInode;
-use crate::{
-    filesystem::vfs::{FileType, IndexNode, Metadata},
-    libs::mutex::Mutex,
+use crate::filesystem::vfs::{
+    file::{File, FileFlags},
+    FileType, IndexNode, Metadata,
 };
+use alloc::string::String;
 use alloc::sync::Arc;
 use system_error::SystemError;
+
+const COPY_UP_CHUNK_SIZE: usize = 64 * 1024;
+type UpperCleanup = Option<(Arc<dyn IndexNode>, String)>;
+type CreatedUpper = (Arc<dyn IndexNode>, UpperCleanup);
 
 impl OvlInode {
     pub fn copy_up(&self) -> Result<(), SystemError> {
@@ -16,14 +21,47 @@ impl OvlInode {
         let lower_inode = self.lower_inodes.first().ok_or(SystemError::ENOENT)?;
 
         let metadata = lower_inode.metadata()?;
-        let new_upper_inode = self.create_upper_inode(metadata.clone())?;
+        let (new_upper_inode, cleanup) = self.create_upper_inode(metadata.clone())?;
 
-        if metadata.file_type == FileType::File {
-            let mut buffer = vec![0u8; metadata.size as usize];
-            let lock = Mutex::new(crate::filesystem::vfs::FilePrivateData::Unused);
-            lower_inode.read_at(0, metadata.size as usize, &mut buffer, lock.lock())?;
+        let copy_result = (|| -> Result<(), SystemError> {
+            if metadata.file_type == FileType::File {
+                let size = metadata.size.max(0) as usize;
+                let lower_file = File::new(lower_inode.clone(), FileFlags::O_RDONLY)?;
+                let upper_file = File::new(new_upper_inode.clone(), FileFlags::O_WRONLY)?;
+                let mut buffer = vec![0u8; COPY_UP_CHUNK_SIZE.min(size.max(1))];
+                let mut offset = 0usize;
 
-            new_upper_inode.write_at(0, metadata.size as usize, &buffer, lock.lock())?;
+                while offset < size {
+                    let chunk_len = (size - offset).min(buffer.len());
+                    let read_len = lower_file.pread(offset, chunk_len, &mut buffer[..chunk_len])?;
+                    if read_len == 0 {
+                        return Err(SystemError::EIO);
+                    }
+
+                    let mut written = 0usize;
+                    while written < read_len {
+                        let n = upper_file.pwrite(
+                            offset + written,
+                            read_len - written,
+                            &buffer[written..read_len],
+                        )?;
+                        if n == 0 {
+                            return Err(SystemError::EIO);
+                        }
+                        written += n;
+                    }
+                    offset += read_len;
+                }
+            }
+
+            Ok(())
+        })();
+
+        if let Err(err) = copy_result {
+            if let Some((parent, name)) = cleanup {
+                let _ = parent.unlink(&name);
+            }
+            return Err(err);
         }
 
         *upper_inode = Some(new_upper_inode);
@@ -31,10 +69,10 @@ impl OvlInode {
         Ok(())
     }
 
-    fn create_upper_inode(&self, metadata: Metadata) -> Result<Arc<dyn IndexNode>, SystemError> {
+    fn create_upper_inode(&self, metadata: Metadata) -> Result<CreatedUpper, SystemError> {
         let upper_root_inode = self.upper_root_inode()?;
         if self.redirect.is_empty() {
-            return Ok(upper_root_inode);
+            return Ok((upper_root_inode, None));
         }
 
         let (parent_path, name) = match self.redirect.rsplit_once('/') {
@@ -44,9 +82,10 @@ impl OvlInode {
 
         let parent_inode = self.ensure_upper_dir_path(parent_path)?;
         if let Ok(existing) = parent_inode.find(name) {
-            return Ok(existing);
+            return Ok((existing, None));
         }
 
-        parent_inode.create_with_data(name, metadata.file_type, metadata.mode, 0)
+        let inode = parent_inode.create_with_data(name, metadata.file_type, metadata.mode, 0)?;
+        Ok((inode, Some((parent_inode, name.into()))))
     }
 }

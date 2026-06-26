@@ -102,8 +102,10 @@ pub fn do_fadvise(fd: i32, offset: i64, len: i64, advise: i32) -> Result<usize, 
         return Err(SystemError::ESPIPE);
     }
 
+    let advice = PosixFadviseFlag::from_i32(advise)?;
+
     // 根据POSIX规范，len == 0 表示从offset到文件结尾
-    if len < 0 || inode.page_cache().is_none() {
+    if offset < 0 || len < 0 {
         return Err(SystemError::EINVAL);
     }
 
@@ -114,12 +116,13 @@ pub fn do_fadvise(fd: i32, offset: i64, len: i64, advise: i32) -> Result<usize, 
 
     // 后续需要考虑DAX和noop_backing_dev_info
 
-    let mut endbyte = offset.saturating_add(len) as usize;
-    if len == 0 {
-        endbyte = usize::MAX;
-    }
+    let endbyte = if len == 0 {
+        usize::MAX
+    } else {
+        offset.checked_add(len - 1).ok_or(SystemError::EINVAL)? as usize
+    };
 
-    match PosixFadviseFlag::from_i32(advise)? {
+    match advice {
         PosixFadviseFlag::Normal => {
             file.set_ra_pages(MAX_READAHEAD);
             file.remove_mode_flags(FileMode::FMODE_RANDOM | FileMode::FMODE_NOREUSE);
@@ -132,29 +135,36 @@ pub fn do_fadvise(fd: i32, offset: i64, len: i64, advise: i32) -> Result<usize, 
             file.remove_mode_flags(FileMode::FMODE_RANDOM);
         }
         PosixFadviseFlag::WillNeed => {
-            let start_page = (offset >> MMArch::PAGE_SHIFT) as usize;
-            let end_page = (endbyte - 1) >> MMArch::PAGE_SHIFT;
-            let mut page_num = end_page - start_page + 1;
-            if page_num == 0 {
-                page_num = usize::MAX;
-            }
+            let Some(page_cache) = inode.page_cache() else {
+                return Ok(0);
+            };
+            let start_page = (offset as usize) >> MMArch::PAGE_SHIFT;
+            let end_page = endbyte >> MMArch::PAGE_SHIFT;
+            let page_num = end_page.saturating_sub(start_page).saturating_add(1);
 
-            let inode = file.inode();
-            let page_cache = inode.page_cache().unwrap();
             let mut ra_state = file.get_ra_state();
             force_page_cache_readahead(&page_cache, &inode, &mut ra_state, start_page, page_num)?;
             file.set_ra_state(ra_state)?;
         }
         PosixFadviseFlag::NoReuse => {
-            file.remove_mode_flags(FileMode::FMODE_NOREUSE);
+            file.set_mode_flags(FileMode::FMODE_NOREUSE);
         }
         PosixFadviseFlag::DontNeed => {
+            let Some(page_cache) = inode.page_cache() else {
+                return Ok(0);
+            };
             let start_index = page_align_up(offset as usize) >> MMArch::PAGE_SHIFT;
             let mut end_index = endbyte >> MMArch::PAGE_SHIFT;
+            let metadata = inode.metadata()?;
+            let last_file_byte = if metadata.size > 0 {
+                Some(metadata.size as usize - 1)
+            } else {
+                None
+            };
 
             // 如果要驱逐的最后一页不是整页，则需要保留
             if (endbyte & MMArch::PAGE_OFFSET_MASK) != MMArch::PAGE_OFFSET_MASK
-                && endbyte != inode.metadata()?.size as usize - 1
+                && Some(endbyte) != last_file_byte
             {
                 if end_index == 0 {
                     return Ok(0);
@@ -165,7 +175,6 @@ pub fn do_fadvise(fd: i32, offset: i64, len: i64, advise: i32) -> Result<usize, 
             // 若以后实现了per-CPU LRU批处理，需要额外处理（lru_add_drain）
 
             if end_index >= start_index {
-                let page_cache = inode.page_cache().unwrap();
                 // 先写回脏页
                 page_cache
                     .manager()

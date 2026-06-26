@@ -515,6 +515,11 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
 
     /// 每个页面的大小
     const PAGE_SIZE: usize = 1 << Self::PAGE_SHIFT;
+    /// SysV SHM attach ABI alignment.
+    ///
+    /// Linux exposes this as SHMLBA. It equals PAGE_SIZE on x86_64, but it is
+    /// intentionally modeled as a separate ABI constant.
+    const SHMLBA: usize = Self::PAGE_SIZE;
     /// 通过这个mask，获取地址的页内偏移量
     const PAGE_OFFSET_MASK: usize = Self::PAGE_SIZE - 1;
     /// 通过这个mask，获取页的首地址

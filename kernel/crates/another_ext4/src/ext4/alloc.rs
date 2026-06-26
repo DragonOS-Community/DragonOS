@@ -6,6 +6,17 @@ use crate::prelude::*;
 use crate::return_error;
 
 impl Ext4 {
+    fn restore_block_allocation_state(
+        &self,
+        bitmap_block: &Block,
+        bg: &BlockGroupRef,
+        sb: &SuperBlock,
+    ) -> Result<()> {
+        self.write_block(bitmap_block)?;
+        self.write_block_group_with_csum(&mut BlockGroupRef::new(bg.id, bg.desc))?;
+        self.write_super_block(sb)
+    }
+
     fn block_group_first_block(sb: &SuperBlock, bgid: BlockGroupId) -> PBlockId {
         bgid as PBlockId * sb.blocks_per_group() as PBlockId
     }
@@ -182,6 +193,9 @@ impl Ext4 {
             // extent physical block numbers are absolute filesystem block numbers.
             let bitmap_block_id = bg.desc.block_bitmap_block();
             let mut bitmap_block = self.read_block(bitmap_block_id)?;
+            let old_bitmap_block = bitmap_block.clone();
+            let old_bg = BlockGroupRef::new(bg.id, bg.desc);
+            let old_sb = sb;
             let mut bitmap = Bitmap::new(&mut *bitmap_block.data, blocks_in_group);
 
             let bit = match bitmap.find_and_set_first_clear_bit(0, blocks_in_group) {
@@ -197,11 +211,29 @@ impl Ext4 {
             // Update block group counters
             bg.desc
                 .set_free_blocks_count(bg.desc.get_free_blocks_count() - 1);
-            self.write_block_group_with_csum(&mut bg)?;
+            if let Err(err) = self.write_block_group_with_csum(&mut bg) {
+                return match self.restore_block_allocation_state(
+                    &old_bitmap_block,
+                    &old_bg,
+                    &old_sb,
+                ) {
+                    Ok(()) => Err(err),
+                    Err(rollback_err) => Err(rollback_err),
+                };
+            }
 
             // Update superblock counters
             sb.set_free_blocks_count(sb.free_blocks_count() - 1);
-            self.write_super_block(&sb)?;
+            if let Err(err) = self.write_super_block(&sb) {
+                return match self.restore_block_allocation_state(
+                    &old_bitmap_block,
+                    &old_bg,
+                    &old_sb,
+                ) {
+                    Ok(()) => Err(err),
+                    Err(rollback_err) => Err(rollback_err),
+                };
+            }
 
             trace!("Alloc block {} ok", fblock);
             return Ok(fblock);
@@ -231,6 +263,9 @@ impl Ext4 {
         // Load block bitmap
         let bitmap_block_id = bg.desc.block_bitmap_block();
         let mut bitmap_block = self.read_block(bitmap_block_id)?;
+        let old_bitmap_block = bitmap_block.clone();
+        let old_bg = BlockGroupRef::new(bg.id, bg.desc);
+        let old_sb = sb;
         let mut bitmap = Bitmap::new(&mut *bitmap_block.data, blocks_in_group);
 
         // Free the block
@@ -245,11 +280,21 @@ impl Ext4 {
         // Update block group counters
         bg.desc
             .set_free_blocks_count(bg.desc.get_free_blocks_count() + 1);
-        self.write_block_group_with_csum(&mut bg)?;
+        if let Err(err) = self.write_block_group_with_csum(&mut bg) {
+            return match self.restore_block_allocation_state(&old_bitmap_block, &old_bg, &old_sb) {
+                Ok(()) => Err(err),
+                Err(rollback_err) => Err(rollback_err),
+            };
+        }
 
         // Update superblock counters
         sb.set_free_blocks_count(sb.free_blocks_count() + 1);
-        self.write_super_block(&sb)?;
+        if let Err(err) = self.write_super_block(&sb) {
+            return match self.restore_block_allocation_state(&old_bitmap_block, &old_bg, &old_sb) {
+                Ok(()) => Err(err),
+                Err(rollback_err) => Err(rollback_err),
+            };
+        }
 
         trace!("Free block {} ok", pblock);
         Ok(())

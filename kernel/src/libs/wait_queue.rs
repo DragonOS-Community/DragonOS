@@ -752,6 +752,11 @@ impl Waker {
         self.state.store(Self::STATE_CLOSED, Ordering::Release);
     }
 
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        self.state.load(Ordering::Acquire) == Self::STATE_CLOSED
+    }
+
     fn consume_notification(&self) -> bool {
         loop {
             let state = self.state.load(Ordering::Acquire);
@@ -938,23 +943,85 @@ impl EventWaitQueue {
         }
     }
 
+    fn register_waker(&self, events: u64, waker: Arc<Waker>) {
+        let mut entry = Some((events, waker));
+        let mut spare: Vec<(u64, Arc<Waker>)> = Vec::new();
+
+        loop {
+            let needed_capacity;
+            {
+                let mut guard = self.wait_list.lock_irqsave();
+                if guard.len() < guard.capacity() {
+                    guard.push(entry.take().unwrap());
+                    return;
+                }
+
+                needed_capacity = (guard.len() + 1).next_power_of_two().max(4);
+                if spare.capacity() >= needed_capacity {
+                    spare.extend(guard.drain(..));
+                    spare = mem::replace(&mut *guard, spare);
+                    continue;
+                }
+            }
+
+            spare = Vec::with_capacity(needed_capacity);
+        }
+    }
+
+    fn remove_waker(&self, target: &Arc<Waker>) {
+        let mut guard = self.wait_list.lock_irqsave();
+        guard.retain(|(_, waker)| !Arc::ptr_eq(waker, target));
+    }
+
+    pub fn wait_event_interruptible<F>(&self, events: u64, mut cond: F) -> Result<(), SystemError>
+    where
+        F: FnMut() -> bool,
+    {
+        before_sleep_check(0);
+        if cond() {
+            return Ok(());
+        }
+
+        let (waiter, waker) = Waiter::new_pair();
+        loop {
+            self.register_waker(events, waker.clone());
+
+            if cond() {
+                self.remove_waker(&waker);
+                return Ok(());
+            }
+
+            if Signal::signal_pending_state(true, false, &ProcessManager::current_pcb()) {
+                self.remove_waker(&waker);
+                waker.close();
+                if cond() {
+                    return Ok(());
+                }
+                return Err(SystemError::ERESTARTSYS);
+            }
+
+            if let Err(err) = waiter.wait(true) {
+                self.remove_waker(&waker);
+                waker.close();
+                if cond() {
+                    return Ok(());
+                }
+                return Err(err);
+            }
+        }
+    }
+
     pub fn sleep(&self, events: u64) {
         before_sleep_check(0);
         let (waiter, waker) = Waiter::new_pair();
-        {
-            let mut guard = self.wait_list.lock_irqsave();
-            guard.push((events, waker));
-        }
+        self.register_waker(events, waker);
         let _ = waiter.wait(true);
     }
 
     pub fn sleep_unlock_spinlock<T>(&self, events: u64, to_unlock: SpinLockGuard<T>) {
         before_sleep_check(1);
         let (waiter, waker) = Waiter::new_pair();
-        {
-            let mut guard = self.wait_list.lock_irqsave();
-            guard.push((events, waker));
-        }
+        self.register_waker(events, waker);
         drop(to_unlock);
         let _ = waiter.wait(true);
     }

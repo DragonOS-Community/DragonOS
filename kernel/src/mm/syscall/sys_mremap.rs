@@ -1,12 +1,11 @@
 //! System call handler for the mremap system call.
 
 use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_MREMAP};
-use crate::mm::syscall::page_align_up;
 use crate::mm::syscall::sys_munmap::do_munmap;
 use crate::mm::syscall::MremapFlags;
 use crate::mm::ucontext::AddressSpace;
 use crate::mm::MemoryManagementArch;
-use crate::mm::{MMArch, VirtAddr, VmFlags};
+use crate::mm::{MMArch, VirtAddr, VirtRegion, VmFlags};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use system_error::SystemError;
 
@@ -38,13 +37,20 @@ impl Syscall for SysMremapHandle {
         let old_vaddr = VirtAddr::new(Self::old_vaddr(args));
         let old_len = Self::old_len(args);
         let new_len = Self::new_len(args);
-        let mremap_flags = MremapFlags::from_bits_truncate(Self::mremap_flags(args) as u8);
+        let mremap_flags_raw = Self::mremap_flags(args);
+        let allowed_mremap_flags = (MremapFlags::MREMAP_MAYMOVE
+            | MremapFlags::MREMAP_FIXED
+            | MremapFlags::MREMAP_DONTUNMAP)
+            .bits() as usize;
+        if mremap_flags_raw & !allowed_mremap_flags != 0 {
+            return Err(SystemError::EINVAL);
+        }
+        let mremap_flags = MremapFlags::from_bits(mremap_flags_raw as u8).unwrap();
         let new_vaddr = VirtAddr::new(Self::new_vaddr(args));
 
         // 需要重映射到新内存区域的情况下，必须包含MREMAP_MAYMOVE并且指定新地址
         if mremap_flags.contains(MremapFlags::MREMAP_FIXED)
-            && (!mremap_flags.contains(MremapFlags::MREMAP_MAYMOVE)
-                || new_vaddr == VirtAddr::new(0))
+            && !mremap_flags.contains(MremapFlags::MREMAP_MAYMOVE)
         {
             return Err(SystemError::EINVAL);
         }
@@ -55,15 +61,22 @@ impl Syscall for SysMremapHandle {
         {
             return Err(SystemError::EINVAL);
         }
+        if mremap_flags.contains(MremapFlags::MREMAP_DONTUNMAP)
+            && !new_vaddr.check_aligned(MMArch::PAGE_SIZE)
+        {
+            return Err(SystemError::EINVAL);
+        }
 
         // 旧内存地址必须对齐
         if !old_vaddr.check_aligned(MMArch::PAGE_SIZE) {
             return Err(SystemError::EINVAL);
         }
 
-        // 将old_len、new_len 对齐页面大小
-        let old_len = page_align_up(old_len);
-        let new_len = page_align_up(new_len);
+        // Linux PAGE_ALIGN 使用 unsigned wrap 语义；极大长度可能 wrap 到 0，
+        // 并继续进入 mremap 的 legacy old_len==0 duplicate 分支。这里显式
+        // wrapping，避免 Rust debug overflow panic，同时保持 Linux 兼容。
+        let old_len = wrapping_page_align_up(old_len);
+        let new_len = wrapping_page_align_up(new_len);
 
         // 不允许重映射内存区域大小为0
         if new_len == 0 {
@@ -71,11 +84,23 @@ impl Syscall for SysMremapHandle {
         }
 
         let current_address_space = AddressSpace::current()?;
-        let vma = current_address_space.read().mappings.contains(old_vaddr);
-        if vma.is_none() {
-            return Err(SystemError::EINVAL);
-        }
-        let vma = vma.unwrap();
+        let vma = loop {
+            let guard = current_address_space.read();
+            if let Some(vma) = guard.mappings.contains(old_vaddr) {
+                break vma;
+            }
+            let probe_region = VirtRegion::new(old_vaddr, MMArch::PAGE_SIZE);
+            if guard
+                .mappings
+                .first_reservation_conflict(probe_region)
+                .is_some()
+            {
+                drop(guard);
+                current_address_space.wait_for_no_reservation_conflict(probe_region);
+                continue;
+            }
+            return Err(SystemError::EFAULT);
+        };
         let (vm_flags, vma_region) = {
             let g = vma.lock();
             (*g.vm_flags(), *g.region())
@@ -87,15 +112,16 @@ impl Syscall for SysMremapHandle {
         // - For expansion, the check is against old_len (not new_len), otherwise all fixed
         //   expansions would spuriously fail.
         if mremap_flags.contains(MremapFlags::MREMAP_FIXED) {
+            validate_fixed_target(old_vaddr, old_len, new_vaddr, new_len)?;
             let span_len = if old_len > new_len { new_len } else { old_len };
             let span_end = old_vaddr
                 .data()
                 .checked_add(span_len)
                 .ok_or(SystemError::EINVAL)?;
             if span_end > vma_region.end().data() {
-                // Side effects like Linux mremap_to():
-                // - unmap destination range first
-                // - if shrinking, unmap the tail [old+new_len, old+old_len)
+                // Match Linux mremap_to() ordering: MREMAP_FIXED unmaps the
+                // destination and, when shrinking, the source tail before the
+                // resized source span is rejected by vma_to_resize().
                 do_munmap(new_vaddr, new_len)?;
                 if old_len > new_len {
                     do_munmap(old_vaddr + new_len, old_len - new_len)?;
@@ -127,7 +153,7 @@ impl Syscall for SysMremapHandle {
         }
 
         // 重映射到新内存区域
-        let r = current_address_space.write().mremap(
+        let r = current_address_space.mremap_wait(
             old_vaddr,
             old_len,
             new_len,
@@ -135,13 +161,6 @@ impl Syscall for SysMremapHandle {
             new_vaddr,
             vm_flags,
         )?;
-
-        // Unmap the old mapping only if this was a move (i.e. result differs from old_vaddr).
-        // - old_len==0 is a special duplication request and must never unmap the source.
-        // - DONTUNMAP keeps the source by definition.
-        if !mremap_flags.contains(MremapFlags::MREMAP_DONTUNMAP) && old_len != 0 && r != old_vaddr {
-            do_munmap(old_vaddr, old_len)?;
-        }
 
         return Ok(r.data());
     }
@@ -179,6 +198,35 @@ impl SysMremapHandle {
     fn new_vaddr(args: &[usize]) -> usize {
         args[4]
     }
+}
+
+fn wrapping_page_align_up(len: usize) -> usize {
+    let mask = MMArch::PAGE_SIZE - 1;
+    len.wrapping_add(mask) & !mask
+}
+
+fn validate_fixed_target(
+    old_vaddr: VirtAddr,
+    old_len: usize,
+    new_vaddr: VirtAddr,
+    new_len: usize,
+) -> Result<(), SystemError> {
+    if !new_vaddr.check_aligned(MMArch::PAGE_SIZE) {
+        return Err(SystemError::EINVAL);
+    }
+    let old_end = old_vaddr.data().wrapping_add(old_len);
+    let new_end = new_vaddr
+        .data()
+        .checked_add(new_len)
+        .ok_or(SystemError::EINVAL)?;
+    if new_end > MMArch::USER_END_VADDR.data() {
+        return Err(SystemError::EINVAL);
+    }
+    if old_end > new_vaddr.data() && new_end > old_vaddr.data() {
+        return Err(SystemError::EINVAL);
+    }
+
+    Ok(())
 }
 
 syscall_table_macros::declare_syscall!(SYS_MREMAP, SysMremapHandle);

@@ -1,11 +1,11 @@
 use core::intrinsics::unlikely;
 
 use crate::arch::interrupt::TrapFrame;
-use crate::arch::ipc::signal::Signal;
 use crate::arch::ipc::signal::MAX_SIG_NUM;
 use crate::arch::MMArch;
 use crate::mm::{MemoryManagementArch, VirtAddr};
 use crate::process::fork::{CloneFlags, KernelCloneArgs, MAX_PID_NS_LEVEL};
+use crate::process::pid::PidType;
 use crate::process::{KernelStack, ProcessControlBlock, ProcessManager};
 use crate::sched::completion::Completion;
 use crate::syscall::user_access::{write_one_to_user_protected, UserBufferReader};
@@ -78,9 +78,14 @@ pub fn do_clone(
     // 克隆pcb
     ProcessManager::copy_process(&current_pcb, &pcb, clone_args, frame)?;
 
+    let child_vpid = pcb
+        .task_pid_nr_ns(PidType::PID, Some(current_pcb.active_pid_ns()))
+        .ok_or(SystemError::EINVAL)?
+        .data();
+
     if flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
         // 对齐 Linux：fork 已成功，不因 parent_tid 写回失败而撤销子任务。
-        let child_tid = pcb.pid().pid_vnr().data() as i32;
+        let child_tid = child_vpid as i32;
         let _ = unsafe { write_one_to_user_protected(parent_tid, &child_tid) };
     }
 
@@ -104,7 +109,7 @@ pub fn do_clone(
         vfork.wait_for_completion_interruptible()?;
     }
 
-    return Ok(pcb.raw_pid().0);
+    return Ok(child_vpid);
 }
 
 impl KernelCloneArgs {
@@ -163,7 +168,7 @@ impl KernelCloneArgs {
         self.pidfd = VirtAddr::new(args.pidfd as usize);
         self.child_tid = VirtAddr::new(args.child_tid as usize);
         self.parent_tid = VirtAddr::new(args.parent_tid as usize);
-        self.exit_signal = Signal::from(args.exit_signal as i32);
+        self.exit_signal = args.exit_signal as i32;
         self.stack = args.stack as usize;
         self.stack_size = args.stack_size as usize;
         self.tls = args.tls as usize;

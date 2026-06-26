@@ -14,9 +14,16 @@ pub(super) fn rollback_allocated_fds(fds: &[i32]) {
     }
 
     let fd_table_binding = ProcessManager::current_pcb().fd_table();
+    let mut dropped_fds = alloc::vec::Vec::new();
     let mut fd_table = fd_table_binding.write();
     for &fd in fds {
-        let _ = fd_table.drop_fd(fd);
+        if let Ok(dropped) = fd_table.drop_fd(fd) {
+            dropped_fds.push(dropped);
+        }
+    }
+    drop(fd_table);
+    for dropped in dropped_fds {
+        let _ = dropped.finish_close();
     }
 }
 

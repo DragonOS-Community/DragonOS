@@ -342,7 +342,9 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
             //     "de_thread: single-thread fast path pid={:?}",
             //     current.raw_pid()
             // );
-            current.exit_signal.store(Signal::SIGCHLD, Ordering::SeqCst);
+            current
+                .exit_signal
+                .store(Signal::SIGCHLD as i32, Ordering::SeqCst);
             return Ok(());
         }
 
@@ -433,8 +435,10 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
 
             ProcessManager::exchange_tid_and_raw_pids(&current, &leader)?;
 
-            current.exit_signal.store(Signal::SIGCHLD, Ordering::SeqCst);
-            leader.exit_signal.store(Signal::INVALID, Ordering::SeqCst);
+            current
+                .exit_signal
+                .store(Signal::SIGCHLD as i32, Ordering::SeqCst);
+            leader.exit_signal.store(-1, Ordering::SeqCst);
 
             // 将当前线程提升为线程组 leader，并清空 group_tasks（已无其他线程）
             {
@@ -489,7 +493,9 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
                 unsafe { ProcessManager::release(leader.raw_pid()) };
             }
         } else {
-            current.exit_signal.store(Signal::SIGCHLD, Ordering::SeqCst);
+            current
+                .exit_signal
+                .store(Signal::SIGCHLD as i32, Ordering::SeqCst);
         }
 
         Ok(())

@@ -3,11 +3,14 @@
 demo/gtest_demo
 normal/capability
 normal/fdatasync
+normal/ext4_xattr
+normal/fallocate_semantics
 normal/syncfs_semantics
 normal/fcntl_lock
 normal/fcntl_signal
 normal/epoll_timeout_budget
 normal/devpts_dir_read
+normal/debugfs_mount
 normal/test_pivot_root
 normal/mount_reconfigure
 normal/mount_propagation
@@ -17,6 +20,8 @@ normal/test_fchown_o_path
 normal/proc_self_limits
 normal/proc_fd_devfs_readlink
 normal/mlock_semantics
+normal/mmap_truncate_cow
+normal/sysv_shm_semantics
 normal/sched_affinity
 normal/sync_file_range
 normal/splice_concurrent_io
@@ -40,6 +45,7 @@ normal/proc_self_exec_cmdline
 normal/proc_thread_accounting
 normal/user_namespace_id_map
 normal/tty_tcflush
+normal/hvc_console_backpressure
 normal/signal_fpstate_sigreturn
 normal/general_protection_signal
 normal/ioperm_semantics
@@ -51,3 +57,10 @@ normal/devfs_ptmx_unlink
 normal/devtmpfs_semantics
 normal/mknod_socket
 normal/pmem_block
+normal/pipe_release_wakeup
+normal/pipe_waitqueue_wakeup
+normal/spawn_exec_pipe_race
+normal/tty_pty_hangup
+normal/cubesandbox_pty_exec_chain
+normal/eventfd_pending_signal
+normal/virtiofs_smoke

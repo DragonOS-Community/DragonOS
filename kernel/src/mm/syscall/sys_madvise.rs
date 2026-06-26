@@ -70,10 +70,7 @@ impl Syscall for SysMadviseHandle {
         let start_frame = VirtPageFrame::new(start_vaddr);
         let page_count = PageFrameCount::new(aligned_len / MMArch::PAGE_SIZE);
 
-        current_address_space
-            .write()
-            .madvise(start_frame, page_count, madv_flags)
-            .map_err(|_| SystemError::EINVAL)?;
+        current_address_space.madvise_wait(start_frame, page_count, madv_flags)?;
         return Ok(0);
     }
 

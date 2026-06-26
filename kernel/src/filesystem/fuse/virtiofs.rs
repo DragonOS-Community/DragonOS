@@ -24,9 +24,10 @@ use crate::{
         virtio_impl::HalImpl,
     },
     filesystem::vfs::{
-        FileSystem, FileSystemMakerData, FsInfo, IndexNode, MountableFileSystem, SuperBlock,
-        FSMAKER,
+        file::File, FileSystem, FileSystemMakerData, FsInfo, IndexNode, MountableFileSystem,
+        SuperBlock, FSMAKER,
     },
+    mm::{fault::PageFaultMessage, VirtRegion, VmFaultReason, VmFlags},
     process::{kthread::KernelThreadClosure, kthread::KernelThreadMechanism, ProcessManager},
     register_mountable_fs,
     time::{sleep::nanosleep, PosixTimeSpec},
@@ -36,8 +37,8 @@ use super::{
     conn::FuseConn,
     fs::{FuseFS, FuseMountData},
     protocol::{
-        fuse_pack_struct, fuse_read_struct, FuseInHeader, FuseOutHeader, FUSE_DESTROY, FUSE_FORGET,
-        FUSE_INTERRUPT,
+        fuse_pack_struct, fuse_read_struct, FuseInHeader, FuseOutHeader, FuseReadIn, FUSE_DESTROY,
+        FUSE_FORGET, FUSE_INTERRUPT, FUSE_READ, FUSE_READDIR, FUSE_READDIRPLUS,
     },
 };
 
@@ -140,6 +141,21 @@ impl VirtioFsBridgeContext {
         }
     }
 
+    fn response_buffer_size(pending: &PendingReq) -> usize {
+        let default_size = VIRTIOFS_RSP_BUF_SIZE;
+        let read_like = matches!(pending.opcode, FUSE_READ | FUSE_READDIR | FUSE_READDIRPLUS);
+        if !read_like || pending.req.len() < core::mem::size_of::<FuseInHeader>() {
+            return default_size;
+        }
+
+        let payload = &pending.req[core::mem::size_of::<FuseInHeader>()..];
+        let Ok(read_in) = fuse_read_struct::<FuseReadIn>(payload) else {
+            return default_size;
+        };
+        let wanted = core::mem::size_of::<FuseOutHeader>().saturating_add(read_in.size as usize);
+        core::cmp::max(core::mem::size_of::<FuseOutHeader>(), wanted).min(default_size)
+    }
+
     fn take_inflight(&mut self, kind: QueueKind, token: u16) -> Result<InflightReq, SystemError> {
         match kind {
             QueueKind::Hiprio => self.hiprio_inflight.remove(&token).ok_or(SystemError::EIO),
@@ -233,7 +249,8 @@ impl VirtioFsBridgeContext {
         let mut rsp = if pending.noreply {
             None
         } else {
-            Some(vec![0u8; VIRTIOFS_RSP_BUF_SIZE])
+            let rsp_size = Self::response_buffer_size(&pending);
+            Some(vec![0u8; rsp_size])
         };
 
         let (token, should_notify) = match kind {
@@ -795,6 +812,31 @@ impl FileSystem for VirtioFsFs {
         self.inner.permission_policy()
     }
 
+    unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
+        self.inner.fault(pfm)
+    }
+
+    unsafe fn page_mkwrite(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
+        self.inner.page_mkwrite(pfm)
+    }
+
+    fn mprotect(&self, old_vm_flags: VmFlags, new_vm_flags: VmFlags) -> Result<(), SystemError> {
+        self.inner.mprotect(old_vm_flags, new_vm_flags)
+    }
+
+    fn vma_close(&self, file: &Arc<File>, region: VirtRegion, vm_flags: VmFlags) {
+        self.inner.vma_close(file, region, vm_flags)
+    }
+
+    unsafe fn map_pages(
+        &self,
+        pfm: &mut PageFaultMessage,
+        start_pgoff: usize,
+        end_pgoff: usize,
+    ) -> VmFaultReason {
+        self.inner.map_pages(pfm, start_pgoff, end_pgoff)
+    }
+
     fn on_umount(&self) {
         self.inner.on_umount();
         self.instance.wait_session_released(self.session_id);
@@ -841,6 +883,9 @@ impl MountableFileSystem for VirtioFsFs {
             rootmode: md.rootmode,
             user_id: md.user_id,
             group_id: md.group_id,
+            max_read: VIRTIOFS_RSP_BUF_SIZE
+                .saturating_sub(core::mem::size_of::<FuseOutHeader>())
+                .min(u32::MAX as usize) as u32,
             allow_other: md.allow_other,
             default_permissions: md.default_permissions,
             conn: md.conn.clone(),

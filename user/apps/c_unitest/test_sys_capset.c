@@ -4,7 +4,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/syscall.h>
-#include <pthread.h>
+#include <sys/wait.h>
 
 typedef struct {
     uint32_t version;
@@ -76,21 +76,52 @@ static int test_rule_effective_subset_permitted() {
     return do_capset(_LINUX_CAPABILITY_VERSION_3, 0, data, 2, EPERM) == 0 ? 0 : -1;
 }
 
-static int test_rule_permitted_not_increase() {
-    // 期望：pP_new ⊆ pP_old。尝试把高位拉高（DragonOS 会截断到低41位）→ EPERM
-    cap_user_data_t data[2];
-    fill_caps_v3(0x0ull, (1ull << 40), 0x0ull, data); // 试图拉高 bit40
-    // 对默认 FULL_SET 情况，此用例可能成功；因此先读取当前 pP，再尝试增加新位
-    // 简化：若默认 FULL_SET，跳过此用例；由集成环境决定
+static int expect_capset_eperm_after_drop(uint64_t next_effective,
+                                          uint64_t next_permitted,
+                                          uint64_t next_inheritable) {
+    pid_t child = fork();
+    if (child < 0) {
+        printf("[FAIL] fork failed: errno=%d(%s)\n", errno, strerror(errno));
+        return -1;
+    }
+
+    if (child == 0) {
+        cap_user_data_t zero[2];
+        fill_caps_v3(0, 0, 0, zero);
+        if (do_capset(_LINUX_CAPABILITY_VERSION_3, 0, zero, 2, 0) != 0) {
+            _exit(11);
+        }
+
+        cap_user_data_t next[2];
+        fill_caps_v3(next_effective, next_permitted, next_inheritable, next);
+        if (do_capset(_LINUX_CAPABILITY_VERSION_3, 0, next, 2, EPERM) != 0) {
+            _exit(12);
+        }
+
+        _exit(0);
+    }
+
+    int status = 0;
+    if (waitpid(child, &status, 0) != child) {
+        printf("[FAIL] waitpid(%d) failed: errno=%d(%s)\n",
+               child, errno, strerror(errno));
+        return -1;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        printf("[FAIL] child %d exited abnormally: status=0x%x\n", child, status);
+        return -1;
+    }
     return 0;
 }
 
+static int test_rule_permitted_not_increase() {
+    // 期望：pP_new ⊆ pP_old。子进程先清空 pP，再尝试提升 bit0 → EPERM
+    return expect_capset_eperm_after_drop(0, 1, 0);
+}
+
 static int test_rule_inheritable_bounds() {
-    // 期望：pI_new ⊆ (pI_old ∪ pP_old) 且 ⊆ (pI_old ∪ bset)。构造一个明显越界位（假设 old pP/pI/bset 不含 bit40）
-    cap_user_data_t data[2];
-    fill_caps_v3(0x0ull, 0x0ull, (1ull << 40), data);
-    // 在默认 FULL_SET 下此用例不触发 EPERM；因此仅作为占位
-    return 0;
+    // 期望：无 CAP_SETPCAP 时 pI_new ⊆ pI_old ∪ pP_old；先清空 pI/pP，再提升 pI(bit0) → EPERM
+    return expect_capset_eperm_after_drop(0, 0, 1);
 }
 
 static int test_version_paths() {
@@ -119,25 +150,12 @@ static int test_version_paths() {
     return 0;
 }
 
-static void *thread_capset_ok(void *arg) {
-    (void)arg;
-    cap_user_data_t data[2];
-    // 尝试设置为空集合（总是 pE ⊆ pP），应成功
-    fill_caps_v3(0x0ull, 0x0ull, 0x0ull, data);
-    do_capset(_LINUX_CAPABILITY_VERSION_3, 0, data, 2, 0);
-    return NULL;
-}
-
-/* 移除并发测试，避免在 DragonOS 下触发 clone/cred 未实现导致 panic */
-static int test_concurrent_capset() { return 0; }
-
 int main() {
     int fails = 0;
     fails += (test_rule_effective_subset_permitted() != 0);
     fails += (test_rule_permitted_not_increase() != 0);
     fails += (test_rule_inheritable_bounds() != 0);
     fails += (test_version_paths() != 0);
-    fails += (test_concurrent_capset() != 0);
 
     if (fails) {
         printf("test_sys_capset: %d test(s) failed\n", fails);

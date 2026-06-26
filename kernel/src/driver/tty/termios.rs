@@ -75,9 +75,7 @@ impl PosixTermios {
     }
 
     fn output_speed(&self) -> Option<u32> {
-        let flag = ControlMode::from_bits_truncate(
-            self.c_cflag & ControlMode::CBAUD.intersection(ControlMode::CBAUDEX).bits(),
-        ); // CBAUD + CBAUDEX
+        let flag = ControlMode::from_bits_truncate(self.c_cflag & ControlMode::CBAUD.bits());
         flag.baud_rate()
     }
 
@@ -91,27 +89,23 @@ impl PosixTermios {
     }
 }
 
-pub const INIT_CONTORL_CHARACTERS: [u8; CONTORL_CHARACTER_NUM] = [
-    b'C' - 0x40,  // VINTR
-    b'\\' - 0x40, // VQUIT
-    0o177,        // VERASE
-    b'U' - 0x40,  // VKILL
-    b'D' - 0x40,  // VEOF
-    1,            // VMIN
-    0,            // VEOL
-    0,            // VTIME
-    0,            // VEOL2
-    0,            // VSWTC
-    b'W' - 0x40,  // VWERASE
-    b'R' - 0x40,  // VREPRINT
-    b'Z' - 0x40,  // VSUSP
-    b'Q' - 0x40,  // VSTART
-    b'S' - 0x40,  // VSTOP
-    b'V' - 0x40,  // VLNEXT
-    b'O' - 0x40,  // VDISCARD
-    0,
-    0,
-];
+pub const INIT_CONTORL_CHARACTERS: [u8; CONTORL_CHARACTER_NUM] = {
+    let mut chs = [0; CONTORL_CHARACTER_NUM];
+    chs[ControlCharIndex::VINTR] = b'C' - 0x40;
+    chs[ControlCharIndex::VQUIT] = b'\\' - 0x40;
+    chs[ControlCharIndex::VERASE] = 0o177;
+    chs[ControlCharIndex::VKILL] = b'U' - 0x40;
+    chs[ControlCharIndex::VEOF] = b'D' - 0x40;
+    chs[ControlCharIndex::VSTART] = b'Q' - 0x40;
+    chs[ControlCharIndex::VSTOP] = b'S' - 0x40;
+    chs[ControlCharIndex::VSUSP] = b'Z' - 0x40;
+    chs[ControlCharIndex::VREPRINT] = b'R' - 0x40;
+    chs[ControlCharIndex::VDISCARD] = b'O' - 0x40;
+    chs[ControlCharIndex::VWERASE] = b'W' - 0x40;
+    chs[ControlCharIndex::VLNEXT] = b'V' - 0x40;
+    chs[ControlCharIndex::VMIN] = 1;
+    chs
+};
 
 // pub const INIT_CONTORL_CHARACTERS: [u8; CONTORL_CHARACTER_NUM] = {
 //     let mut chs: [u8; CONTORL_CHARACTER_NUM] = Default::default();
@@ -420,28 +414,28 @@ impl ControlCharIndex {
     pub const VKILL: usize = 3;
     /// 文件结束信号 \0?
     pub const VEOF: usize = 4;
-    /// 指定非规范模式下的最小字符数
-    pub const VMIN: usize = 5;
-    /// 换行符
-    pub const VEOL: usize = 6;
     /// 指定非规范模式下的超时时间
-    pub const VTIME: usize = 7;
-    /// 换行符
-    pub const VEOL2: usize = 8;
+    pub const VTIME: usize = 5;
+    /// 指定非规范模式下的最小字符数
+    pub const VMIN: usize = 6;
     /// 未使用，保留
-    pub const VSWTC: usize = 9;
-    /// 擦除前一个单词
-    pub const VWERASE: usize = 10;
-    /// 重新打印整行
-    pub const VREPRINT: usize = 11;
-    /// 挂起信号
-    pub const VSUSP: usize = 12;
+    pub const VSWTC: usize = 7;
     /// 启动输出信号
-    pub const VSTART: usize = 13;
+    pub const VSTART: usize = 8;
     /// 停止输出信号
-    pub const VSTOP: usize = 14;
+    pub const VSTOP: usize = 9;
+    /// 挂起信号
+    pub const VSUSP: usize = 10;
+    /// 换行符
+    pub const VEOL: usize = 11;
+    /// 重新打印整行
+    pub const VREPRINT: usize = 12;
+    /// 对应于字符丢弃信号，用于丢弃当前输入的行
+    pub const VDISCARD: usize = 13;
+    /// 擦除前一个单词
+    pub const VWERASE: usize = 14;
     /// 将下一个字符视为字面值，而不是特殊字符
     pub const VLNEXT: usize = 15;
-    /// 对应于字符丢弃信号，用于丢弃当前输入的行
-    pub const VDISCARD: usize = 16;
+    /// 换行符
+    pub const VEOL2: usize = 16;
 }

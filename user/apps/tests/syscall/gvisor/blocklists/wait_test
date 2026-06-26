@@ -1,7 +1,2 @@
 # 缺少 SYS_PTRACE
 WaitTest.TraceeWALL
-# 卡死
-Waiters/WaitAnyChildTest.IgnoredChildRusage/*
-
-# 缺少 /bin/true
-Waiters/WaitSpecificChildTest.AfterChildExecve/*

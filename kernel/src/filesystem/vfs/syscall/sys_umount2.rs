@@ -1,5 +1,7 @@
 //! System call handler for sys_umount.
 
+use super::sys_mount::may_mount;
+
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_UMOUNT2},
     filesystem::vfs::{
@@ -95,6 +97,10 @@ pub fn do_umount2(
 
     let (work, rest) = user_path_at(&ProcessManager::current_pcb(), dirfd, target)?;
     let target_inode = work.lookup_follow_symlink(&rest, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    if !may_mount() {
+        return Err(SystemError::EPERM);
+    }
+
     let path = visible_umount_path(&target_inode)?;
 
     let current_mntns = ProcessManager::current_mntns();
@@ -115,7 +121,13 @@ pub fn do_umount2(
         );
         return Err(err);
     }
-    let _ = current_mntns.remove_mount(&path);
+    if current_mntns.remove_mount_exact(&fs).is_none() {
+        log::error!(
+            "do_umount2: mount_list exact remove miss for resolved='{}', fs='{}'",
+            path,
+            fs.name()
+        );
+    }
     Ok(fs)
 }
 

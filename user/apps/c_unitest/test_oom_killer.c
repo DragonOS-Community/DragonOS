@@ -38,6 +38,11 @@ static int write_inject_config(pid_t tgid, unsigned long fail_after, unsigned lo
     return 0;
 }
 
+static void cleanup_inject_config(void)
+{
+    (void)write_inject_config(0, 0, 0);
+}
+
 static void *fault_one_page(void)
 {
     volatile uint8_t *p;
@@ -151,6 +156,7 @@ static int expect_exit0(pid_t pid, const char *name)
 static int test_current_is_victim(void)
 {
     pid_t child = fork();
+    int ret;
 
     if (child < 0) {
         perror("fork");
@@ -160,7 +166,9 @@ static int test_current_is_victim(void)
         trigger_selfkill_child_main();
     }
 
-    return expect_sigkill(child, "current_is_victim");
+    ret = expect_sigkill(child, "current_is_victim");
+    cleanup_inject_config();
+    return ret;
 }
 
 static int test_other_process_is_victim(void)
@@ -184,6 +192,7 @@ static int test_other_process_is_victim(void)
         perror("fork trigger");
         kill(victim, SIGKILL);
         waitpid(victim, NULL, 0);
+        cleanup_inject_config();
         return -1;
     }
     if (trigger == 0) {
@@ -193,21 +202,29 @@ static int test_other_process_is_victim(void)
     if (expect_exit0(trigger, "trigger_retry") < 0) {
         kill(victim, SIGKILL);
         waitpid(victim, NULL, 0);
+        cleanup_inject_config();
         return -1;
     }
 
-    return expect_sigkill(victim, "other_process_victim");
+    int ret = expect_sigkill(victim, "other_process_victim");
+    cleanup_inject_config();
+    return ret;
 }
 
 int main(void)
 {
+    cleanup_inject_config();
+
     if (test_current_is_victim() < 0) {
+        cleanup_inject_config();
         return 1;
     }
     if (test_other_process_is_victim() < 0) {
+        cleanup_inject_config();
         return 1;
     }
 
+    cleanup_inject_config();
     puts("test_oom_killer: PASS");
     return 0;
 }

@@ -200,6 +200,20 @@ unsafe extern "C" fn do_bounds(regs: &'static TrapFrame, error_code: u64) {
 /// 处理未定义操作码异常 6 #UD
 #[no_mangle]
 unsafe extern "C" fn do_undefined_opcode(regs: &'static TrapFrame, error_code: u64) {
+    if regs.is_from_user() {
+        CurrentIrqArch::interrupt_enable();
+        if let Err(err) = force_kernel_signal_to_current(Signal::SIGILL) {
+            error!(
+                "failed to send SIGILL for user undefined opcode, pid: {:?}, rip: {:#x}, error_code: {:#x}, err: {:?}",
+                ProcessManager::current_pid(),
+                regs.rip,
+                error_code,
+                err
+            );
+        }
+        return;
+    }
+
     error!(
         "do_undefined_opcode(6), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,

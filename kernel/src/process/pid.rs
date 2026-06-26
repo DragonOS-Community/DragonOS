@@ -136,6 +136,11 @@ impl Pid {
         }
     }
 
+    pub fn thread_group_leader_task(&self) -> Option<Arc<ProcessControlBlock>> {
+        self.tasks_iter(PidType::TGID)
+            .find(|task| task.is_thread_group_leader())
+    }
+
     pub fn pid_vnr(&self) -> RawPid {
         let active_pid_ns = ProcessManager::current_pcb().active_pid_ns();
         self.pid_nr_ns(&active_pid_ns)

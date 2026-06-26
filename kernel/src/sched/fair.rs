@@ -90,7 +90,10 @@ impl FairSchedEntity {
             my_cfs_rq: None,
             on_rq: OnRq::None,
             slice: SYSCTL_SHCED_BASE_SLICE.load(Ordering::SeqCst),
-            load: Default::default(),
+            load: LoadWeight {
+                weight: LoadWeight::NICE_0_LOAD,
+                inv_weight: 0,
+            },
             deadline: Default::default(),
             min_deadline: Default::default(),
             exec_start: Default::default(),
@@ -182,11 +185,11 @@ impl FairSchedEntity {
     }
 
     pub fn calculate_delta_fair(&self, delta: u64) -> u64 {
-        if unlikely(self.load.weight != LoadWeight::NICE_0_LOAD_SHIFT as u64) {
+        if unlikely(self.load.weight != LoadWeight::NICE_0_LOAD) {
             return self
                 .force_mut()
                 .load
-                .calculate_delta(delta, LoadWeight::NICE_0_LOAD_SHIFT as u64);
+                .calculate_delta(delta, LoadWeight::NICE_0_LOAD);
         };
 
         delta
@@ -518,6 +521,7 @@ impl CfsRunQueue {
         let delta_exec = curr
             .sum_exec_runtime
             .saturating_sub(curr.prev_sum_exec_runtime);
+
         if delta_exec < SYSCTL_SHCED_MIN_GRANULARITY.load(Ordering::SeqCst) {
             return;
         }
@@ -648,18 +652,18 @@ impl CfsRunQueue {
         let curr = self.current();
 
         let mut vruntime = self.min_vruntime;
+        let mut curr_on_rq = false;
 
         if let Some(curr) = curr.as_ref() {
             if curr.on_rq() {
                 vruntime = curr.vruntime;
-            } else {
-                self.set_current(Weak::default());
+                curr_on_rq = true;
             }
         }
 
         // 找到最小虚拟运行时间的调度实体
         if let Some(se) = self.entities.leftmost() {
-            if curr.is_none() {
+            if !curr_on_rq {
                 vruntime = se.vruntime;
             } else {
                 vruntime = vruntime.min(se.vruntime);
@@ -806,6 +810,7 @@ impl CfsRunQueue {
 
     /// 为调度实体计算初始vruntime等信息
     fn place_entity(&mut self, se: Arc<FairSchedEntity>, flags: EnqueueFlag) {
+        let current_entity = self.current();
         let vruntime = self.avg_vruntime();
         let mut lag = 0;
 
@@ -814,14 +819,12 @@ impl CfsRunQueue {
 
         let mut vslice = se.calculate_delta_fair(se.slice);
 
-        if self.nr_running > 0 {
-            let curr = self.current();
-
+        if SCHED_FEATURES.contains(SchedFeature::PLACE_LAG) && self.nr_running > 0 {
             lag = se.vlag;
 
             let mut load = self.avg_load;
 
-            if let Some(curr) = curr {
+            if let Some(curr) = current_entity {
                 if curr.on_rq() {
                     load += LoadWeight::scale_load_down(curr.load.weight) as i64;
                 }
@@ -836,9 +839,11 @@ impl CfsRunQueue {
             lag /= load;
         }
 
-        se.vruntime = vruntime - lag as u64;
+        se.vruntime = vruntime.wrapping_sub(lag as u64);
 
-        if flags.contains(EnqueueFlag::ENQUEUE_INITIAL) {
+        if SCHED_FEATURES.contains(SchedFeature::PLACE_DEADLINE_INITIAL)
+            && flags.contains(EnqueueFlag::ENQUEUE_INITIAL)
+        {
             vslice /= 2;
         }
 
@@ -1071,9 +1076,13 @@ impl CfsRunQueue {
         if se.on_rq() {
             self.inner_dequeue_entity(se);
             self.update_load_avg(se, UpdateAvgFlags::UPDATE_TG);
+            // Match Linux EEVDF: stash the picked deadline in vlag so
+            // RUN_TO_PARITY can keep the selected entity running until it
+            // becomes ineligible or receives a new slice.
             se.force_mut().vlag = se.deadline as i64;
         }
 
+        se.force_mut().exec_start = self.rq().clock_task();
         self.set_current(Arc::downgrade(se));
 
         se.force_mut().prev_sum_exec_runtime = se.sum_exec_runtime;
@@ -1142,71 +1151,12 @@ impl CfsRunQueue {
     pub fn inner_enqueue_entity(&mut self, se: &Arc<FairSchedEntity>) {
         self.avg_vruntime_add(se);
         self.entities.insert(se.clone());
-        // warn!(
-        //     "enqueue pcb {:?} cfsrq {:?}",
-        //     se.pcb().pid(),
-        //     self.entities
-        //         .iter()
-        //         .map(|x| (x.0, x.1.pcb().pid()))
-        //         .collect::<Vec<_>>()
-        // );
-        // send_to_default_serial8250_port(
-        //     format!(
-        //         "enqueue pcb {:?} cfsrq {:?}\n",
-        //         se.pcb().pid(),
-        //         self.entities
-        //             .iter()
-        //             .map(|x| (x.0, x.1.pcb().pid()))
-        //             .collect::<Vec<_>>()
-        //     )
-        //     .as_bytes(),
-        // );
     }
 
     fn inner_dequeue_entity(&mut self, se: &Arc<FairSchedEntity>) {
-        // warn!(
-        //     "before dequeue pcb {:?} cfsrq {:?}",
-        //     se.pcb().pid(),
-        //     self.entities
-        //         .iter()
-        //         .map(|x| (x.0, x.1.pcb().pid()))
-        //         .collect::<Vec<_>>()
-        // );
-
-        // send_to_default_serial8250_port(
-        //     format!(
-        //         "before dequeue pcb {:?} cfsrq {:?}\n",
-        //         se.pcb().pid(),
-        //         self.entities
-        //             .iter()
-        //             .map(|x| (x.0, x.1.pcb().pid()))
-        //             .collect::<Vec<_>>()
-        //     )
-        //     .as_bytes(),
-        // );
-
-        self.entities.remove(se);
-        // send_to_default_serial8250_port(
-        //     format!(
-        //         "after dequeue pcb {:?}(real: {:?}) cfsrq {:?}\n",
-        //         se.pcb().pid(),
-        //         remove.pcb().pid(),
-        //         self.entities
-        //             .iter()
-        //             .map(|x| (x.0, x.1.pcb().pid()))
-        //             .collect::<Vec<_>>()
-        //     )
-        //     .as_bytes(),
-        // );
-        // warn!(
-        //     "after dequeue pcb {:?}(real: {:?}) cfsrq {:?}",
-        //     se.pcb().pid(),
-        //     remove.pcb().pid(),
-        //     self.entities
-        //         .iter()
-        //         .map(|x| (x.0, x.1.pcb().pid()))
-        //         .collect::<Vec<_>>()
-        // );
+        if self.entities.remove(se).is_none() {
+            panic!("dequeue entity that is not present in CFS timeline");
+        }
         self.avg_vruntime_sub(se);
     }
 
@@ -1343,12 +1293,22 @@ impl CfsRunQueue {
         &self,
         curr: Option<&Arc<FairSchedEntity>>,
     ) -> Option<Arc<FairSchedEntity>> {
+        if SCHED_FEATURES.contains(SchedFeature::RUN_TO_PARITY) {
+            if let Some(curr) = curr.filter(|se| se.on_rq() && self.entity_eligible(se)) {
+                if curr.vlag == curr.deadline as i64 {
+                    return Some(curr.clone());
+                }
+            }
+        }
+
         self.entities
             .pick_eevdf(curr.filter(|se| se.on_rq()), |se| self.entity_eligible(se))
     }
 
-    /// pick下一个运行的task
-    pub fn pick_next_entity(&self) -> Option<Arc<FairSchedEntity>> {
+    pub fn pick_next_entity_with_curr(
+        &self,
+        curr: Option<&Arc<FairSchedEntity>>,
+    ) -> Option<Arc<FairSchedEntity>> {
         if SCHED_FEATURES.contains(SchedFeature::NEXT_BUDDY) {
             if let Some(next) = self.next() {
                 if self.entity_eligible(&next) {
@@ -1357,10 +1317,17 @@ impl CfsRunQueue {
             }
         }
 
-        let curr = self.current();
-        self.pick_eevdf_entity(curr.as_ref())
+        let picked = self
+            .pick_eevdf_entity(curr)
             .or_else(|| self.entities.leftmost())
-            .or_else(|| curr.filter(|se| se.on_rq()))
+            .or_else(|| curr.cloned().filter(|se| se.on_rq()));
+        picked
+    }
+
+    /// pick下一个运行的task
+    pub fn pick_next_entity(&self) -> Option<Arc<FairSchedEntity>> {
+        let curr = self.current();
+        self.pick_next_entity_with_curr(curr.as_ref().filter(|se| se.on_rq()))
     }
 
     pub fn entity_eligible(&self, se: &Arc<FairSchedEntity>) -> bool {
@@ -1434,7 +1401,7 @@ impl Scheduler for CompletelyFairScheduler {
         let mut idle_h_nr_running = pcb.sched_info().policy() == SchedPolicy::IDLE;
         let (should_continue, se) = FairSchedEntity::for_each_in_group(&mut se, |se| {
             if se.on_rq() {
-                return (false, true);
+                return (false, false);
             }
 
             let binding = se.cfs_rq();
@@ -1676,15 +1643,18 @@ impl Scheduler for CompletelyFairScheduler {
             let cfs = cfs_rq.unwrap();
             let cfs = cfs.force_mut();
             let curr = cfs.current();
-            if let Some(curr) = curr {
+            let curr = if let Some(curr) = curr {
                 if curr.on_rq() {
                     cfs.update_current();
+                    Some(curr)
                 } else {
-                    cfs.set_current(Weak::default());
+                    None
                 }
-            }
+            } else {
+                None
+            };
 
-            se = cfs.pick_next_entity();
+            se = cfs.pick_next_entity_with_curr(curr.as_ref());
             match se.clone() {
                 Some(val) => cfs_rq = val.my_cfs_rq.clone(),
                 None => {
@@ -1741,8 +1711,18 @@ impl Scheduler for CompletelyFairScheduler {
         }
 
         loop {
-            let curr = cfs_rq.current();
-            let winner = cfs_rq.pick_next_entity()?;
+            let curr;
+            {
+                let cfs = cfs_rq.force_mut();
+                curr = cfs.current().filter(|se| se.on_rq());
+                if curr.is_some() {
+                    // Linux updates runnable curr before EEVDF pick on the path
+                    // that has not put_prev_entity() yet.
+                    cfs.update_current();
+                }
+            }
+
+            let winner = cfs_rq.pick_next_entity_with_curr(curr.as_ref())?;
 
             // If winner is curr, descend into curr's group
             if let Some(c) = curr {

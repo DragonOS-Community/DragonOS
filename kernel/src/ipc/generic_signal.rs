@@ -447,6 +447,9 @@ fn sig_stop(sig: Signal) {
         let pcb = ProcessManager::current_pcb();
         // 标记停止事件，供 waitid(WSTOPPED) 可见
         pcb.sighand().flags_insert(SignalFlags::CLD_STOPPED);
+        if !pcb.sighand().flags_contains(SignalFlags::STOP_STOPPED) {
+            pcb.sighand().set_stop_signal(sig);
+        }
         pcb.sighand().flags_insert(SignalFlags::STOP_STOPPED);
     }
     ProcessManager::mark_stop().unwrap_or_else(|e| {

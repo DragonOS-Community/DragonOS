@@ -23,6 +23,7 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #define FUSE_TEST_LOG_PREFIX "[fuse-test] "
@@ -114,6 +115,18 @@ static inline int fuse_test_log_enabled(void) {
 #ifndef FUSE_FSYNC
 #define FUSE_FSYNC 20
 #endif
+#ifndef FUSE_SETXATTR
+#define FUSE_SETXATTR 21
+#endif
+#ifndef FUSE_GETXATTR
+#define FUSE_GETXATTR 22
+#endif
+#ifndef FUSE_LISTXATTR
+#define FUSE_LISTXATTR 23
+#endif
+#ifndef FUSE_REMOVEXATTR
+#define FUSE_REMOVEXATTR 24
+#endif
 #ifndef FUSE_FLUSH
 #define FUSE_FLUSH 25
 #endif
@@ -144,6 +157,9 @@ static inline int fuse_test_log_enabled(void) {
 #ifndef FUSE_DESTROY
 #define FUSE_DESTROY 38
 #endif
+#ifndef FUSE_FALLOCATE
+#define FUSE_FALLOCATE 43
+#endif
 #ifndef FUSE_READDIRPLUS
 #define FUSE_READDIRPLUS 44
 #endif
@@ -168,14 +184,43 @@ static inline int fuse_test_log_enabled(void) {
 #ifndef FUSE_READDIRPLUS_AUTO
 #define FUSE_READDIRPLUS_AUTO (1u << 14)
 #endif
+#ifndef FUSE_WRITEBACK_CACHE
+#define FUSE_WRITEBACK_CACHE (1u << 16)
+#endif
+#ifndef FUSE_WRITE_CACHE
+#define FUSE_WRITE_CACHE (1u << 0)
+#endif
+#ifndef FUSE_WRITE_LOCKOWNER
+#define FUSE_WRITE_LOCKOWNER (1u << 1)
+#endif
+#ifndef FUSE_READ_LOCKOWNER
+#define FUSE_READ_LOCKOWNER (1u << 1)
+#endif
 #ifndef FUSE_NO_OPEN_SUPPORT
 #define FUSE_NO_OPEN_SUPPORT (1u << 17)
 #endif
 #ifndef FUSE_NO_OPENDIR_SUPPORT
 #define FUSE_NO_OPENDIR_SUPPORT (1u << 24)
 #endif
+#ifndef FUSE_ATOMIC_O_TRUNC
+#define FUSE_ATOMIC_O_TRUNC (1u << 3)
+#endif
 #ifndef FUSE_FSYNC_FDATASYNC
 #define FUSE_FSYNC_FDATASYNC (1u << 0)
+#endif
+
+/* fuse_open_out.open_flags (subset) */
+#ifndef FOPEN_DIRECT_IO
+#define FOPEN_DIRECT_IO (1u << 0)
+#endif
+#ifndef FOPEN_NONSEEKABLE
+#define FOPEN_NONSEEKABLE (1u << 2)
+#endif
+#ifndef FOPEN_STREAM
+#define FOPEN_STREAM (1u << 4)
+#endif
+#ifndef FOPEN_NOFLUSH
+#define FOPEN_NOFLUSH (1u << 5)
 #endif
 
 #ifndef FUSE_NOTIFY_INVAL_INODE
@@ -204,6 +249,12 @@ static inline int fuse_test_log_enabled(void) {
 #endif
 #ifndef FATTR_SIZE
 #define FATTR_SIZE (1u << 3)
+#endif
+#ifndef FATTR_FH
+#define FATTR_FH (1u << 6)
+#endif
+#ifndef FATTR_LOCKOWNER
+#define FATTR_LOCKOWNER (1u << 9)
 #endif
 
 struct fuse_in_header {
@@ -341,6 +392,29 @@ struct fuse_write_out {
     uint32_t padding;
 };
 
+struct fuse_setxattr_in_compat {
+    uint32_t size;
+    uint32_t flags;
+};
+
+struct fuse_getxattr_in {
+    uint32_t size;
+    uint32_t padding;
+};
+
+struct fuse_getxattr_out {
+    uint32_t size;
+    uint32_t padding;
+};
+
+struct fuse_fallocate_in {
+    uint64_t fh;
+    uint64_t offset;
+    uint64_t length;
+    uint32_t mode;
+    uint32_t padding;
+};
+
 struct fuse_kstatfs {
     uint64_t blocks;
     uint64_t bfree;
@@ -468,10 +542,13 @@ struct simplefs_node {
     int used;
     uint64_t nodeid;
     uint64_t ino;
+    uint64_t generation;
     uint64_t parent;
     int is_dir;
     int is_symlink;
     uint32_t mode; /* includes type bits */
+    uint64_t open_fh;
+    uint32_t open_out_flags;
     char name[SIMPLEFS_NAME_MAX];
     unsigned char data[SIMPLEFS_DATA_MAX];
     size_t size;
@@ -492,10 +569,12 @@ static inline void simplefs_init(struct simplefs *fs) {
     fs->nodes[0].used = 1;
     fs->nodes[0].nodeid = 1;
     fs->nodes[0].ino = 1;
+    fs->nodes[0].generation = 1;
     fs->nodes[0].parent = 1;
     fs->nodes[0].is_dir = 1;
     fs->nodes[0].is_symlink = 0;
     fs->nodes[0].mode = 0040755;
+    fs->nodes[0].open_fh = 1;
     strcpy(fs->nodes[0].name, "");
     fs->nodes[0].size = 0;
 
@@ -503,10 +582,12 @@ static inline void simplefs_init(struct simplefs *fs) {
     fs->nodes[1].used = 1;
     fs->nodes[1].nodeid = 2;
     fs->nodes[1].ino = 2;
+    fs->nodes[1].generation = 1;
     fs->nodes[1].parent = 1;
     fs->nodes[1].is_dir = 0;
     fs->nodes[1].is_symlink = 0;
     fs->nodes[1].mode = 0100644;
+    fs->nodes[1].open_fh = 2;
     strcpy(fs->nodes[1].name, "hello.txt");
     const char *msg = "hello from fuse\n";
     fs->nodes[1].size = strlen(msg);
@@ -564,6 +645,8 @@ static inline struct simplefs_node *simplefs_alloc(struct simplefs *fs) {
             n->used = 1;
             n->nodeid = fs->next_nodeid++;
             n->ino = fs->next_ino++;
+            n->generation = 1;
+            n->open_fh = n->nodeid;
             return n;
         }
     }
@@ -621,31 +704,115 @@ struct fuse_daemon_args {
     int stop_on_destroy;
     uint32_t root_mode_override;
     uint32_t hello_mode_override;
+    uint32_t root_open_out_flags;
+    uint32_t hello_open_out_flags;
+    volatile uint32_t *dynamic_hello_open_out_flags;
+    volatile unsigned char *dynamic_hello_first_byte;
     volatile uint32_t *forget_count;
     volatile uint64_t *forget_nlookup_sum;
+    volatile uint64_t *forget_trace_nodeids;
+    volatile uint64_t *forget_trace_nlookups;
+    uint32_t forget_trace_capacity;
     volatile uint32_t *destroy_count;
     volatile uint32_t *init_in_flags;
     volatile uint32_t *init_in_flags2;
     volatile uint32_t *init_in_max_readahead;
     volatile uint32_t *access_count;
+    volatile uint32_t *lookup_count;
     volatile uint32_t *flush_count;
+    volatile uint32_t *last_flush_uid;
+    volatile uint32_t *last_flush_gid;
+    volatile uint32_t *last_flush_pid;
     volatile uint32_t *fsync_count;
     volatile uint32_t *fsyncdir_count;
     volatile uint32_t *create_count;
     volatile uint32_t *rename2_count;
     volatile uint32_t *open_count;
     volatile uint32_t *opendir_count;
+    volatile uint32_t *setattr_count;
+    volatile uint32_t *fallocate_count;
+    volatile uint32_t *getxattr_count;
+    volatile uint32_t *setxattr_count;
+    volatile uint32_t *listxattr_count;
+    volatile uint32_t *removexattr_count;
+    volatile uint32_t *last_setxattr_flags;
+    volatile uint32_t *last_setattr_valid;
+    volatile uint64_t *last_setattr_fh;
+    volatile uint64_t *last_setattr_size;
+    volatile uint64_t *last_setattr_lock_owner;
+    volatile uint64_t *last_fallocate_fh;
+    volatile uint64_t *last_fallocate_offset;
+    volatile uint64_t *last_fallocate_length;
+    volatile uint32_t *last_fallocate_mode;
     volatile uint32_t *release_count;
     volatile uint32_t *releasedir_count;
     volatile uint32_t *readdirplus_count;
+    volatile uint32_t *read_count;
+    volatile uint32_t *write_count;
+    volatile uint32_t *last_open_in_flags;
+    volatile uint32_t *last_release_in_flags;
+    volatile uint64_t *last_open_fh;
+    volatile uint32_t *last_open_pid;
+    volatile uint64_t *last_read_fh;
+    volatile uint32_t *last_read_size;
+    volatile uint32_t *last_read_open_flags;
+    volatile uint64_t *last_write_fh;
+    volatile uint64_t *last_write_offset;
+    volatile uint32_t *last_write_size;
+    volatile uint32_t *last_write_flags;
+    volatile uint32_t *last_write_open_flags;
+    volatile uint32_t *last_write_uid;
+    volatile uint32_t *last_write_gid;
+    volatile uint32_t *last_write_pid;
+    volatile unsigned char *last_write_watch_byte;
+    volatile uint64_t *last_fsync_fh;
+    volatile uint32_t *write_count_at_fsync;
+    volatile uint32_t *last_write_flags_at_fsync;
+    volatile uint64_t *last_release_fh;
+    volatile uint32_t *last_release_uid;
+    volatile uint32_t *last_release_gid;
+    volatile uint32_t *last_release_pid;
+    volatile uint32_t *last_releasedir_uid;
+    volatile uint32_t *last_releasedir_gid;
+    volatile uint32_t *last_releasedir_pid;
+    volatile uint64_t *read_offsets;
+    volatile uint64_t *read_fhs;
+    volatile uint32_t *read_sizes;
+    uint32_t read_trace_capacity;
     volatile uint32_t *interrupt_count;
     volatile uint64_t *blocked_read_unique;
+    volatile uint64_t *last_interrupt_header_unique;
     volatile uint64_t *last_interrupt_target;
     uint32_t access_deny_mask;
+    uint64_t entry_valid_sec;
+    uint64_t attr_valid_sec;
     uint32_t init_out_flags_override;
+    uint32_t init_out_max_write_override;
+    uint64_t write_watch_offset;
+    uint64_t hello_open_fh_override;
+    uint64_t next_open_fh;
+    uint64_t create_reuse_nodeid;
+    uint64_t create_generation_override;
+    uint64_t link_generation_override;
+    uint64_t hello_generation_override;
+    const char *readdirplus_invalid_attr_name;
+    uint64_t readdirplus_invalid_attr_size;
+    int link_reuse_old_nodeid;
+    int lookup_self_alias;
+    int allow_rename_replace;
+    int has_hello_open_fh_override;
     int force_open_enosys;
     int force_opendir_enosys;
+    int force_flush_errno;
+    int force_fsync_errno;
+    int force_fsyncdir_errno;
+    int force_xattr_enosys;
+    int force_getxattr_erange_at_max;
+    int force_listxattr_erange_at_max;
     int block_read_until_interrupt;
+    size_t hello_data_size_override;
+    size_t hello_read_size_override;
+    size_t hello_generated_size_override;
     struct simplefs fs;
 };
 
@@ -676,6 +843,9 @@ static inline int simplefs_fill_entry_reply(struct fuse_daemon_args *a, const st
     struct fuse_entry_out out;
     memset(&out, 0, sizeof(out));
     out.nodeid = node->nodeid;
+    out.generation = node->generation;
+    out.entry_valid = a->entry_valid_sec;
+    out.attr_valid = a->attr_valid_sec;
     simplefs_fill_attr(node, &out.attr);
     return fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out));
 }
@@ -726,7 +896,9 @@ static inline int simplefs_do_rename(struct fuse_daemon_args *a, const struct fu
         if (flags & RENAME_NOREPLACE) {
             return fuse_write_reply(a->fd, h->unique, -EEXIST, NULL, 0);
         }
-        return fuse_write_reply(a->fd, h->unique, -EEXIST, NULL, 0);
+        if (!a->allow_rename_replace) {
+            return fuse_write_reply(a->fd, h->unique, -EEXIST, NULL, 0);
+        }
     }
     src->parent = newdir;
     strncpy(src->name, newname, sizeof(src->name) - 1);
@@ -768,7 +940,7 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         }
         out.flags = init_flags;
         out.flags2 = 0;
-        out.max_write = 4096;
+        out.max_write = a->init_out_max_write_override ? a->init_out_max_write_override : 4096;
         out.max_pages = 32;
         if (fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out)) != 0) {
             return -1;
@@ -780,13 +952,23 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (payload_len < sizeof(struct fuse_forget_in))
             return -1;
         const struct fuse_forget_in *in = (const struct fuse_forget_in *)payload;
+        uint32_t idx = 0;
+        if (a->forget_count)
+            idx = *a->forget_count;
         if (a->forget_count)
             (*a->forget_count)++;
         if (a->forget_nlookup_sum)
             (*a->forget_nlookup_sum) += in->nlookup;
+        if (a->forget_trace_nodeids && a->forget_trace_nlookups &&
+            idx < a->forget_trace_capacity) {
+            a->forget_trace_nodeids[idx] = h->nodeid;
+            a->forget_trace_nlookups[idx] = in->nlookup;
+        }
         return 0;
     }
     case FUSE_LOOKUP: {
+        if (a->lookup_count)
+            (*a->lookup_count)++;
         const char *name = (const char *)payload;
         if (payload_len == 0 || name[payload_len - 1] != '\0') {
             return -1;
@@ -795,6 +977,16 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (!parent || !simplefs_node_is_dir(parent)) {
             return fuse_write_reply(a->fd, h->unique, -ENOENT, NULL, 0);
         }
+        if (a->lookup_self_alias && strcmp(name, "self_alias") == 0) {
+            struct fuse_entry_out out;
+            memset(&out, 0, sizeof(out));
+            out.nodeid = parent->nodeid;
+            out.generation = parent->generation;
+            out.entry_valid = a->entry_valid_sec;
+            out.attr_valid = a->attr_valid_sec;
+            simplefs_fill_attr(parent, &out.attr);
+            return fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out));
+        }
         struct simplefs_node *child = simplefs_find_child(&a->fs, h->nodeid, name);
         if (!child) {
             return fuse_write_reply(a->fd, h->unique, -ENOENT, NULL, 0);
@@ -802,6 +994,9 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         struct fuse_entry_out out;
         memset(&out, 0, sizeof(out));
         out.nodeid = child->nodeid;
+        out.generation = child->generation;
+        out.entry_valid = a->entry_valid_sec;
+        out.attr_valid = a->attr_valid_sec;
         simplefs_fill_attr(child, &out.attr);
         return fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out));
     }
@@ -818,6 +1013,10 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
     }
     case FUSE_OPENDIR:
     case FUSE_OPEN: {
+        if (payload_len < sizeof(struct fuse_open_in)) {
+            return -1;
+        }
+        const struct fuse_open_in *in = (const struct fuse_open_in *)payload;
         struct simplefs_node *node = simplefs_find_node(&a->fs, h->nodeid);
         if (!node) {
             return fuse_write_reply(a->fd, h->unique, -ENOENT, NULL, 0);
@@ -827,6 +1026,12 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         }
         if (h->opcode == FUSE_OPENDIR && a->opendir_count) {
             (*a->opendir_count)++;
+        }
+        if (h->opcode == FUSE_OPEN && a->last_open_in_flags) {
+            *a->last_open_in_flags = in->flags;
+        }
+        if (h->opcode == FUSE_OPEN && a->last_open_pid) {
+            *a->last_open_pid = h->pid;
         }
         if (h->opcode == FUSE_OPEN && a->force_open_enosys) {
             return fuse_write_reply(a->fd, h->unique, -ENOSYS, NULL, 0);
@@ -840,9 +1045,23 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (h->opcode == FUSE_OPEN && simplefs_node_is_dir(node)) {
             return fuse_write_reply(a->fd, h->unique, -EISDIR, NULL, 0);
         }
+        if (h->opcode == FUSE_OPEN && (in->flags & O_TRUNC)) {
+            node->size = 0;
+        }
+        if (h->opcode == FUSE_OPEN && h->nodeid == 2 && a->dynamic_hello_open_out_flags) {
+            node->open_out_flags = *a->dynamic_hello_open_out_flags;
+        }
         struct fuse_open_out out;
         memset(&out, 0, sizeof(out));
-        out.fh = node->nodeid;
+        if (h->opcode == FUSE_OPEN && a->next_open_fh != 0) {
+            out.fh = a->next_open_fh++;
+        } else {
+            out.fh = node->open_fh;
+        }
+        out.open_flags = node->open_out_flags;
+        if (h->opcode == FUSE_OPEN && a->last_open_fh) {
+            *a->last_open_fh = out.fh;
+        }
         return fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out));
     }
     case FUSE_READLINK: {
@@ -870,13 +1089,64 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
             }
             usleep((useconds_t)a->block_read_until_interrupt * 1000);
         }
-        if (in->offset >= node->size) {
+        uint32_t read_index = 0;
+        if (a->read_count) {
+            read_index = *a->read_count;
+            (*a->read_count)++;
+        }
+        if (a->last_read_fh) {
+            *a->last_read_fh = in->fh;
+        }
+        if (a->last_read_size) {
+            *a->last_read_size = in->size;
+        }
+        if (a->last_read_open_flags) {
+            *a->last_read_open_flags = in->flags;
+        }
+        if (read_index < a->read_trace_capacity) {
+            if (a->read_fhs) {
+                a->read_fhs[read_index] = in->fh;
+            }
+            if (a->read_offsets) {
+                a->read_offsets[read_index] = in->offset;
+            }
+            if (a->read_sizes) {
+                a->read_sizes[read_index] = in->size;
+            }
+        }
+        size_t effective_size = node->size;
+        int generated_hello = h->nodeid == 2 && a->hello_generated_size_override > 0;
+        if (generated_hello) {
+            effective_size = a->hello_generated_size_override;
+        }
+        if (h->nodeid == 2 && a->hello_read_size_override > 0
+            && a->hello_read_size_override < effective_size) {
+            effective_size = a->hello_read_size_override;
+        }
+        if (in->offset >= effective_size) {
             return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
         }
-        size_t remain = node->size - (size_t)in->offset;
+        if (!generated_hello && h->nodeid == 2 && a->dynamic_hello_first_byte
+            && *a->dynamic_hello_first_byte != 0
+            && node->size > 0) {
+            node->data[0] = *a->dynamic_hello_first_byte;
+        }
+        size_t remain = effective_size - (size_t)in->offset;
         size_t to_copy = in->size;
         if (to_copy > remain) {
             to_copy = remain;
+        }
+        if (generated_hello) {
+            unsigned char *generated = (unsigned char *)malloc(to_copy);
+            if (!generated) {
+                return fuse_write_reply(a->fd, h->unique, -ENOMEM, NULL, 0);
+            }
+            for (size_t i = 0; i < to_copy; i++) {
+                generated[i] = (unsigned char)('A' + ((in->offset + i) % 26));
+            }
+            int ret = fuse_write_reply(a->fd, h->unique, 0, generated, to_copy);
+            free(generated);
+            return ret;
         }
         return fuse_write_reply(a->fd, h->unique, 0, node->data + in->offset, to_copy);
     }
@@ -915,6 +1185,7 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
                 struct fuse_direntplus dp;
                 memset(&dp, 0, sizeof(dp));
                 dp.entry_out.nodeid = 1;
+                dp.entry_out.generation = a->fs.nodes[0].generation;
                 simplefs_fill_attr(&a->fs.nodes[0], &dp.entry_out.attr);
                 dp.dirent.ino = 1;
                 dp.dirent.off = idx + 1;
@@ -959,7 +1230,12 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
                 struct fuse_direntplus dp;
                 memset(&dp, 0, sizeof(dp));
                 dp.entry_out.nodeid = c->nodeid;
+                dp.entry_out.generation = c->generation;
                 simplefs_fill_attr(c, &dp.entry_out.attr);
+                if (a->readdirplus_invalid_attr_name &&
+                    strcmp(c->name, a->readdirplus_invalid_attr_name) == 0) {
+                    dp.entry_out.attr.size = a->readdirplus_invalid_attr_size;
+                }
                 dp.dirent.ino = c->ino;
                 dp.dirent.off = child_base + 1;
                 dp.dirent.namelen = (uint32_t)nmlen;
@@ -1011,14 +1287,43 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
                       (unsigned long long)out.st.bavail);
         return fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out));
     }
-    case FUSE_RELEASE:
+    case FUSE_RELEASE: {
+        if (payload_len < sizeof(struct fuse_release_in)) {
+            return -1;
+        }
+        const struct fuse_release_in *in = (const struct fuse_release_in *)payload;
         if (a->release_count) {
             (*a->release_count)++;
         }
+        if (a->last_release_in_flags) {
+            *a->last_release_in_flags = in->flags;
+        }
+        if (a->last_release_fh) {
+            *a->last_release_fh = in->fh;
+        }
+        if (a->last_release_uid) {
+            *a->last_release_uid = h->uid;
+        }
+        if (a->last_release_gid) {
+            *a->last_release_gid = h->gid;
+        }
+        if (a->last_release_pid) {
+            *a->last_release_pid = h->pid;
+        }
         return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
+    }
     case FUSE_RELEASEDIR:
         if (a->releasedir_count) {
             (*a->releasedir_count)++;
+        }
+        if (a->last_releasedir_uid) {
+            *a->last_releasedir_uid = h->uid;
+        }
+        if (a->last_releasedir_gid) {
+            *a->last_releasedir_gid = h->gid;
+        }
+        if (a->last_releasedir_pid) {
+            *a->last_releasedir_pid = h->pid;
         }
         return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
     case FUSE_INTERRUPT: {
@@ -1029,6 +1334,9 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (a->interrupt_count) {
             (*a->interrupt_count)++;
         }
+        if (a->last_interrupt_header_unique) {
+            *a->last_interrupt_header_unique = h->unique;
+        }
         if (a->last_interrupt_target) {
             *a->last_interrupt_target = in->unique;
         }
@@ -1038,15 +1346,47 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (a->flush_count) {
             (*a->flush_count)++;
         }
+        if (a->last_flush_uid) {
+            *a->last_flush_uid = h->uid;
+        }
+        if (a->last_flush_gid) {
+            *a->last_flush_gid = h->gid;
+        }
+        if (a->last_flush_pid) {
+            *a->last_flush_pid = h->pid;
+        }
+        if (a->force_flush_errno > 0) {
+            return fuse_write_reply(a->fd, h->unique, -a->force_flush_errno, NULL, 0);
+        }
         return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
-    case FUSE_FSYNC:
+    case FUSE_FSYNC: {
+        if (payload_len < sizeof(struct fuse_fsync_in)) {
+            return -1;
+        }
+        const struct fuse_fsync_in *in = (const struct fuse_fsync_in *)payload;
         if (a->fsync_count) {
             (*a->fsync_count)++;
         }
+        if (a->last_fsync_fh) {
+            *a->last_fsync_fh = in->fh;
+        }
+        if (a->write_count_at_fsync && a->write_count) {
+            *a->write_count_at_fsync = *a->write_count;
+        }
+        if (a->last_write_flags_at_fsync && a->last_write_flags) {
+            *a->last_write_flags_at_fsync = *a->last_write_flags;
+        }
+        if (a->force_fsync_errno > 0) {
+            return fuse_write_reply(a->fd, h->unique, -a->force_fsync_errno, NULL, 0);
+        }
         return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
+    }
     case FUSE_FSYNCDIR:
         if (a->fsyncdir_count) {
             (*a->fsyncdir_count)++;
+        }
+        if (a->force_fsyncdir_errno > 0) {
+            return fuse_write_reply(a->fd, h->unique, -a->force_fsyncdir_errno, NULL, 0);
         }
         return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
     case FUSE_ACCESS: {
@@ -1088,9 +1428,43 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (in->offset >= SIMPLEFS_DATA_MAX) {
             return fuse_write_reply(a->fd, h->unique, -EFBIG, NULL, 0);
         }
+        if (a->write_count) {
+            (*a->write_count)++;
+        }
+        if (a->last_write_fh) {
+            *a->last_write_fh = in->fh;
+        }
+        if (a->last_write_offset) {
+            *a->last_write_offset = in->offset;
+        }
+        if (a->last_write_size) {
+            *a->last_write_size = in->size;
+        }
+        if (a->last_write_flags) {
+            *a->last_write_flags = in->write_flags;
+        }
+        if (a->last_write_open_flags) {
+            *a->last_write_open_flags = in->flags;
+        }
+        if (a->last_write_uid) {
+            *a->last_write_uid = h->uid;
+        }
+        if (a->last_write_gid) {
+            *a->last_write_gid = h->gid;
+        }
+        if (a->last_write_pid) {
+            *a->last_write_pid = h->pid;
+        }
         size_t to_copy = in->size;
         if (in->offset + to_copy > SIMPLEFS_DATA_MAX) {
             to_copy = SIMPLEFS_DATA_MAX - (size_t)in->offset;
+        }
+        if (a->last_write_watch_byte) {
+            uint64_t watch = a->write_watch_offset;
+            uint64_t end = in->offset + to_copy;
+            if (watch >= in->offset && watch < end) {
+                *a->last_write_watch_byte = data[(size_t)(watch - in->offset)];
+            }
         }
         memcpy(node->data + in->offset, data, to_copy);
         if (node->size < in->offset + to_copy) {
@@ -1127,10 +1501,18 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (!nnode) {
             return fuse_write_reply(a->fd, h->unique, -ENOSPC, NULL, 0);
         }
+        if (a->create_reuse_nodeid != 0) {
+            nnode->nodeid = a->create_reuse_nodeid;
+            nnode->ino = a->create_reuse_nodeid;
+        }
+        if (a->create_generation_override != 0) {
+            nnode->generation = a->create_generation_override;
+        }
         nnode->parent = h->nodeid;
         nnode->is_dir = 0;
         nnode->is_symlink = 0;
         nnode->mode = in->mode;
+        nnode->open_fh = nnode->nodeid;
         strncpy(nnode->name, name, sizeof(nnode->name) - 1);
         nnode->name[sizeof(nnode->name) - 1] = '\0';
         nnode->size = 0;
@@ -1141,8 +1523,9 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         } out;
         memset(&out, 0, sizeof(out));
         out.entry.nodeid = nnode->nodeid;
+        out.entry.generation = nnode->generation;
         simplefs_fill_attr(nnode, &out.entry.attr);
-        out.open_out.fh = nnode->nodeid;
+        out.open_out.fh = nnode->open_fh;
         return fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out));
     }
     case FUSE_SYMLINK: {
@@ -1174,10 +1557,14 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (!nnode) {
             return fuse_write_reply(a->fd, h->unique, -ENOSPC, NULL, 0);
         }
+        if (a->create_generation_override != 0) {
+            nnode->generation = a->create_generation_override;
+        }
         nnode->parent = h->nodeid;
         nnode->is_dir = 0;
         nnode->is_symlink = 1;
         nnode->mode = 0120777;
+        nnode->open_fh = nnode->nodeid;
         strncpy(nnode->name, name, sizeof(nnode->name) - 1);
         nnode->name[sizeof(nnode->name) - 1] = '\0';
         nnode->size = (target_len < SIMPLEFS_DATA_MAX) ? target_len : SIMPLEFS_DATA_MAX;
@@ -1214,10 +1601,18 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (!nnode) {
             return fuse_write_reply(a->fd, h->unique, -ENOSPC, NULL, 0);
         }
+        if (a->link_reuse_old_nodeid) {
+            nnode->nodeid = src->nodeid;
+            nnode->ino = src->ino;
+        }
+        if (a->link_generation_override != 0) {
+            nnode->generation = a->link_generation_override;
+        }
         nnode->parent = h->nodeid;
         nnode->is_dir = 0;
         nnode->is_symlink = src->is_symlink;
         nnode->mode = src->mode;
+        nnode->open_fh = nnode->nodeid;
         strncpy(nnode->name, name, sizeof(nnode->name) - 1);
         nnode->name[sizeof(nnode->name) - 1] = '\0';
         nnode->size = src->size;
@@ -1263,10 +1658,18 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (!nnode) {
             return fuse_write_reply(a->fd, h->unique, -ENOSPC, NULL, 0);
         }
+        if (a->create_reuse_nodeid != 0) {
+            nnode->nodeid = a->create_reuse_nodeid;
+            nnode->ino = a->create_reuse_nodeid;
+        }
+        if (a->create_generation_override != 0) {
+            nnode->generation = a->create_generation_override;
+        }
         nnode->parent = h->nodeid;
         nnode->is_dir = is_dir;
         nnode->is_symlink = 0;
         nnode->mode = mode;
+        nnode->open_fh = nnode->nodeid;
         strncpy(nnode->name, name, sizeof(nnode->name) - 1);
         nnode->name[sizeof(nnode->name) - 1] = '\0';
         nnode->size = 0;
@@ -1329,6 +1732,9 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         return simplefs_do_rename(a, h, in->newdir, in->flags, oldname, newname);
     }
     case FUSE_SETATTR: {
+        if (a->setattr_count) {
+            (*a->setattr_count)++;
+        }
         if (!a->enable_write_ops) {
             return fuse_write_reply(a->fd, h->unique, -ENOSYS, NULL, 0);
         }
@@ -1336,6 +1742,18 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
             return -1;
         }
         const struct fuse_setattr_in *in = (const struct fuse_setattr_in *)payload;
+        if (a->last_setattr_valid) {
+            *a->last_setattr_valid = in->valid;
+        }
+        if (a->last_setattr_fh) {
+            *a->last_setattr_fh = in->fh;
+        }
+        if (a->last_setattr_size) {
+            *a->last_setattr_size = in->size;
+        }
+        if (a->last_setattr_lock_owner) {
+            *a->last_setattr_lock_owner = in->lock_owner;
+        }
         struct simplefs_node *node = simplefs_find_node(&a->fs, h->nodeid);
         if (!node) {
             return fuse_write_reply(a->fd, h->unique, -ENOENT, NULL, 0);
@@ -1357,6 +1775,151 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         simplefs_fill_attr(node, &out.attr);
         return fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out));
     }
+    case FUSE_GETXATTR: {
+        if (a->getxattr_count) {
+            (*a->getxattr_count)++;
+        }
+        if (a->force_xattr_enosys) {
+            return fuse_write_reply(a->fd, h->unique, -ENOSYS, NULL, 0);
+        }
+        if (payload_len < sizeof(struct fuse_getxattr_in) + 1) {
+            return -1;
+        }
+        const struct fuse_getxattr_in *in = (const struct fuse_getxattr_in *)payload;
+        const char *name = (const char *)(payload + sizeof(*in));
+        size_t name_len = payload_len - sizeof(*in);
+        if (name[name_len - 1] != '\0') {
+            return -1;
+        }
+        if (strcmp(name, "user.dragonos") != 0) {
+            return fuse_write_reply(a->fd, h->unique, -ENODATA, NULL, 0);
+        }
+        const char value[] = "virtiofs-xattr";
+        size_t value_len = sizeof(value) - 1;
+        if (in->size == 0) {
+            struct fuse_getxattr_out out;
+            memset(&out, 0, sizeof(out));
+            out.size = (uint32_t)value_len;
+            return fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out));
+        }
+        if (a->force_getxattr_erange_at_max && in->size == 65536) {
+            return fuse_write_reply(a->fd, h->unique, -ERANGE, NULL, 0);
+        }
+        if (in->size < value_len) {
+            return fuse_write_reply(a->fd, h->unique, -ERANGE, NULL, 0);
+        }
+        return fuse_write_reply(a->fd, h->unique, 0, value, value_len);
+    }
+    case FUSE_LISTXATTR: {
+        if (a->listxattr_count) {
+            (*a->listxattr_count)++;
+        }
+        if (a->force_xattr_enosys) {
+            return fuse_write_reply(a->fd, h->unique, -ENOSYS, NULL, 0);
+        }
+        if (payload_len < sizeof(struct fuse_getxattr_in)) {
+            return -1;
+        }
+        const struct fuse_getxattr_in *in = (const struct fuse_getxattr_in *)payload;
+        const char list[] = "user.dragonos";
+        size_t list_len = sizeof(list);
+        if (in->size == 0) {
+            struct fuse_getxattr_out out;
+            memset(&out, 0, sizeof(out));
+            out.size = (uint32_t)list_len;
+            return fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out));
+        }
+        if (a->force_listxattr_erange_at_max && in->size == 65536) {
+            return fuse_write_reply(a->fd, h->unique, -ERANGE, NULL, 0);
+        }
+        if (in->size < list_len) {
+            return fuse_write_reply(a->fd, h->unique, -ERANGE, NULL, 0);
+        }
+        return fuse_write_reply(a->fd, h->unique, 0, list, list_len);
+    }
+    case FUSE_SETXATTR: {
+        if (a->setxattr_count) {
+            (*a->setxattr_count)++;
+        }
+        if (a->force_xattr_enosys) {
+            return fuse_write_reply(a->fd, h->unique, -ENOSYS, NULL, 0);
+        }
+        if (payload_len < sizeof(struct fuse_setxattr_in_compat) + 1) {
+            return -1;
+        }
+        const struct fuse_setxattr_in_compat *in =
+            (const struct fuse_setxattr_in_compat *)payload;
+        if (a->last_setxattr_flags) {
+            *a->last_setxattr_flags = in->flags;
+        }
+        const char *name = (const char *)payload + sizeof(struct fuse_setxattr_in_compat);
+        size_t name_len = strnlen(name, payload_len - sizeof(struct fuse_setxattr_in_compat));
+        if (name_len >= payload_len - sizeof(struct fuse_setxattr_in_compat)) {
+            return -1;
+        }
+        if ((in->flags & XATTR_CREATE) && strcmp(name, "user.dragonos") == 0) {
+            return fuse_write_reply(a->fd, h->unique, -EEXIST, NULL, 0);
+        }
+        if ((in->flags & XATTR_REPLACE) && strcmp(name, "user.missing") == 0) {
+            return fuse_write_reply(a->fd, h->unique, -ENODATA, NULL, 0);
+        }
+        return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
+    }
+    case FUSE_REMOVEXATTR: {
+        if (a->removexattr_count) {
+            (*a->removexattr_count)++;
+        }
+        if (a->force_xattr_enosys) {
+            return fuse_write_reply(a->fd, h->unique, -ENOSYS, NULL, 0);
+        }
+        const char *name = (const char *)payload;
+        if (payload_len == 0 || name[payload_len - 1] != '\0') {
+            return -1;
+        }
+        if (strcmp(name, "user.dragonos") != 0) {
+            return fuse_write_reply(a->fd, h->unique, -ENODATA, NULL, 0);
+        }
+        return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
+    }
+    case FUSE_FALLOCATE: {
+        if (!a->enable_write_ops) {
+            return fuse_write_reply(a->fd, h->unique, -ENOSYS, NULL, 0);
+        }
+        if (payload_len < sizeof(struct fuse_fallocate_in)) {
+            return -1;
+        }
+        const struct fuse_fallocate_in *in = (const struct fuse_fallocate_in *)payload;
+        if (a->fallocate_count) {
+            (*a->fallocate_count)++;
+        }
+        if (a->last_fallocate_fh) {
+            *a->last_fallocate_fh = in->fh;
+        }
+        if (a->last_fallocate_offset) {
+            *a->last_fallocate_offset = in->offset;
+        }
+        if (a->last_fallocate_length) {
+            *a->last_fallocate_length = in->length;
+        }
+        if (a->last_fallocate_mode) {
+            *a->last_fallocate_mode = in->mode;
+        }
+        struct simplefs_node *node = simplefs_find_node(&a->fs, h->nodeid);
+        if (!node || simplefs_node_is_dir(node) || simplefs_node_is_symlink(node)) {
+            return fuse_write_reply(a->fd, h->unique, -EINVAL, NULL, 0);
+        }
+        if (in->mode != 0) {
+            return fuse_write_reply(a->fd, h->unique, -EOPNOTSUPP, NULL, 0);
+        }
+        if (in->offset > SIMPLEFS_DATA_MAX || in->length > SIMPLEFS_DATA_MAX ||
+            in->offset + in->length > SIMPLEFS_DATA_MAX) {
+            return fuse_write_reply(a->fd, h->unique, -EFBIG, NULL, 0);
+        }
+        if (node->size < in->offset + in->length) {
+            node->size = (size_t)(in->offset + in->length);
+        }
+        return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
+    }
     default:
         return fuse_write_reply(a->fd, h->unique, -ENOSYS, NULL, 0);
     }
@@ -1373,8 +1936,33 @@ static inline void *fuse_daemon_thread(void *arg) {
     if (a->root_mode_override) {
         a->fs.nodes[0].mode = a->root_mode_override;
     }
+    if (a->root_open_out_flags != 0) {
+        a->fs.nodes[0].open_out_flags = a->root_open_out_flags;
+    }
     if (a->hello_mode_override) {
         a->fs.nodes[1].mode = a->hello_mode_override;
+    }
+    if (a->hello_generation_override != 0) {
+        a->fs.nodes[1].generation = a->hello_generation_override;
+    }
+    if (a->hello_open_out_flags != 0) {
+        a->fs.nodes[1].open_out_flags = a->hello_open_out_flags;
+    }
+    if (a->has_hello_open_fh_override) {
+        a->fs.nodes[1].open_fh = a->hello_open_fh_override;
+    }
+    if (a->hello_data_size_override > 0) {
+        size_t size = a->hello_data_size_override;
+        if (size > SIMPLEFS_DATA_MAX) {
+            size = SIMPLEFS_DATA_MAX;
+        }
+        for (size_t i = 0; i < size; i++) {
+            a->fs.nodes[1].data[i] = (unsigned char)('A' + (i % 26));
+        }
+        a->fs.nodes[1].size = size;
+    }
+    if (a->hello_generated_size_override > 0) {
+        a->fs.nodes[1].size = a->hello_generated_size_override;
     }
 
     while (!*a->stop) {

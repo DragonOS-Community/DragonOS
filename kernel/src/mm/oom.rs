@@ -8,9 +8,10 @@ use log::{error, warn};
 use system_error::SystemError;
 
 use crate::{
-    arch::ipc::signal::Signal,
+    arch::{ipc::signal::Signal, mm::LockedFrameAllocator, MMArch},
     ipc::signal_types::{SigCode, SigInfo, SigType},
     libs::{spinlock::SpinLock, wait_queue::WaitQueue},
+    mm::{allocator::page_frame::FrameAllocator, MemoryManagementArch},
     process::{pid::PidType, ProcessControlBlock, ProcessFlags, ProcessManager, RawPid},
 };
 
@@ -41,6 +42,7 @@ struct OomVictimState {
     generation: u64,
     mm_id: u64,
     mm: Weak<AddressSpace>,
+    initial_resident_pages: usize,
 }
 
 #[derive(Debug)]
@@ -86,52 +88,86 @@ impl OomFaultInject {
 #[derive(Debug)]
 struct OomCandidate {
     tgid: RawPid,
-    leader: Arc<ProcessControlBlock>,
     mm: Arc<AddressSpace>,
-    score: usize,
+    score: isize,
+    resident_pages: usize,
+    oom_score_adj: i16,
 }
+
+const OOM_SCORE_ADJ_MIN: i16 = -1000;
 
 fn victim_has_progress(victim: &OomVictimState) -> bool {
     let Some(mm) = victim.mm.upgrade() else {
         return true;
     };
-    mm.id() != victim.mm_id || mm.resident_pages() == 0
+    if mm.id() != victim.mm_id {
+        return true;
+    }
+    victim.initial_resident_pages > 0 && mm.resident_pages() < victim.initial_resident_pages
 }
 
 fn wake_oom_waiters() {
     OOM_WAITQ.wake_all();
 }
 
-fn current_is_killed() -> bool {
-    Signal::fatal_signal_pending(&ProcessManager::current_pcb())
+fn current_is_killed_or_exiting() -> bool {
+    let current = ProcessManager::current_pcb();
+    Signal::fatal_signal_pending(&current) || current.flags().intersects(ProcessFlags::EXITING)
 }
 
 fn leader_of(pcb: Arc<ProcessControlBlock>) -> Arc<ProcessControlBlock> {
     ProcessManager::find(pcb.raw_tgid()).unwrap_or(pcb)
 }
 
-fn should_skip_candidate(leader: &Arc<ProcessControlBlock>, mm: &Arc<AddressSpace>) -> bool {
+fn is_global_init_or_kthread(leader: &Arc<ProcessControlBlock>) -> bool {
     leader.raw_pid().data() == 0
         || leader.raw_pid().data() == 1
-        || leader
-            .flags()
-            .contains(ProcessFlags::KTHREAD | ProcessFlags::EXITING)
-        || mm.resident_pages() == 0
+        || leader.flags().contains(ProcessFlags::KTHREAD)
+}
+
+fn should_skip_candidate(leader: &Arc<ProcessControlBlock>, oom_score_adj: i16) -> bool {
+    is_global_init_or_kthread(leader)
+        || leader.flags().contains(ProcessFlags::EXITING)
+        || oom_score_adj == OOM_SCORE_ADJ_MIN
 }
 
 fn better_candidate(new: &OomCandidate, old: &OomCandidate) -> bool {
-    new.score > old.score || (new.score == old.score && new.tgid > old.tgid)
+    new.score > old.score
+        || (new.score == old.score && new.resident_pages > old.resident_pages)
+        || (new.score == old.score
+            && new.resident_pages == old.resident_pages
+            && new.tgid > old.tgid)
 }
 
-fn select_victim() -> Option<OomCandidate> {
-    let pids = ProcessManager::get_all_processes();
-    let mut seen_tgids = Vec::new();
-    let mut best: Option<OomCandidate> = None;
+fn total_system_pages() -> isize {
+    let total_pages = unsafe { LockedFrameAllocator.usage() }.total().bytes() >> MMArch::PAGE_SHIFT;
+    total_pages.min(isize::MAX as usize).max(1) as isize
+}
 
-    for pid in pids {
+fn oom_score(mm: &Arc<AddressSpace>, oom_score_adj: i16, total_pages: isize) -> isize {
+    let resident_pages = mm.resident_pages().min(isize::MAX as usize) as isize;
+    let adjustment = (oom_score_adj as isize).saturating_mul(total_pages) / 1000;
+    resident_pages.saturating_add(adjustment)
+}
+
+fn task_uses_mm(task: &Arc<ProcessControlBlock>, mm: &Arc<AddressSpace>) -> bool {
+    task.basic()
+        .user_vm()
+        .is_some_and(|task_mm| task_mm.id() == mm.id() || Arc::ptr_eq(&task_mm, mm))
+}
+
+fn kill_targets_for_mm(mm: &Arc<AddressSpace>) -> Vec<Arc<ProcessControlBlock>> {
+    let mut seen_tgids = Vec::new();
+    let mut targets = Vec::new();
+
+    for pid in ProcessManager::get_all_processes() {
         let Some(task) = ProcessManager::find(pid) else {
             continue;
         };
+        if !task_uses_mm(&task, mm) {
+            continue;
+        }
+
         let leader = leader_of(task);
         let tgid = leader.raw_tgid();
         if seen_tgids.contains(&tgid) {
@@ -139,17 +175,46 @@ fn select_victim() -> Option<OomCandidate> {
         }
         seen_tgids.push(tgid);
 
-        let Some(mm) = leader.basic().user_vm() else {
+        if is_global_init_or_kthread(&leader) {
+            continue;
+        }
+        targets.push(leader);
+    }
+
+    targets
+}
+
+fn select_victim() -> Option<OomCandidate> {
+    let pids = ProcessManager::get_all_processes();
+    let total_pages = total_system_pages();
+    let mut seen_tgids = Vec::new();
+    let mut best: Option<OomCandidate> = None;
+
+    for pid in pids {
+        let Some(task) = ProcessManager::find(pid) else {
             continue;
         };
-        if should_skip_candidate(&leader, &mm) {
+        let Some(mm) = task.basic().user_vm() else {
+            continue;
+        };
+
+        let leader = leader_of(task);
+        let tgid = leader.raw_tgid();
+        if seen_tgids.contains(&tgid) {
+            continue;
+        }
+        seen_tgids.push(tgid);
+
+        let oom_score_adj = leader.sig_info_irqsave().oom_score_adj();
+        if should_skip_candidate(&leader, oom_score_adj) {
             continue;
         }
 
         let candidate = OomCandidate {
             tgid,
-            leader,
-            score: mm.resident_pages(),
+            score: oom_score(&mm, oom_score_adj, total_pages),
+            resident_pages: mm.resident_pages(),
+            oom_score_adj,
             mm,
         };
         if best
@@ -193,22 +258,48 @@ fn finish_selection_with_victim(generation: u64, candidate: &OomCandidate) {
         generation,
         mm_id: candidate.mm.id(),
         mm: Arc::downgrade(&candidate.mm),
+        initial_resident_pages: candidate.resident_pages,
     });
 }
 
 fn send_oom_sigkill(candidate: &OomCandidate) -> Result<(), SystemError> {
-    let mut info = SigInfo::new(
-        Signal::SIGKILL,
-        0,
-        SigCode::Kernel,
-        SigType::Kill {
-            pid: RawPid::new(0),
-            uid: 0,
+    let mut sent = false;
+    let targets = kill_targets_for_mm(&candidate.mm);
+
+    for target in targets {
+        let mut info = SigInfo::new(
+            Signal::SIGKILL,
+            0,
+            SigCode::Kernel,
+            SigType::Kill {
+                pid: RawPid::new(0),
+                uid: 0,
+            },
+        );
+        match Signal::SIGKILL.send_signal_info_to_pcb(Some(&mut info), target, PidType::TGID) {
+            Ok(_) => sent = true,
+            Err(SystemError::ESRCH) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    sent.then_some(()).ok_or(SystemError::ESRCH)
+}
+
+fn wait_for_oom_slot() -> Result<(), SystemError> {
+    OOM_WAITQ.wait_event_killable(
+        || {
+            let state = OOM_STATE.lock_irqsave();
+            if state.selecting {
+                return false;
+            }
+            match state.inflight.as_ref() {
+                None => true,
+                Some(victim) => victim_has_progress(victim),
+            }
         },
-    );
-    Signal::SIGKILL
-        .send_signal_info_to_pcb(Some(&mut info), candidate.leader.clone(), PidType::TGID)
-        .map(|_| ())
+        None::<fn()>,
+    )
 }
 
 fn wait_until_recoverable(generation: u64) -> Result<(), SystemError> {
@@ -220,7 +311,7 @@ fn wait_until_recoverable(generation: u64) -> Result<(), SystemError> {
             }
             match state.inflight.as_ref() {
                 None => true,
-                Some(victim) if victim.generation != generation => true,
+                Some(victim) if victim.generation == generation => victim_has_progress(victim),
                 Some(victim) => victim_has_progress(victim),
             }
         },
@@ -230,14 +321,14 @@ fn wait_until_recoverable(generation: u64) -> Result<(), SystemError> {
 
 pub fn pagefault_out_of_memory(ctx: OomContext) -> OomOutcome {
     loop {
-        if current_is_killed() {
+        if current_is_killed_or_exiting() {
             return OomOutcome::CurrentTaskKilled;
         }
 
         let generation = match begin_selection() {
             Ok(generation) => generation,
             Err(()) => {
-                let _ = wait_until_recoverable(0);
+                let _ = wait_for_oom_slot();
                 continue;
             }
         };
@@ -255,25 +346,34 @@ pub fn pagefault_out_of_memory(ctx: OomContext) -> OomOutcome {
         };
 
         let current_is_victim = candidate.tgid == ctx.trigger_tgid;
+        let victim_tgid = candidate.tgid;
+        let victim_score = candidate.score;
+        let victim_oom_score_adj = candidate.oom_score_adj;
+        let victim_resident_pages = candidate.resident_pages;
         match send_oom_sigkill(&candidate) {
             Ok(()) => {
                 error!(
-                    "oom-kill: trigger_pid={} trigger_tgid={} victim_tgid={} score={} order={} addr={:#x} ip={:#x}",
+                    "oom-kill: trigger_pid={} trigger_tgid={} victim_tgid={} score={} adj={} rss={} order={} addr={:#x} ip={:#x}",
                     ctx.trigger_pid,
                     ctx.trigger_tgid,
-                    candidate.tgid,
-                    candidate.score,
+                    victim_tgid,
+                    victim_score,
+                    victim_oom_score_adj,
+                    victim_resident_pages,
                     ctx.order,
                     ctx.fault_address.data(),
                     ctx.fault_ip
                 );
                 finish_selection_with_victim(generation, &candidate);
+                drop(candidate);
                 if current_is_victim {
                     return OomOutcome::CurrentTaskKilled;
                 }
                 match wait_until_recoverable(generation) {
                     Ok(()) => return OomOutcome::Retry,
-                    Err(_) if current_is_killed() => return OomOutcome::CurrentTaskKilled,
+                    Err(_) if current_is_killed_or_exiting() => {
+                        return OomOutcome::CurrentTaskKilled
+                    }
                     Err(_) => return OomOutcome::Retry,
                 }
             }
@@ -285,7 +385,7 @@ pub fn pagefault_out_of_memory(ctx: OomContext) -> OomOutcome {
                 finish_selection_none();
                 warn!(
                     "oom: failed to SIGKILL victim tgid={} for trigger pid={} err={:?}",
-                    candidate.tgid, ctx.trigger_pid, err
+                    victim_tgid, ctx.trigger_pid, err
                 );
                 return OomOutcome::NoVictim;
             }
@@ -294,19 +394,43 @@ pub fn pagefault_out_of_memory(ctx: OomContext) -> OomOutcome {
 }
 
 pub fn notify_mm_released(mm: &Arc<AddressSpace>) {
+    let no_task_uses_mm = kill_targets_for_mm(mm).is_empty();
     let mut state = OOM_STATE.lock_irqsave();
-    let matches_inflight = state.inflight.as_ref().is_some_and(|victim| {
-        victim.mm_id == mm.id()
-            || victim
-                .mm
-                .upgrade()
-                .is_some_and(|other| Arc::ptr_eq(&other, mm))
-    });
-    if matches_inflight {
-        state.inflight = None;
-    }
+    let should_wake = match state.inflight.as_ref() {
+        Some(victim)
+            if victim.mm_id == mm.id()
+                || victim
+                    .mm
+                    .upgrade()
+                    .is_some_and(|other| Arc::ptr_eq(&other, mm)) =>
+        {
+            if victim_has_progress(victim) || no_task_uses_mm {
+                state.inflight = None;
+            }
+            true
+        }
+        _ => false,
+    };
     drop(state);
-    if matches_inflight {
+    if should_wake {
+        wake_oom_waiters();
+    }
+}
+
+pub fn notify_mm_resident_changed(mm: &AddressSpace) {
+    let mut state = OOM_STATE.lock_irqsave();
+    let should_wake = if state
+        .inflight
+        .as_ref()
+        .is_some_and(|victim| victim.mm_id == mm.id() && victim_has_progress(victim))
+    {
+        state.inflight = None;
+        true
+    } else {
+        false
+    };
+    drop(state);
+    if should_wake {
         wake_oom_waiters();
     }
 }

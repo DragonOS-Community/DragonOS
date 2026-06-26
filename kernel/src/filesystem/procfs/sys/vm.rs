@@ -7,6 +7,7 @@ use crate::{
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
     mm::{page::PageReclaimer, page_cache_stats},
+    process::cred::{capable, CAPFlags},
 };
 use alloc::{
     string::ToString,
@@ -142,12 +143,15 @@ impl FileOps for DropCachesFileOps {
 }
 
 /// /proc/sys/vm/oom_fault_inject 文件的 FileOps 实现
+///
+/// DragonOS-only test hook. It is intentionally restricted to privileged
+/// callers and must not be treated as a Linux-compatible sysctl ABI.
 #[derive(Debug)]
 pub struct OomFaultInjectFileOps;
 
 impl OomFaultInjectFileOps {
     pub fn new_inode(parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcFileBuilder::new(Self, InodeMode::from_bits_truncate(0o644))
+        ProcFileBuilder::new(Self, InodeMode::from_bits_truncate(0o600))
             .parent(parent)
             .build()
             .unwrap()
@@ -162,6 +166,9 @@ impl FileOps for OomFaultInjectFileOps {
         buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        if !capable(CAPFlags::CAP_SYS_ADMIN) {
+            return Err(SystemError::EPERM);
+        }
         let content = crate::mm::oom::read_fault_inject_config();
         crate::filesystem::procfs::utils::proc_read(offset, len, buf, content.as_bytes())
     }
@@ -173,6 +180,9 @@ impl FileOps for OomFaultInjectFileOps {
         buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        if !capable(CAPFlags::CAP_SYS_ADMIN) {
+            return Err(SystemError::EPERM);
+        }
         crate::mm::oom::write_fault_inject_config(buf)
     }
 }

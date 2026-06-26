@@ -42,6 +42,10 @@
 #define MREMAP_DONTUNMAP 4
 #endif
 
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+
 namespace {
 
 size_t PageSize() {
@@ -445,7 +449,81 @@ TEST(Mremap, DontUnmapClearsSourceLock) {
     EXPECT_EQ(0, munmap(addr, ps));
 }
 
-TEST(Mremap, DuplicateOldLenZeroClearsSourceLock) {
+TEST(Mremap, DontUnmapPartialRangeClearsWholeSourceLock) {
+    const size_t ps = PageSize();
+    ScopedMemlockLimit lim;
+    ASSERT_TRUE(lim.valid());
+    ASSERT_TRUE(lim.set_bytes(ps * 3));
+
+    auto* addr = static_cast<char*>(
+        mmap(nullptr, ps * 3, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    ASSERT_NE(MAP_FAILED, addr);
+    ASSERT_EQ(0, mlock(addr, ps * 3));
+
+    errno = 0;
+    void* moved = reinterpret_cast<void*>(
+        syscall(SYS_mremap, addr + ps, ps, ps, MREMAP_MAYMOVE | MREMAP_DONTUNMAP, 0));
+    ASSERT_NE(MAP_FAILED, moved) << "errno=" << errno << " (" << strerror(errno) << ")";
+
+    errno = 0;
+    EXPECT_EQ(0, msync(addr, ps, MS_INVALIDATE))
+        << "errno=" << errno << " (" << strerror(errno) << ")";
+
+    errno = 0;
+    EXPECT_EQ(0, msync(addr + ps, ps, MS_INVALIDATE))
+        << "errno=" << errno << " (" << strerror(errno) << ")";
+
+    errno = 0;
+    EXPECT_EQ(0, msync(addr + 2 * ps, ps, MS_INVALIDATE))
+        << "errno=" << errno << " (" << strerror(errno) << ")";
+
+    errno = 0;
+    EXPECT_EQ(-1, msync(moved, ps, MS_INVALIDATE));
+    EXPECT_EQ(EBUSY, errno);
+
+    EXPECT_EQ(0, munmap(moved, ps));
+    EXPECT_EQ(0, munmap(addr, ps * 3));
+}
+
+TEST(Mremap, DontUnmapRejectsUnalignedNewAddress) {
+    const size_t ps = PageSize();
+    auto* addr = static_cast<char*>(
+        mmap(nullptr, ps, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    ASSERT_NE(MAP_FAILED, addr);
+
+    errno = 0;
+    void* moved = reinterpret_cast<void*>(
+        syscall(SYS_mremap, addr, ps, ps, MREMAP_MAYMOVE | MREMAP_DONTUNMAP, addr + 1));
+    EXPECT_EQ(MAP_FAILED, moved);
+    EXPECT_EQ(EINVAL, errno);
+
+    addr[0] = 0x5a;
+    EXPECT_EQ(0x5a, addr[0]);
+    EXPECT_EQ(0, munmap(addr, ps));
+}
+
+TEST(Mremap, DontUnmapUsesNewAddressHintWhenAvailable) {
+    const size_t ps = PageSize();
+    auto* addr = static_cast<char*>(
+        mmap(nullptr, ps, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    ASSERT_NE(MAP_FAILED, addr);
+
+    void* hint = mmap(nullptr, ps, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(MAP_FAILED, hint);
+    ASSERT_EQ(0, munmap(hint, ps));
+
+    errno = 0;
+    void* moved =
+        reinterpret_cast<void*>(syscall(SYS_mremap, addr, ps, ps,
+                                        MREMAP_MAYMOVE | MREMAP_DONTUNMAP, hint));
+    ASSERT_NE(MAP_FAILED, moved) << "errno=" << errno << " (" << strerror(errno) << ")";
+    EXPECT_EQ(hint, moved);
+
+    EXPECT_EQ(0, munmap(moved, ps));
+    EXPECT_EQ(0, munmap(addr, ps));
+}
+
+TEST(Mremap, DuplicateOldLenZeroKeepsSourceLock) {
     const size_t ps = PageSize();
     ScopedMemlockLimit lim;
     ASSERT_TRUE(lim.valid());
@@ -466,15 +544,48 @@ TEST(Mremap, DuplicateOldLenZeroClearsSourceLock) {
 
     EXPECT_EQ(0, munlock(dup, ps)) << "errno=" << errno << " (" << strerror(errno) << ")";
 
-    // Linux 6.6 mremap duplicate-mapping semantics clear VM_LOCKED on the
-    // source VMA, so once the duplicated destination is munlocked the source
-    // alias must no longer behave as locked.
+    // Linux 6.6 only clears VM_LOCKED on the old VMA for MREMAP_DONTUNMAP.
+    // The legacy old_len==0 duplicate path keeps the source VMA locked while
+    // also creating a locked duplicate.
     errno = 0;
-    EXPECT_EQ(0, msync(addr, ps, MS_INVALIDATE)) << "errno=" << errno << " (" << strerror(errno)
-                                                 << ")";
+    EXPECT_EQ(-1, msync(addr, ps, MS_INVALIDATE)) << "errno=" << errno << " (" << strerror(errno)
+                                                  << ")";
+    EXPECT_EQ(EBUSY, errno);
 
     EXPECT_EQ(0, munmap(dup, ps));
     EXPECT_EQ(0, munmap(addr, ps));
+}
+
+TEST(Madvise, DontNeedKeepsLinuxOrderedSideEffectsBeforeLockedVmaError) {
+    const size_t ps = PageSize();
+    ScopedMemlockLimit lim;
+    ASSERT_TRUE(lim.valid());
+    ASSERT_TRUE(lim.set_bytes(ps * 2));
+
+    auto* first = static_cast<char*>(
+        mmap(nullptr, ps, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    ASSERT_NE(MAP_FAILED, first);
+    memset(first, 0x5a, ps);
+
+    auto* second = static_cast<char*>(
+        mmap(first + ps, ps, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0));
+    if (second == MAP_FAILED) {
+        EXPECT_EQ(0, munmap(first, ps));
+        GTEST_SKIP() << "failed to reserve adjacent VMA: errno=" << errno << " ("
+                     << strerror(errno) << ")";
+    }
+    ASSERT_EQ(first + ps, second);
+    ASSERT_EQ(0, mlock(second, ps)) << "errno=" << errno << " (" << strerror(errno) << ")";
+
+    errno = 0;
+    EXPECT_EQ(-1, madvise(first, ps * 2, MADV_DONTNEED));
+    EXPECT_EQ(EINVAL, errno);
+
+    EXPECT_EQ('\0', first[0])
+        << "Linux applies MADV_DONTNEED to earlier valid VMAs before returning EINVAL for a later locked VMA";
+
+    EXPECT_EQ(0, munmap(first, ps * 2));
 }
 
 int main(int argc, char** argv) {

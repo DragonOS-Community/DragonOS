@@ -1,8 +1,4 @@
-use crate::arch::ipc::signal::Signal;
 use crate::arch::syscall::nr::SYS_FALLOCATE;
-use crate::filesystem::vfs::{file::FileMode, FileType};
-use crate::ipc::kill::send_signal_to_pid;
-use crate::process::resource::RLimitID;
 use crate::{
     arch::interrupt::TrapFrame,
     process::ProcessManager,
@@ -49,56 +45,14 @@ impl Syscall for SysFallocateHandle {
         let offset = Self::offset(args)?;
         let len = Self::len(args)?;
 
-        // 暂时只支持 mode = 0
-        if mode != 0 {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-        }
-
-        if len == 0 {
-            return Err(SystemError::EINVAL);
-        }
         let binding = ProcessManager::current_pcb().fd_table();
         let fd_table_guard = binding.read();
 
         if let Some(file) = fd_table_guard.get_file_by_fd(fd) {
             drop(fd_table_guard);
 
-            let mode_flags = file.mode();
-
-            if mode_flags.contains(FileMode::FMODE_PATH) {
-                return Err(SystemError::EBADF);
-            }
-
-            if !mode_flags.contains(FileMode::FMODE_WRITE) || !mode_flags.can_write() {
-                return Err(SystemError::EBADF);
-            }
-
-            let md = file.inode().metadata()?;
-            match md.file_type {
-                FileType::File => { /* 普通文件，继续处理 */ }
-                FileType::Dir => return Err(SystemError::EISDIR),
-                FileType::Pipe => return Err(SystemError::ESPIPE),
-                _ => return Err(SystemError::ENODEV),
-            }
-
-            let new_size = offset.checked_add(len).ok_or(SystemError::EFBIG)?;
-
-            let current_size = md.size as usize;
-            // 暂不支持预分配能力，当 new_size <= current_size 时返回 EOPNOTSUPP
-            // 避免 Linux 应用误以为空间已预留，导致后续写入 ENOSPC 的隐蔽问题
-            if new_size <= current_size {
-                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-            }
-
-            let current_pcb = ProcessManager::current_pcb();
-            let fsize_limit = current_pcb.get_rlimit(RLimitID::Fsize);
-            if fsize_limit.rlim_cur != u64::MAX && new_size as u64 > fsize_limit.rlim_cur {
-                let _ = send_signal_to_pid(current_pcb.raw_pid(), Signal::SIGXFSZ);
-                return Err(SystemError::EFBIG);
-            }
-
-            let r = crate::filesystem::vfs::vcore::vfs_truncate(file.inode(), new_size).map(|_| 0);
-            return r;
+            return crate::filesystem::vfs::vcore::vfs_fallocate_file(file, mode, offset, len)
+                .map(|_| 0);
         }
 
         return Err(SystemError::EBADF);

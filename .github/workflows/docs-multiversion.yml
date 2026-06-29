@@ -20,6 +20,11 @@ jobs:
       with:
         fetch-depth: 0
         ref: master
+
+    - name: setup node
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22.11.0'
       
     - name: install requirements
       working-directory: ./docs
@@ -27,7 +32,6 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y python3-pip python3-setuptools
         pip3 install -r requirements.txt
-        python3 -m pip install --user awscli
 
     - name: build docs
       working-directory: ./docs
@@ -36,12 +40,9 @@ jobs:
       run: |
         make html-multiversion
 
-    - name: deploy docs
-      working-directory: ./docs
+    - name: deploy docs to EdgeOne
       env:
-        AWS_ENDPOINT_URL: ${{ secrets.DOCS_DEPLOY_S3_ENDPOINT_URL }}
-        AWS_ACCESS_KEY_ID: ${{ secrets.DOCS_DEPLOY_S3_API_KEY }}
-        AWS_SECRET_ACCESS_KEY: ${{ secrets.DOCS_DEPLOY_S3_SECRET_KEY }}
+        EDGEONE_API_TOKEN: ${{ secrets.EDGEONE_API_TOKEN }}
       
       run: |
-        aws s3 sync ./_build/html s3://dragonos-docs --delete --exclude "p/*"
+        npx --yes edgeone makers deploy ./docs/_build/html -n dragonos-official-docs -t "${EDGEONE_API_TOKEN}" -e production

@@ -112,7 +112,7 @@ fn wake_oom_waiters() {
 
 fn current_is_killed_or_exiting() -> bool {
     let current = ProcessManager::current_pcb();
-    Signal::fatal_signal_pending(&current) || current.flags().intersects(ProcessFlags::EXITING)
+    Signal::oom_fatal_signal_pending(&current) || current.flags().intersects(ProcessFlags::EXITING)
 }
 
 fn leader_of(pcb: Arc<ProcessControlBlock>) -> Arc<ProcessControlBlock> {
@@ -128,6 +128,7 @@ fn is_global_init_or_kthread(leader: &Arc<ProcessControlBlock>) -> bool {
 fn should_skip_candidate(leader: &Arc<ProcessControlBlock>, oom_score_adj: i16) -> bool {
     is_global_init_or_kthread(leader)
         || leader.flags().contains(ProcessFlags::EXITING)
+        || leader.is_active_vfork()
         || oom_score_adj == OOM_SCORE_ADJ_MIN
 }
 
@@ -229,25 +230,35 @@ fn select_victim() -> Option<OomCandidate> {
 }
 
 fn begin_selection() -> Result<u64, ()> {
-    let mut state = OOM_STATE.lock_irqsave();
-    if let Some(victim) = state.inflight.as_ref() {
-        if victim_has_progress(victim) {
-            state.inflight = None;
-            wake_oom_waiters();
+    let mut should_wake = false;
+    let result = {
+        let mut state = OOM_STATE.lock_irqsave();
+        if let Some(victim) = state.inflight.as_ref() {
+            if victim_has_progress(victim) {
+                state.inflight = None;
+                should_wake = true;
+            }
         }
-    }
-    if state.selecting || state.inflight.is_some() {
-        return Err(());
-    }
+        if state.selecting || state.inflight.is_some() {
+            Err(())
+        } else {
+            state.selecting = true;
+            state.generation = state.generation.wrapping_add(1);
+            Ok(state.generation)
+        }
+    };
 
-    state.selecting = true;
-    state.generation = state.generation.wrapping_add(1);
-    Ok(state.generation)
+    if should_wake {
+        wake_oom_waiters();
+    }
+    result
 }
 
 fn finish_selection_none() {
-    let mut state = OOM_STATE.lock_irqsave();
-    state.selecting = false;
+    {
+        let mut state = OOM_STATE.lock_irqsave();
+        state.selecting = false;
+    }
     wake_oom_waiters();
 }
 
@@ -345,7 +356,11 @@ pub fn pagefault_out_of_memory(ctx: OomContext) -> OomOutcome {
             return OomOutcome::NoVictim;
         };
 
-        let current_is_victim = candidate.tgid == ctx.trigger_tgid;
+        let current = ProcessManager::current_pcb();
+        let current_leader = leader_of(current.clone());
+        let current_is_victim = candidate.tgid == current_leader.raw_tgid()
+            || (task_uses_mm(&current, &candidate.mm)
+                && !is_global_init_or_kthread(&current_leader));
         let victim_tgid = candidate.tgid;
         let victim_score = candidate.score;
         let victim_oom_score_adj = candidate.oom_score_adj;
@@ -436,13 +451,20 @@ pub fn notify_mm_resident_changed(mm: &AddressSpace) {
 }
 
 pub fn notify_mm_drop(mm_id: u64) {
-    let mut state = OOM_STATE.lock_irqsave();
-    if state
-        .inflight
-        .as_ref()
-        .is_some_and(|victim| victim.mm_id == mm_id)
-    {
-        state.inflight = None;
+    let should_wake = {
+        let mut state = OOM_STATE.lock_irqsave();
+        if state
+            .inflight
+            .as_ref()
+            .is_some_and(|victim| victim.mm_id == mm_id)
+        {
+            state.inflight = None;
+            true
+        } else {
+            false
+        }
+    };
+    if should_wake {
         wake_oom_waiters();
     }
 }

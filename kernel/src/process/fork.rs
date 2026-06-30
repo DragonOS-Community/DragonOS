@@ -428,21 +428,62 @@ impl ProcessManager {
     ) -> Result<(), SystemError> {
         // 只复制信号掩码 - POSIX 要求 fork 和 execve 都保留信号掩码
         // 注意：先读取父进程的，然后释放锁，再写入子进程的，避免死锁
-        let sig_info_state = {
-            let current_sig_info = current_pcb.sig_info_irqsave();
+        let oom_score_owner =
+            ProcessManager::find(current_pcb.raw_tgid()).unwrap_or_else(|| current_pcb.clone());
+        let sig_info_state = if Arc::ptr_eq(&oom_score_owner, current_pcb) {
+            let sig_info = current_pcb.sig_info_irqsave();
             (
-                *current_sig_info.sig_blocked(),
-                current_sig_info.oom_score_adj(),
+                *sig_info.sig_blocked(),
+                sig_info.oom_score_adj(),
+                sig_info.oom_score_adj_min(),
             )
+        } else {
+            let sig_blocked = {
+                let current_sig_info = current_pcb.sig_info_irqsave();
+                *current_sig_info.sig_blocked()
+            };
+            let (oom_score_adj, oom_score_adj_min) = {
+                let oom_score_owner_sig_info = oom_score_owner.sig_info_irqsave();
+                (
+                    oom_score_owner_sig_info.oom_score_adj(),
+                    oom_score_owner_sig_info.oom_score_adj_min(),
+                )
+            };
+            (sig_blocked, oom_score_adj, oom_score_adj_min)
         };
 
         {
             let mut new_sig_info = new_pcb.sig_info_mut();
             *new_sig_info.sig_block_mut() = sig_info_state.0;
             new_sig_info.set_oom_score_adj(sig_info_state.1);
+            new_sig_info.set_oom_score_adj_min(sig_info_state.2);
         }
 
         Ok(())
+    }
+
+    fn needs_oom_score_adj_clone_vm_sync(clone_flags: &CloneFlags) -> bool {
+        (*clone_flags & (CloneFlags::CLONE_VM | CloneFlags::CLONE_THREAD | CloneFlags::CLONE_VFORK))
+            == CloneFlags::CLONE_VM
+    }
+
+    fn sync_oom_score_adj_for_clone_vm(
+        current_pcb: &Arc<ProcessControlBlock>,
+        new_pcb: &Arc<ProcessControlBlock>,
+    ) {
+        let oom_score_owner =
+            ProcessManager::find(current_pcb.raw_tgid()).unwrap_or_else(|| current_pcb.clone());
+        let (oom_score_adj, oom_score_adj_min) = {
+            let current_sig_info = oom_score_owner.sig_info_irqsave();
+            (
+                current_sig_info.oom_score_adj(),
+                current_sig_info.oom_score_adj_min(),
+            )
+        };
+
+        let mut new_sig_info = new_pcb.sig_info_mut();
+        new_sig_info.set_oom_score_adj(oom_score_adj);
+        new_sig_info.set_oom_score_adj_min(oom_score_adj_min);
     }
 
     /// 复制 prctl 相关的进程/线程状态。
@@ -1004,7 +1045,17 @@ impl ProcessManager {
 
         if pcb.raw_pid() > RawPid(0) {
             let cgroup = pcb.task_cgroup_node();
+            let needs_oom_score_adj_sync = Self::needs_oom_score_adj_clone_vm_sync(&clone_flags);
+            let oom_score_adj_guard = if needs_oom_score_adj_sync {
+                Some(ProcessManager::lock_oom_score_adj())
+            } else {
+                None
+            };
+            if needs_oom_score_adj_sync {
+                Self::sync_oom_score_adj_for_clone_vm(current_pcb, pcb);
+            }
             ProcessManager::add_pcb(pcb.clone());
+            drop(oom_score_adj_guard);
             cgroup.add_task(pcb.raw_pid());
             pcb.mark_visible_thread_accounted();
             inc_visible_thread_count();

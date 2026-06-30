@@ -209,6 +209,30 @@ impl Signal {
 
         return false;
     }
+
+    /// Fatal SIGKILL check for the OOM path.
+    ///
+    /// DragonOS currently stores process-level signals in `sighand.shared_pending`,
+    /// while the global `fatal_signal_pending()` only checks thread-level pending.
+    /// The OOM killer needs to know whether the current task is already destined to
+    /// exit, to avoid continuing to select and kill new victims. This helper is
+    /// read-only and does not consume the signal.
+    pub fn oom_fatal_signal_pending(pcb: &Arc<ProcessControlBlock>) -> bool {
+        if pcb.sighand().group_exit_code_if_set().is_some() {
+            return true;
+        }
+
+        if pcb
+            .sighand()
+            .shared_pending_signal()
+            .contains(Signal::SIGKILL.into())
+        {
+            return true;
+        }
+
+        Self::fatal_signal_pending(pcb)
+    }
+
     /// 向目标进程发送信号
     ///
     /// ## 参数

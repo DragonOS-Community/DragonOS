@@ -13,3 +13,4 @@
    allocate-memory
    mmio
    extable_safe_copy_design
+   oom_killer

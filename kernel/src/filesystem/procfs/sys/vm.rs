@@ -7,6 +7,7 @@ use crate::{
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
     mm::{page::PageReclaimer, page_cache_stats},
+    process::cred::{capable, CAPFlags},
 };
 use alloc::{
     string::ToString,
@@ -47,6 +48,16 @@ impl DirOps for VmDirOps {
             cached_children.insert(name.to_string(), inode.clone());
             return Ok(inode);
         }
+        if name == "oom_fault_inject" {
+            let mut cached_children = dir.cached_children().write();
+            if let Some(child) = cached_children.get(name) {
+                return Ok(child.clone());
+            }
+
+            let inode = OomFaultInjectFileOps::new_inode(dir.self_ref_weak().clone());
+            cached_children.insert(name.to_string(), inode.clone());
+            return Ok(inode);
+        }
 
         Err(SystemError::ENOENT)
     }
@@ -56,6 +67,9 @@ impl DirOps for VmDirOps {
         cached_children
             .entry("drop_caches".to_string())
             .or_insert_with(|| DropCachesFileOps::new_inode(dir.self_ref_weak().clone()));
+        cached_children
+            .entry("oom_fault_inject".to_string())
+            .or_insert_with(|| OomFaultInjectFileOps::new_inode(dir.self_ref_weak().clone()));
     }
 }
 
@@ -125,5 +139,50 @@ impl FileOps for DropCachesFileOps {
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Self::write_config(buf)
+    }
+}
+
+/// /proc/sys/vm/oom_fault_inject 文件的 FileOps 实现
+///
+/// DragonOS-only test hook. It is intentionally restricted to privileged
+/// callers and must not be treated as a Linux-compatible sysctl ABI.
+#[derive(Debug)]
+pub struct OomFaultInjectFileOps;
+
+impl OomFaultInjectFileOps {
+    pub fn new_inode(parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcFileBuilder::new(Self, InodeMode::from_bits_truncate(0o600))
+            .parent(parent)
+            .build()
+            .unwrap()
+    }
+}
+
+impl FileOps for OomFaultInjectFileOps {
+    fn read_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        if !capable(CAPFlags::CAP_SYS_ADMIN) {
+            return Err(SystemError::EPERM);
+        }
+        let content = crate::mm::oom::read_fault_inject_config();
+        crate::filesystem::procfs::utils::proc_read(offset, len, buf, content.as_bytes())
+    }
+
+    fn write_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        buf: &[u8],
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        if !capable(CAPFlags::CAP_SYS_ADMIN) {
+            return Err(SystemError::EPERM);
+        }
+        crate::mm::oom::write_fault_inject_config(buf)
     }
 }

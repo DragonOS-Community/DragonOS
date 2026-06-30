@@ -51,6 +51,7 @@ use crate::{
             futex::{Futex, RobustListHead},
         },
         lock_free_flags::LockFreeFlags,
+        mutex::{Mutex, MutexGuard},
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
         rwsem::RwSem,
         spinlock::{SpinLock, SpinLockGuard},
@@ -187,6 +188,13 @@ pub static mut PROCESS_SWITCH_RESULT: Option<PerCpuVar<SwitchResult>> = None;
 /// 一个只改变1次的全局变量，标志进程管理器是否已经初始化完成
 static mut __PROCESS_MANAGEMENT_INIT_DONE: bool = false;
 
+/// Serializes `/proc/[pid]/oom_score_adj` writes with `CLONE_VM` inheritance.
+///
+/// This mirrors Linux's `oom_adj_mutex` responsibility: a process sharing an
+/// mm with another thread group must not miss a concurrent oom_score_adj update
+/// while it is becoming visible.
+static OOM_SCORE_ADJ_LOCK: Mutex<()> = Mutex::new(());
+
 pub struct SwitchResult {
     pub prev_pcb: Option<Arc<ProcessControlBlock>>,
     pub next_pcb: Option<Arc<ProcessControlBlock>>,
@@ -206,6 +214,21 @@ impl SwitchResult {
 #[derive(Debug)]
 pub struct ProcessManager;
 impl ProcessManager {
+    pub fn lock_oom_score_adj() -> MutexGuard<'static, ()> {
+        OOM_SCORE_ADJ_LOCK.lock()
+    }
+
+    fn mm_has_user_tasks(mm: &Arc<AddressSpace>) -> bool {
+        ProcessManager::get_all_processes()
+            .into_iter()
+            .filter_map(ProcessManager::find)
+            .any(|task| {
+                task.basic()
+                    .user_vm()
+                    .is_some_and(|task_mm| task_mm.id() == mm.id() || Arc::ptr_eq(&task_mm, mm))
+            })
+    }
+
     pub fn is_current(pcb: &Arc<ProcessControlBlock>) -> bool {
         Arc::ptr_eq(pcb, &Self::current_pcb())
     }
@@ -1037,6 +1060,13 @@ impl ProcessManager {
                 drop(irq_guard);
                 old_vm
             };
+            if let Some(old_vm) = old_user_vm.as_ref() {
+                if !Self::mm_has_user_tasks(old_vm) {
+                    unsafe {
+                        old_vm.write().unmap_all();
+                    }
+                }
+            }
             drop(old_user_vm);
 
             pcb.exit_files();
@@ -2524,6 +2554,10 @@ impl ProcessControlBlock {
         self.sig_info.write_irqsave()
     }
 
+    pub fn is_active_vfork(&self) -> bool {
+        self.thread.read_irqsave().vfork_done.is_some()
+    }
+
     /// 获取 rseq 状态的只读引用
     #[inline]
     pub fn rseq_state(&self) -> RwLockReadGuard<'_, rseq::RseqState> {
@@ -3618,6 +3652,12 @@ pub struct ProcessSignalInfo {
 
     /// OOM killer score adjustment exposed through `/proc/[pid]/oom_score_adj`.
     oom_score_adj: i16,
+    /// Minimum oom_score_adj an unprivileged writer may set.
+    ///
+    /// Linux updates this value only from CAP_SYS_RESOURCE writes. The default
+    /// is 0, so an unprivileged process cannot make itself more protected than
+    /// the initial state.
+    oom_score_adj_min: i16,
 }
 
 impl ProcessSignalInfo {
@@ -3685,6 +3725,14 @@ impl ProcessSignalInfo {
     pub fn set_oom_score_adj(&mut self, oom_score_adj: i16) {
         self.oom_score_adj = oom_score_adj;
     }
+
+    pub fn oom_score_adj_min(&self) -> i16 {
+        self.oom_score_adj_min
+    }
+
+    pub fn set_oom_score_adj_min(&mut self, oom_score_adj_min: i16) {
+        self.oom_score_adj_min = oom_score_adj_min;
+    }
 }
 
 impl Default for ProcessSignalInfo {
@@ -3698,6 +3746,7 @@ impl Default for ProcessSignalInfo {
             is_child_subreaper: false,
             is_session_leader: false,
             oom_score_adj: 0,
+            oom_score_adj_min: 0,
         }
     }
 }

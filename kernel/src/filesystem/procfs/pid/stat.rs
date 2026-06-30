@@ -6,7 +6,6 @@ use core::sync::atomic::Ordering;
 
 use crate::libs::mutex::MutexGuard;
 use crate::{
-    arch::MMArch,
     filesystem::{
         procfs::{
             pid::ProcPidTarget,
@@ -15,7 +14,6 @@ use crate::{
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    mm::MemoryManagementArch,
     process::{pid::PidType, ProcessState, RawPid},
     sched::{cputime::ns_to_clock_t, prio::PrioUtil},
 };
@@ -155,7 +153,7 @@ impl FileOps for StatFileOps {
             .map(|vm| {
                 let guard = vm.read_guard_no_reservations();
                 let bytes = guard.vma_usage_bytes();
-                let pages = (bytes.saturating_add(MMArch::PAGE_SIZE - 1)) >> MMArch::PAGE_SHIFT;
+                let pages = vm.resident_pages();
                 (bytes as u64, pages as u64)
             })
             .unwrap_or((0, 0));

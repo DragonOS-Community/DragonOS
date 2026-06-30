@@ -5,7 +5,7 @@ use core::{
     hash::Hasher,
     intrinsics::unlikely,
     ops::Add,
-    sync::atomic::{compiler_fence, AtomicU64, Ordering},
+    sync::atomic::{compiler_fence, AtomicU64, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -138,6 +138,15 @@ pub struct AddressSpace {
     /// without taking `mm.write()`, while fault/munmap/mprotect/mremap paths must
     /// still synchronize with those edits.
     page_table_edit_lock: Mutex<()>,
+    /// Per-mm resident user pages, counted by present user PTEs.
+    resident_user_pages: AtomicUsize,
+    /// Monotonic OOM reclaim progress generation.
+    ///
+    /// This is advanced only after unmapped pages have passed the required TLB
+    /// shootdown and their deferred `Arc<Page>` references are actually dropped.
+    /// OOM waiters must not treat the earlier resident-page accounting decrement
+    /// as reclaim progress.
+    oom_reclaim_generation: AtomicU64,
     /// 使用RwSem而非RwLock，因为地址空间操作可能需要进行I/O（如页缺失时的文件读取）
     inner: RwSem<InnerAddressSpace>,
     /// 等待未发布的 mmap reservation 提交或取消。
@@ -155,6 +164,8 @@ impl AddressSpace {
             active_cpus: SpinLock::new(CpuMask::new()),
             tlb_gen: AtomicU64::new(0),
             page_table_edit_lock: Mutex::new(()),
+            resident_user_pages: AtomicUsize::new(0),
+            oom_reclaim_generation: AtomicU64::new(0),
             inner: RwSem::new(inner),
             reservation_wait: WaitQueue::default(),
         });
@@ -162,6 +173,7 @@ impl AddressSpace {
         // the outer Arc to construct MmuGather / initiate TLB shootdown.
         {
             let mut g = result.inner.write();
+            g.mm_id = id;
             g.outer = Arc::downgrade(&result);
             g.mappings.set_owner(Arc::downgrade(&result));
             if create_stack {
@@ -259,6 +271,67 @@ impl AddressSpace {
             "page_table_edit_lock must not be taken with interrupts disabled"
         );
         self.page_table_edit_lock.lock()
+    }
+
+    #[inline(always)]
+    pub fn resident_pages(&self) -> usize {
+        self.resident_user_pages.load(Ordering::Relaxed)
+    }
+
+    #[inline(always)]
+    pub fn oom_reclaim_generation(&self) -> u64 {
+        self.oom_reclaim_generation.load(Ordering::Acquire)
+    }
+
+    #[inline(always)]
+    pub fn advance_oom_reclaim_generation(&self) {
+        self.oom_reclaim_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[inline(always)]
+    pub fn account_present_page_add(&self) {
+        self.account_present_pages_add(1);
+    }
+
+    #[inline(always)]
+    pub fn account_present_pages_add(&self, count: usize) {
+        if count != 0 {
+            self.resident_user_pages.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
+    #[inline(always)]
+    pub fn account_present_page_sub(&self) {
+        self.account_present_pages_sub(1);
+    }
+
+    #[inline(always)]
+    pub fn account_present_pages_sub(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+
+        let prev = self
+            .resident_user_pages
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pages| {
+                Some(pages.saturating_sub(count))
+            })
+            .unwrap_or(0);
+        if prev < count {
+            error!(
+                "resident_user_pages underflow on mm id={}, prev={}, sub={}",
+                self.id(),
+                prev,
+                count
+            );
+        }
+        debug_assert!(
+            prev >= count,
+            "resident_user_pages underflow on mm id={}, prev={}, sub={}",
+            self.id(),
+            prev,
+            count
+        );
     }
 
     pub fn wait_for_no_reservation_conflict(self: &Arc<Self>, region: VirtRegion) {
@@ -811,6 +884,12 @@ impl AddressSpace {
                 false
             };
 
+            let new_present_pages = if new_vma.mapped() {
+                page_count.data()
+            } else {
+                0
+            };
+
             if let Err(err) = guard.mappings.commit_reserved_vma(reservation_id, new_vma) {
                 let sysv_to_close = if sysv_opened { sysv_shm.clone() } else { None };
                 release_locked_pages_if_reserved!();
@@ -822,6 +901,7 @@ impl AddressSpace {
                 return Err(err);
             }
 
+            self.account_present_pages_add(new_present_pages);
             reservation.disarm();
             drop(guard);
             self.wake_reservation_waiters();
@@ -1178,6 +1258,7 @@ impl Drop for MmapReservationGuard {
 /// @brief 用户地址空间结构体（每个进程都有一个）
 #[derive(Debug)]
 pub struct InnerAddressSpace {
+    mm_id: u64,
     pub user_mapper: UserMapper,
     pub mappings: UserMappings,
     /// 已锁定的用户页数量，以页为单位。
@@ -1351,6 +1432,7 @@ impl InnerAddressSpace {
 
     pub fn new(_create_stack: bool) -> Result<Self, SystemError> {
         let result = Self {
+            mm_id: 0,
             user_mapper: MMArch::setup_new_usermapper()?,
             mappings: UserMappings::new(),
             locked_vm: 0,
@@ -1416,6 +1498,7 @@ impl InnerAddressSpace {
         new_guard.end_data = self.end_data;
 
         let mut parent_cow_remaps: Vec<(VirtAddr, EntryFlags<MMArch>)> = Vec::new();
+        let mut child_present_pages = 0usize;
         let clone_result: Result<(), SystemError> = (|| {
             // 遍历父进程的每个VMA，根据VMA属性进行适当的复制
             // 参考 Linux: https://code.dragonos.org.cn/xref/linux-6.6.21/mm/memory.c#copy_page_range
@@ -1496,6 +1579,7 @@ impl InnerAddressSpace {
                                 if let Some(page) = page_manager_guard.get(&phys_addr) {
                                     page.write().insert_vma(new_vma.clone(), new_vma_mlocked);
                                 }
+                                child_present_pages += 1;
                             }
                         }
                         current_page = VirtAddr::new(current_page.data() + MMArch::PAGE_SIZE);
@@ -1524,6 +1608,7 @@ impl InnerAddressSpace {
         }
 
         drop(new_guard);
+        new_addr_space.account_present_pages_add(child_present_pages);
         // 完成父 mm 的 mm-aware shootdown：INV-3 要求 TLB 生效完成后再继续后续逻辑，
         // 此处没有 page 进入 pending_pages，因此实际只触发 flush_tlb_mm_range。
         parent_tlb.finish();
@@ -2088,9 +2173,17 @@ impl InnerAddressSpace {
                 &mut flusher,
             ))
         };
+        let new_present_pages = if new_vma.mapped() {
+            page_count.data()
+        } else {
+            0
+        };
         self.mappings.insert_vma(new_vma);
         if let Some(new_locked_vm) = new_locked_vm {
             self.locked_vm = new_locked_vm;
+        }
+        if let Some(mm) = self.outer_addr_space() {
+            mm.account_present_pages_add(new_present_pages);
         }
 
         return Ok((page, notifications));
@@ -2460,6 +2553,8 @@ impl InnerAddressSpace {
         let mapper = &mut self.user_mapper.utable;
         let old_vma = old_vma.clone();
         let mut installed_target_pte = false;
+        let mut installed_target_present_pages = 0usize;
+        let mut removed_source_present_pages = 0usize;
 
         {
             let _pt_edit = mm.page_table_edit();
@@ -2478,6 +2573,7 @@ impl InnerAddressSpace {
                     unsafe { flush.ignore() };
                     tlb.accumulate_range(dst);
                     installed_target_pte = true;
+                    installed_target_present_pages += 1;
                     page_manager_guard
                         .get_unwrap(&paddr)
                         .write()
@@ -2520,6 +2616,7 @@ impl InnerAddressSpace {
                     {
                         unsafe { flush.ignore() };
                         tlb.accumulate_range(src);
+                        removed_source_present_pages += 1;
                     } else {
                         panic!("mremap commit lost expected source PTE at {:?}", src);
                     }
@@ -2532,6 +2629,15 @@ impl InnerAddressSpace {
         }
         if installed_target_pte {
             new_vma.lock().set_mapped(true);
+        }
+        if installed_target_present_pages >= removed_source_present_pages {
+            mm.account_present_pages_add(
+                installed_target_present_pages - removed_source_present_pages,
+            );
+        } else {
+            mm.account_present_pages_sub(
+                removed_source_present_pages - installed_target_present_pages,
+            );
         }
 
         if sysv_mremap || remove_source_vma_on_commit || (locked_source && dontunmap_flag) {
@@ -3530,12 +3636,12 @@ impl InnerAddressSpace {
         tlb.set_fullmm();
         let mut vma_close_notifications = Vec::new();
         let mut sysv_close_notifications = Vec::new();
-        for vma in self.mappings.iter_vmas() {
+        for vma in self.mappings.take_all_vmas() {
             let region = *vma.lock().region();
-            if let Some(notification) = Self::collect_vma_close(vma, region) {
+            if let Some(notification) = Self::collect_vma_close(&vma, region) {
                 vma_close_notifications.push(notification);
             }
-            let sysv_close = Self::collect_sysv_shm_close(vma);
+            let sysv_close = Self::collect_sysv_shm_close(&vma);
             if let Some(notification) = sysv_close {
                 sysv_close_notifications.push(notification);
             }
@@ -3743,6 +3849,7 @@ impl Drop for InnerAddressSpace {
         unsafe {
             self.unmap_all();
         }
+        crate::mm::oom::notify_mm_drop(self.mm_id);
     }
 }
 
@@ -4128,6 +4235,19 @@ impl UserMappings {
         return Some(vma);
     }
 
+    fn take_all_vmas(&mut self) -> Vec<Arc<LockedVMA>> {
+        let vmas = self.vmas.drain().collect::<Vec<_>>();
+        self.vmas_by_start.clear();
+        self.reservations.clear();
+        self.vm_holes.clear();
+        self.vm_holes
+            .insert(VirtAddr::new(0), MMArch::USER_END_VADDR.data());
+        for vma in &vmas {
+            self.detach_vma(vma);
+        }
+        vmas
+    }
+
     /// @brief Get the iterator of all VMAs in this process.
     pub fn iter_vmas(&self) -> hashbrown::hash_set::Iter<'_, Arc<LockedVMA>> {
         return self.vmas.iter();
@@ -4266,18 +4386,20 @@ impl LockedVMA {
     /// performs cross-core TLB shootdown first and then frees physical pages (INV-3).
     pub fn unmap(&self, mapper: &mut PageMapper, tlb: &mut MmuGather<'_>) {
         // todo: 如果当前vma与文件相关，完善文件相关的逻辑
-        let (region, should_wakeup_writeback) = {
+        let (region, should_wakeup_writeback, mm) = {
             let mut self_guard = self.lock();
             let region = *self_guard.region();
+            let mm = self_guard.address_space().and_then(|mm| mm.upgrade());
             self_guard.mapped = false;
             let should_wakeup_writeback = self_guard.vm_file().is_some()
                 && self_guard
                     .vm_flags()
                     .contains(VmFlags::VM_SHARED | VmFlags::VM_WRITE);
-            (region, should_wakeup_writeback)
+            (region, should_wakeup_writeback, mm)
         };
 
         let mut pages_to_reclassify = Vec::new();
+        let mut unmapped_present_pages = 0usize;
         {
             let mut page_manager_guard = page_manager_lock();
             for page in region.pages() {
@@ -4299,6 +4421,7 @@ impl LockedVMA {
                 // Local PTE cleared; no immediate invlpg. Final TLB invalidation is performed uniformly by MmuGather.
                 unsafe { flush.ignore() };
                 tlb.accumulate_range(page.virt_address());
+                unmapped_present_pages += 1;
                 if freed_tables {
                     tlb.note_pt_table_freed();
                 }
@@ -4307,6 +4430,10 @@ impl LockedVMA {
 
         for (_, page_arc) in &pages_to_reclassify {
             InnerAddressSpace::remove_page_unevictable_if_unneeded(page_arc);
+        }
+
+        if let Some(mm) = mm.as_ref() {
+            mm.account_present_pages_sub(unmapped_present_pages);
         }
 
         let mut page_manager_guard = page_manager_lock();
@@ -4345,6 +4472,7 @@ impl LockedVMA {
         let Some(intersection) = self_guard.region().intersect(&region) else {
             return;
         };
+        let mm = self_guard.address_space().and_then(|mm| mm.upgrade());
         let vma_start = self_guard.region().start();
         let backing_pgoff = self_guard.backing_page_offset();
         let file_page_cache = self_guard
@@ -4353,6 +4481,7 @@ impl LockedVMA {
         drop(self_guard);
 
         let mut pages_to_reclassify = Vec::new();
+        let mut unmapped_present_pages = 0usize;
         {
             let mut page_manager_guard = page_manager_lock();
             for page in intersection.pages() {
@@ -4399,11 +4528,16 @@ impl LockedVMA {
 
                 unsafe { flush.ignore() };
                 tlb.accumulate_range(virt);
+                unmapped_present_pages += 1;
             }
         }
 
         for (_, page_arc) in &pages_to_reclassify {
             InnerAddressSpace::remove_page_unevictable_if_unneeded(page_arc);
+        }
+
+        if let Some(mm) = mm.as_ref() {
+            mm.account_present_pages_sub(unmapped_present_pages);
         }
 
         let mut page_manager_guard = page_manager_lock();

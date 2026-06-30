@@ -12,11 +12,12 @@ use crate::{
     },
     exception::{extable::ExceptionTableManager, InterruptArch},
     ipc::{
-        signal::{force_kernel_signal_to_current, force_sig_fault_to_current},
-        signal_types::{BUS_ADRERR, SEGV_ACCERR, SEGV_MAPERR},
+        signal::force_sig_fault_to_current,
+        signal_types::{SignalArch, BUS_ADRERR, SEGV_ACCERR, SEGV_MAPERR},
     },
     mm::{
         fault::{FaultFlags, PageFaultHandler, PageFaultMessage},
+        oom::{OomContext, OomOutcome},
         ucontext::{AddressSpace, LockedVMA},
         VirtAddr, VirtRegion, VmFaultReason, VmFlags,
     },
@@ -314,18 +315,54 @@ impl X86_64MMArch {
             false // 不是内核访问，继续正常流程
         };
 
-        let current_address_space: Arc<AddressSpace> = AddressSpace::current().unwrap();
-        let mut space_guard = current_address_space.write();
         let fault_region = VirtRegion::new(
             VirtAddr::new(address.data() & !MMArch::PAGE_OFFSET_MASK),
             MMArch::PAGE_SIZE,
         );
-        let mut fault;
+        let current_address_space: Arc<AddressSpace> = AddressSpace::current().unwrap();
+
         loop {
-            let vma = space_guard.mappings.find_nearest(address);
-            let vma = match vma {
-                Some(vma) => vma,
-                None => {
+            let mut space_guard = current_address_space.write();
+            let mut fault;
+            loop {
+                let vma = space_guard.mappings.find_nearest(address);
+                let vma = match vma {
+                    Some(vma) => vma,
+                    None => {
+                        if space_guard
+                            .mappings
+                            .first_reservation_conflict(fault_region)
+                            .is_some()
+                        {
+                            drop(space_guard);
+                            current_address_space.wait_for_no_reservation_conflict(fault_region);
+                            space_guard = current_address_space.write();
+                            continue;
+                        }
+
+                        log::error!(
+                        "pid:{}, can not find nearest vma, \n\terror_code: {:?}, address: {:#x}, rip: {:#x}",
+                        ProcessManager::current_pid().data(),
+                        error_code,
+                        address.data(),
+                        regs.rip,
+                    );
+
+                        // VMA不存在，检查是否需要异常表修复
+                        if handle_kernel_access_failed(regs) {
+                            return; // 已通过异常表修复
+                        }
+
+                        send_segv_maperr();
+                        return;
+                    }
+                };
+                let guard = vma.lock();
+                let region = *guard.region();
+                let vm_flags = *guard.vm_flags();
+                drop(guard);
+
+                if !region.contains(address) {
                     if space_guard
                         .mappings
                         .first_reservation_conflict(fault_region)
@@ -337,102 +374,69 @@ impl X86_64MMArch {
                         continue;
                     }
 
-                    log::error!(
-                        "pid:{}, can not find nearest vma, \n\terror_code: {:?}, address: {:#x}, rip: {:#x}",
-                        ProcessManager::current_pid().data(),
-                        error_code,
-                        address.data(),
-                        regs.rip,
-                    );
-
-                    // VMA不存在，检查是否需要异常表修复
-                    if handle_kernel_access_failed(regs) {
-                        return; // 已通过异常表修复
-                    }
-
-                    send_segv_maperr();
-                    return;
-                }
-            };
-            let guard = vma.lock();
-            let region = *guard.region();
-            let vm_flags = *guard.vm_flags();
-            drop(guard);
-
-            if !region.contains(address) {
-                if space_guard
-                    .mappings
-                    .first_reservation_conflict(fault_region)
-                    .is_some()
-                {
-                    drop(space_guard);
-                    current_address_space.wait_for_no_reservation_conflict(fault_region);
-                    space_guard = current_address_space.write();
-                    continue;
-                }
-
-                if vm_flags.contains(VmFlags::VM_GROWSDOWN) {
-                    let extension_size = region.start() - address;
-                    let extension_region = VirtRegion::new(address, extension_size);
-                    if space_guard
-                        .mappings
-                        .first_reservation_conflict(extension_region)
-                        .is_some()
-                    {
-                        drop(space_guard);
-                        current_address_space.wait_for_no_reservation_conflict(extension_region);
-                        space_guard = current_address_space.write();
-                        continue;
-                    }
-
-                    // 首先检查地址是否在栈的合理扩展范围内
-                    // 如果地址距离栈底太远（超过最大栈限制），则这不是一个栈扩展请求，
-                    // 而是一个无关的无效内存访问（例如空指针解引用）
-                    let max_stack_limit = space_guard
-                        .user_stack
-                        .as_ref()
-                        .map(|s| s.max_limit())
-                        .unwrap_or(0);
-
-                    if extension_size > max_stack_limit {
-                        // 地址距离栈太远，这不是栈扩展请求，而是普通的无效内存访问
-                        // 检查是否需要异常表修复
-                        if handle_kernel_access_failed(regs) {
-                            return; // 已通过异常表修复
+                    if vm_flags.contains(VmFlags::VM_GROWSDOWN) {
+                        let extension_size = region.start() - address;
+                        let extension_region = VirtRegion::new(address, extension_size);
+                        if space_guard
+                            .mappings
+                            .first_reservation_conflict(extension_region)
+                            .is_some()
+                        {
+                            drop(space_guard);
+                            current_address_space
+                                .wait_for_no_reservation_conflict(extension_region);
+                            space_guard = current_address_space.write();
+                            continue;
                         }
 
-                        send_segv_maperr();
-                        return;
-                    }
+                        // 首先检查地址是否在栈的合理扩展范围内
+                        // 如果地址距离栈底太远（超过最大栈限制），则这不是一个栈扩展请求，
+                        // 而是一个无关的无效内存访问（例如空指针解引用）
+                        let max_stack_limit = space_guard
+                            .user_stack
+                            .as_ref()
+                            .map(|s| s.max_limit())
+                            .unwrap_or(0);
 
-                    if !space_guard.can_extend_stack(extension_size) {
-                        // 栈扩展超过限制
-                        log::warn!(
+                        if extension_size > max_stack_limit {
+                            // 地址距离栈太远，这不是栈扩展请求，而是普通的无效内存访问
+                            // 检查是否需要异常表修复
+                            if handle_kernel_access_failed(regs) {
+                                return; // 已通过异常表修复
+                            }
+
+                            send_segv_maperr();
+                            return;
+                        }
+
+                        if !space_guard.can_extend_stack(extension_size) {
+                            // 栈扩展超过限制
+                            log::warn!(
                             "pid {} user stack limit exceeded, error_code: {:?}, address: {:#x}",
                             ProcessManager::current_pid().data(),
                             error_code,
                             address.data(),
                         );
 
-                        // 栈溢出，检查是否需要异常表修复
-                        if handle_kernel_access_failed(regs) {
-                            return; // 已通过异常表修复
-                        }
+                            // 栈溢出，检查是否需要异常表修复
+                            if handle_kernel_access_failed(regs) {
+                                return; // 已通过异常表修复
+                            }
 
-                        send_segv_maperr();
-                        return;
-                    }
-                    space_guard
-                        .extend_stack(extension_size)
-                        .unwrap_or_else(|_| {
-                            panic!(
-                                "user stack extend failed, error_code: {:?}, address: {:#x}",
-                                error_code,
-                                address.data(),
-                            )
-                        });
-                } else {
-                    log::error!(
+                            send_segv_maperr();
+                            return;
+                        }
+                        space_guard
+                            .extend_stack(extension_size)
+                            .unwrap_or_else(|_| {
+                                panic!(
+                                    "user stack extend failed, error_code: {:?}, address: {:#x}",
+                                    error_code,
+                                    address.data(),
+                                )
+                            });
+                    } else {
+                        log::error!(
                         "pid: {} No mapped vma, error_code: {:?},rip:{:#x}, address: {:#x}, flags: {:?}",
                         ProcessManager::current_pid().data(),
                         error_code,
@@ -440,101 +444,125 @@ impl X86_64MMArch {
                         address.data(),
                         flags
                     );
-                    // 地址不在VMA范围内，检查是否需要异常表修复
+                        // 地址不在VMA范围内，检查是否需要异常表修复
+                        if handle_kernel_access_failed(regs) {
+                            return; // 已通过异常表修复
+                        }
+
+                        send_segv_maperr();
+                        return;
+                    }
+                }
+
+                if unlikely(Self::vma_access_error(vma.clone(), error_code)) {
+                    // VMA权限错误，检查是否需要异常表修复
                     if handle_kernel_access_failed(regs) {
                         return; // 已通过异常表修复
                     }
 
+                    // log::error!(
+                    //     "vma access error, error_code: {:?}, address: {:#x}",
+                    //     error_code,
+                    //     address.data(),
+                    // );
+
+                    send_segv_accerr();
+                    return;
+                }
+                let mapper = &mut space_guard.user_mapper.utable;
+                let message = PageFaultMessage::new(
+                    vma.clone(),
+                    address,
+                    flags,
+                    mapper,
+                    current_address_space.clone(),
+                );
+
+                fault = PageFaultHandler::handle_mm_fault(message);
+
+                if fault.contains(VmFaultReason::VM_FAULT_COMPLETED) {
+                    return;
+                }
+
+                if unlikely(fault.contains(VmFaultReason::VM_FAULT_RETRY)) {
+                    flags |= FaultFlags::FAULT_FLAG_TRIED;
+                } else {
+                    break;
+                }
+            }
+
+            let vm_fault_error = VmFaultReason::VM_FAULT_OOM
+                | VmFaultReason::VM_FAULT_SIGBUS
+                | VmFaultReason::VM_FAULT_SIGSEGV
+                | VmFaultReason::VM_FAULT_HWPOISON
+                | VmFaultReason::VM_FAULT_HWPOISON_LARGE
+                | VmFaultReason::VM_FAULT_FALLBACK;
+
+            if fault.intersects(vm_fault_error) {
+                // 内核态访问用户地址（如 copy_from_user）应走异常表修复，返回 -EFAULT，而不是发送信号/崩溃
+                if !regs.is_from_user() {
+                    if Self::try_fixup_exception(regs, error_code, address) {
+                        return;
+                    }
+                    panic!(
+                        "kernel access to user addr failed without fixup, fault: {:?}, addr: {:#x}, rip: {:#x}",
+                        fault,
+                        address.data(),
+                        regs.rip
+                    );
+                }
+
+                if fault.contains(VmFaultReason::VM_FAULT_OOM) {
+                    error!(
+                        "page fault OOM: pid={:?}, addr={:#x}, rip={:#x}, fault={:?}",
+                        ProcessManager::current_pid(),
+                        address.data(),
+                        regs.rip,
+                        fault
+                    );
+                    drop(space_guard);
+                    let ctx = OomContext {
+                        trigger_pid: ProcessManager::current_pid(),
+                        trigger_tgid: ProcessManager::current_pcb().raw_tgid(),
+                        fault_address: address,
+                        fault_ip: regs.rip as usize,
+                        order: 1,
+                    };
+                    match crate::mm::oom::pagefault_out_of_memory(ctx) {
+                        OomOutcome::Retry => {
+                            flags |= FaultFlags::FAULT_FLAG_TRIED;
+                            continue;
+                        }
+                        OomOutcome::CurrentTaskKilled => {
+                            <crate::arch::ipc::signal::X86_64SignalArch as SignalArch>::do_signal_or_restart(regs);
+                            return;
+                        }
+                        OomOutcome::NoVictim => {
+                            panic!(
+                                "fatal user page-fault OOM: pid={:?}, tgid={:?}, addr={:#x}, rip={:#x}",
+                                ProcessManager::current_pid(),
+                                ProcessManager::current_pcb().raw_tgid(),
+                                address.data(),
+                                regs.rip
+                            );
+                        }
+                    }
+                } else if fault.contains(VmFaultReason::VM_FAULT_SIGBUS)
+                    || fault.contains(VmFaultReason::VM_FAULT_HWPOISON)
+                    || fault.contains(VmFaultReason::VM_FAULT_HWPOISON_LARGE)
+                {
+                    // Linux x86 maps these fault handler errors to SIGBUS/BUS_ADRERR
+                    // except for hwpoison's MCE-specific si_code, which DragonOS does not model yet.
+                    send_bus_adrerr();
+                } else if fault.contains(VmFaultReason::VM_FAULT_SIGSEGV) {
                     send_segv_maperr();
-                    return;
+                } else {
+                    panic!("unexpected fault error: {:?}", fault);
                 }
-            }
-
-            if unlikely(Self::vma_access_error(vma.clone(), error_code)) {
-                // VMA权限错误，检查是否需要异常表修复
-                if handle_kernel_access_failed(regs) {
-                    return; // 已通过异常表修复
-                }
-
-                // log::error!(
-                //     "vma access error, error_code: {:?}, address: {:#x}",
-                //     error_code,
-                //     address.data(),
-                // );
-
-                send_segv_accerr();
-                return;
-            }
-            let mapper = &mut space_guard.user_mapper.utable;
-            let message = PageFaultMessage::new(
-                vma.clone(),
-                address,
-                flags,
-                mapper,
-                current_address_space.clone(),
-            );
-
-            fault = PageFaultHandler::handle_mm_fault(message);
-
-            if fault.contains(VmFaultReason::VM_FAULT_COMPLETED) {
                 return;
             }
 
-            if unlikely(fault.contains(VmFaultReason::VM_FAULT_RETRY)) {
-                flags |= FaultFlags::FAULT_FLAG_TRIED;
-            } else {
-                break;
-            }
+            panic!("fault error: {:?}", fault)
         }
-
-        let vm_fault_error = VmFaultReason::VM_FAULT_OOM
-            | VmFaultReason::VM_FAULT_SIGBUS
-            | VmFaultReason::VM_FAULT_SIGSEGV
-            | VmFaultReason::VM_FAULT_HWPOISON
-            | VmFaultReason::VM_FAULT_HWPOISON_LARGE
-            | VmFaultReason::VM_FAULT_FALLBACK;
-
-        if fault.intersects(vm_fault_error) {
-            // 内核态访问用户地址（如 copy_from_user）应走异常表修复，返回 -EFAULT，而不是发送信号/崩溃
-            if !regs.is_from_user() {
-                if Self::try_fixup_exception(regs, error_code, address) {
-                    return;
-                }
-                panic!(
-                    "kernel access to user addr failed without fixup, fault: {:?}, addr: {:#x}, rip: {:#x}",
-                    fault,
-                    address.data(),
-                    regs.rip
-                );
-            }
-
-            if fault.contains(VmFaultReason::VM_FAULT_OOM) {
-                error!(
-                    "page fault OOM: pid={:?}, addr={:#x}, rip={:#x}, fault={:?}",
-                    ProcessManager::current_pid(),
-                    address.data(),
-                    regs.rip,
-                    fault
-                );
-                if let Err(err) = force_kernel_signal_to_current(Signal::SIGKILL) {
-                    error!("failed to send SIGKILL for page fault OOM: {:?}", err);
-                }
-                return;
-            } else if fault.contains(VmFaultReason::VM_FAULT_SIGBUS)
-                || fault.contains(VmFaultReason::VM_FAULT_HWPOISON)
-                || fault.contains(VmFaultReason::VM_FAULT_HWPOISON_LARGE)
-            {
-                // Linux x86 maps these fault handler errors to SIGBUS/BUS_ADRERR
-                // except for hwpoison's MCE-specific si_code, which DragonOS does not model yet.
-                send_bus_adrerr();
-            } else if fault.contains(VmFaultReason::VM_FAULT_SIGSEGV) {
-                send_segv_maperr();
-            } else {
-                panic!("unexpected fault error: {:?}", fault);
-            }
-            return;
-        }
-
-        panic!("fault error: {:?}", fault)
     }
 }

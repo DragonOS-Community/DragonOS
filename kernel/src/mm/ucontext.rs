@@ -140,6 +140,13 @@ pub struct AddressSpace {
     page_table_edit_lock: Mutex<()>,
     /// Per-mm resident user pages, counted by present user PTEs.
     resident_user_pages: AtomicUsize,
+    /// Monotonic OOM reclaim progress generation.
+    ///
+    /// This is advanced only after unmapped pages have passed the required TLB
+    /// shootdown and their deferred `Arc<Page>` references are actually dropped.
+    /// OOM waiters must not treat the earlier resident-page accounting decrement
+    /// as reclaim progress.
+    oom_reclaim_generation: AtomicU64,
     /// 使用RwSem而非RwLock，因为地址空间操作可能需要进行I/O（如页缺失时的文件读取）
     inner: RwSem<InnerAddressSpace>,
     /// 等待未发布的 mmap reservation 提交或取消。
@@ -158,6 +165,7 @@ impl AddressSpace {
             tlb_gen: AtomicU64::new(0),
             page_table_edit_lock: Mutex::new(()),
             resident_user_pages: AtomicUsize::new(0),
+            oom_reclaim_generation: AtomicU64::new(0),
             inner: RwSem::new(inner),
             reservation_wait: WaitQueue::default(),
         });
@@ -271,6 +279,16 @@ impl AddressSpace {
     }
 
     #[inline(always)]
+    pub fn oom_reclaim_generation(&self) -> u64 {
+        self.oom_reclaim_generation.load(Ordering::Acquire)
+    }
+
+    #[inline(always)]
+    pub fn advance_oom_reclaim_generation(&self) {
+        self.oom_reclaim_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[inline(always)]
     pub fn account_present_page_add(&self) {
         self.account_present_pages_add(1);
     }
@@ -314,7 +332,6 @@ impl AddressSpace {
             prev,
             count
         );
-        crate::mm::oom::notify_mm_resident_changed(self);
     }
 
     pub fn wait_for_no_reservation_conflict(self: &Arc<Self>, region: VirtRegion) {
@@ -3619,12 +3636,12 @@ impl InnerAddressSpace {
         tlb.set_fullmm();
         let mut vma_close_notifications = Vec::new();
         let mut sysv_close_notifications = Vec::new();
-        for vma in self.mappings.iter_vmas() {
+        for vma in self.mappings.take_all_vmas() {
             let region = *vma.lock().region();
-            if let Some(notification) = Self::collect_vma_close(vma, region) {
+            if let Some(notification) = Self::collect_vma_close(&vma, region) {
                 vma_close_notifications.push(notification);
             }
-            let sysv_close = Self::collect_sysv_shm_close(vma);
+            let sysv_close = Self::collect_sysv_shm_close(&vma);
             if let Some(notification) = sysv_close {
                 sysv_close_notifications.push(notification);
             }
@@ -4216,6 +4233,19 @@ impl UserMappings {
         self.detach_vma(&vma);
 
         return Some(vma);
+    }
+
+    fn take_all_vmas(&mut self) -> Vec<Arc<LockedVMA>> {
+        let vmas = self.vmas.drain().collect::<Vec<_>>();
+        self.vmas_by_start.clear();
+        self.reservations.clear();
+        self.vm_holes.clear();
+        self.vm_holes
+            .insert(VirtAddr::new(0), MMArch::USER_END_VADDR.data());
+        for vma in &vmas {
+            self.detach_vma(vma);
+        }
+        vmas
     }
 
     /// @brief Get the iterator of all VMAs in this process.

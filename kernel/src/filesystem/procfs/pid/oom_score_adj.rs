@@ -70,12 +70,29 @@ impl OomScoreAdjFileOps {
             .is_some_and(|task_mm| task_mm.id() == mm.id() || Arc::ptr_eq(&task_mm, mm))
     }
 
-    fn set_score_for_shared_mm(pcb: &Arc<ProcessControlBlock>, score: i16) {
+    fn set_score(pcb: &Arc<ProcessControlBlock>, score: i16, min_update: Option<i16>) {
+        let mut sig_info = pcb.sig_info_mut();
+        sig_info.set_oom_score_adj(score);
+        if let Some(min) = min_update {
+            sig_info.set_oom_score_adj_min(min);
+        }
+    }
+
+    fn set_score_for_shared_mm(
+        pcb: &Arc<ProcessControlBlock>,
+        score: i16,
+        min_update: Option<i16>,
+    ) {
+        Self::set_score(pcb, score, min_update);
+        if pcb.is_active_vfork() {
+            return;
+        }
+
         let Some(mm) = pcb.basic().user_vm() else {
-            pcb.sig_info_mut().set_oom_score_adj(score);
             return;
         };
 
+        let target_tgid = pcb.raw_tgid();
         let mut seen_tgids = alloc::vec::Vec::new();
         for pid in ProcessManager::get_all_processes() {
             let Some(task) = ProcessManager::find(pid) else {
@@ -87,6 +104,9 @@ impl OomScoreAdjFileOps {
 
             let leader = ProcessManager::find(task.raw_tgid()).unwrap_or(task);
             let tgid = leader.raw_tgid();
+            if tgid == target_tgid {
+                continue;
+            }
             if seen_tgids.contains(&tgid) {
                 continue;
             }
@@ -95,10 +115,11 @@ impl OomScoreAdjFileOps {
             if leader.raw_pid().data() == 0
                 || leader.raw_pid().data() == 1
                 || leader.flags().contains(ProcessFlags::KTHREAD)
+                || leader.is_active_vfork()
             {
                 continue;
             }
-            leader.sig_info_mut().set_oom_score_adj(score);
+            Self::set_score(&leader, score, min_update);
         }
     }
 }
@@ -130,10 +151,14 @@ impl FileOps for OomScoreAdjFileOps {
 
         let score = Self::parse_score(buf)?;
         let pcb = self.target_process()?;
-        if score < 0 && !capable(CAPFlags::CAP_SYS_RESOURCE) {
+        let has_cap_sys_resource = capable(CAPFlags::CAP_SYS_RESOURCE);
+        let _oom_score_adj_guard = ProcessManager::lock_oom_score_adj();
+        let min_score = pcb.sig_info_irqsave().oom_score_adj_min();
+        if score < min_score && !has_cap_sys_resource {
             return Err(SystemError::EACCES);
         }
-        Self::set_score_for_shared_mm(&pcb, score);
+        let min_update = has_cap_sys_resource.then_some(score);
+        Self::set_score_for_shared_mm(&pcb, score, min_update);
         Ok(buf.len())
     }
 }

@@ -765,6 +765,13 @@ struct fuse_daemon_args {
     volatile uint32_t *last_write_gid;
     volatile uint32_t *last_write_pid;
     volatile unsigned char *last_write_watch_byte;
+    volatile uint64_t *write_offsets;
+    volatile uint32_t *write_sizes;
+    volatile uint32_t *write_flags;
+    volatile unsigned char *write_watch_bytes;
+    volatile unsigned char *write_covers_watch;
+    volatile unsigned char *backend_watch_byte;
+    uint32_t write_trace_capacity;
     volatile uint64_t *last_fsync_fh;
     volatile uint32_t *write_count_at_fsync;
     volatile uint32_t *last_write_flags_at_fsync;
@@ -1428,8 +1435,9 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (in->offset >= SIMPLEFS_DATA_MAX) {
             return fuse_write_reply(a->fd, h->unique, -EFBIG, NULL, 0);
         }
+        uint32_t write_index = 0;
         if (a->write_count) {
-            (*a->write_count)++;
+            write_index = *a->write_count;
         }
         if (a->last_write_fh) {
             *a->last_write_fh = in->fh;
@@ -1459,16 +1467,49 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (in->offset + to_copy > SIMPLEFS_DATA_MAX) {
             to_copy = SIMPLEFS_DATA_MAX - (size_t)in->offset;
         }
-        if (a->last_write_watch_byte) {
-            uint64_t watch = a->write_watch_offset;
-            uint64_t end = in->offset + to_copy;
-            if (watch >= in->offset && watch < end) {
-                *a->last_write_watch_byte = data[(size_t)(watch - in->offset)];
+        unsigned char watch_byte = 0;
+        int covers_watch = 0;
+        uint64_t watch = a->write_watch_offset;
+        uint64_t end = in->offset + to_copy;
+        if (watch >= in->offset && watch < end) {
+            covers_watch = 1;
+            watch_byte = data[(size_t)(watch - in->offset)];
+            if (a->last_write_watch_byte) {
+                *a->last_write_watch_byte = watch_byte;
+            }
+        }
+        if (write_index < a->write_trace_capacity) {
+            if (a->write_offsets) {
+                a->write_offsets[write_index] = in->offset;
+            }
+            if (a->write_sizes) {
+                a->write_sizes[write_index] = in->size;
+            }
+            if (a->write_flags) {
+                a->write_flags[write_index] = in->write_flags;
+            }
+            if (a->write_watch_bytes) {
+                a->write_watch_bytes[write_index] = watch_byte;
+            }
+            if (a->write_covers_watch) {
+                a->write_covers_watch[write_index] = covers_watch ? 1 : 0;
             }
         }
         memcpy(node->data + in->offset, data, to_copy);
         if (node->size < in->offset + to_copy) {
             node->size = (size_t)in->offset + to_copy;
+        }
+        if (a->backend_watch_byte) {
+            uint64_t watch = a->write_watch_offset;
+            if (watch < node->size && watch < SIMPLEFS_DATA_MAX) {
+                *a->backend_watch_byte = node->data[watch];
+            }
+        }
+        if (a->write_count) {
+            if (a->write_trace_capacity > 0 || a->backend_watch_byte) {
+                __sync_synchronize();
+            }
+            (*a->write_count)++;
         }
         struct fuse_write_out out;
         memset(&out, 0, sizeof(out));

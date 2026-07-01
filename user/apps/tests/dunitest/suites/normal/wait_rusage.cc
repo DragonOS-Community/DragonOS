@@ -1,7 +1,13 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <errno.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
@@ -33,7 +39,40 @@
 #define P_PIDFD 3
 #endif
 
+#ifndef CLONE_PARENT
+#define CLONE_PARENT 0x00008000
+#endif
+
 namespace {
+
+constexpr size_t kCloneStackSize = 1024 * 1024;
+constexpr uid_t kWaitidChildUid = 1234;
+
+bool ReadExact(int fd, void* buf, size_t len) {
+  char* cursor = static_cast<char*>(buf);
+  while (len > 0) {
+    ssize_t n = read(fd, cursor, len);
+    if (n <= 0) {
+      return false;
+    }
+    cursor += n;
+    len -= static_cast<size_t>(n);
+  }
+  return true;
+}
+
+bool WriteExact(int fd, const void* buf, size_t len) {
+  const char* cursor = static_cast<const char*>(buf);
+  while (len > 0) {
+    ssize_t n = write(fd, cursor, len);
+    if (n <= 0) {
+      return false;
+    }
+    cursor += n;
+    len -= static_cast<size_t>(n);
+  }
+  return true;
+}
 
 uint64_t RusageCpuUsec(const struct rusage& ru) {
   return static_cast<uint64_t>(ru.ru_utime.tv_sec) * 1000000ULL +
@@ -115,6 +154,36 @@ void* ForkChildFromThread(void* arg) {
     if (args->wait_result < 0) {
       args->wait_errno = errno;
     }
+  }
+  return nullptr;
+}
+
+struct ThreadForkExitArgs {
+  int ready_fd = -1;
+  int release_fd = -1;
+  pid_t child = -1;
+  int fork_errno = 0;
+};
+
+void* ForkChildAndExitThread(void* arg) {
+  auto* args = reinterpret_cast<ThreadForkExitArgs*>(arg);
+  pid_t child = fork();
+  if (child == 0) {
+    char release = 0;
+    if (read(args->release_fd, &release, 1) != 1) {
+      _exit(22);
+    }
+    _exit(23);
+  }
+  if (child < 0) {
+    args->fork_errno = errno;
+  } else {
+    args->child = child;
+  }
+
+  char byte = child < 0 ? 'e' : 'x';
+  if (write(args->ready_fd, &byte, 1) != 1) {
+    args->fork_errno = errno;
   }
   return nullptr;
 }
@@ -207,7 +276,163 @@ void* ForkTracemeAndWaitFromThread(void* arg) {
   return nullptr;
 }
 
+struct CloneParentSpawnResult {
+  pid_t pid = -1;
+  int err = 0;
+};
+
+struct CloneParentWaitResult {
+  pid_t result = -1;
+  int err = 0;
+  int status = 0;
+};
+
+int CloneParentChild(void* arg) {
+  int release_fd = *reinterpret_cast<int*>(arg);
+  char byte = 0;
+  if (read(release_fd, &byte, 1) != 1) {
+    _exit(18);
+  }
+  _exit(19);
+}
+
+bool WaitidPeekExited(pid_t child, siginfo_t* si) {
+  for (int i = 0; i < 1000; ++i) {
+    memset(si, 0, sizeof(*si));
+    if (syscall(SYS_waitid, P_PID, child, si, WEXITED | WNOWAIT | WNOHANG,
+                nullptr) != 0) {
+      return false;
+    }
+    if (si->si_pid == child) {
+      return true;
+    }
+    usleep(1000);
+  }
+  return false;
+}
+
 }  // namespace
+
+TEST(WaitRusage, WaitidReportsChildRealUid) {
+  pid_t child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    if (setuid(kWaitidChildUid) != 0) {
+      _exit(77);
+    }
+    _exit(0);
+  }
+
+  siginfo_t si {};
+  ASSERT_EQ(0, syscall(SYS_waitid, P_PID, child, &si, WEXITED, nullptr))
+      << strerror(errno);
+  EXPECT_EQ(SIGCHLD, si.si_signo);
+  EXPECT_EQ(CLD_EXITED, si.si_code);
+  EXPECT_EQ(child, si.si_pid);
+  EXPECT_EQ(kWaitidChildUid, si.si_uid);
+  EXPECT_EQ(0, si.si_status);
+}
+
+TEST(WaitRusage, WaitPidSelfReturnsEchild) {
+  int status = 0;
+  errno = 0;
+  EXPECT_EQ(-1, wait4(getpid(), &status, WNOHANG, nullptr));
+  EXPECT_EQ(ECHILD, errno);
+
+  siginfo_t si {};
+  errno = 0;
+  EXPECT_EQ(-1, syscall(SYS_waitid, P_PID, getpid(), &si,
+                        WEXITED | WNOHANG, nullptr));
+  EXPECT_EQ(ECHILD, errno);
+}
+
+TEST(WaitRusage, CloneParentChildNotWaitableByCreatorWithWnothread) {
+  int child_pid_pipe[2] = {};
+  int child_release_pipe[2] = {};
+  int creator_attempt_pipe[2] = {};
+  int creator_result_pipe[2] = {};
+  ASSERT_EQ(0, pipe(child_pid_pipe)) << strerror(errno);
+  ASSERT_EQ(0, pipe(child_release_pipe)) << strerror(errno);
+  ASSERT_EQ(0, pipe(creator_attempt_pipe)) << strerror(errno);
+  ASSERT_EQ(0, pipe(creator_result_pipe)) << strerror(errno);
+
+  pid_t creator = fork();
+  ASSERT_GE(creator, 0) << strerror(errno);
+  if (creator == 0) {
+    close(child_pid_pipe[0]);
+    close(creator_attempt_pipe[1]);
+    close(creator_result_pipe[0]);
+    close(child_release_pipe[1]);
+
+    void* stack = malloc(kCloneStackSize);
+    CloneParentSpawnResult spawn {};
+    if (stack == nullptr) {
+      spawn.err = ENOMEM;
+      WriteExact(child_pid_pipe[1], &spawn, sizeof(spawn));
+      _exit(10);
+    }
+
+    void* stack_top = static_cast<char*>(stack) + kCloneStackSize;
+    pid_t child = clone(CloneParentChild, stack_top, CLONE_PARENT | SIGCHLD,
+                        &child_release_pipe[0]);
+    spawn.pid = child;
+    if (child < 0) {
+      spawn.err = errno;
+      WriteExact(child_pid_pipe[1], &spawn, sizeof(spawn));
+      _exit(11);
+    }
+    if (!WriteExact(child_pid_pipe[1], &spawn, sizeof(spawn))) {
+      _exit(12);
+    }
+
+    char attempt = 0;
+    if (read(creator_attempt_pipe[0], &attempt, 1) != 1) {
+      _exit(13);
+    }
+
+    CloneParentWaitResult result {};
+    result.result = wait4(child, &result.status, __WNOTHREAD | WNOHANG,
+                          nullptr);
+    if (result.result < 0) {
+      result.err = errno;
+    }
+    if (!WriteExact(creator_result_pipe[1], &result, sizeof(result))) {
+      _exit(14);
+    }
+    _exit(0);
+  }
+
+  close(child_pid_pipe[1]);
+  close(creator_attempt_pipe[0]);
+  close(creator_result_pipe[1]);
+  close(child_release_pipe[0]);
+
+  CloneParentSpawnResult spawn {};
+  ASSERT_TRUE(ReadExact(child_pid_pipe[0], &spawn, sizeof(spawn)))
+      << strerror(errno);
+  ASSERT_GT(spawn.pid, 0) << strerror(spawn.err);
+
+  ASSERT_EQ(1, write(child_release_pipe[1], "x", 1)) << strerror(errno);
+  siginfo_t si {};
+  ASSERT_TRUE(WaitidPeekExited(spawn.pid, &si)) << strerror(errno);
+  EXPECT_EQ(CLD_EXITED, si.si_code);
+  EXPECT_EQ(19, si.si_status);
+
+  ASSERT_EQ(1, write(creator_attempt_pipe[1], "x", 1)) << strerror(errno);
+  CloneParentWaitResult result {};
+  ASSERT_TRUE(ReadExact(creator_result_pipe[0], &result, sizeof(result)))
+      << strerror(errno);
+  EXPECT_EQ(-1, result.result);
+  EXPECT_EQ(ECHILD, result.err);
+
+  int status = 0;
+  ASSERT_EQ(spawn.pid, wait4(spawn.pid, &status, 0, nullptr)) << strerror(errno);
+  ExpectEncodedExitStatus(status, 19);
+
+  ASSERT_EQ(creator, wait4(creator, &status, 0, nullptr)) << strerror(errno);
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(0, WEXITSTATUS(status));
+}
 
 TEST(WaitRusage, PtraceTracemeChildIsWaitableWithWclone) {
   int fds[2] = {};
@@ -411,6 +636,38 @@ TEST(WaitRusage, WnothreadWaitsForChildForkedByCurrentThread) {
   close(release_pipe[0]);
   EXPECT_EQ(args.child, args.wait_result) << strerror(args.wait_errno);
   ExpectEncodedExitStatus(args.wait_status, 17);
+}
+
+TEST(WaitRusage, WnothreadChildReparentedWhenForkingThreadExits) {
+  int ready_pipe[2] = {};
+  int release_pipe[2] = {};
+  ASSERT_EQ(0, pipe(ready_pipe)) << strerror(errno);
+  ASSERT_EQ(0, pipe(release_pipe)) << strerror(errno);
+
+  ThreadForkExitArgs args;
+  args.ready_fd = ready_pipe[1];
+  args.release_fd = release_pipe[0];
+  pthread_t thread {};
+  ASSERT_EQ(0, pthread_create(&thread, nullptr, ForkChildAndExitThread, &args))
+      << strerror(errno);
+
+  char byte = 0;
+  ASSERT_EQ(1, read(ready_pipe[0], &byte, 1)) << strerror(errno);
+  close(ready_pipe[0]);
+  ASSERT_EQ(0, pthread_join(thread, nullptr)) << strerror(errno);
+  close(ready_pipe[1]);
+  close(release_pipe[0]);
+
+  ASSERT_EQ(0, args.fork_errno) << strerror(args.fork_errno);
+  ASSERT_GT(args.child, 0);
+
+  ASSERT_EQ(1, write(release_pipe[1], "x", 1)) << strerror(errno);
+  close(release_pipe[1]);
+
+  int status = 0;
+  ASSERT_EQ(args.child, wait4(args.child, &status, __WNOTHREAD, nullptr))
+      << strerror(errno);
+  ExpectEncodedExitStatus(status, 23);
 }
 
 TEST(WaitRusage, ThreadGroupLeaderWaitDelayedUntilSubthreadsExit) {

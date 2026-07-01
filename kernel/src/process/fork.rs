@@ -835,12 +835,15 @@ impl ProcessManager {
             *pcb.parent_pcb.write_irqsave() = current_pcb.parent_pcb.read_irqsave().clone();
             *pcb.real_parent_pcb.write_irqsave() =
                 current_pcb.real_parent_pcb.read_irqsave().clone();
+            *pcb.wait_parent_pcb.write_irqsave() = current_pcb.parent_pcb.read_irqsave().clone();
             pcb.exit_signal.store(-1, Ordering::SeqCst);
         } else {
             if clone_flags.contains(CloneFlags::CLONE_PARENT) {
-                *pcb.parent_pcb.write_irqsave() = current_pcb.parent_pcb.read_irqsave().clone();
+                let parent = current_pcb.parent_pcb.read_irqsave().clone();
+                *pcb.parent_pcb.write_irqsave() = parent.clone();
                 *pcb.real_parent_pcb.write_irqsave() =
                     current_pcb.real_parent_pcb.read_irqsave().clone();
+                *pcb.wait_parent_pcb.write_irqsave() = parent;
                 pcb.exit_signal.store(
                     current_leader.exit_signal.load(Ordering::SeqCst),
                     Ordering::SeqCst,
@@ -848,6 +851,7 @@ impl ProcessManager {
             } else {
                 *pcb.parent_pcb.write_irqsave() = Arc::downgrade(&current_leader);
                 *pcb.real_parent_pcb.write_irqsave() = Arc::downgrade(&current_leader);
+                *pcb.wait_parent_pcb.write_irqsave() = Arc::downgrade(current_pcb);
                 pcb.exit_signal
                     .store(clone_args.exit_signal, Ordering::SeqCst);
             }

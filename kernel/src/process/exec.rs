@@ -453,7 +453,8 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
             }
 
             // 将旧 leader 的 children 列表转移给新 leader
-            {
+            let moved_children = {
+                let leader_pid_ns = leader.active_pid_ns();
                 let (first, second) =
                     if (Arc::as_ptr(&current) as usize) <= (Arc::as_ptr(&leader) as usize) {
                         (current.clone(), leader.clone())
@@ -466,17 +467,30 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
 
                 if Arc::ptr_eq(&leader, &first) {
                     let moved = core::mem::take(&mut *first_children);
-                    second_children.extend(moved);
+                    second_children.extend(moved.iter().copied());
+                    moved
                 } else {
                     let moved = core::mem::take(&mut *second_children);
-                    first_children.extend(moved);
+                    first_children.extend(moved.iter().copied());
+                    moved
                 }
+                .into_iter()
+                .filter_map(|pid| ProcessManager::find_task_by_pid_ns(pid, &leader_pid_ns))
+                .collect::<Vec<_>>()
+            };
+            for child in moved_children {
+                ProcessControlBlock::reparent_child_links_from_thread_group(
+                    &child,
+                    current.tgid,
+                    &current,
+                );
             }
 
             // 继承 old leader 的父进程关系
             let leader_parent = leader.real_parent_pcb.read().clone();
             *current.parent_pcb.write() = leader_parent.clone();
-            *current.real_parent_pcb.write() = leader_parent;
+            *current.real_parent_pcb.write() = leader_parent.clone();
+            *current.wait_parent_pcb.write() = leader_parent;
             *current.fork_parent_pcb.write() = current.self_ref.clone();
 
             // log::info!("de_thread: reparented current to old leader's parent");

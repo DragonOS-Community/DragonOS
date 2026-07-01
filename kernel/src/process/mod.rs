@@ -1252,7 +1252,6 @@ impl ProcessManager {
             ProcessManager::ptrace_unlink_tracee(pcb);
 
             let parent_child_vpid = pcb.real_parent_pcb().and_then(|parent| {
-                let parent = ProcessManager::thread_group_leader_of(&parent);
                 let parent_ns = parent.active_pid_ns();
                 pcb.task_pid_nr_ns(PidType::PID, Some(parent_ns))
                     .map(|vpid| (parent, vpid))
@@ -1694,6 +1693,12 @@ pub struct ProcessControlBlock {
     pub(crate) parent_pcb: RwLock<Weak<ProcessControlBlock>>,
     /// 真实父进程指针
     pub(crate) real_parent_pcb: RwLock<Weak<ProcessControlBlock>>,
+    /// wait 自然父进程指针。
+    ///
+    /// Linux wait_task_zombie()/wait_consider_task() 中 __WNOTHREAD 依赖
+    /// task_struct::parent，而 DragonOS 的 parent_pcb/real_parent_pcb 按线程组
+    /// leader 建模。该字段保留 wait 所需的线程级父关系。
+    pub(crate) wait_parent_pcb: RwLock<Weak<ProcessControlBlock>>,
     pub(crate) fork_parent_pcb: RwLock<Weak<ProcessControlBlock>>,
 
     /// 子进程链表
@@ -1871,6 +1876,7 @@ impl ProcessControlBlock {
                 seccomp_filter: SpinLock::new(None),
                 parent_pcb: RwLock::new(ppcb.clone()),
                 real_parent_pcb: RwLock::new(ppcb.clone()),
+                wait_parent_pcb: RwLock::new(ppcb.clone()),
                 fork_parent_pcb: RwLock::new(ppcb),
                 children: RwLock::new(Vec::new()),
                 ptraced: RwLock::new(Vec::new()),
@@ -2368,6 +2374,10 @@ impl ProcessControlBlock {
         self.fork_parent_pcb.read_irqsave().upgrade()
     }
 
+    pub fn wait_parent_pcb(&self) -> Option<Arc<ProcessControlBlock>> {
+        self.wait_parent_pcb.read_irqsave().upgrade()
+    }
+
     /// 判断当前进程是否是全局的init进程
     pub fn is_global_init(&self) -> bool {
         self.task_tgid_vnr().unwrap() == RawPid(1)
@@ -2413,24 +2423,170 @@ impl ProcessControlBlock {
         Err(SystemError::EBADF)
     }
 
-    /// 当前进程退出时,让初始进程收养所有子进程
-    unsafe fn adopt_childen(&self) -> Result<(), SystemError> {
-        // 取出并清空 children 列表，避免后续 wait/reparent 出现重复。
-        let child_pids: Vec<RawPid> = {
-            let mut children_guard = self.children.write();
-            core::mem::take(&mut *children_guard)
-        };
+    fn is_alive_reparent_target(pcb: &Arc<ProcessControlBlock>) -> bool {
+        !pcb.is_exited() && !pcb.is_zombie() && !pcb.is_dead()
+    }
 
-        if child_pids.is_empty() {
+    fn find_alive_thread_reaper(
+        exiting: &Arc<ProcessControlBlock>,
+    ) -> Option<Arc<ProcessControlBlock>> {
+        ProcessManager::thread_group_tasks_snapshot(exiting.clone())
+            .into_iter()
+            .find(|task| {
+                !Arc::ptr_eq(task, exiting) && ProcessControlBlock::is_alive_reparent_target(task)
+            })
+    }
+
+    fn child_wait_parent_is(
+        child: &Arc<ProcessControlBlock>,
+        parent: &Arc<ProcessControlBlock>,
+    ) -> bool {
+        child
+            .wait_parent_pcb()
+            .as_ref()
+            .map(|wait_parent| Arc::ptr_eq(wait_parent, parent))
+            .unwrap_or(false)
+    }
+
+    fn link_child_to_parent_list(
+        child: &Arc<ProcessControlBlock>,
+        parent: &Arc<ProcessControlBlock>,
+    ) {
+        let child_vpid = child
+            .task_pid_nr_ns(PidType::PID, Some(parent.active_pid_ns()))
+            .unwrap_or(RawPid::new(0));
+        if child_vpid.data() == 0 {
+            return;
+        }
+
+        let mut children = parent.children.write_irqsave();
+        if !children.contains(&child_vpid) {
+            children.push(child_vpid);
+        }
+    }
+
+    pub(crate) fn reparent_child_to(
+        child: &Arc<ProcessControlBlock>,
+        new_parent: &Arc<ProcessControlBlock>,
+    ) {
+        *child.parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
+        *child.real_parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
+        *child.wait_parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
+
+        let parent_pid_in_child_ns = new_parent
+            .task_pid_nr_ns(PidType::PID, Some(child.active_pid_ns()))
+            .unwrap_or(RawPid::new(0));
+        child.basic.write_irqsave().ppid = parent_pid_in_child_ns;
+
+        ProcessControlBlock::link_child_to_parent_list(child, new_parent);
+    }
+
+    pub(crate) fn reparent_child_links_from_thread_group(
+        child: &Arc<ProcessControlBlock>,
+        old_tgid: RawPid,
+        new_parent: &Arc<ProcessControlBlock>,
+    ) {
+        let should_reparent = child
+            .parent_pcb()
+            .as_ref()
+            .map(|parent| parent.tgid == old_tgid)
+            .unwrap_or(false)
+            || child
+                .real_parent_pcb()
+                .as_ref()
+                .map(|parent| parent.tgid == old_tgid)
+                .unwrap_or(false)
+            || child
+                .wait_parent_pcb()
+                .as_ref()
+                .map(|parent| parent.tgid == old_tgid)
+                .unwrap_or(false);
+
+        if should_reparent {
+            ProcessControlBlock::reparent_child_to(child, new_parent);
+        }
+    }
+
+    fn collect_children_for_exit(
+        exiting: &Arc<ProcessControlBlock>,
+    ) -> Vec<Arc<ProcessControlBlock>> {
+        let mut result = Vec::new();
+        let mut seen = Vec::new();
+
+        let mut push_reparent_child =
+            |child: Arc<ProcessControlBlock>, result: &mut Vec<Arc<ProcessControlBlock>>| {
+                if seen.iter().any(|pid| *pid == child.raw_pid()) {
+                    return;
+                }
+                seen.push(child.raw_pid());
+                result.push(child);
+            };
+
+        for owner in ProcessManager::thread_group_tasks_snapshot(exiting.clone()) {
+            let owner_ns = owner.active_pid_ns();
+            let pids_to_rehome: Vec<RawPid> = if Arc::ptr_eq(&owner, exiting) {
+                let mut children = owner.children.write_irqsave();
+                core::mem::take(&mut *children)
+            } else {
+                let mut children = owner.children.write_irqsave();
+                let mut removed = Vec::new();
+                children.retain(|pid| {
+                    let should_remove = ProcessManager::find_task_by_pid_ns(*pid, &owner_ns)
+                        .as_ref()
+                        .map(|child| ProcessControlBlock::child_wait_parent_is(child, exiting))
+                        .unwrap_or(false);
+                    if should_remove {
+                        removed.push(*pid);
+                    }
+                    !should_remove
+                });
+                removed
+            };
+
+            for pid in pids_to_rehome {
+                let Some(child) = ProcessManager::find_task_by_pid_ns(pid, &owner_ns) else {
+                    continue;
+                };
+
+                if let Some(wait_parent) = child.wait_parent_pcb() {
+                    if !Arc::ptr_eq(&wait_parent, exiting)
+                        && wait_parent.tgid == exiting.tgid
+                        && ProcessControlBlock::is_alive_reparent_target(&wait_parent)
+                    {
+                        ProcessControlBlock::reparent_child_to(&child, &wait_parent);
+                        continue;
+                    }
+                }
+
+                push_reparent_child(child, &mut result);
+            }
+        }
+
+        result
+    }
+
+    /// 当前进程退出时，让其他线程、subreaper 或 init 收养其子进程。
+    unsafe fn adopt_childen(&self) -> Result<(), SystemError> {
+        let exiting = self.self_ref.upgrade().ok_or(SystemError::ESRCH)?;
+        let children = ProcessControlBlock::collect_children_for_exit(&exiting);
+
+        if children.is_empty() {
             return Ok(());
         }
 
-        self.notify_parent_exit_for_children(&child_pids);
+        self.notify_parent_exit_for_children(&children);
+
+        if let Some(reaper) = ProcessControlBlock::find_alive_thread_reaper(&exiting) {
+            for child in children {
+                ProcessControlBlock::reparent_child_to(&child, &reaper);
+            }
+            return Ok(());
+        }
 
         let init_pcb = ProcessManager::find_task_by_vpid(RawPid(1)).ok_or(SystemError::ECHILD)?;
 
         // 如果当前进程是 namespace 的 init，则由父进程所在 pidns 的 init 去收养。
-        if Arc::ptr_eq(&self.self_ref.upgrade().unwrap(), &init_pcb) {
+        if Arc::ptr_eq(&exiting, &init_pcb) {
             if let Some(parent_pcb) = self.real_parent_pcb() {
                 assert!(
                     !Arc::ptr_eq(&parent_pcb, &init_pcb),
@@ -2440,22 +2596,8 @@ impl ProcessControlBlock {
                 let parent_init =
                     ProcessManager::find_task_by_pid_ns(RawPid(1), &parent_pcb.active_pid_ns());
                 if let Some(parent_init) = parent_init {
-                    for pid in child_pids.iter().copied() {
-                        if let Some(child) = ProcessManager::find_task_by_vpid(pid) {
-                            *child.parent_pcb.write_irqsave() = Arc::downgrade(&parent_init);
-                            *child.real_parent_pcb.write_irqsave() = Arc::downgrade(&parent_init);
-                            let parent_pid_in_child_ns = parent_init
-                                .task_pid_nr_ns(PidType::PID, Some(child.active_pid_ns()))
-                                .unwrap_or(RawPid::new(0));
-                            child.basic.write_irqsave().ppid = parent_pid_in_child_ns;
-
-                            let child_vpid_in_parent_ns = child
-                                .task_pid_nr_ns(PidType::PID, Some(parent_init.active_pid_ns()))
-                                .unwrap_or(RawPid::new(0));
-                            if child_vpid_in_parent_ns.data() != 0 {
-                                parent_init.children.write().push(child_vpid_in_parent_ns);
-                            }
-                        }
+                    for child in children {
+                        ProcessControlBlock::reparent_child_to(&child, &parent_init);
                     }
                 }
             }
@@ -2484,43 +2626,26 @@ impl ProcessControlBlock {
             cursor = leader.parent_pcb();
         }
 
-        for pid in child_pids.iter().copied() {
-            if let Some(child) = ProcessManager::find_task_by_vpid(pid) {
-                *child.parent_pcb.write_irqsave() = Arc::downgrade(&reaper);
-                *child.real_parent_pcb.write_irqsave() = Arc::downgrade(&reaper);
-                let parent_pid_in_child_ns = reaper
-                    .task_pid_nr_ns(PidType::PID, Some(child.active_pid_ns()))
-                    .unwrap_or(RawPid::new(0));
-                child.basic.write_irqsave().ppid = parent_pid_in_child_ns;
-
-                // 按 wait 语义，将被收养子进程挂到收养者（线程组 leader）的 children 列表中。
-                let child_vpid_in_reaper_ns = child
-                    .task_pid_nr_ns(PidType::PID, Some(reaper.active_pid_ns()))
-                    .unwrap_or(RawPid::new(0));
-                if child_vpid_in_reaper_ns.data() != 0 {
-                    reaper.children.write().push(child_vpid_in_reaper_ns);
-                }
-            }
+        for child in children {
+            ProcessControlBlock::reparent_child_to(&child, &reaper);
         }
 
         Ok(())
     }
 
-    fn notify_parent_exit_for_children(&self, child_pids: &[RawPid]) {
-        for pid in child_pids {
-            if let Some(child) = ProcessManager::find_task_by_vpid(*pid) {
-                let sig = child.pdeath_signal();
-                if sig == Signal::INVALID {
-                    continue;
-                }
-                if let Err(e) = crate::ipc::kill::send_signal_to_pcb(child.clone(), sig) {
-                    warn!(
-                        "adopt_childen: failed to deliver pdeath_signal {:?} to child {:?}: {:?}",
-                        sig,
-                        child.raw_pid(),
-                        e
-                    );
-                }
+    fn notify_parent_exit_for_children(&self, children: &[Arc<ProcessControlBlock>]) {
+        for child in children {
+            let sig = child.pdeath_signal();
+            if sig == Signal::INVALID {
+                continue;
+            }
+            if let Err(e) = crate::ipc::kill::send_signal_to_pcb(child.clone(), sig) {
+                warn!(
+                    "adopt_childen: failed to deliver pdeath_signal {:?} to child {:?}: {:?}",
+                    sig,
+                    child.raw_pid(),
+                    e
+                );
             }
         }
     }

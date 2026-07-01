@@ -4544,6 +4544,12 @@ static int ext_test_shared_mmap_dirty_then_pwrite_keeps_latest_data() {
     void *addr = MAP_FAILED;
     volatile char c = 0;
     pid_t daemon = -1;
+    bool saw_direct_pwrite = false;
+    bool saw_cache_writeback = false;
+    int direct_pwrite_index = -1;
+    int stale_cover_index = -1;
+    unsigned char stale_cover_byte = 0;
+    uint32_t traced_writes = 0;
     struct dirty_pwrite_shared_state {
         volatile int stop;
         volatile int init_done;
@@ -4553,6 +4559,12 @@ static int ext_test_shared_mmap_dirty_then_pwrite_keeps_latest_data() {
         volatile uint32_t last_write_size;
         volatile uint32_t last_write_flags;
         volatile unsigned char last_write_watch_byte;
+        volatile uint64_t write_offsets[8];
+        volatile uint32_t write_sizes[8];
+        volatile uint32_t write_flags[8];
+        volatile unsigned char write_watch_bytes[8];
+        volatile unsigned char write_covers_watch[8];
+        volatile unsigned char backend_watch_byte;
     };
     struct dirty_pwrite_shared_state *shared =
         (struct dirty_pwrite_shared_state *)mmap(NULL, sizeof(*shared), PROT_READ | PROT_WRITE,
@@ -4599,6 +4611,13 @@ static int ext_test_shared_mmap_dirty_then_pwrite_keeps_latest_data() {
         child_args.last_write_size = &shared->last_write_size;
         child_args.last_write_flags = &shared->last_write_flags;
         child_args.last_write_watch_byte = &shared->last_write_watch_byte;
+        child_args.write_offsets = shared->write_offsets;
+        child_args.write_sizes = shared->write_sizes;
+        child_args.write_flags = shared->write_flags;
+        child_args.write_watch_bytes = shared->write_watch_bytes;
+        child_args.write_covers_watch = shared->write_covers_watch;
+        child_args.backend_watch_byte = &shared->backend_watch_byte;
+        child_args.write_trace_capacity = 8;
         child_args.write_watch_offset = 1;
         child_args.next_open_fh = 901;
         fuse_daemon_thread(&child_args);
@@ -4654,13 +4673,54 @@ static int ext_test_shared_mmap_dirty_then_pwrite_keeps_latest_data() {
         printf("[FAIL] msync(shared dirty pwrite): %s (errno=%d)\n", strerror(errno), errno);
         goto fail;
     }
-    if (shared->write_count < 2 || shared->last_write_offset != 0 ||
-        shared->last_write_size != 16 || shared->last_write_flags != FUSE_WRITE_CACHE ||
-        shared->last_write_watch_byte != 'P') {
-        printf("[FAIL] dirty mmap pwrite counters read=%u write=%u off=%llu size=%u flags=%u watched=%u\n",
-               shared->read_count, shared->write_count,
+    __sync_synchronize();
+    traced_writes = shared->write_count;
+    if (traced_writes > 8) {
+        printf("[FAIL] dirty mmap pwrite write trace truncated read=%u write=%u\n",
+               shared->read_count, traced_writes);
+        goto fail;
+    }
+
+    saw_direct_pwrite = false;
+    saw_cache_writeback = false;
+    direct_pwrite_index = -1;
+    stale_cover_index = -1;
+    stale_cover_byte = 0;
+    for (uint32_t i = 0; i < traced_writes; ++i) {
+        uint64_t off = shared->write_offsets[i];
+        uint32_t size = shared->write_sizes[i];
+        uint32_t flags = shared->write_flags[i];
+        unsigned char watch = shared->write_watch_bytes[i];
+        bool covers_watch = shared->write_covers_watch[i] != 0;
+
+        if (off == 1 && size == 1 && flags == 0 && watch == 'P') {
+            saw_direct_pwrite = true;
+            direct_pwrite_index = (int)i;
+        }
+        if (off == 0 && size == 16 && flags == FUSE_WRITE_CACHE && covers_watch) {
+            saw_cache_writeback = true;
+        }
+        if (direct_pwrite_index >= 0 && (int)i > direct_pwrite_index && covers_watch &&
+            watch != 'P') {
+            stale_cover_index = (int)i;
+            stale_cover_byte = watch;
+        }
+    }
+
+    if (traced_writes < 2 || !saw_direct_pwrite || !saw_cache_writeback ||
+        stale_cover_index >= 0 || shared->backend_watch_byte != 'P') {
+        printf("[FAIL] dirty mmap pwrite counters read=%u write=%u last_off=%llu last_size=%u last_flags=%u last_watched=%u backend=%u saw_pwrite=%d saw_cache=%d stale_index=%d stale_byte=%u\n",
+               shared->read_count, traced_writes,
                (unsigned long long)shared->last_write_offset, shared->last_write_size,
-               shared->last_write_flags, shared->last_write_watch_byte);
+               shared->last_write_flags, shared->last_write_watch_byte,
+               shared->backend_watch_byte, saw_direct_pwrite ? 1 : 0,
+               saw_cache_writeback ? 1 : 0, stale_cover_index, stale_cover_byte);
+        for (uint32_t i = 0; i < traced_writes; ++i) {
+            printf("[FAIL] dirty mmap pwrite write[%u] off=%llu size=%u flags=%u covers=%u watched=%u\n",
+                   i, (unsigned long long)shared->write_offsets[i], shared->write_sizes[i],
+                   shared->write_flags[i], shared->write_covers_watch[i],
+                   shared->write_watch_bytes[i]);
+        }
         goto fail;
     }
 

@@ -346,34 +346,62 @@ struct SubreaperAliveArgs {
   int ready_fd = -1;
   int intermediate_release_fd = -1;
   int grandchild_release_fd = -1;
+  int result_fd = -1;
   pid_t intermediate = -1;
   pid_t grandchild = -1;
 };
+
+void ReportSubreaperResult(SubreaperAliveArgs* args, int code) {
+  if (args != nullptr && args->result_fd >= 0) {
+    WriteExact(args->result_fd, &code, sizeof(code));
+  }
+  ExitGroup(code);
+}
 
 void* SubreaperLeaderExitSibling(void* arg) {
   auto* args = reinterpret_cast<SubreaperAliveArgs*>(arg);
   char byte = 0;
   if (read(args->ready_fd, &byte, 1) != 1) {
-    ExitGroup(70);
+    ReportSubreaperResult(args, 70);
   }
 
   pid_t grandchild = args->grandchild;
   if (grandchild <= 0) {
-    ExitGroup(71);
-  }
-
-  usleep(50000);
-  if (write(args->intermediate_release_fd, "i", 1) != 1) {
-    ExitGroup(72);
+    ReportSubreaperResult(args, 71);
   }
 
   int status = 0;
+  bool intermediate_reparented = false;
+  for (int i = 0; i < 1000; ++i) {
+    errno = 0;
+    pid_t ret =
+        wait4(args->intermediate, &status, __WNOTHREAD | WNOHANG, nullptr);
+    if (ret == 0) {
+      intermediate_reparented = true;
+      break;
+    }
+    if (ret == args->intermediate) {
+      ReportSubreaperResult(args, 72);
+    }
+    if (errno != ECHILD) {
+      ReportSubreaperResult(args, 73);
+    }
+    usleep(1000);
+  }
+  if (!intermediate_reparented) {
+    ReportSubreaperResult(args, 74);
+  }
+
+  if (write(args->intermediate_release_fd, "i", 1) != 1) {
+    ReportSubreaperResult(args, 75);
+  }
+
   pid_t ret = wait4(args->intermediate, &status, __WNOTHREAD, nullptr);
   if (ret != args->intermediate) {
-    ExitGroup(73);
+    ReportSubreaperResult(args, 76);
   }
   if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-    ExitGroup(74);
+    ReportSubreaperResult(args, 77);
   }
 
   status = 0;
@@ -386,30 +414,30 @@ void* SubreaperLeaderExitSibling(void* arg) {
       break;
     }
     if (ret == grandchild) {
-      ExitGroup(75);
+      ReportSubreaperResult(args, 78);
     }
     if (errno != ECHILD) {
-      ExitGroup(76);
+      ReportSubreaperResult(args, 79);
     }
     usleep(1000);
   }
   if (!reparented) {
-    ExitGroup(77);
+    ReportSubreaperResult(args, 80);
   }
 
   if (write(args->grandchild_release_fd, "g", 1) != 1) {
-    ExitGroup(78);
+    ReportSubreaperResult(args, 81);
   }
 
   status = 0;
   ret = wait4(grandchild, &status, __WNOTHREAD, nullptr);
   if (ret != grandchild) {
-    ExitGroup(79);
+    ReportSubreaperResult(args, 82);
   }
   if (!WIFEXITED(status)) {
-    ExitGroup(80);
+    ReportSubreaperResult(args, 83);
   }
-  ExitGroup(WEXITSTATUS(status));
+  ReportSubreaperResult(args, WEXITSTATUS(status));
   return nullptr;
 }
 
@@ -977,9 +1005,13 @@ TEST(WaitRusage, TracemeAfterLeaderReparentUsesLiveThread) {
 }
 
 TEST(WaitRusage, SubreaperLeaderExitUsesAliveThread) {
+  int result_pipe[2] = {};
+  ASSERT_EQ(0, pipe(result_pipe)) << strerror(errno);
+
   pid_t helper = fork();
   ASSERT_GE(helper, 0) << strerror(errno);
   if (helper == 0) {
+    close(result_pipe[0]);
     if (prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0) {
       _exit(10);
     }
@@ -1003,6 +1035,7 @@ TEST(WaitRusage, SubreaperLeaderExitUsesAliveThread) {
     args->ready_fd = ready_pipe[0];
     args->intermediate_release_fd = intermediate_release_pipe[1];
     args->grandchild_release_fd = grandchild_release_pipe[1];
+    args->result_fd = result_pipe[1];
 
     pthread_t sibling {};
     if (pthread_create(&sibling, nullptr, SubreaperLeaderExitSibling, args) !=
@@ -1050,10 +1083,15 @@ TEST(WaitRusage, SubreaperLeaderExitUsesAliveThread) {
     _exit(17);
   }
 
+  close(result_pipe[1]);
+  int sibling_result = -1;
+  ASSERT_TRUE(ReadExact(result_pipe[0], &sibling_result, sizeof(sibling_result)))
+      << strerror(errno);
+  EXPECT_EQ(37, sibling_result);
+
   int status = 0;
   ASSERT_EQ(helper, waitpid(helper, &status, 0)) << strerror(errno);
   ASSERT_TRUE(WIFEXITED(status)) << status;
-  EXPECT_EQ(37, WEXITSTATUS(status));
 }
 
 TEST(WaitRusage, ConcurrentExitingThreadsDoNotKeepChildOnDyingReaper) {

@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -38,6 +39,10 @@
 
 #ifndef P_PIDFD
 #define P_PIDFD 3
+#endif
+
+#ifndef PR_SET_CHILD_SUBREAPER
+#define PR_SET_CHILD_SUBREAPER 36
 #endif
 
 #ifndef CLONE_PARENT
@@ -334,6 +339,128 @@ void* TracemeAfterLeaderExitSibling(void* arg) {
     ExitGroup(67);
   }
   ExitGroup(WEXITSTATUS(status));
+  return nullptr;
+}
+
+struct SubreaperAliveArgs {
+  int ready_fd = -1;
+  int intermediate_release_fd = -1;
+  int grandchild_release_fd = -1;
+  pid_t intermediate = -1;
+  pid_t grandchild = -1;
+};
+
+void* SubreaperLeaderExitSibling(void* arg) {
+  auto* args = reinterpret_cast<SubreaperAliveArgs*>(arg);
+  char byte = 0;
+  if (read(args->ready_fd, &byte, 1) != 1) {
+    ExitGroup(70);
+  }
+
+  pid_t grandchild = args->grandchild;
+  if (grandchild <= 0) {
+    ExitGroup(71);
+  }
+
+  usleep(50000);
+  if (write(args->intermediate_release_fd, "i", 1) != 1) {
+    ExitGroup(72);
+  }
+
+  int status = 0;
+  pid_t ret = wait4(args->intermediate, &status, __WNOTHREAD, nullptr);
+  if (ret != args->intermediate) {
+    ExitGroup(73);
+  }
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    ExitGroup(74);
+  }
+
+  status = 0;
+  bool reparented = false;
+  for (int i = 0; i < 1000; ++i) {
+    errno = 0;
+    ret = wait4(grandchild, &status, __WNOTHREAD | WNOHANG, nullptr);
+    if (ret == 0) {
+      reparented = true;
+      break;
+    }
+    if (ret == grandchild) {
+      ExitGroup(75);
+    }
+    if (errno != ECHILD) {
+      ExitGroup(76);
+    }
+    usleep(1000);
+  }
+  if (!reparented) {
+    ExitGroup(77);
+  }
+
+  if (write(args->grandchild_release_fd, "g", 1) != 1) {
+    ExitGroup(78);
+  }
+
+  status = 0;
+  ret = wait4(grandchild, &status, __WNOTHREAD, nullptr);
+  if (ret != grandchild) {
+    ExitGroup(79);
+  }
+  if (!WIFEXITED(status)) {
+    ExitGroup(80);
+  }
+  ExitGroup(WEXITSTATUS(status));
+  return nullptr;
+}
+
+struct ConcurrentExitArgs {
+  int ready_fd = -1;
+  int exit_fd = -1;
+  int child_release_fd = -1;
+  pid_t child = -1;
+  int fork_errno = 0;
+};
+
+void* ForkChildThenConcurrentExit(void* arg) {
+  auto* args = reinterpret_cast<ConcurrentExitArgs*>(arg);
+  pid_t child = fork();
+  if (child == 0) {
+    char release = 0;
+    if (read(args->child_release_fd, &release, 1) != 1) {
+      _exit(32);
+    }
+    _exit(41);
+  }
+  if (child < 0) {
+    args->fork_errno = errno;
+  } else {
+    args->child = child;
+  }
+
+  char byte = child < 0 ? 'e' : 'a';
+  if (write(args->ready_fd, &byte, 1) != 1) {
+    args->fork_errno = errno;
+  }
+
+  char release = 0;
+  if (read(args->exit_fd, &release, 1) != 1) {
+    syscall(SYS_exit, 21);
+  }
+  syscall(SYS_exit, 0);
+  return nullptr;
+}
+
+void* ConcurrentExitOnlyThread(void* arg) {
+  auto* args = reinterpret_cast<ConcurrentExitArgs*>(arg);
+  if (write(args->ready_fd, "b", 1) != 1) {
+    syscall(SYS_exit, 22);
+  }
+
+  char release = 0;
+  if (read(args->exit_fd, &release, 1) != 1) {
+    syscall(SYS_exit, 23);
+  }
+  syscall(SYS_exit, 0);
   return nullptr;
 }
 
@@ -847,6 +974,181 @@ TEST(WaitRusage, TracemeAfterLeaderReparentUsesLiveThread) {
   ASSERT_EQ(helper, waitpid(helper, &status, 0)) << strerror(errno);
   ASSERT_TRUE(WIFEXITED(status)) << status;
   EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+TEST(WaitRusage, SubreaperLeaderExitUsesAliveThread) {
+  pid_t helper = fork();
+  ASSERT_GE(helper, 0) << strerror(errno);
+  if (helper == 0) {
+    if (prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0) {
+      _exit(10);
+    }
+
+    auto* args = static_cast<SubreaperAliveArgs*>(
+        malloc(sizeof(SubreaperAliveArgs)));
+    if (args == nullptr) {
+      _exit(11);
+    }
+    new (args) SubreaperAliveArgs();
+
+    int ready_pipe[2] = {};
+    int intermediate_release_pipe[2] = {};
+    int grandchild_release_pipe[2] = {};
+    int pid_pipe[2] = {};
+    if (pipe(ready_pipe) != 0 || pipe(intermediate_release_pipe) != 0 ||
+        pipe(grandchild_release_pipe) != 0 || pipe(pid_pipe) != 0) {
+      _exit(12);
+    }
+
+    args->ready_fd = ready_pipe[0];
+    args->intermediate_release_fd = intermediate_release_pipe[1];
+    args->grandchild_release_fd = grandchild_release_pipe[1];
+
+    pthread_t sibling {};
+    if (pthread_create(&sibling, nullptr, SubreaperLeaderExitSibling, args) !=
+        0) {
+      _exit(13);
+    }
+
+    pid_t intermediate = fork();
+    if (intermediate == 0) {
+      pid_t grandchild = fork();
+      if (grandchild == 0) {
+        char release = 0;
+        if (read(grandchild_release_pipe[0], &release, 1) != 1) {
+          _exit(30);
+        }
+        _exit(37);
+      }
+      if (grandchild < 0) {
+        _exit(31);
+      }
+      if (!WriteExact(pid_pipe[1], &grandchild, sizeof(grandchild))) {
+        _exit(32);
+      }
+      char release = 0;
+      if (read(intermediate_release_pipe[0], &release, 1) != 1) {
+        _exit(33);
+      }
+      _exit(0);
+    }
+    if (intermediate < 0) {
+      _exit(14);
+    }
+
+    pid_t grandchild = -1;
+    if (!ReadExact(pid_pipe[0], &grandchild, sizeof(grandchild))) {
+      _exit(15);
+    }
+    args->intermediate = intermediate;
+    args->grandchild = grandchild;
+    if (write(ready_pipe[1], "r", 1) != 1) {
+      _exit(16);
+    }
+
+    syscall(SYS_exit, 0);
+    _exit(17);
+  }
+
+  int status = 0;
+  ASSERT_EQ(helper, waitpid(helper, &status, 0)) << strerror(errno);
+  ASSERT_TRUE(WIFEXITED(status)) << status;
+  EXPECT_EQ(37, WEXITSTATUS(status));
+}
+
+TEST(WaitRusage, ConcurrentExitingThreadsDoNotKeepChildOnDyingReaper) {
+  for (int iter = 0; iter < 20; ++iter) {
+    pid_t helper = fork();
+    ASSERT_GE(helper, 0) << strerror(errno);
+    if (helper == 0) {
+      auto* args = static_cast<ConcurrentExitArgs*>(
+          malloc(sizeof(ConcurrentExitArgs)));
+      if (args == nullptr) {
+        _exit(10);
+      }
+      new (args) ConcurrentExitArgs();
+
+      int ready_pipe[2] = {};
+      int exit_pipe[2] = {};
+      int child_release_pipe[2] = {};
+      if (pipe(ready_pipe) != 0 || pipe(exit_pipe) != 0 ||
+          pipe(child_release_pipe) != 0) {
+        _exit(11);
+      }
+
+      args->ready_fd = ready_pipe[1];
+      args->exit_fd = exit_pipe[0];
+      args->child_release_fd = child_release_pipe[0];
+
+      pthread_t fork_thread {};
+      pthread_t exit_thread {};
+      if (pthread_create(&fork_thread, nullptr, ForkChildThenConcurrentExit,
+                         args) != 0) {
+        _exit(12);
+      }
+      if (pthread_create(&exit_thread, nullptr, ConcurrentExitOnlyThread,
+                         args) != 0) {
+        _exit(13);
+      }
+
+      char ready[2] = {};
+      if (!ReadExact(ready_pipe[0], ready, sizeof(ready))) {
+        _exit(14);
+      }
+      if (args->fork_errno != 0 || args->child <= 0) {
+        _exit(15);
+      }
+
+      if (!WriteExact(exit_pipe[1], "xx", 2)) {
+        _exit(16);
+      }
+      if (pthread_join(fork_thread, nullptr) != 0 ||
+          pthread_join(exit_thread, nullptr) != 0) {
+        _exit(17);
+      }
+
+      int status = 0;
+      bool waitable = false;
+      for (int i = 0; i < 1000; ++i) {
+        errno = 0;
+        pid_t ret = wait4(args->child, &status, __WNOTHREAD | WNOHANG,
+                          nullptr);
+        if (ret == 0) {
+          waitable = true;
+          break;
+        }
+        if (ret == args->child) {
+          _exit(18);
+        }
+        if (errno != ECHILD) {
+          _exit(19);
+        }
+        usleep(1000);
+      }
+      if (!waitable) {
+        _exit(20);
+      }
+
+      if (write(child_release_pipe[1], "c", 1) != 1) {
+        _exit(21);
+      }
+
+      status = 0;
+      pid_t ret = wait4(args->child, &status, __WNOTHREAD, nullptr);
+      if (ret != args->child) {
+        _exit(22);
+      }
+      if (!WIFEXITED(status)) {
+        _exit(23);
+      }
+      _exit(WEXITSTATUS(status));
+    }
+
+    int status = 0;
+    ASSERT_EQ(helper, waitpid(helper, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status)) << "iter=" << iter << " status=" << status;
+    EXPECT_EQ(41, WEXITSTATUS(status)) << "iter=" << iter;
+  }
 }
 
 TEST(WaitRusage, NaturalWaitCannotReapThreadTid) {

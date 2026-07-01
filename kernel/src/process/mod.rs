@@ -2431,7 +2431,18 @@ impl ProcessControlBlock {
     }
 
     fn is_alive_reparent_target(pcb: &Arc<ProcessControlBlock>) -> bool {
-        !pcb.is_exited() && !pcb.is_zombie() && !pcb.is_dead()
+        !pcb.flags().contains(ProcessFlags::EXITING)
+            && !pcb.is_exited()
+            && !pcb.is_zombie()
+            && !pcb.is_dead()
+    }
+
+    fn find_alive_thread_in_group(
+        pcb: Arc<ProcessControlBlock>,
+    ) -> Option<Arc<ProcessControlBlock>> {
+        ProcessManager::thread_group_tasks_snapshot(pcb)
+            .into_iter()
+            .find(ProcessControlBlock::is_alive_reparent_target)
     }
 
     fn find_alive_thread_reaper(
@@ -2477,6 +2488,13 @@ impl ProcessControlBlock {
         new_parent: &Arc<ProcessControlBlock>,
     ) {
         let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
+        ProcessControlBlock::reparent_child_to_locked(child, new_parent);
+    }
+
+    fn reparent_child_to_locked(
+        child: &Arc<ProcessControlBlock>,
+        new_parent: &Arc<ProcessControlBlock>,
+    ) {
         *child.parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
         *child.real_parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
         *child.wait_parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
@@ -2519,6 +2537,8 @@ impl ProcessControlBlock {
     fn collect_children_for_exit(
         exiting: &Arc<ProcessControlBlock>,
     ) -> Vec<Arc<ProcessControlBlock>> {
+        // Caller holds PTRACE_RELATION_LOCK so collecting children, selecting a
+        // reaper, and moving children form one tasklist-lock-like transaction.
         let mut result = Vec::new();
         let mut seen = Vec::new();
 
@@ -2562,7 +2582,7 @@ impl ProcessControlBlock {
                         && wait_parent.tgid == exiting.tgid
                         && ProcessControlBlock::is_alive_reparent_target(&wait_parent)
                     {
-                        ProcessControlBlock::reparent_child_to(&child, &wait_parent);
+                        ProcessControlBlock::reparent_child_to_locked(&child, &wait_parent);
                         continue;
                     }
                 }
@@ -2577,6 +2597,7 @@ impl ProcessControlBlock {
     /// 当前进程退出时，让其他线程、subreaper 或 init 收养其子进程。
     unsafe fn adopt_childen(&self) -> Result<(), SystemError> {
         let exiting = self.self_ref.upgrade().ok_or(SystemError::ESRCH)?;
+        let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
         let children = ProcessControlBlock::collect_children_for_exit(&exiting);
 
         if children.is_empty() {
@@ -2587,12 +2608,14 @@ impl ProcessControlBlock {
 
         if let Some(reaper) = ProcessControlBlock::find_alive_thread_reaper(&exiting) {
             for child in children {
-                ProcessControlBlock::reparent_child_to(&child, &reaper);
+                ProcessControlBlock::reparent_child_to_locked(&child, &reaper);
             }
             return Ok(());
         }
 
-        let init_pcb = ProcessManager::find_task_by_vpid(RawPid(1)).ok_or(SystemError::ECHILD)?;
+        let exiting_ns = exiting.active_pid_ns();
+        let init_pcb = ProcessManager::find_task_by_pid_ns(RawPid(1), &exiting_ns)
+            .ok_or(SystemError::ECHILD)?;
 
         // 如果当前进程是 namespace 的 init，则由父进程所在 pidns 的 init 去收养。
         if Arc::ptr_eq(&exiting, &init_pcb) {
@@ -2606,7 +2629,7 @@ impl ProcessControlBlock {
                     ProcessManager::find_task_by_pid_ns(RawPid(1), &parent_pcb.active_pid_ns());
                 if let Some(parent_init) = parent_init {
                     for child in children {
-                        ProcessControlBlock::reparent_child_to(&child, &parent_init);
+                        ProcessControlBlock::reparent_child_to_locked(&child, &parent_init);
                     }
                 }
             }
@@ -2615,7 +2638,7 @@ impl ProcessControlBlock {
 
         // 常规情况：优先 reparent 到“最近祖先 subreaper”，否则 reparent 到 init。
         let mut reaper: Arc<ProcessControlBlock> = init_pcb.clone();
-        let mut cursor = self.parent_pcb();
+        let mut cursor = self.real_parent_pcb();
         while let Some(p) = cursor {
             // Linux 语义：child_subreaper 是线程组级；这里统一按线程组 leader 判定。
             let leader = {
@@ -2623,20 +2646,32 @@ impl ProcessControlBlock {
                 ti.group_leader().unwrap_or_else(|| p.clone())
             };
 
+            let visible_in_exiting_ns = leader
+                .task_pid_nr_ns(PidType::PID, Some(exiting_ns.clone()))
+                .is_some_and(|pid| pid.data() != 0);
+            // Linux uses task_pid(reaper)->level == ns_level. DragonOS exposes
+            // this through active pidns level plus visibility in exiting_ns.
+            if !visible_in_exiting_ns || leader.active_pid_ns().level() != exiting_ns.level() {
+                break;
+            }
+
             if leader.sig_info_irqsave().is_child_subreaper() {
-                reaper = leader;
+                if let Some(alive) = ProcessControlBlock::find_alive_thread_in_group(leader.clone())
+                {
+                    reaper = alive;
+                    break;
+                }
+            }
+
+            if Arc::ptr_eq(&leader, &init_pcb) {
                 break;
             }
 
-            if leader.raw_pid() == RawPid(1) {
-                break;
-            }
-
-            cursor = leader.parent_pcb();
+            cursor = leader.real_parent_pcb();
         }
 
         for child in children {
-            ProcessControlBlock::reparent_child_to(&child, &reaper);
+            ProcessControlBlock::reparent_child_to_locked(&child, &reaper);
         }
 
         Ok(())

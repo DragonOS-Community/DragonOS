@@ -1699,6 +1699,13 @@ pub struct ProcessControlBlock {
     /// task_struct::parent，而 DragonOS 的 parent_pcb/real_parent_pcb 按线程组
     /// leader 建模。该字段保留 wait 所需的线程级父关系。
     pub(crate) wait_parent_pcb: RwLock<Weak<ProcessControlBlock>>,
+    /// Thread-level natural-parent compensation for PTRACE_TRACEME.
+    ///
+    /// On normal fork it points to the creating thread, compensating for the
+    /// fact that real_parent_pcb is still modeled on the thread-group leader.
+    /// After CLONE_PARENT, reparent, and de_thread it must be updated to follow
+    /// Linux real_parent semantics. It is NOT an immutable “first-fork creator”
+    /// record.
     pub(crate) fork_parent_pcb: RwLock<Weak<ProcessControlBlock>>,
 
     /// 子进程链表
@@ -2469,9 +2476,11 @@ impl ProcessControlBlock {
         child: &Arc<ProcessControlBlock>,
         new_parent: &Arc<ProcessControlBlock>,
     ) {
+        let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
         *child.parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
         *child.real_parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
         *child.wait_parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
+        *child.fork_parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
 
         let parent_pid_in_child_ns = new_parent
             .task_pid_nr_ns(PidType::PID, Some(child.active_pid_ns()))

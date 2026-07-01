@@ -31,7 +31,7 @@ use super::{
     account_successful_fork, alloc_pid, inc_visible_thread_count,
     kthread::{KernelThreadPcbPrivate, WorkerPrivate},
     pid::{Pid, PidType},
-    KernelStack, ProcessControlBlock, ProcessManager, RawPid,
+    KernelStack, ProcessControlBlock, ProcessManager, RawPid, PTRACE_RELATION_LOCK,
 };
 pub const MAX_PID_NS_LEVEL: usize = 32;
 
@@ -829,21 +829,23 @@ impl ProcessManager {
             ti.group_leader().unwrap_or_else(|| current_pcb.clone())
         };
 
-        *pcb.fork_parent_pcb.write_irqsave() = Arc::downgrade(current_pcb);
-
-        if clone_flags.contains(CloneFlags::CLONE_THREAD) {
-            *pcb.parent_pcb.write_irqsave() = current_pcb.parent_pcb.read_irqsave().clone();
-            *pcb.real_parent_pcb.write_irqsave() =
-                current_pcb.real_parent_pcb.read_irqsave().clone();
-            *pcb.wait_parent_pcb.write_irqsave() = current_pcb.parent_pcb.read_irqsave().clone();
-            pcb.exit_signal.store(-1, Ordering::SeqCst);
-        } else {
-            if clone_flags.contains(CloneFlags::CLONE_PARENT) {
-                let parent = current_pcb.parent_pcb.read_irqsave().clone();
-                *pcb.parent_pcb.write_irqsave() = parent.clone();
-                *pcb.real_parent_pcb.write_irqsave() =
-                    current_pcb.real_parent_pcb.read_irqsave().clone();
-                *pcb.wait_parent_pcb.write_irqsave() = parent;
+        {
+            let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
+            if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                let inherited_parent = current_pcb.parent_pcb.read_irqsave().clone();
+                let inherited_real_parent = current_pcb.real_parent_pcb.read_irqsave().clone();
+                *pcb.parent_pcb.write_irqsave() = inherited_parent;
+                *pcb.real_parent_pcb.write_irqsave() = inherited_real_parent.clone();
+                *pcb.wait_parent_pcb.write_irqsave() = inherited_real_parent.clone();
+                *pcb.fork_parent_pcb.write_irqsave() = inherited_real_parent;
+                pcb.exit_signal.store(-1, Ordering::SeqCst);
+            } else if clone_flags.contains(CloneFlags::CLONE_PARENT) {
+                let inherited_parent = current_pcb.parent_pcb.read_irqsave().clone();
+                let inherited_real_parent = current_pcb.real_parent_pcb.read_irqsave().clone();
+                *pcb.parent_pcb.write_irqsave() = inherited_parent;
+                *pcb.real_parent_pcb.write_irqsave() = inherited_real_parent.clone();
+                *pcb.wait_parent_pcb.write_irqsave() = inherited_real_parent.clone();
+                *pcb.fork_parent_pcb.write_irqsave() = inherited_real_parent;
                 pcb.exit_signal.store(
                     current_leader.exit_signal.load(Ordering::SeqCst),
                     Ordering::SeqCst,
@@ -852,15 +854,18 @@ impl ProcessManager {
                 *pcb.parent_pcb.write_irqsave() = Arc::downgrade(&current_leader);
                 *pcb.real_parent_pcb.write_irqsave() = Arc::downgrade(&current_leader);
                 *pcb.wait_parent_pcb.write_irqsave() = Arc::downgrade(current_pcb);
+                *pcb.fork_parent_pcb.write_irqsave() = Arc::downgrade(current_pcb);
                 pcb.exit_signal
                     .store(clone_args.exit_signal, Ordering::SeqCst);
             }
 
-            if let Some(parent) = pcb.parent_pcb() {
-                let ppid_in_child_ns = parent
-                    .task_pid_nr_ns(PidType::PID, Some(pcb.active_pid_ns()))
-                    .unwrap_or(RawPid::new(0));
-                pcb.basic.write_irqsave().ppid = ppid_in_child_ns;
+            if !clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                if let Some(parent) = pcb.parent_pcb() {
+                    let ppid_in_child_ns = parent
+                        .task_pid_nr_ns(PidType::PID, Some(pcb.active_pid_ns()))
+                        .unwrap_or(RawPid::new(0));
+                    pcb.basic.write_irqsave().ppid = ppid_in_child_ns;
+                }
             }
         }
 

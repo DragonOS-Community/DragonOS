@@ -19,7 +19,7 @@ use super::{
     namespace::nsproxy::exec_task_namespaces,
     pid::PidType,
     shebang::{ShebangLoader, SHEBANG_LOADER, SHEBANG_MAX_RECURSION_DEPTH},
-    ProcessControlBlock, ProcessFlags, ProcessManager,
+    ProcessControlBlock, ProcessFlags, ProcessManager, PTRACE_RELATION_LOCK,
 };
 
 /// 系统支持的所有二进制文件加载器的列表
@@ -486,12 +486,15 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
                 );
             }
 
-            // 继承 old leader 的父进程关系
-            let leader_parent = leader.real_parent_pcb.read().clone();
-            *current.parent_pcb.write() = leader_parent.clone();
-            *current.real_parent_pcb.write() = leader_parent.clone();
-            *current.wait_parent_pcb.write() = leader_parent;
-            *current.fork_parent_pcb.write() = current.self_ref.clone();
+            // Inherit parent process relationships from the old leader
+            {
+                let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
+                let leader_parent = leader.real_parent_pcb.read_irqsave().clone();
+                *current.parent_pcb.write_irqsave() = leader_parent.clone();
+                *current.real_parent_pcb.write_irqsave() = leader_parent.clone();
+                *current.wait_parent_pcb.write_irqsave() = leader_parent.clone();
+                *current.fork_parent_pcb.write_irqsave() = leader_parent;
+            }
 
             // log::info!("de_thread: reparented current to old leader's parent");
 

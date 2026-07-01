@@ -3,6 +3,7 @@
 #endif
 
 #include <errno.h>
+#include <new>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -273,6 +274,66 @@ void* ForkTracemeAndWaitFromThread(void* arg) {
   if (args->result < 0) {
     args->err = errno;
   }
+  return nullptr;
+}
+
+void ExitGroup(int code) {
+  syscall(SYS_exit_group, code);
+  _exit(code);
+}
+
+struct TracemeReparentArgs {
+  int ready_fd = -1;
+  int release_fd = -1;
+  pid_t child = -1;
+};
+
+void* TracemeAfterLeaderExitSibling(void* arg) {
+  auto* args = reinterpret_cast<TracemeReparentArgs*>(arg);
+  char byte = 0;
+  if (read(args->ready_fd, &byte, 1) != 1) {
+    ExitGroup(60);
+  }
+
+  pid_t child = args->child;
+  if (child <= 0) {
+    ExitGroup(61);
+  }
+
+  bool reparented = false;
+  int status = 0;
+  for (int i = 0; i < 1000; ++i) {
+    errno = 0;
+    pid_t ret = wait4(child, &status, __WNOTHREAD | WNOHANG, nullptr);
+    if (ret == 0) {
+      reparented = true;
+      break;
+    }
+    if (ret == child) {
+      ExitGroup(62);
+    }
+    if (errno != ECHILD) {
+      ExitGroup(63);
+    }
+    usleep(1000);
+  }
+  if (!reparented) {
+    ExitGroup(64);
+  }
+
+  if (write(args->release_fd, "x", 1) != 1) {
+    ExitGroup(65);
+  }
+
+  status = 0;
+  pid_t ret = wait4(child, &status, __WALL, nullptr);
+  if (ret != child) {
+    ExitGroup(66);
+  }
+  if (!WIFEXITED(status)) {
+    ExitGroup(67);
+  }
+  ExitGroup(WEXITSTATUS(status));
   return nullptr;
 }
 
@@ -725,6 +786,67 @@ TEST(WaitRusage, ThreadForkedTracemeIsWaitableByForkingThreadWithWclone) {
   EXPECT_GT(args.result, 0) << strerror(args.err);
   ASSERT_TRUE(WIFEXITED(args.status));
   EXPECT_EQ(0, WEXITSTATUS(args.status));
+}
+
+TEST(WaitRusage, TracemeAfterLeaderReparentUsesLiveThread) {
+  pid_t helper = fork();
+  ASSERT_GE(helper, 0) << strerror(errno);
+  if (helper == 0) {
+    auto* args = static_cast<TracemeReparentArgs*>(
+        malloc(sizeof(TracemeReparentArgs)));
+    if (args == nullptr) {
+      _exit(10);
+    }
+    new (args) TracemeReparentArgs();
+
+    int ready_pipe[2] = {};
+    int release_pipe[2] = {};
+    if (pipe(ready_pipe) != 0 || pipe(release_pipe) != 0) {
+      _exit(11);
+    }
+    args->ready_fd = ready_pipe[0];
+    args->release_fd = release_pipe[1];
+
+    pthread_t sibling {};
+    if (pthread_create(&sibling, nullptr, TracemeAfterLeaderExitSibling,
+                       args) != 0) {
+      _exit(12);
+    }
+
+    pid_t child = fork();
+    if (child == 0) {
+      close(ready_pipe[0]);
+      close(ready_pipe[1]);
+      close(release_pipe[1]);
+
+      char release = 0;
+      if (read(release_pipe[0], &release, 1) != 1) {
+        _exit(30);
+      }
+      if (syscall(SYS_ptrace, PTRACE_TRACEME, 0, 0, 0) != 0) {
+        _exit(40 + errno);
+      }
+      _exit(0);
+    }
+    if (child < 0) {
+      _exit(13);
+    }
+
+    close(release_pipe[0]);
+    args->child = child;
+    if (write(ready_pipe[1], "x", 1) != 1) {
+      _exit(14);
+    }
+    close(ready_pipe[1]);
+
+    syscall(SYS_exit, 0);
+    _exit(15);
+  }
+
+  int status = 0;
+  ASSERT_EQ(helper, waitpid(helper, &status, 0)) << strerror(errno);
+  ASSERT_TRUE(WIFEXITED(status)) << status;
+  EXPECT_EQ(0, WEXITSTATUS(status));
 }
 
 TEST(WaitRusage, NaturalWaitCannotReapThreadTid) {

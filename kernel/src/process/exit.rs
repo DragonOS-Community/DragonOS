@@ -9,7 +9,7 @@ use crate::{
     arch::ipc::signal::{SigChildCode, Signal},
     driver::tty::tty_core::TtyCore,
     ipc::signal_types::SignalFlags,
-    process::{pid::PidType, ptrace, wait::WaitSelector},
+    process::{namespace::user_namespace::map_id_up, pid::PidType, ptrace, wait::WaitSelector},
     syscall::user_access::UserBufferWriter,
 };
 
@@ -19,6 +19,8 @@ use super::{
     resource::{RUsage, RUsageWho},
     ProcessControlBlock, ProcessFlags, ProcessManager, RawPid,
 };
+
+const DEFAULT_OVERFLOW_UID: u32 = 65534;
 
 /// 将内核中保存的 wstatus（已经按 wait4 语义左移过的编码值）
 /// 转换为 waitid 语义下的 si_status（低 8 位退出码）。
@@ -174,13 +176,11 @@ fn wait_candidate_children(options: WaitOption) -> Vec<WaitCandidate> {
     let current = ProcessManager::current_pcb();
     let leader = get_thread_group_leader(&current);
 
-    let natural_owners = if options.contains(WaitOption::WNOTHREAD) {
-        // DragonOS stores natural children on the thread-group leader. Linux's
-        // __WNOTHREAD eligibility is still enforced later through fork_parent.
-        vec![leader.clone()]
-    } else {
-        ProcessManager::thread_group_tasks_snapshot(leader.clone())
-    };
+    // New children are normally inserted on the thread-group leader, but Linux
+    // reparenting can hand a dying thread's children to another live thread in
+    // the same group. Scan the whole group and let is_eligible_child() enforce
+    // __WNOTHREAD's exact wait parent check.
+    let natural_owners = ProcessManager::thread_group_tasks_snapshot(leader.clone());
 
     let mut candidates = Vec::new();
     for waiter in natural_owners {
@@ -236,6 +236,7 @@ pub struct KernelWaitOption<'a> {
 #[allow(dead_code)]
 pub struct WaitIdInfo {
     pub pid: RawPid,
+    pub uid: u32,
     pub status: i32,
     pub cause: i32,
 }
@@ -313,7 +314,7 @@ pub fn kernel_waitid(
             si._sifields = PosixSiginfoFields {
                 _sigchld: PosixSiginfoSigchld {
                     si_pid: info.pid.data() as i32,
-                    si_uid: 0,
+                    si_uid: info.uid,
                     si_status: info.status,
                     si_utime: 0,
                     si_stime: 0,
@@ -343,7 +344,7 @@ pub fn kernel_waitid(
 ///
 /// 根据 Linux wait 语义：
 /// - 默认情况下，线程组中的任何线程都可以等待同一线程组中任何线程 fork 的子进程
-/// - 如果指定了 __WNOTHREAD，则只能等待当前线程自己创建的子进程
+/// - 如果指定了 __WNOTHREAD，则只能等待当前线程自己的 wait 子进程
 ///
 /// # 参数
 /// - `child_pcb`: 要检查的子进程
@@ -356,12 +357,11 @@ fn is_eligible_child(child_pcb: &Arc<ProcessControlBlock>, options: WaitOption) 
     let current_tgid = current.tgid;
 
     if options.contains(WaitOption::WNOTHREAD) {
-        // 带 __WNOTHREAD：只能等待当前线程自己创建的子进程
-        let fork_parent = match child_pcb.fork_parent_pcb() {
+        let wait_parent = match child_pcb.wait_parent_pcb() {
             Some(p) => p,
             None => return false,
         };
-        Arc::ptr_eq(&fork_parent, &current)
+        Arc::ptr_eq(&wait_parent, &current)
     } else {
         // 获取子进程的 real_parent
         let child_parent = match child_pcb.real_parent_pcb() {
@@ -405,6 +405,23 @@ fn wait_visible_pid(child_pcb: &Arc<ProcessControlBlock>) -> RawPid {
     child_pcb
         .task_pid_nr_ns(PidType::PID, Some(leader.active_pid_ns()))
         .unwrap_or(RawPid(0))
+}
+
+fn waitid_visible_uid(child_pcb: &Arc<ProcessControlBlock>) -> u32 {
+    let child_uid = child_pcb.cred().uid.data();
+    let child_uid = u32::try_from(child_uid).unwrap_or(DEFAULT_OVERFLOW_UID);
+    let current_user_ns = ProcessManager::current_pcb().cred().user_ns.clone();
+    let inner = current_user_ns.inner.lock();
+    map_id_up(&inner.uid_map, child_uid).unwrap_or(DEFAULT_OVERFLOW_UID)
+}
+
+fn waitid_info(child_pcb: &Arc<ProcessControlBlock>, status: i32, cause: i32) -> WaitIdInfo {
+    WaitIdInfo {
+        pid: wait_visible_pid(child_pcb),
+        uid: waitid_visible_uid(child_pcb),
+        status,
+        cause,
+    }
 }
 
 enum CandidateDecision {
@@ -488,7 +505,7 @@ fn report_wait_event(
         let child_rusage = fill_wait_rusage(child_pcb, kwo);
         kwo.no_task_error = None;
         kwo.ret_status = raw_wstatus;
-        kwo.ret_info = Some(WaitIdInfo { pid, status, cause });
+        kwo.ret_info = Some(waitid_info(child_pcb, status, cause));
 
         if !kwo.options.contains(WaitOption::WNOWAIT) {
             account_reaped_child_rusage(&child_rusage);
@@ -514,11 +531,7 @@ fn report_wait_event(
             SigChildCode::Stopped.into()
         };
         kwo.no_task_error = None;
-        kwo.ret_info = Some(WaitIdInfo {
-            pid: wait_visible_pid(child_pcb),
-            status: stopsig,
-            cause,
-        });
+        kwo.ret_info = Some(waitid_info(child_pcb, stopsig, cause));
         kwo.ret_status = (stopsig << 8) | 0x7f;
         fill_wait_rusage(child_pcb, kwo);
         return CandidateDecision::Ready(Ok(wait_visible_pid(child_pcb).into()));
@@ -531,11 +544,11 @@ fn report_wait_event(
         )
     {
         kwo.no_task_error = None;
-        kwo.ret_info = Some(WaitIdInfo {
-            pid: wait_visible_pid(child_pcb),
-            status: Signal::SIGCONT as i32,
-            cause: SigChildCode::Continued.into(),
-        });
+        kwo.ret_info = Some(waitid_info(
+            child_pcb,
+            Signal::SIGCONT as i32,
+            SigChildCode::Continued.into(),
+        ));
         kwo.ret_status = 0xffff;
         fill_wait_rusage(child_pcb, kwo);
         return CandidateDecision::Ready(Ok(wait_visible_pid(child_pcb).into()));
@@ -622,10 +635,6 @@ fn do_wait(kwo: &mut KernelWaitOption) -> Result<usize, SystemError> {
     kwo.no_task_error = Some(SystemError::ECHILD);
     let retval = match kwo.selector.clone() {
         WaitSelector::Pid(pid) => {
-            if pid.pid_vnr().data() == ProcessManager::current_pcb().raw_tgid().data() {
-                return Err(SystemError::ECHILD);
-            }
-
             let current = ProcessManager::current_pcb();
             let wait_queue_owner = get_thread_group_leader(&current);
             let check_child = |kwo: &mut KernelWaitOption| -> Result<Option<usize>, SystemError> {

@@ -31,7 +31,7 @@ use super::{
     account_successful_fork, alloc_pid, inc_visible_thread_count,
     kthread::{KernelThreadPcbPrivate, WorkerPrivate},
     pid::{Pid, PidType},
-    KernelStack, ProcessControlBlock, ProcessManager, RawPid,
+    KernelStack, ProcessControlBlock, ProcessManager, RawPid, PTRACE_RELATION_LOCK,
 };
 pub const MAX_PID_NS_LEVEL: usize = 32;
 
@@ -829,37 +829,6 @@ impl ProcessManager {
             ti.group_leader().unwrap_or_else(|| current_pcb.clone())
         };
 
-        *pcb.fork_parent_pcb.write_irqsave() = Arc::downgrade(current_pcb);
-
-        if clone_flags.contains(CloneFlags::CLONE_THREAD) {
-            *pcb.parent_pcb.write_irqsave() = current_pcb.parent_pcb.read_irqsave().clone();
-            *pcb.real_parent_pcb.write_irqsave() =
-                current_pcb.real_parent_pcb.read_irqsave().clone();
-            pcb.exit_signal.store(-1, Ordering::SeqCst);
-        } else {
-            if clone_flags.contains(CloneFlags::CLONE_PARENT) {
-                *pcb.parent_pcb.write_irqsave() = current_pcb.parent_pcb.read_irqsave().clone();
-                *pcb.real_parent_pcb.write_irqsave() =
-                    current_pcb.real_parent_pcb.read_irqsave().clone();
-                pcb.exit_signal.store(
-                    current_leader.exit_signal.load(Ordering::SeqCst),
-                    Ordering::SeqCst,
-                );
-            } else {
-                *pcb.parent_pcb.write_irqsave() = Arc::downgrade(&current_leader);
-                *pcb.real_parent_pcb.write_irqsave() = Arc::downgrade(&current_leader);
-                pcb.exit_signal
-                    .store(clone_args.exit_signal, Ordering::SeqCst);
-            }
-
-            if let Some(parent) = pcb.parent_pcb() {
-                let ppid_in_child_ns = parent
-                    .task_pid_nr_ns(PidType::PID, Some(pcb.active_pid_ns()))
-                    .unwrap_or(RawPid::new(0));
-                pcb.basic.write_irqsave().ppid = ppid_in_child_ns;
-            }
-        }
-
         let clone_into_cgroup_target = Self::resolve_clone_into_cgroup_target(&clone_args)?;
         let reserved_cgroup = if pcb.raw_pid() > RawPid(0) {
             let charge_node = clone_into_cgroup_target
@@ -943,104 +912,140 @@ impl ProcessManager {
         // 处理 rseq 状态。按 Linux copy_process() 顺序，应在任务对外可见前完成。
         crate::process::rseq::rseq_fork(pcb, clone_flags.contains(CloneFlags::CLONE_VM));
 
-        let pid = pcb.pid();
-        if pcb.is_thread_group_leader() {
-            if pcb.raw_pid() == RawPid(1) {
-                pcb.init_task_pid(PidType::TGID, pid.clone());
-                pcb.init_task_pid(PidType::PGID, pid.clone());
-                pcb.init_task_pid(PidType::SID, pid.clone());
+        let publish_result: Result<(), SystemError> = {
+            let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
+            if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                let inherited_parent = current_pcb.parent_pcb.read_irqsave().clone();
+                let inherited_real_parent = current_pcb.real_parent_pcb.read_irqsave().clone();
+                *pcb.parent_pcb.write_irqsave() = inherited_parent;
+                *pcb.real_parent_pcb.write_irqsave() = inherited_real_parent.clone();
+                *pcb.wait_parent_pcb.write_irqsave() = inherited_real_parent.clone();
+                *pcb.fork_parent_pcb.write_irqsave() = inherited_real_parent;
+                pcb.exit_signal.store(-1, Ordering::SeqCst);
+
+                let group_leader = pcb.threads_read_irqsave().group_leader().unwrap();
+                current_pcb.sighand().with_group_exec_check(|| {
+                    pcb.attach_pid(PidType::PID);
+                    pcb.task_join_group_stop();
+                    group_leader
+                        .threads_write_irqsave()
+                        .group_tasks
+                        .push(Arc::downgrade(pcb));
+                })?;
+
+                let leader_tgid_pid = group_leader.pid();
+                pcb.init_task_pid(PidType::TGID, leader_tgid_pid.clone());
+                pcb.init_task_pid(PidType::PGID, leader_tgid_pid.clone());
+                pcb.init_task_pid(PidType::SID, leader_tgid_pid.clone());
+                pcb.attach_pid(PidType::TGID);
+                pcb.attach_pid(PidType::PGID);
+                pcb.attach_pid(PidType::SID);
+                Ok(())
             } else {
-                pcb.init_task_pid(PidType::TGID, pid.clone());
-                pcb.init_task_pid(PidType::PGID, current_pcb.task_pgrp().unwrap());
-                pcb.init_task_pid(PidType::SID, current_pcb.task_session().unwrap());
-            }
-
-            if pid.is_child_reaper() {
-                pid.ns_of_pid().set_child_reaper(Arc::downgrade(pcb));
-                pcb.sighand().flags_insert(SignalFlags::UNKILLABLE);
-            }
-
-            // child_subreaper 是线程组级语义：用线程组 leader 的 siginfo 决定。
-            let parent_leader = {
-                let ti = current_pcb.thread.read_irqsave();
-                ti.group_leader().unwrap_or_else(|| current_pcb.clone())
-            };
-            let parent_siginfo = parent_leader.sig_info_irqsave();
-            let parent_tty = parent_siginfo.tty();
-            let parent_has_child_subreaper = parent_siginfo.has_child_subreaper();
-            let parent_is_child_reaper = parent_siginfo.is_child_subreaper();
-            drop(parent_siginfo);
-            let mut sig_info_guard = pcb.sig_info_mut();
-
-            // log::debug!("set tty: {:?}", parent_tty);
-            sig_info_guard.set_tty(parent_tty);
-
-            /*
-             * Inherit has_child_subreaper flag under the same
-             * tasklist_lock with adding child to the process tree
-             * for propagate_has_child_subreaper optimization.
-             */
-            sig_info_guard
-                .set_has_child_subreaper(parent_has_child_subreaper || parent_is_child_reaper);
-            drop(sig_info_guard);
-            pcb.attach_pid(PidType::TGID);
-            pcb.attach_pid(PidType::PGID);
-            pcb.attach_pid(PidType::SID);
-        } else {
-            let group_leader = pcb.threads_read_irqsave().group_leader().unwrap();
-            let group_exec_result = current_pcb.sighand().with_group_exec_check(|| {
-                pcb.task_join_group_stop();
-                group_leader
-                    .threads_write_irqsave()
-                    .group_tasks
-                    .push(Arc::downgrade(pcb));
-            });
-            if let Err(err) = group_exec_result {
-                Self::rollback_failed_fork(current_pcb, installed_pidfd, reserved_cgroup.as_ref());
-                return Err(err);
-            }
-
-            // 确保非组长线程的 TGID 与组长一致
-            let leader_tgid_pid = group_leader.pid();
-            pcb.init_task_pid(PidType::TGID, leader_tgid_pid.clone());
-            pcb.init_task_pid(PidType::PGID, leader_tgid_pid.clone());
-            pcb.init_task_pid(PidType::SID, leader_tgid_pid.clone());
-            pcb.attach_pid(PidType::TGID);
-            pcb.attach_pid(PidType::PGID);
-            pcb.attach_pid(PidType::SID);
-        }
-
-        pcb.attach_pid(PidType::PID);
-
-        // 将当前pcb加入父进程的子进程哈希表中
-        // 注意：根据 Linux 语义，子进程应该被添加到 **线程组 leader** 的 children 列表中
-        // 而不是创建它的线程的 children 列表中。这样线程组中的任何线程都可以 wait 这个子进程。
-        if pcb.raw_pid() > RawPid(1) && !clone_flags.contains(CloneFlags::CLONE_THREAD) {
-            let parent = pcb.parent_pcb().unwrap_or_else(|| current_leader.clone());
-            let parent_leader = {
-                let ti = parent.thread.read_irqsave();
-                ti.group_leader().unwrap_or_else(|| parent.clone())
-            };
-            let mut children = parent_leader.children.write_irqsave();
-            let parent_ns = parent_leader.active_pid_ns();
-            let child_vpid = pcb.task_pid_nr_ns(PidType::PID, Some(parent_ns));
-            if let Some(vpid) = child_vpid {
-                if vpid.data() != 0 {
-                    children.push(vpid);
-                } else {
-                    warn!(
-                        "fork: child pid is 0 in parent pidns, parent pid={:?}, child pid={:?}",
-                        parent_leader.raw_pid(),
-                        pcb.raw_pid()
+                if clone_flags.contains(CloneFlags::CLONE_PARENT) {
+                    let inherited_parent = current_pcb.parent_pcb.read_irqsave().clone();
+                    let inherited_real_parent = current_pcb.real_parent_pcb.read_irqsave().clone();
+                    *pcb.parent_pcb.write_irqsave() = inherited_parent;
+                    *pcb.real_parent_pcb.write_irqsave() = inherited_real_parent.clone();
+                    *pcb.wait_parent_pcb.write_irqsave() = inherited_real_parent.clone();
+                    *pcb.fork_parent_pcb.write_irqsave() = inherited_real_parent;
+                    pcb.exit_signal.store(
+                        current_leader.exit_signal.load(Ordering::SeqCst),
+                        Ordering::SeqCst,
                     );
+                } else {
+                    *pcb.parent_pcb.write_irqsave() = Arc::downgrade(&current_leader);
+                    *pcb.real_parent_pcb.write_irqsave() = Arc::downgrade(&current_leader);
+                    *pcb.wait_parent_pcb.write_irqsave() = Arc::downgrade(current_pcb);
+                    *pcb.fork_parent_pcb.write_irqsave() = Arc::downgrade(current_pcb);
+                    pcb.exit_signal
+                        .store(clone_args.exit_signal, Ordering::SeqCst);
                 }
-            } else {
-                warn!(
-                    "fork: failed to resolve child pid in parent pidns, parent pid={:?}, child pid={:?}",
-                    parent_leader.raw_pid(),
-                    pcb.raw_pid()
-                );
+
+                if let Some(parent) = pcb.parent_pcb() {
+                    let ppid_in_child_ns = parent
+                        .task_pid_nr_ns(PidType::PID, Some(pcb.active_pid_ns()))
+                        .unwrap_or(RawPid::new(0));
+                    pcb.basic.write_irqsave().ppid = ppid_in_child_ns;
+                }
+
+                let pid = pcb.pid();
+                if pcb.raw_pid() == RawPid(1) {
+                    pcb.init_task_pid(PidType::TGID, pid.clone());
+                    pcb.init_task_pid(PidType::PGID, pid.clone());
+                    pcb.init_task_pid(PidType::SID, pid.clone());
+                } else {
+                    pcb.init_task_pid(PidType::TGID, pid.clone());
+                    pcb.init_task_pid(PidType::PGID, current_pcb.task_pgrp().unwrap());
+                    pcb.init_task_pid(PidType::SID, current_pcb.task_session().unwrap());
+                }
+
+                if pid.is_child_reaper() {
+                    pid.ns_of_pid().set_child_reaper(Arc::downgrade(pcb));
+                    pcb.sighand().flags_insert(SignalFlags::UNKILLABLE);
+                }
+
+                let real_parent = pcb
+                    .real_parent_pcb()
+                    .unwrap_or_else(|| current_leader.clone());
+                let parent_leader = {
+                    let ti = real_parent.thread.read_irqsave();
+                    ti.group_leader().unwrap_or_else(|| real_parent.clone())
+                };
+                let parent_siginfo = parent_leader.sig_info_irqsave();
+                let parent_tty = parent_siginfo.tty();
+                let parent_has_child_subreaper = parent_siginfo.has_child_subreaper();
+                let parent_is_child_reaper = parent_siginfo.is_child_subreaper();
+                drop(parent_siginfo);
+                let mut sig_info_guard = pcb.sig_info_mut();
+                sig_info_guard.set_tty(parent_tty);
+                sig_info_guard
+                    .set_has_child_subreaper(parent_has_child_subreaper || parent_is_child_reaper);
+                drop(sig_info_guard);
+
+                pcb.attach_pid(PidType::TGID);
+                pcb.attach_pid(PidType::PGID);
+                pcb.attach_pid(PidType::SID);
+                pcb.attach_pid(PidType::PID);
+
+                // Publish the child into the parent's children list. This must
+                // happen inside the same relation-lock critical section as parent
+                // field init and PID attach, to close the window where exit/adopt
+                // sees a parent pointer but the children list is still empty.
+                if pcb.raw_pid() > RawPid(1) {
+                    let parent = pcb.parent_pcb().unwrap_or_else(|| current_leader.clone());
+                    let parent_leader = {
+                        let ti = parent.thread.read_irqsave();
+                        ti.group_leader().unwrap_or_else(|| parent.clone())
+                    };
+                    let mut children = parent_leader.children.write_irqsave();
+                    let parent_ns = parent_leader.active_pid_ns();
+                    let child_vpid = pcb.task_pid_nr_ns(PidType::PID, Some(parent_ns));
+                    if let Some(vpid) = child_vpid {
+                        if vpid.data() != 0 {
+                            children.push(vpid);
+                        } else {
+                            warn!(
+                                "fork: child pid is 0 in parent pidns, parent pid={:?}, child pid={:?}",
+                                parent_leader.raw_pid(),
+                                pcb.raw_pid()
+                            );
+                        }
+                    } else {
+                        warn!(
+                            "fork: failed to resolve child pid in parent pidns, parent pid={:?}, child pid={:?}",
+                            parent_leader.raw_pid(),
+                            pcb.raw_pid()
+                        );
+                    }
+                }
+
+                Ok(())
             }
+        };
+        if let Err(err) = publish_result {
+            Self::rollback_failed_fork(current_pcb, installed_pidfd, reserved_cgroup.as_ref());
+            return Err(err);
         }
 
         if pcb.raw_pid() > RawPid(0) {

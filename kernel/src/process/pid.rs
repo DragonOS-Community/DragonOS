@@ -1,6 +1,10 @@
 use core::fmt::Debug;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use crate::filesystem::epoll::{
+    event_poll::{EventPoll, LockedEPItemLinkedList},
+    EPollEventType, EPollItem,
+};
 use crate::libs::rwlock::RwLock;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::process::ProcessManager;
@@ -35,16 +39,20 @@ impl PidType {
 /// 例如 struct pid 应该是在进程创建时（如 fork(), clone()）必然创建的
 #[derive(Clone, Debug)]
 pub struct PidPrivateData {
-    pid: i32,
+    pid: Arc<Pid>,
 }
 
 impl PidPrivateData {
-    pub fn new(pid: i32) -> Self {
+    pub fn new(pid: Arc<Pid>) -> Self {
         Self { pid }
     }
 
-    pub fn pid(&self) -> i32 {
-        self.pid
+    pub fn pid(&self) -> Arc<Pid> {
+        self.pid.clone()
+    }
+
+    pub fn pid_nr_ns(&self, ns: &Arc<PidNamespace>) -> RawPid {
+        self.pid.pid_nr_ns(ns)
     }
 }
 
@@ -58,6 +66,8 @@ pub struct Pid {
     tasks: [SpinLock<Vec<Weak<ProcessControlBlock>>>; PidType::PIDTYPE_MAX],
     /// 在各个namespace中的PID值
     numbers: SpinLock<Vec<Option<UPid>>>,
+    /// pidfd poll/epoll waiters. Linux keeps this wakeup edge on struct pid.
+    pidfd_epitems: LockedEPItemLinkedList,
 }
 
 impl Debug for Pid {
@@ -74,6 +84,7 @@ impl Pid {
             level,
             tasks: core::array::from_fn(|_| SpinLock::new(Vec::new())),
             numbers: SpinLock::new(vec![None; level as usize + 1]),
+            pidfd_epitems: LockedEPItemLinkedList::default(),
         });
 
         pid
@@ -85,6 +96,28 @@ impl Pid {
 
     pub fn set_dead(&self) {
         self.dead.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn add_pidfd_epitem(&self, epitem: Arc<EPollItem>) {
+        self.pidfd_epitems.lock().push_back(epitem);
+    }
+
+    pub(crate) fn remove_pidfd_epitem(&self, epitem: &Arc<EPollItem>) -> Result<(), SystemError> {
+        let mut guard = self.pidfd_epitems.lock();
+        let len = guard.len();
+        guard.retain(|x| !Arc::ptr_eq(x, epitem));
+        if len != guard.len() {
+            Ok(())
+        } else {
+            Err(SystemError::ENOENT)
+        }
+    }
+
+    pub(crate) fn wake_pidfd_pollers(&self) {
+        let _ = EventPoll::wakeup_epoll(
+            &self.pidfd_epitems,
+            EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
+        );
     }
 
     /// 获取指定PID所属的命名空间
@@ -139,6 +172,30 @@ impl Pid {
     pub fn thread_group_leader_task(&self) -> Option<Arc<ProcessControlBlock>> {
         self.tasks_iter(PidType::TGID)
             .find(|task| task.is_thread_group_leader())
+    }
+
+    pub(crate) fn thread_group_exited_for_pidfd(&self) -> bool {
+        let mut leader_seen = false;
+        let mut exited_leader_seen = false;
+
+        for task in self.tasks_iter(PidType::TGID) {
+            if task.is_thread_group_leader() {
+                leader_seen = true;
+                if task.is_live_thread_group_member() {
+                    return false;
+                }
+                if task.is_zombie() || task.is_dead() {
+                    exited_leader_seen = true;
+                }
+                continue;
+            }
+
+            if task.is_live_thread_group_member() {
+                return false;
+            }
+        }
+
+        !leader_seen || exited_leader_seen
     }
 
     pub fn pid_vnr(&self) -> RawPid {

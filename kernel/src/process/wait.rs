@@ -65,10 +65,9 @@ impl WaitSelector {
                     ))))
                 }
             }
-            // P_PIDFD is a waitid-specific selector. DragonOS has pidfd basics,
-            // but pidfd wait still needs fd validation and O_NONBLOCK/EAGAIN
-            // semantics, so keep the unsupported boundary explicit here after
-            // preserving Linux's invalid negative-fd boundary.
+            // P_PIDFD is a waitid-specific selector and must be resolved by
+            // the syscall layer, where fd validation and O_NONBLOCK/EAGAIN
+            // translation have access to the pidfd file.
             3 => {
                 if upid < 0 {
                     return Err(SystemError::EINVAL);

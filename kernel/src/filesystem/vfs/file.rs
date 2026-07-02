@@ -269,20 +269,6 @@ impl FilePrivateData {
         }
         Ok(())
     }
-
-    pub fn is_pid(&self) -> bool {
-        if let FilePrivateData::Pid(_data) = self {
-            return true;
-        }
-        false
-    }
-
-    pub fn get_pid(&self) -> i32 {
-        if let FilePrivateData::Pid(data) = self {
-            return data.pid();
-        }
-        -1
-    }
 }
 
 bitflags! {
@@ -1692,6 +1678,12 @@ impl DroppedFd {
 #[derive(Debug, Clone, Copy)]
 pub struct ReservedFd {
     fd: i32,
+}
+
+impl ReservedFd {
+    pub fn fd(&self) -> i32 {
+        self.fd
+    }
 }
 
 /// @brief pcb里面的文件描述符数组

@@ -66,7 +66,9 @@ pub fn do_clone(
 
     let vfork = Arc::new(Completion::new());
 
-    if flags.contains(CloneFlags::CLONE_PIDFD) && flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
+    if flags.contains(CloneFlags::CLONE_PIDFD)
+        && flags.intersects(CloneFlags::CLONE_PARENT_SETTID | CloneFlags::CLONE_THREAD)
+    {
         return Err(SystemError::EINVAL);
     }
 

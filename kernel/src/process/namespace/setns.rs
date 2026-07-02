@@ -7,7 +7,8 @@ use crate::{
     process::{
         cred::{ns_capable, CAPFlags, Cred},
         fork::CloneFlags,
-        ProcessManager, RawPid,
+        pid::PidType,
+        ProcessManager,
     },
 };
 
@@ -35,6 +36,26 @@ fn can_setns_target_userns(
     let current = ProcessManager::current_pcb();
     let cred = current.cred();
     cred.has_cap_sys_admin() && cred.user_ns.is_ancestor_of(target_user_ns)
+}
+
+fn can_access_pidfd_setns_target(target: &Arc<crate::process::ProcessControlBlock>) -> bool {
+    let current = ProcessManager::current_pcb();
+    if Arc::ptr_eq(&current, target) {
+        return true;
+    }
+
+    let current_cred = current.cred();
+    if current_cred.has_capability(CAPFlags::CAP_SYS_PTRACE) {
+        return true;
+    }
+
+    let target_cred = target.cred();
+    current_cred.uid == target_cred.euid
+        && current_cred.uid == target_cred.suid
+        && current_cred.uid == target_cred.uid
+        && current_cred.gid == target_cred.egid
+        && current_cred.gid == target_cred.sgid
+        && current_cred.gid == target_cred.gid
 }
 
 fn nsfd_target_userns(
@@ -92,21 +113,21 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
         .get_file_by_fd(fd)
         .ok_or(SystemError::EBADF)?;
 
-    // 3. 根据 fd 类型决定 setns 模式：pidfd / namespace fd
-    let (pidfd_pid, ns_fd) = {
+    // 3. 根据 fd 类型决定 setns 模式：namespace fd / pidfd
+    let ns_fd = {
         let pdata = file.private_data.lock();
         match &*pdata {
-            FilePrivateData::Pid(p) => (Some(p.pid()), None),
-            FilePrivateData::Namespace(n) => (None, Some(n.clone())),
-            _ => (None, None),
+            FilePrivateData::Namespace(n) => Some(n.clone()),
+            _ => None,
         }
     };
 
-    // pidfd 路径：flags 必须非空
-    if let Some(pid) = pidfd_pid {
-        if pid < 0 {
-            return Err(SystemError::EBADF);
-        }
+    // pidfd 路径：flags 必须非空。fd 存在但不是 pidfd 时不能返回 EBADF；
+    // setns 语义要求这种类型不匹配返回 EINVAL。
+    if ns_fd.is_none() {
+        let Some(target_pid) = file.try_pidfd_target().ok() else {
+            return Err(SystemError::EINVAL);
+        };
         if flags.is_empty() {
             return Err(SystemError::EINVAL);
         }
@@ -114,8 +135,10 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
             return Err(SystemError::EINVAL);
         }
 
-        let target_pid = RawPid::new(pid as usize);
-        let target = ProcessManager::find_task_by_vpid(target_pid).ok_or(SystemError::ESRCH)?;
+        let target = target_pid.task(PidType::TGID).ok_or(SystemError::ESRCH)?;
+        if !can_access_pidfd_setns_target(&target) {
+            return Err(SystemError::EPERM);
+        }
         if !can_setns_target_userns(&target.cred().user_ns) {
             return Err(SystemError::EPERM);
         }
@@ -140,7 +163,7 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
         }
         if flags.contains(CloneFlags::CLONE_NEWPID) {
             // 与 Linux 语义一致：仅影响子进程的 PID namespace
-            new_inner.pid_ns_for_children = target_nsproxy.pid_ns_for_children.clone();
+            new_inner.pid_ns_for_children = target.active_pid_ns();
         }
         if flags.contains(CloneFlags::CLONE_NEWCGROUP) {
             if !can_setns_cgroup(&target_nsproxy.cgroup_ns) {

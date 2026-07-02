@@ -60,16 +60,7 @@ fn reap_blocked_by_group_exec(child_pcb: &Arc<ProcessControlBlock>) -> bool {
 }
 
 fn delay_group_leader(child_pcb: &Arc<ProcessControlBlock>) -> bool {
-    if !child_pcb.is_thread_group_leader() {
-        return false;
-    }
-
-    child_pcb
-        .threads_read_irqsave()
-        .group_tasks_clone()
-        .iter()
-        .filter_map(Weak::upgrade)
-        .any(|task| !task.is_exited() && !task.is_zombie() && !task.is_dead())
+    child_pcb.is_thread_group_leader() && child_pcb.thread_group_has_live_nonleader_threads()
 }
 
 /// mt-exec: 非执行线程的组长在退出时，延迟 PID/TGID/PGID/SID 的 unhash
@@ -277,16 +268,25 @@ pub fn kernel_wait4(
 pub fn kernel_waitid(
     pid_selector: WaitSelector,
     mut infop: Option<UserBufferWriter<'_>>, // PosixSigInfo
-    options: WaitOption,
+    mut options: WaitOption,
     rusage_buf: Option<&mut RUsage>,
+    pidfd_nonblock: bool,
 ) -> Result<bool, SystemError> {
+    let original_options = options;
+    if pidfd_nonblock {
+        options.insert(WaitOption::WNOHANG);
+    }
+
     // 构造参数
     let mut kwo = KernelWaitOption::new(pid_selector, options);
     kwo.ret_rusage = rusage_buf;
     // waitid 不强制 WEXITED，由调用者通过 options 指定
 
     // 走通用等待
-    let _ = do_wait(&mut kwo)?;
+    let wait_ret = do_wait(&mut kwo)?;
+    if wait_ret == 0 && pidfd_nonblock && !original_options.contains(WaitOption::WNOHANG) {
+        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+    }
 
     // 写回 siginfo（若提供）
     if let Some(mut writer) = infop.take() {
@@ -885,6 +885,7 @@ impl ProcessControlBlock {
             leader_threads
                 .group_tasks
                 .retain(|pcb| !Weak::ptr_eq(pcb, &self.self_ref));
+            leader.pid().wake_pidfd_pollers();
         }
     }
 

@@ -1475,6 +1475,7 @@ bitflags! {
         const MOUNT_MAGIC = 61267;
         const PIPEFS_MAGIC = 0x50495045;
         const EVENTFD_MAGIC = 0x45564446; // "EVDF" in ASCII
+        const PIDFD_MAGIC = 0x50494446; // "PIDF" in ASCII
         const OVERLAYFS_MAGIC = 0x794c7630;
     }
 }

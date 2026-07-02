@@ -6,12 +6,11 @@ use crate::cgroup::{cgroup_accounting_lock, cgroup_can_fork_in, cgroup_migrate_v
 use crate::filesystem::cgroup2::{cgroup2_check_attach_permissions, cgroup2_inode_to_node};
 use crate::filesystem::vfs::file::File;
 use crate::filesystem::vfs::file::FileFlags;
-use crate::filesystem::vfs::file::FilePrivateData;
+use crate::filesystem::vfs::file::ReservedFd;
 use crate::filesystem::vfs::FileType;
-use crate::filesystem::vfs::InodeMode;
 use crate::mm::access_ok;
 use crate::mm::MemoryManagementArch;
-use crate::process::pid::PidPrivateData;
+use crate::process::pidfd::PidFd;
 use alloc::{string::ToString, sync::Arc};
 use log::{error, warn};
 use system_error::SystemError;
@@ -850,43 +849,18 @@ impl ProcessManager {
             None
         };
 
-        // 安装 pidfd 会对父进程 fd 表产生外部可见副作用，必须放在 cgroup
-        // admission 成功之后；若后续发布前失败，需要显式回滚 fd 和 pids 预留。
-        let mut installed_pidfd = None;
+        let mut reserved_pidfd: Option<ReservedFd> = None;
+        let mut pidfd_file: Option<File> = None;
         if clone_flags.contains(CloneFlags::CLONE_PIDFD) {
-            let pid = pcb.raw_pid().0 as i32;
-            let root_inode = ProcessManager::current_mntns().root_inode();
-            let name = format!(
-                "Pidfd(from {} to {})",
-                ProcessManager::current_pcb().raw_pid().data(),
-                pid
-            );
-            let new_inode = match root_inode.create(&name, FileType::File, InodeMode::S_IRWXUGO) {
-                Ok(inode) => inode,
+            let pid = pcb.pid();
+            let prepared = match PidFd::prepare(current_pcb, pid, FileFlags::empty(), false) {
+                Ok(prepared) => prepared,
                 Err(err) => {
                     Self::rollback_failed_fork(current_pcb, None, reserved_cgroup.as_ref());
                     return Err(err);
                 }
             };
-            let file = match File::new(new_inode, FileFlags::O_RDWR | FileFlags::O_CLOEXEC) {
-                Ok(file) => file,
-                Err(err) => {
-                    Self::rollback_failed_fork(current_pcb, None, reserved_cgroup.as_ref());
-                    return Err(err);
-                }
-            };
-            {
-                let mut guard = file.private_data.lock();
-                *guard = FilePrivateData::Pid(PidPrivateData::new(pid));
-            }
-
-            let fd = match current_pcb.fd_table().write().alloc_fd(file, None, true) {
-                Ok(fd) => fd,
-                Err(err) => {
-                    Self::rollback_failed_fork(current_pcb, None, reserved_cgroup.as_ref());
-                    return Err(err);
-                }
-            };
+            let fd = prepared.reservation.fd();
 
             let write_pidfd_result = (|| -> Result<(), SystemError> {
                 let mut writer = UserBufferWriter::new(
@@ -897,11 +871,16 @@ impl ProcessManager {
                 writer.copy_one_to_user(&(fd as i32), 0)
             })();
             if let Err(err) = write_pidfd_result {
-                Self::rollback_failed_fork(current_pcb, Some(fd), reserved_cgroup.as_ref());
+                current_pcb
+                    .fd_table()
+                    .write()
+                    .release_reserved_fd(prepared.reservation);
+                Self::rollback_failed_fork(current_pcb, None, reserved_cgroup.as_ref());
                 return Err(err);
             }
 
-            installed_pidfd = Some(fd);
+            reserved_pidfd = Some(prepared.reservation);
+            pidfd_file = Some(prepared.file);
         }
 
         // 新任务的默认落点 CPU 应在 wake_up_new_task() 时再选择；这里只保留显式 hint，
@@ -1044,8 +1023,21 @@ impl ProcessManager {
             }
         };
         if let Err(err) = publish_result {
-            Self::rollback_failed_fork(current_pcb, installed_pidfd, reserved_cgroup.as_ref());
+            if let Some(reservation) = reserved_pidfd.take() {
+                current_pcb
+                    .fd_table()
+                    .write()
+                    .release_reserved_fd(reservation);
+            }
+            Self::rollback_failed_fork(current_pcb, None, reserved_cgroup.as_ref());
             return Err(err);
+        }
+
+        if let (Some(reservation), Some(file)) = (reserved_pidfd.take(), pidfd_file.take()) {
+            current_pcb
+                .fd_table()
+                .write()
+                .install_reserved_fd(reservation, file)?;
         }
 
         if pcb.raw_pid() > RawPid(0) {

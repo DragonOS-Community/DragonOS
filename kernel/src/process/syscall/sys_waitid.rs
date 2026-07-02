@@ -7,12 +7,18 @@ use crate::process::abi::WaitOption;
 use crate::process::exit::kernel_waitid;
 use crate::process::resource::RUsage;
 use crate::process::wait::WaitSelector;
+use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::UserBufferWriter;
 use alloc::vec::Vec;
 use system_error::SystemError;
 
 pub struct SysWaitId;
+
+struct ResolvedWaitIdSelector {
+    selector: WaitSelector,
+    pidfd_nonblock: bool,
+}
 
 impl SysWaitId {
     #[inline(always)]
@@ -34,6 +40,24 @@ impl SysWaitId {
     #[inline(always)]
     fn rusage(args: &[usize]) -> *mut RUsage {
         args[4] as *mut RUsage
+    }
+
+    fn resolve_selector(which: u32, upid: i32) -> Result<ResolvedWaitIdSelector, SystemError> {
+        if which == 3 {
+            if upid < 0 {
+                return Err(SystemError::EINVAL);
+            }
+            let target = ProcessManager::current_pcb().pidfd_target_from_fd(upid)?;
+            Ok(ResolvedWaitIdSelector {
+                selector: WaitSelector::Pid(target.pid()),
+                pidfd_nonblock: target.is_nonblock(),
+            })
+        } else {
+            Ok(ResolvedWaitIdSelector {
+                selector: WaitSelector::from_waitid(which, upid)?,
+                pidfd_nonblock: false,
+            })
+        }
     }
 }
 
@@ -67,7 +91,7 @@ impl Syscall for SysWaitId {
         }
 
         // which/upid → WaitSelector (P_ALL=0, P_PID=1, P_PGID=2, P_PIDFD=3)
-        let pid_selector = WaitSelector::from_waitid(which, upid)?;
+        let resolved = Self::resolve_selector(which, upid)?;
 
         // Build optional infop writer. Linux validates selector/options before touching user pointers.
         let infop_writer = if infop_ptr.is_null() {
@@ -88,7 +112,13 @@ impl Syscall for SysWaitId {
         };
 
         // 调用内核实现
-        let has_event = kernel_waitid(pid_selector, infop_writer, options, tmp_rusage.as_mut())?;
+        let has_event = kernel_waitid(
+            resolved.selector,
+            infop_writer,
+            options,
+            tmp_rusage.as_mut(),
+            resolved.pidfd_nonblock,
+        )?;
         // log::debug!("sys_waitid: kernel_waitid returned OK");
 
         if has_event && !rusage_ptr.is_null() {

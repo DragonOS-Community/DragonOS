@@ -22,7 +22,7 @@ type = "build-from-source"
 # "install_from_prebuilt" 可选值："local", "archive"
 source = "git"
 # 路径或URL
-source-path = "https://github.com/DragonOS-Community/runcell.git"
+source-path = "https://git.mirrors.dragonos.org.cn/zhuangkaiye/runcell.git"
 # git标签或分支
 # 注意： branch和revision只能二选一，且source要设置为"git"
 revision = "c13e69f"

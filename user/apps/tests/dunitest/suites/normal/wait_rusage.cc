@@ -228,6 +228,47 @@ void* DelayedWriteByte(void* arg) {
   return nullptr;
 }
 
+struct StartThenReleaseArgs {
+  int started_fd = -1;
+  int release_fd = -1;
+  useconds_t delay_usec = 0;
+};
+
+void* WaitForStartThenRelease(void* arg) {
+  auto* args = reinterpret_cast<StartThenReleaseArgs*>(arg);
+  char byte = 0;
+  if (read(args->started_fd, &byte, 1) == 1) {
+    sched_yield();
+    usleep(args->delay_usec);
+    char release = 'x';
+    WriteExact(args->release_fd, &release, 1);
+  }
+  return nullptr;
+}
+
+pid_t WaitPidWithTimeout(pid_t pid, int* status, uint64_t timeout_usec,
+                         int* wait_errno) {
+  const uint64_t start = MonotonicUsec();
+  while (MonotonicUsec() - start < timeout_usec) {
+    errno = 0;
+    pid_t ret = waitpid(pid, status, WNOHANG);
+    if (ret == pid) {
+      return ret;
+    }
+    if (ret < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      if (wait_errno != nullptr) {
+        *wait_errno = errno;
+      }
+      return -1;
+    }
+    usleep(1000);
+  }
+  return 0;
+}
+
 void* ReportTidAndWait(void* arg) {
   auto* args = reinterpret_cast<ThreadTidArgs*>(arg);
   args->tid = static_cast<pid_t>(syscall(SYS_gettid));
@@ -570,6 +611,75 @@ bool WaitidPidfdExited(int pidfd, pid_t child, siginfo_t* si) {
   return false;
 }
 
+int BlockingWaitExitRaceHelper(int iter) {
+  int started_pipe[2] = {};
+  int release_pipe[2] = {};
+  if (pipe(started_pipe) != 0 || pipe(release_pipe) != 0) {
+    return 10;
+  }
+
+  const int expected_exit = 40 + iter;
+  pid_t child = fork();
+  if (child == 0) {
+    close(started_pipe[0]);
+    close(started_pipe[1]);
+    close(release_pipe[1]);
+    char byte = 0;
+    if (read(release_pipe[0], &byte, 1) != 1) {
+      _exit(11);
+    }
+    close(release_pipe[0]);
+    _exit(expected_exit);
+  }
+  if (child < 0) {
+    return 12;
+  }
+
+  close(release_pipe[0]);
+
+  StartThenReleaseArgs release_args {};
+  release_args.started_fd = started_pipe[0];
+  release_args.release_fd = release_pipe[1];
+  release_args.delay_usec = 20000;
+  pthread_t release_thread {};
+  if (pthread_create(&release_thread, nullptr, WaitForStartThenRelease,
+                     &release_args) != 0) {
+    kill(child, SIGKILL);
+    waitpid(child, nullptr, 0);
+    return 13;
+  }
+
+  char started = 's';
+  if (!WriteExact(started_pipe[1], &started, 1)) {
+    kill(child, SIGKILL);
+    waitpid(child, nullptr, 0);
+    pthread_join(release_thread, nullptr);
+    return 14;
+  }
+  close(started_pipe[1]);
+
+  int status = 0;
+  errno = 0;
+  pid_t ret = wait4(child, &status, 0, nullptr);
+  int wait_errno = errno;
+  pthread_join(release_thread, nullptr);
+  close(started_pipe[0]);
+  close(release_pipe[1]);
+
+  if (ret != child) {
+    kill(child, SIGKILL);
+    waitpid(child, nullptr, WNOHANG);
+    return wait_errno == ECHILD ? 15 : 16;
+  }
+  if (!WIFEXITED(status)) {
+    return 17;
+  }
+  if (WEXITSTATUS(status) != expected_exit) {
+    return 18;
+  }
+  return 0;
+}
+
 }  // namespace
 
 TEST(WaitRusage, WaitidReportsChildRealUid) {
@@ -603,6 +713,51 @@ TEST(WaitRusage, WaitPidSelfReturnsEchild) {
   EXPECT_EQ(-1, syscall(SYS_waitid, P_PID, getpid(), &si,
                         WEXITED | WNOHANG, nullptr));
   EXPECT_EQ(ECHILD, errno);
+}
+
+TEST(WaitRusage, WaitidWnohangLiveChildClearsSiginfoAndLeavesRusage) {
+  int release_pipe[2] = {};
+  ASSERT_EQ(0, pipe(release_pipe)) << strerror(errno);
+
+  pid_t child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    close(release_pipe[1]);
+    char byte = 0;
+    if (read(release_pipe[0], &byte, 1) != 1) {
+      _exit(2);
+    }
+    close(release_pipe[0]);
+    _exit(0);
+  }
+  close(release_pipe[0]);
+
+  siginfo_t si {};
+  memset(&si, 0x5a, sizeof(si));
+  struct rusage usage {};
+  memset(&usage, 0x5a, sizeof(usage));
+  unsigned char usage_before[sizeof(usage)] = {};
+  memcpy(usage_before, &usage, sizeof(usage));
+
+  ASSERT_EQ(0, syscall(SYS_waitid, P_PID, child, &si,
+                       WEXITED | WNOHANG, &usage))
+      << strerror(errno);
+  EXPECT_EQ(0, si.si_signo);
+  EXPECT_EQ(0, si.si_code);
+  EXPECT_EQ(0, si.si_pid);
+  EXPECT_EQ(0, si.si_status);
+  EXPECT_EQ(0, memcmp(usage_before, &usage, sizeof(usage)));
+
+  ASSERT_EQ(0, syscall(SYS_waitid, P_PID, child, nullptr,
+                       WEXITED | WNOHANG, nullptr))
+      << strerror(errno);
+
+  ASSERT_EQ(1, write(release_pipe[1], "x", 1)) << strerror(errno);
+  close(release_pipe[1]);
+  int status = 0;
+  ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(0, WEXITSTATUS(status));
 }
 
 TEST(WaitRusage, CloneParentChildNotWaitableByCreatorWithWnothread) {
@@ -1229,6 +1384,32 @@ TEST(WaitRusage, ConcurrentExitingThreadsDoNotKeepChildOnDyingReaper) {
     ASSERT_EQ(helper, waitpid(helper, &status, 0)) << strerror(errno);
     ASSERT_TRUE(WIFEXITED(status)) << "iter=" << iter << " status=" << status;
     EXPECT_EQ(41, WEXITSTATUS(status)) << "iter=" << iter;
+  }
+}
+
+TEST(WaitRusage, BlockingWait4ChildExitDoesNotLoseWakeup) {
+  for (int iter = 0; iter < 5; ++iter) {
+    pid_t helper = fork();
+    ASSERT_GE(helper, 0) << strerror(errno);
+    if (helper == 0) {
+      _exit(BlockingWaitExitRaceHelper(iter));
+    }
+
+    int status = 0;
+    int wait_errno = 0;
+    pid_t wait_ret = WaitPidWithTimeout(helper, &status, 3000000, &wait_errno);
+    if (wait_ret == 0) {
+      kill(helper, SIGKILL);
+      waitpid(helper, nullptr, 0);
+      FAIL() << "blocking wait helper timed out at iter=" << iter
+             << " helper=" << helper;
+    }
+    ASSERT_EQ(helper, wait_ret) << "iter=" << iter << " helper=" << helper
+                                << " errno=" << wait_errno << " ("
+                                << strerror(wait_errno) << ")";
+
+    ASSERT_TRUE(WIFEXITED(status)) << "iter=" << iter << " status=" << status;
+    EXPECT_EQ(0, WEXITSTATUS(status)) << "iter=" << iter;
   }
 }
 

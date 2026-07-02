@@ -80,6 +80,13 @@ pub fn unlink_tracee(tracee: &Arc<ProcessControlBlock>) {
         let raw_pid = tracee.raw_pid();
         tracer.ptraced.write_irqsave().retain(|pid| *pid != raw_pid);
     }
+
+    // Detaching can make a tracee observable by its natural parent again.
+    // Wake the DragonOS wait owner pair (parent task + group leader), matching
+    // Linux's shared signal->wait_chldexit visibility.
+    if let Some(real_parent) = tracee.real_parent_pcb() {
+        ProcessManager::wake_wait_parent(&real_parent);
+    }
 }
 
 pub fn exit_ptrace(tracer: &Arc<ProcessControlBlock>) {
@@ -105,10 +112,11 @@ pub fn exit_ptrace(tracer: &Arc<ProcessControlBlock>) {
                 tracee.flags().remove(ProcessFlags::PTRACED);
             }
         }
+        // Releasing a tracee from this tracer can make it naturally waitable.
+        // Wake both the concrete parent and its thread-group leader; see
+        // ProcessManager::wake_wait_parent() for the wait queue invariant.
         if let Some(real_parent) = tracee.real_parent_pcb() {
-            real_parent
-                .wait_queue
-                .wakeup_all(Some(super::ProcessState::Blocked(true)));
+            ProcessManager::wake_wait_parent(&real_parent);
         }
     }
 }

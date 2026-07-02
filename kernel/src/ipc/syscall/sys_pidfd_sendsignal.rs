@@ -39,8 +39,8 @@ impl SysPidfdSendSignalHandle {
         args[1] as c_int
     }
     #[inline(always)]
-    fn siginfo(args: &[usize]) -> *mut i32 {
-        args[2] as *mut i32
+    fn siginfo(args: &[usize]) -> *const PosixSigInfo {
+        args[2] as *const PosixSigInfo
     }
     #[inline(always)]
     fn flags(args: &[usize]) -> usize {
@@ -97,11 +97,7 @@ impl Syscall for SysPidfdSendSignalHandle {
                 },
             )
         } else {
-            let reader = UserBufferReader::new(
-                sig_info as *const PosixSigInfo,
-                size_of::<PosixSigInfo>(),
-                true,
-            )?;
+            let reader = UserBufferReader::new(sig_info, size_of::<PosixSigInfo>(), true)?;
             let buffer = reader.buffer_protected(0)?;
             let user_info = buffer.read_one::<PosixSigInfo>(0)?;
             if user_info.si_signo != sig_c_int {

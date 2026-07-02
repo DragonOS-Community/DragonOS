@@ -55,7 +55,7 @@ fn raw_siginfo_pid(pid: i32) -> RawPid {
     RawPid::new(pid as usize)
 }
 
-fn sig_type_from_user_siginfo(
+pub(crate) fn sig_type_from_user_siginfo(
     signal: Signal,
     code_enum: SigCode,
     user_info: &PosixSigInfo,

@@ -94,6 +94,7 @@ pub mod idle;
 pub mod kthread;
 pub mod namespace;
 pub mod pid;
+pub mod pidfd;
 pub mod posix_timer;
 pub mod preempt;
 pub mod process_group;
@@ -872,6 +873,7 @@ impl ProcessManager {
         // mt-exec: leader 退出时只标记 zombie，避免触发普通退出通知/收养
         if is_mt_exec_leader {
             current.set_exit_state_zombie();
+            Self::wake_pidfd_pollers_for_task_exit(current);
             return;
         }
         // 让INIT进程收养所有子进程
@@ -884,6 +886,7 @@ impl ProcessManager {
             ProcessManager::exit_ptrace(current);
             // 在通知父进程之前，先标记为 Zombie，保证 wait 可见
             current.set_exit_state_zombie();
+            Self::wake_pidfd_pollers_for_task_exit(current);
             let r = current.parent_pcb.read_irqsave().upgrade();
             if r.is_none() {
                 return;
@@ -953,6 +956,16 @@ impl ProcessManager {
             }
 
             // todo: 这里还需要根据线程组的信息，决定信号的发送
+        }
+    }
+
+    fn wake_pidfd_pollers_for_task_exit(task: &Arc<ProcessControlBlock>) {
+        let thread_pid = task.pid();
+        thread_pid.wake_pidfd_pollers();
+        if let Some(tgid_pid) = task.task_pid_ptr(PidType::TGID) {
+            if !Arc::ptr_eq(&thread_pid, &tgid_pid) {
+                tgid_pid.wake_pidfd_pollers();
+            }
         }
     }
 
@@ -2891,6 +2904,13 @@ impl ProcessControlBlock {
         self.sched_info.state().is_exited()
     }
 
+    /// DragonOS sets `ProcessState::Exited` after the task has left user-visible
+    /// execution, before `ExitState::Zombie`; it is no longer a live thread-group
+    /// member for wait/pidfd readiness.
+    pub(crate) fn is_live_thread_group_member(&self) -> bool {
+        !self.is_exited() && !self.is_zombie() && !self.is_dead()
+    }
+
     pub fn exit_code(&self) -> Option<usize> {
         self.sched_info.state().exit_code()
     }
@@ -2994,6 +3014,18 @@ impl ProcessControlBlock {
 
     pub fn is_thread_group_leader(&self) -> bool {
         self.exit_signal.load(Ordering::SeqCst) >= 0
+    }
+
+    pub(crate) fn thread_group_has_live_nonleader_threads(&self) -> bool {
+        if !self.is_thread_group_leader() {
+            return false;
+        }
+
+        self.threads_read_irqsave()
+            .group_tasks_clone()
+            .into_iter()
+            .filter_map(|task| task.upgrade())
+            .any(|task| task.is_live_thread_group_member())
     }
 
     /// 唤醒等待在本进程 `wait_queue` 上的所有等待者

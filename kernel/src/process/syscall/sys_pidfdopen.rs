@@ -1,13 +1,9 @@
 use crate::alloc::string::ToString;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_PIDFD_OPEN;
-use crate::filesystem::vfs::file::File;
 use crate::filesystem::vfs::file::FileFlags;
-use crate::filesystem::vfs::file::FilePrivateData;
-use crate::filesystem::vfs::FileType;
-use crate::filesystem::vfs::InodeMode;
-use crate::process::pid::PidPrivateData;
-use crate::process::ProcessManager;
+use crate::process::pidfd::PidFd;
+use crate::process::{ProcessManager, RawPid};
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use alloc::vec::Vec;
@@ -37,37 +33,37 @@ impl Syscall for SysPidFdOpen {
         let pid = Self::pid(args);
         let flags = Self::flags(args);
 
-        let mode = InodeMode::from_bits(flags).ok_or_else(|| {
-            log::error!("SysPidFdOpen: failed to get mode!");
-            SystemError::EINVAL
-        })?;
-        let file_type = FileType::from(mode);
-        let file_mode = FileFlags::from_bits(flags).ok_or_else(|| {
-            log::error!("SysPidFdOpen: failed to get file_mode!");
-            SystemError::EINVAL
-        })?;
-
-        let root_inode = ProcessManager::current_mntns().root_inode();
-        let name = format!(
-            "Pidfd(from {} to {})",
-            ProcessManager::current_pcb().raw_pid().data(),
-            pid
-        );
-        let new_inode = root_inode.create(&name, file_type, mode)?;
-        let file = File::new(new_inode, file_mode)?;
-        {
-            let mut guard = file.private_data.lock();
-            *guard = FilePrivateData::Pid(PidPrivateData::new(pid));
+        if pid <= 0 {
+            return Err(SystemError::EINVAL);
         }
+
+        let valid_flags = FileFlags::O_NONBLOCK.bits();
+        if flags & !valid_flags != 0 {
+            return Err(SystemError::EINVAL);
+        }
+
+        let mut file_flags = FileFlags::empty();
+        if flags & FileFlags::O_NONBLOCK.bits() != 0 {
+            file_flags.insert(FileFlags::O_NONBLOCK);
+        }
+        let pid = ProcessManager::find_vpid(RawPid::new(pid as usize)).ok_or(SystemError::ESRCH)?;
+        let current = ProcessManager::current_pcb();
+        let prepared = PidFd::prepare(&current, pid, file_flags, true)?;
 
         // 存入pcb
         // Linux 的 __pidfd_prepare() 无条件对 pidfd 设置 O_CLOEXEC，
         // 无论用户传入什么 flags，pidfd 始终是 close-on-exec 的。
-        ProcessManager::current_pcb()
-            .fd_table()
-            .write()
-            .alloc_fd(file, None, true)
-            .map(|fd| fd as usize)
+        let reservation = prepared.reservation;
+        let file = prepared.file;
+        let fd_table = current.fd_table();
+        let mut fd_table = fd_table.write();
+        match fd_table.install_reserved_fd(reservation, file) {
+            Ok(fd) => Ok(fd as usize),
+            Err(err) => {
+                fd_table.release_reserved_fd(reservation);
+                Err(err)
+            }
+        }
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

@@ -163,6 +163,19 @@ fn push_wait_candidate(
     candidates.push(WaitCandidate { child, relations });
 }
 
+// Wait invariants:
+// - Natural children and ptrace tracees are separate relations. A task that is
+//   present in both sets must be considered through ptrace first, matching Linux
+//   wait_consider_task() for children traced by the caller's thread group.
+// - `children` is a scan index; `wait_parent_pcb` is the thread-level owner used
+//   by __WNOTHREAD. Reparent and ptrace unlink paths must wake the concrete
+//   parent and its group leader via ProcessManager::wake_wait_parent().
+// - `ProcessState::Exited` carries the wait status; `ExitState::Zombie` publishes
+//   wait visibility; `try_mark_dead_from_zombie()` is the only non-WNOWAIT reap
+//   ownership transition. WNOWAIT must not release or account child rusage.
+// - DragonOS does not yet model Linux EXIT_TRACE. Ptrace wait support is limited
+//   to the current ptrace relation list and basic exit/stop reporting; full
+//   ptrace detach/real-parent cascade semantics require a separate design.
 fn wait_candidate_children(options: WaitOption) -> Vec<WaitCandidate> {
     let current = ProcessManager::current_pcb();
     let leader = get_thread_group_leader(&current);
@@ -296,17 +309,10 @@ pub fn kernel_waitid(
         //     writer.size()
         // );
         use crate::ipc::signal_types::{PosixSigInfo, PosixSiginfoFields, PosixSiginfoSigchld};
-        let mut si = PosixSigInfo {
-            si_signo: 0,
-            si_errno: 0,
-            si_code: 0,
-            _sifields: PosixSiginfoFields {
-                _kill: crate::ipc::signal_types::PosixSiginfoKill {
-                    si_pid: 0,
-                    si_uid: 0,
-                },
-            },
-        };
+        // Linux waitid() writes an all-zero siginfo when WNOHANG finds no event.
+        // Zero the whole union, not just the small _kill variant, so fields such
+        // as _sigchld.si_status cannot leak stale stack bytes.
+        let mut si = unsafe { core::mem::zeroed::<PosixSigInfo>() };
         if let Some(info) = &kwo.ret_info {
             si.si_signo = Signal::SIGCHLD as i32; // SIGCHLD
             si.si_errno = 0;

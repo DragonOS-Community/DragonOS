@@ -928,31 +928,16 @@ impl ProcessManager {
                 }
             }
 
-            // 无论exit_signal是什么值，都要唤醒父进程的wait_queue
-            // 因为父进程可能使用__WALL选项等待任何类型的子进程（包括exit_signal=0的clone子进程）
-            // 根据Linux语义，exit_signal只决定发送什么信号，不决定是否唤醒父进程
-            parent_pcb
-                .wait_queue
-                .wakeup_all(Some(ProcessState::Blocked(true)));
+            // Wake the wait parent regardless of exit_signal value.
+            // exit_signal only determines which signal to send, not whether to wake wait.
+            // DragonOS waiters sleep on per-task wait_queue, so we must also wake
+            // the parent's thread-group leader to compensate for Linux's shared
+            // signal->wait_chldexit queue semantics.
+            ProcessManager::wake_wait_parent(&parent_pcb);
 
             // kthread 退出时显式唤醒 kthreadd，使其回收 zombie
             if is_kthread {
                 let _ = ProcessManager::wakeup(&parent_pcb);
-            }
-
-            // 根据 Linux wait 语义，线程组中的任何线程都可以等待同一线程组中任何线程创建的子进程。
-            // 由于子进程被添加到线程组 leader 的 children 列表中，
-            // 因此还需要唤醒线程组 leader 的 wait_queue（如果 leader 不是 parent_pcb 本身）。
-            let parent_group_leader = {
-                let ti = parent_pcb.thread.read_irqsave();
-                ti.group_leader()
-            };
-            if let Some(leader) = parent_group_leader {
-                if !Arc::ptr_eq(&leader, &parent_pcb) {
-                    leader
-                        .wait_queue
-                        .wakeup_all(Some(ProcessState::Blocked(true)));
-                }
             }
 
             // todo: 这里还需要根据线程组的信息，决定信号的发送
@@ -1291,6 +1276,31 @@ impl ProcessManager {
 
     pub fn exit_ptrace(tracer: &Arc<ProcessControlBlock>) {
         ptrace::exit_ptrace(tracer)
+    }
+
+    /// Wake waiters that can observe child state changes through `parent`.
+    ///
+    /// Linux uses the thread-group shared `signal->wait_chldexit` queue.
+    /// DragonOS currently has one `wait_queue` per task, while `do_wait()`
+    /// sleeps on the caller's thread-group leader. Any path that publishes a
+    /// wait-visible transition through a parent relation must therefore wake
+    /// both the concrete parent task and its thread-group leader.
+    pub(crate) fn wake_wait_parent(parent: &Arc<ProcessControlBlock>) {
+        parent
+            .wait_queue
+            .wakeup_all(Some(ProcessState::Blocked(true)));
+
+        let parent_group_leader = {
+            let ti = parent.thread.read_irqsave();
+            ti.group_leader()
+        };
+        if let Some(leader) = parent_group_leader {
+            if !Arc::ptr_eq(&leader, parent) {
+                leader
+                    .wait_queue
+                    .wakeup_all(Some(ProcessState::Blocked(true)));
+            }
+        }
     }
 
     /// 上下文切换完成后的钩子函数
@@ -2519,6 +2529,13 @@ impl ProcessControlBlock {
         child.basic.write_irqsave().ppid = parent_pid_in_child_ns;
 
         ProcessControlBlock::link_child_to_parent_list(child, new_parent);
+
+        // Linux reparent_leader() notifies the new parent when a zombie child
+        // becomes wait-visible through reparenting. DragonOS keeps per-task wait
+        // queues, so wake both the concrete new parent and its group leader.
+        if child.is_zombie() {
+            ProcessManager::wake_wait_parent(new_parent);
+        }
     }
 
     pub(crate) fn reparent_child_links_from_thread_group(

@@ -1,9 +1,8 @@
+use crate::arch::CurrentIrqArch;
 use crate::exception::InterruptArch;
-use crate::ipc::signal_types::SigType;
+use crate::ipc::signal_types::{SigInfo, SigType};
 use crate::process::pid::PidType;
-use crate::process::CurrentIrqArch;
 use crate::process::ProcessControlBlock;
-use crate::process::SigInfo;
 use crate::time::timer::{clock, Jiffies, Timer, TimerFunction};
 use crate::{arch::ipc::signal::Signal, ipc::signal_types::SigCode};
 use alloc::{boxed::Box, sync::Arc, sync::Weak};
@@ -11,29 +10,29 @@ use core::sync::atomic::compiler_fence;
 use core::time::Duration;
 use system_error::SystemError;
 
-/// 闹钟结构体
+/// Alarm timer structure.
 #[derive(Debug)]
 pub struct AlarmTimer {
-    /// 闹钟内置定时器
+    /// Built-in timer of the alarm.
     pub timer: Arc<Timer>,
-    /// 闹钟触发时间
+    /// Alarm trigger time.
     expired_second: u64,
 }
 
 impl AlarmTimer {
-    /// # 创建闹钟结构体
-    ///  
-    /// 自定义定时器触发函数和截止时间来创建闹钟结构体
+    /// # Create an alarm timer structure.
     ///
-    /// ## 函数参数
+    /// Create an alarm timer struct with a custom timer trigger function and
+    /// deadline.
     ///
-    /// timer_func：定时器触发函数
+    /// ## Parameters
     ///
-    /// second：设置alarm触发的秒数
+    /// - `timer_func`: The timer trigger function.
+    /// - `second`: The number of seconds until the alarm fires.
     ///
-    /// ### 函数返回值
+    /// ### Returns
     ///
-    /// Self
+    /// `Self`
     pub fn new(timer_func: Box<dyn TimerFunction>, second: u64) -> Self {
         let expired_jiffies =
             <Jiffies as From<Duration>>::from(Duration::from_secs(second)).timer_jiffies();
@@ -43,25 +42,24 @@ impl AlarmTimer {
         };
         result
     }
-    /// # 启动闹钟
+    /// # Activate the alarm.
     pub fn activate(&self) {
         let timer = self.timer.clone();
         timer.activate();
     }
 
-    /// # 初始化目标进程的alarm定时器
+    /// # Initialize an alarm timer for a target process.
     ///
-    /// 创建一个闹钟结构体并启动闹钟
+    /// Create an alarm timer structure and activate it.
     ///
-    /// ## 函数参数
+    /// ## Parameters
     ///
-    /// pcb：发送信号的目标进程
+    /// - `pcb`: The target process to send the signal to.
+    /// - `second`: The number of seconds until the alarm fires.
     ///
-    /// second：设置alarm触发的秒数
+    /// ### Returns
     ///
-    /// ### 函数返回值
-    ///
-    /// AlarmTimer结构体
+    /// An `AlarmTimer` struct.
     pub fn alarm_timer_init(pcb: Arc<ProcessControlBlock>, second: u64) -> AlarmTimer {
         let timerfunc = AlarmTimerFunc::new(pcb);
         let alarmtimer = AlarmTimer::new(timerfunc, second);
@@ -69,12 +67,12 @@ impl AlarmTimer {
         alarmtimer
     }
 
-    /// # 查看闹钟是否触发
+    /// # Check whether the alarm has fired.
     pub fn timeout(&self) -> bool {
         self.timer.timeout()
     }
 
-    /// # 返回闹钟定时器剩余时间
+    /// # Returns the remaining time on the alarm timer.
     pub fn remain(&self) -> Duration {
         if self.timer.timeout() {
             Duration::ZERO
@@ -93,17 +91,18 @@ impl AlarmTimer {
             remain_second
         }
     }
-    /// # 取消闹钟
+    /// # Cancel the alarm.
     pub fn cancel(&self) {
         self.timer.cancel();
     }
 }
 
-/// # 闹钟TimerFunction结构体
+/// # Alarm `TimerFunction` struct.
 ///
-/// ## 结构成员
+/// ## Struct Members
 ///
-/// target_pcb：发送信号的目标进程（弱引用，进程退出后自动失效）
+/// - `target_pcb`: The target process to send the signal to (weak reference;
+///   automatically invalidated after the process exits).
 #[derive(Debug)]
 pub struct AlarmTimerFunc {
     target_pcb: Weak<ProcessControlBlock>,
@@ -118,14 +117,15 @@ impl AlarmTimerFunc {
 }
 
 impl TimerFunction for AlarmTimerFunc {
-    /// # 闹钟触发函数
+    /// # Alarm trigger function.
     ///
-    /// 闹钟触发时，向目标进程发送一个SIGALRM信号。
-    /// 如果目标进程已退出（弱引用升级失败），则静默返回。
+    /// When the alarm fires, sends a SIGALRM signal to the target process.
+    /// If the target process has already exited (weak reference upgrade fails),
+    /// silently returns.
     fn run(&mut self) -> Result<(), SystemError> {
         let pcb = match self.target_pcb.upgrade() {
             Some(pcb) => pcb,
-            None => return Ok(()), // 进程已退出，无需发送信号
+            None => return Ok(()), // Process has already exited; no signal needed.
         };
 
         let pid = pcb.raw_pid();

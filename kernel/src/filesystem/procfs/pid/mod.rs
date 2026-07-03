@@ -45,7 +45,7 @@ use id_map::{IdMapFileOps, SetgroupsFileOps};
 use limits::LimitsFile;
 use maps::MapsFileOps;
 use ns::NsDirOps;
-use oom_score_adj::OomScoreAdjFileOps;
+use oom_score_adj::{OomScoreAdjFileOps, OomScoreFileOps};
 use stat::StatFileOps;
 use statm::StatmFileOps;
 use status::StatusFileOps;
@@ -180,6 +180,9 @@ impl PidDirOps {
         }),
         ("mountstats", |ops, parent| {
             MountProcFileOps::new_inode(ops.target.clone(), ProcMountRenderKind::MountStats, parent)
+        }),
+        ("oom_score", |ops, parent| {
+            OomScoreFileOps::new_inode(ops.target.clone(), parent)
         }),
         ("oom_score_adj", |ops, parent| {
             OomScoreAdjFileOps::new_inode(ops.target.clone(), parent)

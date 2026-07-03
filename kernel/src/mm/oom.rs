@@ -4,6 +4,7 @@ use alloc::{
     string::ToString,
     sync::{Arc, Weak},
 };
+use core::sync::atomic::{AtomicU64, Ordering};
 use log::{error, warn};
 use system_error::SystemError;
 
@@ -20,6 +21,7 @@ use super::ucontext::AddressSpace;
 static OOM_WAITQ: WaitQueue = WaitQueue::default();
 static OOM_STATE: SpinLock<OomState> = SpinLock::new(OomState::new());
 static OOM_FAULT_INJECT: SpinLock<OomFaultInject> = SpinLock::new(OomFaultInject::disabled());
+static OOM_KILL_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy)]
 pub struct OomContext {
@@ -129,6 +131,7 @@ fn is_global_init_or_kthread(leader: &Arc<ProcessControlBlock>) -> bool {
 fn should_skip_candidate(leader: &Arc<ProcessControlBlock>, oom_score_adj: i16) -> bool {
     is_global_init_or_kthread(leader)
         || leader.flags().contains(ProcessFlags::EXITING)
+        || leader.flags().contains(ProcessFlags::OOM_VICTIM)
         || leader.is_active_vfork()
         || oom_score_adj == OOM_SCORE_ADJ_MIN
 }
@@ -150,6 +153,29 @@ fn oom_score(mm: &Arc<AddressSpace>, oom_score_adj: i16, total_pages: isize) -> 
     let resident_pages = mm.resident_pages().min(isize::MAX as usize) as isize;
     let adjustment = (oom_score_adj as isize).saturating_mul(total_pages) / 1000;
     resident_pages.saturating_add(adjustment)
+}
+
+pub fn proc_oom_score(pcb: &Arc<ProcessControlBlock>) -> usize {
+    let oom_score_adj = pcb.sig_info_irqsave().oom_score_adj();
+    if oom_score_adj == OOM_SCORE_ADJ_MIN {
+        return 0;
+    }
+
+    let Some(mm) = pcb.basic().user_vm() else {
+        return 0;
+    };
+    let total_pages = total_system_pages();
+    let points = oom_score(&mm, oom_score_adj, total_pages).max(0);
+    let score = points.saturating_mul(1000) / total_pages;
+    score.clamp(0, 1000) as usize
+}
+
+pub fn oom_kill_count() -> u64 {
+    OOM_KILL_COUNT.load(Ordering::Relaxed)
+}
+
+fn count_oom_kill() {
+    OOM_KILL_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
 fn task_uses_mm(task: &Arc<ProcessControlBlock>, mm: &Arc<AddressSpace>) -> bool {
@@ -279,6 +305,14 @@ fn send_oom_sigkill(candidate: &OomCandidate) -> Result<(), SystemError> {
     let mut sent = false;
     let targets = kill_targets_for_mm(&candidate.mm);
 
+    // Mark all tasks sharing the victim's mm as OOM victims so the allocator
+    // grants them memory reserves to complete exit (equivalent to Linux
+    // mark_oom_victim / TIF_MEMDIE). Must happen before SIGKILL delivery so
+    // the victim sees the flag even if it immediately enters exit.
+    for target in &targets {
+        target.flags().insert(ProcessFlags::OOM_VICTIM);
+    }
+
     for target in targets {
         let mut info = SigInfo::new(
             Signal::SIGKILL,
@@ -297,6 +331,19 @@ fn send_oom_sigkill(candidate: &OomCandidate) -> Result<(), SystemError> {
     }
 
     sent.then_some(()).ok_or(SystemError::ESRCH)
+}
+
+/// Clear OOM_VICTIM flag on current task. Called from ProcessControlBlock::exit().
+pub fn exit_oom_victim() {
+    let current = ProcessManager::current_pcb();
+    current.flags().remove(ProcessFlags::OOM_VICTIM);
+}
+
+/// Whether the current task is marked as an OOM victim.
+pub fn current_is_oom_victim() -> bool {
+    ProcessManager::current_pcb()
+        .flags()
+        .contains(ProcessFlags::OOM_VICTIM)
 }
 
 fn wait_for_oom_slot() -> Result<(), SystemError> {
@@ -331,7 +378,7 @@ fn wait_until_recoverable(generation: u64) -> Result<(), SystemError> {
             match state.inflight.as_ref() {
                 None => true,
                 Some(victim) if victim.generation == generation => victim_has_progress(victim),
-                Some(victim) => victim_has_progress(victim),
+                Some(_) => true,
             }
         },
         None::<fn()>,
@@ -375,6 +422,7 @@ pub fn pagefault_out_of_memory(ctx: OomContext) -> OomOutcome {
         let victim_resident_pages = candidate.resident_pages;
         match send_oom_sigkill(&candidate) {
             Ok(()) => {
+                count_oom_kill();
                 error!(
                     "oom-kill: trigger_pid={} trigger_tgid={} victim_tgid={} score={} adj={} rss={} order={} addr={:#x} ip={:#x}",
                     ctx.trigger_pid,

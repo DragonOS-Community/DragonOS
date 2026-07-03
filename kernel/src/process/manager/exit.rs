@@ -198,6 +198,9 @@ impl ProcessManager {
         {
             let pcb = current_pcb.clone();
             pcb.mark_exiting();
+            // Clear OOM victim flag: the task is exiting and no longer needs
+            // memory reserves. Equivalent to Linux exit_oom_victim().
+            crate::mm::oom::exit_oom_victim();
             pid = pcb.pid();
             if pid.is_child_reaper() {
                 pid.ns_of_pid().disable_pid_allocation();

@@ -75,8 +75,16 @@ pub(super) fn do_mlock(
         let new_pages = guard.count_unlocked_pages_for_mlock(start, len)?;
         check_mlock_rlimit(guard.locked_vm, new_pages)?;
 
-        guard.apply_vma_lock_flags(start, len, new_flags, false)?;
-        return Ok(0);
+        match guard.apply_vma_lock_flags_collect(start, len, new_flags, false) {
+            Ok(()) => return Ok(0),
+            Err(failure) => {
+                drop(guard);
+                crate::mm::ucontext::InnerAddressSpace::notify_close_notifications(
+                    failure.notifications,
+                );
+                return Err(failure.err);
+            }
+        }
     }
 }
 

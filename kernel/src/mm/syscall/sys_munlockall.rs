@@ -25,8 +25,16 @@ impl Syscall for SysMunlockallHandle {
                 vm.wait_for_no_reservations_interruptible()?;
                 continue;
             }
-            guard.clear_all_vma_lock_flags()?;
-            return Ok(0);
+            match guard.clear_all_vma_lock_flags_collect() {
+                Ok(()) => return Ok(0),
+                Err(failure) => {
+                    drop(guard);
+                    crate::mm::ucontext::InnerAddressSpace::notify_close_notifications(
+                        failure.notifications,
+                    );
+                    return Err(failure.err);
+                }
+            }
         }
     }
 

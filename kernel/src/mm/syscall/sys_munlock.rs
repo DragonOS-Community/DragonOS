@@ -38,8 +38,16 @@ impl Syscall for SysMunlockHandle {
                 vm.wait_for_no_reservation_conflict_interruptible(region)?;
                 continue;
             }
-            guard.apply_vma_lock_flags(start, len, VmFlags::VM_NONE, false)?;
-            return Ok(0);
+            match guard.apply_vma_lock_flags_collect(start, len, VmFlags::VM_NONE, false) {
+                Ok(()) => return Ok(0),
+                Err(failure) => {
+                    drop(guard);
+                    crate::mm::ucontext::InnerAddressSpace::notify_close_notifications(
+                        failure.notifications,
+                    );
+                    return Err(failure.err);
+                }
+            }
         }
     }
 

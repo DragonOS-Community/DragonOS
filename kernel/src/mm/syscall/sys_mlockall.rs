@@ -74,7 +74,13 @@ fn do_mlockall(flags: usize) -> Result<usize, SystemError> {
         guard.set_mlock_future(VmFlags::VM_NONE);
 
         if flags & MCL_CURRENT != 0 {
-            guard.apply_mlockall_current(lock_flags)?;
+            if let Err(failure) = guard.apply_mlockall_current_collect(lock_flags) {
+                drop(guard);
+                crate::mm::ucontext::InnerAddressSpace::notify_close_notifications(
+                    failure.notifications,
+                );
+                return Err(failure.err);
+            }
         }
 
         if flags & MCL_FUTURE != 0 {

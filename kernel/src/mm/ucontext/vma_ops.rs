@@ -18,16 +18,23 @@ impl InnerAddressSpace {
         start_page: VirtPageFrame,
         page_count: PageFrameCount,
     ) -> Result<(), SystemError> {
-        let notifications = self.munmap_collect(start_page, page_count)?;
-        Self::notify_close_notifications(notifications);
-        Ok(())
+        match self.munmap_collect(start_page, page_count) {
+            Ok(notifications) => {
+                Self::notify_close_notifications(notifications);
+                Ok(())
+            }
+            Err(failure) => {
+                Self::notify_close_notifications(failure.notifications);
+                Err(failure.err)
+            }
+        }
     }
 
     pub(super) fn munmap_collect(
         &mut self,
         start_page: VirtPageFrame,
         page_count: PageFrameCount,
-    ) -> Result<VmaCloseNotifications, SystemError> {
+    ) -> Result<VmaCloseNotifications, VmaOpFailure> {
         defer!({
             compiler_fence(Ordering::SeqCst);
         });
@@ -70,7 +77,10 @@ impl InnerAddressSpace {
                     for plan in plans {
                         plan.split_lifecycle.rollback_into(&mut notifications);
                     }
-                    return Err(SystemError::EFAULT);
+                    return Err(VmaOpFailure {
+                        err: SystemError::EFAULT,
+                        notifications,
+                    });
                 };
                 (
                     original_region,
@@ -85,7 +95,10 @@ impl InnerAddressSpace {
                     for plan in plans {
                         plan.split_lifecycle.rollback_into(&mut notifications);
                     }
-                    return Err(SystemError::EFAULT);
+                    return Err(VmaOpFailure {
+                        err: SystemError::EFAULT,
+                        notifications,
+                    });
                 };
                 locked_vm_after_commit = next_locked_vm;
                 Some(locked_vm_after_commit)
@@ -99,7 +112,8 @@ impl InnerAddressSpace {
                     for plan in plans {
                         plan.split_lifecycle.rollback_into(&mut notifications);
                     }
-                    return Err(failure.rollback_into(&mut notifications));
+                    let err = failure.rollback_into(&mut notifications);
+                    return Err(VmaOpFailure { err, notifications });
                 }
             };
 
@@ -120,7 +134,10 @@ impl InnerAddressSpace {
                     for plan in plans {
                         plan.split_lifecycle.rollback_into(&mut notifications);
                     }
-                    return Err(SystemError::EFAULT);
+                    return Err(VmaOpFailure {
+                        err: SystemError::EFAULT,
+                        notifications,
+                    });
                 }
             };
             let (before, after) = {
@@ -133,7 +150,10 @@ impl InnerAddressSpace {
                     for plan in plans {
                         plan.split_lifecycle.rollback_into(&mut notifications);
                     }
-                    return Err(SystemError::EFAULT);
+                    return Err(VmaOpFailure {
+                        err: SystemError::EFAULT,
+                        notifications,
+                    });
                 };
                 let before = split_result.prev;
                 let after = split_result.after;
@@ -1204,6 +1224,13 @@ impl InnerAddressSpace {
     ) -> Result<VirtRegion, SystemError> {
         self.find_free_at_internal(min_vaddr, vaddr, size, flags, false)
             .map(|(region, _)| region)
+            .map_err(|failure| {
+                debug_assert!(
+                    failure.notifications.is_empty(),
+                    "non-collecting find_free_at must not unmap existing VMAs"
+                );
+                failure.err
+            })
     }
 
     pub(super) fn find_free_at_collect(
@@ -1212,7 +1239,7 @@ impl InnerAddressSpace {
         vaddr: VirtAddr,
         size: usize,
         flags: MapFlags,
-    ) -> Result<(VirtRegion, VmaCloseNotifications), SystemError> {
+    ) -> Result<(VirtRegion, VmaCloseNotifications), VmaOpFailure> {
         self.find_free_at_internal(min_vaddr, vaddr, size, flags, true)
     }
 
@@ -1223,7 +1250,7 @@ impl InnerAddressSpace {
         size: usize,
         flags: MapFlags,
         unmap_fixed: bool,
-    ) -> Result<(VirtRegion, VmaCloseNotifications), SystemError> {
+    ) -> Result<(VirtRegion, VmaCloseNotifications), VmaOpFailure> {
         // If no address was specified, search for a free virtual memory range in the current process's address space.
         if vaddr == VirtAddr::new(0)
             && !flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE)
@@ -1240,7 +1267,7 @@ impl InnerAddressSpace {
             || end > MMArch::USER_END_VADDR.data()
             || !vaddr.check_aligned(MMArch::PAGE_SIZE)
         {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
 
         if vaddr < min_vaddr {
@@ -1263,14 +1290,14 @@ impl InnerAddressSpace {
             .first_reservation_conflict(requested)
             .is_some()
         {
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
         }
 
         let has_conflict = self.mappings.has_conflict(requested);
         if has_conflict {
             if flags.contains(MapFlags::MAP_FIXED_NOREPLACE) {
                 // If MAP_FIXED_NOREPLACE was specified and the target address cannot be mapped successfully, abort the mapping without adjusting the address
-                return Err(SystemError::EEXIST);
+                return Err(SystemError::EEXIST.into());
             }
 
             if flags.contains(MapFlags::MAP_FIXED) {

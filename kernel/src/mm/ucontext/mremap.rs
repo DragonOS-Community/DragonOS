@@ -78,13 +78,25 @@ impl InnerAddressSpace {
         if mremap_flags.contains(MremapFlags::MREMAP_FIXED) {
             let start_page = VirtPageFrame::new(new_vaddr);
             let page_count = PageFrameCount::from_bytes(new_len).unwrap();
-            notifications.extend(mremap_try!(self.munmap_collect(start_page, page_count)));
+            match self.munmap_collect(start_page, page_count) {
+                Ok(close_notifications) => notifications.extend(close_notifications),
+                Err(failure) => {
+                    notifications.extend(failure.notifications);
+                    mremap_fail!(failure.err);
+                }
+            }
         }
         if mremap_flags.contains(MremapFlags::MREMAP_FIXED) && old_len > new_len {
-            notifications.extend(mremap_try!(self.munmap_collect(
+            match self.munmap_collect(
                 VirtPageFrame::new(old_vaddr + new_len),
                 PageFrameCount::from_bytes(old_len - new_len).unwrap(),
-            )));
+            ) {
+                Ok(close_notifications) => notifications.extend(close_notifications),
+                Err(failure) => {
+                    notifications.extend(failure.notifications);
+                    mremap_fail!(failure.err);
+                }
+            }
             old_len = new_len;
         }
         // Read backing info of the old VMA (file/shared-anon) and the page offset base.
@@ -261,12 +273,14 @@ impl InnerAddressSpace {
         let new_region: VirtRegion = if let Some(new_region) = fixed_new_region {
             new_region
         } else if dontunmap_flag {
-            let (region, close_notifications) = mremap_try!(self.find_free_at_collect(
-                self.mmap_min,
-                new_vaddr,
-                new_len,
-                map_flags,
-            ));
+            let (region, close_notifications) =
+                match self.find_free_at_collect(self.mmap_min, new_vaddr, new_len, map_flags) {
+                    Ok(outcome) => outcome,
+                    Err(failure) => {
+                        notifications.extend(failure.notifications);
+                        mremap_fail!(failure.err);
+                    }
+                };
             notifications.extend(close_notifications);
             region
         } else {

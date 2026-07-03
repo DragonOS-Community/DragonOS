@@ -644,7 +644,10 @@ impl AddressSpace {
                     PageFrameCount::from_bytes(region.size()).unwrap(),
                 ) {
                     Ok(notifications) => close_notifications.extend(notifications),
-                    Err(err) => map_fail!(err),
+                    Err(failure) => {
+                        close_notifications.extend(failure.notifications);
+                        map_fail!(failure.err);
+                    }
                 }
             }
 
@@ -823,10 +826,18 @@ impl AddressSpace {
                 self.wait_for_no_reservation_conflict(region);
                 continue;
             }
-            let notifications = guard.munmap_collect(start_page, page_count)?;
-            drop(guard);
-            InnerAddressSpace::notify_close_notifications(notifications);
-            return Ok(());
+            match guard.munmap_collect(start_page, page_count) {
+                Ok(notifications) => {
+                    drop(guard);
+                    InnerAddressSpace::notify_close_notifications(notifications);
+                    return Ok(());
+                }
+                Err(failure) => {
+                    drop(guard);
+                    InnerAddressSpace::notify_close_notifications(failure.notifications);
+                    return Err(failure.err);
+                }
+            }
         }
     }
 

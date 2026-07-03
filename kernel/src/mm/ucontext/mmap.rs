@@ -212,10 +212,16 @@ impl InnerAddressSpace {
         self.check_rlimit_as_for_region(region, page_count.bytes(), map_flags)?;
 
         if map_flags.contains(MapFlags::MAP_FIXED) && self.mappings.has_conflict(region) {
-            let close_notifications = mmap_try!(self.munmap_collect(
+            let close_notifications = match self.munmap_collect(
                 VirtPageFrame::new(region.start()),
                 PageFrameCount::from_bytes(region.size()).unwrap(),
-            ));
+            ) {
+                Ok(close_notifications) => close_notifications,
+                Err(failure) => {
+                    notifications.extend(failure.notifications);
+                    mmap_fail!(failure.err);
+                }
+            };
             notifications.extend(close_notifications);
         }
 

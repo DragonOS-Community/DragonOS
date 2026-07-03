@@ -131,8 +131,29 @@ bool WaitForChild(pid_t child, int* status, int rounds = 300) {
     return false;
 }
 
-void WriteReport(int report_fd, const std::string& report) {
-    WriteAll(report_fd, report.c_str(), report.size());
+bool WriteReport(int report_fd, const std::string& report) {
+    return WriteAll(report_fd, report.c_str(), report.size());
+}
+
+bool DrainAvailableReport(int report_fd, std::string* report) {
+    for (;;) {
+        std::array<char, 256> buf = {};
+        ssize_t n = read(report_fd, buf.data(), buf.size());
+        if (n > 0) {
+            report->append(buf.data(), static_cast<size_t>(n));
+            continue;
+        }
+        if (n == 0) {
+            return true;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return true;
+        }
+        return false;
+    }
 }
 
 void KillAndReap(pid_t child) {
@@ -1198,7 +1219,9 @@ int RunPidNamespaceInteractiveShellAndReport(int report_fd) {
         return 39;
     }
 
-    WriteReport(report_fd, "OK");
+    if (!WriteReport(report_fd, "OK")) {
+        return 44;
+    }
     return 0;
 }
 
@@ -1242,11 +1265,7 @@ void ExpectVforkExecLsCompletesInChildPidNamespace() {
     int status = 0;
     bool exited = false;
     for (int elapsed_ms = 0; elapsed_ms < 5000; elapsed_ms += 10) {
-        char ch = 0;
-        ssize_t n = read(report_read.get(), &ch, 1);
-        if (n == 1) {
-            report.push_back(ch);
-        }
+        ASSERT_TRUE(DrainAvailableReport(report_read.get(), &report)) << strerror(errno);
         pid_t ret = waitpid(outer, &status, WNOHANG);
         if (ret == outer) {
             exited = true;
@@ -1260,6 +1279,7 @@ void ExpectVforkExecLsCompletesInChildPidNamespace() {
         KillAndReap(outer);
         FAIL() << "vfork+exec /bin/ls did not finish inside a child PID namespace";
     }
+    ASSERT_TRUE(DrainAvailableReport(report_read.get(), &report)) << strerror(errno);
     ASSERT_TRUE(WIFEXITED(status)) << "outer status=" << status;
     if (WEXITSTATUS(status) == 77) {
         GTEST_SKIP() << "CLONE_NEWPID is not available";
@@ -1308,11 +1328,7 @@ void ExpectInteractiveShellCommandsCompleteInChildPidNamespace() {
     int status = 0;
     bool exited = false;
     for (int elapsed_ms = 0; elapsed_ms < 10000; elapsed_ms += 10) {
-        std::array<char, 256> buf = {};
-        ssize_t n = read(report_read.get(), buf.data(), buf.size());
-        if (n > 0) {
-            report.append(buf.data(), static_cast<size_t>(n));
-        }
+        ASSERT_TRUE(DrainAvailableReport(report_read.get(), &report)) << strerror(errno);
 
         pid_t ret = waitpid(outer, &status, WNOHANG);
         if (ret == outer) {
@@ -1329,6 +1345,7 @@ void ExpectInteractiveShellCommandsCompleteInChildPidNamespace() {
                   "captured report: "
                << report;
     }
+    ASSERT_TRUE(DrainAvailableReport(report_read.get(), &report)) << strerror(errno);
     ASSERT_TRUE(WIFEXITED(status)) << "outer status=" << status << ", report: " << report;
     if (WEXITSTATUS(status) == 77) {
         GTEST_SKIP() << "CLONE_NEWPID is not available";

@@ -3,9 +3,8 @@ use core::{fmt::Debug, ptr::null, sync::atomic::Ordering};
 use alloc::{collections::BTreeMap, ffi::CString, string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
-use crate::process::Signal;
-
 use crate::{
+    arch::ipc::signal::Signal,
     driver::base::block::SeekFrom,
     filesystem::vfs::{fcntl::AtFlags, file::File, open::do_open_execat},
     libs::elf::ELF_LOADER,
@@ -22,11 +21,11 @@ use super::{
     ProcessControlBlock, ProcessFlags, ProcessManager, PTRACE_RELATION_LOCK,
 };
 
-/// 系统支持的所有二进制文件加载器的列表
+/// List of all binary format loaders supported by the system.
 const BINARY_LOADERS: [&'static dyn BinaryLoader; 1] = [&ELF_LOADER];
 
 pub trait BinaryLoader: 'static + Debug {
-    /// 检查二进制文件是否为当前加载器支持的格式
+    /// Checks whether the binary file is in a format supported by this loader.
     fn probe(&'static self, param: &ExecParam, buf: &[u8]) -> Result<(), ExecError>;
 
     fn load(
@@ -36,10 +35,10 @@ pub trait BinaryLoader: 'static + Debug {
     ) -> Result<BinaryLoaderResult, ExecError>;
 }
 
-/// 二进制文件加载结果
+/// Result of loading a binary file.
 #[derive(Debug)]
 pub struct BinaryLoaderResult {
-    /// 程序入口地址
+    /// Program entry point address.
     entry_point: VirtAddr,
 }
 
@@ -53,18 +52,20 @@ impl BinaryLoaderResult {
     }
 }
 
-/// 二进制文件加载的完整结果
+/// The complete result of loading a binary file.
 ///
-/// 用于区分正常加载和需要重新执行(shebang场景)的情况
+/// Used to distinguish between a normal load and the need for re-execution
+/// (the shebang scenario).
 #[derive(Debug)]
 pub enum LoadBinaryResult {
-    /// 正常加载完成，返回入口点
+    /// Normal load completed; returns the entry point.
     Loaded(BinaryLoaderResult),
-    /// 需要重新执行解释器 (shebang场景)
+    /// Re-execution of an interpreter is needed (shebang scenario).
     NeedReexec {
-        /// 下一轮 exec 的启动信息
+        /// Start information for the next exec round.
         next: ExecStartInfo,
-        /// 新的argv (解释器路径 + [可选参数] + 脚本路径 + 原始参数)
+        /// New argv (interpreter path + [optional arg] + script path + original
+        /// args).
         new_argv: Vec<CString>,
     },
 }
@@ -115,10 +116,10 @@ impl ExecStartInfo {
     }
 }
 
-/// 执行上下文，用于跟踪递归执行状态
+/// Execution context used to track recursive execution state.
 #[derive(Debug, Clone)]
 pub struct ExecContext {
-    /// 当前递归深度
+    /// Current recursion depth.
     pub recursion_depth: usize,
 }
 
@@ -133,7 +134,7 @@ impl ExecContext {
         Self { recursion_depth: 0 }
     }
 
-    /// 检查是否超过最大递归深度
+    /// Checks whether the maximum recursion depth has been exceeded.
     pub fn check_recursion_limit(&self) -> Result<(), SystemError> {
         if self.recursion_depth >= SHEBANG_MAX_RECURSION_DEPTH {
             return Err(SystemError::ELOOP);
@@ -151,21 +152,21 @@ impl ExecContext {
 #[derive(Debug)]
 pub enum ExecError {
     SystemError(SystemError),
-    /// 二进制文件不可执行
+    /// Binary file is not executable.
     NotExecutable,
-    /// 二进制文件不是当前架构的
+    /// Binary file is for a different architecture.
     WrongArchitecture,
-    /// 访问权限不足
+    /// Insufficient access permissions.
     PermissionDenied,
-    /// 不支持的操作
+    /// Unsupported operation.
     NotSupported,
-    /// 解析文件本身的时候出现错误（比如一些字段本身不合法）
+    /// Error while parsing the file itself (e.g. some fields are invalid).
     ParseError,
-    /// 内存不足
+    /// Out of memory.
     OutOfMemory,
-    /// 参数错误
+    /// Invalid parameter.
     InvalidParemeter,
-    /// 无效的地址
+    /// Invalid address.
     BadAddress(Option<VirtAddr>),
     Other(String),
 }
@@ -189,7 +190,7 @@ impl From<ExecError> for SystemError {
 
 bitflags! {
     pub struct ExecParamFlags: u32 {
-        // 是否以可执行文件的形式加载
+        // Whether to load as an executable file.
         const EXEC = 1 << 0;
     }
 }
@@ -198,31 +199,32 @@ bitflags! {
 pub struct ExecParam {
     file: Arc<File>,
     vm: Arc<AddressSpace>,
-    /// 一些标志位
+    /// Flags.
     flags: ExecParamFlags,
     filename: CString,
     execfn: CString,
     interp_flags: ExecInterpFlags,
-    /// 用来初始化进程的一些信息。这些信息由二进制加载器和exec机制来共同填充
+    /// Information used to initialize the process. Filled jointly by the binary
+    /// loader and the exec mechanism.
     init_info: ProcInitInfo,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum ExecLoadMode {
-    /// 以可执行文件的形式加载
+    /// Load as an executable file.
     Exec,
-    /// 以动态链接库的形式加载
+    /// Load as a dynamic shared object.
     DSO,
 }
 
 #[allow(dead_code)]
 impl ExecParam {
-    /// 使用已打开的文件创建ExecParam
+    /// Create an `ExecParam` using an already-opened file.
     ///
-    /// ## 参数
-    /// - `file`: 通过do_open_execat打开的可执行文件
-    /// - `vm`: 地址空间
-    /// - `flags`: 执行标志
+    /// ## Parameters
+    /// - `file`: The executable file opened via `do_open_execat`.
+    /// - `vm`: The address space.
+    /// - `flags`: Execution flags.
     pub fn new(
         file: Arc<File>,
         vm: Arc<AddressSpace>,
@@ -260,7 +262,7 @@ impl ExecParam {
         &mut self.init_info
     }
 
-    /// 获取加载模式
+    /// Returns the load mode.
     pub fn load_mode(&self) -> ExecLoadMode {
         if self.flags.contains(ExecParamFlags::EXEC) {
             ExecLoadMode::Exec
@@ -273,7 +275,7 @@ impl ExecParam {
         &self.file
     }
 
-    /// 获取File的Arc引用
+    /// Returns an `Arc` reference to the `File`.
     pub fn file(&self) -> Arc<File> {
         self.file.clone()
     }
@@ -290,9 +292,10 @@ impl ExecParam {
         self.interp_flags
     }
 
-    /// 消费ExecParam并获取File的所有权（用于将文件加入文件描述符表）
+    /// Consume the `ExecParam` and take ownership of the `File` (used for adding
+    /// the file to the file descriptor table).
     ///
-    /// 如果Arc有多个引用，会panic
+    /// Panics if the `Arc` has multiple references.
     pub fn into_file(self) -> File {
         Arc::try_unwrap(self.file).expect("Cannot unwrap Arc<File>: multiple references exist")
     }
@@ -304,7 +307,7 @@ impl ExecParam {
     /// https://code.dragonos.org.cn/xref/linux-6.6.21/fs/exec.c#1246
     pub fn begin_new_exec(&mut self) -> Result<(), ExecError> {
         let me = ProcessManager::current_pcb();
-        // todo: 补充linux的逻辑
+        // TODO: Implement the remaining Linux logic.
         de_thread(&me).map_err(ExecError::SystemError)?;
 
         me.flags().remove(ProcessFlags::FORKNOEXEC);
@@ -327,7 +330,7 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
     }
 
     let sighand = current.sighand();
-    // 与 group-exit/并发 exec 互斥
+    // Mutually exclusive with group-exit / concurrent exec.
     sighand.start_group_exec(&current)?;
 
     let result = (|| {
@@ -390,7 +393,7 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         }
 
         let mut notify_count = kill_list.len() as isize;
-        // 非 leader exec：notify_count 不包含 leader 本身
+        // Non-leader exec: notify_count does not include the leader itself.
         if !Arc::ptr_eq(&leader, &current) && leader_in_kill_list {
             notify_count -= 1;
         }
@@ -400,7 +403,7 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
             let _ = Signal::SIGKILL.send_signal_info_to_pcb(None, task, PidType::PID);
         }
 
-        // 先等待除 leader 外的线程退出（notify_count == 0）
+        // First wait for non-leader threads to exit (notify_count == 0).
         let wait_res = sighand.wait_group_exec_event_killable(
             || {
                 if Signal::fatal_signal_pending(&current) {
@@ -414,11 +417,14 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
 
-        // 非 leader exec：等待 leader 进入 zombie 后再交换 tid/raw_pid
+        // Non-leader exec: wait for the leader to become zombie before swapping
+        // tid/raw_pid.
         if !Arc::ptr_eq(&leader, &current) {
-            // 标记等待 leader 退出（notify_count < 0），由 exit_notify 唤醒。
-            // 必须先发布等待状态再检查 leader，否则 leader 可能在检查与设置之间
-            // 退出，导致 exit_notify 看不到 notify_count < 0 而丢失唤醒。
+            // Mark that we are waiting for the leader to exit (notify_count < 0),
+            // to be woken by exit_notify. The wait state must be published before
+            // checking the leader, otherwise the leader might exit between the
+            // check and the write, causing exit_notify to miss notify_count < 0
+            // and lose the wakeup.
             sighand.set_group_exec_notify_count(-1);
             let wait_res = sighand.wait_group_exec_event_killable(
                 || {
@@ -440,7 +446,8 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
                 .store(Signal::SIGCHLD as i32, Ordering::SeqCst);
             leader.exit_signal.store(-1, Ordering::SeqCst);
 
-            // 将当前线程提升为线程组 leader，并清空 group_tasks（已无其他线程）
+            // Promote the current thread to thread-group leader and clear
+            // group_tasks (no other threads remain).
             {
                 let mut cur_ti = current.threads_write_irqsave();
                 cur_ti.group_leader = Arc::downgrade(&current);
@@ -452,7 +459,7 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
                 leader_ti.group_tasks.clear();
             }
 
-            // 将旧 leader 的 children 列表转移给新 leader
+            // Transfer the old leader's children list to the new leader.
             let moved_children = {
                 let leader_pid_ns = leader.active_pid_ns();
                 let (first, second) =
@@ -486,7 +493,7 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
                 );
             }
 
-            // Inherit parent process relationships from the old leader
+            // Inherit parent process relationships from the old leader.
             {
                 let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
                 let leader_parent = leader.real_parent_pcb.read_irqsave().clone();
@@ -498,10 +505,12 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
 
             // log::info!("de_thread: reparented current to old leader's parent");
 
-            // 补做旧 leader 在退出阶段延迟的 PID/TGID/PGID/SID unhash
+            // Complete the deferred PID/TGID/PGID/SID unhash that the old leader
+            // postponed during its exit phase.
             leader.finish_deferred_unhash_for_exec();
 
-            // 旧 leader 应由 exec 线程回收，避免父进程在交换前/后提前回收
+            // The old leader should be reaped by the exec thread to prevent the
+            // parent from reaping it prematurely before/after the swap.
             if leader.is_zombie() {
                 if leader.try_mark_dead_from_zombie() {
                     unsafe { ProcessManager::release(leader.raw_pid()) };
@@ -522,31 +531,31 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
     result
 }
 
-/// ## 加载二进制文件
+/// ## Load a binary file.
 ///
+/// ## Parameters
+/// - `param`: Execution parameters.
+/// - `ctx`: Execution context used to track recursion depth.
 ///
-/// ## 参数
-/// - `param`: 执行参数
-/// - `ctx`: 执行上下文，用于跟踪递归深度
-///
-/// ## 返回值
-/// - `LoadBinaryResult::Loaded`: 正常加载完成
-/// - `LoadBinaryResult::NeedReexec`: 需要递归执行解释器（shebang场景）
+/// ## Returns
+/// - `LoadBinaryResult::Loaded`: Normal load completed.
+/// - `LoadBinaryResult::NeedReexec`: Re-execution of an interpreter is needed
+///   (shebang scenario).
 pub fn load_binary_file_with_context(
     param: &mut ExecParam,
     ctx: &ExecContext,
 ) -> Result<LoadBinaryResult, SystemError> {
-    // 检查递归深度
+    // Check the recursion depth.
     ctx.check_recursion_limit()?;
 
-    // 读取文件头部，用于判断文件类型
+    // Read the file header to determine the file type.
     let mut head_buf = [0u8; 512];
     param.file_ref().lseek(SeekFrom::SeekSet(0))?;
     let _bytes = param.file_ref().read(512, &mut head_buf)?;
 
-    // 首先检查是否为shebang脚本
+    // First, check if this is a shebang script.
     if SHEBANG_LOADER.probe(param, &head_buf).is_ok() {
-        // 解析shebang行
+        // Parse the shebang line.
         let shebang_info =
             ShebangLoader::parse_shebang_line(&head_buf).map_err(|_| SystemError::ENOEXEC)?;
 
@@ -557,7 +566,7 @@ pub fn load_binary_file_with_context(
             return Err(SystemError::ENOENT);
         }
 
-        // 通过正常的open流程打开解释器文件
+        // Open the interpreter file through the normal open path.
         let interpreter_file =
             do_open_execat(AtFlags::AT_FDCWD.bits(), &shebang_info.interpreter_path).inspect_err(
                 |_e| {
@@ -569,27 +578,28 @@ pub fn load_binary_file_with_context(
                 },
             )?;
 
-        // 获取脚本路径
+        // Get the script path.
         let script_path = param.filename().to_string_lossy().into_owned();
 
-        // 构建新的argv
-        // Linux语义: [interpreter, optional_arg, script_path, original_args[1:]...]
+        // Build the new argv.
+        // Linux semantics: [interpreter, optional_arg, script_path, original_args[1:]...]
         let mut new_argv = Vec::new();
 
-        // argv[0] = 解释器路径
+        // argv[0] = interpreter path
         new_argv.push(
             CString::new(shebang_info.interpreter_path.clone()).map_err(|_| SystemError::EINVAL)?,
         );
 
-        // argv[1] = 可选参数 (如果存在)
+        // argv[1] = optional argument (if present)
         if let Some(ref arg) = shebang_info.interpreter_arg {
             new_argv.push(CString::new(arg.clone()).map_err(|_| SystemError::EINVAL)?);
         }
 
-        // argv[N] = 脚本路径
+        // argv[N] = script path
         new_argv.push(CString::new(script_path).map_err(|_| SystemError::EINVAL)?);
 
-        // 追加原始参数 (跳过argv[0]，因为已经用脚本路径替换)
+        // Append the original arguments (skip argv[0], already replaced by the
+        // script path).
         let original_args = &param.init_info().args;
         if original_args.len() > 1 {
             new_argv.extend(original_args[1..].iter().cloned());
@@ -606,7 +616,7 @@ pub fn load_binary_file_with_context(
         });
     }
 
-    // 然后尝试其他加载器 (ELF等)
+    // Then try other loaders (ELF, etc.)
     let mut loader = None;
     for bl in BINARY_LOADERS.iter() {
         let probe_result = bl.probe(param, &head_buf);
@@ -628,7 +638,8 @@ pub fn load_binary_file_with_context(
     Ok(LoadBinaryResult::Loaded(result))
 }
 
-/// 程序初始化信息，这些信息会被压入用户栈中
+/// Program initialization information. These values are pushed onto the user
+/// stack.
 #[derive(Debug)]
 pub struct ProcInitInfo {
     pub proc_name: CString,
@@ -651,20 +662,22 @@ impl ProcInitInfo {
         }
     }
 
-    /// 把程序初始化信息压入用户栈中
-    /// 这个函数会把参数、环境变量、auxv等信息压入用户栈中
+    /// Push the program initialization information onto the user stack.
+    /// This function pushes arguments, environment variables, auxv, etc. onto
+    /// the user stack.
     ///
-    /// ## 返回值
+    /// ## Returns
     ///
-    /// 返回值是一个元组，第一个元素是最终的用户栈顶地址，第二个元素是环境变量pointer数组的起始地址     
+    /// A tuple where the first element is the final user stack pointer and the
+    /// second element is the starting address of the `envp` pointer array.
     pub unsafe fn push_at(
         &mut self,
         ustack: &mut UserStack,
     ) -> Result<(VirtAddr, VirtAddr), SystemError> {
-        // 先把程序的名称压入栈中
+        // First, push the program name onto the stack.
         self.push_str(ustack, &self.proc_name)?;
 
-        // 然后把环境变量压入栈中
+        // Then push the environment variables onto the stack.
         let envps = self
             .envs
             .iter()
@@ -674,7 +687,7 @@ impl ProcInitInfo {
             })
             .collect::<Vec<_>>();
 
-        // 然后把参数压入栈中
+        // Then push the arguments onto the stack.
         let argps = self
             .args
             .iter()
@@ -684,7 +697,7 @@ impl ProcInitInfo {
             })
             .collect::<Vec<_>>();
 
-        // 压入随机数，把指针放入auxv
+        // Push the random number and store its pointer in auxv.
         self.push_slice(ustack, &[self.rand_num])?;
         self.auxv
             .insert(super::abi::AtType::Random as u8, ustack.sp().data());
@@ -695,14 +708,14 @@ impl ProcInitInfo {
                 .insert(super::abi::AtType::ExecFn as u8, ustack.sp().data());
         }
 
-        // 实现栈的16字节对齐
-        // 后续要压入的内容都是 `usize` 宽度：
-        // - auxv 终止项: 2 words
-        // - auxv 条目: 2 words / entry
+        // Align the stack to 16 bytes.
+        // The remaining content to push is all `usize` width:
+        // - auxv terminator: 2 words
+        // - auxv entries: 2 words / entry
         // - envp NULL: 1 word
-        // - envp 指针数组: envps.len() words
+        // - envp pointer array: envps.len() words
         // - argv NULL: 1 word
-        // - argv 指针数组: argps.len() words
+        // - argv pointer array: argps.len() words
         // - argc: 1 word
         let length_to_push =
             self.remaining_stack_words(envps.len(), argps.len()) * core::mem::size_of::<usize>();
@@ -711,22 +724,22 @@ impl ProcInitInfo {
             &vec![0u8; (ustack.sp().data() - length_to_push) & 0xF],
         )?;
 
-        // 压入auxv
+        // Push auxv.
         self.push_slice(ustack, &[null::<u8>(), null::<u8>()])?;
         for (&k, &v) in self.auxv.iter() {
             self.push_slice(ustack, &[k as usize, v])?;
         }
 
-        // 把环境变量指针压入栈中
+        // Push the environment variable pointers onto the stack.
         self.push_slice(ustack, &[null::<u8>()])?;
         self.push_slice(ustack, envps.as_slice())?;
 
-        // 把参数指针压入栈中
+        // Push the argument pointers onto the stack.
         self.push_slice(ustack, &[null::<u8>()])?;
         self.push_slice(ustack, argps.as_slice())?;
         let argv_ptr = ustack.sp();
 
-        // 把argc压入栈中
+        // Push argc onto the stack.
         self.push_slice(ustack, &[self.args.len()])?;
 
         return Ok((ustack.sp(), argv_ptr));

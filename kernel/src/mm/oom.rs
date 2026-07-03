@@ -346,6 +346,17 @@ pub fn current_is_oom_victim() -> bool {
         .contains(ProcessFlags::OOM_VICTIM)
 }
 
+/// Whether the current task is an OOM fault-injection target.
+/// Used by the page-fault handler to skip direct reclaim for injected OOM,
+/// so the injection is not consumed by a reclaim-then-retry cycle.
+pub fn is_fault_inject_target() -> bool {
+    let current_tgid = ProcessManager::current_pcb().raw_tgid();
+    OOM_FAULT_INJECT
+        .lock_irqsave()
+        .target_tgid
+        .is_some_and(|t| t == current_tgid)
+}
+
 fn wait_for_oom_slot() -> Result<(), SystemError> {
     OOM_WAITQ.wait_event_killable(
         || {

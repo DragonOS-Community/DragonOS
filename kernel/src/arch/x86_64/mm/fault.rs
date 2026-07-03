@@ -522,11 +522,10 @@ impl X86_64MMArch {
                 }
 
                 if fault.contains(VmFaultReason::VM_FAULT_OOM) {
-                    // Before invoking the OOM killer, try synchronous direct
-                    // reclaim (matching Linux's try_to_free_pages before
-                    // out_of_memory). This avoids killing processes when
-                    // reclaiming clean page-cache pages would suffice.
-                    if !tried_direct_reclaim {
+                    // Skip direct reclaim for fault-injection OOM: the injection
+                    // consumes a fail count on the first fault, so reclaiming
+                    // then retrying would bypass the killer entirely.
+                    if !tried_direct_reclaim && !crate::mm::oom::is_fault_inject_target() {
                         tried_direct_reclaim = true;
                         drop(space_guard);
                         crate::mm::page::PageReclaimer::shrink_list(

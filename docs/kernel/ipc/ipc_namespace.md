@@ -51,6 +51,5 @@ Author: longjin <longjin@dragonos.org>
   - `kernel/src/process/namespace/ipc_namespace.rs`
   - `kernel/src/process/namespace/nsproxy.rs`
   - `kernel/src/ipc/syscall/` 内的 `sys_shm*`
-  - `kernel/src/mm/ucontext.rs`（VMA 与 SHM 计数维护）
-
+  - `kernel/src/mm/ucontext/`（VMA 与 SHM 计数维护）
 

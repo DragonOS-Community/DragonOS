@@ -26,6 +26,7 @@ normal/sched_affinity
 normal/sync_file_range
 normal/splice_concurrent_io
 normal/rcu_selftest
+normal/restart_syscall_semantics
 normal/errseq_selftest
 normal/errseq_writeback_reporting
 normal/test_tlb_shootdown

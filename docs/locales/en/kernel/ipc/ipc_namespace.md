@@ -66,4 +66,4 @@ This page describes the current support status and future plans for IPC namespac
   - `kernel/src/process/namespace/ipc_namespace.rs`
   - `kernel/src/process/namespace/nsproxy.rs`
   - `kernel/src/ipc/syscall/` within `sys_shm*`
-  - `kernel/src/mm/ucontext.rs` (VMA and SHM count maintenance)
+  - `kernel/src/mm/ucontext/` (VMA and SHM count maintenance)

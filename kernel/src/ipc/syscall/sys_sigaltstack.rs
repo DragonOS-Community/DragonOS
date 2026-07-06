@@ -65,7 +65,7 @@ impl Syscall for SysAltStackHandle {
             let old_stack_user = if !old_ss.is_null() {
                 let mut old_stack_user = StackUser {
                     ss_sp: stack.sp as *mut c_void,
-                    ss_size: stack.size as usize,
+                    ss_size: stack.size,
                     ..Default::default()
                 };
 
@@ -107,7 +107,7 @@ impl Syscall for SysAltStackHandle {
                     }
                     stack.sp = ss.ss_sp as usize;
                     stack.flags = ss.ss_flags; // 保留 SS_AUTODISARM 等标志
-                    stack.size = ss.ss_size as u32;
+                    stack.size = ss.ss_size;
                 }
             }
 

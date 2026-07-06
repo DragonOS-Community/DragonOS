@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <cstring>
@@ -82,6 +83,20 @@ TEST(UdpIpv6SendSemantics, ConnectToUnspecifiedIpv6UsesIpv6Loopback) {
         << "getpeername failed: " << ErrnoString(errno);
     EXPECT_TRUE(IN6_IS_ADDR_LOOPBACK(&peer.sin6_addr));
     EXPECT_EQ(ntohs(peer.sin6_port), 12345);
+}
+
+TEST(UdpIpv6SendSemantics, InvalidFdWithLargePayloadReturnsEbadfBeforeCopy) {
+    constexpr size_t kLargeLen = 256UL * 1024 * 1024;
+    void* mapping = mmap(nullptr, kLargeLen, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(mapping, MAP_FAILED) << "mmap failed: " << ErrnoString(errno);
+
+    errno = 0;
+    ssize_t ret = sendto(-1, mapping, kLargeLen, 0, nullptr, 0);
+    int saved_errno = errno;
+
+    EXPECT_EQ(ret, -1);
+    EXPECT_EQ(saved_errno, EBADF) << "unexpected errno: " << ErrnoString(saved_errno);
+    EXPECT_EQ(munmap(mapping, kLargeLen), 0) << "munmap failed: " << ErrnoString(errno);
 }
 
 int main(int argc, char** argv) {

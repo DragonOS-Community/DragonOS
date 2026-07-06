@@ -563,7 +563,7 @@ impl Futex {
         op: i32,
     ) -> Result<usize, SystemError> {
         loop {
-            // Linux 语义：对于私有 futex，允许 uaddr1 为 NULL，此时只执行 op，不从 uaddr1 唤醒任何等待者。
+            // Linux semantics: For private futex, allow uaddr1 to be NULL; in that case only execute the op without waking any waiters from uaddr1.
             let key1 = Futex::get_futex_key(
                 uaddr1,
                 flags.contains(FutexFlag::FLAGS_SHARED),
@@ -587,15 +587,15 @@ impl Futex {
             };
 
             let mut wake_count = 0;
-            // 若 uaddr1 没有关联任何等待者，则按照 Linux 行为返回 0 而不是 EINVAL。
+            // If uaddr1 has no associated waiters, return 0 instead of EINVAL per Linux behavior.
             if let Some(bucket1) = futex_data_guard.get_mut(&key1) {
-                // 唤醒uaddr1中的进程
+                // Wake up processes in uaddr1
                 wake_count += bucket1.wake_up(key1.clone(), None, nr_wake as u32)?;
             }
 
-            // 操作成功则唤醒uaddr2中的进程
+            // If the operation succeeds, wake up processes in uaddr2
             if op_ret {
-                // 若 uaddr2 没有关联任何等待者，则按照 Linux 行为跳过唤醒，而不是返回 EINVAL。
+                // If uaddr2 has no associated waiters, skip the wake instead of returning EINVAL per Linux behavior.
                 if let Some(bucket2) = futex_data_guard.get_mut(&key2) {
                     wake_count += bucket2.wake_up(key2, None, nr_wake2 as u32)?;
                 }

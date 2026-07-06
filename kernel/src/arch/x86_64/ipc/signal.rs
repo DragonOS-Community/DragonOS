@@ -597,7 +597,7 @@ impl UserUContext {
         // 注意: cs, ss 等段寄存器不恢复，由内核管理
     }
 
-    /// 从 sigcontext 指向的用户 fpstate 恢复完整 XSAVE 状态。
+    /// Restore the full XSAVE state from the user fpstate pointed to by sigcontext.
     fn restore_fpstate(&self) -> Result<Option<FpState>, SystemError> {
         if self.uc_mcontext.fpstate.is_null() {
             return Ok(None);
@@ -650,7 +650,7 @@ impl X86SigStack {
         !self.flags.contains(SigStackFlags::SS_AUTODISARM) && self.contains_sp(sp)
     }
 
-    /// 纯范围检查，不考虑 `SS_AUTODISARM`。
+    /// Pure range check, without considering `SS_AUTODISARM`.
     #[inline]
     fn contains_sp(&self, sp: usize) -> bool {
         self.sp != 0 && self.size != 0 && sp > self.sp && sp.wrapping_sub(self.sp) <= self.size
@@ -1179,7 +1179,7 @@ fn setup_frame(
     // 设置 fpstate 指针指向栈帧内的 fpstate
     user_frame.setup_fpstate_pointer(frame_location.fpstate);
 
-    // 4. 复制 sigframe
+    // 4. Copy sigframe
     frame_writer
         .copy_one_to_user(&user_frame, 0)
         .inspect_err(|_| {
@@ -1198,8 +1198,8 @@ fn setup_frame(
     // 6. 设置 trap_frame，准备进入信号处理函数
     trap_frame.rdi = sig as u64; // 参数1: 信号编号
     trap_frame.rax = 0; // Linux x86_64: support handlers declared without prototypes
-    trap_frame.rsi = (frame_ptr as usize + core::mem::offset_of!(SigFrame, siginfo)) as u64; // 参数2: siginfo_t*
-    trap_frame.rdx = (frame_ptr as usize + core::mem::offset_of!(SigFrame, ucontext)) as u64; // 参数3: ucontext_t*
+    trap_frame.rsi = (frame_ptr as usize + core::mem::offset_of!(SigFrame, siginfo)) as u64; // arg2: siginfo_t*
+    trap_frame.rdx = (frame_ptr as usize + core::mem::offset_of!(SigFrame, ucontext)) as u64; // arg3: ucontext_t*
     trap_frame.rsp = frame_ptr as u64;
     trap_frame.rip = handler_addr as u64;
     trap_frame.cs = (USER_CS.bits() | 0x3) as u64;

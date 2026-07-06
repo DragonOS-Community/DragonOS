@@ -95,18 +95,18 @@ impl Syscall for SysAltStackHandle {
                 {
                     return Err(SystemError::EINVAL);
                 }
-                // 如果用户请求禁用备用栈
+                // If the user requests disabling the alternate stack
                 if ss.ss_flags.contains(SigStackFlags::SS_DISABLE) {
                     stack.sp = 0;
                     stack.flags = ss.ss_flags;
                     stack.size = 0;
                 } else {
-                    // 如果用户请求设置一个新的栈
+                    // If the user requests setting a new stack
                     if ss.ss_size < MINSIGSTKSZ {
                         return Err(SystemError::ENOMEM);
                     }
                     stack.sp = ss.ss_sp as usize;
-                    stack.flags = ss.ss_flags; // 保留 SS_AUTODISARM 等标志
+                    stack.flags = ss.ss_flags; // Preserve SS_AUTODISARM and other flags
                     stack.size = ss.ss_size;
                 }
             }

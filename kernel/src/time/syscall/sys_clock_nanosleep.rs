@@ -157,7 +157,7 @@ impl Syscall for SysClockNanosleep {
             true,
         )?;
         let rq_user = rq_reader.read_one_from_user::<PosixTimeSpec>(0)?;
-        if !Self::is_valid_timespec(rq_user) {
+        if !Self::is_valid_timespec(&rq_user) {
             return Err(SystemError::EINVAL);
         }
         let rq = PosixTimeSpec {

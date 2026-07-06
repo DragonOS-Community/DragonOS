@@ -118,7 +118,7 @@ impl PtyCommon {
         let user_reader =
             UserBufferReader::new(arg.as_ptr::<i32>(), core::mem::size_of::<i32>(), true)?;
 
-        if *user_reader.read_one_from_user::<i32>(0)? != 0 {
+        if user_reader.read_one_from_user::<i32>(0)? != 0 {
             tty.flags_write().insert(TtyFlag::PTY_LOCK);
         } else {
             tty.flags_write().remove(TtyFlag::PTY_LOCK);
@@ -139,7 +139,7 @@ impl PtyCommon {
             UserBufferReader::new(arg.as_ptr::<i32>(), core::mem::size_of::<i32>(), true)?;
 
         let mut ctrl = tty.contorl_info_irqsave();
-        if *user_reader.read_one_from_user::<i32>(0)? != 0 {
+        if user_reader.read_one_from_user::<i32>(0)? != 0 {
             if !ctrl.packet {
                 tty.link().unwrap().core().contorl_info_irqsave().pktstatus =
                     TtyPacketStatus::empty();

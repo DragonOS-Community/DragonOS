@@ -185,7 +185,7 @@ impl KernelCloneArgs {
             )?;
             for i in 0..self.set_tid_size {
                 let byte_offset = i * core::mem::size_of::<core::ffi::c_int>();
-                let tid = *bufreader.read_one_from_user::<core::ffi::c_int>(byte_offset)?;
+                let tid = bufreader.read_one_from_user::<core::ffi::c_int>(byte_offset)?;
                 self.set_tid.push(tid as usize);
             }
         }

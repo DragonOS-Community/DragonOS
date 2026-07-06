@@ -469,7 +469,7 @@ impl Futex {
             let curval = uval_reader.read_one_from_user::<u32>(0)?;
 
             // 判断是否满足条件
-            if *curval != cmpval.unwrap() {
+            if curval != cmpval.unwrap() {
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
         }
@@ -740,7 +740,7 @@ impl Futex {
 
         let oldval = reader.read_one_from_user::<u32>(0)?;
         // 保存旧值的副本，因为后续的修改操作会改变内存中的值
-        let oldval_copy = *oldval;
+        let oldval_copy = oldval;
 
         // 直接获取用户空间地址的原始指针
         let ptr = uaddr.as_ptr::<u32>();
@@ -1244,13 +1244,8 @@ impl Iterator for FutexIterator<'_> {
             };
 
             // 安全地读取下一个entry
-            let next_entry =
-                RobustListHead::safe_read::<PosixRobustList>(self.entry).and_then(|reader| {
-                    reader
-                        .read_one_from_user::<PosixRobustList>(0)
-                        .ok()
-                        .cloned()
-                })?;
+            let next_entry = RobustListHead::safe_read::<PosixRobustList>(self.entry)
+                .and_then(|reader| reader.read_one_from_user::<PosixRobustList>(0).ok())?;
 
             self.entry = next_entry.next;
             self.count += 1;

@@ -243,7 +243,7 @@ impl TtyJobCtrlManager {
             true,
         )?;
 
-        let pgrp_nr = *user_reader.read_one_from_user::<i32>(0)?;
+        let pgrp_nr = user_reader.read_one_from_user::<i32>(0)?;
         if pgrp_nr < 0 {
             return Err(SystemError::EINVAL);
         }

@@ -1138,7 +1138,7 @@ impl Socket for UnixDatagramSocket {
                 UserBufferReader::new(msg.msg_control as *const u8, msg.msg_controllen, true)?;
             let mut off = 0usize;
             while off + core::mem::size_of::<Cmsghdr>() <= msg.msg_controllen {
-                let hdr = *reader.read_one_from_user::<Cmsghdr>(off)?;
+                let hdr = reader.read_one_from_user::<Cmsghdr>(off)?;
                 if hdr.cmsg_len < core::mem::size_of::<Cmsghdr>() {
                     return Err(SystemError::EINVAL);
                 }

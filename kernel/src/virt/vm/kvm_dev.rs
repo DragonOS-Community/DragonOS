@@ -266,7 +266,7 @@ impl IndexNode for KvmInstance {
 
                 self.kvm
                     .lock()
-                    .set_memory_region(KvmUserspaceMemoryRegion::from_posix(region)?)?;
+                    .set_memory_region(KvmUserspaceMemoryRegion::from_posix(&region)?)?;
 
                 return Ok(0);
             }
@@ -418,7 +418,7 @@ impl IndexNode for KvmVcpuDev {
 
                 let regs = user_reader.read_one_from_user::<KvmCommonRegs>(0)?;
 
-                self.vcpu.lock().set_regs(regs)?;
+                self.vcpu.lock().set_regs(&regs)?;
 
                 return Ok(0);
             }

@@ -556,12 +556,12 @@ impl IndexNode for TtyDevice {
 
                 let user_winsize = reader.read_one_from_user::<WindowSize>(0)?;
 
-                let ret = tty.resize(tty.clone(), *user_winsize);
+                let ret = tty.resize(tty.clone(), user_winsize);
 
                 if ret != Err(SystemError::ENOSYS) {
                     return ret.map(|_| 0);
                 } else {
-                    return tty.tty_do_resize(*user_winsize).map(|_| 0);
+                    return tty.tty_do_resize(user_winsize).map(|_| 0);
                 }
             }
             _ => match TtyJobCtrlManager::job_ctrl_ioctl(tty.clone(), cmd, arg) {

@@ -37,7 +37,7 @@ impl Syscall for SysRtSigSuspend {
             true,
         )?;
         let mask = reader.read_one_from_user::<u64>(0)?;
-        let mut mask = SigSet::from_bits_truncate(*mask);
+        let mut mask = SigSet::from_bits_truncate(mask);
         // It is not possible to block SIGKILL or SIGSTOP; specifying these
         // signals in mask, has no effect on the thread's signal mask.
         mask -= SigSet::SIGKILL;

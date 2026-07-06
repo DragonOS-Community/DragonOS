@@ -2,7 +2,7 @@
 
 use core::{
     cmp::min,
-    mem::size_of,
+    mem::{size_of, MaybeUninit},
     num::NonZero,
     slice::{from_raw_parts, from_raw_parts_mut},
     sync::atomic::{compiler_fence, Ordering},
@@ -18,6 +18,34 @@ use crate::{
 };
 
 use super::{user_buffer::UserBuffer, SystemError};
+
+#[inline(always)]
+fn checked_user_range(buffer_len: usize, offset: usize, len: usize) -> Result<(), SystemError> {
+    if offset
+        .checked_add(len)
+        .filter(|end| *end <= buffer_len)
+        .is_none()
+    {
+        return Err(SystemError::EINVAL);
+    }
+
+    Ok(())
+}
+
+#[inline(always)]
+unsafe fn value_as_bytes<T>(value: &T) -> &[u8] {
+    core::slice::from_raw_parts((value as *const T).cast::<u8>(), core::mem::size_of::<T>())
+}
+
+#[inline(always)]
+unsafe fn value_as_bytes_mut<T>(value: &mut T) -> &mut [u8] {
+    core::slice::from_raw_parts_mut((value as *mut T).cast::<u8>(), core::mem::size_of::<T>())
+}
+
+#[inline(always)]
+unsafe fn maybe_uninit_as_bytes_mut<T>(value: &mut MaybeUninit<T>) -> &mut [u8] {
+    core::slice::from_raw_parts_mut(value.as_mut_ptr().cast::<u8>(), core::mem::size_of::<T>())
+}
 
 /// Clear data in the specified range of user space
 ///
@@ -298,10 +326,12 @@ impl UserBufferReader<'_> {
     /// * `offset` - Byte offset
     ///
     /// # Returns
-    /// * Returns a reference to the user space data
+    /// * Returns a copy of the user space data
     ///
-    pub fn read_one_from_user<T>(&self, offset: usize) -> Result<&T, SystemError> {
-        return self.convert_one_with_offset(self.buffer, offset);
+    pub fn read_one_from_user<T>(&self, offset: usize) -> Result<T, SystemError> {
+        let mut data = MaybeUninit::<T>::uninit();
+        self.copy_one_from_user_bytes(unsafe { maybe_uninit_as_bytes_mut(&mut data) }, offset)?;
+        return Ok(unsafe { data.assume_init() });
     }
 
     /// Read one data item from user space with page mapping and permission verification
@@ -313,12 +343,14 @@ impl UserBufferReader<'_> {
     /// * `offset` - Byte offset
     ///
     /// # Returns
-    /// * Returns a reference to the user space data
+    /// * Returns a copy of the user space data
     ///
     /// # Errors
     /// * `EFAULT` - Pages are not mapped or lack required permissions
-    pub fn read_one_from_user_checked<T>(&self, offset: usize) -> Result<&T, SystemError> {
-        return self.convert_one_with_offset_checked(self.buffer, offset);
+    pub fn read_one_from_user_checked<T>(&self, offset: usize) -> Result<T, SystemError> {
+        let mut data = MaybeUninit::<T>::uninit();
+        self.copy_one_from_user_bytes(unsafe { maybe_uninit_as_bytes_mut(&mut data) }, offset)?;
+        return Ok(unsafe { data.assume_init() });
     }
 
     /// Copy data from user space (to specified address)
@@ -343,13 +375,7 @@ impl UserBufferReader<'_> {
             .checked_mul(core::mem::size_of::<T>())
             .ok_or(SystemError::EINVAL)?;
 
-        if offset
-            .checked_add(bytes_needed)
-            .filter(|end| *end <= self.buffer.len())
-            .is_none()
-        {
-            return Err(SystemError::EINVAL);
-        }
+        checked_user_range(self.buffer.len(), offset, bytes_needed)?;
 
         // Copy exact bytes into dst without relying on a typed view of the entire remaining buffer.
         let src_bytes = &self.buffer[offset..offset + bytes_needed];
@@ -387,13 +413,7 @@ impl UserBufferReader<'_> {
             .checked_mul(core::mem::size_of::<T>())
             .ok_or(SystemError::EINVAL)?;
 
-        if offset
-            .checked_add(bytes_needed)
-            .filter(|end| *end <= self.buffer.len())
-            .is_none()
-        {
-            return Err(SystemError::EINVAL);
-        }
+        checked_user_range(self.buffer.len(), offset, bytes_needed)?;
 
         let accessible_len = user_accessible_len(
             VirtAddr::new(self.buffer.as_ptr() as usize + offset),
@@ -424,8 +444,7 @@ impl UserBufferReader<'_> {
         dst: &mut T,
         offset: usize,
     ) -> Result<(), SystemError> {
-        let data = self.convert_one_with_offset::<T>(self.buffer, offset)?;
-        dst.clone_from(data);
+        self.copy_one_from_user_bytes(unsafe { value_as_bytes_mut(dst) }, offset)?;
         return Ok(());
     }
 
@@ -448,8 +467,7 @@ impl UserBufferReader<'_> {
         dst: &mut T,
         offset: usize,
     ) -> Result<(), SystemError> {
-        let data = self.convert_one_with_offset_checked::<T>(self.buffer, offset)?;
-        dst.clone_from(data);
+        self.copy_one_from_user_bytes(unsafe { value_as_bytes_mut(dst) }, offset)?;
         return Ok(());
     }
 
@@ -544,34 +562,14 @@ impl UserBufferReader<'_> {
         self.convert_with_offset(src, offset)
     }
 
-    fn convert_one_with_offset<T>(&self, src: &[u8], offset: usize) -> Result<&T, SystemError> {
-        if offset + core::mem::size_of::<T>() > src.len() {
-            return Err(SystemError::EINVAL);
+    #[inline(always)]
+    fn copy_one_from_user_bytes(&self, dst: &mut [u8], offset: usize) -> Result<(), SystemError> {
+        checked_user_range(self.buffer.len(), offset, dst.len())?;
+        if dst.is_empty() {
+            return Ok(());
         }
-        let byte_buffer: &[u8] = &src[offset..offset + core::mem::size_of::<T>()];
 
-        let chunks = unsafe { from_raw_parts(byte_buffer.as_ptr() as *const T, 1) };
-        let data = &chunks[0];
-        return Ok(data);
-    }
-
-    fn convert_one_with_offset_checked<T>(
-        &self,
-        src: &[u8],
-        offset: usize,
-    ) -> Result<&T, SystemError> {
-        let size = core::mem::size_of::<T>();
-        if offset + size > src.len() {
-            return Err(SystemError::EINVAL);
-        }
-        if !check_user_access_by_page_table(
-            VirtAddr::new(src.as_ptr() as usize + offset),
-            size,
-            false,
-        ) {
-            return Err(SystemError::EFAULT);
-        }
-        self.convert_one_with_offset(src, offset)
+        self.copy_from_user_protected(dst, offset).map(|_| ())
     }
 }
 
@@ -706,13 +704,8 @@ impl<'a> UserBufferWriter<'a> {
     /// # Returns
     /// * Ok(()) on success
     ///
-    pub fn copy_one_to_user<T: Clone>(
-        &'a mut self,
-        src: &T,
-        offset: usize,
-    ) -> Result<(), SystemError> {
-        let dst = Self::convert_one_with_offset::<T>(self.buffer, offset)?;
-        dst.clone_from(src);
+    pub fn copy_one_to_user<T>(&mut self, src: &T, offset: usize) -> Result<(), SystemError> {
+        self.copy_one_to_user_bytes(unsafe { value_as_bytes(src) }, offset)?;
         return Ok(());
     }
 
@@ -730,13 +723,12 @@ impl<'a> UserBufferWriter<'a> {
     ///
     /// # Errors
     /// * `EFAULT` - Pages are not mapped or lack required permissions
-    pub fn copy_one_to_user_checked<T: Clone>(
-        &'a mut self,
+    pub fn copy_one_to_user_checked<T>(
+        &mut self,
         src: &T,
         offset: usize,
     ) -> Result<(), SystemError> {
-        let dst = Self::convert_one_with_offset_checked::<T>(self.buffer, offset)?;
-        dst.clone_from(src);
+        self.copy_one_to_user_bytes(unsafe { value_as_bytes(src) }, offset)?;
         return Ok(());
     }
 
@@ -855,6 +847,16 @@ impl<'a> UserBufferWriter<'a> {
         }
         Self::convert_one_with_offset(src, offset)
     }
+
+    #[inline(always)]
+    fn copy_one_to_user_bytes(&mut self, src: &[u8], offset: usize) -> Result<(), SystemError> {
+        checked_user_range(self.buffer.len(), offset, src.len())?;
+        if src.is_empty() {
+            return Ok(());
+        }
+
+        self.copy_to_user_protected(src, offset).map(|_| ())
+    }
 }
 
 impl<'a> UserBufferWriter<'a> {
@@ -872,7 +874,7 @@ impl<'a> UserBufferWriter<'a> {
     /// * `Err(SystemError::EFAULT)` - access failed
     #[allow(dead_code)]
     pub fn copy_to_user_protected(
-        &'a mut self,
+        &mut self,
         src: &[u8],
         offset: usize,
     ) -> Result<usize, SystemError> {

@@ -46,7 +46,7 @@ impl Syscall for SysSendmsgHandle {
             UserBufferReader::new(msg, core::mem::size_of::<MsgHdr>(), frame.is_from_user())?;
         let msg_hdr = user_buffer_reader.read_one_from_user::<MsgHdr>(0)?;
 
-        do_sendmsg(fd, msg_hdr, flags)
+        do_sendmsg(fd, &msg_hdr, flags)
     }
 
     /// Formats the syscall parameters for display/debug purposes

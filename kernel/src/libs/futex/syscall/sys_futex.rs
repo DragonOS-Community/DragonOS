@@ -70,7 +70,7 @@ impl Syscall for SysFutexHandle {
                         core::mem::size_of::<PosixTimeSpec>(),
                         frame.is_from_user(),
                     )?;
-                    (Some(*reader.read_one_from_user::<PosixTimeSpec>(0)?), 0)
+                    (Some(reader.read_one_from_user::<PosixTimeSpec>(0)?), 0)
                 } else {
                     (None, 0)
                 }

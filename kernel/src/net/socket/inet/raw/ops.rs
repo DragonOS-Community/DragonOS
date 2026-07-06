@@ -116,6 +116,17 @@ impl crate::net::socket::Socket for RawSocket {
         RawSocket::send_to(self, buffer, flags, address)
     }
 
+    fn validate_send_buffer_len(
+        &self,
+        len: usize,
+        _address: Option<&Endpoint>,
+    ) -> Result<(), SystemError> {
+        if len > u16::MAX as usize {
+            return Err(SystemError::EMSGSIZE);
+        }
+        Ok(())
+    }
+
     fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
         RawSocket::recv(self, buffer, flags)
     }

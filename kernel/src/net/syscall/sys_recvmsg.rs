@@ -135,7 +135,7 @@ pub(super) fn do_recvmsg(
         match socket.recv_msg(&mut kmsg, pmsg_flags) {
             Ok(recv_size) => (alloc::vec::Vec::new(), recv_size, true),
             Err(SystemError::ENOSYS) => {
-                let mut buf = iovs.new_buf(true);
+                let mut buf = iovs.new_buf(true)?;
                 // 从socket中读取数据
                 let recv_size = socket.recv(&mut buf, pmsg_flags)?;
                 (buf, recv_size, false)

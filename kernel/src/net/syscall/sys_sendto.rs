@@ -50,7 +50,8 @@ impl Syscall for SysSendtoHandle {
         let addr = Self::addr(args);
         let addrlen = Self::addrlen(args);
 
-        // Verify buffer and address validity if from user space
+        // Match Linux import_single_range(): reject out-of-range user buffers
+        // before fd lookup, but do not fault in or copy the payload here.
         if frame.is_from_user() {
             let virt_buf = VirtAddr::new(buf as usize);
             if crate::mm::access_ok(virt_buf, len).is_err() {
@@ -60,12 +61,12 @@ impl Syscall for SysSendtoHandle {
 
         let prepared = prepare_send_common(fd, flags, addr, addrlen as u32)?;
 
-        // Read data from user space before passing it into the socket layer.
+        // Pass the validated user payload to the socket layer. Stream sockets
+        // can consume it in bounded chunks; message-oriented sockets keep their
+        // atomic message copy after length validation.
         let user_buffer_reader = UserBufferReader::new(buf, len, frame.is_from_user())?;
-        let mut data = vec![0u8; len];
-        user_buffer_reader.copy_from_user(&mut data, 0)?;
 
-        do_sendto_prepared(&prepared, &data)
+        do_sendto_user_prepared(&prepared, &user_buffer_reader, len)
     }
 
     /// Formats the syscall parameters for display/debug purposes
@@ -133,28 +134,15 @@ pub(super) fn prepare_send_common(
     addr: *const SockAddr,
     addrlen: u32,
 ) -> Result<PreparedSend, SystemError> {
-    let (socket_inode, file_nonblock) = {
-        let binding = ProcessManager::current_pcb().fd_table();
-        let guard = binding.read();
-        let file = guard.get_file_by_fd(fd as i32).ok_or(SystemError::EBADF)?;
-        if file.file_type() != FileType::Socket {
-            return Err(SystemError::EBADF);
-        }
-        (file.inode(), file.flags().contains(FileFlags::O_NONBLOCK))
-    };
+    let (socket_inode, pmsg_flags) = prepare_send_socket(fd, flags)?;
 
-    let socket = socket_inode.as_socket().ok_or(SystemError::EBADF)?;
+    let socket = socket_inode.as_socket().ok_or(SystemError::ENOTSOCK)?;
     let endpoint = if addr.is_null() {
         None
     } else {
         socket.validate_sendto_addr(addr, addrlen)?;
         Some(SockAddr::to_endpoint(addr, addrlen)?)
     };
-
-    let mut pmsg_flags = socket::PMSG::from_bits_truncate(flags);
-    if file_nonblock {
-        pmsg_flags.insert(socket::PMSG::DONTWAIT);
-    }
 
     Ok(PreparedSend {
         socket_inode,
@@ -163,14 +151,35 @@ pub(super) fn prepare_send_common(
     })
 }
 
-pub(super) fn do_sendto_prepared(
+pub(super) fn prepare_send_socket(
+    fd: usize,
+    flags: u32,
+) -> Result<(Arc<dyn IndexNode>, socket::PMSG), SystemError> {
+    let (socket_inode, file_nonblock) = {
+        let binding = ProcessManager::current_pcb().fd_table();
+        let guard = binding.read();
+        let file = guard.get_file_by_fd(fd as i32).ok_or(SystemError::EBADF)?;
+        if file.file_type() != FileType::Socket {
+            return Err(SystemError::ENOTSOCK);
+        }
+        (file.inode(), file.flags().contains(FileFlags::O_NONBLOCK))
+    };
+
+    socket_inode.as_socket().ok_or(SystemError::ENOTSOCK)?;
+
+    let mut pmsg_flags = socket::PMSG::from_bits_truncate(flags);
+    if file_nonblock {
+        pmsg_flags.insert(socket::PMSG::DONTWAIT);
+    }
+
+    Ok((socket_inode, pmsg_flags))
+}
+
+pub(super) fn do_sendto_user_prepared(
     prepared: &PreparedSend,
-    buf: &[u8],
+    reader: &UserBufferReader<'_>,
+    len: usize,
 ) -> Result<usize, SystemError> {
     let socket = prepared.socket_inode.as_socket().unwrap();
-    if let Some(endpoint) = &prepared.endpoint {
-        socket.send_to(buf, prepared.pmsg_flags, endpoint.clone())
-    } else {
-        socket.send(buf, prepared.pmsg_flags)
-    }
+    socket.send_user_buffer(reader, len, prepared.pmsg_flags, prepared.endpoint.clone())
 }

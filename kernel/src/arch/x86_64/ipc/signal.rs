@@ -45,7 +45,7 @@ const FP_XSTATE_MAGIC1: u32 = 0x4650_5853;
 const FP_XSTATE_MAGIC2: u32 = 0x4650_5845;
 const FP_XSTATE_MAGIC2_SIZE: usize = size_of::<u32>();
 const FPSTATE_FRAME_SIZE: usize = size_of::<UserXState>() + FP_XSTATE_MAGIC2_SIZE;
-const MINSIGSTKSZ: usize = 2048;
+pub const MINSIGSTKSZ: usize = 2048;
 
 const X86_EFLAGS_CF: u64 = 1 << 0;
 const X86_EFLAGS_PF: u64 = 1 << 2;

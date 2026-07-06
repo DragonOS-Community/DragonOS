@@ -3,7 +3,11 @@ use alloc::{
     collections::LinkedList,
     sync::{Arc, Weak},
 };
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(
+    target_arch = "x86_64",
+    target_arch = "riscv64",
+    target_arch = "loongarch64"
+))]
 use core::arch::asm;
 use core::{
     hash::{Hash, Hasher},
@@ -587,17 +591,19 @@ impl Futex {
             };
 
             let mut wake_count = 0;
+            let nr_wake = if nr_wake <= 0 { 1 } else { nr_wake as u32 };
+            let nr_wake2 = if nr_wake2 <= 0 { 1 } else { nr_wake2 as u32 };
             // If uaddr1 has no associated waiters, return 0 instead of EINVAL per Linux behavior.
             if let Some(bucket1) = futex_data_guard.get_mut(&key1) {
                 // Wake up processes in uaddr1
-                wake_count += bucket1.wake_up(key1.clone(), None, nr_wake as u32)?;
+                wake_count += bucket1.wake_up(key1.clone(), None, nr_wake)?;
             }
 
             // If the operation succeeds, wake up processes in uaddr2
             if op_ret {
                 // If uaddr2 has no associated waiters, skip the wake instead of returning EINVAL per Linux behavior.
                 if let Some(bucket2) = futex_data_guard.get_mut(&key2) {
-                    wake_count += bucket2.wake_up(key2, None, nr_wake2 as u32)?;
+                    wake_count += bucket2.wake_up(key2, None, nr_wake2)?;
                 }
             }
 
@@ -811,13 +817,411 @@ impl Futex {
         }
     }
 
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "riscv64")]
+    unsafe fn arch_futex_atomic_op_inuser_nofault(
+        op: FutexOP,
+        oparg: u32,
+        uaddr: *mut u32,
+    ) -> Result<u32, SystemError> {
+        match op {
+            FutexOP::FUTEX_OP_SET => Self::riscv64_futex_amoswap_nofault(uaddr, oparg),
+            FutexOP::FUTEX_OP_ADD => Self::riscv64_futex_amoadd_nofault(uaddr, oparg),
+            FutexOP::FUTEX_OP_OR => Self::riscv64_futex_amoor_nofault(uaddr, oparg),
+            FutexOP::FUTEX_OP_ANDN => Self::riscv64_futex_amoand_nofault(uaddr, !oparg),
+            FutexOP::FUTEX_OP_XOR => Self::riscv64_futex_amoxor_nofault(uaddr, oparg),
+            _ => Err(SystemError::ENOSYS),
+        }
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    unsafe fn arch_futex_atomic_op_inuser_nofault(
+        op: FutexOP,
+        oparg: u32,
+        uaddr: *mut u32,
+    ) -> Result<u32, SystemError> {
+        match op {
+            FutexOP::FUTEX_OP_SET => Self::loongarch64_futex_set_nofault(uaddr, oparg),
+            FutexOP::FUTEX_OP_ADD => Self::loongarch64_futex_add_nofault(uaddr, oparg),
+            FutexOP::FUTEX_OP_OR => Self::loongarch64_futex_or_nofault(uaddr, oparg),
+            FutexOP::FUTEX_OP_ANDN => Self::loongarch64_futex_and_nofault(uaddr, !oparg),
+            FutexOP::FUTEX_OP_XOR => Self::loongarch64_futex_xor_nofault(uaddr, oparg),
+            _ => Err(SystemError::ENOSYS),
+        }
+    }
+
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "riscv64",
+        target_arch = "loongarch64"
+    )))]
     unsafe fn arch_futex_atomic_op_inuser_nofault(
         _op: FutexOP,
         _oparg: u32,
         _uaddr: *mut u32,
     ) -> Result<u32, SystemError> {
         Err(SystemError::ENOSYS)
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    unsafe fn riscv64_futex_amoswap_nofault(
+        uaddr: *mut u32,
+        value: u32,
+    ) -> Result<u32, SystemError> {
+        let mut oldval: usize;
+        let mut fault = 0usize;
+        let value = value as usize;
+        asm!(
+            "2:",
+            "amoswap.w.aqrl {oldval}, {value}, ({ptr})",
+            "j 3f",
+            "4:",
+            "li {fault}, 1",
+            "3:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".quad 2b - .",
+            ".quad 4b - . + 8",
+            ".popsection",
+            ptr = in(reg) uaddr,
+            value = in(reg) value,
+            oldval = out(reg) oldval,
+            fault = inout(reg) fault,
+            options(nostack)
+        );
+        if fault == 0 {
+            Ok(oldval as u32)
+        } else {
+            Err(SystemError::EFAULT)
+        }
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    unsafe fn riscv64_futex_amoadd_nofault(
+        uaddr: *mut u32,
+        value: u32,
+    ) -> Result<u32, SystemError> {
+        let mut oldval: usize;
+        let mut fault = 0usize;
+        let value = value as usize;
+        asm!(
+            "2:",
+            "amoadd.w.aqrl {oldval}, {value}, ({ptr})",
+            "j 3f",
+            "4:",
+            "li {fault}, 1",
+            "3:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".quad 2b - .",
+            ".quad 4b - . + 8",
+            ".popsection",
+            ptr = in(reg) uaddr,
+            value = in(reg) value,
+            oldval = out(reg) oldval,
+            fault = inout(reg) fault,
+            options(nostack)
+        );
+        if fault == 0 {
+            Ok(oldval as u32)
+        } else {
+            Err(SystemError::EFAULT)
+        }
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    unsafe fn riscv64_futex_amoor_nofault(uaddr: *mut u32, value: u32) -> Result<u32, SystemError> {
+        let mut oldval: usize;
+        let mut fault = 0usize;
+        let value = value as usize;
+        asm!(
+            "2:",
+            "amoor.w.aqrl {oldval}, {value}, ({ptr})",
+            "j 3f",
+            "4:",
+            "li {fault}, 1",
+            "3:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".quad 2b - .",
+            ".quad 4b - . + 8",
+            ".popsection",
+            ptr = in(reg) uaddr,
+            value = in(reg) value,
+            oldval = out(reg) oldval,
+            fault = inout(reg) fault,
+            options(nostack)
+        );
+        if fault == 0 {
+            Ok(oldval as u32)
+        } else {
+            Err(SystemError::EFAULT)
+        }
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    unsafe fn riscv64_futex_amoand_nofault(
+        uaddr: *mut u32,
+        value: u32,
+    ) -> Result<u32, SystemError> {
+        let mut oldval: usize;
+        let mut fault = 0usize;
+        let value = value as usize;
+        asm!(
+            "2:",
+            "amoand.w.aqrl {oldval}, {value}, ({ptr})",
+            "j 3f",
+            "4:",
+            "li {fault}, 1",
+            "3:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".quad 2b - .",
+            ".quad 4b - . + 8",
+            ".popsection",
+            ptr = in(reg) uaddr,
+            value = in(reg) value,
+            oldval = out(reg) oldval,
+            fault = inout(reg) fault,
+            options(nostack)
+        );
+        if fault == 0 {
+            Ok(oldval as u32)
+        } else {
+            Err(SystemError::EFAULT)
+        }
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    unsafe fn riscv64_futex_amoxor_nofault(
+        uaddr: *mut u32,
+        value: u32,
+    ) -> Result<u32, SystemError> {
+        let mut oldval: usize;
+        let mut fault = 0usize;
+        let value = value as usize;
+        asm!(
+            "2:",
+            "amoxor.w.aqrl {oldval}, {value}, ({ptr})",
+            "j 3f",
+            "4:",
+            "li {fault}, 1",
+            "3:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".quad 2b - .",
+            ".quad 4b - . + 8",
+            ".popsection",
+            ptr = in(reg) uaddr,
+            value = in(reg) value,
+            oldval = out(reg) oldval,
+            fault = inout(reg) fault,
+            options(nostack)
+        );
+        if fault == 0 {
+            Ok(oldval as u32)
+        } else {
+            Err(SystemError::EFAULT)
+        }
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    unsafe fn loongarch64_futex_set_nofault(
+        uaddr: *mut u32,
+        value: u32,
+    ) -> Result<u32, SystemError> {
+        let mut oldval: usize;
+        let mut fault = 0usize;
+        let value = value as usize;
+        asm!(
+            "2:",
+            "ll.w {oldval}, {ptr}, 0",
+            "or {tmp}, {value}, $zero",
+            "3:",
+            "sc.w {tmp}, {ptr}, 0",
+            "beqz {tmp}, 2b",
+            "b 5f",
+            "4:",
+            "ori {fault}, $zero, 1",
+            "5:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".dword 2b - .",
+            ".dword 4b - . + 8",
+            ".dword 3b - .",
+            ".dword 4b - . + 8",
+            ".popsection",
+            ptr = in(reg) uaddr,
+            value = in(reg) value,
+            oldval = out(reg) oldval,
+            tmp = out(reg) _,
+            fault = inout(reg) fault,
+            options(nostack)
+        );
+        if fault == 0 {
+            Ok(oldval as u32)
+        } else {
+            Err(SystemError::EFAULT)
+        }
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    unsafe fn loongarch64_futex_add_nofault(
+        uaddr: *mut u32,
+        value: u32,
+    ) -> Result<u32, SystemError> {
+        let mut oldval: usize;
+        let mut fault = 0usize;
+        let value = value as usize;
+        asm!(
+            "2:",
+            "ll.w {oldval}, {ptr}, 0",
+            "add.w {tmp}, {oldval}, {value}",
+            "3:",
+            "sc.w {tmp}, {ptr}, 0",
+            "beqz {tmp}, 2b",
+            "b 5f",
+            "4:",
+            "ori {fault}, $zero, 1",
+            "5:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".dword 2b - .",
+            ".dword 4b - . + 8",
+            ".dword 3b - .",
+            ".dword 4b - . + 8",
+            ".popsection",
+            ptr = in(reg) uaddr,
+            value = in(reg) value,
+            oldval = out(reg) oldval,
+            tmp = out(reg) _,
+            fault = inout(reg) fault,
+            options(nostack)
+        );
+        if fault == 0 {
+            Ok(oldval as u32)
+        } else {
+            Err(SystemError::EFAULT)
+        }
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    unsafe fn loongarch64_futex_or_nofault(
+        uaddr: *mut u32,
+        value: u32,
+    ) -> Result<u32, SystemError> {
+        let mut oldval: usize;
+        let mut fault = 0usize;
+        let value = value as usize;
+        asm!(
+            "2:",
+            "ll.w {oldval}, {ptr}, 0",
+            "or {tmp}, {oldval}, {value}",
+            "3:",
+            "sc.w {tmp}, {ptr}, 0",
+            "beqz {tmp}, 2b",
+            "b 5f",
+            "4:",
+            "ori {fault}, $zero, 1",
+            "5:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".dword 2b - .",
+            ".dword 4b - . + 8",
+            ".dword 3b - .",
+            ".dword 4b - . + 8",
+            ".popsection",
+            ptr = in(reg) uaddr,
+            value = in(reg) value,
+            oldval = out(reg) oldval,
+            tmp = out(reg) _,
+            fault = inout(reg) fault,
+            options(nostack)
+        );
+        if fault == 0 {
+            Ok(oldval as u32)
+        } else {
+            Err(SystemError::EFAULT)
+        }
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    unsafe fn loongarch64_futex_and_nofault(
+        uaddr: *mut u32,
+        value: u32,
+    ) -> Result<u32, SystemError> {
+        let mut oldval: usize;
+        let mut fault = 0usize;
+        let value = value as usize;
+        asm!(
+            "2:",
+            "ll.w {oldval}, {ptr}, 0",
+            "and {tmp}, {oldval}, {value}",
+            "3:",
+            "sc.w {tmp}, {ptr}, 0",
+            "beqz {tmp}, 2b",
+            "b 5f",
+            "4:",
+            "ori {fault}, $zero, 1",
+            "5:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".dword 2b - .",
+            ".dword 4b - . + 8",
+            ".dword 3b - .",
+            ".dword 4b - . + 8",
+            ".popsection",
+            ptr = in(reg) uaddr,
+            value = in(reg) value,
+            oldval = out(reg) oldval,
+            tmp = out(reg) _,
+            fault = inout(reg) fault,
+            options(nostack)
+        );
+        if fault == 0 {
+            Ok(oldval as u32)
+        } else {
+            Err(SystemError::EFAULT)
+        }
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    unsafe fn loongarch64_futex_xor_nofault(
+        uaddr: *mut u32,
+        value: u32,
+    ) -> Result<u32, SystemError> {
+        let mut oldval: usize;
+        let mut fault = 0usize;
+        let value = value as usize;
+        asm!(
+            "2:",
+            "ll.w {oldval}, {ptr}, 0",
+            "xor {tmp}, {oldval}, {value}",
+            "3:",
+            "sc.w {tmp}, {ptr}, 0",
+            "beqz {tmp}, 2b",
+            "b 5f",
+            "4:",
+            "ori {fault}, $zero, 1",
+            "5:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".dword 2b - .",
+            ".dword 4b - . + 8",
+            ".dword 3b - .",
+            ".dword 4b - . + 8",
+            ".popsection",
+            ptr = in(reg) uaddr,
+            value = in(reg) value,
+            oldval = out(reg) oldval,
+            tmp = out(reg) _,
+            fault = inout(reg) fault,
+            options(nostack)
+        );
+        if fault == 0 {
+            Ok(oldval as u32)
+        } else {
+            Err(SystemError::EFAULT)
+        }
     }
 
     #[cfg(target_arch = "x86_64")]

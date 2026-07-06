@@ -5,6 +5,7 @@ use system_error::SystemError;
 use crate::filesystem::vfs::iov::IoVecs;
 use crate::filesystem::vfs::{fasync::FAsyncItems, InodeId};
 use crate::libs::wait_queue::WaitQueue;
+use crate::mm::MemoryManagementArch;
 use crate::net::socket::common::EPollItems;
 use crate::net::socket::posix::IpOption;
 use crate::net::socket::unix::utils::{CmsgBuffer, SOL_SOCKET};
@@ -470,6 +471,24 @@ impl Socket for TcpSocket {
     ) -> Result<usize, SystemError> {
         // Linux 语义：对已连接 SOCK_STREAM(TCP)，sendto(2) 的地址参数被忽略。
         self.send(buffer, flags)
+    }
+
+    fn send_user_buffer(
+        &self,
+        reader: &crate::syscall::user_access::UserBufferReader<'_>,
+        len: usize,
+        flags: PMSG,
+        address: Option<Endpoint>,
+    ) -> Result<usize, SystemError> {
+        const STREAM_SEND_CHUNK: usize = crate::arch::MMArch::PAGE_SIZE;
+        crate::net::socket::base::send_user_buffer_via_kernel_buf(
+            self,
+            reader,
+            len,
+            flags,
+            address,
+            STREAM_SEND_CHUNK,
+        )
     }
 
     fn epoll_items(&self) -> &EPollItems {

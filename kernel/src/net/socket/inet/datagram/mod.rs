@@ -1576,6 +1576,17 @@ impl Socket for UdpSocket {
         }
     }
 
+    fn validate_send_buffer_len(
+        &self,
+        len: usize,
+        _address: Option<&Endpoint>,
+    ) -> Result<(), SystemError> {
+        if len > u16::MAX as usize {
+            return Err(SystemError::EMSGSIZE);
+        }
+        Ok(())
+    }
+
     fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
         // Check if read is shutdown
         // Linux allows reading buffered data even after SHUT_RD, only returns EOF when buffer is empty
@@ -1894,7 +1905,7 @@ impl Socket for UdpSocket {
 
         // Validate and create iovecs
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
-        let mut buf = iovs.new_buf(true);
+        let mut buf = iovs.new_buf(true)?;
         let buf_cap = buf.len();
 
         // Receive data from socket

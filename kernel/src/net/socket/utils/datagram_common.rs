@@ -6,6 +6,7 @@ use crate::{
 };
 use alloc::fmt::Debug;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::panic;
 use system_error::SystemError;
 
@@ -54,6 +55,15 @@ pub trait Bound {
     ) -> Result<(usize, usize, Self::Endpoint), SystemError>;
 
     fn try_send(&self, buf: &[u8], to: &Self::Endpoint, flags: PMSG) -> Result<usize, SystemError>;
+
+    fn try_send_vec(
+        &self,
+        buf: Vec<u8>,
+        to: &Self::Endpoint,
+        flags: PMSG,
+    ) -> Result<usize, SystemError> {
+        self.try_send(&buf, to, flags)
+    }
 
     fn check_io_events(&self) -> EPollEventType;
 }

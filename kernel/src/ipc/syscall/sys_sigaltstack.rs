@@ -2,16 +2,16 @@ use alloc::string::ToString;
 use alloc::vec::Vec;
 use core::ffi::c_void;
 
-use crate::arch::{interrupt::TrapFrame, ipc::signal::SigStackFlags};
+use crate::arch::{
+    interrupt::TrapFrame,
+    ipc::signal::{SigStackFlags, MINSIGSTKSZ},
+};
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use crate::{arch::syscall::nr::SYS_SIGALTSTACK, process::ProcessManager};
 use system_error::SystemError;
 
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
-
-// 最小信号栈大小
-const MINSIGSTKSZ: usize = 2048;
 
 /// C 中定义的信号栈, 等于 C 中的 stack_t
 #[repr(C)]

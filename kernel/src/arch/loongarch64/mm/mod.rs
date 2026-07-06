@@ -1,5 +1,7 @@
 pub mod bump;
 
+use core::arch::asm;
+
 use crate::mm::{
     allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage},
     page::EntryFlags,
@@ -119,6 +121,86 @@ impl MemoryManagementArch for LoongArch64MMArch {
 
     unsafe fn set_table(table_kind: crate::mm::PageTableKind, table: crate::mm::PhysAddr) {
         todo!()
+    }
+
+    unsafe fn copy_with_exception_table(dst: *mut u8, src: *const u8, len: usize) -> usize {
+        let _pagefault_guard = crate::process::preempt::PageFaultDisabledGuard::new();
+        let mut dst = dst;
+        let mut src = src;
+        let mut remaining = len;
+        let mut fault = 0usize;
+
+        asm!(
+            "beqz {remaining}, 3f",
+            "2:",
+            "ld.b {tmp}, {src}, 0",
+            "5:",
+            "st.b {tmp}, {dst}, 0",
+            "addi.d {src}, {src}, 1",
+            "addi.d {dst}, {dst}, 1",
+            "addi.d {remaining}, {remaining}, -1",
+            "bnez {remaining}, 2b",
+            "b 3f",
+            "4:",
+            "ori {fault}, $zero, 1",
+            "3:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".dword 2b - .",
+            ".dword 4b - . + 8",
+            ".dword 5b - .",
+            ".dword 4b - . + 8",
+            ".popsection",
+            dst = inout(reg) dst,
+            src = inout(reg) src,
+            remaining = inout(reg) remaining,
+            tmp = out(reg) _,
+            fault = inout(reg) fault,
+            options(nostack)
+        );
+
+        if fault == 0 {
+            0
+        } else {
+            remaining
+        }
+    }
+
+    unsafe fn memset_with_exception_table(dst: *mut u8, value: u8, len: usize) -> usize {
+        let _pagefault_guard = crate::process::preempt::PageFaultDisabledGuard::new();
+        let mut dst = dst;
+        let mut remaining = len;
+        let value = value as usize;
+        let mut fault = 0usize;
+
+        asm!(
+            "beqz {remaining}, 3f",
+            "2:",
+            "st.b {value}, {dst}, 0",
+            "addi.d {dst}, {dst}, 1",
+            "addi.d {remaining}, {remaining}, -1",
+            "bnez {remaining}, 2b",
+            "b 3f",
+            "4:",
+            "ori {fault}, $zero, 1",
+            "3:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".dword 2b - .",
+            ".dword 4b - . + 8",
+            ".popsection",
+            dst = inout(reg) dst,
+            remaining = inout(reg) remaining,
+            value = in(reg) value,
+            fault = inout(reg) fault,
+            options(nostack)
+        );
+
+        if fault == 0 {
+            0
+        } else {
+            remaining
+        }
     }
 
     fn virt_is_valid(virt: crate::mm::VirtAddr) -> bool {

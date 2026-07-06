@@ -80,7 +80,10 @@ impl IoVecs {
         // Use exception-table protected copy to avoid kernel faults when userspace pointer is bad.
         let iovs_buf = iovs_reader.buffer_protected(0)?;
 
-        let mut slices: Vec<IoVec> = Vec::with_capacity(iovcnt);
+        let mut slices: Vec<IoVec> = Vec::new();
+        slices
+            .try_reserve(iovcnt)
+            .map_err(|_| SystemError::ENOMEM)?;
         for idx in 0..iovcnt {
             let offset = idx * elem_size;
             let one: IoVec = iovs_buf.read_one(offset)?;
@@ -130,7 +133,10 @@ impl IoVecs {
     /// inaccessible byte** and the remaining iovecs are ignored. If no data can be
     /// read at all, `Err(SystemError::EFAULT)` is returned.
     pub fn gather(&self) -> Result<Vec<u8>, SystemError> {
-        let mut buf = Vec::with_capacity(self.total_len());
+        const GATHER_SCRATCH_LEN: usize = 64 * 1024;
+
+        let mut buf = Vec::new();
+        let mut scratch = Vec::new();
         let mut read_any = false;
 
         for iov in self.0.iter() {
@@ -146,21 +152,36 @@ impl IoVecs {
                 return Ok(buf);
             }
 
-            // 使用异常保护的拷贝，与 scatter 保持一致
-            let mut chunk = alloc::vec![0u8; accessible];
-            match unsafe { copy_from_user_protected(&mut chunk, base) } {
-                Ok(_) => {
-                    buf.extend_from_slice(&chunk);
+            let mut copied = 0usize;
+            while copied < accessible {
+                let want = core::cmp::min(GATHER_SCRATCH_LEN, accessible - copied);
+                if scratch.len() < want {
+                    scratch
+                        .try_reserve(want - scratch.len())
+                        .map_err(|_| SystemError::ENOMEM)?;
+                    scratch.resize(want, 0);
+                }
+
+                // 使用异常保护的拷贝，与 scatter 保持一致
+                match unsafe { copy_from_user_protected(&mut scratch[..want], base + copied) } {
+                    Ok(_) => {
+                        buf.try_reserve(want).map_err(|_| SystemError::ENOMEM)?;
+                        buf.extend_from_slice(&scratch[..want]);
+                    }
+                    Err(SystemError::EFAULT) => {
+                        // Linux: return partial data if any bytes were copied.
+                        if !read_any {
+                            return Err(SystemError::EFAULT);
+                        }
+                        return Ok(buf);
+                    }
+                    Err(e) => return Err(e),
+                }
+
+                copied += want;
+                if want > 0 {
                     read_any = true;
                 }
-                Err(SystemError::EFAULT) => {
-                    // Linux: return partial data if any bytes were copied.
-                    if !read_any {
-                        return Err(SystemError::EFAULT);
-                    }
-                    return Ok(buf);
-                }
-                Err(e) => return Err(e),
             }
 
             // 如果没有读取完整个 iov，说明遇到了不可访问的区域
@@ -240,13 +261,15 @@ impl IoVecs {
     /// # Returns
     ///
     /// A new [`Vec<u8>`] with capacity (and potentially length) equal to the total length of all IoVecs.
-    pub fn new_buf(&self, set_len: bool) -> Vec<u8> {
+    pub fn new_buf(&self, set_len: bool) -> Result<Vec<u8>, SystemError> {
         let total_len = self.total_len();
-        let mut buf: Vec<u8> = Vec::with_capacity(total_len);
+        let mut buf: Vec<u8> = Vec::new();
+        buf.try_reserve(total_len)
+            .map_err(|_| SystemError::ENOMEM)?;
 
         if set_len {
             buf.resize(total_len, 0);
         }
-        return buf;
+        return Ok(buf);
     }
 }

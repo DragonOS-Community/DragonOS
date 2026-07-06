@@ -11,6 +11,8 @@ use crate::{
     ipc::signal_types::{SigCode, SignalArch},
 };
 
+pub const MINSIGSTKSZ: usize = 2048;
+
 pub struct RiscV64SignalArch;
 
 impl SignalArch for RiscV64SignalArch {
@@ -49,7 +51,7 @@ bitflags! {
 pub struct RiscV64SigStack {
     pub sp: usize,
     pub flags: SigStackFlags,
-    pub size: u32,
+    pub size: usize,
 }
 
 impl RiscV64SigStack {
@@ -67,7 +69,8 @@ impl RiscV64SigStack {
         !self.flags.contains(SigStackFlags::SS_AUTODISARM)
             && self.sp != 0
             && self.size != 0
-            && (sp.wrapping_sub(self.sp) < self.size as usize)
+            && sp > self.sp
+            && sp.wrapping_sub(self.sp) <= self.size
     }
 }
 

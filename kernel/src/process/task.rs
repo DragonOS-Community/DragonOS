@@ -883,7 +883,7 @@ impl ProcessControlBlock {
             })?;
 
         if f.file_type() != FileType::Socket {
-            return Err(SystemError::EBADF);
+            return Err(SystemError::ENOTSOCK);
         }
 
         let inode = f.inode();
@@ -893,7 +893,7 @@ impl ProcessControlBlock {
             return Ok(inode);
         }
 
-        Err(SystemError::EBADF)
+        Err(SystemError::ENOTSOCK)
     }
 
     fn is_alive_reparent_target(pcb: &Arc<ProcessControlBlock>) -> bool {

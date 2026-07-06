@@ -1,3 +1,5 @@
+use core::arch::asm;
+
 use riscv::register::satp;
 use sbi_rt::{HartMask, SbiRet};
 use system_error::SystemError;
@@ -180,6 +182,86 @@ impl MemoryManagementArch for RiscV64MMArch {
         let ppn = PhysPageFrame::new(table).ppn();
         riscv::asm::sfence_vma_all();
         satp::set(satp::Mode::Sv39, 0, ppn);
+    }
+
+    unsafe fn copy_with_exception_table(dst: *mut u8, src: *const u8, len: usize) -> usize {
+        let _pagefault_guard = crate::process::preempt::PageFaultDisabledGuard::new();
+        let mut dst = dst;
+        let mut src = src;
+        let mut remaining = len;
+        let mut fault = 0usize;
+
+        asm!(
+            "beqz {remaining}, 3f",
+            "2:",
+            "lb {tmp}, 0({src})",
+            "5:",
+            "sb {tmp}, 0({dst})",
+            "addi {src}, {src}, 1",
+            "addi {dst}, {dst}, 1",
+            "addi {remaining}, {remaining}, -1",
+            "bnez {remaining}, 2b",
+            "j 3f",
+            "4:",
+            "li {fault}, 1",
+            "3:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".quad 2b - .",
+            ".quad 4b - . + 8",
+            ".quad 5b - .",
+            ".quad 4b - . + 8",
+            ".popsection",
+            dst = inout(reg) dst,
+            src = inout(reg) src,
+            remaining = inout(reg) remaining,
+            tmp = out(reg) _,
+            fault = inout(reg) fault,
+            options(nostack)
+        );
+
+        if fault == 0 {
+            0
+        } else {
+            remaining
+        }
+    }
+
+    unsafe fn memset_with_exception_table(dst: *mut u8, value: u8, len: usize) -> usize {
+        let _pagefault_guard = crate::process::preempt::PageFaultDisabledGuard::new();
+        let mut dst = dst;
+        let mut remaining = len;
+        let value = value as usize;
+        let mut fault = 0usize;
+
+        asm!(
+            "beqz {remaining}, 3f",
+            "2:",
+            "sb {value}, 0({dst})",
+            "addi {dst}, {dst}, 1",
+            "addi {remaining}, {remaining}, -1",
+            "bnez {remaining}, 2b",
+            "j 3f",
+            "4:",
+            "li {fault}, 1",
+            "3:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".quad 2b - .",
+            ".quad 4b - . + 8",
+            ".popsection",
+            dst = inout(reg) dst,
+            remaining = inout(reg) remaining,
+            value = in(reg) value,
+            fault = inout(reg) fault,
+            options(nostack)
+        );
+
+        if fault == 0 {
+            0
+        } else {
+            remaining
+        }
     }
 
     fn virt_is_valid(virt: VirtAddr) -> bool {

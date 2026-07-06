@@ -438,6 +438,17 @@ impl Socket for PacketSocket {
         self.try_send(buffer, dest)
     }
 
+    fn validate_send_buffer_len(
+        &self,
+        len: usize,
+        _address: Option<&Endpoint>,
+    ) -> Result<(), SystemError> {
+        if len > u16::MAX as usize {
+            return Err(SystemError::EMSGSIZE);
+        }
+        Ok(())
+    }
+
     fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
         if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
             self.try_recv(buffer).map(|(len, _)| len)

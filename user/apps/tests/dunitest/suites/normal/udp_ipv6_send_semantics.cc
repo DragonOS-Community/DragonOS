@@ -1,12 +1,19 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <gtest/gtest.h>
 
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <fcntl.h>
+#include <sys/syscall.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <cstdint>
 #include <cstring>
 #include <string>
 
@@ -97,6 +104,90 @@ TEST(UdpIpv6SendSemantics, InvalidFdWithLargePayloadReturnsEbadfBeforeCopy) {
     EXPECT_EQ(ret, -1);
     EXPECT_EQ(saved_errno, EBADF) << "unexpected errno: " << ErrnoString(saved_errno);
     EXPECT_EQ(munmap(mapping, kLargeLen), 0) << "munmap failed: " << ErrnoString(errno);
+}
+
+TEST(UdpIpv6SendSemantics, InvalidFdSendtoReturnsEbadfBeforeCheckingPayload) {
+    errno = 0;
+    ssize_t ret = sendto(-1, reinterpret_cast<void*>(1), 4, 0, nullptr, 0);
+    int saved_errno = errno;
+
+    EXPECT_EQ(ret, -1);
+    EXPECT_EQ(saved_errno, EBADF) << "unexpected errno: " << ErrnoString(saved_errno);
+}
+
+TEST(UdpIpv6SendSemantics, NonSocketSendtoReturnsEnotsockBeforeCheckingPayload) {
+    FdGuard fd(open("/dev/null", O_RDONLY));
+    ASSERT_GE(fd.Get(), 0) << "open(/dev/null) failed: " << ErrnoString(errno);
+
+    errno = 0;
+    ssize_t ret = sendto(fd.Get(), reinterpret_cast<void*>(1), 4, 0, nullptr, 0);
+    int saved_errno = errno;
+
+    EXPECT_EQ(ret, -1);
+    EXPECT_EQ(saved_errno, ENOTSOCK) << "unexpected errno: " << ErrnoString(saved_errno);
+}
+
+TEST(UdpIpv6SendSemantics, SendtoRejectsOutOfRangePayloadBeforeFdLookup) {
+    void* out_of_range = reinterpret_cast<void*>(UINTPTR_MAX);
+
+    errno = 0;
+    ssize_t ret = sendto(-1, out_of_range, 4, 0, nullptr, 0);
+    int saved_errno = errno;
+
+    EXPECT_EQ(ret, -1);
+    EXPECT_EQ(saved_errno, EFAULT) << "unexpected errno: " << ErrnoString(saved_errno);
+}
+
+TEST(UdpIpv6SendSemantics, SendtoRejectsOutOfRangePayloadBeforeSocketType) {
+    FdGuard fd(open("/dev/null", O_RDONLY));
+    ASSERT_GE(fd.Get(), 0) << "open(/dev/null) failed: " << ErrnoString(errno);
+    void* out_of_range = reinterpret_cast<void*>(UINTPTR_MAX);
+
+    errno = 0;
+    ssize_t ret = sendto(fd.Get(), out_of_range, 4, 0, nullptr, 0);
+    int saved_errno = errno;
+
+    EXPECT_EQ(ret, -1);
+    EXPECT_EQ(saved_errno, EFAULT) << "unexpected errno: " << ErrnoString(saved_errno);
+}
+
+TEST(UdpIpv6SendSemantics, InvalidFdSendmsgReturnsEbadfBeforeCopyingMsgHdr) {
+    errno = 0;
+    ssize_t ret = sendmsg(-1, reinterpret_cast<msghdr*>(1), 0);
+    int saved_errno = errno;
+
+    EXPECT_EQ(ret, -1);
+    EXPECT_EQ(saved_errno, EBADF) << "unexpected errno: " << ErrnoString(saved_errno);
+}
+
+TEST(UdpIpv6SendSemantics, InvalidFdSendmmsgReturnsEbadfBeforeCopyingMsgVec) {
+    errno = 0;
+    long ret = syscall(SYS_sendmmsg, -1, reinterpret_cast<mmsghdr*>(1), 1U, 0U);
+    int saved_errno = errno;
+
+    EXPECT_EQ(ret, -1);
+    EXPECT_EQ(saved_errno, EBADF) << "unexpected errno: " << ErrnoString(saved_errno);
+}
+
+TEST(UdpIpv6SendSemantics, InvalidFdSendmmsgVlenZeroStillChecksFdFirst) {
+    errno = 0;
+    long ret = syscall(SYS_sendmmsg, -1, reinterpret_cast<mmsghdr*>(1), 0U, 0U);
+    int saved_errno = errno;
+
+    EXPECT_EQ(ret, -1);
+    EXPECT_EQ(saved_errno, EBADF) << "unexpected errno: " << ErrnoString(saved_errno);
+}
+
+TEST(UdpIpv6SendSemantics, SendmmsgVlenZeroDoesNotCopyMsgVec) {
+    FdGuard fd(socket(AF_INET6, SOCK_DGRAM, 0));
+    ASSERT_GE(fd.Get(), 0) << "socket(AF_INET6, SOCK_DGRAM) failed: " << ErrnoString(errno);
+
+    errno = 0;
+    long ret = syscall(SYS_sendmmsg, fd.Get(), reinterpret_cast<mmsghdr*>(1), 0U, 0U);
+    int saved_errno = errno;
+
+    EXPECT_EQ(ret, 0);
+    EXPECT_EQ(saved_errno, 0) << "unexpected errno: " << ErrnoString(saved_errno);
 }
 
 int main(int argc, char** argv) {

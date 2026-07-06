@@ -38,7 +38,7 @@ impl Syscall for SysReadVHandle {
         use crate::process::ProcessManager;
         if let Ok(_socket_inode) = ProcessManager::current_pcb().get_socket_inode(fd) {
             // Socket: read entire message then scatter to iovecs
-            let mut buf = iovecs.new_buf(true);
+            let mut buf = iovecs.new_buf(true)?;
             let nread = do_read(fd, &mut buf)?;
             iovecs.scatter(&buf[..nread])?;
             return Ok(nread);

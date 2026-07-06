@@ -2,13 +2,13 @@ use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SENDMSG;
-use crate::filesystem::vfs::{file::FileFlags, iov::IoVecs};
+use crate::filesystem::vfs::{iov::IoVecs, IndexNode};
 use crate::net::posix::{MsgHdr, SockAddr};
 use crate::net::socket;
-use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::UserBufferReader;
 use alloc::string::ToString;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 /// System call handler for the `sendmsg` syscall
@@ -41,12 +41,7 @@ impl Syscall for SysSendmsgHandle {
         let msg = Self::msg(args);
         let flags = Self::flags(args);
 
-        // Read MsgHdr from user space
-        let user_buffer_reader =
-            UserBufferReader::new(msg, core::mem::size_of::<MsgHdr>(), frame.is_from_user())?;
-        let msg_hdr = user_buffer_reader.read_one_from_user::<MsgHdr>(0)?;
-
-        do_sendmsg(fd, &msg_hdr, flags)
+        do_sendmsg_user(fd, msg, flags, frame.is_from_user())
     }
 
     /// Formats the syscall parameters for display/debug purposes
@@ -84,50 +79,41 @@ impl SysSendmsgHandle {
 
 syscall_table_macros::declare_syscall!(SYS_SENDMSG, SysSendmsgHandle);
 
-/// Internal implementation of the sendmsg operation
-///
-/// # Arguments
-/// * `fd` - File descriptor
-/// * `msg` - Message header
-/// * `flags` - Flags
-///
-/// # Returns
-/// * `Ok(usize)` - Number of bytes sent
-/// * `Err(SystemError)` - Error code if operation fails
-pub(super) fn do_sendmsg(fd: usize, msg: &MsgHdr, flags: u32) -> Result<usize, SystemError> {
-    // Validate and parse iovecs, then gather user data.
-    let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, false)? };
+pub(super) fn do_sendmsg_user(
+    fd: usize,
+    msg: *const MsgHdr,
+    flags: u32,
+    from_user: bool,
+) -> Result<usize, SystemError> {
+    let (socket_inode, pmsg) = super::sys_sendto::prepare_send_socket(fd, flags)?;
 
-    // Honor O_NONBLOCK set via fcntl(F_SETFL) by translating it to MSG_DONTWAIT.
-    let file_nonblock = {
-        let binding = ProcessManager::current_pcb().fd_table();
-        let guard = binding.read();
-        let file = guard.get_file_by_fd(fd as i32).ok_or(SystemError::EBADF)?;
-        file.flags().contains(FileFlags::O_NONBLOCK)
+    // Read MsgHdr from user space only after fd/socket validation, matching
+    // Linux error ordering for bad fd plus bad user pointer.
+    let msg_hdr = {
+        let user_buffer_reader =
+            UserBufferReader::new(msg, core::mem::size_of::<MsgHdr>(), from_user)?;
+        user_buffer_reader.read_one_from_user::<MsgHdr>(0)?
     };
 
-    let mut pmsg = socket::PMSG::from_bits_truncate(flags);
-    if file_nonblock {
-        pmsg.insert(socket::PMSG::DONTWAIT);
-    }
+    do_sendmsg_prepared(&socket_inode, pmsg, &msg_hdr)
+}
+
+pub(super) fn do_sendmsg_prepared(
+    socket_inode: &Arc<dyn IndexNode>,
+    pmsg: socket::PMSG,
+    msg: &MsgHdr,
+) -> Result<usize, SystemError> {
+    let socket = socket_inode.as_socket().ok_or(SystemError::ENOTSOCK)?;
 
     let endpoint = if msg.msg_name.is_null() {
         None
     } else {
-        // 通过 Socket trait 方法验证地址，避免 syscall 层与具体 socket 实现耦合
-        {
-            let socket_inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
-            let socket = socket_inode.as_socket().unwrap();
-            socket.validate_sendto_addr(msg.msg_name as *const SockAddr, msg.msg_namelen)?;
-        }
+        socket.validate_sendto_addr(msg.msg_name as *const SockAddr, msg.msg_namelen)?;
         Some(SockAddr::to_endpoint(
             msg.msg_name as *const SockAddr,
             msg.msg_namelen,
         )?)
     };
-
-    let socket_inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
-    let socket = socket_inode.as_socket().unwrap();
 
     // Prefer socket-level send_msg if implemented.
     match socket.send_msg(msg, pmsg) {
@@ -136,6 +122,8 @@ pub(super) fn do_sendmsg(fd: usize, msg: &MsgHdr, flags: u32) -> Result<usize, S
         Err(e) => return Err(e),
     }
 
+    // Validate and parse iovecs, then gather user data.
+    let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, false)? };
     let buf = iovs.gather()?;
     if let Some(endpoint) = endpoint {
         socket.send_to(&buf, pmsg, endpoint)

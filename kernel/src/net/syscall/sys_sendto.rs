@@ -63,11 +63,12 @@ impl Syscall for SysSendtoHandle {
             }
         }
 
-        // Read data from user space
+        // Read data from user space before passing it into the socket layer.
         let user_buffer_reader = UserBufferReader::new(buf, len, frame.is_from_user())?;
-        let data = user_buffer_reader.read_from_user_checked(0)?;
+        let mut data = vec![0u8; len];
+        user_buffer_reader.copy_from_user(&mut data, 0)?;
 
-        do_sendto(fd, data, flags, addr, addrlen as u32)
+        do_sendto(fd, &data, flags, addr, addrlen as u32)
     }
 
     /// Formats the syscall parameters for display/debug purposes

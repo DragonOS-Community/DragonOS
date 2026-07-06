@@ -67,6 +67,8 @@ pub struct ProcessControlBlock {
     pub(super) basic: RwLock<ProcessBasicInfo>,
     /// Spinlock hold count of the current process.
     pub(super) preempt_count: AtomicUsize,
+    /// Nesting count for no-fault user access sections.
+    pub(super) pagefault_disabled: AtomicUsize,
     /// RCU read-side nesting depth of the current process.
     pub(super) rcu_read_depth: AtomicUsize,
 
@@ -270,6 +272,7 @@ impl ProcessControlBlock {
 
         let basic_info = ProcessBasicInfo::new(ppid, name.clone(), cwd, None);
         let preempt_count = AtomicUsize::new(0);
+        let pagefault_disabled = AtomicUsize::new(0);
         let rcu_read_depth = AtomicUsize::new(0);
         let flags = unsafe { LockFreeFlags::new(ProcessFlags::empty()) };
         let initial_sighand = SigHand::new();
@@ -294,6 +297,7 @@ impl ProcessControlBlock {
                 task_cgroup: RwLock::new(task_cgroup),
                 basic: basic_info,
                 preempt_count,
+                pagefault_disabled,
                 rcu_read_depth,
                 flags,
                 visible_thread_accounted: AtomicBool::new(false),
@@ -515,6 +519,12 @@ impl ProcessControlBlock {
         return self.preempt_count.load(Ordering::SeqCst);
     }
 
+    /// Returns the current task's no-fault user access nesting depth.
+    #[inline(always)]
+    pub fn pagefault_disabled(&self) -> usize {
+        self.pagefault_disabled.load(Ordering::SeqCst)
+    }
+
     #[inline(always)]
     pub fn rcu_read_depth(&self) -> usize {
         self.rcu_read_depth.load(Ordering::SeqCst)
@@ -530,6 +540,16 @@ impl ProcessControlBlock {
     #[inline(always)]
     pub fn preempt_enable(&self) {
         self.preempt_count.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    #[inline(always)]
+    pub fn pagefault_disable(&self) {
+        self.pagefault_disabled.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[inline(always)]
+    pub fn pagefault_enable(&self) {
+        self.pagefault_disabled.fetch_sub(1, Ordering::SeqCst);
     }
 
     #[inline(always)]

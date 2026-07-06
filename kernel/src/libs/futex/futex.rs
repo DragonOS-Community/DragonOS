@@ -3,6 +3,8 @@ use alloc::{
     collections::LinkedList,
     sync::{Arc, Weak},
 };
+#[cfg(target_arch = "x86_64")]
+use core::arch::asm;
 use core::{
     hash::{Hash, Hasher},
     intrinsics::{likely, unlikely},
@@ -16,14 +18,18 @@ use hashbrown::HashMap;
 use system_error::SystemError;
 
 use crate::{
-    arch::{CurrentIrqArch, MMArch},
-    exception::InterruptArch,
+    arch::MMArch,
     libs::{
         mutex::{Mutex, MutexGuard},
         wait_queue::{Waiter, Waker},
     },
-    mm::{ucontext::AddressSpace, MemoryManagementArch, VirtAddr, VirtRegion},
-    process::{ProcessControlBlock, ProcessManager, RawPid},
+    mm::{
+        access_ok,
+        fault::{FaultFlags, PageFaultHandler, PageFaultMessage},
+        ucontext::AddressSpace,
+        MemoryManagementArch, VirtAddr, VirtRegion, VmFaultReason, VmFlags,
+    },
+    process::{preempt::PageFaultDisabledGuard, ProcessControlBlock, ProcessManager, RawPid},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
     time::{
         timer::{next_n_us_timer_jiffies, Timer, TimerFunction},
@@ -253,6 +259,51 @@ impl Futex {
                 data: Mutex::new(HashMap::new()),
             })
         };
+    }
+
+    fn fault_in_user_writeable_u32(uaddr: VirtAddr) -> Result<(), SystemError> {
+        access_ok(uaddr, core::mem::size_of::<u32>()).map_err(|_| SystemError::EFAULT)?;
+
+        let fault_region = VirtRegion::new(
+            VirtAddr::new(uaddr.data() & !MMArch::PAGE_OFFSET_MASK),
+            MMArch::PAGE_SIZE,
+        );
+        let current_address_space = AddressSpace::current()?;
+        let mut flags = FaultFlags::FAULT_FLAG_WRITE;
+
+        loop {
+            let mut space_guard =
+                current_address_space.write_guard_no_reservation_conflict(fault_region);
+            let vma = space_guard
+                .mappings
+                .find_nearest(uaddr)
+                .ok_or(SystemError::EFAULT)?;
+
+            let accessible = vma.is_accessible();
+            let (region, vm_flags) = {
+                let guard = vma.lock();
+                (*guard.region(), *guard.vm_flags())
+            };
+            if !region.contains(uaddr) || !accessible || !vm_flags.contains(VmFlags::VM_WRITE) {
+                return Err(SystemError::EFAULT);
+            }
+
+            let mapper = &mut space_guard.user_mapper.utable;
+            let fault = unsafe {
+                let message =
+                    PageFaultMessage::new(vma, uaddr, flags, mapper, current_address_space.clone());
+                PageFaultHandler::handle_mm_fault(message)
+            };
+
+            if fault.contains(VmFaultReason::VM_FAULT_COMPLETED) {
+                return Ok(());
+            }
+            if fault.contains(VmFaultReason::VM_FAULT_RETRY) {
+                flags |= FaultFlags::FAULT_FLAG_TRIED;
+                continue;
+            }
+            return Err(SystemError::EFAULT);
+        }
     }
 
     /// ### 让当前进程在指定futex上等待直到futex_wake显式唤醒
@@ -511,44 +562,47 @@ impl Futex {
         nr_wake2: i32,
         op: i32,
     ) -> Result<usize, SystemError> {
-        // Linux 语义：对于私有 futex，允许 uaddr1 为 NULL，此时只执行 op，不从 uaddr1 唤醒任何等待者。
-        let key1 = Futex::get_futex_key(
-            uaddr1,
-            flags.contains(FutexFlag::FLAGS_SHARED),
-            FutexAccess::FutexRead,
-        )?;
-        let key2 = Futex::get_futex_key(
-            uaddr2,
-            flags.contains(FutexFlag::FLAGS_SHARED),
-            FutexAccess::FutexWrite,
-        )?;
+        loop {
+            // Linux 语义：对于私有 futex，允许 uaddr1 为 NULL，此时只执行 op，不从 uaddr1 唤醒任何等待者。
+            let key1 = Futex::get_futex_key(
+                uaddr1,
+                flags.contains(FutexFlag::FLAGS_SHARED),
+                FutexAccess::FutexRead,
+            )?;
+            let key2 = Futex::get_futex_key(
+                uaddr2,
+                flags.contains(FutexFlag::FLAGS_SHARED),
+                FutexAccess::FutexWrite,
+            )?;
 
-        let mut futex_data_guard = FutexData::futex_map();
-        let mut wake_count = 0;
+            let mut futex_data_guard = FutexData::futex_map();
+            let op_ret = match Self::futex_atomic_op_inuser(op as u32, uaddr2) {
+                Ok(ret) => ret,
+                Err(SystemError::EFAULT) => {
+                    drop(futex_data_guard);
+                    Self::fault_in_user_writeable_u32(uaddr2)?;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
 
-        // 若 uaddr1 没有关联任何等待者，则按照 Linux 行为返回 0 而不是 EINVAL。
-        if let Some(bucket1) = futex_data_guard.get_mut(&key1) {
-            // 唤醒uaddr1中的进程
-            wake_count += bucket1.wake_up(key1, None, nr_wake as u32)?;
-        }
+            let mut wake_count = 0;
+            // 若 uaddr1 没有关联任何等待者，则按照 Linux 行为返回 0 而不是 EINVAL。
+            if let Some(bucket1) = futex_data_guard.get_mut(&key1) {
+                // 唤醒uaddr1中的进程
+                wake_count += bucket1.wake_up(key1.clone(), None, nr_wake as u32)?;
+            }
 
-        match Self::futex_atomic_op_inuser(op as u32, uaddr2) {
-            Ok(ret) => {
-                // 操作成功则唤醒uaddr2中的进程
-                if ret {
-                    // 若 uaddr2 没有关联任何等待者，则按照 Linux 行为跳过唤醒，而不是返回 EINVAL。
-                    if let Some(bucket2) = futex_data_guard.get_mut(&key2) {
-                        wake_count += bucket2.wake_up(key2, None, nr_wake2 as u32)?;
-                    }
+            // 操作成功则唤醒uaddr2中的进程
+            if op_ret {
+                // 若 uaddr2 没有关联任何等待者，则按照 Linux 行为跳过唤醒，而不是返回 EINVAL。
+                if let Some(bucket2) = futex_data_guard.get_mut(&key2) {
+                    wake_count += bucket2.wake_up(key2, None, nr_wake2 as u32)?;
                 }
             }
-            Err(e) => {
-                // TODO:retry?
-                return Err(e);
-            }
-        }
 
-        Ok(wake_count)
+            return Ok(wake_count);
+        }
     }
 
     pub(super) fn get_futex_key(
@@ -676,45 +730,47 @@ impl Futex {
         let cmp =
             FutexOpCMP::from_bits((encoded_op & 0x0f000000) >> 24).ok_or(SystemError::ENOSYS)?;
 
-        let sign_extend32 = |value: u32, index: i32| {
-            let shift = (31 - index) as u8;
-            return (value << shift) >> shift;
+        let sign_extend32 = |value: u32, index: u32| -> i32 {
+            let shift = 31 - index;
+            return ((value << shift) as i32) >> shift;
         };
 
         let mut oparg = sign_extend32((encoded_op & 0x00fff000) >> 12, 11);
         let cmparg = sign_extend32(encoded_op & 0x00000fff, 11);
 
-        if (encoded_op & (FutexOP::FUTEX_OP_OPARG_SHIFT.bits() << 28) != 0) && oparg > 31 {
-            warn!(
-                "futex_wake_op: pid:{} tries to shift op by {}; fix this program",
-                ProcessManager::current_pcb().raw_pid().data(),
-                oparg
-            );
+        if encoded_op & (FutexOP::FUTEX_OP_OPARG_SHIFT.bits() << 28) != 0 {
+            if !(0..=31).contains(&oparg) {
+                warn!(
+                    "futex_wake_op: pid:{} tries to shift op by {}; fix this program",
+                    ProcessManager::current_pcb().raw_pid().data(),
+                    oparg
+                );
 
-            oparg &= 31;
+                oparg &= 31;
+            }
+            oparg = 1i32 << oparg;
         }
 
-        // TODO: 这个汇编似乎是有问题的，目前不好测试
-        let old_val = Self::arch_futex_atomic_op_inuser(op, oparg, uaddr)?;
+        let old_val = Self::arch_futex_atomic_op_inuser(op, oparg as u32, uaddr)? as i32;
 
         match cmp {
             FutexOpCMP::FUTEX_OP_CMP_EQ => {
-                return Ok(cmparg == old_val);
+                return Ok(old_val == cmparg);
             }
             FutexOpCMP::FUTEX_OP_CMP_NE => {
-                return Ok(cmparg != old_val);
+                return Ok(old_val != cmparg);
             }
             FutexOpCMP::FUTEX_OP_CMP_LT => {
-                return Ok(cmparg < old_val);
+                return Ok(old_val < cmparg);
             }
             FutexOpCMP::FUTEX_OP_CMP_LE => {
-                return Ok(cmparg <= old_val);
+                return Ok(old_val <= cmparg);
             }
             FutexOpCMP::FUTEX_OP_CMP_GE => {
-                return Ok(cmparg >= old_val);
+                return Ok(old_val >= cmparg);
             }
             FutexOpCMP::FUTEX_OP_CMP_GT => {
-                return Ok(cmparg > old_val);
+                return Ok(old_val > cmparg);
             }
             _ => {
                 return Err(SystemError::ENOSYS);
@@ -733,41 +789,218 @@ impl Futex {
         oparg: u32,
         uaddr: VirtAddr,
     ) -> Result<u32, SystemError> {
-        let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        access_ok(uaddr, core::mem::size_of::<u32>()).map_err(|_| SystemError::EFAULT)?;
 
-        let reader =
-            UserBufferReader::new(uaddr.as_ptr::<u32>(), core::mem::size_of::<u32>(), true)?;
+        let _pagefault_guard = PageFaultDisabledGuard::new();
+        unsafe { Self::arch_futex_atomic_op_inuser_nofault(op, oparg, uaddr.as_ptr::<u32>()) }
+    }
 
-        let oldval = reader.read_one_from_user::<u32>(0)?;
-        // 保存旧值的副本，因为后续的修改操作会改变内存中的值
-        let oldval_copy = oldval;
-
-        // 直接获取用户空间地址的原始指针
-        let ptr = uaddr.as_ptr::<u32>();
-
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn arch_futex_atomic_op_inuser_nofault(
+        op: FutexOP,
+        oparg: u32,
+        uaddr: *mut u32,
+    ) -> Result<u32, SystemError> {
         match op {
-            FutexOP::FUTEX_OP_SET => unsafe {
-                *ptr = oparg;
-            },
-            FutexOP::FUTEX_OP_ADD => unsafe {
-                *ptr = (*ptr).wrapping_add(oparg);
-            },
-            FutexOP::FUTEX_OP_OR => unsafe {
-                *ptr |= oparg;
-            },
-            // ANDN 语义：new = old & ~oparg
-            FutexOP::FUTEX_OP_ANDN => unsafe {
-                *ptr &= !oparg;
-            },
-            FutexOP::FUTEX_OP_XOR => unsafe {
-                *ptr ^= oparg;
-            },
-            _ => return Err(SystemError::ENOSYS),
+            FutexOP::FUTEX_OP_SET => Self::futex_atomic_xchg_nofault(uaddr, oparg),
+            FutexOP::FUTEX_OP_ADD => Self::futex_atomic_xadd_nofault(uaddr, oparg),
+            FutexOP::FUTEX_OP_OR => Self::futex_atomic_cmpxchg_or_nofault(uaddr, oparg),
+            FutexOP::FUTEX_OP_ANDN => Self::futex_atomic_cmpxchg_and_nofault(uaddr, !oparg),
+            FutexOP::FUTEX_OP_XOR => Self::futex_atomic_cmpxchg_xor_nofault(uaddr, oparg),
+            _ => Err(SystemError::ENOSYS),
         }
+    }
 
-        drop(guard);
+    #[cfg(not(target_arch = "x86_64"))]
+    unsafe fn arch_futex_atomic_op_inuser_nofault(
+        _op: FutexOP,
+        _oparg: u32,
+        _uaddr: *mut u32,
+    ) -> Result<u32, SystemError> {
+        Err(SystemError::ENOSYS)
+    }
 
-        Ok(oldval_copy)
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn futex_atomic_xchg_nofault(
+        uaddr: *mut u32,
+        mut value: u32,
+    ) -> Result<u32, SystemError> {
+        let mut fault = 0usize;
+        asm!(
+            "2:",
+            "xchg dword ptr [{ptr}], {value:e}",
+            "jmp 3f",
+            "4:",
+            "mov {fault}, 1",
+            "3:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".quad 2b - .",
+            ".quad 4b - . + 8",
+            ".popsection",
+            ptr = in(reg) uaddr,
+            value = inout(reg) value,
+            fault = inout(reg) fault,
+            options(nostack)
+        );
+        if fault == 0 {
+            Ok(value)
+        } else {
+            Err(SystemError::EFAULT)
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn futex_atomic_xadd_nofault(
+        uaddr: *mut u32,
+        mut value: u32,
+    ) -> Result<u32, SystemError> {
+        let mut fault = 0usize;
+        asm!(
+            "2:",
+            "lock xadd dword ptr [{ptr}], {value:e}",
+            "jmp 3f",
+            "4:",
+            "mov {fault}, 1",
+            "3:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".quad 2b - .",
+            ".quad 4b - . + 8",
+            ".popsection",
+            ptr = in(reg) uaddr,
+            value = inout(reg) value,
+            fault = inout(reg) fault,
+            options(nostack)
+        );
+        if fault == 0 {
+            Ok(value)
+        } else {
+            Err(SystemError::EFAULT)
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn futex_atomic_cmpxchg_or_nofault(
+        uaddr: *mut u32,
+        oparg: u32,
+    ) -> Result<u32, SystemError> {
+        let mut oldval: u32;
+        let mut fault = 0usize;
+        asm!(
+            "2:",
+            "mov eax, dword ptr [{ptr}]",
+            "3:",
+            "mov {tmp:e}, eax",
+            "or {tmp:e}, {oparg:e}",
+            "5:",
+            "lock cmpxchg dword ptr [{ptr}], {tmp:e}",
+            "jnz 3b",
+            "jmp 4f",
+            "6:",
+            "mov {fault}, 1",
+            "4:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".quad 2b - .",
+            ".quad 6b - . + 8",
+            ".quad 5b - .",
+            ".quad 6b - . + 8",
+            ".popsection",
+            ptr = in(reg) uaddr,
+            oparg = in(reg) oparg,
+            tmp = out(reg) _,
+            out("eax") oldval,
+            fault = inout(reg) fault,
+            options(nostack)
+        );
+        if fault == 0 {
+            Ok(oldval)
+        } else {
+            Err(SystemError::EFAULT)
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn futex_atomic_cmpxchg_and_nofault(
+        uaddr: *mut u32,
+        oparg: u32,
+    ) -> Result<u32, SystemError> {
+        let mut oldval: u32;
+        let mut fault = 0usize;
+        asm!(
+            "2:",
+            "mov eax, dword ptr [{ptr}]",
+            "3:",
+            "mov {tmp:e}, eax",
+            "and {tmp:e}, {oparg:e}",
+            "5:",
+            "lock cmpxchg dword ptr [{ptr}], {tmp:e}",
+            "jnz 3b",
+            "jmp 4f",
+            "6:",
+            "mov {fault}, 1",
+            "4:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".quad 2b - .",
+            ".quad 6b - . + 8",
+            ".quad 5b - .",
+            ".quad 6b - . + 8",
+            ".popsection",
+            ptr = in(reg) uaddr,
+            oparg = in(reg) oparg,
+            tmp = out(reg) _,
+            out("eax") oldval,
+            fault = inout(reg) fault,
+            options(nostack)
+        );
+        if fault == 0 {
+            Ok(oldval)
+        } else {
+            Err(SystemError::EFAULT)
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn futex_atomic_cmpxchg_xor_nofault(
+        uaddr: *mut u32,
+        oparg: u32,
+    ) -> Result<u32, SystemError> {
+        let mut oldval: u32;
+        let mut fault = 0usize;
+        asm!(
+            "2:",
+            "mov eax, dword ptr [{ptr}]",
+            "3:",
+            "mov {tmp:e}, eax",
+            "xor {tmp:e}, {oparg:e}",
+            "5:",
+            "lock cmpxchg dword ptr [{ptr}], {tmp:e}",
+            "jnz 3b",
+            "jmp 4f",
+            "6:",
+            "mov {fault}, 1",
+            "4:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".quad 2b - .",
+            ".quad 6b - . + 8",
+            ".quad 5b - .",
+            ".quad 6b - . + 8",
+            ".popsection",
+            ptr = in(reg) uaddr,
+            oparg = in(reg) oparg,
+            tmp = out(reg) _,
+            out("eax") oldval,
+            fault = inout(reg) fault,
+            options(nostack)
+        );
+        if fault == 0 {
+            Ok(oldval)
+        } else {
+            Err(SystemError::EFAULT)
+        }
     }
 }
 

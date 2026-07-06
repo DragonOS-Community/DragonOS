@@ -315,6 +315,13 @@ impl X86_64MMArch {
             false // 不是内核访问，继续正常流程
         };
 
+        if !regs.is_from_user()
+            && ProcessManager::current_pcb().pagefault_disabled() > 0
+            && handle_kernel_access_failed(regs)
+        {
+            return;
+        }
+
         let fault_region = VirtRegion::new(
             VirtAddr::new(address.data() & !MMArch::PAGE_OFFSET_MASK),
             MMArch::PAGE_SIZE,

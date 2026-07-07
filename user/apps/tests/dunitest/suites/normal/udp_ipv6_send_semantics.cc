@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -104,6 +105,45 @@ TEST(UdpIpv6SendSemantics, InvalidFdWithLargePayloadReturnsEbadfBeforeCopy) {
     EXPECT_EQ(ret, -1);
     EXPECT_EQ(saved_errno, EBADF) << "unexpected errno: " << ErrnoString(saved_errno);
     EXPECT_EQ(munmap(mapping, kLargeLen), 0) << "munmap failed: " << ErrnoString(errno);
+}
+
+TEST(UdpIpv6SendSemantics, OversizeSendtoPortZeroReturnsEinvalWithoutErrqueue) {
+    FdGuard fd(socket(AF_INET6, SOCK_DGRAM, 0));
+    ASSERT_GE(fd.Get(), 0) << "socket(AF_INET6, SOCK_DGRAM) failed: " << ErrnoString(errno);
+
+    int on = 1;
+    ASSERT_EQ(setsockopt(fd.Get(), IPPROTO_IPV6, IPV6_RECVERR, &on, sizeof(on)), 0)
+        << "setsockopt(IPV6_RECVERR) failed: " << ErrnoString(errno);
+
+    std::vector<char> payload(65536, 'x');
+    sockaddr_in6 dst = MakeIpv6Addr("::1", 0);
+
+    errno = 0;
+    ssize_t ret = sendto(fd.Get(), payload.data(), payload.size(), 0,
+                         reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
+    int saved_errno = errno;
+
+    EXPECT_EQ(ret, -1);
+    EXPECT_EQ(saved_errno, EINVAL) << "unexpected errno: " << ErrnoString(saved_errno);
+
+    char data[8] {};
+    char control[256] {};
+    iovec iov {
+        .iov_base = data,
+        .iov_len = sizeof(data),
+    };
+    msghdr msg {};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
+
+    errno = 0;
+    ssize_t errq_ret = recvmsg(fd.Get(), &msg, MSG_ERRQUEUE);
+    int errq_errno = errno;
+
+    EXPECT_EQ(errq_ret, -1);
+    EXPECT_EQ(errq_errno, EAGAIN) << "unexpected errqueue errno: " << ErrnoString(errq_errno);
 }
 
 TEST(UdpIpv6SendSemantics, InvalidFdSendtoReturnsEbadfBeforeCheckingPayload) {

@@ -1568,6 +1568,12 @@ impl Socket for UdpSocket {
         len: usize,
         address: Option<&Endpoint>,
     ) -> Result<(), SystemError> {
+        if self.ip_version == IpVersion::Ipv6
+            && matches!(address, Some(Endpoint::Ip(dest)) if dest.port == 0)
+        {
+            return Err(SystemError::EINVAL);
+        }
+
         if len > u16::MAX as usize {
             let offender = self.connected_or_explicit_send_dest(address);
             self.enqueue_ipv6_emsgsize_errqueue(len, offender);

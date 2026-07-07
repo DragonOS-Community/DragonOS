@@ -181,6 +181,13 @@ impl PtyByteQueue {
     }
 }
 
+fn wake_pty_packet_readers(tty: &Arc<TtyCore>) -> Result<(), SystemError> {
+    let events = EPollEventType::EPOLLPRI | EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM;
+    tty.core().read_wq().wakeup_any(events.bits() as u64);
+    EventPoll::wakeup_epoll(tty.core().epitems(), events)?;
+    Ok(())
+}
+
 impl crate::driver::tty::tty_driver::TtyCorePrivateField for PtyDevPtsLink {
     fn as_any(&self) -> &dyn core::any::Any {
         self
@@ -242,6 +249,12 @@ impl PtyDevPtsLink {
         }
     }
 
+    fn wake_source_writer(to: &Arc<TtyCore>) {
+        if let Some(source) = to.core().link() {
+            source.tty_wakeup();
+        }
+    }
+
     fn pending_write_room(&self, subtype: TtyDriverSubType) -> usize {
         self.queue_for_source(subtype)
             .map(|queue| queue.lock_irqsave().room())
@@ -280,14 +293,7 @@ impl PtyDevPtsLink {
         Ok(())
     }
 
-    fn discard_requested_prefix(&self, queue: &SpinLock<PtyByteQueue>) -> usize {
-        queue.lock_irqsave().discard_requested_prefix()
-    }
-
-    fn request_discard_pending_from(
-        &self,
-        subtype: TtyDriverSubType,
-    ) -> Result<usize, SystemError> {
+    fn begin_flush_from(&self, subtype: TtyDriverSubType) -> Result<(), SystemError> {
         let Some(queue) = self.queue_for_source(subtype) else {
             return Err(SystemError::ENODEV);
         };
@@ -297,33 +303,71 @@ impl PtyDevPtsLink {
             return Err(SystemError::ENODEV);
         };
 
-        if flushing.load(Ordering::Acquire) {
-            return Ok(0);
-        }
-
-        if discarding
+        while flushing
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            return Ok(0);
+            spin_loop();
         }
 
-        queue.lock_irqsave().request_discard_prefix();
+        while draining
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            spin_loop();
+        }
+
+        drain_requested.store(false, Ordering::Release);
+        discarding.store(false, Ordering::Release);
+        queue.lock_irqsave().clear();
+        draining.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    fn finish_flush_from(&self, subtype: TtyDriverSubType) -> Result<(), SystemError> {
+        let Some((_, drain_requested, discarding, flushing)) = self.state_flags_for_source(subtype)
+        else {
+            return Err(SystemError::ENODEV);
+        };
+
+        drain_requested.store(false, Ordering::Release);
+        discarding.store(false, Ordering::Release);
+        flushing.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    fn request_receive_flush_from(&self, subtype: TtyDriverSubType) -> Result<(), SystemError> {
+        let Some(queue) = self.queue_for_source(subtype) else {
+            return Err(SystemError::ENODEV);
+        };
+        let Some((draining, drain_requested, discarding, flushing)) =
+            self.state_flags_for_source(subtype)
+        else {
+            return Err(SystemError::ENODEV);
+        };
+
+        while flushing.load(Ordering::Acquire) {
+            spin_loop();
+        }
 
         if draining
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
+            .is_ok()
         {
+            drain_requested.store(false, Ordering::Release);
             discarding.store(false, Ordering::Release);
-            return Ok(0);
+            queue.lock_irqsave().clear();
+            draining.store(false, Ordering::Release);
+        } else {
+            queue.lock_irqsave().request_discard_prefix();
+            drain_requested.store(true, Ordering::Release);
         }
 
-        let discarded = self.discard_requested_prefix(queue);
-        drain_requested.store(false, Ordering::Release);
-        draining.store(false, Ordering::Release);
-        discarding.store(false, Ordering::Release);
+        Ok(())
+    }
 
-        Ok(discarded)
+    fn discard_requested_prefix(&self, queue: &SpinLock<PtyByteQueue>) -> usize {
+        queue.lock_irqsave().discard_requested_prefix()
     }
 
     fn write_to_peer(
@@ -345,36 +389,42 @@ impl PtyDevPtsLink {
                 spin_loop();
             }
 
-            let mut queue = queue.lock_irqsave();
+            let mut queue_guard = queue.lock_irqsave();
             if flushing.load(Ordering::Acquire) || discarding.load(Ordering::Acquire) {
-                drop(queue);
+                drop(queue_guard);
                 spin_loop();
                 continue;
             }
-            break queue.push_slice(&buf[..nr]);
+            break queue_guard.push_slice(&buf[..nr]);
         };
 
         if accepted == 0 {
-            self.drain_to_peer(subtype, to.clone())?;
+            let result = self.drain_to_peer(subtype, to.clone())?;
+            if result.freed_backlog != 0 {
+                // Space became available in this PTY direction.
+                Self::wake_source_writer(&to);
+            }
             accepted = loop {
                 while flushing.load(Ordering::Acquire) || discarding.load(Ordering::Acquire) {
                     spin_loop();
                 }
 
-                let mut queue = queue.lock_irqsave();
+                let mut queue_guard = queue.lock_irqsave();
                 if flushing.load(Ordering::Acquire) || discarding.load(Ordering::Acquire) {
-                    drop(queue);
+                    drop(queue_guard);
                     spin_loop();
                     continue;
                 }
-                break queue.push_slice(&buf[..nr]);
+                break queue_guard.push_slice(&buf[..nr]);
             };
         }
 
         if accepted != 0 {
-            self.drain_to_peer(subtype, to)?;
+            let result = self.drain_to_peer(subtype, to.clone())?;
+            if result.freed_backlog != 0 {
+                Self::wake_source_writer(&to);
+            }
         }
-
         Ok(accepted)
     }
 
@@ -408,6 +458,7 @@ impl PtyDevPtsLink {
 
         loop {
             if flushing.load(Ordering::Acquire) {
+                let _ = self.discard_requested_prefix(queue);
                 result.still_pending = !queue.lock_irqsave().is_empty();
                 draining.store(false, Ordering::Release);
                 break;
@@ -448,6 +499,17 @@ impl PtyDevPtsLink {
                     continue;
                 }
                 break;
+            }
+
+            if flushing.load(Ordering::Acquire) {
+                queue.lock_irqsave().advance_front(chunk_len);
+                result.freed_backlog += chunk_len;
+                draining.store(false, Ordering::Release);
+                break;
+            }
+            if discarding.load(Ordering::Acquire) {
+                queue.lock_irqsave().request_discard_prefix();
+                continue;
             }
 
             let delivered =
@@ -710,6 +772,7 @@ impl TtyOperation for Unix98PtyDriverInner {
             tty.contorl_info_irqsave()
                 .pktstatus
                 .insert(TtyPacketStatus::TIOCPKT_FLUSHWRITE);
+            let _ = wake_pty_packet_readers(&to);
         }
 
         to.core().read_wq().wakeup_all();
@@ -791,7 +854,11 @@ impl TtyOperation for Unix98PtyDriverInner {
                         ctrl.pktstatus.insert(TtyPacketStatus::TIOCPKT_IOCTL);
                     }
 
+                    let events = EPollEventType::EPOLLPRI
+                        | EPollEventType::EPOLLIN
+                        | EPollEventType::EPOLLRDNORM;
                     link.read_wq().wakeup_all();
+                    let _ = EventPoll::wakeup_epoll(link.epitems(), events);
                 }
             }
         }
@@ -816,9 +883,10 @@ impl TtyOperation for Unix98PtyDriverInner {
         ctrl.pktstatus.remove(TtyPacketStatus::TIOCPKT_STOP);
         ctrl.pktstatus.insert(TtyPacketStatus::TIOCPKT_START);
 
-        link.core()
-            .read_wq()
-            .wakeup_any(EPollEventType::EPOLLIN.bits() as u64);
+        let events =
+            EPollEventType::EPOLLPRI | EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM;
+        link.core().read_wq().wakeup_any(events.bits() as u64);
+        let _ = EventPoll::wakeup_epoll(link.core().epitems(), events);
 
         Ok(())
     }
@@ -834,15 +902,17 @@ impl TtyOperation for Unix98PtyDriverInner {
         ctrl.pktstatus.remove(TtyPacketStatus::TIOCPKT_START);
         ctrl.pktstatus.insert(TtyPacketStatus::TIOCPKT_STOP);
 
-        link.core()
-            .read_wq()
-            .wakeup_any(EPollEventType::EPOLLIN.bits() as u64);
+        let events =
+            EPollEventType::EPOLLPRI | EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM;
+        link.core().read_wq().wakeup_any(events.bits() as u64);
+        let _ = EventPoll::wakeup_epoll(link.core().epitems(), events);
 
         Ok(())
     }
 
     fn flush_chars(&self, _tty: &TtyCoreData) {
-        // 不做处理
+        // Linux pty does not implement flush_chars; writes are pushed by the
+        // pty write path itself rather than by recursively draining here.
     }
 
     fn lookup(
@@ -899,6 +969,7 @@ impl TtyOperation for Unix98PtyDriverInner {
                 link_core.write_wq().wakeup_all();
                 let epitems = link_core.epitems();
                 let _ = EventPoll::wakeup_epoll(epitems, EPollEventType::EPOLLHUP);
+                TtyCore::tty_vhangup(link.clone());
                 if link_core.flags().contains(TtyFlag::IO_ERROR) {
                     link_core.driver().ttys().remove(&link_core.index());
                 }
@@ -1059,37 +1130,54 @@ pub fn pty_drain_pending_to(tty: Arc<TtyCore>) -> Result<(), SystemError> {
     Ok(())
 }
 
-pub fn pty_discard_pending_to(tty: Arc<TtyCore>) -> Result<(), SystemError> {
+pub fn pty_flush_input_buffer<F>(tty: Arc<TtyCore>, clear_input: F) -> Result<(), SystemError>
+where
+    F: FnOnce(),
+{
     let Some(peer) = tty.core().link() else {
+        clear_input();
         return Ok(());
     };
     let Some(hook_arc) = tty.private_fields() else {
+        clear_input();
         return Ok(());
     };
     let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() else {
+        clear_input();
         return Ok(());
     };
 
-    hook.clear_pending_from(peer.core().driver().tty_driver_sub_type())?;
+    let subtype = peer.core().driver().tty_driver_sub_type();
+    hook.begin_flush_from(subtype)?;
+    clear_input();
+    hook.finish_flush_from(subtype)?;
     peer.tty_wakeup();
     Ok(())
 }
 
-pub fn pty_request_discard_pending_to(tty: Arc<TtyCore>) -> Result<(), SystemError> {
+pub fn pty_receive_flush_input_buffer<F>(
+    tty: Arc<TtyCore>,
+    clear_input: F,
+) -> Result<(), SystemError>
+where
+    F: FnOnce(),
+{
     let Some(peer) = tty.core().link() else {
+        clear_input();
         return Ok(());
     };
     let Some(hook_arc) = tty.private_fields() else {
+        clear_input();
         return Ok(());
     };
     let Some(hook) = hook_arc.as_any().downcast_ref::<PtyDevPtsLink>() else {
+        clear_input();
         return Ok(());
     };
 
-    let discarded =
-        hook.request_discard_pending_from(peer.core().driver().tty_driver_sub_type())?;
-    if discarded != 0 {
-        peer.tty_wakeup();
-    }
+    let subtype = peer.core().driver().tty_driver_sub_type();
+    hook.request_receive_flush_from(subtype)?;
+    clear_input();
+    peer.tty_wakeup();
     Ok(())
 }

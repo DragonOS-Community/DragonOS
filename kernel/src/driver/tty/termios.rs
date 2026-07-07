@@ -38,6 +38,7 @@ pub struct Termios {
     pub output_speed: u32,
 }
 
+#[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct PosixTermios {
     pub c_iflag: u32,

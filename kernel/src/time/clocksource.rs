@@ -1,6 +1,6 @@
 use core::{
     fmt::Debug,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use alloc::{
@@ -11,7 +11,7 @@ use alloc::{
     vec::Vec,
 };
 use lazy_static::__Deref;
-use log::{debug, info};
+use log::{debug, info, warn};
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -73,6 +73,7 @@ static mut WATCHDOG_KTHREAD: Option<Arc<ProcessControlBlock>> = None;
 pub static CUR_CLOCKSOURCE: SpinLock<Option<Arc<dyn Clocksource>>> = SpinLock::new(None);
 /// 是否完成加载
 pub static FINISHED_BOOTING: AtomicBool = AtomicBool::new(false);
+static WATCHDOG_MAX_INTERVAL_NS_SEEN: AtomicU64 = AtomicU64::new(WATCHDOG_INTERVAL_MAX_NS);
 
 /// Interval: 0.5sec Threshold: 0.0625s
 /// 系统节拍率
@@ -80,12 +81,29 @@ pub const HZ: u64 = 250;
 // 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/time/clocksource.c#101
 /// watchdog检查间隔
 pub const WATCHDOG_INTERVAL: u64 = HZ >> 1;
+pub const WATCHDOG_INTERVAL_MAX_NS: u64 = (2 * WATCHDOG_INTERVAL) * (NSEC_PER_SEC as u64 / HZ);
 // 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/time/clocksource.c#108
 /// 最大能接受的误差大小
 pub const WATCHDOG_THRESHOLD: u32 = NSEC_PER_SEC >> 4;
 
 pub const MAX_SKEW_USEC: u64 = 125 * WATCHDOG_INTERVAL / HZ;
 pub const WATCHDOG_MAX_SKEW: u32 = MAX_SKEW_USEC as u32 * NSEC_PER_USEC;
+
+fn should_report_long_watchdog_interval(interval: u64) -> bool {
+    loop {
+        let max_interval = WATCHDOG_MAX_INTERVAL_NS_SEEN.load(Ordering::Relaxed);
+        if interval <= max_interval.saturating_mul(2) {
+            return false;
+        }
+
+        if WATCHDOG_MAX_INTERVAL_NS_SEEN
+            .compare_exchange(max_interval, interval, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return true;
+        }
+    }
+}
 
 // 时钟周期数
 #[derive(Debug, Clone, Copy)]
@@ -890,7 +908,20 @@ pub fn clocksource_watchdog() -> Result<(), SystemError> {
         cs_data.cs_last = cs_now_clock;
         cs.update_clocksource_data(cs_data.clone())?;
 
-        // 判断是否有误差
+        // 判断是否有误差。长间隔判断只能基于可信 watchdog 的读数；
+        // 被监视 clocksource 单侧跳变必须继续进入 skew 检测。
+        if wd_dev_nsec > WATCHDOG_INTERVAL_MAX_NS {
+            if FINISHED_BOOTING.load(Ordering::Relaxed)
+                && should_report_long_watchdog_interval(wd_dev_nsec)
+            {
+                warn!(
+                    "clocksource watchdog: long readout interval, skip check: cs_nsec={} wd_nsec={}",
+                    cs_dev_nsec, wd_dev_nsec
+                );
+            }
+            continue;
+        }
+
         if cs_dev_nsec.abs_diff(wd_dev_nsec) > WATCHDOG_THRESHOLD.into() {
             // debug!("set_unstable");
             // 误差过大，标记为unstable

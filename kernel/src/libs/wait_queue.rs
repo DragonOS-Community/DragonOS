@@ -1011,6 +1011,92 @@ impl EventWaitQueue {
         }
     }
 
+    pub fn wait_event_interruptible_timeout<F>(
+        &self,
+        events: u64,
+        mut cond: F,
+        timeout: Duration,
+    ) -> Result<(), SystemError>
+    where
+        F: FnMut() -> bool,
+    {
+        before_sleep_check(0);
+        if cond() {
+            return Ok(());
+        }
+
+        let deadline = Instant::now() + timeout;
+        let (waiter, waker) = Waiter::new_pair();
+        loop {
+            if Instant::now() >= deadline {
+                self.remove_waker(&waker);
+                waker.close();
+                if cond() {
+                    return Ok(());
+                }
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+
+            self.register_waker(events, waker.clone());
+
+            if cond() {
+                self.remove_waker(&waker);
+                return Ok(());
+            }
+
+            if Signal::signal_pending_state(true, false, &ProcessManager::current_pcb()) {
+                self.remove_waker(&waker);
+                waker.close();
+                if cond() {
+                    return Ok(());
+                }
+                return Err(SystemError::ERESTARTSYS);
+            }
+
+            let remain = deadline
+                .duration_since(Instant::now())
+                .unwrap_or(Duration::ZERO);
+            if remain == Duration::ZERO {
+                self.remove_waker(&waker);
+                waker.close();
+                if cond() {
+                    return Ok(());
+                }
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+
+            let timer: Arc<Timer> = Timer::new(
+                TimeoutWaker::new(waker.clone()),
+                next_n_us_timer_jiffies(remain.total_micros()),
+            );
+            timer.activate();
+
+            let wait_result = waiter.wait(true);
+            let was_timeout = timer.timeout();
+            if !was_timeout {
+                timer.cancel();
+            }
+
+            if was_timeout {
+                self.remove_waker(&waker);
+                waker.close();
+                if cond() {
+                    return Ok(());
+                }
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+
+            if let Err(err) = wait_result {
+                self.remove_waker(&waker);
+                waker.close();
+                if cond() {
+                    return Ok(());
+                }
+                return Err(err);
+            }
+        }
+    }
+
     pub fn sleep(&self, events: u64) {
         before_sleep_check(0);
         let (waiter, waker) = Waiter::new_pair();

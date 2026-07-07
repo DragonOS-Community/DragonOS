@@ -53,6 +53,18 @@ unsafe fn maybe_uninit_as_bytes_mut<T>(value: &mut MaybeUninit<T>) -> &mut [u8] 
     core::slice::from_raw_parts_mut(value.as_mut_ptr().cast::<u8>(), core::mem::size_of::<T>())
 }
 
+fn check_user_access_range(addr: VirtAddr, len: usize, write: bool) -> Result<(), SystemError> {
+    if MMArch::PAGE_FAULT_ENABLED {
+        return access_ok(addr, len).map_err(|_| SystemError::EFAULT);
+    }
+
+    if user_accessible_len(addr, len, write) < len {
+        return Err(SystemError::EFAULT);
+    }
+
+    Ok(())
+}
+
 fn prefault_user_range(addr: VirtAddr, len: usize, write: bool) -> Result<(), SystemError> {
     if MMArch::PAGE_FAULT_ENABLED || len == 0 {
         return Ok(());
@@ -1029,7 +1041,7 @@ pub unsafe fn copy_from_user_protected(
     let dst_ptr = dst.as_mut_ptr();
     let src_ptr = src.data() as *const u8;
 
-    access_ok(src, len).map_err(|_| SystemError::EFAULT)?;
+    check_user_access_range(src, len, false)?;
     prefault_user_range(src, len, false)?;
 
     // 执行实际拷贝,使用异常表保护
@@ -1064,7 +1076,7 @@ pub unsafe fn copy_to_user_protected(dest: VirtAddr, src: &[u8]) -> Result<usize
     let dst_ptr = dest.data() as *mut u8;
     let src_ptr = src.as_ptr();
 
-    access_ok(dest, len).map_err(|_| SystemError::EFAULT)?;
+    check_user_access_range(dest, len, true)?;
     prefault_user_range(dest, len, true)?;
 
     let result = MMArch::copy_with_exception_table(dst_ptr, src_ptr, len);

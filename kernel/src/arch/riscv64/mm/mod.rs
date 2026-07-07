@@ -185,6 +185,7 @@ impl MemoryManagementArch for RiscV64MMArch {
     }
 
     unsafe fn copy_with_exception_table(dst: *mut u8, src: *const u8, len: usize) -> usize {
+        let _pagefault_guard = crate::process::preempt::PageFaultDisabledGuard::new();
         let mut dst = dst;
         let mut src = src;
         let mut remaining = len;
@@ -227,6 +228,7 @@ impl MemoryManagementArch for RiscV64MMArch {
     }
 
     unsafe fn memset_with_exception_table(dst: *mut u8, value: u8, len: usize) -> usize {
+        let _pagefault_guard = crate::process::preempt::PageFaultDisabledGuard::new();
         let mut dst = dst;
         let mut remaining = len;
         let value = value as usize;

@@ -335,7 +335,12 @@ let
 
       cleanup() {
         sudo rm -f /dev/shm/${baseConfig.shmId}
-        ${if hasVmstateDir then ''rm -f "$VMSTATE_DIR/pid" "$VMSTATE_DIR/vsock_cid" "$VMSTATE_DIR/port" "$VMSTATE_DIR/gdb"'' else ""}
+        ${
+          if hasVmstateDir then
+            ''rm -f "$VMSTATE_DIR/pid" "$VMSTATE_DIR/vsock_cid" "$VMSTATE_DIR/port" "$VMSTATE_DIR/gdb"''
+          else
+            ""
+        }
       }
       trap cleanup EXIT
       # FIXED: 既然用了 sudo 运行 qemu，这里创建 shm 也需要权限，
@@ -378,10 +383,10 @@ let
         if hasVmstateDir then
           ''
             ${lib.optionalString debug ''
-            GDB_ARGS=( "-gdb" "tcp::$GDB_PORT" )
-            if [ "''${QEMU_GDB_WAIT:-0}" = "1" ]; then
-              GDB_ARGS+=( "-S" )
-            fi
+              GDB_ARGS=( "-gdb" "tcp::$GDB_PORT" )
+              if [ "''${QEMU_GDB_WAIT:-0}" = "1" ]; then
+                GDB_ARGS+=( "-S" )
+              fi
             ''}
             sudo bash -c 'pidfile="$1"; shift; echo $$ > "$pidfile"; exec "$@"' bash "$VMSTATE_DIR/pid" ${qemuBin} ${qemuFlagsStr} "''${NET_ARGS[@]}" ${
               if qemuFirmware != null then "-L ${qemuFirmware}" else ""
@@ -390,10 +395,10 @@ let
         else
           ''
             ${lib.optionalString debug ''
-            GDB_ARGS=( "-gdb" "tcp::$GDB_PORT" )
-            if [ "''${QEMU_GDB_WAIT:-0}" = "1" ]; then
-              GDB_ARGS+=( "-S" )
-            fi
+              GDB_ARGS=( "-gdb" "tcp::$GDB_PORT" )
+              if [ "''${QEMU_GDB_WAIT:-0}" = "1" ]; then
+                GDB_ARGS+=( "-S" )
+              fi
             ''}
             sudo ${qemuBin} ${qemuFlagsStr} "''${NET_ARGS[@]}" ${
               if qemuFirmware != null then "-L ${qemuFirmware}" else ""

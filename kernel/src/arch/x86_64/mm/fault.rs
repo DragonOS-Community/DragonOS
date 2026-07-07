@@ -525,7 +525,9 @@ impl X86_64MMArch {
                     // Skip direct reclaim for fault-injection OOM: the injection
                     // consumes a fail count on the first fault, so reclaiming
                     // then retrying would bypass the killer entirely.
-                    if !tried_direct_reclaim && !crate::mm::oom::is_fault_inject_target() {
+                    if !tried_direct_reclaim
+                        && !fault.contains(VmFaultReason::VM_FAULT_OOM_INJECTED)
+                    {
                         tried_direct_reclaim = true;
                         drop(space_guard);
                         crate::mm::page::PageReclaimer::shrink_list(

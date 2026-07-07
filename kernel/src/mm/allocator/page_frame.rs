@@ -347,26 +347,28 @@ impl<T: FrameAllocator> FrameAllocator for &mut T {
 ///
 /// @param count 请求分配的页帧数量
 pub unsafe fn allocate_page_frames(count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
-    let frame = unsafe { LockedFrameAllocator.allocate(count) };
-    if frame.is_some() {
-        return frame;
+    unsafe { LockedFrameAllocator.allocate(count) }
+}
+
+pub fn retry_oom_victim_page_frame_alloc<F>(
+    mut try_allocate: F,
+) -> Option<(PhysAddr, PageFrameCount)>
+where
+    F: FnMut() -> Option<(PhysAddr, PageFrameCount)>,
+{
+    if !crate::mm::oom::current_is_oom_victim() {
+        return None;
     }
 
-    // OOM victims get a retry loop: they are already destined to die and need
-    // to allocate memory (page tables, kernel objects) to complete exit and
-    // release their memory. Without this, a victim stuck in an uninterruptible
-    // allocation would never exit, causing an OOM livelock.
-    // Equivalent to Linux's TIF_MEMDIE reserve access in __alloc_pages.
-    if crate::mm::oom::current_is_oom_victim() {
-        // Try to wake the page reclaim thread so subsequent retries have a
-        // chance of succeeding once the victim's own pages start being freed.
-        crate::mm::page::PageReclaimer::wakeup_claim_thread();
-        for _ in 0..1000 {
-            if let Some(f) = unsafe { LockedFrameAllocator.allocate(count) } {
-                return Some(f);
-            }
-            core::hint::spin_loop();
+    // OOM victims are already destined to die and need a chance to allocate
+    // page tables or kernel objects while exiting and freeing their mm.
+    // This mirrors Linux's TIF_MEMDIE reserve access at the page allocator.
+    crate::mm::page::PageReclaimer::wakeup_claim_thread();
+    for _ in 0..1000 {
+        if let Some(frame) = try_allocate() {
+            return Some(frame);
         }
+        core::hint::spin_loop();
     }
 
     None

@@ -31,14 +31,16 @@ impl Syscall for SysSendmmsgHandle {
         let vlen = args[2];
         let flags = args[3] as u32;
 
-        if msgvec.is_null() {
-            return Err(SystemError::EFAULT);
-        }
+        let (socket_inode, base_pmsg) = super::sys_sendto::prepare_send_socket(fd, flags)?;
 
         // Linux truncates vlen to UIO_MAXIOV rather than returning an error.
         let vlen = vlen.min(UIO_MAXIOV);
         if vlen == 0 {
             return Ok(0);
+        }
+
+        if msgvec.is_null() {
+            return Err(SystemError::EFAULT);
         }
 
         let total_len = vlen
@@ -65,13 +67,12 @@ impl Syscall for SysSendmmsgHandle {
 
             // Apply MSG_BATCH to all messages except the last one, hinting the
             // protocol stack that more data follows and it may defer transmission.
-            let this_flags = if i < vlen - 1 {
-                flags | socket::PMSG::BATCH.bits()
-            } else {
-                flags
-            };
+            let mut pmsg = base_pmsg;
+            if i < vlen - 1 {
+                pmsg.insert(socket::PMSG::BATCH);
+            }
 
-            match super::sys_sendmsg::do_sendmsg(fd, &msg_hdr, this_flags) {
+            match super::sys_sendmsg::do_sendmsg_prepared(&socket_inode, pmsg, &msg_hdr) {
                 Ok(n) => {
                     // Write the number of bytes sent into msgvec[i].msg_len.
                     let msg_len_off = core::mem::offset_of!(MMsgHdr, msg_len);

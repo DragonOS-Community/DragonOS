@@ -32,7 +32,7 @@ impl Syscall for SysEpollPwaitHandle {
         }
         let sigmask_reader =
             UserBufferReader::new(sigmask_addr, core::mem::size_of::<SigSet>(), true)?;
-        let mut sigmask = *sigmask_reader.read_one_from_user::<SigSet>(0)?;
+        let mut sigmask = sigmask_reader.read_one_from_user::<SigSet>(0)?;
 
         set_user_sigmask(&mut sigmask);
 

@@ -7,11 +7,12 @@ use log::{error, trace};
 use system_error::SystemError;
 
 use super::TrapFrame;
-use crate::exception::ebreak::EBreak;
+use crate::exception::{ebreak::EBreak, extable::ExceptionTableManager};
 use crate::{
     arch::syscall::syscall_handler,
     driver::{clocksource::timer_riscv::RiscVSbiTimer, irqchip::riscv_intc::riscv_intc_irq},
     exception::softirq::do_softirq,
+    mm::VirtAddr,
     process::{utils::current_pcb_flags, ProcessFlags, ProcessManager},
     sched::{SchedMode, SchedPolicy, __schedule},
 };
@@ -36,6 +37,22 @@ static EXCEPTION_HANDLERS: [ExceptionHandler; 16] = [
     default_handler,            // 14
     do_trap_store_page_fault,   // 15
 ];
+
+fn try_fixup_kernel_user_access(trap_frame: &mut TrapFrame) -> bool {
+    if trap_frame.is_from_user() || ProcessManager::current_pcb().pagefault_disabled() == 0 {
+        return false;
+    }
+    if !VirtAddr::new(trap_frame.badaddr).check_user() {
+        return false;
+    }
+
+    if let Some(fixup_addr) = ExceptionTableManager::search_exception_table(trap_frame.epc) {
+        trap_frame.epc = fixup_addr;
+        return true;
+    }
+
+    false
+}
 
 #[no_mangle]
 unsafe extern "C" fn riscv64_do_irq(trap_frame: &mut TrapFrame) {
@@ -129,7 +146,11 @@ fn do_trap_load_misaligned(_trap_frame: &mut TrapFrame) -> Result<(), SystemErro
 }
 
 /// 处理加载访问异常 #5
-fn do_trap_load_access_fault(_trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+fn do_trap_load_access_fault(trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+    if try_fixup_kernel_user_access(trap_frame) {
+        return Ok(());
+    }
+
     error!("riscv64_do_irq: do_trap_load_access_fault");
     loop {
         spin_loop();
@@ -145,7 +166,11 @@ fn do_trap_store_misaligned(_trap_frame: &mut TrapFrame) -> Result<(), SystemErr
 }
 
 /// 处理存储访问异常 #7
-fn do_trap_store_access_fault(_trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+fn do_trap_store_access_fault(trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+    if try_fixup_kernel_user_access(trap_frame) {
+        return Ok(());
+    }
+
     error!("riscv64_do_irq: do_trap_store_access_fault");
     loop {
         spin_loop();
@@ -199,6 +224,8 @@ fn do_trap_load_page_fault(trap_frame: &mut TrapFrame) -> Result<(), SystemError
             "riscv64_do_irq: do_trap_load_page_fault(user mode): epc: {epc:#x}, vaddr={:#x}, cause={:?}",
             vaddr, cause
         );
+    } else if try_fixup_kernel_user_access(trap_frame) {
+        return Ok(());
     } else {
         panic!(
             "riscv64_do_irq: do_trap_load_page_fault(kernel mode): epc: {epc:#x}, vaddr={:#x}, cause={:?}",
@@ -215,6 +242,10 @@ fn do_trap_load_page_fault(trap_frame: &mut TrapFrame) -> Result<(), SystemError
 
 /// 处理页存储错误异常 #15
 fn do_trap_store_page_fault(trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+    if try_fixup_kernel_user_access(trap_frame) {
+        return Ok(());
+    }
+
     error!(
         "riscv64_do_irq: do_trap_store_page_fault: epc: {:#x}, vaddr={:#x}, cause={:?}",
         trap_frame.epc, trap_frame.badaddr, trap_frame.cause

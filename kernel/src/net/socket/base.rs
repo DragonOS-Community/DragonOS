@@ -10,9 +10,11 @@ use crate::{
     },
 };
 // use crate::filesystem::epoll::event_poll::EventPoll;
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::AtomicUsize;
 use system_error::SystemError;
+
+use crate::syscall::user_access::UserBufferReader;
 
 use super::{
     endpoint::Endpoint,
@@ -161,6 +163,41 @@ pub trait Socket: PollableInode + IndexNode {
     /// # `send_to`
     fn send_to(&self, buffer: &[u8], flags: PMSG, address: Endpoint) -> Result<usize, SystemError>;
 
+    /// Validate a send buffer length before copying the user payload.
+    ///
+    /// Message-oriented sockets should reject impossible message sizes here so
+    /// syscall code does not allocate a kernel buffer that the socket will later
+    /// reject as `EMSGSIZE`.
+    fn validate_send_buffer_len(
+        &self,
+        _len: usize,
+        _address: Option<&Endpoint>,
+    ) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    /// Send directly from a validated user buffer.
+    ///
+    /// The default keeps message-oriented socket semantics by materializing the
+    /// whole message after socket-specific length validation. Stream sockets can
+    /// override this to copy and send bounded chunks.
+    fn send_user_buffer(
+        &self,
+        reader: &UserBufferReader<'_>,
+        len: usize,
+        flags: PMSG,
+        address: Option<Endpoint>,
+    ) -> Result<usize, SystemError> {
+        self.validate_send_buffer_len(len, address.as_ref())?;
+
+        let data = copy_user_buffer_to_vec(reader, len)?;
+        if let Some(endpoint) = address {
+            self.send_to(&data, flags, endpoint)
+        } else {
+            self.send(&data, flags)
+        }
+    }
+
     /// # `set_option`
     /// Posix `setsockopt` ，设置socket选项
     /// ## Parameters
@@ -240,4 +277,75 @@ pub(crate) fn read_to_user_buffer_via_kernel_buf<S: Socket + ?Sized>(
     let n = socket.read(&mut kbuf)?;
     user_buffer.write_to_user(0, &kbuf[..n])?;
     Ok(n)
+}
+
+pub(crate) fn copy_user_buffer_to_vec(
+    reader: &UserBufferReader<'_>,
+    len: usize,
+) -> Result<Vec<u8>, SystemError> {
+    let mut data = Vec::new();
+    data.try_reserve(len).map_err(|_| SystemError::ENOMEM)?;
+    data.resize(len, 0);
+    reader.copy_from_user(&mut data, 0)?;
+    Ok(data)
+}
+
+pub(crate) fn send_user_buffer_via_kernel_buf<S: Socket + ?Sized>(
+    socket: &S,
+    reader: &UserBufferReader<'_>,
+    len: usize,
+    flags: PMSG,
+    address: Option<Endpoint>,
+    kernel_buf_len: usize,
+) -> Result<usize, SystemError> {
+    if len == 0 {
+        return if let Some(endpoint) = address {
+            socket.send_to(&[], flags, endpoint)
+        } else {
+            socket.send(&[], flags)
+        };
+    }
+
+    let scratch_len = core::cmp::min(kernel_buf_len.max(1), len);
+    let mut kbuf = Vec::new();
+    kbuf.try_reserve(scratch_len)
+        .map_err(|_| SystemError::ENOMEM)?;
+    kbuf.resize(scratch_len, 0);
+    let mut total_sent = 0usize;
+
+    while total_sent < len {
+        let want = core::cmp::min(kbuf.len(), len - total_sent);
+        if let Err(e) = reader.copy_from_user(&mut kbuf[..want], total_sent) {
+            return if total_sent == 0 {
+                Err(e)
+            } else {
+                Ok(total_sent)
+            };
+        }
+
+        let result = if let Some(endpoint) = address.as_ref() {
+            socket.send_to(&kbuf[..want], flags, endpoint.clone())
+        } else {
+            socket.send(&kbuf[..want], flags)
+        };
+
+        match result {
+            Ok(0) => return Ok(total_sent),
+            Ok(n) => {
+                total_sent = total_sent.saturating_add(n);
+                if n < want {
+                    return Ok(total_sent);
+                }
+            }
+            Err(e) => {
+                return if total_sent == 0 {
+                    Err(e)
+                } else {
+                    Ok(total_sent)
+                }
+            }
+        }
+    }
+
+    Ok(total_sent)
 }

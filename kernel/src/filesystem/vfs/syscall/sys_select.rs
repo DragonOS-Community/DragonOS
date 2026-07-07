@@ -62,7 +62,7 @@ pub fn common_sys_select(
             size_of::<PosixTimeval>(),
             true,
         )?;
-        let ts = *tsreader.read_one_from_user::<PosixTimeval>(0)?;
+        let ts = tsreader.read_one_from_user::<PosixTimeval>(0)?;
         // 检查是否为负值
         if ts.tv_sec < 0 || ts.tv_usec < 0 {
             return Err(SystemError::EINVAL);
@@ -98,7 +98,7 @@ pub(super) fn do_sys_select(
             None
         } else {
             let fdset_buf = UserBufferReader::new(fdset_addr, size_of::<FdSet>(), true)?;
-            let fdset = *fdset_buf.read_one_from_user::<FdSet>(0)?;
+            let fdset = fdset_buf.read_one_from_user::<FdSet>(0)?;
             Some(fdset)
         };
         Ok(fdset)

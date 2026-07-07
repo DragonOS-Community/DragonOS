@@ -26,7 +26,7 @@ impl Syscall for SysSendfileHandle {
         let offset = if offset_ptr.is_null() {
             None
         } else {
-            let offset = *UserBufferReader::new(offset_ptr, size_of::<isize>(), true)?
+            let offset = UserBufferReader::new(offset_ptr, size_of::<isize>(), true)?
                 .read_one_from_user::<isize>(0)?;
             if offset < 0 {
                 return Err(SystemError::EINVAL);

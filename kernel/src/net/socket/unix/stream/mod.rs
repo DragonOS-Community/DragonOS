@@ -7,6 +7,7 @@ use crate::{
     },
     libs::mutex::Mutex,
     libs::rwsem::RwSem,
+    mm::MemoryManagementArch,
     net::socket::{self, *},
 };
 use crate::{
@@ -932,7 +933,7 @@ impl Socket for UnixStreamSocket {
 
         // Scatter destination is described by msg_iov/msg_iovlen in user memory.
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
-        let mut buf = iovs.new_buf(true);
+        let mut buf = iovs.new_buf(true)?;
 
         // Read payload first.
         let nonblock = self.is_nonblocking() || _flags.contains(socket::PMSG::DONTWAIT);
@@ -1203,7 +1204,7 @@ impl Socket for UnixStreamSocket {
                 UserBufferReader::new(msg.msg_control as *const u8, msg.msg_controllen, true)?;
             let mut off = 0usize;
             while off + core::mem::size_of::<Cmsghdr>() <= msg.msg_controllen {
-                let hdr = *reader.read_one_from_user::<Cmsghdr>(off)?;
+                let hdr = reader.read_one_from_user::<Cmsghdr>(off)?;
                 if hdr.cmsg_len < core::mem::size_of::<Cmsghdr>() {
                     return Err(SystemError::EINVAL);
                 }
@@ -1322,6 +1323,48 @@ impl Socket for UnixStreamSocket {
         // Connected stream socket with a destination address.
         let _ = _address;
         Err(SystemError::EISCONN)
+    }
+
+    fn validate_send_buffer_len(
+        &self,
+        len: usize,
+        _address: Option<&Endpoint>,
+    ) -> Result<(), SystemError> {
+        if self.is_seqpacket
+            && len.saturating_add(core::mem::size_of::<u32>()) > self.sndbuf.load(Ordering::Relaxed)
+        {
+            return Err(SystemError::EMSGSIZE);
+        }
+        Ok(())
+    }
+
+    fn send_user_buffer(
+        &self,
+        reader: &crate::syscall::user_access::UserBufferReader<'_>,
+        len: usize,
+        flags: socket::PMSG,
+        address: Option<Endpoint>,
+    ) -> Result<usize, SystemError> {
+        self.validate_send_buffer_len(len, address.as_ref())?;
+
+        if self.is_seqpacket {
+            let data = crate::net::socket::base::copy_user_buffer_to_vec(reader, len)?;
+            return if let Some(endpoint) = address {
+                self.send_to(&data, flags, endpoint)
+            } else {
+                self.send(&data, flags)
+            };
+        }
+
+        const STREAM_SEND_CHUNK: usize = crate::arch::MMArch::PAGE_SIZE;
+        crate::net::socket::base::send_user_buffer_via_kernel_buf(
+            self,
+            reader,
+            len,
+            flags,
+            address,
+            STREAM_SEND_CHUNK,
+        )
     }
 
     fn send_buffer_size(&self) -> usize {

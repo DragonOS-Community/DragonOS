@@ -11,7 +11,33 @@ use crate::{
         PMSG,
     },
 };
+use alloc::vec::Vec;
 use system_error::SystemError;
+
+fn send_kobject_message(
+    message: KobjectUeventMessage,
+    sent_len: usize,
+    to: &NetlinkSocketAddr,
+    netns: alloc::sync::Arc<crate::process::namespace::net_namespace::NetNamespace>,
+) -> Result<usize, SystemError> {
+    if to.port() != 0 {
+        <NetlinkKobjectUeventProtocol as SupportedNetlinkProtocol>::unicast(
+            to.port(),
+            message.clone(),
+            netns.clone(),
+        )?;
+    }
+
+    if !to.groups().is_empty() {
+        <NetlinkKobjectUeventProtocol as SupportedNetlinkProtocol>::multicast(
+            to.groups(),
+            message,
+            netns,
+        )?;
+    }
+
+    Ok(sent_len)
+}
 
 impl datagram_common::Bound for BoundNetlink<KobjectUeventMessage> {
     type Endpoint = NetlinkSocketAddr;
@@ -39,25 +65,19 @@ impl datagram_common::Bound for BoundNetlink<KobjectUeventMessage> {
         _flags: PMSG,
     ) -> Result<usize, SystemError> {
         let sent_len = buf.len();
-        let message = KobjectUeventMessage::new(buf);
+        let message = KobjectUeventMessage::try_new(buf)?;
+        send_kobject_message(message, sent_len, to, self.netns())
+    }
 
-        if to.port() != 0 {
-            <NetlinkKobjectUeventProtocol as SupportedNetlinkProtocol>::unicast(
-                to.port(),
-                message.clone(),
-                self.netns(),
-            )?;
-        }
-
-        if !to.groups().is_empty() {
-            <NetlinkKobjectUeventProtocol as SupportedNetlinkProtocol>::multicast(
-                to.groups(),
-                message,
-                self.netns(),
-            )?;
-        }
-
-        Ok(sent_len)
+    fn try_send_vec(
+        &self,
+        buf: Vec<u8>,
+        to: &Self::Endpoint,
+        _flags: PMSG,
+    ) -> Result<usize, SystemError> {
+        let sent_len = buf.len();
+        let message = KobjectUeventMessage::from_vec(buf);
+        send_kobject_message(message, sent_len, to, self.netns())
     }
 
     fn try_recv(

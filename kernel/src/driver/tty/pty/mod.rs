@@ -118,7 +118,7 @@ impl PtyCommon {
         let user_reader =
             UserBufferReader::new(arg.as_ptr::<i32>(), core::mem::size_of::<i32>(), true)?;
 
-        if *user_reader.read_one_from_user::<i32>(0)? != 0 {
+        if user_reader.read_one_from_user::<i32>(0)? != 0 {
             tty.flags_write().insert(TtyFlag::PTY_LOCK);
         } else {
             tty.flags_write().remove(TtyFlag::PTY_LOCK);
@@ -128,18 +128,20 @@ impl PtyCommon {
     }
 
     pub fn pty_get_lock(tty: &TtyCoreData, arg: VirtAddr) -> Result<(), SystemError> {
+        let locked = tty.flags().contains(TtyFlag::PTY_LOCK) as i32;
         let mut user_writer =
             UserBufferWriter::new(arg.as_ptr::<i32>(), core::mem::size_of::<i32>(), true)?;
-        user_writer.copy_one_to_user(&tty.flags().contains(TtyFlag::PTY_LOCK), 0)?;
+        user_writer.copy_one_to_user(&locked, 0)?;
         Ok(())
     }
 
     pub fn pty_set_packet_mode(tty: &TtyCoreData, arg: VirtAddr) -> Result<(), SystemError> {
         let user_reader =
             UserBufferReader::new(arg.as_ptr::<i32>(), core::mem::size_of::<i32>(), true)?;
+        let packet_enabled = user_reader.read_one_from_user::<i32>(0)? != 0;
 
         let mut ctrl = tty.contorl_info_irqsave();
-        if *user_reader.read_one_from_user::<i32>(0)? != 0 {
+        if packet_enabled {
             if !ctrl.packet {
                 tty.link().unwrap().core().contorl_info_irqsave().pktstatus =
                     TtyPacketStatus::empty();
@@ -152,9 +154,10 @@ impl PtyCommon {
     }
 
     pub fn pty_get_packet_mode(tty: &TtyCoreData, arg: VirtAddr) -> Result<(), SystemError> {
+        let packet = tty.contorl_info_irqsave().packet as i32;
         let mut user_writer =
             UserBufferWriter::new(arg.as_ptr::<i32>(), core::mem::size_of::<i32>(), true)?;
-        user_writer.copy_one_to_user(&tty.contorl_info_irqsave().packet, 0)?;
+        user_writer.copy_one_to_user(&packet, 0)?;
         Ok(())
     }
 

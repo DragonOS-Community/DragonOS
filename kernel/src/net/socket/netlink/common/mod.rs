@@ -3,6 +3,7 @@ use crate::{
         epoll::EPollEventType,
         vfs::{fasync::FAsyncItems, iov::IoVecs, vcore::generate_inode_id, InodeId},
     },
+    libs::align::align_up,
     libs::{rwsem::RwSem, wait_queue::WaitQueue},
     net::{
         posix::SockAddr,
@@ -13,16 +14,21 @@ use crate::{
             netlink::{
                 addr::{multicast::GroupIdSet, NetlinkSocketAddr},
                 common::{bound::BoundNetlink, unbound::UnboundNetlink},
-                table::SupportedNetlinkProtocol,
+                message::{segment::header::CMsgSegHdr, NLMSG_ALIGN},
+                table::{StandardNetlinkProtocol, SupportedNetlinkProtocol},
             },
             utils::datagram_common::{select_remote_and_bind, Bound, Inner},
             AddressFamily, Socket, PMSG, PSO, PSOCK, PSOL,
         },
     },
     process::{namespace::net_namespace::NetNamespace, ProcessManager},
+    syscall::user_access::UserBufferReader,
 };
-use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use alloc::{sync::Arc, vec::Vec};
+use core::{
+    mem::size_of,
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+};
 use system_error::SystemError;
 
 pub(super) mod bound;
@@ -116,6 +122,28 @@ where
         Ok(send_bytes)
     }
 
+    fn try_send_vec(
+        &self,
+        buf: Vec<u8>,
+        to: Option<NetlinkSocketAddr>,
+        flags: crate::net::socket::PMSG,
+    ) -> Result<usize, SystemError> {
+        let send_bytes = select_remote_and_bind(
+            &self.inner,
+            to,
+            || {
+                self.inner.write().bind_ephemeral(
+                    &NetlinkSocketAddr::new_unspecified(),
+                    self.wait_queue.clone(),
+                    self.netns(),
+                )
+            },
+            |bound, remote| bound.try_send_vec(buf, &remote, flags),
+        )?;
+
+        Ok(send_bytes)
+    }
+
     fn try_recv(
         &self,
         buf: &mut [u8],
@@ -138,6 +166,140 @@ where
         } else {
             copy_len
         }
+    }
+
+    fn route_effective_send_len(
+        reader: &UserBufferReader<'_>,
+        len: usize,
+    ) -> Result<usize, SystemError> {
+        let header_len = size_of::<CMsgSegHdr>();
+        let mut offset = 0usize;
+        let mut copy_len = 0usize;
+
+        while offset < len {
+            let remaining = len - offset;
+            if remaining < header_len {
+                return if offset == 0 {
+                    Err(SystemError::EINVAL)
+                } else {
+                    Self::probe_user_tail(reader, offset, remaining)?;
+                    Ok(copy_len)
+                };
+            }
+
+            let header = reader.read_one_from_user::<CMsgSegHdr>(offset)?;
+            let msg_len = header.len as usize;
+
+            if msg_len == 0 && offset != 0 {
+                Self::probe_user_tail(reader, offset, len - offset)?;
+                return Ok(copy_len);
+            }
+
+            if msg_len < header_len
+                || offset
+                    .checked_add(msg_len)
+                    .filter(|end| *end <= len)
+                    .is_none()
+            {
+                return Err(SystemError::EINVAL);
+            }
+
+            copy_len = offset + msg_len;
+            let next_offset = offset
+                .checked_add(align_up(msg_len, NLMSG_ALIGN))
+                .ok_or(SystemError::EINVAL)?;
+            let probe_end = core::cmp::min(next_offset, len);
+            if probe_end > copy_len {
+                Self::probe_user_tail(reader, copy_len, probe_end - copy_len)?;
+            }
+            offset = next_offset;
+        }
+
+        Ok(copy_len)
+    }
+
+    fn route_effective_send_len_bytes(buf: &[u8]) -> Result<usize, SystemError> {
+        let header_len = size_of::<CMsgSegHdr>();
+        let mut offset = 0usize;
+        let mut copy_len = 0usize;
+
+        while offset < buf.len() {
+            let remaining = buf.len() - offset;
+            if remaining < header_len {
+                return if offset == 0 {
+                    Err(SystemError::EINVAL)
+                } else {
+                    Ok(copy_len)
+                };
+            }
+
+            // SAFETY: `remaining >= header_len`, and netlink headers may be
+            // unaligned in a byte buffer.
+            let header =
+                unsafe { core::ptr::read_unaligned(buf[offset..].as_ptr() as *const CMsgSegHdr) };
+            let msg_len = header.len as usize;
+
+            if msg_len == 0 && offset != 0 {
+                return Ok(copy_len);
+            }
+
+            if msg_len < header_len
+                || offset
+                    .checked_add(msg_len)
+                    .filter(|end| *end <= buf.len())
+                    .is_none()
+            {
+                return Err(SystemError::EINVAL);
+            }
+
+            copy_len = offset + msg_len;
+            offset = offset
+                .checked_add(align_up(msg_len, NLMSG_ALIGN))
+                .ok_or(SystemError::EINVAL)?;
+        }
+
+        Ok(copy_len)
+    }
+
+    fn probe_user_tail(
+        reader: &UserBufferReader<'_>,
+        offset: usize,
+        len: usize,
+    ) -> Result<(), SystemError> {
+        if len == 0 {
+            return Ok(());
+        }
+
+        const NETLINK_TAIL_PROBE: usize = 4096;
+        let scratch_len = core::cmp::min(NETLINK_TAIL_PROBE, len);
+        let mut scratch = Vec::new();
+        scratch
+            .try_reserve(scratch_len)
+            .map_err(|_| SystemError::ENOMEM)?;
+        scratch.resize(scratch_len, 0);
+
+        let mut checked = 0usize;
+        while checked < len {
+            let want = core::cmp::min(scratch.len(), len - checked);
+            reader.copy_from_user(&mut scratch[..want], offset + checked)?;
+            checked += want;
+        }
+
+        Ok(())
+    }
+
+    fn copy_netlink_user_buffer(
+        &self,
+        reader: &UserBufferReader<'_>,
+        len: usize,
+    ) -> Result<alloc::vec::Vec<u8>, SystemError> {
+        let effective_len = if self.protocol == u32::from(StandardNetlinkProtocol::ROUTE) {
+            Self::route_effective_send_len(reader, len)?
+        } else {
+            len
+        };
+
+        crate::net::socket::base::copy_user_buffer_to_vec(reader, effective_len)
     }
 
     fn recv_from_inner(
@@ -308,7 +470,7 @@ where
         flags: PMSG,
     ) -> Result<usize, SystemError> {
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
-        let mut buf = iovs.new_buf(true);
+        let mut buf = iovs.new_buf(true)?;
 
         let (copy_len, orig_len, endpoint) = self.recv_from_inner(&mut buf, flags, None)?;
         iovs.scatter(&buf[..copy_len])?;
@@ -330,6 +492,30 @@ where
 
     fn send(&self, buffer: &[u8], flags: PMSG) -> Result<usize, SystemError> {
         self.try_send(buffer, None, flags)
+    }
+
+    fn send_user_buffer(
+        &self,
+        reader: &UserBufferReader<'_>,
+        len: usize,
+        flags: PMSG,
+        address: Option<Endpoint>,
+    ) -> Result<usize, SystemError> {
+        let data = self.copy_netlink_user_buffer(reader, len)?;
+        let copied_len = data.len();
+
+        let sent = if let Some(endpoint) = address {
+            let endpoint = endpoint.try_into()?;
+            self.try_send_vec(data, Some(endpoint), flags)?
+        } else {
+            self.try_send_vec(data, None, flags)?
+        };
+
+        if self.protocol == u32::from(StandardNetlinkProtocol::ROUTE) && sent == copied_len {
+            Ok(len)
+        } else {
+            Ok(sent)
+        }
     }
 
     fn option(&self, level: PSOL, name: usize, value: &mut [u8]) -> Result<usize, SystemError> {
@@ -390,13 +576,27 @@ where
 
     fn send_msg(&self, msg: &crate::net::posix::MsgHdr, flags: PMSG) -> Result<usize, SystemError> {
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, false)? };
-        let data = iovs.gather()?;
+        let mut data = iovs.gather()?;
+        let original_len = data.len();
+        let effective_len = if self.protocol == u32::from(StandardNetlinkProtocol::ROUTE) {
+            Self::route_effective_send_len_bytes(&data)?
+        } else {
+            original_len
+        };
+        data.truncate(effective_len);
 
-        if msg.msg_name.is_null() || msg.msg_namelen == 0 {
-            self.send(&data, flags)
+        let sent = if msg.msg_name.is_null() || msg.msg_namelen == 0 {
+            self.try_send_vec(data, None, flags)?
         } else {
             let endpoint = SockAddr::to_endpoint(msg.msg_name as *const SockAddr, msg.msg_namelen)?;
-            self.send_to(&data, flags, endpoint)
+            let endpoint = endpoint.try_into()?;
+            self.try_send_vec(data, Some(endpoint), flags)?
+        };
+
+        if self.protocol == u32::from(StandardNetlinkProtocol::ROUTE) && sent == effective_len {
+            Ok(original_len)
+        } else {
+            Ok(sent)
         }
     }
 

@@ -115,7 +115,7 @@ pub fn do_prlimit64(
     if !new_limit.is_null() {
         // 从用户拷贝新值
         let reader = UserBufferReader::new(new_limit, core::mem::size_of::<RLimit64>(), true)?;
-        let newval = *reader.read_one_from_user::<RLimit64>(0)?;
+        let newval = reader.read_one_from_user::<RLimit64>(0)?;
         // 应用到目标进程
         target.set_rlimit(resource, newval)?;
     }

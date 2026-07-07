@@ -2,7 +2,7 @@
 
 use core::{
     cmp::min,
-    mem::size_of,
+    mem::{size_of, MaybeUninit},
     num::NonZero,
     slice::{from_raw_parts, from_raw_parts_mut},
     sync::atomic::{compiler_fence, Ordering},
@@ -11,6 +11,12 @@ use core::{
 use alloc::{ffi::CString, vec::Vec};
 use defer::defer;
 
+#[cfg(target_arch = "riscv64")]
+use crate::mm::{
+    fault::{FaultFlags, PageFaultHandler, PageFaultMessage},
+    ucontext::AddressSpace,
+    VmFaultReason,
+};
 use crate::{
     arch::MMArch,
     mm::{access_ok, MemoryManagementArch, VirtAddr, VirtRegion, VmFlags},
@@ -18,6 +24,131 @@ use crate::{
 };
 
 use super::{user_buffer::UserBuffer, SystemError};
+
+#[inline(always)]
+fn checked_user_range(buffer_len: usize, offset: usize, len: usize) -> Result<(), SystemError> {
+    if offset
+        .checked_add(len)
+        .filter(|end| *end <= buffer_len)
+        .is_none()
+    {
+        return Err(SystemError::EINVAL);
+    }
+
+    Ok(())
+}
+
+#[inline(always)]
+unsafe fn value_as_bytes<T>(value: &T) -> &[u8] {
+    core::slice::from_raw_parts((value as *const T).cast::<u8>(), core::mem::size_of::<T>())
+}
+
+#[inline(always)]
+unsafe fn value_as_bytes_mut<T>(value: &mut T) -> &mut [u8] {
+    core::slice::from_raw_parts_mut((value as *mut T).cast::<u8>(), core::mem::size_of::<T>())
+}
+
+#[inline(always)]
+unsafe fn maybe_uninit_as_bytes_mut<T>(value: &mut MaybeUninit<T>) -> &mut [u8] {
+    core::slice::from_raw_parts_mut(value.as_mut_ptr().cast::<u8>(), core::mem::size_of::<T>())
+}
+
+fn check_user_access_range(addr: VirtAddr, len: usize, write: bool) -> Result<(), SystemError> {
+    if MMArch::PAGE_FAULT_ENABLED {
+        return access_ok(addr, len).map_err(|_| SystemError::EFAULT);
+    }
+
+    if user_accessible_len(addr, len, write) < len {
+        return Err(SystemError::EFAULT);
+    }
+
+    Ok(())
+}
+
+fn prefault_user_range(addr: VirtAddr, len: usize, write: bool) -> Result<(), SystemError> {
+    if MMArch::PAGE_FAULT_ENABLED || len == 0 {
+        return Ok(());
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    {
+        let _ = (addr, write);
+        return Ok(());
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        let end = addr.data().checked_add(len).ok_or(SystemError::EFAULT)?;
+        let start_page = VirtAddr::new(addr.data() & !MMArch::PAGE_OFFSET_MASK);
+        let end_page = VirtAddr::new((end - 1) & !MMArch::PAGE_OFFSET_MASK);
+        let region_len = end_page
+            .data()
+            .checked_sub(start_page.data())
+            .and_then(|len| len.checked_add(MMArch::PAGE_SIZE))
+            .ok_or(SystemError::EFAULT)?;
+        let region = VirtRegion::new(start_page, region_len);
+
+        let mm = AddressSpace::current()?;
+        let mut space_guard = mm.write_guard_no_reservation_conflict(region);
+        let mut current = start_page;
+        loop {
+            let vma = space_guard
+                .mappings
+                .contains(current)
+                .ok_or(SystemError::EFAULT)?;
+            let vm_flags = *vma.lock().vm_flags();
+            let permitted = if write {
+                vm_flags.contains(VmFlags::VM_WRITE)
+            } else {
+                vm_flags.contains(VmFlags::VM_READ)
+            };
+            if !permitted {
+                return Err(SystemError::EFAULT);
+            }
+
+            let fault_flags = if write {
+                FaultFlags::FAULT_FLAG_WRITE
+            } else {
+                FaultFlags::empty()
+            };
+            let fault = unsafe {
+                let message = PageFaultMessage::new(
+                    vma,
+                    current,
+                    fault_flags,
+                    &mut space_guard.user_mapper.utable,
+                    mm.clone(),
+                );
+                PageFaultHandler::handle_mm_fault(message)
+            };
+            if fault.contains(VmFaultReason::VM_FAULT_OOM) {
+                return Err(SystemError::ENOMEM);
+            }
+            if fault.intersects(
+                VmFaultReason::VM_FAULT_SIGBUS
+                    | VmFaultReason::VM_FAULT_SIGSEGV
+                    | VmFaultReason::VM_FAULT_HWPOISON
+                    | VmFaultReason::VM_FAULT_HWPOISON_LARGE
+                    | VmFaultReason::VM_FAULT_FALLBACK
+                    | VmFaultReason::VM_FAULT_RETRY,
+            ) {
+                return Err(SystemError::EFAULT);
+            }
+
+            if current == end_page {
+                break;
+            }
+            current = VirtAddr::new(
+                current
+                    .data()
+                    .checked_add(MMArch::PAGE_SIZE)
+                    .ok_or(SystemError::EFAULT)?,
+            );
+        }
+
+        Ok(())
+    }
+}
 
 /// Clear data in the specified range of user space
 ///
@@ -72,6 +203,7 @@ pub unsafe fn clear_user_cow_protected(dest: VirtAddr, len: usize) -> Result<usi
     if user_accessible_len(dest, len, true) < len {
         return Err(SystemError::EFAULT);
     }
+    prefault_user_range(dest, len, true)?;
 
     let result = MMArch::memset_with_exception_table(dest.data() as *mut u8, 0, len);
     if result == 0 {
@@ -298,10 +430,12 @@ impl UserBufferReader<'_> {
     /// * `offset` - Byte offset
     ///
     /// # Returns
-    /// * Returns a reference to the user space data
+    /// * Returns a copy of the user space data
     ///
-    pub fn read_one_from_user<T>(&self, offset: usize) -> Result<&T, SystemError> {
-        return self.convert_one_with_offset(self.buffer, offset);
+    pub fn read_one_from_user<T>(&self, offset: usize) -> Result<T, SystemError> {
+        let mut data = MaybeUninit::<T>::uninit();
+        self.copy_one_from_user_bytes(unsafe { maybe_uninit_as_bytes_mut(&mut data) }, offset)?;
+        return Ok(unsafe { data.assume_init() });
     }
 
     /// Read one data item from user space with page mapping and permission verification
@@ -313,12 +447,17 @@ impl UserBufferReader<'_> {
     /// * `offset` - Byte offset
     ///
     /// # Returns
-    /// * Returns a reference to the user space data
+    /// * Returns a copy of the user space data
     ///
     /// # Errors
     /// * `EFAULT` - Pages are not mapped or lack required permissions
-    pub fn read_one_from_user_checked<T>(&self, offset: usize) -> Result<&T, SystemError> {
-        return self.convert_one_with_offset_checked(self.buffer, offset);
+    pub fn read_one_from_user_checked<T>(&self, offset: usize) -> Result<T, SystemError> {
+        let mut data = MaybeUninit::<T>::uninit();
+        self.copy_one_from_user_bytes_checked(
+            unsafe { maybe_uninit_as_bytes_mut(&mut data) },
+            offset,
+        )?;
+        return Ok(unsafe { data.assume_init() });
     }
 
     /// Copy data from user space (to specified address)
@@ -343,19 +482,11 @@ impl UserBufferReader<'_> {
             .checked_mul(core::mem::size_of::<T>())
             .ok_or(SystemError::EINVAL)?;
 
-        if offset
-            .checked_add(bytes_needed)
-            .filter(|end| *end <= self.buffer.len())
-            .is_none()
-        {
-            return Err(SystemError::EINVAL);
-        }
+        checked_user_range(self.buffer.len(), offset, bytes_needed)?;
 
-        // Copy exact bytes into dst without relying on a typed view of the entire remaining buffer.
-        let src_bytes = &self.buffer[offset..offset + bytes_needed];
         let dst_bytes =
             unsafe { core::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u8, bytes_needed) };
-        dst_bytes.copy_from_slice(src_bytes);
+        self.copy_from_user_protected(dst_bytes, offset)?;
         Ok(dst.len())
     }
 
@@ -387,13 +518,7 @@ impl UserBufferReader<'_> {
             .checked_mul(core::mem::size_of::<T>())
             .ok_or(SystemError::EINVAL)?;
 
-        if offset
-            .checked_add(bytes_needed)
-            .filter(|end| *end <= self.buffer.len())
-            .is_none()
-        {
-            return Err(SystemError::EINVAL);
-        }
+        checked_user_range(self.buffer.len(), offset, bytes_needed)?;
 
         let accessible_len = user_accessible_len(
             VirtAddr::new(self.buffer.as_ptr() as usize + offset),
@@ -404,10 +529,9 @@ impl UserBufferReader<'_> {
             return Err(SystemError::EFAULT);
         }
 
-        let src_bytes = &self.buffer[offset..offset + bytes_needed];
         let dst_bytes =
             unsafe { core::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u8, bytes_needed) };
-        dst_bytes.copy_from_slice(src_bytes);
+        self.copy_from_user_protected(dst_bytes, offset)?;
         Ok(dst.len())
     }
 
@@ -424,8 +548,7 @@ impl UserBufferReader<'_> {
         dst: &mut T,
         offset: usize,
     ) -> Result<(), SystemError> {
-        let data = self.convert_one_with_offset::<T>(self.buffer, offset)?;
-        dst.clone_from(data);
+        self.copy_one_from_user_bytes(unsafe { value_as_bytes_mut(dst) }, offset)?;
         return Ok(());
     }
 
@@ -448,8 +571,7 @@ impl UserBufferReader<'_> {
         dst: &mut T,
         offset: usize,
     ) -> Result<(), SystemError> {
-        let data = self.convert_one_with_offset_checked::<T>(self.buffer, offset)?;
-        dst.clone_from(data);
+        self.copy_one_from_user_bytes_checked(unsafe { value_as_bytes_mut(dst) }, offset)?;
         return Ok(());
     }
 
@@ -544,34 +666,37 @@ impl UserBufferReader<'_> {
         self.convert_with_offset(src, offset)
     }
 
-    fn convert_one_with_offset<T>(&self, src: &[u8], offset: usize) -> Result<&T, SystemError> {
-        if offset + core::mem::size_of::<T>() > src.len() {
-            return Err(SystemError::EINVAL);
+    #[inline(always)]
+    fn copy_one_from_user_bytes(&self, dst: &mut [u8], offset: usize) -> Result<(), SystemError> {
+        checked_user_range(self.buffer.len(), offset, dst.len())?;
+        if dst.is_empty() {
+            return Ok(());
         }
-        let byte_buffer: &[u8] = &src[offset..offset + core::mem::size_of::<T>()];
 
-        let chunks = unsafe { from_raw_parts(byte_buffer.as_ptr() as *const T, 1) };
-        let data = &chunks[0];
-        return Ok(data);
+        self.copy_from_user_protected(dst, offset).map(|_| ())
     }
 
-    fn convert_one_with_offset_checked<T>(
+    #[inline(always)]
+    fn copy_one_from_user_bytes_checked(
         &self,
-        src: &[u8],
+        dst: &mut [u8],
         offset: usize,
-    ) -> Result<&T, SystemError> {
-        let size = core::mem::size_of::<T>();
-        if offset + size > src.len() {
-            return Err(SystemError::EINVAL);
+    ) -> Result<(), SystemError> {
+        checked_user_range(self.buffer.len(), offset, dst.len())?;
+        if dst.is_empty() {
+            return Ok(());
         }
-        if !check_user_access_by_page_table(
-            VirtAddr::new(src.as_ptr() as usize + offset),
-            size,
+
+        let accessible_len = user_accessible_len(
+            VirtAddr::new(self.buffer.as_ptr() as usize + offset),
+            dst.len(),
             false,
-        ) {
+        );
+        if accessible_len < dst.len() {
             return Err(SystemError::EFAULT);
         }
-        self.convert_one_with_offset(src, offset)
+
+        self.copy_from_user_protected(dst, offset).map(|_| ())
     }
 }
 
@@ -706,13 +831,8 @@ impl<'a> UserBufferWriter<'a> {
     /// # Returns
     /// * Ok(()) on success
     ///
-    pub fn copy_one_to_user<T: Clone>(
-        &'a mut self,
-        src: &T,
-        offset: usize,
-    ) -> Result<(), SystemError> {
-        let dst = Self::convert_one_with_offset::<T>(self.buffer, offset)?;
-        dst.clone_from(src);
+    pub fn copy_one_to_user<T>(&mut self, src: &T, offset: usize) -> Result<(), SystemError> {
+        self.copy_one_to_user_bytes(unsafe { value_as_bytes(src) }, offset)?;
         return Ok(());
     }
 
@@ -730,13 +850,12 @@ impl<'a> UserBufferWriter<'a> {
     ///
     /// # Errors
     /// * `EFAULT` - Pages are not mapped or lack required permissions
-    pub fn copy_one_to_user_checked<T: Clone>(
-        &'a mut self,
+    pub fn copy_one_to_user_checked<T>(
+        &mut self,
         src: &T,
         offset: usize,
     ) -> Result<(), SystemError> {
-        let dst = Self::convert_one_with_offset_checked::<T>(self.buffer, offset)?;
-        dst.clone_from(src);
+        self.copy_one_to_user_bytes_checked(unsafe { value_as_bytes(src) }, offset)?;
         return Ok(());
     }
 
@@ -827,33 +946,37 @@ impl<'a> UserBufferWriter<'a> {
         Self::convert_with_offset(src, offset)
     }
 
-    fn convert_one_with_offset<T>(src: &mut [u8], offset: usize) -> Result<&mut T, SystemError> {
-        if offset + core::mem::size_of::<T>() > src.len() {
-            return Err(SystemError::EINVAL);
+    #[inline(always)]
+    fn copy_one_to_user_bytes(&mut self, src: &[u8], offset: usize) -> Result<(), SystemError> {
+        checked_user_range(self.buffer.len(), offset, src.len())?;
+        if src.is_empty() {
+            return Ok(());
         }
-        let byte_buffer: &mut [u8] = &mut src[offset..offset + core::mem::size_of::<T>()];
 
-        let chunks = unsafe { from_raw_parts_mut(byte_buffer.as_mut_ptr() as *mut T, 1) };
-        let data = &mut chunks[0];
-        return Ok(data);
+        self.copy_to_user_protected(src, offset).map(|_| ())
     }
 
-    fn convert_one_with_offset_checked<T>(
-        src: &mut [u8],
+    #[inline(always)]
+    fn copy_one_to_user_bytes_checked(
+        &mut self,
+        src: &[u8],
         offset: usize,
-    ) -> Result<&mut T, SystemError> {
-        let size = core::mem::size_of::<T>();
-        if offset + size > src.len() {
-            return Err(SystemError::EINVAL);
+    ) -> Result<(), SystemError> {
+        checked_user_range(self.buffer.len(), offset, src.len())?;
+        if src.is_empty() {
+            return Ok(());
         }
-        if !check_user_access_by_page_table(
-            VirtAddr::new(src.as_ptr() as usize + offset),
-            size,
+
+        let accessible_len = user_accessible_len(
+            VirtAddr::new(self.buffer.as_ptr() as usize + offset),
+            src.len(),
             true,
-        ) {
+        );
+        if accessible_len < src.len() {
             return Err(SystemError::EFAULT);
         }
-        Self::convert_one_with_offset(src, offset)
+
+        self.copy_to_user_protected(src, offset).map(|_| ())
     }
 }
 
@@ -872,7 +995,7 @@ impl<'a> UserBufferWriter<'a> {
     /// * `Err(SystemError::EFAULT)` - access failed
     #[allow(dead_code)]
     pub fn copy_to_user_protected(
-        &'a mut self,
+        &mut self,
         src: &[u8],
         offset: usize,
     ) -> Result<usize, SystemError> {
@@ -892,66 +1015,6 @@ impl<'a> UserBufferWriter<'a> {
             )
         }
     }
-}
-
-/// Check user access by page table - verifies both page mapping AND permissions
-///
-/// This function checks if pages are mapped in the page table AND verifies
-/// the required permissions (user access, and write access if requested).
-/// It returns false if pages are not mapped or lack required permissions.
-///
-/// # Arguments
-/// * `addr` - Virtual address to check
-/// * `size` - Size of the memory region to check
-/// * `check_write` - Whether to check for write permission
-///
-/// # Returns
-/// * `true` if all pages are mapped and have required permissions
-/// * `false` if any page is not mapped or lacks required permissions
-fn check_user_access_by_page_table(addr: VirtAddr, size: usize, check_write: bool) -> bool {
-    // Check if address is valid
-    if addr.is_null() {
-        return false;
-    }
-    // Get address space and check mapping
-    let vm = match ProcessManager::current_pcb().basic().user_vm() {
-        Some(vm) => vm,
-        None => return false,
-    };
-
-    // Calculate page-aligned address and size
-    let page_mask = MMArch::PAGE_SIZE - 1;
-    let aligned_addr = addr.data() & (!page_mask); // Align down to page boundary
-    let offset = (addr - aligned_addr).data();
-    let aligned_size = (offset + size).next_multiple_of(MMArch::PAGE_SIZE);
-
-    // Calculate number of pages to check (rounded up)
-    let pages = aligned_size / MMArch::PAGE_SIZE;
-
-    let guard = vm.read_guard_no_reservation_conflict(VirtRegion::new(
-        VirtAddr::new(aligned_addr),
-        aligned_size,
-    ));
-    for i in 0..pages {
-        let page_addr = aligned_addr + i * MMArch::PAGE_SIZE;
-        let flags = match guard.user_mapper.utable.translate(VirtAddr::new(page_addr)) {
-            Some((_, flags)) => flags,
-            None => return false,
-        };
-
-        if !flags.has_user() {
-            // If no user access permission, return false
-            return false;
-        }
-
-        if check_write && !flags.has_write() {
-            // If write permission check is required but no write permission, return false
-            return false;
-        }
-    }
-    drop(guard);
-
-    return true;
 }
 
 /// 带异常保护的用户空间数据拷贝
@@ -978,12 +1041,8 @@ pub unsafe fn copy_from_user_protected(
     let dst_ptr = dst.as_mut_ptr();
     let src_ptr = src.data() as *const u8;
 
-    // 预检查：只基于 VMA 做权限/范围检查（不要求 PTE 已经存在）。
-    // Linux 语义：对懒分配/按需调页的用户页，拷贝过程中触发的缺页应由缺页处理器补齐。
-    // 这里避免用“页表必须 present”作为判断条件，否则 read()/readv() 写入 mmap 区域会错误返回 -EFAULT。
-    if user_accessible_len(src, len, false) < len {
-        return Err(SystemError::EFAULT);
-    }
+    check_user_access_range(src, len, false)?;
+    prefault_user_range(src, len, false)?;
 
     // 执行实际拷贝,使用异常表保护
     let result = MMArch::copy_with_exception_table(dst_ptr, src_ptr, len);
@@ -1017,9 +1076,8 @@ pub unsafe fn copy_to_user_protected(dest: VirtAddr, src: &[u8]) -> Result<usize
     let dst_ptr = dest.data() as *mut u8;
     let src_ptr = src.as_ptr();
 
-    if user_accessible_len(dest, len, true) < len {
-        return Err(SystemError::EFAULT);
-    }
+    check_user_access_range(dest, len, true)?;
+    prefault_user_range(dest, len, true)?;
 
     let result = MMArch::copy_with_exception_table(dst_ptr, src_ptr, len);
 

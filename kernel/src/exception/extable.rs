@@ -57,26 +57,14 @@ impl ExceptionTableManager {
 
             let table = core::slice::from_raw_parts(start, count);
 
-            // 二分查找(表在编译时已排序)
-            Self::binary_search(table, fault_addr)
+            Self::linear_search(table, fault_addr)
         }
     }
 
-    fn binary_search(table: &[ExceptionTableEntry], fault_addr: usize) -> Option<usize> {
-        let mut left = 0;
-        let mut right = table.len();
-
-        while left < right {
-            let mid = left + (right - left) / 2;
-            let entry = &table[mid];
-            let insn_addr = entry.insn_addr();
-
-            if insn_addr == fault_addr {
+    fn linear_search(table: &[ExceptionTableEntry], fault_addr: usize) -> Option<usize> {
+        for entry in table {
+            if entry.insn_addr() == fault_addr {
                 return Some(entry.fixup_addr());
-            } else if insn_addr < fault_addr {
-                left = mid + 1;
-            } else {
-                right = mid;
             }
         }
 

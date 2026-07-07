@@ -854,7 +854,7 @@ impl Socket for UnixDatagramSocket {
         // - Fill msg_name/msg_namelen when provided.
 
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
-        let mut buf = iovs.new_buf(true);
+        let mut buf = iovs.new_buf(true)?;
         let buf_cap = buf.len();
 
         let nonblock = self.is_nonblocking() || flags.contains(PMSG::DONTWAIT);
@@ -1138,7 +1138,7 @@ impl Socket for UnixDatagramSocket {
                 UserBufferReader::new(msg.msg_control as *const u8, msg.msg_controllen, true)?;
             let mut off = 0usize;
             while off + core::mem::size_of::<Cmsghdr>() <= msg.msg_controllen {
-                let hdr = *reader.read_one_from_user::<Cmsghdr>(off)?;
+                let hdr = reader.read_one_from_user::<Cmsghdr>(off)?;
                 if hdr.cmsg_len < core::mem::size_of::<Cmsghdr>() {
                     return Err(SystemError::EINVAL);
                 }
@@ -1234,6 +1234,17 @@ impl Socket for UnixDatagramSocket {
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    fn validate_send_buffer_len(
+        &self,
+        len: usize,
+        _address: Option<&Endpoint>,
+    ) -> Result<(), SystemError> {
+        if len > Self::MAX_MSG_SIZE {
+            return Err(SystemError::EMSGSIZE);
+        }
+        Ok(())
     }
 
     fn send_buffer_size(&self) -> usize {

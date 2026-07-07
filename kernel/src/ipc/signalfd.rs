@@ -316,7 +316,7 @@ pub(super) fn read_user_sigset(mask_ptr: usize, mask_size: usize) -> Result<SigS
         return Err(SystemError::EINVAL);
     }
     let reader = UserBufferReader::new(mask_ptr as *const u64, size_of::<u64>(), true)?;
-    let bits = *reader.read_one_from_user::<u64>(0)?;
+    let bits = reader.read_one_from_user::<u64>(0)?;
     Ok(SigSet::from_bits_truncate(bits))
 }
 

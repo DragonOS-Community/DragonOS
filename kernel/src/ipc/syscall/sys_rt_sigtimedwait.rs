@@ -93,7 +93,7 @@ pub fn do_kernel_rt_sigtimedwait(
     } else {
         let reader = UserBufferReader::new(uts, size_of::<PosixTimeSpec>(), from_user)?;
         let timeout = reader.read_one_from_user::<PosixTimeSpec>(0)?;
-        let deadline = compute_deadline(*timeout)?;
+        let deadline = compute_deadline(timeout)?;
         Some(deadline)
     };
 

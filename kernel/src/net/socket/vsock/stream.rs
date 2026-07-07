@@ -21,6 +21,7 @@ use crate::filesystem::vfs::{
 };
 use crate::libs::mutex::Mutex;
 use crate::libs::wait_queue::WaitQueue;
+use crate::mm::MemoryManagementArch;
 use crate::net::socket::common::{write_i32_getsockopt, EPollItems, ShutdownBit};
 use crate::net::socket::endpoint::Endpoint;
 use crate::net::socket::{RecvFromAddrBehavior, Socket, PMSG, PSO, PSOL};
@@ -1349,6 +1350,24 @@ impl Socket for VsockStreamSocket {
         _address: Endpoint,
     ) -> Result<usize, SystemError> {
         self.send(buffer, flags)
+    }
+
+    fn send_user_buffer(
+        &self,
+        reader: &crate::syscall::user_access::UserBufferReader<'_>,
+        len: usize,
+        flags: PMSG,
+        address: Option<Endpoint>,
+    ) -> Result<usize, SystemError> {
+        const STREAM_SEND_CHUNK: usize = crate::arch::MMArch::PAGE_SIZE;
+        crate::net::socket::base::send_user_buffer_via_kernel_buf(
+            self,
+            reader,
+            len,
+            flags,
+            address,
+            STREAM_SEND_CHUNK,
+        )
     }
 
     /// 关闭发送/接收方向（半关闭）。

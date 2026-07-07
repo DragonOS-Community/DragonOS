@@ -205,9 +205,14 @@ where
             }
 
             copy_len = offset + msg_len;
-            offset = offset
+            let next_offset = offset
                 .checked_add(align_up(msg_len, NLMSG_ALIGN))
                 .ok_or(SystemError::EINVAL)?;
+            let probe_end = core::cmp::min(next_offset, len);
+            if probe_end > copy_len {
+                Self::probe_user_tail(reader, copy_len, probe_end - copy_len)?;
+            }
+            offset = next_offset;
         }
 
         Ok(copy_len)

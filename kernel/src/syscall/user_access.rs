@@ -11,6 +11,12 @@ use core::{
 use alloc::{ffi::CString, vec::Vec};
 use defer::defer;
 
+#[cfg(target_arch = "riscv64")]
+use crate::mm::{
+    fault::{FaultFlags, PageFaultHandler, PageFaultMessage},
+    ucontext::AddressSpace,
+    VmFaultReason,
+};
 use crate::{
     arch::MMArch,
     mm::{access_ok, MemoryManagementArch, VirtAddr, VirtRegion, VmFlags},
@@ -45,6 +51,91 @@ unsafe fn value_as_bytes_mut<T>(value: &mut T) -> &mut [u8] {
 #[inline(always)]
 unsafe fn maybe_uninit_as_bytes_mut<T>(value: &mut MaybeUninit<T>) -> &mut [u8] {
     core::slice::from_raw_parts_mut(value.as_mut_ptr().cast::<u8>(), core::mem::size_of::<T>())
+}
+
+fn prefault_user_range(addr: VirtAddr, len: usize, write: bool) -> Result<(), SystemError> {
+    if MMArch::PAGE_FAULT_ENABLED || len == 0 {
+        return Ok(());
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    {
+        let _ = (addr, write);
+        return Ok(());
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        let end = addr.data().checked_add(len).ok_or(SystemError::EFAULT)?;
+        let start_page = VirtAddr::new(addr.data() & !MMArch::PAGE_OFFSET_MASK);
+        let end_page = VirtAddr::new((end - 1) & !MMArch::PAGE_OFFSET_MASK);
+        let region_len = end_page
+            .data()
+            .checked_sub(start_page.data())
+            .and_then(|len| len.checked_add(MMArch::PAGE_SIZE))
+            .ok_or(SystemError::EFAULT)?;
+        let region = VirtRegion::new(start_page, region_len);
+
+        let mm = AddressSpace::current()?;
+        let mut space_guard = mm.write_guard_no_reservation_conflict(region);
+        let mut current = start_page;
+        loop {
+            let vma = space_guard
+                .mappings
+                .contains(current)
+                .ok_or(SystemError::EFAULT)?;
+            let vm_flags = *vma.lock().vm_flags();
+            let permitted = if write {
+                vm_flags.contains(VmFlags::VM_WRITE)
+            } else {
+                vm_flags.contains(VmFlags::VM_READ)
+            };
+            if !permitted {
+                return Err(SystemError::EFAULT);
+            }
+
+            let fault_flags = if write {
+                FaultFlags::FAULT_FLAG_WRITE
+            } else {
+                FaultFlags::empty()
+            };
+            let fault = unsafe {
+                let message = PageFaultMessage::new(
+                    vma,
+                    current,
+                    fault_flags,
+                    &mut space_guard.user_mapper.utable,
+                    mm.clone(),
+                );
+                PageFaultHandler::handle_mm_fault(message)
+            };
+            if fault.contains(VmFaultReason::VM_FAULT_OOM) {
+                return Err(SystemError::ENOMEM);
+            }
+            if fault.intersects(
+                VmFaultReason::VM_FAULT_SIGBUS
+                    | VmFaultReason::VM_FAULT_SIGSEGV
+                    | VmFaultReason::VM_FAULT_HWPOISON
+                    | VmFaultReason::VM_FAULT_HWPOISON_LARGE
+                    | VmFaultReason::VM_FAULT_FALLBACK
+                    | VmFaultReason::VM_FAULT_RETRY,
+            ) {
+                return Err(SystemError::EFAULT);
+            }
+
+            if current == end_page {
+                break;
+            }
+            current = VirtAddr::new(
+                current
+                    .data()
+                    .checked_add(MMArch::PAGE_SIZE)
+                    .ok_or(SystemError::EFAULT)?,
+            );
+        }
+
+        Ok(())
+    }
 }
 
 /// Clear data in the specified range of user space
@@ -100,6 +191,7 @@ pub unsafe fn clear_user_cow_protected(dest: VirtAddr, len: usize) -> Result<usi
     if user_accessible_len(dest, len, true) < len {
         return Err(SystemError::EFAULT);
     }
+    prefault_user_range(dest, len, true)?;
 
     let result = MMArch::memset_with_exception_table(dest.data() as *mut u8, 0, len);
     if result == 0 {
@@ -938,6 +1030,7 @@ pub unsafe fn copy_from_user_protected(
     let src_ptr = src.data() as *const u8;
 
     access_ok(src, len).map_err(|_| SystemError::EFAULT)?;
+    prefault_user_range(src, len, false)?;
 
     // 执行实际拷贝,使用异常表保护
     let result = MMArch::copy_with_exception_table(dst_ptr, src_ptr, len);
@@ -972,6 +1065,7 @@ pub unsafe fn copy_to_user_protected(dest: VirtAddr, src: &[u8]) -> Result<usize
     let src_ptr = src.as_ptr();
 
     access_ok(dest, len).map_err(|_| SystemError::EFAULT)?;
+    prefault_user_range(dest, len, true)?;
 
     let result = MMArch::copy_with_exception_table(dst_ptr, src_ptr, len);
 

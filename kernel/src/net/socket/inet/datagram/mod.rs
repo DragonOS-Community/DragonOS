@@ -864,6 +864,50 @@ impl UdpSocket {
         self.errqueue.lock().pop_front()
     }
 
+    fn enqueue_ipv6_emsgsize_errqueue(&self, payload_len: usize, offender: Option<IpEndpoint>) {
+        if self.ip_version != IpVersion::Ipv6 || !self.recv_err_v6.load(Ordering::Acquire) {
+            return;
+        }
+
+        let mut off = offender.unwrap_or_else(|| IpEndpoint::new(self.unspecified_addr(), 0));
+        if off.addr.is_unspecified() {
+            off.addr = smoltcp::wire::IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 1);
+        }
+
+        let mut ee = SystemError::EMSGSIZE.to_posix_errno();
+        if ee < 0 {
+            ee = -ee;
+        }
+        let err = SockExtendedErr {
+            ee_errno: ee as u32,
+            ee_origin: SO_EE_ORIGIN_LOCAL,
+            ee_type: ICMP_ECHOREPLY,
+            ee_code: ICMP_NET_UNREACH,
+            ee_pad: 0,
+            ee_info: payload_len as u32,
+            ee_data: 0,
+        };
+        let addr_len = SockAddr::from(Endpoint::Ip(off)).len().unwrap_or(0) as usize;
+        if addr_len != 0 {
+            self.enqueue_errqueue(err, off, PSOL::IPV6 as i32, PIPV6::RECVERR as i32, addr_len);
+        }
+    }
+
+    fn connected_or_explicit_send_dest(&self, address: Option<&Endpoint>) -> Option<IpEndpoint> {
+        if let Some(Endpoint::Ip(dest)) = address {
+            return Some(Self::normalize_unspecified_dest(*dest));
+        }
+
+        self.inner
+            .read()
+            .as_ref()
+            .and_then(|inner| match inner {
+                UdpInner::Bound(bound) => bound.remote_endpoint().ok(),
+                _ => None,
+            })
+            .map(Self::normalize_unspecified_dest)
+    }
+
     pub fn try_send(
         &self,
         buf: &[u8],
@@ -1123,36 +1167,7 @@ impl UdpSocket {
                 );
             }
             if let Err(SystemError::EMSGSIZE) = result {
-                if self.ip_version == IpVersion::Ipv6 && self.recv_err_v6.load(Ordering::Acquire) {
-                    let mut off =
-                        dest.unwrap_or_else(|| IpEndpoint::new(self.unspecified_addr(), 0));
-                    if off.addr.is_unspecified() {
-                        off.addr = smoltcp::wire::IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 1);
-                    }
-                    let mut ee = SystemError::EMSGSIZE.to_posix_errno();
-                    if ee < 0 {
-                        ee = -ee;
-                    }
-                    let err = SockExtendedErr {
-                        ee_errno: ee as u32,
-                        ee_origin: SO_EE_ORIGIN_LOCAL,
-                        ee_type: ICMP_ECHOREPLY,
-                        ee_code: ICMP_NET_UNREACH,
-                        ee_pad: 0,
-                        ee_info: buf.len() as u32,
-                        ee_data: 0,
-                    };
-                    let addr_len = SockAddr::from(Endpoint::Ip(off)).len().unwrap_or(0) as usize;
-                    if addr_len != 0 {
-                        self.enqueue_errqueue(
-                            err,
-                            off,
-                            PSOL::IPV6 as i32,
-                            PIPV6::RECVERR as i32,
-                            addr_len,
-                        );
-                    }
-                }
+                self.enqueue_ipv6_emsgsize_errqueue(buf.len(), dest);
             }
             return result;
         }
@@ -1213,35 +1228,7 @@ impl UdpSocket {
         }
 
         if let Err(SystemError::EMSGSIZE) = result {
-            if self.ip_version == IpVersion::Ipv6 && self.recv_err_v6.load(Ordering::Acquire) {
-                let mut off = to.unwrap_or_else(|| IpEndpoint::new(self.unspecified_addr(), 0));
-                if off.addr.is_unspecified() {
-                    off.addr = smoltcp::wire::IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 1);
-                }
-                let mut ee = SystemError::EMSGSIZE.to_posix_errno();
-                if ee < 0 {
-                    ee = -ee;
-                }
-                let err = SockExtendedErr {
-                    ee_errno: ee as u32,
-                    ee_origin: SO_EE_ORIGIN_LOCAL,
-                    ee_type: ICMP_ECHOREPLY,
-                    ee_code: ICMP_NET_UNREACH,
-                    ee_pad: 0,
-                    ee_info: buf.len() as u32,
-                    ee_data: 0,
-                };
-                let addr_len = SockAddr::from(Endpoint::Ip(off)).len().unwrap_or(0) as usize;
-                if addr_len != 0 {
-                    self.enqueue_errqueue(
-                        err,
-                        off,
-                        PSOL::IPV6 as i32,
-                        PIPV6::RECVERR as i32,
-                        addr_len,
-                    );
-                }
-            }
+            self.enqueue_ipv6_emsgsize_errqueue(buf.len(), to);
         }
 
         result
@@ -1579,9 +1566,11 @@ impl Socket for UdpSocket {
     fn validate_send_buffer_len(
         &self,
         len: usize,
-        _address: Option<&Endpoint>,
+        address: Option<&Endpoint>,
     ) -> Result<(), SystemError> {
         if len > u16::MAX as usize {
+            let offender = self.connected_or_explicit_send_dest(address);
+            self.enqueue_ipv6_emsgsize_errqueue(len, offender);
             return Err(SystemError::EMSGSIZE);
         }
         Ok(())

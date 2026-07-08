@@ -80,7 +80,7 @@ fn ring_cap_for_effective_sockbuf(effective: usize) -> usize {
     // Underlying ring buffer requires power-of-two capacity.
     let mut cap = effective.next_power_of_two();
     cap = core::cmp::max(cap, inner::UNIX_STREAM_DEFAULT_BUF_SIZE);
-    cap = core::cmp::min(cap, UnixStreamSocket::MAX_EFFECTIVE_SOCKET_BUF_SIZE);
+    cap = core::cmp::min(cap, UnixStreamSocket::MAX_RING_SOCKET_BUF_CAPACITY);
     cap
 }
 
@@ -123,9 +123,12 @@ impl UnixStreamSocket {
     #[allow(dead_code)]
     pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
     pub const MIN_SOCKET_BUF_SIZE: usize = 1024;
-    /// Upper bound for the *effective* (doubled) SO_SNDBUF/SO_RCVBUF value.
-    /// Must be a power-of-two friendly size to keep ring buffer resizes sane.
-    const MAX_EFFECTIVE_SOCKET_BUF_SIZE: usize = 8 * 1024 * 1024;
+    /// Linux defaults `net.core.wmem_max`/`rmem_max` to SK_WMEM_MAX/SK_RMEM_MAX
+    /// and stores the doubled effective value for SO_SNDBUF/SO_RCVBUF.
+    const MAX_EFFECTIVE_SOCKET_BUF_SIZE: usize = 425_984;
+    /// Internal Unix stream rings require power-of-two capacity. Keep this
+    /// separate from the Linux-visible SO_SNDBUF/SO_RCVBUF value.
+    const MAX_RING_SOCKET_BUF_CAPACITY: usize = 524_288;
 
     pub(super) fn new_init(
         init: Init,
@@ -225,14 +228,37 @@ impl UnixStreamSocket {
     fn wake_peer_writable(&self) {
         if let Some(peer_weak) = self.peer.lock().as_ref() {
             if let Some(peer) = peer_weak.upgrade() {
-                peer.wait_queue
-                    .wakeup(Some(crate::process::ProcessState::Blocked(true)));
-                let _ = EventPoll::wakeup_epoll(
-                    peer.epoll_items().as_ref(),
-                    EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM,
-                );
-                peer.fasync_items.send_sigio(FASYNC_POLL_OUT);
+                peer.wake_self_writable();
             }
+        }
+    }
+
+    fn is_self_writable_now(&self) -> bool {
+        let inner_guard = self.inner.read();
+        let Some(inner) = inner_guard.as_ref() else {
+            return false;
+        };
+        let Inner::Connected(connected) = inner else {
+            return false;
+        };
+        if connected.send_closed() {
+            return false;
+        }
+
+        let sndbuf = self.sndbuf.load(Ordering::Relaxed);
+        let queued = connected.outq_len(self.is_seqpacket);
+        connected.send_free_len() > 0 && queued < sndbuf
+    }
+
+    fn wake_self_writable(&self) {
+        self.wait_queue
+            .wakeup(Some(crate::process::ProcessState::Blocked(true)));
+        if self.is_self_writable_now() {
+            let _ = EventPoll::wakeup_epoll(
+                self.epoll_items().as_ref(),
+                EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM,
+            );
+            self.fasync_items.send_sigio(FASYNC_POLL_OUT);
         }
     }
 
@@ -646,7 +672,7 @@ impl Socket for UnixStreamSocket {
                 }
 
                 let effective = Self::effective_sockbuf(requested as usize);
-                self.sndbuf.store(effective, Ordering::SeqCst);
+                let old_effective = self.sndbuf.load(Ordering::Relaxed);
 
                 let new_cap = ring_cap_for_effective_sockbuf(effective);
                 if let Some(inner) = self.inner.read().as_ref() {
@@ -663,6 +689,10 @@ impl Socket for UnixStreamSocket {
                         Inner::Init(_) => {}
                     }
                 }
+                self.sndbuf.store(effective, Ordering::SeqCst);
+                if effective > old_effective {
+                    self.wake_self_writable();
+                }
                 Ok(())
             }
             crate::net::socket::PSO::RCVBUF | crate::net::socket::PSO::RCVBUFFORCE => {
@@ -672,7 +702,7 @@ impl Socket for UnixStreamSocket {
                 }
 
                 let effective = Self::effective_sockbuf(requested as usize);
-                self.rcvbuf.store(effective, Ordering::SeqCst);
+                let old_effective = self.rcvbuf.load(Ordering::Relaxed);
 
                 let new_cap = ring_cap_for_effective_sockbuf(effective);
                 if let Some(inner) = self.inner.read().as_ref() {
@@ -688,6 +718,10 @@ impl Socket for UnixStreamSocket {
                         }
                         Inner::Init(_) => {}
                     }
+                }
+                self.rcvbuf.store(effective, Ordering::SeqCst);
+                if effective > old_effective {
+                    self.wake_peer_writable();
                 }
                 Ok(())
             }

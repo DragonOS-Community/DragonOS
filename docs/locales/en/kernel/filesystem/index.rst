@@ -24,6 +24,7 @@ todo: Due to the file system module reconstruction, the documentation is tempora
 
    overview
    fuse
+   virtiofs_benchmark_runbook
    vfs/index
    proc/index
    sysfs

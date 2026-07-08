@@ -32,6 +32,7 @@ use super::protocol::{
     FUSE_NO_OPENDIR_SUPPORT, FUSE_NO_OPEN_SUPPORT, FUSE_PARALLEL_DIROPS, FUSE_POSIX_ACL,
     FUSE_POSIX_LOCKS, FUSE_READDIRPLUS_AUTO, FUSE_REMOVEXATTR, FUSE_SETXATTR, FUSE_SUBMOUNTS,
 };
+use super::{stats, trace};
 
 fn wait_with_recheck<T, F>(waitq: &WaitQueue, mut check: F) -> Result<T, SystemError>
 where
@@ -60,6 +61,7 @@ where
 #[derive(Debug)]
 pub struct FuseRequest {
     pub bytes: Vec<u8>,
+    unique: u64,
     opcode: u32,
 }
 
@@ -459,15 +461,21 @@ impl FuseConn {
     }
 
     pub fn abort(&self) {
-        let processing: Vec<Arc<FusePendingState>> = {
+        let (processing, pending_noreply_count): (Vec<Arc<FusePendingState>>, usize) = {
             let mut g = self.inner.lock();
             g.connected = false;
             g.mounted = false;
+            let pending_noreply_count = g
+                .pending
+                .iter()
+                .filter(|req| matches!(req.opcode, FUSE_FORGET | FUSE_DESTROY | FUSE_INTERRUPT))
+                .count();
             g.pending.clear();
             let processing = g.processing.values().cloned().collect();
             g.processing.clear();
-            processing
+            (processing, pending_noreply_count)
         };
+        stats::on_fuse_requests_aborted(processing.len() + pending_noreply_count);
         for p in processing {
             p.complete(Err(SystemError::ENOTCONN));
         }
@@ -485,7 +493,9 @@ impl FuseConn {
     /// happens when /dev/fuse is closed or explicit abort path is triggered.
     pub fn on_umount(&self) {
         let processing: Vec<Arc<FusePendingState>>;
+        let dropped_processing: Vec<Arc<FusePendingState>>;
         let should_destroy: bool;
+        let dropped_pending: usize;
         {
             let mut g = self.inner.lock();
             should_destroy = g.connected && g.initialized;
@@ -495,12 +505,34 @@ impl FuseConn {
             // requests so the daemon can release lookup references before
             // it receives DESTROY; drop ordinary requests that can no longer
             // complete after unmount.
+            let mut dropped_noreply = 0usize;
+            let mut dropped_reply_unique = Vec::new();
+            for req in g.pending.iter() {
+                if req.opcode == FUSE_FORGET {
+                    continue;
+                }
+                if matches!(req.opcode, FUSE_DESTROY | FUSE_INTERRUPT) {
+                    dropped_noreply += 1;
+                } else if g.processing.contains_key(&req.unique) {
+                    dropped_reply_unique.push(req.unique);
+                }
+            }
             g.pending.retain(|req| req.opcode == FUSE_FORGET);
+            dropped_processing = dropped_reply_unique
+                .into_iter()
+                .filter_map(|unique| g.processing.remove(&unique))
+                .collect();
+            dropped_pending = dropped_noreply + dropped_processing.len();
             processing = g.processing.values().cloned().collect();
             g.processing.clear();
         }
 
+        stats::on_fuse_requests_dropped_umount(dropped_pending);
+        stats::on_fuse_requests_aborted(processing.len());
         for p in processing {
+            p.complete(Err(SystemError::ENOTCONN));
+        }
+        for p in dropped_processing {
             p.complete(Err(SystemError::ENOTCONN));
         }
         self.init_wait.wakeup(None);
@@ -667,33 +699,55 @@ impl FuseConn {
             return Err(SystemError::EINVAL);
         }
 
-        // Linux: if O_NONBLOCK and no pending request, return EAGAIN.
-        let req = if nonblock {
-            self.pop_pending_nonblock()?
-        } else {
-            self.pop_pending_blocking()?
-        };
+        let req = loop {
+            // Linux: if O_NONBLOCK and no pending request, return EAGAIN.
+            let req = if nonblock {
+                self.pop_pending_nonblock()?
+            } else {
+                self.pop_pending_blocking()?
+            };
 
-        if out.len() < req.bytes.len() {
-            // Put it back and report EINVAL: userspace must provide a sufficiently large buffer.
-            let req_len = req.bytes.len();
-            let mut g = self.inner.lock();
-            if g.connected {
-                g.pending.push_front(req);
+            if out.len() >= req.bytes.len() {
+                break req;
             }
+
+            self.fail_oversized_read_request(&req);
             log::warn!(
                 "fuse: read buffer smaller than queued request: got={} need={}",
                 out.len(),
-                req_len
+                req.bytes.len()
             );
-            return Err(SystemError::EINVAL);
-        }
+        };
 
         out[..req.bytes.len()].copy_from_slice(&req.bytes);
+        stats::on_fuse_request_dequeued(req.bytes.len());
+        trace::trace_fuse_request_dequeue(req.unique, req.opcode, req.bytes.len() as u64);
         if req.opcode == FUSE_DESTROY {
             self.abort();
         }
         Ok(req.bytes.len())
+    }
+
+    fn fail_oversized_read_request(&self, req: &FuseRequest) {
+        stats::on_fuse_read_buffer_too_small();
+        let err = if req.opcode == FUSE_SETXATTR {
+            SystemError::E2BIG
+        } else {
+            SystemError::EIO
+        };
+        let pending = {
+            let mut g = self.inner.lock();
+            g.processing.remove(&req.unique)
+        };
+
+        if let Some(pending) = pending {
+            let error = -err.to_posix_errno();
+            stats::on_fuse_reply_complete(error, 0);
+            trace::trace_fuse_reply_complete(req.unique, req.opcode, error, 0);
+            pending.complete(Err(err));
+        } else {
+            stats::on_fuse_requests_aborted(1);
+        }
     }
 
     fn kernel_init_flags() -> u64 {
@@ -906,7 +960,11 @@ impl FuseConn {
         let mut bytes = Vec::with_capacity(hdr.len as usize);
         bytes.extend_from_slice(fuse_pack_struct(&hdr));
         bytes.extend_from_slice(payload);
-        Arc::new(FuseRequest { bytes, opcode })
+        Arc::new(FuseRequest {
+            bytes,
+            unique,
+            opcode,
+        })
     }
 
     fn push_request(
@@ -915,6 +973,9 @@ impl FuseConn {
         pending_state: Option<Arc<FusePendingState>>,
         unique: u64,
     ) -> Result<(), SystemError> {
+        let req_len = req.bytes.len();
+        let opcode = req.opcode;
+        let no_reply = pending_state.is_none();
         {
             let mut g = self.inner.lock();
             if !g.connected {
@@ -926,6 +987,8 @@ impl FuseConn {
             }
         }
 
+        stats::on_fuse_request_queued(req_len, no_reply);
+        trace::trace_fuse_request_queue(unique, opcode, req_len as u64, no_reply as u8);
         self.read_wait.wakeup(None);
         let _ = EventPoll::wakeup_epoll(
             &self.epitems,
@@ -952,6 +1015,13 @@ impl FuseConn {
 
         if (out_hdr.unique & Self::FUSE_INT_REQ_BIT) != 0 {
             return self.write_interrupt_reply(&out_hdr, data.len());
+        }
+
+        if out_hdr.error <= -512 || out_hdr.error > 0 {
+            return Err(SystemError::EINVAL);
+        }
+        if out_hdr.error != 0 && data.len() != core::mem::size_of::<FuseOutHeader>() {
+            return Err(SystemError::EINVAL);
         }
 
         let pending = {
@@ -987,6 +1057,13 @@ impl FuseConn {
                 );
             }
             pending.complete(Err(e));
+            stats::on_fuse_reply_complete(error, payload.len());
+            trace::trace_fuse_reply_complete(
+                out_hdr.unique,
+                pending.opcode,
+                error,
+                payload.len() as u64,
+            );
             if pending.opcode == FUSE_INIT {
                 self.abort();
             }
@@ -997,6 +1074,14 @@ impl FuseConn {
             let init_out: FuseInitOut = match fuse_read_struct(payload) {
                 Ok(v) => v,
                 Err(e) => {
+                    let error = -e.to_posix_errno();
+                    stats::on_fuse_reply_complete(error, payload.len());
+                    trace::trace_fuse_reply_complete(
+                        out_hdr.unique,
+                        pending.opcode,
+                        error,
+                        payload.len() as u64,
+                    );
                     pending.complete(Err(e));
                     self.abort();
                     return Ok(data.len());
@@ -1004,6 +1089,14 @@ impl FuseConn {
             };
 
             if init_out.major != FUSE_KERNEL_VERSION {
+                let error = -SystemError::EINVAL.to_posix_errno();
+                stats::on_fuse_reply_complete(error, payload.len());
+                trace::trace_fuse_reply_complete(
+                    out_hdr.unique,
+                    pending.opcode,
+                    error,
+                    payload.len() as u64,
+                );
                 pending.complete(Err(SystemError::EINVAL));
                 self.abort();
                 return Ok(data.len());
@@ -1055,6 +1148,8 @@ impl FuseConn {
             self.init_wait.wakeup(None);
         }
 
+        stats::on_fuse_reply_complete(0, payload.len());
+        trace::trace_fuse_reply_complete(out_hdr.unique, pending.opcode, 0, payload.len() as u64);
         pending.complete(Ok(payload.to_vec()));
         Ok(data.len())
     }

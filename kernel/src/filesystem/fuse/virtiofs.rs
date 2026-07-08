@@ -40,6 +40,7 @@ use super::{
         fuse_pack_struct, fuse_read_struct, FuseInHeader, FuseOutHeader, FuseReadIn, FUSE_DESTROY,
         FUSE_FORGET, FUSE_INTERRUPT, FUSE_READ, FUSE_READDIR, FUSE_READDIRPLUS,
     },
+    stats, trace,
 };
 
 const VIRTIOFS_REQ_QUEUE_SIZE: usize = 8;
@@ -141,6 +142,13 @@ impl VirtioFsBridgeContext {
         }
     }
 
+    fn trace_queue_fields(kind: QueueKind) -> (u8, u16) {
+        match kind {
+            QueueKind::Hiprio => (trace::VIRTIOFS_QUEUE_HIPRIO, 0),
+            QueueKind::Request(slot) => (trace::VIRTIOFS_QUEUE_REQUEST, slot as u16),
+        }
+    }
+
     fn response_buffer_size(pending: &PendingReq) -> usize {
         let default_size = VIRTIOFS_RSP_BUF_SIZE;
         let read_like = matches!(pending.opcode, FUSE_READ | FUSE_READDIR | FUSE_READDIRPLUS);
@@ -186,8 +194,15 @@ impl VirtioFsBridgeContext {
         Ok(())
     }
 
-    fn complete_request_with_errno(conn: &Arc<FuseConn>, unique: u64, errno: i32) {
+    fn complete_request_with_negative_errno(conn: &Arc<FuseConn>, unique: u64, errno: i32) {
         if unique == 0 {
+            return;
+        }
+        if errno <= -512 || errno >= 0 {
+            warn!(
+                "virtiofs bridge: invalid internal completion errno={} unique={}",
+                errno, unique
+            );
             return;
         }
         let out_hdr = FuseOutHeader {
@@ -196,11 +211,25 @@ impl VirtioFsBridgeContext {
             unique,
         };
         let payload = fuse_pack_struct(&out_hdr);
-        let _ = conn.write_reply(payload);
+        match conn.write_reply(payload) {
+            Ok(_) => {}
+            Err(SystemError::ENOENT) => {
+                debug!(
+                    "virtiofs bridge: late internal completion ignored unique={} errno={}",
+                    unique, errno
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "virtiofs bridge: internal completion failed unique={} errno={} err={:?}",
+                    unique, errno, e
+                );
+            }
+        }
     }
 
     fn complete_request_with_error(&self, unique: u64, err: SystemError) {
-        Self::complete_request_with_errno(&self.conn, unique, err.to_posix_errno());
+        Self::complete_request_with_negative_errno(&self.conn, unique, err.to_posix_errno());
     }
 
     fn choose_request_slot(&mut self) -> Result<usize, SystemError> {
@@ -212,8 +241,8 @@ impl VirtioFsBridgeContext {
         Ok(slot)
     }
 
-    fn pump_new_requests(&mut self) -> Result<bool, SystemError> {
-        let mut progressed = false;
+    fn pump_new_requests(&mut self) -> Result<usize, SystemError> {
+        let mut pumped = 0usize;
         for _ in 0..VIRTIOFS_PUMP_BUDGET {
             let len = match self.conn.read_request(true, &mut self.req_buf) {
                 Ok(len) => len,
@@ -221,6 +250,7 @@ impl VirtioFsBridgeContext {
                 Err(e) => return Err(e),
             };
             let req = self.req_buf[..len].to_vec();
+            stats::on_virtiofs_request_cloned(req.len());
             let in_hdr: FuseInHeader = fuse_read_struct(&req)?;
             let noreply = matches!(in_hdr.opcode, FUSE_FORGET | FUSE_DESTROY);
             let queue = if matches!(in_hdr.opcode, FUSE_FORGET | FUSE_INTERRUPT) {
@@ -235,9 +265,10 @@ impl VirtioFsBridgeContext {
                 noreply,
                 queue,
             })?;
-            progressed = true;
+            pumped += 1;
         }
-        Ok(progressed)
+        stats::on_virtiofs_pump_batch(pumped);
+        Ok(pumped)
     }
 
     fn submit_one_pending(&mut self, kind: QueueKind) -> Result<bool, SystemError> {
@@ -250,6 +281,7 @@ impl VirtioFsBridgeContext {
             None
         } else {
             let rsp_size = Self::response_buffer_size(&pending);
+            stats::on_virtiofs_response_buffer_alloc(rsp_size);
             Some(vec![0u8; rsp_size])
         };
 
@@ -284,11 +316,34 @@ impl VirtioFsBridgeContext {
 
         let token = match token {
             Ok(token) => token,
-            Err(VirtioError::QueueFull) | Err(VirtioError::NotReady) => {
+            Err(VirtioError::QueueFull) => {
+                stats::on_virtiofs_queue_full();
+                let (queue_kind, queue_slot) = Self::trace_queue_fields(kind);
+                trace::trace_virtiofs_queue_retry(
+                    pending.unique,
+                    pending.opcode,
+                    queue_kind,
+                    queue_slot,
+                    trace::VIRTIOFS_RETRY_QUEUE_FULL,
+                );
+                self.push_pending_front(pending)?;
+                return Ok(false);
+            }
+            Err(VirtioError::NotReady) => {
+                stats::on_virtiofs_not_ready();
+                let (queue_kind, queue_slot) = Self::trace_queue_fields(kind);
+                trace::trace_virtiofs_queue_retry(
+                    pending.unique,
+                    pending.opcode,
+                    queue_kind,
+                    queue_slot,
+                    trace::VIRTIOFS_RETRY_NOT_READY,
+                );
                 self.push_pending_front(pending)?;
                 return Ok(false);
             }
             Err(e) => {
+                stats::on_virtiofs_submit_error();
                 let se = virtio_drivers_error_to_system_error(e);
                 warn!(
                     "virtiofs bridge: submit failed opcode={} unique={} queue={:?} err={:?}",
@@ -308,6 +363,16 @@ impl VirtioFsBridgeContext {
                 .notify(queue_idx);
         }
 
+        stats::on_virtiofs_submitted(pending.req.len());
+        let (queue_kind, queue_slot) = Self::trace_queue_fields(kind);
+        trace::trace_virtiofs_submit(
+            pending.unique,
+            pending.opcode,
+            queue_kind,
+            queue_slot,
+            token,
+            pending.req.len() as u64,
+        );
         let inflight = InflightReq { pending, rsp };
         match kind {
             QueueKind::Hiprio => {
@@ -389,6 +454,7 @@ impl VirtioFsBridgeContext {
         let used_len = match used_len_res {
             Ok(v) => v as usize,
             Err(e) => {
+                stats::on_virtiofs_pop_used_error();
                 let unique = inflight.pending.unique;
                 self.put_back_inflight(kind, token, inflight)?;
                 warn!(
@@ -399,15 +465,31 @@ impl VirtioFsBridgeContext {
             }
         };
 
+        let (queue_kind, queue_slot) = Self::trace_queue_fields(kind);
+        trace::trace_virtiofs_complete(
+            inflight.pending.unique,
+            inflight.pending.opcode,
+            queue_kind,
+            queue_slot,
+            token,
+            used_len as u64,
+        );
+
         if inflight.pending.noreply {
+            stats::on_virtiofs_completed(used_len, true);
             return Ok(true);
         }
 
         let rsp_buf = inflight.rsp.as_ref().ok_or(SystemError::EIO)?;
         if used_len > rsp_buf.len() {
+            stats::on_virtiofs_completed(used_len, false);
             self.complete_request_with_error(inflight.pending.unique, SystemError::EIO);
             return Ok(true);
         }
+        if rsp_buf.len() > used_len {
+            stats::on_virtiofs_response_buffer_waste(rsp_buf.len() - used_len);
+        }
+        stats::on_virtiofs_completed(used_len, false);
 
         match self.conn.write_reply(&rsp_buf[..used_len]) {
             Ok(_) | Err(SystemError::ENOENT) => {}
@@ -430,19 +512,20 @@ impl VirtioFsBridgeContext {
         Ok(true)
     }
 
-    fn drain_completions(&mut self) -> Result<bool, SystemError> {
-        let mut progressed = false;
+    fn drain_completions(&mut self) -> Result<usize, SystemError> {
+        let mut completed = 0usize;
         while self.pop_one_used(QueueKind::Hiprio)? {
-            progressed = true;
+            completed += 1;
         }
 
         for slot in 0..self.request_vqs.len() {
             while self.pop_one_used(QueueKind::Request(slot))? {
-                progressed = true;
+                completed += 1;
             }
         }
 
-        Ok(progressed)
+        stats::on_virtiofs_complete_batch(completed);
+        Ok(completed)
     }
 
     fn fail_all_unfinished(&mut self, err: SystemError) {
@@ -480,9 +563,11 @@ impl VirtioFsBridgeContext {
             inflight_map.clear();
         }
 
+        let failed = need_reply.len();
         for unique in need_reply {
-            Self::complete_request_with_errno(&conn, unique, errno);
+            Self::complete_request_with_negative_errno(&conn, unique, errno);
         }
+        stats::on_virtiofs_fail_unfinished(failed);
     }
 
     fn run_loop(&mut self) -> Result<(), SystemError> {
@@ -490,7 +575,7 @@ impl VirtioFsBridgeContext {
             let mut progressed = false;
 
             match self.pump_new_requests() {
-                Ok(v) => progressed |= v,
+                Ok(v) => progressed |= v != 0,
                 Err(SystemError::ENOTCONN) => {}
                 Err(e) => {
                     warn!("virtiofs bridge: read_request failed: {:?}", e);
@@ -503,9 +588,12 @@ impl VirtioFsBridgeContext {
             progressed |= self.submit_pending()?;
 
             if let Some(transport) = self.transport.as_mut() {
-                let _ = transport.ack_interrupt();
+                if transport.ack_interrupt() {
+                    stats::on_virtiofs_ack_interrupt();
+                }
             }
-            progressed |= self.drain_completions()?;
+            progressed |= self.drain_completions()? != 0;
+            stats::on_virtiofs_loop_iteration(progressed);
 
             if !self.conn.is_connected() && !self.has_inflight() {
                 break;
@@ -520,6 +608,7 @@ impl VirtioFsBridgeContext {
             }
 
             if !progressed {
+                stats::on_virtiofs_idle_sleep(VIRTIOFS_POLL_NS);
                 Self::poll_pause();
             }
         }

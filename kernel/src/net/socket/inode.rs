@@ -338,6 +338,18 @@ impl<T: Socket + 'static> IndexNode for T {
         self.write(buf)
     }
 
+    fn write_user_at(
+        &self,
+        _offset: usize,
+        len: usize,
+        reader: &UserBufferReader<'_>,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<Option<usize>, SystemError> {
+        drop(data);
+        self.send_user_buffer(reader, len, super::PMSG::empty(), None)
+            .map(Some)
+    }
+
     fn resize(&self, _len: usize) -> Result<(), SystemError> {
         Ok(())
     }

@@ -2,12 +2,14 @@ use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_WRITE;
+use crate::filesystem::vfs::file::File;
 use crate::mm::VirtAddr;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use crate::syscall::user_access::{user_accessible_len, UserBufferReader};
 use alloc::string::ToString;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 /// System call handler for the `write` syscall
@@ -57,7 +59,8 @@ impl Syscall for SysWriteHandle {
             if accessible == 0 {
                 return Err(SystemError::EFAULT);
             }
-            UserBufferReader::new(buf_vaddr, accessible, true)?
+            let user_buffer_reader = UserBufferReader::new(buf_vaddr, accessible, true)?;
+            return do_write_user(fd, &user_buffer_reader, accessible);
         } else {
             UserBufferReader::new(buf_vaddr, len, false)?
         };
@@ -117,6 +120,16 @@ syscall_table_macros::declare_syscall!(SYS_WRITE, SysWriteHandle);
 /// * `Ok(usize)` - Number of bytes successfully written
 /// * `Err(SystemError)` - Error code if operation fails
 pub(super) fn do_write(fd: i32, buf: &[u8]) -> Result<usize, SystemError> {
+    let file = get_file_by_fd(fd)?;
+    file.write(buf.len(), buf)
+}
+
+fn do_write_user(fd: i32, reader: &UserBufferReader<'_>, len: usize) -> Result<usize, SystemError> {
+    let file = get_file_by_fd(fd)?;
+    file.write_user(len, reader)
+}
+
+fn get_file_by_fd(fd: i32) -> Result<Arc<File>, SystemError> {
     let binding = ProcessManager::current_pcb().fd_table();
     let fd_table_guard = binding.read();
 
@@ -124,8 +137,8 @@ pub(super) fn do_write(fd: i32, buf: &[u8]) -> Result<usize, SystemError> {
         .get_file_by_fd(fd)
         .ok_or(SystemError::EBADF)?;
 
-    // drop guard 以避免无法调度的问题
+    // drop guard to avoid scheduling issues
     drop(fd_table_guard);
 
-    return file.write(buf.len(), buf);
+    Ok(file)
 }

@@ -479,6 +479,19 @@ impl SigInfo {
         self.sig_code
     }
 
+    pub fn has_pid_and_uid(&self) -> bool {
+        matches!(self.sig_type, SigType::Kill { .. } | SigType::Rt { .. })
+    }
+
+    pub fn clear_sender_pid(&mut self) {
+        match &mut self.sig_type {
+            SigType::Kill { pid, .. } | SigType::Rt { pid, .. } => {
+                *pid = RawPid::new(0);
+            }
+            _ => {}
+        }
+    }
+
     #[inline(always)]
     pub fn signo_i32(&self) -> i32 {
         self.sig_no

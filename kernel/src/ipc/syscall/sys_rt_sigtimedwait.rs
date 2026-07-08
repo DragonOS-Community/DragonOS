@@ -64,10 +64,22 @@ pub fn do_kernel_rt_sigtimedwait(
         sigset_val
     };
 
-    // 构造等待/屏蔽语义：与Linux一致
-    // - 等待集合 these
-    // - 临时屏蔽集合 = 旧blocked ∪ these（将这些信号作为masked的常规语义，但仍由本系统调用专门消费）
+    // Construct wait/block semantics: consistent with Linux.
+    // While waiting, temporarily remove awaited from blocked, and preserve the
+    // original mask in real_blocked.
     let awaited = these;
+
+    // Compute the timeout. Linux validates the timeout before modifying the
+    // temporary signal mask, to avoid leaking temporary mask state along
+    // EINVAL/EFAULT paths.
+    let deadline = if uts.is_null() {
+        None // infinite wait
+    } else {
+        let reader = UserBufferReader::new(uts, size_of::<PosixTimeSpec>(), from_user)?;
+        let timeout = reader.read_one_from_user::<PosixTimeSpec>(0)?;
+        let deadline = compute_deadline(timeout)?;
+        Some(deadline)
+    };
 
     // 快速路径：先尝试从队列中获取信号
     if let Some((sig, info)) = try_dequeue_signal(&awaited) {
@@ -78,24 +90,21 @@ pub fn do_kernel_rt_sigtimedwait(
         return Ok(sig as usize);
     }
 
+    if let Some(deadline) = deadline {
+        if is_timeout_expired(deadline) {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+    }
+
     // 设置新的信号掩码以准备睡眠，临时地解除对用户等待信号的阻塞，让信号到达时能正确唤醒睡眠中的进程
     let pcb = ProcessManager::current_pcb();
     let mut new_blocked = *pcb.sig_info_irqsave().sig_blocked();
     new_blocked.remove(awaited);
+    set_sigtimedwait_real_blocked();
     // 应用新掩码（内部会自动保存旧掩码到 saved_sigmask ，用于后续恢复）
     set_user_sigmask(&mut new_blocked);
     // 必须重新计算 pending，因为 blocked 变了，可能某些 pending 信号现在变得可见了
     pcb.recalc_sigpending();
-
-    // 计算超时时间
-    let deadline = if uts.is_null() {
-        None // 无限等待
-    } else {
-        let reader = UserBufferReader::new(uts, size_of::<PosixTimeSpec>(), from_user)?;
-        let timeout = reader.read_one_from_user::<PosixTimeSpec>(0)?;
-        let deadline = compute_deadline(timeout)?;
-        Some(deadline)
-    };
 
     // 等待循环（prepare-to-wait 语义）
     let mut _loop_count = 0;
@@ -109,14 +118,14 @@ pub fn do_kernel_rt_sigtimedwait(
             drop(preempt_guard);
 
             if let Some((sig, info)) = try_dequeue_signal(&awaited) {
-                restore_saved_sigmask();
+                restore_sigtimedwait_mask();
                 if !uinfo.is_null() {
                     copy_posix_siginfo_to_user(uinfo, &info, from_user)?;
                 }
                 return Ok(sig as usize);
             }
             // 有 pending 但未从 awaited 集取到（被其他信号打断）
-            restore_saved_sigmask();
+            restore_sigtimedwait_mask();
             return Err(SystemError::EINTR);
         }
 
@@ -124,7 +133,7 @@ pub fn do_kernel_rt_sigtimedwait(
         if let Some(deadline) = deadline {
             if is_timeout_expired(deadline) {
                 drop(preempt_guard);
-                restore_saved_sigmask();
+                restore_sigtimedwait_mask();
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
         }
@@ -133,7 +142,7 @@ pub fn do_kernel_rt_sigtimedwait(
         pcb.recalc_sigpending();
         if pcb.has_pending_signal_fast() {
             drop(preempt_guard);
-            restore_saved_sigmask();
+            restore_sigtimedwait_mask();
             return Err(SystemError::EINTR);
         }
 
@@ -144,7 +153,7 @@ pub fn do_kernel_rt_sigtimedwait(
             let remaining = deadline.total_nanos() - now.total_nanos();
             if remaining <= 0 {
                 drop(preempt_guard);
-                restore_saved_sigmask();
+                restore_sigtimedwait_mask();
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
             remaining / (NSEC_PER_JIFFY as i64)
@@ -154,11 +163,24 @@ pub fn do_kernel_rt_sigtimedwait(
 
         drop(preempt_guard);
         if let Err(e) = schedule_timeout(remaining_time) {
-            restore_saved_sigmask();
+            restore_sigtimedwait_mask();
             return Err(e);
         }
         // 被唤醒后回到循环起点，继续重检条件
     }
+}
+
+fn set_sigtimedwait_real_blocked() {
+    let pcb = ProcessManager::current_pcb();
+    let mut siginfo = pcb.sig_info_mut();
+    let blocked = *siginfo.sig_blocked();
+    *siginfo.real_blocked_mut() = blocked;
+}
+
+fn restore_sigtimedwait_mask() {
+    restore_saved_sigmask();
+    let pcb = ProcessManager::current_pcb();
+    *pcb.sig_info_mut().real_blocked_mut() = SigSet::empty();
 }
 
 /// 尝试从信号队列中取出信号

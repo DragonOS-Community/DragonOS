@@ -41,7 +41,7 @@ use crate::{
     mm::{fault::PageFaultMessage, VirtRegion, VmFaultReason, VmFlags},
     net::socket::Socket,
     process::ProcessManager,
-    syscall::user_buffer::UserBuffer,
+    syscall::{user_access::UserBufferReader, user_buffer::UserBuffer},
     time::PosixTimeSpec,
 };
 
@@ -486,6 +486,23 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError>;
+
+    /// Write to the inode from a userspace buffer.
+    ///
+    /// By default returns `None`, causing the VFS `File` layer to follow the
+    /// traditional path of first copying into a kernel buffer and then calling
+    /// `write_at()`. Inodes that need to avoid an upfront bulk copy (e.g. socket
+    /// streams) can override this method and consume the user buffer directly.
+    fn write_user_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _reader: &UserBufferReader<'_>,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<Option<usize>, SystemError> {
+        drop(data);
+        Ok(None)
+    }
 
     /// 基于打开文件上下文执行 fallocate。
     ///

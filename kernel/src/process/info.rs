@@ -212,6 +212,9 @@ impl ProcessBasicInfo {
 pub struct ProcessSignalInfo {
     // Signals currently blocked by this process.
     sig_blocked: SigSet,
+    // Original blocked mask used by sigtimedwait while it temporarily unblocks
+    // the waited signal set.
+    real_blocked: SigSet,
     // Saved old signal mask, used for restoration.
     saved_sigmask: SigSet,
     // sig_pending stores the signals pending for the current thread.
@@ -254,6 +257,14 @@ impl ProcessSignalInfo {
 
     pub fn sig_block_mut(&mut self) -> &mut SigSet {
         &mut self.sig_blocked
+    }
+
+    pub fn real_blocked(&self) -> &SigSet {
+        &self.real_blocked
+    }
+
+    pub fn real_blocked_mut(&mut self) -> &mut SigSet {
+        &mut self.real_blocked
     }
 
     pub fn saved_sigmask(&self) -> &SigSet {
@@ -319,6 +330,7 @@ impl Default for ProcessSignalInfo {
     fn default() -> Self {
         Self {
             sig_blocked: SigSet::empty(),
+            real_blocked: SigSet::empty(),
             saved_sigmask: SigSet::empty(),
             sig_pending: SigPending::default(),
             tty: None,

@@ -9,7 +9,7 @@ use system_error::SystemError;
 use crate::libs::spinlock::SpinLock;
 use crate::libs::spinlock::SpinLockGuard;
 use crate::process::fork::CloneFlags;
-use crate::process::pid::Pid;
+use crate::process::pid::{Pid, PidType};
 use crate::process::ProcessControlBlock;
 use crate::process::ProcessManager;
 use crate::process::RawPid;
@@ -247,6 +247,11 @@ impl Drop for PidNamespace {
 }
 
 impl ProcessControlBlock {
+    pub fn try_active_pid_ns(&self) -> Option<Arc<PidNamespace>> {
+        self.task_pid_ptr(PidType::PID)
+            .and_then(|pid| pid.try_ns_of_pid())
+    }
+
     pub fn active_pid_ns(&self) -> Arc<PidNamespace> {
         self.pid().ns_of_pid()
     }

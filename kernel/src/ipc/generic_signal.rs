@@ -390,8 +390,21 @@ bitflags! {
     }
 }
 
-/// 信号默认处理函数——终止进程
+/// Signal default handler — terminate process
 fn sig_terminate(sig: Signal) {
+    let code = ProcessManager::current_pcb()
+        .sighand()
+        .group_exit_code_if_set();
+    compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    // If a thread group exit is already in progress, all subsequent fatal signals
+    // must use the unified group_exit_code. During delivery, fatal group-exit injects
+    // a private SIGKILL into each thread; we must handle this check first here,
+    // otherwise a non-leader thread will mistake the injected SIGKILL for a
+    // thread-level SIGKILL and overwrite the exit code.
+    if let Some(code) = code {
+        ProcessManager::exit(code);
+    }
+
     if sig == Signal::SIGKILL {
         let current = ProcessManager::current_pcb();
         if !current.is_thread_group_leader() {
@@ -407,24 +420,16 @@ fn sig_terminate(sig: Signal) {
             }
         }
     }
-    let code = ProcessManager::current_pcb()
-        .sighand()
-        .group_exit_code_if_set();
-    compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    // 若线程组退出已经在进行中，则所有后续致命信号都应当使用统一的 group_exit_code，
-    // 避免多次触发 zap_other_threads 等逻辑。
-    if let Some(code) = code {
-        ProcessManager::exit(code);
-    } else {
-        // 还未进入 group-exit：按照 Linux 语义，
-        // 第一个致命信号负责设置 group_exit_code 并终止整个线程组。
-        //
-        // 对于信号导致的退出，exit_code 不需要左移（低 7 位即为信号编号）。
-        ProcessManager::group_exit(sig as usize);
-    }
+    // Not yet in group-exit: per Linux semantics,
+    // the first fatal signal is responsible for setting group_exit_code and
+    // terminating the entire thread group.
+    //
+    // For signal-induced exits, exit_code does not need a left shift
+    // (the lower 7 bits are the signal number).
+    ProcessManager::group_exit(sig as usize);
 }
 
-/// 信号默认处理函数——终止进程并生成 core dump
+/// Signal default handler — terminate process and generate core dump
 fn sig_terminate_dump(sig: Signal) {
     let code = ProcessManager::current_pcb()
         .sighand()

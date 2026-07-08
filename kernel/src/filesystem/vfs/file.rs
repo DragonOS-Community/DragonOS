@@ -53,6 +53,7 @@ use crate::{
         resource::RLimitID,
         ProcessControlBlock, ProcessManager, RawPid,
     },
+    syscall::user_access::UserBufferReader,
 };
 
 use crate::filesystem::vfs::InodeMode;
@@ -686,6 +687,43 @@ impl File {
             self.inode
                 .write_at(actual_offset, actual_len, buf, self.private_data.lock())?;
 
+        self.finalize_write(actual_offset, written_len, config)
+    }
+
+    fn write_user_at_and_finalize(
+        &self,
+        actual_offset: usize,
+        actual_len: usize,
+        reader: &UserBufferReader<'_>,
+        config: WriteConfig,
+    ) -> Result<usize, SystemError> {
+        let written_len = match self.inode.write_user_at(
+            actual_offset,
+            actual_len,
+            reader,
+            self.private_data.lock(),
+        )? {
+            Some(written_len) => written_len,
+            None => {
+                let mut buf = Vec::new();
+                buf.try_reserve(actual_len)
+                    .map_err(|_| SystemError::ENOMEM)?;
+                buf.resize(actual_len, 0);
+                reader.copy_from_user(&mut buf, 0)?;
+                self.inode
+                    .write_at(actual_offset, actual_len, &buf, self.private_data.lock())?
+            }
+        };
+
+        self.finalize_write(actual_offset, written_len, config)
+    }
+
+    fn finalize_write(
+        &self,
+        actual_offset: usize,
+        written_len: usize,
+        config: WriteConfig,
+    ) -> Result<usize, SystemError> {
         if written_len > 0 {
             self.maybe_kill_suid_sgid_after_write()?;
         }
@@ -1171,6 +1209,88 @@ impl File {
                 inode_flags,
             },
         )
+    }
+
+    pub fn do_write_user(
+        &self,
+        offset: usize,
+        len: usize,
+        reader: &UserBufferReader<'_>,
+        update_offset: bool,
+        force_append: bool,
+    ) -> Result<usize, SystemError> {
+        self.writeable()?;
+
+        let inode_flags = self.get_inode_flags()?;
+        let flags = self.flags();
+        // Check S_IMMUTABLE
+        if inode_flags.contains(InodeFlags::S_IMMUTABLE) {
+            return Err(SystemError::EPERM);
+        }
+        // Inodes with S_APPEND may only be appended to
+        if inode_flags.contains(InodeFlags::S_APPEND) && !flags.contains(FileFlags::O_APPEND) {
+            return Err(SystemError::EPERM);
+        }
+
+        let md = self.inode.metadata()?;
+        let file_type = md.file_type;
+
+        let is_append = (flags.contains(FileFlags::O_APPEND) || force_append)
+            && matches!(file_type, FileType::File);
+
+        // Linux semantics require O_APPEND (and RWF_APPEND) to atomically fetch EOF and write under concurrency.
+        if is_append {
+            let dev_id = md.dev_id;
+            let inode_id = md.inode_id;
+            return with_inode_append_lock(dev_id, inode_id, || {
+                let md = self.inode.metadata()?;
+                let actual_offset = md.size.max(0) as usize;
+                let actual_len = self.limit_write_len_by_fsize(file_type, actual_offset, len)?;
+
+                self.write_user_at_and_finalize(
+                    actual_offset,
+                    actual_len,
+                    reader,
+                    WriteConfig {
+                        update_offset,
+                        offset_update: OffsetUpdate::StoreEnd,
+                        flags,
+                        inode_flags,
+                    },
+                )
+            });
+        }
+
+        let actual_offset = offset;
+        let actual_len = self.limit_write_len_by_fsize(file_type, actual_offset, len)?;
+
+        self.write_user_at_and_finalize(
+            actual_offset,
+            actual_len,
+            reader,
+            WriteConfig {
+                update_offset,
+                offset_update: OffsetUpdate::Add,
+                flags,
+                inode_flags,
+            },
+        )
+    }
+
+    /// Write to the file from a userspace buffer.
+    pub fn write_user(
+        &self,
+        len: usize,
+        reader: &UserBufferReader<'_>,
+    ) -> Result<usize, SystemError> {
+        let stream = self.mode.read().contains(FileMode::FMODE_STREAM);
+        let offset = if stream {
+            0
+        } else {
+            self.offset.load(Ordering::SeqCst)
+        };
+
+        self.do_write_user(offset, len, reader, !stream, false)
     }
 
     /// @brief 获取文件的元数据

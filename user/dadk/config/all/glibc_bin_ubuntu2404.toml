@@ -21,7 +21,7 @@ type = "install-from-prebuilt"
 # "install_from_prebuilt" 可选值："local", "archive"
 source = "archive"
 # 路径或URL
-source-path = "https://mirrors.dragonos.org.cn/pub/third_party/gnu/glibc-bin/glibc-ubuntu2404-x86_64-202505111756-8f3207567bf10f4d09027b2cd84b7807.tar.xz"
+source-path = "https://dragonos-mirrors.yacloud.com.cn/pub/third_party/gnu/glibc-bin/glibc-ubuntu2404-x86_64-202505111756-8f3207567bf10f4d09027b2cd84b7807.tar.xz"
 archive-rootdir = "sysroot/"
 
 [build]

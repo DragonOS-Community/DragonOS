@@ -21,7 +21,7 @@ type = "install-from-prebuilt"
 # "install_from_prebuilt" 可选值："local", "archive"
 source = "archive"
 # 路径或URL
-source-path = "https://mirrors.dragonos.org.cn/pub/third_party/gnu/tar/tar-1.35-x86_64-linux-gnu.tar.xz"
+source-path = "https://dragonos-mirrors.yacloud.com.cn/pub/third_party/gnu/tar/tar-1.35-x86_64-linux-gnu.tar.xz"
 
 [build]
 

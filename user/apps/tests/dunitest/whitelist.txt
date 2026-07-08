@@ -11,6 +11,7 @@ normal/fcntl_signal
 normal/epoll_timeout_budget
 normal/devpts_dir_read
 normal/debugfs_mount
+normal/fuse_stats_debugfs
 normal/test_pivot_root
 normal/mount_reconfigure
 normal/mount_propagation

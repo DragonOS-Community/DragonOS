@@ -420,6 +420,26 @@ impl SigHand {
         }
     }
 
+    /// Initiates thread group exit triggered by a fatal signal.
+    ///
+    /// In Linux, the fatal group-exit branch in `complete_signal()` overwrites
+    /// stop/job-control state. DragonOS currently lacks a full jobctl structure,
+    /// but the stopped/continued state visible to wait is stored in
+    /// `SignalFlags::STOP_MASK`; we clear it here before setting GROUP_EXIT to
+    /// prevent a soon-to-be-killed stopped thread group from exposing stale
+    /// stop/continue events.
+    pub fn start_group_exit_for_fatal_signal(&self, exit_code: usize) -> usize {
+        let mut g = self.inner_mut();
+        if g.flags.contains(SignalFlags::GROUP_EXIT) {
+            g.group_exit_code
+        } else {
+            g.flags.remove(SignalFlags::STOP_MASK);
+            g.flags.insert(SignalFlags::GROUP_EXIT);
+            g.group_exit_code = exit_code;
+            exit_code
+        }
+    }
+
     // ===== PIDs helpers =====
     pub fn pid(&self, ty: PidType) -> Option<Arc<Pid>> {
         self.inner().pids[ty as usize].clone()

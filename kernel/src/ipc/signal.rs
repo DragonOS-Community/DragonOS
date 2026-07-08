@@ -12,7 +12,8 @@ use crate::{
     arch::ipc::signal::{SigSet, Signal},
     ipc::signal_types::{
         SaHandlerType, SigCode, SigInfo, SigType, SigactionType, SignalFlags,
-        SIG_KERNEL_IGNORE_MASK, SIG_KERNEL_ONLY_MASK, SIG_KERNEL_STOP_MASK,
+        SIG_KERNEL_COREDUMP_MASK, SIG_KERNEL_IGNORE_MASK, SIG_KERNEL_ONLY_MASK,
+        SIG_KERNEL_STOP_MASK,
     },
     libs::rwlock::RwLockWriteGuard,
     mm::VirtAddr,
@@ -316,9 +317,9 @@ impl Signal {
 
         if let Some(ref siginfo) = info {
             force_send = matches!(siginfo.sig_code(), SigCode::Kernel | SigCode::SysSeccomp);
-        } else {
-            // todo: 判断signal是否来自于一个祖先进程的namespace，如果是，则强制发送信号
-            //详见 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/signal.c?r=&mo=32170&fi=1220#1226
+        }
+        if !force_send && signal_from_ancestor_pid_namespace(&pcb) {
+            force_send = true;
         }
 
         let prepare_result = self.prepare_sianal(pcb.clone(), force_send);
@@ -472,9 +473,78 @@ impl Signal {
             return;
         };
 
+        if !is_thread_target
+            && self.start_fatal_group_exit_if_needed(pcb.clone(), target_pcb.clone())
+        {
+            return;
+        }
+
         target_pcb.recalc_sigpending();
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         signal_wake_up(target_pcb, *self == Signal::SIGKILL);
+    }
+
+    fn start_fatal_group_exit_if_needed(
+        &self,
+        suggested: Arc<ProcessControlBlock>,
+        target: Arc<ProcessControlBlock>,
+    ) -> bool {
+        if !self.should_start_fatal_group_exit(&suggested, &target) {
+            return false;
+        }
+
+        target
+            .sighand()
+            .start_group_exit_for_fatal_signal(*self as usize);
+
+        let tasks = ProcessManager::thread_group_tasks_snapshot(target);
+        for task in tasks {
+            Self::queue_group_kill_to_thread(&task);
+        }
+
+        true
+    }
+
+    fn should_start_fatal_group_exit(
+        &self,
+        suggested: &Arc<ProcessControlBlock>,
+        target: &Arc<ProcessControlBlock>,
+    ) -> bool {
+        if SIG_KERNEL_COREDUMP_MASK.contains((*self).into()) {
+            return false;
+        }
+
+        if !self.sig_fatal(suggested.clone()) {
+            return false;
+        }
+
+        if *self != Signal::SIGKILL && suggested.is_ptraced() {
+            return false;
+        }
+
+        if *self != Signal::SIGKILL
+            && target
+                .sig_info_irqsave()
+                .sig_blocked()
+                .contains((*self).into())
+        {
+            return false;
+        }
+
+        true
+    }
+
+    fn queue_group_kill_to_thread(task: &Arc<ProcessControlBlock>) {
+        if task.flags().contains(ProcessFlags::EXITING) || task.is_zombie() || task.is_dead() {
+            return;
+        }
+
+        task.sig_info_mut()
+            .sig_pending_mut()
+            .signal_mut()
+            .insert(Signal::SIGKILL.into());
+        task.recalc_sigpending();
+        signal_wake_up(task.clone(), true);
     }
 
     fn select_group_signal_target(
@@ -549,6 +619,10 @@ impl Signal {
     #[allow(dead_code)]
     #[inline]
     fn sig_fatal(&self, pcb: Arc<ProcessControlBlock>) -> bool {
+        if !(self.into_sigset() & (SIG_KERNEL_IGNORE_MASK | SIG_KERNEL_STOP_MASK)).is_empty() {
+            return false;
+        }
+
         let sa = pcb.sighand().handler(*self).unwrap();
         let action = sa.action();
         // 如果handler是空，采用默认函数，signal处理可能会导致进程退出。
@@ -774,7 +848,16 @@ fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
     } else if state.is_stopped() {
         // 对已处于 Stopped 的任务，除非致命信号，否则不要唤醒为 Runnable
         // SIGCONT 的唤醒在 prepare_signal(SIGCONT) 路径专门处理
-        wakeup_ok = false;
+        if fatal {
+            let _r = ProcessManager::wakeup_stop(&pcb)
+                .or_else(|_| ProcessManager::wakeup(&pcb))
+                .map(|_| {
+                    ProcessManager::kick(&pcb);
+                });
+            return;
+        } else {
+            wakeup_ok = false;
+        }
     } else {
         wakeup_ok = false;
     }
@@ -984,6 +1067,15 @@ fn retarget_shared_pending(pcb: Arc<ProcessControlBlock>, which: SigSet) {
         }
     }
     // debug!("retarget_shared_pending done!");
+}
+
+fn signal_from_ancestor_pid_namespace(target: &Arc<ProcessControlBlock>) -> bool {
+    let current = ProcessManager::current_pcb();
+    let Some(current_pid) = current.task_pid_ptr(PidType::PID) else {
+        return false;
+    };
+
+    current_pid.pid_nr_ns(&target.active_pid_ns()).data() == 0
 }
 
 /// 设置当前进程的屏蔽信号 (sig_block)

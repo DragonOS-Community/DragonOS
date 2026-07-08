@@ -123,9 +123,9 @@ impl UnixStreamSocket {
     #[allow(dead_code)]
     pub const DEFAULT_METADATA_BUF_SIZE: usize = 1024;
     pub const MIN_SOCKET_BUF_SIZE: usize = 1024;
-    /// Upper bound for the *effective* (doubled) SO_SNDBUF/SO_RCVBUF value.
-    /// Must be a power-of-two friendly size to keep ring buffer resizes sane.
-    const MAX_EFFECTIVE_SOCKET_BUF_SIZE: usize = 8 * 1024 * 1024;
+    /// Linux defaults `net.core.wmem_max`/`rmem_max` to SK_WMEM_MAX/SK_RMEM_MAX
+    /// and stores the doubled effective value for SO_SNDBUF/SO_RCVBUF.
+    const MAX_EFFECTIVE_SOCKET_BUF_SIZE: usize = 425_984;
 
     pub(super) fn new_init(
         init: Init,

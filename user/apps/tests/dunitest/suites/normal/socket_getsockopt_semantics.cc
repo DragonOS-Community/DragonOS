@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <limits.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -134,6 +135,22 @@ TEST(SocketGetsockoptSemantics, UnixStreamScalarOptionsAllowShortBuffers) {
     ExpectIntOptionPrefix(fd.Get(), SOL_SOCKET, SO_DOMAIN, AF_UNIX, 2);
     ExpectIntOptionPrefix(fd.Get(), SOL_SOCKET, SO_PROTOCOL, 0, 2);
     ExpectIntOptionPrefix(fd.Get(), SOL_SOCKET, SO_ACCEPTCONN, 0, 1);
+}
+
+TEST(SocketGetsockoptSemantics, UnixStreamSndbufClampsToLinuxDefaultMax) {
+    FdGuard fd(socket(AF_UNIX, SOCK_STREAM, 0));
+    ASSERT_GE(fd.Get(), 0) << "socket(AF_UNIX, SOCK_STREAM) failed: " << ErrnoString(errno);
+
+    const int requested = INT_MAX;
+    ASSERT_EQ(setsockopt(fd.Get(), SOL_SOCKET, SO_SNDBUF, &requested, sizeof(requested)), 0)
+            << "setsockopt(SO_SNDBUF) failed: " << ErrnoString(errno);
+
+    int actual = 0;
+    socklen_t len = sizeof(actual);
+    ASSERT_EQ(getsockopt(fd.Get(), SOL_SOCKET, SO_SNDBUF, &actual, &len), 0)
+            << "getsockopt(SO_SNDBUF) failed: " << ErrnoString(errno);
+    EXPECT_EQ(len, sizeof(actual));
+    EXPECT_EQ(actual, 425984);
 }
 
 TEST(SocketGetsockoptSemantics, UnixStreamLingerAllowsShortBuffers) {

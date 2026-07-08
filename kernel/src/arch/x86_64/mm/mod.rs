@@ -783,10 +783,7 @@ impl LockedFrameAllocator {
 }
 
 impl FrameAllocator for LockedFrameAllocator {
-    unsafe fn allocate(
-        &mut self,
-        mut count: PageFrameCount,
-    ) -> Option<(PhysAddr, PageFrameCount)> {
+    unsafe fn allocate(&mut self, mut count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
         count = count.next_power_of_two();
         if let Some(frame) = unsafe { Self::allocate_inner(count) } {
             return Some(frame);

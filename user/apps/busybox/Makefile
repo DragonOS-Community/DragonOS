@@ -2,6 +2,8 @@ ARCH ?= x86_64
 busybox_version := 1.35.0
 busybox_tarball := busybox-$(busybox_version).tar.bz2
 busybox_tarball_path := $(busybox_tarball)
+busybox_mirror := https://dragonos-mirrors.yacloud.com.cn/pub/third_party/busybox
+wget := wget --tries=3 --connect-timeout=15 --read-timeout=60
 build_dir := build/$(ARCH)
 busybox_dir := $(build_dir)/busybox-$(busybox_version)
 prefix := $(ARCH)-linux-musl-
@@ -12,13 +14,15 @@ strip := $(prefix)strip
 
 # 下载 busybox 的 md5sum 文件
 $(busybox_tarball_path).md5sum:
-	wget https://mirrors.dragonos.org.cn/pub/third_party/busybox/$(busybox_tarball).md5sum
+	$(wget) -O $@.tmp $(busybox_mirror)/$(busybox_tarball).md5sum
+	mv $@.tmp $@
 
 # 下载源码
 $(busybox_tarball_path): $(busybox_tarball_path).md5sum
 	@if [ ! -f $@ ] || ! md5sum -c $(busybox_tarball_path).md5sum; then \
 		echo "Downloading $@..."; \
-		wget https://mirrors.dragonos.org.cn/pub/third_party/busybox/$(busybox_tarball); \
+		$(wget) -O $@.tmp $(busybox_mirror)/$(busybox_tarball); \
+		mv $@.tmp $@; \
 	fi
 
 # 解压源码包

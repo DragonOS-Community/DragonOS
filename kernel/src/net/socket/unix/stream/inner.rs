@@ -826,10 +826,23 @@ impl Backlog {
         let c2s_cap = core::cmp::max(client_snd_cap, server_rcv_cap);
         let s2c_cap = core::cmp::max(server_snd_cap, client_rcv_cap);
 
-        let _ = client_conn.resize_sendbuf(c2s_cap);
-        let _ = server_conn.resize_recvbuf(c2s_cap);
-        let _ = server_conn.resize_sendbuf(s2c_cap);
-        let _ = client_conn.resize_recvbuf(s2c_cap);
+        debug_assert!(c2s_cap.is_power_of_two());
+        debug_assert!(s2c_cap.is_power_of_two());
+        let restore_init = || Init {
+            addr: client_conn.addr.clone(),
+        };
+        if let Err(e) = client_conn.resize_sendbuf(c2s_cap) {
+            return Err((restore_init(), e));
+        }
+        if let Err(e) = server_conn.resize_recvbuf(c2s_cap) {
+            return Err((restore_init(), e));
+        }
+        if let Err(e) = server_conn.resize_sendbuf(s2c_cap) {
+            return Err((restore_init(), e));
+        }
+        if let Err(e) = client_conn.resize_recvbuf(s2c_cap) {
+            return Err((restore_init(), e));
+        }
 
         let server_socket =
             UnixStreamSocket::new_connected(server_conn, false, is_seqpacket, self.netns.clone());

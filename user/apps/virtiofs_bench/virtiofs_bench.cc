@@ -130,6 +130,28 @@ bool read_full_loop(int fd, std::vector<char>& buf, uint64_t* bytes) {
     }
 }
 
+int errno_or_eio() {
+    return errno == 0 ? EIO : errno;
+}
+
+void record_first_error(int* err, int value) {
+    if (*err == 0) {
+        *err = value;
+    }
+}
+
+void fsync_preserve_error(int fd, int* err) {
+    if (fsync(fd) != 0) {
+        record_first_error(err, errno_or_eio());
+    }
+}
+
+void close_preserve_error(int fd, int* err) {
+    if (close(fd) != 0) {
+        record_first_error(err, errno_or_eio());
+    }
+}
+
 void emit_result(const char* workload, const Options& opt, uint64_t elapsed_us, uint64_t bytes,
                  uint64_t ops, int err) {
     utsname uts = {};
@@ -167,14 +189,14 @@ int prepare_data_file(const Options& opt, const std::string& path, char fill) {
             n = opt.file_size - done;
         }
         if (!write_full(fd, buf.data(), n)) {
-            err = errno;
+            err = errno_or_eio();
             break;
         }
     }
-    if (err == 0 && fsync(fd) != 0) {
-        err = errno;
+    if (err == 0) {
+        fsync_preserve_error(fd, &err);
     }
-    close(fd);
+    close_preserve_error(fd, &err);
     return err;
 }
 
@@ -189,7 +211,10 @@ int metadata_workload(const Options& opt, const std::string& root) {
             err = errno;
             break;
         }
-        close(fd);
+        close_preserve_error(fd, &err);
+        if (err != 0) {
+            break;
+        }
         struct stat st = {};
         if (stat(p.c_str(), &st) != 0) {
             err = errno;
@@ -223,14 +248,16 @@ int sequential_workload(const Options& opt, const std::string& root) {
                 n = opt.file_size - done;
             }
             if (!write_full(fd, buf.data(), n)) {
-                err = errno;
+                err = errno_or_eio();
                 break;
             }
             bytes += n;
             ++ops;
         }
-        fsync(fd);
-        close(fd);
+        if (err == 0) {
+            fsync_preserve_error(fd, &err);
+        }
+        close_preserve_error(fd, &err);
     }
     emit_result("sequential_write", opt, now_us() - start, bytes, ops, err);
     if (err != 0) {
@@ -324,6 +351,8 @@ struct WorkerArg {
     size_t id;
     int err;
     uint64_t bytes;
+    uint64_t ops;
+    bool started;
 };
 
 void* worker_main(void* raw) {
@@ -337,14 +366,16 @@ void* worker_main(void* raw) {
     }
     for (size_t i = 0; i < arg->opt.iterations; ++i) {
         if (!write_full(fd, buf.data(), buf.size())) {
-            arg->err = errno;
-            close(fd);
-            return nullptr;
+            arg->err = errno_or_eio();
+            break;
         }
         arg->bytes += buf.size();
+        ++arg->ops;
     }
-    fsync(fd);
-    close(fd);
+    if (arg->err == 0) {
+        fsync_preserve_error(fd, &arg->err);
+    }
+    close_preserve_error(fd, &arg->err);
     return nullptr;
 }
 
@@ -358,21 +389,33 @@ int concurrent_workload(const Options& opt, const std::string& root) {
         args[i].id = i;
         args[i].err = 0;
         args[i].bytes = 0;
-        if (pthread_create(&threads[i], nullptr, worker_main, &args[i]) != 0) {
-            args[i].err = errno;
+        args[i].ops = 0;
+        args[i].started = false;
+        int rc = pthread_create(&threads[i], nullptr, worker_main, &args[i]);
+        if (rc != 0) {
+            args[i].err = rc;
+        } else {
+            args[i].started = true;
         }
     }
     uint64_t bytes = 0;
+    uint64_t ops = 0;
     int err = 0;
     for (size_t i = 0; i < opt.workers; ++i) {
-        pthread_join(threads[i], nullptr);
+        if (args[i].started) {
+            int rc = pthread_join(threads[i], nullptr);
+            if (rc != 0) {
+                record_first_error(&err, rc);
+                continue;
+            }
+        }
         bytes += args[i].bytes;
+        ops += args[i].ops;
         if (args[i].err != 0 && err == 0) {
             err = args[i].err;
         }
     }
-    emit_result("concurrent_write", opt, now_us() - start, bytes, opt.workers * opt.iterations,
-                err);
+    emit_result("concurrent_write", opt, now_us() - start, bytes, ops, err);
     return err == 0 ? 0 : -1;
 }
 

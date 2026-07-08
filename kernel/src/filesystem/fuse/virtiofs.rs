@@ -194,8 +194,15 @@ impl VirtioFsBridgeContext {
         Ok(())
     }
 
-    fn complete_request_with_errno(conn: &Arc<FuseConn>, unique: u64, errno: i32) {
+    fn complete_request_with_negative_errno(conn: &Arc<FuseConn>, unique: u64, errno: i32) {
         if unique == 0 {
+            return;
+        }
+        if errno <= -512 || errno >= 0 {
+            warn!(
+                "virtiofs bridge: invalid internal completion errno={} unique={}",
+                errno, unique
+            );
             return;
         }
         let out_hdr = FuseOutHeader {
@@ -204,11 +211,25 @@ impl VirtioFsBridgeContext {
             unique,
         };
         let payload = fuse_pack_struct(&out_hdr);
-        let _ = conn.write_reply(payload);
+        match conn.write_reply(payload) {
+            Ok(_) => {}
+            Err(SystemError::ENOENT) => {
+                debug!(
+                    "virtiofs bridge: late internal completion ignored unique={} errno={}",
+                    unique, errno
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "virtiofs bridge: internal completion failed unique={} errno={} err={:?}",
+                    unique, errno, e
+                );
+            }
+        }
     }
 
     fn complete_request_with_error(&self, unique: u64, err: SystemError) {
-        Self::complete_request_with_errno(&self.conn, unique, err.to_posix_errno());
+        Self::complete_request_with_negative_errno(&self.conn, unique, err.to_posix_errno());
     }
 
     fn choose_request_slot(&mut self) -> Result<usize, SystemError> {
@@ -544,7 +565,7 @@ impl VirtioFsBridgeContext {
 
         let failed = need_reply.len();
         for unique in need_reply {
-            Self::complete_request_with_errno(&conn, unique, errno);
+            Self::complete_request_with_negative_errno(&conn, unique, errno);
         }
         stats::on_virtiofs_fail_unfinished(failed);
     }

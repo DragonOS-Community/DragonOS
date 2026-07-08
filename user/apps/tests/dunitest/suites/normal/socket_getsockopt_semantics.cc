@@ -153,6 +153,34 @@ TEST(SocketGetsockoptSemantics, UnixStreamSndbufClampsToLinuxDefaultMax) {
     EXPECT_EQ(actual, 425984);
 }
 
+TEST(SocketGetsockoptSemantics, ConnectedUnixStreamBuffersClampToLinuxDefaultMax) {
+    int sv[2] = {-1, -1};
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0)
+            << "socketpair(AF_UNIX, SOCK_STREAM) failed: " << ErrnoString(errno);
+    FdGuard first(sv[0]);
+    FdGuard second(sv[1]);
+
+    const int requested = INT_MAX;
+    ASSERT_EQ(setsockopt(first.Get(), SOL_SOCKET, SO_SNDBUF, &requested, sizeof(requested)), 0)
+            << "setsockopt(SO_SNDBUF) failed: " << ErrnoString(errno);
+    ASSERT_EQ(setsockopt(first.Get(), SOL_SOCKET, SO_RCVBUF, &requested, sizeof(requested)), 0)
+            << "setsockopt(SO_RCVBUF) failed: " << ErrnoString(errno);
+
+    int actual = 0;
+    socklen_t len = sizeof(actual);
+    ASSERT_EQ(getsockopt(first.Get(), SOL_SOCKET, SO_SNDBUF, &actual, &len), 0)
+            << "getsockopt(SO_SNDBUF) failed: " << ErrnoString(errno);
+    EXPECT_EQ(len, sizeof(actual));
+    EXPECT_EQ(actual, 425984);
+
+    actual = 0;
+    len = sizeof(actual);
+    ASSERT_EQ(getsockopt(first.Get(), SOL_SOCKET, SO_RCVBUF, &actual, &len), 0)
+            << "getsockopt(SO_RCVBUF) failed: " << ErrnoString(errno);
+    EXPECT_EQ(len, sizeof(actual));
+    EXPECT_EQ(actual, 425984);
+}
+
 TEST(SocketGetsockoptSemantics, UnixStreamLingerAllowsShortBuffers) {
     FdGuard fd(socket(AF_UNIX, SOCK_STREAM, 0));
     ASSERT_GE(fd.Get(), 0) << "socket(AF_UNIX, SOCK_STREAM) failed: " << ErrnoString(errno);

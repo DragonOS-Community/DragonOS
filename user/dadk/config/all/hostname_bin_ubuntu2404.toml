@@ -21,7 +21,7 @@ type = "install-from-prebuilt"
 # "install_from_prebuilt" 可选值："local", "archive"
 source = "archive"
 # 路径或URL
-source-path = "https://dragonos-mirrors.yacloud.com.cn/pub/third_party/gnu/hostname/hostname-ubuntu2404-202508242357-7f0f1ee8f863d34a0f81641071311bf2.tar.xz"
+source-path = "https://mirrors.dragonos.org.cn/pub/third_party/gnu/hostname/hostname-ubuntu2404-202508242357-7f0f1ee8f863d34a0f81641071311bf2.tar.xz"
 archive-rootdir = "sysroot/"
 
 [build]

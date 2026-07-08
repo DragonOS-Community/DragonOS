@@ -21,7 +21,7 @@ type = "build-from-source"
 # "install_from_prebuilt" 可选值："local", "archive"
 source = "archive"
 # 路径或URL
-source-path = "https://dragonos-mirrors.yacloud.com.cn/pub/third_party/musl/musl-1.2.4.tar.gz"
+source-path = "https://mirrors.dragonos.org.cn/pub/third_party/musl/musl-1.2.4.tar.gz"
 # 把压缩包中的哪个目录作为根目录（可选）,仅当 source = "archive" 时生效
 archive-rootdir = "musl-1.2.4"
 

@@ -14,7 +14,7 @@ strip := $(prefix)strip
 
 # 下载源码
 $(dropbear_tarball_path):
-	wget https://dragonos-mirrors.yacloud.com.cn/pub/third_party/dropbear/$(dropbear_tarball)
+	wget https://mirrors.dragonos.org.cn/pub/third_party/dropbear/$(dropbear_tarball)
 # 解压源码包
 $(dropbear_dir): $(dropbear_tarball_path)
 	mkdir -p $(build_dir)

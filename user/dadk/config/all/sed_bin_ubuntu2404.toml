@@ -21,7 +21,7 @@ type = "install-from-prebuilt"
 # "install_from_prebuilt" 可选值："local", "archive"
 source = "archive"
 # 路径或URL
-source-path = "https://dragonos-mirrors.yacloud.com.cn/pub/third_party/gnu/sed/sed-ubuntu2404-202507281635-1499ec1a44d2f0d6b787543d8d73637d.tar.xz"
+source-path = "https://mirrors.dragonos.org.cn/pub/third_party/gnu/sed/sed-ubuntu2404-202507281635-1499ec1a44d2f0d6b787543d8d73637d.tar.xz"
 archive-rootdir = "sysroot/"
 
 [build]

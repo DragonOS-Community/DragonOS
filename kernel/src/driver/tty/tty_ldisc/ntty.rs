@@ -1,6 +1,5 @@
 use alloc::{boxed::Box, vec::Vec};
-use core::intrinsics::likely;
-use core::ops::BitXor;
+use core::{intrinsics::likely, ops::BitXor};
 
 use bitmap::{static_bitmap, traits::BitMapOps, StaticBitmap};
 
@@ -11,7 +10,7 @@ use crate::{
     arch::ipc::signal::Signal,
     driver::tty::{
         pty::unix98pty::{
-            pty_discard_pending_to, pty_drain_pending_to, pty_request_discard_pending_to,
+            pty_drain_pending_to, pty_flush_input_buffer, pty_receive_flush_input_buffer,
         },
         termios::{ControlCharIndex, InputMode, LocalMode, OutputMode, Termios},
         tty_core::{
@@ -21,7 +20,10 @@ use crate::{
         tty_driver::{TtyDriverFlag, TtyDriverSubType, TtyOperation},
         tty_job_control::TtyJobCtrlManager,
     },
-    filesystem::{epoll::EPollEventType, vfs::file::FileFlags},
+    filesystem::{
+        epoll::{event_poll::EventPoll, EPollEventType},
+        vfs::file::FileFlags,
+    },
     libs::{
         rwlock::RwLockReadGuard,
         spinlock::{SpinLock, SpinLockGuard},
@@ -29,6 +31,7 @@ use crate::{
     mm::VirtAddr,
     process::ProcessManager,
     syscall::user_access::UserBufferWriter,
+    time::Duration,
 };
 
 use super::TtyLineDiscipline;
@@ -39,6 +42,11 @@ pub const ECHO_DISCARD_WATERMARK: usize = NTTY_BUFSIZE - (ECHO_BLOCK + 32);
 
 fn ntty_buf_mask(idx: usize) -> usize {
     return idx & (NTTY_BUFSIZE - 1);
+}
+
+fn wake_tty_readers(tty: &Arc<TtyCore>, events: EPollEventType) {
+    tty.core().read_wq().wakeup_any(events.bits() as u64);
+    let _ = EventPoll::wakeup_epoll(tty.core().epitems(), events);
 }
 
 fn is_ascii_control(c: u8) -> bool {
@@ -56,6 +64,7 @@ pub struct NTtyLinediscipline {
     pub(crate) output_lock: TtySleepLock,
 }
 
+#[derive(Debug, Clone)]
 struct EchoStep {
     bytes: Vec<u8>,
     tail: usize,
@@ -63,11 +72,25 @@ struct EchoStep {
     canon_cursor_column: u32,
 }
 
+#[derive(Debug)]
+struct EchoPendingStep {
+    bytes: Vec<u8>,
+    offset: usize,
+    step: EchoStep,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpostCharResult {
     Emitted,
     ConsumedWithoutOutput,
     NeedsMoreRoom,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NTtyReadWait {
+    NoWait,
+    Forever,
+    Timeout(Duration),
 }
 
 impl NTtyLinediscipline {
@@ -93,9 +116,41 @@ impl NTtyLinediscipline {
         }
     }
 
-    fn drain_echoes(&self, tty: Arc<TtyCore>) -> Result<(), SystemError> {
+    fn drain_opost_pending(&self, tty: &TtyCore) -> Result<bool, SystemError> {
         let core = tty.core();
         loop {
+            let pending = self.disc_data().opost_pending_bytes().to_vec();
+            if pending.is_empty() {
+                return Ok(true);
+            }
+
+            let written = tty.write(core, &pending, pending.len())?;
+            if written == 0 {
+                core.flags_write().insert(TtyFlag::DO_WRITE_WAKEUP);
+                return Ok(false);
+            }
+
+            self.disc_data().advance_opost_pending(written);
+            tty.flush_chars(core);
+        }
+    }
+
+    fn drain_echoes(&self, tty: &TtyCore) -> Result<(), SystemError> {
+        let core = tty.core();
+        loop {
+            while let Some(bytes) = { self.disc_data().echo_pending_bytes() } {
+                let written = tty.write(core, &bytes, bytes.len())?;
+                if written == 0 {
+                    core.flags_write().insert(TtyFlag::DO_WRITE_WAKEUP);
+                    return Ok(());
+                }
+                {
+                    let mut guard = self.disc_data();
+                    guard.advance_echo_pending(written);
+                }
+                tty.flush_chars(core);
+            }
+
             let termios = *core.termios();
             let space = tty.write_room(core);
             let step = {
@@ -112,14 +167,12 @@ impl NTtyLinediscipline {
                 while sent < step.bytes.len() {
                     let written = tty.write(core, &step.bytes[sent..], step.bytes.len() - sent)?;
                     if written == 0 {
-                        if sent == 0 {
-                            return Ok(());
+                        if sent != 0 {
+                            let mut guard = self.disc_data();
+                            guard.set_echo_pending_step(step, sent);
                         }
-                        let _ = core.write_wq().wait_event_interruptible(
-                            EPollEventType::EPOLLOUT.bits() as u64,
-                            || tty.write_room(core) > 0,
-                        );
-                        continue;
+                        core.flags_write().insert(TtyFlag::DO_WRITE_WAKEUP);
+                        return Ok(());
                     }
                     sent += written;
                 }
@@ -130,7 +183,35 @@ impl NTtyLinediscipline {
             guard.apply_echo_step(step);
         }
 
+        if self.disc_data().has_output_wakeup_pending() {
+            core.flags_write().insert(TtyFlag::DO_WRITE_WAKEUP);
+        } else {
+            core.flags_write().remove(TtyFlag::DO_WRITE_WAKEUP);
+        }
         Ok(())
+    }
+
+    fn packet_status_pending(core: &TtyCoreData, packet: bool) -> bool {
+        if !packet {
+            return false;
+        }
+        let Some(link) = core.link() else {
+            return false;
+        };
+        let pending = !link.core().contorl_info_irqsave().pktstatus.is_empty();
+        pending
+    }
+
+    fn check_pty_unthrottle_after_read(tty: &Arc<TtyCore>) {
+        let _ = pty_drain_pending_to(tty.clone());
+        match tty.core().driver().tty_driver_sub_type() {
+            TtyDriverSubType::PtyMaster | TtyDriverSubType::PtySlave => {
+                if let Some(peer) = tty.core().link() {
+                    peer.tty_wakeup();
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -183,6 +264,7 @@ pub struct NTtyData {
     /// OPOST 处理后尚未被底层 driver 接收的输出字节。
     opost_pending: Vec<u8>,
     opost_pending_offset: usize,
+    echo_pending_step: Option<EchoPendingStep>,
     /// 回显缓冲区的尾指针
     echo_tail: usize,
 
@@ -220,6 +302,7 @@ impl NTtyData {
             canon_cursor_column: 0,
             opost_pending: Vec::with_capacity(NTTY_BUFSIZE),
             opost_pending_offset: 0,
+            echo_pending_step: None,
             echo_tail: 0,
             read_buf: vec![0; NTTY_BUFSIZE].into_boxed_slice().try_into().unwrap(),
             echo_buf: vec![0; NTTY_BUFSIZE].into_boxed_slice().try_into().unwrap(),
@@ -244,6 +327,52 @@ impl NTtyData {
             self.opost_pending.clear();
             self.opost_pending_offset = 0;
         }
+    }
+
+    fn echo_pending_bytes(&self) -> Option<Vec<u8>> {
+        let pending = self.echo_pending_step.as_ref()?;
+        if pending.offset >= pending.bytes.len() {
+            None
+        } else {
+            Some(pending.bytes[pending.offset..].to_vec())
+        }
+    }
+
+    fn advance_echo_pending(&mut self, count: usize) {
+        let Some(pending) = self.echo_pending_step.as_mut() else {
+            return;
+        };
+        pending.offset += count;
+        if pending.offset >= pending.bytes.len() {
+            let pending = self.echo_pending_step.take().unwrap();
+            self.apply_echo_step(pending.step);
+        }
+    }
+
+    fn set_echo_pending_step(&mut self, step: EchoStep, offset: usize) {
+        self.echo_pending_step = Some(EchoPendingStep {
+            bytes: step.bytes.clone(),
+            offset,
+            step,
+        });
+    }
+
+    fn has_echo_output_pending(&self) -> bool {
+        self.echo_pending_step.is_some()
+            || ntty_buf_mask(self.echo_commit) != ntty_buf_mask(self.echo_tail)
+    }
+
+    fn discard_output_state(&mut self) {
+        self.opost_pending.clear();
+        self.opost_pending_offset = 0;
+        self.echo_pending_step = None;
+        self.echo_tail = self.echo_head;
+        self.echo_mark = self.echo_head;
+        self.echo_commit = self.echo_head;
+    }
+
+    fn has_output_wakeup_pending(&self) -> bool {
+        !self.opost_pending_bytes().is_empty() || self.has_echo_output_pending()
     }
 
     fn opost_char_space(&self, termios: &Termios, c: u8) -> usize {
@@ -374,7 +503,15 @@ impl NTtyData {
             }
 
             if count > look_ahead {
-                self.receive_buf_standard(tty.clone(), buf, flags, count - look_ahead, false);
+                let remaining = &buf[look_ahead..];
+                let remaining_flags = flags.map(|f| &f[look_ahead..]);
+                self.receive_buf_standard(
+                    tty.clone(),
+                    remaining,
+                    remaining_flags,
+                    count - look_ahead,
+                    false,
+                );
             }
 
             // 刷新echo
@@ -392,9 +529,7 @@ impl NTtyData {
         self.commit_head = self.read_head;
 
         if self.read_cnt() > 0 {
-            tty.core()
-                .read_wq()
-                .wakeup_any((EPollEventType::EPOLLIN | EPollEventType::EPOLLRDBAND).bits() as u64);
+            wake_tty_readers(&tty, EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM);
         }
     }
 
@@ -618,9 +753,7 @@ impl NTtyData {
                 self.read_buf[ntty_buf_mask(self.read_head)] = c;
                 self.read_head += 1;
                 self.canon_head = self.read_head;
-                tty.core().read_wq().wakeup_any(
-                    (EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM).bits() as u64,
-                );
+                wake_tty_readers(&tty, EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM);
                 return;
             }
 
@@ -631,9 +764,7 @@ impl NTtyData {
                 self.read_buf[ntty_buf_mask(self.read_head)] = c;
                 self.read_head += 1;
                 self.canon_head = self.read_head;
-                tty.core().read_wq().wakeup_any(
-                    (EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM).bits() as u64,
-                );
+                wake_tty_readers(&tty, EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM);
                 return;
             }
 
@@ -659,9 +790,7 @@ impl NTtyData {
                 self.read_buf[ntty_buf_mask(self.read_head)] = c;
                 self.read_head += 1;
                 self.canon_head = self.read_head;
-                tty.core().read_wq().wakeup_any(
-                    (EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM).bits() as u64,
-                );
+                wake_tty_readers(&tty, EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM);
                 return;
             }
         }
@@ -912,29 +1041,25 @@ impl NTtyData {
         }
 
         if !termios.local_mode.contains(LocalMode::NOFLSH) {
-            // 重置
-            self.echo_head = 0;
-            self.echo_tail = 0;
-            self.echo_mark = 0;
-            self.echo_commit = 0;
+            self.discard_output_state();
 
             let _ = tty.flush_buffer(tty.core());
 
-            self.read_head = 0;
-            self.canon_head = 0;
-            self.read_tail = 0;
-            self.line_start = 0;
+            let _ = pty_receive_flush_input_buffer(tty.clone(), || {
+                self.read_head = 0;
+                self.canon_head = 0;
+                self.read_tail = 0;
+                self.line_start = 0;
 
-            self.erasing = false;
-            self.read_flags.set_all(false);
-            self.pushing = false;
-            self.lookahead_count = 0;
+                self.erasing = false;
+                self.read_flags.set_all(false);
+                self.pushing = false;
+                self.lookahead_count = 0;
 
-            let _ = pty_request_discard_pending_to(tty.clone());
-
-            if tty.core().link().is_some() {
-                self.packet_mode_flush(tty.core());
-            }
+                if tty.core().link().is_some() {
+                    self.packet_mode_flush(tty.core());
+                }
+            });
         }
     }
 
@@ -1611,6 +1736,10 @@ impl NTtyData {
                 .insert(TtyPacketStatus::TIOCPKT_FLUSHREAD);
 
             link.core().read_wq().wakeup_all();
+            let _ = EventPoll::wakeup_epoll(
+                link.core().epitems(),
+                EPollEventType::EPOLLPRI | EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
+            );
         }
     }
 }
@@ -1631,25 +1760,24 @@ impl TtyLineDiscipline for NTtyLinediscipline {
     /// ## 重置缓冲区的基本信息
     fn flush_buffer(&self, tty: Arc<TtyCore>) -> Result<(), system_error::SystemError> {
         let core = tty.core();
-        let _ = core.termios();
-        let mut ldata = self.disc_data();
-        ldata.read_head = 0;
-        ldata.canon_head = 0;
-        ldata.read_tail = 0;
-        ldata.commit_head = 0;
-        ldata.line_start = 0;
-        ldata.erasing = false;
-        ldata.read_flags.set_all(false);
-        ldata.pushing = false;
-        ldata.lookahead_count = 0;
-        ldata.no_room = false;
+        pty_flush_input_buffer(tty.clone(), || {
+            let _ = core.termios();
+            let mut ldata = self.disc_data();
+            ldata.read_head = 0;
+            ldata.canon_head = 0;
+            ldata.read_tail = 0;
+            ldata.commit_head = 0;
+            ldata.line_start = 0;
+            ldata.erasing = false;
+            ldata.read_flags.set_all(false);
+            ldata.pushing = false;
+            ldata.lookahead_count = 0;
+            ldata.no_room = false;
 
-        if core.link().is_some() {
-            ldata.packet_mode_flush(core);
-        }
-        drop(ldata);
-
-        let _ = pty_discard_pending_to(tty.clone());
+            if core.link().is_some() {
+                ldata.packet_mode_flush(core);
+            }
+        })?;
 
         core.read_wq().wakeup_all();
         core.write_wq().wakeup_all();
@@ -1661,10 +1789,17 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         Ok(())
     }
 
-    fn flush_output(&self, _tty: Arc<TtyCore>) -> Result<(), system_error::SystemError> {
+    fn flush_output(&self, tty: Arc<TtyCore>) -> Result<(), system_error::SystemError> {
+        let _output_guard = self.output_lock.lock();
         let mut ldata = self.disc_data();
-        ldata.opost_pending.clear();
-        ldata.opost_pending_offset = 0;
+        ldata.discard_output_state();
+
+        let ret = tty.core().driver().driver_funcs().flush_buffer(tty.core());
+        if ret != Err(SystemError::ENOSYS) {
+            ret?;
+        }
+        tty.core().flags_write().remove(TtyFlag::DO_WRITE_WAKEUP);
+        tty.core().write_wq().wakeup_all();
 
         Ok(())
     }
@@ -1716,7 +1851,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
             let read_tail_moved = tail != ldata.read_tail;
             drop(ldata);
             if read_tail_moved {
-                let _ = pty_drain_pending_to(tty.clone());
+                Self::check_pty_unthrottle_after_read(&tty);
             }
             return Ok(offset);
         }
@@ -1726,12 +1861,23 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         TtyJobCtrlManager::tty_check_change(tty.clone(), Signal::SIGTTIN)?;
 
         let mut minimum: usize = 0;
+        let mut current_wait = NTtyReadWait::Forever;
+        let mut inter_byte_timeout = None;
         if !ldata.icanon {
             let core = tty.core();
             let termios = core.termios();
-            minimum = termios.control_characters[ControlCharIndex::VMIN] as usize;
-            if minimum == 0 {
+            let vmin = termios.control_characters[ControlCharIndex::VMIN] as usize;
+            let vtime = termios.control_characters[ControlCharIndex::VTIME] as u64;
+            minimum = vmin;
+            if vmin == 0 {
                 minimum = 1;
+                current_wait = if vtime == 0 {
+                    NTtyReadWait::NoWait
+                } else {
+                    NTtyReadWait::Timeout(Duration::from_millis(vtime * 100))
+                };
+            } else if vtime != 0 {
+                inter_byte_timeout = Some(Duration::from_millis(vtime * 100));
             }
         }
 
@@ -1764,16 +1910,33 @@ impl TtyLineDiscipline for NTtyLinediscipline {
 
             let core = tty.core();
             if !ldata.input_available(core.termios(), false) {
-                if core.flags().contains(TtyFlag::OTHER_CLOSED) {
-                    if core.driver().tty_driver_sub_type() == TtyDriverSubType::PtyMaster {
-                        // Linux pty master read after the last slave close returns EIO.
-                        ret = Err(SystemError::EIO);
-                    }
-                    break;
+                drop(ldata);
+                let _ = pty_drain_pending_to(tty.clone());
+                ldata = self.disc_data();
+            }
+
+            if !ldata.input_available(core.termios(), false) {
+                if Self::packet_status_pending(core, packet) {
+                    drop(ldata);
+                    continue;
                 }
 
-                if core.flags().contains(TtyFlag::HUPPED) || core.flags().contains(TtyFlag::HUPPING)
                 {
+                    let flags = core.flags();
+                    if flags.contains(TtyFlag::OTHER_CLOSED) {
+                        if flags.contains(TtyFlag::HUPPED) || flags.contains(TtyFlag::HUPPING) {
+                            break;
+                        }
+                        ret = Err(SystemError::EIO);
+                        break;
+                    }
+
+                    if flags.contains(TtyFlag::HUPPED) || flags.contains(TtyFlag::HUPPING) {
+                        break;
+                    }
+                }
+
+                if matches!(current_wait, NTtyReadWait::NoWait) {
                     break;
                 }
 
@@ -1789,17 +1952,33 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                     break;
                 }
 
-                // 休眠一段时间
-                // 获取到termios读锁，避免termios被更改导致行为异常
-                // let termios = core.termios_preempt_enable();
-                // let helper = WakeUpHelper::new(ProcessManager::current_pcb());
-                // let wakeup_helper = Timer::new(helper, timeout);
-                // wakeup_helper.activate();
-                // drop(termios);
-                core.read_wq().sleep_unlock_spinlock(
-                    (EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM).bits() as u64,
-                    ldata,
-                );
+                drop(ldata);
+                let events = (EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM).bits() as u64;
+                let readiness = || {
+                    let ldata = self.disc_data();
+                    ldata.input_available(core.termios(), false)
+                        || Self::packet_status_pending(core, packet)
+                        || core.flags().contains(TtyFlag::OTHER_CLOSED)
+                        || core.flags().contains(TtyFlag::HUPPED)
+                        || core.flags().contains(TtyFlag::HUPPING)
+                        || core.flags().contains(TtyFlag::LDISC_CHANGING)
+                        || ProcessManager::current_pcb().has_pending_signal_fast()
+                };
+                let wait_result = match current_wait {
+                    NTtyReadWait::NoWait => Ok(()),
+                    NTtyReadWait::Forever => {
+                        core.read_wq().wait_event_interruptible(events, readiness)
+                    }
+                    NTtyReadWait::Timeout(timeout) => core
+                        .read_wq()
+                        .wait_event_interruptible_timeout(events, readiness, timeout),
+                };
+                if let Err(err) = wait_result {
+                    if err != SystemError::EAGAIN_OR_EWOULDBLOCK {
+                        ret = Err(err);
+                    }
+                    break;
+                }
                 continue;
             }
 
@@ -1829,12 +2008,17 @@ impl TtyLineDiscipline for NTtyLinediscipline {
             if offset >= minimum {
                 break;
             }
+            if let Some(timeout) = inter_byte_timeout {
+                if offset != 0 {
+                    current_wait = NTtyReadWait::Timeout(timeout);
+                }
+            }
         }
         let ldata = self.disc_data();
         let read_tail_moved = tail != ldata.read_tail;
         drop(ldata);
         if read_tail_moved {
-            let _ = pty_drain_pending_to(tty.clone());
+            Self::check_pty_unthrottle_after_read(&tty);
         }
 
         if offset > 0 {
@@ -1865,7 +2049,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         let mut output_guard = Some(self.output_lock.lock());
 
         self.disc_data().process_echoes(tty.clone());
-        self.drain_echoes(tty.clone())?;
+        self.drain_echoes(&tty)?;
 
         let mut offset = 0;
         loop {
@@ -1956,18 +2140,18 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                                         guard.canon_cursor_column = canon_cursor_column;
                                         break;
                                     } else {
-                                        let _ = core.write_wq().wait_event_interruptible(
-                                            EPollEventType::EPOLLOUT.bits() as u64,
-                                            || tty.write_room(core) > 0,
-                                        );
-                                        continue;
+                                        let mut guard = self.disc_data();
+                                        guard.opost_pending.clear();
+                                        guard.opost_pending.extend_from_slice(&out_buf[sent..]);
+                                        guard.opost_pending_offset = 0;
+                                        break;
                                     }
                                 }
                                 sent += written;
                                 tty.flush_chars(core);
                             }
 
-                            if sent == out_buf.len() {
+                            if sent != 0 {
                                 offset += 1;
                                 nr -= 1;
                                 made_progress = true;
@@ -2000,6 +2184,9 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                 || core.flags().contains(TtyFlag::LDISC_CHANGING)
             {
                 if offset != 0 {
+                    if self.disc_data().has_output_wakeup_pending() {
+                        core.flags_write().insert(TtyFlag::DO_WRITE_WAKEUP);
+                    }
                     break;
                 }
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
@@ -2040,6 +2227,10 @@ impl TtyLineDiscipline for NTtyLinediscipline {
             }
             output_guard = Some(self.output_lock.lock());
             termios = *core.termios();
+        }
+
+        if self.disc_data().has_output_wakeup_pending() {
+            core.flags_write().insert(TtyFlag::DO_WRITE_WAKEUP);
         }
 
         drop(output_guard);
@@ -2248,15 +2439,15 @@ impl TtyLineDiscipline for NTtyLinediscipline {
             // 原模式或real_raw
             ldata.raw = true;
 
-            ldata.real_raw = termios.input_mode.contains(InputMode::IGNBRK)
+            ldata.real_raw = (termios.input_mode.contains(InputMode::IGNBRK)
                 || (!termios.input_mode.contains(InputMode::BRKINT)
-                    && !termios.input_mode.contains(InputMode::PARMRK))
-                    && (termios.input_mode.contains(InputMode::IGNPAR)
-                        || !termios.input_mode.contains(InputMode::INPCK))
-                    && (core
-                        .driver()
-                        .flags()
-                        .contains(TtyDriverFlag::TTY_DRIVER_REAL_RAW));
+                    && !termios.input_mode.contains(InputMode::PARMRK)))
+                && (termios.input_mode.contains(InputMode::IGNPAR)
+                    || !termios.input_mode.contains(InputMode::INPCK))
+                && (core
+                    .driver()
+                    .flags()
+                    .contains(TtyDriverFlag::TTY_DRIVER_REAL_RAW));
         }
 
         // if !termios.input_mode.contains(InputMode::IXON)
@@ -2271,11 +2462,18 @@ impl TtyLineDiscipline for NTtyLinediscipline {
 
     fn poll(&self, tty: Arc<TtyCore>) -> Result<usize, system_error::SystemError> {
         let core = tty.core();
-        let ldata = self.disc_data();
+        let mut ldata = self.disc_data();
 
         let mut event = EPollEventType::empty();
         if ldata.input_available(core.termios(), true) {
             event.insert(EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM)
+        } else {
+            drop(ldata);
+            let _ = pty_drain_pending_to(tty.clone());
+            ldata = self.disc_data();
+            if ldata.input_available(core.termios(), true) {
+                event.insert(EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM)
+            }
         }
 
         if core.contorl_info_irqsave().packet {
@@ -2310,6 +2508,34 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         Ok(event.bits() as usize)
     }
 
+    fn write_wakeup(&self, tty: &TtyCore) -> Result<(), SystemError> {
+        if let Some(_output_guard) = self.output_lock.try_lock() {
+            if self.drain_opost_pending(tty)? {
+                self.drain_echoes(tty)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn receive_room(&self, tty: Arc<TtyCore>) -> usize {
+        let termios = tty.core().termios();
+        let ldata = self.disc_data();
+        let tail = ldata.read_tail;
+        let mut room = NTTY_BUFSIZE as isize - (ldata.read_head - tail) as isize;
+
+        if termios.input_mode.contains(InputMode::PARMRK) {
+            room = if room > 0 { (room + 2) / 3 } else { room };
+        }
+
+        room -= 1;
+        if room <= 0 {
+            let overflow = ldata.icanon && ldata.canon_head == tail;
+            room = if overflow { 1 } else { 0 };
+        }
+
+        room as usize
+    }
+
     fn hangup(&self, tty: Arc<TtyCore>) -> Result<(), system_error::SystemError> {
         self.flush_buffer(tty.clone())?;
         self.flush_output(tty.clone())?;
@@ -2333,7 +2559,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         let ret = ldata.receive_buf_common(tty.clone(), buf, flags, count, false);
         drop(ldata);
         if let Some(_output_guard) = self.output_lock.try_lock() {
-            self.drain_echoes(tty)?;
+            self.drain_echoes(&tty)?;
         }
         ret
     }
@@ -2349,7 +2575,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         let ret = ldata.receive_buf_common(tty.clone(), buf, flags, count, true);
         drop(ldata);
         if let Some(_output_guard) = self.output_lock.try_lock() {
-            self.drain_echoes(tty)?;
+            self.drain_echoes(&tty)?;
         }
         ret
     }

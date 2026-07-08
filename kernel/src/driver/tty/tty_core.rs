@@ -12,7 +12,10 @@ use system_error::SystemError;
 use crate::{
     arch::ipc::signal::Signal,
     driver::base::device::device_number::DeviceNumber,
-    filesystem::epoll::{event_poll::LockedEPItemLinkedList, EPollEventType, EPollItem},
+    filesystem::epoll::{
+        event_poll::{EventPoll, LockedEPItemLinkedList},
+        EPollEventType, EPollItem,
+    },
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
@@ -229,12 +232,55 @@ impl TtyCore {
 
     pub fn tty_wakeup(&self) {
         if self.core.flags().contains(TtyFlag::DO_WRITE_WAKEUP) {
-            let _ = self.ldisc().write_wakeup(self.core());
+            let _ = self.ldisc().write_wakeup(self);
         }
 
-        self.core()
-            .write_wq
-            .wakeup_any(EPollEventType::EPOLLOUT.bits() as u64);
+        let events = EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM;
+        self.core().write_wq.wakeup_any(events.bits() as u64);
+        let _ = EventPoll::wakeup_epoll(self.core().epitems(), events);
+    }
+
+    pub fn tty_vhangup(tty: Arc<TtyCore>) {
+        {
+            let mut flags = tty.core().flags_write();
+            if flags.contains(TtyFlag::HUPPED) {
+                return;
+            }
+            flags.insert(TtyFlag::HUPPING);
+        }
+
+        let (sid, pgid) = {
+            let ctrl = tty.core().contorl_info_irqsave();
+            (ctrl.session.clone(), ctrl.pgid.clone())
+        };
+
+        if let Some(pgrp) = pgid {
+            let _ = crate::ipc::kill::send_signal_to_pgid(&pgrp, Signal::SIGHUP);
+            let _ = crate::ipc::kill::send_signal_to_pgid(&pgrp, Signal::SIGCONT);
+        }
+
+        let _ = tty.ldisc().hangup(tty.clone());
+
+        {
+            let mut ctrl = tty.core().contorl_info_irqsave();
+            ctrl.session = None;
+            ctrl.pgid = None;
+            ctrl.pktstatus = TtyPacketStatus::empty();
+        }
+        if let Some(sid) = sid {
+            TtyJobCtrlManager::session_clear_tty(sid);
+        }
+
+        {
+            let mut flags = tty.core().flags_write();
+            flags.remove(TtyFlag::DO_WRITE_WAKEUP);
+            flags.remove(TtyFlag::HUPPING);
+            flags.insert(TtyFlag::HUPPED);
+        }
+
+        tty.core().read_wq().wakeup_all();
+        tty.core().write_wq().wakeup_all();
+        let _ = EventPoll::wakeup_epoll(tty.core().epitems(), EPollEventType::EPOLLHUP);
     }
 
     pub fn tty_mode_ioctl(tty: Arc<TtyCore>, cmd: u32, arg: usize) -> Result<usize, SystemError> {
@@ -297,19 +343,9 @@ impl TtyCore {
             TtyFlushArg::TCIOFLUSH => {
                 tty.ldisc().flush_buffer(tty.clone())?;
                 tty.ldisc().flush_output(tty.clone())?;
-                let ret = tty.core().driver().driver_funcs().flush_buffer(tty.core());
-                if ret != Err(SystemError::ENOSYS) {
-                    ret?;
-                }
-                tty.core().write_wq().wakeup_all();
             }
             TtyFlushArg::TCOFLUSH => {
                 tty.ldisc().flush_output(tty.clone())?;
-                let ret = tty.core().driver().driver_funcs().flush_buffer(tty.core());
-                if ret != Err(SystemError::ENOSYS) {
-                    ret?;
-                }
-                tty.core().write_wq().wakeup_all();
             }
             _ => {
                 return Err(SystemError::EINVAL);

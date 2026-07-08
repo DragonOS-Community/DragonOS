@@ -7,7 +7,7 @@ use crate::filesystem::vfs::file::FileFlags;
 
 use super::{
     termios::Termios,
-    tty_core::{TtyCore, TtyCoreData, TtyFlag},
+    tty_core::{TtyCore, TtyFlag},
 };
 
 pub mod ntty;
@@ -16,7 +16,12 @@ pub trait TtyLineDiscipline: Sync + Send + Debug {
     fn open(&self, tty: Arc<TtyCore>) -> Result<(), SystemError>;
     fn close(&self, tty: Arc<TtyCore>) -> Result<(), SystemError>;
     fn flush_buffer(&self, tty: Arc<TtyCore>) -> Result<(), SystemError>;
-    fn flush_output(&self, _tty: Arc<TtyCore>) -> Result<(), SystemError> {
+    fn flush_output(&self, tty: Arc<TtyCore>) -> Result<(), SystemError> {
+        let ret = tty.core().driver().driver_funcs().flush_buffer(tty.core());
+        if ret != Err(SystemError::ENOSYS) {
+            ret?;
+        }
+        tty.core().write_wq().wakeup_all();
         Ok(())
     }
 
@@ -54,6 +59,10 @@ pub trait TtyLineDiscipline: Sync + Send + Debug {
     fn poll(&self, tty: Arc<TtyCore>) -> Result<usize, SystemError>;
     fn hangup(&self, tty: Arc<TtyCore>) -> Result<(), SystemError>;
 
+    fn receive_room(&self, _tty: Arc<TtyCore>) -> usize {
+        usize::MAX
+    }
+
     /// ## 接收数据
     fn receive_buf(
         &self,
@@ -73,7 +82,7 @@ pub trait TtyLineDiscipline: Sync + Send + Debug {
     ) -> Result<usize, SystemError>;
 
     /// ## 唤醒线路写者
-    fn write_wakeup(&self, _tty: &TtyCoreData) -> Result<(), SystemError> {
+    fn write_wakeup(&self, _tty: &TtyCore) -> Result<(), SystemError> {
         Err(SystemError::ENOSYS)
     }
 }

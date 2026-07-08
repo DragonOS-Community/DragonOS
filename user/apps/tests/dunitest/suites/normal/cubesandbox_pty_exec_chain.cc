@@ -8,6 +8,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <termios.h>
@@ -19,6 +20,12 @@
 #include <string>
 
 namespace {
+
+#ifndef TIOCPKT
+constexpr int kTiocpkt = 0x5420;
+#else
+constexpr int kTiocpkt = TIOCPKT;
+#endif
 
 class UniqueFd {
 public:
@@ -93,6 +100,25 @@ void SetRawByteMode(int fd) {
         << "tcsetattr failed: errno=" << errno << " (" << strerror(errno) << ")";
 }
 
+void SetNoncanonicalMode(int fd, cc_t vmin, cc_t vtime) {
+    struct termios term = {};
+    ASSERT_EQ(0, tcgetattr(fd, &term))
+        << "tcgetattr failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    term.c_lflag &= static_cast<tcflag_t>(~ICANON);
+    term.c_cc[VMIN] = vmin;
+    term.c_cc[VTIME] = vtime;
+
+    ASSERT_EQ(0, tcsetattr(fd, TCSANOW, &term))
+        << "tcsetattr failed: errno=" << errno << " (" << strerror(errno) << ")";
+}
+
+void EnablePacketMode(int master_fd) {
+    int on = 1;
+    ASSERT_EQ(0, ioctl(master_fd, kTiocpkt, &on))
+        << "ioctl(TIOCPKT) failed: errno=" << errno << " (" << strerror(errno) << ")";
+}
+
 bool WriteAll(int fd, const char* data, size_t len) {
     size_t written = 0;
     while (written < len) {
@@ -107,6 +133,10 @@ bool WriteAll(int fd, const char* data, size_t len) {
         return false;
     }
     return true;
+}
+
+bool WriteReport(int fd, const std::string& report) {
+    return WriteAll(fd, report.data(), report.size());
 }
 
 bool SetNonblockNoAssert(int fd) {
@@ -131,8 +161,10 @@ bool WaitForChild(pid_t child, int* status, int rounds = 300) {
     return false;
 }
 
-bool WriteReport(int report_fd, const std::string& report) {
-    return WriteAll(report_fd, report.c_str(), report.size());
+long MonotonicMillis() {
+    struct timespec ts = {};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<long>(ts.tv_sec) * 1000 + ts.tv_nsec / (1000 * 1000);
 }
 
 bool DrainAvailableReport(int report_fd, std::string* report) {
@@ -160,6 +192,109 @@ void KillAndReap(pid_t child) {
     kill(child, SIGKILL);
     waitpid(child, nullptr, 0);
 }
+
+class ChildReaper {
+public:
+    explicit ChildReaper(pid_t child) : child_(child) {}
+    ChildReaper(const ChildReaper&) = delete;
+    ChildReaper& operator=(const ChildReaper&) = delete;
+    ~ChildReaper() { Cleanup(); }
+
+    void Disarm() { child_ = -1; }
+
+    void Cleanup() {
+        if (child_ > 0) {
+            KillAndReap(child_);
+            child_ = -1;
+        }
+    }
+
+private:
+    pid_t child_ = -1;
+};
+
+class ShimCleanup {
+public:
+    ShimCleanup(pid_t child, UniqueFd* stdin_write, UniqueFd* pty_master,
+                std::atomic<int>* child_exited = nullptr)
+        : child_(child),
+          stdin_write_(stdin_write),
+          pty_master_(pty_master),
+          child_exited_(child_exited) {}
+
+    ShimCleanup(const ShimCleanup&) = delete;
+    ShimCleanup& operator=(const ShimCleanup&) = delete;
+    ~ShimCleanup() { Cleanup(); }
+
+    void SetStdinThread(pthread_t thread) {
+        stdin_thread_ = thread;
+        stdin_started_ = true;
+    }
+
+    void SetStdoutThread(pthread_t thread) {
+        stdout_thread_ = thread;
+        stdout_started_ = true;
+    }
+
+    void JoinStdin(void** result) {
+        if (stdin_started_) {
+            EXPECT_EQ(0, pthread_join(stdin_thread_, result)) << strerror(errno);
+            stdin_started_ = false;
+        }
+    }
+
+    void JoinStdout(void** result) {
+        if (stdout_started_) {
+            EXPECT_EQ(0, pthread_join(stdout_thread_, result)) << strerror(errno);
+            stdout_started_ = false;
+        }
+    }
+
+    void ChildReaped() { child_ = -1; }
+
+    void Disarm() { active_ = false; }
+
+    void Cleanup() {
+        if (!active_) {
+            return;
+        }
+        active_ = false;
+
+        if (stdin_write_ != nullptr) {
+            stdin_write_->reset();
+        }
+        if (child_ > 0) {
+            KillAndReap(child_);
+            child_ = -1;
+        }
+        if (child_exited_ != nullptr) {
+            child_exited_->store(1, std::memory_order_release);
+        }
+        if (pty_master_ != nullptr) {
+            pty_master_->reset();
+        }
+
+        if (stdin_started_) {
+            pthread_join(stdin_thread_, nullptr);
+            stdin_started_ = false;
+        }
+        if (stdout_started_) {
+            pthread_join(stdout_thread_, nullptr);
+            stdout_started_ = false;
+        }
+    }
+
+private:
+    bool active_ = true;
+    pid_t child_ = -1;
+    UniqueFd* stdin_write_ = nullptr;
+    UniqueFd* pty_master_ = nullptr;
+    std::atomic<int>* child_exited_ = nullptr;
+    pthread_t stdin_thread_ = {};
+    bool stdin_started_ = false;
+    pthread_t stdout_thread_ = {};
+    bool stdout_started_ = false;
+};
 
 bool ReadUntilContains(int fd, const std::string& needle, std::string* output, int timeout_ms) {
     const size_t search_from = 0;
@@ -275,6 +410,136 @@ bool ReadUntilContainsFrom(int fd, const std::string& needle, std::string* outpu
 
         usleep(10 * 1000);
         elapsed_ms += 10;
+    }
+    return false;
+}
+
+size_t FindShellPromptFrom(const std::string& output, size_t search_from) {
+    size_t hash_prompt = output.find("# ", search_from);
+    size_t dollar_prompt = output.find("$ ", search_from);
+    if (hash_prompt == std::string::npos) {
+        return dollar_prompt;
+    }
+    if (dollar_prompt == std::string::npos) {
+        return hash_prompt;
+    }
+    return hash_prompt < dollar_prompt ? hash_prompt : dollar_prompt;
+}
+
+bool ReadUntilShellPromptFrom(int fd, std::string* output, size_t search_from, int timeout_ms) {
+    if (FindShellPromptFrom(*output, search_from) != std::string::npos) {
+        return true;
+    }
+
+    int elapsed_ms = 0;
+    while (elapsed_ms < timeout_ms) {
+        struct pollfd pfd = {
+            .fd = fd,
+            .events = POLLIN | POLLERR | POLLHUP,
+            .revents = 0,
+        };
+        sigset_t mask;
+        sigemptyset(&mask);
+        struct timespec ts = {
+            .tv_sec = 0,
+            .tv_nsec = 10 * 1000 * 1000,
+        };
+        int ret = ppoll(&pfd, 1, &ts, &mask);
+        if (ret < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (ret == 0) {
+            elapsed_ms += 10;
+            continue;
+        }
+
+        if ((pfd.revents & POLLIN) != 0) {
+            char buf[256] = {};
+            ssize_t n = read(fd, buf, sizeof(buf));
+            if (n > 0) {
+                output->append(buf, static_cast<size_t>(n));
+                if (FindShellPromptFrom(*output, search_from) != std::string::npos) {
+                    return true;
+                }
+                continue;
+            }
+            if (n < 0 && errno == EINTR) {
+                continue;
+            }
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                continue;
+            }
+            return false;
+        }
+
+        if ((pfd.revents & (POLLERR | POLLHUP)) != 0) {
+            return FindShellPromptFrom(*output, search_from) != std::string::npos;
+        }
+    }
+    return false;
+}
+
+bool ReadUntilCommandOutputAndPrompt(int fd, const std::string& marker, std::string* output,
+                                     size_t search_from, int timeout_ms) {
+    auto has_marker_and_prompt = [&]() {
+        size_t marker_pos = output->find(marker, search_from);
+        return marker_pos != std::string::npos &&
+               FindShellPromptFrom(*output, marker_pos + marker.size()) != std::string::npos;
+    };
+    if (has_marker_and_prompt()) {
+        return true;
+    }
+
+    int elapsed_ms = 0;
+    while (elapsed_ms < timeout_ms) {
+        struct pollfd pfd = {
+            .fd = fd,
+            .events = POLLIN | POLLERR | POLLHUP,
+            .revents = 0,
+        };
+        sigset_t mask;
+        sigemptyset(&mask);
+        struct timespec ts = {
+            .tv_sec = 0,
+            .tv_nsec = 10 * 1000 * 1000,
+        };
+        int ret = ppoll(&pfd, 1, &ts, &mask);
+        if (ret < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (ret == 0) {
+            elapsed_ms += 10;
+            continue;
+        }
+
+        if ((pfd.revents & POLLIN) != 0) {
+            char buf[256] = {};
+            ssize_t n = read(fd, buf, sizeof(buf));
+            if (n > 0) {
+                output->append(buf, static_cast<size_t>(n));
+                if (has_marker_and_prompt()) {
+                    return true;
+                }
+                continue;
+            }
+            if (n < 0 && errno == EINTR) {
+                continue;
+            }
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                continue;
+            }
+            return false;
+        }
+
+        if ((pfd.revents & (POLLERR | POLLHUP)) != 0) {
+            return has_marker_and_prompt();
+        }
     }
     return false;
 }
@@ -475,6 +740,7 @@ void RunShellCommandSequence(void (*exec_shell)(int), const char* shell_name) {
         pair.master.reset();
         exec_shell(pair.slave.get());
     }
+    ChildReaper child_guard(child);
 
     pair.slave.reset();
 
@@ -499,8 +765,70 @@ void RunShellCommandSequence(void (*exec_shell)(int), const char* shell_name) {
     if (!WaitForChild(child, &status)) {
         kill(child, SIGKILL);
         waitpid(child, nullptr, 0);
+        child_guard.Disarm();
         FAIL() << shell_name << " did not exit after command sequence, captured: " << output;
     }
+    child_guard.Disarm();
+    ASSERT_TRUE(WIFEXITED(status) || WIFSIGNALED(status));
+}
+
+void RunPromptDrivenShellCommandSequence(void (*exec_shell)(int), const char* shell_name,
+                                         bool packet_mode = false) {
+    PtyPair pair = OpenPty();
+    ASSERT_GE(pair.master.get(), 0);
+    ASSERT_GE(pair.slave.get(), 0);
+    SetNonblock(pair.master.get());
+    if (packet_mode) {
+        EnablePacketMode(pair.master.get());
+    }
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        pair.master.reset();
+        exec_shell(pair.slave.get());
+    }
+    ChildReaper child_guard(child);
+
+    pair.slave.reset();
+
+    std::string output;
+    ASSERT_TRUE(ReadUntilShellPromptFrom(pair.master.get(), &output, 0, 3000))
+        << "did not observe initial prompt through " << shell_name << ", captured: " << output;
+
+    size_t before_first = output.size();
+    constexpr char kFirstCommand[] = "x=one; echo CUBE_${x}_OK\n";
+    ASSERT_TRUE(WriteAll(pair.master.get(), kFirstCommand, strlen(kFirstCommand)))
+        << "write first prompt-driven command failed through " << shell_name
+        << ": errno=" << errno << " (" << strerror(errno) << ")";
+    ASSERT_TRUE(ReadUntilCommandOutputAndPrompt(pair.master.get(), "CUBE_one_OK", &output,
+                                               before_first, 5000))
+        << "did not observe first command output and prompt through " << shell_name
+        << ", captured: " << output;
+
+    size_t before_second = output.size();
+    constexpr char kSecondCommand[] = "x=two; echo CUBE_${x}_OK\n";
+    ASSERT_TRUE(WriteAll(pair.master.get(), kSecondCommand, strlen(kSecondCommand)))
+        << "write second prompt-driven command failed through " << shell_name
+        << ": errno=" << errno << " (" << strerror(errno) << ")";
+    ASSERT_TRUE(ReadUntilCommandOutputAndPrompt(pair.master.get(), "CUBE_two_OK", &output,
+                                               before_second, 5000))
+        << "did not observe second command output and prompt through " << shell_name
+        << ", captured: " << output;
+
+    ASSERT_TRUE(WriteAll(pair.master.get(), "exit\n", strlen("exit\n")))
+        << "write exit failed through " << shell_name << ": errno=" << errno << " ("
+        << strerror(errno) << ")";
+
+    int status = 0;
+    if (!WaitForChild(child, &status)) {
+        kill(child, SIGKILL);
+        waitpid(child, nullptr, 0);
+        child_guard.Disarm();
+        FAIL() << shell_name << " did not exit after prompt-driven command sequence, captured: "
+               << output;
+    }
+    child_guard.Disarm();
     ASSERT_TRUE(WIFEXITED(status) || WIFSIGNALED(status));
 }
 
@@ -516,6 +844,7 @@ void RunRepeatedShellCommandSequence(void (*exec_shell)(int), const char* shell_
         pair.master.reset();
         exec_shell(pair.slave.get());
     }
+    ChildReaper child_guard(child);
 
     pair.slave.reset();
 
@@ -547,9 +876,11 @@ void RunRepeatedShellCommandSequence(void (*exec_shell)(int), const char* shell_
     if (!WaitForChild(child, &status)) {
         kill(child, SIGKILL);
         waitpid(child, nullptr, 0);
+        child_guard.Disarm();
         FAIL() << shell_name << " did not exit after repeated command sequence, captured: "
                << output;
     }
+    child_guard.Disarm();
     ASSERT_TRUE(WIFEXITED(status) || WIFSIGNALED(status));
 }
 
@@ -721,6 +1052,82 @@ void* ForwardPtyOutputToClient(void* arg) {
     return nullptr;
 }
 
+void* ForwardPtyOutputToClientWithEpollEt(void* arg) {
+    auto* forwarder = reinterpret_cast<MockShimStdoutForwarder*>(arg);
+    forwarder->stages->fetch_or(kConcurrentStdoutForwardStarted, std::memory_order_release);
+
+    int epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd < 0) {
+        close(forwarder->client_stdout_fd);
+        return reinterpret_cast<void*>(1);
+    }
+    UniqueFd epoll_fd(epfd);
+
+    struct epoll_event event = {};
+    event.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLET;
+    event.data.fd = forwarder->pty_master_fd;
+    if (epoll_ctl(epoll_fd.get(), EPOLL_CTL_ADD, forwarder->pty_master_fd, &event) != 0) {
+        close(forwarder->client_stdout_fd);
+        return reinterpret_cast<void*>(2);
+    }
+
+    int idle_after_child_exit = 0;
+    std::array<char, 256> buf = {};
+    for (;;) {
+        struct epoll_event ready = {};
+        int ret = epoll_wait(epoll_fd.get(), &ready, 1, 10);
+        if (ret < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            close(forwarder->client_stdout_fd);
+            return reinterpret_cast<void*>(3);
+        }
+
+        if (ret == 0) {
+            if (forwarder->child_exited->load(std::memory_order_acquire) != 0 &&
+                ++idle_after_child_exit >= 5) {
+                break;
+            }
+            continue;
+        }
+        idle_after_child_exit = 0;
+
+        if ((ready.events & EPOLLIN) != 0) {
+            for (;;) {
+                ssize_t n = read(forwarder->pty_master_fd, buf.data(), buf.size());
+                if (n > 0) {
+                    if (!WriteAll(forwarder->client_stdout_fd, buf.data(),
+                                  static_cast<size_t>(n))) {
+                        close(forwarder->client_stdout_fd);
+                        return reinterpret_cast<void*>(4);
+                    }
+                    continue;
+                }
+                if (n == 0 || (n < 0 && errno == EIO)) {
+                    break;
+                }
+                if (n < 0 && errno == EINTR) {
+                    continue;
+                }
+                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    break;
+                }
+                close(forwarder->client_stdout_fd);
+                return reinterpret_cast<void*>(5);
+            }
+        }
+
+        if ((ready.events & (EPOLLERR | EPOLLHUP)) != 0) {
+            break;
+        }
+    }
+
+    forwarder->stages->fetch_or(kConcurrentStdoutForwardFinished, std::memory_order_release);
+    close(forwarder->client_stdout_fd);
+    return nullptr;
+}
+
 void RunCubeShimLikeExecChain(void (*exec_shell)(int), const char* shell_name) {
     // Model the interactive Cube exec path at the kernel ABI boundary:
     // client stdin pipe -> shim forwarder thread -> PTY master -> shell on the
@@ -754,10 +1161,12 @@ void RunCubeShimLikeExecChain(void (*exec_shell)(int), const char* shell_name) {
         .pty_master_fd = pair.master.get(),
         .stages = &stages,
     };
+    ShimCleanup cleanup(child, &client_stdin_write, &pair.master);
 
     pthread_t stdin_thread = {};
-    ASSERT_EQ(0, pthread_create(&stdin_thread, nullptr, ForwardClientInputToPty, &forwarder))
-        << strerror(errno);
+    int thread_rc = pthread_create(&stdin_thread, nullptr, ForwardClientInputToPty, &forwarder);
+    ASSERT_EQ(0, thread_rc) << strerror(errno);
+    cleanup.SetStdinThread(stdin_thread);
 
     ASSERT_TRUE(WaitUntilAtomic(stages, kShimStdinForwardStarted, 1000))
         << "stdin forwarder did not start for " << shell_name;
@@ -820,17 +1229,17 @@ void RunCubeShimLikeExecChain(void (*exec_shell)(int), const char* shell_name) {
     }
 
     void* thread_result = nullptr;
-    ASSERT_EQ(0, pthread_join(stdin_thread, &thread_result)) << strerror(errno);
+    cleanup.JoinStdin(&thread_result);
     EXPECT_EQ(nullptr, thread_result) << "stdin forwarder failed for " << shell_name;
 
     int status = 0;
     if (!WaitForChild(child, &status)) {
         int observed = stages.load(std::memory_order_acquire);
-        kill(child, SIGKILL);
-        waitpid(child, nullptr, 0);
+        cleanup.Cleanup();
         FAIL() << "mock shim child did not exit for " << shell_name << ", stages=0x" << std::hex
                << observed << " (" << DescribeShimStages(observed) << "), captured: " << output;
     }
+    cleanup.ChildReaped();
     stages.fetch_or(kShimChildExited, std::memory_order_release);
 
     constexpr int kExpectedStages = kShimChildForked | kShimStdinForwardStarted |
@@ -841,6 +1250,7 @@ void RunCubeShimLikeExecChain(void (*exec_shell)(int), const char* shell_name) {
         << "mock shim chain did not reach all stages for " << shell_name
         << ", stages=0x" << std::hex << observed << " (" << DescribeShimStages(observed) << ")"
         << ", captured output: " << output;
+    cleanup.Disarm();
     ASSERT_TRUE(WIFEXITED(status) || WIFSIGNALED(status));
 }
 
@@ -889,15 +1299,17 @@ void RunCubeShimLikeConcurrentForwarders(void (*exec_shell)(int), const char* sh
         .stages = &stages,
         .child_exited = &child_exited,
     };
+    ShimCleanup cleanup(child, &client_stdin_write, &pair.master, &child_exited);
 
     pthread_t stdin_thread = {};
-    ASSERT_EQ(0, pthread_create(&stdin_thread, nullptr, ForwardClientInputToPty, &stdin_forwarder))
-        << strerror(errno);
+    int stdin_rc = pthread_create(&stdin_thread, nullptr, ForwardClientInputToPty, &stdin_forwarder);
+    ASSERT_EQ(0, stdin_rc) << strerror(errno);
+    cleanup.SetStdinThread(stdin_thread);
 
     pthread_t stdout_thread = {};
-    ASSERT_EQ(0,
-              pthread_create(&stdout_thread, nullptr, ForwardPtyOutputToClient, &stdout_forwarder))
-        << strerror(errno);
+    int stdout_rc = pthread_create(&stdout_thread, nullptr, ForwardPtyOutputToClient, &stdout_forwarder);
+    ASSERT_EQ(0, stdout_rc) << strerror(errno);
+    cleanup.SetStdoutThread(stdout_thread);
 
     ASSERT_TRUE(WaitUntilAtomic(stages, kShimStdinForwardStarted, 1000))
         << "stdin forwarder did not start for " << shell_name;
@@ -935,25 +1347,23 @@ void RunCubeShimLikeConcurrentForwarders(void (*exec_shell)(int), const char* sh
     stages.fetch_or(kConcurrentSawEndMarker, std::memory_order_release);
 
     void* stdin_result = nullptr;
-    ASSERT_EQ(0, pthread_join(stdin_thread, &stdin_result)) << strerror(errno);
+    cleanup.JoinStdin(&stdin_result);
     EXPECT_EQ(nullptr, stdin_result) << "stdin forwarder failed for " << shell_name;
 
     int status = 0;
     if (!WaitForChild(child, &status)) {
         int observed = stages.load(std::memory_order_acquire);
-        kill(child, SIGKILL);
-        waitpid(child, nullptr, 0);
-        child_exited.store(1, std::memory_order_release);
-        pthread_join(stdout_thread, nullptr);
+        cleanup.Cleanup();
         FAIL() << "child did not exit for " << shell_name << ", stages=0x" << std::hex
                << observed << " (" << DescribeConcurrentStages(observed)
                << "), captured: " << output;
     }
+    cleanup.ChildReaped();
     stages.fetch_or(kConcurrentChildExited, std::memory_order_release);
     child_exited.store(1, std::memory_order_release);
 
     void* stdout_result = nullptr;
-    ASSERT_EQ(0, pthread_join(stdout_thread, &stdout_result)) << strerror(errno);
+    cleanup.JoinStdout(&stdout_result);
     EXPECT_EQ(nullptr, stdout_result) << "stdout forwarder failed for " << shell_name;
 
     constexpr int kExpectedStages =
@@ -967,6 +1377,7 @@ void RunCubeShimLikeConcurrentForwarders(void (*exec_shell)(int), const char* sh
         << ", stages=0x" << std::hex << observed << " ("
         << DescribeConcurrentStages(observed) << ")"
         << ", captured output: " << output;
+    cleanup.Disarm();
     ASSERT_TRUE(WIFEXITED(status) || WIFSIGNALED(status));
 }
 
@@ -1015,15 +1426,17 @@ void RunCubeShimLikeByteStreamInput(void (*exec_shell)(int), const char* shell_n
         .stages = &stages,
         .child_exited = &child_exited,
     };
+    ShimCleanup cleanup(child, &client_stdin_write, &pair.master, &child_exited);
 
     pthread_t stdin_thread = {};
-    ASSERT_EQ(0, pthread_create(&stdin_thread, nullptr, ForwardClientInputToPty, &stdin_forwarder))
-        << strerror(errno);
+    int stdin_rc = pthread_create(&stdin_thread, nullptr, ForwardClientInputToPty, &stdin_forwarder);
+    ASSERT_EQ(0, stdin_rc) << strerror(errno);
+    cleanup.SetStdinThread(stdin_thread);
 
     pthread_t stdout_thread = {};
-    ASSERT_EQ(0,
-              pthread_create(&stdout_thread, nullptr, ForwardPtyOutputToClient, &stdout_forwarder))
-        << strerror(errno);
+    int stdout_rc = pthread_create(&stdout_thread, nullptr, ForwardPtyOutputToClient, &stdout_forwarder);
+    ASSERT_EQ(0, stdout_rc) << strerror(errno);
+    cleanup.SetStdoutThread(stdout_thread);
 
     ASSERT_TRUE(WaitUntilAtomic(stages, kShimStdinForwardStarted, 1000))
         << "stdin forwarder did not start for " << shell_name;
@@ -1053,25 +1466,140 @@ void RunCubeShimLikeByteStreamInput(void (*exec_shell)(int), const char* shell_n
         << ", captured: " << output;
 
     void* stdin_result = nullptr;
-    ASSERT_EQ(0, pthread_join(stdin_thread, &stdin_result)) << strerror(errno);
+    cleanup.JoinStdin(&stdin_result);
     EXPECT_EQ(nullptr, stdin_result) << "stdin forwarder failed for " << shell_name;
 
     int status = 0;
     if (!WaitForChild(child, &status)) {
         int observed = stages.load(std::memory_order_acquire);
-        kill(child, SIGKILL);
-        waitpid(child, nullptr, 0);
-        child_exited.store(1, std::memory_order_release);
-        pthread_join(stdout_thread, nullptr);
+        cleanup.Cleanup();
         FAIL() << "byte-stream child did not exit for " << shell_name << ", stages=0x"
                << std::hex << observed << " (" << DescribeConcurrentStages(observed)
                << "), captured: " << output;
     }
+    cleanup.ChildReaped();
     child_exited.store(1, std::memory_order_release);
 
     void* stdout_result = nullptr;
-    ASSERT_EQ(0, pthread_join(stdout_thread, &stdout_result)) << strerror(errno);
+    cleanup.JoinStdout(&stdout_result);
     EXPECT_EQ(nullptr, stdout_result) << "stdout forwarder failed for " << shell_name;
+    cleanup.Disarm();
+    ASSERT_TRUE(WIFEXITED(status) || WIFSIGNALED(status));
+}
+
+void RunCubeShimLikePromptDrivenEpollEt(void (*exec_shell)(int), const char* shell_name) {
+    PtyPair pair = OpenPty();
+    ASSERT_GE(pair.master.get(), 0);
+    ASSERT_GE(pair.slave.get(), 0);
+    SetNonblock(pair.master.get());
+
+    int client_stdin[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(client_stdin)) << strerror(errno);
+    UniqueFd client_stdin_read(client_stdin[0]);
+    UniqueFd client_stdin_write(client_stdin[1]);
+
+    int client_stdout[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(client_stdout)) << strerror(errno);
+    UniqueFd client_stdout_read(client_stdout[0]);
+    int client_stdout_write = client_stdout[1];
+    SetNonblock(client_stdout_read.get());
+
+    std::atomic<int> stages{0};
+    std::atomic<int> child_exited{0};
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        client_stdin_read.reset();
+        client_stdin_write.reset();
+        client_stdout_read.reset();
+        close(client_stdout_write);
+        pair.master.reset();
+        exec_shell(pair.slave.get());
+    }
+
+    stages.fetch_or(kConcurrentChildForked, std::memory_order_release);
+    pair.slave.reset();
+
+    MockShimForwarder stdin_forwarder = {
+        .source_fd = client_stdin_read.get(),
+        .pty_master_fd = pair.master.get(),
+        .stages = &stages,
+    };
+    MockShimStdoutForwarder stdout_forwarder = {
+        .pty_master_fd = pair.master.get(),
+        .client_stdout_fd = client_stdout_write,
+        .stages = &stages,
+        .child_exited = &child_exited,
+    };
+    ShimCleanup cleanup(child, &client_stdin_write, &pair.master, &child_exited);
+
+    pthread_t stdin_thread = {};
+    int stdin_rc = pthread_create(&stdin_thread, nullptr, ForwardClientInputToPty, &stdin_forwarder);
+    ASSERT_EQ(0, stdin_rc) << strerror(errno);
+    cleanup.SetStdinThread(stdin_thread);
+
+    pthread_t stdout_thread = {};
+    int stdout_rc =
+        pthread_create(&stdout_thread, nullptr, ForwardPtyOutputToClientWithEpollEt,
+                       &stdout_forwarder);
+    ASSERT_EQ(0, stdout_rc) << strerror(errno);
+    cleanup.SetStdoutThread(stdout_thread);
+
+    ASSERT_TRUE(WaitUntilAtomic(stages, kShimStdinForwardStarted, 1000))
+        << "stdin forwarder did not start for " << shell_name;
+    ASSERT_TRUE(WaitUntilAtomic(stages, kConcurrentStdoutForwardStarted, 1000))
+        << "epoll stdout forwarder did not start for " << shell_name;
+
+    std::string output;
+    ASSERT_TRUE(ReadUntilShellPromptFrom(client_stdout_read.get(), &output, 0, 5000))
+        << "initial prompt not captured for " << shell_name << ", captured: " << output;
+
+    size_t after_initial_prompt = output.size();
+    ASSERT_TRUE(WriteAll(client_stdin_write.get(), "echo one\n", strlen("echo one\n")))
+        << "first prompt-driven write failed for " << shell_name << ": errno=" << errno << " ("
+        << strerror(errno) << ")";
+    ASSERT_TRUE(ReadUntilCommandOutputAndPrompt(client_stdout_read.get(), "one", &output,
+                                                after_initial_prompt, 5000))
+        << "first command did not reach shell through epoll forwarder for " << shell_name
+        << ", captured: " << output;
+    stages.fetch_or(kConcurrentSawStartMarker, std::memory_order_release);
+
+    size_t after_first_prompt = output.size();
+    ASSERT_TRUE(WriteAll(client_stdin_write.get(), "echo two\n", strlen("echo two\n")))
+        << "second prompt-driven write failed for " << shell_name << ": errno=" << errno << " ("
+        << strerror(errno) << ")";
+    ASSERT_TRUE(ReadUntilCommandOutputAndPrompt(client_stdout_read.get(), "two", &output,
+                                                after_first_prompt, 5000))
+        << "second command did not reach shell through epoll forwarder for " << shell_name
+        << ", captured: " << output;
+    stages.fetch_or(kConcurrentSawEndMarker, std::memory_order_release);
+
+    ASSERT_TRUE(WriteAll(client_stdin_write.get(), "exit\n", strlen("exit\n")))
+        << "exit write failed for " << shell_name << ": errno=" << errno << " (" << strerror(errno)
+        << ")";
+    client_stdin_write.reset();
+
+    void* stdin_result = nullptr;
+    cleanup.JoinStdin(&stdin_result);
+    EXPECT_EQ(nullptr, stdin_result) << "stdin forwarder failed for " << shell_name;
+
+    int status = 0;
+    if (!WaitForChild(child, &status)) {
+        int observed = stages.load(std::memory_order_acquire);
+        cleanup.Cleanup();
+        FAIL() << "prompt-driven epoll child did not exit for " << shell_name << ", stages=0x"
+               << std::hex << observed << " (" << DescribeConcurrentStages(observed)
+               << "), captured: " << output;
+    }
+    cleanup.ChildReaped();
+    stages.fetch_or(kConcurrentChildExited, std::memory_order_release);
+    child_exited.store(1, std::memory_order_release);
+
+    void* stdout_result = nullptr;
+    cleanup.JoinStdout(&stdout_result);
+    EXPECT_EQ(nullptr, stdout_result) << "epoll stdout forwarder failed for " << shell_name;
+    cleanup.Disarm();
     ASSERT_TRUE(WIFEXITED(status) || WIFSIGNALED(status));
 }
 
@@ -1214,8 +1742,8 @@ int RunPidNamespaceInteractiveShellAndReport(int report_fd) {
     close(master);
 
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        WriteReport(report_fd, "shell bad status: " + std::to_string(status) + " output: " +
-                                   output);
+        WriteReport(report_fd,
+                    "shell bad status: " + std::to_string(status) + " output: " + output);
         return 39;
     }
 
@@ -1258,6 +1786,7 @@ void ExpectVforkExecLsCompletesInChildPidNamespace() {
         }
         _exit(WEXITSTATUS(status));
     }
+    ChildReaper outer_guard(outer);
 
     report_write.reset();
 
@@ -1277,8 +1806,10 @@ void ExpectVforkExecLsCompletesInChildPidNamespace() {
 
     if (!exited) {
         KillAndReap(outer);
+        outer_guard.Disarm();
         FAIL() << "vfork+exec /bin/ls did not finish inside a child PID namespace";
     }
+    outer_guard.Disarm();
     ASSERT_TRUE(DrainAvailableReport(report_read.get(), &report)) << strerror(errno);
     ASSERT_TRUE(WIFEXITED(status)) << "outer status=" << status;
     if (WEXITSTATUS(status) == 77) {
@@ -1321,6 +1852,7 @@ void ExpectInteractiveShellCommandsCompleteInChildPidNamespace() {
         }
         _exit(WEXITSTATUS(status));
     }
+    ChildReaper outer_guard(outer);
 
     report_write.reset();
 
@@ -1341,10 +1873,12 @@ void ExpectInteractiveShellCommandsCompleteInChildPidNamespace() {
 
     if (!exited) {
         KillAndReap(outer);
+        outer_guard.Disarm();
         FAIL() << "interactive shell commands did not finish inside a child PID namespace, "
                   "captured report: "
                << report;
     }
+    outer_guard.Disarm();
     ASSERT_TRUE(DrainAvailableReport(report_read.get(), &report)) << strerror(errno);
     ASSERT_TRUE(WIFEXITED(status)) << "outer status=" << status << ", report: " << report;
     if (WEXITSTATUS(status) == 77) {
@@ -1366,6 +1900,7 @@ TEST(CubeSandboxPtyExecChain, BlockingPtyMasterReadDoesNotBlockConcurrentWrite) 
         pair.master.reset();
         ExecDefaultShellOnSlave(pair.slave.get());
     }
+    ChildReaper shell_guard(shell);
 
     pair.slave.reset();
 
@@ -1395,6 +1930,7 @@ TEST(CubeSandboxPtyExecChain, BlockingPtyMasterReadDoesNotBlockConcurrentWrite) 
             _exit(n == 0 ? 0 : 1);
         }
     }
+    ChildReaper reader_guard(reader);
 
     captured_write.reset();
 
@@ -1419,21 +1955,20 @@ TEST(CubeSandboxPtyExecChain, BlockingPtyMasterReadDoesNotBlockConcurrentWrite) 
 
     int shell_status = 0;
     if (!WaitForChild(shell, &shell_status)) {
-        kill(shell, SIGKILL);
-        waitpid(shell, nullptr, 0);
-        kill(reader, SIGKILL);
-        waitpid(reader, nullptr, 0);
+        shell_guard.Cleanup();
+        reader_guard.Cleanup();
         FAIL() << "shell did not exit after blocking-read test, captured: " << output;
     }
+    shell_guard.Disarm();
 
     pair.master.reset();
 
     int reader_status = 0;
     if (!WaitForChild(reader, &reader_status)) {
-        kill(reader, SIGKILL);
-        waitpid(reader, nullptr, 0);
+        reader_guard.Cleanup();
         FAIL() << "PTY master reader did not exit after shell close, captured: " << output;
     }
+    reader_guard.Disarm();
 
     ASSERT_TRUE(WIFEXITED(shell_status) || WIFSIGNALED(shell_status));
     ASSERT_TRUE(WIFEXITED(reader_status) || WIFSIGNALED(reader_status));
@@ -1618,8 +2153,169 @@ TEST(CubeSandboxPtyExecChain, RawPtyByteReadsSurviveSigmaskAndPpoll) {
     EXPECT_EQ(0, WEXITSTATUS(status));
 }
 
+TEST(CubeSandboxPtyExecChain, PtyMasterReadAfterLastSlaveCloseReturnsEio) {
+    PtyPair pair = OpenPty();
+    ASSERT_GE(pair.master.get(), 0);
+    ASSERT_GE(pair.slave.get(), 0);
+    SetNoncanonicalMode(pair.master.get(), 0, 0);
+
+    pair.slave.reset();
+
+    char ch = 0;
+    errno = 0;
+    EXPECT_EQ(-1, read(pair.master.get(), &ch, 1));
+    EXPECT_EQ(EIO, errno);
+}
+
+TEST(CubeSandboxPtyExecChain, NoncanonicalVtimeReadTimesOut) {
+    PtyPair pair = OpenPty();
+    ASSERT_GE(pair.master.get(), 0);
+    ASSERT_GE(pair.slave.get(), 0);
+    SetNoncanonicalMode(pair.slave.get(), 0, 1);
+
+    char ch = 0;
+    long start_ms = MonotonicMillis();
+    errno = 0;
+    ssize_t n = read(pair.slave.get(), &ch, 1);
+    long elapsed_ms = MonotonicMillis() - start_ms;
+
+    EXPECT_EQ(0, n) << "errno=" << errno << " (" << strerror(errno) << ")";
+    EXPECT_GE(elapsed_ms, 50);
+    EXPECT_LT(elapsed_ms, 1500);
+}
+
+TEST(CubeSandboxPtyExecChain, CanonicalPollWaitsForLineCommit) {
+    PtyPair pair = OpenPty();
+    ASSERT_GE(pair.master.get(), 0);
+    ASSERT_GE(pair.slave.get(), 0);
+    SetNonblock(pair.slave.get());
+
+    ASSERT_TRUE(WriteAll(pair.master.get(), "abc", 3));
+
+    struct pollfd pfd = {
+        .fd = pair.slave.get(),
+        .events = POLLIN | POLLERR | POLLHUP,
+        .revents = 0,
+    };
+    EXPECT_EQ(0, poll(&pfd, 1, 100)) << "unexpected revents=" << pfd.revents;
+
+    char buf[8] = {};
+    errno = 0;
+    EXPECT_EQ(-1, read(pair.slave.get(), buf, sizeof(buf)));
+    EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << strerror(errno);
+
+    ASSERT_TRUE(WriteAll(pair.master.get(), "\n", 1));
+    pfd.revents = 0;
+    ASSERT_EQ(1, poll(&pfd, 1, 1000));
+    ASSERT_NE(0, pfd.revents & POLLIN);
+    ssize_t n = read(pair.slave.get(), buf, sizeof(buf));
+    ASSERT_GT(n, 0) << strerror(errno);
+    EXPECT_NE(nullptr, memchr(buf, '\n', static_cast<size_t>(n)));
+}
+
+TEST(CubeSandboxPtyExecChain, PacketOnlyStatusWakesRead) {
+    PtyPair pair = OpenPty();
+    ASSERT_GE(pair.master.get(), 0);
+    ASSERT_GE(pair.slave.get(), 0);
+    EnablePacketMode(pair.master.get());
+
+    ASSERT_EQ(0, tcflush(pair.slave.get(), TCIFLUSH)) << strerror(errno);
+
+    struct pollfd pfd = {
+        .fd = pair.master.get(),
+        .events = POLLIN | POLLPRI | POLLERR | POLLHUP,
+        .revents = 0,
+    };
+    ASSERT_EQ(1, poll(&pfd, 1, 1000)) << strerror(errno);
+    ASSERT_NE(0, pfd.revents & (POLLIN | POLLPRI));
+
+    unsigned char status = 0;
+    ASSERT_EQ(1, read(pair.master.get(), &status, 1)) << strerror(errno);
+    EXPECT_NE(0, status);
+}
+
+TEST(CubeSandboxPtyExecChain, SignalFlushDropsPrefixAndKeepsSuffix) {
+    PtyPair pair = OpenPty();
+    ASSERT_GE(pair.master.get(), 0);
+    ASSERT_GE(pair.slave.get(), 0);
+
+    struct termios term = {};
+    ASSERT_EQ(0, tcgetattr(pair.slave.get(), &term)) << strerror(errno);
+    term.c_lflag |= ICANON | ISIG;
+    term.c_lflag &= static_cast<tcflag_t>(~ECHO);
+    ASSERT_EQ(0, tcsetattr(pair.slave.get(), TCSANOW, &term)) << strerror(errno);
+    SetNonblock(pair.slave.get());
+
+    const char input[] = {'o', 'l', 'd', '\003', 'a', 'f', 't', 'e', 'r', '\n'};
+    ASSERT_TRUE(WriteAll(pair.master.get(), input, sizeof(input)));
+
+    char buf[32] = {};
+    ASSERT_EQ(6, read(pair.slave.get(), buf, sizeof(buf))) << strerror(errno);
+    EXPECT_EQ(0, memcmp(buf, "after\n", 6));
+}
+
+TEST(CubeSandboxPtyExecChain, TciflushDropsOldInputAndAcceptsNewInput) {
+    PtyPair pair = OpenPty();
+    ASSERT_GE(pair.master.get(), 0);
+    ASSERT_GE(pair.slave.get(), 0);
+    SetRawByteMode(pair.slave.get());
+    SetNonblock(pair.slave.get());
+
+    ASSERT_TRUE(WriteAll(pair.master.get(), "old-data", strlen("old-data")));
+    ASSERT_EQ(0, tcflush(pair.slave.get(), TCIFLUSH)) << strerror(errno);
+
+    char buf[16] = {};
+    errno = 0;
+    EXPECT_EQ(-1, read(pair.slave.get(), buf, sizeof(buf)));
+    EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << strerror(errno);
+
+    ASSERT_TRUE(WriteAll(pair.master.get(), "N", 1));
+    ASSERT_EQ(1, read(pair.slave.get(), buf, 1)) << strerror(errno);
+    EXPECT_EQ('N', buf[0]);
+}
+
+TEST(CubeSandboxPtyExecChain, WriterPolloutAfterPeerDrainsInput) {
+    PtyPair pair = OpenPty();
+    ASSERT_GE(pair.master.get(), 0);
+    ASSERT_GE(pair.slave.get(), 0);
+    SetRawByteMode(pair.slave.get());
+    SetNonblock(pair.master.get());
+
+    std::array<char, 1024> chunk = {};
+    chunk.fill('x');
+    bool saturated = false;
+    for (int i = 0; i < 1024; ++i) {
+        ssize_t n = write(pair.master.get(), chunk.data(), chunk.size());
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            saturated = true;
+            break;
+        }
+        ASSERT_GT(n, 0) << strerror(errno);
+    }
+    ASSERT_TRUE(saturated) << "PTY master did not report a full output direction";
+
+    std::array<char, 4096> drain = {};
+    ASSERT_GT(read(pair.slave.get(), drain.data(), drain.size()), 0) << strerror(errno);
+
+    struct pollfd pfd = {
+        .fd = pair.master.get(),
+        .events = POLLOUT | POLLERR | POLLHUP,
+        .revents = 0,
+    };
+    ASSERT_EQ(1, poll(&pfd, 1, 1000)) << strerror(errno);
+    EXPECT_NE(0, pfd.revents & POLLOUT);
+}
+
 TEST(CubeSandboxPtyExecChain, ShellRunsLsThenUnameThroughControllingPty) {
     RunShellCommandSequence(ExecDefaultShellOnSlave, "default shell");
+}
+
+TEST(CubeSandboxPtyExecChain, ShellRunsPromptDrivenCommandsThroughControllingPty) {
+    RunPromptDrivenShellCommandSequence(ExecDefaultShellOnSlave, "default shell");
+}
+
+TEST(CubeSandboxPtyExecChain, ShellRunsPromptDrivenCommandsThroughPacketModePty) {
+    RunPromptDrivenShellCommandSequence(ExecDefaultShellOnSlave, "default shell packet mode", true);
 }
 
 TEST(CubeSandboxPtyExecChain, ShellRepeatedlyRunsLsThenUnameThroughControllingPty) {
@@ -1633,6 +2329,13 @@ TEST(CubeSandboxPtyExecChain, BusyBoxAshRunsLsThenUnameThroughControllingPty) {
     RunShellCommandSequence(ExecBusyBoxShellOnSlave, "busybox ash");
 }
 
+TEST(CubeSandboxPtyExecChain, BusyBoxAshRunsPromptDrivenCommandsThroughControllingPty) {
+    if (access("/bin/busybox", X_OK) != 0) {
+        GTEST_SKIP() << "/bin/busybox is not available on this host";
+    }
+    RunPromptDrivenShellCommandSequence(ExecBusyBoxShellOnSlave, "busybox ash");
+}
+
 TEST(CubeSandboxPtyExecChain, MockShimForwardsClientInputAndCollectsExecOutput) {
     RunCubeShimLikeExecChain(ExecDefaultShellOnSlave, "default shell");
 }
@@ -1643,6 +2346,17 @@ TEST(CubeSandboxPtyExecChain, MockShimConcurrentForwardersPublishExecProgress) {
 
 TEST(CubeSandboxPtyExecChain, MockShimByteStreamInputCommandsReachShell) {
     RunCubeShimLikeByteStreamInput(ExecDefaultShellOnSlave, "default shell");
+}
+
+TEST(CubeSandboxPtyExecChain, MockShimPromptDrivenEpollEtCommandsReachShell) {
+    RunCubeShimLikePromptDrivenEpollEt(ExecDefaultShellOnSlave, "default shell");
+}
+
+TEST(CubeSandboxPtyExecChain, BusyBoxAshPromptDrivenEpollEtCommandsReachShell) {
+    if (access("/bin/busybox", X_OK) != 0) {
+        GTEST_SKIP() << "/bin/busybox is not available on this host";
+    }
+    RunCubeShimLikePromptDrivenEpollEt(ExecBusyBoxShellOnSlave, "busybox ash");
 }
 
 }  // namespace

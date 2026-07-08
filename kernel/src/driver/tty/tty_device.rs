@@ -392,7 +392,6 @@ impl IndexNode for TtyDevice {
                     return Err(err);
                 }
             };
-
             if ret == 0 {
                 break;
             }

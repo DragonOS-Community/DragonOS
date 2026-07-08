@@ -2,7 +2,7 @@ sphinx==5.0.2
 myst-parser==0.18.0
 sphinx-rtd-theme
 sphinxcontrib-mermaid==1.0.0
-git+https://github.com/DragonOS-Community/sphinx-multiversion.git@5858b75#egg=sphinx-multiversion
+git+https://git.mirrors.dragonos.org.cn/DragonOS-Community/sphinx-multiversion.git@5858b75#egg=sphinx-multiversion
 openai~=1.79
 tqdm~=4.65.0
 linkify-it-py

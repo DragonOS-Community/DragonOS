@@ -123,12 +123,16 @@ impl Pid {
     /// 获取指定PID所属的命名空间
     ///
     /// 返回该PID被分配时所在的PID命名空间的引用(Arc封装)
-    pub fn ns_of_pid(&self) -> Arc<PidNamespace> {
+    pub fn try_ns_of_pid(&self) -> Option<Arc<PidNamespace>> {
         self.numbers
             .lock()
             .get(self.level as usize)
-            .map(|upid| upid.as_ref().unwrap().ns.clone())
-            .unwrap()
+            .and_then(|upid| upid.as_ref().map(|upid| upid.ns.clone()))
+    }
+
+    pub fn ns_of_pid(&self) -> Arc<PidNamespace> {
+        self.try_ns_of_pid()
+            .expect("ns_of_pid requires an attached pid")
     }
 
     pub fn first_upid(&self) -> Option<UPid> {

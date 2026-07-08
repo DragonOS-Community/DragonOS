@@ -307,20 +307,11 @@ impl Signal {
     /// @return SystemError 错误码
     fn send_signal(
         &self,
-        info: Option<&mut SigInfo>,
+        mut info: Option<&mut SigInfo>,
         pcb: Arc<ProcessControlBlock>,
         pt: PidType,
     ) -> Result<i32, SystemError> {
-        // 是否强制发送信号
-        let mut force_send = false;
-        // signal的信息为空
-
-        if let Some(ref siginfo) = info {
-            force_send = matches!(siginfo.sig_code(), SigCode::Kernel | SigCode::SysSeccomp);
-        }
-        if !force_send && signal_from_ancestor_pid_namespace(&pcb) {
-            force_send = true;
-        }
+        let force_send = should_force_send(info.as_deref_mut(), &pcb);
 
         let prepare_result = self.prepare_sianal(pcb.clone(), force_send);
         if !prepare_result {
@@ -493,9 +484,12 @@ impl Signal {
             return false;
         }
 
-        target
+        if !target
             .sighand()
-            .start_group_exit_for_fatal_signal(*self as usize);
+            .start_group_exit_for_fatal_signal(*self as usize)
+        {
+            return true;
+        }
 
         let tasks = ProcessManager::thread_group_tasks_snapshot(target);
         for task in tasks {
@@ -522,12 +516,7 @@ impl Signal {
             return false;
         }
 
-        if *self != Signal::SIGKILL
-            && target
-                .sig_info_irqsave()
-                .sig_blocked()
-                .contains((*self).into())
-        {
+        if *self != Signal::SIGKILL && target.blocks_signal_for_fatal_group_exit(*self) {
             return false;
         }
 
@@ -951,6 +940,12 @@ impl ProcessControlBlock {
          */
         return false;
     }
+
+    fn blocks_signal_for_fatal_group_exit(&self, sig: Signal) -> bool {
+        let sigset = sig.into_sigset();
+        let siginfo = self.sig_info_irqsave();
+        siginfo.sig_blocked().contains(sigset) || siginfo.real_blocked().contains(sigset)
+    }
 }
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/sched/signal.h?fi=restore_saved_sigmask#547
 pub fn restore_saved_sigmask() {
@@ -1069,13 +1064,33 @@ fn retarget_shared_pending(pcb: Arc<ProcessControlBlock>, which: SigSet) {
     // debug!("retarget_shared_pending done!");
 }
 
+fn should_force_send(info: Option<&mut SigInfo>, target: &Arc<ProcessControlBlock>) -> bool {
+    let Some(info) = info else {
+        return false;
+    };
+
+    if matches!(info.sig_code(), SigCode::Kernel | SigCode::SysSeccomp) {
+        return true;
+    }
+
+    if info.has_pid_and_uid() && signal_from_ancestor_pid_namespace(target) {
+        info.clear_sender_pid();
+        return true;
+    }
+
+    false
+}
+
 fn signal_from_ancestor_pid_namespace(target: &Arc<ProcessControlBlock>) -> bool {
     let current = ProcessManager::current_pcb();
     let Some(current_pid) = current.task_pid_ptr(PidType::PID) else {
         return false;
     };
+    let Some(target_ns) = target.try_active_pid_ns() else {
+        return true;
+    };
 
-    current_pid.pid_nr_ns(&target.active_pid_ns()).data() == 0
+    current_pid.pid_nr_ns(&target_ns).data() == 0
 }
 
 /// 设置当前进程的屏蔽信号 (sig_block)

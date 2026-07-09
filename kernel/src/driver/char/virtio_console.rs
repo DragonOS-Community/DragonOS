@@ -13,7 +13,7 @@ use crate::{
         },
         tty::{
             console::ConsoleSwitch,
-            kthread::{enqueue_tty_rx_to_vc_from_irq, tty_port_input_room},
+            kthread::{enqueue_tty_rx_to_target_from_irq, tty_input_target_room, TtyInputTarget},
             termios::{WindowSize, TTY_STD_TERMIOS},
             tty_core::{TtyCore, TtyCoreData},
             tty_driver::{TtyDriver, TtyDriverManager, TtyDriverType, TtyOperation},
@@ -385,7 +385,7 @@ impl VirtIOConsoleDevice {
                 device_common: DeviceCommonData::default(),
                 kobject_common: KObjectCommonData::default(),
                 irq,
-                input_vc_index: None,
+                input_target: None,
                 input_rx_paused: false,
                 output_tty: Weak::new(),
                 outbuf: Vec::with_capacity(VIRTIO_CONSOLE_OUTBUF_SIZE),
@@ -435,12 +435,12 @@ impl VirtIOConsoleDevice {
         let mut received = 0;
         while received < limit {
             let mut inner = self.inner();
-            let Some(vc_index) = inner.input_vc_index else {
+            let Some(target) = inner.input_target.clone() else {
                 inner.input_rx_paused = false;
                 break;
             };
 
-            if tty_port_input_room(vc_index) == 0 {
+            if tty_input_target_room(&target) == 0 {
                 inner.input_rx_paused = true;
                 break;
             }
@@ -457,7 +457,7 @@ impl VirtIOConsoleDevice {
                 }
             };
 
-            if enqueue_tty_rx_to_vc_from_irq(vc_index, &[c]) != 1 {
+            if enqueue_tty_rx_to_target_from_irq(&target, &[c]) != 1 {
                 inner.input_rx_paused = true;
                 break;
             }
@@ -492,7 +492,7 @@ struct InnerVirtIOConsoleDevice {
     device_common: DeviceCommonData,
     kobject_common: KObjectCommonData,
     irq: Option<IrqNumber>,
-    input_vc_index: Option<usize>,
+    input_target: Option<TtyInputTarget>,
     input_rx_paused: bool,
     output_tty: Weak<TtyCore>,
     outbuf: Vec<u8>,
@@ -508,7 +508,7 @@ impl Debug for InnerVirtIOConsoleDevice {
             .field("device_common", &self.device_common)
             .field("kobject_common", &self.kobject_common)
             .field("irq", &self.irq)
-            .field("input_vc_index", &self.input_vc_index)
+            .field("input_target", &self.input_target)
             .field("input_rx_paused", &self.input_rx_paused)
             .field("outbuf_len", &self.outbuf.len())
             .field("outbuf_size", &self.outbuf_size)
@@ -984,7 +984,7 @@ impl TtyOperation for VirtIOConsoleDriver {
         let dev = self.devices.read()[index].clone();
         if let Some(dev) = &dev {
             let mut inner = dev.inner();
-            inner.input_vc_index = None;
+            inner.input_target = None;
             inner.input_rx_paused = false;
         }
 
@@ -1051,12 +1051,12 @@ impl TtyOperation for VirtIOConsoleDriver {
             .inspect_err(|_| {
                 vc_manager().free(vc_index);
                 let mut inner = dev.inner();
-                inner.input_vc_index = None;
+                inner.input_target = None;
                 inner.output_tty = Weak::new();
             })?;
         {
             let mut inner = dev.inner();
-            inner.input_vc_index = Some(vc_index);
+            inner.input_target = Some(TtyInputTarget::new(vc_index, vc.port()));
             inner.input_rx_paused = false;
             inner.output_tty = Arc::downgrade(&tty);
         }

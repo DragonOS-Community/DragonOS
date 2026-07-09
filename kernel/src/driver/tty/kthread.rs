@@ -8,7 +8,7 @@ use crate::{
         serial::serial8250::retry_serial8250_input,
         tty::{
             tty_core::TtyCore,
-            tty_port::{TtyInputByteResult, TTY_PORT_RX_CHUNK_SIZE},
+            tty_port::{TtyInputByteResult, TtyPort, TTY_PORT_RX_CHUNK_SIZE},
             virtual_terminal::{vc_manager, MAX_NR_CONSOLES},
         },
     },
@@ -20,6 +20,18 @@ use crate::{
 
 const TTY_INPUT_WORK_QUEUE_SIZE: usize = MAX_NR_CONSOLES as usize;
 const TTY_INPUT_DRAIN_BUDGET: usize = 16;
+
+#[derive(Clone, Debug)]
+pub struct TtyInputTarget {
+    vc_index: usize,
+    port: Arc<dyn TtyPort>,
+}
+
+impl TtyInputTarget {
+    pub fn new(vc_index: usize, port: Arc<dyn TtyPort>) -> Self {
+        Self { vc_index, port }
+    }
+}
 
 struct TtyInputWorkQueue {
     queue: [usize; TTY_INPUT_WORK_QUEUE_SIZE],
@@ -162,32 +174,30 @@ pub fn enqueue_tty_rx_to_vc_from_irq(vc_index: usize, data: &[u8]) -> usize {
     let Some(vc) = vc_manager().get(vc_index) else {
         return 0;
     };
-    let accepted = vc.port().enqueue_input(data);
+    enqueue_tty_rx_to_target_from_irq(&TtyInputTarget::new(vc_index, vc.port()), data)
+}
+
+pub fn enqueue_tty_rx_to_target_from_irq(target: &TtyInputTarget, data: &[u8]) -> usize {
+    let accepted = target.port.enqueue_input(data);
     if accepted != 0 {
-        queue_tty_input_work_from_irq(vc_index);
+        queue_tty_input_work_from_irq(target.vc_index);
     }
     accepted
 }
 
-pub fn enqueue_tty_rx_byte_to_vc_from_irq(
-    vc_index: usize,
+pub fn enqueue_tty_rx_byte_to_target_from_irq(
+    target: &TtyInputTarget,
     producer: &mut dyn FnMut() -> Option<u8>,
 ) -> TtyInputByteResult {
-    let Some(vc) = vc_manager().get(vc_index) else {
-        return TtyInputByteResult::NoTarget;
-    };
-    let result = vc.port().enqueue_input_byte_with(producer);
+    let result = target.port.enqueue_input_byte_with(producer);
     if result == TtyInputByteResult::Enqueued {
-        queue_tty_input_work_from_irq(vc_index);
+        queue_tty_input_work_from_irq(target.vc_index);
     }
     result
 }
 
-pub fn tty_port_input_room(vc_index: usize) -> usize {
-    vc_manager()
-        .get(vc_index)
-        .map(|vc| vc.port().input_room())
-        .unwrap_or(0)
+pub fn tty_input_target_room(target: &TtyInputTarget) -> usize {
+    target.port.input_room()
 }
 
 pub fn retry_tty_input_producers() {

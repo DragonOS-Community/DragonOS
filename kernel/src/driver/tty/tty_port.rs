@@ -33,7 +33,6 @@ pub enum TtyInputByteResult {
     Enqueued,
     NoRoom,
     NoData,
-    NoTarget,
 }
 
 #[derive(Debug)]

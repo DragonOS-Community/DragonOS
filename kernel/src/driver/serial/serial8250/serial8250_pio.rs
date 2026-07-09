@@ -2,7 +2,7 @@
 
 use core::{
     hint::spin_loop,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use alloc::{
@@ -20,7 +20,7 @@ use crate::{
         serial::{AtomicBaudRate, BaudRate, DivisorFraction, UartPort},
         tty::{
             console::ConsoleSwitch,
-            kthread::enqueue_tty_rx_byte_to_vc_from_irq,
+            kthread::{enqueue_tty_rx_byte_to_target_from_irq, TtyInputTarget},
             termios::WindowSize,
             tty_core::{TtyCore, TtyCoreData},
             tty_driver::{TtyDriver, TtyDriverManager, TtyOperation},
@@ -47,7 +47,6 @@ static mut PIO_PORTS: [Option<Serial8250PIOPort>; 8] =
 
 const SERIAL_8250_PIO_IRQ: IrqNumber = IrqNumber::new(IoApic::VECTOR_BASE as u32 + 4);
 const SERIAL_8250_RX_IRQ_LIMIT: usize = 256;
-const SERIAL_8250_NO_VC_INDEX: usize = usize::MAX;
 
 lazy_static! {
     static ref SERIAL_8250_RX_RETRY_TASKLET: Arc<Tasklet> =
@@ -126,10 +125,20 @@ pub struct Serial8250PIOPort {
     iobase: Serial8250PortBase,
     baudrate: AtomicBaudRate,
     initialized: AtomicBool,
-    input_vc_index: AtomicUsize,
     rx_paused: AtomicBool,
-    rx_lock: SpinLock<()>,
+    rx_state: SpinLock<Serial8250RxState>,
     inner: RwSem<Serial8250PIOPortInner>,
+}
+
+#[derive(Debug)]
+struct Serial8250RxState {
+    input_target: Option<TtyInputTarget>,
+}
+
+impl Serial8250RxState {
+    const fn new() -> Self {
+        Self { input_target: None }
+    }
 }
 
 impl Serial8250PIOPort {
@@ -139,9 +148,8 @@ impl Serial8250PIOPort {
             iobase,
             baudrate: AtomicBaudRate::new(baudrate),
             initialized: AtomicBool::new(false),
-            input_vc_index: AtomicUsize::new(SERIAL_8250_NO_VC_INDEX),
             rx_paused: AtomicBool::new(false),
-            rx_lock: SpinLock::new(()),
+            rx_state: SpinLock::new(Serial8250RxState::new()),
             inner: RwSem::new(Serial8250PIOPortInner::new()),
         };
 
@@ -237,25 +245,13 @@ impl Serial8250PIOPort {
         return Some(self.serial_in(0) as u8);
     }
 
-    fn input_vc_index(&self) -> Option<usize> {
-        let vc_index = self.input_vc_index.load(Ordering::Acquire);
-        if vc_index == SERIAL_8250_NO_VC_INDEX {
-            None
-        } else {
-            Some(vc_index)
-        }
-    }
-
-    fn set_input_vc_index(&self, vc_index: Option<usize>) {
-        self.input_vc_index.store(
-            vc_index.unwrap_or(SERIAL_8250_NO_VC_INDEX),
-            Ordering::Release,
-        );
+    fn set_input_target(&self, target: Option<TtyInputTarget>) {
+        self.rx_state.lock_irqsave().input_target = target;
     }
 
     fn pump_rx(&self) -> Result<(), SystemError> {
-        let _rx_guard = self.rx_lock.lock_irqsave();
-        let Some(target_vc_index) = self.input_vc_index() else {
+        let rx_state = self.rx_state.lock_irqsave();
+        let Some(target) = rx_state.input_target.as_ref() else {
             self.rx_paused.store(false, Ordering::Release);
             return Ok(());
         };
@@ -265,7 +261,7 @@ impl Serial8250PIOPort {
         let mut received = 0;
         for _ in 0..SERIAL_8250_RX_IRQ_LIMIT {
             let mut producer = || self.read_one_byte();
-            match enqueue_tty_rx_byte_to_vc_from_irq(target_vc_index, &mut producer) {
+            match enqueue_tty_rx_byte_to_target_from_irq(target, &mut producer) {
                 TtyInputByteResult::Enqueued => {
                     received += 1;
                     self.rx_paused.store(false, Ordering::Release);
@@ -274,7 +270,7 @@ impl Serial8250PIOPort {
                     self.rx_paused.store(true, Ordering::Release);
                     break;
                 }
-                TtyInputByteResult::NoData | TtyInputByteResult::NoTarget => {
+                TtyInputByteResult::NoData => {
                     self.rx_paused.store(false, Ordering::Release);
                     break;
                 }
@@ -454,8 +450,7 @@ impl TtyOperation for Serial8250PIOTtyDriverInner {
         let tty_index = tty.core().index();
         if tty_index < unsafe { PIO_PORTS.len() } {
             if let Some(port) = unsafe { PIO_PORTS[tty_index].as_ref() } {
-                let _rx_guard = port.rx_lock.lock_irqsave();
-                port.set_input_vc_index(None);
+                port.set_input_target(None);
                 port.rx_paused.store(false, Ordering::Release);
             }
         }
@@ -492,10 +487,10 @@ impl TtyOperation for Serial8250PIOTtyDriverInner {
         let vc_index = vc_manager().alloc(vc.clone()).ok_or(SystemError::EBUSY)?;
         self.do_install(driver, tty, vc.clone()).inspect_err(|_| {
             vc_manager().free(vc_index);
-            port.set_input_vc_index(None);
+            port.set_input_target(None);
             port.rx_paused.store(false, Ordering::Release);
         })?;
-        port.set_input_vc_index(Some(vc_index));
+        port.set_input_target(Some(TtyInputTarget::new(vc_index, vc.port())));
         port.rx_paused.store(true, Ordering::Release);
         retry_serial8250_pio_input();
 

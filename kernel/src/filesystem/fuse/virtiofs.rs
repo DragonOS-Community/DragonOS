@@ -718,7 +718,7 @@ impl VirtioFsBridgeContext {
         conn: &FuseConn,
         events: u32,
     ) -> Option<stats::VirtioFsBridgeWaitExit> {
-        if !conn.is_connected() {
+        if !conn.is_connected() && !self.has_inflight() {
             return Some(stats::VirtioFsBridgeWaitExit::Disconnect);
         }
 
@@ -741,7 +741,7 @@ impl VirtioFsBridgeContext {
         }
 
         let disconnect_event = events & stats::VirtioFsBridgeWakeSource::Disconnect.bit() != 0;
-        if disconnect_event {
+        if disconnect_event && !self.has_inflight() {
             return Some(stats::VirtioFsBridgeWaitExit::Disconnect);
         }
 
@@ -870,7 +870,7 @@ impl VirtioFsBridgeContext {
             }
             stats::on_virtiofs_loop_iteration(progressed);
 
-            if !self.conn.is_connected() {
+            if !self.conn.is_connected() && !self.has_inflight() {
                 break;
             }
 

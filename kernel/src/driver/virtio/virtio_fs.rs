@@ -1,7 +1,7 @@
 use alloc::{
     collections::BTreeMap,
     string::{String, ToString},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 use core::ptr;
 
@@ -11,10 +11,16 @@ use virtio_drivers::transport::Transport;
 
 use crate::{
     driver::base::device::{Device, DeviceId},
+    exception::{irqdesc::IrqReturn, IrqNumber},
+    filesystem::fuse::{conn::FuseConn, stats},
     libs::{spinlock::SpinLock, wait_queue::WaitQueue},
 };
 
-use super::transport::VirtIOTransport;
+use super::{
+    irq::{virtio_irq_manager, VirtioIrqCallback},
+    transport::VirtIOTransport,
+    transport_pci::PciInterruptAck,
+};
 
 const VIRTIO_FS_TAG_LEN: usize = 36;
 const VIRTIO_FS_REQUEST_QUEUE_BASE: u16 = 1;
@@ -40,12 +46,19 @@ impl core::fmt::Debug for VirtioFsTransportHolder {
 unsafe impl Send for VirtioFsTransportHolder {}
 
 #[derive(Debug)]
+struct VirtioFsActiveBridge {
+    session_id: u64,
+    conn: Weak<FuseConn>,
+}
+
+#[derive(Debug)]
 struct VirtioFsInstanceState {
     transport: Option<VirtioFsTransportHolder>,
     session_active: bool,
     active_session_id: u64,
     released_session_id: u64,
     next_session_id: u64,
+    active_bridge: Option<VirtioFsActiveBridge>,
 }
 
 #[derive(Debug)]
@@ -53,6 +66,9 @@ pub struct VirtioFsInstance {
     tag: String,
     num_request_queues: u32,
     dev_id: Arc<DeviceId>,
+    irq_wake_enabled: bool,
+    irq_is_msix: bool,
+    irq_ack: Option<PciInterruptAck>,
     state: SpinLock<VirtioFsInstanceState>,
     session_wait: WaitQueue,
 }
@@ -63,17 +79,24 @@ impl VirtioFsInstance {
         num_request_queues: u32,
         dev_id: Arc<DeviceId>,
         transport: VirtIOTransport,
+        irq_wake_enabled: bool,
+        irq_is_msix: bool,
+        irq_ack: Option<PciInterruptAck>,
     ) -> Self {
         Self {
             tag,
             num_request_queues,
             dev_id,
+            irq_wake_enabled,
+            irq_is_msix,
+            irq_ack,
             state: SpinLock::new(VirtioFsInstanceState {
                 transport: Some(VirtioFsTransportHolder(transport)),
                 session_active: false,
                 active_session_id: 0,
                 released_session_id: 0,
                 next_session_id: 1,
+                active_bridge: None,
             }),
             session_wait: WaitQueue::default(),
         }
@@ -123,11 +146,56 @@ impl VirtioFsInstance {
         state.next_session_id = state.next_session_id.wrapping_add(1);
         state.active_session_id = session_id;
         state.session_active = true;
+        state.active_bridge = None;
         Ok((transport, session_id))
+    }
+
+    pub fn install_bridge_wake(&self, session_id: u64, conn: &Arc<FuseConn>) {
+        let mut state = self.state.lock_irqsave();
+        if state.session_active && state.active_session_id == session_id {
+            state.active_bridge = Some(VirtioFsActiveBridge {
+                session_id,
+                conn: Arc::downgrade(conn),
+            });
+        }
+    }
+
+    pub fn enable_irq_wake(self: &Arc<Self>) -> bool {
+        if !self.irq_wake_enabled {
+            return false;
+        }
+        match virtio_irq_manager().register_callback(self.dev_id.clone(), self.clone()) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(
+                    "virtio-fs: failed to register irq callback for tag='{}' dev={:?}: {:?}; use polling fallback",
+                    self.tag, self.dev_id, e
+                );
+                false
+            }
+        }
+    }
+
+    pub fn disable_irq_wake(&self) {
+        if self.irq_wake_enabled {
+            virtio_irq_manager().unregister_callback(&self.dev_id);
+        }
+    }
+
+    pub fn clear_bridge_wake(&self, session_id: u64) {
+        let mut state = self.state.lock_irqsave();
+        if state
+            .active_bridge
+            .as_ref()
+            .is_some_and(|bridge| bridge.session_id == session_id)
+        {
+            state.active_bridge = None;
+        }
     }
 
     pub fn put_transport_after_session(&self, transport: VirtIOTransport) {
         let mut state = self.state.lock_irqsave();
+        state.active_bridge = None;
         state.transport = Some(VirtioFsTransportHolder(transport));
         state.released_session_id = state.active_session_id;
         state.active_session_id = 0;
@@ -145,6 +213,57 @@ impl VirtioFsInstance {
                 None
             }
         });
+    }
+
+    fn wake_bridge_from_irq(&self) -> IrqReturn {
+        let mut owned_irq = self.irq_is_msix;
+        if let Some(irq_ack) = self.irq_ack.as_ref() {
+            let acked = irq_ack.ack_interrupt();
+            if !acked && !self.irq_is_msix {
+                return IrqReturn::NotHandled;
+            }
+            owned_irq = acked || self.irq_is_msix;
+        }
+
+        let (session_id, conn) = {
+            let state = self.state.lock_irqsave();
+            let Some(bridge) = state.active_bridge.as_ref() else {
+                stats::on_virtiofs_irq_no_active_conn();
+                return if owned_irq {
+                    IrqReturn::Handled
+                } else {
+                    IrqReturn::NotHandled
+                };
+            };
+            if !state.session_active || bridge.session_id != state.active_session_id {
+                stats::on_virtiofs_irq_stale_session();
+                return if owned_irq {
+                    IrqReturn::Handled
+                } else {
+                    IrqReturn::NotHandled
+                };
+            }
+            (bridge.session_id, bridge.conn.clone())
+        };
+
+        let Some(conn) = conn.upgrade() else {
+            stats::on_virtiofs_irq_weak_upgrade_failed();
+            self.clear_bridge_wake(session_id);
+            return if owned_irq {
+                IrqReturn::Handled
+            } else {
+                IrqReturn::NotHandled
+            };
+        };
+
+        conn.wake_bridge_irq_safe(stats::VirtioFsBridgeWakeSource::Completion);
+        IrqReturn::Handled
+    }
+}
+
+impl VirtioIrqCallback for VirtioFsInstance {
+    fn handle_irq(&self, _irq: IrqNumber) -> Result<IrqReturn, SystemError> {
+        Ok(self.wake_bridge_from_irq())
     }
 }
 
@@ -207,11 +326,48 @@ pub fn virtio_fs(
         }
     };
 
+    {
+        let map = VIRTIO_FS_INSTANCES.lock_irqsave();
+        if map.contains_key(&tag) {
+            warn!(
+                "virtio-fs: duplicated tag '{}' for device {:?}, ignore new device",
+                tag, dev_id
+            );
+            return;
+        }
+    }
+
+    let mut irq_wake_enabled = false;
+    let mut irq_is_msix = false;
+    let mut irq_ack = None;
+    if matches!(transport, VirtIOTransport::Pci(_)) {
+        if let Err(e) = transport.setup_irq(dev_id.clone()) {
+            warn!(
+                "virtio-fs: failed to setup irq for tag='{}' dev={:?}: {:?}; use polling fallback",
+                tag, dev_id, e
+            );
+        } else {
+            irq_wake_enabled = true;
+            irq_is_msix = transport.irq_is_msix();
+            if let VirtIOTransport::Pci(pci_transport) = &transport {
+                irq_ack = Some(pci_transport.interrupt_ack());
+            }
+        }
+    } else {
+        warn!(
+            "virtio-fs: tag='{}' dev={:?} has no event-driven IRQ wake path; use polling fallback",
+            tag, dev_id
+        );
+    }
+
     let instance = Arc::new(VirtioFsInstance::new(
         tag.clone(),
         nrqs,
         dev_id.clone(),
         transport,
+        irq_wake_enabled,
+        irq_is_msix,
+        irq_ack,
     ));
 
     let mut map = VIRTIO_FS_INSTANCES.lock_irqsave();

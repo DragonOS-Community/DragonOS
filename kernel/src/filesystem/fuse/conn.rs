@@ -1,5 +1,5 @@
 use alloc::{collections::BTreeMap, collections::VecDeque, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use num_traits::FromPrimitive;
 use system_error::SystemError;
@@ -55,6 +55,45 @@ where
             waitq.remove_waker(&waker);
             return Err(e);
         }
+    }
+}
+
+#[derive(Debug)]
+struct FuseBridgeWake {
+    events: AtomicU32,
+    wait: WaitQueue,
+}
+
+impl FuseBridgeWake {
+    fn new() -> Self {
+        Self {
+            events: AtomicU32::new(0),
+            wait: WaitQueue::default(),
+        }
+    }
+
+    fn signal(&self, source: stats::VirtioFsBridgeWakeSource, trace_allowed: bool) {
+        self.events.fetch_or(source.bit(), Ordering::Release);
+        stats::on_virtiofs_bridge_wake(source);
+        if trace_allowed {
+            trace::trace_virtiofs_bridge_wake(source.trace_id());
+        }
+        self.wait.wakeup(None);
+    }
+
+    fn take_events(&self) -> u32 {
+        self.events.swap(0, Ordering::AcqRel)
+    }
+
+    fn events(&self) -> u32 {
+        self.events.load(Ordering::Acquire)
+    }
+
+    fn wait_until<F, R>(&self, mut cond: F) -> R
+    where
+        F: FnMut(u32) -> Option<R>,
+    {
+        self.wait.wait_until(|| cond(self.events()))
     }
 }
 
@@ -197,6 +236,7 @@ pub struct FuseConn {
     dev_count: AtomicUsize,
     read_wait: WaitQueue,
     init_wait: WaitQueue,
+    bridge_wake: FuseBridgeWake,
     epitems: LockedEPItemLinkedList,
 }
 
@@ -257,6 +297,7 @@ impl FuseConn {
             dev_count: AtomicUsize::new(1),
             read_wait: WaitQueue::default(),
             init_wait: WaitQueue::default(),
+            bridge_wake: FuseBridgeWake::new(),
             epitems: LockedEPItemLinkedList::default(),
         })
     }
@@ -272,6 +313,29 @@ impl FuseConn {
 
     pub fn has_pending_requests(&self) -> bool {
         !self.inner.lock().pending.is_empty()
+    }
+
+    pub fn bridge_wake_events(&self) -> u32 {
+        self.bridge_wake.events()
+    }
+
+    pub fn take_bridge_wake_events(&self) -> u32 {
+        self.bridge_wake.take_events()
+    }
+
+    pub fn wait_bridge_until<F, R>(&self, cond: F) -> R
+    where
+        F: FnMut(u32) -> Option<R>,
+    {
+        self.bridge_wake.wait_until(cond)
+    }
+
+    pub fn wake_bridge(&self, source: stats::VirtioFsBridgeWakeSource) {
+        self.bridge_wake.signal(source, true);
+    }
+
+    pub fn wake_bridge_irq_safe(&self, source: stats::VirtioFsBridgeWakeSource) {
+        self.bridge_wake.signal(source, false);
     }
 
     pub fn mark_mounted(&self) -> Result<(), SystemError> {
@@ -480,6 +544,7 @@ impl FuseConn {
             p.complete(Err(SystemError::ENOTCONN));
         }
         self.read_wait.wakeup(None);
+        self.wake_bridge(stats::VirtioFsBridgeWakeSource::Disconnect);
         self.init_wait.wakeup(None);
         let _ = EventPoll::wakeup_epoll(
             &self.epitems,
@@ -536,6 +601,7 @@ impl FuseConn {
             p.complete(Err(SystemError::ENOTCONN));
         }
         self.init_wait.wakeup(None);
+        self.wake_bridge(stats::VirtioFsBridgeWakeSource::Teardown);
 
         if !should_destroy {
             self.abort();
@@ -990,6 +1056,7 @@ impl FuseConn {
         stats::on_fuse_request_queued(req_len, no_reply);
         trace::trace_fuse_request_queue(unique, opcode, req_len as u64, no_reply as u8);
         self.read_wait.wakeup(None);
+        self.wake_bridge(stats::VirtioFsBridgeWakeSource::Request);
         let _ = EventPoll::wakeup_epoll(
             &self.epitems,
             EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
@@ -1130,9 +1197,10 @@ impl FuseConn {
             {
                 let mut g = self.inner.lock();
                 if g.connected {
-                    // 对齐 Linux：仅启用「daemon 支持 ∩ 本端请求」的特性位。
-                    // virtiofsd 常在 INIT 回复里带上 DO_READDIRPLUS 等位；若直接采纳，
-                    // 会走 READDIRPLUS + cache_child_from_entry，导致 inode 映射过期。
+                    // Align with Linux: only enable feature bits that are in the intersection of
+                    // daemon-supported and locally-requested flags. virtiofsd often sets
+                    // DO_READDIRPLUS etc. in the INIT reply; if adopted directly, it would
+                    // trigger READDIRPLUS + cache_child_from_entry, causing stale inode mappings.
                     let enabled_flags = negotiated_flags & g.init_flags;
                     g.initialized = true;
                     g.init = FuseInitNegotiated {

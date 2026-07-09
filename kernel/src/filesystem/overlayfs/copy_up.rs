@@ -3,9 +3,14 @@ use crate::filesystem::vfs::{
     self,
     file::{File, FileFlags, FilePrivateData},
     syscall::RenameFlags,
+    utils::should_remove_sgid,
     FileType, IndexNode, Metadata,
 };
 use crate::libs::mutex::Mutex;
+use crate::process::{
+    cred::{CAPFlags, Cred},
+    ProcessManager,
+};
 use alloc::string::String;
 use alloc::sync::Arc;
 use system_error::SystemError;
@@ -46,7 +51,8 @@ impl OvlInode {
 
         let lower_inode = self.lower_inodes.first().ok_or(SystemError::ENOENT)?;
 
-        let metadata = lower_inode.metadata()?;
+        let mut metadata = lower_inode.metadata()?;
+        Self::adjust_metadata_for_truncate_copy_up(&mut metadata, copy_size);
         if self.redirect.is_empty() {
             *upper_inode = Some(self.upper_root_inode()?);
             return Ok(());
@@ -169,6 +175,33 @@ impl OvlInode {
         }
 
         Ok(inode)
+    }
+
+    fn adjust_metadata_for_truncate_copy_up(metadata: &mut Metadata, copy_size: Option<usize>) {
+        if copy_size != Some(0) || metadata.file_type != FileType::File || metadata.size == 0 {
+            return;
+        }
+
+        Self::clear_suid_sgid_for_current_cred(metadata, &ProcessManager::current_pcb().cred());
+    }
+
+    fn clear_suid_sgid_for_current_cred(metadata: &mut Metadata, cred: &Arc<Cred>) {
+        if cred.has_capability(CAPFlags::CAP_FSETID) {
+            return;
+        }
+
+        if !metadata
+            .mode
+            .intersects(vfs::InodeMode::S_ISUID | vfs::InodeMode::S_ISGID)
+        {
+            return;
+        }
+
+        metadata.mode.remove(vfs::InodeMode::S_ISUID);
+
+        if should_remove_sgid(metadata.mode, metadata.gid, cred) {
+            metadata.mode.remove(vfs::InodeMode::S_ISGID);
+        }
     }
 
     fn create_copy_up_temp(

@@ -924,6 +924,56 @@ TEST(OverlayFsSemantics, CopyUpTruncatePublishesEmptyUpperFile) {
     EXPECT_EQ(0, overlay_temp_entry_count(env.work));
 }
 
+TEST(OverlayFsSemantics, CopyUpTruncateDropsPrivilegedBitsWithoutCapFsetid) {
+    if (geteuid() != 0) {
+        GTEST_SKIP() << "requires root to prepare setuid/setgid lower file";
+    }
+
+    ScopedOverlayEnv scoped("overlayfs_copy_up_truncate_mode");
+    const auto& env = scoped.env;
+    std::string lower_file = join_path(env.lower, "file");
+    std::string upper_file = join_path(env.upper, "file");
+    std::string merged_file = join_path(env.merged, "file");
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_EQ(0, write_text(lower_file, "truncate should clear privileged bits"));
+    ASSERT_EQ(0, chmod(lower_file.c_str(), 06777)) << strerror(errno);
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        if (setgid(1000) != 0) {
+            _exit(2);
+        }
+        if (setuid(1000) != 0) {
+            _exit(3);
+        }
+
+        int fd = open(merged_file.c_str(), O_WRONLY | O_TRUNC | O_CLOEXEC);
+        if (fd < 0) {
+            _exit(4);
+        }
+        _exit(close(fd) == 0 ? 0 : 5);
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(0, WEXITSTATUS(status));
+
+    struct stat st = {};
+    ASSERT_EQ(0, stat(upper_file.c_str(), &st)) << strerror(errno);
+    EXPECT_EQ(0, st.st_size);
+    EXPECT_EQ(0u, static_cast<unsigned>(st.st_mode & (S_ISUID | S_ISGID)));
+    EXPECT_EQ(0, overlay_temp_entry_count(env.work));
+}
+
 TEST(OverlayFsSemantics, CopyUpLargeLowerFileConcurrentReadersNeverSeePartialUpper) {
     constexpr size_t kFileSize = 4 * 1024 * 1024;
     ScopedOverlayEnv scoped("overlayfs_copy_up_concurrent");

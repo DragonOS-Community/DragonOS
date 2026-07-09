@@ -156,6 +156,8 @@ pub enum TtyPortState {
 pub trait TtyPort: Sync + Send + Debug {
     fn port_data(&self) -> SpinLockGuard<'_, TtyPortData>;
 
+    fn ensure_input_queue(&self);
+
     /// 获取Port的状态
     fn state(&self) -> TtyPortState {
         self.port_data().iflags
@@ -163,6 +165,7 @@ pub trait TtyPort: Sync + Send + Debug {
 
     /// 为port设置tty
     fn setup_internal_tty(&self, tty: Weak<TtyCore>) {
+        self.ensure_input_queue();
         self.port_data().internal_tty = tty;
     }
 
@@ -208,7 +211,7 @@ pub trait TtyPort: Sync + Send + Debug {
 #[derive(Debug)]
 pub struct DefaultTtyPort {
     port_data: SpinLock<TtyPortData>,
-    input_queue: SpinLock<TtyInputQueue>,
+    input_queue: SpinLock<Option<TtyInputQueue>>,
     input_drain_wq: WaitQueue,
 }
 
@@ -216,7 +219,7 @@ impl DefaultTtyPort {
     pub fn new() -> Self {
         Self {
             port_data: SpinLock::new(TtyPortData::new()),
-            input_queue: SpinLock::new(TtyInputQueue::new()),
+            input_queue: SpinLock::new(None),
             input_drain_wq: WaitQueue::default(),
         }
     }
@@ -227,12 +230,35 @@ impl TtyPort for DefaultTtyPort {
         self.port_data.lock_irqsave()
     }
 
+    fn ensure_input_queue(&self) {
+        if self.input_queue.lock_irqsave().is_some() {
+            return;
+        }
+
+        let new_queue = TtyInputQueue::new();
+        let mut queue = self.input_queue.lock_irqsave();
+        if queue.is_none() {
+            *queue = Some(new_queue);
+        }
+    }
+
     fn input_room(&self) -> usize {
-        self.input_queue.lock_irqsave().room()
+        self.input_queue
+            .lock_irqsave()
+            .as_ref()
+            .map(TtyInputQueue::room)
+            .unwrap_or(TTY_PORT_RX_BUF_SIZE)
     }
 
     fn enqueue_input(&self, buf: &[u8]) -> usize {
-        self.input_queue.lock_irqsave().push_slice(buf)
+        if buf.is_empty() {
+            return 0;
+        }
+        let mut queue = self.input_queue.lock_irqsave();
+        let Some(queue) = queue.as_mut() else {
+            return 0;
+        };
+        queue.push_slice(buf)
     }
 
     fn enqueue_input_byte_with(
@@ -240,6 +266,9 @@ impl TtyPort for DefaultTtyPort {
         producer: &mut dyn FnMut() -> Option<u8>,
     ) -> TtyInputByteResult {
         let mut queue = self.input_queue.lock_irqsave();
+        let Some(queue) = queue.as_mut() else {
+            return TtyInputByteResult::NoRoom;
+        };
         if queue.room() == 0 {
             return TtyInputByteResult::NoRoom;
         }
@@ -251,12 +280,19 @@ impl TtyPort for DefaultTtyPort {
     }
 
     fn has_input(&self) -> bool {
-        !self.input_queue.lock_irqsave().is_empty()
+        self.input_queue
+            .lock_irqsave()
+            .as_ref()
+            .map(|queue| !queue.is_empty())
+            .unwrap_or(false)
     }
 
     fn clear_input(&self) -> usize {
         self.input_drain_wq.wait_until(|| {
             let mut queue = self.input_queue.lock_irqsave();
+            let Some(queue) = queue.as_mut() else {
+                return Some(0);
+            };
             if queue.draining {
                 return None;
             }
@@ -265,7 +301,11 @@ impl TtyPort for DefaultTtyPort {
     }
 
     fn clear_input_from_receive(&self) -> usize {
-        self.input_queue.lock_irqsave().clear_buffer()
+        self.input_queue
+            .lock_irqsave()
+            .as_mut()
+            .map(TtyInputQueue::clear_buffer)
+            .unwrap_or(0)
     }
 
     fn drain_input_to_ldisc(&self, max_count: usize) -> Result<TtyInputDrain, SystemError> {
@@ -273,6 +313,9 @@ impl TtyPort for DefaultTtyPort {
         let max_count = max_count.min(TTY_PORT_RX_CHUNK_SIZE);
         let (copied, generation) = {
             let mut queue = self.input_queue.lock_irqsave();
+            let Some(queue) = queue.as_mut() else {
+                return Ok(TtyInputDrain::default());
+            };
             let (copied, generation) = queue.copy_front(&mut chunk[..max_count]);
             if copied != 0 {
                 queue.draining = true;
@@ -286,6 +329,10 @@ impl TtyPort for DefaultTtyPort {
 
         let receive_result = self.receive_buf(&chunk[..copied], &[], copied);
         let mut queue = self.input_queue.lock_irqsave();
+        let Some(queue) = queue.as_mut() else {
+            self.input_drain_wq.wakeup_all(None);
+            return Ok(TtyInputDrain::default());
+        };
         queue.draining = false;
         self.input_drain_wq.wakeup_all(None);
 

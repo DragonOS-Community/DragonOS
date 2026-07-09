@@ -5,6 +5,7 @@ pub mod entry;
 use super::page_cache::PageCache;
 use super::ramfs::{LockedRamFSInode, RamFSInode};
 use super::vfs::file::{File, FileFlags, FilePrivateData};
+use super::vfs::mount::MountFSInode;
 use super::vfs::utils::DName;
 use super::vfs::vcore;
 use super::vfs::FSMAKER;
@@ -33,6 +34,8 @@ use system_error::SystemError;
 const WHITEOUT_MODE: u64 = 0o020000 | 0o600; // whiteout字符设备文件模式与权限
 const WHITEOUT_DEV: DeviceNumber = DeviceNumber::new(Major::UNNAMED_MAJOR, 0); // Whiteout 文件设备号
 const WHITEOUT_FLAG: u64 = 0x1;
+const OVL_MAX_STACK: usize = 500;
+const MAX_MOUNT_ANCESTOR_DEPTH: usize = vfs::MAX_PATHLEN;
 static OVL_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 type LowerRoot = (String, Arc<dyn IndexNode>);
 type WorkdirTemp = (Arc<dyn IndexNode>, Arc<dyn IndexNode>, String);
@@ -79,29 +82,51 @@ pub struct OverlayMountData {
 
 impl OverlayMountData {
     pub fn from_raw(raw_data: Option<&str>) -> Result<Self, SystemError> {
-        if raw_data.is_none() {
+        let raw_str = raw_data.ok_or(SystemError::EINVAL)?;
+        if raw_str.is_empty() {
             return Err(SystemError::EINVAL);
         }
-        let raw_str = raw_data.unwrap();
-        let mut data = OverlayMountData {
-            upper_dir: String::new(),
-            lower_dirs: Vec::new(),
-            work_dir: String::new(),
-        };
+        let mut upper_dir = None;
+        let mut lower_dirs = None;
+        let mut work_dir = None;
 
         for pair in raw_str.split(',') {
-            let mut parts = pair.split('=');
-            let key = parts.next().ok_or(SystemError::EINVAL)?;
-            let value = parts.next().ok_or(SystemError::EINVAL)?;
+            let (key, value) = pair.split_once('=').ok_or(SystemError::EINVAL)?;
+            if key.is_empty() || value.is_empty() {
+                return Err(SystemError::EINVAL);
+            }
 
             match key {
-                "upperdir" => data.upper_dir = value.into(),
-                "lowerdir" => data.lower_dirs = value.split(':').map(|s| s.into()).collect(),
-                "workdir" => data.work_dir = value.into(),
+                "upperdir" => upper_dir = Some(value.into()),
+                "lowerdir" => lower_dirs = Some(Self::parse_lower_dirs(value)?),
+                "workdir" => work_dir = Some(value.into()),
                 _ => return Err(SystemError::EINVAL),
             }
         }
-        Ok(data)
+
+        Ok(OverlayMountData {
+            upper_dir: upper_dir.ok_or(SystemError::EINVAL)?,
+            lower_dirs: lower_dirs.ok_or(SystemError::EINVAL)?,
+            work_dir: work_dir.ok_or(SystemError::EINVAL)?,
+        })
+    }
+
+    fn parse_lower_dirs(raw: &str) -> Result<Vec<String>, SystemError> {
+        let mut lower_dirs = Vec::new();
+        for dir in raw.split(':') {
+            if dir.is_empty() {
+                return Err(SystemError::EINVAL);
+            }
+            if lower_dirs.len() == OVL_MAX_STACK {
+                return Err(SystemError::EINVAL);
+            }
+            lower_dirs.push(dir.into());
+        }
+
+        if lower_dirs.is_empty() {
+            return Err(SystemError::EINVAL);
+        }
+        Ok(lower_dirs)
     }
 }
 impl FileSystemMakerData for OverlayMountData {
@@ -190,6 +215,71 @@ impl OverlayFS {
     pub fn ovl_upper_mnt(&self) -> Arc<OvlInode> {
         self.layers[0].mnt.clone()
     }
+
+    fn same_mount_inode(
+        left: &Arc<dyn IndexNode>,
+        right: &Arc<dyn IndexNode>,
+    ) -> Result<bool, SystemError> {
+        let left = Self::canonical_inode(left.clone());
+        let right = Self::canonical_inode(right.clone());
+        if !Arc::ptr_eq(&left.fs(), &right.fs()) {
+            return Ok(false);
+        }
+
+        Ok(left.metadata()?.inode_id == right.metadata()?.inode_id)
+    }
+
+    fn is_mount_ancestor(
+        ancestor: &Arc<dyn IndexNode>,
+        node: &Arc<dyn IndexNode>,
+    ) -> Result<bool, SystemError> {
+        let ancestor = Self::canonical_inode(ancestor.clone());
+        let node = Self::canonical_inode(node.clone());
+        if !Arc::ptr_eq(&ancestor.fs(), &node.fs()) {
+            return Ok(false);
+        }
+
+        let mut current = node;
+        for _ in 0..MAX_MOUNT_ANCESTOR_DEPTH {
+            if Self::same_mount_inode(&ancestor, &current)? {
+                return Ok(true);
+            }
+
+            let parent = Self::canonical_inode(current.parent().map_err(|_| SystemError::EINVAL)?);
+            if Self::same_mount_inode(&parent, &current)? {
+                return Ok(false);
+            }
+            if !Arc::ptr_eq(&ancestor.fs(), &parent.fs()) {
+                return Ok(false);
+            }
+            current = parent;
+        }
+
+        Err(SystemError::ELOOP)
+    }
+
+    fn canonical_inode(mut inode: Arc<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        while let Some(mount_inode) = inode.clone().downcast_arc::<MountFSInode>() {
+            inode = mount_inode.underlying_inode();
+        }
+        inode
+    }
+
+    fn layers_overlap_either_direction(
+        left: &Arc<dyn IndexNode>,
+        right: &Arc<dyn IndexNode>,
+    ) -> Result<bool, SystemError> {
+        Ok(Self::same_mount_inode(left, right)?
+            || Self::is_mount_ancestor(left, right)?
+            || Self::is_mount_ancestor(right, left)?)
+    }
+
+    fn layer_is_same_or_descendant_of(
+        layer: &Arc<dyn IndexNode>,
+        ancestor: &Arc<dyn IndexNode>,
+    ) -> Result<bool, SystemError> {
+        Ok(Self::same_mount_inode(layer, ancestor)? || Self::is_mount_ancestor(ancestor, layer)?)
+    }
 }
 
 impl MountableFileSystem for OverlayFS {
@@ -204,6 +294,9 @@ impl MountableFileSystem for OverlayFS {
             .lookup(&mount_data.upper_dir)
             .map_err(|_| SystemError::EINVAL)?;
         let upper_file_type = upper_inode.metadata()?.file_type;
+        if upper_file_type != FileType::Dir {
+            return Err(SystemError::EINVAL);
+        }
         let upper_layer = OvlLayer {
             mnt: Arc::new(OvlInode::new(
                 mount_data.upper_dir.clone(),
@@ -223,6 +316,9 @@ impl MountableFileSystem for OverlayFS {
                     .root_inode()
                     .lookup(dir)
                     .map_err(|_| SystemError::EINVAL)?;
+                if lower_inode.metadata()?.file_type != FileType::Dir {
+                    return Err(SystemError::EINVAL);
+                }
                 Ok((dir.clone(), lower_inode))
             })
             .collect();
@@ -252,14 +348,26 @@ impl MountableFileSystem for OverlayFS {
         let workdir_inode = root_inode
             .lookup(&mount_data.work_dir)
             .map_err(|_| SystemError::EINVAL)?;
-        if upper_file_type != FileType::Dir || workdir_inode.metadata()?.file_type != FileType::Dir
+        if workdir_inode.metadata()?.file_type != FileType::Dir {
+            return Err(SystemError::EINVAL);
+        }
+        if !Arc::ptr_eq(&upper_inode.fs(), &workdir_inode.fs())
+            || Self::layers_overlap_either_direction(&upper_inode, &workdir_inode)?
         {
             return Err(SystemError::EINVAL);
         }
-        if Arc::ptr_eq(&upper_inode, &workdir_inode)
-            || !Arc::ptr_eq(&upper_inode.fs(), &workdir_inode.fs())
-        {
-            return Err(SystemError::EINVAL);
+        for (i, (_, lower_inode)) in lower_roots.iter().enumerate() {
+            if Self::layer_is_same_or_descendant_of(lower_inode, &upper_inode)?
+                || Self::layer_is_same_or_descendant_of(lower_inode, &workdir_inode)?
+            {
+                return Err(SystemError::ELOOP);
+            }
+
+            for (_, other_lower_inode) in lower_roots.iter().skip(i + 1) {
+                if Self::layers_overlap_either_direction(lower_inode, other_lower_inode)? {
+                    return Err(SystemError::ELOOP);
+                }
+            }
         }
 
         if lower_roots.is_empty() {

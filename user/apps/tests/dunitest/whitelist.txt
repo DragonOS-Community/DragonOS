@@ -17,6 +17,7 @@ normal/mount_reconfigure
 normal/mount_propagation
 normal/mount_move
 normal/overlayfs_semantics
+normal/overlayfs_mount_validation
 normal/test_fchown_o_path
 normal/proc_self_limits
 normal/proc_fd_devfs_readlink

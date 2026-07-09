@@ -626,7 +626,6 @@ impl FuseConn {
             p.complete(Err(SystemError::ENOTCONN));
         }
         self.init_wait.wakeup(None);
-        self.wake_bridge(stats::VirtioFsBridgeWakeSource::Teardown);
 
         if !should_destroy {
             self.abort();
@@ -637,6 +636,7 @@ impl FuseConn {
             self.abort();
             return;
         }
+        self.wake_bridge(stats::VirtioFsBridgeWakeSource::Teardown);
     }
 
     /// Queue a FORGET message (no reply expected).

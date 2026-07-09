@@ -116,6 +116,10 @@ impl VirtioFsBridgeContext {
         self.hiprio_blocked.blocked || self.request_blocked.iter().any(|state| state.blocked)
     }
 
+    fn can_pump_high_priority(&self) -> bool {
+        !self.hiprio_blocked.blocked
+    }
+
     fn block_state_mut(&mut self, kind: QueueKind) -> Result<&mut QueueBlockState, SystemError> {
         match kind {
             QueueKind::Hiprio => Ok(&mut self.hiprio_blocked),
@@ -132,6 +136,7 @@ impl VirtioFsBridgeContext {
             stats::on_virtiofs_queue_full_blocked();
         }
         state.blocked = true;
+        state.completion_seen = false;
         Ok(())
     }
 
@@ -176,6 +181,84 @@ impl VirtioFsBridgeContext {
                 .ok_or(SystemError::EINVAL)?
                 .pop_front(),
         })
+    }
+
+    fn queue_can_retry(&self, kind: QueueKind) -> Result<bool, SystemError> {
+        let state = match kind {
+            QueueKind::Hiprio => &self.hiprio_blocked,
+            QueueKind::Request(slot) => {
+                self.request_blocked.get(slot).ok_or(SystemError::EINVAL)?
+            }
+        };
+        Ok(!state.blocked || state.completion_seen)
+    }
+
+    fn request_inflight_contains_unique(&self, unique: u64) -> bool {
+        self.request_inflight
+            .iter()
+            .any(|map| map.values().any(|req| req.pending.unique == unique))
+    }
+
+    fn hiprio_pending_submit_ready(&self, pending: &PendingReq) -> bool {
+        if pending.opcode != FUSE_INTERRUPT {
+            return true;
+        }
+
+        let target_unique = FuseConn::interrupt_target_unique(pending.unique);
+        self.conn.has_processing_request(target_unique)
+            && self.request_inflight_contains_unique(target_unique)
+    }
+
+    fn pop_ready_hiprio_pending(&mut self) -> Result<Option<PendingReq>, SystemError> {
+        if !self.queue_can_retry(QueueKind::Hiprio)? {
+            return Ok(None);
+        }
+
+        let mut index = 0usize;
+        while index < self.hiprio_pending.len() {
+            let (opcode, unique) = {
+                let pending = self.hiprio_pending.get(index).ok_or(SystemError::EINVAL)?;
+                (pending.opcode, pending.unique)
+            };
+
+            if opcode == FUSE_INTERRUPT {
+                let target_unique = FuseConn::interrupt_target_unique(unique);
+                if !self.conn.has_processing_request(target_unique) {
+                    self.hiprio_pending.remove(index);
+                    stats::on_fuse_requests_aborted(1);
+                    continue;
+                }
+            }
+
+            if self
+                .hiprio_pending
+                .get(index)
+                .is_some_and(|pending| self.hiprio_pending_submit_ready(pending))
+            {
+                return self
+                    .hiprio_pending
+                    .remove(index)
+                    .map(Some)
+                    .ok_or(SystemError::EINVAL);
+            }
+
+            index += 1;
+        }
+
+        Ok(None)
+    }
+
+    fn pop_pending_for_submit(
+        &mut self,
+        kind: QueueKind,
+    ) -> Result<Option<PendingReq>, SystemError> {
+        if matches!(kind, QueueKind::Hiprio) {
+            return self.pop_ready_hiprio_pending();
+        }
+        if !self.queue_can_retry(kind)? {
+            return Ok(None);
+        }
+        self.pop_pending_front(kind)
     }
 
     fn queue_index(&self, kind: QueueKind) -> Result<u16, SystemError> {
@@ -317,8 +400,33 @@ impl VirtioFsBridgeContext {
         Ok(pumped)
     }
 
+    fn pump_high_priority_requests(&mut self) -> Result<usize, SystemError> {
+        let mut pumped = 0usize;
+        for _ in 0..VIRTIOFS_PUMP_BUDGET {
+            let len = match self.conn.read_high_priority_request(&mut self.req_buf) {
+                Ok(len) => len,
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => break,
+                Err(e) => return Err(e),
+            };
+            let req = self.req_buf[..len].to_vec();
+            stats::on_virtiofs_request_cloned(req.len());
+            let in_hdr: FuseInHeader = fuse_read_struct(&req)?;
+            debug_assert!(matches!(in_hdr.opcode, FUSE_FORGET | FUSE_INTERRUPT));
+            self.push_pending_back(PendingReq {
+                req,
+                unique: in_hdr.unique,
+                opcode: in_hdr.opcode,
+                noreply: in_hdr.opcode == FUSE_FORGET,
+                queue: QueueKind::Hiprio,
+            })?;
+            pumped += 1;
+        }
+        stats::on_virtiofs_pump_batch(pumped);
+        Ok(pumped)
+    }
+
     fn submit_one_pending(&mut self, kind: QueueKind) -> Result<bool, SystemError> {
-        let pending = match self.pop_pending_front(kind)? {
+        let pending = match self.pop_pending_for_submit(kind)? {
             Some(p) => p,
             None => return Ok(false),
         };
@@ -615,7 +723,7 @@ impl VirtioFsBridgeContext {
         }
 
         let teardown_event = events & stats::VirtioFsBridgeWakeSource::Teardown.bit() != 0;
-        if teardown_event || !conn.is_mounted() {
+        if teardown_event {
             return Some(stats::VirtioFsBridgeWaitExit::Teardown);
         }
 
@@ -626,6 +734,9 @@ impl VirtioFsBridgeContext {
 
         let request_event = events & stats::VirtioFsBridgeWakeSource::Request.bit() != 0;
         if !self.has_queue_full_blocked() && (request_event || conn.has_pending_requests()) {
+            return Some(stats::VirtioFsBridgeWaitExit::RequestPending);
+        }
+        if self.can_pump_high_priority() && conn.has_pending_high_priority_requests() {
             return Some(stats::VirtioFsBridgeWaitExit::RequestPending);
         }
 
@@ -727,15 +838,20 @@ impl VirtioFsBridgeContext {
         loop {
             let mut progressed = false;
 
-            if !self.has_queue_full_blocked() {
-                match self.pump_new_requests() {
-                    Ok(v) => progressed |= v != 0,
-                    Err(SystemError::ENOTCONN) => {}
-                    Err(e) => {
-                        warn!("virtiofs bridge: read_request failed: {:?}", e);
-                        if !self.conn.is_connected() {
-                            break;
-                        }
+            let pump_result = if !self.has_queue_full_blocked() {
+                self.pump_new_requests()
+            } else if self.can_pump_high_priority() {
+                self.pump_high_priority_requests()
+            } else {
+                Ok(0)
+            };
+            match pump_result {
+                Ok(v) => progressed |= v != 0,
+                Err(SystemError::ENOTCONN) => {}
+                Err(e) => {
+                    warn!("virtiofs bridge: read_request failed: {:?}", e);
+                    if !self.conn.is_connected() {
+                        break;
                     }
                 }
             }

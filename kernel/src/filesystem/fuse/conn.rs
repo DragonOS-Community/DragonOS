@@ -224,6 +224,8 @@ struct FuseConnInner {
     no_removexattr: bool,
     no_interrupt: bool,
     max_write_cap: usize,
+    separate_hiprio_pending: bool,
+    hiprio_pending: VecDeque<Arc<FuseRequest>>,
     pending: VecDeque<Arc<FuseRequest>>,
     processing: BTreeMap<u64, Arc<FusePendingState>>,
 }
@@ -251,6 +253,7 @@ impl FuseConn {
         Self::new_with_max_write_cap(
             Self::max_write_cap_for_user_read_chunk(),
             Self::kernel_init_flags(),
+            false,
         )
     }
 
@@ -261,10 +264,14 @@ impl FuseConn {
         } else {
             Self::MIN_MAX_WRITE
         };
-        Self::new_with_max_write_cap(cap, Self::virtiofs_init_flags())
+        Self::new_with_max_write_cap(cap, Self::virtiofs_init_flags(), true)
     }
 
-    fn new_with_max_write_cap(max_write_cap: usize, init_flags: u64) -> Arc<Self> {
+    fn new_with_max_write_cap(
+        max_write_cap: usize,
+        init_flags: u64,
+        separate_hiprio_pending: bool,
+    ) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(FuseConnInner {
                 connected: true,
@@ -289,6 +296,8 @@ impl FuseConn {
                 no_removexattr: false,
                 no_interrupt: false,
                 max_write_cap,
+                separate_hiprio_pending,
+                hiprio_pending: VecDeque::new(),
                 pending: VecDeque::new(),
                 processing: BTreeMap::new(),
             }),
@@ -312,7 +321,20 @@ impl FuseConn {
     }
 
     pub fn has_pending_requests(&self) -> bool {
-        !self.inner.lock().pending.is_empty()
+        let g = self.inner.lock();
+        !g.hiprio_pending.is_empty() || !g.pending.is_empty()
+    }
+
+    pub fn has_pending_high_priority_requests(&self) -> bool {
+        !self.inner.lock().hiprio_pending.is_empty()
+    }
+
+    pub fn has_processing_request(&self, unique: u64) -> bool {
+        self.inner.lock().processing.contains_key(&unique)
+    }
+
+    pub fn interrupt_target_unique(unique: u64) -> u64 {
+        unique & !Self::FUSE_INT_REQ_BIT
     }
 
     pub fn bridge_wake_events(&self) -> u32 {
@@ -532,8 +554,10 @@ impl FuseConn {
             let pending_noreply_count = g
                 .pending
                 .iter()
+                .chain(g.hiprio_pending.iter())
                 .filter(|req| matches!(req.opcode, FUSE_FORGET | FUSE_DESTROY | FUSE_INTERRUPT))
                 .count();
+            g.hiprio_pending.clear();
             g.pending.clear();
             let processing = g.processing.values().cloned().collect();
             g.processing.clear();
@@ -572,7 +596,7 @@ impl FuseConn {
             // complete after unmount.
             let mut dropped_noreply = 0usize;
             let mut dropped_reply_unique = Vec::new();
-            for req in g.pending.iter() {
+            for req in g.hiprio_pending.iter().chain(g.pending.iter()) {
                 if req.opcode == FUSE_FORGET {
                     continue;
                 }
@@ -582,6 +606,7 @@ impl FuseConn {
                     dropped_reply_unique.push(req.unique);
                 }
             }
+            g.hiprio_pending.retain(|req| req.opcode == FUSE_FORGET);
             g.pending.retain(|req| req.opcode == FUSE_FORGET);
             dropped_processing = dropped_reply_unique
                 .into_iter()
@@ -683,7 +708,7 @@ impl FuseConn {
 
     pub fn poll(&self) -> EPollEventType {
         let g = self.inner.lock();
-        let have_pending = !g.pending.is_empty();
+        let have_pending = !g.hiprio_pending.is_empty() || !g.pending.is_empty();
         drop(g);
         self.poll_mask(have_pending)
     }
@@ -734,9 +759,7 @@ impl FuseConn {
         if !g.connected {
             return Err(SystemError::ENOTCONN);
         }
-        g.pending
-            .pop_front()
-            .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)
+        Self::pop_pending_locked(&mut g).ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)
     }
 
     fn pop_pending_blocking(&self) -> Result<Arc<FuseRequest>, SystemError> {
@@ -745,11 +768,51 @@ impl FuseConn {
             if !g.connected {
                 return Err(SystemError::ENOTCONN);
             }
-            if let Some(req) = g.pending.pop_front() {
+            if let Some(req) = Self::pop_pending_locked(&mut g) {
                 return Ok(Some(req));
             }
             Ok(None)
         })
+    }
+
+    fn is_high_priority_opcode(opcode: u32) -> bool {
+        matches!(opcode, FUSE_FORGET | FUSE_INTERRUPT)
+    }
+
+    fn is_stale_interrupt_locked(req: &FuseRequest, g: &FuseConnInner) -> bool {
+        req.opcode == FUSE_INTERRUPT
+            && !g
+                .processing
+                .contains_key(&Self::interrupt_target_unique(req.unique))
+    }
+
+    fn pop_high_priority_pending_locked(g: &mut FuseConnInner) -> Option<Arc<FuseRequest>> {
+        loop {
+            let req = g.hiprio_pending.pop_front()?;
+            if Self::is_stale_interrupt_locked(&req, g) {
+                stats::on_fuse_requests_aborted(1);
+                continue;
+            }
+            return Some(req);
+        }
+    }
+
+    fn pop_pending_locked(g: &mut FuseConnInner) -> Option<Arc<FuseRequest>> {
+        Self::pop_high_priority_pending_locked(g).or_else(|| g.pending.pop_front())
+    }
+
+    fn complete_dequeued_request(
+        &self,
+        req: Arc<FuseRequest>,
+        out: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        out[..req.bytes.len()].copy_from_slice(&req.bytes);
+        stats::on_fuse_request_dequeued(req.bytes.len());
+        trace::trace_fuse_request_dequeue(req.unique, req.opcode, req.bytes.len() as u64);
+        if req.opcode == FUSE_DESTROY {
+            self.abort();
+        }
+        Ok(req.bytes.len())
     }
 
     pub fn read_request(&self, nonblock: bool, out: &mut [u8]) -> Result<usize, SystemError> {
@@ -785,13 +848,43 @@ impl FuseConn {
             );
         };
 
-        out[..req.bytes.len()].copy_from_slice(&req.bytes);
-        stats::on_fuse_request_dequeued(req.bytes.len());
-        trace::trace_fuse_request_dequeue(req.unique, req.opcode, req.bytes.len() as u64);
-        if req.opcode == FUSE_DESTROY {
-            self.abort();
+        self.complete_dequeued_request(req, out)
+    }
+
+    pub fn read_high_priority_request(&self, out: &mut [u8]) -> Result<usize, SystemError> {
+        let min_read = self.min_read_buffer();
+        if out.len() < min_read {
+            log::warn!(
+                "fuse: read buffer too small for high-priority request: got={} min={}",
+                out.len(),
+                min_read
+            );
+            return Err(SystemError::EINVAL);
         }
-        Ok(req.bytes.len())
+
+        let req = loop {
+            let req = {
+                let mut g = self.inner.lock();
+                if !g.connected {
+                    return Err(SystemError::ENOTCONN);
+                }
+                Self::pop_high_priority_pending_locked(&mut g)
+                    .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?
+            };
+
+            if out.len() >= req.bytes.len() {
+                break req;
+            }
+
+            self.fail_oversized_read_request(&req);
+            log::warn!(
+                "fuse: read buffer smaller than queued high-priority request: got={} need={}",
+                out.len(),
+                req.bytes.len()
+            );
+        };
+
+        self.complete_dequeued_request(req, out)
     }
 
     fn fail_oversized_read_request(&self, req: &FuseRequest) {
@@ -1047,7 +1140,11 @@ impl FuseConn {
             if !g.connected {
                 return Err(SystemError::ENOTCONN);
             }
-            g.pending.push_back(req);
+            if g.separate_hiprio_pending && Self::is_high_priority_opcode(opcode) {
+                g.hiprio_pending.push_back(req);
+            } else {
+                g.pending.push_back(req);
+            }
             if let Some(pending) = pending_state {
                 g.processing.insert(unique, pending);
             }

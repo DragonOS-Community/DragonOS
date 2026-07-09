@@ -47,6 +47,7 @@ static mut PIO_PORTS: [Option<Serial8250PIOPort>; 8] =
 
 const SERIAL_8250_PIO_IRQ: IrqNumber = IrqNumber::new(IoApic::VECTOR_BASE as u32 + 4);
 const SERIAL_8250_RX_IRQ_LIMIT: usize = 256;
+const SERIAL_8250_IER_RX_AVAILABLE: u8 = 0x01;
 
 lazy_static! {
     static ref SERIAL_8250_RX_RETRY_TASKLET: Arc<Tasklet> =
@@ -133,11 +134,17 @@ pub struct Serial8250PIOPort {
 #[derive(Debug)]
 struct Serial8250RxState {
     input_target: Option<TtyInputTarget>,
+    ier: u8,
+    irq_registered: bool,
 }
 
 impl Serial8250RxState {
     const fn new() -> Self {
-        Self { input_target: None }
+        Self {
+            input_target: None,
+            ier: 0,
+            irq_registered: false,
+        }
     }
 }
 
@@ -187,10 +194,7 @@ impl Serial8250PIOPort {
             // If serial is not faulty set it in normal operation mode
             // (not-loopback with IRQs enabled and OUT#1 and OUT#2 bits enabled)
             CurrentPortIOArch::out8(port + 4, 0x0b);
-
-            CurrentPortIOArch::out8(port + 1, 0x01); // Enable interrupts
         }
-
         return Ok(());
         /*
                 Notice that the initialization code above writes to [PORT + 1]
@@ -249,10 +253,50 @@ impl Serial8250PIOPort {
         self.rx_state.lock_irqsave().input_target = target;
     }
 
+    fn set_rx_interrupt_enabled(&self, enabled: bool) {
+        let mut rx_state = self.rx_state.lock_irqsave();
+        self.set_rx_interrupt_enabled_locked(&mut rx_state, enabled);
+    }
+
+    fn set_rx_interrupt_enabled_locked(&self, rx_state: &mut Serial8250RxState, enabled: bool) {
+        if enabled {
+            rx_state.ier |= SERIAL_8250_IER_RX_AVAILABLE;
+        } else {
+            rx_state.ier &= !SERIAL_8250_IER_RX_AVAILABLE;
+        }
+        self.sync_ier_locked(rx_state);
+    }
+
+    fn sync_ier_locked(&self, rx_state: &Serial8250RxState) {
+        let ier = if rx_state.irq_registered {
+            rx_state.ier
+        } else {
+            0
+        };
+        self.serial_out(1, ier.into());
+    }
+
+    fn mark_rx_irq_registered(&self) {
+        let mut rx_state = self.rx_state.lock_irqsave();
+        rx_state.irq_registered = true;
+        self.sync_ier_locked(&rx_state);
+    }
+
+    fn pause_rx_locked(&self, rx_state: &mut Serial8250RxState) {
+        self.rx_paused.store(true, Ordering::Release);
+        self.set_rx_interrupt_enabled_locked(rx_state, false);
+    }
+
+    fn resume_rx_locked(&self, rx_state: &mut Serial8250RxState) {
+        self.rx_paused.store(false, Ordering::Release);
+        self.set_rx_interrupt_enabled_locked(rx_state, true);
+    }
+
     fn pump_rx(&self) -> Result<(), SystemError> {
-        let rx_state = self.rx_state.lock_irqsave();
+        let mut rx_state = self.rx_state.lock_irqsave();
         let Some(target) = rx_state.input_target.as_ref() else {
             self.rx_paused.store(false, Ordering::Release);
+            self.set_rx_interrupt_enabled_locked(&mut rx_state, false);
             return Ok(());
         };
 
@@ -267,17 +311,17 @@ impl Serial8250PIOPort {
                     self.rx_paused.store(false, Ordering::Release);
                 }
                 TtyInputByteResult::NoRoom => {
-                    self.rx_paused.store(true, Ordering::Release);
+                    self.pause_rx_locked(&mut rx_state);
                     break;
                 }
                 TtyInputByteResult::NoData => {
-                    self.rx_paused.store(false, Ordering::Release);
+                    self.resume_rx_locked(&mut rx_state);
                     break;
                 }
             }
         }
         if received == SERIAL_8250_RX_IRQ_LIMIT {
-            self.rx_paused.store(true, Ordering::Release);
+            self.pause_rx_locked(&mut rx_state);
             retry_serial8250_pio_input();
         }
         Ok(())
@@ -447,16 +491,6 @@ impl TtyOperation for Serial8250PIOTtyDriverInner {
     }
 
     fn close(&self, tty: Arc<TtyCore>) -> Result<(), SystemError> {
-        let tty_index = tty.core().index();
-        if tty_index < unsafe { PIO_PORTS.len() } {
-            if let Some(port) = unsafe { PIO_PORTS[tty_index].as_ref() } {
-                port.set_input_target(None);
-                port.rx_paused.store(false, Ordering::Release);
-            }
-        }
-        if let Some(port) = tty.core().port() {
-            port.clear_input();
-        }
         tty.ldisc().flush_buffer(tty.clone())?;
         Ok(())
     }
@@ -489,10 +523,17 @@ impl TtyOperation for Serial8250PIOTtyDriverInner {
             vc_manager().free(vc_index);
             port.set_input_target(None);
             port.rx_paused.store(false, Ordering::Release);
+            port.set_rx_interrupt_enabled(false);
         })?;
-        port.set_input_target(Some(TtyInputTarget::new(vc_index, vc.port())));
-        port.rx_paused.store(true, Ordering::Release);
-        retry_serial8250_pio_input();
+        let irq_registered = {
+            let mut rx_state = port.rx_state.lock_irqsave();
+            rx_state.input_target = Some(TtyInputTarget::new(vc_index, vc.port()));
+            port.pause_rx_locked(&mut rx_state);
+            rx_state.irq_registered
+        };
+        if irq_registered {
+            retry_serial8250_pio_input();
+        }
 
         Ok(())
     }
@@ -536,6 +577,11 @@ pub(super) fn serial_8250_pio_register_tty_devices() -> Result<(), SystemError> 
         .inspect_err(|e| {
             log::error!("failed to request irq for serial 8250 pio: {:?}", e);
         })?;
+
+    for port in unsafe { PIO_PORTS.iter() }.flatten() {
+        port.mark_rx_irq_registered();
+    }
+    retry_serial8250_pio_input();
 
     Ok(())
 }

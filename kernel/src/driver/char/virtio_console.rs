@@ -982,15 +982,6 @@ impl TtyOperation for VirtIOConsoleDriver {
         }
 
         let dev = self.devices.read()[index].clone();
-        if let Some(dev) = &dev {
-            let mut inner = dev.inner();
-            inner.input_target = None;
-            inner.input_rx_paused = false;
-        }
-
-        if let Some(port) = tty.core().port() {
-            port.clear_input();
-        }
         tty.ldisc().flush_buffer(tty.clone())?;
 
         if let Some(dev) = dev {
@@ -1007,12 +998,10 @@ impl TtyOperation for VirtIOConsoleDriver {
                     let mut inner = dev.inner();
                     inner.discard_unsubmitted_output_locked();
                     let wake_tty = inner.output_tty.upgrade();
-                    inner.output_tty = Weak::new();
                     drop(inner);
                     VirtIOConsoleDevice::wake_output_tty(wake_tty);
                 }
             }
-            dev.inner().output_tty = Weak::new();
         }
 
         Ok(())

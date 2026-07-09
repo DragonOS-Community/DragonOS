@@ -329,6 +329,10 @@ impl FuseConn {
         !self.inner.lock().hiprio_pending.is_empty()
     }
 
+    pub fn has_pending_ordinary_requests(&self) -> bool {
+        !self.inner.lock().pending.is_empty()
+    }
+
     pub fn has_processing_request(&self, unique: u64) -> bool {
         self.inner.lock().processing.contains_key(&unique)
     }
@@ -775,6 +779,29 @@ impl FuseConn {
         })
     }
 
+    fn pop_ordinary_pending_nonblock(&self) -> Result<Arc<FuseRequest>, SystemError> {
+        let mut g = self.inner.lock();
+        if !g.connected {
+            return Err(SystemError::ENOTCONN);
+        }
+        g.pending
+            .pop_front()
+            .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)
+    }
+
+    fn pop_ordinary_pending_blocking(&self) -> Result<Arc<FuseRequest>, SystemError> {
+        wait_with_recheck(&self.read_wait, || {
+            let mut g = self.inner.lock();
+            if !g.connected {
+                return Err(SystemError::ENOTCONN);
+            }
+            if let Some(req) = g.pending.pop_front() {
+                return Ok(Some(req));
+            }
+            Ok(None)
+        })
+    }
+
     fn is_high_priority_opcode(opcode: u32) -> bool {
         matches!(opcode, FUSE_FORGET | FUSE_INTERRUPT)
     }
@@ -815,12 +842,21 @@ impl FuseConn {
         Ok(req.bytes.len())
     }
 
-    pub fn read_request(&self, nonblock: bool, out: &mut [u8]) -> Result<usize, SystemError> {
-        // Linux: require a sane minimum read buffer for all reads.
+    fn read_dequeued_request<F>(
+        &self,
+        nonblock: bool,
+        out: &mut [u8],
+        context: &str,
+        mut pop_request: F,
+    ) -> Result<usize, SystemError>
+    where
+        F: FnMut() -> Result<Arc<FuseRequest>, SystemError>,
+    {
         let min_read = self.min_read_buffer();
         if out.len() < min_read {
             log::warn!(
-                "fuse: read buffer too small: got={} min={} nonblock={}",
+                "fuse: read buffer too small for {}: got={} min={} nonblock={}",
+                context,
                 out.len(),
                 min_read,
                 nonblock
@@ -829,12 +865,7 @@ impl FuseConn {
         }
 
         let req = loop {
-            // Linux: if O_NONBLOCK and no pending request, return EAGAIN.
-            let req = if nonblock {
-                self.pop_pending_nonblock()?
-            } else {
-                self.pop_pending_blocking()?
-            };
+            let req = pop_request()?;
 
             if out.len() >= req.bytes.len() {
                 break req;
@@ -842,7 +873,8 @@ impl FuseConn {
 
             self.fail_oversized_read_request(&req);
             log::warn!(
-                "fuse: read buffer smaller than queued request: got={} need={}",
+                "fuse: read buffer smaller than queued {} request: got={} need={}",
+                context,
                 out.len(),
                 req.bytes.len()
             );
@@ -851,40 +883,40 @@ impl FuseConn {
         self.complete_dequeued_request(req, out)
     }
 
-    pub fn read_high_priority_request(&self, out: &mut [u8]) -> Result<usize, SystemError> {
-        let min_read = self.min_read_buffer();
-        if out.len() < min_read {
-            log::warn!(
-                "fuse: read buffer too small for high-priority request: got={} min={}",
-                out.len(),
-                min_read
-            );
-            return Err(SystemError::EINVAL);
-        }
-
-        let req = loop {
-            let req = {
-                let mut g = self.inner.lock();
-                if !g.connected {
-                    return Err(SystemError::ENOTCONN);
-                }
-                Self::pop_high_priority_pending_locked(&mut g)
-                    .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?
-            };
-
-            if out.len() >= req.bytes.len() {
-                break req;
+    pub fn read_request(&self, nonblock: bool, out: &mut [u8]) -> Result<usize, SystemError> {
+        // Linux: require a sane minimum read buffer for all reads.
+        self.read_dequeued_request(nonblock, out, "request", || {
+            // Linux: if O_NONBLOCK and no pending request, return EAGAIN.
+            if nonblock {
+                self.pop_pending_nonblock()
+            } else {
+                self.pop_pending_blocking()
             }
+        })
+    }
 
-            self.fail_oversized_read_request(&req);
-            log::warn!(
-                "fuse: read buffer smaller than queued high-priority request: got={} need={}",
-                out.len(),
-                req.bytes.len()
-            );
-        };
+    pub fn read_ordinary_request(
+        &self,
+        nonblock: bool,
+        out: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        self.read_dequeued_request(nonblock, out, "ordinary request", || {
+            if nonblock {
+                self.pop_ordinary_pending_nonblock()
+            } else {
+                self.pop_ordinary_pending_blocking()
+            }
+        })
+    }
 
-        self.complete_dequeued_request(req, out)
+    pub fn read_high_priority_request(&self, out: &mut [u8]) -> Result<usize, SystemError> {
+        self.read_dequeued_request(true, out, "high-priority request", || {
+            let mut g = self.inner.lock();
+            if !g.connected {
+                return Err(SystemError::ENOTCONN);
+            }
+            Self::pop_high_priority_pending_locked(&mut g).ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)
+        })
     }
 
     fn fail_oversized_read_request(&self, req: &FuseRequest) {
@@ -1416,5 +1448,79 @@ impl FuseConn {
             g.init.max_readahead as usize
         };
         core::cmp::max(1, bytes >> MMArch::PAGE_SHIFT)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::{sync::Arc, vec::Vec};
+
+    use system_error::SystemError;
+
+    use super::{
+        fuse_read_struct, FuseConn, FuseInHeader, FusePendingState, FuseRequestCred, FUSE_FORGET,
+        FUSE_LOOKUP,
+    };
+
+    fn queue_test_request(conn: &Arc<FuseConn>, opcode: u32, pending_reply: bool) -> u64 {
+        let unique = conn.alloc_unique();
+        let req = conn.build_request(unique, opcode, 1, &[], FuseRequestCred::nocreds());
+        let pending = pending_reply.then(|| Arc::new(FusePendingState::new(unique, opcode)));
+        conn.push_request(req, pending, unique).unwrap();
+        unique
+    }
+
+    fn read_opcode(buf: &[u8]) -> u32 {
+        let hdr: FuseInHeader = fuse_read_struct(buf).unwrap();
+        hdr.opcode
+    }
+
+    #[test]
+    fn ordinary_read_does_not_consume_high_priority_queue() {
+        let conn = FuseConn::new_for_virtiofs(8192);
+        queue_test_request(&conn, FUSE_FORGET, false);
+        queue_test_request(&conn, FUSE_LOOKUP, true);
+
+        assert!(conn.has_pending_high_priority_requests());
+        assert!(conn.has_pending_ordinary_requests());
+
+        let mut buf = Vec::new();
+        buf.resize(conn.min_read_buffer(), 0);
+        let len = conn.read_ordinary_request(true, &mut buf).unwrap();
+        assert_eq!(read_opcode(&buf[..len]), FUSE_LOOKUP);
+        assert!(conn.has_pending_high_priority_requests());
+        assert!(!conn.has_pending_ordinary_requests());
+
+        let len = conn.read_high_priority_request(&mut buf).unwrap();
+        assert_eq!(read_opcode(&buf[..len]), FUSE_FORGET);
+        assert!(!conn.has_pending_high_priority_requests());
+    }
+
+    #[test]
+    fn ordinary_read_returns_eagain_when_only_high_priority_is_pending() {
+        let conn = FuseConn::new_for_virtiofs(8192);
+        queue_test_request(&conn, FUSE_FORGET, false);
+
+        let mut buf = Vec::new();
+        buf.resize(conn.min_read_buffer(), 0);
+        assert!(matches!(
+            conn.read_ordinary_request(true, &mut buf),
+            Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+        ));
+        assert!(conn.has_pending_high_priority_requests());
+    }
+
+    #[test]
+    fn normal_fuse_read_request_keeps_high_priority_visible() {
+        let conn = FuseConn::new();
+        queue_test_request(&conn, FUSE_FORGET, false);
+
+        assert!(!conn.has_pending_high_priority_requests());
+        assert!(conn.has_pending_ordinary_requests());
+
+        let mut buf = Vec::new();
+        buf.resize(conn.min_read_buffer(), 0);
+        let len = conn.read_request(true, &mut buf).unwrap();
+        assert_eq!(read_opcode(&buf[..len]), FUSE_FORGET);
     }
 }

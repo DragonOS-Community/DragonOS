@@ -120,6 +120,21 @@ impl VirtioFsBridgeContext {
         !self.hiprio_blocked.blocked
     }
 
+    fn has_unblocked_request_slot(&self) -> bool {
+        Self::has_unblocked_request_slot_in(&self.request_blocked, self.request_vqs.len())
+    }
+
+    fn has_unblocked_request_slot_in(
+        request_blocked: &[QueueBlockState],
+        request_queue_count: usize,
+    ) -> bool {
+        (0..request_queue_count).any(|slot| {
+            request_blocked
+                .get(slot)
+                .is_some_and(|state| !state.blocked)
+        })
+    }
+
     fn block_state_mut(&mut self, kind: QueueKind) -> Result<&mut QueueBlockState, SystemError> {
         match kind {
             QueueKind::Hiprio => Ok(&mut self.hiprio_blocked),
@@ -361,19 +376,49 @@ impl VirtioFsBridgeContext {
         Self::complete_request_with_negative_errno(&self.conn, unique, err.to_posix_errno());
     }
 
-    fn choose_request_slot(&mut self) -> Result<usize, SystemError> {
-        if self.request_vqs.is_empty() {
-            return Err(SystemError::ENODEV);
-        }
-        let slot = self.next_request_slot % self.request_vqs.len();
-        self.next_request_slot = (self.next_request_slot + 1) % self.request_vqs.len();
-        Ok(slot)
+    fn choose_unblocked_request_slot(&mut self) -> Result<usize, SystemError> {
+        Self::choose_unblocked_request_slot_in(
+            &mut self.next_request_slot,
+            &self.request_blocked,
+            self.request_vqs.len(),
+        )
     }
 
-    fn pump_new_requests(&mut self) -> Result<usize, SystemError> {
+    fn choose_unblocked_request_slot_in(
+        next_request_slot: &mut usize,
+        request_blocked: &[QueueBlockState],
+        request_queue_count: usize,
+    ) -> Result<usize, SystemError> {
+        if request_queue_count == 0 {
+            return Err(SystemError::ENODEV);
+        }
+
+        for offset in 0..request_queue_count {
+            let slot = (*next_request_slot + offset) % request_queue_count;
+            let state = request_blocked.get(slot).ok_or(SystemError::EINVAL)?;
+            if !state.blocked {
+                *next_request_slot = (slot + 1) % request_queue_count;
+                return Ok(slot);
+            }
+        }
+
+        Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+    }
+
+    fn pump_ordinary_requests(&mut self) -> Result<usize, SystemError> {
         let mut pumped = 0usize;
         for _ in 0..VIRTIOFS_PUMP_BUDGET {
-            let len = match self.conn.read_request(true, &mut self.req_buf) {
+            if !self.conn.has_pending_ordinary_requests() {
+                break;
+            }
+
+            let slot = match self.choose_unblocked_request_slot() {
+                Ok(slot) => slot,
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => break,
+                Err(e) => return Err(e),
+            };
+
+            let len = match self.conn.read_ordinary_request(true, &mut self.req_buf) {
                 Ok(len) => len,
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => break,
                 Err(e) => return Err(e),
@@ -382,17 +427,13 @@ impl VirtioFsBridgeContext {
             stats::on_virtiofs_request_cloned(req.len());
             let in_hdr: FuseInHeader = fuse_read_struct(&req)?;
             let noreply = matches!(in_hdr.opcode, FUSE_FORGET | FUSE_DESTROY);
-            let queue = if matches!(in_hdr.opcode, FUSE_FORGET | FUSE_INTERRUPT) {
-                QueueKind::Hiprio
-            } else {
-                QueueKind::Request(self.choose_request_slot()?)
-            };
+            debug_assert!(!matches!(in_hdr.opcode, FUSE_FORGET | FUSE_INTERRUPT));
             self.push_pending_back(PendingReq {
                 req,
                 unique: in_hdr.unique,
                 opcode: in_hdr.opcode,
                 noreply,
-                queue,
+                queue: QueueKind::Request(slot),
             })?;
             pumped += 1;
         }
@@ -422,6 +463,17 @@ impl VirtioFsBridgeContext {
             pumped += 1;
         }
         stats::on_virtiofs_pump_batch(pumped);
+        Ok(pumped)
+    }
+
+    fn pump_available_requests(&mut self) -> Result<usize, SystemError> {
+        let mut pumped = 0usize;
+        if self.can_pump_high_priority() && self.conn.has_pending_high_priority_requests() {
+            pumped += self.pump_high_priority_requests()?;
+        }
+        if self.has_unblocked_request_slot() && self.conn.has_pending_ordinary_requests() {
+            pumped += self.pump_ordinary_requests()?;
+        }
         Ok(pumped)
     }
 
@@ -732,11 +784,10 @@ impl VirtioFsBridgeContext {
             return Some(stats::VirtioFsBridgeWaitExit::Completion);
         }
 
-        let request_event = events & stats::VirtioFsBridgeWakeSource::Request.bit() != 0;
-        if !self.has_queue_full_blocked() && (request_event || conn.has_pending_requests()) {
+        if self.can_pump_high_priority() && conn.has_pending_high_priority_requests() {
             return Some(stats::VirtioFsBridgeWaitExit::RequestPending);
         }
-        if self.can_pump_high_priority() && conn.has_pending_high_priority_requests() {
+        if self.has_unblocked_request_slot() && conn.has_pending_ordinary_requests() {
             return Some(stats::VirtioFsBridgeWaitExit::RequestPending);
         }
 
@@ -838,13 +889,7 @@ impl VirtioFsBridgeContext {
         loop {
             let mut progressed = false;
 
-            let pump_result = if !self.has_queue_full_blocked() {
-                self.pump_new_requests()
-            } else if self.can_pump_high_priority() {
-                self.pump_high_priority_requests()
-            } else {
-                Ok(0)
-            };
+            let pump_result = self.pump_available_requests();
             match pump_result {
                 Ok(v) => progressed |= v != 0,
                 Err(SystemError::ENOTCONN) => {}
@@ -1282,3 +1327,100 @@ impl MountableFileSystem for VirtioFsFs {
 }
 
 register_mountable_fs!(VirtioFsFs, VIRTIOFSMAKER, "virtiofs");
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+
+    use system_error::SystemError;
+
+    use super::{QueueBlockState, VirtioFsBridgeContext};
+
+    fn block_state(blocked: bool, completion_seen: bool) -> QueueBlockState {
+        QueueBlockState {
+            blocked,
+            completion_seen,
+        }
+    }
+
+    #[test]
+    fn choose_unblocked_request_slot_skips_blocked_slots() {
+        let states = vec![
+            block_state(true, false),
+            block_state(false, false),
+            block_state(false, false),
+        ];
+        let mut next = 0usize;
+
+        assert!(VirtioFsBridgeContext::has_unblocked_request_slot_in(
+            &states,
+            states.len()
+        ));
+        assert_eq!(
+            VirtioFsBridgeContext::choose_unblocked_request_slot_in(
+                &mut next,
+                &states,
+                states.len()
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(next, 2);
+        assert_eq!(
+            VirtioFsBridgeContext::choose_unblocked_request_slot_in(
+                &mut next,
+                &states,
+                states.len()
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(next, 0);
+        assert_eq!(
+            VirtioFsBridgeContext::choose_unblocked_request_slot_in(
+                &mut next,
+                &states,
+                states.len()
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn completion_seen_does_not_accept_new_ordinary_requests() {
+        let states = vec![block_state(true, true), block_state(false, false)];
+        let mut next = 0usize;
+
+        assert_eq!(
+            VirtioFsBridgeContext::choose_unblocked_request_slot_in(
+                &mut next,
+                &states,
+                states.len()
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(next, 0);
+    }
+
+    #[test]
+    fn all_blocked_request_slots_are_not_pumpable() {
+        let states = vec![block_state(true, false), block_state(true, true)];
+        let mut next = 0usize;
+
+        assert!(!VirtioFsBridgeContext::has_unblocked_request_slot_in(
+            &states,
+            states.len()
+        ));
+        assert!(matches!(
+            VirtioFsBridgeContext::choose_unblocked_request_slot_in(
+                &mut next,
+                &states,
+                states.len()
+            ),
+            Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+        ));
+        assert_eq!(next, 0);
+    }
+}

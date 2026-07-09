@@ -35,8 +35,9 @@ use crate::{
 
 #[cfg(target_arch = "x86_64")]
 use self::serial8250_pio::{
-    send_to_default_serial8250_pio_port, serial8250_pio_port_early_init,
-    serial_8250_pio_register_tty_devices, Serial8250PIOTtyDriverInner,
+    retry_serial8250_pio_input, send_to_default_serial8250_pio_port,
+    serial8250_pio_port_early_init, serial_8250_pio_register_tty_devices,
+    Serial8250PIOTtyDriverInner,
 };
 
 use super::{uart_manager, UartDriver, UartManager, UartPort, TTY_SERIAL_DEFAULT_TERMIOS};
@@ -46,6 +47,11 @@ mod serial8250_pio;
 
 #[cfg(target_arch = "loongarch64")]
 mod serial8250_la64;
+
+pub fn retry_serial8250_input() {
+    #[cfg(target_arch = "x86_64")]
+    retry_serial8250_pio_input();
+}
 
 static mut SERIAL8250_ISA_DEVICES: Option<Arc<Serial8250ISADevices>> = None;
 static mut SERIAL8250_ISA_DRIVER: Option<Arc<Serial8250ISADriver>> = None;

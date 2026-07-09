@@ -5,6 +5,7 @@ use alloc::{string::ToString, sync::Arc};
 use crate::{
     driver::{
         char::virtio_console::retry_virtio_console_input,
+        serial::serial8250::retry_serial8250_input,
         tty::{
             tty_core::TtyCore,
             tty_port::{TtyInputByteResult, TTY_PORT_RX_CHUNK_SIZE},
@@ -109,7 +110,7 @@ fn drain_vc_input(vc_index: usize) {
         };
 
         if drain.freed_room != 0 {
-            retry_virtio_console_input();
+            retry_tty_input_producers();
         }
 
         if drain.copied == 0 || !drain.still_pending {
@@ -173,7 +174,7 @@ pub fn enqueue_tty_rx_byte_to_vc_from_irq(
     producer: &mut dyn FnMut() -> Option<u8>,
 ) -> TtyInputByteResult {
     let Some(vc) = vc_manager().get(vc_index) else {
-        return TtyInputByteResult::NoRoom;
+        return TtyInputByteResult::NoTarget;
     };
     let result = vc.port().enqueue_input_byte_with(producer);
     if result == TtyInputByteResult::Enqueued {
@@ -189,9 +190,14 @@ pub fn tty_port_input_room(vc_index: usize) -> usize {
         .unwrap_or(0)
 }
 
+pub fn retry_tty_input_producers() {
+    retry_virtio_console_input();
+    retry_serial8250_input();
+}
+
 pub fn tty_kick_input_worker(tty: Arc<TtyCore>) {
     let Some(vc_index) = tty.core().vc_index() else {
-        retry_virtio_console_input();
+        retry_tty_input_producers();
         return;
     };
 
@@ -202,5 +208,5 @@ pub fn tty_kick_input_worker(tty: Arc<TtyCore>) {
     {
         queue_tty_input_work(vc_index);
     }
-    retry_virtio_console_input();
+    retry_tty_input_producers();
 }

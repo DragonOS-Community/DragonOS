@@ -8,21 +8,18 @@ use system_error::SystemError;
 
 use crate::{
     arch::ipc::signal::Signal,
-    driver::{
-        char::virtio_console::retry_virtio_console_input,
-        tty::{
-            kthread::tty_kick_input_worker,
-            pty::unix98pty::{
-                pty_drain_pending_to, pty_flush_input_buffer, pty_receive_flush_input_buffer,
-            },
-            termios::{ControlCharIndex, InputMode, LocalMode, OutputMode, Termios},
-            tty_core::{
-                EchoOperation, TtyCore, TtyCoreData, TtyFlag, TtyIoctlCmd, TtyPacketStatus,
-                TtySleepLock,
-            },
-            tty_driver::{TtyDriverFlag, TtyDriverSubType, TtyOperation},
-            tty_job_control::TtyJobCtrlManager,
+    driver::tty::{
+        kthread::{retry_tty_input_producers, tty_kick_input_worker},
+        pty::unix98pty::{
+            pty_drain_pending_to, pty_flush_input_buffer, pty_receive_flush_input_buffer,
         },
+        termios::{ControlCharIndex, InputMode, LocalMode, OutputMode, Termios},
+        tty_core::{
+            EchoOperation, TtyCore, TtyCoreData, TtyFlag, TtyIoctlCmd, TtyPacketStatus,
+            TtySleepLock,
+        },
+        tty_driver::{TtyDriverFlag, TtyDriverSubType, TtyOperation},
+        tty_job_control::TtyJobCtrlManager,
     },
     filesystem::{
         epoll::{event_poll::EventPoll, EPollEventType},
@@ -1049,7 +1046,7 @@ impl NTtyData {
 
             if let Some(port) = tty.core().port() {
                 if port.clear_input_from_receive() != 0 {
-                    retry_virtio_console_input();
+                    retry_tty_input_producers();
                 }
             }
 
@@ -1776,7 +1773,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         let core = tty.core();
         if let Some(port) = core.port() {
             if port.clear_input() != 0 {
-                retry_virtio_console_input();
+                retry_tty_input_producers();
             }
         }
         pty_flush_input_buffer(tty.clone(), || {

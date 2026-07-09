@@ -1,5 +1,6 @@
-use super::OvlInode;
+use super::inode::OvlInode;
 use crate::filesystem::vfs::{
+    self,
     file::{File, FileFlags},
     FileType, IndexNode, Metadata,
 };
@@ -12,7 +13,16 @@ type UpperCleanup = Option<(Arc<dyn IndexNode>, String)>;
 type CreatedUpper = (Arc<dyn IndexNode>, UpperCleanup);
 
 impl OvlInode {
-    pub fn copy_up(&self) -> Result<(), SystemError> {
+    pub(super) fn writable_upper_inode(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        if let Some(inode) = self.upper_inode.lock().clone() {
+            return Ok(inode);
+        }
+
+        self.copy_up()?;
+        self.upper_inode.lock().clone().ok_or(SystemError::EROFS)
+    }
+
+    pub(super) fn copy_up(&self) -> Result<(), SystemError> {
         let mut upper_inode = self.upper_inode.lock();
         if upper_inode.is_some() {
             return Ok(());
@@ -87,5 +97,44 @@ impl OvlInode {
 
         let inode = parent_inode.create_with_data(name, metadata.file_type, metadata.mode, 0)?;
         Ok((inode, Some((parent_inode, name.into()))))
+    }
+
+    fn ensure_upper_dir_path(&self, path: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let mut current = self.upper_root_inode()?;
+        if path.is_empty() {
+            return Ok(current);
+        }
+
+        let mut current_path = String::new();
+        for component in path.split('/').filter(|component| !component.is_empty()) {
+            if !current_path.is_empty() {
+                current_path.push('/');
+            }
+            current_path.push_str(component);
+
+            match current.find(component) {
+                Ok(next) => current = next,
+                Err(SystemError::ENOENT) => {
+                    let mode = self.lower_dir_mode(&current_path)?;
+                    current = current.mkdir(component, mode)?;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(current)
+    }
+
+    fn lower_dir_mode(&self, path: &str) -> Result<vfs::InodeMode, SystemError> {
+        let fs = self.overlay_fs()?;
+        for layer in fs.layers.iter().skip(1) {
+            if let Some(lower_root) = layer.mnt.lower_inodes.first() {
+                if let Ok(inode) = lower_root.lookup(path) {
+                    return Ok(inode.metadata()?.mode);
+                }
+            }
+        }
+
+        Ok(vfs::InodeMode::S_IRWXUGO)
     }
 }

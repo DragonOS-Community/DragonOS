@@ -1,0 +1,97 @@
+use super::dir;
+use super::inode::OvlInode;
+use crate::filesystem::vfs::{syscall::RenameFlags, IndexNode};
+use crate::libs::casting::DowncastArc;
+use alloc::sync::Arc;
+use system_error::SystemError;
+
+pub(super) fn move_to(
+    inode: &OvlInode,
+    old_name: &str,
+    target: &Arc<dyn IndexNode>,
+    new_name: &str,
+    flags: RenameFlags,
+) -> Result<(), SystemError> {
+    if flags.contains(RenameFlags::WHITEOUT) {
+        return Err(SystemError::EINVAL);
+    }
+
+    let fs = inode.overlay_fs()?;
+    let _mutation_guard = fs.mutation_lock.lock();
+
+    let target_ovl = target
+        .clone()
+        .downcast_arc::<OvlInode>()
+        .ok_or(SystemError::EXDEV)?;
+
+    let source = inode.lookup_overlay_child(old_name)?;
+    let target_had_whiteout = target_ovl.has_whiteout(new_name);
+    let target_child = match target_ovl.lookup_overlay_child(new_name) {
+        Ok(found) => Some(found),
+        Err(SystemError::ENOENT) => None,
+        Err(err) => return Err(err),
+    };
+
+    if flags.contains(RenameFlags::NOREPLACE) && target_child.is_some() {
+        return Err(SystemError::EEXIST);
+    }
+
+    if flags.contains(RenameFlags::EXCHANGE) {
+        let target_child = target_child.ok_or(SystemError::ENOENT)?;
+        if (source.is_dir() && source.has_lower())
+            || (target_child.is_dir() && target_child.has_lower())
+        {
+            return Err(SystemError::EXDEV);
+        }
+
+        source.copy_up()?;
+        target_child.copy_up()?;
+        let old_upper_dir = inode.writable_upper_inode()?;
+        let new_upper_dir = target_ovl.writable_upper_inode()?;
+        return old_upper_dir.move_to(old_name, &new_upper_dir, new_name, flags);
+    }
+
+    if inode.redirect == target_ovl.redirect && old_name == new_name {
+        return Ok(());
+    }
+
+    let source_needs_whiteout = source.has_lower();
+    if source_needs_whiteout && source.is_dir() {
+        return Err(SystemError::EXDEV);
+    }
+
+    if let Some(target_child) = target_child {
+        if source.is_dir() && !target_child.is_dir() {
+            return Err(SystemError::ENOTDIR);
+        }
+        if !source.is_dir() && target_child.is_dir() {
+            return Err(SystemError::EISDIR);
+        }
+        if source.is_dir() && target_child.is_dir() {
+            let target_node: Arc<dyn IndexNode> = target_child.clone();
+            if !dir::is_dir_empty(&target_node)? {
+                return Err(SystemError::ENOTEMPTY);
+            }
+        }
+    }
+
+    if !source.is_pure_upper() {
+        source.copy_up()?;
+    }
+
+    let old_upper_dir = inode.writable_upper_inode()?;
+    let new_upper_dir = target_ovl.writable_upper_inode()?;
+    let mut upper_flags = flags;
+    if target_had_whiteout {
+        upper_flags.remove(RenameFlags::NOREPLACE);
+        if source.is_dir() {
+            old_upper_dir.move_to(old_name, &new_upper_dir, new_name, RenameFlags::EXCHANGE)?;
+            OvlInode::cleanup_workdir_temp(&old_upper_dir, old_name);
+            return Ok(());
+        }
+    }
+    if source_needs_whiteout {
+        upper_flags.insert(RenameFlags::WHITEOUT);
+    }
+    old_upper_dir.move_to(old_name, &new_upper_dir, new_name, upper_flags)
+}

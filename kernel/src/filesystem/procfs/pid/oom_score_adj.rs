@@ -26,6 +26,43 @@ const OOM_SCORE_ADJ_MAX: i16 = 1000;
 const PROC_NUMBUF: usize = 13;
 
 #[derive(Debug)]
+pub struct OomScoreFileOps {
+    target: ProcPidTarget,
+}
+
+impl OomScoreFileOps {
+    pub fn new(target: ProcPidTarget) -> Self {
+        Self { target }
+    }
+
+    pub fn new_inode(target: ProcPidTarget, parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcFileBuilder::new(Self::new(target), InodeMode::S_IRUGO)
+            .parent(parent)
+            .build()
+            .unwrap()
+    }
+
+    fn target_process(&self) -> Result<Arc<ProcessControlBlock>, SystemError> {
+        self.target.thread_group_leader().ok_or(SystemError::ESRCH)
+    }
+}
+
+impl FileOps for OomScoreFileOps {
+    fn read_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        let pcb = self.target_process()?;
+        let score = crate::mm::oom::proc_oom_score(&pcb);
+        let content = format!("{}\n", score);
+        proc_read(offset, len, buf, content.as_bytes())
+    }
+}
+
+#[derive(Debug)]
 pub struct OomScoreAdjFileOps {
     target: ProcPidTarget,
 }

@@ -11,9 +11,10 @@ use crate::{
     ipc::signal_types::{SaHandlerType, SigCode, SigInfo, SigPending, SigactionType, SignalFlags},
     libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
     libs::wait_queue::WaitQueue,
+    mm::ucontext::AddressSpace,
     process::{
         pid::{Pid, PidType},
-        ProcessControlBlock, ProcessManager,
+        ProcessControlBlock, ProcessManager, RawPid,
     },
 };
 
@@ -59,6 +60,14 @@ pub struct InnerSigHand {
     pub group_exec_task: Option<Weak<ProcessControlBlock>>,
     /// 线程组 exec（de-thread）等待计数（仿照 Linux 的 signal_struct::notify_count）
     pub group_exec_notify_count: isize,
+    /// The mm selected by the OOM killer for this thread group.
+    ///
+    /// The reserve entitlement is not decided by this metadata alone. Callers
+    /// must go through `oom::current_is_oom_victim()`, which also verifies that
+    /// the task is already fatal/exiting.
+    pub oom_tgid: Option<RawPid>,
+    pub oom_mm_id: Option<u64>,
+    pub oom_mm: Option<Arc<AddressSpace>>,
     pub pids: [Option<Arc<Pid>>; PidType::PIDTYPE_MAX],
     /// 在 sighand 上维护的引用计数（与 Linux 一致的布局位置）
     pub cnt: i64,
@@ -176,6 +185,29 @@ impl SigHand {
         self_guard.group_exec_task = other_guard.group_exec_task.clone();
         self_guard.group_exec_notify_count = other_guard.group_exec_notify_count;
         self_guard.pids = other_guard.pids.clone();
+    }
+
+    pub fn record_oom_victim_mm(&self, tgid: RawPid, mm: &Arc<AddressSpace>) {
+        let mut g = self.inner_mut();
+        g.oom_tgid = Some(tgid);
+        g.oom_mm_id = Some(mm.id());
+        g.oom_mm = Some(mm.clone());
+    }
+
+    pub fn clear_oom_mm_if(&self, tgid: RawPid, mm_id: u64) -> bool {
+        let mut g = self.inner_mut();
+        if g.oom_tgid != Some(tgid) || g.oom_mm_id != Some(mm_id) {
+            return false;
+        }
+        g.oom_tgid = None;
+        g.oom_mm_id = None;
+        g.oom_mm = None;
+        true
+    }
+
+    pub fn oom_victim_mm_matches(&self, tgid: RawPid) -> bool {
+        let g = self.inner();
+        g.oom_tgid == Some(tgid) && g.oom_mm.is_some()
     }
 
     // ===== Shared pending helpers =====
@@ -475,6 +507,9 @@ impl Default for InnerSigHand {
             stop_signal: Signal::SIGSTOP,
             group_exec_task: None,
             group_exec_notify_count: 0,
+            oom_tgid: None,
+            oom_mm_id: None,
+            oom_mm: None,
             cnt: 0,
         }
     }

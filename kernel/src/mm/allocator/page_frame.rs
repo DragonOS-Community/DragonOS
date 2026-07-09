@@ -347,8 +347,24 @@ impl<T: FrameAllocator> FrameAllocator for &mut T {
 ///
 /// @param count 请求分配的页帧数量
 pub unsafe fn allocate_page_frames(count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
-    let frame = unsafe { LockedFrameAllocator.allocate(count)? };
-    return Some(frame);
+    unsafe { LockedFrameAllocator.allocate(count) }
+}
+
+pub fn retry_oom_victim_page_frame_alloc<F>(
+    mut try_allocate: F,
+) -> Option<(PhysAddr, PageFrameCount)>
+where
+    F: FnMut() -> Option<(PhysAddr, PageFrameCount)>,
+{
+    if !crate::mm::oom::current_is_oom_victim() {
+        return None;
+    }
+
+    // OOM victims are already destined to die and need a chance to allocate
+    // page tables or kernel objects while exiting and freeing their mm.
+    // This mirrors Linux's TIF_MEMDIE reserve access at the page allocator.
+    crate::mm::page::PageReclaimer::wakeup_claim_thread();
+    try_allocate()
 }
 
 /// @brief 向全局页帧分配器释放连续count个页帧

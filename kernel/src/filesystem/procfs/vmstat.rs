@@ -9,7 +9,7 @@ use crate::{
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    mm::page_cache_stats,
+    mm::{oom, page_cache_stats},
 };
 use alloc::{borrow::ToOwned, format, sync::Arc, sync::Weak, vec::Vec};
 use system_error::SystemError;
@@ -24,6 +24,7 @@ enum VmstatSource {
     Shmem,
     Unevictable,
     DropPagecache,
+    OomKill,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -412,7 +413,7 @@ const VMSTAT_FIELDS: &[VmstatField] = &[
     },
     VmstatField {
         name: "oom_kill",
-        source: VmstatSource::Zero,
+        source: VmstatSource::OomKill,
     },
     VmstatField {
         name: "unevictable_pgs_culled",
@@ -470,6 +471,7 @@ impl VmstatFileOps {
                 VmstatSource::Shmem => stats.shmem_pages,
                 VmstatSource::Unevictable => stats.unevictable,
                 VmstatSource::DropPagecache => stats.drop_pagecache,
+                VmstatSource::OomKill => oom::oom_kill_count(),
             };
             data.append(&mut format!("{} {}\n", field.name, value).as_bytes().to_owned());
         }

@@ -1,9 +1,5 @@
-use alloc::vec::Vec;
-use alloc::{
-    format,
-    string::ToString,
-    sync::{Arc, Weak},
-};
+use alloc::{format, string::ToString, sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicU64, Ordering};
 use log::{error, warn};
 use system_error::SystemError;
 
@@ -20,6 +16,7 @@ use super::ucontext::AddressSpace;
 static OOM_WAITQ: WaitQueue = WaitQueue::default();
 static OOM_STATE: SpinLock<OomState> = SpinLock::new(OomState::new());
 static OOM_FAULT_INJECT: SpinLock<OomFaultInject> = SpinLock::new(OomFaultInject::disabled());
+static OOM_KILL_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy)]
 pub struct OomContext {
@@ -40,9 +37,8 @@ pub enum OomOutcome {
 #[derive(Debug, Clone)]
 struct OomVictimState {
     generation: u64,
+    tgid: RawPid,
     mm_id: u64,
-    mm: Weak<AddressSpace>,
-    initial_reclaim_generation: u64,
 }
 
 #[derive(Debug)]
@@ -91,21 +87,10 @@ struct OomCandidate {
     mm: Arc<AddressSpace>,
     score: isize,
     resident_pages: usize,
-    reclaim_generation: u64,
     oom_score_adj: i16,
 }
 
 const OOM_SCORE_ADJ_MIN: i16 = -1000;
-
-fn victim_has_progress(victim: &OomVictimState) -> bool {
-    let Some(mm) = victim.mm.upgrade() else {
-        return true;
-    };
-    if mm.id() != victim.mm_id {
-        return true;
-    }
-    mm.oom_reclaim_generation() != victim.initial_reclaim_generation
-}
 
 fn wake_oom_waiters() {
     OOM_WAITQ.wake_all();
@@ -152,10 +137,67 @@ fn oom_score(mm: &Arc<AddressSpace>, oom_score_adj: i16, total_pages: isize) -> 
     resident_pages.saturating_add(adjustment)
 }
 
+pub fn proc_oom_score(pcb: &Arc<ProcessControlBlock>) -> usize {
+    let leader = leader_of(pcb.clone());
+    if is_global_init_or_kthread(&leader) || leader.is_active_vfork() {
+        return 0;
+    }
+
+    let oom_score_adj = pcb.sig_info_irqsave().oom_score_adj();
+    if oom_score_adj == OOM_SCORE_ADJ_MIN {
+        return 0;
+    }
+
+    let Some(mm) = pcb.basic().user_vm() else {
+        return 0;
+    };
+    let total_pages = total_system_pages();
+    let badness = oom_score(&mm, oom_score_adj, total_pages);
+    let score = 1000isize
+        .saturating_add(badness.saturating_mul(1000) / total_pages)
+        .saturating_mul(2)
+        / 3;
+    score.clamp(0, 2000) as usize
+}
+
+pub fn oom_kill_count() -> u64 {
+    OOM_KILL_COUNT.load(Ordering::Relaxed)
+}
+
+fn count_oom_kill() {
+    OOM_KILL_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
 fn task_uses_mm(task: &Arc<ProcessControlBlock>, mm: &Arc<AddressSpace>) -> bool {
     task.basic()
         .user_vm()
         .is_some_and(|task_mm| task_mm.id() == mm.id() || Arc::ptr_eq(&task_mm, mm))
+}
+
+fn clear_inflight_for_mm(mm_id: u64) -> bool {
+    let mut state = OOM_STATE.lock_irqsave();
+    if state
+        .inflight
+        .as_ref()
+        .is_some_and(|victim| victim.mm_id == mm_id)
+    {
+        state.inflight = None;
+        true
+    } else {
+        false
+    }
+}
+
+fn rollback_inflight(generation: u64, tgid: RawPid, mm_id: u64) -> bool {
+    let mut state = OOM_STATE.lock_irqsave();
+    if state.inflight.as_ref().is_some_and(|victim| {
+        victim.generation == generation && victim.tgid == tgid && victim.mm_id == mm_id
+    }) {
+        state.inflight = None;
+        true
+    } else {
+        false
+    }
 }
 
 fn kill_targets_for_mm(mm: &Arc<AddressSpace>) -> Vec<Arc<ProcessControlBlock>> {
@@ -170,7 +212,7 @@ fn kill_targets_for_mm(mm: &Arc<AddressSpace>) -> Vec<Arc<ProcessControlBlock>> 
             continue;
         }
 
-        let leader = leader_of(task);
+        let leader = leader_of(task.clone());
         let tgid = leader.raw_tgid();
         if seen_tgids.contains(&tgid) {
             continue;
@@ -180,7 +222,7 @@ fn kill_targets_for_mm(mm: &Arc<AddressSpace>) -> Vec<Arc<ProcessControlBlock>> 
         if is_global_init_or_kthread(&leader) {
             continue;
         }
-        targets.push(leader);
+        targets.push(task);
     }
 
     targets
@@ -216,7 +258,6 @@ fn select_victim() -> Option<OomCandidate> {
             tgid,
             score: oom_score(&mm, oom_score_adj, total_pages),
             resident_pages: mm.resident_pages(),
-            reclaim_generation: mm.oom_reclaim_generation(),
             oom_score_adj,
             mm,
         };
@@ -232,28 +273,14 @@ fn select_victim() -> Option<OomCandidate> {
 }
 
 fn begin_selection() -> Result<u64, ()> {
-    let mut should_wake = false;
-    let result = {
-        let mut state = OOM_STATE.lock_irqsave();
-        if let Some(victim) = state.inflight.as_ref() {
-            if victim_has_progress(victim) {
-                state.inflight = None;
-                should_wake = true;
-            }
-        }
-        if state.selecting || state.inflight.is_some() {
-            Err(())
-        } else {
-            state.selecting = true;
-            state.generation = state.generation.wrapping_add(1);
-            Ok(state.generation)
-        }
-    };
-
-    if should_wake {
-        wake_oom_waiters();
+    let mut state = OOM_STATE.lock_irqsave();
+    if state.selecting || state.inflight.is_some() {
+        Err(())
+    } else {
+        state.selecting = true;
+        state.generation = state.generation.wrapping_add(1);
+        Ok(state.generation)
     }
-    result
 }
 
 fn finish_selection_none() {
@@ -264,22 +291,34 @@ fn finish_selection_none() {
     wake_oom_waiters();
 }
 
-fn finish_selection_with_victim(generation: u64, candidate: &OomCandidate) {
-    let mut state = OOM_STATE.lock_irqsave();
-    state.selecting = false;
-    state.inflight = Some(OomVictimState {
-        generation,
-        mm_id: candidate.mm.id(),
-        mm: Arc::downgrade(&candidate.mm),
-        initial_reclaim_generation: candidate.reclaim_generation,
-    });
+pub fn note_oom_victim_mm_released(mm_id: u64) {
+    if clear_inflight_for_mm(mm_id) {
+        wake_oom_waiters();
+    }
 }
 
-fn send_oom_sigkill(candidate: &OomCandidate) -> Result<(), SystemError> {
-    let mut sent = false;
+fn send_oom_sigkill(
+    generation: u64,
+    candidate: &OomCandidate,
+) -> Result<Option<RawPid>, SystemError> {
     let targets = kill_targets_for_mm(&candidate.mm);
+    let Some(victim) = targets
+        .iter()
+        .find(|target| target.raw_tgid() == candidate.tgid)
+        .or_else(|| {
+            targets
+                .iter()
+                .find(|target| task_uses_mm(target, &candidate.mm))
+        })
+        .cloned()
+    else {
+        finish_selection_none();
+        return Err(SystemError::ESRCH);
+    };
+    let victim_tgid = victim.raw_tgid();
+    let victim_mm_id = candidate.mm.id();
 
-    for target in targets {
+    let send_sigkill = |target: Arc<ProcessControlBlock>| {
         let mut info = SigInfo::new(
             Signal::SIGKILL,
             0,
@@ -289,14 +328,60 @@ fn send_oom_sigkill(candidate: &OomCandidate) -> Result<(), SystemError> {
                 uid: 0,
             },
         );
-        match Signal::SIGKILL.send_signal_info_to_pcb(Some(&mut info), target, PidType::TGID) {
-            Ok(_) => sent = true,
-            Err(SystemError::ESRCH) => continue,
-            Err(err) => return Err(err),
+        Signal::SIGKILL.send_signal_info_to_pcb(Some(&mut info), target, PidType::TGID)
+    };
+
+    victim.with_task_lock_irqsave(|| {
+        if !task_uses_mm(&victim, &candidate.mm) {
+            finish_selection_none();
+            return Err(SystemError::ESRCH);
+        }
+
+        let sighand = victim.sighand();
+        sighand.record_oom_victim_mm(victim_tgid, &candidate.mm);
+        let mut state = OOM_STATE.lock_irqsave();
+        state.selecting = false;
+        state.inflight = Some(OomVictimState {
+            generation,
+            tgid: victim_tgid,
+            mm_id: victim_mm_id,
+        });
+        drop(state);
+        match send_sigkill(victim.clone()) {
+            Ok(_) => Ok(Some(victim_tgid)),
+            Err(err) => {
+                sighand.clear_oom_mm_if(victim_tgid, victim_mm_id);
+                if rollback_inflight(generation, victim_tgid, victim_mm_id) {
+                    wake_oom_waiters();
+                }
+                Err(err)
+            }
+        }
+    })?;
+
+    for target in targets {
+        if target.raw_tgid() == victim_tgid {
+            continue;
+        }
+        match send_sigkill(target) {
+            Ok(_) | Err(SystemError::ESRCH) => {}
+            Err(err) => warn!(
+                "oom: failed to SIGKILL task group sharing victim mm: {:?}",
+                err
+            ),
         }
     }
 
-    sent.then_some(()).ok_or(SystemError::ESRCH)
+    Ok(Some(victim_tgid))
+}
+
+/// Whether the current task is marked as an OOM victim.
+pub fn current_is_oom_victim() -> bool {
+    if !ProcessManager::initialized() {
+        return false;
+    }
+    let current = ProcessManager::current_pcb();
+    current.sighand().oom_victim_mm_matches(current.raw_tgid()) && current_is_killed_or_exiting()
 }
 
 fn wait_for_oom_slot() -> Result<(), SystemError> {
@@ -309,10 +394,7 @@ fn wait_for_oom_slot() -> Result<(), SystemError> {
             if state.selecting {
                 return false;
             }
-            match state.inflight.as_ref() {
-                None => true,
-                Some(victim) => victim_has_progress(victim),
-            }
+            state.inflight.as_ref().is_none()
         },
         None::<fn()>,
     )
@@ -330,8 +412,8 @@ fn wait_until_recoverable(generation: u64) -> Result<(), SystemError> {
             }
             match state.inflight.as_ref() {
                 None => true,
-                Some(victim) if victim.generation == generation => victim_has_progress(victim),
-                Some(victim) => victim_has_progress(victim),
+                Some(victim) if victim.generation == generation => false,
+                Some(_) => true,
             }
         },
         None::<fn()>,
@@ -369,25 +451,27 @@ pub fn pagefault_out_of_memory(ctx: OomContext) -> OomOutcome {
         let current_is_victim = candidate.tgid == current_leader.raw_tgid()
             || (task_uses_mm(&current, &candidate.mm)
                 && !is_global_init_or_kthread(&current_leader));
-        let victim_tgid = candidate.tgid;
+        let candidate_tgid = candidate.tgid;
         let victim_score = candidate.score;
         let victim_oom_score_adj = candidate.oom_score_adj;
         let victim_resident_pages = candidate.resident_pages;
-        match send_oom_sigkill(&candidate) {
-            Ok(()) => {
-                error!(
-                    "oom-kill: trigger_pid={} trigger_tgid={} victim_tgid={} score={} adj={} rss={} order={} addr={:#x} ip={:#x}",
-                    ctx.trigger_pid,
-                    ctx.trigger_tgid,
-                    victim_tgid,
-                    victim_score,
-                    victim_oom_score_adj,
-                    victim_resident_pages,
-                    ctx.order,
-                    ctx.fault_address.data(),
-                    ctx.fault_ip
-                );
-                finish_selection_with_victim(generation, &candidate);
+        match send_oom_sigkill(generation, &candidate) {
+            Ok(killed_tgid) => {
+                if let Some(killed_tgid) = killed_tgid {
+                    count_oom_kill();
+                    error!(
+                        "oom-kill: trigger_pid={} trigger_tgid={} victim_tgid={} score={} adj={} rss={} order={} addr={:#x} ip={:#x}",
+                        ctx.trigger_pid,
+                        ctx.trigger_tgid,
+                        killed_tgid,
+                        victim_score,
+                        victim_oom_score_adj,
+                        victim_resident_pages,
+                        ctx.order,
+                        ctx.fault_address.data(),
+                        ctx.fault_ip
+                    );
+                }
                 drop(candidate);
                 if current_is_victim {
                     return OomOutcome::CurrentTaskKilled;
@@ -404,14 +488,12 @@ pub fn pagefault_out_of_memory(ctx: OomContext) -> OomOutcome {
                 }
             }
             Err(SystemError::ESRCH) => {
-                finish_selection_none();
                 continue;
             }
             Err(err) => {
-                finish_selection_none();
                 warn!(
                     "oom: failed to SIGKILL victim tgid={} for trigger pid={} err={:?}",
-                    victim_tgid, ctx.trigger_pid, err
+                    candidate_tgid, ctx.trigger_pid, err
                 );
                 return OomOutcome::NoVictim;
             }
@@ -419,39 +501,8 @@ pub fn pagefault_out_of_memory(ctx: OomContext) -> OomOutcome {
     }
 }
 
-pub fn notify_mm_reclaim_progress(mm: &AddressSpace) {
-    let mut state = OOM_STATE.lock_irqsave();
-    let should_wake = if state
-        .inflight
-        .as_ref()
-        .is_some_and(|victim| victim.mm_id == mm.id() && victim_has_progress(victim))
-    {
-        state.inflight = None;
-        true
-    } else {
-        false
-    };
-    drop(state);
-    if should_wake {
-        wake_oom_waiters();
-    }
-}
-
 pub fn notify_mm_drop(mm_id: u64) {
-    let should_wake = {
-        let mut state = OOM_STATE.lock_irqsave();
-        if state
-            .inflight
-            .as_ref()
-            .is_some_and(|victim| victim.mm_id == mm_id)
-        {
-            state.inflight = None;
-            true
-        } else {
-            false
-        }
-    };
-    if should_wake {
+    if clear_inflight_for_mm(mm_id) {
         wake_oom_waiters();
     }
 }

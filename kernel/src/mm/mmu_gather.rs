@@ -160,15 +160,8 @@ impl<'mm> MmuGather<'mm> {
     ///
     /// The caller must guarantee that TLB shootdown has already completed before calling this.
     pub fn flush_mmu_free(&mut self) {
-        let released_pages = !self.pending_pages.is_empty();
         // Drop all Arc<Page>, letting InnerPage::drop reach deallocate_page_frames
         self.pending_pages.clear();
-        if released_pages {
-            if let Some(mm) = self.mm {
-                mm.advance_oom_reclaim_generation();
-                crate::mm::oom::notify_mm_reclaim_progress(mm);
-            }
-        }
     }
 
     /// Finish the gather: flush TLB first, then free pages.

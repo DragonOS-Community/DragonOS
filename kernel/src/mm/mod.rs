@@ -105,6 +105,7 @@ bitflags! {
         const VM_FAULT_DONE_COW = 0x001000;
         const VM_FAULT_NEEDDSYNC = 0x002000;
         const VM_FAULT_COMPLETED = 0x004000;
+        const VM_FAULT_OOM_INJECTED = 0x008000;
         const VM_FAULT_HINDEX_MASK = 0x0f0000;
         const VM_FAULT_ERROR = 0x000001 | 0x000002 | 0x000040 | 0x000010 | 0x000020 | 0x000800;
     }

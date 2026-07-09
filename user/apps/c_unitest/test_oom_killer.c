@@ -15,6 +15,10 @@
 #define BIG_PAGES 16384
 #define PAGE_SIZE 4096
 
+#define OOM_SCORE_MAX 2000
+#define OOM_SCORE_DEFAULT_MIN 600
+#define OOM_SCORE_BOOSTED_MIN 1200
+
 static int write_inject_config(pid_t tgid, unsigned long fail_after, unsigned long fail_times)
 {
     char buf[128];
@@ -41,6 +45,90 @@ static int write_inject_config(pid_t tgid, unsigned long fail_after, unsigned lo
 static void cleanup_inject_config(void)
 {
     (void)write_inject_config(0, 0, 0);
+}
+
+
+static int read_proc_int(pid_t pid, const char *name, long *value)
+{
+    char path[128];
+    char buf[64];
+    int fd;
+    ssize_t n;
+    char *end;
+
+    snprintf(path, sizeof(path), "/proc/%d/%s", pid, name);
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        perror(path);
+        return -1;
+    }
+
+    n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) {
+        perror(path);
+        return -1;
+    }
+    buf[n] = '\0';
+
+    errno = 0;
+    *value = strtol(buf, &end, 10);
+    if (errno != 0 || end == buf || (*end != '\n' && *end != '\0')) {
+        fprintf(stderr, "%s: invalid integer: %s\n", path, buf);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int write_proc_int(pid_t pid, const char *name, long value)
+{
+    char path[128];
+    char buf[64];
+    int fd;
+    int len;
+
+    snprintf(path, sizeof(path), "/proc/%d/%s", pid, name);
+    fd = open(path, O_WRONLY);
+    if (fd < 0) {
+        perror(path);
+        return -1;
+    }
+
+    len = snprintf(buf, sizeof(buf), "%ld\n", value);
+    if (write(fd, buf, len) != len) {
+        perror(path);
+        close(fd);
+        return -1;
+    }
+
+    close(fd);
+    return 0;
+}
+
+static int read_vmstat_value(const char *name, long *value)
+{
+    FILE *fp;
+    char key[64];
+    long val;
+
+    fp = fopen("/proc/vmstat", "r");
+    if (fp == NULL) {
+        perror("/proc/vmstat");
+        return -1;
+    }
+
+    while (fscanf(fp, "%63s %ld", key, &val) == 2) {
+        if (strcmp(key, name) == 0) {
+            fclose(fp);
+            *value = val;
+            return 0;
+        }
+    }
+
+    fclose(fp);
+    fprintf(stderr, "/proc/vmstat: missing %s\n", name);
+    return -1;
 }
 
 static void *fault_one_page(void)
@@ -153,6 +241,113 @@ static int expect_exit0(pid_t pid, const char *name)
     return 0;
 }
 
+static int test_proc_oom_score(void)
+{
+    long score;
+    long init_score;
+    long default_score;
+    long boosted_score;
+
+    if (read_proc_int(1, "oom_score", &init_score) < 0) {
+        return -1;
+    }
+    if (init_score != 0) {
+        fprintf(stderr, "global init oom_score should be 0, got %ld\n", init_score);
+        return -1;
+    }
+
+    if (read_proc_int(getpid(), "oom_score", &default_score) < 0) {
+        return -1;
+    }
+    if (default_score < 0 || default_score > OOM_SCORE_MAX) {
+        fprintf(stderr, "oom_score out of range: %ld\n", default_score);
+        return -1;
+    }
+    if (default_score < OOM_SCORE_DEFAULT_MIN) {
+        fprintf(stderr, "default oom_score too low for Linux [0,2000] scale: %ld\n",
+                default_score);
+        return -1;
+    }
+
+    if (write_proc_int(getpid(), "oom_score_adj", 1000) < 0) {
+        return -1;
+    }
+    if (read_proc_int(getpid(), "oom_score", &boosted_score) < 0) {
+        (void)write_proc_int(getpid(), "oom_score_adj", 0);
+        return -1;
+    }
+    if (write_proc_int(getpid(), "oom_score_adj", 0) < 0) {
+        return -1;
+    }
+    if (boosted_score < 0 || boosted_score > OOM_SCORE_MAX) {
+        fprintf(stderr, "boosted oom_score out of range: %ld\n", boosted_score);
+        return -1;
+    }
+    if (boosted_score < OOM_SCORE_BOOSTED_MIN) {
+        fprintf(stderr, "boosted oom_score too low for Linux [0,2000] scale: %ld\n",
+                boosted_score);
+        return -1;
+    }
+    if (boosted_score < default_score) {
+        fprintf(stderr, "oom_score_adj=1000 should not lower oom_score: %ld -> %ld\n",
+                default_score, boosted_score);
+        return -1;
+    }
+
+    if (write_proc_int(getpid(), "oom_score_adj", -1000) < 0) {
+        return -1;
+    }
+    if (read_proc_int(getpid(), "oom_score", &score) < 0) {
+        (void)write_proc_int(getpid(), "oom_score_adj", 0);
+        return -1;
+    }
+    if (write_proc_int(getpid(), "oom_score_adj", 0) < 0) {
+        return -1;
+    }
+    if (score != 0) {
+        fprintf(stderr, "oom_score_adj=-1000 should force oom_score 0, got %ld\n", score);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int test_vmstat_oom_kill_counter(void)
+{
+    long before;
+    long after;
+    pid_t child;
+
+    if (read_vmstat_value("oom_kill", &before) < 0) {
+        return -1;
+    }
+
+    child = fork();
+    if (child < 0) {
+        perror("fork");
+        return -1;
+    }
+    if (child == 0) {
+        trigger_selfkill_child_main();
+    }
+
+    if (expect_sigkill(child, "vmstat_oom_kill_counter") < 0) {
+        cleanup_inject_config();
+        return -1;
+    }
+    cleanup_inject_config();
+
+    if (read_vmstat_value("oom_kill", &after) < 0) {
+        return -1;
+    }
+    if (after <= before) {
+        fprintf(stderr, "oom_kill counter did not increase: before=%ld after=%ld\n", before, after);
+        return -1;
+    }
+
+    return 0;
+}
+
 static int test_current_is_victim(void)
 {
     pid_t child = fork();
@@ -215,11 +410,21 @@ int main(void)
 {
     cleanup_inject_config();
 
+    if (test_proc_oom_score() < 0) {
+        cleanup_inject_config();
+        return 1;
+    }
+
     if (test_current_is_victim() < 0) {
         cleanup_inject_config();
         return 1;
     }
     if (test_other_process_is_victim() < 0) {
+        cleanup_inject_config();
+        return 1;
+    }
+
+    if (test_vmstat_oom_kill_counter() < 0) {
         cleanup_inject_config();
         return 1;
     }

@@ -17,7 +17,9 @@ use crate::libs::align::page_align_up;
 use crate::libs::lib_ui::screen_manager::scm_disable_put_to_window;
 use crate::libs::spinlock::SpinLock;
 
-use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
+use crate::mm::allocator::page_frame::{
+    retry_oom_victim_page_frame_alloc, FrameAllocator, PageFrameCount, PageFrameUsage,
+};
 use crate::mm::memblock::mem_block_manager;
 use crate::mm::ucontext::LockedVMA;
 use crate::{
@@ -770,14 +772,24 @@ pub fn test_buddy() {
 #[derive(Debug, Clone, Copy, Hash)]
 pub struct LockedFrameAllocator;
 
-impl FrameAllocator for LockedFrameAllocator {
-    unsafe fn allocate(&mut self, mut count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
-        count = count.next_power_of_two();
+impl LockedFrameAllocator {
+    unsafe fn allocate_inner(count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
         if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
             return allocator.allocate(count);
         } else {
             return None;
         }
+    }
+}
+
+impl FrameAllocator for LockedFrameAllocator {
+    unsafe fn allocate(&mut self, mut count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
+        count = count.next_power_of_two();
+        if let Some(frame) = unsafe { Self::allocate_inner(count) } {
+            return Some(frame);
+        }
+
+        retry_oom_victim_page_frame_alloc(|| unsafe { Self::allocate_inner(count) })
     }
 
     unsafe fn free(&mut self, address: crate::mm::PhysAddr, count: PageFrameCount) {

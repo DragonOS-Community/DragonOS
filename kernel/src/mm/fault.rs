@@ -306,7 +306,7 @@ impl PageFaultHandler {
     /// - VmFaultReason: 页面错误处理信息标志
     pub unsafe fn do_anonymous_page(pfm: &mut PageFaultMessage) -> VmFaultReason {
         if crate::mm::oom::should_inject_fault_oom() {
-            return VmFaultReason::VM_FAULT_OOM;
+            return VmFaultReason::VM_FAULT_OOM | VmFaultReason::VM_FAULT_OOM_INJECTED;
         }
         let address = pfm.address_aligned_down();
         let vma = pfm.vma.clone();
@@ -1005,7 +1005,7 @@ impl PageFaultHandler {
     /// - VmFaultReason: 页面错误处理信息标志
     pub unsafe fn finish_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
         if crate::mm::oom::should_inject_fault_oom() {
-            return VmFaultReason::VM_FAULT_OOM;
+            return VmFaultReason::VM_FAULT_OOM | VmFaultReason::VM_FAULT_OOM_INJECTED;
         }
         let vma = pfm.vma();
         let vma_guard = vma.lock();
@@ -1057,7 +1057,7 @@ impl PageFaultHandler {
     /// Map a zeroed anonymous page for /dev/zero style mappings.
     pub unsafe fn zero_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
         if crate::mm::oom::should_inject_fault_oom() {
-            return VmFaultReason::VM_FAULT_OOM;
+            return VmFaultReason::VM_FAULT_OOM | VmFaultReason::VM_FAULT_OOM_INJECTED;
         }
         let address = pfm.address_aligned_down();
         let vma = pfm.vma();
@@ -1090,7 +1090,7 @@ impl PageFaultHandler {
         end_pgoff: usize,
     ) -> VmFaultReason {
         if crate::mm::oom::should_inject_fault_oom() {
-            return VmFaultReason::VM_FAULT_OOM;
+            return VmFaultReason::VM_FAULT_OOM | VmFaultReason::VM_FAULT_OOM_INJECTED;
         }
         let vma = pfm.vma();
         let vma_guard = vma.lock();

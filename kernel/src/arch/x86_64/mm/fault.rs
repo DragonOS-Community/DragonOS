@@ -328,6 +328,8 @@ impl X86_64MMArch {
         );
         let current_address_space: Arc<AddressSpace> = AddressSpace::current().unwrap();
 
+        let mut tried_direct_reclaim = false;
+
         loop {
             let mut space_guard = current_address_space.write();
             let mut fault;
@@ -520,6 +522,21 @@ impl X86_64MMArch {
                 }
 
                 if fault.contains(VmFaultReason::VM_FAULT_OOM) {
+                    // Skip direct reclaim for fault-injection OOM: the injection
+                    // consumes a fail count on the first fault, so reclaiming
+                    // then retrying would bypass the killer entirely.
+                    if !tried_direct_reclaim
+                        && !fault.contains(VmFaultReason::VM_FAULT_OOM_INJECTED)
+                    {
+                        tried_direct_reclaim = true;
+                        drop(space_guard);
+                        crate::mm::page::PageReclaimer::shrink_list(
+                            <crate::mm::allocator::page_frame::PageFrameCount>::new(64),
+                        );
+                        flags |= FaultFlags::FAULT_FLAG_TRIED;
+                        continue;
+                    }
+
                     error!(
                         "page fault OOM: pid={:?}, addr={:#x}, rip={:#x}, fault={:?}",
                         ProcessManager::current_pid(),
@@ -533,7 +550,7 @@ impl X86_64MMArch {
                         trigger_tgid: ProcessManager::current_pcb().raw_tgid(),
                         fault_address: address,
                         fault_ip: regs.rip as usize,
-                        order: 1,
+                        order: 0,
                     };
                     match crate::mm::oom::pagefault_out_of_memory(ctx) {
                         OomOutcome::Retry => {

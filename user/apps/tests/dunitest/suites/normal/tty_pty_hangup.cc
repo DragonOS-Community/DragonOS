@@ -311,6 +311,54 @@ std::string ReadCanonicalLine(int fd) {
     return std::string(buf, buf + n);
 }
 
+std::string ReadExpectedBytesWithPoll(int fd, size_t expected, size_t max_chunk) {
+    std::string output(expected, '\0');
+    size_t total = 0;
+    while (total < expected) {
+        struct pollfd pfd = {
+            .fd = fd,
+            .events = POLLIN | POLLHUP | POLLERR,
+            .revents = 0,
+        };
+        int ret = 0;
+        do {
+            ret = poll(&pfd, 1, 5000);
+        } while (ret < 0 && errno == EINTR);
+
+        if (ret <= 0) {
+            ADD_FAILURE() << "poll waiting for canonical data failed: errno="
+                          << (ret < 0 ? errno : ETIMEDOUT) << " ("
+                          << strerror(ret < 0 ? errno : ETIMEDOUT) << "), total=" << total
+                          << ", expected=" << expected;
+            output.resize(total);
+            return output;
+        }
+        if ((pfd.revents & POLLIN) == 0) {
+            ADD_FAILURE() << "poll returned without POLLIN, revents=" << pfd.revents
+                          << ", total=" << total << ", expected=" << expected;
+            output.resize(total);
+            return output;
+        }
+
+        const size_t chunk = std::min(max_chunk, expected - total);
+        ssize_t n = 0;
+        do {
+            n = read(fd, output.data() + total, chunk);
+        } while (n < 0 && errno == EINTR);
+
+        if (n <= 0) {
+            ADD_FAILURE() << "read canonical data failed: errno=" << (n < 0 ? errno : EIO)
+                          << " (" << strerror(n < 0 ? errno : EIO) << "), total=" << total
+                          << ", expected=" << expected;
+            output.resize(total);
+            return output;
+        }
+        total += static_cast<size_t>(n);
+    }
+
+    return output;
+}
+
 struct ConcurrentSlaveOpenArgs {
     const char* slave_name;
     int start_read_fd;
@@ -1341,6 +1389,95 @@ TEST(TtyPtyHangup, LargeCanonicalMasterWriteDrainsWithSmallSlaveReads) {
     ASSERT_EQ(input.size(), args.written);
     ASSERT_EQ(output.size(), total);
     EXPECT_EQ(input, std::string(output.begin(), output.end()));
+}
+
+TEST(TtyPtyHangup, Canonical4095PayloadPreserved) {
+    PtyPair pair = OpenCanonicalNoEchoPty();
+    ASSERT_GE(pair.master.get(), 0);
+    ASSERT_GE(pair.slave.get(), 0);
+
+    std::string input(4095, 'x');
+    input.push_back('\n');
+
+    WriteAllArgs args = {
+        .fd = pair.master.get(),
+        .data = input.data(),
+        .len = input.size(),
+        .written = 0,
+        .error = 0,
+    };
+    pthread_t writer = {};
+    ASSERT_EQ(0, pthread_create(&writer, nullptr, WriteAll, &args)) << "pthread_create failed";
+
+    std::string output = ReadExpectedBytesWithPoll(pair.slave.get(), input.size(), 257);
+
+    ASSERT_EQ(0, pthread_join(writer, nullptr)) << "pthread_join failed";
+    ASSERT_EQ(0, args.error) << "writer failed after " << args.written << " bytes: errno="
+                             << args.error << " (" << strerror(args.error) << ")";
+    ASSERT_EQ(input.size(), args.written);
+    ASSERT_EQ(input.size(), output.size());
+    EXPECT_EQ(input, output);
+}
+
+TEST(TtyPtyHangup, CanonicalOver4095PayloadTruncatedLikeLinux) {
+    PtyPair pair = OpenCanonicalNoEchoPty();
+    ASSERT_GE(pair.master.get(), 0);
+    ASSERT_GE(pair.slave.get(), 0);
+
+    std::string input(4096, 'y');
+    input.push_back('\n');
+    std::string expected(4095, 'y');
+    expected.push_back('\n');
+
+    WriteAllArgs args = {
+        .fd = pair.master.get(),
+        .data = input.data(),
+        .len = input.size(),
+        .written = 0,
+        .error = 0,
+    };
+    pthread_t writer = {};
+    ASSERT_EQ(0, pthread_create(&writer, nullptr, WriteAll, &args)) << "pthread_create failed";
+
+    std::string output = ReadExpectedBytesWithPoll(pair.slave.get(), expected.size(), 257);
+
+    ASSERT_EQ(0, pthread_join(writer, nullptr)) << "pthread_join failed";
+    ASSERT_EQ(0, args.error) << "writer failed after " << args.written << " bytes: errno="
+                             << args.error << " (" << strerror(args.error) << ")";
+    ASSERT_EQ(input.size(), args.written);
+    ASSERT_EQ(expected.size(), output.size());
+    EXPECT_EQ(expected, output);
+}
+
+TEST(TtyPtyHangup, MultipleLongCanonicalLinesDrainWithoutLoss) {
+    PtyPair pair = OpenCanonicalNoEchoPty();
+    ASSERT_GE(pair.master.get(), 0);
+    ASSERT_GE(pair.slave.get(), 0);
+
+    std::string input;
+    for (int i = 0; i < 8; ++i) {
+        input.append(3072, static_cast<char>('a' + i));
+        input.push_back('\n');
+    }
+
+    WriteAllArgs args = {
+        .fd = pair.master.get(),
+        .data = input.data(),
+        .len = input.size(),
+        .written = 0,
+        .error = 0,
+    };
+    pthread_t writer = {};
+    ASSERT_EQ(0, pthread_create(&writer, nullptr, WriteAll, &args)) << "pthread_create failed";
+
+    std::string output = ReadExpectedBytesWithPoll(pair.slave.get(), input.size(), 511);
+
+    ASSERT_EQ(0, pthread_join(writer, nullptr)) << "pthread_join failed";
+    ASSERT_EQ(0, args.error) << "writer failed after " << args.written << " bytes: errno="
+                             << args.error << " (" << strerror(args.error) << ")";
+    ASSERT_EQ(input.size(), args.written);
+    ASSERT_EQ(input.size(), output.size());
+    EXPECT_EQ(input, output);
 }
 
 TEST(TtyPtyHangup, TciflushDoesNotDiscardLargeOpostSlaveOutput) {

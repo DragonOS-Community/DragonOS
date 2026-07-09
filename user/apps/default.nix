@@ -64,11 +64,12 @@ let
   );
 in
 [
-  (static.busybox.override {
-    extraConfig = ''
-      CONFIG_FEATURE_DEFAULT_PASSWD_ALGO "sha512"
-    '';
-  })
+	  (static.busybox.override {
+	    extraConfig = ''
+	      CONFIG_FEATURE_DEFAULT_PASSWD_ALGO "sha512"
+	      CONFIG_FEATURE_EDITING_MAX_LEN 8192
+	    '';
+	  })
   static.curl
   static.dropbear
   cross.glibc

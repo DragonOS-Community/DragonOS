@@ -75,6 +75,7 @@ pub struct VirtConsole {
 
 struct InnerVirtConsole {
     vcdev: Option<Arc<TtyDevice>>,
+    devfs_removing: bool,
 }
 
 impl VirtConsole {
@@ -83,7 +84,10 @@ impl VirtConsole {
             vc_data,
             port: Arc::new(DefaultTtyPort::new()),
             index: Lazy::new(),
-            inner: SpinLock::new(InnerVirtConsole { vcdev: None }),
+            inner: SpinLock::new(InnerVirtConsole {
+                vcdev: None,
+                devfs_removing: false,
+            }),
         })
     }
 
@@ -124,15 +128,26 @@ impl VirtConsole {
         Ok(())
     }
 
-    fn devfs_remove(&self) {
-        let vcdev = self.inner.lock().vcdev.take();
-        if let Some(vcdev) = vcdev {
-            devfs_unregister(vcdev.name_ref(), vcdev.clone())
-                .inspect_err(|e| {
-                    log::error!("virt console: devfs_unregister failed: {:?}", e);
-                })
-                .ok();
+    fn devfs_remove(&self) -> Result<bool, SystemError> {
+        let vcdev = {
+            let mut inner = self.inner.lock();
+            if inner.devfs_removing {
+                return Ok(false);
+            }
+            let Some(vcdev) = inner.vcdev.take() else {
+                return Ok(true);
+            };
+            inner.devfs_removing = true;
+            vcdev
+        };
+        let result = devfs_unregister(vcdev.name_ref(), vcdev.clone());
+        let mut inner = self.inner.lock();
+        inner.devfs_removing = false;
+        if let Err(e) = result {
+            inner.vcdev = Some(vcdev);
+            return Err(e);
         }
+        Ok(true)
     }
 }
 
@@ -160,16 +175,16 @@ impl VirtConsoleManager {
     }
 
     pub fn get(&self, index: usize) -> Option<Arc<VirtConsole>> {
-        let inner = self.inner.lock();
+        let inner = self.inner.lock_irqsave();
         inner.consoles.get(&index).cloned()
     }
 
     pub fn alloc(&self, vc: Arc<VirtConsole>) -> Option<usize> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.inner.lock_irqsave();
         let index = inner.ida.alloc()?;
         vc.index.init(index);
         if let Some(vc_data) = vc.vc_data.as_ref() {
-            vc_data.lock().vc_index = index;
+            vc_data.lock_irqsave().vc_index = index;
         }
 
         inner.consoles.insert(index, vc);
@@ -178,20 +193,46 @@ impl VirtConsoleManager {
 
     /// 释放虚拟终端
     pub fn free(&self, index: usize) {
-        let mut inner = self.inner.lock();
-        if let Some(vc) = inner.consoles.remove(&index) {
-            vc.devfs_remove();
+        let vc = {
+            let inner = self.inner.lock_irqsave();
+            inner.consoles.get(&index).cloned()
+        };
+        if let Some(vc) = vc {
+            let remove_done = match vc.devfs_remove() {
+                Ok(remove_done) => remove_done,
+                Err(e) => {
+                    log::error!("virt console: devfs_unregister failed: {:?}", e);
+                    return;
+                }
+            };
+            if !remove_done {
+                return;
+            }
+            let mut inner = self.inner.lock_irqsave();
+            if inner
+                .consoles
+                .get(&index)
+                .is_some_and(|stored| Arc::ptr_eq(stored, &vc))
+            {
+                inner.consoles.remove(&index);
+                inner.ida.free(index);
+            }
         }
-        inner.ida.free(index);
     }
 
     /// 获取当前虚拟终端
     pub fn current_vc(&self) -> Option<Arc<VirtConsole>> {
-        self.current_vc.read().as_ref().map(|(vc, _)| vc.clone())
+        self.current_vc
+            .read_irqsave()
+            .as_ref()
+            .map(|(vc, _)| vc.clone())
     }
 
     pub fn current_vc_index(&self) -> Option<usize> {
-        self.current_vc.read().as_ref().map(|(_, index)| *index)
+        self.current_vc
+            .read_irqsave()
+            .as_ref()
+            .map(|(_, index)| *index)
     }
 
     pub fn current_vc_tty_name(&self) -> Option<String> {
@@ -203,7 +244,7 @@ impl VirtConsoleManager {
     /// 设置当前虚拟终端
     pub fn set_current_vc(&self, vc: Arc<VirtConsole>) {
         let index = *vc.index.get();
-        *self.current_vc.write() = Some((vc, index));
+        *self.current_vc.write_irqsave() = Some((vc, index));
     }
 
     /// 通过tty名称查找虚拟终端
@@ -212,7 +253,7 @@ impl VirtConsoleManager {
     ///
     /// * `name` - tty名称 (如ttyS0)
     pub fn lookup_vc_by_tty_name(&self, name: &str) -> Option<Arc<VirtConsole>> {
-        let inner = self.inner.lock();
+        let inner = self.inner.lock_irqsave();
         for (_index, vc) in inner.consoles.iter() {
             let found = vc
                 .port

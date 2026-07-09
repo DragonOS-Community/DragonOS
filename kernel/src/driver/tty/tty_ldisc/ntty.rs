@@ -9,6 +9,7 @@ use system_error::SystemError;
 use crate::{
     arch::ipc::signal::Signal,
     driver::tty::{
+        kthread::{retry_tty_input_producers, tty_kick_input_worker},
         pty::unix98pty::{
             pty_drain_pending_to, pty_flush_input_buffer, pty_receive_flush_input_buffer,
         },
@@ -1043,12 +1044,22 @@ impl NTtyData {
         if !termios.local_mode.contains(LocalMode::NOFLSH) {
             self.discard_output_state();
 
-            let _ = tty.flush_buffer(tty.core());
+            if let Some(port) = tty.core().port() {
+                if port.clear_input_from_receive() != 0 {
+                    retry_tty_input_producers();
+                }
+            }
+
+            let ret = tty.core().driver().driver_funcs().flush_buffer(tty.core());
+            if ret != Err(SystemError::ENOSYS) {
+                let _ = ret;
+            }
 
             let _ = pty_receive_flush_input_buffer(tty.clone(), || {
                 self.read_head = 0;
                 self.canon_head = 0;
                 self.read_tail = 0;
+                self.commit_head = 0;
                 self.line_start = 0;
 
                 self.erasing = false;
@@ -1760,6 +1771,11 @@ impl TtyLineDiscipline for NTtyLinediscipline {
     /// ## 重置缓冲区的基本信息
     fn flush_buffer(&self, tty: Arc<TtyCore>) -> Result<(), system_error::SystemError> {
         let core = tty.core();
+        if let Some(port) = core.port() {
+            if port.clear_input() != 0 {
+                retry_tty_input_producers();
+            }
+        }
         pty_flush_input_buffer(tty.clone(), || {
             let _ = core.termios();
             let mut ldata = self.disc_data();
@@ -1851,6 +1867,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
             let read_tail_moved = tail != ldata.read_tail;
             drop(ldata);
             if read_tail_moved {
+                tty_kick_input_worker(tty.clone());
                 Self::check_pty_unthrottle_after_read(&tty);
             }
             return Ok(offset);
@@ -2018,6 +2035,7 @@ impl TtyLineDiscipline for NTtyLinediscipline {
         let read_tail_moved = tail != ldata.read_tail;
         drop(ldata);
         if read_tail_moved {
+            tty_kick_input_worker(tty.clone());
             Self::check_pty_unthrottle_after_read(&tty);
         }
 

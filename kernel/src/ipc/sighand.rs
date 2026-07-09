@@ -11,9 +11,10 @@ use crate::{
     ipc::signal_types::{SaHandlerType, SigCode, SigInfo, SigPending, SigactionType, SignalFlags},
     libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
     libs::wait_queue::WaitQueue,
+    mm::ucontext::AddressSpace,
     process::{
         pid::{Pid, PidType},
-        ProcessControlBlock, ProcessManager,
+        ProcessControlBlock, ProcessManager, RawPid,
     },
 };
 
@@ -59,6 +60,14 @@ pub struct InnerSigHand {
     pub group_exec_task: Option<Weak<ProcessControlBlock>>,
     /// 线程组 exec（de-thread）等待计数（仿照 Linux 的 signal_struct::notify_count）
     pub group_exec_notify_count: isize,
+    /// The mm through which the OOM killer authorizes the current thread group
+    /// to access memory reserves.
+    ///
+    /// Corresponds to Linux `signal_struct::oom_mm`: the entitlement belongs to
+    /// the selected thread group, not to any arbitrary task sharing the same mm.
+    pub oom_tgid: Option<RawPid>,
+    pub oom_mm_id: Option<u64>,
+    pub oom_mm: Option<Arc<AddressSpace>>,
     pub pids: [Option<Arc<Pid>>; PidType::PIDTYPE_MAX],
     /// 在 sighand 上维护的引用计数（与 Linux 一致的布局位置）
     pub cnt: i64,
@@ -176,6 +185,18 @@ impl SigHand {
         self_guard.group_exec_task = other_guard.group_exec_task.clone();
         self_guard.group_exec_notify_count = other_guard.group_exec_notify_count;
         self_guard.pids = other_guard.pids.clone();
+    }
+
+    pub fn mark_oom_mm(&self, tgid: RawPid, mm: &Arc<AddressSpace>) {
+        let mut g = self.inner_mut();
+        g.oom_tgid = Some(tgid);
+        g.oom_mm_id = Some(mm.id());
+        g.oom_mm = Some(mm.clone());
+    }
+
+    pub fn is_oom_victim_tgid(&self, tgid: RawPid) -> bool {
+        let g = self.inner();
+        g.oom_tgid == Some(tgid) && g.oom_mm.is_some()
     }
 
     // ===== Shared pending helpers =====
@@ -475,6 +496,9 @@ impl Default for InnerSigHand {
             stop_signal: Signal::SIGSTOP,
             group_exec_task: None,
             group_exec_notify_count: 0,
+            oom_tgid: None,
+            oom_mm_id: None,
+            oom_mm: None,
             cnt: 0,
         }
     }

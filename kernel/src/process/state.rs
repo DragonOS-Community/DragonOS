@@ -199,10 +199,6 @@ bitflags! {
         const PID_UNHASHED = 1 << 15;
         /// Task is currently traced by another task.
         const PTRACED = 1 << 16;
-        /// OOM killer 已选中此进程为受害者；分配器应允许其从储备中分配，
-        /// 使其能完成退出并释放内存。由 mark_oom_victim 设置，exit 清除。
-        /// 等价于 Linux 的 TIF_MEMDIE 语义。
-        const OOM_VICTIM = 1 << 17;
     }
 }
 

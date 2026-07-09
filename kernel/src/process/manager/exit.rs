@@ -198,9 +198,6 @@ impl ProcessManager {
         {
             let pcb = current_pcb.clone();
             pcb.mark_exiting();
-            // Clear OOM victim flag: the task is exiting and no longer needs
-            // memory reserves. Equivalent to Linux exit_oom_victim().
-            crate::mm::oom::exit_oom_victim();
             pid = pcb.pid();
             if pid.is_child_reaper() {
                 pid.ns_of_pid().disable_pid_allocation();
@@ -253,7 +250,7 @@ impl ProcessManager {
             // The CPU-visible active mm is switched to idle here and tracked by
             // per-CPU TlbState. The PCB-visible user_vm becomes None, matching
             // Linux task->mm == NULL after exit_mm().
-            let old_user_vm = {
+            let old_user_vm = pcb.with_task_lock_irqsave(|| {
                 let idle_vm = IDLE_PROCESS_ADDRESS_SPACE();
                 let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
                 let cpu = smp_get_processor_id();
@@ -268,12 +265,14 @@ impl ProcessManager {
                 drop(basic);
                 drop(irq_guard);
                 old_vm
-            };
+            });
             if let Some(old_vm) = old_user_vm.as_ref() {
-                if !Self::mm_has_user_tasks(old_vm) {
+                let last_user = !Self::mm_has_user_tasks(old_vm);
+                if last_user {
                     unsafe {
                         old_vm.write().unmap_all();
                     }
+                    crate::mm::oom::note_oom_victim_mm_released(old_vm.id());
                 }
             }
             drop(old_user_vm);

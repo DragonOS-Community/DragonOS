@@ -15,8 +15,9 @@
 #define BIG_PAGES 16384
 #define PAGE_SIZE 4096
 
-
-#define OOM_SCORE_MAX 1000
+#define OOM_SCORE_MAX 2000
+#define OOM_SCORE_DEFAULT_MIN 600
+#define OOM_SCORE_BOOSTED_MIN 1200
 
 static int write_inject_config(pid_t tgid, unsigned long fail_after, unsigned long fail_times)
 {
@@ -243,12 +244,53 @@ static int expect_exit0(pid_t pid, const char *name)
 static int test_proc_oom_score(void)
 {
     long score;
+    long init_score;
+    long default_score;
+    long boosted_score;
 
-    if (read_proc_int(getpid(), "oom_score", &score) < 0) {
+    if (read_proc_int(1, "oom_score", &init_score) < 0) {
         return -1;
     }
-    if (score < 0 || score > OOM_SCORE_MAX) {
-        fprintf(stderr, "oom_score out of range: %ld\n", score);
+    if (init_score != 0) {
+        fprintf(stderr, "global init oom_score should be 0, got %ld\n", init_score);
+        return -1;
+    }
+
+    if (read_proc_int(getpid(), "oom_score", &default_score) < 0) {
+        return -1;
+    }
+    if (default_score < 0 || default_score > OOM_SCORE_MAX) {
+        fprintf(stderr, "oom_score out of range: %ld\n", default_score);
+        return -1;
+    }
+    if (default_score < OOM_SCORE_DEFAULT_MIN) {
+        fprintf(stderr, "default oom_score too low for Linux [0,2000] scale: %ld\n",
+                default_score);
+        return -1;
+    }
+
+    if (write_proc_int(getpid(), "oom_score_adj", 1000) < 0) {
+        return -1;
+    }
+    if (read_proc_int(getpid(), "oom_score", &boosted_score) < 0) {
+        (void)write_proc_int(getpid(), "oom_score_adj", 0);
+        return -1;
+    }
+    if (write_proc_int(getpid(), "oom_score_adj", 0) < 0) {
+        return -1;
+    }
+    if (boosted_score < 0 || boosted_score > OOM_SCORE_MAX) {
+        fprintf(stderr, "boosted oom_score out of range: %ld\n", boosted_score);
+        return -1;
+    }
+    if (boosted_score < OOM_SCORE_BOOSTED_MIN) {
+        fprintf(stderr, "boosted oom_score too low for Linux [0,2000] scale: %ld\n",
+                boosted_score);
+        return -1;
+    }
+    if (boosted_score < default_score) {
+        fprintf(stderr, "oom_score_adj=1000 should not lower oom_score: %ld -> %ld\n",
+                default_score, boosted_score);
         return -1;
     }
 

@@ -22,20 +22,26 @@ impl ProcessManager {
 }
 
 impl ProcessControlBlock {
+    pub fn with_task_lock_irqsave<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _task_guard = self.task_lock.lock_irqsave();
+        f()
+    }
+
     pub fn sighand(&self) -> Arc<SigHand> {
         self.sighand.load()
     }
 
     pub fn replace_sighand(&self, new: Arc<SigHand>) {
-        let _task_guard = self.task_lock.lock_irqsave();
-        new.attach_task_ref();
-        let old = self.sighand.swap(new.clone());
-        if Arc::ptr_eq(&old, &new) {
-            new.detach_task_ref();
-            return;
-        }
+        self.with_task_lock_irqsave(|| {
+            new.attach_task_ref();
+            let old = self.sighand.swap(new.clone());
+            if Arc::ptr_eq(&old, &new) {
+                new.detach_task_ref();
+                return;
+            }
 
-        old.detach_task_ref();
-        crate::rcu::rcu_defer_drop(old);
+            old.detach_task_ref();
+            crate::rcu::rcu_defer_drop(old);
+        });
     }
 }

@@ -364,14 +364,7 @@ where
     // page tables or kernel objects while exiting and freeing their mm.
     // This mirrors Linux's TIF_MEMDIE reserve access at the page allocator.
     crate::mm::page::PageReclaimer::wakeup_claim_thread();
-    for _ in 0..1000 {
-        if let Some(frame) = try_allocate() {
-            return Some(frame);
-        }
-        core::hint::spin_loop();
-    }
-
-    None
+    try_allocate()
 }
 
 /// @brief 向全局页帧分配器释放连续count个页帧

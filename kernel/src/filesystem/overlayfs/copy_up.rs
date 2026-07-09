@@ -178,7 +178,7 @@ impl OvlInode {
     }
 
     fn adjust_metadata_for_truncate_copy_up(metadata: &mut Metadata, copy_size: Option<usize>) {
-        if copy_size != Some(0) || metadata.file_type != FileType::File || metadata.size == 0 {
+        if copy_size != Some(0) || metadata.file_type != FileType::File {
             return;
         }
 

@@ -724,7 +724,6 @@ where
     F: FnOnce(&Arc<dyn IndexNode>) -> Result<(), SystemError>,
 {
     let md = inode.metadata()?;
-    let old_size = md.size;
 
     // 防御性检查：统一拒绝超出 isize::MAX 的长度，避免后续类型转换溢出
     if len > isize::MAX as usize {
@@ -764,14 +763,14 @@ where
 
     let result = do_resize(&inode);
 
-    if result.is_ok() && old_size != len as i64 {
-        clear_suid_sgid_after_size_change(inode.as_ref())?;
+    if result.is_ok() {
+        clear_suid_sgid_after_truncate(inode.as_ref())?;
     }
 
     result
 }
 
-fn clear_suid_sgid_after_size_change(inode: &dyn IndexNode) -> Result<(), SystemError> {
+fn clear_suid_sgid_after_truncate(inode: &dyn IndexNode) -> Result<(), SystemError> {
     let cred = ProcessManager::current_pcb().cred();
     if cred.has_capability(CAPFlags::CAP_FSETID) {
         return Ok(());
@@ -863,7 +862,7 @@ pub fn resize_based_fallocate(
 
     let result = inode.resize_with_lock_owner(new_size, lock_owner);
     if result.is_ok() && md.size != new_size as i64 {
-        clear_suid_sgid_after_size_change(inode)?;
+        clear_suid_sgid_after_truncate(inode)?;
     }
 
     result

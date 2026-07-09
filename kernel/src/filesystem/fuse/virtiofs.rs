@@ -953,7 +953,7 @@ fn start_bridge(instance: Arc<VirtioFsInstance>, conn: Arc<FuseConn>) -> Result<
     }
     transport.set_guest_page_size(PAGE_SIZE as u32);
 
-    let hiprio_vq = match VirtQueue::<HalImpl, { VIRTIOFS_REQ_QUEUE_SIZE }>::new(
+    let mut hiprio_vq = match VirtQueue::<HalImpl, { VIRTIOFS_REQ_QUEUE_SIZE }>::new(
         &mut transport,
         instance.hiprio_queue_index(),
         false,
@@ -967,13 +967,14 @@ fn start_bridge(instance: Arc<VirtioFsInstance>, conn: Arc<FuseConn>) -> Result<
             return Err(se);
         }
     };
+    hiprio_vq.set_dev_notify(true);
 
     let mut request_vqs = Vec::with_capacity(instance.request_queue_count());
     for slot in 0..instance.request_queue_count() {
         let idx = instance
             .request_queue_index_by_slot(slot)
             .ok_or(SystemError::EINVAL)?;
-        let vq = match VirtQueue::<HalImpl, { VIRTIOFS_REQ_QUEUE_SIZE }>::new(
+        let mut vq = match VirtQueue::<HalImpl, { VIRTIOFS_REQ_QUEUE_SIZE }>::new(
             &mut transport,
             idx,
             false,
@@ -987,6 +988,7 @@ fn start_bridge(instance: Arc<VirtioFsInstance>, conn: Arc<FuseConn>) -> Result<
                 return Err(se);
             }
         };
+        vq.set_dev_notify(true);
         request_vqs.push(vq);
     }
     transport.finish_init();

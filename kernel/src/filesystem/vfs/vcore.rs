@@ -779,13 +779,16 @@ fn clear_suid_sgid_after_truncate(inode: &dyn IndexNode) -> Result<(), SystemErr
     let mut md = inode.metadata()?;
     if md.file_type == FileType::File && md.mode.intersects(InodeMode::S_ISUID | InodeMode::S_ISGID)
     {
+        let original_mode = md.mode;
         md.mode.remove(InodeMode::S_ISUID);
 
         if should_remove_sgid(md.mode, md.gid, &cred) {
             md.mode.remove(InodeMode::S_ISGID);
         }
 
-        inode.set_metadata(&md)?;
+        if md.mode != original_mode {
+            inode.set_metadata(&md)?;
+        }
     }
 
     Ok(())

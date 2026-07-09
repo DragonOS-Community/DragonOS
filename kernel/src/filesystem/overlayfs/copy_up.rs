@@ -17,6 +17,26 @@ use system_error::SystemError;
 
 const COPY_UP_CHUNK_SIZE: usize = 64 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyUpOutcome {
+    Published,
+    PublishedAfterTruncate,
+    Existing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OpenCopyUpOutcome {
+    NoTruncateRequested,
+    TruncateCompletedBeforePublish,
+    NeedsPostOpenTruncate,
+}
+
+impl OpenCopyUpOutcome {
+    pub(super) fn needs_post_open_truncate(self) -> bool {
+        self == Self::NeedsPostOpenTruncate
+    }
+}
+
 impl OvlInode {
     pub(super) fn writable_upper_inode_locked(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
         if let Some(inode) = self.upper_inode.lock().clone() {
@@ -27,7 +47,10 @@ impl OvlInode {
         self.upper_inode.lock().clone().ok_or(SystemError::EROFS)
     }
 
-    pub(super) fn copy_up_for_open(&self, flags: &FileFlags) -> Result<(), SystemError> {
+    pub(super) fn copy_up_for_open(
+        &self,
+        flags: &FileFlags,
+    ) -> Result<OpenCopyUpOutcome, SystemError> {
         let copy_size = if flags.contains(FileFlags::O_TRUNC) {
             Some(0)
         } else {
@@ -36,17 +59,27 @@ impl OvlInode {
 
         let fs = self.overlay_fs()?;
         let _mutation_guard = fs.mutation_lock.lock();
-        self.copy_up_locked_with_size(copy_size)
+        let outcome = self.copy_up_locked_with_size(copy_size)?;
+        if copy_size.is_none() {
+            Ok(OpenCopyUpOutcome::NoTruncateRequested)
+        } else if outcome == CopyUpOutcome::PublishedAfterTruncate {
+            Ok(OpenCopyUpOutcome::TruncateCompletedBeforePublish)
+        } else {
+            Ok(OpenCopyUpOutcome::NeedsPostOpenTruncate)
+        }
     }
 
     pub(super) fn copy_up_locked(&self) -> Result<(), SystemError> {
-        self.copy_up_locked_with_size(None)
+        self.copy_up_locked_with_size(None).map(|_| ())
     }
 
-    fn copy_up_locked_with_size(&self, copy_size: Option<usize>) -> Result<(), SystemError> {
+    fn copy_up_locked_with_size(
+        &self,
+        copy_size: Option<usize>,
+    ) -> Result<CopyUpOutcome, SystemError> {
         let mut upper_inode = self.upper_inode.lock();
         if upper_inode.is_some() {
-            return Ok(());
+            return Ok(CopyUpOutcome::Existing);
         }
 
         let lower_inode = self.lower_inodes.first().ok_or(SystemError::ENOENT)?;
@@ -55,7 +88,7 @@ impl OvlInode {
         Self::adjust_metadata_for_truncate_copy_up(&mut metadata, copy_size);
         if self.redirect.is_empty() {
             *upper_inode = Some(self.upper_root_inode()?);
-            return Ok(());
+            return Ok(CopyUpOutcome::Existing);
         }
 
         let (parent_path, name) = self.upper_parent_path_and_name();
@@ -63,7 +96,7 @@ impl OvlInode {
         match parent_inode.find(name) {
             Ok(existing) => {
                 *upper_inode = Some(Self::validate_existing_upper(existing, &metadata)?);
-                return Ok(());
+                return Ok(CopyUpOutcome::Existing);
             }
             Err(SystemError::ENOENT) => {}
             Err(err) => return Err(err),
@@ -89,16 +122,35 @@ impl OvlInode {
             return Err(err);
         }
 
+        let publish_outcome = if copy_size == Some(0) && metadata.file_type == FileType::File {
+            let truncate_result = (|| {
+                // Truncate privilege-bit rules must use the lower inode's semantic owner/group.
+                let mut temp_metadata = temp_inode.metadata()?;
+                temp_metadata.uid = metadata.uid;
+                temp_metadata.gid = metadata.gid;
+                temp_metadata.mode = metadata.mode;
+                temp_inode.set_metadata(&temp_metadata)?;
+                vfs::vcore::vfs_truncate(temp_inode.clone(), 0)
+            })();
+            if let Err(err) = truncate_result {
+                Self::cleanup_workdir_temp(&workdir, &temp_name);
+                return Err(err);
+            }
+            CopyUpOutcome::PublishedAfterTruncate
+        } else {
+            CopyUpOutcome::Published
+        };
+
         match workdir.move_to(&temp_name, &parent_inode, name, RenameFlags::NOREPLACE) {
             Ok(()) => {
                 *upper_inode = Some(Self::validate_existing_upper(temp_inode, &metadata)?);
-                return Ok(());
+                return Ok(publish_outcome);
             }
             Err(SystemError::EEXIST) => {
                 Self::cleanup_workdir_temp(&workdir, &temp_name);
                 let existing = parent_inode.find(name)?;
                 *upper_inode = Some(Self::validate_existing_upper(existing, &metadata)?);
-                return Ok(());
+                return Ok(CopyUpOutcome::Existing);
             }
             Err(err) => {
                 Self::cleanup_workdir_temp(&workdir, &temp_name);

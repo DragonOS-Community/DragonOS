@@ -180,7 +180,7 @@ fn open_backing_file(
     flags: FileFlags,
 ) -> Result<OverlayFilePrivateData, SystemError> {
     if open_flags_need_copy_up(&flags) {
-        inode.copy_up()?;
+        inode.copy_up_for_open(&flags)?;
     }
 
     let (backing_inode, backing_is_upper) = inode.current_realdata_inode()?;

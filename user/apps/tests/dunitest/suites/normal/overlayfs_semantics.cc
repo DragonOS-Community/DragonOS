@@ -11,6 +11,8 @@
 #include <sys/sysmacros.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <algorithm>
 #include <string>
 #include <unistd.h>
 
@@ -86,6 +88,83 @@ std::string read_text(const std::string& path) {
     return std::string(buf, static_cast<size_t>(n));
 }
 
+int overlay_temp_entry_count(const std::string& dir_path) {
+    DIR* dir = opendir(dir_path.c_str());
+    if (dir == nullptr) {
+        return -1;
+    }
+
+    int count = 0;
+    while (dirent* ent = readdir(dir)) {
+        if (strncmp(ent->d_name, ".dragonos-ovl-", strlen(".dragonos-ovl-")) == 0) {
+            count++;
+        }
+    }
+    closedir(dir);
+    return count;
+}
+
+bool write_pattern_file(const std::string& path, size_t size) {
+    int fd = open(path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0) {
+        return false;
+    }
+
+    char buf[4096] = {};
+    size_t offset = 0;
+    while (offset < size) {
+        size_t chunk = std::min(sizeof(buf), size - offset);
+        for (size_t i = 0; i < chunk; ++i) {
+            buf[i] = static_cast<char>((offset + i) & 0xff);
+        }
+
+        ssize_t written = write(fd, buf, chunk);
+        if (written != static_cast<ssize_t>(chunk)) {
+            int saved_errno = errno;
+            close(fd);
+            errno = saved_errno;
+            return false;
+        }
+        offset += chunk;
+    }
+
+    return close(fd) == 0;
+}
+
+bool validate_pattern_window(int fd, size_t offset, size_t len) {
+    char buf[4096] = {};
+    if (len > sizeof(buf)) {
+        return false;
+    }
+
+    ssize_t n = pread(fd, buf, len, static_cast<off_t>(offset));
+    if (n != static_cast<ssize_t>(len)) {
+        return false;
+    }
+
+    for (size_t i = 0; i < len; ++i) {
+        if (buf[i] != static_cast<char>((offset + i) & 0xff)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool validate_pattern_file(const std::string& path, size_t size) {
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        return false;
+    }
+
+    bool ok = validate_pattern_window(fd, 0, 4096)
+        && validate_pattern_window(fd, size / 2, 4096)
+        && validate_pattern_window(fd, size - 4096, 4096);
+    int saved_errno = errno;
+    close(fd);
+    errno = saved_errno;
+    return ok;
+}
+
 long renameat2_call(const std::string& old_path, const std::string& new_path, unsigned flags) {
     return syscall(__NR_renameat2, AT_FDCWD, old_path.c_str(), AT_FDCWD, new_path.c_str(), flags);
 }
@@ -136,6 +215,16 @@ void cleanup_overlay_env(const OverlayRenameEnv& env) {
     umount(env.merged.c_str());
     remove_recursive(env.root);
 }
+
+struct ScopedOverlayEnv {
+    explicit ScopedOverlayEnv(const char* name) : env(make_overlay_env(name)) {}
+
+    ~ScopedOverlayEnv() {
+        cleanup_overlay_env(env);
+    }
+
+    OverlayRenameEnv env;
+};
 
 bool setup_overlay_env(const OverlayRenameEnv& env) {
     if (ensure_dir("/tmp") != 0 || ensure_dir(env.root.c_str()) != 0
@@ -741,6 +830,165 @@ TEST(OverlayFsSemantics, OpenOverlayDirectoryWithoutFsOpenHook) {
     rmdir(lower);
     rmdir(upper);
     rmdir(root);
+}
+
+TEST(OverlayFsSemantics, CopyUpLowerFilePublishesCompleteUpperFile) {
+    ScopedOverlayEnv scoped("overlayfs_copy_up_file");
+    const auto& env = scoped.env;
+    std::string lower_file = join_path(env.lower, "file");
+    std::string upper_file = join_path(env.upper, "file");
+    std::string merged_file = join_path(env.merged, "file");
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_EQ(0, write_text(lower_file, "lower-copy-up-data"));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    int fd = open(merged_file.c_str(), O_WRONLY | O_CLOEXEC);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+
+    EXPECT_EQ("lower-copy-up-data", read_text(upper_file));
+    EXPECT_EQ("lower-copy-up-data", read_text(merged_file));
+    EXPECT_EQ(0, overlay_temp_entry_count(env.work));
+}
+
+TEST(OverlayFsSemantics, CopyUpNestedLowerFileUsesWorkdirTempAndKeepsLeafAtomic) {
+    ScopedOverlayEnv scoped("overlayfs_copy_up_nested");
+    const auto& env = scoped.env;
+    std::string lower_a = join_path(env.lower, "a");
+    std::string lower_b = join_path(lower_a, "b");
+    std::string lower_file = join_path(lower_b, "file");
+    std::string upper_a = join_path(env.upper, "a");
+    std::string upper_b = join_path(upper_a, "b");
+    std::string upper_file = join_path(upper_b, "file");
+    std::string merged_file = join_path(join_path(join_path(env.merged, "a"), "b"), "file");
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_EQ(0, mkdir(lower_a.c_str(), 0755));
+    ASSERT_EQ(0, mkdir(lower_b.c_str(), 0755));
+    ASSERT_EQ(0, write_text(lower_file, "nested-copy-up-data"));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    int fd = open(merged_file.c_str(), O_WRONLY | O_CLOEXEC);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+
+    struct stat st = {};
+    ASSERT_EQ(0, stat(upper_a.c_str(), &st)) << strerror(errno);
+    EXPECT_TRUE(S_ISDIR(st.st_mode));
+    ASSERT_EQ(0, stat(upper_b.c_str(), &st)) << strerror(errno);
+    EXPECT_TRUE(S_ISDIR(st.st_mode));
+    EXPECT_EQ("nested-copy-up-data", read_text(upper_file));
+    EXPECT_EQ("nested-copy-up-data", read_text(merged_file));
+    EXPECT_EQ(0, overlay_temp_entry_count(env.work));
+}
+
+TEST(OverlayFsSemantics, CopyUpTruncatePublishesEmptyUpperFile) {
+    ScopedOverlayEnv scoped("overlayfs_copy_up_truncate");
+    const auto& env = scoped.env;
+    std::string lower_file = join_path(env.lower, "file");
+    std::string upper_file = join_path(env.upper, "file");
+    std::string merged_file = join_path(env.merged, "file");
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_EQ(0, write_text(lower_file, "must-not-be-published-before-truncate"));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    int fd = open(merged_file.c_str(), O_WRONLY | O_TRUNC | O_CLOEXEC);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+
+    struct stat st = {};
+    ASSERT_EQ(0, stat(upper_file.c_str(), &st)) << strerror(errno);
+    EXPECT_EQ(0, st.st_size);
+    ASSERT_EQ(0, stat(merged_file.c_str(), &st)) << strerror(errno);
+    EXPECT_EQ(0, st.st_size);
+    EXPECT_EQ("", read_text(upper_file));
+    EXPECT_EQ("", read_text(merged_file));
+    EXPECT_EQ("must-not-be-published-before-truncate", read_text(lower_file));
+    EXPECT_EQ(0, overlay_temp_entry_count(env.work));
+}
+
+TEST(OverlayFsSemantics, CopyUpLargeLowerFileConcurrentReadersNeverSeePartialUpper) {
+    constexpr size_t kFileSize = 4 * 1024 * 1024;
+    ScopedOverlayEnv scoped("overlayfs_copy_up_concurrent");
+    const auto& env = scoped.env;
+    std::string lower_file = join_path(env.lower, "large");
+    std::string upper_file = join_path(env.upper, "large");
+    std::string merged_file = join_path(env.merged, "large");
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_TRUE(write_pattern_file(lower_file, kFileSize)) << strerror(errno);
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    int start_pipe[2] = {};
+    int done_pipe[2] = {};
+    ASSERT_EQ(0, pipe(start_pipe)) << strerror(errno);
+    ASSERT_EQ(0, pipe(done_pipe)) << strerror(errno);
+
+    pid_t reader = fork();
+    ASSERT_GE(reader, 0) << strerror(errno);
+    if (reader == 0) {
+        alarm(10);
+        close(start_pipe[1]);
+        close(done_pipe[1]);
+        char token = 0;
+        if (read(start_pipe[0], &token, 1) != 1) {
+            _exit(3);
+        }
+        fcntl(done_pipe[0], F_SETFL, O_NONBLOCK);
+        for (;;) {
+            if (!validate_pattern_file(merged_file, kFileSize)) {
+                _exit(2);
+            }
+            char done = 0;
+            ssize_t n = read(done_pipe[0], &done, 1);
+            if (n == 0 || n == 1) {
+                break;
+            }
+            if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                _exit(4);
+            }
+        }
+        _exit(0);
+    }
+
+    close(start_pipe[0]);
+    close(done_pipe[0]);
+    ASSERT_EQ(1, write(start_pipe[1], "x", 1)) << strerror(errno);
+    close(start_pipe[1]);
+    int fd = open(merged_file.c_str(), O_WRONLY | O_CLOEXEC);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+    close(done_pipe[1]);
+
+    int status = 0;
+    ASSERT_EQ(reader, waitpid(reader, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status)) << "reader status=" << status;
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    EXPECT_TRUE(validate_pattern_file(upper_file, kFileSize));
+    EXPECT_TRUE(validate_pattern_file(merged_file, kFileSize));
+    EXPECT_EQ(0, overlay_temp_entry_count(env.work));
 }
 
 TEST(RenameAt2Semantics, RejectsUnknownWhiteoutAndInvalidFlagCombinations) {

@@ -39,7 +39,7 @@ pub(super) fn rmdir(inode: &OvlInode, name: &str) -> Result<(), SystemError> {
             if !is_dir_empty(&found)? {
                 return Err(SystemError::ENOTEMPTY);
             }
-            return inode.create_whiteout(name);
+            return inode.create_whiteout_locked(name);
         }
         Err(SystemError::ENOENT) => {}
         Err(err) => return Err(err),
@@ -64,7 +64,7 @@ pub(super) fn unlink(inode: &OvlInode, name: &str) -> Result<(), SystemError> {
             if found.metadata()?.file_type == FileType::Dir {
                 return Err(SystemError::EISDIR);
             }
-            return inode.create_whiteout(name);
+            return inode.create_whiteout_locked(name);
         }
         Err(SystemError::ENOENT) => {}
         Err(err) => return Err(err),
@@ -141,7 +141,7 @@ fn create_over_whiteout<F>(
 where
     F: Fn(&Arc<dyn IndexNode>, &str) -> Result<Arc<dyn IndexNode>, SystemError>,
 {
-    let upper_inode = inode.writable_upper_inode()?;
+    let upper_inode = inode.writable_upper_inode_locked()?;
     match upper_inode.find(name) {
         Ok(found) if OvlInode::is_whiteout_inode(&found) => {}
         Ok(_) => return Err(SystemError::EEXIST),

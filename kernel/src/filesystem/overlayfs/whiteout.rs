@@ -16,14 +16,14 @@ impl OvlInode {
             .unwrap_or(false)
     }
 
-    pub(super) fn create_whiteout(&self, name: &str) -> Result<(), SystemError> {
+    pub(super) fn create_whiteout_locked(&self, name: &str) -> Result<(), SystemError> {
         let whiteout_mode = vfs::InodeMode::S_IFCHR;
         if let Some(ref upper_inode) = *self.upper_inode.lock() {
             upper_inode.mknod(name, whiteout_mode, WHITEOUT_DEV)?;
             return Ok(());
         }
 
-        self.copy_up()?;
+        self.copy_up_locked()?;
         let upper_inode = self.upper_inode.lock();
         if let Some(ref upper_inode) = *upper_inode {
             upper_inode.mknod(name, whiteout_mode, WHITEOUT_DEV)?;

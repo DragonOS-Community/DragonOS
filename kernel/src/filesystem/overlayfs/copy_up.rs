@@ -1,28 +1,44 @@
 use super::inode::OvlInode;
 use crate::filesystem::vfs::{
     self,
-    file::{File, FileFlags},
+    file::{File, FileFlags, FilePrivateData},
+    syscall::RenameFlags,
     FileType, IndexNode, Metadata,
 };
+use crate::libs::mutex::Mutex;
 use alloc::string::String;
 use alloc::sync::Arc;
 use system_error::SystemError;
 
 const COPY_UP_CHUNK_SIZE: usize = 64 * 1024;
-type UpperCleanup = Option<(Arc<dyn IndexNode>, String)>;
-type CreatedUpper = (Arc<dyn IndexNode>, UpperCleanup);
 
 impl OvlInode {
-    pub(super) fn writable_upper_inode(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+    pub(super) fn writable_upper_inode_locked(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
         if let Some(inode) = self.upper_inode.lock().clone() {
             return Ok(inode);
         }
 
-        self.copy_up()?;
+        self.copy_up_locked()?;
         self.upper_inode.lock().clone().ok_or(SystemError::EROFS)
     }
 
-    pub(super) fn copy_up(&self) -> Result<(), SystemError> {
+    pub(super) fn copy_up_for_open(&self, flags: &FileFlags) -> Result<(), SystemError> {
+        let copy_size = if flags.contains(FileFlags::O_TRUNC) {
+            Some(0)
+        } else {
+            None
+        };
+
+        let fs = self.overlay_fs()?;
+        let _mutation_guard = fs.mutation_lock.lock();
+        self.copy_up_locked_with_size(copy_size)
+    }
+
+    pub(super) fn copy_up_locked(&self) -> Result<(), SystemError> {
+        self.copy_up_locked_with_size(None)
+    }
+
+    fn copy_up_locked_with_size(&self, copy_size: Option<usize>) -> Result<(), SystemError> {
         let mut upper_inode = self.upper_inode.lock();
         if upper_inode.is_some() {
             return Ok(());
@@ -31,72 +47,65 @@ impl OvlInode {
         let lower_inode = self.lower_inodes.first().ok_or(SystemError::ENOENT)?;
 
         let metadata = lower_inode.metadata()?;
-        let (new_upper_inode, cleanup) = self.create_upper_inode(metadata.clone())?;
+        if self.redirect.is_empty() {
+            *upper_inode = Some(self.upper_root_inode()?);
+            return Ok(());
+        }
 
-        let copy_result = (|| -> Result<(), SystemError> {
-            if metadata.file_type == FileType::File {
-                let size = metadata.size.max(0) as usize;
-                let lower_file = File::new(lower_inode.clone(), FileFlags::O_RDONLY)?;
-                let upper_file = File::new(new_upper_inode.clone(), FileFlags::O_WRONLY)?;
-                let mut buffer = vec![0u8; COPY_UP_CHUNK_SIZE.min(size.max(1))];
-                let mut offset = 0usize;
-
-                while offset < size {
-                    let chunk_len = (size - offset).min(buffer.len());
-                    let read_len = lower_file.pread(offset, chunk_len, &mut buffer[..chunk_len])?;
-                    if read_len == 0 {
-                        return Err(SystemError::EIO);
-                    }
-
-                    let mut written = 0usize;
-                    while written < read_len {
-                        let n = upper_file.pwrite(
-                            offset + written,
-                            read_len - written,
-                            &buffer[written..read_len],
-                        )?;
-                        if n == 0 {
-                            return Err(SystemError::EIO);
-                        }
-                        written += n;
-                    }
-                    offset += read_len;
-                }
+        let (parent_path, name) = self.upper_parent_path_and_name();
+        let parent_inode = self.ensure_upper_dir_path(parent_path)?;
+        match parent_inode.find(name) {
+            Ok(existing) => {
+                *upper_inode = Some(Self::validate_existing_upper(existing, &metadata)?);
+                return Ok(());
             }
+            Err(SystemError::ENOENT) => {}
+            Err(err) => return Err(err),
+        }
 
-            Ok(())
-        })();
+        let symlink_target = if metadata.file_type == FileType::SymLink {
+            Some(Self::read_symlink_target(lower_inode.clone(), &metadata)?)
+        } else {
+            None
+        };
 
-        if let Err(err) = copy_result {
-            if let Some((parent, name)) = cleanup {
-                let _ = parent.unlink(&name);
-            }
+        let (workdir, temp_inode, temp_name) = self.create_workdir_temp(|workdir, temp_name| {
+            Self::create_copy_up_temp(workdir, temp_name, &metadata, symlink_target.as_deref())
+        })?;
+
+        if let Err(err) = Self::copy_data_if_needed(
+            lower_inode.clone(),
+            temp_inode.clone(),
+            &metadata,
+            copy_size,
+        ) {
+            Self::cleanup_workdir_temp(&workdir, &temp_name);
             return Err(err);
         }
 
-        *upper_inode = Some(new_upper_inode);
-
-        Ok(())
+        match workdir.move_to(&temp_name, &parent_inode, name, RenameFlags::NOREPLACE) {
+            Ok(()) => {
+                *upper_inode = Some(Self::validate_existing_upper(temp_inode, &metadata)?);
+                return Ok(());
+            }
+            Err(SystemError::EEXIST) => {
+                Self::cleanup_workdir_temp(&workdir, &temp_name);
+                let existing = parent_inode.find(name)?;
+                *upper_inode = Some(Self::validate_existing_upper(existing, &metadata)?);
+                return Ok(());
+            }
+            Err(err) => {
+                Self::cleanup_workdir_temp(&workdir, &temp_name);
+                return Err(err);
+            }
+        }
     }
 
-    fn create_upper_inode(&self, metadata: Metadata) -> Result<CreatedUpper, SystemError> {
-        let upper_root_inode = self.upper_root_inode()?;
-        if self.redirect.is_empty() {
-            return Ok((upper_root_inode, None));
-        }
-
-        let (parent_path, name) = match self.redirect.rsplit_once('/') {
+    fn upper_parent_path_and_name(&self) -> (&str, &str) {
+        match self.redirect.rsplit_once('/') {
             Some((parent_path, name)) => (parent_path, name),
             None => ("", self.redirect.as_str()),
-        };
-
-        let parent_inode = self.ensure_upper_dir_path(parent_path)?;
-        if let Ok(existing) = parent_inode.find(name) {
-            return Ok((existing, None));
         }
-
-        let inode = parent_inode.create_with_data(name, metadata.file_type, metadata.mode, 0)?;
-        Ok((inode, Some((parent_inode, name.into()))))
     }
 
     fn ensure_upper_dir_path(&self, path: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
@@ -136,5 +145,117 @@ impl OvlInode {
         }
 
         Ok(vfs::InodeMode::S_IRWXUGO)
+    }
+
+    fn validate_existing_upper(
+        inode: Arc<dyn IndexNode>,
+        lower_metadata: &Metadata,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        if Self::is_whiteout_inode(&inode) {
+            return Err(SystemError::ENOENT);
+        }
+
+        let upper_metadata = inode.metadata()?;
+        if upper_metadata.file_type != lower_metadata.file_type {
+            return Err(SystemError::EIO);
+        }
+
+        if matches!(
+            upper_metadata.file_type,
+            FileType::CharDevice | FileType::BlockDevice
+        ) && upper_metadata.raw_dev != lower_metadata.raw_dev
+        {
+            return Err(SystemError::EIO);
+        }
+
+        Ok(inode)
+    }
+
+    fn create_copy_up_temp(
+        workdir: &Arc<dyn IndexNode>,
+        temp_name: &str,
+        metadata: &Metadata,
+        symlink_target: Option<&str>,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        match metadata.file_type {
+            FileType::SymLink => {
+                workdir.symlink(temp_name, symlink_target.ok_or(SystemError::EIO)?)
+            }
+            FileType::CharDevice | FileType::BlockDevice | FileType::Pipe | FileType::Socket => {
+                let mode = (metadata.mode & !vfs::InodeMode::S_IFMT)
+                    | vfs::InodeMode::from(metadata.file_type);
+                workdir.mknod(temp_name, mode, metadata.raw_dev)
+            }
+            _ => workdir.create_with_data(temp_name, metadata.file_type, metadata.mode, 0),
+        }
+    }
+
+    fn copy_data_if_needed(
+        lower_inode: Arc<dyn IndexNode>,
+        upper_inode: Arc<dyn IndexNode>,
+        metadata: &Metadata,
+        copy_size: Option<usize>,
+    ) -> Result<(), SystemError> {
+        if metadata.file_type != FileType::File {
+            return Ok(());
+        }
+
+        let size = copy_size.unwrap_or_else(|| metadata.size.max(0) as usize);
+        if size == 0 {
+            return Ok(());
+        }
+
+        let lower_file = File::new(lower_inode, FileFlags::O_RDONLY)?;
+        let upper_file = File::new(upper_inode, FileFlags::O_WRONLY)?;
+        let mut buffer = vec![0u8; COPY_UP_CHUNK_SIZE.min(size)];
+        let mut offset = 0usize;
+
+        while offset < size {
+            let chunk_len = (size - offset).min(buffer.len());
+            let read_len = lower_file.pread(offset, chunk_len, &mut buffer[..chunk_len])?;
+            if read_len == 0 {
+                return Err(SystemError::EIO);
+            }
+
+            let mut written = 0usize;
+            while written < read_len {
+                let n = upper_file.pwrite(
+                    offset + written,
+                    read_len - written,
+                    &buffer[written..read_len],
+                )?;
+                if n == 0 {
+                    return Err(SystemError::EIO);
+                }
+                written += n;
+            }
+            offset += read_len;
+        }
+
+        Ok(())
+    }
+
+    fn read_symlink_target(
+        lower_inode: Arc<dyn IndexNode>,
+        metadata: &Metadata,
+    ) -> Result<String, SystemError> {
+        let size = metadata.size.max(0) as usize;
+        let mut buffer = vec![0u8; size];
+        let mut offset = 0usize;
+
+        while offset < size {
+            let read_len = lower_inode.read_at(
+                offset,
+                size - offset,
+                &mut buffer[offset..],
+                Mutex::new(FilePrivateData::Unused).lock(),
+            )?;
+            if read_len == 0 {
+                return Err(SystemError::EIO);
+            }
+            offset += read_len;
+        }
+
+        String::from_utf8(buffer).map_err(|_| SystemError::EINVAL)
     }
 }

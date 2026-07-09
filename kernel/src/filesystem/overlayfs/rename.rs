@@ -44,10 +44,10 @@ pub(super) fn move_to(
             return Err(SystemError::EXDEV);
         }
 
-        source.copy_up()?;
-        target_child.copy_up()?;
-        let old_upper_dir = inode.writable_upper_inode()?;
-        let new_upper_dir = target_ovl.writable_upper_inode()?;
+        source.copy_up_locked()?;
+        target_child.copy_up_locked()?;
+        let old_upper_dir = inode.writable_upper_inode_locked()?;
+        let new_upper_dir = target_ovl.writable_upper_inode_locked()?;
         return old_upper_dir.move_to(old_name, &new_upper_dir, new_name, flags);
     }
 
@@ -76,11 +76,11 @@ pub(super) fn move_to(
     }
 
     if !source.is_pure_upper() {
-        source.copy_up()?;
+        source.copy_up_locked()?;
     }
 
-    let old_upper_dir = inode.writable_upper_inode()?;
-    let new_upper_dir = target_ovl.writable_upper_inode()?;
+    let old_upper_dir = inode.writable_upper_inode_locked()?;
+    let new_upper_dir = target_ovl.writable_upper_inode_locked()?;
     let mut upper_flags = flags;
     if target_had_whiteout {
         upper_flags.remove(RenameFlags::NOREPLACE);

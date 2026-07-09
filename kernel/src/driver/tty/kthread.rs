@@ -1,122 +1,206 @@
 //! tty刷新内核线程
 
 use alloc::{string::ToString, sync::Arc};
-use kdepends::thingbuf::StaticThingBuf;
 
 use crate::{
-    arch::CurrentIrqArch,
-    driver::tty::virtual_terminal::vc_manager,
-    exception::tasklet::{tasklet_schedule, Tasklet, TaskletData},
-    exception::InterruptArch,
-    process::{
-        kthread::{KernelThreadClosure, KernelThreadMechanism},
-        ProcessControlBlock, ProcessManager,
+    driver::{
+        char::virtio_console::retry_virtio_console_input,
+        tty::{
+            tty_core::TtyCore,
+            tty_port::{TtyInputByteResult, TTY_PORT_RX_CHUNK_SIZE},
+            virtual_terminal::{vc_manager, MAX_NR_CONSOLES},
+        },
     },
+    exception::tasklet::{tasklet_schedule, Tasklet, TaskletData},
+    libs::wait_queue::WaitQueue,
+    process::kthread::{KernelThreadClosure, KernelThreadMechanism},
     sched::{schedule, SchedMode},
 };
 
-/// 用于缓存 IRQ 上下文投递的 TTY 输入。
-///
-/// N_TTY 规范模式按 Linux 语义支持 4096 字节行缓冲；这里的 IRQ 暂存队列必须
-/// 大于该长度，避免输入还没进入行规程就被提前截断。
-const TTY_RX_IRQ_BUF_SIZE: usize = 8192;
+const TTY_INPUT_WORK_QUEUE_SIZE: usize = MAX_NR_CONSOLES as usize;
+const TTY_INPUT_DRAIN_BUDGET: usize = 16;
 
-/// 单次从 IRQ 暂存队列投递给行规程的最大字节数。
-const TTY_RX_DEQUEUE_MAX: usize = 256;
-
-#[derive(Clone, Copy, Default)]
-struct TtyRxItem {
-    vc_index: usize,
-    byte: u8,
+struct TtyInputWorkQueue {
+    queue: [usize; TTY_INPUT_WORK_QUEUE_SIZE],
+    in_queue: [bool; TTY_INPUT_WORK_QUEUE_SIZE],
+    head: usize,
+    len: usize,
 }
 
-static KEYBUF: StaticThingBuf<TtyRxItem, TTY_RX_IRQ_BUF_SIZE> = StaticThingBuf::new();
+impl TtyInputWorkQueue {
+    const fn new() -> Self {
+        Self {
+            queue: [0; TTY_INPUT_WORK_QUEUE_SIZE],
+            in_queue: [false; TTY_INPUT_WORK_QUEUE_SIZE],
+            head: 0,
+            len: 0,
+        }
+    }
 
-static mut TTY_REFRESH_THREAD: Option<Arc<ProcessControlBlock>> = None;
+    fn push(&mut self, vc_index: usize) -> bool {
+        if vc_index >= TTY_INPUT_WORK_QUEUE_SIZE || self.in_queue[vc_index] {
+            return false;
+        }
+        debug_assert!(self.len < TTY_INPUT_WORK_QUEUE_SIZE);
+        if self.len >= TTY_INPUT_WORK_QUEUE_SIZE {
+            return false;
+        }
+        let idx = (self.head + self.len) % TTY_INPUT_WORK_QUEUE_SIZE;
+        self.queue[idx] = vc_index;
+        self.in_queue[vc_index] = true;
+        self.len += 1;
+        true
+    }
+
+    fn pop(&mut self) -> Option<usize> {
+        if self.len == 0 {
+            return None;
+        }
+        let vc_index = self.queue[self.head];
+        self.head = (self.head + 1) % TTY_INPUT_WORK_QUEUE_SIZE;
+        self.len -= 1;
+        self.in_queue[vc_index] = false;
+        if self.len == 0 {
+            self.head = 0;
+        }
+        Some(vc_index)
+    }
+}
+
+static TTY_INPUT_WORK_QUEUE: crate::libs::spinlock::SpinLock<TtyInputWorkQueue> =
+    crate::libs::spinlock::SpinLock::new(TtyInputWorkQueue::new());
+static TTY_REFRESH_WAIT_QUEUE: WaitQueue = WaitQueue::default();
 
 lazy_static! {
-    /// TTY RX tasklet，用于在 softirq 上下文中处理 TTY 输入
+    /// TTY RX tasklet that wakes the TTY input thread from softirq context.
     static ref TTY_RX_TASKLET: Arc<Tasklet> = Tasklet::new(tty_rx_tasklet_fn, 0, None);
 }
 
 pub(super) fn tty_flush_thread_init() {
     let closure =
         KernelThreadClosure::StaticEmptyClosure((&(tty_refresh_thread as fn() -> i32), ()));
-    let pcb = KernelThreadMechanism::create_and_run(closure, "tty_refresh".to_string())
+    KernelThreadMechanism::create_and_run(closure, "tty_refresh".to_string())
         .ok_or("")
         .expect("create tty_refresh thread failed");
-    unsafe {
-        TTY_REFRESH_THREAD = Some(pcb);
-    }
 }
 
 fn tty_refresh_thread() -> i32 {
     loop {
-        if KEYBUF.is_empty() {
-            // 如果缓冲区为空，就休眠
-            let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-            ProcessManager::mark_sleep(true).expect("TTY_REFRESH_THREAD can not mark sleep");
+        let vc_index =
+            TTY_REFRESH_WAIT_QUEUE.wait_until(|| TTY_INPUT_WORK_QUEUE.lock_irqsave().pop());
+        drain_vc_input(vc_index);
+    }
+}
+
+fn drain_vc_input(vc_index: usize) {
+    let Some(vc) = vc_manager().get(vc_index) else {
+        return;
+    };
+    let port = vc.port();
+    let mut budget = TTY_INPUT_DRAIN_BUDGET;
+
+    while budget != 0 {
+        let drain = match port.drain_input_to_ldisc(TTY_PORT_RX_CHUNK_SIZE) {
+            Ok(drain) => drain,
+            Err(err) => {
+                log::warn!("tty_refresh: drain vc{} input failed: {:?}", vc_index, err);
+                break;
+            }
+        };
+
+        if drain.freed_room != 0 {
+            retry_virtio_console_input();
+        }
+
+        if drain.copied == 0 || !drain.still_pending {
+            break;
+        }
+
+        if drain.blocked {
+            break;
+        }
+
+        budget -= 1;
+        if budget == 0 {
+            queue_tty_input_work(vc_index);
             schedule(SchedMode::SM_NONE);
-        }
-
-        let to_dequeue = core::cmp::min(KEYBUF.len(), TTY_RX_DEQUEUE_MAX);
-        if to_dequeue == 0 {
-            continue;
-        }
-        let mut data = [TtyRxItem::default(); TTY_RX_DEQUEUE_MAX];
-        for item in data.iter_mut().take(to_dequeue) {
-            *item = KEYBUF.pop().unwrap();
-        }
-
-        let mut offset = 0;
-        while offset < to_dequeue {
-            let vc_index = data[offset].vc_index;
-            let mut bytes = [0u8; TTY_RX_DEQUEUE_MAX];
-            let mut count = 0;
-            while offset < to_dequeue && data[offset].vc_index == vc_index {
-                bytes[count] = data[offset].byte;
-                count += 1;
-                offset += 1;
-            }
-
-            if let Some(vc) = vc_manager().get(vc_index) {
-                let _ = vc.port().receive_buf(&bytes[0..count], &[], count);
-            }
+            break;
         }
     }
 }
 
 fn tty_rx_tasklet_fn(_data: usize, _data_obj: Option<Arc<dyn TaskletData>>) {
-    // 在 softirq/tasklet 上下文：不做 drain，只负责唤醒线程去处理输入。
-    if unsafe { TTY_REFRESH_THREAD.is_none() } {
-        return;
+    TTY_REFRESH_WAIT_QUEUE.wakeup(None);
+}
+
+fn queue_tty_input_work_common(vc_index: usize) -> bool {
+    TTY_INPUT_WORK_QUEUE.lock_irqsave().push(vc_index)
+}
+
+fn queue_tty_input_work_from_irq(vc_index: usize) {
+    if queue_tty_input_work_common(vc_index) {
+        tasklet_schedule(&TTY_RX_TASKLET);
     }
-    if KEYBUF.is_empty() {
-        return;
+}
+
+fn queue_tty_input_work(vc_index: usize) {
+    if queue_tty_input_work_common(vc_index) {
+        TTY_REFRESH_WAIT_QUEUE.wakeup(None);
     }
-    let _ = ProcessManager::wakeup(unsafe { TTY_REFRESH_THREAD.as_ref().unwrap() });
 }
 
 /// 在 hardirq 上下文投递输入：只入队并调度 tasklet（不直接唤醒线程）。
-///
-/// 这样可以避免在硬中断里触碰调度/唤醒逻辑，符合 Linux bottom-half 语义。
-pub fn enqueue_tty_rx_from_irq(data: &[u8]) {
-    if let Some(vc_index) = vc_manager().current_vc_index() {
-        enqueue_tty_rx_to_vc_from_irq(vc_index, data);
-    }
+pub fn enqueue_tty_rx_from_irq(data: &[u8]) -> usize {
+    vc_manager()
+        .current_vc_index()
+        .map(|vc_index| enqueue_tty_rx_to_vc_from_irq(vc_index, data))
+        .unwrap_or(0)
 }
 
-pub fn enqueue_tty_rx_to_vc_from_irq(vc_index: usize, data: &[u8]) {
-    if unsafe { TTY_REFRESH_THREAD.is_none() } {
+pub fn enqueue_tty_rx_to_vc_from_irq(vc_index: usize, data: &[u8]) -> usize {
+    let Some(vc) = vc_manager().get(vc_index) else {
+        return 0;
+    };
+    let accepted = vc.port().enqueue_input(data);
+    if accepted != 0 {
+        queue_tty_input_work_from_irq(vc_index);
+    }
+    accepted
+}
+
+pub fn enqueue_tty_rx_byte_to_vc_from_irq(
+    vc_index: usize,
+    producer: &mut dyn FnMut() -> Option<u8>,
+) -> TtyInputByteResult {
+    let Some(vc) = vc_manager().get(vc_index) else {
+        return TtyInputByteResult::NoRoom;
+    };
+    let result = vc.port().enqueue_input_byte_with(producer);
+    if result == TtyInputByteResult::Enqueued {
+        queue_tty_input_work_from_irq(vc_index);
+    }
+    result
+}
+
+pub fn tty_port_input_room(vc_index: usize) -> usize {
+    vc_manager()
+        .get(vc_index)
+        .map(|vc| vc.port().input_room())
+        .unwrap_or(0)
+}
+
+pub fn tty_kick_input_worker(tty: Arc<TtyCore>) {
+    let Some(vc_index) = tty.core().vc_index() else {
+        retry_virtio_console_input();
         return;
+    };
+
+    if vc_manager()
+        .get(vc_index)
+        .map(|vc| vc.port().has_input())
+        .unwrap_or(false)
+    {
+        queue_tty_input_work(vc_index);
     }
-    for item in data {
-        KEYBUF
-            .push(TtyRxItem {
-                vc_index,
-                byte: *item,
-            })
-            .ok();
-    }
-    tasklet_schedule(&TTY_RX_TASKLET);
+    retry_virtio_console_input();
 }

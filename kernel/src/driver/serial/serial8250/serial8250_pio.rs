@@ -20,10 +20,11 @@ use crate::{
         serial::{AtomicBaudRate, BaudRate, DivisorFraction, UartPort},
         tty::{
             console::ConsoleSwitch,
-            kthread::enqueue_tty_rx_to_vc_from_irq,
+            kthread::enqueue_tty_rx_byte_to_vc_from_irq,
             termios::WindowSize,
             tty_core::{TtyCore, TtyCoreData},
             tty_driver::{TtyDriver, TtyDriverManager, TtyOperation},
+            tty_port::TtyInputByteResult,
             virtual_terminal::{vc_manager, virtual_console::VirtualConsoleData, VirtConsole},
         },
         video::console::dummycon::dummy_console,
@@ -268,22 +269,16 @@ impl UartPort for Serial8250PIOPort {
     }
 
     fn handle_irq(&self) -> Result<(), SystemError> {
-        let mut buf = [0; SERIAL_8250_RX_IRQ_LIMIT];
-        let mut index = 0;
-        let target_vc_index = self.inner.read().input_vc_index;
+        let Some(target_vc_index) = self.inner.read().input_vc_index else {
+            return Ok(());
+        };
 
         // Linux serial8250_rx_chars 同样保留 256 字节上限，避免 RX IRQ 无界占用 CPU。
-        while index < SERIAL_8250_RX_IRQ_LIMIT {
-            let Some(c) = self.read_one_byte() else {
-                break;
-            };
-            buf[index] = c;
-            index += 1;
-        }
-
-        if index > 0 {
-            if let Some(vc_index) = target_vc_index {
-                enqueue_tty_rx_to_vc_from_irq(vc_index, &buf[0..index]);
+        for _ in 0..SERIAL_8250_RX_IRQ_LIMIT {
+            let mut producer = || self.read_one_byte();
+            match enqueue_tty_rx_byte_to_vc_from_irq(target_vc_index, &mut producer) {
+                TtyInputByteResult::Enqueued => {}
+                TtyInputByteResult::NoRoom | TtyInputByteResult::NoData => break,
             }
         }
         Ok(())

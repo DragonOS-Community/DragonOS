@@ -13,7 +13,7 @@ use crate::{
         },
         tty::{
             console::ConsoleSwitch,
-            kthread::enqueue_tty_rx_to_vc_from_irq,
+            kthread::{enqueue_tty_rx_to_vc_from_irq, tty_port_input_room},
             termios::{WindowSize, TTY_STD_TERMIOS},
             tty_core::{TtyCore, TtyCoreData},
             tty_driver::{TtyDriver, TtyDriverManager, TtyDriverType, TtyOperation},
@@ -29,7 +29,11 @@ use crate::{
             VIRTIO_VENDOR_ID,
         },
     },
-    exception::{irqdesc::IrqReturn, IrqNumber},
+    exception::{
+        irqdesc::IrqReturn,
+        tasklet::{tasklet_schedule, Tasklet, TaskletData},
+        IrqNumber,
+    },
     filesystem::kernfs::KernFSInode,
     init::initcall::INITCALL_POSTCORE,
     libs::{
@@ -75,6 +79,22 @@ const VIRTIO_CONSOLE_IRQ_TX_FLUSH_BUDGET: usize = VIRTIO_CONSOLE_TX_CHUNK;
 
 static mut VIRTIO_CONSOLE_DRIVER: Option<Arc<VirtIOConsoleDriver>> = None;
 static mut TTY_HVC_DRIVER: Option<Arc<TtyDriver>> = None;
+
+lazy_static! {
+    static ref VIRTIO_CONSOLE_RX_RETRY_TASKLET: Arc<Tasklet> =
+        Tasklet::new(virtio_console_rx_retry_tasklet, 0, None);
+}
+
+pub fn retry_virtio_console_input() {
+    tasklet_schedule(&VIRTIO_CONSOLE_RX_RETRY_TASKLET);
+}
+
+fn virtio_console_rx_retry_tasklet(_data: usize, _data_obj: Option<Arc<dyn TaskletData>>) {
+    let Some(driver) = (unsafe { VIRTIO_CONSOLE_DRIVER.as_ref().cloned() }) else {
+        return;
+    };
+    driver.retry_input();
+}
 
 #[inline(always)]
 fn tty_hvc_driver() -> &'static Arc<TtyDriver> {
@@ -366,6 +386,7 @@ impl VirtIOConsoleDevice {
                 kobject_common: KObjectCommonData::default(),
                 irq,
                 input_vc_index: None,
+                input_rx_paused: false,
                 output_tty: Weak::new(),
                 outbuf: Vec::with_capacity(VIRTIO_CONSOLE_OUTBUF_SIZE),
                 outbuf_size: VIRTIO_CONSOLE_OUTBUF_SIZE,
@@ -409,6 +430,59 @@ impl VirtIOConsoleDevice {
             tty.tty_wakeup();
         }
     }
+
+    fn pump_input(&self, limit: usize) -> Result<usize, SystemError> {
+        let mut received = 0;
+        while received < limit {
+            let mut inner = self.inner();
+            let Some(vc_index) = inner.input_vc_index else {
+                inner.input_rx_paused = false;
+                break;
+            };
+
+            if tty_port_input_room(vc_index) == 0 {
+                inner.input_rx_paused = true;
+                break;
+            }
+
+            let c = match inner.device_inner.recv(false) {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    inner.input_rx_paused = false;
+                    break;
+                }
+                Err(err) => {
+                    inner.input_rx_paused = false;
+                    return Err(virtio_drivers_error_to_system_error(err));
+                }
+            };
+
+            if enqueue_tty_rx_to_vc_from_irq(vc_index, &[c]) != 1 {
+                inner.input_rx_paused = true;
+                break;
+            }
+
+            match inner.device_inner.recv(true) {
+                Ok(Some(_)) => {
+                    inner.input_rx_paused = false;
+                    received += 1;
+                }
+                Ok(None) => {
+                    inner.input_rx_paused = false;
+                    break;
+                }
+                Err(err) => {
+                    inner.input_rx_paused = false;
+                    return Err(virtio_drivers_error_to_system_error(err));
+                }
+            }
+        }
+        if limit != 0 && received == limit {
+            self.inner().input_rx_paused = true;
+            retry_virtio_console_input();
+        }
+        Ok(received)
+    }
 }
 
 struct InnerVirtIOConsoleDevice {
@@ -419,6 +493,7 @@ struct InnerVirtIOConsoleDevice {
     kobject_common: KObjectCommonData,
     irq: Option<IrqNumber>,
     input_vc_index: Option<usize>,
+    input_rx_paused: bool,
     output_tty: Weak<TtyCore>,
     outbuf: Vec<u8>,
     outbuf_size: usize,
@@ -434,6 +509,7 @@ impl Debug for InnerVirtIOConsoleDevice {
             .field("kobject_common", &self.kobject_common)
             .field("irq", &self.irq)
             .field("input_vc_index", &self.input_vc_index)
+            .field("input_rx_paused", &self.input_rx_paused)
             .field("outbuf_len", &self.outbuf.len())
             .field("outbuf_size", &self.outbuf_size)
             .field("flush_pending", &self.flush_pending)
@@ -636,37 +712,7 @@ impl Device for VirtIOConsoleDevice {
 
 impl VirtIODevice for VirtIOConsoleDevice {
     fn handle_irq(&self, _irq: IrqNumber) -> Result<IrqReturn, SystemError> {
-        let mut buf = [0u8; 256];
-        let mut index = 0;
-        let mut received = 0;
-        let target_vc_index = self.inner().input_vc_index;
-
-        // 不能只取固定前缀：virtio-console 驱动会在本地缓存一个已完成的 rx buffer，
-        // 若中断上半部只消费其中一部分，剩余字节不会自动产生新中断，后续输入会错位。
-        // 同时限制单次 IRQ 的处理量，避免宿主持续写入时 hardirq 长时间不返回。
-        while received < VIRTIO_CONSOLE_RX_IRQ_LIMIT {
-            match self.inner().device_inner.recv(true) {
-                Ok(Some(c)) => {
-                    buf[index] = c;
-                    index += 1;
-                    received += 1;
-                    if index == buf.len() {
-                        if let Some(vc_index) = target_vc_index {
-                            enqueue_tty_rx_to_vc_from_irq(vc_index, &buf);
-                        }
-                        index = 0;
-                    }
-                }
-                Ok(None) => break,
-                Err(_) => break,
-            }
-        }
-
-        if index > 0 {
-            if let Some(vc_index) = target_vc_index {
-                enqueue_tty_rx_to_vc_from_irq(vc_index, &buf[0..index]);
-            }
-        }
+        let _ = self.pump_input(VIRTIO_CONSOLE_RX_IRQ_LIMIT);
         if let Ok((_, tty)) = self.flush_output_budget(VIRTIO_CONSOLE_IRQ_TX_FLUSH_BUDGET) {
             Self::wake_output_tty(tty);
         }
@@ -747,6 +793,16 @@ impl VirtIOConsoleDriver {
 
     fn inner(&self) -> SpinLockGuard<'_, InnerVirtIOConsoleDriver> {
         self.inner.lock()
+    }
+
+    fn retry_input(&self) {
+        let devices = self.devices.read();
+        for dev in devices.iter().flatten() {
+            let paused = dev.inner().input_rx_paused;
+            if paused {
+                let _ = dev.pump_input(VIRTIO_CONSOLE_RX_IRQ_LIMIT);
+            }
+        }
     }
 
     fn do_install(
@@ -925,7 +981,19 @@ impl TtyOperation for VirtIOConsoleDriver {
             return Ok(());
         }
 
-        if let Some(dev) = self.devices.read()[index].clone() {
+        let dev = self.devices.read()[index].clone();
+        if let Some(dev) = &dev {
+            let mut inner = dev.inner();
+            inner.input_vc_index = None;
+            inner.input_rx_paused = false;
+        }
+
+        if let Some(port) = tty.core().port() {
+            port.clear_input();
+        }
+        tty.ldisc().flush_buffer(tty.clone())?;
+
+        if let Some(dev) = dev {
             match dev.flush_output_budget(VIRTIO_CONSOLE_TX_FLUSH_BUDGET) {
                 Ok((_, wake_tty)) => {
                     let close_wake = {
@@ -939,10 +1007,12 @@ impl TtyOperation for VirtIOConsoleDriver {
                     let mut inner = dev.inner();
                     inner.discard_unsubmitted_output_locked();
                     let wake_tty = inner.output_tty.upgrade();
+                    inner.output_tty = Weak::new();
                     drop(inner);
                     VirtIOConsoleDevice::wake_output_tty(wake_tty);
                 }
             }
+            dev.inner().output_tty = Weak::new();
         }
 
         Ok(())
@@ -977,17 +1047,20 @@ impl TtyOperation for VirtIOConsoleDriver {
 
         let vc = VirtConsole::new(Some(vc_data));
         let vc_index = vc_manager().alloc(vc.clone()).ok_or(SystemError::EBUSY)?;
+        self.do_install(driver, tty.clone(), vc.clone())
+            .inspect_err(|_| {
+                vc_manager().free(vc_index);
+                let mut inner = dev.inner();
+                inner.input_vc_index = None;
+                inner.output_tty = Weak::new();
+            })?;
         {
             let mut inner = dev.inner();
             inner.input_vc_index = Some(vc_index);
+            inner.input_rx_paused = false;
             inner.output_tty = Arc::downgrade(&tty);
         }
-        self.do_install(driver, tty, vc.clone()).inspect_err(|_| {
-            vc_manager().free(vc_index);
-            let mut inner = dev.inner();
-            inner.input_vc_index = None;
-            inner.output_tty = Weak::new();
-        })?;
+        let _ = dev.pump_input(VIRTIO_CONSOLE_RX_IRQ_LIMIT);
 
         Ok(())
     }

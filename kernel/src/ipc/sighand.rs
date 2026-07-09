@@ -60,11 +60,11 @@ pub struct InnerSigHand {
     pub group_exec_task: Option<Weak<ProcessControlBlock>>,
     /// 线程组 exec（de-thread）等待计数（仿照 Linux 的 signal_struct::notify_count）
     pub group_exec_notify_count: isize,
-    /// The mm through which the OOM killer authorizes the current thread group
-    /// to access memory reserves.
+    /// The mm selected by the OOM killer for this thread group.
     ///
-    /// Corresponds to Linux `signal_struct::oom_mm`: the entitlement belongs to
-    /// the selected thread group, not to any arbitrary task sharing the same mm.
+    /// The reserve entitlement is not decided by this metadata alone. Callers
+    /// must go through `oom::current_is_oom_victim()`, which also verifies that
+    /// the task is already fatal/exiting.
     pub oom_tgid: Option<RawPid>,
     pub oom_mm_id: Option<u64>,
     pub oom_mm: Option<Arc<AddressSpace>>,
@@ -187,14 +187,25 @@ impl SigHand {
         self_guard.pids = other_guard.pids.clone();
     }
 
-    pub fn mark_oom_mm(&self, tgid: RawPid, mm: &Arc<AddressSpace>) {
+    pub fn record_oom_victim_mm(&self, tgid: RawPid, mm: &Arc<AddressSpace>) {
         let mut g = self.inner_mut();
         g.oom_tgid = Some(tgid);
         g.oom_mm_id = Some(mm.id());
         g.oom_mm = Some(mm.clone());
     }
 
-    pub fn is_oom_victim_tgid(&self, tgid: RawPid) -> bool {
+    pub fn clear_oom_mm_if(&self, tgid: RawPid, mm_id: u64) -> bool {
+        let mut g = self.inner_mut();
+        if g.oom_tgid != Some(tgid) || g.oom_mm_id != Some(mm_id) {
+            return false;
+        }
+        g.oom_tgid = None;
+        g.oom_mm_id = None;
+        g.oom_mm = None;
+        true
+    }
+
+    pub fn oom_victim_mm_matches(&self, tgid: RawPid) -> bool {
         let g = self.inner();
         g.oom_tgid == Some(tgid) && g.oom_mm.is_some()
     }

@@ -3,11 +3,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -16,7 +18,12 @@
 namespace {
 
 constexpr const char* kOomScoreAdjPath = "/proc/self/oom_score_adj";
+constexpr const char* kOomFaultInjectPath = "/proc/sys/vm/oom_fault_inject";
 constexpr size_t kCloneStackSize = 64 * 1024;
+constexpr size_t kPageSize = 4096;
+constexpr size_t kBigPages = 16384;
+constexpr int kWaitVictimPolls = 200;
+constexpr useconds_t kWaitVictimPollUs = 10000;
 
 int write_oom_score_adj_errno(int score) {
     char buf[32];
@@ -113,6 +120,127 @@ int read_exact(int fd, void* buf, size_t len) {
     return 0;
 }
 
+int write_oom_fault_inject(pid_t tgid, unsigned long fail_after, unsigned long fail_times) {
+    char buf[128];
+    int len = snprintf(buf, sizeof(buf), "%d %lu %lu\n", tgid, fail_after, fail_times);
+    if (len <= 0 || len >= static_cast<int>(sizeof(buf))) {
+        return EINVAL;
+    }
+
+    int fd = open(kOomFaultInjectPath, O_WRONLY);
+    if (fd < 0) {
+        return errno;
+    }
+
+    errno = 0;
+    ssize_t written = write(fd, buf, len);
+    int saved_errno = errno;
+    close(fd);
+    if (written < 0) {
+        return saved_errno;
+    }
+    return written == len ? 0 : EIO;
+}
+
+void cleanup_oom_fault_inject() {
+    (void)write_oom_fault_inject(0, 0, 0);
+}
+
+struct OomFaultInjectGuard {
+    OomFaultInjectGuard() { cleanup_oom_fault_inject(); }
+    ~OomFaultInjectGuard() { cleanup_oom_fault_inject(); }
+};
+
+int read_vmstat_value(const char* name, long* value) {
+    FILE* fp = fopen("/proc/vmstat", "r");
+    if (fp == nullptr) {
+        return errno;
+    }
+
+    char key[64];
+    long val = 0;
+    while (fscanf(fp, "%63s %ld", key, &val) == 2) {
+        if (strcmp(key, name) == 0) {
+            fclose(fp);
+            *value = val;
+            return 0;
+        }
+    }
+
+    fclose(fp);
+    return ENOENT;
+}
+
+void* fault_one_page() {
+    volatile uint8_t* p = static_cast<volatile uint8_t*>(
+        mmap(nullptr, kPageSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (p == MAP_FAILED) {
+        return nullptr;
+    }
+
+    p[0] = 0x5a;
+    return const_cast<uint8_t*>(p);
+}
+
+void* map_and_touch_pages(size_t pages) {
+    size_t len = pages * kPageSize;
+    volatile uint8_t* p = static_cast<volatile uint8_t*>(
+        mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (p == MAP_FAILED) {
+        return MAP_FAILED;
+    }
+
+    for (size_t i = 0; i < len; i += kPageSize) {
+        p[i] = static_cast<uint8_t>(i / kPageSize);
+    }
+    return const_cast<uint8_t*>(p);
+}
+
+void trigger_selfkill_child_main() {
+    if (write_oom_score_adj_errno(1000) != 0) {
+        _exit(2);
+    }
+    if (map_and_touch_pages(kBigPages) == MAP_FAILED) {
+        _exit(2);
+    }
+    if (write_oom_fault_inject(getpid(), 0, 1) != 0) {
+        _exit(2);
+    }
+
+    (void)fault_one_page();
+    _exit(3);
+}
+
+void victim_child_main(int ready_write) {
+    if (write_oom_score_adj_errno(1000) != 0) {
+        _exit(2);
+    }
+    if (map_and_touch_pages(kBigPages) == MAP_FAILED) {
+        _exit(2);
+    }
+    char byte = 'x';
+    if (write_exact(ready_write, &byte, 1) != 0) {
+        _exit(2);
+    }
+    close(ready_write);
+    for (;;) {
+        pause();
+    }
+}
+
+void trigger_retry_child_main() {
+    if (write_oom_fault_inject(getpid(), 0, 1) != 0) {
+        _exit(2);
+    }
+
+    void* p = fault_one_page();
+    if (p == nullptr) {
+        _exit(3);
+    }
+    memset(p, 0xa5, kPageSize);
+    _exit(0);
+}
+
 void expect_child_success(int (*child_fn)(), const char* name) {
     pid_t child = fork();
     ASSERT_GE(child, 0) << name << ": fork failed: errno=" << errno << " (" << strerror(errno)
@@ -128,6 +256,36 @@ void expect_child_success(int (*child_fn)(), const char* name) {
                                    << std::hex << status;
     EXPECT_EQ(0, WEXITSTATUS(status)) << name << ": child exit status=0x" << std::hex
                                       << WEXITSTATUS(status);
+}
+
+void expect_child_sigkill(void (*child_fn)(), const char* name) {
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << name << ": fork failed: errno=" << errno << " (" << strerror(errno)
+                        << ")";
+    if (child == 0) {
+        child_fn();
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0))
+        << name << ": waitpid failed: errno=" << errno << " (" << strerror(errno) << ")";
+    ASSERT_TRUE(WIFSIGNALED(status)) << name << ": child did not die by signal, status=0x"
+                                    << std::hex << status;
+    EXPECT_EQ(SIGKILL, WTERMSIG(status)) << name << ": unexpected signal";
+}
+
+bool wait_for_sigkill_with_timeout(pid_t pid, int* status) {
+    for (int i = 0; i < kWaitVictimPolls; ++i) {
+        pid_t waited = waitpid(pid, status, WNOHANG);
+        if (waited == pid) {
+            return true;
+        }
+        if (waited < 0) {
+            return false;
+        }
+        usleep(kWaitVictimPollUs);
+    }
+    return false;
 }
 
 int child_unprivileged_can_raise_negative_oom_score_adj() {
@@ -390,6 +548,87 @@ TEST(OomScoreAdj, VforkWriteDoesNotPropagateToParent) {
 TEST(OomScoreAdj, CloneVmProcessReceivesSharedMmOomScoreAdjUpdate) {
     expect_child_success(child_clone_vm_process_receives_shared_mm_oom_score_adj_update,
                          "CloneVmProcessReceivesSharedMmOomScoreAdjUpdate");
+}
+
+TEST(OomKiller, FaultInjectKillsCurrentVictim) {
+    OomFaultInjectGuard guard;
+    expect_child_sigkill(trigger_selfkill_child_main, "FaultInjectKillsCurrentVictim");
+}
+
+TEST(OomKiller, VmstatOomKillCounterIncreases) {
+    OomFaultInjectGuard guard;
+    long before = 0;
+    ASSERT_EQ(0, read_vmstat_value("oom_kill", &before));
+
+    expect_child_sigkill(trigger_selfkill_child_main, "VmstatOomKillCounterIncreases");
+
+    long after = 0;
+    ASSERT_EQ(0, read_vmstat_value("oom_kill", &after));
+    EXPECT_GT(after, before);
+}
+
+TEST(OomKiller, OtherProcessVictimAllowsTriggerRetry) {
+    OomFaultInjectGuard guard;
+    int ready_pipe[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(ready_pipe));
+
+    pid_t victim = fork();
+    ASSERT_GE(victim, 0) << "fork victim failed: errno=" << errno << " (" << strerror(errno)
+                         << ")";
+    if (victim == 0) {
+        close(ready_pipe[0]);
+        victim_child_main(ready_pipe[1]);
+    }
+    close(ready_pipe[1]);
+
+    char ready_byte = 0;
+    int ready_err = read_exact(ready_pipe[0], &ready_byte, 1);
+    close(ready_pipe[0]);
+    if (ready_err != 0) {
+        kill(victim, SIGKILL);
+        waitpid(victim, nullptr, 0);
+        ASSERT_EQ(0, ready_err) << "victim ready failed: errno=" << ready_err << " ("
+                                << strerror(ready_err) << ")";
+    }
+
+    pid_t trigger = fork();
+    if (trigger < 0) {
+        int saved_errno = errno;
+        kill(victim, SIGKILL);
+        waitpid(victim, nullptr, 0);
+        ASSERT_GE(trigger, 0) << "fork trigger failed: errno=" << saved_errno << " ("
+                              << strerror(saved_errno) << ")";
+    }
+    if (trigger == 0) {
+        trigger_retry_child_main();
+    }
+
+    int trigger_status = 0;
+    pid_t waited = waitpid(trigger, &trigger_status, 0);
+    if (waited != trigger) {
+        int saved_errno = errno;
+        kill(victim, SIGKILL);
+        waitpid(victim, nullptr, 0);
+        ASSERT_EQ(trigger, waited) << "waitpid trigger failed: errno=" << saved_errno << " ("
+                                   << strerror(saved_errno) << ")";
+    }
+    if (!WIFEXITED(trigger_status) || WEXITSTATUS(trigger_status) != 0) {
+        kill(victim, SIGKILL);
+        waitpid(victim, nullptr, 0);
+    }
+    ASSERT_TRUE(WIFEXITED(trigger_status))
+        << "trigger should exit normally, status=0x" << std::hex << trigger_status;
+    ASSERT_EQ(0, WEXITSTATUS(trigger_status));
+
+    int victim_status = 0;
+    if (!wait_for_sigkill_with_timeout(victim, &victim_status)) {
+        kill(victim, SIGKILL);
+        waitpid(victim, nullptr, 0);
+        FAIL() << "victim was not OOM-killed within timeout";
+    }
+    ASSERT_TRUE(WIFSIGNALED(victim_status))
+        << "victim should die by signal, status=0x" << std::hex << victim_status;
+    EXPECT_EQ(SIGKILL, WTERMSIG(victim_status));
 }
 
 int main(int argc, char** argv) {

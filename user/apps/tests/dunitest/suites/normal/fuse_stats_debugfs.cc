@@ -142,6 +142,23 @@ TEST(FuseStatsDebugFs, StatsFileExistsAndSupportsOffsetReads) {
     expect_field(whole, "response_buffer_alloc_bytes ");
     expect_field(whole, "bytes_submitted_total ");
     expect_field(whole, "bytes_completed_total ");
+    expect_field(whole, "bridge_waits_total ");
+    expect_field(whole, "bridge_wait_exit_request_pending_total ");
+    expect_field(whole, "bridge_wait_exit_completion_total ");
+    expect_field(whole, "bridge_wait_exit_teardown_total ");
+    expect_field(whole, "bridge_wait_exit_disconnect_total ");
+    expect_field(whole, "bridge_wait_exit_spurious_total ");
+    expect_field(whole, "bridge_wake_request_total ");
+    expect_field(whole, "bridge_wake_completion_total ");
+    expect_field(whole, "bridge_wake_teardown_total ");
+    expect_field(whole, "bridge_wake_disconnect_total ");
+    expect_field(whole, "bridge_irq_no_active_conn_total ");
+    expect_field(whole, "bridge_irq_stale_session_total ");
+    expect_field(whole, "bridge_irq_weak_upgrade_failed_total ");
+    expect_field(whole, "bridge_queue_full_blocked_total ");
+    expect_field(whole, "bridge_queue_full_retry_total ");
+    expect_field(whole, "bridge_queue_full_retry_after_completion_total ");
+    expect_field(whole, "bridge_queue_full_retry_success_total ");
 
     expect_counter_increased(whole, after_fuse, "requests_queued_total");
     expect_counter_increased(whole, after_fuse, "requests_dequeued_total");

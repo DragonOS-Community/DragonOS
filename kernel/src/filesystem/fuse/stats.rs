@@ -42,6 +42,72 @@ pub struct VirtioFsStatsSnapshot {
     pub bytes_completed_total: u64,
     pub pump_batch: [u64; BATCH_BUCKETS],
     pub complete_batch: [u64; BATCH_BUCKETS],
+    pub bridge_waits_total: u64,
+    pub bridge_wait_exit_request_pending_total: u64,
+    pub bridge_wait_exit_completion_total: u64,
+    pub bridge_wait_exit_teardown_total: u64,
+    pub bridge_wait_exit_disconnect_total: u64,
+    pub bridge_wait_exit_spurious_total: u64,
+    pub bridge_wake_request_total: u64,
+    pub bridge_wake_completion_total: u64,
+    pub bridge_wake_teardown_total: u64,
+    pub bridge_wake_disconnect_total: u64,
+    pub bridge_irq_no_active_conn_total: u64,
+    pub bridge_irq_stale_session_total: u64,
+    pub bridge_irq_weak_upgrade_failed_total: u64,
+    pub bridge_queue_full_blocked_total: u64,
+    pub bridge_queue_full_retry_total: u64,
+    pub bridge_queue_full_retry_after_completion_total: u64,
+    pub bridge_queue_full_retry_success_total: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtioFsBridgeWakeSource {
+    Request,
+    Completion,
+    Teardown,
+    Disconnect,
+}
+
+impl VirtioFsBridgeWakeSource {
+    pub const fn bit(self) -> u32 {
+        match self {
+            Self::Request => 1 << 0,
+            Self::Completion => 1 << 1,
+            Self::Teardown => 1 << 2,
+            Self::Disconnect => 1 << 3,
+        }
+    }
+
+    pub const fn trace_id(self) -> u8 {
+        match self {
+            Self::Request => 1,
+            Self::Completion => 2,
+            Self::Teardown => 3,
+            Self::Disconnect => 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtioFsBridgeWaitExit {
+    RequestPending,
+    Completion,
+    Teardown,
+    Disconnect,
+    Spurious,
+}
+
+impl VirtioFsBridgeWaitExit {
+    pub const fn trace_id(self) -> u8 {
+        match self {
+            Self::RequestPending => 1,
+            Self::Completion => 2,
+            Self::Teardown => 3,
+            Self::Disconnect => 4,
+            Self::Spurious => 5,
+        }
+    }
 }
 
 static REQUESTS_QUEUED_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -79,6 +145,24 @@ static BYTES_COMPLETED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 static PUMP_BATCH: [AtomicU64; BATCH_BUCKETS] = [const { AtomicU64::new(0) }; BATCH_BUCKETS];
 static COMPLETE_BATCH: [AtomicU64; BATCH_BUCKETS] = [const { AtomicU64::new(0) }; BATCH_BUCKETS];
+
+static BRIDGE_WAITS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BRIDGE_WAIT_EXIT_REQUEST_PENDING_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BRIDGE_WAIT_EXIT_COMPLETION_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BRIDGE_WAIT_EXIT_TEARDOWN_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BRIDGE_WAIT_EXIT_DISCONNECT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BRIDGE_WAIT_EXIT_SPURIOUS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BRIDGE_WAKE_REQUEST_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BRIDGE_WAKE_COMPLETION_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BRIDGE_WAKE_TEARDOWN_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BRIDGE_WAKE_DISCONNECT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BRIDGE_IRQ_NO_ACTIVE_CONN_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BRIDGE_IRQ_STALE_SESSION_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BRIDGE_IRQ_WEAK_UPGRADE_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BRIDGE_QUEUE_FULL_BLOCKED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BRIDGE_QUEUE_FULL_RETRY_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BRIDGE_QUEUE_FULL_RETRY_AFTER_COMPLETION_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BRIDGE_QUEUE_FULL_RETRY_SUCCESS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 fn add(counter: &AtomicU64, value: u64) {
@@ -172,6 +256,47 @@ pub fn on_virtiofs_idle_sleep(ns: i64) {
 }
 
 #[inline]
+pub fn on_virtiofs_bridge_wait() {
+    inc(&BRIDGE_WAITS_TOTAL);
+}
+
+#[inline]
+pub fn on_virtiofs_bridge_wait_exit(reason: VirtioFsBridgeWaitExit) {
+    match reason {
+        VirtioFsBridgeWaitExit::RequestPending => inc(&BRIDGE_WAIT_EXIT_REQUEST_PENDING_TOTAL),
+        VirtioFsBridgeWaitExit::Completion => inc(&BRIDGE_WAIT_EXIT_COMPLETION_TOTAL),
+        VirtioFsBridgeWaitExit::Teardown => inc(&BRIDGE_WAIT_EXIT_TEARDOWN_TOTAL),
+        VirtioFsBridgeWaitExit::Disconnect => inc(&BRIDGE_WAIT_EXIT_DISCONNECT_TOTAL),
+        VirtioFsBridgeWaitExit::Spurious => inc(&BRIDGE_WAIT_EXIT_SPURIOUS_TOTAL),
+    }
+}
+
+#[inline]
+pub fn on_virtiofs_bridge_wake(source: VirtioFsBridgeWakeSource) {
+    match source {
+        VirtioFsBridgeWakeSource::Request => inc(&BRIDGE_WAKE_REQUEST_TOTAL),
+        VirtioFsBridgeWakeSource::Completion => inc(&BRIDGE_WAKE_COMPLETION_TOTAL),
+        VirtioFsBridgeWakeSource::Teardown => inc(&BRIDGE_WAKE_TEARDOWN_TOTAL),
+        VirtioFsBridgeWakeSource::Disconnect => inc(&BRIDGE_WAKE_DISCONNECT_TOTAL),
+    }
+}
+
+#[inline]
+pub fn on_virtiofs_irq_no_active_conn() {
+    inc(&BRIDGE_IRQ_NO_ACTIVE_CONN_TOTAL);
+}
+
+#[inline]
+pub fn on_virtiofs_irq_stale_session() {
+    inc(&BRIDGE_IRQ_STALE_SESSION_TOTAL);
+}
+
+#[inline]
+pub fn on_virtiofs_irq_weak_upgrade_failed() {
+    inc(&BRIDGE_IRQ_WEAK_UPGRADE_FAILED_TOTAL);
+}
+
+#[inline]
 pub fn on_virtiofs_ack_interrupt() {
     inc(&BRIDGE_ACK_INTERRUPT_TOTAL);
 }
@@ -213,6 +338,24 @@ pub fn on_virtiofs_submitted(req_len: usize) {
 #[inline]
 pub fn on_virtiofs_queue_full() {
     inc(&VIRTQUEUE_FULL_TOTAL);
+}
+
+#[inline]
+pub fn on_virtiofs_queue_full_blocked() {
+    inc(&BRIDGE_QUEUE_FULL_BLOCKED_TOTAL);
+}
+
+#[inline]
+pub fn on_virtiofs_queue_full_retry(after_completion: bool) {
+    inc(&BRIDGE_QUEUE_FULL_RETRY_TOTAL);
+    if after_completion {
+        inc(&BRIDGE_QUEUE_FULL_RETRY_AFTER_COMPLETION_TOTAL);
+    }
+}
+
+#[inline]
+pub fn on_virtiofs_queue_full_retry_success() {
+    inc(&BRIDGE_QUEUE_FULL_RETRY_SUCCESS_TOTAL);
 }
 
 #[inline]
@@ -284,6 +427,29 @@ pub fn virtiofs_snapshot() -> VirtioFsStatsSnapshot {
         bytes_completed_total: BYTES_COMPLETED_TOTAL.load(Ordering::Relaxed),
         pump_batch: snapshot_batch(&PUMP_BATCH),
         complete_batch: snapshot_batch(&COMPLETE_BATCH),
+        bridge_waits_total: BRIDGE_WAITS_TOTAL.load(Ordering::Relaxed),
+        bridge_wait_exit_request_pending_total: BRIDGE_WAIT_EXIT_REQUEST_PENDING_TOTAL
+            .load(Ordering::Relaxed),
+        bridge_wait_exit_completion_total: BRIDGE_WAIT_EXIT_COMPLETION_TOTAL
+            .load(Ordering::Relaxed),
+        bridge_wait_exit_teardown_total: BRIDGE_WAIT_EXIT_TEARDOWN_TOTAL.load(Ordering::Relaxed),
+        bridge_wait_exit_disconnect_total: BRIDGE_WAIT_EXIT_DISCONNECT_TOTAL
+            .load(Ordering::Relaxed),
+        bridge_wait_exit_spurious_total: BRIDGE_WAIT_EXIT_SPURIOUS_TOTAL.load(Ordering::Relaxed),
+        bridge_wake_request_total: BRIDGE_WAKE_REQUEST_TOTAL.load(Ordering::Relaxed),
+        bridge_wake_completion_total: BRIDGE_WAKE_COMPLETION_TOTAL.load(Ordering::Relaxed),
+        bridge_wake_teardown_total: BRIDGE_WAKE_TEARDOWN_TOTAL.load(Ordering::Relaxed),
+        bridge_wake_disconnect_total: BRIDGE_WAKE_DISCONNECT_TOTAL.load(Ordering::Relaxed),
+        bridge_irq_no_active_conn_total: BRIDGE_IRQ_NO_ACTIVE_CONN_TOTAL.load(Ordering::Relaxed),
+        bridge_irq_stale_session_total: BRIDGE_IRQ_STALE_SESSION_TOTAL.load(Ordering::Relaxed),
+        bridge_irq_weak_upgrade_failed_total: BRIDGE_IRQ_WEAK_UPGRADE_FAILED_TOTAL
+            .load(Ordering::Relaxed),
+        bridge_queue_full_blocked_total: BRIDGE_QUEUE_FULL_BLOCKED_TOTAL.load(Ordering::Relaxed),
+        bridge_queue_full_retry_total: BRIDGE_QUEUE_FULL_RETRY_TOTAL.load(Ordering::Relaxed),
+        bridge_queue_full_retry_after_completion_total:
+            BRIDGE_QUEUE_FULL_RETRY_AFTER_COMPLETION_TOTAL.load(Ordering::Relaxed),
+        bridge_queue_full_retry_success_total: BRIDGE_QUEUE_FULL_RETRY_SUCCESS_TOTAL
+            .load(Ordering::Relaxed),
     }
 }
 
@@ -334,7 +500,24 @@ complete_batch_0 {}\n\
 complete_batch_1 {}\n\
 complete_batch_2_4 {}\n\
 complete_batch_5_16 {}\n\
-complete_batch_gt_16 {}\n",
+complete_batch_gt_16 {}\n\
+bridge_waits_total {}\n\
+bridge_wait_exit_request_pending_total {}\n\
+bridge_wait_exit_completion_total {}\n\
+bridge_wait_exit_teardown_total {}\n\
+bridge_wait_exit_disconnect_total {}\n\
+bridge_wait_exit_spurious_total {}\n\
+bridge_wake_request_total {}\n\
+bridge_wake_completion_total {}\n\
+bridge_wake_teardown_total {}\n\
+bridge_wake_disconnect_total {}\n\
+bridge_irq_no_active_conn_total {}\n\
+bridge_irq_stale_session_total {}\n\
+bridge_irq_weak_upgrade_failed_total {}\n\
+bridge_queue_full_blocked_total {}\n\
+bridge_queue_full_retry_total {}\n\
+bridge_queue_full_retry_after_completion_total {}\n\
+bridge_queue_full_retry_success_total {}\n",
         fuse.requests_queued_total,
         fuse.requests_dequeued_total,
         fuse.requests_replied_ok_total,
@@ -376,5 +559,22 @@ complete_batch_gt_16 {}\n",
         virtiofs.complete_batch[2],
         virtiofs.complete_batch[3],
         virtiofs.complete_batch[4],
+        virtiofs.bridge_waits_total,
+        virtiofs.bridge_wait_exit_request_pending_total,
+        virtiofs.bridge_wait_exit_completion_total,
+        virtiofs.bridge_wait_exit_teardown_total,
+        virtiofs.bridge_wait_exit_disconnect_total,
+        virtiofs.bridge_wait_exit_spurious_total,
+        virtiofs.bridge_wake_request_total,
+        virtiofs.bridge_wake_completion_total,
+        virtiofs.bridge_wake_teardown_total,
+        virtiofs.bridge_wake_disconnect_total,
+        virtiofs.bridge_irq_no_active_conn_total,
+        virtiofs.bridge_irq_stale_session_total,
+        virtiofs.bridge_irq_weak_upgrade_failed_total,
+        virtiofs.bridge_queue_full_blocked_total,
+        virtiofs.bridge_queue_full_retry_total,
+        virtiofs.bridge_queue_full_retry_after_completion_total,
+        virtiofs.bridge_queue_full_retry_success_total,
     )
 }

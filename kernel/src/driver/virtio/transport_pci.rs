@@ -29,9 +29,9 @@ use super::VIRTIO_VENDOR_ID;
 use crate::driver::pci::pci_irq::IrqType;
 
 /// The offset to add to a VirtIO device ID to get the corresponding PCI device ID.
-/// PCI Virtio设备的DEVICE_ID 的offset
+/// The offset of the PCI VirtIO device ID.
 const PCI_DEVICE_ID_OFFSET: u16 = 0x1040;
-/// PCI Virtio 设备的DEVICE_ID及其对应的设备类型
+/// PCI VirtIO device IDs and their corresponding device types.
 const TRANSITIONAL_NETWORK: u16 = 0x1000;
 const TRANSITIONAL_BLOCK: u16 = 0x1001;
 const TRANSITIONAL_MEMORY_BALLOONING: u16 = 0x1002;
@@ -58,15 +58,13 @@ const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
 /// Device specific configuration.
 const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
 
-/// Virtio设备接收中断的设备号
+/// The interrupt vector number for VirtIO device receive interrupts.
 const VIRTIO_RECV_VECTOR: IrqNumber = IrqNumber::new(56);
-/// Virtio设备接收中断的设备号的表项号
+/// The MSI-X table entry index for VirtIO device receive interrupts.
 const VIRTIO_RECV_VECTOR_INDEX: u16 = 0;
-// 接收的queue号
+// Receive queue number
 const QUEUE_RECEIVE: u16 = 0;
-///@brief device id 转换为设备类型
-///@param pci_device_id，device_id
-///@return DeviceType 对应的设备类型
+/// Converts a PCI device ID to the corresponding VirtIO device type.
 fn device_type(pci_device_id: u16) -> DeviceType {
     match pci_device_id {
         TRANSITIONAL_NETWORK => DeviceType::Network,
@@ -106,11 +104,31 @@ pub struct PciTransport {
     device: Arc<PciDeviceStructureGeneralDevice>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PciInterruptAck {
+    isr_status: NonNull<Volatile<u8>>,
+}
+
+// The handle only permits an atomic MMIO ISR-status read used for interrupt acknowledgement.
+// Queue/config mutation remains owned by PciTransport.
+unsafe impl Send for PciInterruptAck {}
+unsafe impl Sync for PciInterruptAck {}
+
+impl PciInterruptAck {
+    pub fn ack_interrupt(&self) -> bool {
+        // Safe because the ISR status pointer comes from a valid VirtIO PCI ISR BAR region.
+        // Reading the ISR status resets it to 0 and causes the device to de-assert the interrupt.
+        let isr_status = unsafe { self.isr_status.as_ptr().vread() };
+        // TODO: Distinguish between queue interrupt and device configuration interrupt.
+        isr_status & 0x3 != 0
+    }
+}
+
 impl PciTransport {
     /// Construct a new PCI VirtIO device driver for the given device function on the given PCI
     /// root controller.
     ///
-    /// ## 参数
+    /// ## Parameters
     ///
     /// - `device` - The PCI device structure for the VirtIO device.
     /// - `irq_handler` - An optional handler for the device's interrupt. If `None`, a default
@@ -137,12 +155,13 @@ impl PciTransport {
         device.bar_ioremap().unwrap()?;
         device.enable_master();
         let standard_device = device.as_standard_device().unwrap();
-        // 目前缺少对PCI设备中断号的统一管理，所以这里需要指定一个中断号。不能与其他中断重复
+        // Currently there is no unified management of PCI device interrupt numbers, so an
+        // interrupt number must be specified here. It must not conflict with other interrupts.
         let irq_vector = standard_device.irq_vector_mut().unwrap();
         irq_vector.write().push(irq);
 
         // panic!();
-        //device_capability为迭代器，遍历其相当于遍历所有的cap空间
+        // device_capability is an iterator; iterating over it traverses all capability space.
         for capability in device.capabilities().unwrap() {
             if capability.id != PCI_CAP_ID_VNDR {
                 continue;
@@ -237,6 +256,16 @@ impl PciTransport {
 
     pub fn irq(&self) -> IrqNumber {
         self.irq
+    }
+
+    pub fn interrupt_ack(&self) -> PciInterruptAck {
+        PciInterruptAck {
+            isr_status: self.isr_status,
+        }
+    }
+
+    pub fn ack_interrupt_ref(&self) -> bool {
+        self.interrupt_ack().ack_interrupt()
     }
 
     fn cache_queue_notify_index(&mut self, queue: u16) -> Option<usize> {
@@ -390,7 +419,7 @@ impl Transport for PciTransport {
             if self.cache_queue_notify_index(queue).is_none() {
                 self.fail_bad_notify_config(queue);
             }
-            // 这里设置队列中断对应的中断项
+            // Set the interrupt entry corresponding to the queue interrupt
             if matches!(*self.device.irq_type.read(), IrqType::Msix { .. }) {
                 if queue == QUEUE_RECEIVE {
                     volwrite!(self.common_cfg, msix_config, VIRTIO_RECV_VECTOR_INDEX);
@@ -441,12 +470,7 @@ impl Transport for PciTransport {
     }
 
     fn ack_interrupt(&mut self) -> bool {
-        // Safe because the common config pointer is valid and we checked in get_bar_region that it
-        // was aligned.
-        // Reading the ISR status resets it to 0 and causes the device to de-assert the interrupt.
-        let isr_status = unsafe { self.isr_status.as_ptr().vread() };
-        // TODO: Distinguish between queue interrupt and device configuration interrupt.
-        isr_status & 0x3 != 0
+        self.ack_interrupt_ref()
     }
 
     fn config_space<T>(&self) -> Result<NonNull<T>, Error> {
@@ -475,7 +499,8 @@ impl Drop for PciTransport {
         // Reset the device when the transport is dropped.
         self.set_status(DeviceStatus::empty());
 
-        // todo: 调用pci的中断释放函数，并且在virtio_irq_manager里面删除对应的设备的中断
+        // TODO: Call the PCI interrupt release function and remove the corresponding device
+        // interrupt from virtio_irq_manager
     }
 }
 
@@ -500,7 +525,7 @@ struct CommonCfg {
 }
 
 /// Information about a VirtIO structure within some BAR, as provided by a `virtio_pci_cap`.
-/// cfg空间在哪个bar的多少偏移处，长度多少
+/// Information about which BAR a VirtIO structure resides in, at what offset, and its length.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct VirtioCapabilityInfo {
     /// The bar in which the structure can be found.
@@ -512,7 +537,7 @@ struct VirtioCapabilityInfo {
 }
 
 /// An error encountered initialising a VirtIO PCI transport.
-/// VirtIO PCI transport 初始化时的错误
+/// An error encountered during VirtIO PCI transport initialization.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VirtioPciError {
     /// PCI device vender ID was not the VirtIO vendor ID.
@@ -539,7 +564,7 @@ pub enum VirtioPciError {
         /// The expected alignment in bytes.
         alignment: usize,
     },
-    ///获取虚拟地址失败
+    /// Failed to obtain the virtual address.
     BarGetVaddrFailed,
     /// A generic PCI error,
     Pci(PciError),
@@ -585,16 +610,19 @@ impl Display for VirtioPciError {
     }
 }
 
-/// PCI error到VirtioPciError的转换，层层上报
+/// Conversion from `PciError` to `VirtioPciError`, propagated up through the layers.
 impl From<PciError> for VirtioPciError {
     fn from(error: PciError) -> Self {
         Self::Pci(error)
     }
 }
 
-/// @brief 获取虚拟地址并将其转化为对应类型的指针
-/// @param device_bar 存储bar信息的结构体 struct_info 存储cfg空间的位置信息
-/// @return Result<NonNull<T>, VirtioPciError> 成功则返回对应类型的指针，失败则返回Error
+/// Obtains a virtual address and casts it to a pointer of the corresponding type.
+///
+/// * `device_bar` - The BAR info structure.
+/// * `struct_info` - The location info of the config space.
+///
+/// Returns a pointer of type `T` on success, or a `VirtioPciError` on failure.
 fn get_bar_region<T>(
     device_bar: &PciStandardDeviceBar,
     struct_info: &VirtioCapabilityInfo,
@@ -626,9 +654,12 @@ fn get_bar_region<T>(
     Ok(vaddr.cast())
 }
 
-/// @brief 获取虚拟地址并将其转化为对应类型的切片的指针
-/// @param device_bar 存储bar信息的结构体 struct_info 存储cfg空间的位置信息切片的指针
-/// @return Result<NonNull<[T]>, VirtioPciError> 成功则返回对应类型的指针切片，失败则返回Error
+/// Obtains a virtual address and casts it to a pointer to a slice of the corresponding type.
+///
+/// * `device_bar` - The BAR info structure.
+/// * `struct_info` - The location info of the config space.
+///
+/// Returns a pointer to a `[T]` slice on success, or a `VirtioPciError` on failure.
 fn get_bar_region_slice<T>(
     device_bar: &PciStandardDeviceBar,
     struct_info: &VirtioCapabilityInfo,

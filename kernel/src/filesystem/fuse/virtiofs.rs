@@ -70,9 +70,17 @@ struct InflightReq {
     rsp: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Default)]
+struct QueueBlockState {
+    blocked: bool,
+    completion_seen: bool,
+}
+
 struct VirtioFsBridgeContext {
     instance: Arc<VirtioFsInstance>,
     conn: Arc<FuseConn>,
+    session_id: u64,
+    irq_wake_enabled: bool,
     transport: Option<VirtIOTransport>,
     hiprio_vq: Option<VirtQueue<HalImpl, { VIRTIOFS_REQ_QUEUE_SIZE }>>,
     request_vqs: Vec<VirtQueue<HalImpl, { VIRTIOFS_REQ_QUEUE_SIZE }>>,
@@ -82,6 +90,8 @@ struct VirtioFsBridgeContext {
     request_inflight: Vec<BTreeMap<u16, InflightReq>>,
     next_request_slot: usize,
     req_buf: Vec<u8>,
+    hiprio_blocked: QueueBlockState,
+    request_blocked: Vec<QueueBlockState>,
 }
 
 impl VirtioFsBridgeContext {
@@ -95,6 +105,62 @@ impl VirtioFsBridgeContext {
 
     fn has_inflight(&self) -> bool {
         !self.hiprio_inflight.is_empty() || self.request_inflight.iter().any(|m| !m.is_empty())
+    }
+
+    fn has_completion_available(&self) -> bool {
+        self.hiprio_vq.as_ref().is_some_and(|queue| queue.can_pop())
+            || self.request_vqs.iter().any(|queue| queue.can_pop())
+    }
+
+    fn has_queue_full_blocked(&self) -> bool {
+        self.hiprio_blocked.blocked || self.request_blocked.iter().any(|state| state.blocked)
+    }
+
+    fn can_pump_high_priority(&self) -> bool {
+        !self.hiprio_blocked.blocked
+    }
+
+    fn has_unblocked_request_slot(&self) -> bool {
+        Self::has_unblocked_request_slot_in(&self.request_blocked, self.request_vqs.len())
+    }
+
+    fn has_unblocked_request_slot_in(
+        request_blocked: &[QueueBlockState],
+        request_queue_count: usize,
+    ) -> bool {
+        (0..request_queue_count).any(|slot| {
+            request_blocked
+                .get(slot)
+                .is_some_and(|state| !state.blocked)
+        })
+    }
+
+    fn block_state_mut(&mut self, kind: QueueKind) -> Result<&mut QueueBlockState, SystemError> {
+        match kind {
+            QueueKind::Hiprio => Ok(&mut self.hiprio_blocked),
+            QueueKind::Request(slot) => self
+                .request_blocked
+                .get_mut(slot)
+                .ok_or(SystemError::EINVAL),
+        }
+    }
+
+    fn mark_queue_full_blocked(&mut self, kind: QueueKind) -> Result<(), SystemError> {
+        let state = self.block_state_mut(kind)?;
+        if !state.blocked {
+            stats::on_virtiofs_queue_full_blocked();
+        }
+        state.blocked = true;
+        state.completion_seen = false;
+        Ok(())
+    }
+
+    fn mark_queue_completion_seen(&mut self, kind: QueueKind) {
+        if let Ok(state) = self.block_state_mut(kind) {
+            if state.blocked {
+                state.completion_seen = true;
+            }
+        }
     }
 
     fn push_pending_back(&mut self, pending: PendingReq) -> Result<(), SystemError> {
@@ -130,6 +196,84 @@ impl VirtioFsBridgeContext {
                 .ok_or(SystemError::EINVAL)?
                 .pop_front(),
         })
+    }
+
+    fn queue_can_retry(&self, kind: QueueKind) -> Result<bool, SystemError> {
+        let state = match kind {
+            QueueKind::Hiprio => &self.hiprio_blocked,
+            QueueKind::Request(slot) => {
+                self.request_blocked.get(slot).ok_or(SystemError::EINVAL)?
+            }
+        };
+        Ok(!state.blocked || state.completion_seen)
+    }
+
+    fn request_inflight_contains_unique(&self, unique: u64) -> bool {
+        self.request_inflight
+            .iter()
+            .any(|map| map.values().any(|req| req.pending.unique == unique))
+    }
+
+    fn hiprio_pending_submit_ready(&self, pending: &PendingReq) -> bool {
+        if pending.opcode != FUSE_INTERRUPT {
+            return true;
+        }
+
+        let target_unique = FuseConn::interrupt_target_unique(pending.unique);
+        self.conn.has_processing_request(target_unique)
+            && self.request_inflight_contains_unique(target_unique)
+    }
+
+    fn pop_ready_hiprio_pending(&mut self) -> Result<Option<PendingReq>, SystemError> {
+        if !self.queue_can_retry(QueueKind::Hiprio)? {
+            return Ok(None);
+        }
+
+        let mut index = 0usize;
+        while index < self.hiprio_pending.len() {
+            let (opcode, unique) = {
+                let pending = self.hiprio_pending.get(index).ok_or(SystemError::EINVAL)?;
+                (pending.opcode, pending.unique)
+            };
+
+            if opcode == FUSE_INTERRUPT {
+                let target_unique = FuseConn::interrupt_target_unique(unique);
+                if !self.conn.has_processing_request(target_unique) {
+                    self.hiprio_pending.remove(index);
+                    stats::on_fuse_requests_aborted(1);
+                    continue;
+                }
+            }
+
+            if self
+                .hiprio_pending
+                .get(index)
+                .is_some_and(|pending| self.hiprio_pending_submit_ready(pending))
+            {
+                return self
+                    .hiprio_pending
+                    .remove(index)
+                    .map(Some)
+                    .ok_or(SystemError::EINVAL);
+            }
+
+            index += 1;
+        }
+
+        Ok(None)
+    }
+
+    fn pop_pending_for_submit(
+        &mut self,
+        kind: QueueKind,
+    ) -> Result<Option<PendingReq>, SystemError> {
+        if matches!(kind, QueueKind::Hiprio) {
+            return self.pop_ready_hiprio_pending();
+        }
+        if !self.queue_can_retry(kind)? {
+            return Ok(None);
+        }
+        self.pop_pending_front(kind)
     }
 
     fn queue_index(&self, kind: QueueKind) -> Result<u16, SystemError> {
@@ -232,19 +376,49 @@ impl VirtioFsBridgeContext {
         Self::complete_request_with_negative_errno(&self.conn, unique, err.to_posix_errno());
     }
 
-    fn choose_request_slot(&mut self) -> Result<usize, SystemError> {
-        if self.request_vqs.is_empty() {
-            return Err(SystemError::ENODEV);
-        }
-        let slot = self.next_request_slot % self.request_vqs.len();
-        self.next_request_slot = (self.next_request_slot + 1) % self.request_vqs.len();
-        Ok(slot)
+    fn choose_unblocked_request_slot(&mut self) -> Result<usize, SystemError> {
+        Self::choose_unblocked_request_slot_in(
+            &mut self.next_request_slot,
+            &self.request_blocked,
+            self.request_vqs.len(),
+        )
     }
 
-    fn pump_new_requests(&mut self) -> Result<usize, SystemError> {
+    fn choose_unblocked_request_slot_in(
+        next_request_slot: &mut usize,
+        request_blocked: &[QueueBlockState],
+        request_queue_count: usize,
+    ) -> Result<usize, SystemError> {
+        if request_queue_count == 0 {
+            return Err(SystemError::ENODEV);
+        }
+
+        for offset in 0..request_queue_count {
+            let slot = (*next_request_slot + offset) % request_queue_count;
+            let state = request_blocked.get(slot).ok_or(SystemError::EINVAL)?;
+            if !state.blocked {
+                *next_request_slot = (slot + 1) % request_queue_count;
+                return Ok(slot);
+            }
+        }
+
+        Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+    }
+
+    fn pump_ordinary_requests(&mut self) -> Result<usize, SystemError> {
         let mut pumped = 0usize;
         for _ in 0..VIRTIOFS_PUMP_BUDGET {
-            let len = match self.conn.read_request(true, &mut self.req_buf) {
+            if !self.conn.has_pending_ordinary_requests() {
+                break;
+            }
+
+            let slot = match self.choose_unblocked_request_slot() {
+                Ok(slot) => slot,
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => break,
+                Err(e) => return Err(e),
+            };
+
+            let len = match self.conn.read_ordinary_request(true, &mut self.req_buf) {
                 Ok(len) => len,
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => break,
                 Err(e) => return Err(e),
@@ -253,17 +427,13 @@ impl VirtioFsBridgeContext {
             stats::on_virtiofs_request_cloned(req.len());
             let in_hdr: FuseInHeader = fuse_read_struct(&req)?;
             let noreply = matches!(in_hdr.opcode, FUSE_FORGET | FUSE_DESTROY);
-            let queue = if matches!(in_hdr.opcode, FUSE_FORGET | FUSE_INTERRUPT) {
-                QueueKind::Hiprio
-            } else {
-                QueueKind::Request(self.choose_request_slot()?)
-            };
+            debug_assert!(!matches!(in_hdr.opcode, FUSE_FORGET | FUSE_INTERRUPT));
             self.push_pending_back(PendingReq {
                 req,
                 unique: in_hdr.unique,
                 opcode: in_hdr.opcode,
                 noreply,
-                queue,
+                queue: QueueKind::Request(slot),
             })?;
             pumped += 1;
         }
@@ -271,11 +441,54 @@ impl VirtioFsBridgeContext {
         Ok(pumped)
     }
 
+    fn pump_high_priority_requests(&mut self) -> Result<usize, SystemError> {
+        let mut pumped = 0usize;
+        for _ in 0..VIRTIOFS_PUMP_BUDGET {
+            let len = match self.conn.read_high_priority_request(&mut self.req_buf) {
+                Ok(len) => len,
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => break,
+                Err(e) => return Err(e),
+            };
+            let req = self.req_buf[..len].to_vec();
+            stats::on_virtiofs_request_cloned(req.len());
+            let in_hdr: FuseInHeader = fuse_read_struct(&req)?;
+            debug_assert!(matches!(in_hdr.opcode, FUSE_FORGET | FUSE_INTERRUPT));
+            self.push_pending_back(PendingReq {
+                req,
+                unique: in_hdr.unique,
+                opcode: in_hdr.opcode,
+                noreply: in_hdr.opcode == FUSE_FORGET,
+                queue: QueueKind::Hiprio,
+            })?;
+            pumped += 1;
+        }
+        stats::on_virtiofs_pump_batch(pumped);
+        Ok(pumped)
+    }
+
+    fn pump_available_requests(&mut self) -> Result<usize, SystemError> {
+        let mut pumped = 0usize;
+        if self.can_pump_high_priority() && self.conn.has_pending_high_priority_requests() {
+            pumped += self.pump_high_priority_requests()?;
+        }
+        if self.has_unblocked_request_slot() && self.conn.has_pending_ordinary_requests() {
+            pumped += self.pump_ordinary_requests()?;
+        }
+        Ok(pumped)
+    }
+
     fn submit_one_pending(&mut self, kind: QueueKind) -> Result<bool, SystemError> {
-        let pending = match self.pop_pending_front(kind)? {
+        let pending = match self.pop_pending_for_submit(kind)? {
             Some(p) => p,
             None => return Ok(false),
         };
+        let retry_after_completion = {
+            let state = self.block_state_mut(kind)?;
+            state.blocked.then_some(state.completion_seen)
+        };
+        if let Some(after_completion) = retry_after_completion {
+            stats::on_virtiofs_queue_full_retry(after_completion);
+        }
         let queue_idx = self.queue_index(kind)?;
         let mut rsp = if pending.noreply {
             None
@@ -318,6 +531,7 @@ impl VirtioFsBridgeContext {
             Ok(token) => token,
             Err(VirtioError::QueueFull) => {
                 stats::on_virtiofs_queue_full();
+                self.mark_queue_full_blocked(kind)?;
                 let (queue_kind, queue_slot) = Self::trace_queue_fields(kind);
                 trace::trace_virtiofs_queue_retry(
                     pending.unique,
@@ -331,16 +545,16 @@ impl VirtioFsBridgeContext {
             }
             Err(VirtioError::NotReady) => {
                 stats::on_virtiofs_not_ready();
-                let (queue_kind, queue_slot) = Self::trace_queue_fields(kind);
-                trace::trace_virtiofs_queue_retry(
-                    pending.unique,
-                    pending.opcode,
-                    queue_kind,
-                    queue_slot,
-                    trace::VIRTIOFS_RETRY_NOT_READY,
+                stats::on_virtiofs_submit_error();
+                let se = virtio_drivers_error_to_system_error(VirtioError::NotReady);
+                warn!(
+                    "virtiofs bridge: queue not ready opcode={} unique={} queue={:?} err={:?}",
+                    pending.opcode, pending.unique, kind, se
                 );
-                self.push_pending_front(pending)?;
-                return Ok(false);
+                if !pending.noreply {
+                    self.complete_request_with_error(pending.unique, se);
+                }
+                return Ok(true);
             }
             Err(e) => {
                 stats::on_virtiofs_submit_error();
@@ -364,6 +578,19 @@ impl VirtioFsBridgeContext {
         }
 
         stats::on_virtiofs_submitted(pending.req.len());
+        let retry_succeeded = {
+            let state = self.block_state_mut(kind)?;
+            if state.blocked {
+                state.blocked = false;
+                state.completion_seen = false;
+                true
+            } else {
+                false
+            }
+        };
+        if retry_succeeded {
+            stats::on_virtiofs_queue_full_retry_success();
+        }
         let (queue_kind, queue_slot) = Self::trace_queue_fields(kind);
         trace::trace_virtiofs_submit(
             pending.unique,
@@ -514,18 +741,91 @@ impl VirtioFsBridgeContext {
 
     fn drain_completions(&mut self) -> Result<usize, SystemError> {
         let mut completed = 0usize;
+        let mut hiprio_completed = 0usize;
         while self.pop_one_used(QueueKind::Hiprio)? {
+            hiprio_completed += 1;
             completed += 1;
+        }
+        if hiprio_completed != 0 {
+            self.mark_queue_completion_seen(QueueKind::Hiprio);
         }
 
         for slot in 0..self.request_vqs.len() {
+            let mut queue_completed = 0usize;
             while self.pop_one_used(QueueKind::Request(slot))? {
+                queue_completed += 1;
                 completed += 1;
+            }
+            if queue_completed != 0 {
+                self.mark_queue_completion_seen(QueueKind::Request(slot));
             }
         }
 
         stats::on_virtiofs_complete_batch(completed);
         Ok(completed)
+    }
+
+    fn bridge_wait_exit_reason(
+        &self,
+        conn: &FuseConn,
+        events: u32,
+    ) -> Option<stats::VirtioFsBridgeWaitExit> {
+        if !conn.is_connected() && !self.has_inflight() {
+            return Some(stats::VirtioFsBridgeWaitExit::Disconnect);
+        }
+
+        let teardown_event = events & stats::VirtioFsBridgeWakeSource::Teardown.bit() != 0;
+        if teardown_event {
+            return Some(stats::VirtioFsBridgeWaitExit::Teardown);
+        }
+
+        let completion_event = events & stats::VirtioFsBridgeWakeSource::Completion.bit() != 0;
+        if completion_event || self.has_completion_available() {
+            return Some(stats::VirtioFsBridgeWaitExit::Completion);
+        }
+
+        if self.can_pump_high_priority() && conn.has_pending_high_priority_requests() {
+            return Some(stats::VirtioFsBridgeWaitExit::RequestPending);
+        }
+        if self.has_unblocked_request_slot() && conn.has_pending_ordinary_requests() {
+            return Some(stats::VirtioFsBridgeWaitExit::RequestPending);
+        }
+
+        let disconnect_event = events & stats::VirtioFsBridgeWakeSource::Disconnect.bit() != 0;
+        if disconnect_event && !self.has_inflight() {
+            return Some(stats::VirtioFsBridgeWaitExit::Disconnect);
+        }
+
+        let known_events = stats::VirtioFsBridgeWakeSource::Request.bit()
+            | stats::VirtioFsBridgeWakeSource::Completion.bit()
+            | stats::VirtioFsBridgeWakeSource::Teardown.bit()
+            | stats::VirtioFsBridgeWakeSource::Disconnect.bit();
+        if events & !known_events != 0 {
+            return Some(stats::VirtioFsBridgeWaitExit::Spurious);
+        }
+
+        None
+    }
+
+    fn wait_for_event(&mut self) {
+        if !self.irq_wake_enabled {
+            stats::on_virtiofs_idle_sleep(VIRTIOFS_POLL_NS);
+            Self::poll_pause();
+            return;
+        }
+
+        let conn = self.conn.clone();
+        trace::trace_virtiofs_bridge_wait_enter(
+            self.has_internal_pending() as u8,
+            self.has_inflight() as u8,
+            self.has_completion_available() as u8,
+            self.has_queue_full_blocked() as u8,
+        );
+        stats::on_virtiofs_bridge_wait();
+        let reason = conn.wait_bridge_until(|events| self.bridge_wait_exit_reason(&conn, events));
+        let events = conn.take_bridge_wake_events();
+        stats::on_virtiofs_bridge_wait_exit(reason);
+        trace::trace_virtiofs_bridge_wait_exit(reason.trace_id(), events);
     }
 
     fn fail_all_unfinished(&mut self, err: SystemError) {
@@ -570,11 +870,27 @@ impl VirtioFsBridgeContext {
         stats::on_virtiofs_fail_unfinished(failed);
     }
 
+    fn reset_device_and_unset_queues(&mut self) {
+        if let Some(transport) = self.transport.as_mut() {
+            transport.set_status(DeviceStatus::empty());
+            if self.hiprio_vq.take().is_some() {
+                transport.queue_unset(self.instance.hiprio_queue_index());
+            }
+            for slot in 0..self.request_vqs.len() {
+                if let Some(idx) = self.instance.request_queue_index_by_slot(slot) {
+                    transport.queue_unset(idx);
+                }
+            }
+            self.request_vqs.clear();
+        }
+    }
+
     fn run_loop(&mut self) -> Result<(), SystemError> {
         loop {
             let mut progressed = false;
 
-            match self.pump_new_requests() {
+            let pump_result = self.pump_available_requests();
+            match pump_result {
                 Ok(v) => progressed |= v != 0,
                 Err(SystemError::ENOTCONN) => {}
                 Err(e) => {
@@ -592,7 +908,11 @@ impl VirtioFsBridgeContext {
                     stats::on_virtiofs_ack_interrupt();
                 }
             }
-            progressed |= self.drain_completions()? != 0;
+            let completed = self.drain_completions()?;
+            if completed != 0 {
+                progressed = true;
+                progressed |= self.submit_pending()?;
+            }
             stats::on_virtiofs_loop_iteration(progressed);
 
             if !self.conn.is_connected() && !self.has_inflight() {
@@ -608,8 +928,7 @@ impl VirtioFsBridgeContext {
             }
 
             if !progressed {
-                stats::on_virtiofs_idle_sleep(VIRTIOFS_POLL_NS);
-                Self::poll_pause();
+                self.wait_for_event();
             }
         }
 
@@ -617,20 +936,12 @@ impl VirtioFsBridgeContext {
     }
 
     fn finish(&mut self) {
-        self.fail_all_unfinished(SystemError::ENOTCONN);
-
-        if let Some(transport) = self.transport.as_mut() {
-            if self.hiprio_vq.take().is_some() {
-                transport.queue_unset(self.instance.hiprio_queue_index());
-            }
-            for slot in 0..self.request_vqs.len() {
-                if let Some(idx) = self.instance.request_queue_index_by_slot(slot) {
-                    transport.queue_unset(idx);
-                }
-            }
-            self.request_vqs.clear();
-            transport.set_status(DeviceStatus::empty());
+        if self.irq_wake_enabled {
+            self.instance.disable_irq_wake();
         }
+        self.instance.clear_bridge_wake(self.session_id);
+        self.reset_device_and_unset_queues();
+        self.fail_all_unfinished(SystemError::ENOTCONN);
 
         if let Some(transport) = self.transport.take() {
             self.instance.put_transport_after_session(transport);
@@ -687,7 +998,7 @@ fn start_bridge(instance: Arc<VirtioFsInstance>, conn: Arc<FuseConn>) -> Result<
     }
     transport.set_guest_page_size(PAGE_SIZE as u32);
 
-    let hiprio_vq = match VirtQueue::<HalImpl, { VIRTIOFS_REQ_QUEUE_SIZE }>::new(
+    let mut hiprio_vq = match VirtQueue::<HalImpl, { VIRTIOFS_REQ_QUEUE_SIZE }>::new(
         &mut transport,
         instance.hiprio_queue_index(),
         false,
@@ -701,13 +1012,14 @@ fn start_bridge(instance: Arc<VirtioFsInstance>, conn: Arc<FuseConn>) -> Result<
             return Err(se);
         }
     };
+    hiprio_vq.set_dev_notify(true);
 
     let mut request_vqs = Vec::with_capacity(instance.request_queue_count());
     for slot in 0..instance.request_queue_count() {
         let idx = instance
             .request_queue_index_by_slot(slot)
             .ok_or(SystemError::EINVAL)?;
-        let vq = match VirtQueue::<HalImpl, { VIRTIOFS_REQ_QUEUE_SIZE }>::new(
+        let mut vq = match VirtQueue::<HalImpl, { VIRTIOFS_REQ_QUEUE_SIZE }>::new(
             &mut transport,
             idx,
             false,
@@ -721,13 +1033,19 @@ fn start_bridge(instance: Arc<VirtioFsInstance>, conn: Arc<FuseConn>) -> Result<
                 return Err(se);
             }
         };
+        vq.set_dev_notify(true);
         request_vqs.push(vq);
     }
     transport.finish_init();
 
+    instance.install_bridge_wake(session_id, &conn);
+    let irq_wake_enabled = instance.enable_irq_wake();
+    let request_queue_count = request_vqs.len();
     let ctx = Box::new(VirtioFsBridgeContext {
         instance,
         conn,
+        session_id,
+        irq_wake_enabled,
         transport: Some(transport),
         hiprio_vq: Some(hiprio_vq),
         request_pending: core::iter::repeat_with(VecDeque::new)
@@ -741,6 +1059,10 @@ fn start_bridge(instance: Arc<VirtioFsInstance>, conn: Arc<FuseConn>) -> Result<
         hiprio_inflight: BTreeMap::new(),
         next_request_slot: 0,
         req_buf: vec![0u8; VIRTIOFS_REQ_BUF_SIZE],
+        hiprio_blocked: QueueBlockState::default(),
+        request_blocked: core::iter::repeat_with(QueueBlockState::default)
+            .take(request_queue_count)
+            .collect(),
     });
 
     let raw = Box::into_raw(ctx);
@@ -1005,3 +1327,100 @@ impl MountableFileSystem for VirtioFsFs {
 }
 
 register_mountable_fs!(VirtioFsFs, VIRTIOFSMAKER, "virtiofs");
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+
+    use system_error::SystemError;
+
+    use super::{QueueBlockState, VirtioFsBridgeContext};
+
+    fn block_state(blocked: bool, completion_seen: bool) -> QueueBlockState {
+        QueueBlockState {
+            blocked,
+            completion_seen,
+        }
+    }
+
+    #[test]
+    fn choose_unblocked_request_slot_skips_blocked_slots() {
+        let states = vec![
+            block_state(true, false),
+            block_state(false, false),
+            block_state(false, false),
+        ];
+        let mut next = 0usize;
+
+        assert!(VirtioFsBridgeContext::has_unblocked_request_slot_in(
+            &states,
+            states.len()
+        ));
+        assert_eq!(
+            VirtioFsBridgeContext::choose_unblocked_request_slot_in(
+                &mut next,
+                &states,
+                states.len()
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(next, 2);
+        assert_eq!(
+            VirtioFsBridgeContext::choose_unblocked_request_slot_in(
+                &mut next,
+                &states,
+                states.len()
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(next, 0);
+        assert_eq!(
+            VirtioFsBridgeContext::choose_unblocked_request_slot_in(
+                &mut next,
+                &states,
+                states.len()
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn completion_seen_does_not_accept_new_ordinary_requests() {
+        let states = vec![block_state(true, true), block_state(false, false)];
+        let mut next = 0usize;
+
+        assert_eq!(
+            VirtioFsBridgeContext::choose_unblocked_request_slot_in(
+                &mut next,
+                &states,
+                states.len()
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(next, 0);
+    }
+
+    #[test]
+    fn all_blocked_request_slots_are_not_pumpable() {
+        let states = vec![block_state(true, false), block_state(true, true)];
+        let mut next = 0usize;
+
+        assert!(!VirtioFsBridgeContext::has_unblocked_request_slot_in(
+            &states,
+            states.len()
+        ));
+        assert!(matches!(
+            VirtioFsBridgeContext::choose_unblocked_request_slot_in(
+                &mut next,
+                &states,
+                states.len()
+            ),
+            Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+        ));
+        assert_eq!(next, 0);
+    }
+}

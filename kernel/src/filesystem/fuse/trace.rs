@@ -6,34 +6,99 @@ pub const VIRTIOFS_QUEUE_HIPRIO: u8 = 0;
 pub const VIRTIOFS_QUEUE_REQUEST: u8 = 1;
 
 pub const VIRTIOFS_RETRY_QUEUE_FULL: u8 = 1;
-pub const VIRTIOFS_RETRY_NOT_READY: u8 = 2;
 
 define_event_trace!(
-    fuse_request_queue,
+fuse_request_queue,
+TP_system(fuse),
+TP_PROTO(unique: u64, opcode: u32, len: u64, no_reply: u8),
+TP_STRUCT__entry {
+    unique: u64,
+    opcode: u32,
+    len: u64,
+    no_reply: u8,
+},
+TP_fast_assign {
+    unique: unique,
+    opcode: opcode,
+    len: len,
+    no_reply: no_reply,
+},
+TP_ident(__entry),
+TP_printk({
+    let unique = __entry.unique;
+    let opcode = __entry.opcode;
+    let len = __entry.len;
+    let no_reply = __entry.no_reply;
+    format!(
+        "unique={} opcode={} len={} no_reply={}",
+        unique, opcode, len, no_reply
+    )
+})
+);
+
+define_event_trace!(
+    virtiofs_bridge_wait_enter,
     TP_system(fuse),
-    TP_PROTO(unique: u64, opcode: u32, len: u64, no_reply: u8),
+    TP_PROTO(pending: u8, inflight: u8, can_pop: u8, queue_full_blocked: u8),
     TP_STRUCT__entry {
-        unique: u64,
-        opcode: u32,
-        len: u64,
-        no_reply: u8,
+        pending: u8,
+        inflight: u8,
+        can_pop: u8,
+        queue_full_blocked: u8,
     },
     TP_fast_assign {
-        unique: unique,
-        opcode: opcode,
-        len: len,
-        no_reply: no_reply,
+        pending: pending,
+        inflight: inflight,
+        can_pop: can_pop,
+        queue_full_blocked: queue_full_blocked,
     },
     TP_ident(__entry),
     TP_printk({
-        let unique = __entry.unique;
-        let opcode = __entry.opcode;
-        let len = __entry.len;
-        let no_reply = __entry.no_reply;
+        let pending = __entry.pending;
+        let inflight = __entry.inflight;
+        let can_pop = __entry.can_pop;
+        let queue_full_blocked = __entry.queue_full_blocked;
         format!(
-            "unique={} opcode={} len={} no_reply={}",
-            unique, opcode, len, no_reply
+            "pending={} inflight={} can_pop={} queue_full_blocked={}",
+            pending, inflight, can_pop, queue_full_blocked
         )
+    })
+);
+
+define_event_trace!(
+    virtiofs_bridge_wait_exit,
+    TP_system(fuse),
+    TP_PROTO(reason: u8, events: u32),
+    TP_STRUCT__entry {
+        reason: u8,
+        events: u32,
+    },
+    TP_fast_assign {
+        reason: reason,
+        events: events,
+    },
+    TP_ident(__entry),
+    TP_printk({
+        let reason = __entry.reason;
+        let events = __entry.events;
+        format!("reason={} events={}", reason, events)
+    })
+);
+
+define_event_trace!(
+    virtiofs_bridge_wake,
+    TP_system(fuse),
+    TP_PROTO(source: u8),
+    TP_STRUCT__entry {
+        source: u8,
+    },
+    TP_fast_assign {
+        source: source,
+    },
+    TP_ident(__entry),
+    TP_printk({
+        let source = __entry.source;
+        format!("source={}", source)
     })
 );
 

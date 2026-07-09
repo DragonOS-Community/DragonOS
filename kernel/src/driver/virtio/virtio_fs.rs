@@ -153,6 +153,7 @@ impl VirtioFsInstance {
     pub fn install_bridge_wake(&self, session_id: u64, conn: &Arc<FuseConn>) {
         let mut state = self.state.lock_irqsave();
         if state.session_active && state.active_session_id == session_id {
+            conn.install_bridge_wake();
             state.active_bridge = Some(VirtioFsActiveBridge {
                 session_id,
                 conn: Arc::downgrade(conn),
@@ -183,24 +184,42 @@ impl VirtioFsInstance {
     }
 
     pub fn clear_bridge_wake(&self, session_id: u64) {
-        let mut state = self.state.lock_irqsave();
-        if state
-            .active_bridge
-            .as_ref()
-            .is_some_and(|bridge| bridge.session_id == session_id)
-        {
-            state.active_bridge = None;
+        let conn = {
+            let mut state = self.state.lock_irqsave();
+            if state
+                .active_bridge
+                .as_ref()
+                .is_some_and(|bridge| bridge.session_id == session_id)
+            {
+                state
+                    .active_bridge
+                    .take()
+                    .and_then(|bridge| bridge.conn.upgrade())
+            } else {
+                None
+            }
+        };
+        if let Some(conn) = conn {
+            conn.clear_bridge_wake();
         }
     }
 
     pub fn put_transport_after_session(&self, transport: VirtIOTransport) {
-        let mut state = self.state.lock_irqsave();
-        state.active_bridge = None;
-        state.transport = Some(VirtioFsTransportHolder(transport));
-        state.released_session_id = state.active_session_id;
-        state.active_session_id = 0;
-        state.session_active = false;
-        drop(state);
+        let conn = {
+            let mut state = self.state.lock_irqsave();
+            let conn = state
+                .active_bridge
+                .take()
+                .and_then(|bridge| bridge.conn.upgrade());
+            state.transport = Some(VirtioFsTransportHolder(transport));
+            state.released_session_id = state.active_session_id;
+            state.active_session_id = 0;
+            state.session_active = false;
+            conn
+        };
+        if let Some(conn) = conn {
+            conn.clear_bridge_wake();
+        }
         self.session_wait.wakeup(None);
     }
 

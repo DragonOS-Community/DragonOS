@@ -1,5 +1,5 @@
 use alloc::{collections::BTreeMap, collections::VecDeque, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use num_traits::FromPrimitive;
 use system_error::SystemError;
@@ -60,6 +60,7 @@ where
 
 #[derive(Debug)]
 struct FuseBridgeWake {
+    active: AtomicBool,
     events: AtomicU32,
     wait: WaitQueue,
 }
@@ -67,12 +68,26 @@ struct FuseBridgeWake {
 impl FuseBridgeWake {
     fn new() -> Self {
         Self {
+            active: AtomicBool::new(false),
             events: AtomicU32::new(0),
             wait: WaitQueue::default(),
         }
     }
 
+    fn install(&self) {
+        self.active.store(true, Ordering::Release);
+    }
+
+    fn clear(&self) {
+        self.active.store(false, Ordering::Release);
+        self.events.store(0, Ordering::Release);
+        self.wait.wakeup(None);
+    }
+
     fn signal(&self, source: stats::VirtioFsBridgeWakeSource, trace_allowed: bool) {
+        if !self.active.load(Ordering::Acquire) {
+            return;
+        }
         self.events.fetch_or(source.bit(), Ordering::Release);
         stats::on_virtiofs_bridge_wake(source);
         if trace_allowed {
@@ -354,6 +369,14 @@ impl FuseConn {
         F: FnMut(u32) -> Option<R>,
     {
         self.bridge_wake.wait_until(cond)
+    }
+
+    pub fn install_bridge_wake(&self) {
+        self.bridge_wake.install();
+    }
+
+    pub fn clear_bridge_wake(&self) {
+        self.bridge_wake.clear();
     }
 
     pub fn wake_bridge(&self, source: stats::VirtioFsBridgeWakeSource) {
@@ -1522,5 +1545,28 @@ mod tests {
         buf.resize(conn.min_read_buffer(), 0);
         let len = conn.read_request(true, &mut buf).unwrap();
         assert_eq!(read_opcode(&buf[..len]), FUSE_FORGET);
+    }
+
+    #[test]
+    fn bridge_wake_events_are_ignored_until_bridge_is_installed() {
+        let conn = FuseConn::new();
+
+        conn.wake_bridge(stats::VirtioFsBridgeWakeSource::Request);
+        assert_eq!(conn.bridge_wake_events(), 0);
+
+        conn.install_bridge_wake();
+        conn.wake_bridge(stats::VirtioFsBridgeWakeSource::Request);
+        assert_eq!(
+            conn.bridge_wake_events(),
+            stats::VirtioFsBridgeWakeSource::Request.bit()
+        );
+        assert_eq!(
+            conn.take_bridge_wake_events(),
+            stats::VirtioFsBridgeWakeSource::Request.bit()
+        );
+
+        conn.clear_bridge_wake();
+        conn.wake_bridge(stats::VirtioFsBridgeWakeSource::Request);
+        assert_eq!(conn.bridge_wake_events(), 0);
     }
 }

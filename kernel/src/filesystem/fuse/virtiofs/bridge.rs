@@ -3,10 +3,10 @@ use alloc::{
     collections::{BTreeMap, VecDeque},
     string::String,
     sync::Arc,
-    vec,
     vec::Vec,
 };
 
+use device_output_buffer::{BufferError, DeviceOutputBuffer};
 use log::{debug, info, warn};
 use system_error::SystemError;
 use virtio_drivers::{
@@ -15,10 +15,12 @@ use virtio_drivers::{
 };
 
 use crate::{
+    arch::MMArch,
     driver::virtio::{
         transport::VirtIOTransport, virtio_drivers_error_to_system_error,
         virtio_fs::VirtioFsInstance,
     },
+    mm::{MemoryManagementArch, VirtAddr},
     process::{kthread::KernelThreadClosure, kthread::KernelThreadMechanism},
     time::{sleep::nanosleep, PosixTimeSpec},
 };
@@ -61,8 +63,64 @@ struct PendingReq {
 
 #[derive(Debug)]
 struct InflightReq {
-    pending: PendingReq,
-    rsp: Option<Vec<u8>>,
+    pending: Option<PendingReq>,
+    rsp: Option<DeviceOutputBuffer>,
+    descriptor_live: bool,
+}
+
+impl InflightReq {
+    fn new(pending: PendingReq, rsp: Option<DeviceOutputBuffer>) -> Self {
+        Self {
+            pending: Some(pending),
+            rsp,
+            descriptor_live: false,
+        }
+    }
+
+    fn pending(&self) -> &PendingReq {
+        self.pending
+            .as_ref()
+            .expect("inflight request must own pending metadata")
+    }
+
+    fn mark_submitted(&mut self) {
+        if let Some(rsp) = self.rsp.as_mut() {
+            rsp.mark_submitted();
+        }
+        self.descriptor_live = true;
+    }
+
+    fn mark_completed(&mut self) {
+        debug_assert!(self.descriptor_live);
+        self.descriptor_live = false;
+    }
+
+    unsafe fn mark_reset_retired_after_detach(&mut self) -> Result<(), BufferError> {
+        debug_assert!(self.descriptor_live);
+        if let Some(rsp) = self.rsp.as_mut() {
+            unsafe { rsp.retire_after_reset_and_detach()? };
+        }
+        self.descriptor_live = false;
+        Ok(())
+    }
+}
+
+impl Drop for InflightReq {
+    fn drop(&mut self) {
+        if !self.descriptor_live {
+            return;
+        }
+        // A live descriptor references both the request and optional response allocation. If a
+        // future error path drops the token owner without a successful pop or reset detach, leak
+        // both owners rather than freeing DMA-visible memory.
+        if let Some(pending) = self.pending.take() {
+            core::mem::forget(pending);
+        }
+        if let Some(rsp) = self.rsp.take() {
+            core::mem::forget(rsp);
+        }
+        stats::on_virtiofs_dma_owner_quarantined();
+    }
 }
 
 #[derive(Debug, Default)]
@@ -73,7 +131,7 @@ struct QueueBlockState {
 
 #[derive(Debug)]
 struct ResponseBufferPool {
-    buffers: Vec<Vec<u8>>,
+    buffers: Vec<DeviceOutputBuffer>,
     retained_capacity_bytes: usize,
 }
 
@@ -85,46 +143,39 @@ impl ResponseBufferPool {
         }
     }
 
-    fn acquire(&mut self, opcode: u32, len: usize) -> Vec<u8> {
+    fn acquire(&mut self, opcode: u32, len: usize) -> Result<DeviceOutputBuffer, SystemError> {
         let best_fit = self
             .buffers
             .iter()
             .enumerate()
-            .filter(|(_, buf)| buf.capacity() >= len)
-            .min_by_key(|(_, buf)| buf.capacity())
+            .filter(|(_, buf)| buf.allocation_len() >= len)
+            .min_by_key(|(_, buf)| buf.allocation_len())
             .map(|(index, _)| index);
         if let Some(index) = best_fit {
             let mut buf = self.buffers.swap_remove(index);
             self.retained_capacity_bytes = self
                 .retained_capacity_bytes
-                .checked_sub(buf.capacity())
+                .checked_sub(buf.allocation_len())
                 .expect("response pool capacity accounting underflow");
-            let old_len = buf.len();
-            if len > old_len {
-                // `resize` zero-initializes the newly exposed tail. Clear only the old prefix so
-                // every byte visible to the device is written exactly once on this reuse path.
-                buf.resize(len, 0);
-                buf[..old_len].fill(0);
-            } else {
-                buf.truncate(len);
-                buf.fill(0);
-            }
+            buf.prepare(len, response_buffer_virt_to_phys)
+                .map_err(|_| SystemError::EIO)?;
             stats::on_virtiofs_response_buffer_reuse(opcode, len);
-            stats::on_virtiofs_response_buffer_zero(opcode, len);
-            return buf;
+            return Ok(buf);
         }
 
-        let buf = vec![0u8; len];
+        let buf = DeviceOutputBuffer::new(len, response_buffer_virt_to_phys)
+            .map_err(|_| SystemError::EIO)?;
         stats::on_virtiofs_response_buffer_alloc(opcode, len);
         stats::on_virtiofs_response_buffer_zero(opcode, len);
-        buf
+        Ok(buf)
     }
 
-    fn release(&mut self, buf: Vec<u8>, reusable: bool) {
-        let capacity = buf.capacity();
+    fn release(&mut self, mut buf: DeviceOutputBuffer, reusable: bool) {
+        let capacity = buf.allocation_len();
         let next_capacity = self.retained_capacity_bytes.checked_add(capacity);
         let within_limits = reusable
-            && buf.len() <= VIRTIOFS_RSP_BUF_SIZE
+            && buf.recycle().is_ok()
+            && buf.allocation_len() <= VIRTIOFS_RSP_BUF_SIZE
             && capacity <= VIRTIOFS_RSP_BUF_SIZE
             && self.buffers.len() < VIRTIOFS_RSP_POOL_MAX_BUFFERS
             && next_capacity.is_some_and(|total| total <= VIRTIOFS_RSP_POOL_MAX_CAPACITY_BYTES);
@@ -142,6 +193,12 @@ impl ResponseBufferPool {
         self.buffers.clear();
         self.retained_capacity_bytes = 0;
     }
+}
+
+fn response_buffer_virt_to_phys(vaddr: usize) -> Option<usize> {
+    // SAFETY: DeviceOutputBuffer supplies the address of its live Box allocation. The kernel
+    // allocator obtains slab and buddy memory from the architecture direct map.
+    unsafe { MMArch::virt_2_phys(VirtAddr::new(vaddr)) }.map(|paddr| paddr.data())
 }
 
 impl Drop for ResponseBufferPool {
@@ -363,7 +420,7 @@ impl VirtioFsBridgeContext {
     fn request_inflight_contains_unique(&self, unique: u64) -> bool {
         self.request_inflight
             .iter()
-            .any(|map| map.values().any(|req| req.pending.unique == unique))
+            .any(|map| map.values().any(|req| req.pending().unique == unique))
     }
 
     fn hiprio_pending_submit_ready(&self, pending: &PendingReq) -> bool {
@@ -725,8 +782,15 @@ impl VirtioFsBridgeContext {
                         return Ok(true);
                     }
                 };
+                let rsp = match self.response_pool.acquire(pending.opcode, capacity.bytes) {
+                    Ok(rsp) => rsp,
+                    Err(e) => {
+                        self.terminate_pending_with_error(&pending, e);
+                        return Ok(true);
+                    }
+                };
                 (
-                    Some(self.response_pool.acquire(pending.opcode, capacity.bytes)),
+                    Some(rsp),
                     matches!(capacity.source, FuseReplyCapacitySource::ExplicitFallback),
                 )
             }
@@ -737,7 +801,11 @@ impl VirtioFsBridgeContext {
                 let queue = self.hiprio_vq.as_mut().ok_or(SystemError::EIO)?;
                 let token = if let Some(rsp_buf) = rsp.as_mut() {
                     let inputs = [pending.req.bytes()];
-                    let mut outputs = [rsp_buf.as_mut_slice()];
+                    let mut outputs = [unsafe {
+                        rsp_buf
+                            .submission_dma_slice(response_buffer_virt_to_phys)
+                            .map_err(|_| SystemError::EIO)?
+                    }];
                     // SAFETY: The request contains a non-empty FuseInHeader, and the reply
                     // contract makes `rsp_buf` at least a non-empty FuseOutHeader. On success,
                     // only their owners and independent metadata are moved/read before notification;
@@ -761,7 +829,11 @@ impl VirtioFsBridgeContext {
                 let queue = self.request_vqs.get_mut(slot).ok_or(SystemError::EINVAL)?;
                 let token = if let Some(rsp_buf) = rsp.as_mut() {
                     let inputs = [pending.req.bytes()];
-                    let mut outputs = [rsp_buf.as_mut_slice()];
+                    let mut outputs = [unsafe {
+                        rsp_buf
+                            .submission_dma_slice(response_buffer_virt_to_phys)
+                            .map_err(|_| SystemError::EIO)?
+                    }];
                     // SAFETY: The request contains a non-empty FuseInHeader, and the reply
                     // contract makes `rsp_buf` at least a non-empty FuseOutHeader. On success,
                     // only their owners and independent metadata are moved/read before notification;
@@ -831,10 +903,11 @@ impl VirtioFsBridgeContext {
             }
         };
 
-        if let Some(rsp_buf) = rsp.as_ref() {
-            stats::on_virtiofs_response_submitted(trace_opcode, rsp_buf.len(), fallback);
+        let mut inflight = InflightReq::new(pending, rsp);
+        inflight.mark_submitted();
+        if let Some(rsp_buf) = inflight.rsp.as_ref() {
+            stats::on_virtiofs_response_submitted(trace_opcode, rsp_buf.writable_len(), fallback);
         }
-        let inflight = InflightReq { pending, rsp };
         let replaced = match kind {
             QueueKind::Hiprio => self.hiprio_inflight.insert(token, inflight),
             QueueKind::Request(slot) => self.request_inflight[slot].insert(token, inflight),
@@ -917,55 +990,72 @@ impl VirtioFsBridgeContext {
         };
 
         let mut inflight = self.take_inflight(kind, token)?;
-
-        let used_len_res = match kind {
-            QueueKind::Hiprio => {
-                let queue = self.hiprio_vq.as_mut().ok_or(SystemError::EIO)?;
-                let inputs = [inflight.pending.req.bytes()];
-                if let Some(rsp_buf) = inflight.rsp.as_mut() {
-                    let mut outputs = [rsp_buf.as_mut_slice()];
-                    // SAFETY: `inflight` is the token-indexed owner of the exact request and
-                    // response buffers submitted by `add`. Both remain live during this call;
-                    // an error puts the same owner back, while success retires device access.
-                    unsafe { queue.pop_used(token, &inputs, &mut outputs) }
-                        .map_err(virtio_drivers_error_to_system_error)
-                } else {
-                    let mut outputs: [&mut [u8]; 0] = [];
-                    // SAFETY: `inflight` is the token-indexed owner of the exact request buffer
-                    // submitted by `add` and keeps it live during this call. This no-reply request
-                    // has no output buffer; an error restores the owner, while success retires
-                    // device access.
-                    unsafe { queue.pop_used(token, &inputs, &mut outputs) }
-                        .map_err(virtio_drivers_error_to_system_error)
+        let pending = inflight
+            .pending
+            .take()
+            .expect("inflight request must own pending metadata");
+        let inputs = [pending.req.bytes()];
+        let used_len_res = if let Some(rsp_buf) = inflight.rsp.as_mut() {
+            let output = match unsafe { rsp_buf.retirement_dma_slice(response_buffer_virt_to_phys) }
+            {
+                Ok(output) => output,
+                Err(_) => {
+                    let unique = pending.unique;
+                    inflight.pending = Some(pending);
+                    self.put_back_inflight(kind, token, inflight)?;
+                    warn!(
+                        "virtiofs bridge: response DMA identity changed unique={} token={} queue={:?}",
+                        unique, token, kind
+                    );
+                    return Err(SystemError::EIO);
                 }
+            };
+            let mut outputs = [output];
+            // SAFETY: The stateful response buffer reconstructed the exact virtual address and
+            // length recorded at add, and `req_owner` references the same immutable FuseRequest.
+            // On error the complete token owner is restored to the inflight map.
+            match kind {
+                QueueKind::Hiprio => unsafe {
+                    self.hiprio_vq
+                        .as_mut()
+                        .expect("hiprio queue was validated before taking its inflight owner")
+                        .pop_used(token, &inputs, &mut outputs)
+                },
+                QueueKind::Request(slot) => unsafe {
+                    self.request_vqs
+                        .get_mut(slot)
+                        .expect("request queue was validated before taking its inflight owner")
+                        .pop_used(token, &inputs, &mut outputs)
+                },
             }
-            QueueKind::Request(slot) => {
-                let queue = self.request_vqs.get_mut(slot).ok_or(SystemError::EINVAL)?;
-                let inputs = [inflight.pending.req.bytes()];
-                if let Some(rsp_buf) = inflight.rsp.as_mut() {
-                    let mut outputs = [rsp_buf.as_mut_slice()];
-                    // SAFETY: `inflight` is the token-indexed owner of the exact request and
-                    // response buffers submitted by `add`. Both remain live during this call;
-                    // an error puts the same owner back, while success retires device access.
-                    unsafe { queue.pop_used(token, &inputs, &mut outputs) }
-                        .map_err(virtio_drivers_error_to_system_error)
-                } else {
-                    let mut outputs: [&mut [u8]; 0] = [];
-                    // SAFETY: `inflight` is the token-indexed owner of the exact request buffer
-                    // submitted by `add` and keeps it live during this call. This no-reply request
-                    // has no output buffer; an error restores the owner, while success retires
-                    // device access.
-                    unsafe { queue.pop_used(token, &inputs, &mut outputs) }
-                        .map_err(virtio_drivers_error_to_system_error)
-                }
+            .map_err(virtio_drivers_error_to_system_error)
+        } else {
+            let mut outputs: [&mut [u8]; 0] = [];
+            // SAFETY: This no-reply request is owned by the token-indexed InflightReq and the
+            // request address/length are unchanged from add.
+            match kind {
+                QueueKind::Hiprio => unsafe {
+                    self.hiprio_vq
+                        .as_mut()
+                        .expect("hiprio queue was validated before taking its inflight owner")
+                        .pop_used(token, &inputs, &mut outputs)
+                },
+                QueueKind::Request(slot) => unsafe {
+                    self.request_vqs
+                        .get_mut(slot)
+                        .expect("request queue was validated before taking its inflight owner")
+                        .pop_used(token, &inputs, &mut outputs)
+                },
             }
+            .map_err(virtio_drivers_error_to_system_error)
         };
 
         let used_len = match used_len_res {
             Ok(v) => v as usize,
             Err(e) => {
                 stats::on_virtiofs_pop_used_error();
-                let unique = inflight.pending.unique;
+                let unique = pending.unique;
+                inflight.pending = Some(pending);
                 self.put_back_inflight(kind, token, inflight)?;
                 warn!(
                     "virtiofs bridge: pop_used failed unique={} token={} queue={:?} err={:?}",
@@ -974,51 +1064,56 @@ impl VirtioFsBridgeContext {
                 return Err(e);
             }
         };
+        inflight.mark_completed();
         stats::on_virtiofs_inflight_remove(kind.stats_kind(), 1);
+
+        let unique = pending.unique;
+        let opcode = pending.opcode;
+        let noreply = pending.noreply;
 
         let (queue_kind, queue_slot) = Self::trace_queue_fields(kind);
         trace::trace_virtiofs_complete(
-            inflight.pending.unique,
-            inflight.pending.opcode,
+            unique,
+            opcode,
             queue_kind,
             queue_slot,
             token,
             used_len as u64,
         );
 
-        if inflight.pending.noreply {
+        if noreply {
             stats::on_virtiofs_completed(used_len, true);
             return Ok(true);
         }
 
-        let rsp_buf = inflight
+        let mut rsp_buf = inflight
             .rsp
             .take()
             .expect("reply-bearing inflight request must own a response buffer");
-        stats::on_virtiofs_response_completed(inflight.pending.opcode, rsp_buf.len(), used_len);
-        if used_len > rsp_buf.len() {
+        let capacity = rsp_buf.writable_len();
+        stats::on_virtiofs_response_completed(opcode, capacity, used_len);
+        // SAFETY: pop_used succeeded for this exact token and DMA identity, so the descriptor is
+        // retired before the device-written prefix becomes readable or releasable.
+        if unsafe { rsp_buf.complete_after_pop(used_len) }.is_err() {
             stats::on_virtiofs_completed(used_len, false);
-            self.terminate_pending_with_error(&inflight.pending, SystemError::EIO);
+            self.terminate_pending_with_error(&pending, SystemError::EIO);
             self.response_pool.release(rsp_buf, false);
             return Ok(true);
         }
-        if rsp_buf.len() > used_len {
-            stats::on_virtiofs_response_buffer_waste(rsp_buf.len() - used_len);
+        if capacity > used_len {
+            stats::on_virtiofs_response_buffer_waste(capacity - used_len);
         }
         stats::on_virtiofs_completed(used_len, false);
 
-        if inflight.pending.opcode == FUSE_DESTROY && used_len == 0 {
-            let reusable = match self
-                .conn
-                .complete_destroy_without_reply(inflight.pending.unique)
-            {
+        if opcode == FUSE_DESTROY && used_len == 0 {
+            let reusable = match self.conn.complete_destroy_without_reply(unique) {
                 Ok(()) => true,
                 Err(e) => {
                     warn!(
                         "virtiofs bridge: zero-length DESTROY completion failed unique={} err={:?}",
-                        inflight.pending.unique, e
+                        unique, e
                     );
-                    self.terminate_pending_with_error(&inflight.pending, SystemError::EIO);
+                    self.terminate_pending_with_error(&pending, SystemError::EIO);
                     false
                 }
             };
@@ -1026,24 +1121,25 @@ impl VirtioFsBridgeContext {
             return Ok(true);
         }
 
-        let expected_unique = inflight.pending.unique;
-        if !Self::reply_matches_expected_unique(&rsp_buf[..used_len], expected_unique) {
+        let reply = rsp_buf
+            .initialized_prefix()
+            .expect("completion established the initialized response prefix");
+        if !Self::reply_matches_expected_unique(reply, unique) {
             warn!(
                 "virtiofs bridge: reply unique mismatch or short header expected={} opcode={} used_len={}",
-                expected_unique, inflight.pending.opcode, used_len
+                unique, opcode, used_len
             );
-            self.terminate_pending_with_error(&inflight.pending, SystemError::EIO);
+            self.terminate_pending_with_error(&pending, SystemError::EIO);
             self.response_pool.release(rsp_buf, false);
             return Ok(true);
         }
 
-        let reusable = match self.conn.write_reply(&rsp_buf[..used_len]) {
+        let reusable = match self.conn.write_reply(reply) {
             Ok(_) => true,
-            Err(SystemError::ENOENT) if inflight.pending.opcode != FUSE_DESTROY => true,
+            Err(SystemError::ENOENT) if opcode != FUSE_DESTROY => true,
             Err(e) => {
                 // Linux virtio-fs always ends a completed request from the used ring.
                 // Keep that behavior here: fail this unique instead of exiting bridge loop.
-                let unique = inflight.pending.unique;
                 let completion_err = if e == SystemError::EINVAL {
                     SystemError::EIO
                 } else {
@@ -1051,9 +1147,9 @@ impl VirtioFsBridgeContext {
                 };
                 warn!(
                     "virtiofs bridge: write_reply failed unique={} opcode={} err={:?}, complete with {:?}",
-                    unique, inflight.pending.opcode, e, completion_err
+                    unique, opcode, e, completion_err
                 );
-                self.terminate_pending_with_error(&inflight.pending, completion_err);
+                self.terminate_pending_with_error(&pending, completion_err);
                 false
             }
         };
@@ -1168,15 +1264,15 @@ impl VirtioFsBridgeContext {
 
     fn collect_inflight_reply_uniques(&self, need_reply: &mut Vec<u64>) {
         for (_, req) in self.hiprio_inflight.iter() {
-            if !req.pending.noreply {
-                need_reply.push(req.pending.unique);
+            if !req.pending().noreply {
+                need_reply.push(req.pending().unique);
             }
         }
 
         for inflight_map in &self.request_inflight {
             for (_, req) in inflight_map.iter() {
-                if !req.pending.noreply {
-                    need_reply.push(req.pending.unique);
+                if !req.pending().noreply {
+                    need_reply.push(req.pending().unique);
                 }
             }
         }
@@ -1239,14 +1335,32 @@ impl VirtioFsBridgeContext {
         queue: &mut VirtioFsQueue,
         inflight: &mut BTreeMap<u16, InflightReq>,
         kind: QueueKind,
-    ) {
+    ) -> bool {
+        let mut all_detached = true;
         for (token, req) in inflight.iter_mut() {
-            let inputs = [req.pending.req.bytes()];
+            let req_owner = req.pending().req.clone();
+            let inputs = [req_owner.bytes()];
             let result = if let Some(rsp_buf) = req.rsp.as_mut() {
-                let mut outputs = [rsp_buf.as_mut_slice()];
+                let output = match unsafe {
+                    rsp_buf.retirement_dma_slice(response_buffer_virt_to_phys)
+                } {
+                    Ok(output) => output,
+                    Err(_) => {
+                        all_detached = false;
+                        stats::on_virtiofs_detach_failure();
+                        warn!(
+                            "virtiofs bridge: response DMA identity changed during reset token={} queue={:?} unique={}",
+                            token,
+                            kind,
+                            req.pending().unique
+                        );
+                        continue;
+                    }
+                };
+                let mut outputs = [output];
                 // SAFETY: The caller invokes this only after the device reset completed, so the
-                // device can no longer access the queue. The buffers come from the same InflightReq
-                // that was inserted immediately after `VirtQueue::add` returned this token.
+                // device can no longer access the queue. The stateful buffer reconstructed the
+                // exact virtual address and length recorded for this token.
                 unsafe { queue.detach_unused(*token, &inputs, &mut outputs) }
             } else {
                 let mut outputs: [&mut [u8]; 0] = [];
@@ -1254,18 +1368,35 @@ impl VirtioFsBridgeContext {
                 unsafe { queue.detach_unused(*token, &inputs, &mut outputs) }
             };
 
-            if let Err(e) = result {
-                warn!(
-                    "virtiofs bridge: failed to detach inflight descriptor token={} queue={:?} unique={} err={:?}",
-                    token, kind, req.pending.unique, e
-                );
+            match result {
+                Ok(()) => {
+                    // SAFETY: reset preceded this drain and detach_unused just succeeded for the
+                    // exact request/response DMA identity owned by this token.
+                    if unsafe { req.mark_reset_retired_after_detach() }.is_err() {
+                        all_detached = false;
+                        stats::on_virtiofs_detach_failure();
+                    }
+                }
+                Err(e) => {
+                    all_detached = false;
+                    stats::on_virtiofs_detach_failure();
+                    warn!(
+                        "virtiofs bridge: failed to detach inflight descriptor token={} queue={:?} unique={} err={:?}",
+                        token,
+                        kind,
+                        req.pending().unique,
+                        e
+                    );
+                }
             }
         }
+        all_detached
     }
 
-    fn detach_inflight_descriptors_after_reset(&mut self) {
+    fn detach_inflight_descriptors_after_reset(&mut self) -> bool {
+        let mut all_detached = true;
         if let Some(queue) = self.hiprio_vq.as_mut() {
-            Self::detach_inflight_descriptors_for_queue(
+            all_detached &= Self::detach_inflight_descriptors_for_queue(
                 queue,
                 &mut self.hiprio_inflight,
                 QueueKind::Hiprio,
@@ -1274,13 +1405,14 @@ impl VirtioFsBridgeContext {
 
         for slot in 0..self.request_vqs.len() {
             if let Some(inflight) = self.request_inflight.get_mut(slot) {
-                Self::detach_inflight_descriptors_for_queue(
+                all_detached &= Self::detach_inflight_descriptors_for_queue(
                     &mut self.request_vqs[slot],
                     inflight,
                     QueueKind::Request(slot),
                 );
             }
         }
+        all_detached
     }
 
     fn reset_device_and_unset_queues(&mut self) -> bool {
@@ -1298,8 +1430,13 @@ impl VirtioFsBridgeContext {
                 self.instance.dev_id()
             );
             return false;
-        } else {
-            self.detach_inflight_descriptors_after_reset();
+        } else if !self.detach_inflight_descriptors_after_reset() {
+            warn!(
+                "virtiofs bridge: descriptor detach failed after reset tag='{}' dev={:?}; quarantine queues and DMA owners",
+                self.instance.tag(),
+                self.instance.dev_id()
+            );
+            return false;
         }
 
         if let Some(transport) = self.transport.as_mut() {
@@ -1789,17 +1926,26 @@ mod tests {
     }
 
     #[test]
-    fn response_pool_reuses_exact_length_and_zeroes_before_submit() {
+    fn response_pool_reuses_exact_length_without_reinitializing() {
         let mut pool = ResponseBufferPool::new();
-        let mut buf = pool.acquire(FUSE_LOOKUP, 128);
-        buf.fill(0xaa);
-        let ptr = buf.as_ptr();
+        let mut buf = pool.acquire(FUSE_LOOKUP, 128).unwrap();
+        let ptr = unsafe {
+            buf.submission_dma_slice(super::response_buffer_virt_to_phys)
+                .unwrap()
+                .as_ptr()
+        };
         pool.release(buf, true);
 
         assert_eq!(pool.buffers.len(), 1);
-        let reused = pool.acquire(FUSE_LOOKUP, 128);
-        assert_eq!(reused.as_ptr(), ptr);
-        assert!(reused.iter().all(|byte| *byte == 0));
+        let mut reused = pool.acquire(FUSE_LOOKUP, 128).unwrap();
+        let reused_ptr = unsafe {
+            reused
+                .submission_dma_slice(super::response_buffer_virt_to_phys)
+                .unwrap()
+                .as_ptr()
+        };
+        assert_eq!(reused_ptr, ptr);
+        assert_eq!(reused.writable_len(), 128);
         assert!(pool.buffers.is_empty());
         assert_eq!(pool.retained_capacity_bytes, 0);
     }
@@ -1807,40 +1953,59 @@ mod tests {
     #[test]
     fn response_pool_best_fit_reuses_larger_capacity_without_exposing_tail() {
         let mut pool = ResponseBufferPool::new();
-        let mut large = Vec::with_capacity(256);
-        large.resize(192, 0xaa);
-        let ptr = large.as_ptr();
+        let mut large = pool.acquire(FUSE_LOOKUP, 192).unwrap();
+        let ptr = unsafe {
+            large
+                .submission_dma_slice(super::response_buffer_virt_to_phys)
+                .unwrap()
+                .as_ptr()
+        };
         pool.release(large, true);
 
-        let reused = pool.acquire(FUSE_LOOKUP, 64);
-        assert_eq!(reused.as_ptr(), ptr);
-        assert_eq!(reused.len(), 64);
-        assert!(reused.iter().all(|byte| *byte == 0));
-        assert_eq!(reused.capacity(), 256);
+        let mut reused = pool.acquire(FUSE_LOOKUP, 64).unwrap();
+        let reused_ptr = unsafe {
+            reused
+                .submission_dma_slice(super::response_buffer_virt_to_phys)
+                .unwrap()
+                .as_ptr()
+        };
+        assert_eq!(reused_ptr, ptr);
+        assert_eq!(reused.writable_len(), 64);
+        assert_eq!(reused.allocation_len(), 192);
         assert_eq!(pool.retained_capacity_bytes, 0);
     }
 
     #[test]
-    fn response_pool_zeroes_old_prefix_when_reused_length_grows() {
+    fn response_pool_reuses_retained_allocation_when_writable_length_grows() {
         let mut pool = ResponseBufferPool::new();
-        let mut buf = Vec::with_capacity(256);
-        buf.resize(64, 0xaa);
-        let ptr = buf.as_ptr();
+        let mut buf = pool.acquire(FUSE_LOOKUP, 256).unwrap();
+        let ptr = unsafe {
+            buf.submission_dma_slice(super::response_buffer_virt_to_phys)
+                .unwrap()
+                .as_ptr()
+        };
         pool.release(buf, true);
 
-        let reused = pool.acquire(FUSE_LOOKUP, 128);
-        assert_eq!(reused.as_ptr(), ptr);
-        assert_eq!(reused.len(), 128);
-        assert!(reused.iter().all(|byte| *byte == 0));
+        let mut reused = pool.acquire(FUSE_LOOKUP, 128).unwrap();
+        let reused_ptr = unsafe {
+            reused
+                .submission_dma_slice(super::response_buffer_virt_to_phys)
+                .unwrap()
+                .as_ptr()
+        };
+        assert_eq!(reused_ptr, ptr);
+        assert_eq!(reused.writable_len(), 128);
     }
 
     #[test]
     fn response_pool_rejects_excess_capacity_and_nonreusable_buffers() {
         let mut pool = ResponseBufferPool::new();
-        let mut oversized_capacity = Vec::with_capacity(VIRTIOFS_RSP_BUF_SIZE + 1);
-        oversized_capacity.resize(16, 0);
+        let oversized_capacity = pool
+            .acquire(FUSE_LOOKUP, VIRTIOFS_RSP_BUF_SIZE + 1)
+            .unwrap();
         pool.release(oversized_capacity, true);
-        pool.release(vec![0u8; 16], false);
+        let nonreusable = pool.acquire(FUSE_LOOKUP, 16).unwrap();
+        pool.release(nonreusable, false);
 
         assert!(pool.buffers.is_empty());
         assert_eq!(pool.retained_capacity_bytes, 0);
@@ -1849,14 +2014,20 @@ mod tests {
     #[test]
     fn response_pool_enforces_buffer_count_and_checked_capacity() {
         let mut pool = ResponseBufferPool::new();
+        let mut buffers = Vec::new();
         for _ in 0..=VIRTIOFS_RSP_POOL_MAX_BUFFERS {
-            pool.release(vec![0u8; 1], true);
+            buffers.push(pool.acquire(FUSE_LOOKUP, 1).unwrap());
+        }
+        for buf in buffers {
+            pool.release(buf, true);
         }
         assert_eq!(pool.buffers.len(), VIRTIOFS_RSP_POOL_MAX_BUFFERS);
 
         pool.clear();
         pool.retained_capacity_bytes = usize::MAX;
-        pool.release(vec![0u8; 1], true);
+        let buf = pool.acquire(FUSE_LOOKUP, 1).unwrap();
+        pool.retained_capacity_bytes = usize::MAX;
+        pool.release(buf, true);
         assert!(pool.buffers.is_empty());
         pool.retained_capacity_bytes = 0;
     }

@@ -98,13 +98,41 @@ StatsMap read_stats() {
 }
 
 void emit_stats_delta(const char* workload, const StatsMap& before, const StatsMap& after) {
+    std::vector<std::string> active_opcode_prefixes;
+    const std::string requests_suffix = "_requests_total";
+    for (const auto& item : after) {
+        auto old = before.find(item.first);
+        if (old == before.end() || item.second <= old->second ||
+            item.first.rfind("virtiofs_opcode.opcode_", 0) != 0 ||
+            item.first.size() <= requests_suffix.size() ||
+            item.first.compare(item.first.size() - requests_suffix.size(), requests_suffix.size(),
+                               requests_suffix) != 0) {
+            continue;
+        }
+        active_opcode_prefixes.push_back(
+            item.first.substr(0, item.first.size() - requests_suffix.size()));
+    }
+
     for (const auto& item : after) {
         auto old = before.find(item.first);
         if (old == before.end()) {
             continue;
         }
         long long delta = item.second - old->second;
-        if (delta == 0) {
+        bool required_zero = item.first == "virtiofs.response_buffer_zero_bytes" ||
+                             item.first == "virtiofs.response_buffer_alloc_bytes" ||
+                             item.first == "virtiofs.response_buffer_reuse_bytes";
+        if (!required_zero) {
+            for (const std::string& prefix : active_opcode_prefixes) {
+                if (item.first == prefix + "_response_buffer_zero_bytes" ||
+                    item.first == prefix + "_response_buffer_alloc_bytes" ||
+                    item.first == prefix + "_response_buffer_reuse_bytes") {
+                    required_zero = true;
+                    break;
+                }
+            }
+        }
+        if (delta == 0 && !required_zero) {
             continue;
         }
         printf("stats_delta workload=%s key=%s delta=%lld\n", workload, item.first.c_str(),

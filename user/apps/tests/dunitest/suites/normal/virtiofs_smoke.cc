@@ -9,6 +9,7 @@
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/xattr.h>
@@ -16,6 +17,10 @@
 
 #ifndef EOPNOTSUPP
 #define EOPNOTSUPP 95
+#endif
+
+#ifndef FS_IOC_GETFLAGS
+#define FS_IOC_GETFLAGS _IOR('f', 1, long)
 #endif
 
 namespace {
@@ -230,6 +235,36 @@ void assert_directory_probe_loop(const char* path, int count, bool probe_xattr) 
     }
 }
 
+void assert_virtiofs_write_fsync_read_ioctl(const char* mountpoint) {
+    char path[256] = {};
+    snprintf(path, sizeof(path), "%s/.dragonos_output_buffer_test", mountpoint);
+    int fd = open(path, O_CREAT | O_TRUNC | O_RDWR, 0644);
+    ASSERT_GE(fd, 0) << "open(" << path << ") failed: " << strerror(errno);
+
+    static const char payload[] = "virtiofs-device-output-prefix";
+    ASSERT_EQ((ssize_t)sizeof(payload), write(fd, payload, sizeof(payload)))
+        << "write(" << path << ") failed: " << strerror(errno);
+    ASSERT_EQ(0, fsync(fd)) << "fsync(" << path << ") failed: " << strerror(errno);
+    ASSERT_EQ(0, lseek(fd, 0, SEEK_SET)) << "lseek(" << path << ") failed: " << strerror(errno);
+
+    char readback[sizeof(payload)] = {};
+    ASSERT_EQ((ssize_t)sizeof(readback), read(fd, readback, sizeof(readback)))
+        << "read(" << path << ") failed: " << strerror(errno);
+    EXPECT_EQ(0, memcmp(payload, readback, sizeof(payload)));
+
+    long flags = 0;
+    errno = 0;
+    int ioctl_rc = ioctl(fd, FS_IOC_GETFLAGS, &flags);
+    if (ioctl_rc != 0) {
+        EXPECT_TRUE(errno == ENOTTY || errno == EOPNOTSUPP || errno == ENOSYS || errno == EINVAL)
+            << "FS_IOC_GETFLAGS failed unexpectedly: errno=" << errno << " (" << strerror(errno)
+            << ")";
+    }
+
+    ASSERT_EQ(0, close(fd)) << "close(" << path << ") failed: " << strerror(errno);
+    ASSERT_EQ(0, unlink(path)) << "unlink(" << path << ") failed: " << strerror(errno);
+}
+
 bool should_skip_missing_virtiofs(int err) {
     return err == ENODEV || err == ENOENT || err == EINVAL || err == EOPNOTSUPP || err == ENOSYS;
 }
@@ -272,6 +307,7 @@ TEST(VirtioFsSmoke, MountReadExecAndOverlayLower) {
     }
 
     assert_directory_probe_loop(mnt, 3, true);
+    assert_virtiofs_write_fsync_read_ioctl(mnt);
     snprintf(path, sizeof(path), "%s/hello.txt", mnt);
     assert_file_contains_prefix(path, "virtiofs-host-file");
 
@@ -284,6 +320,12 @@ TEST(VirtioFsSmoke, MountReadExecAndOverlayLower) {
     assert_repeated_busybox_exec(local_copy, "uname", 1);
     assert_repeated_busybox_exec(path, "ls", 2);
     assert_repeated_busybox_exec(path, "uname", 3);
+
+    ASSERT_EQ(0, umount(mnt)) << "first virtiofs umount failed: " << strerror(errno);
+    ASSERT_EQ(0, mount("hostshare", mnt, "virtiofs", 0, nullptr))
+        << "virtiofs remount failed: " << strerror(errno);
+    assert_directory_probe_loop(mnt, 2, true);
+    assert_virtiofs_write_fsync_read_ioctl(mnt);
 
     snprintf(options, sizeof(options), "lowerdir=%s,upperdir=%s,workdir=%s", mnt, upper, work);
     ASSERT_EQ(0, mount("overlay", merged, "overlay", 0, options))

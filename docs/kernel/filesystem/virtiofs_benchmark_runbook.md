@@ -192,9 +192,26 @@ opcode_16_requests_total
 ```
 
 比较优化前后时，先确认目标 opcode 的 `requests_total` 在 workload 中确实增加。request bridge copy
-下降和 response allocation/reuse 应分别判断；`response_buffer_zero_bytes` 表示新分配初始化或复用前
-清零产生的显式写入，不应把 allocator 次数下降误报成清零带宽也下降。pool 的容量边界由实现常量和
-单元测试验证；状态型 retained gauge 不做 opt-in 输出，以免首次观测前已有 buffer 导致欠计。
+下降和 response allocation/reuse 应分别判断；`response_buffer_zero_bytes` 只表示新建 backing 的一次
+初始化，复用不再产生清零写入。pool 的容量边界由实现常量和单元测试验证；状态型 retained gauge
+不做 opt-in 输出，以免首次观测前已有 buffer 导致欠计。
+
+清零优化必须在同一个手工挂载 session 内测量，避免自动卸载清空 response pool。第一次运行用于启用
+detailed stats 并预热各响应尺寸，第二次相同运行才是 measurement：
+
+```sh
+mkdir -p /tmp/host
+mount -t virtiofs hostshare /tmp/host
+VIRTIOFS_STATS_PATH=/tmp/dbg/fuse/stats /bin/virtiofs_bench --mount /tmp/host \
+  --workload metadata --files 64
+VIRTIOFS_STATS_PATH=/tmp/dbg/fuse/stats /bin/virtiofs_bench --mount /tmp/host \
+  --workload metadata --files 64
+umount /tmp/host
+```
+
+工具会为全局字段和本轮活跃 opcode 显式输出 `alloc/reuse/zero_bytes` 的零增量。measurement 阶段应
+满足 `response_buffer_reuse_bytes > 0`、`response_buffer_alloc_bytes == 0`、
+`response_buffer_zero_bytes == 0`；同时检查 submitted capacity、used 与 unused tail 仍保持恒等关系。
 
 其中 `*_configured` 是配置快照，benchmark 的 `stats_delta` 通常为 0；判断队列深度是否生效时应看
 `/tmp/dbg/fuse/stats` 中的绝对值。

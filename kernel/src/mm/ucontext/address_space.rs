@@ -634,7 +634,10 @@ impl AddressSpace {
                 map_fail!(err);
             }
 
-            if let Err(err) = file.inode().check_mmap_file(&file, len, offset, vm_flags) {
+            if let Err(err) = vma_file
+                .inode()
+                .check_mmap_file(&vma_file, len, offset, vm_flags)
+            {
                 map_fail!(err);
             }
 
@@ -696,15 +699,16 @@ impl AddressSpace {
 
             let mut reservation = MmapReservationGuard::new(self.clone(), reservation_id);
             let hook_result =
-                file.inode()
-                    .mmap_file(&file, region.start().data(), len, offset, vm_flags);
+                vma_file
+                    .inode()
+                    .mmap_file(&vma_file, region.start().data(), len, offset, vm_flags);
             let file_mmap_opened = hook_result.is_ok();
             let mut guard = self.write();
             macro_rules! close_file_mmap_if_opened {
                 () => {
                     if file_mmap_opened {
                         InnerAddressSpace::notify_vma_close(VmaCloseNotification {
-                            file: file.clone(),
+                            file: vma_file.clone(),
                             region,
                             vm_flags,
                         });

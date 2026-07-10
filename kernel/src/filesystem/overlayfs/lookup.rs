@@ -93,13 +93,13 @@ pub(super) fn find(
         lower_inodes[0].metadata()?.file_type
     };
 
-    let child = Arc::new(OvlInode::new(
+    let fs = inode.overlay_fs()?;
+    let child = fs.intern_inode(
         inode.child_redirect(name),
         file_type,
         upper_inode,
         lower_inodes,
-    ));
-    child.set_fs(inode.fs.lock().clone());
+    )?;
 
     Ok(child)
 }

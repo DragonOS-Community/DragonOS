@@ -163,7 +163,7 @@ where
         Err(err) => return Err(err),
     }
 
-    let (workdir, temp_inode, temp_name) = inode.create_workdir_temp(create_temp)?;
+    let (workdir, _temp_inode, temp_name) = inode.create_workdir_temp(create_temp)?;
     let commit_result = if is_dir {
         workdir.move_to(
             &temp_name,
@@ -197,7 +197,7 @@ where
         }
     }
 
-    upper_inode.find(name).or(Ok(temp_inode))
+    upper_inode.find(name)
 }
 
 fn is_dot_entry(name: &str) -> bool {

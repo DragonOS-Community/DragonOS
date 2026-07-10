@@ -69,6 +69,28 @@ struct packet_mreq_manual {
     unsigned char mr_address[8];
 };
 
+/* 暴力枚举 eth0-eth20，用 ioctl(SIOCGIFINDEX) 验证存在性。
+ * DragonOS 没有 /proc/net/dev，且接口名可能不稳定。 */
+static const char *discover_ifname(void) {
+    static char name[32] = "eth0";
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) return name;
+    for (int i = 0; i <= 20; i++) {
+        snprintf(name, sizeof(name), "eth%d", i);
+        struct ifreq ifr;
+        memset(&ifr, 0, sizeof(ifr));
+        strncpy(ifr.ifr_name, name, IFNAMSIZ - 1);
+        if (ioctl(sock, SIOCGIFINDEX, &ifr) == 0) {
+            close(sock);
+            printf("[INFO] discover_ifname: found %s (ifindex=%d)\n", name, ifr.ifr_ifindex);
+            return name;
+        }
+    }
+    close(sock);
+    strcpy(name, "eth0");
+    return name;
+}
+
 /* ---- 测试辅助宏 (与 test_af_packet.c 风格一致) ---- */
 
 static int fail_count = 0;
@@ -106,17 +128,18 @@ static int get_ifindex(const char *ifname)
 
 int main(void)
 {
+    const char *ifname = discover_ifname();
     printf("===== AF_PACKET Multicast Membership 测试 =====\n\n");
 
-    /* 获取 eth0 ifindex */
-    int ifindex = get_ifindex("eth12");
+    /* 获取网卡 ifindex */
+    int ifindex = get_ifindex(ifname);
     if (ifindex < 0) {
-        printf("[FAIL] 获取 eth0 ifindex: %s (errno=%d)\n", strerror(errno), errno);
-        printf("\n无法继续: 测试需要 eth0 网卡且内核支持 SIOCGIFINDEX ioctl。\n");
+        printf("[FAIL] 获取 %s ifindex: %s (errno=%d)\n", ifname, strerror(errno), errno);
+        printf("\n无法继续: 测试需要网卡且内核支持 SIOCGIFINDEX ioctl。\n");
         printf("通过: 0, 失败: 1\n");
         return 1;
     }
-    printf("eth0 ifindex = %d\n", ifindex);
+    printf("%s ifindex = %d\n", ifname, ifindex);
 
     /* 创建 AF_PACKET SOCK_RAW socket */
     int fd = socket(AF_PACKET, SOCK_RAW, htons(MY_ETH_P_ALL));

@@ -67,7 +67,27 @@ struct arp_hdr {
 /* 编译期断言: 手写长度与结构体保持一致 */
 _Static_assert(sizeof(struct arp_hdr) == ARP_PKT_LEN, "arp_hdr 大小必须为 28");
 
-#define IFNAME "eth12"
+/* 暴力枚举 eth0-eth20，用 ioctl(SIOCGIFINDEX) 验证存在性。
+ * DragonOS 没有 /proc/net/dev，且接口名可能不稳定。 */
+static const char *discover_ifname(void) {
+    static char name[32] = "eth0";
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) return name;
+    for (int i = 0; i <= 20; i++) {
+        snprintf(name, sizeof(name), "eth%d", i);
+        struct ifreq ifr;
+        memset(&ifr, 0, sizeof(ifr));
+        strncpy(ifr.ifr_name, name, IFNAMSIZ - 1);
+        if (ioctl(sock, SIOCGIFINDEX, &ifr) == 0) {
+            close(sock);
+            printf("[INFO] discover_ifname: found %s (ifindex=%d)\n", name, ifr.ifr_ifindex);
+            return name;
+        }
+    }
+    close(sock);
+    strcpy(name, "eth0");
+    return name;
+}
 #define LOCAL_IP  "10.0.2.15"
 #define GATEWAY   "10.0.2.2"
 
@@ -262,8 +282,9 @@ static void stimulate(int tx_fd, int ifindex, const unsigned char local_mac[6])
 
 int main(void)
 {
+    const char *ifname = discover_ifname();
     printf("===== AF_PACKET 端到端收发测试 =====\n");
-    printf("接口: %s, 本机 IP: %s, 网关: %s\n\n", IFNAME, LOCAL_IP, GATEWAY);
+    printf("接口: %s, 本机 IP: %s, 网关: %s\n\n", ifname, LOCAL_IP, GATEWAY);
 
     /* ---- 创建主 SOCK_RAW 套接字 ---- */
     int raw_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
@@ -279,19 +300,19 @@ int main(void)
     PASS("socket(AF_PACKET, SOCK_RAW, ETH_P_ALL)");
 
     /* ---- 获取接口索引与本机 MAC ---- */
-    int ifindex = get_if_index(raw_fd, IFNAME);
+    int ifindex = get_if_index(raw_fd, ifname);
     if (ifindex < 0) {
-        FAIL("get_if_index(eth0)", "ioctl(SIOCGIFINDEX) 失败");
+        FAIL("get_if_index", "ioctl(SIOCGIFINDEX) on %s 失败", ifname);
         goto summary;
     }
     {
         char msg[64];
-        snprintf(msg, sizeof(msg), "获取 %s 接口索引 = %d", IFNAME, ifindex);
+        snprintf(msg, sizeof(msg), "获取 %s 接口索引 = %d", ifname, ifindex);
         PASS(msg);
     }
 
     unsigned char local_mac[6];
-    get_if_hwaddr(raw_fd, IFNAME, local_mac);
+    get_if_hwaddr(raw_fd, ifname, local_mac);
     {
         char macs[24], msg[64];
         mac_to_str(local_mac, macs, sizeof(macs));
@@ -310,7 +331,11 @@ int main(void)
             FAIL("bind(AF_PACKET -> eth0)", "绑定失败");
             goto summary;
         }
-        PASS("bind(AF_PACKET, ETH_P_ALL, " IFNAME ")");
+        {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "bind(AF_PACKET, ETH_P_ALL, %s)", ifname);
+            PASS(buf);
+        }
     }
 
     /* ---- 接收超时 ---- */
@@ -564,7 +589,11 @@ int main(void)
             if (bind(dgram_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
                 FAIL("bind(SOCK_DGRAM -> eth0)", "绑定失败");
             } else {
-                PASS("bind(SOCK_DGRAM, " IFNAME ")");
+                {
+                    char buf2[64];
+                    snprintf(buf2, sizeof(buf2), "bind(SOCK_DGRAM, %s)", ifname);
+                    PASS(buf2);
+                }
 
                 /* DGRAM 只发 L3 负载 (ARP 28 字节)，内核负责加以太网头 */
                 struct arp_hdr arp;

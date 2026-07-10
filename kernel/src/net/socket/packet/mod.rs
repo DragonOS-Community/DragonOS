@@ -451,7 +451,9 @@ impl PacketSocket {
                 // 载荷
                 frame.extend_from_slice(buf);
 
-                self.send_raw_frame(&iface, &frame)
+self.send_raw_frame(&iface, &frame)?;
+                // SOCK_DGRAM: 返回用户 payload 长度（非完整帧长度），符合 Linux packet_sendmsg 语义
+                Ok(buf.len())
             }
         }
     }

@@ -106,6 +106,10 @@ fn is_unsupported(err: &SystemError) -> bool {
     )
 }
 
+fn is_origin_xattr_unavailable(err: &SystemError) -> bool {
+    is_unsupported(err) || *err == SystemError::EPERM
+}
+
 fn is_private_xattr(name: &str) -> bool {
     name.starts_with(OVL_XATTR_PRIVATE_PREFIX) || name == OVL_XATTR_ORIGIN
 }
@@ -311,7 +315,7 @@ pub(super) fn prepare_origin(
         // Some backings (notably the current ext4 symlink path) cannot store
         // xattrs. Fall back consistently to the upper identity rather than
         // claiming provenance that a later lookup cannot recover.
-        Err(err) if is_unsupported(&err) || err == SystemError::EPERM => Ok(None),
+        Err(err) if is_origin_xattr_unavailable(&err) => Ok(None),
         Err(err) => Err(err),
     }
 }
@@ -325,7 +329,11 @@ pub(super) fn load_origin(
     let value = match read_xattr_value(upper, OVL_XATTR_ORIGIN) {
         Ok(value) => value,
         Err(SystemError::ENODATA) => return Ok(None),
-        Err(err) if is_unsupported(&err) => return Ok(None),
+        // Keep this symmetric with prepare_origin(): if the backing
+        // filesystem cannot store the private origin xattr, a later inode
+        // instantiation must use the upper identity instead of exposing the
+        // backing xattr error through lookup/stat.
+        Err(err) if is_origin_xattr_unavailable(&err) => return Ok(None),
         Err(err) => return Err(err),
     };
     let Some(origin) = decode_origin(&value) else {

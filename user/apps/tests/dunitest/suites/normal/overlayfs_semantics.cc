@@ -1743,6 +1743,40 @@ TEST(OverlayFsSemantics, CopyUpLowerSymlinkPreservesTarget) {
     EXPECT_EQ(0, overlay_temp_entry_count(env.work));
 }
 
+TEST(OverlayFsSemantics, ReloadCopiedUpExt4SymlinkWithoutOriginXattr) {
+    if (!root_supports_ext4_xattrs()) {
+        GTEST_SKIP() << "requires ext4 rootfs symlink xattr behavior";
+    }
+
+    ScopedOverlayEnv scoped("overlayfs_reload_ext4_symlink", "/root");
+    const auto& env = scoped.env;
+    std::string lower_target = join_path(env.lower, "target");
+    std::string lower_link = join_path(env.lower, "link");
+    std::string merged_link = join_path(env.merged, "link");
+    std::string merged_renamed = join_path(env.merged, "renamed-link");
+
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_EQ(0, write_text(lower_target, "target-data"));
+    ASSERT_EQ(0, symlink("target", lower_link.c_str())) << strerror(errno);
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+    ASSERT_EQ(0, rename(merged_link.c_str(), merged_renamed.c_str())) << strerror(errno);
+
+    // ext4 currently rejects xattrs on symlinks with EPERM. Remount to force
+    // OverlayFS to instantiate a fresh inode and reload the optional origin
+    // xattr instead of reusing the copy-up inode state.
+    ASSERT_EQ(0, umount(env.merged.c_str())) << strerror(errno);
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+    struct stat st = {};
+    ASSERT_EQ(0, lstat(merged_renamed.c_str(), &st)) << strerror(errno);
+    EXPECT_TRUE(S_ISLNK(st.st_mode));
+    EXPECT_EQ("target", read_symlink_target(merged_renamed));
+    EXPECT_EQ("target-data", read_text(merged_renamed));
+}
+
 TEST(OverlayFsSemantics, CopyUpLowerCharDevicePreservesRdev) {
     ScopedOverlayEnv scoped("overlayfs_copy_up_chrdev");
     const auto& env = scoped.env;

@@ -32,7 +32,7 @@ use core::{
 };
 use log::info;
 use smoltcp::{phy, wire::HardwareAddress};
-// use system_error::SystemError;
+use system_error::SystemError;
 
 use super::e1000e::{E1000EBuffer, E1000EDevice};
 use super::irq::e1000e_irq_manager;
@@ -396,6 +396,20 @@ impl Iface for E1000EInterface {
 
     fn poll_napi(&self, budget: usize) -> bool {
         self.common.poll_napi(self.driver.force_get_mut(), budget)
+    }
+
+    fn raw_transmit(&self, frame: &[u8]) -> Result<(), SystemError> {
+        use smoltcp::phy::{Device, TxToken};
+        let device = self.driver.force_get_mut();
+        match device.transmit(Instant::now().into()) {
+            Some(tx_token) => {
+                tx_token.consume(frame.len(), |buf| {
+                    buf.copy_from_slice(frame);
+                });
+                Ok(())
+            }
+            None => Err(SystemError::ENOBUFS),
+        }
     }
 
     fn addr_assign_type(&self) -> u8 {

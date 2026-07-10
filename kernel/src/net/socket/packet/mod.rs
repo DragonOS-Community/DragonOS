@@ -405,8 +405,8 @@ impl PacketSocket {
 
     /// 发送原始帧到网卡
     fn send_raw_frame(&self, iface: &Arc<dyn Iface>, frame: &[u8]) -> Result<usize, SystemError> {
-        // 通过网卡接口发送原始帧
-        iface.common().send_raw_packet(frame)?;
+        // 通过网卡接口直接发送原始帧（绕过 smoltcp 协议栈）
+        iface.raw_transmit(frame)?;
         Ok(frame.len())
     }
 

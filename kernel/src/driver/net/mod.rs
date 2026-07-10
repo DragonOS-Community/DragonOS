@@ -104,6 +104,15 @@ pub trait Iface: crate::driver::base::device::Device {
         self.poll()
     }
 
+    /// # `raw_transmit`
+    /// 发送原始以太网帧（AF_PACKET 用）。
+    ///
+    /// 默认返回 `ENOSYS`；具体网卡驱动应覆盖此方法，通过底层 `phy::Device`
+    /// 的 TX 通道直接发送帧，绕过 smoltcp 协议栈。
+    fn raw_transmit(&self, _frame: &[u8]) -> Result<(), SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+
     /// # `should_drop_rx_packet`
     /// 驱动收包入口可选调用：询问“上层(协议栈/Socket 语义)”是否需要丢弃该包。
     ///
@@ -782,16 +791,5 @@ impl IfaceCommon {
         drop(sockets);
         let mut sockets = self.packet_sockets.write();
         sockets.retain(|s| s.strong_count() > 0);
-    }
-
-    /// 发送原始数据包
-    ///
-    /// 目前是简化实现，后续可以扩展
-    pub fn send_raw_packet(&self, _frame: &[u8]) -> Result<(), SystemError> {
-        // TODO: 实现原始数据包发送
-        // 这需要直接访问网卡驱动的 TX 队列
-        // 目前返回 ENOSYS，后续可以扩展
-        log::warn!("send_raw_packet: not fully implemented yet");
-        Err(SystemError::ENOSYS)
     }
 }

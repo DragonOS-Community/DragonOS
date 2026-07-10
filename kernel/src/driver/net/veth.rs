@@ -690,6 +690,20 @@ impl Iface for VethInterface {
         self.common.poll_napi(self.driver.force_get_mut(), budget)
     }
 
+    fn raw_transmit(&self, frame: &[u8]) -> Result<(), SystemError> {
+        use smoltcp::phy::{Device, TxToken};
+        let device = self.driver.force_get_mut();
+        match device.transmit(crate::time::Instant::now().into()) {
+            Some(tx_token) => {
+                tx_token.consume(frame.len(), |buf| {
+                    buf.copy_from_slice(frame);
+                });
+                Ok(())
+            }
+            None => Err(SystemError::ENOBUFS),
+        }
+    }
+
     fn addr_assign_type(&self) -> u8 {
         self.inner().netdevice_common.addr_assign_type
     }

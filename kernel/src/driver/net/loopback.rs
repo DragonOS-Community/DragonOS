@@ -600,6 +600,20 @@ impl Iface for LoopbackInterface {
         has_work_left || self.driver.has_pending_rx()
     }
 
+    fn raw_transmit(&self, frame: &[u8]) -> Result<(), SystemError> {
+        use smoltcp::phy::{Device, TxToken};
+        let device = self.driver.force_get_mut();
+        match device.transmit(Instant::now().into()) {
+            Some(tx_token) => {
+                tx_token.consume(frame.len(), |buf| {
+                    buf.copy_from_slice(frame);
+                });
+                Ok(())
+            }
+            None => Err(SystemError::ENOBUFS),
+        }
+    }
+
     fn should_drop_rx_packet(&self, packet: &[u8]) -> bool {
         self.common.should_drop_rx_packet(packet)
     }

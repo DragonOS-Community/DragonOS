@@ -782,6 +782,20 @@ impl Iface for VirtioInterface {
             .poll_napi(self.device_inner.force_get_mut(), budget)
     }
 
+    fn raw_transmit(&self, frame: &[u8]) -> Result<(), SystemError> {
+        use smoltcp::phy::{Device, TxToken};
+        let device = self.device_inner.force_get_mut();
+        match device.transmit(Instant::now().into()) {
+            Some(tx_token) => {
+                tx_token.consume(frame.len(), |buf| {
+                    buf.copy_from_slice(frame);
+                });
+                Ok(())
+            }
+            None => Err(SystemError::ENOBUFS),
+        }
+    }
+
     // fn as_any_ref(&'static self) -> &'static dyn core::any::Any {
     //     return self;
     // }

@@ -5,7 +5,7 @@
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use system_error::SystemError;
 
 use crate::driver::net::Iface;
@@ -14,7 +14,7 @@ use crate::filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, Inod
 use crate::libs::mutex::Mutex;
 use crate::libs::rwsem::RwSem;
 use crate::libs::wait_queue::WaitQueue;
-use crate::net::socket::common::EPollItems;
+use crate::net::socket::common::{write_i32_getsockopt, write_u32_getsockopt, EPollItems};
 use crate::net::socket::endpoint::Endpoint;
 use crate::net::socket::{Socket, PMSG, PSOCK, PSOL};
 use crate::process::cred::CAPFlags;
@@ -35,6 +35,39 @@ pub mod eth_protocol {
     /// IPv6 协议
     pub const ETH_P_IPV6: u16 = 0x86DD;
 }
+
+/// SOL_PACKET 级别 socket 选项常量 (对应 Linux `include/uapi/linux/if_packet.h`)
+pub mod packet_option {
+    /// 加入多播组 (独立 issue)
+    pub const PACKET_ADD_MEMBERSHIP: usize = 1;
+    /// 离开多播组 (独立 issue)
+    pub const PACKET_DROP_MEMBERSHIP: usize = 2;
+    /// 获取统计信息 (只读 getsockopt)
+    pub const PACKET_STATISTICS: usize = 6;
+    /// 复制阈值字节数
+    pub const PACKET_COPY_THRESH: usize = 7;
+    /// 辅助数据开关
+    pub const PACKET_AUXDATA: usize = 8;
+    /// 返回原始接收接口索引
+    pub const PACKET_ORIGDEV: usize = 9;
+    /// TPACKET 版本 (TPACKET_V1/V2/V3)
+    pub const PACKET_VERSION: usize = 10;
+    /// 预留字节数
+    pub const PACKET_RESERVE: usize = 12;
+    /// 虚拟网络头开关
+    pub const PACKET_VNET_HDR: usize = 15;
+    /// 发送时间戳 fd
+    pub const PACKET_TX_TIMESTAMP: usize = 16;
+    /// 接收时间戳类型
+    pub const PACKET_TIMESTAMP: usize = 17;
+    /// QDisc 绕过开关
+    pub const PACKET_QDISC_BYPASS: usize = 20;
+}
+
+/// TPACKET 版本常量 (用于 PACKET_VERSION 校验)
+const TPACKET_V1: i32 = 0;
+const TPACKET_V2: i32 = 1;
+const TPACKET_V3: i32 = 2;
 
 /// 数据包类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -107,14 +140,27 @@ pub struct SockAddrLl {
     pub sll_addr: [u8; 8],
 }
 
-/// Packet socket 选项 (为将来的功能预留)
-#[allow(dead_code)]
+/// Packet socket 选项存储 (对应 SOL_PACKET 级别 setsockopt/getsockopt)
 #[derive(Debug, Clone, Default)]
 pub struct PacketSocketOptions {
-    /// 是否启用辅助数据
+    /// PACKET_COPY_THRESH: 复制阈值字节数
+    pub copy_thresh: u32,
+    /// PACKET_AUXDATA: 是否启用辅助数据
     pub auxdata: bool,
-    /// 接收时间戳
-    pub timestamp: bool,
+    /// PACKET_ORIGDEV: 是否返回原始接收接口
+    pub origdev: bool,
+    /// PACKET_VERSION: TPACKET 版本 (TPACKET_V1/V2/V3)
+    pub version: i32,
+    /// PACKET_RESERVE: 预留字节数
+    pub reserve: u32,
+    /// PACKET_VNET_HDR: 是否启用虚拟网络头
+    pub vnet_hdr: bool,
+    /// PACKET_TX_TIMESTAMP: 发送时间戳 fd
+    pub tx_timestamp: i32,
+    /// PACKET_TIMESTAMP: 接收时间戳类型 (SOF_TIMESTAMPING 标志位)
+    pub timestamp: i32,
+    /// PACKET_QDISC_BYPASS: 是否绕过 qdisc
+    pub qdisc_bypass: bool,
 }
 
 const DEFAULT_RX_BUFFER_PACKETS: usize = 256;
@@ -138,9 +184,12 @@ pub struct PacketSocket {
     rx_buffer: Mutex<VecDeque<ReceivedPacket>>,
     /// 接收缓冲区最大包数
     rx_buffer_max_packets: AtomicUsize,
-    /// 选项 (为将来的功能预留)
-    #[allow(dead_code)]
+    /// 选项存储
     options: RwSem<PacketSocketOptions>,
+    /// 统计: 自上次 getsockopt(PACKET_STATISTICS) 以来接收的包数
+    stats_packets: AtomicU32,
+    /// 统计: 自上次 getsockopt(PACKET_STATISTICS) 以来丢弃的包数
+    stats_drops: AtomicU32,
     /// 非阻塞标志
     nonblock: AtomicBool,
     /// 等待队列
@@ -187,6 +236,8 @@ impl PacketSocket {
             rx_buffer: Mutex::new(VecDeque::with_capacity(DEFAULT_RX_BUFFER_PACKETS)),
             rx_buffer_max_packets: AtomicUsize::new(DEFAULT_RX_BUFFER_PACKETS),
             options: RwSem::new(PacketSocketOptions::default()),
+            stats_packets: AtomicU32::new(0),
+            stats_drops: AtomicU32::new(0),
             nonblock: AtomicBool::new(nonblock),
             wait_queue: WaitQueue::default(),
             inode_id: generate_inode_id(),
@@ -276,10 +327,13 @@ impl PacketSocket {
         if rx_buf.len() < max_packets {
             rx_buf.push_back(packet);
             drop(rx_buf);
+            self.stats_packets.fetch_add(1, Ordering::Relaxed);
             // 唤醒等待的进程
             self.wait_queue.wakeup(None);
+        } else {
+            // 缓冲区满，丢弃并计数
+            self.stats_drops.fetch_add(1, Ordering::Relaxed);
         }
-        // 否则丢弃（缓冲区满）
     }
 
     /// 尝试接收
@@ -375,6 +429,26 @@ impl PacketSocket {
     /// 获取自引用
     pub fn self_ref(&self) -> Weak<Self> {
         self.self_ref.clone()
+    }
+
+    /// 从 optval 解析 i32 (至少 4 字节)
+    fn parse_i32_opt(optval: &[u8]) -> Result<i32, SystemError> {
+        if optval.len() < core::mem::size_of::<i32>() {
+            return Err(SystemError::EINVAL);
+        }
+        let mut raw = [0u8; 4];
+        raw.copy_from_slice(&optval[..4]);
+        Ok(i32::from_ne_bytes(raw))
+    }
+
+    /// 从 optval 解析 u32 (至少 4 字节)
+    fn parse_u32_opt(optval: &[u8]) -> Result<u32, SystemError> {
+        if optval.len() < core::mem::size_of::<u32>() {
+            return Err(SystemError::EINVAL);
+        }
+        let mut raw = [0u8; 4];
+        raw.copy_from_slice(&optval[..4]);
+        Ok(u32::from_ne_bytes(raw))
     }
 }
 
@@ -597,35 +671,104 @@ impl Socket for PacketSocket {
             return Err(SystemError::ENOPROTOOPT);
         }
 
+        let opts = self.options.read();
         match name {
-            // PACKET_STATISTICS = 6
-            6 => {
-                // 返回统计信息（简化实现）
+            packet_option::PACKET_STATISTICS => {
+                // struct tpacket_stats { tp_packets: u32, tp_drops: u32 }
+                // Linux 语义: 返回自上次 getsockopt 以来的累计统计并清零计数器
                 if value.len() < 8 {
                     return Err(SystemError::EINVAL);
                 }
-                // tp_packets, tp_drops
-                value[..8].fill(0);
+                let packets = self.stats_packets.swap(0, Ordering::Relaxed);
+                let drops = self.stats_drops.swap(0, Ordering::Relaxed);
+                value[..4].copy_from_slice(&packets.to_ne_bytes());
+                value[4..8].copy_from_slice(&drops.to_ne_bytes());
                 Ok(8)
+            }
+            packet_option::PACKET_COPY_THRESH => {
+                Ok(write_u32_getsockopt(value, opts.copy_thresh))
+            }
+            packet_option::PACKET_AUXDATA => {
+                Ok(write_i32_getsockopt(value, opts.auxdata as i32))
+            }
+            packet_option::PACKET_ORIGDEV => {
+                Ok(write_i32_getsockopt(value, opts.origdev as i32))
+            }
+            packet_option::PACKET_VERSION => {
+                Ok(write_i32_getsockopt(value, opts.version))
+            }
+            packet_option::PACKET_RESERVE => {
+                Ok(write_u32_getsockopt(value, opts.reserve))
+            }
+            packet_option::PACKET_VNET_HDR => {
+                Ok(write_i32_getsockopt(value, opts.vnet_hdr as i32))
+            }
+            packet_option::PACKET_TX_TIMESTAMP => {
+                Ok(write_i32_getsockopt(value, opts.tx_timestamp))
+            }
+            packet_option::PACKET_TIMESTAMP => {
+                Ok(write_i32_getsockopt(value, opts.timestamp))
+            }
+            packet_option::PACKET_QDISC_BYPASS => {
+                Ok(write_i32_getsockopt(value, opts.qdisc_bypass as i32))
             }
             _ => Err(SystemError::ENOPROTOOPT),
         }
     }
 
-    fn set_option(&self, level: PSOL, name: usize, _val: &[u8]) -> Result<(), SystemError> {
+    fn set_option(&self, level: PSOL, name: usize, val: &[u8]) -> Result<(), SystemError> {
         if level != PSOL::PACKET {
-            return Ok(()); // 忽略其他级别的选项
+            return Err(SystemError::ENOPROTOOPT);
         }
 
+        let mut opts = self.options.write();
         match name {
-            // PACKET_ADD_MEMBERSHIP = 1
-            // PACKET_DROP_MEMBERSHIP = 2
-            // PACKET_AUXDATA = 8
-            1 | 2 | 8 => {
-                // TODO: 实现多播成员和辅助数据
+            packet_option::PACKET_ADD_MEMBERSHIP | packet_option::PACKET_DROP_MEMBERSHIP => {
+                // TODO: 实现多播成员管理 (独立 issue)
+                // 当前保持接受但不处理的行为
                 Ok(())
             }
-            _ => Ok(()),
+            packet_option::PACKET_COPY_THRESH => {
+                opts.copy_thresh = Self::parse_u32_opt(val)?;
+                Ok(())
+            }
+            packet_option::PACKET_AUXDATA => {
+                opts.auxdata = Self::parse_i32_opt(val)? != 0;
+                Ok(())
+            }
+            packet_option::PACKET_ORIGDEV => {
+                opts.origdev = Self::parse_i32_opt(val)? != 0;
+                Ok(())
+            }
+            packet_option::PACKET_VERSION => {
+                let v = Self::parse_i32_opt(val)?;
+                if v != TPACKET_V1 && v != TPACKET_V2 && v != TPACKET_V3 {
+                    return Err(SystemError::EINVAL);
+                }
+                opts.version = v;
+                Ok(())
+            }
+            packet_option::PACKET_RESERVE => {
+                opts.reserve = Self::parse_u32_opt(val)?;
+                Ok(())
+            }
+            packet_option::PACKET_VNET_HDR => {
+                opts.vnet_hdr = Self::parse_i32_opt(val)? != 0;
+                Ok(())
+            }
+            packet_option::PACKET_TX_TIMESTAMP => {
+                opts.tx_timestamp = Self::parse_i32_opt(val)?;
+                Ok(())
+            }
+            packet_option::PACKET_TIMESTAMP => {
+                opts.timestamp = Self::parse_i32_opt(val)?;
+                Ok(())
+            }
+            packet_option::PACKET_QDISC_BYPASS => {
+                opts.qdisc_bypass = Self::parse_i32_opt(val)? != 0;
+                Ok(())
+            }
+            _ => Err(SystemError::ENOPROTOOPT),
         }
     }
 }

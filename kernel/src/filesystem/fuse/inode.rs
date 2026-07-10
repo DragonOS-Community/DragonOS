@@ -125,6 +125,7 @@ impl PageCacheBackend for FusePageCacheBackend {
 impl FuseNode {
     const FUSE_DIRENT_ALIGN: usize = 8;
     const LOOKUP_CACHE_MAX_ENTRIES: usize = 1024;
+    const READDIR_BUFFER_SIZE: usize = 64 * 1024;
     const XATTR_SIZE_MAX: usize = 65536;
     const XATTR_LIST_MAX: usize = 65536;
 
@@ -183,6 +184,20 @@ impl FuseNode {
 
     fn max_pages_bytes(&self) -> usize {
         core::cmp::max(1, self.conn().max_pages()).saturating_mul(MMArch::PAGE_SIZE)
+    }
+
+    fn readdir_request_size_for_limits(max_read: usize, max_pages: usize) -> u32 {
+        let max_pages_bytes = core::cmp::max(1, max_pages).saturating_mul(MMArch::PAGE_SIZE);
+        let size = core::cmp::min(
+            Self::READDIR_BUFFER_SIZE,
+            core::cmp::min(max_read, max_pages_bytes),
+        );
+        debug_assert!(size <= u32::MAX as usize);
+        size as u32
+    }
+
+    fn readdir_request_size(&self) -> u32 {
+        Self::readdir_request_size_for_limits(self.conn().max_read(), self.conn().max_pages())
     }
 
     pub fn nodeid(&self) -> u64 {
@@ -2530,6 +2545,10 @@ impl IndexNode for FuseNode {
         let fh = dir_p.fh;
         let open_flags = dir_p.open_flags;
         let mut use_readdirplus = self.conn.use_readdirplus();
+        // Linux issues uncached READDIR with a single PAGE_SIZE output page. DragonOS keeps the
+        // existing larger batch when the connection supports it, but must not exceed either the
+        // mount's max_read value or the negotiated max_pages descriptor bound.
+        let readdir_size = self.readdir_request_size();
 
         let mut names: Vec<String> = Vec::new();
         let mut offset: u64 = 0;
@@ -2538,7 +2557,7 @@ impl IndexNode for FuseNode {
             let read_in = FuseReadIn {
                 fh,
                 offset,
-                size: 64 * 1024,
+                size: readdir_size,
                 read_flags: 0,
                 lock_owner: 0,
                 flags: open_flags,
@@ -2913,5 +2932,31 @@ impl Drop for FuseNode {
         self.clear_lookup_cache_tree();
         self.flush_forget();
         self.clear_parent();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FuseNode;
+    use crate::{arch::MMArch, mm::MemoryManagementArch};
+
+    #[test]
+    fn readdir_request_size_honors_read_and_page_limits() {
+        assert_eq!(
+            FuseNode::readdir_request_size_for_limits(256 * 1024, 124),
+            64 * 1024
+        );
+        assert_eq!(
+            FuseNode::readdir_request_size_for_limits(256 * 1024, 4),
+            (4 * MMArch::PAGE_SIZE) as u32
+        );
+        assert_eq!(
+            FuseNode::readdir_request_size_for_limits(8 * 1024, 124),
+            8 * 1024
+        );
+        assert_eq!(
+            FuseNode::readdir_request_size_for_limits(4 * 1024, 0),
+            MMArch::PAGE_SIZE as u32
+        );
     }
 }

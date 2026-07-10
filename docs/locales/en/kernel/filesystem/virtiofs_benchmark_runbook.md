@@ -74,12 +74,33 @@ mkdir -p /tmp/dbg
 mount -t debugfs debugfs /tmp/dbg
 ```
 
+Per-opcode, response reuse/zero, and pool details are disabled by default so normal hot paths do
+not pay for extra atomic read-modify-write operations. The first read of `/tmp/dbg/fuse/stats`
+enables these detailed counters for subsequent operations in the current boot. Read it once before
+the target workload; `virtiofs_bench` does this baseline read automatically when
+`VIRTIOFS_STATS_PATH` is set. Requests before that first read are excluded only from detailed
+fields; the existing aggregate counters are unaffected.
+
 Default full run:
 
 ```sh
 VIRTIOFS_STATS_PATH=/tmp/dbg/fuse/stats /bin/virtiofs_bench
 mount | grep virtiofs || echo no_virtiofs_mount
 ```
+
+Run timing validation separately from counter attribution. For pure timing runs, leave
+`VIRTIOFS_STATS_PATH` unset or empty. The benchmark then does not read debugfs or enable detailed
+per-opcode counters:
+
+```sh
+VIRTIOFS_STATS_PATH= /bin/virtiofs_bench --workload metadata --files 64
+VIRTIOFS_STATS_PATH= /bin/virtiofs_bench --workload sequential --file-size 4194304
+```
+
+After warm-up, run each version at least five times in baseline/optimized/baseline order and compare
+the median and range. Use a separate diagnostic run with
+`VIRTIOFS_STATS_PATH=/tmp/dbg/fuse/stats` to verify request, copy, and allocation deltas. Do not treat
+the diagnostic timing as an uninstrumented end-to-end result.
 
 Small smoke run:
 
@@ -149,6 +170,10 @@ virtiofs.bytes_submitted_total
 virtiofs.bytes_completed_total
 virtiofs.bridge_poll_sleep_ns_total
 virtiofs.response_buffer_waste_bytes
+virtiofs.response_buffer_alloc_count
+virtiofs.response_buffer_reuse_count
+virtiofs.response_buffer_zero_bytes
+virtiofs.response_pool_dropped_count
 virtiofs.virtqueue_full_total
 virtiofs.device_queue_depth_max
 virtiofs.hiprio_vring_size_configured
@@ -158,6 +183,25 @@ virtiofs.sg_limit_pages_configured
 virtiofs.inflight_peak
 virtiofs.queue_full_blocked_current
 ```
+
+The `[virtiofs_opcode]` section breaks the same metrics down by FUSE opcode. For example, lookup is
+opcode 1, read is opcode 15, and write is opcode 16:
+
+```text
+opcode_1_request_bridge_copy_bytes
+opcode_1_response_buffer_alloc_count
+opcode_1_response_buffer_reuse_count
+opcode_15_requests_total
+opcode_16_requests_total
+```
+
+Before comparing runs, verify that `requests_total` increased for the opcode exercised by the
+workload. Evaluate request bridge copies and response allocation/reuse separately.
+`response_buffer_zero_bytes` records explicit writes from allocation initialization or clearing a
+reused buffer before submission, so fewer allocator calls must not be reported as fewer zero-fill
+bytes. Pool capacity bounds are enforced by implementation constants and unit tests. A retained
+state gauge is intentionally not opt-in because buffers that predate the first stats read could not
+be represented accurately.
 
 The `*_configured` fields are configuration snapshots, so their `stats_delta` is usually 0.
 Check their absolute values in `/tmp/dbg/fuse/stats` when verifying whether queue depth took effect.

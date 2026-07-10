@@ -63,12 +63,16 @@ const char* result_mount_options(const Options& opt) {
 
 std::string stats_path() {
     const char* value = getenv("VIRTIOFS_STATS_PATH");
-    return value && value[0] != '\0' ? value : "/sys/kernel/debug/fuse/stats";
+    return value && value[0] != '\0' ? value : "";
 }
 
 StatsMap read_stats() {
     StatsMap stats;
-    std::ifstream in(stats_path());
+    std::string path = stats_path();
+    if (path.empty()) {
+        return stats;
+    }
+    std::ifstream in(path);
     if (!in) {
         return stats;
     }
@@ -99,8 +103,12 @@ void emit_stats_delta(const char* workload, const StatsMap& before, const StatsM
         if (old == before.end()) {
             continue;
         }
+        long long delta = item.second - old->second;
+        if (delta == 0) {
+            continue;
+        }
         printf("stats_delta workload=%s key=%s delta=%lld\n", workload, item.first.c_str(),
-               item.second - old->second);
+               delta);
     }
 }
 

@@ -74,12 +74,29 @@ mkdir -p /tmp/dbg
 mount -t debugfs debugfs /tmp/dbg
 ```
 
+逐 opcode、response reuse/zero 和 pool 详细统计默认关闭，避免正常热路径承担额外原子读改写开销。
+首次读取 `/tmp/dbg/fuse/stats` 会为本次启动后续操作开启这些详细统计。因此必须在目标 workload 前读取
+一次；`virtiofs_bench` 设置 `VIRTIOFS_STATS_PATH` 后会自动完成这次基线读取。首次读取前发生的挂载或
+请求不会计入详细字段，原有 aggregate 计数器不受影响。
+
 默认完整运行：
 
 ```sh
 VIRTIOFS_STATS_PATH=/tmp/dbg/fuse/stats /bin/virtiofs_bench
 mount | grep virtiofs || echo no_virtiofs_mount
 ```
+
+性能验收和指标归因必须分开运行。纯性能轮次不要设置 `VIRTIOFS_STATS_PATH`，此时 benchmark 不读取
+debugfs，也不会开启逐 opcode 等详细统计：
+
+```sh
+VIRTIOFS_STATS_PATH= /bin/virtiofs_bench --workload metadata --files 64
+VIRTIOFS_STATS_PATH= /bin/virtiofs_bench --workload sequential --file-size 4194304
+```
+
+每个版本预热后至少运行 5 轮，采用 baseline/optimized/baseline 的交替顺序并比较中位数及范围。另起
+设置 `VIRTIOFS_STATS_PATH=/tmp/dbg/fuse/stats` 的诊断轮次验证请求数量、复制和分配变化，不能把诊断
+轮次耗时当作无观测开销的端到端性能。
 
 小规模 smoke 运行：
 
@@ -149,6 +166,10 @@ virtiofs.bytes_submitted_total
 virtiofs.bytes_completed_total
 virtiofs.bridge_poll_sleep_ns_total
 virtiofs.response_buffer_waste_bytes
+virtiofs.response_buffer_alloc_count
+virtiofs.response_buffer_reuse_count
+virtiofs.response_buffer_zero_bytes
+virtiofs.response_pool_dropped_count
 virtiofs.virtqueue_full_total
 virtiofs.device_queue_depth_max
 virtiofs.hiprio_vring_size_configured
@@ -158,6 +179,22 @@ virtiofs.sg_limit_pages_configured
 virtiofs.inflight_peak
 virtiofs.queue_full_blocked_current
 ```
+
+`[virtiofs_opcode]` 段按 FUSE opcode 输出同口径细分指标，例如 lookup 为 opcode 1、read 为
+opcode 15、write 为 opcode 16：
+
+```text
+opcode_1_request_bridge_copy_bytes
+opcode_1_response_buffer_alloc_count
+opcode_1_response_buffer_reuse_count
+opcode_15_requests_total
+opcode_16_requests_total
+```
+
+比较优化前后时，先确认目标 opcode 的 `requests_total` 在 workload 中确实增加。request bridge copy
+下降和 response allocation/reuse 应分别判断；`response_buffer_zero_bytes` 表示新分配初始化或复用前
+清零产生的显式写入，不应把 allocator 次数下降误报成清零带宽也下降。pool 的容量边界由实现常量和
+单元测试验证；状态型 retained gauge 不做 opt-in 输出，以免首次观测前已有 buffer 导致欠计。
 
 其中 `*_configured` 是配置快照，benchmark 的 `stats_delta` 通常为 0；判断队列深度是否生效时应看
 `/tmp/dbg/fuse/stats` 中的绝对值。

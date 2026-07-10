@@ -127,13 +127,6 @@ impl OverlayFS {
             || Self::is_mount_ancestor(left, right)?
             || Self::is_mount_ancestor(right, left)?)
     }
-
-    fn layer_is_same_or_descendant_of(
-        layer: &Arc<dyn IndexNode>,
-        ancestor: &Arc<dyn IndexNode>,
-    ) -> Result<bool, SystemError> {
-        Ok(Self::same_mount_inode(layer, ancestor)? || Self::is_mount_ancestor(ancestor, layer)?)
-    }
 }
 
 impl MountableFileSystem for OverlayFS {
@@ -272,5 +265,14 @@ impl MountableFileSystem for OverlayFS {
             e
         })?;
         Ok(Some(Arc::new(mount_data)))
+    }
+}
+
+impl OverlayFS {
+    fn layer_is_same_or_descendant_of(
+        layer: &Arc<dyn IndexNode>,
+        ancestor: &Arc<dyn IndexNode>,
+    ) -> Result<bool, SystemError> {
+        Ok(Self::same_mount_inode(layer, ancestor)? || Self::is_mount_ancestor(ancestor, layer)?)
     }
 }

@@ -163,7 +163,19 @@ pub(super) fn mmap_file(
         .mmap_file(&backing_file, start, len, offset, vm_flags)
 }
 
-fn open_flags_need_copy_up(flags: &FileFlags) -> bool {
+fn open_flags_need_copy_up(file_type: FileType, flags: &FileFlags) -> bool {
+    if matches!(
+        file_type,
+        FileType::Pipe
+            | FileType::Socket
+            | FileType::CharDevice
+            | FileType::BlockDevice
+            | FileType::KvmDevice
+            | FileType::FramebufferDevice
+    ) {
+        return false;
+    }
+
     let access = flags.access_flags();
     access == FileFlags::O_WRONLY
         || access == FileFlags::O_RDWR
@@ -179,13 +191,12 @@ fn open_backing_file(
     inode: &OvlInode,
     flags: FileFlags,
 ) -> Result<OverlayFilePrivateData, SystemError> {
-    if open_flags_need_copy_up(&flags) {
-        inode.copy_up()?;
-    }
+    let needs_post_open_truncate = open_flags_need_copy_up(inode.file_type, &flags)
+        && inode.copy_up_for_open(&flags)?.needs_post_open_truncate();
 
     let (backing_inode, backing_is_upper) = inode.current_realdata_inode()?;
     let backing_file = Arc::new(File::new(backing_inode, backing_open_flags(flags))?);
-    if flags.contains(FileFlags::O_TRUNC) && backing_is_upper {
+    if inode.file_type == FileType::File && backing_is_upper && needs_post_open_truncate {
         vcore::vfs_truncate_file(
             backing_file.inode(),
             0,

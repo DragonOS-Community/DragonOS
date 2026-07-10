@@ -4,18 +4,83 @@ use super::inode::OvlInode;
 use crate::driver::base::device::device_number::DeviceNumber;
 use crate::filesystem::vfs::mount::MountFSInode;
 use crate::filesystem::vfs::{
-    self, FileSystem, FileSystemMakerData, FileType, FsInfo, IndexNode, MountableFileSystem,
-    SuperBlock,
+    self, FileSystem, FileSystemMakerData, FileType, FsInfo, IndexNode, InodeId,
+    MountableFileSystem, SuperBlock,
 };
 use crate::libs::{casting::DowncastArc, mutex::Mutex};
+use crate::process::Cred;
 use crate::process::ProcessManager;
+use alloc::collections::BTreeMap;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use system_error::SystemError;
 
 const MAX_MOUNT_ANCESTOR_DEPTH: usize = vfs::MAX_PATHLEN;
+const INODE_CACHE_PRUNE_INTERVAL: usize = 256;
 type LowerRoot = (String, Arc<dyn IndexNode>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct RealInodeIdentity {
+    filesystem: usize,
+    dev_id: usize,
+    inode_id: InodeId,
+}
+
+impl RealInodeIdentity {
+    fn from_inode(inode: &Arc<dyn IndexNode>) -> Result<Self, SystemError> {
+        let fs = inode.fs();
+        let metadata = inode.metadata()?;
+        Ok(Self {
+            filesystem: Arc::as_ptr(&fs) as *const () as usize,
+            dev_id: metadata.dev_id,
+            inode_id: metadata.inode_id,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum OvlInodeOrigin {
+    Lower {
+        lower: Vec<RealInodeIdentity>,
+        upper: Option<RealInodeIdentity>,
+    },
+    Upper(RealInodeIdentity),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct OvlInodeCacheKey {
+    redirect: String,
+    origin: OvlInodeOrigin,
+}
+
+#[derive(Debug, Default)]
+struct OvlInodeCache {
+    entries: BTreeMap<OvlInodeCacheKey, Weak<OvlInode>>,
+    insertions_since_prune: usize,
+}
+
+impl OvlInodeCache {
+    fn intern(
+        &mut self,
+        key: OvlInodeCacheKey,
+        create: impl FnOnce() -> Arc<OvlInode>,
+    ) -> Arc<OvlInode> {
+        if let Some(inode) = self.entries.get(&key).and_then(Weak::upgrade) {
+            return inode;
+        }
+
+        if self.insertions_since_prune >= INODE_CACHE_PRUNE_INTERVAL {
+            self.entries.retain(|_, inode| inode.strong_count() != 0);
+            self.insertions_since_prune = 0;
+        }
+
+        let inode = create();
+        self.entries.insert(key, Arc::downgrade(&inode));
+        self.insertions_since_prune += 1;
+        inode
+    }
+}
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -38,6 +103,8 @@ pub(super) struct OverlayFS {
     pub(super) root_inode: Arc<OvlInode>,
     pub(super) super_block: SuperBlock,
     pub(super) mutation_lock: Mutex<()>,
+    pub(super) backing_cred: Arc<Cred>,
+    inode_cache: Mutex<OvlInodeCache>,
 }
 
 impl FileSystem for OverlayFS {
@@ -68,6 +135,47 @@ impl FileSystem for OverlayFS {
 impl OverlayFS {
     pub(super) fn ovl_upper_mnt(&self) -> Arc<OvlInode> {
         self.layers[0].mnt.clone()
+    }
+
+    pub(super) fn intern_inode(
+        self: &Arc<Self>,
+        redirect: String,
+        file_type: FileType,
+        upper_inode: Option<Arc<dyn IndexNode>>,
+        lower_inodes: Vec<Arc<dyn IndexNode>>,
+    ) -> Result<Arc<OvlInode>, SystemError> {
+        let origin = if lower_inodes.is_empty() {
+            OvlInodeOrigin::Upper(RealInodeIdentity::from_inode(
+                upper_inode.as_ref().ok_or(SystemError::ENOENT)?,
+            )?)
+        } else {
+            OvlInodeOrigin::Lower {
+                lower: lower_inodes
+                    .iter()
+                    .map(RealInodeIdentity::from_inode)
+                    .collect::<Result<Vec<_>, _>>()?,
+                upper: upper_inode
+                    .as_ref()
+                    .map(RealInodeIdentity::from_inode)
+                    .transpose()?,
+            }
+        };
+        let key = OvlInodeCacheKey {
+            redirect: redirect.clone(),
+            origin,
+        };
+
+        let inode = self.inode_cache.lock().intern(key, || {
+            let inode = Arc::new(OvlInode::new(
+                redirect,
+                file_type,
+                upper_inode,
+                lower_inodes,
+            ));
+            inode.set_fs(Arc::downgrade(self));
+            inode
+        });
+        Ok(inode)
     }
 
     fn same_mount_inode(
@@ -236,6 +344,7 @@ impl MountableFileSystem for OverlayFS {
         ));
 
         let super_block = SuperBlock::new(vfs::Magic::OVERLAYFS_MAGIC, 4096, 255);
+        let backing_cred = ProcessManager::current_pcb().cred();
         let fs = Arc::new_cyclic(|weak_fs| {
             for layer in &layers {
                 layer.mnt.set_fs(weak_fs.clone());
@@ -251,6 +360,8 @@ impl MountableFileSystem for OverlayFS {
                 root_inode,
                 super_block: super_block.clone(),
                 mutation_lock: Mutex::new(()),
+                backing_cred,
+                inode_cache: Mutex::new(OvlInodeCache::default()),
             }
         });
         Ok(fs)

@@ -35,11 +35,11 @@ use crate::{
 };
 
 use super::{
-    conn::{FuseConn, FuseRequest},
+    conn::{FuseConn, FuseReplyCapacitySource, FuseReplyContract, FuseRequest},
     fs::{FuseFS, FuseMountData},
     protocol::{
-        fuse_pack_struct, fuse_read_struct, FuseInHeader, FuseOutHeader, FuseReadIn, FUSE_DESTROY,
-        FUSE_FORGET, FUSE_INTERRUPT, FUSE_READ, FUSE_READDIR, FUSE_READDIRPLUS,
+        fuse_pack_struct, fuse_read_struct, FuseOutHeader, FUSE_DESTROY, FUSE_FORGET,
+        FUSE_INTERRUPT,
     },
     stats, trace,
 };
@@ -99,13 +99,29 @@ impl ResponseBufferPool {
     }
 
     fn acquire(&mut self, opcode: u32, len: usize) -> Vec<u8> {
-        if let Some(index) = self.buffers.iter().position(|buf| buf.len() == len) {
+        let best_fit = self
+            .buffers
+            .iter()
+            .enumerate()
+            .filter(|(_, buf)| buf.capacity() >= len)
+            .min_by_key(|(_, buf)| buf.capacity())
+            .map(|(index, _)| index);
+        if let Some(index) = best_fit {
             let mut buf = self.buffers.swap_remove(index);
             self.retained_capacity_bytes = self
                 .retained_capacity_bytes
                 .checked_sub(buf.capacity())
                 .expect("response pool capacity accounting underflow");
-            buf.fill(0);
+            let old_len = buf.len();
+            if len > old_len {
+                // `resize` zero-initializes the newly exposed tail. Clear only the old prefix so
+                // every byte visible to the device is written exactly once on this reuse path.
+                buf.resize(len, 0);
+                buf[..old_len].fill(0);
+            } else {
+                buf.truncate(len);
+                buf.fill(0);
+            }
             stats::on_virtiofs_response_buffer_reuse(opcode, len);
             stats::on_virtiofs_response_buffer_zero(opcode, len);
             return buf;
@@ -577,6 +593,35 @@ impl VirtioFsBridgeContext {
         Ok(None)
     }
 
+    fn destroy_barrier_ready(&self, unique: u64) -> bool {
+        let request_pending_has_other = self.request_pending.iter().any(|queue| {
+            queue
+                .iter()
+                .any(|pending| pending.opcode != FUSE_DESTROY || pending.unique != unique)
+        });
+        Self::destroy_barrier_ready_state(
+            self.conn.has_pending_requests(),
+            !self.hiprio_pending.is_empty(),
+            !self.hiprio_inflight.is_empty(),
+            self.request_inflight.iter().any(|map| !map.is_empty()),
+            request_pending_has_other,
+        )
+    }
+
+    fn destroy_barrier_ready_state(
+        conn_has_pending: bool,
+        hiprio_has_pending: bool,
+        hiprio_has_inflight: bool,
+        request_has_inflight: bool,
+        request_pending_has_other: bool,
+    ) -> bool {
+        !(conn_has_pending
+            || hiprio_has_pending
+            || hiprio_has_inflight
+            || request_has_inflight
+            || request_pending_has_other)
+    }
+
     fn pop_pending_for_submit(
         &mut self,
         kind: QueueKind,
@@ -586,6 +631,18 @@ impl VirtioFsBridgeContext {
         }
         if !self.queue_can_retry(kind)? {
             return Ok(None);
+        }
+        if let QueueKind::Request(slot) = kind {
+            let pending = self
+                .request_pending
+                .get(slot)
+                .ok_or(SystemError::EINVAL)?
+                .front();
+            if pending.is_some_and(|pending| {
+                pending.opcode == FUSE_DESTROY && !self.destroy_barrier_ready(pending.unique)
+            }) {
+                return Ok(None);
+            }
         }
         self.pop_pending_front(kind)
     }
@@ -605,21 +662,6 @@ impl VirtioFsBridgeContext {
             QueueKind::Hiprio => (trace::VIRTIOFS_QUEUE_HIPRIO, 0),
             QueueKind::Request(slot) => (trace::VIRTIOFS_QUEUE_REQUEST, slot as u16),
         }
-    }
-
-    fn response_buffer_size(pending: &PendingReq) -> usize {
-        let default_size = VIRTIOFS_RSP_BUF_SIZE;
-        let read_like = matches!(pending.opcode, FUSE_READ | FUSE_READDIR | FUSE_READDIRPLUS);
-        if !read_like || pending.req.bytes().len() < core::mem::size_of::<FuseInHeader>() {
-            return default_size;
-        }
-
-        let payload = &pending.req.bytes()[core::mem::size_of::<FuseInHeader>()..];
-        let Ok(read_in) = fuse_read_struct::<FuseReadIn>(payload) else {
-            return default_size;
-        };
-        let wanted = core::mem::size_of::<FuseOutHeader>().saturating_add(read_in.size as usize);
-        core::cmp::max(core::mem::size_of::<FuseOutHeader>(), wanted).min(default_size)
     }
 
     fn take_inflight(&mut self, kind: QueueKind, token: u16) -> Result<InflightReq, SystemError> {
@@ -690,6 +732,22 @@ impl VirtioFsBridgeContext {
         Self::complete_request_with_negative_errno(&self.conn, unique, err.to_posix_errno());
     }
 
+    fn terminate_pending_with_error(&self, pending: &PendingReq, err: SystemError) {
+        if !pending.noreply {
+            self.complete_request_with_error(pending.unique, err);
+        }
+        if pending.opcode == FUSE_DESTROY {
+            self.conn.abort();
+        }
+    }
+
+    fn reply_matches_expected_unique(data: &[u8], expected_unique: u64) -> bool {
+        matches!(
+            fuse_read_struct::<FuseOutHeader>(data),
+            Ok(header) if header.unique == expected_unique
+        )
+    }
+
     fn choose_unblocked_request_slot(&mut self) -> Result<usize, SystemError> {
         Self::choose_unblocked_request_slot_in(
             &mut self.next_request_slot,
@@ -742,7 +800,7 @@ impl VirtioFsBridgeContext {
             };
             let opcode = req.opcode();
             let unique = req.unique();
-            let noreply = matches!(opcode, FUSE_FORGET | FUSE_DESTROY);
+            let noreply = matches!(req.reply_contract(), FuseReplyContract::NoReply);
             debug_assert!(!matches!(opcode, FUSE_FORGET | FUSE_INTERRUPT));
             self.push_pending_back(PendingReq {
                 req,
@@ -770,12 +828,13 @@ impl VirtioFsBridgeContext {
             };
             let opcode = req.opcode();
             let unique = req.unique();
+            let noreply = matches!(req.reply_contract(), FuseReplyContract::NoReply);
             debug_assert!(matches!(opcode, FUSE_FORGET | FUSE_INTERRUPT));
             self.push_pending_back(PendingReq {
                 req,
                 unique,
                 opcode,
-                noreply: opcode == FUSE_FORGET,
+                noreply,
                 queue: QueueKind::Hiprio,
             })?;
             pumped += 1;
@@ -796,6 +855,9 @@ impl VirtioFsBridgeContext {
     }
 
     fn submit_one_pending(&mut self, kind: QueueKind) -> Result<bool, SystemError> {
+        if !self.conn.is_connected() {
+            return Ok(false);
+        }
         let queue_idx = self.queue_index(kind)?;
         if self.transport.is_none() {
             return Err(SystemError::EIO);
@@ -831,11 +893,21 @@ impl VirtioFsBridgeContext {
         let trace_unique = pending.unique;
         let trace_opcode = pending.opcode;
         let req_len = pending.req.bytes().len();
-        let mut rsp = if pending.noreply {
-            None
-        } else {
-            let rsp_size = Self::response_buffer_size(&pending);
-            Some(self.response_pool.acquire(pending.opcode, rsp_size))
+        let (mut rsp, fallback) = match pending.req.reply_contract() {
+            FuseReplyContract::NoReply => (None, false),
+            FuseReplyContract::Reply { capacity } => {
+                let capacity = match capacity {
+                    Some(capacity) => capacity,
+                    None => {
+                        self.terminate_pending_with_error(&pending, SystemError::EIO);
+                        return Ok(true);
+                    }
+                };
+                (
+                    Some(self.response_pool.acquire(pending.opcode, capacity.bytes)),
+                    matches!(capacity.source, FuseReplyCapacitySource::ExplicitFallback),
+                )
+            }
         };
 
         let (token, should_notify) = match kind {
@@ -897,9 +969,7 @@ impl VirtioFsBridgeContext {
                     "virtiofs bridge: queue not ready opcode={} unique={} queue={:?} err={:?}",
                     pending.opcode, pending.unique, kind, se
                 );
-                if !pending.noreply {
-                    self.complete_request_with_error(pending.unique, se);
-                }
+                self.terminate_pending_with_error(&pending, se);
                 return Ok(true);
             }
             Err(e) => {
@@ -912,13 +982,14 @@ impl VirtioFsBridgeContext {
                     "virtiofs bridge: submit failed opcode={} unique={} queue={:?} err={:?}",
                     pending.opcode, pending.unique, kind, se
                 );
-                if !pending.noreply {
-                    self.complete_request_with_error(pending.unique, se);
-                }
+                self.terminate_pending_with_error(&pending, se);
                 return Ok(true);
             }
         };
 
+        if let Some(rsp_buf) = rsp.as_ref() {
+            stats::on_virtiofs_response_submitted(trace_opcode, rsp_buf.len(), fallback);
+        }
         let inflight = InflightReq { pending, rsp };
         let replaced = match kind {
             QueueKind::Hiprio => self.hiprio_inflight.insert(token, inflight),
@@ -968,10 +1039,16 @@ impl VirtioFsBridgeContext {
         while self.submit_one_pending(QueueKind::Hiprio)? {
             progressed = true;
         }
+        if !self.conn.is_connected() {
+            return Ok(progressed);
+        }
 
         for slot in 0..self.request_vqs.len() {
             while self.submit_one_pending(QueueKind::Request(slot))? {
                 progressed = true;
+            }
+            if !self.conn.is_connected() {
+                break;
             }
         }
         Ok(progressed)
@@ -1060,9 +1137,10 @@ impl VirtioFsBridgeContext {
             .rsp
             .take()
             .expect("reply-bearing inflight request must own a response buffer");
+        stats::on_virtiofs_response_completed(inflight.pending.opcode, rsp_buf.len(), used_len);
         if used_len > rsp_buf.len() {
             stats::on_virtiofs_completed(used_len, false);
-            self.complete_request_with_error(inflight.pending.unique, SystemError::EIO);
+            self.terminate_pending_with_error(&inflight.pending, SystemError::EIO);
             self.response_pool.release(rsp_buf, false);
             return Ok(true);
         }
@@ -1071,8 +1149,39 @@ impl VirtioFsBridgeContext {
         }
         stats::on_virtiofs_completed(used_len, false);
 
+        if inflight.pending.opcode == FUSE_DESTROY && used_len == 0 {
+            let reusable = match self
+                .conn
+                .complete_destroy_without_reply(inflight.pending.unique)
+            {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!(
+                        "virtiofs bridge: zero-length DESTROY completion failed unique={} err={:?}",
+                        inflight.pending.unique, e
+                    );
+                    self.terminate_pending_with_error(&inflight.pending, SystemError::EIO);
+                    false
+                }
+            };
+            self.response_pool.release(rsp_buf, reusable);
+            return Ok(true);
+        }
+
+        let expected_unique = inflight.pending.unique;
+        if !Self::reply_matches_expected_unique(&rsp_buf[..used_len], expected_unique) {
+            warn!(
+                "virtiofs bridge: reply unique mismatch or short header expected={} opcode={} used_len={}",
+                expected_unique, inflight.pending.opcode, used_len
+            );
+            self.terminate_pending_with_error(&inflight.pending, SystemError::EIO);
+            self.response_pool.release(rsp_buf, false);
+            return Ok(true);
+        }
+
         let reusable = match self.conn.write_reply(&rsp_buf[..used_len]) {
-            Ok(_) | Err(SystemError::ENOENT) => true,
+            Ok(_) => true,
+            Err(SystemError::ENOENT) if inflight.pending.opcode != FUSE_DESTROY => true,
             Err(e) => {
                 // Linux virtio-fs always ends a completed request from the used ring.
                 // Keep that behavior here: fail this unique instead of exiting bridge loop.
@@ -1086,7 +1195,7 @@ impl VirtioFsBridgeContext {
                     "virtiofs bridge: write_reply failed unique={} opcode={} err={:?}, complete with {:?}",
                     unique, inflight.pending.opcode, e, completion_err
                 );
-                self.complete_request_with_error(unique, completion_err);
+                self.terminate_pending_with_error(&inflight.pending, completion_err);
                 false
             }
         };
@@ -1125,7 +1234,7 @@ impl VirtioFsBridgeContext {
         conn: &FuseConn,
         events: u32,
     ) -> Option<stats::VirtioFsBridgeWaitExit> {
-        if !conn.is_connected() && !self.has_inflight() {
+        if !conn.is_connected() {
             return Some(stats::VirtioFsBridgeWaitExit::Disconnect);
         }
 
@@ -1147,7 +1256,7 @@ impl VirtioFsBridgeContext {
         }
 
         let disconnect_event = events & stats::VirtioFsBridgeWakeSource::Disconnect.bit() != 0;
-        if disconnect_event && !self.has_inflight() {
+        if disconnect_event {
             return Some(stats::VirtioFsBridgeWaitExit::Disconnect);
         }
 
@@ -1352,6 +1461,9 @@ impl VirtioFsBridgeContext {
 
     fn run_loop(&mut self) -> Result<(), SystemError> {
         loop {
+            if !self.conn.is_connected() {
+                break;
+            }
             let mut progressed = false;
 
             let pump_result = self.pump_available_requests();
@@ -1366,7 +1478,13 @@ impl VirtioFsBridgeContext {
                 }
             }
 
+            if !self.conn.is_connected() {
+                break;
+            }
             progressed |= self.submit_pending()?;
+            if !self.conn.is_connected() {
+                break;
+            }
 
             if let Some(transport) = self.transport.as_mut() {
                 if transport.ack_interrupt() {
@@ -1374,15 +1492,14 @@ impl VirtioFsBridgeContext {
                 }
             }
             let completed = self.drain_completions()?;
+            if !self.conn.is_connected() {
+                break;
+            }
             if completed != 0 {
                 progressed = true;
                 progressed |= self.submit_pending()?;
             }
             stats::on_virtiofs_loop_iteration(progressed);
-
-            if !self.conn.is_connected() && !self.has_inflight() {
-                break;
-            }
 
             if !self.conn.is_mounted()
                 && !self.conn.has_pending_requests()
@@ -1854,10 +1971,7 @@ impl MountableFileSystem for VirtioFsFs {
         let (rootmode, user_id, group_id, default_permissions, allow_other, dax_mode) =
             Self::parse_mount_options(raw_data)?;
         let instance = virtio_fs_find_instance(source).ok_or(SystemError::ENODEV)?;
-        let conn = FuseConn::new_for_virtiofs(core::cmp::min(
-            VIRTIOFS_MAX_REQUEST_SIZE,
-            VIRTIOFS_RSP_BUF_SIZE,
-        ));
+        let conn = FuseConn::new_for_virtiofs(VIRTIOFS_MAX_REQUEST_SIZE, VIRTIOFS_RSP_BUF_SIZE);
 
         Ok(Some(Arc::new(VirtioFsMountData {
             rootmode,
@@ -2017,6 +2131,41 @@ mod tests {
     }
 
     #[test]
+    fn destroy_barrier_waits_for_every_pre_destroy_queue_domain() {
+        assert!(VirtioFsBridgeContext::destroy_barrier_ready_state(
+            false, false, false, false, false
+        ));
+        for blocked_domain in 0..5 {
+            let mut state = [false; 5];
+            state[blocked_domain] = true;
+            assert!(!VirtioFsBridgeContext::destroy_barrier_ready_state(
+                state[0], state[1], state[2], state[3], state[4]
+            ));
+        }
+    }
+
+    #[test]
+    fn reply_header_must_match_inflight_unique() {
+        let header = super::FuseOutHeader {
+            len: core::mem::size_of::<super::FuseOutHeader>() as u32,
+            error: 0,
+            unique: 42,
+        };
+        assert!(VirtioFsBridgeContext::reply_matches_expected_unique(
+            super::fuse_pack_struct(&header),
+            42
+        ));
+        assert!(!VirtioFsBridgeContext::reply_matches_expected_unique(
+            super::fuse_pack_struct(&header),
+            43
+        ));
+        assert!(!VirtioFsBridgeContext::reply_matches_expected_unique(
+            &[],
+            42
+        ));
+    }
+
+    #[test]
     fn choose_queue_size_uses_supported_power_of_two() {
         assert_eq!(choose_queue_size(8).unwrap(), 8);
         assert_eq!(choose_queue_size(15).unwrap(), 8);
@@ -2039,6 +2188,36 @@ mod tests {
         assert!(reused.iter().all(|byte| *byte == 0));
         assert!(pool.buffers.is_empty());
         assert_eq!(pool.retained_capacity_bytes, 0);
+    }
+
+    #[test]
+    fn response_pool_best_fit_reuses_larger_capacity_without_exposing_tail() {
+        let mut pool = ResponseBufferPool::new();
+        let mut large = Vec::with_capacity(256);
+        large.resize(192, 0xaa);
+        let ptr = large.as_ptr();
+        pool.release(large, true);
+
+        let reused = pool.acquire(FUSE_LOOKUP, 64);
+        assert_eq!(reused.as_ptr(), ptr);
+        assert_eq!(reused.len(), 64);
+        assert!(reused.iter().all(|byte| *byte == 0));
+        assert_eq!(reused.capacity(), 256);
+        assert_eq!(pool.retained_capacity_bytes, 0);
+    }
+
+    #[test]
+    fn response_pool_zeroes_old_prefix_when_reused_length_grows() {
+        let mut pool = ResponseBufferPool::new();
+        let mut buf = Vec::with_capacity(256);
+        buf.resize(64, 0xaa);
+        let ptr = buf.as_ptr();
+        pool.release(buf, true);
+
+        let reused = pool.acquire(FUSE_LOOKUP, 128);
+        assert_eq!(reused.as_ptr(), ptr);
+        assert_eq!(reused.len(), 128);
+        assert!(reused.iter().all(|byte| *byte == 0));
     }
 
     #[test]

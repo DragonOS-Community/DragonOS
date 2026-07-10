@@ -262,15 +262,20 @@ impl TtyDriver {
     }
 
     #[inline]
-    fn lookup_tty(&self, index: usize) -> Option<Arc<TtyCore>> {
-        let ret = self
-            .driver_funcs()
-            .lookup(index, TtyDriverPrivateData::Unused);
-        if let Err(SystemError::ENOSYS) = ret {
-            let device_guard = self.ttys.lock();
-            return device_guard.get(&index).cloned();
+    fn lookup_tty(&self, index: usize) -> Result<Option<Arc<TtyCore>>, SystemError> {
+        // Match Linux tty_driver_lookup_tty(): a driver lookup error is distinct from "not
+        // found". Only an unimplemented lookup hook may fall back to the generic tty table.
+        let private_data = if self.tty_driver_type() == TtyDriverType::Pty {
+            TtyDriverPrivateData::Pty(self.tty_driver_sub_type() == TtyDriverSubType::PtyMaster)
+        } else {
+            TtyDriverPrivateData::Unused
+        };
+
+        match self.driver_funcs().lookup(index, private_data) {
+            Ok(tty) => Ok(Some(tty)),
+            Err(SystemError::ENOSYS) => Ok(self.ttys.lock().get(&index).cloned()),
+            Err(err) => Err(err),
         }
-        ret.ok()
     }
 
     pub fn standard_install(&self, tty_core: Arc<TtyCore>) -> Result<(), SystemError> {
@@ -371,7 +376,7 @@ impl TtyDriver {
         let mut tty: Option<Arc<TtyCore>> = None;
 
         if let Some(idx) = index {
-            if let Some(t) = self.lookup_tty(idx) {
+            if let Some(t) = self.lookup_tty(idx)? {
                 if t.core().port().is_none() {
                     warn!("{} port is None", t.core().name());
                 } else if t.core().port().unwrap().state() == TtyPortState::KOPENED {

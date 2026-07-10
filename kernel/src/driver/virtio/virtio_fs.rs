@@ -60,6 +60,24 @@ struct VirtioFsInstanceState {
     active_bridge: Option<VirtioFsActiveBridge>,
 }
 
+impl VirtioFsInstanceState {
+    fn release_active_session_without_transport(&mut self, session_id: u64) -> bool {
+        if !self.session_active || self.active_session_id != session_id {
+            return false;
+        }
+
+        self.active_bridge = None;
+        self.released_session_id = session_id;
+        self.active_session_id = 0;
+        self.session_active = false;
+        true
+    }
+
+    fn is_session_released(&self, session_id: u64) -> bool {
+        self.released_session_id == session_id
+    }
+}
+
 #[derive(Debug)]
 pub struct VirtioFsInstance {
     tag: String,
@@ -222,10 +240,36 @@ impl VirtioFsInstance {
         self.session_wait.wakeup(None);
     }
 
+    /// Publish logical session completion while keeping an unsafe transport quarantined.
+    ///
+    /// This is used only when device reset did not complete. The caller must retain the
+    /// transport, queues, and DMA buffers because the device may still access them.
+    pub fn release_session_without_transport(&self, session_id: u64) -> bool {
+        let conn = {
+            let mut state = self.state.lock_irqsave();
+            if !state.session_active || state.active_session_id != session_id {
+                return false;
+            }
+            let conn = state
+                .active_bridge
+                .as_ref()
+                .and_then(|bridge| bridge.conn.upgrade());
+            if !state.release_active_session_without_transport(session_id) {
+                return false;
+            }
+            conn
+        };
+        if let Some(conn) = conn {
+            conn.clear_bridge_wake();
+        }
+        self.session_wait.wakeup(None);
+        true
+    }
+
     pub fn wait_session_released(&self, session_id: u64) {
         self.session_wait.wait_until(|| {
             let state = self.state.lock_irqsave();
-            if state.released_session_id == session_id && state.transport.is_some() {
+            if state.is_session_released(session_id) {
                 Some(())
             } else {
                 None
@@ -402,4 +446,41 @@ pub fn virtio_fs(
         "virtio-fs: registered instance tag='{}' dev={:?} request_queues={}",
         tag, dev_id, nrqs
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn active_state(session_id: u64) -> VirtioFsInstanceState {
+        VirtioFsInstanceState {
+            transport: None,
+            session_active: true,
+            active_session_id: session_id,
+            released_session_id: 0,
+            next_session_id: session_id + 1,
+            active_bridge: None,
+        }
+    }
+
+    #[test]
+    fn reset_timeout_releases_session_without_transport() {
+        let mut state = active_state(7);
+
+        assert!(state.release_active_session_without_transport(7));
+        assert!(state.is_session_released(7));
+        assert!(!state.session_active);
+        assert_eq!(state.active_session_id, 0);
+        assert!(state.transport.is_none());
+    }
+
+    #[test]
+    fn stale_session_cannot_release_active_session() {
+        let mut state = active_state(9);
+
+        assert!(!state.release_active_session_without_transport(8));
+        assert!(state.session_active);
+        assert_eq!(state.active_session_id, 9);
+        assert!(!state.is_session_released(8));
+    }
 }

@@ -255,6 +255,7 @@ fn cleanup_created_queues(
 
 fn put_transport_after_start_failure(
     instance: &Arc<VirtioFsInstance>,
+    session_id: u64,
     mut transport: VirtIOTransport,
     hiprio_vq: VirtioFsQueue,
     request_vqs: Vec<VirtioFsQueue>,
@@ -275,11 +276,20 @@ fn put_transport_after_start_failure(
         core::mem::forget(transport);
         core::mem::forget(hiprio_vq);
         core::mem::forget(request_vqs);
+        if !instance.release_session_without_transport(session_id) {
+            warn!(
+                "virtiofs bridge: failed to release quarantined start session id={} tag='{}' dev={:?}",
+                session_id,
+                instance.tag(),
+                instance.dev_id()
+            );
+        }
     }
 }
 
 fn reset_transport_after_start_failure(
     instance: &Arc<VirtioFsInstance>,
+    session_id: u64,
     mut transport: VirtIOTransport,
 ) {
     transport.set_status(DeviceStatus::empty());
@@ -293,6 +303,14 @@ fn reset_transport_after_start_failure(
             instance.dev_id()
         );
         core::mem::forget(transport);
+        if !instance.release_session_without_transport(session_id) {
+            warn!(
+                "virtiofs bridge: failed to release quarantined start session id={} tag='{}' dev={:?}",
+                session_id,
+                instance.tag(),
+                instance.dev_id()
+            );
+        }
     }
 }
 
@@ -1064,11 +1082,7 @@ impl VirtioFsBridgeContext {
         trace::trace_virtiofs_bridge_wait_exit(reason.trace_id(), events);
     }
 
-    fn fail_all_unfinished(&mut self, err: SystemError) {
-        let conn = self.conn.clone();
-        let errno = err.to_posix_errno();
-        let mut need_reply = Vec::new();
-
+    fn drain_pending_reply_uniques(&mut self, need_reply: &mut Vec<u64>) {
         while let Some(req) = self.hiprio_pending.pop_front() {
             if !req.noreply {
                 need_reply.push(req.unique);
@@ -1082,36 +1096,59 @@ impl VirtioFsBridgeContext {
                 }
             }
         }
+    }
 
-        let hiprio_inflight_count = self.hiprio_inflight.len();
+    fn collect_inflight_reply_uniques(&self, need_reply: &mut Vec<u64>) {
         for (_, req) in self.hiprio_inflight.iter() {
             if !req.pending.noreply {
                 need_reply.push(req.pending.unique);
             }
         }
+
+        for inflight_map in &self.request_inflight {
+            for (_, req) in inflight_map.iter() {
+                if !req.pending.noreply {
+                    need_reply.push(req.pending.unique);
+                }
+            }
+        }
+    }
+
+    fn complete_unfinished(&self, err: SystemError, need_reply: Vec<u64>) {
+        let failed = need_reply.len();
+        let errno = err.to_posix_errno();
+        for unique in need_reply {
+            Self::complete_request_with_negative_errno(&self.conn, unique, errno);
+        }
+        stats::on_virtiofs_fail_unfinished(failed);
+    }
+
+    fn fail_unfinished_preserving_inflight_dma(&mut self, err: SystemError) {
+        let mut need_reply = Vec::new();
+        self.drain_pending_reply_uniques(&mut need_reply);
+        self.collect_inflight_reply_uniques(&mut need_reply);
+        self.complete_unfinished(err, need_reply);
+    }
+
+    fn fail_all_unfinished(&mut self, err: SystemError) {
+        let mut need_reply = Vec::new();
+        self.drain_pending_reply_uniques(&mut need_reply);
+        self.collect_inflight_reply_uniques(&mut need_reply);
+
+        let hiprio_inflight_count = self.hiprio_inflight.len();
         self.hiprio_inflight.clear();
         stats::on_virtiofs_inflight_remove(stats::VirtioFsQueueKind::Hiprio, hiprio_inflight_count);
 
         let mut request_inflight_count = 0usize;
         for inflight_map in &mut self.request_inflight {
             request_inflight_count += inflight_map.len();
-            for (_, req) in inflight_map.iter() {
-                if !req.pending.noreply {
-                    need_reply.push(req.pending.unique);
-                }
-            }
             inflight_map.clear();
         }
         stats::on_virtiofs_inflight_remove(
             stats::VirtioFsQueueKind::Request,
             request_inflight_count,
         );
-
-        let failed = need_reply.len();
-        for unique in need_reply {
-            Self::complete_request_with_negative_errno(&conn, unique, errno);
-        }
-        stats::on_virtiofs_fail_unfinished(failed);
+        self.complete_unfinished(err, need_reply);
     }
 
     fn clear_queue_full_blocked_stats(&mut self) {
@@ -1269,6 +1306,18 @@ impl VirtioFsBridgeContext {
         self.clear_queue_full_blocked_stats();
         self.instance.clear_bridge_wake(self.session_id);
         if !self.reset_device_and_unset_queues() {
+            self.fail_unfinished_preserving_inflight_dma(SystemError::ENOTCONN);
+            if !self
+                .instance
+                .release_session_without_transport(self.session_id)
+            {
+                warn!(
+                    "virtiofs bridge: failed to release quarantined session id={} tag='{}' dev={:?}",
+                    self.session_id,
+                    self.instance.tag(),
+                    self.instance.dev_id()
+                );
+            }
             return false;
         }
         self.fail_all_unfinished(SystemError::ENOTCONN);
@@ -1336,7 +1385,7 @@ fn start_bridge(instance: Arc<VirtioFsInstance>, conn: Arc<FuseConn>) -> Result<
             instance.dev_id(),
             status
         );
-        reset_transport_after_start_failure(&instance, transport);
+        reset_transport_after_start_failure(&instance, session_id, transport);
         return Err(SystemError::ENODEV);
     }
     transport.set_guest_page_size(PAGE_SIZE as u32);
@@ -1351,7 +1400,7 @@ fn start_bridge(instance: Arc<VirtioFsInstance>, conn: Arc<FuseConn>) -> Result<
                     instance.dev_id(),
                     e
                 );
-                reset_transport_after_start_failure(&instance, transport);
+                reset_transport_after_start_failure(&instance, session_id, transport);
                 return Err(e);
             }
         };
@@ -1368,6 +1417,7 @@ fn start_bridge(instance: Arc<VirtioFsInstance>, conn: Arc<FuseConn>) -> Result<
             None => {
                 put_transport_after_start_failure(
                     &instance,
+                    session_id,
                     transport,
                     hiprio_vq,
                     request_vqs,
@@ -1391,6 +1441,7 @@ fn start_bridge(instance: Arc<VirtioFsInstance>, conn: Arc<FuseConn>) -> Result<
                 );
                 put_transport_after_start_failure(
                     &instance,
+                    session_id,
                     transport,
                     hiprio_vq,
                     request_vqs,
@@ -1411,6 +1462,7 @@ fn start_bridge(instance: Arc<VirtioFsInstance>, conn: Arc<FuseConn>) -> Result<
     let Some(sg_limit_pages) = request_size_min.checked_sub(FUSE_HEADER_OVERHEAD) else {
         put_transport_after_start_failure(
             &instance,
+            session_id,
             transport,
             hiprio_vq,
             request_vqs,
@@ -1422,6 +1474,7 @@ fn start_bridge(instance: Arc<VirtioFsInstance>, conn: Arc<FuseConn>) -> Result<
     if sg_limit_pages == 0 {
         put_transport_after_start_failure(
             &instance,
+            session_id,
             transport,
             hiprio_vq,
             request_vqs,
@@ -1434,6 +1487,7 @@ fn start_bridge(instance: Arc<VirtioFsInstance>, conn: Arc<FuseConn>) -> Result<
     if let Err(e) = conn.set_max_pages_limit(max_pages_limit) {
         put_transport_after_start_failure(
             &instance,
+            session_id,
             transport,
             hiprio_vq,
             request_vqs,

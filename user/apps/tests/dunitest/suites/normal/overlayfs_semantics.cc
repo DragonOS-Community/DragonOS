@@ -88,6 +88,15 @@ std::string read_text(const std::string& path) {
     return std::string(buf, static_cast<size_t>(n));
 }
 
+std::string read_symlink_target(const std::string& path) {
+    char buf[512] = {};
+    ssize_t n = readlink(path.c_str(), buf, sizeof(buf) - 1);
+    if (n < 0) {
+        return {};
+    }
+    return std::string(buf, static_cast<size_t>(n));
+}
+
 int overlay_temp_entry_count(const std::string& dir_path) {
     DIR* dir = opendir(dir_path.c_str());
     if (dir == nullptr) {
@@ -1151,6 +1160,177 @@ TEST(OverlayFsSemantics, CopyUpLargeLowerFileConcurrentReadersNeverSeePartialUpp
     EXPECT_EQ(0, WEXITSTATUS(status));
     EXPECT_TRUE(validate_pattern_file(upper_file, kFileSize));
     EXPECT_TRUE(validate_pattern_file(merged_file, kFileSize));
+    EXPECT_EQ(0, overlay_temp_entry_count(env.work));
+}
+
+TEST(OverlayFsSemantics, CopyUpLowerSymlinkPreservesTarget) {
+    ScopedOverlayEnv scoped("overlayfs_copy_up_symlink");
+    const auto& env = scoped.env;
+    std::string lower_target = join_path(env.lower, "target");
+    std::string lower_link = join_path(env.lower, "link");
+    std::string upper_renamed = join_path(env.upper, "renamed-link");
+    std::string merged_link = join_path(env.merged, "link");
+    std::string merged_renamed = join_path(env.merged, "renamed-link");
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_EQ(0, write_text(lower_target, "target-data"));
+    ASSERT_EQ(0, symlink("target", lower_link.c_str())) << strerror(errno);
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    ASSERT_EQ(0, rename(merged_link.c_str(), merged_renamed.c_str())) << strerror(errno);
+
+    struct stat st = {};
+    ASSERT_EQ(0, lstat(upper_renamed.c_str(), &st)) << strerror(errno);
+    EXPECT_TRUE(S_ISLNK(st.st_mode));
+    EXPECT_EQ("target", read_symlink_target(upper_renamed));
+    EXPECT_EQ("target", read_symlink_target(merged_renamed));
+    EXPECT_EQ("target-data", read_text(merged_renamed));
+    EXPECT_EQ(0, overlay_temp_entry_count(env.work));
+}
+
+TEST(OverlayFsSemantics, CopyUpLowerCharDevicePreservesRdev) {
+    ScopedOverlayEnv scoped("overlayfs_copy_up_chrdev");
+    const auto& env = scoped.env;
+    std::string lower_node = join_path(env.lower, "node");
+    std::string upper_renamed = join_path(env.upper, "renamed-node");
+    std::string merged_node = join_path(env.merged, "node");
+    std::string merged_renamed = join_path(env.merged, "renamed-node");
+    dev_t dev = makedev(1, 7);
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_EQ(0, mknod(lower_node.c_str(), S_IFCHR | 0600, dev)) << strerror(errno);
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    ASSERT_EQ(0, rename(merged_node.c_str(), merged_renamed.c_str())) << strerror(errno);
+
+    struct stat st = {};
+    ASSERT_EQ(0, lstat(upper_renamed.c_str(), &st)) << strerror(errno);
+    EXPECT_TRUE(S_ISCHR(st.st_mode));
+    EXPECT_EQ(dev, st.st_rdev);
+    EXPECT_FALSE(is_whiteout(upper_renamed));
+    ASSERT_EQ(0, lstat(merged_renamed.c_str(), &st)) << strerror(errno);
+    EXPECT_TRUE(S_ISCHR(st.st_mode));
+    EXPECT_EQ(dev, st.st_rdev);
+    EXPECT_EQ(0, overlay_temp_entry_count(env.work));
+}
+
+TEST(OverlayFsSemantics, CopyUpLowerBlockDevicePreservesRdev) {
+    ScopedOverlayEnv scoped("overlayfs_copy_up_blkdev");
+    const auto& env = scoped.env;
+    std::string lower_node = join_path(env.lower, "node");
+    std::string upper_renamed = join_path(env.upper, "renamed-node");
+    std::string merged_node = join_path(env.merged, "node");
+    std::string merged_renamed = join_path(env.merged, "renamed-node");
+    dev_t dev = makedev(7, 1);
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_EQ(0, mknod(lower_node.c_str(), S_IFBLK | 0600, dev)) << strerror(errno);
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    ASSERT_EQ(0, rename(merged_node.c_str(), merged_renamed.c_str())) << strerror(errno);
+
+    struct stat st = {};
+    ASSERT_EQ(0, lstat(upper_renamed.c_str(), &st)) << strerror(errno);
+    EXPECT_TRUE(S_ISBLK(st.st_mode));
+    EXPECT_EQ(dev, st.st_rdev);
+    ASSERT_EQ(0, lstat(merged_renamed.c_str(), &st)) << strerror(errno);
+    EXPECT_TRUE(S_ISBLK(st.st_mode));
+    EXPECT_EQ(dev, st.st_rdev);
+    EXPECT_EQ(0, overlay_temp_entry_count(env.work));
+}
+
+TEST(OverlayFsSemantics, CopyUpLowerFifoPreservesType) {
+    ScopedOverlayEnv scoped("overlayfs_copy_up_fifo");
+    const auto& env = scoped.env;
+    std::string lower_fifo = join_path(env.lower, "fifo");
+    std::string upper_renamed = join_path(env.upper, "renamed-fifo");
+    std::string merged_fifo = join_path(env.merged, "fifo");
+    std::string merged_renamed = join_path(env.merged, "renamed-fifo");
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_EQ(0, mkfifo(lower_fifo.c_str(), 0600)) << strerror(errno);
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    ASSERT_EQ(0, rename(merged_fifo.c_str(), merged_renamed.c_str())) << strerror(errno);
+
+    struct stat st = {};
+    ASSERT_EQ(0, lstat(upper_renamed.c_str(), &st)) << strerror(errno);
+    EXPECT_TRUE(S_ISFIFO(st.st_mode));
+    ASSERT_EQ(0, lstat(merged_renamed.c_str(), &st)) << strerror(errno);
+    EXPECT_TRUE(S_ISFIFO(st.st_mode));
+    EXPECT_EQ(0, overlay_temp_entry_count(env.work));
+}
+
+TEST(OverlayFsSemantics, CopyUpLowerSocketPreservesType) {
+    ScopedOverlayEnv scoped("overlayfs_copy_up_socket");
+    const auto& env = scoped.env;
+    std::string lower_socket = join_path(env.lower, "sock");
+    std::string upper_renamed = join_path(env.upper, "renamed-sock");
+    std::string merged_socket = join_path(env.merged, "sock");
+    std::string merged_renamed = join_path(env.merged, "renamed-sock");
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_EQ(0, mknod(lower_socket.c_str(), S_IFSOCK | 0600, 0)) << strerror(errno);
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    ASSERT_EQ(0, rename(merged_socket.c_str(), merged_renamed.c_str())) << strerror(errno);
+
+    struct stat st = {};
+    ASSERT_EQ(0, lstat(upper_renamed.c_str(), &st)) << strerror(errno);
+    EXPECT_TRUE(S_ISSOCK(st.st_mode));
+    ASSERT_EQ(0, lstat(merged_renamed.c_str(), &st)) << strerror(errno);
+    EXPECT_TRUE(S_ISSOCK(st.st_mode));
+    EXPECT_EQ(0, overlay_temp_entry_count(env.work));
+}
+
+TEST(OverlayFsSemantics, OpenLowerFifoForWriteDoesNotCopyUp) {
+    ScopedOverlayEnv scoped("overlayfs_open_fifo_no_copy_up");
+    const auto& env = scoped.env;
+    std::string lower_fifo = join_path(env.lower, "fifo");
+    std::string upper_fifo = join_path(env.upper, "fifo");
+    std::string merged_fifo = join_path(env.merged, "fifo");
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_EQ(0, mkfifo(lower_fifo.c_str(), 0600)) << strerror(errno);
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    int fd = open(merged_fifo.c_str(), O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+    ASSERT_EQ(-1, fd);
+    EXPECT_EQ(ENXIO, errno);
+
+    struct stat st = {};
+    EXPECT_EQ(-1, lstat(upper_fifo.c_str(), &st));
+    EXPECT_EQ(ENOENT, errno);
     EXPECT_EQ(0, overlay_temp_entry_count(env.work));
 }
 

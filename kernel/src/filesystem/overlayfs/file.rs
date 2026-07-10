@@ -164,15 +164,7 @@ pub(super) fn mmap_file(
 }
 
 fn open_flags_need_copy_up(file_type: FileType, flags: &FileFlags) -> bool {
-    if matches!(
-        file_type,
-        FileType::Pipe
-            | FileType::Socket
-            | FileType::CharDevice
-            | FileType::BlockDevice
-            | FileType::KvmDevice
-            | FileType::FramebufferDevice
-    ) {
+    if file_type != FileType::File {
         return false;
     }
 

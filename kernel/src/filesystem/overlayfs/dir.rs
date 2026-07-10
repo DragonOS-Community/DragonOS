@@ -21,56 +21,51 @@ pub(super) fn mkdir(
 }
 
 pub(super) fn rmdir(inode: &OvlInode, name: &str) -> Result<(), SystemError> {
-    let fs = inode.overlay_fs()?;
-    let _mutation_guard = fs.mutation_lock.lock();
-    if let Some(ref upper_inode) = *inode.upper_inode.lock() {
-        match upper_inode.rmdir(name) {
-            Ok(()) => return Ok(()),
-            Err(SystemError::ENOENT) => {}
-            Err(err) => return Err(err),
-        }
-    }
-
-    match inode.find(name) {
-        Ok(found) => {
-            if found.metadata()?.file_type != FileType::Dir {
-                return Err(SystemError::ENOTDIR);
-            }
-            if !is_dir_empty(&found)? {
-                return Err(SystemError::ENOTEMPTY);
-            }
-            return inode.create_whiteout_locked(name);
-        }
-        Err(SystemError::ENOENT) => {}
-        Err(err) => return Err(err),
-    }
-
-    Err(SystemError::ENOENT)
+    remove(inode, name, true)
 }
 
 pub(super) fn unlink(inode: &OvlInode, name: &str) -> Result<(), SystemError> {
+    remove(inode, name, false)
+}
+
+fn remove(inode: &OvlInode, name: &str, is_dir: bool) -> Result<(), SystemError> {
     let fs = inode.overlay_fs()?;
     let _mutation_guard = fs.mutation_lock.lock();
-    if let Some(ref upper_inode) = *inode.upper_inode.lock() {
-        match upper_inode.unlink(name) {
-            Ok(()) => return Ok(()),
+
+    let child = inode.lookup_overlay_child(name)?;
+    if is_dir && !child.is_dir() {
+        return Err(SystemError::ENOTDIR);
+    }
+    if !is_dir && child.is_dir() {
+        return Err(SystemError::EISDIR);
+    }
+
+    let lower_positive = inode.lower_positive(name);
+    if is_dir && (lower_positive || child.has_lower()) {
+        let child_inode: Arc<dyn IndexNode> = child.clone();
+        if !is_dir_empty(&child_inode)? {
+            return Err(SystemError::ENOTEMPTY);
+        }
+    }
+
+    let upper_dir = inode.upper_inode.lock().clone();
+    if let Some(upper_dir) = upper_dir {
+        match upper_dir.find(name) {
+            Ok(_) if lower_positive => {
+                return inode.replace_upper_with_whiteout_locked(name, is_dir);
+            }
+            Ok(_) if is_dir => return upper_dir.rmdir(name),
+            Ok(_) => return upper_dir.unlink(name),
             Err(SystemError::ENOENT) => {}
             Err(err) => return Err(err),
         }
     }
 
-    match inode.find(name) {
-        Ok(found) => {
-            if found.metadata()?.file_type == FileType::Dir {
-                return Err(SystemError::EISDIR);
-            }
-            return inode.create_whiteout_locked(name);
-        }
-        Err(SystemError::ENOENT) => {}
-        Err(err) => return Err(err),
+    if lower_positive {
+        inode.create_whiteout_locked(name)
+    } else {
+        Err(SystemError::ENOENT)
     }
-
-    Err(SystemError::ENOENT)
 }
 
 pub(super) fn link(

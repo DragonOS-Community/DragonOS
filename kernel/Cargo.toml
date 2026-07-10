@@ -82,7 +82,7 @@ smoltcp = { version = "=0.12.0", git = "https://github.com/DragonOS-Community/sm
 syscall_table_macros = { path = "crates/syscall_table_macros" }
 system_error = { path = "crates/system_error" }
 unified-init = { path = "crates/unified-init" }
-virtio-drivers = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/virtio-drivers", rev = "3ac8163046" }
+virtio-drivers = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/virtio-drivers", rev = "89f6a402d494cf615cadfd851c9f017f31acac81" }
 wait_queue_macros = { path = "crates/wait_queue_macros" }
 paste = "=1.0.14"
 slabmalloc = { path = "crates/rust-slabmalloc" }

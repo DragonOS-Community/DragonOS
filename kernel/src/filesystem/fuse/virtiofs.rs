@@ -6,14 +6,15 @@ use alloc::{
     vec,
     vec::Vec,
 };
+use core::hint::spin_loop;
 
 use linkme::distributed_slice;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use system_error::SystemError;
 use virtio_drivers::{
     queue::VirtQueue,
     transport::{DeviceStatus, Transport},
-    Error as VirtioError, PAGE_SIZE,
+    Error as VirtioError, Result as VirtioResult, PAGE_SIZE,
 };
 
 use crate::{
@@ -43,7 +44,11 @@ use super::{
     stats, trace,
 };
 
-const VIRTIOFS_REQ_QUEUE_SIZE: usize = 8;
+const VIRTIOFS_QUEUE_SIZE_MIN: usize = 8;
+const VIRTIOFS_QUEUE_SIZE_MAX: usize = 1024;
+const VIRTIOFS_RESET_WAIT_SPINS: usize = 100_000;
+const FUSE_HEADER_OVERHEAD: usize = 4;
+const FUSE_MAX_MAX_PAGES: usize = 256;
 const VIRTIOFS_REQ_BUF_SIZE: usize = 256 * 1024;
 const VIRTIOFS_RSP_BUF_SIZE: usize = 256 * 1024;
 const VIRTIOFS_POLL_NS: i64 = 1_000_000;
@@ -76,14 +81,239 @@ struct QueueBlockState {
     completion_seen: bool,
 }
 
+enum VirtioFsQueue {
+    Q8(Box<VirtQueue<HalImpl, 8>>),
+    Q16(Box<VirtQueue<HalImpl, 16>>),
+    Q32(Box<VirtQueue<HalImpl, 32>>),
+    Q64(Box<VirtQueue<HalImpl, 64>>),
+    Q128(Box<VirtQueue<HalImpl, 128>>),
+    Q256(Box<VirtQueue<HalImpl, 256>>),
+    Q512(Box<VirtQueue<HalImpl, 512>>),
+    Q1024(Box<VirtQueue<HalImpl, 1024>>),
+}
+
+impl VirtioFsQueue {
+    fn can_pop(&self) -> bool {
+        match self {
+            Self::Q8(q) => q.can_pop(),
+            Self::Q16(q) => q.can_pop(),
+            Self::Q32(q) => q.can_pop(),
+            Self::Q64(q) => q.can_pop(),
+            Self::Q128(q) => q.can_pop(),
+            Self::Q256(q) => q.can_pop(),
+            Self::Q512(q) => q.can_pop(),
+            Self::Q1024(q) => q.can_pop(),
+        }
+    }
+
+    fn peek_used(&self) -> Option<u16> {
+        match self {
+            Self::Q8(q) => q.peek_used(),
+            Self::Q16(q) => q.peek_used(),
+            Self::Q32(q) => q.peek_used(),
+            Self::Q64(q) => q.peek_used(),
+            Self::Q128(q) => q.peek_used(),
+            Self::Q256(q) => q.peek_used(),
+            Self::Q512(q) => q.peek_used(),
+            Self::Q1024(q) => q.peek_used(),
+        }
+    }
+
+    fn should_notify(&self) -> bool {
+        match self {
+            Self::Q8(q) => q.should_notify(),
+            Self::Q16(q) => q.should_notify(),
+            Self::Q32(q) => q.should_notify(),
+            Self::Q64(q) => q.should_notify(),
+            Self::Q128(q) => q.should_notify(),
+            Self::Q256(q) => q.should_notify(),
+            Self::Q512(q) => q.should_notify(),
+            Self::Q1024(q) => q.should_notify(),
+        }
+    }
+
+    unsafe fn add<'a, 'b>(
+        &mut self,
+        inputs: &'a [&'b [u8]],
+        outputs: &'a mut [&'b mut [u8]],
+    ) -> VirtioResult<u16> {
+        match self {
+            Self::Q8(q) => unsafe { q.add(inputs, outputs) },
+            Self::Q16(q) => unsafe { q.add(inputs, outputs) },
+            Self::Q32(q) => unsafe { q.add(inputs, outputs) },
+            Self::Q64(q) => unsafe { q.add(inputs, outputs) },
+            Self::Q128(q) => unsafe { q.add(inputs, outputs) },
+            Self::Q256(q) => unsafe { q.add(inputs, outputs) },
+            Self::Q512(q) => unsafe { q.add(inputs, outputs) },
+            Self::Q1024(q) => unsafe { q.add(inputs, outputs) },
+        }
+    }
+
+    unsafe fn pop_used<'a>(
+        &mut self,
+        token: u16,
+        inputs: &'a [&'a [u8]],
+        outputs: &'a mut [&'a mut [u8]],
+    ) -> VirtioResult<u32> {
+        match self {
+            Self::Q8(q) => unsafe { q.pop_used(token, inputs, outputs) },
+            Self::Q16(q) => unsafe { q.pop_used(token, inputs, outputs) },
+            Self::Q32(q) => unsafe { q.pop_used(token, inputs, outputs) },
+            Self::Q64(q) => unsafe { q.pop_used(token, inputs, outputs) },
+            Self::Q128(q) => unsafe { q.pop_used(token, inputs, outputs) },
+            Self::Q256(q) => unsafe { q.pop_used(token, inputs, outputs) },
+            Self::Q512(q) => unsafe { q.pop_used(token, inputs, outputs) },
+            Self::Q1024(q) => unsafe { q.pop_used(token, inputs, outputs) },
+        }
+    }
+
+    unsafe fn detach_unused<'a>(
+        &mut self,
+        token: u16,
+        inputs: &'a [&'a [u8]],
+        outputs: &'a mut [&'a mut [u8]],
+    ) -> VirtioResult<()> {
+        match self {
+            Self::Q8(q) => unsafe { q.detach_unused(token, inputs, outputs) },
+            Self::Q16(q) => unsafe { q.detach_unused(token, inputs, outputs) },
+            Self::Q32(q) => unsafe { q.detach_unused(token, inputs, outputs) },
+            Self::Q64(q) => unsafe { q.detach_unused(token, inputs, outputs) },
+            Self::Q128(q) => unsafe { q.detach_unused(token, inputs, outputs) },
+            Self::Q256(q) => unsafe { q.detach_unused(token, inputs, outputs) },
+            Self::Q512(q) => unsafe { q.detach_unused(token, inputs, outputs) },
+            Self::Q1024(q) => unsafe { q.detach_unused(token, inputs, outputs) },
+        }
+    }
+}
+
+fn choose_queue_size(device_max: u32) -> Result<usize, SystemError> {
+    let limit = core::cmp::min(device_max as usize, VIRTIOFS_QUEUE_SIZE_MAX);
+    if limit < VIRTIOFS_QUEUE_SIZE_MIN {
+        return Err(SystemError::EINVAL);
+    }
+
+    let mut size = VIRTIOFS_QUEUE_SIZE_MIN;
+    while size <= limit / 2 {
+        size *= 2;
+    }
+    Ok(size)
+}
+
+fn create_queue_with_size(
+    transport: &mut VirtIOTransport,
+    idx: u16,
+    size: usize,
+) -> Result<VirtioFsQueue, VirtioError> {
+    macro_rules! new_queue {
+        ($size:expr, $variant:ident) => {{
+            let mut queue = VirtQueue::<HalImpl, $size>::new_boxed(transport, idx, false, false)?;
+            queue.set_dev_notify(true);
+            Ok(VirtioFsQueue::$variant(queue))
+        }};
+    }
+
+    match size {
+        8 => new_queue!(8, Q8),
+        16 => new_queue!(16, Q16),
+        32 => new_queue!(32, Q32),
+        64 => new_queue!(64, Q64),
+        128 => new_queue!(128, Q128),
+        256 => new_queue!(256, Q256),
+        512 => new_queue!(512, Q512),
+        1024 => new_queue!(1024, Q1024),
+        _ => Err(VirtioError::InvalidParam),
+    }
+}
+
+fn create_queue(
+    transport: &mut VirtIOTransport,
+    idx: u16,
+) -> Result<(VirtioFsQueue, usize, usize), SystemError> {
+    let device_max = transport.max_queue_size(idx) as usize;
+    let size = choose_queue_size(device_max as u32)?;
+    let queue = create_queue_with_size(transport, idx, size)
+        .map_err(virtio_drivers_error_to_system_error)?;
+    Ok((queue, device_max, size))
+}
+
+fn cleanup_created_queues(
+    transport: &mut VirtIOTransport,
+    hiprio_idx: u16,
+    request_indices: &[u16],
+) -> bool {
+    transport.set_status(DeviceStatus::empty());
+    if !wait_transport_reset_complete(transport) {
+        return false;
+    }
+
+    transport.queue_unset(hiprio_idx);
+    for idx in request_indices {
+        transport.queue_unset(*idx);
+    }
+    true
+}
+
+fn put_transport_after_start_failure(
+    instance: &Arc<VirtioFsInstance>,
+    mut transport: VirtIOTransport,
+    hiprio_vq: VirtioFsQueue,
+    request_vqs: Vec<VirtioFsQueue>,
+    hiprio_idx: u16,
+    request_indices: &[u16],
+) {
+    if cleanup_created_queues(&mut transport, hiprio_idx, request_indices) {
+        drop(hiprio_vq);
+        drop(request_vqs);
+        transport.set_status(DeviceStatus::FAILED);
+        instance.put_transport_after_session(transport);
+    } else {
+        warn!(
+            "virtiofs bridge: device reset did not complete during start failure cleanup tag='{}' dev={:?}; keep transport unavailable",
+            instance.tag(),
+            instance.dev_id()
+        );
+        core::mem::forget(transport);
+        core::mem::forget(hiprio_vq);
+        core::mem::forget(request_vqs);
+    }
+}
+
+fn reset_transport_after_start_failure(
+    instance: &Arc<VirtioFsInstance>,
+    mut transport: VirtIOTransport,
+) {
+    transport.set_status(DeviceStatus::empty());
+    if wait_transport_reset_complete(&transport) {
+        transport.set_status(DeviceStatus::FAILED);
+        instance.put_transport_after_session(transport);
+    } else {
+        warn!(
+            "virtiofs bridge: device reset did not complete during start failure tag='{}' dev={:?}; keep transport unavailable",
+            instance.tag(),
+            instance.dev_id()
+        );
+        core::mem::forget(transport);
+    }
+}
+
+fn wait_transport_reset_complete(transport: &VirtIOTransport) -> bool {
+    for _ in 0..VIRTIOFS_RESET_WAIT_SPINS {
+        if transport.get_status().is_empty() {
+            return true;
+        }
+        spin_loop();
+    }
+    false
+}
+
 struct VirtioFsBridgeContext {
     instance: Arc<VirtioFsInstance>,
     conn: Arc<FuseConn>,
     session_id: u64,
     irq_wake_enabled: bool,
     transport: Option<VirtIOTransport>,
-    hiprio_vq: Option<VirtQueue<HalImpl, { VIRTIOFS_REQ_QUEUE_SIZE }>>,
-    request_vqs: Vec<VirtQueue<HalImpl, { VIRTIOFS_REQ_QUEUE_SIZE }>>,
+    hiprio_vq: Option<VirtioFsQueue>,
+    request_vqs: Vec<VirtioFsQueue>,
     hiprio_pending: VecDeque<PendingReq>,
     request_pending: Vec<VecDeque<PendingReq>>,
     hiprio_inflight: BTreeMap<u16, InflightReq>,
@@ -530,7 +760,7 @@ impl VirtioFsBridgeContext {
         let token = match token {
             Ok(token) => token,
             Err(VirtioError::QueueFull) => {
-                stats::on_virtiofs_queue_full();
+                stats::on_virtiofs_queue_full(kind.stats_kind());
                 self.mark_queue_full_blocked(kind)?;
                 let (queue_kind, queue_slot) = Self::trace_queue_fields(kind);
                 trace::trace_virtiofs_queue_retry(
@@ -570,19 +800,29 @@ impl VirtioFsBridgeContext {
             }
         };
 
-        if should_notify {
-            self.transport
-                .as_mut()
-                .ok_or(SystemError::EIO)?
-                .notify(queue_idx);
-        }
+        let (queue_kind, queue_slot) = Self::trace_queue_fields(kind);
+        let trace_unique = pending.unique;
+        let trace_opcode = pending.opcode;
+        let req_len = pending.req.len();
+        let inflight = InflightReq { pending, rsp };
+        let replaced = match kind {
+            QueueKind::Hiprio => self.hiprio_inflight.insert(token, inflight),
+            QueueKind::Request(slot) => self
+                .request_inflight
+                .get_mut(slot)
+                .ok_or(SystemError::EINVAL)?
+                .insert(token, inflight),
+        };
+        debug_assert!(replaced.is_none());
+        stats::on_virtiofs_inflight_add(kind.stats_kind());
+        stats::on_virtiofs_submitted(req_len);
 
-        stats::on_virtiofs_submitted(pending.req.len());
         let retry_succeeded = {
             let state = self.block_state_mut(kind)?;
             if state.blocked {
                 state.blocked = false;
                 state.completion_seen = false;
+                stats::on_virtiofs_queue_full_unblocked();
                 true
             } else {
                 false
@@ -591,27 +831,22 @@ impl VirtioFsBridgeContext {
         if retry_succeeded {
             stats::on_virtiofs_queue_full_retry_success();
         }
-        let (queue_kind, queue_slot) = Self::trace_queue_fields(kind);
+
+        if should_notify {
+            self.transport
+                .as_mut()
+                .ok_or(SystemError::EIO)?
+                .notify(queue_idx);
+        }
+
         trace::trace_virtiofs_submit(
-            pending.unique,
-            pending.opcode,
+            trace_unique,
+            trace_opcode,
             queue_kind,
             queue_slot,
             token,
-            pending.req.len() as u64,
+            req_len as u64,
         );
-        let inflight = InflightReq { pending, rsp };
-        match kind {
-            QueueKind::Hiprio => {
-                self.hiprio_inflight.insert(token, inflight);
-            }
-            QueueKind::Request(slot) => {
-                self.request_inflight
-                    .get_mut(slot)
-                    .ok_or(SystemError::EINVAL)?
-                    .insert(token, inflight);
-            }
-        }
         Ok(true)
     }
 
@@ -691,6 +926,7 @@ impl VirtioFsBridgeContext {
                 return Err(e);
             }
         };
+        stats::on_virtiofs_inflight_remove(kind.stats_kind(), 1);
 
         let (queue_kind, queue_slot) = Self::trace_queue_fields(kind);
         trace::trace_virtiofs_complete(
@@ -847,14 +1083,18 @@ impl VirtioFsBridgeContext {
             }
         }
 
+        let hiprio_inflight_count = self.hiprio_inflight.len();
         for (_, req) in self.hiprio_inflight.iter() {
             if !req.pending.noreply {
                 need_reply.push(req.pending.unique);
             }
         }
         self.hiprio_inflight.clear();
+        stats::on_virtiofs_inflight_remove(stats::VirtioFsQueueKind::Hiprio, hiprio_inflight_count);
 
+        let mut request_inflight_count = 0usize;
         for inflight_map in &mut self.request_inflight {
+            request_inflight_count += inflight_map.len();
             for (_, req) in inflight_map.iter() {
                 if !req.pending.noreply {
                     need_reply.push(req.pending.unique);
@@ -862,6 +1102,10 @@ impl VirtioFsBridgeContext {
             }
             inflight_map.clear();
         }
+        stats::on_virtiofs_inflight_remove(
+            stats::VirtioFsQueueKind::Request,
+            request_inflight_count,
+        );
 
         let failed = need_reply.len();
         for unique in need_reply {
@@ -870,9 +1114,90 @@ impl VirtioFsBridgeContext {
         stats::on_virtiofs_fail_unfinished(failed);
     }
 
-    fn reset_device_and_unset_queues(&mut self) {
-        if let Some(transport) = self.transport.as_mut() {
+    fn clear_queue_full_blocked_stats(&mut self) {
+        if self.hiprio_blocked.blocked {
+            self.hiprio_blocked.blocked = false;
+            self.hiprio_blocked.completion_seen = false;
+            stats::on_virtiofs_queue_full_unblocked();
+        }
+
+        for state in &mut self.request_blocked {
+            if state.blocked {
+                state.blocked = false;
+                state.completion_seen = false;
+                stats::on_virtiofs_queue_full_unblocked();
+            }
+        }
+    }
+
+    fn detach_inflight_descriptors_for_queue(
+        queue: &mut VirtioFsQueue,
+        inflight: &mut BTreeMap<u16, InflightReq>,
+        kind: QueueKind,
+    ) {
+        for (token, req) in inflight.iter_mut() {
+            let inputs = [req.pending.req.as_slice()];
+            let result = if let Some(rsp_buf) = req.rsp.as_mut() {
+                let mut outputs = [rsp_buf.as_mut_slice()];
+                // SAFETY: The caller invokes this only after the device reset completed, so the
+                // device can no longer access the queue. The buffers come from the same InflightReq
+                // that was inserted immediately after `VirtQueue::add` returned this token.
+                unsafe { queue.detach_unused(*token, &inputs, &mut outputs) }
+            } else {
+                let mut outputs: [&mut [u8]; 0] = [];
+                // SAFETY: Same as above; this request had no device-writable response buffer.
+                unsafe { queue.detach_unused(*token, &inputs, &mut outputs) }
+            };
+
+            if let Err(e) = result {
+                warn!(
+                    "virtiofs bridge: failed to detach inflight descriptor token={} queue={:?} unique={} err={:?}",
+                    token, kind, req.pending.unique, e
+                );
+            }
+        }
+    }
+
+    fn detach_inflight_descriptors_after_reset(&mut self) {
+        if let Some(queue) = self.hiprio_vq.as_mut() {
+            Self::detach_inflight_descriptors_for_queue(
+                queue,
+                &mut self.hiprio_inflight,
+                QueueKind::Hiprio,
+            );
+        }
+
+        for slot in 0..self.request_vqs.len() {
+            if let Some(inflight) = self.request_inflight.get_mut(slot) {
+                Self::detach_inflight_descriptors_for_queue(
+                    &mut self.request_vqs[slot],
+                    inflight,
+                    QueueKind::Request(slot),
+                );
+            }
+        }
+    }
+
+    fn reset_device_and_unset_queues(&mut self) -> bool {
+        let reset_complete = if let Some(transport) = self.transport.as_mut() {
             transport.set_status(DeviceStatus::empty());
+            wait_transport_reset_complete(transport)
+        } else {
+            return true;
+        };
+
+        if !reset_complete {
+            warn!(
+                "virtiofs bridge: device reset did not complete before queue cleanup tag='{}' dev={:?}; keep queues and transport unavailable",
+                self.instance.tag(),
+                self.instance.dev_id()
+            );
+            return false;
+        } else {
+            self.detach_inflight_descriptors_after_reset();
+        }
+
+        if let Some(transport) = self.transport.as_mut() {
             if self.hiprio_vq.take().is_some() {
                 transport.queue_unset(self.instance.hiprio_queue_index());
             }
@@ -883,6 +1208,8 @@ impl VirtioFsBridgeContext {
             }
             self.request_vqs.clear();
         }
+
+        true
     }
 
     fn run_loop(&mut self) -> Result<(), SystemError> {
@@ -935,16 +1262,30 @@ impl VirtioFsBridgeContext {
         Ok(())
     }
 
-    fn finish(&mut self) {
+    fn finish(&mut self) -> bool {
         if self.irq_wake_enabled {
             self.instance.disable_irq_wake();
         }
+        self.clear_queue_full_blocked_stats();
         self.instance.clear_bridge_wake(self.session_id);
-        self.reset_device_and_unset_queues();
+        if !self.reset_device_and_unset_queues() {
+            return false;
+        }
         self.fail_all_unfinished(SystemError::ENOTCONN);
 
         if let Some(transport) = self.transport.take() {
             self.instance.put_transport_after_session(transport);
+        }
+
+        true
+    }
+}
+
+impl QueueKind {
+    fn stats_kind(self) -> stats::VirtioFsQueueKind {
+        match self {
+            QueueKind::Hiprio => stats::VirtioFsQueueKind::Hiprio,
+            QueueKind::Request(_) => stats::VirtioFsQueueKind::Request,
         }
     }
 }
@@ -955,7 +1296,10 @@ fn virtiofs_bridge_thread_entry(arg: usize) -> i32 {
     if let Err(e) = &result {
         warn!("virtiofs bridge thread exit with error: {:?}", e);
     }
-    ctx.finish();
+    let safe_to_drop = ctx.finish();
+    if !safe_to_drop {
+        Box::leak(ctx);
+    }
     result.map(|_| 0).unwrap_or_else(|e| e.to_posix_errno())
 }
 
@@ -992,50 +1336,133 @@ fn start_bridge(instance: Arc<VirtioFsInstance>, conn: Arc<FuseConn>) -> Result<
             instance.dev_id(),
             status
         );
-        transport.set_status(DeviceStatus::FAILED);
-        instance.put_transport_after_session(transport);
+        reset_transport_after_start_failure(&instance, transport);
         return Err(SystemError::ENODEV);
     }
     transport.set_guest_page_size(PAGE_SIZE as u32);
 
-    let mut hiprio_vq = match VirtQueue::<HalImpl, { VIRTIOFS_REQ_QUEUE_SIZE }>::new(
-        &mut transport,
-        instance.hiprio_queue_index(),
-        false,
-        false,
-    ) {
-        Ok(vq) => vq,
-        Err(e) => {
-            let se = virtio_drivers_error_to_system_error(e);
-            transport.set_status(DeviceStatus::FAILED);
-            instance.put_transport_after_session(transport);
-            return Err(se);
-        }
-    };
-    hiprio_vq.set_dev_notify(true);
-
-    let mut request_vqs = Vec::with_capacity(instance.request_queue_count());
-    for slot in 0..instance.request_queue_count() {
-        let idx = instance
-            .request_queue_index_by_slot(slot)
-            .ok_or(SystemError::EINVAL)?;
-        let mut vq = match VirtQueue::<HalImpl, { VIRTIOFS_REQ_QUEUE_SIZE }>::new(
-            &mut transport,
-            idx,
-            false,
-            false,
-        ) {
-            Ok(vq) => vq,
+    let (hiprio_vq, hiprio_device_max, hiprio_size) =
+        match create_queue(&mut transport, instance.hiprio_queue_index()) {
+            Ok(v) => v,
             Err(e) => {
-                let se = virtio_drivers_error_to_system_error(e);
-                transport.set_status(DeviceStatus::FAILED);
-                instance.put_transport_after_session(transport);
-                return Err(se);
+                warn!(
+                    "virtiofs bridge: failed to create hiprio queue tag='{}' dev={:?}: {:?}",
+                    instance.tag(),
+                    instance.dev_id(),
+                    e
+                );
+                reset_transport_after_start_failure(&instance, transport);
+                return Err(e);
             }
         };
-        vq.set_dev_notify(true);
+
+    let mut request_vqs = Vec::with_capacity(instance.request_queue_count());
+    let mut request_indices = Vec::with_capacity(instance.request_queue_count());
+    let mut request_size_min = usize::MAX;
+    let mut request_size_max = 0usize;
+    let mut device_queue_depth_max = hiprio_device_max;
+
+    for slot in 0..instance.request_queue_count() {
+        let idx = match instance.request_queue_index_by_slot(slot) {
+            Some(idx) => idx,
+            None => {
+                put_transport_after_start_failure(
+                    &instance,
+                    transport,
+                    hiprio_vq,
+                    request_vqs,
+                    instance.hiprio_queue_index(),
+                    &request_indices,
+                );
+                return Err(SystemError::EINVAL);
+            }
+        };
+
+        let (vq, device_max, queue_size) = match create_queue(&mut transport, idx) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    "virtiofs bridge: failed to create request queue slot={} idx={} tag='{}' dev={:?}: {:?}",
+                    slot,
+                    idx,
+                    instance.tag(),
+                    instance.dev_id(),
+                    e
+                );
+                put_transport_after_start_failure(
+                    &instance,
+                    transport,
+                    hiprio_vq,
+                    request_vqs,
+                    instance.hiprio_queue_index(),
+                    &request_indices,
+                );
+                return Err(e);
+            }
+        };
+
+        request_indices.push(idx);
+        request_size_min = core::cmp::min(request_size_min, queue_size);
+        request_size_max = core::cmp::max(request_size_max, queue_size);
+        device_queue_depth_max = core::cmp::max(device_queue_depth_max, device_max);
         request_vqs.push(vq);
     }
+
+    let Some(sg_limit_pages) = request_size_min.checked_sub(FUSE_HEADER_OVERHEAD) else {
+        put_transport_after_start_failure(
+            &instance,
+            transport,
+            hiprio_vq,
+            request_vqs,
+            instance.hiprio_queue_index(),
+            &request_indices,
+        );
+        return Err(SystemError::EINVAL);
+    };
+    if sg_limit_pages == 0 {
+        put_transport_after_start_failure(
+            &instance,
+            transport,
+            hiprio_vq,
+            request_vqs,
+            instance.hiprio_queue_index(),
+            &request_indices,
+        );
+        return Err(SystemError::EINVAL);
+    }
+    let max_pages_limit = core::cmp::min(sg_limit_pages, FUSE_MAX_MAX_PAGES);
+    if let Err(e) = conn.set_max_pages_limit(max_pages_limit) {
+        put_transport_after_start_failure(
+            &instance,
+            transport,
+            hiprio_vq,
+            request_vqs,
+            instance.hiprio_queue_index(),
+            &request_indices,
+        );
+        return Err(e);
+    }
+
+    stats::on_virtiofs_queue_configured(
+        device_queue_depth_max,
+        hiprio_size,
+        request_vqs.len(),
+        request_size_min,
+        request_size_max,
+        max_pages_limit,
+    );
+
+    info!(
+        "virtiofs bridge: queue config tag='{}' dev={:?} hiprio_vring={} request_queues={} request_vring_min={} request_vring_max={} sg_limit_pages={}",
+        instance.tag(),
+        instance.dev_id(),
+        hiprio_size,
+        request_vqs.len(),
+        request_size_min,
+        request_size_max,
+        max_pages_limit
+    );
+
     transport.finish_init();
 
     instance.install_bridge_wake(session_id, &conn);
@@ -1076,7 +1503,10 @@ fn start_bridge(instance: Arc<VirtioFsInstance>, conn: Arc<FuseConn>) -> Result<
     .is_none()
     {
         let mut ctx = unsafe { Box::from_raw(raw) };
-        ctx.finish();
+        let safe_to_drop = ctx.finish();
+        if !safe_to_drop {
+            Box::leak(ctx);
+        }
         return Err(SystemError::ENOMEM);
     }
 
@@ -1334,7 +1764,7 @@ mod tests {
 
     use system_error::SystemError;
 
-    use super::{QueueBlockState, VirtioFsBridgeContext};
+    use super::{choose_queue_size, QueueBlockState, VirtioFsBridgeContext};
 
     fn block_state(blocked: bool, completion_seen: bool) -> QueueBlockState {
         QueueBlockState {
@@ -1422,5 +1852,14 @@ mod tests {
             Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
         ));
         assert_eq!(next, 0);
+    }
+
+    #[test]
+    fn choose_queue_size_uses_supported_power_of_two() {
+        assert_eq!(choose_queue_size(8).unwrap(), 8);
+        assert_eq!(choose_queue_size(15).unwrap(), 8);
+        assert_eq!(choose_queue_size(128).unwrap(), 128);
+        assert_eq!(choose_queue_size(2048).unwrap(), 1024);
+        assert_eq!(choose_queue_size(7), Err(SystemError::EINVAL));
     }
 }

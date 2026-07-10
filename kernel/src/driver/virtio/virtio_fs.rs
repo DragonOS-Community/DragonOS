@@ -24,8 +24,7 @@ use super::{
 
 const VIRTIO_FS_TAG_LEN: usize = 36;
 const VIRTIO_FS_REQUEST_QUEUE_BASE: u16 = 1;
-const VIRTIO_FS_MAX_REQUEST_QUEUES: u32 =
-    (u16::MAX as u32) - (VIRTIO_FS_REQUEST_QUEUE_BASE as u32) + 1;
+const VIRTIO_FS_MAX_REQUEST_QUEUES: u32 = 64;
 
 #[repr(C, packed)]
 struct VirtioFsConfig {

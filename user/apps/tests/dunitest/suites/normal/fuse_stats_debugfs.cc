@@ -134,6 +134,19 @@ TEST(FuseStatsDebugFs, StatsFileExistsAndSupportsOffsetReads) {
     expect_field(whole, "read_buffer_too_small_total ");
 
     expect_field(whole, "[virtiofs]\n");
+    expect_field(whole, "device_queue_depth_max ");
+    expect_field(whole, "hiprio_vring_size_configured ");
+    expect_field(whole, "request_queue_count_configured ");
+    expect_field(whole, "request_vring_size_min_configured ");
+    expect_field(whole, "request_vring_size_max_configured ");
+    expect_field(whole, "sg_limit_pages_configured ");
+    expect_field(whole, "inflight_current ");
+    expect_field(whole, "inflight_peak ");
+    expect_field(whole, "hiprio_inflight_current ");
+    expect_field(whole, "hiprio_inflight_peak ");
+    expect_field(whole, "request_inflight_current ");
+    expect_field(whole, "request_inflight_peak ");
+    expect_field(whole, "queue_full_blocked_current ");
     expect_field(whole, "bridge_loop_iterations_total ");
     expect_field(whole, "bridge_idle_sleeps_total ");
     expect_field(whole, "virtqueue_full_total ");
@@ -159,6 +172,17 @@ TEST(FuseStatsDebugFs, StatsFileExistsAndSupportsOffsetReads) {
     expect_field(whole, "bridge_queue_full_retry_total ");
     expect_field(whole, "bridge_queue_full_retry_after_completion_total ");
     expect_field(whole, "bridge_queue_full_retry_success_total ");
+    expect_field(whole, "hiprio_queue_full_total ");
+    expect_field(whole, "request_queue_full_total ");
+
+    EXPECT_GE(parse_counter(whole, "device_queue_depth_max"), 0);
+    EXPECT_GE(parse_counter(whole, "hiprio_vring_size_configured"), 0);
+    EXPECT_GE(parse_counter(whole, "request_queue_count_configured"), 0);
+    EXPECT_GE(parse_counter(whole, "request_vring_size_min_configured"), 0);
+    EXPECT_GE(parse_counter(whole, "request_vring_size_max_configured"), 0);
+    EXPECT_GE(parse_counter(whole, "sg_limit_pages_configured"), 0);
+    EXPECT_GE(parse_counter(whole, "inflight_current"), 0);
+    EXPECT_GE(parse_counter(whole, "inflight_peak"), 0);
 
     expect_counter_increased(whole, after_fuse, "requests_queued_total");
     expect_counter_increased(whole, after_fuse, "requests_dequeued_total");

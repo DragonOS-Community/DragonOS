@@ -16,6 +16,8 @@
 # - DRAGONOS_VIRTIOFS_SOCKET: virtiofsd socket路径
 # - DRAGONOS_VIRTIOFS_TAG: virtiofs 挂载tag
 # - DRAGONOS_VIRTIOFS_ENV_FILE: virtiofs配置文件路径（默认 ${ROOT_PATH}/tools/virtiofs/env.sh）
+# - DRAGONOS_VIRTIOFS_QUEUE_SIZE: (optional) queue-size passed to vhost-user-fs-pci
+# - DRAGONOS_VIRTIOFS_NUM_REQUEST_QUEUES: (optional) num-request-queues passed to vhost-user-fs-pci
 #
 
 check_dependencies()
@@ -129,6 +131,8 @@ DRAGONOS_VIRTIOFS_ENABLE=${DRAGONOS_VIRTIOFS_ENABLE:=0}
 DRAGONOS_VIRTIOFS_SOCKET=${DRAGONOS_VIRTIOFS_SOCKET:=/tmp/dragonos-virtiofsd.sock}
 DRAGONOS_VIRTIOFS_TAG=${DRAGONOS_VIRTIOFS_TAG:=hostshare}
 DRAGONOS_VIRTIOFS_ENV_FILE=${DRAGONOS_VIRTIOFS_ENV_FILE:=}
+DRAGONOS_VIRTIOFS_QUEUE_SIZE=${DRAGONOS_VIRTIOFS_QUEUE_SIZE:=}
+DRAGONOS_VIRTIOFS_NUM_REQUEST_QUEUES=${DRAGONOS_VIRTIOFS_NUM_REQUEST_QUEUES:=}
 
 # 检查必要的环境变量
 if [ -z "${ROOT_PATH}" ]; then
@@ -556,14 +560,34 @@ if [ "${DRAGONOS_VIRTIOFS_ENABLE}" == "1" ]; then
         exit 1
     fi
 
-    echo "[INFO] 启用virtiofs: tag=${DRAGONOS_VIRTIOFS_TAG}, socket=${DRAGONOS_VIRTIOFS_SOCKET}"
+    virtiofs_device_opts="vhost-user-fs-pci,chardev=char_virtiofs,tag=${DRAGONOS_VIRTIOFS_TAG}"
+    if [ -n "${DRAGONOS_VIRTIOFS_QUEUE_SIZE}" ]; then
+        if ! [[ "${DRAGONOS_VIRTIOFS_QUEUE_SIZE}" =~ ^[0-9]+$ ]] || [ "${DRAGONOS_VIRTIOFS_QUEUE_SIZE}" -eq 0 ]; then
+            echo "[ERROR] DRAGONOS_VIRTIOFS_QUEUE_SIZE must be a positive integer"
+            exit 1
+        fi
+        virtiofs_device_opts="${virtiofs_device_opts},queue-size=${DRAGONOS_VIRTIOFS_QUEUE_SIZE}"
+    fi
+    if [ -n "${DRAGONOS_VIRTIOFS_NUM_REQUEST_QUEUES}" ]; then
+        if ! [[ "${DRAGONOS_VIRTIOFS_NUM_REQUEST_QUEUES}" =~ ^[0-9]+$ ]] || [ "${DRAGONOS_VIRTIOFS_NUM_REQUEST_QUEUES}" -eq 0 ]; then
+            echo "[ERROR] DRAGONOS_VIRTIOFS_NUM_REQUEST_QUEUES must be a positive integer"
+            exit 1
+        fi
+        if [ "${DRAGONOS_VIRTIOFS_NUM_REQUEST_QUEUES}" -gt 64 ]; then
+            echo "[ERROR] DRAGONOS_VIRTIOFS_NUM_REQUEST_QUEUES cannot exceed 64"
+            exit 1
+        fi
+        virtiofs_device_opts="${virtiofs_device_opts},num-request-queues=${DRAGONOS_VIRTIOFS_NUM_REQUEST_QUEUES}"
+    fi
+
+    echo "[INFO] Enabling virtiofs: tag=${DRAGONOS_VIRTIOFS_TAG}, socket=${DRAGONOS_VIRTIOFS_SOCKET}, queue_size=${DRAGONOS_VIRTIOFS_QUEUE_SIZE:-qemu-default}, request_queues=${DRAGONOS_VIRTIOFS_NUM_REQUEST_QUEUES:-qemu-default}"
 
     QEMU_OBJECT_ARGS+=(
       -object "memory-backend-memfd,id=mem,size=${QEMU_MEMORY},share=on"
     )
     QEMU_NUMA_ARGS+=(-numa "node,memdev=mem")
     QEMU_CHARDEV_ARGS+=(-chardev "socket,id=char_virtiofs,path=${DRAGONOS_VIRTIOFS_SOCKET}")
-    QEMU_DEVICE_ARGS+=(-device "vhost-user-fs-pci,chardev=char_virtiofs,tag=${DRAGONOS_VIRTIOFS_TAG}")
+    QEMU_DEVICE_ARGS+=(-device "${virtiofs_device_opts}")
 fi
 
 

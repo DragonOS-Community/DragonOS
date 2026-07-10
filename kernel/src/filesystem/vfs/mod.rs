@@ -213,6 +213,26 @@ bitflags! {
     }
 }
 
+bitflags! {
+    /// 指定 `set_metadata_masked()` 实际要更新的元数据字段。
+    ///
+    /// 该掩码对应 Linux `iattr::ia_valid` 中 DragonOS 当前可表达的
+    /// setattr 字段，避免将调用者读取的完整元数据快照误当成完整更新。
+    pub struct SetMetadataMask: u32 {
+        const MODE = 1 << 0;
+        const UID = 1 << 1;
+        const GID = 1 << 2;
+        const ATIME = 1 << 3;
+        const MTIME = 1 << 4;
+        /// 仅供 VFS/backing 自动维护；用户态 setattr 不能提供任意 ctime。
+        const CTIME = 1 << 5;
+        /// 时间设置来自“当前时间”请求，可由当前写权限授权。
+        const TIMES_BY_WRITE = 1 << 6;
+        /// 已授权的数据写/size change 引发的 metadata 副作用。
+        const WRITE_SIDE_EFFECT = 1 << 7;
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum SpecialNodeData {
@@ -581,6 +601,21 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn set_metadata(&self, _metadata: &Metadata) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回"不支持"
         return Err(SystemError::ENOSYS);
+    }
+
+    /// 仅更新 `mask` 指定的元数据字段。
+    ///
+    /// 旧文件系统默认回退到完整 metadata 更新，以保持现有实现兼容；需要在
+    /// copy-up 等并发边界精确保留未请求字段的堆叠文件系统应覆盖此方法。
+    fn set_metadata_masked(
+        &self,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), SystemError> {
+        if mask.is_empty() {
+            return Ok(());
+        }
+        self.set_metadata(metadata)
     }
 
     /// @brief 重新设置文件的大小

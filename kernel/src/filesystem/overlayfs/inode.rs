@@ -1,12 +1,15 @@
 use super::entry::OvlEntry;
 use super::fs::OverlayFS;
+use super::metadata::OvlOrigin;
 use super::{dir, file, lookup, readdir, rename};
 use crate::driver::base::device::device_number::DeviceNumber;
 use crate::filesystem::page_cache::PageCache;
 use crate::filesystem::vfs::file::{File, FileFlags, FilePrivateData};
 use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::utils::DName;
-use crate::filesystem::vfs::{self, FileSystem, FileType, IndexNode, Metadata};
+use crate::filesystem::vfs::{
+    self, FileSystem, FileType, IndexNode, InodeId, Metadata, SetMetadataMask, XattrFlags,
+};
 use crate::libs::casting::DowncastArc;
 use crate::libs::mutex::Mutex;
 use crate::mm::VmFlags;
@@ -23,9 +26,17 @@ pub struct OvlInode {
     pub(super) flags: Mutex<u64>,
     pub(super) upper_inode: Mutex<Option<Arc<dyn IndexNode>>>, // Read-write layer (upper)
     pub(super) lower_inodes: Vec<Arc<dyn IndexNode>>, // Read-only layer (lower, supports multi-layer)
+    pub(super) overlay_inode_id: Option<InodeId>,
+    origin: Mutex<OriginState>,
     #[allow(dead_code)]
     pub(super) oe: Arc<OvlEntry>,
     pub(super) fs: Mutex<Weak<OverlayFS>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OriginState {
+    Unchecked,
+    Checked(Option<OvlOrigin>),
 }
 
 impl OvlInode {
@@ -34,6 +45,7 @@ impl OvlInode {
         file_type: FileType,
         upper: Option<Arc<dyn IndexNode>>,
         lower_inodes: Vec<Arc<dyn IndexNode>>,
+        overlay_inode_id: Option<InodeId>,
     ) -> Self {
         Self {
             redirect,
@@ -41,6 +53,8 @@ impl OvlInode {
             flags: Mutex::new(0),
             upper_inode: Mutex::new(upper),
             lower_inodes,
+            overlay_inode_id,
+            origin: Mutex::new(OriginState::Unchecked),
             oe: Arc::new(OvlEntry::new()),
             fs: Mutex::new(Weak::default()),
         }
@@ -89,6 +103,37 @@ impl OvlInode {
 
     pub(super) fn is_dir(&self) -> bool {
         self.file_type == FileType::Dir
+    }
+
+    pub(super) fn load_origin_once(&self) -> Result<(), SystemError> {
+        if matches!(*self.origin.lock(), OriginState::Checked(_)) {
+            return Ok(());
+        }
+
+        // Never hold the origin state while taking upper_inode: copy-up owns
+        // upper_inode while publishing the checked origin state.
+        let upper = self.upper_inode.lock().clone();
+        let loaded = upper
+            .as_ref()
+            .map(|upper| super::metadata::load_origin(self, upper))
+            .transpose()?
+            .flatten();
+        let mut state = self.origin.lock();
+        if matches!(*state, OriginState::Unchecked) {
+            *state = OriginState::Checked(loaded);
+        }
+        Ok(())
+    }
+
+    pub(super) fn set_origin(&self, origin: Option<OvlOrigin>) {
+        *self.origin.lock() = OriginState::Checked(origin);
+    }
+
+    pub(super) fn origin(&self) -> Option<OvlOrigin> {
+        match *self.origin.lock() {
+            OriginState::Unchecked => None,
+            OriginState::Checked(origin) => origin,
+        }
     }
 }
 
@@ -192,16 +237,62 @@ impl IndexNode for OvlInode {
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
-        if let Some(ref upper_inode) = *self.upper_inode.lock() {
-            return upper_inode.metadata();
-        }
+        self.load_origin_once()?;
+        super::metadata::metadata(self)
+    }
 
-        for lower_inode in &self.lower_inodes {
-            if let Ok(metadata) = lower_inode.metadata() {
-                return Ok(metadata);
-            }
-        }
-        Ok(Metadata::default())
+    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
+        super::metadata::set_metadata_masked(
+            self,
+            metadata,
+            SetMetadataMask::MODE
+                | SetMetadataMask::UID
+                | SetMetadataMask::GID
+                | SetMetadataMask::ATIME
+                | SetMetadataMask::MTIME
+                | SetMetadataMask::CTIME,
+        )
+    }
+
+    fn set_metadata_masked(
+        &self,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), SystemError> {
+        super::metadata::set_metadata_masked(self, metadata, mask)
+    }
+
+    fn resize(&self, len: usize) -> Result<(), SystemError> {
+        super::metadata::resize_with_lock_owner(self, len, 0)
+    }
+
+    fn resize_with_lock_owner(&self, len: usize, lock_owner: u64) -> Result<(), SystemError> {
+        super::metadata::resize_with_lock_owner(self, len, lock_owner)
+    }
+
+    fn resize_file(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        super::metadata::resize_file(self, len, lock_owner, data)
+    }
+
+    fn getxattr(&self, name: &str, buf: &mut [u8]) -> Result<usize, SystemError> {
+        super::metadata::getxattr(self, name, buf)
+    }
+
+    fn setxattr(&self, name: &str, value: &[u8], flags: XattrFlags) -> Result<usize, SystemError> {
+        super::metadata::setxattr(self, name, value, flags)
+    }
+
+    fn listxattr(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
+        super::metadata::listxattr(self, buf)
+    }
+
+    fn removexattr(&self, name: &str) -> Result<usize, SystemError> {
+        super::metadata::removexattr(self, name)
     }
 
     fn as_any_ref(&self) -> &dyn core::any::Any {

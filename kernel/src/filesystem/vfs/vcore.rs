@@ -19,7 +19,7 @@ use crate::{
             file::{File, FileMode, FilePrivateData},
             mount::MountFlags,
             permission::PermissionMask,
-            AtomicInodeId, FileSystem, FileType, InodeFlags, InodeMode, MountFS,
+            AtomicInodeId, FileSystem, FileType, InodeFlags, InodeMode, MountFS, SetMetadataMask,
         },
     },
     init::cmdline::kenrel_cmdline_param_manager,
@@ -764,20 +764,24 @@ where
     let result = do_resize(&inode);
 
     if result.is_ok() {
-        clear_suid_sgid_after_truncate(inode.as_ref())?;
+        finish_truncate_metadata(inode.as_ref())?;
     }
 
     result
 }
 
-fn clear_suid_sgid_after_truncate(inode: &dyn IndexNode) -> Result<(), SystemError> {
+fn finish_truncate_metadata(inode: &dyn IndexNode) -> Result<(), SystemError> {
     let cred = ProcessManager::current_pcb().cred();
-    if cred.has_capability(CAPFlags::CAP_FSETID) {
-        return Ok(());
-    }
-
     let mut md = inode.metadata()?;
-    if md.file_type == FileType::File && md.mode.intersects(InodeMode::S_ISUID | InodeMode::S_ISGID)
+    let now = crate::time::PosixTimeSpec::now();
+    md.mtime = now;
+    md.ctime = now;
+    let mut mask =
+        SetMetadataMask::MTIME | SetMetadataMask::CTIME | SetMetadataMask::WRITE_SIDE_EFFECT;
+
+    if !cred.has_capability(CAPFlags::CAP_FSETID)
+        && md.file_type == FileType::File
+        && md.mode.intersects(InodeMode::S_ISUID | InodeMode::S_ISGID)
     {
         let original_mode = md.mode;
         md.mode.remove(InodeMode::S_ISUID);
@@ -787,11 +791,10 @@ fn clear_suid_sgid_after_truncate(inode: &dyn IndexNode) -> Result<(), SystemErr
         }
 
         if md.mode != original_mode {
-            inode.set_metadata(&md)?;
+            mask.insert(SetMetadataMask::MODE);
         }
     }
-
-    Ok(())
+    inode.set_metadata_masked(&md, mask)
 }
 
 /// 统一的 VFS 截断封装：对 inode 进行基本检查并调用 resize
@@ -865,7 +868,7 @@ pub fn resize_based_fallocate(
 
     let result = inode.resize_with_lock_owner(new_size, lock_owner);
     if result.is_ok() && md.size != new_size as i64 {
-        clear_suid_sgid_after_truncate(inode)?;
+        finish_truncate_metadata(inode)?;
     }
 
     result

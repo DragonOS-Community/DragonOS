@@ -2,22 +2,24 @@ use super::config::OverlayMountData;
 use super::entry::OvlLayer;
 use super::inode::OvlInode;
 use crate::driver::base::device::device_number::DeviceNumber;
-use crate::filesystem::vfs::mount::MountFSInode;
+use crate::filesystem::vfs::mount::{MountFS, MountFSInode};
 use crate::filesystem::vfs::{
-    self, FileSystem, FileSystemMakerData, FileType, FsInfo, IndexNode, InodeId,
-    MountableFileSystem, SuperBlock,
+    self, vcore::generate_inode_id, FileSystem, FileSystemMakerData, FileType, FsInfo, IndexNode,
+    InodeId, MountableFileSystem, SuperBlock,
 };
 use crate::libs::{casting::DowncastArc, mutex::Mutex};
 use crate::process::Cred;
 use crate::process::ProcessManager;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use system_error::SystemError;
 
 const MAX_MOUNT_ANCESTOR_DEPTH: usize = vfs::MAX_PATHLEN;
 const INODE_CACHE_PRUNE_INTERVAL: usize = 256;
+static OVL_MOUNT_EPOCH: AtomicU64 = AtomicU64::new(1);
 type LowerRoot = (String, Arc<dyn IndexNode>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -29,7 +31,7 @@ struct RealInodeIdentity {
 
 impl RealInodeIdentity {
     fn from_inode(inode: &Arc<dyn IndexNode>) -> Result<Self, SystemError> {
-        let fs = inode.fs();
+        let fs = OverlayFS::canonical_backing_fs(inode);
         let metadata = inode.metadata()?;
         Ok(Self {
             filesystem: Arc::as_ptr(&fs) as *const () as usize,
@@ -57,27 +59,43 @@ struct OvlInodeCacheKey {
 #[derive(Debug, Default)]
 struct OvlInodeCache {
     entries: BTreeMap<OvlInodeCacheKey, Weak<OvlInode>>,
+    /// Bounded strong cache for non-samefs directories whose fallback inode
+    /// number is only meaningful for the OvlInode cache lifetime.
+    recent_fallback_dirs: VecDeque<Arc<OvlInode>>,
     insertions_since_prune: usize,
 }
+
+const FALLBACK_DIR_CACHE_SIZE: usize = 256;
 
 impl OvlInodeCache {
     fn intern(
         &mut self,
         key: OvlInodeCacheKey,
+        retain_fallback_dir: bool,
         create: impl FnOnce() -> Arc<OvlInode>,
     ) -> Arc<OvlInode> {
-        if let Some(inode) = self.entries.get(&key).and_then(Weak::upgrade) {
-            return inode;
-        }
+        let inode = if let Some(inode) = self.entries.get(&key).and_then(Weak::upgrade) {
+            inode
+        } else {
+            if self.insertions_since_prune >= INODE_CACHE_PRUNE_INTERVAL {
+                self.entries.retain(|_, inode| inode.strong_count() != 0);
+                self.insertions_since_prune = 0;
+            }
 
-        if self.insertions_since_prune >= INODE_CACHE_PRUNE_INTERVAL {
-            self.entries.retain(|_, inode| inode.strong_count() != 0);
-            self.insertions_since_prune = 0;
-        }
+            let inode = create();
+            self.entries.insert(key, Arc::downgrade(&inode));
+            self.insertions_since_prune += 1;
+            inode
+        };
 
-        let inode = create();
-        self.entries.insert(key, Arc::downgrade(&inode));
-        self.insertions_since_prune += 1;
+        if retain_fallback_dir {
+            self.recent_fallback_dirs
+                .retain(|cached| !Arc::ptr_eq(cached, &inode));
+            self.recent_fallback_dirs.push_back(inode.clone());
+            if self.recent_fallback_dirs.len() > FALLBACK_DIR_CACHE_SIZE {
+                self.recent_fallback_dirs.pop_front();
+            }
+        }
         inode
     }
 }
@@ -104,6 +122,8 @@ pub(super) struct OverlayFS {
     pub(super) super_block: SuperBlock,
     pub(super) mutation_lock: Mutex<()>,
     pub(super) backing_cred: Arc<Cred>,
+    pub(super) samefs: bool,
+    pub(super) mount_epoch: u64,
     inode_cache: Mutex<OvlInodeCache>,
 }
 
@@ -165,17 +185,56 @@ impl OverlayFS {
             origin,
         };
 
-        let inode = self.inode_cache.lock().intern(key, || {
-            let inode = Arc::new(OvlInode::new(
-                redirect,
-                file_type,
-                upper_inode,
-                lower_inodes,
-            ));
-            inode.set_fs(Arc::downgrade(self));
-            inode
-        });
+        let retain_fallback_dir = !self.samefs && file_type == FileType::Dir;
+        let inode = self
+            .inode_cache
+            .lock()
+            .intern(key, retain_fallback_dir, || {
+                let fallback_id = retain_fallback_dir.then(generate_inode_id);
+                let inode = Arc::new(OvlInode::new(
+                    redirect,
+                    file_type,
+                    upper_inode,
+                    lower_inodes,
+                    fallback_id,
+                ));
+                inode.set_fs(Arc::downgrade(self));
+                inode
+            });
+        inode.load_origin_once()?;
         Ok(inode)
+    }
+
+    fn canonical_backing_fs(inode: &Arc<dyn IndexNode>) -> Arc<dyn FileSystem> {
+        let mut fs = inode.fs();
+        while let Some(mount_fs) = fs.clone().downcast_arc::<MountFS>() {
+            fs = mount_fs.inner_filesystem();
+        }
+        fs
+    }
+
+    pub(super) fn backing_fsid(&self, inode: &Arc<dyn IndexNode>) -> Result<u32, SystemError> {
+        let target_fs = Self::canonical_backing_fs(inode);
+        // Origin records describe a lower object. Prefer a lower layer when the
+        // upper and lower directories happen to share the same filesystem.
+        for layer in self.layers.iter().skip(1).chain(self.layers.iter().take(1)) {
+            let real = if layer.index == 0 {
+                layer.mnt.upper_inode.lock().clone()
+            } else {
+                layer.mnt.lower_inodes.first().cloned()
+            };
+            let Some(real) = real else {
+                continue;
+            };
+            if Arc::ptr_eq(&target_fs, &Self::canonical_backing_fs(&real)) {
+                return Ok(layer.fsid);
+            }
+        }
+        Err(SystemError::EXDEV)
+    }
+
+    pub(super) fn has_backing_fsid(&self, fsid: u32) -> bool {
+        self.layers.iter().any(|layer| layer.fsid == fsid)
     }
 
     fn same_mount_inode(
@@ -258,6 +317,7 @@ impl MountableFileSystem for OverlayFS {
                 upper_file_type,
                 Some(upper_inode.clone()),
                 Vec::new(),
+                None,
             )),
             index: 0,
             fsid: 0,
@@ -291,6 +351,7 @@ impl MountableFileSystem for OverlayFS {
                         lower_file_type,
                         None,
                         vec![lower_inode.clone()],
+                        None,
                     )),
                     index: (i + 1) as u32,
                     fsid: (i + 1) as u32,
@@ -333,6 +394,18 @@ impl MountableFileSystem for OverlayFS {
         layers.push(upper_layer);
         layers.extend(lower_layers);
 
+        let upper_backing_fs = Self::canonical_backing_fs(&upper_inode);
+        let samefs = lower_roots
+            .iter()
+            .all(|(_, lower)| Arc::ptr_eq(&upper_backing_fs, &Self::canonical_backing_fs(lower)));
+        let sequence = OVL_MOUNT_EPOCH.fetch_add(1, Ordering::Relaxed);
+        let random = u64::from_le_bytes(crate::libs::rand::rand_bytes::<8>());
+        let now = crate::time::PosixTimeSpec::now();
+        let mount_epoch = random
+            ^ sequence.rotate_left(17)
+            ^ (now.tv_sec as u64).rotate_left(31)
+            ^ now.tv_nsec as u64;
+
         let root_inode = Arc::new(OvlInode::new(
             String::new(),
             upper_file_type,
@@ -341,6 +414,7 @@ impl MountableFileSystem for OverlayFS {
                 .iter()
                 .map(|(_, lower_inode)| lower_inode.clone())
                 .collect(),
+            (!samefs).then(generate_inode_id),
         ));
 
         let super_block = SuperBlock::new(vfs::Magic::OVERLAYFS_MAGIC, 4096, 255);
@@ -361,9 +435,12 @@ impl MountableFileSystem for OverlayFS {
                 super_block: super_block.clone(),
                 mutation_lock: Mutex::new(()),
                 backing_cred,
+                samefs,
+                mount_epoch,
                 inode_cache: Mutex::new(OvlInodeCache::default()),
             }
         });
+        fs.root_inode.load_origin_once()?;
         Ok(fs)
     }
 

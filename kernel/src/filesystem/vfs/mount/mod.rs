@@ -2,7 +2,7 @@ use super::{
     file::{FileFlags, FileMode},
     utils::DName,
     FilePrivateData, FileSystem, FileType, IndexNode, InodeId, InodeMode, PollableInode,
-    SuperBlock, XattrFlags,
+    SetMetadataMask, SuperBlock, XattrFlags,
 };
 use crate::{
     driver::base::device::device_number::{DeviceNumber, Major},
@@ -246,6 +246,11 @@ int_like!(MountId, usize);
 static MOUNT_ID_ALLOCATOR: Mutex<IdAllocator> =
     Mutex::new(IdAllocator::new(0, usize::MAX).unwrap());
 
+/// Linux `unnamed_dev_ida` 的 DragonOS 等价物。minor 0 保留为“尚未分配”，
+/// 上界传入 `MINOR_MASK + 1` 是因为 `IdAllocator` 的 max_id 为开区间。
+static UNNAMED_DEV_ID_ALLOCATOR: Mutex<IdAllocator> =
+    Mutex::new(IdAllocator::new(1, DeviceNumber::MINOR_MASK as usize + 1).unwrap());
+
 lazy_static! {
     static ref MOUNTED_SUPERBLOCKS: SpinLock<Vec<Weak<MountFS>>> = SpinLock::new(Vec::new());
 }
@@ -291,6 +296,7 @@ pub struct SuperBlockState {
     write_count: AtomicUsize,
     wb_error: ErrSeq,
     umount_lock: RwSem<()>,
+    unnamed_dev_minor: Mutex<Option<u32>>,
 }
 
 struct MountStateInit {
@@ -305,6 +311,7 @@ impl SuperBlockState {
             write_count: AtomicUsize::new(0),
             wb_error: ErrSeq::new(),
             umount_lock: RwSem::new(()),
+            unnamed_dev_minor: Mutex::new(None),
         }
     }
 
@@ -350,6 +357,31 @@ impl SuperBlockState {
 
     pub fn umount_write(&self) -> crate::libs::rwsem::RwSemWriteGuard<'_, ()> {
         self.umount_lock.write()
+    }
+
+    /// 返回该 superblock 的匿名设备号，首次需要时才分配。
+    ///
+    /// 锁覆盖“检查并分配”全过程，确保并发 metadata 查询只消耗一个 minor。
+    pub fn unnamed_dev(&self) -> Result<DeviceNumber, SystemError> {
+        let mut minor = self.unnamed_dev_minor.lock();
+        if let Some(minor) = *minor {
+            return Ok(DeviceNumber::new(Major::UNNAMED_MAJOR, minor));
+        }
+
+        let allocated = UNNAMED_DEV_ID_ALLOCATOR
+            .lock()
+            .alloc()
+            .ok_or(SystemError::EMFILE)? as u32;
+        *minor = Some(allocated);
+        Ok(DeviceNumber::new(Major::UNNAMED_MAJOR, allocated))
+    }
+}
+
+impl Drop for SuperBlockState {
+    fn drop(&mut self) {
+        if let Some(minor) = self.unnamed_dev_minor.lock().take() {
+            UNNAMED_DEV_ID_ALLOCATOR.lock().free(minor as usize);
+        }
     }
 }
 
@@ -1459,12 +1491,10 @@ impl IndexNode for MountFSInode {
     fn metadata(&self) -> Result<super::Metadata, SystemError> {
         let mut md = self.inner_inode.metadata()?;
 
-        // Provide a stable and unique st_dev for each mount point (via metadata.dev_id).
-        // This handles the case where the underlying filesystem does not provide a dev_id.
+        // Filesystems without a real device share one lazily allocated st_dev across all
+        // views of the same superblock (including bind mounts and namespace copies).
         if md.dev_id == 0 {
-            let mnt_id: usize = self.mount_fs.mount_id().into();
-            let minor = (mnt_id as u32) & DeviceNumber::MINOR_MASK;
-            md.dev_id = DeviceNumber::new(Major::UNNAMED_MAJOR, minor).data() as usize;
+            md.dev_id = self.mount_fs.super_block_state.unnamed_dev()?.data() as usize;
         }
 
         Ok(md)
@@ -1474,6 +1504,16 @@ impl IndexNode for MountFSInode {
     fn set_metadata(&self, metadata: &super::Metadata) -> Result<(), SystemError> {
         self.ensure_mount_writable()?;
         return self.inner_inode.set_metadata(metadata);
+    }
+
+    #[inline]
+    fn set_metadata_masked(
+        &self,
+        metadata: &super::Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), SystemError> {
+        self.ensure_mount_writable()?;
+        self.inner_inode.set_metadata_masked(metadata, mask)
     }
 
     #[inline]

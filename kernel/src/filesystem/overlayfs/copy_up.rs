@@ -1,10 +1,11 @@
 use super::inode::OvlInode;
+use super::{cred::CredOverrideGuard, metadata};
 use crate::filesystem::vfs::{
     self,
     file::{File, FileFlags, FilePrivateData},
     syscall::RenameFlags,
     utils::should_remove_sgid,
-    FileType, IndexNode, Metadata, MAX_PATHLEN,
+    FileType, IndexNode, Metadata, SetMetadataMask, MAX_PATHLEN,
 };
 use crate::libs::mutex::Mutex;
 use crate::process::{
@@ -77,6 +78,9 @@ impl OvlInode {
         &self,
         copy_size: Option<usize>,
     ) -> Result<CopyUpOutcome, SystemError> {
+        let fs = self.overlay_fs()?;
+        let caller_cred = ProcessManager::current_pcb().cred();
+        let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
         let mut upper_inode = self.upper_inode.lock();
         if upper_inode.is_some() {
             return Ok(CopyUpOutcome::Existing);
@@ -85,7 +89,7 @@ impl OvlInode {
         let lower_inode = self.lower_inodes.first().ok_or(SystemError::ENOENT)?;
 
         let mut metadata = lower_inode.metadata()?;
-        Self::adjust_metadata_for_truncate_copy_up(&mut metadata, copy_size);
+        Self::adjust_metadata_for_truncate_copy_up(&mut metadata, copy_size, &caller_cred);
         if self.redirect.is_empty() {
             *upper_inode = Some(self.upper_root_inode()?);
             return Ok(CopyUpOutcome::Existing);
@@ -95,7 +99,9 @@ impl OvlInode {
         let parent_inode = self.ensure_upper_dir_path(parent_path)?;
         match parent_inode.find(name) {
             Ok(existing) => {
-                *upper_inode = Some(Self::validate_existing_upper(existing, &metadata)?);
+                let existing = Self::validate_existing_upper(existing, &metadata)?;
+                self.set_origin(metadata::load_origin(self, &existing)?);
+                *upper_inode = Some(existing);
                 return Ok(CopyUpOutcome::Existing);
             }
             Err(SystemError::ENOENT) => {}
@@ -122,6 +128,19 @@ impl OvlInode {
             return Err(err);
         }
 
+        if let Err(err) = metadata::copy_xattrs(lower_inode, &temp_inode) {
+            let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
+            return Err(err);
+        }
+
+        let origin = match metadata::prepare_origin(self, lower_inode, &temp_inode, &metadata) {
+            Ok(origin) => origin,
+            Err(err) => {
+                let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
+                return Err(err);
+            }
+        };
+
         if let Err(err) = Self::restore_copy_up_metadata(&temp_inode, &metadata) {
             let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
             return Err(err);
@@ -137,15 +156,26 @@ impl OvlInode {
             CopyUpOutcome::Published
         };
 
+        let parent_metadata = match parent_inode.metadata() {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
+                return Err(err);
+            }
+        };
         match workdir.move_to(&temp_name, &parent_inode, name, RenameFlags::NOREPLACE) {
             Ok(()) => {
+                Self::restore_parent_timestamps(&parent_inode, &parent_metadata);
+                self.set_origin(origin);
                 *upper_inode = Some(Self::validate_existing_upper(temp_inode, &metadata)?);
                 return Ok(publish_outcome);
             }
             Err(SystemError::EEXIST) => {
                 let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
                 let existing = parent_inode.find(name)?;
-                *upper_inode = Some(Self::validate_existing_upper(existing, &metadata)?);
+                let existing = Self::validate_existing_upper(existing, &metadata)?;
+                self.set_origin(metadata::load_origin(self, &existing)?);
+                *upper_inode = Some(existing);
                 return Ok(CopyUpOutcome::Existing);
             }
             Err(err) => {
@@ -176,10 +206,16 @@ impl OvlInode {
             current_path.push_str(component);
 
             match current.find(component) {
-                Ok(next) => current = next,
+                Ok(next) => {
+                    if Self::is_whiteout_inode_checked(&next)?
+                        || next.metadata()?.file_type != FileType::Dir
+                    {
+                        return Err(SystemError::ENOTDIR);
+                    }
+                    current = next;
+                }
                 Err(SystemError::ENOENT) => {
-                    let mode = self.lower_dir_mode(&current_path)?;
-                    current = current.mkdir(component, mode)?;
+                    current = self.copy_up_dir_component(&current, component, &current_path)?;
                 }
                 Err(err) => return Err(err),
             }
@@ -188,17 +224,64 @@ impl OvlInode {
         Ok(current)
     }
 
-    fn lower_dir_mode(&self, path: &str) -> Result<vfs::InodeMode, SystemError> {
+    fn lower_dir_inode(&self, path: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
         let fs = self.overlay_fs()?;
         for layer in fs.layers.iter().skip(1) {
             if let Some(lower_root) = layer.mnt.lower_inodes.first() {
                 if let Ok(inode) = lower_root.lookup(path) {
-                    return Ok(inode.metadata()?.mode);
+                    if inode.metadata()?.file_type == FileType::Dir {
+                        return Ok(inode);
+                    }
+                    return Err(SystemError::ENOTDIR);
                 }
             }
         }
+        Err(SystemError::ENOENT)
+    }
 
-        Ok(vfs::InodeMode::S_IRWXUGO)
+    fn copy_up_dir_component(
+        &self,
+        upper_parent: &Arc<dyn IndexNode>,
+        name: &str,
+        lower_path: &str,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let lower = self.lower_dir_inode(lower_path)?;
+        let lower_metadata = lower.metadata()?;
+        let parent_metadata = upper_parent.metadata()?;
+        let (workdir, temp, temp_name) = self.create_workdir_temp(|workdir, temp_name| {
+            workdir.mkdir(temp_name, lower_metadata.mode)
+        })?;
+
+        let prepared = (|| {
+            metadata::copy_xattrs(&lower, &temp)?;
+            metadata::prepare_origin(self, &lower, &temp, &lower_metadata)?;
+            Self::restore_copy_up_metadata(&temp, &lower_metadata)
+        })();
+        if let Err(err) = prepared {
+            let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
+            return Err(err);
+        }
+
+        match workdir.move_to(&temp_name, upper_parent, name, RenameFlags::NOREPLACE) {
+            Ok(()) => {
+                Self::restore_parent_timestamps(upper_parent, &parent_metadata);
+                Ok(temp)
+            }
+            Err(SystemError::EEXIST) => {
+                let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
+                let existing = upper_parent.find(name)?;
+                if Self::is_whiteout_inode_checked(&existing)?
+                    || existing.metadata()?.file_type != FileType::Dir
+                {
+                    return Err(SystemError::EIO);
+                }
+                Ok(existing)
+            }
+            Err(err) => {
+                let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
+                Err(err)
+            }
+        }
     }
 
     fn validate_existing_upper(
@@ -225,12 +308,16 @@ impl OvlInode {
         Ok(inode)
     }
 
-    fn adjust_metadata_for_truncate_copy_up(metadata: &mut Metadata, copy_size: Option<usize>) {
+    fn adjust_metadata_for_truncate_copy_up(
+        metadata: &mut Metadata,
+        copy_size: Option<usize>,
+        caller_cred: &Arc<Cred>,
+    ) {
         if copy_size != Some(0) || metadata.file_type != FileType::File {
             return;
         }
 
-        Self::clear_suid_sgid_for_current_cred(metadata, &ProcessManager::current_pcb().cred());
+        Self::clear_suid_sgid_for_current_cred(metadata, caller_cred);
     }
 
     fn clear_suid_sgid_for_current_cred(metadata: &mut Metadata, cred: &Arc<Cred>) {
@@ -284,6 +371,18 @@ impl OvlInode {
         upper_metadata.atime = lower_metadata.atime;
         upper_metadata.mtime = lower_metadata.mtime;
         upper_inode.set_metadata(&upper_metadata)
+    }
+
+    fn restore_parent_timestamps(parent: &Arc<dyn IndexNode>, saved: &Metadata) {
+        let result = (|| {
+            let mut current = parent.metadata()?;
+            current.atime = saved.atime;
+            current.mtime = saved.mtime;
+            parent.set_metadata_masked(&current, SetMetadataMask::ATIME | SetMetadataMask::MTIME)
+        })();
+        if let Err(err) = result {
+            log::warn!("overlayfs: failed to restore parent timestamps: {err:?}");
+        }
     }
 
     fn copy_up_file_type(file_type: FileType) -> FileType {

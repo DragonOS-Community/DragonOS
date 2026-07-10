@@ -8,15 +8,19 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use system_error::SystemError;
 
+use crate::driver::net::types::InterfaceFlags;
 use crate::driver::net::Iface;
 use crate::filesystem::epoll::EPollEventType;
+use crate::filesystem::vfs::iov::IoVecs;
 use crate::filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId};
 use crate::libs::mutex::Mutex;
 use crate::libs::rwsem::RwSem;
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::socket::common::{write_i32_getsockopt, write_u32_getsockopt, EPollItems};
-use crate::net::socket::endpoint::Endpoint;
+use crate::net::posix::SockAddr;
+use crate::net::socket::unix::utils::CmsgBuffer;
 use crate::net::socket::{Socket, PMSG, PSOCK, PSOL};
+use crate::net::socket::endpoint::Endpoint;
 use crate::process::cred::CAPFlags;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
@@ -68,6 +72,35 @@ pub mod packet_option {
 const TPACKET_V1: i32 = 0;
 const TPACKET_V2: i32 = 1;
 const TPACKET_V3: i32 = 2;
+
+/// packet_mreq 的 mr_type 常量 (对应 Linux `include/uapi/linux/if_packet.h`)
+pub mod packet_mreq_type {
+    /// PACKET_MR_PROMISC: 混杂模式 (接收所有单播包)
+    pub const PACKET_MR_PROMISC: u32 = 0;
+    /// PACKET_MR_MULTICAST: 特定多播组
+    pub const PACKET_MR_MULTICAST: u32 = 1;
+    /// PACKET_MR_ALLMULTI: 所有多播
+    pub const PACKET_MR_ALLMULTI: u32 = 2;
+    /// PACKET_MR_UNICAST: 特定单播
+    pub const PACKET_MR_UNICAST: u32 = 3;
+}
+
+/// struct packet_mreq (对应 Linux `struct packet_mreq`)
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct PacketMreq {
+    /// 接口索引
+    pub mr_ifindex: u32,
+    /// 操作类型 (PACKET_MR_*)
+    pub mr_type: u32,
+    /// 地址长度
+    pub mr_alen: u16,
+    /// 硬件地址 (最多 8 字节)
+    pub mr_address: [u8; 8],
+}
+
+/// SOL_PACKET 常量 (用于 cmsg level)
+const SOL_PACKET: i32 = 263;
 
 /// 数据包类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -140,6 +173,20 @@ pub struct SockAddrLl {
     pub sll_addr: [u8; 8],
 }
 
+/// struct tpacket_auxdata (对应 Linux `include/uapi/linux/if_packet.h`)
+/// 用于 PACKET_AUXDATA 辅助数据
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TpacketAuxdata {
+    pub tp_status: u32,
+    pub tp_len: u32,
+    pub tp_snaplen: u32,
+    pub tp_mac: u16,
+    pub tp_net: u16,
+    pub tp_vlan_tci: u16,
+    pub tp_vlan_tpid: u16,
+}
+
 /// Packet socket 选项存储 (对应 SOL_PACKET 级别 setsockopt/getsockopt)
 #[derive(Debug, Clone, Default)]
 pub struct PacketSocketOptions {
@@ -206,6 +253,10 @@ pub struct PacketSocket {
     epoll_items: EPollItems,
     /// fasync 项
     fasync_items: FAsyncItems,
+    /// ADD_MEMBERSHIP 设置 PROMISC 的接口索引列表 (DROP 时清除)
+    promisc_ifindices: Mutex<Vec<u32>>,
+    /// ADD_MEMBERSHIP 设置 ALLMULTI 的接口索引列表 (DROP 时清除)
+    allmulti_ifindices: Mutex<Vec<u32>>,
 }
 
 impl PacketSocket {
@@ -246,6 +297,8 @@ impl PacketSocket {
             netns,
             epoll_items: EPollItems::default(),
             fasync_items: FAsyncItems::default(),
+            promisc_ifindices: Mutex::new(Vec::new()),
+            allmulti_ifindices: Mutex::new(Vec::new()),
         }))
     }
 
@@ -450,6 +503,68 @@ impl PacketSocket {
         raw.copy_from_slice(&optval[..4]);
         Ok(u32::from_ne_bytes(raw))
     }
+
+    /// 从 optval 解析 PacketMreq
+    fn parse_mreq(optval: &[u8]) -> Result<PacketMreq, SystemError> {
+        if optval.len() < core::mem::size_of::<PacketMreq>() {
+            return Err(SystemError::EINVAL);
+        }
+        let mut raw = [0u8; core::mem::size_of::<PacketMreq>()];
+        raw.copy_from_slice(&optval[..core::mem::size_of::<PacketMreq>()]);
+        // SAFETY: raw is properly aligned and sized for PacketMreq (#[repr(C)])
+        Ok(unsafe { core::ptr::read_unaligned(raw.as_ptr() as *const PacketMreq) })
+    }
+
+    /// 按接口索引查找网卡
+    fn find_iface(&self, ifindex: u32) -> Result<Arc<dyn Iface>, SystemError> {
+        self.netns
+            .device_list()
+            .values()
+            .find(|iface| iface.nic_id() == ifindex as usize)
+            .cloned()
+            .ok_or(SystemError::ENODEV)
+    }
+
+    /// 处理 ADD_MEMBERSHIP / DROP_MEMBERSHIP
+    fn set_membership(
+        &self,
+        mreq: &PacketMreq,
+        is_add: bool,
+    ) -> Result<(), SystemError> {
+        match mreq.mr_type {
+            packet_mreq_type::PACKET_MR_PROMISC => {
+                let iface = self.find_iface(mreq.mr_ifindex)?;
+                let mut flags = iface.flags();
+                if is_add {
+                    flags |= InterfaceFlags::PROMISC;
+                    self.promisc_ifindices.lock().push(mreq.mr_ifindex);
+                } else {
+                    flags &= !InterfaceFlags::PROMISC;
+                    self.promisc_ifindices.lock().retain(|&i| i != mreq.mr_ifindex);
+                }
+                iface.common().set_flags(flags);
+                Ok(())
+            }
+            packet_mreq_type::PACKET_MR_ALLMULTI => {
+                let iface = self.find_iface(mreq.mr_ifindex)?;
+                let mut flags = iface.flags();
+                if is_add {
+                    flags |= InterfaceFlags::ALLMULTI;
+                    self.allmulti_ifindices.lock().push(mreq.mr_ifindex);
+                } else {
+                    flags &= !InterfaceFlags::ALLMULTI;
+                    self.allmulti_ifindices.lock().retain(|&i| i != mreq.mr_ifindex);
+                }
+                iface.common().set_flags(flags);
+                Ok(())
+            }
+            packet_mreq_type::PACKET_MR_MULTICAST | packet_mreq_type::PACKET_MR_UNICAST => {
+                // TODO: 多播地址过滤 — 当前接受但不处理硬件过滤
+                Ok(())
+            }
+            _ => Err(SystemError::EINVAL),
+        }
+    }
 }
 
 impl Socket for PacketSocket {
@@ -592,6 +707,23 @@ impl Socket for PacketSocket {
         if let Some(iface) = self.bound_iface.read().as_ref() {
             iface.common().unregister_packet_socket(&self.self_ref);
         }
+
+        // 清除通过 ADD_MEMBERSHIP 设置的 PROMISC/ALLMULTI flags
+        for &ifindex in self.promisc_ifindices.lock().iter() {
+            if let Ok(iface) = self.find_iface(ifindex) {
+                let mut flags = iface.flags();
+                flags &= !InterfaceFlags::PROMISC;
+                iface.common().set_flags(flags);
+            }
+        }
+        for &ifindex in self.allmulti_ifindices.lock().iter() {
+            if let Ok(iface) = self.find_iface(ifindex) {
+                let mut flags = iface.flags();
+                flags &= !InterfaceFlags::ALLMULTI;
+                iface.common().set_flags(flags);
+            }
+        }
+
         Ok(())
     }
 
@@ -625,18 +757,147 @@ impl Socket for PacketSocket {
 
     fn recv_msg(
         &self,
-        _msg: &mut crate::net::posix::MsgHdr,
-        _flags: PMSG,
+        msg: &mut crate::net::posix::MsgHdr,
+        flags: PMSG,
     ) -> Result<usize, SystemError> {
-        Err(SystemError::ENOSYS)
+        let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
+        let mut buf = iovs.new_buf(true)?;
+        let buf_cap = buf.len();
+
+        let (copy_len, metadata) = if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
+            self.try_recv(&mut buf)?
+        } else {
+            loop {
+                match self.try_recv(&mut buf) {
+                    Ok(r) => break r,
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                        wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        };
+
+        // Scatter 到用户 iovec
+        iovs.scatter(&buf[..copy_len])?;
+
+        // 写 sockaddr_ll (msg_name)
+        if !msg.msg_name.is_null() {
+            let mut sll_addr = [0u8; 8];
+            sll_addr[..6].copy_from_slice(&metadata.src_mac);
+            let sll = SockAddrLl {
+                sll_family: 17, // AF_PACKET
+                sll_protocol: metadata.protocol.to_be(),
+                sll_ifindex: metadata.ifindex as i32,
+                sll_hatype: 1, // ARPHRD_ETHER
+                sll_pkttype: metadata.pkt_type as u8,
+                sll_halen: 6,
+                sll_addr,
+            };
+            let sll_bytes = unsafe {
+                core::slice::from_raw_parts(
+                    &sll as *const SockAddrLl as *const u8,
+                    core::mem::size_of::<SockAddrLl>(),
+                )
+            };
+            let mut writer = crate::syscall::user_access::UserBufferWriter::new(
+                msg.msg_name as *mut u8,
+                core::mem::size_of::<SockAddrLl>(),
+                true,
+            )?;
+            writer
+                .buffer_protected(0)?
+                .write_to_user(0, sll_bytes)?;
+            msg.msg_namelen = core::mem::size_of::<SockAddrLl>() as u32;
+        } else {
+            msg.msg_namelen = 0;
+        }
+
+        // 设置 msg_flags (截断时 MSG_TRUNC)
+        let cmsg_len = msg.msg_controllen;
+        msg.msg_controllen = 0;
+        msg.msg_flags = 0;
+        let orig_len = copy_len; // AF_PACKET 不跟踪原始长度，用 copy_len
+        if orig_len > buf_cap {
+            msg.msg_flags |= PMSG::TRUNC.bits() as i32;
+        }
+
+        // 写 PACKET_AUXDATA cmsg (当启用且 msg_control 不为 null)
+        let auxdata_enabled = self.options.read().auxdata;
+        if auxdata_enabled && cmsg_len > 0 {
+            let aux = TpacketAuxdata {
+                tp_status: 0,
+                tp_len: copy_len as u32,
+                tp_snaplen: copy_len as u32,
+                tp_mac: 0,
+                tp_net: 0,
+                tp_vlan_tci: 0,
+                tp_vlan_tpid: 0,
+            };
+            let aux_bytes = unsafe {
+                core::slice::from_raw_parts(
+                    &aux as *const TpacketAuxdata as *const u8,
+                    core::mem::size_of::<TpacketAuxdata>(),
+                )
+            };
+            let mut write_off = 0usize;
+            let mut cmsg_buf = CmsgBuffer {
+                ptr: msg.msg_control,
+                len: cmsg_len,
+                write_off: &mut write_off,
+            };
+            cmsg_buf.put(
+                &mut msg.msg_flags,
+                SOL_PACKET,
+                packet_option::PACKET_AUXDATA as i32,
+                core::mem::size_of::<TpacketAuxdata>(),
+                aux_bytes,
+            )?;
+            msg.msg_controllen = write_off;
+        }
+
+        let ret_len = if flags.contains(PMSG::TRUNC) {
+            orig_len
+        } else {
+            copy_len
+        };
+        Ok(ret_len)
     }
 
     fn send_msg(
         &self,
-        _msg: &crate::net::posix::MsgHdr,
-        _flags: PMSG,
+        msg: &crate::net::posix::MsgHdr,
+        flags: PMSG,
     ) -> Result<usize, SystemError> {
-        Err(SystemError::ENOSYS)
+        let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, false)? };
+        let data = iovs.gather()?;
+
+        // 解析目标地址
+        let dest = if !msg.msg_name.is_null() && msg.msg_namelen > 0 {
+            let endpoint =
+                SockAddr::to_endpoint(msg.msg_name as *const SockAddr, msg.msg_namelen)?;
+            if let Endpoint::LinkLayer(ll) = endpoint {
+                Some(SockAddrLl {
+                    sll_family: 17,
+                    sll_protocol: ll.protocol.to_be(),
+                    sll_ifindex: ll.interface as i32,
+                    sll_hatype: ll.hatype,
+                    sll_pkttype: ll.pkttype,
+                    sll_halen: ll.halen,
+                    sll_addr: ll.addr,
+                })
+            } else {
+                return Err(SystemError::EINVAL);
+            }
+        } else {
+            None
+        };
+
+        if flags.contains(PMSG::DONTWAIT) || self.is_nonblock() {
+            self.try_send(&data, dest)
+        } else {
+            self.try_send(&data, dest)
+        }
     }
 
     fn epoll_items(&self) -> &EPollItems {
@@ -721,13 +982,17 @@ impl Socket for PacketSocket {
             return Err(SystemError::ENOPROTOOPT);
         }
 
-        let mut opts = self.options.write();
+        // ADD/DROP_MEMBERSHIP 不需要 options 写锁
         match name {
             packet_option::PACKET_ADD_MEMBERSHIP | packet_option::PACKET_DROP_MEMBERSHIP => {
-                // TODO: 实现多播成员管理 (独立 issue)
-                // 当前保持接受但不处理的行为
-                Ok(())
+                let mreq = Self::parse_mreq(val)?;
+                return self.set_membership(&mreq, name == packet_option::PACKET_ADD_MEMBERSHIP);
             }
+            _ => {}
+        }
+
+        let mut opts = self.options.write();
+        match name {
             packet_option::PACKET_COPY_THRESH => {
                 opts.copy_thresh = Self::parse_u32_opt(val)?;
                 Ok(())

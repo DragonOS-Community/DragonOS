@@ -16,11 +16,11 @@ use crate::filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, Inod
 use crate::libs::mutex::Mutex;
 use crate::libs::rwsem::RwSem;
 use crate::libs::wait_queue::WaitQueue;
-use crate::net::socket::common::{write_i32_getsockopt, write_u32_getsockopt, EPollItems};
 use crate::net::posix::SockAddr;
+use crate::net::socket::common::{write_i32_getsockopt, write_u32_getsockopt, EPollItems};
+use crate::net::socket::endpoint::Endpoint;
 use crate::net::socket::unix::utils::CmsgBuffer;
 use crate::net::socket::{Socket, PMSG, PSOCK, PSOL};
-use crate::net::socket::endpoint::Endpoint;
 use crate::process::cred::CAPFlags;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
@@ -451,7 +451,7 @@ impl PacketSocket {
                 // 载荷
                 frame.extend_from_slice(buf);
 
-self.send_raw_frame(&iface, &frame)?;
+                self.send_raw_frame(&iface, &frame)?;
                 // SOCK_DGRAM: 返回用户 payload 长度（非完整帧长度），符合 Linux packet_sendmsg 语义
                 Ok(buf.len())
             }
@@ -528,11 +528,7 @@ self.send_raw_frame(&iface, &frame)?;
     }
 
     /// 处理 ADD_MEMBERSHIP / DROP_MEMBERSHIP
-    fn set_membership(
-        &self,
-        mreq: &PacketMreq,
-        is_add: bool,
-    ) -> Result<(), SystemError> {
+    fn set_membership(&self, mreq: &PacketMreq, is_add: bool) -> Result<(), SystemError> {
         match mreq.mr_type {
             packet_mreq_type::PACKET_MR_PROMISC => {
                 let iface = self.find_iface(mreq.mr_ifindex)?;
@@ -542,7 +538,9 @@ self.send_raw_frame(&iface, &frame)?;
                     self.promisc_ifindices.lock().push(mreq.mr_ifindex);
                 } else {
                     flags &= !InterfaceFlags::PROMISC;
-                    self.promisc_ifindices.lock().retain(|&i| i != mreq.mr_ifindex);
+                    self.promisc_ifindices
+                        .lock()
+                        .retain(|&i| i != mreq.mr_ifindex);
                 }
                 iface.common().set_flags(flags);
                 Ok(())
@@ -555,7 +553,9 @@ self.send_raw_frame(&iface, &frame)?;
                     self.allmulti_ifindices.lock().push(mreq.mr_ifindex);
                 } else {
                     flags &= !InterfaceFlags::ALLMULTI;
-                    self.allmulti_ifindices.lock().retain(|&i| i != mreq.mr_ifindex);
+                    self.allmulti_ifindices
+                        .lock()
+                        .retain(|&i| i != mreq.mr_ifindex);
                 }
                 iface.common().set_flags(flags);
                 Ok(())
@@ -807,9 +807,7 @@ impl Socket for PacketSocket {
                 core::mem::size_of::<SockAddrLl>(),
                 true,
             )?;
-            writer
-                .buffer_protected(0)?
-                .write_to_user(0, sll_bytes)?;
+            writer.buffer_protected(0)?.write_to_user(0, sll_bytes)?;
             msg.msg_namelen = core::mem::size_of::<SockAddrLl>() as u32;
         } else {
             msg.msg_namelen = 0;
@@ -866,18 +864,13 @@ impl Socket for PacketSocket {
         Ok(ret_len)
     }
 
-    fn send_msg(
-        &self,
-        msg: &crate::net::posix::MsgHdr,
-        flags: PMSG,
-    ) -> Result<usize, SystemError> {
+    fn send_msg(&self, msg: &crate::net::posix::MsgHdr, flags: PMSG) -> Result<usize, SystemError> {
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, false)? };
         let data = iovs.gather()?;
 
         // 解析目标地址
         let dest = if !msg.msg_name.is_null() && msg.msg_namelen > 0 {
-            let endpoint =
-                SockAddr::to_endpoint(msg.msg_name as *const SockAddr, msg.msg_namelen)?;
+            let endpoint = SockAddr::to_endpoint(msg.msg_name as *const SockAddr, msg.msg_namelen)?;
             if let Endpoint::LinkLayer(ll) = endpoint {
                 Some(SockAddrLl {
                     sll_family: 17,
@@ -895,11 +888,7 @@ impl Socket for PacketSocket {
             None
         };
 
-        if flags.contains(PMSG::DONTWAIT) || self.is_nonblock() {
-            self.try_send(&data, dest)
-        } else {
-            self.try_send(&data, dest)
-        }
+        self.try_send(&data, dest)
     }
 
     fn epoll_items(&self) -> &EPollItems {
@@ -948,30 +937,16 @@ impl Socket for PacketSocket {
                 value[4..8].copy_from_slice(&drops.to_ne_bytes());
                 Ok(8)
             }
-            packet_option::PACKET_COPY_THRESH => {
-                Ok(write_u32_getsockopt(value, opts.copy_thresh))
-            }
-            packet_option::PACKET_AUXDATA => {
-                Ok(write_i32_getsockopt(value, opts.auxdata as i32))
-            }
-            packet_option::PACKET_ORIGDEV => {
-                Ok(write_i32_getsockopt(value, opts.origdev as i32))
-            }
-            packet_option::PACKET_VERSION => {
-                Ok(write_i32_getsockopt(value, opts.version))
-            }
-            packet_option::PACKET_RESERVE => {
-                Ok(write_u32_getsockopt(value, opts.reserve))
-            }
-            packet_option::PACKET_VNET_HDR => {
-                Ok(write_i32_getsockopt(value, opts.vnet_hdr as i32))
-            }
+            packet_option::PACKET_COPY_THRESH => Ok(write_u32_getsockopt(value, opts.copy_thresh)),
+            packet_option::PACKET_AUXDATA => Ok(write_i32_getsockopt(value, opts.auxdata as i32)),
+            packet_option::PACKET_ORIGDEV => Ok(write_i32_getsockopt(value, opts.origdev as i32)),
+            packet_option::PACKET_VERSION => Ok(write_i32_getsockopt(value, opts.version)),
+            packet_option::PACKET_RESERVE => Ok(write_u32_getsockopt(value, opts.reserve)),
+            packet_option::PACKET_VNET_HDR => Ok(write_i32_getsockopt(value, opts.vnet_hdr as i32)),
             packet_option::PACKET_TX_TIMESTAMP => {
                 Ok(write_i32_getsockopt(value, opts.tx_timestamp))
             }
-            packet_option::PACKET_TIMESTAMP => {
-                Ok(write_i32_getsockopt(value, opts.timestamp))
-            }
+            packet_option::PACKET_TIMESTAMP => Ok(write_i32_getsockopt(value, opts.timestamp)),
             packet_option::PACKET_QDISC_BYPASS => {
                 Ok(write_i32_getsockopt(value, opts.qdisc_bypass as i32))
             }

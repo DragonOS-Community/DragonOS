@@ -56,6 +56,8 @@ pub struct VirtioFsStatsSnapshot {
     pub virtqueue_not_ready_total: u64,
     pub submit_error_total: u64,
     pub pop_used_error_total: u64,
+    pub detach_failure_total: u64,
+    pub dma_owner_quarantined_total: u64,
     pub bridge_request_clone_count: u64,
     pub bridge_request_clone_bytes: u64,
     pub response_buffer_alloc_count: u64,
@@ -180,6 +182,8 @@ static VIRTQUEUE_FULL_TOTAL: AtomicU64 = AtomicU64::new(0);
 static VIRTQUEUE_NOT_READY_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SUBMIT_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
 static POP_USED_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DETACH_FAILURE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DMA_OWNER_QUARANTINED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BRIDGE_REQUEST_CLONE_COUNT: AtomicU64 = AtomicU64::new(0);
 static BRIDGE_REQUEST_CLONE_BYTES: AtomicU64 = AtomicU64::new(0);
 static RESPONSE_BUFFER_ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -651,6 +655,16 @@ pub fn on_virtiofs_pop_used_error() {
 }
 
 #[inline]
+pub fn on_virtiofs_detach_failure() {
+    inc(&DETACH_FAILURE_TOTAL);
+}
+
+#[inline]
+pub fn on_virtiofs_dma_owner_quarantined() {
+    inc(&DMA_OWNER_QUARANTINED_TOTAL);
+}
+
+#[inline]
 pub fn on_virtiofs_completed(used_len: usize, noreply: bool) {
     inc(&BRIDGE_COMPLETED_TOTAL);
     if noreply {
@@ -710,6 +724,8 @@ pub fn virtiofs_snapshot() -> VirtioFsStatsSnapshot {
         virtqueue_not_ready_total: VIRTQUEUE_NOT_READY_TOTAL.load(Ordering::Relaxed),
         submit_error_total: SUBMIT_ERROR_TOTAL.load(Ordering::Relaxed),
         pop_used_error_total: POP_USED_ERROR_TOTAL.load(Ordering::Relaxed),
+        detach_failure_total: DETACH_FAILURE_TOTAL.load(Ordering::Relaxed),
+        dma_owner_quarantined_total: DMA_OWNER_QUARANTINED_TOTAL.load(Ordering::Relaxed),
         bridge_request_clone_count: BRIDGE_REQUEST_CLONE_COUNT.load(Ordering::Relaxed),
         bridge_request_clone_bytes: BRIDGE_REQUEST_CLONE_BYTES.load(Ordering::Relaxed),
         response_buffer_alloc_count: RESPONSE_BUFFER_ALLOC_COUNT.load(Ordering::Relaxed),
@@ -794,6 +810,8 @@ virtqueue_full_total {}\n\
 virtqueue_not_ready_total {}\n\
 submit_error_total {}\n\
 pop_used_error_total {}\n\
+detach_failure_total {}\n\
+dma_owner_quarantined_total {}\n\
 bridge_request_clone_count {}\n\
 bridge_request_clone_bytes {}\n\
 response_buffer_alloc_count {}\n\
@@ -867,6 +885,8 @@ request_queue_full_total {}\n",
         virtiofs.virtqueue_not_ready_total,
         virtiofs.submit_error_total,
         virtiofs.pop_used_error_total,
+        virtiofs.detach_failure_total,
+        virtiofs.dma_owner_quarantined_total,
         virtiofs.bridge_request_clone_count,
         virtiofs.bridge_request_clone_bytes,
         virtiofs.response_buffer_alloc_count,

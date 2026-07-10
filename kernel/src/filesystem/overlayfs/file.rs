@@ -1,7 +1,7 @@
 use super::cred::CredOverrideGuard;
 use super::inode::OvlInode;
 use crate::filesystem::vfs::file::{File, FileFlags, FilePrivateData};
-use crate::filesystem::vfs::{self, vcore, FileType};
+use crate::filesystem::vfs::{self, vcore, FileType, Metadata, SetMetadataMask};
 use crate::libs::mutex::Mutex;
 use crate::mm::VmFlags;
 use crate::process::Cred;
@@ -129,6 +129,27 @@ pub(super) fn flush_file(
 ) -> Result<(), SystemError> {
     let (backing_file, _) = backing_file_for_io(inode, data)?;
     backing_file.flush_for_close(lock_owner)
+}
+
+pub(super) fn resize_file_with_metadata(
+    inode: &OvlInode,
+    data: crate::libs::mutex::MutexGuard<FilePrivateData>,
+    len: usize,
+    lock_owner: u64,
+    metadata: &Metadata,
+    mask: SetMetadataMask,
+) -> Result<(), SystemError> {
+    let (backing_file, backing_is_upper) = backing_file_for_io(inode, data)?;
+    if !backing_is_upper {
+        return Err(SystemError::EIO);
+    }
+    backing_file.inode().resize_file_with_metadata(
+        len,
+        lock_owner,
+        backing_file.private_data.lock(),
+        metadata,
+        mask,
+    )
 }
 
 pub(super) fn close(

@@ -1,8 +1,8 @@
 use super::cred::CredOverrideGuard;
 use super::inode::OvlInode;
 use crate::filesystem::vfs::{
-    permission::PermissionMask, FilePrivateData, FileType, IndexNode, InodeFlags, InodeId,
-    InodeMode, Metadata, SetMetadataMask, XattrFlags,
+    merge_metadata_masked, permission::PermissionMask, FilePrivateData, FileType, IndexNode,
+    InodeFlags, InodeId, InodeMode, Metadata, SetMetadataMask, XattrFlags,
 };
 use crate::libs::mutex::MutexGuard;
 use crate::process::{cred::CAPFlags, cred::Kgid, ProcessManager};
@@ -423,26 +423,36 @@ pub(super) fn set_metadata_masked(
     inode.copy_up_locked()?;
     let upper = inode.upper_inode.lock().clone().ok_or(SystemError::EIO)?;
     let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
-    let mut upper_metadata = upper.metadata()?;
-    if mask.contains(SetMetadataMask::MODE) {
-        upper_metadata.mode = requested.mode;
-    }
-    if mask.contains(SetMetadataMask::UID) {
-        upper_metadata.uid = requested.uid;
-    }
-    if mask.contains(SetMetadataMask::GID) {
-        upper_metadata.gid = requested.gid;
-    }
-    if mask.contains(SetMetadataMask::ATIME) {
-        upper_metadata.atime = requested.atime;
-    }
-    if mask.contains(SetMetadataMask::MTIME) {
-        upper_metadata.mtime = requested.mtime;
-    }
-    if mask.contains(SetMetadataMask::CTIME) {
-        upper_metadata.ctime = requested.ctime;
-    }
+    let upper_metadata = prepare_upper_metadata(&upper, requested, mask)?;
     upper.set_metadata_masked(&upper_metadata, mask)
+}
+
+fn prepare_upper_metadata(
+    upper: &Arc<dyn IndexNode>,
+    requested: &Metadata,
+    mask: SetMetadataMask,
+) -> Result<Metadata, SystemError> {
+    let mut upper_metadata = upper.metadata()?;
+    merge_metadata_masked(&mut upper_metadata, requested, mask);
+    Ok(upper_metadata)
+}
+
+pub(super) fn resize_with_metadata(
+    inode: &OvlInode,
+    len: usize,
+    lock_owner: u64,
+    requested: &Metadata,
+    mask: SetMetadataMask,
+) -> Result<(), SystemError> {
+    let fs = inode.overlay_fs()?;
+    let _mutation_guard = fs.mutation_lock.lock();
+    check_metadata_mutation_permission(inode, requested, mask)?;
+    inode.copy_up_locked()?;
+    let upper = inode.upper_inode.lock().clone().ok_or(SystemError::EIO)?;
+    let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
+    let mut upper_metadata = prepare_upper_metadata(&upper, requested, mask)?;
+    upper_metadata.size = len as i64;
+    upper.resize_with_metadata(len, lock_owner, &upper_metadata, mask)
 }
 
 fn check_metadata_mutation_permission(
@@ -507,6 +517,25 @@ pub(super) fn resize_file(
 ) -> Result<(), SystemError> {
     drop(data);
     resize_with_lock_owner(inode, len, lock_owner)
+}
+
+pub(super) fn resize_file_with_metadata(
+    inode: &OvlInode,
+    len: usize,
+    lock_owner: u64,
+    data: MutexGuard<FilePrivateData>,
+    requested: &Metadata,
+    mask: SetMetadataMask,
+) -> Result<(), SystemError> {
+    let fs = inode.overlay_fs()?;
+    let _mutation_guard = fs.mutation_lock.lock();
+    check_metadata_mutation_permission(inode, requested, mask)?;
+    inode.copy_up_locked()?;
+    let upper = inode.upper_inode.lock().clone().ok_or(SystemError::EIO)?;
+    let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
+    let mut upper_metadata = prepare_upper_metadata(&upper, requested, mask)?;
+    upper_metadata.size = len as i64;
+    super::file::resize_file_with_metadata(inode, data, len, lock_owner, &upper_metadata, mask)
 }
 
 pub(super) fn getxattr(inode: &OvlInode, name: &str, buf: &mut [u8]) -> Result<usize, SystemError> {

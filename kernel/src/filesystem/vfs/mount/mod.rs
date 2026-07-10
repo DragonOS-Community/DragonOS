@@ -1540,6 +1540,33 @@ impl IndexNode for MountFSInode {
     }
 
     #[inline]
+    fn resize_with_metadata(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        metadata: &super::Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), SystemError> {
+        self.ensure_mount_writable()?;
+        self.inner_inode
+            .resize_with_metadata(len, lock_owner, metadata, mask)
+    }
+
+    #[inline]
+    fn resize_file_with_metadata(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        metadata: &super::Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), SystemError> {
+        self.ensure_mount_writable()?;
+        self.inner_inode
+            .resize_file_with_metadata(len, lock_owner, data, metadata, mask)
+    }
+
+    #[inline]
     fn fallocate_file(
         &self,
         mode: i32,

@@ -139,6 +139,29 @@ bitflags! {
     }
 }
 
+/// Merge only fields selected by `mask` into an existing metadata snapshot.
+/// Intent-only bits do not map to stored fields.
+pub fn merge_metadata_masked(target: &mut Metadata, requested: &Metadata, mask: SetMetadataMask) {
+    if mask.contains(SetMetadataMask::MODE) {
+        target.mode = requested.mode;
+    }
+    if mask.contains(SetMetadataMask::UID) {
+        target.uid = requested.uid;
+    }
+    if mask.contains(SetMetadataMask::GID) {
+        target.gid = requested.gid;
+    }
+    if mask.contains(SetMetadataMask::ATIME) {
+        target.atime = requested.atime;
+    }
+    if mask.contains(SetMetadataMask::MTIME) {
+        target.mtime = requested.mtime;
+    }
+    if mask.contains(SetMetadataMask::CTIME) {
+        target.ctime = requested.ctime;
+    }
+}
+
 impl From<FileType> for InodeMode {
     fn from(val: FileType) -> Self {
         match val {
@@ -650,6 +673,41 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ) -> Result<(), SystemError> {
         drop(data);
         self.resize_with_lock_owner(len, lock_owner)
+    }
+
+    /// Atomically apply a size change and its VFS-computed metadata side
+    /// effects when the filesystem can represent them in one operation.
+    ///
+    /// Local filesystems that keep size and inode metadata separately can use
+    /// the default two-step implementation. Protocol and stacking
+    /// filesystems should override this method to preserve their transaction
+    /// and request-context semantics.
+    fn resize_with_metadata(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), SystemError> {
+        self.resize_with_lock_owner(len, lock_owner)?;
+        let mut current = self.metadata()?;
+        merge_metadata_masked(&mut current, metadata, mask);
+        self.set_metadata_masked(&current, mask)
+    }
+
+    /// File-context variant of `resize_with_metadata()`.
+    fn resize_file_with_metadata(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), SystemError> {
+        self.resize_file(len, lock_owner, data)?;
+        let mut current = self.metadata()?;
+        merge_metadata_masked(&mut current, metadata, mask);
+        self.set_metadata_masked(&current, mask)
     }
 
     /// @brief 在当前目录下创建一个新的inode

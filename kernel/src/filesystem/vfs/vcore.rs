@@ -19,7 +19,8 @@ use crate::{
             file::{File, FileMode, FilePrivateData},
             mount::MountFlags,
             permission::PermissionMask,
-            AtomicInodeId, FileSystem, FileType, InodeFlags, InodeMode, MountFS, SetMetadataMask,
+            AtomicInodeId, FileSystem, FileType, InodeFlags, InodeMode, Metadata, MountFS,
+            SetMetadataMask,
         },
     },
     init::cmdline::kenrel_cmdline_param_manager,
@@ -721,7 +722,7 @@ fn vfs_truncate_inner<F>(
     do_resize: F,
 ) -> Result<(), SystemError>
 where
-    F: FnOnce(&Arc<dyn IndexNode>) -> Result<(), SystemError>,
+    F: FnOnce(&Arc<dyn IndexNode>, &Metadata, SetMetadataMask) -> Result<(), SystemError>,
 {
     let md = inode.metadata()?;
 
@@ -761,19 +762,17 @@ where
         }
     }
 
-    let result = do_resize(&inode);
-
-    if result.is_ok() {
-        finish_truncate_metadata(inode.as_ref())?;
-    }
-
-    result
+    let (md, mask) = prepare_write_side_effect_metadata(md, len);
+    do_resize(&inode, &md, mask)
 }
 
-fn finish_truncate_metadata(inode: &dyn IndexNode) -> Result<(), SystemError> {
+fn prepare_write_side_effect_metadata(
+    mut md: Metadata,
+    new_size: usize,
+) -> (Metadata, SetMetadataMask) {
     let cred = ProcessManager::current_pcb().cred();
-    let mut md = inode.metadata()?;
     let now = crate::time::PosixTimeSpec::now();
+    md.size = new_size as i64;
     md.mtime = now;
     md.ctime = now;
     let mut mask =
@@ -794,7 +793,7 @@ fn finish_truncate_metadata(inode: &dyn IndexNode) -> Result<(), SystemError> {
             mask.insert(SetMetadataMask::MODE);
         }
     }
-    inode.set_metadata_masked(&md, mask)
+    (md, mask)
 }
 
 /// 统一的 VFS 截断封装：对 inode 进行基本检查并调用 resize
@@ -804,8 +803,8 @@ fn finish_truncate_metadata(inode: &dyn IndexNode) -> Result<(), SystemError> {
 #[inline(never)]
 pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemError> {
     let lock_owner = current_file_lock_owner_id();
-    vfs_truncate_inner(inode, len, |inode| {
-        inode.resize_with_lock_owner(len, lock_owner)
+    vfs_truncate_inner(inode, len, |inode, metadata, mask| {
+        inode.resize_with_metadata(len, lock_owner, metadata, mask)
     })
 }
 
@@ -817,8 +816,8 @@ pub fn vfs_truncate_file<'a>(
     lock_owner: u64,
     data: impl FnOnce() -> MutexGuard<'a, FilePrivateData>,
 ) -> Result<(), SystemError> {
-    vfs_truncate_inner(inode, len, |inode| {
-        inode.resize_file(len, lock_owner, data())
+    vfs_truncate_inner(inode, len, |inode, metadata, mask| {
+        inode.resize_file_with_metadata(len, lock_owner, data(), metadata, mask)
     })
 }
 
@@ -866,12 +865,8 @@ pub fn resize_based_fallocate(
 
     check_file_size_limit(new_size)?;
 
-    let result = inode.resize_with_lock_owner(new_size, lock_owner);
-    if result.is_ok() && md.size != new_size as i64 {
-        finish_truncate_metadata(inode)?;
-    }
-
-    result
+    let (metadata, mask) = prepare_write_side_effect_metadata(md, new_size);
+    inode.resize_with_metadata(new_size, lock_owner, &metadata, mask)
 }
 
 /// 基于已打开文件执行 VFS fallocate 公共检查，再分派给具体文件系统。

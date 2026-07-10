@@ -12,7 +12,8 @@ use crate::{
             permission::PermissionMask,
             syscall::RenameFlags,
             utils::DName,
-            FilePrivateData, FileSystem, FileType, IndexNode, InodeMode, Metadata, XattrFlags,
+            FilePrivateData, FileSystem, FileType, IndexNode, InodeMode, Metadata, SetMetadataMask,
+            XattrFlags,
         },
     },
     libs::{casting::DowncastArc, mutex::MutexGuard},
@@ -549,11 +550,11 @@ impl IndexNode for FuseNode {
     }
 
     fn resize(&self, len: usize) -> Result<(), SystemError> {
-        self.setattr_size(len, None, None)
+        self.setattr_size(len, None, None, None)
     }
 
     fn resize_with_lock_owner(&self, len: usize, lock_owner: u64) -> Result<(), SystemError> {
-        self.setattr_size(len, Some(lock_owner), None)
+        self.setattr_size(len, Some(lock_owner), None, None)
     }
 
     fn resize_file(
@@ -572,8 +573,45 @@ impl IndexNode for FuseNode {
         drop(data);
 
         match fuse_data {
-            FuseFilePrivateData::File(p) => self.setattr_size(len, Some(lock_owner), Some(p.fh)),
+            FuseFilePrivateData::File(p) => {
+                self.setattr_size(len, Some(lock_owner), Some(p.fh), None)
+            }
             _ => self.resize_with_lock_owner(len, lock_owner),
+        }
+    }
+
+    fn resize_with_metadata(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), SystemError> {
+        self.setattr_size(len, Some(lock_owner), None, Some((metadata, mask)))
+    }
+
+    fn resize_file_with_metadata(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), SystemError> {
+        let fuse_data = match &*data {
+            FilePrivateData::Fuse(data) => data.clone(),
+            _ => {
+                drop(data);
+                return self.resize_with_metadata(len, lock_owner, metadata, mask);
+            }
+        };
+        drop(data);
+
+        match fuse_data {
+            FuseFilePrivateData::File(p) => {
+                self.setattr_size(len, Some(lock_owner), Some(p.fh), Some((metadata, mask)))
+            }
+            _ => self.resize_with_metadata(len, lock_owner, metadata, mask),
         }
     }
 

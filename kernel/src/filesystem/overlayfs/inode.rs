@@ -279,6 +279,27 @@ impl IndexNode for OvlInode {
         super::metadata::resize_file(self, len, lock_owner, data)
     }
 
+    fn resize_with_metadata(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), SystemError> {
+        super::metadata::resize_with_metadata(self, len, lock_owner, metadata, mask)
+    }
+
+    fn resize_file_with_metadata(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), SystemError> {
+        super::metadata::resize_file_with_metadata(self, len, lock_owner, data, metadata, mask)
+    }
+
     fn getxattr(&self, name: &str, buf: &mut [u8]) -> Result<usize, SystemError> {
         super::metadata::getxattr(self, name, buf)
     }

@@ -4,7 +4,7 @@ use crate::filesystem::vfs::{
     file::{File, FileFlags, FilePrivateData},
     syscall::RenameFlags,
     utils::should_remove_sgid,
-    FileType, IndexNode, Metadata,
+    FileType, IndexNode, Metadata, MAX_PATHLEN,
 };
 use crate::libs::mutex::Mutex;
 use crate::process::{
@@ -103,7 +103,7 @@ impl OvlInode {
         }
 
         let symlink_target = if metadata.file_type == FileType::SymLink {
-            Some(Self::read_symlink_target(lower_inode.clone(), &metadata)?)
+            Some(Self::read_symlink_target(lower_inode.clone())?)
         } else {
             None
         };
@@ -214,14 +214,14 @@ impl OvlInode {
         }
 
         let upper_metadata = inode.metadata()?;
-        if upper_metadata.file_type != lower_metadata.file_type {
+        if Self::copy_up_file_type(upper_metadata.file_type)
+            != Self::copy_up_file_type(lower_metadata.file_type)
+        {
             return Err(SystemError::EIO);
         }
 
-        if matches!(
-            upper_metadata.file_type,
-            FileType::CharDevice | FileType::BlockDevice
-        ) && upper_metadata.raw_dev != lower_metadata.raw_dev
+        if Self::is_device_node_file_type(lower_metadata.file_type)
+            && upper_metadata.raw_dev != lower_metadata.raw_dev
         {
             return Err(SystemError::EIO);
         }
@@ -266,13 +266,35 @@ impl OvlInode {
             FileType::SymLink => {
                 workdir.symlink(temp_name, symlink_target.ok_or(SystemError::EIO)?)
             }
-            FileType::CharDevice | FileType::BlockDevice | FileType::Pipe | FileType::Socket => {
+            file_type if Self::is_mknod_copy_up_type(file_type) => {
                 let mode = (metadata.mode & !vfs::InodeMode::S_IFMT)
-                    | vfs::InodeMode::from(metadata.file_type);
+                    | vfs::InodeMode::from(Self::copy_up_file_type(file_type));
                 workdir.mknod(temp_name, mode, metadata.raw_dev)
             }
             _ => workdir.create_with_data(temp_name, metadata.file_type, metadata.mode, 0),
         }
+    }
+
+    fn copy_up_file_type(file_type: FileType) -> FileType {
+        match file_type {
+            FileType::KvmDevice | FileType::FramebufferDevice => FileType::CharDevice,
+            _ => file_type,
+        }
+    }
+
+    fn is_device_node_file_type(file_type: FileType) -> bool {
+        matches!(
+            file_type,
+            FileType::CharDevice
+                | FileType::BlockDevice
+                | FileType::KvmDevice
+                | FileType::FramebufferDevice
+        )
+    }
+
+    fn is_mknod_copy_up_type(file_type: FileType) -> bool {
+        Self::is_device_node_file_type(file_type)
+            || matches!(file_type, FileType::Pipe | FileType::Socket)
     }
 
     fn copy_data_if_needed(
@@ -320,27 +342,23 @@ impl OvlInode {
         Ok(())
     }
 
-    fn read_symlink_target(
-        lower_inode: Arc<dyn IndexNode>,
-        metadata: &Metadata,
-    ) -> Result<String, SystemError> {
-        let size = metadata.size.max(0) as usize;
-        let mut buffer = vec![0u8; size];
-        let mut offset = 0usize;
+    fn read_symlink_target(lower_inode: Arc<dyn IndexNode>) -> Result<String, SystemError> {
+        let mut buffer = vec![0u8; MAX_PATHLEN];
+        let len = lower_inode.read_at(
+            0,
+            MAX_PATHLEN,
+            &mut buffer,
+            Mutex::new(FilePrivateData::Unused).lock(),
+        )?;
 
-        while offset < size {
-            let read_len = lower_inode.read_at(
-                offset,
-                size - offset,
-                &mut buffer[offset..],
-                Mutex::new(FilePrivateData::Unused).lock(),
-            )?;
-            if read_len == 0 {
-                return Err(SystemError::EIO);
-            }
-            offset += read_len;
+        if len == 0 {
+            return Err(SystemError::EIO);
+        }
+        if len >= MAX_PATHLEN {
+            return Err(SystemError::ENAMETOOLONG);
         }
 
+        buffer.truncate(len);
         String::from_utf8(buffer).map_err(|_| SystemError::EINVAL)
     }
 }

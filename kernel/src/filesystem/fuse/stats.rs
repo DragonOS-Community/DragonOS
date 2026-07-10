@@ -19,6 +19,19 @@ pub struct FuseStatsSnapshot {
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct VirtioFsStatsSnapshot {
+    pub device_queue_depth_max: u64,
+    pub hiprio_vring_size_configured: u64,
+    pub request_queue_count_configured: u64,
+    pub request_vring_size_min_configured: u64,
+    pub request_vring_size_max_configured: u64,
+    pub sg_limit_pages_configured: u64,
+    pub inflight_current: u64,
+    pub inflight_peak: u64,
+    pub hiprio_inflight_current: u64,
+    pub hiprio_inflight_peak: u64,
+    pub request_inflight_current: u64,
+    pub request_inflight_peak: u64,
+    pub queue_full_blocked_current: u64,
     pub bridge_loop_iterations_total: u64,
     pub bridge_progress_iterations_total: u64,
     pub bridge_idle_sleeps_total: u64,
@@ -59,6 +72,8 @@ pub struct VirtioFsStatsSnapshot {
     pub bridge_queue_full_retry_total: u64,
     pub bridge_queue_full_retry_after_completion_total: u64,
     pub bridge_queue_full_retry_success_total: u64,
+    pub hiprio_queue_full_total: u64,
+    pub request_queue_full_total: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +113,12 @@ pub enum VirtioFsBridgeWaitExit {
     Spurious,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtioFsQueueKind {
+    Hiprio,
+    Request,
+}
+
 impl VirtioFsBridgeWaitExit {
     pub const fn trace_id(self) -> u8 {
         match self {
@@ -120,6 +141,20 @@ static NOREPLY_QUEUED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READ_BUFFER_TOO_SMALL_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BYTES_REQUEST_TO_DEV_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BYTES_REPLY_PAYLOAD_CLONED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+static DEVICE_QUEUE_DEPTH_MAX: AtomicU64 = AtomicU64::new(0);
+static HIPRIO_VRING_SIZE_CONFIGURED: AtomicU64 = AtomicU64::new(0);
+static REQUEST_QUEUE_COUNT_CONFIGURED: AtomicU64 = AtomicU64::new(0);
+static REQUEST_VRING_SIZE_MIN_CONFIGURED: AtomicU64 = AtomicU64::new(0);
+static REQUEST_VRING_SIZE_MAX_CONFIGURED: AtomicU64 = AtomicU64::new(0);
+static SG_LIMIT_PAGES_CONFIGURED: AtomicU64 = AtomicU64::new(0);
+static INFLIGHT_CURRENT: AtomicU64 = AtomicU64::new(0);
+static INFLIGHT_PEAK: AtomicU64 = AtomicU64::new(0);
+static HIPRIO_INFLIGHT_CURRENT: AtomicU64 = AtomicU64::new(0);
+static HIPRIO_INFLIGHT_PEAK: AtomicU64 = AtomicU64::new(0);
+static REQUEST_INFLIGHT_CURRENT: AtomicU64 = AtomicU64::new(0);
+static REQUEST_INFLIGHT_PEAK: AtomicU64 = AtomicU64::new(0);
+static QUEUE_FULL_BLOCKED_CURRENT: AtomicU64 = AtomicU64::new(0);
 
 static BRIDGE_LOOP_ITERATIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BRIDGE_PROGRESS_ITERATIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -163,6 +198,8 @@ static BRIDGE_QUEUE_FULL_BLOCKED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BRIDGE_QUEUE_FULL_RETRY_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BRIDGE_QUEUE_FULL_RETRY_AFTER_COMPLETION_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BRIDGE_QUEUE_FULL_RETRY_SUCCESS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static HIPRIO_QUEUE_FULL_TOTAL: AtomicU64 = AtomicU64::new(0);
+static REQUEST_QUEUE_FULL_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 fn add(counter: &AtomicU64, value: u64) {
@@ -170,8 +207,31 @@ fn add(counter: &AtomicU64, value: u64) {
 }
 
 #[inline]
+fn saturating_sub(counter: &AtomicU64, value: u64) {
+    let mut old = counter.load(Ordering::Relaxed);
+    loop {
+        let new = old.saturating_sub(value);
+        match counter.compare_exchange_weak(old, new, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(v) => old = v,
+        }
+    }
+}
+
+#[inline]
 fn inc(counter: &AtomicU64) {
     add(counter, 1);
+}
+
+#[inline]
+fn update_peak(peak: &AtomicU64, value: u64) {
+    let mut old = peak.load(Ordering::Relaxed);
+    while value > old {
+        match peak.compare_exchange_weak(old, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(v) => old = v,
+        }
+    }
 }
 
 #[inline]
@@ -244,6 +304,53 @@ pub fn on_virtiofs_loop_iteration(progressed: bool) {
     inc(&BRIDGE_LOOP_ITERATIONS_TOTAL);
     if progressed {
         inc(&BRIDGE_PROGRESS_ITERATIONS_TOTAL);
+    }
+}
+
+pub fn on_virtiofs_queue_configured(
+    device_queue_depth_max: usize,
+    hiprio_vring_size: usize,
+    request_queue_count: usize,
+    request_vring_size_min: usize,
+    request_vring_size_max: usize,
+    sg_limit_pages: usize,
+) {
+    DEVICE_QUEUE_DEPTH_MAX.store(device_queue_depth_max as u64, Ordering::Relaxed);
+    HIPRIO_VRING_SIZE_CONFIGURED.store(hiprio_vring_size as u64, Ordering::Relaxed);
+    REQUEST_QUEUE_COUNT_CONFIGURED.store(request_queue_count as u64, Ordering::Relaxed);
+    REQUEST_VRING_SIZE_MIN_CONFIGURED.store(request_vring_size_min as u64, Ordering::Relaxed);
+    REQUEST_VRING_SIZE_MAX_CONFIGURED.store(request_vring_size_max as u64, Ordering::Relaxed);
+    SG_LIMIT_PAGES_CONFIGURED.store(sg_limit_pages as u64, Ordering::Relaxed);
+}
+
+pub fn on_virtiofs_inflight_add(kind: VirtioFsQueueKind) {
+    let total = INFLIGHT_CURRENT.fetch_add(1, Ordering::Relaxed) + 1;
+    update_peak(&INFLIGHT_PEAK, total);
+    match kind {
+        VirtioFsQueueKind::Hiprio => {
+            let current = HIPRIO_INFLIGHT_CURRENT.fetch_add(1, Ordering::Relaxed) + 1;
+            update_peak(&HIPRIO_INFLIGHT_PEAK, current);
+        }
+        VirtioFsQueueKind::Request => {
+            let current = REQUEST_INFLIGHT_CURRENT.fetch_add(1, Ordering::Relaxed) + 1;
+            update_peak(&REQUEST_INFLIGHT_PEAK, current);
+        }
+    }
+}
+
+pub fn on_virtiofs_inflight_remove(kind: VirtioFsQueueKind, count: usize) {
+    if count == 0 {
+        return;
+    }
+    let count = count as u64;
+    saturating_sub(&INFLIGHT_CURRENT, count);
+    match kind {
+        VirtioFsQueueKind::Hiprio => {
+            saturating_sub(&HIPRIO_INFLIGHT_CURRENT, count);
+        }
+        VirtioFsQueueKind::Request => {
+            saturating_sub(&REQUEST_INFLIGHT_CURRENT, count);
+        }
     }
 }
 
@@ -336,13 +443,23 @@ pub fn on_virtiofs_submitted(req_len: usize) {
 }
 
 #[inline]
-pub fn on_virtiofs_queue_full() {
+pub fn on_virtiofs_queue_full(kind: VirtioFsQueueKind) {
     inc(&VIRTQUEUE_FULL_TOTAL);
+    match kind {
+        VirtioFsQueueKind::Hiprio => inc(&HIPRIO_QUEUE_FULL_TOTAL),
+        VirtioFsQueueKind::Request => inc(&REQUEST_QUEUE_FULL_TOTAL),
+    }
 }
 
 #[inline]
 pub fn on_virtiofs_queue_full_blocked() {
     inc(&BRIDGE_QUEUE_FULL_BLOCKED_TOTAL);
+    inc(&QUEUE_FULL_BLOCKED_CURRENT);
+}
+
+#[inline]
+pub fn on_virtiofs_queue_full_unblocked() {
+    saturating_sub(&QUEUE_FULL_BLOCKED_CURRENT, 1);
 }
 
 #[inline]
@@ -404,6 +521,21 @@ pub fn fuse_snapshot() -> FuseStatsSnapshot {
 
 pub fn virtiofs_snapshot() -> VirtioFsStatsSnapshot {
     VirtioFsStatsSnapshot {
+        device_queue_depth_max: DEVICE_QUEUE_DEPTH_MAX.load(Ordering::Relaxed),
+        hiprio_vring_size_configured: HIPRIO_VRING_SIZE_CONFIGURED.load(Ordering::Relaxed),
+        request_queue_count_configured: REQUEST_QUEUE_COUNT_CONFIGURED.load(Ordering::Relaxed),
+        request_vring_size_min_configured: REQUEST_VRING_SIZE_MIN_CONFIGURED
+            .load(Ordering::Relaxed),
+        request_vring_size_max_configured: REQUEST_VRING_SIZE_MAX_CONFIGURED
+            .load(Ordering::Relaxed),
+        sg_limit_pages_configured: SG_LIMIT_PAGES_CONFIGURED.load(Ordering::Relaxed),
+        inflight_current: INFLIGHT_CURRENT.load(Ordering::Relaxed),
+        inflight_peak: INFLIGHT_PEAK.load(Ordering::Relaxed),
+        hiprio_inflight_current: HIPRIO_INFLIGHT_CURRENT.load(Ordering::Relaxed),
+        hiprio_inflight_peak: HIPRIO_INFLIGHT_PEAK.load(Ordering::Relaxed),
+        request_inflight_current: REQUEST_INFLIGHT_CURRENT.load(Ordering::Relaxed),
+        request_inflight_peak: REQUEST_INFLIGHT_PEAK.load(Ordering::Relaxed),
+        queue_full_blocked_current: QUEUE_FULL_BLOCKED_CURRENT.load(Ordering::Relaxed),
         bridge_loop_iterations_total: BRIDGE_LOOP_ITERATIONS_TOTAL.load(Ordering::Relaxed),
         bridge_progress_iterations_total: BRIDGE_PROGRESS_ITERATIONS_TOTAL.load(Ordering::Relaxed),
         bridge_idle_sleeps_total: BRIDGE_IDLE_SLEEPS_TOTAL.load(Ordering::Relaxed),
@@ -450,6 +582,8 @@ pub fn virtiofs_snapshot() -> VirtioFsStatsSnapshot {
             BRIDGE_QUEUE_FULL_RETRY_AFTER_COMPLETION_TOTAL.load(Ordering::Relaxed),
         bridge_queue_full_retry_success_total: BRIDGE_QUEUE_FULL_RETRY_SUCCESS_TOTAL
             .load(Ordering::Relaxed),
+        hiprio_queue_full_total: HIPRIO_QUEUE_FULL_TOTAL.load(Ordering::Relaxed),
+        request_queue_full_total: REQUEST_QUEUE_FULL_TOTAL.load(Ordering::Relaxed),
     }
 }
 
@@ -470,6 +604,19 @@ bytes_request_to_dev_total {}\n\
 bytes_reply_payload_cloned_total {}\n\
 \n\
 [virtiofs]\n\
+device_queue_depth_max {}\n\
+hiprio_vring_size_configured {}\n\
+request_queue_count_configured {}\n\
+request_vring_size_min_configured {}\n\
+request_vring_size_max_configured {}\n\
+sg_limit_pages_configured {}\n\
+inflight_current {}\n\
+inflight_peak {}\n\
+hiprio_inflight_current {}\n\
+hiprio_inflight_peak {}\n\
+request_inflight_current {}\n\
+request_inflight_peak {}\n\
+queue_full_blocked_current {}\n\
 bridge_loop_iterations_total {}\n\
 bridge_progress_iterations_total {}\n\
 bridge_idle_sleeps_total {}\n\
@@ -517,7 +664,9 @@ bridge_irq_weak_upgrade_failed_total {}\n\
 bridge_queue_full_blocked_total {}\n\
 bridge_queue_full_retry_total {}\n\
 bridge_queue_full_retry_after_completion_total {}\n\
-bridge_queue_full_retry_success_total {}\n",
+bridge_queue_full_retry_success_total {}\n\
+hiprio_queue_full_total {}\n\
+request_queue_full_total {}\n",
         fuse.requests_queued_total,
         fuse.requests_dequeued_total,
         fuse.requests_replied_ok_total,
@@ -528,6 +677,19 @@ bridge_queue_full_retry_success_total {}\n",
         fuse.read_buffer_too_small_total,
         fuse.bytes_request_to_dev_total,
         fuse.bytes_reply_payload_cloned_total,
+        virtiofs.device_queue_depth_max,
+        virtiofs.hiprio_vring_size_configured,
+        virtiofs.request_queue_count_configured,
+        virtiofs.request_vring_size_min_configured,
+        virtiofs.request_vring_size_max_configured,
+        virtiofs.sg_limit_pages_configured,
+        virtiofs.inflight_current,
+        virtiofs.inflight_peak,
+        virtiofs.hiprio_inflight_current,
+        virtiofs.hiprio_inflight_peak,
+        virtiofs.request_inflight_current,
+        virtiofs.request_inflight_peak,
+        virtiofs.queue_full_blocked_current,
         virtiofs.bridge_loop_iterations_total,
         virtiofs.bridge_progress_iterations_total,
         virtiofs.bridge_idle_sleeps_total,
@@ -576,5 +738,7 @@ bridge_queue_full_retry_success_total {}\n",
         virtiofs.bridge_queue_full_retry_total,
         virtiofs.bridge_queue_full_retry_after_completion_total,
         virtiofs.bridge_queue_full_retry_success_total,
+        virtiofs.hiprio_queue_full_total,
+        virtiofs.request_queue_full_total,
     )
 }

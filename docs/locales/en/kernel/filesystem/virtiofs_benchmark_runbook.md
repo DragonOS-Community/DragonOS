@@ -52,6 +52,19 @@ make qemu-virtiofs-nographic AUTO_TEST=none
 
 Run the two commands in separate terminals. The QEMU command exposes tag `hostshare`.
 
+To validate different virtqueue depths, pass an explicit queue size to the QEMU device:
+
+```sh
+DRAGONOS_VIRTIOFS_QUEUE_SIZE=8 make qemu-virtiofs-nographic AUTO_TEST=none
+DRAGONOS_VIRTIOFS_QUEUE_SIZE=128 make qemu-virtiofs-nographic AUTO_TEST=none
+```
+
+To test multiple ordinary request queues, also set it up to 64:
+
+```sh
+DRAGONOS_VIRTIOFS_NUM_REQUEST_QUEUES=2 make qemu-virtiofs-nographic AUTO_TEST=none
+```
+
 ## Run On DragonOS
 
 Inside DragonOS:
@@ -137,7 +150,17 @@ virtiofs.bytes_completed_total
 virtiofs.bridge_poll_sleep_ns_total
 virtiofs.response_buffer_waste_bytes
 virtiofs.virtqueue_full_total
+virtiofs.device_queue_depth_max
+virtiofs.hiprio_vring_size_configured
+virtiofs.request_queue_count_configured
+virtiofs.request_vring_size_min_configured
+virtiofs.sg_limit_pages_configured
+virtiofs.inflight_peak
+virtiofs.queue_full_blocked_current
 ```
+
+The `*_configured` fields are configuration snapshots, so their `stats_delta` is usually 0.
+Check their absolute values in `/tmp/dbg/fuse/stats` when verifying whether queue depth took effect.
 
 ## Compare Results
 

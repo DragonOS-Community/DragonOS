@@ -209,7 +209,7 @@ impl Default for FuseInitNegotiated {
             // Linux guarantees max_write >= 4096 after init; before init keep sane default.
             max_write: 4096,
             time_gran: 0,
-            max_pages: 1,
+            max_pages: FuseConn::DEFAULT_MAX_PAGES as u16,
             flags: 0,
         }
     }
@@ -239,6 +239,7 @@ struct FuseConnInner {
     no_removexattr: bool,
     no_interrupt: bool,
     max_write_cap: usize,
+    max_pages_limit: usize,
     separate_hiprio_pending: bool,
     hiprio_pending: VecDeque<Arc<FuseRequest>>,
     pending: VecDeque<Arc<FuseRequest>>,
@@ -262,6 +263,8 @@ impl FuseConn {
     // Keep this in sync with `sys_read.rs` userspace chunking size.
     const USER_READ_CHUNK: usize = 64 * 1024;
     const MIN_MAX_WRITE: usize = 4096;
+    const DEFAULT_MAX_PAGES: usize = 32;
+    const MAX_MAX_PAGES: usize = 256;
     const DEFAULT_MAX_READAHEAD: usize = 128 * MMArch::PAGE_SIZE;
 
     pub fn new() -> Arc<Self> {
@@ -311,6 +314,7 @@ impl FuseConn {
                 no_removexattr: false,
                 no_interrupt: false,
                 max_write_cap,
+                max_pages_limit: Self::MAX_MAX_PAGES,
                 separate_hiprio_pending,
                 hiprio_pending: VecDeque::new(),
                 pending: VecDeque::new(),
@@ -771,9 +775,16 @@ impl FuseConn {
         }
     }
 
-    fn max_write_cap(&self) -> usize {
-        let g = self.inner.lock();
-        core::cmp::max(Self::MIN_MAX_WRITE, g.max_write_cap)
+    pub fn set_max_pages_limit(&self, max_pages_limit: usize) -> Result<(), SystemError> {
+        if max_pages_limit == 0 {
+            return Err(SystemError::EINVAL);
+        }
+        let mut g = self.inner.lock();
+        if g.initialized {
+            return Err(SystemError::EBUSY);
+        }
+        g.max_pages_limit = core::cmp::min(max_pages_limit, Self::MAX_MAX_PAGES);
+        Ok(())
     }
 
     fn min_read_buffer(&self) -> usize {
@@ -1326,14 +1337,20 @@ impl FuseConn {
                 negotiated_flags |= (init_out.flags2 as u64) << 32;
             }
             let negotiated_minor = core::cmp::min(init_out.minor, FUSE_KERNEL_MINOR_VERSION);
-            let negotiated_max_pages_raw =
-                if (negotiated_flags & FUSE_MAX_PAGES) != 0 && init_out.max_pages != 0 {
-                    init_out.max_pages
-                } else {
-                    1
-                };
-            let negotiated_max_write = core::cmp::max(4096usize, init_out.max_write as usize);
-            let max_write_cap = self.max_write_cap();
+            let negotiated_max_pages_raw = if (negotiated_flags & FUSE_MAX_PAGES) != 0 {
+                core::cmp::max(init_out.max_pages, 1)
+            } else {
+                Self::DEFAULT_MAX_PAGES as u16
+            };
+            let negotiated_max_write =
+                core::cmp::max(Self::MIN_MAX_WRITE, init_out.max_write as usize);
+            let (max_write_cap, max_pages_limit) = {
+                let g = self.inner.lock();
+                (
+                    core::cmp::max(Self::MIN_MAX_WRITE, g.max_write_cap),
+                    g.max_pages_limit,
+                )
+            };
             let capped_max_write = core::cmp::min(negotiated_max_write, max_write_cap);
             if capped_max_write < negotiated_max_write {
                 log::trace!(
@@ -1342,9 +1359,8 @@ impl FuseConn {
                     capped_max_write
                 );
             }
-            let pages_from_write =
-                core::cmp::max(1usize, capped_max_write.div_ceil(MMArch::PAGE_SIZE)) as u16;
-            let negotiated_max_pages = core::cmp::min(negotiated_max_pages_raw, pages_from_write);
+            let negotiated_max_pages =
+                core::cmp::min(negotiated_max_pages_raw, max_pages_limit as u16);
 
             {
                 let mut g = self.inner.lock();

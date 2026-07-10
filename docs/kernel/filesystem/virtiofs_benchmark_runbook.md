@@ -52,6 +52,19 @@ make qemu-virtiofs-nographic AUTO_TEST=none
 
 这两个命令需要在两个终端分别运行。QEMU 命令会暴露 tag `hostshare`。
 
+验证不同 virtqueue 深度时，可以给 QEMU 设备传入显式 queue size：
+
+```sh
+DRAGONOS_VIRTIOFS_QUEUE_SIZE=8 make qemu-virtiofs-nographic AUTO_TEST=none
+DRAGONOS_VIRTIOFS_QUEUE_SIZE=128 make qemu-virtiofs-nographic AUTO_TEST=none
+```
+
+需要测试多个普通请求队列时，还可以设置，最大值为 64：
+
+```sh
+DRAGONOS_VIRTIOFS_NUM_REQUEST_QUEUES=2 make qemu-virtiofs-nographic AUTO_TEST=none
+```
+
 ## 在 DragonOS 中运行
 
 进入 DragonOS 后，先挂载 debugfs：
@@ -137,7 +150,17 @@ virtiofs.bytes_completed_total
 virtiofs.bridge_poll_sleep_ns_total
 virtiofs.response_buffer_waste_bytes
 virtiofs.virtqueue_full_total
+virtiofs.device_queue_depth_max
+virtiofs.hiprio_vring_size_configured
+virtiofs.request_queue_count_configured
+virtiofs.request_vring_size_min_configured
+virtiofs.sg_limit_pages_configured
+virtiofs.inflight_peak
+virtiofs.queue_full_blocked_current
 ```
+
+其中 `*_configured` 是配置快照，benchmark 的 `stats_delta` 通常为 0；判断队列深度是否生效时应看
+`/tmp/dbg/fuse/stats` 中的绝对值。
 
 ## 对比结果
 

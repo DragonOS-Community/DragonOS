@@ -181,6 +181,10 @@ impl FuseNode {
         Ok(())
     }
 
+    fn max_pages_bytes(&self) -> usize {
+        core::cmp::max(1, self.conn().max_pages()).saturating_mul(MMArch::PAGE_SIZE)
+    }
+
     pub fn nodeid(&self) -> u64 {
         self.nodeid
     }
@@ -743,7 +747,7 @@ impl FuseNode {
         {
             return Err(SystemError::ESTALE);
         }
-        let max_write = self.conn().max_write();
+        let max_write = core::cmp::min(self.conn().max_write(), self.max_pages_bytes());
         if max_write == 0 {
             return Err(SystemError::EIO);
         }
@@ -1272,7 +1276,7 @@ impl FuseNode {
         file_flags: u32,
         lock_owner: u64,
     ) -> Result<usize, SystemError> {
-        let max_read = self.conn().max_read();
+        let max_read = core::cmp::min(self.conn().max_read(), self.max_pages_bytes());
         if max_read == 0 {
             return Err(SystemError::EIO);
         }
@@ -2179,7 +2183,7 @@ impl IndexNode for FuseNode {
         let fh = private_data.fh;
         let file_flags = private_data.open_flags;
         let fopen_flags = private_data.fopen_flags;
-        let max_write = self.conn().max_write();
+        let max_write = core::cmp::min(self.conn().max_write(), self.max_pages_bytes());
         if max_write == 0 {
             return Err(SystemError::EIO);
         }

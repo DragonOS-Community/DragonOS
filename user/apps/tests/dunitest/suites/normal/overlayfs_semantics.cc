@@ -1115,6 +1115,60 @@ TEST(OverlayFsSemantics, HardlinkUsesRealUpperInodeForLowerAndUpperSources) {
     EXPECT_EQ(0, overlay_temp_entry_count(env.work));
 }
 
+TEST(OverlayFsSemantics, HardlinkCopyUpPreservesLowerOwnershipAndMode) {
+    if (geteuid() != 0) {
+        GTEST_SKIP() << "requires root to prepare lower ownership";
+    }
+
+    ScopedOverlayEnv scoped("overlayfs_hardlink_copy_up_metadata");
+    const auto& env = scoped.env;
+    std::string lower_source = join_path(env.lower, "source");
+    std::string merged_source = join_path(env.merged, "source");
+    std::string merged_target = join_path(env.merged, "target");
+    std::string upper_source = join_path(env.upper, "source");
+    std::string upper_target = join_path(env.upper, "target");
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_EQ(0, write_text(lower_source, "lower-owned"));
+    ASSERT_EQ(0, chown(lower_source.c_str(), 1000, 1001)) << strerror(errno);
+    ASSERT_EQ(0, chmod(lower_source.c_str(), 0640)) << strerror(errno);
+
+    struct stat lower_st = {};
+    ASSERT_EQ(0, stat(lower_source.c_str(), &lower_st)) << strerror(errno);
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    ASSERT_EQ(0, link(merged_source.c_str(), merged_target.c_str())) << strerror(errno);
+
+    struct stat merged_source_st = {};
+    struct stat merged_target_st = {};
+    struct stat upper_source_st = {};
+    struct stat upper_target_st = {};
+    ASSERT_EQ(0, stat(merged_source.c_str(), &merged_source_st)) << strerror(errno);
+    ASSERT_EQ(0, stat(merged_target.c_str(), &merged_target_st)) << strerror(errno);
+    ASSERT_EQ(0, stat(upper_source.c_str(), &upper_source_st)) << strerror(errno);
+    ASSERT_EQ(0, stat(upper_target.c_str(), &upper_target_st)) << strerror(errno);
+
+    EXPECT_EQ(lower_st.st_uid, merged_source_st.st_uid);
+    EXPECT_EQ(lower_st.st_gid, merged_source_st.st_gid);
+    EXPECT_EQ(lower_st.st_mode & 07777, merged_source_st.st_mode & 07777);
+    EXPECT_EQ(lower_st.st_uid, merged_target_st.st_uid);
+    EXPECT_EQ(lower_st.st_gid, merged_target_st.st_gid);
+    EXPECT_EQ(lower_st.st_mode & 07777, merged_target_st.st_mode & 07777);
+    EXPECT_EQ(lower_st.st_uid, upper_source_st.st_uid);
+    EXPECT_EQ(lower_st.st_gid, upper_source_st.st_gid);
+    EXPECT_EQ(lower_st.st_mode & 07777, upper_source_st.st_mode & 07777);
+    EXPECT_EQ(lower_st.st_uid, upper_target_st.st_uid);
+    EXPECT_EQ(lower_st.st_gid, upper_target_st.st_gid);
+    EXPECT_EQ(lower_st.st_mode & 07777, upper_target_st.st_mode & 07777);
+    EXPECT_EQ(upper_source_st.st_ino, upper_target_st.st_ino);
+    EXPECT_EQ(0, overlay_temp_entry_count(env.work));
+}
+
 TEST(OverlayFsSemantics, HardlinkExistingMergedTargetFailsBeforeSourceCopyUp) {
     ScopedOverlayEnv scoped("overlayfs_hardlink_existing_target");
     const auto& env = scoped.env;

@@ -4,6 +4,27 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use system_error::SystemError;
 
+impl OvlInode {
+    pub(super) fn lower_positive(&self, name: &str) -> bool {
+        for lower in &self.lower_inodes {
+            match lower.find(name) {
+                Ok(found) => {
+                    // A metadata failure must not turn a possibly positive lower entry into a
+                    // pure-upper decision. Linux makes the same conservative choice for lower
+                    // lookup errors in ovl_lower_positive().
+                    return match Self::is_whiteout_inode_checked(&found) {
+                        Ok(is_whiteout) => !is_whiteout,
+                        Err(_) => true,
+                    };
+                }
+                Err(SystemError::ENOENT) | Err(SystemError::ENAMETOOLONG) => continue,
+                Err(_) => return true,
+            }
+        }
+        false
+    }
+}
+
 pub(super) fn find(
     inode: &OvlInode,
     name: &str,

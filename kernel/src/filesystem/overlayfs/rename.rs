@@ -55,8 +55,9 @@ pub(super) fn move_to(
         return Ok(());
     }
 
-    let source_needs_whiteout = source.has_lower();
-    if source_needs_whiteout && source.is_dir() {
+    let source_needs_whiteout = inode.lower_positive(old_name);
+    let source_has_lower_tree = source.is_dir() && source.has_lower();
+    if source_has_lower_tree {
         return Err(SystemError::EXDEV);
     }
 
@@ -84,6 +85,14 @@ pub(super) fn move_to(
     let mut upper_flags = flags;
     if target_had_whiteout {
         upper_flags.remove(RenameFlags::NOREPLACE);
+        if source_needs_whiteout {
+            return old_upper_dir.move_to(
+                old_name,
+                &new_upper_dir,
+                new_name,
+                RenameFlags::EXCHANGE,
+            );
+        }
         if source.is_dir() {
             old_upper_dir.move_to(old_name, &new_upper_dir, new_name, RenameFlags::EXCHANGE)?;
             OvlInode::cleanup_workdir_temp(&old_upper_dir, old_name);

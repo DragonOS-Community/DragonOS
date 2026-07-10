@@ -26,6 +26,7 @@ use super::{
     stats, trace, FuseConn, FusePendingState, FuseReplyCapacity, FuseReplyCapacitySource,
     FuseReplyContract, FuseRequest, FuseRequestCred,
 };
+use crate::filesystem::fuse::reply::FuseReply;
 
 impl FuseConn {
     fn is_high_priority_opcode(opcode: u32) -> bool {
@@ -96,7 +97,7 @@ impl FuseConn {
         opcode: u32,
         nodeid: u64,
         payload: &[u8],
-    ) -> Result<Vec<u8>, SystemError> {
+    ) -> Result<FuseReply, SystemError> {
         if opcode != FUSE_INIT {
             let cred = ProcessManager::current_pcb().cred();
             if !self.allow_current_process(&cred) {
@@ -113,7 +114,7 @@ impl FuseConn {
         opcode: u32,
         nodeid: u64,
         payload: &[u8],
-    ) -> Result<Vec<u8>, SystemError> {
+    ) -> Result<FuseReply, SystemError> {
         if opcode != FUSE_INIT {
             self.wait_initialized()?;
         }
@@ -128,7 +129,7 @@ impl FuseConn {
         nodeid: u64,
         payload: &[u8],
         req_cred: FuseRequestCred,
-    ) -> Result<Vec<u8>, SystemError> {
+    ) -> Result<FuseReply, SystemError> {
         if opcode != FUSE_INIT {
             self.wait_initialized()?;
         }
@@ -174,7 +175,7 @@ impl FuseConn {
         &self,
         opcode: u32,
         pending: Arc<FusePendingState>,
-    ) -> Result<Vec<u8>, SystemError> {
+    ) -> Result<FuseReply, SystemError> {
         match pending.wait_complete() {
             Err(SystemError::EINTR) | Err(SystemError::ERESTARTSYS) => {
                 if opcode != FUSE_INTERRUPT {

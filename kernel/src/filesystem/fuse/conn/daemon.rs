@@ -18,8 +18,51 @@ use super::super::protocol::{
 use super::{
     stats, trace, wait_with_recheck, FuseConn, FuseConnInner, FuseInitNegotiated, FuseRequest,
 };
+use crate::filesystem::fuse::reply::FuseReply;
 
 impl FuseConn {
+    fn claim_pending_reply<F>(
+        &self,
+        unique: u64,
+        pending: &Arc<super::FusePendingState>,
+        update: F,
+    ) -> Result<(), SystemError>
+    where
+        F: FnOnce(&mut FuseConnInner),
+    {
+        let mut g = self.inner.lock();
+        if !g.connected || (g.teardown_started && pending.opcode != FUSE_DESTROY) {
+            return Err(SystemError::ENOENT);
+        }
+        let Some(current) = g.processing.get(&unique) else {
+            return Err(SystemError::ENOENT);
+        };
+        if !Arc::ptr_eq(current, pending) {
+            return Err(SystemError::ENOENT);
+        }
+        g.processing.remove(&unique);
+        update(&mut g);
+        Ok(())
+    }
+
+    fn complete_claimed_reply_with_error(
+        pending: &Arc<super::FusePendingState>,
+        unique: u64,
+        error: SystemError,
+        reply_error: i32,
+        payload_len: usize,
+    ) {
+        if pending.complete(Err(error)) {
+            stats::on_fuse_reply_complete(pending.opcode, reply_error, payload_len);
+            trace::trace_fuse_reply_complete(
+                unique,
+                pending.opcode,
+                reply_error,
+                payload_len as u64,
+            );
+        }
+    }
+
     pub fn poll_mask(&self, have_pending: bool) -> EPollEventType {
         let mut events = EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM;
         let g = self.inner.lock();
@@ -304,7 +347,7 @@ impl FuseConn {
         minor: u32,
         opcode: u32,
         payload: &[u8],
-    ) -> Result<Vec<u8>, SystemError> {
+    ) -> Result<Option<Vec<u8>>, SystemError> {
         let (compat_len, full_len) = if minor < 4 && opcode == FUSE_STATFS {
             (Self::FUSE_COMPAT_STATFS_SIZE, size_of::<FuseStatfsOut>())
         } else if minor < 9
@@ -328,9 +371,9 @@ impl FuseConn {
                 .copy_from_slice(&payload[..Self::FUSE_COMPAT_ENTRY_OUT_SIZE]);
             normalized[size_of::<FuseEntryOut>()..]
                 .copy_from_slice(&payload[Self::FUSE_COMPAT_ENTRY_OUT_SIZE..compat_len]);
-            return Ok(normalized);
+            return Ok(Some(normalized));
         } else {
-            return Ok(payload.to_vec());
+            return Ok(None);
         };
 
         if payload.len() != compat_len {
@@ -338,18 +381,31 @@ impl FuseConn {
         }
         let mut normalized = vec![0u8; full_len];
         normalized[..compat_len].copy_from_slice(payload);
-        Ok(normalized)
+        Ok(Some(normalized))
     }
 
     pub fn write_reply(&self, data: &[u8]) -> Result<usize, SystemError> {
         if data.len() < core::mem::size_of::<FuseOutHeader>() {
             return Err(SystemError::EINVAL);
         }
-
         let out_hdr: FuseOutHeader = fuse_read_struct(data)?;
         if out_hdr.len as usize != data.len() {
             return Err(SystemError::EINVAL);
         }
+        stats::on_dev_fuse_input_copy(data.len() - core::mem::size_of::<FuseOutHeader>());
+        self.write_owned_reply(FuseReply::from_bytes(data.to_vec()))
+    }
+
+    pub(crate) fn write_owned_reply(&self, data: FuseReply) -> Result<usize, SystemError> {
+        if data.len() < core::mem::size_of::<FuseOutHeader>() {
+            return Err(SystemError::EINVAL);
+        }
+
+        let out_hdr: FuseOutHeader = fuse_read_struct(&data)?;
+        if out_hdr.len as usize != data.len() {
+            return Err(SystemError::EINVAL);
+        }
+        let from_virtiofs = data.is_virtiofs();
 
         if out_hdr.unique == 0 {
             let payload = &data[core::mem::size_of::<FuseOutHeader>()..];
@@ -369,18 +425,20 @@ impl FuseConn {
         }
 
         let (pending, negotiated_minor) = {
-            let mut g = self.inner.lock();
+            let g = self.inner.lock();
             if !g.connected {
                 return Err(SystemError::ENOENT);
             }
             let pending = g
                 .processing
-                .remove(&out_hdr.unique)
+                .get(&out_hdr.unique)
+                .cloned()
                 .ok_or(SystemError::ENOENT)?;
             (pending, g.init.minor)
         };
 
         let payload = &data[core::mem::size_of::<FuseOutHeader>()..];
+        let payload_len = payload.len();
         let error = out_hdr.error;
 
         if error != 0 {
@@ -402,13 +460,13 @@ impl FuseConn {
                     errno
                 );
             }
-            pending.complete(Err(e));
-            stats::on_fuse_reply_complete(pending.opcode, error, payload.len());
-            trace::trace_fuse_reply_complete(
+            self.claim_pending_reply(out_hdr.unique, &pending, |_| {})?;
+            Self::complete_claimed_reply_with_error(
+                &pending,
                 out_hdr.unique,
-                pending.opcode,
+                e,
                 error,
-                payload.len() as u64,
+                payload_len,
             );
             if matches!(pending.opcode, FUSE_INIT | FUSE_DESTROY) {
                 self.abort();
@@ -421,14 +479,14 @@ impl FuseConn {
                 Ok(v) => v,
                 Err(e) => {
                     let error = -e.to_posix_errno();
-                    stats::on_fuse_reply_complete(pending.opcode, error, payload.len());
-                    trace::trace_fuse_reply_complete(
+                    self.claim_pending_reply(out_hdr.unique, &pending, |_| {})?;
+                    Self::complete_claimed_reply_with_error(
+                        &pending,
                         out_hdr.unique,
-                        pending.opcode,
+                        e,
                         error,
-                        payload.len() as u64,
+                        payload_len,
                     );
-                    pending.complete(Err(e));
                     self.abort();
                     return Ok(data.len());
                 }
@@ -436,14 +494,14 @@ impl FuseConn {
 
             if init_out.major != FUSE_KERNEL_VERSION {
                 let error = -SystemError::EINVAL.to_posix_errno();
-                stats::on_fuse_reply_complete(pending.opcode, error, payload.len());
-                trace::trace_fuse_reply_complete(
+                self.claim_pending_reply(out_hdr.unique, &pending, |_| {})?;
+                Self::complete_claimed_reply_with_error(
+                    &pending,
                     out_hdr.unique,
-                    pending.opcode,
+                    SystemError::EINVAL,
                     error,
-                    payload.len() as u64,
+                    payload_len,
                 );
-                pending.complete(Err(SystemError::EINVAL));
                 self.abort();
                 return Ok(data.len());
             }
@@ -478,45 +536,43 @@ impl FuseConn {
             let negotiated_max_pages =
                 core::cmp::min(negotiated_max_pages_raw, max_pages_limit as u16);
 
-            {
-                let mut g = self.inner.lock();
-                if g.connected {
-                    // Align with Linux: only enable feature bits that are in the intersection of
-                    // daemon-supported and locally-requested flags. virtiofsd often sets
-                    // DO_READDIRPLUS etc. in the INIT reply; if adopted directly, it would
-                    // trigger READDIRPLUS + cache_child_from_entry, causing stale inode mappings.
-                    let enabled_flags = negotiated_flags & g.init_flags;
-                    g.initialized = true;
-                    g.init = FuseInitNegotiated {
-                        minor: negotiated_minor,
-                        max_readahead: init_out.max_readahead,
-                        max_write: capped_max_write as u32,
-                        time_gran: init_out.time_gran,
-                        max_pages: negotiated_max_pages,
-                        flags: enabled_flags,
-                    };
-                    self.reply_layout_minor
-                        .store(negotiated_minor, Ordering::Release);
-                }
-            }
+            self.claim_pending_reply(out_hdr.unique, &pending, |g| {
+                // Align with Linux: only enable feature bits that are in the intersection of
+                // daemon-supported and locally-requested flags. virtiofsd often sets
+                // DO_READDIRPLUS etc. in the INIT reply; if adopted directly, it would
+                // trigger READDIRPLUS + cache_child_from_entry, causing stale inode mappings.
+                let enabled_flags = negotiated_flags & g.init_flags;
+                g.initialized = true;
+                g.init = FuseInitNegotiated {
+                    minor: negotiated_minor,
+                    max_readahead: init_out.max_readahead,
+                    max_write: capped_max_write as u32,
+                    time_gran: init_out.time_gran,
+                    max_pages: negotiated_max_pages,
+                    flags: enabled_flags,
+                };
+                self.reply_layout_minor
+                    .store(negotiated_minor, Ordering::Release);
+            })?;
             self.init_wait.wakeup(None);
+        } else {
+            self.claim_pending_reply(out_hdr.unique, &pending, |_| {})?;
         }
 
         let normalized_payload = if pending.opcode == FUSE_INIT {
-            payload.to_vec()
+            None
         } else {
             match Self::normalize_compat_reply(negotiated_minor, pending.opcode, payload) {
                 Ok(payload) => payload,
                 Err(e) => {
                     let error = -e.to_posix_errno();
-                    stats::on_fuse_reply_complete(pending.opcode, error, payload.len());
-                    trace::trace_fuse_reply_complete(
+                    Self::complete_claimed_reply_with_error(
+                        &pending,
                         out_hdr.unique,
-                        pending.opcode,
+                        e,
                         error,
-                        payload.len() as u64,
+                        payload_len,
                     );
-                    pending.complete(Err(e));
                     if pending.opcode == FUSE_DESTROY {
                         self.abort();
                     }
@@ -524,14 +580,65 @@ impl FuseConn {
                 }
             }
         };
+        let normalized_payload_len = normalized_payload.as_ref().map(Vec::len);
 
-        stats::on_fuse_reply_complete(pending.opcode, 0, payload.len());
-        trace::trace_fuse_reply_complete(out_hdr.unique, pending.opcode, 0, payload.len() as u64);
-        pending.complete(Ok(normalized_payload));
+        let data_len = data.len();
+        let payload_reply = match data.narrow(core::mem::size_of::<FuseOutHeader>()..data_len) {
+            Ok(reply) => reply,
+            Err(e) => {
+                let error = -e.to_posix_errno();
+                Self::complete_claimed_reply_with_error(
+                    &pending,
+                    out_hdr.unique,
+                    e,
+                    error,
+                    payload_len,
+                );
+                if matches!(pending.opcode, FUSE_INIT | FUSE_DESTROY) {
+                    self.abort();
+                }
+                return Ok(data_len);
+            }
+        };
+        let payload_reply = if let Some(normalized) = normalized_payload {
+            match payload_reply.into_compat_bytes(normalized) {
+                Ok(reply) => reply,
+                Err(e) => {
+                    let error = -e.to_posix_errno();
+                    Self::complete_claimed_reply_with_error(
+                        &pending,
+                        out_hdr.unique,
+                        e,
+                        error,
+                        payload_len,
+                    );
+                    if pending.opcode == FUSE_DESTROY {
+                        self.abort();
+                    }
+                    return Ok(data_len);
+                }
+            }
+        } else {
+            payload_reply
+        };
+
+        let transferred = payload_reply.is_device_transfer();
+        if pending.complete(Ok(payload_reply)) {
+            stats::on_fuse_reply_complete(pending.opcode, 0, payload_len);
+            if transferred {
+                stats::on_fuse_reply_payload_transfer(pending.opcode, payload_len);
+            } else {
+                stats::on_fuse_reply_payload_copy(pending.opcode, payload_len);
+                if from_virtiofs {
+                    stats::on_virtiofs_compat_copy(normalized_payload_len.unwrap_or(payload_len));
+                }
+            }
+            trace::trace_fuse_reply_complete(out_hdr.unique, pending.opcode, 0, payload_len as u64);
+        }
         if pending.opcode == FUSE_DESTROY {
             self.abort();
         }
-        Ok(data.len())
+        Ok(data_len)
     }
 
     /// Linux supplies an output header buffer for DESTROY, while virtiofsd completes the
@@ -554,7 +661,7 @@ impl FuseConn {
 
         stats::on_fuse_reply_complete(FUSE_DESTROY, 0, 0);
         trace::trace_fuse_reply_complete(unique, FUSE_DESTROY, 0, 0);
-        pending.complete(Ok(Vec::new()));
+        pending.complete(Ok(FuseReply::from_bytes(Vec::new())));
         self.abort();
         Ok(())
     }
@@ -626,7 +733,7 @@ pub(super) fn normalize_compat_reply_for_test(
     opcode: u32,
     payload: &[u8],
 ) -> Result<Vec<u8>, SystemError> {
-    FuseConn::normalize_compat_reply(minor, opcode, payload)
+    FuseConn::normalize_compat_reply(minor, opcode, payload)?.ok_or(SystemError::EINVAL)
 }
 
 #[cfg(test)]
@@ -635,6 +742,8 @@ mod tests {
     use core::{mem::size_of, sync::atomic::Ordering};
 
     use system_error::SystemError;
+
+    use crate::filesystem::fuse::protocol::FUSE_FORGET;
 
     use super::super::request::queue_test_request;
     use super::*;

@@ -35,16 +35,17 @@ use super::super::{
 };
 use super::{
     queue::{create_queue, wait_transport_reset_complete, VirtioFsQueue},
-    VIRTIOFS_MAX_REQUEST_SIZE, VIRTIOFS_RSP_BUF_SIZE,
+    reply::{ResponseBufferPool, VirtioFsReplyStorage},
+    VIRTIOFS_MAX_REQUEST_SIZE,
 };
+use crate::filesystem::fuse::reply::FuseReply;
 
 const FUSE_HEADER_OVERHEAD: usize = 4;
 const FUSE_MAX_MAX_PAGES: usize = 256;
-const VIRTIOFS_RSP_POOL_MAX_BUFFERS: usize = 16;
-const VIRTIOFS_RSP_POOL_MAX_CAPACITY_BYTES: usize =
-    VIRTIOFS_RSP_BUF_SIZE * VIRTIOFS_RSP_POOL_MAX_BUFFERS;
 const VIRTIOFS_POLL_NS: i64 = 1_000_000;
 const VIRTIOFS_PUMP_BUDGET: usize = 64;
+const VIRTIOFS_COMPLETE_BUDGET: usize = 64;
+const VIRTIOFS_HIPRIO_COMPLETE_BUDGET: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueueKind {
@@ -129,82 +130,16 @@ struct QueueBlockState {
     completion_seen: bool,
 }
 
-#[derive(Debug)]
-struct ResponseBufferPool {
-    buffers: Vec<DeviceOutputBuffer>,
-    retained_capacity_bytes: usize,
-}
-
-impl ResponseBufferPool {
-    fn new() -> Self {
-        Self {
-            buffers: Vec::with_capacity(VIRTIOFS_RSP_POOL_MAX_BUFFERS),
-            retained_capacity_bytes: 0,
-        }
-    }
-
-    fn acquire(&mut self, opcode: u32, len: usize) -> Result<DeviceOutputBuffer, SystemError> {
-        let best_fit = self
-            .buffers
-            .iter()
-            .enumerate()
-            .filter(|(_, buf)| buf.allocation_len() >= len)
-            .min_by_key(|(_, buf)| buf.allocation_len())
-            .map(|(index, _)| index);
-        if let Some(index) = best_fit {
-            let mut buf = self.buffers.swap_remove(index);
-            self.retained_capacity_bytes = self
-                .retained_capacity_bytes
-                .checked_sub(buf.allocation_len())
-                .expect("response pool capacity accounting underflow");
-            buf.prepare(len, response_buffer_virt_to_phys)
-                .map_err(|_| SystemError::EIO)?;
-            stats::on_virtiofs_response_buffer_reuse(opcode, len);
-            return Ok(buf);
-        }
-
-        let buf = DeviceOutputBuffer::new(len, response_buffer_virt_to_phys)
-            .map_err(|_| SystemError::EIO)?;
-        stats::on_virtiofs_response_buffer_alloc(opcode, len);
-        stats::on_virtiofs_response_buffer_zero(opcode, len);
-        Ok(buf)
-    }
-
-    fn release(&mut self, mut buf: DeviceOutputBuffer, reusable: bool) {
-        let capacity = buf.allocation_len();
-        let next_capacity = self.retained_capacity_bytes.checked_add(capacity);
-        let within_limits = reusable
-            && buf.recycle().is_ok()
-            && buf.allocation_len() <= VIRTIOFS_RSP_BUF_SIZE
-            && capacity <= VIRTIOFS_RSP_BUF_SIZE
-            && self.buffers.len() < VIRTIOFS_RSP_POOL_MAX_BUFFERS
-            && next_capacity.is_some_and(|total| total <= VIRTIOFS_RSP_POOL_MAX_CAPACITY_BYTES);
-
-        if !within_limits {
-            stats::on_virtiofs_response_pool_drop();
-            return;
-        }
-
-        self.retained_capacity_bytes = next_capacity.expect("checked above");
-        self.buffers.push(buf);
-    }
-
-    fn clear(&mut self) {
-        self.buffers.clear();
-        self.retained_capacity_bytes = 0;
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReplyCreditBlockedHead {
+    token: u16,
+    required_capacity: usize,
 }
 
 fn response_buffer_virt_to_phys(vaddr: usize) -> Option<usize> {
     // SAFETY: DeviceOutputBuffer supplies the address of its live Box allocation. The kernel
     // allocator obtains slab and buddy memory from the architecture direct map.
     unsafe { MMArch::virt_2_phys(VirtAddr::new(vaddr)) }.map(|paddr| paddr.data())
-}
-
-impl Drop for ResponseBufferPool {
-    fn drop(&mut self) {
-        self.clear();
-    }
 }
 
 fn cleanup_created_queues(
@@ -299,8 +234,11 @@ struct VirtioFsBridgeContext {
     request_inflight: Vec<BTreeMap<u16, InflightReq>>,
     response_pool: ResponseBufferPool,
     next_request_slot: usize,
+    next_completion_slot: usize,
     hiprio_blocked: QueueBlockState,
     request_blocked: Vec<QueueBlockState>,
+    hiprio_reply_blocked: Option<ReplyCreditBlockedHead>,
+    request_reply_blocked: Vec<Option<ReplyCreditBlockedHead>>,
 }
 
 impl VirtioFsBridgeContext {
@@ -317,8 +255,50 @@ impl VirtioFsBridgeContext {
     }
 
     fn has_completion_available(&self) -> bool {
-        self.hiprio_vq.as_ref().is_some_and(|queue| queue.can_pop())
-            || self.request_vqs.iter().any(|queue| queue.can_pop())
+        let hiprio = self.hiprio_vq.as_ref().is_some_and(|queue| {
+            queue.can_pop()
+                && !self.hiprio_reply_blocked.is_some_and(|blocked| {
+                    queue
+                        .peek_used()
+                        .is_some_and(|token| token == blocked.token)
+                })
+        });
+        hiprio
+            || self.request_vqs.iter().enumerate().any(|(slot, queue)| {
+                queue.can_pop()
+                    && !self.request_reply_blocked.get(slot).is_some_and(|blocked| {
+                        blocked.is_some_and(|blocked| {
+                            queue
+                                .peek_used()
+                                .is_some_and(|token| token == blocked.token)
+                        })
+                    })
+            })
+    }
+
+    fn reply_blocked_mut(
+        &mut self,
+        kind: QueueKind,
+    ) -> Result<&mut Option<ReplyCreditBlockedHead>, SystemError> {
+        match kind {
+            QueueKind::Hiprio => Ok(&mut self.hiprio_reply_blocked),
+            QueueKind::Request(slot) => self
+                .request_reply_blocked
+                .get_mut(slot)
+                .ok_or(SystemError::EINVAL),
+        }
+    }
+
+    fn clear_reply_credit_blocked(&mut self) {
+        self.hiprio_reply_blocked = None;
+        for blocked in &mut self.request_reply_blocked {
+            *blocked = None;
+        }
+    }
+
+    fn has_reply_credit_blocked(&self) -> bool {
+        self.hiprio_reply_blocked.is_some()
+            || self.request_reply_blocked.iter().any(Option::is_some)
     }
 
     fn has_queue_full_blocked(&self) -> bool {
@@ -782,7 +762,11 @@ impl VirtioFsBridgeContext {
                         return Ok(true);
                     }
                 };
-                let rsp = match self.response_pool.acquire(pending.opcode, capacity.bytes) {
+                let rsp = match self.response_pool.acquire(
+                    pending.opcode,
+                    capacity.bytes,
+                    response_buffer_virt_to_phys,
+                ) {
                     Ok(rsp) => rsp,
                     Err(e) => {
                         self.terminate_pending_with_error(&pending, e);
@@ -989,6 +973,42 @@ impl VirtioFsBridgeContext {
             }
         };
 
+        let response_capacity = match kind {
+            QueueKind::Hiprio => self
+                .hiprio_inflight
+                .get(&token)
+                .and_then(|req| req.rsp.as_ref())
+                .map(DeviceOutputBuffer::allocation_len),
+            QueueKind::Request(slot) => self
+                .request_inflight
+                .get(slot)
+                .and_then(|map| map.get(&token))
+                .and_then(|req| req.rsp.as_ref())
+                .map(DeviceOutputBuffer::allocation_len),
+        };
+        let reservation = if let Some(required_capacity) = response_capacity {
+            match self.response_pool.reserve(required_capacity) {
+                Some(reservation) => {
+                    *self.reply_blocked_mut(kind)? = None;
+                    Some(reservation)
+                }
+                None => {
+                    let blocked = ReplyCreditBlockedHead {
+                        token,
+                        required_capacity,
+                    };
+                    let state = self.reply_blocked_mut(kind)?;
+                    if *state != Some(blocked) {
+                        stats::on_virtiofs_reply_credit_blocked();
+                        *state = Some(blocked);
+                    }
+                    return Ok(false);
+                }
+            }
+        } else {
+            None
+        };
+
         let mut inflight = self.take_inflight(kind, token)?;
         let pending = inflight
             .pending
@@ -1090,6 +1110,8 @@ impl VirtioFsBridgeContext {
             .rsp
             .take()
             .expect("reply-bearing inflight request must own a response buffer");
+        let reservation = reservation
+            .expect("reply-bearing completion reserved retention capacity before pop_used");
         let capacity = rsp_buf.writable_len();
         stats::on_virtiofs_response_completed(opcode, capacity, used_len);
         // SAFETY: pop_used succeeded for this exact token and DMA identity, so the descriptor is
@@ -1130,13 +1152,22 @@ impl VirtioFsBridgeContext {
                 unique, opcode, used_len
             );
             self.terminate_pending_with_error(&pending, SystemError::EIO);
-            self.response_pool.release(rsp_buf, false);
+            self.response_pool.release(rsp_buf, true);
             return Ok(true);
         }
 
-        let reusable = match self.conn.write_reply(reply) {
-            Ok(_) => true,
-            Err(SystemError::ENOENT) if opcode != FUSE_DESTROY => true,
+        let storage = match VirtioFsReplyStorage::from_completed(rsp_buf, reservation, 0..used_len)
+        {
+            Ok(storage) => storage,
+            Err(_) => {
+                self.terminate_pending_with_error(&pending, SystemError::EIO);
+                return Ok(true);
+            }
+        };
+        let owned_reply = FuseReply::from_virtiofs(storage);
+        match self.conn.write_owned_reply(owned_reply) {
+            Ok(_) => {}
+            Err(SystemError::ENOENT) if opcode != FUSE_DESTROY => {}
             Err(e) => {
                 // Linux virtio-fs always ends a completed request from the used ring.
                 // Keep that behavior here: fail this unique instead of exiting bridge loop.
@@ -1150,17 +1181,18 @@ impl VirtioFsBridgeContext {
                     unique, opcode, e, completion_err
                 );
                 self.terminate_pending_with_error(&pending, completion_err);
-                false
             }
-        };
-        self.response_pool.release(rsp_buf, reusable);
+        }
         Ok(true)
     }
 
     fn drain_completions(&mut self) -> Result<usize, SystemError> {
         let mut completed = 0usize;
         let mut hiprio_completed = 0usize;
-        while self.pop_one_used(QueueKind::Hiprio)? {
+        while hiprio_completed < VIRTIOFS_HIPRIO_COMPLETE_BUDGET
+            && completed < VIRTIOFS_COMPLETE_BUDGET
+            && self.pop_one_used(QueueKind::Hiprio)?
+        {
             hiprio_completed += 1;
             completed += 1;
         }
@@ -1168,14 +1200,24 @@ impl VirtioFsBridgeContext {
             self.mark_queue_completion_seen(QueueKind::Hiprio);
         }
 
-        for slot in 0..self.request_vqs.len() {
-            let mut queue_completed = 0usize;
-            while self.pop_one_used(QueueKind::Request(slot))? {
-                queue_completed += 1;
-                completed += 1;
+        let queue_count = self.request_vqs.len();
+        while queue_count != 0 && completed < VIRTIOFS_COMPLETE_BUDGET {
+            let start = self.next_completion_slot % queue_count;
+            self.next_completion_slot = (start + 1) % queue_count;
+            let mut round_progress = false;
+            for offset in 0..queue_count {
+                if completed == VIRTIOFS_COMPLETE_BUDGET {
+                    break;
+                }
+                let slot = (start + offset) % queue_count;
+                if self.pop_one_used(QueueKind::Request(slot))? {
+                    self.mark_queue_completion_seen(QueueKind::Request(slot));
+                    completed += 1;
+                    round_progress = true;
+                }
             }
-            if queue_completed != 0 {
-                self.mark_queue_completion_seen(QueueKind::Request(slot));
+            if !round_progress {
+                break;
             }
         }
 
@@ -1197,8 +1239,12 @@ impl VirtioFsBridgeContext {
             return Some(stats::VirtioFsBridgeWaitExit::Teardown);
         }
 
-        let completion_event = events & stats::VirtioFsBridgeWakeSource::Completion.bit() != 0;
-        if completion_event || self.has_completion_available() {
+        let reply_released = events & stats::VirtioFsBridgeWakeSource::ReplyReleased.bit() != 0;
+        if reply_released {
+            return Some(stats::VirtioFsBridgeWaitExit::Completion);
+        }
+
+        if self.has_completion_available() {
             return Some(stats::VirtioFsBridgeWaitExit::Completion);
         }
 
@@ -1217,7 +1263,8 @@ impl VirtioFsBridgeContext {
         let known_events = stats::VirtioFsBridgeWakeSource::Request.bit()
             | stats::VirtioFsBridgeWakeSource::Completion.bit()
             | stats::VirtioFsBridgeWakeSource::Teardown.bit()
-            | stats::VirtioFsBridgeWakeSource::Disconnect.bit();
+            | stats::VirtioFsBridgeWakeSource::Disconnect.bit()
+            | stats::VirtioFsBridgeWakeSource::ReplyReleased.bit();
         if events & !known_events != 0 {
             return Some(stats::VirtioFsBridgeWaitExit::Spurious);
         }
@@ -1227,6 +1274,12 @@ impl VirtioFsBridgeContext {
 
     fn wait_for_event(&mut self) {
         if !self.irq_wake_enabled {
+            if self.has_reply_credit_blocked() {
+                // Polling itself guarantees the retry. Do not leave the release gate armed or
+                // every later consumer Drop would signal a WaitQueue nobody is sleeping on.
+                self.response_pool.clear_credit_waiting();
+                self.clear_reply_credit_blocked();
+            }
             stats::on_virtiofs_idle_sleep(VIRTIOFS_POLL_NS);
             Self::poll_pause();
             return;
@@ -1242,6 +1295,13 @@ impl VirtioFsBridgeContext {
         stats::on_virtiofs_bridge_wait();
         let reason = conn.wait_bridge_until(|events| self.bridge_wait_exit_reason(&conn, events));
         let events = conn.take_bridge_wake_events();
+        if events & stats::VirtioFsBridgeWakeSource::ReplyReleased.bit() != 0 {
+            if self.has_reply_credit_blocked() {
+                stats::on_virtiofs_reply_credit_blocked_wake();
+            }
+            self.response_pool.clear_credit_waiting();
+            self.clear_reply_credit_blocked();
+        }
         stats::on_virtiofs_bridge_wait_exit(reason);
         trace::trace_virtiofs_bridge_wait_exit(reason.trace_id(), events);
     }
@@ -1518,10 +1578,10 @@ impl VirtioFsBridgeContext {
         }
         self.clear_queue_full_blocked_stats();
         self.instance.clear_bridge_wake(self.session_id);
+        self.response_pool.close();
         if !self.reset_device_and_unset_queues() {
             // Idle pooled buffers are not visible to the device. Release them before the
             // reset-timeout quarantine keeps the transport, queues and inflight DMA buffers alive.
-            self.response_pool.clear();
             self.fail_unfinished_preserving_inflight_dma(SystemError::ENOTCONN);
             if !self
                 .instance
@@ -1743,6 +1803,7 @@ pub(super) fn start_bridge(
     instance.install_bridge_wake(session_id, &conn);
     let irq_wake_enabled = instance.enable_irq_wake();
     let request_queue_count = request_vqs.len();
+    let response_pool = ResponseBufferPool::new(&conn);
     let ctx = Box::new(VirtioFsBridgeContext {
         instance,
         conn,
@@ -1759,10 +1820,15 @@ pub(super) fn start_bridge(
         request_vqs,
         hiprio_pending: VecDeque::new(),
         hiprio_inflight: BTreeMap::new(),
-        response_pool: ResponseBufferPool::new(),
+        response_pool,
         next_request_slot: 0,
+        next_completion_slot: 0,
         hiprio_blocked: QueueBlockState::default(),
         request_blocked: core::iter::repeat_with(QueueBlockState::default)
+            .take(request_queue_count)
+            .collect(),
+        hiprio_reply_blocked: None,
+        request_reply_blocked: core::iter::repeat_with(|| None)
             .take(request_queue_count)
             .collect(),
     });
@@ -1792,15 +1858,11 @@ pub(super) fn start_bridge(
 
 #[cfg(test)]
 mod tests {
-    use alloc::{vec, vec::Vec};
+    use alloc::vec;
 
     use system_error::SystemError;
 
-    use super::{
-        QueueBlockState, ResponseBufferPool, VirtioFsBridgeContext, VIRTIOFS_RSP_BUF_SIZE,
-        VIRTIOFS_RSP_POOL_MAX_BUFFERS,
-    };
-    use crate::filesystem::fuse::protocol::FUSE_LOOKUP;
+    use super::{QueueBlockState, VirtioFsBridgeContext};
 
     fn block_state(blocked: bool, completion_seen: bool) -> QueueBlockState {
         QueueBlockState {
@@ -1923,112 +1985,5 @@ mod tests {
             &[],
             42
         ));
-    }
-
-    #[test]
-    fn response_pool_reuses_exact_length_without_reinitializing() {
-        let mut pool = ResponseBufferPool::new();
-        let mut buf = pool.acquire(FUSE_LOOKUP, 128).unwrap();
-        let ptr = unsafe {
-            buf.submission_dma_slice(super::response_buffer_virt_to_phys)
-                .unwrap()
-                .as_ptr()
-        };
-        pool.release(buf, true);
-
-        assert_eq!(pool.buffers.len(), 1);
-        let mut reused = pool.acquire(FUSE_LOOKUP, 128).unwrap();
-        let reused_ptr = unsafe {
-            reused
-                .submission_dma_slice(super::response_buffer_virt_to_phys)
-                .unwrap()
-                .as_ptr()
-        };
-        assert_eq!(reused_ptr, ptr);
-        assert_eq!(reused.writable_len(), 128);
-        assert!(pool.buffers.is_empty());
-        assert_eq!(pool.retained_capacity_bytes, 0);
-    }
-
-    #[test]
-    fn response_pool_best_fit_reuses_larger_capacity_without_exposing_tail() {
-        let mut pool = ResponseBufferPool::new();
-        let mut large = pool.acquire(FUSE_LOOKUP, 192).unwrap();
-        let ptr = unsafe {
-            large
-                .submission_dma_slice(super::response_buffer_virt_to_phys)
-                .unwrap()
-                .as_ptr()
-        };
-        pool.release(large, true);
-
-        let mut reused = pool.acquire(FUSE_LOOKUP, 64).unwrap();
-        let reused_ptr = unsafe {
-            reused
-                .submission_dma_slice(super::response_buffer_virt_to_phys)
-                .unwrap()
-                .as_ptr()
-        };
-        assert_eq!(reused_ptr, ptr);
-        assert_eq!(reused.writable_len(), 64);
-        assert_eq!(reused.allocation_len(), 192);
-        assert_eq!(pool.retained_capacity_bytes, 0);
-    }
-
-    #[test]
-    fn response_pool_reuses_retained_allocation_when_writable_length_grows() {
-        let mut pool = ResponseBufferPool::new();
-        let mut buf = pool.acquire(FUSE_LOOKUP, 256).unwrap();
-        let ptr = unsafe {
-            buf.submission_dma_slice(super::response_buffer_virt_to_phys)
-                .unwrap()
-                .as_ptr()
-        };
-        pool.release(buf, true);
-
-        let mut reused = pool.acquire(FUSE_LOOKUP, 128).unwrap();
-        let reused_ptr = unsafe {
-            reused
-                .submission_dma_slice(super::response_buffer_virt_to_phys)
-                .unwrap()
-                .as_ptr()
-        };
-        assert_eq!(reused_ptr, ptr);
-        assert_eq!(reused.writable_len(), 128);
-    }
-
-    #[test]
-    fn response_pool_rejects_excess_capacity_and_nonreusable_buffers() {
-        let mut pool = ResponseBufferPool::new();
-        let oversized_capacity = pool
-            .acquire(FUSE_LOOKUP, VIRTIOFS_RSP_BUF_SIZE + 1)
-            .unwrap();
-        pool.release(oversized_capacity, true);
-        let nonreusable = pool.acquire(FUSE_LOOKUP, 16).unwrap();
-        pool.release(nonreusable, false);
-
-        assert!(pool.buffers.is_empty());
-        assert_eq!(pool.retained_capacity_bytes, 0);
-    }
-
-    #[test]
-    fn response_pool_enforces_buffer_count_and_checked_capacity() {
-        let mut pool = ResponseBufferPool::new();
-        let mut buffers = Vec::new();
-        for _ in 0..=VIRTIOFS_RSP_POOL_MAX_BUFFERS {
-            buffers.push(pool.acquire(FUSE_LOOKUP, 1).unwrap());
-        }
-        for buf in buffers {
-            pool.release(buf, true);
-        }
-        assert_eq!(pool.buffers.len(), VIRTIOFS_RSP_POOL_MAX_BUFFERS);
-
-        pool.clear();
-        pool.retained_capacity_bytes = usize::MAX;
-        let buf = pool.acquire(FUSE_LOOKUP, 1).unwrap();
-        pool.retained_capacity_bytes = usize::MAX;
-        pool.release(buf, true);
-        assert!(pool.buffers.is_empty());
-        pool.retained_capacity_bytes = 0;
     }
 }

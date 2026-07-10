@@ -30,6 +30,7 @@ use super::protocol::{
     FUSE_PARALLEL_DIROPS, FUSE_POSIX_ACL, FUSE_POSIX_LOCKS, FUSE_READDIRPLUS_AUTO,
     FUSE_REMOVEXATTR, FUSE_SETXATTR, FUSE_SUBMOUNTS,
 };
+use super::reply::FuseReply;
 use super::{stats, trace};
 
 mod daemon;
@@ -190,8 +191,15 @@ impl FuseRequestCred {
 pub struct FusePendingState {
     unique: u64,
     opcode: u32,
-    response: Mutex<Option<Result<Vec<u8>, SystemError>>>,
+    response: Mutex<PendingCompletion>,
     wait: WaitQueue,
+}
+
+#[derive(Debug)]
+enum PendingCompletion {
+    Waiting,
+    Ready(Result<FuseReply, SystemError>),
+    Consumed,
 }
 
 impl FusePendingState {
@@ -199,7 +207,7 @@ impl FusePendingState {
         Self {
             unique,
             opcode,
-            response: Mutex::new(None),
+            response: Mutex::new(PendingCompletion::Waiting),
             wait: WaitQueue::default(),
         }
     }
@@ -208,22 +216,26 @@ impl FusePendingState {
         self.unique
     }
 
-    pub fn complete(&self, v: Result<Vec<u8>, SystemError>) {
+    pub fn complete(&self, v: Result<FuseReply, SystemError>) -> bool {
         let mut guard = self.response.lock();
-        if guard.is_some() {
+        if !matches!(*guard, PendingCompletion::Waiting) {
             // Duplicate replies are ignored (Linux does similarly).
-            return;
+            return false;
         }
-        *guard = Some(v);
+        *guard = PendingCompletion::Ready(v);
         drop(guard);
         self.wait.wakeup(None);
+        true
     }
 
-    pub fn wait_complete(&self) -> Result<Vec<u8>, SystemError> {
+    pub fn wait_complete(&self) -> Result<FuseReply, SystemError> {
         wait_with_recheck(&self.wait, || {
             let mut guard = self.response.lock();
-            if let Some(res) = guard.take() {
-                return Ok(Some(res));
+            if matches!(*guard, PendingCompletion::Ready(_)) {
+                let ready = core::mem::replace(&mut *guard, PendingCompletion::Consumed);
+                if let PendingCompletion::Ready(res) = ready {
+                    return Ok(Some(res));
+                }
             }
             Ok(None)
         })?

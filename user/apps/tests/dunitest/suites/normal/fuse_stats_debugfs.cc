@@ -153,6 +153,9 @@ TEST(FuseStatsDebugFs, StatsFileExistsAndSupportsOffsetReads) {
     expect_field(whole, "virtqueue_not_ready_total ");
     expect_field(whole, "bridge_request_clone_bytes ");
     expect_field(whole, "response_buffer_alloc_bytes ");
+    expect_field(whole, "response_buffer_reuse_count ");
+    expect_field(whole, "response_buffer_zero_bytes ");
+    expect_field(whole, "response_pool_dropped_count ");
     expect_field(whole, "bytes_submitted_total ");
     expect_field(whole, "bytes_completed_total ");
     expect_field(whole, "bridge_waits_total ");
@@ -174,6 +177,12 @@ TEST(FuseStatsDebugFs, StatsFileExistsAndSupportsOffsetReads) {
     expect_field(whole, "bridge_queue_full_retry_success_total ");
     expect_field(whole, "hiprio_queue_full_total ");
     expect_field(whole, "request_queue_full_total ");
+    expect_field(whole, "[virtiofs_opcode]\n");
+    expect_field(whole, "opcode_1_requests_total ");
+    expect_field(whole, "opcode_15_request_bridge_copy_bytes ");
+    expect_field(whole, "opcode_16_response_buffer_alloc_count ");
+    expect_field(whole, "opcode_16_response_buffer_zero_bytes ");
+    expect_field(whole, "opcode_63_reply_payload_copy_bytes ");
 
     EXPECT_GE(parse_counter(whole, "device_queue_depth_max"), 0);
     EXPECT_GE(parse_counter(whole, "hiprio_vring_size_configured"), 0);

@@ -1,7 +1,17 @@
 use alloc::{format, string::String};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::{
+    fmt::Write,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+};
 
 const BATCH_BUCKETS: usize = 5;
+const OPCODE_BUCKETS: usize = 64;
+const OPCODE_OVERFLOW_BUCKET: usize = OPCODE_BUCKETS - 1;
+
+// Detailed copy/allocation counters are opt-in so their atomic RMWs do not
+// perturb the normal virtio-fs hot path. Reading the debugfs snapshot enables
+// them for subsequent operations in the current boot.
+static DETAILED_STATS_ENABLED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FuseStatsSnapshot {
@@ -174,9 +184,39 @@ static BRIDGE_REQUEST_CLONE_COUNT: AtomicU64 = AtomicU64::new(0);
 static BRIDGE_REQUEST_CLONE_BYTES: AtomicU64 = AtomicU64::new(0);
 static RESPONSE_BUFFER_ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
 static RESPONSE_BUFFER_ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
+static RESPONSE_BUFFER_REUSE_COUNT: AtomicU64 = AtomicU64::new(0);
+static RESPONSE_BUFFER_REUSE_BYTES: AtomicU64 = AtomicU64::new(0);
+static RESPONSE_BUFFER_ZERO_COUNT: AtomicU64 = AtomicU64::new(0);
+static RESPONSE_BUFFER_ZERO_BYTES: AtomicU64 = AtomicU64::new(0);
+static RESPONSE_POOL_DROPPED_COUNT: AtomicU64 = AtomicU64::new(0);
 static RESPONSE_BUFFER_WASTE_BYTES: AtomicU64 = AtomicU64::new(0);
 static BYTES_SUBMITTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BYTES_COMPLETED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+static OPCODE_REQUESTS_TOTAL: [AtomicU64; OPCODE_BUCKETS] =
+    [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
+static OPCODE_REQUEST_BYTES_TOTAL: [AtomicU64; OPCODE_BUCKETS] =
+    [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
+static OPCODE_REQUEST_BRIDGE_COPY_COUNT: [AtomicU64; OPCODE_BUCKETS] =
+    [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
+static OPCODE_REQUEST_BRIDGE_COPY_BYTES: [AtomicU64; OPCODE_BUCKETS] =
+    [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
+static OPCODE_RESPONSE_BUFFER_ALLOC_COUNT: [AtomicU64; OPCODE_BUCKETS] =
+    [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
+static OPCODE_RESPONSE_BUFFER_ALLOC_BYTES: [AtomicU64; OPCODE_BUCKETS] =
+    [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
+static OPCODE_RESPONSE_BUFFER_REUSE_COUNT: [AtomicU64; OPCODE_BUCKETS] =
+    [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
+static OPCODE_RESPONSE_BUFFER_REUSE_BYTES: [AtomicU64; OPCODE_BUCKETS] =
+    [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
+static OPCODE_RESPONSE_BUFFER_ZERO_COUNT: [AtomicU64; OPCODE_BUCKETS] =
+    [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
+static OPCODE_RESPONSE_BUFFER_ZERO_BYTES: [AtomicU64; OPCODE_BUCKETS] =
+    [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
+static OPCODE_REPLY_PAYLOAD_COPY_COUNT: [AtomicU64; OPCODE_BUCKETS] =
+    [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
+static OPCODE_REPLY_PAYLOAD_COPY_BYTES: [AtomicU64; OPCODE_BUCKETS] =
+    [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
 
 static PUMP_BATCH: [AtomicU64; BATCH_BUCKETS] = [const { AtomicU64::new(0) }; BATCH_BUCKETS];
 static COMPLETE_BATCH: [AtomicU64; BATCH_BUCKETS] = [const { AtomicU64::new(0) }; BATCH_BUCKETS];
@@ -221,6 +261,16 @@ fn saturating_sub(counter: &AtomicU64, value: u64) {
 #[inline]
 fn inc(counter: &AtomicU64) {
     add(counter, 1);
+}
+
+#[inline]
+fn opcode_bucket(opcode: u32) -> usize {
+    core::cmp::min(opcode as usize, OPCODE_OVERFLOW_BUCKET)
+}
+
+#[inline]
+fn detailed_stats_enabled() -> bool {
+    DETAILED_STATS_ENABLED.load(Ordering::Relaxed)
 }
 
 #[inline]
@@ -280,10 +330,15 @@ pub fn on_fuse_read_buffer_too_small() {
 }
 
 #[inline]
-pub fn on_fuse_reply_complete(error: i32, payload_len: usize) {
+pub fn on_fuse_reply_complete(opcode: u32, error: i32, payload_len: usize) {
     if error == 0 {
         inc(&REQUESTS_REPLIED_OK_TOTAL);
         add(&BYTES_REPLY_PAYLOAD_CLONED_TOTAL, payload_len as u64);
+        if detailed_stats_enabled() {
+            let bucket = opcode_bucket(opcode);
+            inc(&OPCODE_REPLY_PAYLOAD_COPY_COUNT[bucket]);
+            add(&OPCODE_REPLY_PAYLOAD_COPY_BYTES[bucket], payload_len as u64);
+        }
     } else {
         inc(&REQUESTS_REPLIED_ERR_TOTAL);
     }
@@ -420,15 +475,46 @@ pub fn on_virtiofs_complete_batch(count: usize) {
 }
 
 #[inline]
-pub fn on_virtiofs_request_cloned(len: usize) {
-    inc(&BRIDGE_REQUEST_CLONE_COUNT);
-    add(&BRIDGE_REQUEST_CLONE_BYTES, len as u64);
+pub fn on_virtiofs_response_buffer_alloc(opcode: u32, len: usize) {
+    inc(&RESPONSE_BUFFER_ALLOC_COUNT);
+    add(&RESPONSE_BUFFER_ALLOC_BYTES, len as u64);
+    if detailed_stats_enabled() {
+        let bucket = opcode_bucket(opcode);
+        inc(&OPCODE_RESPONSE_BUFFER_ALLOC_COUNT[bucket]);
+        add(&OPCODE_RESPONSE_BUFFER_ALLOC_BYTES[bucket], len as u64);
+    }
 }
 
 #[inline]
-pub fn on_virtiofs_response_buffer_alloc(len: usize) {
-    inc(&RESPONSE_BUFFER_ALLOC_COUNT);
-    add(&RESPONSE_BUFFER_ALLOC_BYTES, len as u64);
+pub fn on_virtiofs_response_buffer_reuse(opcode: u32, len: usize) {
+    if !detailed_stats_enabled() {
+        return;
+    }
+    inc(&RESPONSE_BUFFER_REUSE_COUNT);
+    add(&RESPONSE_BUFFER_REUSE_BYTES, len as u64);
+    let bucket = opcode_bucket(opcode);
+    inc(&OPCODE_RESPONSE_BUFFER_REUSE_COUNT[bucket]);
+    add(&OPCODE_RESPONSE_BUFFER_REUSE_BYTES[bucket], len as u64);
+}
+
+#[inline]
+pub fn on_virtiofs_response_buffer_zero(opcode: u32, len: usize) {
+    if !detailed_stats_enabled() {
+        return;
+    }
+    inc(&RESPONSE_BUFFER_ZERO_COUNT);
+    add(&RESPONSE_BUFFER_ZERO_BYTES, len as u64);
+    let bucket = opcode_bucket(opcode);
+    inc(&OPCODE_RESPONSE_BUFFER_ZERO_COUNT[bucket]);
+    add(&OPCODE_RESPONSE_BUFFER_ZERO_BYTES[bucket], len as u64);
+}
+
+#[inline]
+pub fn on_virtiofs_response_pool_drop() {
+    if !detailed_stats_enabled() {
+        return;
+    }
+    inc(&RESPONSE_POOL_DROPPED_COUNT);
 }
 
 #[inline]
@@ -437,9 +523,14 @@ pub fn on_virtiofs_response_buffer_waste(len: usize) {
 }
 
 #[inline]
-pub fn on_virtiofs_submitted(req_len: usize) {
+pub fn on_virtiofs_submitted(opcode: u32, req_len: usize) {
     inc(&BRIDGE_SUBMITTED_TOTAL);
     add(&BYTES_SUBMITTED_TOTAL, req_len as u64);
+    if detailed_stats_enabled() {
+        let bucket = opcode_bucket(opcode);
+        inc(&OPCODE_REQUESTS_TOTAL[bucket]);
+        add(&OPCODE_REQUEST_BYTES_TOTAL[bucket], req_len as u64);
+    }
 }
 
 #[inline]
@@ -588,9 +679,12 @@ pub fn virtiofs_snapshot() -> VirtioFsStatsSnapshot {
 }
 
 pub fn format_snapshot() -> String {
+    // A stats read is the explicit start of a detailed observation window.
+    // Enable it before taking the baseline snapshot.
+    DETAILED_STATS_ENABLED.store(true, Ordering::Relaxed);
     let fuse = fuse_snapshot();
     let virtiofs = virtiofs_snapshot();
-    format!(
+    let mut output = format!(
         "[fuse]\n\
 requests_queued_total {}\n\
 requests_dequeued_total {}\n\
@@ -740,5 +834,50 @@ request_queue_full_total {}\n",
         virtiofs.bridge_queue_full_retry_success_total,
         virtiofs.hiprio_queue_full_total,
         virtiofs.request_queue_full_total,
+    );
+
+    writeln!(
+        output,
+        "response_buffer_reuse_count {}\nresponse_buffer_reuse_bytes {}\n\
+response_buffer_zero_count {}\nresponse_buffer_zero_bytes {}\nresponse_pool_dropped_count {}",
+        RESPONSE_BUFFER_REUSE_COUNT.load(Ordering::Relaxed),
+        RESPONSE_BUFFER_REUSE_BYTES.load(Ordering::Relaxed),
+        RESPONSE_BUFFER_ZERO_COUNT.load(Ordering::Relaxed),
+        RESPONSE_BUFFER_ZERO_BYTES.load(Ordering::Relaxed),
+        RESPONSE_POOL_DROPPED_COUNT.load(Ordering::Relaxed),
     )
+    .expect("formatting fuse stats into String cannot fail");
+
+    output.push_str("\n[virtiofs_opcode]\n");
+    for opcode in 0..OPCODE_BUCKETS {
+        writeln!(
+            output,
+            "opcode_{opcode}_requests_total {}\n\
+opcode_{opcode}_request_bytes_total {}\n\
+opcode_{opcode}_request_bridge_copy_count {}\n\
+opcode_{opcode}_request_bridge_copy_bytes {}\n\
+opcode_{opcode}_response_buffer_alloc_count {}\n\
+opcode_{opcode}_response_buffer_alloc_bytes {}\n\
+opcode_{opcode}_response_buffer_reuse_count {}\n\
+opcode_{opcode}_response_buffer_reuse_bytes {}\n\
+opcode_{opcode}_response_buffer_zero_count {}\n\
+opcode_{opcode}_response_buffer_zero_bytes {}\n\
+opcode_{opcode}_reply_payload_copy_count {}\n\
+opcode_{opcode}_reply_payload_copy_bytes {}",
+            OPCODE_REQUESTS_TOTAL[opcode].load(Ordering::Relaxed),
+            OPCODE_REQUEST_BYTES_TOTAL[opcode].load(Ordering::Relaxed),
+            OPCODE_REQUEST_BRIDGE_COPY_COUNT[opcode].load(Ordering::Relaxed),
+            OPCODE_REQUEST_BRIDGE_COPY_BYTES[opcode].load(Ordering::Relaxed),
+            OPCODE_RESPONSE_BUFFER_ALLOC_COUNT[opcode].load(Ordering::Relaxed),
+            OPCODE_RESPONSE_BUFFER_ALLOC_BYTES[opcode].load(Ordering::Relaxed),
+            OPCODE_RESPONSE_BUFFER_REUSE_COUNT[opcode].load(Ordering::Relaxed),
+            OPCODE_RESPONSE_BUFFER_REUSE_BYTES[opcode].load(Ordering::Relaxed),
+            OPCODE_RESPONSE_BUFFER_ZERO_COUNT[opcode].load(Ordering::Relaxed),
+            OPCODE_RESPONSE_BUFFER_ZERO_BYTES[opcode].load(Ordering::Relaxed),
+            OPCODE_REPLY_PAYLOAD_COPY_COUNT[opcode].load(Ordering::Relaxed),
+            OPCODE_REPLY_PAYLOAD_COPY_BYTES[opcode].load(Ordering::Relaxed),
+        )
+        .expect("formatting fuse opcode stats into String cannot fail");
+    }
+    output
 }

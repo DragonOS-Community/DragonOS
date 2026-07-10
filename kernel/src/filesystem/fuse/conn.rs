@@ -114,9 +114,23 @@ impl FuseBridgeWake {
 
 #[derive(Debug)]
 pub struct FuseRequest {
-    pub bytes: Vec<u8>,
+    bytes: Vec<u8>,
     unique: u64,
     opcode: u32,
+}
+
+impl FuseRequest {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(crate) fn unique(&self) -> u64 {
+        self.unique
+    }
+
+    pub(crate) fn opcode(&self) -> u32 {
+        self.opcode
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -868,12 +882,60 @@ impl FuseConn {
         out: &mut [u8],
     ) -> Result<usize, SystemError> {
         out[..req.bytes.len()].copy_from_slice(&req.bytes);
+        self.account_dequeued_request(&req);
+        Ok(req.bytes.len())
+    }
+
+    fn account_dequeued_request(&self, req: &FuseRequest) {
         stats::on_fuse_request_dequeued(req.bytes.len());
         trace::trace_fuse_request_dequeue(req.unique, req.opcode, req.bytes.len() as u64);
         if req.opcode == FUSE_DESTROY {
             self.abort();
         }
-        Ok(req.bytes.len())
+    }
+
+    fn dequeue_for_kernel_transport<F>(
+        &self,
+        max_message_size: usize,
+        pop_request: F,
+    ) -> Result<Arc<FuseRequest>, SystemError>
+    where
+        F: FnOnce() -> Result<Arc<FuseRequest>, SystemError>,
+    {
+        let req = pop_request()?;
+        if req.bytes.len() > max_message_size {
+            self.fail_oversized_read_request(&req);
+            log::warn!(
+                "fuse: kernel transport buffer smaller than queued request: got={} need={}",
+                max_message_size,
+                req.bytes.len()
+            );
+            // Return to the bridge loop after one malformed request so completion, reset and the
+            // other priority queue cannot be starved by a producer of oversized requests.
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        self.account_dequeued_request(&req);
+        Ok(req)
+    }
+
+    pub(crate) fn dequeue_virtiofs_ordinary_request(
+        &self,
+        max_message_size: usize,
+    ) -> Result<Arc<FuseRequest>, SystemError> {
+        self.dequeue_for_kernel_transport(max_message_size, || self.pop_ordinary_pending_nonblock())
+    }
+
+    pub(crate) fn dequeue_virtiofs_high_priority_request(
+        &self,
+        max_message_size: usize,
+    ) -> Result<Arc<FuseRequest>, SystemError> {
+        self.dequeue_for_kernel_transport(max_message_size, || {
+            let mut g = self.inner.lock();
+            if !g.connected {
+                return Err(SystemError::ENOTCONN);
+            }
+            Self::pop_high_priority_pending_locked(&mut g).ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)
+        })
     }
 
     fn read_dequeued_request<F>(
@@ -967,7 +1029,7 @@ impl FuseConn {
 
         if let Some(pending) = pending {
             let error = -err.to_posix_errno();
-            stats::on_fuse_reply_complete(error, 0);
+            stats::on_fuse_reply_complete(req.opcode, error, 0);
             trace::trace_fuse_reply_complete(req.unique, req.opcode, error, 0);
             pending.complete(Err(err));
         } else {
@@ -1287,7 +1349,7 @@ impl FuseConn {
                 );
             }
             pending.complete(Err(e));
-            stats::on_fuse_reply_complete(error, payload.len());
+            stats::on_fuse_reply_complete(pending.opcode, error, payload.len());
             trace::trace_fuse_reply_complete(
                 out_hdr.unique,
                 pending.opcode,
@@ -1305,7 +1367,7 @@ impl FuseConn {
                 Ok(v) => v,
                 Err(e) => {
                     let error = -e.to_posix_errno();
-                    stats::on_fuse_reply_complete(error, payload.len());
+                    stats::on_fuse_reply_complete(pending.opcode, error, payload.len());
                     trace::trace_fuse_reply_complete(
                         out_hdr.unique,
                         pending.opcode,
@@ -1320,7 +1382,7 @@ impl FuseConn {
 
             if init_out.major != FUSE_KERNEL_VERSION {
                 let error = -SystemError::EINVAL.to_posix_errno();
-                stats::on_fuse_reply_complete(error, payload.len());
+                stats::on_fuse_reply_complete(pending.opcode, error, payload.len());
                 trace::trace_fuse_reply_complete(
                     out_hdr.unique,
                     pending.opcode,
@@ -1384,7 +1446,7 @@ impl FuseConn {
             self.init_wait.wakeup(None);
         }
 
-        stats::on_fuse_reply_complete(0, payload.len());
+        stats::on_fuse_reply_complete(pending.opcode, 0, payload.len());
         trace::trace_fuse_reply_complete(out_hdr.unique, pending.opcode, 0, payload.len() as u64);
         pending.complete(Ok(payload.to_vec()));
         Ok(data.len())
@@ -1547,6 +1609,67 @@ mod tests {
             Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
         ));
         assert!(conn.has_pending_high_priority_requests());
+    }
+
+    #[test]
+    fn virtiofs_direct_dequeue_transfers_existing_request() {
+        let conn = FuseConn::new_for_virtiofs(8192);
+        let unique = conn.alloc_unique();
+        let req = conn.build_request(
+            unique,
+            FUSE_LOOKUP,
+            1,
+            b"name\0",
+            FuseRequestCred::nocreds(),
+        );
+        let expected_ptr = req.bytes().as_ptr();
+        conn.push_request(
+            req,
+            Some(Arc::new(FusePendingState::new(unique, FUSE_LOOKUP))),
+            unique,
+        )
+        .unwrap();
+
+        let dequeued = conn.dequeue_virtiofs_ordinary_request(8192).unwrap();
+        assert_eq!(dequeued.opcode(), FUSE_LOOKUP);
+        assert_eq!(dequeued.unique(), unique);
+        assert_eq!(dequeued.bytes().as_ptr(), expected_ptr);
+    }
+
+    #[test]
+    fn virtiofs_direct_dequeue_keeps_priority_queues_separate() {
+        let conn = FuseConn::new_for_virtiofs(8192);
+        queue_test_request(&conn, FUSE_FORGET, false);
+        queue_test_request(&conn, FUSE_LOOKUP, true);
+
+        let ordinary = conn.dequeue_virtiofs_ordinary_request(8192).unwrap();
+        assert_eq!(ordinary.opcode(), FUSE_LOOKUP);
+        let hiprio = conn.dequeue_virtiofs_high_priority_request(8192).unwrap();
+        assert_eq!(hiprio.opcode(), FUSE_FORGET);
+    }
+
+    #[test]
+    fn virtiofs_direct_dequeue_rejects_oversized_request() {
+        let conn = FuseConn::new_for_virtiofs(8192);
+        let unique = conn.alloc_unique();
+        let req = conn.build_request(
+            unique,
+            FUSE_FORGET,
+            1,
+            &[0u8; 128],
+            FuseRequestCred::nocreds(),
+        );
+        conn.push_request(req, None, unique).unwrap();
+        queue_test_request(&conn, FUSE_FORGET, false);
+
+        assert!(matches!(
+            conn.dequeue_virtiofs_high_priority_request(64),
+            Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+        ));
+        assert!(conn.has_pending_high_priority_requests());
+        let next = conn.dequeue_virtiofs_high_priority_request(8192).unwrap();
+        assert_eq!(next.opcode(), FUSE_FORGET);
+        assert!(!conn.has_pending_high_priority_requests());
     }
 
     #[test]

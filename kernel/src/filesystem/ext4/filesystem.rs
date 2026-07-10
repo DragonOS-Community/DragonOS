@@ -1,7 +1,7 @@
 use crate::{
     driver::base::{block::gendisk::GenDisk, device::device_number::DeviceNumber},
     filesystem::{
-        ext4::inode::{Ext4Inode, InodeDirtyState},
+        ext4::inode::{Ext4Inode, Ext4InodeLifecycle, Ext4InodeLifecycleState, InodeDirtyState},
         vfs::{
             self,
             fcntl::AtFlags,
@@ -11,7 +11,10 @@ use crate::{
             VFS_MAX_FOLLOW_SYMLINK_TIMES,
         },
     },
-    libs::{mutex::Mutex, rwsem::RwSem},
+    libs::{
+        mutex::Mutex,
+        rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
+    },
     mm::{
         fault::{PageFaultHandler, PageFaultMessage},
         VmFaultReason,
@@ -30,6 +33,20 @@ use system_error::SystemError;
 
 use super::inode::LockedExt4Inode;
 
+#[derive(Debug)]
+struct CanonicalInodeEntry {
+    inode: Weak<LockedExt4Inode>,
+    lifecycle: Arc<Ext4InodeLifecycle>,
+}
+
+#[must_use]
+pub(super) struct Ext4InodeTombstone {
+    fs: Weak<Ext4FileSystem>,
+    inode_num: u32,
+    lifecycle: Arc<Ext4InodeLifecycle>,
+    resolved: bool,
+}
+
 pub struct Ext4FileSystem {
     /// 对应 another_ext4 中的实际文件系统
     pub(super) fs: another_ext4::Ext4,
@@ -41,6 +58,17 @@ pub struct Ext4FileSystem {
 
     /// 元数据（size/mtime）脏但尚未刷盘的 inode 列表。
     dirty_inodes: Mutex<Vec<Arc<LockedExt4Inode>>>,
+
+    /// Per-superblock canonical VFS inode identity, keyed by the on-disk inode number.
+    inode_table: Mutex<BTreeMap<u32, CanonicalInodeEntry>>,
+
+    /// Allocations hold a read guard through canonical publication. Physical reclaim
+    /// holds a write guard through tombstone completion so an inode number cannot be
+    /// reused in the handoff window.
+    inode_reuse_barrier: RwSem<()>,
+
+    /// Fail-stop allocation after an indeterminate physical reclaim.
+    lifecycle_error: Mutex<Option<SystemError>>,
 
     /// Mount-time ext4 options parsed from user/kernel mount data.
     _mount_options: Ext4MountOptions,
@@ -123,7 +151,204 @@ impl FileSystem for Ext4FileSystem {
 }
 
 impl Ext4FileSystem {
-    pub(super) fn mark_inode_dirty(inode: &Arc<LockedExt4Inode>, dirty: InodeDirtyState) {
+    pub(super) fn begin_allocation(&self) -> Result<RwSemReadGuard<'_, ()>, SystemError> {
+        let guard = self.inode_reuse_barrier.read();
+        if let Some(error) = self.lifecycle_error.lock().clone() {
+            return Err(error);
+        }
+        Ok(guard)
+    }
+
+    pub(super) fn begin_reclaim(&self) -> RwSemWriteGuard<'_, ()> {
+        self.inode_reuse_barrier.write()
+    }
+
+    pub(super) fn fail_stop_lifecycle(&self) {
+        *self.lifecycle_error.lock() = Some(SystemError::EIO);
+    }
+
+    pub(super) fn get_or_create_inode(
+        self: &Arc<Self>,
+        inode_num: u32,
+        dname: DName,
+        parent: Option<Weak<LockedExt4Inode>>,
+    ) -> Result<Arc<LockedExt4Inode>, SystemError> {
+        self.get_or_create_inode_inner(inode_num, dname, parent, false, None)
+    }
+
+    pub(super) fn publish_allocated_inode(
+        self: &Arc<Self>,
+        inode_num: u32,
+        dname: DName,
+        parent: Option<Weak<LockedExt4Inode>>,
+        file_type: another_ext4::FileType,
+        _reuse_guard: &RwSemReadGuard<'_, ()>,
+    ) -> Result<Arc<LockedExt4Inode>, SystemError> {
+        self.get_or_create_inode_inner(inode_num, dname, parent, true, Some(file_type))
+    }
+
+    fn get_or_create_inode_inner(
+        self: &Arc<Self>,
+        inode_num: u32,
+        dname: DName,
+        parent: Option<Weak<LockedExt4Inode>>,
+        reuse_guard_held: bool,
+        known_file_type: Option<another_ext4::FileType>,
+    ) -> Result<Arc<LockedExt4Inode>, SystemError> {
+        let mut candidate = None;
+        let mut admission_guard = None;
+        loop {
+            let wait_lifecycle = {
+                let mut table = self.inode_table.lock();
+                match table.get(&inode_num) {
+                    Some(entry) => match entry.lifecycle.state() {
+                        Ext4InodeLifecycleState::Live => {
+                            if let Some(inode) = entry.inode.upgrade() {
+                                return Ok(inode);
+                            }
+                            entry.lifecycle.set_state(Ext4InodeLifecycleState::Retired);
+                            table.remove(&inode_num);
+                            None
+                        }
+                        Ext4InodeLifecycleState::Freeing => {
+                            candidate = None;
+                            drop(admission_guard.take());
+                            Some(entry.lifecycle.clone())
+                        }
+                        Ext4InodeLifecycleState::Retired => {
+                            candidate = None;
+                            drop(admission_guard.take());
+                            table.remove(&inode_num);
+                            None
+                        }
+                        Ext4InodeLifecycleState::Poisoned(error) => return Err(error),
+                    },
+                    None => {
+                        if candidate.is_none() {
+                            drop(table);
+                            if !reuse_guard_held {
+                                admission_guard = Some(self.inode_reuse_barrier.read());
+                            }
+                            candidate = Some(LockedExt4Inode::new(
+                                inode_num,
+                                Arc::downgrade(self),
+                                dname.clone(),
+                                parent.clone(),
+                                known_file_type,
+                            )?);
+                            continue;
+                        }
+                        let inode = candidate.take().expect("candidate checked above");
+                        table.insert(
+                            inode_num,
+                            CanonicalInodeEntry {
+                                inode: Arc::downgrade(&inode),
+                                lifecycle: inode.lifecycle().clone(),
+                            },
+                        );
+                        drop(admission_guard.take());
+                        return Ok(inode);
+                    }
+                }
+            };
+
+            if let Some(lifecycle) = wait_lifecycle {
+                match lifecycle.wait_while_freeing() {
+                    Ext4InodeLifecycleState::Poisoned(error) => return Err(error),
+                    _ => continue,
+                }
+            }
+        }
+    }
+
+    pub(super) fn validate_inode(&self, inode: &Arc<LockedExt4Inode>) -> Result<(), SystemError> {
+        let inode_num = inode.0.lock().inner_inode_num;
+        let table = self.inode_table.lock();
+        let entry = table.get(&inode_num).ok_or(SystemError::ESTALE)?;
+        if !Weak::ptr_eq(&entry.inode, &Arc::downgrade(inode))
+            || !Arc::ptr_eq(&entry.lifecycle, inode.lifecycle())
+        {
+            return Err(SystemError::ESTALE);
+        }
+        inode.lifecycle().begin_operation().map(drop)
+    }
+
+    pub(super) fn begin_freeing(
+        self: &Arc<Self>,
+        inode: &Arc<LockedExt4Inode>,
+    ) -> Result<Ext4InodeTombstone, SystemError> {
+        let inode_num = inode.0.lock().inner_inode_num;
+        {
+            let table = self.inode_table.lock();
+            let entry = table.get(&inode_num).ok_or(SystemError::ESTALE)?;
+            if !Weak::ptr_eq(&entry.inode, &Arc::downgrade(inode))
+                || !Arc::ptr_eq(&entry.lifecycle, inode.lifecycle())
+            {
+                return Err(SystemError::ESTALE);
+            }
+            entry.lifecycle.begin_freeing()?;
+        }
+        inode.lifecycle().wait_for_quiescent();
+        Ok(Ext4InodeTombstone {
+            fs: Arc::downgrade(self),
+            inode_num,
+            lifecycle: inode.lifecycle().clone(),
+            resolved: false,
+        })
+    }
+
+    fn finish_tombstone(
+        &self,
+        tombstone: &mut Ext4InodeTombstone,
+        state: Ext4InodeLifecycleState,
+        remove: bool,
+    ) -> Result<(), SystemError> {
+        let mut table = self.inode_table.lock();
+        let entry = table.get(&tombstone.inode_num).ok_or(SystemError::ESTALE)?;
+        if !Arc::ptr_eq(&entry.lifecycle, &tombstone.lifecycle) {
+            return Err(SystemError::ESTALE);
+        }
+        tombstone.lifecycle.set_state(state);
+        if remove {
+            table.remove(&tombstone.inode_num);
+        }
+        tombstone.resolved = true;
+        Ok(())
+    }
+
+    pub(super) fn complete_freeing(
+        &self,
+        mut tombstone: Ext4InodeTombstone,
+    ) -> Result<(), SystemError> {
+        self.finish_tombstone(&mut tombstone, Ext4InodeLifecycleState::Retired, true)
+    }
+
+    pub(super) fn abort_freeing(
+        &self,
+        mut tombstone: Ext4InodeTombstone,
+    ) -> Result<(), SystemError> {
+        self.finish_tombstone(&mut tombstone, Ext4InodeLifecycleState::Live, false)
+    }
+
+    pub(super) fn poison_freeing(
+        &self,
+        mut tombstone: Ext4InodeTombstone,
+        _error: SystemError,
+    ) -> Result<(), SystemError> {
+        let poison = SystemError::EIO;
+        *self.lifecycle_error.lock() = Some(poison.clone());
+        self.finish_tombstone(
+            &mut tombstone,
+            Ext4InodeLifecycleState::Poisoned(poison),
+            false,
+        )
+    }
+
+    pub(super) fn mark_inode_dirty(
+        inode: &Arc<LockedExt4Inode>,
+        dirty: InodeDirtyState,
+    ) -> Result<(), SystemError> {
+        let _operation = inode.lifecycle().begin_operation()?;
         let (fs, should_queue) = {
             let mut guard = inode.0.lock();
             guard.dirty_state.insert(dirty);
@@ -141,6 +366,7 @@ impl Ext4FileSystem {
                 fs.dirty_inodes.lock().push(inode.clone());
             }
         }
+        Ok(())
     }
 
     fn flush_dirty_inodes(&self) -> Result<(), SystemError> {
@@ -157,6 +383,37 @@ impl Ext4FileSystem {
         for inode in dirty {
             let mut should_requeue = false;
             let result = {
+                let has_dirty_metadata = {
+                    let mut guard = inode.0.lock();
+                    let has_dirty = guard
+                        .dirty_state
+                        .intersects(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY);
+                    if !has_dirty {
+                        guard.dirty_state.remove(InodeDirtyState::QUEUED);
+                    }
+                    has_dirty
+                };
+                if !has_dirty_metadata {
+                    continue;
+                }
+                let _operation = match inode.lifecycle().begin_operation() {
+                    Ok(operation) => operation,
+                    Err(error @ (SystemError::ESTALE | SystemError::EIO)) => {
+                        log::error!(
+                            "ext4: rejecting stale metadata writeback before disk access: {:?}",
+                            error
+                        );
+                        if let Some(page_cache) = inode.0.lock().page_cache.clone() {
+                            page_cache.record_writeback_error_with_superblock(error);
+                        }
+                        continue;
+                    }
+                    Err(error) => {
+                        requeue.push(inode);
+                        last_err = Err(error);
+                        continue;
+                    }
+                };
                 let _io_guard = inode.1.lock();
                 let (fs, inode_num, snapshot_dirty, cached_size, cached_mtime) = {
                     let mut guard = inode.0.lock();
@@ -298,6 +555,8 @@ impl Ext4FileSystem {
                     }),
                     Mutex::new(()),
                     RwSem::new(()),
+                    Mutex::new(()),
+                    Ext4InodeLifecycle::new(),
                 )
             });
 
@@ -306,14 +565,56 @@ impl Ext4FileSystem {
             raw_dev,
             root_inode,
             dirty_inodes: Mutex::new(Vec::new()),
+            inode_table: Mutex::new(BTreeMap::new()),
+            inode_reuse_barrier: RwSem::new(()),
+            lifecycle_error: Mutex::new(None),
             _mount_options: mount_options,
         });
 
         let mut guard = fs.root_inode.0.lock();
         guard.fs_ptr = Arc::downgrade(&fs);
         drop(guard);
+        fs.inode_table.lock().insert(
+            another_ext4::EXT4_ROOT_INO,
+            CanonicalInodeEntry {
+                inode: Arc::downgrade(&fs.root_inode),
+                lifecycle: fs.root_inode.lifecycle().clone(),
+            },
+        );
 
         Ok(fs)
+    }
+}
+
+impl Drop for Ext4InodeTombstone {
+    fn drop(&mut self) {
+        if self.resolved {
+            return;
+        }
+        if let Some(fs) = self.fs.upgrade() {
+            let error = SystemError::EIO;
+            *fs.lifecycle_error.lock() = Some(error.clone());
+            if fs
+                .finish_tombstone(
+                    self,
+                    Ext4InodeLifecycleState::Poisoned(error.clone()),
+                    false,
+                )
+                .is_err()
+            {
+                // The canonical table may itself be inconsistent. Always wake waiters on
+                // the tombstone's original lifecycle before fail-stopping the filesystem.
+                self.lifecycle
+                    .set_state(Ext4InodeLifecycleState::Poisoned(error));
+            }
+            log::error!(
+                "ext4: unresolved inode tombstone for inode {}, filesystem fail-stopped",
+                self.inode_num
+            );
+        } else {
+            self.lifecycle
+                .set_state(Ext4InodeLifecycleState::Poisoned(SystemError::EIO));
+        }
     }
 }
 

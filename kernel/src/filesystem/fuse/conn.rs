@@ -1,5 +1,8 @@
-use alloc::{collections::BTreeMap, collections::VecDeque, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use alloc::{collections::BTreeMap, collections::VecDeque, sync::Arc, vec, vec::Vec};
+use core::{
+    mem::size_of,
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+};
 
 use num_traits::FromPrimitive;
 use system_error::SystemError;
@@ -21,16 +24,21 @@ use crate::{
 use crate::process::cred::CAPFlags;
 
 use super::protocol::{
-    fuse_pack_struct, fuse_read_struct, FuseForgetIn, FuseInHeader, FuseInitIn, FuseInitOut,
-    FuseInterruptIn, FuseOutHeader, FuseWriteIn, FUSE_ABORT_ERROR, FUSE_ASYNC_DIO, FUSE_ASYNC_READ,
-    FUSE_ATOMIC_O_TRUNC, FUSE_AUTO_INVAL_DATA, FUSE_BIG_WRITES, FUSE_DESTROY, FUSE_DONT_MASK,
-    FUSE_DO_READDIRPLUS, FUSE_EXPLICIT_INVAL_DATA, FUSE_EXPORT_SUPPORT, FUSE_FLUSH, FUSE_FORGET,
-    FUSE_FSYNC, FUSE_FSYNCDIR, FUSE_GETXATTR, FUSE_HANDLE_KILLPRIV, FUSE_INIT, FUSE_INIT_EXT,
-    FUSE_INTERRUPT, FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION, FUSE_LISTXATTR, FUSE_LOOKUP,
-    FUSE_MAX_PAGES, FUSE_MIN_READ_BUFFER, FUSE_NOTIFY_DELETE, FUSE_NOTIFY_INVAL_ENTRY,
-    FUSE_NOTIFY_INVAL_INODE, FUSE_NOTIFY_POLL, FUSE_NOTIFY_RETRIEVE, FUSE_NOTIFY_STORE,
-    FUSE_NO_OPENDIR_SUPPORT, FUSE_NO_OPEN_SUPPORT, FUSE_PARALLEL_DIROPS, FUSE_POSIX_ACL,
-    FUSE_POSIX_LOCKS, FUSE_READDIRPLUS_AUTO, FUSE_REMOVEXATTR, FUSE_SETXATTR, FUSE_SUBMOUNTS,
+    fuse_pack_struct, fuse_read_struct, FuseAttrOut, FuseEntryOut, FuseForgetIn, FuseGetxattrIn,
+    FuseGetxattrOut, FuseInHeader, FuseInitIn, FuseInitOut, FuseInterruptIn, FuseOpenOut,
+    FuseOutHeader, FuseReadIn, FuseStatfsOut, FuseWriteIn, FuseWriteOut, FUSE_ABORT_ERROR,
+    FUSE_ACCESS, FUSE_ASYNC_DIO, FUSE_ASYNC_READ, FUSE_ATOMIC_O_TRUNC, FUSE_AUTO_INVAL_DATA,
+    FUSE_BIG_WRITES, FUSE_CREATE, FUSE_DESTROY, FUSE_DONT_MASK, FUSE_DO_READDIRPLUS,
+    FUSE_EXPLICIT_INVAL_DATA, FUSE_EXPORT_SUPPORT, FUSE_FALLOCATE, FUSE_FLUSH, FUSE_FORGET,
+    FUSE_FSYNC, FUSE_FSYNCDIR, FUSE_GETATTR, FUSE_GETXATTR, FUSE_HANDLE_KILLPRIV, FUSE_INIT,
+    FUSE_INIT_EXT, FUSE_INTERRUPT, FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION, FUSE_LINK,
+    FUSE_LISTXATTR, FUSE_LOOKUP, FUSE_MAX_PAGES, FUSE_MIN_READ_BUFFER, FUSE_MKDIR, FUSE_MKNOD,
+    FUSE_NOTIFY_DELETE, FUSE_NOTIFY_INVAL_ENTRY, FUSE_NOTIFY_INVAL_INODE, FUSE_NOTIFY_POLL,
+    FUSE_NOTIFY_RETRIEVE, FUSE_NOTIFY_STORE, FUSE_NO_OPENDIR_SUPPORT, FUSE_NO_OPEN_SUPPORT,
+    FUSE_OPEN, FUSE_OPENDIR, FUSE_PARALLEL_DIROPS, FUSE_POSIX_ACL, FUSE_POSIX_LOCKS, FUSE_READ,
+    FUSE_READDIR, FUSE_READDIRPLUS, FUSE_READDIRPLUS_AUTO, FUSE_READLINK, FUSE_RELEASE,
+    FUSE_RELEASEDIR, FUSE_REMOVEXATTR, FUSE_RENAME, FUSE_RENAME2, FUSE_RMDIR, FUSE_SETATTR,
+    FUSE_SETXATTR, FUSE_STATFS, FUSE_SUBMOUNTS, FUSE_SYMLINK, FUSE_UNLINK, FUSE_WRITE,
 };
 use super::{stats, trace};
 
@@ -117,6 +125,26 @@ pub struct FuseRequest {
     bytes: Vec<u8>,
     unique: u64,
     opcode: u32,
+    reply_contract: FuseReplyContract,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FuseReplyCapacitySource {
+    Exact,
+    RequestBounded,
+    ExplicitFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FuseReplyCapacity {
+    pub(crate) bytes: usize,
+    pub(crate) source: FuseReplyCapacitySource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FuseReplyContract {
+    NoReply,
+    Reply { capacity: Option<FuseReplyCapacity> },
 }
 
 impl FuseRequest {
@@ -130,6 +158,10 @@ impl FuseRequest {
 
     pub(crate) fn opcode(&self) -> u32 {
         self.opcode
+    }
+
+    pub(crate) fn reply_contract(&self) -> FuseReplyContract {
+        self.reply_contract
     }
 }
 
@@ -255,6 +287,7 @@ struct FuseConnInner {
     max_write_cap: usize,
     max_pages_limit: usize,
     separate_hiprio_pending: bool,
+    teardown_started: bool,
     hiprio_pending: VecDeque<Arc<FuseRequest>>,
     pending: VecDeque<Arc<FuseRequest>>,
     processing: BTreeMap<u64, Arc<FusePendingState>>,
@@ -270,6 +303,8 @@ pub struct FuseConn {
     init_wait: WaitQueue,
     bridge_wake: FuseBridgeWake,
     epitems: LockedEPItemLinkedList,
+    backend_reply_limit: Option<usize>,
+    reply_layout_minor: AtomicU32,
 }
 
 impl FuseConn {
@@ -280,29 +315,36 @@ impl FuseConn {
     const DEFAULT_MAX_PAGES: usize = 32;
     const MAX_MAX_PAGES: usize = 256;
     const DEFAULT_MAX_READAHEAD: usize = 128 * MMArch::PAGE_SIZE;
+    const XATTR_SIZE_MAX: usize = 64 * 1024;
+    const FUSE_COMPAT_ENTRY_OUT_SIZE: usize = 120;
+    const FUSE_COMPAT_ATTR_OUT_SIZE: usize = 96;
+    const FUSE_COMPAT_STATFS_SIZE: usize = 48;
+    const FUSE_COMPAT_INIT_OUT_SIZE: usize = 8;
 
     pub fn new() -> Arc<Self> {
         Self::new_with_max_write_cap(
             Self::max_write_cap_for_user_read_chunk(),
             Self::kernel_init_flags(),
             false,
+            None,
         )
     }
 
-    pub fn new_for_virtiofs(max_message_size: usize) -> Arc<Self> {
-        let overhead = core::mem::size_of::<FuseInHeader>() + core::mem::size_of::<FuseWriteIn>();
-        let cap = if max_message_size > overhead {
-            core::cmp::max(Self::MIN_MAX_WRITE, max_message_size - overhead)
+    pub fn new_for_virtiofs(max_request_size: usize, max_reply_size: usize) -> Arc<Self> {
+        let overhead = size_of::<FuseInHeader>() + size_of::<FuseWriteIn>();
+        let cap = if max_request_size > overhead {
+            core::cmp::max(Self::MIN_MAX_WRITE, max_request_size - overhead)
         } else {
             Self::MIN_MAX_WRITE
         };
-        Self::new_with_max_write_cap(cap, Self::virtiofs_init_flags(), true)
+        Self::new_with_max_write_cap(cap, Self::virtiofs_init_flags(), true, Some(max_reply_size))
     }
 
     fn new_with_max_write_cap(
         max_write_cap: usize,
         init_flags: u64,
         separate_hiprio_pending: bool,
+        backend_reply_limit: Option<usize>,
     ) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(FuseConnInner {
@@ -330,6 +372,7 @@ impl FuseConn {
                 max_write_cap,
                 max_pages_limit: Self::MAX_MAX_PAGES,
                 separate_hiprio_pending,
+                teardown_started: false,
                 hiprio_pending: VecDeque::new(),
                 pending: VecDeque::new(),
                 processing: BTreeMap::new(),
@@ -341,6 +384,8 @@ impl FuseConn {
             init_wait: WaitQueue::default(),
             bridge_wake: FuseBridgeWake::new(),
             epitems: LockedEPItemLinkedList::default(),
+            backend_reply_limit,
+            reply_layout_minor: AtomicU32::new(0),
         })
     }
 
@@ -600,7 +645,7 @@ impl FuseConn {
                 .pending
                 .iter()
                 .chain(g.hiprio_pending.iter())
-                .filter(|req| matches!(req.opcode, FUSE_FORGET | FUSE_DESTROY | FUSE_INTERRUPT))
+                .filter(|req| matches!(req.opcode, FUSE_FORGET | FUSE_INTERRUPT))
                 .count();
             g.hiprio_pending.clear();
             g.pending.clear();
@@ -632,6 +677,10 @@ impl FuseConn {
         let dropped_pending: usize;
         {
             let mut g = self.inner.lock();
+            if g.teardown_started {
+                return;
+            }
+            g.teardown_started = true;
             should_destroy = g.connected && g.initialized;
             g.mounted = false;
             // Filesystem teardown queues accumulated FORGET requests before
@@ -677,7 +726,10 @@ impl FuseConn {
             return;
         }
 
-        if self.enqueue_noreply(FUSE_DESTROY, 0, &[]).is_err() {
+        if self
+            .enqueue_request_with_cred(FUSE_DESTROY, 0, &[], FuseRequestCred::nocreds())
+            .is_err()
+        {
             self.abort();
             return;
         }
@@ -722,7 +774,8 @@ impl FuseConn {
             0,
             fuse_pack_struct(&inarg),
             FuseRequestCred::nocreds(),
-        );
+            false,
+        )?;
         self.push_request(req, None, unique | Self::FUSE_INT_REQ_BIT)
     }
 
@@ -889,9 +942,6 @@ impl FuseConn {
     fn account_dequeued_request(&self, req: &FuseRequest) {
         stats::on_fuse_request_dequeued(req.bytes.len());
         trace::trace_fuse_request_dequeue(req.unique, req.opcode, req.bytes.len() as u64);
-        if req.opcode == FUSE_DESTROY {
-            self.abort();
-        }
     }
 
     fn dequeue_for_kernel_transport<F>(
@@ -1179,6 +1229,7 @@ impl FuseConn {
     }
 
     fn enqueue_noreply(&self, opcode: u32, nodeid: u64, payload: &[u8]) -> Result<(), SystemError> {
+        debug_assert_eq!(opcode, FUSE_FORGET);
         let unique = self.alloc_unique();
         let req = self.build_request(
             unique,
@@ -1190,7 +1241,8 @@ impl FuseConn {
                 gid: 0,
                 pid: 0,
             },
-        );
+            true,
+        )?;
         self.push_request(req, None, unique)?;
         Ok(())
     }
@@ -1219,9 +1271,120 @@ impl FuseConn {
         let unique = self.alloc_unique();
         let pending_state = Arc::new(FusePendingState::new(unique, opcode));
 
-        let req = self.build_request(unique, opcode, nodeid, payload, req_cred);
+        let req = self.build_request(unique, opcode, nodeid, payload, req_cred, false)?;
         self.push_request(req, Some(pending_state.clone()), unique)?;
         Ok(pending_state)
+    }
+
+    fn reply_capacity(
+        &self,
+        opcode: u32,
+        payload: &[u8],
+    ) -> Result<Option<FuseReplyCapacity>, SystemError> {
+        let minor = self.reply_layout_minor.load(Ordering::Acquire);
+        let header = size_of::<FuseOutHeader>();
+        let exact = |payload_len: usize| -> Result<Option<FuseReplyCapacity>, SystemError> {
+            let bytes = header
+                .checked_add(payload_len)
+                .ok_or(SystemError::EOVERFLOW)?;
+            if self.backend_reply_limit.is_some_and(|limit| bytes > limit) {
+                return Err(SystemError::EOVERFLOW);
+            }
+            Ok(Some(FuseReplyCapacity {
+                bytes,
+                source: FuseReplyCapacitySource::Exact,
+            }))
+        };
+
+        let entry_size = if minor < 9 {
+            Self::FUSE_COMPAT_ENTRY_OUT_SIZE
+        } else {
+            size_of::<FuseEntryOut>()
+        };
+        let attr_size = if minor < 9 {
+            Self::FUSE_COMPAT_ATTR_OUT_SIZE
+        } else {
+            size_of::<FuseAttrOut>()
+        };
+
+        let fixed_payload = match opcode {
+            FUSE_LOOKUP | FUSE_SYMLINK | FUSE_MKNOD | FUSE_MKDIR | FUSE_LINK => Some(entry_size),
+            FUSE_GETATTR | FUSE_SETATTR => Some(attr_size),
+            FUSE_OPEN | FUSE_OPENDIR => Some(size_of::<FuseOpenOut>()),
+            FUSE_WRITE => Some(size_of::<FuseWriteOut>()),
+            FUSE_STATFS => Some(if minor < 4 {
+                Self::FUSE_COMPAT_STATFS_SIZE
+            } else {
+                size_of::<FuseStatfsOut>()
+            }),
+            FUSE_CREATE => Some(
+                entry_size
+                    .checked_add(size_of::<FuseOpenOut>())
+                    .ok_or(SystemError::EOVERFLOW)?,
+            ),
+            FUSE_INIT => Some(size_of::<FuseInitOut>()),
+            FUSE_UNLINK | FUSE_RMDIR | FUSE_RENAME | FUSE_RENAME2 | FUSE_RELEASE | FUSE_FSYNC
+            | FUSE_SETXATTR | FUSE_REMOVEXATTR | FUSE_FLUSH | FUSE_RELEASEDIR | FUSE_FSYNCDIR
+            | FUSE_ACCESS | FUSE_INTERRUPT | FUSE_DESTROY | FUSE_FALLOCATE => Some(0),
+            _ => None,
+        };
+        if let Some(payload_len) = fixed_payload {
+            return exact(payload_len);
+        }
+
+        let requested = match opcode {
+            FUSE_READ | FUSE_READDIR | FUSE_READDIRPLUS => {
+                let read_in: FuseReadIn = fuse_read_struct(payload)?;
+                let requested = read_in.size as usize;
+                let (max_read, max_pages) = {
+                    let g = self.inner.lock();
+                    (g.max_read as usize, g.init.max_pages as usize)
+                };
+                let max_pages_bytes = max_pages
+                    .checked_mul(MMArch::PAGE_SIZE)
+                    .ok_or(SystemError::EOVERFLOW)?;
+                if requested > max_read || requested > max_pages_bytes {
+                    return Err(SystemError::EINVAL);
+                }
+                requested
+            }
+            FUSE_GETXATTR | FUSE_LISTXATTR => {
+                let getxattr_in: FuseGetxattrIn = fuse_read_struct(payload)?;
+                let requested = getxattr_in.size as usize;
+                if requested > Self::XATTR_SIZE_MAX {
+                    return Err(SystemError::EINVAL);
+                }
+                if requested == 0 {
+                    size_of::<FuseGetxattrOut>()
+                } else {
+                    requested
+                }
+            }
+            FUSE_READLINK => MMArch::PAGE_SIZE
+                .checked_sub(1)
+                .ok_or(SystemError::EOVERFLOW)?,
+            _ => {
+                return match self.backend_reply_limit {
+                    Some(bytes) if bytes >= header => Ok(Some(FuseReplyCapacity {
+                        bytes,
+                        source: FuseReplyCapacitySource::ExplicitFallback,
+                    })),
+                    Some(_) => Err(SystemError::EOVERFLOW),
+                    None => Ok(None),
+                };
+            }
+        };
+
+        let bytes = header
+            .checked_add(requested)
+            .ok_or(SystemError::EOVERFLOW)?;
+        if self.backend_reply_limit.is_some_and(|limit| bytes > limit) {
+            return Err(SystemError::EOVERFLOW);
+        }
+        Ok(Some(FuseReplyCapacity {
+            bytes,
+            source: FuseReplyCapacitySource::RequestBounded,
+        }))
     }
 
     fn build_request(
@@ -1231,9 +1394,21 @@ impl FuseConn {
         nodeid: u64,
         payload: &[u8],
         req_cred: FuseRequestCred,
-    ) -> Arc<FuseRequest> {
+        no_reply: bool,
+    ) -> Result<Arc<FuseRequest>, SystemError> {
+        let request_len = size_of::<FuseInHeader>()
+            .checked_add(payload.len())
+            .ok_or(SystemError::EOVERFLOW)?;
+        let request_len = u32::try_from(request_len).map_err(|_| SystemError::EOVERFLOW)?;
+        let reply_contract = if no_reply {
+            FuseReplyContract::NoReply
+        } else {
+            FuseReplyContract::Reply {
+                capacity: self.reply_capacity(opcode, payload)?,
+            }
+        };
         let hdr = FuseInHeader {
-            len: (core::mem::size_of::<FuseInHeader>() + payload.len()) as u32,
+            len: request_len,
             opcode,
             unique,
             nodeid,
@@ -1247,11 +1422,12 @@ impl FuseConn {
         let mut bytes = Vec::with_capacity(hdr.len as usize);
         bytes.extend_from_slice(fuse_pack_struct(&hdr));
         bytes.extend_from_slice(payload);
-        Arc::new(FuseRequest {
+        Ok(Arc::new(FuseRequest {
             bytes,
             unique,
             opcode,
-        })
+            reply_contract,
+        }))
     }
 
     fn push_request(
@@ -1262,10 +1438,17 @@ impl FuseConn {
     ) -> Result<(), SystemError> {
         let req_len = req.bytes.len();
         let opcode = req.opcode;
-        let no_reply = pending_state.is_none();
+        let no_reply = matches!(req.reply_contract, FuseReplyContract::NoReply);
+        debug_assert_eq!(
+            no_reply,
+            pending_state.is_none() && opcode != FUSE_INTERRUPT
+        );
         {
             let mut g = self.inner.lock();
             if !g.connected {
+                return Err(SystemError::ENOTCONN);
+            }
+            if g.teardown_started && opcode != FUSE_DESTROY {
                 return Err(SystemError::ENOTCONN);
             }
             if g.separate_hiprio_pending && Self::is_high_priority_opcode(opcode) {
@@ -1287,6 +1470,58 @@ impl FuseConn {
             EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
         );
         Ok(())
+    }
+
+    fn parse_init_reply(payload: &[u8]) -> Result<FuseInitOut, SystemError> {
+        if payload.len() < Self::FUSE_COMPAT_INIT_OUT_SIZE
+            || payload.len() > size_of::<FuseInitOut>()
+        {
+            return Err(SystemError::EINVAL);
+        }
+        let mut normalized = vec![0u8; size_of::<FuseInitOut>()];
+        normalized[..payload.len()].copy_from_slice(payload);
+        fuse_read_struct(&normalized)
+    }
+
+    fn normalize_compat_reply(
+        minor: u32,
+        opcode: u32,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, SystemError> {
+        let (compat_len, full_len) = if minor < 4 && opcode == FUSE_STATFS {
+            (Self::FUSE_COMPAT_STATFS_SIZE, size_of::<FuseStatfsOut>())
+        } else if minor < 9
+            && matches!(
+                opcode,
+                FUSE_LOOKUP | FUSE_SYMLINK | FUSE_MKNOD | FUSE_MKDIR | FUSE_LINK
+            )
+        {
+            (Self::FUSE_COMPAT_ENTRY_OUT_SIZE, size_of::<FuseEntryOut>())
+        } else if minor < 9 && matches!(opcode, FUSE_GETATTR | FUSE_SETATTR) {
+            (Self::FUSE_COMPAT_ATTR_OUT_SIZE, size_of::<FuseAttrOut>())
+        } else if minor < 9 && opcode == FUSE_CREATE {
+            let compat_len = Self::FUSE_COMPAT_ENTRY_OUT_SIZE
+                .checked_add(size_of::<FuseOpenOut>())
+                .ok_or(SystemError::EOVERFLOW)?;
+            if payload.len() != compat_len {
+                return Err(SystemError::EINVAL);
+            }
+            let mut normalized = vec![0u8; size_of::<FuseEntryOut>() + size_of::<FuseOpenOut>()];
+            normalized[..Self::FUSE_COMPAT_ENTRY_OUT_SIZE]
+                .copy_from_slice(&payload[..Self::FUSE_COMPAT_ENTRY_OUT_SIZE]);
+            normalized[size_of::<FuseEntryOut>()..]
+                .copy_from_slice(&payload[Self::FUSE_COMPAT_ENTRY_OUT_SIZE..compat_len]);
+            return Ok(normalized);
+        } else {
+            return Ok(payload.to_vec());
+        };
+
+        if payload.len() != compat_len {
+            return Err(SystemError::EINVAL);
+        }
+        let mut normalized = vec![0u8; full_len];
+        normalized[..compat_len].copy_from_slice(payload);
+        Ok(normalized)
     }
 
     pub fn write_reply(&self, data: &[u8]) -> Result<usize, SystemError> {
@@ -1316,14 +1551,16 @@ impl FuseConn {
             return Err(SystemError::EINVAL);
         }
 
-        let pending = {
+        let (pending, negotiated_minor) = {
             let mut g = self.inner.lock();
             if !g.connected {
                 return Err(SystemError::ENOENT);
             }
-            g.processing
+            let pending = g
+                .processing
                 .remove(&out_hdr.unique)
-                .ok_or(SystemError::ENOENT)?
+                .ok_or(SystemError::ENOENT)?;
+            (pending, g.init.minor)
         };
 
         let payload = &data[core::mem::size_of::<FuseOutHeader>()..];
@@ -1356,14 +1593,14 @@ impl FuseConn {
                 error,
                 payload.len() as u64,
             );
-            if pending.opcode == FUSE_INIT {
+            if matches!(pending.opcode, FUSE_INIT | FUSE_DESTROY) {
                 self.abort();
             }
             return Ok(data.len());
         }
 
         if pending.opcode == FUSE_INIT {
-            let init_out: FuseInitOut = match fuse_read_struct(payload) {
+            let init_out: FuseInitOut = match Self::parse_init_reply(payload) {
                 Ok(v) => v,
                 Err(e) => {
                     let error = -e.to_posix_errno();
@@ -1441,15 +1678,68 @@ impl FuseConn {
                         max_pages: negotiated_max_pages,
                         flags: enabled_flags,
                     };
+                    self.reply_layout_minor
+                        .store(negotiated_minor, Ordering::Release);
                 }
             }
             self.init_wait.wakeup(None);
         }
 
+        let normalized_payload = if pending.opcode == FUSE_INIT {
+            payload.to_vec()
+        } else {
+            match Self::normalize_compat_reply(negotiated_minor, pending.opcode, payload) {
+                Ok(payload) => payload,
+                Err(e) => {
+                    let error = -e.to_posix_errno();
+                    stats::on_fuse_reply_complete(pending.opcode, error, payload.len());
+                    trace::trace_fuse_reply_complete(
+                        out_hdr.unique,
+                        pending.opcode,
+                        error,
+                        payload.len() as u64,
+                    );
+                    pending.complete(Err(e));
+                    if pending.opcode == FUSE_DESTROY {
+                        self.abort();
+                    }
+                    return Ok(data.len());
+                }
+            }
+        };
+
         stats::on_fuse_reply_complete(pending.opcode, 0, payload.len());
         trace::trace_fuse_reply_complete(out_hdr.unique, pending.opcode, 0, payload.len() as u64);
-        pending.complete(Ok(payload.to_vec()));
+        pending.complete(Ok(normalized_payload));
+        if pending.opcode == FUSE_DESTROY {
+            self.abort();
+        }
         Ok(data.len())
+    }
+
+    /// Linux supplies an output header buffer for DESTROY, while virtiofsd completes the
+    /// descriptor with zero used bytes. Linux treats the zero-initialized request header as a
+    /// successful completion because DESTROY has no output arguments. Preserve that transport
+    /// semantic without relaxing validation for any other opcode.
+    pub(crate) fn complete_destroy_without_reply(&self, unique: u64) -> Result<(), SystemError> {
+        let pending = {
+            let mut g = self.inner.lock();
+            if !g.connected {
+                return Err(SystemError::ENOENT);
+            }
+            let pending = g.processing.remove(&unique).ok_or(SystemError::ENOENT)?;
+            if pending.opcode != FUSE_DESTROY {
+                g.processing.insert(unique, pending);
+                return Err(SystemError::EINVAL);
+            }
+            pending
+        };
+
+        stats::on_fuse_reply_complete(FUSE_DESTROY, 0, 0);
+        trace::trace_fuse_reply_complete(unique, FUSE_DESTROY, 0, 0);
+        pending.complete(Ok(Vec::new()));
+        self.abort();
+        Ok(())
     }
 
     fn write_interrupt_reply(
@@ -1554,18 +1844,46 @@ impl FuseConn {
 
 #[cfg(test)]
 mod tests {
-    use alloc::{sync::Arc, vec::Vec};
+    use alloc::{sync::Arc, vec, vec::Vec};
+    use core::{mem::size_of, sync::atomic::Ordering};
 
     use system_error::SystemError;
 
+    use super::stats;
     use super::{
-        fuse_read_struct, FuseConn, FuseInHeader, FusePendingState, FuseRequestCred, FUSE_FORGET,
-        FUSE_LOOKUP,
+        fuse_pack_struct, fuse_read_struct, FuseAttrOut, FuseConn, FuseEntryOut, FuseGetxattrIn,
+        FuseGetxattrOut, FuseInHeader, FuseInitOut, FuseOpenOut, FuseOutHeader, FusePendingState,
+        FuseReadIn, FuseReplyCapacitySource, FuseReplyContract, FuseRequestCred, FuseStatfsOut,
+        FuseWriteOut, FUSE_ACCESS, FUSE_CREATE, FUSE_DESTROY, FUSE_FALLOCATE, FUSE_FLUSH,
+        FUSE_FORGET, FUSE_FSYNC, FUSE_FSYNCDIR, FUSE_GETATTR, FUSE_GETXATTR, FUSE_INIT,
+        FUSE_INTERRUPT, FUSE_LINK, FUSE_LISTXATTR, FUSE_LOOKUP, FUSE_MKDIR, FUSE_MKNOD, FUSE_OPEN,
+        FUSE_OPENDIR, FUSE_READ, FUSE_READDIR, FUSE_READDIRPLUS, FUSE_READLINK, FUSE_RELEASE,
+        FUSE_RELEASEDIR, FUSE_REMOVEXATTR, FUSE_RENAME, FUSE_RENAME2, FUSE_RMDIR, FUSE_SETATTR,
+        FUSE_SETXATTR, FUSE_STATFS, FUSE_SYMLINK, FUSE_UNLINK, FUSE_WRITE,
     };
+
+    fn set_minor(conn: &FuseConn, minor: u32) {
+        conn.inner.lock().init.minor = minor;
+        conn.reply_layout_minor.store(minor, Ordering::Release);
+    }
+
+    fn capacity(conn: &FuseConn, opcode: u32, payload: &[u8]) -> (usize, FuseReplyCapacitySource) {
+        let capacity = conn.reply_capacity(opcode, payload).unwrap().unwrap();
+        (capacity.bytes, capacity.source)
+    }
 
     fn queue_test_request(conn: &Arc<FuseConn>, opcode: u32, pending_reply: bool) -> u64 {
         let unique = conn.alloc_unique();
-        let req = conn.build_request(unique, opcode, 1, &[], FuseRequestCred::nocreds());
+        let req = conn
+            .build_request(
+                unique,
+                opcode,
+                1,
+                &[],
+                FuseRequestCred::nocreds(),
+                !pending_reply,
+            )
+            .unwrap();
         let pending = pending_reply.then(|| Arc::new(FusePendingState::new(unique, opcode)));
         conn.push_request(req, pending, unique).unwrap();
         unique
@@ -1578,7 +1896,7 @@ mod tests {
 
     #[test]
     fn ordinary_read_does_not_consume_high_priority_queue() {
-        let conn = FuseConn::new_for_virtiofs(8192);
+        let conn = FuseConn::new_for_virtiofs(8192, 8192);
         queue_test_request(&conn, FUSE_FORGET, false);
         queue_test_request(&conn, FUSE_LOOKUP, true);
 
@@ -1599,7 +1917,7 @@ mod tests {
 
     #[test]
     fn ordinary_read_returns_eagain_when_only_high_priority_is_pending() {
-        let conn = FuseConn::new_for_virtiofs(8192);
+        let conn = FuseConn::new_for_virtiofs(8192, 8192);
         queue_test_request(&conn, FUSE_FORGET, false);
 
         let mut buf = Vec::new();
@@ -1613,15 +1931,18 @@ mod tests {
 
     #[test]
     fn virtiofs_direct_dequeue_transfers_existing_request() {
-        let conn = FuseConn::new_for_virtiofs(8192);
+        let conn = FuseConn::new_for_virtiofs(8192, 8192);
         let unique = conn.alloc_unique();
-        let req = conn.build_request(
-            unique,
-            FUSE_LOOKUP,
-            1,
-            b"name\0",
-            FuseRequestCred::nocreds(),
-        );
+        let req = conn
+            .build_request(
+                unique,
+                FUSE_LOOKUP,
+                1,
+                b"name\0",
+                FuseRequestCred::nocreds(),
+                false,
+            )
+            .unwrap();
         let expected_ptr = req.bytes().as_ptr();
         conn.push_request(
             req,
@@ -1638,7 +1959,7 @@ mod tests {
 
     #[test]
     fn virtiofs_direct_dequeue_keeps_priority_queues_separate() {
-        let conn = FuseConn::new_for_virtiofs(8192);
+        let conn = FuseConn::new_for_virtiofs(8192, 8192);
         queue_test_request(&conn, FUSE_FORGET, false);
         queue_test_request(&conn, FUSE_LOOKUP, true);
 
@@ -1650,15 +1971,18 @@ mod tests {
 
     #[test]
     fn virtiofs_direct_dequeue_rejects_oversized_request() {
-        let conn = FuseConn::new_for_virtiofs(8192);
+        let conn = FuseConn::new_for_virtiofs(8192, 8192);
         let unique = conn.alloc_unique();
-        let req = conn.build_request(
-            unique,
-            FUSE_FORGET,
-            1,
-            &[0u8; 128],
-            FuseRequestCred::nocreds(),
-        );
+        let req = conn
+            .build_request(
+                unique,
+                FUSE_FORGET,
+                1,
+                &[0u8; 128],
+                FuseRequestCred::nocreds(),
+                true,
+            )
+            .unwrap();
         conn.push_request(req, None, unique).unwrap();
         queue_test_request(&conn, FUSE_FORGET, false);
 
@@ -1707,5 +2031,314 @@ mod tests {
         conn.clear_bridge_wake();
         conn.wake_bridge(stats::VirtioFsBridgeWakeSource::Request);
         assert_eq!(conn.bridge_wake_events(), 0);
+    }
+
+    #[test]
+    fn reply_capacity_covers_every_supported_opcode_without_fallback() {
+        let conn = FuseConn::new_for_virtiofs(256 * 1024, 256 * 1024);
+        set_minor(&conn, 39);
+        let header = size_of::<FuseOutHeader>();
+        let fixed = [
+            (FUSE_LOOKUP, size_of::<FuseEntryOut>()),
+            (FUSE_SYMLINK, size_of::<FuseEntryOut>()),
+            (FUSE_MKNOD, size_of::<FuseEntryOut>()),
+            (FUSE_MKDIR, size_of::<FuseEntryOut>()),
+            (FUSE_LINK, size_of::<FuseEntryOut>()),
+            (FUSE_GETATTR, size_of::<FuseAttrOut>()),
+            (FUSE_SETATTR, size_of::<FuseAttrOut>()),
+            (FUSE_OPEN, size_of::<FuseOpenOut>()),
+            (FUSE_OPENDIR, size_of::<FuseOpenOut>()),
+            (FUSE_WRITE, size_of::<FuseWriteOut>()),
+            (FUSE_STATFS, size_of::<FuseStatfsOut>()),
+            (
+                FUSE_CREATE,
+                size_of::<FuseEntryOut>() + size_of::<FuseOpenOut>(),
+            ),
+            (FUSE_INIT, size_of::<FuseInitOut>()),
+        ];
+        for (opcode, payload_len) in fixed {
+            assert_eq!(
+                capacity(&conn, opcode, &[]),
+                (header + payload_len, FuseReplyCapacitySource::Exact)
+            );
+        }
+
+        let header_only = [
+            FUSE_UNLINK,
+            FUSE_RMDIR,
+            FUSE_RENAME,
+            FUSE_RENAME2,
+            FUSE_RELEASE,
+            FUSE_FSYNC,
+            FUSE_SETXATTR,
+            FUSE_REMOVEXATTR,
+            FUSE_FLUSH,
+            FUSE_RELEASEDIR,
+            FUSE_FSYNCDIR,
+            FUSE_ACCESS,
+            FUSE_INTERRUPT,
+            FUSE_DESTROY,
+            FUSE_FALLOCATE,
+        ];
+        for opcode in header_only {
+            assert_eq!(
+                capacity(&conn, opcode, &[]),
+                (header, FuseReplyCapacitySource::Exact)
+            );
+        }
+
+        let read_in = FuseReadIn {
+            fh: 0,
+            offset: 0,
+            size: 4096,
+            read_flags: 0,
+            lock_owner: 0,
+            flags: 0,
+            padding: 0,
+        };
+        for opcode in [FUSE_READ, FUSE_READDIR, FUSE_READDIRPLUS] {
+            assert_eq!(
+                capacity(&conn, opcode, fuse_pack_struct(&read_in)),
+                (header + 4096, FuseReplyCapacitySource::RequestBounded)
+            );
+        }
+        assert_eq!(
+            capacity(&conn, FUSE_READLINK, &[]),
+            (
+                header + <crate::arch::MMArch as crate::mm::MemoryManagementArch>::PAGE_SIZE - 1,
+                FuseReplyCapacitySource::RequestBounded
+            )
+        );
+
+        for opcode in [FUSE_GETXATTR, FUSE_LISTXATTR] {
+            let query = FuseGetxattrIn {
+                size: 0,
+                padding: 0,
+            };
+            assert_eq!(
+                capacity(&conn, opcode, fuse_pack_struct(&query)),
+                (
+                    header + size_of::<FuseGetxattrOut>(),
+                    FuseReplyCapacitySource::RequestBounded
+                )
+            );
+            let value = FuseGetxattrIn {
+                size: 64 * 1024,
+                padding: 0,
+            };
+            assert_eq!(
+                capacity(&conn, opcode, fuse_pack_struct(&value)),
+                (header + 64 * 1024, FuseReplyCapacitySource::RequestBounded)
+            );
+        }
+
+        assert_eq!(
+            capacity(&conn, 63, &[]),
+            (256 * 1024, FuseReplyCapacitySource::ExplicitFallback)
+        );
+    }
+
+    #[test]
+    fn reply_contract_rejects_malformed_and_out_of_bounds_variable_requests() {
+        let conn = FuseConn::new_for_virtiofs(256 * 1024, 256 * 1024);
+        conn.configure_mount(0, 0, true, 4096);
+        assert_eq!(
+            conn.reply_capacity(FUSE_READ, &[]),
+            Err(SystemError::EINVAL)
+        );
+        assert_eq!(
+            conn.reply_capacity(FUSE_GETXATTR, &[]),
+            Err(SystemError::EINVAL)
+        );
+
+        let too_large_read = FuseReadIn {
+            fh: 0,
+            offset: 0,
+            size: 4097,
+            read_flags: 0,
+            lock_owner: 0,
+            flags: 0,
+            padding: 0,
+        };
+        assert_eq!(
+            conn.reply_capacity(FUSE_READ, fuse_pack_struct(&too_large_read)),
+            Err(SystemError::EINVAL)
+        );
+        let too_large_xattr = FuseGetxattrIn {
+            size: 64 * 1024 + 1,
+            padding: 0,
+        };
+        assert_eq!(
+            conn.reply_capacity(FUSE_GETXATTR, fuse_pack_struct(&too_large_xattr)),
+            Err(SystemError::EINVAL)
+        );
+
+        let undersized = FuseConn::new_for_virtiofs(8192, size_of::<FuseOutHeader>() - 1);
+        assert_eq!(
+            undersized.reply_capacity(63, &[]),
+            Err(SystemError::EOVERFLOW)
+        );
+    }
+
+    #[test]
+    fn negotiated_minor_tightens_and_normalizes_compat_replies() {
+        let conn = FuseConn::new_for_virtiofs(256 * 1024, 256 * 1024);
+        let header = size_of::<FuseOutHeader>();
+        set_minor(&conn, 3);
+        assert_eq!(
+            capacity(&conn, FUSE_STATFS, &[]).0,
+            header + FuseConn::FUSE_COMPAT_STATFS_SIZE
+        );
+        assert_eq!(
+            capacity(&conn, FUSE_LOOKUP, &[]).0,
+            header + FuseConn::FUSE_COMPAT_ENTRY_OUT_SIZE
+        );
+        assert_eq!(
+            capacity(&conn, FUSE_GETATTR, &[]).0,
+            header + FuseConn::FUSE_COMPAT_ATTR_OUT_SIZE
+        );
+        assert_eq!(
+            capacity(&conn, FUSE_CREATE, &[]).0,
+            header + FuseConn::FUSE_COMPAT_ENTRY_OUT_SIZE + size_of::<FuseOpenOut>()
+        );
+
+        let compat_entry = vec![0x5a; FuseConn::FUSE_COMPAT_ENTRY_OUT_SIZE];
+        let normalized = FuseConn::normalize_compat_reply(3, FUSE_LOOKUP, &compat_entry).unwrap();
+        assert_eq!(normalized.len(), size_of::<FuseEntryOut>());
+        assert_eq!(
+            &normalized[..FuseConn::FUSE_COMPAT_ENTRY_OUT_SIZE],
+            &compat_entry
+        );
+        assert!(normalized[FuseConn::FUSE_COMPAT_ENTRY_OUT_SIZE..]
+            .iter()
+            .all(|byte| *byte == 0));
+
+        let compat_create_len = FuseConn::FUSE_COMPAT_ENTRY_OUT_SIZE + size_of::<FuseOpenOut>();
+        let compat_create = vec![0xa5; compat_create_len];
+        let normalized = FuseConn::normalize_compat_reply(3, FUSE_CREATE, &compat_create).unwrap();
+        assert_eq!(
+            &normalized[size_of::<FuseEntryOut>()..],
+            &compat_create[FuseConn::FUSE_COMPAT_ENTRY_OUT_SIZE..]
+        );
+    }
+
+    #[test]
+    fn init_reply_accepts_zero_extended_compat_prefix_only() {
+        assert!(matches!(
+            FuseConn::parse_init_reply(&[0u8; 7]),
+            Err(SystemError::EINVAL)
+        ));
+        let mut compat = [0u8; FuseConn::FUSE_COMPAT_INIT_OUT_SIZE];
+        compat[..4].copy_from_slice(&super::FUSE_KERNEL_VERSION.to_ne_bytes());
+        compat[4..].copy_from_slice(&3u32.to_ne_bytes());
+        let parsed = FuseConn::parse_init_reply(&compat).unwrap();
+        assert_eq!(parsed.major, super::FUSE_KERNEL_VERSION);
+        assert_eq!(parsed.minor, 3);
+        assert_eq!(parsed.max_write, 0);
+        assert!(matches!(
+            FuseConn::parse_init_reply(&vec![0u8; size_of::<FuseInitOut>() + 1]),
+            Err(SystemError::EINVAL)
+        ));
+    }
+
+    #[test]
+    fn forget_is_no_reply_while_interrupt_and_destroy_have_header_capacity() {
+        let conn = FuseConn::new_for_virtiofs(8192, 8192);
+        let unique = conn.alloc_unique();
+        let forget = conn
+            .build_request(
+                unique,
+                FUSE_FORGET,
+                1,
+                &[],
+                FuseRequestCred::nocreds(),
+                true,
+            )
+            .unwrap();
+        assert_eq!(forget.reply_contract(), FuseReplyContract::NoReply);
+
+        for opcode in [FUSE_INTERRUPT, FUSE_DESTROY] {
+            let req = conn
+                .build_request(
+                    conn.alloc_unique(),
+                    opcode,
+                    0,
+                    &[],
+                    FuseRequestCred::nocreds(),
+                    false,
+                )
+                .unwrap();
+            assert!(matches!(
+                req.reply_contract(),
+                FuseReplyContract::Reply {
+                    capacity: Some(capacity)
+                } if capacity.bytes == size_of::<FuseOutHeader>()
+            ));
+        }
+    }
+
+    #[test]
+    fn zero_length_destroy_completion_finishes_unique_and_disconnects() {
+        let conn = FuseConn::new_for_virtiofs(8192, 8192);
+        let unique = conn.alloc_unique();
+        let pending = Arc::new(FusePendingState::new(unique, FUSE_DESTROY));
+        let req = conn
+            .build_request(
+                unique,
+                FUSE_DESTROY,
+                0,
+                &[],
+                FuseRequestCred::nocreds(),
+                false,
+            )
+            .unwrap();
+        conn.push_request(req, Some(pending.clone()), unique)
+            .unwrap();
+        conn.dequeue_virtiofs_ordinary_request(8192).unwrap();
+
+        conn.complete_destroy_without_reply(unique).unwrap();
+        assert!(!conn.is_connected());
+        assert_eq!(pending.wait_complete().unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn teardown_gate_is_idempotent_and_rejects_late_business_requests() {
+        let conn = FuseConn::new_for_virtiofs(8192, 8192);
+        {
+            let mut g = conn.inner.lock();
+            g.initialized = true;
+            g.mounted = true;
+        }
+
+        conn.on_umount();
+        conn.on_umount();
+        {
+            let g = conn.inner.lock();
+            assert!(g.teardown_started);
+            assert_eq!(
+                g.pending
+                    .iter()
+                    .filter(|req| req.opcode == FUSE_DESTROY)
+                    .count(),
+                1
+            );
+        }
+
+        let unique = conn.alloc_unique();
+        let request = conn
+            .build_request(
+                unique,
+                FUSE_LOOKUP,
+                1,
+                b"late\0",
+                FuseRequestCred::nocreds(),
+                false,
+            )
+            .unwrap();
+        let pending = Arc::new(FusePendingState::new(unique, FUSE_LOOKUP));
+        assert_eq!(
+            conn.push_request(request, Some(pending), unique),
+            Err(SystemError::ENOTCONN)
+        );
     }
 }

@@ -213,6 +213,22 @@ static OPCODE_RESPONSE_BUFFER_ZERO_COUNT: [AtomicU64; OPCODE_BUCKETS] =
     [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
 static OPCODE_RESPONSE_BUFFER_ZERO_BYTES: [AtomicU64; OPCODE_BUCKETS] =
     [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
+static OPCODE_RESPONSE_SUBMITTED_CAPACITY_COUNT: [AtomicU64; OPCODE_BUCKETS] =
+    [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
+static OPCODE_RESPONSE_SUBMITTED_CAPACITY_BYTES: [AtomicU64; OPCODE_BUCKETS] =
+    [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
+static OPCODE_RESPONSE_CAPACITY_FALLBACK_COUNT: [AtomicU64; OPCODE_BUCKETS] =
+    [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
+static OPCODE_RESPONSE_COMPLETED_CAPACITY_BYTES: [AtomicU64; OPCODE_BUCKETS] =
+    [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
+static OPCODE_RESPONSE_USED_BYTES: [AtomicU64; OPCODE_BUCKETS] =
+    [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
+static OPCODE_RESPONSE_UNUSED_TAIL_BYTES: [AtomicU64; OPCODE_BUCKETS] =
+    [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
+static OPCODE_RESPONSE_OVERRUN_COUNT: [AtomicU64; OPCODE_BUCKETS] =
+    [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
+static OPCODE_RESPONSE_OVERRUN_BYTES: [AtomicU64; OPCODE_BUCKETS] =
+    [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
 static OPCODE_REPLY_PAYLOAD_COPY_COUNT: [AtomicU64; OPCODE_BUCKETS] =
     [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
 static OPCODE_REPLY_PAYLOAD_COPY_BYTES: [AtomicU64; OPCODE_BUCKETS] =
@@ -520,6 +536,59 @@ pub fn on_virtiofs_response_pool_drop() {
 #[inline]
 pub fn on_virtiofs_response_buffer_waste(len: usize) {
     add(&RESPONSE_BUFFER_WASTE_BYTES, len as u64);
+}
+
+/// Record the response capacity made device-writable by a successful queue add.
+///
+/// This is deliberately separate from response-buffer preparation: queue-full and
+/// submission-error paths can acquire and clear a buffer without submitting it.
+#[inline]
+pub fn on_virtiofs_response_submitted(opcode: u32, capacity: usize, fallback: bool) {
+    if !detailed_stats_enabled() {
+        return;
+    }
+
+    let bucket = opcode_bucket(opcode);
+    inc(&OPCODE_RESPONSE_SUBMITTED_CAPACITY_COUNT[bucket]);
+    add(
+        &OPCODE_RESPONSE_SUBMITTED_CAPACITY_BYTES[bucket],
+        capacity as u64,
+    );
+    if fallback {
+        inc(&OPCODE_RESPONSE_CAPACITY_FALLBACK_COUNT[bucket]);
+    }
+}
+
+/// Record the used-ring length against the submitted response capacity.
+///
+/// Valid completions contribute to the completed/used/unused-tail identity. An
+/// overrun is kept in a disjoint event domain and records only the excess bytes,
+/// avoiding unsigned subtraction and misleading completed-capacity accounting.
+#[inline]
+pub fn on_virtiofs_response_completed(opcode: u32, capacity: usize, used_len: usize) {
+    if !detailed_stats_enabled() {
+        return;
+    }
+
+    let bucket = opcode_bucket(opcode);
+    if used_len > capacity {
+        inc(&OPCODE_RESPONSE_OVERRUN_COUNT[bucket]);
+        add(
+            &OPCODE_RESPONSE_OVERRUN_BYTES[bucket],
+            (used_len - capacity) as u64,
+        );
+        return;
+    }
+
+    add(
+        &OPCODE_RESPONSE_COMPLETED_CAPACITY_BYTES[bucket],
+        capacity as u64,
+    );
+    add(&OPCODE_RESPONSE_USED_BYTES[bucket], used_len as u64);
+    add(
+        &OPCODE_RESPONSE_UNUSED_TAIL_BYTES[bucket],
+        (capacity - used_len) as u64,
+    );
 }
 
 #[inline]
@@ -862,6 +931,14 @@ opcode_{opcode}_response_buffer_reuse_count {}\n\
 opcode_{opcode}_response_buffer_reuse_bytes {}\n\
 opcode_{opcode}_response_buffer_zero_count {}\n\
 opcode_{opcode}_response_buffer_zero_bytes {}\n\
+opcode_{opcode}_response_submitted_capacity_count {}\n\
+opcode_{opcode}_response_submitted_capacity_bytes {}\n\
+opcode_{opcode}_response_capacity_fallback_count {}\n\
+opcode_{opcode}_response_completed_capacity_bytes {}\n\
+opcode_{opcode}_response_used_bytes {}\n\
+opcode_{opcode}_response_unused_tail_bytes {}\n\
+opcode_{opcode}_response_overrun_count {}\n\
+opcode_{opcode}_response_overrun_bytes {}\n\
 opcode_{opcode}_reply_payload_copy_count {}\n\
 opcode_{opcode}_reply_payload_copy_bytes {}",
             OPCODE_REQUESTS_TOTAL[opcode].load(Ordering::Relaxed),
@@ -874,6 +951,14 @@ opcode_{opcode}_reply_payload_copy_bytes {}",
             OPCODE_RESPONSE_BUFFER_REUSE_BYTES[opcode].load(Ordering::Relaxed),
             OPCODE_RESPONSE_BUFFER_ZERO_COUNT[opcode].load(Ordering::Relaxed),
             OPCODE_RESPONSE_BUFFER_ZERO_BYTES[opcode].load(Ordering::Relaxed),
+            OPCODE_RESPONSE_SUBMITTED_CAPACITY_COUNT[opcode].load(Ordering::Relaxed),
+            OPCODE_RESPONSE_SUBMITTED_CAPACITY_BYTES[opcode].load(Ordering::Relaxed),
+            OPCODE_RESPONSE_CAPACITY_FALLBACK_COUNT[opcode].load(Ordering::Relaxed),
+            OPCODE_RESPONSE_COMPLETED_CAPACITY_BYTES[opcode].load(Ordering::Relaxed),
+            OPCODE_RESPONSE_USED_BYTES[opcode].load(Ordering::Relaxed),
+            OPCODE_RESPONSE_UNUSED_TAIL_BYTES[opcode].load(Ordering::Relaxed),
+            OPCODE_RESPONSE_OVERRUN_COUNT[opcode].load(Ordering::Relaxed),
+            OPCODE_RESPONSE_OVERRUN_BYTES[opcode].load(Ordering::Relaxed),
             OPCODE_REPLY_PAYLOAD_COPY_COUNT[opcode].load(Ordering::Relaxed),
             OPCODE_REPLY_PAYLOAD_COPY_BYTES[opcode].load(Ordering::Relaxed),
         )

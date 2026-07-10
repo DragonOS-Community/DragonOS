@@ -567,6 +567,33 @@ TEST(OverlayFsSemantics, MknodWhiteoutOnOverlayIsDenied) {
     remove_tree(root);
 }
 
+TEST(OverlayFsSemantics, MknodFifoOverWhiteoutCreatesReachableUpperNode) {
+    ScopedOverlayEnv scoped("overlayfs_mknod_fifo_whiteout");
+    const auto& env = scoped.env;
+    std::string lower_entry = join_path(env.lower, "entry");
+    std::string upper_entry = join_path(env.upper, "entry");
+    std::string merged_entry = join_path(env.merged, "entry");
+
+    prepare_overlay_env(env);
+    ASSERT_EQ(0, write_text(lower_entry, "lower"));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    ASSERT_EQ(0, unlink(merged_entry.c_str())) << strerror(errno);
+    ASSERT_TRUE(is_whiteout(upper_entry));
+    ASSERT_EQ(0, mkfifo(merged_entry.c_str(), 0640)) << strerror(errno);
+
+    struct stat merged_st = {};
+    struct stat upper_st = {};
+    struct stat lower_st = {};
+    ASSERT_EQ(0, lstat(merged_entry.c_str(), &merged_st)) << strerror(errno);
+    ASSERT_EQ(0, lstat(upper_entry.c_str(), &upper_st)) << strerror(errno);
+    ASSERT_EQ(0, lstat(lower_entry.c_str(), &lower_st)) << strerror(errno);
+    EXPECT_TRUE(S_ISFIFO(merged_st.st_mode));
+    EXPECT_TRUE(S_ISFIFO(upper_st.st_mode));
+    EXPECT_TRUE(S_ISREG(lower_st.st_mode));
+    EXPECT_EQ(0, overlay_temp_entry_count(env.work));
+}
+
 TEST(OverlayFsSemantics, LowerWhiteoutHidesLowerLayers) {
     char root[128] = {};
     char upper[160] = {};

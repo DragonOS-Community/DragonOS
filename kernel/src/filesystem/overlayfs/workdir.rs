@@ -28,18 +28,21 @@ impl OvlInode {
         Err(SystemError::EEXIST)
     }
 
-    pub(super) fn cleanup_workdir_temp(workdir: &Arc<dyn IndexNode>, name: &str) {
-        let Ok(inode) = workdir.find(name) else {
-            return;
+    pub(super) fn cleanup_workdir_temp(
+        workdir: &Arc<dyn IndexNode>,
+        name: &str,
+    ) -> Result<(), SystemError> {
+        let inode = match workdir.find(name) {
+            Ok(inode) => inode,
+            Err(SystemError::ENOENT) => return Ok(()),
+            Err(err) => return Err(err),
         };
-        let Ok(metadata) = inode.metadata() else {
-            return;
-        };
+        let metadata = inode.metadata()?;
 
         if metadata.file_type == FileType::Dir {
-            let _ = workdir.rmdir(name);
+            workdir.rmdir(name)
         } else {
-            let _ = workdir.unlink(name);
+            workdir.unlink(name)
         }
     }
 }

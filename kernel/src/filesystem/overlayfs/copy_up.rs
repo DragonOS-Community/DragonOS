@@ -118,22 +118,18 @@ impl OvlInode {
             &metadata,
             copy_size,
         ) {
-            Self::cleanup_workdir_temp(&workdir, &temp_name);
+            let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
+            return Err(err);
+        }
+
+        if let Err(err) = Self::restore_copy_up_metadata(&temp_inode, &metadata) {
+            let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
             return Err(err);
         }
 
         let publish_outcome = if copy_size == Some(0) && metadata.file_type == FileType::File {
-            let truncate_result = (|| {
-                // Truncate privilege-bit rules must use the lower inode's semantic owner/group.
-                let mut temp_metadata = temp_inode.metadata()?;
-                temp_metadata.uid = metadata.uid;
-                temp_metadata.gid = metadata.gid;
-                temp_metadata.mode = metadata.mode;
-                temp_inode.set_metadata(&temp_metadata)?;
-                vfs::vcore::vfs_truncate(temp_inode.clone(), 0)
-            })();
-            if let Err(err) = truncate_result {
-                Self::cleanup_workdir_temp(&workdir, &temp_name);
+            if let Err(err) = vfs::vcore::vfs_truncate(temp_inode.clone(), 0) {
+                let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
                 return Err(err);
             }
             CopyUpOutcome::PublishedAfterTruncate
@@ -147,13 +143,13 @@ impl OvlInode {
                 return Ok(publish_outcome);
             }
             Err(SystemError::EEXIST) => {
-                Self::cleanup_workdir_temp(&workdir, &temp_name);
+                let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
                 let existing = parent_inode.find(name)?;
                 *upper_inode = Some(Self::validate_existing_upper(existing, &metadata)?);
                 return Ok(CopyUpOutcome::Existing);
             }
             Err(err) => {
-                Self::cleanup_workdir_temp(&workdir, &temp_name);
+                let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
                 return Err(err);
             }
         }
@@ -273,6 +269,21 @@ impl OvlInode {
             }
             _ => workdir.create_with_data(temp_name, metadata.file_type, metadata.mode, 0),
         }
+    }
+
+    fn restore_copy_up_metadata(
+        upper_inode: &Arc<dyn IndexNode>,
+        lower_metadata: &Metadata,
+    ) -> Result<(), SystemError> {
+        let mut upper_metadata = upper_inode.metadata()?;
+        if lower_metadata.file_type != FileType::SymLink {
+            upper_metadata.mode = lower_metadata.mode;
+        }
+        upper_metadata.uid = lower_metadata.uid;
+        upper_metadata.gid = lower_metadata.gid;
+        upper_metadata.atime = lower_metadata.atime;
+        upper_metadata.mtime = lower_metadata.mtime;
+        upper_inode.set_metadata(&upper_metadata)
     }
 
     fn copy_up_file_type(file_type: FileType) -> FileType {

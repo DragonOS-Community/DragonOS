@@ -118,7 +118,7 @@ impl OvlInode {
             &metadata,
             copy_size,
         ) {
-            Self::cleanup_workdir_temp(&workdir, &temp_name);
+            let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
             return Err(err);
         }
 
@@ -133,7 +133,7 @@ impl OvlInode {
                 vfs::vcore::vfs_truncate(temp_inode.clone(), 0)
             })();
             if let Err(err) = truncate_result {
-                Self::cleanup_workdir_temp(&workdir, &temp_name);
+                let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
                 return Err(err);
             }
             CopyUpOutcome::PublishedAfterTruncate
@@ -147,13 +147,13 @@ impl OvlInode {
                 return Ok(publish_outcome);
             }
             Err(SystemError::EEXIST) => {
-                Self::cleanup_workdir_temp(&workdir, &temp_name);
+                let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
                 let existing = parent_inode.find(name)?;
                 *upper_inode = Some(Self::validate_existing_upper(existing, &metadata)?);
                 return Ok(CopyUpOutcome::Existing);
             }
             Err(err) => {
-                Self::cleanup_workdir_temp(&workdir, &temp_name);
+                let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
                 return Err(err);
             }
         }

@@ -58,7 +58,7 @@ impl OvlInode {
         };
 
         if let Err(err) = workdir.move_to(&temp_name, &upper_dir, name, flags) {
-            Self::cleanup_workdir_temp(&workdir, &temp_name);
+            let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
             return Err(err);
         }
 

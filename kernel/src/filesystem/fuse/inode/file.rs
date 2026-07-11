@@ -17,7 +17,7 @@ use crate::{
 };
 
 use super::super::{
-    conn::FuseRequestCred,
+    conn::{BackgroundReadPagesCtx, FuseRequestCred},
     private_data::{
         FuseFilePrivateData, FuseOpenContext, FuseOpenPrivateData, FuseWritebackHandle,
     },
@@ -37,6 +37,12 @@ use super::FuseNode;
 #[derive(Debug)]
 struct FusePageCacheBackend {
     node: Weak<FuseNode>,
+}
+
+struct FillPagesFileCtx {
+    file_size: usize,
+    fh: u64,
+    file_flags: u32,
 }
 
 impl FusePageCacheBackend {
@@ -774,12 +780,10 @@ impl FuseNode {
         page_cache: &Arc<PageCache>,
         start_page: usize,
         end_page: usize,
-        file_size: usize,
-        fh: u64,
-        file_flags: u32,
         demand_end_page: usize,
+        file_ctx: &FillPagesFileCtx,
     ) -> Result<(usize, Option<usize>), SystemError> {
-        if start_page >= end_page || file_size == 0 {
+        if start_page >= end_page || file_ctx.file_size == 0 {
             return Ok((0, None));
         }
 
@@ -815,7 +819,7 @@ impl FuseNode {
             let read_offset = run_start
                 .checked_mul(MMArch::PAGE_SIZE)
                 .ok_or(SystemError::EOVERFLOW)?;
-            if read_offset >= file_size {
+            if read_offset >= file_ctx.file_size {
                 break;
             }
 
@@ -824,7 +828,7 @@ impl FuseNode {
                 .ok_or(SystemError::EOVERFLOW)?;
             let read_len = core::cmp::min(
                 core::cmp::min(read_pages_len, max_read),
-                file_size - read_offset,
+                file_ctx.file_size - read_offset,
             );
             if read_len == 0 {
                 break;
@@ -844,26 +848,28 @@ impl FuseNode {
                 Err(error) => return Err(error),
             };
             let read_in = FuseReadIn {
-                fh,
+                fh: file_ctx.fh,
                 offset: read_offset as u64,
                 size: read_len as u32,
                 read_flags: 0,
                 lock_owner: 0,
-                flags: file_flags,
+                flags: file_ctx.file_flags,
                 padding: 0,
             };
             let speculative = run_start >= demand_end_page;
             let pending = self.conn().enqueue_background_read_pages(
                 self.nodeid,
-                &fuse_pack_struct(&read_in),
-                target.clone(),
+                fuse_pack_struct(&read_in),
                 FuseRequestCred::from_current(),
                 speculative,
-                self.self_ref.clone(),
-                run_start,
-                read_len,
-                file_size,
-                observed_attr_version,
+                BackgroundReadPagesCtx {
+                    destination: target.clone(),
+                    node: self.self_ref.clone(),
+                    start_page: run_start,
+                    requested: read_len,
+                    observed_size: file_ctx.file_size,
+                    observed_attr_version,
+                },
             );
             let pending = match pending {
                 Ok(Some(pending)) => pending,
@@ -981,14 +987,17 @@ impl FuseNode {
                 start_page_index.saturating_add(readaround_pages),
             ),
         );
+        let file_ctx = FillPagesFileCtx {
+            file_size,
+            fh,
+            file_flags,
+        };
         let (_, mut truncate_eof) = self.fill_page_cache_range_with_open(
             &page_cache,
             start_page_index,
             prefetch_end,
-            file_size,
-            fh,
-            file_flags,
             end_page_index + 1,
+            &file_ctx,
         )?;
         let observed_attr_version = self.attr_version();
 
@@ -1150,14 +1159,17 @@ impl FuseNode {
         let pages_to_read = core::cmp::min(max_pages, core::cmp::max(req_pages, 16));
         let end_page = core::cmp::min(last_file_page + 1, page_index.saturating_add(pages_to_read));
 
+        let file_ctx = FillPagesFileCtx {
+            file_size,
+            fh,
+            file_flags,
+        };
         let (total_read, truncate_eof) = self.fill_page_cache_range_with_open(
             &page_cache,
             page_index,
             end_page,
-            file_size,
-            fh,
-            file_flags,
             page_index.saturating_add(req_pages),
+            &file_ctx,
         )?;
 
         if let Some(eof) = truncate_eof {

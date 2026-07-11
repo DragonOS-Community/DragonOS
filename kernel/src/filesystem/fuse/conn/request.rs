@@ -44,6 +44,16 @@ enum FuseReplyRouting {
     ReadPages(Arc<PageCacheReadDmaReservation>),
 }
 
+/// Bundled context for a background read-pages request.
+pub(crate) struct BackgroundReadPagesCtx {
+    pub destination: Arc<PageCacheReadDmaReservation>,
+    pub node: alloc::sync::Weak<super::super::inode::FuseNode>,
+    pub start_page: usize,
+    pub requested: usize,
+    pub observed_size: usize,
+    pub observed_attr_version: u64,
+}
+
 impl FuseConn {
     fn is_high_priority_opcode(opcode: u32) -> bool {
         matches!(opcode, FUSE_FORGET | FUSE_INTERRUPT)
@@ -160,14 +170,9 @@ impl FuseConn {
         &self,
         nodeid: u64,
         payload: &[u8],
-        destination: Arc<PageCacheReadDmaReservation>,
         req_cred: FuseRequestCred,
         speculative: bool,
-        node: alloc::sync::Weak<super::super::inode::FuseNode>,
-        start_page: usize,
-        requested: usize,
-        observed_size: usize,
-        observed_attr_version: u64,
+        ctx: BackgroundReadPagesCtx,
     ) -> Result<Option<Arc<FusePendingState>>, SystemError> {
         self.wait_initialized()?;
         let Some(credit) = self.acquire_background_credit(speculative)? else {
@@ -179,12 +184,12 @@ impl FuseConn {
             FUSE_READ,
             Some(credit),
             Some(super::FuseReadCompletion {
-                target: destination.clone(),
-                node,
-                start_page,
-                requested,
-                observed_size,
-                observed_attr_version,
+                target: ctx.destination.clone(),
+                node: ctx.node,
+                start_page: ctx.start_page,
+                requested: ctx.requested,
+                observed_size: ctx.observed_size,
+                observed_attr_version: ctx.observed_attr_version,
             }),
         ));
         let req = self.build_request(
@@ -193,7 +198,7 @@ impl FuseConn {
             nodeid,
             payload,
             req_cred,
-            FuseReplyRouting::ReadPages(destination),
+            FuseReplyRouting::ReadPages(ctx.destination),
         )?;
         self.push_request(req, Some(pending.clone()), unique)?;
         Ok(Some(pending))

@@ -41,6 +41,7 @@ use super::{stats, trace};
 
 mod daemon;
 mod request;
+pub(crate) use request::BackgroundReadPagesCtx;
 
 fn wait_with_recheck<T, F>(waitq: &WaitQueue, mut check: F) -> Result<T, SystemError>
 where

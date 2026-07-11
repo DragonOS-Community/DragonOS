@@ -1,5 +1,5 @@
 use super::dir;
-use super::inode::OvlInode;
+use super::inode::{DirState, OvlInode};
 use crate::filesystem::vfs::{syscall::RenameFlags, IndexNode};
 use crate::libs::casting::DowncastArc;
 use alloc::sync::Arc;
@@ -16,17 +16,72 @@ pub(super) fn move_to(
         return Err(SystemError::EINVAL);
     }
 
-    let fs = inode.overlay_fs()?;
-    let _mutation_guard = fs.mutation_lock.lock();
-
     let target_ovl = target
         .clone()
         .downcast_arc::<OvlInode>()
         .ok_or(SystemError::EXDEV)?;
 
-    let source = inode.lookup_overlay_child(old_name)?;
+    let fs = inode.overlay_fs()?;
+    let source_state = inode.dir_state()?;
+    let target_state = target_ovl.dir_state()?;
+    let _commit_guard = fs.mutation_lock.lock();
+    let result = if Arc::ptr_eq(&source_state, &target_state) {
+        let _guard = source_state.mutation_lock.lock();
+        move_to_locked(
+            inode,
+            old_name,
+            &target_ovl,
+            new_name,
+            flags,
+            &source_state,
+            &target_state,
+        )
+    } else if Arc::as_ptr(&source_state) < Arc::as_ptr(&target_state) {
+        let _source_guard = source_state.mutation_lock.lock();
+        let _target_guard = target_state.mutation_lock.lock();
+        move_to_locked(
+            inode,
+            old_name,
+            &target_ovl,
+            new_name,
+            flags,
+            &source_state,
+            &target_state,
+        )
+    } else {
+        let _target_guard = target_state.mutation_lock.lock();
+        let _source_guard = source_state.mutation_lock.lock();
+        move_to_locked(
+            inode,
+            old_name,
+            &target_ovl,
+            new_name,
+            flags,
+            &source_state,
+            &target_state,
+        )
+    };
+    if result.is_ok() {
+        source_state.modified(&[old_name, new_name]);
+        if !Arc::ptr_eq(&source_state, &target_state) {
+            target_state.modified(&[old_name, new_name]);
+        }
+    }
+    result
+}
+
+fn move_to_locked(
+    inode: &OvlInode,
+    old_name: &str,
+    target_ovl: &Arc<OvlInode>,
+    new_name: &str,
+    flags: RenameFlags,
+    source_state: &DirState,
+    target_state: &DirState,
+) -> Result<(), SystemError> {
+    let source = inode.lookup_overlay_child_locked(old_name, source_state)?;
     let target_had_whiteout = target_ovl.has_whiteout(new_name);
-    let target_child = match target_ovl.lookup_overlay_child(new_name) {
+    let target_child = match target_ovl.lookup_overlay_child_locked(new_name, target_state) {
         Ok(found) => Some(found),
         Err(SystemError::ENOENT) => None,
         Err(err) => return Err(err),
@@ -34,6 +89,10 @@ pub(super) fn move_to(
 
     if flags.contains(RenameFlags::NOREPLACE) && target_child.is_some() {
         return Err(SystemError::EEXIST);
+    }
+
+    if inode.redirect == target_ovl.redirect && old_name == new_name {
+        return Ok(());
     }
 
     if flags.contains(RenameFlags::EXCHANGE) {
@@ -51,17 +110,13 @@ pub(super) fn move_to(
         return old_upper_dir.move_to(old_name, &new_upper_dir, new_name, flags);
     }
 
-    if inode.redirect == target_ovl.redirect && old_name == new_name {
-        return Ok(());
-    }
-
     let source_needs_whiteout = inode.lower_positive(old_name);
     let source_has_lower_tree = source.is_dir() && source.has_lower();
     if source_has_lower_tree {
         return Err(SystemError::EXDEV);
     }
 
-    if let Some(target_child) = target_child {
+    let target_child_state = if let Some(target_child) = target_child.as_ref() {
         if source.is_dir() && !target_child.is_dir() {
             return Err(SystemError::ENOTDIR);
         }
@@ -69,10 +124,21 @@ pub(super) fn move_to(
             return Err(SystemError::EISDIR);
         }
         if source.is_dir() && target_child.is_dir() {
-            let target_node: Arc<dyn IndexNode> = target_child.clone();
-            if !dir::is_dir_empty(&target_node)? {
-                return Err(SystemError::ENOTEMPTY);
-            }
+            Some(target_child.dir_state()?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let _target_child_guard = target_child_state
+        .as_ref()
+        .map(|state| state.mutation_lock.lock());
+    if let (Some(target_child), Some(target_child_state)) =
+        (target_child.as_ref(), target_child_state.as_ref())
+    {
+        if !dir::is_dir_empty_locked(target_child, target_child_state)? {
+            return Err(SystemError::ENOTEMPTY);
         }
     }
 

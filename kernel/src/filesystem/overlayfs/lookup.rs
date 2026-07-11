@@ -29,6 +29,29 @@ pub(super) fn find(
     inode: &OvlInode,
     name: &str,
 ) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
+    let state = inode.dir_state()?;
+    let _dir_guard = state.mutation_lock.lock();
+    find_locked(inode, name, &state)
+}
+
+pub(super) fn find_locked(
+    inode: &OvlInode,
+    name: &str,
+    state: &super::inode::DirState,
+) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
+    find_locked_revalidated(inode, name, state, false)
+}
+
+fn find_locked_revalidated(
+    inode: &OvlInode,
+    name: &str,
+    state: &super::inode::DirState,
+    replace_stale: bool,
+) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
+    let child_redirect = inode.child_redirect(name);
+    let version = inode.dir_version()?;
+    let cached = state.cached_lookup(&version, name);
+
     let mut upper_inode = None;
     let mut upper_file_type = None;
     if let Some(ref upper) = *inode.upper_inode.lock() {
@@ -93,13 +116,73 @@ pub(super) fn find(
         lower_inodes[0].metadata()?.file_type
     };
 
+    if let Some(cached) = cached {
+        if cached.redirect == child_redirect
+            && cached.file_type == file_type
+            && same_backing_set(&cached, upper_inode.as_ref(), &lower_inodes)?
+        {
+            return Ok(cached);
+        }
+    }
+
     let fs = inode.overlay_fs()?;
     let child = fs.intern_inode(
-        inode.child_redirect(name),
+        child_redirect.clone(),
         file_type,
         upper_inode,
         lower_inodes,
+        replace_stale,
     )?;
+    let Some(child) = child else {
+        // Serialize the refreshed backing lookup with both direct copy-up and
+        // publication of this object as an ancestor of another copy-up.
+        // Both lock domains are independent, and every dual acquisition uses
+        // leaf-before-ancestor order.
+        let _copy_up_guard = fs.copy_up_lock(&child_redirect).lock();
+        let _ancestor_guard = fs.ancestor_copy_up_lock(&child_redirect).lock();
+        return find_locked_revalidated(inode, name, state, true);
+    };
+
+    state.cache_lookup(name, child.clone());
 
     Ok(child)
+}
+
+fn same_backing_set(
+    cached: &OvlInode,
+    upper: Option<&Arc<dyn IndexNode>>,
+    lowers: &[Arc<dyn IndexNode>],
+) -> Result<bool, SystemError> {
+    let cached_upper = cached.upper_inode.lock().clone();
+    if !same_optional_inode(cached_upper.as_ref(), upper)?
+        || cached.lower_inodes.len() != lowers.len()
+    {
+        return Ok(false);
+    }
+    for (cached, current) in cached.lower_inodes.iter().zip(lowers) {
+        if !same_inode(cached, current)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn same_optional_inode(
+    left: Option<&Arc<dyn IndexNode>>,
+    right: Option<&Arc<dyn IndexNode>>,
+) -> Result<bool, SystemError> {
+    match (left, right) {
+        (None, None) => Ok(true),
+        (Some(left), Some(right)) => same_inode(left, right),
+        _ => Ok(false),
+    }
+}
+
+fn same_inode(left: &Arc<dyn IndexNode>, right: &Arc<dyn IndexNode>) -> Result<bool, SystemError> {
+    if !Arc::ptr_eq(&left.fs(), &right.fs()) {
+        return Ok(false);
+    }
+    let left = left.metadata()?;
+    let right = right.metadata()?;
+    Ok(left.dev_id == right.dev_id && left.inode_id == right.inode_id)
 }

@@ -98,6 +98,7 @@ pub(super) fn write_at(
     let _privilege_guard = inode.content_privilege_lock.lock();
     let (backing_file, _) = backing_file_for_io(inode, data)?;
     let fs = inode.overlay_fs()?;
+    let _content_guard = fs.content_lock(&backing_file.inode())?.lock();
     let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
     super::metadata::remove_security_capability(&backing_file.inode())?;
     backing_file.pwrite(offset, len, buf)
@@ -238,6 +239,8 @@ fn open_backing_file(
         backing_cred.clone(),
     )?;
     if inode.file_type == FileType::File && backing_is_upper && needs_post_open_truncate {
+        let fs = inode.overlay_fs()?;
+        let _content_guard = fs.content_lock(&backing_file.inode())?.lock();
         vcore::vfs_truncate_file(
             backing_file.inode(),
             0,

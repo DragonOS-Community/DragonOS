@@ -14,6 +14,7 @@ use crate::process::{
 };
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use system_error::SystemError;
 
 const COPY_UP_CHUNK_SIZE: usize = 64 * 1024;
@@ -59,7 +60,7 @@ impl OvlInode {
         };
 
         let fs = self.overlay_fs()?;
-        let _mutation_guard = fs.mutation_lock.lock();
+        let _copy_up_guard = fs.copy_up_lock(&self.redirect).lock();
         let outcome = self.copy_up_locked_with_size(copy_size)?;
         if copy_size.is_none() {
             Ok(OpenCopyUpOutcome::NoTruncateRequested)
@@ -71,10 +72,14 @@ impl OvlInode {
     }
 
     pub(super) fn copy_up_locked(&self) -> Result<(), SystemError> {
+        let fs = self.overlay_fs()?;
+        let _copy_up_guard = fs.copy_up_lock(&self.redirect).lock();
         self.copy_up_locked_with_size(None).map(|_| ())
     }
 
     pub(super) fn copy_up_locked_for_truncate(&self, len: usize) -> Result<(), SystemError> {
+        let fs = self.overlay_fs()?;
+        let _copy_up_guard = fs.copy_up_lock(&self.redirect).lock();
         self.copy_up_locked_with_size(Some(len)).map(|_| ())
     }
 
@@ -101,13 +106,31 @@ impl OvlInode {
 
         let (parent_path, name) = self.upper_parent_path_and_name();
         let parent_inode = self.ensure_upper_dir_path(parent_path)?;
+        // Directory copy-up and publication of this path as another object's
+        // ancestor share the same exact-path commit domain.  Parent ancestor
+        // guards have already been released by ensure_upper_dir_path().
+        let _ancestor_publish_guard = (metadata.file_type == FileType::Dir)
+            .then(|| fs.ancestor_copy_up_lock(&self.redirect).lock());
         match parent_inode.find(name) {
-            Ok(existing) => {
+            Ok(existing)
+                if metadata.file_type == FileType::Dir
+                    && fs.matches_ancestor_publication(
+                        &self.redirect,
+                        &self.lower_inodes,
+                        &existing,
+                    )? =>
+            {
                 let existing = Self::validate_existing_upper(existing, &metadata)?;
                 self.set_origin(metadata::load_origin(self, &existing)?);
                 *upper_inode = Some(existing);
                 return Ok(CopyUpOutcome::Existing);
             }
+            // The redirect stripe is held for the whole copy-up, so another
+            // copy-up of this object cannot have published this entry.  An
+            // unexpected upper therefore belongs to a newer namespace
+            // object; adopting it would let a stale lower inode modify that
+            // replacement.
+            Ok(_) => return Err(SystemError::ESTALE),
             Err(SystemError::ENOENT) => {}
             Err(err) => return Err(err),
         }
@@ -186,11 +209,10 @@ impl OvlInode {
             }
             Err(SystemError::EEXIST) => {
                 let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
-                let existing = parent_inode.find(name)?;
-                let existing = Self::validate_existing_upper(existing, &metadata)?;
-                self.set_origin(metadata::load_origin(self, &existing)?);
-                *upper_inode = Some(existing);
-                return Ok(CopyUpOutcome::Existing);
+                // NOREPLACE can fail here only if the parent namespace changed
+                // after the absence check above.  Never bind this stale lower
+                // inode to the replacement that won the race.
+                return Err(SystemError::ESTALE);
             }
             Err(err) => {
                 let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
@@ -219,6 +241,11 @@ impl OvlInode {
             }
             current_path.push_str(component);
 
+            // Serialize the absence check and publication for this ancestor
+            // independently from leaf copy-up stripes.  The guard is dropped
+            // after each component, so ancestor locks are never nested.
+            let fs = self.overlay_fs()?;
+            let _ancestor_guard = fs.ancestor_copy_up_lock(&current_path).lock();
             match current.find(component) {
                 Ok(next) => {
                     if Self::is_whiteout_inode_checked(&next)?
@@ -238,19 +265,23 @@ impl OvlInode {
         Ok(current)
     }
 
-    fn lower_dir_inode(&self, path: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+    fn lower_dir_inodes(&self, path: &str) -> Result<Vec<Arc<dyn IndexNode>>, SystemError> {
         let fs = self.overlay_fs()?;
+        let mut lowers = Vec::new();
         for layer in fs.layers.iter().skip(1) {
             if let Some(lower_root) = layer.mnt.lower_inodes.first() {
-                if let Ok(inode) = lower_root.lookup(path) {
-                    if inode.metadata()?.file_type == FileType::Dir {
-                        return Ok(inode);
-                    }
-                    return Err(SystemError::ENOTDIR);
+                match lower_root.lookup(path) {
+                    Ok(inode) if inode.metadata()?.file_type == FileType::Dir => lowers.push(inode),
+                    Ok(_) if lowers.is_empty() => return Err(SystemError::ENOTDIR),
+                    Ok(_) => break,
+                    Err(SystemError::ENOENT) => {}
+                    Err(err) => return Err(err),
                 }
             }
         }
-        Err(SystemError::ENOENT)
+        (!lowers.is_empty())
+            .then_some(lowers)
+            .ok_or(SystemError::ENOENT)
     }
 
     fn copy_up_dir_component(
@@ -259,7 +290,37 @@ impl OvlInode {
         name: &str,
         lower_path: &str,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        let lower = self.lower_dir_inode(lower_path)?;
+        let fs = self.overlay_fs()?;
+        let lowers = self.lower_dir_inodes(lower_path)?;
+        let lower = &lowers[0];
+        let cached_dirs = fs.cached_lower_dirs(lower_path, &lowers)?;
+        let mut cached_upper_guards = cached_dirs
+            .iter()
+            .map(|inode| inode.upper_inode.lock())
+            .collect::<Vec<_>>();
+        match upper_parent.find(name) {
+            Ok(existing) => {
+                if Self::is_whiteout_inode_checked(&existing)?
+                    || existing.metadata()?.file_type != FileType::Dir
+                {
+                    return Err(SystemError::ENOTDIR);
+                }
+                for upper in cached_upper_guards
+                    .iter()
+                    .filter_map(|upper| upper.as_ref())
+                {
+                    if fs.same_backing_inode(upper, &existing)? {
+                        return Ok(existing);
+                    }
+                }
+                if fs.matches_ancestor_publication(lower_path, &lowers, &existing)? {
+                    return Ok(existing);
+                }
+                return Err(SystemError::ESTALE);
+            }
+            Err(SystemError::ENOENT) => {}
+            Err(err) => return Err(err),
+        }
         let lower_metadata = lower.metadata()?;
         let parent_metadata = upper_parent.metadata()?;
         let (workdir, temp, temp_name) = self.create_workdir_temp(|workdir, temp_name| {
@@ -267,29 +328,41 @@ impl OvlInode {
         })?;
 
         let prepared = (|| {
-            metadata::copy_xattrs(&lower, &temp)?;
-            metadata::prepare_origin(self, &lower, &temp, &lower_metadata)?;
-            Self::restore_copy_up_metadata(&temp, &lower_metadata)
+            metadata::copy_xattrs(lower, &temp)?;
+            let origin = metadata::prepare_origin(self, lower, &temp, &lower_metadata)?;
+            Self::restore_copy_up_metadata(&temp, &lower_metadata)?;
+            Ok(origin)
         })();
-        if let Err(err) = prepared {
-            let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
-            return Err(err);
-        }
+        let origin = match prepared {
+            Ok(origin) => origin,
+            Err(err) => {
+                let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
+                return Err(err);
+            }
+        };
+        let publication = match fs.prepare_ancestor_publication(&lowers, &temp) {
+            Ok(publication) => publication,
+            Err(err) => {
+                let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
+                return Err(err);
+            }
+        };
 
         match workdir.move_to(&temp_name, upper_parent, name, RenameFlags::NOREPLACE) {
             Ok(()) => {
                 Self::restore_parent_timestamps(upper_parent, &parent_metadata);
+                for (inode, upper) in cached_dirs.iter().zip(cached_upper_guards.iter_mut()) {
+                    if upper.is_none() {
+                        **upper = Some(temp.clone());
+                        inode.set_origin(origin);
+                    }
+                }
+                fs.remember_ancestor_publication(lower_path, publication);
                 Ok(temp)
             }
             Err(SystemError::EEXIST) => {
                 let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
-                let existing = upper_parent.find(name)?;
-                if Self::is_whiteout_inode_checked(&existing)?
-                    || existing.metadata()?.file_type != FileType::Dir
-                {
-                    return Err(SystemError::EIO);
-                }
-                Ok(existing)
+                Err(SystemError::ESTALE)
             }
             Err(err) => {
                 let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);

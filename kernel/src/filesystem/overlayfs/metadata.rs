@@ -414,10 +414,10 @@ pub(super) fn resize_with_lock_owner(
     lock_owner: u64,
 ) -> Result<(), SystemError> {
     let fs = inode.overlay_fs()?;
-    let _mutation_guard = fs.mutation_lock.lock();
     let _privilege_guard = inode.content_privilege_lock.lock();
     inode.copy_up_locked_for_truncate(len)?;
     let upper = inode.upper_inode.lock().clone().ok_or(SystemError::EIO)?;
+    let _content_guard = fs.content_lock(&upper)?.lock();
     let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
     remove_security_capability(&upper)?;
     upper.resize_with_lock_owner(len, lock_owner)
@@ -432,12 +432,13 @@ pub(super) fn set_metadata_masked(
         return Ok(());
     }
     let fs = inode.overlay_fs()?;
-    let _mutation_guard = fs.mutation_lock.lock();
     let kill_capability = metadata_change_kills_capability(mask);
-    let _privilege_guard = kill_capability.then(|| inode.content_privilege_lock.lock());
+    let _privilege_guard = inode.content_privilege_lock.lock();
     check_metadata_mutation_permission(inode, requested, mask)?;
     inode.copy_up_locked()?;
     let upper = inode.upper_inode.lock().clone().ok_or(SystemError::EIO)?;
+    let _content_guard = fs.content_lock(&upper)?.lock();
+    check_metadata_mutation_permission(inode, requested, mask)?;
     let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
     if kill_capability {
         remove_security_capability(&upper)?;
@@ -464,11 +465,12 @@ pub(super) fn resize_with_metadata(
     mask: SetMetadataMask,
 ) -> Result<(), SystemError> {
     let fs = inode.overlay_fs()?;
-    let _mutation_guard = fs.mutation_lock.lock();
     let _privilege_guard = inode.content_privilege_lock.lock();
     check_metadata_mutation_permission(inode, requested, mask)?;
     inode.copy_up_locked_for_truncate(len)?;
     let upper = inode.upper_inode.lock().clone().ok_or(SystemError::EIO)?;
+    let _content_guard = fs.content_lock(&upper)?.lock();
+    check_metadata_mutation_permission(inode, requested, mask)?;
     let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
     remove_security_capability(&upper)?;
     let mut upper_metadata = prepare_upper_metadata(&upper, requested, mask)?;
@@ -549,11 +551,12 @@ pub(super) fn resize_file_with_metadata(
     mask: SetMetadataMask,
 ) -> Result<(), SystemError> {
     let fs = inode.overlay_fs()?;
-    let _mutation_guard = fs.mutation_lock.lock();
     let _privilege_guard = inode.content_privilege_lock.lock();
     check_metadata_mutation_permission(inode, requested, mask)?;
     inode.copy_up_locked_for_truncate(len)?;
     let upper = inode.upper_inode.lock().clone().ok_or(SystemError::EIO)?;
+    let _content_guard = fs.content_lock(&upper)?.lock();
+    check_metadata_mutation_permission(inode, requested, mask)?;
     let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
     remove_security_capability(&upper)?;
     let mut upper_metadata = prepare_upper_metadata(&upper, requested, mask)?;
@@ -587,12 +590,12 @@ pub(super) fn setxattr(
         return Err(SystemError::EPERM);
     }
     let fs = inode.overlay_fs()?;
-    let _mutation_guard = fs.mutation_lock.lock();
-    let _privilege_guard =
-        (name == XATTR_SECURITY_CAPABILITY).then(|| inode.content_privilege_lock.lock());
+    let _privilege_guard = inode.content_privilege_lock.lock();
     check_xattr_mutation_permission(inode, name)?;
     inode.copy_up_locked()?;
     let upper = inode.upper_inode.lock().clone().ok_or(SystemError::EIO)?;
+    let _content_guard = fs.content_lock(&upper)?.lock();
+    check_xattr_mutation_permission(inode, name)?;
     let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
     upper.setxattr(name, value, flags)
 }
@@ -633,9 +636,7 @@ pub(super) fn removexattr(inode: &OvlInode, name: &str) -> Result<usize, SystemE
         return Err(SystemError::EPERM);
     }
     let fs = inode.overlay_fs()?;
-    let _mutation_guard = fs.mutation_lock.lock();
-    let _privilege_guard =
-        (name == XATTR_SECURITY_CAPABILITY).then(|| inode.content_privilege_lock.lock());
+    let _privilege_guard = inode.content_privilege_lock.lock();
     check_xattr_mutation_permission(inode, name)?;
     let copied_up_for_remove = !inode.has_upper();
     if copied_up_for_remove {
@@ -645,6 +646,8 @@ pub(super) fn removexattr(inode: &OvlInode, name: &str) -> Result<usize, SystemE
 
     inode.copy_up_locked()?;
     let upper = inode.upper_inode.lock().clone().ok_or(SystemError::EIO)?;
+    let _content_guard = fs.content_lock(&upper)?.lock();
+    check_xattr_mutation_permission(inode, name)?;
     let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
     match upper.removexattr(name) {
         Ok(size) => Ok(size),

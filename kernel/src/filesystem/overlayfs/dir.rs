@@ -1,4 +1,4 @@
-use super::inode::OvlInode;
+use super::inode::{DirState, OvlInode};
 use super::whiteout::WHITEOUT_DEV;
 use crate::driver::base::device::device_number::DeviceNumber;
 use crate::filesystem::vfs::{self, FileType, IndexNode};
@@ -10,14 +10,18 @@ pub(super) fn mkdir(
     name: &str,
     mode: vfs::InodeMode,
 ) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
-    let fs = inode.overlay_fs()?;
-    let _mutation_guard = fs.mutation_lock.lock();
-    create_over_whiteout(
+    let state = inode.dir_state()?;
+    let _mutation_guard = state.mutation_lock.lock();
+    let result = create_over_whiteout(
         inode,
         name,
         |dir, temp_name| dir.mkdir(temp_name, mode),
         true,
-    )
+    );
+    if result.is_ok() {
+        state.modified(&[name]);
+    }
+    result
 }
 
 pub(super) fn rmdir(inode: &OvlInode, name: &str) -> Result<(), SystemError> {
@@ -30,9 +34,13 @@ pub(super) fn unlink(inode: &OvlInode, name: &str) -> Result<(), SystemError> {
 
 fn remove(inode: &OvlInode, name: &str, is_dir: bool) -> Result<(), SystemError> {
     let fs = inode.overlay_fs()?;
-    let _mutation_guard = fs.mutation_lock.lock();
+    // rmdir keeps the mount-wide commit lock because it nests a child directory
+    // emptiness check. Unlink only needs the stable parent namespace lock.
+    let _commit_guard = is_dir.then(|| fs.mutation_lock.lock());
+    let state = inode.dir_state()?;
+    let _mutation_guard = state.mutation_lock.lock();
 
-    let child = inode.lookup_overlay_child(name)?;
+    let child = inode.lookup_overlay_child_locked(name, &state)?;
     if is_dir && !child.is_dir() {
         return Err(SystemError::ENOTDIR);
     }
@@ -40,32 +48,39 @@ fn remove(inode: &OvlInode, name: &str, is_dir: bool) -> Result<(), SystemError>
         return Err(SystemError::EISDIR);
     }
 
+    // Serialize the emptiness check and namespace commit with mutations made
+    // through an already-resolved fd for the child directory.  The parent
+    // lock alone cannot exclude create/unlink operations inside that child.
+    let child_state = is_dir.then(|| child.dir_state()).transpose()?;
+    let _child_mutation_guard = child_state.as_ref().map(|state| state.mutation_lock.lock());
+
     let lower_positive = inode.lower_positive(name);
-    if is_dir && (lower_positive || child.has_lower()) {
-        let child_inode: Arc<dyn IndexNode> = child.clone();
-        if !is_dir_empty(&child_inode)? {
-            return Err(SystemError::ENOTEMPTY);
-        }
+    if is_dir
+        && (lower_positive || child.has_lower())
+        && !is_dir_empty_locked(&child, child_state.as_ref().ok_or(SystemError::EIO)?)?
+    {
+        return Err(SystemError::ENOTEMPTY);
     }
 
     let upper_dir = inode.upper_inode.lock().clone();
-    if let Some(upper_dir) = upper_dir {
+    let result = if let Some(upper_dir) = upper_dir {
         match upper_dir.find(name) {
-            Ok(_) if lower_positive => {
-                return inode.replace_upper_with_whiteout_locked(name, is_dir);
-            }
-            Ok(_) if is_dir => return upper_dir.rmdir(name),
-            Ok(_) => return upper_dir.unlink(name),
-            Err(SystemError::ENOENT) => {}
-            Err(err) => return Err(err),
+            Ok(_) if lower_positive => inode.replace_upper_with_whiteout_locked(name, is_dir),
+            Ok(_) if is_dir => upper_dir.rmdir(name),
+            Ok(_) => upper_dir.unlink(name),
+            Err(SystemError::ENOENT) if lower_positive => inode.create_whiteout_locked(name),
+            Err(SystemError::ENOENT) => Err(SystemError::ENOENT),
+            Err(err) => Err(err),
         }
-    }
-
-    if lower_positive {
+    } else if lower_positive {
         inode.create_whiteout_locked(name)
     } else {
         Err(SystemError::ENOENT)
+    };
+    if result.is_ok() {
+        state.modified(&[name]);
     }
+    result
 }
 
 pub(super) fn link(
@@ -74,9 +89,10 @@ pub(super) fn link(
     other: &Arc<dyn IndexNode>,
 ) -> Result<(), system_error::SystemError> {
     let fs = inode.overlay_fs()?;
-    let _mutation_guard = fs.mutation_lock.lock();
+    let state = inode.dir_state()?;
+    let _mutation_guard = state.mutation_lock.lock();
 
-    match inode.find(name) {
+    match super::lookup::find_locked(inode, name, &state) {
         Ok(_) => return Err(SystemError::EEXIST),
         Err(SystemError::ENOENT) => {}
         Err(err) => return Err(err),
@@ -91,7 +107,7 @@ pub(super) fn link(
     source.copy_up_locked()?;
     let source_upper = source.upper_inode.lock().clone().ok_or(SystemError::EIO)?;
 
-    create_over_whiteout(
+    let result = create_over_whiteout(
         inode,
         name,
         |dir, temp_name| {
@@ -100,7 +116,11 @@ pub(super) fn link(
         },
         false,
     )
-    .map(|_| ())
+    .map(|_| ());
+    if result.is_ok() {
+        state.modified(&[name]);
+    }
+    result
 }
 
 pub(super) fn create(
@@ -109,14 +129,18 @@ pub(super) fn create(
     file_type: vfs::FileType,
     mode: vfs::InodeMode,
 ) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
-    let fs = inode.overlay_fs()?;
-    let _mutation_guard = fs.mutation_lock.lock();
-    create_over_whiteout(
+    let state = inode.dir_state()?;
+    let _mutation_guard = state.mutation_lock.lock();
+    let result = create_over_whiteout(
         inode,
         name,
         |dir, temp_name| dir.create(temp_name, file_type, mode),
         file_type == FileType::Dir,
-    )
+    );
+    if result.is_ok() {
+        state.modified(&[name]);
+    }
+    result
 }
 
 pub(super) fn mknod(
@@ -125,22 +149,28 @@ pub(super) fn mknod(
     mode: vfs::InodeMode,
     dev_t: DeviceNumber,
 ) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
-    let fs = inode.overlay_fs()?;
-    let _mutation_guard = fs.mutation_lock.lock();
+    let state = inode.dir_state()?;
+    let _mutation_guard = state.mutation_lock.lock();
     if FileType::from(mode) == FileType::CharDevice && dev_t == WHITEOUT_DEV {
         return Err(SystemError::EPERM);
     }
 
-    create_over_whiteout(
+    let result = create_over_whiteout(
         inode,
         filename,
         |dir, temp_name| dir.mknod(temp_name, mode, dev_t),
         FileType::from(mode) == FileType::Dir,
-    )
+    );
+    if result.is_ok() {
+        state.modified(&[filename]);
+    }
+    result
 }
 
-pub(super) fn is_dir_empty(inode: &Arc<dyn IndexNode>) -> Result<bool, SystemError> {
-    Ok(inode.list()?.iter().all(|entry| is_dot_entry(entry)))
+pub(super) fn is_dir_empty_locked(inode: &OvlInode, state: &DirState) -> Result<bool, SystemError> {
+    Ok(super::readdir::list_locked(inode, state)?
+        .iter()
+        .all(|entry| is_dot_entry(entry)))
 }
 
 fn create_over_whiteout<F>(

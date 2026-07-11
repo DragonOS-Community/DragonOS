@@ -13,6 +13,8 @@ use crate::filesystem::vfs::{
 use crate::libs::casting::DowncastArc;
 use crate::libs::mutex::Mutex;
 use crate::mm::VmFlags;
+use crate::time::PosixTimeSpec;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -29,9 +31,115 @@ pub struct OvlInode {
     pub(super) overlay_inode_id: Option<InodeId>,
     origin: Mutex<OriginState>,
     pub(super) content_privilege_lock: Mutex<()>,
+    dir_state: Mutex<Option<Arc<DirState>>>,
     #[allow(dead_code)]
     pub(super) oe: Arc<OvlEntry>,
     pub(super) fs: Mutex<Weak<OverlayFS>>,
+}
+
+const LOOKUP_CACHE_CAPACITY: usize = 256;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DirVersion {
+    dev_id: usize,
+    inode_id: InodeId,
+    size: i64,
+    mtime: PosixTimeSpec,
+    ctime: PosixTimeSpec,
+}
+
+#[derive(Debug, Default)]
+struct DirStateData {
+    generation: u64,
+    readdir_cache: Option<(u64, Arc<Vec<String>>)>,
+    lookup_cache: BTreeMap<String, Weak<OvlInode>>,
+    lookup_order: VecDeque<String>,
+    backing_version: Option<Vec<DirVersion>>,
+}
+
+#[derive(Debug)]
+pub(super) struct DirState {
+    pub(super) mutation_lock: Mutex<()>,
+    data: Mutex<DirStateData>,
+}
+
+impl Default for DirState {
+    fn default() -> Self {
+        Self {
+            mutation_lock: Mutex::new(()),
+            data: Mutex::new(DirStateData::default()),
+        }
+    }
+}
+
+impl DirState {
+    fn revalidate<'a>(data: &'a mut DirStateData, version: &[DirVersion]) -> &'a mut DirStateData {
+        if data.backing_version.as_deref() != Some(version) {
+            data.backing_version = Some(version.to_vec());
+            data.generation = data.generation.wrapping_add(1);
+            data.readdir_cache = None;
+            data.lookup_cache.clear();
+            data.lookup_order.clear();
+        }
+        data
+    }
+
+    pub(super) fn cached_readdir(&self, version: &[DirVersion]) -> Option<Arc<Vec<String>>> {
+        let mut data = self.data.lock();
+        let data = Self::revalidate(&mut data, version);
+        data.readdir_cache
+            .as_ref()
+            .filter(|(generation, _)| *generation == data.generation)
+            .map(|(_, entries)| entries.clone())
+    }
+
+    pub(super) fn cache_readdir(&self, version: &[DirVersion], entries: Arc<Vec<String>>) {
+        let mut data = self.data.lock();
+        let data = Self::revalidate(&mut data, version);
+        let generation = data.generation;
+        data.readdir_cache = Some((generation, entries));
+    }
+
+    pub(super) fn cached_lookup(
+        &self,
+        version: &[DirVersion],
+        name: &str,
+    ) -> Option<Arc<OvlInode>> {
+        let mut data = self.data.lock();
+        Self::revalidate(&mut data, version)
+            .lookup_cache
+            .get(name)
+            .and_then(Weak::upgrade)
+    }
+
+    pub(super) fn cache_lookup(&self, name: &str, inode: Arc<OvlInode>) {
+        if name == "." || name == ".." {
+            return;
+        }
+        let mut data = self.data.lock();
+        if data
+            .lookup_cache
+            .insert(name.to_string(), Arc::downgrade(&inode))
+            .is_none()
+        {
+            data.lookup_order.push_back(name.to_string());
+        }
+        while data.lookup_cache.len() > LOOKUP_CACHE_CAPACITY {
+            if let Some(oldest) = data.lookup_order.pop_front() {
+                data.lookup_cache.remove(&oldest);
+            }
+        }
+    }
+
+    pub(super) fn modified(&self, names: &[&str]) {
+        let mut data = self.data.lock();
+        data.generation = data.generation.wrapping_add(1);
+        data.readdir_cache = None;
+        for name in names {
+            data.lookup_cache.remove(*name);
+            data.lookup_order.retain(|cached| cached != name);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -57,6 +165,7 @@ impl OvlInode {
             overlay_inode_id,
             origin: Mutex::new(OriginState::Unchecked),
             content_privilege_lock: Mutex::new(()),
+            dir_state: Mutex::new(None),
             oe: Arc::new(OvlEntry::new()),
             fs: Mutex::new(Weak::default()),
         }
@@ -81,14 +190,48 @@ impl OvlInode {
         self.fs.lock().upgrade().ok_or(SystemError::EINVAL)
     }
 
+    pub(super) fn dir_state(&self) -> Result<Arc<DirState>, SystemError> {
+        if !self.is_dir() {
+            return Err(SystemError::ENOTDIR);
+        }
+        if let Some(state) = self.dir_state.lock().clone() {
+            return Ok(state);
+        }
+        let state = self.overlay_fs()?.intern_dir_state(self)?;
+        let mut slot = self.dir_state.lock();
+        Ok(slot.get_or_insert_with(|| state.clone()).clone())
+    }
+
+    pub(super) fn dir_version(&self) -> Result<Vec<DirVersion>, SystemError> {
+        let upper = self.upper_inode.lock().clone();
+        upper
+            .into_iter()
+            .chain(self.lower_inodes.iter().cloned())
+            .map(|inode| {
+                let metadata = inode.metadata()?;
+                Ok(DirVersion {
+                    dev_id: metadata.dev_id,
+                    inode_id: metadata.inode_id,
+                    size: metadata.size,
+                    mtime: metadata.mtime,
+                    ctime: metadata.ctime,
+                })
+            })
+            .collect()
+    }
+
     pub(super) fn downcast_overlay_inode(
         inode: Arc<dyn IndexNode>,
     ) -> Result<Arc<OvlInode>, SystemError> {
         inode.downcast_arc::<OvlInode>().ok_or(SystemError::EXDEV)
     }
 
-    pub(super) fn lookup_overlay_child(&self, name: &str) -> Result<Arc<OvlInode>, SystemError> {
-        Self::downcast_overlay_inode(self.find(name)?)
+    pub(super) fn lookup_overlay_child_locked(
+        &self,
+        name: &str,
+        state: &DirState,
+    ) -> Result<Arc<OvlInode>, SystemError> {
+        Self::downcast_overlay_inode(lookup::find_locked(self, name, state)?)
     }
 
     pub(super) fn has_upper(&self) -> bool {

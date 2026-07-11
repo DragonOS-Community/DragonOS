@@ -93,6 +93,18 @@ struct OvlInodeCache {
     insertions_since_prune: usize,
 }
 
+#[derive(Debug)]
+pub(super) struct AncestorPublication {
+    lower: Vec<RealInodeIdentity>,
+    upper: Weak<dyn IndexNode>,
+}
+
+#[derive(Debug, Default)]
+struct AncestorPublicationCache {
+    entries: BTreeMap<String, AncestorPublication>,
+    insertions_since_prune: usize,
+}
+
 const FALLBACK_DIR_CACHE_SIZE: usize = 256;
 const LOOKUP_RETENTION_SIZE: usize = 1024;
 const LOCK_STRIPE_COUNT: usize = 64;
@@ -164,6 +176,7 @@ pub(super) struct OverlayFS {
     pub(super) samefs: bool,
     inode_cache: Mutex<OvlInodeCache>,
     dir_state_cache: Mutex<DirStateCache>,
+    ancestor_publications: Mutex<AncestorPublicationCache>,
     copy_up_locks: Vec<Mutex<()>>,
     ancestor_copy_up_locks: Vec<Mutex<()>>,
     content_locks: Vec<Mutex<()>>,
@@ -299,6 +312,60 @@ impl OverlayFS {
         inodes.sort_by_key(Arc::as_ptr);
         inodes.dedup_by(|left, right| Arc::ptr_eq(left, right));
         Ok(inodes)
+    }
+
+    pub(super) fn prepare_ancestor_publication(
+        &self,
+        lowers: &[Arc<dyn IndexNode>],
+        upper: &Arc<dyn IndexNode>,
+    ) -> Result<AncestorPublication, SystemError> {
+        let lower = lowers
+            .iter()
+            .map(RealInodeIdentity::from_inode)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(AncestorPublication {
+            lower,
+            upper: Arc::downgrade(upper),
+        })
+    }
+
+    pub(super) fn remember_ancestor_publication(
+        &self,
+        redirect: &str,
+        publication: AncestorPublication,
+    ) {
+        let mut cache = self.ancestor_publications.lock();
+        if cache.insertions_since_prune >= INODE_CACHE_PRUNE_INTERVAL {
+            cache
+                .entries
+                .retain(|_, publication| publication.upper.strong_count() != 0);
+            cache.insertions_since_prune = 0;
+        }
+        cache.entries.insert(String::from(redirect), publication);
+        cache.insertions_since_prune += 1;
+    }
+
+    pub(super) fn matches_ancestor_publication(
+        &self,
+        redirect: &str,
+        lowers: &[Arc<dyn IndexNode>],
+        upper: &Arc<dyn IndexNode>,
+    ) -> Result<bool, SystemError> {
+        let lower = lowers
+            .iter()
+            .map(RealInodeIdentity::from_inode)
+            .collect::<Result<Vec<_>, _>>()?;
+        let published = self
+            .ancestor_publications
+            .lock()
+            .entries
+            .get(redirect)
+            .and_then(|publication| {
+                (publication.lower == lower)
+                    .then(|| publication.upper.upgrade())
+                    .flatten()
+            });
+        Ok(published.is_some_and(|published| Arc::ptr_eq(&published, upper)))
     }
 
     pub(super) fn same_backing_inode(
@@ -593,6 +660,7 @@ impl MountableFileSystem for OverlayFS {
                 samefs,
                 inode_cache: Mutex::new(OvlInodeCache::default()),
                 dir_state_cache: Mutex::new(DirStateCache::default()),
+                ancestor_publications: Mutex::new(AncestorPublicationCache::default()),
                 copy_up_locks: (0..LOCK_STRIPE_COUNT).map(|_| Mutex::new(())).collect(),
                 ancestor_copy_up_locks: (0..LOCK_STRIPE_COUNT).map(|_| Mutex::new(())).collect(),
                 content_locks: (0..LOCK_STRIPE_COUNT).map(|_| Mutex::new(())).collect(),

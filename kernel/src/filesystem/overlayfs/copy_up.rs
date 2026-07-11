@@ -295,6 +295,9 @@ impl OvlInode {
                         return Ok(existing);
                     }
                 }
+                if fs.matches_ancestor_publication(lower_path, &lowers, &existing)? {
+                    return Ok(existing);
+                }
                 return Err(SystemError::ESTALE);
             }
             Err(SystemError::ENOENT) => {}
@@ -319,6 +322,13 @@ impl OvlInode {
                 return Err(err);
             }
         };
+        let publication = match fs.prepare_ancestor_publication(&lowers, &temp) {
+            Ok(publication) => publication,
+            Err(err) => {
+                let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
+                return Err(err);
+            }
+        };
 
         match workdir.move_to(&temp_name, upper_parent, name, RenameFlags::NOREPLACE) {
             Ok(()) => {
@@ -329,6 +339,7 @@ impl OvlInode {
                         inode.set_origin(origin);
                     }
                 }
+                fs.remember_ancestor_publication(lower_path, publication);
                 Ok(temp)
             }
             Err(SystemError::EEXIST) => {

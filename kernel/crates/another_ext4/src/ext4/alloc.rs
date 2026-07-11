@@ -180,7 +180,12 @@ impl Ext4 {
     }
 
     fn rollback_new_inode(&self, inode_id: InodeId, is_dir: bool) -> Result<()> {
+        // The inode-table slot is the authoritative lifetime identity. It may
+        // still contain the previous generation, or the newly initialized
+        // generation if the write completed before reporting an error.
+        let generation = self.read_inode_uncached(inode_id)?.inode.generation();
         let mut inode = Box::new(Inode::default());
+        inode.set_generation(generation);
         inode.set_mode(if is_dir {
             InodeMode::DIRECTORY
         } else {

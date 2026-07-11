@@ -325,6 +325,20 @@ impl SuperBlockState {
     }
 
     fn dentry_state(&self, parent: InodeId, child: InodeId, name: DName) -> Arc<AtomicBool> {
+        self.get_dentry_state(parent, child, name, false)
+    }
+
+    fn live_dentry_state(&self, parent: InodeId, child: InodeId, name: DName) -> Arc<AtomicBool> {
+        self.get_dentry_state(parent, child, name, true)
+    }
+
+    fn get_dentry_state(
+        &self,
+        parent: InodeId,
+        child: InodeId,
+        name: DName,
+        require_live: bool,
+    ) -> Arc<AtomicBool> {
         let key = DentryKey {
             parent,
             child,
@@ -332,7 +346,9 @@ impl SuperBlockState {
         };
         let mut states = self.dentry_states.lock();
         if let Some(state) = states.get(&key).and_then(Weak::upgrade) {
-            return state;
+            if !require_live || !state.load(Ordering::Acquire) {
+                return state;
+            }
         }
         // Keep dead weak entries bounded without adding work to every lookup.
         if !states.is_empty() && states.len().is_multiple_of(256) {
@@ -961,12 +977,13 @@ impl MountFSInode {
     ) -> Arc<Self> {
         let mut parent_state = parent.dentry.lock();
         if let Some(cached) = parent_state.children.get(&name).and_then(Weak::upgrade) {
-            if cached
-                .inner_inode
-                .metadata()
-                .ok()
-                .zip(inner_inode.metadata().ok())
-                .is_some_and(|(cached, found)| cached.inode_id == found.inode_id)
+            if !cached.dentry.lock().disconnected.load(Ordering::Acquire)
+                && cached
+                    .inner_inode
+                    .metadata()
+                    .ok()
+                    .zip(inner_inode.metadata().ok())
+                    .is_some_and(|(cached, found)| cached.inode_id == found.inode_id)
             {
                 return cached;
             }
@@ -977,7 +994,7 @@ impl MountFSInode {
             .ok()
             .zip(inner_inode.metadata().ok())
             .map(|(parent, child)| {
-                mount_fs.super_block_state.dentry_state(
+                mount_fs.super_block_state.live_dentry_state(
                     parent.inode_id,
                     child.inode_id,
                     name.clone(),
@@ -1283,10 +1300,11 @@ impl MountFSInode {
             .get(&dname)
             .and_then(Weak::upgrade)
             .filter(|cached| {
-                cached
-                    .inner_inode
-                    .metadata()
-                    .is_ok_and(|metadata| metadata.inode_id == inode_id)
+                !cached.dentry.lock().disconnected.load(Ordering::Acquire)
+                    && cached
+                        .inner_inode
+                        .metadata()
+                        .is_ok_and(|metadata| metadata.inode_id == inode_id)
             });
         let mount_inode = cached.unwrap_or_else(|| {
             MountFSInode::new_child(inner_inode.clone(), base.mount_fs.clone(), &base, dname)

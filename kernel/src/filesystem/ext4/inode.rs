@@ -870,6 +870,13 @@ impl IndexNode for LockedExt4Inode {
             return Err(SystemError::ENOTDIR);
         }
         let target_num = concret_fs.lookup(inode_num, name)?;
+        if target_num == inode_num {
+            return Err(if name == "." {
+                SystemError::EINVAL
+            } else {
+                SystemError::ENOTEMPTY
+            });
+        }
         if concret_fs.getattr(target_num)?.ftype != FileType::Directory {
             return Err(SystemError::ENOTDIR);
         }

@@ -267,6 +267,7 @@ TEST(Ext4InodeIdentity, BindAliasAndMapsShareDeletedDentryState) {
     const std::string source_dir = base + "/source";
     const std::string bind_dir = base + "/bind";
     const std::string source = source_dir + "/file";
+    const std::string keeper = source_dir + "/keeper";
     const std::string alias = bind_dir + "/file";
 
     ASSERT_EQ(0, mkdir(base.c_str(), 0700)) << strerror(errno);
@@ -276,6 +277,7 @@ TEST(Ext4InodeIdentity, BindAliasAndMapsShareDeletedDentryState) {
     ASSERT_GE(create_fd, 0) << strerror(errno);
     ASSERT_EQ(0, ftruncate(create_fd, 4096)) << strerror(errno);
     ASSERT_EQ(0, close(create_fd)) << strerror(errno);
+    ASSERT_EQ(0, link(source.c_str(), keeper.c_str())) << strerror(errno);
     ASSERT_EQ(0, mount(source_dir.c_str(), bind_dir.c_str(), nullptr, MS_BIND, nullptr))
         << strerror(errno);
 
@@ -295,8 +297,22 @@ TEST(Ext4InodeIdentity, BindAliasAndMapsShareDeletedDentryState) {
     const std::string maps = ReadFile("/proc/self/maps");
     EXPECT_NE(std::string::npos, maps.find(deleted_path)) << maps;
 
+    ASSERT_EQ(0, link(keeper.c_str(), source.c_str())) << strerror(errno);
+    int recreated_fd = open(alias.c_str(), O_RDONLY);
+    ASSERT_GE(recreated_fd, 0) << strerror(errno);
+    const std::string recreated_proc_fd =
+        "/proc/self/fd/" + std::to_string(recreated_fd);
+    memset(target, 0, sizeof(target));
+    target_size =
+        readlink(recreated_proc_fd.c_str(), target, sizeof(target) - 1);
+    ASSERT_GT(target_size, 0) << strerror(errno);
+    EXPECT_EQ(alias, std::string(target, static_cast<size_t>(target_size)));
+    ASSERT_EQ(0, close(recreated_fd)) << strerror(errno);
+
     ASSERT_EQ(0, munmap(mapping, 4096)) << strerror(errno);
     ASSERT_EQ(0, close(alias_fd)) << strerror(errno);
+    ASSERT_EQ(0, unlink(source.c_str())) << strerror(errno);
+    ASSERT_EQ(0, unlink(keeper.c_str())) << strerror(errno);
     ASSERT_EQ(0, umount(bind_dir.c_str())) << strerror(errno);
     ASSERT_EQ(0, rmdir(bind_dir.c_str())) << strerror(errno);
     ASSERT_EQ(0, rmdir(source_dir.c_str())) << strerror(errno);

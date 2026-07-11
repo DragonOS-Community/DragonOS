@@ -2697,6 +2697,60 @@ TEST(OverlayFsSemantics, RenameNoReplaceOverWhiteoutTargetTreatsTargetAsAbsent) 
     cleanup_overlay_env(env);
 }
 
+TEST(OverlayFsSemantics, CopyUpDoesNotAdoptConcurrentReplacement) {
+    constexpr size_t kCopySize = 64 * 1024 * 1024;
+    ScopedOverlayEnv scoped("overlayfs_copy_up_replace_race");
+    const auto& env = scoped.env;
+    std::string lower_file = join_path(env.lower, "entry");
+    std::string upper_file = join_path(env.upper, "entry");
+    std::string merged_file = join_path(env.merged, "entry");
+
+    prepare_overlay_env(env);
+    int lower_fd = open(lower_file.c_str(), O_CREAT | O_WRONLY | O_CLOEXEC, 0644);
+    ASSERT_GE(lower_fd, 0) << strerror(errno);
+    std::vector<char> block(1024 * 1024, 'l');
+    for (size_t offset = 0; offset < kCopySize; offset += block.size()) {
+        ASSERT_EQ(static_cast<ssize_t>(block.size()),
+            write(lower_fd, block.data(), block.size()))
+            << strerror(errno);
+    }
+    ASSERT_EQ(0, close(lower_fd)) << strerror(errno);
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        int fd = open(merged_file.c_str(), O_WRONLY | O_CLOEXEC);
+        if (fd < 0) {
+            _exit(errno == ESTALE ? 0 : 2);
+        }
+        if (write(fd, "stale", 5) != 5) {
+            close(fd);
+            _exit(4);
+        }
+        close(fd);
+        _exit(3);
+    }
+
+    bool copy_up_started = false;
+    for (int attempt = 0; attempt < 20000; ++attempt) {
+        if (overlay_temp_entry_count(env.work) > 0) {
+            copy_up_started = true;
+            break;
+        }
+        usleep(100);
+    }
+    ASSERT_TRUE(copy_up_started);
+    ASSERT_EQ(0, write_text(upper_file, "replacement")) << strerror(errno);
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    EXPECT_EQ("replacement", read_text(merged_file));
+    EXPECT_EQ(0, overlay_temp_entry_count(env.work));
+}
+
 TEST(OverlayFsSemantics, LowerFileRenameToDirectoryFailsWithoutCopyUp) {
     auto env = make_overlay_env("overlayfs_lower_file_to_dir_no_copyup");
     std::string lower_old = join_path(env.lower, "old");

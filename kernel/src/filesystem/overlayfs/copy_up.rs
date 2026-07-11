@@ -106,12 +106,12 @@ impl OvlInode {
         let (parent_path, name) = self.upper_parent_path_and_name();
         let parent_inode = self.ensure_upper_dir_path(parent_path)?;
         match parent_inode.find(name) {
-            Ok(existing) => {
-                let existing = Self::validate_existing_upper(existing, &metadata)?;
-                self.set_origin(metadata::load_origin(self, &existing)?);
-                *upper_inode = Some(existing);
-                return Ok(CopyUpOutcome::Existing);
-            }
+            // The redirect stripe is held for the whole copy-up, so another
+            // copy-up of this object cannot have published this entry.  An
+            // unexpected upper therefore belongs to a newer namespace
+            // object; adopting it would let a stale lower inode modify that
+            // replacement.
+            Ok(_) => return Err(SystemError::ESTALE),
             Err(SystemError::ENOENT) => {}
             Err(err) => return Err(err),
         }
@@ -190,11 +190,10 @@ impl OvlInode {
             }
             Err(SystemError::EEXIST) => {
                 let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
-                let existing = parent_inode.find(name)?;
-                let existing = Self::validate_existing_upper(existing, &metadata)?;
-                self.set_origin(metadata::load_origin(self, &existing)?);
-                *upper_inode = Some(existing);
-                return Ok(CopyUpOutcome::Existing);
+                // NOREPLACE can fail here only if the parent namespace changed
+                // after the absence check above.  Never bind this stale lower
+                // inode to the replacement that won the race.
+                return Err(SystemError::ESTALE);
             }
             Err(err) => {
                 let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);

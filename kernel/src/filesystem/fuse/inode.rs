@@ -51,6 +51,10 @@ pub struct FuseNode {
     direct_io_lock: Mutex<()>,
     cached_metadata_deadline_ns: AtomicU64,
     attr_version: AtomicU64,
+    /// Version chain produced while short READ replies from one metadata
+    /// snapshot monotonically converge on the lowest observed EOF.
+    short_read_source_attr_version: AtomicU64,
+    short_read_chain_attr_version: AtomicU64,
     /// Lowest EOF established by a short READ whose inode-wide cache truncate
     /// is deferred out of the transport completion path.
     pending_short_read_eof: AtomicU64,
@@ -100,6 +104,8 @@ impl FuseNode {
             direct_io_lock: Mutex::new(()),
             cached_metadata_deadline_ns: AtomicU64::new(if has_cached { u64::MAX } else { 0 }),
             attr_version: AtomicU64::new(1),
+            short_read_source_attr_version: AtomicU64::new(0),
+            short_read_chain_attr_version: AtomicU64::new(0),
             pending_short_read_eof: AtomicU64::new(u64::MAX),
             lookup_count: AtomicU64::new(0),
             lookup_attr_flags: AtomicU32::new(0),
@@ -188,7 +194,7 @@ impl FuseNode {
     pub fn set_cached_metadata(&self, md: Metadata) {
         let mut metadata = self.cached_metadata.lock();
         *metadata = Some(md);
-        self.attr_version.fetch_add(1, Ordering::AcqRel);
+        self.bump_attr_version();
         drop(metadata);
         self.cached_metadata_deadline_ns
             .store(u64::MAX, Ordering::Relaxed);
@@ -197,7 +203,7 @@ impl FuseNode {
     pub fn set_cached_metadata_with_valid(&self, md: Metadata, valid: u64, valid_nsec: u32) {
         let mut metadata = self.cached_metadata.lock();
         *metadata = Some(md);
-        self.attr_version.fetch_add(1, Ordering::AcqRel);
+        self.bump_attr_version();
         drop(metadata);
         self.cached_metadata_deadline_ns
             .store(Self::cache_deadline(valid, valid_nsec), Ordering::Relaxed);
@@ -207,8 +213,18 @@ impl FuseNode {
         self.attr_version.load(Ordering::Acquire)
     }
 
-    pub(crate) fn bump_attr_version(&self) {
-        self.attr_version.fetch_add(1, Ordering::AcqRel);
+    pub(crate) fn bump_attr_version(&self) -> u64 {
+        let version = self
+            .attr_version
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        if version == 0 {
+            self.short_read_source_attr_version
+                .store(u64::MAX, Ordering::Release);
+            self.short_read_chain_attr_version
+                .store(u64::MAX, Ordering::Release);
+        }
+        version
     }
 
     /// 累计该 inode 在 userspace daemon 侧持有的 LOOKUP 引用。

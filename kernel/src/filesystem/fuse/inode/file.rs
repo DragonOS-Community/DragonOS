@@ -243,12 +243,22 @@ impl FuseNode {
             let mut guard = self.cached_metadata.lock();
             if let Some(md) = guard.as_mut() {
                 let current_size = md.size.max(0) as usize;
-                if self.attr_version() == observed_attr_version
-                    && current_size == observed_size
-                    && eof < current_size
-                {
+                let current_version = self.attr_version();
+                let first_from_snapshot =
+                    current_version == observed_attr_version && current_size == observed_size;
+                let continues_short_read_chain =
+                    self.short_read_source_attr_version.load(Ordering::Acquire)
+                        == observed_attr_version
+                        && self.short_read_chain_attr_version.load(Ordering::Acquire)
+                            == current_version
+                        && current_size <= observed_size;
+                if (first_from_snapshot || continues_short_read_chain) && eof < current_size {
                     md.size = eof as i64;
-                    self.bump_attr_version();
+                    let chain_version = self.bump_attr_version();
+                    self.short_read_source_attr_version
+                        .store(observed_attr_version, Ordering::Release);
+                    self.short_read_chain_attr_version
+                        .store(chain_version, Ordering::Release);
                     self.pending_short_read_eof
                         .fetch_min(eof as u64, Ordering::AcqRel);
                     self.cached_metadata_deadline_ns
@@ -1307,9 +1317,11 @@ impl FuseNode {
         if let Some(md) = metadata.as_mut() {
             if end > md.size.max(0) as usize {
                 md.size = end as i64;
-                self.bump_attr_version();
             }
         }
+        // Every successful write is a mutation fence for READ replies issued
+        // from an older metadata snapshot, even when it does not extend size.
+        self.bump_attr_version();
         Ok(())
     }
 

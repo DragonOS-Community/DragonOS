@@ -39,6 +39,15 @@ pub(super) fn find_locked(
     name: &str,
     state: &super::inode::DirState,
 ) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
+    find_locked_revalidated(inode, name, state, false)
+}
+
+fn find_locked_revalidated(
+    inode: &OvlInode,
+    name: &str,
+    state: &super::inode::DirState,
+    replace_stale: bool,
+) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
     let child_redirect = inode.child_redirect(name);
     let version = inode.dir_version()?;
     let cached = state.cached_lookup(&version, name);
@@ -117,7 +126,22 @@ pub(super) fn find_locked(
     }
 
     let fs = inode.overlay_fs()?;
-    let child = fs.intern_inode(child_redirect, file_type, upper_inode, lower_inodes)?;
+    let child = fs.intern_inode(
+        child_redirect.clone(),
+        file_type,
+        upper_inode,
+        lower_inodes,
+        replace_stale,
+    )?;
+    let Some(child) = child else {
+        // Serialize the refreshed backing lookup with both direct copy-up and
+        // publication of this object as an ancestor of another copy-up.
+        // Both lock domains are independent, and every dual acquisition uses
+        // leaf-before-ancestor order.
+        let _copy_up_guard = fs.copy_up_lock(&child_redirect).lock();
+        let _ancestor_guard = fs.ancestor_copy_up_lock(&child_redirect).lock();
+        return find_locked_revalidated(inode, name, state, true);
+    };
 
     state.cache_lookup(name, child.clone());
 

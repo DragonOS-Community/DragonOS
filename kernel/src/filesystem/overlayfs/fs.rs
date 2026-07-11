@@ -205,7 +205,8 @@ impl OverlayFS {
         file_type: FileType,
         upper_inode: Option<Arc<dyn IndexNode>>,
         lower_inodes: Vec<Arc<dyn IndexNode>>,
-    ) -> Result<Arc<OvlInode>, SystemError> {
+        replace_stale: bool,
+    ) -> Result<Option<Arc<OvlInode>>, SystemError> {
         let origin = if lower_inodes.is_empty() {
             OvlInodeOrigin::Upper(RealInodeIdentity::from_inode(
                 upper_inode.as_ref().ok_or(SystemError::ENOENT)?,
@@ -242,6 +243,12 @@ impl OverlayFS {
                     }
                     continue;
                 }
+                // A lower-only backing snapshot can race with this candidate's
+                // copy-up publication.  Ask lookup to refresh the backing once
+                // before deciding that the cached upper is detached.
+                if !expected_has_upper && !replace_stale {
+                    return Ok(None);
+                }
             }
 
             let replacement = {
@@ -263,7 +270,7 @@ impl OverlayFS {
             }
         };
         inode.load_origin_once()?;
-        Ok(inode)
+        Ok(Some(inode))
     }
 
     pub(super) fn cached_lower_dirs(

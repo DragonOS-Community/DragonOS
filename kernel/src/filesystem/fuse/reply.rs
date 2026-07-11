@@ -18,6 +18,18 @@ pub struct FuseReply {
     range: Range<usize>,
 }
 
+/// Completion returned only by the page-cache read path.
+///
+/// A transport may either place the payload directly in the owned destination
+/// pages or retain the existing contiguous reply path.  Both variants describe
+/// the result of the same FUSE request; callers must never retry merely because
+/// the contiguous variant was selected.
+#[derive(Debug)]
+pub(crate) enum FuseReadPagesReply {
+    Direct { bytes: usize },
+    Contiguous(FuseReply),
+}
+
 impl fmt::Debug for FuseReply {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FuseReply")

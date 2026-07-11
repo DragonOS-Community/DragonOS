@@ -3,6 +3,7 @@ use alloc::{
     collections::{BTreeMap, VecDeque},
     string::String,
     sync::Arc,
+    vec,
     vec::Vec,
 };
 
@@ -14,6 +15,7 @@ use virtio_drivers::{
     Error as VirtioError, PAGE_SIZE,
 };
 
+use crate::filesystem::page_cache::PageCacheReadDmaReservation;
 use crate::{
     arch::MMArch,
     driver::virtio::{
@@ -65,20 +67,74 @@ struct PendingReq {
 #[derive(Debug)]
 struct InflightReq {
     pending: Option<PendingReq>,
-    rsp: Option<DeviceOutputBuffer>,
+    output: Option<VirtioFsOutput>,
     retained_capacity: Option<usize>,
     descriptor_live: bool,
+}
+
+#[derive(Debug)]
+enum VirtioFsOutput {
+    Contiguous(DeviceOutputBuffer),
+    ReadPages {
+        header: DeviceOutputBuffer,
+        target: Arc<PageCacheReadDmaReservation>,
+    },
+}
+
+impl VirtioFsOutput {
+    fn writable_len(&self) -> usize {
+        match self {
+            Self::Contiguous(rsp) => rsp.writable_len(),
+            Self::ReadPages { header, target } => header.writable_len() + target.payload_capacity(),
+        }
+    }
+
+    unsafe fn dma_slices(&mut self, submission: bool) -> Result<Vec<&mut [u8]>, SystemError> {
+        match self {
+            Self::Contiguous(rsp) => {
+                let slice = if submission {
+                    unsafe { rsp.submission_dma_slice(response_buffer_virt_to_phys) }
+                } else {
+                    unsafe { rsp.retirement_dma_slice(response_buffer_virt_to_phys) }
+                }
+                .map_err(|_| SystemError::EIO)?;
+                Ok(vec![slice])
+            }
+            Self::ReadPages { header, target } => {
+                let header = if submission {
+                    unsafe { header.submission_dma_slice(response_buffer_virt_to_phys) }
+                } else {
+                    unsafe { header.retirement_dma_slice(response_buffer_virt_to_phys) }
+                }
+                .map_err(|_| SystemError::EIO)?;
+                let mut outputs = Vec::with_capacity(1 + target.page_count());
+                outputs.push(header);
+                for descriptor in target.descriptors() {
+                    // SAFETY: the reservation exclusively owns mapping-invisible candidate pages;
+                    // their recorded direct-map address and full-page length remain fixed until
+                    // this exact descriptor is retired.
+                    outputs.push(unsafe {
+                        core::slice::from_raw_parts_mut(
+                            descriptor.vaddr().data() as *mut u8,
+                            descriptor.len(),
+                        )
+                    });
+                }
+                Ok(outputs)
+            }
+        }
+    }
 }
 
 impl InflightReq {
     fn new(
         pending: PendingReq,
-        rsp: Option<DeviceOutputBuffer>,
+        output: Option<VirtioFsOutput>,
         retained_capacity: Option<usize>,
     ) -> Self {
         Self {
             pending: Some(pending),
-            rsp,
+            output,
             retained_capacity,
             descriptor_live: false,
         }
@@ -91,10 +147,20 @@ impl InflightReq {
     }
 
     fn mark_submitted(&mut self) {
-        if let Some(rsp) = self.rsp.as_mut() {
-            rsp.mark_submitted();
-        }
+        // Queue acceptance is the DMA ownership commit point. From here on Drop must quarantine
+        // every owner even if an internal state assertion unexpectedly fails.
         self.descriptor_live = true;
+        if let Some(output) = self.output.as_mut() {
+            match output {
+                VirtioFsOutput::Contiguous(rsp) => rsp.mark_submitted(),
+                VirtioFsOutput::ReadPages { header, target } => {
+                    header.mark_submitted();
+                    target
+                        .mark_submitted()
+                        .expect("direct-read target must remain Prepared until queue acceptance");
+                }
+            }
+        }
     }
 
     fn mark_completed(&mut self) {
@@ -104,8 +170,17 @@ impl InflightReq {
 
     unsafe fn mark_reset_retired_after_detach(&mut self) -> Result<(), BufferError> {
         debug_assert!(self.descriptor_live);
-        if let Some(rsp) = self.rsp.as_mut() {
-            unsafe { rsp.retire_after_reset_and_detach()? };
+        if let Some(output) = self.output.as_mut() {
+            match output {
+                VirtioFsOutput::Contiguous(rsp) => unsafe { rsp.retire_after_reset_and_detach()? },
+                VirtioFsOutput::ReadPages { header, target } => {
+                    unsafe { header.retire_after_reset_and_detach()? };
+                    target
+                        .mark_reset_retired()
+                        .map_err(|_| BufferError::InvalidState)?;
+                    let _ = target.rollback(SystemError::EIO);
+                }
+            }
         }
         self.descriptor_live = false;
         Ok(())
@@ -123,8 +198,11 @@ impl Drop for InflightReq {
         if let Some(pending) = self.pending.take() {
             core::mem::forget(pending);
         }
-        if let Some(rsp) = self.rsp.take() {
-            core::mem::forget(rsp);
+        if let Some(output) = self.output.take() {
+            if let VirtioFsOutput::ReadPages { target, .. } = &output {
+                let _ = target.detach_mapping_for_quarantine();
+            }
+            core::mem::forget(output);
         }
         stats::on_virtiofs_dma_owner_quarantined();
     }
@@ -248,6 +326,18 @@ struct VirtioFsBridgeContext {
 }
 
 impl VirtioFsBridgeContext {
+    fn release_unsubmitted_output(pool: &ResponseBufferPool, output: Option<VirtioFsOutput>) {
+        match output {
+            Some(VirtioFsOutput::Contiguous(rsp)) => {
+                pool.release(rsp, true);
+            }
+            Some(VirtioFsOutput::ReadPages { header, .. }) => {
+                pool.release(header, true);
+            }
+            None => {}
+        }
+    }
+
     fn poll_pause() {
         let _ = nanosleep(PosixTimeSpec::new(0, VIRTIOFS_POLL_NS));
     }
@@ -758,7 +848,21 @@ impl VirtioFsBridgeContext {
         let trace_unique = pending.unique;
         let trace_opcode = pending.opcode;
         let req_len = pending.req.bytes().len();
-        let (mut rsp, retained_capacity, fallback) = match pending.req.reply_contract() {
+        let queue_size = match kind {
+            QueueKind::Hiprio => self.hiprio_vq.as_ref().ok_or(SystemError::EIO)?.size(),
+            QueueKind::Request(slot) => self
+                .request_vqs
+                .get(slot)
+                .ok_or(SystemError::EINVAL)?
+                .size(),
+        };
+        let direct_target = pending.req.read_pages_destination().filter(|target| {
+            2usize
+                .checked_add(target.page_count())
+                .is_some_and(|descriptors| descriptors <= queue_size)
+        });
+        let direct_selected = direct_target.is_some();
+        let (mut output, retained_capacity, fallback) = match pending.req.reply_contract() {
             FuseReplyContract::NoReply => (None, None, false),
             FuseReplyContract::Reply { capacity } => {
                 let capacity = match capacity {
@@ -768,9 +872,14 @@ impl VirtioFsBridgeContext {
                         return Ok(true);
                     }
                 };
+                let output_capacity = if direct_target.is_some() {
+                    core::mem::size_of::<FuseOutHeader>()
+                } else {
+                    capacity.bytes
+                };
                 let rsp = match self.response_pool.acquire(
                     pending.opcode,
-                    capacity.bytes,
+                    output_capacity,
                     response_buffer_virt_to_phys,
                 ) {
                     Ok(rsp) => rsp,
@@ -779,24 +888,28 @@ impl VirtioFsBridgeContext {
                         return Ok(true);
                     }
                 };
-                (
-                    Some(rsp),
-                    Some(capacity.retained_bytes),
-                    matches!(capacity.source, FuseReplyCapacitySource::ExplicitFallback),
-                )
+                let output = if let Some(target) = direct_target {
+                    VirtioFsOutput::ReadPages {
+                        header: rsp,
+                        target: target.clone(),
+                    }
+                } else {
+                    VirtioFsOutput::Contiguous(rsp)
+                };
+                let retained = matches!(output, VirtioFsOutput::Contiguous(_))
+                    .then_some(capacity.retained_bytes);
+                let fallback = (pending.req.read_pages_destination().is_some() && !direct_selected)
+                    || matches!(capacity.source, FuseReplyCapacitySource::ExplicitFallback);
+                (Some(output), retained, fallback)
             }
         };
 
         let (token, should_notify) = match kind {
             QueueKind::Hiprio => {
                 let queue = self.hiprio_vq.as_mut().ok_or(SystemError::EIO)?;
-                let token = if let Some(rsp_buf) = rsp.as_mut() {
+                let token = if let Some(output) = output.as_mut() {
                     let inputs = [pending.req.bytes()];
-                    let mut outputs = [unsafe {
-                        rsp_buf
-                            .submission_dma_slice(response_buffer_virt_to_phys)
-                            .map_err(|_| SystemError::EIO)?
-                    }];
+                    let mut outputs = unsafe { output.dma_slices(true)? };
                     // SAFETY: The request contains a non-empty FuseInHeader, and the reply
                     // contract makes `rsp_buf` at least a non-empty FuseOutHeader. On success,
                     // only their owners and independent metadata are moved/read before notification;
@@ -818,13 +931,9 @@ impl VirtioFsBridgeContext {
             }
             QueueKind::Request(slot) => {
                 let queue = self.request_vqs.get_mut(slot).ok_or(SystemError::EINVAL)?;
-                let token = if let Some(rsp_buf) = rsp.as_mut() {
+                let token = if let Some(output) = output.as_mut() {
                     let inputs = [pending.req.bytes()];
-                    let mut outputs = [unsafe {
-                        rsp_buf
-                            .submission_dma_slice(response_buffer_virt_to_phys)
-                            .map_err(|_| SystemError::EIO)?
-                    }];
+                    let mut outputs = unsafe { output.dma_slices(true)? };
                     // SAFETY: The request contains a non-empty FuseInHeader, and the reply
                     // contract makes `rsp_buf` at least a non-empty FuseOutHeader. On success,
                     // only their owners and independent metadata are moved/read before notification;
@@ -849,9 +958,7 @@ impl VirtioFsBridgeContext {
         let token = match token {
             Ok(token) => token,
             Err(VirtioError::QueueFull) => {
-                if let Some(rsp_buf) = rsp.take() {
-                    self.response_pool.release(rsp_buf, true);
-                }
+                Self::release_unsubmitted_output(&self.response_pool, output.take());
                 stats::on_virtiofs_queue_full(kind.stats_kind());
                 self.mark_queue_full_blocked(kind)?;
                 let (queue_kind, queue_slot) = Self::trace_queue_fields(kind);
@@ -866,9 +973,7 @@ impl VirtioFsBridgeContext {
                 return Ok(false);
             }
             Err(VirtioError::NotReady) => {
-                if let Some(rsp_buf) = rsp.take() {
-                    self.response_pool.release(rsp_buf, true);
-                }
+                Self::release_unsubmitted_output(&self.response_pool, output.take());
                 stats::on_virtiofs_not_ready();
                 stats::on_virtiofs_submit_error();
                 let se = virtio_drivers_error_to_system_error(VirtioError::NotReady);
@@ -880,9 +985,7 @@ impl VirtioFsBridgeContext {
                 return Ok(true);
             }
             Err(e) => {
-                if let Some(rsp_buf) = rsp.take() {
-                    self.response_pool.release(rsp_buf, true);
-                }
+                Self::release_unsubmitted_output(&self.response_pool, output.take());
                 stats::on_virtiofs_submit_error();
                 let se = virtio_drivers_error_to_system_error(e);
                 warn!(
@@ -894,10 +997,10 @@ impl VirtioFsBridgeContext {
             }
         };
 
-        let mut inflight = InflightReq::new(pending, rsp, retained_capacity);
+        let mut inflight = InflightReq::new(pending, output, retained_capacity);
         inflight.mark_submitted();
-        if let Some(rsp_buf) = inflight.rsp.as_ref() {
-            stats::on_virtiofs_response_submitted(trace_opcode, rsp_buf.writable_len(), fallback);
+        if let Some(output) = inflight.output.as_ref() {
+            stats::on_virtiofs_response_submitted(trace_opcode, output.writable_len(), fallback);
         }
         let replaced = match kind {
             QueueKind::Hiprio => self.hiprio_inflight.insert(token, inflight),
@@ -981,21 +1084,27 @@ impl VirtioFsBridgeContext {
         };
 
         let response_capacity = match kind {
-            QueueKind::Hiprio => self.hiprio_inflight.get(&token).and_then(|req| {
-                req.rsp.as_ref().map(|rsp| {
-                    rsp.allocation_len()
-                        .max(req.retained_capacity.unwrap_or_default())
-                })
-            }),
+            QueueKind::Hiprio => {
+                self.hiprio_inflight
+                    .get(&token)
+                    .and_then(|req| match req.output.as_ref() {
+                        Some(VirtioFsOutput::Contiguous(rsp)) => Some(
+                            rsp.allocation_len()
+                                .max(req.retained_capacity.unwrap_or_default()),
+                        ),
+                        _ => None,
+                    })
+            }
             QueueKind::Request(slot) => self
                 .request_inflight
                 .get(slot)
                 .and_then(|map| map.get(&token))
-                .and_then(|req| {
-                    req.rsp.as_ref().map(|rsp| {
+                .and_then(|req| match req.output.as_ref() {
+                    Some(VirtioFsOutput::Contiguous(rsp)) => Some(
                         rsp.allocation_len()
-                            .max(req.retained_capacity.unwrap_or_default())
-                    })
+                            .max(req.retained_capacity.unwrap_or_default()),
+                    ),
+                    _ => None,
                 }),
         };
         let reservation = if let Some(required_capacity) = response_capacity {
@@ -1027,10 +1136,9 @@ impl VirtioFsBridgeContext {
             .take()
             .expect("inflight request must own pending metadata");
         let inputs = [pending.req.bytes()];
-        let used_len_res = if let Some(rsp_buf) = inflight.rsp.as_mut() {
-            let output = match unsafe { rsp_buf.retirement_dma_slice(response_buffer_virt_to_phys) }
-            {
-                Ok(output) => output,
+        let used_len_res = if let Some(output) = inflight.output.as_mut() {
+            let mut outputs = match unsafe { output.dma_slices(false) } {
+                Ok(outputs) => outputs,
                 Err(_) => {
                     let unique = pending.unique;
                     inflight.pending = Some(pending);
@@ -1042,7 +1150,6 @@ impl VirtioFsBridgeContext {
                     return Err(SystemError::EIO);
                 }
             };
-            let mut outputs = [output];
             // SAFETY: The stateful response buffer reconstructed the exact virtual address and
             // length recorded at add, and `req_owner` references the same immutable FuseRequest.
             // On error the complete token owner is restored to the inflight map.
@@ -1118,12 +1225,73 @@ impl VirtioFsBridgeContext {
             return Ok(true);
         }
 
-        let mut rsp_buf = inflight
-            .rsp
+        let output = inflight
+            .output
             .take()
-            .expect("reply-bearing inflight request must own a response buffer");
-        let reservation = reservation
-            .expect("reply-bearing completion reserved retention capacity before pop_used");
+            .expect("reply-bearing inflight request must own output storage");
+        if let VirtioFsOutput::ReadPages { mut header, target } = output {
+            let capacity = core::mem::size_of::<FuseOutHeader>() + target.payload_capacity();
+            let request_reply_capacity = match pending.req.reply_contract() {
+                FuseReplyContract::Reply {
+                    capacity: Some(capacity),
+                } => capacity.bytes,
+                _ => 0,
+            };
+            stats::on_virtiofs_response_completed(opcode, capacity, used_len);
+            if target.mark_completed().is_err()
+                || used_len < core::mem::size_of::<FuseOutHeader>()
+                || used_len > capacity
+                || used_len > request_reply_capacity
+                || unsafe { header.complete_after_pop(core::mem::size_of::<FuseOutHeader>()) }
+                    .is_err()
+            {
+                let _ = target.rollback(SystemError::EIO);
+                self.terminate_pending_with_error(&pending, SystemError::EIO);
+                self.response_pool.release(header, false);
+                return Ok(true);
+            }
+            let header_bytes = header
+                .initialized_prefix()
+                .expect("direct header completion initialized the fixed header");
+            let out = match fuse_read_struct::<FuseOutHeader>(header_bytes) {
+                Ok(out) => out,
+                Err(_) => {
+                    let _ = target.rollback(SystemError::EIO);
+                    self.terminate_pending_with_error(&pending, SystemError::EIO);
+                    self.response_pool.release(header, true);
+                    return Ok(true);
+                }
+            };
+            let valid_error = out.error <= 0 && out.error > -512;
+            if out.unique != unique || out.len as usize != used_len || !valid_error {
+                let _ = target.rollback(SystemError::EIO);
+                self.terminate_pending_with_error(&pending, SystemError::EIO);
+                self.response_pool.release(header, true);
+                return Ok(true);
+            }
+            let payload_len = used_len - core::mem::size_of::<FuseOutHeader>();
+            if out.error != 0 && payload_len != 0 {
+                let _ = target.rollback(SystemError::EIO);
+                self.terminate_pending_with_error(&pending, SystemError::EIO);
+            } else if out.error != 0 {
+                let _ = target.rollback(SystemError::EIO);
+                Self::complete_request_with_negative_errno(&self.conn, unique, out.error);
+            } else if self
+                .conn
+                .complete_read_pages_direct(unique, payload_len)
+                .is_err()
+            {
+                let _ = target.rollback(SystemError::EIO);
+            }
+            stats::on_virtiofs_completed(used_len, false);
+            self.response_pool.release(header, true);
+            return Ok(true);
+        }
+        let VirtioFsOutput::Contiguous(mut rsp_buf) = output else {
+            unreachable!()
+        };
+        let reservation =
+            reservation.expect("contiguous completion reserved retention capacity before pop_used");
         let capacity = rsp_buf.writable_len();
         stats::on_virtiofs_response_completed(opcode, capacity, used_len);
         // SAFETY: pop_used succeeded for this exact token and DMA identity, so the descriptor is
@@ -1412,11 +1580,9 @@ impl VirtioFsBridgeContext {
         for (token, req) in inflight.iter_mut() {
             let req_owner = req.pending().req.clone();
             let inputs = [req_owner.bytes()];
-            let result = if let Some(rsp_buf) = req.rsp.as_mut() {
-                let output = match unsafe {
-                    rsp_buf.retirement_dma_slice(response_buffer_virt_to_phys)
-                } {
-                    Ok(output) => output,
+            let result = if let Some(output) = req.output.as_mut() {
+                let mut outputs = match unsafe { output.dma_slices(false) } {
+                    Ok(outputs) => outputs,
                     Err(_) => {
                         all_detached = false;
                         stats::on_virtiofs_detach_failure();
@@ -1429,7 +1595,6 @@ impl VirtioFsBridgeContext {
                         continue;
                     }
                 };
-                let mut outputs = [output];
                 // SAFETY: The caller invokes this only after the device reset completed, so the
                 // device can no longer access the queue. The stateful buffer reconstructed the
                 // exact virtual address and length recorded for this token.

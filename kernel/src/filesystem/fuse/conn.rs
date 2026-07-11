@@ -6,6 +6,7 @@ use core::{
 
 use system_error::SystemError;
 
+use crate::filesystem::page_cache::PageCacheReadDmaReservation;
 use crate::{
     arch::MMArch,
     filesystem::epoll::{
@@ -30,7 +31,7 @@ use super::protocol::{
     FUSE_PARALLEL_DIROPS, FUSE_POSIX_ACL, FUSE_POSIX_LOCKS, FUSE_READDIRPLUS_AUTO,
     FUSE_REMOVEXATTR, FUSE_SETXATTR, FUSE_SUBMOUNTS,
 };
-use super::reply::FuseReply;
+use super::reply::{FuseReadPagesReply, FuseReply};
 use super::{stats, trace};
 
 mod daemon;
@@ -120,6 +121,7 @@ pub struct FuseRequest {
     unique: u64,
     opcode: u32,
     reply_contract: FuseReplyContract,
+    read_pages_destination: Option<Arc<PageCacheReadDmaReservation>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +159,10 @@ impl FuseRequest {
 
     pub(crate) fn reply_contract(&self) -> FuseReplyContract {
         self.reply_contract
+    }
+
+    pub(crate) fn read_pages_destination(&self) -> Option<&Arc<PageCacheReadDmaReservation>> {
+        self.read_pages_destination.as_ref()
     }
 }
 
@@ -199,8 +205,14 @@ pub struct FusePendingState {
 #[derive(Debug)]
 enum PendingCompletion {
     Waiting,
-    Ready(Result<FuseReply, SystemError>),
+    Ready(Result<FusePendingResult, SystemError>),
     Consumed,
+}
+
+#[derive(Debug)]
+pub(crate) enum FusePendingResult {
+    Reply(FuseReply),
+    ReadPagesDirect { bytes: usize },
 }
 
 impl FusePendingState {
@@ -218,6 +230,17 @@ impl FusePendingState {
     }
 
     pub fn complete(&self, v: Result<FuseReply, SystemError>) -> bool {
+        self.complete_result(v.map(FusePendingResult::Reply))
+    }
+
+    /// Complete a page-cache read whose payload was written into its owned
+    /// destination.  This deliberately shares the ordinary pending state so
+    /// duplicate replies, disconnect and teardown have one retirement point.
+    pub(crate) fn complete_read_pages_direct(&self, bytes: usize) -> bool {
+        self.complete_result(Ok(FusePendingResult::ReadPagesDirect { bytes }))
+    }
+
+    fn complete_result(&self, v: Result<FusePendingResult, SystemError>) -> bool {
         let mut guard = self.response.lock();
         if !matches!(*guard, PendingCompletion::Waiting) {
             // Duplicate replies are ignored (Linux does similarly).
@@ -230,6 +253,24 @@ impl FusePendingState {
     }
 
     pub fn wait_complete(&self) -> Result<FuseReply, SystemError> {
+        match self.wait_result()? {
+            FusePendingResult::Reply(reply) => Ok(reply),
+            // A direct completion is a request-contract violation for ordinary
+            // callers.  Do not expose an empty reply that could look valid.
+            FusePendingResult::ReadPagesDirect { .. } => Err(SystemError::EIO),
+        }
+    }
+
+    pub(crate) fn wait_read_pages_complete(&self) -> Result<FuseReadPagesReply, SystemError> {
+        match self.wait_result()? {
+            FusePendingResult::Reply(reply) => Ok(FuseReadPagesReply::Contiguous(reply)),
+            FusePendingResult::ReadPagesDirect { bytes } => {
+                Ok(FuseReadPagesReply::Direct { bytes })
+            }
+        }
+    }
+
+    fn wait_result(&self) -> Result<FusePendingResult, SystemError> {
         wait_with_recheck(&self.wait, || {
             let mut guard = self.response.lock();
             if matches!(*guard, PendingCompletion::Ready(_)) {
@@ -854,7 +895,7 @@ mod tests {
         FuseEntryOut, FuseOpenOut, FuseOutHeader, FuseStatfsOut, FUSE_CREATE, FUSE_DESTROY,
         FUSE_GETATTR, FUSE_LOOKUP, FUSE_STATFS,
     };
-    use super::{daemon, request, stats, FuseConn, FuseReplyCapacitySource};
+    use super::{daemon, request, stats, FuseConn, FusePendingState, FuseReplyCapacitySource};
 
     fn set_minor(conn: &FuseConn, minor: u32) {
         conn.inner.lock().init.minor = minor;
@@ -966,5 +1007,30 @@ mod tests {
             conn.request_nocreds(FUSE_LOOKUP, 1, b"late\0"),
             Err(SystemError::ENOTCONN)
         );
+    }
+
+    #[test]
+    fn pending_read_pages_preserves_direct_and_contiguous_results() {
+        let direct = FusePendingState::new(1, super::super::protocol::FUSE_READ);
+        assert!(direct.complete_read_pages_direct(4097));
+        assert!(!direct.complete_read_pages_direct(1));
+        assert!(matches!(
+            direct.wait_read_pages_complete().unwrap(),
+            super::super::reply::FuseReadPagesReply::Direct { bytes: 4097 }
+        ));
+
+        let contiguous = FusePendingState::new(3, super::super::protocol::FUSE_READ);
+        assert!(contiguous.complete(Ok(super::super::reply::FuseReply::from_bytes(vec![1, 2]))));
+        assert!(matches!(
+            contiguous.wait_read_pages_complete().unwrap(),
+            super::super::reply::FuseReadPagesReply::Contiguous(reply) if &*reply == [1, 2]
+        ));
+    }
+
+    #[test]
+    fn ordinary_wait_rejects_direct_completion() {
+        let pending = FusePendingState::new(1, super::super::protocol::FUSE_READ);
+        assert!(pending.complete_read_pages_direct(1));
+        assert_eq!(pending.wait_complete(), Err(SystemError::EIO));
     }
 }

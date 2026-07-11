@@ -30,6 +30,7 @@ use super::super::{
         FUSE_READ, FUSE_READ_LOCKOWNER, FUSE_SETATTR, FUSE_WRITE, FUSE_WRITEBACK_CACHE,
         FUSE_WRITE_CACHE,
     },
+    reply::FuseReadPagesReply,
 };
 use super::FuseNode;
 
@@ -801,69 +802,60 @@ impl FuseNode {
                 break;
             }
 
-            let mut read_buf = vec![0u8; read_len];
-            let bytes_read = self.read_direct_with_open(
-                read_offset,
-                read_len,
-                &mut read_buf,
+            let target = match page_cache
+                .manager()
+                .reserve_read_dma(run_start, run_end - run_start)
+            {
+                Ok(target) => Arc::new(target),
+                Err(SystemError::EEXIST) => {
+                    // A concurrent reader won the reservation race. Wait for its first page to
+                    // leave Loading, then rebuild the missing run from current cache state.
+                    drop(page_cache.manager().commit_page(run_start)?);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let read_in = FuseReadIn {
                 fh,
-                file_flags,
-                0,
+                offset: read_offset as u64,
+                size: read_len as u32,
+                read_flags: 0,
+                lock_owner: 0,
+                flags: file_flags,
+                padding: 0,
+            };
+            let result = self.conn().request_read_pages(
+                self.nodeid,
+                fuse_pack_struct(&read_in),
+                target.clone(),
+                FuseRequestCred::from_current(),
             )?;
-            if bytes_read == 0 {
-                let (eof, should_truncate) = self.note_short_read_eof(run_start, 0, file_size)?;
-                if should_truncate {
-                    truncate_eof = Some(eof);
-                }
-                break;
-            }
-
-            let covered_pages = bytes_read.div_ceil(MMArch::PAGE_SIZE);
-            let pages_to_commit = core::cmp::min(run_end - run_start, covered_pages);
-            let mut saw_short_page = false;
-            for rel_page in 0..pages_to_commit {
-                let page_idx = run_start + rel_page;
-                let page_offset = rel_page * MMArch::PAGE_SIZE;
-                let page_read_len =
-                    core::cmp::min(MMArch::PAGE_SIZE, bytes_read.saturating_sub(page_offset));
-                if page_read_len == 0 {
-                    break;
-                }
-
-                let mut filled_len = None;
-                let page = page_cache.manager().commit_page_with(page_idx, |_, dst| {
-                    dst.fill(0);
-                    dst[..page_read_len]
-                        .copy_from_slice(&read_buf[page_offset..page_offset + page_read_len]);
-                    filled_len = Some(page_read_len);
-                    Ok(page_read_len)
-                })?;
-                drop(page);
-
-                if filled_len.is_some() {
-                    total_read += 1;
-                }
-
-                if page_read_len < MMArch::PAGE_SIZE {
-                    let (eof, should_truncate) =
-                        self.note_short_read_eof(page_idx, page_read_len, file_size)?;
-                    if should_truncate {
-                        truncate_eof = Some(eof);
+            let bytes_read = match result {
+                FuseReadPagesReply::Direct { bytes } => {
+                    if bytes > read_len {
+                        let _ = target.rollback(SystemError::EIO);
+                        return Err(SystemError::EIO);
                     }
-                    saw_short_page = true;
-                    break;
+                    target.publish_completed(bytes)?;
+                    bytes
                 }
-            }
+                FuseReadPagesReply::Contiguous(reply) => {
+                    if reply.len() > read_len {
+                        return Err(SystemError::EIO);
+                    }
+                    let bytes = reply.len();
+                    target.publish_contiguous(&reply)?;
+                    bytes
+                }
+            };
+            total_read += bytes_read.div_ceil(MMArch::PAGE_SIZE);
 
-            if bytes_read < read_len && !saw_short_page {
+            if bytes_read < read_len {
                 let (eof, should_truncate) =
                     self.note_short_read_eof(run_start, bytes_read, file_size)?;
                 if should_truncate {
                     truncate_eof = Some(eof);
                 }
-            }
-
-            if saw_short_page || bytes_read < read_len {
                 break;
             }
             idx = run_end;

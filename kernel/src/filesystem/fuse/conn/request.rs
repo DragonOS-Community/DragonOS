@@ -27,6 +27,22 @@ use super::{
     FuseReplyContract, FuseRequest, FuseRequestCred,
 };
 use crate::filesystem::fuse::reply::FuseReply;
+use crate::filesystem::{fuse::reply::FuseReadPagesReply, page_cache::PageCacheReadDmaReservation};
+
+/// How the reply for a request being built should be delivered back.
+///
+/// This folds the former separate `no_reply` flag and optional page-cache DMA
+/// destination into a single value so the two can never disagree: a
+/// [`FuseReplyRouting::ReadPages`] request is always a reply-bearing
+/// `FUSE_READ`, validated in [`FuseConn::build_request`].
+enum FuseReplyRouting {
+    /// Deliver the reply into the connection's reply buffer.
+    Normal,
+    /// No reply is expected (e.g. `FUSE_FORGET`).
+    NoReply,
+    /// DMA the `FUSE_READ` reply directly into the reserved page-cache pages.
+    ReadPages(Arc<PageCacheReadDmaReservation>),
+}
 
 impl FuseConn {
     fn is_high_priority_opcode(opcode: u32) -> bool {
@@ -74,7 +90,7 @@ impl FuseConn {
             0,
             fuse_pack_struct(&inarg),
             FuseRequestCred::nocreds(),
-            false,
+            FuseReplyRouting::Normal,
         )?;
         self.push_request(req, None, unique | Self::FUSE_INT_REQ_BIT)
     }
@@ -135,6 +151,26 @@ impl FuseConn {
         }
         let pending = self.enqueue_request_with_cred(opcode, nodeid, payload, req_cred)?;
         self.wait_request_complete(opcode, pending)
+    }
+
+    /// Submit one READ whose owned destination can be used directly by a
+    /// capable transport, while retaining the same-request contiguous fallback.
+    pub(crate) fn request_read_pages(
+        &self,
+        nodeid: u64,
+        payload: &[u8],
+        destination: Arc<PageCacheReadDmaReservation>,
+        req_cred: FuseRequestCred,
+    ) -> Result<FuseReadPagesReply, SystemError> {
+        self.wait_initialized()?;
+        let pending = self.enqueue_read_pages(nodeid, payload, destination, req_cred)?;
+        match pending.wait_read_pages_complete() {
+            Err(SystemError::EINTR) | Err(SystemError::ERESTARTSYS) => {
+                let _ = self.queue_interrupt(pending.unique());
+                Err(SystemError::EINTR)
+            }
+            result => result,
+        }
     }
 
     pub fn request_nocreds_background(
@@ -200,7 +236,7 @@ impl FuseConn {
                 gid: 0,
                 pid: 0,
             },
-            true,
+            FuseReplyRouting::NoReply,
         )?;
         self.push_request(req, None, unique)?;
         Ok(())
@@ -230,9 +266,37 @@ impl FuseConn {
         let unique = self.alloc_unique();
         let pending_state = Arc::new(FusePendingState::new(unique, opcode));
 
-        let req = self.build_request(unique, opcode, nodeid, payload, req_cred, false)?;
+        let req = self.build_request(
+            unique,
+            opcode,
+            nodeid,
+            payload,
+            req_cred,
+            FuseReplyRouting::Normal,
+        )?;
         self.push_request(req, Some(pending_state.clone()), unique)?;
         Ok(pending_state)
+    }
+
+    fn enqueue_read_pages(
+        &self,
+        nodeid: u64,
+        payload: &[u8],
+        destination: Arc<PageCacheReadDmaReservation>,
+        req_cred: FuseRequestCred,
+    ) -> Result<Arc<FusePendingState>, SystemError> {
+        let unique = self.alloc_unique();
+        let pending = Arc::new(FusePendingState::new(unique, FUSE_READ));
+        let req = self.build_request(
+            unique,
+            FUSE_READ,
+            nodeid,
+            payload,
+            req_cred,
+            FuseReplyRouting::ReadPages(destination),
+        )?;
+        self.push_request(req, Some(pending.clone()), unique)?;
+        Ok(pending)
     }
 
     fn reply_capacity(
@@ -363,8 +427,18 @@ impl FuseConn {
         nodeid: u64,
         payload: &[u8],
         req_cred: FuseRequestCred,
-        no_reply: bool,
+        reply_routing: FuseReplyRouting,
     ) -> Result<Arc<FuseRequest>, SystemError> {
+        let (no_reply, read_pages_destination) = match reply_routing {
+            FuseReplyRouting::Normal => (false, None),
+            FuseReplyRouting::NoReply => (true, None),
+            FuseReplyRouting::ReadPages(destination) => {
+                if opcode != FUSE_READ {
+                    return Err(SystemError::EINVAL);
+                }
+                (false, Some(destination))
+            }
+        };
         let request_len = size_of::<FuseInHeader>()
             .checked_add(payload.len())
             .ok_or(SystemError::EOVERFLOW)?;
@@ -396,6 +470,7 @@ impl FuseConn {
             unique,
             opcode,
             reply_contract,
+            read_pages_destination,
         }))
     }
 
@@ -466,7 +541,11 @@ pub(super) fn queue_test_request(
             nodeid,
             payload,
             FuseRequestCred::nocreds(),
-            !pending_reply,
+            if pending_reply {
+                FuseReplyRouting::Normal
+            } else {
+                FuseReplyRouting::NoReply
+            },
         )
         .unwrap();
     let request_ptr = req.bytes().as_ptr();
@@ -652,7 +731,7 @@ mod tests {
                 1,
                 &[],
                 FuseRequestCred::nocreds(),
-                true,
+                FuseReplyRouting::NoReply,
             )
             .unwrap();
         assert_eq!(forget.reply_contract(), FuseReplyContract::NoReply);
@@ -665,7 +744,7 @@ mod tests {
                     0,
                     &[],
                     FuseRequestCred::nocreds(),
-                    false,
+                    FuseReplyRouting::Normal,
                 )
                 .unwrap();
             assert!(matches!(

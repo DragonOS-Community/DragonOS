@@ -59,7 +59,7 @@ impl OvlInode {
         };
 
         let fs = self.overlay_fs()?;
-        let _mutation_guard = fs.mutation_lock.lock();
+        let _copy_up_guard = fs.copy_up_lock(&self.redirect).lock();
         let outcome = self.copy_up_locked_with_size(copy_size)?;
         if copy_size.is_none() {
             Ok(OpenCopyUpOutcome::NoTruncateRequested)
@@ -71,10 +71,14 @@ impl OvlInode {
     }
 
     pub(super) fn copy_up_locked(&self) -> Result<(), SystemError> {
+        let fs = self.overlay_fs()?;
+        let _copy_up_guard = fs.copy_up_lock(&self.redirect).lock();
         self.copy_up_locked_with_size(None).map(|_| ())
     }
 
     pub(super) fn copy_up_locked_for_truncate(&self, len: usize) -> Result<(), SystemError> {
+        let fs = self.overlay_fs()?;
+        let _copy_up_guard = fs.copy_up_lock(&self.redirect).lock();
         self.copy_up_locked_with_size(Some(len)).map(|_| ())
     }
 

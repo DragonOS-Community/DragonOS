@@ -1,6 +1,6 @@
 use super::config::OverlayMountData;
 use super::entry::OvlLayer;
-use super::inode::OvlInode;
+use super::inode::{DirState, OvlInode};
 use crate::driver::base::device::device_number::DeviceNumber;
 use crate::filesystem::vfs::mount::{MountFS, MountFSInode};
 use crate::filesystem::vfs::{
@@ -54,9 +54,39 @@ struct OvlInodeCacheKey {
     origin: OvlInodeOrigin,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum DirIdentity {
+    Lower(Vec<RealInodeIdentity>),
+    Upper(RealInodeIdentity),
+}
+
+#[derive(Debug, Default)]
+struct DirStateCache {
+    entries: BTreeMap<DirIdentity, Weak<DirState>>,
+    insertions_since_prune: usize,
+}
+
+impl DirStateCache {
+    fn intern(&mut self, key: DirIdentity) -> Arc<DirState> {
+        if let Some(state) = self.entries.get(&key).and_then(Weak::upgrade) {
+            return state;
+        }
+        if self.insertions_since_prune >= INODE_CACHE_PRUNE_INTERVAL {
+            self.entries.retain(|_, state| state.strong_count() != 0);
+            self.insertions_since_prune = 0;
+        }
+        let state = Arc::new(DirState::default());
+        self.entries.insert(key, Arc::downgrade(&state));
+        self.insertions_since_prune += 1;
+        state
+    }
+}
+
 #[derive(Debug, Default)]
 struct OvlInodeCache {
     entries: BTreeMap<OvlInodeCacheKey, Weak<OvlInode>>,
+    /// Mount-global bounded retention for repeated short-lived lookups.
+    recent_lookups: VecDeque<Arc<OvlInode>>,
     /// Bounded strong cache for non-samefs directories whose fallback inode
     /// number is only meaningful for the OvlInode cache lifetime.
     recent_fallback_dirs: VecDeque<Arc<OvlInode>>,
@@ -64,6 +94,8 @@ struct OvlInodeCache {
 }
 
 const FALLBACK_DIR_CACHE_SIZE: usize = 256;
+const LOOKUP_RETENTION_SIZE: usize = 1024;
+const LOCK_STRIPE_COUNT: usize = 64;
 
 impl OvlInodeCache {
     fn intern(
@@ -85,6 +117,13 @@ impl OvlInodeCache {
             self.insertions_since_prune += 1;
             inode
         };
+
+        self.recent_lookups
+            .retain(|cached| !Arc::ptr_eq(cached, &inode));
+        self.recent_lookups.push_back(inode.clone());
+        if self.recent_lookups.len() > LOOKUP_RETENTION_SIZE {
+            self.recent_lookups.pop_front();
+        }
 
         if retain_fallback_dir {
             self.recent_fallback_dirs
@@ -122,6 +161,9 @@ pub(super) struct OverlayFS {
     pub(super) backing_cred: Arc<Cred>,
     pub(super) samefs: bool,
     inode_cache: Mutex<OvlInodeCache>,
+    dir_state_cache: Mutex<DirStateCache>,
+    copy_up_locks: Vec<Mutex<()>>,
+    content_locks: Vec<Mutex<()>>,
 }
 
 impl FileSystem for OverlayFS {
@@ -200,6 +242,46 @@ impl OverlayFS {
             });
         inode.load_origin_once()?;
         Ok(inode)
+    }
+
+    pub(super) fn intern_dir_state(
+        &self,
+        inode: &OvlInode,
+    ) -> Result<Arc<DirState>, SystemError> {
+        let identity = if inode.lower_inodes.is_empty() {
+            DirIdentity::Upper(RealInodeIdentity::from_inode(
+                inode.upper_inode.lock().as_ref().ok_or(SystemError::ENOENT)?,
+            )?)
+        } else {
+            DirIdentity::Lower(
+                inode
+                    .lower_inodes
+                    .iter()
+                    .map(RealInodeIdentity::from_inode)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        };
+        Ok(self.dir_state_cache.lock().intern(identity))
+    }
+
+    pub(super) fn copy_up_lock(&self, redirect: &str) -> &Mutex<()> {
+        let mut hash = 0xcbf29ce484222325u64;
+        for byte in redirect.as_bytes() {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        &self.copy_up_locks[hash as usize % self.copy_up_locks.len()]
+    }
+
+    pub(super) fn content_lock(
+        &self,
+        inode: &Arc<dyn IndexNode>,
+    ) -> Result<&Mutex<()>, SystemError> {
+        let identity = RealInodeIdentity::from_inode(inode)?;
+        let mut hash = identity.filesystem as u64;
+        hash ^= (identity.dev_id as u64).rotate_left(21);
+        hash ^= (identity.inode_id.data() as u64).rotate_left(42);
+        Ok(&self.content_locks[hash as usize % self.content_locks.len()])
     }
 
     fn canonical_backing_fs(inode: &Arc<dyn IndexNode>) -> Arc<dyn FileSystem> {
@@ -436,6 +518,9 @@ impl MountableFileSystem for OverlayFS {
                 backing_cred,
                 samefs,
                 inode_cache: Mutex::new(OvlInodeCache::default()),
+                dir_state_cache: Mutex::new(DirStateCache::default()),
+                copy_up_locks: (0..LOCK_STRIPE_COUNT).map(|_| Mutex::new(())).collect(),
+                content_locks: (0..LOCK_STRIPE_COUNT).map(|_| Mutex::new(())).collect(),
             }
         });
         fs.root_inode.load_origin_once()?;

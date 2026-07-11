@@ -58,6 +58,22 @@ bool path_exists(const std::string& path) {
     return stat(path.c_str(), &st) == 0;
 }
 
+std::vector<std::string> directory_names(const std::string& path) {
+    std::vector<std::string> names;
+    DIR* dir = opendir(path.c_str());
+    if (dir == nullptr) {
+        return names;
+    }
+    while (dirent* ent = readdir(dir)) {
+        if (strcmp(ent->d_name, ".") != 0 && strcmp(ent->d_name, "..") != 0) {
+            names.emplace_back(ent->d_name);
+        }
+    }
+    closedir(dir);
+    std::sort(names.begin(), names.end());
+    return names;
+}
+
 std::vector<std::string> xattr_names(const std::string& path) {
     ssize_t needed = listxattr(path.c_str(), nullptr, 0);
     EXPECT_GE(needed, 0) << path << ": " << strerror(errno);
@@ -3269,6 +3285,42 @@ TEST(OverlayFsSemantics, BindSharesDeviceAndIndependentOverlayGetsNewDevice) {
     EXPECT_NE(original.st_dev, independent.st_dev);
     ASSERT_EQ(0, umount(bind_path.c_str()));
     ASSERT_EQ(0, rmdir(bind_path.c_str()));
+}
+
+TEST(OverlayFsSemantics, LargeMergedDirectoryCacheInvalidatesAfterMutations) {
+    ScopedOverlayEnv scoped("overlayfs_large_readdir_cache");
+    const auto& env = scoped.env;
+    prepare_overlay_env(env);
+
+    constexpr int kEntryCount = 256;
+    for (int i = 0; i < kEntryCount; ++i) {
+        char name[32] = {};
+        snprintf(name, sizeof(name), "entry_%03d", i);
+        ASSERT_EQ(0, write_text(join_path(env.lower, name), "lower"));
+        if ((i % 2) == 0) {
+            ASSERT_EQ(0, write_text(join_path(env.upper, name), "upper"));
+        }
+    }
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    auto first = directory_names(env.merged);
+    ASSERT_EQ(static_cast<size_t>(kEntryCount), first.size());
+    EXPECT_EQ(first, directory_names(env.merged));
+
+    std::string created = join_path(env.merged, "created");
+    ASSERT_EQ(0, write_text(created, "new")) << strerror(errno);
+    auto after_create = directory_names(env.merged);
+    EXPECT_TRUE(std::binary_search(after_create.begin(), after_create.end(), "created"));
+
+    ASSERT_EQ(0, unlink(join_path(env.merged, "entry_003").c_str())) << strerror(errno);
+    auto after_unlink = directory_names(env.merged);
+    EXPECT_FALSE(std::binary_search(after_unlink.begin(), after_unlink.end(), "entry_003"));
+
+    std::string renamed = join_path(env.merged, "renamed");
+    ASSERT_EQ(0, rename(created.c_str(), renamed.c_str())) << strerror(errno);
+    auto after_rename = directory_names(env.merged);
+    EXPECT_FALSE(std::binary_search(after_rename.begin(), after_rename.end(), "created"));
+    EXPECT_TRUE(std::binary_search(after_rename.begin(), after_rename.end(), "renamed"));
 }
 
 int main(int argc, char** argv) {

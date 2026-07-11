@@ -70,3 +70,6 @@ normal/tty_pty_hangup
 normal/cubesandbox_pty_exec_chain
 normal/eventfd_pending_signal
 normal/virtiofs_smoke
+normal/af_packet_sockopt
+normal/af_packet_e2e
+normal/af_packet_mcast

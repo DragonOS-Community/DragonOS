@@ -1,6 +1,7 @@
 use crate::driver::net::bridge::BridgeDriver;
 use crate::driver::net::loopback::LoopbackInterface;
 use crate::init::initcall::INITCALL_SUBSYS;
+use crate::libs::mutex::Mutex;
 use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::libs::rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard};
 use crate::libs::wait_queue::WaitQueue;
@@ -8,13 +9,14 @@ use crate::net::routing::Router;
 use crate::net::socket::netlink::table::{
     generate_supported_netlink_kernel_sockets, NetlinkKernelSocket, NetlinkSocketTable,
 };
+use crate::net::socket::packet::{PacketSocket, PacketType};
 use crate::net::socket::unix::ns::UnixAbstractTable;
 use crate::process::fork::CloneFlags;
 use crate::process::kthread::{KernelThreadClosure, KernelThreadMechanism};
 use crate::process::namespace::{nsproxy::NsProxy, NamespaceOps, NamespaceType};
 use crate::process::ProcessControlBlock;
 use crate::process::ProcessManager;
-use crate::rcu::RcuOptionArcSlot;
+use crate::rcu::{RcuArcSlot, RcuOptionArcSlot};
 use crate::time::{Duration, Instant};
 use crate::{
     driver::net::napi::napi_schedule,
@@ -25,6 +27,7 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use hashbrown::HashMap;
@@ -76,6 +79,11 @@ pub struct NetNamespace {
     /// 注意：该结构会在 bind/connect 等路径被访问，且这些路径可能会获取可睡眠的 Mutex，
     /// 因此这里使用可睡眠的 `RwSem`，避免自旋锁 + schedule 的组合导致崩溃。
     device_list: RwSem<BTreeMap<usize, Arc<dyn Iface>>>,
+    /// Lock-free read-side snapshot for AF_PACKET delivery from NAPI context.
+    packet_sockets: RcuArcSlot<PacketSocketRegistrySnapshot>,
+    /// Serializes copy-on-write registry updates in process context.
+    packet_sockets_writer: Mutex<()>,
+    packet_sockets_need_cleanup: AtomicBool,
     ///当前网络命名空间下的桥接设备列表
     bridge_list: RwSem<BTreeMap<String, Arc<BridgeDriver>>>,
 
@@ -95,6 +103,11 @@ pub struct NetNamespace {
     loopback_iface: RcuOptionArcSlot<LoopbackInterface>,
     /// 当前网络命名空间的默认网卡。
     default_iface: RcuOptionArcSlot<DefaultIfaceRef>,
+}
+
+#[derive(Debug, Default)]
+struct PacketSocketRegistrySnapshot {
+    sockets: Vec<Weak<PacketSocket>>,
 }
 
 #[derive(Debug)]
@@ -190,6 +203,7 @@ impl NetnsPoller {
             };
 
             let nsid = netns.ns_common.nsid.data();
+            netns.cleanup_packet_sockets();
             let now_us = Instant::now().total_micros() as u64;
 
             // 处理“已到期的定时事件”：到期则 schedule NAPI 推进一次。
@@ -298,6 +312,9 @@ impl NetNamespace {
             inner: RwLock::new(inner),
             poller: NetnsPoller::new(self_ref.clone()),
             device_list: RwSem::new(BTreeMap::new()),
+            packet_sockets: RcuArcSlot::new(Arc::new(PacketSocketRegistrySnapshot::default())),
+            packet_sockets_writer: Mutex::new(()),
+            packet_sockets_need_cleanup: AtomicBool::new(false),
             bridge_list: RwSem::new(BTreeMap::new()),
             netlink_socket_table: NetlinkSocketTable::default(),
             netlink_kernel_socket: RwSem::new(generate_supported_netlink_kernel_sockets()),
@@ -334,6 +351,9 @@ impl NetNamespace {
             inner: RwLock::new(inner),
             poller: NetnsPoller::new(self_ref.clone()),
             device_list: RwSem::new(BTreeMap::new()),
+            packet_sockets: RcuArcSlot::new(Arc::new(PacketSocketRegistrySnapshot::default())),
+            packet_sockets_writer: Mutex::new(()),
+            packet_sockets_need_cleanup: AtomicBool::new(false),
             bridge_list: RwSem::new(BTreeMap::new()),
             netlink_socket_table: NetlinkSocketTable::default(),
             netlink_kernel_socket: RwSem::new(generate_supported_netlink_kernel_sockets()),
@@ -376,6 +396,77 @@ impl NetNamespace {
 
     pub fn device_list(&self) -> RwSemReadGuard<'_, BTreeMap<usize, Arc<dyn Iface>>> {
         self.device_list.read()
+    }
+
+    pub fn register_packet_socket(&self, socket: Weak<PacketSocket>) {
+        let _guard = self.packet_sockets_writer.lock();
+        let current = self.packet_sockets.load();
+        let mut sockets = current.sockets.clone();
+        sockets.retain(|entry| entry.strong_count() != 0);
+        if !sockets.iter().any(|entry| Weak::ptr_eq(entry, &socket)) {
+            sockets.push(socket);
+        }
+        self.packet_sockets
+            .store_deferred(Arc::new(PacketSocketRegistrySnapshot { sockets }));
+        self.packet_sockets_need_cleanup
+            .store(false, Ordering::Release);
+    }
+
+    pub fn unregister_packet_socket(&self, socket: &Weak<PacketSocket>) {
+        let _guard = self.packet_sockets_writer.lock();
+        let current = self.packet_sockets.load();
+        let mut sockets = current.sockets.clone();
+        sockets.retain(|entry| entry.strong_count() != 0 && !Weak::ptr_eq(entry, socket));
+        self.packet_sockets
+            .store_deferred(Arc::new(PacketSocketRegistrySnapshot { sockets }));
+        self.packet_sockets_need_cleanup
+            .store(false, Ordering::Release);
+    }
+
+    fn cleanup_packet_sockets(&self) {
+        if !self
+            .packet_sockets_need_cleanup
+            .swap(false, Ordering::AcqRel)
+        {
+            return;
+        }
+        let _guard = self.packet_sockets_writer.lock();
+        let current = self.packet_sockets.load();
+        let mut sockets = current.sockets.clone();
+        sockets.retain(|entry| entry.strong_count() != 0);
+        self.packet_sockets
+            .store_deferred(Arc::new(PacketSocketRegistrySnapshot { sockets }));
+    }
+
+    /// Deliver an ingress frame without taking a sleeping lock or allocating a
+    /// temporary registry copy in the NAPI read-side path.
+    pub fn deliver_to_packet_sockets(
+        &self,
+        ingress_ifindex: u32,
+        frame: &[u8],
+        pkt_type: PacketType,
+    ) {
+        let snapshot = self.packet_sockets.load();
+        let mut stale = false;
+        for socket in snapshot.sockets.iter() {
+            if let Some(socket) = socket.upgrade() {
+                socket.deliver(ingress_ifindex, frame, pkt_type);
+            } else {
+                stale = true;
+            }
+        }
+        if stale {
+            self.packet_sockets_need_cleanup
+                .store(true, Ordering::Release);
+        }
+    }
+
+    pub fn has_packet_sockets(&self) -> bool {
+        self.packet_sockets
+            .load()
+            .sockets
+            .iter()
+            .any(|socket| socket.strong_count() != 0)
     }
 
     #[inline]

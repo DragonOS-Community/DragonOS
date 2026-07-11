@@ -9,7 +9,6 @@ use crate::driver::net::napi::NapiStruct;
 use crate::driver::net::types::{InterfaceFlags, InterfaceType};
 use crate::libs::rwsem::{RwSem, RwSemReadGuard};
 use crate::net::routing::RouterEnableDeviceCommon;
-use crate::net::socket::packet::PacketSocket;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::{
     libs::{mutex::Mutex, rwlock::RwLock},
@@ -102,6 +101,16 @@ pub trait Iface: crate::driver::base::device::Device {
     #[inline]
     fn poll_napi(&self, _budget: usize) -> bool {
         self.poll()
+    }
+
+    /// # `raw_transmit`
+    /// Send a raw Ethernet frame (for AF_PACKET).
+    ///
+    /// By default returns `ENOSYS`; concrete NIC drivers should override this
+    /// method to send frames directly through the underlying `phy::Device`
+    /// TX channel, bypassing the smoltcp stack.
+    fn raw_transmit(&self, _frame: &[u8]) -> Result<(), SystemError> {
+        Err(SystemError::ENOSYS)
     }
 
     /// # `should_drop_rx_packet`
@@ -263,8 +272,6 @@ pub struct IfaceCommon {
     router_common_data: RouterEnableDeviceCommon,
     /// NAPI 结构体
     napi_struct: RwLock<Option<Arc<NapiStruct>>>,
-    /// Packet sockets registered to receive raw frames
-    packet_sockets: RwLock<Vec<Weak<PacketSocket>>>,
     netlink_routes: RwSem<Vec<NetlinkRouteEntry>>,
     static_neighbors: RwSem<Vec<StaticNeighborEntry>>,
     /// TCP close(2) 语义辅助：延迟回收 smoltcp TCP socket（Linux-like）。
@@ -311,7 +318,6 @@ impl IfaceCommon {
             mtu: AtomicUsize::new(mtu),
             type_,
             napi_struct: RwLock::new(None),
-            packet_sockets: RwLock::new(Vec::new()),
             netlink_routes: RwSem::new(Vec::new()),
             static_neighbors: RwSem::new(Vec::new()),
             tcp_close_defer: crate::net::tcp_close_defer::TcpCloseDefer::new(),
@@ -748,50 +754,5 @@ impl IfaceCommon {
         let before = neighbors.len();
         neighbors.retain(|existing| existing.ip_addr != ip_addr);
         neighbors.len() != before
-    }
-
-    /// 注册 packet socket 以接收原始数据包
-    pub fn register_packet_socket(&self, socket: Weak<PacketSocket>) {
-        self.packet_sockets.write().push(socket);
-    }
-
-    /// 取消注册 packet socket
-    pub fn unregister_packet_socket(&self, socket: &Weak<PacketSocket>) {
-        let mut sockets = self.packet_sockets.write();
-        sockets.retain(|s| !Weak::ptr_eq(s, socket));
-    }
-
-    /// 向所有注册的 packet socket 分发数据包
-    ///
-    /// # 参数
-    /// - `frame`: 完整的以太网帧
-    /// - `pkt_type`: 数据包类型
-    pub fn deliver_to_packet_sockets(
-        &self,
-        frame: &[u8],
-        pkt_type: crate::net::socket::packet::PacketType,
-    ) {
-        let sockets = self.packet_sockets.read();
-        for socket_weak in sockets.iter() {
-            if let Some(socket) = socket_weak.upgrade() {
-                socket.deliver_packet(frame, pkt_type);
-            }
-        }
-
-        // 清理已释放的 weak 引用（延迟清理）
-        drop(sockets);
-        let mut sockets = self.packet_sockets.write();
-        sockets.retain(|s| s.strong_count() > 0);
-    }
-
-    /// 发送原始数据包
-    ///
-    /// 目前是简化实现，后续可以扩展
-    pub fn send_raw_packet(&self, _frame: &[u8]) -> Result<(), SystemError> {
-        // TODO: 实现原始数据包发送
-        // 这需要直接访问网卡驱动的 TX 队列
-        // 目前返回 ENOSYS，后续可以扩展
-        log::warn!("send_raw_packet: not fully implemented yet");
-        Err(SystemError::ENOSYS)
     }
 }

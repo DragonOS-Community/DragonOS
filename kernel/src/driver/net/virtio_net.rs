@@ -1,8 +1,8 @@
 use core::{
     any::Any,
-    cell::UnsafeCell,
     fmt::{Debug, Formatter},
     ops::{Deref, DerefMut},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use alloc::{
@@ -381,44 +381,13 @@ impl DerefMut for VirtIoNetImpl {
 unsafe impl Send for VirtIoNetImpl {}
 unsafe impl Sync for VirtIoNetImpl {}
 
-#[derive(Debug)]
-struct VirtIONicDeviceInnerWrapper(UnsafeCell<VirtIONicDeviceInner>);
-unsafe impl Send for VirtIONicDeviceInnerWrapper {}
-unsafe impl Sync for VirtIONicDeviceInnerWrapper {}
-
-impl Deref for VirtIONicDeviceInnerWrapper {
-    type Target = VirtIONicDeviceInner;
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.0.get() }
-    }
-}
-impl DerefMut for VirtIONicDeviceInnerWrapper {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut *self.0.get() }
-    }
-}
-
-#[allow(clippy::mut_from_ref)]
-impl VirtIONicDeviceInnerWrapper {
-    fn force_get_mut(&self) -> &mut <VirtIONicDeviceInnerWrapper as Deref>::Target {
-        unsafe { &mut *self.0.get() }
-    }
-}
-
 /// Virtio网络设备驱动(加锁)
+#[derive(Clone)]
 pub struct VirtIONicDeviceInner {
     pub inner: Arc<SpinLock<VirtIoNetImpl>>,
     /// 指向所属网络接口的弱引用，用于 packet socket 分发
-    iface: SpinLock<Weak<dyn super::Iface>>,
-}
-
-impl Clone for VirtIONicDeviceInner {
-    fn clone(&self) -> Self {
-        return VirtIONicDeviceInner {
-            inner: self.inner.clone(),
-            iface: SpinLock::new(self.iface.lock().clone()),
-        };
-    }
+    iface: Arc<SpinLock<Weak<dyn super::Iface>>>,
+    tx_reserved: Arc<AtomicBool>,
 }
 
 impl Debug for VirtIONicDeviceInner {
@@ -431,7 +400,7 @@ impl Debug for VirtIONicDeviceInner {
 #[cast_to([sync] Device)]
 #[derive(Debug)]
 pub struct VirtioInterface {
-    device_inner: VirtIONicDeviceInnerWrapper,
+    device_inner: VirtIONicDeviceInner,
     iface_common: super::IfaceCommon,
     inner: SpinLock<InnerVirtIOInterface>,
     locked_kobj_state: LockedKObjectState,
@@ -465,7 +434,7 @@ impl VirtioInterface {
         let mtu = device_inner.capabilities().max_transmission_unit;
 
         let iface = Arc::new(VirtioInterface {
-            device_inner: VirtIONicDeviceInnerWrapper(UnsafeCell::new(device_inner)),
+            device_inner,
             locked_kobj_state: LockedKObjectState::default(),
             iface_common: super::IfaceCommon::new(
                 iface_id,
@@ -485,7 +454,6 @@ impl VirtioInterface {
         // 设置 device_inner 对接口的弱引用，用于 packet socket 分发
         iface
             .device_inner
-            .force_get_mut()
             .set_iface(Arc::downgrade(&iface) as Weak<dyn super::Iface>);
 
         // 设置napi struct
@@ -584,7 +552,8 @@ impl VirtIONicDeviceInner {
         let inner = Arc::new(SpinLock::new(VirtIoNetImpl::new(driver_net)));
         let result = VirtIONicDeviceInner {
             inner,
-            iface: SpinLock::new(Weak::<VirtioInterface>::new()),
+            iface: Arc::new(SpinLock::new(Weak::<VirtioInterface>::new())),
+            tx_reserved: Arc::new(AtomicBool::new(false)),
         };
         return result;
     }
@@ -602,19 +571,61 @@ impl VirtIONicDeviceInner {
     pub fn iface(&self) -> Option<Arc<dyn super::Iface>> {
         self.iface.lock().upgrade()
     }
+
+    fn submit_frame<R, F>(&self, len: usize, fill: F) -> Result<R, SystemError>
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        if len > 2000 {
+            return Err(SystemError::EMSGSIZE);
+        }
+        let mut driver_net = self.inner.lock_irqsave();
+        if !driver_net.can_send() {
+            return Err(SystemError::ENOBUFS);
+        }
+        let mut tx_buf = driver_net.new_tx_buffer(len);
+        let result = fill(tx_buf.packet_mut());
+        driver_net.send(tx_buf).map_err(|_| SystemError::ENOBUFS)?;
+        Ok(result)
+    }
+
+    fn try_reserve_tx(&self) -> bool {
+        self.tx_reserved
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn release_tx(&self) {
+        self.tx_reserved.store(false, Ordering::Release);
+    }
+
+    pub fn try_raw_transmit(&self, frame: &[u8]) -> Result<(), SystemError> {
+        if !self.try_reserve_tx() {
+            return Err(SystemError::ENOBUFS);
+        }
+        let result = self.submit_frame(frame.len(), |buf| buf.copy_from_slice(frame));
+        self.release_tx();
+        result
+    }
 }
 
 pub struct VirtioNetToken {
     driver: VirtIONicDeviceInner,
     rx_buffer: Option<virtio_drivers::device::net::RxBuffer>,
+    tx_reserved: bool,
 }
 
 impl VirtioNetToken {
     pub fn new(
         driver: VirtIONicDeviceInner,
         rx_buffer: Option<virtio_drivers::device::net::RxBuffer>,
+        tx_reserved: bool,
     ) -> Self {
-        return Self { driver, rx_buffer };
+        return Self {
+            driver,
+            rx_buffer,
+            tx_reserved,
+        };
     }
 }
 
@@ -634,8 +645,8 @@ impl phy::Device for VirtIONicDeviceInner {
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         match self.inner.lock_irqsave().receive() {
             Ok(buf) => Some((
-                VirtioNetToken::new(self.clone(), Some(buf)),
-                VirtioNetToken::new(self.clone(), None),
+                VirtioNetToken::new(self.clone(), Some(buf), false),
+                VirtioNetToken::new(self.clone(), None, false),
             )),
             Err(virtio_drivers::Error::NotReady) => None,
             Err(err) => panic!("VirtIO receive failed: {}", err),
@@ -644,10 +655,14 @@ impl phy::Device for VirtIONicDeviceInner {
 
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
         // debug!("VirtioNet: transmit");
+        if !self.try_reserve_tx() {
+            return None;
+        }
         if self.inner.lock_irqsave().can_send() {
             // debug!("VirtioNet: can send");
-            return Some(VirtioNetToken::new(self.clone(), None));
+            return Some(VirtioNetToken::new(self.clone(), None, true));
         } else {
+            self.release_tx();
             // debug!("VirtioNet: can not send");
             return None;
         }
@@ -668,32 +683,62 @@ impl phy::Device for VirtIONicDeviceInner {
 }
 
 impl phy::TxToken for VirtioNetToken {
-    fn consume<R, F>(self, len: usize, f: F) -> R
+    fn consume<R, F>(mut self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        // // 为了线程安全，这里需要对VirtioNet进行加【写锁】，以保证对设备的互斥访问。
-        let mut driver_net = self.driver.inner.lock_irqsave();
-        let mut tx_buf = driver_net.new_tx_buffer(len);
+        if !self.tx_reserved {
+            let mut frame = alloc::vec![0; len];
+            let result = f(&mut frame);
+            if self.driver.try_raw_transmit(&frame).is_ok() {
+                if let Some(iface) = self.driver.iface() {
+                    crate::net::socket::packet::deliver_to_packet_sockets(
+                        &iface,
+                        &frame,
+                        crate::net::socket::packet::PacketType::Outgoing,
+                    );
+                }
+            }
+            return result;
+        }
+        let mut driver = self.driver.inner.lock_irqsave();
+        let mut tx_buf = driver.new_tx_buffer(len);
         let result = f(tx_buf.packet_mut());
-        driver_net.send(tx_buf).expect("virtio_net send failed");
-        return result;
+        let tap_frame = self
+            .driver
+            .iface()
+            .filter(crate::net::socket::packet::packet_sockets_active)
+            .map(|iface| (iface, tx_buf.packet().to_vec()));
+        let _ = driver.send(tx_buf);
+        drop(driver);
+        if let Some((iface, frame)) = tap_frame {
+            crate::net::socket::packet::deliver_to_packet_sockets(
+                &iface,
+                &frame,
+                crate::net::socket::packet::PacketType::Outgoing,
+            );
+        }
+        self.driver.release_tx();
+        self.tx_reserved = false;
+        result
     }
 }
 
 impl phy::RxToken for VirtioNetToken {
-    fn consume<R, F>(self, f: F) -> R
+    fn consume<R, F>(mut self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R,
     {
         // 为了线程安全，这里需要对VirtioNet进行加【写锁】，以保证对设备的互斥访问。
-        let rx_buf = self.rx_buffer.unwrap();
+        let rx_buf = self.rx_buffer.take().unwrap();
         let packet = rx_buf.packet();
 
         // 向注册的 packet socket 分发数据包
         if let Some(iface) = self.driver.iface() {
-            let pkt_type = determine_packet_type(packet, &iface);
-            iface.common().deliver_to_packet_sockets(packet, pkt_type);
+            let pkt_type = crate::net::socket::packet::classify_packet(packet, &iface);
+            if let Some(netns) = iface.net_namespace() {
+                netns.deliver_to_packet_sockets(iface.nic_id() as u32, packet, pkt_type);
+            }
         }
 
         let result = f(packet);
@@ -706,37 +751,13 @@ impl phy::RxToken for VirtioNetToken {
     }
 }
 
-/// 根据以太网帧的目的 MAC 地址确定数据包类型
-fn determine_packet_type(
-    frame: &[u8],
-    iface: &Arc<dyn super::Iface>,
-) -> crate::net::socket::packet::PacketType {
-    use crate::net::socket::packet::PacketType;
-
-    if frame.len() < 14 {
-        return PacketType::Host;
+impl Drop for VirtioNetToken {
+    fn drop(&mut self) {
+        if self.tx_reserved {
+            self.driver.release_tx();
+            self.tx_reserved = false;
+        }
     }
-
-    let dst_mac = &frame[0..6];
-
-    // 检查是否为广播地址 (FF:FF:FF:FF:FF:FF)
-    if dst_mac == [0xff, 0xff, 0xff, 0xff, 0xff, 0xff] {
-        return PacketType::Broadcast;
-    }
-
-    // 检查是否为多播地址 (第一个字节的最低位为1)
-    if dst_mac[0] & 0x01 != 0 {
-        return PacketType::Multicast;
-    }
-
-    // 检查是否为发往本机的包
-    let our_mac = iface.mac();
-    if dst_mac == our_mac.as_bytes() {
-        return PacketType::Host;
-    }
-
-    // 其他情况为发往其他主机的包（混杂模式下捕获）
-    PacketType::OtherHost
 }
 
 /// @brief virtio-net 驱动的初始化与测试
@@ -774,12 +795,25 @@ impl Iface for VirtioInterface {
 
     fn poll(&self) -> bool {
         // log::debug!("VirtioInterface: poll");
-        self.iface_common.poll(self.device_inner.force_get_mut())
+        let mut device = self.device_inner.clone();
+        self.iface_common.poll(&mut device)
     }
 
     fn poll_napi(&self, budget: usize) -> bool {
-        self.iface_common
-            .poll_napi(self.device_inner.force_get_mut(), budget)
+        let mut device = self.device_inner.clone();
+        self.iface_common.poll_napi(&mut device, budget)
+    }
+
+    fn raw_transmit(&self, frame: &[u8]) -> Result<(), SystemError> {
+        self.device_inner.try_raw_transmit(frame)?;
+        if let Some(iface) = self.device_inner.iface() {
+            crate::net::socket::packet::deliver_to_packet_sockets(
+                &iface,
+                frame,
+                crate::net::socket::packet::PacketType::Outgoing,
+            );
+        }
+        Ok(())
     }
 
     // fn as_any_ref(&'static self) -> &'static dyn core::any::Any {

@@ -75,11 +75,11 @@ pub fn do_linkat(
         )?
     };
 
-    // old_inode为目录时返回EPERM
+    // Return EPERM when old_inode is a directory
     if old_inode.metadata()?.file_type == FileType::Dir {
         return Err(SystemError::EPERM);
     }
-    // 硬链接安全检查
+    // Hard link security check
     may_linkat(&old_inode)?;
 
     // 得到新创建节点的父节点

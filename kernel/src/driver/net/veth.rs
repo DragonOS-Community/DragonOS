@@ -178,7 +178,8 @@ impl Veth {
 #[derive(Clone)]
 pub struct VethDriver {
     pub inner: Arc<SpinLock<Veth>>,
-    /// 指向所属网络接口的共享弱引用，用于 packet socket 分发。
+    /// A shared weak reference to the owning network interface, used for packet
+    /// socket delivery.
     iface: Arc<SpinLock<Weak<dyn Iface>>>,
 }
 

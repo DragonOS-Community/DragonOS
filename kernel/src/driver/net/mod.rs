@@ -104,10 +104,11 @@ pub trait Iface: crate::driver::base::device::Device {
     }
 
     /// # `raw_transmit`
-    /// 发送原始以太网帧（AF_PACKET 用）。
+    /// Send a raw Ethernet frame (for AF_PACKET).
     ///
-    /// 默认返回 `ENOSYS`；具体网卡驱动应覆盖此方法，通过底层 `phy::Device`
-    /// 的 TX 通道直接发送帧，绕过 smoltcp 协议栈。
+    /// By default returns `ENOSYS`; concrete NIC drivers should override this
+    /// method to send frames directly through the underlying `phy::Device`
+    /// TX channel, bypassing the smoltcp stack.
     fn raw_transmit(&self, _frame: &[u8]) -> Result<(), SystemError> {
         Err(SystemError::ENOSYS)
     }

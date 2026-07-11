@@ -1,10 +1,12 @@
-// af_packet_sockopt.cc - AF_PACKET socket 选项往返测试 (dunitest/gtest)
+// af_packet_sockopt.cc - AF_PACKET socket option round-trip tests (dunitest/gtest)
 //
-// 由 user/apps/c_unitest/test_af_packet.c 转换而来。
-// 验证 DragonOS AF_PACKET setsockopt/getsockopt 的选项往返、
-// 取值校验与错误码语义，共 18 个用例 (对应原 C 测试的 18 个断言点)。
+// Converted from user/apps/c_unitest/test_af_packet.c.
+// Validates DragonOS AF_PACKET setsockopt/getsockopt option round-trips,
+// value checks and error-code semantics, 18 test cases total (corresponding
+// to the 18 assertion points in the original C test).
 //
-// 本组测试不依赖网络接口，仅操作套接字选项层。
+// This test suite does not depend on network interfaces; it only operates
+// at the socket option layer.
 
 #include <gtest/gtest.h>
 
@@ -18,7 +20,7 @@
 #include <cstring>
 #include <string>
 
-// ---- 手动定义常量 (DragonOS musl 可能缺少 if_packet.h) ----
+// ---- Manually define constants (DragonOS musl may lack if_packet.h) ----
 
 #ifndef AF_PACKET
 #define AF_PACKET 17
@@ -28,10 +30,10 @@
 #define SOL_PACKET 263
 #endif
 
-// 以太网协议: ETH_P_ALL = 0x0003 (接收所有协议)
+// Ethernet protocol: ETH_P_ALL = 0x0003 (receive all protocols)
 inline constexpr int kEthPAll = 0x0003;
 
-// SOL_PACKET 级别 socket 选项 (对应 Linux if_packet.h)
+// SOL_PACKET level socket options (matching Linux if_packet.h)
 #ifndef PACKET_ADD_MEMBERSHIP
 #define PACKET_ADD_MEMBERSHIP 1
 #endif
@@ -69,7 +71,7 @@ inline constexpr int kEthPAll = 0x0003;
 #define PACKET_QDISC_BYPASS 20
 #endif
 
-// TPACKET 版本 (PACKET_VERSION 取值)
+// TPACKET versions (PACKET_VERSION values)
 #ifndef TPACKET_V1
 #define TPACKET_V1 0
 #endif
@@ -82,7 +84,7 @@ inline constexpr int kEthPAll = 0x0003;
 
 namespace {
 
-// RAII fd 守护，出作用域自动 close
+// RAII fd guard, auto-closes when leaving scope
 class FdGuard {
   public:
     explicit FdGuard(int fd = -1) : fd_(fd) {}
@@ -105,22 +107,22 @@ std::string ErrnoString(int err) {
     return std::to_string(err) + " (" + std::strerror(err) + ")";
 }
 
-// 创建 SOCK_RAW 套接字；失败时 ADD_FAILURE 并返回 -1
+// Create a SOCK_RAW socket; on failure ADD_FAILURE and return -1
 int MakeRawFd() {
     int fd = socket(AF_PACKET, SOCK_RAW, htons(kEthPAll));
     if (fd < 0) {
-        ADD_FAILURE() << "socket(AF_PACKET, SOCK_RAW) 失败: " << ErrnoString(errno)
-                      << " (需要 CAP_NET_RAW，请在 root 下运行)";
+        ADD_FAILURE() << "socket(AF_PACKET, SOCK_RAW) failed: " << ErrnoString(errno)
+                      << " (requires CAP_NET_RAW, please run as root)";
     }
     return fd;
 }
 
-// setsockopt 整型辅助
+// setsockopt integer helper
 int SetIntOpt(int fd, int opt, int val) {
     return setsockopt(fd, SOL_PACKET, opt, &val, sizeof(val));
 }
 
-// getsockopt 整型辅助
+// getsockopt integer helper
 int GetIntOpt(int fd, int opt, int* val) {
     socklen_t len = sizeof(*val);
     return getsockopt(fd, SOL_PACKET, opt, val, &len);
@@ -128,19 +130,19 @@ int GetIntOpt(int fd, int opt, int* val) {
 
 }  // namespace
 
-// ===== Test 1: 创建 SOCK_RAW =====
+// ===== Test 1: Create SOCK_RAW =====
 TEST(AfPacketSockopt, CreateRawSocket) {
     FdGuard fd(socket(AF_PACKET, SOCK_RAW, htons(kEthPAll)));
     ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
 }
 
-// ===== Test 2: 创建 SOCK_DGRAM =====
+// ===== Test 2: Create SOCK_DGRAM =====
 TEST(AfPacketSockopt, CreateDgramSocket) {
     FdGuard fd(socket(AF_PACKET, SOCK_DGRAM, htons(kEthPAll)));
     ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
 }
 
-// ===== Test 3: PACKET_AUXDATA 设 1 往返 =====
+// ===== Test 3: PACKET_AUXDATA set to 1 round-trip =====
 TEST(AfPacketSockopt, AuxdataEnableRoundtrip) {
     FdGuard fd(MakeRawFd());
     ASSERT_GE(fd.Get(), 0);
@@ -150,7 +152,7 @@ TEST(AfPacketSockopt, AuxdataEnableRoundtrip) {
     EXPECT_EQ(got, 1);
 }
 
-// ===== Test 4: PACKET_AUXDATA 设 0 往返 =====
+// ===== Test 4: PACKET_AUXDATA set to 0 round-trip =====
 TEST(AfPacketSockopt, AuxdataDisableRoundtrip) {
     FdGuard fd(MakeRawFd());
     ASSERT_GE(fd.Get(), 0);
@@ -179,7 +181,7 @@ TEST(AfPacketSockopt, UnsupportedSetSucceedsButGetIsNotAdvertised) {
     }
 }
 
-// ===== Test 15: PACKET_STATISTICS 返回 8 字节结构 =====
+// ===== Test 15: PACKET_STATISTICS returns 8-byte struct =====
 TEST(AfPacketSockopt, StatisticsReturnsStruct) {
     FdGuard fd(MakeRawFd());
     ASSERT_GE(fd.Get(), 0);
@@ -194,7 +196,7 @@ TEST(AfPacketSockopt, StatisticsReturnsStruct) {
     EXPECT_EQ(len, sizeof(stats));
 }
 
-// ===== Test 17: getsockopt 非法 option 返回 ENOPROTOOPT =====
+// ===== Test 17: getsockopt invalid option returns ENOPROTOOPT =====
 TEST(AfPacketSockopt, InvalidGetsockoptReturnsEnoprotoopt) {
     FdGuard fd(MakeRawFd());
     ASSERT_GE(fd.Get(), 0);
@@ -205,7 +207,7 @@ TEST(AfPacketSockopt, InvalidGetsockoptReturnsEnoprotoopt) {
     EXPECT_EQ(errno, ENOPROTOOPT) << ErrnoString(errno);
 }
 
-// ===== Test 18: recvmsg 不返回 ENOSYS =====
+// ===== Test 18: recvmsg does not return ENOSYS =====
 TEST(AfPacketSockopt, RecvmsgDoesNotReturnEnosys) {
     FdGuard fd(MakeRawFd());
     ASSERT_GE(fd.Get(), 0);
@@ -219,14 +221,14 @@ TEST(AfPacketSockopt, RecvmsgDoesNotReturnEnosys) {
     msg.msg_iovlen = 1;
 
     errno = 0;
-    // MSG_DONTWAIT: 无数据时立即返回 EAGAIN，不应阻塞
+    // MSG_DONTWAIT: returns EAGAIN immediately when no data; should not block
     ssize_t n = recvmsg(fd.Get(), &msg, MSG_DONTWAIT);
     if (n >= 0) {
-        SUCCEED();  // 有数据也算 recvmsg 正常工作
+        SUCCEED();  // having data also counts as recvmsg working correctly
         return;
     }
-    EXPECT_NE(errno, ENOSYS) << "recvmsg 返回 ENOSYS (功能未实现)";
-    // EAGAIN/EWOULDBLOCK 是正常的 (无数据)
+    EXPECT_NE(errno, ENOSYS) << "recvmsg returned ENOSYS (feature not implemented)";
+    // EAGAIN/EWOULDBLOCK is normal (no data)
 }
 
 int main(int argc, char** argv) {

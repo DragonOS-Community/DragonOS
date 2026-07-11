@@ -1,10 +1,12 @@
-// af_packet_mcast.cc - AF_PACKET multicast membership 测试 (dunitest/gtest)
+// af_packet_mcast.cc - AF_PACKET multicast membership tests (dunitest/gtest)
 //
-// 由 user/apps/c_unitest/test_af_packet_mcast.c 转换而来。
-// 验证 DragonOS AF_PACKET 的 PACKET_ADD_MEMBERSHIP / PACKET_DROP_MEMBERSHIP
-// 行为，覆盖 PROMISC / ALLMULTI / MULTICAST 三种 mr_type 以及错误码语义。
+// Converted from user/apps/c_unitest/test_af_packet_mcast.c.
+// Verify DragonOS AF_PACKET PACKET_ADD_MEMBERSHIP / PACKET_DROP_MEMBERSHIP
+// behavior, covering the three mr_type values PROMISC / ALLMULTI / MULTICAST
+// as well as error-code semantics.
 //
-// 需要网络接口: 用 discover_ifname() 暴力枚举 eth0-eth20。
+// Requires a network interface: uses discover_ifname() to brute-force
+// enumerate eth0-eth20.
 
 #include <gtest/gtest.h>
 
@@ -18,7 +20,7 @@
 #include <cstring>
 #include <string>
 
-// ---- 手动定义常量 (DragonOS musl 可能缺少 if_packet.h) ----
+// ---- Manually define constants (DragonOS musl may lack if_packet.h) ----
 
 #ifndef AF_PACKET
 #define AF_PACKET 17
@@ -45,7 +47,7 @@ inline constexpr int kEthPAll = 0x0003;
 #define PACKET_DROP_MEMBERSHIP 2
 #endif
 
-// packet_mreq 的 mr_type 常量 (对应 Linux if_packet.h)
+// mr_type constants for packet_mreq (corresponding to Linux if_packet.h)
 #ifndef PACKET_MR_PROMISC
 #define PACKET_MR_PROMISC 0
 #endif
@@ -61,8 +63,8 @@ inline constexpr int kEthPAll = 0x0003;
 
 namespace {
 
-// 手动定义 struct packet_mreq (对应 Linux struct packet_mreq)。
-// 布局: mr_ifindex(u32) + mr_type(u32) + mr_alen(u16) + mr_address[8]。
+// Manually define struct packet_mreq (corresponding to Linux struct packet_mreq).
+// Layout: mr_ifindex(u32) + mr_type(u32) + mr_alen(u16) + mr_address[8].
 struct PacketMreq {
     unsigned int mr_ifindex;
     unsigned int mr_type;
@@ -70,7 +72,7 @@ struct PacketMreq {
     unsigned char mr_address[8];
 };
 
-// RAII fd 守护
+// RAII fd guard
 class FdGuard {
   public:
     explicit FdGuard(int fd = -1) : fd_(fd) {}
@@ -93,8 +95,8 @@ std::string ErrnoString(int err) {
     return std::to_string(err) + " (" + std::strerror(err) + ")";
 }
 
-// 暴力枚举 eth0-eth20，用 ioctl(SIOCGIFINDEX) 验证存在性。
-// DragonOS 没有 /proc/net/dev，且接口名可能不稳定。
+// Brute-force enumerate eth0-eth20, verifying existence via ioctl(SIOCGIFINDEX).
+// DragonOS does not have /proc/net/dev, and interface names may be unstable.
 std::string DiscoverIfname() {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) return "eth0";
@@ -112,8 +114,8 @@ std::string DiscoverIfname() {
     return "eth0";
 }
 
-// 获取网卡 ifindex: 用临时 AF_INET/DGRAM 控制套接字发送 ioctl。
-// 成功返回 ifindex (>=1)，失败返回 -1。
+// Get the NIC ifindex: use a temporary AF_INET/DGRAM control socket to send ioctl.
+// Returns ifindex (>=1) on success, -1 on failure.
 int GetIfIndex(const std::string& ifname) {
     struct ifreq ifr;
     std::memset(&ifr, 0, sizeof(ifr));
@@ -128,9 +130,9 @@ int GetIfIndex(const std::string& ifname) {
     return ifr.ifr_ifindex;
 }
 
-// 探测网卡并创建 SOCK_RAW 套接字。
-// 若无网卡或无权限则 GTEST_SKIP；返回的 FdGuard 持有有效 fd。
-// 返回 ifindex，通过 out_fd 输出套接字 fd。
+// Probe for a NIC and create a SOCK_RAW socket.
+// GTEST_SKIP if no NIC or insufficient permissions; the returned FdGuard holds a valid fd.
+// Returns ifindex, outputs socket fd via out_fd.
 int SetupMcastEnv(FdGuard* out_fd) {
     std::string ifname = DiscoverIfname();
     int ifindex = GetIfIndex(ifname);
@@ -151,10 +153,10 @@ TEST(AfPacketMcast, AddMembershipPromisc) {
     FdGuard fd;
     int ifindex = SetupMcastEnv(&fd);
     if (ifindex == -1) {
-        GTEST_SKIP() << "未找到可用网卡，跳过 multicast 测试";
+        GTEST_SKIP() << "No usable NIC found, skipping multicast test";
     }
-    ASSERT_NE(ifindex, -2) << "创建 AF_PACKET socket 失败: " << ErrnoString(errno)
-                           << " (需要 CAP_NET_RAW)";
+    ASSERT_NE(ifindex, -2) << "Failed to create AF_PACKET socket: " << ErrnoString(errno)
+                           << " (requires CAP_NET_RAW)";
 
     PacketMreq mreq{};
     mreq.mr_ifindex = static_cast<unsigned int>(ifindex);
@@ -169,11 +171,11 @@ TEST(AfPacketMcast, DropMembershipPromisc) {
     FdGuard fd;
     int ifindex = SetupMcastEnv(&fd);
     if (ifindex == -1) {
-        GTEST_SKIP() << "未找到可用网卡，跳过 multicast 测试";
+        GTEST_SKIP() << "No usable NIC found, skipping multicast test";
     }
-    ASSERT_NE(ifindex, -2) << "创建 AF_PACKET socket 失败: " << ErrnoString(errno);
+    ASSERT_NE(ifindex, -2) << "Failed to create AF_PACKET socket: " << ErrnoString(errno);
 
-    // 先 ADD 再 DROP (复用同一 mreq)
+    // First ADD then DROP (reusing the same mreq)
     PacketMreq mreq{};
     mreq.mr_ifindex = static_cast<unsigned int>(ifindex);
     mreq.mr_type = PACKET_MR_PROMISC;
@@ -182,7 +184,7 @@ TEST(AfPacketMcast, DropMembershipPromisc) {
 
     errno = 0;
     EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_DROP_MEMBERSHIP, &mreq, sizeof(mreq)), 0)
-        << ErrnoString(errno) << " (应恢复接口标志)";
+        << ErrnoString(errno) << " (should restore interface flags)";
 }
 
 // ===== Test 3: ADD/DROP MEMBERSHIP (PACKET_MR_ALLMULTI) =====
@@ -190,9 +192,9 @@ TEST(AfPacketMcast, AddDropMembershipAllmulti) {
     FdGuard fd;
     int ifindex = SetupMcastEnv(&fd);
     if (ifindex == -1) {
-        GTEST_SKIP() << "未找到可用网卡，跳过 multicast 测试";
+        GTEST_SKIP() << "No usable NIC found, skipping multicast test";
     }
-    ASSERT_NE(ifindex, -2) << "创建 AF_PACKET socket 失败: " << ErrnoString(errno);
+    ASSERT_NE(ifindex, -2) << "Failed to create AF_PACKET socket: " << ErrnoString(errno);
 
     PacketMreq mreq{};
     mreq.mr_ifindex = static_cast<unsigned int>(ifindex);
@@ -202,10 +204,10 @@ TEST(AfPacketMcast, AddDropMembershipAllmulti) {
     EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq)), 0)
         << ErrnoString(errno);
 
-    // DROP 清除
+    // DROP cleanup
     errno = 0;
     EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_DROP_MEMBERSHIP, &mreq, sizeof(mreq)), 0)
-        << ErrnoString(errno) << " (应恢复)";
+        << ErrnoString(errno) << " (should restore)";
 }
 
 // origin/master keeps membership as an unconditional compatibility no-op.
@@ -213,13 +215,13 @@ TEST(AfPacketMcast, ArbitraryMembershipPayloadRemainsCompatible) {
     FdGuard fd;
     int ifindex = SetupMcastEnv(&fd);
     if (ifindex == -1) {
-        GTEST_SKIP() << "未找到可用网卡，跳过 multicast 测试";
+        GTEST_SKIP() << "No usable NIC found, skipping multicast test";
     }
-    ASSERT_NE(ifindex, -2) << "创建 AF_PACKET socket 失败: " << ErrnoString(errno);
+    ASSERT_NE(ifindex, -2) << "Failed to create AF_PACKET socket: " << ErrnoString(errno);
 
     PacketMreq mreq{};
     mreq.mr_ifindex = static_cast<unsigned int>(ifindex);
-    mreq.mr_type = 999;  // 非法类型
+    mreq.mr_type = 999;  // invalid type
     errno = 0;
     EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq)), 0)
         << ErrnoString(errno);
@@ -229,32 +231,32 @@ TEST(AfPacketMcast, UnknownIfindexRemainsCompatibleNoop) {
     FdGuard fd;
     int ifindex = SetupMcastEnv(&fd);
     if (ifindex == -1) {
-        GTEST_SKIP() << "未找到可用网卡，跳过 multicast 测试";
+        GTEST_SKIP() << "No usable NIC found, skipping multicast test";
     }
-    ASSERT_NE(ifindex, -2) << "创建 AF_PACKET socket 失败: " << ErrnoString(errno);
+    ASSERT_NE(ifindex, -2) << "Failed to create AF_PACKET socket: " << ErrnoString(errno);
 
     PacketMreq mreq{};
-    mreq.mr_ifindex = 99999;  // 不存在的接口
+    mreq.mr_ifindex = 99999;  // non-existent interface
     mreq.mr_type = PACKET_MR_PROMISC;
     errno = 0;
     EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq)), 0)
         << ErrnoString(errno);
 }
 
-// ===== Test 6: ADD/DROP MEMBERSHIP (PACKET_MR_MULTICAST, 特定多播 MAC) =====
+// ===== Test 6: ADD/DROP MEMBERSHIP (PACKET_MR_MULTICAST, specific multicast MAC) =====
 TEST(AfPacketMcast, AddDropMembershipMulticast) {
     FdGuard fd;
     int ifindex = SetupMcastEnv(&fd);
     if (ifindex == -1) {
-        GTEST_SKIP() << "未找到可用网卡，跳过 multicast 测试";
+        GTEST_SKIP() << "No usable NIC found, skipping multicast test";
     }
-    ASSERT_NE(ifindex, -2) << "创建 AF_PACKET socket 失败: " << ErrnoString(errno);
+    ASSERT_NE(ifindex, -2) << "Failed to create AF_PACKET socket: " << ErrnoString(errno);
 
     PacketMreq mreq{};
     mreq.mr_ifindex = static_cast<unsigned int>(ifindex);
     mreq.mr_type = PACKET_MR_MULTICAST;
-    mreq.mr_alen = 6;  // 以太网 MAC 长度
-    // 多播 MAC: 01:00:5e:00:00:01 (IGMP/多播组映射)
+    mreq.mr_alen = 6;  // Ethernet MAC length
+    // Multicast MAC: 01:00:5e:00:00:01 (IGMP/multicast group mapping)
     mreq.mr_address[0] = 0x01;
     mreq.mr_address[1] = 0x00;
     mreq.mr_address[2] = 0x5e;
@@ -266,7 +268,7 @@ TEST(AfPacketMcast, AddDropMembershipMulticast) {
     EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq)), 0)
         << ErrnoString(errno);
 
-    // DROP 清除
+    // DROP cleanup
     errno = 0;
     EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_DROP_MEMBERSHIP, &mreq, sizeof(mreq)), 0)
         << ErrnoString(errno);

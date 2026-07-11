@@ -321,7 +321,8 @@ impl LoopbackInterface {
     /// ## `new` 是一个公共函数，用于创建一个新的 `LoopbackInterface` 实例。
     /// 生成一个新的接口 ID。创建一个新的接口配置，设置其硬件地址和随机种子，使用接口配置和驱动器创建一个新的 `smoltcp::iface::Interface` 实例。
     /// 设置接口的 IP 地址为 127.0.0.1。
-    /// 保存可克隆的驱动句柄，底层队列和接口反向引用由共享锁保护。
+    /// Saves a cloneable driver handle; the underlying queue and the interface
+    /// back-reference are protected by a shared lock.
     /// 创建一个新的 `LoopbackInterface` 实例，包含驱动器、接口 ID、接口和名称，并将其封装在一个 `Arc` 中。
     /// ## 参数
     /// - `driver`：一个 `LoopbackDriver` 实例，用于驱动网络环回操作。

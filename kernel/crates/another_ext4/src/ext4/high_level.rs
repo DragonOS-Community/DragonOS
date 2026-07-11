@@ -106,7 +106,7 @@ impl Ext4 {
     ///
     /// * `ENOENT` - The object does not exist.
     /// * `ENOTEMPTY` - The object is a non-empty directory.
-    pub fn generic_remove(&self, root: InodeId, path: &str) -> Result<Option<InodeReclaimHandle>> {
+    pub fn generic_remove(&self, root: InodeId, path: &str) -> Result<()> {
         // Get the parent directory path and the file name
         let mut search_path = Self::split_path(path);
         let file_name = &search_path.split_off(search_path.len() - 1)[0];
@@ -121,11 +121,15 @@ impl Ext4 {
             return_error!(ErrCode::ENOTEMPTY, "Directory {} not empty", path);
         }
         // Unlink the file
-        if child.inode.is_dir() {
+        let reclaim = if child.inode.is_dir() {
             self.rmdir(parent_id, file_name)
         } else {
             self.unlink(parent_id, file_name)
+        }?;
+        if let Some(handle) = reclaim {
+            self.reclaim_inode(handle)?;
         }
+        Ok(())
     }
 
     /// Move an object from one location to another.
@@ -141,12 +145,7 @@ impl Ext4 {
     /// * `ENOTDIR` - Any parent in the path is not a directory.
     /// * `ENOENT` - The source object does not exist.
     /// * `EEXIST` - The destination object already exists.
-    pub fn generic_rename(
-        &self,
-        root: InodeId,
-        src: &str,
-        dst: &str,
-    ) -> Result<Option<InodeReclaimHandle>> {
+    pub fn generic_rename(&self, root: InodeId, src: &str, dst: &str) -> Result<()> {
         // Parse the directories and file names
         let mut src_path = Self::split_path(src);
         let src_file_name = &src_path.split_off(src_path.len() - 1)[0];
@@ -158,7 +157,12 @@ impl Ext4 {
         let src_parent_id = self.generic_lookup(root, &src_parent_path)?;
         let dst_parent_id = self.generic_lookup(root, &dst_parent_path)?;
         // Move the file
-        self.rename(src_parent_id, src_file_name, dst_parent_id, dst_file_name)
+        if let Some(handle) =
+            self.rename(src_parent_id, src_file_name, dst_parent_id, dst_file_name)?
+        {
+            self.reclaim_inode(handle)?;
+        }
+        Ok(())
     }
 
     /// A helper function to split a path by '/'

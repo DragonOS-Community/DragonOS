@@ -40,66 +40,66 @@ pub mod eth_protocol {
     pub const ETH_P_IPV6: u16 = 0x86DD;
 }
 
-/// SOL_PACKET 级别 socket 选项常量 (对应 Linux `include/uapi/linux/if_packet.h`)
+/// SOL_PACKET-level socket option constants (corresponding to Linux `include/uapi/linux/if_packet.h`)
 pub mod packet_option {
-    /// 加入多播组 (独立 issue)
+    /// Join multicast group (separate issue)
     pub const PACKET_ADD_MEMBERSHIP: usize = 1;
-    /// 离开多播组 (独立 issue)
+    /// Leave multicast group (separate issue)
     pub const PACKET_DROP_MEMBERSHIP: usize = 2;
-    /// 获取统计信息 (只读 getsockopt)
+    /// Get statistics (read-only getsockopt)
     pub const PACKET_STATISTICS: usize = 6;
-    /// 复制阈值字节数
+    /// Copy threshold in bytes
     pub const PACKET_COPY_THRESH: usize = 7;
-    /// 辅助数据开关
+    /// Auxiliary data toggle
     pub const PACKET_AUXDATA: usize = 8;
-    /// 返回原始接收接口索引
+    /// Return original receiving interface index
     pub const PACKET_ORIGDEV: usize = 9;
-    /// TPACKET 版本 (TPACKET_V1/V2/V3)
+    /// TPACKET version (TPACKET_V1/V2/V3)
     pub const PACKET_VERSION: usize = 10;
-    /// 预留字节数
+    /// Reserved bytes
     pub const PACKET_RESERVE: usize = 12;
-    /// 虚拟网络头开关
+    /// Virtual network header toggle
     pub const PACKET_VNET_HDR: usize = 15;
-    /// 发送时间戳 fd
+    /// Transmit timestamp fd
     pub const PACKET_TX_TIMESTAMP: usize = 16;
-    /// 接收时间戳类型
+    /// Receive timestamp type
     pub const PACKET_TIMESTAMP: usize = 17;
-    /// QDisc 绕过开关
+    /// QDisc bypass toggle
     pub const PACKET_QDISC_BYPASS: usize = 20;
 }
 
-/// TPACKET 版本常量 (用于 PACKET_VERSION 校验)
+/// TPACKET version constants (for PACKET_VERSION validation)
 const TPACKET_V1: i32 = 0;
 const TPACKET_V2: i32 = 1;
 const TPACKET_V3: i32 = 2;
 
-/// packet_mreq 的 mr_type 常量 (对应 Linux `include/uapi/linux/if_packet.h`)
+/// packet_mreq mr_type constants (corresponding to Linux `include/uapi/linux/if_packet.h`)
 pub mod packet_mreq_type {
-    /// PACKET_MR_PROMISC: 混杂模式 (接收所有单播包)
-    pub const PACKET_MR_PROMISC: u32 = 0;
-    /// PACKET_MR_MULTICAST: 特定多播组
-    pub const PACKET_MR_MULTICAST: u32 = 1;
-    /// PACKET_MR_ALLMULTI: 所有多播
-    pub const PACKET_MR_ALLMULTI: u32 = 2;
-    /// PACKET_MR_UNICAST: 特定单播
-    pub const PACKET_MR_UNICAST: u32 = 3;
+    /// PACKET_MR_PROMISC: promiscuous mode (receive all unicast packets)
+    pub const PACKET_MR_PROMISC: u16 = 0;
+    /// PACKET_MR_MULTICAST: specific multicast group
+    pub const PACKET_MR_MULTICAST: u16 = 1;
+    /// PACKET_MR_ALLMULTI: all multicast
+    pub const PACKET_MR_ALLMULTI: u16 = 2;
+    /// PACKET_MR_UNICAST: specific unicast
+    pub const PACKET_MR_UNICAST: u16 = 3;
 }
 
-/// struct packet_mreq (对应 Linux `struct packet_mreq`)
+/// struct packet_mreq (corresponding to Linux `struct packet_mreq`)
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct PacketMreq {
-    /// 接口索引
-    pub mr_ifindex: u32,
-    /// 操作类型 (PACKET_MR_*)
-    pub mr_type: u32,
-    /// 地址长度
+    /// Interface index
+    pub mr_ifindex: i32,
+    /// Operation type (PACKET_MR_*)
+    pub mr_type: u16,
+    /// Address length
     pub mr_alen: u16,
-    /// 硬件地址 (最多 8 字节)
+    /// Hardware address (up to 8 bytes)
     pub mr_address: [u8; 8],
 }
 
-/// SOL_PACKET 常量 (用于 cmsg level)
+/// SOL_PACKET constant (for cmsg level)
 const SOL_PACKET: i32 = 263;
 
 /// 数据包类型
@@ -173,8 +173,8 @@ pub struct SockAddrLl {
     pub sll_addr: [u8; 8],
 }
 
-/// struct tpacket_auxdata (对应 Linux `include/uapi/linux/if_packet.h`)
-/// 用于 PACKET_AUXDATA 辅助数据
+/// struct tpacket_auxdata (corresponding to Linux `include/uapi/linux/if_packet.h`)
+/// Used for PACKET_AUXDATA auxiliary data
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TpacketAuxdata {
@@ -187,26 +187,26 @@ pub struct TpacketAuxdata {
     pub tp_vlan_tpid: u16,
 }
 
-/// Packet socket 选项存储 (对应 SOL_PACKET 级别 setsockopt/getsockopt)
+/// Packet socket option storage (corresponding to SOL_PACKET-level setsockopt/getsockopt)
 #[derive(Debug, Clone, Default)]
 pub struct PacketSocketOptions {
-    /// PACKET_COPY_THRESH: 复制阈值字节数
+    /// PACKET_COPY_THRESH: copy threshold in bytes
     pub copy_thresh: u32,
-    /// PACKET_AUXDATA: 是否启用辅助数据
+    /// PACKET_AUXDATA: whether auxiliary data is enabled
     pub auxdata: bool,
-    /// PACKET_ORIGDEV: 是否返回原始接收接口
+    /// PACKET_ORIGDEV: whether to return original receiving interface
     pub origdev: bool,
-    /// PACKET_VERSION: TPACKET 版本 (TPACKET_V1/V2/V3)
+    /// PACKET_VERSION: TPACKET version (TPACKET_V1/V2/V3)
     pub version: i32,
-    /// PACKET_RESERVE: 预留字节数
+    /// PACKET_RESERVE: reserved bytes
     pub reserve: u32,
-    /// PACKET_VNET_HDR: 是否启用虚拟网络头
+    /// PACKET_VNET_HDR: whether virtual network header is enabled
     pub vnet_hdr: bool,
-    /// PACKET_TX_TIMESTAMP: 发送时间戳 fd
+    /// PACKET_TX_TIMESTAMP: transmit timestamp fd
     pub tx_timestamp: i32,
-    /// PACKET_TIMESTAMP: 接收时间戳类型 (SOF_TIMESTAMPING 标志位)
+    /// PACKET_TIMESTAMP: receive timestamp type (SOF_TIMESTAMPING flag bits)
     pub timestamp: i32,
-    /// PACKET_QDISC_BYPASS: 是否绕过 qdisc
+    /// PACKET_QDISC_BYPASS: whether to bypass qdisc
     pub qdisc_bypass: bool,
 }
 
@@ -231,11 +231,11 @@ pub struct PacketSocket {
     rx_buffer: Mutex<VecDeque<ReceivedPacket>>,
     /// 接收缓冲区最大包数
     rx_buffer_max_packets: AtomicUsize,
-    /// 选项存储
+    /// Option storage
     options: RwSem<PacketSocketOptions>,
-    /// 统计: 自上次 getsockopt(PACKET_STATISTICS) 以来接收的包数
+    /// Statistics: packets received since last getsockopt(PACKET_STATISTICS)
     stats_packets: AtomicU32,
-    /// 统计: 自上次 getsockopt(PACKET_STATISTICS) 以来丢弃的包数
+    /// Statistics: packets dropped since last getsockopt(PACKET_STATISTICS)
     stats_drops: AtomicU32,
     /// 非阻塞标志
     nonblock: AtomicBool,
@@ -253,9 +253,9 @@ pub struct PacketSocket {
     epoll_items: EPollItems,
     /// fasync 项
     fasync_items: FAsyncItems,
-    /// ADD_MEMBERSHIP 设置 PROMISC 的接口索引列表 (DROP 时清除)
+    /// Interface indices where ADD_MEMBERSHIP set PROMISC (cleared on DROP)
     promisc_ifindices: Mutex<Vec<u32>>,
-    /// ADD_MEMBERSHIP 设置 ALLMULTI 的接口索引列表 (DROP 时清除)
+    /// Interface indices where ADD_MEMBERSHIP set ALLMULTI (cleared on DROP)
     allmulti_ifindices: Mutex<Vec<u32>>,
 }
 
@@ -384,7 +384,7 @@ impl PacketSocket {
             // 唤醒等待的进程
             self.wait_queue.wakeup(None);
         } else {
-            // 缓冲区满，丢弃并计数
+            // Buffer full, drop and count
             self.stats_drops.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -452,7 +452,7 @@ impl PacketSocket {
                 frame.extend_from_slice(buf);
 
                 self.send_raw_frame(&iface, &frame)?;
-                // SOCK_DGRAM: 返回用户 payload 长度（非完整帧长度），符合 Linux packet_sendmsg 语义
+                // SOCK_DGRAM: return user payload length (not full frame length), matching Linux packet_sendmsg semantics
                 Ok(buf.len())
             }
         }
@@ -460,7 +460,7 @@ impl PacketSocket {
 
     /// 发送原始帧到网卡
     fn send_raw_frame(&self, iface: &Arc<dyn Iface>, frame: &[u8]) -> Result<usize, SystemError> {
-        // 通过网卡接口直接发送原始帧（绕过 smoltcp 协议栈）
+        // Send raw frame directly via NIC interface (bypassing smoltcp protocol stack)
         iface.raw_transmit(frame)?;
         Ok(frame.len())
     }
@@ -486,7 +486,7 @@ impl PacketSocket {
         self.self_ref.clone()
     }
 
-    /// 从 optval 解析 i32 (至少 4 字节)
+    /// Parse i32 from optval (at least 4 bytes)
     fn parse_i32_opt(optval: &[u8]) -> Result<i32, SystemError> {
         if optval.len() < core::mem::size_of::<i32>() {
             return Err(SystemError::EINVAL);
@@ -496,7 +496,7 @@ impl PacketSocket {
         Ok(i32::from_ne_bytes(raw))
     }
 
-    /// 从 optval 解析 u32 (至少 4 字节)
+    /// Parse u32 from optval (at least 4 bytes)
     fn parse_u32_opt(optval: &[u8]) -> Result<u32, SystemError> {
         if optval.len() < core::mem::size_of::<u32>() {
             return Err(SystemError::EINVAL);
@@ -506,7 +506,7 @@ impl PacketSocket {
         Ok(u32::from_ne_bytes(raw))
     }
 
-    /// 从 optval 解析 PacketMreq
+    /// Parse PacketMreq from optval
     fn parse_mreq(optval: &[u8]) -> Result<PacketMreq, SystemError> {
         if optval.len() < core::mem::size_of::<PacketMreq>() {
             return Err(SystemError::EINVAL);
@@ -517,7 +517,7 @@ impl PacketSocket {
         Ok(unsafe { core::ptr::read_unaligned(raw.as_ptr() as *const PacketMreq) })
     }
 
-    /// 按接口索引查找网卡
+    /// Find NIC by interface index
     fn find_iface(&self, ifindex: u32) -> Result<Arc<dyn Iface>, SystemError> {
         self.netns
             .device_list()
@@ -527,41 +527,43 @@ impl PacketSocket {
             .ok_or(SystemError::ENODEV)
     }
 
-    /// 处理 ADD_MEMBERSHIP / DROP_MEMBERSHIP
+    /// Handle ADD_MEMBERSHIP / DROP_MEMBERSHIP
     fn set_membership(&self, mreq: &PacketMreq, is_add: bool) -> Result<(), SystemError> {
         match mreq.mr_type {
             packet_mreq_type::PACKET_MR_PROMISC => {
-                let iface = self.find_iface(mreq.mr_ifindex)?;
+                let iface = self.find_iface(mreq.mr_ifindex as u32)?;
                 let mut flags = iface.flags();
                 if is_add {
                     flags |= InterfaceFlags::PROMISC;
-                    self.promisc_ifindices.lock().push(mreq.mr_ifindex);
+                    self.promisc_ifindices.lock().push(mreq.mr_ifindex as u32);
                 } else {
                     flags &= !InterfaceFlags::PROMISC;
                     self.promisc_ifindices
                         .lock()
-                        .retain(|&i| i != mreq.mr_ifindex);
+                        .retain(|&i| i != mreq.mr_ifindex as u32);
                 }
                 iface.common().set_flags(flags);
                 Ok(())
             }
             packet_mreq_type::PACKET_MR_ALLMULTI => {
-                let iface = self.find_iface(mreq.mr_ifindex)?;
+                let iface = self.find_iface(mreq.mr_ifindex as u32)?;
                 let mut flags = iface.flags();
                 if is_add {
                     flags |= InterfaceFlags::ALLMULTI;
-                    self.allmulti_ifindices.lock().push(mreq.mr_ifindex);
+                    self.allmulti_ifindices.lock().push(mreq.mr_ifindex as u32);
                 } else {
                     flags &= !InterfaceFlags::ALLMULTI;
                     self.allmulti_ifindices
                         .lock()
-                        .retain(|&i| i != mreq.mr_ifindex);
+                        .retain(|&i| i != mreq.mr_ifindex as u32);
                 }
                 iface.common().set_flags(flags);
                 Ok(())
             }
             packet_mreq_type::PACKET_MR_MULTICAST | packet_mreq_type::PACKET_MR_UNICAST => {
-                // TODO: 多播地址过滤 — 当前接受但不处理硬件过滤
+                // Validate that the interface exists (hardware multicast filtering not yet implemented)
+                self.find_iface(mreq.mr_ifindex as u32)?;
+                // TODO: multicast address filtering
                 Ok(())
             }
             _ => Err(SystemError::EINVAL),
@@ -710,7 +712,7 @@ impl Socket for PacketSocket {
             iface.common().unregister_packet_socket(&self.self_ref);
         }
 
-        // 清除通过 ADD_MEMBERSHIP 设置的 PROMISC/ALLMULTI flags
+        // Clear PROMISC/ALLMULTI flags set via ADD_MEMBERSHIP
         for &ifindex in self.promisc_ifindices.lock().iter() {
             if let Ok(iface) = self.find_iface(ifindex) {
                 let mut flags = iface.flags();
@@ -780,11 +782,13 @@ impl Socket for PacketSocket {
             }
         };
 
-        // Scatter 到用户 iovec
+        // Scatter into user iovec
         iovs.scatter(&buf[..copy_len])?;
 
-        // 写 sockaddr_ll (msg_name)
+        // Write sockaddr_ll (msg_name), respecting the caller-provided msg_namelen
         if !msg.msg_name.is_null() {
+            let write_len =
+                core::cmp::min(msg.msg_namelen as usize, core::mem::size_of::<SockAddrLl>());
             let mut sll_addr = [0u8; 8];
             sll_addr[..6].copy_from_slice(&metadata.src_mac);
             let sll = SockAddrLl {
@@ -804,25 +808,27 @@ impl Socket for PacketSocket {
             };
             let mut writer = crate::syscall::user_access::UserBufferWriter::new(
                 msg.msg_name as *mut u8,
-                core::mem::size_of::<SockAddrLl>(),
+                write_len,
                 true,
             )?;
-            writer.buffer_protected(0)?.write_to_user(0, sll_bytes)?;
-            msg.msg_namelen = core::mem::size_of::<SockAddrLl>() as u32;
+            writer
+                .buffer_protected(0)?
+                .write_to_user(0, &sll_bytes[..write_len])?;
+            msg.msg_namelen = write_len as u32;
         } else {
             msg.msg_namelen = 0;
         }
 
-        // 设置 msg_flags (截断时 MSG_TRUNC)
+        // Set msg_flags (MSG_TRUNC on truncation)
         let cmsg_len = msg.msg_controllen;
         msg.msg_controllen = 0;
         msg.msg_flags = 0;
-        let orig_len = copy_len; // AF_PACKET 不跟踪原始长度，用 copy_len
+        let orig_len = copy_len; // AF_PACKET does not track original length; use copy_len
         if orig_len > buf_cap {
             msg.msg_flags |= PMSG::TRUNC.bits() as i32;
         }
 
-        // 写 PACKET_AUXDATA cmsg (当启用且 msg_control 不为 null)
+        // Write PACKET_AUXDATA cmsg (when enabled and msg_control is not null)
         let auxdata_enabled = self.options.read().auxdata;
         if auxdata_enabled && cmsg_len > 0 {
             let aux = TpacketAuxdata {
@@ -868,7 +874,7 @@ impl Socket for PacketSocket {
         let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, false)? };
         let data = iovs.gather()?;
 
-        // 解析目标地址
+        // Parse destination address
         let dest = if !msg.msg_name.is_null() && msg.msg_namelen > 0 {
             let endpoint = SockAddr::to_endpoint(msg.msg_name as *const SockAddr, msg.msg_namelen)?;
             if let Endpoint::LinkLayer(ll) = endpoint {
@@ -927,7 +933,7 @@ impl Socket for PacketSocket {
         match name {
             packet_option::PACKET_STATISTICS => {
                 // struct tpacket_stats { tp_packets: u32, tp_drops: u32 }
-                // Linux 语义: 返回自上次 getsockopt 以来的累计统计并清零计数器
+                // Linux semantics: return cumulative stats since last getsockopt and reset counters
                 if value.len() < 8 {
                     return Err(SystemError::EINVAL);
                 }
@@ -959,7 +965,7 @@ impl Socket for PacketSocket {
             return Err(SystemError::ENOPROTOOPT);
         }
 
-        // ADD/DROP_MEMBERSHIP 不需要 options 写锁
+        // ADD/DROP_MEMBERSHIP does not need the options write lock
         match name {
             packet_option::PACKET_ADD_MEMBERSHIP | packet_option::PACKET_DROP_MEMBERSHIP => {
                 let mreq = Self::parse_mreq(val)?;

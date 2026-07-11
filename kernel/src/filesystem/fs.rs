@@ -3,7 +3,10 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use alloc::sync::Arc;
 
 use crate::filesystem::vfs::InodeMode;
-use crate::filesystem::vfs::{mount::MountFSInode, utils::ResolvedPath, IndexNode};
+use crate::filesystem::vfs::{
+    inode_lifecycle::InodeRetentionGuard, mount::MountFSInode, utils::ResolvedPath, IndexNode,
+    InodeRetentionKind,
+};
 use crate::libs::casting::DowncastArc;
 use crate::libs::rwsem::RwSem;
 use crate::process::ProcessManager;
@@ -11,6 +14,9 @@ use crate::process::ProcessManager;
 #[derive(Debug)]
 struct PinnedPath {
     inode: Arc<dyn IndexNode>,
+    // Declared before the mount guard so the inode eviction request is
+    // published before the final external mount pin can seal its queue.
+    _inode_retention: InodeRetentionGuard,
     _mount_guard: Option<crate::filesystem::vfs::mount::MountExternalGuard>,
 }
 
@@ -22,18 +28,24 @@ impl PinnedPath {
                 .try_pin_external()
                 .expect("live process path must pin its mount")
         });
+        let inode_retention = InodeRetentionGuard::new(inode.clone(), InodeRetentionKind::Cache)
+            .expect("live process path must retain its inode");
         Self {
             inode,
             _mount_guard: mount_guard,
+            _inode_retention: inode_retention,
         }
     }
 
     fn from_resolved(resolved: ResolvedPath) -> Self {
         let (inode, mount_guard, operation_guard) = resolved.into_parts();
+        let inode_retention = InodeRetentionGuard::new(inode.clone(), InodeRetentionKind::Cache)
+            .expect("resolved process path must retain its inode");
         drop(operation_guard);
         Self {
             inode,
             _mount_guard: mount_guard,
+            _inode_retention: inode_retention,
         }
     }
 
@@ -49,6 +61,9 @@ impl PinnedPath {
 
 impl Clone for PinnedPath {
     fn clone(&self) -> Self {
+        let inode_retention =
+            InodeRetentionGuard::new(self.inode.clone(), InodeRetentionKind::Cache)
+                .expect("valid process path must remain retainable");
         Self {
             inode: self.inode.clone(),
             _mount_guard: self._mount_guard.as_ref().map(|guard| {
@@ -56,6 +71,7 @@ impl Clone for PinnedPath {
                     .derive()
                     .expect("valid process path must remain derivable")
             }),
+            _inode_retention: inode_retention,
         }
     }
 }

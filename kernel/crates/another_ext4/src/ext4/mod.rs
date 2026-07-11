@@ -69,6 +69,12 @@ pub struct Ext4 {
     /// concurrent modification, which would cause two inodes to receive the
     /// same physical block (corrupting extent trees and data).
     alloc_lock: spin::Mutex<()>,
+    /// Serializes directory-entry/link-count transactions.  Inode data and
+    /// writeback remain sharded; namespace operations are comparatively cold
+    /// and need a single ordering domain until journal transactions exist.
+    namespace_lock: spin::Mutex<()>,
+    /// First unrecoverable metadata error.  Once set, mutation must fail-stop.
+    poisoned: spin::Mutex<Option<ErrCode>>,
     /// Serializes inode metadata and extent-tree mutations per inode shard.
     ///
     /// another_ext4 stores inodes as value snapshots in a small cache. Without
@@ -131,6 +137,8 @@ impl Ext4 {
             cached_block_groups,
             inode_cache: spin::Mutex::new(InodeCache::new(INODE_CACHE_SIZE)),
             alloc_lock: spin::Mutex::new(()),
+            namespace_lock: spin::Mutex::new(()),
+            poisoned: spin::Mutex::new(None),
             inode_mutation_locks,
         })
     }
@@ -149,5 +157,42 @@ impl Ext4 {
     #[inline]
     fn inode_mutation_lock_index(&self, inode_id: InodeId) -> usize {
         inode_id as usize % self.inode_mutation_locks.len()
+    }
+
+    pub(super) fn ensure_mutable(&self) -> Result<()> {
+        if let Some(code) = *self.poisoned.lock() {
+            return_error!(code, "Filesystem is fail-stopped after a metadata error");
+        }
+        Ok(())
+    }
+
+    pub(super) fn poison(&self, code: ErrCode) {
+        let mut poisoned = self.poisoned.lock();
+        if poisoned.is_none() {
+            *poisoned = Some(code);
+        }
+    }
+
+    pub(super) fn poison_on_error<T>(&self, result: Result<T>) -> Result<T> {
+        if result.is_err() {
+            self.poison(ErrCode::EIO);
+        }
+        result
+    }
+
+    pub(super) fn lock_inode_mutations(
+        &self,
+        inode_ids: &[InodeId],
+    ) -> Vec<spin::MutexGuard<'_, ()>> {
+        let mut indices: Vec<usize> = inode_ids
+            .iter()
+            .map(|inode_id| self.inode_mutation_lock_index(*inode_id))
+            .collect();
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+            .into_iter()
+            .map(|index| self.inode_mutation_locks[index].lock())
+            .collect()
     }
 }

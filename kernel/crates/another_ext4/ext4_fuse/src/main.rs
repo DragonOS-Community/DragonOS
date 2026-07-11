@@ -73,7 +73,7 @@ fn main() {
     let options = Vec::<MountOption>::new();
     let session =
         fuser::spawn_mount2(fs, &args.mountpoint, &options).expect("Failed to start FUSE session");
-    
+
     // Set EXIT_FLAG when Ctrl+C is received
     let _ = ctrlc::set_handler(|| {
         EXIT_FLAG.get_or_init(|| true);

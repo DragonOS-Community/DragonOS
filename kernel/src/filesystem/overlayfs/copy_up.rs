@@ -100,7 +100,8 @@ impl OvlInode {
         let mut metadata = lower_inode.metadata()?;
         Self::adjust_metadata_for_truncate_copy_up(&mut metadata, copy_size, &caller_cred);
         if self.redirect.is_empty() {
-            *upper_inode = Some(self.upper_root_inode()?);
+            let inode = self.upper_root_inode()?;
+            self.install_upper_inode(&mut upper_inode, inode)?;
             return Ok(CopyUpOutcome::Existing);
         }
 
@@ -122,7 +123,7 @@ impl OvlInode {
             {
                 let existing = Self::validate_existing_upper(existing, &metadata)?;
                 self.set_origin(metadata::load_origin(self, &existing)?);
-                *upper_inode = Some(existing);
+                self.install_upper_inode(&mut upper_inode, existing)?;
                 return Ok(CopyUpOutcome::Existing);
             }
             // The redirect stripe is held for the whole copy-up, so another
@@ -204,7 +205,8 @@ impl OvlInode {
             Ok(()) => {
                 Self::restore_parent_timestamps(&parent_inode, &parent_metadata);
                 self.set_origin(origin);
-                *upper_inode = Some(Self::validate_existing_upper(temp_inode, &metadata)?);
+                let inode = Self::validate_existing_upper(temp_inode, &metadata)?;
+                self.install_upper_inode(&mut upper_inode, inode)?;
                 return Ok(publish_outcome);
             }
             Err(SystemError::EEXIST) => {
@@ -353,7 +355,7 @@ impl OvlInode {
                 Self::restore_parent_timestamps(upper_parent, &parent_metadata);
                 for (inode, upper) in cached_dirs.iter().zip(cached_upper_guards.iter_mut()) {
                     if upper.is_none() {
-                        **upper = Some(temp.clone());
+                        inode.install_upper_inode(upper, temp.clone())?;
                         inode.set_origin(origin);
                     }
                 }

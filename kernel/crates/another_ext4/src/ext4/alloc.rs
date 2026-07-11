@@ -6,6 +6,16 @@ use crate::prelude::*;
 use crate::return_error;
 
 impl Ext4 {
+    fn restore_inode_allocation_state(
+        &self,
+        bitmap_block: &Block,
+        bg: &BlockGroupRef,
+        sb: &SuperBlock,
+    ) -> Result<()> {
+        self.write_block(bitmap_block)?;
+        self.write_block_group_with_csum(&mut BlockGroupRef::new(bg.id, bg.desc))?;
+        self.write_super_block(sb)
+    }
     fn restore_block_allocation_state(
         &self,
         bitmap_block: &Block,
@@ -33,18 +43,30 @@ impl Ext4 {
     /// Create a new inode, returning the inode and its number
     #[inline(never)]
     pub(super) fn create_inode(&self, mode: InodeMode) -> Result<InodeRef> {
+        self.ensure_mutable()?;
         // Allocate an inode
         let is_dir = mode.file_type() == FileType::Directory;
         let id = self.alloc_inode(is_dir)?;
 
-        // Initialize the inode
-        let mut inode = Box::new(Inode::default());
-        inode.set_mode(mode);
-        inode.extent_init();
-        let mut inode_ref = InodeRef::new(id, inode);
-
-        // Sync the inode to disk
-        self.write_inode_with_csum(&mut inode_ref)?;
+        let initialized = (|| {
+            let generation = self.next_inode_generation(id)?;
+            let mut inode = Box::new(Inode::default());
+            inode.set_generation(generation);
+            inode.set_mode(mode);
+            inode.extent_init();
+            let mut inode_ref = InodeRef::new(id, inode);
+            self.write_inode_with_csum(&mut inode_ref)?;
+            Ok(inode_ref)
+        })();
+        let inode_ref = match initialized {
+            Ok(inode_ref) => inode_ref,
+            Err(error) => {
+                if self.rollback_new_inode(id, is_dir).is_err() {
+                    self.poison(ErrCode::EIO);
+                }
+                return Err(error);
+            }
+        };
 
         trace!("Alloc inode {} ok", inode_ref.id);
         Ok(inode_ref)
@@ -62,20 +84,29 @@ impl Ext4 {
         major: u32,
         minor: u32,
     ) -> Result<InodeRef> {
+        self.ensure_mutable()?;
         // Device nodes are never directories
         let id = self.alloc_inode(false)?;
 
-        // Initialize the inode
-        let mut inode = Box::new(Inode::default());
-        inode.set_mode(mode);
-
-        // Key difference: set device number instead of extent tree
-        inode.set_device(major, minor);
-
-        let mut inode_ref = InodeRef::new(id, inode);
-
-        // Sync the inode to disk
-        self.write_inode_with_csum(&mut inode_ref)?;
+        let initialized = (|| {
+            let generation = self.next_inode_generation(id)?;
+            let mut inode = Box::new(Inode::default());
+            inode.set_generation(generation);
+            inode.set_mode(mode);
+            inode.set_device(major, minor);
+            let mut inode_ref = InodeRef::new(id, inode);
+            self.write_inode_with_csum(&mut inode_ref)?;
+            Ok(inode_ref)
+        })();
+        let inode_ref = match initialized {
+            Ok(inode_ref) => inode_ref,
+            Err(error) => {
+                if self.rollback_new_inode(id, false).is_err() {
+                    self.poison(ErrCode::EIO);
+                }
+                return Err(error);
+            }
+        };
 
         trace!(
             "Alloc device inode {} ({}:{}) ok",
@@ -140,6 +171,94 @@ impl Ext4 {
         // Invalidate inode cache entry
         self.inode_cache.lock().invalidate(inode_id);
         Ok(())
+    }
+
+    fn next_inode_generation(&self, inode_id: InodeId) -> Result<u32> {
+        let previous = self.read_inode_uncached(inode_id)?.inode.generation();
+        let next = previous.wrapping_add(1);
+        Ok(if next == 0 { 1 } else { next })
+    }
+
+    fn rollback_new_inode(&self, inode_id: InodeId, is_dir: bool) -> Result<()> {
+        // The inode-table slot is the authoritative lifetime identity. It may
+        // still contain the previous generation, or the newly initialized
+        // generation if the write completed before reporting an error.
+        let generation = self.read_inode_uncached(inode_id)?.inode.generation();
+        let mut inode = Box::new(Inode::default());
+        inode.set_generation(generation);
+        inode.set_mode(if is_dir {
+            InodeMode::DIRECTORY
+        } else {
+            InodeMode::FILE
+        });
+        self.dealloc_inode(&mut InodeRef::new(inode_id, inode))
+    }
+
+    /// Physically reclaim the inode lifetime represented by `handle`.
+    ///
+    /// Validation and reclamation share the inode mutation shard.  The inode is
+    /// re-read from disk so an unlink-time value snapshot can never discard
+    /// blocks or xattrs added by later writeback.
+    pub fn reclaim_inode(
+        &self,
+        handle: InodeReclaimHandle,
+    ) -> core::result::Result<(), InodeReclaimError> {
+        match self.reclaim_inode_inner(&handle) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(InodeReclaimError::new(error, handle)),
+        }
+    }
+
+    fn reclaim_inode_inner(&self, handle: &InodeReclaimHandle) -> Result<()> {
+        self.ensure_mutable()?;
+        let _mutation_guard =
+            self.inode_mutation_locks[self.inode_mutation_lock_index(handle.inode_id)].lock();
+        if !self.inode_is_allocated(handle.inode_id)? {
+            return_error!(
+                ErrCode::EINVAL,
+                "Reclaim capability references free inode {}",
+                handle.inode_id
+            );
+        }
+        let mut inode = self.read_inode_uncached(handle.inode_id)?;
+        if inode.inode.mode().bits() == 0
+            || inode.inode.link_count() != 0
+            || inode.inode.generation() != handle.generation
+        {
+            return_error!(
+                ErrCode::EINVAL,
+                "Invalid or stale reclaim capability for inode {}",
+                handle.inode_id
+            );
+        }
+        if let Err(error) = self.free_inode(&mut inode) {
+            self.poison(ErrCode::EIO);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn inode_is_allocated(&self, inode_id: InodeId) -> Result<bool> {
+        let _alloc_guard = self.alloc_lock.lock();
+        let sb = self.read_super_block_cached();
+        if inode_id == 0 || inode_id > sb.inode_count() {
+            return_error!(ErrCode::EINVAL, "Invalid inode number {}", inode_id);
+        }
+        let inodes_per_group = sb.inodes_per_group();
+        let bgid = ((inode_id - 1) / inodes_per_group) as BlockGroupId;
+        if bgid >= sb.block_group_count() {
+            return_error!(ErrCode::EINVAL, "Invalid inode block group {}", bgid);
+        }
+        let idx_in_bg = (inode_id - 1) % inodes_per_group;
+        let bg = self.read_block_group(bgid)?;
+        let bitmap_block = self.read_block(bg.desc.inode_bitmap_block())?;
+        let inode_count = sb.inode_count_in_group(bgid) as usize;
+        if idx_in_bg as usize >= inode_count {
+            return_error!(ErrCode::EINVAL, "Invalid inode index {}", idx_in_bg);
+        }
+        let mut bitmap_data = bitmap_block.data.clone();
+        let bitmap = Bitmap::new(&mut *bitmap_data, inode_count);
+        Ok(!bitmap.is_bit_clear(idx_in_bg as usize))
     }
 
     /// Append a data block for an inode, return a pair of (logical block id, physical block id)
@@ -307,7 +426,7 @@ impl Ext4 {
         let bg_count = sb.block_group_count();
 
         let mut bgid = 0;
-        while bgid <= bg_count {
+        while bgid < bg_count {
             // Load block group descriptor
             let mut bg = self.read_block_group(bgid)?;
             // If there are no free inodes in this block group, try the next one
@@ -318,6 +437,9 @@ impl Ext4 {
             // Load inode bitmap
             let bitmap_block_id = bg.desc.inode_bitmap_block();
             let mut bitmap_block = self.read_block(bitmap_block_id)?;
+            let old_bitmap_block = bitmap_block.clone();
+            let old_bg = BlockGroupRef::new(bg.id, bg.desc);
+            let old_sb = sb;
             let inode_count = sb.inode_count_in_group(bgid) as usize;
             let mut bitmap = Bitmap::new(&mut *bitmap_block.data, inode_count);
 
@@ -346,11 +468,27 @@ impl Ext4 {
                 unused = inode_count as u32 - (idx_in_bg + 1);
                 bg.desc.set_itable_unused(unused);
             }
-            self.write_block_group_with_csum(&mut bg)?;
+            if let Err(error) = self.write_block_group_with_csum(&mut bg) {
+                if self
+                    .restore_inode_allocation_state(&old_bitmap_block, &old_bg, &old_sb)
+                    .is_err()
+                {
+                    self.poison(ErrCode::EIO);
+                }
+                return Err(error);
+            }
 
             // Update superblock counters
             sb.set_free_inodes_count(sb.free_inodes_count() - 1);
-            self.write_super_block(&sb)?;
+            if let Err(error) = self.write_super_block(&sb) {
+                if self
+                    .restore_inode_allocation_state(&old_bitmap_block, &old_bg, &old_sb)
+                    .is_err()
+                {
+                    self.poison(ErrCode::EIO);
+                }
+                return Err(error);
+            }
 
             // Compute the absolute i-node number
             let inodes_per_group = sb.inodes_per_group();
@@ -375,6 +513,9 @@ impl Ext4 {
         // Load inode bitmap
         let bitmap_block_id = bg.desc.inode_bitmap_block();
         let mut bitmap_block = self.read_block(bitmap_block_id)?;
+        let old_bitmap_block = bitmap_block.clone();
+        let old_bg = BlockGroupRef::new(bg.id, bg.desc);
+        let old_sb = sb;
         let inode_count = sb.inode_count_in_group(bgid) as usize;
         let mut bitmap = Bitmap::new(&mut *bitmap_block.data, inode_count);
 
@@ -399,14 +540,33 @@ impl Ext4 {
             bg.desc.set_used_dirs_count(bg.desc.used_dirs_count() - 1);
         }
         bg.desc.set_itable_unused(bg.desc.itable_unused() + 1);
-        self.write_block_group_with_csum(&mut bg)?;
+        if let Err(error) = self.write_block_group_with_csum(&mut bg) {
+            if self
+                .restore_inode_allocation_state(&old_bitmap_block, &old_bg, &old_sb)
+                .is_err()
+            {
+                self.poison(ErrCode::EIO);
+            }
+            return Err(error);
+        }
 
         // Update superblock counters
         sb.set_free_inodes_count(sb.free_inodes_count() + 1);
-        self.write_super_block(&sb)?;
+        if let Err(error) = self.write_super_block(&sb) {
+            if self
+                .restore_inode_allocation_state(&old_bitmap_block, &old_bg, &old_sb)
+                .is_err()
+            {
+                self.poison(ErrCode::EIO);
+            }
+            return Err(error);
+        }
 
-        // Clear inode content
+        // Clear inode content while preserving the lifetime generation.  The
+        // next allocation advances it before publishing the reused inode.
+        let generation = inode_ref.inode.generation();
         *inode_ref.inode = Inode::default();
+        inode_ref.inode.set_generation(generation);
         self.write_inode_with_csum(inode_ref)?;
 
         Ok(())

@@ -61,6 +61,16 @@ impl Ext4 {
         Ok(inode_ref)
     }
 
+    /// Read the authoritative inode-table entry without consulting the value cache.
+    pub(super) fn read_inode_uncached(&self, inode_id: InodeId) -> Result<InodeRef> {
+        let (block_id, offset) = self.inode_disk_pos(inode_id)?;
+        let block = self.read_block(block_id)?;
+        Ok(InodeRef::new(
+            inode_id,
+            Box::new(block.read_offset_as(offset)),
+        ))
+    }
+
     /// Read the root inode from block device
     #[allow(unused)]
     pub(super) fn read_root_inode(&self) -> Result<InodeRef> {

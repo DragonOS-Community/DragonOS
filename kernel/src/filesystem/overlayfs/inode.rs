@@ -8,7 +8,8 @@ use crate::filesystem::vfs::file::{File, FileFlags, FilePrivateData};
 use crate::filesystem::vfs::syscall::RenameFlags;
 use crate::filesystem::vfs::utils::DName;
 use crate::filesystem::vfs::{
-    self, FileSystem, FileType, IndexNode, InodeId, Metadata, SetMetadataMask, XattrFlags,
+    self, inode_lifecycle::InodeRetentionGuard, FileSystem, FileType, IndexNode, InodeId,
+    InodeRetentionKind, Metadata, SetMetadataMask, XattrFlags,
 };
 use crate::libs::casting::DowncastArc;
 use crate::libs::mutex::Mutex;
@@ -28,6 +29,7 @@ pub struct OvlInode {
     pub(super) flags: Mutex<u64>,
     pub(super) upper_inode: Mutex<Option<Arc<dyn IndexNode>>>, // Read-write layer (upper)
     pub(super) lower_inodes: Vec<Arc<dyn IndexNode>>, // Read-only layer (lower, supports multi-layer)
+    pub(super) backing_retentions: Mutex<Vec<InodeRetentionGuard>>,
     pub(super) overlay_inode_id: Option<InodeId>,
     origin: Mutex<OriginState>,
     pub(super) content_privilege_lock: Mutex<()>,
@@ -149,6 +151,17 @@ enum OriginState {
 }
 
 impl OvlInode {
+    pub(super) fn install_upper_inode(
+        &self,
+        slot: &mut Option<Arc<dyn IndexNode>>,
+        inode: Arc<dyn IndexNode>,
+    ) -> Result<(), SystemError> {
+        let retention = InodeRetentionGuard::new(inode.clone(), InodeRetentionKind::Cache)?;
+        self.backing_retentions.lock().push(retention);
+        *slot = Some(inode);
+        Ok(())
+    }
+
     pub fn new(
         redirect: String,
         file_type: FileType,
@@ -156,12 +169,19 @@ impl OvlInode {
         lower_inodes: Vec<Arc<dyn IndexNode>>,
         overlay_inode_id: Option<InodeId>,
     ) -> Self {
+        let backing_retentions = upper
+            .iter()
+            .chain(lower_inodes.iter())
+            .map(|inode| InodeRetentionGuard::new(inode.clone(), InodeRetentionKind::Cache))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("new overlay inode backing must remain retainable");
         Self {
             redirect,
             file_type,
             flags: Mutex::new(0),
             upper_inode: Mutex::new(upper),
             lower_inodes,
+            backing_retentions: Mutex::new(backing_retentions),
             overlay_inode_id,
             origin: Mutex::new(OriginState::Unchecked),
             content_privilege_lock: Mutex::new(()),

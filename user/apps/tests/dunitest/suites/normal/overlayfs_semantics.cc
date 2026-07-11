@@ -2423,6 +2423,47 @@ TEST(OverlayFsSemantics, CopiedUpLowerFileUnlinkKeepsOldNameHidden) {
     EXPECT_EQ(0, overlay_temp_entry_count(env.work));
 }
 
+TEST(OverlayFsSemantics, CopiedUpOpenFileSurvivesUnlink) {
+    ScopedOverlayEnv scoped("overlayfs_copied_up_open_unlink");
+    const auto& env = scoped.env;
+    std::string lower_file = join_path(env.lower, "file");
+    std::string merged_file = join_path(env.merged, "file");
+
+    prepare_overlay_env(env);
+    ASSERT_EQ(0, write_text(lower_file, "lower"));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    int fd = open(merged_file.c_str(), O_RDWR | O_TRUNC);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    ASSERT_EQ(6, write(fd, "copied", 6)) << strerror(errno);
+    ASSERT_EQ(0, fsync(fd)) << strerror(errno);
+    ASSERT_EQ(0, unlink(merged_file.c_str())) << strerror(errno);
+    expect_path_enoent(merged_file);
+
+    ASSERT_EQ(0, lseek(fd, 0, SEEK_SET)) << strerror(errno);
+    char buffer[7] = {};
+    ASSERT_EQ(6, read(fd, buffer, 6)) << strerror(errno);
+    EXPECT_STREQ("copied", buffer);
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+}
+
+TEST(OverlayFsSemantics, CurrentUpperDirectorySurvivesRmdir) {
+    ScopedOverlayEnv scoped("overlayfs_upper_removed_cwd");
+    const auto& env = scoped.env;
+    std::string merged_dir = join_path(env.merged, "removed_cwd");
+
+    prepare_overlay_env(env);
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+    ASSERT_EQ(0, mkdir(merged_dir.c_str(), 0755)) << strerror(errno);
+    ASSERT_EQ(0, chdir(merged_dir.c_str())) << strerror(errno);
+    ASSERT_EQ(0, rmdir(merged_dir.c_str())) << strerror(errno);
+
+    struct stat current = {};
+    ASSERT_EQ(0, stat(".", &current)) << strerror(errno);
+    EXPECT_TRUE(S_ISDIR(current.st_mode));
+    ASSERT_EQ(0, chdir("/")) << strerror(errno);
+}
+
 TEST(OverlayFsSemantics, CopiedUpLowerFileRenameKeepsOldNameHidden) {
     ScopedOverlayEnv scoped("overlayfs_copied_up_rename_whiteout");
     const auto& env = scoped.env;

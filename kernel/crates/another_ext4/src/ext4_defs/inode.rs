@@ -461,6 +461,53 @@ pub struct InodeRef {
     pub inode: Box<Inode>,
 }
 
+/// One-shot capability for reclaiming one specific unlinked inode lifetime.
+///
+/// The fields are private so callers cannot forge a request from a bare inode
+/// number.  The type is intentionally not `Clone`: ownership must stay with the
+/// canonical lifetime until physical eviction.
+#[derive(Debug)]
+pub struct InodeReclaimHandle {
+    pub(crate) inode_id: InodeId,
+    pub(crate) generation: u32,
+}
+
+/// A failed physical reclaim together with its unconsumed capability.
+#[derive(Debug)]
+pub struct InodeReclaimError {
+    error: Ext4Error,
+    handle: InodeReclaimHandle,
+}
+
+impl InodeReclaimError {
+    pub(crate) fn new(error: Ext4Error, handle: InodeReclaimHandle) -> Self {
+        Self { error, handle }
+    }
+
+    pub fn into_parts(self) -> (Ext4Error, InodeReclaimHandle) {
+        (self.error, self.handle)
+    }
+}
+
+impl From<InodeReclaimError> for Ext4Error {
+    fn from(failure: InodeReclaimError) -> Self {
+        failure.error
+    }
+}
+
+impl InodeReclaimHandle {
+    pub(crate) fn new(inode_id: InodeId, generation: u32) -> Self {
+        Self {
+            inode_id,
+            generation,
+        }
+    }
+
+    pub fn inode_id(&self) -> InodeId {
+        self.inode_id
+    }
+}
+
 impl InodeRef {
     pub fn new(id: InodeId, inode: Box<Inode>) -> Self {
         Self { id, inode }

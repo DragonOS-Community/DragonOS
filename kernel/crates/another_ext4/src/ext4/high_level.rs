@@ -61,39 +61,38 @@ impl Ext4 {
     /// * `ENOTDIR` - Any parent along `path` is not a directory.
     /// * `EEXIST` - The object already exists.
     pub fn generic_create(&self, root: InodeId, path: &str, mode: InodeMode) -> Result<InodeId> {
-        // Search from the given parent inode
-        let mut cur = self.read_inode(root)?;
+        let mut cur = root;
         let search_path = Self::split_path(path);
         // Search recursively
         for (i, path) in search_path.iter().enumerate() {
-            if !cur.inode.is_dir() {
-                return_error!(ErrCode::ENOTDIR, "Parent {} is not a directory", cur.id);
+            if self.getattr(cur)?.ftype != FileType::Directory {
+                return_error!(ErrCode::ENOTDIR, "Parent {} is not a directory", cur);
             }
-            match self.dir_find_entry(&cur, path) {
+            match self.lookup(cur, path) {
                 Ok(id) => {
                     if i == search_path.len() - 1 {
                         // Reach the object and it already exists
                         return_error!(ErrCode::EEXIST, "Object {}/{} already exists", root, path);
                     }
-                    cur = self.read_inode(id)?;
+                    cur = id;
                 }
                 Err(e) => {
                     if e.code() != ErrCode::ENOENT {
                         return_error!(e.code(), "Unexpected error: {:?}", e);
                     }
-                    let mut child = if i == search_path.len() - 1 {
-                        // Reach the object, create it
-                        self.create_inode(mode)?
+                    cur = if i == search_path.len() - 1 {
+                        if mode.file_type() == FileType::Directory {
+                            self.mkdir(cur, path, mode)?
+                        } else {
+                            self.create(cur, path, mode)?
+                        }
                     } else {
-                        // Create parent directory
-                        self.create_inode(InodeMode::DIRECTORY | InodeMode::ALL_RWX)?
+                        self.mkdir(cur, path, InodeMode::DIRECTORY | InodeMode::ALL_RWX)?
                     };
-                    self.link_inode(&mut cur, &mut child, path)?;
-                    cur = child;
                 }
             }
         }
-        Ok(cur.id)
+        Ok(cur)
     }
 
     /// Remove an object from the filesystem.
@@ -116,14 +115,21 @@ impl Ext4 {
         let parent_id = self.generic_lookup(root, &parent_path)?;
         // Get the child inode
         let child_id = self.lookup(parent_id, file_name)?;
-        let mut parent = self.read_inode(parent_id)?;
-        let mut child = self.read_inode(child_id)?;
+        let child = self.read_inode(child_id)?;
         // Check if child is a non-empty directory
         if child.inode.is_dir() && self.dir_list_entries(&child)?.len() > 2 {
             return_error!(ErrCode::ENOTEMPTY, "Directory {} not empty", path);
         }
         // Unlink the file
-        self.unlink_inode(&mut parent, &mut child, file_name, true)
+        let reclaim = if child.inode.is_dir() {
+            self.rmdir(parent_id, file_name)
+        } else {
+            self.unlink(parent_id, file_name)
+        }?;
+        if let Some(handle) = reclaim {
+            self.reclaim_inode(handle)?;
+        }
+        Ok(())
     }
 
     /// Move an object from one location to another.
@@ -151,7 +157,12 @@ impl Ext4 {
         let src_parent_id = self.generic_lookup(root, &src_parent_path)?;
         let dst_parent_id = self.generic_lookup(root, &dst_parent_path)?;
         // Move the file
-        self.rename(src_parent_id, src_file_name, dst_parent_id, dst_file_name)
+        if let Some(handle) =
+            self.rename(src_parent_id, src_file_name, dst_parent_id, dst_file_name)?
+        {
+            self.reclaim_inode(handle)?;
+        }
+        Ok(())
     }
 
     /// A helper function to split a path by '/'

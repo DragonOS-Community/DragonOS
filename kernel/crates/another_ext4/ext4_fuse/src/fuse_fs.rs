@@ -17,7 +17,7 @@
 
 use super::common::{sys_time2second, time_or_now2second, translate_attr, translate_ftype};
 use crate::block_dev::StateBlockDevice;
-use another_ext4::{ErrCode, Ext4, Ext4Error, FileType as Ext4FileType, InodeMode, SetAttr};
+use another_ext4::{ErrCode, Ext4, Ext4Error, InodeMode, InodeReclaimHandle, SetAttr};
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyOpen, ReplyWrite, Request,
@@ -41,6 +41,10 @@ pub struct StateExt4FuseFs<T> {
     next_fid: FId,
     /// Next directory handler id
     next_did: FId,
+    lookup_counts: HashMap<u32, u64>,
+    open_handles: HashMap<FId, u32>,
+    open_dir_handles: HashMap<FId, u32>,
+    pending_reclaims: HashMap<u32, InodeReclaimHandle>,
 }
 
 impl<T: 'static> StateExt4FuseFs<T> {
@@ -48,7 +52,7 @@ impl<T: 'static> StateExt4FuseFs<T> {
     const RESTORE_IOC: u32 = 2;
 
     /// Create a file system on a block device
-    /// 
+    ///
     /// `init` - If true, initialize the filesystem
     pub fn new(block_dev: Arc<dyn StateBlockDevice<T>>, init: bool) -> Self {
         let mut fs = Ext4::load(block_dev.clone()).expect("Failed to load ext4 filesystem");
@@ -61,12 +65,26 @@ impl<T: 'static> StateExt4FuseFs<T> {
             states: HashMap::new(),
             next_fid: 0,
             next_did: 0,
+            lookup_counts: HashMap::new(),
+            open_handles: HashMap::new(),
+            open_dir_handles: HashMap::new(),
+            pending_reclaims: HashMap::new(),
         }
     }
 
     /// Save a state
     fn checkpoint(&mut self, key: StateKey) -> bool {
         log::info!("Checkpoint {}", key);
+        // A reclaim capability cannot be duplicated across execution
+        // timelines. Refuse the checkpoint instead of creating a snapshot
+        // whose unlinked inode could no longer be reclaimed after restore.
+        if !self.pending_reclaims.is_empty() {
+            log::warn!(
+                "Cannot checkpoint with {} pending inode reclaims",
+                self.pending_reclaims.len()
+            );
+            return false;
+        }
         self.states
             .insert(key, self.block_dev.checkpoint())
             .is_none()
@@ -77,6 +95,10 @@ impl<T: 'static> StateExt4FuseFs<T> {
         log::info!("Restore {}", key);
         if let Some(state) = self.states.remove(&key) {
             self.block_dev.restore(state);
+            // Reclaim handles are capabilities for inode lifetimes in the
+            // discarded block-device timeline. Drop them without reclaiming;
+            // lookup/open tracking still represents the live FUSE session.
+            self.pending_reclaims.clear();
             true
         } else {
             false
@@ -90,17 +112,83 @@ impl<T: 'static> StateExt4FuseFs<T> {
             Err(e) => Err(e),
         }
     }
+
+    fn retain_lookup(&mut self, inode: u32) {
+        *self.lookup_counts.entry(inode).or_insert(0) += 1;
+    }
+
+    fn queue_reclaim(&mut self, handle: InodeReclaimHandle) -> Result<(), Ext4Error> {
+        let inode = handle.inode_id();
+        match self.pending_reclaims.entry(inode) {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                return Err(Ext4Error::new(ErrCode::EINVAL));
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(handle);
+            }
+        }
+        self.try_reclaim(inode)
+    }
+
+    fn try_reclaim(&mut self, inode: u32) -> Result<(), Ext4Error> {
+        let looked_up = self.lookup_counts.get(&inode).copied().unwrap_or(0) != 0;
+        let opened = self
+            .open_handles
+            .values()
+            .chain(self.open_dir_handles.values())
+            .any(|open_inode| *open_inode == inode);
+        if !looked_up && !opened {
+            if let Some(handle) = self.pending_reclaims.remove(&inode) {
+                if let Err(failure) = self.fs.reclaim_inode(handle) {
+                    let (error, handle) = failure.into_parts();
+                    self.pending_reclaims.insert(inode, handle);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
     fn destroy(&mut self) {
-        // 空实现
+        self.lookup_counts.clear();
+        self.open_handles.clear();
+        self.open_dir_handles.clear();
+        let pending = std::mem::take(&mut self.pending_reclaims);
+        for (_, handle) in pending {
+            if let Err(error) = self.fs.reclaim_inode(handle) {
+                log::error!(
+                    "failed to drain ext4 reclaim during FUSE destroy: {:?}",
+                    error
+                );
+            }
+        }
     }
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         match self.fs.lookup(parent as u32, name.to_str().unwrap()) {
-            Ok(inode_id) => reply.entry(&get_ttl(), &self.get_attr(inode_id).unwrap(), 0),
+            Ok(inode_id) => {
+                self.retain_lookup(inode_id);
+                reply.entry(&get_ttl(), &self.get_attr(inode_id).unwrap(), 0)
+            }
             Err(e) => reply.error(e.code() as i32),
+        }
+    }
+
+    fn forget(&mut self, _req: &Request<'_>, ino: u64, nlookup: u64) {
+        let ino = ino as u32;
+        let count = self.lookup_counts.entry(ino).or_insert(0);
+        *count = count.saturating_sub(nlookup);
+        if *count == 0 {
+            self.lookup_counts.remove(&ino);
+        }
+        if let Err(error) = self.try_reclaim(ino) {
+            log::error!(
+                "failed to reclaim forgotten ext4 inode {}: {:?}",
+                ino,
+                error
+            );
         }
     }
 
@@ -165,6 +253,8 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
             InodeMode::from_bits_truncate(mode as u16),
         ) {
             Ok(ino) => {
+                self.retain_lookup(ino);
+                self.open_handles.insert(self.next_fid, ino);
                 reply.created(
                     &get_ttl(),
                     &self.get_attr(ino).unwrap(),
@@ -189,6 +279,7 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
             Err(e) => return reply.error(e.code() as i32),
         }
         reply.opened(self.next_fid, 0);
+        self.open_handles.insert(self.next_fid, ino as u32);
         self.next_fid += 1;
     }
 
@@ -231,14 +322,18 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
     fn release(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
-        _fh: u64,
+        ino: u64,
+        fh: u64,
         _flags: i32,
         _lock_owner: Option<u64>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        reply.ok();
+        self.open_handles.remove(&fh);
+        match self.try_reclaim(ino as u32) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error.code() as i32),
+        }
     }
 
     fn link(
@@ -257,14 +352,21 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
             .fs
             .link(ino as u32, newparent as u32, newname.to_str().unwrap())
         {
-            Ok(_) => reply.entry(&get_ttl(), &self.get_attr(ino as u32).unwrap(), 0),
+            Ok(_) => {
+                self.retain_lookup(ino as u32);
+                reply.entry(&get_ttl(), &self.get_attr(ino as u32).unwrap(), 0)
+            }
             Err(e) => reply.error(e.code() as i32),
         }
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         match self.fs.unlink(parent as u32, name.to_str().unwrap()) {
-            Ok(_) => reply.ok(),
+            Ok(Some(handle)) => match self.queue_reclaim(handle) {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(e.code() as i32),
+            },
+            Ok(None) => reply.ok(),
             Err(e) => reply.error(e.code() as i32),
         }
     }
@@ -282,31 +384,17 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
         if parent == newparent && name == newname {
             return reply.ok();
         }
-        if let Ok(src) = self.fs.lookup(parent as u32, name.to_str().unwrap()) {
-            // Check if newname is already in use
-            if let Ok(des) = self.fs.lookup(newparent as u32, newname.to_str().unwrap()) {
-                if self.fs.getattr(src).unwrap().ftype == Ext4FileType::Directory
-                    && self.fs.getattr(des).unwrap().ftype == Ext4FileType::Directory
-                    && self.fs.listdir(des).unwrap().len() <= 2
-                {
-                    // Overwrite empty directory
-                    if let Err(e) = self.fs.rmdir(newparent as u32, newname.to_str().unwrap()) {
-                        return reply.error(e.code() as i32);
-                    }
-                } else {
-                    return reply.error(ErrCode::ENOTEMPTY as i32);
-                }
-            }
-        } else {
-            return reply.error(ErrCode::ENOENT as i32);
-        }
         match self.fs.rename(
             parent as u32,
             name.to_str().unwrap(),
             newparent as u32,
             newname.to_str().unwrap(),
         ) {
-            Ok(_) => reply.ok(),
+            Ok(Some(handle)) => match self.queue_reclaim(handle) {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(e.code() as i32),
+            },
+            Ok(None) => reply.ok(),
             Err(e) => reply.error(e.code() as i32),
         }
     }
@@ -329,7 +417,10 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
             name.to_str().unwrap(),
             InodeMode::from_bits_truncate(mode as u16),
         ) {
-            Ok(ino) => reply.entry(&get_ttl(), &self.get_attr(ino).unwrap(), 0),
+            Ok(ino) => {
+                self.retain_lookup(ino);
+                reply.entry(&get_ttl(), &self.get_attr(ino).unwrap(), 0)
+            }
             Err(e) => reply.error(e.code() as i32),
         }
     }
@@ -340,6 +431,7 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
                 if attr.kind != FileType::Directory {
                     return reply.error(ErrCode::ENOTDIR as i32);
                 }
+                self.open_dir_handles.insert(self.next_did, ino as u32);
                 reply.opened(self.next_did, 0);
                 self.next_did += 1;
             }
@@ -382,17 +474,25 @@ impl<T: 'static> Filesystem for StateExt4FuseFs<T> {
     fn releasedir(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
-        _fh: u64,
+        ino: u64,
+        fh: u64,
         _flags: i32,
         reply: ReplyEmpty,
     ) {
-        reply.ok();
+        self.open_dir_handles.remove(&fh);
+        match self.try_reclaim(ino as u32) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error.code() as i32),
+        }
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         match self.fs.rmdir(parent as u32, name.to_str().unwrap()) {
-            Ok(()) => reply.ok(),
+            Ok(Some(handle)) => match self.queue_reclaim(handle) {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(e.code() as i32),
+            },
+            Ok(None) => reply.ok(),
             Err(e) => reply.error(e.code() as i32),
         }
     }

@@ -3,8 +3,10 @@ name = "ext4_fuse"
 version = "0.1.0"
 edition = "2021"
 
+[workspace]
+
 [dependencies]
-fuser = "0.13"
+fuser = { version = "0.13", default-features = false, features = ["abi-7-31"] }
 another_ext4 = { path = "..", features = ["fuser_root_inode"] }
 simple_logger = "4.3"
 log = "0.4"

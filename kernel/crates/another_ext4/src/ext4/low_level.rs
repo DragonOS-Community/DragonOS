@@ -72,10 +72,10 @@ impl Ext4 {
     ///
     /// # Error
     ///
-    /// `EINVAL` if the inode is invalid (link count == 0).
+    /// `EINVAL` if the inode-table entry is physically free.
     pub fn getattr(&self, id: InodeId) -> Result<FileAttr> {
         let inode = self.read_inode(id)?;
-        if inode.inode.link_count() == 0 {
+        if inode.inode.mode().bits() == 0 {
             return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
         }
 
@@ -114,6 +114,7 @@ impl Ext4 {
     ///
     /// `EINVAL` if the inode is invalid (mode == 0).
     pub fn setattr(&self, id: InodeId, attr: SetAttr) -> Result<()> {
+        self.ensure_mutable()?;
         let _mutation_guard = self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
         let mut inode = self.read_inode(id)?;
         if inode.inode.mode().bits() == 0 {
@@ -229,6 +230,7 @@ impl Ext4 {
         _size: u64,
         _mtime: Option<u32>,
     ) -> Result<()> {
+        self.ensure_mutable()?;
         let _mutation_guard = self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
         let mut inode = self.read_inode(id)?;
         if inode.inode.mode().bits() == 0 {
@@ -245,6 +247,7 @@ impl Ext4 {
         size: Option<u64>,
         mtime: Option<u32>,
     ) -> Result<()> {
+        self.ensure_mutable()?;
         let _mutation_guard = self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
         let mut inode = self.read_inode(id)?;
         if inode.inode.mode().bits() == 0 {
@@ -312,6 +315,9 @@ impl Ext4 {
     /// * `ENOTDIR` - `parent` is not a directory
     /// * `ENOSPC` - No space left on device
     pub fn create(&self, parent: InodeId, name: &str, mode: InodeMode) -> Result<InodeId> {
+        self.ensure_mutable()?;
+        let _namespace_guard = self.namespace_lock.lock();
+        let _mutation_guards = self.lock_inode_mutations(&[parent]);
         let mut parent = self.read_inode(parent)?;
         // Can only create a file in a directory
         if !parent.inode.is_dir() {
@@ -354,6 +360,9 @@ impl Ext4 {
         major: u32,
         minor: u32,
     ) -> Result<InodeId> {
+        self.ensure_mutable()?;
+        let _namespace_guard = self.namespace_lock.lock();
+        let _mutation_guards = self.lock_inode_mutations(&[parent]);
         let mut parent_ref = self.read_inode(parent)?;
 
         // Can only create in a directory
@@ -510,6 +519,7 @@ impl Ext4 {
     /// * `EISDIR` - `file` is not a regular file
     /// * `ENOSPC` - no space left on device
     pub fn write(&self, file: InodeId, offset: usize, data: &[u8]) -> Result<usize> {
+        self.ensure_mutable()?;
         let write_size = data.len();
         if write_size == 0 {
             return Ok(0);
@@ -567,37 +577,36 @@ impl Ext4 {
     /// and background writeback, which can corrupt the extent tree when both
     /// operate on cloned `InodeRef` snapshots from the inode cache.
     pub fn write_data_only(&self, file: InodeId, offset: usize, data: &[u8]) -> Result<usize> {
+        self.ensure_mutable()?;
         let write_size = data.len();
         let mut chunks = Vec::new();
-        {
-            let _mutation_guard =
-                self.inode_mutation_locks[self.inode_mutation_lock_index(file)].lock();
-            let file = self.read_inode(file)?;
-            if !file.inode.is_file() {
-                return_error!(ErrCode::EISDIR, "Inode {} is not a file", file.id);
-            }
+        let _mutation_guard =
+            self.inode_mutation_locks[self.inode_mutation_lock_index(file)].lock();
+        let file = self.read_inode(file)?;
+        if !file.inode.is_file() {
+            return_error!(ErrCode::EISDIR, "Inode {} is not a file", file.id);
+        }
 
-            let mut cursor = 0;
-            let mut iblock = (offset / BLOCK_SIZE) as LBlockId;
-            while cursor < write_size {
-                let block_offset = (offset + cursor) % BLOCK_SIZE;
-                let write_len = min(BLOCK_SIZE - block_offset, write_size - cursor);
-                match self.extent_query(&file, iblock) {
-                    Ok(fblock) => {
-                        chunks.push((fblock, block_offset, cursor, write_len));
-                    }
-                    Err(e) => {
-                        debug!(
+        let mut cursor = 0;
+        let mut iblock = (offset / BLOCK_SIZE) as LBlockId;
+        while cursor < write_size {
+            let block_offset = (offset + cursor) % BLOCK_SIZE;
+            let write_len = min(BLOCK_SIZE - block_offset, write_size - cursor);
+            match self.extent_query(&file, iblock) {
+                Ok(fblock) => {
+                    chunks.push((fblock, block_offset, cursor, write_len));
+                }
+                Err(e) => {
+                    debug!(
                             "write_data_only: extent_query FAILED ino={} iblock={} offset={} len={} fs_blkcnt={} size={} err={:?}",
                             file.id, iblock, offset, write_size,
                             file.inode.fs_block_count(), file.inode.size(), e
                         );
-                        return Err(e);
-                    }
+                    return Err(e);
                 }
-                cursor += write_len;
-                iblock += 1;
             }
+            cursor += write_len;
+            iblock += 1;
         }
 
         for (fblock, block_offset, cursor, write_len) in chunks {
@@ -622,6 +631,9 @@ impl Ext4 {
     /// * `ENOTDIR` - `parent` is not a directory
     /// * `ENOSPC` - no space left on device
     pub fn link(&self, child: InodeId, parent: InodeId, name: &str) -> Result<()> {
+        self.ensure_mutable()?;
+        let _namespace_guard = self.namespace_lock.lock();
+        let _mutation_guards = self.lock_inode_mutations(&[parent, child]);
         let mut parent = self.read_inode(parent)?;
         // Can only link to a directory
         if !parent.inode.is_dir() {
@@ -648,19 +660,30 @@ impl Ext4 {
     /// * `ENOTDIR` - `parent` is not a directory
     /// * `ENOENT` - `name` does not exist in `parent`
     /// * `EISDIR` - `parent/name` is a directory
-    pub fn unlink(&self, parent: InodeId, name: &str) -> Result<()> {
-        let mut parent = self.read_inode(parent)?;
+    pub fn unlink(&self, parent: InodeId, name: &str) -> Result<Option<InodeReclaimHandle>> {
+        self.ensure_mutable()?;
+        let _namespace_guard = self.namespace_lock.lock();
+        let mut parent_ref = self.read_inode(parent)?;
         // Can only unlink from a directory
-        if !parent.inode.is_dir() {
-            return_error!(ErrCode::ENOTDIR, "Inode {} is not a directory", parent.id);
+        if !parent_ref.inode.is_dir() {
+            return_error!(
+                ErrCode::ENOTDIR,
+                "Inode {} is not a directory",
+                parent_ref.id
+            );
         }
         // Cannot unlink directory
-        let child_id = self.dir_find_entry(&parent, name)?;
+        let child_id = self.dir_find_entry(&parent_ref, name)?;
+        let _mutation_guards = self.lock_inode_mutations(&[parent, child_id]);
+        parent_ref = self.read_inode(parent)?;
+        if self.dir_find_entry(&parent_ref, name)? != child_id {
+            return_error!(ErrCode::ENOENT, "Namespace changed during unlink");
+        }
         let mut child = self.read_inode(child_id)?;
         if child.inode.is_dir() {
             return_error!(ErrCode::EISDIR, "Cannot unlink a directory");
         }
-        self.unlink_inode(&mut parent, &mut child, name, true)
+        self.unlink_inode(&mut parent_ref, &mut child, name)
     }
 
     /// Helper: Read and validate parent directories for rename operations.
@@ -749,15 +772,17 @@ impl Ext4 {
         name: &str,
         new_parent: InodeId,
         new_name: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<InodeReclaimHandle>> {
+        self.ensure_mutable()?;
+        let _namespace_guard = self.namespace_lock.lock();
+        let mut reclaim = None;
         // 1. 验证父目录
         let (mut parent_ref, mut new_parent_ref) = self.read_rename_dirs(parent, new_parent)?;
 
         // 2. 查找源 inode
         let child_id = self.dir_find_entry(&parent_ref, name)?;
-        let child = self.read_inode(child_id)?;
+        let mut child = self.read_inode(child_id)?;
         let child_is_dir = child.inode.is_dir();
-        let child_file_type = child.inode.file_type();
 
         // 3. 循环检测：防止把目录移到自己的子目录下
         if child_is_dir && parent != new_parent {
@@ -767,12 +792,25 @@ impl Ext4 {
         // 4. 检查目标是否存在
         let target_dir_ref = new_parent_ref.as_ref().unwrap_or(&parent_ref);
         let existing = self.dir_find_entry(target_dir_ref, new_name).ok();
+        let mut mutation_ids = vec![parent, new_parent, child_id];
+        if let Some(existing_id) = existing {
+            mutation_ids.push(existing_id);
+        }
+        let _mutation_guards = self.lock_inode_mutations(&mutation_ids);
+        parent_ref = self.read_inode(parent)?;
+        new_parent_ref = if parent == new_parent {
+            None
+        } else {
+            Some(self.read_inode(new_parent)?)
+        };
+        child = self.read_inode(child_id)?;
+        let child_file_type = child.inode.file_type();
 
         match existing {
             Some(existing_id) if existing_id == child_id => {
                 // 情况 A：源和目标是同一个 inode（硬链接或同名）
                 // POSIX 语义：无操作，返回成功
-                return Ok(());
+                return Ok(None);
             }
             Some(existing_id) => {
                 // 情况 B：目标存在且是不同 inode → 原子替换
@@ -808,7 +846,12 @@ impl Ext4 {
                 // 这是原子操作的核心：目标目录项从未"消失"
                 {
                     let target_dir = new_parent_ref.as_mut().unwrap_or(&mut parent_ref);
-                    self.dir_replace_entry(target_dir, new_name, child_id, child_file_type)?;
+                    self.poison_on_error(self.dir_replace_entry(
+                        target_dir,
+                        new_name,
+                        child_id,
+                        child_file_type,
+                    ))?;
 
                     // 4b-3. 处理被替换目录的父目录 link count
                     //
@@ -821,32 +864,27 @@ impl Ext4 {
                         target_dir
                             .inode
                             .set_link_count(target_dir.inode.link_count() - 1);
-                        self.write_inode_with_csum(target_dir)?;
+                        self.poison_on_error(self.write_inode_with_csum(target_dir))?;
                     }
                 }
 
                 // 4b-4. 删除源目录项，避免 rename 覆盖后源路径仍可见
-                self.dir_remove_entry(&parent_ref, name)?;
+                self.poison_on_error(self.dir_remove_entry(&parent_ref, name))?;
 
-                // 4b-5. 递减被替换 inode 的 link count（可能触发释放）
-                // 目录最小 link count 为 2（父目录条目 + 自己的 "."），所以 <=2 表示无其他硬链接
-                let existing_link_cnt = existing_inode.inode.link_count();
-                if existing_link_cnt <= 1 || (existing_is_dir && existing_link_cnt <= 2) {
-                    self.free_inode(&mut existing_inode)?;
-                } else {
-                    existing_inode.inode.set_link_count(existing_link_cnt - 1);
-                    self.write_inode_with_csum(&mut existing_inode)?;
-                }
-
-                // 4b-6. 跨目录移动时，处理源目录的 ".." 指向
+                // 4b-5. 跨目录移动时，处理源目录的 ".." 指向
                 if child_is_dir && parent != new_parent {
                     // 更新被移动目录的 ".." 指向新父目录
-                    self.dir_replace_entry(&child, "..", new_parent, FileType::Directory)?;
+                    self.poison_on_error(self.dir_replace_entry(
+                        &child,
+                        "..",
+                        new_parent,
+                        FileType::Directory,
+                    ))?;
 
                     parent_ref
                         .inode
                         .set_link_count(parent_ref.inode.link_count() - 1);
-                    self.write_inode_with_csum(&mut parent_ref)?;
+                    self.poison_on_error(self.write_inode_with_csum(&mut parent_ref))?;
 
                     // 注意：当 parent != new_parent 时，new_parent_ref 必定是 Some(...)
                     let new_parent_dir = new_parent_ref.as_mut().ok_or(format_error!(
@@ -856,34 +894,66 @@ impl Ext4 {
                     new_parent_dir
                         .inode
                         .set_link_count(new_parent_dir.inode.link_count() + 1);
-                    self.write_inode_with_csum(new_parent_dir)?;
+                    self.poison_on_error(self.write_inode_with_csum(new_parent_dir))?;
+                }
+                // 4b-6. The target link transition is the final fallible
+                // metadata step.  Once it reaches zero the returned capability
+                // cannot be lost behind later rename work.
+                let existing_link_cnt = existing_inode.inode.link_count();
+                if existing_link_cnt <= 1 || (existing_is_dir && existing_link_cnt <= 2) {
+                    existing_inode.inode.set_link_count(0);
+                    if let Err(error) = self.write_inode_with_csum(&mut existing_inode) {
+                        self.poison(ErrCode::EIO);
+                        return Err(error);
+                    }
+                    reclaim = Some(InodeReclaimHandle::new(
+                        existing_inode.id,
+                        existing_inode.inode.generation(),
+                    ));
+                } else {
+                    existing_inode.inode.set_link_count(existing_link_cnt - 1);
+                    if let Err(error) = self.write_inode_with_csum(&mut existing_inode) {
+                        self.poison(ErrCode::EIO);
+                        return Err(error);
+                    }
                 }
                 // 文件的 link count 不变（只是换了名字/位置）
             }
             None => {
                 // 情况 C：目标不存在 → 简单重命名
-                // TODO
-                // 若加上失败回滚，则在回滚失败时更混乱
-                // 不回滚则可能多一个硬链接
-                // *实现 journal 事务才是最正确的解决方法*
+                // Without a journal, any failure after the first namespace
+                // write fail-stops this mount so a partial rename cannot be
+                // followed by further allocation or metadata mutation.
 
                 // C-1. 在目标父目录添加新条目（先 add）
                 let target_dir = new_parent_ref.as_mut().unwrap_or(&mut parent_ref);
-                self.dir_add_entry(target_dir, &child, new_name)?;
+                match self.dir_add_entry_classified(target_dir, &child, new_name) {
+                    Ok(()) => {}
+                    Err(super::dir::DirAddFailure::Unmodified(error)) => return Err(error),
+                    Err(super::dir::DirAddFailure::Indeterminate(error)) => {
+                        self.poison(ErrCode::EIO);
+                        return Err(error);
+                    }
+                }
 
                 // C-2. 从源父目录删除旧条目（后 delete）
-                self.dir_remove_entry(&parent_ref, name)?;
+                self.poison_on_error(self.dir_remove_entry(&parent_ref, name))?;
 
                 // C-3. 目录跨目录移动时，原子更新 ".." 并调整 link count
                 if child_is_dir && parent != new_parent {
                     // ".." 原地替换：旧父 → 新父，单次 I/O，无中间态
-                    self.dir_replace_entry(&child, "..", new_parent, FileType::Directory)?;
+                    self.poison_on_error(self.dir_replace_entry(
+                        &child,
+                        "..",
+                        new_parent,
+                        FileType::Directory,
+                    ))?;
 
                     // 源父目录失去 ".." 引用
                     parent_ref
                         .inode
                         .set_link_count(parent_ref.inode.link_count() - 1);
-                    self.write_inode_with_csum(&mut parent_ref)?;
+                    self.poison_on_error(self.write_inode_with_csum(&mut parent_ref))?;
 
                     // 目标父目录获得 ".." 引用
                     let new_parent_dir = new_parent_ref.as_mut().ok_or(format_error!(
@@ -893,14 +963,14 @@ impl Ext4 {
                     new_parent_dir
                         .inode
                         .set_link_count(new_parent_dir.inode.link_count() + 1);
-                    self.write_inode_with_csum(new_parent_dir)?;
+                    self.poison_on_error(self.write_inode_with_csum(new_parent_dir))?;
                 }
                 // 文件：无 ".."，nlink 不变（只换了名字/位置）
                 // 目录同目录：".." 已指向正确的父，link count 不变
             }
         }
 
-        Ok(())
+        Ok(reclaim)
     }
 
     /// Atomically exchange two directory entries (RENAME_EXCHANGE semantics).
@@ -927,17 +997,25 @@ impl Ext4 {
         new_parent: InodeId,
         new_name: &str,
     ) -> Result<()> {
+        self.ensure_mutable()?;
+        let _namespace_guard = self.namespace_lock.lock();
         // 1. 验证父目录
         let (mut parent_ref, mut new_parent_ref) = self.read_rename_dirs(parent, new_parent)?;
 
         // 2. 查找两个 inode
         let old_id = self.dir_find_entry(&parent_ref, name)?;
+        let target_dir_ref = new_parent_ref.as_ref().unwrap_or(&parent_ref);
+        let new_id = self.dir_find_entry(target_dir_ref, new_name)?;
+        let _mutation_guards = self.lock_inode_mutations(&[parent, new_parent, old_id, new_id]);
+        parent_ref = self.read_inode(parent)?;
+        new_parent_ref = if parent == new_parent {
+            None
+        } else {
+            Some(self.read_inode(new_parent)?)
+        };
         let old_inode = self.read_inode(old_id)?;
         let old_is_dir = old_inode.inode.is_dir();
         let old_type = old_inode.inode.file_type();
-
-        let target_dir_ref = new_parent_ref.as_ref().unwrap_or(&parent_ref);
-        let new_id = self.dir_find_entry(target_dir_ref, new_name)?;
         let new_inode = self.read_inode(new_id)?;
         let new_is_dir = new_inode.inode.is_dir();
         let new_type = new_inode.inode.file_type();
@@ -959,44 +1037,59 @@ impl Ext4 {
 
         // 5. 原子交换：原地替换目录项的 inode 引用
         if parent == new_parent {
-            self.dir_replace_entry(&parent_ref, name, new_id, new_type)?;
-            self.dir_replace_entry(&parent_ref, new_name, old_id, old_type)?;
+            self.poison_on_error(self.dir_replace_entry(&parent_ref, name, new_id, new_type))?;
+            self.poison_on_error(self.dir_replace_entry(&parent_ref, new_name, old_id, old_type))?;
         } else {
-            self.dir_replace_entry(&parent_ref, name, new_id, new_type)?;
+            self.poison_on_error(self.dir_replace_entry(&parent_ref, name, new_id, new_type))?;
             let new_parent_dir = new_parent_ref.as_ref().ok_or(format_error!(
                 ErrCode::EINVAL,
                 "rename_exchange: missing new parent reference for cross-dir exchange"
             ))?;
-            self.dir_replace_entry(new_parent_dir, new_name, old_id, old_type)?;
+            self.poison_on_error(self.dir_replace_entry(
+                new_parent_dir,
+                new_name,
+                old_id,
+                old_type,
+            ))?;
         }
 
         // 6. 跨目录时更新目录的 ".." 指向和父目录 link_count
         if parent != new_parent {
             if old_is_dir {
-                self.dir_replace_entry(&old_inode, "..", new_parent, FileType::Directory)?;
+                self.poison_on_error(self.dir_replace_entry(
+                    &old_inode,
+                    "..",
+                    new_parent,
+                    FileType::Directory,
+                ))?;
                 parent_ref
                     .inode
                     .set_link_count(parent_ref.inode.link_count() - 1);
-                self.write_inode_with_csum(&mut parent_ref)?;
+                self.poison_on_error(self.write_inode_with_csum(&mut parent_ref))?;
                 let np = new_parent_ref.as_mut().ok_or(format_error!(
                     ErrCode::EINVAL,
                     "rename_exchange: missing new parent reference for old_dir update"
                 ))?;
                 np.inode.set_link_count(np.inode.link_count() + 1);
-                self.write_inode_with_csum(np)?;
+                self.poison_on_error(self.write_inode_with_csum(np))?;
             }
             if new_is_dir {
-                self.dir_replace_entry(&new_inode, "..", parent, FileType::Directory)?;
+                self.poison_on_error(self.dir_replace_entry(
+                    &new_inode,
+                    "..",
+                    parent,
+                    FileType::Directory,
+                ))?;
                 let np = new_parent_ref.as_mut().ok_or(format_error!(
                     ErrCode::EINVAL,
                     "rename_exchange: missing new parent reference for new_dir update"
                 ))?;
                 np.inode.set_link_count(np.inode.link_count() - 1);
-                self.write_inode_with_csum(np)?;
+                self.poison_on_error(self.write_inode_with_csum(np))?;
                 parent_ref
                     .inode
                     .set_link_count(parent_ref.inode.link_count() + 1);
-                self.write_inode_with_csum(&mut parent_ref)?;
+                self.poison_on_error(self.write_inode_with_csum(&mut parent_ref))?;
             }
         }
 
@@ -1021,6 +1114,9 @@ impl Ext4 {
     /// * `ENOTDIR` - `parent` is not a directory
     /// * `ENOSPC` - no space left on device
     pub fn mkdir(&self, parent: InodeId, name: &str, mode: InodeMode) -> Result<InodeId> {
+        self.ensure_mutable()?;
+        let _namespace_guard = self.namespace_lock.lock();
+        let _mutation_guards = self.lock_inode_mutations(&[parent]);
         let mut parent = self.read_inode(parent)?;
         // Can only create a directory in a directory
         if !parent.inode.is_dir() {
@@ -1031,10 +1127,15 @@ impl Ext4 {
         let mut child = self.create_inode(mode)?;
         // Add "." entry
         let child_self = child.clone();
-        self.dir_add_entry(&mut child, &child_self, ".")?;
+        if let Err(error) = self.dir_add_entry(&mut child, &child_self, ".") {
+            if self.free_inode(&mut child).is_err() {
+                self.poison(ErrCode::EIO);
+            }
+            return Err(error);
+        }
         child.inode.set_link_count(1);
         // Link the new inode
-        self.link_inode(&mut parent, &mut child, name)?;
+        self.link_new_inode_or_free(&mut parent, &mut child, name)?;
         Ok(child.id)
     }
 
@@ -1096,13 +1197,25 @@ impl Ext4 {
     /// * `ENOTDIR` - `parent` or `child` is not a directory
     /// * `ENOENT` - `name` does not exist in `parent`
     /// * `ENOTEMPTY` - `child` is not empty
-    pub fn rmdir(&self, parent: InodeId, name: &str) -> Result<()> {
-        let mut parent = self.read_inode(parent)?;
+    pub fn rmdir(&self, parent: InodeId, name: &str) -> Result<Option<InodeReclaimHandle>> {
+        self.ensure_mutable()?;
+        let _namespace_guard = self.namespace_lock.lock();
+        let mut parent_ref = self.read_inode(parent)?;
         // Can only remove a directory in a directory
-        if !parent.inode.is_dir() {
-            return_error!(ErrCode::ENOTDIR, "Inode {} is not a directory", parent.id);
+        if !parent_ref.inode.is_dir() {
+            return_error!(
+                ErrCode::ENOTDIR,
+                "Inode {} is not a directory",
+                parent_ref.id
+            );
         }
-        let mut child = self.read_inode(self.dir_find_entry(&parent, name)?)?;
+        let child_id = self.dir_find_entry(&parent_ref, name)?;
+        let _mutation_guards = self.lock_inode_mutations(&[parent, child_id]);
+        parent_ref = self.read_inode(parent)?;
+        if self.dir_find_entry(&parent_ref, name)? != child_id {
+            return_error!(ErrCode::ENOENT, "Namespace changed during rmdir");
+        }
+        let mut child = self.read_inode(child_id)?;
         // Child must be a directory
         if !child.inode.is_dir() {
             return_error!(ErrCode::ENOTDIR, "Inode {} is not a directory", child.id);
@@ -1112,7 +1225,7 @@ impl Ext4 {
             return_error!(ErrCode::ENOTEMPTY, "Directory {} is not empty", child.id);
         }
         // Remove directory entry
-        self.unlink_inode(&mut parent, &mut child, name, true)
+        self.unlink_inode(&mut parent_ref, &mut child, name)
     }
 
     /// Get extended attribute of a file.
@@ -1158,6 +1271,7 @@ impl Ext4 {
     ///
     /// `ENOSPC` - xattr block does not have enough space
     pub fn setxattr(&self, inode: InodeId, name: &str, value: &[u8]) -> Result<()> {
+        self.ensure_mutable()?;
         self.setxattr_with_flags(inode, name, value, false, false)
     }
 
@@ -1174,6 +1288,7 @@ impl Ext4 {
         create: bool,
         replace: bool,
     ) -> Result<()> {
+        self.ensure_mutable()?;
         let _mutation_guard =
             self.inode_mutation_locks[self.inode_mutation_lock_index(inode)].lock();
         let mut inode_ref = self.read_inode(inode)?;
@@ -1246,6 +1361,7 @@ impl Ext4 {
     ///
     /// `ENODATA` - the attribute does not exist
     pub fn removexattr(&self, inode: InodeId, name: &str) -> Result<()> {
+        self.ensure_mutable()?;
         let _mutation_guard =
             self.inode_mutation_locks[self.inode_mutation_lock_index(inode)].lock();
         let inode_ref = self.read_inode(inode)?;
@@ -1326,6 +1442,8 @@ mod tests {
             cached_block_groups: Vec::new(),
             inode_cache: spin::Mutex::new(crate::ext4::InodeCache::new(16)),
             alloc_lock: spin::Mutex::new(()),
+            namespace_lock: spin::Mutex::new(()),
+            poisoned: spin::Mutex::new(None),
             inode_mutation_locks: (0..crate::ext4::INODE_MUTATION_LOCK_SHARDS)
                 .map(|_| spin::Mutex::new(()))
                 .collect(),

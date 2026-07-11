@@ -588,6 +588,8 @@ mod tests {
             cached_block_groups: Vec::new(),
             inode_cache: spin::Mutex::new(crate::ext4::InodeCache::new(16)),
             alloc_lock: spin::Mutex::new(()),
+            namespace_lock: spin::Mutex::new(()),
+            poisoned: spin::Mutex::new(None),
             inode_mutation_locks: (0..crate::ext4::INODE_MUTATION_LOCK_SHARDS)
                 .map(|_| spin::Mutex::new(()))
                 .collect(),

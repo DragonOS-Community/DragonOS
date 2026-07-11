@@ -174,10 +174,15 @@ fn large_read_write_test(ext4: &mut Ext4) {
 }
 
 fn remove_file_test(ext4: &mut Ext4) {
+    let removed = ext4
+        .generic_lookup(ROOT_INO, "d3/f0")
+        .expect("lookup before remove failed");
     ext4.generic_remove(ROOT_INO, "d3/f0")
         .expect("remove file failed");
     ext4.generic_lookup(ROOT_INO, "d3/f0")
         .expect_err("file not removed");
+    ext4.getattr(removed)
+        .expect_err("removed inode was not reclaimed");
     ext4.generic_remove(ROOT_INO, "d3/f1")
         .expect("remove file failed");
     ext4.generic_lookup(ROOT_INO, "d3/f1")
@@ -188,6 +193,26 @@ fn remove_file_test(ext4: &mut Ext4) {
         .expect_err("file not removed");
     ext4.generic_remove(ROOT_INO, "d1/not_exist")
         .expect_err("remove file failed");
+}
+
+fn generic_rename_reclaims_replaced_inode_test(ext4: &mut Ext4) {
+    let file_mode: InodeMode = InodeMode::FILE | InodeMode::ALL_RWX;
+    let source = ext4
+        .generic_create(ROOT_INO, "rename_source", file_mode)
+        .expect("create rename source failed");
+    let replaced = ext4
+        .generic_create(ROOT_INO, "rename_target", file_mode)
+        .expect("create rename target failed");
+
+    ext4.generic_rename(ROOT_INO, "rename_source", "rename_target")
+        .expect("generic rename failed");
+    assert_eq!(
+        ext4.generic_lookup(ROOT_INO, "rename_target")
+            .expect("lookup renamed file failed"),
+        source
+    );
+    ext4.getattr(replaced)
+        .expect_err("replaced inode was not reclaimed");
 }
 
 fn xattr_test(ext4: &mut Ext4) {
@@ -372,10 +397,15 @@ fn sparse_growth_and_range_writeback_test() {
 
     let attr = ext4.getattr(ino).expect("getattr sparse file failed");
     assert_eq!(attr.size, sparse_size);
-    assert_eq!(attr.blocks, 0, "sparse growth must not allocate data blocks");
+    assert_eq!(
+        attr.blocks, 0,
+        "sparse growth must not allocate data blocks"
+    );
 
     let mut hole = vec![0x5Au8; 8192];
-    let n = ext4.read(ino, 123, &mut hole).expect("read sparse hole failed");
+    let n = ext4
+        .read(ino, 123, &mut hole)
+        .expect("read sparse hole failed");
     assert_eq!(n, hole.len());
     assert!(hole.iter().all(|&b| b == 0), "hole read must return zeros");
 
@@ -386,14 +416,8 @@ fn sparse_growth_and_range_writeback_test() {
 
     let write_offset = 1024 * 1024 + 123;
     let data = vec![0xC3u8; 7000];
-    ext4.prepare_buffered_write(
-        ino,
-        write_offset,
-        data.len(),
-        sparse_size,
-        None,
-    )
-    .expect("prepare buffered sparse write failed");
+    ext4.prepare_buffered_write(ino, write_offset, data.len(), sparse_size, None)
+        .expect("prepare buffered sparse write failed");
     ext4.write_data_only(ino, write_offset, &data)
         .expect("write_data_only after prepare failed");
 
@@ -497,6 +521,8 @@ fn main() {
     println!("large read write test done");
     remove_file_test(&mut ext4);
     println!("remove file test done");
+    generic_rename_reclaims_replaced_inode_test(&mut ext4);
+    println!("generic rename reclaim test done");
     xattr_test(&mut ext4);
     println!("xattr test done");
     rename_exchange_test::rename_exchange_test(&mut ext4);

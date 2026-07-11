@@ -18,6 +18,59 @@ constexpr unsigned long kLoopCtlGetFree = 0x4C82;
 constexpr unsigned long kLoopSetFd = 0x4C00;
 constexpr unsigned long kLoopClrFd = 0x4C01;
 
+std::string FixturePath() {
+    char executable[512] = {};
+    ssize_t size = readlink("/proc/self/exe", executable, sizeof(executable) - 1);
+    if (size <= 0) {
+        return {};
+    }
+    std::string path(executable, static_cast<size_t>(size));
+    for (int i = 0; i < 3; ++i) {
+        size_t slash = path.rfind('/');
+        if (slash == std::string::npos) {
+            return {};
+        }
+        path.resize(slash);
+    }
+    return path + "/fixtures/ext4_inode_identity.img";
+}
+
+void CopySparseFile(const std::string& source, int destination) {
+    int source_fd = open(source.c_str(), O_RDONLY);
+    ASSERT_GE(source_fd, 0) << source << ": " << strerror(errno);
+    char buffer[64 * 1024];
+    off_t size = 0;
+    for (;;) {
+        ssize_t count = read(source_fd, buffer, sizeof(buffer));
+        ASSERT_GE(count, 0) << strerror(errno);
+        if (count == 0) {
+            break;
+        }
+        bool all_zero = true;
+        for (ssize_t i = 0; i < count; ++i) {
+            if (buffer[i] != 0) {
+                all_zero = false;
+                break;
+            }
+        }
+        if (all_zero) {
+            ASSERT_NE(static_cast<off_t>(-1), lseek(destination, count, SEEK_CUR))
+                << strerror(errno);
+        } else {
+            ssize_t done = 0;
+            while (done < count) {
+                ssize_t written = write(destination, buffer + done, count - done);
+                ASSERT_GT(written, 0) << strerror(errno);
+                done += written;
+            }
+        }
+        size += count;
+    }
+    ASSERT_EQ(0, ftruncate(destination, size)) << strerror(errno);
+    ASSERT_EQ(0, close(source_fd)) << strerror(errno);
+    ASSERT_EQ(0, lseek(destination, 0, SEEK_SET)) << strerror(errno);
+}
+
 class LoopExt4 {
   public:
     ~LoopExt4() {
@@ -47,12 +100,9 @@ class LoopExt4 {
 
         backing_fd_ = open(image_.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
         ASSERT_GE(backing_fd_, 0) << strerror(errno);
-        ASSERT_EQ(0, ftruncate(backing_fd_, 32 * 1024 * 1024)) << strerror(errno);
+        ASSERT_NO_FATAL_FAILURE(CopySparseFile(FixturePath(), backing_fd_));
         close(backing_fd_);
         backing_fd_ = -1;
-
-        std::string command = "/usr/sbin/mke2fs -q -t ext4 -F " + image_;
-        ASSERT_EQ(0, system(command.c_str())) << "mke2fs failed";
 
         int control = open("/dev/loop-control", O_RDWR);
         ASSERT_GE(control, 0) << strerror(errno);
@@ -146,6 +196,17 @@ TEST(Ext4InodeIdentity, RemountedHardLinksShareCanonicalInodeAndPageCache) {
     EXPECT_EQ(source_stat.st_dev, alias_stat.st_dev);
     EXPECT_EQ(source_stat.st_ino, alias_stat.st_ino);
     EXPECT_EQ(2u, source_stat.st_nlink);
+
+    int alias_path_fd = open(alias.c_str(), O_RDONLY);
+    ASSERT_GE(alias_path_fd, 0) << strerror(errno);
+    const std::string proc_fd =
+        "/proc/self/fd/" + std::to_string(alias_path_fd);
+    char link_target[512] = {};
+    ssize_t link_size =
+        readlink(proc_fd.c_str(), link_target, sizeof(link_target) - 1);
+    ASSERT_GT(link_size, 0) << strerror(errno);
+    EXPECT_EQ(alias, std::string(link_target, static_cast<size_t>(link_size)));
+    ASSERT_EQ(0, close(alias_path_fd)) << strerror(errno);
 
     int source_fd = open(source.c_str(), O_RDWR | O_TRUNC);
     ASSERT_GE(source_fd, 0) << strerror(errno);

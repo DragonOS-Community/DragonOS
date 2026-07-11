@@ -9,6 +9,7 @@ use crate::filesystem::{
     },
     vfs::{IndexNode, InodeMode, SpecialNodeData},
 };
+use crate::libs::casting::DowncastArc;
 use alloc::{
     format,
     string::ToString,
@@ -149,11 +150,20 @@ impl SymOps for FdSymOps {
             .unwrap_or_default();
 
         // 现在安全地获取文件的路径
-        let mut path = if let Ok(p) = file.inode().absolute_path() {
+        let inode = file.inode();
+        let path_result = if let Some(mount_inode) = inode
+            .clone()
+            .downcast_arc::<crate::filesystem::vfs::mount::MountFSInode>(
+        ) {
+            mount_inode.procfs_path()
+        } else {
+            inode.absolute_path()
+        };
+        let mut path = if let Ok(p) = path_result {
             p
         } else {
             // 匿名文件或无法获取路径
-            let inode_id = file.inode().metadata()?.inode_id;
+            let inode_id = inode.metadata()?.inode_id;
             format!("anon_inode:[{}]", inode_id)
         };
 

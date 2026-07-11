@@ -19,6 +19,7 @@ RUNNER_BIN = $(RUNNER_DIR)/target/$(RUST_TARGET)/release/dunitest-runner
 RESULTS_DIR = results
 BIN_DIR = bin
 BUILD_DIR = build
+EXT4_FIXTURE = $(BUILD_DIR)/fixtures/ext4_inode_identity.img
 
 # 要编译的测试套件目录列表（suites/ 下的子目录名）
 SUITES = demo normal fuse
@@ -57,7 +58,12 @@ $(GTEST_SRC):
 	@mv "$(GTEST_TMP_ROOT)" "$(GTEST_ROOT)"
 	@test -f "$(GTEST_SRC)"
 
-build-suites: $(TEST_BINS)
+build-suites: $(TEST_BINS) $(EXT4_FIXTURE)
+
+$(EXT4_FIXTURE):
+	@mkdir -p "$(dir $@)"
+	@truncate -s 32M "$@"
+	@mke2fs -q -t ext4 -F "$@"
 
 $(GTEST_OBJ): $(GTEST_SRC)
 	@mkdir -p "$(dir $@)"
@@ -84,6 +90,8 @@ install: build
 	@cp -f $(RUNNER_BIN) $(INSTALL_DIR)/dunitest-runner
 	@chmod +x $(INSTALL_DIR)/dunitest-runner
 	@cp -rf $(BIN_DIR) $(INSTALL_DIR)/
+	@mkdir -p $(INSTALL_DIR)/fixtures
+	@cp --sparse=always -f $(EXT4_FIXTURE) $(INSTALL_DIR)/fixtures/
 	@cp -f whitelist.txt $(INSTALL_DIR)/whitelist.txt
 	@cp -f scripts/run_tests.sh $(INSTALL_DIR)/run_tests.sh
 	@chmod +x $(INSTALL_DIR)/run_tests.sh

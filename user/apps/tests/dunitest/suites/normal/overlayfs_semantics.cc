@@ -3192,7 +3192,7 @@ TEST(OverlayFsSemantics, ContentMutationRemovesCopiedUpFileCapability) {
     ASSERT_GE(fd, 0) << strerror(errno);
     ASSERT_EQ(1, write(fd, "x", 1)) << strerror(errno);
     ASSERT_EQ(0, close(fd)) << strerror(errno);
-    ASSERT_EQ(0, truncate(join_path(env.merged, names[1]).c_str(), 0)) << strerror(errno);
+    ASSERT_EQ(0, truncate(join_path(env.merged, names[1]).c_str(), 3)) << strerror(errno);
     ASSERT_EQ(0, chown(join_path(env.merged, names[2]).c_str(), 1000, 1001)) << strerror(errno);
 
     for (const char* name : names) {
@@ -3206,6 +3206,8 @@ TEST(OverlayFsSemantics, ContentMutationRemovesCopiedUpFileCapability) {
             EXPECT_EQ(ENODATA, errno) << *file;
         }
     }
+    EXPECT_EQ("low", read_text(join_path(env.upper, names[1])));
+    EXPECT_EQ("low", read_text(join_path(env.merged, names[1])));
 }
 
 TEST(OverlayFsSemantics, NonRootOwnerCanTriggerCopyUpThroughMounterCredentials) {

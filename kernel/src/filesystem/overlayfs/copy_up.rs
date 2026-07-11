@@ -137,7 +137,10 @@ impl OvlInode {
             return Err(err);
         }
 
-        if copy_size == Some(0) && metadata.file_type == FileType::File {
+        // A length-aware copy-up already contains the post-truncate data.
+        // Drop capabilities before publishing that changed content so lookup
+        // and exec can never observe a stale capability on the new upper.
+        if copy_size.is_some() && metadata.file_type == FileType::File {
             if let Err(err) = metadata::remove_security_capability(&temp_inode) {
                 let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
                 return Err(err);

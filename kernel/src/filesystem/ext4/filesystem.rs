@@ -159,8 +159,24 @@ impl FileSystem for Ext4FileSystem {
         PageFaultHandler::filemap_map_pages(pfm, start_pgoff, end_pgoff)
     }
 
-    fn sync_fs(&self, _wait: bool) -> Result<(), SystemError> {
-        self.flush_dirty_inodes()
+    fn sync_fs(&self, wait: bool) -> Result<(), SystemError> {
+        let eviction_epoch = wait.then(|| {
+            // Like Linux ext4 flushing its filesystem workqueue before waiting
+            // for the target transaction, include every reclaim request that
+            // was published before this sync.  Do not seal the queue: requests
+            // published after this snapshot belong to a later sync boundary.
+            EvictionEpoch::new(self.eviction_queue.lock().next_epoch)
+        });
+        let flush_result = self.flush_dirty_inodes();
+        if let Some(epoch) = eviction_epoch {
+            // Finish the snapshotted asynchronous metadata work even if inode
+            // writeback failed, while preserving that earlier error for the
+            // caller and the superblock writeback error sequence.
+            let eviction_result = self.drain_evictions_through(epoch);
+            flush_result.and(eviction_result)
+        } else {
+            flush_result
+        }
     }
 
     fn seal_eviction_queue(&self) -> EvictionEpoch {

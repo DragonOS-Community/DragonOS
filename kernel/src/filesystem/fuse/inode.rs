@@ -24,6 +24,7 @@ use crate::{
     time::PosixTimeSpec,
 };
 
+use super::reply::FuseReply;
 use super::{
     conn::FuseConn,
     fs::FuseFS,
@@ -239,7 +240,7 @@ impl FuseNode {
         *self.parent_nodeid.lock()
     }
 
-    fn request_name(&self, opcode: u32, nodeid: u64, name: &str) -> Result<Vec<u8>, SystemError> {
+    fn request_name(&self, opcode: u32, nodeid: u64, name: &str) -> Result<FuseReply, SystemError> {
         self.check_not_stale()?;
         let payload = Self::pack_name_payload(name);
         self.conn().request(opcode, nodeid, &payload)

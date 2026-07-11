@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -140,6 +141,63 @@ void emit_stats_delta(const char* workload, const StatsMap& before, const StatsM
     }
 }
 
+bool stats_delta(const StatsMap& before, const StatsMap& after, const std::string& key,
+                 long long* delta) {
+    auto old = before.find(key);
+    auto current = after.find(key);
+    if (old == before.end() || current == after.end()) {
+        return false;
+    }
+    *delta = current->second - old->second;
+    return true;
+}
+
+bool require_zero_copy_transfer(const char* workload, const StatsMap& before,
+                                const StatsMap& after, int opcode) {
+    const std::string prefix =
+        "virtiofs_opcode.opcode_" + std::to_string(opcode);
+    long long requests = 0;
+    long long transfer_count = 0;
+    long long transfer_bytes = 0;
+    long long copy_bytes = 0;
+    bool present =
+        stats_delta(before, after, prefix + "_requests_total", &requests) &&
+        stats_delta(before, after, prefix + "_reply_payload_transfer_count", &transfer_count) &&
+        stats_delta(before, after, prefix + "_reply_payload_transfer_bytes", &transfer_bytes) &&
+        stats_delta(before, after, prefix + "_reply_payload_copy_bytes", &copy_bytes);
+    bool passed = present && requests > 0 && transfer_count > 0 && transfer_bytes > 0 &&
+                  copy_bytes == 0;
+    if (!passed) {
+        fprintf(stderr,
+                "stats_assert workload=%s opcode=%d status=fail present=%d requests=%lld "
+                "transfer_count=%lld transfer_bytes=%lld copy_bytes=%lld\n",
+                workload, opcode, present ? 1 : 0, requests, transfer_count, transfer_bytes,
+                copy_bytes);
+    }
+    return passed;
+}
+
+bool validate_zero_copy_metrics(const char* workload, const StatsMap& before,
+                                const StatsMap& after) {
+    if (strcmp(workload, "metadata") == 0) {
+        return require_zero_copy_transfer(workload, before, after, 35);  // CREATE
+    }
+    if (strcmp(workload, "sequential") == 0) {
+        return require_zero_copy_transfer(workload, before, after, 15);  // READ
+    }
+    if (strcmp(workload, "readdir") == 0) {
+        long long readdir_requests = 0;
+        long long readdirplus_requests = 0;
+        stats_delta(before, after, "virtiofs_opcode.opcode_28_requests_total",
+                    &readdir_requests);
+        stats_delta(before, after, "virtiofs_opcode.opcode_44_requests_total",
+                    &readdirplus_requests);
+        int opcode = readdirplus_requests > 0 ? 44 : 28;
+        return require_zero_copy_transfer(workload, before, after, opcode);
+    }
+    return true;
+}
+
 bool write_full(int fd, const void* data, size_t len) {
     const char* p = static_cast<const char*>(data);
     while (len > 0) {
@@ -263,6 +321,59 @@ int metadata_workload(const Options& opt, const std::string& root) {
         ops += 3;
     }
     emit_result("metadata", opt, now_us() - start, 0, ops, err);
+    return err == 0 ? 0 : -1;
+}
+
+int readdir_workload(const Options& opt, const std::string& root) {
+    const std::string prefix = "readdir_";
+    uint64_t start = now_us();
+    uint64_t ops = 0;
+    int err = 0;
+    for (size_t i = 0; i < opt.files; ++i) {
+        std::string path = path_join(root, prefix + std::to_string(i));
+        int fd = open(path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
+        if (fd < 0) {
+            err = errno_or_eio();
+            break;
+        }
+        close_preserve_error(fd, &err);
+        if (err != 0) {
+            break;
+        }
+    }
+
+    size_t found = 0;
+    if (err == 0) {
+        DIR* dir = opendir(root.c_str());
+        if (!dir) {
+            err = errno_or_eio();
+        } else {
+            errno = 0;
+            while (dirent* entry = readdir(dir)) {
+                if (strncmp(entry->d_name, prefix.c_str(), prefix.size()) == 0) {
+                    ++found;
+                }
+            }
+            if (errno != 0) {
+                err = errno;
+            }
+            if (closedir(dir) != 0 && err == 0) {
+                err = errno_or_eio();
+            }
+        }
+    }
+    if (err == 0 && found != opt.files) {
+        err = EIO;
+    }
+    for (size_t i = 0; i < opt.files; ++i) {
+        std::string path = path_join(root, prefix + std::to_string(i));
+        if (unlink(path.c_str()) == 0) {
+            ++ops;
+        } else if (err == 0) {
+            err = errno_or_eio();
+        }
+    }
+    emit_result("readdir", opt, now_us() - start, 0, ops + found, err);
     return err == 0 ? 0 : -1;
 }
 
@@ -457,7 +568,7 @@ int concurrent_workload(const Options& opt, const std::string& root) {
 
 void usage(const char* argv0) {
     fprintf(stderr,
-            "usage: %s --mount PATH [--workload all|metadata|sequential|random_read|mmap|concurrent] "
+            "usage: %s --mount PATH [--workload all|metadata|readdir|sequential|random_read|mmap|concurrent] "
             "[--files N] [--file-size N] [--block-size N] [--iterations N] [--workers N]\n",
             argv0);
     fprintf(stderr,
@@ -523,7 +634,8 @@ bool parse_args(int argc, char** argv, Options* opt) {
             return false;
         }
     }
-    if (opt->workload != "all" && opt->workload != "metadata" && opt->workload != "sequential" &&
+    if (opt->workload != "all" && opt->workload != "metadata" && opt->workload != "readdir" &&
+        opt->workload != "sequential" &&
         opt->workload != "random_read" && opt->workload != "mmap" &&
         opt->workload != "concurrent") {
         fprintf(stderr, "unknown workload: %s\n", opt->workload.c_str());
@@ -582,10 +694,19 @@ struct AutoMount {
 
 int run_with_stats_delta(const char* name, int (*workload)(const Options&, const std::string&),
                          const Options& opt, const std::string& root) {
+    const bool verify_stats = !stats_path().empty();
     StatsMap before = read_stats();
+    if (verify_stats && before.empty()) {
+        fprintf(stderr, "stats_assert workload=%s status=fail reason=baseline_unavailable\n", name);
+        return -1;
+    }
     int rc = workload(opt, root);
     StatsMap after = read_stats();
     emit_stats_delta(name, before, after);
+    if (rc == 0 && verify_stats &&
+        (!validate_zero_copy_metrics(name, before, after) || after.empty())) {
+        return -1;
+    }
     return rc;
 }
 
@@ -625,6 +746,9 @@ int main(int argc, char** argv) {
     int rc = 0;
     if (opt.workload == "all" || opt.workload == "metadata") {
         rc |= run_with_stats_delta("metadata", metadata_workload, opt, root);
+    }
+    if (opt.workload == "all" || opt.workload == "readdir") {
+        rc |= run_with_stats_delta("readdir", readdir_workload, opt, root);
     }
     if (opt.workload == "all" || opt.workload == "sequential") {
         rc |= run_with_stats_delta("sequential", sequential_workload, opt, root);

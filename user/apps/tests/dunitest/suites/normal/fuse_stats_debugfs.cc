@@ -132,6 +132,13 @@ TEST(FuseStatsDebugFs, StatsFileExistsAndSupportsOffsetReads) {
     expect_field(whole, "requests_aborted_total ");
     expect_field(whole, "requests_dropped_umount_total ");
     expect_field(whole, "read_buffer_too_small_total ");
+    expect_field(whole, "reply_payload_transfer_count_total ");
+    expect_field(whole, "reply_payload_transfer_bytes_total ");
+    expect_field(whole, "reply_payload_copy_count_total ");
+    expect_field(whole, "dev_fuse_input_copy_count_total ");
+    expect_field(whole, "dev_fuse_input_copy_bytes_total ");
+    expect_field(whole, "virtiofs_compat_copy_count_total ");
+    expect_field(whole, "virtiofs_compat_copy_bytes_total ");
 
     expect_field(whole, "[virtiofs]\n");
     expect_field(whole, "device_queue_depth_max ");
@@ -147,6 +154,12 @@ TEST(FuseStatsDebugFs, StatsFileExistsAndSupportsOffsetReads) {
     expect_field(whole, "request_inflight_current ");
     expect_field(whole, "request_inflight_peak ");
     expect_field(whole, "queue_full_blocked_current ");
+    expect_field(whole, "reply_retained_current ");
+    expect_field(whole, "reply_retained_peak ");
+    expect_field(whole, "reply_retained_capacity_bytes_current ");
+    expect_field(whole, "reply_retained_capacity_bytes_peak ");
+    expect_field(whole, "reply_credit_blocked_total ");
+    expect_field(whole, "reply_credit_blocked_wake_total ");
     expect_field(whole, "bridge_loop_iterations_total ");
     expect_field(whole, "bridge_idle_sleeps_total ");
     expect_field(whole, "virtqueue_full_total ");
@@ -166,6 +179,7 @@ TEST(FuseStatsDebugFs, StatsFileExistsAndSupportsOffsetReads) {
     expect_field(whole, "bridge_wait_exit_spurious_total ");
     expect_field(whole, "bridge_wake_request_total ");
     expect_field(whole, "bridge_wake_completion_total ");
+    expect_field(whole, "bridge_wake_reply_released_total ");
     expect_field(whole, "bridge_wake_teardown_total ");
     expect_field(whole, "bridge_wake_disconnect_total ");
     expect_field(whole, "bridge_irq_no_active_conn_total ");
@@ -183,6 +197,8 @@ TEST(FuseStatsDebugFs, StatsFileExistsAndSupportsOffsetReads) {
     expect_field(whole, "opcode_16_response_buffer_alloc_count ");
     expect_field(whole, "opcode_16_response_buffer_zero_bytes ");
     expect_field(whole, "opcode_63_reply_payload_copy_bytes ");
+    expect_field(whole, "opcode_63_reply_payload_transfer_count ");
+    expect_field(whole, "opcode_63_reply_payload_transfer_bytes ");
 
     EXPECT_GE(parse_counter(whole, "device_queue_depth_max"), 0);
     EXPECT_GE(parse_counter(whole, "hiprio_vring_size_configured"), 0);
@@ -196,6 +212,13 @@ TEST(FuseStatsDebugFs, StatsFileExistsAndSupportsOffsetReads) {
     expect_counter_increased(whole, after_fuse, "requests_queued_total");
     expect_counter_increased(whole, after_fuse, "requests_dequeued_total");
     expect_counter_increased(whole, after_fuse, "requests_replied_ok_total");
+    expect_counter_increased(whole, after_fuse, "bytes_reply_payload_cloned_total");
+    expect_counter_increased(whole, after_fuse, "dev_fuse_input_copy_count_total");
+    expect_counter_increased(whole, after_fuse, "dev_fuse_input_copy_bytes_total");
+    EXPECT_EQ(parse_counter(whole, "reply_payload_transfer_count_total"),
+              parse_counter(after_fuse, "reply_payload_transfer_count_total"));
+    EXPECT_EQ(parse_counter(whole, "virtiofs_compat_copy_count_total"),
+              parse_counter(after_fuse, "virtiofs_compat_copy_count_total"));
 }
 
 int main(int argc, char** argv) {

@@ -30,6 +30,7 @@ use super::protocol::{
     FUSE_PARALLEL_DIROPS, FUSE_POSIX_ACL, FUSE_POSIX_LOCKS, FUSE_READDIRPLUS_AUTO,
     FUSE_REMOVEXATTR, FUSE_SETXATTR, FUSE_SUBMOUNTS,
 };
+use super::reply::FuseReply;
 use super::{stats, trace};
 
 mod daemon;
@@ -131,6 +132,7 @@ pub(crate) enum FuseReplyCapacitySource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FuseReplyCapacity {
     pub(crate) bytes: usize,
+    pub(crate) retained_bytes: usize,
     pub(crate) source: FuseReplyCapacitySource,
 }
 
@@ -190,8 +192,15 @@ impl FuseRequestCred {
 pub struct FusePendingState {
     unique: u64,
     opcode: u32,
-    response: Mutex<Option<Result<Vec<u8>, SystemError>>>,
+    response: Mutex<PendingCompletion>,
     wait: WaitQueue,
+}
+
+#[derive(Debug)]
+enum PendingCompletion {
+    Waiting,
+    Ready(Result<FuseReply, SystemError>),
+    Consumed,
 }
 
 impl FusePendingState {
@@ -199,7 +208,7 @@ impl FusePendingState {
         Self {
             unique,
             opcode,
-            response: Mutex::new(None),
+            response: Mutex::new(PendingCompletion::Waiting),
             wait: WaitQueue::default(),
         }
     }
@@ -208,22 +217,26 @@ impl FusePendingState {
         self.unique
     }
 
-    pub fn complete(&self, v: Result<Vec<u8>, SystemError>) {
+    pub fn complete(&self, v: Result<FuseReply, SystemError>) -> bool {
         let mut guard = self.response.lock();
-        if guard.is_some() {
+        if !matches!(*guard, PendingCompletion::Waiting) {
             // Duplicate replies are ignored (Linux does similarly).
-            return;
+            return false;
         }
-        *guard = Some(v);
+        *guard = PendingCompletion::Ready(v);
         drop(guard);
         self.wait.wakeup(None);
+        true
     }
 
-    pub fn wait_complete(&self) -> Result<Vec<u8>, SystemError> {
+    pub fn wait_complete(&self) -> Result<FuseReply, SystemError> {
         wait_with_recheck(&self.wait, || {
             let mut guard = self.response.lock();
-            if let Some(res) = guard.take() {
-                return Ok(Some(res));
+            if matches!(*guard, PendingCompletion::Ready(_)) {
+                let ready = core::mem::replace(&mut *guard, PendingCompletion::Consumed);
+                if let PendingCompletion::Ready(res) = ready {
+                    return Ok(Some(res));
+                }
             }
             Ok(None)
         })?
@@ -838,8 +851,8 @@ mod tests {
     use system_error::SystemError;
 
     use super::super::protocol::{
-        FuseEntryOut, FuseOpenOut, FuseOutHeader, FUSE_CREATE, FUSE_DESTROY, FUSE_GETATTR,
-        FUSE_LOOKUP, FUSE_STATFS,
+        FuseEntryOut, FuseOpenOut, FuseOutHeader, FuseStatfsOut, FUSE_CREATE, FUSE_DESTROY,
+        FUSE_GETATTR, FUSE_LOOKUP, FUSE_STATFS,
     };
     use super::{daemon, request, stats, FuseConn, FuseReplyCapacitySource};
 
@@ -883,10 +896,14 @@ mod tests {
         let conn = FuseConn::new_for_virtiofs(256 * 1024, 256 * 1024);
         let header = size_of::<FuseOutHeader>();
         set_minor(&conn, 3);
+        let statfs_capacity = request::reply_capacity_for_test(&conn, FUSE_STATFS, &[])
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            capacity(&conn, FUSE_STATFS, &[]).0,
+            statfs_capacity.bytes,
             header + FuseConn::FUSE_COMPAT_STATFS_SIZE
         );
+        assert_eq!(statfs_capacity.retained_bytes, size_of::<FuseStatfsOut>());
         assert_eq!(
             capacity(&conn, FUSE_LOOKUP, &[]).0,
             header + FuseConn::FUSE_COMPAT_ENTRY_OUT_SIZE

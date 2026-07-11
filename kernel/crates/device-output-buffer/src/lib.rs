@@ -25,6 +25,92 @@ pub enum BufferError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionLimits {
+    pub max_count: usize,
+    pub max_capacity_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionSnapshot {
+    pub count: usize,
+    pub capacity_bytes: usize,
+}
+
+/// Pure accounting state for bounding completed device storage retained by consumers.
+///
+/// Synchronization and wakeups deliberately live in the transport using this type. A successful
+/// reservation must be paired with exactly one `release` unless ownership is moved to another
+/// object that retains that obligation.
+#[derive(Debug)]
+pub struct RetentionCredits {
+    limits: RetentionLimits,
+    used: RetentionSnapshot,
+}
+
+impl RetentionCredits {
+    pub const fn new(limits: RetentionLimits) -> Self {
+        Self {
+            limits,
+            used: RetentionSnapshot {
+                count: 0,
+                capacity_bytes: 0,
+            },
+        }
+    }
+
+    pub fn try_reserve(&mut self, capacity: usize) -> bool {
+        if capacity == 0 {
+            return false;
+        }
+        let Some(count) = self.used.count.checked_add(1) else {
+            return false;
+        };
+        let Some(capacity_bytes) = self.used.capacity_bytes.checked_add(capacity) else {
+            return false;
+        };
+        if count > self.limits.max_count || capacity_bytes > self.limits.max_capacity_bytes {
+            return false;
+        }
+        self.used = RetentionSnapshot {
+            count,
+            capacity_bytes,
+        };
+        true
+    }
+
+    pub fn release(&mut self, capacity: usize) -> bool {
+        if self.used.count == 0 || capacity == 0 || capacity > self.used.capacity_bytes {
+            return false;
+        }
+        self.used.count -= 1;
+        self.used.capacity_bytes -= capacity;
+        true
+    }
+
+    /// Replace the capacity charged to one live reservation without changing its count.
+    pub fn resize(&mut self, old_capacity: usize, new_capacity: usize) -> bool {
+        if self.used.count == 0 || old_capacity == 0 || new_capacity == 0 {
+            return false;
+        }
+        let Some(without_old) = self.used.capacity_bytes.checked_sub(old_capacity) else {
+            return false;
+        };
+        let Some(capacity_bytes) = without_old.checked_add(new_capacity) else {
+            return false;
+        };
+        if capacity_bytes > self.limits.max_capacity_bytes {
+            return false;
+        }
+        self.used.capacity_bytes = capacity_bytes;
+        true
+    }
+
+    pub const fn snapshot(&self) -> RetentionSnapshot {
+        self.used
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DmaIdentity {
     vaddr: usize,
     paddr: usize,
@@ -263,7 +349,10 @@ impl Drop for DeviceOutputBuffer {
 
 #[cfg(test)]
 mod tests {
-    use super::{BufferError, BufferState, DeviceOutputBuffer};
+    use super::{
+        BufferError, BufferState, DeviceOutputBuffer, RetentionCredits, RetentionLimits,
+        RetentionSnapshot,
+    };
 
     fn direct(vaddr: usize) -> Option<usize> {
         Some(vaddr.wrapping_sub(0x1000))
@@ -348,5 +437,71 @@ mod tests {
         buf.recycle().unwrap();
         assert_eq!(buf.prepare(0, direct), Err(BufferError::InvalidLength));
         assert_eq!(buf.prepare(65, direct), Err(BufferError::InvalidLength));
+    }
+
+    #[test]
+    fn retention_credits_enforce_count_and_capacity() {
+        let mut credits = RetentionCredits::new(RetentionLimits {
+            max_count: 2,
+            max_capacity_bytes: 96,
+        });
+        assert!(credits.try_reserve(64));
+        assert!(!credits.try_reserve(64));
+        assert!(credits.try_reserve(32));
+        assert!(!credits.try_reserve(1));
+        assert_eq!(
+            credits.snapshot(),
+            RetentionSnapshot {
+                count: 2,
+                capacity_bytes: 96,
+            }
+        );
+        assert!(credits.release(64));
+        assert!(credits.try_reserve(48));
+        assert_eq!(credits.snapshot().capacity_bytes, 80);
+    }
+
+    #[test]
+    fn retention_credits_reject_invalid_release_and_overflow() {
+        let mut credits = RetentionCredits::new(RetentionLimits {
+            max_count: usize::MAX,
+            max_capacity_bytes: usize::MAX,
+        });
+        assert!(!credits.release(1));
+        assert!(!credits.try_reserve(0));
+        assert!(credits.try_reserve(usize::MAX));
+        assert!(!credits.try_reserve(1));
+        assert!(!credits.release(0));
+        assert!(credits.release(usize::MAX));
+        assert_eq!(
+            credits.snapshot(),
+            RetentionSnapshot {
+                count: 0,
+                capacity_bytes: 0
+            }
+        );
+    }
+
+    #[test]
+    fn retention_credits_resize_preserves_count_and_enforces_capacity() {
+        let mut credits = RetentionCredits::new(RetentionLimits {
+            max_count: 2,
+            max_capacity_bytes: 96,
+        });
+        assert!(credits.try_reserve(64));
+        assert!(credits.resize(64, 80));
+        assert_eq!(
+            credits.snapshot(),
+            RetentionSnapshot {
+                count: 1,
+                capacity_bytes: 80,
+            }
+        );
+        assert!(!credits.resize(80, 97));
+        assert!(!credits.resize(0, 1));
+        assert!(credits.resize(80, 48));
+        assert_eq!(credits.snapshot().count, 1);
+        assert_eq!(credits.snapshot().capacity_bytes, 48);
+        assert!(credits.release(48));
     }
 }

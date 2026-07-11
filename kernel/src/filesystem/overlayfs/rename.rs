@@ -21,10 +21,6 @@ pub(super) fn move_to(
         .downcast_arc::<OvlInode>()
         .ok_or(SystemError::EXDEV)?;
 
-    if inode.redirect == target_ovl.redirect && old_name == new_name {
-        return Ok(());
-    }
-
     let fs = inode.overlay_fs()?;
     let source_state = inode.dir_state()?;
     let target_state = target_ovl.dir_state()?;
@@ -93,6 +89,10 @@ fn move_to_locked(
 
     if flags.contains(RenameFlags::NOREPLACE) && target_child.is_some() {
         return Err(SystemError::EEXIST);
+    }
+
+    if inode.redirect == target_ovl.redirect && old_name == new_name {
+        return Ok(());
     }
 
     if flags.contains(RenameFlags::EXCHANGE) {

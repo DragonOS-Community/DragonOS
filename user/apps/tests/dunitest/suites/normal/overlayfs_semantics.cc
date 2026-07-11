@@ -2153,6 +2153,26 @@ TEST(OverlayFsSemantics, UpperOnlyRenameNoReplacePreservesState) {
     cleanup_overlay_env(env);
 }
 
+TEST(OverlayFsSemantics, RenameSamePathValidatesSourceAndNoReplace) {
+    ScopedOverlayEnv scoped("overlayfs_rename_same_path");
+    const auto& env = scoped.env;
+    prepare_overlay_env(env);
+    std::string merged_file = join_path(env.merged, "file");
+    ASSERT_EQ(0, write_text(join_path(env.lower, "file"), "lower"));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    EXPECT_EQ(0, rename(merged_file.c_str(), merged_file.c_str())) << strerror(errno);
+
+    errno = 0;
+    EXPECT_EQ(-1, renameat2_call(merged_file, merged_file, RENAME_NOREPLACE));
+    EXPECT_EQ(EEXIST, errno);
+
+    std::string missing = join_path(env.merged, "missing");
+    errno = 0;
+    EXPECT_EQ(-1, rename(missing.c_str(), missing.c_str()));
+    EXPECT_EQ(ENOENT, errno);
+}
+
 TEST(OverlayFsSemantics, UserWhiteoutRenameIsRejected) {
     auto env = make_overlay_env("overlayfs_user_whiteout_reject");
     std::string upper_old = join_path(env.upper, "old");

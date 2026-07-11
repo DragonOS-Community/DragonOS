@@ -25,7 +25,6 @@ const ORIGIN_ENCODED_SIZE: usize = 40;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct OvlOrigin {
-    pub(super) epoch: u64,
     pub(super) fsid: u32,
     pub(super) dev_id: usize,
     pub(super) inode_id: InodeId,
@@ -66,7 +65,9 @@ fn encode_origin(origin: OvlOrigin) -> [u8; ORIGIN_ENCODED_SIZE] {
     encoded[..4].copy_from_slice(&ORIGIN_MAGIC);
     encoded[4] = ORIGIN_VERSION;
     encoded[5] = file_type_to_u8(origin.file_type);
-    encoded[8..16].copy_from_slice(&origin.epoch.to_le_bytes());
+    // Bytes 8..16 are reserved. Early version-1 records stored a mount-local
+    // epoch there; leaving them unused keeps those records readable across
+    // remounts without changing the on-disk layout.
     encoded[16..20].copy_from_slice(&origin.fsid.to_le_bytes());
     encoded[24..32].copy_from_slice(&(origin.dev_id as u64).to_le_bytes());
     encoded[32..40].copy_from_slice(&(origin.inode_id.data() as u64).to_le_bytes());
@@ -84,14 +85,12 @@ fn decode_origin(value: &[u8]) -> Option<OvlOrigin> {
         return None;
     }
 
-    let epoch = u64::from_le_bytes(value[8..16].try_into().ok()?);
     let fsid = u32::from_le_bytes(value[16..20].try_into().ok()?);
     let dev_id_u64 = u64::from_le_bytes(value[24..32].try_into().ok()?);
     let inode_id_u64 = u64::from_le_bytes(value[32..40].try_into().ok()?);
     let dev_id = usize::try_from(dev_id_u64).ok()?;
     let inode_id = usize::try_from(inode_id_u64).ok()?;
     Some(OvlOrigin {
-        epoch,
         fsid,
         dev_id,
         inode_id: InodeId::new(inode_id),
@@ -300,7 +299,6 @@ pub(super) fn prepare_origin(
     let fs = inode.overlay_fs()?;
     let fsid = fs.backing_fsid(lower)?;
     let origin = OvlOrigin {
-        epoch: fs.mount_epoch,
         fsid,
         dev_id: lower_metadata.dev_id,
         inode_id: lower_metadata.inode_id,
@@ -339,9 +337,8 @@ pub(super) fn load_origin(
     let Some(origin) = decode_origin(&value) else {
         return Ok(None);
     };
-    if origin.epoch != fs.mount_epoch
-        || origin.file_type != inode.file_type
-        || !fs.has_backing_fsid(origin.fsid)
+    if origin.file_type != inode.file_type
+        || !fs.backing_fsid_matches_device(origin.fsid, origin.dev_id)?
     {
         return Ok(None);
     }

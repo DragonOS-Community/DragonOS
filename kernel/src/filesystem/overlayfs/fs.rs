@@ -14,12 +14,10 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
 use system_error::SystemError;
 
 const MAX_MOUNT_ANCESTOR_DEPTH: usize = vfs::MAX_PATHLEN;
 const INODE_CACHE_PRUNE_INTERVAL: usize = 256;
-static OVL_MOUNT_EPOCH: AtomicU64 = AtomicU64::new(1);
 type LowerRoot = (String, Arc<dyn IndexNode>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -123,7 +121,6 @@ pub(super) struct OverlayFS {
     pub(super) mutation_lock: Mutex<()>,
     pub(super) backing_cred: Arc<Cred>,
     pub(super) samefs: bool,
-    pub(super) mount_epoch: u64,
     inode_cache: Mutex<OvlInodeCache>,
 }
 
@@ -233,8 +230,18 @@ impl OverlayFS {
         Err(SystemError::EXDEV)
     }
 
-    pub(super) fn has_backing_fsid(&self, fsid: u32) -> bool {
-        self.layers.iter().any(|layer| layer.fsid == fsid)
+    pub(super) fn backing_fsid_matches_device(
+        &self,
+        fsid: u32,
+        dev_id: usize,
+    ) -> Result<bool, SystemError> {
+        let Some(layer) = self.layers.iter().find(|layer| layer.fsid == fsid) else {
+            return Ok(false);
+        };
+        let Some(lower) = layer.mnt.lower_inodes.first() else {
+            return Ok(false);
+        };
+        Ok(lower.metadata()?.dev_id == dev_id)
     }
 
     fn same_mount_inode(
@@ -398,14 +405,6 @@ impl MountableFileSystem for OverlayFS {
         let samefs = lower_roots
             .iter()
             .all(|(_, lower)| Arc::ptr_eq(&upper_backing_fs, &Self::canonical_backing_fs(lower)));
-        let sequence = OVL_MOUNT_EPOCH.fetch_add(1, Ordering::Relaxed);
-        let random = u64::from_le_bytes(crate::libs::rand::rand_bytes::<8>());
-        let now = crate::time::PosixTimeSpec::now();
-        let mount_epoch = random
-            ^ sequence.rotate_left(17)
-            ^ (now.tv_sec as u64).rotate_left(31)
-            ^ now.tv_nsec as u64;
-
         let root_inode = Arc::new(OvlInode::new(
             String::new(),
             upper_file_type,
@@ -436,7 +435,6 @@ impl MountableFileSystem for OverlayFS {
                 mutation_lock: Mutex::new(()),
                 backing_cred,
                 samefs,
-                mount_epoch,
                 inode_cache: Mutex::new(OvlInodeCache::default()),
             }
         });

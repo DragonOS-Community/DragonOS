@@ -2785,6 +2785,35 @@ TEST(OverlayFsSemantics, UpperDirRenameOverEmptyLowerDirSucceeds) {
     cleanup_overlay_env(env);
 }
 
+TEST(OverlayFsSemantics, CopiedUpIdentitySurvivesRemount) {
+    if (!root_supports_ext4_xattrs()) {
+        GTEST_SKIP() << "requires the Ubuntu 24.04 ext4 rootfs backing";
+    }
+
+    ScopedOverlayEnv scoped("overlayfs_remount_identity", "/root");
+    const auto& env = scoped.env;
+    prepare_overlay_env(env);
+    std::string lower_file = join_path(env.lower, "file");
+    std::string merged_file = join_path(env.merged, "file");
+    ASSERT_EQ(0, write_text(lower_file, "lower")) << strerror(errno);
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    struct stat before = {};
+    struct stat copied_up = {};
+    struct stat remounted = {};
+    ASSERT_EQ(0, stat(merged_file.c_str(), &before)) << strerror(errno);
+    ASSERT_EQ(0, chmod(merged_file.c_str(), 0600)) << strerror(errno);
+    ASSERT_EQ(0, stat(merged_file.c_str(), &copied_up)) << strerror(errno);
+    EXPECT_EQ(before.st_dev, copied_up.st_dev);
+    EXPECT_EQ(before.st_ino, copied_up.st_ino);
+
+    ASSERT_EQ(0, umount(env.merged.c_str())) << strerror(errno);
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+    ASSERT_EQ(0, stat(merged_file.c_str(), &remounted)) << strerror(errno);
+    EXPECT_EQ(before.st_dev, remounted.st_dev);
+    EXPECT_EQ(before.st_ino, remounted.st_ino);
+}
+
 TEST(OverlayFsSemantics, LowerMetadataMutationsCopyUpAndKeepStableIdentity) {
     if (geteuid() != 0) {
         GTEST_SKIP() << "requires root for chown coverage";

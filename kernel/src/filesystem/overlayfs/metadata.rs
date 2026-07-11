@@ -416,7 +416,7 @@ pub(super) fn resize_with_lock_owner(
     let fs = inode.overlay_fs()?;
     let _mutation_guard = fs.mutation_lock.lock();
     let _privilege_guard = inode.content_privilege_lock.lock();
-    inode.copy_up_locked()?;
+    inode.copy_up_locked_for_truncate(len)?;
     let upper = inode.upper_inode.lock().clone().ok_or(SystemError::EIO)?;
     let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
     remove_security_capability(&upper)?;
@@ -467,7 +467,7 @@ pub(super) fn resize_with_metadata(
     let _mutation_guard = fs.mutation_lock.lock();
     let _privilege_guard = inode.content_privilege_lock.lock();
     check_metadata_mutation_permission(inode, requested, mask)?;
-    inode.copy_up_locked()?;
+    inode.copy_up_locked_for_truncate(len)?;
     let upper = inode.upper_inode.lock().clone().ok_or(SystemError::EIO)?;
     let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
     remove_security_capability(&upper)?;
@@ -552,7 +552,7 @@ pub(super) fn resize_file_with_metadata(
     let _mutation_guard = fs.mutation_lock.lock();
     let _privilege_guard = inode.content_privilege_lock.lock();
     check_metadata_mutation_permission(inode, requested, mask)?;
-    inode.copy_up_locked()?;
+    inode.copy_up_locked_for_truncate(len)?;
     let upper = inode.upper_inode.lock().clone().ok_or(SystemError::EIO)?;
     let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
     remove_security_capability(&upper)?;

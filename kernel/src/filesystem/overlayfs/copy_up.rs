@@ -74,6 +74,10 @@ impl OvlInode {
         self.copy_up_locked_with_size(None).map(|_| ())
     }
 
+    pub(super) fn copy_up_locked_for_truncate(&self, len: usize) -> Result<(), SystemError> {
+        self.copy_up_locked_with_size(Some(len)).map(|_| ())
+    }
+
     fn copy_up_locked_with_size(
         &self,
         copy_size: Option<usize>,
@@ -320,7 +324,7 @@ impl OvlInode {
         copy_size: Option<usize>,
         caller_cred: &Arc<Cred>,
     ) {
-        if copy_size != Some(0) || metadata.file_type != FileType::File {
+        if copy_size.is_none() || metadata.file_type != FileType::File {
             return;
         }
 
@@ -424,7 +428,8 @@ impl OvlInode {
             return Ok(());
         }
 
-        let size = copy_size.unwrap_or_else(|| metadata.size.max(0) as usize);
+        let lower_size = metadata.size.max(0) as usize;
+        let size = copy_size.map_or(lower_size, |target_size| target_size.min(lower_size));
         if size == 0 {
             return Ok(());
         }

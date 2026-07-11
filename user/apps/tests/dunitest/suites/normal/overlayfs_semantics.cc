@@ -2850,6 +2850,11 @@ TEST(OverlayFsSemantics, LowerMetadataMutationsCopyUpAndKeepStableIdentity) {
     ASSERT_EQ(0, ftruncate(fd, 4)) << strerror(errno);
     ASSERT_EQ(0, close(fd)) << strerror(errno);
 
+    EXPECT_EQ("012", read_text(join_path(env.upper, names[3])));
+    EXPECT_EQ("012", read_text(join_path(env.merged, names[3])));
+    EXPECT_EQ("0123", read_text(join_path(env.upper, names[4])));
+    EXPECT_EQ("0123", read_text(join_path(env.merged, names[4])));
+
     for (size_t i = 0; i < 5; ++i) {
         struct stat merged_st = {};
         struct stat lower_st = {};

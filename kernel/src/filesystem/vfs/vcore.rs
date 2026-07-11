@@ -26,7 +26,6 @@ use crate::{
     init::cmdline::kenrel_cmdline_param_manager,
     ipc::kill::send_signal_to_pid,
     libs::mutex::MutexGuard,
-    mm::truncate::truncate_inode_pages,
     process::{
         cred::CAPFlags, namespace::mnt::mnt_namespace_init, resource::RLimitID, ProcessManager,
     },
@@ -685,11 +684,6 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
     // 如果目标是目录，则返回 EISDIR
     if target_inode.metadata()?.file_type == FileType::Dir {
         return Err(SystemError::EISDIR);
-    }
-
-    // 对目标 inode 执行页缓存清理
-    if let Some(page_cache) = target_inode.page_cache().clone() {
-        truncate_inode_pages(page_cache, 0);
     }
 
     // 在父目录上执行 unlink 操作

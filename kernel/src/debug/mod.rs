@@ -1,4 +1,5 @@
 pub mod errseq;
+pub mod ext4;
 pub mod fuse;
 pub mod jump_label;
 pub mod klog;

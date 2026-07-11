@@ -51,6 +51,9 @@ pub struct FuseNode {
     direct_io_lock: Mutex<()>,
     cached_metadata_deadline_ns: AtomicU64,
     attr_version: AtomicU64,
+    /// Lowest EOF established by a short READ whose inode-wide cache truncate
+    /// is deferred out of the transport completion path.
+    pending_short_read_eof: AtomicU64,
     lookup_count: AtomicU64,
     /// 最近一次 LOOKUP 回复中的 fuse_attr.flags（用于 announce-submounts）。
     lookup_attr_flags: AtomicU32,
@@ -97,6 +100,7 @@ impl FuseNode {
             direct_io_lock: Mutex::new(()),
             cached_metadata_deadline_ns: AtomicU64::new(if has_cached { u64::MAX } else { 0 }),
             attr_version: AtomicU64::new(1),
+            pending_short_read_eof: AtomicU64::new(u64::MAX),
             lookup_count: AtomicU64::new(0),
             lookup_attr_flags: AtomicU32::new(0),
             generation: AtomicU64::new(0),

@@ -8,6 +8,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::MMArch,
+    exception::workqueue::{schedule_work, Work},
     filesystem::{
         page_cache::{PageCache, PageCacheBackend, PageCacheReadDmaReservation},
         vfs::{file::FileFlags, FilePrivateData, FileType, IndexNode, Metadata, SetMetadataMask},
@@ -141,6 +142,7 @@ impl FuseNode {
         truncate_metadata: Option<(&Metadata, SetMetadataMask)>,
     ) -> Result<(), SystemError> {
         self.check_not_stale()?;
+        self.resolve_pending_short_read_truncate(len)?;
         let mut valid = FATTR_SIZE;
         if lock_owner.is_some() {
             valid |= FATTR_LOCKOWNER;
@@ -247,13 +249,60 @@ impl FuseNode {
                 {
                     md.size = eof as i64;
                     self.bump_attr_version();
+                    self.pending_short_read_eof
+                        .fetch_min(eof as u64, Ordering::AcqRel);
                     self.cached_metadata_deadline_ns
                         .store(u64::MAX, Ordering::Relaxed);
+                    if let Some(cache) = self.cached_page_cache() {
+                        let start_page = eof / MMArch::PAGE_SIZE;
+                        schedule_work(Work::new(move || {
+                            if let Err(error) = cache.unmap_mapping_pages_even_cow(start_page, None)
+                            {
+                                log::warn!(
+                                    "fuse: short-read mapping invalidation failed eof={} err={:?}",
+                                    eof,
+                                    error
+                                );
+                            }
+                        }));
+                    }
                     should_truncate = true;
                 }
             }
         }
         Ok((eof, should_truncate))
+    }
+
+    /// Finish an inode-wide page-cache truncate only when a later metadata
+    /// refresh grows the file past an EOF established by a short READ.
+    ///
+    /// Running `PageCache::truncate()` from the FUSE reply completion would
+    /// deadlock a single-threaded daemon when it waits for another outstanding
+    /// readahead page. Deferring it to the next operation that can expose or
+    /// create data past that EOF preserves coherence without blocking the
+    /// daemon's reply path.
+    pub(super) fn resolve_pending_short_read_truncate(
+        &self,
+        visible_size: usize,
+    ) -> Result<(), SystemError> {
+        let eof = self.pending_short_read_eof.load(Ordering::Acquire);
+        if eof == u64::MAX || visible_size <= eof as usize {
+            return Ok(());
+        }
+
+        self.truncate_pending_short_read_eof(eof)?;
+        Ok(())
+    }
+
+    fn truncate_pending_short_read_eof(&self, eof: u64) -> Result<(), SystemError> {
+        self.truncate_page_cache(eof as usize)?;
+        let _ = self.pending_short_read_eof.compare_exchange(
+            eof,
+            u64::MAX,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        Ok(())
     }
 
     /// Linux `fuse_send_open()` forwards file flags except creation-only bits.
@@ -944,6 +993,7 @@ impl FuseNode {
     ) -> Result<usize, SystemError> {
         let md = self.cached_or_fetch_metadata()?;
         let file_size = md.size.max(0) as usize;
+        self.resolve_pending_short_read_truncate(file_size)?;
         if offset >= file_size || len == 0 {
             return Ok(0);
         }
@@ -1083,6 +1133,7 @@ impl FuseNode {
     ) -> Result<Arc<crate::mm::page::Page>, SystemError> {
         let md = self.cached_metadata_snapshot().ok_or(SystemError::EIO)?;
         let file_size = md.size.max(0) as usize;
+        self.resolve_pending_short_read_truncate(file_size)?;
         if file_size == 0 || page_index.saturating_mul(MMArch::PAGE_SIZE) >= file_size {
             return Err(SystemError::EINVAL);
         }
@@ -1137,6 +1188,7 @@ impl FuseNode {
 
         let md = self.cached_metadata_snapshot().ok_or(SystemError::EIO)?;
         let file_size = md.size.max(0) as usize;
+        self.resolve_pending_short_read_truncate(file_size)?;
         if file_size == 0 {
             return Ok(0);
         }

@@ -708,6 +708,9 @@ struct fuse_daemon_args {
     uint32_t hello_open_out_flags;
     volatile uint32_t *dynamic_hello_open_out_flags;
     volatile unsigned char *dynamic_hello_first_byte;
+    volatile size_t *dynamic_hello_read_size;
+    volatile size_t *dynamic_hello_byte_offset;
+    volatile unsigned char *dynamic_hello_byte;
     volatile uint32_t *forget_count;
     volatile uint64_t *forget_nlookup_sum;
     volatile uint64_t *forget_trace_nodeids;
@@ -1131,9 +1134,11 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (generated_hello) {
             effective_size = a->hello_generated_size_override;
         }
-        if (h->nodeid == 2 && a->hello_read_size_override > 0
-            && a->hello_read_size_override < effective_size) {
-            effective_size = a->hello_read_size_override;
+        size_t read_size_override = a->dynamic_hello_read_size
+                                        ? *a->dynamic_hello_read_size
+                                        : a->hello_read_size_override;
+        if (h->nodeid == 2 && read_size_override > 0 && read_size_override < effective_size) {
+            effective_size = read_size_override;
         }
         if (in->offset >= effective_size) {
             return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
@@ -1142,6 +1147,10 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
             && *a->dynamic_hello_first_byte != 0
             && node->size > 0) {
             node->data[0] = *a->dynamic_hello_first_byte;
+        }
+        if (!generated_hello && h->nodeid == 2 && a->dynamic_hello_byte_offset
+            && a->dynamic_hello_byte && *a->dynamic_hello_byte_offset < node->size) {
+            node->data[*a->dynamic_hello_byte_offset] = *a->dynamic_hello_byte;
         }
         size_t remain = effective_size - (size_t)in->offset;
         size_t to_copy = in->size;

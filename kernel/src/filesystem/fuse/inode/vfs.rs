@@ -380,7 +380,8 @@ impl IndexNode for FuseNode {
             return Err(SystemError::EINVAL);
         }
         if len > 0 {
-            offset.checked_add(len).ok_or(SystemError::EOVERFLOW)?;
+            let end = offset.checked_add(len).ok_or(SystemError::EOVERFLOW)?;
+            self.resolve_pending_short_read_truncate(end)?;
         }
         let private_data = Self::fuse_file_private_snapshot(&data)?;
         drop(data);
@@ -499,6 +500,9 @@ impl IndexNode for FuseNode {
     fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
         self.check_not_stale()?;
         let old = self.cached_or_fetch_metadata()?;
+        if metadata.size > old.size {
+            self.resolve_pending_short_read_truncate(metadata.size.max(0) as usize)?;
+        }
         let mut valid = 0u32;
         if metadata.mode != old.mode {
             valid |= FATTR_MODE;

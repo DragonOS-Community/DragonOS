@@ -439,9 +439,7 @@ impl Ext4 {
                     ))? as u32;
             // Update bitmap in disk
             bg.desc.set_inode_bitmap_csum(&sb.uuid(), &bitmap);
-            if let Err(error) = self.write_block(&bitmap_block) {
-                return Err(error);
-            }
+            self.write_block(&bitmap_block)?;
 
             // Modify block group counters
             bg.desc

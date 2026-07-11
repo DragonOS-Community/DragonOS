@@ -372,10 +372,15 @@ fn sparse_growth_and_range_writeback_test() {
 
     let attr = ext4.getattr(ino).expect("getattr sparse file failed");
     assert_eq!(attr.size, sparse_size);
-    assert_eq!(attr.blocks, 0, "sparse growth must not allocate data blocks");
+    assert_eq!(
+        attr.blocks, 0,
+        "sparse growth must not allocate data blocks"
+    );
 
     let mut hole = vec![0x5Au8; 8192];
-    let n = ext4.read(ino, 123, &mut hole).expect("read sparse hole failed");
+    let n = ext4
+        .read(ino, 123, &mut hole)
+        .expect("read sparse hole failed");
     assert_eq!(n, hole.len());
     assert!(hole.iter().all(|&b| b == 0), "hole read must return zeros");
 
@@ -386,14 +391,8 @@ fn sparse_growth_and_range_writeback_test() {
 
     let write_offset = 1024 * 1024 + 123;
     let data = vec![0xC3u8; 7000];
-    ext4.prepare_buffered_write(
-        ino,
-        write_offset,
-        data.len(),
-        sparse_size,
-        None,
-    )
-    .expect("prepare buffered sparse write failed");
+    ext4.prepare_buffered_write(ino, write_offset, data.len(), sparse_size, None)
+        .expect("prepare buffered sparse write failed");
     ext4.write_data_only(ino, write_offset, &data)
         .expect("write_data_only after prepare failed");
 

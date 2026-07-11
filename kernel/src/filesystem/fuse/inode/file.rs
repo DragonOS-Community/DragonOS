@@ -112,10 +112,7 @@ impl FuseNode {
             .checked_add(data.len())
             .ok_or(SystemError::EOVERFLOW)?;
         let page_cache = self.ensure_page_cache()?;
-        let file_size = self
-            .cached_or_fetch_metadata()?
-            .size
-            .max(0) as usize;
+        let file_size = self.cached_or_fetch_metadata()?.size.max(0) as usize;
         let start_page = offset >> MMArch::PAGE_SHIFT;
         let end_page = (end - 1) >> MMArch::PAGE_SHIFT;
 
@@ -129,8 +126,8 @@ impl FuseNode {
             let page_start = page_index << MMArch::PAGE_SHIFT;
             let write_start = core::cmp::max(offset, page_start);
             let write_end = core::cmp::min(end, page_start + MMArch::PAGE_SIZE);
-            let full_overwrite = write_start == page_start
-                && write_end - write_start == MMArch::PAGE_SIZE;
+            let full_overwrite =
+                write_start == page_start && write_end - write_start == MMArch::PAGE_SIZE;
             if full_overwrite || page_cache.manager().peek_page(page_index).is_some() {
                 continue;
             }
@@ -148,9 +145,11 @@ impl FuseNode {
             {
                 return Err(SystemError::ESTALE);
             }
-            let _ = page_cache.manager().commit_page_with(page_index, |idx, dst| {
-                self.read_page_with_open(idx, dst, open.fh, open.open_flags)
-            })?;
+            let _ = page_cache
+                .manager()
+                .commit_page_with(page_index, |idx, dst| {
+                    self.read_page_with_open(idx, dst, open.fh, open.open_flags)
+                })?;
         }
 
         let written = page_cache.write(offset, data)?;

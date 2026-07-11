@@ -230,7 +230,9 @@ impl FuseNode {
                 md = local.clone();
             }
         }
-        if self.conn.has_init_flag(super::protocol::FUSE_WRITEBACK_CACHE)
+        if self
+            .conn
+            .has_init_flag(super::protocol::FUSE_WRITEBACK_CACHE)
             && md.file_type == FileType::File
         {
             if let Some(local) = metadata.as_ref() {
@@ -242,15 +244,14 @@ impl FuseNode {
         *metadata = Some(md.clone());
         self.bump_attr_version();
         drop(metadata);
-        self.cached_metadata_deadline_ns
-            .store(
-                if stale_reply {
-                    0
-                } else {
-                    Self::cache_deadline(valid, valid_nsec)
-                },
-                Ordering::Relaxed,
-            );
+        self.cached_metadata_deadline_ns.store(
+            if stale_reply {
+                0
+            } else {
+                Self::cache_deadline(valid, valid_nsec)
+            },
+            Ordering::Relaxed,
+        );
         md
     }
 

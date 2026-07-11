@@ -837,12 +837,8 @@ impl IndexNode for FuseNode {
 
             let mut last_off: u64 = offset;
             if use_readdirplus {
-                last_off = self.parse_readdirplus_payload(
-                    &payload,
-                    &mut names,
-                    last_off,
-                    request_epoch,
-                )?;
+                last_off =
+                    self.parse_readdirplus_payload(&payload, &mut names, last_off, request_epoch)?;
             } else {
                 last_off = Self::parse_readdir_payload(&payload, &mut names, last_off)?;
             }

@@ -535,6 +535,30 @@ impl FuseConn {
             }
             let negotiated_max_pages =
                 core::cmp::min(negotiated_max_pages_raw, max_pages_limit as u16);
+            let (max_background, congestion_threshold) = if negotiated_minor >= 13 {
+                let max_background = if init_out.max_background == 0 {
+                    Self::DEFAULT_MAX_BACKGROUND
+                } else {
+                    init_out.max_background as usize
+                };
+                let congestion = if init_out.congestion_threshold == 0 {
+                    Self::DEFAULT_CONGESTION_THRESHOLD
+                } else {
+                    init_out.congestion_threshold as usize
+                };
+                (
+                    core::cmp::max(1, max_background),
+                    core::cmp::min(
+                        core::cmp::max(1, congestion),
+                        core::cmp::max(1, max_background),
+                    ),
+                )
+            } else {
+                (
+                    Self::DEFAULT_MAX_BACKGROUND,
+                    Self::DEFAULT_CONGESTION_THRESHOLD,
+                )
+            };
 
             self.claim_pending_reply(out_hdr.unique, &pending, |g| {
                 // Align with Linux: only enable feature bits that are in the intersection of
@@ -554,6 +578,8 @@ impl FuseConn {
                 self.reply_layout_minor
                     .store(negotiated_minor, Ordering::Release);
             })?;
+            self.background
+                .configure(max_background, congestion_threshold);
             self.init_wait.wakeup(None);
         } else {
             self.claim_pending_reply(out_hdr.unique, &pending, |_| {})?;

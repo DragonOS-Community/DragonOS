@@ -1,4 +1,4 @@
-use alloc::sync::Arc;
+use alloc::{boxed::Box, sync::Arc};
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use system_error::SystemError;
@@ -6,6 +6,7 @@ use system_error::SystemError;
 use crate::{
     filesystem::vfs::file::FileFlags,
     libs::{errseq::ErrSeqValue, mutex::Mutex, wait_queue::WaitQueue},
+    mm::readahead::FileReadaheadState,
 };
 
 use super::{
@@ -37,6 +38,78 @@ pub struct FuseOpenPrivateData {
     pub no_open: bool,
     pub open_context: FuseOpenContext,
     pub writeback_handle: Option<Arc<FuseWritebackHandle>>,
+    /// Per-open-file-description state. Cloning private data (dup/snapshots)
+    /// keeps one shared sequential-read history.
+    pub readahead_state: Arc<Mutex<FileReadaheadState>>,
+    pub lifetime: Arc<FuseOpenLifetime>,
+}
+
+pub struct FuseOpenLifetime {
+    closing: AtomicBool,
+    inflight: AtomicUsize,
+    deferred_release: Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
+}
+
+impl core::fmt::Debug for FuseOpenLifetime {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FuseOpenLifetime")
+            .field("closing", &self.closing.load(Ordering::Acquire))
+            .field("inflight", &self.inflight.load(Ordering::Acquire))
+            .finish()
+    }
+}
+
+impl FuseOpenLifetime {
+    pub fn new() -> Self {
+        Self {
+            closing: AtomicBool::new(false),
+            inflight: AtomicUsize::new(0),
+            deferred_release: Mutex::new(None),
+        }
+    }
+
+    pub fn try_pin(self: &Arc<Self>) -> Option<FuseOpenLifetimePin> {
+        if self.closing.load(Ordering::Acquire) {
+            return None;
+        }
+        self.inflight.fetch_add(1, Ordering::AcqRel);
+        if self.closing.load(Ordering::Acquire) {
+            self.unpin();
+            return None;
+        }
+        Some(FuseOpenLifetimePin(self.clone()))
+    }
+
+    pub fn close_or_defer(&self, release: impl FnOnce() + Send + 'static) {
+        if self.closing.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let mut deferred = self.deferred_release.lock();
+        if self.inflight.load(Ordering::Acquire) == 0 {
+            drop(deferred);
+            release();
+        } else {
+            *deferred = Some(Box::new(release));
+        }
+    }
+
+    fn unpin(&self) {
+        if self.inflight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let release = self.deferred_release.lock().take();
+            if let Some(release) = release {
+                release();
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct FuseOpenLifetimePin(Arc<FuseOpenLifetime>);
+
+impl Drop for FuseOpenLifetimePin {
+    fn drop(&mut self) {
+        self.0.unpin();
+    }
 }
 
 #[derive(Debug, Clone)]

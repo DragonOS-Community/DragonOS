@@ -708,6 +708,9 @@ struct fuse_daemon_args {
     uint32_t hello_open_out_flags;
     volatile uint32_t *dynamic_hello_open_out_flags;
     volatile unsigned char *dynamic_hello_first_byte;
+    volatile size_t *dynamic_hello_read_size;
+    volatile size_t *dynamic_hello_byte_offset;
+    volatile unsigned char *dynamic_hello_byte;
     volatile uint32_t *forget_count;
     volatile uint64_t *forget_nlookup_sum;
     volatile uint64_t *forget_trace_nodeids;
@@ -817,6 +820,11 @@ struct fuse_daemon_args {
     int force_getxattr_erange_at_max;
     int force_listxattr_erange_at_max;
     int block_read_until_interrupt;
+    int defer_first_read_reply;
+    volatile int *saw_pipelined_read;
+    uint64_t deferred_read_unique;
+    uint64_t deferred_read_offset;
+    uint32_t deferred_read_size;
     size_t hello_data_size_override;
     size_t hello_read_size_override;
     size_t hello_generated_size_override;
@@ -1126,9 +1134,11 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (generated_hello) {
             effective_size = a->hello_generated_size_override;
         }
-        if (h->nodeid == 2 && a->hello_read_size_override > 0
-            && a->hello_read_size_override < effective_size) {
-            effective_size = a->hello_read_size_override;
+        size_t read_size_override = a->dynamic_hello_read_size
+                                        ? *a->dynamic_hello_read_size
+                                        : a->hello_read_size_override;
+        if (h->nodeid == 2 && read_size_override > 0 && read_size_override < effective_size) {
+            effective_size = read_size_override;
         }
         if (in->offset >= effective_size) {
             return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
@@ -1138,10 +1148,50 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
             && node->size > 0) {
             node->data[0] = *a->dynamic_hello_first_byte;
         }
+        if (!generated_hello && h->nodeid == 2 && a->dynamic_hello_byte_offset
+            && a->dynamic_hello_byte && *a->dynamic_hello_byte_offset < node->size) {
+            node->data[*a->dynamic_hello_byte_offset] = *a->dynamic_hello_byte;
+        }
         size_t remain = effective_size - (size_t)in->offset;
         size_t to_copy = in->size;
         if (to_copy > remain) {
             to_copy = remain;
+        }
+        if (generated_hello && a->defer_first_read_reply) {
+            if (a->deferred_read_unique == 0) {
+                a->deferred_read_unique = h->unique;
+                a->deferred_read_offset = in->offset;
+                a->deferred_read_size = (uint32_t)to_copy;
+                return 0;
+            }
+            if (a->saw_pipelined_read) {
+                *a->saw_pipelined_read = 1;
+            }
+            unsigned char *current = (unsigned char *)malloc(to_copy);
+            unsigned char *first = (unsigned char *)malloc(a->deferred_read_size);
+            if (!current || !first) {
+                free(current);
+                free(first);
+                return -1;
+            }
+            for (size_t i = 0; i < to_copy; i++)
+                current[i] = (unsigned char)('A' + ((in->offset + i) % 26));
+            for (size_t i = 0; i < a->deferred_read_size; i++)
+                first[i] = (unsigned char)('A' + ((a->deferred_read_offset + i) % 26));
+            int ret;
+            if (a->defer_first_read_reply == 2) {
+                ret = fuse_write_reply(a->fd, a->deferred_read_unique, 0, first,
+                                       a->deferred_read_size);
+            } else {
+                ret = fuse_write_reply(a->fd, h->unique, 0, current, to_copy);
+                if (ret == 0)
+                    ret = fuse_write_reply(a->fd, a->deferred_read_unique, 0, first,
+                                           a->deferred_read_size);
+            }
+            free(current);
+            free(first);
+            a->deferred_read_unique = 0;
+            return ret;
         }
         if (generated_hello) {
             unsigned char *generated = (unsigned char *)malloc(to_copy);

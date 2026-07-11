@@ -308,7 +308,10 @@ impl IndexNode for FuseNode {
                 if p.no_open {
                     return writeback_result;
                 }
-                self.release_common(FUSE_RELEASE, p.fh, p.open_flags, 0);
+                let node = self.self_ref.upgrade().ok_or(SystemError::EIO)?;
+                p.lifetime.close_or_defer(move || {
+                    node.release_common(FUSE_RELEASE, p.fh, p.open_flags, 0);
+                });
                 writeback_result
             }
             FuseFilePrivateData::Dir(p) => {
@@ -357,7 +360,7 @@ impl IndexNode for FuseNode {
             return self.read_direct_with_open(offset, len, buf, fh, file_flags, lock_owner);
         }
 
-        self.read_cached_with_open(offset, len, buf, fh, file_flags)
+        self.read_cached_with_open(offset, len, buf, &private_data)
     }
 
     fn write_at(
@@ -373,7 +376,8 @@ impl IndexNode for FuseNode {
             return Err(SystemError::EINVAL);
         }
         if len > 0 {
-            offset.checked_add(len).ok_or(SystemError::EOVERFLOW)?;
+            let end = offset.checked_add(len).ok_or(SystemError::EOVERFLOW)?;
+            self.resolve_pending_short_read_truncate(end)?;
         }
         let private_data = Self::fuse_file_private_snapshot(&data)?;
         drop(data);
@@ -492,6 +496,9 @@ impl IndexNode for FuseNode {
     fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
         self.check_not_stale()?;
         let old = self.cached_or_fetch_metadata()?;
+        if metadata.size > old.size {
+            self.resolve_pending_short_read_truncate(metadata.size.max(0) as usize)?;
+        }
         let mut valid = 0u32;
         if metadata.mode != old.mode {
             valid |= FATTR_MODE;
@@ -655,11 +662,14 @@ impl IndexNode for FuseNode {
             .request(FUSE_FALLOCATE, self.nodeid, fuse_pack_struct(&in_arg))
         {
             Ok(_) => {
-                if let Some(md) = self.cached_metadata.lock().as_mut() {
+                let mut metadata = self.cached_metadata.lock();
+                if let Some(md) = metadata.as_mut() {
                     if new_size > md.size.max(0) as usize {
                         md.size = new_size as i64;
+                        self.bump_attr_version();
                     }
                 }
+                drop(metadata);
                 self.cached_metadata_deadline_ns.store(0, Ordering::Relaxed);
                 Ok(())
             }

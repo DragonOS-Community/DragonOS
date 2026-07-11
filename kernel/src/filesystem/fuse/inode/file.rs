@@ -8,8 +8,9 @@ use system_error::SystemError;
 
 use crate::{
     arch::MMArch,
+    exception::workqueue::{schedule_work, Work},
     filesystem::{
-        page_cache::{PageCache, PageCacheBackend},
+        page_cache::{PageCache, PageCacheBackend, PageCacheReadDmaReservation},
         vfs::{file::FileFlags, FilePrivateData, FileType, IndexNode, Metadata, SetMetadataMask},
     },
     libs::mutex::Mutex,
@@ -17,9 +18,10 @@ use crate::{
 };
 
 use super::super::{
-    conn::FuseRequestCred,
+    conn::{BackgroundReadPagesCtx, FuseRequestCred},
     private_data::{
-        FuseFilePrivateData, FuseOpenContext, FuseOpenPrivateData, FuseWritebackHandle,
+        FuseFilePrivateData, FuseOpenContext, FuseOpenLifetime, FuseOpenPrivateData,
+        FuseWritebackHandle,
     },
     protocol::{
         fuse_pack_struct, fuse_read_struct, FuseAttrOut, FuseFlushIn, FuseFsyncIn, FuseOpenIn,
@@ -37,6 +39,13 @@ use super::FuseNode;
 #[derive(Debug)]
 struct FusePageCacheBackend {
     node: Weak<FuseNode>,
+}
+
+struct FillPagesFileCtx {
+    file_size: usize,
+    fh: u64,
+    file_flags: u32,
+    lifetime: Arc<FuseOpenLifetime>,
 }
 
 impl FusePageCacheBackend {
@@ -93,7 +102,7 @@ impl FuseNode {
         self.page_cache.lock().clone()
     }
 
-    fn cached_metadata_snapshot(&self) -> Option<Metadata> {
+    pub(crate) fn cached_metadata_snapshot(&self) -> Option<Metadata> {
         self.cached_metadata.lock().clone()
     }
 
@@ -105,11 +114,26 @@ impl FuseNode {
         Ok(())
     }
 
-    pub(super) fn truncate_page_cache(&self, new_size: usize) -> Result<(), SystemError> {
+    pub(crate) fn truncate_page_cache(&self, new_size: usize) -> Result<(), SystemError> {
         if let Some(cache) = self.cached_page_cache() {
             cache.truncate(new_size)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn discard_completed_pages_beyond(
+        &self,
+        target: &PageCacheReadDmaReservation,
+        eof: usize,
+    ) {
+        let Some(cache) = self.cached_page_cache() else {
+            return;
+        };
+        for descriptor in target.descriptors() {
+            if descriptor.page_index().saturating_mul(MMArch::PAGE_SIZE) >= eof {
+                let _ = cache.manager().discard_clean_page(descriptor.page_index());
+            }
+        }
     }
 
     pub(super) fn setattr_size(
@@ -120,6 +144,7 @@ impl FuseNode {
         truncate_metadata: Option<(&Metadata, SetMetadataMask)>,
     ) -> Result<(), SystemError> {
         self.check_not_stale()?;
+        self.resolve_pending_short_read_truncate(len)?;
         let mut valid = FATTR_SIZE;
         if lock_owner.is_some() {
             valid |= FATTR_LOCKOWNER;
@@ -204,11 +229,12 @@ impl FuseNode {
         Ok(())
     }
 
-    fn note_short_read_eof(
+    pub(crate) fn note_short_read_eof(
         &self,
         page_index: usize,
         read_len: usize,
         observed_size: usize,
+        observed_attr_version: u64,
     ) -> Result<(usize, bool), SystemError> {
         let eof = page_index
             .checked_mul(MMArch::PAGE_SIZE)
@@ -219,15 +245,76 @@ impl FuseNode {
             let mut guard = self.cached_metadata.lock();
             if let Some(md) = guard.as_mut() {
                 let current_size = md.size.max(0) as usize;
-                if current_size == observed_size && eof < current_size {
+                let current_version = self.attr_version();
+                let first_from_snapshot =
+                    current_version == observed_attr_version && current_size == observed_size;
+                let continues_short_read_chain =
+                    self.short_read_source_attr_version.load(Ordering::Acquire)
+                        == observed_attr_version
+                        && self.short_read_chain_attr_version.load(Ordering::Acquire)
+                            == current_version
+                        && current_size <= observed_size;
+                if (first_from_snapshot || continues_short_read_chain) && eof < current_size {
                     md.size = eof as i64;
+                    let chain_version = self.bump_attr_version();
+                    self.short_read_source_attr_version
+                        .store(observed_attr_version, Ordering::Release);
+                    self.short_read_chain_attr_version
+                        .store(chain_version, Ordering::Release);
+                    self.pending_short_read_eof
+                        .fetch_min(eof as u64, Ordering::AcqRel);
                     self.cached_metadata_deadline_ns
                         .store(u64::MAX, Ordering::Relaxed);
+                    if let Some(cache) = self.cached_page_cache() {
+                        let start_page = eof / MMArch::PAGE_SIZE;
+                        schedule_work(Work::new(move || {
+                            if let Err(error) = cache.unmap_mapping_pages_even_cow(start_page, None)
+                            {
+                                log::warn!(
+                                    "fuse: short-read mapping invalidation failed eof={} err={:?}",
+                                    eof,
+                                    error
+                                );
+                            }
+                        }));
+                    }
                     should_truncate = true;
                 }
             }
         }
         Ok((eof, should_truncate))
+    }
+
+    /// Finish an inode-wide page-cache truncate only when a later metadata
+    /// refresh grows the file past an EOF established by a short READ.
+    ///
+    /// Running `PageCache::truncate()` from the FUSE reply completion would
+    /// deadlock a single-threaded daemon when it waits for another outstanding
+    /// readahead page. Deferring it to the next operation that can expose or
+    /// create data past that EOF preserves coherence without blocking the
+    /// daemon's reply path.
+    pub(super) fn resolve_pending_short_read_truncate(
+        &self,
+        visible_size: usize,
+    ) -> Result<(), SystemError> {
+        let eof = self.pending_short_read_eof.load(Ordering::Acquire);
+        if eof == u64::MAX || visible_size <= eof as usize {
+            return Ok(());
+        }
+
+        self.truncate_pending_short_read_eof(eof)?;
+        Ok(())
+    }
+
+    fn truncate_pending_short_read_eof(&self, eof: u64) -> Result<(), SystemError> {
+        self.truncate_page_cache(eof as usize)?;
+        let _ = self.pending_short_read_eof.compare_exchange(
+            eof,
+            u64::MAX,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        Ok(())
     }
 
     /// Linux `fuse_send_open()` forwards file flags except creation-only bits.
@@ -477,6 +564,8 @@ impl FuseNode {
                 no_open,
                 open_context,
                 writeback_handle,
+                readahead_state: Arc::new(Mutex::new(FileReadaheadState::new())),
+                lifetime: Arc::new(FuseOpenLifetime::new()),
             })),
             FUSE_OPENDIR => FilePrivateData::Fuse(FuseFilePrivateData::Dir(FuseOpenPrivateData {
                 conn: conn_any,
@@ -487,6 +576,8 @@ impl FuseNode {
                 no_open,
                 open_context,
                 writeback_handle: None,
+                readahead_state: Arc::new(Mutex::new(FileReadaheadState::new())),
+                lifetime: Arc::new(FuseOpenLifetime::new()),
             })),
             _ => return Err(SystemError::EINVAL),
         };
@@ -512,6 +603,7 @@ impl FuseNode {
             let mut guard = self.cached_metadata.lock();
             if let Some(md) = guard.as_mut() {
                 md.size = 0;
+                self.bump_attr_version();
             }
         } else if (fopen_flags & FOPEN_KEEP_CACHE) == 0 {
             self.invalidate_clean_page_cache()?;
@@ -751,11 +843,10 @@ impl FuseNode {
         page_cache: &Arc<PageCache>,
         start_page: usize,
         end_page: usize,
-        file_size: usize,
-        fh: u64,
-        file_flags: u32,
+        demand_end_page: usize,
+        file_ctx: &FillPagesFileCtx,
     ) -> Result<(usize, Option<usize>), SystemError> {
-        if start_page >= end_page || file_size == 0 {
+        if start_page >= end_page || file_ctx.file_size == 0 {
             return Ok((0, None));
         }
 
@@ -766,7 +857,11 @@ impl FuseNode {
             core::cmp::min(max_pages_by_read, self.conn().max_pages()),
         );
         let mut total_read = 0usize;
-        let mut truncate_eof = None;
+        let truncate_eof = None;
+        let mut pending_reads = Vec::new();
+        let mut submission_error = None;
+        let observed_attr_version = self.attr_version();
+        let mut submitted_requests = 0usize;
 
         let mut idx = start_page;
         while idx < end_page {
@@ -787,7 +882,7 @@ impl FuseNode {
             let read_offset = run_start
                 .checked_mul(MMArch::PAGE_SIZE)
                 .ok_or(SystemError::EOVERFLOW)?;
-            if read_offset >= file_size {
+            if read_offset >= file_ctx.file_size {
                 break;
             }
 
@@ -796,18 +891,24 @@ impl FuseNode {
                 .ok_or(SystemError::EOVERFLOW)?;
             let read_len = core::cmp::min(
                 core::cmp::min(read_pages_len, max_read),
-                file_size - read_offset,
+                file_ctx.file_size - read_offset,
             );
             if read_len == 0 {
                 break;
             }
 
+            let speculative = run_start >= demand_end_page;
             let target = match page_cache
                 .manager()
                 .reserve_read_dma(run_start, run_end - run_start)
             {
                 Ok(target) => Arc::new(target),
                 Err(SystemError::EEXIST) => {
+                    if speculative {
+                        // The foreground read has no dependency on a conflicting
+                        // speculative window. Do not inherit its latency or error.
+                        break;
+                    }
                     // A concurrent reader won the reservation race. Wait for its first page to
                     // leave Loading, then rebuild the missing run from current cache state.
                     drop(page_cache.manager().commit_page(run_start)?);
@@ -816,49 +917,93 @@ impl FuseNode {
                 Err(error) => return Err(error),
             };
             let read_in = FuseReadIn {
-                fh,
+                fh: file_ctx.fh,
                 offset: read_offset as u64,
                 size: read_len as u32,
                 read_flags: 0,
                 lock_owner: 0,
-                flags: file_flags,
+                flags: file_ctx.file_flags,
                 padding: 0,
             };
-            let result = self.conn().request_read_pages(
-                self.nodeid,
-                fuse_pack_struct(&read_in),
-                target.clone(),
-                FuseRequestCred::from_current(),
-            )?;
-            let bytes_read = match result {
-                FuseReadPagesReply::Direct { bytes } => {
-                    if bytes > read_len {
-                        let _ = target.rollback(SystemError::EIO);
-                        return Err(SystemError::EIO);
-                    }
-                    target.publish_completed(bytes)?;
-                    bytes
-                }
-                FuseReadPagesReply::Contiguous(reply) => {
-                    if reply.len() > read_len {
-                        return Err(SystemError::EIO);
-                    }
-                    let bytes = reply.len();
-                    target.publish_contiguous(&reply)?;
-                    bytes
-                }
-            };
-            total_read += bytes_read.div_ceil(MMArch::PAGE_SIZE);
-
-            if bytes_read < read_len {
-                let (eof, should_truncate) =
-                    self.note_short_read_eof(run_start, bytes_read, file_size)?;
-                if should_truncate {
-                    truncate_eof = Some(eof);
+            let Some(open_pin) = file_ctx.lifetime.try_pin() else {
+                let _ = target.rollback(SystemError::EIO);
+                if !speculative {
+                    submission_error = Some(SystemError::EIO);
                 }
                 break;
+            };
+            let pending = self.conn().enqueue_background_read_pages(
+                self.nodeid,
+                fuse_pack_struct(&read_in),
+                FuseRequestCred::from_current(),
+                speculative,
+                BackgroundReadPagesCtx {
+                    destination: target.clone(),
+                    node: self.self_ref.clone(),
+                    start_page: run_start,
+                    requested: read_len,
+                    observed_size: file_ctx.file_size,
+                    observed_attr_version,
+                    open_pin,
+                },
+            );
+            let pending = match pending {
+                Ok(Some(pending)) => pending,
+                Ok(None) => {
+                    let _ = target.rollback(SystemError::EIO);
+                    break;
+                }
+                Err(error) => {
+                    let _ = target.rollback(error.clone());
+                    if !speculative {
+                        submission_error = Some(error);
+                    }
+                    break;
+                }
+            };
+            submitted_requests += 1;
+            if !speculative {
+                pending_reads.push((read_len, pending));
             }
             idx = run_end;
+        }
+
+        let mut first_error = submission_error;
+        let mut interrupted = false;
+        super::super::stats::on_readahead_batch(
+            end_page.saturating_sub(start_page),
+            submitted_requests,
+        );
+        for (read_len, pending) in pending_reads {
+            let (result, was_interrupted) = self.conn().wait_background_read_pages(&pending);
+            interrupted |= was_interrupted;
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    if interrupted {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let bytes_read = match result {
+                FuseReadPagesReply::Direct { bytes } => bytes,
+                FuseReadPagesReply::Contiguous(reply) => reply.len(),
+            };
+            if bytes_read > read_len {
+                return Err(SystemError::EIO);
+            }
+            total_read += bytes_read.div_ceil(MMArch::PAGE_SIZE);
+        }
+
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        if interrupted {
+            return Err(SystemError::EINTR);
         }
 
         Ok((total_read, truncate_eof))
@@ -869,11 +1014,14 @@ impl FuseNode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        fh: u64,
-        file_flags: u32,
+        open: &FuseOpenPrivateData,
     ) -> Result<usize, SystemError> {
+        let fh = open.fh;
+        let file_flags = open.open_flags;
+        let ra_state = &open.readahead_state;
         let md = self.cached_or_fetch_metadata()?;
         let file_size = md.size.max(0) as usize;
+        self.resolve_pending_short_read_truncate(file_size)?;
         if offset >= file_size || len == 0 {
             return Ok(0);
         }
@@ -884,9 +1032,32 @@ impl FuseNode {
         let page_cache = self.ensure_page_cache()?;
         let _invalidate = page_cache.invalidate_read();
         let last_file_page = (file_size - 1) >> MMArch::PAGE_SHIFT;
-        let max_pages_by_read = core::cmp::max(1, self.conn().max_read() >> MMArch::PAGE_SHIFT);
-        let max_pages_by_conn = core::cmp::min(max_pages_by_read, self.conn().max_pages());
-        let readaround_pages = core::cmp::min(max_pages_by_conn, 16);
+        let max_window = core::cmp::max(
+            1,
+            core::cmp::min(
+                self.conn().max_readahead_pages(),
+                FileReadaheadState::new().ra_pages,
+            ),
+        );
+        let demand_pages = end_page_index - start_page_index + 1;
+        let readaround_pages = {
+            let mut state = ra_state.lock();
+            let sequential = start_page_index == 0 || state.first_sequential(start_page_index);
+            let pages = if sequential {
+                let base = core::cmp::max(demand_pages, state.size.max(1));
+                core::cmp::min(
+                    max_window,
+                    core::cmp::max(demand_pages, base.saturating_mul(2)),
+                )
+            } else {
+                demand_pages
+            };
+            state.start = start_page_index;
+            state.size = pages;
+            state.async_size = pages.saturating_sub(demand_pages);
+            state.prev_index = end_page_index as i64;
+            pages
+        };
         let prefetch_end = core::cmp::min(
             last_file_page + 1,
             core::cmp::max(
@@ -894,14 +1065,20 @@ impl FuseNode {
                 start_page_index.saturating_add(readaround_pages),
             ),
         );
+        let file_ctx = FillPagesFileCtx {
+            file_size,
+            fh,
+            file_flags,
+            lifetime: open.lifetime.clone(),
+        };
         let (_, mut truncate_eof) = self.fill_page_cache_range_with_open(
             &page_cache,
             start_page_index,
             prefetch_end,
-            file_size,
-            fh,
-            file_flags,
+            end_page_index + 1,
+            &file_ctx,
         )?;
+        let observed_attr_version = self.attr_version();
 
         let mut dst_offset = 0usize;
         for page_index in start_page_index..=end_page_index {
@@ -926,8 +1103,12 @@ impl FuseNode {
             let mut copy_end = copy_end;
             if let Some(read_len) = filled_len {
                 if read_len < MMArch::PAGE_SIZE {
-                    let (eof, should_truncate) =
-                        self.note_short_read_eof(page_index, read_len, file_size)?;
+                    let (eof, should_truncate) = self.note_short_read_eof(
+                        page_index,
+                        read_len,
+                        file_size,
+                        observed_attr_version,
+                    )?;
                     copy_end = core::cmp::min(copy_end, eof);
                     if should_truncate {
                         truncate_eof = Some(eof);
@@ -981,10 +1162,12 @@ impl FuseNode {
     ) -> Result<Arc<crate::mm::page::Page>, SystemError> {
         let md = self.cached_metadata_snapshot().ok_or(SystemError::EIO)?;
         let file_size = md.size.max(0) as usize;
+        self.resolve_pending_short_read_truncate(file_size)?;
         if file_size == 0 || page_index.saturating_mul(MMArch::PAGE_SIZE) >= file_size {
             return Err(SystemError::EINVAL);
         }
         let page_cache = self.ensure_page_cache()?;
+        let observed_attr_version = self.attr_version();
         let mut filled_len = None;
         let page = page_cache
             .manager()
@@ -995,7 +1178,12 @@ impl FuseNode {
             })?;
         if let Some(read_len) = filled_len {
             if read_len < MMArch::PAGE_SIZE {
-                let (eof, _) = self.note_short_read_eof(page_index, read_len, file_size)?;
+                let (eof, _) = self.note_short_read_eof(
+                    page_index,
+                    read_len,
+                    file_size,
+                    observed_attr_version,
+                )?;
                 if page_index.saturating_mul(MMArch::PAGE_SIZE) >= eof {
                     drop(page);
                     page_cache.manager().discard_clean_page(page_index)?;
@@ -1022,6 +1210,7 @@ impl FuseNode {
         ra_state: &mut FileReadaheadState,
         fh: u64,
         file_flags: u32,
+        lifetime: Arc<FuseOpenLifetime>,
     ) -> Result<usize, SystemError> {
         if req_pages == 0 {
             return Ok(0);
@@ -1029,6 +1218,7 @@ impl FuseNode {
 
         let md = self.cached_metadata_snapshot().ok_or(SystemError::EIO)?;
         let file_size = md.size.max(0) as usize;
+        self.resolve_pending_short_read_truncate(file_size)?;
         if file_size == 0 {
             return Ok(0);
         }
@@ -1051,13 +1241,18 @@ impl FuseNode {
         let pages_to_read = core::cmp::min(max_pages, core::cmp::max(req_pages, 16));
         let end_page = core::cmp::min(last_file_page + 1, page_index.saturating_add(pages_to_read));
 
+        let file_ctx = FillPagesFileCtx {
+            file_size,
+            fh,
+            file_flags,
+            lifetime,
+        };
         let (total_read, truncate_eof) = self.fill_page_cache_range_with_open(
             &page_cache,
             page_index,
             end_page,
-            file_size,
-            fh,
-            file_flags,
+            page_index.saturating_add(req_pages),
+            &file_ctx,
         )?;
 
         if let Some(eof) = truncate_eof {
@@ -1139,11 +1334,15 @@ impl FuseNode {
             return Ok(());
         }
         let end = offset.checked_add(len).ok_or(SystemError::EOVERFLOW)?;
-        if let Some(md) = self.cached_metadata.lock().as_mut() {
+        let mut metadata = self.cached_metadata.lock();
+        if let Some(md) = metadata.as_mut() {
             if end > md.size.max(0) as usize {
                 md.size = end as i64;
             }
         }
+        // Every successful write is a mutation fence for READ replies issued
+        // from an older metadata snapshot, even when it does not extend size.
+        self.bump_attr_version();
         Ok(())
     }
 

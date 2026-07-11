@@ -686,12 +686,18 @@ impl FileSystem for FuseFS {
         };
         drop(vma_guard);
 
-        let (node, fh, file_flags, fopen_flags) = {
+        let (node, fh, file_flags, fopen_flags, lifetime) = {
             let data = file.private_data.lock();
             let FilePrivateData::Fuse(FuseFilePrivateData::File(p)) = &*data else {
                 return VmFaultReason::VM_FAULT_SIGBUS;
             };
-            (p.node.clone(), p.fh, p.open_flags, p.fopen_flags)
+            (
+                p.node.clone(),
+                p.fh,
+                p.open_flags,
+                p.fopen_flags,
+                p.lifetime.clone(),
+            )
         };
         if (fopen_flags & FOPEN_DIRECT_IO) != 0 && vm_flags.contains(VmFlags::VM_MAYSHARE) {
             return VmFaultReason::VM_FAULT_SIGBUS;
@@ -707,7 +713,14 @@ impl FileSystem for FuseFS {
 
         if major {
             let mut ra_state = file.get_ra_state();
-            let _ = node.mmap_readahead_with_open(page_index, 1, &mut ra_state, fh, file_flags);
+            let _ = node.mmap_readahead_with_open(
+                page_index,
+                1,
+                &mut ra_state,
+                fh,
+                file_flags,
+                lifetime,
+            );
             let _ = file.set_ra_state(ra_state);
         }
 

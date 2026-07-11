@@ -192,7 +192,21 @@ impl Debug for VethDriver {
 }
 
 impl VethDriver {
-    const MAX_FRAME_LEN: usize = 1514;
+    const MAX_UNTAGGED_FRAME_LEN: usize = 1514;
+    const MAX_VLAN_FRAME_LEN: usize = Self::MAX_UNTAGGED_FRAME_LEN + 4;
+
+    fn validate_frame_len(frame: &[u8]) -> Result<(), SystemError> {
+        if frame.len() <= Self::MAX_UNTAGGED_FRAME_LEN {
+            return Ok(());
+        }
+        let vlan_tagged = frame.len() >= 14
+            && matches!(u16::from_be_bytes([frame[12], frame[13]]), 0x8100 | 0x88a8);
+        if vlan_tagged && frame.len() <= Self::MAX_VLAN_FRAME_LEN {
+            Ok(())
+        } else {
+            Err(SystemError::EMSGSIZE)
+        }
+    }
 
     /// # `new_pair`
     /// 创建一对虚拟以太网设备（veth pair），用于网络测试
@@ -233,9 +247,7 @@ impl VethDriver {
     }
 
     fn submit_frame(&self, frame: Vec<u8>) -> Result<(), SystemError> {
-        if frame.len() > Self::MAX_FRAME_LEN {
-            return Err(SystemError::EMSGSIZE);
-        }
+        Self::validate_frame_len(&frame)?;
         let peer = self
             .inner
             .lock()
@@ -246,9 +258,7 @@ impl VethDriver {
     }
 
     pub fn try_raw_transmit(&self, frame: &[u8]) -> Result<(), SystemError> {
-        if frame.len() > Self::MAX_FRAME_LEN {
-            return Err(SystemError::EMSGSIZE);
-        }
+        Self::validate_frame_len(frame)?;
         self.submit_frame(frame.to_vec())
     }
 }

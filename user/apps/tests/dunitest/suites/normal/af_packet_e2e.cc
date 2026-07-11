@@ -62,6 +62,7 @@ namespace {
 inline constexpr int kArpPktLen = 28;
 inline constexpr int kEthHdrLen = 14;
 inline constexpr int kArpFrameLen = kEthHdrLen + kArpPktLen;  // 42
+inline constexpr size_t kVlanFrameLen = 1518;
 inline constexpr int kEthFrameLen = 1514;
 
 inline constexpr const char* kLocalIp = "10.0.2.15";
@@ -660,6 +661,51 @@ TEST(AfPacketE2E, PeekDoesNotConsumeFrame) {
     EXPECT_EQ(std::memcmp(peek_buf, recv_buf, static_cast<size_t>(received)), 0);
     EXPECT_EQ(peek_from.sll_protocol, recv_from.sll_protocol);
     EXPECT_EQ(peek_from.sll_pkttype, recv_from.sll_pkttype);
+}
+
+TEST(AfPacketE2E, VethAcceptsFullMtuVlanFrame) {
+    const std::string ifname = "veth1";
+    int ifindex = ProbeIfindex(ifname);
+    if (ifindex < 0) {
+        GTEST_SKIP() << "veth1 is unavailable";
+    }
+
+    FdGuard fd(socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL)));
+    ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+    uint8_t local_mac[6];
+    GetIfHwaddr(fd.Get(), ifname, local_mac);
+
+    uint8_t frame[kVlanFrameLen]{};
+    std::memset(frame, 0xff, 6);
+    std::memcpy(frame + 6, local_mac, 6);
+    frame[12] = 0x08;
+    frame[13] = 0x00;
+
+    struct sockaddr_ll dst{};
+    dst.sll_family = AF_PACKET;
+    dst.sll_protocol = htons(0x8100);
+    dst.sll_ifindex = ifindex;
+    dst.sll_hatype = ARPHRD_ETHER;
+    dst.sll_halen = ETH_ALEN;
+    std::memset(dst.sll_addr, 0xff, ETH_ALEN);
+
+    errno = 0;
+    EXPECT_EQ(sendto(fd.Get(), frame, sizeof(frame), 0,
+                     reinterpret_cast<struct sockaddr*>(&dst), sizeof(dst)),
+              -1);
+    EXPECT_EQ(errno, EMSGSIZE);
+
+    frame[12] = 0x81;
+    frame[13] = 0x00;
+    frame[14] = 0x00;
+    frame[15] = 0x01;
+    frame[16] = 0x08;
+    frame[17] = 0x00;
+
+    EXPECT_EQ(sendto(fd.Get(), frame, sizeof(frame), 0,
+                     reinterpret_cast<struct sockaddr*>(&dst), sizeof(dst)),
+              static_cast<ssize_t>(sizeof(frame)))
+        << ErrnoString(errno);
 }
 
 int main(int argc, char** argv) {

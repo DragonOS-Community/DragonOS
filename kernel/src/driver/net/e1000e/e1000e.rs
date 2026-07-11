@@ -568,20 +568,14 @@ impl Drop for E1000EDevice {
         unsafe {
             // 释放所有buffer中的dma页
             // free all dma pages in buffers
-            for buffer in self.recv_buffers.drain(..recv_ring_length) {
-                if let Some(buffer) = buffer {
-                    buffer.free_buffer();
-                }
+            for buffer in self.recv_buffers.drain(..recv_ring_length).flatten() {
+                buffer.free_buffer();
             }
-            for buffer in self.trans_buffers.drain(..trans_ring_length) {
-                if let Some(buffer) = buffer {
-                    buffer.free_buffer();
-                }
+            for buffer in self.trans_buffers.drain(..trans_ring_length).flatten() {
+                buffer.free_buffer();
             }
-            for buffer in self.napi_buffers.drain(..) {
-                if let Some(buffer) = buffer {
-                    buffer.free_buffer();
-                }
+            for buffer in self.napi_buffers.drain(..).flatten() {
+                buffer.free_buffer();
             }
             // 释放descriptor ring
             // free descriptor ring

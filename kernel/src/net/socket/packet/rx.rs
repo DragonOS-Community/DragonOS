@@ -13,7 +13,14 @@ use super::{
     ReceivedPacket, SockAddrLl, TpacketAuxdata,
 };
 
-fn parse_frame(frame: &[u8]) -> Option<([u8; 6], [u8; 6], u16, Option<(u16, u16)>)> {
+struct ParsedFrame {
+    dst: [u8; 6],
+    src: [u8; 6],
+    protocol: u16,
+    vlan: Option<(u16, u16)>,
+}
+
+fn parse_frame(frame: &[u8]) -> Option<ParsedFrame> {
     if frame.len() < 14 {
         return None;
     }
@@ -26,9 +33,19 @@ fn parse_frame(frame: &[u8]) -> Option<([u8; 6], [u8; 6], u16, Option<(u16, u16)
         }
         let tci = u16::from_be_bytes([frame[14], frame[15]]);
         let protocol = u16::from_be_bytes([frame[16], frame[17]]);
-        Some((dst, src, protocol, Some((tci, outer))))
+        Some(ParsedFrame {
+            dst,
+            src,
+            protocol,
+            vlan: Some((tci, outer)),
+        })
     } else {
-        Some((dst, src, outer, None))
+        Some(ParsedFrame {
+            dst,
+            src,
+            protocol: outer,
+            vlan: None,
+        })
     }
 }
 
@@ -38,7 +55,13 @@ impl PacketSocket {
         if bound_protocol == 0 || (bound_ifindex != 0 && bound_ifindex != ifindex) {
             return;
         }
-        let Some((dst, src, protocol, vlan)) = parse_frame(frame) else {
+        let Some(ParsedFrame {
+            dst,
+            src,
+            protocol,
+            vlan,
+        }) = parse_frame(frame)
+        else {
             return;
         };
         if bound_protocol != eth_protocol::ETH_P_ALL && bound_protocol != protocol {

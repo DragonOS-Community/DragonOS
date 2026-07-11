@@ -33,6 +33,16 @@
 // Ethernet protocol: ETH_P_ALL = 0x0003 (receive all protocols)
 inline constexpr int kEthPAll = 0x0003;
 
+struct TestSockAddrLl {
+    uint16_t sll_family;
+    uint16_t sll_protocol;
+    int32_t sll_ifindex;
+    uint16_t sll_hatype;
+    uint8_t sll_pkttype;
+    uint8_t sll_halen;
+    uint8_t sll_addr[8];
+};
+
 // SOL_PACKET level socket options (matching Linux if_packet.h)
 #ifndef PACKET_ADD_MEMBERSHIP
 #define PACKET_ADD_MEMBERSHIP 1
@@ -140,6 +150,27 @@ TEST(AfPacketSockopt, CreateRawSocket) {
 TEST(AfPacketSockopt, CreateDgramSocket) {
     FdGuard fd(socket(AF_PACKET, SOCK_DGRAM, htons(kEthPAll)));
     ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+}
+
+// Linux 6.6 packet_do_bind() substitutes po->num when sll_protocol is zero.
+// Binding with protocol zero therefore selects only the interface and keeps
+// the protocol supplied to socket(), rather than disabling packet delivery.
+TEST(AfPacketSockopt, ZeroBindProtocolKeepsSocketProtocol) {
+    FdGuard fd(MakeRawFd());
+    ASSERT_GE(fd.Get(), 0);
+
+    TestSockAddrLl bind_addr{};
+    bind_addr.sll_family = AF_PACKET;
+    ASSERT_EQ(bind(fd.Get(), reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)), 0)
+        << ErrnoString(errno);
+
+    TestSockAddrLl local_addr{};
+    socklen_t local_len = sizeof(local_addr);
+    ASSERT_EQ(getsockname(fd.Get(), reinterpret_cast<sockaddr*>(&local_addr), &local_len), 0)
+        << ErrnoString(errno);
+    EXPECT_GE(local_len, 12U);
+    EXPECT_LE(local_len, sizeof(local_addr));
+    EXPECT_EQ(ntohs(local_addr.sll_protocol), kEthPAll);
 }
 
 // ===== Test 3: PACKET_AUXDATA set to 1 round-trip =====

@@ -13,6 +13,6 @@ pub use constants::{BLOCK_SIZE, EXT4_ROOT_INO, INODE_BLOCK_SIZE};
 pub use error::{ErrCode, Ext4Error};
 pub use ext4::{Ext4, SetAttr};
 pub use ext4_defs::{
-    Block, BlockDevice, DirEntry, FileAttr, FileType, Inode, InodeMode, InodeReclaimHandle,
-    InodeRef,
+    Block, BlockDevice, DirEntry, FileAttr, FileType, Inode, InodeMode, InodeReclaimError,
+    InodeReclaimHandle, InodeRef,
 };

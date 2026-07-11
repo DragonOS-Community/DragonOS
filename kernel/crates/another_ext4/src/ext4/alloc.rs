@@ -194,7 +194,17 @@ impl Ext4 {
     /// Validation and reclamation share the inode mutation shard.  The inode is
     /// re-read from disk so an unlink-time value snapshot can never discard
     /// blocks or xattrs added by later writeback.
-    pub fn reclaim_inode(&self, handle: InodeReclaimHandle) -> Result<()> {
+    pub fn reclaim_inode(
+        &self,
+        handle: InodeReclaimHandle,
+    ) -> core::result::Result<(), InodeReclaimError> {
+        match self.reclaim_inode_inner(&handle) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(InodeReclaimError::new(error, handle)),
+        }
+    }
+
+    fn reclaim_inode_inner(&self, handle: &InodeReclaimHandle) -> Result<()> {
         self.ensure_mutable()?;
         let _mutation_guard =
             self.inode_mutation_locks[self.inode_mutation_lock_index(handle.inode_id)].lock();

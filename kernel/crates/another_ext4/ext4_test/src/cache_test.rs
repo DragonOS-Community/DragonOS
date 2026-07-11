@@ -492,6 +492,28 @@ pub fn deferred_reclaim_lifecycle_test(ext4: &Ext4) {
     ext4.reclaim_inode(handle).expect("victim reclaim failed");
     assert!(ext4.getattr(victim).is_err());
 
+    let retry_victim = ext4
+        .create(ROOT_INO, "reclaim_retry_victim", mode)
+        .expect("create retry victim failed");
+    let retry_handle = ext4
+        .unlink(ROOT_INO, "reclaim_retry_victim")
+        .expect("unlink retry victim failed")
+        .expect("final unlink must return a retry handle");
+    ext4.link(retry_victim, ROOT_INO, "reclaim_retry_link")
+        .expect("restore retry victim link failed");
+    let failure = ext4
+        .reclaim_inode(retry_handle)
+        .expect_err("linked inode reclaim must fail");
+    let (error, returned_handle) = failure.into_parts();
+    assert_eq!(error.code(), another_ext4::ErrCode::EINVAL);
+    assert_eq!(returned_handle.inode_id(), retry_victim);
+    drop(returned_handle);
+    reclaim(
+        ext4,
+        ext4.unlink(ROOT_INO, "reclaim_retry_link")
+            .expect("cleanup retry victim failed"),
+    );
+
     let source = ext4
         .create(ROOT_INO, "rename_source", mode)
         .expect("create source failed");

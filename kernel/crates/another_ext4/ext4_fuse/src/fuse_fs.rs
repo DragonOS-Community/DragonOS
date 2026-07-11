@@ -119,8 +119,13 @@ impl<T: 'static> StateExt4FuseFs<T> {
 
     fn queue_reclaim(&mut self, handle: InodeReclaimHandle) -> Result<(), Ext4Error> {
         let inode = handle.inode_id();
-        if self.pending_reclaims.insert(inode, handle).is_some() {
-            return Err(Ext4Error::new(ErrCode::EINVAL));
+        match self.pending_reclaims.entry(inode) {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                return Err(Ext4Error::new(ErrCode::EINVAL));
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(handle);
+            }
         }
         self.try_reclaim(inode)
     }
@@ -134,7 +139,11 @@ impl<T: 'static> StateExt4FuseFs<T> {
             .any(|open_inode| *open_inode == inode);
         if !looked_up && !opened {
             if let Some(handle) = self.pending_reclaims.remove(&inode) {
-                self.fs.reclaim_inode(handle)?;
+                if let Err(failure) = self.fs.reclaim_inode(handle) {
+                    let (error, handle) = failure.into_parts();
+                    self.pending_reclaims.insert(inode, handle);
+                    return Err(error);
+                }
             }
         }
         Ok(())

@@ -1113,6 +1113,28 @@ TEST(OverlayFsSemantics, DetachedOldDirectoryIsNotReusedForAncestorCopyUp) {
     EXPECT_EQ(0, close(old_dir_fd)) << strerror(errno);
 }
 
+TEST(TmpfsSemantics, RemovedDirectoryFdRejectsNamespaceMutations) {
+    std::string root = "/tmp/tmpfs_dead_dir_" + std::to_string(getpid());
+    std::string dir = join_path(root, "dir");
+
+    ASSERT_EQ(0, mkdir(root.c_str(), 0755)) << strerror(errno);
+    ASSERT_EQ(0, mkdir(dir.c_str(), 0755)) << strerror(errno);
+    int dir_fd = open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    ASSERT_GE(dir_fd, 0) << strerror(errno);
+    ASSERT_EQ(0, rmdir(dir.c_str())) << strerror(errno);
+
+    errno = 0;
+    EXPECT_EQ(-1, mkdirat(dir_fd, "child", 0755));
+    EXPECT_EQ(ENOENT, errno);
+
+    errno = 0;
+    EXPECT_EQ(-1, renameat(dir_fd, "missing", dir_fd, "missing"));
+    EXPECT_EQ(ENOENT, errno);
+
+    EXPECT_EQ(0, close(dir_fd)) << strerror(errno);
+    EXPECT_EQ(0, rmdir(root.c_str())) << strerror(errno);
+}
+
 TEST(OverlayFsSemantics, ConcurrentChildrenShareAncestorPublication) {
     constexpr int kParentCount = 32;
     constexpr int kEvictionLookups = 1100;

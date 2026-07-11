@@ -94,9 +94,8 @@ fn tmpfs_move_entry_between_dirs(
     new_key: &DName,
     flags: RenameFlags,
 ) -> Result<(), SystemError> {
-    if src_dir.metadata.file_type != FileType::Dir || dst_dir.metadata.file_type != FileType::Dir {
-        return Err(SystemError::ENOTDIR);
-    }
+    tmpfs_require_live_dir(src_dir)?;
+    tmpfs_require_live_dir(dst_dir)?;
 
     let src_self = src_dir.self_ref.upgrade().ok_or(SystemError::EIO)?;
     let dst_self = dst_dir.self_ref.upgrade().ok_or(SystemError::EIO)?;
@@ -117,6 +116,7 @@ fn tmpfs_move_entry_between_dirs(
         if Arc::ptr_eq(&inode_to_move, &existing) {
             return Ok(());
         }
+        let now = PosixTimeSpec::now();
         let existing_type = existing.0.lock().metadata.file_type;
 
         src_dir.children.insert(old_key.clone(), existing.clone());
@@ -136,12 +136,16 @@ fn tmpfs_move_entry_between_dirs(
             let mut moved = inode_to_move.0.lock();
             moved.parent = Arc::downgrade(&dst_self);
             moved.name = new_key.clone();
+            moved.metadata.ctime = now;
         }
         {
             let mut replaced = existing.0.lock();
             replaced.parent = Arc::downgrade(&src_self);
             replaced.name = old_key.clone();
+            replaced.metadata.ctime = now;
         }
+        tmpfs_touch_dir(src_dir, now);
+        tmpfs_touch_dir(dst_dir, now);
         return Ok(());
     }
 
@@ -173,6 +177,9 @@ fn tmpfs_move_entry_between_dirs(
             // Destination already points to the same inode. For files this is
             // effectively removing the old entry.
             src_dir.children.remove(old_key);
+            let now = PosixTimeSpec::now();
+            tmpfs_touch_dir(src_dir, now);
+            inode_to_move.0.lock().metadata.ctime = now;
             return Ok(());
         }
 
@@ -195,6 +202,7 @@ fn tmpfs_move_entry_between_dirs(
         } else {
             existing_guard.metadata.nlinks = existing_guard.metadata.nlinks.saturating_sub(1);
         }
+        existing_guard.metadata.ctime = PosixTimeSpec::now();
     }
 
     // Remove from source directory.
@@ -214,7 +222,26 @@ fn tmpfs_move_entry_between_dirs(
     let mut moved = inode_to_move.0.lock();
     moved.parent = Arc::downgrade(&dst_self);
     moved.name = new_key.clone();
+    let now = PosixTimeSpec::now();
+    moved.metadata.ctime = now;
+    tmpfs_touch_dir(src_dir, now);
+    tmpfs_touch_dir(dst_dir, now);
 
+    Ok(())
+}
+
+fn tmpfs_touch_dir(dir: &mut TmpfsInode, now: PosixTimeSpec) {
+    dir.metadata.mtime = now;
+    dir.metadata.ctime = now;
+}
+
+fn tmpfs_require_live_dir(dir: &TmpfsInode) -> Result<(), SystemError> {
+    if dir.metadata.file_type != FileType::Dir {
+        return Err(SystemError::ENOTDIR);
+    }
+    if dir.metadata.nlinks == 0 {
+        return Err(SystemError::ENOENT);
+    }
     Ok(())
 }
 
@@ -223,6 +250,7 @@ fn tmpfs_insert_whiteout(dir: &mut TmpfsInode, name: &DName) -> Result<(), Syste
         return Err(SystemError::EEXIST);
     }
 
+    let now = PosixTimeSpec::now();
     let whiteout = Arc::new(LockedTmpfsInode::new(TmpfsInode {
         parent: dir.self_ref.clone(),
         self_ref: Weak::default(),
@@ -234,10 +262,10 @@ fn tmpfs_insert_whiteout(dir: &mut TmpfsInode, name: &DName) -> Result<(), Syste
             size: 0,
             blk_size: 0,
             blocks: 0,
-            atime: PosixTimeSpec::default(),
-            mtime: PosixTimeSpec::default(),
-            ctime: PosixTimeSpec::default(),
-            btime: PosixTimeSpec::default(),
+            atime: now,
+            mtime: now,
+            ctime: now,
+            btime: now,
             file_type: FileType::CharDevice,
             mode: InodeMode::S_IFCHR | InodeMode::from_bits_truncate(0o600),
             nlinks: 1,
@@ -1069,13 +1097,12 @@ impl IndexNode for LockedTmpfsInode {
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let name = DName::from(name);
         let mut inode = self.0.lock();
-        if inode.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
+        tmpfs_require_live_dir(&inode)?;
         if inode.children.contains_key(&name) {
             return Err(SystemError::EEXIST);
         }
 
+        let now = PosixTimeSpec::now();
         let result: Arc<LockedTmpfsInode> = Arc::new(LockedTmpfsInode::new(TmpfsInode {
             parent: inode.self_ref.clone(),
             self_ref: Weak::default(),
@@ -1087,10 +1114,10 @@ impl IndexNode for LockedTmpfsInode {
                 size: 0,
                 blk_size: 0,
                 blocks: 0,
-                atime: PosixTimeSpec::default(),
-                mtime: PosixTimeSpec::default(),
-                ctime: PosixTimeSpec::default(),
-                btime: PosixTimeSpec::default(),
+                atime: now,
+                mtime: now,
+                ctime: now,
+                btime: now,
                 file_type,
                 mode,
                 flags: InodeFlags::empty(),
@@ -1125,6 +1152,7 @@ impl IndexNode for LockedTmpfsInode {
         if file_type == FileType::Dir {
             inode.metadata.nlinks += 1;
         }
+        tmpfs_touch_dir(&mut inode, now);
         Ok(result)
     }
 
@@ -1137,9 +1165,7 @@ impl IndexNode for LockedTmpfsInode {
         let mut inode: MutexGuard<TmpfsInode> = self.0.lock();
         let mut other_locked: MutexGuard<TmpfsInode> = other.0.lock();
 
-        if inode.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
+        tmpfs_require_live_dir(&inode)?;
         if other_locked.metadata.file_type == FileType::Dir {
             return Err(SystemError::EISDIR);
         }
@@ -1151,14 +1177,15 @@ impl IndexNode for LockedTmpfsInode {
             .children
             .insert(name, other_locked.self_ref.upgrade().unwrap());
         other_locked.metadata.nlinks += 1;
+        let now = PosixTimeSpec::now();
+        other_locked.metadata.ctime = now;
+        tmpfs_touch_dir(&mut inode, now);
         Ok(())
     }
 
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
         let mut inode: MutexGuard<TmpfsInode> = self.0.lock();
-        if inode.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
+        tmpfs_require_live_dir(&inode)?;
         if name == "." || name == ".." {
             return Err(SystemError::ENOTEMPTY);
         }
@@ -1188,9 +1215,12 @@ impl IndexNode for LockedTmpfsInode {
             .expect("tempfs nlinks underflow: filesystem corruption detected");
 
         let should_free = deleted_guard.metadata.nlinks == 0;
+        let now = PosixTimeSpec::now();
+        deleted_guard.metadata.ctime = now;
         drop(deleted_guard);
 
         inode.children.remove(&name);
+        tmpfs_touch_dir(&mut inode, now);
 
         if should_free {
             tmpfs.decrease_size(file_size);
@@ -1210,9 +1240,7 @@ impl IndexNode for LockedTmpfsInode {
 
         let name = DName::from(name);
         let mut inode: MutexGuard<TmpfsInode> = self.0.lock();
-        if inode.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
+        tmpfs_require_live_dir(&inode)?;
         let to_delete = inode.children.get(&name).ok_or(SystemError::ENOENT)?;
         let deleted_inode = to_delete.0.lock();
         if deleted_inode.metadata.file_type != FileType::Dir {
@@ -1233,9 +1261,14 @@ impl IndexNode for LockedTmpfsInode {
             .ok_or(SystemError::EIO)?;
 
         drop(deleted_inode);
-        to_delete.0.lock().metadata.nlinks -= 1;
+        let now = PosixTimeSpec::now();
+        let mut deleted_inode = to_delete.0.lock();
+        deleted_inode.metadata.nlinks = 0;
+        deleted_inode.metadata.ctime = now;
+        drop(deleted_inode);
         inode.children.remove(&name);
         inode.metadata.nlinks -= 1;
+        tmpfs_touch_dir(&mut inode, now);
 
         // 减少文件系统使用的大小（目录通常大小为0）
         tmpfs.decrease_size(dir_size);
@@ -1263,16 +1296,6 @@ impl IndexNode for LockedTmpfsInode {
             .downcast_arc::<LockedTmpfsInode>()
             .ok_or(SystemError::EINVAL)?;
 
-        // Fast path: renaming to itself.
-        if Arc::ptr_eq(&(self.0.lock().self_ref.upgrade().unwrap()), &target_locked)
-            && old_key == new_key
-        {
-            if flags.contains(RenameFlags::NOREPLACE) {
-                return Err(SystemError::EEXIST);
-            }
-            return Ok(());
-        }
-
         // Lock ordering: lock by inode_id to avoid deadlocks.
         let self_id = self.0.lock().metadata.inode_id;
         let target_id = target_locked.0.lock().metadata.inode_id;
@@ -1280,6 +1303,7 @@ impl IndexNode for LockedTmpfsInode {
         if self_id == target_id {
             // Same directory rename.
             let mut dir = self.0.lock();
+            tmpfs_require_live_dir(&dir)?;
             let inode_to_move = dir
                 .children
                 .get(&old_key)
@@ -1299,10 +1323,16 @@ impl IndexNode for LockedTmpfsInode {
                     return Ok(());
                 }
 
+                let now = PosixTimeSpec::now();
                 dir.children.insert(old_key.clone(), existing.clone());
                 dir.children.insert(new_key.clone(), inode_to_move.clone());
-                existing.0.lock().name = old_key;
-                inode_to_move.0.lock().name = new_key;
+                let mut existing = existing.0.lock();
+                existing.name = old_key;
+                existing.metadata.ctime = now;
+                let mut moved = inode_to_move.0.lock();
+                moved.name = new_key;
+                moved.metadata.ctime = now;
+                tmpfs_touch_dir(&mut dir, now);
                 return Ok(());
             }
 
@@ -1340,6 +1370,7 @@ impl IndexNode for LockedTmpfsInode {
                     existing_guard.metadata.nlinks =
                         existing_guard.metadata.nlinks.saturating_sub(1);
                 }
+                existing_guard.metadata.ctime = PosixTimeSpec::now();
             }
 
             // Move entry within the same directory.
@@ -1348,7 +1379,11 @@ impl IndexNode for LockedTmpfsInode {
                 tmpfs_insert_whiteout(&mut dir, &old_key)?;
             }
             dir.children.insert(new_key.clone(), inode_to_move.clone());
-            inode_to_move.0.lock().name = new_key;
+            let now = PosixTimeSpec::now();
+            let mut moved = inode_to_move.0.lock();
+            moved.name = new_key;
+            moved.metadata.ctime = now;
+            tmpfs_touch_dir(&mut dir, now);
             return Ok(());
         }
 
@@ -1458,9 +1493,7 @@ impl IndexNode for LockedTmpfsInode {
         dev_t: DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let mut inode = self.0.lock();
-        if inode.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
+        tmpfs_require_live_dir(&inode)?;
 
         let file_type = FileType::from(mode);
         if unlikely(file_type == FileType::File) {
@@ -1481,6 +1514,7 @@ impl IndexNode for LockedTmpfsInode {
             _ => return Err(SystemError::EINVAL),
         };
 
+        let now = PosixTimeSpec::now();
         let nod = Arc::new(LockedTmpfsInode::new(TmpfsInode {
             parent: inode.self_ref.clone(),
             self_ref: Weak::default(),
@@ -1492,10 +1526,10 @@ impl IndexNode for LockedTmpfsInode {
                 size: 0,
                 blk_size: 0,
                 blocks: 0,
-                atime: PosixTimeSpec::default(),
-                mtime: PosixTimeSpec::default(),
-                ctime: PosixTimeSpec::default(),
-                btime: PosixTimeSpec::default(),
+                atime: now,
+                mtime: now,
+                ctime: now,
+                btime: now,
                 file_type,
                 mode,
                 nlinks: 1,
@@ -1519,6 +1553,7 @@ impl IndexNode for LockedTmpfsInode {
         }
 
         inode.children.insert(filename, nod.clone());
+        tmpfs_touch_dir(&mut inode, now);
         Ok(nod)
     }
 

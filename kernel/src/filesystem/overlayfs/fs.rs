@@ -1,6 +1,6 @@
 use super::config::OverlayMountData;
 use super::entry::OvlLayer;
-use super::inode::OvlInode;
+use super::inode::{DirState, OvlInode};
 use crate::driver::base::device::device_number::DeviceNumber;
 use crate::filesystem::vfs::mount::{MountFS, MountFSInode};
 use crate::filesystem::vfs::{
@@ -54,37 +54,81 @@ struct OvlInodeCacheKey {
     origin: OvlInodeOrigin,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum DirIdentity {
+    Lower(Vec<RealInodeIdentity>),
+    Upper(RealInodeIdentity),
+}
+
+#[derive(Debug, Default)]
+struct DirStateCache {
+    entries: BTreeMap<DirIdentity, Weak<DirState>>,
+    insertions_since_prune: usize,
+}
+
+impl DirStateCache {
+    fn intern(&mut self, key: DirIdentity) -> Arc<DirState> {
+        if let Some(state) = self.entries.get(&key).and_then(Weak::upgrade) {
+            return state;
+        }
+        if self.insertions_since_prune >= INODE_CACHE_PRUNE_INTERVAL {
+            self.entries.retain(|_, state| state.strong_count() != 0);
+            self.insertions_since_prune = 0;
+        }
+        let state = Arc::new(DirState::default());
+        self.entries.insert(key, Arc::downgrade(&state));
+        self.insertions_since_prune += 1;
+        state
+    }
+}
+
 #[derive(Debug, Default)]
 struct OvlInodeCache {
     entries: BTreeMap<OvlInodeCacheKey, Weak<OvlInode>>,
+    /// Mount-global bounded retention for repeated short-lived lookups.
+    recent_lookups: VecDeque<Arc<OvlInode>>,
     /// Bounded strong cache for non-samefs directories whose fallback inode
     /// number is only meaningful for the OvlInode cache lifetime.
     recent_fallback_dirs: VecDeque<Arc<OvlInode>>,
     insertions_since_prune: usize,
 }
 
+#[derive(Debug)]
+pub(super) struct AncestorPublication {
+    lower: Vec<RealInodeIdentity>,
+    upper: Weak<dyn IndexNode>,
+}
+
+#[derive(Debug, Default)]
+struct AncestorPublicationCache {
+    entries: BTreeMap<String, AncestorPublication>,
+    insertions_since_prune: usize,
+}
+
 const FALLBACK_DIR_CACHE_SIZE: usize = 256;
+const LOOKUP_RETENTION_SIZE: usize = 1024;
+const LOCK_STRIPE_COUNT: usize = 64;
 
 impl OvlInodeCache {
-    fn intern(
-        &mut self,
-        key: OvlInodeCacheKey,
-        retain_fallback_dir: bool,
-        create: impl FnOnce() -> Arc<OvlInode>,
-    ) -> Arc<OvlInode> {
-        let inode = if let Some(inode) = self.entries.get(&key).and_then(Weak::upgrade) {
-            inode
-        } else {
-            if self.insertions_since_prune >= INODE_CACHE_PRUNE_INTERVAL {
-                self.entries.retain(|_, inode| inode.strong_count() != 0);
-                self.insertions_since_prune = 0;
-            }
+    fn lookup(&self, key: &OvlInodeCacheKey) -> Option<Arc<OvlInode>> {
+        self.entries.get(key).and_then(Weak::upgrade)
+    }
 
-            let inode = create();
-            self.entries.insert(key, Arc::downgrade(&inode));
-            self.insertions_since_prune += 1;
-            inode
-        };
+    fn still_contains(&self, key: &OvlInodeCacheKey, expected: Option<&Arc<OvlInode>>) -> bool {
+        match (self.lookup(key), expected) {
+            (Some(current), Some(expected)) => Arc::ptr_eq(&current, expected),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    fn retain(&mut self, inode: Arc<OvlInode>, retain_fallback_dir: bool) {
+        self.recent_lookups
+            .retain(|cached| !Arc::ptr_eq(cached, &inode));
+        self.recent_lookups.push_back(inode.clone());
+        if self.recent_lookups.len() > LOOKUP_RETENTION_SIZE {
+            self.recent_lookups.pop_front();
+        }
 
         if retain_fallback_dir {
             self.recent_fallback_dirs
@@ -94,7 +138,16 @@ impl OvlInodeCache {
                 self.recent_fallback_dirs.pop_front();
             }
         }
-        inode
+    }
+
+    fn replace(&mut self, key: OvlInodeCacheKey, inode: Arc<OvlInode>, retain_fallback_dir: bool) {
+        if self.insertions_since_prune >= INODE_CACHE_PRUNE_INTERVAL {
+            self.entries.retain(|_, inode| inode.strong_count() != 0);
+            self.insertions_since_prune = 0;
+        }
+        self.entries.insert(key, Arc::downgrade(&inode));
+        self.insertions_since_prune += 1;
+        self.retain(inode, retain_fallback_dir);
     }
 }
 
@@ -122,6 +175,11 @@ pub(super) struct OverlayFS {
     pub(super) backing_cred: Arc<Cred>,
     pub(super) samefs: bool,
     inode_cache: Mutex<OvlInodeCache>,
+    dir_state_cache: Mutex<DirStateCache>,
+    ancestor_publications: Mutex<AncestorPublicationCache>,
+    copy_up_locks: Vec<Mutex<()>>,
+    ancestor_copy_up_locks: Vec<Mutex<()>>,
+    content_locks: Vec<Mutex<()>>,
 }
 
 impl FileSystem for OverlayFS {
@@ -160,7 +218,8 @@ impl OverlayFS {
         file_type: FileType,
         upper_inode: Option<Arc<dyn IndexNode>>,
         lower_inodes: Vec<Arc<dyn IndexNode>>,
-    ) -> Result<Arc<OvlInode>, SystemError> {
+        replace_stale: bool,
+    ) -> Result<Option<Arc<OvlInode>>, SystemError> {
         let origin = if lower_inodes.is_empty() {
             OvlInodeOrigin::Upper(RealInodeIdentity::from_inode(
                 upper_inode.as_ref().ok_or(SystemError::ENOENT)?,
@@ -183,23 +242,187 @@ impl OverlayFS {
         };
 
         let retain_fallback_dir = !self.samefs && file_type == FileType::Dir;
-        let inode = self
-            .inode_cache
-            .lock()
-            .intern(key, retain_fallback_dir, || {
+        let expected_has_upper = upper_inode.is_some();
+        let inode = loop {
+            // Never inspect an inode while holding inode_cache: copy-up owns
+            // upper_inode before consulting this cache for ancestor objects.
+            let candidate = self.inode_cache.lock().lookup(&key);
+            if let Some(candidate) = candidate.as_ref() {
+                if candidate.has_upper() == expected_has_upper {
+                    let mut cache = self.inode_cache.lock();
+                    if cache.still_contains(&key, Some(candidate)) {
+                        cache.retain(candidate.clone(), retain_fallback_dir);
+                        break candidate.clone();
+                    }
+                    continue;
+                }
+                // A lower-only backing snapshot can race with this candidate's
+                // copy-up publication.  Ask lookup to refresh the backing once
+                // before deciding that the cached upper is detached.
+                if !expected_has_upper && !replace_stale {
+                    return Ok(None);
+                }
+            }
+
+            let replacement = {
                 let fallback_id = retain_fallback_dir.then(generate_inode_id);
                 let inode = Arc::new(OvlInode::new(
-                    redirect,
+                    redirect.clone(),
                     file_type,
-                    upper_inode,
-                    lower_inodes,
+                    upper_inode.clone(),
+                    lower_inodes.clone(),
                     fallback_id,
                 ));
                 inode.set_fs(Arc::downgrade(self));
                 inode
-            });
+            };
+            let mut cache = self.inode_cache.lock();
+            if cache.still_contains(&key, candidate.as_ref()) {
+                cache.replace(key.clone(), replacement.clone(), retain_fallback_dir);
+                break replacement;
+            }
+        };
         inode.load_origin_once()?;
-        Ok(inode)
+        Ok(Some(inode))
+    }
+
+    pub(super) fn cached_lower_dirs(
+        &self,
+        redirect: &str,
+        lowers: &[Arc<dyn IndexNode>],
+    ) -> Result<Vec<Arc<OvlInode>>, SystemError> {
+        let lower_identities = lowers
+            .iter()
+            .map(RealInodeIdentity::from_inode)
+            .collect::<Result<Vec<_>, _>>()?;
+        let cache = self.inode_cache.lock();
+        let mut inodes = cache
+            .entries
+            .iter()
+            .filter_map(|(key, inode)| {
+                let OvlInodeOrigin::Lower { lower, .. } = &key.origin else {
+                    return None;
+                };
+                (key.redirect == redirect && *lower == lower_identities)
+                    .then(|| inode.upgrade())
+                    .flatten()
+            })
+            .filter(|inode| inode.is_dir())
+            .collect::<Vec<_>>();
+        inodes.sort_by_key(Arc::as_ptr);
+        inodes.dedup_by(|left, right| Arc::ptr_eq(left, right));
+        Ok(inodes)
+    }
+
+    pub(super) fn prepare_ancestor_publication(
+        &self,
+        lowers: &[Arc<dyn IndexNode>],
+        upper: &Arc<dyn IndexNode>,
+    ) -> Result<AncestorPublication, SystemError> {
+        let lower = lowers
+            .iter()
+            .map(RealInodeIdentity::from_inode)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(AncestorPublication {
+            lower,
+            upper: Arc::downgrade(upper),
+        })
+    }
+
+    pub(super) fn remember_ancestor_publication(
+        &self,
+        redirect: &str,
+        publication: AncestorPublication,
+    ) {
+        let mut cache = self.ancestor_publications.lock();
+        if cache.insertions_since_prune >= INODE_CACHE_PRUNE_INTERVAL {
+            cache
+                .entries
+                .retain(|_, publication| publication.upper.strong_count() != 0);
+            cache.insertions_since_prune = 0;
+        }
+        cache.entries.insert(String::from(redirect), publication);
+        cache.insertions_since_prune += 1;
+    }
+
+    pub(super) fn matches_ancestor_publication(
+        &self,
+        redirect: &str,
+        lowers: &[Arc<dyn IndexNode>],
+        upper: &Arc<dyn IndexNode>,
+    ) -> Result<bool, SystemError> {
+        let lower = lowers
+            .iter()
+            .map(RealInodeIdentity::from_inode)
+            .collect::<Result<Vec<_>, _>>()?;
+        let published = self
+            .ancestor_publications
+            .lock()
+            .entries
+            .get(redirect)
+            .and_then(|publication| {
+                (publication.lower == lower)
+                    .then(|| publication.upper.upgrade())
+                    .flatten()
+            });
+        Ok(published.is_some_and(|published| Arc::ptr_eq(&published, upper)))
+    }
+
+    pub(super) fn same_backing_inode(
+        &self,
+        left: &Arc<dyn IndexNode>,
+        right: &Arc<dyn IndexNode>,
+    ) -> Result<bool, SystemError> {
+        Self::same_mount_inode(left, right)
+    }
+
+    pub(super) fn intern_dir_state(&self, inode: &OvlInode) -> Result<Arc<DirState>, SystemError> {
+        let identity = if inode.lower_inodes.is_empty() {
+            DirIdentity::Upper(RealInodeIdentity::from_inode(
+                inode
+                    .upper_inode
+                    .lock()
+                    .as_ref()
+                    .ok_or(SystemError::ENOENT)?,
+            )?)
+        } else {
+            DirIdentity::Lower(
+                inode
+                    .lower_inodes
+                    .iter()
+                    .map(RealInodeIdentity::from_inode)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        };
+        Ok(self.dir_state_cache.lock().intern(identity))
+    }
+
+    fn redirect_lock_index(&self, redirect: &str) -> usize {
+        let mut hash = 0xcbf29ce484222325u64;
+        for byte in redirect.as_bytes() {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash as usize % LOCK_STRIPE_COUNT
+    }
+
+    pub(super) fn copy_up_lock(&self, redirect: &str) -> &Mutex<()> {
+        &self.copy_up_locks[self.redirect_lock_index(redirect)]
+    }
+
+    pub(super) fn ancestor_copy_up_lock(&self, redirect: &str) -> &Mutex<()> {
+        &self.ancestor_copy_up_locks[self.redirect_lock_index(redirect)]
+    }
+
+    pub(super) fn content_lock(
+        &self,
+        inode: &Arc<dyn IndexNode>,
+    ) -> Result<&Mutex<()>, SystemError> {
+        let identity = RealInodeIdentity::from_inode(inode)?;
+        let mut hash = identity.filesystem as u64;
+        hash ^= (identity.dev_id as u64).rotate_left(21);
+        hash ^= (identity.inode_id.data() as u64).rotate_left(42);
+        Ok(&self.content_locks[hash as usize % self.content_locks.len()])
     }
 
     fn canonical_backing_fs(inode: &Arc<dyn IndexNode>) -> Arc<dyn FileSystem> {
@@ -436,6 +659,11 @@ impl MountableFileSystem for OverlayFS {
                 backing_cred,
                 samefs,
                 inode_cache: Mutex::new(OvlInodeCache::default()),
+                dir_state_cache: Mutex::new(DirStateCache::default()),
+                ancestor_publications: Mutex::new(AncestorPublicationCache::default()),
+                copy_up_locks: (0..LOCK_STRIPE_COUNT).map(|_| Mutex::new(())).collect(),
+                ancestor_copy_up_locks: (0..LOCK_STRIPE_COUNT).map(|_| Mutex::new(())).collect(),
+                content_locks: (0..LOCK_STRIPE_COUNT).map(|_| Mutex::new(())).collect(),
             }
         });
         fs.root_inode.load_origin_once()?;

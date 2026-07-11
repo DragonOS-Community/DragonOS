@@ -58,6 +58,22 @@ bool path_exists(const std::string& path) {
     return stat(path.c_str(), &st) == 0;
 }
 
+std::vector<std::string> directory_names(const std::string& path) {
+    std::vector<std::string> names;
+    DIR* dir = opendir(path.c_str());
+    if (dir == nullptr) {
+        return names;
+    }
+    while (dirent* ent = readdir(dir)) {
+        if (strcmp(ent->d_name, ".") != 0 && strcmp(ent->d_name, "..") != 0) {
+            names.emplace_back(ent->d_name);
+        }
+    }
+    closedir(dir);
+    std::sort(names.begin(), names.end());
+    return names;
+}
+
 std::vector<std::string> xattr_names(const std::string& path) {
     ssize_t needed = listxattr(path.c_str(), nullptr, 0);
     EXPECT_GE(needed, 0) << path << ": " << strerror(errno);
@@ -1040,6 +1056,157 @@ TEST(OverlayFsSemantics, OldLowerFileDescriptorsSwitchToUpperAfterCopyUp) {
 
     EXPECT_EQ(0, close(old_fd2)) << strerror(errno);
     EXPECT_EQ(0, close(old_fd1)) << strerror(errno);
+}
+
+TEST(OverlayFsSemantics, OldLowerDirectoryUsesAncestorCopyUp) {
+    ScopedOverlayEnv scoped("overlayfs_revalidate_old_dir");
+    const auto& env = scoped.env;
+    std::string lower_dir = join_path(env.lower, "dir");
+    std::string lower_file = join_path(lower_dir, "file");
+    std::string merged_dir = join_path(env.merged, "dir");
+    std::string merged_file = join_path(merged_dir, "file");
+    std::string upper_created = join_path(env.upper, "dir/created");
+
+    prepare_overlay_env(env);
+    ASSERT_EQ(0, mkdir(lower_dir.c_str(), 0755)) << strerror(errno);
+    ASSERT_EQ(0, write_text(lower_file, "lower"));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    int old_dir_fd = open(merged_dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    ASSERT_GE(old_dir_fd, 0) << strerror(errno);
+    ASSERT_EQ(0, write_text(merged_file, "upper")) << strerror(errno);
+    ASSERT_EQ(0, mkdirat(old_dir_fd, "created", 0755)) << strerror(errno);
+
+    EXPECT_TRUE(path_exists(upper_created));
+    EXPECT_EQ(0, close(old_dir_fd)) << strerror(errno);
+}
+
+TEST(OverlayFsSemantics, DetachedOldDirectoryIsNotReusedForAncestorCopyUp) {
+    ScopedOverlayEnv scoped("overlayfs_detached_old_dir");
+    const auto& env = scoped.env;
+    std::string lower_dir = join_path(env.lower, "dir");
+    std::string lower_file = join_path(lower_dir, "file");
+    std::string upper_dir = join_path(env.upper, "dir");
+    std::string upper_file = join_path(upper_dir, "file");
+    std::string merged_dir = join_path(env.merged, "dir");
+    std::string merged_file = join_path(merged_dir, "file");
+
+    prepare_overlay_env(env);
+    ASSERT_EQ(0, mkdir(lower_dir.c_str(), 0755)) << strerror(errno);
+    ASSERT_EQ(0, write_text(lower_file, "lower"));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    int old_dir_fd = open(merged_dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    ASSERT_GE(old_dir_fd, 0) << strerror(errno);
+    ASSERT_EQ(0, write_text(merged_file, "upper")) << strerror(errno);
+    ASSERT_EQ(0, unlink(merged_file.c_str())) << strerror(errno);
+    ASSERT_EQ(0, rmdir(merged_dir.c_str())) << strerror(errno);
+    ASSERT_TRUE(is_whiteout(upper_dir));
+
+    // Simulate an upper-layer namespace change that reveals the lower path
+    // while old_dir_fd still retains the detached directory object.
+    ASSERT_EQ(0, unlink(upper_dir.c_str())) << strerror(errno);
+    ASSERT_EQ(0, write_text(merged_file, "new")) << strerror(errno);
+
+    EXPECT_EQ("new", read_text(merged_file));
+    EXPECT_EQ("new", read_text(upper_file));
+    EXPECT_EQ(0, close(old_dir_fd)) << strerror(errno);
+}
+
+TEST(TmpfsSemantics, RemovedDirectoryFdRejectsNamespaceMutations) {
+    std::string root = "/tmp/tmpfs_dead_dir_" + std::to_string(getpid());
+    std::string dir = join_path(root, "dir");
+
+    ASSERT_EQ(0, mkdir(root.c_str(), 0755)) << strerror(errno);
+    ASSERT_EQ(0, mkdir(dir.c_str(), 0755)) << strerror(errno);
+    int dir_fd = open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    ASSERT_GE(dir_fd, 0) << strerror(errno);
+    ASSERT_EQ(0, rmdir(dir.c_str())) << strerror(errno);
+
+    errno = 0;
+    EXPECT_EQ(-1, mkdirat(dir_fd, "child", 0755));
+    EXPECT_EQ(ENOENT, errno);
+
+    errno = 0;
+    EXPECT_EQ(-1, renameat(dir_fd, "missing", dir_fd, "missing"));
+    EXPECT_EQ(ENOENT, errno);
+
+    EXPECT_EQ(0, close(dir_fd)) << strerror(errno);
+    EXPECT_EQ(0, rmdir(root.c_str())) << strerror(errno);
+}
+
+TEST(OverlayFsSemantics, ConcurrentChildrenShareAncestorPublication) {
+    constexpr int kParentCount = 32;
+    constexpr int kEvictionLookups = 1100;
+    ScopedOverlayEnv scoped("overlayfs_concurrent_ancestors");
+    const auto& env = scoped.env;
+    std::vector<int> left_fds;
+    std::vector<int> right_fds;
+
+    prepare_overlay_env(env);
+    for (int i = 0; i < kParentCount; ++i) {
+        std::string dir = join_path(env.lower, ("dir" + std::to_string(i)).c_str());
+        ASSERT_EQ(0, mkdir(dir.c_str(), 0755)) << strerror(errno);
+        ASSERT_EQ(0, write_text(join_path(dir, "left"), "left"));
+        ASSERT_EQ(0, write_text(join_path(dir, "right"), "right"));
+    }
+    for (int i = 0; i < kEvictionLookups; ++i) {
+        ASSERT_EQ(0, write_text(
+                         join_path(env.lower, ("evict" + std::to_string(i)).c_str()),
+                         "x"));
+    }
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    for (int i = 0; i < kParentCount; ++i) {
+        std::string dir = join_path(env.merged, ("dir" + std::to_string(i)).c_str());
+        left_fds.push_back(open(join_path(dir, "left").c_str(), O_RDONLY | O_CLOEXEC));
+        right_fds.push_back(open(join_path(dir, "right").c_str(), O_RDONLY | O_CLOEXEC));
+        ASSERT_GE(left_fds.back(), 0) << strerror(errno);
+        ASSERT_GE(right_fds.back(), 0) << strerror(errno);
+    }
+    for (int i = 0; i < kEvictionLookups; ++i) {
+        struct stat st = {};
+        std::string path = join_path(env.merged, ("evict" + std::to_string(i)).c_str());
+        ASSERT_EQ(0, stat(path.c_str(), &st)) << strerror(errno);
+    }
+
+    int start_pipe[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(start_pipe)) << strerror(errno);
+    std::vector<pid_t> children;
+    for (const auto* fds : {&left_fds, &right_fds}) {
+        pid_t child = fork();
+        ASSERT_GE(child, 0) << strerror(errno);
+        if (child == 0) {
+            close(start_pipe[1]);
+            char token = 0;
+            if (read(start_pipe[0], &token, 1) != 1) {
+                _exit(2);
+            }
+            for (int fd : *fds) {
+                if (fchmod(fd, 0600) != 0) {
+                    _exit(3);
+                }
+                sched_yield();
+            }
+            _exit(0);
+        }
+        children.push_back(child);
+    }
+    close(start_pipe[0]);
+    ASSERT_EQ(2, write(start_pipe[1], "xx", 2));
+    close(start_pipe[1]);
+    for (pid_t child : children) {
+        int status = 0;
+        ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+        ASSERT_TRUE(WIFEXITED(status));
+        EXPECT_EQ(0, WEXITSTATUS(status));
+    }
+    for (int fd : left_fds) {
+        close(fd);
+    }
+    for (int fd : right_fds) {
+        close(fd);
+    }
 }
 
 TEST(OverlayFsSemantics, OldLowerFileDescriptorDoesNotFollowSameNameReplacement) {
@@ -2137,6 +2304,26 @@ TEST(OverlayFsSemantics, UpperOnlyRenameNoReplacePreservesState) {
     cleanup_overlay_env(env);
 }
 
+TEST(OverlayFsSemantics, RenameSamePathValidatesSourceAndNoReplace) {
+    ScopedOverlayEnv scoped("overlayfs_rename_same_path");
+    const auto& env = scoped.env;
+    prepare_overlay_env(env);
+    std::string merged_file = join_path(env.merged, "file");
+    ASSERT_EQ(0, write_text(join_path(env.lower, "file"), "lower"));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    EXPECT_EQ(0, rename(merged_file.c_str(), merged_file.c_str())) << strerror(errno);
+
+    errno = 0;
+    EXPECT_EQ(-1, renameat2_call(merged_file, merged_file, RENAME_NOREPLACE));
+    EXPECT_EQ(EEXIST, errno);
+
+    std::string missing = join_path(env.merged, "missing");
+    errno = 0;
+    EXPECT_EQ(-1, rename(missing.c_str(), missing.c_str()));
+    EXPECT_EQ(ENOENT, errno);
+}
+
 TEST(OverlayFsSemantics, UserWhiteoutRenameIsRejected) {
     auto env = make_overlay_env("overlayfs_user_whiteout_reject");
     std::string upper_old = join_path(env.upper, "old");
@@ -2700,6 +2887,60 @@ TEST(OverlayFsSemantics, RenameNoReplaceOverWhiteoutTargetTreatsTargetAsAbsent) 
     EXPECT_EQ("upper-old", read_text(upper_new));
     EXPECT_EQ("lower-new", read_text(lower_new));
     cleanup_overlay_env(env);
+}
+
+TEST(OverlayFsSemantics, CopyUpDoesNotAdoptConcurrentReplacement) {
+    constexpr size_t kCopySize = 64 * 1024 * 1024;
+    ScopedOverlayEnv scoped("overlayfs_copy_up_replace_race");
+    const auto& env = scoped.env;
+    std::string lower_file = join_path(env.lower, "entry");
+    std::string upper_file = join_path(env.upper, "entry");
+    std::string merged_file = join_path(env.merged, "entry");
+
+    prepare_overlay_env(env);
+    int lower_fd = open(lower_file.c_str(), O_CREAT | O_WRONLY | O_CLOEXEC, 0644);
+    ASSERT_GE(lower_fd, 0) << strerror(errno);
+    std::vector<char> block(1024 * 1024, 'l');
+    for (size_t offset = 0; offset < kCopySize; offset += block.size()) {
+        ASSERT_EQ(static_cast<ssize_t>(block.size()),
+            write(lower_fd, block.data(), block.size()))
+            << strerror(errno);
+    }
+    ASSERT_EQ(0, close(lower_fd)) << strerror(errno);
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        int fd = open(merged_file.c_str(), O_WRONLY | O_CLOEXEC);
+        if (fd < 0) {
+            _exit(errno == ESTALE ? 0 : 2);
+        }
+        if (write(fd, "stale", 5) != 5) {
+            close(fd);
+            _exit(4);
+        }
+        close(fd);
+        _exit(3);
+    }
+
+    bool copy_up_started = false;
+    for (int attempt = 0; attempt < 20000; ++attempt) {
+        if (overlay_temp_entry_count(env.work) > 0) {
+            copy_up_started = true;
+            break;
+        }
+        usleep(100);
+    }
+    ASSERT_TRUE(copy_up_started);
+    ASSERT_EQ(0, write_text(upper_file, "replacement")) << strerror(errno);
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    EXPECT_EQ("replacement", read_text(merged_file));
+    EXPECT_EQ(0, overlay_temp_entry_count(env.work));
 }
 
 TEST(OverlayFsSemantics, LowerFileRenameToDirectoryFailsWithoutCopyUp) {
@@ -3310,6 +3551,42 @@ TEST(OverlayFsSemantics, BindSharesDeviceAndIndependentOverlayGetsNewDevice) {
     EXPECT_NE(original.st_dev, independent.st_dev);
     ASSERT_EQ(0, umount(bind_path.c_str()));
     ASSERT_EQ(0, rmdir(bind_path.c_str()));
+}
+
+TEST(OverlayFsSemantics, LargeMergedDirectoryCacheInvalidatesAfterMutations) {
+    ScopedOverlayEnv scoped("overlayfs_large_readdir_cache");
+    const auto& env = scoped.env;
+    prepare_overlay_env(env);
+
+    constexpr int kEntryCount = 256;
+    for (int i = 0; i < kEntryCount; ++i) {
+        char name[32] = {};
+        snprintf(name, sizeof(name), "entry_%03d", i);
+        ASSERT_EQ(0, write_text(join_path(env.lower, name), "lower"));
+        if ((i % 2) == 0) {
+            ASSERT_EQ(0, write_text(join_path(env.upper, name), "upper"));
+        }
+    }
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    auto first = directory_names(env.merged);
+    ASSERT_EQ(static_cast<size_t>(kEntryCount), first.size());
+    EXPECT_EQ(first, directory_names(env.merged));
+
+    std::string created = join_path(env.merged, "created");
+    ASSERT_EQ(0, write_text(created, "new")) << strerror(errno);
+    auto after_create = directory_names(env.merged);
+    EXPECT_TRUE(std::binary_search(after_create.begin(), after_create.end(), "created"));
+
+    ASSERT_EQ(0, unlink(join_path(env.merged, "entry_003").c_str())) << strerror(errno);
+    auto after_unlink = directory_names(env.merged);
+    EXPECT_FALSE(std::binary_search(after_unlink.begin(), after_unlink.end(), "entry_003"));
+
+    std::string renamed = join_path(env.merged, "renamed");
+    ASSERT_EQ(0, rename(created.c_str(), renamed.c_str())) << strerror(errno);
+    auto after_rename = directory_names(env.merged);
+    EXPECT_FALSE(std::binary_search(after_rename.begin(), after_rename.end(), "created"));
+    EXPECT_TRUE(std::binary_search(after_rename.begin(), after_rename.end(), "renamed"));
 }
 
 int main(int argc, char** argv) {

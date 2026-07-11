@@ -55,7 +55,7 @@ impl Syscall for SysFchdirHandle {
 
         let path = inode.absolute_path()?;
         pcb.basic_mut().set_cwd(path);
-        pcb.fs_struct_mut().set_pwd_resolved(resolved);
+        pcb.fs_struct().set_pwd_resolved(resolved);
         return Ok(0);
     }
 

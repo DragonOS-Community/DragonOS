@@ -108,7 +108,7 @@ impl Syscall for SysChdirHandle {
         }
 
         proc.basic_mut().set_cwd(new_path);
-        proc.fs_struct_mut().set_pwd_resolved(resolved);
+        proc.fs_struct().set_pwd_resolved(resolved);
         Ok(0)
     }
 

@@ -144,7 +144,8 @@ impl SymOps for FdSymOps {
 
         // 获取进程的 chroot 根路径
         let root_prefix = process
-            .fs_struct()
+            .try_fs_struct()
+            .ok_or(SystemError::ESRCH)?
             .root()
             .absolute_path()
             .unwrap_or_default();

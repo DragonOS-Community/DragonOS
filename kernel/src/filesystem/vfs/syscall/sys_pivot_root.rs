@@ -299,7 +299,9 @@ fn repair_same_namespace_fs_refs(
             continue;
         }
 
-        let fs = task.fs_struct();
+        let Some(fs) = task.try_fs_struct() else {
+            continue;
+        };
         let is_current_task = Arc::ptr_eq(&task, current_task);
         let root_replaced = same_path_ref(&fs.root(), old_root_inode);
         let pwd_replaced = same_path_ref(&fs.pwd(), old_root_inode);
@@ -311,13 +313,11 @@ fn repair_same_namespace_fs_refs(
 
         let old_cwd = task.basic().cwd();
         let mut basic = task.basic_mut();
-        let fs_guard = task.fs_struct_mut();
-
         if root_replaced || is_current_task {
-            fs_guard.set_root(new_root_inode.clone());
+            fs.set_root(new_root_inode.clone());
         }
         if pwd_replaced {
-            fs_guard.set_pwd(new_root_inode.clone());
+            fs.set_pwd(new_root_inode.clone());
         }
 
         if rewrite_cwd {

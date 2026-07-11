@@ -143,9 +143,9 @@ fn migrate_virtual_filesystem(
     // 以及 init stdio 的 /dev/hvc0 查找都会仍在旧 root 上执行，导致找不到设备节点。
     let new_root_inode = current_mntns.root_inode();
     let pcb = ProcessManager::current_pcb();
-    pcb.fs_struct_mut().set_root(new_root_inode.clone());
+    pcb.fs_struct().set_root(new_root_inode.clone());
     // init 通常 cwd 为 "/"，将 pwd 同步到新根，避免落在旧根造成后续语义混乱
-    pcb.fs_struct_mut().set_pwd(new_root_inode.clone());
+    pcb.fs_struct().set_pwd(new_root_inode.clone());
 
     // WARNING: mount devpts after devfs has been mounted,
     devpts_init().expect("Failed to initialize devpts");

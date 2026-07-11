@@ -73,7 +73,7 @@ impl Syscall for SysChrootHandle {
         )?;
 
         // 更新进程 fs root；不改变 cwd（Linux 行为）
-        pcb.fs_struct_mut().set_root_resolved(resolved);
+        pcb.fs_struct().set_root_resolved(resolved);
         Ok(0)
     }
 

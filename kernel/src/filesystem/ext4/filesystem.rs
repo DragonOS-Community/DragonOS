@@ -1,5 +1,6 @@
 use crate::{
     driver::base::{block::gendisk::GenDisk, device::device_number::DeviceNumber},
+    exception::workqueue::{schedule_work, Work},
     filesystem::{
         ext4::inode::{Ext4Inode, Ext4InodeLifecycle, Ext4InodeLifecycleState, InodeDirtyState},
         vfs::{
@@ -7,13 +8,15 @@ use crate::{
             fcntl::AtFlags,
             utils::{user_path_at, DName},
             vcore::{generate_inode_id, try_find_gendisk},
-            FileSystem, FileSystemMakerData, IndexNode, Magic, MountableFileSystem, FSMAKER,
-            VFS_MAX_FOLLOW_SYMLINK_TIMES,
+            EvictionEpoch, FileSystem, FileSystemMakerData, IndexNode, Magic, MountableFileSystem,
+            FSMAKER, VFS_MAX_FOLLOW_SYMLINK_TIMES,
         },
     },
     libs::{
         mutex::Mutex,
         rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
+        spinlock::SpinLock,
+        wait_queue::WaitQueue,
     },
     mm::{
         fault::{PageFaultHandler, PageFaultMessage},
@@ -37,6 +40,14 @@ use super::inode::LockedExt4Inode;
 struct CanonicalInodeEntry {
     inode: Weak<LockedExt4Inode>,
     lifecycle: Arc<Ext4InodeLifecycle>,
+}
+
+#[derive(Debug, Default)]
+struct Ext4EvictionQueueState {
+    next_epoch: u64,
+    completed_epoch: u64,
+    sealed: bool,
+    error: Option<SystemError>,
 }
 
 #[must_use]
@@ -69,6 +80,9 @@ pub struct Ext4FileSystem {
 
     /// Fail-stop allocation after an indeterminate physical reclaim.
     lifecycle_error: Mutex<Option<SystemError>>,
+
+    eviction_queue: SpinLock<Ext4EvictionQueueState>,
+    eviction_wait: WaitQueue,
 
     /// Mount-time ext4 options parsed from user/kernel mount data.
     _mount_options: Ext4MountOptions,
@@ -148,9 +162,55 @@ impl FileSystem for Ext4FileSystem {
     fn sync_fs(&self, _wait: bool) -> Result<(), SystemError> {
         self.flush_dirty_inodes()
     }
+
+    fn seal_eviction_queue(&self) -> EvictionEpoch {
+        let mut queue = self.eviction_queue.lock();
+        queue.sealed = true;
+        EvictionEpoch::new(queue.next_epoch)
+    }
+
+    fn drain_evictions_through(&self, epoch: EvictionEpoch) -> Result<(), SystemError> {
+        self.eviction_wait
+            .wait_until(|| {
+                let queue = self.eviction_queue.lock();
+                (queue.completed_epoch >= epoch.value()).then(|| queue.error.clone())
+            })
+            .map_or(Ok(()), Err)
+    }
 }
 
 impl Ext4FileSystem {
+    pub(super) fn schedule_inode_eviction(
+        self: &Arc<Self>,
+        inode: Arc<LockedExt4Inode>,
+    ) -> Result<(), SystemError> {
+        let fs = self.clone();
+        {
+            // Linearize epoch allocation with FIFO publication so concurrent
+            // producers cannot invert completion epochs.
+            let mut queue = self.eviction_queue.lock();
+            if queue.sealed {
+                return Err(SystemError::EBUSY);
+            }
+            queue.next_epoch = queue
+                .next_epoch
+                .checked_add(1)
+                .ok_or(SystemError::EOVERFLOW)?;
+            let epoch = queue.next_epoch;
+            schedule_work(Work::new(move || {
+                let result = inode.run_deferred_eviction();
+                let mut queue = fs.eviction_queue.lock();
+                if let Err(error) = result {
+                    queue.error.get_or_insert(error);
+                }
+                queue.completed_epoch = epoch;
+                drop(queue);
+                fs.eviction_wait.wake_all();
+            }));
+        }
+        Ok(())
+    }
+
     pub(super) fn begin_allocation(&self) -> Result<RwSemReadGuard<'_, ()>, SystemError> {
         let guard = self.inode_reuse_barrier.read();
         if let Some(error) = self.lifecycle_error.lock().clone() {
@@ -557,6 +617,11 @@ impl Ext4FileSystem {
                     RwSem::new(()),
                     Mutex::new(()),
                     Ext4InodeLifecycle::new(),
+                    vfs::InodeRetentionState::new(),
+                    SpinLock::new(None),
+                    SpinLock::new(false),
+                    self_ref.clone(),
+                    SpinLock::new(Weak::new()),
                 )
             });
 
@@ -568,12 +633,15 @@ impl Ext4FileSystem {
             inode_table: Mutex::new(BTreeMap::new()),
             inode_reuse_barrier: RwSem::new(()),
             lifecycle_error: Mutex::new(None),
+            eviction_queue: SpinLock::new(Ext4EvictionQueueState::default()),
+            eviction_wait: WaitQueue::default(),
             _mount_options: mount_options,
         });
 
         let mut guard = fs.root_inode.0.lock();
         guard.fs_ptr = Arc::downgrade(&fs);
         drop(guard);
+        *fs.root_inode.9.lock() = Arc::downgrade(&fs);
         fs.inode_table.lock().insert(
             another_ext4::EXT4_ROOT_INO,
             CanonicalInodeEntry {

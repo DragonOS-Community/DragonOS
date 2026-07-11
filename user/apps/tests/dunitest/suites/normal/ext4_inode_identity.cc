@@ -184,6 +184,66 @@ TEST(Ext4InodeIdentity, KernelLifecycleSelftestPasses) {
     EXPECT_EQ(std::string::npos, text.find("=fail\n")) << text;
 }
 
+TEST(Ext4InodeIdentity, OpenFileSurvivesFinalUnlink) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+
+    const std::string path = fs.mount_point() + "/open_unlink";
+    int fd = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    constexpr char kBefore[] = "before-unlink";
+    ASSERT_NO_FATAL_FAILURE(WriteAll(fd, kBefore, sizeof(kBefore) - 1));
+    ASSERT_EQ(0, fsync(fd)) << strerror(errno);
+
+    struct stat before = {};
+    ASSERT_EQ(0, fstat(fd, &before)) << strerror(errno);
+    ASSERT_EQ(0, unlink(path.c_str())) << strerror(errno);
+    EXPECT_EQ(-1, access(path.c_str(), F_OK));
+    EXPECT_EQ(ENOENT, errno);
+
+    ASSERT_EQ(0, lseek(fd, 0, SEEK_SET)) << strerror(errno);
+    char buffer[64] = {};
+    ASSERT_EQ(static_cast<ssize_t>(sizeof(kBefore) - 1),
+              read(fd, buffer, sizeof(buffer)))
+        << strerror(errno);
+    EXPECT_EQ(0, memcmp(buffer, kBefore, sizeof(kBefore) - 1));
+
+    constexpr char kAfter[] = "-after";
+    ASSERT_EQ(static_cast<off_t>(sizeof(kBefore) - 1),
+              lseek(fd, 0, SEEK_END))
+        << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(WriteAll(fd, kAfter, sizeof(kAfter) - 1));
+    ASSERT_EQ(0, fsync(fd)) << strerror(errno);
+    struct stat unlinked = {};
+    ASSERT_EQ(0, fstat(fd, &unlinked)) << strerror(errno);
+    EXPECT_EQ(before.st_ino, unlinked.st_ino);
+    EXPECT_EQ(0u, unlinked.st_nlink);
+    EXPECT_EQ(static_cast<off_t>(sizeof(kBefore) + sizeof(kAfter) - 2),
+              unlinked.st_size);
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
+TEST(Ext4InodeIdentity, CurrentDirectorySurvivesRmdir) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+
+    const std::string directory = fs.mount_point() + "/removed_cwd";
+    ASSERT_EQ(0, mkdir(directory.c_str(), 0755)) << strerror(errno);
+    ASSERT_EQ(0, chdir(directory.c_str())) << strerror(errno);
+    ASSERT_EQ(0, rmdir(directory.c_str())) << strerror(errno);
+
+    struct stat current = {};
+    ASSERT_EQ(0, stat(".", &current)) << strerror(errno);
+    EXPECT_TRUE(S_ISDIR(current.st_mode));
+
+    ASSERT_EQ(0, chdir("/")) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
 TEST(Ext4InodeIdentity, RemountedHardLinksShareCanonicalInodeAndPageCache) {
     LoopExt4 fs;
     ASSERT_NO_FATAL_FAILURE(fs.SetUp());

@@ -927,7 +927,14 @@ impl Ext4 {
 
                 // C-1. 在目标父目录添加新条目（先 add）
                 let target_dir = new_parent_ref.as_mut().unwrap_or(&mut parent_ref);
-                self.poison_on_error(self.dir_add_entry(target_dir, &child, new_name))?;
+                match self.dir_add_entry_classified(target_dir, &child, new_name) {
+                    Ok(()) => {}
+                    Err(super::dir::DirAddFailure::Unmodified(error)) => return Err(error),
+                    Err(super::dir::DirAddFailure::Indeterminate(error)) => {
+                        self.poison(ErrCode::EIO);
+                        return Err(error);
+                    }
+                }
 
                 // C-2. 从源父目录删除旧条目（后 delete）
                 self.poison_on_error(self.dir_remove_entry(&parent_ref, name))?;

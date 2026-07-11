@@ -218,6 +218,7 @@ struct FuseReadCompletion {
     requested: usize,
     observed_size: usize,
     observed_attr_version: u64,
+    _open_pin: super::private_data::FuseOpenLifetimePin,
 }
 
 impl FuseReadCompletion {

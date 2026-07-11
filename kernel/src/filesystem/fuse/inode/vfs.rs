@@ -305,6 +305,7 @@ impl IndexNode for FuseNode {
                 if let Some(handle) = &p.writeback_handle {
                     self.unregister_writeback_handle(handle);
                 }
+                p.lifetime.close_and_wait();
                 if p.no_open {
                     return writeback_result;
                 }
@@ -364,6 +365,7 @@ impl IndexNode for FuseNode {
             fh,
             file_flags,
             &private_data.readahead_state,
+            private_data.lifetime.clone(),
         )
     }
 

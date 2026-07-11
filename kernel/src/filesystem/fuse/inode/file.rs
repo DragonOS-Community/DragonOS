@@ -20,7 +20,8 @@ use crate::{
 use super::super::{
     conn::{BackgroundReadPagesCtx, FuseRequestCred},
     private_data::{
-        FuseFilePrivateData, FuseOpenContext, FuseOpenPrivateData, FuseWritebackHandle,
+        FuseFilePrivateData, FuseOpenContext, FuseOpenLifetime, FuseOpenPrivateData,
+        FuseWritebackHandle,
     },
     protocol::{
         fuse_pack_struct, fuse_read_struct, FuseAttrOut, FuseFlushIn, FuseFsyncIn, FuseOpenIn,
@@ -44,6 +45,7 @@ struct FillPagesFileCtx {
     file_size: usize,
     fh: u64,
     file_flags: u32,
+    lifetime: Arc<FuseOpenLifetime>,
 }
 
 impl FusePageCacheBackend {
@@ -563,6 +565,7 @@ impl FuseNode {
                 open_context,
                 writeback_handle,
                 readahead_state: Arc::new(Mutex::new(FileReadaheadState::new())),
+                lifetime: Arc::new(FuseOpenLifetime::new()),
             })),
             FUSE_OPENDIR => FilePrivateData::Fuse(FuseFilePrivateData::Dir(FuseOpenPrivateData {
                 conn: conn_any,
@@ -574,6 +577,7 @@ impl FuseNode {
                 open_context,
                 writeback_handle: None,
                 readahead_state: Arc::new(Mutex::new(FileReadaheadState::new())),
+                lifetime: Arc::new(FuseOpenLifetime::new()),
             })),
             _ => return Err(SystemError::EINVAL),
         };
@@ -916,6 +920,13 @@ impl FuseNode {
                 padding: 0,
             };
             let speculative = run_start >= demand_end_page;
+            let Some(open_pin) = file_ctx.lifetime.try_pin() else {
+                let _ = target.rollback(SystemError::EIO);
+                if !speculative {
+                    submission_error = Some(SystemError::EIO);
+                }
+                break;
+            };
             let pending = self.conn().enqueue_background_read_pages(
                 self.nodeid,
                 fuse_pack_struct(&read_in),
@@ -928,6 +939,7 @@ impl FuseNode {
                     requested: read_len,
                     observed_size: file_ctx.file_size,
                     observed_attr_version,
+                    open_pin,
                 },
             );
             let pending = match pending {
@@ -1000,6 +1012,7 @@ impl FuseNode {
         fh: u64,
         file_flags: u32,
         ra_state: &Arc<Mutex<FileReadaheadState>>,
+        lifetime: Arc<FuseOpenLifetime>,
     ) -> Result<usize, SystemError> {
         let md = self.cached_or_fetch_metadata()?;
         let file_size = md.size.max(0) as usize;
@@ -1051,6 +1064,7 @@ impl FuseNode {
             file_size,
             fh,
             file_flags,
+            lifetime,
         };
         let (_, mut truncate_eof) = self.fill_page_cache_range_with_open(
             &page_cache,
@@ -1191,6 +1205,7 @@ impl FuseNode {
         ra_state: &mut FileReadaheadState,
         fh: u64,
         file_flags: u32,
+        lifetime: Arc<FuseOpenLifetime>,
     ) -> Result<usize, SystemError> {
         if req_pages == 0 {
             return Ok(0);
@@ -1225,6 +1240,7 @@ impl FuseNode {
             file_size,
             fh,
             file_flags,
+            lifetime,
         };
         let (total_read, truncate_eof) = self.fill_page_cache_range_with_open(
             &page_cache,

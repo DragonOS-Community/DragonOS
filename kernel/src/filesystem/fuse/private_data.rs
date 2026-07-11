@@ -41,6 +41,58 @@ pub struct FuseOpenPrivateData {
     /// Per-open-file-description state. Cloning private data (dup/snapshots)
     /// keeps one shared sequential-read history.
     pub readahead_state: Arc<Mutex<FileReadaheadState>>,
+    pub lifetime: Arc<FuseOpenLifetime>,
+}
+
+#[derive(Debug)]
+pub struct FuseOpenLifetime {
+    closing: AtomicBool,
+    inflight: AtomicUsize,
+    wait_queue: WaitQueue,
+}
+
+impl FuseOpenLifetime {
+    pub fn new() -> Self {
+        Self {
+            closing: AtomicBool::new(false),
+            inflight: AtomicUsize::new(0),
+            wait_queue: WaitQueue::default(),
+        }
+    }
+
+    pub fn try_pin(self: &Arc<Self>) -> Option<FuseOpenLifetimePin> {
+        if self.closing.load(Ordering::Acquire) {
+            return None;
+        }
+        self.inflight.fetch_add(1, Ordering::AcqRel);
+        if self.closing.load(Ordering::Acquire) {
+            self.unpin();
+            return None;
+        }
+        Some(FuseOpenLifetimePin(self.clone()))
+    }
+
+    pub fn close_and_wait(&self) {
+        self.closing.store(true, Ordering::Release);
+        self.wait_queue.wait_until(|| {
+            (self.inflight.load(Ordering::Acquire) == 0).then_some(())
+        });
+    }
+
+    fn unpin(&self) {
+        if self.inflight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.wait_queue.wake_all();
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct FuseOpenLifetimePin(Arc<FuseOpenLifetime>);
+
+impl Drop for FuseOpenLifetimePin {
+    fn drop(&mut self) {
+        self.0.unpin();
+    }
 }
 
 #[derive(Debug, Clone)]

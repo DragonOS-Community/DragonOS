@@ -52,6 +52,7 @@ pub(crate) struct BackgroundReadPagesCtx {
     pub requested: usize,
     pub observed_size: usize,
     pub observed_attr_version: u64,
+    pub open_pin: super::super::private_data::FuseOpenLifetimePin,
 }
 
 impl FuseConn {
@@ -190,6 +191,7 @@ impl FuseConn {
                 requested: ctx.requested,
                 observed_size: ctx.observed_size,
                 observed_attr_version: ctx.observed_attr_version,
+                _open_pin: ctx.open_pin,
             }),
         ));
         let req = self.build_request(

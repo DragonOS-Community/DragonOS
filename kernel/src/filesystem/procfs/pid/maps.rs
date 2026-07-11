@@ -2,7 +2,7 @@
 //!
 //! 返回进程的内存映射信息，格式兼容 Linux procfs
 
-use crate::libs::mutex::MutexGuard;
+use crate::libs::{casting::DowncastArc, mutex::MutexGuard};
 use crate::{
     arch::MMArch,
     filesystem::{
@@ -67,7 +67,7 @@ fn perms_from_vm_flags(vm_flags: VmFlags) -> [u8; 4] {
 /// 格式化设备号、inode 和路径
 #[inline(never)]
 fn format_dev_inode_and_path(
-    file_inode: Option<&dyn IndexNode>,
+    file_inode: Option<&Arc<dyn IndexNode>>,
     root_prefix: &str,
 ) -> (String, String) {
     if let Some(inode) = file_inode {
@@ -75,7 +75,12 @@ fn format_dev_inode_and_path(
             Ok(md) => {
                 let dev = format!("{:02x}:{:02x}", (md.dev_id >> 8) & 0xff, md.dev_id & 0xff);
                 let ino = md.inode_id.into();
-                let mut path = inode.absolute_path().unwrap_or_default();
+                let mut path = inode
+                    .clone()
+                    .downcast_arc::<crate::filesystem::vfs::mount::MountFSInode>()
+                    .map(|inode| inode.procfs_path())
+                    .unwrap_or_else(|| inode.absolute_path())
+                    .unwrap_or_default();
                 // 尊重进程的 chroot：去掉根目录前缀
                 if !root_prefix.is_empty() && root_prefix != "/" {
                     if let Some(rest) = path.strip_prefix(root_prefix) {
@@ -140,7 +145,7 @@ fn generate_maps_content(target: &ProcPidTarget) -> Result<Vec<u8>, SystemError>
 
         let (dev_ino, path_tail) = if let Some(f) = g.vm_file() {
             let inode = f.inode();
-            format_dev_inode_and_path(Some(inode.as_ref()), &root_prefix)
+            format_dev_inode_and_path(Some(&inode), &root_prefix)
         } else {
             format_dev_inode_and_path(None, &root_prefix)
         };

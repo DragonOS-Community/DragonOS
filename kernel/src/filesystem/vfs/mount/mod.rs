@@ -41,7 +41,7 @@ use core::{
     fmt::Debug,
     hash::Hash,
     mem,
-    sync::atomic::{compiler_fence, AtomicUsize, Ordering},
+    sync::atomic::{compiler_fence, AtomicBool, AtomicUsize, Ordering},
 };
 use hashbrown::HashMap;
 use ida::IdAllocator;
@@ -273,9 +273,6 @@ pub struct MountFS {
     /// allocations, this keeps the root dentry's child cache shared by all
     /// lookups that enter the mount.
     root_inode: Mutex<Weak<MountFSInode>>,
-    /// Serializes directory mutations against lookups while allowing lookups
-    /// within the mount to proceed concurrently.
-    dentry_namespace_lock: RwSem<()>,
     /// B-tree mapping InodeId -> MountFS at that mount point
     mountpoints: Mutex<BTreeMap<InodeId, Arc<MountFS>>>,
     /// The inode of the mount point where this filesystem is mounted
@@ -298,6 +295,16 @@ pub struct SuperBlockState {
     write_count: AtomicUsize,
     wb_error: ErrSeq,
     umount_lock: RwSem<()>,
+    /// Shared by all mounts of this superblock, including bind mounts.
+    dentry_namespace_lock: RwSem<()>,
+    dentry_states: Mutex<BTreeMap<DentryKey, Weak<AtomicBool>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct DentryKey {
+    parent: InodeId,
+    child: InodeId,
+    name: DName,
 }
 
 struct MountStateInit {
@@ -312,7 +319,28 @@ impl SuperBlockState {
             write_count: AtomicUsize::new(0),
             wb_error: ErrSeq::new(),
             umount_lock: RwSem::new(()),
+            dentry_namespace_lock: RwSem::new(()),
+            dentry_states: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    fn dentry_state(&self, parent: InodeId, child: InodeId, name: DName) -> Arc<AtomicBool> {
+        let key = DentryKey {
+            parent,
+            child,
+            name,
+        };
+        let mut states = self.dentry_states.lock();
+        if let Some(state) = states.get(&key).and_then(Weak::upgrade) {
+            return state;
+        }
+        // Keep dead weak entries bounded without adding work to every lookup.
+        if !states.is_empty() && states.len().is_multiple_of(256) {
+            states.retain(|_, state| state.strong_count() != 0);
+        }
+        let state = Arc::new(AtomicBool::new(false));
+        states.insert(key, Arc::downgrade(&state));
+        state
     }
 
     pub fn flags(&self) -> MountFlags {
@@ -402,7 +430,7 @@ struct MountDentryState {
     name: Option<DName>,
     parent: Option<Arc<MountFSInode>>,
     children: BTreeMap<DName, Weak<MountFSInode>>,
-    disconnected: bool,
+    disconnected: Arc<AtomicBool>,
 }
 
 impl MountFS {
@@ -443,7 +471,6 @@ impl MountFS {
             inner_filesystem,
             root_inner_inode,
             root_inode: Mutex::new(Weak::new()),
-            dentry_namespace_lock: RwSem::new(()),
             mountpoints: Mutex::new(BTreeMap::new()),
             self_mountpoint: RwSem::new(self_mountpoint),
             self_ref: self_ref.clone(),
@@ -472,7 +499,6 @@ impl MountFS {
             inner_filesystem: self.inner_filesystem.clone(),
             root_inner_inode: self.root_inner_inode.clone(),
             root_inode: Mutex::new(Weak::new()),
-            dentry_namespace_lock: RwSem::new(()),
             mountpoints: Mutex::new(BTreeMap::new()),
             self_mountpoint: RwSem::new(self_mountpoint),
             self_ref: self_ref.clone(),
@@ -945,6 +971,19 @@ impl MountFSInode {
                 return cached;
             }
         }
+        let disconnected = parent
+            .inner_inode
+            .metadata()
+            .ok()
+            .zip(inner_inode.metadata().ok())
+            .map(|(parent, child)| {
+                mount_fs.super_block_state.dentry_state(
+                    parent.inode_id,
+                    child.inode_id,
+                    name.clone(),
+                )
+            })
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         let inode = Arc::new_cyclic(|self_ref| Self {
             inner_inode,
             mount_fs,
@@ -953,7 +992,7 @@ impl MountFSInode {
                 name: Some(name.clone()),
                 parent: Some(parent.clone()),
                 children: BTreeMap::new(),
-                disconnected: false,
+                disconnected,
             }),
         });
         parent_state.children.insert(name, Arc::downgrade(&inode));
@@ -1048,7 +1087,7 @@ impl MountFSInode {
                 state.name = Some(old_name);
                 state.parent = Some(source.clone());
             } else {
-                state.disconnected = true;
+                state.disconnected.store(true, Ordering::Release);
             }
         }
     }
@@ -1231,7 +1270,7 @@ impl MountFSInode {
 
     fn do_find(&self, name: &str) -> Result<Arc<MountFSInode>, SystemError> {
         let base = self.overlaid_inode();
-        let _namespace_guard = base.mount_fs.dentry_namespace_lock.read();
+        let _namespace_guard = base.mount_fs.super_block_state.dentry_namespace_lock.read();
         // Directly call the find method of the filesystem the current inode belongs to.
         // Since downward lookups may cross filesystem boundaries, we need to attempt inode replacement.
         let inner_inode = base.inner_inode.find(name)?;
@@ -1342,7 +1381,7 @@ impl MountFSInode {
 
     pub(crate) fn procfs_path(&self) -> Result<String, SystemError> {
         let mut path = self.do_absolute_path_impl(true)?;
-        if self.dentry.lock().disconnected {
+        if self.dentry.lock().disconnected.load(Ordering::Acquire) {
             path.push_str(" (deleted)");
         }
         Ok(path)
@@ -1366,7 +1405,7 @@ impl MountFSInode {
         // A lookup-created wrapper has authoritative alias-specific dentry identity.
         // Filesystem-provided paths are only a fallback for roots/legacy wrappers.
         let current_state = current.dentry.lock();
-        if current_state.disconnected && !allow_disconnected {
+        if current_state.disconnected.load(Ordering::Acquire) && !allow_disconnected {
             return Err(SystemError::ENOENT);
         }
         let use_inner_path = current_state.name.is_none();
@@ -1573,7 +1612,11 @@ impl IndexNode for MountFSInode {
         data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         self.ensure_mount_writable()?;
-        let _namespace_guard = self.mount_fs.dentry_namespace_lock.write();
+        let _namespace_guard = self
+            .mount_fs
+            .super_block_state
+            .dentry_namespace_lock
+            .write();
         let inner_inode = self
             .inner_inode
             .create_with_data(name, file_type, mode, data)?;
@@ -1715,7 +1758,11 @@ impl IndexNode for MountFSInode {
         mode: InodeMode,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         self.ensure_mount_writable()?;
-        let _namespace_guard = self.mount_fs.dentry_namespace_lock.write();
+        let _namespace_guard = self
+            .mount_fs
+            .super_block_state
+            .dentry_namespace_lock
+            .write();
         let inner_inode = self.inner_inode.create(name, file_type, mode)?;
         let parent = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
         return Ok(MountFSInode::new_child(
@@ -1728,7 +1775,11 @@ impl IndexNode for MountFSInode {
 
     fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
         self.ensure_mount_writable()?;
-        let _namespace_guard = self.mount_fs.dentry_namespace_lock.write();
+        let _namespace_guard = self
+            .mount_fs
+            .super_block_state
+            .dentry_namespace_lock
+            .write();
         // Filesystem implementations expect `other` to be an inode of the same concrete filesystem (e.g. LockedExt4Inode).
         // When VFS mount wrapping is enabled, `other` is typically a `MountFSInode`, which causes
         // filesystem-level downcasts to fail and incorrectly return EINVAL.
@@ -1745,7 +1796,11 @@ impl IndexNode for MountFSInode {
 
     fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
         self.ensure_mount_writable()?;
-        let _namespace_guard = self.mount_fs.dentry_namespace_lock.write();
+        let _namespace_guard = self
+            .mount_fs
+            .super_block_state
+            .dentry_namespace_lock
+            .write();
         let inner_inode = self.inner_inode.symlink(name, target)?;
         let parent = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
         Ok(MountFSInode::new_child(
@@ -1760,8 +1815,13 @@ impl IndexNode for MountFSInode {
     #[inline]
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
         self.ensure_mount_writable()?;
-        let _namespace_guard = self.mount_fs.dentry_namespace_lock.write();
+        let _namespace_guard = self
+            .mount_fs
+            .super_block_state
+            .dentry_namespace_lock
+            .write();
         let inode_id = self.inner_inode.find(name)?.metadata()?.inode_id;
+        let parent_id = self.inner_inode.metadata()?.inode_id;
 
         // First check if this inode is a mount point; if so, it cannot be deleted
         if self.mount_fs.mountpoints.lock().contains_key(&inode_id) {
@@ -1769,6 +1829,10 @@ impl IndexNode for MountFSInode {
         }
         // Delegate to the inner inode's unlink method to delete this inode
         self.inner_inode.unlink(name)?;
+        self.mount_fs
+            .super_block_state
+            .dentry_state(parent_id, inode_id, DName::from(name))
+            .store(true, Ordering::Release);
         if let Some(child) = self
             .dentry
             .lock()
@@ -1776,8 +1840,8 @@ impl IndexNode for MountFSInode {
             .remove(&DName::from(name))
             .and_then(|w| w.upgrade())
         {
-            let mut state = child.dentry.lock();
-            state.disconnected = true;
+            let state = child.dentry.lock();
+            state.disconnected.store(true, Ordering::Release);
         }
         return Ok(());
     }
@@ -1785,8 +1849,13 @@ impl IndexNode for MountFSInode {
     #[inline]
     fn rmdir(&self, name: &str) -> Result<(), SystemError> {
         self.ensure_mount_writable()?;
-        let _namespace_guard = self.mount_fs.dentry_namespace_lock.write();
+        let _namespace_guard = self
+            .mount_fs
+            .super_block_state
+            .dentry_namespace_lock
+            .write();
         let inode_id = self.inner_inode.find(name)?.metadata()?.inode_id;
+        let parent_id = self.inner_inode.metadata()?.inode_id;
 
         // First check if this inode is a mount point; if so, it cannot be deleted
         if self.mount_fs.mountpoints.lock().contains_key(&inode_id) {
@@ -1794,6 +1863,10 @@ impl IndexNode for MountFSInode {
         }
         // Delegate to the inner inode's rmdir method to delete this inode
         self.inner_inode.rmdir(name)?;
+        self.mount_fs
+            .super_block_state
+            .dentry_state(parent_id, inode_id, DName::from(name))
+            .store(true, Ordering::Release);
         if let Some(child) = self
             .dentry
             .lock()
@@ -1801,8 +1874,8 @@ impl IndexNode for MountFSInode {
             .remove(&DName::from(name))
             .and_then(|w| w.upgrade())
         {
-            let mut state = child.dentry.lock();
-            state.disconnected = true;
+            let state = child.dentry.lock();
+            state.disconnected.store(true, Ordering::Release);
         }
         return Ok(());
     }
@@ -1816,7 +1889,11 @@ impl IndexNode for MountFSInode {
         flags: RenameFlags,
     ) -> Result<(), SystemError> {
         self.ensure_mount_writable()?;
-        let _namespace_guard = self.mount_fs.dentry_namespace_lock.write();
+        let _namespace_guard = self
+            .mount_fs
+            .super_block_state
+            .dentry_namespace_lock
+            .write();
         // Filesystem implementations generally expect `target` to be an inode
         // of the same concrete FS (e.g. tmpfs' LockedTmpfsInode). When VFS
         // mount wrapping is enabled, `target` is often a `MountFSInode`, which
@@ -1828,9 +1905,26 @@ impl IndexNode for MountFSInode {
             .as_ref()
             .map(|mnt| mnt.inner_inode.clone())
             .unwrap_or_else(|| target.clone());
+        let replaced = if flags.contains(RenameFlags::EXCHANGE) {
+            None
+        } else {
+            target_inner.find(new_name).ok().and_then(|inode| {
+                target_inner
+                    .metadata()
+                    .ok()
+                    .zip(inode.metadata().ok())
+                    .map(|(parent, child)| (parent.inode_id, child.inode_id))
+            })
+        };
 
         self.inner_inode
             .move_to(old_name, &target_inner, new_name, flags)?;
+        if let Some((parent, child)) = replaced {
+            self.mount_fs
+                .super_block_state
+                .dentry_state(parent, child, DName::from(new_name))
+                .store(true, Ordering::Release);
+        }
         if let (Some(source), Some(target)) = (self.self_ref.upgrade(), target_mount) {
             Self::update_move_dentries(
                 &source,
@@ -1980,7 +2074,11 @@ impl IndexNode for MountFSInode {
         dev_t: DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         self.ensure_mount_writable()?;
-        let _namespace_guard = self.mount_fs.dentry_namespace_lock.write();
+        let _namespace_guard = self
+            .mount_fs
+            .super_block_state
+            .dentry_namespace_lock
+            .write();
         let inner_inode = self.inner_inode.mknod(filename, mode, dev_t)?;
         let parent = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
         return Ok(MountFSInode::new_child(

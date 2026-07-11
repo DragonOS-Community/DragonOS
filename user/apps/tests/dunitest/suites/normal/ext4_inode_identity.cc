@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -153,6 +154,23 @@ void WriteAll(int fd, const char* data, size_t len) {
     }
 }
 
+std::string ReadFile(const char* path) {
+    int fd = open(path, O_RDONLY);
+    EXPECT_GE(fd, 0) << strerror(errno);
+    std::string result;
+    char buffer[4096];
+    for (;;) {
+        ssize_t count = read(fd, buffer, sizeof(buffer));
+        EXPECT_GE(count, 0) << strerror(errno);
+        if (count <= 0) {
+            break;
+        }
+        result.append(buffer, static_cast<size_t>(count));
+    }
+    EXPECT_EQ(0, close(fd)) << strerror(errno);
+    return result;
+}
+
 TEST(Ext4InodeIdentity, KernelLifecycleSelftestPasses) {
     int fd = open("/sys/kernel/debug/ext4/lifecycle_selftest", O_RDONLY);
     ASSERT_GE(fd, 0) << strerror(errno);
@@ -242,6 +260,47 @@ TEST(Ext4InodeIdentity, RemountedHardLinksShareCanonicalInodeAndPageCache) {
     ASSERT_EQ(0, rmdir(dir_a.c_str())) << strerror(errno);
     ASSERT_EQ(0, rmdir(dir_b.c_str())) << strerror(errno);
     ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
+TEST(Ext4InodeIdentity, BindAliasAndMapsShareDeletedDentryState) {
+    const std::string base = "/tmp/dentry_bind_" + std::to_string(getpid());
+    const std::string source_dir = base + "/source";
+    const std::string bind_dir = base + "/bind";
+    const std::string source = source_dir + "/file";
+    const std::string alias = bind_dir + "/file";
+
+    ASSERT_EQ(0, mkdir(base.c_str(), 0700)) << strerror(errno);
+    ASSERT_EQ(0, mkdir(source_dir.c_str(), 0700)) << strerror(errno);
+    ASSERT_EQ(0, mkdir(bind_dir.c_str(), 0700)) << strerror(errno);
+    int create_fd = open(source.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+    ASSERT_GE(create_fd, 0) << strerror(errno);
+    ASSERT_EQ(0, ftruncate(create_fd, 4096)) << strerror(errno);
+    ASSERT_EQ(0, close(create_fd)) << strerror(errno);
+    ASSERT_EQ(0, mount(source_dir.c_str(), bind_dir.c_str(), nullptr, MS_BIND, nullptr))
+        << strerror(errno);
+
+    int alias_fd = open(alias.c_str(), O_RDWR);
+    ASSERT_GE(alias_fd, 0) << strerror(errno);
+    void* mapping = mmap(nullptr, 4096, PROT_READ, MAP_PRIVATE, alias_fd, 0);
+    ASSERT_NE(MAP_FAILED, mapping) << strerror(errno);
+    ASSERT_EQ(0, unlink(source.c_str())) << strerror(errno);
+
+    char target[512] = {};
+    const std::string proc_fd = "/proc/self/fd/" + std::to_string(alias_fd);
+    ssize_t target_size = readlink(proc_fd.c_str(), target, sizeof(target) - 1);
+    ASSERT_GT(target_size, 0) << strerror(errno);
+    const std::string deleted_path = alias + " (deleted)";
+    EXPECT_EQ(deleted_path,
+              std::string(target, static_cast<size_t>(target_size)));
+    const std::string maps = ReadFile("/proc/self/maps");
+    EXPECT_NE(std::string::npos, maps.find(deleted_path)) << maps;
+
+    ASSERT_EQ(0, munmap(mapping, 4096)) << strerror(errno);
+    ASSERT_EQ(0, close(alias_fd)) << strerror(errno);
+    ASSERT_EQ(0, umount(bind_dir.c_str())) << strerror(errno);
+    ASSERT_EQ(0, rmdir(bind_dir.c_str())) << strerror(errno);
+    ASSERT_EQ(0, rmdir(source_dir.c_str())) << strerror(errno);
+    ASSERT_EQ(0, rmdir(base.c_str())) << strerror(errno);
 }
 
 }  // namespace

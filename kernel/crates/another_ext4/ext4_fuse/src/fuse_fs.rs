@@ -75,6 +75,16 @@ impl<T: 'static> StateExt4FuseFs<T> {
     /// Save a state
     fn checkpoint(&mut self, key: StateKey) -> bool {
         log::info!("Checkpoint {}", key);
+        // A reclaim capability cannot be duplicated across execution
+        // timelines. Refuse the checkpoint instead of creating a snapshot
+        // whose unlinked inode could no longer be reclaimed after restore.
+        if !self.pending_reclaims.is_empty() {
+            log::warn!(
+                "Cannot checkpoint with {} pending inode reclaims",
+                self.pending_reclaims.len()
+            );
+            return false;
+        }
         self.states
             .insert(key, self.block_dev.checkpoint())
             .is_none()
@@ -85,6 +95,10 @@ impl<T: 'static> StateExt4FuseFs<T> {
         log::info!("Restore {}", key);
         if let Some(state) = self.states.remove(&key) {
             self.block_dev.restore(state);
+            // Reclaim handles are capabilities for inode lifetimes in the
+            // discarded block-device timeline. Drop them without reclaiming;
+            // lookup/open tracking still represents the live FUSE session.
+            self.pending_reclaims.clear();
             true
         } else {
             false

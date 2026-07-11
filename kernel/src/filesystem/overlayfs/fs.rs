@@ -98,26 +98,19 @@ const LOOKUP_RETENTION_SIZE: usize = 1024;
 const LOCK_STRIPE_COUNT: usize = 64;
 
 impl OvlInodeCache {
-    fn intern(
-        &mut self,
-        key: OvlInodeCacheKey,
-        retain_fallback_dir: bool,
-        create: impl FnOnce() -> Arc<OvlInode>,
-    ) -> Arc<OvlInode> {
-        let inode = if let Some(inode) = self.entries.get(&key).and_then(Weak::upgrade) {
-            inode
-        } else {
-            if self.insertions_since_prune >= INODE_CACHE_PRUNE_INTERVAL {
-                self.entries.retain(|_, inode| inode.strong_count() != 0);
-                self.insertions_since_prune = 0;
-            }
+    fn lookup(&self, key: &OvlInodeCacheKey) -> Option<Arc<OvlInode>> {
+        self.entries.get(key).and_then(Weak::upgrade)
+    }
 
-            let inode = create();
-            self.entries.insert(key, Arc::downgrade(&inode));
-            self.insertions_since_prune += 1;
-            inode
-        };
+    fn still_contains(&self, key: &OvlInodeCacheKey, expected: Option<&Arc<OvlInode>>) -> bool {
+        match (self.lookup(key), expected) {
+            (Some(current), Some(expected)) => Arc::ptr_eq(&current, expected),
+            (None, None) => true,
+            _ => false,
+        }
+    }
 
+    fn retain(&mut self, inode: Arc<OvlInode>, retain_fallback_dir: bool) {
         self.recent_lookups
             .retain(|cached| !Arc::ptr_eq(cached, &inode));
         self.recent_lookups.push_back(inode.clone());
@@ -133,7 +126,16 @@ impl OvlInodeCache {
                 self.recent_fallback_dirs.pop_front();
             }
         }
-        inode
+    }
+
+    fn replace(&mut self, key: OvlInodeCacheKey, inode: Arc<OvlInode>, retain_fallback_dir: bool) {
+        if self.insertions_since_prune >= INODE_CACHE_PRUNE_INTERVAL {
+            self.entries.retain(|_, inode| inode.strong_count() != 0);
+            self.insertions_since_prune = 0;
+        }
+        self.entries.insert(key, Arc::downgrade(&inode));
+        self.insertions_since_prune += 1;
+        self.retain(inode, retain_fallback_dir);
     }
 }
 
@@ -226,21 +228,40 @@ impl OverlayFS {
         };
 
         let retain_fallback_dir = !self.samefs && file_type == FileType::Dir;
-        let inode = self
-            .inode_cache
-            .lock()
-            .intern(key, retain_fallback_dir, || {
+        let expected_has_upper = upper_inode.is_some();
+        let inode = loop {
+            // Never inspect an inode while holding inode_cache: copy-up owns
+            // upper_inode before consulting this cache for ancestor objects.
+            let candidate = self.inode_cache.lock().lookup(&key);
+            if let Some(candidate) = candidate.as_ref() {
+                if candidate.has_upper() == expected_has_upper {
+                    let mut cache = self.inode_cache.lock();
+                    if cache.still_contains(&key, Some(candidate)) {
+                        cache.retain(candidate.clone(), retain_fallback_dir);
+                        break candidate.clone();
+                    }
+                    continue;
+                }
+            }
+
+            let replacement = {
                 let fallback_id = retain_fallback_dir.then(generate_inode_id);
                 let inode = Arc::new(OvlInode::new(
-                    redirect,
+                    redirect.clone(),
                     file_type,
-                    upper_inode,
-                    lower_inodes,
+                    upper_inode.clone(),
+                    lower_inodes.clone(),
                     fallback_id,
                 ));
                 inode.set_fs(Arc::downgrade(self));
                 inode
-            });
+            };
+            let mut cache = self.inode_cache.lock();
+            if cache.still_contains(&key, candidate.as_ref()) {
+                cache.replace(key.clone(), replacement.clone(), retain_fallback_dir);
+                break replacement;
+            }
+        };
         inode.load_origin_once()?;
         Ok(inode)
     }

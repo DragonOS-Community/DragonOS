@@ -106,7 +106,25 @@ impl OvlInode {
 
         let (parent_path, name) = self.upper_parent_path_and_name();
         let parent_inode = self.ensure_upper_dir_path(parent_path)?;
+        // Directory copy-up and publication of this path as another object's
+        // ancestor share the same exact-path commit domain.  Parent ancestor
+        // guards have already been released by ensure_upper_dir_path().
+        let _ancestor_publish_guard = (metadata.file_type == FileType::Dir)
+            .then(|| fs.ancestor_copy_up_lock(&self.redirect).lock());
         match parent_inode.find(name) {
+            Ok(existing)
+                if metadata.file_type == FileType::Dir
+                    && fs.matches_ancestor_publication(
+                        &self.redirect,
+                        &self.lower_inodes,
+                        &existing,
+                    )? =>
+            {
+                let existing = Self::validate_existing_upper(existing, &metadata)?;
+                self.set_origin(metadata::load_origin(self, &existing)?);
+                *upper_inode = Some(existing);
+                return Ok(CopyUpOutcome::Existing);
+            }
             // The redirect stripe is held for the whole copy-up, so another
             // copy-up of this object cannot have published this entry.  An
             // unexpected upper therefore belongs to a newer namespace

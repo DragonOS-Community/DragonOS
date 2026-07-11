@@ -610,7 +610,8 @@ pub(super) fn removexattr(inode: &OvlInode, name: &str) -> Result<usize, SystemE
     let fs = inode.overlay_fs()?;
     let _mutation_guard = fs.mutation_lock.lock();
     check_xattr_mutation_permission(inode, name)?;
-    if !inode.has_upper() {
+    let copied_up_for_remove = !inode.has_upper();
+    if copied_up_for_remove {
         let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
         inode.current_realdata_inode()?.0.getxattr(name, &mut [])?;
     }
@@ -618,5 +619,23 @@ pub(super) fn removexattr(inode: &OvlInode, name: &str) -> Result<usize, SystemE
     inode.copy_up_locked()?;
     let upper = inode.upper_inode.lock().clone().ok_or(SystemError::EIO)?;
     let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
-    upper.removexattr(name)
+    match upper.removexattr(name) {
+        Ok(size) => Ok(size),
+        Err(err)
+            if copied_up_for_remove && (err == SystemError::ENODATA || is_unsupported(&err)) =>
+        {
+            // Optional lower xattrs may be intentionally discarded when the
+            // upper backing does not support their namespace. The attribute
+            // existed in the merged view before copy-up, so report a
+            // completed removal only after confirming that it is no longer
+            // observable through the published upper inode.
+            match upper.getxattr(name, &mut []) {
+                Err(SystemError::ENODATA) => Ok(0),
+                Err(probe_err) if is_unsupported(&probe_err) => Ok(0),
+                Ok(_) => Err(err),
+                Err(probe_err) => Err(probe_err),
+            }
+        }
+        Err(err) => Err(err),
+    }
 }

@@ -675,6 +675,7 @@ static int ext_test_xattr_enosys_is_cached() {
     args.init_done = &init_done;
     args.listxattr_count = &listxattr_count;
     args.force_xattr_enosys = 1;
+    args.stop_on_destroy = 1;
 
     pthread_t th;
     if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {

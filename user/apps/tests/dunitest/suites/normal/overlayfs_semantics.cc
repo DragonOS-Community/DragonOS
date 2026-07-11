@@ -293,6 +293,10 @@ bool root_supports_ext4_xattrs() {
     return statfs("/root", &st) == 0 && st.f_type == 0xEF53;
 }
 
+bool is_xattr_unsupported_errno(int error) {
+    return error == ENOSYS || error == EOPNOTSUPP;
+}
+
 struct ScopedCustomMount {
     ScopedCustomMount(std::string root_path, std::string merged_path)
         : root(std::move(root_path)), merged(std::move(merged_path)) {}
@@ -2932,6 +2936,56 @@ TEST(OverlayFsSemantics, UserXattrOperationsAndPrivateNamespaceSemantics) {
         EXPECT_NE(0u, name.find("trusted.overlay."));
         EXPECT_NE("trusted.dragonos.overlay.origin", name);
     }
+}
+
+TEST(OverlayFsSemantics, RemoveLowerXattrDroppedByUnsupportedUpperSucceeds) {
+    if (!root_supports_ext4_xattrs()) {
+        GTEST_SKIP() << "requires an ext4 lower and tmpfs upper";
+    }
+
+    std::string suffix = std::to_string(getpid());
+    std::string lower_root = "/root/overlayfs_xattr_drop_lower_" + suffix;
+    std::string upper_root = "/tmp/overlayfs_xattr_drop_upper_" + suffix;
+    std::string lower = join_path(lower_root, "l");
+    std::string upper = join_path(upper_root, "u");
+    std::string work = join_path(upper_root, "w");
+    std::string merged = join_path(upper_root, "m");
+    std::string lower_file = join_path(lower, "file");
+    std::string upper_file = join_path(upper, "file");
+    std::string merged_file = join_path(merged, "file");
+    std::string upper_probe = join_path(upper_root, "xattr_probe");
+    ScopedCustomMount lower_cleanup(lower_root, "");
+    ScopedCustomMount upper_cleanup(upper_root, merged);
+
+    ASSERT_EQ(0, ensure_dir(lower_root.c_str()));
+    ASSERT_EQ(0, ensure_dir(upper_root.c_str()));
+    ASSERT_EQ(0, ensure_dir(lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(work.c_str()));
+    ASSERT_EQ(0, ensure_dir(merged.c_str()));
+    ASSERT_EQ(0, write_text(lower_file, "lower"));
+    ASSERT_EQ(0, write_text(upper_probe, "probe"));
+    errno = 0;
+    int probe_result = setxattr(upper_probe.c_str(), "user.probe", "value", 5, 0);
+    if (probe_result == 0) {
+        GTEST_SKIP() << "requires an upper filesystem without xattr support";
+    }
+    ASSERT_TRUE(is_xattr_unsupported_errno(errno)) << strerror(errno);
+    ASSERT_EQ(0, setxattr(lower_file.c_str(), "user.dropped", "value", 5, 0))
+        << strerror(errno);
+
+    std::string options = "lowerdir=" + lower + ",upperdir=" + upper + ",workdir=" + work;
+    ASSERT_EQ(0, mount("overlay", merged.c_str(), "overlay", 0, options.c_str()))
+        << strerror(errno);
+    upper_cleanup.mounted = true;
+
+    expect_xattr(merged_file, "user.dropped", "value", 5);
+    ASSERT_EQ(0, removexattr(merged_file.c_str(), "user.dropped")) << strerror(errno);
+    EXPECT_TRUE(path_exists(upper_file));
+    errno = 0;
+    EXPECT_EQ(-1, getxattr(merged_file.c_str(), "user.dropped", nullptr, 0));
+    EXPECT_TRUE(errno == ENODATA || is_xattr_unsupported_errno(errno)) << strerror(errno);
+    expect_xattr(lower_file, "user.dropped", "value", 5);
 }
 
 TEST(OverlayFsSemantics, CallerPermissionsProtectTimestampsAndUserXattrs) {

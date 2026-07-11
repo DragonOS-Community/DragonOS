@@ -16,6 +16,7 @@ use crate::{
         wait_queue::WaitQueue,
     },
     mm::{truncate::truncate_inode_pages, MemoryManagementArch},
+    process::{ProcessManager, RawPid},
     time::PosixTimeSpec,
 };
 use alloc::{
@@ -63,6 +64,7 @@ pub(super) enum Ext4InodeLifecycleState {
 struct Ext4InodeLifecycleInner {
     state: Ext4InodeLifecycleState,
     active_operations: usize,
+    operation_owners: BTreeMap<RawPid, usize>,
 }
 
 #[derive(Debug)]
@@ -78,6 +80,7 @@ impl Ext4InodeLifecycle {
             inner: Mutex::new(Ext4InodeLifecycleInner {
                 state: Ext4InodeLifecycleState::Live,
                 active_operations: 0,
+                operation_owners: BTreeMap::new(),
             }),
             link_mutation: Mutex::new(()),
             wait_queue: WaitQueue::default(),
@@ -94,21 +97,33 @@ impl Ext4InodeLifecycle {
     }
 
     pub(super) fn begin_operation(self: &Arc<Self>) -> Result<Ext4InodeOperation, SystemError> {
+        let owner = ProcessManager::current_pcb().raw_pid();
         let mut inner = self.inner.lock();
         match inner.state.clone() {
-            Ext4InodeLifecycleState::Live => {
-                inner.active_operations = inner
-                    .active_operations
-                    .checked_add(1)
-                    .ok_or(SystemError::EOVERFLOW)?;
-                Ok(Ext4InodeOperation {
-                    lifecycle: self.clone(),
-                })
-            }
-            Ext4InodeLifecycleState::Freeing => Err(SystemError::EBUSY),
-            Ext4InodeLifecycleState::Retired => Err(SystemError::ESTALE),
-            Ext4InodeLifecycleState::Poisoned(error) => Err(error),
+            Ext4InodeLifecycleState::Live => {}
+            Ext4InodeLifecycleState::Freeing if inner.operation_owners.contains_key(&owner) => {}
+            Ext4InodeLifecycleState::Freeing => return Err(SystemError::EBUSY),
+            Ext4InodeLifecycleState::Retired => return Err(SystemError::ESTALE),
+            Ext4InodeLifecycleState::Poisoned(error) => return Err(error),
         }
+
+        let active_operations = inner
+            .active_operations
+            .checked_add(1)
+            .ok_or(SystemError::EOVERFLOW)?;
+        let owner_depth = inner
+            .operation_owners
+            .get(&owner)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(SystemError::EOVERFLOW)?;
+        inner.active_operations = active_operations;
+        inner.operation_owners.insert(owner, owner_depth);
+        Ok(Ext4InodeOperation {
+            lifecycle: self.clone(),
+            owner,
+        })
     }
 
     pub(super) fn begin_freeing(&self) -> Result<(), SystemError> {
@@ -147,6 +162,7 @@ impl Ext4InodeLifecycle {
 #[must_use]
 pub(super) struct Ext4InodeOperation {
     lifecycle: Arc<Ext4InodeLifecycle>,
+    owner: RawPid,
 }
 
 impl Drop for Ext4InodeOperation {
@@ -155,6 +171,18 @@ impl Drop for Ext4InodeOperation {
             let mut inner = self.lifecycle.inner.lock();
             debug_assert!(inner.active_operations > 0);
             inner.active_operations = inner.active_operations.saturating_sub(1);
+            let remove_owner = if let Some(owner_depth) = inner.operation_owners.get_mut(&self.owner)
+            {
+                debug_assert!(*owner_depth > 0);
+                *owner_depth = owner_depth.saturating_sub(1);
+                *owner_depth == 0
+            } else {
+                debug_assert!(false, "missing ext4 lifecycle operation owner");
+                false
+            };
+            if remove_owner {
+                inner.operation_owners.remove(&self.owner);
+            }
             inner.active_operations == 0
         };
         if should_wake {
@@ -1787,6 +1815,19 @@ pub(crate) fn run_lifecycle_selftests() -> String {
     append(
         "retired_rejects_operation",
         lifecycle.begin_operation().err() == Some(SystemError::ESTALE),
+    );
+
+    let lifecycle = Ext4InodeLifecycle::new();
+    let outer = lifecycle.begin_operation().expect("live operation");
+    append("reentrant_begin_freeing", lifecycle.begin_freeing().is_ok());
+    let nested = lifecycle.begin_operation();
+    append("freeing_allows_owner_nested_operation", nested.is_ok());
+    drop(nested);
+    drop(outer);
+    lifecycle.wait_for_quiescent();
+    append(
+        "reentrant_operations_drained",
+        lifecycle.inner.lock().active_operations == 0,
     );
 
     let lifecycle = Ext4InodeLifecycle::new();

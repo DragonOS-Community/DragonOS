@@ -3473,6 +3473,7 @@ static int ext_test_cached_read_sees_write_through_update() {
     args.write_count = &write_count;
     args.last_write_fh = &last_write_fh;
     args.next_open_fh = 300;
+    args.stop_on_destroy = 1;
 
     pthread_t th;
     if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {

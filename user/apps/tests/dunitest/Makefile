@@ -62,7 +62,7 @@ build-suites: $(TEST_BINS) $(EXT4_FIXTURE)
 
 $(EXT4_FIXTURE):
 	@mkdir -p "$(dir $@)"
-	@truncate -s 32M "$@"
+	@truncate -s 8M "$@"
 	@mke2fs -q -t ext4 -F "$@"
 
 $(GTEST_OBJ): $(GTEST_SRC)

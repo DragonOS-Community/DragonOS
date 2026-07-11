@@ -326,6 +326,15 @@ pub struct MountExternalGuard {
     mount: Arc<MountFS>,
 }
 
+// SAFETY: MountExternalGuard only owns an Arc<MountFS>. Every mutable MountFS
+// field reachable from the guard is protected by Mutex/RwSem/SpinLock or is
+// atomic. These explicit impls break the recursive auto-trait proof cycle
+// MountFS -> MountFSInode/File -> MountExternalGuard -> MountFS, which some
+// cross-target rustc builds cannot normalize within the default recursion
+// limit; they do not weaken the synchronization requirements of MountFS.
+unsafe impl Send for MountExternalGuard {}
+unsafe impl Sync for MountExternalGuard {}
+
 #[derive(Debug)]
 pub struct SuperBlockState {
     flags: RwSem<MountFlags>,

@@ -24,8 +24,7 @@ impl Syscall for SysStatfsHandle {
         let path = Self::path(args);
         let user_statfs = Self::statfs(args);
         let mut writer = UserBufferWriter::new(user_statfs, size_of::<PosixStatfs>(), true)?;
-        let path = vfs_check_and_clone_cstr(path, Some(MAX_PATHLEN))
-            .unwrap()
+        let path = vfs_check_and_clone_cstr(path, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
         if path.is_empty() {

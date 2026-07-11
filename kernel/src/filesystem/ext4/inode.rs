@@ -13,8 +13,10 @@ use crate::{
         casting::DowncastArc,
         mutex::{Mutex, MutexGuard},
         rwsem::RwSem,
+        wait_queue::WaitQueue,
     },
     mm::{truncate::truncate_inode_pages, MemoryManagementArch},
+    process::{ProcessManager, RawPid},
     time::PosixTimeSpec,
 };
 use alloc::{
@@ -47,6 +49,145 @@ bitflags! {
         /// 仅时间戳脏（lazytime），对应 I_DIRTY_TIME (1 << 11)
         #[allow(dead_code)]
         const TIME_DIRTY    = 1 << 11;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Ext4InodeLifecycleState {
+    Live,
+    Freeing,
+    Retired,
+    Poisoned(SystemError),
+}
+
+#[derive(Debug)]
+struct Ext4InodeLifecycleInner {
+    state: Ext4InodeLifecycleState,
+    active_operations: usize,
+    operation_owners: BTreeMap<RawPid, usize>,
+}
+
+#[derive(Debug)]
+pub(super) struct Ext4InodeLifecycle {
+    inner: Mutex<Ext4InodeLifecycleInner>,
+    link_mutation: Mutex<()>,
+    wait_queue: WaitQueue,
+}
+
+impl Ext4InodeLifecycle {
+    pub(super) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(Ext4InodeLifecycleInner {
+                state: Ext4InodeLifecycleState::Live,
+                active_operations: 0,
+                operation_owners: BTreeMap::new(),
+            }),
+            link_mutation: Mutex::new(()),
+            wait_queue: WaitQueue::default(),
+        })
+    }
+
+    pub(super) fn state(&self) -> Ext4InodeLifecycleState {
+        self.inner.lock().state.clone()
+    }
+
+    /// Serializes link-count mutations for all aliases of this canonical inode.
+    pub(super) fn lock_link_mutation(&self) -> MutexGuard<'_, ()> {
+        self.link_mutation.lock()
+    }
+
+    pub(super) fn begin_operation(self: &Arc<Self>) -> Result<Ext4InodeOperation, SystemError> {
+        let owner = ProcessManager::current_pcb().raw_pid();
+        let mut inner = self.inner.lock();
+        match inner.state.clone() {
+            Ext4InodeLifecycleState::Live => {}
+            Ext4InodeLifecycleState::Freeing if inner.operation_owners.contains_key(&owner) => {}
+            Ext4InodeLifecycleState::Freeing => return Err(SystemError::EBUSY),
+            Ext4InodeLifecycleState::Retired => return Err(SystemError::ESTALE),
+            Ext4InodeLifecycleState::Poisoned(error) => return Err(error),
+        }
+
+        let active_operations = inner
+            .active_operations
+            .checked_add(1)
+            .ok_or(SystemError::EOVERFLOW)?;
+        let owner_depth = inner
+            .operation_owners
+            .get(&owner)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(SystemError::EOVERFLOW)?;
+        inner.active_operations = active_operations;
+        inner.operation_owners.insert(owner, owner_depth);
+        Ok(Ext4InodeOperation {
+            lifecycle: self.clone(),
+            owner,
+        })
+    }
+
+    pub(super) fn begin_freeing(&self) -> Result<(), SystemError> {
+        let mut inner = self.inner.lock();
+        match inner.state.clone() {
+            Ext4InodeLifecycleState::Live => {
+                inner.state = Ext4InodeLifecycleState::Freeing;
+                Ok(())
+            }
+            Ext4InodeLifecycleState::Freeing => Err(SystemError::EBUSY),
+            Ext4InodeLifecycleState::Retired => Err(SystemError::ESTALE),
+            Ext4InodeLifecycleState::Poisoned(error) => Err(error),
+        }
+    }
+
+    pub(super) fn wait_for_quiescent(&self) {
+        self.wait_queue.wait_until(|| {
+            let inner = self.inner.lock();
+            (inner.active_operations == 0).then_some(())
+        });
+    }
+
+    pub(super) fn wait_while_freeing(&self) -> Ext4InodeLifecycleState {
+        self.wait_queue.wait_until(|| {
+            let state = self.inner.lock().state.clone();
+            (state != Ext4InodeLifecycleState::Freeing).then_some(state)
+        })
+    }
+
+    pub(super) fn set_state(&self, state: Ext4InodeLifecycleState) {
+        self.inner.lock().state = state;
+        self.wait_queue.wake_all();
+    }
+}
+
+#[must_use]
+pub(super) struct Ext4InodeOperation {
+    lifecycle: Arc<Ext4InodeLifecycle>,
+    owner: RawPid,
+}
+
+impl Drop for Ext4InodeOperation {
+    fn drop(&mut self) {
+        let should_wake = {
+            let mut inner = self.lifecycle.inner.lock();
+            debug_assert!(inner.active_operations > 0);
+            inner.active_operations = inner.active_operations.saturating_sub(1);
+            let remove_owner =
+                if let Some(owner_depth) = inner.operation_owners.get_mut(&self.owner) {
+                    debug_assert!(*owner_depth > 0);
+                    *owner_depth = owner_depth.saturating_sub(1);
+                    *owner_depth == 0
+                } else {
+                    debug_assert!(false, "missing ext4 lifecycle operation owner");
+                    false
+                };
+            if remove_owner {
+                inner.operation_owners.remove(&self.owner);
+            }
+            inner.active_operations == 0
+        };
+        if should_wake {
+            self.lifecycle.wait_queue.wake_all();
+        }
     }
 }
 
@@ -86,6 +227,8 @@ pub struct LockedExt4Inode(
     pub(super) Mutex<Ext4Inode>,
     pub(super) Mutex<()>,
     pub(super) RwSem<()>,
+    pub(super) Mutex<()>,
+    pub(super) Arc<Ext4InodeLifecycle>,
 );
 
 impl IndexNode for LockedExt4Inode {
@@ -107,11 +250,15 @@ impl IndexNode for LockedExt4Inode {
         file_type: vfs::FileType,
         mode: vfs::InodeMode,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let _operation = self.begin_operation()?;
+        let _namespace = self.3.lock();
         let mut guard = self.0.lock();
         // another_ext4的高4位是文件类型，低12位是权限
         let file_mode = InodeMode::from(file_type).union(mode);
         let file_mode = another_ext4::InodeMode::from_bits_truncate(file_mode.bits() as u16);
-        let ext4 = &guard.concret_fs().fs;
+        let fs = guard.concret_fs();
+        let _reuse = fs.begin_allocation()?;
+        let ext4 = &fs.fs;
 
         let id = if file_type == vfs::FileType::Dir {
             ext4.mkdir(guard.inner_inode_num, name, file_mode)?
@@ -122,12 +269,13 @@ impl IndexNode for LockedExt4Inode {
         let dname = DName::from(name);
         // 通过self_ref获取Arc<Self>，然后转换为Arc<dyn IndexNode>
         let self_arc = guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
-        let inode = LockedExt4Inode::new(
+        let inode = fs.publish_allocated_inode(
             id,
-            guard.fs_ptr.clone(),
             dname.clone(),
             Some(Arc::downgrade(&self_arc)),
-        );
+            Self::disk_file_type(file_type),
+            &_reuse,
+        )?;
         // 更新 children 缓存
         guard.children.insert(dname, inode.clone());
         drop(guard);
@@ -155,6 +303,7 @@ impl IndexNode for LockedExt4Inode {
         buf: &mut [u8],
         data: PrivateData,
     ) -> Result<usize, SystemError> {
+        let _operation = self.begin_operation()?;
         let len = core::cmp::min(len, buf.len());
         let buf = &mut buf[0..len];
 
@@ -178,6 +327,7 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn read_sync(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let _operation = self.begin_operation()?;
         let (fs, inode_num) = {
             let guard = self.0.lock();
             (guard.concret_fs(), guard.inner_inode_num)
@@ -209,6 +359,7 @@ impl IndexNode for LockedExt4Inode {
         buf: &[u8],
         data: PrivateData,
     ) -> Result<usize, SystemError> {
+        let _operation = self.begin_operation()?;
         let len = core::cmp::min(len, buf.len());
         if len == 0 {
             return Ok(0);
@@ -280,7 +431,7 @@ impl IndexNode for LockedExt4Inode {
                 Ext4FileSystem::mark_inode_dirty(
                     &self_arc,
                     InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY,
-                );
+                )?;
             }
 
             Ok(write_len)
@@ -290,6 +441,7 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn write_sync(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        let _operation = self.begin_operation()?;
         let _io_guard = self.1.lock();
         let (fs, inode_num) = {
             let guard = self.0.lock();
@@ -331,20 +483,24 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let _operation = self.begin_operation()?;
+        let _namespace = self.3.lock();
         let mut guard = self.0.lock();
         let dname = DName::from(name);
         if let Some(child) = guard.children.get(&dname) {
-            return Ok(child.clone() as Arc<dyn IndexNode>);
+            let child = child.clone();
+            let fs = guard.concret_fs();
+            if fs.validate_inode(&child).is_ok() {
+                return Ok(child as Arc<dyn IndexNode>);
+            }
+            guard.children.remove(&dname);
         }
-        let next_inode = guard.concret_fs().fs.lookup(guard.inner_inode_num, name)?;
+        let fs = guard.concret_fs();
+        let next_inode = fs.fs.lookup(guard.inner_inode_num, name)?;
         // 通过self_ref获取Arc<Self>，然后转换为Arc<dyn IndexNode>
         let self_arc = guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
-        let inode = LockedExt4Inode::new(
-            next_inode,
-            guard.fs_ptr.clone(),
-            dname.clone(),
-            Some(Arc::downgrade(&self_arc)),
-        );
+        let inode =
+            fs.get_or_create_inode(next_inode, dname.clone(), Some(Arc::downgrade(&self_arc)))?;
         guard.children.insert(dname, inode.clone());
         Ok(inode)
     }
@@ -363,6 +519,7 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
+        let _operation = self.begin_operation()?;
         let guard = self.0.lock();
         let dentry = guard.concret_fs().fs.listdir(guard.inner_inode_num)?;
         let mut list = Vec::new();
@@ -373,14 +530,24 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
+        let _operation = self.begin_operation()?;
+        let _namespace = self.3.lock();
         let mut guard = self.0.lock();
-        let ext4 = &guard.concret_fs().fs;
+        let fs = guard.concret_fs();
+        let ext4 = &fs.fs;
         let inode_num = guard.inner_inode_num;
 
         let other_arc = other
             .clone()
             .downcast_arc::<LockedExt4Inode>()
             .ok_or(SystemError::EINVAL)?;
+        let other_fs = other_arc.0.lock().concret_fs();
+        if !Arc::ptr_eq(&fs, &other_fs) {
+            return Err(SystemError::EXDEV);
+        }
+        let other_lifecycle = other_arc.lifecycle().clone();
+        let _link_mutation = other_lifecycle.lock_link_mutation();
+        let _other_operation = other_arc.begin_operation()?;
         let other_inode_num = other_arc.0.lock().inner_inode_num;
 
         let my_attr = ext4.getattr(inode_num)?;
@@ -407,20 +574,82 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
+        let _operation = self.begin_operation()?;
+        let _namespace = self.3.lock();
         let mut guard = self.0.lock();
-        let ext4 = &guard.concret_fs().fs;
+        let fs = guard.concret_fs();
+        let ext4 = &fs.fs;
         let inode_num = guard.inner_inode_num;
         let attr = ext4.getattr(inode_num)?;
         if attr.ftype != another_ext4::FileType::Directory {
             return Err(SystemError::ENOTDIR);
         }
-        ext4.unlink(inode_num, name)?;
+        let target_num = ext4.lookup(inode_num, name)?;
+        if ext4.getattr(target_num)?.ftype == FileType::Directory {
+            return Err(SystemError::EISDIR);
+        }
+        let self_arc = guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+        let target = fs.get_or_create_inode(
+            target_num,
+            DName::from(name),
+            Some(Arc::downgrade(&self_arc)),
+        )?;
+        let target_lifecycle = target.lifecycle().clone();
+        let _link_mutation = target_lifecycle.lock_link_mutation();
+        let target_attr = ext4.getattr(target_num)?;
+
+        // Removing a non-final hard link must not enter the eviction lifecycle: the
+        // canonical inode and its shared page cache remain live for the other aliases.
+        if target_attr.links > 1 {
+            let _target_operation = target.begin_operation()?;
+            if ext4.lookup(inode_num, name)? != target_num {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+            ext4.unlink(inode_num, name)?;
+            let _ = guard.children.remove(&DName::from(name));
+            return Ok(());
+        }
+
+        let tombstone = fs.begin_freeing(&target)?;
+        match ext4.lookup(inode_num, name) {
+            Ok(current) if current == target_num => {}
+            Ok(_) => {
+                fs.abort_freeing(tombstone)?;
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+            Err(error) => {
+                fs.abort_freeing(tombstone)?;
+                return Err(error.into());
+            }
+        }
+        let _reuse = fs.begin_reclaim();
+        if let Some(page_cache) = target.page_cache() {
+            truncate_inode_pages(page_cache, 0);
+        }
+        let result = ext4.unlink(inode_num, name).map_err(SystemError::from);
+        if let Err(error) = result {
+            let _ = fs.poison_freeing(tombstone, error.clone());
+            return Err(error);
+        }
+        match ext4.getattr(target_num) {
+            Ok(_) => fs.abort_freeing(tombstone)?,
+            Err(error) => {
+                let error = SystemError::from(error);
+                if error == SystemError::EINVAL {
+                    fs.complete_freeing(tombstone)?;
+                } else {
+                    let _ = fs.poison_freeing(tombstone, error.clone());
+                    return Err(error);
+                }
+            }
+        }
         // 清理 children 缓存
         let _ = guard.children.remove(&DName::from(name));
         Ok(())
     }
 
     fn metadata(&self) -> Result<vfs::Metadata, SystemError> {
+        let _operation = self.begin_operation()?;
         let (fs, inode_num, vfs_inode_id, cached_size, cached_mtime) = {
             let guard = self.0.lock();
             (
@@ -474,6 +703,7 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn sync(&self) -> Result<(), SystemError> {
+        let _operation = self.begin_operation()?;
         if let Some(page_cache) = self.page_cache() {
             page_cache.manager().sync()?;
         }
@@ -481,6 +711,7 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn datasync(&self) -> Result<(), SystemError> {
+        let _operation = self.begin_operation()?;
         if let Some(page_cache) = self.page_cache() {
             page_cache.manager().sync()?;
         }
@@ -502,6 +733,7 @@ impl IndexNode for LockedExt4Inode {
         datasync: bool,
         _data: PrivateData,
     ) -> Result<(), SystemError> {
+        let _operation = self.begin_operation()?;
         if let Some(page_cache) = self.page_cache() {
             let start_index = start >> MMArch::PAGE_SHIFT;
             let end_index = end >> MMArch::PAGE_SHIFT;
@@ -521,6 +753,7 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn set_metadata(&self, metadata: &vfs::Metadata) -> Result<(), SystemError> {
+        let _operation = self.begin_operation()?;
         let mode = metadata.mode.union(InodeMode::from(metadata.file_type));
 
         let to_ext4_time =
@@ -559,6 +792,7 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn resize(&self, len: usize) -> Result<(), SystemError> {
+        let _operation = self.begin_operation()?;
         let _size_guard = self.2.write();
         let (fs, inode_num, page_cache, cached_size) = {
             let guard = self.0.lock();
@@ -626,13 +860,93 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn rmdir(&self, name: &str) -> Result<(), SystemError> {
+        let _operation = self.begin_operation()?;
+        let _namespace = self.3.lock();
         let mut guard = self.0.lock();
-        let concret_fs = &guard.concret_fs().fs;
+        let fs = guard.concret_fs();
+        let concret_fs = &fs.fs;
         let inode_num = guard.inner_inode_num;
         if concret_fs.getattr(inode_num)?.ftype != FileType::Directory {
             return Err(SystemError::ENOTDIR);
         }
-        concret_fs.rmdir(inode_num, name)?;
+        let target_num = concret_fs.lookup(inode_num, name)?;
+        if target_num == inode_num {
+            return Err(if name == "." {
+                SystemError::EINVAL
+            } else {
+                SystemError::ENOTEMPTY
+            });
+        }
+        if concret_fs.getattr(target_num)?.ftype != FileType::Directory {
+            return Err(SystemError::ENOTDIR);
+        }
+        if concret_fs.listdir(target_num)?.len() > 2 {
+            return Err(SystemError::ENOTEMPTY);
+        }
+        let self_arc = guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+        let target = fs.get_or_create_inode(
+            target_num,
+            DName::from(name),
+            Some(Arc::downgrade(&self_arc)),
+        )?;
+        let target_lifecycle = target.lifecycle().clone();
+        let _link_mutation = target_lifecycle.lock_link_mutation();
+        let tombstone = fs.begin_freeing(&target)?;
+        match concret_fs.lookup(inode_num, name) {
+            Ok(current) if current == target_num => {}
+            Ok(_) => {
+                fs.abort_freeing(tombstone)?;
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+            Err(error) => {
+                fs.abort_freeing(tombstone)?;
+                return Err(error.into());
+            }
+        }
+        let target_attr = match concret_fs.getattr(target_num) {
+            Ok(attr) => attr,
+            Err(error) => {
+                fs.abort_freeing(tombstone)?;
+                return Err(error.into());
+            }
+        };
+        if target_attr.ftype != FileType::Directory {
+            fs.abort_freeing(tombstone)?;
+            return Err(SystemError::ENOTDIR);
+        }
+        match concret_fs.listdir(target_num) {
+            Ok(entries) if entries.len() <= 2 => {}
+            Ok(_) => {
+                fs.abort_freeing(tombstone)?;
+                return Err(SystemError::ENOTEMPTY);
+            }
+            Err(error) => {
+                fs.abort_freeing(tombstone)?;
+                return Err(error.into());
+            }
+        }
+        let _reuse = fs.begin_reclaim();
+        let result = concret_fs.rmdir(inode_num, name).map_err(SystemError::from);
+        if let Err(error) = result {
+            let _ = fs.poison_freeing(tombstone, error.clone());
+            return Err(error);
+        }
+        match concret_fs.getattr(target_num) {
+            Ok(_) => {
+                let error = SystemError::EIO;
+                let _ = fs.poison_freeing(tombstone, error.clone());
+                return Err(error);
+            }
+            Err(error) => {
+                let error = SystemError::from(error);
+                if error == SystemError::EINVAL {
+                    fs.complete_freeing(tombstone)?;
+                } else {
+                    let _ = fs.poison_freeing(tombstone, error.clone());
+                    return Err(error);
+                }
+            }
+        }
         // 清理 children 缓存
         let _ = guard.children.remove(&DName::from(name));
 
@@ -644,6 +958,7 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn getxattr(&self, name: &str, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let _operation = self.begin_operation()?;
         let guard = self.0.lock();
         let ext4 = &guard.concret_fs().fs;
         let inode_num = guard.inner_inode_num;
@@ -673,6 +988,7 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn setxattr(&self, name: &str, value: &[u8], flags: XattrFlags) -> Result<usize, SystemError> {
+        let _operation = self.begin_operation()?;
         let guard = self.0.lock();
         let ext4 = &guard.concret_fs().fs;
         let inode_num = guard.inner_inode_num;
@@ -693,6 +1009,7 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn listxattr(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let _operation = self.begin_operation()?;
         let guard = self.0.lock();
         let ext4 = &guard.concret_fs().fs;
         let inode_num = guard.inner_inode_num;
@@ -724,6 +1041,7 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn removexattr(&self, name: &str) -> Result<usize, SystemError> {
+        let _operation = self.begin_operation()?;
         let guard = self.0.lock();
         let ext4 = &guard.concret_fs().fs;
         let inode_num = guard.inner_inode_num;
@@ -746,9 +1064,13 @@ impl IndexNode for LockedExt4Inode {
         if file_type == vfs::FileType::File {
             return self.create(filename, vfs::FileType::File, mode);
         }
+        let _operation = self.begin_operation()?;
+        let _namespace = self.3.lock();
 
         let mut guard = self.0.lock();
-        let ext4 = &guard.concret_fs().fs;
+        let fs = guard.concret_fs();
+        let _reuse = fs.begin_allocation()?;
+        let ext4 = &fs.fs;
         let inode_num = guard.inner_inode_num;
 
         if ext4.getattr(inode_num)?.ftype != FileType::Directory {
@@ -779,12 +1101,13 @@ impl IndexNode for LockedExt4Inode {
         // Wrap as VFS inode and cache
         let dname = DName::from(filename);
         let self_arc = guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
-        let inode = LockedExt4Inode::new(
+        let inode = fs.publish_allocated_inode(
             id,
-            guard.fs_ptr.clone(),
             dname.clone(),
             Some(Arc::downgrade(&self_arc)),
-        );
+            Self::disk_file_type(file_type),
+            &_reuse,
+        )?;
         guard.children.insert(dname, inode.clone());
         drop(guard);
         Ok(inode as Arc<dyn IndexNode>)
@@ -801,10 +1124,12 @@ impl IndexNode for LockedExt4Inode {
         new_name: &str,
         flags: RenameFlags,
     ) -> Result<(), SystemError> {
+        let _operation = self.begin_operation()?;
         let target_locked = target
             .clone()
             .downcast_arc::<LockedExt4Inode>()
             .ok_or(SystemError::EXDEV)?;
+        let _target_operation = target_locked.begin_operation()?;
 
         let (ext4_fs, src_inode_num) = {
             let guard = self.0.lock();
@@ -812,6 +1137,17 @@ impl IndexNode for LockedExt4Inode {
         };
         let ext4 = &ext4_fs.fs;
         let target_inode_num = target_locked.0.lock().inner_inode_num;
+        if !Arc::ptr_eq(&ext4_fs, &target_locked.0.lock().concret_fs()) {
+            return Err(SystemError::EXDEV);
+        }
+
+        let (_first_namespace, _second_namespace) = if src_inode_num == target_inode_num {
+            (self.3.lock(), None)
+        } else if src_inode_num < target_inode_num {
+            (self.3.lock(), Some(target_locked.3.lock()))
+        } else {
+            (target_locked.3.lock(), Some(self.3.lock()))
+        };
 
         let old_dname = DName::from(old_name);
         let new_dname = DName::from(new_name);
@@ -843,55 +1179,288 @@ impl IndexNode for LockedExt4Inode {
             return Ok(());
         }
 
-        // Check if target exists (for cache update and page cache cleanup)
-        let had_dst = ext4.lookup(target_inode_num, new_name).is_ok();
-
-        // Clear target's page cache if it exists and is a file
-        if had_dst {
-            if let Ok(target_inode) = target_locked.find(new_name) {
-                if let Some(pc) = target_inode.page_cache() {
-                    truncate_inode_pages(pc, 0);
+        // Capture the replacement target while both parent namespace locks are held.
+        let dst_inode_num = ext4.lookup(target_inode_num, new_name).ok();
+        let src_child_num = ext4.lookup(src_inode_num, old_name)?;
+        if dst_inode_num == Some(src_child_num) {
+            return Ok(());
+        }
+        let had_dst = dst_inode_num.is_some();
+        let dst_inode = if let Some(dst_inode_num) = dst_inode_num {
+            let target_parent = target_locked
+                .0
+                .lock()
+                .self_ref
+                .upgrade()
+                .ok_or(SystemError::ENOENT)?;
+            Some(ext4_fs.get_or_create_inode(
+                dst_inode_num,
+                new_dname.clone(),
+                Some(Arc::downgrade(&target_parent)),
+            )?)
+        } else {
+            None
+        };
+        let dst_lifecycle = dst_inode.as_ref().map(|inode| inode.lifecycle().clone());
+        let _dst_link_mutation = dst_lifecycle
+            .as_ref()
+            .map(|lifecycle| lifecycle.lock_link_mutation());
+        if let Some(dst_inode_num) = dst_inode_num {
+            let src_type = ext4.getattr(src_child_num)?.ftype;
+            let dst_type = ext4.getattr(dst_inode_num)?.ftype;
+            match (
+                src_type == FileType::Directory,
+                dst_type == FileType::Directory,
+            ) {
+                (true, false) => return Err(SystemError::ENOTDIR),
+                (false, true) => return Err(SystemError::EISDIR),
+                (true, true) if ext4.listdir(dst_inode_num)?.len() > 2 => {
+                    return Err(SystemError::ENOTEMPTY);
                 }
+                _ => {}
             }
         }
 
+        let mut resulting_whiteout = None;
         if flags.contains(RenameFlags::WHITEOUT) {
+            // Prepare and drain the replacement target before changing the source
+            // namespace. No fallible target preparation may occur after exchange.
+            let mut tombstone = None;
+            let mut will_free = false;
+            if let (Some(dst_inode), Some(dst_inode_num)) = (&dst_inode, dst_inode_num) {
+                let attr = ext4.getattr(dst_inode_num)?;
+                will_free = if attr.ftype == FileType::Directory {
+                    attr.links <= 2
+                } else {
+                    attr.links <= 1
+                };
+                if will_free {
+                    tombstone = Some(ext4_fs.begin_freeing(dst_inode)?);
+                    if ext4.lookup(target_inode_num, new_name).ok() != Some(dst_inode_num) {
+                        ext4_fs.abort_freeing(tombstone.take().unwrap())?;
+                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                    }
+                    let fresh_attr = match ext4.getattr(dst_inode_num) {
+                        Ok(attr) => attr,
+                        Err(error) => {
+                            ext4_fs.abort_freeing(tombstone.take().unwrap())?;
+                            return Err(error.into());
+                        }
+                    };
+                    if fresh_attr.ftype == FileType::Directory {
+                        match ext4.listdir(dst_inode_num) {
+                            Ok(entries) if entries.len() <= 2 => {}
+                            Ok(_) => {
+                                ext4_fs.abort_freeing(tombstone.take().unwrap())?;
+                                return Err(SystemError::ENOTEMPTY);
+                            }
+                            Err(error) => {
+                                ext4_fs.abort_freeing(tombstone.take().unwrap())?;
+                                return Err(error.into());
+                            }
+                        }
+                    }
+                }
+            }
+
             let mut temp_name = String::new();
+            let mut whiteout_inode = None;
+            let source_parent = self
+                .0
+                .lock()
+                .self_ref
+                .upgrade()
+                .ok_or(SystemError::ENOENT)?;
             for _ in 0..32 {
                 let candidate = format!(".dragonos-whiteout-{}", generate_inode_id().data());
                 if ext4.lookup(src_inode_num, &candidate).is_ok() {
                     continue;
                 }
-                ext4.mknod(
+                let allocation = {
+                    match ext4_fs.begin_allocation() {
+                        Ok(guard) => guard,
+                        Err(error) => {
+                            if let Some(tombstone) = tombstone.take() {
+                                ext4_fs.abort_freeing(tombstone)?;
+                            }
+                            return Err(error);
+                        }
+                    }
+                };
+                let whiteout_num = match ext4.mknod(
                     src_inode_num,
                     &candidate,
                     another_ext4::InodeMode::CHARDEV
                         | another_ext4::InodeMode::from_bits_retain(0o600),
                     WHITEOUT_DEV.major().data(),
                     WHITEOUT_DEV.minor(),
-                )?;
+                ) {
+                    Ok(inode_num) => inode_num,
+                    Err(error) => {
+                        if let Some(tombstone) = tombstone.take() {
+                            ext4_fs.abort_freeing(tombstone)?;
+                        }
+                        return Err(error.into());
+                    }
+                };
+                whiteout_inode = match ext4_fs.publish_allocated_inode(
+                    whiteout_num,
+                    DName::from(candidate.as_str()),
+                    Some(Arc::downgrade(&source_parent)),
+                    FileType::CharacterDev,
+                    &allocation,
+                ) {
+                    Ok(inode) => Some(inode),
+                    Err(error) => {
+                        drop(allocation);
+                        let _reclaim = ext4_fs.begin_reclaim();
+                        if ext4.unlink(src_inode_num, &candidate).is_err() {
+                            ext4_fs.fail_stop_lifecycle();
+                            if let Some(tombstone) = tombstone.take() {
+                                let _ = ext4_fs.poison_freeing(tombstone, SystemError::EIO);
+                            }
+                            return Err(SystemError::EIO);
+                        }
+                        if let Some(tombstone) = tombstone.take() {
+                            ext4_fs.abort_freeing(tombstone)?;
+                        }
+                        return Err(error);
+                    }
+                };
                 temp_name = candidate;
                 break;
             }
             if temp_name.is_empty() {
+                if let Some(tombstone) = tombstone.take() {
+                    ext4_fs.abort_freeing(tombstone)?;
+                }
                 return Err(SystemError::EEXIST);
             }
 
             if let Err(err) =
                 ext4.rename_exchange(src_inode_num, old_name, src_inode_num, &temp_name)
             {
-                let _ = ext4.unlink(src_inode_num, &temp_name);
+                if let Some(tombstone) = tombstone.take() {
+                    ext4_fs.abort_freeing(tombstone)?;
+                }
+                Self::reclaim_temporary_inode(
+                    &ext4_fs,
+                    src_inode_num,
+                    &temp_name,
+                    whiteout_inode.take().unwrap(),
+                )?;
                 return Err(err.into());
             }
-
+            let _reuse = tombstone.as_ref().map(|_| ext4_fs.begin_reclaim());
+            if will_free {
+                if let Some(pc) = dst_inode.as_ref().and_then(|inode| inode.page_cache()) {
+                    truncate_inode_pages(pc, 0);
+                }
+            }
             if let Err(err) = ext4.rename(src_inode_num, &temp_name, target_inode_num, new_name) {
-                let _ = ext4.rename_exchange(src_inode_num, old_name, src_inode_num, &temp_name);
-                let _ = ext4.unlink(src_inode_num, &temp_name);
-                return Err(err.into());
+                let rename_error = SystemError::from(err);
+                let rollback =
+                    ext4.rename_exchange(src_inode_num, old_name, src_inode_num, &temp_name);
+                if let Some(tombstone) = tombstone.take() {
+                    let _ = ext4_fs.poison_freeing(tombstone, rename_error.clone());
+                }
+                drop(_reuse);
+                if rollback.is_err() {
+                    let whiteout_tombstone = ext4_fs
+                        .begin_freeing(whiteout_inode.as_ref().expect("whiteout was published"))?;
+                    let _ = ext4_fs.poison_freeing(whiteout_tombstone, SystemError::EIO);
+                    return Err(SystemError::EIO);
+                }
+                Self::reclaim_temporary_inode(
+                    &ext4_fs,
+                    src_inode_num,
+                    &temp_name,
+                    whiteout_inode.take().unwrap(),
+                )?;
+                return Err(rename_error);
             }
+            if let (Some(dst_inode_num), Some(tombstone)) = (dst_inode_num, tombstone.take()) {
+                match ext4.getattr(dst_inode_num) {
+                    Ok(_) => ext4_fs.abort_freeing(tombstone)?,
+                    Err(error) => {
+                        let error = SystemError::from(error);
+                        if error == SystemError::EINVAL {
+                            ext4_fs.complete_freeing(tombstone)?;
+                        } else {
+                            let _ = ext4_fs.poison_freeing(tombstone, error.clone());
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+            if let Some(whiteout) = &whiteout_inode {
+                whiteout.0.lock().dname = old_dname.clone();
+            }
+            resulting_whiteout = whiteout_inode;
         } else {
-            // ext4 library now correctly handles atomic replace
-            ext4.rename(src_inode_num, old_name, target_inode_num, new_name)?;
+            if let Some(dst_inode) = &dst_inode {
+                let attr = ext4.getattr(dst_inode_num.unwrap())?;
+                let will_free = if attr.ftype == FileType::Directory {
+                    attr.links <= 2
+                } else {
+                    attr.links <= 1
+                };
+                if !will_free {
+                    ext4.rename(src_inode_num, old_name, target_inode_num, new_name)?;
+                } else {
+                    let tombstone = ext4_fs.begin_freeing(dst_inode)?;
+                    if ext4.lookup(target_inode_num, new_name).ok() != dst_inode_num {
+                        ext4_fs.abort_freeing(tombstone)?;
+                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                    }
+                    let fresh_attr = match ext4.getattr(dst_inode_num.unwrap()) {
+                        Ok(attr) => attr,
+                        Err(error) => {
+                            ext4_fs.abort_freeing(tombstone)?;
+                            return Err(error.into());
+                        }
+                    };
+                    if fresh_attr.ftype == FileType::Directory {
+                        match ext4.listdir(dst_inode_num.unwrap()) {
+                            Ok(entries) if entries.len() <= 2 => {}
+                            Ok(_) => {
+                                ext4_fs.abort_freeing(tombstone)?;
+                                return Err(SystemError::ENOTEMPTY);
+                            }
+                            Err(error) => {
+                                ext4_fs.abort_freeing(tombstone)?;
+                                return Err(error.into());
+                            }
+                        }
+                    }
+                    let _reuse = ext4_fs.begin_reclaim();
+                    if let Some(pc) = dst_inode.page_cache() {
+                        truncate_inode_pages(pc, 0);
+                    }
+                    if let Err(err) =
+                        ext4.rename(src_inode_num, old_name, target_inode_num, new_name)
+                    {
+                        let error = SystemError::from(err);
+                        let _ = ext4_fs.poison_freeing(tombstone, error.clone());
+                        return Err(error);
+                    }
+                    match ext4.getattr(dst_inode_num.unwrap()) {
+                        Ok(_) => ext4_fs.abort_freeing(tombstone)?,
+                        Err(error) => {
+                            let error = SystemError::from(error);
+                            if error == SystemError::EINVAL {
+                                ext4_fs.complete_freeing(tombstone)?;
+                            } else {
+                                let _ = ext4_fs.poison_freeing(tombstone, error.clone());
+                                return Err(error);
+                            }
+                        }
+                    }
+                }
+            } else {
+                // ext4 library now correctly handles atomic replace
+                ext4.rename(src_inode_num, old_name, target_inode_num, new_name)?;
+            }
         }
 
         // Update cache
@@ -903,11 +1472,71 @@ impl IndexNode for LockedExt4Inode {
             &new_dname,
             had_dst,
         );
+        if let Some(whiteout) = resulting_whiteout {
+            self.0.lock().children.insert(old_dname, whiteout);
+        }
         Ok(())
     }
 }
 
 impl LockedExt4Inode {
+    fn reclaim_temporary_inode(
+        fs: &Arc<Ext4FileSystem>,
+        parent_inode_num: u32,
+        name: &str,
+        inode: Arc<LockedExt4Inode>,
+    ) -> Result<(), SystemError> {
+        let lifecycle = inode.lifecycle().clone();
+        let _link_mutation = lifecycle.lock_link_mutation();
+        let tombstone = fs.begin_freeing(&inode)?;
+        let _reuse = fs.begin_reclaim();
+        if let Err(error) = fs.fs.unlink(parent_inode_num, name) {
+            let error = SystemError::from(error);
+            let _ = fs.poison_freeing(tombstone, error.clone());
+            return Err(error);
+        }
+        let inode_num = inode.0.lock().inner_inode_num;
+        match fs.fs.getattr(inode_num) {
+            Ok(_) => {
+                let error = SystemError::EIO;
+                let _ = fs.poison_freeing(tombstone, error.clone());
+                Err(error)
+            }
+            Err(error) => {
+                let error = SystemError::from(error);
+                if error == SystemError::EINVAL {
+                    fs.complete_freeing(tombstone)
+                } else {
+                    let _ = fs.poison_freeing(tombstone, error.clone());
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    fn disk_file_type(file_type: vfs::FileType) -> FileType {
+        match file_type {
+            vfs::FileType::Dir => FileType::Directory,
+            vfs::FileType::BlockDevice => FileType::BlockDev,
+            vfs::FileType::CharDevice
+            | vfs::FileType::FramebufferDevice
+            | vfs::FileType::KvmDevice => FileType::CharacterDev,
+            vfs::FileType::Pipe => FileType::Fifo,
+            vfs::FileType::SymLink => FileType::SymLink,
+            vfs::FileType::Socket => FileType::Socket,
+            vfs::FileType::File => FileType::RegularFile,
+        }
+    }
+
+    #[inline]
+    fn begin_operation(&self) -> Result<Ext4InodeOperation, SystemError> {
+        self.4.begin_operation()
+    }
+
+    pub(super) fn lifecycle(&self) -> &Arc<Ext4InodeLifecycle> {
+        &self.4
+    }
+
     /// 更新 rename 后的缓存
     fn update_rename_cache(
         &self,
@@ -1025,12 +1654,16 @@ impl LockedExt4Inode {
         fs_ptr: Weak<super::filesystem::Ext4FileSystem>,
         dname: DName,
         parent: Option<Weak<LockedExt4Inode>>,
-    ) -> Arc<Self> {
+        known_file_type: Option<FileType>,
+    ) -> Result<Arc<Self>, SystemError> {
+        let lifecycle = Ext4InodeLifecycle::new();
         let inode = Arc::new({
             LockedExt4Inode(
                 Mutex::new(Ext4Inode::new(inode_num, fs_ptr.clone(), dname, parent)),
                 Mutex::new(()),
                 RwSem::new(()),
+                Mutex::new(()),
+                lifecycle,
             )
         });
         let mut guard = inode.0.lock();
@@ -1049,17 +1682,19 @@ impl LockedExt4Inode {
 
         // 对于 FIFO，创建 pipe inode
         if let Some(fs) = fs_ptr.upgrade() {
-            if let Ok(attr) = fs.fs.getattr(inode_num) {
-                if attr.ftype == FileType::Fifo {
-                    let pipe_inode = LockedPipeInode::new();
-                    pipe_inode.set_fifo();
-                    guard.special_node = Some(SpecialNodeData::Pipe(pipe_inode));
-                }
+            let file_type = match known_file_type {
+                Some(file_type) => file_type,
+                None => fs.fs.getattr(inode_num)?.ftype,
+            };
+            if file_type == FileType::Fifo {
+                let pipe_inode = LockedPipeInode::new();
+                pipe_inode.set_fifo();
+                guard.special_node = Some(SpecialNodeData::Pipe(pipe_inode));
             }
         }
 
         drop(guard);
-        return inode;
+        Ok(inode)
     }
 
     fn file_type(ftype: FileType) -> vfs::FileType {
@@ -1111,6 +1746,7 @@ impl Ext4Inode {
 
 impl LockedExt4Inode {
     pub(super) fn flush_metadata(&self, datasync: bool) -> Result<(), SystemError> {
+        let _operation = self.begin_operation()?;
         let _io_guard = self.1.lock();
         let (fs, inode_num, dirty, cached_size, cached_mtime) = {
             let guard = self.0.lock();
@@ -1162,4 +1798,61 @@ impl Debug for Ext4Inode {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "Ext4Inode")
     }
+}
+
+pub(crate) fn run_lifecycle_selftests() -> String {
+    let mut failures = 0usize;
+    let mut report = String::new();
+    let mut append = |name: &str, ok: bool| {
+        if ok {
+            report.push_str(&format!("{name}=ok\n"));
+        } else {
+            failures += 1;
+            report.push_str(&format!("{name}=fail\n"));
+        }
+    };
+
+    let lifecycle = Ext4InodeLifecycle::new();
+    let operation = lifecycle.begin_operation();
+    append("live_operation", operation.is_ok());
+    drop(operation);
+    append("begin_freeing", lifecycle.begin_freeing().is_ok());
+    lifecycle.wait_for_quiescent();
+    lifecycle.set_state(Ext4InodeLifecycleState::Retired);
+    append(
+        "retired_rejects_operation",
+        lifecycle.begin_operation().err() == Some(SystemError::ESTALE),
+    );
+
+    let lifecycle = Ext4InodeLifecycle::new();
+    let outer = lifecycle.begin_operation().expect("live operation");
+    append("reentrant_begin_freeing", lifecycle.begin_freeing().is_ok());
+    let nested = lifecycle.begin_operation();
+    append("freeing_allows_owner_nested_operation", nested.is_ok());
+    drop(nested);
+    drop(outer);
+    lifecycle.wait_for_quiescent();
+    append(
+        "reentrant_operations_drained",
+        lifecycle.inner.lock().active_operations == 0,
+    );
+
+    let lifecycle = Ext4InodeLifecycle::new();
+    append("abort_begin", lifecycle.begin_freeing().is_ok());
+    lifecycle.set_state(Ext4InodeLifecycleState::Live);
+    append("abort_restores_live", lifecycle.begin_operation().is_ok());
+
+    let lifecycle = Ext4InodeLifecycle::new();
+    lifecycle.set_state(Ext4InodeLifecycleState::Poisoned(SystemError::EIO));
+    append(
+        "poison_is_observable",
+        lifecycle.begin_operation().err() == Some(SystemError::EIO),
+    );
+
+    if failures == 0 {
+        report.insert_str(0, "status=ok\n");
+    } else {
+        report.insert_str(0, &format!("status=fail failures={failures}\n"));
+    }
+    report
 }

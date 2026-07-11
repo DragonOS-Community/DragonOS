@@ -126,24 +126,30 @@ impl PacketSocket {
     pub(super) fn can_recv(&self) -> bool {
         !self.rx_buffer.lock().is_empty()
     }
-    fn dequeue(&self) -> Result<ReceivedPacket, SystemError> {
-        let packet = self
-            .rx_buffer
-            .lock()
-            .pop_front()
-            .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
-        self.rx_buffer_len.fetch_sub(1, Ordering::AcqRel);
+    fn dequeue(&self, peek: bool) -> Result<ReceivedPacket, SystemError> {
+        let mut queue = self.rx_buffer.lock();
+        let packet = if peek {
+            queue.front().cloned()
+        } else {
+            queue.pop_front()
+        }
+        .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+        drop(queue);
+        if !peek {
+            self.rx_buffer_len.fetch_sub(1, Ordering::AcqRel);
+        }
         Ok(packet)
     }
     fn wait_dequeue(&self, flags: PMSG) -> Result<ReceivedPacket, SystemError> {
-        if flags.intersects(PMSG::PEEK | PMSG::OOB) {
+        if flags.contains(PMSG::OOB) {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
+        let peek = flags.contains(PMSG::PEEK);
         if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
-            return self.dequeue();
+            return self.dequeue(peek);
         }
         loop {
-            match self.dequeue() {
+            match self.dequeue(peek) {
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
                     wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?
                 }

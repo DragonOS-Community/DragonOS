@@ -49,10 +49,10 @@ inline constexpr int kEthPAll = 0x0003;
 
 // mr_type constants for packet_mreq (corresponding to Linux if_packet.h)
 #ifndef PACKET_MR_PROMISC
-#define PACKET_MR_PROMISC 0
+#define PACKET_MR_PROMISC 1
 #endif
 #ifndef PACKET_MR_MULTICAST
-#define PACKET_MR_MULTICAST 1
+#define PACKET_MR_MULTICAST 0
 #endif
 #ifndef PACKET_MR_ALLMULTI
 #define PACKET_MR_ALLMULTI 2
@@ -64,13 +64,14 @@ inline constexpr int kEthPAll = 0x0003;
 namespace {
 
 // Manually define struct packet_mreq (corresponding to Linux struct packet_mreq).
-// Layout: mr_ifindex(u32) + mr_type(u32) + mr_alen(u16) + mr_address[8].
+// Layout: mr_ifindex(i32) + mr_type(u16) + mr_alen(u16) + mr_address[8].
 struct PacketMreq {
-    unsigned int mr_ifindex;
-    unsigned int mr_type;
+    int mr_ifindex;
+    unsigned short mr_type;
     unsigned short mr_alen;
     unsigned char mr_address[8];
 };
+static_assert(sizeof(PacketMreq) == 16, "packet_mreq must match the Linux UAPI layout");
 
 // RAII fd guard
 class FdGuard {

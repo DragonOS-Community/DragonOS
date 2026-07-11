@@ -54,7 +54,7 @@ pub struct PacketMetadata {
     pub vlan_tpid: u16,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ReceivedPacket {
     pub data: alloc::vec::Vec<u8>,
     pub metadata: PacketMetadata,

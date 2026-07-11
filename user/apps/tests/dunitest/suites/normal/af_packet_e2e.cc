@@ -624,6 +624,44 @@ TEST(AfPacketE2E, WildcardRecvmsgTruncAndAuxdata) {
     EXPECT_GE(aux->tp_net, static_cast<uint16_t>(kEthHdrLen));
 }
 
+TEST(AfPacketE2E, PeekDoesNotConsumeFrame) {
+    std::string ifname = DiscoverIfname();
+    int ifindex = ProbeIfindex(ifname);
+    if (ifindex < 0) {
+        GTEST_SKIP() << "No usable NIC found, skipping MSG_PEEK test";
+    }
+
+    uint8_t local_mac[6];
+    FdGuard fd(MakeBoundRaw(ifname, ifindex, local_mac));
+    ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+
+    uint8_t frame[kArpFrameLen];
+    BuildArpRequest(frame, local_mac);
+    uint8_t bcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    struct sockaddr_ll dst;
+    MakeDstLL(&dst, ifindex, bcast);
+    ASSERT_EQ(sendto(fd.Get(), frame, sizeof(frame), 0,
+                     reinterpret_cast<struct sockaddr*>(&dst), sizeof(dst)),
+              static_cast<ssize_t>(sizeof(frame)))
+        << ErrnoString(errno);
+
+    uint8_t peek_buf[kEthFrameLen + 64]{};
+    uint8_t recv_buf[kEthFrameLen + 64]{};
+    struct sockaddr_ll peek_from{};
+    struct sockaddr_ll recv_from{};
+    socklen_t peek_len = sizeof(peek_from);
+    socklen_t recv_len = sizeof(recv_from);
+    ssize_t peeked = recvfrom(fd.Get(), peek_buf, sizeof(peek_buf), MSG_PEEK | MSG_DONTWAIT,
+                              reinterpret_cast<struct sockaddr*>(&peek_from), &peek_len);
+    ASSERT_GT(peeked, 0) << ErrnoString(errno);
+    ssize_t received = recvfrom(fd.Get(), recv_buf, sizeof(recv_buf), MSG_DONTWAIT,
+                                reinterpret_cast<struct sockaddr*>(&recv_from), &recv_len);
+    ASSERT_EQ(received, peeked) << ErrnoString(errno);
+    EXPECT_EQ(std::memcmp(peek_buf, recv_buf, static_cast<size_t>(received)), 0);
+    EXPECT_EQ(peek_from.sll_protocol, recv_from.sll_protocol);
+    EXPECT_EQ(peek_from.sll_pkttype, recv_from.sll_pkttype);
+}
+
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

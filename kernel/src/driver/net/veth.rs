@@ -27,8 +27,6 @@ use alloc::fmt::Debug;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::cell::UnsafeCell;
-use core::ops::{Deref, DerefMut};
 use smoltcp::phy::DeviceCapabilities;
 use smoltcp::phy::{self, RxToken};
 use smoltcp::wire::{EthernetAddress, EthernetFrame, HardwareAddress, IpAddress, IpCidr};
@@ -66,8 +64,13 @@ impl Veth {
     }
 
     pub(self) fn to_peer(peer: &Arc<VethInterface>, data: &[u8]) {
+        let _ = Self::to_peer_owned(peer, data.to_vec());
+    }
+
+    fn to_peer_owned(peer: &Arc<VethInterface>, data: Vec<u8>) -> Result<(), SystemError> {
+        let napi = peer.napi_struct().ok_or(SystemError::ENOBUFS)?;
         let mut peer_veth = peer.driver.inner.lock();
-        peer_veth.rx_queue.push_back(data.to_vec());
+        peer_veth.rx_queue.push_back(data);
 
         // {
         //     let ether = EthernetFrame::new_checked(data).unwrap();
@@ -103,13 +106,8 @@ impl Veth {
         // }
 
         drop(peer_veth);
-
-        let Some(napi) = peer.napi_struct() else {
-            log::error!("Veth {} has no napi_struct", peer.name);
-            return;
-        };
-
         napi_schedule(napi);
+        Ok(())
     }
 
     fn to_bridge(bridge_data: &BridgeCommonData, data: &[u8]) {
@@ -177,22 +175,24 @@ impl Veth {
     }
 }
 
+#[derive(Clone)]
 pub struct VethDriver {
     pub inner: Arc<SpinLock<Veth>>,
-    /// 指向所属网络接口的弱引用，用于 packet socket 分发
-    iface: SpinLock<Weak<dyn Iface>>,
+    /// 指向所属网络接口的共享弱引用，用于 packet socket 分发。
+    iface: Arc<SpinLock<Weak<dyn Iface>>>,
 }
 
-impl Clone for VethDriver {
-    fn clone(&self) -> Self {
-        VethDriver {
-            inner: self.inner.clone(),
-            iface: SpinLock::new(self.iface.lock().clone()),
-        }
+impl Debug for VethDriver {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("VethDriver")
+            .field("name", &self.name())
+            .finish()
     }
 }
 
 impl VethDriver {
+    const MAX_FRAME_LEN: usize = 1514;
+
     /// # `new_pair`
     /// 创建一对虚拟以太网设备（veth pair），用于网络测试
     /// ## 参数
@@ -207,11 +207,11 @@ impl VethDriver {
 
         let driver1 = VethDriver {
             inner: dev1,
-            iface: SpinLock::new(Weak::<VethInterface>::new()),
+            iface: Arc::new(SpinLock::new(Weak::<VethInterface>::new())),
         };
         let driver2 = VethDriver {
             inner: dev2,
-            iface: SpinLock::new(Weak::<VethInterface>::new()),
+            iface: Arc::new(SpinLock::new(Weak::<VethInterface>::new())),
         };
 
         (driver1, driver2)
@@ -230,6 +230,26 @@ impl VethDriver {
     pub fn iface(&self) -> Option<Arc<dyn Iface>> {
         self.iface.lock().upgrade()
     }
+
+    fn submit_frame(&self, frame: Vec<u8>) -> Result<(), SystemError> {
+        if frame.len() > Self::MAX_FRAME_LEN {
+            return Err(SystemError::EMSGSIZE);
+        }
+        let peer = self
+            .inner
+            .lock()
+            .peer
+            .upgrade()
+            .ok_or(SystemError::ENOBUFS)?;
+        Veth::to_peer_owned(&peer, frame)
+    }
+
+    pub fn try_raw_transmit(&self, frame: &[u8]) -> Result<(), SystemError> {
+        if frame.len() > Self::MAX_FRAME_LEN {
+            return Err(SystemError::EMSGSIZE);
+        }
+        self.submit_frame(frame.to_vec())
+    }
 }
 
 pub struct VethTxToken {
@@ -243,7 +263,14 @@ impl phy::TxToken for VethTxToken {
     {
         let mut buf = vec![0; len];
         let result = f(&mut buf);
-        self.driver.inner.lock().send_to_peer(&buf);
+        if let Some(iface) = self.driver.iface() {
+            crate::net::socket::packet::deliver_to_packet_sockets(
+                &iface,
+                &buf,
+                crate::net::socket::packet::PacketType::Outgoing,
+            );
+        }
+        let _ = self.driver.submit_frame(buf);
         result
     }
 }
@@ -262,69 +289,13 @@ impl RxToken for VethRxToken {
 
         // 向注册的 packet socket 分发数据包
         if let Some(iface) = self.driver.iface() {
-            let pkt_type = determine_packet_type(packet, &iface);
-            iface.common().deliver_to_packet_sockets(packet, pkt_type);
+            let pkt_type = crate::net::socket::packet::classify_packet(packet, &iface);
+            if let Some(netns) = iface.net_namespace() {
+                netns.deliver_to_packet_sockets(iface.nic_id() as u32, packet, pkt_type);
+            }
         }
 
         f(packet)
-    }
-}
-
-/// 根据以太网帧的目的 MAC 地址确定数据包类型
-fn determine_packet_type(
-    frame: &[u8],
-    iface: &Arc<dyn Iface>,
-) -> crate::net::socket::packet::PacketType {
-    use crate::net::socket::packet::PacketType;
-
-    if frame.len() < 14 {
-        return PacketType::Host;
-    }
-
-    let dst_mac = &frame[0..6];
-
-    // 检查是否为广播地址 (FF:FF:FF:FF:FF:FF)
-    if dst_mac == [0xff, 0xff, 0xff, 0xff, 0xff, 0xff] {
-        return PacketType::Broadcast;
-    }
-
-    // 检查是否为多播地址 (第一个字节的最低位为1)
-    if dst_mac[0] & 0x01 != 0 {
-        return PacketType::Multicast;
-    }
-
-    // 检查是否为发往本机的包
-    let our_mac = iface.mac();
-    if dst_mac == our_mac.as_bytes() {
-        return PacketType::Host;
-    }
-
-    // 其他情况为发往其他主机的包（混杂模式下捕获）
-    PacketType::OtherHost
-}
-
-#[derive(Debug)]
-struct VethDriverWarpper(UnsafeCell<VethDriver>);
-unsafe impl Send for VethDriverWarpper {}
-unsafe impl Sync for VethDriverWarpper {}
-
-impl Deref for VethDriverWarpper {
-    type Target = VethDriver;
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.0.get() }
-    }
-}
-
-impl DerefMut for VethDriverWarpper {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut *self.0.get() }
-    }
-}
-
-impl VethDriverWarpper {
-    #[allow(clippy::mut_from_ref)]
-    fn force_get_mut(&self) -> &mut VethDriver {
-        unsafe { &mut *self.0.get() }
     }
 }
 
@@ -369,8 +340,7 @@ impl phy::Device for VethDriver {
 #[cast_to([sync] device::Device)]
 #[derive(Debug)]
 pub struct VethInterface {
-    name: String,
-    driver: VethDriverWarpper,
+    driver: VethDriver,
     common: IfaceCommon,
     inner: SpinLock<VethCommonData>,
     locked_kobj_state: LockedKObjectState,
@@ -395,7 +365,6 @@ impl VethInterface {
         use smoltcp::phy::Device;
 
         let iface_id = generate_iface_id();
-        let name = driver.name();
         let mac = [
             0x02,
             0x00,
@@ -422,8 +391,7 @@ impl VethInterface {
         let mtu = driver.capabilities().max_transmission_unit;
 
         let device = Arc::new(VethInterface {
-            name,
-            driver: VethDriverWarpper(UnsafeCell::new(driver.clone())),
+            driver: driver.clone(),
             common: IfaceCommon::new(
                 iface_id,
                 super::types::InterfaceType::EETHER,
@@ -441,7 +409,6 @@ impl VethInterface {
         // 设置 driver 对接口的弱引用，用于 packet socket 分发
         device
             .driver
-            .force_get_mut()
             .set_iface(Arc::downgrade(&device) as Weak<dyn Iface>);
 
         driver.inner.lock().self_iface_ref = Arc::downgrade(&device);
@@ -682,26 +649,26 @@ impl Iface for VethInterface {
 
     fn poll(&self) -> bool {
         // log::info!("VethInterface {} polling normal", self.name);
-        self.common.poll(self.driver.force_get_mut())
+        let mut driver = self.driver.clone();
+        self.common.poll(&mut driver)
         // self.clear_recv_buffer();
     }
 
     fn poll_napi(&self, budget: usize) -> bool {
-        self.common.poll_napi(self.driver.force_get_mut(), budget)
+        let mut driver = self.driver.clone();
+        self.common.poll_napi(&mut driver, budget)
     }
 
     fn raw_transmit(&self, frame: &[u8]) -> Result<(), SystemError> {
-        use smoltcp::phy::{Device, TxToken};
-        let device = self.driver.force_get_mut();
-        match device.transmit(crate::time::Instant::now().into()) {
-            Some(tx_token) => {
-                tx_token.consume(frame.len(), |buf| {
-                    buf.copy_from_slice(frame);
-                });
-                Ok(())
-            }
-            None => Err(SystemError::ENOBUFS),
+        self.driver.try_raw_transmit(frame)?;
+        if let Some(iface) = self.driver.iface() {
+            crate::net::socket::packet::deliver_to_packet_sockets(
+                &iface,
+                frame,
+                crate::net::socket::packet::PacketType::Outgoing,
+            );
         }
+        Ok(())
     }
 
     fn addr_assign_type(&self) -> u8 {

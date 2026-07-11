@@ -208,8 +208,8 @@ TEST(AfPacketMcast, AddDropMembershipAllmulti) {
         << ErrnoString(errno) << " (应恢复)";
 }
 
-// ===== Test 4: 无效 mr_type (999) 应返回 EINVAL =====
-TEST(AfPacketMcast, InvalidMrTypeReturnsEinval) {
+// origin/master keeps membership as an unconditional compatibility no-op.
+TEST(AfPacketMcast, ArbitraryMembershipPayloadRemainsCompatible) {
     FdGuard fd;
     int ifindex = SetupMcastEnv(&fd);
     if (ifindex == -1) {
@@ -221,13 +221,11 @@ TEST(AfPacketMcast, InvalidMrTypeReturnsEinval) {
     mreq.mr_ifindex = static_cast<unsigned int>(ifindex);
     mreq.mr_type = 999;  // 非法类型
     errno = 0;
-    int rc = setsockopt(fd.Get(), SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
-    EXPECT_EQ(rc, -1);
-    EXPECT_EQ(errno, EINVAL) << ErrnoString(errno);
+    EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq)), 0)
+        << ErrnoString(errno);
 }
 
-// ===== Test 5: 无效 ifindex (99999) 应返回错误 =====
-TEST(AfPacketMcast, InvalidIfindexReturnsError) {
+TEST(AfPacketMcast, UnknownIfindexRemainsCompatibleNoop) {
     FdGuard fd;
     int ifindex = SetupMcastEnv(&fd);
     if (ifindex == -1) {
@@ -239,11 +237,8 @@ TEST(AfPacketMcast, InvalidIfindexReturnsError) {
     mreq.mr_ifindex = 99999;  // 不存在的接口
     mreq.mr_type = PACKET_MR_PROMISC;
     errno = 0;
-    int rc = setsockopt(fd.Get(), SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
-    // 内核 find_iface 返回 ENODEV；容忍 ENXIO/EINVAL 作为合理错误码
-    EXPECT_EQ(rc, -1);
-    EXPECT_TRUE(errno == ENODEV || errno == ENXIO || errno == EINVAL)
-        << "期望 ENODEV/ENXIO/EINVAL，实际 " << ErrnoString(errno);
+    EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq)), 0)
+        << ErrnoString(errno);
 }
 
 // ===== Test 6: ADD/DROP MEMBERSHIP (PACKET_MR_MULTICAST, 特定多播 MAC) =====

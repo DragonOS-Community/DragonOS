@@ -160,117 +160,23 @@ TEST(AfPacketSockopt, AuxdataDisableRoundtrip) {
     EXPECT_EQ(got, 0);
 }
 
-// ===== Test 5: PACKET_VERSION = TPACKET_V2 往返 =====
-TEST(AfPacketSockopt, VersionV2Roundtrip) {
+// origin/master intentionally accepts unsupported setsockopt names so applications
+// can continue, but it does not advertise fake state through getsockopt. PR #2046
+// must preserve that compatibility boundary.
+TEST(AfPacketSockopt, UnsupportedSetSucceedsButGetIsNotAdvertised) {
     FdGuard fd(MakeRawFd());
     ASSERT_GE(fd.Get(), 0);
-    ASSERT_EQ(SetIntOpt(fd.Get(), PACKET_VERSION, TPACKET_V2), 0) << ErrnoString(errno);
-    int got = -1;
-    ASSERT_EQ(GetIntOpt(fd.Get(), PACKET_VERSION, &got), 0) << ErrnoString(errno);
-    EXPECT_EQ(got, TPACKET_V2);
-}
-
-// ===== Test 6: PACKET_VERSION = TPACKET_V3 往返 =====
-TEST(AfPacketSockopt, VersionV3Roundtrip) {
-    FdGuard fd(MakeRawFd());
-    ASSERT_GE(fd.Get(), 0);
-    ASSERT_EQ(SetIntOpt(fd.Get(), PACKET_VERSION, TPACKET_V3), 0) << ErrnoString(errno);
-    int got = -1;
-    ASSERT_EQ(GetIntOpt(fd.Get(), PACKET_VERSION, &got), 0) << ErrnoString(errno);
-    EXPECT_EQ(got, TPACKET_V3);
-}
-
-// ===== Test 7: PACKET_VERSION 非法值返回 EINVAL =====
-TEST(AfPacketSockopt, VersionInvalidReturnsEinval) {
-    FdGuard fd(MakeRawFd());
-    ASSERT_GE(fd.Get(), 0);
-    errno = 0;
-    EXPECT_EQ(SetIntOpt(fd.Get(), PACKET_VERSION, 999), -1);
-    EXPECT_EQ(errno, EINVAL) << ErrnoString(errno);
-}
-
-// ===== Test 8: PACKET_COPY_THRESH 往返 =====
-TEST(AfPacketSockopt, CopyThreshRoundtrip) {
-    FdGuard fd(MakeRawFd());
-    ASSERT_GE(fd.Get(), 0);
-    ASSERT_EQ(SetIntOpt(fd.Get(), PACKET_COPY_THRESH, 4096), 0) << ErrnoString(errno);
-    int got = -1;
-    ASSERT_EQ(GetIntOpt(fd.Get(), PACKET_COPY_THRESH, &got), 0) << ErrnoString(errno);
-    EXPECT_EQ(got, 4096);
-}
-
-// ===== Test 9: PACKET_RESERVE 往返 =====
-TEST(AfPacketSockopt, ReserveRoundtrip) {
-    FdGuard fd(MakeRawFd());
-    ASSERT_GE(fd.Get(), 0);
-    ASSERT_EQ(SetIntOpt(fd.Get(), PACKET_RESERVE, 128), 0) << ErrnoString(errno);
-    int got = -1;
-    ASSERT_EQ(GetIntOpt(fd.Get(), PACKET_RESERVE, &got), 0) << ErrnoString(errno);
-    EXPECT_EQ(got, 128);
-}
-
-// ===== Test 10: PACKET_ORIGDEV 0/1 往返 =====
-TEST(AfPacketSockopt, OrigdevBoolRoundtrip) {
-    FdGuard fd(MakeRawFd());
-    ASSERT_GE(fd.Get(), 0);
-    ASSERT_EQ(SetIntOpt(fd.Get(), PACKET_ORIGDEV, 1), 0) << ErrnoString(errno);
-    int got = -1;
-    ASSERT_EQ(GetIntOpt(fd.Get(), PACKET_ORIGDEV, &got), 0);
-    EXPECT_EQ(got, 1);
-    ASSERT_EQ(SetIntOpt(fd.Get(), PACKET_ORIGDEV, 0), 0);
-    got = -1;
-    ASSERT_EQ(GetIntOpt(fd.Get(), PACKET_ORIGDEV, &got), 0);
-    EXPECT_EQ(got, 0);
-}
-
-// ===== Test 11: PACKET_VNET_HDR 0/1 往返 =====
-TEST(AfPacketSockopt, VnetHdrBoolRoundtrip) {
-    FdGuard fd(MakeRawFd());
-    ASSERT_GE(fd.Get(), 0);
-    ASSERT_EQ(SetIntOpt(fd.Get(), PACKET_VNET_HDR, 1), 0) << ErrnoString(errno);
-    int got = -1;
-    ASSERT_EQ(GetIntOpt(fd.Get(), PACKET_VNET_HDR, &got), 0);
-    EXPECT_EQ(got, 1);
-    ASSERT_EQ(SetIntOpt(fd.Get(), PACKET_VNET_HDR, 0), 0);
-    got = -1;
-    ASSERT_EQ(GetIntOpt(fd.Get(), PACKET_VNET_HDR, &got), 0);
-    EXPECT_EQ(got, 0);
-}
-
-// ===== Test 12: PACKET_QDISC_BYPASS 0/1 往返 =====
-TEST(AfPacketSockopt, QdiscBypassBoolRoundtrip) {
-    FdGuard fd(MakeRawFd());
-    ASSERT_GE(fd.Get(), 0);
-    ASSERT_EQ(SetIntOpt(fd.Get(), PACKET_QDISC_BYPASS, 1), 0) << ErrnoString(errno);
-    int got = -1;
-    ASSERT_EQ(GetIntOpt(fd.Get(), PACKET_QDISC_BYPASS, &got), 0);
-    EXPECT_EQ(got, 1);
-    ASSERT_EQ(SetIntOpt(fd.Get(), PACKET_QDISC_BYPASS, 0), 0);
-    got = -1;
-    ASSERT_EQ(GetIntOpt(fd.Get(), PACKET_QDISC_BYPASS, &got), 0);
-    EXPECT_EQ(got, 0);
-}
-
-// ===== Test 13: PACKET_TX_TIMESTAMP = -1 往返 (DragonOS 行为) =====
-// 注意: 真实 Linux 不支持该 option 作为可写整数 (返回 ENOPROTOOPT)，
-// 本用例仅针对 DragonOS 内核按原始 i32 存储的行为；在原生 Linux 上会失败属预期。
-TEST(AfPacketSockopt, TxTimestampRoundtrip) {
-    FdGuard fd(MakeRawFd());
-    ASSERT_GE(fd.Get(), 0);
-    ASSERT_EQ(SetIntOpt(fd.Get(), PACKET_TX_TIMESTAMP, -1), 0) << ErrnoString(errno);
-    int got = 0;
-    ASSERT_EQ(GetIntOpt(fd.Get(), PACKET_TX_TIMESTAMP, &got), 0) << ErrnoString(errno);
-    EXPECT_EQ(got, -1);
-}
-
-// ===== Test 14: PACKET_TIMESTAMP = 1 往返 =====
-TEST(AfPacketSockopt, TimestampRoundtrip) {
-    FdGuard fd(MakeRawFd());
-    ASSERT_GE(fd.Get(), 0);
-    ASSERT_EQ(SetIntOpt(fd.Get(), PACKET_TIMESTAMP, 1), 0) << ErrnoString(errno);
-    int got = 0;
-    ASSERT_EQ(GetIntOpt(fd.Get(), PACKET_TIMESTAMP, &got), 0) << ErrnoString(errno);
-    EXPECT_EQ(got, 1);
+    const int options[] = {PACKET_COPY_THRESH, PACKET_ORIGDEV, PACKET_VERSION,
+                           PACKET_RESERVE, PACKET_VNET_HDR, PACKET_TX_TIMESTAMP,
+                           PACKET_TIMESTAMP, PACKET_QDISC_BYPASS, 9999};
+    for (int option : options) {
+        ASSERT_EQ(SetIntOpt(fd.Get(), option, 999), 0)
+            << "setsockopt option=" << option << ": " << ErrnoString(errno);
+        int got = 0;
+        errno = 0;
+        EXPECT_EQ(GetIntOpt(fd.Get(), option, &got), -1) << "option=" << option;
+        EXPECT_EQ(errno, ENOPROTOOPT) << "option=" << option << ": " << ErrnoString(errno);
+    }
 }
 
 // ===== Test 15: PACKET_STATISTICS 返回 8 字节结构 =====
@@ -286,16 +192,6 @@ TEST(AfPacketSockopt, StatisticsReturnsStruct) {
     ASSERT_EQ(getsockopt(fd.Get(), SOL_PACKET, PACKET_STATISTICS, &stats, &len), 0)
         << ErrnoString(errno);
     EXPECT_EQ(len, sizeof(stats));
-}
-
-// ===== Test 16: setsockopt 非法 option 返回 ENOPROTOOPT =====
-TEST(AfPacketSockopt, InvalidSetsockoptReturnsEnoprotoopt) {
-    FdGuard fd(MakeRawFd());
-    ASSERT_GE(fd.Get(), 0);
-    int val = 1;
-    errno = 0;
-    EXPECT_EQ(setsockopt(fd.Get(), SOL_PACKET, 9999, &val, sizeof(val)), -1);
-    EXPECT_EQ(errno, ENOPROTOOPT) << ErrnoString(errno);
 }
 
 // ===== Test 17: getsockopt 非法 option 返回 ENOPROTOOPT =====

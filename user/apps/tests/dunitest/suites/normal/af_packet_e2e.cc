@@ -50,6 +50,12 @@
 #ifndef PACKET_OUTGOING
 #define PACKET_OUTGOING 4
 #endif
+#ifndef PACKET_AUXDATA
+#define PACKET_AUXDATA 8
+#endif
+#ifndef TP_STATUS_USER
+#define TP_STATUS_USER 1
+#endif
 
 namespace {
 
@@ -75,6 +81,16 @@ struct ArpHdr {
     uint8_t ar_tpa[4];   // 目标 IP
 };
 static_assert(sizeof(ArpHdr) == kArpPktLen, "ArpHdr 大小必须为 28");
+
+struct PacketAuxdata {
+    uint32_t tp_status;
+    uint32_t tp_len;
+    uint32_t tp_snaplen;
+    uint16_t tp_mac;
+    uint16_t tp_net;
+    uint16_t tp_vlan_tci;
+    uint16_t tp_vlan_tpid;
+};
 
 // RAII fd 守护
 class FdGuard {
@@ -545,6 +561,67 @@ TEST(AfPacketE2E, DgramSendReturnsLayer3PayloadLen) {
                        reinterpret_cast<struct sockaddr*>(&dst), sizeof(dst));
     ASSERT_EQ(n, static_cast<ssize_t>(sizeof(arp)))
         << "DGRAM sendto 应返回 L3 负载长度 28: " << ErrnoString(errno);
+}
+
+// A socket created with a non-zero protocol is wildcard-bound until an explicit
+// bind. Exercise the netns registry, short-iovec MSG_TRUNC, full name length and
+// the minimum truthful PACKET_AUXDATA fields together.
+TEST(AfPacketE2E, WildcardRecvmsgTruncAndAuxdata) {
+    std::string ifname = DiscoverIfname();
+    int ifindex = ProbeIfindex(ifname);
+    if (ifindex < 0) {
+        GTEST_SKIP() << "未找到可用网卡，跳过 wildcard recvmsg 测试";
+    }
+
+    FdGuard fd(socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL)));
+    ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+    int enabled = 1;
+    ASSERT_EQ(setsockopt(fd.Get(), SOL_PACKET, PACKET_AUXDATA, &enabled, sizeof(enabled)), 0)
+        << ErrnoString(errno);
+
+    uint8_t local_mac[6];
+    GetIfHwaddr(fd.Get(), ifname, local_mac);
+    Stimulate(fd.Get(), ifindex, local_mac);
+
+    uint8_t short_buf[8]{};
+    struct iovec iov{short_buf, sizeof(short_buf)};
+    struct sockaddr_ll from{};
+    alignas(struct cmsghdr) uint8_t control[CMSG_SPACE(sizeof(PacketAuxdata))]{};
+    struct msghdr msg{};
+    msg.msg_name = &from;
+    msg.msg_namelen = 1;  // force address truncation; kernel must still report full size
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
+
+    ssize_t n = -1;
+    for (int attempt = 0; attempt < kRecvMaxAttempts; ++attempt) {
+        msg.msg_namelen = 1;
+        msg.msg_controllen = sizeof(control);
+        n = recvmsg(fd.Get(), &msg, MSG_DONTWAIT | MSG_TRUNC);
+        if (n >= 0) break;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) break;
+        usleep(50 * 1000);
+    }
+    if (n < 0) {
+        GTEST_SKIP() << "网络环境未返回可用于 wildcard recvmsg 的帧";
+    }
+
+    EXPECT_GT(n, static_cast<ssize_t>(sizeof(short_buf)));
+    EXPECT_NE(msg.msg_flags & MSG_TRUNC, 0);
+    EXPECT_EQ(msg.msg_namelen, sizeof(struct sockaddr_ll));
+
+    struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+    ASSERT_NE(cmsg, nullptr);
+    EXPECT_EQ(cmsg->cmsg_level, SOL_PACKET);
+    EXPECT_EQ(cmsg->cmsg_type, PACKET_AUXDATA);
+    ASSERT_GE(cmsg->cmsg_len, CMSG_LEN(sizeof(PacketAuxdata)));
+    const auto* aux = reinterpret_cast<const PacketAuxdata*>(CMSG_DATA(cmsg));
+    EXPECT_NE(aux->tp_status & TP_STATUS_USER, 0u);
+    EXPECT_EQ(aux->tp_len, static_cast<uint32_t>(n));
+    EXPECT_GE(aux->tp_snaplen, sizeof(short_buf));
+    EXPECT_GE(aux->tp_net, static_cast<uint16_t>(kEthHdrLen));
 }
 
 int main(int argc, char** argv) {

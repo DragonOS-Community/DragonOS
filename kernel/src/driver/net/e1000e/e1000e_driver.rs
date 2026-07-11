@@ -26,9 +26,8 @@ use alloc::{
     sync::{Arc, Weak},
 };
 use core::{
-    cell::UnsafeCell,
     fmt::Debug,
-    ops::{Deref, DerefMut},
+    sync::atomic::{AtomicBool, Ordering},
 };
 use log::info;
 use smoltcp::{phy, wire::HardwareAddress};
@@ -41,48 +40,25 @@ use crate::driver::base::device::DeviceId;
 const DEVICE_NAME: &str = "e1000e";
 
 pub struct E1000ERxToken {
-    buffer: E1000EBuffer,
+    buffer: Option<E1000EBuffer>,
     driver: E1000EDriver,
 }
 pub struct E1000ETxToken {
     driver: E1000EDriver,
+    tx_reserved: bool,
 }
 pub struct E1000EDriver {
     pub inner: Arc<SpinLock<E1000EDevice>>,
     /// 指向所属网络接口的弱引用，用于 packet socket 分发
-    iface: SpinLock<Weak<dyn Iface>>,
+    iface: Arc<SpinLock<Weak<dyn Iface>>>,
+    tx_reserved: Arc<AtomicBool>,
 }
 unsafe impl Send for E1000EDriver {}
 unsafe impl Sync for E1000EDriver {}
 
-/// @brief 网卡驱动的包裹器，这是为了获取网卡驱动的可变引用而设计的。
-/// 参阅virtio_net.rs
-struct E1000EDriverWrapper(UnsafeCell<E1000EDriver>);
-unsafe impl Send for E1000EDriverWrapper {}
-unsafe impl Sync for E1000EDriverWrapper {}
-
-impl Deref for E1000EDriverWrapper {
-    type Target = E1000EDriver;
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.0.get() }
-    }
-}
-impl DerefMut for E1000EDriverWrapper {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut *self.0.get() }
-    }
-}
-
-impl E1000EDriverWrapper {
-    #[allow(clippy::mut_from_ref)]
-    fn force_get_mut(&self) -> &mut E1000EDriver {
-        unsafe { &mut *self.0.get() }
-    }
-}
-
-impl Debug for E1000EDriverWrapper {
+impl Debug for E1000EDriver {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("E1000ENICDriver").finish()
+        f.debug_struct("E1000EDriver").finish_non_exhaustive()
     }
 }
 
@@ -90,7 +66,7 @@ impl Debug for E1000EDriverWrapper {
 #[cast_to([sync] Device)]
 #[derive(Debug)]
 pub struct E1000EInterface {
-    driver: E1000EDriverWrapper,
+    driver: E1000EDriver,
     common: IfaceCommon,
     inner: SpinLock<InnerE1000EInterface>,
     locked_kobj_state: LockedKObjectState,
@@ -104,68 +80,79 @@ pub struct InnerE1000EInterface {
 }
 
 impl phy::RxToken for E1000ERxToken {
-    fn consume<R, F>(self, f: F) -> R
+    fn consume<R, F>(mut self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R,
     {
-        let packet = self.buffer.as_slice();
+        let buffer = self.buffer.take().unwrap();
+        let packet = buffer.as_slice();
 
         // 向注册的 packet socket 分发数据包
         if let Some(iface) = self.driver.iface() {
-            let pkt_type = determine_packet_type(packet, &iface);
-            iface.common().deliver_to_packet_sockets(packet, pkt_type);
+            let pkt_type = crate::net::socket::packet::classify_packet(packet, &iface);
+            if let Some(netns) = iface.net_namespace() {
+                netns.deliver_to_packet_sockets(iface.nic_id() as u32, packet, pkt_type);
+            }
         }
 
         let result = f(packet);
-        self.buffer.free_buffer();
+        buffer.free_buffer();
         return result;
     }
 }
 
-/// 根据以太网帧的目的 MAC 地址确定数据包类型
-fn determine_packet_type(
-    frame: &[u8],
-    iface: &Arc<dyn Iface>,
-) -> crate::net::socket::packet::PacketType {
-    use crate::net::socket::packet::PacketType;
-
-    if frame.len() < 14 {
-        return PacketType::Host;
+impl Drop for E1000ERxToken {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            buffer.free_buffer();
+        }
     }
-
-    let dst_mac = &frame[0..6];
-
-    // 检查是否为广播地址 (FF:FF:FF:FF:FF:FF)
-    if dst_mac == [0xff, 0xff, 0xff, 0xff, 0xff, 0xff] {
-        return PacketType::Broadcast;
-    }
-
-    // 检查是否为多播地址 (第一个字节的最低位为1)
-    if dst_mac[0] & 0x01 != 0 {
-        return PacketType::Multicast;
-    }
-
-    // 检查是否为发往本机的包
-    let our_mac = iface.mac();
-    if dst_mac == our_mac.as_bytes() {
-        return PacketType::Host;
-    }
-
-    // 其他情况为发往其他主机的包（混杂模式下捕获）
-    PacketType::OtherHost
 }
 
 impl phy::TxToken for E1000ETxToken {
-    fn consume<R, F>(self, _len: usize, f: F) -> R
+    fn consume<R, F>(mut self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buffer = E1000EBuffer::new(4096);
+        let mut buffer = E1000EBuffer::new(len);
         let result = f(buffer.as_mut_slice());
+        if !self.tx_reserved {
+            if self.driver.try_raw_transmit(buffer.as_slice()).is_ok() {
+                if let Some(iface) = self.driver.iface() {
+                    crate::net::socket::packet::deliver_to_packet_sockets(
+                        &iface,
+                        buffer.as_slice(),
+                        crate::net::socket::packet::PacketType::Outgoing,
+                    );
+                }
+            }
+            buffer.free_buffer();
+            return result;
+        }
+        if let Some(iface) = self.driver.iface() {
+            crate::net::socket::packet::deliver_to_packet_sockets(
+                &iface,
+                buffer.as_slice(),
+                crate::net::socket::packet::PacketType::Outgoing,
+            );
+        }
         let mut device = self.driver.inner.lock();
-        device.e1000e_transmit(buffer);
-        buffer.free_buffer();
+        if let Err(buffer) = device.e1000e_transmit(buffer) {
+            buffer.free_buffer();
+        }
+        drop(device);
+        self.driver.release_tx();
+        self.tx_reserved = false;
         return result;
+    }
+}
+
+impl Drop for E1000ETxToken {
+    fn drop(&mut self) {
+        if self.tx_reserved {
+            self.driver.release_tx();
+            self.tx_reserved = false;
+        }
     }
 }
 
@@ -175,7 +162,8 @@ impl E1000EDriver {
         let inner: Arc<SpinLock<E1000EDevice>> = Arc::new(SpinLock::new(device));
         let result = E1000EDriver {
             inner,
-            iface: SpinLock::new(Weak::<E1000EInterface>::new()),
+            iface: Arc::new(SpinLock::new(Weak::<E1000EInterface>::new())),
+            tx_reserved: Arc::new(AtomicBool::new(false)),
         };
         return result;
     }
@@ -189,13 +177,56 @@ impl E1000EDriver {
     pub fn iface(&self) -> Option<Arc<dyn Iface>> {
         self.iface.lock().upgrade()
     }
+
+    fn try_reserve_tx(&self) -> bool {
+        self.tx_reserved
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn release_tx(&self) {
+        self.tx_reserved.store(false, Ordering::Release);
+    }
+
+    /// Atomically checks descriptor availability and publishes one raw frame.
+    /// The submitted DMA buffer remains owned by the TX ring until DD is
+    /// observed when that descriptor is reused.
+    pub fn try_raw_transmit(&self, frame: &[u8]) -> Result<(), SystemError> {
+        const MAX_FRAME_LEN: usize = 1536;
+        if frame.len() > MAX_FRAME_LEN || frame.len() > u16::MAX as usize {
+            return Err(SystemError::EMSGSIZE);
+        }
+
+        if !self.try_reserve_tx() {
+            return Err(SystemError::ENOBUFS);
+        }
+        let mut device = self.inner.lock();
+        if !device.e1000e_can_transmit() {
+            self.release_tx();
+            return Err(SystemError::ENOBUFS);
+        }
+
+        let mut buffer = E1000EBuffer::new(frame.len());
+        buffer.as_mut_slice().copy_from_slice(frame);
+        let result = match device.e1000e_transmit(buffer) {
+            Ok(()) => Ok(()),
+            Err(buffer) => {
+                buffer.free_buffer();
+                Err(SystemError::ENOBUFS)
+            }
+        };
+        drop(device);
+        self.release_tx();
+        result
+    }
 }
 
 impl Clone for E1000EDriver {
     fn clone(&self) -> Self {
         return E1000EDriver {
             inner: self.inner.clone(),
-            iface: SpinLock::new(self.iface.lock().clone()),
+            iface: self.iface.clone(),
+            tx_reserved: self.tx_reserved.clone(),
         };
     }
 }
@@ -211,11 +242,12 @@ impl phy::Device for E1000EDriver {
         match self.inner.lock().e1000e_receive() {
             Some(buffer) => Some((
                 E1000ERxToken {
-                    buffer,
+                    buffer: Some(buffer),
                     driver: self.clone(),
                 },
                 E1000ETxToken {
                     driver: self.clone(),
+                    tx_reserved: false,
                 },
             )),
             None => {
@@ -225,11 +257,18 @@ impl phy::Device for E1000EDriver {
     }
 
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
+        if !self.try_reserve_tx() {
+            return None;
+        }
         match self.inner.lock().e1000e_can_transmit() {
             true => Some(E1000ETxToken {
                 driver: self.clone(),
+                tx_reserved: true,
             }),
-            false => None,
+            false => {
+                self.release_tx();
+                None
+            }
         }
     }
 
@@ -271,7 +310,7 @@ impl E1000EInterface {
         let mtu = driver.capabilities().max_transmission_unit;
 
         let iface = Arc::new(E1000EInterface {
-            driver: E1000EDriverWrapper(UnsafeCell::new(driver)),
+            driver,
             common: IfaceCommon::new(
                 iface_id,
                 crate::driver::net::types::InterfaceType::EETHER,
@@ -295,7 +334,6 @@ impl E1000EInterface {
         // 设置 driver 对接口的弱引用，用于 packet socket 分发
         iface
             .driver
-            .force_get_mut()
             .set_iface(Arc::downgrade(&iface) as Weak<dyn Iface>);
 
         iface
@@ -391,25 +429,25 @@ impl Iface for E1000EInterface {
     }
 
     fn poll(&self) -> bool {
-        self.common.poll(self.driver.force_get_mut())
+        let mut driver = self.driver.clone();
+        self.common.poll(&mut driver)
     }
 
     fn poll_napi(&self, budget: usize) -> bool {
-        self.common.poll_napi(self.driver.force_get_mut(), budget)
+        let mut driver = self.driver.clone();
+        self.common.poll_napi(&mut driver, budget)
     }
 
     fn raw_transmit(&self, frame: &[u8]) -> Result<(), SystemError> {
-        use smoltcp::phy::{Device, TxToken};
-        let device = self.driver.force_get_mut();
-        match device.transmit(Instant::now().into()) {
-            Some(tx_token) => {
-                tx_token.consume(frame.len(), |buf| {
-                    buf.copy_from_slice(frame);
-                });
-                Ok(())
-            }
-            None => Err(SystemError::ENOBUFS),
+        self.driver.try_raw_transmit(frame)?;
+        if let Some(iface) = self.driver.iface() {
+            crate::net::socket::packet::deliver_to_packet_sockets(
+                &iface,
+                frame,
+                crate::net::socket::packet::PacketType::Outgoing,
+            );
         }
+        Ok(())
     }
 
     fn addr_assign_type(&self) -> u8 {

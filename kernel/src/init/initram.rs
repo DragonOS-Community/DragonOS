@@ -4,7 +4,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::filesystem::ramfs::RamFS;
-use crate::filesystem::vfs::mount::MountFlags;
+use crate::filesystem::vfs::mount::{MountFlags, MOUNT_LIFECYCLE_LOCK};
 use crate::filesystem::vfs::FilePrivateData;
 use crate::filesystem::vfs::FileSystem;
 use crate::filesystem::vfs::MountFS;
@@ -110,6 +110,10 @@ pub fn initramfs_init() -> Result<(), SystemError> {
     let root_inode = mount_fs.root_inode();
     unsafe {
         __INIT_ROOT_INODE = Some(root_inode.clone());
+    }
+    {
+        let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+        mount_fs.activate();
     }
 
     // Linux 中，内嵌的 initramfs 始终存在

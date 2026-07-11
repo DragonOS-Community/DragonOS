@@ -33,7 +33,10 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use hashbrown::HashSet;
 use system_error::SystemError;
 
-use crate::filesystem::vfs::{mount::MountFlags, mount::MountPath, MountFS};
+use crate::filesystem::vfs::{
+    mount::{MountFlags, MountPath, MOUNT_LIFECYCLE_LOCK},
+    MountFS,
+};
 use crate::libs::rwlock::RwLock;
 
 // ============================================================================
@@ -1133,18 +1136,25 @@ fn propagate_one(
             source_mountpoint.clone_with_new_mount_fs(target_mnt.clone()),
         ));
     }
-    target_mnt.add_mount(mountpoint_id, cloned_child.clone())?;
+    {
+        let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+        if !target_mnt.is_live() {
+            return Err(SystemError::EBUSY);
+        }
+        target_mnt.add_mount(mountpoint_id, cloned_child.clone())?;
 
-    // Propagated child mounts must inherit the target mount's namespace,
-    // otherwise subsequent is_belongs_to_mntns() checks would incorrectly return EINVAL.
-    if let Some(ns) = target_mnt.namespace() {
-        cloned_child.set_namespace(Arc::downgrade(&ns));
-        let target_mount_path = propagated_mount_path(source_parent_path, mount_path, target_mnt);
-        ns.add_mount(Some(mountpoint_id), target_mount_path, cloned_child)
-            .inspect_err(|_e| {
-                // Roll back the cloned mount inserted into mountpoints.
-                target_mnt.mountpoints().remove(&mountpoint_id);
-            })?;
+        // Propagated child mounts must inherit the target mount's namespace,
+        // otherwise subsequent is_belongs_to_mntns() checks would incorrectly return EINVAL.
+        if let Some(ns) = target_mnt.namespace() {
+            cloned_child.set_namespace(Arc::downgrade(&ns));
+            let target_mount_path =
+                propagated_mount_path(source_parent_path, mount_path, target_mnt);
+            ns.add_mount(Some(mountpoint_id), target_mount_path, cloned_child.clone())
+                .inspect_err(|_e| {
+                    target_mnt.mountpoints().remove(&mountpoint_id);
+                })?;
+        }
+        cloned_child.activate();
     }
 
     Ok(())
@@ -1311,6 +1321,29 @@ pub fn propagate_umount(
     Ok(())
 }
 
+/// Preflight the propagation set before ordinary umount mutates topology.
+pub fn propagation_umount_busy(parent_mnt: &Arc<MountFS>, mountpoint_id: InodeId) -> bool {
+    let propagation = parent_mnt.propagation();
+    if !propagation.is_shared() {
+        return false;
+    }
+    let mut pending = get_all_peers(propagation.peer_group_id());
+    pending.extend(propagation.slaves());
+    let mut visited = HashSet::new();
+    while let Some(parent) = pending.pop() {
+        if !visited.insert(parent.mount_id().data()) {
+            continue;
+        }
+        if let Some(child) = parent.mountpoints().get(&mountpoint_id).cloned() {
+            if child.subtree_has_external_pins() {
+                return true;
+            }
+        }
+        pending.extend(parent.propagation().slaves());
+    }
+    false
+}
+
 /// Umount at a specific peer mount.
 ///
 /// Does NOT call `sync_filesystem()` here: all propagation clones share the same
@@ -1332,13 +1365,7 @@ fn umount_at_peer(peer_mnt: &Arc<MountFS>, mountpoint_id: InodeId) -> Result<(),
         child_prop.set_master(None);
     }
 
-    child.set_self_mountpoint(None);
-
-    // 先从 mount_list 移除，再清 namespace，避免 "namespace=None 但 mount_list 仍有记录" 的 TOCTOU 中间态。
-    if let Some(ns) = child.namespace() {
-        ns.remove_mount_exact(&child);
-    }
-    child.clear_namespace();
+    MountFS::deactivate_disconnected_subtree(&child);
 
     Ok(())
 }
@@ -1393,7 +1420,7 @@ mod tests {
     }
 
     fn new_test_mount(propagation: Arc<MountPropagation>) -> Arc<MountFS> {
-        MountFS::new(
+        let mount = MountFS::new(
             RamFS::new(),
             None,
             None,
@@ -1401,7 +1428,12 @@ mod tests {
             None,
             MountFlags::empty(),
             None,
-        )
+        );
+        // Test fixtures represent mounts that have already been published.
+        // Production constructors intentionally remain in Constructing until
+        // their topology/namespace insertion commits.
+        mount.activate();
+        mount
     }
 
     #[test]

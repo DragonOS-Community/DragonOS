@@ -7,7 +7,7 @@ use alloc::{string::String, vec::Vec};
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_CHDIR;
 use crate::filesystem::vfs::permission::PermissionMask;
-use crate::filesystem::vfs::utils::user_path_at;
+use crate::filesystem::vfs::utils::{user_path_at, ResolvedPath};
 use crate::filesystem::vfs::{fcntl::AtFlags, FileType, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES};
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
@@ -68,6 +68,8 @@ impl Syscall for SysChdirHandle {
         let (inode_begin, remain_path) = user_path_at(&proc, AtFlags::AT_FDCWD.bits(), path)?;
         let inode =
             inode_begin.lookup_follow_symlink(&remain_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        let resolved = ResolvedPath::new(inode)?;
+        let inode = resolved.inode();
         let metadata = inode.metadata()?;
         if metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
@@ -106,7 +108,7 @@ impl Syscall for SysChdirHandle {
         }
 
         proc.basic_mut().set_cwd(new_path);
-        proc.fs_struct_mut().set_pwd(inode);
+        proc.fs_struct().set_pwd_resolved(resolved);
         Ok(0)
     }
 

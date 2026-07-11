@@ -1,11 +1,12 @@
 use super::{
     file::{FileFlags, FileMode},
     utils::DName,
-    FilePrivateData, FileSystem, FileType, IndexNode, InodeId, InodeMode, PollableInode,
-    SetMetadataMask, SuperBlock, XattrFlags,
+    FilePrivateData, FileSystem, FileType, IndexNode, InodeId, InodeMode, InodeRetentionKind,
+    PollableInode, SetMetadataMask, SuperBlock, XattrFlags,
 };
 use crate::{
     driver::base::device::device_number::{DeviceNumber, Major},
+    exception::workqueue::{schedule_work, Work},
     filesystem::{
         page_cache::list_page_caches,
         page_cache::PageCache,
@@ -17,14 +18,16 @@ use crate::{
         mutex::{Mutex, MutexGuard},
         rwsem::RwSem,
         spinlock::SpinLock,
+        wait_queue::WaitQueue,
     },
     mm::{fault::PageFaultMessage, VirtRegion, VmFaultReason, VmFlags},
     process::{
         namespace::{
             mnt::MntNamespace,
             propagation::{
-                inherit_bind_mount_propagation, propagate_mount, propagate_umount, register_peer,
-                register_slave_with_master, unregister_peer, MountPropagation,
+                inherit_bind_mount_propagation, propagate_mount, propagate_umount,
+                propagation_umount_busy, register_peer, register_slave_with_master,
+                unregister_peer, MountPropagation,
             },
         },
         ProcessManager,
@@ -49,6 +52,10 @@ use lazy_static::lazy_static;
 use system_error::SystemError;
 
 mod subtree_move;
+
+/// Serializes mount pin admission against multi-mount busy preflight and
+/// detach, including propagation peers in other namespaces.
+pub(crate) static MOUNT_LIFECYCLE_LOCK: Mutex<()> = Mutex::new(());
 
 bitflags! {
     /// Mount flags for filesystem independent mount options
@@ -292,7 +299,41 @@ pub struct MountFS {
     mount_flags: RwSem<MountFlags>,
     super_block_state: Arc<SuperBlockState>,
     mount_source: RwSem<Option<String>>,
+    lifecycle: Mutex<MountLifecycle>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MountLifecycleState {
+    Constructing,
+    Live,
+    Detaching,
+    Detached,
+}
+
+#[derive(Debug)]
+struct MountLifecycle {
+    state: MountLifecycleState,
+    external_pins: usize,
+}
+
+/// A semantic reference to a path or open file description on one mount.
+///
+/// Unlike an `Arc<MountFS>`, this reference participates in ordinary umount's
+/// busy decision. It is intentionally not `Clone`: every independently owned
+/// path must explicitly acquire its own pin.
+#[derive(Debug)]
+pub struct MountExternalGuard {
+    mount: Arc<MountFS>,
+}
+
+// SAFETY: MountExternalGuard only owns an Arc<MountFS>. Every mutable MountFS
+// field reachable from the guard is protected by Mutex/RwSem/SpinLock or is
+// atomic. These explicit impls break the recursive auto-trait proof cycle
+// MountFS -> MountFSInode/File -> MountExternalGuard -> MountFS, which some
+// cross-target rustc builds cannot normalize within the default recursion
+// limit; they do not weaken the synchronization requirements of MountFS.
+unsafe impl Send for MountExternalGuard {}
+unsafe impl Sync for MountExternalGuard {}
 
 #[derive(Debug)]
 pub struct SuperBlockState {
@@ -304,6 +345,22 @@ pub struct SuperBlockState {
     /// Shared by all mounts of this superblock, including bind mounts.
     dentry_namespace_lock: RwSem<()>,
     dentry_states: Mutex<BTreeMap<DentryKey, Weak<AtomicBool>>>,
+    lifecycle: Mutex<SuperBlockLifecycle>,
+    shutdown_wait: WaitQueue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SuperBlockLifecycleState {
+    Active,
+    Dying,
+    Dead,
+}
+
+#[derive(Debug)]
+struct SuperBlockLifecycle {
+    active_mounts: usize,
+    external_pins: usize,
+    state: SuperBlockLifecycleState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -328,7 +385,71 @@ impl SuperBlockState {
             unnamed_dev_minor: Mutex::new(None),
             dentry_namespace_lock: RwSem::new(()),
             dentry_states: Mutex::new(BTreeMap::new()),
+            lifecycle: Mutex::new(SuperBlockLifecycle {
+                active_mounts: 0,
+                external_pins: 0,
+                state: SuperBlockLifecycleState::Active,
+            }),
+            shutdown_wait: WaitQueue::default(),
         }
+    }
+
+    fn add_mount(&self) {
+        let mut lifecycle = self.lifecycle.lock();
+        debug_assert_eq!(lifecycle.state, SuperBlockLifecycleState::Active);
+        lifecycle.active_mounts += 1;
+    }
+
+    fn try_add_external_pin(&self) -> bool {
+        let mut lifecycle = self.lifecycle.lock();
+        if lifecycle.state != SuperBlockLifecycleState::Active {
+            return false;
+        }
+        lifecycle.external_pins += 1;
+        true
+    }
+
+    fn remove_external_pin(&self) -> bool {
+        let mut lifecycle = self.lifecycle.lock();
+        debug_assert!(lifecycle.external_pins > 0);
+        lifecycle.external_pins -= 1;
+        Self::try_begin_shutdown(&mut lifecycle)
+    }
+
+    fn remove_mount(&self) -> bool {
+        let mut lifecycle = self.lifecycle.lock();
+        debug_assert!(lifecycle.active_mounts > 0);
+        lifecycle.active_mounts -= 1;
+        Self::try_begin_shutdown(&mut lifecycle)
+    }
+
+    fn try_begin_shutdown(lifecycle: &mut SuperBlockLifecycle) -> bool {
+        if lifecycle.state == SuperBlockLifecycleState::Active
+            && lifecycle.active_mounts == 0
+            && lifecycle.external_pins == 0
+        {
+            lifecycle.state = SuperBlockLifecycleState::Dying;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn finish_shutdown(&self) {
+        let mut lifecycle = self.lifecycle.lock();
+        debug_assert_eq!(lifecycle.state, SuperBlockLifecycleState::Dying);
+        lifecycle.state = SuperBlockLifecycleState::Dead;
+        drop(lifecycle);
+        self.shutdown_wait.wake_all();
+    }
+
+    /// Wait only when this unmount started the final superblock shutdown.
+    /// A still-active shared superblock needs no shutdown completion wait.
+    fn wait_for_shutdown_if_started(&self) {
+        self.shutdown_wait.wait_until(|| {
+            let state = self.lifecycle.lock().state;
+            (state != SuperBlockLifecycleState::Dying).then_some(())
+        });
     }
 
     fn dentry_state(&self, parent: InodeId, child: InodeId, name: DName) -> Arc<AtomicBool> {
@@ -528,6 +649,10 @@ impl MountFS {
             mount_flags: RwSem::new(mount_flags),
             super_block_state: state_init.super_block_state,
             mount_source: RwSem::new(state_init.mount_source),
+            lifecycle: Mutex::new(MountLifecycle {
+                state: MountLifecycleState::Constructing,
+                external_pins: 0,
+            }),
         });
 
         if let Some(mnt_ns) = mnt_ns {
@@ -556,6 +681,10 @@ impl MountFS {
             mount_flags: RwSem::new(self.mount_flags()),
             super_block_state: self.super_block_state.clone(),
             mount_source: RwSem::new(mount_source),
+            lifecycle: Mutex::new(MountLifecycle {
+                state: MountLifecycleState::Constructing,
+                external_pins: 0,
+            }),
         });
 
         register_mounted_superblock(&mountfs);
@@ -722,6 +851,137 @@ impl MountFS {
         self.self_ref.upgrade().unwrap()
     }
 
+    /// Publish a fully attached mount into the shared-superblock lifecycle.
+    /// Construction failures before this point require no counter rollback.
+    pub(crate) fn activate(&self) {
+        let mut lifecycle = self.lifecycle.lock();
+        if lifecycle.state == MountLifecycleState::Constructing {
+            self.super_block_state.add_mount();
+            lifecycle.state = MountLifecycleState::Live;
+        }
+    }
+
+    /// Remove one published mount from superblock activity exactly once.
+    /// This performs no filesystem I/O; final shutdown is delegated to workqueue.
+    pub(crate) fn deactivate(&self) {
+        let should_remove = {
+            let mut lifecycle = self.lifecycle.lock();
+            match lifecycle.state {
+                MountLifecycleState::Constructing => {
+                    lifecycle.state = MountLifecycleState::Detached;
+                    false
+                }
+                MountLifecycleState::Live | MountLifecycleState::Detaching => {
+                    lifecycle.state = MountLifecycleState::Detached;
+                    true
+                }
+                MountLifecycleState::Detached => false,
+            }
+        };
+        if should_remove && self.super_block_state.remove_mount() {
+            Self::schedule_final_shutdown(self.self_ref());
+        }
+    }
+
+    pub(crate) fn has_external_pins(&self) -> bool {
+        self.lifecycle.lock().external_pins != 0
+    }
+
+    pub(crate) fn subtree_has_external_pins(&self) -> bool {
+        if self.has_external_pins() {
+            return true;
+        }
+        self.mountpoints
+            .lock()
+            .values()
+            .any(|child| child.subtree_has_external_pins())
+    }
+
+    pub(crate) fn is_live(&self) -> bool {
+        self.lifecycle.lock().state == MountLifecycleState::Live
+    }
+
+    /// Finish lifecycle teardown for a subtree already disconnected from its
+    /// parent topology (propagation and namespace destruction paths).
+    pub(crate) fn deactivate_disconnected_subtree(root: &Arc<Self>) {
+        let children: Vec<_> = root.mountpoints.lock().values().cloned().collect();
+        for child in children {
+            Self::deactivate_disconnected_subtree(&child);
+        }
+        root.mountpoints.lock().clear();
+        if let Some(namespace) = root.namespace() {
+            namespace.remove_mount_exact(root);
+        }
+        root.set_self_mountpoint(None);
+        root.clear_namespace();
+        root.deactivate();
+    }
+
+    /// Acquire an external semantic reference used by ordinary umount's busy
+    /// check. Existing paths may derive another reference after lazy detach;
+    /// acquisition stops once final superblock shutdown has begun.
+    pub fn try_pin_external(&self) -> Result<MountExternalGuard, SystemError> {
+        let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+        let mut lifecycle = self.lifecycle.lock();
+        match lifecycle.state {
+            MountLifecycleState::Constructing | MountLifecycleState::Detaching => {
+                return Err(SystemError::EBUSY);
+            }
+            MountLifecycleState::Detached if lifecycle.external_pins == 0 => {
+                return Err(SystemError::ESTALE);
+            }
+            MountLifecycleState::Live | MountLifecycleState::Detached => {}
+        }
+        if !self.super_block_state.try_add_external_pin() {
+            return Err(SystemError::ESTALE);
+        }
+        lifecycle.external_pins += 1;
+        Ok(MountExternalGuard {
+            mount: self.self_ref(),
+        })
+    }
+
+    fn derive_external_pin(&self) -> Result<MountExternalGuard, SystemError> {
+        let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+        let mut lifecycle = self.lifecycle.lock();
+        if !self.super_block_state.try_add_external_pin() {
+            return Err(SystemError::ESTALE);
+        }
+        lifecycle.external_pins += 1;
+        Ok(MountExternalGuard {
+            mount: self.self_ref(),
+        })
+    }
+
+    fn schedule_final_shutdown(mount: Arc<Self>) {
+        schedule_work(Work::new(move || mount.finish_final_shutdown()));
+    }
+
+    fn finish_final_shutdown(&self) {
+        let sb_state = self.super_block_state();
+        let _umount_guard = sb_state.umount_write();
+        self.inner_filesystem.close_external_inode_admission();
+        if let Err(err) = self.sync_filesystem_locked() {
+            log::warn!("final superblock sync failed during umount: {:?}", err);
+            sb_state.record_wb_error(err);
+        }
+        if let Err(err) = self.inner_filesystem.shrink_inode_cache_for_shutdown() {
+            log::warn!("final inode cache shrink failed: {:?}", err);
+            sb_state.record_wb_error(err);
+        }
+        if let Err(err) = self.inner_filesystem.quiesce_async_inode_work() {
+            log::warn!("final asynchronous inode quiesce failed: {:?}", err);
+            sb_state.record_wb_error(err);
+        }
+        let epoch = self.inner_filesystem.seal_eviction_queue();
+        if let Err(err) = self.inner_filesystem.drain_evictions_through(epoch) {
+            log::warn!("final superblock eviction drain failed: {:?}", err);
+            sb_state.record_wb_error(err);
+        }
+        self.inner_filesystem.on_umount();
+        sb_state.finish_shutdown();
+    }
+
     /// Unmount the filesystem.
     ///
     /// Modeled after Linux `deactivate_super()` + `generic_shutdown_super()`:
@@ -733,26 +993,136 @@ impl MountFS {
     /// # Errors
     /// Returns `EINVAL` if this is the root filesystem.
     pub fn umount(&self) -> Result<Arc<MountFS>, SystemError> {
-        let mountpoint = self.self_mountpoint().ok_or(SystemError::EINVAL)?;
+        Self::umount_subtree_with_mode(&self.self_ref(), false)
+    }
 
-        // Phase 1: Exclusive lock — excludes concurrent sync/IO during teardown.
-        let sb_state = self.super_block_state();
-        let _umount_guard = sb_state.umount_write();
-
-        // Phase 2: Sync while the superblock lock is already held.
-        // Errors during pre-umount sync are non-fatal (warn only).
-        if let Err(e) = self.sync_filesystem_locked() {
-            log::warn!("umount: pre-sync failed: {:?}, proceeding with umount", e);
+    /// Detach a complete mount subtree, deepest mounts first. Ordinary umount
+    /// performs one preflight busy check so it cannot partially detach merely
+    /// because a descendant owns an external path/file reference.
+    pub fn umount_subtree_with_mode(
+        root: &Arc<MountFS>,
+        lazy: bool,
+    ) -> Result<Arc<MountFS>, SystemError> {
+        fn collect(root: &Arc<MountFS>) -> Vec<Arc<MountFS>> {
+            let mut mounts = Vec::new();
+            let mut stack = vec![root.clone()];
+            while let Some(mount) = stack.pop() {
+                stack.extend(mount.mountpoints().values().cloned());
+                mounts.push(mount);
+            }
+            mounts.reverse();
+            mounts
         }
 
-        // Phase 3: Detach and propagate (no syncing under the lock).
-        let result = mountpoint.do_umount();
+        // Potentially sleeping metadata reads happen without the topology lock.
+        let mounts = {
+            let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+            collect(root)
+        };
+        let mut super_blocks = Vec::new();
+        for mount in &mounts {
+            let state = mount.super_block_state();
+            if !super_blocks
+                .iter()
+                .any(|existing| Arc::ptr_eq(existing, &state))
+            {
+                super_blocks.push(state);
+            }
+        }
+        let mut propagation_keys = Vec::with_capacity(mounts.len());
+        for mount in &mounts {
+            let mountpoint = mount.self_mountpoint().ok_or(SystemError::EINVAL)?;
+            propagation_keys.push((
+                mountpoint.mount_fs.clone(),
+                mountpoint.inner_inode.metadata()?.inode_id,
+            ));
+        }
+
+        let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+        let current = collect(root);
+        if current.len() != mounts.len()
+            || current
+                .iter()
+                .zip(mounts.iter())
+                .any(|(left, right)| left.mount_id() != right.mount_id())
+        {
+            return Err(SystemError::EBUSY);
+        }
+        if !lazy && root.subtree_has_external_pins() {
+            return Err(SystemError::EBUSY);
+        }
+        for (mount, (parent, mountpoint_id)) in mounts.iter().zip(propagation_keys.iter()) {
+            if !mount.is_live() {
+                return Err(SystemError::EINVAL);
+            }
+            if !lazy && propagation_umount_busy(parent, *mountpoint_id) {
+                return Err(SystemError::EBUSY);
+            }
+        }
+        for mount in &mounts {
+            mount.lifecycle.lock().state = MountLifecycleState::Detaching;
+        }
+
+        for (mount, (_, mountpoint_id)) in mounts.into_iter().zip(propagation_keys.into_iter()) {
+            let namespace = mount.namespace();
+            // All fallible admission checks completed above. A peer propagation
+            // may already have detached this node, which is an equivalent commit.
+            if mount.lifecycle.lock().state != MountLifecycleState::Detached {
+                mount.commit_umount_at(mountpoint_id)?;
+            }
+            if let Some(namespace) = namespace {
+                namespace.remove_mount_exact(&mount);
+            }
+        }
+        // Final filesystem shutdown may sleep and may itself need pathname
+        // operations. Never wait while holding the topology/admission lock.
+        drop(_topology);
+        if !lazy {
+            for super_block in super_blocks {
+                super_block.wait_for_shutdown_if_started();
+            }
+        }
+        Ok(root.clone())
+    }
+
+    /// Detach this mount. Lazy detach skips the external-pin busy check and
+    /// pre-detach sync; final shared-superblock shutdown remains deferred until
+    /// every mount and external pin is gone.
+    pub fn umount_with_mode(&self, lazy: bool) -> Result<Arc<MountFS>, SystemError> {
+        let mountpoint = self.self_mountpoint().ok_or(SystemError::EINVAL)?;
+
+        if !lazy {
+            let mountpoint_id = mountpoint.inner_inode.metadata()?.inode_id;
+            if propagation_umount_busy(&mountpoint.mount_fs, mountpoint_id) {
+                return Err(SystemError::EBUSY);
+            }
+        }
+
+        {
+            let mut lifecycle = self.lifecycle.lock();
+            if lifecycle.state != MountLifecycleState::Live {
+                return Err(SystemError::EINVAL);
+            }
+            if !lazy && lifecycle.external_pins != 0 {
+                return Err(SystemError::EBUSY);
+            }
+            lifecycle.state = MountLifecycleState::Detaching;
+        }
+
+        let mountpoint_id = mountpoint.inner_inode.metadata()?.inode_id;
+        self.commit_umount_at(mountpoint_id)
+    }
+
+    fn commit_umount_at(&self, mountpoint_id: InodeId) -> Result<Arc<MountFS>, SystemError> {
+        let mountpoint = self.self_mountpoint().ok_or(SystemError::EINVAL)?;
+        let result = mountpoint.do_umount_at(mountpoint_id);
 
         if result.is_ok() {
-            // Clear self_mountpoint to drop the back-reference to the old parent mountpoint.
             self.self_mountpoint.write().take();
-            self.inner_filesystem.on_umount();
             self.clear_namespace();
+            self.deactivate();
+        } else {
+            self.lifecycle.lock().state = MountLifecycleState::Live;
         }
 
         return result;
@@ -991,6 +1361,31 @@ impl Drop for MountFS {
     }
 }
 
+impl MountExternalGuard {
+    pub fn mount(&self) -> Arc<MountFS> {
+        self.mount.clone()
+    }
+
+    /// Derive another owner from an already valid path. This remains legal
+    /// while lazy detach is in progress, matching Linux path_get semantics.
+    pub fn derive(&self) -> Result<Self, SystemError> {
+        self.mount.derive_external_pin()
+    }
+}
+
+impl Drop for MountExternalGuard {
+    fn drop(&mut self) {
+        {
+            let mut lifecycle = self.mount.lifecycle.lock();
+            debug_assert!(lifecycle.external_pins > 0);
+            lifecycle.external_pins -= 1;
+        }
+        if self.mount.super_block_state.remove_external_pin() {
+            MountFS::schedule_final_shutdown(self.mount.clone());
+        }
+    }
+}
+
 impl MountFSInode {
     fn new_root(inner_inode: Arc<dyn IndexNode>, mount_fs: Arc<MountFS>) -> Arc<Self> {
         Arc::new_cyclic(|self_ref| Self {
@@ -1214,14 +1609,23 @@ impl MountFSInode {
             inherit_bind_mount_propagation(source, &new_mount_fs);
         }
 
-        self.mount_fs
-            .add_mount(metadata.inode_id, new_mount_fs.clone())?;
-
-        ProcessManager::current_mntns().add_mount(
-            Some(metadata.inode_id),
-            mount_path.clone(),
-            new_mount_fs.clone(),
-        )?;
+        {
+            let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+            if !self.mount_fs.is_live() {
+                return Err(SystemError::EBUSY);
+            }
+            self.mount_fs
+                .add_mount(metadata.inode_id, new_mount_fs.clone())?;
+            if let Err(error) = ProcessManager::current_mntns().add_mount(
+                Some(metadata.inode_id),
+                mount_path.clone(),
+                new_mount_fs.clone(),
+            ) {
+                self.mount_fs.mountpoints().remove(&metadata.inode_id);
+                return Err(error);
+            }
+            new_mount_fs.activate();
+        }
 
         if parent_propagation.is_shared() {
             if let Err(e) = propagate_mount(
@@ -1388,10 +1792,7 @@ impl MountFSInode {
     }
 
     /// Remove the filesystem mounted at this mount point
-    fn do_umount(&self) -> Result<Arc<MountFS>, SystemError> {
-        // Allow umount for both directory and file bind mounts
-        let mountpoint_id = self.inner_inode.metadata()?.inode_id;
-
+    fn do_umount_at(&self, mountpoint_id: InodeId) -> Result<Arc<MountFS>, SystemError> {
         // Detach first. Follow-up bookkeeping (peer registry and propagation)
         // must not run if detach itself failed.
         let child_mount = self
@@ -1548,6 +1949,14 @@ impl MountFSInode {
 }
 
 impl IndexNode for MountFSInode {
+    fn retain(&self, kind: InodeRetentionKind) -> Result<(), SystemError> {
+        self.inner_inode.retain(kind)
+    }
+
+    fn release(&self, kind: InodeRetentionKind) {
+        self.inner_inode.release(kind);
+    }
+
     fn open(
         &self,
         data: MutexGuard<FilePrivateData>,

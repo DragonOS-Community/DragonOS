@@ -7,8 +7,10 @@ use super::{
     mount::MountFlags,
     permission::PermissionMask,
     syscall::{OpenHow, OpenHowResolve},
-    utils::{rsplit_path, should_remove_sgid_on_chown, user_path_at},
-    vcore::{check_parent_dir_permission_inode, resolve_parent_inode, vfs_truncate},
+    utils::{
+        rsplit_path, should_remove_sgid_on_chown, user_path_at, user_resolved_path_at, ResolvedPath,
+    },
+    vcore::{check_parent_dir_permission_inode, vfs_truncate},
     FileType, FsPermissionPolicy, IndexNode, InodeMode, SetMetadataMask, MAX_PATHLEN,
     VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
@@ -85,6 +87,8 @@ pub(super) fn do_faccessat(
         mask |= PermissionMask::MAY_EXEC;
     }
 
+    let resolved = ResolvedPath::new(inode)?;
+    let inode = resolved.inode();
     let metadata = inode.metadata()?;
     match inode.fs().permission_policy() {
         FsPermissionPolicy::Dac => {
@@ -281,12 +285,17 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
     // 检查路径末尾斜杠 - 如果以斜杠结尾，目标必须是目录
     let path_ends_with_slash = path.ends_with('/');
 
-    let (inode_begin, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
-    let inode =
-        inode_begin.lookup_follow_symlink2(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES, follow_symlink);
+    let (start_path, path) = user_resolved_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
+    let inode_begin = start_path.inode();
+    let resolved = inode_begin.lookup_follow_symlink_owned(
+        &start_path,
+        &path,
+        VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        follow_symlink,
+    );
     let mut created = false;
-    let inode: Arc<dyn IndexNode> = match inode {
-        Ok(inode) => inode,
+    let resolved = match resolved {
+        Ok(resolved) => resolved,
         Err(errno) => {
             // 文件不存在，且需要创建
             if how.o_flags.contains(FileFlags::O_CREAT)
@@ -303,9 +312,16 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
                 if filename.len() > crate::filesystem::vfs::NAME_MAX {
                     return Err(SystemError::ENAMETOOLONG);
                 }
-                // 查找父目录
-                let parent_inode: Arc<dyn IndexNode> =
-                    resolve_parent_inode(inode_begin, parent_path)?;
+                // Resolve and retain the actual parent mount across permission
+                // checks and create. The original start_path alone is not
+                // sufficient when parent_path crosses a mount boundary.
+                let parent_resolved = inode_begin.lookup_follow_symlink_owned(
+                    &start_path,
+                    parent_path.unwrap_or(""),
+                    VFS_MAX_FOLLOW_SYMLINK_TIMES,
+                    true,
+                )?;
+                let parent_inode = parent_resolved.inode();
                 let parent_md = parent_inode.metadata()?;
                 // 父节点必须是目录
                 if parent_md.file_type != FileType::Dir {
@@ -322,13 +338,17 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
                 let inode: Arc<dyn IndexNode> =
                     parent_inode.create(filename, FileType::File, create_mode)?;
                 created = true;
-                inode
+                let created_path = ResolvedPath::new(inode)?;
+                drop(parent_resolved);
+                created_path
             } else {
                 // 不需要创建文件，因此返回错误码
                 return Err(errno);
             }
         }
     };
+    drop(start_path);
+    let inode = resolved.inode();
     let metadata = inode.metadata()?;
     let file_type: FileType = metadata.file_type;
 
@@ -414,7 +434,8 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
     if file_type == FileType::File && inode.truncate_before_open(&how.o_flags) {
         vfs_truncate(inode.clone(), 0)?;
     }
-    let file: File = File::new(inode, how.o_flags)?;
+    let (inode, mount_guard, operation_guard) = resolved.into_parts();
+    let file: File = File::new_with_mount_guard(inode, how.o_flags, mount_guard, operation_guard)?;
     let cloexec = how.o_flags.contains(FileFlags::O_CLOEXEC);
 
     // 把文件对象存入pcb

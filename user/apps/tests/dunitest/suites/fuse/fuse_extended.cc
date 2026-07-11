@@ -292,6 +292,7 @@ static int ext_test_positive_lookup_cache_respects_entry_ttl() {
     args.lookup_count = &lookup_count;
     args.entry_valid_sec = 60;
     args.attr_valid_sec = 60;
+    args.stop_on_destroy = 1;
 
     pthread_t th;
     if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
@@ -421,6 +422,7 @@ static int ext_test_xattr_ops() {
     args.listxattr_count = &listxattr_count;
     args.removexattr_count = &removexattr_count;
     args.last_setxattr_flags = &last_setxattr_flags;
+    args.stop_on_destroy = 1;
 
     pthread_t th;
     if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
@@ -3040,6 +3042,7 @@ static int ext_test_clone() {
     clone_args.init_done = &init_done;
     clone_args.enable_write_ops = 0;
     clone_args.exit_after_init = 0;
+    clone_args.stop_on_destroy = 1;
 
     pthread_t clone_th;
     if (pthread_create(&clone_th, NULL, fuse_daemon_thread, &clone_args) != 0) {
@@ -3142,6 +3145,7 @@ static int ext_test_large_read_over_max_write() {
     args.read_sizes = read_sizes;
     args.read_trace_capacity = 4;
     args.hello_data_size_override = data_size;
+    args.stop_on_destroy = 1;
 
     pthread_t th;
     if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
@@ -3257,6 +3261,7 @@ static int ext_test_cached_read_uses_open_fh_without_extra_open() {
     args.read_fhs = read_fhs;
     args.read_trace_capacity = 4;
     args.next_open_fh = 100;
+    args.stop_on_destroy = 1;
 
     pthread_t th;
     if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
@@ -3364,6 +3369,7 @@ static int ext_test_cached_short_read_updates_eof() {
     args.read_trace_capacity = 4;
     args.hello_data_size_override = 8192;
     args.hello_read_size_override = 5;
+    args.stop_on_destroy = 1;
 
     pthread_t th;
     if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
@@ -3876,6 +3882,7 @@ static int ext_test_mmap_fault_batches_readaround_pages() {
     args.read_trace_capacity = 8;
     args.hello_generated_size_override = map_len;
     args.init_out_max_write_override = map_len;
+    args.stop_on_destroy = 1;
 
     pthread_t th;
     if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
@@ -3997,6 +4004,7 @@ static int ext_test_direct_io_read_bypasses_page_cache() {
     args.read_trace_capacity = 4;
     args.next_open_fh = 700;
     args.hello_open_out_flags = FOPEN_DIRECT_IO;
+    args.stop_on_destroy = 1;
 
     pthread_t th;
     if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
@@ -4107,6 +4115,7 @@ static int ext_test_direct_io_write_invalidates_cached_read() {
     args.dynamic_hello_open_out_flags = &open_out_flags;
     args.last_write_fh = &last_write_fh;
     args.next_open_fh = 520;
+    args.stop_on_destroy = 1;
 
     pthread_t th;
     if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {

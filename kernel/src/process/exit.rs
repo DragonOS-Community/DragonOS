@@ -44,11 +44,8 @@ fn wstatus_to_waitid_exit_info(raw_wstatus: i32) -> (i32, i32) {
     }
 }
 
-/// mt-exec: de_thread 正在等待旧 leader 完成 PID/TID 交换时，禁止提前回收
+/// mt-exec: de_thread 正在接管旧线程组时，禁止 wait 路径提前回收其他线程。
 fn reap_blocked_by_group_exec(child_pcb: &Arc<ProcessControlBlock>) -> bool {
-    if !child_pcb.is_thread_group_leader() {
-        return false;
-    }
     if !child_pcb.sighand().flags_contains(SignalFlags::GROUP_EXEC) {
         return false;
     }
@@ -61,24 +58,6 @@ fn reap_blocked_by_group_exec(child_pcb: &Arc<ProcessControlBlock>) -> bool {
 
 fn delay_group_leader(child_pcb: &Arc<ProcessControlBlock>) -> bool {
     child_pcb.is_thread_group_leader() && child_pcb.thread_group_has_live_nonleader_threads()
-}
-
-/// mt-exec: 非执行线程的组长在退出时，延迟 PID/TGID/PGID/SID 的 unhash
-/// 以避免 de_thread 交换 TID/raw_pid 时出现 ESRCH。
-fn should_defer_unhash_for_group_exec(pcb: &ProcessControlBlock, group_dead: bool) -> bool {
-    if !group_dead {
-        return false;
-    }
-    let sighand = pcb.sighand();
-    if !sighand.flags_contains(SignalFlags::GROUP_EXEC) {
-        return false;
-    }
-    let exec_task = sighand.group_exec_task();
-    let this = pcb.self_ref.upgrade();
-    match (exec_task, this) {
-        (Some(exec_task), Some(this)) => !Arc::ptr_eq(&exec_task, &this),
-        _ => false,
-    }
 }
 
 /// 检查子进程的 exit_signal 是否与等待选项匹配
@@ -490,15 +469,19 @@ fn report_wait_event(
         return CandidateDecision::Ineligible;
     }
 
+    // exit_notify publishes ProcessState::Exited before the release-store that
+    // makes ExitState::Zombie visible. Observe Zombie first (Acquire), then read
+    // the scheduler state so the wait status cannot come from an older snapshot.
+    let is_zombie = child_pcb.is_zombie();
     let state = child_pcb.sched_info().state();
 
     // Linux wait_consider_task() checks zombie before stopped/continued.
     // A zombie leader with live subthreads is still an eligible child even when
     // the caller did not request WEXITED; otherwise waitid(WSTOPPED|WNOHANG)
     // would incorrectly report ECHILD while the thread group can still change.
-    let delayed_zombie = child_pcb.is_zombie()
-        && (delay_group_leader(child_pcb) || reap_blocked_by_group_exec(child_pcb));
-    if child_pcb.is_zombie() && !delayed_zombie && kwo.options.contains(WaitOption::WEXITED) {
+    let delayed_zombie =
+        is_zombie && (delay_group_leader(child_pcb) || reap_blocked_by_group_exec(child_pcb));
+    if is_zombie && !delayed_zombie && kwo.options.contains(WaitOption::WEXITED) {
         let Some(raw_wstatus) = state.raw_wstatus().map(|status| status as i32) else {
             return CandidateDecision::Pending { can_change: false };
         };
@@ -560,7 +543,7 @@ fn report_wait_event(
         return CandidateDecision::Ready(Ok(wait_visible_pid(child_pcb).into()));
     }
 
-    let can_change = if child_pcb.is_zombie() {
+    let can_change = if is_zombie {
         delayed_zombie
             && (relation == WaitRelation::Natural
                 || kwo.options.contains(WaitOption::WEXITED)
@@ -867,16 +850,12 @@ impl ProcessControlBlock {
 
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/exit.c#123
     fn __unhash_process(&self, group_dead: bool) {
-        if should_defer_unhash_for_group_exec(self, group_dead) {
-            self.flags().insert(ProcessFlags::DEFER_UNHASH);
-        } else {
-            self.dec_visible_thread_count_if_accounted();
-            self.detach_pid(PidType::PID);
-            if group_dead {
-                self.detach_pid(PidType::TGID);
-                self.detach_pid(PidType::PGID);
-                self.detach_pid(PidType::SID);
-            }
+        self.dec_visible_thread_count_if_accounted();
+        self.detach_pid(PidType::PID);
+        if group_dead {
+            self.detach_pid(PidType::TGID);
+            self.detach_pid(PidType::PGID);
+            self.detach_pid(PidType::SID);
         }
 
         // 从线程组中移除。非组长线程离开 group_tasks 后，线程组 rusage 仍需保留其 CPU 时间。
@@ -895,18 +874,14 @@ impl ProcessControlBlock {
         }
     }
 
-    /// 在 de_thread 完成 PID/TID 交换后，补做延迟的 unhash。
-    pub(super) fn finish_deferred_unhash_for_exec(&self) {
-        if !self.flags().contains(ProcessFlags::DEFER_UNHASH) {
-            return;
-        }
-        self.flags().remove(ProcessFlags::DEFER_UNHASH);
-        self.dec_visible_thread_count_if_accounted();
-        self.detach_pid(PidType::PID);
-        if self.is_thread_group_leader() {
-            self.detach_pid(PidType::TGID);
-            self.detach_pid(PidType::PGID);
-            self.detach_pid(PidType::SID);
-        }
+    /// Remove the old leader's non-PID links after non-leader exec migration.
+    ///
+    /// DragonOS attaches TGID/PGID/SID links to every thread. The generic release
+    /// path observes the migrated old leader as a non-leader and therefore only
+    /// detaches PID; Linux instead transfers these leader links in de_thread().
+    pub(super) fn detach_exec_leader_non_pid_links(&self) {
+        self.detach_pid(PidType::TGID);
+        self.detach_pid(PidType::PGID);
+        self.detach_pid(PidType::SID);
     }
 }

@@ -505,18 +505,29 @@ fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
 
             // log::info!("de_thread: reparented current to old leader's parent");
 
-            // Complete the deferred PID/TGID/PGID/SID unhash that the old leader
-            // postponed during its exit phase.
-            leader.finish_deferred_unhash_for_exec();
-
             // The old leader should be reaped by the exec thread to prevent the
             // parent from reaping it prematurely before/after the swap.
+            let mut release_leader = false;
             if leader.is_zombie() {
                 if leader.try_mark_dead_from_zombie() {
-                    unsafe { ProcessManager::release(leader.raw_pid()) };
+                    release_leader = true;
                 }
             } else if leader.is_dead() {
+                release_leader = true;
+            }
+
+            if release_leader {
+                // Remove the old PCB from ALL_PROCESS before generic release can
+                // return its swapped-out TID to the PID allocator. Otherwise a
+                // concurrent fork can reuse that number and a late release would
+                // remove the newly published child under the same map key.
                 unsafe { ProcessManager::release(leader.raw_pid()) };
+
+                // Every DragonOS thread owns TGID/PGID/SID task links. The
+                // generic release path sees the migrated old leader as a
+                // non-leader and only detaches PID, so remove its remaining links
+                // explicitly. `leader` remains alive through this Arc.
+                leader.detach_exec_leader_non_pid_links();
             }
         } else {
             current

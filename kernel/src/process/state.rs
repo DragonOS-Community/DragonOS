@@ -193,8 +193,6 @@ bitflags! {
         /// Process is waiting for an I/O operation to complete (used for iowait
         /// accounting).
         const IN_IOWAIT = 1 << 13;
-        /// Delay unhash of PID/TGID/PGID/SID during thread-group exec.
-        const DEFER_UNHASH = 1 << 14;
         /// PID links and visible-thread accounting have already been released.
         const PID_UNHASHED = 1 << 15;
         /// Task is currently traced by another task.

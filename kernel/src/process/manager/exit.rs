@@ -482,18 +482,23 @@ impl ProcessManager {
                     .map(|vpid| (parent, vpid))
             });
 
-            pcb.__exit_signal();
-            {
-                let _cgroup_guard = crate::cgroup::cgroup_accounting_lock().lock();
-                pcb.task_cgroup_node().uncharge_pids(1);
-            }
             // Remove from the parent's children list.
             if let Some((parent, vpid)) = parent_child_vpid {
                 let mut children = parent.children.write();
                 children.retain(|&p| p != vpid);
             }
 
+            // Revoke the old PCB's global numeric lookup before __exit_signal()
+            // can detach the final PID link and return that number to the
+            // allocator. Otherwise a concurrent fork may publish a new task at
+            // the same key and this release would delete the new task instead.
             ALL_PROCESS.lock_irqsave().as_mut().unwrap().remove(&pid);
+
+            pcb.__exit_signal();
+            {
+                let _cgroup_guard = crate::cgroup::cgroup_accounting_lock().lock();
+                pcb.task_cgroup_node().uncharge_pids(1);
+            }
         }
     }
 

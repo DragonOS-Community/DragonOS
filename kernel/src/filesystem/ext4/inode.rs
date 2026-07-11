@@ -605,7 +605,9 @@ impl IndexNode for LockedExt4Inode {
             if ext4.lookup(inode_num, name)? != target_num {
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
-            ext4.unlink(inode_num, name)?;
+            if let Some(handle) = ext4.unlink(inode_num, name)? {
+                fs.fs.reclaim_inode(handle)?;
+            }
             let _ = guard.children.remove(&DName::from(name));
             return Ok(());
         }
@@ -627,22 +629,24 @@ impl IndexNode for LockedExt4Inode {
             truncate_inode_pages(page_cache, 0);
         }
         let result = ext4.unlink(inode_num, name).map_err(SystemError::from);
-        if let Err(error) = result {
+        let handle = match result {
+            Ok(Some(handle)) => handle,
+            Ok(None) => {
+                let error = SystemError::EIO;
+                let _ = fs.poison_freeing(tombstone, error.clone());
+                return Err(error);
+            }
+            Err(error) => {
+                let _ = fs.poison_freeing(tombstone, error.clone());
+                return Err(error);
+            }
+        };
+        if let Err(error) = ext4.reclaim_inode(handle) {
+            let error = SystemError::from(error);
             let _ = fs.poison_freeing(tombstone, error.clone());
             return Err(error);
         }
-        match ext4.getattr(target_num) {
-            Ok(_) => fs.abort_freeing(tombstone)?,
-            Err(error) => {
-                let error = SystemError::from(error);
-                if error == SystemError::EINVAL {
-                    fs.complete_freeing(tombstone)?;
-                } else {
-                    let _ = fs.poison_freeing(tombstone, error.clone());
-                    return Err(error);
-                }
-            }
-        }
+        fs.complete_freeing(tombstone)?;
         // 清理 children 缓存
         let _ = guard.children.remove(&DName::from(name));
         Ok(())
@@ -926,27 +930,24 @@ impl IndexNode for LockedExt4Inode {
             }
         }
         let _reuse = fs.begin_reclaim();
-        let result = concret_fs.rmdir(inode_num, name).map_err(SystemError::from);
-        if let Err(error) = result {
-            let _ = fs.poison_freeing(tombstone, error.clone());
-            return Err(error);
-        }
-        match concret_fs.getattr(target_num) {
-            Ok(_) => {
+        let handle = match concret_fs.rmdir(inode_num, name).map_err(SystemError::from) {
+            Ok(Some(handle)) => handle,
+            Ok(None) => {
                 let error = SystemError::EIO;
                 let _ = fs.poison_freeing(tombstone, error.clone());
                 return Err(error);
             }
             Err(error) => {
-                let error = SystemError::from(error);
-                if error == SystemError::EINVAL {
-                    fs.complete_freeing(tombstone)?;
-                } else {
-                    let _ = fs.poison_freeing(tombstone, error.clone());
-                    return Err(error);
-                }
+                let _ = fs.poison_freeing(tombstone, error.clone());
+                return Err(error);
             }
+        };
+        if let Err(error) = concret_fs.reclaim_inode(handle) {
+            let error = SystemError::from(error);
+            let _ = fs.poison_freeing(tombstone, error.clone());
+            return Err(error);
         }
+        fs.complete_freeing(tombstone)?;
         // 清理 children 缓存
         let _ = guard.children.remove(&DName::from(name));
 
@@ -1314,7 +1315,14 @@ impl IndexNode for LockedExt4Inode {
                     Err(error) => {
                         drop(allocation);
                         let _reclaim = ext4_fs.begin_reclaim();
-                        if ext4.unlink(src_inode_num, &candidate).is_err() {
+                        let cleanup =
+                            ext4.unlink(src_inode_num, &candidate).and_then(
+                                |handle| match handle {
+                                    Some(handle) => ext4.reclaim_inode(handle),
+                                    None => Ok(()),
+                                },
+                            );
+                        if cleanup.is_err() {
                             ext4_fs.fail_stop_lifecycle();
                             if let Some(tombstone) = tombstone.take() {
                                 let _ = ext4_fs.poison_freeing(tombstone, SystemError::EIO);
@@ -1357,41 +1365,45 @@ impl IndexNode for LockedExt4Inode {
                     truncate_inode_pages(pc, 0);
                 }
             }
-            if let Err(err) = ext4.rename(src_inode_num, &temp_name, target_inode_num, new_name) {
-                let rename_error = SystemError::from(err);
-                let rollback =
-                    ext4.rename_exchange(src_inode_num, old_name, src_inode_num, &temp_name);
-                if let Some(tombstone) = tombstone.take() {
-                    let _ = ext4_fs.poison_freeing(tombstone, rename_error.clone());
-                }
-                drop(_reuse);
-                if rollback.is_err() {
-                    let whiteout_tombstone = ext4_fs
-                        .begin_freeing(whiteout_inode.as_ref().expect("whiteout was published"))?;
-                    let _ = ext4_fs.poison_freeing(whiteout_tombstone, SystemError::EIO);
-                    return Err(SystemError::EIO);
-                }
-                Self::reclaim_temporary_inode(
-                    &ext4_fs,
-                    src_inode_num,
-                    &temp_name,
-                    whiteout_inode.take().unwrap(),
-                )?;
-                return Err(rename_error);
-            }
-            if let (Some(dst_inode_num), Some(tombstone)) = (dst_inode_num, tombstone.take()) {
-                match ext4.getattr(dst_inode_num) {
-                    Ok(_) => ext4_fs.abort_freeing(tombstone)?,
-                    Err(error) => {
-                        let error = SystemError::from(error);
-                        if error == SystemError::EINVAL {
-                            ext4_fs.complete_freeing(tombstone)?;
-                        } else {
-                            let _ = ext4_fs.poison_freeing(tombstone, error.clone());
-                            return Err(error);
+            let rename_handle =
+                match ext4.rename(src_inode_num, &temp_name, target_inode_num, new_name) {
+                    Ok(handle) => handle,
+                    Err(err) => {
+                        let rename_error = SystemError::from(err);
+                        let rollback = ext4.rename_exchange(
+                            src_inode_num,
+                            old_name,
+                            src_inode_num,
+                            &temp_name,
+                        );
+                        if let Some(tombstone) = tombstone.take() {
+                            let _ = ext4_fs.poison_freeing(tombstone, rename_error.clone());
                         }
+                        drop(_reuse);
+                        if rollback.is_err() {
+                            let whiteout_tombstone = ext4_fs.begin_freeing(
+                                whiteout_inode.as_ref().expect("whiteout was published"),
+                            )?;
+                            let _ = ext4_fs.poison_freeing(whiteout_tombstone, SystemError::EIO);
+                            return Err(SystemError::EIO);
+                        }
+                        Self::reclaim_temporary_inode(
+                            &ext4_fs,
+                            src_inode_num,
+                            &temp_name,
+                            whiteout_inode.take().unwrap(),
+                        )?;
+                        return Err(rename_error);
                     }
+                };
+            if let (Some(_dst_inode_num), Some(tombstone)) = (dst_inode_num, tombstone.take()) {
+                let handle = rename_handle.ok_or(SystemError::EIO)?;
+                if let Err(error) = ext4.reclaim_inode(handle) {
+                    let error = SystemError::from(error);
+                    let _ = ext4_fs.poison_freeing(tombstone, error.clone());
+                    return Err(error);
                 }
+                ext4_fs.complete_freeing(tombstone)?;
             }
             if let Some(whiteout) = &whiteout_inode {
                 whiteout.0.lock().dname = old_dname.clone();
@@ -1406,7 +1418,7 @@ impl IndexNode for LockedExt4Inode {
                     attr.links <= 1
                 };
                 if !will_free {
-                    ext4.rename(src_inode_num, old_name, target_inode_num, new_name)?;
+                    let _ = ext4.rename(src_inode_num, old_name, target_inode_num, new_name)?;
                 } else {
                     let tombstone = ext4_fs.begin_freeing(dst_inode)?;
                     if ext4.lookup(target_inode_num, new_name).ok() != dst_inode_num {
@@ -1437,29 +1449,30 @@ impl IndexNode for LockedExt4Inode {
                     if let Some(pc) = dst_inode.page_cache() {
                         truncate_inode_pages(pc, 0);
                     }
-                    if let Err(err) =
-                        ext4.rename(src_inode_num, old_name, target_inode_num, new_name)
-                    {
-                        let error = SystemError::from(err);
-                        let _ = ext4_fs.poison_freeing(tombstone, error.clone());
-                        return Err(error);
-                    }
-                    match ext4.getattr(dst_inode_num.unwrap()) {
-                        Ok(_) => ext4_fs.abort_freeing(tombstone)?,
-                        Err(error) => {
-                            let error = SystemError::from(error);
-                            if error == SystemError::EINVAL {
-                                ext4_fs.complete_freeing(tombstone)?;
-                            } else {
+                    let handle =
+                        match ext4.rename(src_inode_num, old_name, target_inode_num, new_name) {
+                            Ok(Some(handle)) => handle,
+                            Ok(None) => {
+                                let error = SystemError::EIO;
                                 let _ = ext4_fs.poison_freeing(tombstone, error.clone());
                                 return Err(error);
                             }
-                        }
+                            Err(err) => {
+                                let error = SystemError::from(err);
+                                let _ = ext4_fs.poison_freeing(tombstone, error.clone());
+                                return Err(error);
+                            }
+                        };
+                    if let Err(error) = ext4.reclaim_inode(handle) {
+                        let error = SystemError::from(error);
+                        let _ = ext4_fs.poison_freeing(tombstone, error.clone());
+                        return Err(error);
                     }
+                    ext4_fs.complete_freeing(tombstone)?;
                 }
             } else {
                 // ext4 library now correctly handles atomic replace
-                ext4.rename(src_inode_num, old_name, target_inode_num, new_name)?;
+                let _ = ext4.rename(src_inode_num, old_name, target_inode_num, new_name)?;
             }
         }
 
@@ -1490,28 +1503,25 @@ impl LockedExt4Inode {
         let _link_mutation = lifecycle.lock_link_mutation();
         let tombstone = fs.begin_freeing(&inode)?;
         let _reuse = fs.begin_reclaim();
-        if let Err(error) = fs.fs.unlink(parent_inode_num, name) {
+        let handle = match fs.fs.unlink(parent_inode_num, name) {
+            Ok(Some(handle)) => handle,
+            Ok(None) => {
+                let error = SystemError::EIO;
+                let _ = fs.poison_freeing(tombstone, error.clone());
+                return Err(error);
+            }
+            Err(error) => {
+                let error = SystemError::from(error);
+                let _ = fs.poison_freeing(tombstone, error.clone());
+                return Err(error);
+            }
+        };
+        if let Err(error) = fs.fs.reclaim_inode(handle) {
             let error = SystemError::from(error);
             let _ = fs.poison_freeing(tombstone, error.clone());
             return Err(error);
         }
-        let inode_num = inode.0.lock().inner_inode_num;
-        match fs.fs.getattr(inode_num) {
-            Ok(_) => {
-                let error = SystemError::EIO;
-                let _ = fs.poison_freeing(tombstone, error.clone());
-                Err(error)
-            }
-            Err(error) => {
-                let error = SystemError::from(error);
-                if error == SystemError::EINVAL {
-                    fs.complete_freeing(tombstone)
-                } else {
-                    let _ = fs.poison_freeing(tombstone, error.clone());
-                    Err(error)
-                }
-            }
-        }
+        fs.complete_freeing(tombstone)
     }
 
     fn disk_file_type(file_type: vfs::FileType) -> FileType {

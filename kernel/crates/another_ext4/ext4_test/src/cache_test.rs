@@ -9,6 +9,12 @@ use another_ext4::{Ext4, InodeMode, BLOCK_SIZE};
 
 use super::ROOT_INO;
 
+fn reclaim(ext4: &Ext4, handle: Option<another_ext4::InodeReclaimHandle>) {
+    if let Some(handle) = handle {
+        ext4.reclaim_inode(handle).expect("reclaim failed");
+    }
+}
+
 /// Test 1: SuperBlock free counters stay consistent after creating and deleting files.
 ///
 /// Verifies that the cached superblock's free_blocks_count and free_inodes_count
@@ -55,12 +61,12 @@ pub fn superblock_cache_consistency_test(ext4: &Ext4) {
 
     // Delete all files
     for name in &file_ids {
-        ext4.unlink(test_dir, name)
-            .expect("unlink failed");
+        let handle = ext4.unlink(test_dir, name).expect("unlink failed");
+        reclaim(ext4, handle);
     }
     // Remove directory
-    ext4.rmdir(ROOT_INO, "sb_cache_test")
-        .expect("rmdir failed");
+    let handle = ext4.rmdir(ROOT_INO, "sb_cache_test").expect("rmdir failed");
+    reclaim(ext4, handle);
 
     // Verify counters recovered (should be close to original)
     let sb_after = ext4.super_block().expect("read superblock failed");
@@ -98,14 +104,12 @@ pub fn inode_cache_write_read_test(ext4: &Ext4) {
 
     // getattr should reflect the new size (from cache)
     let attr = ext4.getattr(fid).expect("getattr failed");
-    assert_eq!(
-        attr.size, 12345,
-        "cached inode should reflect written size"
-    );
+    assert_eq!(attr.size, 12345, "cached inode should reflect written size");
 
     // Write more data at an offset
     let data2 = vec![99u8; 5000];
-    ext4.write(fid, 20000, &data2).expect("write at offset failed");
+    ext4.write(fid, 20000, &data2)
+        .expect("write at offset failed");
 
     let attr2 = ext4.getattr(fid).expect("getattr failed");
     assert_eq!(
@@ -137,8 +141,10 @@ pub fn inode_cache_write_read_test(ext4: &Ext4) {
     assert_eq!(attr3.size, 25000, "size should be preserved after setattr");
 
     // Cleanup
-    ext4.unlink(ROOT_INO, "inode_cache_test_file")
+    let handle = ext4
+        .unlink(ROOT_INO, "inode_cache_test_file")
         .expect("unlink failed");
+    reclaim(ext4, handle);
 
     println!("  [PASS] inode cache write-read consistency");
 }
@@ -160,9 +166,18 @@ pub fn inode_cache_invalidation_test(ext4: &Ext4) {
     let attr = ext4.getattr(fid).expect("getattr failed");
     assert!(attr.size > 0, "file should have data");
 
-    // Unlink (which frees the inode internally)
-    ext4.unlink(ROOT_INO, "inode_inval_test")
-        .expect("unlink failed");
+    // Logical unlink preserves the allocated zero-link inode until eviction.
+    let handle = ext4
+        .unlink(ROOT_INO, "inode_inval_test")
+        .expect("unlink failed")
+        .expect("final unlink must return reclaim handle");
+
+    assert!(
+        ext4.getattr(fid).is_ok(),
+        "zero-link inode must remain accessible before reclaim"
+    );
+
+    ext4.reclaim_inode(handle).expect("reclaim failed");
 
     // After free, getattr should fail (inode link_count == 0)
     let result = ext4.getattr(fid);
@@ -189,10 +204,15 @@ pub fn data_integrity_test(ext4: &Ext4) {
     // Test 4a: Write and read back various patterns
     // Pattern 1: Sequential bytes
     let pattern1: Vec<u8> = (0..=255).cycle().take(BLOCK_SIZE * 3 + 137).collect();
-    ext4.write(fid, 0, &pattern1).expect("write pattern1 failed");
+    ext4.write(fid, 0, &pattern1)
+        .expect("write pattern1 failed");
     let mut rbuf1 = vec![0u8; pattern1.len()];
     let rcount1 = ext4.read(fid, 0, &mut rbuf1).expect("read pattern1 failed");
-    assert_eq!(rcount1, pattern1.len(), "read count should match write count");
+    assert_eq!(
+        rcount1,
+        pattern1.len(),
+        "read count should match write count"
+    );
     assert_eq!(rbuf1, pattern1, "pattern1 data mismatch");
 
     // Test 4b: Overwrite middle portion
@@ -200,12 +220,22 @@ pub fn data_integrity_test(ext4: &Ext4) {
     ext4.write(fid, BLOCK_SIZE, &pattern2)
         .expect("overwrite middle failed");
     let mut rbuf2 = vec![0u8; pattern1.len()];
-    let rcount2 = ext4.read(fid, 0, &mut rbuf2).expect("read after overwrite failed");
+    let rcount2 = ext4
+        .read(fid, 0, &mut rbuf2)
+        .expect("read after overwrite failed");
     assert_eq!(rcount2, pattern1.len());
     // First block should be original pattern
-    assert_eq!(&rbuf2[..BLOCK_SIZE], &pattern1[..BLOCK_SIZE], "first block should be unchanged");
+    assert_eq!(
+        &rbuf2[..BLOCK_SIZE],
+        &pattern1[..BLOCK_SIZE],
+        "first block should be unchanged"
+    );
     // Second block should be overwritten
-    assert_eq!(&rbuf2[BLOCK_SIZE..BLOCK_SIZE * 2], &pattern2[..], "middle block should be overwritten");
+    assert_eq!(
+        &rbuf2[BLOCK_SIZE..BLOCK_SIZE * 2],
+        &pattern2[..],
+        "middle block should be overwritten"
+    );
     // Third block onwards should be original
     assert_eq!(
         &rbuf2[BLOCK_SIZE * 2..],
@@ -233,10 +263,7 @@ pub fn data_integrity_test(ext4: &Ext4) {
         .read(fid, pattern1.len(), &mut gap_buf)
         .expect("read gap failed");
     assert_eq!(gap_read, 4096);
-    assert!(
-        gap_buf.iter().all(|&b| b == 0),
-        "gap should be zero-filled"
-    );
+    assert!(gap_buf.iter().all(|&b| b == 0), "gap should be zero-filled");
 
     // Read the data after gap
     let mut after_buf = vec![0u8; gap_data.len()];
@@ -247,8 +274,10 @@ pub fn data_integrity_test(ext4: &Ext4) {
     assert_eq!(&after_buf, gap_data, "data after gap should match");
 
     // Cleanup
-    ext4.unlink(ROOT_INO, "data_integrity_test")
+    let handle = ext4
+        .unlink(ROOT_INO, "data_integrity_test")
         .expect("unlink failed");
+    reclaim(ext4, handle);
 
     println!("  [PASS] data integrity through cache layers");
 }
@@ -288,7 +317,8 @@ pub fn cache_eviction_stress_test(ext4: &Ext4) {
             .unwrap_or_else(|e| panic!("read {} (ino {}) failed: {:?}", name, fid, e));
         let actual = std::str::from_utf8(&buf[..rcount]).expect("invalid utf8");
         assert_eq!(
-            actual, expected_content.as_str(),
+            actual,
+            expected_content.as_str(),
             "file {} content mismatch",
             name
         );
@@ -296,7 +326,8 @@ pub fn cache_eviction_stress_test(ext4: &Ext4) {
 
     // Delete all in reverse order
     for (name, _, _) in inode_ids.iter().rev() {
-        ext4.unlink(test_dir, name).expect("unlink failed");
+        let handle = ext4.unlink(test_dir, name).expect("unlink failed");
+        reclaim(ext4, handle);
     }
 
     // Verify directory is now empty (only . and ..)
@@ -308,8 +339,10 @@ pub fn cache_eviction_stress_test(ext4: &Ext4) {
         entries.len()
     );
 
-    ext4.rmdir(ROOT_INO, "eviction_stress")
+    let handle = ext4
+        .rmdir(ROOT_INO, "eviction_stress")
         .expect("rmdir failed");
+    reclaim(ext4, handle);
 
     println!("  [PASS] cache eviction stress ({} files)", num_files);
 }
@@ -334,18 +367,20 @@ pub fn block_group_cache_test(ext4: &Ext4) {
     let mut rbuf = vec![0u8; big_data.len()];
     let rcount = ext4.read(fid, 0, &mut rbuf).expect("read back failed");
     assert_eq!(rcount, big_data.len(), "read count mismatch");
-    assert_eq!(rbuf, big_data, "1MB data mismatch after block group allocations");
+    assert_eq!(
+        rbuf, big_data,
+        "1MB data mismatch after block group allocations"
+    );
 
     // Verify superblock counters are coherent
     let sb = ext4.super_block().expect("read sb failed");
-    assert!(
-        sb.free_blocks_count() > 0,
-        "should still have free blocks"
-    );
+    assert!(sb.free_blocks_count() > 0, "should still have free blocks");
 
     // Cleanup
-    ext4.unlink(ROOT_INO, "bg_cache_test")
+    let handle = ext4
+        .unlink(ROOT_INO, "bg_cache_test")
         .expect("unlink failed");
+    reclaim(ext4, handle);
 
     println!("  [PASS] block group cache consistency");
 }
@@ -384,15 +419,19 @@ pub fn metadata_consistency_after_lookup_test(ext4: &Ext4) {
     assert_eq!(looked_up, fid, "lookup should return same inode number");
 
     // getattr on the looked-up inode should reflect our setattr
-    let attr = ext4.getattr(looked_up).expect("getattr after lookup failed");
+    let attr = ext4
+        .getattr(looked_up)
+        .expect("getattr after lookup failed");
     assert_eq!(attr.uid, 42, "uid mismatch after lookup");
     assert_eq!(attr.gid, 99, "gid mismatch after lookup");
     assert_eq!(attr.atime, 1000000, "atime mismatch after lookup");
     assert_eq!(attr.mtime, 2000000, "mtime mismatch after lookup");
 
     // Cleanup
-    ext4.unlink(ROOT_INO, "meta_lookup_test")
+    let handle = ext4
+        .unlink(ROOT_INO, "meta_lookup_test")
         .expect("unlink failed");
+    reclaim(ext4, handle);
 
     println!("  [PASS] metadata consistency after lookup");
 }
@@ -425,11 +464,54 @@ pub fn e2fsck_validation(image_path: &str) {
         } else {
             panic!(
                 "e2fsck found non-checksum errors (exit code {}):\n{}",
-                exit_code,
-                stdout
+                exit_code, stdout
             );
         }
     }
+}
+
+pub fn deferred_reclaim_lifecycle_test(ext4: &Ext4) {
+    let mode = InodeMode::FILE | InodeMode::ALL_RW;
+    let victim = ext4
+        .create(ROOT_INO, "deferred_victim", mode)
+        .expect("create victim failed");
+    ext4.write(victim, 0, b"still-live")
+        .expect("write victim failed");
+    let handle = ext4
+        .unlink(ROOT_INO, "deferred_victim")
+        .expect("logical unlink failed")
+        .expect("final unlink must return a handle");
+    let other = ext4
+        .create(ROOT_INO, "deferred_other", mode)
+        .expect("create other failed");
+    assert_ne!(victim, other, "inode reused before explicit reclaim");
+    let mut buf = [0u8; 10];
+    ext4.read(victim, 0, &mut buf)
+        .expect("zero-link inode must remain readable");
+    assert_eq!(&buf, b"still-live");
+    ext4.reclaim_inode(handle).expect("victim reclaim failed");
+    assert!(ext4.getattr(victim).is_err());
+
+    let source = ext4
+        .create(ROOT_INO, "rename_source", mode)
+        .expect("create source failed");
+    let replaced = ext4
+        .create(ROOT_INO, "rename_target", mode)
+        .expect("create target failed");
+    let replaced_handle = ext4
+        .rename(ROOT_INO, "rename_source", ROOT_INO, "rename_target")
+        .expect("rename replacement failed")
+        .expect("replacement must return target handle");
+    assert_eq!(ext4.lookup(ROOT_INO, "rename_target").unwrap(), source);
+    assert_eq!(ext4.getattr(replaced).unwrap().links, 0);
+    ext4.reclaim_inode(replaced_handle)
+        .expect("replacement reclaim failed");
+
+    for name in ["deferred_other", "rename_target"] {
+        let handle = ext4.unlink(ROOT_INO, name).expect("cleanup unlink failed");
+        reclaim(ext4, handle);
+    }
+    println!("  [PASS] deferred reclaim lifecycle and rename replacement");
 }
 
 /// Run all cache correctness tests.
@@ -441,6 +523,7 @@ pub fn run_all_cache_tests(ext4: &Ext4, _image_path: &str) {
     data_integrity_test(ext4);
     block_group_cache_test(ext4);
     metadata_consistency_after_lookup_test(ext4);
+    deferred_reclaim_lifecycle_test(ext4);
     cache_eviction_stress_test(ext4);
     // e2fsck is run after dropping ext4 to ensure all writes are flushed
     println!("  (e2fsck validation deferred to after drop)");

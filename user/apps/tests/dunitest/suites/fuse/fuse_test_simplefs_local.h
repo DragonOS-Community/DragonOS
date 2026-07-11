@@ -1412,7 +1412,10 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
     case FUSE_DESTROY:
         if (a->destroy_count)
             (*a->destroy_count)++;
-        if (a->stop_on_destroy && a->stop)
+        // DESTROY is the final request for this connection. Always leave the
+        // daemon loop instead of racing a subsequent blocking read against a
+        // close from the test thread.
+        if (a->stop)
             *a->stop = 1;
         return 0;
     case FUSE_WRITE: {

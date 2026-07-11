@@ -95,7 +95,7 @@ pub(super) fn move_to(
         }
         if source.is_dir() {
             old_upper_dir.move_to(old_name, &new_upper_dir, new_name, RenameFlags::EXCHANGE)?;
-            OvlInode::cleanup_workdir_temp(&old_upper_dir, old_name);
+            let _ = OvlInode::cleanup_workdir_temp(&old_upper_dir, old_name);
             return Ok(());
         }
     }

@@ -25,6 +25,13 @@ pub struct FuseStatsSnapshot {
     pub read_buffer_too_small_total: u64,
     pub bytes_request_to_dev_total: u64,
     pub bytes_reply_payload_cloned_total: u64,
+    pub reply_payload_copy_count_total: u64,
+    pub reply_payload_transfer_count_total: u64,
+    pub reply_payload_transfer_bytes_total: u64,
+    pub dev_fuse_input_copy_count_total: u64,
+    pub dev_fuse_input_copy_bytes_total: u64,
+    pub virtiofs_compat_copy_count_total: u64,
+    pub virtiofs_compat_copy_bytes_total: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -42,6 +49,12 @@ pub struct VirtioFsStatsSnapshot {
     pub request_inflight_current: u64,
     pub request_inflight_peak: u64,
     pub queue_full_blocked_current: u64,
+    pub reply_retained_current: u64,
+    pub reply_retained_peak: u64,
+    pub reply_retained_capacity_bytes_current: u64,
+    pub reply_retained_capacity_bytes_peak: u64,
+    pub reply_credit_blocked_total: u64,
+    pub reply_credit_blocked_wake_total: u64,
     pub bridge_loop_iterations_total: u64,
     pub bridge_progress_iterations_total: u64,
     pub bridge_idle_sleeps_total: u64,
@@ -56,6 +69,8 @@ pub struct VirtioFsStatsSnapshot {
     pub virtqueue_not_ready_total: u64,
     pub submit_error_total: u64,
     pub pop_used_error_total: u64,
+    pub detach_failure_total: u64,
+    pub dma_owner_quarantined_total: u64,
     pub bridge_request_clone_count: u64,
     pub bridge_request_clone_bytes: u64,
     pub response_buffer_alloc_count: u64,
@@ -73,6 +88,7 @@ pub struct VirtioFsStatsSnapshot {
     pub bridge_wait_exit_spurious_total: u64,
     pub bridge_wake_request_total: u64,
     pub bridge_wake_completion_total: u64,
+    pub bridge_wake_reply_released_total: u64,
     pub bridge_wake_teardown_total: u64,
     pub bridge_wake_disconnect_total: u64,
     pub bridge_irq_no_active_conn_total: u64,
@@ -92,6 +108,7 @@ pub enum VirtioFsBridgeWakeSource {
     Completion,
     Teardown,
     Disconnect,
+    ReplyReleased,
 }
 
 impl VirtioFsBridgeWakeSource {
@@ -101,6 +118,7 @@ impl VirtioFsBridgeWakeSource {
             Self::Completion => 1 << 1,
             Self::Teardown => 1 << 2,
             Self::Disconnect => 1 << 3,
+            Self::ReplyReleased => 1 << 4,
         }
     }
 
@@ -110,6 +128,7 @@ impl VirtioFsBridgeWakeSource {
             Self::Completion => 2,
             Self::Teardown => 3,
             Self::Disconnect => 4,
+            Self::ReplyReleased => 5,
         }
     }
 }
@@ -151,6 +170,13 @@ static NOREPLY_QUEUED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READ_BUFFER_TOO_SMALL_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BYTES_REQUEST_TO_DEV_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BYTES_REPLY_PAYLOAD_CLONED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static REPLY_PAYLOAD_COPY_COUNT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static REPLY_PAYLOAD_TRANSFER_COUNT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static REPLY_PAYLOAD_TRANSFER_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DEV_FUSE_INPUT_COPY_COUNT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DEV_FUSE_INPUT_COPY_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static VIRTIOFS_COMPAT_COPY_COUNT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static VIRTIOFS_COMPAT_COPY_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 static DEVICE_QUEUE_DEPTH_MAX: AtomicU64 = AtomicU64::new(0);
 static HIPRIO_VRING_SIZE_CONFIGURED: AtomicU64 = AtomicU64::new(0);
@@ -165,6 +191,12 @@ static HIPRIO_INFLIGHT_PEAK: AtomicU64 = AtomicU64::new(0);
 static REQUEST_INFLIGHT_CURRENT: AtomicU64 = AtomicU64::new(0);
 static REQUEST_INFLIGHT_PEAK: AtomicU64 = AtomicU64::new(0);
 static QUEUE_FULL_BLOCKED_CURRENT: AtomicU64 = AtomicU64::new(0);
+static REPLY_RETAINED_CURRENT: AtomicU64 = AtomicU64::new(0);
+static REPLY_RETAINED_PEAK: AtomicU64 = AtomicU64::new(0);
+static REPLY_RETAINED_CAPACITY_BYTES_CURRENT: AtomicU64 = AtomicU64::new(0);
+static REPLY_RETAINED_CAPACITY_BYTES_PEAK: AtomicU64 = AtomicU64::new(0);
+static REPLY_CREDIT_BLOCKED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static REPLY_CREDIT_BLOCKED_WAKE_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 static BRIDGE_LOOP_ITERATIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BRIDGE_PROGRESS_ITERATIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -180,6 +212,8 @@ static VIRTQUEUE_FULL_TOTAL: AtomicU64 = AtomicU64::new(0);
 static VIRTQUEUE_NOT_READY_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SUBMIT_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
 static POP_USED_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DETACH_FAILURE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DMA_OWNER_QUARANTINED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BRIDGE_REQUEST_CLONE_COUNT: AtomicU64 = AtomicU64::new(0);
 static BRIDGE_REQUEST_CLONE_BYTES: AtomicU64 = AtomicU64::new(0);
 static RESPONSE_BUFFER_ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -213,9 +247,29 @@ static OPCODE_RESPONSE_BUFFER_ZERO_COUNT: [AtomicU64; OPCODE_BUCKETS] =
     [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
 static OPCODE_RESPONSE_BUFFER_ZERO_BYTES: [AtomicU64; OPCODE_BUCKETS] =
     [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
+static OPCODE_RESPONSE_SUBMITTED_CAPACITY_COUNT: [AtomicU64; OPCODE_BUCKETS] =
+    [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
+static OPCODE_RESPONSE_SUBMITTED_CAPACITY_BYTES: [AtomicU64; OPCODE_BUCKETS] =
+    [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
+static OPCODE_RESPONSE_CAPACITY_FALLBACK_COUNT: [AtomicU64; OPCODE_BUCKETS] =
+    [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
+static OPCODE_RESPONSE_COMPLETED_CAPACITY_BYTES: [AtomicU64; OPCODE_BUCKETS] =
+    [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
+static OPCODE_RESPONSE_USED_BYTES: [AtomicU64; OPCODE_BUCKETS] =
+    [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
+static OPCODE_RESPONSE_UNUSED_TAIL_BYTES: [AtomicU64; OPCODE_BUCKETS] =
+    [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
+static OPCODE_RESPONSE_OVERRUN_COUNT: [AtomicU64; OPCODE_BUCKETS] =
+    [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
+static OPCODE_RESPONSE_OVERRUN_BYTES: [AtomicU64; OPCODE_BUCKETS] =
+    [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
 static OPCODE_REPLY_PAYLOAD_COPY_COUNT: [AtomicU64; OPCODE_BUCKETS] =
     [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
 static OPCODE_REPLY_PAYLOAD_COPY_BYTES: [AtomicU64; OPCODE_BUCKETS] =
+    [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
+static OPCODE_REPLY_PAYLOAD_TRANSFER_COUNT: [AtomicU64; OPCODE_BUCKETS] =
+    [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
+static OPCODE_REPLY_PAYLOAD_TRANSFER_BYTES: [AtomicU64; OPCODE_BUCKETS] =
     [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
 
 static PUMP_BATCH: [AtomicU64; BATCH_BUCKETS] = [const { AtomicU64::new(0) }; BATCH_BUCKETS];
@@ -229,6 +283,7 @@ static BRIDGE_WAIT_EXIT_DISCONNECT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BRIDGE_WAIT_EXIT_SPURIOUS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BRIDGE_WAKE_REQUEST_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BRIDGE_WAKE_COMPLETION_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BRIDGE_WAKE_REPLY_RELEASED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BRIDGE_WAKE_TEARDOWN_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BRIDGE_WAKE_DISCONNECT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BRIDGE_IRQ_NO_ACTIVE_CONN_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -330,18 +385,96 @@ pub fn on_fuse_read_buffer_too_small() {
 }
 
 #[inline]
-pub fn on_fuse_reply_complete(opcode: u32, error: i32, payload_len: usize) {
+pub fn on_fuse_reply_complete(_opcode: u32, error: i32, _payload_len: usize) {
     if error == 0 {
         inc(&REQUESTS_REPLIED_OK_TOTAL);
-        add(&BYTES_REPLY_PAYLOAD_CLONED_TOTAL, payload_len as u64);
-        if detailed_stats_enabled() {
-            let bucket = opcode_bucket(opcode);
-            inc(&OPCODE_REPLY_PAYLOAD_COPY_COUNT[bucket]);
-            add(&OPCODE_REPLY_PAYLOAD_COPY_BYTES[bucket], payload_len as u64);
-        }
     } else {
         inc(&REQUESTS_REPLIED_ERR_TOTAL);
     }
+}
+
+#[inline]
+pub fn on_fuse_reply_payload_copy(opcode: u32, payload_len: usize) {
+    if payload_len == 0 {
+        return;
+    }
+    inc(&REPLY_PAYLOAD_COPY_COUNT_TOTAL);
+    add(&BYTES_REPLY_PAYLOAD_CLONED_TOTAL, payload_len as u64);
+    if detailed_stats_enabled() {
+        let bucket = opcode_bucket(opcode);
+        inc(&OPCODE_REPLY_PAYLOAD_COPY_COUNT[bucket]);
+        add(&OPCODE_REPLY_PAYLOAD_COPY_BYTES[bucket], payload_len as u64);
+    }
+}
+
+#[inline]
+pub fn on_virtiofs_reply_retained(capacity: usize) {
+    let count = REPLY_RETAINED_CURRENT.fetch_add(1, Ordering::Relaxed) + 1;
+    let capacity = capacity as u64;
+    let bytes =
+        REPLY_RETAINED_CAPACITY_BYTES_CURRENT.fetch_add(capacity, Ordering::Relaxed) + capacity;
+    update_peak(&REPLY_RETAINED_PEAK, count);
+    update_peak(&REPLY_RETAINED_CAPACITY_BYTES_PEAK, bytes);
+}
+
+#[inline]
+pub fn on_virtiofs_reply_released(capacity: usize) {
+    saturating_sub(&REPLY_RETAINED_CURRENT, 1);
+    saturating_sub(&REPLY_RETAINED_CAPACITY_BYTES_CURRENT, capacity as u64);
+}
+
+#[inline]
+pub fn on_virtiofs_reply_capacity_reaccounted(old_capacity: usize, new_capacity: usize) {
+    if new_capacity > old_capacity {
+        let delta = (new_capacity - old_capacity) as u64;
+        let bytes =
+            REPLY_RETAINED_CAPACITY_BYTES_CURRENT.fetch_add(delta, Ordering::Relaxed) + delta;
+        update_peak(&REPLY_RETAINED_CAPACITY_BYTES_PEAK, bytes);
+    } else {
+        saturating_sub(
+            &REPLY_RETAINED_CAPACITY_BYTES_CURRENT,
+            (old_capacity - new_capacity) as u64,
+        );
+    }
+}
+
+#[inline]
+pub fn on_virtiofs_reply_credit_blocked() {
+    inc(&REPLY_CREDIT_BLOCKED_TOTAL);
+}
+
+#[inline]
+pub fn on_virtiofs_reply_credit_blocked_wake() {
+    inc(&REPLY_CREDIT_BLOCKED_WAKE_TOTAL);
+}
+
+#[inline]
+pub fn on_fuse_reply_payload_transfer(opcode: u32, payload_len: usize) {
+    if payload_len == 0 {
+        return;
+    }
+    inc(&REPLY_PAYLOAD_TRANSFER_COUNT_TOTAL);
+    add(&REPLY_PAYLOAD_TRANSFER_BYTES_TOTAL, payload_len as u64);
+    if detailed_stats_enabled() {
+        let bucket = opcode_bucket(opcode);
+        inc(&OPCODE_REPLY_PAYLOAD_TRANSFER_COUNT[bucket]);
+        add(
+            &OPCODE_REPLY_PAYLOAD_TRANSFER_BYTES[bucket],
+            payload_len as u64,
+        );
+    }
+}
+
+#[inline]
+pub fn on_dev_fuse_input_copy(payload_len: usize) {
+    inc(&DEV_FUSE_INPUT_COPY_COUNT_TOTAL);
+    add(&DEV_FUSE_INPUT_COPY_BYTES_TOTAL, payload_len as u64);
+}
+
+#[inline]
+pub fn on_virtiofs_compat_copy(payload_len: usize) {
+    inc(&VIRTIOFS_COMPAT_COPY_COUNT_TOTAL);
+    add(&VIRTIOFS_COMPAT_COPY_BYTES_TOTAL, payload_len as u64);
 }
 
 #[inline]
@@ -440,6 +573,7 @@ pub fn on_virtiofs_bridge_wake(source: VirtioFsBridgeWakeSource) {
         VirtioFsBridgeWakeSource::Completion => inc(&BRIDGE_WAKE_COMPLETION_TOTAL),
         VirtioFsBridgeWakeSource::Teardown => inc(&BRIDGE_WAKE_TEARDOWN_TOTAL),
         VirtioFsBridgeWakeSource::Disconnect => inc(&BRIDGE_WAKE_DISCONNECT_TOTAL),
+        VirtioFsBridgeWakeSource::ReplyReleased => inc(&BRIDGE_WAKE_REPLY_RELEASED_TOTAL),
     }
 }
 
@@ -522,6 +656,59 @@ pub fn on_virtiofs_response_buffer_waste(len: usize) {
     add(&RESPONSE_BUFFER_WASTE_BYTES, len as u64);
 }
 
+/// Record the response capacity made device-writable by a successful queue add.
+///
+/// This is deliberately separate from response-buffer preparation: queue-full and
+/// submission-error paths can acquire and clear a buffer without submitting it.
+#[inline]
+pub fn on_virtiofs_response_submitted(opcode: u32, capacity: usize, fallback: bool) {
+    if !detailed_stats_enabled() {
+        return;
+    }
+
+    let bucket = opcode_bucket(opcode);
+    inc(&OPCODE_RESPONSE_SUBMITTED_CAPACITY_COUNT[bucket]);
+    add(
+        &OPCODE_RESPONSE_SUBMITTED_CAPACITY_BYTES[bucket],
+        capacity as u64,
+    );
+    if fallback {
+        inc(&OPCODE_RESPONSE_CAPACITY_FALLBACK_COUNT[bucket]);
+    }
+}
+
+/// Record the used-ring length against the submitted response capacity.
+///
+/// Valid completions contribute to the completed/used/unused-tail identity. An
+/// overrun is kept in a disjoint event domain and records only the excess bytes,
+/// avoiding unsigned subtraction and misleading completed-capacity accounting.
+#[inline]
+pub fn on_virtiofs_response_completed(opcode: u32, capacity: usize, used_len: usize) {
+    if !detailed_stats_enabled() {
+        return;
+    }
+
+    let bucket = opcode_bucket(opcode);
+    if used_len > capacity {
+        inc(&OPCODE_RESPONSE_OVERRUN_COUNT[bucket]);
+        add(
+            &OPCODE_RESPONSE_OVERRUN_BYTES[bucket],
+            (used_len - capacity) as u64,
+        );
+        return;
+    }
+
+    add(
+        &OPCODE_RESPONSE_COMPLETED_CAPACITY_BYTES[bucket],
+        capacity as u64,
+    );
+    add(&OPCODE_RESPONSE_USED_BYTES[bucket], used_len as u64);
+    add(
+        &OPCODE_RESPONSE_UNUSED_TAIL_BYTES[bucket],
+        (capacity - used_len) as u64,
+    );
+}
+
 #[inline]
 pub fn on_virtiofs_submitted(opcode: u32, req_len: usize) {
     inc(&BRIDGE_SUBMITTED_TOTAL);
@@ -582,6 +769,16 @@ pub fn on_virtiofs_pop_used_error() {
 }
 
 #[inline]
+pub fn on_virtiofs_detach_failure() {
+    inc(&DETACH_FAILURE_TOTAL);
+}
+
+#[inline]
+pub fn on_virtiofs_dma_owner_quarantined() {
+    inc(&DMA_OWNER_QUARANTINED_TOTAL);
+}
+
+#[inline]
 pub fn on_virtiofs_completed(used_len: usize, noreply: bool) {
     inc(&BRIDGE_COMPLETED_TOTAL);
     if noreply {
@@ -607,6 +804,15 @@ pub fn fuse_snapshot() -> FuseStatsSnapshot {
         read_buffer_too_small_total: READ_BUFFER_TOO_SMALL_TOTAL.load(Ordering::Relaxed),
         bytes_request_to_dev_total: BYTES_REQUEST_TO_DEV_TOTAL.load(Ordering::Relaxed),
         bytes_reply_payload_cloned_total: BYTES_REPLY_PAYLOAD_CLONED_TOTAL.load(Ordering::Relaxed),
+        reply_payload_copy_count_total: REPLY_PAYLOAD_COPY_COUNT_TOTAL.load(Ordering::Relaxed),
+        reply_payload_transfer_count_total: REPLY_PAYLOAD_TRANSFER_COUNT_TOTAL
+            .load(Ordering::Relaxed),
+        reply_payload_transfer_bytes_total: REPLY_PAYLOAD_TRANSFER_BYTES_TOTAL
+            .load(Ordering::Relaxed),
+        dev_fuse_input_copy_count_total: DEV_FUSE_INPUT_COPY_COUNT_TOTAL.load(Ordering::Relaxed),
+        dev_fuse_input_copy_bytes_total: DEV_FUSE_INPUT_COPY_BYTES_TOTAL.load(Ordering::Relaxed),
+        virtiofs_compat_copy_count_total: VIRTIOFS_COMPAT_COPY_COUNT_TOTAL.load(Ordering::Relaxed),
+        virtiofs_compat_copy_bytes_total: VIRTIOFS_COMPAT_COPY_BYTES_TOTAL.load(Ordering::Relaxed),
     }
 }
 
@@ -627,6 +833,14 @@ pub fn virtiofs_snapshot() -> VirtioFsStatsSnapshot {
         request_inflight_current: REQUEST_INFLIGHT_CURRENT.load(Ordering::Relaxed),
         request_inflight_peak: REQUEST_INFLIGHT_PEAK.load(Ordering::Relaxed),
         queue_full_blocked_current: QUEUE_FULL_BLOCKED_CURRENT.load(Ordering::Relaxed),
+        reply_retained_current: REPLY_RETAINED_CURRENT.load(Ordering::Relaxed),
+        reply_retained_peak: REPLY_RETAINED_PEAK.load(Ordering::Relaxed),
+        reply_retained_capacity_bytes_current: REPLY_RETAINED_CAPACITY_BYTES_CURRENT
+            .load(Ordering::Relaxed),
+        reply_retained_capacity_bytes_peak: REPLY_RETAINED_CAPACITY_BYTES_PEAK
+            .load(Ordering::Relaxed),
+        reply_credit_blocked_total: REPLY_CREDIT_BLOCKED_TOTAL.load(Ordering::Relaxed),
+        reply_credit_blocked_wake_total: REPLY_CREDIT_BLOCKED_WAKE_TOTAL.load(Ordering::Relaxed),
         bridge_loop_iterations_total: BRIDGE_LOOP_ITERATIONS_TOTAL.load(Ordering::Relaxed),
         bridge_progress_iterations_total: BRIDGE_PROGRESS_ITERATIONS_TOTAL.load(Ordering::Relaxed),
         bridge_idle_sleeps_total: BRIDGE_IDLE_SLEEPS_TOTAL.load(Ordering::Relaxed),
@@ -641,6 +855,8 @@ pub fn virtiofs_snapshot() -> VirtioFsStatsSnapshot {
         virtqueue_not_ready_total: VIRTQUEUE_NOT_READY_TOTAL.load(Ordering::Relaxed),
         submit_error_total: SUBMIT_ERROR_TOTAL.load(Ordering::Relaxed),
         pop_used_error_total: POP_USED_ERROR_TOTAL.load(Ordering::Relaxed),
+        detach_failure_total: DETACH_FAILURE_TOTAL.load(Ordering::Relaxed),
+        dma_owner_quarantined_total: DMA_OWNER_QUARANTINED_TOTAL.load(Ordering::Relaxed),
         bridge_request_clone_count: BRIDGE_REQUEST_CLONE_COUNT.load(Ordering::Relaxed),
         bridge_request_clone_bytes: BRIDGE_REQUEST_CLONE_BYTES.load(Ordering::Relaxed),
         response_buffer_alloc_count: RESPONSE_BUFFER_ALLOC_COUNT.load(Ordering::Relaxed),
@@ -661,6 +877,7 @@ pub fn virtiofs_snapshot() -> VirtioFsStatsSnapshot {
         bridge_wait_exit_spurious_total: BRIDGE_WAIT_EXIT_SPURIOUS_TOTAL.load(Ordering::Relaxed),
         bridge_wake_request_total: BRIDGE_WAKE_REQUEST_TOTAL.load(Ordering::Relaxed),
         bridge_wake_completion_total: BRIDGE_WAKE_COMPLETION_TOTAL.load(Ordering::Relaxed),
+        bridge_wake_reply_released_total: BRIDGE_WAKE_REPLY_RELEASED_TOTAL.load(Ordering::Relaxed),
         bridge_wake_teardown_total: BRIDGE_WAKE_TEARDOWN_TOTAL.load(Ordering::Relaxed),
         bridge_wake_disconnect_total: BRIDGE_WAKE_DISCONNECT_TOTAL.load(Ordering::Relaxed),
         bridge_irq_no_active_conn_total: BRIDGE_IRQ_NO_ACTIVE_CONN_TOTAL.load(Ordering::Relaxed),
@@ -696,6 +913,13 @@ noreply_queued_total {}\n\
 read_buffer_too_small_total {}\n\
 bytes_request_to_dev_total {}\n\
 bytes_reply_payload_cloned_total {}\n\
+reply_payload_copy_count_total {}\n\
+reply_payload_transfer_count_total {}\n\
+reply_payload_transfer_bytes_total {}\n\
+dev_fuse_input_copy_count_total {}\n\
+dev_fuse_input_copy_bytes_total {}\n\
+virtiofs_compat_copy_count_total {}\n\
+virtiofs_compat_copy_bytes_total {}\n\
 \n\
 [virtiofs]\n\
 device_queue_depth_max {}\n\
@@ -711,6 +935,12 @@ hiprio_inflight_peak {}\n\
 request_inflight_current {}\n\
 request_inflight_peak {}\n\
 queue_full_blocked_current {}\n\
+reply_retained_current {}\n\
+reply_retained_peak {}\n\
+reply_retained_capacity_bytes_current {}\n\
+reply_retained_capacity_bytes_peak {}\n\
+reply_credit_blocked_total {}\n\
+reply_credit_blocked_wake_total {}\n\
 bridge_loop_iterations_total {}\n\
 bridge_progress_iterations_total {}\n\
 bridge_idle_sleeps_total {}\n\
@@ -725,6 +955,8 @@ virtqueue_full_total {}\n\
 virtqueue_not_ready_total {}\n\
 submit_error_total {}\n\
 pop_used_error_total {}\n\
+detach_failure_total {}\n\
+dma_owner_quarantined_total {}\n\
 bridge_request_clone_count {}\n\
 bridge_request_clone_bytes {}\n\
 response_buffer_alloc_count {}\n\
@@ -750,6 +982,7 @@ bridge_wait_exit_disconnect_total {}\n\
 bridge_wait_exit_spurious_total {}\n\
 bridge_wake_request_total {}\n\
 bridge_wake_completion_total {}\n\
+bridge_wake_reply_released_total {}\n\
 bridge_wake_teardown_total {}\n\
 bridge_wake_disconnect_total {}\n\
 bridge_irq_no_active_conn_total {}\n\
@@ -771,6 +1004,13 @@ request_queue_full_total {}\n",
         fuse.read_buffer_too_small_total,
         fuse.bytes_request_to_dev_total,
         fuse.bytes_reply_payload_cloned_total,
+        fuse.reply_payload_copy_count_total,
+        fuse.reply_payload_transfer_count_total,
+        fuse.reply_payload_transfer_bytes_total,
+        fuse.dev_fuse_input_copy_count_total,
+        fuse.dev_fuse_input_copy_bytes_total,
+        fuse.virtiofs_compat_copy_count_total,
+        fuse.virtiofs_compat_copy_bytes_total,
         virtiofs.device_queue_depth_max,
         virtiofs.hiprio_vring_size_configured,
         virtiofs.request_queue_count_configured,
@@ -784,6 +1024,12 @@ request_queue_full_total {}\n",
         virtiofs.request_inflight_current,
         virtiofs.request_inflight_peak,
         virtiofs.queue_full_blocked_current,
+        virtiofs.reply_retained_current,
+        virtiofs.reply_retained_peak,
+        virtiofs.reply_retained_capacity_bytes_current,
+        virtiofs.reply_retained_capacity_bytes_peak,
+        virtiofs.reply_credit_blocked_total,
+        virtiofs.reply_credit_blocked_wake_total,
         virtiofs.bridge_loop_iterations_total,
         virtiofs.bridge_progress_iterations_total,
         virtiofs.bridge_idle_sleeps_total,
@@ -798,6 +1044,8 @@ request_queue_full_total {}\n",
         virtiofs.virtqueue_not_ready_total,
         virtiofs.submit_error_total,
         virtiofs.pop_used_error_total,
+        virtiofs.detach_failure_total,
+        virtiofs.dma_owner_quarantined_total,
         virtiofs.bridge_request_clone_count,
         virtiofs.bridge_request_clone_bytes,
         virtiofs.response_buffer_alloc_count,
@@ -823,6 +1071,7 @@ request_queue_full_total {}\n",
         virtiofs.bridge_wait_exit_spurious_total,
         virtiofs.bridge_wake_request_total,
         virtiofs.bridge_wake_completion_total,
+        virtiofs.bridge_wake_reply_released_total,
         virtiofs.bridge_wake_teardown_total,
         virtiofs.bridge_wake_disconnect_total,
         virtiofs.bridge_irq_no_active_conn_total,
@@ -862,8 +1111,18 @@ opcode_{opcode}_response_buffer_reuse_count {}\n\
 opcode_{opcode}_response_buffer_reuse_bytes {}\n\
 opcode_{opcode}_response_buffer_zero_count {}\n\
 opcode_{opcode}_response_buffer_zero_bytes {}\n\
+opcode_{opcode}_response_submitted_capacity_count {}\n\
+opcode_{opcode}_response_submitted_capacity_bytes {}\n\
+opcode_{opcode}_response_capacity_fallback_count {}\n\
+opcode_{opcode}_response_completed_capacity_bytes {}\n\
+opcode_{opcode}_response_used_bytes {}\n\
+opcode_{opcode}_response_unused_tail_bytes {}\n\
+opcode_{opcode}_response_overrun_count {}\n\
+opcode_{opcode}_response_overrun_bytes {}\n\
 opcode_{opcode}_reply_payload_copy_count {}\n\
-opcode_{opcode}_reply_payload_copy_bytes {}",
+opcode_{opcode}_reply_payload_copy_bytes {}\n\
+opcode_{opcode}_reply_payload_transfer_count {}\n\
+opcode_{opcode}_reply_payload_transfer_bytes {}",
             OPCODE_REQUESTS_TOTAL[opcode].load(Ordering::Relaxed),
             OPCODE_REQUEST_BYTES_TOTAL[opcode].load(Ordering::Relaxed),
             OPCODE_REQUEST_BRIDGE_COPY_COUNT[opcode].load(Ordering::Relaxed),
@@ -874,8 +1133,18 @@ opcode_{opcode}_reply_payload_copy_bytes {}",
             OPCODE_RESPONSE_BUFFER_REUSE_BYTES[opcode].load(Ordering::Relaxed),
             OPCODE_RESPONSE_BUFFER_ZERO_COUNT[opcode].load(Ordering::Relaxed),
             OPCODE_RESPONSE_BUFFER_ZERO_BYTES[opcode].load(Ordering::Relaxed),
+            OPCODE_RESPONSE_SUBMITTED_CAPACITY_COUNT[opcode].load(Ordering::Relaxed),
+            OPCODE_RESPONSE_SUBMITTED_CAPACITY_BYTES[opcode].load(Ordering::Relaxed),
+            OPCODE_RESPONSE_CAPACITY_FALLBACK_COUNT[opcode].load(Ordering::Relaxed),
+            OPCODE_RESPONSE_COMPLETED_CAPACITY_BYTES[opcode].load(Ordering::Relaxed),
+            OPCODE_RESPONSE_USED_BYTES[opcode].load(Ordering::Relaxed),
+            OPCODE_RESPONSE_UNUSED_TAIL_BYTES[opcode].load(Ordering::Relaxed),
+            OPCODE_RESPONSE_OVERRUN_COUNT[opcode].load(Ordering::Relaxed),
+            OPCODE_RESPONSE_OVERRUN_BYTES[opcode].load(Ordering::Relaxed),
             OPCODE_REPLY_PAYLOAD_COPY_COUNT[opcode].load(Ordering::Relaxed),
             OPCODE_REPLY_PAYLOAD_COPY_BYTES[opcode].load(Ordering::Relaxed),
+            OPCODE_REPLY_PAYLOAD_TRANSFER_COUNT[opcode].load(Ordering::Relaxed),
+            OPCODE_REPLY_PAYLOAD_TRANSFER_BYTES[opcode].load(Ordering::Relaxed),
         )
         .expect("formatting fuse opcode stats into String cannot fail");
     }

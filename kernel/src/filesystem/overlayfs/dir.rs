@@ -75,12 +75,28 @@ pub(super) fn link(
 ) -> Result<(), system_error::SystemError> {
     let fs = inode.overlay_fs()?;
     let _mutation_guard = fs.mutation_lock.lock();
+
+    match inode.find(name) {
+        Ok(_) => return Err(SystemError::EEXIST),
+        Err(SystemError::ENOENT) => {}
+        Err(err) => return Err(err),
+    }
+
+    let source = OvlInode::downcast_overlay_inode(other.clone())?;
+    let source_fs = source.overlay_fs()?;
+    if !Arc::ptr_eq(&fs, &source_fs) {
+        return Err(SystemError::EXDEV);
+    }
+
+    source.copy_up_locked()?;
+    let source_upper = source.upper_inode.lock().clone().ok_or(SystemError::EIO)?;
+
     create_over_whiteout(
         inode,
         name,
         |dir, temp_name| {
-            dir.link(temp_name, other)?;
-            dir.find(temp_name)
+            dir.link(temp_name, &source_upper)?;
+            Ok(source_upper.clone())
         },
         false,
     )
@@ -138,13 +154,16 @@ where
 {
     let upper_inode = inode.writable_upper_inode_locked()?;
     match upper_inode.find(name) {
-        Ok(found) if OvlInode::is_whiteout_inode(&found) => {}
-        Ok(_) => return Err(SystemError::EEXIST),
+        Ok(found) => {
+            if !OvlInode::is_whiteout_inode_checked(&found)? {
+                return Err(SystemError::EEXIST);
+            }
+        }
         Err(SystemError::ENOENT) => return create_temp(&upper_inode, name),
         Err(err) => return Err(err),
     }
 
-    let (workdir, temp_inode, temp_name) = inode.create_workdir_temp(create_temp)?;
+    let (workdir, _temp_inode, temp_name) = inode.create_workdir_temp(create_temp)?;
     let commit_result = if is_dir {
         workdir.move_to(
             &temp_name,
@@ -162,15 +181,23 @@ where
     };
 
     if let Err(err) = commit_result {
-        OvlInode::cleanup_workdir_temp(&workdir, &temp_name);
+        if let Err(cleanup_err) = OvlInode::cleanup_workdir_temp(&workdir, &temp_name) {
+            log::error!(
+                "overlayfs: failed to clean workdir temp {temp_name} after publish error {err:?}: {cleanup_err:?}"
+            );
+        }
         return Err(err);
     }
 
     if is_dir {
-        OvlInode::cleanup_workdir_temp(&workdir, &temp_name);
+        if let Err(err) = OvlInode::cleanup_workdir_temp(&workdir, &temp_name) {
+            log::error!(
+                "overlayfs: failed to clean detached workdir temp {temp_name} after publish: {err:?}"
+            );
+        }
     }
 
-    upper_inode.find(name).or(Ok(temp_inode))
+    upper_inode.find(name)
 }
 
 fn is_dot_entry(name: &str) -> bool {

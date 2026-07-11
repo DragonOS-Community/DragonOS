@@ -1,14 +1,15 @@
 use alloc::{collections::BTreeMap, collections::VecDeque, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::{
+    mem::size_of,
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+};
 
-use num_traits::FromPrimitive;
 use system_error::SystemError;
 
 use crate::{
     arch::MMArch,
-    exception::workqueue::{schedule_work, Work},
     filesystem::epoll::{
-        event_poll::EventPoll, event_poll::LockedEPItemLinkedList, EPollEventType, EPollItem,
+        event_poll::EventPoll, event_poll::LockedEPItemLinkedList, EPollEventType,
     },
     libs::{
         mutex::Mutex,
@@ -21,18 +22,19 @@ use crate::{
 use crate::process::cred::CAPFlags;
 
 use super::protocol::{
-    fuse_pack_struct, fuse_read_struct, FuseForgetIn, FuseInHeader, FuseInitIn, FuseInitOut,
-    FuseInterruptIn, FuseOutHeader, FuseWriteIn, FUSE_ABORT_ERROR, FUSE_ASYNC_DIO, FUSE_ASYNC_READ,
+    FuseInHeader, FuseWriteIn, FUSE_ABORT_ERROR, FUSE_ASYNC_DIO, FUSE_ASYNC_READ,
     FUSE_ATOMIC_O_TRUNC, FUSE_AUTO_INVAL_DATA, FUSE_BIG_WRITES, FUSE_DESTROY, FUSE_DONT_MASK,
-    FUSE_DO_READDIRPLUS, FUSE_EXPLICIT_INVAL_DATA, FUSE_EXPORT_SUPPORT, FUSE_FLUSH, FUSE_FORGET,
-    FUSE_FSYNC, FUSE_FSYNCDIR, FUSE_GETXATTR, FUSE_HANDLE_KILLPRIV, FUSE_INIT, FUSE_INIT_EXT,
-    FUSE_INTERRUPT, FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION, FUSE_LISTXATTR, FUSE_LOOKUP,
-    FUSE_MAX_PAGES, FUSE_MIN_READ_BUFFER, FUSE_NOTIFY_DELETE, FUSE_NOTIFY_INVAL_ENTRY,
-    FUSE_NOTIFY_INVAL_INODE, FUSE_NOTIFY_POLL, FUSE_NOTIFY_RETRIEVE, FUSE_NOTIFY_STORE,
-    FUSE_NO_OPENDIR_SUPPORT, FUSE_NO_OPEN_SUPPORT, FUSE_PARALLEL_DIROPS, FUSE_POSIX_ACL,
-    FUSE_POSIX_LOCKS, FUSE_READDIRPLUS_AUTO, FUSE_REMOVEXATTR, FUSE_SETXATTR, FUSE_SUBMOUNTS,
+    FUSE_DO_READDIRPLUS, FUSE_EXPLICIT_INVAL_DATA, FUSE_EXPORT_SUPPORT, FUSE_FORGET, FUSE_FSYNC,
+    FUSE_FSYNCDIR, FUSE_GETXATTR, FUSE_HANDLE_KILLPRIV, FUSE_INIT_EXT, FUSE_INTERRUPT,
+    FUSE_LISTXATTR, FUSE_MAX_PAGES, FUSE_NO_OPENDIR_SUPPORT, FUSE_NO_OPEN_SUPPORT,
+    FUSE_PARALLEL_DIROPS, FUSE_POSIX_ACL, FUSE_POSIX_LOCKS, FUSE_READDIRPLUS_AUTO,
+    FUSE_REMOVEXATTR, FUSE_SETXATTR, FUSE_SUBMOUNTS,
 };
+use super::reply::FuseReply;
 use super::{stats, trace};
+
+mod daemon;
+mod request;
 
 fn wait_with_recheck<T, F>(waitq: &WaitQueue, mut check: F) -> Result<T, SystemError>
 where
@@ -117,6 +119,27 @@ pub struct FuseRequest {
     bytes: Vec<u8>,
     unique: u64,
     opcode: u32,
+    reply_contract: FuseReplyContract,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FuseReplyCapacitySource {
+    Exact,
+    RequestBounded,
+    ExplicitFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FuseReplyCapacity {
+    pub(crate) bytes: usize,
+    pub(crate) retained_bytes: usize,
+    pub(crate) source: FuseReplyCapacitySource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FuseReplyContract {
+    NoReply,
+    Reply { capacity: Option<FuseReplyCapacity> },
 }
 
 impl FuseRequest {
@@ -130,6 +153,10 @@ impl FuseRequest {
 
     pub(crate) fn opcode(&self) -> u32 {
         self.opcode
+    }
+
+    pub(crate) fn reply_contract(&self) -> FuseReplyContract {
+        self.reply_contract
     }
 }
 
@@ -165,8 +192,15 @@ impl FuseRequestCred {
 pub struct FusePendingState {
     unique: u64,
     opcode: u32,
-    response: Mutex<Option<Result<Vec<u8>, SystemError>>>,
+    response: Mutex<PendingCompletion>,
     wait: WaitQueue,
+}
+
+#[derive(Debug)]
+enum PendingCompletion {
+    Waiting,
+    Ready(Result<FuseReply, SystemError>),
+    Consumed,
 }
 
 impl FusePendingState {
@@ -174,7 +208,7 @@ impl FusePendingState {
         Self {
             unique,
             opcode,
-            response: Mutex::new(None),
+            response: Mutex::new(PendingCompletion::Waiting),
             wait: WaitQueue::default(),
         }
     }
@@ -183,22 +217,26 @@ impl FusePendingState {
         self.unique
     }
 
-    pub fn complete(&self, v: Result<Vec<u8>, SystemError>) {
+    pub fn complete(&self, v: Result<FuseReply, SystemError>) -> bool {
         let mut guard = self.response.lock();
-        if guard.is_some() {
+        if !matches!(*guard, PendingCompletion::Waiting) {
             // Duplicate replies are ignored (Linux does similarly).
-            return;
+            return false;
         }
-        *guard = Some(v);
+        *guard = PendingCompletion::Ready(v);
         drop(guard);
         self.wait.wakeup(None);
+        true
     }
 
-    pub fn wait_complete(&self) -> Result<Vec<u8>, SystemError> {
+    pub fn wait_complete(&self) -> Result<FuseReply, SystemError> {
         wait_with_recheck(&self.wait, || {
             let mut guard = self.response.lock();
-            if let Some(res) = guard.take() {
-                return Ok(Some(res));
+            if matches!(*guard, PendingCompletion::Ready(_)) {
+                let ready = core::mem::replace(&mut *guard, PendingCompletion::Consumed);
+                if let PendingCompletion::Ready(res) = ready {
+                    return Ok(Some(res));
+                }
             }
             Ok(None)
         })?
@@ -255,6 +293,7 @@ struct FuseConnInner {
     max_write_cap: usize,
     max_pages_limit: usize,
     separate_hiprio_pending: bool,
+    teardown_started: bool,
     hiprio_pending: VecDeque<Arc<FuseRequest>>,
     pending: VecDeque<Arc<FuseRequest>>,
     processing: BTreeMap<u64, Arc<FusePendingState>>,
@@ -270,6 +309,8 @@ pub struct FuseConn {
     init_wait: WaitQueue,
     bridge_wake: FuseBridgeWake,
     epitems: LockedEPItemLinkedList,
+    backend_reply_limit: Option<usize>,
+    reply_layout_minor: AtomicU32,
 }
 
 impl FuseConn {
@@ -280,29 +321,36 @@ impl FuseConn {
     const DEFAULT_MAX_PAGES: usize = 32;
     const MAX_MAX_PAGES: usize = 256;
     const DEFAULT_MAX_READAHEAD: usize = 128 * MMArch::PAGE_SIZE;
+    const XATTR_SIZE_MAX: usize = 64 * 1024;
+    const FUSE_COMPAT_ENTRY_OUT_SIZE: usize = 120;
+    const FUSE_COMPAT_ATTR_OUT_SIZE: usize = 96;
+    const FUSE_COMPAT_STATFS_SIZE: usize = 48;
+    const FUSE_COMPAT_INIT_OUT_SIZE: usize = 8;
 
     pub fn new() -> Arc<Self> {
         Self::new_with_max_write_cap(
             Self::max_write_cap_for_user_read_chunk(),
             Self::kernel_init_flags(),
             false,
+            None,
         )
     }
 
-    pub fn new_for_virtiofs(max_message_size: usize) -> Arc<Self> {
-        let overhead = core::mem::size_of::<FuseInHeader>() + core::mem::size_of::<FuseWriteIn>();
-        let cap = if max_message_size > overhead {
-            core::cmp::max(Self::MIN_MAX_WRITE, max_message_size - overhead)
+    pub fn new_for_virtiofs(max_request_size: usize, max_reply_size: usize) -> Arc<Self> {
+        let overhead = size_of::<FuseInHeader>() + size_of::<FuseWriteIn>();
+        let cap = if max_request_size > overhead {
+            core::cmp::max(Self::MIN_MAX_WRITE, max_request_size - overhead)
         } else {
             Self::MIN_MAX_WRITE
         };
-        Self::new_with_max_write_cap(cap, Self::virtiofs_init_flags(), true)
+        Self::new_with_max_write_cap(cap, Self::virtiofs_init_flags(), true, Some(max_reply_size))
     }
 
     fn new_with_max_write_cap(
         max_write_cap: usize,
         init_flags: u64,
         separate_hiprio_pending: bool,
+        backend_reply_limit: Option<usize>,
     ) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(FuseConnInner {
@@ -330,6 +378,7 @@ impl FuseConn {
                 max_write_cap,
                 max_pages_limit: Self::MAX_MAX_PAGES,
                 separate_hiprio_pending,
+                teardown_started: false,
                 hiprio_pending: VecDeque::new(),
                 pending: VecDeque::new(),
                 processing: BTreeMap::new(),
@@ -341,6 +390,8 @@ impl FuseConn {
             init_wait: WaitQueue::default(),
             bridge_wake: FuseBridgeWake::new(),
             epitems: LockedEPItemLinkedList::default(),
+            backend_reply_limit,
+            reply_layout_minor: AtomicU32::new(0),
         })
     }
 
@@ -540,10 +591,6 @@ impl FuseConn {
         }
     }
 
-    fn alloc_unique(&self) -> u64 {
-        self.next_unique.fetch_add(2, Ordering::Relaxed)
-    }
-
     fn allow_current_process(&self, cred: &crate::process::cred::Cred) -> bool {
         let g = self.inner.lock();
 
@@ -600,7 +647,7 @@ impl FuseConn {
                 .pending
                 .iter()
                 .chain(g.hiprio_pending.iter())
-                .filter(|req| matches!(req.opcode, FUSE_FORGET | FUSE_DESTROY | FUSE_INTERRUPT))
+                .filter(|req| matches!(req.opcode, FUSE_FORGET | FUSE_INTERRUPT))
                 .count();
             g.hiprio_pending.clear();
             g.pending.clear();
@@ -632,6 +679,10 @@ impl FuseConn {
         let dropped_pending: usize;
         {
             let mut g = self.inner.lock();
+            if g.teardown_started {
+                return;
+            }
+            g.teardown_started = true;
             should_destroy = g.connected && g.initialized;
             g.mounted = false;
             // Filesystem teardown queues accumulated FORGET requests before
@@ -677,53 +728,14 @@ impl FuseConn {
             return;
         }
 
-        if self.enqueue_noreply(FUSE_DESTROY, 0, &[]).is_err() {
+        if self
+            .enqueue_request_with_cred(FUSE_DESTROY, 0, &[], FuseRequestCred::nocreds())
+            .is_err()
+        {
             self.abort();
             return;
         }
         self.wake_bridge(stats::VirtioFsBridgeWakeSource::Teardown);
-    }
-
-    /// Queue a FORGET message (no reply expected).
-    pub fn queue_forget(&self, nodeid: u64, nlookup: u64) -> Result<(), SystemError> {
-        if nodeid == 0 || nlookup == 0 {
-            return Ok(());
-        }
-        let can_send = {
-            let g = self.inner.lock();
-            g.connected && g.mounted && g.initialized
-        };
-        if !can_send {
-            return Ok(());
-        }
-        let inarg = FuseForgetIn { nlookup };
-        self.enqueue_noreply(FUSE_FORGET, nodeid, fuse_pack_struct(&inarg))
-    }
-
-    fn queue_interrupt(&self, unique: u64) -> Result<(), SystemError> {
-        if unique == 0 {
-            return Ok(());
-        }
-        let can_send = {
-            let g = self.inner.lock();
-            g.connected
-                && g.mounted
-                && g.initialized
-                && !g.no_interrupt
-                && g.processing.contains_key(&unique)
-        };
-        if !can_send {
-            return Ok(());
-        }
-        let inarg = FuseInterruptIn { unique };
-        let req = self.build_request(
-            unique | Self::FUSE_INT_REQ_BIT,
-            FUSE_INTERRUPT,
-            0,
-            fuse_pack_struct(&inarg),
-            FuseRequestCred::nocreds(),
-        );
-        self.push_request(req, None, unique | Self::FUSE_INT_REQ_BIT)
     }
 
     /// Acquire a new `/dev/fuse` file handle reference to this connection.
@@ -737,47 +749,6 @@ impl FuseConn {
         if self.dev_count.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.abort();
         }
-    }
-
-    pub fn poll_mask(&self, have_pending: bool) -> EPollEventType {
-        let mut events = EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM;
-        let g = self.inner.lock();
-        if !g.connected {
-            return EPollEventType::EPOLLERR;
-        }
-        if have_pending {
-            events |= EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM;
-        }
-        events
-    }
-
-    pub fn poll(&self) -> EPollEventType {
-        let g = self.inner.lock();
-        let have_pending = !g.hiprio_pending.is_empty() || !g.pending.is_empty();
-        drop(g);
-        self.poll_mask(have_pending)
-    }
-
-    pub fn add_epitem(&self, epitem: Arc<EPollItem>) -> Result<(), SystemError> {
-        self.epitems.lock().push_back(epitem);
-        Ok(())
-    }
-
-    pub fn remove_epitem(&self, epitem: &Arc<EPollItem>) -> Result<(), SystemError> {
-        let mut guard = self.epitems.lock();
-        let len = guard.len();
-        guard.retain(|x| !Arc::ptr_eq(x, epitem));
-        if len != guard.len() {
-            return Ok(());
-        }
-        Err(SystemError::ENOENT)
-    }
-
-    fn calc_min_read_buffer(max_write: usize) -> usize {
-        core::cmp::max(
-            FUSE_MIN_READ_BUFFER,
-            core::mem::size_of::<FuseInHeader>() + core::mem::size_of::<FuseWriteIn>() + max_write,
-        )
     }
 
     fn max_write_cap_for_user_read_chunk() -> usize {
@@ -799,242 +770,6 @@ impl FuseConn {
         }
         g.max_pages_limit = core::cmp::min(max_pages_limit, Self::MAX_MAX_PAGES);
         Ok(())
-    }
-
-    fn min_read_buffer(&self) -> usize {
-        let g = self.inner.lock();
-        Self::calc_min_read_buffer(g.init.max_write as usize)
-    }
-
-    fn pop_pending_nonblock(&self) -> Result<Arc<FuseRequest>, SystemError> {
-        let mut g = self.inner.lock();
-        if !g.connected {
-            return Err(SystemError::ENOTCONN);
-        }
-        Self::pop_pending_locked(&mut g).ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)
-    }
-
-    fn pop_pending_blocking(&self) -> Result<Arc<FuseRequest>, SystemError> {
-        wait_with_recheck(&self.read_wait, || {
-            let mut g = self.inner.lock();
-            if !g.connected {
-                return Err(SystemError::ENOTCONN);
-            }
-            if let Some(req) = Self::pop_pending_locked(&mut g) {
-                return Ok(Some(req));
-            }
-            Ok(None)
-        })
-    }
-
-    fn pop_ordinary_pending_nonblock(&self) -> Result<Arc<FuseRequest>, SystemError> {
-        let mut g = self.inner.lock();
-        if !g.connected {
-            return Err(SystemError::ENOTCONN);
-        }
-        g.pending
-            .pop_front()
-            .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)
-    }
-
-    fn pop_ordinary_pending_blocking(&self) -> Result<Arc<FuseRequest>, SystemError> {
-        wait_with_recheck(&self.read_wait, || {
-            let mut g = self.inner.lock();
-            if !g.connected {
-                return Err(SystemError::ENOTCONN);
-            }
-            if let Some(req) = g.pending.pop_front() {
-                return Ok(Some(req));
-            }
-            Ok(None)
-        })
-    }
-
-    fn is_high_priority_opcode(opcode: u32) -> bool {
-        matches!(opcode, FUSE_FORGET | FUSE_INTERRUPT)
-    }
-
-    fn is_stale_interrupt_locked(req: &FuseRequest, g: &FuseConnInner) -> bool {
-        req.opcode == FUSE_INTERRUPT
-            && !g
-                .processing
-                .contains_key(&Self::interrupt_target_unique(req.unique))
-    }
-
-    fn pop_high_priority_pending_locked(g: &mut FuseConnInner) -> Option<Arc<FuseRequest>> {
-        loop {
-            let req = g.hiprio_pending.pop_front()?;
-            if Self::is_stale_interrupt_locked(&req, g) {
-                stats::on_fuse_requests_aborted(1);
-                continue;
-            }
-            return Some(req);
-        }
-    }
-
-    fn pop_pending_locked(g: &mut FuseConnInner) -> Option<Arc<FuseRequest>> {
-        Self::pop_high_priority_pending_locked(g).or_else(|| g.pending.pop_front())
-    }
-
-    fn complete_dequeued_request(
-        &self,
-        req: Arc<FuseRequest>,
-        out: &mut [u8],
-    ) -> Result<usize, SystemError> {
-        out[..req.bytes.len()].copy_from_slice(&req.bytes);
-        self.account_dequeued_request(&req);
-        Ok(req.bytes.len())
-    }
-
-    fn account_dequeued_request(&self, req: &FuseRequest) {
-        stats::on_fuse_request_dequeued(req.bytes.len());
-        trace::trace_fuse_request_dequeue(req.unique, req.opcode, req.bytes.len() as u64);
-        if req.opcode == FUSE_DESTROY {
-            self.abort();
-        }
-    }
-
-    fn dequeue_for_kernel_transport<F>(
-        &self,
-        max_message_size: usize,
-        pop_request: F,
-    ) -> Result<Arc<FuseRequest>, SystemError>
-    where
-        F: FnOnce() -> Result<Arc<FuseRequest>, SystemError>,
-    {
-        let req = pop_request()?;
-        if req.bytes.len() > max_message_size {
-            self.fail_oversized_read_request(&req);
-            log::warn!(
-                "fuse: kernel transport buffer smaller than queued request: got={} need={}",
-                max_message_size,
-                req.bytes.len()
-            );
-            // Return to the bridge loop after one malformed request so completion, reset and the
-            // other priority queue cannot be starved by a producer of oversized requests.
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-        }
-        self.account_dequeued_request(&req);
-        Ok(req)
-    }
-
-    pub(crate) fn dequeue_virtiofs_ordinary_request(
-        &self,
-        max_message_size: usize,
-    ) -> Result<Arc<FuseRequest>, SystemError> {
-        self.dequeue_for_kernel_transport(max_message_size, || self.pop_ordinary_pending_nonblock())
-    }
-
-    pub(crate) fn dequeue_virtiofs_high_priority_request(
-        &self,
-        max_message_size: usize,
-    ) -> Result<Arc<FuseRequest>, SystemError> {
-        self.dequeue_for_kernel_transport(max_message_size, || {
-            let mut g = self.inner.lock();
-            if !g.connected {
-                return Err(SystemError::ENOTCONN);
-            }
-            Self::pop_high_priority_pending_locked(&mut g).ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)
-        })
-    }
-
-    fn read_dequeued_request<F>(
-        &self,
-        nonblock: bool,
-        out: &mut [u8],
-        context: &str,
-        mut pop_request: F,
-    ) -> Result<usize, SystemError>
-    where
-        F: FnMut() -> Result<Arc<FuseRequest>, SystemError>,
-    {
-        let min_read = self.min_read_buffer();
-        if out.len() < min_read {
-            log::warn!(
-                "fuse: read buffer too small for {}: got={} min={} nonblock={}",
-                context,
-                out.len(),
-                min_read,
-                nonblock
-            );
-            return Err(SystemError::EINVAL);
-        }
-
-        let req = loop {
-            let req = pop_request()?;
-
-            if out.len() >= req.bytes.len() {
-                break req;
-            }
-
-            self.fail_oversized_read_request(&req);
-            log::warn!(
-                "fuse: read buffer smaller than queued {} request: got={} need={}",
-                context,
-                out.len(),
-                req.bytes.len()
-            );
-        };
-
-        self.complete_dequeued_request(req, out)
-    }
-
-    pub fn read_request(&self, nonblock: bool, out: &mut [u8]) -> Result<usize, SystemError> {
-        // Linux: require a sane minimum read buffer for all reads.
-        self.read_dequeued_request(nonblock, out, "request", || {
-            // Linux: if O_NONBLOCK and no pending request, return EAGAIN.
-            if nonblock {
-                self.pop_pending_nonblock()
-            } else {
-                self.pop_pending_blocking()
-            }
-        })
-    }
-
-    pub fn read_ordinary_request(
-        &self,
-        nonblock: bool,
-        out: &mut [u8],
-    ) -> Result<usize, SystemError> {
-        self.read_dequeued_request(nonblock, out, "ordinary request", || {
-            if nonblock {
-                self.pop_ordinary_pending_nonblock()
-            } else {
-                self.pop_ordinary_pending_blocking()
-            }
-        })
-    }
-
-    pub fn read_high_priority_request(&self, out: &mut [u8]) -> Result<usize, SystemError> {
-        self.read_dequeued_request(true, out, "high-priority request", || {
-            let mut g = self.inner.lock();
-            if !g.connected {
-                return Err(SystemError::ENOTCONN);
-            }
-            Self::pop_high_priority_pending_locked(&mut g).ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)
-        })
-    }
-
-    fn fail_oversized_read_request(&self, req: &FuseRequest) {
-        stats::on_fuse_read_buffer_too_small();
-        let err = if req.opcode == FUSE_SETXATTR {
-            SystemError::E2BIG
-        } else {
-            SystemError::EIO
-        };
-        let pending = {
-            let mut g = self.inner.lock();
-            g.processing.remove(&req.unique)
-        };
-
-        if let Some(pending) = pending {
-            let error = -err.to_posix_errno();
-            stats::on_fuse_reply_complete(req.opcode, error, 0);
-            trace::trace_fuse_reply_complete(req.unique, req.opcode, error, 0);
-            pending.complete(Err(err));
-        } else {
-            stats::on_fuse_requests_aborted(1);
-        }
     }
 
     fn kernel_init_flags() -> u64 {
@@ -1067,450 +802,6 @@ impl FuseConn {
 
     pub fn supports_submounts(&self) -> bool {
         self.has_init_flag(FUSE_SUBMOUNTS)
-    }
-
-    pub fn enqueue_init(&self) -> Result<(), SystemError> {
-        let flags = self.inner.lock().init_flags;
-        let init_in = FuseInitIn {
-            major: FUSE_KERNEL_VERSION,
-            minor: FUSE_KERNEL_MINOR_VERSION,
-            max_readahead: Self::DEFAULT_MAX_READAHEAD as u32,
-            flags: flags as u32,
-            flags2: (flags >> 32) as u32,
-            unused: [0; 11],
-        };
-        self.enqueue_request(FUSE_INIT, 0, fuse_pack_struct(&init_in))
-            .map(|_| ())
-    }
-
-    pub fn request(
-        &self,
-        opcode: u32,
-        nodeid: u64,
-        payload: &[u8],
-    ) -> Result<Vec<u8>, SystemError> {
-        if opcode != FUSE_INIT {
-            let cred = ProcessManager::current_pcb().cred();
-            if !self.allow_current_process(&cred) {
-                return Err(SystemError::EACCES);
-            }
-            self.wait_initialized()?;
-        }
-        let pending = self.enqueue_request(opcode, nodeid, payload)?;
-        self.wait_request_complete(opcode, pending)
-    }
-
-    pub fn request_nocreds(
-        &self,
-        opcode: u32,
-        nodeid: u64,
-        payload: &[u8],
-    ) -> Result<Vec<u8>, SystemError> {
-        if opcode != FUSE_INIT {
-            self.wait_initialized()?;
-        }
-        let pending =
-            self.enqueue_request_with_cred(opcode, nodeid, payload, FuseRequestCred::nocreds())?;
-        self.wait_request_complete(opcode, pending)
-    }
-
-    pub(crate) fn request_with_cred(
-        &self,
-        opcode: u32,
-        nodeid: u64,
-        payload: &[u8],
-        req_cred: FuseRequestCred,
-    ) -> Result<Vec<u8>, SystemError> {
-        if opcode != FUSE_INIT {
-            self.wait_initialized()?;
-        }
-        let pending = self.enqueue_request_with_cred(opcode, nodeid, payload, req_cred)?;
-        self.wait_request_complete(opcode, pending)
-    }
-
-    pub fn request_nocreds_background(
-        self: &Arc<Self>,
-        opcode: u32,
-        nodeid: u64,
-        payload: &[u8],
-    ) -> Result<(), SystemError> {
-        if opcode != FUSE_INIT {
-            self.wait_initialized()?;
-        }
-        let pending =
-            self.enqueue_request_with_cred(opcode, nodeid, payload, FuseRequestCred::nocreds())?;
-        let conn = self.clone();
-        schedule_work(Work::new(move || {
-            if let Err(err) = conn.wait_request_complete(opcode, pending.clone()) {
-                if matches!(err, SystemError::ENOTCONN | SystemError::ENOENT) {
-                    log::debug!(
-                        "fuse: background request aborted opcode={} nodeid={} err={:?}",
-                        opcode,
-                        nodeid,
-                        err
-                    );
-                } else {
-                    log::warn!(
-                        "fuse: background request failed opcode={} nodeid={} err={:?}",
-                        opcode,
-                        nodeid,
-                        err
-                    );
-                }
-            }
-        }));
-        Ok(())
-    }
-
-    fn wait_request_complete(
-        &self,
-        opcode: u32,
-        pending: Arc<FusePendingState>,
-    ) -> Result<Vec<u8>, SystemError> {
-        match pending.wait_complete() {
-            Err(SystemError::EINTR) | Err(SystemError::ERESTARTSYS) => {
-                if opcode != FUSE_INTERRUPT {
-                    let _ = self.queue_interrupt(pending.unique());
-                }
-                Err(SystemError::EINTR)
-            }
-            x => x,
-        }
-    }
-
-    fn enqueue_noreply(&self, opcode: u32, nodeid: u64, payload: &[u8]) -> Result<(), SystemError> {
-        let unique = self.alloc_unique();
-        let req = self.build_request(
-            unique,
-            opcode,
-            nodeid,
-            payload,
-            FuseRequestCred {
-                uid: 0,
-                gid: 0,
-                pid: 0,
-            },
-        );
-        self.push_request(req, None, unique)?;
-        Ok(())
-    }
-
-    fn enqueue_request(
-        &self,
-        opcode: u32,
-        nodeid: u64,
-        payload: &[u8],
-    ) -> Result<Arc<FusePendingState>, SystemError> {
-        let pcb = ProcessManager::current_pcb();
-        let cred = pcb.cred();
-        if !self.allow_current_process(&cred) {
-            return Err(SystemError::EACCES);
-        }
-        self.enqueue_request_with_cred(opcode, nodeid, payload, FuseRequestCred::from_current())
-    }
-
-    fn enqueue_request_with_cred(
-        &self,
-        opcode: u32,
-        nodeid: u64,
-        payload: &[u8],
-        req_cred: FuseRequestCred,
-    ) -> Result<Arc<FusePendingState>, SystemError> {
-        let unique = self.alloc_unique();
-        let pending_state = Arc::new(FusePendingState::new(unique, opcode));
-
-        let req = self.build_request(unique, opcode, nodeid, payload, req_cred);
-        self.push_request(req, Some(pending_state.clone()), unique)?;
-        Ok(pending_state)
-    }
-
-    fn build_request(
-        &self,
-        unique: u64,
-        opcode: u32,
-        nodeid: u64,
-        payload: &[u8],
-        req_cred: FuseRequestCred,
-    ) -> Arc<FuseRequest> {
-        let hdr = FuseInHeader {
-            len: (core::mem::size_of::<FuseInHeader>() + payload.len()) as u32,
-            opcode,
-            unique,
-            nodeid,
-            uid: req_cred.uid,
-            gid: req_cred.gid,
-            pid: req_cred.pid,
-            total_extlen: 0,
-            padding: 0,
-        };
-
-        let mut bytes = Vec::with_capacity(hdr.len as usize);
-        bytes.extend_from_slice(fuse_pack_struct(&hdr));
-        bytes.extend_from_slice(payload);
-        Arc::new(FuseRequest {
-            bytes,
-            unique,
-            opcode,
-        })
-    }
-
-    fn push_request(
-        &self,
-        req: Arc<FuseRequest>,
-        pending_state: Option<Arc<FusePendingState>>,
-        unique: u64,
-    ) -> Result<(), SystemError> {
-        let req_len = req.bytes.len();
-        let opcode = req.opcode;
-        let no_reply = pending_state.is_none();
-        {
-            let mut g = self.inner.lock();
-            if !g.connected {
-                return Err(SystemError::ENOTCONN);
-            }
-            if g.separate_hiprio_pending && Self::is_high_priority_opcode(opcode) {
-                g.hiprio_pending.push_back(req);
-            } else {
-                g.pending.push_back(req);
-            }
-            if let Some(pending) = pending_state {
-                g.processing.insert(unique, pending);
-            }
-        }
-
-        stats::on_fuse_request_queued(req_len, no_reply);
-        trace::trace_fuse_request_queue(unique, opcode, req_len as u64, no_reply as u8);
-        self.read_wait.wakeup(None);
-        self.wake_bridge(stats::VirtioFsBridgeWakeSource::Request);
-        let _ = EventPoll::wakeup_epoll(
-            &self.epitems,
-            EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
-        );
-        Ok(())
-    }
-
-    pub fn write_reply(&self, data: &[u8]) -> Result<usize, SystemError> {
-        if data.len() < core::mem::size_of::<FuseOutHeader>() {
-            return Err(SystemError::EINVAL);
-        }
-
-        let out_hdr: FuseOutHeader = fuse_read_struct(data)?;
-        if out_hdr.len as usize != data.len() {
-            return Err(SystemError::EINVAL);
-        }
-
-        if out_hdr.unique == 0 {
-            let payload = &data[core::mem::size_of::<FuseOutHeader>()..];
-            self.handle_notify(out_hdr.error, payload)?;
-            return Ok(data.len());
-        }
-
-        if (out_hdr.unique & Self::FUSE_INT_REQ_BIT) != 0 {
-            return self.write_interrupt_reply(&out_hdr, data.len());
-        }
-
-        if out_hdr.error <= -512 || out_hdr.error > 0 {
-            return Err(SystemError::EINVAL);
-        }
-        if out_hdr.error != 0 && data.len() != core::mem::size_of::<FuseOutHeader>() {
-            return Err(SystemError::EINVAL);
-        }
-
-        let pending = {
-            let mut g = self.inner.lock();
-            if !g.connected {
-                return Err(SystemError::ENOENT);
-            }
-            g.processing
-                .remove(&out_hdr.unique)
-                .ok_or(SystemError::ENOENT)?
-        };
-
-        let payload = &data[core::mem::size_of::<FuseOutHeader>()..];
-        let error = out_hdr.error;
-
-        if error != 0 {
-            // Negative errno from userspace.
-            let errno = -error;
-            let e = SystemError::from_i32(errno).unwrap_or(SystemError::EIO);
-            if Self::is_expected_reply_error(pending.opcode, errno) {
-                log::trace!(
-                    "fuse: reply error opcode={} unique={} errno={}",
-                    pending.opcode,
-                    out_hdr.unique,
-                    errno
-                );
-            } else {
-                log::warn!(
-                    "fuse: reply error opcode={} unique={} errno={}",
-                    pending.opcode,
-                    out_hdr.unique,
-                    errno
-                );
-            }
-            pending.complete(Err(e));
-            stats::on_fuse_reply_complete(pending.opcode, error, payload.len());
-            trace::trace_fuse_reply_complete(
-                out_hdr.unique,
-                pending.opcode,
-                error,
-                payload.len() as u64,
-            );
-            if pending.opcode == FUSE_INIT {
-                self.abort();
-            }
-            return Ok(data.len());
-        }
-
-        if pending.opcode == FUSE_INIT {
-            let init_out: FuseInitOut = match fuse_read_struct(payload) {
-                Ok(v) => v,
-                Err(e) => {
-                    let error = -e.to_posix_errno();
-                    stats::on_fuse_reply_complete(pending.opcode, error, payload.len());
-                    trace::trace_fuse_reply_complete(
-                        out_hdr.unique,
-                        pending.opcode,
-                        error,
-                        payload.len() as u64,
-                    );
-                    pending.complete(Err(e));
-                    self.abort();
-                    return Ok(data.len());
-                }
-            };
-
-            if init_out.major != FUSE_KERNEL_VERSION {
-                let error = -SystemError::EINVAL.to_posix_errno();
-                stats::on_fuse_reply_complete(pending.opcode, error, payload.len());
-                trace::trace_fuse_reply_complete(
-                    out_hdr.unique,
-                    pending.opcode,
-                    error,
-                    payload.len() as u64,
-                );
-                pending.complete(Err(SystemError::EINVAL));
-                self.abort();
-                return Ok(data.len());
-            }
-
-            let mut negotiated_flags = init_out.flags as u64;
-            if (negotiated_flags & FUSE_INIT_EXT) != 0 {
-                negotiated_flags |= (init_out.flags2 as u64) << 32;
-            }
-            let negotiated_minor = core::cmp::min(init_out.minor, FUSE_KERNEL_MINOR_VERSION);
-            let negotiated_max_pages_raw = if (negotiated_flags & FUSE_MAX_PAGES) != 0 {
-                core::cmp::max(init_out.max_pages, 1)
-            } else {
-                Self::DEFAULT_MAX_PAGES as u16
-            };
-            let negotiated_max_write =
-                core::cmp::max(Self::MIN_MAX_WRITE, init_out.max_write as usize);
-            let (max_write_cap, max_pages_limit) = {
-                let g = self.inner.lock();
-                (
-                    core::cmp::max(Self::MIN_MAX_WRITE, g.max_write_cap),
-                    g.max_pages_limit,
-                )
-            };
-            let capped_max_write = core::cmp::min(negotiated_max_write, max_write_cap);
-            if capped_max_write < negotiated_max_write {
-                log::trace!(
-                    "fuse: cap negotiated max_write from {} to {} due backend read buffer limit",
-                    negotiated_max_write,
-                    capped_max_write
-                );
-            }
-            let negotiated_max_pages =
-                core::cmp::min(negotiated_max_pages_raw, max_pages_limit as u16);
-
-            {
-                let mut g = self.inner.lock();
-                if g.connected {
-                    // Align with Linux: only enable feature bits that are in the intersection of
-                    // daemon-supported and locally-requested flags. virtiofsd often sets
-                    // DO_READDIRPLUS etc. in the INIT reply; if adopted directly, it would
-                    // trigger READDIRPLUS + cache_child_from_entry, causing stale inode mappings.
-                    let enabled_flags = negotiated_flags & g.init_flags;
-                    g.initialized = true;
-                    g.init = FuseInitNegotiated {
-                        minor: negotiated_minor,
-                        max_readahead: init_out.max_readahead,
-                        max_write: capped_max_write as u32,
-                        time_gran: init_out.time_gran,
-                        max_pages: negotiated_max_pages,
-                        flags: enabled_flags,
-                    };
-                }
-            }
-            self.init_wait.wakeup(None);
-        }
-
-        stats::on_fuse_reply_complete(pending.opcode, 0, payload.len());
-        trace::trace_fuse_reply_complete(out_hdr.unique, pending.opcode, 0, payload.len() as u64);
-        pending.complete(Ok(payload.to_vec()));
-        Ok(data.len())
-    }
-
-    fn write_interrupt_reply(
-        &self,
-        out_hdr: &FuseOutHeader,
-        data_len: usize,
-    ) -> Result<usize, SystemError> {
-        if data_len != core::mem::size_of::<FuseOutHeader>() {
-            return Err(SystemError::EINVAL);
-        }
-        if out_hdr.error <= -512 || out_hdr.error > 0 {
-            return Err(SystemError::EINVAL);
-        }
-
-        let target_unique = out_hdr.unique & !Self::FUSE_INT_REQ_BIT;
-        {
-            let mut g = self.inner.lock();
-            if !g.connected || !g.processing.contains_key(&target_unique) {
-                return Err(SystemError::ENOENT);
-            }
-            if out_hdr.error == -SystemError::ENOSYS.to_posix_errno() {
-                g.no_interrupt = true;
-            }
-        }
-
-        if out_hdr.error == -SystemError::EAGAIN_OR_EWOULDBLOCK.to_posix_errno() {
-            self.queue_interrupt(target_unique)?;
-        }
-
-        Ok(data_len)
-    }
-
-    fn handle_notify(&self, code: i32, payload: &[u8]) -> Result<(), SystemError> {
-        if code <= 0 {
-            return Err(SystemError::EINVAL);
-        }
-        match code {
-            FUSE_NOTIFY_POLL
-            | FUSE_NOTIFY_INVAL_INODE
-            | FUSE_NOTIFY_INVAL_ENTRY
-            | FUSE_NOTIFY_STORE
-            | FUSE_NOTIFY_RETRIEVE
-            | FUSE_NOTIFY_DELETE => {
-                log::debug!("fuse: notify code={} len={}", code, payload.len());
-                Ok(())
-            }
-            _ => Err(SystemError::EINVAL),
-        }
-    }
-
-    fn is_expected_reply_error(opcode: u32, errno: i32) -> bool {
-        matches!(
-            (opcode, SystemError::from_i32(errno)),
-            (FUSE_LOOKUP, Some(SystemError::ENOENT))
-                | (FUSE_FLUSH, Some(SystemError::ENOSYS))
-                | (FUSE_GETXATTR, Some(SystemError::ENOSYS))
-                | (FUSE_SETXATTR, Some(SystemError::ENOSYS))
-                | (FUSE_LISTXATTR, Some(SystemError::ENOSYS))
-                | (FUSE_REMOVEXATTR, Some(SystemError::ENOSYS))
-                | (FUSE_INTERRUPT, Some(SystemError::EAGAIN_OR_EWOULDBLOCK))
-        )
     }
 
     #[allow(dead_code)]
@@ -1554,136 +845,27 @@ impl FuseConn {
 
 #[cfg(test)]
 mod tests {
-    use alloc::{sync::Arc, vec::Vec};
+    use alloc::vec;
+    use core::{mem::size_of, sync::atomic::Ordering};
 
     use system_error::SystemError;
 
-    use super::{
-        fuse_read_struct, FuseConn, FuseInHeader, FusePendingState, FuseRequestCred, FUSE_FORGET,
-        FUSE_LOOKUP,
+    use super::super::protocol::{
+        FuseEntryOut, FuseOpenOut, FuseOutHeader, FuseStatfsOut, FUSE_CREATE, FUSE_DESTROY,
+        FUSE_GETATTR, FUSE_LOOKUP, FUSE_STATFS,
     };
+    use super::{daemon, request, stats, FuseConn, FuseReplyCapacitySource};
 
-    fn queue_test_request(conn: &Arc<FuseConn>, opcode: u32, pending_reply: bool) -> u64 {
-        let unique = conn.alloc_unique();
-        let req = conn.build_request(unique, opcode, 1, &[], FuseRequestCred::nocreds());
-        let pending = pending_reply.then(|| Arc::new(FusePendingState::new(unique, opcode)));
-        conn.push_request(req, pending, unique).unwrap();
-        unique
+    fn set_minor(conn: &FuseConn, minor: u32) {
+        conn.inner.lock().init.minor = minor;
+        conn.reply_layout_minor.store(minor, Ordering::Release);
     }
 
-    fn read_opcode(buf: &[u8]) -> u32 {
-        let hdr: FuseInHeader = fuse_read_struct(buf).unwrap();
-        hdr.opcode
-    }
-
-    #[test]
-    fn ordinary_read_does_not_consume_high_priority_queue() {
-        let conn = FuseConn::new_for_virtiofs(8192);
-        queue_test_request(&conn, FUSE_FORGET, false);
-        queue_test_request(&conn, FUSE_LOOKUP, true);
-
-        assert!(conn.has_pending_high_priority_requests());
-        assert!(conn.has_pending_ordinary_requests());
-
-        let mut buf = Vec::new();
-        buf.resize(conn.min_read_buffer(), 0);
-        let len = conn.read_ordinary_request(true, &mut buf).unwrap();
-        assert_eq!(read_opcode(&buf[..len]), FUSE_LOOKUP);
-        assert!(conn.has_pending_high_priority_requests());
-        assert!(!conn.has_pending_ordinary_requests());
-
-        let len = conn.read_high_priority_request(&mut buf).unwrap();
-        assert_eq!(read_opcode(&buf[..len]), FUSE_FORGET);
-        assert!(!conn.has_pending_high_priority_requests());
-    }
-
-    #[test]
-    fn ordinary_read_returns_eagain_when_only_high_priority_is_pending() {
-        let conn = FuseConn::new_for_virtiofs(8192);
-        queue_test_request(&conn, FUSE_FORGET, false);
-
-        let mut buf = Vec::new();
-        buf.resize(conn.min_read_buffer(), 0);
-        assert!(matches!(
-            conn.read_ordinary_request(true, &mut buf),
-            Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
-        ));
-        assert!(conn.has_pending_high_priority_requests());
-    }
-
-    #[test]
-    fn virtiofs_direct_dequeue_transfers_existing_request() {
-        let conn = FuseConn::new_for_virtiofs(8192);
-        let unique = conn.alloc_unique();
-        let req = conn.build_request(
-            unique,
-            FUSE_LOOKUP,
-            1,
-            b"name\0",
-            FuseRequestCred::nocreds(),
-        );
-        let expected_ptr = req.bytes().as_ptr();
-        conn.push_request(
-            req,
-            Some(Arc::new(FusePendingState::new(unique, FUSE_LOOKUP))),
-            unique,
-        )
-        .unwrap();
-
-        let dequeued = conn.dequeue_virtiofs_ordinary_request(8192).unwrap();
-        assert_eq!(dequeued.opcode(), FUSE_LOOKUP);
-        assert_eq!(dequeued.unique(), unique);
-        assert_eq!(dequeued.bytes().as_ptr(), expected_ptr);
-    }
-
-    #[test]
-    fn virtiofs_direct_dequeue_keeps_priority_queues_separate() {
-        let conn = FuseConn::new_for_virtiofs(8192);
-        queue_test_request(&conn, FUSE_FORGET, false);
-        queue_test_request(&conn, FUSE_LOOKUP, true);
-
-        let ordinary = conn.dequeue_virtiofs_ordinary_request(8192).unwrap();
-        assert_eq!(ordinary.opcode(), FUSE_LOOKUP);
-        let hiprio = conn.dequeue_virtiofs_high_priority_request(8192).unwrap();
-        assert_eq!(hiprio.opcode(), FUSE_FORGET);
-    }
-
-    #[test]
-    fn virtiofs_direct_dequeue_rejects_oversized_request() {
-        let conn = FuseConn::new_for_virtiofs(8192);
-        let unique = conn.alloc_unique();
-        let req = conn.build_request(
-            unique,
-            FUSE_FORGET,
-            1,
-            &[0u8; 128],
-            FuseRequestCred::nocreds(),
-        );
-        conn.push_request(req, None, unique).unwrap();
-        queue_test_request(&conn, FUSE_FORGET, false);
-
-        assert!(matches!(
-            conn.dequeue_virtiofs_high_priority_request(64),
-            Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
-        ));
-        assert!(conn.has_pending_high_priority_requests());
-        let next = conn.dequeue_virtiofs_high_priority_request(8192).unwrap();
-        assert_eq!(next.opcode(), FUSE_FORGET);
-        assert!(!conn.has_pending_high_priority_requests());
-    }
-
-    #[test]
-    fn normal_fuse_read_request_keeps_high_priority_visible() {
-        let conn = FuseConn::new();
-        queue_test_request(&conn, FUSE_FORGET, false);
-
-        assert!(!conn.has_pending_high_priority_requests());
-        assert!(conn.has_pending_ordinary_requests());
-
-        let mut buf = Vec::new();
-        buf.resize(conn.min_read_buffer(), 0);
-        let len = conn.read_request(true, &mut buf).unwrap();
-        assert_eq!(read_opcode(&buf[..len]), FUSE_FORGET);
+    fn capacity(conn: &FuseConn, opcode: u32, payload: &[u8]) -> (usize, FuseReplyCapacitySource) {
+        let capacity = request::reply_capacity_for_test(conn, opcode, payload)
+            .unwrap()
+            .unwrap();
+        (capacity.bytes, capacity.source)
     }
 
     #[test]
@@ -1707,5 +889,82 @@ mod tests {
         conn.clear_bridge_wake();
         conn.wake_bridge(stats::VirtioFsBridgeWakeSource::Request);
         assert_eq!(conn.bridge_wake_events(), 0);
+    }
+
+    #[test]
+    fn negotiated_minor_tightens_and_normalizes_compat_replies() {
+        let conn = FuseConn::new_for_virtiofs(256 * 1024, 256 * 1024);
+        let header = size_of::<FuseOutHeader>();
+        set_minor(&conn, 3);
+        let statfs_capacity = request::reply_capacity_for_test(&conn, FUSE_STATFS, &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            statfs_capacity.bytes,
+            header + FuseConn::FUSE_COMPAT_STATFS_SIZE
+        );
+        assert_eq!(statfs_capacity.retained_bytes, size_of::<FuseStatfsOut>());
+        assert_eq!(
+            capacity(&conn, FUSE_LOOKUP, &[]).0,
+            header + FuseConn::FUSE_COMPAT_ENTRY_OUT_SIZE
+        );
+        assert_eq!(
+            capacity(&conn, FUSE_GETATTR, &[]).0,
+            header + FuseConn::FUSE_COMPAT_ATTR_OUT_SIZE
+        );
+        assert_eq!(
+            capacity(&conn, FUSE_CREATE, &[]).0,
+            header + FuseConn::FUSE_COMPAT_ENTRY_OUT_SIZE + size_of::<FuseOpenOut>()
+        );
+
+        let compat_entry = vec![0x5a; FuseConn::FUSE_COMPAT_ENTRY_OUT_SIZE];
+        let normalized =
+            daemon::normalize_compat_reply_for_test(3, FUSE_LOOKUP, &compat_entry).unwrap();
+        assert_eq!(normalized.len(), size_of::<FuseEntryOut>());
+        assert_eq!(
+            &normalized[..FuseConn::FUSE_COMPAT_ENTRY_OUT_SIZE],
+            &compat_entry
+        );
+        assert!(normalized[FuseConn::FUSE_COMPAT_ENTRY_OUT_SIZE..]
+            .iter()
+            .all(|byte| *byte == 0));
+
+        let compat_create_len = FuseConn::FUSE_COMPAT_ENTRY_OUT_SIZE + size_of::<FuseOpenOut>();
+        let compat_create = vec![0xa5; compat_create_len];
+        let normalized =
+            daemon::normalize_compat_reply_for_test(3, FUSE_CREATE, &compat_create).unwrap();
+        assert_eq!(
+            &normalized[size_of::<FuseEntryOut>()..],
+            &compat_create[FuseConn::FUSE_COMPAT_ENTRY_OUT_SIZE..]
+        );
+    }
+
+    #[test]
+    fn teardown_gate_is_idempotent_and_rejects_late_business_requests() {
+        let conn = FuseConn::new_for_virtiofs(8192, 8192);
+        {
+            let mut g = conn.inner.lock();
+            g.initialized = true;
+            g.mounted = true;
+        }
+
+        conn.on_umount();
+        conn.on_umount();
+        {
+            let g = conn.inner.lock();
+            assert!(g.teardown_started);
+            assert_eq!(
+                g.pending
+                    .iter()
+                    .filter(|req| req.opcode == FUSE_DESTROY)
+                    .count(),
+                1
+            );
+        }
+
+        assert_eq!(
+            conn.request_nocreds(FUSE_LOOKUP, 1, b"late\0"),
+            Err(SystemError::ENOTCONN)
+        );
     }
 }

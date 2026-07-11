@@ -921,11 +921,13 @@ impl TtyOperation for Unix98PtyDriverInner {
         priv_data: TtyDriverPrivateData,
     ) -> Result<Arc<TtyCore>, SystemError> {
         if let TtyDriverPrivateData::Pty(false) = priv_data {
+            // Unix98 slave ttys are created only by ptmx. A missing peer must fail like Linux
+            // pts_unix98_lookup() instead of letting the generic path construct a new tty.
             return pts_driver()
                 .ttys()
                 .get(&index)
                 .cloned()
-                .ok_or(SystemError::ENODEV);
+                .ok_or(SystemError::EIO);
         }
 
         return Err(SystemError::ENOSYS);

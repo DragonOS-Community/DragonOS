@@ -139,6 +139,29 @@ bitflags! {
     }
 }
 
+/// Merge only fields selected by `mask` into an existing metadata snapshot.
+/// Intent-only bits do not map to stored fields.
+pub fn merge_metadata_masked(target: &mut Metadata, requested: &Metadata, mask: SetMetadataMask) {
+    if mask.contains(SetMetadataMask::MODE) {
+        target.mode = requested.mode;
+    }
+    if mask.contains(SetMetadataMask::UID) {
+        target.uid = requested.uid;
+    }
+    if mask.contains(SetMetadataMask::GID) {
+        target.gid = requested.gid;
+    }
+    if mask.contains(SetMetadataMask::ATIME) {
+        target.atime = requested.atime;
+    }
+    if mask.contains(SetMetadataMask::MTIME) {
+        target.mtime = requested.mtime;
+    }
+    if mask.contains(SetMetadataMask::CTIME) {
+        target.ctime = requested.ctime;
+    }
+}
+
 impl From<FileType> for InodeMode {
     fn from(val: FileType) -> Self {
         match val {
@@ -210,6 +233,26 @@ bitflags! {
         const S_VERITY = (1 << 16);
         /// 内核正在使用的文件（如cachefiles）
         const S_KERNEL_FILE = (1 << 17);
+    }
+}
+
+bitflags! {
+    /// 指定 `set_metadata_masked()` 实际要更新的元数据字段。
+    ///
+    /// 该掩码对应 Linux `iattr::ia_valid` 中 DragonOS 当前可表达的
+    /// setattr 字段，避免将调用者读取的完整元数据快照误当成完整更新。
+    pub struct SetMetadataMask: u32 {
+        const MODE = 1 << 0;
+        const UID = 1 << 1;
+        const GID = 1 << 2;
+        const ATIME = 1 << 3;
+        const MTIME = 1 << 4;
+        /// 仅供 VFS/backing 自动维护；用户态 setattr 不能提供任意 ctime。
+        const CTIME = 1 << 5;
+        /// 时间设置来自“当前时间”请求，可由当前写权限授权。
+        const TIMES_BY_WRITE = 1 << 6;
+        /// 已授权的数据写/size change 引发的 metadata 副作用。
+        const WRITE_SIDE_EFFECT = 1 << 7;
     }
 }
 
@@ -583,6 +626,21 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
+    /// 仅更新 `mask` 指定的元数据字段。
+    ///
+    /// 旧文件系统默认回退到完整 metadata 更新，以保持现有实现兼容；需要在
+    /// copy-up 等并发边界精确保留未请求字段的堆叠文件系统应覆盖此方法。
+    fn set_metadata_masked(
+        &self,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), SystemError> {
+        if mask.is_empty() {
+            return Ok(());
+        }
+        self.set_metadata(metadata)
+    }
+
     /// @brief 重新设置文件的大小
     ///
     /// 如果文件大小增加，则文件内容不变，但是文件的空洞部分会被填充为0
@@ -615,6 +673,41 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ) -> Result<(), SystemError> {
         drop(data);
         self.resize_with_lock_owner(len, lock_owner)
+    }
+
+    /// Atomically apply a size change and its VFS-computed metadata side
+    /// effects when the filesystem can represent them in one operation.
+    ///
+    /// Local filesystems that keep size and inode metadata separately can use
+    /// the default two-step implementation. Protocol and stacking
+    /// filesystems should override this method to preserve their transaction
+    /// and request-context semantics.
+    fn resize_with_metadata(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), SystemError> {
+        self.resize_with_lock_owner(len, lock_owner)?;
+        let mut current = self.metadata()?;
+        merge_metadata_masked(&mut current, metadata, mask);
+        self.set_metadata_masked(&current, mask)
+    }
+
+    /// File-context variant of `resize_with_metadata()`.
+    fn resize_file_with_metadata(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), SystemError> {
+        self.resize_file(len, lock_owner, data)?;
+        let mut current = self.metadata()?;
+        merge_metadata_masked(&mut current, metadata, mask);
+        self.set_metadata_masked(&current, mask)
     }
 
     /// @brief 在当前目录下创建一个新的inode

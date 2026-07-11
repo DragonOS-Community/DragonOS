@@ -1,13 +1,17 @@
+use crate::filesystem::vfs::mount::MountFS;
+use crate::filesystem::vfs::permission::check_inode_permission;
 use crate::filesystem::vfs::permission::PermissionMask;
 use crate::filesystem::vfs::syscall::AtFlags;
 use crate::filesystem::vfs::utils::rsplit_path;
 use crate::filesystem::vfs::utils::user_path_at;
 use crate::filesystem::vfs::FileType;
 use crate::filesystem::vfs::IndexNode;
+use crate::filesystem::vfs::InodeFlags;
 use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::vfs::Metadata;
 use crate::filesystem::vfs::SystemError;
 use crate::filesystem::vfs::VFS_MAX_FOLLOW_SYMLINK_TIMES;
+use crate::libs::casting::DowncastArc;
 use crate::process::cred::CAPFlags;
 use crate::process::ProcessManager;
 use alloc::sync::Arc;
@@ -75,25 +79,58 @@ pub fn do_linkat(
         )?
     };
 
-    // Return EPERM when old_inode is a directory
-    if old_inode.metadata()?.file_type == FileType::Dir {
-        return Err(SystemError::EPERM);
-    }
-    // Hard link security check
-    may_linkat(&old_inode)?;
-
     // 得到新创建节点的父节点
     let (new_begin_inode, new_remain_path) = user_path_at(&pcb, newfd, new)?;
     let (new_name, new_parent_path) = rsplit_path(&new_remain_path);
     let new_parent = new_begin_inode
         .lookup_follow_symlink(new_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
+    let new_parent_metadata = new_parent.metadata()?;
+    if new_parent_metadata.file_type != FileType::Dir {
+        return Err(SystemError::ENOTDIR);
+    }
+
+    // Match Linux may_create() error ordering: search permission is needed to
+    // inspect the target, an existing target wins over a missing write bit,
+    // and write permission is checked only for a negative target.
+    check_inode_permission(&new_parent, &new_parent_metadata, PermissionMask::MAY_EXEC)?;
+    match new_parent.find(new_name) {
+        Ok(_) => return Err(SystemError::EEXIST),
+        Err(SystemError::ENOENT) => {}
+        Err(err) => return Err(err),
+    }
+
+    // Linux filename_create() lets an existing target win over a read-only
+    // mount, but returns EROFS for a negative target before later EXDEV and
+    // inode permission checks.
+    let new_parent_fs = new_parent.fs();
+    if let Some(mount_fs) = new_parent_fs.clone().downcast_arc::<MountFS>() {
+        if mount_fs.is_readonly() {
+            return Err(SystemError::EROFS);
+        }
+    }
+
     // 跨文件系统检查：类似 Linux 的 "if (dir->i_sb != inode->i_sb) return -EXDEV;"
     // 通过比较文件系统指针地址判断是否为同一文件系统实例
-    let new_parent_fs = new_parent.fs();
     let old_inode_fs = old_inode.fs();
     if !Arc::ptr_eq(&new_parent_fs, &old_inode_fs) {
         return Err(SystemError::EXDEV);
+    }
+
+    // Linux do_linkat() checks protected-hardlink policy after preparing the
+    // negative target and checking the target mount identity.
+    may_linkat(&old_inode)?;
+    check_inode_permission(&new_parent, &new_parent_metadata, PermissionMask::MAY_WRITE)?;
+
+    let old_metadata = old_inode.metadata()?;
+    if old_metadata
+        .flags
+        .intersects(InodeFlags::S_APPEND | InodeFlags::S_IMMUTABLE)
+    {
+        return Err(SystemError::EPERM);
+    }
+    if old_metadata.file_type == FileType::Dir {
+        return Err(SystemError::EPERM);
     }
 
     return new_parent.link(new_name, &old_inode).map(|_| 0);

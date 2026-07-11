@@ -4,6 +4,7 @@ demo/gtest_demo
 normal/capability
 normal/fdatasync
 normal/ext4_xattr
+normal/ext4_inode_identity
 normal/fallocate_semantics
 normal/syncfs_semantics
 normal/fcntl_lock

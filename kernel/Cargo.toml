@@ -103,6 +103,7 @@ cfg-if = { version = "1.0.0" }
 derive_builder = { version = "0.20.2", default-features = false, features = [
     "alloc",
 ] }
+device-output-buffer = { path = "crates/device-output-buffer" }
 
 inherit-methods-macro = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/inherit-methods-macro", rev = "98f7e3e" }
 

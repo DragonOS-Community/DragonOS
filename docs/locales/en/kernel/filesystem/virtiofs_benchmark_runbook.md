@@ -197,11 +197,28 @@ opcode_16_requests_total
 
 Before comparing runs, verify that `requests_total` increased for the opcode exercised by the
 workload. Evaluate request bridge copies and response allocation/reuse separately.
-`response_buffer_zero_bytes` records explicit writes from allocation initialization or clearing a
-reused buffer before submission, so fewer allocator calls must not be reported as fewer zero-fill
-bytes. Pool capacity bounds are enforced by implementation constants and unit tests. A retained
-state gauge is intentionally not opt-in because buffers that predate the first stats read could not
-be represented accurately.
+`response_buffer_zero_bytes` records the one-time initialization of new backing storage; reuse no
+longer writes zeroes. Pool capacity bounds are enforced by implementation constants and unit tests.
+A retained state gauge is intentionally not opt-in because buffers that predate the first stats
+read could not be represented accurately.
+
+Measure the zero-fill optimization in one manually mounted session so automatic unmount does not
+clear the response pool. The first identical run enables detailed stats and warms response sizes;
+the second run is the measurement:
+
+```sh
+mkdir -p /tmp/host
+mount -t virtiofs hostshare /tmp/host
+VIRTIOFS_STATS_PATH=/tmp/dbg/fuse/stats /bin/virtiofs_bench --mount /tmp/host \
+  --workload metadata --files 64
+VIRTIOFS_STATS_PATH=/tmp/dbg/fuse/stats /bin/virtiofs_bench --mount /tmp/host \
+  --workload metadata --files 64
+umount /tmp/host
+```
+
+The tool emits zero deltas explicitly for global and active-opcode alloc/reuse/zero byte fields.
+The measured phase should have `response_buffer_reuse_bytes > 0`,
+`response_buffer_alloc_bytes == 0`, and `response_buffer_zero_bytes == 0`.
 
 The `*_configured` fields are configuration snapshots, so their `stats_delta` is usually 0.
 Check their absolute values in `/tmp/dbg/fuse/stats` when verifying whether queue depth took effect.

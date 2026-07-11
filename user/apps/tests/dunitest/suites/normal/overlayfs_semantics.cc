@@ -3,6 +3,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/capability.h>
 #include <signal.h>
 #include <sched.h>
 #include <stdio.h>
@@ -10,10 +11,12 @@
 #include <sys/mount.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/sysmacros.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
 #include <algorithm>
 #include <string>
 #include <utility>
@@ -53,6 +56,44 @@ std::string join_path(const std::string& dir, const char* name) {
 bool path_exists(const std::string& path) {
     struct stat st = {};
     return stat(path.c_str(), &st) == 0;
+}
+
+std::vector<std::string> xattr_names(const std::string& path) {
+    ssize_t needed = listxattr(path.c_str(), nullptr, 0);
+    EXPECT_GE(needed, 0) << path << ": " << strerror(errno);
+    if (needed <= 0) {
+        return {};
+    }
+
+    std::vector<char> list(static_cast<size_t>(needed));
+    ssize_t actual = listxattr(path.c_str(), list.data(), list.size());
+    EXPECT_EQ(needed, actual) << path << ": " << strerror(errno);
+    if (actual != needed) {
+        return {};
+    }
+
+    std::vector<std::string> names;
+    size_t start = 0;
+    for (size_t i = 0; i < static_cast<size_t>(actual); ++i) {
+        if (list[i] == '\0') {
+            names.emplace_back(list.data() + start, i - start);
+            start = i + 1;
+        }
+    }
+    EXPECT_EQ(static_cast<size_t>(actual), start);
+    return names;
+}
+
+bool has_xattr_name(const std::vector<std::string>& names, const char* name) {
+    return std::find(names.begin(), names.end(), name) != names.end();
+}
+
+void expect_xattr(const std::string& path, const char* name, const void* expected, size_t size) {
+    std::vector<unsigned char> value(size == 0 ? 1 : size);
+    ssize_t actual = getxattr(path.c_str(), name, value.data(), value.size());
+    ASSERT_EQ(static_cast<ssize_t>(size), actual)
+        << path << " " << name << ": " << strerror(errno);
+    EXPECT_EQ(0, memcmp(value.data(), expected, size));
 }
 
 void expect_path_enoent(const std::string& path) {
@@ -220,8 +261,8 @@ struct OverlayRenameEnv {
     std::string merged;
 };
 
-OverlayRenameEnv make_overlay_env(const char* name) {
-    std::string root = std::string("/tmp/") + name + "_" + std::to_string(getpid());
+OverlayRenameEnv make_overlay_env(const char* name, const char* base = "/tmp") {
+    std::string root = std::string(base) + "/" + name + "_" + std::to_string(getpid());
     OverlayRenameEnv env = {};
     env.root = root;
     env.upper = join_path(root, "u");
@@ -237,7 +278,8 @@ void cleanup_overlay_env(const OverlayRenameEnv& env) {
 }
 
 struct ScopedOverlayEnv {
-    explicit ScopedOverlayEnv(const char* name) : env(make_overlay_env(name)) {}
+    explicit ScopedOverlayEnv(const char* name, const char* base = "/tmp")
+        : env(make_overlay_env(name, base)) {}
 
     ~ScopedOverlayEnv() {
         cleanup_overlay_env(env);
@@ -245,6 +287,15 @@ struct ScopedOverlayEnv {
 
     OverlayRenameEnv env;
 };
+
+bool root_supports_ext4_xattrs() {
+    struct statfs st = {};
+    return statfs("/root", &st) == 0 && st.f_type == 0xEF53;
+}
+
+bool is_xattr_unsupported_errno(int error) {
+    return error == ENOSYS || error == EOPNOTSUPP;
+}
 
 struct ScopedCustomMount {
     ScopedCustomMount(std::string root_path, std::string merged_path)
@@ -565,6 +616,33 @@ TEST(OverlayFsSemantics, MknodWhiteoutOnOverlayIsDenied) {
     EXPECT_EQ(ENOENT, errno);
 
     remove_tree(root);
+}
+
+TEST(OverlayFsSemantics, MknodFifoOverWhiteoutCreatesReachableUpperNode) {
+    ScopedOverlayEnv scoped("overlayfs_mknod_fifo_whiteout");
+    const auto& env = scoped.env;
+    std::string lower_entry = join_path(env.lower, "entry");
+    std::string upper_entry = join_path(env.upper, "entry");
+    std::string merged_entry = join_path(env.merged, "entry");
+
+    prepare_overlay_env(env);
+    ASSERT_EQ(0, write_text(lower_entry, "lower"));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    ASSERT_EQ(0, unlink(merged_entry.c_str())) << strerror(errno);
+    ASSERT_TRUE(is_whiteout(upper_entry));
+    ASSERT_EQ(0, mkfifo(merged_entry.c_str(), 0640)) << strerror(errno);
+
+    struct stat merged_st = {};
+    struct stat upper_st = {};
+    struct stat lower_st = {};
+    ASSERT_EQ(0, lstat(merged_entry.c_str(), &merged_st)) << strerror(errno);
+    ASSERT_EQ(0, lstat(upper_entry.c_str(), &upper_st)) << strerror(errno);
+    ASSERT_EQ(0, lstat(lower_entry.c_str(), &lower_st)) << strerror(errno);
+    EXPECT_TRUE(S_ISFIFO(merged_st.st_mode));
+    EXPECT_TRUE(S_ISFIFO(upper_st.st_mode));
+    EXPECT_TRUE(S_ISREG(lower_st.st_mode));
+    EXPECT_EQ(0, overlay_temp_entry_count(env.work));
 }
 
 TEST(OverlayFsSemantics, LowerWhiteoutHidesLowerLayers) {
@@ -1051,6 +1129,322 @@ TEST(OverlayFsSemantics, LowerHardlinkRedirectsKeepIndependentCopyUpState) {
     EXPECT_EQ(0, close(old_a)) << strerror(errno);
 }
 
+TEST(OverlayFsSemantics, HardlinkUsesRealUpperInodeForLowerAndUpperSources) {
+    ScopedOverlayEnv scoped("overlayfs_hardlink_real_upper");
+    const auto& env = scoped.env;
+    std::string lower_a = join_path(env.lower, "a");
+    std::string merged_a = join_path(env.merged, "a");
+    std::string merged_b = join_path(env.merged, "b");
+    std::string upper_a = join_path(env.upper, "a");
+    std::string upper_b = join_path(env.upper, "b");
+    std::string merged_c = join_path(env.merged, "c");
+    std::string merged_d = join_path(env.merged, "d");
+    std::string upper_c = join_path(env.upper, "c");
+    std::string upper_d = join_path(env.upper, "d");
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_EQ(0, write_text(lower_a, "lower"));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    ASSERT_EQ(0, link(merged_a.c_str(), merged_b.c_str())) << strerror(errno);
+
+    struct stat merged_a_st = {};
+    struct stat merged_b_st = {};
+    struct stat upper_a_st = {};
+    struct stat upper_b_st = {};
+    ASSERT_EQ(0, stat(merged_a.c_str(), &merged_a_st)) << strerror(errno);
+    ASSERT_EQ(0, stat(merged_b.c_str(), &merged_b_st)) << strerror(errno);
+    ASSERT_EQ(0, stat(upper_a.c_str(), &upper_a_st)) << strerror(errno);
+    ASSERT_EQ(0, stat(upper_b.c_str(), &upper_b_st)) << strerror(errno);
+    EXPECT_EQ(merged_a_st.st_ino, merged_b_st.st_ino);
+    EXPECT_EQ(upper_a_st.st_ino, upper_b_st.st_ino);
+    EXPECT_EQ(2u, static_cast<unsigned>(merged_a_st.st_nlink));
+    EXPECT_EQ(2u, static_cast<unsigned>(upper_b_st.st_nlink));
+
+    ASSERT_EQ(0, write_text(merged_b, "lower-linked")) << strerror(errno);
+    EXPECT_EQ("lower-linked", read_text(merged_a));
+    EXPECT_EQ("lower-linked", read_text(upper_a));
+
+    ASSERT_EQ(0, write_text(merged_c, "upper")) << strerror(errno);
+    ASSERT_EQ(0, link(merged_c.c_str(), merged_d.c_str())) << strerror(errno);
+
+    struct stat merged_c_st = {};
+    struct stat merged_d_st = {};
+    struct stat upper_c_st = {};
+    struct stat upper_d_st = {};
+    ASSERT_EQ(0, stat(merged_c.c_str(), &merged_c_st)) << strerror(errno);
+    ASSERT_EQ(0, stat(merged_d.c_str(), &merged_d_st)) << strerror(errno);
+    ASSERT_EQ(0, stat(upper_c.c_str(), &upper_c_st)) << strerror(errno);
+    ASSERT_EQ(0, stat(upper_d.c_str(), &upper_d_st)) << strerror(errno);
+    EXPECT_EQ(merged_c_st.st_ino, merged_d_st.st_ino);
+    EXPECT_EQ(merged_c_st.st_ino, upper_c_st.st_ino);
+    EXPECT_EQ(upper_c_st.st_ino, upper_d_st.st_ino);
+    EXPECT_EQ(2u, static_cast<unsigned>(merged_c_st.st_nlink));
+
+    ASSERT_EQ(0, write_text(merged_d, "upper-linked")) << strerror(errno);
+    EXPECT_EQ("upper-linked", read_text(merged_c));
+    EXPECT_EQ("upper-linked", read_text(upper_c));
+    EXPECT_EQ(0, overlay_temp_entry_count(env.work));
+}
+
+TEST(OverlayFsSemantics, HardlinkCopyUpPreservesLowerOwnershipAndMode) {
+    if (geteuid() != 0) {
+        GTEST_SKIP() << "requires root to prepare lower ownership";
+    }
+
+    ScopedOverlayEnv scoped("overlayfs_hardlink_copy_up_metadata");
+    const auto& env = scoped.env;
+    std::string lower_source = join_path(env.lower, "source");
+    std::string merged_source = join_path(env.merged, "source");
+    std::string merged_target = join_path(env.merged, "target");
+    std::string upper_source = join_path(env.upper, "source");
+    std::string upper_target = join_path(env.upper, "target");
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_EQ(0, write_text(lower_source, "lower-owned"));
+    ASSERT_EQ(0, chown(lower_source.c_str(), 1000, 1001)) << strerror(errno);
+    ASSERT_EQ(0, chmod(lower_source.c_str(), 0640)) << strerror(errno);
+
+    struct stat lower_st = {};
+    ASSERT_EQ(0, stat(lower_source.c_str(), &lower_st)) << strerror(errno);
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    ASSERT_EQ(0, link(merged_source.c_str(), merged_target.c_str())) << strerror(errno);
+
+    struct stat merged_source_st = {};
+    struct stat merged_target_st = {};
+    struct stat upper_source_st = {};
+    struct stat upper_target_st = {};
+    ASSERT_EQ(0, stat(merged_source.c_str(), &merged_source_st)) << strerror(errno);
+    ASSERT_EQ(0, stat(merged_target.c_str(), &merged_target_st)) << strerror(errno);
+    ASSERT_EQ(0, stat(upper_source.c_str(), &upper_source_st)) << strerror(errno);
+    ASSERT_EQ(0, stat(upper_target.c_str(), &upper_target_st)) << strerror(errno);
+
+    EXPECT_EQ(lower_st.st_uid, merged_source_st.st_uid);
+    EXPECT_EQ(lower_st.st_gid, merged_source_st.st_gid);
+    EXPECT_EQ(lower_st.st_mode & 07777, merged_source_st.st_mode & 07777);
+    EXPECT_EQ(lower_st.st_uid, merged_target_st.st_uid);
+    EXPECT_EQ(lower_st.st_gid, merged_target_st.st_gid);
+    EXPECT_EQ(lower_st.st_mode & 07777, merged_target_st.st_mode & 07777);
+    EXPECT_EQ(lower_st.st_uid, upper_source_st.st_uid);
+    EXPECT_EQ(lower_st.st_gid, upper_source_st.st_gid);
+    EXPECT_EQ(lower_st.st_mode & 07777, upper_source_st.st_mode & 07777);
+    EXPECT_EQ(lower_st.st_uid, upper_target_st.st_uid);
+    EXPECT_EQ(lower_st.st_gid, upper_target_st.st_gid);
+    EXPECT_EQ(lower_st.st_mode & 07777, upper_target_st.st_mode & 07777);
+    EXPECT_EQ(upper_source_st.st_ino, upper_target_st.st_ino);
+    EXPECT_EQ(0, overlay_temp_entry_count(env.work));
+}
+
+TEST(OverlayFsSemantics, HardlinkExistingMergedTargetFailsBeforeSourceCopyUp) {
+    ScopedOverlayEnv scoped("overlayfs_hardlink_existing_target");
+    const auto& env = scoped.env;
+    std::string lower_source = join_path(env.lower, "source");
+    std::string lower_target = join_path(env.lower, "target");
+    std::string upper_source = join_path(env.upper, "source");
+    std::string upper_target = join_path(env.upper, "target");
+    std::string merged_source = join_path(env.merged, "source");
+    std::string merged_target = join_path(env.merged, "target");
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_EQ(0, write_text(lower_source, "source"));
+    ASSERT_EQ(0, write_text(lower_target, "lower-target"));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    errno = 0;
+    EXPECT_EQ(-1, link(merged_source.c_str(), merged_target.c_str()));
+    EXPECT_EQ(EEXIST, errno);
+    EXPECT_FALSE(path_exists(upper_source));
+    EXPECT_FALSE(path_exists(upper_target));
+    EXPECT_EQ("source", read_text(merged_source));
+    EXPECT_EQ("lower-target", read_text(merged_target));
+
+    struct stat lower_source_st = {};
+    ASSERT_EQ(0, stat(lower_source.c_str(), &lower_source_st)) << strerror(errno);
+    EXPECT_EQ(1u, static_cast<unsigned>(lower_source_st.st_nlink));
+
+    ASSERT_EQ(0, write_text(upper_target, "upper-target"));
+    errno = 0;
+    EXPECT_EQ(-1, link(merged_source.c_str(), merged_target.c_str()));
+    EXPECT_EQ(EEXIST, errno);
+    EXPECT_FALSE(path_exists(upper_source));
+    EXPECT_EQ("upper-target", read_text(merged_target));
+    EXPECT_EQ(0, overlay_temp_entry_count(env.work));
+}
+
+TEST(OverlayFsSemantics, HardlinkMayCreatePermissionAndErrorOrdering) {
+    if (geteuid() != 0) {
+        GTEST_SKIP() << "requires root to prepare a non-owner caller";
+    }
+
+    ScopedOverlayEnv scoped("overlayfs_hardlink_permission");
+    const auto& env = scoped.env;
+    std::string lower_source = join_path(env.lower, "source");
+    std::string lower_existing = join_path(env.lower, "existing");
+    std::string upper_source = join_path(env.upper, "source");
+    std::string merged_source = join_path(env.merged, "source");
+    std::string merged_existing = join_path(env.merged, "existing");
+    std::string merged_missing = join_path(env.merged, "missing");
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_EQ(0, write_text(lower_source, "source"));
+    ASSERT_EQ(0, write_text(lower_existing, "existing"));
+    ASSERT_EQ(0, chown(lower_source.c_str(), 1000, 1000)) << strerror(errno);
+    ASSERT_EQ(0, chmod(env.upper.c_str(), 0555)) << strerror(errno);
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        if (setgid(1000) != 0 || setuid(1000) != 0) {
+            _exit(2);
+        }
+
+        errno = 0;
+        if (link(merged_source.c_str(), merged_existing.c_str()) != -1 || errno != EEXIST) {
+            _exit(3);
+        }
+
+        errno = 0;
+        if (link(merged_source.c_str(), merged_missing.c_str()) != -1 || errno != EACCES) {
+            _exit(4);
+        }
+        _exit(0);
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    EXPECT_FALSE(path_exists(upper_source));
+    EXPECT_FALSE(path_exists(merged_missing));
+}
+
+TEST(OverlayFsSemantics, HardlinkReadonlyMountAndExistingTargetErrorOrdering) {
+    ScopedOverlayEnv scoped("overlayfs_hardlink_readonly");
+    const auto& env = scoped.env;
+    std::string lower_source = join_path(env.lower, "source");
+    std::string lower_existing = join_path(env.lower, "existing");
+    std::string merged_source = join_path(env.merged, "source");
+    std::string merged_existing = join_path(env.merged, "existing");
+    std::string merged_missing = join_path(env.merged, "missing");
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_EQ(0, write_text(lower_source, "source"));
+    ASSERT_EQ(0, write_text(lower_existing, "existing"));
+
+    std::string options =
+        "lowerdir=" + env.lower + ",upperdir=" + env.upper + ",workdir=" + env.work;
+    ASSERT_EQ(0, mount("overlay", env.merged.c_str(), "overlay", MS_RDONLY, options.c_str()))
+        << strerror(errno);
+
+    errno = 0;
+    EXPECT_EQ(-1, link(env.merged.c_str(), merged_existing.c_str()));
+    EXPECT_EQ(EEXIST, errno);
+
+    errno = 0;
+    EXPECT_EQ(-1, link(merged_source.c_str(), merged_existing.c_str()));
+    EXPECT_EQ(EEXIST, errno);
+
+    errno = 0;
+    EXPECT_EQ(-1, link(merged_source.c_str(), merged_missing.c_str()));
+    EXPECT_EQ(EROFS, errno);
+}
+
+TEST(OverlayFsSemantics, HardlinkReplacesWhiteoutWithRealUpperInode) {
+    ScopedOverlayEnv scoped("overlayfs_hardlink_whiteout");
+    const auto& env = scoped.env;
+    std::string lower_source = join_path(env.lower, "source");
+    std::string lower_target = join_path(env.lower, "target");
+    std::string upper_source = join_path(env.upper, "source");
+    std::string upper_target = join_path(env.upper, "target");
+    std::string merged_source = join_path(env.merged, "source");
+    std::string merged_target = join_path(env.merged, "target");
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_EQ(0, write_text(lower_source, "source"));
+    ASSERT_EQ(0, write_text(lower_target, "lower-target"));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    ASSERT_EQ(0, unlink(merged_target.c_str())) << strerror(errno);
+    ASSERT_TRUE(is_whiteout(upper_target));
+    ASSERT_EQ(0, link(merged_source.c_str(), merged_target.c_str())) << strerror(errno);
+    EXPECT_FALSE(is_whiteout(upper_target));
+    EXPECT_EQ("source", read_text(merged_target));
+    EXPECT_EQ("lower-target", read_text(lower_target));
+
+    struct stat source_st = {};
+    struct stat target_st = {};
+    ASSERT_EQ(0, stat(upper_source.c_str(), &source_st)) << strerror(errno);
+    ASSERT_EQ(0, stat(upper_target.c_str(), &target_st)) << strerror(errno);
+    EXPECT_EQ(source_st.st_ino, target_st.st_ino);
+    EXPECT_EQ(2u, static_cast<unsigned>(source_st.st_nlink));
+    EXPECT_EQ(0, overlay_temp_entry_count(env.work));
+}
+
+TEST(OverlayFsSemantics, LowerSymlinkHardlinkUsesRealUpperInode) {
+    ScopedOverlayEnv scoped("overlayfs_hardlink_symlink");
+    const auto& env = scoped.env;
+    std::string lower_source = join_path(env.lower, "source");
+    std::string merged_source = join_path(env.merged, "source");
+    std::string merged_target = join_path(env.merged, "target");
+    std::string upper_source = join_path(env.upper, "source");
+    std::string upper_target = join_path(env.upper, "target");
+
+    ASSERT_EQ(0, ensure_dir("/tmp"));
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_EQ(0, symlink("symlink-value", lower_source.c_str())) << strerror(errno);
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    ASSERT_EQ(0, link(merged_source.c_str(), merged_target.c_str())) << strerror(errno);
+    EXPECT_EQ("symlink-value", read_symlink_target(merged_source));
+    EXPECT_EQ("symlink-value", read_symlink_target(merged_target));
+    EXPECT_EQ("symlink-value", read_symlink_target(upper_source));
+    EXPECT_EQ("symlink-value", read_symlink_target(upper_target));
+
+    struct stat source_st = {};
+    struct stat target_st = {};
+    ASSERT_EQ(0, lstat(merged_source.c_str(), &source_st)) << strerror(errno);
+    ASSERT_EQ(0, lstat(merged_target.c_str(), &target_st)) << strerror(errno);
+    EXPECT_EQ(source_st.st_ino, target_st.st_ino);
+    EXPECT_EQ(2u, static_cast<unsigned>(source_st.st_nlink));
+    EXPECT_EQ(0, overlay_temp_entry_count(env.work));
+}
+
 TEST(OverlayFsSemantics, CopyUpLowerFilePublishesCompleteUpperFile) {
     ScopedOverlayEnv scoped("overlayfs_copy_up_file");
     const auto& env = scoped.env;
@@ -1351,6 +1745,40 @@ TEST(OverlayFsSemantics, CopyUpLowerSymlinkPreservesTarget) {
     EXPECT_EQ("target", read_symlink_target(merged_renamed));
     EXPECT_EQ("target-data", read_text(merged_renamed));
     EXPECT_EQ(0, overlay_temp_entry_count(env.work));
+}
+
+TEST(OverlayFsSemantics, ReloadCopiedUpExt4SymlinkWithoutOriginXattr) {
+    if (!root_supports_ext4_xattrs()) {
+        GTEST_SKIP() << "requires ext4 rootfs symlink xattr behavior";
+    }
+
+    ScopedOverlayEnv scoped("overlayfs_reload_ext4_symlink", "/root");
+    const auto& env = scoped.env;
+    std::string lower_target = join_path(env.lower, "target");
+    std::string lower_link = join_path(env.lower, "link");
+    std::string merged_link = join_path(env.merged, "link");
+    std::string merged_renamed = join_path(env.merged, "renamed-link");
+
+    ASSERT_EQ(0, ensure_dir(env.root.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.work.c_str()));
+    ASSERT_EQ(0, ensure_dir(env.merged.c_str()));
+    ASSERT_EQ(0, write_text(lower_target, "target-data"));
+    ASSERT_EQ(0, symlink("target", lower_link.c_str())) << strerror(errno);
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+    ASSERT_EQ(0, rename(merged_link.c_str(), merged_renamed.c_str())) << strerror(errno);
+
+    // ext4 currently rejects xattrs on symlinks with EPERM. Remount to force
+    // OverlayFS to instantiate a fresh inode and reload the optional origin
+    // xattr instead of reusing the copy-up inode state.
+    ASSERT_EQ(0, umount(env.merged.c_str())) << strerror(errno);
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+    struct stat st = {};
+    ASSERT_EQ(0, lstat(merged_renamed.c_str(), &st)) << strerror(errno);
+    EXPECT_TRUE(S_ISLNK(st.st_mode));
+    EXPECT_EQ("target", read_symlink_target(merged_renamed));
+    EXPECT_EQ("target-data", read_text(merged_renamed));
 }
 
 TEST(OverlayFsSemantics, CopyUpLowerCharDevicePreservesRdev) {
@@ -2355,6 +2783,492 @@ TEST(OverlayFsSemantics, UpperDirRenameOverEmptyLowerDirSucceeds) {
     EXPECT_EQ("source", read_text(join_path(merged_new, "child")));
     EXPECT_EQ(0, close(old_target_fd)) << strerror(errno);
     cleanup_overlay_env(env);
+}
+
+TEST(OverlayFsSemantics, CopiedUpIdentitySurvivesRemount) {
+    if (!root_supports_ext4_xattrs()) {
+        GTEST_SKIP() << "requires the Ubuntu 24.04 ext4 rootfs backing";
+    }
+
+    ScopedOverlayEnv scoped("overlayfs_remount_identity", "/root");
+    const auto& env = scoped.env;
+    prepare_overlay_env(env);
+    std::string lower_file = join_path(env.lower, "file");
+    std::string merged_file = join_path(env.merged, "file");
+    ASSERT_EQ(0, write_text(lower_file, "lower")) << strerror(errno);
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    struct stat before = {};
+    struct stat copied_up = {};
+    struct stat remounted = {};
+    ASSERT_EQ(0, stat(merged_file.c_str(), &before)) << strerror(errno);
+    ASSERT_EQ(0, chmod(merged_file.c_str(), 0600)) << strerror(errno);
+    ASSERT_EQ(0, stat(merged_file.c_str(), &copied_up)) << strerror(errno);
+    EXPECT_EQ(before.st_dev, copied_up.st_dev);
+    EXPECT_EQ(before.st_ino, copied_up.st_ino);
+
+    ASSERT_EQ(0, umount(env.merged.c_str())) << strerror(errno);
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+    ASSERT_EQ(0, stat(merged_file.c_str(), &remounted)) << strerror(errno);
+    EXPECT_EQ(before.st_dev, remounted.st_dev);
+    EXPECT_EQ(before.st_ino, remounted.st_ino);
+}
+
+TEST(OverlayFsSemantics, LowerMetadataMutationsCopyUpAndKeepStableIdentity) {
+    if (geteuid() != 0) {
+        GTEST_SKIP() << "requires root for chown coverage";
+    }
+
+    if (!root_supports_ext4_xattrs()) {
+        GTEST_SKIP() << "requires the Ubuntu 24.04 ext4 rootfs backing";
+    }
+
+    ScopedOverlayEnv scoped("overlayfs_metadata_copy_up", "/root");
+    const auto& env = scoped.env;
+    prepare_overlay_env(env);
+
+    const char* names[] = {"mode", "owner", "time", "truncate", "ftruncate"};
+    for (const char* name : names) {
+        ASSERT_EQ(0, write_text(join_path(env.lower, name), "0123456789")) << strerror(errno);
+    }
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    struct stat before[5] = {};
+    for (size_t i = 0; i < 5; ++i) {
+        ASSERT_EQ(0, stat(join_path(env.merged, names[i]).c_str(), &before[i])) << strerror(errno);
+    }
+    sleep(1);
+
+    ASSERT_EQ(0, chmod(join_path(env.merged, names[0]).c_str(), 0601)) << strerror(errno);
+    ASSERT_EQ(0, chown(join_path(env.merged, names[1]).c_str(), 1000, 1001)) << strerror(errno);
+    timespec times[2] = {{123456789, 123456789}, {123456790, 987654321}};
+    ASSERT_EQ(0, utimensat(AT_FDCWD, join_path(env.merged, names[2]).c_str(), times, 0))
+        << strerror(errno);
+    ASSERT_EQ(0, truncate(join_path(env.merged, names[3]).c_str(), 3)) << strerror(errno);
+    int fd = open(join_path(env.merged, names[4]).c_str(), O_WRONLY | O_CLOEXEC);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    ASSERT_EQ(0, ftruncate(fd, 4)) << strerror(errno);
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+
+    EXPECT_EQ("012", read_text(join_path(env.upper, names[3])));
+    EXPECT_EQ("012", read_text(join_path(env.merged, names[3])));
+    EXPECT_EQ("0123", read_text(join_path(env.upper, names[4])));
+    EXPECT_EQ("0123", read_text(join_path(env.merged, names[4])));
+
+    for (size_t i = 0; i < 5; ++i) {
+        struct stat merged_st = {};
+        struct stat lower_st = {};
+        struct stat upper_st = {};
+        ASSERT_EQ(0, stat(join_path(env.merged, names[i]).c_str(), &merged_st)) << strerror(errno);
+        ASSERT_EQ(0, stat(join_path(env.lower, names[i]).c_str(), &lower_st)) << strerror(errno);
+        ASSERT_EQ(0, stat(join_path(env.upper, names[i]).c_str(), &upper_st)) << strerror(errno);
+        EXPECT_EQ(before[i].st_dev, merged_st.st_dev) << names[i];
+        EXPECT_EQ(before[i].st_ino, merged_st.st_ino) << names[i];
+        EXPECT_GT(merged_st.st_ctim.tv_sec, before[i].st_ctim.tv_sec) << names[i];
+        EXPECT_EQ(10, lower_st.st_size) << names[i];
+        if (i >= 3) {
+            EXPECT_GT(merged_st.st_mtim.tv_sec, before[i].st_mtim.tv_sec) << names[i];
+        }
+    }
+
+    struct stat st = {};
+    ASSERT_EQ(0, stat(join_path(env.merged, names[0]).c_str(), &st));
+    EXPECT_EQ(0601u, st.st_mode & 07777);
+    ASSERT_EQ(0, stat(join_path(env.lower, names[0]).c_str(), &st));
+    EXPECT_EQ(0644u, st.st_mode & 07777);
+    ASSERT_EQ(0, stat(join_path(env.merged, names[1]).c_str(), &st));
+    EXPECT_EQ(1000u, st.st_uid);
+    EXPECT_EQ(1001u, st.st_gid);
+    ASSERT_EQ(0, stat(join_path(env.lower, names[1]).c_str(), &st));
+    EXPECT_EQ(0u, st.st_uid);
+    EXPECT_EQ(0u, st.st_gid);
+    ASSERT_EQ(0, stat(join_path(env.merged, names[2]).c_str(), &st));
+    EXPECT_EQ(times[0].tv_sec, st.st_atim.tv_sec);
+    EXPECT_EQ(times[1].tv_sec, st.st_mtim.tv_sec);
+    // DragonOS ext4 currently exposes second-resolution timestamps.
+    EXPECT_EQ(0, st.st_atim.tv_nsec);
+    EXPECT_EQ(0, st.st_mtim.tv_nsec);
+    ASSERT_EQ(0, stat(join_path(env.lower, names[2]).c_str(), &st));
+    EXPECT_NE(times[1].tv_sec, st.st_mtim.tv_sec);
+    ASSERT_EQ(0, stat(join_path(env.merged, names[3]).c_str(), &st));
+    EXPECT_EQ(3, st.st_size);
+    ASSERT_EQ(0, stat(join_path(env.merged, names[4]).c_str(), &st));
+    EXPECT_EQ(4, st.st_size);
+
+    std::string pure_upper = join_path(env.merged, "pure_upper_time");
+    ASSERT_EQ(0, write_text(pure_upper, "upper"));
+    struct stat pure_before = {};
+    ASSERT_EQ(0, stat(pure_upper.c_str(), &pure_before));
+    sleep(1);
+    ASSERT_EQ(0, chmod(pure_upper.c_str(), 0600));
+    struct stat pure_after_chmod = {};
+    ASSERT_EQ(0, stat(pure_upper.c_str(), &pure_after_chmod));
+    EXPECT_GT(pure_after_chmod.st_ctim.tv_sec, pure_before.st_ctim.tv_sec);
+    sleep(1);
+    ASSERT_EQ(0, truncate(pure_upper.c_str(), 2));
+    struct stat pure_after_truncate = {};
+    ASSERT_EQ(0, stat(pure_upper.c_str(), &pure_after_truncate));
+    EXPECT_GT(pure_after_truncate.st_ctim.tv_sec, pure_after_chmod.st_ctim.tv_sec);
+    EXPECT_GT(pure_after_truncate.st_mtim.tv_sec, pure_after_chmod.st_mtim.tv_sec);
+}
+
+TEST(OverlayFsSemantics, UserXattrOperationsAndPrivateNamespaceSemantics) {
+    if (!root_supports_ext4_xattrs()) {
+        GTEST_SKIP() << "requires the Ubuntu 24.04 ext4 rootfs backing";
+    }
+
+    ScopedOverlayEnv scoped("overlayfs_xattr_ops", "/root");
+    const auto& env = scoped.env;
+    prepare_overlay_env(env);
+    std::string lower_file = join_path(env.lower, "file");
+    std::string merged_file = join_path(env.merged, "file");
+    std::string upper_file = join_path(env.upper, "file");
+    std::string missing_lower = join_path(env.lower, "missing");
+    std::string missing_merged = join_path(env.merged, "missing");
+    std::string missing_upper = join_path(env.upper, "missing");
+    ASSERT_EQ(0, write_text(lower_file, "lower"));
+    ASSERT_EQ(0, write_text(missing_lower, "lower"));
+    ASSERT_EQ(0, setxattr(lower_file.c_str(), "user.base", "lower", 5, 0)) << strerror(errno);
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    expect_xattr(merged_file, "user.base", "lower", 5);
+    EXPECT_TRUE(has_xattr_name(xattr_names(merged_file), "user.base"));
+    ASSERT_EQ(0, setxattr(merged_file.c_str(), "user.base", "upper", 5, XATTR_REPLACE))
+        << strerror(errno);
+    expect_xattr(merged_file, "user.base", "upper", 5);
+    expect_xattr(upper_file, "user.base", "upper", 5);
+    expect_xattr(lower_file, "user.base", "lower", 5);
+    errno = 0;
+    EXPECT_EQ(-1, setxattr(merged_file.c_str(), "user.base", "new", 3, XATTR_CREATE));
+    EXPECT_EQ(EEXIST, errno);
+    ASSERT_EQ(0, setxattr(merged_file.c_str(), "user.created", "value", 5, XATTR_CREATE));
+    ASSERT_EQ(0, removexattr(merged_file.c_str(), "user.base"));
+    errno = 0;
+    EXPECT_EQ(-1, getxattr(merged_file.c_str(), "user.base", nullptr, 0));
+    EXPECT_EQ(ENODATA, errno);
+
+    errno = 0;
+    EXPECT_EQ(-1, removexattr(missing_merged.c_str(), "user.absent"));
+    EXPECT_EQ(ENODATA, errno);
+    EXPECT_FALSE(path_exists(missing_upper));
+
+    constexpr const char* kPrivate = "trusted.overlay.origin";
+    errno = 0;
+    EXPECT_EQ(-1, getxattr(merged_file.c_str(), kPrivate, nullptr, 0));
+    EXPECT_EQ(EOPNOTSUPP, errno);
+    errno = 0;
+    EXPECT_EQ(-1, setxattr(merged_file.c_str(), kPrivate, "x", 1, 0));
+    EXPECT_EQ(EOPNOTSUPP, errno);
+    errno = 0;
+    EXPECT_EQ(-1, removexattr(merged_file.c_str(), kPrivate));
+    EXPECT_EQ(EOPNOTSUPP, errno);
+    errno = 0;
+    EXPECT_EQ(-1,
+              getxattr(merged_file.c_str(), "trusted.dragonos.overlay.origin", nullptr, 0));
+    EXPECT_EQ(EOPNOTSUPP, errno);
+    for (const auto& name : xattr_names(merged_file)) {
+        EXPECT_NE(0u, name.find("trusted.overlay."));
+        EXPECT_NE("trusted.dragonos.overlay.origin", name);
+    }
+}
+
+TEST(OverlayFsSemantics, RemoveLowerXattrDroppedByUnsupportedUpperSucceeds) {
+    if (!root_supports_ext4_xattrs()) {
+        GTEST_SKIP() << "requires an ext4 lower and tmpfs upper";
+    }
+
+    std::string suffix = std::to_string(getpid());
+    std::string lower_root = "/root/overlayfs_xattr_drop_lower_" + suffix;
+    std::string upper_root = "/tmp/overlayfs_xattr_drop_upper_" + suffix;
+    std::string lower = join_path(lower_root, "l");
+    std::string upper = join_path(upper_root, "u");
+    std::string work = join_path(upper_root, "w");
+    std::string merged = join_path(upper_root, "m");
+    std::string lower_file = join_path(lower, "file");
+    std::string upper_file = join_path(upper, "file");
+    std::string merged_file = join_path(merged, "file");
+    std::string upper_probe = join_path(upper_root, "xattr_probe");
+    ScopedCustomMount lower_cleanup(lower_root, "");
+    ScopedCustomMount upper_cleanup(upper_root, merged);
+
+    ASSERT_EQ(0, ensure_dir(lower_root.c_str()));
+    ASSERT_EQ(0, ensure_dir(upper_root.c_str()));
+    ASSERT_EQ(0, ensure_dir(lower.c_str()));
+    ASSERT_EQ(0, ensure_dir(upper.c_str()));
+    ASSERT_EQ(0, ensure_dir(work.c_str()));
+    ASSERT_EQ(0, ensure_dir(merged.c_str()));
+    ASSERT_EQ(0, write_text(lower_file, "lower"));
+    ASSERT_EQ(0, write_text(upper_probe, "probe"));
+    errno = 0;
+    int probe_result = setxattr(upper_probe.c_str(), "user.probe", "value", 5, 0);
+    if (probe_result == 0) {
+        GTEST_SKIP() << "requires an upper filesystem without xattr support";
+    }
+    ASSERT_TRUE(is_xattr_unsupported_errno(errno)) << strerror(errno);
+    ASSERT_EQ(0, setxattr(lower_file.c_str(), "user.dropped", "value", 5, 0))
+        << strerror(errno);
+
+    std::string options = "lowerdir=" + lower + ",upperdir=" + upper + ",workdir=" + work;
+    ASSERT_EQ(0, mount("overlay", merged.c_str(), "overlay", 0, options.c_str()))
+        << strerror(errno);
+    upper_cleanup.mounted = true;
+
+    expect_xattr(merged_file, "user.dropped", "value", 5);
+    ASSERT_EQ(0, removexattr(merged_file.c_str(), "user.dropped")) << strerror(errno);
+    EXPECT_TRUE(path_exists(upper_file));
+    errno = 0;
+    EXPECT_EQ(-1, getxattr(merged_file.c_str(), "user.dropped", nullptr, 0));
+    EXPECT_TRUE(errno == ENODATA || is_xattr_unsupported_errno(errno)) << strerror(errno);
+    expect_xattr(lower_file, "user.dropped", "value", 5);
+}
+
+TEST(OverlayFsSemantics, CallerPermissionsProtectTimestampsAndUserXattrs) {
+    if (geteuid() != 0) {
+        GTEST_SKIP() << "requires root to create the non-root caller";
+    }
+    if (!root_supports_ext4_xattrs()) {
+        GTEST_SKIP() << "requires the Ubuntu 24.04 ext4 rootfs backing";
+    }
+
+    ASSERT_EQ(0, ensure_dir("/var/tmp"));
+    ASSERT_EQ(0, chmod("/var/tmp", 01777));
+    ScopedOverlayEnv scoped("overlayfs_caller_permissions", "/var/tmp");
+    const auto& env = scoped.env;
+    prepare_overlay_env(env);
+    std::string lower_file = join_path(env.lower, "secret");
+    std::string lower_sticky = join_path(env.lower, "sticky");
+    std::string lower_fifo = join_path(env.lower, "fifo");
+    std::string merged_file = join_path(env.merged, "secret");
+    std::string merged_sticky = join_path(env.merged, "sticky");
+    std::string merged_fifo = join_path(env.merged, "fifo");
+    ASSERT_EQ(0, write_text(lower_file, "secret"));
+    ASSERT_EQ(0, setxattr(lower_file.c_str(), "user.secret", "hidden", 6, 0));
+    ASSERT_EQ(0, chmod(lower_file.c_str(), 0000));
+    ASSERT_EQ(0, mkdir(lower_sticky.c_str(), 01777));
+    ASSERT_EQ(0, chmod(lower_sticky.c_str(), 01777));
+    ASSERT_EQ(0, mkfifo(lower_fifo.c_str(), 0666));
+    ASSERT_EQ(0, chmod(lower_fifo.c_str(), 0666));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        if (setgid(1000) != 0 || setuid(1000) != 0) {
+            _exit(10);
+        }
+        __user_cap_header_struct cap_header = {_LINUX_CAPABILITY_VERSION_3, 0};
+        __user_cap_data_struct cap_data[2] = {};
+        if (syscall(SYS_capset, &cap_header, cap_data) != 0) {
+            _exit(16);
+        }
+        char value[8] = {};
+        if (getxattr(merged_file.c_str(), "user.secret", value, sizeof(value)) != -1
+            || errno != EACCES) {
+            _exit(11);
+        }
+        if (setxattr(merged_sticky.c_str(), "user.denied", "x", 1, 0) != -1
+            || errno != EPERM) {
+            _exit(12);
+        }
+        if (setxattr(merged_fifo.c_str(), "user.denied", "x", 1, 0) != -1
+            || errno != EPERM) {
+            _exit(13);
+        }
+        timespec explicit_times[2] = {{123456789, 0}, {123456790, 0}};
+        if (utimensat(AT_FDCWD, merged_file.c_str(), explicit_times, 0) != -1
+            || errno != EPERM) {
+            _exit(14);
+        }
+        if (utimensat(AT_FDCWD, merged_file.c_str(), nullptr, 0) != -1
+            || errno != EACCES) {
+            _exit(15);
+        }
+        _exit(0);
+    }
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0));
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    EXPECT_FALSE(path_exists(join_path(env.upper, "secret")));
+    EXPECT_FALSE(path_exists(join_path(env.upper, "sticky")));
+    EXPECT_FALSE(path_exists(join_path(env.upper, "fifo")));
+}
+
+TEST(OverlayFsSemantics, CopyUpPreservesRawAclCapabilityAndAncestorMetadata) {
+    if (geteuid() != 0) {
+        GTEST_SKIP() << "requires root for ownership and security xattr coverage";
+    }
+
+    if (!root_supports_ext4_xattrs()) {
+        GTEST_SKIP() << "requires the Ubuntu 24.04 ext4 rootfs backing";
+    }
+
+    ScopedOverlayEnv scoped("overlayfs_copy_up_raw_metadata", "/root");
+    const auto& env = scoped.env;
+    prepare_overlay_env(env);
+    std::string lower_a = join_path(env.lower, "a");
+    std::string lower_b = join_path(lower_a, "b");
+    std::string lower_file = join_path(lower_b, "file");
+    std::string upper_a = join_path(env.upper, "a");
+    std::string upper_b = join_path(upper_a, "b");
+    std::string upper_file = join_path(upper_b, "file");
+    std::string merged_file = join_path(join_path(join_path(env.merged, "a"), "b"), "file");
+    ASSERT_EQ(0, mkdir(lower_a.c_str(), 0751));
+    ASSERT_EQ(0, mkdir(lower_b.c_str(), 0710));
+    ASSERT_EQ(0, write_text(lower_file, "metadata"));
+    ASSERT_EQ(0, chown(lower_a.c_str(), 1000, 1001));
+    ASSERT_EQ(0, chown(lower_b.c_str(), 1002, 1003));
+    timespec a_times[2] = {{123400000, 111}, {123400001, 222}};
+    timespec b_times[2] = {{123500000, 333}, {123500001, 444}};
+    ASSERT_EQ(0, utimensat(AT_FDCWD, lower_a.c_str(), a_times, 0));
+    ASSERT_EQ(0, utimensat(AT_FDCWD, lower_b.c_str(), b_times, 0));
+
+    const unsigned char acl[] = {
+        2, 0, 0, 0, 1, 0, 7, 0, 0xff, 0xff, 0xff, 0xff,
+        4, 0, 5, 0, 0xff, 0xff, 0xff, 0xff, 0x20, 0, 5, 0, 0xff, 0xff, 0xff, 0xff};
+    const unsigned char capability[] = {
+        0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    ASSERT_EQ(0, setxattr(lower_a.c_str(), "user.ancestor", "a", 1, 0)) << strerror(errno);
+    ASSERT_EQ(0, setxattr(lower_b.c_str(), "system.posix_acl_default", acl, sizeof(acl), 0))
+        << "ext4 must accept the raw default ACL used by this test: " << strerror(errno);
+    ASSERT_EQ(0, setxattr(lower_file.c_str(), "system.posix_acl_access", acl, sizeof(acl), 0))
+        << "ext4 must accept the raw access ACL used by this test: " << strerror(errno);
+    ASSERT_EQ(0,
+              setxattr(lower_file.c_str(), "security.capability", capability, sizeof(capability), 0))
+        << "ext4 must accept the raw file capability used by this test: " << strerror(errno);
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    int fd = open(merged_file.c_str(), O_WRONLY | O_CLOEXEC);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    ASSERT_EQ(0, close(fd));
+
+    struct stat st = {};
+    ASSERT_EQ(0, stat(upper_a.c_str(), &st));
+    EXPECT_EQ(1000u, st.st_uid);
+    EXPECT_EQ(1001u, st.st_gid);
+    EXPECT_EQ(0751u, st.st_mode & 07777);
+    EXPECT_EQ(a_times[0].tv_sec, st.st_atim.tv_sec);
+    EXPECT_EQ(a_times[1].tv_sec, st.st_mtim.tv_sec);
+    ASSERT_EQ(0, stat(upper_b.c_str(), &st));
+    EXPECT_EQ(1002u, st.st_uid);
+    EXPECT_EQ(1003u, st.st_gid);
+    EXPECT_EQ(0710u, st.st_mode & 07777);
+    EXPECT_EQ(b_times[0].tv_sec, st.st_atim.tv_sec);
+    EXPECT_EQ(b_times[1].tv_sec, st.st_mtim.tv_sec);
+    expect_xattr(upper_a, "user.ancestor", "a", 1);
+    expect_xattr(upper_b, "system.posix_acl_default", acl, sizeof(acl));
+    expect_xattr(upper_file, "system.posix_acl_access", acl, sizeof(acl));
+    expect_xattr(upper_file, "security.capability", capability, sizeof(capability));
+    expect_xattr(merged_file, "system.posix_acl_access", acl, sizeof(acl));
+    expect_xattr(merged_file, "security.capability", capability, sizeof(capability));
+}
+
+TEST(OverlayFsSemantics, ContentMutationRemovesCopiedUpFileCapability) {
+    if (geteuid() != 0) {
+        GTEST_SKIP() << "requires root for security xattr coverage";
+    }
+    if (!root_supports_ext4_xattrs()) {
+        GTEST_SKIP() << "requires the Ubuntu 24.04 ext4 rootfs backing";
+    }
+
+    ScopedOverlayEnv scoped("overlayfs_kill_file_capability", "/root");
+    const auto& env = scoped.env;
+    prepare_overlay_env(env);
+    const unsigned char capability[] = {
+        0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    const char* names[] = {"write", "truncate", "chown"};
+    for (const char* name : names) {
+        std::string lower_file = join_path(env.lower, name);
+        ASSERT_EQ(0, write_text(lower_file, "lower")) << strerror(errno);
+        ASSERT_EQ(0,
+                  setxattr(lower_file.c_str(), "security.capability", capability,
+                           sizeof(capability), 0))
+            << strerror(errno);
+    }
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    std::string merged_write = join_path(env.merged, names[0]);
+    int fd = open(merged_write.c_str(), O_WRONLY | O_CLOEXEC);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    ASSERT_EQ(1, write(fd, "x", 1)) << strerror(errno);
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+    ASSERT_EQ(0, truncate(join_path(env.merged, names[1]).c_str(), 3)) << strerror(errno);
+    ASSERT_EQ(0, chown(join_path(env.merged, names[2]).c_str(), 1000, 1001)) << strerror(errno);
+
+    for (const char* name : names) {
+        std::string lower_file = join_path(env.lower, name);
+        std::string upper_file = join_path(env.upper, name);
+        std::string merged_file = join_path(env.merged, name);
+        expect_xattr(lower_file, "security.capability", capability, sizeof(capability));
+        for (const std::string* file : {&upper_file, &merged_file}) {
+            errno = 0;
+            EXPECT_EQ(-1, getxattr(file->c_str(), "security.capability", nullptr, 0));
+            EXPECT_EQ(ENODATA, errno) << *file;
+        }
+    }
+    EXPECT_EQ("low", read_text(join_path(env.upper, names[1])));
+    EXPECT_EQ("low", read_text(join_path(env.merged, names[1])));
+}
+
+TEST(OverlayFsSemantics, NonRootOwnerCanTriggerCopyUpThroughMounterCredentials) {
+    if (geteuid() != 0) {
+        GTEST_SKIP() << "requires root to create the non-root caller";
+    }
+
+    ScopedOverlayEnv scoped("overlayfs_nonroot_copy_up");
+    const auto& env = scoped.env;
+    prepare_overlay_env(env);
+    std::string lower_file = join_path(env.lower, "file");
+    std::string merged_file = join_path(env.merged, "file");
+    std::string upper_file = join_path(env.upper, "file");
+    ASSERT_EQ(0, write_text(lower_file, "owned"));
+    ASSERT_EQ(0, chown(lower_file.c_str(), 1000, 1000));
+    ASSERT_EQ(0, chmod(lower_file.c_str(), 0644));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        if (setgid(1000) != 0 || setuid(1000) != 0) {
+            _exit(2);
+        }
+        _exit(chmod(merged_file.c_str(), 0600) == 0 ? 0 : 3);
+    }
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0));
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(0, WEXITSTATUS(status));
+    struct stat st = {};
+    ASSERT_EQ(0, stat(upper_file.c_str(), &st));
+    EXPECT_EQ(1000u, st.st_uid);
+    EXPECT_EQ(0600u, st.st_mode & 07777);
+}
+
+TEST(OverlayFsSemantics, BindSharesDeviceAndIndependentOverlayGetsNewDevice) {
+    ScopedOverlayEnv first("overlayfs_stat_device_first");
+    ScopedOverlayEnv second("overlayfs_stat_device_second");
+    prepare_overlay_env(first.env);
+    prepare_overlay_env(second.env);
+    ASSERT_EQ(0, write_text(join_path(first.env.lower, "file"), "first"));
+    ASSERT_EQ(0, write_text(join_path(second.env.lower, "file"), "second"));
+    ASSERT_TRUE(setup_overlay_env(first.env)) << strerror(errno);
+    ASSERT_TRUE(setup_overlay_env(second.env)) << strerror(errno);
+
+    std::string bind_path = join_path(first.env.root, "bind");
+    ASSERT_EQ(0, mkdir(bind_path.c_str(), 0755));
+    ASSERT_EQ(0, mount(first.env.merged.c_str(), bind_path.c_str(), nullptr, MS_BIND, nullptr))
+        << strerror(errno);
+    struct stat original = {};
+    struct stat bound = {};
+    struct stat independent = {};
+    ASSERT_EQ(0, stat(join_path(first.env.merged, "file").c_str(), &original));
+    ASSERT_EQ(0, stat(join_path(bind_path, "file").c_str(), &bound));
+    ASSERT_EQ(0, stat(join_path(second.env.merged, "file").c_str(), &independent));
+    EXPECT_EQ(original.st_dev, bound.st_dev);
+    EXPECT_EQ(original.st_ino, bound.st_ino);
+    EXPECT_NE(original.st_dev, independent.st_dev);
+    ASSERT_EQ(0, umount(bind_path.c_str()));
+    ASSERT_EQ(0, rmdir(bind_path.c_str()));
 }
 
 int main(int argc, char** argv) {

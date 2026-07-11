@@ -65,7 +65,10 @@ let
       "^scripts/run_tests\\.sh$"
     ];
 
-    nativeBuildInputs = [ pkgs.autoPatchelfHook ];
+    nativeBuildInputs = [
+      pkgs.autoPatchelfHook
+      pkgs.e2fsprogs
+    ];
 
     buildInputs = [ pkgs.stdenv.cc.cc.lib ];
 
@@ -85,6 +88,7 @@ let
 
       mkdir -p $out/${installDir}
       cp -r bin $out/${installDir}/
+      cp -r build/fixtures $out/${installDir}/
       install -m644 whitelist.txt $out/${installDir}/
       install -m755 scripts/run_tests.sh $out/${installDir}/
 

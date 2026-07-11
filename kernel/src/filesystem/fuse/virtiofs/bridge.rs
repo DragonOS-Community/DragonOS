@@ -66,14 +66,20 @@ struct PendingReq {
 struct InflightReq {
     pending: Option<PendingReq>,
     rsp: Option<DeviceOutputBuffer>,
+    retained_capacity: Option<usize>,
     descriptor_live: bool,
 }
 
 impl InflightReq {
-    fn new(pending: PendingReq, rsp: Option<DeviceOutputBuffer>) -> Self {
+    fn new(
+        pending: PendingReq,
+        rsp: Option<DeviceOutputBuffer>,
+        retained_capacity: Option<usize>,
+    ) -> Self {
         Self {
             pending: Some(pending),
             rsp,
+            retained_capacity,
             descriptor_live: false,
         }
     }
@@ -752,8 +758,8 @@ impl VirtioFsBridgeContext {
         let trace_unique = pending.unique;
         let trace_opcode = pending.opcode;
         let req_len = pending.req.bytes().len();
-        let (mut rsp, fallback) = match pending.req.reply_contract() {
-            FuseReplyContract::NoReply => (None, false),
+        let (mut rsp, retained_capacity, fallback) = match pending.req.reply_contract() {
+            FuseReplyContract::NoReply => (None, None, false),
             FuseReplyContract::Reply { capacity } => {
                 let capacity = match capacity {
                     Some(capacity) => capacity,
@@ -775,6 +781,7 @@ impl VirtioFsBridgeContext {
                 };
                 (
                     Some(rsp),
+                    Some(capacity.retained_bytes),
                     matches!(capacity.source, FuseReplyCapacitySource::ExplicitFallback),
                 )
             }
@@ -887,7 +894,7 @@ impl VirtioFsBridgeContext {
             }
         };
 
-        let mut inflight = InflightReq::new(pending, rsp);
+        let mut inflight = InflightReq::new(pending, rsp, retained_capacity);
         inflight.mark_submitted();
         if let Some(rsp_buf) = inflight.rsp.as_ref() {
             stats::on_virtiofs_response_submitted(trace_opcode, rsp_buf.writable_len(), fallback);
@@ -974,17 +981,22 @@ impl VirtioFsBridgeContext {
         };
 
         let response_capacity = match kind {
-            QueueKind::Hiprio => self
-                .hiprio_inflight
-                .get(&token)
-                .and_then(|req| req.rsp.as_ref())
-                .map(DeviceOutputBuffer::allocation_len),
+            QueueKind::Hiprio => self.hiprio_inflight.get(&token).and_then(|req| {
+                req.rsp.as_ref().map(|rsp| {
+                    rsp.allocation_len()
+                        .max(req.retained_capacity.unwrap_or_default())
+                })
+            }),
             QueueKind::Request(slot) => self
                 .request_inflight
                 .get(slot)
                 .and_then(|map| map.get(&token))
-                .and_then(|req| req.rsp.as_ref())
-                .map(DeviceOutputBuffer::allocation_len),
+                .and_then(|req| {
+                    req.rsp.as_ref().map(|rsp| {
+                        rsp.allocation_len()
+                            .max(req.retained_capacity.unwrap_or_default())
+                    })
+                }),
         };
         let reservation = if let Some(required_capacity) = response_capacity {
             match self.response_pool.reserve(required_capacity) {

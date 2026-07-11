@@ -424,6 +424,21 @@ pub fn on_virtiofs_reply_released(capacity: usize) {
 }
 
 #[inline]
+pub fn on_virtiofs_reply_capacity_reaccounted(old_capacity: usize, new_capacity: usize) {
+    if new_capacity > old_capacity {
+        let delta = (new_capacity - old_capacity) as u64;
+        let bytes =
+            REPLY_RETAINED_CAPACITY_BYTES_CURRENT.fetch_add(delta, Ordering::Relaxed) + delta;
+        update_peak(&REPLY_RETAINED_CAPACITY_BYTES_PEAK, bytes);
+    } else {
+        saturating_sub(
+            &REPLY_RETAINED_CAPACITY_BYTES_CURRENT,
+            (old_capacity - new_capacity) as u64,
+        );
+    }
+}
+
+#[inline]
 pub fn on_virtiofs_reply_credit_blocked() {
     inc(&REPLY_CREDIT_BLOCKED_TOTAL);
 }

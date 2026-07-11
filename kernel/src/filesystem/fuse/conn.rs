@@ -132,6 +132,7 @@ pub(crate) enum FuseReplyCapacitySource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FuseReplyCapacity {
     pub(crate) bytes: usize,
+    pub(crate) retained_bytes: usize,
     pub(crate) source: FuseReplyCapacitySource,
 }
 
@@ -850,8 +851,8 @@ mod tests {
     use system_error::SystemError;
 
     use super::super::protocol::{
-        FuseEntryOut, FuseOpenOut, FuseOutHeader, FUSE_CREATE, FUSE_DESTROY, FUSE_GETATTR,
-        FUSE_LOOKUP, FUSE_STATFS,
+        FuseEntryOut, FuseOpenOut, FuseOutHeader, FuseStatfsOut, FUSE_CREATE, FUSE_DESTROY,
+        FUSE_GETATTR, FUSE_LOOKUP, FUSE_STATFS,
     };
     use super::{daemon, request, stats, FuseConn, FuseReplyCapacitySource};
 
@@ -895,10 +896,14 @@ mod tests {
         let conn = FuseConn::new_for_virtiofs(256 * 1024, 256 * 1024);
         let header = size_of::<FuseOutHeader>();
         set_minor(&conn, 3);
+        let statfs_capacity = request::reply_capacity_for_test(&conn, FUSE_STATFS, &[])
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            capacity(&conn, FUSE_STATFS, &[]).0,
+            statfs_capacity.bytes,
             header + FuseConn::FUSE_COMPAT_STATFS_SIZE
         );
+        assert_eq!(statfs_capacity.retained_bytes, size_of::<FuseStatfsOut>());
         assert_eq!(
             capacity(&conn, FUSE_LOOKUP, &[]).0,
             header + FuseConn::FUSE_COMPAT_ENTRY_OUT_SIZE

@@ -87,6 +87,24 @@ impl RetentionCredits {
         true
     }
 
+    /// Replace the capacity charged to one live reservation without changing its count.
+    pub fn resize(&mut self, old_capacity: usize, new_capacity: usize) -> bool {
+        if self.used.count == 0 || old_capacity == 0 || new_capacity == 0 {
+            return false;
+        }
+        let Some(without_old) = self.used.capacity_bytes.checked_sub(old_capacity) else {
+            return false;
+        };
+        let Some(capacity_bytes) = without_old.checked_add(new_capacity) else {
+            return false;
+        };
+        if capacity_bytes > self.limits.max_capacity_bytes {
+            return false;
+        }
+        self.used.capacity_bytes = capacity_bytes;
+        true
+    }
+
     pub const fn snapshot(&self) -> RetentionSnapshot {
         self.used
     }
@@ -462,5 +480,28 @@ mod tests {
                 capacity_bytes: 0
             }
         );
+    }
+
+    #[test]
+    fn retention_credits_resize_preserves_count_and_enforces_capacity() {
+        let mut credits = RetentionCredits::new(RetentionLimits {
+            max_count: 2,
+            max_capacity_bytes: 96,
+        });
+        assert!(credits.try_reserve(64));
+        assert!(credits.resize(64, 80));
+        assert_eq!(
+            credits.snapshot(),
+            RetentionSnapshot {
+                count: 1,
+                capacity_bytes: 80,
+            }
+        );
+        assert!(!credits.resize(80, 97));
+        assert!(!credits.resize(0, 1));
+        assert!(credits.resize(80, 48));
+        assert_eq!(credits.snapshot().count, 1);
+        assert_eq!(credits.snapshot().capacity_bytes, 48);
+        assert!(credits.release(48));
     }
 }

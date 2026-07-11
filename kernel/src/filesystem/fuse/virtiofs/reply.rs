@@ -216,8 +216,23 @@ pub(crate) struct RetentionReservation {
 }
 
 impl RetentionReservation {
-    pub(crate) fn capacity(&self) -> usize {
-        self.capacity
+    fn reaccount_capacity(&mut self, capacity: usize) -> bool {
+        let old_capacity = self.capacity;
+        if old_capacity == capacity {
+            return true;
+        }
+        let resized = self.inner.lock().credits.resize(old_capacity, capacity);
+        if !resized {
+            return false;
+        }
+        self.capacity = capacity;
+        stats::on_virtiofs_reply_capacity_reaccounted(old_capacity, capacity);
+        if capacity < old_capacity {
+            if let Some(gate) = self.gate.upgrade() {
+                gate.signal();
+            }
+        }
+        true
     }
 }
 
@@ -296,11 +311,11 @@ impl VirtioFsReplyStorage {
     pub(crate) fn into_compat_bytes(self, bytes: Vec<u8>) -> Result<Self, SystemError> {
         match self {
             Self::Device(mut lease) => {
-                let reservation = lease
+                let mut reservation = lease
                     .reservation
                     .take()
                     .expect("device reply owns its retention reservation");
-                if bytes.capacity() > reservation.capacity() {
+                if !reservation.reaccount_capacity(bytes.capacity()) {
                     return Err(SystemError::EIO);
                 }
                 if let Some(mut buf) = lease.buffer.take() {
@@ -351,5 +366,38 @@ impl Drop for DeviceReplyLease {
                 stats::on_virtiofs_response_pool_drop();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+
+    use device_output_buffer::DeviceOutputBuffer;
+
+    use super::{ResponseBufferPool, VirtioFsReplyStorage};
+    use crate::filesystem::fuse::conn::FuseConn;
+
+    fn direct(vaddr: usize) -> Option<usize> {
+        Some(vaddr)
+    }
+
+    #[test]
+    fn compat_expansion_uses_precharged_retention_capacity() {
+        let conn = FuseConn::new_for_virtiofs(256 * 1024, 256 * 1024);
+        let pool = ResponseBufferPool::new(&conn);
+        let reservation = pool.reserve(80).unwrap();
+        let mut buffer = DeviceOutputBuffer::new(64, direct).unwrap();
+        unsafe {
+            buffer.submission_dma_slice(direct).unwrap();
+        }
+        buffer.mark_submitted();
+        unsafe {
+            buffer.complete_after_pop(64).unwrap();
+        }
+        let storage = VirtioFsReplyStorage::from_completed(buffer, reservation, 0..64).unwrap();
+
+        let storage = storage.into_compat_bytes(vec![0; 80]).unwrap();
+        assert_eq!(storage.as_slice().len(), 80);
     }
 }

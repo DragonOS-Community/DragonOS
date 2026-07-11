@@ -171,15 +171,15 @@ impl Drop for Ext4InodeOperation {
             let mut inner = self.lifecycle.inner.lock();
             debug_assert!(inner.active_operations > 0);
             inner.active_operations = inner.active_operations.saturating_sub(1);
-            let remove_owner = if let Some(owner_depth) = inner.operation_owners.get_mut(&self.owner)
-            {
-                debug_assert!(*owner_depth > 0);
-                *owner_depth = owner_depth.saturating_sub(1);
-                *owner_depth == 0
-            } else {
-                debug_assert!(false, "missing ext4 lifecycle operation owner");
-                false
-            };
+            let remove_owner =
+                if let Some(owner_depth) = inner.operation_owners.get_mut(&self.owner) {
+                    debug_assert!(*owner_depth > 0);
+                    *owner_depth = owner_depth.saturating_sub(1);
+                    *owner_depth == 0
+                } else {
+                    debug_assert!(false, "missing ext4 lifecycle operation owner");
+                    false
+                };
             if remove_owner {
                 inner.operation_owners.remove(&self.owner);
             }
@@ -1258,7 +1258,12 @@ impl IndexNode for LockedExt4Inode {
 
             let mut temp_name = String::new();
             let mut whiteout_inode = None;
-            let source_parent = self.0.lock().self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+            let source_parent = self
+                .0
+                .lock()
+                .self_ref
+                .upgrade()
+                .ok_or(SystemError::ENOENT)?;
             for _ in 0..32 {
                 let candidate = format!(".dragonos-whiteout-{}", generate_inode_id().data());
                 if ext4.lookup(src_inode_num, &candidate).is_ok() {
@@ -1276,13 +1281,13 @@ impl IndexNode for LockedExt4Inode {
                     }
                 };
                 let whiteout_num = match ext4.mknod(
-                        src_inode_num,
-                        &candidate,
-                        another_ext4::InodeMode::CHARDEV
-                            | another_ext4::InodeMode::from_bits_retain(0o600),
-                        WHITEOUT_DEV.major().data(),
-                        WHITEOUT_DEV.minor(),
-                    ) {
+                    src_inode_num,
+                    &candidate,
+                    another_ext4::InodeMode::CHARDEV
+                        | another_ext4::InodeMode::from_bits_retain(0o600),
+                    WHITEOUT_DEV.major().data(),
+                    WHITEOUT_DEV.minor(),
+                ) {
                     Ok(inode_num) => inode_num,
                     Err(error) => {
                         if let Some(tombstone) = tombstone.take() {
@@ -1347,20 +1352,15 @@ impl IndexNode for LockedExt4Inode {
             }
             if let Err(err) = ext4.rename(src_inode_num, &temp_name, target_inode_num, new_name) {
                 let rename_error = SystemError::from(err);
-                let rollback = ext4.rename_exchange(
-                    src_inode_num,
-                    old_name,
-                    src_inode_num,
-                    &temp_name,
-                );
+                let rollback =
+                    ext4.rename_exchange(src_inode_num, old_name, src_inode_num, &temp_name);
                 if let Some(tombstone) = tombstone.take() {
                     let _ = ext4_fs.poison_freeing(tombstone, rename_error.clone());
                 }
                 drop(_reuse);
                 if rollback.is_err() {
-                    let whiteout_tombstone = ext4_fs.begin_freeing(
-                        whiteout_inode.as_ref().expect("whiteout was published"),
-                    )?;
+                    let whiteout_tombstone = ext4_fs
+                        .begin_freeing(whiteout_inode.as_ref().expect("whiteout was published"))?;
                     let _ = ext4_fs.poison_freeing(whiteout_tombstone, SystemError::EIO);
                     return Err(SystemError::EIO);
                 }

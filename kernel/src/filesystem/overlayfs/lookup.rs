@@ -39,6 +39,7 @@ pub(super) fn find_locked(
     name: &str,
     state: &super::inode::DirState,
 ) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
+    let child_redirect = inode.child_redirect(name);
     let version = inode.dir_version()?;
     let cached = state.cached_lookup(&version, name);
 
@@ -107,7 +108,8 @@ pub(super) fn find_locked(
     };
 
     if let Some(cached) = cached {
-        if cached.file_type == file_type
+        if cached.redirect == child_redirect
+            && cached.file_type == file_type
             && same_backing_set(&cached, upper_inode.as_ref(), &lower_inodes)?
         {
             return Ok(cached);
@@ -115,12 +117,7 @@ pub(super) fn find_locked(
     }
 
     let fs = inode.overlay_fs()?;
-    let child = fs.intern_inode(
-        inode.child_redirect(name),
-        file_type,
-        upper_inode,
-        lower_inodes,
-    )?;
+    let child = fs.intern_inode(child_redirect, file_type, upper_inode, lower_inodes)?;
 
     state.cache_lookup(name, child.clone());
 

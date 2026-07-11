@@ -2648,6 +2648,10 @@ impl IndexNode for MountFSInode {
 }
 
 impl FileSystem for MountFS {
+    fn supports_reliable_flush(&self) -> bool {
+        self.inner_filesystem.supports_reliable_flush()
+    }
+
     fn support_readahead(&self) -> bool {
         self.inner_filesystem.support_readahead()
     }

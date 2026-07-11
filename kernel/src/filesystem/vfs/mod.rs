@@ -1740,6 +1740,10 @@ impl WritebackControl {
 
 /// @brief 所有文件系统都应该实现的trait
 pub trait FileSystem: Any + Sync + Send + Debug {
+    /// Whether `sync_fs(true)` reaches a power-loss-safe backing barrier.
+    fn supports_reliable_flush(&self) -> bool {
+        false
+    }
     /// @brief 获取当前文件系统的root inode的指针
     fn root_inode(&self) -> Arc<dyn IndexNode>;
 

@@ -850,6 +850,10 @@ impl BlockDevice for MMC {
         Ok(())
     }
 
+    fn supports_reliable_flush(&self) -> bool {
+        false
+    }
+
     fn blk_size_log2(&self) -> u8 {
         9
     }

@@ -1330,7 +1330,17 @@ impl BlockDevice for LoopDevice {
     }
 
     fn sync(&self) -> Result<(), SystemError> {
-        Ok(())
+        let inode = self.inner().file_inode.clone().ok_or(SystemError::ENODEV)?;
+        inode.sync()?;
+        inode.fs().sync_fs(true)
+    }
+
+    fn supports_reliable_flush(&self) -> bool {
+        self.inner()
+            .file_inode
+            .as_ref()
+            .map(|inode| inode.fs().supports_reliable_flush())
+            .unwrap_or(false)
     }
 
     fn blk_size_log2(&self) -> u8 {

@@ -142,7 +142,7 @@ impl Ext4 {
     /// inode table at `index = (inode_id - 1) % sb.inodes_per_group`.
     /// To get the byte address within the inode table, use
     /// `offset = index * sb.inode_size`.
-    fn inode_disk_pos(&self, inode_id: InodeId) -> Result<(PBlockId, usize)> {
+    pub(super) fn inode_disk_pos(&self, inode_id: InodeId) -> Result<(PBlockId, usize)> {
         let super_block = self.read_super_block_cached();
         let inodes_per_group = super_block.inodes_per_group();
 

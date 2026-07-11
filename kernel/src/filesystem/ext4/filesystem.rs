@@ -118,6 +118,10 @@ impl Default for Ext4MountOptions {
 }
 
 impl FileSystem for Ext4FileSystem {
+    fn supports_reliable_flush(&self) -> bool {
+        self.fs.supports_reliable_flush()
+    }
+
     fn root_inode(&self) -> Arc<dyn IndexNode> {
         self.root_inode.clone()
     }
@@ -168,7 +172,7 @@ impl FileSystem for Ext4FileSystem {
             EvictionEpoch::new(self.eviction_queue.lock().next_epoch)
         });
         let flush_result = self.flush_dirty_inodes();
-        if let Some(epoch) = eviction_epoch {
+        let result = if let Some(epoch) = eviction_epoch {
             // Finish the snapshotted asynchronous metadata work even if inode
             // writeback failed, while preserving that earlier error for the
             // caller and the superblock writeback error sequence.
@@ -176,6 +180,17 @@ impl FileSystem for Ext4FileSystem {
             flush_result.and(eviction_result)
         } else {
             flush_result
+        };
+        if wait {
+            result.and_then(|_| self.fs.flush_device().map_err(SystemError::from))
+        } else {
+            result
+        }
+    }
+
+    fn on_umount(&self) {
+        if let Err(error) = self.fs.shutdown_writable() {
+            log::error!("ext4: failed to mark journal clean on unmount: {:?}", error);
         }
     }
 
@@ -611,6 +626,8 @@ impl Ext4FileSystem {
         mount_options: Ext4MountOptions,
     ) -> Result<Arc<dyn FileSystem>, SystemError> {
         let raw_dev = mount_data.device_num();
+        // The JBD2 writer is not activated for production mounts until every
+        // metadata mutation path has been converted to explicit handles.
         let fs = another_ext4::Ext4::load(mount_data.clone())?;
         let root_inode: Arc<LockedExt4Inode> =
             Arc::new_cyclic(|self_ref: &Weak<LockedExt4Inode>| {

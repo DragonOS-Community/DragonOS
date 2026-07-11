@@ -576,6 +576,13 @@ mod tests {
         fn write_block(&self, _block: &Block) -> Result<()> {
             Ok(())
         }
+
+        fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+        fn supports_reliable_flush(&self) -> bool {
+            true
+        }
     }
 
     fn make_test_fs(block_count: u32) -> Ext4 {
@@ -590,6 +597,7 @@ mod tests {
             alloc_lock: spin::Mutex::new(()),
             namespace_lock: spin::Mutex::new(()),
             poisoned: spin::Mutex::new(None),
+            journal: None,
             inode_mutation_locks: (0..crate::ext4::INODE_MUTATION_LOCK_SHARDS)
                 .map(|_| spin::Mutex::new(()))
                 .collect(),

@@ -26,14 +26,14 @@ fn make_ext4() {
 fn open_ext4() -> Ext4 {
     let file = BlockFile::new("ext4.img");
     println!("creating ext4");
-    let mut ext4 = Ext4::load(Arc::new(file)).expect("open ext4 failed");
+    let mut ext4 = Ext4::load_writable(Arc::new(file)).expect("open writable ext4 failed");
     ext4.init().expect("init ext4 failed");
     ext4
 }
 
 fn load_ext4() -> Ext4 {
     let file = BlockFile::new("ext4.img");
-    Ext4::load(Arc::new(file)).expect("open ext4 failed")
+    Ext4::load_writable(Arc::new(file)).expect("open writable ext4 failed")
 }
 
 fn read_u16_le(buf: &[u8], off: usize) -> u16 {

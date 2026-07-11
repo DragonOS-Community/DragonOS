@@ -82,4 +82,15 @@ impl another_ext4::BlockDevice for GenDisk {
             })?;
         Ok(())
     }
+
+    fn flush(&self) -> core::result::Result<(), another_ext4::Ext4Error> {
+        self.sync().map_err(|e| {
+            log::error!("Ext4BlkDevice flush failed: {:?}", e);
+            another_ext4::Ext4Error::new(Self::map_system_error_to_ext4(&e))
+        })
+    }
+
+    fn supports_reliable_flush(&self) -> bool {
+        self.block_device().supports_reliable_flush()
+    }
 }

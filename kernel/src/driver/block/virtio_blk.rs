@@ -707,6 +707,13 @@ impl BlockDevice for VirtIOBlkDevice {
         Ok(())
     }
 
+    fn supports_reliable_flush(&self) -> bool {
+        self.inner()
+            .device_inner
+            .as_ref()
+            .is_some_and(|device| device.supports_flush())
+    }
+
     fn blk_size_log2(&self) -> u8 {
         9
     }

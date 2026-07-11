@@ -37,4 +37,14 @@ impl BlockDevice for BlockFile {
             .map_err(|_| another_ext4::Ext4Error::new(another_ext4::ErrCode::EIO))?;
         Ok(())
     }
+
+    fn flush(&self) -> core::result::Result<(), another_ext4::Ext4Error> {
+        self.0
+            .sync_all()
+            .map_err(|_| another_ext4::Ext4Error::new(another_ext4::ErrCode::EIO))
+    }
+
+    fn supports_reliable_flush(&self) -> bool {
+        true
+    }
 }

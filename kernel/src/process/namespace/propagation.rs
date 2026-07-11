@@ -1420,7 +1420,7 @@ mod tests {
     }
 
     fn new_test_mount(propagation: Arc<MountPropagation>) -> Arc<MountFS> {
-        MountFS::new(
+        let mount = MountFS::new(
             RamFS::new(),
             None,
             None,
@@ -1428,7 +1428,12 @@ mod tests {
             None,
             MountFlags::empty(),
             None,
-        )
+        );
+        // Test fixtures represent mounts that have already been published.
+        // Production constructors intentionally remain in Constructing until
+        // their topology/namespace insertion commits.
+        mount.activate();
+        mount
     }
 
     #[test]

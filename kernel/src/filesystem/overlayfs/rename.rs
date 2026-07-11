@@ -83,7 +83,6 @@ fn move_to_locked(
     source_state: &DirState,
     target_state: &DirState,
 ) -> Result<(), SystemError> {
-
     let source = inode.lookup_overlay_child_locked(old_name, source_state)?;
     let target_had_whiteout = target_ovl.has_whiteout(new_name);
     let target_child = match target_ovl.lookup_overlay_child_locked(new_name, target_state) {

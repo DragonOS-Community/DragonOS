@@ -59,9 +59,7 @@ fn remove(inode: &OvlInode, name: &str, is_dir: bool) -> Result<(), SystemError>
     let upper_dir = inode.upper_inode.lock().clone();
     let result = if let Some(upper_dir) = upper_dir {
         match upper_dir.find(name) {
-            Ok(_) if lower_positive => {
-                inode.replace_upper_with_whiteout_locked(name, is_dir)
-            }
+            Ok(_) if lower_positive => inode.replace_upper_with_whiteout_locked(name, is_dir),
             Ok(_) if is_dir => upper_dir.rmdir(name),
             Ok(_) => upper_dir.unlink(name),
             Err(SystemError::ENOENT) if lower_positive => inode.create_whiteout_locked(name),

@@ -244,13 +244,14 @@ impl OverlayFS {
         Ok(inode)
     }
 
-    pub(super) fn intern_dir_state(
-        &self,
-        inode: &OvlInode,
-    ) -> Result<Arc<DirState>, SystemError> {
+    pub(super) fn intern_dir_state(&self, inode: &OvlInode) -> Result<Arc<DirState>, SystemError> {
         let identity = if inode.lower_inodes.is_empty() {
             DirIdentity::Upper(RealInodeIdentity::from_inode(
-                inode.upper_inode.lock().as_ref().ok_or(SystemError::ENOENT)?,
+                inode
+                    .upper_inode
+                    .lock()
+                    .as_ref()
+                    .ok_or(SystemError::ENOENT)?,
             )?)
         } else {
             DirIdentity::Lower(

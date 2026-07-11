@@ -84,10 +84,7 @@ impl DirState {
         data
     }
 
-    pub(super) fn cached_readdir(
-        &self,
-        version: &[DirVersion],
-    ) -> Option<Arc<Vec<String>>> {
+    pub(super) fn cached_readdir(&self, version: &[DirVersion]) -> Option<Arc<Vec<String>>> {
         let mut data = self.data.lock();
         let data = Self::revalidate(&mut data, version);
         data.readdir_cache

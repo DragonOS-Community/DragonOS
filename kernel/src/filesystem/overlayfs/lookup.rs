@@ -157,10 +157,7 @@ fn same_optional_inode(
     }
 }
 
-fn same_inode(
-    left: &Arc<dyn IndexNode>,
-    right: &Arc<dyn IndexNode>,
-) -> Result<bool, SystemError> {
+fn same_inode(left: &Arc<dyn IndexNode>, right: &Arc<dyn IndexNode>) -> Result<bool, SystemError> {
     if !Arc::ptr_eq(&left.fs(), &right.fs()) {
         return Ok(false);
     }

@@ -244,6 +244,42 @@ impl OverlayFS {
         Ok(inode)
     }
 
+    pub(super) fn cached_lower_dirs(
+        &self,
+        redirect: &str,
+        lowers: &[Arc<dyn IndexNode>],
+    ) -> Result<Vec<Arc<OvlInode>>, SystemError> {
+        let lower_identities = lowers
+            .iter()
+            .map(RealInodeIdentity::from_inode)
+            .collect::<Result<Vec<_>, _>>()?;
+        let cache = self.inode_cache.lock();
+        let mut inodes = cache
+            .entries
+            .iter()
+            .filter_map(|(key, inode)| {
+                let OvlInodeOrigin::Lower { lower, .. } = &key.origin else {
+                    return None;
+                };
+                (key.redirect == redirect && *lower == lower_identities)
+                    .then(|| inode.upgrade())
+                    .flatten()
+            })
+            .filter(|inode| inode.is_dir())
+            .collect::<Vec<_>>();
+        inodes.sort_by_key(Arc::as_ptr);
+        inodes.dedup_by(|left, right| Arc::ptr_eq(left, right));
+        Ok(inodes)
+    }
+
+    pub(super) fn same_backing_inode(
+        &self,
+        left: &Arc<dyn IndexNode>,
+        right: &Arc<dyn IndexNode>,
+    ) -> Result<bool, SystemError> {
+        Self::same_mount_inode(left, right)
+    }
+
     pub(super) fn intern_dir_state(&self, inode: &OvlInode) -> Result<Arc<DirState>, SystemError> {
         let identity = if inode.lower_inodes.is_empty() {
             DirIdentity::Upper(RealInodeIdentity::from_inode(

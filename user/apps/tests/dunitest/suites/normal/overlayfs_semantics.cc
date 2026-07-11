@@ -1058,6 +1058,61 @@ TEST(OverlayFsSemantics, OldLowerFileDescriptorsSwitchToUpperAfterCopyUp) {
     EXPECT_EQ(0, close(old_fd1)) << strerror(errno);
 }
 
+TEST(OverlayFsSemantics, OldLowerDirectoryUsesAncestorCopyUp) {
+    ScopedOverlayEnv scoped("overlayfs_revalidate_old_dir");
+    const auto& env = scoped.env;
+    std::string lower_dir = join_path(env.lower, "dir");
+    std::string lower_file = join_path(lower_dir, "file");
+    std::string merged_dir = join_path(env.merged, "dir");
+    std::string merged_file = join_path(merged_dir, "file");
+    std::string upper_created = join_path(env.upper, "dir/created");
+
+    prepare_overlay_env(env);
+    ASSERT_EQ(0, mkdir(lower_dir.c_str(), 0755)) << strerror(errno);
+    ASSERT_EQ(0, write_text(lower_file, "lower"));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    int old_dir_fd = open(merged_dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    ASSERT_GE(old_dir_fd, 0) << strerror(errno);
+    ASSERT_EQ(0, write_text(merged_file, "upper")) << strerror(errno);
+    ASSERT_EQ(0, mkdirat(old_dir_fd, "created", 0755)) << strerror(errno);
+
+    EXPECT_TRUE(path_exists(upper_created));
+    EXPECT_EQ(0, close(old_dir_fd)) << strerror(errno);
+}
+
+TEST(OverlayFsSemantics, DetachedOldDirectoryIsNotReusedForAncestorCopyUp) {
+    ScopedOverlayEnv scoped("overlayfs_detached_old_dir");
+    const auto& env = scoped.env;
+    std::string lower_dir = join_path(env.lower, "dir");
+    std::string lower_file = join_path(lower_dir, "file");
+    std::string upper_dir = join_path(env.upper, "dir");
+    std::string upper_file = join_path(upper_dir, "file");
+    std::string merged_dir = join_path(env.merged, "dir");
+    std::string merged_file = join_path(merged_dir, "file");
+
+    prepare_overlay_env(env);
+    ASSERT_EQ(0, mkdir(lower_dir.c_str(), 0755)) << strerror(errno);
+    ASSERT_EQ(0, write_text(lower_file, "lower"));
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    int old_dir_fd = open(merged_dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    ASSERT_GE(old_dir_fd, 0) << strerror(errno);
+    ASSERT_EQ(0, write_text(merged_file, "upper")) << strerror(errno);
+    ASSERT_EQ(0, unlink(merged_file.c_str())) << strerror(errno);
+    ASSERT_EQ(0, rmdir(merged_dir.c_str())) << strerror(errno);
+    ASSERT_TRUE(is_whiteout(upper_dir));
+
+    // Simulate an upper-layer namespace change that reveals the lower path
+    // while old_dir_fd still retains the detached directory object.
+    ASSERT_EQ(0, unlink(upper_dir.c_str())) << strerror(errno);
+    ASSERT_EQ(0, write_text(merged_file, "new")) << strerror(errno);
+
+    EXPECT_EQ("new", read_text(merged_file));
+    EXPECT_EQ("new", read_text(upper_file));
+    EXPECT_EQ(0, close(old_dir_fd)) << strerror(errno);
+}
+
 TEST(OverlayFsSemantics, OldLowerFileDescriptorDoesNotFollowSameNameReplacement) {
     ScopedOverlayEnv scoped("overlayfs_revalidate_identity");
     const auto& env = scoped.env;

@@ -500,33 +500,48 @@ struct WorkerArg {
     uint64_t bytes;
     uint64_t ops;
     bool started;
+    bool read_only;
 };
 
 void* worker_main(void* raw) {
     WorkerArg* arg = static_cast<WorkerArg*>(raw);
     std::vector<char> buf(arg->opt.block_size, static_cast<char>('A' + (arg->id % 26)));
-    std::string p = path_join(arg->root, "worker_" + std::to_string(arg->id) + ".dat");
-    int fd = open(p.c_str(), O_CREAT | O_TRUNC | O_RDWR, 0644);
+    std::string p = arg->read_only
+                        ? path_join(arg->root, "concurrent_read.dat")
+                        : path_join(arg->root, "worker_" + std::to_string(arg->id) + ".dat");
+    int fd = open(p.c_str(), arg->read_only ? O_RDONLY : (O_CREAT | O_TRUNC | O_RDWR), 0644);
     if (fd < 0) {
         arg->err = errno;
         return nullptr;
     }
     for (size_t i = 0; i < arg->opt.iterations; ++i) {
-        if (!write_full(fd, buf.data(), buf.size())) {
-            arg->err = errno_or_eio();
-            break;
+        if (arg->read_only) {
+            size_t span = arg->opt.file_size > buf.size() ? arg->opt.file_size - buf.size() : 0;
+            off_t off = span == 0 ? 0 : static_cast<off_t>((i * buf.size()) % span);
+            ssize_t n = pread(fd, buf.data(), buf.size(), off);
+            if (n < 0) {
+                arg->err = errno;
+                break;
+            }
+            arg->bytes += static_cast<uint64_t>(n);
+        } else {
+            if (!write_full(fd, buf.data(), buf.size())) {
+                arg->err = errno_or_eio();
+                break;
+            }
+            arg->bytes += buf.size();
         }
-        arg->bytes += buf.size();
         ++arg->ops;
     }
-    if (arg->err == 0) {
+    if (!arg->read_only && arg->err == 0) {
         fsync_preserve_error(fd, &arg->err);
     }
     close_preserve_error(fd, &arg->err);
     return nullptr;
 }
 
-int concurrent_workload(const Options& opt, const std::string& root) {
+static int run_concurrent_phase(const Options& opt, const std::string& root, bool read_only,
+                                const char* label) {
     std::vector<pthread_t> threads(opt.workers);
     std::vector<WorkerArg> args(opt.workers);
     uint64_t start = now_us();
@@ -538,6 +553,7 @@ int concurrent_workload(const Options& opt, const std::string& root) {
         args[i].bytes = 0;
         args[i].ops = 0;
         args[i].started = false;
+        args[i].read_only = read_only;
         int rc = pthread_create(&threads[i], nullptr, worker_main, &args[i]);
         if (rc != 0) {
             args[i].err = rc;
@@ -562,8 +578,29 @@ int concurrent_workload(const Options& opt, const std::string& root) {
             err = args[i].err;
         }
     }
-    emit_result("concurrent_write", opt, now_us() - start, bytes, ops, err);
+    emit_result(label, opt, now_us() - start, bytes, ops, err);
     return err == 0 ? 0 : -1;
+}
+
+int concurrent_workload(const Options& opt, const std::string& root) {
+    int rc = run_concurrent_phase(opt, root, false, "concurrent_write");
+    std::string path = path_join(root, "concurrent_read.dat");
+    std::vector<char> block(opt.block_size, 'R');
+    int fd = open(path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (fd < 0)
+        return -1;
+    for (size_t done = 0; done < opt.file_size;) {
+        size_t len = std::min(block.size(), opt.file_size - done);
+        if (!write_full(fd, block.data(), len)) {
+            close(fd);
+            return -1;
+        }
+        done += len;
+    }
+    fsync(fd);
+    close(fd);
+    rc |= run_concurrent_phase(opt, root, true, "concurrent_read");
+    return rc;
 }
 
 void usage(const char* argv0) {

@@ -6,6 +6,7 @@ use system_error::SystemError;
 use crate::{
     filesystem::vfs::file::FileFlags,
     libs::{errseq::ErrSeqValue, mutex::Mutex, wait_queue::WaitQueue},
+    mm::readahead::FileReadaheadState,
 };
 
 use super::{
@@ -37,6 +38,9 @@ pub struct FuseOpenPrivateData {
     pub no_open: bool,
     pub open_context: FuseOpenContext,
     pub writeback_handle: Option<Arc<FuseWritebackHandle>>,
+    /// Per-open-file-description state. Cloning private data (dup/snapshots)
+    /// keeps one shared sequential-read history.
+    pub readahead_state: Arc<Mutex<FileReadaheadState>>,
 }
 
 #[derive(Debug, Clone)]

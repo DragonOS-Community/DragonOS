@@ -1,4 +1,9 @@
-use alloc::{collections::BTreeMap, collections::VecDeque, sync::Arc, vec::Vec};
+use alloc::{
+    collections::BTreeMap,
+    collections::VecDeque,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use core::{
     mem::size_of,
     sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
@@ -200,11 +205,163 @@ pub struct FusePendingState {
     opcode: u32,
     response: Mutex<PendingCompletion>,
     wait: WaitQueue,
+    background_credit: Mutex<Option<FuseBackgroundCredit>>,
+    read_completion: Option<FuseReadCompletion>,
+}
+
+#[derive(Debug)]
+struct FuseReadCompletion {
+    target: Arc<PageCacheReadDmaReservation>,
+    node: Weak<super::inode::FuseNode>,
+    start_page: usize,
+    requested: usize,
+    observed_size: usize,
+    observed_attr_version: u64,
+}
+
+impl FuseReadCompletion {
+    fn finish(&self, result: &Result<FusePendingResult, SystemError>) -> Result<(), SystemError> {
+        let node = self.node.upgrade();
+        if let Some(node) = &node {
+            let start = self.start_page.saturating_mul(MMArch::PAGE_SIZE);
+            if node.attr_version() != self.observed_attr_version
+                && node
+                    .cached_metadata_snapshot()
+                    .is_some_and(|metadata| metadata.size.max(0) as usize <= start)
+            {
+                let _ = self.target.rollback(SystemError::EIO);
+                return Ok(());
+            }
+        }
+        let bytes = match result {
+            Ok(FusePendingResult::Reply(reply)) => {
+                if reply.len() > self.requested {
+                    self.target.rollback(SystemError::EIO)?;
+                    return Err(SystemError::EIO);
+                }
+                let bytes = reply.len();
+                self.target.publish_contiguous(reply)?;
+                bytes
+            }
+            Ok(FusePendingResult::ReadPagesDirect { bytes }) => {
+                if *bytes > self.requested {
+                    self.target.rollback(SystemError::EIO)?;
+                    return Err(SystemError::EIO);
+                }
+                self.target.publish_completed(*bytes)?;
+                *bytes
+            }
+            Err(error) => {
+                let _ = self.target.rollback(error.clone());
+                return Ok(());
+            }
+        };
+        if bytes < self.requested {
+            stats::on_readahead_short_read();
+            if let Some(node) = node {
+                let (eof, _) = node.note_short_read_eof(
+                    self.start_page,
+                    bytes,
+                    self.observed_size,
+                    self.observed_attr_version,
+                )?;
+                node.discard_completed_pages_beyond(&self.target, eof);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct FuseBackgroundInner {
+    connected: bool,
+    max: usize,
+    congestion: usize,
+    inflight: usize,
+}
+
+#[derive(Debug)]
+struct FuseBackgroundState {
+    inner: Mutex<FuseBackgroundInner>,
+    wait: WaitQueue,
+}
+
+#[derive(Debug)]
+struct FuseBackgroundCredit {
+    state: Arc<FuseBackgroundState>,
+}
+
+impl Drop for FuseBackgroundCredit {
+    fn drop(&mut self) {
+        let mut inner = self.state.inner.lock();
+        inner.inflight = inner.inflight.saturating_sub(1);
+        drop(inner);
+        stats::on_background_released();
+        self.state.wait.wakeup(None);
+    }
+}
+
+impl FuseBackgroundState {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(FuseBackgroundInner {
+                connected: true,
+                max: FuseConn::DEFAULT_MAX_BACKGROUND,
+                congestion: FuseConn::DEFAULT_CONGESTION_THRESHOLD,
+                inflight: 0,
+            }),
+            wait: WaitQueue::default(),
+        })
+    }
+
+    fn configure(&self, max: usize, congestion: usize) {
+        let mut inner = self.inner.lock();
+        inner.max = core::cmp::max(1, max);
+        inner.congestion = core::cmp::min(core::cmp::max(1, congestion), inner.max);
+        drop(inner);
+        self.wait.wakeup(None);
+    }
+
+    fn disconnect(&self) {
+        self.inner.lock().connected = false;
+        self.wait.wakeup(None);
+    }
+
+    fn acquire(
+        self: &Arc<Self>,
+        speculative: bool,
+    ) -> Result<Option<FuseBackgroundCredit>, SystemError> {
+        wait_with_recheck(&self.wait, || {
+            let mut inner = self.inner.lock();
+            if !inner.connected {
+                return Err(SystemError::ENOTCONN);
+            }
+            let limit = if speculative {
+                inner.congestion
+            } else {
+                inner.max
+            };
+            if inner.inflight < limit {
+                inner.inflight += 1;
+                stats::on_background_acquired();
+                return Ok(Some(Some(FuseBackgroundCredit {
+                    state: self.clone(),
+                })));
+            }
+            if speculative {
+                stats::on_background_pressure(true);
+                return Ok(Some(None));
+            }
+            stats::on_background_pressure(false);
+            Ok(None)
+        })
+    }
 }
 
 #[derive(Debug)]
 enum PendingCompletion {
     Waiting,
+    Completing,
     Ready(Result<FusePendingResult, SystemError>),
     Consumed,
 }
@@ -215,13 +372,29 @@ pub(crate) enum FusePendingResult {
     ReadPagesDirect { bytes: usize },
 }
 
+enum FuseReadWaitOutcome {
+    Complete(Result<FuseReadPagesReply, SystemError>),
+    Interrupted,
+}
+
 impl FusePendingState {
     pub fn new(unique: u64, opcode: u32) -> Self {
+        Self::new_with_credit(unique, opcode, None, None)
+    }
+
+    fn new_with_credit(
+        unique: u64,
+        opcode: u32,
+        background_credit: Option<FuseBackgroundCredit>,
+        read_completion: Option<FuseReadCompletion>,
+    ) -> Self {
         Self {
             unique,
             opcode,
             response: Mutex::new(PendingCompletion::Waiting),
             wait: WaitQueue::default(),
+            background_credit: Mutex::new(background_credit),
+            read_completion,
         }
     }
 
@@ -240,14 +413,26 @@ impl FusePendingState {
         self.complete_result(Ok(FusePendingResult::ReadPagesDirect { bytes }))
     }
 
-    fn complete_result(&self, v: Result<FusePendingResult, SystemError>) -> bool {
+    fn complete_result(&self, mut v: Result<FusePendingResult, SystemError>) -> bool {
         let mut guard = self.response.lock();
         if !matches!(*guard, PendingCompletion::Waiting) {
             // Duplicate replies are ignored (Linux does similarly).
             return false;
         }
+        *guard = PendingCompletion::Completing;
+        drop(guard);
+        if let Some(completion) = &self.read_completion {
+            if let Err(error) = completion.finish(&v) {
+                v = Err(error);
+            }
+        }
+        let mut guard = self.response.lock();
         *guard = PendingCompletion::Ready(v);
         drop(guard);
+        // Linux releases a background slot at request completion, not when a
+        // waiter later consumes the result.  Taking the token makes this
+        // exactly-once across replies, abort and teardown.
+        self.background_credit.lock().take();
         self.wait.wakeup(None);
         true
     }
@@ -261,11 +446,47 @@ impl FusePendingState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn wait_read_pages_complete(&self) -> Result<FuseReadPagesReply, SystemError> {
         match self.wait_result()? {
             FusePendingResult::Reply(reply) => Ok(FuseReadPagesReply::Contiguous(reply)),
             FusePendingResult::ReadPagesDirect { bytes } => {
                 Ok(FuseReadPagesReply::Direct { bytes })
+            }
+        }
+    }
+
+    fn wait_read_pages_once(&self) -> FuseReadWaitOutcome {
+        let take_ready = || {
+            let mut guard = self.response.lock();
+            if matches!(*guard, PendingCompletion::Ready(_)) {
+                let ready = core::mem::replace(&mut *guard, PendingCompletion::Consumed);
+                if let PendingCompletion::Ready(result) = ready {
+                    return Some(result.map(|result| match result {
+                        FusePendingResult::Reply(reply) => FuseReadPagesReply::Contiguous(reply),
+                        FusePendingResult::ReadPagesDirect { bytes } => {
+                            FuseReadPagesReply::Direct { bytes }
+                        }
+                    }));
+                }
+            }
+            None
+        };
+        if let Some(result) = take_ready() {
+            return FuseReadWaitOutcome::Complete(result);
+        }
+        loop {
+            let (waiter, waker) = Waiter::new_pair();
+            if let Err(error) = self.wait.register_waker(waker.clone()) {
+                return FuseReadWaitOutcome::Complete(Err(error));
+            }
+            if let Some(result) = take_ready() {
+                self.wait.remove_waker(&waker);
+                return FuseReadWaitOutcome::Complete(result);
+            }
+            if waiter.wait(true).is_err() {
+                self.wait.remove_waker(&waker);
+                return FuseReadWaitOutcome::Interrupted;
             }
         }
     }
@@ -352,6 +573,7 @@ pub struct FuseConn {
     epitems: LockedEPItemLinkedList,
     backend_reply_limit: Option<usize>,
     reply_layout_minor: AtomicU32,
+    background: Arc<FuseBackgroundState>,
 }
 
 impl FuseConn {
@@ -362,6 +584,8 @@ impl FuseConn {
     const DEFAULT_MAX_PAGES: usize = 32;
     const MAX_MAX_PAGES: usize = 256;
     const DEFAULT_MAX_READAHEAD: usize = 128 * MMArch::PAGE_SIZE;
+    const DEFAULT_MAX_BACKGROUND: usize = 12;
+    const DEFAULT_CONGESTION_THRESHOLD: usize = 9;
     const XATTR_SIZE_MAX: usize = 64 * 1024;
     const FUSE_COMPAT_ENTRY_OUT_SIZE: usize = 120;
     const FUSE_COMPAT_ATTR_OUT_SIZE: usize = 96;
@@ -433,6 +657,7 @@ impl FuseConn {
             epitems: LockedEPItemLinkedList::default(),
             backend_reply_limit,
             reply_layout_minor: AtomicU32::new(0),
+            background: FuseBackgroundState::new(),
         })
     }
 
@@ -680,6 +905,7 @@ impl FuseConn {
     }
 
     pub fn abort(&self) {
+        self.background.disconnect();
         let (processing, pending_noreply_count): (Vec<Arc<FusePendingState>>, usize) = {
             let mut g = self.inner.lock();
             g.connected = false;
@@ -714,6 +940,7 @@ impl FuseConn {
     /// Keep the connection readable for daemon-side teardown; actual disconnect
     /// happens when /dev/fuse is closed or explicit abort path is triggered.
     pub fn on_umount(&self) {
+        self.background.disconnect();
         let processing: Vec<Arc<FusePendingState>>;
         let dropped_processing: Vec<Arc<FusePendingState>>;
         let should_destroy: bool;
@@ -881,6 +1108,19 @@ impl FuseConn {
             g.init.max_readahead as usize
         };
         core::cmp::max(1, bytes >> MMArch::PAGE_SHIFT)
+    }
+
+    fn acquire_background_credit(
+        &self,
+        speculative: bool,
+    ) -> Result<Option<FuseBackgroundCredit>, SystemError> {
+        {
+            let inner = self.inner.lock();
+            if !inner.connected || inner.teardown_started {
+                return Err(SystemError::ENOTCONN);
+            }
+        }
+        self.background.acquire(speculative)
     }
 }
 

@@ -50,6 +50,7 @@ pub struct FuseNode {
     lookup_cache: Mutex<BTreeMap<String, FuseLookupCacheEntry>>,
     direct_io_lock: Mutex<()>,
     cached_metadata_deadline_ns: AtomicU64,
+    attr_version: AtomicU64,
     lookup_count: AtomicU64,
     /// 最近一次 LOOKUP 回复中的 fuse_attr.flags（用于 announce-submounts）。
     lookup_attr_flags: AtomicU32,
@@ -95,6 +96,7 @@ impl FuseNode {
             lookup_cache: Mutex::new(BTreeMap::new()),
             direct_io_lock: Mutex::new(()),
             cached_metadata_deadline_ns: AtomicU64::new(if has_cached { u64::MAX } else { 0 }),
+            attr_version: AtomicU64::new(1),
             lookup_count: AtomicU64::new(0),
             lookup_attr_flags: AtomicU32::new(0),
             generation: AtomicU64::new(0),
@@ -180,15 +182,29 @@ impl FuseNode {
     }
 
     pub fn set_cached_metadata(&self, md: Metadata) {
-        *self.cached_metadata.lock() = Some(md);
+        let mut metadata = self.cached_metadata.lock();
+        *metadata = Some(md);
+        self.attr_version.fetch_add(1, Ordering::AcqRel);
+        drop(metadata);
         self.cached_metadata_deadline_ns
             .store(u64::MAX, Ordering::Relaxed);
     }
 
     pub fn set_cached_metadata_with_valid(&self, md: Metadata, valid: u64, valid_nsec: u32) {
-        *self.cached_metadata.lock() = Some(md);
+        let mut metadata = self.cached_metadata.lock();
+        *metadata = Some(md);
+        self.attr_version.fetch_add(1, Ordering::AcqRel);
+        drop(metadata);
         self.cached_metadata_deadline_ns
             .store(Self::cache_deadline(valid, valid_nsec), Ordering::Relaxed);
+    }
+
+    pub(crate) fn attr_version(&self) -> u64 {
+        self.attr_version.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn bump_attr_version(&self) {
+        self.attr_version.fetch_add(1, Ordering::AcqRel);
     }
 
     /// 累计该 inode 在 userspace daemon 侧持有的 LOOKUP 引用。

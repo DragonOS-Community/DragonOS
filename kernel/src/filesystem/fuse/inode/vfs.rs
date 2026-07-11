@@ -357,7 +357,14 @@ impl IndexNode for FuseNode {
             return self.read_direct_with_open(offset, len, buf, fh, file_flags, lock_owner);
         }
 
-        self.read_cached_with_open(offset, len, buf, fh, file_flags)
+        self.read_cached_with_open(
+            offset,
+            len,
+            buf,
+            fh,
+            file_flags,
+            &private_data.readahead_state,
+        )
     }
 
     fn write_at(
@@ -655,11 +662,14 @@ impl IndexNode for FuseNode {
             .request(FUSE_FALLOCATE, self.nodeid, fuse_pack_struct(&in_arg))
         {
             Ok(_) => {
-                if let Some(md) = self.cached_metadata.lock().as_mut() {
+                let mut metadata = self.cached_metadata.lock();
+                if let Some(md) = metadata.as_mut() {
                     if new_size > md.size.max(0) as usize {
                         md.size = new_size as i64;
+                        self.bump_attr_version();
                     }
                 }
+                drop(metadata);
                 self.cached_metadata_deadline_ns.store(0, Ordering::Relaxed);
                 Ok(())
             }

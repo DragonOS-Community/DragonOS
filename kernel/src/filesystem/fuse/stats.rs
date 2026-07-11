@@ -32,6 +32,15 @@ pub struct FuseStatsSnapshot {
     pub dev_fuse_input_copy_bytes_total: u64,
     pub virtiofs_compat_copy_count_total: u64,
     pub virtiofs_compat_copy_bytes_total: u64,
+    pub readahead_batches_total: u64,
+    pub readahead_requests_total: u64,
+    pub readahead_window_pages_total: u64,
+    pub readahead_window_pages_peak: u64,
+    pub readahead_short_reads_total: u64,
+    pub background_inflight_current: u64,
+    pub background_inflight_peak: u64,
+    pub background_max_blocked_total: u64,
+    pub background_congestion_skipped_total: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -177,6 +186,43 @@ static DEV_FUSE_INPUT_COPY_COUNT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static DEV_FUSE_INPUT_COPY_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static VIRTIOFS_COMPAT_COPY_COUNT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static VIRTIOFS_COMPAT_COPY_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static READAHEAD_BATCHES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static READAHEAD_REQUESTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static READAHEAD_WINDOW_PAGES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static READAHEAD_WINDOW_PAGES_PEAK: AtomicU64 = AtomicU64::new(0);
+static READAHEAD_SHORT_READS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BACKGROUND_INFLIGHT_CURRENT: AtomicU64 = AtomicU64::new(0);
+static BACKGROUND_INFLIGHT_PEAK: AtomicU64 = AtomicU64::new(0);
+static BACKGROUND_MAX_BLOCKED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BACKGROUND_CONGESTION_SKIPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+pub fn on_readahead_batch(window_pages: usize, requests: usize) {
+    inc(&READAHEAD_BATCHES_TOTAL);
+    add(&READAHEAD_REQUESTS_TOTAL, requests as u64);
+    add(&READAHEAD_WINDOW_PAGES_TOTAL, window_pages as u64);
+    update_peak(&READAHEAD_WINDOW_PAGES_PEAK, window_pages as u64);
+}
+
+pub fn on_readahead_short_read() {
+    inc(&READAHEAD_SHORT_READS_TOTAL);
+}
+
+pub fn on_background_acquired() {
+    let current = BACKGROUND_INFLIGHT_CURRENT.fetch_add(1, Ordering::Relaxed) + 1;
+    update_peak(&BACKGROUND_INFLIGHT_PEAK, current);
+}
+
+pub fn on_background_released() {
+    saturating_sub(&BACKGROUND_INFLIGHT_CURRENT, 1);
+}
+
+pub fn on_background_pressure(speculative: bool) {
+    if speculative {
+        inc(&BACKGROUND_CONGESTION_SKIPPED_TOTAL);
+    } else {
+        inc(&BACKGROUND_MAX_BLOCKED_TOTAL);
+    }
+}
 
 static DEVICE_QUEUE_DEPTH_MAX: AtomicU64 = AtomicU64::new(0);
 static HIPRIO_VRING_SIZE_CONFIGURED: AtomicU64 = AtomicU64::new(0);
@@ -813,6 +859,16 @@ pub fn fuse_snapshot() -> FuseStatsSnapshot {
         dev_fuse_input_copy_bytes_total: DEV_FUSE_INPUT_COPY_BYTES_TOTAL.load(Ordering::Relaxed),
         virtiofs_compat_copy_count_total: VIRTIOFS_COMPAT_COPY_COUNT_TOTAL.load(Ordering::Relaxed),
         virtiofs_compat_copy_bytes_total: VIRTIOFS_COMPAT_COPY_BYTES_TOTAL.load(Ordering::Relaxed),
+        readahead_batches_total: READAHEAD_BATCHES_TOTAL.load(Ordering::Relaxed),
+        readahead_requests_total: READAHEAD_REQUESTS_TOTAL.load(Ordering::Relaxed),
+        readahead_window_pages_total: READAHEAD_WINDOW_PAGES_TOTAL.load(Ordering::Relaxed),
+        readahead_window_pages_peak: READAHEAD_WINDOW_PAGES_PEAK.load(Ordering::Relaxed),
+        readahead_short_reads_total: READAHEAD_SHORT_READS_TOTAL.load(Ordering::Relaxed),
+        background_inflight_current: BACKGROUND_INFLIGHT_CURRENT.load(Ordering::Relaxed),
+        background_inflight_peak: BACKGROUND_INFLIGHT_PEAK.load(Ordering::Relaxed),
+        background_max_blocked_total: BACKGROUND_MAX_BLOCKED_TOTAL.load(Ordering::Relaxed),
+        background_congestion_skipped_total: BACKGROUND_CONGESTION_SKIPPED_TOTAL
+            .load(Ordering::Relaxed),
     }
 }
 
@@ -920,6 +976,15 @@ dev_fuse_input_copy_count_total {}\n\
 dev_fuse_input_copy_bytes_total {}\n\
 virtiofs_compat_copy_count_total {}\n\
 virtiofs_compat_copy_bytes_total {}\n\
+readahead_batches_total {}\n\
+readahead_requests_total {}\n\
+readahead_window_pages_total {}\n\
+readahead_window_pages_peak {}\n\
+readahead_short_reads_total {}\n\
+background_inflight_current {}\n\
+background_inflight_peak {}\n\
+background_max_blocked_total {}\n\
+background_congestion_skipped_total {}\n\
 \n\
 [virtiofs]\n\
 device_queue_depth_max {}\n\
@@ -1011,6 +1076,15 @@ request_queue_full_total {}\n",
         fuse.dev_fuse_input_copy_bytes_total,
         fuse.virtiofs_compat_copy_count_total,
         fuse.virtiofs_compat_copy_bytes_total,
+        fuse.readahead_batches_total,
+        fuse.readahead_requests_total,
+        fuse.readahead_window_pages_total,
+        fuse.readahead_window_pages_peak,
+        fuse.readahead_short_reads_total,
+        fuse.background_inflight_current,
+        fuse.background_inflight_peak,
+        fuse.background_max_blocked_total,
+        fuse.background_congestion_skipped_total,
         virtiofs.device_queue_depth_max,
         virtiofs.hiprio_vring_size_configured,
         virtiofs.request_queue_count_configured,

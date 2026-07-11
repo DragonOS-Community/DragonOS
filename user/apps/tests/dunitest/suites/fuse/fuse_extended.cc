@@ -3225,6 +3225,68 @@ fail:
     return -1;
 }
 
+static int ext_test_cached_read_pipelines_requests() {
+    const char *mp = "/tmp/test_fuse_read_pipeline";
+    const size_t data_size = 64 * 1024;
+    char *buf = NULL;
+    int n = -1;
+    int ok = 0;
+    if (ensure_dir(mp) != 0)
+        return -1;
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        rmdir(mp);
+        return -1;
+    }
+    volatile int stop = 0, init_done = 0, saw_pipeline = 0;
+    volatile uint32_t read_count = 0;
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.stop_on_destroy = 1;
+    args.hello_generated_size_override = data_size;
+    args.read_count = &read_count;
+    args.defer_first_read_reply = 2;
+    args.saw_pipelined_read = &saw_pipeline;
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0)
+        goto fail_no_thread;
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0,max_read=4096", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0 || fuseg_wait_init(&init_done) != 0)
+        goto fail;
+    char path[256];
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    buf = (char *)malloc(data_size);
+    if (!buf)
+        goto fail;
+    n = fuseg_read_file(path, buf, 4096);
+    ok = n == 4096 && saw_pipeline && read_count >= 2;
+    for (size_t i = 0; ok && i < 4096; ++i)
+        ok = buf[i] == (char)('A' + (i % 26));
+    free(buf);
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return ok ? 0 : -1;
+fail:
+    free(buf);
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+fail_no_thread:
+    close(fd);
+    rmdir(mp);
+    return -1;
+}
+
 static int ext_test_cached_read_uses_open_fh_without_extra_open() {
     const char *mp = "/tmp/test_fuse_cached_read_fh";
     char path[256];
@@ -3416,9 +3478,11 @@ static int ext_test_cached_short_read_updates_eof() {
         goto fail;
     }
 
-    if (read_count != 1 || read_offsets[0] != 0 || read_sizes[0] != 4096) {
-        printf("[FAIL] short read trace count=%u off0=%llu size0=%u\n", read_count,
-               (unsigned long long)read_offsets[0], read_sizes[0]);
+    if (read_count < 2 || read_offsets[0] != 0 || read_sizes[0] != 4096 ||
+        read_offsets[1] != 4096 || read_sizes[1] != 4096) {
+        printf("[FAIL] short read trace count=%u off0=%llu size0=%u off1=%llu size1=%u\n",
+               read_count, (unsigned long long)read_offsets[0], read_sizes[0],
+               (unsigned long long)read_offsets[1], read_sizes[1]);
         goto fail;
     }
 
@@ -7745,6 +7809,10 @@ TEST(FuseExtended, PermissionModelAllowOtherDefaultPermissions) {
 
 TEST(FuseExtended, DevCloneAttachAndServe) {
     ASSERT_EQ(0, ext_test_clone());
+}
+
+TEST(FuseExtended, CachedReadPipelinesRequests) {
+    ASSERT_EQ(0, ext_test_cached_read_pipelines_requests());
 }
 
 int main(int argc, char **argv) {

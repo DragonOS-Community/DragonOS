@@ -9,7 +9,7 @@ mod uapi;
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use system_error::SystemError;
 
 use crate::driver::net::Iface;
@@ -79,6 +79,7 @@ pub struct PacketSocket {
     pub(super) stats_packets: AtomicU32,
     pub(super) stats_drops: AtomicU32,
     pub(super) nonblock: AtomicBool,
+    pub(super) recv_timeout_us: AtomicU64,
     pub(super) wait_queue: WaitQueue,
     inode_id: InodeId,
     open_files: AtomicUsize,
@@ -114,6 +115,7 @@ impl PacketSocket {
             stats_packets: AtomicU32::new(0),
             stats_drops: AtomicU32::new(0),
             nonblock: AtomicBool::new(nonblock),
+            recv_timeout_us: AtomicU64::new(u64::MAX),
             wait_queue: WaitQueue::default(),
             inode_id: generate_inode_id(),
             open_files: AtomicUsize::new(0),
@@ -127,6 +129,15 @@ impl PacketSocket {
     }
     pub fn is_nonblock(&self) -> bool {
         self.nonblock.load(Ordering::Relaxed)
+    }
+    /// Returns the configured receive timeout, or None for infinite wait.
+    pub(super) fn recv_timeout(&self) -> Option<crate::time::Duration> {
+        let us = self.recv_timeout_us.load(Ordering::Relaxed);
+        if us == u64::MAX {
+            None
+        } else {
+            Some(crate::time::Duration::from_micros(us))
+        }
     }
     pub fn netns(&self) -> Arc<NetNamespace> {
         self.netns.clone()

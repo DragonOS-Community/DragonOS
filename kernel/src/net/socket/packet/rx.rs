@@ -151,7 +151,10 @@ impl PacketSocket {
         loop {
             match self.dequeue(peek) {
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                    wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?
+                    self.wait_queue.wait_event_interruptible_timeout(
+                        || self.can_recv(),
+                        self.recv_timeout(),
+                    )?;
                 }
                 r => return r,
             }

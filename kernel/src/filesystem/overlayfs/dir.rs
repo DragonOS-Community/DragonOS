@@ -1,4 +1,4 @@
-use super::inode::OvlInode;
+use super::inode::{DirState, OvlInode};
 use super::whiteout::WHITEOUT_DEV;
 use crate::driver::base::device::device_number::DeviceNumber;
 use crate::filesystem::vfs::{self, FileType, IndexNode};
@@ -48,12 +48,18 @@ fn remove(inode: &OvlInode, name: &str, is_dir: bool) -> Result<(), SystemError>
         return Err(SystemError::EISDIR);
     }
 
+    // Serialize the emptiness check and namespace commit with mutations made
+    // through an already-resolved fd for the child directory.  The parent
+    // lock alone cannot exclude create/unlink operations inside that child.
+    let child_state = is_dir.then(|| child.dir_state()).transpose()?;
+    let _child_mutation_guard = child_state.as_ref().map(|state| state.mutation_lock.lock());
+
     let lower_positive = inode.lower_positive(name);
-    if is_dir && (lower_positive || child.has_lower()) {
-        let child_inode: Arc<dyn IndexNode> = child.clone();
-        if !is_dir_empty(&child_inode)? {
-            return Err(SystemError::ENOTEMPTY);
-        }
+    if is_dir
+        && (lower_positive || child.has_lower())
+        && !is_dir_empty_locked(&child, child_state.as_ref().ok_or(SystemError::EIO)?)?
+    {
+        return Err(SystemError::ENOTEMPTY);
     }
 
     let upper_dir = inode.upper_inode.lock().clone();
@@ -161,8 +167,10 @@ pub(super) fn mknod(
     result
 }
 
-pub(super) fn is_dir_empty(inode: &Arc<dyn IndexNode>) -> Result<bool, SystemError> {
-    Ok(inode.list()?.iter().all(|entry| is_dot_entry(entry)))
+pub(super) fn is_dir_empty_locked(inode: &OvlInode, state: &DirState) -> Result<bool, SystemError> {
+    Ok(super::readdir::list_locked(inode, state)?
+        .iter()
+        .all(|entry| is_dot_entry(entry)))
 }
 
 fn create_over_whiteout<F>(

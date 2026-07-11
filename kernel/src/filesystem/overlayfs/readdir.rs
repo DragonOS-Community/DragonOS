@@ -1,4 +1,4 @@
-use super::inode::OvlInode;
+use super::inode::{DirState, OvlInode};
 use crate::filesystem::vfs::IndexNode;
 use alloc::collections::BTreeSet;
 use alloc::string::String;
@@ -9,6 +9,10 @@ use system_error::SystemError;
 pub(super) fn list(inode: &OvlInode) -> Result<Vec<String>, SystemError> {
     let state = inode.dir_state()?;
     let _guard = state.mutation_lock.lock();
+    list_locked(inode, &state)
+}
+
+pub(super) fn list_locked(inode: &OvlInode, state: &DirState) -> Result<Vec<String>, SystemError> {
     loop {
         let version = inode.dir_version()?;
         if let Some(entries) = state.cached_readdir(&version) {

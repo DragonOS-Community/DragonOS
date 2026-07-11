@@ -116,7 +116,7 @@ fn move_to_locked(
         return Err(SystemError::EXDEV);
     }
 
-    if let Some(target_child) = target_child {
+    let target_child_state = if let Some(target_child) = target_child.as_ref() {
         if source.is_dir() && !target_child.is_dir() {
             return Err(SystemError::ENOTDIR);
         }
@@ -124,10 +124,21 @@ fn move_to_locked(
             return Err(SystemError::EISDIR);
         }
         if source.is_dir() && target_child.is_dir() {
-            let target_node: Arc<dyn IndexNode> = target_child.clone();
-            if !dir::is_dir_empty(&target_node)? {
-                return Err(SystemError::ENOTEMPTY);
-            }
+            Some(target_child.dir_state()?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let _target_child_guard = target_child_state
+        .as_ref()
+        .map(|state| state.mutation_lock.lock());
+    if let (Some(target_child), Some(target_child_state)) =
+        (target_child.as_ref(), target_child_state.as_ref())
+    {
+        if !dir::is_dir_empty_locked(target_child, target_child_state)? {
+            return Err(SystemError::ENOTEMPTY);
         }
     }
 

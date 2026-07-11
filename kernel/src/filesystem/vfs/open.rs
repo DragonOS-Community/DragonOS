@@ -10,7 +10,7 @@ use super::{
     utils::{
         rsplit_path, should_remove_sgid_on_chown, user_path_at, user_resolved_path_at, ResolvedPath,
     },
-    vcore::{check_parent_dir_permission_inode, resolve_parent_inode, vfs_truncate},
+    vcore::{check_parent_dir_permission_inode, vfs_truncate},
     FileType, FsPermissionPolicy, IndexNode, InodeMode, SetMetadataMask, MAX_PATHLEN,
     VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
@@ -312,9 +312,16 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
                 if filename.len() > crate::filesystem::vfs::NAME_MAX {
                     return Err(SystemError::ENAMETOOLONG);
                 }
-                // 查找父目录
-                let parent_inode: Arc<dyn IndexNode> =
-                    resolve_parent_inode(inode_begin, parent_path)?;
+                // Resolve and retain the actual parent mount across permission
+                // checks and create. The original start_path alone is not
+                // sufficient when parent_path crosses a mount boundary.
+                let parent_resolved = inode_begin.lookup_follow_symlink_owned(
+                    &start_path,
+                    parent_path.unwrap_or(""),
+                    VFS_MAX_FOLLOW_SYMLINK_TIMES,
+                    true,
+                )?;
+                let parent_inode = parent_resolved.inode();
                 let parent_md = parent_inode.metadata()?;
                 // 父节点必须是目录
                 if parent_md.file_type != FileType::Dir {
@@ -331,7 +338,9 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
                 let inode: Arc<dyn IndexNode> =
                     parent_inode.create(filename, FileType::File, create_mode)?;
                 created = true;
-                ResolvedPath::new(inode)?
+                let created_path = ResolvedPath::new(inode)?;
+                drop(parent_resolved);
+                created_path
             } else {
                 // 不需要创建文件，因此返回错误码
                 return Err(errno);

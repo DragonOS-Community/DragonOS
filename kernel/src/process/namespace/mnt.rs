@@ -3,7 +3,7 @@ use crate::{
         mount::{MountFSInode, MountFlags, MountList, MountPath, MOUNT_LIFECYCLE_LOCK},
         FileSystem, IndexNode, InodeId, MountFS,
     },
-    libs::{once::Once, rwsem::RwSem},
+    libs::{mutex::MutexGuard, once::Once, rwsem::RwSem},
     process::{fork::CloneFlags, namespace::NamespaceType, ProcessManager},
 };
 use alloc::string::{String, ToString};
@@ -278,7 +278,12 @@ impl MntNamespace {
         Ok(())
     }
 
-    fn copy_with_mountfs(&self, new_root: Arc<MountFS>, _user_ns: Arc<UserNamespace>) -> Arc<Self> {
+    fn copy_with_mountfs(
+        &self,
+        new_root: Arc<MountFS>,
+        _user_ns: Arc<UserNamespace>,
+        _topology: &MutexGuard<'_, ()>,
+    ) -> Arc<Self> {
         let mut ns_common = self.ns_common.clone();
         ns_common.level += 1;
 
@@ -293,14 +298,13 @@ impl MntNamespace {
             }),
         });
 
-        {
-            let _topology = MOUNT_LIFECYCLE_LOCK.lock();
-            new_root.set_namespace(Arc::downgrade(&result));
-            result
-                .add_mount(None, Arc::new(MountPath::from("/")), new_root)
-                .expect("Failed to add root mount");
-            result.root_mntfs().activate();
-        }
+        // The caller holds MOUNT_LIFECYCLE_LOCK, which serializes publication
+        // of every mount in the namespace copy with move/unmount/teardown.
+        new_root.set_namespace(Arc::downgrade(&result));
+        result
+            .add_mount(None, Arc::new(MountPath::from("/")), new_root)
+            .expect("Failed to add root mount");
+        result.root_mntfs().activate();
 
         result
     }
@@ -331,6 +335,10 @@ impl MntNamespace {
             // Return the current mount namespace if CLONE_NEWNS is not set
             return Ok(self.self_ref.upgrade().unwrap());
         }
+        // Keep the global topology lock outside the namespace lock. All other
+        // topology mutations use the same order, so namespace copy cannot
+        // deadlock with move_mount() or namespace teardown.
+        let _topology = MOUNT_LIFECYCLE_LOCK.lock();
         let inner = self.inner.read();
 
         let old_root_mntfs = Self::root_mntfs_locked(&inner);
@@ -353,7 +361,7 @@ impl MntNamespace {
             register_slave_with_master(&new_root_mntfs);
         }
 
-        let new_mntns = self.copy_with_mountfs(new_root_mntfs, user_ns);
+        let new_mntns = self.copy_with_mountfs(new_root_mntfs, user_ns, &_topology);
         let new_mntns_root = new_mntns.root_mntfs();
 
         for x in inner.mount_list.clone_inner().values() {
@@ -404,20 +412,17 @@ impl MntNamespace {
                 register_slave_with_master(&new_mount_fs);
             }
 
-            {
-                let _topology = MOUNT_LIFECYCLE_LOCK.lock();
-                data.parent_mount_fs
-                    .add_mount(data.self_mp_inode_id, new_mount_fs.clone())
-                    .expect("Failed to add mount");
-                new_mntns
-                    .add_mount(
-                        Some(data.self_mp_inode_id),
-                        data.mount_path.clone(),
-                        new_mount_fs.clone(),
-                    )
-                    .expect("Failed to add mount to mount namespace");
-                new_mount_fs.activate();
-            }
+            data.parent_mount_fs
+                .add_mount(data.self_mp_inode_id, new_mount_fs.clone())
+                .expect("Failed to add mount");
+            new_mntns
+                .add_mount(
+                    Some(data.self_mp_inode_id),
+                    data.mount_path.clone(),
+                    new_mount_fs.clone(),
+                )
+                .expect("Failed to add mount to mount namespace");
+            new_mount_fs.activate();
 
             // Add child mounts of the original mount point to the queue
 

@@ -18,6 +18,7 @@ use crate::{
         mutex::{Mutex, MutexGuard},
         rwsem::RwSem,
         spinlock::SpinLock,
+        wait_queue::WaitQueue,
     },
     mm::{fault::PageFaultMessage, VirtRegion, VmFaultReason, VmFlags},
     process::{
@@ -336,6 +337,7 @@ pub struct SuperBlockState {
     dentry_namespace_lock: RwSem<()>,
     dentry_states: Mutex<BTreeMap<DentryKey, Weak<AtomicBool>>>,
     lifecycle: Mutex<SuperBlockLifecycle>,
+    shutdown_wait: WaitQueue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -379,6 +381,7 @@ impl SuperBlockState {
                 external_pins: 0,
                 state: SuperBlockLifecycleState::Active,
             }),
+            shutdown_wait: WaitQueue::default(),
         }
     }
 
@@ -427,6 +430,17 @@ impl SuperBlockState {
         let mut lifecycle = self.lifecycle.lock();
         debug_assert_eq!(lifecycle.state, SuperBlockLifecycleState::Dying);
         lifecycle.state = SuperBlockLifecycleState::Dead;
+        drop(lifecycle);
+        self.shutdown_wait.wake_all();
+    }
+
+    /// Wait only when this unmount started the final superblock shutdown.
+    /// A still-active shared superblock needs no shutdown completion wait.
+    fn wait_for_shutdown_if_started(&self) {
+        self.shutdown_wait.wait_until(|| {
+            let state = self.lifecycle.lock().state;
+            (state != SuperBlockLifecycleState::Dying).then_some(())
+        });
     }
 
     fn dentry_state(&self, parent: InodeId, child: InodeId, name: DName) -> Arc<AtomicBool> {
@@ -996,6 +1010,16 @@ impl MountFS {
             let _topology = MOUNT_LIFECYCLE_LOCK.lock();
             collect(root)
         };
+        let mut super_blocks = Vec::new();
+        for mount in &mounts {
+            let state = mount.super_block_state();
+            if !super_blocks
+                .iter()
+                .any(|existing| Arc::ptr_eq(existing, &state))
+            {
+                super_blocks.push(state);
+            }
+        }
         let mut propagation_keys = Vec::with_capacity(mounts.len());
         for mount in &mounts {
             let mountpoint = mount.self_mountpoint().ok_or(SystemError::EINVAL)?;
@@ -1039,6 +1063,14 @@ impl MountFS {
             }
             if let Some(namespace) = namespace {
                 namespace.remove_mount_exact(&mount);
+            }
+        }
+        // Final filesystem shutdown may sleep and may itself need pathname
+        // operations. Never wait while holding the topology/admission lock.
+        drop(_topology);
+        if !lazy {
+            for super_block in super_blocks {
+                super_block.wait_for_shutdown_if_started();
             }
         }
         Ok(root.clone())

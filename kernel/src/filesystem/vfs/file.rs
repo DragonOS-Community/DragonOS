@@ -9,7 +9,7 @@ use system_error::SystemError;
 
 use super::{
     append_lock::with_inode_append_lock, mount::MountFSInode, utils::should_remove_sgid, FileType,
-    IndexNode, InodeId, Metadata, SpecialNodeData,
+    IndexNode, InodeId, Metadata, SetMetadataMask, SpecialNodeData,
 };
 use crate::{arch::ipc::signal::Signal, filesystem::vfs::InodeFlags, process::pid::PidPrivateData};
 use crate::{
@@ -617,7 +617,10 @@ impl File {
             md.mode.remove(InodeMode::S_ISGID);
         }
 
-        self.inode.set_metadata(&md)?;
+        self.inode.set_metadata_masked(
+            &md,
+            SetMetadataMask::MODE | SetMetadataMask::WRITE_SIDE_EFFECT,
+        )?;
         Ok(())
     }
 

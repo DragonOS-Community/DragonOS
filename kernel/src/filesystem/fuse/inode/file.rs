@@ -10,7 +10,7 @@ use crate::{
     arch::MMArch,
     filesystem::{
         page_cache::{PageCache, PageCacheBackend},
-        vfs::{file::FileFlags, FilePrivateData, FileType, IndexNode, Metadata},
+        vfs::{file::FileFlags, FilePrivateData, FileType, IndexNode, Metadata, SetMetadataMask},
     },
     libs::mutex::Mutex,
     mm::{readahead::FileReadaheadState, MemoryManagementArch},
@@ -23,10 +23,12 @@ use super::super::{
     },
     protocol::{
         fuse_pack_struct, fuse_read_struct, FuseAttrOut, FuseFlushIn, FuseFsyncIn, FuseOpenIn,
-        FuseOpenOut, FuseReadIn, FuseReleaseIn, FuseSetattrIn, FuseWriteIn, FuseWriteOut, FATTR_FH,
-        FATTR_LOCKOWNER, FATTR_SIZE, FOPEN_KEEP_CACHE, FOPEN_NOFLUSH, FUSE_FLUSH, FUSE_FSYNC,
-        FUSE_FSYNCDIR, FUSE_FSYNC_FDATASYNC, FUSE_OPEN, FUSE_OPENDIR, FUSE_READ,
-        FUSE_READ_LOCKOWNER, FUSE_SETATTR, FUSE_WRITE, FUSE_WRITE_CACHE,
+        FuseOpenOut, FuseReadIn, FuseReleaseIn, FuseSetattrIn, FuseWriteIn, FuseWriteOut,
+        FATTR_ATIME, FATTR_CTIME, FATTR_FH, FATTR_GID, FATTR_LOCKOWNER, FATTR_MODE, FATTR_MTIME,
+        FATTR_SIZE, FATTR_UID, FOPEN_KEEP_CACHE, FOPEN_NOFLUSH, FUSE_FLUSH, FUSE_FSYNC,
+        FUSE_FSYNCDIR, FUSE_FSYNC_FDATASYNC, FUSE_HANDLE_KILLPRIV, FUSE_OPEN, FUSE_OPENDIR,
+        FUSE_READ, FUSE_READ_LOCKOWNER, FUSE_SETATTR, FUSE_WRITE, FUSE_WRITEBACK_CACHE,
+        FUSE_WRITE_CACHE,
     },
 };
 use super::FuseNode;
@@ -114,6 +116,7 @@ impl FuseNode {
         len: usize,
         lock_owner: Option<u64>,
         fh: Option<u64>,
+        truncate_metadata: Option<(&Metadata, SetMetadataMask)>,
     ) -> Result<(), SystemError> {
         self.check_not_stale()?;
         let mut valid = FATTR_SIZE;
@@ -123,22 +126,70 @@ impl FuseNode {
         if fh.is_some() {
             valid |= FATTR_FH;
         }
+        let mut mode = 0;
+        let mut uid = 0;
+        let mut gid = 0;
+        let mut atime = 0;
+        let mut mtime = 0;
+        let mut ctime = 0;
+        let mut atimensec = 0;
+        let mut mtimensec = 0;
+        let mut ctimensec = 0;
+        if let Some((metadata, mask)) = truncate_metadata {
+            let automatic = mask.contains(SetMetadataMask::WRITE_SIDE_EFFECT);
+            let conn = self.conn();
+            let daemon_handles_killpriv = conn.has_init_flag(FUSE_HANDLE_KILLPRIV);
+            let trust_local_cmtime = conn.has_init_flag(FUSE_WRITEBACK_CACHE);
+
+            // Linux sends truncate and its killpriv state in one SETATTR.
+            // With HANDLE_KILLPRIV the daemon owns the mode transition.
+            if mask.contains(SetMetadataMask::MODE) && !(automatic && daemon_handles_killpriv) {
+                valid |= FATTR_MODE;
+                mode = metadata.mode.bits();
+            }
+            if mask.contains(SetMetadataMask::UID) {
+                valid |= FATTR_UID;
+                uid = metadata.uid as u32;
+            }
+            if mask.contains(SetMetadataMask::GID) {
+                valid |= FATTR_GID;
+                gid = metadata.gid as u32;
+            }
+            if mask.contains(SetMetadataMask::ATIME) {
+                valid |= FATTR_ATIME;
+                atime = metadata.atime.tv_sec as u64;
+                atimensec = metadata.atime.tv_nsec as u32;
+            }
+            // DragonOS does not currently negotiate WRITEBACK_CACHE. Match
+            // Linux FUSE by accepting the daemon-returned cmtime for truncate
+            // instead of sending a second SETATTR without the file handle.
+            if mask.contains(SetMetadataMask::MTIME) && (!automatic || trust_local_cmtime) {
+                valid |= FATTR_MTIME;
+                mtime = metadata.mtime.tv_sec as u64;
+                mtimensec = metadata.mtime.tv_nsec as u32;
+            }
+            if mask.contains(SetMetadataMask::CTIME) && (!automatic || trust_local_cmtime) {
+                valid |= FATTR_CTIME;
+                ctime = metadata.ctime.tv_sec as u64;
+                ctimensec = metadata.ctime.tv_nsec as u32;
+            }
+        }
         let inarg = FuseSetattrIn {
             valid,
             padding: 0,
             fh: fh.unwrap_or(0),
             size: len as u64,
             lock_owner: lock_owner.unwrap_or(0),
-            atime: 0,
-            mtime: 0,
-            ctime: 0,
-            atimensec: 0,
-            mtimensec: 0,
-            ctimensec: 0,
-            mode: 0,
+            atime,
+            mtime,
+            ctime,
+            atimensec,
+            mtimensec,
+            ctimensec,
+            mode,
             unused4: 0,
-            uid: 0,
-            gid: 0,
+            uid,
+            gid,
             unused5: 0,
         };
         let payload = self

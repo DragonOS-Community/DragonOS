@@ -1,4 +1,5 @@
 use crate::arch::rand::rand;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 bitflags! {
     pub struct GRandFlags: u8{
@@ -51,13 +52,22 @@ pub fn rand_bytes<const N: usize>() -> [u8; N] {
 // 软件实现的随机数生成器
 #[allow(dead_code)]
 pub fn soft_rand() -> usize {
-    static mut SEED: u64 = 0xdead_beef_cafe_babe;
+    static SEED: AtomicU64 = AtomicU64::new(0xdead_beef_cafe_babe);
     let mut buf = [0u8; size_of::<usize>()];
     for x in buf.iter_mut() {
-        unsafe {
-            // from musl
-            SEED = SEED.wrapping_mul(0x5851_f42d_4c95_7f2d);
-            *x = (SEED >> 33) as u8;
+        let mut current = SEED.load(Ordering::Relaxed);
+        loop {
+            // Linear congruential step inherited from the existing musl-style
+            // fallback. Atomic CAS avoids cross-CPU data races on architectures
+            // without a hardware random source.
+            let next = current.wrapping_mul(0x5851_f42d_4c95_7f2d);
+            match SEED.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => {
+                    *x = (next >> 33) as u8;
+                    break;
+                }
+                Err(actual) => current = actual,
+            }
         }
     }
     let x: usize = usize::from_ne_bytes(buf);

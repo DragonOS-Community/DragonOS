@@ -9,7 +9,8 @@ use super::{
     syscall::{OpenHow, OpenHowResolve},
     utils::{rsplit_path, should_remove_sgid_on_chown, user_path_at},
     vcore::{check_parent_dir_permission_inode, resolve_parent_inode, vfs_truncate},
-    FileType, FsPermissionPolicy, IndexNode, InodeMode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    FileType, FsPermissionPolicy, IndexNode, InodeMode, SetMetadataMask, MAX_PATHLEN,
+    VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 use crate::{filesystem::vfs::syscall::UtimensFlags, process::cred::Kgid};
 use crate::{
@@ -125,7 +126,8 @@ pub fn do_fchmod(inode: Arc<dyn IndexNode>, mode: InodeMode) -> Result<usize, Sy
     }
 
     metadata.mode = chmod_preserve_type(metadata.mode, mode);
-    inode.set_metadata(&metadata)?;
+    metadata.ctime = PosixTimeSpec::now();
+    inode.set_metadata_masked(&metadata, SetMetadataMask::MODE | SetMetadataMask::CTIME)?;
     Ok(0)
 }
 
@@ -180,6 +182,7 @@ fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usi
     let change_gid = gid != usize::MAX;
     let old_uid = meta.uid;
     let old_gid = meta.gid;
+    let old_mode = meta.mode;
 
     // 检查权限
     match current_uid {
@@ -219,7 +222,21 @@ fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usi
             meta.mode.remove(InodeMode::S_ISGID);
         }
     }
-    inode.set_metadata(&meta)?;
+    let mut mask = SetMetadataMask::empty();
+    if change_uid {
+        mask.insert(SetMetadataMask::UID);
+    }
+    if change_gid {
+        mask.insert(SetMetadataMask::GID);
+    }
+    if meta.mode != old_mode {
+        mask.insert(SetMetadataMask::MODE);
+    }
+    if !mask.is_empty() {
+        meta.ctime = PosixTimeSpec::now();
+        mask.insert(SetMetadataMask::CTIME);
+    }
+    inode.set_metadata_masked(&meta, mask)?;
 
     return Ok(0);
 }
@@ -545,22 +562,50 @@ pub fn do_utimensat(
     let now = PosixTimeSpec::now();
     let mut meta = inode.metadata()?;
 
+    let both_omit =
+        times.is_some_and(|times| times[0].tv_nsec == UTIME_OMIT && times[1].tv_nsec == UTIME_OMIT);
+    if both_omit {
+        return Ok(0);
+    }
+    let both_now =
+        times.is_none_or(|times| times[0].tv_nsec == UTIME_NOW && times[1].tv_nsec == UTIME_NOW);
+    check_timestamp_update_permission(&inode, &meta, both_now)?;
+
     if let Some([atime, mtime]) = times {
+        let mut mask = SetMetadataMask::empty();
         if atime.tv_nsec == UTIME_NOW {
             meta.atime = now;
+            mask.insert(SetMetadataMask::ATIME);
         } else if atime.tv_nsec != UTIME_OMIT {
             meta.atime = atime;
+            mask.insert(SetMetadataMask::ATIME);
         }
         if mtime.tv_nsec == UTIME_NOW {
             meta.mtime = now;
+            mask.insert(SetMetadataMask::MTIME);
         } else if mtime.tv_nsec != UTIME_OMIT {
             meta.mtime = mtime;
+            mask.insert(SetMetadataMask::MTIME);
         }
-        inode.set_metadata(&meta).unwrap();
+        if !mask.is_empty() {
+            meta.ctime = now;
+            mask.insert(SetMetadataMask::CTIME);
+            if both_now {
+                mask.insert(SetMetadataMask::TIMES_BY_WRITE);
+            }
+        }
+        inode.set_metadata_masked(&meta, mask)?;
     } else {
         meta.atime = now;
         meta.mtime = now;
-        inode.set_metadata(&meta).unwrap();
+        meta.ctime = now;
+        inode.set_metadata_masked(
+            &meta,
+            SetMetadataMask::ATIME
+                | SetMetadataMask::MTIME
+                | SetMetadataMask::CTIME
+                | SetMetadataMask::TIMES_BY_WRITE,
+        )?;
     }
     return Ok(0);
 }
@@ -574,16 +619,47 @@ pub fn do_utimes(path: &str, times: Option<[PosixTimeval; 2]>) -> Result<usize, 
     )?;
     let inode = inode_begin.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
     let mut meta = inode.metadata()?;
+    check_timestamp_update_permission(&inode, &meta, times.is_none())?;
 
     if let Some([atime, mtime]) = times {
         meta.atime = PosixTimeSpec::from(atime);
         meta.mtime = PosixTimeSpec::from(mtime);
-        inode.set_metadata(&meta)?;
+        meta.ctime = PosixTimeSpec::now();
+        inode.set_metadata_masked(
+            &meta,
+            SetMetadataMask::ATIME | SetMetadataMask::MTIME | SetMetadataMask::CTIME,
+        )?;
     } else {
         let now = PosixTimeSpec::now();
         meta.atime = now;
         meta.mtime = now;
-        inode.set_metadata(&meta)?;
+        meta.ctime = now;
+        inode.set_metadata_masked(
+            &meta,
+            SetMetadataMask::ATIME
+                | SetMetadataMask::MTIME
+                | SetMetadataMask::CTIME
+                | SetMetadataMask::TIMES_BY_WRITE,
+        )?;
     }
     return Ok(0);
+}
+
+fn check_timestamp_update_permission(
+    inode: &Arc<dyn IndexNode>,
+    metadata: &super::Metadata,
+    may_use_write_permission: bool,
+) -> Result<(), SystemError> {
+    let cred = ProcessManager::current_pcb().cred();
+    if cred.fsuid.data() == metadata.uid || cred.has_capability(CAPFlags::CAP_FOWNER) {
+        return Ok(());
+    }
+    if may_use_write_permission {
+        return super::permission::check_inode_permission(
+            inode,
+            metadata,
+            PermissionMask::MAY_WRITE,
+        );
+    }
+    Err(SystemError::EPERM)
 }

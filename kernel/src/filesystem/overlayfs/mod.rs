@@ -1,11 +1,13 @@
 mod config;
 mod copy_up;
+mod cred;
 mod dir;
 mod entry;
 mod file;
 mod fs;
 mod inode;
 mod lookup;
+mod metadata;
 mod path;
 mod readdir;
 mod rename;

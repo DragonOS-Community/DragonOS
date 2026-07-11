@@ -1,9 +1,10 @@
+use super::cred::CredOverrideGuard;
 use super::inode::OvlInode;
 use crate::filesystem::vfs::file::{File, FileFlags, FilePrivateData};
-use crate::filesystem::vfs::{self, vcore, FileType};
+use crate::filesystem::vfs::{self, vcore, FileType, Metadata, SetMetadataMask};
 use crate::libs::mutex::Mutex;
 use crate::mm::VmFlags;
-use crate::process::{Cred, ProcessControlBlock, ProcessManager};
+use crate::process::Cred;
 use alloc::sync::Arc;
 use core::mem;
 use system_error::SystemError;
@@ -21,28 +22,6 @@ struct OverlayFilePrivateDataInner {
     backing_is_upper: bool,
     flags: FileFlags,
     backing_cred: Arc<Cred>,
-}
-
-struct CredOverrideGuard {
-    pcb: Arc<ProcessControlBlock>,
-    saved_cred: Arc<Cred>,
-}
-
-impl CredOverrideGuard {
-    fn new(override_cred: Arc<Cred>) -> Result<Self, SystemError> {
-        let pcb = ProcessManager::current_pcb();
-        let saved_cred = pcb.cred();
-        pcb.set_cred(override_cred)?;
-        Ok(Self { pcb, saved_cred })
-    }
-}
-
-impl Drop for CredOverrideGuard {
-    fn drop(&mut self) {
-        if let Err(err) = self.pcb.set_cred(self.saved_cred.clone()) {
-            log::error!("overlayfs: failed to restore backing-open credentials: {err:?}");
-        }
-    }
 }
 
 impl OverlayFilePrivateData {
@@ -111,7 +90,16 @@ pub(super) fn write_at(
     buf: &[u8],
     data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
 ) -> Result<usize, SystemError> {
+    if len == 0 {
+        let (backing_file, _) = backing_file_for_io(inode, data)?;
+        return backing_file.pwrite(offset, len, buf);
+    }
+
+    let _privilege_guard = inode.content_privilege_lock.lock();
     let (backing_file, _) = backing_file_for_io(inode, data)?;
+    let fs = inode.overlay_fs()?;
+    let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
+    super::metadata::remove_security_capability(&backing_file.inode())?;
     backing_file.pwrite(offset, len, buf)
 }
 
@@ -150,6 +138,27 @@ pub(super) fn flush_file(
 ) -> Result<(), SystemError> {
     let (backing_file, _) = backing_file_for_io(inode, data)?;
     backing_file.flush_for_close(lock_owner)
+}
+
+pub(super) fn resize_file_with_metadata(
+    inode: &OvlInode,
+    data: crate::libs::mutex::MutexGuard<FilePrivateData>,
+    len: usize,
+    lock_owner: u64,
+    metadata: &Metadata,
+    mask: SetMetadataMask,
+) -> Result<(), SystemError> {
+    let (backing_file, backing_is_upper) = backing_file_for_io(inode, data)?;
+    if !backing_is_upper {
+        return Err(SystemError::EIO);
+    }
+    backing_file.inode().resize_file_with_metadata(
+        len,
+        lock_owner,
+        backing_file.private_data.lock(),
+        metadata,
+        mask,
+    )
 }
 
 pub(super) fn close(

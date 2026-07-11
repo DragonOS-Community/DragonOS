@@ -28,6 +28,7 @@ pub struct OvlInode {
     pub(super) lower_inodes: Vec<Arc<dyn IndexNode>>, // Read-only layer (lower, supports multi-layer)
     pub(super) overlay_inode_id: Option<InodeId>,
     origin: Mutex<OriginState>,
+    pub(super) content_privilege_lock: Mutex<()>,
     #[allow(dead_code)]
     pub(super) oe: Arc<OvlEntry>,
     pub(super) fs: Mutex<Weak<OverlayFS>>,
@@ -55,6 +56,7 @@ impl OvlInode {
             lower_inodes,
             overlay_inode_id,
             origin: Mutex::new(OriginState::Unchecked),
+            content_privilege_lock: Mutex::new(()),
             oe: Arc::new(OvlEntry::new()),
             fs: Mutex::new(Weak::default()),
         }

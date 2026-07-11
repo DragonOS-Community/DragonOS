@@ -2864,6 +2864,7 @@ static int ext_run_permission_case(const char *mp, const char *opts, uint32_t ro
     args.init_done = &init_done;
     args.enable_write_ops = 0;
     args.exit_after_init = 0;
+    args.stop_on_destroy = 1;
     args.root_mode_override = root_mode_override;
     args.hello_mode_override = hello_mode_override;
 

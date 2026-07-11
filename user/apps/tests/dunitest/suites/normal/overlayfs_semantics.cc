@@ -3158,6 +3158,51 @@ TEST(OverlayFsSemantics, CopyUpPreservesRawAclCapabilityAndAncestorMetadata) {
     expect_xattr(merged_file, "security.capability", capability, sizeof(capability));
 }
 
+TEST(OverlayFsSemantics, ContentMutationRemovesCopiedUpFileCapability) {
+    if (geteuid() != 0) {
+        GTEST_SKIP() << "requires root for security xattr coverage";
+    }
+    if (!root_supports_ext4_xattrs()) {
+        GTEST_SKIP() << "requires the Ubuntu 24.04 ext4 rootfs backing";
+    }
+
+    ScopedOverlayEnv scoped("overlayfs_kill_file_capability", "/root");
+    const auto& env = scoped.env;
+    prepare_overlay_env(env);
+    const unsigned char capability[] = {
+        0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    const char* names[] = {"write", "truncate", "chown"};
+    for (const char* name : names) {
+        std::string lower_file = join_path(env.lower, name);
+        ASSERT_EQ(0, write_text(lower_file, "lower")) << strerror(errno);
+        ASSERT_EQ(0,
+                  setxattr(lower_file.c_str(), "security.capability", capability,
+                           sizeof(capability), 0))
+            << strerror(errno);
+    }
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    std::string merged_write = join_path(env.merged, names[0]);
+    int fd = open(merged_write.c_str(), O_WRONLY | O_CLOEXEC);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    ASSERT_EQ(1, write(fd, "x", 1)) << strerror(errno);
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+    ASSERT_EQ(0, truncate(join_path(env.merged, names[1]).c_str(), 0)) << strerror(errno);
+    ASSERT_EQ(0, chown(join_path(env.merged, names[2]).c_str(), 1000, 1001)) << strerror(errno);
+
+    for (const char* name : names) {
+        std::string lower_file = join_path(env.lower, name);
+        std::string upper_file = join_path(env.upper, name);
+        std::string merged_file = join_path(env.merged, name);
+        expect_xattr(lower_file, "security.capability", capability, sizeof(capability));
+        for (const std::string* file : {&upper_file, &merged_file}) {
+            errno = 0;
+            EXPECT_EQ(-1, getxattr(file->c_str(), "security.capability", nullptr, 0));
+            EXPECT_EQ(ENODATA, errno) << *file;
+        }
+    }
+}
+
 TEST(OverlayFsSemantics, NonRootOwnerCanTriggerCopyUpThroughMounterCredentials) {
     if (geteuid() != 0) {
         GTEST_SKIP() << "requires root to create the non-root caller";

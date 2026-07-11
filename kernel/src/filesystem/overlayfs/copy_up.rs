@@ -133,6 +133,13 @@ impl OvlInode {
             return Err(err);
         }
 
+        if copy_size == Some(0) && metadata.file_type == FileType::File {
+            if let Err(err) = metadata::remove_security_capability(&temp_inode) {
+                let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
+                return Err(err);
+            }
+        }
+
         let origin = match metadata::prepare_origin(self, lower_inode, &temp_inode, &metadata) {
             Ok(origin) => origin,
             Err(err) => {

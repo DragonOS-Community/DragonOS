@@ -90,7 +90,16 @@ pub(super) fn write_at(
     buf: &[u8],
     data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
 ) -> Result<usize, SystemError> {
+    if len == 0 {
+        let (backing_file, _) = backing_file_for_io(inode, data)?;
+        return backing_file.pwrite(offset, len, buf);
+    }
+
+    let _privilege_guard = inode.content_privilege_lock.lock();
     let (backing_file, _) = backing_file_for_io(inode, data)?;
+    let fs = inode.overlay_fs()?;
+    let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
+    super::metadata::remove_security_capability(&backing_file.inode())?;
     backing_file.pwrite(offset, len, buf)
 }
 

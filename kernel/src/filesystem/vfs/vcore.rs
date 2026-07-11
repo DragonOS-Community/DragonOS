@@ -17,7 +17,7 @@ use crate::{
         sysfs::sysfs_init,
         vfs::{
             file::{File, FileMode, FilePrivateData},
-            mount::MountFlags,
+            mount::{MountFlags, MOUNT_LIFECYCLE_LOCK},
             permission::PermissionMask,
             AtomicInodeId, FileSystem, FileType, InodeFlags, InodeMode, Metadata, MountFS,
             SetMetadataMask,
@@ -132,7 +132,11 @@ fn migrate_virtual_filesystem(
         .mount_from(old_root_inode.find("sys").expect("sys not mounted!"))
         .expect("Failed to migrate filesystem of sys");
 
-    current_mntns.force_change_root_mountfs(new_fs);
+    {
+        let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+        new_fs.activate();
+        current_mntns.force_change_root_mountfs(new_fs);
+    }
 
     // 换根后需要同步更新“当前进程”的 fs root/pwd。
     // 我们的路径解析（绝对路径）以进程 fs root 为起点；若不更新，后续诸如 /dev/pts 的挂载、

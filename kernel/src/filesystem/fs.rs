@@ -2,21 +2,75 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use alloc::sync::Arc;
 
-use crate::filesystem::vfs::IndexNode;
 use crate::filesystem::vfs::InodeMode;
+use crate::filesystem::vfs::{mount::MountFSInode, utils::ResolvedPath, IndexNode};
+use crate::libs::casting::DowncastArc;
 use crate::libs::rwsem::RwSem;
 use crate::process::ProcessManager;
+
+#[derive(Debug)]
+struct PinnedPath {
+    inode: Arc<dyn IndexNode>,
+    _mount_guard: Option<crate::filesystem::vfs::mount::MountExternalGuard>,
+}
+
+impl PinnedPath {
+    fn new(inode: Arc<dyn IndexNode>) -> Self {
+        let mount_guard = inode.clone().downcast_arc::<MountFSInode>().map(|inode| {
+            inode
+                .mount_fs()
+                .try_pin_external()
+                .expect("live process path must pin its mount")
+        });
+        Self {
+            inode,
+            _mount_guard: mount_guard,
+        }
+    }
+
+    fn from_resolved(resolved: ResolvedPath) -> Self {
+        let (inode, mount_guard, operation_guard) = resolved.into_parts();
+        drop(operation_guard);
+        Self {
+            inode,
+            _mount_guard: mount_guard,
+        }
+    }
+
+    fn resolved(&self) -> Result<ResolvedPath, system_error::SystemError> {
+        let mount_guard = self
+            ._mount_guard
+            .as_ref()
+            .map(|guard| guard.derive())
+            .transpose()?;
+        ResolvedPath::from_existing_mount(self.inode.clone(), mount_guard)
+    }
+}
+
+impl Clone for PinnedPath {
+    fn clone(&self) -> Self {
+        Self {
+            inode: self.inode.clone(),
+            _mount_guard: self._mount_guard.as_ref().map(|guard| {
+                guard
+                    .derive()
+                    .expect("valid process path must remain derivable")
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PathContext {
-    root: Arc<dyn IndexNode>,
-    pwd: Arc<dyn IndexNode>,
+    root: PinnedPath,
+    pwd: PinnedPath,
 }
 
 impl PathContext {
     pub fn new() -> Self {
         Self {
-            root: ProcessManager::current_mntns().root_inode(),
-            pwd: ProcessManager::current_mntns().root_inode(),
+            root: PinnedPath::new(ProcessManager::current_mntns().root_inode()),
+            pwd: PinnedPath::new(ProcessManager::current_mntns().root_inode()),
         }
     }
 }
@@ -66,18 +120,34 @@ impl FsStruct {
     }
 
     pub fn set_root(&self, inode: Arc<dyn IndexNode>) {
-        self.path_context.write().root = inode;
+        self.path_context.write().root = PinnedPath::new(inode);
+    }
+
+    pub fn set_root_resolved(&self, path: ResolvedPath) {
+        self.path_context.write().root = PinnedPath::from_resolved(path);
     }
 
     pub fn set_pwd(&self, inode: Arc<dyn IndexNode>) {
-        self.path_context.write().pwd = inode;
+        self.path_context.write().pwd = PinnedPath::new(inode);
+    }
+
+    pub fn set_pwd_resolved(&self, path: ResolvedPath) {
+        self.path_context.write().pwd = PinnedPath::from_resolved(path);
     }
 
     pub fn pwd(&self) -> Arc<dyn IndexNode> {
-        self.path_context.read().pwd.clone()
+        self.path_context.read().pwd.inode.clone()
     }
 
     pub fn root(&self) -> Arc<dyn IndexNode> {
-        self.path_context.read().root.clone()
+        self.path_context.read().root.inode.clone()
+    }
+
+    pub fn pwd_resolved(&self) -> Result<ResolvedPath, system_error::SystemError> {
+        self.path_context.read().pwd.resolved()
+    }
+
+    pub fn root_resolved(&self) -> Result<ResolvedPath, system_error::SystemError> {
+        self.path_context.read().root.resolved()
     }
 }

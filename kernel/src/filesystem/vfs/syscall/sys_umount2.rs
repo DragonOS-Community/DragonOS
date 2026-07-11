@@ -75,7 +75,7 @@ syscall_table_macros::declare_syscall!(SYS_UMOUNT2, SysUmount2Handle);
 ///
 /// - dirfd: i32 - 目录文件描述符，用于指定要卸载的文件系统的根目录。
 /// - target: &str - 要卸载的文件系统的目标路径。
-/// - _flag: UmountFlag - 卸载标志，目前未使用。
+/// - flag: UmountFlag - 卸载模式；`MNT_DETACH` 执行 lazy detach。
 ///
 /// ## 返回值
 ///
@@ -85,18 +85,27 @@ syscall_table_macros::declare_syscall!(SYS_UMOUNT2, SysUmount2Handle);
 /// ## 错误处理
 ///
 /// 如果指定的路径没有对应的文件系统，或者在尝试卸载时发生错误，将返回错误。
-pub fn do_umount2(
-    dirfd: i32,
-    target: &str,
-    _flag: UmountFlag,
-) -> Result<Arc<MountFS>, SystemError> {
+pub fn do_umount2(dirfd: i32, target: &str, flag: UmountFlag) -> Result<Arc<MountFS>, SystemError> {
     let target = target.trim();
     if target.is_empty() {
         return Err(SystemError::ENOENT);
     }
 
+    if flag.contains(UmountFlag::MNT_EXPIRE)
+        && flag.intersects(UmountFlag::MNT_FORCE | UmountFlag::MNT_DETACH)
+    {
+        return Err(SystemError::EINVAL);
+    }
+    if flag.intersects(UmountFlag::MNT_EXPIRE | UmountFlag::MNT_FORCE) {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+
     let (work, rest) = user_path_at(&ProcessManager::current_pcb(), dirfd, target)?;
-    let target_inode = work.lookup_follow_symlink(&rest, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    let target_inode = work.lookup_follow_symlink2(
+        &rest,
+        VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        !flag.contains(UmountFlag::UMOUNT_NOFOLLOW),
+    )?;
     if !may_mount() {
         return Err(SystemError::EPERM);
     }
@@ -112,7 +121,11 @@ pub fn do_umount2(
         return Err(SystemError::EINVAL);
     }
 
-    if let Err(err) = fs.umount() {
+    // The target lookup above is not an external mount pin. This is deliberate:
+    // Linux discounts the syscall's own path reference from the busy check.
+    // File/path owners acquire explicit MountExternalGuard values instead.
+    let lazy = flag.contains(UmountFlag::MNT_DETACH);
+    if let Err(err) = MountFS::umount_subtree_with_mode(&fs, lazy) {
         log::warn!(
             "do_umount2: fs.umount failed for resolved='{}', fs='{}': {:?}",
             path,
@@ -120,13 +133,6 @@ pub fn do_umount2(
             err
         );
         return Err(err);
-    }
-    if current_mntns.remove_mount_exact(&fs).is_none() {
-        log::error!(
-            "do_umount2: mount_list exact remove miss for resolved='{}', fs='{}'",
-            path,
-            fs.name()
-        );
     }
     Ok(fs)
 }

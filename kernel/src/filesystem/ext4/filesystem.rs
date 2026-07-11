@@ -7,8 +7,8 @@ use crate::{
             fcntl::AtFlags,
             utils::{user_path_at, DName},
             vcore::{generate_inode_id, try_find_gendisk},
-            FileSystem, FileSystemMakerData, IndexNode, Magic, MountableFileSystem, FSMAKER,
-            VFS_MAX_FOLLOW_SYMLINK_TIMES,
+            FileSystem, FileSystemMakerData, IndexNode, InodeRetentionKind, Magic,
+            MountableFileSystem, FSMAKER, VFS_MAX_FOLLOW_SYMLINK_TIMES,
         },
     },
     libs::{
@@ -32,11 +32,18 @@ use linkme::distributed_slice;
 use system_error::SystemError;
 
 use super::inode::LockedExt4Inode;
+use crate::filesystem::vfs::inode_lifecycle::InodeRetentionGuard;
 
 #[derive(Debug)]
 struct CanonicalInodeEntry {
     inode: Weak<LockedExt4Inode>,
     lifecycle: Arc<Ext4InodeLifecycle>,
+}
+
+#[derive(Debug)]
+struct DirtyInodeEntry {
+    inode: Arc<LockedExt4Inode>,
+    _retention: InodeRetentionGuard,
 }
 
 #[must_use]
@@ -57,7 +64,7 @@ pub struct Ext4FileSystem {
     root_inode: Arc<LockedExt4Inode>,
 
     /// 元数据（size/mtime）脏但尚未刷盘的 inode 列表。
-    dirty_inodes: Mutex<Vec<Arc<LockedExt4Inode>>>,
+    dirty_inodes: Mutex<Vec<DirtyInodeEntry>>,
 
     /// Per-superblock canonical VFS inode identity, keyed by the on-disk inode number.
     inode_table: Mutex<BTreeMap<u32, CanonicalInodeEntry>>,
@@ -363,14 +370,20 @@ impl Ext4FileSystem {
 
         if should_queue {
             if let Some(fs) = fs {
-                fs.dirty_inodes.lock().push(inode.clone());
+                fs.dirty_inodes.lock().push(DirtyInodeEntry {
+                    inode: inode.clone(),
+                    _retention: InodeRetentionGuard::new(
+                        inode.clone(),
+                        InodeRetentionKind::AsyncWork,
+                    )?,
+                });
             }
         }
         Ok(())
     }
 
     fn flush_dirty_inodes(&self) -> Result<(), SystemError> {
-        let dirty: Vec<Arc<LockedExt4Inode>> = {
+        let dirty: Vec<DirtyInodeEntry> = {
             let mut guard = self.dirty_inodes.lock();
             if guard.is_empty() {
                 return Ok(());
@@ -379,8 +392,10 @@ impl Ext4FileSystem {
         };
 
         let mut last_err = Ok(());
-        let mut requeue: Vec<Arc<LockedExt4Inode>> = Vec::new();
-        for inode in dirty {
+        let mut requeue: Vec<DirtyInodeEntry> = Vec::new();
+        for dirty_entry in dirty {
+            let inode = dirty_entry.inode.clone();
+            let mut dirty_entry = Some(dirty_entry);
             let mut should_requeue = false;
             let result = {
                 let has_dirty_metadata = {
@@ -409,7 +424,7 @@ impl Ext4FileSystem {
                         continue;
                     }
                     Err(error) => {
-                        requeue.push(inode);
+                        requeue.push(dirty_entry.take().unwrap());
                         last_err = Err(error);
                         continue;
                     }
@@ -491,7 +506,7 @@ impl Ext4FileSystem {
                 last_err = Err(e);
             }
             if should_requeue {
-                requeue.push(inode);
+                requeue.push(dirty_entry.take().unwrap());
             }
         }
         if !requeue.is_empty() {

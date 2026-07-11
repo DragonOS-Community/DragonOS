@@ -5,8 +5,7 @@ use crate::{
         page_cache::{AsyncPageCacheBackend, PageCache},
         vfs::{
             self, syscall::RenameFlags, utils::DName, vcore::generate_inode_id, FilePrivateData,
-            IndexNode, InodeFlags, InodeId, InodeMode, InodeRetentionState, SpecialNodeData,
-            XattrFlags,
+            IndexNode, InodeFlags, InodeId, InodeMode, SpecialNodeData, XattrFlags,
         },
     },
     ipc::pipe::LockedPipeInode,
@@ -73,7 +72,6 @@ pub(super) struct Ext4InodeLifecycle {
     inner: Mutex<Ext4InodeLifecycleInner>,
     link_mutation: Mutex<()>,
     wait_queue: WaitQueue,
-    retention: InodeRetentionState,
 }
 
 impl Ext4InodeLifecycle {
@@ -86,7 +84,6 @@ impl Ext4InodeLifecycle {
             }),
             link_mutation: Mutex::new(()),
             wait_queue: WaitQueue::default(),
-            retention: InodeRetentionState::new(),
         })
     }
 
@@ -235,16 +232,6 @@ pub struct LockedExt4Inode(
 );
 
 impl IndexNode for LockedExt4Inode {
-    fn retention_state(&self) -> Option<&InodeRetentionState> {
-        Some(&self.4.retention)
-    }
-
-    fn on_zero_retention(&self) {
-        // Wake lifecycle waiters so a zero-link inode implementation can
-        // re-evaluate eviction eligibility without doing I/O in this callback.
-        self.4.wait_queue.wake_all();
-    }
-
     fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
         Ok(())
     }

@@ -12,7 +12,7 @@ use super::super::protocol::{
     FUSE_GETXATTR, FUSE_INIT, FUSE_INIT_EXT, FUSE_INTERRUPT, FUSE_KERNEL_MINOR_VERSION,
     FUSE_KERNEL_VERSION, FUSE_LINK, FUSE_LISTXATTR, FUSE_LOOKUP, FUSE_MAX_PAGES,
     FUSE_MIN_READ_BUFFER, FUSE_MKDIR, FUSE_MKNOD, FUSE_NOTIFY_DELETE, FUSE_NOTIFY_INVAL_ENTRY,
-    FUSE_NOTIFY_INVAL_INODE, FUSE_NOTIFY_POLL, FUSE_NOTIFY_RETRIEVE, FUSE_NOTIFY_STORE,
+    FUSE_NOTIFY_INVAL_INODE, FUSE_NOTIFY_POLL, FUSE_NOTIFY_RETRIEVE, FUSE_NOTIFY_STORE, FUSE_READ,
     FUSE_REMOVEXATTR, FUSE_SETATTR, FUSE_SETXATTR, FUSE_STATFS, FUSE_SYMLINK,
 };
 use super::{
@@ -663,6 +663,36 @@ impl FuseConn {
         trace::trace_fuse_reply_complete(unique, FUSE_DESTROY, 0, 0);
         pending.complete(Ok(FuseReply::from_bytes(Vec::new())));
         self.abort();
+        Ok(())
+    }
+
+    /// Retire a successful FUSE_READ whose payload was written into the request's owned page
+    /// destination instead of a `FuseReply` allocation.
+    pub(crate) fn complete_read_pages_direct(
+        &self,
+        unique: u64,
+        payload_len: usize,
+    ) -> Result<(), SystemError> {
+        let pending = {
+            let g = self.inner.lock();
+            if !g.connected || g.teardown_started {
+                return Err(SystemError::ENOENT);
+            }
+            let pending = g
+                .processing
+                .get(&unique)
+                .cloned()
+                .ok_or(SystemError::ENOENT)?;
+            if pending.opcode != FUSE_READ {
+                return Err(SystemError::EINVAL);
+            }
+            pending
+        };
+        self.claim_pending_reply(unique, &pending, |_| {})?;
+        if pending.complete_read_pages_direct(payload_len) {
+            stats::on_fuse_reply_complete(FUSE_READ, 0, payload_len);
+            trace::trace_fuse_reply_complete(unique, FUSE_READ, 0, payload_len as u64);
+        }
         Ok(())
     }
 

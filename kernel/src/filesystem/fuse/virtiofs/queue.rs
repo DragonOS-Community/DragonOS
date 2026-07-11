@@ -26,6 +26,24 @@ pub(super) enum VirtioFsQueue {
 }
 
 impl VirtioFsQueue {
+    /// Total number of direct descriptors in this split virtqueue.
+    ///
+    /// virtiofs creates these queues with indirect descriptors disabled, so a request whose
+    /// immutable SG shape exceeds this value can never be submitted to this queue. Transient
+    /// descriptor exhaustion is still reported by `add` as `QueueFull`.
+    pub(super) const fn size(&self) -> usize {
+        match self {
+            Self::Q8(_) => 8,
+            Self::Q16(_) => 16,
+            Self::Q32(_) => 32,
+            Self::Q64(_) => 64,
+            Self::Q128(_) => 128,
+            Self::Q256(_) => 256,
+            Self::Q512(_) => 512,
+            Self::Q1024(_) => 1024,
+        }
+    }
+
     pub(super) fn can_pop(&self) -> bool {
         match self {
             Self::Q8(q) => q.can_pop(),

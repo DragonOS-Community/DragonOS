@@ -305,11 +305,13 @@ impl IndexNode for FuseNode {
                 if let Some(handle) = &p.writeback_handle {
                     self.unregister_writeback_handle(handle);
                 }
-                p.lifetime.close_and_wait();
                 if p.no_open {
                     return writeback_result;
                 }
-                self.release_common(FUSE_RELEASE, p.fh, p.open_flags, 0);
+                let node = self.self_ref.upgrade().ok_or(SystemError::EIO)?;
+                p.lifetime.close_or_defer(move || {
+                    node.release_common(FUSE_RELEASE, p.fh, p.open_flags, 0);
+                });
                 writeback_result
             }
             FuseFilePrivateData::Dir(p) => {
@@ -358,15 +360,7 @@ impl IndexNode for FuseNode {
             return self.read_direct_with_open(offset, len, buf, fh, file_flags, lock_owner);
         }
 
-        self.read_cached_with_open(
-            offset,
-            len,
-            buf,
-            fh,
-            file_flags,
-            &private_data.readahead_state,
-            private_data.lifetime.clone(),
-        )
+        self.read_cached_with_open(offset, len, buf, &private_data)
     }
 
     fn write_at(

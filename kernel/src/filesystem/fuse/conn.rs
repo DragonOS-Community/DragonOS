@@ -218,10 +218,14 @@ struct FuseReadCompletion {
     requested: usize,
     observed_size: usize,
     observed_attr_version: u64,
-    _open_pin: super::private_data::FuseOpenLifetimePin,
+    open_pin: Mutex<Option<super::private_data::FuseOpenLifetimePin>>,
 }
 
 impl FuseReadCompletion {
+    fn release_open_pin(&self) {
+        self.open_pin.lock().take();
+    }
+
     fn finish(&self, result: &Result<FusePendingResult, SystemError>) -> Result<(), SystemError> {
         let node = self.node.upgrade();
         if let Some(node) = &node {
@@ -427,6 +431,7 @@ impl FusePendingState {
             if let Err(error) = completion.finish(&v) {
                 v = Err(error);
             }
+            completion.release_open_pin();
         }
         let mut guard = self.response.lock();
         *guard = PendingCompletion::Ready(v);

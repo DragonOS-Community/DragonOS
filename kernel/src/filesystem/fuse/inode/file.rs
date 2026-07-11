@@ -897,12 +897,18 @@ impl FuseNode {
                 break;
             }
 
+            let speculative = run_start >= demand_end_page;
             let target = match page_cache
                 .manager()
                 .reserve_read_dma(run_start, run_end - run_start)
             {
                 Ok(target) => Arc::new(target),
                 Err(SystemError::EEXIST) => {
+                    if speculative {
+                        // The foreground read has no dependency on a conflicting
+                        // speculative window. Do not inherit its latency or error.
+                        break;
+                    }
                     // A concurrent reader won the reservation race. Wait for its first page to
                     // leave Loading, then rebuild the missing run from current cache state.
                     drop(page_cache.manager().commit_page(run_start)?);
@@ -919,7 +925,6 @@ impl FuseNode {
                 flags: file_ctx.file_flags,
                 padding: 0,
             };
-            let speculative = run_start >= demand_end_page;
             let Some(open_pin) = file_ctx.lifetime.try_pin() else {
                 let _ = target.rollback(SystemError::EIO);
                 if !speculative {
@@ -1009,11 +1014,11 @@ impl FuseNode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        fh: u64,
-        file_flags: u32,
-        ra_state: &Arc<Mutex<FileReadaheadState>>,
-        lifetime: Arc<FuseOpenLifetime>,
+        open: &FuseOpenPrivateData,
     ) -> Result<usize, SystemError> {
+        let fh = open.fh;
+        let file_flags = open.open_flags;
+        let ra_state = &open.readahead_state;
         let md = self.cached_or_fetch_metadata()?;
         let file_size = md.size.max(0) as usize;
         self.resolve_pending_short_read_truncate(file_size)?;
@@ -1064,7 +1069,7 @@ impl FuseNode {
             file_size,
             fh,
             file_flags,
-            lifetime,
+            lifetime: open.lifetime.clone(),
         };
         let (_, mut truncate_eof) = self.fill_page_cache_range_with_open(
             &page_cache,

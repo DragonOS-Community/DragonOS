@@ -17,7 +17,8 @@ pub(crate) fn collect_visible_mounts(
     let nsproxy = target.nsproxy();
     let mount_list = nsproxy.mnt_ns.mount_list();
     let root_path = target
-        .fs_struct()
+        .try_fs_struct()
+        .ok_or(SystemError::ESRCH)?
         .root()
         .absolute_path()
         .unwrap_or_else(|_| "/".to_string());

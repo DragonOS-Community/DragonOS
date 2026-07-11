@@ -1,11 +1,10 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_STATFS;
-use crate::filesystem::vfs::file::FileFlags;
-use crate::filesystem::vfs::syscall::open_utils;
+use crate::filesystem::vfs::fcntl::AtFlags;
 use crate::filesystem::vfs::syscall::PosixStatfs;
-use crate::filesystem::vfs::utils::user_path_at;
-use crate::filesystem::vfs::InodeMode;
+use crate::filesystem::vfs::utils::user_resolved_path_at;
 use crate::filesystem::vfs::MAX_PATHLEN;
+use crate::filesystem::vfs::VFS_MAX_FOLLOW_SYMLINK_TIMES;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
@@ -25,14 +24,23 @@ impl Syscall for SysStatfsHandle {
         let path = Self::path(args);
         let user_statfs = Self::statfs(args);
         let mut writer = UserBufferWriter::new(user_statfs, size_of::<PosixStatfs>(), true)?;
-        let fd = open_utils::do_open(path, FileFlags::O_RDONLY.bits(), InodeMode::empty().bits())?;
-        let path = vfs_check_and_clone_cstr(path, Some(MAX_PATHLEN))
-            .unwrap()
+        let path = vfs_check_and_clone_cstr(path, Some(MAX_PATHLEN))?
             .into_string()
             .map_err(|_| SystemError::EINVAL)?;
+        if path.is_empty() {
+            return Err(SystemError::ENOENT);
+        }
         let pcb = ProcessManager::current_pcb();
-        let (inode_begin, remain_path) = user_path_at(&pcb, fd as i32, &path)?;
-        let inode = inode_begin.lookup_follow_symlink(&remain_path, MAX_PATHLEN)?;
+        let (start_path, remain_path) =
+            user_resolved_path_at(&pcb, AtFlags::AT_FDCWD.bits(), &path)?;
+        let inode_begin = start_path.inode();
+        let resolved = inode_begin.lookup_follow_symlink_owned(
+            &start_path,
+            &remain_path,
+            VFS_MAX_FOLLOW_SYMLINK_TIMES,
+            true,
+        )?;
+        let inode = resolved.inode();
         let sb = inode.fs().statfs(&inode)?;
         let statfs = PosixStatfs::from(sb);
         writer.copy_one_to_user(&statfs, 0)?;

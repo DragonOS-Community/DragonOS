@@ -278,6 +278,10 @@ impl ProcessManager {
             drop(old_user_vm);
 
             pcb.exit_files();
+            // Linux exit_fs() follows exit_files(). A zombie must not keep
+            // cwd/root path references alive, otherwise an already-reaped
+            // chrooted child can make an unrelated umount report EBUSY.
+            pcb.exit_fs();
             pcb.exit_timers();
 
             let (current_tty, is_session_leader, sid) = {

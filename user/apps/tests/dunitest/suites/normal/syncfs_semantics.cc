@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/mman.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -443,6 +444,93 @@ TEST(SyncUmountLifetime, SharedMountPropagationUmountNoDeadlock) {
         << "propagated child mount remained in peer namespace after umount";
 
     CleanupSharedUmountPaths(child, parent, root);
+}
+
+TEST(SyncUmountLifetime, OpenFileDescriptionPinsMountUntilLastOwner) {
+    const char* mountpoint = "/tmp/dunitest_mount_pin";
+    const char* file_path = "/tmp/dunitest_mount_pin/file";
+
+    ASSERT_EQ(0, EnsureDir("/tmp")) << strerror(errno);
+    ASSERT_EQ(0, EnsureDir(mountpoint)) << strerror(errno);
+    ASSERT_EQ(0, mount("", mountpoint, "ramfs", 0, nullptr)) << strerror(errno);
+
+    int fd = open(file_path, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    ASSERT_EQ(4, write(fd, "data", 4)) << strerror(errno);
+    int duplicate = dup(fd);
+    ASSERT_GE(duplicate, 0) << strerror(errno);
+    ASSERT_EQ(0, close(fd));
+
+    errno = 0;
+    ASSERT_EQ(-1, umount(mountpoint));
+    EXPECT_EQ(EBUSY, errno);
+
+    ASSERT_EQ(0, close(duplicate));
+    ASSERT_EQ(0, umount(mountpoint)) << strerror(errno);
+    ASSERT_EQ(0, rmdir(mountpoint)) << strerror(errno);
+}
+
+TEST(SyncUmountLifetime, VmaAndOPathPinMount) {
+    const char* mountpoint = "/tmp/dunitest_mount_vma_pin";
+    const char* file_path = "/tmp/dunitest_mount_vma_pin/file";
+    const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+
+    ASSERT_EQ(0, EnsureDir("/tmp")) << strerror(errno);
+    ASSERT_EQ(0, EnsureDir(mountpoint)) << strerror(errno);
+    ASSERT_EQ(0, mount("", mountpoint, "ramfs", 0, nullptr)) << strerror(errno);
+
+    int fd = open(file_path, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    ASSERT_EQ(0, ftruncate(fd, static_cast<off_t>(page_size))) << strerror(errno);
+    void* mapping = mmap(nullptr, page_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    ASSERT_NE(MAP_FAILED, mapping) << strerror(errno);
+    ASSERT_EQ(0, close(fd));
+
+    int path_fd = open(file_path, O_PATH | O_CLOEXEC);
+    ASSERT_GE(path_fd, 0) << strerror(errno);
+    errno = 0;
+    ASSERT_EQ(-1, umount(mountpoint));
+    EXPECT_EQ(EBUSY, errno);
+
+    ASSERT_EQ(0, close(path_fd));
+    errno = 0;
+    ASSERT_EQ(-1, umount(mountpoint));
+    EXPECT_EQ(EBUSY, errno) << "the VMA must retain its effective File";
+
+    ASSERT_EQ(0, munmap(mapping, page_size)) << strerror(errno);
+    ASSERT_EQ(0, umount(mountpoint)) << strerror(errno);
+    ASSERT_EQ(0, rmdir(mountpoint)) << strerror(errno);
+}
+
+TEST(SyncUmountLifetime, LazyDetachKeepsExistingFileUsable) {
+    const char* mountpoint = "/tmp/dunitest_mount_lazy_pin";
+    const char* file_path = "/tmp/dunitest_mount_lazy_pin/file";
+
+    ASSERT_EQ(0, EnsureDir("/tmp")) << strerror(errno);
+    ASSERT_EQ(0, EnsureDir(mountpoint)) << strerror(errno);
+    ASSERT_EQ(0, mount("", mountpoint, "ramfs", 0, nullptr)) << strerror(errno);
+
+    int fd = open(file_path, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    int dirfd = open(mountpoint, O_RDONLY | O_DIRECTORY);
+    ASSERT_GE(dirfd, 0) << strerror(errno);
+    ASSERT_EQ(0, umount2(mountpoint, MNT_DETACH)) << strerror(errno);
+    EXPECT_FALSE(MountInfoContains(mountpoint));
+
+    ASSERT_EQ(5, write(fd, "alive", 5)) << strerror(errno);
+    ASSERT_EQ(0, lseek(fd, 0, SEEK_SET)) << strerror(errno);
+    char buf[6] = {};
+    ASSERT_EQ(5, read(fd, buf, 5)) << strerror(errno);
+    EXPECT_STREQ("alive", buf);
+
+    int derived = openat(dirfd, "derived", O_CREAT | O_RDWR | O_TRUNC, 0644);
+    ASSERT_GE(derived, 0) << "openat on a detached but pinned path: " << strerror(errno);
+    ASSERT_EQ(7, write(derived, "derived", 7)) << strerror(errno);
+
+    ASSERT_EQ(0, close(derived));
+    ASSERT_EQ(0, close(dirfd));
+    ASSERT_EQ(0, close(fd));
+    ASSERT_EQ(0, rmdir(mountpoint)) << strerror(errno);
 }
 
 int main(int argc, char** argv) {

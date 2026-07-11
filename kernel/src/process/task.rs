@@ -160,7 +160,7 @@ pub struct ProcessControlBlock {
     pub(super) thread: RwLock<ThreadInfo>,
 
     /// Process filesystem state.
-    pub(super) fs: RwLock<Arc<FsStruct>>,
+    pub(super) fs: RwLock<Option<Arc<FsStruct>>>,
 
     /// Alarm timer.
     pub(super) alarm_timer: SpinLock<Option<AlarmTimer>>,
@@ -331,7 +331,7 @@ impl ProcessControlBlock {
                 wait_queue: WaitQueue::default(),
                 cputime_wait_queue: WaitQueue::default(),
                 thread: RwLock::new(ThreadInfo::new()),
-                fs: RwLock::new(Arc::new(FsStruct::new())),
+                fs: RwLock::new(Some(Arc::new(FsStruct::new()))),
                 alarm_timer: SpinLock::new(None),
                 itimers: SpinLock::new(ProcessItimers::default()),
                 posix_timers: SpinLock::new(posix_timer::ProcessPosixTimers::default()),
@@ -743,27 +743,41 @@ impl ProcessControlBlock {
 
     #[inline(always)]
     pub fn fs_struct(&self) -> Arc<FsStruct> {
-        self.fs.read().clone()
+        self.try_fs_struct()
+            .expect("live task must have an fs_struct")
     }
 
-    pub fn fs_struct_mut(&self) -> RwLockWriteGuard<'_, Arc<FsStruct>> {
-        self.fs.write()
+    /// Return the filesystem context when the task has not passed exit_fs().
+    pub fn try_fs_struct(&self) -> Option<Arc<FsStruct>> {
+        self.fs.read().clone()
     }
 
     #[inline(always)]
     pub fn fs_struct_is_shared(&self) -> bool {
-        Arc::strong_count(&*self.fs.read()) > 1
+        Arc::strong_count(
+            self.fs
+                .read()
+                .as_ref()
+                .expect("live task must have an fs_struct"),
+        ) > 1
     }
 
     pub fn set_fs_struct(&self, fs: Arc<FsStruct>) -> Arc<FsStruct> {
         let mut guard = self.fs.write();
-        let old = guard.clone();
-        *guard = fs;
+        let old = guard.replace(fs).expect("live task must have an fs_struct");
         old
     }
 
+    /// Drop this task's reference to its filesystem context during exit.
+    ///
+    /// This mirrors Linux `exit_fs()`: a zombie retains process metadata for
+    /// wait(2), but must no longer pin its root or working-directory mounts.
+    pub(super) fn exit_fs(&self) {
+        self.fs.write().take();
+    }
+
     pub fn pwd_inode(&self) -> Arc<dyn IndexNode> {
-        self.fs.read().pwd()
+        self.fs_struct().pwd()
     }
 
     /// Returns an `Arc` pointer to the file descriptor table.

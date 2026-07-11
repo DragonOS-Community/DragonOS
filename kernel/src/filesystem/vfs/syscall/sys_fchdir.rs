@@ -40,6 +40,8 @@ impl Syscall for SysFchdirHandle {
             .get_file_by_fd(fd)
             .ok_or(SystemError::EBADF)?;
         let inode = file.inode();
+        let resolved = crate::filesystem::vfs::utils::ResolvedPath::new(inode)?;
+        let inode = resolved.inode();
         let metadata = inode.metadata()?;
 
         if metadata.file_type != crate::filesystem::vfs::FileType::Dir {
@@ -53,7 +55,7 @@ impl Syscall for SysFchdirHandle {
 
         let path = inode.absolute_path()?;
         pcb.basic_mut().set_cwd(path);
-        pcb.fs_struct_mut().set_pwd(inode);
+        pcb.fs_struct().set_pwd_resolved(resolved);
         return Ok(0);
     }
 

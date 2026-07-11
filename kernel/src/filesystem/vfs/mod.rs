@@ -3,6 +3,7 @@ pub mod fasync;
 pub mod fcntl;
 pub mod file;
 pub mod flock;
+pub mod inode_lifecycle;
 pub mod iov;
 pub mod mount;
 pub mod open;
@@ -45,6 +46,7 @@ use crate::{
     time::PosixTimeSpec,
 };
 
+pub use self::inode_lifecycle::{EvictionEpoch, InodeRetentionKind, InodeRetentionState};
 pub use self::{file::FilePrivateData, mount::MountFS};
 use self::{
     file::{FileFlags, FileMode},
@@ -369,6 +371,43 @@ pub trait PollableInode: Any + Sync + Send + Debug + CastFromSync {
 }
 
 pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
+    /// Optional VFS accounting embedded by this canonical inode.
+    fn retention_state(&self) -> Option<&InodeRetentionState> {
+        None
+    }
+
+    /// Retain this canonical inode lifetime for a semantic VFS owner.
+    ///
+    /// This is deliberately distinct from `open()`: `O_PATH`, caches and
+    /// asynchronous work retain an inode without a filesystem open callback.
+    /// Admission of a new canonical lifetime must be resolved before this
+    /// infallible hook is called.
+    fn retain(&self, kind: InodeRetentionKind) -> Result<(), SystemError> {
+        if let Some(state) = self.retention_state() {
+            state.retain(kind)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Release one semantic inode lifetime owner.
+    ///
+    /// Implementations must not sleep or perform fallible I/O here. The final
+    /// release may publish a one-shot eviction request for an explicit worker
+    /// or shutdown drain.
+    fn release(&self, kind: InodeRetentionKind) {
+        if self
+            .retention_state()
+            .is_some_and(|state| state.release(kind))
+        {
+            self.on_zero_retention();
+        }
+    }
+
+    /// Non-blocking final-release notification. Implementations may enqueue,
+    /// but must not execute, fallible eviction work here.
+    fn on_zero_retention(&self) {}
+
     /// 是否为"流式"文件（不可 random access / 不可 seek）。
     ///
     /// 语义目标：把"pread/pwrite/lseek 应返回 ESPIPE"的判定收敛在 VFS 层，
@@ -1272,18 +1311,65 @@ impl dyn IndexNode {
         max_follow_times: usize,
         follow_final_symlink: bool,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.do_lookup_follow_symlink_owned(path, max_follow_times, follow_final_symlink, None)
+            .map(|(inode, _)| inode)
+    }
+
+    /// Path walk variant that transfers a mount/operation pin at every mount
+    /// transition before the newly found inode is inspected or used.
+    pub fn lookup_follow_symlink_owned(
+        &self,
+        start: &utils::ResolvedPath,
+        path: &str,
+        max_follow_times: usize,
+        follow_final_symlink: bool,
+    ) -> Result<utils::ResolvedPath, SystemError> {
+        self.do_lookup_follow_symlink_owned(
+            path,
+            max_follow_times,
+            follow_final_symlink,
+            Some(start.derive()?),
+        )?
+        .1
+        .ok_or(SystemError::ESTALE)
+    }
+
+    fn do_lookup_follow_symlink_owned(
+        &self,
+        path: &str,
+        max_follow_times: usize,
+        follow_final_symlink: bool,
+        mut ownership: Option<utils::ResolvedPath>,
+    ) -> Result<(Arc<dyn IndexNode>, Option<utils::ResolvedPath>), SystemError> {
         if self.metadata()?.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
 
         // Linux 语义：绝对路径应当以"进程 fs root"（可被 chroot 改变）为起点
-        let process_root_inode = ProcessManager::current_pcb().fs_struct().root();
+        let fs_struct = ProcessManager::current_pcb().fs_struct();
+        let process_root_path = if ownership.is_some() {
+            Some(fs_struct.root_resolved()?)
+        } else {
+            None
+        };
+        let process_root_inode = process_root_path
+            .as_ref()
+            .map(|path| path.inode())
+            .unwrap_or_else(|| fs_struct.root());
         let trailing_slash = path.ends_with('/');
 
         // 处理绝对路径
         // result: 上一个被找到的inode
         // rest_path: 还没有查找的路径
         let (mut result, mut rest_path) = if let Some(rest) = path.strip_prefix('/') {
+            if ownership.is_some() {
+                ownership = Some(
+                    process_root_path
+                        .as_ref()
+                        .ok_or(SystemError::ESTALE)?
+                        .derive()?,
+                );
+            }
             (process_root_inode.clone(), String::from(rest))
         } else {
             // 是相对路径
@@ -1333,6 +1419,9 @@ impl dyn IndexNode {
             }
 
             let inode = result.find(&name)?;
+            if ownership.is_some() {
+                ownership = Some(utils::ResolvedPath::new(inode.clone())?);
+            }
             let file_type = inode.metadata()?.file_type;
             // 如果已经是路径的最后一个部分，并且不希望跟随最后的符号链接
             if rest_path.is_empty() && !follow_final_symlink && file_type == FileType::SymLink {
@@ -1340,7 +1429,7 @@ impl dyn IndexNode {
                 // 此时即使请求"不跟随最终 symlink"，也不能返回 symlink 本身。
                 if !trailing_slash {
                     // 返回符号链接本身
-                    return Ok(inode);
+                    return Ok((inode, ownership));
                 }
             }
 
@@ -1381,8 +1470,11 @@ impl dyn IndexNode {
                 // 这些链接的 readlink 返回的路径可能不可解析（如 pipe:[xxx]），
                 // 但它们有一个 special_node 指向真实的 inode
                 if let Some(SpecialNodeData::Reference(target_inode)) = inode.special_node() {
+                    if ownership.is_some() {
+                        ownership = Some(utils::ResolvedPath::new(target_inode.clone())?);
+                    }
                     if rest_path.is_empty() {
-                        return Ok(target_inode);
+                        return Ok((target_inode, ownership));
                     } else {
                         // 将 result 设为 magic link 的目标 inode，继续迭代
                         result = target_inode;
@@ -1417,6 +1509,14 @@ impl dyn IndexNode {
                 // 相对路径：从当前 result（symlink 所在目录）开始
                 if let Some(rest) = new_path.strip_prefix('/') {
                     result = process_root_inode.clone();
+                    if ownership.is_some() {
+                        ownership = Some(
+                            process_root_path
+                                .as_ref()
+                                .ok_or(SystemError::ESTALE)?
+                                .derive()?,
+                        );
+                    }
                     rest_path = String::from(rest);
                 } else {
                     rest_path = new_path;
@@ -1433,7 +1533,7 @@ impl dyn IndexNode {
             return Err(SystemError::ENOTDIR);
         }
 
-        return Ok(result);
+        return Ok((result, ownership));
     }
 }
 
@@ -1674,6 +1774,38 @@ pub trait FileSystem: Any + Sync + Send + Debug {
             return Err(SystemError::EINVAL);
         }
         Ok(request.sb_flags & request.sb_flags_mask)
+    }
+
+    /// Stop admitting new external inode lifetimes during final superblock
+    /// shutdown. Cache shrink and asynchronous cancellation may still publish
+    /// eviction requests after this point.
+    fn close_external_inode_admission(&self) {}
+
+    /// Release filesystem-owned dentry/inode cache retention during final
+    /// shutdown. Implementations may publish eviction requests here.
+    fn shrink_inode_cache_for_shutdown(&self) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    /// Stop or finish asynchronous retention producers before the eviction
+    /// queue is sealed.
+    fn quiesce_async_inode_work(&self) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    /// Seal the eviction producer queue after cache shrink and asynchronous
+    /// work have quiesced, returning the final request epoch to drain.
+    fn seal_eviction_queue(&self) -> EvictionEpoch {
+        EvictionEpoch::EMPTY
+    }
+
+    /// Wait for all eviction requests up to `epoch` and report their errors.
+    ///
+    /// Filesystems that implement deferred eviction must also retain errors in
+    /// their persistent writeback/error sequence; this call is not a
+    /// destructive single-consumer error channel.
+    fn drain_evictions_through(&self, _epoch: EvictionEpoch) -> Result<(), SystemError> {
+        Ok(())
     }
 
     /// VFS permission checking policy for this filesystem instance.

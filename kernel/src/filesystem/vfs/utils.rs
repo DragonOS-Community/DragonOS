@@ -8,7 +8,75 @@ use system_error::SystemError;
 use crate::process::cred::{Cred, Kgid};
 use crate::process::ProcessControlBlock;
 
-use super::{fcntl::AtFlags, FileType, IndexNode, InodeMode};
+use super::{
+    fcntl::AtFlags,
+    inode_lifecycle::{InodeRetentionGuard, InodeRetentionKind},
+    mount::{MountExternalGuard, MountFSInode},
+    FileType, IndexNode, InodeMode,
+};
+use crate::libs::casting::DowncastArc;
+
+/// A resolved inode plus the mount and operation ownership required while a
+/// syscall performs permission, truncate, and open work on it.
+#[derive(Debug)]
+pub struct ResolvedPath {
+    inode: Arc<dyn IndexNode>,
+    mount_guard: Option<MountExternalGuard>,
+    _operation_guard: InodeRetentionGuard,
+}
+
+impl ResolvedPath {
+    pub fn new(inode: Arc<dyn IndexNode>) -> Result<Self, SystemError> {
+        let mount_guard = inode
+            .clone()
+            .downcast_arc::<MountFSInode>()
+            .map(|inode| inode.mount_fs().try_pin_external())
+            .transpose()?;
+        let operation_guard =
+            InodeRetentionGuard::new(inode.clone(), InodeRetentionKind::Operation)?;
+        Ok(Self {
+            inode,
+            mount_guard,
+            _operation_guard: operation_guard,
+        })
+    }
+
+    pub(crate) fn from_existing_mount(
+        inode: Arc<dyn IndexNode>,
+        mount_guard: Option<MountExternalGuard>,
+    ) -> Result<Self, SystemError> {
+        let operation_guard =
+            InodeRetentionGuard::new(inode.clone(), InodeRetentionKind::Operation)?;
+        Ok(Self {
+            inode,
+            mount_guard,
+            _operation_guard: operation_guard,
+        })
+    }
+
+    pub fn inode(&self) -> Arc<dyn IndexNode> {
+        self.inode.clone()
+    }
+
+    pub fn derive(&self) -> Result<Self, SystemError> {
+        let mount_guard = self
+            .mount_guard
+            .as_ref()
+            .map(MountExternalGuard::derive)
+            .transpose()?;
+        Self::from_existing_mount(self.inode.clone(), mount_guard)
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        Arc<dyn IndexNode>,
+        Option<MountExternalGuard>,
+        InodeRetentionGuard,
+    ) {
+        (self.inode.clone(), self.mount_guard, self._operation_guard)
+    }
+}
 
 /// @brief 切分路径字符串，返回最左侧那一级的目录名和剩余的部分。
 ///
@@ -79,6 +147,31 @@ pub fn user_path_at(
     }
 
     Ok((pcb.pwd_inode(), ret_path))
+}
+
+/// Resolve the starting point while retaining its mount for the complete path walk.
+pub fn user_resolved_path_at(
+    pcb: &Arc<ProcessControlBlock>,
+    dirfd: i32,
+    path: &str,
+) -> Result<(ResolvedPath, String), SystemError> {
+    let ret_path = String::from(path);
+    if path.is_empty() {
+        return Ok((pcb.fs_struct().pwd_resolved()?, ret_path));
+    }
+    if path.as_bytes()[0] == b'/' {
+        return Ok((pcb.fs_struct().root_resolved()?, ret_path));
+    }
+    if dirfd != AtFlags::AT_FDCWD.bits() {
+        let binding = pcb.fd_table();
+        let fd_table = binding.read();
+        let file = fd_table.get_file_by_fd(dirfd).ok_or(SystemError::EBADF)?;
+        if file.file_type() != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+        return Ok((file.resolved_path()?, ret_path));
+    }
+    Ok((pcb.fs_struct().pwd_resolved()?, ret_path))
 }
 
 pub fn is_ancestor(ancestor: &Arc<dyn IndexNode>, node: &Arc<dyn IndexNode>) -> bool {

@@ -118,11 +118,10 @@ fn generate_maps_content(target: &ProcPidTarget) -> Result<Vec<u8>, SystemError>
     let Some(vm) = vm else {
         return Ok(Vec::new());
     };
-    let root_prefix = target_pcb
-        .fs_struct()
-        .root()
-        .absolute_path()
-        .unwrap_or_default();
+    let Some(fs) = target_pcb.try_fs_struct() else {
+        return Ok(Vec::new());
+    };
+    let root_prefix = fs.root().absolute_path().unwrap_or_default();
 
     let as_guard = vm.read_guard_no_reservations();
 

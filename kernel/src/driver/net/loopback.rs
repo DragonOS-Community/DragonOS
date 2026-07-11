@@ -21,8 +21,6 @@ use alloc::fmt::Debug;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::cell::UnsafeCell;
-use core::ops::{Deref, DerefMut};
 use smoltcp::wire::HardwareAddress;
 use smoltcp::{
     phy::{self},
@@ -43,6 +41,7 @@ const DEVICE_NAME: &str = "loopback";
 /// 用于储存lo网卡接收到的数据
 pub struct LoopbackRxToken {
     buffer: Vec<u8>,
+    driver: LoopbackDriver,
 }
 
 impl phy::RxToken for LoopbackRxToken {
@@ -59,6 +58,13 @@ impl phy::RxToken for LoopbackRxToken {
     where
         F: FnOnce(&[u8]) -> R,
     {
+        if let Some(iface) = self.driver.iface() {
+            crate::net::socket::packet::deliver_ip_to_packet_sockets(
+                &iface,
+                &self.buffer,
+                crate::net::socket::packet::PacketType::Loopback,
+            );
+        }
         f(self.buffer.as_slice())
     }
 }
@@ -86,21 +92,14 @@ impl phy::TxToken for LoopbackTxToken {
     {
         let mut buffer = vec![0; len];
         let result = f(buffer.as_mut_slice());
-        {
-            let mut device = self.driver.inner.lock();
-            device.loopback_transmit(buffer);
-        }
-
-        // Linux 语义：lo 发送应尽快在本地“收到”并分发给 socket。
-        // 优先走 NAPI schedule（bounded work），避免唤醒 netns 线程去做全量扫描。
         if let Some(iface) = self.driver.iface() {
-            if let Some(napi) = iface.napi_struct() {
-                napi_schedule(napi);
-            } else if let Some(netns) = iface.common().net_namespace() {
-                // 兼容兜底：若未配置 NAPI，则仍唤醒 netns 线程推进一次 poll。
-                netns.wakeup_poll_thread();
-            }
+            crate::net::socket::packet::deliver_ip_to_packet_sockets(
+                &iface,
+                &buffer,
+                crate::net::socket::packet::PacketType::Outgoing,
+            );
         }
+        let _ = self.driver.submit_frame(buffer);
         // debug!("lo transmit!");
         result
     }
@@ -161,43 +160,13 @@ impl Loopback {
     }
 }
 
-/// ## driver的包裹器
-/// 为实现获得不可变引用的Interface的内部可变性，故为Driver提供UnsafeCell包裹器
-///
-/// 参考virtio_net.rs
-struct LoopbackDriverWapper(UnsafeCell<LoopbackDriver>);
-unsafe impl Send for LoopbackDriverWapper {}
-unsafe impl Sync for LoopbackDriverWapper {}
-
-/// ## deref 方法返回一个指向 `LoopbackDriver` 的引用。
-impl Deref for LoopbackDriverWapper {
-    type Target = LoopbackDriver;
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.0.get() }
-    }
-}
-/// ## `deref_mut` 方法返回一个指向可变 `LoopbackDriver` 的引用。
-impl DerefMut for LoopbackDriverWapper {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut *self.0.get() }
-    }
-}
-
-impl LoopbackDriverWapper {
-    /// ## force_get_mut返回一个指向可变 `LoopbackDriver` 的引用。
-    #[allow(clippy::mut_from_ref)]
-    #[allow(clippy::mut_from_ref)]
-    fn force_get_mut(&self) -> &mut LoopbackDriver {
-        unsafe { &mut *self.0.get() }
-    }
-}
-
 /// ## Loopback驱动
 /// 负责操作Loopback设备实现基本的网卡功能
+#[derive(Clone)]
 pub struct LoopbackDriver {
     pub inner: Arc<SpinLock<Loopback>>,
     /// 指向所属网络接口的弱引用，用于唤醒 netns 轮询线程
-    iface: SpinLock<Option<Weak<dyn Iface>>>,
+    iface: Arc<SpinLock<Option<Weak<dyn Iface>>>>,
 }
 
 impl Default for LoopbackDriver {
@@ -206,16 +175,7 @@ impl Default for LoopbackDriver {
         let inner = Arc::new(SpinLock::new(Loopback::default()));
         LoopbackDriver {
             inner,
-            iface: SpinLock::new(None),
-        }
-    }
-}
-
-impl Clone for LoopbackDriver {
-    fn clone(&self) -> Self {
-        LoopbackDriver {
-            inner: self.inner.clone(),
-            iface: SpinLock::new(self.iface.lock().clone()),
+            iface: Arc::new(SpinLock::new(None)),
         }
     }
 }
@@ -266,7 +226,10 @@ impl phy::Device for LoopbackDriver {
                 }
             }
 
-            let rx = LoopbackRxToken { buffer };
+            let rx = LoopbackRxToken {
+                buffer,
+                driver: self.clone(),
+            };
             let tx = LoopbackTxToken {
                 driver: self.clone(),
             };
@@ -290,6 +253,8 @@ impl phy::Device for LoopbackDriver {
 }
 
 impl LoopbackDriver {
+    const MAX_PACKET_LEN: usize = 65535;
+
     pub fn set_iface(&self, iface: Weak<dyn Iface>) {
         *self.iface.lock() = Some(iface);
     }
@@ -301,6 +266,28 @@ impl LoopbackDriver {
     pub fn has_pending_rx(&self) -> bool {
         !self.inner.lock().queue.is_empty()
     }
+
+    fn submit_frame(&self, frame: Vec<u8>) -> Result<(), SystemError> {
+        if frame.len() > Self::MAX_PACKET_LEN {
+            return Err(SystemError::EMSGSIZE);
+        }
+        self.inner.lock().loopback_transmit(frame);
+        if let Some(iface) = self.iface() {
+            if let Some(napi) = iface.napi_struct() {
+                napi_schedule(napi);
+            } else if let Some(netns) = iface.common().net_namespace() {
+                netns.wakeup_poll_thread();
+            }
+        }
+        Ok(())
+    }
+
+    pub fn try_raw_transmit(&self, frame: &[u8]) -> Result<(), SystemError> {
+        if frame.len() > Self::MAX_PACKET_LEN {
+            return Err(SystemError::EMSGSIZE);
+        }
+        self.submit_frame(frame.to_vec())
+    }
 }
 
 /// ## LoopbackInterface结构
@@ -308,7 +295,7 @@ impl LoopbackDriver {
 #[cast_to([sync] Iface)]
 #[cast_to([sync] Device)]
 pub struct LoopbackInterface {
-    driver: LoopbackDriverWapper,
+    driver: LoopbackDriver,
     common: IfaceCommon,
     inner: SpinLock<InnerLoopbackInterface>,
     locked_kobj_state: LockedKObjectState,
@@ -334,7 +321,8 @@ impl LoopbackInterface {
     /// ## `new` 是一个公共函数，用于创建一个新的 `LoopbackInterface` 实例。
     /// 生成一个新的接口 ID。创建一个新的接口配置，设置其硬件地址和随机种子，使用接口配置和驱动器创建一个新的 `smoltcp::iface::Interface` 实例。
     /// 设置接口的 IP 地址为 127.0.0.1。
-    /// 创建一个新的 `LoopbackDriverWapper` 实例，包装驱动器。
+    /// Saves a cloneable driver handle; the underlying queue and the interface
+    /// back-reference are protected by a shared lock.
     /// 创建一个新的 `LoopbackInterface` 实例，包含驱动器、接口 ID、接口和名称，并将其封装在一个 `Arc` 中。
     /// ## 参数
     /// - `driver`：一个 `LoopbackDriver` 实例，用于驱动网络环回操作。
@@ -406,7 +394,7 @@ impl LoopbackInterface {
         let mtu = driver.capabilities().max_transmission_unit;
 
         let iface = Arc::new(LoopbackInterface {
-            driver: LoopbackDriverWapper(UnsafeCell::new(driver)),
+            driver,
             common: IfaceCommon::new(
                 iface_id,
                 super::types::InterfaceType::LOOPBACK,
@@ -425,10 +413,7 @@ impl LoopbackInterface {
 
         // 记录 iface 弱引用，用于 lo 发送时唤醒 netns 轮询线程
         let iface_dyn = iface.clone() as Arc<dyn Iface>;
-        iface
-            .driver
-            .force_get_mut()
-            .set_iface(Arc::downgrade(&iface_dyn));
+        iface.driver.set_iface(Arc::downgrade(&iface_dyn));
 
         // 设置 NAPI：让 loopback 也走 bounded poll（对齐 Linux）。
         let napi_struct = NapiStruct::new(iface.clone(), 10);
@@ -590,14 +575,31 @@ impl Iface for LoopbackInterface {
         // 一次 `poll()` 的 egress 阶段可能会把新包重新塞回 lo 的本地接收队列。
         // 即使 smoltcp 没返回 `SocketStateChanged` / `poll_at == Now`，
         // 这些新包也需要立刻再 poll 一轮才能被当前线程吃掉。
-        let progressed = self.common.poll(self.driver.force_get_mut());
+        let mut driver = self.driver.clone();
+        let progressed = self.common.poll(&mut driver);
         progressed || self.driver.has_pending_rx()
     }
 
     fn poll_napi(&self, budget: usize) -> bool {
         // 与普通 poll 相同：若 egress 刚把包送回 lo 队列，则 NAPI 也必须继续自驱动。
-        let has_work_left = self.common.poll_napi(self.driver.force_get_mut(), budget);
+        let mut driver = self.driver.clone();
+        let has_work_left = self.common.poll_napi(&mut driver, budget);
         has_work_left || self.driver.has_pending_rx()
+    }
+
+    fn raw_transmit(&self, frame: &[u8]) -> Result<(), SystemError> {
+        if frame.len() < 14 {
+            return Err(SystemError::EINVAL);
+        }
+        self.driver.try_raw_transmit(&frame[14..])?;
+        if let Some(iface) = self.driver.iface() {
+            crate::net::socket::packet::deliver_to_packet_sockets(
+                &iface,
+                frame,
+                crate::net::socket::packet::PacketType::Outgoing,
+            );
+        }
+        Ok(())
     }
 
     fn should_drop_rx_packet(&self, packet: &[u8]) -> bool {

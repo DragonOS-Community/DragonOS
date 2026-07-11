@@ -7,6 +7,7 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
 
@@ -117,6 +118,13 @@ TEST(DevtmpfsSemantics, DevMountExportsLinuxTypeAndStatfs) {
 
     EXPECT_TRUE(ProcMountsHasDevtmpfsAt("/dev"));
     EXPECT_TRUE(MountInfoHasDevtmpfsAt("/dev"));
+}
+
+TEST(DevtmpfsSemantics, StatfsRejectsInvalidPathPointer) {
+    struct statfs st = {};
+    errno = 0;
+    EXPECT_EQ(-1, syscall(SYS_statfs, reinterpret_cast<const char*>(1), &st));
+    EXPECT_EQ(EFAULT, errno);
 }
 
 TEST(DevtmpfsSemantics, BuiltinDeviceNumbersAndLinks) {

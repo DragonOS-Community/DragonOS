@@ -8,8 +8,11 @@ use log::error;
 use system_error::SystemError;
 
 use super::{
-    append_lock::with_inode_append_lock, mount::MountFSInode, utils::should_remove_sgid, FileType,
-    IndexNode, InodeId, Metadata, SetMetadataMask, SpecialNodeData,
+    append_lock::with_inode_append_lock,
+    inode_lifecycle::{InodeRetentionGuard, InodeRetentionKind},
+    mount::{MountExternalGuard, MountFSInode},
+    utils::should_remove_sgid,
+    FileType, IndexNode, InodeId, Metadata, SetMetadataMask, SpecialNodeData,
 };
 use crate::{arch::ipc::signal::Signal, filesystem::vfs::InodeFlags, process::pid::PidPrivateData};
 use crate::{
@@ -528,9 +531,25 @@ pub struct File {
     /// via `eventpoll_release(file)`.  DragonOS keeps the same lifetime edge
     /// here so fd numbers can be safely reused after close.
     epitems: Arc<LockedEPItemLinkedList>,
+    /// One semantic inode pin per open file description. Duplicated file
+    /// descriptors and VMAs share this `File`, while `O_PATH` still owns it.
+    /// Declared last so the explicit `Drop` body runs `close()` before release.
+    _inode_retention: InodeRetentionGuard,
+    /// Pins the mount used to resolve this pathname independently from the
+    /// operation inode (which device/FIFO resolution may replace).
+    _mount_guard: Option<MountExternalGuard>,
 }
 
 impl File {
+    pub fn resolved_path(&self) -> Result<super::utils::ResolvedPath, SystemError> {
+        let mount_guard = self
+            ._mount_guard
+            .as_ref()
+            .map(MountExternalGuard::derive)
+            .transpose()?;
+        super::utils::ResolvedPath::from_existing_mount(self.inode.clone(), mount_guard)
+    }
+
     #[inline]
     pub fn cred(&self) -> Arc<Cred> {
         self.cred.clone()
@@ -763,8 +782,40 @@ impl File {
     /// semantics (e.g. sockets created by socket syscalls).
     pub fn new_with_private_data(
         inode: Arc<dyn IndexNode>,
+        flags: FileFlags,
+        private_data_init: FilePrivateData,
+    ) -> Result<Self, SystemError> {
+        let mount_guard = inode
+            .clone()
+            .downcast_arc::<MountFSInode>()
+            .map(|inode| inode.mount_fs().try_pin_external())
+            .transpose()?;
+        Self::new_with_private_data_and_mount_guard(inode, flags, private_data_init, mount_guard)
+    }
+
+    /// Construct a pathname-backed file by consuming the mount pin acquired
+    /// during path resolution. This closes the lookup-to-open umount window.
+    pub fn new_with_mount_guard(
+        inode: Arc<dyn IndexNode>,
+        flags: FileFlags,
+        mount_guard: Option<MountExternalGuard>,
+        operation_guard: InodeRetentionGuard,
+    ) -> Result<Self, SystemError> {
+        let file = Self::new_with_private_data_and_mount_guard(
+            inode,
+            flags,
+            FilePrivateData::default(),
+            mount_guard,
+        );
+        drop(operation_guard);
+        file
+    }
+
+    fn new_with_private_data_and_mount_guard(
+        inode: Arc<dyn IndexNode>,
         mut flags: FileFlags,
         private_data_init: FilePrivateData,
+        mount_guard: Option<MountExternalGuard>,
     ) -> Result<Self, SystemError> {
         let mut inode = inode;
         let mut file_type = inode.metadata()?.file_type;
@@ -810,6 +861,10 @@ impl File {
         flags.remove(FileFlags::O_CLOEXEC);
 
         let mut mode = FileMode::open_fmode(flags);
+        // Pin the final operation inode before invoking filesystem open. If
+        // open fails, the local guard releases exactly once on this error path.
+        let inode_retention =
+            InodeRetentionGuard::new(inode.clone(), InodeRetentionKind::OpenFileDescription)?;
 
         let private_data = Mutex::new(private_data_init);
         if is_path {
@@ -879,6 +934,8 @@ impl File {
             wb_error_seq: Mutex::new(wb_error_seq),
             sb_error_seq: Mutex::new(sb_error_seq),
             epitems: Arc::new(LockedEPItemLinkedList::default()),
+            _inode_retention: inode_retention,
+            _mount_guard: mount_guard,
         };
 
         return Ok(f);
@@ -1477,15 +1534,40 @@ impl File {
     ///
     /// @return Option<File> 克隆后的文件结构体。如果克隆失败，返回None
     pub fn try_clone(&self) -> Option<File> {
+        let inode_retention =
+            InodeRetentionGuard::new(self.inode.clone(), InodeRetentionKind::OpenFileDescription)
+                .ok()?;
+        let flags = self.flags();
+        let mode = self.mode();
+        let private_data = Mutex::new(self.private_data.lock().clone());
+        let mount_guard = self
+            ._mount_guard
+            .as_ref()
+            .map(MountExternalGuard::derive)
+            .transpose()
+            .ok()?;
+
+        if !mode.contains(FileMode::FMODE_PATH)
+            && self.inode.open(private_data.lock(), &flags).is_err()
+        {
+            return None;
+        }
+
+        if mode.contains(FileMode::FMODE_WRITER) {
+            if let Some(mnt_inode) = self.inode.clone().downcast_arc::<MountFSInode>() {
+                mnt_inode.mount_fs().inc_write_count();
+            }
+        }
+
         let res = Self {
             open_file_id: alloc_open_file_id(),
             inode: self.inode.clone(),
             offset: AtomicUsize::new(self.offset.load(Ordering::SeqCst)),
-            flags: RwSem::new(self.flags()),
-            mode: RwSem::new(self.mode()),
+            flags: RwSem::new(flags),
+            mode: RwSem::new(mode),
             file_type: self.file_type,
             readdir_subdirs_name: Mutex::new(self.readdir_subdirs_name.lock().clone()),
-            private_data: Mutex::new(self.private_data.lock().clone()),
+            private_data,
             cred: self.cred.clone(),
             owner: Mutex::new(FileOwner::new()),
             posix_lock_key: self.posix_lock_key,
@@ -1493,17 +1575,9 @@ impl File {
             wb_error_seq: Mutex::new(*self.wb_error_seq.lock()),
             sb_error_seq: Mutex::new(*self.sb_error_seq.lock()),
             epitems: Arc::new(LockedEPItemLinkedList::default()),
+            _inode_retention: inode_retention,
+            _mount_guard: mount_guard,
         };
-        // 调用inode的open方法，让inode知道有新的文件打开了这个inode
-        // TODO: reopen is not a good idea for some inodes, need a better design
-        if self
-            .inode
-            .open(res.private_data.lock(), &res.flags())
-            .is_err()
-        {
-            return None;
-        }
-
         return Some(res);
     }
 

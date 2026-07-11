@@ -4,6 +4,7 @@ pub mod fs;
 pub mod inode;
 pub mod private_data;
 pub mod protocol;
+pub(crate) mod reply;
 pub mod stats;
 pub mod trace;
 pub mod virtiofs;

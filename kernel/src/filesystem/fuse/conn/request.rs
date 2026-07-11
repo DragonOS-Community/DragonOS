@@ -26,6 +26,7 @@ use super::{
     stats, trace, FuseConn, FusePendingState, FuseReplyCapacity, FuseReplyCapacitySource,
     FuseReplyContract, FuseRequest, FuseRequestCred,
 };
+use crate::filesystem::fuse::reply::FuseReply;
 
 impl FuseConn {
     fn is_high_priority_opcode(opcode: u32) -> bool {
@@ -96,7 +97,7 @@ impl FuseConn {
         opcode: u32,
         nodeid: u64,
         payload: &[u8],
-    ) -> Result<Vec<u8>, SystemError> {
+    ) -> Result<FuseReply, SystemError> {
         if opcode != FUSE_INIT {
             let cred = ProcessManager::current_pcb().cred();
             if !self.allow_current_process(&cred) {
@@ -113,7 +114,7 @@ impl FuseConn {
         opcode: u32,
         nodeid: u64,
         payload: &[u8],
-    ) -> Result<Vec<u8>, SystemError> {
+    ) -> Result<FuseReply, SystemError> {
         if opcode != FUSE_INIT {
             self.wait_initialized()?;
         }
@@ -128,7 +129,7 @@ impl FuseConn {
         nodeid: u64,
         payload: &[u8],
         req_cred: FuseRequestCred,
-    ) -> Result<Vec<u8>, SystemError> {
+    ) -> Result<FuseReply, SystemError> {
         if opcode != FUSE_INIT {
             self.wait_initialized()?;
         }
@@ -174,7 +175,7 @@ impl FuseConn {
         &self,
         opcode: u32,
         pending: Arc<FusePendingState>,
-    ) -> Result<Vec<u8>, SystemError> {
+    ) -> Result<FuseReply, SystemError> {
         match pending.wait_complete() {
             Err(SystemError::EINTR) | Err(SystemError::ERESTARTSYS) => {
                 if opcode != FUSE_INTERRUPT {
@@ -241,7 +242,9 @@ impl FuseConn {
     ) -> Result<Option<FuseReplyCapacity>, SystemError> {
         let minor = self.reply_layout_minor.load(Ordering::Acquire);
         let header = size_of::<FuseOutHeader>();
-        let exact = |payload_len: usize| -> Result<Option<FuseReplyCapacity>, SystemError> {
+        let exact = |payload_len: usize,
+                     normalized_payload_len: usize|
+         -> Result<Option<FuseReplyCapacity>, SystemError> {
             let bytes = header
                 .checked_add(payload_len)
                 .ok_or(SystemError::EOVERFLOW)?;
@@ -250,6 +253,7 @@ impl FuseConn {
             }
             Ok(Some(FuseReplyCapacity {
                 bytes,
+                retained_bytes: bytes.max(normalized_payload_len),
                 source: FuseReplyCapacitySource::Exact,
             }))
         };
@@ -287,7 +291,12 @@ impl FuseConn {
             _ => None,
         };
         if let Some(payload_len) = fixed_payload {
-            return exact(payload_len);
+            let normalized_payload_len = if minor < 4 && opcode == FUSE_STATFS {
+                size_of::<FuseStatfsOut>()
+            } else {
+                payload_len
+            };
+            return exact(payload_len, normalized_payload_len);
         }
 
         let requested = match opcode {
@@ -325,6 +334,7 @@ impl FuseConn {
                 return match self.backend_reply_limit {
                     Some(bytes) if bytes >= header => Ok(Some(FuseReplyCapacity {
                         bytes,
+                        retained_bytes: bytes,
                         source: FuseReplyCapacitySource::ExplicitFallback,
                     })),
                     Some(_) => Err(SystemError::EOVERFLOW),
@@ -341,6 +351,7 @@ impl FuseConn {
         }
         Ok(Some(FuseReplyCapacity {
             bytes,
+            retained_bytes: bytes,
             source: FuseReplyCapacitySource::RequestBounded,
         }))
     }

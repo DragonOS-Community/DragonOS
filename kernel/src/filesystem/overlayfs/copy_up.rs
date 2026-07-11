@@ -223,6 +223,11 @@ impl OvlInode {
             }
             current_path.push_str(component);
 
+            // Serialize the absence check and publication for this ancestor
+            // independently from leaf copy-up stripes.  The guard is dropped
+            // after each component, so ancestor locks are never nested.
+            let fs = self.overlay_fs()?;
+            let _ancestor_guard = fs.ancestor_copy_up_lock(&current_path).lock();
             match current.find(component) {
                 Ok(next) => {
                     if Self::is_whiteout_inode_checked(&next)?

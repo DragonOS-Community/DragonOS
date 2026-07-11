@@ -1113,6 +1113,80 @@ TEST(OverlayFsSemantics, DetachedOldDirectoryIsNotReusedForAncestorCopyUp) {
     EXPECT_EQ(0, close(old_dir_fd)) << strerror(errno);
 }
 
+TEST(OverlayFsSemantics, ConcurrentChildrenShareAncestorPublication) {
+    constexpr int kParentCount = 32;
+    constexpr int kEvictionLookups = 1100;
+    ScopedOverlayEnv scoped("overlayfs_concurrent_ancestors");
+    const auto& env = scoped.env;
+    std::vector<int> left_fds;
+    std::vector<int> right_fds;
+
+    prepare_overlay_env(env);
+    for (int i = 0; i < kParentCount; ++i) {
+        std::string dir = join_path(env.lower, ("dir" + std::to_string(i)).c_str());
+        ASSERT_EQ(0, mkdir(dir.c_str(), 0755)) << strerror(errno);
+        ASSERT_EQ(0, write_text(join_path(dir, "left"), "left"));
+        ASSERT_EQ(0, write_text(join_path(dir, "right"), "right"));
+    }
+    for (int i = 0; i < kEvictionLookups; ++i) {
+        ASSERT_EQ(0, write_text(
+                         join_path(env.lower, ("evict" + std::to_string(i)).c_str()),
+                         "x"));
+    }
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+
+    for (int i = 0; i < kParentCount; ++i) {
+        std::string dir = join_path(env.merged, ("dir" + std::to_string(i)).c_str());
+        left_fds.push_back(open(join_path(dir, "left").c_str(), O_RDONLY | O_CLOEXEC));
+        right_fds.push_back(open(join_path(dir, "right").c_str(), O_RDONLY | O_CLOEXEC));
+        ASSERT_GE(left_fds.back(), 0) << strerror(errno);
+        ASSERT_GE(right_fds.back(), 0) << strerror(errno);
+    }
+    for (int i = 0; i < kEvictionLookups; ++i) {
+        struct stat st = {};
+        std::string path = join_path(env.merged, ("evict" + std::to_string(i)).c_str());
+        ASSERT_EQ(0, stat(path.c_str(), &st)) << strerror(errno);
+    }
+
+    int start_pipe[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(start_pipe)) << strerror(errno);
+    std::vector<pid_t> children;
+    for (const auto* fds : {&left_fds, &right_fds}) {
+        pid_t child = fork();
+        ASSERT_GE(child, 0) << strerror(errno);
+        if (child == 0) {
+            close(start_pipe[1]);
+            char token = 0;
+            if (read(start_pipe[0], &token, 1) != 1) {
+                _exit(2);
+            }
+            for (int fd : *fds) {
+                if (fchmod(fd, 0600) != 0) {
+                    _exit(3);
+                }
+                sched_yield();
+            }
+            _exit(0);
+        }
+        children.push_back(child);
+    }
+    close(start_pipe[0]);
+    ASSERT_EQ(2, write(start_pipe[1], "xx", 2));
+    close(start_pipe[1]);
+    for (pid_t child : children) {
+        int status = 0;
+        ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+        ASSERT_TRUE(WIFEXITED(status));
+        EXPECT_EQ(0, WEXITSTATUS(status));
+    }
+    for (int fd : left_fds) {
+        close(fd);
+    }
+    for (int fd : right_fds) {
+        close(fd);
+    }
+}
+
 TEST(OverlayFsSemantics, OldLowerFileDescriptorDoesNotFollowSameNameReplacement) {
     ScopedOverlayEnv scoped("overlayfs_revalidate_identity");
     const auto& env = scoped.env;

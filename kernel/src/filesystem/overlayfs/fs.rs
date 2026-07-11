@@ -163,6 +163,7 @@ pub(super) struct OverlayFS {
     inode_cache: Mutex<OvlInodeCache>,
     dir_state_cache: Mutex<DirStateCache>,
     copy_up_locks: Vec<Mutex<()>>,
+    ancestor_copy_up_locks: Vec<Mutex<()>>,
     content_locks: Vec<Mutex<()>>,
 }
 
@@ -301,13 +302,21 @@ impl OverlayFS {
         Ok(self.dir_state_cache.lock().intern(identity))
     }
 
-    pub(super) fn copy_up_lock(&self, redirect: &str) -> &Mutex<()> {
+    fn redirect_lock_index(&self, redirect: &str) -> usize {
         let mut hash = 0xcbf29ce484222325u64;
         for byte in redirect.as_bytes() {
             hash ^= *byte as u64;
             hash = hash.wrapping_mul(0x100000001b3);
         }
-        &self.copy_up_locks[hash as usize % self.copy_up_locks.len()]
+        hash as usize % LOCK_STRIPE_COUNT
+    }
+
+    pub(super) fn copy_up_lock(&self, redirect: &str) -> &Mutex<()> {
+        &self.copy_up_locks[self.redirect_lock_index(redirect)]
+    }
+
+    pub(super) fn ancestor_copy_up_lock(&self, redirect: &str) -> &Mutex<()> {
+        &self.ancestor_copy_up_locks[self.redirect_lock_index(redirect)]
     }
 
     pub(super) fn content_lock(
@@ -557,6 +566,7 @@ impl MountableFileSystem for OverlayFS {
                 inode_cache: Mutex::new(OvlInodeCache::default()),
                 dir_state_cache: Mutex::new(DirStateCache::default()),
                 copy_up_locks: (0..LOCK_STRIPE_COUNT).map(|_| Mutex::new(())).collect(),
+                ancestor_copy_up_locks: (0..LOCK_STRIPE_COUNT).map(|_| Mutex::new(())).collect(),
                 content_locks: (0..LOCK_STRIPE_COUNT).map(|_| Mutex::new(())).collect(),
             }
         });

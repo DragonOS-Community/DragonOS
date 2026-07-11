@@ -83,6 +83,10 @@ static int ext_test_p2_ops() {
     volatile uint32_t fsyncdir_count = 0;
     volatile uint32_t create_count = 0;
     volatile uint32_t rename2_count = 0;
+    volatile uint32_t write_count = 0;
+    volatile uint32_t last_write_flags = 0;
+    volatile uint32_t write_count_at_fsync = 0;
+    volatile uint32_t last_write_flags_at_fsync = 0;
 
     struct fuse_daemon_args args;
     memset(&args, 0, sizeof(args));
@@ -97,6 +101,11 @@ static int ext_test_p2_ops() {
     args.fsyncdir_count = &fsyncdir_count;
     args.create_count = &create_count;
     args.rename2_count = &rename2_count;
+    args.write_count = &write_count;
+    args.last_write_flags = &last_write_flags;
+    args.write_count_at_fsync = &write_count_at_fsync;
+    args.last_write_flags_at_fsync = &last_write_flags_at_fsync;
+    args.init_out_flags_override = FUSE_INIT_EXT | FUSE_MAX_PAGES | FUSE_WRITEBACK_CACHE;
     args.access_deny_mask = 2;
 
     pthread_t th;
@@ -149,8 +158,21 @@ static int ext_test_p2_ops() {
         close(f);
         goto fail;
     }
+    if (write_count != 0) {
+        printf("[FAIL] writeback-cache write reached daemon before fsync: writes=%u\n",
+               write_count);
+        close(f);
+        goto fail;
+    }
     if (fsync(f) != 0) {
         printf("[FAIL] fsync(file): %s (errno=%d)\n", strerror(errno), errno);
+        close(f);
+        goto fail;
+    }
+    if (write_count_at_fsync == 0 ||
+        (last_write_flags_at_fsync & FUSE_WRITE_CACHE) == 0) {
+        printf("[FAIL] fsync did not drain cached write first: writes=%u flags=0x%x\n",
+               write_count_at_fsync, last_write_flags_at_fsync);
         close(f);
         goto fail;
     }
@@ -2652,8 +2674,10 @@ static int ext_test_init_requests_linux_no_open_support() {
     }
 
     if ((init_flags & FUSE_NO_OPEN_SUPPORT) == 0 ||
-        (init_flags & FUSE_NO_OPENDIR_SUPPORT) == 0) {
-        printf("[FAIL] INIT flags missing no-open support bits: flags=0x%x\n", init_flags);
+        (init_flags & FUSE_NO_OPENDIR_SUPPORT) == 0 ||
+        (init_flags & FUSE_WRITEBACK_CACHE) == 0) {
+        printf("[FAIL] INIT flags missing no-open/writeback support bits: flags=0x%x\n",
+               init_flags);
         goto fail;
     }
 

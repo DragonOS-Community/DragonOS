@@ -177,7 +177,7 @@ impl FuseNode {
         (base_len + Self::FUSE_DIRENT_ALIGN - 1) & !(Self::FUSE_DIRENT_ALIGN - 1)
     }
 
-    fn cache_child_from_entry(&self, entry: &FuseEntryOut, name: &str) {
+    fn cache_child_from_entry(&self, entry: &FuseEntryOut, name: &str, request_epoch: u64) {
         let mut consumed = false;
         let result = (|| {
             let md = Self::metadata_from_valid_entry(entry, SystemError::EIO, None)?;
@@ -195,7 +195,12 @@ impl FuseNode {
             )?;
             consumed = true;
             child.set_dname(name);
-            child.set_cached_metadata_with_valid(md, entry.attr_valid, entry.attr_valid_nsec);
+            child.merge_cached_metadata_from_daemon(
+                md,
+                entry.attr_valid,
+                entry.attr_valid_nsec,
+                request_epoch,
+            );
             self.cache_lookup_child(
                 name,
                 &child,
@@ -215,6 +220,7 @@ impl FuseNode {
         payload: &[u8],
         names: &mut Vec<String>,
         mut last_off: u64,
+        request_epoch: u64,
     ) -> Result<u64, SystemError> {
         let mut pos: usize = 0;
         while pos + size_of::<FuseDirentPlus>() <= payload.len() {
@@ -230,7 +236,7 @@ impl FuseNode {
             if let Ok(name) = core::str::from_utf8(name_bytes) {
                 if !name.is_empty() && name != "." && name != ".." {
                     names.push(name.to_string());
-                    self.cache_child_from_entry(&plus.entry_out, name);
+                    self.cache_child_from_entry(&plus.entry_out, name, request_epoch);
                 }
             } else if plus.entry_out.nodeid != 0 {
                 let _ = self.conn.queue_forget(plus.entry_out.nodeid, 1);
@@ -334,7 +340,12 @@ impl FuseNode {
                 );
             }
             consumed = true;
-            child.set_cached_metadata_with_valid(md, entry.attr_valid, entry.attr_valid_nsec);
+            child.merge_cached_metadata_from_daemon(
+                md,
+                entry.attr_valid,
+                entry.attr_valid_nsec,
+                self.conn.sample_attr_epoch(),
+            );
             Ok(child as Arc<dyn IndexNode>)
         })();
         if result.is_err() && entry.nodeid != 0 && !consumed {

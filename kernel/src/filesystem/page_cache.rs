@@ -1047,17 +1047,40 @@ impl PageCacheManager {
 
     pub fn sync(&self) -> Result<(), SystemError> {
         let cache = self.upgrade()?;
-        let dirty_entries: Vec<(usize, Arc<PageEntry>)> = {
-            let inner = cache.inner.lock();
-            inner
-                .dirty_pages
-                .iter()
-                .filter_map(|idx| inner.pages.get(idx).cloned().map(|entry| (*idx, entry)))
-                .collect()
-        };
+        loop {
+            let (dirty_entries, writeback_entries): (Vec<_>, Vec<_>) = {
+                let inner = cache.inner.lock();
+                let dirty = inner
+                    .dirty_pages
+                    .iter()
+                    .filter_map(|idx| inner.pages.get(idx).cloned().map(|entry| (*idx, entry)))
+                    .collect();
+                let writeback = inner
+                    .pages
+                    .values()
+                    .filter(|entry| entry.state() == PageState::Writeback)
+                    .cloned()
+                    .collect();
+                (dirty, writeback)
+            };
 
-        for (page_index, entry) in dirty_entries {
-            Self::writeback_entry(&cache, page_index, entry)?;
+            for (page_index, entry) in dirty_entries {
+                Self::writeback_entry(&cache, page_index, entry)?;
+            }
+            for entry in writeback_entries {
+                Self::wait_writeback_entry(entry)?;
+            }
+
+            let inner = cache.inner.lock();
+            let done = inner.dirty_pages.is_empty()
+                && !inner
+                    .pages
+                    .values()
+                    .any(|entry| entry.state() == PageState::Writeback);
+            drop(inner);
+            if done {
+                break;
+            }
         }
 
         // 脏页写完后调 write_inode 回写元数据。

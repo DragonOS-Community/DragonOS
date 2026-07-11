@@ -757,10 +757,20 @@ impl FileSystem for FuseFS {
             p.node.clone()
         };
 
-        let Ok(_pin) = node.pin_writeback_handle() else {
-            return VmFaultReason::VM_FAULT_SIGBUS;
-        };
-        PageFaultHandler::filemap_page_mkwrite(pfm)
+        node.with_writeback_admission(|| {
+            let Ok(_pin) = node.pin_writeback_handle() else {
+                return VmFaultReason::VM_FAULT_SIGBUS;
+            };
+            let result = PageFaultHandler::filemap_page_mkwrite(pfm);
+            if !result.intersects(
+                VmFaultReason::VM_FAULT_SIGBUS
+                    | VmFaultReason::VM_FAULT_OOM
+                    | VmFaultReason::VM_FAULT_RETRY,
+            ) {
+                node.note_mmap_write();
+            }
+            result
+        })
     }
 
     fn mprotect(&self, _old_vm_flags: VmFlags, new_vm_flags: VmFlags) -> Result<(), SystemError> {

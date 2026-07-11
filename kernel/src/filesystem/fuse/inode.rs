@@ -21,6 +21,7 @@ use crate::{
         vfs::{FileType, InodeFlags, InodeId, InodeMode, Metadata},
     },
     libs::mutex::Mutex,
+    libs::rwsem::RwSem,
     time::PosixTimeSpec,
 };
 
@@ -48,7 +49,9 @@ pub struct FuseNode {
     page_cache: Mutex<Option<Arc<PageCache>>>,
     writeback_handles: Mutex<Vec<Arc<FuseWritebackHandle>>>,
     lookup_cache: Mutex<BTreeMap<String, FuseLookupCacheEntry>>,
-    direct_io_lock: Mutex<()>,
+    /// Serializes dirty-page admission against operations which must drain and
+    /// invalidate the page cache (truncate and direct I/O).
+    writeback_barrier: RwSem<()>,
     cached_metadata_deadline_ns: AtomicU64,
     attr_version: AtomicU64,
     /// Version chain produced while short READ replies from one metadata
@@ -89,6 +92,7 @@ impl FuseNode {
         cached: Option<Metadata>,
     ) -> Arc<Self> {
         let has_cached = cached.is_some();
+        let initial_attr_epoch = conn.sample_attr_epoch();
         Arc::new_cyclic(|self_ref| Self {
             fs,
             conn,
@@ -101,9 +105,9 @@ impl FuseNode {
             page_cache: Mutex::new(None),
             writeback_handles: Mutex::new(Vec::new()),
             lookup_cache: Mutex::new(BTreeMap::new()),
-            direct_io_lock: Mutex::new(()),
+            writeback_barrier: RwSem::new(()),
             cached_metadata_deadline_ns: AtomicU64::new(if has_cached { u64::MAX } else { 0 }),
-            attr_version: AtomicU64::new(1),
+            attr_version: AtomicU64::new(initial_attr_epoch),
             short_read_source_attr_version: AtomicU64::new(0),
             short_read_chain_attr_version: AtomicU64::new(0),
             pending_short_read_eof: AtomicU64::new(u64::MAX),
@@ -209,15 +213,54 @@ impl FuseNode {
             .store(Self::cache_deadline(valid, valid_nsec), Ordering::Relaxed);
     }
 
+    /// Install an unsolicited/lookup/getattr daemon attribute snapshot.
+    /// With writeback cache negotiated, locally maintained size and cmtime are
+    /// authoritative and must not be rolled back by a stale daemon reply.
+    pub(crate) fn merge_cached_metadata_from_daemon(
+        &self,
+        mut md: Metadata,
+        valid: u64,
+        valid_nsec: u32,
+        request_epoch: u64,
+    ) -> Metadata {
+        let mut metadata = self.cached_metadata.lock();
+        let stale_reply = self.attr_version() > request_epoch;
+        if stale_reply {
+            if let Some(local) = metadata.as_ref() {
+                md = local.clone();
+            }
+        }
+        if self.conn.has_init_flag(super::protocol::FUSE_WRITEBACK_CACHE)
+            && md.file_type == FileType::File
+        {
+            if let Some(local) = metadata.as_ref() {
+                md.size = local.size;
+                md.mtime = local.mtime;
+                md.ctime = local.ctime;
+            }
+        }
+        *metadata = Some(md.clone());
+        self.bump_attr_version();
+        drop(metadata);
+        self.cached_metadata_deadline_ns
+            .store(
+                if stale_reply {
+                    0
+                } else {
+                    Self::cache_deadline(valid, valid_nsec)
+                },
+                Ordering::Relaxed,
+            );
+        md
+    }
+
     pub(crate) fn attr_version(&self) -> u64 {
         self.attr_version.load(Ordering::Acquire)
     }
 
     pub(crate) fn bump_attr_version(&self) -> u64 {
-        let version = self
-            .attr_version
-            .fetch_add(1, Ordering::AcqRel)
-            .wrapping_add(1);
+        let version = self.conn.next_attr_epoch();
+        self.attr_version.store(version, Ordering::Release);
         if version == 0 {
             self.short_read_source_attr_version
                 .store(u64::MAX, Ordering::Release);
@@ -385,6 +428,7 @@ impl FuseNode {
 
     fn fetch_attr(&self) -> Result<Metadata, SystemError> {
         self.check_not_stale()?;
+        let request_epoch = self.conn.sample_attr_epoch();
         let getattr_in = FuseGetattrIn {
             getattr_flags: 0,
             dummy: 0,
@@ -395,8 +439,12 @@ impl FuseNode {
                 .request(FUSE_GETATTR, self.nodeid, fuse_pack_struct(&getattr_in))?;
         let out: FuseAttrOut = fuse_read_struct(&payload)?;
         let md = Self::attr_to_metadata(&out.attr);
-        self.set_cached_metadata_with_valid(md.clone(), out.attr_valid, out.attr_valid_nsec);
-        Ok(md)
+        Ok(self.merge_cached_metadata_from_daemon(
+            md,
+            out.attr_valid,
+            out.attr_valid_nsec,
+            request_epoch,
+        ))
     }
 
     fn cached_or_fetch_metadata(&self) -> Result<Metadata, SystemError> {

@@ -84,6 +84,7 @@ static int ext_test_p2_ops() {
     volatile uint32_t create_count = 0;
     volatile uint32_t rename2_count = 0;
     volatile uint32_t write_count = 0;
+    volatile uint32_t last_write_size = 0;
     volatile uint32_t last_write_flags = 0;
     volatile uint32_t write_count_at_fsync = 0;
     volatile uint32_t last_write_flags_at_fsync = 0;
@@ -102,10 +103,12 @@ static int ext_test_p2_ops() {
     args.create_count = &create_count;
     args.rename2_count = &rename2_count;
     args.write_count = &write_count;
+    args.last_write_size = &last_write_size;
     args.last_write_flags = &last_write_flags;
     args.write_count_at_fsync = &write_count_at_fsync;
     args.last_write_flags_at_fsync = &last_write_flags_at_fsync;
     args.init_out_flags_override = FUSE_INIT_EXT | FUSE_MAX_PAGES | FUSE_WRITEBACK_CACHE;
+    args.link_reuse_old_nodeid = 1;
     args.access_deny_mask = 2;
 
     pthread_t th;
@@ -158,6 +161,15 @@ static int ext_test_p2_ops() {
         close(f);
         goto fail;
     }
+    // LINK returns an attribute snapshot for the same inode.  With
+    // writeback-cache negotiated, that daemon-side size is stale until fsync;
+    // processing the LINK reply must not roll back the local dirty size.
+    snprintf(hard_path, sizeof(hard_path), "%s/p2_hard.txt", mp);
+    if (link(created, hard_path) != 0) {
+        printf("[FAIL] link dirty writeback file: %s (errno=%d)\n", strerror(errno), errno);
+        close(f);
+        goto fail;
+    }
     if (write_count != 0) {
         printf("[FAIL] writeback-cache write reached daemon before fsync: writes=%u\n",
                write_count);
@@ -169,14 +181,18 @@ static int ext_test_p2_ops() {
         close(f);
         goto fail;
     }
-    if (write_count_at_fsync == 0 ||
+    if (write_count_at_fsync == 0 || last_write_size != strlen("p2-data") ||
         (last_write_flags_at_fsync & FUSE_WRITE_CACHE) == 0) {
-        printf("[FAIL] fsync did not drain cached write first: writes=%u flags=0x%x\n",
-               write_count_at_fsync, last_write_flags_at_fsync);
+        printf("[FAIL] fsync did not drain full cached write first: writes=%u size=%u flags=0x%x\n",
+               write_count_at_fsync, last_write_size, last_write_flags_at_fsync);
         close(f);
         goto fail;
     }
     close(f);
+    if (unlink(hard_path) != 0) {
+        printf("[FAIL] unlink dirty-link probe: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
 
     snprintf(symlink_path, sizeof(symlink_path), "%s/p2_symlink.txt", mp);
     if (symlink("p2_create.txt", symlink_path) != 0) {
@@ -194,11 +210,11 @@ static int ext_test_p2_ops() {
         goto fail;
     }
 
-    snprintf(hard_path, sizeof(hard_path), "%s/p2_hard.txt", mp);
     if (link(created, hard_path) != 0) {
-        printf("[FAIL] link: %s (errno=%d)\n", strerror(errno), errno);
+        printf("[FAIL] link after fsync: %s (errno=%d)\n", strerror(errno), errno);
         goto fail;
     }
+
     if (unlink(created) != 0) {
         printf("[FAIL] unlink original: %s (errno=%d)\n", strerror(errno), errno);
         goto fail;

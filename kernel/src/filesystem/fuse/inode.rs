@@ -195,15 +195,6 @@ impl FuseNode {
         self.cached_metadata.lock().as_ref().map(|md| md.file_type)
     }
 
-    pub fn set_cached_metadata(&self, md: Metadata) {
-        let mut metadata = self.cached_metadata.lock();
-        *metadata = Some(md);
-        self.bump_attr_version();
-        drop(metadata);
-        self.cached_metadata_deadline_ns
-            .store(u64::MAX, Ordering::Relaxed);
-    }
-
     pub fn set_cached_metadata_with_valid(&self, md: Metadata, valid: u64, valid_nsec: u32) {
         let mut metadata = self.cached_metadata.lock();
         *metadata = Some(md);

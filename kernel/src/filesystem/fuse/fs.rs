@@ -231,18 +231,17 @@ impl FuseFS {
                         n.set_generation(gen);
                         n.set_parent_nodeid(parent_nodeid);
                         n.set_parent_if_absent(parent);
-                        if let Some(md) = cached {
-                            n.set_cached_metadata(md);
-                        }
+                        // Attribute replies for an existing inode must be
+                        // installed by the caller through its daemon-attribute
+                        // merge path.  Installing `cached` here would roll
+                        // back locally authoritative writeback-cache fields
+                        // before the caller gets a chance to preserve them.
                         n.inc_lookup(lookup_refs);
                         return Ok(n);
                     }
                 } else {
                     n.set_parent_nodeid(parent_nodeid);
                     n.set_parent_if_absent(parent);
-                    if let Some(md) = cached {
-                        n.set_cached_metadata(md);
-                    }
                     n.inc_lookup(lookup_refs);
                     return Ok(n);
                 }
@@ -305,17 +304,13 @@ impl FuseFS {
                     } else {
                         n.set_generation(gen);
                         n.set_parent_if_absent(parent);
-                        if let Some(md) = cached {
-                            n.set_cached_metadata(md);
-                        }
+                        // See get_or_create_node_with_generation(): callers own
+                        // daemon-attribute merging for reused inode identities.
                         n.inc_lookup(lookup_refs);
                         return Ok(n);
                     }
                 } else {
                     n.set_parent_if_absent(parent);
-                    if let Some(md) = cached {
-                        n.set_cached_metadata(md);
-                    }
                     n.inc_lookup(lookup_refs);
                     return Ok(n);
                 }

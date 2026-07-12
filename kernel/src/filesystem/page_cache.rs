@@ -1210,6 +1210,49 @@ impl PageCacheManager {
         Ok(())
     }
 
+    /// Launder a complete range for best-effort cache invalidation.
+    ///
+    /// Ordinary range writeback is fail-fast. Invalidation instead mirrors
+    /// Linux invalidate_inode_pages2_range(): retain the first error but keep
+    /// processing every later page in the range.
+    pub(crate) fn launder_range_for_invalidate(
+        &self,
+        start_index: usize,
+        end_index: usize,
+    ) -> Result<(), SystemError> {
+        let cache = self.upgrade()?;
+        let dirty_entries: Vec<(usize, Arc<PageEntry>)> = {
+            let inner = cache.inner.lock();
+            inner
+                .dirty_pages
+                .range(start_index..=end_index)
+                .filter_map(|idx| inner.pages.get(idx).cloned().map(|entry| (*idx, entry)))
+                .collect()
+        };
+        let mut first_error = None;
+        for (page_index, entry) in dirty_entries {
+            if let Err(error) = Self::writeback_entry(&cache, page_index, entry) {
+                first_error.get_or_insert(error);
+            }
+        }
+
+        let entries: Vec<Arc<PageEntry>> = {
+            let inner = cache.inner.lock();
+            inner
+                .page_indices
+                .range(start_index..=end_index)
+                .filter_map(|idx| inner.pages.get(idx).cloned())
+                .collect()
+        };
+        for entry in entries {
+            if let Err(error) = Self::wait_writeback_entry(entry) {
+                first_error.get_or_insert(error);
+            }
+        }
+
+        first_error.map_or(Ok(()), Err)
+    }
+
     pub fn prepare_page_mkwrite(
         &self,
         page_index: usize,
@@ -1298,20 +1341,6 @@ impl PageCacheManager {
         Ok(self
             .upgrade()?
             .evict_clean_pages_for_invalidate(Some((start_index, end_index))))
-    }
-
-    pub fn has_pages_in_range(
-        &self,
-        start_index: usize,
-        end_index: usize,
-    ) -> Result<bool, SystemError> {
-        let cache = self.upgrade()?;
-        let guard = cache.inner.lock();
-        Ok(guard
-            .page_indices
-            .range(start_index..=end_index)
-            .next()
-            .is_some())
     }
 
     pub fn discard_clean_range(

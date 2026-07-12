@@ -99,30 +99,24 @@ impl FuseNode {
         };
         let end_exclusive = end_index.checked_add(1);
 
-        page_cache.unmap_mapping_pages_even_cow(start_index, end_exclusive)?;
+        let _ = page_cache.unmap_mapping_pages_even_cow(start_index, end_exclusive);
         // Linux invalidate_inode_pages2_range() waits for writeback and calls
         // ->launder_folio() for dirty folios. FUSE wires that hook to
         // fuse_launder_folio(), so reverse invalidation drains dirty data before
         // removing the cache rather than silently discarding local writes.
-        page_cache
+        // fuse_reverse_inval_inode() ignores the aggregate invalidation result,
+        // so every phase remains best-effort and one failure does not prevent
+        // clean pages elsewhere in the range from being invalidated.
+        let _ = page_cache
             .manager()
-            .writeback_range(start_index, end_index)?;
-        page_cache
-            .manager()
-            .wait_writeback_range(start_index, end_index)?;
+            .launder_range_for_invalidate(start_index, end_index);
         {
             let _invalidate = page_cache.invalidate_write();
             let _ = page_cache
                 .manager()
-                .discard_clean_range(start_index, end_index)?;
-            if page_cache
-                .manager()
-                .has_pages_in_range(start_index, end_index)?
-            {
-                return Err(SystemError::EBUSY);
-            }
+                .discard_clean_range(start_index, end_index);
         }
-        page_cache.unmap_mapping_pages_even_cow(start_index, end_exclusive)?;
+        let _ = page_cache.unmap_mapping_pages_even_cow(start_index, end_exclusive);
         Ok(())
     }
 

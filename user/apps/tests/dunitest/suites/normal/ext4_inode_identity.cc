@@ -9,6 +9,7 @@
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -255,6 +256,46 @@ TEST(Ext4InodeIdentity, DirtyClosedUnlinkSyncfsCompletes) {
     ASSERT_EQ(0, unlink(path.c_str())) << strerror(errno);
     ASSERT_EQ(0, syscall(__NR_syncfs, sync_fd)) << strerror(errno);
     ASSERT_EQ(0, close(sync_fd)) << strerror(errno);
+
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
+TEST(Ext4InodeIdentity, FsyncBeforeFinalCloseReclaimsUnlinkedBlocks) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+
+    for (int iteration = 0; iteration < 3; ++iteration) {
+        struct statvfs before = {};
+        ASSERT_EQ(0, statvfs(fs.mount_point().c_str(), &before)) << strerror(errno);
+
+        const std::string path = fs.mount_point() + "/fsync_unlinked_reclaim_" +
+                                 std::to_string(iteration);
+        int fd = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+        ASSERT_GE(fd, 0) << strerror(errno);
+        char block[64 * 1024];
+        memset(block, 0x5a, sizeof(block));
+        for (int i = 0; i < 8; ++i) {
+            ASSERT_NO_FATAL_FAILURE(WriteAll(fd, block, sizeof(block)));
+        }
+        ASSERT_EQ(0, unlink(path.c_str())) << strerror(errno);
+        ASSERT_EQ(0, fsync(fd)) << strerror(errno);
+        ASSERT_EQ(0, close(fd)) << strerror(errno);
+
+        struct statvfs after = {};
+        bool reclaimed = false;
+        for (int i = 0; i < 20; ++i) {
+            ASSERT_EQ(0, statvfs(fs.mount_point().c_str(), &after)) << strerror(errno);
+            if (after.f_bfree >= before.f_bfree) {
+                reclaimed = true;
+                break;
+            }
+            usleep(5 * 1000);
+        }
+        EXPECT_TRUE(reclaimed) << "iteration=" << iteration
+                               << " free blocks before=" << before.f_bfree
+                               << " after=" << after.f_bfree;
+    }
 
     ASSERT_NO_FATAL_FAILURE(fs.Unmount());
 }

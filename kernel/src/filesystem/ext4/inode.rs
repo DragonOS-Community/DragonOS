@@ -797,6 +797,7 @@ impl IndexNode for LockedExt4Inode {
                 .dirty_state
                 .remove(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY);
         }
+        self.release_clean_metadata_queue_owner(&fs);
 
         Ok(())
     }
@@ -844,6 +845,7 @@ impl IndexNode for LockedExt4Inode {
                     .dirty_state
                     .remove(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY);
             }
+            self.release_clean_metadata_queue_owner(&fs);
         }
         if len < old_size as usize {
             if let Some(page_cache) = page_cache {
@@ -1398,6 +1400,12 @@ impl IndexNode for LockedExt4Inode {
 }
 
 impl LockedExt4Inode {
+    fn release_clean_metadata_queue_owner(&self, fs: &Arc<Ext4FileSystem>) {
+        if let Some(inode) = self.retention_callback_self.upgrade() {
+            fs.release_clean_queued_inode(&inode);
+        }
+    }
+
     fn metadata_contention_backoff(attempt: usize) {
         const YIELDS_BEFORE_SLEEP: usize = 64;
         if attempt.is_multiple_of(YIELDS_BEFORE_SLEEP) {
@@ -1833,6 +1841,7 @@ impl LockedExt4Inode {
         let mtime_dirty = dirty.contains(InodeDirtyState::MTIME_DIRTY);
 
         if !size_dirty && (!mtime_dirty || datasync) {
+            self.release_clean_metadata_queue_owner(&fs);
             return Ok(());
         }
 
@@ -1858,6 +1867,8 @@ impl LockedExt4Inode {
         if !datasync && mtime_dirty && guard.cached_mtime == cached_mtime {
             guard.dirty_state.remove(InodeDirtyState::MTIME_DIRTY);
         }
+        drop(guard);
+        self.release_clean_metadata_queue_owner(&fs);
         Ok(())
     }
 }

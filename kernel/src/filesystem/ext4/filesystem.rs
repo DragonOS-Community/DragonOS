@@ -494,6 +494,62 @@ impl Ext4FileSystem {
         Ok(())
     }
 
+    pub(super) fn release_clean_queued_inode(&self, inode: &Arc<LockedExt4Inode>) {
+        {
+            let mut dirty_inodes = self.dirty_inodes.lock();
+            let Some(position) = dirty_inodes
+                .iter()
+                .position(|queued| Arc::ptr_eq(queued, inode))
+            else {
+                // flush_dirty_inodes() already owns this queue entry and will
+                // release its AsyncWork retention after observing it clean.
+                return;
+            };
+
+            let mut guard = inode.inner.lock();
+            if !guard.dirty_state.contains(InodeDirtyState::QUEUED)
+                || guard.dirty_state.intersects(
+                    InodeDirtyState::SIZE_DIRTY
+                        | InodeDirtyState::MTIME_DIRTY
+                        | InodeDirtyState::WRITEBACK,
+                )
+            {
+                return;
+            }
+
+            dirty_inodes.swap_remove(position);
+            guard.dirty_state.remove(InodeDirtyState::QUEUED);
+        }
+
+        inode.release(InodeRetentionKind::AsyncWork);
+    }
+
+    fn publish_requeued_inodes(&self, requeue: Vec<Arc<LockedExt4Inode>>) {
+        let mut clean = Vec::new();
+        {
+            let mut dirty_inodes = self.dirty_inodes.lock();
+            for inode in requeue {
+                let mut guard = inode.inner.lock();
+                if guard
+                    .dirty_state
+                    .intersects(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY)
+                {
+                    guard.dirty_state.insert(InodeDirtyState::QUEUED);
+                    drop(guard);
+                    dirty_inodes.push(inode);
+                } else {
+                    guard.dirty_state.remove(InodeDirtyState::QUEUED);
+                    drop(guard);
+                    clean.push(inode);
+                }
+            }
+        }
+
+        for inode in clean {
+            inode.release(InodeRetentionKind::AsyncWork);
+        }
+    }
+
     fn flush_dirty_inodes(&self) -> Result<(), SystemError> {
         let dirty: Vec<Arc<LockedExt4Inode>> = {
             let mut guard = self.dirty_inodes.lock();
@@ -654,7 +710,7 @@ impl Ext4FileSystem {
             }
         }
         if !requeue.is_empty() {
-            self.dirty_inodes.lock().extend(requeue);
+            self.publish_requeued_inodes(requeue);
         }
         last_err
     }

@@ -1,4 +1,5 @@
 mod bridge;
+pub(crate) mod dax;
 mod mount;
 mod queue;
 pub(crate) mod reply;

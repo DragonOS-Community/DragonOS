@@ -25,6 +25,7 @@ use crate::{
     process::ProcessManager,
 };
 
+use super::virtiofs::dax::DaxRangeAllocator;
 use crate::process::cred::CAPFlags;
 
 use super::protocol::{
@@ -583,6 +584,7 @@ pub struct FuseConn {
     reply_layout_minor: AtomicU32,
     background: Arc<FuseBackgroundState>,
     filesystems: Mutex<Vec<Weak<super::fs::FuseFS>>>,
+    dax_allocator: Option<Arc<DaxRangeAllocator>>,
 }
 
 impl FuseConn {
@@ -607,17 +609,43 @@ impl FuseConn {
             Self::kernel_init_flags(),
             false,
             None,
+            None,
         )
     }
 
     pub fn new_for_virtiofs(max_request_size: usize, max_reply_size: usize) -> Arc<Self> {
+        Self::new_for_virtiofs_with_dax(max_request_size, max_reply_size, None)
+    }
+
+    pub(crate) fn new_for_virtiofs_with_dax(
+        max_request_size: usize,
+        max_reply_size: usize,
+        cache_window_len: Option<usize>,
+    ) -> Arc<Self> {
         let overhead = size_of::<FuseInHeader>() + size_of::<FuseWriteIn>();
         let cap = if max_request_size > overhead {
             core::cmp::max(Self::MIN_MAX_WRITE, max_request_size - overhead)
         } else {
             Self::MIN_MAX_WRITE
         };
-        Self::new_with_max_write_cap(cap, Self::virtiofs_init_flags(), true, Some(max_reply_size))
+        let dax_allocator = cache_window_len.and_then(|len| match DaxRangeAllocator::new(len) {
+            Ok(allocator) => Some(Arc::new(allocator)),
+            Err(error) => {
+                log::warn!(
+                    "virtiofs: failed to create DAX range allocator for window length {}: {:?}; continue with DAX disabled",
+                    len,
+                    error
+                );
+                None
+            }
+        });
+        Self::new_with_max_write_cap(
+            cap,
+            Self::virtiofs_init_flags(),
+            true,
+            Some(max_reply_size),
+            dax_allocator,
+        )
     }
 
     fn new_with_max_write_cap(
@@ -625,6 +653,7 @@ impl FuseConn {
         init_flags: u64,
         separate_hiprio_pending: bool,
         backend_reply_limit: Option<usize>,
+        dax_allocator: Option<Arc<DaxRangeAllocator>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(FuseConnInner {
@@ -669,7 +698,26 @@ impl FuseConn {
             reply_layout_minor: AtomicU32::new(0),
             background: FuseBackgroundState::new(),
             filesystems: Mutex::new(Vec::new()),
+            dax_allocator,
         })
+    }
+
+    pub(crate) fn dax_allocator(&self) -> Option<&Arc<DaxRangeAllocator>> {
+        self.dax_allocator.as_ref()
+    }
+
+    fn shutdown_dax_allocator(&self) {
+        let Some(allocator) = self.dax_allocator.as_ref() else {
+            return;
+        };
+        allocator.begin_shutdown();
+        if let Err(error) = allocator.finish_shutdown() {
+            log::error!(
+                "virtiofs: DAX allocator still owns ranges during connection teardown: {:?}, state={:?}",
+                error,
+                allocator.snapshot()
+            );
+        }
     }
 
     pub(crate) fn register_filesystem(&self, fs: Weak<super::fs::FuseFS>) {
@@ -939,6 +987,7 @@ impl FuseConn {
     }
 
     pub fn abort(&self) {
+        self.shutdown_dax_allocator();
         self.background.disconnect();
         let (processing, pending_noreply_count): (Vec<Arc<FusePendingState>>, usize) = {
             let mut g = self.inner.lock();
@@ -974,6 +1023,7 @@ impl FuseConn {
     /// Keep the connection readable for daemon-side teardown; actual disconnect
     /// happens when /dev/fuse is closed or explicit abort path is triggered.
     pub fn on_umount(&self) {
+        self.shutdown_dax_allocator();
         self.background.disconnect();
         let processing: Vec<Arc<FusePendingState>>;
         let dropped_processing: Vec<Arc<FusePendingState>>;

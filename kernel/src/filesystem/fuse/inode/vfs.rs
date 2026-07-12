@@ -749,6 +749,7 @@ impl IndexNode for FuseNode {
 
         match fuse_data {
             FuseFilePrivateData::File(p) => {
+                let _barrier = self.writeback_barrier.write();
                 let sync_result = self.sync_cached_pages();
                 let wb_error_result = self.check_and_advance_open_wb_error(&p);
                 sync_result?;
@@ -777,20 +778,21 @@ impl IndexNode for FuseNode {
         drop(data);
 
         if let FuseFilePrivateData::File(_) = &fuse_data {
+            let _barrier = self.writeback_barrier.write();
             if let Some(page_cache) = self.cached_page_cache() {
                 let start_index = start >> MMArch::PAGE_SHIFT;
                 let end_index = end >> MMArch::PAGE_SHIFT;
-                page_cache
-                    .manager()
-                    .writeback_range(start_index, end_index)?;
+                page_cache.manager().sync_range(start_index, end_index)?;
             }
+            if let FuseFilePrivateData::File(p) = fuse_data {
+                self.check_and_advance_open_wb_error(&p)?;
+                return self.fsync_with_fh(FUSE_FSYNC, p.fh, datasync);
+            }
+            unreachable!();
         }
 
         match fuse_data {
-            FuseFilePrivateData::File(p) => {
-                self.check_and_advance_open_wb_error(&p)?;
-                self.fsync_with_fh(FUSE_FSYNC, p.fh, datasync)
-            }
+            FuseFilePrivateData::File(_) => unreachable!(),
             FuseFilePrivateData::Dir(p) => self.fsync_with_fh(FUSE_FSYNCDIR, p.fh, datasync),
             FuseFilePrivateData::Dev(_) => self.fsync_common(datasync),
         }

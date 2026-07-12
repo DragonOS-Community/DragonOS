@@ -2821,6 +2821,7 @@ static int ext_test_init_requests_linux_no_open_support() {
     volatile int stop = 0;
     volatile int init_done = 0;
     volatile uint32_t init_flags = 0;
+    volatile uint32_t init_flags2 = 0;
 
     struct fuse_daemon_args args;
     memset(&args, 0, sizeof(args));
@@ -2829,6 +2830,7 @@ static int ext_test_init_requests_linux_no_open_support() {
     args.init_done = &init_done;
     args.stop_on_destroy = 1;
     args.init_in_flags = &init_flags;
+    args.init_in_flags2 = &init_flags2;
 
     pthread_t th;
     if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
@@ -2855,9 +2857,11 @@ static int ext_test_init_requests_linux_no_open_support() {
 
     if ((init_flags & FUSE_NO_OPEN_SUPPORT) == 0 ||
         (init_flags & FUSE_NO_OPENDIR_SUPPORT) == 0 ||
-        (init_flags & FUSE_WRITEBACK_CACHE) == 0) {
-        printf("[FAIL] INIT flags missing no-open/writeback support bits: flags=0x%x\n",
-               init_flags);
+        (init_flags & FUSE_WRITEBACK_CACHE) == 0 ||
+        (init_flags2 & (1u << (35 - 32))) == 0) {
+        printf("[FAIL] INIT flags missing no-open/writeback/expire-only support bits: "
+               "flags=0x%x flags2=0x%x\n",
+               init_flags, init_flags2);
         goto fail;
     }
 

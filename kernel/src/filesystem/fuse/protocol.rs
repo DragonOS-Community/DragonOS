@@ -75,6 +75,8 @@ pub const FUSE_EXPLICIT_INVAL_DATA: u64 = 1 << 25;
 /// Guest auto-mounts directories marked FUSE_ATTR_SUBMOUNT (Linux fuse.h: init->flags bit 27).
 pub const FUSE_SUBMOUNTS: u64 = 1 << 27;
 pub const FUSE_INIT_EXT: u64 = 1 << 30;
+/// Kernel supports expiry-only entry invalidation (Linux 6.6 fuse.h bit 35).
+pub const FUSE_HAS_EXPIRE_ONLY: u64 = 1 << 35;
 /// Allow shared mmap for FOPEN_DIRECT_IO files (Linux 6.6 fuse.h bit 36).
 #[allow(dead_code)]
 pub const FUSE_DIRECT_IO_ALLOW_MMAP: u64 = 1 << 36;

@@ -262,6 +262,11 @@ impl FuseNode {
         version
     }
 
+    pub(crate) fn invalidate_cached_metadata(&self) {
+        self.bump_attr_version();
+        self.cached_metadata_deadline_ns.store(0, Ordering::Release);
+    }
+
     /// 累计该 inode 在 userspace daemon 侧持有的 LOOKUP 引用。
     ///
     /// 对齐 Linux：每个成功的 LOOKUP/READDIRPLUS entry 都必须被记账，并在 inode

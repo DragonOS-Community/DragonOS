@@ -1300,6 +1300,20 @@ impl PageCacheManager {
             .evict_clean_pages_for_invalidate(Some((start_index, end_index))))
     }
 
+    pub fn has_pages_in_range(
+        &self,
+        start_index: usize,
+        end_index: usize,
+    ) -> Result<bool, SystemError> {
+        let cache = self.upgrade()?;
+        let guard = cache.inner.lock();
+        Ok(guard
+            .page_indices
+            .range(start_index..=end_index)
+            .next()
+            .is_some())
+    }
+
     pub fn discard_clean_range(
         &self,
         start_index: usize,

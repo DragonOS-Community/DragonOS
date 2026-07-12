@@ -582,6 +582,7 @@ pub struct FuseConn {
     backend_reply_limit: Option<usize>,
     reply_layout_minor: AtomicU32,
     background: Arc<FuseBackgroundState>,
+    filesystems: Mutex<Vec<Weak<super::fs::FuseFS>>>,
 }
 
 impl FuseConn {
@@ -667,7 +668,21 @@ impl FuseConn {
             backend_reply_limit,
             reply_layout_minor: AtomicU32::new(0),
             background: FuseBackgroundState::new(),
+            filesystems: Mutex::new(Vec::new()),
         })
+    }
+
+    pub(crate) fn register_filesystem(&self, fs: Weak<super::fs::FuseFS>) {
+        let mut filesystems = self.filesystems.lock();
+        filesystems.retain(|entry| entry.strong_count() != 0);
+        filesystems.push(fs);
+    }
+
+    pub(crate) fn filesystems(&self) -> Vec<Arc<super::fs::FuseFS>> {
+        let mut filesystems = self.filesystems.lock();
+        let live = filesystems.iter().filter_map(Weak::upgrade).collect();
+        filesystems.retain(|entry| entry.strong_count() != 0);
+        live
     }
 
     #[allow(dead_code)]

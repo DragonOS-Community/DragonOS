@@ -126,7 +126,30 @@ pub const FUSE_NOTIFY_INVAL_ENTRY: i32 = 3;
 pub const FUSE_NOTIFY_STORE: i32 = 4;
 pub const FUSE_NOTIFY_RETRIEVE: i32 = 5;
 pub const FUSE_NOTIFY_DELETE: i32 = 6;
+pub const FUSE_EXPIRE_ONLY: u32 = 1 << 0;
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseNotifyInvalInodeOut {
+    pub ino: u64,
+    pub off: i64,
+    pub len: i64,
+}
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseNotifyInvalEntryOut {
+    pub parent: u64,
+    pub namelen: u32,
+    pub flags: u32,
+}
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseNotifyDeleteOut {
+    pub parent: u64,
+    pub child: u64,
+    pub namelen: u32,
+    pub padding: u32,
+}
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct FuseInHeader {

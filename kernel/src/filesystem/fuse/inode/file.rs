@@ -82,6 +82,46 @@ impl PageCacheBackend for FusePageCacheBackend {
 }
 
 impl FuseNode {
+    pub(crate) fn notify_invalidate_pages(&self, offset: i64, len: i64) -> Result<(), SystemError> {
+        self.invalidate_cached_metadata();
+        if offset < 0 {
+            return Ok(());
+        }
+        let Some(page_cache) = self.cached_page_cache() else {
+            return Ok(());
+        };
+        let start_index = (offset as usize) >> MMArch::PAGE_SHIFT;
+        let end_index = if len <= 0 {
+            usize::MAX
+        } else {
+            let last = (offset as u64).saturating_add(len as u64).saturating_sub(1);
+            core::cmp::min(last, usize::MAX as u64) as usize >> MMArch::PAGE_SHIFT
+        };
+        let end_exclusive = end_index.checked_add(1);
+
+        page_cache.unmap_mapping_pages_even_cow(start_index, end_exclusive)?;
+        page_cache
+            .manager()
+            .writeback_range(start_index, end_index)?;
+        page_cache
+            .manager()
+            .wait_writeback_range(start_index, end_index)?;
+        {
+            let _invalidate = page_cache.invalidate_write();
+            let _ = page_cache
+                .manager()
+                .discard_clean_range(start_index, end_index)?;
+            if page_cache
+                .manager()
+                .has_pages_in_range(start_index, end_index)?
+            {
+                return Err(SystemError::EBUSY);
+            }
+        }
+        page_cache.unmap_mapping_pages_even_cow(start_index, end_exclusive)?;
+        Ok(())
+    }
+
     pub(crate) fn with_writeback_admission<T>(&self, f: impl FnOnce() -> T) -> T {
         let _guard = self.writeback_barrier.read();
         f()

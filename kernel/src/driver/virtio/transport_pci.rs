@@ -3,7 +3,7 @@
 use crate::arch::{PciArch, TraitPciArch};
 use crate::driver::base::device::DeviceId;
 use crate::driver::pci::pci::{
-    BusDeviceFunction, PciAddr, PciBarMappingRequest, PciDeviceStructure,
+    BusDeviceFunction, PciAddr, PciBarMappingRequest, PciBarSubresourceGuard, PciDeviceStructure,
     PciDeviceStructureGeneralDevice, PciError, PciStandardDeviceBar, PCI_CAP_ID_VNDR,
 };
 
@@ -12,7 +12,7 @@ use crate::driver::pci::root::pci_root_0;
 use crate::exception::IrqNumber;
 
 use crate::libs::volatile::{ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly};
-use crate::mm::{PhysAddr, VirtAddr};
+use crate::mm::{MemoryManagementArch, PhysAddr, VirtAddr};
 
 use alloc::{sync::Arc, vec, vec::Vec};
 use core::{
@@ -305,7 +305,15 @@ impl PciTransport {
                         struct_info.bar,
                         offset,
                         length,
-                    );
+                    )
+                    .filter(|_| {
+                        !shared_memory_overlaps_mappings(
+                            struct_info.bar,
+                            offset,
+                            length,
+                            &transport_config_mappings,
+                        )
+                    });
                     if region.is_none() {
                         warn!(
                             "VirtIO PCI shared-memory capability id={} is outside its BAR or cannot be represented",
@@ -385,6 +393,19 @@ impl PciTransport {
             .iter()
             .find(|(region_id, _)| *region_id == id)
             .and_then(|(_, region)| *region)
+    }
+
+    pub fn reserve_shared_memory_region(
+        &self,
+        region: VirtioSharedMemoryRegion,
+    ) -> Result<PciBarSubresourceGuard, PciError> {
+        PciBarSubresourceGuard::reserve(
+            &self.device,
+            region.bar(),
+            region.offset(),
+            region.length(),
+            region.physical_address(),
+        )
     }
 
     fn cache_queue_notify_index(&mut self, queue: u16) -> Option<usize> {
@@ -805,12 +826,44 @@ fn validate_shared_memory_region(
 ) -> Option<VirtioSharedMemoryRegion> {
     let bar_info = device_bar.get_bar(bar).ok()?;
     let (bar_address, bar_size) = bar_info.memory_address_size()?;
-    validate_shared_memory_range(bar_address, bar_size, offset, length)
+    validate_shared_memory_range(bar_address, bar_size, bar, offset, length)
+}
+
+fn shared_memory_overlaps_mappings(
+    bar: u8,
+    offset: u64,
+    length: u64,
+    mappings: &[PciBarMappingRequest],
+) -> bool {
+    let Some(end) = offset.checked_add(length) else {
+        return true;
+    };
+    let page_mask = !((crate::arch::MMArch::PAGE_SIZE as u64) - 1);
+    let cache_start = offset & page_mask;
+    let Some(cache_end) = end
+        .checked_add(crate::arch::MMArch::PAGE_SIZE as u64 - 1)
+        .map(|value| value & page_mask)
+    else {
+        return true;
+    };
+    mappings.iter().any(|mapping| {
+        if mapping.bar != bar {
+            return false;
+        }
+        let Some(mapping_end) = mapping.offset.checked_add(mapping.length) else {
+            return true;
+        };
+        let mapping_start = mapping.offset & page_mask;
+        let mapping_end =
+            mapping_end.saturating_add(crate::arch::MMArch::PAGE_SIZE as u64 - 1) & page_mask;
+        cache_start < mapping_end && mapping_start < cache_end
+    })
 }
 
 fn validate_shared_memory_range(
     bar_address: u64,
     bar_size: u64,
+    bar: u8,
     offset: u64,
     length: u64,
 ) -> Option<VirtioSharedMemoryRegion> {
@@ -830,12 +883,18 @@ fn validate_shared_memory_range(
     Some(VirtioSharedMemoryRegion::new(
         PhysAddr::new(physical_address),
         length,
+        bar,
+        offset as u64,
     ))
 }
 
 #[cfg(test)]
 mod shared_memory_tests {
-    use super::{shared_memory_cap_len_supported, validate_shared_memory_range};
+    use super::{
+        shared_memory_cap_len_supported, shared_memory_overlaps_mappings,
+        validate_shared_memory_range,
+    };
+    use crate::driver::pci::pci::PciBarMappingRequest;
 
     #[test]
     fn accepts_padded_shared_memory_capability() {
@@ -846,30 +905,62 @@ mod shared_memory_tests {
 
     #[test]
     fn validates_shared_memory_range() {
-        let region = validate_shared_memory_range(0x1000, 0x4000, 0x1000, 0x2000).unwrap();
+        let region = validate_shared_memory_range(0x1000, 0x4000, 2, 0x1000, 0x2000).unwrap();
         assert_eq!(region.physical_address().data(), 0x2000);
         assert_eq!(region.length(), 0x2000);
     }
 
     #[test]
     fn rejects_unallocated_shared_memory_bar() {
-        assert!(validate_shared_memory_range(0, 0x4000, 0x1000, 0x2000).is_none());
+        assert!(validate_shared_memory_range(0, 0x4000, 2, 0x1000, 0x2000).is_none());
     }
 
     #[test]
     fn preserves_zero_length_region() {
-        let region = validate_shared_memory_range(0x1000, 0x4000, 0x4000, 0).unwrap();
+        let region = validate_shared_memory_range(0x1000, 0x4000, 2, 0x4000, 0).unwrap();
         assert_eq!(region.physical_address().data(), 0x5000);
         assert_eq!(region.length(), 0);
     }
 
     #[test]
     fn rejects_range_end_overflow() {
-        assert!(validate_shared_memory_range(0x1000, u64::MAX, u64::MAX, 1).is_none());
+        assert!(validate_shared_memory_range(0x1000, u64::MAX, 2, u64::MAX, 1).is_none());
     }
 
     #[test]
     fn rejects_range_outside_bar() {
-        assert!(validate_shared_memory_range(0x1000, 0x4000, 0x3000, 0x1001).is_none());
+        assert!(validate_shared_memory_range(0x1000, 0x4000, 2, 0x3000, 0x1001).is_none());
+    }
+
+    #[test]
+    fn rejects_shared_page_with_transport_mapping() {
+        let mappings = [PciBarMappingRequest {
+            bar: 2,
+            offset: 0x80,
+            length: 0x100,
+        }];
+        assert!(shared_memory_overlaps_mappings(2, 0x800, 0x800, &mappings));
+    }
+
+    #[test]
+    fn accepts_mapping_on_adjacent_page() {
+        let mappings = [PciBarMappingRequest {
+            bar: 2,
+            offset: 0,
+            length: 0x1000,
+        }];
+        assert!(!shared_memory_overlaps_mappings(
+            2, 0x1000, 0x1000, &mappings
+        ));
+    }
+
+    #[test]
+    fn ignores_mapping_in_different_bar() {
+        let mappings = [PciBarMappingRequest {
+            bar: 4,
+            offset: 0,
+            length: 0x2000,
+        }];
+        assert!(!shared_memory_overlaps_mappings(2, 0, 0x2000, &mappings));
     }
 }

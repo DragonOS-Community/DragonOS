@@ -1620,6 +1620,15 @@ pub struct PageMapper<Arch, F> {
     phantom: PhantomData<fn() -> Arch>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct CreatedPageTable {
+    parent_base: VirtAddr,
+    parent_phys: PhysAddr,
+    parent_level: usize,
+    index: usize,
+    child_phys: PhysAddr,
+}
+
 impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
     /// 创建新的页面映射器
     ///
@@ -1767,6 +1776,171 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
                     // 获取新分配的页表
                     table = table.next_level_table(i)?;
                 }
+            }
+        }
+    }
+
+    /// Map an existing physical range at a specific page-table leaf level.
+    ///
+    /// The target entry must be empty. Any intermediate tables allocated by this call are appended
+    /// to `created_tables`, allowing a higher-level transaction to reclaim only tables it owns.
+    pub unsafe fn map_phys_at_level(
+        &mut self,
+        virt: VirtAddr,
+        phys: PhysAddr,
+        level: usize,
+        flags: EntryFlags<Arch>,
+        created_tables: &mut Vec<CreatedPageTable>,
+    ) -> Option<PageFlush<Arch>> {
+        if level >= Arch::PAGE_LEVELS {
+            return None;
+        }
+        let shift = level
+            .checked_mul(Arch::PAGE_ENTRY_SHIFT)?
+            .checked_add(Arch::PAGE_SHIFT)?;
+        let size = 1usize.checked_shl(shift as u32)?;
+        if !virt.check_aligned(size) || !phys.check_aligned(size) {
+            return None;
+        }
+
+        let virt = VirtAddr::new(virt.data() & !Arch::PAGE_NEGATIVE_MASK);
+        let mut table = self.table();
+        while table.level() > level {
+            let index = table.index_of(virt)?;
+            let entry = table.entry(index)?;
+            if entry.present() {
+                if Arch::entry_is_leaf(table.level(), entry.flags().data()) {
+                    return None;
+                }
+                table = table.next_level_table(index)?;
+                continue;
+            }
+
+            let child_phys = self.frame_allocator.allocate_one()?;
+            Arch::write_bytes(Arch::phys_2_virt(child_phys)?, 0, Arch::PAGE_SIZE);
+            let child = PageTable::new(table.entry_base(index)?, child_phys, table.level() - 1);
+            table.set_entry(
+                index,
+                PageEntry::new(
+                    child_phys,
+                    EntryFlags::new_page_table(virt.kind() == PageTableKind::User),
+                ),
+            )?;
+            created_tables.push(CreatedPageTable {
+                parent_base: table.base(),
+                parent_phys: table.phys(),
+                parent_level: table.level(),
+                index,
+                child_phys,
+            });
+            table = child;
+        }
+
+        let index = table.index_of(virt)?;
+        if !table.entry(index)?.empty() {
+            return None;
+        }
+        let flags = if level == 0 {
+            flags
+        } else {
+            flags.set_huge_page(true)
+        };
+        table.set_entry(index, PageEntry::new(phys, flags))?;
+        Some(PageFlush::new(virt))
+    }
+
+    /// Return whether every top-level slot covering `[start, end)` already points at a shared
+    /// kernel page-table subtree. Device-linear mappings may add lower-level entries to an existing
+    /// shared subtree, but must not create a new top-level entry visible only in the current CR3.
+    pub unsafe fn has_existing_top_level_subtrees(&self, start: VirtAddr, end: VirtAddr) -> bool {
+        if start >= end {
+            return false;
+        }
+        let table = self.table();
+        let top_level_size_shift = (Arch::PAGE_LEVELS - 1)
+            .checked_mul(Arch::PAGE_ENTRY_SHIFT)
+            .and_then(|shift| shift.checked_add(Arch::PAGE_SHIFT));
+        let Some(top_level_size) =
+            top_level_size_shift.and_then(|shift| 1usize.checked_shl(shift as u32))
+        else {
+            return false;
+        };
+        let mut address = start.data();
+        while address < end.data() {
+            let vaddr = VirtAddr::new(address);
+            let Some(index) = table.index_of(vaddr) else {
+                return false;
+            };
+            let Some(entry) = table.entry(index) else {
+                return false;
+            };
+            if !entry.present() || Arch::entry_is_leaf(table.level(), entry.flags().data()) {
+                return false;
+            }
+            let next = (address & !(top_level_size - 1)).saturating_add(top_level_size);
+            if next <= address {
+                return false;
+            }
+            address = next.min(end.data());
+        }
+        true
+    }
+
+    /// Clear exactly the leaf entry at `level`, without descending through a huge mapping and
+    /// without freeing intermediate page tables.
+    pub unsafe fn clear_mapping_at_level(
+        &mut self,
+        virt: VirtAddr,
+        level: usize,
+    ) -> Option<(PhysAddr, EntryFlags<Arch>)> {
+        let mut table = self.table();
+        while table.level() > level {
+            let index = table.index_of(virt)?;
+            let entry = table.entry(index)?;
+            if !entry.present() || Arch::entry_is_leaf(table.level(), entry.flags().data()) {
+                return None;
+            }
+            table = table.next_level_table(index)?;
+        }
+        let index = table.index_of(virt)?;
+        let entry = table.entry(index)?;
+        if !entry.present() || !Arch::entry_is_leaf(level, entry.flags().data()) {
+            return None;
+        }
+        table.set_entry(index, PageEntry::from_usize(0))?;
+        Some((entry.address().ok()?, entry.flags()))
+    }
+
+    /// Reclaim transaction-owned page tables after a synchronous kernel TLB shootdown.
+    pub unsafe fn reclaim_created_tables(&mut self, created_tables: &mut Vec<CreatedPageTable>) {
+        // A lower-level table must be reclaimed before the parent that points to it. Records that
+        // are still non-empty remain owned and are retried by a later device-mapping teardown.
+        created_tables.sort_unstable_by_key(|owned| owned.parent_level);
+        let pending = core::mem::take(created_tables);
+        for owned in pending {
+            let parent =
+                PageTable::<Arch>::new(owned.parent_base, owned.parent_phys, owned.parent_level);
+            let Some(entry) = parent.entry(owned.index) else {
+                continue;
+            };
+            if !entry.present() || entry.address().ok() != Some(owned.child_phys) {
+                continue;
+            }
+            if Arch::entry_is_leaf(owned.parent_level, entry.flags().data()) {
+                continue;
+            }
+            let child = PageTable::<Arch>::new(
+                parent.entry_base(owned.index).unwrap(),
+                owned.child_phys,
+                owned.parent_level - 1,
+            );
+            let empty = (0..Arch::PAGE_ENTRY_NUM)
+                .all(|index| child.entry(index).is_some_and(|entry| entry.empty()));
+            if empty {
+                parent.set_entry(owned.index, PageEntry::from_usize(0));
+                self.frame_allocator.free_one(owned.child_phys);
+            } else {
+                created_tables.push(owned);
             }
         }
     }

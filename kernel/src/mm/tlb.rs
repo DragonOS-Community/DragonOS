@@ -52,7 +52,7 @@ pub const TLB_SINGLE_PAGE_FLUSH_CEILING: usize = 33;
 #[allow(dead_code)]
 pub struct FlushTlbInfo {
     /// Target address space
-    pub mm: Arc<AddressSpace>,
+    pub mm: Option<Arc<AddressSpace>>,
     /// Start virtual address (inclusive, aligned to stride)
     pub start: VirtAddr,
     /// End virtual address (exclusive). If `TLB_FLUSH_ALL`, invalidate the entire mm.
@@ -274,10 +274,10 @@ pub unsafe fn tlb_state_clear_loaded_mm() {
 ///
 /// Only updates `loaded_tlb_gen` when this CPU's loaded_mm matches `info.mm`.
 pub fn local_flush_tlb_func(info: &FlushTlbInfo) {
-    let loaded_matches = {
+    let loaded_matches = info.mm.as_ref().is_none_or(|mm| {
         let st = tlb_state_force(smp_get_processor_id());
-        st.loaded_is(&info.mm)
-    };
+        st.loaded_is(mm)
+    });
 
     if !loaded_matches {
         // This CPU has already switched to a different mm; the previous CR3 write implicitly
@@ -304,9 +304,11 @@ pub fn local_flush_tlb_func(info: &FlushTlbInfo) {
         }
     }
 
-    let st = tlb_state_local_mut();
-    if st.loaded_tlb_gen < info.new_tlb_gen {
-        st.loaded_tlb_gen = info.new_tlb_gen;
+    if info.mm.is_some() {
+        let st = tlb_state_local_mut();
+        if st.loaded_tlb_gen < info.new_tlb_gen {
+            st.loaded_tlb_gen = info.new_tlb_gen;
+        }
     }
 }
 
@@ -360,8 +362,13 @@ pub fn remote_flush_tlb_on_ipi() {
 /// Upon return, all CPUs in `target_cpus` have completed this shootdown (INV-4).
 fn flush_tlb_multi(target_cpus: &CpuMask, info: &FlushTlbInfo) {
     // Filter out offline CPUs to avoid sending IPIs to not-yet-started / offline APICs.
-    let online = smp_cpu_manager().present_cpus();
-    let active: CpuMask = target_cpus & online;
+    let mut online = CpuMask::new();
+    for cpu in smp_cpu_manager().present_cpus().iter_cpu() {
+        if smp_cpu_manager().is_online_cpu(cpu) {
+            online.set(cpu, true);
+        }
+    }
+    let active: CpuMask = target_cpus & &online;
 
     let my_cpu = smp_get_processor_id();
 
@@ -460,7 +467,7 @@ pub fn flush_tlb_mm_range(
     let this_cpu = smp_get_processor_id();
 
     let info = FlushTlbInfo {
-        mm: mm.clone(),
+        mm: Some(mm.clone()),
         start,
         end,
         new_tlb_gen: new_gen,
@@ -491,6 +498,53 @@ pub fn flush_tlb_mm_range(
         local_flush_tlb_func(&info);
     }
 
+    compiler_fence(Ordering::SeqCst);
+    drop(irq_guard);
+
+    #[cfg(target_arch = "x86_64")]
+    if !irq_was_enabled {
+        unsafe { CurrentIrqArch::interrupt_disable() };
+    }
+}
+
+/// Synchronously invalidate a kernel address-space range on every online CPU.
+///
+/// Kernel mappings are shared by all process page tables, so this request is deliberately
+/// independent from any user `AddressSpace` and its TLB generation. Callers must publish PTE
+/// changes before invoking this function and must not free intermediate page-table pages until it
+/// returns.
+pub fn flush_tlb_kernel_range(start: VirtAddr, end: VirtAddr, freed_tables: bool) {
+    #[cfg(target_arch = "x86_64")]
+    let irq_was_enabled = CurrentIrqArch::is_irq_enabled();
+    #[cfg(target_arch = "x86_64")]
+    if !irq_was_enabled {
+        unsafe { CurrentIrqArch::interrupt_enable() };
+    }
+    #[cfg(target_arch = "x86_64")]
+    let _flush_guard = FLUSH_TLB_GLOBAL_LOCK.lock();
+
+    let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+    compiler_fence(Ordering::SeqCst);
+    let this_cpu = smp_get_processor_id();
+    let info = FlushTlbInfo {
+        mm: None,
+        start,
+        end,
+        new_tlb_gen: 0,
+        stride_shift: MMArch::PAGE_SHIFT as u8,
+        freed_tables,
+        initiating_cpu: this_cpu,
+    };
+    let mut remote_mask = CpuMask::new();
+    for cpu in smp_cpu_manager().present_cpus().iter_cpu() {
+        if cpu != this_cpu && smp_cpu_manager().is_online_cpu(cpu) {
+            remote_mask.set(cpu, true);
+        }
+    }
+    if !remote_mask.is_empty() {
+        flush_tlb_multi(&remote_mask, &info);
+    }
+    local_flush_tlb_func(&info);
     compiler_fence(Ordering::SeqCst);
     drop(irq_guard);
 

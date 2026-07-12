@@ -10,6 +10,7 @@ use crate::arch::{MMArch, PciArch, TraitPciArch};
 use crate::driver::pci::subsys::pci_bus_subsys_init;
 use crate::exception::IrqNumber;
 use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use crate::libs::spinlock::SpinLock;
 
 use crate::mm::mmio_buddy::{mmio_pool, MMIOSpaceGuard};
 
@@ -1342,6 +1343,80 @@ pub struct PciBarMappingRequest {
     pub bar: u8,
     pub offset: u64,
     pub length: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PciBarSubresource {
+    bdf: BusDeviceFunction,
+    bar: u8,
+    offset: u64,
+    length: u64,
+    physical_start: u64,
+}
+
+lazy_static! {
+    static ref PCI_BAR_SUBRESOURCES: SpinLock<Vec<PciBarSubresource>> = SpinLock::new(Vec::new());
+}
+
+#[derive(Debug)]
+pub struct PciBarSubresourceGuard {
+    resource: PciBarSubresource,
+}
+
+impl PciBarSubresourceGuard {
+    pub fn reserve(
+        device: &PciDeviceStructureGeneralDevice,
+        bar: u8,
+        offset: u64,
+        length: u64,
+        physical_start: PhysAddr,
+    ) -> Result<Self, PciError> {
+        if length == 0 {
+            return Err(PciError::InvalidBarRange);
+        }
+        let end = offset
+            .checked_add(length)
+            .ok_or(PciError::InvalidBarRange)?;
+        let bar_info = device.standard_device_bar.read();
+        let (_, bar_size) = bar_info
+            .get_bar(bar)?
+            .memory_address_size()
+            .ok_or(PciError::InvalidBarType)?;
+        if end > bar_size {
+            return Err(PciError::InvalidBarRange);
+        }
+        drop(bar_info);
+
+        let resource = PciBarSubresource {
+            bdf: device.common_header.bus_device_function,
+            bar,
+            offset,
+            length,
+            physical_start: physical_start.data() as u64,
+        };
+        let physical_end = resource
+            .physical_start
+            .checked_add(length)
+            .ok_or(PciError::InvalidBarRange)?;
+        let mut resources = PCI_BAR_SUBRESOURCES.lock_irqsave();
+        if resources.iter().any(|existing| {
+            let existing_end = existing.physical_start.saturating_add(existing.length);
+            resource.physical_start < existing_end && existing.physical_start < physical_end
+        }) {
+            return Err(PciError::InvalidBarRange);
+        }
+        resources.push(resource);
+        Ok(Self { resource })
+    }
+}
+
+impl Drop for PciBarSubresourceGuard {
+    fn drop(&mut self) {
+        let mut resources = PCI_BAR_SUBRESOURCES.lock_irqsave();
+        if let Some(index) = resources.iter().position(|item| *item == self.resource) {
+            resources.remove(index);
+        }
+    }
 }
 
 fn unallocated_bar_has_required_mapping(

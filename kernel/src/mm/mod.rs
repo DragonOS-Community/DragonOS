@@ -22,6 +22,7 @@ use self::{
 };
 
 pub mod allocator;
+pub mod device_linear;
 pub mod dma;
 pub mod early_ioremap;
 pub mod fault;

@@ -7,7 +7,7 @@ use crate::{
         base::device::DeviceId,
         pci::pci_irq::IrqType,
         pci::{
-            pci::{PciDeviceStructure, PciError},
+            pci::{PciBarSubresourceGuard, PciDeviceStructure, PciError},
             pci_irq::{IrqCommonMsg, IrqSpecificMsg, PciInterrupt, PciIrqError, PciIrqMsg, IRQ},
         },
     },
@@ -27,13 +27,17 @@ use super::{
 pub struct VirtioSharedMemoryRegion {
     physical_address: PhysAddr,
     length: u64,
+    bar: u8,
+    offset: u64,
 }
 
 impl VirtioSharedMemoryRegion {
-    pub(crate) fn new(physical_address: PhysAddr, length: u64) -> Self {
+    pub(crate) fn new(physical_address: PhysAddr, length: u64, bar: u8, offset: u64) -> Self {
         Self {
             physical_address,
             length,
+            bar,
+            offset,
         }
     }
 
@@ -44,6 +48,14 @@ impl VirtioSharedMemoryRegion {
 
     pub fn length(&self) -> u64 {
         self.length
+    }
+
+    pub(crate) fn bar(&self) -> u8 {
+        self.bar
+    }
+
+    pub(crate) fn offset(&self) -> u64 {
+        self.offset
     }
 }
 
@@ -76,6 +88,16 @@ impl VirtIOTransport {
         match self {
             VirtIOTransport::Pci(transport) => transport.shared_memory_region(id),
             VirtIOTransport::Mmio(_) => None,
+        }
+    }
+
+    pub fn reserve_shared_memory_region(
+        &self,
+        region: VirtioSharedMemoryRegion,
+    ) -> Result<PciBarSubresourceGuard, PciError> {
+        match self {
+            VirtIOTransport::Pci(transport) => transport.reserve_shared_memory_region(region),
+            VirtIOTransport::Mmio(_) => Err(PciError::InvalidBarType),
         }
     }
 

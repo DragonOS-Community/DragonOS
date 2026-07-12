@@ -10,10 +10,16 @@ use system_error::SystemError;
 use virtio_drivers::transport::Transport;
 
 use crate::{
+    arch::MMArch,
     driver::base::device::{Device, DeviceId},
+    driver::pci::pci::PciBarSubresourceGuard,
     exception::{irqdesc::IrqReturn, IrqNumber},
     filesystem::fuse::{conn::FuseConn, stats},
     libs::{spinlock::SpinLock, wait_queue::WaitQueue},
+    mm::{
+        device_linear::DeviceLinearMapping, memblock::mem_block_manager, page::EntryFlags,
+        MemoryManagementArch,
+    },
 };
 
 use super::{
@@ -59,6 +65,54 @@ struct VirtioFsIrqConfig {
 }
 
 #[derive(Debug)]
+struct VirtioFsCacheWindow {
+    mapping: DeviceLinearMapping,
+    _reservation: PciBarSubresourceGuard,
+}
+
+impl VirtioFsCacheWindow {
+    fn new(
+        transport: &VirtIOTransport,
+        region: VirtioSharedMemoryRegion,
+    ) -> Result<Self, SystemError> {
+        let length = usize::try_from(region.length()).map_err(|_| SystemError::EOVERFLOW)?;
+        let start = region.physical_address();
+        if length == 0
+            || !start.check_aligned(MMArch::PAGE_SIZE)
+            || !length.is_multiple_of(MMArch::PAGE_SIZE)
+        {
+            return Err(SystemError::EINVAL);
+        }
+        let end = start
+            .data()
+            .checked_add(length)
+            .ok_or(SystemError::EOVERFLOW)?;
+        if mem_block_manager().to_iter().any(|area| {
+            let area_end = area.base.data().saturating_add(area.size);
+            start.data() < area_end && area.base.data() < end
+        }) {
+            return Err(SystemError::EBUSY);
+        }
+
+        let reservation = transport
+            .reserve_shared_memory_region(region)
+            .map_err(|_| SystemError::EBUSY)?;
+        let flags = EntryFlags::new()
+            .set_user(false)
+            .set_write(true)
+            .set_execute(false)
+            .set_page_cache_disable(false)
+            .set_page_write_through(false)
+            .set_page_global(false);
+        let mapping = DeviceLinearMapping::new(start, length, flags)?;
+        Ok(Self {
+            mapping,
+            _reservation: reservation,
+        })
+    }
+}
+
+#[derive(Debug)]
 struct VirtioFsInstanceState {
     transport: Option<VirtioFsTransportHolder>,
     session_active: bool,
@@ -94,7 +148,7 @@ pub struct VirtioFsInstance {
     irq_wake_enabled: bool,
     irq_is_msix: bool,
     irq_ack: Option<PciInterruptAck>,
-    cache_region: Option<VirtioSharedMemoryRegion>,
+    cache_window: Option<VirtioFsCacheWindow>,
     state: SpinLock<VirtioFsInstanceState>,
     session_wait: WaitQueue,
 }
@@ -106,7 +160,7 @@ impl VirtioFsInstance {
         dev_id: Arc<DeviceId>,
         transport: VirtIOTransport,
         irq: VirtioFsIrqConfig,
-        cache_region: Option<VirtioSharedMemoryRegion>,
+        cache_window: Option<VirtioFsCacheWindow>,
     ) -> Self {
         Self {
             tag,
@@ -115,7 +169,7 @@ impl VirtioFsInstance {
             irq_wake_enabled: irq.wake_enabled,
             irq_is_msix: irq.is_msix,
             irq_ack: irq.ack,
-            cache_region,
+            cache_window,
             state: SpinLock::new(VirtioFsInstanceState {
                 transport: Some(VirtioFsTransportHolder(transport)),
                 session_active: false,
@@ -140,8 +194,10 @@ impl VirtioFsInstance {
         self.num_request_queues
     }
 
-    pub fn cache_region(&self) -> Option<VirtioSharedMemoryRegion> {
-        self.cache_region
+    pub fn cache_window_len(&self) -> Option<usize> {
+        self.cache_window
+            .as_ref()
+            .map(|window| window.mapping.len())
     }
 
     pub fn hiprio_queue_index(&self) -> u16 {
@@ -418,6 +474,16 @@ pub fn virtio_fs(
     let cache_region = transport
         .shared_memory_region(VIRTIO_FS_SHMCAP_ID_CACHE)
         .filter(|region| region.length() != 0);
+    let cache_window = cache_region.and_then(|region| match VirtioFsCacheWindow::new(&transport, region) {
+        Ok(window) => Some(window),
+        Err(error) => {
+            warn!(
+                "virtio-fs: cache window unavailable for tag='{}' dev={:?}: {:?}; continue without DAX",
+                tag, dev_id, error
+            );
+            None
+        }
+    });
     if matches!(transport, VirtIOTransport::Pci(_)) {
         if let Err(e) = transport.setup_irq(dev_id.clone()) {
             warn!(
@@ -448,10 +514,10 @@ pub fn virtio_fs(
             is_msix: irq_is_msix,
             ack: irq_ack,
         },
-        cache_region,
+        cache_window,
     ));
 
-    let cache_region_len = instance.cache_region().map(|region| region.length());
+    let cache_region_len = instance.cache_window_len();
     let mut map = VIRTIO_FS_INSTANCES.lock_irqsave();
     if map.contains_key(&tag) {
         warn!(

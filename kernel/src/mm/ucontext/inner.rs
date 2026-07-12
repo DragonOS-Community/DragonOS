@@ -464,6 +464,36 @@ impl InnerAddressSpace {
         }
     }
 
+    fn populate_vma_intersection(
+        &mut self,
+        vma: Arc<LockedVMA>,
+        intersection: VirtRegion,
+        vm_flags: VmFlags,
+        fault_in_missing: bool,
+    ) -> Result<(), SystemError> {
+        if vm_flags.is_mlock_population_unsupported() {
+            return Ok(());
+        }
+
+        let fault_flags = if fault_in_missing {
+            Some(Self::mlock_fault_flags(vm_flags).ok_or(SystemError::ENOMEM)?)
+        } else {
+            None
+        };
+        let mut addr = intersection.start();
+        while addr < intersection.end() {
+            if self.user_mapper.utable.translate(addr).is_some() {
+                if vm_flags.contains(VmFlags::VM_LOCKED) {
+                    self.add_present_page_mlock_ref(addr, &vma);
+                }
+            } else if fault_in_missing {
+                self.populate_vma_page(vma.clone(), addr, fault_flags.unwrap())?;
+            }
+            addr = VirtAddr::new(addr.data() + MMArch::PAGE_SIZE);
+        }
+        Ok(())
+    }
+
     pub(super) fn populate_vma_range(
         &mut self,
         start: VirtAddr,
@@ -490,18 +520,7 @@ impl InnerAddressSpace {
                 continue;
             }
 
-            let fault_flags = Self::mlock_fault_flags(vm_flags).ok_or(SystemError::ENOMEM)?;
-            let mut addr = intersection.start();
-            while addr < intersection.end() {
-                if self.user_mapper.utable.translate(addr).is_some() {
-                    if vm_flags.contains(VmFlags::VM_LOCKED) {
-                        self.add_present_page_mlock_ref(addr, &vma);
-                    }
-                } else if fault_in_missing {
-                    self.populate_vma_page(vma.clone(), addr, fault_flags)?;
-                }
-                addr = VirtAddr::new(addr.data() + MMArch::PAGE_SIZE);
-            }
+            self.populate_vma_intersection(vma, intersection, vm_flags, fault_in_missing)?;
 
             cursor = intersection.end();
             if cursor >= target.end() {
@@ -514,6 +533,46 @@ impl InnerAddressSpace {
         }
 
         Ok(())
+    }
+
+    /// Populate the current VMAs intersecting an already validated mlock
+    /// range.  Unlike the commit-time coverage check, holes created after the
+    /// mlock flags were committed are skipped, matching Linux __mm_populate().
+    pub(super) fn populate_mlock_range_post_commit(
+        &mut self,
+        start: VirtAddr,
+        len: usize,
+    ) -> Result<(), SystemError> {
+        let target = Self::checked_user_region(start, len)?;
+        let mut vmas = self.mappings.conflicts(target);
+        vmas.sort_by_key(|vma| vma.lock().region().start().data());
+
+        for vma in vmas {
+            let (region, vm_flags) = {
+                let guard = vma.lock();
+                (*guard.region(), *guard.vm_flags())
+            };
+            let Some(intersection) = region.intersect(&target) else {
+                continue;
+            };
+            let fault_in_missing = !vm_flags.contains(VmFlags::VM_LOCKONFAULT);
+            self.populate_vma_intersection(vma, intersection, vm_flags, fault_in_missing)?;
+        }
+        Ok(())
+    }
+
+    /// Best-effort population used after mlockall(MCL_CURRENT).  Address-space
+    /// holes and per-VMA failures do not prevent later VMAs from being visited.
+    pub(super) fn populate_mlockall_post_commit(&mut self) {
+        let vmas = self.mappings.iter_vmas().cloned().collect::<Vec<_>>();
+        for vma in vmas {
+            let (region, vm_flags) = {
+                let guard = vma.lock();
+                (*guard.region(), *guard.vm_flags())
+            };
+            let fault_in_missing = !vm_flags.contains(VmFlags::VM_LOCKONFAULT);
+            let _ = self.populate_vma_intersection(vma, region, vm_flags, fault_in_missing);
+        }
     }
 
     pub(super) fn best_effort_locked_population(

@@ -50,16 +50,16 @@ pub(super) fn do_mlock(
     len: usize,
     new_flags: VmFlags,
 ) -> Result<usize, SystemError> {
+    if !can_do_mlock() {
+        return Err(SystemError::EPERM);
+    }
+
     let (start, len) = normalize_mlock_range(start, len)?;
     if len == 0 {
         return Ok(0);
     }
     if access_ok(start, len).is_err() {
         return Err(SystemError::EINVAL);
-    }
-
-    if !can_do_mlock() {
-        return Err(SystemError::EPERM);
     }
 
     let vm = AddressSpace::current()?;
@@ -75,8 +75,12 @@ pub(super) fn do_mlock(
         let new_pages = guard.count_unlocked_pages_for_mlock(start, len)?;
         check_mlock_rlimit(guard.locked_vm, new_pages)?;
 
-        match guard.apply_vma_lock_flags_collect(start, len, new_flags, false) {
-            Ok(()) => return Ok(0),
+        match guard.apply_vma_lock_flags_collect(start, len, new_flags) {
+            Ok(()) => {
+                drop(guard);
+                vm.populate_mlock_range_post_commit(start, len)?;
+                return Ok(0);
+            }
             Err(failure) => {
                 drop(guard);
                 crate::mm::ucontext::InnerAddressSpace::notify_close_notifications(

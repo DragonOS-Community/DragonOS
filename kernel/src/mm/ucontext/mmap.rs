@@ -159,7 +159,7 @@ impl InnerAddressSpace {
         }
         // debug!("mmap: addr: {addr:?}, page_count: {page_count:?}, prot_flags: {prot_flags:?}, map_flags: {map_flags:?}");
 
-        let vm_flags = VmFlags::from(prot_flags)
+        let mut vm_flags = VmFlags::from(prot_flags)
             | VmFlags::from(map_flags)
             | self.mlock_future
             | VmFlags::VM_MAYREAD
@@ -173,6 +173,9 @@ impl InnerAddressSpace {
                 SystemError::EAGAIN_OR_EWOULDBLOCK
             };
             self.check_mlock_rlimit_for_pages(page_count.data(), error)?;
+        }
+        if vm_flags.is_mlock_flag_unsupported() {
+            vm_flags &= VmFlags::VM_LOCKED_CLEAR_MASK;
         }
 
         let mut notifications = VmaCloseNotifications::default();

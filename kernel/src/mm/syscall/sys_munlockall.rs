@@ -25,16 +25,10 @@ impl Syscall for SysMunlockallHandle {
                 vm.wait_for_no_reservations_interruptible()?;
                 continue;
             }
-            match guard.clear_all_vma_lock_flags_collect() {
-                Ok(()) => return Ok(0),
-                Err(failure) => {
-                    drop(guard);
-                    crate::mm::ucontext::InnerAddressSpace::notify_close_notifications(
-                        failure.notifications,
-                    );
-                    return Err(failure.err);
-                }
-            }
+            let notifications = guard.clear_all_vma_lock_flags_collect();
+            drop(guard);
+            crate::mm::ucontext::InnerAddressSpace::notify_close_notifications(notifications);
+            return Ok(0);
         }
     }
 

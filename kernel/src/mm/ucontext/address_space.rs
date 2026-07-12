@@ -55,6 +55,27 @@ pub struct AddressSpace {
 }
 
 impl AddressSpace {
+    /// Populate a range after mlock flags have been committed and the commit
+    /// guard released.  Reservation waits happen without holding the mm guard.
+    pub fn populate_mlock_range_post_commit(
+        self: &Arc<Self>,
+        start: VirtAddr,
+        len: usize,
+    ) -> Result<(), SystemError> {
+        let region = VirtRegion::new(start, len);
+        let mut guard = self.write_guard_no_reservation_conflict(region);
+        guard.populate_mlock_range_post_commit(start, len)
+    }
+
+    /// Best-effort post-commit population for mlockall(MCL_CURRENT).
+    pub fn populate_mlockall_post_commit(self: &Arc<Self>) {
+        // Do not wait for reservations created after the mlockall commit.
+        // They are not part of MCL_CURRENT's committed VMA set and a blocking
+        // file mmap must not indefinitely delay this best-effort phase.
+        let mut guard = self.write();
+        guard.populate_mlockall_post_commit();
+    }
+
     pub fn new(create_stack: bool) -> Result<Arc<Self>, SystemError> {
         let inner = InnerAddressSpace::new(false)?;
         let table_paddr = inner.user_mapper.utable.table().phys();
@@ -629,6 +650,9 @@ impl AddressSpace {
                 if let Err(err) = guard.check_mlock_rlimit_for_pages(page_count.data(), error) {
                     map_fail!(err);
                 }
+            }
+            if vm_flags.is_mlock_flag_unsupported() {
+                vm_flags &= VmFlags::VM_LOCKED_CLEAR_MASK;
             }
             if let Err(err) = guard.check_rlimit_as_for_region(region, len, map_flags) {
                 map_fail!(err);

@@ -73,22 +73,23 @@ fn do_mlockall(flags: usize) -> Result<usize, SystemError> {
         }
         guard.set_mlock_future(VmFlags::VM_NONE);
 
-        if flags & MCL_CURRENT != 0 {
-            if let Err(failure) = guard.apply_mlockall_current_collect(lock_flags) {
-                drop(guard);
-                crate::mm::ucontext::InnerAddressSpace::notify_close_notifications(
-                    failure.notifications,
-                );
-                return Err(failure.err);
-            }
-        }
+        let notifications = if flags & MCL_CURRENT != 0 {
+            Some(guard.apply_mlockall_current_collect(lock_flags))
+        } else {
+            None
+        };
 
         if flags & MCL_FUTURE != 0 {
             guard.set_mlock_future(lock_flags);
         }
 
-        // TODO: when fault-time page locking is implemented, VM_LOCKONFAULT should
-        // mark pages unevictable on demand instead of relying only on VMA state.
+        drop(guard);
+        if let Some(notifications) = notifications {
+            crate::mm::ucontext::InnerAddressSpace::notify_close_notifications(notifications);
+        }
+        if flags & MCL_CURRENT != 0 {
+            vm.populate_mlockall_post_commit();
+        }
         return Ok(0);
     }
 }

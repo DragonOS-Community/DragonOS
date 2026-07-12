@@ -256,6 +256,26 @@ TEST(Mlock, PopulatesFileMappingBeforeFault) {
     EXPECT_EQ(0, munmap(addr, ps));
 }
 
+TEST(Mlock, ProtNoneReturnsEnomemButKeepsVmaLocked) {
+    const size_t ps = PageSize();
+    ScopedMemlockLimit lim;
+    ASSERT_TRUE(lim.valid());
+    ASSERT_TRUE(lim.set_bytes(ps));
+
+    void* addr = mmap(nullptr, ps, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(MAP_FAILED, addr);
+
+    errno = 0;
+    EXPECT_EQ(-1, mlock(addr, ps));
+    EXPECT_EQ(ENOMEM, errno);
+
+    errno = 0;
+    EXPECT_EQ(-1, msync(addr, ps, MS_INVALIDATE));
+    EXPECT_EQ(EBUSY, errno) << "mlock population failure must not roll back VM_LOCKED";
+
+    EXPECT_EQ(0, munmap(addr, ps));
+}
+
 TEST(Mlock2, OnFaultDoesNotPrefault) {
     const size_t ps = PageSize();
     const size_t len = ps * 2;
@@ -282,6 +302,26 @@ TEST(Mlock2, OnFaultDoesNotPrefault) {
 
     EXPECT_EQ(0, munlock(addr, len));
     EXPECT_EQ(0, munmap(addr, len));
+}
+
+TEST(Mlock2, OnFaultAcceptsProtNoneWithoutPrefault) {
+    const size_t ps = PageSize();
+    ScopedMemlockLimit lim;
+    ASSERT_TRUE(lim.valid());
+    ASSERT_TRUE(lim.set_bytes(ps));
+
+    void* addr = mmap(nullptr, ps, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(MAP_FAILED, addr);
+
+    errno = 0;
+    ASSERT_EQ(0, static_cast<int>(syscall(SYS_mlock2, addr, ps, MLOCK_ONFAULT)))
+        << "errno=" << errno << " (" << strerror(errno) << ")";
+
+    unsigned char vec[1] = {0};
+    ASSERT_EQ(0, mincore(addr, ps, vec));
+    EXPECT_FALSE(IsResident(vec[0]));
+
+    EXPECT_EQ(0, munmap(addr, ps));
 }
 
 TEST(MlockAll, FutureAppliesToNewMappings) {
@@ -313,17 +353,26 @@ TEST(MlockAll, CurrentWithProtNoneClearsStaleFuture) {
         GTEST_SKIP() << "unable to raise RLIMIT_MEMLOCK to hard limit";
     }
 
-    void* guard = mmap(nullptr, ps, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    ASSERT_NE(MAP_FAILED, guard);
+    auto* range = static_cast<char*>(
+        mmap(nullptr, ps * 3, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    ASSERT_NE(MAP_FAILED, range);
+    ASSERT_EQ(0, mprotect(range + ps, ps, PROT_NONE));
 
     ASSERT_EQ(0, mlockall(MCL_FUTURE)) << "errno=" << errno << " (" << strerror(errno) << ")";
 
     errno = 0;
-    if (mlockall(MCL_CURRENT) == -1 && errno == ENOMEM) {
+    int current_result = mlockall(MCL_CURRENT);
+    if (current_result == -1 && errno == ENOMEM) {
         munlockall();
-        munmap(guard, ps);
+        munmap(range, ps * 3);
         GTEST_SKIP() << "RLIMIT_MEMLOCK too small for mlockall(MCL_CURRENT)";
     }
+    ASSERT_EQ(0, current_result) << "errno=" << errno << " (" << strerror(errno) << ")";
+
+    unsigned char vec[1] = {0};
+    ASSERT_EQ(0, mincore(range + ps * 2, ps, vec));
+    EXPECT_TRUE(IsResident(vec[0]))
+        << "mlockall(MCL_CURRENT) must continue past PROT_NONE VMAs and prefault later VMAs";
 
     void* fresh = mmap(nullptr, ps, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     ASSERT_NE(MAP_FAILED, fresh);
@@ -334,7 +383,7 @@ TEST(MlockAll, CurrentWithProtNoneClearsStaleFuture) {
 
     EXPECT_EQ(0, munmap(fresh, ps));
     EXPECT_EQ(0, munlockall());
-    EXPECT_EQ(0, munmap(guard, ps));
+    EXPECT_EQ(0, munmap(range, ps * 3));
 }
 
 TEST(MlockAll, FutureAppliesToBrkGrowth) {

@@ -10,7 +10,9 @@ use crate::{
     arch::MMArch,
     exception::workqueue::{schedule_work, Work},
     filesystem::{
-        page_cache::{PageCache, PageCacheBackend, PageCacheReadDmaReservation},
+        page_cache::{
+            schedule_pagecache_io, PageCache, PageCacheBackend, PageCacheReadDmaReservation,
+        },
         vfs::{file::FileFlags, FilePrivateData, FileType, IndexNode, Metadata, SetMetadataMask},
     },
     libs::mutex::Mutex,
@@ -102,23 +104,38 @@ impl FuseNode {
         // Linux unmap_mapping_pages(..., even_cows=false) preserves private
         // MAP_PRIVATE COW pages while zapping mappings backed by page cache.
         let _ = page_cache.unmap_mapping_pages(start_index, end_exclusive);
-        // Linux invalidate_inode_pages2_range() waits for writeback and calls
-        // ->launder_folio() for dirty folios. FUSE wires that hook to
-        // fuse_launder_folio(), so reverse invalidation drains dirty data before
-        // removing the cache rather than silently discarding local writes.
-        // fuse_reverse_inval_inode() ignores the aggregate invalidation result,
-        // so every phase remains best-effort and one failure does not prevent
-        // clean pages elsewhere in the range from being invalidated.
-        let _ = page_cache
-            .manager()
-            .launder_range_for_invalidate(start_index, end_index);
+        // Remove cache entries that need no daemon I/O before acknowledging the
+        // notification. Dirty/loading/writeback entries remain pinned until the
+        // deferred phase has made them safe to discard.
         {
             let _invalidate = page_cache.invalidate_write();
             let _ = page_cache
                 .manager()
-                .discard_clean_range(start_index, end_index);
+                .discard_clean_range_nowait(start_index, end_index);
         }
-        let _ = page_cache.unmap_mapping_pages(start_index, end_exclusive);
+        // Laundering a dirty FUSE page sends FUSE_WRITE and waits for the daemon.
+        // A notification is itself written by that daemon, so doing this inline
+        // deadlocks a single-threaded daemon before it can read the new request.
+        // Finish invalidation after the notify write has returned.  The first
+        // unmap above immediately prevents stale page-cache mappings from being
+        // used while the work is pending.
+        // This may block on userspace I/O, so use the dedicated page-cache I/O
+        // pool rather than the single system workqueue.
+        schedule_pagecache_io(Work::new(move || {
+            // Linux invalidate_inode_pages2_range() launders dirty folios before
+            // removing clean cache pages.  Keep that ordering and best-effort
+            // behavior, but outside the unsolicited-notify call stack.
+            let _ = page_cache
+                .manager()
+                .launder_range_for_invalidate(start_index, end_index);
+            {
+                let _invalidate = page_cache.invalidate_write();
+                let _ = page_cache
+                    .manager()
+                    .discard_clean_range(start_index, end_index);
+            }
+            let _ = page_cache.unmap_mapping_pages(start_index, end_exclusive);
+        }));
         Ok(())
     }
 

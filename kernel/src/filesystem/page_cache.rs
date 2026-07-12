@@ -122,7 +122,7 @@ lazy_static! {
     static ref PAGECACHE_REGISTRY: SpinLock<Vec<Weak<PageCache>>> = SpinLock::new(Vec::new());
 }
 
-fn schedule_pagecache_io(work: Arc<Work>) {
+pub(crate) fn schedule_pagecache_io(work: Arc<Work>) {
     let idx = PAGECACHE_IO_RR.fetch_add(1, Ordering::Relaxed) % PAGECACHE_IO_WQS.len();
     PAGECACHE_IO_WQS[idx].enqueue(work);
 }
@@ -1348,6 +1348,27 @@ impl PageCacheManager {
         start_index: usize,
         end_index: usize,
     ) -> Result<usize, SystemError> {
+        self.discard_clean_range_inner(start_index, end_index, true)
+    }
+
+    /// Discard immediately reclaimable clean pages without waiting for I/O.
+    ///
+    /// This is used while acknowledging a FUSE notification: waiting for a
+    /// Loading page there can deadlock the daemon that must complete that load.
+    pub(crate) fn discard_clean_range_nowait(
+        &self,
+        start_index: usize,
+        end_index: usize,
+    ) -> Result<usize, SystemError> {
+        self.discard_clean_range_inner(start_index, end_index, false)
+    }
+
+    fn discard_clean_range_inner(
+        &self,
+        start_index: usize,
+        end_index: usize,
+        wait_loading: bool,
+    ) -> Result<usize, SystemError> {
         let cache = self.upgrade()?;
         if cache.is_shmem() {
             return Ok(0);
@@ -1356,7 +1377,7 @@ impl PageCacheManager {
 
         let mut discarded = 0;
         for page_index in indices {
-            if let Some(page) = cache.remove_clean_page_candidate(page_index) {
+            if let Some(page) = cache.remove_clean_page_candidate(page_index, wait_loading) {
                 let paddr = page.phys_address();
                 let can_remove_from_manager = page.read().can_deallocate();
                 let _ = page_reclaimer_lock().remove_page(&paddr);
@@ -1384,7 +1405,7 @@ impl PageCacheManager {
         if cache.is_shmem() {
             return Ok(());
         }
-        if let Some(page) = cache.remove_clean_page_candidate(page_index) {
+        if let Some(page) = cache.remove_clean_page_candidate(page_index, true) {
             cache.discard_unlinked_page(&page);
         }
         Ok(())
@@ -2456,7 +2477,11 @@ impl PageCache {
         }
     }
 
-    fn remove_clean_page_candidate(&self, page_index: usize) -> Option<Arc<Page>> {
+    fn remove_clean_page_candidate(
+        &self,
+        page_index: usize,
+        wait_loading: bool,
+    ) -> Option<Arc<Page>> {
         loop {
             let entry = {
                 let guard = self.inner.lock();
@@ -2465,6 +2490,9 @@ impl PageCache {
 
             match entry.state() {
                 PageState::Loading => {
+                    if !wait_loading {
+                        return None;
+                    }
                     let _ = entry.wait_ready();
                     continue;
                 }
@@ -2504,7 +2532,7 @@ impl PageCache {
     fn evict_clean_pages_for_invalidate(&self, range: Option<(usize, usize)>) -> usize {
         let mut evicted = 0;
         for page_index in self.clean_evict_indices(range) {
-            if let Some(page) = self.remove_clean_page_candidate(page_index) {
+            if let Some(page) = self.remove_clean_page_candidate(page_index, true) {
                 let paddr = page.phys_address();
                 page_manager_lock().remove_page(&paddr);
                 let _ = page_reclaimer_lock().remove_page(&paddr);

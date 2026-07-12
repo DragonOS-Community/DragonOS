@@ -193,6 +193,31 @@ const INODE_CACHE_SIZE: usize = 512;
 pub(super) const INODE_MUTATION_LOCK_SHARDS: usize = 64;
 
 impl Ext4 {
+    fn is_power_of(mut value: u32, base: u32) -> bool {
+        while value > base && value.is_multiple_of(base) {
+            value /= base;
+        }
+        value == base
+    }
+
+    fn block_group_has_super(sb: &SuperBlock, group: BlockGroupId) -> bool {
+        if group == 0 {
+            return true;
+        }
+        if sb.has_compatible_feature(SuperBlock::FEATURE_COMPAT_SPARSE_SUPER2) {
+            return sb.backup_block_groups().contains(&group);
+        }
+        if group <= 1
+            || !sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_SPARSE_SUPER)
+        {
+            return true;
+        }
+        group & 1 != 0
+            && (Self::is_power_of(group, 3)
+                || Self::is_power_of(group, 5)
+                || Self::is_power_of(group, 7))
+    }
+
     fn merge_metadata_ranges(mut ranges: Vec<(PBlockId, PBlockId)>) -> Vec<(PBlockId, PBlockId)> {
         ranges.sort_unstable();
         let mut merged: Vec<(PBlockId, PBlockId)> = Vec::new();
@@ -213,9 +238,7 @@ impl Ext4 {
         groups: &[spin::Mutex<BlockGroupDesc>],
     ) -> Result<Vec<(PBlockId, PBlockId)>> {
         let desc_per_block = BLOCK_SIZE as u64 / sb.desc_size() as u64;
-        let gdt_end = 1u64
-            .checked_add((sb.block_group_count() as u64).div_ceil(desc_per_block))
-            .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+        let gdt_blocks = (sb.block_group_count() as u64).div_ceil(desc_per_block);
         let inode_table_blocks = (sb.inodes_per_group() as u64)
             .checked_mul(sb.inode_size() as u64)
             .and_then(|bytes| bytes.checked_add(BLOCK_SIZE as u64 - 1))
@@ -223,10 +246,27 @@ impl Ext4 {
             .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
         let mut ranges = Vec::new();
         ranges
-            .try_reserve_exact(2usize.saturating_add(groups.len().saturating_mul(3)))
+            .try_reserve_exact(groups.len().saturating_mul(4))
             .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
-        ranges.extend_from_slice(&[(0, 1), (1, gdt_end)]);
-        for group in groups {
+        for (bgid, group) in groups.iter().enumerate() {
+            let bgid = bgid as BlockGroupId;
+            if Self::block_group_has_super(sb, bgid) {
+                let start =
+                    sb.first_data_block() as u64 + bgid as u64 * sb.blocks_per_group() as u64;
+                let end = start
+                    .checked_add(1)
+                    .and_then(|value| value.checked_add(gdt_blocks))
+                    .and_then(|value| value.checked_add(sb.reserved_gdt_blocks() as u64))
+                    .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+                let group_end = start
+                    .checked_add(sb.blocks_per_group() as u64)
+                    .map(|value| core::cmp::min(value, sb.block_count()))
+                    .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+                if end > group_end {
+                    return Err(Ext4Error::new(ErrCode::EIO));
+                }
+                ranges.push((start, end));
+            }
             let desc = *group.lock();
             for start in [desc.block_bitmap_block(), desc.inode_bitmap_block()] {
                 ranges.push((
@@ -276,6 +316,7 @@ impl Ext4 {
             || sb.clusters_per_group() == 0
             || sb.clusters_per_group() as usize > BLOCK_SIZE * 8
             || sb.inodes_per_group() as usize > BLOCK_SIZE * 8
+            || sb.reserved_gdt_blocks() as usize > BLOCK_SIZE / 4
             || sb.clusters_per_group() != sb.blocks_per_group()
             || blocks <= sb.first_data_block() as u64
             || sb.inode_count() == 0
@@ -571,12 +612,44 @@ mod validation_tests {
     }
 
     #[test]
+    fn reserved_gdt_blocks_obey_linux_geometry_limit() {
+        let mut sb = SuperBlock::validation_fixture();
+        sb.set_reserved_gdt_blocks((BLOCK_SIZE / 4) as u16);
+        sb.set_checksum();
+        assert!(Ext4::validate_super_block(&sb).is_ok());
+
+        sb.set_reserved_gdt_blocks((BLOCK_SIZE / 4 + 1) as u16);
+        sb.set_checksum();
+        assert!(Ext4::validate_super_block(&sb).is_err());
+    }
+
+    #[test]
     fn orphan_present_is_recognized_for_read_only_loading() {
         let mut sb = SuperBlock::validation_fixture();
         sb.set_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_ORPHAN_PRESENT, true);
         sb.set_checksum();
 
         assert!(Ext4::validate_super_block(&sb).is_ok());
+    }
+
+    #[test]
+    fn backup_super_groups_follow_linux_sparse_rules() {
+        let mut sb = SuperBlock::validation_fixture();
+        sb.set_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_SPARSE_SUPER, true);
+        for group in [0, 1, 3, 5, 7, 9, 25, 49] {
+            assert!(Ext4::block_group_has_super(&sb, group));
+        }
+        for group in [2, 4, 11, 15, 21] {
+            assert!(!Ext4::block_group_has_super(&sb, group));
+        }
+
+        sb.set_compatible_feature(SuperBlock::FEATURE_COMPAT_SPARSE_SUPER2, true);
+        sb.set_backup_block_groups([4, 12]);
+        assert!(Ext4::block_group_has_super(&sb, 0));
+        assert!(Ext4::block_group_has_super(&sb, 4));
+        assert!(Ext4::block_group_has_super(&sb, 12));
+        assert!(!Ext4::block_group_has_super(&sb, 1));
+        assert!(!Ext4::block_group_has_super(&sb, 3));
     }
 
     #[test]

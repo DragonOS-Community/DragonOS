@@ -115,12 +115,15 @@ impl SuperBlock {
     const SB_MAGIC: u16 = 0xEF53;
 
     pub const FEATURE_COMPAT_HAS_JOURNAL: u32 = 0x0004;
+    pub const FEATURE_COMPAT_RESIZE_INODE: u32 = 0x0010;
+    pub const FEATURE_COMPAT_SPARSE_SUPER2: u32 = 0x0200;
     pub const FEATURE_COMPAT_FAST_COMMIT: u32 = 0x0400;
     pub const FEATURE_COMPAT_ORPHAN_FILE: u32 = 0x1000;
     pub const FEATURE_INCOMPAT_RECOVER: u32 = 0x0004;
     pub const FEATURE_INCOMPAT_JOURNAL_DEV: u32 = 0x0008;
     /// The orphan file may contain orphaned inodes.
     pub const FEATURE_RO_COMPAT_ORPHAN_PRESENT: u32 = 0x0001_0000;
+    pub const FEATURE_RO_COMPAT_SPARSE_SUPER: u32 = 0x0001;
     pub const FEATURE_RO_COMPAT_METADATA_CSUM: u32 = 0x0400;
 
     pub fn check_magic(&self) -> bool {
@@ -178,6 +181,14 @@ impl SuperBlock {
 
     pub fn journal_inode_number(&self) -> u32 {
         self.journal_inode_number
+    }
+
+    pub fn reserved_gdt_blocks(&self) -> u16 {
+        self.s_reserved_gdt_blocks
+    }
+
+    pub fn backup_block_groups(&self) -> [u32; 2] {
+        self.backup_bgs
     }
 
     pub fn journal_device(&self) -> u32 {
@@ -349,6 +360,25 @@ impl SuperBlock {
         } else {
             self.features_read_only &= !feature;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_compatible_feature(&mut self, feature: u32, enabled: bool) {
+        if enabled {
+            self.features_compatible |= feature;
+        } else {
+            self.features_compatible &= !feature;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_backup_block_groups(&mut self, groups: [u32; 2]) {
+        self.backup_bgs = groups;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_reserved_gdt_blocks(&mut self, blocks: u16) {
+        self.s_reserved_gdt_blocks = blocks;
     }
 }
 

@@ -506,6 +506,14 @@ fn prepare_buffered_write_does_not_commit_size_test() {
 
 fn legacy_orphan_mount_cleanup_test() {
     make_ext4();
+    let (free_inodes_before, free_blocks_before) = {
+        let ext4 = load_ext4();
+        let sb = ext4.super_block().expect("read baseline superblock failed");
+        let counters = (sb.free_inodes_count(), sb.free_blocks_count());
+        ext4.shutdown_writable()
+            .expect("baseline clean writable shutdown failed");
+        counters
+    };
     let orphan = {
         let ext4 = load_ext4();
         let mode = InodeMode::FILE | InodeMode::ALL_RWX;
@@ -527,12 +535,43 @@ fn legacy_orphan_mount_cleanup_test() {
     };
 
     let ext4 = load_ext4();
-    ext4
-        .generic_lookup(ROOT_INO, "crash_orphan")
+    ext4.generic_lookup(ROOT_INO, "crash_orphan")
         .expect_err("orphaned name reappeared after recovery");
-    ext4
-        .getattr(orphan)
+    ext4.getattr(orphan)
         .expect_err("mount recovery did not reclaim orphan inode");
+
+    // Recovery must leave both allocation bitmaps reusable.  Repeated
+    // allocate/write/unlink/reclaim cycles catch a stale inode bit, leaked
+    // data blocks, or an orphan record that is consumed more than once.
+    let mode = InodeMode::FILE | InodeMode::ALL_RWX;
+    for iteration in 0..16 {
+        let name = format!("post_recovery_reuse_{iteration}");
+        let inode = ext4
+            .generic_create(ROOT_INO, &name, mode)
+            .expect("post-recovery create failed");
+        let payload = vec![iteration as u8; 2 * 1024 * 1024];
+        ext4.write(inode, 0, &payload)
+            .expect("post-recovery write failed");
+        let handle = ext4
+            .unlink(ROOT_INO, &name)
+            .expect("post-recovery unlink failed")
+            .expect("post-recovery final unlink returned no reclaim handle");
+        ext4.reclaim_inode(handle)
+            .expect("post-recovery reclaim failed");
+    }
+    let recovered = ext4
+        .super_block()
+        .expect("read recovered superblock failed");
+    assert_eq!(
+        recovered.free_inodes_count(),
+        free_inodes_before,
+        "orphan recovery leaked inode bitmap accounting"
+    );
+    assert_eq!(
+        recovered.free_blocks_count(),
+        free_blocks_before,
+        "orphan recovery leaked block bitmap accounting"
+    );
     ext4.shutdown_writable()
         .expect("clean writable shutdown failed");
     drop(ext4);

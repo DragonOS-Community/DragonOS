@@ -177,6 +177,23 @@ impl FileSystem for Ext4FileSystem {
     }
 
     unsafe fn page_mkwrite(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
+        let file = pfm.vma().lock().vm_file();
+        let Some(file) = file else {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        };
+        let Some(page_index) = pfm.backing_pgoff() else {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        };
+        let inode_ref = file.inode();
+        let Some(inode) = inode_ref
+            .as_any_ref()
+            .downcast_ref::<LockedExt4Inode>()
+        else {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        };
+        let Ok(_prepare_guard) = inode.prepare_mmap_write(page_index) else {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        };
         PageFaultHandler::filemap_page_mkwrite(pfm)
     }
 

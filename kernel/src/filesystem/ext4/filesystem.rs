@@ -375,7 +375,7 @@ impl Ext4FileSystem {
     }
 
     pub(super) fn validate_inode(&self, inode: &Arc<LockedExt4Inode>) -> Result<(), SystemError> {
-        let inode_num = inode.0.lock().inner_inode_num;
+        let inode_num = inode.inner.lock().inner_inode_num;
         let table = self.inode_table.lock();
         let entry = table.get(&inode_num).ok_or(SystemError::ESTALE)?;
         if !Weak::ptr_eq(&entry.inode, &Arc::downgrade(inode))
@@ -390,7 +390,7 @@ impl Ext4FileSystem {
         self: &Arc<Self>,
         inode: &Arc<LockedExt4Inode>,
     ) -> Result<Ext4InodeTombstone, SystemError> {
-        let inode_num = inode.0.lock().inner_inode_num;
+        let inode_num = inode.inner.lock().inner_inode_num;
         {
             let table = self.inode_table.lock();
             let entry = table.get(&inode_num).ok_or(SystemError::ESTALE)?;
@@ -467,7 +467,7 @@ impl Ext4FileSystem {
         // this temporary retain/release pair from creating a false-zero edge.
         inode.retain(InodeRetentionKind::AsyncWork)?;
         let (fs, should_queue) = {
-            let mut guard = inode.0.lock();
+            let mut guard = inode.inner.lock();
             guard.dirty_state.insert(dirty);
             let should_queue = !guard
                 .dirty_state
@@ -482,7 +482,7 @@ impl Ext4FileSystem {
             if let Some(fs) = fs {
                 fs.dirty_inodes.lock().push(inode.clone());
             } else {
-                let mut guard = inode.0.lock();
+                let mut guard = inode.inner.lock();
                 guard.dirty_state.remove(InodeDirtyState::QUEUED);
                 drop(guard);
                 inode.release(InodeRetentionKind::AsyncWork);
@@ -509,7 +509,7 @@ impl Ext4FileSystem {
             let mut should_requeue = false;
             let mut release_async_owner = false;
             let has_dirty_metadata = {
-                let mut guard = inode.0.lock();
+                let mut guard = inode.inner.lock();
                 let has_dirty = guard
                     .dirty_state
                     .intersects(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY);
@@ -537,7 +537,7 @@ impl Ext4FileSystem {
                         error
                     );
                     let page_cache = {
-                        let mut guard = inode.0.lock();
+                        let mut guard = inode.inner.lock();
                         guard.dirty_state.remove(
                             InodeDirtyState::SIZE_DIRTY
                                 | InodeDirtyState::MTIME_DIRTY
@@ -562,9 +562,9 @@ impl Ext4FileSystem {
 
             let result = {
                 let _operation = operation;
-                let _io_guard = inode.1.lock();
+                let _io_guard = inode.io_lock.lock();
                 let (fs, inode_num, snapshot_dirty, cached_size, cached_mtime) = {
-                    let mut guard = inode.0.lock();
+                    let mut guard = inode.inner.lock();
                     guard.dirty_state.remove(InodeDirtyState::QUEUED);
                     let snapshot_dirty = guard
                         .dirty_state
@@ -615,7 +615,7 @@ impl Ext4FileSystem {
                         Err(SystemError::EIO)
                     };
 
-                    let mut guard = inode.0.lock();
+                    let mut guard = inode.inner.lock();
                     if result.is_ok() {
                         if snapshot_dirty.contains(InodeDirtyState::SIZE_DIRTY)
                             && guard.cached_file_size == cached_size
@@ -705,32 +705,30 @@ impl Ext4FileSystem {
             another_ext4::Ext4::load_writable(mount_data.clone())?
         };
         let root_inode: Arc<LockedExt4Inode> =
-            Arc::new_cyclic(|self_ref: &Weak<LockedExt4Inode>| {
-                LockedExt4Inode(
-                    Mutex::new(Ext4Inode {
-                        inner_inode_num: another_ext4::EXT4_ROOT_INO,
-                        fs_ptr: Weak::default(),
-                        page_cache: None,
-                        children: BTreeMap::new(),
-                        dname: DName::from("/"),
-                        vfs_inode_id: generate_inode_id(),
-                        parent: self_ref.clone(),
-                        self_ref: self_ref.clone(),
-                        special_node: None,
-                        cached_file_size: None,
-                        cached_mtime: None,
-                        dirty_state: super::inode::InodeDirtyState::empty(),
-                    }),
-                    Mutex::new(()),
-                    RwSem::new(()),
-                    Mutex::new(()),
-                    Ext4InodeLifecycle::new(),
-                    vfs::InodeRetentionState::new(),
-                    SpinLock::new(None),
-                    SpinLock::new(false),
-                    self_ref.clone(),
-                    SpinLock::new(Weak::new()),
-                )
+            Arc::new_cyclic(|self_ref: &Weak<LockedExt4Inode>| LockedExt4Inode {
+                inner: Mutex::new(Ext4Inode {
+                    inner_inode_num: another_ext4::EXT4_ROOT_INO,
+                    fs_ptr: Weak::default(),
+                    page_cache: None,
+                    children: BTreeMap::new(),
+                    dname: DName::from("/"),
+                    vfs_inode_id: generate_inode_id(),
+                    parent: self_ref.clone(),
+                    self_ref: self_ref.clone(),
+                    special_node: None,
+                    cached_file_size: None,
+                    cached_mtime: None,
+                    dirty_state: super::inode::InodeDirtyState::empty(),
+                }),
+                io_lock: Mutex::new(()),
+                size_lock: RwSem::new(()),
+                namespace_lock: Mutex::new(()),
+                lifecycle: Ext4InodeLifecycle::new(),
+                retention: vfs::InodeRetentionState::new(),
+                pending_reclaim: SpinLock::new(None),
+                eviction_scheduled: SpinLock::new(false),
+                retention_callback_self: self_ref.clone(),
+                eviction_filesystem: SpinLock::new(Weak::new()),
             });
 
         let fs = Arc::new(Ext4FileSystem {
@@ -746,10 +744,10 @@ impl Ext4FileSystem {
             _mount_options: mount_options,
         });
 
-        let mut guard = fs.root_inode.0.lock();
+        let mut guard = fs.root_inode.inner.lock();
         guard.fs_ptr = Arc::downgrade(&fs);
         drop(guard);
-        *fs.root_inode.9.lock() = Arc::downgrade(&fs);
+        *fs.root_inode.eviction_filesystem.lock() = Arc::downgrade(&fs);
         fs.inode_table.lock().insert(
             another_ext4::EXT4_ROOT_INO,
             CanonicalInodeEntry {

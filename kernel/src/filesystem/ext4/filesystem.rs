@@ -545,9 +545,9 @@ impl Ext4FileSystem {
                         } else {
                             None
                         };
-                        fs.fs
-                            .commit_inode_metadata(inode_num, size, mtime)
-                            .map_err(SystemError::from)
+                        LockedExt4Inode::retry_metadata_contention(|| {
+                            fs.fs.commit_inode_metadata(inode_num, size, mtime)
+                        })
                     })
                 } else {
                     Err(SystemError::EIO)

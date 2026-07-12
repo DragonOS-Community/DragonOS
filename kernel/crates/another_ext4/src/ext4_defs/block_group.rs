@@ -7,7 +7,6 @@
 
 use super::crc::*;
 use super::AsBytes;
-use super::Bitmap;
 use crate::constants::*;
 use crate::prelude::*;
 
@@ -106,20 +105,6 @@ impl BlockGroupDesc {
         self.free_blocks_count_hi = (cnt >> 16) as u16;
     }
 
-    pub fn set_inode_bitmap_csum(&mut self, uuid: &[u8], bitmap: &Bitmap) {
-        let mut csum = crc32(CRC32_INIT, uuid);
-        csum = crc32(csum, bitmap.as_bytes());
-        self.inode_bitmap_csum_lo = csum as u16;
-        self.inode_bitmap_csum_hi = (csum >> 16) as u16;
-    }
-
-    pub fn set_block_bitmap_csum(&mut self, uuid: &[u8], bitmap: &Bitmap) {
-        let mut csum = crc32(CRC32_INIT, uuid);
-        csum = crc32(csum, bitmap.as_bytes());
-        self.block_bitmap_csum_lo = csum as u16;
-        self.block_bitmap_csum_hi = (csum >> 16) as u16;
-    }
-
     fn bitmap_csum(uuid: &[u8], bytes: &[u8], len: usize) -> Option<u32> {
         let covered = bytes.get(..len)?;
         Some(crc32(crc32(CRC32_INIT, uuid), covered))
@@ -215,6 +200,12 @@ mod tests {
         let uuid = [0x5a; 16];
         let mut desc = BlockGroupDesc::default();
         let mut bytes = [0u8; 32];
+        // Model a partial last inode group: direct mutation may touch only 65
+        // real inode bits, while Linux checksums the fixed 128-bit group bitmap.
+        {
+            let mut actual_inodes = crate::ext4_defs::Bitmap::new(&mut bytes, 65);
+            actual_inodes.set_bit(64);
+        }
 
         assert!(desc.update_block_bitmap_csum(&uuid, &bytes, 16));
         assert!(desc.verify_block_bitmap_csum(&uuid, &bytes, 16));
@@ -228,6 +219,12 @@ mod tests {
         // Bytes beyond the fixed checksum length are outside the bitmap.
         bytes[16] ^= 1;
         assert!(desc.verify_block_bitmap_csum(&uuid, &bytes, 16));
+
+        assert!(desc.update_inode_bitmap_csum(&uuid, &bytes, 16));
+        bytes[15] ^= 1;
+        assert!(!desc.verify_inode_bitmap_csum(&uuid, &bytes, 16));
+        bytes[15] ^= 1;
+        assert!(desc.verify_inode_bitmap_csum(&uuid, &bytes, 16));
     }
 
     #[test]

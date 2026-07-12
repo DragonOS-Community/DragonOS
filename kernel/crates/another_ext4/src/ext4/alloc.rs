@@ -648,16 +648,23 @@ impl Ext4 {
             let old_bitmap_block = bitmap_block.clone();
             let old_bg = BlockGroupRef::new(bg.id, bg.desc);
             let old_sb = sb;
-            let mut bitmap = Bitmap::new(&mut *bitmap_block.data, blocks_in_group);
-
-            let bit = match bitmap.find_and_set_first_clear_bit(0, blocks_in_group) {
-                Some(bit) => bit,
-                None => continue,
+            let bit = {
+                let mut bitmap = Bitmap::new(&mut *bitmap_block.data, blocks_in_group);
+                match bitmap.find_and_set_first_clear_bit(0, blocks_in_group) {
+                    Some(bit) => bit,
+                    None => continue,
+                }
             };
             let fblock = Self::block_group_first_block(&sb, bgid) + bit as PBlockId;
 
             // Set block group checksum
-            bg.desc.set_block_bitmap_csum(&sb.uuid(), &bitmap);
+            if !bg.desc.update_block_bitmap_csum(
+                &sb.uuid(),
+                &*bitmap_block.data,
+                sb.clusters_per_group() as usize / 8,
+            ) {
+                return_error!(ErrCode::EIO, "Invalid block bitmap checksum length");
+            }
             self.write_block(&bitmap_block)?;
 
             // Update block group counters
@@ -749,15 +756,22 @@ impl Ext4 {
         let old_bitmap_block = bitmap_block.clone();
         let old_bg = BlockGroupRef::new(bg.id, bg.desc);
         let old_sb = sb;
-        let mut bitmap = Bitmap::new(&mut *bitmap_block.data, blocks_in_group);
-
-        // Free the block
-        if bitmap.is_bit_clear(bit) {
-            return_error!(ErrCode::EINVAL, "Block {} is already free", pblock);
+        {
+            let mut bitmap = Bitmap::new(&mut *bitmap_block.data, blocks_in_group);
+            // Free the block
+            if bitmap.is_bit_clear(bit) {
+                return_error!(ErrCode::EINVAL, "Block {} is already free", pblock);
+            }
+            bitmap.clear_bit(bit);
         }
-        bitmap.clear_bit(bit);
         // Set block group checksum
-        bg.desc.set_block_bitmap_csum(&sb.uuid(), &bitmap);
+        if !bg.desc.update_block_bitmap_csum(
+            &sb.uuid(),
+            &*bitmap_block.data,
+            sb.clusters_per_group() as usize / 8,
+        ) {
+            return_error!(ErrCode::EIO, "Invalid block bitmap checksum length");
+        }
         self.write_block(&bitmap_block)?;
 
         // Update block group counters
@@ -805,19 +819,26 @@ impl Ext4 {
             let old_bg = BlockGroupRef::new(bg.id, bg.desc);
             let old_sb = sb;
             let inode_count = sb.inode_count_in_group(bgid) as usize;
-            let mut bitmap = Bitmap::new(&mut *bitmap_block.data, inode_count);
-
-            // Find a free inode
-            let idx_in_bg =
+            // Find a free inode, limiting allocation to real inodes even though
+            // the checksum covers the fixed inodes_per_group bitmap length.
+            let idx_in_bg = {
+                let mut bitmap = Bitmap::new(&mut *bitmap_block.data, inode_count);
                 bitmap
                     .find_and_set_first_clear_bit(0, inode_count)
                     .ok_or(format_error!(
                         ErrCode::ENOSPC,
                         "No free inodes in block group {}",
                         bgid
-                    ))? as u32;
+                    ))? as u32
+            };
             // Update bitmap in disk
-            bg.desc.set_inode_bitmap_csum(&sb.uuid(), &bitmap);
+            if !bg.desc.update_inode_bitmap_csum(
+                &sb.uuid(),
+                &*bitmap_block.data,
+                sb.inodes_per_group() as usize / 8,
+            ) {
+                return_error!(ErrCode::EIO, "Invalid inode bitmap checksum length");
+            }
             self.write_block(&bitmap_block)?;
 
             // Modify block group counters
@@ -881,20 +902,27 @@ impl Ext4 {
         let old_bg = BlockGroupRef::new(bg.id, bg.desc);
         let old_sb = sb;
         let inode_count = sb.inode_count_in_group(bgid) as usize;
-        let mut bitmap = Bitmap::new(&mut *bitmap_block.data, inode_count);
-
-        // Free the inode
-        if bitmap.is_bit_clear(idx_in_bg as usize) {
-            return_error!(
-                ErrCode::EINVAL,
-                "Inode {} is already free in block group {}",
-                inode_ref.id,
-                bgid
-            );
+        {
+            let mut bitmap = Bitmap::new(&mut *bitmap_block.data, inode_count);
+            // Free the inode
+            if bitmap.is_bit_clear(idx_in_bg as usize) {
+                return_error!(
+                    ErrCode::EINVAL,
+                    "Inode {} is already free in block group {}",
+                    inode_ref.id,
+                    bgid
+                );
+            }
+            bitmap.clear_bit(idx_in_bg as usize);
         }
-        bitmap.clear_bit(idx_in_bg as usize);
         // Update bitmap in disk
-        bg.desc.set_inode_bitmap_csum(&sb.uuid(), &bitmap);
+        if !bg.desc.update_inode_bitmap_csum(
+            &sb.uuid(),
+            &*bitmap_block.data,
+            sb.inodes_per_group() as usize / 8,
+        ) {
+            return_error!(ErrCode::EIO, "Invalid inode bitmap checksum length");
+        }
         self.write_block(&bitmap_block)?;
 
         // Update block group counters

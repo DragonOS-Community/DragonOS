@@ -5,10 +5,6 @@ impl<'a> Bitmap<'a> {
         Self(&mut bmap[..nbits.div_ceil(8)])
     }
 
-    pub fn as_bytes(&self) -> &[u8] {
-        self.0
-    }
-
     pub fn is_bit_clear(&self, bit: usize) -> bool {
         self.0[bit / 8] & (1 << (bit % 8)) == 0
     }

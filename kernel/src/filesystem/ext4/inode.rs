@@ -281,9 +281,9 @@ impl IndexNode for LockedExt4Inode {
         let ext4 = &fs.fs;
 
         let id = if file_type == vfs::FileType::Dir {
-            ext4.mkdir(guard.inner_inode_num, name, file_mode)?
+            Self::retry_metadata_contention(|| ext4.mkdir(guard.inner_inode_num, name, file_mode))?
         } else {
-            ext4.create(guard.inner_inode_num, name, file_mode)?
+            Self::retry_metadata_contention(|| ext4.create(guard.inner_inode_num, name, file_mode))?
         };
 
         let dname = DName::from(name);
@@ -427,15 +427,15 @@ impl IndexNode for LockedExt4Inode {
                 log::warn!("Failed to get current time, using 0");
                 0
             });
-            fs.fs
-                .prepare_buffered_write(
+            Self::retry_metadata_contention(|| {
+                fs.fs.prepare_buffered_write(
                     inode_num,
                     alloc_start,
                     alloc_len,
                     new_end as u64,
                     Some(time),
                 )
-                .map_err(SystemError::from)?;
+            })?;
 
             // 写入范围的磁盘块已就绪，现在安全写入 page cache。
             let write_len = PageCache::write(&page_cache, offset, buf)?;
@@ -475,10 +475,9 @@ impl IndexNode for LockedExt4Inode {
             // which overwrites the inode's block_count/extent tree with a stale
             // snapshot, causing setattr to re-allocate blocks endlessly until
             // the extent tree overflows (entries > max_entries → EIO).
-            FileType::RegularFile => fs
-                .fs
-                .write_data_only(inode_num, offset, buf)
-                .map_err(From::from),
+            FileType::RegularFile => {
+                Self::retry_metadata_contention(|| fs.fs.write_data_only(inode_num, offset, buf))
+            }
             _ => Err(SystemError::EINVAL),
         }
     }
@@ -773,21 +772,23 @@ impl IndexNode for LockedExt4Inode {
             (guard.concret_fs(), guard.inner_inode_num)
         };
         let ext4 = &fs.fs;
-        ext4.setattr(
-            inode_num,
-            another_ext4::SetAttr {
-                mode: Some(another_ext4::InodeMode::from_bits_truncate(
-                    mode.bits() as u16
-                )),
-                uid: Some(metadata.uid as u32),
-                gid: Some(metadata.gid as u32),
-                size: Some(metadata.size as u64),
-                atime: Some(to_ext4_time(&metadata.atime)),
-                mtime: Some(to_ext4_time(&metadata.mtime)),
-                ctime: Some(to_ext4_time(&metadata.ctime)),
-                crtime: Some(to_ext4_time(&metadata.btime)),
-            },
-        )?;
+        Self::retry_metadata_contention(|| {
+            ext4.setattr(
+                inode_num,
+                another_ext4::SetAttr {
+                    mode: Some(another_ext4::InodeMode::from_bits_truncate(
+                        mode.bits() as u16
+                    )),
+                    uid: Some(metadata.uid as u32),
+                    gid: Some(metadata.gid as u32),
+                    size: Some(metadata.size as u64),
+                    atime: Some(to_ext4_time(&metadata.atime)),
+                    mtime: Some(to_ext4_time(&metadata.mtime)),
+                    ctime: Some(to_ext4_time(&metadata.ctime)),
+                    crtime: Some(to_ext4_time(&metadata.btime)),
+                },
+            )
+        })?;
         {
             let mut guard = self.0.lock();
             guard.cached_file_size = Some(metadata.size as u64);
@@ -820,20 +821,21 @@ impl IndexNode for LockedExt4Inode {
             let _io_guard = self.1.lock();
             let ext4 = &fs.fs;
             // 仅调整文件大小，其他属性保持不变
-            ext4.setattr(
-                inode_num,
-                another_ext4::SetAttr {
-                    mode: None,
-                    uid: None,
-                    gid: None,
-                    size: Some(len as u64),
-                    atime: None,
-                    mtime: None,
-                    ctime: None,
-                    crtime: None,
-                },
-            )
-            .map_err(SystemError::from)?;
+            Self::retry_metadata_contention(|| {
+                ext4.setattr(
+                    inode_num,
+                    another_ext4::SetAttr {
+                        mode: None,
+                        uid: None,
+                        gid: None,
+                        size: Some(len as u64),
+                        atime: None,
+                        mtime: None,
+                        ctime: None,
+                        crtime: None,
+                    },
+                )
+            })?;
             // 更新缓存的文件大小
             {
                 let mut guard = self.0.lock();
@@ -970,13 +972,15 @@ impl IndexNode for LockedExt4Inode {
             return Err(SystemError::EPERM);
         }
 
-        ext4.setxattr_with_flags(
-            inode_num,
-            name,
-            value,
-            flags.contains(XattrFlags::CREATE),
-            flags.contains(XattrFlags::REPLACE),
-        )?;
+        Self::retry_metadata_contention(|| {
+            ext4.setxattr_with_flags(
+                inode_num,
+                name,
+                value,
+                flags.contains(XattrFlags::CREATE),
+                flags.contains(XattrFlags::REPLACE),
+            )
+        })?;
 
         Ok(0)
     }
@@ -1023,7 +1027,7 @@ impl IndexNode for LockedExt4Inode {
             return Err(SystemError::EPERM);
         }
 
-        ext4.removexattr(inode_num, name)?;
+        Self::retry_metadata_contention(|| ext4.removexattr(inode_num, name))?;
         Ok(0)
     }
 
@@ -1059,16 +1063,18 @@ impl IndexNode for LockedExt4Inode {
             vfs::FileType::CharDevice | vfs::FileType::BlockDevice
         ) {
             // Character/block device: use mknod to store device number in i_block
-            ext4.mknod(
-                inode_num,
-                filename,
-                file_mode,
-                dev_t.major().data(),
-                dev_t.minor(),
-            )?
+            Self::retry_metadata_contention(|| {
+                ext4.mknod(
+                    inode_num,
+                    filename,
+                    file_mode,
+                    dev_t.major().data(),
+                    dev_t.minor(),
+                )
+            })?
         } else {
             // FIFO, Socket, etc.: use regular create (no device number needed)
-            ext4.create(inode_num, filename, file_mode)?
+            Self::retry_metadata_contention(|| ext4.create(inode_num, filename, file_mode))?
         };
 
         // Wrap as VFS inode and cache
@@ -1397,7 +1403,7 @@ impl LockedExt4Inode {
         }
     }
 
-    fn retry_metadata_contention<T>(
+    pub(super) fn retry_metadata_contention<T>(
         mut operation: impl FnMut() -> core::result::Result<T, another_ext4::Ext4Error>,
     ) -> Result<T, SystemError> {
         let mut attempt = 1usize;
@@ -1835,9 +1841,7 @@ impl LockedExt4Inode {
         } else {
             None
         };
-        fs.fs
-            .commit_inode_metadata(inode_num, size, mtime)
-            .map_err(SystemError::from)?;
+        Self::retry_metadata_contention(|| fs.fs.commit_inode_metadata(inode_num, size, mtime))?;
 
         let mut guard = self.0.lock();
         if size_dirty && guard.cached_file_size == cached_size {

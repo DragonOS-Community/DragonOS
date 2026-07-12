@@ -6,14 +6,14 @@ use super::pci_irq::{IrqType, PciIrqError};
 use super::raw_device::PciGeneralDevice;
 use super::root::{pci_root_0, PciRoot};
 
-use crate::arch::{PciArch, TraitPciArch};
+use crate::arch::{MMArch, PciArch, TraitPciArch};
 use crate::driver::pci::subsys::pci_bus_subsys_init;
 use crate::exception::IrqNumber;
 use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::mm::mmio_buddy::{mmio_pool, MMIOSpaceGuard};
 
-use crate::mm::VirtAddr;
+use crate::mm::{MemoryManagementArch, PhysAddr, VirtAddr};
 
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -282,6 +282,7 @@ impl From<u8> for HeaderType {
 pub enum PciError {
     /// The device reported an invalid BAR type.
     InvalidBarType,
+    InvalidBarRange,
     CreateMmioError,
     InvalidBusDeviceFunction,
     SegmentNotFound,
@@ -296,6 +297,7 @@ impl Display for PciError {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
             Self::InvalidBarType => write!(f, "Invalid PCI BAR type."),
+            Self::InvalidBarRange => write!(f, "Invalid PCI BAR range."),
             Self::CreateMmioError => write!(f, "Error occurred while creating mmio."),
             Self::InvalidBusDeviceFunction => write!(f, "Found invalid BusDeviceFunction."),
             Self::SegmentNotFound => write!(f, "Target segment not found"),
@@ -375,6 +377,16 @@ pub trait PciDeviceStructure: Send + Sync {
     fn bar_ioremap(&self) -> Option<Result<u8, PciError>> {
         None
     }
+    fn bar_ioremap_excluding(&self, _metadata_only_bars: &[u8]) -> Option<Result<u8, PciError>> {
+        self.bar_ioremap_with_mappings(_metadata_only_bars, &[])
+    }
+    fn bar_ioremap_with_mappings(
+        &self,
+        _metadata_only_bars: &[u8],
+        _required_mappings: &[PciBarMappingRequest],
+    ) -> Option<Result<u8, PciError>> {
+        self.bar_ioremap()
+    }
     /// @brief 获取PCI设备的bar寄存器的引用
     /// @return
     #[inline(always)]
@@ -393,6 +405,50 @@ pub trait PciDeviceStructure: Send + Sync {
             }
         }
         None
+    }
+    /// Return the BAR subranges required by the MSI-X table and pending-bit array.
+    fn msix_mapping_requests(&self) -> Result<Vec<PciBarMappingRequest>, PciError> {
+        let Some(capability) = self
+            .capabilities()
+            .and_then(|mut caps| caps.find(|cap| cap.id == PCI_CAP_ID_MSIX))
+        else {
+            return Ok(Vec::new());
+        };
+        let table_offset = capability
+            .offset
+            .checked_add(4)
+            .ok_or(PciError::InvalidBarRange)?;
+        let pba_offset = capability
+            .offset
+            .checked_add(8)
+            .ok_or(PciError::InvalidBarRange)?;
+        let bus_device_function = self.common_header().bus_device_function;
+        let table = pci_root_0().read_config(bus_device_function, table_offset.into());
+        let pba = pci_root_0().read_config(bus_device_function, pba_offset.into());
+        let table_bar = (table & 0x7) as u8;
+        let pba_bar = (pba & 0x7) as u8;
+        if table_bar >= 6 || pba_bar >= 6 {
+            return Err(PciError::InvalidBarType);
+        }
+        let vectors = u64::from(capability.private_header & 0x7ff) + 1;
+        let table_length = vectors.checked_mul(16).ok_or(PciError::InvalidBarRange)?;
+        let pba_length = vectors
+            .checked_add(63)
+            .and_then(|count| count.checked_div(64))
+            .and_then(|entries| entries.checked_mul(8))
+            .ok_or(PciError::InvalidBarRange)?;
+        Ok(vec![
+            PciBarMappingRequest {
+                bar: table_bar,
+                offset: u64::from(table & !0x7),
+                length: table_length,
+            },
+            PciBarMappingRequest {
+                bar: pba_bar,
+                offset: u64::from(pba & !0x7),
+                length: pba_length,
+            },
+        ])
     }
     /// @brief 寻找设备的msi空间的offset
     fn msi_capability_offset(&self) -> Option<u8> {
@@ -479,8 +535,22 @@ impl PciDeviceStructure for PciDeviceStructureGeneralDevice {
         })
     }
     fn bar_ioremap(&self) -> Option<Result<u8, PciError>> {
+        self.bar_ioremap_excluding(&[])
+    }
+    fn bar_ioremap_excluding(&self, metadata_only_bars: &[u8]) -> Option<Result<u8, PciError>> {
+        self.bar_ioremap_with_mappings(metadata_only_bars, &[])
+    }
+    fn bar_ioremap_with_mappings(
+        &self,
+        metadata_only_bars: &[u8],
+        required_mappings: &[PciBarMappingRequest],
+    ) -> Option<Result<u8, PciError>> {
         let common_header = &self.common_header;
-        match pci_bar_init(common_header.bus_device_function) {
+        match pci_bar_init(
+            common_header.bus_device_function,
+            metadata_only_bars,
+            required_mappings,
+        ) {
             Ok(bar) => {
                 *self.standard_device_bar.write() = bar;
                 Some(Ok(0))
@@ -1199,9 +1269,11 @@ pub enum BarInfo {
         /// The memory address, always 16-byte aligned.
         address: u64,
         /// The size of the BAR in bytes.
-        size: u32,
+        size: u64,
         /// The virtaddress for a memory bar(mapped).
-        mmio_guard: Arc<MMIOSpaceGuard>,
+        mmio_guard: Option<Arc<MMIOSpaceGuard>>,
+        /// Individually mapped subranges for metadata-only BARs.
+        mapped_ranges: Vec<PciBarMappedRange>,
     },
     /// The BAR is for an I/O region.
     IO {
@@ -1218,8 +1290,8 @@ impl BarInfo {
     /// BAR.
     ///@brief 得到某个bar的memory_address与size(前提是他的类型为Memory Bar)
     ///@param self
-    ///@return Option<(u64, u32) 是Memory Bar返回内存地址与大小，不是则返回None
-    pub fn memory_address_size(&self) -> Option<(u64, u32)> {
+    ///@return Option<(u64, u64) 是Memory Bar返回内存地址与大小，不是则返回None
+    pub fn memory_address_size(&self) -> Option<(u64, u64)> {
         if let Self::Memory { address, size, .. } = self {
             Some((*address, *size))
         } else {
@@ -1231,11 +1303,61 @@ impl BarInfo {
     ///@return Option<(u64) 是Memory Bar返回映射的虚拟地址，不是则返回None
     pub fn virtual_address(&self) -> Option<VirtAddr> {
         if let Self::Memory { mmio_guard, .. } = self {
-            Some(mmio_guard.vaddr())
+            mmio_guard.as_ref().map(|guard| guard.vaddr())
         } else {
             None
         }
     }
+
+    pub fn virtual_address_at(&self, offset: u64, length: usize) -> Option<VirtAddr> {
+        let Self::Memory {
+            size,
+            mmio_guard,
+            mapped_ranges,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let length = u64::try_from(length).ok()?;
+        let end = offset.checked_add(length)?;
+        if end > *size {
+            return None;
+        }
+        if let Some(guard) = mmio_guard {
+            return Some(guard.vaddr() + usize::try_from(offset).ok()?);
+        }
+        mapped_ranges.iter().find_map(|range| {
+            let range_end = range.offset.checked_add(range.length)?;
+            if offset < range.offset || end > range_end {
+                return None;
+            }
+            Some(range.vaddr + usize::try_from(offset - range.offset).ok()?)
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PciBarMappingRequest {
+    pub bar: u8,
+    pub offset: u64,
+    pub length: u64,
+}
+
+fn unallocated_bar_has_required_mapping(
+    address: u64,
+    bar: u8,
+    required_mappings: &[PciBarMappingRequest],
+) -> bool {
+    address == 0 && required_mappings.iter().any(|request| request.bar == bar)
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PciBarMappedRange {
+    offset: u64,
+    length: u64,
+    vaddr: VirtAddr,
+    _guard: Arc<MMIOSpaceGuard>,
 }
 ///实现BarInfo的Display trait，自定义输出
 impl Display for BarInfo {
@@ -1247,6 +1369,7 @@ impl Display for BarInfo {
                 address,
                 size,
                 mmio_guard,
+                ..
             } => write!(
                 f,
                 "Memory space at {:#010x}, size {}, type {:?}, prefetchable {}, mmio_guard: {:?}",
@@ -1320,38 +1443,55 @@ impl Default for PciStandardDeviceBar {
 ///@return Result<PciStandardDeviceBar, PciError> 成功则返回对应的PciStandardDeviceBar结构体，失败则返回错误类型
 pub fn pci_bar_init(
     bus_device_function: BusDeviceFunction,
+    metadata_only_bars: &[u8],
+    required_mappings: &[PciBarMappingRequest],
 ) -> Result<PciStandardDeviceBar, PciError> {
+    struct DecodeGuard {
+        bus_device_function: BusDeviceFunction,
+        command: u16,
+    }
+
+    impl Drop for DecodeGuard {
+        fn drop(&mut self) {
+            pci_root_0().write_config(
+                self.bus_device_function,
+                STATUS_COMMAND_OFFSET.into(),
+                u32::from(self.command),
+            );
+        }
+    }
+
+    let command_status =
+        pci_root_0().read_config(bus_device_function, STATUS_COMMAND_OFFSET.into());
+    let command = command_status as u16;
+    pci_root_0().write_config(
+        bus_device_function,
+        STATUS_COMMAND_OFFSET.into(),
+        u32::from(command & !(Command::IO_SPACE | Command::MEMORY_SPACE).bits()),
+    );
+    let _decode_guard = DecodeGuard {
+        bus_device_function,
+        command,
+    };
     let mut device_bar: PciStandardDeviceBar = PciStandardDeviceBar::default();
+    let mut consumed_mappings = vec![false; required_mappings.len()];
     let mut bar_index_ignore: u8 = 255;
     for bar_index in 0..6 {
         if bar_index == bar_index_ignore {
             continue;
         }
         let bar_info;
-        let bar_orig =
-            pci_root_0().read_config(bus_device_function, (BAR0_OFFSET + 4 * bar_index).into());
-        pci_root_0().write_config(
-            bus_device_function,
-            (BAR0_OFFSET + 4 * bar_index).into(),
-            0xffffffff,
-        );
-        let size_mask =
-            pci_root_0().read_config(bus_device_function, (BAR0_OFFSET + 4 * bar_index).into());
-        // A wrapping add is necessary to correctly handle the case of unused BARs, which read back
-        // as 0, and should be treated as size 0.
-        let size = (!(size_mask & 0xfffffff0)).wrapping_add(1);
-        //debug!("bar_orig:{:#x},size: {:#x}", bar_orig,size);
-        // Restore the original value.
-        pci_root_0().write_config(
-            bus_device_function,
-            (BAR0_OFFSET + 4 * bar_index).into(),
-            bar_orig,
-        );
-        if size == 0 {
-            continue;
-        }
+        let bar_offset = BAR0_OFFSET + 4 * bar_index;
+        let bar_orig = pci_root_0().read_config(bus_device_function, bar_offset.into());
         if bar_orig & 0x00000001 == 0x00000001 {
             // I/O space
+            pci_root_0().write_config(bus_device_function, bar_offset.into(), 0xffffffff);
+            let size_mask = pci_root_0().read_config(bus_device_function, bar_offset.into());
+            pci_root_0().write_config(bus_device_function, bar_offset.into(), bar_orig);
+            let size = (!(size_mask & 0xfffffffc)).wrapping_add(1);
+            if size == 0 {
+                continue;
+            }
             let address = bar_orig & 0xfffffffc;
             bar_info = BarInfo::IO { address, size };
         } else {
@@ -1359,39 +1499,146 @@ pub fn pci_bar_init(
             let mut address = u64::from(bar_orig & 0xfffffff0);
             let prefetchable = bar_orig & 0x00000008 != 0;
             let address_type = MemoryBarType::try_from(((bar_orig & 0x00000006) >> 1) as u8)?;
-            if address_type == MemoryBarType::Width64 {
+            let size = if address_type == MemoryBarType::Width64 {
                 if bar_index >= 5 {
                     return Err(PciError::InvalidBarType);
                 }
-                let address_top = pci_root_0().read_config(
-                    bus_device_function,
-                    (BAR0_OFFSET + 4 * (bar_index + 1)).into(),
-                );
+                let high_offset = BAR0_OFFSET + 4 * (bar_index + 1);
+                let address_top = pci_root_0().read_config(bus_device_function, high_offset.into());
                 address |= u64::from(address_top) << 32;
                 bar_index_ignore = bar_index + 1; //下个bar跳过，因为64位的memory bar覆盖了两个bar
+
+                pci_root_0().write_config(bus_device_function, bar_offset.into(), 0xffffffff);
+                pci_root_0().write_config(bus_device_function, high_offset.into(), 0xffffffff);
+                let size_mask_low =
+                    pci_root_0().read_config(bus_device_function, bar_offset.into());
+                let size_mask_high =
+                    pci_root_0().read_config(bus_device_function, high_offset.into());
+                pci_root_0().write_config(bus_device_function, bar_offset.into(), bar_orig);
+                pci_root_0().write_config(bus_device_function, high_offset.into(), address_top);
+                let size_mask =
+                    (u64::from(size_mask_high) << 32) | u64::from(size_mask_low & 0xfffffff0);
+                (!size_mask).wrapping_add(1)
+            } else {
+                pci_root_0().write_config(bus_device_function, bar_offset.into(), 0xffffffff);
+                let size_mask = pci_root_0().read_config(bus_device_function, bar_offset.into());
+                pci_root_0().write_config(bus_device_function, bar_offset.into(), bar_orig);
+                u64::from((!(size_mask & 0xfffffff0)).wrapping_add(1))
+            };
+            if size == 0 {
+                continue;
             }
+            if unallocated_bar_has_required_mapping(address, bar_index, required_mappings) {
+                return Err(PciError::InvalidBarRange);
+            }
+
             let pci_address = PciAddr::new(address as usize);
             let paddr = PciArch::address_pci_to_physical(pci_address); //PCI总线域物理地址转换为存储器域物理地址
 
-            let space_guard: Arc<MMIOSpaceGuard>;
-            unsafe {
-                let size_want = size as usize;
-                let tmp = mmio_pool()
+            // Keep resource discovery independent from virtual mapping. Very large 64-bit BARs,
+            // such as a virtiofs DAX window, must not consume an equally large MMIO VA range.
+            let (space_guard, mapped_ranges) = if address == 0 {
+                // Preserve the BAR metadata for resource discovery, but never map an
+                // unallocated BAR at physical address zero.
+                (None, Vec::new())
+            } else if metadata_only_bars.contains(&bar_index) {
+                let mut intervals = Vec::new();
+                for (index, request) in required_mappings.iter().enumerate() {
+                    if request.bar != bar_index {
+                        continue;
+                    }
+                    let end = request
+                        .offset
+                        .checked_add(request.length)
+                        .ok_or(PciError::InvalidBarRange)?;
+                    if request.length == 0 || end > size {
+                        return Err(PciError::InvalidBarRange);
+                    }
+                    consumed_mappings[index] = true;
+                    let start =
+                        usize::try_from(request.offset).map_err(|_| PciError::InvalidBarRange)?;
+                    let end = usize::try_from(end).map_err(|_| PciError::InvalidBarRange)?;
+                    let aligned_start = crate::libs::align::page_align_down(start);
+                    let aligned_end = end
+                        .checked_add(MMArch::PAGE_SIZE - 1)
+                        .map(crate::libs::align::page_align_down)
+                        .ok_or(PciError::InvalidBarRange)?;
+                    intervals.push((aligned_start, aligned_end));
+                }
+                intervals.sort_unstable_by_key(|interval| interval.0);
+                let mut merged: Vec<(usize, usize)> = Vec::new();
+                for (start, end) in intervals {
+                    if let Some(last) = merged.last_mut() {
+                        if start <= last.1 {
+                            last.1 = last.1.max(end);
+                            continue;
+                        }
+                    }
+                    merged.push((start, end));
+                }
+
+                let mut mapped_ranges = Vec::new();
+                for (start, end) in merged {
+                    let length = end.checked_sub(start).ok_or(PciError::InvalidBarRange)?;
+                    let request_paddr = paddr
+                        .data()
+                        .checked_add(start)
+                        .map(PhysAddr::new)
+                        .ok_or(PciError::InvalidBarRange)?;
+                    let page_offset = request_paddr.data() & (MMArch::PAGE_SIZE - 1);
+                    let mapped_length = crate::libs::align::page_align_up(
+                        length
+                            .checked_add(page_offset)
+                            .ok_or(PciError::InvalidBarRange)?,
+                    );
+                    let guard = mmio_pool()
+                        .create_mmio(mapped_length)
+                        .map_err(|_| PciError::CreateMmioError)?;
+                    let vaddr = unsafe {
+                        guard
+                            .map_any_phys(request_paddr, length)
+                            .map_err(|_| PciError::CreateMmioError)?
+                    };
+                    mapped_ranges.push(PciBarMappedRange {
+                        offset: start as u64,
+                        length: length as u64,
+                        vaddr,
+                        _guard: Arc::new(guard),
+                    });
+                }
+                (None, mapped_ranges)
+            } else {
+                for (index, request) in required_mappings.iter().enumerate() {
+                    if request.bar != bar_index {
+                        continue;
+                    }
+                    let end = request
+                        .offset
+                        .checked_add(request.length)
+                        .ok_or(PciError::InvalidBarRange)?;
+                    if request.length == 0 || end > size {
+                        return Err(PciError::InvalidBarRange);
+                    }
+                    consumed_mappings[index] = true;
+                }
+                let size_want = usize::try_from(size).map_err(|_| PciError::CreateMmioError)?;
+                let guard = mmio_pool()
                     .create_mmio(size_want)
                     .map_err(|_| PciError::CreateMmioError)?;
-                space_guard = Arc::new(tmp);
-                //debug!("Pci bar init: mmio space: {space_guard:?}, paddr={paddr:?}, size_want={size_want}");
-                assert!(
-                    space_guard.map_phys(paddr, size_want).is_ok(),
-                    "pci_bar_init: map_phys failed"
-                );
-            }
+                unsafe {
+                    guard
+                        .map_phys(paddr, size_want)
+                        .map_err(|_| PciError::CreateMmioError)?;
+                }
+                (Some(Arc::new(guard)), Vec::new())
+            };
             bar_info = BarInfo::Memory {
                 address_type,
                 prefetchable,
                 address,
                 size,
                 mmio_guard: space_guard,
+                mapped_ranges,
             };
         }
         match bar_index {
@@ -1416,8 +1663,29 @@ pub fn pci_bar_init(
             _ => {}
         }
     }
+    if consumed_mappings.iter().any(|consumed| !consumed) {
+        return Err(PciError::InvalidBarRange);
+    }
     //debug!("pci_device_bar:{}", device_bar);
     return Ok(device_bar);
+}
+
+#[cfg(test)]
+mod bar_mapping_tests {
+    use super::{unallocated_bar_has_required_mapping, PciBarMappingRequest};
+
+    #[test]
+    fn rejects_required_mapping_for_unallocated_bar() {
+        let mappings = [PciBarMappingRequest {
+            bar: 2,
+            offset: 0x1000,
+            length: 0x1000,
+        }];
+
+        assert!(unallocated_bar_has_required_mapping(0, 2, &mappings));
+        assert!(!unallocated_bar_has_required_mapping(0, 1, &mappings));
+        assert!(!unallocated_bar_has_required_mapping(0x1000, 2, &mappings));
+    }
 }
 
 /// Information about a PCI device capability.

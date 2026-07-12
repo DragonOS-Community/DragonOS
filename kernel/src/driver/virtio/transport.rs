@@ -12,11 +12,40 @@ use crate::{
         },
     },
     exception::IrqNumber,
+    mm::PhysAddr,
 };
 
 use super::{
     irq::DefaultVirtioIrqHandler, transport_mmio::VirtIOMmioTransport, transport_pci::PciTransport,
 };
+
+/// A validated VirtIO shared-memory region descriptor.
+///
+/// This is address metadata only. It does not grant access to the region or describe a safe
+/// cache policy for normal memory accesses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VirtioSharedMemoryRegion {
+    physical_address: PhysAddr,
+    length: u64,
+}
+
+impl VirtioSharedMemoryRegion {
+    pub(crate) fn new(physical_address: PhysAddr, length: u64) -> Self {
+        Self {
+            physical_address,
+            length,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn physical_address(&self) -> PhysAddr {
+        self.physical_address
+    }
+
+    pub fn length(&self) -> u64 {
+        self.length
+    }
+}
 
 pub enum VirtIOTransport {
     Pci(PciTransport),
@@ -40,6 +69,13 @@ impl VirtIOTransport {
                 )
             }
             VirtIOTransport::Mmio(_) => false,
+        }
+    }
+
+    pub fn shared_memory_region(&self, id: u8) -> Option<VirtioSharedMemoryRegion> {
+        match self {
+            VirtIOTransport::Pci(transport) => transport.shared_memory_region(id),
+            VirtIOTransport::Mmio(_) => None,
         }
     }
 

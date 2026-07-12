@@ -205,7 +205,7 @@ impl E1000EDevice {
         if address == 0 {
             return Err(E1000EPciError::BarNotAllocated);
         }
-        if size != E1000E_BAR_REG_SIZE {
+        if size != u64::from(E1000E_BAR_REG_SIZE) {
             return Err(E1000EPciError::UnexpectedBarSize);
         }
         let vaddress = bar0

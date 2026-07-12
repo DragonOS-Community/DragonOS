@@ -2,6 +2,7 @@ use crate::constants::*;
 use crate::ext4_defs::*;
 use crate::prelude::*;
 use crate::return_error;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 mod alloc;
 mod dir;
@@ -12,7 +13,9 @@ mod journal_recovery;
 mod journal_transaction;
 mod link;
 mod low_level;
+mod orphan;
 mod rw;
+mod xattr_reclaim;
 
 pub use low_level::SetAttr;
 
@@ -65,6 +68,8 @@ pub struct Ext4 {
     /// Cached block group descriptors. Loaded at mount time.
     /// Index is block group id.
     cached_block_groups: Vec<spin::Mutex<BlockGroupDesc>>,
+    /// Sorted, merged half-open ranges occupied by primary ext4 metadata.
+    system_metadata_ranges: Vec<(PBlockId, PBlockId)>,
     /// LRU-ish inode cache. Avoids repeated disk reads for frequently accessed inodes.
     inode_cache: spin::Mutex<InodeCache>,
     /// Global allocation lock. Protects block/inode bitmap operations from
@@ -75,6 +80,14 @@ pub struct Ext4 {
     /// writeback remain sharded; namespace operations are comparatively cold
     /// and need a single ordering domain until journal transactions exist.
     namespace_lock: spin::Mutex<()>,
+    /// Separates legacy direct metadata writers from journal transactions.
+    ///
+    /// Direct writers hold a shared guard for their complete top-level
+    /// operation. A journal transaction holds the exclusive guard from its
+    /// first home-block snapshot until commit/cache publication. Taking this
+    /// lock only at `write_block` would be too late: a transaction could have
+    /// already captured an image which a direct writer subsequently changes.
+    metadata_mutation_barrier: MetadataMutationGate,
     /// First unrecoverable metadata error.  Once set, mutation must fail-stop.
     poisoned: spin::Mutex<Option<ErrCode>>,
     /// Validated synchronous JBD2 engine. It is initialized only by
@@ -90,11 +103,268 @@ pub struct Ext4 {
     inode_mutation_locks: Vec<spin::Mutex<()>>,
 }
 
+/// Non-blocking gate separating legacy direct writers from journal snapshots.
+///
+/// The top bit denotes an exclusive transactional owner; the remaining bits
+/// count direct writers.  Acquisition never waits for an existing owner, which
+/// is essential because guards intentionally span block-device I/O.
+#[derive(Debug)]
+struct MetadataMutationGate {
+    state: AtomicUsize,
+}
+
+const METADATA_GATE_EXCLUSIVE: usize = 1usize << (usize::BITS - 1);
+const METADATA_GATE_DIRECT_MAX: usize = METADATA_GATE_EXCLUSIVE - 1;
+
+impl MetadataMutationGate {
+    const fn new() -> Self {
+        Self {
+            state: AtomicUsize::new(0),
+        }
+    }
+
+    fn try_direct(&self) -> Result<MetadataMutationGuard<'_>> {
+        const COMPATIBLE_CAS_RETRIES: usize = 64;
+        let mut state = self.state.load(Ordering::Relaxed);
+        for _ in 0..COMPATIBLE_CAS_RETRIES {
+            if state & METADATA_GATE_EXCLUSIVE != 0 || state == METADATA_GATE_DIRECT_MAX {
+                return Err(Ext4Error::new(ErrCode::EAGAIN));
+            }
+            match self.state.compare_exchange_weak(
+                state,
+                state + 1,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Ok(MetadataMutationGuard {
+                        gate: self,
+                        exclusive: false,
+                    });
+                }
+                // Retry only a compatible direct-count collision. Observing an
+                // exclusive owner is rejected at the top of the next iteration;
+                // no acquisition waits for an I/O-spanning owner to depart.
+                Err(observed) => state = observed,
+            }
+        }
+        Err(Ext4Error::new(ErrCode::EAGAIN))
+    }
+
+    fn try_transactional(&self) -> Result<MetadataMutationGuard<'_>> {
+        self.state
+            .compare_exchange(
+                0,
+                METADATA_GATE_EXCLUSIVE,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .map_err(|_| Ext4Error::new(ErrCode::EAGAIN))?;
+        Ok(MetadataMutationGuard {
+            gate: self,
+            exclusive: true,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct MetadataMutationGuard<'a> {
+    gate: &'a MetadataMutationGate,
+    exclusive: bool,
+}
+
+impl Drop for MetadataMutationGuard<'_> {
+    fn drop(&mut self) {
+        if self.exclusive {
+            debug_assert_eq!(
+                self.gate.state.load(Ordering::Relaxed),
+                METADATA_GATE_EXCLUSIVE
+            );
+            self.gate.state.store(0, Ordering::Release);
+        } else {
+            let previous = self.gate.state.fetch_sub(1, Ordering::Release);
+            debug_assert!(previous > 0 && previous < METADATA_GATE_EXCLUSIVE);
+        }
+    }
+}
+
 /// Maximum number of inodes to cache in memory.
 const INODE_CACHE_SIZE: usize = 512;
 pub(super) const INODE_MUTATION_LOCK_SHARDS: usize = 64;
 
 impl Ext4 {
+    fn merge_metadata_ranges(mut ranges: Vec<(PBlockId, PBlockId)>) -> Vec<(PBlockId, PBlockId)> {
+        ranges.sort_unstable();
+        let mut merged: Vec<(PBlockId, PBlockId)> = Vec::new();
+        for (start, end) in ranges {
+            if let Some(last) = merged.last_mut() {
+                if start <= last.1 {
+                    last.1 = core::cmp::max(last.1, end);
+                    continue;
+                }
+            }
+            merged.push((start, end));
+        }
+        merged
+    }
+
+    fn build_system_metadata_ranges(
+        sb: &SuperBlock,
+        groups: &[spin::Mutex<BlockGroupDesc>],
+    ) -> Result<Vec<(PBlockId, PBlockId)>> {
+        let desc_per_block = BLOCK_SIZE as u64 / sb.desc_size() as u64;
+        let gdt_end = 1u64
+            .checked_add((sb.block_group_count() as u64).div_ceil(desc_per_block))
+            .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+        let inode_table_blocks = (sb.inodes_per_group() as u64)
+            .checked_mul(sb.inode_size() as u64)
+            .and_then(|bytes| bytes.checked_add(BLOCK_SIZE as u64 - 1))
+            .map(|bytes| bytes / BLOCK_SIZE as u64)
+            .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+        let mut ranges = Vec::new();
+        ranges
+            .try_reserve_exact(2usize.saturating_add(groups.len().saturating_mul(3)))
+            .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+        ranges.extend_from_slice(&[(0, 1), (1, gdt_end)]);
+        for group in groups {
+            let desc = *group.lock();
+            for start in [desc.block_bitmap_block(), desc.inode_bitmap_block()] {
+                ranges.push((
+                    start,
+                    start
+                        .checked_add(1)
+                        .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?,
+                ));
+            }
+            let table = desc.inode_table_first_block();
+            ranges.push((
+                table,
+                table
+                    .checked_add(inode_table_blocks)
+                    .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?,
+            ));
+        }
+        Ok(Self::merge_metadata_ranges(ranges))
+    }
+
+    fn validate_super_block(sb: &SuperBlock) -> Result<()> {
+        const SUPPORTED_INCOMPAT: u32 = 0x0002 | 0x0004 | 0x0040 | 0x0080 | 0x0200;
+        const SUPPORTED_RO_COMPAT: u32 =
+            0x0001 | 0x0002 | 0x0004 | 0x0008 | 0x0020 | 0x0040 | 0x0400;
+
+        let metadata_csum =
+            sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_METADATA_CSUM);
+        let blocks = sb.block_count();
+        let blocks_per_group = sb.blocks_per_group() as u64;
+        let inodes_per_group = sb.inodes_per_group() as u64;
+        if !sb.check_magic()
+            || (metadata_csum && (!sb.has_supported_checksum_type() || !sb.verify_checksum()))
+            || sb.block_size() != BLOCK_SIZE as u64
+            || sb.first_data_block() != 0
+            || sb.inode_size() != SB_GOOD_INODE_SIZE
+            || sb.desc_size() != SB_GOOD_DESC_SIZE
+            || sb.incompatible_features() & !SUPPORTED_INCOMPAT != 0
+            || sb.read_only_compatible_features() & !SUPPORTED_RO_COMPAT != 0
+            || blocks_per_group == 0
+            || inodes_per_group == 0
+            || sb.clusters_per_group() == 0
+            || sb.clusters_per_group() as usize > BLOCK_SIZE * 8
+            || sb.inodes_per_group() as usize > BLOCK_SIZE * 8
+            || sb.clusters_per_group() != sb.blocks_per_group()
+            || blocks <= sb.first_data_block() as u64
+            || sb.inode_count() == 0
+            || sb.first_inode() > sb.inode_count()
+            || sb.free_blocks_count() > blocks
+            || sb.free_inodes_count() > sb.inode_count()
+            || sb.reserved_blocks_count() > blocks
+        {
+            return_error!(
+                ErrCode::EIO,
+                "Invalid ext4 superblock geometry, feature set, or checksum"
+            );
+        }
+
+        let groups = (blocks - sb.first_data_block() as u64).div_ceil(blocks_per_group);
+        let inode_capacity = groups
+            .checked_mul(inodes_per_group)
+            .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+        let prior_capacity = groups
+            .saturating_sub(1)
+            .checked_mul(inodes_per_group)
+            .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+        if groups == 0
+            || groups > u32::MAX as u64
+            || sb.inode_count() as u64 > inode_capacity
+            || sb.inode_count() as u64 <= prior_capacity
+        {
+            return_error!(ErrCode::EIO, "Invalid ext4 group-count or inode geometry");
+        }
+        Ok(())
+    }
+
+    fn read_validated_block_groups(
+        device: &dyn BlockDevice,
+        sb: &SuperBlock,
+    ) -> Result<Vec<spin::Mutex<BlockGroupDesc>>> {
+        Self::validate_super_block(sb)?;
+        let bg_count = sb.block_group_count();
+        let desc_per_block = BLOCK_SIZE as u32 / sb.desc_size() as u32;
+        let metadata_csum =
+            sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_METADATA_CSUM);
+        let inode_table_blocks = (sb.inodes_per_group() as u64)
+            .checked_mul(sb.inode_size() as u64)
+            .and_then(|bytes| bytes.checked_add(BLOCK_SIZE as u64 - 1))
+            .map(|bytes| bytes / BLOCK_SIZE as u64)
+            .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+        let mut groups = Vec::new();
+        groups
+            .try_reserve_exact(bg_count as usize)
+            .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+        for bgid in 0..bg_count {
+            let block_id = sb
+                .first_data_block()
+                .checked_add(bgid / desc_per_block)
+                .and_then(|id| id.checked_add(1))
+                .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+            if block_id as u64 >= sb.block_count() {
+                return Err(Ext4Error::new(ErrCode::EIO));
+            }
+            let offset = (bgid % desc_per_block) * sb.desc_size() as u32;
+            let block = device.read_block(block_id as PBlockId)?;
+            let desc = block.read_offset_as::<BlockGroupDesc>(offset as usize);
+            Self::validate_block_group(sb, bgid, &desc, metadata_csum, inode_table_blocks)?;
+            groups.push(spin::Mutex::new(desc));
+        }
+        Ok(groups)
+    }
+
+    fn validate_block_group(
+        sb: &SuperBlock,
+        bgid: BlockGroupId,
+        desc: &BlockGroupDesc,
+        metadata_csum: bool,
+        inode_table_blocks: u64,
+    ) -> Result<()> {
+        let group = BlockGroupRef::new(bgid, *desc);
+        let block_bitmap = desc.block_bitmap_block();
+        let inode_bitmap = desc.inode_bitmap_block();
+        let inode_table = desc.inode_table_first_block();
+        if (metadata_csum && !group.verify_checksum(&sb.uuid()))
+            || block_bitmap == 0
+            || block_bitmap >= sb.block_count()
+            || inode_bitmap == 0
+            || inode_bitmap >= sb.block_count()
+            || inode_table == 0
+            || inode_table >= sb.block_count()
+            || inode_table
+                .checked_add(inode_table_blocks)
+                .is_none_or(|end| end > sb.block_count())
+        {
+            return_error!(ErrCode::EIO, "Invalid ext4 block-group descriptor");
+        }
+        Ok(())
+    }
+
     /// Opens and loads an Ext4 from the `block_device`.
     pub fn load(block_device: Arc<dyn BlockDevice>) -> Result<Self> {
         // Load the superblock
@@ -102,34 +372,8 @@ impl Ext4 {
         let block = block_device.read_block(0)?;
         let sb = block.read_offset_as::<SuperBlock>(BASE_OFFSET);
         log::debug!("Load Ext4 Superblock: {:?}", sb);
-        // Check magic number
-        if !sb.check_magic() {
-            return_error!(ErrCode::EINVAL, "Invalid magic number");
-        }
-        // Check inode size
-        if sb.inode_size() != SB_GOOD_INODE_SIZE {
-            return_error!(ErrCode::EINVAL, "Invalid inode size {}", sb.inode_size());
-        }
-        // Check block group desc size
-        if sb.desc_size() != SB_GOOD_DESC_SIZE {
-            return_error!(
-                ErrCode::EINVAL,
-                "Invalid block group desc size {}",
-                sb.desc_size()
-            );
-        }
-
-        // Load all block group descriptors into cache
-        let bg_count = sb.block_group_count();
-        let desc_per_block = BLOCK_SIZE as u32 / sb.desc_size() as u32;
-        let mut cached_block_groups = Vec::with_capacity(bg_count as usize);
-        for bgid in 0..bg_count {
-            let block_id = sb.first_data_block() + bgid / desc_per_block + 1;
-            let offset = (bgid % desc_per_block) * sb.desc_size() as u32;
-            let bg_block = block_device.read_block(block_id as PBlockId)?;
-            let desc = bg_block.read_offset_as::<BlockGroupDesc>(offset as usize);
-            cached_block_groups.push(spin::Mutex::new(desc));
-        }
+        let cached_block_groups = Self::read_validated_block_groups(block_device.as_ref(), &sb)?;
+        let system_metadata_ranges = Self::build_system_metadata_ranges(&sb, &cached_block_groups)?;
 
         // Create Ext4 instance
         let mut inode_mutation_locks = Vec::with_capacity(INODE_MUTATION_LOCK_SHARDS);
@@ -140,9 +384,11 @@ impl Ext4 {
             block_device,
             cached_super_block: spin::Mutex::new(sb),
             cached_block_groups,
+            system_metadata_ranges,
             inode_cache: spin::Mutex::new(InodeCache::new(INODE_CACHE_SIZE)),
             alloc_lock: spin::Mutex::new(()),
             namespace_lock: spin::Mutex::new(()),
+            metadata_mutation_barrier: MetadataMutationGate::new(),
             poisoned: spin::Mutex::new(None),
             journal: None,
             inode_mutation_locks,
@@ -179,6 +425,43 @@ impl Ext4 {
         Ok(())
     }
 
+    fn ranges_overlap(
+        start: PBlockId,
+        end: PBlockId,
+        reserved_start: PBlockId,
+        reserved_end: PBlockId,
+    ) -> bool {
+        start < reserved_end && reserved_start < end
+    }
+
+    /// Validate that a physical range is ordinary file-owned storage rather
+    /// than ext4 system metadata or the internal journal. All ranges are
+    /// half-open and every end is checked before comparison.
+    pub(super) fn validate_data_blocks(&self, start: PBlockId, count: u64) -> Result<()> {
+        let sb = self.read_super_block_cached();
+        let end = start
+            .checked_add(count)
+            .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+        if count == 0 || start < sb.first_data_block() as u64 || end > sb.block_count() {
+            return_error!(ErrCode::EIO, "Invalid data block range {}..{}", start, end);
+        }
+
+        let candidate = self
+            .system_metadata_ranges
+            .partition_point(|(_, reserved_end)| *reserved_end <= start);
+        if self.system_metadata_ranges.get(candidate).is_some_and(
+            |(reserved_start, reserved_end)| {
+                Self::ranges_overlap(start, end, *reserved_start, *reserved_end)
+            },
+        ) {
+            return_error!(ErrCode::EIO, "Data range overlaps ext4 system metadata");
+        }
+        if self.journal_owns_block_range(start, end) {
+            return_error!(ErrCode::EIO, "Data range overlaps the internal journal");
+        }
+        Ok(())
+    }
+
     pub(super) fn poison(&self, code: ErrCode) {
         let mut poisoned = self.poisoned.lock();
         if poisoned.is_none() {
@@ -207,5 +490,118 @@ impl Ext4 {
             .into_iter()
             .map(|index| self.inode_mutation_locks[index].lock())
             .collect()
+    }
+
+    /// Enter a complete legacy/direct metadata mutation operation.
+    #[inline]
+    pub(super) fn lock_direct_metadata_mutation(&self) -> Result<MetadataMutationGuard<'_>> {
+        self.metadata_mutation_barrier.try_direct()
+    }
+
+    /// Enter a complete transaction-private snapshot/commit operation.
+    ///
+    /// Callers must not already hold a direct-mutation guard. Top-level
+    /// operations which can choose a transactional path acquire this guard
+    /// directly; contention is reported as `EAGAIN` rather than waited on.
+    #[inline]
+    pub(super) fn lock_transactional_metadata_mutation(&self) -> Result<MetadataMutationGuard<'_>> {
+        self.metadata_mutation_barrier.try_transactional()
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+
+    struct ValidationDevice {
+        blocks: BTreeMap<PBlockId, Block>,
+    }
+
+    impl BlockDevice for ValidationDevice {
+        fn read_block(&self, block_id: PBlockId) -> Result<Block> {
+            self.blocks
+                .get(&block_id)
+                .cloned()
+                .ok_or_else(|| Ext4Error::new(ErrCode::EIO))
+        }
+
+        fn write_block(&self, _block: &Block) -> Result<()> {
+            Err(Ext4Error::new(ErrCode::EIO))
+        }
+
+        fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn supports_reliable_flush(&self) -> bool {
+            true
+        }
+    }
+
+    fn system_zone_test_fs() -> Ext4 {
+        let mut sb = SuperBlock::validation_fixture();
+        sb.set_checksum();
+        let mut desc = BlockGroupDesc::validation_fixture();
+        let mut group = BlockGroupRef::new(0, desc);
+        group.set_checksum(&sb.uuid());
+        desc = group.desc;
+
+        let mut block0 = Block::new(0, Box::new([0; BLOCK_SIZE]));
+        block0.write_offset_as(BASE_OFFSET, &sb);
+        let mut block1 = Block::new(1, Box::new([0; BLOCK_SIZE]));
+        block1.write_offset_as(0, &desc);
+        let device = ValidationDevice {
+            blocks: BTreeMap::from([(0, block0), (1, block1)]),
+        };
+        Ext4::load(Arc::new(device)).unwrap()
+    }
+
+    #[test]
+    fn replayed_superblock_checksum_damage_is_rejected() {
+        let mut sb = SuperBlock::validation_fixture();
+        assert!(Ext4::validate_super_block(&sb).is_ok());
+        sb.set_free_inodes_count(1);
+        assert!(Ext4::validate_super_block(&sb).is_err());
+    }
+
+    #[test]
+    fn replayed_group_descriptor_damage_and_bad_addresses_are_rejected() {
+        let sb = SuperBlock::validation_fixture();
+        let mut desc = BlockGroupDesc::validation_fixture();
+        let mut group = BlockGroupRef::new(0, desc);
+        group.set_checksum(&sb.uuid());
+        desc = group.desc;
+        assert!(Ext4::validate_block_group(&sb, 0, &desc, true, 16).is_ok());
+
+        desc.set_free_inodes_count(1);
+        assert!(Ext4::validate_block_group(&sb, 0, &desc, true, 16).is_err());
+
+        let mut bad_address = BlockGroupDesc::validation_fixture();
+        let mut bytes = bad_address.to_bytes().to_vec();
+        bytes[0..4].copy_from_slice(&(sb.block_count() as u32).to_le_bytes());
+        bad_address = BlockGroupDesc::from_bytes(&bytes);
+        let mut group = BlockGroupRef::new(0, bad_address);
+        group.set_checksum(&sb.uuid());
+        assert!(Ext4::validate_block_group(&sb, 0, &group.desc, true, 16).is_err());
+    }
+
+    #[test]
+    fn malicious_extent_or_xattr_cannot_claim_system_metadata() {
+        let fs = system_zone_test_fs();
+        assert!(fs.validate_data_blocks(0, 1).is_err());
+        assert!(fs.validate_data_blocks(1, 1).is_err());
+        assert!(fs.validate_data_blocks(2, 1).is_err());
+        assert!(fs.validate_data_blocks(3, 1).is_err());
+        assert!(fs.validate_data_blocks(4, 16).is_err());
+        assert!(fs.validate_data_blocks(20, 1).is_ok());
+    }
+
+    #[test]
+    fn system_metadata_ranges_merge_adjacency_and_preserve_boundaries() {
+        let merged = Ext4::merge_metadata_ranges(vec![(8, 10), (1, 3), (3, 5), (9, 12)]);
+        assert_eq!(merged, vec![(1, 5), (8, 12)]);
+        assert!(!Ext4::ranges_overlap(5, 8, 1, 5));
+        assert!(!Ext4::ranges_overlap(5, 8, 8, 12));
+        assert!(Ext4::ranges_overlap(4, 9, 1, 5));
     }
 }

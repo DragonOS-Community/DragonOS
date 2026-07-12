@@ -225,7 +225,11 @@ impl Extent {
 
     /// Set the number of blocks covered by this extent
     pub fn set_block_count(&mut self, block_count: LBlockId) {
+        let unwritten = self.is_unwritten();
         self.block_count = block_count as u16;
+        if unwritten {
+            self.block_count |= Self::INIT_MAX_LEN;
+        }
     }
 
     /// Check if the extent is unwritten
@@ -456,6 +460,20 @@ impl<'a> ExtentNodeMut<'a> {
         unsafe {
             &mut *((self.header_mut() as *mut ExtentHeader).add(1) as *mut FakeExtent).add(pos)
         }
+    }
+
+    /// Remove the last entry from this node.
+    ///
+    /// Extent nodes are packed arrays.  Decreasing `eh_entries` is sufficient:
+    /// bytes beyond the new entry count are not part of the tree and are
+    /// deliberately left untouched, matching ext4's on-disk convention.
+    pub fn remove_last_entry(&mut self) -> bool {
+        let entries = self.header().entries_count();
+        if entries == 0 {
+            return false;
+        }
+        self.header_mut().set_entries_count(entries - 1);
+        true
     }
 
     /// Initialize the extent node

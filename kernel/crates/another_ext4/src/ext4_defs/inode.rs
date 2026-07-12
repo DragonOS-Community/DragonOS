@@ -324,6 +324,21 @@ impl Inode {
         self.dtime = dtime;
     }
 
+    /// Next inode number in the legacy ext4 orphan list, or zero.
+    ///
+    /// Linux stores this pointer in `i_dtime` while an inode is orphaned.
+    pub fn next_orphan(&self) -> InodeId {
+        self.dtime
+    }
+
+    /// Set the next inode number in the legacy ext4 orphan list.
+    ///
+    /// This deliberately aliases `i_dtime`; callers must recompute the inode
+    /// checksum before persisting the inode.
+    pub fn set_next_orphan(&mut self, next: InodeId) {
+        self.dtime = next;
+    }
+
     pub fn crtime(&self) -> u32 {
         self.crtime
     }
@@ -367,6 +382,11 @@ impl Inode {
 
     pub fn flags(&self) -> u32 {
         self.flags
+    }
+
+    /// Whether `i_block` contains an extent root rather than inline/device data.
+    pub fn uses_extents(&self) -> bool {
+        self.flags & Self::FLAG_EXTENTS != 0
     }
 
     pub fn set_flags(&mut self, f: u32) {
@@ -514,16 +534,31 @@ impl InodeRef {
     }
 
     pub fn set_checksum(&mut self, uuid: &[u8]) {
-        // Must set checksum field to 0 before calculation to avoid including old value
-        // causing checksum to never match (Linux semantics).
-        self.inode.osd2.l_checksum_lo = 0;
-        self.inode.checksum_hi = 0;
-        let mut checksum = crc32(CRC32_INIT, uuid);
-        checksum = crc32(checksum, &self.id.to_le_bytes());
-        checksum = crc32(checksum, &self.inode.generation.to_le_bytes());
-        checksum = crc32(checksum, self.inode.to_bytes());
+        let checksum = self.calculated_checksum(uuid);
         self.inode.osd2.l_checksum_lo = checksum as u16;
         self.inode.checksum_hi = (checksum >> 16) as u16;
+    }
+
+    /// Return the checksum stored in the on-disk inode fields.
+    pub fn checksum(&self) -> u32 {
+        self.inode.osd2.l_checksum_lo as u32 | ((self.inode.checksum_hi as u32) << 16)
+    }
+
+    /// Compute the Linux ext4 inode checksum without modifying the inode.
+    pub fn calculated_checksum(&self, uuid: &[u8]) -> u32 {
+        // Linux treats both checksum fields as zero while calculating CRC32C.
+        let mut inode = self.inode.as_ref().clone();
+        inode.osd2.l_checksum_lo = 0;
+        inode.checksum_hi = 0;
+        let mut checksum = crc32(CRC32_INIT, uuid);
+        checksum = crc32(checksum, &self.id.to_le_bytes());
+        checksum = crc32(checksum, &inode.generation.to_le_bytes());
+        crc32(checksum, inode.to_bytes())
+    }
+
+    /// Verify the stored checksum against the inode identity and filesystem UUID.
+    pub fn verify_checksum(&self, uuid: &[u8]) -> bool {
+        self.checksum() == self.calculated_checksum(uuid)
     }
 }
 
@@ -592,6 +627,46 @@ pub mod device {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retryable_reclaim_error_returns_its_one_shot_handle() {
+        let failure = InodeReclaimError::new(
+            Ext4Error::new(ErrCode::EAGAIN),
+            InodeReclaimHandle::new(37, 91),
+        );
+        let (error, handle) = failure.into_parts();
+        assert_eq!(error.code(), ErrCode::EAGAIN);
+        assert_eq!(handle.inode_id, 37);
+        assert_eq!(handle.generation, 91);
+    }
+
+    #[test]
+    fn next_orphan_is_the_dtime_disk_field() {
+        let mut inode = Inode::default();
+        inode.set_next_orphan(123);
+        assert_eq!(inode.next_orphan(), 123);
+        assert_eq!(inode.dtime(), 123);
+
+        inode.set_dtime(456);
+        assert_eq!(inode.next_orphan(), 456);
+    }
+
+    #[test]
+    fn inode_checksum_can_be_verified_without_mutation() {
+        let uuid = *b"0123456789abcdef";
+        let mut inode = InodeRef::new(42, Box::new(Inode::default()));
+        inode.inode.set_generation(7);
+        inode.inode.set_next_orphan(11);
+        inode.set_checksum(&uuid);
+
+        let stored = inode.checksum();
+        assert!(inode.verify_checksum(&uuid));
+        assert_eq!(inode.checksum(), stored);
+
+        inode.inode.set_next_orphan(12);
+        assert!(!inode.verify_checksum(&uuid));
+        assert_eq!(inode.checksum(), stored);
+    }
 
     // ==================== device module tests ====================
 

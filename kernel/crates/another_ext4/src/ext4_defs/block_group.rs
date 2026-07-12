@@ -98,12 +98,12 @@ impl BlockGroupDesc {
     }
 
     pub fn get_free_blocks_count(&self) -> u64 {
-        ((self.free_blocks_count_hi as u64) << 32) | self.free_blocks_count_lo as u64
+        ((self.free_blocks_count_hi as u64) << 16) | self.free_blocks_count_lo as u64
     }
 
     pub fn set_free_blocks_count(&mut self, cnt: u64) {
-        self.free_blocks_count_lo = ((cnt << 32) >> 32) as u16;
-        self.free_blocks_count_hi = (cnt >> 32) as u16;
+        self.free_blocks_count_lo = cnt as u16;
+        self.free_blocks_count_hi = (cnt >> 16) as u16;
     }
 
     pub fn set_inode_bitmap_csum(&mut self, uuid: &[u8], bitmap: &Bitmap) {
@@ -118,6 +118,50 @@ impl BlockGroupDesc {
         csum = crc32(csum, bitmap.as_bytes());
         self.block_bitmap_csum_lo = csum as u16;
         self.block_bitmap_csum_hi = (csum >> 16) as u16;
+    }
+
+    fn bitmap_csum(uuid: &[u8], bytes: &[u8], len: usize) -> Option<u32> {
+        let covered = bytes.get(..len)?;
+        Some(crc32(crc32(CRC32_INIT, uuid), covered))
+    }
+
+    pub fn verify_inode_bitmap_csum(&self, uuid: &[u8], bytes: &[u8], len: usize) -> bool {
+        Self::bitmap_csum(uuid, bytes, len).is_some_and(|csum| {
+            csum == (self.inode_bitmap_csum_lo as u32 | ((self.inode_bitmap_csum_hi as u32) << 16))
+        })
+    }
+
+    pub fn update_inode_bitmap_csum(&mut self, uuid: &[u8], bytes: &[u8], len: usize) -> bool {
+        let Some(csum) = Self::bitmap_csum(uuid, bytes, len) else {
+            return false;
+        };
+        self.inode_bitmap_csum_lo = csum as u16;
+        self.inode_bitmap_csum_hi = (csum >> 16) as u16;
+        true
+    }
+
+    pub fn verify_block_bitmap_csum(&self, uuid: &[u8], bytes: &[u8], len: usize) -> bool {
+        Self::bitmap_csum(uuid, bytes, len).is_some_and(|csum| {
+            csum == (self.block_bitmap_csum_lo as u32 | ((self.block_bitmap_csum_hi as u32) << 16))
+        })
+    }
+
+    pub fn update_block_bitmap_csum(&mut self, uuid: &[u8], bytes: &[u8], len: usize) -> bool {
+        let Some(csum) = Self::bitmap_csum(uuid, bytes, len) else {
+            return false;
+        };
+        self.block_bitmap_csum_lo = csum as u16;
+        self.block_bitmap_csum_hi = (csum >> 16) as u16;
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn validation_fixture() -> Self {
+        let mut desc = Self::default();
+        desc.block_bitmap_lo = 2;
+        desc.inode_bitmap_lo = 3;
+        desc.inode_table_first_block_lo = 4;
+        desc
     }
 }
 
@@ -143,5 +187,56 @@ impl BlockGroupRef {
         checksum = crc32(checksum, &self.id.to_le_bytes());
         checksum = crc32(checksum, self.desc.to_bytes());
         self.desc.checksum = checksum as u16;
+    }
+
+    pub fn verify_checksum(&self, uuid: &[u8]) -> bool {
+        let expected = self.desc.checksum;
+        let mut copy = BlockGroupRef::new(self.id, self.desc);
+        copy.set_checksum(uuid);
+        copy.desc.checksum == expected
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn free_block_count_roundtrips_high_sixteen_bits() {
+        let mut desc = BlockGroupDesc::default();
+        for count in [0, 1, u16::MAX as u64, 0x1234_5678, u32::MAX as u64] {
+            desc.set_free_blocks_count(count);
+            assert_eq!(desc.get_free_blocks_count(), count);
+        }
+    }
+
+    #[test]
+    fn bitmap_checksum_covers_fixed_group_bytes_not_mutation_bounds() {
+        let uuid = [0x5a; 16];
+        let mut desc = BlockGroupDesc::default();
+        let mut bytes = [0u8; 32];
+
+        assert!(desc.update_block_bitmap_csum(&uuid, &bytes, 16));
+        assert!(desc.verify_block_bitmap_csum(&uuid, &bytes, 16));
+
+        // This byte can be beyond the actual blocks in a partial final group,
+        // but Linux still includes it in clusters_per_group / 8.
+        bytes[15] ^= 1;
+        assert!(!desc.verify_block_bitmap_csum(&uuid, &bytes, 16));
+        bytes[15] ^= 1;
+
+        // Bytes beyond the fixed checksum length are outside the bitmap.
+        bytes[16] ^= 1;
+        assert!(desc.verify_block_bitmap_csum(&uuid, &bytes, 16));
+    }
+
+    #[test]
+    fn group_descriptor_checksum_detects_corruption() {
+        let uuid = [0xa5; 16];
+        let mut group = BlockGroupRef::new(7, BlockGroupDesc::default());
+        group.set_checksum(&uuid);
+        assert!(group.verify_checksum(&uuid));
+        group.desc.set_free_inodes_count(1);
+        assert!(!group.verify_checksum(&uuid));
     }
 }

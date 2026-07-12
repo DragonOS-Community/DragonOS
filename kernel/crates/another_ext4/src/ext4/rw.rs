@@ -4,6 +4,93 @@ use crate::ext4_defs::*;
 use crate::prelude::*;
 
 impl Ext4 {
+    /// Obtain a transaction-private metadata block image for mutation.
+    /// Repeated calls for the same block merge changes in one staged image.
+    pub(super) fn transaction_block_for_update<'tx>(
+        &self,
+        transaction: &'tx mut super::journal_transaction::Transaction<'_>,
+        block_id: PBlockId,
+    ) -> Result<&'tx mut [u8; BLOCK_SIZE]> {
+        transaction.read_for_update(self.block_device.as_ref(), block_id)
+    }
+
+    /// Stage block 0 with a checksum-correct ext4 superblock while preserving
+    /// boot-sector bytes and every unrelated field in the containing block.
+    pub(super) fn transaction_stage_super_block(
+        &self,
+        transaction: &mut super::journal_transaction::Transaction<'_>,
+        sb: &SuperBlock,
+    ) -> Result<()> {
+        let image = self.transaction_block_for_update(transaction, 0)?;
+        let mut checksummed = *sb;
+        checksummed.set_checksum();
+        image[BASE_OFFSET..BASE_OFFSET + core::mem::size_of::<SuperBlock>()]
+            .copy_from_slice(checksummed.to_bytes());
+        Ok(())
+    }
+
+    /// Read the transaction's current superblock image.  This must be used by
+    /// operations which may update allocation counters more than once in one
+    /// transaction; the mounted cache is deliberately not published until the
+    /// checkpoint is durable.
+    pub(super) fn transaction_read_super_block(
+        &self,
+        transaction: &super::journal_transaction::Transaction<'_>,
+    ) -> Result<SuperBlock> {
+        let image = transaction.read(self.block_device.as_ref(), 0)?;
+        Ok(SuperBlock::from_bytes(&image[BASE_OFFSET..]))
+    }
+
+    /// Read a block-group descriptor from the transaction's current image.
+    pub(super) fn transaction_read_block_group(
+        &self,
+        transaction: &super::journal_transaction::Transaction<'_>,
+        block_group_id: BlockGroupId,
+    ) -> Result<BlockGroupRef> {
+        let (block_id, offset) = self.block_group_disk_pos(block_group_id)?;
+        let image = transaction.read(self.block_device.as_ref(), block_id)?;
+        Ok(BlockGroupRef::new(
+            block_group_id,
+            BlockGroupDesc::from_bytes(&image[offset..]),
+        ))
+    }
+
+    /// Merge a checksum-correct descriptor into its transaction-owned GDT
+    /// block.  Several groups may share that block, so staging a fresh block
+    /// for each descriptor would lose earlier changes.
+    pub(super) fn transaction_stage_block_group_with_csum(
+        &self,
+        transaction: &mut super::journal_transaction::Transaction<'_>,
+        bg_ref: &mut BlockGroupRef,
+        uuid: &[u8],
+    ) -> Result<()> {
+        bg_ref.set_checksum(uuid);
+        let (block_id, offset) = self.block_group_disk_pos(bg_ref.id)?;
+        let image = self.transaction_block_for_update(transaction, block_id)?;
+        image[offset..offset + core::mem::size_of::<BlockGroupDesc>()]
+            .copy_from_slice(bg_ref.desc.to_bytes());
+        Ok(())
+    }
+
+    /// Stage a checksum-correct inode-table entry without publishing it to the
+    /// value cache before the surrounding journal transaction commits.
+    ///
+    /// Using the transaction-owned block image is important because several
+    /// inodes may share one inode-table block; repeated calls must merge rather
+    /// than overwrite an earlier staged entry.
+    pub(super) fn transaction_stage_inode_with_csum(
+        &self,
+        transaction: &mut super::journal_transaction::Transaction<'_>,
+        inode_ref: &mut InodeRef,
+    ) -> Result<()> {
+        inode_ref.set_checksum(&self.read_super_block_cached().uuid());
+        let (block_id, offset) = self.inode_disk_pos(inode_ref.id)?;
+        let image = self.transaction_block_for_update(transaction, block_id)?;
+        let bytes = inode_ref.inode.to_bytes();
+        image[offset..offset + bytes.len()].copy_from_slice(bytes);
+        Ok(())
+    }
+
     /// Read a block from block device
     pub(super) fn read_block(&self, block_id: PBlockId) -> Result<Block> {
         self.block_device.read_block(block_id)
@@ -161,6 +248,13 @@ impl Ext4 {
     #[allow(unused)]
     fn block_group_disk_pos(&self, block_group_id: BlockGroupId) -> Result<(PBlockId, usize)> {
         let super_block = self.read_super_block_cached();
+        if block_group_id >= super_block.block_group_count() {
+            return Err(crate::format_error!(
+                ErrCode::EINVAL,
+                "Invalid block group id {}",
+                block_group_id
+            ));
+        }
         let desc_per_block = BLOCK_SIZE as u32 / super_block.desc_size() as u32;
 
         let block_id = super_block.first_data_block() + block_group_id / desc_per_block + 1;

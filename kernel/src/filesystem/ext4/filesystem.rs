@@ -626,9 +626,9 @@ impl Ext4FileSystem {
         mount_options: Ext4MountOptions,
     ) -> Result<Arc<dyn FileSystem>, SystemError> {
         let raw_dev = mount_data.device_num();
-        // The JBD2 writer is not activated for production mounts until every
-        // metadata mutation path has been converted to explicit handles.
-        let fs = another_ext4::Ext4::load(mount_data.clone())?;
+        // Writable mounts recover the journal and the validated legacy orphan
+        // chain before this filesystem is published to the VFS.
+        let fs = another_ext4::Ext4::load_writable(mount_data.clone())?;
         let root_inode: Arc<LockedExt4Inode> =
             Arc::new_cyclic(|self_ref: &Weak<LockedExt4Inode>| {
                 LockedExt4Inode(

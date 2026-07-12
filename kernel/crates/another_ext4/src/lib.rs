@@ -2,6 +2,9 @@
 #![no_std]
 #![deny(clippy::all)]
 
+#[cfg(test)]
+extern crate std;
+
 mod constants;
 mod error;
 mod ext4;

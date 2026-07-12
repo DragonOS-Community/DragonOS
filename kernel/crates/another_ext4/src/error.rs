@@ -45,6 +45,8 @@ pub enum ErrCode {
     EMLINK = 31,
     /// Math result not representable.
     ERANGE = 34,
+    /// File name too long.
+    ENAMETOOLONG = 36,
     /// Directory not empty.
     ENOTEMPTY = 39,
     /// No data available.

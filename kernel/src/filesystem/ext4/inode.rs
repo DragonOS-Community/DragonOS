@@ -19,6 +19,8 @@ use crate::{
     },
     mm::{truncate::truncate_inode_pages, MemoryManagementArch},
     process::{ProcessManager, RawPid},
+    sched::sched_yield,
+    time::sleep::nanosleep,
     time::PosixTimeSpec,
 };
 use alloc::{
@@ -1370,6 +1372,38 @@ impl IndexNode for LockedExt4Inode {
 }
 
 impl LockedExt4Inode {
+    fn metadata_contention_backoff(attempt: usize) {
+        const YIELDS_BEFORE_SLEEP: usize = 64;
+        if attempt % YIELDS_BEFORE_SLEEP == 0 {
+            // Keep the current eviction epoch pending, but avoid a workqueue
+            // hot loop while an I/O-spanning metadata owner is asleep.
+            let _ = nanosleep(PosixTimeSpec::new(0, 1_000_000));
+        } else {
+            sched_yield();
+        }
+    }
+
+    fn reclaim_with_metadata_contention_retry(
+        fs: &another_ext4::Ext4,
+        mut handle: another_ext4::InodeReclaimHandle,
+    ) -> Result<(), (another_ext4::Ext4Error, another_ext4::InodeReclaimHandle)> {
+        let mut attempt = 1usize;
+        loop {
+            match fs.reclaim_inode(handle) {
+                Ok(()) => return Ok(()),
+                Err(failure) => {
+                    let (error, returned_handle) = failure.into_parts();
+                    if error.code() != another_ext4::ErrCode::EAGAIN {
+                        return Err((error, returned_handle));
+                    }
+                    handle = returned_handle;
+                    Self::metadata_contention_backoff(attempt);
+                    attempt = attempt.saturating_add(1);
+                }
+            }
+        }
+    }
+
     fn reclaim_temporary_inode(
         fs: &Arc<Ext4FileSystem>,
         parent_inode_num: u32,
@@ -1380,21 +1414,27 @@ impl LockedExt4Inode {
         let _link_mutation = lifecycle.lock_link_mutation();
         let tombstone = fs.begin_freeing(&inode)?;
         let _reuse = fs.begin_reclaim();
-        let handle = match fs.fs.unlink(parent_inode_num, name) {
-            Ok(Some(handle)) => handle,
-            Ok(None) => {
-                let error = SystemError::EIO;
-                let _ = fs.poison_freeing(tombstone, error.clone());
-                return Err(error);
-            }
-            Err(error) => {
-                let error = SystemError::from(error);
-                let _ = fs.poison_freeing(tombstone, error.clone());
-                return Err(error);
+        let mut attempt = 1usize;
+        let handle = loop {
+            match fs.fs.unlink(parent_inode_num, name) {
+                Ok(Some(handle)) => break handle,
+                Ok(None) => {
+                    let error = SystemError::EIO;
+                    let _ = fs.poison_freeing(tombstone, error.clone());
+                    return Err(error);
+                }
+                Err(error) if error.code() == another_ext4::ErrCode::EAGAIN => {
+                    Self::metadata_contention_backoff(attempt);
+                    attempt = attempt.saturating_add(1);
+                }
+                Err(error) => {
+                    let error = SystemError::from(error);
+                    let _ = fs.poison_freeing(tombstone, error.clone());
+                    return Err(error);
+                }
             }
         };
-        if let Err(error) = fs.fs.reclaim_inode(handle) {
-            let (error, handle) = error.into_parts();
+        if let Err((error, handle)) = Self::reclaim_with_metadata_contention_retry(&fs.fs, handle) {
             *inode.6.lock() = Some(handle);
             let error = SystemError::from(error);
             let _ = fs.poison_freeing(tombstone, error.clone());
@@ -1706,13 +1746,12 @@ impl LockedExt4Inode {
                 return Err(SystemError::EIO);
             }
         };
-        match fs.fs.reclaim_inode(handle) {
+        match Self::reclaim_with_metadata_contention_retry(&fs.fs, handle) {
             Ok(()) => {
                 fs.complete_freeing(tombstone)?;
                 Ok(())
             }
-            Err(failure) => {
-                let (error, handle) = failure.into_parts();
+            Err((error, handle)) => {
                 *self.6.lock() = Some(handle);
                 let error = SystemError::from(error);
                 let _ = fs.poison_freeing(tombstone, error.clone());

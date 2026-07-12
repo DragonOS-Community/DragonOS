@@ -5,6 +5,20 @@ use crate::format_error;
 use crate::prelude::*;
 use crate::return_error;
 
+fn extent_tail_batch_limit(
+    first_data_block: PBlockId,
+    blocks_per_group: PBlockId,
+    start: PBlockId,
+    count: u32,
+) -> Option<u32> {
+    if blocks_per_group == 0 || count == 0 || start < first_data_block {
+        return None;
+    }
+    let last = start.checked_add(count as PBlockId)?.checked_sub(1)?;
+    let in_last_group = (last - first_data_block) % blocks_per_group + 1;
+    Some(core::cmp::min(count, in_last_group as u32))
+}
+
 impl Ext4 {
     fn restore_inode_allocation_state(
         &self,
@@ -28,7 +42,7 @@ impl Ext4 {
     }
 
     fn block_group_first_block(sb: &SuperBlock, bgid: BlockGroupId) -> PBlockId {
-        bgid as PBlockId * sb.blocks_per_group() as PBlockId
+        sb.first_data_block() as PBlockId + bgid as PBlockId * sb.blocks_per_group() as PBlockId
     }
 
     fn block_group_block_count(sb: &SuperBlock, bgid: BlockGroupId) -> usize {
@@ -38,6 +52,192 @@ impl Ext4 {
             return 0;
         }
         core::cmp::min(sb.blocks_per_group() as u64, total - first) as usize
+    }
+
+    /// Stage the release of one contiguous physical-block range.
+    ///
+    /// This changes allocation metadata only.  In particular, freed data is
+    /// not zeroed: after commit the blocks no longer belong to this inode and
+    /// clearing them would be both unnecessary I/O and a race with reuse.
+    pub(super) fn transaction_dealloc_block_range(
+        &self,
+        transaction: &mut super::journal_transaction::Transaction<'_>,
+        first: PBlockId,
+        count: u32,
+    ) -> Result<()> {
+        let _alloc_guard = self.alloc_lock.lock();
+        if count == 0 {
+            return_error!(ErrCode::EINVAL, "Cannot free an empty block range");
+        }
+
+        let mut sb = self.transaction_read_super_block(transaction)?;
+        let last_exclusive = first
+            .checked_add(count as PBlockId)
+            .ok_or_else(|| format_error!(ErrCode::EINVAL, "Block range overflows"))?;
+        if first < sb.first_data_block() as PBlockId
+            || first >= sb.block_count()
+            || last_exclusive > sb.block_count()
+        {
+            return_error!(
+                ErrCode::EINVAL,
+                "Invalid block range {}..{}",
+                first,
+                last_exclusive
+            );
+        }
+        let blocks_per_group = sb.blocks_per_group() as PBlockId;
+        let data_first = sb.first_data_block() as PBlockId;
+        let bgid = ((first - data_first) / blocks_per_group) as BlockGroupId;
+        if ((last_exclusive - 1 - data_first) / blocks_per_group) as BlockGroupId != bgid {
+            return_error!(ErrCode::EINVAL, "Block range crosses a block group");
+        }
+        let group_first = Self::block_group_first_block(&sb, bgid);
+        let bit = (first - group_first) as usize;
+        let count = count as usize;
+        let blocks_in_group = Self::block_group_block_count(&sb, bgid);
+        if bit
+            .checked_add(count)
+            .is_none_or(|end| end > blocks_in_group)
+        {
+            return_error!(ErrCode::EINVAL, "Block range exceeds block group");
+        }
+        self.validate_data_blocks(first, count as u64)?;
+
+        let mut bg = self.transaction_read_block_group(transaction, bgid)?;
+        let bitmap_block_id = bg.desc.block_bitmap_block();
+        let metadata_csum =
+            sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_METADATA_CSUM);
+        let checksum_bytes = (sb.clusters_per_group() as usize) / 8;
+        if metadata_csum {
+            if !bg.verify_checksum(&sb.uuid()) {
+                return_error!(ErrCode::EIO, "Corrupt block-group descriptor checksum");
+            }
+            let bitmap_image = transaction.read(self.block_device.as_ref(), bitmap_block_id)?;
+            if !bg
+                .desc
+                .verify_block_bitmap_csum(&sb.uuid(), &*bitmap_image, checksum_bytes)
+            {
+                return_error!(ErrCode::EIO, "Corrupt block bitmap checksum");
+            }
+        }
+        // Validate all accounting before mutating the transaction image.  A
+        // corrupt counter must not leave a half-applied bitmap update behind.
+        let new_bg_free = bg
+            .desc
+            .get_free_blocks_count()
+            .checked_add(count as u64)
+            .filter(|value| *value <= blocks_in_group as u64)
+            .ok_or_else(|| format_error!(ErrCode::EINVAL, "Invalid block-group free count"))?;
+        let new_sb_free = sb
+            .free_blocks_count()
+            .checked_add(count as u64)
+            .filter(|value| *value <= sb.block_count())
+            .ok_or_else(|| format_error!(ErrCode::EINVAL, "Invalid filesystem free count"))?;
+        {
+            let image = self.transaction_block_for_update(transaction, bitmap_block_id)?;
+            let mut bitmap = Bitmap::new(image, blocks_in_group);
+            if (bit..bit + count).any(|index| bitmap.is_bit_clear(index)) {
+                return_error!(ErrCode::EINVAL, "Block range contains a free block");
+            }
+            for index in bit..bit + count {
+                bitmap.clear_bit(index);
+            }
+            if metadata_csum
+                && !bg
+                    .desc
+                    .update_block_bitmap_csum(&sb.uuid(), image, checksum_bytes)
+            {
+                return_error!(ErrCode::EIO, "Invalid block bitmap checksum length");
+            }
+        }
+
+        bg.desc.set_free_blocks_count(new_bg_free);
+        self.transaction_stage_block_group_with_csum(transaction, &mut bg, &sb.uuid())?;
+        sb.set_free_blocks_count(new_sb_free);
+        self.transaction_stage_super_block(transaction, &sb)
+    }
+
+    /// Stage final inode-number release.  `itable_unused` describes the
+    /// never-initialized tail of the inode table, not reusable inode slots, so
+    /// freeing an inode must leave it unchanged (as Linux ext4 does).
+    pub(super) fn transaction_dealloc_inode(
+        &self,
+        transaction: &mut super::journal_transaction::Transaction<'_>,
+        inode_id: InodeId,
+        is_dir: bool,
+    ) -> Result<()> {
+        let _alloc_guard = self.alloc_lock.lock();
+        let mut sb = self.transaction_read_super_block(transaction)?;
+        if inode_id == 0 || inode_id > sb.inode_count() {
+            return_error!(ErrCode::EINVAL, "Invalid inode {}", inode_id);
+        }
+        let inodes_per_group = sb.inodes_per_group();
+        let bgid = ((inode_id - 1) / inodes_per_group) as BlockGroupId;
+        let idx = ((inode_id - 1) % inodes_per_group) as usize;
+        let inode_count = sb.inode_count_in_group(bgid) as usize;
+        if idx >= inode_count {
+            return_error!(ErrCode::EINVAL, "Invalid inode index {}", idx);
+        }
+
+        let mut bg = self.transaction_read_block_group(transaction, bgid)?;
+        let bitmap_block_id = bg.desc.inode_bitmap_block();
+        let metadata_csum =
+            sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_METADATA_CSUM);
+        let checksum_bytes = (sb.inodes_per_group() as usize) / 8;
+        if metadata_csum {
+            if !bg.verify_checksum(&sb.uuid()) {
+                return_error!(ErrCode::EIO, "Corrupt block-group descriptor checksum");
+            }
+            let bitmap_image = transaction.read(self.block_device.as_ref(), bitmap_block_id)?;
+            if !bg
+                .desc
+                .verify_inode_bitmap_csum(&sb.uuid(), &*bitmap_image, checksum_bytes)
+            {
+                return_error!(ErrCode::EIO, "Corrupt inode bitmap checksum");
+            }
+        }
+        let new_bg_free = bg
+            .desc
+            .free_inodes_count()
+            .checked_add(1)
+            .filter(|value| *value <= inode_count as u32)
+            .ok_or_else(|| format_error!(ErrCode::EINVAL, "Invalid block-group inode count"))?;
+        let new_sb_free = sb
+            .free_inodes_count()
+            .checked_add(1)
+            .filter(|value| *value <= sb.inode_count())
+            .ok_or_else(|| format_error!(ErrCode::EINVAL, "Invalid filesystem inode count"))?;
+        let new_used_dirs =
+            if is_dir {
+                Some(bg.desc.used_dirs_count().checked_sub(1).ok_or_else(|| {
+                    format_error!(ErrCode::EINVAL, "Invalid used-directory count")
+                })?)
+            } else {
+                None
+            };
+        {
+            let image = self.transaction_block_for_update(transaction, bitmap_block_id)?;
+            let mut bitmap = Bitmap::new(image, inode_count);
+            if bitmap.is_bit_clear(idx) {
+                return_error!(ErrCode::EINVAL, "Inode {} is already free", inode_id);
+            }
+            bitmap.clear_bit(idx);
+            if metadata_csum
+                && !bg
+                    .desc
+                    .update_inode_bitmap_csum(&sb.uuid(), image, checksum_bytes)
+            {
+                return_error!(ErrCode::EIO, "Invalid inode bitmap checksum length");
+            }
+        }
+
+        bg.desc.set_free_inodes_count(new_bg_free);
+        if let Some(used) = new_used_dirs {
+            bg.desc.set_used_dirs_count(used);
+        }
+        self.transaction_stage_block_group_with_csum(transaction, &mut bg, &sb.uuid())?;
+        sb.set_free_inodes_count(new_sb_free);
+        self.transaction_stage_super_block(transaction, &sb)
     }
 
     /// Create a new inode, returning the inode and its number
@@ -145,26 +345,17 @@ impl Ext4 {
         // Free the data blocks allocated for the inode
         let pblocks = self.extent_all_data_blocks(inode)?;
         for pblock in pblocks {
-            // Deallocate the block
             self.dealloc_block(inode, pblock)?;
-            // Clear the block content
-            self.write_block(&Block::new(pblock, Box::new([0; BLOCK_SIZE])))?;
         }
         // Free extent tree
         let pblocks = self.extent_all_tree_blocks(inode)?;
         for pblock in pblocks {
-            // Deallocate the block
             self.dealloc_block(inode, pblock)?;
-            // Clear the block content
-            self.write_block(&Block::new(pblock, Box::new([0; BLOCK_SIZE])))?;
         }
         // Free xattr block
         let xattr_block = inode.inode.xattr_block();
         if xattr_block != 0 {
-            // Deallocate the block
             self.dealloc_block(inode, xattr_block)?;
-            // Clear the block content
-            self.write_block(&Block::new(xattr_block, Box::new([0; BLOCK_SIZE])))?;
         }
         // Deallocate the inode
         self.dealloc_inode(inode)?;
@@ -211,34 +402,171 @@ impl Ext4 {
 
     fn reclaim_inode_inner(&self, handle: &InodeReclaimHandle) -> Result<()> {
         self.ensure_mutable()?;
+        // Delayed VFS eviction runs after the namespace operation released its
+        // guard. Re-enter the transactional domain for the complete multi-
+        // transaction reclaim so no legacy direct writer can race snapshots.
+        let _metadata_guard = self.lock_transactional_metadata_mutation()?;
         let _mutation_guard =
             self.inode_mutation_locks[self.inode_mutation_lock_index(handle.inode_id)].lock();
-        if !self.inode_is_allocated(handle.inode_id)? {
+        self.reclaim_inode_lifetime(handle.inode_id, handle.generation)
+    }
+
+    /// Reclaim a mount-recovery orphan without manufacturing a VFS lifetime
+    /// capability. The generation is read authoritatively before entering the
+    /// same validated orchestration used by delayed final close.
+    pub(super) fn reclaim_orphan_inode_by_id(&self, inode_id: InodeId) -> Result<()> {
+        self.ensure_mutable()?;
+        let _mutation_guard =
+            self.inode_mutation_locks[self.inode_mutation_lock_index(inode_id)].lock();
+        let generation = self.read_inode_uncached(inode_id)?.inode.generation();
+        self.reclaim_inode_lifetime(inode_id, generation)
+    }
+
+    fn reclaim_inode_lifetime(&self, inode_id: InodeId, generation: u32) -> Result<()> {
+        self.validate_reclaim_inode(inode_id, generation)?;
+        if !self.legacy_orphan_contains(inode_id)? {
+            return_error!(ErrCode::EINVAL, "Inode {} is not orphaned", inode_id);
+        }
+        // Each iteration starts from the checkpointed inode-table entry.  The
+        // on-disk extent root is therefore the restart cursor after any crash.
+        // Chain membership was fully validated once above. The metadata write
+        // barrier keeps the chain stable, avoiding O(extents * orphan_count)
+        // repeated walks; final orphan_del performs its own bounded walk.
+        loop {
+            let mut inode = self.validate_reclaim_inode(inode_id, generation)?;
+            if !inode.inode.uses_extents() {
+                if inode.inode.fs_block_count() != 0 {
+                    return_error!(ErrCode::EIO, "Non-extent orphan owns blocks");
+                }
+                break;
+            }
+
+            let mut transaction = self.transaction_start(32)?;
+            let Some(tail) = self.extent_tail(&transaction, &inode)? else {
+                break;
+            };
+            let extent_end = tail
+                .start_pblock
+                .checked_add(tail.block_count as PBlockId)
+                .ok_or_else(|| format_error!(ErrCode::EIO, "Invalid extent physical range"))?;
+            if tail.start_pblock == 0
+                || extent_end > self.read_super_block_cached().block_count()
+                || self.journal_owns_block_range(tail.start_pblock, extent_end)
+            {
+                return_error!(
+                    ErrCode::EIO,
+                    "Orphan extent overlaps invalid or journal-owned blocks"
+                );
+            }
+            // transaction_dealloc_block_range deliberately accepts one block
+            // group only. Trim the right edge at that boundary so bitmap and
+            // counters stay a compact, independently restartable unit.
+            let sb = self.read_super_block_cached();
+            let blocks_per_group = sb.blocks_per_group() as PBlockId;
+            let remove_limit = extent_tail_batch_limit(
+                sb.first_data_block() as PBlockId,
+                blocks_per_group,
+                tail.start_pblock,
+                tail.block_count,
+            )
+            .ok_or_else(|| format_error!(ErrCode::EIO, "Invalid extent tail"))?;
+            let removed = self
+                .extent_remove_tail_in_transaction(&mut transaction, &mut inode, remove_limit)?
+                .ok_or_else(|| format_error!(ErrCode::EIO, "Extent tail disappeared"))?;
+            self.transaction_dealloc_block_range(
+                &mut transaction,
+                removed.start_pblock,
+                removed.block_count,
+            )?;
+            for metadata in removed.metadata_blocks.iter().copied() {
+                self.transaction_dealloc_block_range(&mut transaction, metadata, 1)?;
+            }
+            let released = removed.block_count as u64 + removed.metadata_blocks.len() as u64;
+            let remaining = inode
+                .inode
+                .fs_block_count()
+                .checked_sub(released)
+                .ok_or_else(|| format_error!(ErrCode::EIO, "Invalid inode block count"))?;
+            inode.inode.set_fs_block_count(remaining);
+            inode.inode.set_size(core::cmp::min(
+                inode.inode.size(),
+                removed.start_lblock as u64 * BLOCK_SIZE as u64,
+            ));
+            self.transaction_stage_inode_with_csum(&mut transaction, &mut inode)?;
+            self.commit_reclaim_transaction(transaction)?;
+        }
+
+        // External xattrs form their own restartable transaction. Shared
+        // blocks update h_refcount; exclusive blocks also release allocation.
+        let mut inode = self.validate_reclaim_inode(inode_id, generation)?;
+        if inode.inode.xattr_block() != 0 {
+            let mut transaction = self.transaction_start(16)?;
+            if let Some(block) = self.transaction_release_xattr(&mut transaction, &mut inode)? {
+                self.transaction_dealloc_block_range(&mut transaction, block, 1)?;
+            }
+            self.commit_reclaim_transaction(transaction)?;
+        }
+
+        // Only the final transaction makes the orphan undiscoverable. It also
+        // frees the inode number and installs a checksum-correct cleared table
+        // entry, preserving generation so reuse advances lifetime identity.
+        let inode = self.validate_reclaim_inode(inode_id, generation)?;
+        if inode.inode.uses_extents() {
+            let transaction = self.transaction_start(1)?;
+            if self.extent_tail(&transaction, &inode)?.is_some() {
+                return_error!(ErrCode::EIO, "Final reclaim with live extent");
+            }
+            transaction.abort();
+        }
+        if inode.inode.xattr_block() != 0 || inode.inode.fs_block_count() != 0 {
+            return_error!(ErrCode::EIO, "Final reclaim with owned blocks");
+        }
+        let is_dir = inode.inode.is_dir();
+        let mut transaction = self.transaction_start(16)?;
+        let mut sb = self.transaction_read_super_block(&transaction)?;
+        self.transaction_orphan_del(&mut transaction, &inode, &mut sb)?;
+        self.transaction_dealloc_inode(&mut transaction, inode_id, is_dir)?;
+        let mut cleared = InodeRef::new(inode_id, Box::new(Inode::default()));
+        cleared.inode.set_generation(generation);
+        self.transaction_stage_inode_with_csum(&mut transaction, &mut cleared)?;
+        self.commit_reclaim_transaction(transaction)
+    }
+
+    fn validate_reclaim_inode(&self, inode_id: InodeId, generation: u32) -> Result<InodeRef> {
+        if !self.inode_is_allocated(inode_id)? {
             return_error!(
                 ErrCode::EINVAL,
-                "Reclaim capability references free inode {}",
-                handle.inode_id
+                "Reclaim references free inode {}",
+                inode_id
             );
         }
-        let mut inode = self.read_inode_uncached(handle.inode_id)?;
+        let inode = self.read_inode_uncached(inode_id)?;
         if inode.inode.mode().bits() == 0
             || inode.inode.link_count() != 0
-            || inode.inode.generation() != handle.generation
+            || inode.inode.generation() != generation
+            || !inode.verify_checksum(&self.read_super_block_cached().uuid())
         {
             return_error!(
                 ErrCode::EINVAL,
-                "Invalid or stale reclaim capability for inode {}",
-                handle.inode_id
+                "Invalid or stale orphan inode {}",
+                inode_id
             );
         }
-        if let Err(error) = self.free_inode(&mut inode) {
+        Ok(inode)
+    }
+
+    fn commit_reclaim_transaction(
+        &self,
+        transaction: super::journal_transaction::Transaction<'_>,
+    ) -> Result<()> {
+        if let Err(error) = transaction.commit(self.block_device.as_ref(), self) {
             self.poison(ErrCode::EIO);
-            return Err(error);
+            return Err(error.error);
         }
         Ok(())
     }
 
-    fn inode_is_allocated(&self, inode_id: InodeId) -> Result<bool> {
+    pub(super) fn inode_is_allocated(&self, inode_id: InodeId) -> Result<bool> {
         let _alloc_guard = self.alloc_lock.lock();
         let sb = self.read_super_block_cached();
         if inode_id == 0 || inode_id > sb.inode_count() {
@@ -280,8 +608,12 @@ impl Ext4 {
         let iblock = self.extent_next_data_lblock(inode)?;
         // Check the extent tree to get the physical block id
         let fblock = self.extent_query_or_create(inode, iblock, 1)?;
-        // Update block count: data blocks only (tree blocks are added by setattr)
-        inode.inode.set_fs_block_count(iblock as u64 + 1);
+        let total_blocks = self
+            .extent_all_data_blocks(inode)?
+            .len()
+            .checked_add(self.extent_all_tree_blocks(inode)?.len())
+            .ok_or_else(|| format_error!(ErrCode::EFBIG, "Inode blocks overflow"))?;
+        inode.inode.set_fs_block_count(total_blocks as u64);
         self.write_inode_with_csum(inode)?;
 
         Ok((iblock, fblock))
@@ -361,6 +693,33 @@ impl Ext4 {
         return_error!(ErrCode::ENOSPC, "No free blocks in filesystem");
     }
 
+    /// Allocate and initialize a data block before any extent can publish it.
+    /// Extent-tree and xattr metadata allocations deliberately use
+    /// `alloc_block()` directly because their callers construct metadata
+    /// images rather than exposing zero-filled file data.
+    pub(super) fn alloc_zeroed_data_block(&self, inode: &mut InodeRef) -> Result<PBlockId> {
+        self.alloc_initialized_data_block(inode, Box::new([0; BLOCK_SIZE]))
+    }
+
+    pub(super) fn alloc_initialized_data_block(
+        &self,
+        inode: &mut InodeRef,
+        image: Box<[u8; BLOCK_SIZE]>,
+    ) -> Result<PBlockId> {
+        let pblock = self.alloc_block(inode)?;
+        if let Err(init_error) = self.write_block(&Block::new(pblock, image)) {
+            if let Err(rollback_error) = self.dealloc_block(inode, pblock) {
+                // The allocation bit may still be set and no extent owns the
+                // block.  Fail-stop instead of permitting silent leakage or a
+                // later stale-data mapping on this mount.
+                self.poison(ErrCode::EIO);
+                return Err(rollback_error);
+            }
+            return Err(init_error);
+        }
+        Ok(pblock)
+    }
+
     /// Deallocate a physical block allocated for an inode
     pub(super) fn dealloc_block(&self, _inode: &mut InodeRef, pblock: PBlockId) -> Result<()> {
         let _alloc_guard = self.alloc_lock.lock();
@@ -369,7 +728,11 @@ impl Ext4 {
             return_error!(ErrCode::EINVAL, "Invalid block {}", pblock);
         }
 
-        let bgid = (pblock / sb.blocks_per_group() as PBlockId) as BlockGroupId;
+        if pblock < sb.first_data_block() as PBlockId {
+            return_error!(ErrCode::EINVAL, "Invalid block {}", pblock);
+        }
+        let bgid = ((pblock - sb.first_data_block() as PBlockId)
+            / sb.blocks_per_group() as PBlockId) as BlockGroupId;
         let bit = (pblock - Self::block_group_first_block(&sb, bgid)) as usize;
         let blocks_in_group = Self::block_group_block_count(&sb, bgid);
         if bit >= blocks_in_group {
@@ -570,5 +933,25 @@ impl Ext4 {
         self.write_inode_with_csum(inode_ref)?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod reclaim_tests {
+    use super::extent_tail_batch_limit;
+
+    #[test]
+    fn extent_reclaim_batch_never_crosses_a_block_group() {
+        // 1 KiB ext4 starts data at block 1. The tail spans groups 0 and 1;
+        // only the two right-most blocks in group 1 may be removed together.
+        assert_eq!(extent_tail_batch_limit(1, 8, 7, 4), Some(2));
+        assert_eq!(extent_tail_batch_limit(0, 8, 9, 3), Some(3));
+    }
+
+    #[test]
+    fn extent_reclaim_batch_rejects_invalid_or_overflowing_tails() {
+        assert_eq!(extent_tail_batch_limit(1, 8, 0, 1), None);
+        assert_eq!(extent_tail_batch_limit(0, 8, u64::MAX, 2), None);
+        assert_eq!(extent_tail_batch_limit(0, 0, 1, 1), None);
     }
 }

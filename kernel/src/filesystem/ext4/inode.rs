@@ -1139,7 +1139,9 @@ impl IndexNode for LockedExt4Inode {
         // RENAME_EXCHANGE: 原子交换两个文件/目录
         if flags.contains(RenameFlags::EXCHANGE) {
             // VFS 层已验证目标存在，直接调用 exchange
-            ext4.rename_exchange(src_inode_num, old_name, target_inode_num, new_name)?;
+            Self::retry_metadata_contention(|| {
+                ext4.rename_exchange(src_inode_num, old_name, target_inode_num, new_name)
+            })?;
 
             // 更新缓存：交换两个条目
             self.update_exchange_cache(
@@ -1235,14 +1237,16 @@ impl IndexNode for LockedExt4Inode {
                     continue;
                 }
                 let allocation = ext4_fs.begin_allocation()?;
-                let whiteout_num = ext4.mknod(
-                    src_inode_num,
-                    &candidate,
-                    another_ext4::InodeMode::CHARDEV
-                        | another_ext4::InodeMode::from_bits_retain(0o600),
-                    WHITEOUT_DEV.major().data(),
-                    WHITEOUT_DEV.minor(),
-                )?;
+                let whiteout_num = Self::retry_metadata_contention(|| {
+                    ext4.mknod(
+                        src_inode_num,
+                        &candidate,
+                        another_ext4::InodeMode::CHARDEV
+                            | another_ext4::InodeMode::from_bits_retain(0o600),
+                        WHITEOUT_DEV.major().data(),
+                        WHITEOUT_DEV.minor(),
+                    )
+                })?;
                 whiteout_inode = match ext4_fs.publish_allocated_inode(
                     whiteout_num,
                     DName::from(candidate.as_str()),
@@ -1254,15 +1258,16 @@ impl IndexNode for LockedExt4Inode {
                     Err(error) => {
                         drop(allocation);
                         let _reclaim = ext4_fs.begin_reclaim();
-                        let cleanup =
-                            ext4.unlink(src_inode_num, &candidate).and_then(
-                                |handle| match handle {
-                                    Some(handle) => ext4
-                                        .reclaim_inode(handle)
-                                        .map_err(|failure| failure.into_parts().0),
-                                    None => Ok(()),
-                                },
-                            );
+                        let cleanup = Self::retry_metadata_contention(|| {
+                            ext4.unlink(src_inode_num, &candidate)
+                        })
+                        .and_then(|handle| match handle {
+                            Some(handle) => {
+                                Self::reclaim_with_metadata_contention_retry(ext4, handle)
+                                    .map_err(|failure| SystemError::from(failure.0))
+                            }
+                            None => Ok(()),
+                        });
                         if cleanup.is_err() {
                             ext4_fs.fail_stop_lifecycle();
                             return Err(SystemError::EIO);
@@ -1277,44 +1282,41 @@ impl IndexNode for LockedExt4Inode {
                 return Err(SystemError::EEXIST);
             }
 
-            if let Err(err) =
+            if let Err(err) = Self::retry_metadata_contention(|| {
                 ext4.rename_exchange(src_inode_num, old_name, src_inode_num, &temp_name)
-            {
+            }) {
                 Self::reclaim_temporary_inode(
                     &ext4_fs,
                     src_inode_num,
                     &temp_name,
                     whiteout_inode.take().unwrap(),
                 )?;
-                return Err(err.into());
+                return Err(err);
             }
-            let rename_handle =
-                match ext4.rename(src_inode_num, &temp_name, target_inode_num, new_name) {
-                    Ok(handle) => handle,
-                    Err(err) => {
-                        let rename_error = SystemError::from(err);
-                        let rollback = ext4.rename_exchange(
-                            src_inode_num,
-                            old_name,
-                            src_inode_num,
-                            &temp_name,
-                        );
-                        if rollback.is_err() {
-                            let whiteout_tombstone = ext4_fs.begin_freeing(
-                                whiteout_inode.as_ref().expect("whiteout was published"),
-                            )?;
-                            let _ = ext4_fs.poison_freeing(whiteout_tombstone, SystemError::EIO);
-                            return Err(SystemError::EIO);
-                        }
-                        Self::reclaim_temporary_inode(
-                            &ext4_fs,
-                            src_inode_num,
-                            &temp_name,
-                            whiteout_inode.take().unwrap(),
+            let rename_handle = match Self::retry_metadata_contention(|| {
+                ext4.rename(src_inode_num, &temp_name, target_inode_num, new_name)
+            }) {
+                Ok(handle) => handle,
+                Err(rename_error) => {
+                    let rollback = Self::retry_metadata_contention(|| {
+                        ext4.rename_exchange(src_inode_num, old_name, src_inode_num, &temp_name)
+                    });
+                    if rollback.is_err() {
+                        let whiteout_tombstone = ext4_fs.begin_freeing(
+                            whiteout_inode.as_ref().expect("whiteout was published"),
                         )?;
-                        return Err(rename_error);
+                        let _ = ext4_fs.poison_freeing(whiteout_tombstone, SystemError::EIO);
+                        return Err(SystemError::EIO);
                     }
-                };
+                    Self::reclaim_temporary_inode(
+                        &ext4_fs,
+                        src_inode_num,
+                        &temp_name,
+                        whiteout_inode.take().unwrap(),
+                    )?;
+                    return Err(rename_error);
+                }
+            };
             if will_free {
                 let handle = rename_handle.ok_or(SystemError::EIO)?;
                 dst_inode
@@ -1335,7 +1337,9 @@ impl IndexNode for LockedExt4Inode {
                     attr.links <= 1
                 };
                 if !will_free {
-                    let _ = ext4.rename(src_inode_num, old_name, target_inode_num, new_name)?;
+                    let _ = Self::retry_metadata_contention(|| {
+                        ext4.rename(src_inode_num, old_name, target_inode_num, new_name)
+                    })?;
                 } else {
                     if ext4.lookup(target_inode_num, new_name).ok() != dst_inode_num {
                         return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
@@ -1348,17 +1352,20 @@ impl IndexNode for LockedExt4Inode {
                             Err(error) => return Err(error.into()),
                         }
                     }
-                    let handle =
-                        match ext4.rename(src_inode_num, old_name, target_inode_num, new_name) {
-                            Ok(Some(handle)) => handle,
-                            Ok(None) => return Err(SystemError::EIO),
-                            Err(err) => return Err(err.into()),
-                        };
+                    let handle = match Self::retry_metadata_contention(|| {
+                        ext4.rename(src_inode_num, old_name, target_inode_num, new_name)
+                    }) {
+                        Ok(Some(handle)) => handle,
+                        Ok(None) => return Err(SystemError::EIO),
+                        Err(err) => return Err(err),
+                    };
                     dst_inode.defer_reclaim(handle)?;
                 }
             } else {
                 // ext4 library now correctly handles atomic replace
-                let _ = ext4.rename(src_inode_num, old_name, target_inode_num, new_name)?;
+                let _ = Self::retry_metadata_contention(|| {
+                    ext4.rename(src_inode_num, old_name, target_inode_num, new_name)
+                })?;
             }
         }
 

@@ -249,8 +249,14 @@ impl Ext4 {
 
     fn validate_super_block(sb: &SuperBlock) -> Result<()> {
         const SUPPORTED_INCOMPAT: u32 = 0x0002 | 0x0004 | 0x0040 | 0x0080 | 0x0200;
-        const SUPPORTED_RO_COMPAT: u32 =
-            0x0001 | 0x0002 | 0x0004 | 0x0008 | 0x0020 | 0x0040 | 0x0400;
+        const SUPPORTED_RO_COMPAT: u32 = 0x0001
+            | 0x0002
+            | 0x0004
+            | 0x0008
+            | 0x0020
+            | 0x0040
+            | 0x0400
+            | SuperBlock::FEATURE_RO_COMPAT_ORPHAN_PRESENT;
 
         let metadata_csum =
             sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_METADATA_CSUM);
@@ -562,6 +568,15 @@ mod validation_tests {
         assert!(Ext4::validate_super_block(&sb).is_ok());
         sb.set_free_inodes_count(1);
         assert!(Ext4::validate_super_block(&sb).is_err());
+    }
+
+    #[test]
+    fn orphan_present_is_recognized_for_read_only_loading() {
+        let mut sb = SuperBlock::validation_fixture();
+        sb.set_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_ORPHAN_PRESENT, true);
+        sb.set_checksum();
+
+        assert!(Ext4::validate_super_block(&sb).is_ok());
     }
 
     #[test]

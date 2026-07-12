@@ -341,6 +341,15 @@ impl SuperBlock {
         sb.set_checksum();
         sb
     }
+
+    #[cfg(test)]
+    pub(crate) fn set_read_only_compatible_feature(&mut self, feature: u32, enabled: bool) {
+        if enabled {
+            self.features_read_only |= feature;
+        } else {
+            self.features_read_only &= !feature;
+        }
+    }
 }
 
 #[cfg(test)]

@@ -116,6 +116,11 @@ impl MemoryManagementArch for X86_64MMArch {
     const ENTRY_FLAG_HUGE_PAGE: usize = 1 << 7;
     const ENTRY_FLAG_GLOBAL: usize = 1 << 8;
 
+    #[inline(always)]
+    fn entry_is_leaf(level: usize, flags: usize) -> bool {
+        level == 0 || flags & Self::ENTRY_FLAG_HUGE_PAGE != 0
+    }
+
     /// 物理地址与虚拟地址的偏移量
     /// 0xffff_8000_0000_0000
     const PHYS_OFFSET: usize = Self::PAGE_NEGATIVE_MASK + (Self::PAGE_ADDRESS_SIZE >> 1);

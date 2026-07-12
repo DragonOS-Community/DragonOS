@@ -57,6 +57,11 @@ impl MemoryManagementArch for LoongArch64MMArch {
 
     const ENTRY_FLAG_GLOBAL: usize = 0;
 
+    #[inline(always)]
+    fn entry_is_leaf(level: usize, _flags: usize) -> bool {
+        level == 0
+    }
+
     const PHYS_OFFSET: usize = 0x9000_0000_0000_0000;
 
     const KERNEL_LINK_OFFSET: usize = 0;

@@ -149,6 +149,12 @@ impl MemoryManagementArch for RiscV64MMArch {
 
     const ENTRY_FLAG_HUGE_PAGE: usize = Self::ENTRY_FLAG_PRESENT | Self::ENTRY_FLAG_READWRITE;
 
+    #[inline(always)]
+    fn entry_is_leaf(_level: usize, flags: usize) -> bool {
+        flags & (Self::ENTRY_FLAG_READONLY | Self::ENTRY_FLAG_WRITEABLE | Self::ENTRY_FLAG_EXEC)
+            != 0
+    }
+
     #[inline(never)]
     unsafe fn init() {
         riscv_mm_init().expect("init kernel memory management architecture failed");

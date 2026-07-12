@@ -1566,11 +1566,6 @@ impl<Arch: MemoryManagementArch> EntryFlags<Arch> {
         return self.update_flags(Arch::ENTRY_FLAG_HUGE_PAGE, value);
     }
 
-    #[inline(always)]
-    pub fn has_huge_page(&self) -> bool {
-        self.has_flag(Arch::ENTRY_FLAG_HUGE_PAGE)
-    }
-
     /// MMIO内存的页表项标志
     #[inline(always)]
     pub fn mmio_flags() -> Self {
@@ -1814,7 +1809,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
             let index = table.index_of(virt)?;
             let entry = table.entry(index)?;
             if entry.present() {
-                if entry.flags().has_huge_page() {
+                if Arch::entry_is_leaf(table.level(), entry.flags().data()) {
                     return None;
                 }
                 table = table.next_level_table(index)?;
@@ -1879,7 +1874,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
             let Some(entry) = table.entry(index) else {
                 return false;
             };
-            if !entry.present() || entry.flags().has_huge_page() {
+            if !entry.present() || Arch::entry_is_leaf(table.level(), entry.flags().data()) {
                 return false;
             }
             let next = (address & !(top_level_size - 1)).saturating_add(top_level_size);
@@ -1902,14 +1897,14 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         while table.level() > level {
             let index = table.index_of(virt)?;
             let entry = table.entry(index)?;
-            if !entry.present() || entry.flags().has_huge_page() {
+            if !entry.present() || Arch::entry_is_leaf(table.level(), entry.flags().data()) {
                 return None;
             }
             table = table.next_level_table(index)?;
         }
         let index = table.index_of(virt)?;
         let entry = table.entry(index)?;
-        if !entry.present() || (level != 0) != entry.flags().has_huge_page() {
+        if !entry.present() || !Arch::entry_is_leaf(level, entry.flags().data()) {
             return None;
         }
         table.set_entry(index, PageEntry::from_usize(0))?;
@@ -1925,6 +1920,9 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
                 continue;
             };
             if !entry.present() || entry.address().ok() != Some(owned.child_phys) {
+                continue;
+            }
+            if Arch::entry_is_leaf(owned.parent_level, entry.flags().data()) {
                 continue;
             }
             let child = PageTable::<Arch>::new(

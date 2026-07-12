@@ -525,6 +525,11 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     /// 当该位为1时，代表该页表项是全局的
     const ENTRY_FLAG_GLOBAL: usize;
 
+    /// Return whether a present entry at `level` is a leaf mapping rather than a pointer to the
+    /// next-level table. Architectures such as RISC-V encode this through permission bits instead
+    /// of a dedicated huge-page bit.
+    fn entry_is_leaf(level: usize, flags: usize) -> bool;
+
     /// 虚拟地址与物理地址的偏移量
     const PHYS_OFFSET: usize;
 

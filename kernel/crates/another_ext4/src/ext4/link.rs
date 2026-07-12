@@ -2,6 +2,13 @@ use super::Ext4;
 use crate::ext4_defs::*;
 use crate::prelude::*;
 
+/// Whether removing one published namespace entry makes the inode an orphan.
+/// Directories cannot have hard-link aliases: once rmdir/rename has verified
+/// that the directory is empty, Linux clears even an unexpectedly high nlink.
+pub(super) fn namespace_removal_is_final(is_dir: bool, link_count: u16) -> bool {
+    is_dir || link_count <= 1
+}
+
 impl Ext4 {
     /// Link a child inode to a parent directory.
     pub(super) fn link_inode(
@@ -76,7 +83,10 @@ impl Ext4 {
         name: &str,
     ) -> Result<Option<InodeReclaimHandle>> {
         let child_link_cnt = child.inode.link_count();
-        let final_link = (child.inode.is_dir() && child_link_cnt <= 2) || child_link_cnt <= 1;
+        // Linux clears an empty directory's link count unconditionally after
+        // removing its sole parent entry.  A stale/high directory nlink is a
+        // corruption warning, not evidence of another namespace alias.
+        let final_link = namespace_removal_is_final(child.inode.is_dir(), child_link_cnt);
 
         if final_link {
             // Linux journals deletion of the directory entry, the zero link
@@ -124,5 +134,18 @@ impl Ext4 {
             return Err(error);
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::namespace_removal_is_final;
+
+    #[test]
+    fn empty_directory_removal_is_final_despite_stale_high_nlink() {
+        assert!(namespace_removal_is_final(true, 7));
+        assert!(namespace_removal_is_final(true, u16::MAX));
+        assert!(namespace_removal_is_final(false, 1));
+        assert!(!namespace_removal_is_final(false, 2));
     }
 }

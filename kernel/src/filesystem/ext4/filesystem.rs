@@ -87,6 +87,11 @@ pub struct Ext4FileSystem {
     /// Fail-stop allocation after an indeterminate physical reclaim.
     lifecycle_error: Mutex<Option<SystemError>>,
 
+    /// Own capabilities whose canonical handoff cannot be reconstructed after
+    /// an impossible namespace outcome. A fail-stopped mount keeps them alive;
+    /// mount recovery consumes the durable orphan chain after teardown.
+    pub(super) quarantined_reclaims: SpinLock<Vec<another_ext4::InodeReclaimHandle>>,
+
     eviction_queue: SpinLock<Ext4EvictionQueueState>,
     eviction_wait: WaitQueue,
 
@@ -278,6 +283,7 @@ impl Ext4FileSystem {
 
     pub(super) fn fail_stop_lifecycle(&self) {
         *self.lifecycle_error.lock() = Some(SystemError::EIO);
+        self.fs.fail_stop_mutations();
     }
 
     pub(super) fn get_or_create_inode(
@@ -795,6 +801,7 @@ impl Ext4FileSystem {
             inode_table: Mutex::new(BTreeMap::new()),
             inode_reuse_barrier: RwSem::new(()),
             lifecycle_error: Mutex::new(None),
+            quarantined_reclaims: SpinLock::new(Vec::new()),
             eviction_queue: SpinLock::new(Ext4EvictionQueueState::default()),
             eviction_wait: WaitQueue::default(),
             _mount_options: mount_options,

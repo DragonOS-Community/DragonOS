@@ -899,8 +899,12 @@ impl Ext4 {
                 }
 
                 let existing_link_cnt = existing_inode.inode.link_count();
+                // An empty replaced directory loses its only parent entry and
+                // Linux clear_nlink()s it even when an old/corrupt on-disk
+                // count is unexpectedly greater than two.  Regular files can
+                // still have independent hard links.
                 let final_target =
-                    existing_link_cnt <= 1 || (existing_is_dir && existing_link_cnt <= 2);
+                    super::link::namespace_removal_is_final(existing_is_dir, existing_link_cnt);
 
                 // Upper bound of distinct home blocks in the replace set:
                 // destination dirent + source dirent + optional child "..";

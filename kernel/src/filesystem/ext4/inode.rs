@@ -621,36 +621,14 @@ impl IndexNode for LockedExt4Inode {
         )?;
         let target_lifecycle = target.lifecycle().clone();
         let _link_mutation = target_lifecycle.lock_link_mutation();
-        let target_attr = ext4.getattr(target_num)?;
-
-        // Removing a non-final hard link must not enter the eviction lifecycle: the
-        // canonical inode and its shared page cache remain live for the other aliases.
-        if target_attr.links > 1 {
-            let _target_operation = target.begin_operation()?;
-            if ext4.lookup(inode_num, name)? != target_num {
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-            }
-            if let Some(handle) = Self::retry_metadata_contention(|| ext4.unlink(inode_num, name))?
-            {
-                fs.fs
-                    .reclaim_inode(handle)
-                    .map_err(|failure| SystemError::from(failure.into_parts().0))?;
-            }
-            let _ = guard.children.remove(&DName::from(name));
-            return Ok(());
-        }
-
+        let _target_operation = target.begin_operation()?;
         match ext4.lookup(inode_num, name) {
             Ok(current) if current == target_num => {}
             Ok(_) => return Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
             Err(error) => return Err(error.into()),
         }
-        let handle = match Self::retry_metadata_contention(|| ext4.unlink(inode_num, name)) {
-            Ok(Some(handle)) => handle,
-            Ok(None) => return Err(SystemError::EIO),
-            Err(error) => return Err(error),
-        };
-        target.defer_reclaim(handle)?;
+        let reclaim = Self::retry_metadata_contention(|| ext4.unlink(inode_num, name))?;
+        target.handoff_namespace_reclaim(reclaim)?;
         // 清理 children 缓存
         let _ = guard.children.remove(&DName::from(name));
         Ok(())
@@ -918,12 +896,8 @@ impl IndexNode for LockedExt4Inode {
             Ok(_) => return Err(SystemError::ENOTEMPTY),
             Err(error) => return Err(error.into()),
         }
-        let handle = match Self::retry_metadata_contention(|| concret_fs.rmdir(inode_num, name)) {
-            Ok(Some(handle)) => handle,
-            Ok(None) => return Err(SystemError::EIO),
-            Err(error) => return Err(error),
-        };
-        target.defer_reclaim(handle)?;
+        let reclaim = Self::retry_metadata_contention(|| concret_fs.rmdir(inode_num, name))?;
+        target.handoff_namespace_reclaim(reclaim)?;
         // 清理 children 缓存
         let _ = guard.children.remove(&DName::from(name));
 
@@ -1212,31 +1186,6 @@ impl IndexNode for LockedExt4Inode {
 
         let mut resulting_whiteout = None;
         if flags.contains(RenameFlags::WHITEOUT) {
-            // Prepare and drain the replacement target before changing the source
-            // namespace. No fallible target preparation may occur after exchange.
-            let mut will_free = false;
-            if let (Some(_), Some(dst_inode_num)) = (&dst_inode, dst_inode_num) {
-                let attr = ext4.getattr(dst_inode_num)?;
-                will_free = if attr.ftype == FileType::Directory {
-                    attr.links <= 2
-                } else {
-                    attr.links <= 1
-                };
-                if will_free {
-                    if ext4.lookup(target_inode_num, new_name).ok() != Some(dst_inode_num) {
-                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                    }
-                    let fresh_attr = ext4.getattr(dst_inode_num)?;
-                    if fresh_attr.ftype == FileType::Directory {
-                        match ext4.listdir(dst_inode_num) {
-                            Ok(entries) if entries.len() <= 2 => {}
-                            Ok(_) => return Err(SystemError::ENOTEMPTY),
-                            Err(error) => return Err(error.into()),
-                        }
-                    }
-                }
-            }
-
             let mut temp_name = String::new();
             let mut whiteout_inode = None;
             let source_parent = self
@@ -1331,12 +1280,13 @@ impl IndexNode for LockedExt4Inode {
                     return Err(rename_error);
                 }
             };
-            if will_free {
-                let handle = rename_handle.ok_or(SystemError::EIO)?;
-                dst_inode
-                    .as_ref()
-                    .ok_or(SystemError::EIO)?
-                    .defer_reclaim(handle)?;
+            if let Some(dst_inode) = &dst_inode {
+                dst_inode.handoff_namespace_reclaim(rename_handle)?;
+            } else if let Some(handle) = rename_handle {
+                // The destination was absent while both namespace locks were
+                // held, so the backend must not report a replaced lifetime.
+                // If it does, retain that orphan capability and fail-stop.
+                return Self::quarantine_unexpected_rename_reclaim(&ext4_fs, handle);
             }
             if let Some(whiteout) = &whiteout_inode {
                 whiteout.inner.lock().dname = old_dname.clone();
@@ -1344,42 +1294,18 @@ impl IndexNode for LockedExt4Inode {
             resulting_whiteout = whiteout_inode;
         } else {
             if let Some(dst_inode) = &dst_inode {
-                let attr = ext4.getattr(dst_inode_num.unwrap())?;
-                let will_free = if attr.ftype == FileType::Directory {
-                    attr.links <= 2
-                } else {
-                    attr.links <= 1
-                };
-                if !will_free {
-                    let _ = Self::retry_metadata_contention(|| {
-                        ext4.rename(src_inode_num, old_name, target_inode_num, new_name)
-                    })?;
-                } else {
-                    if ext4.lookup(target_inode_num, new_name).ok() != dst_inode_num {
-                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                    }
-                    let fresh_attr = ext4.getattr(dst_inode_num.unwrap())?;
-                    if fresh_attr.ftype == FileType::Directory {
-                        match ext4.listdir(dst_inode_num.unwrap()) {
-                            Ok(entries) if entries.len() <= 2 => {}
-                            Ok(_) => return Err(SystemError::ENOTEMPTY),
-                            Err(error) => return Err(error.into()),
-                        }
-                    }
-                    let handle = match Self::retry_metadata_contention(|| {
-                        ext4.rename(src_inode_num, old_name, target_inode_num, new_name)
-                    }) {
-                        Ok(Some(handle)) => handle,
-                        Ok(None) => return Err(SystemError::EIO),
-                        Err(err) => return Err(err),
-                    };
-                    dst_inode.defer_reclaim(handle)?;
-                }
-            } else {
-                // ext4 library now correctly handles atomic replace
-                let _ = Self::retry_metadata_contention(|| {
+                let reclaim = Self::retry_metadata_contention(|| {
                     ext4.rename(src_inode_num, old_name, target_inode_num, new_name)
                 })?;
+                dst_inode.handoff_namespace_reclaim(reclaim)?;
+            } else {
+                // ext4 library now correctly handles atomic replace
+                let reclaim = Self::retry_metadata_contention(|| {
+                    ext4.rename(src_inode_num, old_name, target_inode_num, new_name)
+                })?;
+                if let Some(handle) = reclaim {
+                    return Self::quarantine_unexpected_rename_reclaim(&ext4_fs, handle);
+                }
             }
         }
 
@@ -1400,6 +1326,18 @@ impl IndexNode for LockedExt4Inode {
 }
 
 impl LockedExt4Inode {
+    fn quarantine_unexpected_rename_reclaim(
+        fs: &Arc<Ext4FileSystem>,
+        handle: another_ext4::InodeReclaimHandle,
+    ) -> Result<(), SystemError> {
+        fs.fail_stop_lifecycle();
+        // Never risk a second pending capability on a guessed canonical inode.
+        // The fail-stopped mount owns this handle until durable orphan recovery
+        // can complete after teardown.
+        fs.quarantined_reclaims.lock().push(handle);
+        Err(SystemError::EIO)
+    }
+
     fn release_clean_metadata_queue_owner(&self, fs: &Arc<Ext4FileSystem>) {
         if let Some(inode) = self.retention_callback_self.upgrade() {
             fs.release_clean_queued_inode(&inode);
@@ -1727,6 +1665,30 @@ impl Ext4Inode {
 }
 
 impl LockedExt4Inode {
+    /// Transfer the authoritative result of a namespace transaction to this
+    /// canonical inode lifetime. `None` means another hard link remains;
+    /// `Some` is the unique capability for the zero-link orphan.
+    fn handoff_namespace_reclaim(
+        self: &Arc<Self>,
+        reclaim: Option<another_ext4::InodeReclaimHandle>,
+    ) -> Result<(), SystemError> {
+        let Some(handle) = reclaim else {
+            return Ok(());
+        };
+        let (fs, inode_num) = {
+            let inner = self.inner.lock();
+            (inner.concret_fs(), inner.inner_inode_num)
+        };
+        if handle.inode_id() != inode_num {
+            // Never attach a capability to the wrong canonical lifetime. The
+            // fail-stopped mount retains it for durable orphan recovery.
+            fs.fail_stop_lifecycle();
+            fs.quarantined_reclaims.lock().push(handle);
+            return Err(SystemError::EIO);
+        }
+        self.defer_reclaim(handle)
+    }
+
     /// Publish the one-shot capability produced by the final unlink. Physical
     /// reclaim waits until every semantic VFS owner has released this inode.
     pub(super) fn defer_reclaim(

@@ -8,7 +8,7 @@
 //!
 //! We only implement the seperate data block storage of extended attributes.
 
-use super::{AsBytes, Block};
+use super::{crc::crc32, AsBytes, Block};
 use crate::constants::*;
 use crate::prelude::*;
 use core::cmp::Ordering;
@@ -34,7 +34,7 @@ pub struct XattrHeader {
 unsafe impl AsBytes for XattrHeader {}
 
 impl XattrHeader {
-    const XATTR_MAGIC: u32 = 0xEA020000;
+    pub const XATTR_MAGIC: u32 = 0xEA020000;
 
     pub fn new() -> Self {
         XattrHeader {
@@ -46,6 +46,128 @@ impl XattrHeader {
             reserved: [0; 3],
         }
     }
+
+    pub fn magic(&self) -> u32 {
+        self.magic
+    }
+
+    pub fn refcount(&self) -> u32 {
+        self.refcount
+    }
+
+    pub fn set_refcount(&mut self, refcount: u32) {
+        self.refcount = refcount;
+    }
+
+    pub fn blocks(&self) -> u32 {
+        self.blocks
+    }
+
+    pub fn checksum(&self) -> u32 {
+        self.checksum
+    }
+
+    pub fn set_checksum(&mut self, checksum: u32) {
+        self.checksum = checksum;
+    }
+}
+
+/// Compute an ext4 external-xattr block checksum using the Linux 6.6 layout.
+/// `seed` is the filesystem metadata checksum seed (normally CRC32C(uuid)).
+pub fn xattr_block_checksum(seed: u32, block_id: PBlockId, block: &[u8]) -> Option<u32> {
+    if block.len() != BLOCK_SIZE {
+        return None;
+    }
+    let checksum_offset = core::mem::offset_of!(XattrHeader, checksum);
+    let mut checksum = crc32(seed, &block_id.to_le_bytes());
+    checksum = crc32(checksum, &block[..checksum_offset]);
+    checksum = crc32(checksum, &[0; core::mem::size_of::<u32>()]);
+    Some(crc32(
+        checksum,
+        &block[checksum_offset + core::mem::size_of::<u32>()..],
+    ))
+}
+
+/// Validate the fixed header and entry table needed before releasing a block.
+/// Returns whether any value is stored in an EA inode, which this crate cannot
+/// reclaim yet.
+pub fn validate_xattr_block_for_release(block: &[u8]) -> Option<(XattrHeader, bool)> {
+    if block.len() != BLOCK_SIZE || block.len() < size_of::<XattrHeader>() {
+        return None;
+    }
+    let header = XattrHeader::from_bytes(&block[..size_of::<XattrHeader>()]);
+    if header.magic() != XattrHeader::XATTR_MAGIC || header.refcount() == 0 || header.blocks() != 1
+    {
+        return None;
+    }
+
+    let mut entry_start = size_of::<XattrHeader>();
+    let mut has_ea_inode = false;
+    let mut inline_values = Vec::new();
+    loop {
+        let terminator_end = entry_start.checked_add(size_of::<u32>())?;
+        if terminator_end > BLOCK_SIZE {
+            return None;
+        }
+        if block[entry_start..terminator_end] == [0; 4] {
+            break;
+        }
+        let fixed_end = entry_start.checked_add(size_of::<FakeXattrEntry>())?;
+        if fixed_end > BLOCK_SIZE {
+            return None;
+        }
+        let entry = FakeXattrEntry::from_bytes(
+            &block[entry_start..entry_start + size_of::<FakeXattrEntry>()],
+        );
+        let name_end = fixed_end.checked_add(entry.name_len as usize)?;
+        if name_end > BLOCK_SIZE || block[fixed_end..name_end].contains(&0) {
+            return None;
+        }
+        let entry_size = size_of::<FakeXattrEntry>()
+            .checked_add(entry.name_len as usize)?
+            .checked_add(3)?
+            & !3;
+        let next_entry = entry_start.checked_add(entry_size)?;
+        // `next_entry == BLOCK_SIZE` cannot leave the mandatory four-byte
+        // terminator. This mirrors Linux's `EXT4_XATTR_NEXT(e) >= end` check.
+        if next_entry
+            .checked_add(size_of::<u32>())
+            .is_none_or(|end| end > BLOCK_SIZE)
+        {
+            return None;
+        }
+        has_ea_inode |= entry.value_inum != 0;
+        if entry.value_inum != 0 {
+            if entry.value_size == 0 {
+                return None;
+            }
+        } else if entry.value_size != 0 {
+            let value_start = entry.value_offset as usize;
+            let value_size = entry.value_size as usize;
+            let padded_size = value_size.checked_add(3)? & !3;
+            let value_end = value_start.checked_add(padded_size)?;
+            if value_start & 3 != 0 || value_end > BLOCK_SIZE {
+                return None;
+            }
+            inline_values.push((value_start, value_end));
+        }
+        entry_start = next_entry;
+    }
+
+    let names_end = entry_start.checked_add(size_of::<u32>())?;
+    for &(start, end) in &inline_values {
+        if start < names_end || end > BLOCK_SIZE {
+            return None;
+        }
+    }
+    inline_values.sort_unstable_by_key(|range| range.0);
+    if inline_values
+        .windows(2)
+        .any(|ranges| ranges[1].0 < ranges[0].1)
+    {
+        return None;
+    }
+    Some((header, has_ea_inode))
 }
 
 /// Following the struct `XattrHeader` is an array of `XattrEntry`.
@@ -226,6 +348,26 @@ impl XattrBlock {
     pub fn init(&mut self) {
         let header = XattrHeader::new();
         self.0.write_offset_as(0, &header);
+    }
+
+    /// Verify the Linux ext4 external-xattr block checksum.
+    pub fn verify_checksum(&self, seed: u32, block_id: PBlockId) -> bool {
+        let header: XattrHeader = self.0.read_offset_as(0);
+        xattr_block_checksum(seed, block_id, &*self.0.data)
+            .is_some_and(|checksum| checksum == header.checksum())
+    }
+
+    /// Recompute the Linux ext4 external-xattr block checksum after mutation.
+    pub fn update_checksum(&mut self, seed: u32, block_id: PBlockId) -> bool {
+        let mut header: XattrHeader = self.0.read_offset_as(0);
+        header.set_checksum(0);
+        self.0.write_offset_as(0, &header);
+        let Some(checksum) = xattr_block_checksum(seed, block_id, &*self.0.data) else {
+            return false;
+        };
+        header.set_checksum(checksum);
+        self.0.write_offset_as(0, &header);
+        true
     }
 
     /// Get a xattr by name, return the value.
@@ -412,5 +554,140 @@ impl XattrBlock {
         }
 
         true
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+
+    fn add_inline_entry(
+        bytes: &mut [u8; BLOCK_SIZE],
+        start: usize,
+        name: &[u8],
+        value_offset: u16,
+        value_size: u32,
+    ) -> usize {
+        let entry = FakeXattrEntry {
+            name_len: name.len() as u8,
+            name_index: 1,
+            value_offset,
+            value_inum: 0,
+            value_size,
+            hash: 0,
+        };
+        bytes[start..start + size_of::<FakeXattrEntry>()].copy_from_slice(entry.to_bytes());
+        let name_start = start + size_of::<FakeXattrEntry>();
+        bytes[name_start..name_start + name.len()].copy_from_slice(name);
+        start + (size_of::<FakeXattrEntry>() + name.len()).div_ceil(4) * 4
+    }
+
+    fn checksummed_block(block_id: PBlockId, refcount: u32) -> ([u8; BLOCK_SIZE], u32) {
+        let mut bytes = [0; BLOCK_SIZE];
+        let mut header = XattrHeader::new();
+        header.set_refcount(refcount);
+        bytes[..size_of::<XattrHeader>()].copy_from_slice(header.to_bytes());
+        let seed = 0x1234_5678;
+        let checksum = xattr_block_checksum(seed, block_id, &bytes).unwrap();
+        header.set_checksum(checksum);
+        bytes[..size_of::<XattrHeader>()].copy_from_slice(header.to_bytes());
+        (bytes, seed)
+    }
+
+    #[test]
+    fn release_validation_checks_fixed_header_fields() {
+        let (mut bytes, _) = checksummed_block(17, 2);
+        let (header, has_ea_inode) = validate_xattr_block_for_release(&bytes).unwrap();
+        assert_eq!(header.refcount(), 2);
+        assert!(!has_ea_inode);
+
+        bytes[..4].copy_from_slice(&0u32.to_le_bytes());
+        assert!(validate_xattr_block_for_release(&bytes).is_none());
+        let (mut bytes, _) = checksummed_block(17, 1);
+        bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
+        assert!(validate_xattr_block_for_release(&bytes).is_none());
+    }
+
+    #[test]
+    fn checksum_binds_block_number_and_detects_damage() {
+        let (mut bytes, seed) = checksummed_block(17, 2);
+        let header = XattrHeader::from_bytes(&bytes[..size_of::<XattrHeader>()]);
+        assert_eq!(
+            xattr_block_checksum(seed, 17, &bytes).unwrap(),
+            header.checksum()
+        );
+        assert_ne!(
+            xattr_block_checksum(seed, 18, &bytes).unwrap(),
+            header.checksum()
+        );
+        bytes[BLOCK_SIZE - 1] ^= 1;
+        assert_ne!(
+            xattr_block_checksum(seed, 17, &bytes).unwrap(),
+            header.checksum()
+        );
+    }
+
+    #[test]
+    fn xattr_block_mutation_recomputes_linux_checksum() {
+        let seed = 0x1234_5678;
+        let block_id = 17;
+        let mut block = XattrBlock::new(Block::new(block_id, Box::new([0; BLOCK_SIZE])));
+        block.init();
+        assert!(block.insert("user.test", b"value"));
+        assert!(block.update_checksum(seed, block_id));
+        assert!(block.verify_checksum(seed, block_id));
+
+        assert!(block.remove("user.test"));
+        assert!(!block.verify_checksum(seed, block_id));
+        assert!(block.update_checksum(seed, block_id));
+        assert!(block.verify_checksum(seed, block_id));
+        assert!(!block.verify_checksum(seed, block_id + 1));
+    }
+
+    #[test]
+    fn release_validation_reports_ea_inode_entries() {
+        let (mut bytes, seed) = checksummed_block(17, 1);
+        bytes[size_of::<XattrHeader>()] = 1; // name_len
+        bytes[size_of::<XattrHeader>() + 4..size_of::<XattrHeader>() + 8]
+            .copy_from_slice(&42u32.to_le_bytes()); // value_inum
+        bytes[size_of::<XattrHeader>() + 8..size_of::<XattrHeader>() + 12]
+            .copy_from_slice(&1u32.to_le_bytes()); // value_size
+        bytes[size_of::<XattrHeader>() + size_of::<FakeXattrEntry>()] = b'x';
+        let checksum = xattr_block_checksum(seed, 17, &bytes).unwrap();
+        bytes[core::mem::offset_of!(XattrHeader, checksum)
+            ..core::mem::offset_of!(XattrHeader, checksum) + 4]
+            .copy_from_slice(&checksum.to_le_bytes());
+        assert_eq!(validate_xattr_block_for_release(&bytes).unwrap().1, true);
+    }
+
+    #[test]
+    fn release_validation_rejects_malformed_layout_without_checksum_help() {
+        let (template, _) = checksummed_block(17, 1);
+        let first = size_of::<XattrHeader>();
+
+        let mut bytes = template;
+        let next = add_inline_entry(&mut bytes, first, b"a\0b", 4088, 4);
+        bytes[next..next + 4].fill(0);
+        assert!(validate_xattr_block_for_release(&bytes).is_none());
+
+        let mut bytes = template;
+        let next = add_inline_entry(&mut bytes, first, b"a", 33, 4);
+        bytes[next..next + 4].fill(0);
+        assert!(validate_xattr_block_for_release(&bytes).is_none());
+
+        let mut bytes = template;
+        let next = add_inline_entry(&mut bytes, first, b"a", first as u16, 4);
+        bytes[next..next + 4].fill(0);
+        assert!(validate_xattr_block_for_release(&bytes).is_none());
+
+        let mut bytes = template;
+        let second = add_inline_entry(&mut bytes, first, b"a", 4088, 8);
+        let end = add_inline_entry(&mut bytes, second, b"b", 4092, 4);
+        bytes[end..end + 4].fill(0);
+        assert!(validate_xattr_block_for_release(&bytes).is_none());
+
+        let mut bytes = template;
+        bytes[first..].fill(0xff);
+        assert!(validate_xattr_block_for_release(&bytes).is_none());
     }
 }

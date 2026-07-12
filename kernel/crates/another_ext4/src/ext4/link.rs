@@ -9,10 +9,38 @@ impl Ext4 {
         parent: &mut InodeRef,
         child: &mut InodeRef,
         name: &str,
+        allow_orphan_relink: bool,
     ) -> Result<()> {
         self.ensure_mutable()?;
         let child_link_count = child.inode.link_count();
         let parent_link_count = parent.inode.link_count();
+        if child_link_count == 0 && allow_orphan_relink {
+            if !self.legacy_orphan_contains(child.id)? {
+                return Err(Ext4Error::new(ErrCode::EINVAL));
+            }
+            if child.inode.is_dir() {
+                return Err(Ext4Error::new(ErrCode::EPERM));
+            }
+            if !self.dir_has_insert_space(parent, child, name)? {
+                self.prepare_empty_dir_slot(parent)?;
+            }
+            // A zero-link inode is discoverable through the durable orphan
+            // chain.  Linux removes it from that chain in the same handle that
+            // publishes the new name and link count; otherwise a crash could
+            // reclaim a newly reachable inode.
+            let mut transaction = self.transaction_start(3)?;
+            let mut sb = self.read_super_block_cached();
+            self.transaction_orphan_del(&mut transaction, child, &mut sb)?;
+            self.transaction_dir_add_existing(&mut transaction, parent, child, name)?;
+            child.inode.set_link_count(1);
+            child.inode.set_next_orphan(0);
+            self.transaction_stage_inode_with_csum(&mut transaction, child)?;
+            if let Err(error) = transaction.commit(self.block_device.as_ref(), self) {
+                self.poison(ErrCode::EIO);
+                return Err(error.error);
+            }
+            return Ok(());
+        }
         if child.inode.is_dir() {
             // Prepare all inode metadata before publishing parent/name.  A
             // failure before the final dir_add_entry cannot leave a namespace
@@ -47,10 +75,42 @@ impl Ext4 {
         child: &mut InodeRef,
         name: &str,
     ) -> Result<Option<InodeReclaimHandle>> {
-        // Remove entry from parent directory
-        self.dir_remove_entry(parent, name)?;
-
         let child_link_cnt = child.inode.link_count();
+        let final_link = (child.inode.is_dir() && child_link_cnt <= 2) || child_link_cnt <= 1;
+
+        if final_link {
+            // Linux journals deletion of the directory entry, the zero link
+            // count, and insertion into the orphan list in one handle.  Keep
+            // the same crash invariant here: after recovery the inode is
+            // either still named, or unreachable and discoverable from the
+            // on-disk orphan head.
+            let mut transaction =
+                self.transaction_start(if child.inode.is_dir() { 4 } else { 3 })?;
+            self.transaction_dir_remove_entry(&mut transaction, parent, name)?;
+
+            if child.inode.is_dir() {
+                parent.inode.set_link_count(parent.inode.link_count() - 1);
+                self.transaction_stage_inode_with_csum(&mut transaction, parent)?;
+            }
+            child.inode.set_link_count(0);
+            let mut sb = self.read_super_block_cached();
+            self.transaction_orphan_add(&mut transaction, child, &mut sb)?;
+
+            if let Err(error) = transaction.commit(self.block_device.as_ref(), self) {
+                // A commit-path failure may make journal state uncertain.  Do
+                // not let legacy direct writers continue after this boundary.
+                self.poison(ErrCode::EIO);
+                return Err(error.error);
+            }
+            return Ok(Some(InodeReclaimHandle::new(
+                child.id,
+                child.inode.generation(),
+            )));
+        }
+
+        // Non-final hard-link removal does not create an orphan.  Preserve the
+        // established path until all namespace writers move under JBD2.
+        self.dir_remove_entry(parent, name)?;
         if child.inode.is_dir() {
             parent.inode.set_link_count(parent.inode.link_count() - 1);
             if let Err(error) = self.write_inode_with_csum(parent) {
@@ -58,14 +118,11 @@ impl Ext4 {
                 return Err(error);
             }
         }
-        let final_link = (child.inode.is_dir() && child_link_cnt <= 2) || child_link_cnt <= 1;
-        child
-            .inode
-            .set_link_count(if final_link { 0 } else { child_link_cnt - 1 });
+        child.inode.set_link_count(child_link_cnt - 1);
         if let Err(error) = self.write_inode_with_csum(child) {
             self.poison(ErrCode::EIO);
             return Err(error);
         }
-        Ok(final_link.then(|| InodeReclaimHandle::new(child.id, child.inode.generation())))
+        Ok(None)
     }
 }

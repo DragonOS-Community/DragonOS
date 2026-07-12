@@ -511,7 +511,7 @@ fn do_new_mount(
 ) -> Result<Arc<MountFS>, SystemError> {
     let fs_type_str = filesystemtype.ok_or(SystemError::EINVAL)?;
     let source = source.ok_or(SystemError::EINVAL)?;
-    let fs = produce_fs(&fs_type_str, data.as_deref(), &source).inspect_err(|e| {
+    let fs = produce_fs(&fs_type_str, data.as_deref(), &source, mount_flags).inspect_err(|e| {
         log::warn!("Failed to produce filesystem: {:?}", e);
     })?;
 

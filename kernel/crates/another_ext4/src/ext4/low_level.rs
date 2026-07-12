@@ -40,6 +40,43 @@ impl SetAttr {
 }
 
 impl Ext4 {
+    fn xattr_checksum_seed(&self) -> Result<Option<u32>> {
+        let sb = self.read_super_block_cached();
+        if !sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_METADATA_CSUM) {
+            return Ok(None);
+        }
+        // A seeded-checksum filesystem must use s_checksum_seed rather than
+        // CRC32C(UUID). Writable preflight rejects it, and direct xattr paths
+        // must fail closed as well instead of writing a mismatched checksum.
+        const FEATURE_INCOMPAT_CSUM_SEED: u32 = 0x2000;
+        if sb.has_incompatible_feature(FEATURE_INCOMPAT_CSUM_SEED) {
+            return Err(Ext4Error::new(ErrCode::ENOTSUP));
+        }
+        Ok(Some(crate::ext4_defs::crc::crc32(CRC32_INIT, &sb.uuid())))
+    }
+
+    fn verify_xattr_block_checksum(&self, block_id: PBlockId, block: &XattrBlock) -> Result<()> {
+        if let Some(seed) = self.xattr_checksum_seed()? {
+            if !block.verify_checksum(seed, block_id) {
+                return Err(Ext4Error::new(ErrCode::EIO));
+            }
+        }
+        Ok(())
+    }
+
+    fn update_xattr_block_checksum(
+        &self,
+        block_id: PBlockId,
+        block: &mut XattrBlock,
+    ) -> Result<()> {
+        if let Some(seed) = self.xattr_checksum_seed()? {
+            if !block.update_checksum(seed, block_id) {
+                return Err(Ext4Error::new(ErrCode::EIO));
+            }
+        }
+        Ok(())
+    }
+
     fn read_extent_or_hole(
         &self,
         file: &InodeRef,
@@ -115,6 +152,7 @@ impl Ext4 {
     /// `EINVAL` if the inode is invalid (mode == 0).
     pub fn setattr(&self, id: InodeId, attr: SetAttr) -> Result<()> {
         self.ensure_mutable()?;
+        let _metadata_guard = self.lock_direct_metadata_mutation()?;
         let _mutation_guard = self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
         let mut inode = self.read_inode(id)?;
         if inode.inode.mode().bits() == 0 {
@@ -209,6 +247,8 @@ impl Ext4 {
         offset: usize,
         len: usize,
     ) -> Result<()> {
+        self.ensure_mutable()?;
+        let _metadata_guard = self.lock_direct_metadata_mutation()?;
         let _mutation_guard = self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
         let mut inode = self.read_inode(id)?;
         if inode.inode.mode().bits() == 0 {
@@ -231,6 +271,7 @@ impl Ext4 {
         _mtime: Option<u32>,
     ) -> Result<()> {
         self.ensure_mutable()?;
+        let _metadata_guard = self.lock_direct_metadata_mutation()?;
         let _mutation_guard = self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
         let mut inode = self.read_inode(id)?;
         if inode.inode.mode().bits() == 0 {
@@ -248,6 +289,7 @@ impl Ext4 {
         mtime: Option<u32>,
     ) -> Result<()> {
         self.ensure_mutable()?;
+        let _metadata_guard = self.lock_direct_metadata_mutation()?;
         let _mutation_guard = self.inode_mutation_locks[self.inode_mutation_lock_index(id)].lock();
         let mut inode = self.read_inode(id)?;
         if inode.inode.mode().bits() == 0 {
@@ -280,7 +322,7 @@ impl Ext4 {
         child: &mut InodeRef,
         name: &str,
     ) -> Result<()> {
-        if let Err(link_err) = self.link_inode(parent, child, name) {
+        if let Err(link_err) = self.link_inode(parent, child, name, false) {
             if let Err(cleanup_err) = self.free_inode(child) {
                 trace!(
                     "link failed for new inode {} (name {}), cleanup failed: {:?}; original link error: {:?}",
@@ -316,6 +358,7 @@ impl Ext4 {
     /// * `ENOSPC` - No space left on device
     pub fn create(&self, parent: InodeId, name: &str, mode: InodeMode) -> Result<InodeId> {
         self.ensure_mutable()?;
+        let _metadata_guard = self.lock_direct_metadata_mutation()?;
         let _namespace_guard = self.namespace_lock.lock();
         let _mutation_guards = self.lock_inode_mutations(&[parent]);
         let mut parent = self.read_inode(parent)?;
@@ -361,6 +404,7 @@ impl Ext4 {
         minor: u32,
     ) -> Result<InodeId> {
         self.ensure_mutable()?;
+        let _metadata_guard = self.lock_direct_metadata_mutation()?;
         let _namespace_guard = self.namespace_lock.lock();
         let _mutation_guards = self.lock_inode_mutations(&[parent]);
         let mut parent_ref = self.read_inode(parent)?;
@@ -520,6 +564,7 @@ impl Ext4 {
     /// * `ENOSPC` - no space left on device
     pub fn write(&self, file: InodeId, offset: usize, data: &[u8]) -> Result<usize> {
         self.ensure_mutable()?;
+        let _metadata_guard = self.lock_direct_metadata_mutation()?;
         let write_size = data.len();
         if write_size == 0 {
             return Ok(0);
@@ -578,6 +623,7 @@ impl Ext4 {
     /// operate on cloned `InodeRef` snapshots from the inode cache.
     pub fn write_data_only(&self, file: InodeId, offset: usize, data: &[u8]) -> Result<usize> {
         self.ensure_mutable()?;
+        let _metadata_guard = self.lock_direct_metadata_mutation()?;
         let write_size = data.len();
         let mut chunks = Vec::new();
         let _mutation_guard =
@@ -632,6 +678,10 @@ impl Ext4 {
     /// * `ENOSPC` - no space left on device
     pub fn link(&self, child: InodeId, parent: InodeId, name: &str) -> Result<()> {
         self.ensure_mutable()?;
+        // Relinking a zero-link inode must compose namespace publication with
+        // orphan removal in one journal transaction.  Use the exclusive
+        // metadata domain for both zero and nonzero link-count cases.
+        let _metadata_guard = self.lock_transactional_metadata_mutation()?;
         let _namespace_guard = self.namespace_lock.lock();
         let _mutation_guards = self.lock_inode_mutations(&[parent, child]);
         let mut parent = self.read_inode(parent)?;
@@ -644,7 +694,7 @@ impl Ext4 {
         if child.inode.is_dir() {
             return_error!(ErrCode::EISDIR, "Cannot link a directory");
         }
-        self.link_inode(&mut parent, &mut child, name)?;
+        self.link_inode(&mut parent, &mut child, name, true)?;
         Ok(())
     }
 
@@ -662,6 +712,7 @@ impl Ext4 {
     /// * `EISDIR` - `parent/name` is a directory
     pub fn unlink(&self, parent: InodeId, name: &str) -> Result<Option<InodeReclaimHandle>> {
         self.ensure_mutable()?;
+        let _metadata_guard = self.lock_transactional_metadata_mutation()?;
         let _namespace_guard = self.namespace_lock.lock();
         let mut parent_ref = self.read_inode(parent)?;
         // Can only unlink from a directory
@@ -774,6 +825,11 @@ impl Ext4 {
         new_name: &str,
     ) -> Result<Option<InodeReclaimHandle>> {
         self.ensure_mutable()?;
+        // Rename can remove the final name of an overwritten target. Keep the
+        // complete namespace transition in the exclusive domain so a follow-up
+        // transactional orphan/reclaim implementation cannot inherit a stale
+        // direct-writer snapshot window.
+        let _metadata_guard = self.lock_transactional_metadata_mutation()?;
         let _namespace_guard = self.namespace_lock.lock();
         let mut reclaim = None;
         // 1. 验证父目录
@@ -842,51 +898,66 @@ impl Ext4 {
                     }
                 }
 
-                // 4b-2. 原子替换：原地修改目标目录项，指向源 inode
-                // 这是原子操作的核心：目标目录项从未"消失"
+                let existing_link_cnt = existing_inode.inode.link_count();
+                let final_target =
+                    existing_link_cnt <= 1 || (existing_is_dir && existing_link_cnt <= 2);
+
+                // Upper bound of distinct home blocks in the replace set:
+                // destination dirent + source dirent + optional child "..";
+                // overwritten inode + each logically changed parent inode;
+                // and the superblock only for a final target.  The transaction
+                // map deduplicates entries which share a directory or inode-
+                // table block, so same-parent and same-block cases consume
+                // fewer credits without weakening the reservation bound.
+                let mut credits = 3; // two dirent blocks + overwritten inode
+                if child_is_dir && parent != new_parent {
+                    credits += 3; // child ".." + old parent + new parent
+                }
+                if existing_is_dir && !(child_is_dir && parent != new_parent) {
+                    credits += 1; // target parent (new parent already counted above)
+                }
+                if final_target {
+                    credits += 1; // superblock orphan head
+                }
+                let mut transaction = self.transaction_start(credits)?;
+
+                // Match Linux ext4_rename(): ext4_setent(new), delete(old),
+                // ext4_rename_dir_finish(), parent counts, target nlink, and
+                // ext4_orphan_add() all belong to this single handle.
                 {
                     let target_dir = new_parent_ref.as_mut().unwrap_or(&mut parent_ref);
-                    self.poison_on_error(self.dir_replace_entry(
+                    self.transaction_dir_replace_entry(
+                        &mut transaction,
                         target_dir,
                         new_name,
                         child_id,
                         child_file_type,
-                    ))?;
+                    )?;
 
-                    // 4b-3. 处理被替换目录的父目录 link count
-                    //
-                    // 被替换目录的 ".." 不主动删除（对齐 Linux ext4_rename）：
-                    // Linux 使用 clear_nlink(new.inode) 标记被替换目录待释放，
-                    // 从不触碰其内部的 ".." 条目。".." 随 free_inode 释放数据块自然消失。
-                    //
-                    // 父目录 link count 仍需递减：被替换目录的 ".." 引用逻辑上失效。
                     if existing_is_dir {
                         target_dir
                             .inode
                             .set_link_count(target_dir.inode.link_count() - 1);
-                        self.poison_on_error(self.write_inode_with_csum(target_dir))?;
+                        self.transaction_stage_inode_with_csum(&mut transaction, target_dir)?;
                     }
                 }
 
-                // 4b-4. 删除源目录项，避免 rename 覆盖后源路径仍可见
-                self.poison_on_error(self.dir_remove_entry(&parent_ref, name))?;
+                self.transaction_dir_remove_entry(&mut transaction, &parent_ref, name)?;
 
-                // 4b-5. 跨目录移动时，处理源目录的 ".." 指向
                 if child_is_dir && parent != new_parent {
-                    // 更新被移动目录的 ".." 指向新父目录
-                    self.poison_on_error(self.dir_replace_entry(
+                    self.transaction_dir_replace_entry(
+                        &mut transaction,
                         &child,
                         "..",
                         new_parent,
                         FileType::Directory,
-                    ))?;
+                    )?;
 
                     parent_ref
                         .inode
                         .set_link_count(parent_ref.inode.link_count() - 1);
-                    self.poison_on_error(self.write_inode_with_csum(&mut parent_ref))?;
+                    self.transaction_stage_inode_with_csum(&mut transaction, &mut parent_ref)?;
 
-                    // 注意：当 parent != new_parent 时，new_parent_ref 必定是 Some(...)
                     let new_parent_dir = new_parent_ref.as_mut().ok_or(format_error!(
                         ErrCode::EINVAL,
                         "rename: missing new parent reference for directory move"
@@ -894,28 +965,30 @@ impl Ext4 {
                     new_parent_dir
                         .inode
                         .set_link_count(new_parent_dir.inode.link_count() + 1);
-                    self.poison_on_error(self.write_inode_with_csum(new_parent_dir))?;
+                    self.transaction_stage_inode_with_csum(&mut transaction, new_parent_dir)?;
                 }
-                // 4b-6. The target link transition is the final fallible
-                // metadata step.  Once it reaches zero the returned capability
-                // cannot be lost behind later rename work.
-                let existing_link_cnt = existing_inode.inode.link_count();
-                if existing_link_cnt <= 1 || (existing_is_dir && existing_link_cnt <= 2) {
+
+                if final_target {
                     existing_inode.inode.set_link_count(0);
-                    if let Err(error) = self.write_inode_with_csum(&mut existing_inode) {
-                        self.poison(ErrCode::EIO);
-                        return Err(error);
-                    }
+                    let mut sb = self.read_super_block_cached();
+                    self.transaction_orphan_add(&mut transaction, &mut existing_inode, &mut sb)?;
+                } else {
+                    existing_inode.inode.set_link_count(existing_link_cnt - 1);
+                    self.transaction_stage_inode_with_csum(&mut transaction, &mut existing_inode)?;
+                }
+
+                if let Err(error) = transaction.commit(self.block_device.as_ref(), self) {
+                    // Once commit processing starts, failures can leave an
+                    // uncertain committed/checkpointed state.  Fail-stop every
+                    // subsequent metadata writer on this mount.
+                    self.poison(ErrCode::EIO);
+                    return Err(error.error);
+                }
+                if final_target {
                     reclaim = Some(InodeReclaimHandle::new(
                         existing_inode.id,
                         existing_inode.inode.generation(),
                     ));
-                } else {
-                    existing_inode.inode.set_link_count(existing_link_cnt - 1);
-                    if let Err(error) = self.write_inode_with_csum(&mut existing_inode) {
-                        self.poison(ErrCode::EIO);
-                        return Err(error);
-                    }
                 }
                 // 文件的 link count 不变（只是换了名字/位置）
             }
@@ -998,6 +1071,7 @@ impl Ext4 {
         new_name: &str,
     ) -> Result<()> {
         self.ensure_mutable()?;
+        let _metadata_guard = self.lock_direct_metadata_mutation()?;
         let _namespace_guard = self.namespace_lock.lock();
         // 1. 验证父目录
         let (mut parent_ref, mut new_parent_ref) = self.read_rename_dirs(parent, new_parent)?;
@@ -1115,6 +1189,7 @@ impl Ext4 {
     /// * `ENOSPC` - no space left on device
     pub fn mkdir(&self, parent: InodeId, name: &str, mode: InodeMode) -> Result<InodeId> {
         self.ensure_mutable()?;
+        let _metadata_guard = self.lock_direct_metadata_mutation()?;
         let _namespace_guard = self.namespace_lock.lock();
         let _mutation_guards = self.lock_inode_mutations(&[parent]);
         let mut parent = self.read_inode(parent)?;
@@ -1199,6 +1274,7 @@ impl Ext4 {
     /// * `ENOTEMPTY` - `child` is not empty
     pub fn rmdir(&self, parent: InodeId, name: &str) -> Result<Option<InodeReclaimHandle>> {
         self.ensure_mutable()?;
+        let _metadata_guard = self.lock_transactional_metadata_mutation()?;
         let _namespace_guard = self.namespace_lock.lock();
         let mut parent_ref = self.read_inode(parent)?;
         // Can only remove a directory in a directory
@@ -1249,6 +1325,7 @@ impl Ext4 {
             return_error!(ErrCode::ENODATA, "Xattr {} does not exist", name);
         }
         let xattr_block = XattrBlock::new(self.read_block(xattr_block_id)?);
+        self.verify_xattr_block_checksum(xattr_block_id, &xattr_block)?;
         match xattr_block.get(name) {
             Some(value) => Ok(value.to_owned()),
             None => Err(format_error!(
@@ -1289,6 +1366,7 @@ impl Ext4 {
         replace: bool,
     ) -> Result<()> {
         self.ensure_mutable()?;
+        let _metadata_guard = self.lock_direct_metadata_mutation()?;
         let _mutation_guard =
             self.inode_mutation_locks[self.inode_mutation_lock_index(inode)].lock();
         let mut inode_ref = self.read_inode(inode)?;
@@ -1310,6 +1388,7 @@ impl Ext4 {
                         inode
                     );
                 }
+                self.update_xattr_block_checksum(pblock, &mut xattr_block)?;
                 self.write_block(&xattr_block.block())?;
                 inode_ref.inode.set_xattr_block(pblock);
                 self.write_inode_with_csum(&mut inode_ref)?;
@@ -1326,6 +1405,7 @@ impl Ext4 {
         }
 
         let xattr_block = XattrBlock::new(self.read_block(xattr_block_id)?);
+        self.verify_xattr_block_checksum(xattr_block_id, &xattr_block)?;
         let exists = xattr_block.get(name).is_some();
         if exists && create {
             return_error!(ErrCode::EEXIST, "Xattr {} already exists", name);
@@ -1339,6 +1419,7 @@ impl Ext4 {
             let _ = new_xattr_block.remove(name);
         }
         if new_xattr_block.insert(name, value) {
+            self.update_xattr_block_checksum(xattr_block_id, &mut new_xattr_block)?;
             self.write_block(&new_xattr_block.block())?;
             Ok(())
         } else {
@@ -1362,6 +1443,7 @@ impl Ext4 {
     /// `ENODATA` - the attribute does not exist
     pub fn removexattr(&self, inode: InodeId, name: &str) -> Result<()> {
         self.ensure_mutable()?;
+        let _metadata_guard = self.lock_direct_metadata_mutation()?;
         let _mutation_guard =
             self.inode_mutation_locks[self.inode_mutation_lock_index(inode)].lock();
         let inode_ref = self.read_inode(inode)?;
@@ -1370,7 +1452,9 @@ impl Ext4 {
             return_error!(ErrCode::ENODATA, "Xattr {} does not exist", name);
         }
         let mut xattr_block = XattrBlock::new(self.read_block(xattr_block_id)?);
+        self.verify_xattr_block_checksum(xattr_block_id, &xattr_block)?;
         if xattr_block.remove(name) {
+            self.update_xattr_block_checksum(xattr_block_id, &mut xattr_block)?;
             self.write_block(&xattr_block.block())?;
             Ok(())
         } else {
@@ -1394,6 +1478,7 @@ impl Ext4 {
             return Ok(Vec::new());
         }
         let xattr_block = XattrBlock::new(self.read_block(xattr_block_id)?);
+        self.verify_xattr_block_checksum(xattr_block_id, &xattr_block)?;
         Ok(xattr_block.list())
     }
 }
@@ -1447,9 +1532,11 @@ mod tests {
             block_device,
             cached_super_block: spin::Mutex::new(sb),
             cached_block_groups: Vec::new(),
+            system_metadata_ranges: Vec::new(),
             inode_cache: spin::Mutex::new(crate::ext4::InodeCache::new(16)),
             alloc_lock: spin::Mutex::new(()),
             namespace_lock: spin::Mutex::new(()),
+            metadata_mutation_barrier: crate::ext4::MetadataMutationGate::new(),
             poisoned: spin::Mutex::new(None),
             journal: None,
             inode_mutation_locks: (0..crate::ext4::INODE_MUTATION_LOCK_SHARDS)
@@ -1469,6 +1556,92 @@ mod tests {
         fs.read_extent_or_hole(&inode, 0, 0, &mut buf).unwrap();
 
         assert_eq!(buf, [0; 16]);
+    }
+
+    #[test]
+    fn metadata_mutation_barrier_separates_direct_and_transactional_writers() {
+        let fs = make_test_fs(16);
+
+        let direct = fs.lock_direct_metadata_mutation().unwrap();
+        let second_direct = fs.lock_direct_metadata_mutation().unwrap();
+        assert_eq!(
+            fs.lock_transactional_metadata_mutation()
+                .expect_err("exclusive gate must not wait for direct owners")
+                .code(),
+            ErrCode::EAGAIN
+        );
+        drop(second_direct);
+        drop(direct);
+
+        let transaction = fs.lock_transactional_metadata_mutation().unwrap();
+        assert_eq!(
+            fs.lock_direct_metadata_mutation()
+                .expect_err("direct gate must not wait for exclusive owner")
+                .code(),
+            ErrCode::EAGAIN
+        );
+        assert_eq!(
+            fs.lock_transactional_metadata_mutation()
+                .expect_err("second exclusive owner must be rejected")
+                .code(),
+            ErrCode::EAGAIN
+        );
+        drop(transaction);
+        drop(fs.lock_transactional_metadata_mutation().unwrap());
+        drop(fs.lock_direct_metadata_mutation().unwrap());
+    }
+
+    #[test]
+    fn metadata_mutation_barrier_rejects_direct_count_overflow() {
+        let fs = make_test_fs(16);
+        fs.metadata_mutation_barrier.state.store(
+            crate::ext4::METADATA_GATE_DIRECT_MAX,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        assert_eq!(
+            fs.lock_direct_metadata_mutation()
+                .expect_err("direct count must not enter the exclusive bit")
+                .code(),
+            ErrCode::EAGAIN
+        );
+        fs.metadata_mutation_barrier
+            .state
+            .store(0, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn metadata_mutation_barrier_allows_concurrent_direct_owners() {
+        let fs = make_test_fs(16);
+        let start = std::sync::Barrier::new(3);
+        let release = std::sync::Barrier::new(3);
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                let sender = sender.clone();
+                let start = &start;
+                let release = &release;
+                let fs = &fs;
+                scope.spawn(move || {
+                    start.wait();
+                    let guard = fs.lock_direct_metadata_mutation();
+                    sender.send(guard.is_ok()).unwrap();
+                    release.wait();
+                    drop(guard);
+                });
+            }
+            start.wait();
+            assert!(receiver.recv().unwrap());
+            assert!(receiver.recv().unwrap());
+            assert_eq!(
+                fs.lock_transactional_metadata_mutation()
+                    .expect_err("both direct guards must remain live")
+                    .code(),
+                ErrCode::EAGAIN
+            );
+            release.wait();
+        });
+        drop(fs.lock_transactional_metadata_mutation().unwrap());
     }
 
     #[test]
@@ -1506,6 +1679,7 @@ mod tests {
             }
 
             let mut sb_block = blocks.remove(&0).unwrap();
+            Self::write_u32(&mut sb_block, BASE_OFFSET, 16);
             Self::write_u32(&mut sb_block, BASE_OFFSET + 4, TEST_BLOCK_COUNT as u32);
             Self::write_u32(
                 &mut sb_block,
@@ -1516,6 +1690,7 @@ mod tests {
             Self::write_u32(&mut sb_block, BASE_OFFSET + 24, 2);
             Self::write_u32(&mut sb_block, BASE_OFFSET + 28, 2);
             Self::write_u32(&mut sb_block, BASE_OFFSET + 32, TEST_BLOCK_COUNT as u32);
+            Self::write_u32(&mut sb_block, BASE_OFFSET + 36, TEST_BLOCK_COUNT as u32);
             Self::write_u32(&mut sb_block, BASE_OFFSET + 40, 16);
             Self::write_u16(&mut sb_block, BASE_OFFSET + 56, 0xef53);
             Self::write_u32(&mut sb_block, BASE_OFFSET + 84, 1);
@@ -1603,6 +1778,25 @@ mod tests {
             let block = blocks.get(&TEST_INODE_TABLE).unwrap();
             let inode: Inode = block.read_offset_as(SB_GOOD_INODE_SIZE);
             inode.xattr_block()
+        }
+
+        fn fill_block(&self, block_id: PBlockId, byte: u8) {
+            self.blocks
+                .lock()
+                .get_mut(&block_id)
+                .unwrap()
+                .data
+                .fill(byte);
+        }
+
+        fn block_is_zero(&self, block_id: PBlockId) -> bool {
+            self.blocks
+                .lock()
+                .get(&block_id)
+                .unwrap()
+                .data
+                .iter()
+                .all(|byte| *byte == 0)
         }
     }
 
@@ -1768,6 +1962,33 @@ mod tests {
 
         assert_eq!(err.code(), ErrCode::EIO);
         assert_allocation_state(&fs, &block_device, false, TEST_INITIAL_FREE_BLOCKS);
+    }
+
+    #[test]
+    fn newly_reused_data_block_is_zeroed_before_mapping() {
+        let (block_device, fs) = load_failing_test_fs();
+        let mut inode = fs.read_inode(2).unwrap();
+        block_device.fill_block(TEST_XATTR_BLOCK, 0xa5);
+
+        let pblock = fs.alloc_zeroed_data_block(&mut inode).unwrap();
+
+        assert_eq!(pblock, TEST_XATTR_BLOCK);
+        assert!(block_device.block_is_zero(pblock));
+        assert_allocation_state(&fs, &block_device, true, TEST_INITIAL_FREE_BLOCKS - 1);
+    }
+
+    #[test]
+    fn data_block_zero_write_failure_rolls_back_allocation() {
+        let (block_device, fs) = load_failing_test_fs();
+        let mut inode = fs.read_inode(2).unwrap();
+        block_device.fill_block(TEST_XATTR_BLOCK, 0xa5);
+        block_device.fail_once_on_write(TEST_XATTR_BLOCK);
+
+        let err = fs.alloc_zeroed_data_block(&mut inode).unwrap_err();
+
+        assert_eq!(err.code(), ErrCode::EIO);
+        assert_allocation_state(&fs, &block_device, false, TEST_INITIAL_FREE_BLOCKS);
+        assert!(!block_device.block_is_zero(TEST_XATTR_BLOCK));
     }
 
     #[test]

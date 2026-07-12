@@ -1931,6 +1931,13 @@ pub trait MountableFileSystem: FileSystem {
         log::error!("This filesystem does not support make_fs");
         Err(SystemError::ENOSYS)
     }
+
+    fn make_fs_with_flags(
+        data: Option<&dyn FileSystemMakerData>,
+        _mount_flags: MountFlags,
+    ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
+        Self::make_fs(data)
+    }
 }
 
 /// # 注册一个可以被挂载文件系统
@@ -1947,8 +1954,9 @@ macro_rules! register_mountable_fs {
         impl $fs {
             fn make_fs_bridge(
                 data: Option<&dyn FileSystemMakerData>,
+                mount_flags: $crate::filesystem::vfs::mount::MountFlags,
             ) -> Result<Arc<dyn FileSystem>, SystemError> {
-                <$fs as MountableFileSystem>::make_fs(data)
+                <$fs as MountableFileSystem>::make_fs_with_flags(data, mount_flags)
             }
 
             fn make_mount_data_bridge(
@@ -1966,6 +1974,7 @@ macro_rules! register_mountable_fs {
                 &($fs::make_fs_bridge
                     as fn(
                         Option<&dyn FileSystemMakerData>,
+                        $crate::filesystem::vfs::mount::MountFlags,
                     ) -> Result<Arc<dyn FileSystem + 'static>, SystemError>),
                 &($fs::make_mount_data_bridge
                     as fn(
@@ -2032,8 +2041,9 @@ impl FileSystemMaker {
     pub fn build(
         &self,
         data: Option<&dyn FileSystemMakerData>,
+        mount_flags: MountFlags,
     ) -> Result<Arc<dyn FileSystem>, SystemError> {
-        (self.maker)(data)
+        (self.maker)(data, mount_flags)
     }
 }
 
@@ -2041,8 +2051,10 @@ pub trait FileSystemMakerData: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
-pub type FSMakerFunction =
-    fn(data: Option<&dyn FileSystemMakerData>) -> Result<Arc<dyn FileSystem>, SystemError>;
+pub type FSMakerFunction = fn(
+    data: Option<&dyn FileSystemMakerData>,
+    mount_flags: MountFlags,
+) -> Result<Arc<dyn FileSystem>, SystemError>;
 pub type MountDataBuilder =
     fn(
         raw_data: Option<&str>,
@@ -2076,6 +2088,7 @@ pub fn produce_fs(
     filesystem: &str,
     data: Option<&str>,
     source: &str,
+    mount_flags: MountFlags,
 ) -> Result<Arc<dyn FileSystem>, SystemError> {
     let canonical_filesystem = if filesystem.starts_with("fuse.") {
         "fuse"
@@ -2087,7 +2100,7 @@ pub fn produce_fs(
         Some(maker) => {
             let mount_data = (maker.builder)(data, source)?;
             let mount_data_ref = mount_data.as_ref().map(|arc| arc.as_ref());
-            maker.build(mount_data_ref)
+            maker.build(mount_data_ref, mount_flags)
         }
         None => {
             log::error!("mismatch filesystem type : {}", filesystem);

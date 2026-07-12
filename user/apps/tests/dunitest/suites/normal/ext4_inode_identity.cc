@@ -226,6 +226,34 @@ TEST(Ext4InodeIdentity, OpenFileSurvivesFinalUnlink) {
     ASSERT_NO_FATAL_FAILURE(fs.Unmount());
 }
 
+TEST(Ext4InodeIdentity, EmptyPathRelinkCancelsDeferredReclaim) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+
+    const std::string old_path = fs.mount_point() + "/relink_source";
+    const std::string new_path = fs.mount_point() + "/relink_target";
+    int fd = open(old_path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    constexpr char kPayload[] = "relinked-data";
+    ASSERT_NO_FATAL_FAILURE(WriteAll(fd, kPayload, sizeof(kPayload) - 1));
+    ASSERT_EQ(0, fsync(fd)) << strerror(errno);
+    ASSERT_EQ(0, unlink(old_path.c_str())) << strerror(errno);
+
+    constexpr int kAtEmptyPath = 0x1000;
+    ASSERT_EQ(0, linkat(fd, "", AT_FDCWD, new_path.c_str(), kAtEmptyPath))
+        << strerror(errno);
+    struct stat linked = {};
+    ASSERT_EQ(0, stat(new_path.c_str(), &linked)) << strerror(errno);
+    EXPECT_EQ(1u, linked.st_nlink);
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+
+    EXPECT_EQ(std::string(kPayload, sizeof(kPayload) - 1),
+              ReadFile(new_path.c_str()));
+    ASSERT_EQ(0, unlink(new_path.c_str())) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
 TEST(Ext4InodeIdentity, CurrentDirectorySurvivesRmdir) {
     LoopExt4 fs;
     ASSERT_NO_FATAL_FAILURE(fs.SetUp());

@@ -78,7 +78,13 @@ impl StagedBlock {
 
 /// Cache changes are published only after checkpoint data is durable.
 pub trait CachePublisher: Send + Sync {
-    fn publish(&self, blocks: &[&StagedBlock]);
+    /// Publish already-checkpointed images to in-memory caches.
+    ///
+    /// This callback runs after the home-block flush, so it must not allocate,
+    /// perform I/O, or otherwise fail.  Borrowing the transaction's map also
+    /// lets publishers inspect the final image for a particular home block
+    /// without building a temporary collection.
+    fn publish(&self, blocks: &BTreeMap<PBlockId, StagedBlock>);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -123,6 +129,17 @@ impl JournalTransactionCore {
 
     pub fn can_shutdown(&self) -> bool {
         !self.writer.load(Ordering::Acquire) && !self.is_poisoned()
+    }
+
+    pub fn owns_block_range(&self, start: PBlockId, end: PBlockId) -> bool {
+        start < end
+            && self
+                .context
+                .lock()
+                .journal_blocks
+                .range(start..end)
+                .next()
+                .is_some()
     }
 
     pub fn start(&self, credits: usize) -> Result<Transaction<'_>> {
@@ -188,6 +205,37 @@ impl Transaction<'_> {
         }
         self.staged.insert(home, StagedBlock { home, image });
         Ok(())
+    }
+
+    /// Return the transaction-private final image of `home` for mutation.
+    ///
+    /// The first access snapshots the device block and consumes one credit;
+    /// later accesses return the same image, providing read-your-writes and
+    /// naturally merging updates to shared metadata blocks.
+    pub fn read_for_update<'a>(
+        &'a mut self,
+        device: &dyn BlockDevice,
+        home: PBlockId,
+    ) -> Result<&'a mut [u8; BLOCK_SIZE]> {
+        if !self.staged.contains_key(&home) {
+            if self.staged.len() == self.credits {
+                return Err(Ext4Error::new(ErrCode::E2BIG));
+            }
+            let block = device.read_block(home)?;
+            self.staged.insert(
+                home,
+                StagedBlock {
+                    home,
+                    image: block.data,
+                },
+            );
+        }
+        Ok(self
+            .staged
+            .get_mut(&home)
+            .expect("staged block was just inserted")
+            .image
+            .as_mut())
     }
 
     pub fn read<'a>(&'a self, device: &dyn BlockDevice, home: PBlockId) -> Result<BlockView<'a>> {
@@ -326,7 +374,7 @@ impl Transaction<'_> {
         if let Err(error) = device.flush() {
             return self.fail(error, CommitFailure::CheckpointFailed, true);
         }
-        publisher.publish(&self.staged.values().collect::<Vec<_>>());
+        publisher.publish(&self.staged);
 
         if let Err(error) =
             write_journal_superblock(device, &mapping, &clean_sb_image).and_then(|_| device.flush())
@@ -629,9 +677,24 @@ mod tests {
 
     struct Publisher(AtomicUsize);
     impl CachePublisher for Publisher {
-        fn publish(&self, blocks: &[&StagedBlock]) {
+        fn publish(&self, blocks: &BTreeMap<PBlockId, StagedBlock>) {
             self.0.fetch_add(blocks.len(), Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn read_for_update_merges_shared_block_and_charges_one_credit() {
+        let device = MemoryDevice::new();
+        let core = JournalTransactionCore::new(context()).unwrap();
+        let mut transaction = core.start(1).unwrap();
+
+        transaction.read_for_update(&device, 42).unwrap()[10] = 1;
+        transaction.read_for_update(&device, 42).unwrap()[11] = 2;
+        assert_eq!(transaction.read(&device, 42).unwrap()[10..12], [1, 2]);
+        assert_eq!(
+            transaction.read_for_update(&device, 43).unwrap_err().code(),
+            ErrCode::E2BIG
+        );
     }
 
     fn context() -> JournalContext {

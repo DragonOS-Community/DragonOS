@@ -397,10 +397,11 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
 
     let init_rootfs = |kind: RootFsKind| -> Result<Arc<dyn FileSystem>, SystemError> {
         match kind {
-            RootFsKind::Ext4 => Ext4FileSystem::from_gendisk_with_options(
-                gendisk.clone(),
-                root_options.ext4_options,
-            ),
+            RootFsKind::Ext4 => {
+                let mut ext4_options = root_options.ext4_options;
+                ext4_options.read_only = root_options.mount_flags.contains(MountFlags::RDONLY);
+                Ext4FileSystem::from_gendisk_with_options(gendisk.clone(), ext4_options)
+            }
             RootFsKind::Fat => {
                 if root_options.has_ext4_specific_options() {
                     error!("rootfs: ext4-specific rootflags cannot be used with FAT rootfs");

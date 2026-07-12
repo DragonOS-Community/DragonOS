@@ -19,7 +19,7 @@ fn make_ext4() {
         .args(["if=/dev/zero", "of=ext4.img", "bs=1M", "count=512"])
         .status();
     let _ = std::process::Command::new("mkfs.ext4")
-        .args(["ext4.img"])
+        .args(["-O", "^orphan_file", "ext4.img"])
         .output();
 }
 
@@ -504,6 +504,156 @@ fn prepare_buffered_write_does_not_commit_size_test() {
     println!("prepare buffered write size boundary test done");
 }
 
+fn legacy_orphan_mount_cleanup_test() {
+    make_ext4();
+    let orphan = {
+        let ext4 = load_ext4();
+        let mode = InodeMode::FILE | InodeMode::ALL_RWX;
+        let inode = ext4
+            .generic_create(ROOT_INO, "crash_orphan", mode)
+            .expect("create crash orphan failed");
+        ext4.write(inode, 0, &vec![0x5a; 3 * 1024 * 1024])
+            .expect("write crash orphan failed");
+
+        // Model a crash after the final unlink transaction but before the VFS
+        // lifetime owner invokes reclaim_inode(): persist the one-shot handle
+        // only in volatile memory, then drop the mounted instance.
+        let handle = ext4
+            .unlink(ROOT_INO, "crash_orphan")
+            .expect("final unlink transaction failed")
+            .expect("final unlink did not produce reclaim handle");
+        drop(handle);
+        inode
+    };
+
+    let ext4 = load_ext4();
+    ext4
+        .generic_lookup(ROOT_INO, "crash_orphan")
+        .expect_err("orphaned name reappeared after recovery");
+    ext4
+        .getattr(orphan)
+        .expect_err("mount recovery did not reclaim orphan inode");
+    ext4.shutdown_writable()
+        .expect("clean writable shutdown failed");
+    drop(ext4);
+
+    let output = std::process::Command::new("e2fsck")
+        .args(["-fn", "ext4.img"])
+        .output()
+        .expect("e2fsck failed");
+    assert!(
+        output.status.success(),
+        "orphan recovery e2fsck FAILED:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    println!("legacy orphan mount cleanup test done");
+}
+
+fn rename_replace_orphan_mount_cleanup_test() {
+    make_ext4();
+    let replaced = {
+        let ext4 = load_ext4();
+        let mode = InodeMode::FILE | InodeMode::ALL_RWX;
+        ext4.generic_create(ROOT_INO, "rename_source", mode)
+            .expect("create rename source failed");
+        let replaced = ext4
+            .generic_create(ROOT_INO, "rename_target", mode)
+            .expect("create rename target failed");
+        ext4.write(replaced, 0, &vec![0xa5; 1024 * 1024])
+            .expect("write rename target failed");
+
+        // Model a crash after the atomic replace transaction and before the
+        // VFS lifetime owner consumes the reclaim capability.  The replaced
+        // inode must already be on the durable legacy orphan chain.
+        let handle = ext4
+            .rename(ROOT_INO, "rename_source", ROOT_INO, "rename_target")
+            .expect("rename replace transaction failed")
+            .expect("final target replacement did not return reclaim handle");
+        drop(handle);
+        replaced
+    };
+
+    let ext4 = load_ext4();
+    ext4.getattr(replaced)
+        .expect_err("mount recovery did not reclaim rename target orphan");
+    ext4.generic_lookup(ROOT_INO, "rename_source")
+        .expect_err("rename source name reappeared after recovery");
+    ext4.generic_lookup(ROOT_INO, "rename_target")
+        .expect("rename target disappeared after recovery");
+    ext4.shutdown_writable()
+        .expect("clean writable shutdown failed");
+    drop(ext4);
+
+    let output = std::process::Command::new("e2fsck")
+        .args(["-fn", "ext4.img"])
+        .output()
+        .expect("e2fsck failed");
+    assert!(
+        output.status.success(),
+        "rename orphan recovery e2fsck FAILED:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    println!("rename replace orphan mount cleanup test done");
+}
+
+fn cross_parent_directory_replace_orphan_test() {
+    make_ext4();
+    let replaced = {
+        let ext4 = load_ext4();
+        let mode = InodeMode::DIRECTORY | InodeMode::ALL_RWX;
+        let old_parent = ext4
+            .generic_create(ROOT_INO, "old_parent", mode)
+            .expect("create old parent failed");
+        let new_parent = ext4
+            .generic_create(ROOT_INO, "new_parent", mode)
+            .expect("create new parent failed");
+        let source = ext4
+            .generic_create(old_parent, "source_dir", mode)
+            .expect("create source directory failed");
+        let replaced = ext4
+            .generic_create(new_parent, "target_dir", mode)
+            .expect("create target directory failed");
+
+        let handle = ext4
+            .rename(old_parent, "source_dir", new_parent, "target_dir")
+            .expect("cross-parent directory replace transaction failed")
+            .expect("directory replacement did not return reclaim handle");
+        assert_eq!(
+            ext4.generic_lookup(new_parent, "target_dir")
+                .expect("new directory entry missing"),
+            source
+        );
+        ext4.generic_lookup(old_parent, "source_dir")
+            .expect_err("old directory entry survived replace");
+        assert_eq!(
+            ext4.generic_lookup(source, "..").expect("new '..' missing"),
+            new_parent
+        );
+        drop(handle);
+        replaced
+    };
+
+    let ext4 = load_ext4();
+    ext4.getattr(replaced)
+        .expect_err("mount recovery did not reclaim replaced directory");
+    ext4.shutdown_writable()
+        .expect("clean writable shutdown failed");
+    drop(ext4);
+    let output = std::process::Command::new("e2fsck")
+        .args(["-fn", "ext4.img"])
+        .output()
+        .expect("e2fsck failed");
+    assert!(
+        output.status.success(),
+        "cross-parent directory rename e2fsck FAILED:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    println!("cross-parent directory replace orphan test done");
+}
+
 fn main() {
     SimpleLogger::new().init().unwrap();
     log::set_max_level(log::LevelFilter::Off);
@@ -531,12 +681,17 @@ fn main() {
     extent_corruption_test();
     println!("extent corruption test done");
 
+    rename_replace_orphan_mount_cleanup_test();
+    cross_parent_directory_replace_orphan_test();
+
     // Interleaved setattr + writeback test
     interleaved_setattr_writeback_test();
 
     sparse_growth_and_range_writeback_test();
 
     prepare_buffered_write_does_not_commit_size_test();
+
+    legacy_orphan_mount_cleanup_test();
 
     // Cache correctness tests — run on a fresh image
     // Use load_ext4 (not open_ext4) to avoid init() corrupting mkfs.ext4 checksums

@@ -536,6 +536,79 @@ pub fn deferred_reclaim_lifecycle_test(ext4: &Ext4) {
     println!("  [PASS] deferred reclaim lifecycle and rename replacement");
 }
 
+pub fn full_directory_orphan_relink_test(ext4: &Ext4) {
+    let file_mode = InodeMode::FILE | InodeMode::ALL_RW;
+    let dir_mode = InodeMode::DIRECTORY | InodeMode::ALL_RWX;
+    let parent = ext4
+        .mkdir(ROOT_INO, "full_relink_dir", dir_mode)
+        .expect("create full relink directory failed");
+    assert_eq!(
+        ext4.create(parent, &"n".repeat(256), file_mode)
+            .expect_err("256-byte name must be rejected")
+            .code(),
+        another_ext4::ErrCode::ENAMETOOLONG
+    );
+    let victim = ext4
+        .create(parent, "v", file_mode)
+        .expect("create relink victim failed");
+    let spacer = ext4
+        .create(ROOT_INO, "full_relink_spacer", file_mode)
+        .expect("create allocation spacer failed");
+    let mut fillers = Vec::new();
+    for index in 0..75 {
+        let prefix = format!("f{index:02}");
+        let name = format!("{}{}", prefix, "x".repeat(255 - prefix.len()));
+        ext4.create(parent, &name, file_mode)
+            .expect("fill relink directory failed");
+        fillers.push(name);
+        if index % 15 == 14 {
+            let offset = (index / 15) * BLOCK_SIZE;
+            ext4.write(spacer, offset, &[0x5a])
+                .expect("fragment directory allocation failed");
+        }
+    }
+    let blocks_before = ext4.getattr(parent).unwrap().blocks;
+    assert!(
+        blocks_before / 8 > ext4.getattr(parent).unwrap().size / BLOCK_SIZE as u64,
+        "fixture must force external extent-tree metadata"
+    );
+    let handle = ext4
+        .unlink(parent, "v")
+        .expect("unlink full-directory victim failed")
+        .expect("victim unlink must return handle");
+    let relink_name = format!("r{}", "y".repeat(254));
+    ext4.link(victim, parent, &relink_name)
+        .expect("full-directory orphan relink failed");
+    assert!(
+        ext4.getattr(parent).unwrap().blocks > blocks_before,
+        "relink should prepare a new empty directory block"
+    );
+    drop(handle);
+
+    reclaim(
+        ext4,
+        ext4.unlink(parent, &relink_name)
+            .expect("unlink relink target failed"),
+    );
+    for name in fillers {
+        reclaim(
+            ext4,
+            ext4.unlink(parent, &name).expect("unlink filler failed"),
+        );
+    }
+    reclaim(
+        ext4,
+        ext4.rmdir(ROOT_INO, "full_relink_dir")
+            .expect("remove full relink directory failed"),
+    );
+    reclaim(
+        ext4,
+        ext4.unlink(ROOT_INO, "full_relink_spacer")
+            .expect("remove allocation spacer failed"),
+    );
+    println!("  [PASS] full-directory orphan relink preparation");
+}
+
 /// Run all cache correctness tests.
 pub fn run_all_cache_tests(ext4: &Ext4, _image_path: &str) {
     println!("=== Cache Correctness Tests ===");
@@ -546,6 +619,7 @@ pub fn run_all_cache_tests(ext4: &Ext4, _image_path: &str) {
     block_group_cache_test(ext4);
     metadata_consistency_after_lookup_test(ext4);
     deferred_reclaim_lifecycle_test(ext4);
+    full_directory_orphan_relink_test(ext4);
     cache_eviction_stress_test(ext4);
     // e2fsck is run after dropping ext4 to ensure all writes are flushed
     println!("  (e2fsck validation deferred to after drop)");

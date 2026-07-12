@@ -6,10 +6,11 @@ use crate::{
         vfs::{
             self,
             fcntl::AtFlags,
+            mount::MountFlags,
             utils::{user_path_at, DName},
             vcore::{generate_inode_id, try_find_gendisk},
-            EvictionEpoch, FileSystem, FileSystemMakerData, IndexNode, Magic, MountableFileSystem,
-            FSMAKER, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+            EvictionEpoch, FileSystem, FileSystemMakerData, FsReconfigureRequest, IndexNode, Magic,
+            MountableFileSystem, FSMAKER, VFS_MAX_FOLLOW_SYMLINK_TIMES,
         },
     },
     libs::{
@@ -106,6 +107,7 @@ pub enum Ext4ErrorsBehavior {
 pub struct Ext4MountOptions {
     pub dax: Option<Ext4DaxMode>,
     pub errors: Ext4ErrorsBehavior,
+    pub read_only: bool,
 }
 
 impl Default for Ext4MountOptions {
@@ -113,11 +115,25 @@ impl Default for Ext4MountOptions {
         Self {
             dax: None,
             errors: Ext4ErrorsBehavior::Continue,
+            read_only: false,
         }
     }
 }
 
 impl FileSystem for Ext4FileSystem {
+    fn reconfigure(&self, request: FsReconfigureRequest<'_>) -> Result<MountFlags, SystemError> {
+        if request.raw_data.is_some_and(|raw| !raw.trim().is_empty()) {
+            return Err(SystemError::EINVAL);
+        }
+        let requested_read_only = request.sb_flags.contains(MountFlags::RDONLY);
+        if request.sb_flags_mask.contains(MountFlags::RDONLY)
+            && requested_read_only != self._mount_options.read_only
+        {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        Ok(request.sb_flags & request.sb_flags_mask)
+    }
+
     fn supports_reliable_flush(&self) -> bool {
         self.fs.supports_reliable_flush()
     }
@@ -189,6 +205,9 @@ impl FileSystem for Ext4FileSystem {
     }
 
     fn on_umount(&self) {
+        if self._mount_options.read_only {
+            return;
+        }
         if let Err(error) = self.fs.shutdown_writable() {
             log::error!("ext4: failed to mark journal clean on unmount: {:?}", error);
         }
@@ -545,9 +564,9 @@ impl Ext4FileSystem {
                         } else {
                             None
                         };
-                        fs.fs
-                            .commit_inode_metadata(inode_num, size, mtime)
-                            .map_err(SystemError::from)
+                        LockedExt4Inode::retry_metadata_contention(|| {
+                            fs.fs.commit_inode_metadata(inode_num, size, mtime)
+                        })
                     })
                 } else {
                     Err(SystemError::EIO)
@@ -626,9 +645,13 @@ impl Ext4FileSystem {
         mount_options: Ext4MountOptions,
     ) -> Result<Arc<dyn FileSystem>, SystemError> {
         let raw_dev = mount_data.device_num();
-        // The JBD2 writer is not activated for production mounts until every
-        // metadata mutation path has been converted to explicit handles.
-        let fs = another_ext4::Ext4::load(mount_data.clone())?;
+        // Writable mounts recover the journal and the validated legacy orphan
+        // chain before this filesystem is published to the VFS.
+        let fs = if mount_options.read_only {
+            another_ext4::Ext4::load(mount_data.clone())?
+        } else {
+            another_ext4::Ext4::load_writable(mount_data.clone())?
+        };
         let root_inode: Arc<LockedExt4Inode> =
             Arc::new_cyclic(|self_ref: &Weak<LockedExt4Inode>| {
                 LockedExt4Inode(
@@ -720,6 +743,20 @@ impl Drop for Ext4InodeTombstone {
 }
 
 impl MountableFileSystem for Ext4FileSystem {
+    fn make_fs_with_flags(
+        data: Option<&dyn FileSystemMakerData>,
+        mount_flags: MountFlags,
+    ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
+        let mount_data = data
+            .and_then(|d| d.as_any().downcast_ref::<Ext4MountData>())
+            .ok_or(SystemError::EINVAL)?;
+        let options = Ext4MountOptions {
+            read_only: mount_flags.contains(MountFlags::RDONLY),
+            ..Ext4MountOptions::default()
+        };
+        Self::from_gendisk_with_options(mount_data.gendisk.clone(), options)
+    }
+
     fn make_fs(
         data: Option<&dyn FileSystemMakerData>,
     ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {

@@ -115,10 +115,16 @@ impl SuperBlock {
     const SB_MAGIC: u16 = 0xEF53;
 
     pub const FEATURE_COMPAT_HAS_JOURNAL: u32 = 0x0004;
+    pub const FEATURE_COMPAT_RESIZE_INODE: u32 = 0x0010;
+    pub const FEATURE_COMPAT_SPARSE_SUPER2: u32 = 0x0200;
     pub const FEATURE_COMPAT_FAST_COMMIT: u32 = 0x0400;
     pub const FEATURE_COMPAT_ORPHAN_FILE: u32 = 0x1000;
     pub const FEATURE_INCOMPAT_RECOVER: u32 = 0x0004;
     pub const FEATURE_INCOMPAT_JOURNAL_DEV: u32 = 0x0008;
+    /// The orphan file may contain orphaned inodes.
+    pub const FEATURE_RO_COMPAT_ORPHAN_PRESENT: u32 = 0x0001_0000;
+    pub const FEATURE_RO_COMPAT_SPARSE_SUPER: u32 = 0x0001;
+    pub const FEATURE_RO_COMPAT_METADATA_CSUM: u32 = 0x0400;
 
     pub fn check_magic(&self) -> bool {
         self.magic == Self::SB_MAGIC
@@ -126,6 +132,11 @@ impl SuperBlock {
 
     pub fn first_data_block(&self) -> u32 {
         self.first_data_block
+    }
+
+    /// First inode number available for normal (non-reserved) allocation.
+    pub fn first_inode(&self) -> u32 {
+        self.first_inode
     }
 
     pub fn free_inodes_count(&self) -> u32 {
@@ -156,6 +167,10 @@ impl SuperBlock {
         self.features_incompatible & feature != 0
     }
 
+    pub fn has_read_only_compatible_feature(&self, feature: u32) -> bool {
+        self.features_read_only & feature != 0
+    }
+
     pub fn set_incompatible_feature(&mut self, feature: u32, enabled: bool) {
         if enabled {
             self.features_incompatible |= feature;
@@ -168,12 +183,32 @@ impl SuperBlock {
         self.journal_inode_number
     }
 
+    pub fn reserved_gdt_blocks(&self) -> u16 {
+        self.s_reserved_gdt_blocks
+    }
+
+    pub fn backup_block_groups(&self) -> [u32; 2] {
+        self.backup_bgs
+    }
+
     pub fn journal_device(&self) -> u32 {
         self.journal_dev
     }
 
     pub fn journal_uuid(&self) -> [u8; 16] {
         self.journal_uuid
+    }
+
+    /// Head inode number of the legacy on-disk orphan list, or zero.
+    pub fn last_orphan(&self) -> u32 {
+        self.last_orphan
+    }
+
+    /// Set the head inode number of the legacy on-disk orphan list.
+    ///
+    /// The caller must recompute the superblock checksum before persisting it.
+    pub fn set_last_orphan(&mut self, inode: u32) {
+        self.last_orphan = inode;
     }
 
     /// Total number of inodes.
@@ -225,12 +260,21 @@ impl SuperBlock {
 
     pub fn inode_count_in_group(&self, bgid: u32) -> u32 {
         let bg_count = self.block_group_count();
-        if bgid < bg_count {
+        if bgid >= bg_count {
+            0
+        } else if bgid + 1 < bg_count {
             self.inodes_per_group
         } else {
-            // Last group
-            self.inode_count - (bg_count - 1) * self.inodes_per_group
+            self.inode_count
+                .saturating_sub((bg_count - 1).saturating_mul(self.inodes_per_group))
         }
+    }
+
+    /// Number of allocation clusters represented by a block bitmap.  The
+    /// on-disk field historically named fragments-per-group is
+    /// s_clusters_per_group in ext4.
+    pub fn clusters_per_group(&self) -> u32 {
+        self.frags_per_group
     }
 
     pub fn set_free_inodes_count(&mut self, count: u32) {
@@ -276,5 +320,101 @@ impl SuperBlock {
         let off = core::mem::offset_of!(SuperBlock, checksum);
         let bytes = self.to_bytes();
         self.checksum = crc32(CRC32_INIT, &bytes[..off]);
+    }
+
+    pub fn verify_checksum(&self) -> bool {
+        let expected = self.checksum;
+        let mut copy = *self;
+        copy.set_checksum();
+        copy.checksum == expected
+    }
+
+    pub fn has_supported_checksum_type(&self) -> bool {
+        self.checksum_type == 1
+    }
+
+    #[cfg(test)]
+    pub(crate) fn validation_fixture() -> Self {
+        let mut sb: Self = unsafe { core::mem::zeroed() };
+        sb.magic = Self::SB_MAGIC;
+        sb.block_count_lo = 1024;
+        sb.blocks_per_group = 1024;
+        sb.frags_per_group = 1024;
+        sb.inode_count = 256;
+        sb.inodes_per_group = 256;
+        sb.first_inode = 11;
+        sb.log_block_size = 2;
+        sb.log_cluster_size = 2;
+        sb.inode_size = 256;
+        sb.desc_size = 64;
+        sb.features_read_only = Self::FEATURE_RO_COMPAT_METADATA_CSUM;
+        sb.checksum_type = 1;
+        sb.set_checksum();
+        sb
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_read_only_compatible_feature(&mut self, feature: u32, enabled: bool) {
+        if enabled {
+            self.features_read_only |= feature;
+        } else {
+            self.features_read_only &= !feature;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_compatible_feature(&mut self, feature: u32, enabled: bool) {
+        if enabled {
+            self.features_compatible |= feature;
+        } else {
+            self.features_compatible &= !feature;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_backup_block_groups(&mut self, groups: [u32; 2]) {
+        self.backup_bgs = groups;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_reserved_gdt_blocks(&mut self, blocks: u16) {
+        self.s_reserved_gdt_blocks = blocks;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn orphan_fields_and_feature_accessors_roundtrip() {
+        // Every bit pattern of SuperBlock's integer/byte fields is valid.
+        let mut sb: SuperBlock = unsafe { core::mem::zeroed() };
+        sb.first_inode = 11;
+        sb.features_read_only = SuperBlock::FEATURE_RO_COMPAT_ORPHAN_PRESENT;
+
+        assert_eq!(sb.first_inode(), 11);
+        assert!(sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_ORPHAN_PRESENT));
+        assert_eq!(sb.last_orphan(), 0);
+
+        sb.set_last_orphan(42);
+        assert_eq!(sb.last_orphan(), 42);
+    }
+
+    #[test]
+    fn final_group_uses_actual_inode_mutation_bound() {
+        // Every bit pattern of SuperBlock's integer/byte fields is valid.
+        let mut sb: SuperBlock = unsafe { core::mem::zeroed() };
+        sb.block_count_lo = 24;
+        sb.first_data_block = 0;
+        sb.blocks_per_group = 8;
+        sb.inodes_per_group = 8;
+        sb.inode_count = 20;
+
+        assert_eq!(sb.block_group_count(), 3);
+        assert_eq!(sb.inode_count_in_group(0), 8);
+        assert_eq!(sb.inode_count_in_group(1), 8);
+        assert_eq!(sb.inode_count_in_group(2), 4);
+        assert_eq!(sb.inode_count_in_group(3), 0);
     }
 }

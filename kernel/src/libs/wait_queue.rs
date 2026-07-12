@@ -29,7 +29,7 @@ use crate::{
     process::{ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
     sched::{io_schedule, schedule, SchedMode},
     time::{
-        timer::{next_n_us_timer_jiffies, Timer},
+        timer::{clock, next_n_us_timer_jiffies, Timer},
         Duration, Instant,
     },
 };
@@ -126,6 +126,7 @@ impl WaitQueue {
             cond,
             WaitSignalMode::Uninterruptible,
             None,
+            None,
             None::<fn()>,
             false,
         )
@@ -143,6 +144,7 @@ impl WaitQueue {
         self.wait_until_impl(
             cond,
             WaitSignalMode::Uninterruptible,
+            None,
             None,
             None::<fn()>,
             true,
@@ -162,6 +164,7 @@ impl WaitQueue {
             cond,
             WaitSignalMode::Interruptible,
             None,
+            None,
             None::<fn()>,
             false,
         )
@@ -179,6 +182,7 @@ impl WaitQueue {
             cond,
             WaitSignalMode::Interruptible,
             None,
+            None,
             None::<fn()>,
             true,
         )
@@ -189,7 +193,14 @@ impl WaitQueue {
     where
         F: FnMut() -> Option<R>,
     {
-        self.wait_until_impl(cond, WaitSignalMode::Killable, None, None::<fn()>, false)
+        self.wait_until_impl(
+            cond,
+            WaitSignalMode::Killable,
+            None,
+            None,
+            None::<fn()>,
+            false,
+        )
     }
 
     /// Waits until condition returns `Some(R)` with timeout (interruptible).
@@ -207,6 +218,30 @@ impl WaitQueue {
             cond,
             WaitSignalMode::Interruptible,
             Some(timeout),
+            None,
+            None::<fn()>,
+            false,
+        )
+    }
+
+    /// Waits with a timeout expressed in scheduler ticks.
+    ///
+    /// This preserves timeout ranges that cannot be represented by `Duration`'s
+    /// microsecond storage and is useful for Linux socket timeout semantics.
+    #[track_caller]
+    pub fn wait_until_timeout_ticks<F, R>(
+        &self,
+        cond: F,
+        timeout_ticks: u64,
+    ) -> Result<R, SystemError>
+    where
+        F: FnMut() -> Option<R>,
+    {
+        self.wait_until_impl(
+            cond,
+            WaitSignalMode::Interruptible,
+            None,
+            Some(timeout_ticks),
             None::<fn()>,
             false,
         )
@@ -223,6 +258,7 @@ impl WaitQueue {
         mut cond: F,
         mode: WaitSignalMode,
         timeout: Option<Duration>,
+        timeout_ticks: Option<u64>,
         mut before_sleep: Option<B>,
         is_io: bool,
     ) -> Result<R, SystemError>
@@ -235,7 +271,11 @@ impl WaitQueue {
             return Ok(res);
         }
 
-        let deadline = timeout.map(|t| Instant::now() + t);
+        // Compute one fixed deadline for the whole wait. Reusing it across wakeups
+        // prevents timer re-registration or preemption from extending the budget.
+        let deadline_ticks = timeout_ticks
+            .map(|ticks| clock().saturating_add(ticks))
+            .or_else(|| timeout.map(|duration| next_n_us_timer_jiffies(duration.total_micros())));
 
         // Create only ONE waiter/waker pair (key difference from old implementation)
         let (waiter, waker) = Waiter::new_pair();
@@ -258,15 +298,9 @@ impl WaitQueue {
 
         loop {
             // Check timeout
-            if let Some(deadline) = deadline {
-                if Instant::now() >= deadline {
-                    self.remove_waker(&waker);
-                    return cancel_or_timeout(
-                        &mut cond,
-                        &waker,
-                        SystemError::EAGAIN_OR_EWOULDBLOCK,
-                    );
-                }
+            if deadline_ticks.is_some_and(|deadline| clock() >= deadline) {
+                self.remove_waker(&waker);
+                return cancel_or_timeout(&mut cond, &waker, SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
 
             // Enqueue waker BEFORE checking condition (critical for correctness!)
@@ -309,19 +343,16 @@ impl WaitQueue {
             }
 
             // Setup timeout timer if needed
-            let timer = if let Some(deadline) = deadline {
-                let remain = deadline
-                    .duration_since(Instant::now())
-                    .unwrap_or(Duration::ZERO);
-                if remain == Duration::ZERO {
+            let timer = if let Some(deadline) = deadline_ticks {
+                if clock() >= deadline {
                     self.remove_waker(&waker);
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                    return cancel_or_timeout(
+                        &mut cond,
+                        &waker,
+                        SystemError::EAGAIN_OR_EWOULDBLOCK,
+                    );
                 }
-                let sleep_us = remain.total_micros();
-                let t: Arc<Timer> = Timer::new(
-                    TimeoutWaker::new(waker.clone()),
-                    next_n_us_timer_jiffies(sleep_us),
-                );
+                let t: Arc<Timer> = Timer::new(TimeoutWaker::new(waker.clone()), deadline);
                 t.activate();
                 Some(t)
             } else {
@@ -376,6 +407,7 @@ impl WaitQueue {
             || if cond() { Some(()) } else { None },
             WaitSignalMode::Interruptible,
             None,
+            None,
             before_sleep,
             false,
         )
@@ -398,6 +430,7 @@ impl WaitQueue {
             || if cond() { Some(()) } else { None },
             WaitSignalMode::Interruptible,
             None,
+            None,
             before_sleep,
             true,
         )
@@ -415,6 +448,7 @@ impl WaitQueue {
         self.wait_until_impl(
             || if cond() { Some(()) } else { None },
             WaitSignalMode::Killable,
+            None,
             None,
             before_sleep,
             false,
@@ -434,6 +468,7 @@ impl WaitQueue {
         self.wait_until_impl(
             || if cond() { Some(()) } else { None },
             WaitSignalMode::Uninterruptible,
+            None,
             None,
             before_sleep,
             false,
@@ -456,6 +491,7 @@ impl WaitQueue {
             || if cond() { Some(()) } else { None },
             WaitSignalMode::Interruptible,
             timeout,
+            None,
             None::<fn()>,
             false,
         )
@@ -476,6 +512,7 @@ impl WaitQueue {
             || if cond() { Some(()) } else { None },
             WaitSignalMode::Interruptible,
             timeout,
+            None,
             None::<fn()>,
             true,
         )
@@ -497,6 +534,7 @@ impl WaitQueue {
             || if cond() { Some(()) } else { None },
             WaitSignalMode::Uninterruptible,
             timeout,
+            None,
             None::<fn()>,
             false,
         )
@@ -519,6 +557,7 @@ impl WaitQueue {
             || if cond() { Some(()) } else { None },
             WaitSignalMode::Interruptible,
             timeout,
+            None,
             before_sleep,
             false,
         )

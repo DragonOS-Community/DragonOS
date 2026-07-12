@@ -2,7 +2,9 @@ use core::sync::atomic::Ordering;
 use system_error::SystemError;
 
 use crate::net::socket::common::write_i32_getsockopt;
-use crate::net::socket::common::{parse_timeval_opt, write_timeval_opt};
+use crate::net::socket::common::{
+    parse_timeval_ticks, write_timeval_ticks, INFINITE_TIMEOUT_TICKS,
+};
 use crate::net::socket::{PSO, PSOL};
 
 use super::{packet_option, PacketSocket};
@@ -67,21 +69,18 @@ impl PacketSocket {
     fn set_socket_option(&self, name: usize, val: &[u8]) -> Result<(), SystemError> {
         match PSO::try_from(name as u32) {
             Ok(PSO::RCVTIMEO_OLD) | Ok(PSO::RCVTIMEO_NEW) => {
-                let d = parse_timeval_opt(val)?;
-                let us = d.map(|v| v.total_micros()).unwrap_or(u64::MAX);
-                self.recv_timeout_us.store(us, Ordering::Relaxed);
+                let ticks = parse_timeval_ticks(val)?.unwrap_or(INFINITE_TIMEOUT_TICKS);
+                self.recv_timeout_ticks.store(ticks, Ordering::Relaxed);
                 Ok(())
             }
-            // Preserve backward compatibility: unknown SOL_SOCKET options are silently accepted.
-            _ => Ok(()),
+            _ => Err(SystemError::ENOPROTOOPT),
         }
     }
     fn get_socket_option(&self, name: usize, value: &mut [u8]) -> Result<usize, SystemError> {
         match PSO::try_from(name as u32) {
             Ok(PSO::RCVTIMEO_OLD) | Ok(PSO::RCVTIMEO_NEW) => {
-                let us = self.recv_timeout_us.load(Ordering::Relaxed);
-                let us = if us == u64::MAX { 0 } else { us };
-                Ok(write_timeval_opt(value, us))
+                let ticks = self.recv_timeout_ticks.load(Ordering::Relaxed);
+                Ok(write_timeval_ticks(value, ticks))
             }
             _ => Err(SystemError::ENOPROTOOPT),
         }

@@ -12,8 +12,11 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <signal.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/uio.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <cstdint>
@@ -32,6 +35,9 @@
 
 // Ethernet protocol: ETH_P_ALL = 0x0003 (receive all protocols)
 inline constexpr int kEthPAll = 0x0003;
+inline constexpr int kPrivateEtherType = 0x88b5;
+inline constexpr int kSoRcvtimeoOld = 20;
+inline constexpr int kSoRcvtimeoNew = 66;
 
 struct TestSockAddrLl {
     uint16_t sll_family;
@@ -126,6 +132,47 @@ int MakeRawFd() {
     }
     return fd;
 }
+
+int MakeTimeoutFd() {
+    int fd = socket(AF_PACKET, SOCK_RAW, htons(kPrivateEtherType));
+    if (fd < 0) {
+        ADD_FAILURE() << "socket(AF_PACKET, SOCK_RAW) failed: " << ErrnoString(errno)
+                      << " (requires CAP_NET_RAW, please run as root)";
+    }
+    return fd;
+}
+
+int64_t MonotonicMillis() {
+    struct timespec ts {};
+    EXPECT_EQ(clock_gettime(CLOCK_MONOTONIC, &ts), 0);
+    return static_cast<int64_t>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
+}
+
+ssize_t ReadCall(int fd) {
+    char byte;
+    return read(fd, &byte, sizeof(byte));
+}
+
+ssize_t RecvCall(int fd) {
+    char byte;
+    return recv(fd, &byte, sizeof(byte), 0);
+}
+
+ssize_t RecvfromCall(int fd) {
+    char byte;
+    return recvfrom(fd, &byte, sizeof(byte), 0, nullptr, nullptr);
+}
+
+ssize_t RecvmsgCall(int fd) {
+    char byte;
+    struct iovec iov { &byte, sizeof(byte) };
+    struct msghdr msg {};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    return recvmsg(fd, &msg, 0);
+}
+
+void NoopSignalHandler(int) {}
 
 // setsockopt integer helper
 int SetIntOpt(int fd, int opt, int val) {
@@ -236,6 +283,136 @@ TEST(AfPacketSockopt, InvalidGetsockoptReturnsEnoprotoopt) {
     errno = 0;
     EXPECT_EQ(getsockopt(fd.Get(), SOL_PACKET, 9999, &got, &len), -1);
     EXPECT_EQ(errno, ENOPROTOOPT) << ErrnoString(errno);
+}
+
+TEST(AfPacketSockopt, ReceiveTimeoutOldAndNewRoundTrip) {
+    FdGuard fd(MakeTimeoutFd());
+    ASSERT_GE(fd.Get(), 0);
+
+    for (int option : {kSoRcvtimeoOld, kSoRcvtimeoNew}) {
+        struct timeval set_value { 1, 234567 };
+        ASSERT_EQ(setsockopt(fd.Get(), SOL_SOCKET, option, &set_value, sizeof(set_value)), 0)
+            << "option=" << option << ": " << ErrnoString(errno);
+
+        struct timeval got_value {};
+        socklen_t len = sizeof(got_value);
+        ASSERT_EQ(getsockopt(fd.Get(), SOL_SOCKET, option, &got_value, &len), 0)
+            << "option=" << option << ": " << ErrnoString(errno);
+        EXPECT_EQ(len, sizeof(got_value));
+        EXPECT_EQ(got_value.tv_sec, set_value.tv_sec);
+        // DragonOS HZ=250, matching Linux's ceil-to-tick socket timeout storage.
+        EXPECT_EQ(got_value.tv_usec, 236000);
+    }
+}
+
+TEST(AfPacketSockopt, ReceiveTimeoutZeroMeansInfinite) {
+    FdGuard fd(MakeTimeoutFd());
+    ASSERT_GE(fd.Get(), 0);
+    struct timeval zero {};
+    ASSERT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoRcvtimeoOld, &zero, sizeof(zero)), 0)
+        << ErrnoString(errno);
+    struct timeval got { -1, -1 };
+    socklen_t len = sizeof(got);
+    ASSERT_EQ(getsockopt(fd.Get(), SOL_SOCKET, kSoRcvtimeoOld, &got, &len), 0)
+        << ErrnoString(errno);
+    EXPECT_EQ(got.tv_sec, 0);
+    EXPECT_EQ(got.tv_usec, 0);
+}
+
+TEST(AfPacketSockopt, ReceiveTimeoutRejectsInvalidUsecAndShortNativeLayout) {
+    FdGuard fd(MakeTimeoutFd());
+    ASSERT_GE(fd.Get(), 0);
+
+    struct timeval invalid { 0, 1000000 };
+    errno = 0;
+    EXPECT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoRcvtimeoOld, &invalid, sizeof(invalid)), -1);
+    EXPECT_EQ(errno, EDOM) << ErrnoString(errno);
+
+    struct timeval valid { 0, 50000 };
+    for (socklen_t len : {static_cast<socklen_t>(8), static_cast<socklen_t>(12)}) {
+        errno = 0;
+        EXPECT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoRcvtimeoOld, &valid, len), -1);
+        EXPECT_EQ(errno, EINVAL) << "len=" << len << ": " << ErrnoString(errno);
+    }
+}
+
+TEST(AfPacketSockopt, NegativeReceiveTimeoutExpiresImmediatelyAndReadsBackZero) {
+    FdGuard fd(MakeTimeoutFd());
+    ASSERT_GE(fd.Get(), 0);
+    struct timeval negative { -1, 0 };
+    ASSERT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoRcvtimeoOld, &negative, sizeof(negative)), 0)
+        << ErrnoString(errno);
+
+    char byte;
+    errno = 0;
+    EXPECT_EQ(recv(fd.Get(), &byte, sizeof(byte), 0), -1);
+    EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << ErrnoString(errno);
+
+    struct timeval got { -1, -1 };
+    socklen_t len = sizeof(got);
+    ASSERT_EQ(getsockopt(fd.Get(), SOL_SOCKET, kSoRcvtimeoOld, &got, &len), 0);
+    EXPECT_EQ(got.tv_sec, 0);
+    EXPECT_EQ(got.tv_usec, 0);
+}
+
+TEST(AfPacketSockopt, UnknownSocketOptionReturnsEnoprotoopt) {
+    FdGuard fd(MakeTimeoutFd());
+    ASSERT_GE(fd.Get(), 0);
+    int value = 1;
+    errno = 0;
+    EXPECT_EQ(setsockopt(fd.Get(), SOL_SOCKET, 0x7fff, &value, sizeof(value)), -1);
+    EXPECT_EQ(errno, ENOPROTOOPT) << ErrnoString(errno);
+}
+
+TEST(AfPacketSockopt, AllReceiveEntrypointsHonorOneTimeoutBudget) {
+    using ReceiveCall = ssize_t (*)(int);
+    const ReceiveCall calls[] = {ReadCall, RecvCall, RecvfromCall, RecvmsgCall};
+
+    for (ReceiveCall call : calls) {
+        FdGuard fd(MakeTimeoutFd());
+        ASSERT_GE(fd.Get(), 0);
+        struct timeval timeout { 0, 50000 };
+        ASSERT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoRcvtimeoOld, &timeout, sizeof(timeout)), 0)
+            << ErrnoString(errno);
+
+        const int64_t started = MonotonicMillis();
+        errno = 0;
+        EXPECT_EQ(call(fd.Get()), -1);
+        const int saved_errno = errno;
+        const int64_t elapsed = MonotonicMillis() - started;
+        EXPECT_TRUE(saved_errno == EAGAIN || saved_errno == EWOULDBLOCK)
+            << ErrnoString(saved_errno);
+        EXPECT_GE(elapsed, 20) << "timeout returned too early";
+        EXPECT_LT(elapsed, 2000) << "timeout budget was not bounded";
+    }
+}
+
+TEST(AfPacketSockopt, HugeFiniteTimeoutDoesNotWrapToImmediateExpiry) {
+    FdGuard fd(MakeTimeoutFd());
+    ASSERT_GE(fd.Get(), 0);
+    // Above u64::MAX microseconds, but below Linux MAX_SCHEDULE_TIMEOUT/HZ.
+    struct timeval huge { 20000000000000LL, 0 };
+    ASSERT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoRcvtimeoOld, &huge, sizeof(huge)), 0)
+        << ErrnoString(errno);
+    struct timeval got {};
+    socklen_t got_len = sizeof(got);
+    ASSERT_EQ(getsockopt(fd.Get(), SOL_SOCKET, kSoRcvtimeoOld, &got, &got_len), 0);
+    EXPECT_EQ(got.tv_sec, huge.tv_sec);
+    EXPECT_EQ(got.tv_usec, 0);
+
+    struct sigaction action {};
+    struct sigaction old_action {};
+    action.sa_handler = NoopSignalHandler;
+    sigemptyset(&action.sa_mask);
+    ASSERT_EQ(sigaction(SIGALRM, &action, &old_action), 0);
+    alarm(1);
+    char byte;
+    errno = 0;
+    EXPECT_EQ(recv(fd.Get(), &byte, sizeof(byte), 0), -1);
+    const int saved_errno = errno;
+    alarm(0);
+    EXPECT_EQ(sigaction(SIGALRM, &old_action, nullptr), 0);
+    EXPECT_EQ(saved_errno, EINTR) << ErrnoString(saved_errno);
 }
 
 // ===== Test 18: recvmsg does not return ENOSYS =====

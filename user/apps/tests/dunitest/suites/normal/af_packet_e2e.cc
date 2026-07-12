@@ -9,7 +9,7 @@
 //   Test 5: SOCK_DGRAM send/receive -- kernel constructs Ethernet header, returns L3 payload length
 //
 // Runtime environment: DragonOS QEMU, eth0(virtio-net) 10.0.2.15/24, gateway 10.0.2.2.
-// Use GTEST_SKIP() instead of failure when no packets are received; SO_RCVTIMEO failures are not reported as errors (platform limitation).
+// Use GTEST_SKIP() when the runtime network environment cannot provide packets.
 
 #include <gtest/gtest.h>
 
@@ -272,7 +272,6 @@ void Stimulate(int tx_fd, int ifindex, const uint8_t local_mac[6]) {
 }
 
 // Create a SOCK_RAW socket bound to the specified interface, return fd or -1.
-// Also attempt to set SO_RCVTIMEO (DragonOS may not support it, failure is not an error).
 int MakeBoundRaw(const std::string& ifname, int ifindex, uint8_t mac[6]) {
     int fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (fd < 0) return -1;
@@ -286,11 +285,13 @@ int MakeBoundRaw(const std::string& ifname, int ifindex, uint8_t mac[6]) {
         return -1;
     }
     GetIfHwaddr(fd, ifname, mac);
-    // SO_RCVTIMEO: attempt to set, failure is not an error (DragonOS platform limitation)
     struct timeval tv;
     tv.tv_sec = 1;
     tv.tv_usec = 0;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        close(fd);
+        return -1;
+    }
     return fd;
 }
 
@@ -405,7 +406,7 @@ TEST(AfPacketE2E, RecvfromReturnsDataAndSockaddrLl) {
     struct sockaddr_ll from;
     bool got_inbound = false;
     ssize_t n = -1;
-    // MSG_DONTWAIT ensures non-blocking (SO_RCVTIMEO may not be supported on DragonOS)
+    // Poll in bounded nonblocking steps while waiting for the stimulated traffic.
     for (int attempt = 0; attempt < kRecvMaxAttempts; ++attempt) {
         std::memset(&from, 0, sizeof(from));
         socklen_t fromlen = sizeof(from);

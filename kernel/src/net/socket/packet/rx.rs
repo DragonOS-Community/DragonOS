@@ -148,16 +148,12 @@ impl PacketSocket {
         if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
             return self.dequeue(peek);
         }
-        loop {
-            match self.dequeue(peek) {
-                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                    self.wait_queue.wait_event_interruptible_timeout(
-                        || self.can_recv(),
-                        self.recv_timeout(),
-                    )?;
-                }
-                r => return r,
-            }
+        if let Some(timeout_ticks) = self.recv_timeout_ticks() {
+            self.wait_queue
+                .wait_until_timeout_ticks(|| self.dequeue(peek).ok(), timeout_ticks)
+        } else {
+            self.wait_queue
+                .wait_until_interruptible(|| self.dequeue(peek).ok())
         }
     }
     pub(super) fn recv_packet(&self, buf: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {

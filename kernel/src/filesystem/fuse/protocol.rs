@@ -75,6 +75,8 @@ pub const FUSE_EXPLICIT_INVAL_DATA: u64 = 1 << 25;
 /// Guest auto-mounts directories marked FUSE_ATTR_SUBMOUNT (Linux fuse.h: init->flags bit 27).
 pub const FUSE_SUBMOUNTS: u64 = 1 << 27;
 pub const FUSE_INIT_EXT: u64 = 1 << 30;
+/// Kernel supports expiry-only entry invalidation (Linux 6.6 fuse.h bit 35).
+pub const FUSE_HAS_EXPIRE_ONLY: u64 = 1 << 35;
 /// Allow shared mmap for FOPEN_DIRECT_IO files (Linux 6.6 fuse.h bit 36).
 #[allow(dead_code)]
 pub const FUSE_DIRECT_IO_ALLOW_MMAP: u64 = 1 << 36;
@@ -126,7 +128,30 @@ pub const FUSE_NOTIFY_INVAL_ENTRY: i32 = 3;
 pub const FUSE_NOTIFY_STORE: i32 = 4;
 pub const FUSE_NOTIFY_RETRIEVE: i32 = 5;
 pub const FUSE_NOTIFY_DELETE: i32 = 6;
+pub const FUSE_EXPIRE_ONLY: u32 = 1 << 0;
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseNotifyInvalInodeOut {
+    pub ino: u64,
+    pub off: i64,
+    pub len: i64,
+}
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseNotifyInvalEntryOut {
+    pub parent: u64,
+    pub namelen: u32,
+    pub flags: u32,
+}
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseNotifyDeleteOut {
+    pub parent: u64,
+    pub child: u64,
+    pub namelen: u32,
+    pub padding: u32,
+}
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct FuseInHeader {

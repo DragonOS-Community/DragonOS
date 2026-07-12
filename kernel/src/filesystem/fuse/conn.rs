@@ -31,8 +31,8 @@ use super::protocol::{
     FuseInHeader, FuseWriteIn, FUSE_ABORT_ERROR, FUSE_ASYNC_DIO, FUSE_ASYNC_READ,
     FUSE_ATOMIC_O_TRUNC, FUSE_AUTO_INVAL_DATA, FUSE_BIG_WRITES, FUSE_DESTROY, FUSE_DONT_MASK,
     FUSE_DO_READDIRPLUS, FUSE_EXPLICIT_INVAL_DATA, FUSE_EXPORT_SUPPORT, FUSE_FORGET, FUSE_FSYNC,
-    FUSE_FSYNCDIR, FUSE_GETXATTR, FUSE_HANDLE_KILLPRIV, FUSE_INIT_EXT, FUSE_INTERRUPT,
-    FUSE_LISTXATTR, FUSE_MAX_PAGES, FUSE_NO_OPENDIR_SUPPORT, FUSE_NO_OPEN_SUPPORT,
+    FUSE_FSYNCDIR, FUSE_GETXATTR, FUSE_HANDLE_KILLPRIV, FUSE_HAS_EXPIRE_ONLY, FUSE_INIT_EXT,
+    FUSE_INTERRUPT, FUSE_LISTXATTR, FUSE_MAX_PAGES, FUSE_NO_OPENDIR_SUPPORT, FUSE_NO_OPEN_SUPPORT,
     FUSE_PARALLEL_DIROPS, FUSE_POSIX_ACL, FUSE_POSIX_LOCKS, FUSE_READDIRPLUS_AUTO,
     FUSE_REMOVEXATTR, FUSE_SETXATTR, FUSE_SUBMOUNTS, FUSE_WRITEBACK_CACHE,
 };
@@ -582,6 +582,7 @@ pub struct FuseConn {
     backend_reply_limit: Option<usize>,
     reply_layout_minor: AtomicU32,
     background: Arc<FuseBackgroundState>,
+    filesystems: Mutex<Vec<Weak<super::fs::FuseFS>>>,
 }
 
 impl FuseConn {
@@ -667,7 +668,21 @@ impl FuseConn {
             backend_reply_limit,
             reply_layout_minor: AtomicU32::new(0),
             background: FuseBackgroundState::new(),
+            filesystems: Mutex::new(Vec::new()),
         })
+    }
+
+    pub(crate) fn register_filesystem(&self, fs: Weak<super::fs::FuseFS>) {
+        let mut filesystems = self.filesystems.lock();
+        filesystems.retain(|entry| entry.strong_count() != 0);
+        filesystems.push(fs);
+    }
+
+    pub(crate) fn filesystems(&self) -> Vec<Arc<super::fs::FuseFS>> {
+        let mut filesystems = self.filesystems.lock();
+        let live = filesystems.iter().filter_map(Weak::upgrade).collect();
+        filesystems.retain(|entry| entry.strong_count() != 0);
+        live
     }
 
     #[allow(dead_code)]
@@ -1079,6 +1094,7 @@ impl FuseConn {
             | FUSE_MAX_PAGES
             | FUSE_EXPLICIT_INVAL_DATA
             | FUSE_INIT_EXT
+            | FUSE_HAS_EXPIRE_ONLY
             | FUSE_WRITEBACK_CACHE
     }
 

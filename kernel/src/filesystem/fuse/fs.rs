@@ -11,7 +11,7 @@ use crate::{
         FilePrivateData, FileSystem, FileSystemMakerData, FileType, FsInfo, IndexNode, InodeFlags,
         InodeId, InodeMode, Magic, Metadata, MountableFileSystem, SuperBlock, FSMAKER,
     },
-    libs::mutex::Mutex,
+    libs::{mutex::Mutex, rwsem::RwSem},
     mm::{
         fault::{PageFaultHandler, PageFaultMessage},
         VirtRegion, VmFaultReason, VmFlags,
@@ -68,6 +68,7 @@ pub struct FuseFS {
     nodes: Mutex<BTreeMap<u64, Weak<FuseNode>>>,
     retired_nodes: Mutex<Vec<Weak<FuseNode>>>,
     state: AtomicU8,
+    notify_barrier: RwSem<()>,
     default_permissions: bool,
     is_submount: bool,
 }
@@ -76,6 +77,24 @@ impl FuseFS {
     const STATE_ACTIVE: u8 = 0;
     const STATE_TEARING_DOWN: u8 = 1;
     const STATE_DEAD: u8 = 2;
+
+    fn live_node(&self, nodeid: u64) -> Option<Arc<FuseNode>> {
+        if self.state.load(Ordering::Acquire) != Self::STATE_ACTIVE {
+            return None;
+        }
+        if self.root.nodeid() == nodeid {
+            return Some(self.root.clone());
+        }
+        self.nodes.lock().get(&nodeid).and_then(Weak::upgrade)
+    }
+
+    pub(crate) fn notify_node<F>(&self, nodeid: u64, notify: F) -> Option<Result<(), SystemError>>
+    where
+        F: FnOnce(&Arc<FuseNode>) -> Result<(), SystemError>,
+    {
+        let _lifetime = self.notify_barrier.read();
+        self.live_node(nodeid).map(|node| notify(&node))
+    }
 
     fn should_retire_node(
         node: &Arc<FuseNode>,
@@ -362,16 +381,19 @@ impl FuseFS {
             nodes: Mutex::new(BTreeMap::new()),
             retired_nodes: Mutex::new(Vec::new()),
             state: AtomicU8::new(Self::STATE_ACTIVE),
+            notify_barrier: RwSem::new(()),
             default_permissions: parent.default_permissions,
             is_submount: true,
         });
         fs.nodes
             .lock()
             .insert(root_nodeid, Arc::downgrade(&fs.root));
+        fs.conn.register_filesystem(Arc::downgrade(&fs));
         fs
     }
 
     fn teardown_nodes(&self) {
+        let _lifetime = self.notify_barrier.write();
         if self
             .state
             .compare_exchange(
@@ -586,12 +608,14 @@ impl MountableFileSystem for FuseFS {
             nodes: Mutex::new(BTreeMap::new()),
             retired_nodes: Mutex::new(Vec::new()),
             state: AtomicU8::new(Self::STATE_ACTIVE),
+            notify_barrier: RwSem::new(()),
             default_permissions: mount_data.default_permissions,
             is_submount: false,
         });
         fs.nodes
             .lock()
             .insert(FUSE_ROOT_ID, Arc::downgrade(&fs.root));
+        conn.register_filesystem(Arc::downgrade(&fs));
 
         if let Err(e) = conn.enqueue_init() {
             conn.rollback_mount_setup();

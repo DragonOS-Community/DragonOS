@@ -1047,6 +1047,18 @@ fail_no_umount:
 static int ext_test_p3_noopen_readdirplus_notify() {
     const char *mp = "/tmp/test_fuse_p3_noopen";
     ssize_t wn = -1;
+    ssize_t verify_n = -1;
+    int f = -1;
+    uint32_t reads_before_inval = 0;
+    uint32_t lookups_before_inval = 0;
+    size_t entry_notify_len = 0;
+    void *private_map = MAP_FAILED;
+    char verify_buf[64];
+    struct {
+        struct fuse_out_header out;
+        struct fuse_notify_inval_entry_out inval;
+        char name[sizeof("hello.txt")];
+    } entry_notify;
     if (ensure_dir(mp) != 0) {
         printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
         return -1;
@@ -1066,6 +1078,8 @@ static int ext_test_p3_noopen_readdirplus_notify() {
     volatile uint32_t release_count = 0;
     volatile uint32_t releasedir_count = 0;
     volatile uint32_t readdirplus_count = 0;
+    volatile uint32_t lookup_count = 0;
+    volatile uint32_t read_count = 0;
 
     struct fuse_daemon_args args;
     memset(&args, 0, sizeof(args));
@@ -1079,8 +1093,12 @@ static int ext_test_p3_noopen_readdirplus_notify() {
     args.release_count = &release_count;
     args.releasedir_count = &releasedir_count;
     args.readdirplus_count = &readdirplus_count;
+    args.lookup_count = &lookup_count;
+    args.read_count = &read_count;
     args.force_open_enosys = 1;
     args.force_opendir_enosys = 1;
+    args.entry_valid_sec = 60;
+    args.attr_valid_sec = 60;
     args.init_out_flags_override = FUSE_INIT_EXT | FUSE_MAX_PAGES | FUSE_NO_OPEN_SUPPORT |
                                    FUSE_NO_OPENDIR_SUPPORT | FUSE_DO_READDIRPLUS;
 
@@ -1124,6 +1142,19 @@ static int ext_test_p3_noopen_readdirplus_notify() {
         }
     }
 
+    f = open(file_path, O_RDONLY);
+    if (f < 0 || read(f, verify_buf, sizeof(verify_buf)) <= 0) {
+        printf("[FAIL] keep-open read before notify: %s (errno=%d)\n", strerror(errno), errno);
+        if (f >= 0) close(f);
+        goto fail;
+    }
+    private_map = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE, f, 0);
+    if (private_map == MAP_FAILED) {
+        printf("[FAIL] MAP_PRIVATE before notify: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    ((volatile char *)private_map)[0] = 'P';
+
     for (int i = 0; i < 2; i++) {
         DIR *dir = opendir(mp);
         if (!dir) {
@@ -1163,6 +1194,51 @@ static int ext_test_p3_noopen_readdirplus_notify() {
 
     usleep(100 * 1000);
 
+    reads_before_inval = read_count;
+    if (lseek(f, 0, SEEK_SET) < 0) {
+        printf("[FAIL] lseek after inode notify: %s (errno=%d)\n", strerror(errno), errno);
+        close(f);
+        goto fail;
+    }
+    verify_n = read(f, verify_buf, sizeof(verify_buf));
+    close(f);
+    f = -1;
+    if (verify_n <= 0 || read_count <= reads_before_inval) {
+        printf("[FAIL] inode notify did not force a fresh READ: before=%u after=%u n=%zd\n",
+               reads_before_inval, read_count, verify_n);
+        goto fail;
+    }
+    if (((volatile char *)private_map)[0] != 'P') {
+        printf("[FAIL] inode notify discarded MAP_PRIVATE COW data\n");
+        goto fail;
+    }
+
+    memset(&entry_notify, 0, sizeof(entry_notify));
+    entry_notify_len = offsetof(decltype(entry_notify), name) + sizeof(entry_notify.name);
+    entry_notify.out.len = entry_notify_len;
+    entry_notify.out.error = FUSE_NOTIFY_INVAL_ENTRY;
+    entry_notify.inval.parent = 1;
+    entry_notify.inval.namelen = strlen("hello.txt");
+    memcpy(entry_notify.name, "hello.txt", sizeof("hello.txt"));
+    lookups_before_inval = lookup_count;
+    wn = write(fd, &entry_notify, entry_notify_len);
+    if (wn != (ssize_t)entry_notify_len) {
+        printf("[FAIL] write entry notify: wn=%zd errno=%d (%s)\n", wn, errno,
+               strerror(errno));
+        goto fail;
+    }
+    f = open(file_path, O_RDONLY);
+    if (f < 0) {
+        printf("[FAIL] open after entry notify: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    close(f);
+    if (lookup_count <= lookups_before_inval) {
+        printf("[FAIL] entry notify did not force a fresh LOOKUP: before=%u after=%u\n",
+               lookups_before_inval, lookup_count);
+        goto fail;
+    }
+
     if (open_count != 1 || opendir_count != 1 || release_count != 0 || releasedir_count != 0 ||
         readdirplus_count == 0) {
         printf("[FAIL] counters open=%u opendir=%u release=%u releasedir=%u readdirplus=%u\n",
@@ -1170,6 +1246,8 @@ static int ext_test_p3_noopen_readdirplus_notify() {
         goto fail;
     }
 
+    munmap(private_map, 4096);
+    private_map = MAP_FAILED;
     if (umount(mp) != 0) {
         printf("[FAIL] umount(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
         goto fail_no_umount;
@@ -1181,6 +1259,9 @@ static int ext_test_p3_noopen_readdirplus_notify() {
     return 0;
 
 fail:
+    if (private_map != MAP_FAILED) {
+        munmap(private_map, 4096);
+    }
     umount(mp);
 fail_no_umount:
     stop = 1;
@@ -2740,6 +2821,7 @@ static int ext_test_init_requests_linux_no_open_support() {
     volatile int stop = 0;
     volatile int init_done = 0;
     volatile uint32_t init_flags = 0;
+    volatile uint32_t init_flags2 = 0;
 
     struct fuse_daemon_args args;
     memset(&args, 0, sizeof(args));
@@ -2748,6 +2830,7 @@ static int ext_test_init_requests_linux_no_open_support() {
     args.init_done = &init_done;
     args.stop_on_destroy = 1;
     args.init_in_flags = &init_flags;
+    args.init_in_flags2 = &init_flags2;
 
     pthread_t th;
     if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) {
@@ -2774,9 +2857,11 @@ static int ext_test_init_requests_linux_no_open_support() {
 
     if ((init_flags & FUSE_NO_OPEN_SUPPORT) == 0 ||
         (init_flags & FUSE_NO_OPENDIR_SUPPORT) == 0 ||
-        (init_flags & FUSE_WRITEBACK_CACHE) == 0) {
-        printf("[FAIL] INIT flags missing no-open/writeback support bits: flags=0x%x\n",
-               init_flags);
+        (init_flags & FUSE_WRITEBACK_CACHE) == 0 ||
+        (init_flags2 & (1u << (35 - 32))) == 0) {
+        printf("[FAIL] INIT flags missing no-open/writeback/expire-only support bits: "
+               "flags=0x%x flags2=0x%x\n",
+               init_flags, init_flags2);
         goto fail;
     }
 

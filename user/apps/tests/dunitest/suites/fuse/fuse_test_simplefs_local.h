@@ -226,6 +226,9 @@ static inline int fuse_test_log_enabled(void) {
 #ifndef FUSE_NOTIFY_INVAL_INODE
 #define FUSE_NOTIFY_INVAL_INODE 2
 #endif
+#ifndef FUSE_NOTIFY_INVAL_ENTRY
+#define FUSE_NOTIFY_INVAL_ENTRY 3
+#endif
 
 #ifndef RENAME_NOREPLACE
 #define RENAME_NOREPLACE (1u << 0)
@@ -520,6 +523,12 @@ struct fuse_notify_inval_inode_out {
     uint64_t ino;
     int64_t off;
     int64_t len;
+};
+
+struct fuse_notify_inval_entry_out {
+    uint64_t parent;
+    uint32_t namelen;
+    uint32_t flags;
 };
 
 static inline size_t fuse_dirent_rec_len(size_t namelen) {

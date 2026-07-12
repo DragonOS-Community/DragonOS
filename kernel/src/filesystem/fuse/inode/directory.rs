@@ -108,6 +108,33 @@ impl FuseNode {
         }
     }
 
+    pub(crate) fn notify_invalidate_child(
+        &self,
+        name: &str,
+        expected_child: Option<u64>,
+    ) -> Result<(), SystemError> {
+        let removed = self
+            .remove_lookup_cache_entry(name)
+            .ok_or(SystemError::ENOENT)?;
+        let matches = expected_child.is_none_or(|nodeid| removed.child.nodeid() == nodeid);
+        removed.child.clear_dname_if(name);
+        Self::clear_removed_lookup_entries(vec![removed]);
+        self.invalidate_cached_metadata();
+        if matches {
+            Ok(())
+        } else {
+            Err(SystemError::ENOENT)
+        }
+    }
+
+    pub(crate) fn notify_expire_child(&self, name: &str) -> Result<(), SystemError> {
+        let mut cache = self.lookup_cache.lock();
+        let entry = cache.get_mut(name).ok_or(SystemError::ENOENT)?;
+        entry.deadline_ns = 0;
+        self.invalidate_cached_metadata();
+        Ok(())
+    }
+
     pub(super) fn lookup_cached_child(&self, name: &str) -> Option<Arc<FuseNode>> {
         self.prune_lookup_cache();
         let cache = self.lookup_cache.lock();

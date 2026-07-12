@@ -10,7 +10,9 @@ use crate::{
     arch::MMArch,
     exception::workqueue::{schedule_work, Work},
     filesystem::{
-        page_cache::{PageCache, PageCacheBackend, PageCacheReadDmaReservation},
+        page_cache::{
+            schedule_pagecache_io, PageCache, PageCacheBackend, PageCacheReadDmaReservation,
+        },
         vfs::{file::FileFlags, FilePrivateData, FileType, IndexNode, Metadata, SetMetadataMask},
     },
     libs::mutex::Mutex,
@@ -82,6 +84,61 @@ impl PageCacheBackend for FusePageCacheBackend {
 }
 
 impl FuseNode {
+    pub(crate) fn notify_invalidate_pages(&self, offset: i64, len: i64) -> Result<(), SystemError> {
+        self.invalidate_cached_metadata();
+        if offset < 0 {
+            return Ok(());
+        }
+        let Some(page_cache) = self.cached_page_cache() else {
+            return Ok(());
+        };
+        let start_index = (offset as usize) >> MMArch::PAGE_SHIFT;
+        let end_index = if len <= 0 {
+            usize::MAX
+        } else {
+            let last = (offset as u64).saturating_add(len as u64).saturating_sub(1);
+            core::cmp::min(last, usize::MAX as u64) as usize >> MMArch::PAGE_SHIFT
+        };
+        let end_exclusive = end_index.checked_add(1);
+
+        // Linux unmap_mapping_pages(..., even_cows=false) preserves private
+        // MAP_PRIVATE COW pages while zapping mappings backed by page cache.
+        let _ = page_cache.unmap_mapping_pages(start_index, end_exclusive);
+        // Remove cache entries that need no daemon I/O before acknowledging the
+        // notification. Dirty/loading/writeback entries remain pinned until the
+        // deferred phase has made them safe to discard.
+        {
+            let _invalidate = page_cache.invalidate_write();
+            let _ = page_cache
+                .manager()
+                .discard_clean_range_nowait(start_index, end_index);
+        }
+        // Laundering a dirty FUSE page sends FUSE_WRITE and waits for the daemon.
+        // A notification is itself written by that daemon, so doing this inline
+        // deadlocks a single-threaded daemon before it can read the new request.
+        // Finish invalidation after the notify write has returned.  The first
+        // unmap above immediately prevents stale page-cache mappings from being
+        // used while the work is pending.
+        // This may block on userspace I/O, so use the dedicated page-cache I/O
+        // pool rather than the single system workqueue.
+        schedule_pagecache_io(Work::new(move || {
+            // Linux invalidate_inode_pages2_range() launders dirty folios before
+            // removing clean cache pages.  Keep that ordering and best-effort
+            // behavior, but outside the unsolicited-notify call stack.
+            let _ = page_cache
+                .manager()
+                .launder_range_for_invalidate(start_index, end_index);
+            {
+                let _invalidate = page_cache.invalidate_write();
+                let _ = page_cache
+                    .manager()
+                    .discard_clean_range(start_index, end_index);
+            }
+            let _ = page_cache.unmap_mapping_pages(start_index, end_exclusive);
+        }));
+        Ok(())
+    }
+
     pub(crate) fn with_writeback_admission<T>(&self, f: impl FnOnce() -> T) -> T {
         let _guard = self.writeback_barrier.read();
         f()

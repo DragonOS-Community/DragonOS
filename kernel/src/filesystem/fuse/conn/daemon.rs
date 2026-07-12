@@ -7,8 +7,9 @@ use system_error::SystemError;
 use crate::filesystem::epoll::{EPollEventType, EPollItem};
 
 use super::super::protocol::{
-    fuse_read_struct, FuseAttrOut, FuseEntryOut, FuseInHeader, FuseInitOut, FuseOpenOut,
-    FuseOutHeader, FuseStatfsOut, FuseWriteIn, FUSE_CREATE, FUSE_DESTROY, FUSE_FLUSH, FUSE_GETATTR,
+    fuse_read_struct, FuseAttrOut, FuseEntryOut, FuseInHeader, FuseInitOut, FuseNotifyDeleteOut,
+    FuseNotifyInvalEntryOut, FuseNotifyInvalInodeOut, FuseOpenOut, FuseOutHeader, FuseStatfsOut,
+    FuseWriteIn, FUSE_CREATE, FUSE_DESTROY, FUSE_EXPIRE_ONLY, FUSE_FLUSH, FUSE_GETATTR,
     FUSE_GETXATTR, FUSE_INIT, FUSE_INIT_EXT, FUSE_INTERRUPT, FUSE_KERNEL_MINOR_VERSION,
     FUSE_KERNEL_VERSION, FUSE_LINK, FUSE_LISTXATTR, FUSE_LOOKUP, FUSE_MAX_PAGES,
     FUSE_MIN_READ_BUFFER, FUSE_MKDIR, FUSE_MKNOD, FUSE_NOTIFY_DELETE, FUSE_NOTIFY_INVAL_ENTRY,
@@ -757,17 +758,116 @@ impl FuseConn {
             return Err(SystemError::EINVAL);
         }
         match code {
-            FUSE_NOTIFY_POLL
-            | FUSE_NOTIFY_INVAL_INODE
-            | FUSE_NOTIFY_INVAL_ENTRY
-            | FUSE_NOTIFY_STORE
-            | FUSE_NOTIFY_RETRIEVE
-            | FUSE_NOTIFY_DELETE => {
-                log::debug!("fuse: notify code={} len={}", code, payload.len());
-                Ok(())
+            FUSE_NOTIFY_INVAL_INODE => {
+                if payload.len() != size_of::<FuseNotifyInvalInodeOut>() {
+                    return Err(SystemError::EINVAL);
+                }
+                let arg: FuseNotifyInvalInodeOut = fuse_read_struct(payload)?;
+                self.notify_nodes(arg.ino, |node| {
+                    node.notify_invalidate_pages(arg.off, arg.len)
+                })
+            }
+            FUSE_NOTIFY_INVAL_ENTRY => {
+                let (arg, name) = Self::notify_entry(payload)?;
+                if arg.flags & FUSE_EXPIRE_ONLY != 0 {
+                    if arg.flags != FUSE_EXPIRE_ONLY {
+                        return Err(SystemError::EINVAL);
+                    }
+                    return self.notify_nodes(arg.parent, |node| node.notify_expire_child(name));
+                }
+                if arg.flags != 0 {
+                    return Err(SystemError::EINVAL);
+                }
+                self.notify_nodes(arg.parent, |node| node.notify_invalidate_child(name, None))
+            }
+            FUSE_NOTIFY_DELETE => {
+                let (arg, name) = Self::notify_delete(payload)?;
+                self.notify_nodes(arg.parent, |node| {
+                    node.notify_invalidate_child(name, Some(arg.child))
+                })
+            }
+            FUSE_NOTIFY_POLL | FUSE_NOTIFY_STORE | FUSE_NOTIFY_RETRIEVE => {
+                Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
             }
             _ => Err(SystemError::EINVAL),
         }
+    }
+
+    fn notify_nodes<F>(&self, nodeid: u64, mut notify: F) -> Result<(), SystemError>
+    where
+        F: FnMut(&Arc<super::super::inode::FuseNode>) -> Result<(), SystemError>,
+    {
+        let mut matched = false;
+        let mut succeeded = false;
+        let mut soft_error = None;
+        let mut hard_error = None;
+        for fs in self.filesystems() {
+            let Some(result) = fs.notify_node(nodeid, |node| notify(node)) else {
+                continue;
+            };
+            matched = true;
+            match result {
+                Ok(()) => succeeded = true,
+                Err(SystemError::ENOENT) => soft_error = Some(SystemError::ENOENT),
+                Err(error) => {
+                    if hard_error.is_none() {
+                        hard_error = Some(error);
+                    }
+                }
+            }
+        }
+        if let Some(error) = hard_error {
+            Err(error)
+        } else if !matched {
+            Err(SystemError::ENOENT)
+        } else if succeeded {
+            Ok(())
+        } else if let Some(error) = soft_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn notify_name(payload: &[u8], header_len: usize, namelen: usize) -> Result<&str, SystemError> {
+        if namelen > 255 || payload.len() != header_len.saturating_add(namelen).saturating_add(1) {
+            return Err(if namelen > 255 {
+                SystemError::ENAMETOOLONG
+            } else {
+                SystemError::EINVAL
+            });
+        }
+        let bytes = &payload[header_len..header_len + namelen];
+        if payload[header_len + namelen] != 0 || bytes.contains(&0) {
+            return Err(SystemError::EINVAL);
+        }
+        core::str::from_utf8(bytes).map_err(|_| SystemError::EINVAL)
+    }
+
+    fn notify_entry(payload: &[u8]) -> Result<(FuseNotifyInvalEntryOut, &str), SystemError> {
+        if payload.len() < size_of::<FuseNotifyInvalEntryOut>() {
+            return Err(SystemError::EINVAL);
+        }
+        let arg: FuseNotifyInvalEntryOut = fuse_read_struct(payload)?;
+        let name = Self::notify_name(
+            payload,
+            size_of::<FuseNotifyInvalEntryOut>(),
+            arg.namelen as usize,
+        )?;
+        Ok((arg, name))
+    }
+
+    fn notify_delete(payload: &[u8]) -> Result<(FuseNotifyDeleteOut, &str), SystemError> {
+        if payload.len() < size_of::<FuseNotifyDeleteOut>() {
+            return Err(SystemError::EINVAL);
+        }
+        let arg: FuseNotifyDeleteOut = fuse_read_struct(payload)?;
+        let name = Self::notify_name(
+            payload,
+            size_of::<FuseNotifyDeleteOut>(),
+            arg.namelen as usize,
+        )?;
+        Ok((arg, name))
     }
 
     fn is_expected_reply_error(opcode: u32, errno: i32) -> bool {

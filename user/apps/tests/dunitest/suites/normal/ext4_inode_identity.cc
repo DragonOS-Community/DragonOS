@@ -165,6 +165,40 @@ class LoopExt4 {
         mounted_ = false;
     }
 
+    void Detach() {
+        ASSERT_TRUE(mounted_);
+        ASSERT_EQ(0, umount2(mount_point_.c_str(), MNT_DETACH)) << strerror(errno);
+        mounted_ = false;
+        detached_ = true;
+    }
+
+    void FinishDetached() {
+        ASSERT_TRUE(detached_);
+        // MNT_DETACH drops the namespace edge immediately, while final
+        // superblock teardown runs after the last external owner is released.
+        // Do not detach the loop backing underneath that teardown.
+        usleep(50 * 1000);
+        bool cleared = false;
+        for (int attempt = 0; attempt < 100; ++attempt) {
+            if (ioctl(loop_fd_, kLoopClrFd, 0) == 0) {
+                cleared = true;
+                break;
+            }
+            ASSERT_EQ(EBUSY, errno) << strerror(errno);
+            usleep(5 * 1000);
+        }
+        ASSERT_TRUE(cleared) << "detached ext4 mount retained the loop device";
+        detached_ = false;
+        close(loop_fd_);
+        loop_fd_ = -1;
+        close(backing_fd_);
+        backing_fd_ = -1;
+        ASSERT_EQ(0, rmdir(mount_point_.c_str())) << strerror(errno);
+        mount_point_.clear();
+        ASSERT_EQ(0, unlink(image_.c_str())) << strerror(errno);
+        image_.clear();
+    }
+
     const std::string& mount_point() const {
         return mount_point_;
     }
@@ -176,6 +210,7 @@ class LoopExt4 {
     int backing_fd_ = -1;
     int loop_fd_ = -1;
     bool mounted_ = false;
+    bool detached_ = false;
 };
 
 void WriteAll(int fd, const char* data, size_t len) {
@@ -257,6 +292,186 @@ TEST(Ext4InodeIdentity, OpenFileSurvivesFinalUnlink) {
     ASSERT_EQ(0, close(fd)) << strerror(errno);
 
     ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
+TEST(Ext4InodeIdentity, DeletedFdSupportsTruncateAndFallocate) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+
+    const std::string path = fs.mount_point() + "/deleted_fd_mutation";
+    int fd = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    constexpr char kPrefix[] = "retained-prefix";
+    ASSERT_NO_FATAL_FAILURE(WriteAll(fd, kPrefix, sizeof(kPrefix) - 1));
+    ASSERT_EQ(0, unlink(path.c_str())) << strerror(errno);
+    struct stat st = {};
+    ASSERT_EQ(0, fstat(fd, &st)) << strerror(errno);
+    EXPECT_EQ(0u, st.st_nlink);
+
+    ASSERT_EQ(0, ftruncate(fd, 8)) << strerror(errno);
+    ASSERT_EQ(0, fallocate(fd, 0, 0, 8192)) << strerror(errno);
+    ASSERT_EQ(0, fstat(fd, &st)) << strerror(errno);
+    EXPECT_EQ(8192, st.st_size);
+    char data[16] = {};
+    ASSERT_EQ(16, pread(fd, data, sizeof(data), 0)) << strerror(errno);
+    EXPECT_EQ(0, memcmp(data, kPrefix, 8));
+    for (size_t i = 8; i < sizeof(data); ++i) {
+        EXPECT_EQ(0, data[i]);
+    }
+    ASSERT_EQ(0, fsync(fd)) << strerror(errno);
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
+TEST(Ext4InodeIdentity, DirtySharedMappingSurvivesUnlinkAndFdClose) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+
+    const std::string path = fs.mount_point() + "/dirty_mapping";
+    int fd = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    ASSERT_EQ(0, ftruncate(fd, 8192)) << strerror(errno);
+    char* mapping = static_cast<char*>(
+        mmap(nullptr, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
+    ASSERT_NE(MAP_FAILED, mapping) << strerror(errno);
+    memcpy(mapping + 64, "first-page", 10);
+    memcpy(mapping + 4096 + 32, "second-page", 11);
+    ASSERT_EQ(0, unlink(path.c_str())) << strerror(errno);
+    ASSERT_EQ(0, msync(mapping, 8192, MS_SYNC)) << strerror(errno);
+    ASSERT_EQ(0, fsync(fd)) << strerror(errno);
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+
+    EXPECT_EQ(0, memcmp(mapping + 64, "first-page", 10));
+    memcpy(mapping + 4096 + 32, "after-close", 11);
+    ASSERT_EQ(0, msync(mapping + 4096, 4096, MS_SYNC)) << strerror(errno);
+    EXPECT_EQ(-1, umount(fs.mount_point().c_str()));
+    EXPECT_EQ(EBUSY, errno);
+    ASSERT_EQ(0, munmap(mapping, 8192)) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
+TEST(Ext4InodeIdentity, SharedMmapWriteSerializesWithTruncate) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+
+    const std::string path = fs.mount_point() + "/mmap_truncate_race";
+    int fd = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    ASSERT_EQ(0, ftruncate(fd, 8192)) << strerror(errno);
+    char* mapping = static_cast<char*>(
+        mmap(nullptr, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
+    ASSERT_NE(MAP_FAILED, mapping) << strerror(errno);
+
+    std::atomic<bool> start{false};
+    std::atomic<int> first_error{0};
+    auto record_error = [&](int error) {
+        int expected = 0;
+        first_error.compare_exchange_strong(expected, error);
+    };
+    std::thread writer([&] {
+        while (!start.load(std::memory_order_acquire)) {
+        }
+        for (int iteration = 0; iteration < 64; ++iteration) {
+            if (madvise(mapping, 4096, MADV_DONTNEED) != 0) {
+                record_error(errno);
+                return;
+            }
+            mapping[iteration % 64] = static_cast<char>(iteration);
+            if (msync(mapping, 4096, MS_SYNC) != 0) {
+                record_error(errno);
+                return;
+            }
+        }
+    });
+    std::thread truncater([&] {
+        while (!start.load(std::memory_order_acquire)) {
+        }
+        for (int iteration = 0; iteration < 64; ++iteration) {
+            if (ftruncate(fd, (iteration & 1) ? 8192 : 4096) != 0) {
+                record_error(errno);
+                return;
+            }
+        }
+    });
+    start.store(true, std::memory_order_release);
+    writer.join();
+    truncater.join();
+    EXPECT_EQ(0, first_error.load());
+    ASSERT_EQ(0, ftruncate(fd, 8192)) << strerror(errno);
+    ASSERT_EQ(0, msync(mapping, 4096, MS_SYNC)) << strerror(errno);
+    ASSERT_EQ(0, fsync(fd)) << strerror(errno);
+    ASSERT_EQ(0, munmap(mapping, 8192)) << strerror(errno);
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+    ASSERT_EQ(0, unlink(path.c_str())) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
+TEST(Ext4InodeIdentity, FinalAndNonFinalHardLinkRemoval) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+
+    const std::string first = fs.mount_point() + "/hardlink_first";
+    const std::string second = fs.mount_point() + "/hardlink_second";
+    int fd = open(first.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    constexpr char kData[] = "hard-link-lifetime";
+    ASSERT_NO_FATAL_FAILURE(WriteAll(fd, kData, sizeof(kData) - 1));
+    ASSERT_EQ(0, link(first.c_str(), second.c_str())) << strerror(errno);
+    ASSERT_EQ(0, unlink(first.c_str())) << strerror(errno);
+    struct stat fd_stat = {};
+    struct stat path_stat = {};
+    ASSERT_EQ(0, fstat(fd, &fd_stat)) << strerror(errno);
+    ASSERT_EQ(0, stat(second.c_str(), &path_stat)) << strerror(errno);
+    EXPECT_EQ(1u, fd_stat.st_nlink);
+    EXPECT_EQ(fd_stat.st_ino, path_stat.st_ino);
+
+    ASSERT_EQ(0, unlink(second.c_str())) << strerror(errno);
+    ASSERT_EQ(0, fstat(fd, &fd_stat)) << strerror(errno);
+    EXPECT_EQ(0u, fd_stat.st_nlink);
+    EXPECT_EQ(-1, access(second.c_str(), F_OK));
+    EXPECT_EQ(ENOENT, errno);
+    char data[sizeof(kData)] = {};
+    ASSERT_EQ(static_cast<ssize_t>(sizeof(kData) - 1),
+              pread(fd, data, sizeof(kData) - 1, 0))
+        << strerror(errno);
+    EXPECT_EQ(0, memcmp(data, kData, sizeof(kData) - 1));
+    ASSERT_EQ(1, pwrite(fd, "!", 1, sizeof(kData) - 1)) << strerror(errno);
+    ASSERT_EQ(0, fsync(fd)) << strerror(errno);
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
+TEST(Ext4InodeIdentity, LazyUnmountPreservesLiveUnlinkedFd) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+
+    const std::string path = fs.mount_point() + "/lazy_unmount";
+    int fd = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    constexpr char kData[] = "before-detach";
+    ASSERT_NO_FATAL_FAILURE(WriteAll(fd, kData, sizeof(kData) - 1));
+    ASSERT_EQ(0, unlink(path.c_str())) << strerror(errno);
+    EXPECT_EQ(-1, umount(fs.mount_point().c_str()));
+    EXPECT_EQ(EBUSY, errno);
+    ASSERT_NO_FATAL_FAILURE(fs.Detach());
+
+    struct stat st = {};
+    ASSERT_EQ(0, fstat(fd, &st)) << strerror(errno);
+    EXPECT_EQ(0u, st.st_nlink);
+    ASSERT_EQ(1, pwrite(fd, "!", 1, sizeof(kData) - 1)) << strerror(errno);
+    ASSERT_EQ(0, fsync(fd)) << strerror(errno);
+    char data[sizeof(kData)] = {};
+    ASSERT_EQ(static_cast<ssize_t>(sizeof(kData) - 1),
+              pread(fd, data, sizeof(kData) - 1, 0))
+        << strerror(errno);
+    EXPECT_EQ(0, memcmp(data, kData, sizeof(kData) - 1));
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.FinishDetached());
 }
 
 TEST(Ext4InodeIdentity, DirtyClosedUnlinkSyncfsCompletes) {

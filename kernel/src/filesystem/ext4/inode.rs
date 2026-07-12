@@ -13,7 +13,7 @@ use crate::{
     libs::{
         casting::DowncastArc,
         mutex::{Mutex, MutexGuard},
-        rwsem::RwSem,
+        rwsem::{RwSem, RwSemReadGuard},
         spinlock::SpinLock,
         wait_queue::WaitQueue,
     },
@@ -167,6 +167,13 @@ impl Ext4InodeLifecycle {
 pub(super) struct Ext4InodeOperation {
     lifecycle: Arc<Ext4InodeLifecycle>,
     owner: RawPid,
+}
+
+/// Keeps the ext4 mmap write-preparation critical section alive until the
+/// generic page-cache layer has made the page writable and dirty.
+pub(super) struct Ext4MmapWriteGuard<'a> {
+    _operation: Ext4InodeOperation,
+    _size_guard: RwSemReadGuard<'a, ()>,
 }
 
 impl Drop for Ext4InodeOperation {
@@ -384,7 +391,6 @@ impl IndexNode for LockedExt4Inode {
         if len == 0 {
             return Ok(0);
         }
-        let _size_guard = self.size_lock.read();
         let buf = &buf[0..len];
 
         let (fs, inode_num, page_cache) = {
@@ -398,6 +404,7 @@ impl IndexNode for LockedExt4Inode {
 
         if let Some(page_cache) = page_cache {
             let _invalidate = page_cache.invalidate_write();
+            let _size_guard = self.size_lock.read();
             let _io_guard = self.io_lock.lock();
 
             // 使用缓存的文件大小，避免 getattr 磁盘 I/O
@@ -456,6 +463,7 @@ impl IndexNode for LockedExt4Inode {
 
             Ok(write_len)
         } else {
+            let _size_guard = self.size_lock.read();
             self.write_direct(offset, len, buf, data)
         }
     }
@@ -782,21 +790,15 @@ impl IndexNode for LockedExt4Inode {
 
     fn resize(&self, len: usize) -> Result<(), SystemError> {
         let _operation = self.begin_operation()?;
-        let _size_guard = self.size_lock.write();
-        let (fs, inode_num, page_cache, cached_size) = {
+        let (fs, inode_num, page_cache) = {
             let guard = self.inner.lock();
             (
                 guard.concret_fs(),
                 guard.inner_inode_num,
                 guard.page_cache.clone(),
-                guard.cached_file_size,
             )
         };
-        let old_size = match cached_size {
-            Some(size) => size,
-            None => fs.fs.getattr(inode_num)?.size,
-        };
-        {
+        let apply_resize = || -> Result<(), SystemError> {
             let _io_guard = self.io_lock.lock();
             let ext4 = &fs.fs;
             // 仅调整文件大小，其他属性保持不变
@@ -824,13 +826,52 @@ impl IndexNode for LockedExt4Inode {
                     .remove(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY);
             }
             self.release_clean_metadata_queue_owner(&fs);
-        }
-        if len < old_size as usize {
-            if let Some(page_cache) = page_cache {
-                page_cache.truncate(len)?;
+            Ok(())
+        };
+
+        if let Some(page_cache) = page_cache {
+            let hole_start_page = len
+                .checked_add(MMArch::PAGE_SIZE - 1)
+                .ok_or(SystemError::EFBIG)?
+                >> MMArch::PAGE_SHIFT;
+            let mut truncate_pending = false;
+            loop {
+                // Match PageCache::truncate(), but acquire ext4's size lock
+                // after invalidate_write so mmap faults and regular writes
+                // use one global order: invalidate -> size -> inode I/O.
+                page_cache.unmap_mapping_pages_even_cow(hole_start_page, None)?;
+                let (shrinking, committed) = {
+                    let _invalidate = page_cache.invalidate_write();
+                    let _size_guard = self.size_lock.write();
+                    // Classify against the authoritative size while holding the
+                    // same lock that serializes the update.  A function-entry
+                    // snapshot can become stale after a concurrent extension.
+                    let cached_size = self.inner.lock().cached_file_size;
+                    let current_size = match cached_size {
+                        Some(size) => size,
+                        None => fs.fs.getattr(inode_num)?.size,
+                    };
+                    // After truncate_locked() asks for another unmap pass, the
+                    // inode size already equals len.  Preserve that pending
+                    // cache truncation unless a concurrent resize moved the
+                    // authoritative size below this request.
+                    let shrinking = len < current_size as usize
+                        || (truncate_pending && len == current_size as usize);
+                    apply_resize()?;
+                    let committed = !shrinking || page_cache.truncate_locked(len)?;
+                    (shrinking, committed)
+                };
+                if committed {
+                    if shrinking {
+                        page_cache.unmap_mapping_pages_even_cow(hole_start_page, None)?;
+                    }
+                    return Ok(());
+                }
+                truncate_pending = shrinking;
             }
         }
-        Ok(())
+        let _size_guard = self.size_lock.write();
+        apply_resize()
     }
 
     fn fallocate_file(
@@ -1832,6 +1873,65 @@ impl LockedExt4Inode {
         drop(guard);
         self.release_clean_metadata_queue_owner(&fs);
         Ok(())
+    }
+
+    /// Prepare the on-disk extent before a shared file VMA becomes writable.
+    ///
+    /// This is the ext4 counterpart of Linux `ext4_page_mkwrite()`: page-cache
+    /// dirtying alone is insufficient for a sparse page because writeback uses
+    /// `write_data_only()` and therefore requires the backing block to exist.
+    pub(super) fn prepare_mmap_write(
+        &self,
+        page_index: usize,
+    ) -> Result<Ext4MmapWriteGuard<'_>, SystemError> {
+        let operation = self.begin_operation()?;
+        let size_guard = self.size_lock.read();
+        let io_guard = self.io_lock.lock();
+        let (fs, inode_num, file_size) = {
+            let mut guard = self.inner.lock();
+            let fs = guard.concret_fs();
+            let file_size = match guard.cached_file_size {
+                Some(size) => size,
+                None => {
+                    let size = fs.fs.getattr(guard.inner_inode_num)?.size;
+                    guard.cached_file_size = Some(size);
+                    size
+                }
+            };
+            (fs, guard.inner_inode_num, file_size)
+        };
+        let page_start = page_index
+            .checked_mul(MMArch::PAGE_SIZE)
+            .ok_or(SystemError::EFBIG)?;
+        if page_start >= file_size as usize {
+            return Err(SystemError::EFBIG);
+        }
+        let time = PosixTimeSpec::now().tv_sec.to_u32().unwrap_or(0);
+        Self::retry_metadata_contention(|| {
+            fs.fs.prepare_buffered_write(
+                inode_num,
+                page_start,
+                MMArch::PAGE_SIZE,
+                file_size,
+                Some(time),
+            )
+        })?;
+        // The size read lock remains held through the generic page-cache
+        // handoff, so truncate cannot remove the prepared extent.  Release the
+        // inode I/O lock first: filemap_page_mkwrite may wait for an existing
+        // writeback, whose write_sync path needs this same lock.
+        drop(io_guard);
+
+        let self_arc = {
+            let mut guard = self.inner.lock();
+            guard.cached_mtime = Some(time);
+            guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?
+        };
+        Ext4FileSystem::mark_inode_dirty(&self_arc, InodeDirtyState::MTIME_DIRTY)?;
+        Ok(Ext4MmapWriteGuard {
+            _operation: operation,
+            _size_guard: size_guard,
+        })
     }
 }
 

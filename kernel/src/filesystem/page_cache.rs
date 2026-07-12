@@ -2324,7 +2324,12 @@ impl PageCache {
         }
     }
 
-    fn truncate_locked(&self, new_size: usize) -> Result<bool, SystemError> {
+    /// Remove cached pages while the caller holds `invalidate_write()`.
+    ///
+    /// Filesystems that must serialize their on-disk size update with page
+    /// invalidation use this after unmapping PTEs.  Callers must repeat the
+    /// unmap-and-lock sequence when this returns `false`.
+    pub(crate) fn truncate_locked(&self, new_size: usize) -> Result<bool, SystemError> {
         let first_full_truncate_page = page_align_up(new_size) >> MMArch::PAGE_SHIFT;
         let truncate_indices: Vec<usize> = {
             let guard = self.inner.lock();

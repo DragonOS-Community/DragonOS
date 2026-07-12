@@ -516,11 +516,21 @@ impl PageFaultHandler {
         let cache_page = pfm.page.clone().expect("no cache_page in PageFaultMessage");
 
         // 将pagecache页设为脏页，以便回收时能够回写
-        cache_page.write().add_flags(PageFlags::PG_DIRTY);
         let page_type = { cache_page.read().page_type().clone() };
         if let PageType::File(info) = page_type {
             if let Some(page_cache) = info.page_cache.upgrade() {
-                page_cache.mark_page_dirty(info.index);
+                let mut dirty_reservation = match page_cache.prepare_page_dirty() {
+                    Ok(reservation) => reservation,
+                    Err(_) => return VmFaultReason::VM_FAULT_SIGBUS,
+                };
+                cache_page.write().add_flags(PageFlags::PG_DIRTY);
+                if page_cache
+                    .mark_page_dirty_prepared(info.index, &mut dirty_reservation)
+                    .is_err()
+                {
+                    cache_page.write().remove_flags(PageFlags::PG_DIRTY);
+                    return VmFaultReason::VM_FAULT_SIGBUS;
+                }
             }
         }
         ret = ret.union(Self::finish_fault(pfm));
@@ -625,11 +635,21 @@ impl PageFaultHandler {
             // 共享映射：原地升级 PTE 为可写，并标记脏。
             let table = mapper.get_table(address, 0).unwrap();
             let i = table.index_of(address).unwrap();
-            old_page.write().add_flags(PageFlags::PG_DIRTY);
             let page_type = { old_page.read().page_type().clone() };
             if let PageType::File(info) = page_type {
                 if let Some(page_cache) = info.page_cache.upgrade() {
-                    page_cache.mark_page_dirty(info.index);
+                    let mut dirty_reservation = match page_cache.prepare_page_dirty() {
+                        Ok(reservation) => reservation,
+                        Err(_) => return VmFaultReason::VM_FAULT_SIGBUS,
+                    };
+                    old_page.write().add_flags(PageFlags::PG_DIRTY);
+                    if page_cache
+                        .mark_page_dirty_prepared(info.index, &mut dirty_reservation)
+                        .is_err()
+                    {
+                        old_page.write().remove_flags(PageFlags::PG_DIRTY);
+                        return VmFaultReason::VM_FAULT_SIGBUS;
+                    }
                 }
             }
             entry.set_flags(new_flags);

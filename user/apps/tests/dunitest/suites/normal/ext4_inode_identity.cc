@@ -9,9 +9,22 @@
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <string>
+#include <thread>
+
+#ifndef __NR_syncfs
+#if defined(__x86_64__)
+#define __NR_syncfs 306
+#elif defined(__riscv) || defined(__loongarch64__)
+#define __NR_syncfs 267
+#else
+#error "__NR_syncfs is not defined for this architecture"
+#endif
+#endif
 
 namespace {
 
@@ -194,7 +207,6 @@ TEST(Ext4InodeIdentity, OpenFileSurvivesFinalUnlink) {
     ASSERT_GE(fd, 0) << strerror(errno);
     constexpr char kBefore[] = "before-unlink";
     ASSERT_NO_FATAL_FAILURE(WriteAll(fd, kBefore, sizeof(kBefore) - 1));
-    ASSERT_EQ(0, fsync(fd)) << strerror(errno);
 
     struct stat before = {};
     ASSERT_EQ(0, fstat(fd, &before)) << strerror(errno);
@@ -214,6 +226,7 @@ TEST(Ext4InodeIdentity, OpenFileSurvivesFinalUnlink) {
               lseek(fd, 0, SEEK_END))
         << strerror(errno);
     ASSERT_NO_FATAL_FAILURE(WriteAll(fd, kAfter, sizeof(kAfter) - 1));
+    ASSERT_EQ(0, fdatasync(fd)) << strerror(errno);
     ASSERT_EQ(0, fsync(fd)) << strerror(errno);
     struct stat unlinked = {};
     ASSERT_EQ(0, fstat(fd, &unlinked)) << strerror(errno);
@@ -222,6 +235,146 @@ TEST(Ext4InodeIdentity, OpenFileSurvivesFinalUnlink) {
     EXPECT_EQ(static_cast<off_t>(sizeof(kBefore) + sizeof(kAfter) - 2),
               unlinked.st_size);
     ASSERT_EQ(0, close(fd)) << strerror(errno);
+
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
+TEST(Ext4InodeIdentity, DirtyClosedUnlinkSyncfsCompletes) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+
+    const std::string path = fs.mount_point() + "/dirty_closed_unlink";
+    int sync_fd = open(fs.mount_point().c_str(), O_RDONLY | O_DIRECTORY);
+    ASSERT_GE(sync_fd, 0) << strerror(errno);
+    int fd = open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    constexpr char kPayload[] = "dirty-without-pre-fsync";
+    ASSERT_NO_FATAL_FAILURE(WriteAll(fd, kPayload, sizeof(kPayload) - 1));
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+    ASSERT_EQ(0, unlink(path.c_str())) << strerror(errno);
+    ASSERT_EQ(0, syscall(__NR_syncfs, sync_fd)) << strerror(errno);
+    ASSERT_EQ(0, close(sync_fd)) << strerror(errno);
+
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
+TEST(Ext4InodeIdentity, RecreatedPathIsIndependentFromLiveUnlinkedInode) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+
+    const std::string path = fs.mount_point() + "/recreated";
+    int old_fd = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+    ASSERT_GE(old_fd, 0) << strerror(errno);
+    constexpr char kOld[] = "old-lifetime";
+    ASSERT_NO_FATAL_FAILURE(WriteAll(old_fd, kOld, sizeof(kOld) - 1));
+    ASSERT_EQ(0, unlink(path.c_str())) << strerror(errno);
+
+    int new_fd = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+    ASSERT_GE(new_fd, 0) << strerror(errno);
+    constexpr char kNew[] = "new-lifetime-data";
+    ASSERT_NO_FATAL_FAILURE(WriteAll(new_fd, kNew, sizeof(kNew) - 1));
+
+    struct stat old_stat = {};
+    struct stat new_stat = {};
+    ASSERT_EQ(0, fstat(old_fd, &old_stat)) << strerror(errno);
+    ASSERT_EQ(0, fstat(new_fd, &new_stat)) << strerror(errno);
+    EXPECT_NE(old_stat.st_ino, new_stat.st_ino);
+    EXPECT_EQ(0u, old_stat.st_nlink);
+    EXPECT_EQ(1u, new_stat.st_nlink);
+    ASSERT_EQ(0, lseek(old_fd, 0, SEEK_SET)) << strerror(errno);
+    char old_data[sizeof(kOld)] = {};
+    ASSERT_EQ(static_cast<ssize_t>(sizeof(kOld) - 1),
+              read(old_fd, old_data, sizeof(old_data)))
+        << strerror(errno);
+    EXPECT_EQ(0, memcmp(old_data, kOld, sizeof(kOld) - 1));
+    ASSERT_EQ(0, fsync(old_fd)) << strerror(errno);
+    ASSERT_EQ(0, fsync(new_fd)) << strerror(errno);
+    ASSERT_EQ(0, close(old_fd)) << strerror(errno);
+    ASSERT_EQ(0, close(new_fd)) << strerror(errno);
+    ASSERT_EQ(0, unlink(path.c_str())) << strerror(errno);
+
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
+TEST(Ext4InodeIdentity, ConcurrentWriteUnlinkSyncAndClose) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+
+    const std::string path = fs.mount_point() + "/concurrent_unlink";
+    int owner_fd = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+    ASSERT_GE(owner_fd, 0) << strerror(errno);
+    int writer_fd = dup(owner_fd);
+    int sync_fd = dup(owner_fd);
+    int close_fd = dup(owner_fd);
+    int drain_fd = open(fs.mount_point().c_str(), O_RDONLY | O_DIRECTORY);
+    ASSERT_GE(writer_fd, 0) << strerror(errno);
+    ASSERT_GE(sync_fd, 0) << strerror(errno);
+    ASSERT_GE(close_fd, 0) << strerror(errno);
+    ASSERT_GE(drain_fd, 0) << strerror(errno);
+
+    std::atomic<bool> start{false};
+    std::atomic<int> first_error{0};
+    auto record_error = [&](int error) {
+        int expected = 0;
+        first_error.compare_exchange_strong(expected, error);
+    };
+    std::thread writer([&] {
+        while (!start.load(std::memory_order_acquire)) {
+        }
+        constexpr char kChunk[] = "concurrent-data";
+        for (int i = 0; i < 64; ++i) {
+            if (pwrite(writer_fd, kChunk, sizeof(kChunk) - 1,
+                       static_cast<off_t>(i * (sizeof(kChunk) - 1))) !=
+                static_cast<ssize_t>(sizeof(kChunk) - 1)) {
+                record_error(errno);
+                break;
+            }
+            if ((i & 7) == 0 && fdatasync(writer_fd) != 0) {
+                record_error(errno);
+                break;
+            }
+        }
+        if (close(writer_fd) != 0) {
+            record_error(errno);
+        }
+    });
+    std::thread syncer([&] {
+        while (!start.load(std::memory_order_acquire)) {
+        }
+        for (int i = 0; i < 16; ++i) {
+            if (syscall(__NR_syncfs, sync_fd) != 0) {
+                record_error(errno);
+                break;
+            }
+        }
+        if (close(sync_fd) != 0) {
+            record_error(errno);
+        }
+    });
+    std::thread closer([&] {
+        while (!start.load(std::memory_order_acquire)) {
+        }
+        if (close(close_fd) != 0) {
+            record_error(errno);
+        }
+    });
+
+    start.store(true, std::memory_order_release);
+    int unlink_result = unlink(path.c_str());
+    int unlink_errno = errno;
+    int owner_close_result = close(owner_fd);
+    int owner_close_errno = errno;
+    writer.join();
+    syncer.join();
+    closer.join();
+    ASSERT_EQ(0, unlink_result) << strerror(unlink_errno);
+    ASSERT_EQ(0, owner_close_result) << strerror(owner_close_errno);
+    EXPECT_EQ(0, first_error.load());
+    ASSERT_EQ(0, syscall(__NR_syncfs, drain_fd)) << strerror(errno);
+    ASSERT_EQ(0, close(drain_fd)) << strerror(errno);
 
     ASSERT_NO_FATAL_FAILURE(fs.Unmount());
 }

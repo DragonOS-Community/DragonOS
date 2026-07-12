@@ -1,6 +1,6 @@
 use crate::{
     driver::base::{block::gendisk::GenDisk, device::device_number::DeviceNumber},
-    exception::workqueue::{schedule_work, Work},
+    exception::workqueue::{Work, WorkQueue},
     filesystem::{
         ext4::inode::{Ext4Inode, Ext4InodeLifecycle, Ext4InodeLifecycleState, InodeDirtyState},
         vfs::{
@@ -9,8 +9,8 @@ use crate::{
             mount::MountFlags,
             utils::{user_path_at, DName},
             vcore::{generate_inode_id, try_find_gendisk},
-            EvictionEpoch, FileSystem, FileSystemMakerData, FsReconfigureRequest, IndexNode, Magic,
-            MountableFileSystem, FSMAKER, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+            EvictionEpoch, FileSystem, FileSystemMakerData, FsReconfigureRequest, IndexNode,
+            InodeRetentionKind, Magic, MountableFileSystem, FSMAKER, VFS_MAX_FOLLOW_SYMLINK_TIMES,
         },
     },
     libs::{
@@ -32,6 +32,7 @@ use alloc::{
     vec::Vec,
 };
 use kdepends::another_ext4;
+use lazy_static::lazy_static;
 use linkme::distributed_slice;
 use system_error::SystemError;
 
@@ -49,6 +50,10 @@ struct Ext4EvictionQueueState {
     completed_epoch: u64,
     sealed: bool,
     error: Option<SystemError>,
+}
+
+lazy_static! {
+    static ref EXT4_EVICTION_WQ: Arc<WorkQueue> = WorkQueue::new("ext4_evict");
 }
 
 #[must_use]
@@ -180,14 +185,12 @@ impl FileSystem for Ext4FileSystem {
     }
 
     fn sync_fs(&self, wait: bool) -> Result<(), SystemError> {
+        let flush_result = self.flush_dirty_inodes();
         let eviction_epoch = wait.then(|| {
-            // Like Linux ext4 flushing its filesystem workqueue before waiting
-            // for the target transaction, include every reclaim request that
-            // was published before this sync.  Do not seal the queue: requests
-            // published after this snapshot belong to a later sync boundary.
+            // Capture after dirty metadata flush: releasing the last AsyncWork
+            // owner can publish reclaim, and this sync boundary must include it.
             EvictionEpoch::new(self.eviction_queue.lock().next_epoch)
         });
-        let flush_result = self.flush_dirty_inodes();
         let result = if let Some(epoch) = eviction_epoch {
             // Finish the snapshotted asynchronous metadata work even if inode
             // writeback failed, while preserving that earlier error for the
@@ -247,7 +250,7 @@ impl Ext4FileSystem {
                 .checked_add(1)
                 .ok_or(SystemError::EOVERFLOW)?;
             let epoch = queue.next_epoch;
-            schedule_work(Work::new(move || {
+            EXT4_EVICTION_WQ.enqueue(Work::new(move || {
                 let result = inode.run_deferred_eviction();
                 let mut queue = fs.eviction_queue.lock();
                 if let Err(error) = result {
@@ -459,6 +462,10 @@ impl Ext4FileSystem {
         dirty: InodeDirtyState,
     ) -> Result<(), SystemError> {
         let _operation = inode.lifecycle().begin_operation()?;
+        // Acquire a prospective queue ownership before publishing dirty state.
+        // If the inode is already queued, the existing AsyncWork owner prevents
+        // this temporary retain/release pair from creating a false-zero edge.
+        inode.retain(InodeRetentionKind::AsyncWork)?;
         let (fs, should_queue) = {
             let mut guard = inode.0.lock();
             guard.dirty_state.insert(dirty);
@@ -474,7 +481,15 @@ impl Ext4FileSystem {
         if should_queue {
             if let Some(fs) = fs {
                 fs.dirty_inodes.lock().push(inode.clone());
+            } else {
+                let mut guard = inode.0.lock();
+                guard.dirty_state.remove(InodeDirtyState::QUEUED);
+                drop(guard);
+                inode.release(InodeRetentionKind::AsyncWork);
+                return Err(SystemError::EIO);
             }
+        } else {
+            inode.release(InodeRetentionKind::AsyncWork);
         }
         Ok(())
     }
@@ -492,38 +507,61 @@ impl Ext4FileSystem {
         let mut requeue: Vec<Arc<LockedExt4Inode>> = Vec::new();
         for inode in dirty {
             let mut should_requeue = false;
-            let result = {
-                let has_dirty_metadata = {
-                    let mut guard = inode.0.lock();
-                    let has_dirty = guard
+            let mut release_async_owner = false;
+            let has_dirty_metadata = {
+                let mut guard = inode.0.lock();
+                let has_dirty = guard
+                    .dirty_state
+                    .intersects(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY);
+                if !has_dirty {
+                    guard
                         .dirty_state
-                        .intersects(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY);
-                    if !has_dirty {
-                        guard.dirty_state.remove(InodeDirtyState::QUEUED);
+                        .remove(InodeDirtyState::QUEUED | InodeDirtyState::WRITEBACK);
+                    release_async_owner = true;
+                }
+                has_dirty
+            };
+
+            if !has_dirty_metadata {
+                if release_async_owner {
+                    inode.release(InodeRetentionKind::AsyncWork);
+                }
+                continue;
+            }
+
+            let operation = match inode.lifecycle().begin_operation() {
+                Ok(operation) => operation,
+                Err(error @ (SystemError::ESTALE | SystemError::EIO)) => {
+                    log::error!(
+                        "ext4: rejecting stale metadata writeback before disk access: {:?}",
+                        error
+                    );
+                    let page_cache = {
+                        let mut guard = inode.0.lock();
+                        guard.dirty_state.remove(
+                            InodeDirtyState::SIZE_DIRTY
+                                | InodeDirtyState::MTIME_DIRTY
+                                | InodeDirtyState::QUEUED
+                                | InodeDirtyState::WRITEBACK,
+                        );
+                        guard.page_cache.clone()
+                    };
+                    if let Some(page_cache) = page_cache {
+                        page_cache.record_writeback_error_with_superblock(error.clone());
                     }
-                    has_dirty
-                };
-                if !has_dirty_metadata {
+                    inode.release(InodeRetentionKind::AsyncWork);
+                    last_err = Err(error);
                     continue;
                 }
-                let _operation = match inode.lifecycle().begin_operation() {
-                    Ok(operation) => operation,
-                    Err(error @ (SystemError::ESTALE | SystemError::EIO)) => {
-                        log::error!(
-                            "ext4: rejecting stale metadata writeback before disk access: {:?}",
-                            error
-                        );
-                        if let Some(page_cache) = inode.0.lock().page_cache.clone() {
-                            page_cache.record_writeback_error_with_superblock(error);
-                        }
-                        continue;
-                    }
-                    Err(error) => {
-                        requeue.push(inode);
-                        last_err = Err(error);
-                        continue;
-                    }
-                };
+                Err(error) => {
+                    requeue.push(inode);
+                    last_err = Err(error);
+                    continue;
+                }
+            };
+
+            let result = {
+                let _operation = operation;
                 let _io_guard = inode.1.lock();
                 let (fs, inode_num, snapshot_dirty, cached_size, cached_mtime) = {
                     let mut guard = inode.0.lock();
@@ -533,9 +571,11 @@ impl Ext4FileSystem {
                         .intersection(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY);
                     if snapshot_dirty.is_empty() {
                         guard.dirty_state.remove(InodeDirtyState::WRITEBACK);
-                        continue;
+                        release_async_owner = true;
                     }
-                    guard.dirty_state.insert(InodeDirtyState::WRITEBACK);
+                    if !snapshot_dirty.is_empty() {
+                        guard.dirty_state.insert(InodeDirtyState::WRITEBACK);
+                    }
                     (
                         guard.fs_ptr.upgrade(),
                         guard.inner_inode_num,
@@ -545,55 +585,62 @@ impl Ext4FileSystem {
                     )
                 };
 
-                let result = if let Some(fs) = fs {
-                    let size = if snapshot_dirty.contains(InodeDirtyState::SIZE_DIRTY) {
-                        match cached_size {
-                            Some(size) => Ok(Some(size)),
-                            None => fs
-                                .fs
-                                .getattr(inode_num)
-                                .map(|attr| Some(attr.size))
-                                .map_err(SystemError::from),
-                        }
-                    } else {
-                        Ok(None)
-                    };
-                    size.and_then(|size| {
-                        let mtime = if snapshot_dirty.contains(InodeDirtyState::MTIME_DIRTY) {
-                            cached_mtime
-                        } else {
-                            None
-                        };
-                        LockedExt4Inode::retry_metadata_contention(|| {
-                            fs.fs.commit_inode_metadata(inode_num, size, mtime)
-                        })
-                    })
+                if snapshot_dirty.is_empty() {
+                    Ok(())
                 } else {
-                    Err(SystemError::EIO)
-                };
+                    let result = if let Some(fs) = fs {
+                        let size = if snapshot_dirty.contains(InodeDirtyState::SIZE_DIRTY) {
+                            match cached_size {
+                                Some(size) => Ok(Some(size)),
+                                None => fs
+                                    .fs
+                                    .getattr(inode_num)
+                                    .map(|attr| Some(attr.size))
+                                    .map_err(SystemError::from),
+                            }
+                        } else {
+                            Ok(None)
+                        };
+                        size.and_then(|size| {
+                            let mtime = if snapshot_dirty.contains(InodeDirtyState::MTIME_DIRTY) {
+                                cached_mtime
+                            } else {
+                                None
+                            };
+                            LockedExt4Inode::retry_metadata_contention(|| {
+                                fs.fs.commit_inode_metadata(inode_num, size, mtime)
+                            })
+                        })
+                    } else {
+                        Err(SystemError::EIO)
+                    };
 
-                let mut guard = inode.0.lock();
-                if result.is_ok() {
-                    if snapshot_dirty.contains(InodeDirtyState::SIZE_DIRTY)
-                        && guard.cached_file_size == cached_size
-                    {
-                        guard.dirty_state.remove(InodeDirtyState::SIZE_DIRTY);
+                    let mut guard = inode.0.lock();
+                    if result.is_ok() {
+                        if snapshot_dirty.contains(InodeDirtyState::SIZE_DIRTY)
+                            && guard.cached_file_size == cached_size
+                        {
+                            guard.dirty_state.remove(InodeDirtyState::SIZE_DIRTY);
+                        }
+                        if snapshot_dirty.contains(InodeDirtyState::MTIME_DIRTY)
+                            && guard.cached_mtime == cached_mtime
+                        {
+                            guard.dirty_state.remove(InodeDirtyState::MTIME_DIRTY);
+                        }
                     }
-                    if snapshot_dirty.contains(InodeDirtyState::MTIME_DIRTY)
-                        && guard.cached_mtime == cached_mtime
+                    guard.dirty_state.remove(InodeDirtyState::WRITEBACK);
+                    if guard
+                        .dirty_state
+                        .intersects(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY)
                     {
-                        guard.dirty_state.remove(InodeDirtyState::MTIME_DIRTY);
+                        guard.dirty_state.insert(InodeDirtyState::QUEUED);
+                        should_requeue = true;
+                    } else {
+                        guard.dirty_state.remove(InodeDirtyState::QUEUED);
+                        release_async_owner = true;
                     }
+                    result
                 }
-                guard.dirty_state.remove(InodeDirtyState::WRITEBACK);
-                if guard
-                    .dirty_state
-                    .intersects(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY)
-                {
-                    guard.dirty_state.insert(InodeDirtyState::QUEUED);
-                    should_requeue = true;
-                }
-                result
             };
 
             if let Err(e) = result {
@@ -602,6 +649,8 @@ impl Ext4FileSystem {
             }
             if should_requeue {
                 requeue.push(inode);
+            } else if release_async_owner {
+                inode.release(InodeRetentionKind::AsyncWork);
             }
         }
         if !requeue.is_empty() {
@@ -644,6 +693,9 @@ impl Ext4FileSystem {
         mount_data: Arc<GenDisk>,
         mount_options: Ext4MountOptions,
     ) -> Result<Arc<dyn FileSystem>, SystemError> {
+        // Worker creation may sleep and must never happen from final-release
+        // publication while inode/eviction locks are held.
+        lazy_static::initialize(&EXT4_EVICTION_WQ);
         let raw_dev = mount_data.device_num();
         // Writable mounts recover the journal and the validated legacy orphan
         // chain before this filesystem is published to the VFS.

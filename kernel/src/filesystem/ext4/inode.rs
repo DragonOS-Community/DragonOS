@@ -17,7 +17,7 @@ use crate::{
         spinlock::SpinLock,
         wait_queue::WaitQueue,
     },
-    mm::{truncate::truncate_inode_pages, MemoryManagementArch},
+    mm::MemoryManagementArch,
     process::{ProcessManager, RawPid},
     sched::sched_yield,
     time::sleep::nanosleep,
@@ -1791,7 +1791,11 @@ impl LockedExt4Inode {
         };
         let _reuse = fs.begin_reclaim();
         if let Some(page_cache) = self.page_cache() {
-            truncate_inode_pages(page_cache, 0);
+            if let Err(error) = page_cache.truncate(0) {
+                *self.6.lock() = Some(handle);
+                let _ = fs.poison_freeing(tombstone, error.clone());
+                return Err(error);
+            }
         }
         match Self::reclaim_with_metadata_contention_retry(&fs.fs, handle) {
             Ok(()) => {

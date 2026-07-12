@@ -12,7 +12,9 @@ use hashbrown::HashMap;
 use system_error::SystemError;
 
 use super::vfs::{
-    mount::record_writeback_error_for_fs, FilePrivateData, IndexNode, WritebackControl,
+    inode_lifecycle::{InodeRetentionGuard, InodeRetentionKind},
+    mount::record_writeback_error_for_fs,
+    FilePrivateData, IndexNode, WritebackControl,
 };
 use crate::exception::workqueue::{schedule_work, Work, WorkQueue};
 use crate::libs::errseq::{ErrSeq, ErrSeqValue};
@@ -283,6 +285,21 @@ pub struct PageCache {
     manager: PageCacheManager,
 }
 
+pub struct PageDirtyReservation {
+    cache: Weak<PageCache>,
+    active: bool,
+}
+
+impl Drop for PageDirtyReservation {
+    fn drop(&mut self) {
+        if self.active {
+            if let Some(cache) = self.cache.upgrade() {
+                cache.cancel_page_dirty_reservation();
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct InnerPageCache {
     #[allow(unused)]
@@ -290,6 +307,9 @@ pub struct InnerPageCache {
     pages: HashMap<usize, Arc<PageEntry>>,
     page_indices: BTreeSet<usize>,
     dirty_pages: BTreeSet<usize>,
+    /// Aggregated semantic owner for all dirty and writeback pages in this mapping.
+    dirty_retention: Option<InodeRetentionGuard>,
+    dirty_preparations: usize,
     page_cache_ref: Weak<PageCache>,
 }
 
@@ -894,7 +914,7 @@ impl PageCacheManager {
                 let _ = entry.wait_ready()?;
             }
         }
-        cache.mark_page_dirty(page_index);
+        cache.mark_page_dirty(page_index)?;
         Ok(())
     }
 
@@ -1067,6 +1087,16 @@ impl PageCacheManager {
 
     pub fn sync(&self) -> Result<(), SystemError> {
         let cache = self.upgrade()?;
+        // Keep the canonical inode alive across the boundary between the last
+        // page completing writeback and write_inode(). The aggregated dirty
+        // owner may be released by finish_writeback_entry(), but eviction must
+        // not enter that false-zero window before metadata is committed.
+        let sync_inode = cache
+            .inode()
+            .and_then(|inode| inode.upgrade())
+            .ok_or(SystemError::EIO)?;
+        let _sync_retention =
+            InodeRetentionGuard::new(sync_inode.clone(), InodeRetentionKind::AsyncWork)?;
         loop {
             let (dirty_entries, writeback_entries): (Vec<_>, Vec<_>) = {
                 let inner = cache.inner.lock();
@@ -1104,13 +1134,11 @@ impl PageCacheManager {
         }
 
         // 脏页写完后调 write_inode 回写元数据。
-        if let Some(inode) = cache.inode().and_then(|w| w.upgrade()) {
-            let wbc = WritebackControl::sync_all_for_sync();
-            if let Err(e) = inode.write_inode(&wbc) {
-                log::warn!("write_inode failed: {:?}", e);
-                cache.record_writeback_error_with_superblock(e.clone());
-                return Err(e);
-            }
+        let wbc = WritebackControl::sync_all_for_sync();
+        if let Err(e) = sync_inode.write_inode(&wbc) {
+            log::warn!("write_inode failed: {:?}", e);
+            cache.record_writeback_error_with_superblock(e.clone());
+            return Err(e);
         }
 
         Ok(())
@@ -1422,7 +1450,10 @@ impl PageCacheManager {
     }
 
     pub fn remove_page(&self, page_index: usize) -> Result<Option<Arc<Page>>, SystemError> {
-        Ok(self.upgrade()?.lock().remove_page(page_index))
+        let cache = self.upgrade()?;
+        let removed = cache.lock().remove_page(page_index);
+        drop(cache.detach_dirty_retention_if_idle());
+        Ok(removed)
     }
 
     pub fn remove_clean_page_for_reclaim(
@@ -1516,8 +1547,9 @@ impl PageCacheManager {
                         return Ok(false);
                     }
                     drop(guard);
-                    entry.set_state(PageState::Dirty);
                     let mut inner = cache.inner.lock();
+                    cache.ensure_dirty_retention_locked(&mut inner)?;
+                    entry.set_state(PageState::Dirty);
                     inner.dirty_pages.insert(page_index);
                     continue;
                 }
@@ -1559,8 +1591,9 @@ impl PageCacheManager {
                         return Ok(false);
                     }
                     drop(guard);
-                    entry.set_state(PageState::Dirty);
                     let mut inner = cache.inner.lock();
+                    cache.ensure_dirty_retention_locked(&mut inner)?;
+                    entry.set_state(PageState::Dirty);
                     inner.dirty_pages.insert(page_index);
                     continue;
                 }
@@ -1597,10 +1630,12 @@ impl PageCacheManager {
                 let mut guard = page.write();
                 guard.add_flags(PageFlags::PG_ERROR | PageFlags::PG_DIRTY);
             }
-            cache.account_state_transition(PageState::Writeback, PageState::Dirty);
-            entry.set_state(PageState::Dirty);
-            let mut inner = cache.inner.lock();
-            inner.dirty_pages.insert(page_index);
+            {
+                let mut inner = cache.inner.lock();
+                cache.account_state_transition(PageState::Writeback, PageState::Dirty);
+                inner.dirty_pages.insert(page_index);
+                entry.set_state(PageState::Dirty);
+            }
             entry.wait_queue.wake_all();
             return Err(e);
         }
@@ -1611,18 +1646,20 @@ impl PageCacheManager {
         }
 
         let page_dirty = page.read().flags().contains(PageFlags::PG_DIRTY);
-        if page_dirty {
-            cache.account_state_transition(PageState::Writeback, PageState::Dirty);
-            entry.set_state(PageState::Dirty);
+        {
             let mut inner = cache.inner.lock();
-            inner.dirty_pages.insert(page_index);
-        } else {
-            cache.account_state_transition(PageState::Writeback, PageState::UpToDate);
-            entry.set_state(PageState::UpToDate);
-            let mut inner = cache.inner.lock();
-            inner.dirty_pages.remove(&page_index);
+            if page_dirty {
+                cache.account_state_transition(PageState::Writeback, PageState::Dirty);
+                inner.dirty_pages.insert(page_index);
+                entry.set_state(PageState::Dirty);
+            } else {
+                cache.account_state_transition(PageState::Writeback, PageState::UpToDate);
+                inner.dirty_pages.remove(&page_index);
+                entry.set_state(PageState::UpToDate);
+            }
         }
         entry.wait_queue.wake_all();
+        drop(cache.detach_dirty_retention_if_idle());
         Ok(())
     }
 
@@ -1921,6 +1958,8 @@ impl InnerPageCache {
             pages: HashMap::new(),
             page_indices: BTreeSet::new(),
             dirty_pages: BTreeSet::new(),
+            dirty_retention: None,
+            dirty_preparations: 0,
             page_cache_ref,
         }
     }
@@ -2358,6 +2397,7 @@ impl PageCache {
                 if let Some(page) = removed_page {
                     self.discard_unlinked_page(&page);
                 }
+                drop(self.detach_dirty_retention_if_idle());
                 break;
             }
         }
@@ -3279,17 +3319,96 @@ impl PageCache {
         }
     }
 
-    pub fn mark_page_dirty(&self, page_index: usize) {
+    fn ensure_dirty_retention_locked(&self, inner: &mut InnerPageCache) -> Result<(), SystemError> {
+        if inner.dirty_retention.is_some() {
+            return Ok(());
+        }
+        let inode = self
+            .inode()
+            .and_then(|inode| inode.upgrade())
+            .ok_or(SystemError::EIO)?;
+        inner.dirty_retention = Some(InodeRetentionGuard::new(
+            inode,
+            InodeRetentionKind::AsyncWork,
+        )?);
+        Ok(())
+    }
+
+    /// Establish dirty backing ownership before callers expose modified data.
+    pub fn prepare_page_dirty(&self) -> Result<PageDirtyReservation, SystemError> {
+        let mut inner = self.inner.lock();
+        self.ensure_dirty_retention_locked(&mut inner)?;
+        inner.dirty_preparations = inner
+            .dirty_preparations
+            .checked_add(1)
+            .expect("page-cache dirty preparation overflow");
+        Ok(PageDirtyReservation {
+            cache: self.manager.owner.clone(),
+            active: true,
+        })
+    }
+
+    fn cancel_page_dirty_reservation(&self) {
+        let mut inner = self.inner.lock();
+        assert!(inner.dirty_preparations != 0);
+        inner.dirty_preparations -= 1;
+        drop(inner);
+        drop(self.detach_dirty_retention_if_idle());
+    }
+
+    fn detach_dirty_retention_if_idle(&self) -> Option<InodeRetentionGuard> {
+        let mut inner = self.inner.lock();
+        let has_writeback = inner
+            .pages
+            .values()
+            .any(|entry| entry.state() == PageState::Writeback);
+        if inner.dirty_preparations == 0 && inner.dirty_pages.is_empty() && !has_writeback {
+            inner.dirty_retention.take()
+        } else {
+            None
+        }
+    }
+
+    pub fn mark_page_dirty(&self, page_index: usize) -> Result<(), SystemError> {
         let mut guard = self.inner.lock();
         if let Some(entry) = guard.get_entry(page_index) {
+            self.ensure_dirty_retention_locked(&mut guard)?;
             let old_state = entry.state();
             guard.dirty_pages.insert(page_index);
             if old_state == PageState::Writeback {
-                return;
+                return Ok(());
             }
             self.account_state_transition(old_state, PageState::Dirty);
             entry.set_state(PageState::Dirty);
+            return Ok(());
         }
+        drop(guard);
+        drop(self.detach_dirty_retention_if_idle());
+        Ok(())
+    }
+
+    pub fn mark_page_dirty_prepared(
+        &self,
+        page_index: usize,
+        reservation: &mut PageDirtyReservation,
+    ) -> Result<(), SystemError> {
+        assert!(reservation.active);
+        let mut guard = self.inner.lock();
+        assert!(guard.dirty_preparations != 0);
+        guard.dirty_preparations -= 1;
+        reservation.active = false;
+        if let Some(entry) = guard.get_entry(page_index) {
+            let old_state = entry.state();
+            guard.dirty_pages.insert(page_index);
+            if old_state != PageState::Writeback {
+                self.account_state_transition(old_state, PageState::Dirty);
+                entry.set_state(PageState::Dirty);
+            }
+            return Ok(());
+        }
+        drop(guard);
+        drop(self.detach_dirty_retention_if_idle());
+        Ok(())
     }
 
     pub fn mark_page_writeback(&self, page_index: usize) {
@@ -3310,6 +3429,8 @@ impl PageCache {
             entry.set_state(PageState::UpToDate);
             guard.dirty_pages.remove(&page_index);
         }
+        drop(guard);
+        drop(self.detach_dirty_retention_if_idle());
     }
 
     pub fn mark_page_error(&self, page_index: usize, error: SystemError) {
@@ -3317,10 +3438,10 @@ impl PageCache {
         let mut guard = self.inner.lock();
         if let Some(entry) = guard.get_entry(page_index) {
             let old_state = entry.state();
-            self.account_state_transition(old_state, PageState::Error);
-            entry.set_state(PageState::Error);
+            self.account_state_transition(old_state, PageState::Dirty);
+            guard.dirty_pages.insert(page_index);
+            entry.set_state(PageState::Dirty);
             entry.wait_queue.wake_all();
-            guard.dirty_pages.remove(&page_index);
         }
     }
 
@@ -3418,6 +3539,11 @@ impl PageCache {
 
     pub fn write(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
         let (copies, ret) = self.prepare_write_copies(offset, buf.len())?;
+        let mut dirty_reservation = if ret != 0 {
+            Some(self.prepare_page_dirty()?)
+        } else {
+            None
+        };
         let mut src_offset = 0;
         for item in copies {
             // Prefault before taking the page lock.
@@ -3430,7 +3556,11 @@ impl PageCache {
             page_guard.add_flags(PageFlags::PG_DIRTY);
             src_offset += item.sub_len;
             drop(page_guard);
-            self.mark_page_dirty(item.page_index);
+            if let Some(mut reservation) = dirty_reservation.take() {
+                self.mark_page_dirty_prepared(item.page_index, &mut reservation)?;
+            } else {
+                self.mark_page_dirty(item.page_index)?;
+            }
         }
         Ok(ret)
     }
@@ -3513,6 +3643,7 @@ impl PageCache {
         // all copied bytes and PG_DIRTY transitions are ready to be exposed.
         let mut page_guards: Vec<_> = copies.iter().map(|item| item.entry.page.write()).collect();
 
+        let mut dirty_reservation = self.prepare_page_dirty()?;
         before_dirty(ret)?;
 
         src_offset = 0;
@@ -3526,8 +3657,12 @@ impl PageCache {
         }
         drop(page_guards);
 
-        for item in copies {
-            self.mark_page_dirty(item.page_index);
+        for (index, item) in copies.into_iter().enumerate() {
+            if index == 0 {
+                self.mark_page_dirty_prepared(item.page_index, &mut dirty_reservation)?;
+            } else {
+                self.mark_page_dirty(item.page_index)?;
+            }
         }
 
         Ok(ret)

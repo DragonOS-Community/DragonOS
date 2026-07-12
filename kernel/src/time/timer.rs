@@ -291,9 +291,9 @@ pub fn next_n_ms_timer_jiffies(expire_ms: u64) -> u64 {
 /// 计算接下来n微秒对应的定时器时间片
 pub fn next_n_us_timer_jiffies(expire_us: u64) -> u64 {
     let now = TIMER_JIFFIES.load(Ordering::SeqCst);
-    let ns = expire_us * 1000;
-    let jiffies = ns.div_ceil(NSEC_PER_JIFFY as u64);
-    now + jiffies
+    let jiffies =
+        ((expire_us as u128 * 1000).div_ceil(NSEC_PER_JIFFY as u128)).min(u64::MAX as u128) as u64;
+    now.saturating_add(jiffies)
 }
 
 /// @brief 让pcb休眠timeout个jiffies

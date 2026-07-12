@@ -9,7 +9,7 @@ mod uapi;
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use system_error::SystemError;
 
 use crate::driver::net::Iface;
@@ -29,8 +29,9 @@ pub use uapi::{
     TpacketAuxdata,
 };
 
-const DEFAULT_RX_BUFFER_PACKETS: usize = 256;
 const DEFAULT_RX_BUFFER_SIZE: usize = 256 * 1024;
+const DEFAULT_TX_BUFFER_SIZE: usize = 256 * 1024;
+const READ_SCRATCH_BUFFER_SIZE: usize = DEFAULT_RX_BUFFER_SIZE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketSocketType {
@@ -58,6 +59,7 @@ pub struct PacketMetadata {
 pub struct ReceivedPacket {
     pub data: alloc::vec::Vec<u8>,
     pub metadata: PacketMetadata,
+    accounted_bytes: usize,
 }
 
 #[derive(Debug, Default)]
@@ -73,12 +75,15 @@ pub struct PacketSocket {
     pub(super) bind_lock: Mutex<()>,
     pub(super) bound_iface: RwSem<Option<Arc<dyn Iface>>>,
     pub(super) rx_buffer: Mutex<VecDeque<ReceivedPacket>>,
-    pub(super) rx_buffer_len: AtomicUsize,
-    pub(super) rx_buffer_max_packets: AtomicUsize,
+    pub(super) rx_buffer_bytes: AtomicUsize,
+    pub(super) send_buffer_bytes: AtomicUsize,
+    pub(super) recv_buffer_bytes: AtomicUsize,
     pub(super) options: RwSem<PacketSocketOptions>,
     pub(super) stats_packets: AtomicU32,
     pub(super) stats_drops: AtomicU32,
     pub(super) nonblock: AtomicBool,
+    pub(super) send_timeout_ticks: AtomicU64,
+    pub(super) recv_timeout_ticks: AtomicU64,
     pub(super) wait_queue: WaitQueue,
     inode_id: InodeId,
     open_files: AtomicUsize,
@@ -107,13 +112,16 @@ impl PacketSocket {
             binding: binding::PacketBinding::new(0, protocol),
             bind_lock: Mutex::new(()),
             bound_iface: RwSem::new(None),
-            rx_buffer: Mutex::new(VecDeque::with_capacity(DEFAULT_RX_BUFFER_PACKETS)),
-            rx_buffer_len: AtomicUsize::new(0),
-            rx_buffer_max_packets: AtomicUsize::new(DEFAULT_RX_BUFFER_PACKETS),
+            rx_buffer: Mutex::new(VecDeque::new()),
+            rx_buffer_bytes: AtomicUsize::new(0),
+            send_buffer_bytes: AtomicUsize::new(DEFAULT_TX_BUFFER_SIZE),
+            recv_buffer_bytes: AtomicUsize::new(DEFAULT_RX_BUFFER_SIZE),
             options: RwSem::new(PacketSocketOptions::default()),
             stats_packets: AtomicU32::new(0),
             stats_drops: AtomicU32::new(0),
             nonblock: AtomicBool::new(nonblock),
+            send_timeout_ticks: AtomicU64::new(crate::net::socket::common::INFINITE_TIMEOUT_TICKS),
+            recv_timeout_ticks: AtomicU64::new(crate::net::socket::common::INFINITE_TIMEOUT_TICKS),
             wait_queue: WaitQueue::default(),
             inode_id: generate_inode_id(),
             open_files: AtomicUsize::new(0),
@@ -127,6 +135,15 @@ impl PacketSocket {
     }
     pub fn is_nonblock(&self) -> bool {
         self.nonblock.load(Ordering::Relaxed)
+    }
+    /// Returns the configured receive timeout in scheduler ticks, or None for infinite wait.
+    pub(super) fn recv_timeout_ticks(&self) -> Option<u64> {
+        let ticks = self.recv_timeout_ticks.load(Ordering::Relaxed);
+        if ticks == crate::net::socket::common::INFINITE_TIMEOUT_TICKS {
+            None
+        } else {
+            Some(ticks)
+        }
     }
     pub fn netns(&self) -> Arc<NetNamespace> {
         self.netns.clone()
@@ -195,10 +212,10 @@ impl Socket for PacketSocket {
         self.bind_endpoint(endpoint)
     }
     fn send_buffer_size(&self) -> usize {
-        DEFAULT_RX_BUFFER_SIZE
+        self.send_buffer_bytes.load(Ordering::Relaxed)
     }
     fn recv_buffer_size(&self) -> usize {
-        DEFAULT_RX_BUFFER_SIZE
+        self.recv_buffer_bytes.load(Ordering::Relaxed)
     }
     fn connect(&self, _: Endpoint) -> Result<(), SystemError> {
         Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
@@ -222,7 +239,7 @@ impl Socket for PacketSocket {
         crate::net::socket::base::read_to_user_buffer_via_kernel_buf(
             self,
             b,
-            self.recv_buffer_size(),
+            READ_SCRATCH_BUFFER_SIZE,
         )
     }
     fn recv_from(

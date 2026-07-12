@@ -9,7 +9,7 @@
 //   Test 5: SOCK_DGRAM send/receive -- kernel constructs Ethernet header, returns L3 payload length
 //
 // Runtime environment: DragonOS QEMU, eth0(virtio-net) 10.0.2.15/24, gateway 10.0.2.2.
-// Use GTEST_SKIP() instead of failure when no packets are received; SO_RCVTIMEO failures are not reported as errors (platform limitation).
+// Use GTEST_SKIP() when the runtime network environment cannot provide packets.
 
 #include <gtest/gtest.h>
 
@@ -64,6 +64,7 @@ inline constexpr int kEthHdrLen = 14;
 inline constexpr int kArpFrameLen = kEthHdrLen + kArpPktLen;  // 42
 inline constexpr size_t kVlanFrameLen = 1518;
 inline constexpr int kEthFrameLen = 1514;
+inline constexpr uint16_t kPrivateEtherType = 0x88b5;
 
 inline constexpr const char* kLocalIp = "10.0.2.15";
 inline constexpr const char* kGateway = "10.0.2.2";
@@ -272,7 +273,6 @@ void Stimulate(int tx_fd, int ifindex, const uint8_t local_mac[6]) {
 }
 
 // Create a SOCK_RAW socket bound to the specified interface, return fd or -1.
-// Also attempt to set SO_RCVTIMEO (DragonOS may not support it, failure is not an error).
 int MakeBoundRaw(const std::string& ifname, int ifindex, uint8_t mac[6]) {
     int fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (fd < 0) return -1;
@@ -286,11 +286,13 @@ int MakeBoundRaw(const std::string& ifname, int ifindex, uint8_t mac[6]) {
         return -1;
     }
     GetIfHwaddr(fd, ifname, mac);
-    // SO_RCVTIMEO: attempt to set, failure is not an error (DragonOS platform limitation)
     struct timeval tv;
     tv.tv_sec = 1;
     tv.tv_usec = 0;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        close(fd);
+        return -1;
+    }
     return fd;
 }
 
@@ -405,7 +407,7 @@ TEST(AfPacketE2E, RecvfromReturnsDataAndSockaddrLl) {
     struct sockaddr_ll from;
     bool got_inbound = false;
     ssize_t n = -1;
-    // MSG_DONTWAIT ensures non-blocking (SO_RCVTIMEO may not be supported on DragonOS)
+    // Poll in bounded nonblocking steps while waiting for the stimulated traffic.
     for (int attempt = 0; attempt < kRecvMaxAttempts; ++attempt) {
         std::memset(&from, 0, sizeof(from));
         socklen_t fromlen = sizeof(from);
@@ -706,6 +708,81 @@ TEST(AfPacketE2E, VethAcceptsFullMtuVlanFrame) {
                      reinterpret_cast<struct sockaddr*>(&dst), sizeof(dst)),
               static_cast<ssize_t>(sizeof(frame)))
         << ErrnoString(errno);
+}
+
+TEST(AfPacketE2E, ReceiveBufferSizeControlsQueuedBytes) {
+    const std::string ifname = "veth1";
+    int ifindex = ProbeIfindex(ifname);
+    ASSERT_GE(ifindex, 0) << "veth1 must exist for deterministic AF_PACKET queue testing";
+
+    auto make_receiver = [ifindex]() {
+        int fd = socket(AF_PACKET, SOCK_RAW, htons(kPrivateEtherType));
+        if (fd < 0) return fd;
+        struct sockaddr_ll bind_addr{};
+        bind_addr.sll_family = AF_PACKET;
+        bind_addr.sll_protocol = htons(kPrivateEtherType);
+        bind_addr.sll_ifindex = ifindex;
+        if (bind(fd, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) < 0) {
+            close(fd);
+            return -1;
+        }
+        return fd;
+    };
+
+    FdGuard small(make_receiver());
+    FdGuard large(make_receiver());
+    FdGuard sender(socket(AF_PACKET, SOCK_RAW, htons(kPrivateEtherType)));
+    ASSERT_GE(small.Get(), 0) << ErrnoString(errno);
+    ASSERT_GE(large.Get(), 0) << ErrnoString(errno);
+    ASSERT_GE(sender.Get(), 0) << ErrnoString(errno);
+
+    int small_request = 0;
+    int large_request = 100000;
+    ASSERT_EQ(setsockopt(small.Get(), SOL_SOCKET, SO_RCVBUF, &small_request,
+                         sizeof(small_request)),
+              0);
+    ASSERT_EQ(setsockopt(large.Get(), SOL_SOCKET, SO_RCVBUF, &large_request,
+                         sizeof(large_request)),
+              0);
+
+    uint8_t local_mac[6];
+    GetIfHwaddr(sender.Get(), ifname, local_mac);
+    uint8_t frame[512]{};
+    std::memset(frame, 0xff, 6);
+    std::memcpy(frame + 6, local_mac, 6);
+    frame[12] = static_cast<uint8_t>(kPrivateEtherType >> 8);
+    frame[13] = static_cast<uint8_t>(kPrivateEtherType);
+
+    struct sockaddr_ll dst{};
+    dst.sll_family = AF_PACKET;
+    dst.sll_protocol = htons(kPrivateEtherType);
+    dst.sll_ifindex = ifindex;
+    dst.sll_hatype = ARPHRD_ETHER;
+    dst.sll_halen = ETH_ALEN;
+    std::memset(dst.sll_addr, 0xff, ETH_ALEN);
+
+    int sent = 0;
+    for (int i = 0; i < 128; ++i) {
+        if (sendto(sender.Get(), frame, sizeof(frame), 0,
+                   reinterpret_cast<sockaddr*>(&dst), sizeof(dst)) !=
+            static_cast<ssize_t>(sizeof(frame))) {
+            break;
+        }
+        ++sent;
+    }
+    ASSERT_GT(sent, 16) << ErrnoString(errno);
+
+    auto drain = [](int fd) {
+        uint8_t buffer[512];
+        int count = 0;
+        while (recv(fd, buffer, sizeof(buffer), MSG_DONTWAIT) > 0) ++count;
+        return count;
+    };
+    int small_count = drain(small.Get());
+    int large_count = drain(large.Get());
+    EXPECT_GT(small_count, 0);
+    EXPECT_GT(large_count, small_count)
+        << "sent=" << sent << " small=" << small_count << " large=" << large_count;
 }
 
 int main(int argc, char** argv) {

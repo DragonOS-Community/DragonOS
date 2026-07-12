@@ -1119,7 +1119,7 @@ pub fn devfs_init() -> Result<(), SystemError> {
                 .or_else(|_| dev_inode.mkdir("shm", InodeMode::from_bits_truncate(0o1777)));
             if let Ok(shm_inode) = shm_inode {
                 let flags = MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC;
-                match produce_fs("tmpfs", Some("mode=1777"), "tmpfs") {
+                match produce_fs("tmpfs", Some("mode=1777"), "tmpfs", flags) {
                     Ok(fs) => {
                         if let Err(e) = shm_inode.mount(fs, flags) {
                             if e != SystemError::EBUSY {

@@ -40,6 +40,43 @@ impl SetAttr {
 }
 
 impl Ext4 {
+    fn xattr_checksum_seed(&self) -> Result<Option<u32>> {
+        let sb = self.read_super_block_cached();
+        if !sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_METADATA_CSUM) {
+            return Ok(None);
+        }
+        // A seeded-checksum filesystem must use s_checksum_seed rather than
+        // CRC32C(UUID). Writable preflight rejects it, and direct xattr paths
+        // must fail closed as well instead of writing a mismatched checksum.
+        const FEATURE_INCOMPAT_CSUM_SEED: u32 = 0x2000;
+        if sb.has_incompatible_feature(FEATURE_INCOMPAT_CSUM_SEED) {
+            return Err(Ext4Error::new(ErrCode::ENOTSUP));
+        }
+        Ok(Some(crate::ext4_defs::crc::crc32(CRC32_INIT, &sb.uuid())))
+    }
+
+    fn verify_xattr_block_checksum(&self, block_id: PBlockId, block: &XattrBlock) -> Result<()> {
+        if let Some(seed) = self.xattr_checksum_seed()? {
+            if !block.verify_checksum(seed, block_id) {
+                return Err(Ext4Error::new(ErrCode::EIO));
+            }
+        }
+        Ok(())
+    }
+
+    fn update_xattr_block_checksum(
+        &self,
+        block_id: PBlockId,
+        block: &mut XattrBlock,
+    ) -> Result<()> {
+        if let Some(seed) = self.xattr_checksum_seed()? {
+            if !block.update_checksum(seed, block_id) {
+                return Err(Ext4Error::new(ErrCode::EIO));
+            }
+        }
+        Ok(())
+    }
+
     fn read_extent_or_hole(
         &self,
         file: &InodeRef,
@@ -1288,6 +1325,7 @@ impl Ext4 {
             return_error!(ErrCode::ENODATA, "Xattr {} does not exist", name);
         }
         let xattr_block = XattrBlock::new(self.read_block(xattr_block_id)?);
+        self.verify_xattr_block_checksum(xattr_block_id, &xattr_block)?;
         match xattr_block.get(name) {
             Some(value) => Ok(value.to_owned()),
             None => Err(format_error!(
@@ -1350,6 +1388,7 @@ impl Ext4 {
                         inode
                     );
                 }
+                self.update_xattr_block_checksum(pblock, &mut xattr_block)?;
                 self.write_block(&xattr_block.block())?;
                 inode_ref.inode.set_xattr_block(pblock);
                 self.write_inode_with_csum(&mut inode_ref)?;
@@ -1366,6 +1405,7 @@ impl Ext4 {
         }
 
         let xattr_block = XattrBlock::new(self.read_block(xattr_block_id)?);
+        self.verify_xattr_block_checksum(xattr_block_id, &xattr_block)?;
         let exists = xattr_block.get(name).is_some();
         if exists && create {
             return_error!(ErrCode::EEXIST, "Xattr {} already exists", name);
@@ -1379,6 +1419,7 @@ impl Ext4 {
             let _ = new_xattr_block.remove(name);
         }
         if new_xattr_block.insert(name, value) {
+            self.update_xattr_block_checksum(xattr_block_id, &mut new_xattr_block)?;
             self.write_block(&new_xattr_block.block())?;
             Ok(())
         } else {
@@ -1411,7 +1452,9 @@ impl Ext4 {
             return_error!(ErrCode::ENODATA, "Xattr {} does not exist", name);
         }
         let mut xattr_block = XattrBlock::new(self.read_block(xattr_block_id)?);
+        self.verify_xattr_block_checksum(xattr_block_id, &xattr_block)?;
         if xattr_block.remove(name) {
+            self.update_xattr_block_checksum(xattr_block_id, &mut xattr_block)?;
             self.write_block(&xattr_block.block())?;
             Ok(())
         } else {
@@ -1435,6 +1478,7 @@ impl Ext4 {
             return Ok(Vec::new());
         }
         let xattr_block = XattrBlock::new(self.read_block(xattr_block_id)?);
+        self.verify_xattr_block_checksum(xattr_block_id, &xattr_block)?;
         Ok(xattr_block.list())
     }
 }

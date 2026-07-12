@@ -32,8 +32,8 @@ pub struct BlockGroupDesc {
     used_dirs_count_lo: u16,         // 目录数
     flags: u16,                      // EXT4_BG_flags (INODE_UNINIT, etc)
     exclude_bitmap_lo: u32,          // 快照排除位图
-    block_bitmap_csum_lo: u16,       // crc32c(s_uuid+grp_num+bbitmap) LE
-    inode_bitmap_csum_lo: u16,       // crc32c(s_uuid+grp_num+ibitmap) LE
+    block_bitmap_csum_lo: u16,       // crc32c(s_csum_seed+bbitmap) LE
+    inode_bitmap_csum_lo: u16,       // crc32c(s_csum_seed+ibitmap) LE
     itable_unused_lo: u16,           // 未使用的节点数
     checksum: u16,                   // crc16(sb_uuid+group+desc)
 
@@ -45,8 +45,8 @@ pub struct BlockGroupDesc {
     used_dirs_count_hi: u16,         // 目录数 MSB
     itable_unused_hi: u16,           // 未使用的节点数 MSB
     exclude_bitmap_hi: u32,          // 快照排除位图 MSB
-    block_bitmap_csum_hi: u16,       // crc32c(s_uuid+grp_num+bbitmap) BE
-    inode_bitmap_csum_hi: u16,       // crc32c(s_uuid+grp_num+ibitmap) BE
+    block_bitmap_csum_hi: u16,       // crc32c(s_csum_seed+bbitmap) BE
+    inode_bitmap_csum_hi: u16,       // crc32c(s_csum_seed+ibitmap) BE
     reserved: u32,                   // 填充
 }
 

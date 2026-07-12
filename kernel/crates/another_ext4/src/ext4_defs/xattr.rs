@@ -350,6 +350,26 @@ impl XattrBlock {
         self.0.write_offset_as(0, &header);
     }
 
+    /// Verify the Linux ext4 external-xattr block checksum.
+    pub fn verify_checksum(&self, seed: u32, block_id: PBlockId) -> bool {
+        let header: XattrHeader = self.0.read_offset_as(0);
+        xattr_block_checksum(seed, block_id, &*self.0.data)
+            .is_some_and(|checksum| checksum == header.checksum())
+    }
+
+    /// Recompute the Linux ext4 external-xattr block checksum after mutation.
+    pub fn update_checksum(&mut self, seed: u32, block_id: PBlockId) -> bool {
+        let mut header: XattrHeader = self.0.read_offset_as(0);
+        header.set_checksum(0);
+        self.0.write_offset_as(0, &header);
+        let Some(checksum) = xattr_block_checksum(seed, block_id, &*self.0.data) else {
+            return false;
+        };
+        header.set_checksum(checksum);
+        self.0.write_offset_as(0, &header);
+        true
+    }
+
     /// Get a xattr by name, return the value.
     pub fn get(&self, name: &str) -> Option<&[u8]> {
         let mut entry_start = size_of::<XattrHeader>();
@@ -605,6 +625,23 @@ mod release_tests {
             xattr_block_checksum(seed, 17, &bytes).unwrap(),
             header.checksum()
         );
+    }
+
+    #[test]
+    fn xattr_block_mutation_recomputes_linux_checksum() {
+        let seed = 0x1234_5678;
+        let block_id = 17;
+        let mut block = XattrBlock::new(Block::new(block_id, Box::new([0; BLOCK_SIZE])));
+        block.init();
+        assert!(block.insert("user.test", b"value"));
+        assert!(block.update_checksum(seed, block_id));
+        assert!(block.verify_checksum(seed, block_id));
+
+        assert!(block.remove("user.test"));
+        assert!(!block.verify_checksum(seed, block_id));
+        assert!(block.update_checksum(seed, block_id));
+        assert!(block.verify_checksum(seed, block_id));
+        assert!(!block.verify_checksum(seed, block_id + 1));
     }
 
     #[test]

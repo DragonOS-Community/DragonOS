@@ -611,7 +611,7 @@ impl InnerAddressSpace {
     pub(crate) fn apply_mlockall_current_collect(
         &mut self,
         new_flags: VmFlags,
-    ) -> Result<(), VmaOpFailure> {
+    ) -> VmaCloseNotifications {
         let ranges = self
             .mappings
             .iter_vmas()
@@ -621,28 +621,27 @@ impl InnerAddressSpace {
             })
             .collect::<Vec<_>>();
 
+        let mut notifications = VmaCloseNotifications::default();
         for (start, len) in ranges {
-            self.apply_vma_lock_flags_collect(start, len, new_flags, true)?;
+            if let Err(failure) = self.apply_vma_lock_flags_collect(start, len, new_flags) {
+                notifications.extend(failure.notifications);
+            }
         }
 
-        Ok(())
+        notifications
     }
 
     pub fn apply_mlockall_current(&mut self, new_flags: VmFlags) -> Result<(), SystemError> {
-        match self.apply_mlockall_current_collect(new_flags) {
-            Ok(()) => Ok(()),
-            Err(failure) => {
-                Self::notify_close_notifications(failure.notifications);
-                Err(failure.err)
-            }
-        }
+        let notifications = self.apply_mlockall_current_collect(new_flags);
+        Self::notify_close_notifications(notifications);
+        Ok(())
     }
 
     pub fn set_mlock_future(&mut self, flags: VmFlags) {
         self.mlock_future = flags;
     }
 
-    pub(crate) fn clear_all_vma_lock_flags_collect(&mut self) -> Result<(), VmaOpFailure> {
+    pub(crate) fn clear_all_vma_lock_flags_collect(&mut self) -> VmaCloseNotifications {
         self.mlock_future = VmFlags::VM_NONE;
         let ranges = self
             .mappings
@@ -660,21 +659,20 @@ impl InnerAddressSpace {
             })
             .collect::<Vec<_>>();
 
+        let mut notifications = VmaCloseNotifications::default();
         for (start, len) in ranges {
-            self.apply_vma_lock_flags_collect(start, len, VmFlags::VM_NONE, false)?;
+            if let Err(failure) = self.apply_vma_lock_flags_collect(start, len, VmFlags::VM_NONE) {
+                notifications.extend(failure.notifications);
+            }
         }
 
-        Ok(())
+        notifications
     }
 
     pub fn clear_all_vma_lock_flags(&mut self) -> Result<(), SystemError> {
-        match self.clear_all_vma_lock_flags_collect() {
-            Ok(()) => Ok(()),
-            Err(failure) => {
-                Self::notify_close_notifications(failure.notifications);
-                Err(failure.err)
-            }
-        }
+        let notifications = self.clear_all_vma_lock_flags_collect();
+        Self::notify_close_notifications(notifications);
+        Ok(())
     }
 
     pub(crate) fn apply_vma_lock_flags_collect(
@@ -682,7 +680,6 @@ impl InnerAddressSpace {
         start: VirtAddr,
         len: usize,
         new_flags: VmFlags,
-        ignore_populate_errors: bool,
     ) -> Result<(), VmaOpFailure> {
         let target = Self::checked_user_region(start, len)?;
         self.count_unlocked_pages_for_mlock(start, len)?;
@@ -703,6 +700,9 @@ impl InnerAddressSpace {
                     *guard.vm_flags(),
                 )
             };
+            if old_flags.is_mlock_flag_unsupported() {
+                continue;
+            }
             let old_locked = old_flags.contains(VmFlags::VM_LOCKED);
             let committed_flags = (old_flags & VmFlags::VM_LOCKED_CLEAR_MASK) | new_flags;
             if committed_flags == old_flags {
@@ -784,13 +784,7 @@ impl InnerAddressSpace {
             split_lifecycle.commit();
         }
 
-        if wants_locked {
-            let fault_in_missing = !new_flags.contains(VmFlags::VM_LOCKONFAULT);
-            let result = self.populate_vma_range(target.start(), target.size(), fault_in_missing);
-            if !ignore_populate_errors {
-                result?;
-            }
-        } else {
+        if !wants_locked {
             self.munlock_vma_pages_range(target.start(), target.end())?;
         }
 
@@ -802,9 +796,8 @@ impl InnerAddressSpace {
         start: VirtAddr,
         len: usize,
         new_flags: VmFlags,
-        ignore_populate_errors: bool,
     ) -> Result<(), SystemError> {
-        match self.apply_vma_lock_flags_collect(start, len, new_flags, ignore_populate_errors) {
+        match self.apply_vma_lock_flags_collect(start, len, new_flags) {
             Ok(()) => Ok(()),
             Err(failure) => {
                 Self::notify_close_notifications(failure.notifications);

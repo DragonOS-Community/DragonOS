@@ -117,6 +117,24 @@ bitflags! {
     }
 }
 
+impl VmFlags {
+    /// VMAs which Linux mlock_fixup() leaves unlocked and unaccounted.
+    #[inline]
+    pub fn is_mlock_flag_unsupported(self) -> bool {
+        self.intersects(Self::VM_IO | Self::VM_DONTEXPAND | Self::VM_PFNMAP | Self::VM_HUGETLB)
+    }
+
+    /// VMAs which cannot be handled by DragonOS' ordinary prefault path.
+    ///
+    /// This deliberately differs from `is_mlock_flag_unsupported`: Linux
+    /// __mm_populate() only skips VM_IO/VM_PFNMAP, while DragonOS must also
+    /// skip hugetlb until its fault path is implemented.
+    #[inline]
+    pub fn is_mlock_population_unsupported(self) -> bool {
+        self.intersects(Self::VM_IO | Self::VM_PFNMAP | Self::VM_HUGETLB)
+    }
+}
+
 impl core::ops::Index<VmFlags> for [usize] {
     type Output = usize;
 

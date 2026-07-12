@@ -38,7 +38,7 @@ impl Syscall for SysMunlockHandle {
                 vm.wait_for_no_reservation_conflict_interruptible(region)?;
                 continue;
             }
-            match guard.apply_vma_lock_flags_collect(start, len, VmFlags::VM_NONE, false) {
+            match guard.apply_vma_lock_flags_collect(start, len, VmFlags::VM_NONE) {
                 Ok(()) => return Ok(0),
                 Err(failure) => {
                     drop(guard);

@@ -18,13 +18,14 @@ use crate::{
 
 use super::{
     irq::{virtio_irq_manager, VirtioIrqCallback},
-    transport::VirtIOTransport,
+    transport::{VirtIOTransport, VirtioSharedMemoryRegion},
     transport_pci::PciInterruptAck,
 };
 
 const VIRTIO_FS_TAG_LEN: usize = 36;
 const VIRTIO_FS_REQUEST_QUEUE_BASE: u16 = 1;
 const VIRTIO_FS_MAX_REQUEST_QUEUES: u32 = 64;
+const VIRTIO_FS_SHMCAP_ID_CACHE: u8 = 0;
 
 #[repr(C, packed)]
 struct VirtioFsConfig {
@@ -48,6 +49,13 @@ unsafe impl Send for VirtioFsTransportHolder {}
 struct VirtioFsActiveBridge {
     session_id: u64,
     conn: Weak<FuseConn>,
+}
+
+#[derive(Debug)]
+struct VirtioFsIrqConfig {
+    wake_enabled: bool,
+    is_msix: bool,
+    ack: Option<PciInterruptAck>,
 }
 
 #[derive(Debug)]
@@ -86,6 +94,7 @@ pub struct VirtioFsInstance {
     irq_wake_enabled: bool,
     irq_is_msix: bool,
     irq_ack: Option<PciInterruptAck>,
+    cache_region: Option<VirtioSharedMemoryRegion>,
     state: SpinLock<VirtioFsInstanceState>,
     session_wait: WaitQueue,
 }
@@ -96,17 +105,17 @@ impl VirtioFsInstance {
         num_request_queues: u32,
         dev_id: Arc<DeviceId>,
         transport: VirtIOTransport,
-        irq_wake_enabled: bool,
-        irq_is_msix: bool,
-        irq_ack: Option<PciInterruptAck>,
+        irq: VirtioFsIrqConfig,
+        cache_region: Option<VirtioSharedMemoryRegion>,
     ) -> Self {
         Self {
             tag,
             num_request_queues,
             dev_id,
-            irq_wake_enabled,
-            irq_is_msix,
-            irq_ack,
+            irq_wake_enabled: irq.wake_enabled,
+            irq_is_msix: irq.is_msix,
+            irq_ack: irq.ack,
+            cache_region,
             state: SpinLock::new(VirtioFsInstanceState {
                 transport: Some(VirtioFsTransportHolder(transport)),
                 session_active: false,
@@ -129,6 +138,10 @@ impl VirtioFsInstance {
 
     pub fn num_request_queues(&self) -> u32 {
         self.num_request_queues
+    }
+
+    pub fn cache_region(&self) -> Option<VirtioSharedMemoryRegion> {
+        self.cache_region
     }
 
     pub fn hiprio_queue_index(&self) -> u16 {
@@ -402,6 +415,9 @@ pub fn virtio_fs(
     let mut irq_wake_enabled = false;
     let mut irq_is_msix = false;
     let mut irq_ack = None;
+    let cache_region = transport
+        .shared_memory_region(VIRTIO_FS_SHMCAP_ID_CACHE)
+        .filter(|region| region.length() != 0);
     if matches!(transport, VirtIOTransport::Pci(_)) {
         if let Err(e) = transport.setup_irq(dev_id.clone()) {
             warn!(
@@ -427,11 +443,15 @@ pub fn virtio_fs(
         nrqs,
         dev_id.clone(),
         transport,
-        irq_wake_enabled,
-        irq_is_msix,
-        irq_ack,
+        VirtioFsIrqConfig {
+            wake_enabled: irq_wake_enabled,
+            is_msix: irq_is_msix,
+            ack: irq_ack,
+        },
+        cache_region,
     ));
 
+    let cache_region_len = instance.cache_region().map(|region| region.length());
     let mut map = VIRTIO_FS_INSTANCES.lock_irqsave();
     if map.contains_key(&tag) {
         warn!(
@@ -443,8 +463,8 @@ pub fn virtio_fs(
 
     map.insert(tag.clone(), instance);
     info!(
-        "virtio-fs: registered instance tag='{}' dev={:?} request_queues={}",
-        tag, dev_id, nrqs
+        "virtio-fs: registered instance tag='{}' dev={:?} request_queues={} cache_region_len={:?}",
+        tag, dev_id, nrqs, cache_region_len
     );
 }
 

@@ -575,10 +575,13 @@ pub trait PciInterrupt: PciDeviceStructure {
                         .read();
                     let msix_bar = pcistandardbar.get_bar(msix_table_bar)?;
                     let vaddr: crate::mm::VirtAddr = msix_bar
-                        .virtual_address()
-                        .ok_or(PciError::PciIrqError(PciIrqError::BarGetVaddrFailed))?
-                        + msix_table_offset as usize
-                        + msg.irq_common_message.irq_index as usize * size_of::<MsixEntry>();
+                        .virtual_address_at(
+                            u64::from(msix_table_offset)
+                                + msg.irq_common_message.irq_index as u64
+                                    * size_of::<MsixEntry>() as u64,
+                            size_of::<MsixEntry>(),
+                        )
+                        .ok_or(PciError::PciIrqError(PciIrqError::BarGetVaddrFailed))?;
                     let msix_entry = NonNull::new(vaddr.data() as *mut MsixEntry).unwrap();
                     // 这里的操作并不适用于所有架构，需要再优化，msg_upper_data并不一定为0
                     unsafe {
@@ -698,11 +701,13 @@ pub trait PciInterrupt: PciDeviceStructure {
                     let msix_bar = pcistandardbar.get_bar(msix_table_bar).unwrap();
                     for index in 0..irq_max_num {
                         let vaddr = msix_bar
-                            .virtual_address()
+                            .virtual_address_at(
+                                u64::from(msix_table_offset)
+                                    + index as u64 * size_of::<MsixEntry>() as u64,
+                                size_of::<MsixEntry>(),
+                            )
                             .ok_or(PciError::PciIrqError(PciIrqError::BarGetVaddrFailed))
-                            .unwrap()
-                            + msix_table_offset as usize
-                            + index as usize * size_of::<MsixEntry>();
+                            .unwrap();
                         let msix_entry = NonNull::new(vaddr.data() as *mut MsixEntry).unwrap();
                         unsafe {
                             volwrite!(msix_entry, vector_control, 0);
@@ -826,9 +831,13 @@ pub trait PciInterrupt: PciDeviceStructure {
                         .unwrap()
                         .read();
                     let msix_bar = pcistandardbar.get_bar(msix_table_bar).unwrap();
-                    let vaddr = msix_bar.virtual_address().unwrap()
-                        + msix_table_offset as usize
-                        + irq_index as usize * size_of::<MsixEntry>();
+                    let vaddr = msix_bar
+                        .virtual_address_at(
+                            u64::from(msix_table_offset)
+                                + irq_index as u64 * size_of::<MsixEntry>() as u64,
+                            size_of::<MsixEntry>(),
+                        )
+                        .unwrap();
                     let msix_entry = NonNull::new(vaddr.data() as *mut MsixEntry).unwrap();
                     unsafe {
                         volwrite!(msix_entry, vector_control, 1);
@@ -947,9 +956,13 @@ pub trait PciInterrupt: PciDeviceStructure {
                         .unwrap()
                         .read();
                     let msix_bar = pcistandardbar.get_bar(msix_table_bar).unwrap();
-                    let vaddr = msix_bar.virtual_address().unwrap()
-                        + msix_table_offset as usize
-                        + irq_index as usize * size_of::<MsixEntry>();
+                    let vaddr = msix_bar
+                        .virtual_address_at(
+                            u64::from(msix_table_offset)
+                                + irq_index as u64 * size_of::<MsixEntry>() as u64,
+                            size_of::<MsixEntry>(),
+                        )
+                        .unwrap();
                     let msix_entry = NonNull::new(vaddr.data() as *mut MsixEntry).unwrap();
                     unsafe {
                         volwrite!(msix_entry, vector_control, 0);
@@ -1062,9 +1075,13 @@ pub trait PciInterrupt: PciDeviceStructure {
                         .unwrap()
                         .read();
                     let pending_bar = pcistandardbar.get_bar(pending_table_bar).unwrap();
-                    let vaddr = pending_bar.virtual_address().unwrap()
-                        + pending_table_offset as usize
-                        + (irq_index as usize / 64) * size_of::<PendingEntry>();
+                    let vaddr = pending_bar
+                        .virtual_address_at(
+                            u64::from(pending_table_offset)
+                                + (irq_index as u64 / 64) * size_of::<PendingEntry>() as u64,
+                            size_of::<PendingEntry>(),
+                        )
+                        .unwrap();
                     let pending_entry = NonNull::new(vaddr.data() as *mut PendingEntry).unwrap();
                     let pending_entry = unsafe { volread!(pending_entry, entry) };
                     return Ok(pending_entry & (1 << (irq_index as u64 % 64)) != 0);

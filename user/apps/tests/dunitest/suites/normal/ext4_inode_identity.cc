@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +26,24 @@
 #else
 #error "__NR_syncfs is not defined for this architecture"
 #endif
+#endif
+
+#ifndef __NR_renameat2
+#if defined(__x86_64__)
+#define __NR_renameat2 316
+#elif defined(__riscv) || defined(__loongarch64__)
+#define __NR_renameat2 276
+#else
+#error "__NR_renameat2 is not defined for this architecture"
+#endif
+#endif
+
+#ifndef RENAME_EXCHANGE
+#define RENAME_EXCHANGE (1U << 1)
+#endif
+
+#ifndef RENAME_WHITEOUT
+#define RENAME_WHITEOUT (1U << 2)
 #endif
 
 namespace {
@@ -455,14 +474,176 @@ TEST(Ext4InodeIdentity, CurrentDirectorySurvivesRmdir) {
 
     const std::string directory = fs.mount_point() + "/removed_cwd";
     ASSERT_EQ(0, mkdir(directory.c_str(), 0755)) << strerror(errno);
+    int directory_fd = open(directory.c_str(), O_RDONLY | O_DIRECTORY);
+    ASSERT_GE(directory_fd, 0) << strerror(errno);
+    struct stat before = {};
+    ASSERT_EQ(0, fstat(directory_fd, &before)) << strerror(errno);
     ASSERT_EQ(0, chdir(directory.c_str())) << strerror(errno);
     ASSERT_EQ(0, rmdir(directory.c_str())) << strerror(errno);
 
     struct stat current = {};
     ASSERT_EQ(0, stat(".", &current)) << strerror(errno);
     EXPECT_TRUE(S_ISDIR(current.st_mode));
+    struct stat removed = {};
+    ASSERT_EQ(0, fstat(directory_fd, &removed)) << strerror(errno);
+    EXPECT_EQ(before.st_ino, removed.st_ino);
+    EXPECT_EQ(0u, removed.st_nlink);
 
     ASSERT_EQ(0, chdir("/")) << strerror(errno);
+    ASSERT_EQ(0, close(directory_fd)) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
+TEST(Ext4InodeIdentity, DirtyOpenRenameTargetSurvivesReplacement) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+
+    const std::string source = fs.mount_point() + "/rename_source";
+    const std::string target = fs.mount_point() + "/rename_target";
+    int source_fd = open(source.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+    int target_fd = open(target.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+    ASSERT_GE(source_fd, 0) << strerror(errno);
+    ASSERT_GE(target_fd, 0) << strerror(errno);
+    constexpr char kSource[] = "new-path-data";
+    constexpr char kTarget[] = "old-open-data";
+    ASSERT_NO_FATAL_FAILURE(WriteAll(source_fd, kSource, sizeof(kSource) - 1));
+    ASSERT_NO_FATAL_FAILURE(WriteAll(target_fd, kTarget, sizeof(kTarget) - 1));
+    struct stat old_target = {};
+    ASSERT_EQ(0, fstat(target_fd, &old_target)) << strerror(errno);
+
+    ASSERT_EQ(0, rename(source.c_str(), target.c_str())) << strerror(errno);
+    EXPECT_EQ(std::string(kSource, sizeof(kSource) - 1), ReadFile(target.c_str()));
+    struct stat replaced = {};
+    ASSERT_EQ(0, fstat(target_fd, &replaced)) << strerror(errno);
+    EXPECT_EQ(old_target.st_ino, replaced.st_ino);
+    EXPECT_EQ(0u, replaced.st_nlink);
+    ASSERT_EQ(0, lseek(target_fd, 0, SEEK_SET)) << strerror(errno);
+    char buffer[sizeof(kTarget)] = {};
+    ASSERT_EQ(static_cast<ssize_t>(sizeof(kTarget) - 1),
+              read(target_fd, buffer, sizeof(buffer)))
+        << strerror(errno);
+    EXPECT_EQ(0, memcmp(buffer, kTarget, sizeof(kTarget) - 1));
+    constexpr char kSuffix[] = "-after-rename";
+    ASSERT_EQ(static_cast<off_t>(sizeof(kTarget) - 1),
+              lseek(target_fd, 0, SEEK_END));
+    ASSERT_NO_FATAL_FAILURE(WriteAll(target_fd, kSuffix, sizeof(kSuffix) - 1));
+    ASSERT_EQ(0, fdatasync(target_fd)) << strerror(errno);
+    ASSERT_EQ(0, close(target_fd)) << strerror(errno);
+    ASSERT_EQ(0, close(source_fd)) << strerror(errno);
+    ASSERT_EQ(0, unlink(target.c_str())) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
+TEST(Ext4InodeIdentity, RenameReplacementPreservesRemainingHardLink) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+
+    const std::string source = fs.mount_point() + "/hardlink_source";
+    const std::string target = fs.mount_point() + "/hardlink_target";
+    const std::string alias = fs.mount_point() + "/hardlink_alias";
+    int target_fd = open(target.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+    ASSERT_GE(target_fd, 0) << strerror(errno);
+    constexpr char kOld[] = "linked-target";
+    ASSERT_NO_FATAL_FAILURE(WriteAll(target_fd, kOld, sizeof(kOld) - 1));
+    ASSERT_EQ(0, link(target.c_str(), alias.c_str())) << strerror(errno);
+    int source_fd = open(source.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
+    ASSERT_GE(source_fd, 0) << strerror(errno);
+    ASSERT_EQ(0, close(source_fd)) << strerror(errno);
+
+    ASSERT_EQ(0, rename(source.c_str(), target.c_str())) << strerror(errno);
+    EXPECT_EQ(std::string(kOld, sizeof(kOld) - 1), ReadFile(alias.c_str()));
+    struct stat remaining = {};
+    ASSERT_EQ(0, fstat(target_fd, &remaining)) << strerror(errno);
+    EXPECT_EQ(1u, remaining.st_nlink);
+    ASSERT_EQ(0, unlink(alias.c_str())) << strerror(errno);
+    ASSERT_EQ(0, fstat(target_fd, &remaining)) << strerror(errno);
+    EXPECT_EQ(0u, remaining.st_nlink);
+    ASSERT_EQ(0, fsync(target_fd)) << strerror(errno);
+    ASSERT_EQ(0, close(target_fd)) << strerror(errno);
+    ASSERT_EQ(0, unlink(target.c_str())) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
+TEST(Ext4InodeIdentity, RenameExchangeDoesNotUnlinkEitherInode) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+
+    const std::string left = fs.mount_point() + "/exchange_left";
+    const std::string right = fs.mount_point() + "/exchange_right";
+    int left_fd = open(left.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+    int right_fd = open(right.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+    ASSERT_GE(left_fd, 0) << strerror(errno);
+    ASSERT_GE(right_fd, 0) << strerror(errno);
+    constexpr char kLeft[] = "left";
+    constexpr char kRight[] = "right";
+    ASSERT_NO_FATAL_FAILURE(WriteAll(left_fd, kLeft, sizeof(kLeft) - 1));
+    ASSERT_NO_FATAL_FAILURE(WriteAll(right_fd, kRight, sizeof(kRight) - 1));
+    ASSERT_EQ(0, syscall(__NR_renameat2, AT_FDCWD, left.c_str(), AT_FDCWD,
+                         right.c_str(), RENAME_EXCHANGE))
+        << strerror(errno);
+    EXPECT_EQ(std::string(kRight, sizeof(kRight) - 1), ReadFile(left.c_str()));
+    EXPECT_EQ(std::string(kLeft, sizeof(kLeft) - 1), ReadFile(right.c_str()));
+    struct stat left_stat = {};
+    struct stat right_stat = {};
+    ASSERT_EQ(0, fstat(left_fd, &left_stat)) << strerror(errno);
+    ASSERT_EQ(0, fstat(right_fd, &right_stat)) << strerror(errno);
+    EXPECT_EQ(1u, left_stat.st_nlink);
+    EXPECT_EQ(1u, right_stat.st_nlink);
+    ASSERT_EQ(0, close(left_fd)) << strerror(errno);
+    ASSERT_EQ(0, close(right_fd)) << strerror(errno);
+    ASSERT_EQ(0, unlink(left.c_str())) << strerror(errno);
+    ASSERT_EQ(0, unlink(right.c_str())) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+}
+
+TEST(Ext4InodeIdentity, RenameWhiteoutPreservesTargetAndLeaksNoTemporaryName) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+
+    const std::string source = fs.mount_point() + "/whiteout_source";
+    const std::string target = fs.mount_point() + "/whiteout_target";
+    int source_fd = open(source.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+    int target_fd = open(target.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+    ASSERT_GE(source_fd, 0) << strerror(errno);
+    ASSERT_GE(target_fd, 0) << strerror(errno);
+    constexpr char kSource[] = "whiteout-new";
+    constexpr char kTarget[] = "whiteout-old";
+    ASSERT_NO_FATAL_FAILURE(WriteAll(source_fd, kSource, sizeof(kSource) - 1));
+    ASSERT_NO_FATAL_FAILURE(WriteAll(target_fd, kTarget, sizeof(kTarget) - 1));
+
+    ASSERT_EQ(0, syscall(__NR_renameat2, AT_FDCWD, source.c_str(), AT_FDCWD,
+                         target.c_str(), RENAME_WHITEOUT))
+        << strerror(errno);
+    EXPECT_EQ(std::string(kSource, sizeof(kSource) - 1), ReadFile(target.c_str()));
+    struct stat whiteout = {};
+    ASSERT_EQ(0, lstat(source.c_str(), &whiteout)) << strerror(errno);
+    EXPECT_TRUE(S_ISCHR(whiteout.st_mode));
+    struct stat replaced = {};
+    ASSERT_EQ(0, fstat(target_fd, &replaced)) << strerror(errno);
+    EXPECT_EQ(0u, replaced.st_nlink);
+
+    DIR* directory = opendir(fs.mount_point().c_str());
+    ASSERT_NE(nullptr, directory) << strerror(errno);
+    bool leaked_temporary = false;
+    constexpr char kTemporaryPrefix[] = ".dragonos-whiteout-";
+    while (dirent* entry = readdir(directory)) {
+        if (strncmp(entry->d_name, kTemporaryPrefix,
+                    sizeof(kTemporaryPrefix) - 1) == 0) {
+            leaked_temporary = true;
+        }
+    }
+    ASSERT_EQ(0, closedir(directory)) << strerror(errno);
+    EXPECT_FALSE(leaked_temporary);
+
+    ASSERT_EQ(0, fdatasync(target_fd)) << strerror(errno);
+    ASSERT_EQ(0, close(target_fd)) << strerror(errno);
+    ASSERT_EQ(0, close(source_fd)) << strerror(errno);
+    ASSERT_EQ(0, unlink(source.c_str())) << strerror(errno);
+    ASSERT_EQ(0, unlink(target.c_str())) << strerror(errno);
     ASSERT_NO_FATAL_FAILURE(fs.Unmount());
 }
 

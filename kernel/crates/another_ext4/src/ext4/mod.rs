@@ -472,6 +472,12 @@ impl Ext4 {
         Ok(())
     }
 
+    /// Prevent every subsequent metadata mutation after an upper-layer
+    /// lifecycle invariant becomes indeterminate.
+    pub fn fail_stop_mutations(&self) {
+        self.poison(ErrCode::EIO);
+    }
+
     fn ranges_overlap(
         start: PBlockId,
         end: PBlockId,

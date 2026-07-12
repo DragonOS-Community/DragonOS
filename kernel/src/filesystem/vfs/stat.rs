@@ -225,8 +225,10 @@ pub fn vfs_getattr(
 
     // Derive directory link count dynamically only when metadata has no reliable value.
     if metadata.file_type == crate::filesystem::vfs::FileType::Dir {
-        // Many filesystems already maintain nlinks; use it when it looks valid (>=2 for dirs).
-        if metadata.nlinks < 2 {
+        // Zero is authoritative for an unlinked-but-live directory.  Only the
+        // legacy/default value one means the filesystem did not provide a
+        // usable directory link count and needs VFS derivation.
+        if metadata.nlinks == 1 {
             if let Ok(entries) = inode.list() {
                 let mut subdir_links = 0usize;
                 for name in entries {

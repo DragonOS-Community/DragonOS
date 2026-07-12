@@ -1648,7 +1648,16 @@ impl PageCacheManager {
         let page_dirty = page.read().flags().contains(PageFlags::PG_DIRTY);
         {
             let mut inner = cache.inner.lock();
-            if page_dirty {
+            // `mark_page_dirty{,_prepared}()` publishes redirty through
+            // `dirty_pages` while holding `inner`.  The PG_DIRTY sample above
+            // must therefore be combined with that publication after taking
+            // the same lock; otherwise a redirty registered between the
+            // sample and this critical section would be overwritten as clean.
+            // Do not read the page flags while holding `inner`: legacy
+            // writeback paths acquire the page lock before updating the page
+            // cache, so doing so would invert the established lock order.
+            let redirtied = page_dirty || inner.dirty_pages.contains(&page_index);
+            if redirtied {
                 cache.account_state_transition(PageState::Writeback, PageState::Dirty);
                 inner.dirty_pages.insert(page_index);
                 entry.set_state(PageState::Dirty);

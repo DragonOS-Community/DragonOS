@@ -106,6 +106,7 @@ pub enum Ext4ErrorsBehavior {
 pub struct Ext4MountOptions {
     pub dax: Option<Ext4DaxMode>,
     pub errors: Ext4ErrorsBehavior,
+    pub read_only: bool,
 }
 
 impl Default for Ext4MountOptions {
@@ -113,6 +114,7 @@ impl Default for Ext4MountOptions {
         Self {
             dax: None,
             errors: Ext4ErrorsBehavior::Continue,
+            read_only: false,
         }
     }
 }
@@ -189,6 +191,9 @@ impl FileSystem for Ext4FileSystem {
     }
 
     fn on_umount(&self) {
+        if self._mount_options.read_only {
+            return;
+        }
         if let Err(error) = self.fs.shutdown_writable() {
             log::error!("ext4: failed to mark journal clean on unmount: {:?}", error);
         }
@@ -628,7 +633,11 @@ impl Ext4FileSystem {
         let raw_dev = mount_data.device_num();
         // Writable mounts recover the journal and the validated legacy orphan
         // chain before this filesystem is published to the VFS.
-        let fs = another_ext4::Ext4::load_writable(mount_data.clone())?;
+        let fs = if mount_options.read_only {
+            another_ext4::Ext4::load(mount_data.clone())?
+        } else {
+            another_ext4::Ext4::load_writable(mount_data.clone())?
+        };
         let root_inode: Arc<LockedExt4Inode> =
             Arc::new_cyclic(|self_ref: &Weak<LockedExt4Inode>| {
                 LockedExt4Inode(

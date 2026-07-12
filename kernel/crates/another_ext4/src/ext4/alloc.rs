@@ -19,6 +19,23 @@ fn extent_tail_batch_limit(
     Some(core::cmp::min(count, in_last_group as u32))
 }
 
+fn linked_orphan_tail_remove_limit(
+    keep_blocks: u64,
+    tail_start: u32,
+    tail_blocks: u32,
+    group_limit: u32,
+) -> Option<u32> {
+    let tail_end = tail_start as u64 + tail_blocks as u64;
+    if tail_end <= keep_blocks {
+        return None;
+    }
+    let beyond_eof = tail_end - core::cmp::max(keep_blocks, tail_start as u64);
+    Some(core::cmp::min(
+        group_limit,
+        core::cmp::min(beyond_eof, u32::MAX as u64) as u32,
+    ))
+}
+
 impl Ext4 {
     fn restore_inode_allocation_state(
         &self,
@@ -420,6 +437,95 @@ impl Ext4 {
             self.inode_mutation_locks[self.inode_mutation_lock_index(inode_id)].lock();
         let generation = self.read_inode_uncached(inode_id)?.inode.generation();
         self.reclaim_inode_lifetime(inode_id, generation)
+    }
+
+    /// Complete a crash-interrupted truncate for an inode that still has names.
+    /// Blocks at or beyond ceil(i_size / block_size) are removed in restartable
+    /// transactions; the inode itself and its xattrs remain live.
+    pub(super) fn recover_linked_orphan_inode_by_id(&self, inode_id: InodeId) -> Result<()> {
+        self.ensure_mutable()?;
+        let _mutation_guard =
+            self.inode_mutation_locks[self.inode_mutation_lock_index(inode_id)].lock();
+        if !self.legacy_orphan_contains(inode_id)? {
+            return_error!(ErrCode::EINVAL, "Inode {} is not orphaned", inode_id);
+        }
+        loop {
+            let mut inode = self.read_inode_uncached(inode_id)?;
+            let sb = self.read_super_block_cached();
+            if !self.inode_is_allocated(inode_id)?
+                || inode.inode.mode().bits() == 0
+                || inode.inode.link_count() == 0
+                || !super::orphan::inode_checksum_valid(&sb, &inode)
+                || !inode.inode.is_file()
+                || !inode.inode.uses_extents()
+            {
+                return_error!(ErrCode::EIO, "Invalid linked truncate orphan {}", inode_id);
+            }
+            let keep_blocks = inode.inode.size().div_ceil(BLOCK_SIZE as u64);
+            let mut transaction = self.transaction_start(32)?;
+            let Some(tail) = self.extent_tail(&transaction, &inode)? else {
+                transaction.abort();
+                break;
+            };
+            let extent_end = tail
+                .start_pblock
+                .checked_add(tail.block_count as PBlockId)
+                .ok_or_else(|| format_error!(ErrCode::EIO, "Invalid extent physical range"))?;
+            if tail.start_pblock == 0
+                || extent_end > sb.block_count()
+                || self.journal_owns_block_range(tail.start_pblock, extent_end)
+            {
+                return_error!(ErrCode::EIO, "Invalid linked orphan extent");
+            }
+            let group_limit = extent_tail_batch_limit(
+                sb.first_data_block() as PBlockId,
+                sb.blocks_per_group() as PBlockId,
+                tail.start_pblock,
+                tail.block_count,
+            )
+            .ok_or_else(|| format_error!(ErrCode::EIO, "Invalid extent tail"))?;
+            let Some(remove_limit) = linked_orphan_tail_remove_limit(
+                keep_blocks,
+                tail.start_lblock,
+                tail.block_count,
+                group_limit,
+            ) else {
+                transaction.abort();
+                break;
+            };
+            let removed = self
+                .extent_remove_tail_in_transaction(&mut transaction, &mut inode, remove_limit)?
+                .ok_or_else(|| format_error!(ErrCode::EIO, "Extent tail disappeared"))?;
+            self.transaction_dealloc_block_range(
+                &mut transaction,
+                removed.start_pblock,
+                removed.block_count,
+            )?;
+            for metadata in removed.metadata_blocks.iter().copied() {
+                self.transaction_dealloc_block_range(&mut transaction, metadata, 1)?;
+            }
+            let released = removed.block_count as u64 + removed.metadata_blocks.len() as u64;
+            inode.inode.set_fs_block_count(
+                inode
+                    .inode
+                    .fs_block_count()
+                    .checked_sub(released)
+                    .ok_or_else(|| format_error!(ErrCode::EIO, "Invalid inode block count"))?,
+            );
+            self.transaction_stage_inode_with_csum(&mut transaction, &mut inode)?;
+            self.commit_reclaim_transaction(transaction)?;
+        }
+
+        let mut inode = self.read_inode_uncached(inode_id)?;
+        if inode.inode.link_count() == 0 {
+            return_error!(ErrCode::EIO, "Linked truncate orphan lost all links");
+        }
+        let mut transaction = self.transaction_start(8)?;
+        let mut sb = self.transaction_read_super_block(&transaction)?;
+        self.transaction_orphan_del(&mut transaction, &inode, &mut sb)?;
+        inode.inode.set_next_orphan(0);
+        self.transaction_stage_inode_with_csum(&mut transaction, &mut inode)?;
+        self.commit_reclaim_transaction(transaction)
     }
 
     fn reclaim_inode_lifetime(&self, inode_id: InodeId, generation: u32) -> Result<()> {
@@ -967,7 +1073,7 @@ impl Ext4 {
 
 #[cfg(test)]
 mod reclaim_tests {
-    use super::extent_tail_batch_limit;
+    use super::{extent_tail_batch_limit, linked_orphan_tail_remove_limit};
 
     #[test]
     fn extent_reclaim_batch_never_crosses_a_block_group() {
@@ -982,5 +1088,13 @@ mod reclaim_tests {
         assert_eq!(extent_tail_batch_limit(1, 8, 0, 1), None);
         assert_eq!(extent_tail_batch_limit(0, 8, u64::MAX, 2), None);
         assert_eq!(extent_tail_batch_limit(0, 0, 1, 1), None);
+    }
+
+    #[test]
+    fn linked_orphan_trim_preserves_eof_block_and_honors_group_batch() {
+        assert_eq!(linked_orphan_tail_remove_limit(5, 3, 6, 6), Some(4));
+        assert_eq!(linked_orphan_tail_remove_limit(5, 3, 6, 2), Some(2));
+        assert_eq!(linked_orphan_tail_remove_limit(5, 8, 3, 3), Some(3));
+        assert_eq!(linked_orphan_tail_remove_limit(12, 8, 3, 3), None);
     }
 }

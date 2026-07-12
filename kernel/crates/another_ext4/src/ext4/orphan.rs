@@ -75,7 +75,7 @@ fn validate_chain<R: LegacyOrphanReader>(reader: &R, head: InodeId) -> Result<Le
         }
 
         let node = reader.read_orphan_inode(current)?;
-        if !node.valid_checksum || !node.valid_mode || node.links != 0 {
+        if !node.valid_checksum || !node.valid_mode {
             return Err(corruption());
         }
         if node.next != 0 && !valid_orphan_number(reader, node.next) {
@@ -158,7 +158,6 @@ impl Ext4 {
             let current_inode = self.read_inode_uncached(current)?;
             if !inode_checksum_valid(sb, &current_inode)
                 || current_inode.inode.file_type() == FileType::Unknown
-                || current_inode.inode.link_count() != 0
             {
                 return Err(corruption());
             }
@@ -226,7 +225,6 @@ impl Ext4 {
 
             let node = self.read_orphan_inode(inode_id)?;
             if node.next != expected_next
-                || node.links != 0
                 || !node.valid_mode
                 || !node.valid_checksum
                 || !self.inode_allocated(inode_id)?
@@ -234,7 +232,11 @@ impl Ext4 {
                 return Err(corruption());
             }
 
-            self.reclaim_orphan_inode_by_id(inode_id)?;
+            if node.links == 0 {
+                self.reclaim_orphan_inode_by_id(inode_id)?;
+            } else {
+                self.recover_linked_orphan_inode_by_id(inode_id)?;
+            }
 
             if self.read_super_block_cached().last_orphan() != expected_next {
                 return Err(corruption());
@@ -355,12 +357,29 @@ mod tests {
     }
 
     #[test]
-    fn rejects_free_and_linked_inode() {
+    fn rejects_free_inode_and_accepts_linked_truncate_orphan() {
         let free = reader(&[(11, (false, MockReader::valid(0).1))]);
         assert!(validate_chain(&free, 11).is_err());
         let mut linked = MockReader::valid(0).1;
         linked.links = 1;
-        assert!(validate_chain(&reader(&[(11, (true, linked))]), 11).is_err());
+        assert_eq!(
+            validate_chain(&reader(&[(11, (true, linked))]), 11)
+                .unwrap()
+                .inodes,
+            vec![11]
+        );
+    }
+
+    #[test]
+    fn accepts_mixed_link_counts_in_complete_chain() {
+        let mut linked = MockReader::valid(12).1;
+        linked.links = 2;
+        let r = reader(&[
+            (11, MockReader::valid(13)),
+            (13, (true, linked)),
+            (12, MockReader::valid(0)),
+        ]);
+        assert_eq!(validate_chain(&r, 11).unwrap().inodes, vec![11, 13, 12]);
     }
 
     #[test]

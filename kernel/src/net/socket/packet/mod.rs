@@ -29,8 +29,9 @@ pub use uapi::{
     TpacketAuxdata,
 };
 
-const DEFAULT_RX_BUFFER_PACKETS: usize = 256;
 const DEFAULT_RX_BUFFER_SIZE: usize = 256 * 1024;
+const DEFAULT_TX_BUFFER_SIZE: usize = 256 * 1024;
+const READ_SCRATCH_BUFFER_SIZE: usize = DEFAULT_RX_BUFFER_SIZE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketSocketType {
@@ -58,6 +59,7 @@ pub struct PacketMetadata {
 pub struct ReceivedPacket {
     pub data: alloc::vec::Vec<u8>,
     pub metadata: PacketMetadata,
+    accounted_bytes: usize,
 }
 
 #[derive(Debug, Default)]
@@ -73,8 +75,9 @@ pub struct PacketSocket {
     pub(super) bind_lock: Mutex<()>,
     pub(super) bound_iface: RwSem<Option<Arc<dyn Iface>>>,
     pub(super) rx_buffer: Mutex<VecDeque<ReceivedPacket>>,
-    pub(super) rx_buffer_len: AtomicUsize,
-    pub(super) rx_buffer_max_packets: AtomicUsize,
+    pub(super) rx_buffer_bytes: AtomicUsize,
+    pub(super) send_buffer_bytes: AtomicUsize,
+    pub(super) recv_buffer_bytes: AtomicUsize,
     pub(super) options: RwSem<PacketSocketOptions>,
     pub(super) stats_packets: AtomicU32,
     pub(super) stats_drops: AtomicU32,
@@ -109,9 +112,10 @@ impl PacketSocket {
             binding: binding::PacketBinding::new(0, protocol),
             bind_lock: Mutex::new(()),
             bound_iface: RwSem::new(None),
-            rx_buffer: Mutex::new(VecDeque::with_capacity(DEFAULT_RX_BUFFER_PACKETS)),
-            rx_buffer_len: AtomicUsize::new(0),
-            rx_buffer_max_packets: AtomicUsize::new(DEFAULT_RX_BUFFER_PACKETS),
+            rx_buffer: Mutex::new(VecDeque::new()),
+            rx_buffer_bytes: AtomicUsize::new(0),
+            send_buffer_bytes: AtomicUsize::new(DEFAULT_TX_BUFFER_SIZE),
+            recv_buffer_bytes: AtomicUsize::new(DEFAULT_RX_BUFFER_SIZE),
             options: RwSem::new(PacketSocketOptions::default()),
             stats_packets: AtomicU32::new(0),
             stats_drops: AtomicU32::new(0),
@@ -208,10 +212,10 @@ impl Socket for PacketSocket {
         self.bind_endpoint(endpoint)
     }
     fn send_buffer_size(&self) -> usize {
-        DEFAULT_RX_BUFFER_SIZE
+        self.send_buffer_bytes.load(Ordering::Relaxed)
     }
     fn recv_buffer_size(&self) -> usize {
-        DEFAULT_RX_BUFFER_SIZE
+        self.recv_buffer_bytes.load(Ordering::Relaxed)
     }
     fn connect(&self, _: Endpoint) -> Result<(), SystemError> {
         Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
@@ -235,7 +239,7 @@ impl Socket for PacketSocket {
         crate::net::socket::base::read_to_user_buffer_via_kernel_buf(
             self,
             b,
-            self.recv_buffer_size(),
+            READ_SCRATCH_BUFFER_SIZE,
         )
     }
     fn recv_from(

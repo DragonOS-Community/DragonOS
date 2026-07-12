@@ -22,6 +22,7 @@
 #include <cstring>
 #include <string>
 #include <tuple>
+#include <utility>
 
 // ---- Manually define constants (DragonOS musl may lack if_packet.h) ----
 
@@ -40,6 +41,19 @@ inline constexpr int kSoRcvtimeoOld = 20;
 inline constexpr int kSoSndtimeoOld = 21;
 inline constexpr int kSoRcvtimeoNew = 66;
 inline constexpr int kSoSndtimeoNew = 67;
+inline constexpr int kSoAttachFilter = 26;
+
+struct TestSockFilter {
+    uint16_t code;
+    uint8_t jt;
+    uint8_t jf;
+    uint32_t k;
+};
+
+struct TestSockFprog {
+    uint16_t len;
+    TestSockFilter* filter;
+};
 
 struct TestSockAddrLl {
     uint16_t sll_family;
@@ -284,6 +298,112 @@ TEST(AfPacketSockopt, InvalidGetsockoptReturnsEnoprotoopt) {
     socklen_t len = sizeof(got);
     errno = 0;
     EXPECT_EQ(getsockopt(fd.Get(), SOL_PACKET, 9999, &got, &len), -1);
+    EXPECT_EQ(errno, ENOPROTOOPT) << ErrnoString(errno);
+}
+
+TEST(AfPacketSockopt, SocketBufferOptionsRoundTrip) {
+    FdGuard fd(MakeRawFd());
+    ASSERT_GE(fd.Get(), 0);
+
+    for (auto [option, requested] :
+         {std::pair{SO_RCVBUF, 8192}, std::pair{SO_SNDBUF, 12288}}) {
+        ASSERT_EQ(setsockopt(fd.Get(), SOL_SOCKET, option, &requested, sizeof(requested)), 0)
+            << "option=" << option << ": " << ErrnoString(errno);
+        int actual = 0;
+        socklen_t len = sizeof(actual);
+        ASSERT_EQ(getsockopt(fd.Get(), SOL_SOCKET, option, &actual, &len), 0)
+            << "option=" << option << ": " << ErrnoString(errno);
+        EXPECT_EQ(len, sizeof(actual));
+        EXPECT_EQ(actual, requested * 2) << "option=" << option;
+    }
+}
+
+TEST(AfPacketSockopt, SocketBufferOptionsFollowLinuxBounds) {
+    FdGuard fd(MakeRawFd());
+    ASSERT_GE(fd.Get(), 0);
+
+    for (auto [option, minimum] :
+         {std::pair{SO_RCVBUF, 2304}, std::pair{SO_SNDBUF, 4608}}) {
+        int requested = 0;
+        ASSERT_EQ(setsockopt(fd.Get(), SOL_SOCKET, option, &requested, sizeof(requested)), 0);
+        int actual = 0;
+        socklen_t len = sizeof(actual);
+        ASSERT_EQ(getsockopt(fd.Get(), SOL_SOCKET, option, &actual, &len), 0);
+        EXPECT_EQ(actual, minimum) << "option=" << option;
+
+        requested = -1;
+        ASSERT_EQ(setsockopt(fd.Get(), SOL_SOCKET, option, &requested, sizeof(requested)), 0);
+        len = sizeof(actual);
+        ASSERT_EQ(getsockopt(fd.Get(), SOL_SOCKET, option, &actual, &len), 0);
+        EXPECT_EQ(actual, 425984) << "option=" << option;
+
+        requested = 212993;
+        ASSERT_EQ(setsockopt(fd.Get(), SOL_SOCKET, option, &requested, sizeof(requested)), 0);
+        len = sizeof(actual);
+        ASSERT_EQ(getsockopt(fd.Get(), SOL_SOCKET, option, &actual, &len), 0);
+        EXPECT_EQ(actual, 425984) << "option=" << option;
+
+        struct {
+            int requested;
+            int ignored;
+        } extended{4096, 0x12345678};
+        ASSERT_EQ(setsockopt(fd.Get(), SOL_SOCKET, option, &extended, sizeof(extended)), 0);
+        len = sizeof(actual);
+        ASSERT_EQ(getsockopt(fd.Get(), SOL_SOCKET, option, &actual, &len), 0);
+        EXPECT_EQ(actual, 8192) << "option=" << option;
+
+        requested = 4096;
+        for (socklen_t short_len : {0U, 1U, 2U, 3U}) {
+            errno = 0;
+            EXPECT_EQ(setsockopt(fd.Get(), SOL_SOCKET, option, &requested, short_len), -1);
+            EXPECT_EQ(errno, EINVAL) << "option=" << option << " len=" << short_len;
+        }
+    }
+}
+
+TEST(AfPacketSockopt, SocketBufferOptionsAreIndependent) {
+    FdGuard first(MakeRawFd());
+    FdGuard second(MakeRawFd());
+    ASSERT_GE(first.Get(), 0);
+    ASSERT_GE(second.Get(), 0);
+
+    int first_default_send = 0;
+    int second_default_receive = 0;
+    socklen_t len = sizeof(int);
+    ASSERT_EQ(getsockopt(first.Get(), SOL_SOCKET, SO_SNDBUF, &first_default_send, &len), 0);
+    len = sizeof(int);
+    ASSERT_EQ(getsockopt(second.Get(), SOL_SOCKET, SO_RCVBUF, &second_default_receive, &len), 0);
+
+    int requested = 16384;
+    ASSERT_EQ(setsockopt(first.Get(), SOL_SOCKET, SO_RCVBUF, &requested, sizeof(requested)), 0);
+    int actual = 0;
+    len = sizeof(actual);
+    ASSERT_EQ(getsockopt(first.Get(), SOL_SOCKET, SO_SNDBUF, &actual, &len), 0);
+    EXPECT_EQ(actual, first_default_send);
+    len = sizeof(actual);
+    ASSERT_EQ(getsockopt(second.Get(), SOL_SOCKET, SO_RCVBUF, &actual, &len), 0);
+    EXPECT_EQ(actual, second_default_receive);
+
+    int first_receive = 0;
+    len = sizeof(first_receive);
+    ASSERT_EQ(getsockopt(first.Get(), SOL_SOCKET, SO_RCVBUF, &first_receive, &len), 0);
+    requested = 24576;
+    ASSERT_EQ(setsockopt(first.Get(), SOL_SOCKET, SO_SNDBUF, &requested, sizeof(requested)), 0);
+    len = sizeof(actual);
+    ASSERT_EQ(getsockopt(first.Get(), SOL_SOCKET, SO_RCVBUF, &actual, &len), 0);
+    EXPECT_EQ(actual, first_receive);
+    len = sizeof(actual);
+    ASSERT_EQ(getsockopt(second.Get(), SOL_SOCKET, SO_RCVBUF, &actual, &len), 0);
+    EXPECT_EQ(actual, second_default_receive);
+}
+
+TEST(AfPacketSockopt, AttachFilterIsNotSilentlyAccepted) {
+    FdGuard fd(MakeRawFd());
+    ASSERT_GE(fd.Get(), 0);
+    TestSockFilter accept_all{0x06, 0, 0, 0xffffffff};
+    TestSockFprog program{1, &accept_all};
+    errno = 0;
+    EXPECT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoAttachFilter, &program, sizeof(program)), -1);
     EXPECT_EQ(errno, ENOPROTOOPT) << ErrnoString(errno);
 }
 

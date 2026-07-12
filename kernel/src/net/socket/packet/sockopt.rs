@@ -1,9 +1,10 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 use system_error::SystemError;
 
-use crate::net::socket::common::write_i32_getsockopt;
 use crate::net::socket::common::{
-    parse_timeval_ticks, write_timeval_ticks, INFINITE_TIMEOUT_TICKS,
+    parse_socket_buffer_size, parse_timeval_ticks, write_i32_getsockopt, write_timeval_ticks,
+    write_u32_getsockopt, INFINITE_TIMEOUT_TICKS, SOCK_MIN_RCVBUF, SOCK_MIN_SNDBUF,
+    SYSCTL_RMEM_MAX, SYSCTL_WMEM_MAX,
 };
 use crate::net::socket::{PSO, PSOL};
 
@@ -75,13 +76,41 @@ impl PacketSocket {
         }
     }
     fn set_socket_option(&self, name: usize, val: &[u8]) -> Result<(), SystemError> {
-        let timeout = self.socket_timeout_ticks(name)?;
-        let ticks = parse_timeval_ticks(val)?.unwrap_or(INFINITE_TIMEOUT_TICKS);
-        timeout.store(ticks, Ordering::Relaxed);
-        Ok(())
+        match PSO::try_from(name as u32) {
+            Ok(PSO::RCVBUF) => {
+                let size = parse_socket_buffer_size(val, SYSCTL_RMEM_MAX, SOCK_MIN_RCVBUF)?;
+                self.recv_buffer_bytes.store(size, Ordering::Relaxed);
+                Ok(())
+            }
+            Ok(PSO::SNDBUF) => {
+                let size = parse_socket_buffer_size(val, SYSCTL_WMEM_MAX, SOCK_MIN_SNDBUF)?;
+                self.send_buffer_bytes.store(size, Ordering::Relaxed);
+                Ok(())
+            }
+            Ok(PSO::SNDTIMEO_OLD | PSO::SNDTIMEO_NEW | PSO::RCVTIMEO_OLD | PSO::RCVTIMEO_NEW) => {
+                let timeout = self.socket_timeout_ticks(name)?;
+                let ticks = parse_timeval_ticks(val)?.unwrap_or(INFINITE_TIMEOUT_TICKS);
+                timeout.store(ticks, Ordering::Relaxed);
+                Ok(())
+            }
+            _ => Err(SystemError::ENOPROTOOPT),
+        }
     }
     fn get_socket_option(&self, name: usize, value: &mut [u8]) -> Result<usize, SystemError> {
-        let ticks = self.socket_timeout_ticks(name)?.load(Ordering::Relaxed);
-        Ok(write_timeval_ticks(value, ticks))
+        match PSO::try_from(name as u32) {
+            Ok(PSO::RCVBUF) => Ok(write_u32_getsockopt(
+                value,
+                self.recv_buffer_bytes.load(Ordering::Relaxed) as u32,
+            )),
+            Ok(PSO::SNDBUF) => Ok(write_u32_getsockopt(
+                value,
+                self.send_buffer_bytes.load(Ordering::Relaxed) as u32,
+            )),
+            Ok(PSO::SNDTIMEO_OLD | PSO::SNDTIMEO_NEW | PSO::RCVTIMEO_OLD | PSO::RCVTIMEO_NEW) => {
+                let ticks = self.socket_timeout_ticks(name)?.load(Ordering::Relaxed);
+                Ok(write_timeval_ticks(value, ticks))
+            }
+            _ => Err(SystemError::ENOPROTOOPT),
+        }
     }
 }

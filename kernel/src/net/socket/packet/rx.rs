@@ -67,6 +67,16 @@ impl PacketSocket {
         if bound_protocol != eth_protocol::ETH_P_ALL && bound_protocol != protocol {
             return;
         }
+        // Match Linux packet_rcv(): reject a socket whose receive memory is
+        // already full before allocating and copying a private frame. The
+        // atomic reservation below remains the final concurrent admission
+        // check and permits Linux's one-packet bounded overshoot.
+        if self.rx_buffer_bytes.load(Ordering::Acquire)
+            >= self.recv_buffer_bytes.load(Ordering::Relaxed)
+        {
+            self.stats_drops.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let visible_len = frame
             .len()
             .saturating_sub(if vlan.is_some() { 4 } else { 0 });
@@ -75,6 +85,7 @@ impl PacketSocket {
         } else {
             14
         };
+        let data_len = visible_len - start;
         let metadata = PacketMetadata {
             src_mac: src,
             dst_mac: dst,
@@ -90,10 +101,15 @@ impl PacketSocket {
             vlan_tci: vlan.map_or(0, |v| v.0),
             vlan_tpid: vlan.map_or(0, |v| v.1),
         };
+        let accounted_bytes = data_len.saturating_add(core::mem::size_of::<ReceivedPacket>());
         if self
-            .rx_buffer_len
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |len| {
-                (len < self.rx_buffer_max_packets.load(Ordering::Relaxed)).then_some(len + 1)
+            .rx_buffer_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                // Linux checks sk_rmem_alloc before charging the next skb, so
+                // one final packet may take the queue over sk_rcvbuf.
+                (used < self.recv_buffer_bytes.load(Ordering::Relaxed))
+                    .then(|| used.checked_add(accounted_bytes))
+                    .flatten()
             })
             .is_err()
         {
@@ -101,8 +117,9 @@ impl PacketSocket {
             return;
         }
         let mut data = Vec::new();
-        if data.try_reserve_exact(visible_len - start).is_err() {
-            self.rx_buffer_len.fetch_sub(1, Ordering::AcqRel);
+        if data.try_reserve_exact(data_len).is_err() {
+            self.rx_buffer_bytes
+                .fetch_sub(accounted_bytes, Ordering::AcqRel);
             self.stats_drops.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -116,8 +133,18 @@ impl PacketSocket {
         } else {
             data.extend_from_slice(&frame[start..]);
         }
-        let packet = ReceivedPacket { data, metadata };
+        let packet = ReceivedPacket {
+            data,
+            metadata,
+            accounted_bytes,
+        };
         let mut queue = self.rx_buffer.lock();
+        if queue.try_reserve(1).is_err() {
+            self.rx_buffer_bytes
+                .fetch_sub(accounted_bytes, Ordering::AcqRel);
+            self.stats_drops.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         queue.push_back(packet);
         drop(queue);
         self.stats_packets.fetch_add(1, Ordering::Relaxed);
@@ -136,7 +163,8 @@ impl PacketSocket {
         .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
         drop(queue);
         if !peek {
-            self.rx_buffer_len.fetch_sub(1, Ordering::AcqRel);
+            self.rx_buffer_bytes
+                .fetch_sub(packet.accounted_bytes, Ordering::AcqRel);
         }
         Ok(packet)
     }

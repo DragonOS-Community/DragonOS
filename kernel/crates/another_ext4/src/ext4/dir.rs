@@ -70,7 +70,7 @@ impl Ext4 {
 
     fn dir_data_block_count(dir: &InodeRef) -> Result<u32> {
         let size = dir.inode.size();
-        if size % BLOCK_SIZE as u64 != 0 {
+        if !size.is_multiple_of(BLOCK_SIZE as u64) {
             return Err(Ext4Error::new(ErrCode::EIO));
         }
         u32::try_from(size / BLOCK_SIZE as u64).map_err(|_| Ext4Error::new(ErrCode::EIO))

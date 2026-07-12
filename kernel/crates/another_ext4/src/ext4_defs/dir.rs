@@ -256,7 +256,7 @@ impl DirBlock {
             let name_len = self.0.data[offset + 6] as usize;
             let file_type = self.0.data[offset + 7];
             if rec_len < size_of::<FakeDirEntry>()
-                || rec_len % 4 != 0
+                || !rec_len.is_multiple_of(4)
                 || offset.checked_add(rec_len).is_none_or(|end| end > data_end)
                 || name_len > rec_len - size_of::<FakeDirEntry>()
                 || file_type > FileType::SymLink as u8

@@ -526,7 +526,7 @@ impl Ext4 {
         let mut sb = self.transaction_read_super_block(&transaction)?;
         self.transaction_orphan_del(&mut transaction, &inode, &mut sb)?;
         self.transaction_dealloc_inode(&mut transaction, inode_id, is_dir)?;
-        let mut cleared = InodeRef::new(inode_id, Box::new(Inode::default()));
+        let mut cleared = InodeRef::new(inode_id, Box::default());
         cleared.inode.set_generation(generation);
         self.transaction_stage_inode_with_csum(&mut transaction, &mut cleared)?;
         self.commit_reclaim_transaction(transaction)

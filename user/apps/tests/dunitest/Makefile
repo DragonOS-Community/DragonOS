@@ -63,7 +63,15 @@ build-suites: $(TEST_BINS) $(EXT4_FIXTURE)
 $(EXT4_FIXTURE):
 	@mkdir -p "$(dir $@)"
 	@truncate -s 8M "$@"
-	@mke2fs -q -t ext4 -F -O ^orphan_file "$@"
+	@output=$$(mke2fs -q -t ext4 -F -O ^orphan_file "$@" 2>&1) || { \
+		case "$$output" in \
+			*"Invalid filesystem option set: ^orphan_file"*) \
+				rm -f "$@"; \
+				truncate -s 8M "$@"; \
+				mke2fs -q -t ext4 -F "$@" ;; \
+			*) printf '%s\n' "$$output" >&2; exit 1 ;; \
+		esac; \
+	}
 
 $(GTEST_OBJ): $(GTEST_SRC)
 	@mkdir -p "$(dir $@)"

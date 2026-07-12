@@ -1374,7 +1374,7 @@ impl IndexNode for LockedExt4Inode {
 impl LockedExt4Inode {
     fn metadata_contention_backoff(attempt: usize) {
         const YIELDS_BEFORE_SLEEP: usize = 64;
-        if attempt % YIELDS_BEFORE_SLEEP == 0 {
+        if attempt.is_multiple_of(YIELDS_BEFORE_SLEEP) {
             // Keep the current eviction epoch pending, but avoid a workqueue
             // hot loop while an I/O-spanning metadata owner is asleep.
             let _ = nanosleep(PosixTimeSpec::new(0, 1_000_000));

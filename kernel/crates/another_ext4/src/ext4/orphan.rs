@@ -35,6 +35,11 @@ fn corruption() -> Ext4Error {
     Ext4Error::new(ErrCode::EIO)
 }
 
+pub(super) fn inode_checksum_valid(sb: &SuperBlock, inode: &InodeRef) -> bool {
+    !sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_METADATA_CSUM)
+        || inode.verify_checksum(&sb.uuid())
+}
+
 fn unsupported_orphan_format(sb: &SuperBlock) -> bool {
     unsupported_orphan_features(sb.compatible_features(), sb.read_only_compatible_features())
 }
@@ -151,7 +156,7 @@ impl Ext4 {
                 return Err(corruption());
             }
             let current_inode = self.read_inode_uncached(current)?;
-            if !current_inode.verify_checksum(&sb.uuid())
+            if !inode_checksum_valid(sb, &current_inode)
                 || current_inode.inode.file_type() == FileType::Unknown
                 || current_inode.inode.link_count() != 0
             {
@@ -274,7 +279,7 @@ impl LegacyOrphanReader for Ext4 {
             next: inode_ref.inode.next_orphan(),
             links: inode_ref.inode.link_count(),
             valid_mode: inode_ref.inode.file_type() != FileType::Unknown,
-            valid_checksum: inode_ref.verify_checksum(&sb.uuid()),
+            valid_checksum: inode_checksum_valid(&sb, &inode_ref),
         })
     }
 }
@@ -379,5 +384,23 @@ mod tests {
             0,
             SuperBlock::FEATURE_RO_COMPAT_ORPHAN_PRESENT
         ));
+    }
+
+    #[test]
+    fn inode_checksum_is_optional_without_metadata_csum() {
+        let sb: SuperBlock = unsafe { core::mem::zeroed() };
+        let mut inode = InodeRef::new(11, Box::default());
+        inode.inode.set_generation(7);
+        inode.set_checksum(&sb.uuid());
+        inode.inode.set_generation(8);
+
+        assert!(!inode.verify_checksum(&sb.uuid()));
+        assert!(inode_checksum_valid(&sb, &inode));
+
+        let checked_sb = SuperBlock::validation_fixture();
+        inode.inode.set_generation(9);
+        inode.set_checksum(&checked_sb.uuid());
+        inode.inode.set_generation(10);
+        assert!(!inode_checksum_valid(&checked_sb, &inode));
     }
 }

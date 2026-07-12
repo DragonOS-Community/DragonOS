@@ -541,10 +541,11 @@ impl Ext4 {
             );
         }
         let inode = self.read_inode_uncached(inode_id)?;
+        let sb = self.read_super_block_cached();
         if inode.inode.mode().bits() == 0
             || inode.inode.link_count() != 0
             || inode.inode.generation() != generation
-            || !inode.verify_checksum(&self.read_super_block_cached().uuid())
+            || !super::orphan::inode_checksum_valid(&sb, &inode)
         {
             return_error!(
                 ErrCode::EINVAL,

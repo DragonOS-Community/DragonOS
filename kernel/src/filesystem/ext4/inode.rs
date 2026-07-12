@@ -585,7 +585,13 @@ impl IndexNode for LockedExt4Inode {
             return Err(SystemError::EEXIST);
         }
 
-        ext4.link(other_inode_num, inode_num, name)?;
+        Self::retry_metadata_contention(|| ext4.link(other_inode_num, inode_num, name))?;
+        if other_attr.links == 0 {
+            // The orphan-del transaction made this inode live again. Discard
+            // the one-shot capability published by its previous final unlink
+            // before the fd retention that enabled AT_EMPTY_PATH can vanish.
+            other_arc.cancel_deferred_reclaim_after_relink();
+        }
 
         let dname = DName::from(name);
         guard.children.insert(dname, other_arc);
@@ -625,7 +631,8 @@ impl IndexNode for LockedExt4Inode {
             if ext4.lookup(inode_num, name)? != target_num {
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
-            if let Some(handle) = ext4.unlink(inode_num, name)? {
+            if let Some(handle) = Self::retry_metadata_contention(|| ext4.unlink(inode_num, name))?
+            {
                 fs.fs
                     .reclaim_inode(handle)
                     .map_err(|failure| SystemError::from(failure.into_parts().0))?;
@@ -639,7 +646,7 @@ impl IndexNode for LockedExt4Inode {
             Ok(_) => return Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
             Err(error) => return Err(error.into()),
         }
-        let handle = match ext4.unlink(inode_num, name).map_err(SystemError::from) {
+        let handle = match Self::retry_metadata_contention(|| ext4.unlink(inode_num, name)) {
             Ok(Some(handle)) => handle,
             Ok(None) => return Err(SystemError::EIO),
             Err(error) => return Err(error),
@@ -907,7 +914,7 @@ impl IndexNode for LockedExt4Inode {
             Ok(_) => return Err(SystemError::ENOTEMPTY),
             Err(error) => return Err(error.into()),
         }
-        let handle = match concret_fs.rmdir(inode_num, name).map_err(SystemError::from) {
+        let handle = match Self::retry_metadata_contention(|| concret_fs.rmdir(inode_num, name)) {
             Ok(Some(handle)) => handle,
             Ok(None) => return Err(SystemError::EIO),
             Err(error) => return Err(error),
@@ -1383,6 +1390,22 @@ impl LockedExt4Inode {
         }
     }
 
+    fn retry_metadata_contention<T>(
+        mut operation: impl FnMut() -> core::result::Result<T, another_ext4::Ext4Error>,
+    ) -> Result<T, SystemError> {
+        let mut attempt = 1usize;
+        loop {
+            match operation() {
+                Ok(value) => return Ok(value),
+                Err(error) if error.code() == another_ext4::ErrCode::EAGAIN => {
+                    Self::metadata_contention_backoff(attempt);
+                    attempt = attempt.saturating_add(1);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
     fn reclaim_with_metadata_contention_retry(
         fs: &another_ext4::Ext4,
         mut handle: another_ext4::InodeReclaimHandle,
@@ -1694,6 +1717,13 @@ impl LockedExt4Inode {
         self.try_schedule_deferred_eviction()
     }
 
+    fn cancel_deferred_reclaim_after_relink(&self) {
+        // Dropping the capability is the in-memory counterpart of the durable
+        // orphan-del transaction. A queued eviction, if any, observes None and
+        // cleanly aborts instead of treating cancellation as corruption.
+        let _ = self.6.lock().take();
+    }
+
     fn try_schedule_deferred_eviction(self: &Arc<Self>) -> Result<(), SystemError> {
         if self.6.lock().is_none() {
             return Ok(());
@@ -1732,20 +1762,24 @@ impl LockedExt4Inode {
                 return Err(error);
             }
         };
+        // Serialize the final capability decision with final unlink/relink.
+        // `begin_freeing` first closes operation admission and drains existing
+        // operations, so this ordering cannot deadlock a relink that already
+        // owns the link-mutation lock.
+        let _link_mutation = self.lifecycle().lock_link_mutation();
+        let handle = match self.6.lock().take() {
+            Some(handle) => handle,
+            None => {
+                fs.abort_freeing(tombstone)?;
+                *self.7.lock() = false;
+                self.5.abort_freeing();
+                return Ok(());
+            }
+        };
         let _reuse = fs.begin_reclaim();
         if let Some(page_cache) = self.page_cache() {
             truncate_inode_pages(page_cache, 0);
         }
-        let handle = match self.6.lock().take() {
-            Some(handle) => handle,
-            None => {
-                let _ = fs.abort_freeing(tombstone);
-                *self.7.lock() = false;
-                self.5.abort_freeing();
-                fs.fail_stop_lifecycle();
-                return Err(SystemError::EIO);
-            }
-        };
         match Self::reclaim_with_metadata_contention_retry(&fs.fs, handle) {
             Ok(()) => {
                 fs.complete_freeing(tombstone)?;
@@ -1862,6 +1896,20 @@ pub(crate) fn run_lifecycle_selftests() -> String {
     append(
         "poison_is_observable",
         lifecycle.begin_operation().err() == Some(SystemError::EIO),
+    );
+
+    let mut attempts = 0usize;
+    let retry_result = LockedExt4Inode::retry_metadata_contention(|| {
+        attempts += 1;
+        if attempts < 3 {
+            Err(another_ext4::Ext4Error::new(another_ext4::ErrCode::EAGAIN))
+        } else {
+            Ok(())
+        }
+    });
+    append(
+        "metadata_contention_is_internal",
+        retry_result.is_ok() && attempts == 3,
     );
 
     if failures == 0 {

@@ -1052,6 +1052,7 @@ static int ext_test_p3_noopen_readdirplus_notify() {
     uint32_t reads_before_inval = 0;
     uint32_t lookups_before_inval = 0;
     size_t entry_notify_len = 0;
+    void *private_map = MAP_FAILED;
     char verify_buf[64];
     struct {
         struct fuse_out_header out;
@@ -1147,6 +1148,12 @@ static int ext_test_p3_noopen_readdirplus_notify() {
         if (f >= 0) close(f);
         goto fail;
     }
+    private_map = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE, f, 0);
+    if (private_map == MAP_FAILED) {
+        printf("[FAIL] MAP_PRIVATE before notify: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    ((volatile char *)private_map)[0] = 'P';
 
     for (int i = 0; i < 2; i++) {
         DIR *dir = opendir(mp);
@@ -1201,6 +1208,10 @@ static int ext_test_p3_noopen_readdirplus_notify() {
                reads_before_inval, read_count, verify_n);
         goto fail;
     }
+    if (((volatile char *)private_map)[0] != 'P') {
+        printf("[FAIL] inode notify discarded MAP_PRIVATE COW data\n");
+        goto fail;
+    }
 
     memset(&entry_notify, 0, sizeof(entry_notify));
     entry_notify_len = offsetof(decltype(entry_notify), name) + sizeof(entry_notify.name);
@@ -1235,6 +1246,8 @@ static int ext_test_p3_noopen_readdirplus_notify() {
         goto fail;
     }
 
+    munmap(private_map, 4096);
+    private_map = MAP_FAILED;
     if (umount(mp) != 0) {
         printf("[FAIL] umount(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
         goto fail_no_umount;
@@ -1246,6 +1259,9 @@ static int ext_test_p3_noopen_readdirplus_notify() {
     return 0;
 
 fail:
+    if (private_map != MAP_FAILED) {
+        munmap(private_map, 4096);
+    }
     umount(mp);
 fail_no_umount:
     stop = 1;

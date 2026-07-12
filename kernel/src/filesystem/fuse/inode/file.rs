@@ -99,7 +99,9 @@ impl FuseNode {
         };
         let end_exclusive = end_index.checked_add(1);
 
-        let _ = page_cache.unmap_mapping_pages_even_cow(start_index, end_exclusive);
+        // Linux unmap_mapping_pages(..., even_cows=false) preserves private
+        // MAP_PRIVATE COW pages while zapping mappings backed by page cache.
+        let _ = page_cache.unmap_mapping_pages(start_index, end_exclusive);
         // Linux invalidate_inode_pages2_range() waits for writeback and calls
         // ->launder_folio() for dirty folios. FUSE wires that hook to
         // fuse_launder_folio(), so reverse invalidation drains dirty data before
@@ -116,7 +118,7 @@ impl FuseNode {
                 .manager()
                 .discard_clean_range(start_index, end_index);
         }
-        let _ = page_cache.unmap_mapping_pages_even_cow(start_index, end_exclusive);
+        let _ = page_cache.unmap_mapping_pages(start_index, end_exclusive);
         Ok(())
     }
 

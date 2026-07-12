@@ -411,7 +411,26 @@ impl IndexNode for FuseNode {
             self.prepare_direct_io_range(offset, len, &private_data, true)?;
         }
         if cached_write && self.conn().has_init_flag(FUSE_WRITEBACK_CACHE) {
-            return self.writeback_cache_write(offset, &buf[..len], &private_data);
+            while total_written < len {
+                let chunk = core::cmp::min(max_write, len - total_written);
+                let chunk_offset = offset
+                    .checked_add(total_written)
+                    .ok_or(SystemError::EOVERFLOW)?;
+                let wrote = match self.writeback_cache_write(
+                    chunk_offset,
+                    &buf[total_written..total_written + chunk],
+                    &private_data,
+                ) {
+                    Ok(wrote) => wrote,
+                    Err(e) if total_written == 0 => return Err(e),
+                    Err(_) => return Ok(total_written),
+                };
+                total_written += wrote;
+                if wrote < chunk {
+                    break;
+                }
+            }
+            return Ok(total_written);
         }
         let cached_page_cache = if cached_write {
             self.cached_page_cache()

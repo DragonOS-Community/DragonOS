@@ -152,8 +152,13 @@ impl FuseNode {
                 })?;
         }
 
-        let written = page_cache.write(offset, data)?;
-        self.note_successful_write(offset, written)?;
+        // Linux fuse_write_end() publishes the extended i_size before marking
+        // the page dirty. Preserve the same invariant: writeback calculates
+        // the last-page length from cached metadata, so it must never observe
+        // dirty data while the old EOF is still visible.
+        let written = page_cache.write_with_before_dirty(offset, data, |written| {
+            self.note_successful_write(offset, written)
+        })?;
         Ok(written)
     }
 

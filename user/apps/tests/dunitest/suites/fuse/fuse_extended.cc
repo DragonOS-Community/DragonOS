@@ -63,6 +63,7 @@ static int ext_test_p2_ops() {
     char rbuf[64];
     char dst_exist[256];
     char renamed[256];
+    const char extension = 'X';
     if (ensure_dir(mp) != 0) {
         printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
         return -1;
@@ -88,6 +89,7 @@ static int ext_test_p2_ops() {
     volatile uint32_t last_write_flags = 0;
     volatile uint32_t write_count_at_fsync = 0;
     volatile uint32_t last_write_flags_at_fsync = 0;
+    volatile unsigned char extension_write_byte = 0;
 
     struct fuse_daemon_args args;
     memset(&args, 0, sizeof(args));
@@ -107,6 +109,8 @@ static int ext_test_p2_ops() {
     args.last_write_flags = &last_write_flags;
     args.write_count_at_fsync = &write_count_at_fsync;
     args.last_write_flags_at_fsync = &last_write_flags_at_fsync;
+    args.write_watch_offset = 200;
+    args.last_write_watch_byte = &extension_write_byte;
     args.init_out_flags_override = FUSE_INIT_EXT | FUSE_MAX_PAGES | FUSE_WRITEBACK_CACHE;
     args.link_reuse_old_nodeid = 1;
     args.access_deny_mask = 2;
@@ -188,6 +192,29 @@ static int ext_test_p2_ops() {
         close(f);
         goto fail;
     }
+
+    // Exercise writeback of an extension in the original EOF page. The
+    // writeback length must be calculated from the extended local size.
+    write_count = 0;
+    last_write_size = 0;
+    write_count_at_fsync = 0;
+    if (pwrite(f, &extension, 1, 200) != 1) {
+        printf("[FAIL] extend dirty writeback file: %s (errno=%d)\n", strerror(errno), errno);
+        close(f);
+        goto fail;
+    }
+    if (fsync(f) != 0) {
+        printf("[FAIL] fsync(extended file): %s (errno=%d)\n", strerror(errno), errno);
+        close(f);
+        goto fail;
+    }
+    if (write_count_at_fsync == 0 || last_write_size != 201 ||
+        extension_write_byte != (unsigned char)extension) {
+        printf("[FAIL] fsync truncated extended cached page: writes=%u size=%u byte=%u\n",
+               write_count_at_fsync, last_write_size, extension_write_byte);
+        close(f);
+        goto fail;
+    }
     close(f);
     if (unlink(hard_path) != 0) {
         printf("[FAIL] unlink dirty-link probe: %s (errno=%d)\n", strerror(errno), errno);
@@ -226,13 +253,12 @@ static int ext_test_p2_ops() {
     }
     rn = read(f, rbuf, sizeof(rbuf) - 1);
     close(f);
-    if (rn <= 0) {
+    if (rn < (ssize_t)strlen("p2-data")) {
         printf("[FAIL] read hard link: %s (errno=%d)\n", strerror(errno), errno);
         goto fail;
     }
-    rbuf[rn] = '\0';
-    if (strcmp(rbuf, "p2-data") != 0) {
-        printf("[FAIL] hard link content mismatch: got=%s\n", rbuf);
+    if (memcmp(rbuf, "p2-data", strlen("p2-data")) != 0) {
+        printf("[FAIL] hard link content prefix mismatch\n");
         goto fail;
     }
 

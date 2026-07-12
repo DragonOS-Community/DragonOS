@@ -3162,23 +3162,42 @@ impl PageCache {
         Ok(ret)
     }
 
-    /// 两阶段写入：持锁收集目标页，解锁后按页写入，避免用户缺页时持有page cache锁
     pub fn write(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
-        let len = buf.len();
+        let (copies, ret) = self.prepare_write_copies(offset, buf.len())?;
+        let mut src_offset = 0;
+        for item in copies {
+            // Prefault before taking the page lock.
+            let _ = volatile_read!(buf[src_offset]);
+            let mut page_guard = item.entry.page.write();
+            unsafe {
+                page_guard.as_slice_mut()[item.page_offset..item.page_offset + item.sub_len]
+                    .copy_from_slice(&buf[src_offset..src_offset + item.sub_len]);
+            }
+            page_guard.add_flags(PageFlags::PG_DIRTY);
+            src_offset += item.sub_len;
+            drop(page_guard);
+            self.mark_page_dirty(item.page_index);
+        }
+        Ok(ret)
+    }
+
+    fn prepare_write_copies(
+        &self,
+        offset: usize,
+        len: usize,
+    ) -> Result<(Vec<CopyItem>, usize), SystemError> {
         if len == 0 {
-            return Ok(0);
+            return Ok((Vec::new(), 0));
         }
 
         let start_page_index = offset >> MMArch::PAGE_SHIFT;
         let end_page_index = (offset + len - 1) >> MMArch::PAGE_SHIFT;
-
         let mut copies: Vec<CopyItem> = Vec::new();
         let mut ret = 0usize;
 
         for page_index in start_page_index..=end_page_index {
             let page_start = page_index * MMArch::PAGE_SIZE;
             let page_end = page_start + MMArch::PAGE_SIZE;
-
             let write_start = core::cmp::max(offset, page_start);
             let write_end = core::cmp::min(offset + len, page_end);
             let page_write_len = write_end.saturating_sub(write_start);
@@ -3201,18 +3220,59 @@ impl PageCache {
             ret += page_write_len;
         }
 
+        Ok((copies, ret))
+    }
+
+    /// Two-phase write: prepare and pin every destination page before
+    /// committing metadata or exposing dirty data.
+    ///
+    /// `before_dirty` runs after all fallible page preparation has completed
+    /// and while every destination page is write-locked, but before any caller
+    /// data is copied or dirty state becomes visible. The locks remain held
+    /// through the copy and dirty transition, making the metadata, data, and
+    /// dirty state externally visible as one ordered commit.
+    pub(crate) fn write_with_before_dirty<F>(
+        &self,
+        offset: usize,
+        buf: &[u8],
+        before_dirty: F,
+    ) -> Result<usize, SystemError>
+    where
+        F: FnOnce(usize) -> Result<(), SystemError>,
+    {
+        let (copies, ret) = self.prepare_write_copies(offset, buf.len())?;
+        if ret == 0 {
+            return Ok(0);
+        }
+
         let mut src_offset = 0;
-        for item in copies {
-            // 预触发用户缓冲区当前段，避免后续在持页锁时缺页
+        for item in &copies {
+            // Prefault each source segment before the metadata commit so the
+            // remaining page-locked copy path cannot introduce a new failure
+            // point after the filesystem publishes the write.
             let _ = volatile_read!(buf[src_offset]);
-            let mut page_guard = item.entry.page.write();
+            src_offset += item.sub_len;
+        }
+
+        // Lock in ascending page-index order (the same order as `copies`) so
+        // readers and writeback cannot observe metadata for the new EOF until
+        // all copied bytes and PG_DIRTY transitions are ready to be exposed.
+        let mut page_guards: Vec<_> = copies.iter().map(|item| item.entry.page.write()).collect();
+
+        before_dirty(ret)?;
+
+        src_offset = 0;
+        for (item, page_guard) in copies.iter().zip(page_guards.iter_mut()) {
             unsafe {
                 page_guard.as_slice_mut()[item.page_offset..item.page_offset + item.sub_len]
                     .copy_from_slice(&buf[src_offset..src_offset + item.sub_len]);
             }
             page_guard.add_flags(PageFlags::PG_DIRTY);
             src_offset += item.sub_len;
-            drop(page_guard);
+        }
+        drop(page_guards);
+
+        for item in copies {
             self.mark_page_dirty(item.page_index);
         }
 

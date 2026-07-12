@@ -32,7 +32,7 @@ use super::super::{
         FUSE_LOOKUP, FUSE_MKDIR, FUSE_MKNOD, FUSE_OPEN, FUSE_OPENDIR, FUSE_READDIR,
         FUSE_READDIRPLUS, FUSE_READLINK, FUSE_RELEASE, FUSE_RELEASEDIR, FUSE_REMOVEXATTR,
         FUSE_RENAME, FUSE_RENAME2, FUSE_RMDIR, FUSE_SETATTR, FUSE_SETXATTR, FUSE_SYMLINK,
-        FUSE_UNLINK, FUSE_WRITE, FUSE_WRITE_LOCKOWNER,
+        FUSE_UNLINK, FUSE_WRITE, FUSE_WRITEBACK_CACHE, FUSE_WRITE_LOCKOWNER,
     },
 };
 use super::FuseNode;
@@ -355,6 +355,7 @@ impl IndexNode for FuseNode {
         let fopen_flags = private_data.fopen_flags;
 
         if (fopen_flags & FOPEN_DIRECT_IO) != 0 || (file_flags & FileFlags::O_DIRECT.bits()) != 0 {
+            let _barrier = self.writeback_barrier.write();
             self.prepare_direct_io_range(offset, len, &private_data, false)?;
             let lock_owner = crate::filesystem::vfs::vcore::current_file_lock_owner_id();
             return self.read_direct_with_open(offset, len, buf, fh, file_flags, lock_owner);
@@ -395,14 +396,41 @@ impl IndexNode for FuseNode {
         } else {
             crate::filesystem::vfs::vcore::current_file_lock_owner_id()
         };
+        let _writeback_guard = if cached_write {
+            Some(self.writeback_barrier.read())
+        } else {
+            None
+        };
         let _direct_write_guard = if cached_write {
             None
         } else {
-            Some(self.direct_io_lock.lock())
+            Some(self.writeback_barrier.write())
         };
         let mut total_written = 0usize;
         if !cached_write {
             self.prepare_direct_io_range(offset, len, &private_data, true)?;
+        }
+        if cached_write && self.conn().has_init_flag(FUSE_WRITEBACK_CACHE) {
+            while total_written < len {
+                let chunk = core::cmp::min(max_write, len - total_written);
+                let chunk_offset = offset
+                    .checked_add(total_written)
+                    .ok_or(SystemError::EOVERFLOW)?;
+                let wrote = match self.writeback_cache_write(
+                    chunk_offset,
+                    &buf[total_written..total_written + chunk],
+                    &private_data,
+                ) {
+                    Ok(wrote) => wrote,
+                    Err(e) if total_written == 0 => return Err(e),
+                    Err(_) => return Ok(total_written),
+                };
+                total_written += wrote;
+                if wrote < chunk {
+                    break;
+                }
+            }
+            return Ok(total_written);
         }
         let cached_page_cache = if cached_write {
             self.cached_page_cache()
@@ -495,6 +523,14 @@ impl IndexNode for FuseNode {
 
     fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
         self.check_not_stale()?;
+        let writeback_cache = self.conn().has_init_flag(FUSE_WRITEBACK_CACHE);
+        if writeback_cache {
+            self.sync_dirty_cached_pages()?;
+        }
+        let _barrier = writeback_cache.then(|| self.writeback_barrier.write());
+        if writeback_cache {
+            self.sync_dirty_cached_pages()?;
+        }
         let old = self.cached_or_fetch_metadata()?;
         if metadata.size > old.size {
             self.resolve_pending_short_read_truncate(metadata.size.max(0) as usize)?;
@@ -649,6 +685,7 @@ impl IndexNode for FuseNode {
         if new_size > md.size.max(0) as usize {
             crate::filesystem::vfs::vcore::check_file_size_limit(new_size)?;
         }
+        let _barrier = self.writeback_barrier.write();
 
         let in_arg = FuseFallocateIn {
             fh: fuse_data.fh,
@@ -666,8 +703,11 @@ impl IndexNode for FuseNode {
                 if let Some(md) = metadata.as_mut() {
                     if new_size > md.size.max(0) as usize {
                         md.size = new_size as i64;
-                        self.bump_attr_version();
                     }
+                    let now = crate::time::PosixTimeSpec::now();
+                    md.mtime = now;
+                    md.ctime = now;
+                    self.bump_attr_version();
                 }
                 drop(metadata);
                 self.cached_metadata_deadline_ns.store(0, Ordering::Relaxed);
@@ -709,6 +749,7 @@ impl IndexNode for FuseNode {
 
         match fuse_data {
             FuseFilePrivateData::File(p) => {
+                let _barrier = self.writeback_barrier.write();
                 let sync_result = self.sync_cached_pages();
                 let wb_error_result = self.check_and_advance_open_wb_error(&p);
                 sync_result?;
@@ -737,20 +778,21 @@ impl IndexNode for FuseNode {
         drop(data);
 
         if let FuseFilePrivateData::File(_) = &fuse_data {
+            let _barrier = self.writeback_barrier.write();
             if let Some(page_cache) = self.cached_page_cache() {
                 let start_index = start >> MMArch::PAGE_SHIFT;
                 let end_index = end >> MMArch::PAGE_SHIFT;
-                page_cache
-                    .manager()
-                    .writeback_range(start_index, end_index)?;
+                page_cache.manager().sync_range(start_index, end_index)?;
             }
+            if let FuseFilePrivateData::File(p) = fuse_data {
+                self.check_and_advance_open_wb_error(&p)?;
+                return self.fsync_with_fh(FUSE_FSYNC, p.fh, datasync);
+            }
+            unreachable!();
         }
 
         match fuse_data {
-            FuseFilePrivateData::File(p) => {
-                self.check_and_advance_open_wb_error(&p)?;
-                self.fsync_with_fh(FUSE_FSYNC, p.fh, datasync)
-            }
+            FuseFilePrivateData::File(_) => unreachable!(),
             FuseFilePrivateData::Dir(p) => self.fsync_with_fh(FUSE_FSYNCDIR, p.fh, datasync),
             FuseFilePrivateData::Dev(_) => self.fsync_common(datasync),
         }
@@ -797,6 +839,7 @@ impl IndexNode for FuseNode {
             } else {
                 FUSE_READDIR
             };
+            let request_epoch = self.conn.sample_attr_epoch();
             let payload = match self
                 .conn()
                 .request(opcode, self.nodeid, fuse_pack_struct(&read_in))
@@ -815,7 +858,8 @@ impl IndexNode for FuseNode {
 
             let mut last_off: u64 = offset;
             if use_readdirplus {
-                last_off = self.parse_readdirplus_payload(&payload, &mut names, last_off)?;
+                last_off =
+                    self.parse_readdirplus_payload(&payload, &mut names, last_off, request_epoch)?;
             } else {
                 last_off = Self::parse_readdir_payload(&payload, &mut names, last_off)?;
             }
@@ -849,6 +893,7 @@ impl IndexNode for FuseNode {
             return Ok(child);
         }
 
+        let request_epoch = self.conn.sample_attr_epoch();
         let payload = match self.request_name(FUSE_LOOKUP, self.nodeid, name) {
             Ok(payload) => payload,
             Err(err) => {
@@ -896,7 +941,12 @@ impl IndexNode for FuseNode {
         child
             .lookup_attr_flags
             .store(entry.attr.flags, Ordering::Relaxed);
-        child.set_cached_metadata_with_valid(md, entry.attr_valid, entry.attr_valid_nsec);
+        child.merge_cached_metadata_from_daemon(
+            md,
+            entry.attr_valid,
+            entry.attr_valid_nsec,
+            request_epoch,
+        );
         self.cache_lookup_child(
             name,
             &child,
@@ -1028,6 +1078,7 @@ impl IndexNode for FuseNode {
             oldnodeid: target.nodeid,
         };
         let payload_in = Self::pack_struct_and_name_payload(&inarg, name);
+        let request_epoch = self.conn.sample_attr_epoch();
         let payload = self.conn().request(FUSE_LINK, self.nodeid, &payload_in)?;
         let entry: FuseEntryOut = fuse_read_struct(&payload)?;
         let mut consumed = false;
@@ -1044,7 +1095,12 @@ impl IndexNode for FuseNode {
                 1,
             )?;
             consumed = true;
-            child.set_cached_metadata_with_valid(md, entry.attr_valid, entry.attr_valid_nsec);
+            child.merge_cached_metadata_from_daemon(
+                md,
+                entry.attr_valid,
+                entry.attr_valid_nsec,
+                request_epoch,
+            );
             Ok(())
         })();
         if result.is_err() && entry.nodeid != 0 && !consumed {

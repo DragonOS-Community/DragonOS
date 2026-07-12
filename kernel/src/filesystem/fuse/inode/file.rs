@@ -15,6 +15,7 @@ use crate::{
     },
     libs::mutex::Mutex,
     mm::{readahead::FileReadaheadState, MemoryManagementArch},
+    time::PosixTimeSpec,
 };
 
 use super::super::{
@@ -81,6 +82,90 @@ impl PageCacheBackend for FusePageCacheBackend {
 }
 
 impl FuseNode {
+    pub(crate) fn with_writeback_admission<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _guard = self.writeback_barrier.read();
+        f()
+    }
+
+    pub(crate) fn note_mmap_write(&self) {
+        if !self.conn().has_init_flag(FUSE_WRITEBACK_CACHE) {
+            return;
+        }
+        let now = PosixTimeSpec::now();
+        if let Some(md) = self.cached_metadata.lock().as_mut() {
+            md.mtime = now;
+            md.ctime = now;
+            self.bump_attr_version();
+        }
+    }
+
+    pub(super) fn writeback_cache_write(
+        &self,
+        offset: usize,
+        data: &[u8],
+        open: &FuseOpenPrivateData,
+    ) -> Result<usize, SystemError> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let end = offset
+            .checked_add(data.len())
+            .ok_or(SystemError::EOVERFLOW)?;
+        let page_cache = self.ensure_page_cache()?;
+        let file_size = self.cached_or_fetch_metadata()?.size.max(0) as usize;
+        let start_page = offset >> MMArch::PAGE_SHIFT;
+        let end_page = (end - 1) >> MMArch::PAGE_SHIFT;
+
+        // Keep the open request context alive while partial pages are filled.
+        let _lifetime = open.lifetime.clone();
+        for page_index in start_page..=end_page {
+            let page_start = page_index << MMArch::PAGE_SHIFT;
+            let write_start = core::cmp::max(offset, page_start);
+            let write_end = core::cmp::min(end, page_start + MMArch::PAGE_SIZE);
+            let full_overwrite =
+                write_start == page_start && write_end - write_start == MMArch::PAGE_SIZE;
+            if full_overwrite {
+                let _ = page_cache
+                    .manager()
+                    .commit_overwrite_for_write(page_index)?;
+                continue;
+            }
+            if page_cache.manager().peek_page(page_index).is_some() {
+                continue;
+            }
+
+            if page_start >= file_size {
+                let _ = page_cache
+                    .manager()
+                    .commit_overwrite_for_write(page_index)?;
+                continue;
+            }
+
+            self.check_not_stale()?;
+            let generation = self.generation();
+            if open.open_context.node_generation != 0
+                && generation != 0
+                && open.open_context.node_generation != generation
+            {
+                return Err(SystemError::ESTALE);
+            }
+            let _ = page_cache
+                .manager()
+                .commit_page_for_write_with(page_index, |idx, dst| {
+                    self.read_page_with_open(idx, dst, open.fh, open.open_flags)
+                })?;
+        }
+
+        // Linux fuse_write_end() publishes the extended i_size before marking
+        // the page dirty. Preserve the same invariant: writeback calculates
+        // the last-page length from cached metadata, so it must never observe
+        // dirty data while the old EOF is still visible.
+        let written = page_cache.write_with_before_dirty(offset, data, |written| {
+            self.note_successful_write(offset, written)
+        })?;
+        Ok(written)
+    }
+
     pub(super) fn max_pages_bytes(&self) -> usize {
         core::cmp::max(1, self.conn().max_pages()).saturating_mul(MMArch::PAGE_SIZE)
     }
@@ -145,6 +230,12 @@ impl FuseNode {
     ) -> Result<(), SystemError> {
         self.check_not_stale()?;
         self.resolve_pending_short_read_truncate(len)?;
+        // Drain once before taking the exclusive admission barrier to reduce
+        // hold time, then drain again under the barrier to close the race with
+        // buffered writes and page_mkwrite.
+        self.sync_dirty_cached_pages()?;
+        let _barrier = self.writeback_barrier.write();
+        self.sync_dirty_cached_pages()?;
         let mut valid = FATTR_SIZE;
         if lock_owner.is_some() {
             valid |= FATTR_LOCKOWNER;
@@ -236,6 +327,13 @@ impl FuseNode {
         observed_size: usize,
         observed_attr_version: u64,
     ) -> Result<(usize, bool), SystemError> {
+        // Linux fuse_short_read() treats a short daemon read as a hole when
+        // writeback-cache is active. Local i_size may include dirty sparse
+        // extensions that the daemon has not observed yet, so shrinking it
+        // here could discard valid dirty pages beyond the hole.
+        if self.conn().has_init_flag(FUSE_WRITEBACK_CACHE) {
+            return Ok((observed_size, false));
+        }
         let eof = page_index
             .checked_mul(MMArch::PAGE_SIZE)
             .and_then(|start| start.checked_add(read_len))
@@ -386,9 +484,6 @@ impl FuseNode {
         let Some(page_cache) = self.cached_page_cache() else {
             return Ok(());
         };
-        if !page_cache.has_dirty_pages() {
-            return Ok(());
-        }
         page_cache.manager().sync()
     }
 
@@ -411,7 +506,12 @@ impl FuseNode {
         data: &FuseOpenPrivateData,
         lock_owner: u64,
     ) -> Result<(), SystemError> {
-        let writeback_result = if data.writeback_handle.is_some() {
+        // Linux fuse_flush() drains inode writeback even when this particular
+        // descriptor is read-only: another writable open may have admitted
+        // dirty data for the same inode.
+        let writeback_cache = self.conn().has_init_flag(FUSE_WRITEBACK_CACHE);
+        let _barrier = writeback_cache.then(|| self.writeback_barrier.write());
+        let writeback_result = if writeback_cache {
             self.sync_dirty_cached_pages()
         } else {
             Ok(())
@@ -515,7 +615,6 @@ impl FuseNode {
             if out.size as usize != chunk {
                 return Err(SystemError::EIO);
             }
-            self.note_successful_write(offset, chunk)?;
             total += chunk;
         }
 
@@ -1134,7 +1233,8 @@ impl FuseNode {
             }
             dst_offset += copy_len;
 
-            if filled_len.is_some_and(|read_len| read_len < MMArch::PAGE_SIZE)
+            if (!self.conn().has_init_flag(FUSE_WRITEBACK_CACHE)
+                && filled_len.is_some_and(|read_len| read_len < MMArch::PAGE_SIZE))
                 || current_size <= page_end
             {
                 break;
@@ -1338,6 +1438,11 @@ impl FuseNode {
         if let Some(md) = metadata.as_mut() {
             if end > md.size.max(0) as usize {
                 md.size = end as i64;
+            }
+            if self.conn().has_init_flag(FUSE_WRITEBACK_CACHE) {
+                let now = PosixTimeSpec::now();
+                md.mtime = now;
+                md.ctime = now;
             }
         }
         // Every successful write is a mutation fence for READ replies issued

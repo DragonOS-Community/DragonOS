@@ -34,7 +34,7 @@ use super::protocol::{
     FUSE_FSYNCDIR, FUSE_GETXATTR, FUSE_HANDLE_KILLPRIV, FUSE_INIT_EXT, FUSE_INTERRUPT,
     FUSE_LISTXATTR, FUSE_MAX_PAGES, FUSE_NO_OPENDIR_SUPPORT, FUSE_NO_OPEN_SUPPORT,
     FUSE_PARALLEL_DIROPS, FUSE_POSIX_ACL, FUSE_POSIX_LOCKS, FUSE_READDIRPLUS_AUTO,
-    FUSE_REMOVEXATTR, FUSE_SETXATTR, FUSE_SUBMOUNTS,
+    FUSE_REMOVEXATTR, FUSE_SETXATTR, FUSE_SUBMOUNTS, FUSE_WRITEBACK_CACHE,
 };
 use super::reply::{FuseReadPagesReply, FuseReply};
 use super::{stats, trace};
@@ -573,6 +573,7 @@ struct FuseConnInner {
 pub struct FuseConn {
     inner: Mutex<FuseConnInner>,
     next_unique: AtomicU64,
+    attr_epoch: AtomicU64,
     dev_count: AtomicUsize,
     read_wait: WaitQueue,
     init_wait: WaitQueue,
@@ -657,6 +658,7 @@ impl FuseConn {
             }),
             // Use non-zero unique, keep even IDs for "ordinary" requests as Linux does.
             next_unique: AtomicU64::new(2),
+            attr_epoch: AtomicU64::new(1),
             dev_count: AtomicUsize::new(1),
             read_wait: WaitQueue::default(),
             init_wait: WaitQueue::default(),
@@ -675,6 +677,16 @@ impl FuseConn {
 
     pub fn is_connected(&self) -> bool {
         self.inner.lock().connected
+    }
+
+    pub(crate) fn sample_attr_epoch(&self) -> u64 {
+        self.attr_epoch.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn next_attr_epoch(&self) -> u64 {
+        self.attr_epoch
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1)
     }
 
     pub fn has_pending_requests(&self) -> bool {
@@ -1067,10 +1079,10 @@ impl FuseConn {
             | FUSE_MAX_PAGES
             | FUSE_EXPLICIT_INVAL_DATA
             | FUSE_INIT_EXT
+            | FUSE_WRITEBACK_CACHE
     }
 
     /// virtiofs uses the normal FUSE capability request plus Linux's submount bit.
-    /// WRITEBACK_CACHE is not requested until DragonOS has complete writeback-cache semantics.
     fn virtiofs_init_flags() -> u64 {
         Self::kernel_init_flags() | FUSE_SUBMOUNTS
     }

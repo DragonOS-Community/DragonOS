@@ -851,8 +851,28 @@ impl PageCacheManager {
         self.upgrade()?.get_or_create_page_with(page_index, fill)
     }
 
+    pub fn commit_page_for_write_with<F>(
+        &self,
+        page_index: usize,
+        fill: F,
+    ) -> Result<Arc<Page>, SystemError>
+    where
+        F: FnOnce(usize, &mut [u8]) -> Result<usize, SystemError>,
+    {
+        self.upgrade()?
+            .get_or_create_page_for_write_with(page_index, fill)
+    }
+
     pub fn commit_overwrite(&self, page_index: usize) -> Result<Arc<Page>, SystemError> {
         self.upgrade()?.get_or_create_page_zero(page_index)
+    }
+
+    pub fn commit_overwrite_for_write(&self, page_index: usize) -> Result<Arc<Page>, SystemError> {
+        self.upgrade()?
+            .get_or_create_page_for_write_with(page_index, |_idx, dst| {
+                dst.fill(0);
+                Ok(MMArch::PAGE_SIZE)
+            })
     }
 
     pub fn commit_overwrite_pinned(
@@ -1047,17 +1067,40 @@ impl PageCacheManager {
 
     pub fn sync(&self) -> Result<(), SystemError> {
         let cache = self.upgrade()?;
-        let dirty_entries: Vec<(usize, Arc<PageEntry>)> = {
-            let inner = cache.inner.lock();
-            inner
-                .dirty_pages
-                .iter()
-                .filter_map(|idx| inner.pages.get(idx).cloned().map(|entry| (*idx, entry)))
-                .collect()
-        };
+        loop {
+            let (dirty_entries, writeback_entries): (Vec<_>, Vec<_>) = {
+                let inner = cache.inner.lock();
+                let dirty = inner
+                    .dirty_pages
+                    .iter()
+                    .filter_map(|idx| inner.pages.get(idx).cloned().map(|entry| (*idx, entry)))
+                    .collect();
+                let writeback = inner
+                    .pages
+                    .values()
+                    .filter(|entry| entry.state() == PageState::Writeback)
+                    .cloned()
+                    .collect();
+                (dirty, writeback)
+            };
 
-        for (page_index, entry) in dirty_entries {
-            Self::writeback_entry(&cache, page_index, entry)?;
+            for (page_index, entry) in dirty_entries {
+                Self::writeback_entry(&cache, page_index, entry)?;
+            }
+            for entry in writeback_entries {
+                Self::wait_writeback_entry(entry)?;
+            }
+
+            let inner = cache.inner.lock();
+            let done = inner.dirty_pages.is_empty()
+                && !inner
+                    .pages
+                    .values()
+                    .any(|entry| entry.state() == PageState::Writeback);
+            drop(inner);
+            if done {
+                break;
+            }
         }
 
         // 脏页写完后调 write_inode 回写元数据。
@@ -1071,6 +1114,55 @@ impl PageCacheManager {
         }
 
         Ok(())
+    }
+
+    /// Write and wait for every dirty or in-flight page in an inclusive range.
+    ///
+    /// Unlike `writeback_range`, this is a data-integrity operation: pages
+    /// already under writeback when the call starts must complete before the
+    /// caller may issue a backend fsync request.
+    pub fn sync_range(&self, start_index: usize, end_index: usize) -> Result<(), SystemError> {
+        let cache = self.upgrade()?;
+        loop {
+            let (dirty_entries, writeback_entries): (Vec<_>, Vec<_>) = {
+                let inner = cache.inner.lock();
+                let dirty = inner
+                    .dirty_pages
+                    .range(start_index..=end_index)
+                    .filter_map(|idx| inner.pages.get(idx).cloned().map(|entry| (*idx, entry)))
+                    .collect();
+                let writeback = inner
+                    .page_indices
+                    .range(start_index..=end_index)
+                    .filter_map(|idx| inner.pages.get(idx))
+                    .filter(|entry| entry.state() == PageState::Writeback)
+                    .cloned()
+                    .collect();
+                (dirty, writeback)
+            };
+
+            for (page_index, entry) in dirty_entries {
+                Self::writeback_entry(&cache, page_index, entry)?;
+            }
+            for entry in writeback_entries {
+                Self::wait_writeback_entry(entry)?;
+            }
+
+            let inner = cache.inner.lock();
+            let has_dirty = inner
+                .dirty_pages
+                .range(start_index..=end_index)
+                .next()
+                .is_some();
+            let has_writeback = inner
+                .page_indices
+                .range(start_index..=end_index)
+                .filter_map(|idx| inner.pages.get(idx))
+                .any(|entry| entry.state() == PageState::Writeback);
+            if !has_dirty && !has_writeback {
+                return Ok(());
+            }
+        }
     }
 
     pub fn resize(&self, len: usize) -> Result<(), SystemError> {
@@ -2750,6 +2842,25 @@ impl PageCache {
         }
     }
 
+    fn discard_error_entry_if_same(&self, page_index: usize, expected: &Arc<PageEntry>) -> bool {
+        let removed = {
+            let mut guard = self.inner.lock();
+            let Some(entry) = guard.get_entry(page_index) else {
+                return false;
+            };
+            if !Arc::ptr_eq(&entry, expected) || entry.state() != PageState::Error {
+                return false;
+            }
+            guard.remove_page(page_index)
+        };
+        if let Some(page) = removed {
+            self.discard_unlinked_page(&page);
+            true
+        } else {
+            false
+        }
+    }
+
     fn discard_unlinked_page(&self, page: &Arc<Page>) {
         let paddr = page.phys_address();
         let can_remove_from_manager = {
@@ -2972,6 +3083,101 @@ impl PageCache {
         }
     }
 
+    /// Populate a page for a write, replacing only a pre-existing Error entry.
+    /// Errors produced by this call's own fill operation are returned without
+    /// retry so persistent backend failures cannot turn into an infinite loop.
+    fn get_or_create_page_for_write_with<F>(
+        &self,
+        page_index: usize,
+        fill: F,
+    ) -> Result<Arc<Page>, SystemError>
+    where
+        F: FnOnce(usize, &mut [u8]) -> Result<usize, SystemError>,
+    {
+        let mut fill = Some(fill);
+        loop {
+            let mut page_cache_ref = None;
+            let existing_entry = {
+                let guard = self.inner.lock();
+                match guard.get_entry(page_index) {
+                    Some(entry) => Some(entry),
+                    None => {
+                        page_cache_ref = Some(guard.page_cache_ref.clone());
+                        None
+                    }
+                }
+            };
+
+            if let Some(entry) = existing_entry {
+                match entry.state() {
+                    state if state.is_ready() => return Ok(entry.page.clone()),
+                    PageState::Error => {
+                        self.discard_error_entry_if_same(page_index, &entry);
+                        continue;
+                    }
+                    PageState::Loading | PageState::Writeback => match entry.wait_ready() {
+                        Ok(page) => return Ok(page),
+                        Err(_e) if entry.state() == PageState::Error => {
+                            self.discard_error_entry_if_same(page_index, &entry);
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    },
+                    PageState::UpToDate | PageState::Dirty => unreachable!(),
+                }
+            }
+
+            let page = self.allocate_page(
+                page_cache_ref.expect("page_cache_ref should exist"),
+                page_index,
+            )?;
+            let entry = Arc::new(PageEntry::new(page, PageState::Loading));
+            let inserted = {
+                let mut guard = self.inner.lock();
+                if guard.get_entry(page_index).is_some() {
+                    false
+                } else {
+                    guard.insert_entry(page_index, entry.clone());
+                    true
+                }
+            };
+            if !inserted {
+                self.discard_unlinked_page(&entry.page);
+                continue;
+            }
+            self.reconcile_entry_unevictable_for_insert(&entry);
+
+            let populate_result = {
+                let mut tmp = vec![0; MMArch::PAGE_SIZE];
+                match fill.take().expect("write page fill consumed once")(page_index, &mut tmp) {
+                    Ok(read_len) if read_len <= MMArch::PAGE_SIZE => {
+                        let mut page_guard = entry.page.write();
+                        let dst = unsafe { page_guard.as_slice_mut() };
+                        dst.copy_from_slice(&tmp);
+                        page_guard.add_flags(PageFlags::PG_UPTODATE);
+                        Ok(())
+                    }
+                    Ok(_) => Err(SystemError::EIO),
+                    Err(e) => Err(e),
+                }
+            };
+
+            match populate_result {
+                Ok(()) => {
+                    entry.set_state(PageState::UpToDate);
+                    entry.wait_queue.wake_all();
+                    return Ok(entry.page.clone());
+                }
+                Err(e) => {
+                    entry.set_state(PageState::Error);
+                    entry.wait_queue.wake_all();
+                    self.remove_failed_entry(page_index, &entry);
+                    return Err(e);
+                }
+            }
+        }
+    }
+
     pub fn get_or_create_page_zero(&self, page_index: usize) -> Result<Arc<Page>, SystemError> {
         Ok(self.get_or_create_entry(page_index, false)?.page.clone())
     }
@@ -3139,23 +3345,42 @@ impl PageCache {
         Ok(ret)
     }
 
-    /// 两阶段写入：持锁收集目标页，解锁后按页写入，避免用户缺页时持有page cache锁
     pub fn write(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
-        let len = buf.len();
+        let (copies, ret) = self.prepare_write_copies(offset, buf.len())?;
+        let mut src_offset = 0;
+        for item in copies {
+            // Prefault before taking the page lock.
+            let _ = volatile_read!(buf[src_offset]);
+            let mut page_guard = item.entry.page.write();
+            unsafe {
+                page_guard.as_slice_mut()[item.page_offset..item.page_offset + item.sub_len]
+                    .copy_from_slice(&buf[src_offset..src_offset + item.sub_len]);
+            }
+            page_guard.add_flags(PageFlags::PG_DIRTY);
+            src_offset += item.sub_len;
+            drop(page_guard);
+            self.mark_page_dirty(item.page_index);
+        }
+        Ok(ret)
+    }
+
+    fn prepare_write_copies(
+        &self,
+        offset: usize,
+        len: usize,
+    ) -> Result<(Vec<CopyItem>, usize), SystemError> {
         if len == 0 {
-            return Ok(0);
+            return Ok((Vec::new(), 0));
         }
 
         let start_page_index = offset >> MMArch::PAGE_SHIFT;
         let end_page_index = (offset + len - 1) >> MMArch::PAGE_SHIFT;
-
         let mut copies: Vec<CopyItem> = Vec::new();
         let mut ret = 0usize;
 
         for page_index in start_page_index..=end_page_index {
             let page_start = page_index * MMArch::PAGE_SIZE;
             let page_end = page_start + MMArch::PAGE_SIZE;
-
             let write_start = core::cmp::max(offset, page_start);
             let write_end = core::cmp::min(offset + len, page_end);
             let page_write_len = write_end.saturating_sub(write_start);
@@ -3178,18 +3403,59 @@ impl PageCache {
             ret += page_write_len;
         }
 
+        Ok((copies, ret))
+    }
+
+    /// Two-phase write: prepare and pin every destination page before
+    /// committing metadata or exposing dirty data.
+    ///
+    /// `before_dirty` runs after all fallible page preparation has completed
+    /// and while every destination page is write-locked, but before any caller
+    /// data is copied or dirty state becomes visible. The locks remain held
+    /// through the copy and dirty transition, making the metadata, data, and
+    /// dirty state externally visible as one ordered commit.
+    pub(crate) fn write_with_before_dirty<F>(
+        &self,
+        offset: usize,
+        buf: &[u8],
+        before_dirty: F,
+    ) -> Result<usize, SystemError>
+    where
+        F: FnOnce(usize) -> Result<(), SystemError>,
+    {
+        let (copies, ret) = self.prepare_write_copies(offset, buf.len())?;
+        if ret == 0 {
+            return Ok(0);
+        }
+
         let mut src_offset = 0;
-        for item in copies {
-            // 预触发用户缓冲区当前段，避免后续在持页锁时缺页
+        for item in &copies {
+            // Prefault each source segment before the metadata commit so the
+            // remaining page-locked copy path cannot introduce a new failure
+            // point after the filesystem publishes the write.
             let _ = volatile_read!(buf[src_offset]);
-            let mut page_guard = item.entry.page.write();
+            src_offset += item.sub_len;
+        }
+
+        // Lock in ascending page-index order (the same order as `copies`) so
+        // readers and writeback cannot observe metadata for the new EOF until
+        // all copied bytes and PG_DIRTY transitions are ready to be exposed.
+        let mut page_guards: Vec<_> = copies.iter().map(|item| item.entry.page.write()).collect();
+
+        before_dirty(ret)?;
+
+        src_offset = 0;
+        for (item, page_guard) in copies.iter().zip(page_guards.iter_mut()) {
             unsafe {
                 page_guard.as_slice_mut()[item.page_offset..item.page_offset + item.sub_len]
                     .copy_from_slice(&buf[src_offset..src_offset + item.sub_len]);
             }
             page_guard.add_flags(PageFlags::PG_DIRTY);
             src_offset += item.sub_len;
-            drop(page_guard);
+        }
+        drop(page_guards);
+
+        for item in copies {
             self.mark_page_dirty(item.page_index);
         }
 

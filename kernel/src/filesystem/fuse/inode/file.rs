@@ -327,6 +327,13 @@ impl FuseNode {
         observed_size: usize,
         observed_attr_version: u64,
     ) -> Result<(usize, bool), SystemError> {
+        // Linux fuse_short_read() treats a short daemon read as a hole when
+        // writeback-cache is active. Local i_size may include dirty sparse
+        // extensions that the daemon has not observed yet, so shrinking it
+        // here could discard valid dirty pages beyond the hole.
+        if self.conn().has_init_flag(FUSE_WRITEBACK_CACHE) {
+            return Ok((observed_size, false));
+        }
         let eof = page_index
             .checked_mul(MMArch::PAGE_SIZE)
             .and_then(|start| start.checked_add(read_len))
@@ -1226,7 +1233,8 @@ impl FuseNode {
             }
             dst_offset += copy_len;
 
-            if filled_len.is_some_and(|read_len| read_len < MMArch::PAGE_SIZE)
+            if (!self.conn().has_init_flag(FUSE_WRITEBACK_CACHE)
+                && filled_len.is_some_and(|read_len| read_len < MMArch::PAGE_SIZE))
                 || current_size <= page_end
             {
                 break;

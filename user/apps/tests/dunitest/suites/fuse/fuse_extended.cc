@@ -60,10 +60,15 @@ static int ext_test_p2_ops() {
     char symlink_path[256];
     char target_buf[256];
     char hard_path[256];
+    char sparse_path[256];
     char rbuf[64];
     char dst_exist[256];
     char renamed[256];
     const char extension = 'X';
+    const char sparse_marker = 'S';
+    const off_t sparse_offset = 5000;
+    const size_t sparse_size = (size_t)sparse_offset + 1;
+    unsigned char *sparse_contents = NULL;
     if (ensure_dir(mp) != 0) {
         printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
         return -1;
@@ -216,6 +221,58 @@ static int ext_test_p2_ops() {
         goto fail;
     }
     close(f);
+
+    // A short daemon READ inside a locally extended sparse file denotes a
+    // hole under FUSE_WRITEBACK_CACHE. It must neither shrink local i_size nor
+    // discard the dirty page beyond the hole before writeback reaches daemon.
+    snprintf(sparse_path, sizeof(sparse_path), "%s/p2_sparse.txt", mp);
+    f = open(sparse_path, O_CREAT | O_RDWR, 0644);
+    if (f < 0) {
+        printf("[FAIL] open sparse file: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    if (pwrite(f, &sparse_marker, 1, sparse_offset) != 1) {
+        printf("[FAIL] sparse cached extension: %s (errno=%d)\n", strerror(errno), errno);
+        close(f);
+        goto fail;
+    }
+    sparse_contents = (unsigned char *)malloc(sparse_size);
+    if (!sparse_contents) {
+        printf("[FAIL] allocate sparse read buffer\n");
+        close(f);
+        goto fail;
+    }
+    memset(sparse_contents, 0xff, sparse_size);
+    if (pread(f, sparse_contents, sparse_size, 0) != (ssize_t)sparse_size) {
+        printf("[FAIL] read sparse extension before fsync: %s (errno=%d)\n", strerror(errno),
+               errno);
+        free(sparse_contents);
+        close(f);
+        goto fail;
+    }
+    for (size_t i = 0; i < sparse_size - 1; ++i) {
+        if (sparse_contents[i] != 0) {
+            printf("[FAIL] sparse hole byte %zu is %u\n", i, sparse_contents[i]);
+            free(sparse_contents);
+            close(f);
+            goto fail;
+        }
+    }
+    if (sparse_contents[sparse_size - 1] != (unsigned char)sparse_marker) {
+        printf("[FAIL] sparse dirty tail lost before fsync: got=%u\n",
+               sparse_contents[sparse_size - 1]);
+        free(sparse_contents);
+        close(f);
+        goto fail;
+    }
+    free(sparse_contents);
+    if (fsync(f) != 0) {
+        printf("[FAIL] fsync sparse file: %s (errno=%d)\n", strerror(errno), errno);
+        close(f);
+        goto fail;
+    }
+    close(f);
+
     if (unlink(hard_path) != 0) {
         printf("[FAIL] unlink dirty-link probe: %s (errno=%d)\n", strerror(errno), errno);
         goto fail;

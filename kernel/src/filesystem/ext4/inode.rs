@@ -391,7 +391,6 @@ impl IndexNode for LockedExt4Inode {
         if len == 0 {
             return Ok(0);
         }
-        let _size_guard = self.size_lock.read();
         let buf = &buf[0..len];
 
         let (fs, inode_num, page_cache) = {
@@ -405,6 +404,7 @@ impl IndexNode for LockedExt4Inode {
 
         if let Some(page_cache) = page_cache {
             let _invalidate = page_cache.invalidate_write();
+            let _size_guard = self.size_lock.read();
             let _io_guard = self.io_lock.lock();
 
             // 使用缓存的文件大小，避免 getattr 磁盘 I/O
@@ -463,6 +463,7 @@ impl IndexNode for LockedExt4Inode {
 
             Ok(write_len)
         } else {
+            let _size_guard = self.size_lock.read();
             self.write_direct(offset, len, buf, data)
         }
     }
@@ -789,7 +790,6 @@ impl IndexNode for LockedExt4Inode {
 
     fn resize(&self, len: usize) -> Result<(), SystemError> {
         let _operation = self.begin_operation()?;
-        let _size_guard = self.size_lock.write();
         let (fs, inode_num, page_cache, cached_size) = {
             let guard = self.inner.lock();
             (
@@ -803,7 +803,7 @@ impl IndexNode for LockedExt4Inode {
             Some(size) => size,
             None => fs.fs.getattr(inode_num)?.size,
         };
-        {
+        let apply_resize = || -> Result<(), SystemError> {
             let _io_guard = self.io_lock.lock();
             let ext4 = &fs.fs;
             // 仅调整文件大小，其他属性保持不变
@@ -831,13 +831,35 @@ impl IndexNode for LockedExt4Inode {
                     .remove(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY);
             }
             self.release_clean_metadata_queue_owner(&fs);
-        }
+            Ok(())
+        };
+
         if len < old_size as usize {
             if let Some(page_cache) = page_cache {
-                page_cache.truncate(len)?;
+                let hole_start_page = len
+                    .checked_add(MMArch::PAGE_SIZE - 1)
+                    .ok_or(SystemError::EFBIG)?
+                    >> MMArch::PAGE_SHIFT;
+                loop {
+                    // Match PageCache::truncate(), but acquire ext4's size lock
+                    // after invalidate_write so mmap faults and regular writes
+                    // use one global order: invalidate -> size -> inode I/O.
+                    page_cache.unmap_mapping_pages_even_cow(hole_start_page, None)?;
+                    let committed = {
+                        let _invalidate = page_cache.invalidate_write();
+                        let _size_guard = self.size_lock.write();
+                        apply_resize()?;
+                        page_cache.truncate_locked(len)?
+                    };
+                    if committed {
+                        page_cache.unmap_mapping_pages_even_cow(hole_start_page, None)?;
+                        return Ok(());
+                    }
+                }
             }
         }
-        Ok(())
+        let _size_guard = self.size_lock.write();
+        apply_resize()
     }
 
     fn fallocate_file(

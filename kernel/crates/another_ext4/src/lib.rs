@@ -6,7 +6,7 @@ mod constants;
 mod error;
 mod ext4;
 mod ext4_defs;
-mod jbd2;
+pub mod jbd2;
 mod prelude;
 
 pub use constants::{BLOCK_SIZE, EXT4_ROOT_INO, INODE_BLOCK_SIZE};

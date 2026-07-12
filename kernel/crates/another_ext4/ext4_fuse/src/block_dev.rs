@@ -97,6 +97,12 @@ impl BlockDevice for BlockMem {
         *slot = *block.data;
         Ok(())
     }
+    fn flush(&self) -> core::result::Result<(), another_ext4::Ext4Error> {
+        Ok(())
+    }
+    fn supports_reliable_flush(&self) -> bool {
+        true
+    }
 }
 
 impl StateBlockDevice<Vec<[u8; BLOCK_SIZE]>> for BlockMem {

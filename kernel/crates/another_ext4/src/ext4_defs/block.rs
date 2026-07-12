@@ -80,4 +80,59 @@ pub trait BlockDevice: Send + Sync + Any {
     fn read_block(&self, block_id: PBlockId) -> Result<Block>;
     /// Write a block to disk.
     fn write_block(&self, block: &Block) -> Result<()>;
+    /// Make all writes completed before this call durable on stable storage.
+    ///
+    /// A successful return must not be used for durability unless
+    /// [`Self::supports_reliable_flush`] is also true.
+    fn flush(&self) -> Result<()>;
+    /// Whether [`Self::flush`] provides a power-loss durability barrier.
+    fn supports_reliable_flush(&self) -> bool;
+}
+
+#[cfg(test)]
+mod block_device_tests {
+    use super::*;
+
+    struct FlushDevice {
+        reliable: bool,
+        error: Option<ErrCode>,
+    }
+
+    impl BlockDevice for FlushDevice {
+        fn read_block(&self, block_id: PBlockId) -> Result<Block> {
+            Ok(Block::new(block_id, Box::new([0; BLOCK_SIZE])))
+        }
+
+        fn write_block(&self, _block: &Block) -> Result<()> {
+            Ok(())
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.error.map_or(Ok(()), |code| Err(Ext4Error::new(code)))
+        }
+
+        fn supports_reliable_flush(&self) -> bool {
+            self.reliable
+        }
+    }
+
+    #[test]
+    fn flush_capability_is_independent_from_method_presence() {
+        let device: &dyn BlockDevice = &FlushDevice {
+            reliable: false,
+            error: None,
+        };
+        assert!(!device.supports_reliable_flush());
+        assert!(device.flush().is_ok());
+    }
+
+    #[test]
+    fn flush_error_is_preserved_through_trait_dispatch() {
+        let device: &dyn BlockDevice = &FlushDevice {
+            reliable: true,
+            error: Some(ErrCode::EIO),
+        };
+        assert!(device.supports_reliable_flush());
+        assert_eq!(device.flush().unwrap_err().code(), ErrCode::EIO);
+    }
 }

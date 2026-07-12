@@ -364,6 +364,10 @@ impl BlockDevice for PmemBlockDevice {
         Ok(())
     }
 
+    fn supports_reliable_flush(&self) -> bool {
+        self.flush.is_some()
+    }
+
     fn blk_size_log2(&self) -> u8 {
         9
     }

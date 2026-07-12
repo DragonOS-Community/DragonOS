@@ -114,6 +114,12 @@ unsafe impl AsBytes for SuperBlock {}
 impl SuperBlock {
     const SB_MAGIC: u16 = 0xEF53;
 
+    pub const FEATURE_COMPAT_HAS_JOURNAL: u32 = 0x0004;
+    pub const FEATURE_COMPAT_FAST_COMMIT: u32 = 0x0400;
+    pub const FEATURE_COMPAT_ORPHAN_FILE: u32 = 0x1000;
+    pub const FEATURE_INCOMPAT_RECOVER: u32 = 0x0004;
+    pub const FEATURE_INCOMPAT_JOURNAL_DEV: u32 = 0x0008;
+
     pub fn check_magic(&self) -> bool {
         self.magic == Self::SB_MAGIC
     }
@@ -128,6 +134,46 @@ impl SuperBlock {
 
     pub fn uuid(&self) -> [u8; 16] {
         self.uuid
+    }
+
+    pub fn compatible_features(&self) -> u32 {
+        self.features_compatible
+    }
+
+    pub fn incompatible_features(&self) -> u32 {
+        self.features_incompatible
+    }
+
+    pub fn read_only_compatible_features(&self) -> u32 {
+        self.features_read_only
+    }
+
+    pub fn has_compatible_feature(&self, feature: u32) -> bool {
+        self.features_compatible & feature != 0
+    }
+
+    pub fn has_incompatible_feature(&self, feature: u32) -> bool {
+        self.features_incompatible & feature != 0
+    }
+
+    pub fn set_incompatible_feature(&mut self, feature: u32, enabled: bool) {
+        if enabled {
+            self.features_incompatible |= feature;
+        } else {
+            self.features_incompatible &= !feature;
+        }
+    }
+
+    pub fn journal_inode_number(&self) -> u32 {
+        self.journal_inode_number
+    }
+
+    pub fn journal_device(&self) -> u32 {
+        self.journal_dev
+    }
+
+    pub fn journal_uuid(&self) -> [u8; 16] {
+        self.journal_uuid
     }
 
     /// Total number of inodes.

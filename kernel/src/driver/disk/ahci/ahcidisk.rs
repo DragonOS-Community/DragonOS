@@ -545,6 +545,10 @@ impl BlockDevice for LockedAhciDisk {
         return self.inner().sync();
     }
 
+    fn supports_reliable_flush(&self) -> bool {
+        false
+    }
+
     #[inline]
     fn device(&self) -> Arc<dyn Device> {
         return self.inner().self_ref.upgrade().unwrap();

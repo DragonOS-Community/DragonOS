@@ -13,6 +13,8 @@ pub enum ErrCode {
     ENOENT = 2,
     /// I/O error.
     EIO = 5,
+    /// Resource temporarily unavailable.
+    EAGAIN = 11,
     /// No such device or address.
     ENXIO = 6,
     /// Argument list too long.

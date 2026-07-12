@@ -425,6 +425,13 @@ impl FileSystemMakerData for TmpfsMountData {
 }
 
 impl FileSystem for Tmpfs {
+    fn supports_reliable_flush(&self) -> bool {
+        // tmpfs has no crash-surviving backing state. A loop image stored here
+        // disappears as a whole on power loss, so there is no partially
+        // durable post-crash image for JBD2 to recover.
+        true
+    }
+
     unsafe fn fault(
         &self,
         pfm: &mut crate::mm::fault::PageFaultMessage,

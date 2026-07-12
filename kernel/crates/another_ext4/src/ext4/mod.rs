@@ -8,6 +8,8 @@ mod dir;
 mod extent;
 mod high_level;
 mod journal;
+mod journal_recovery;
+mod journal_transaction;
 mod link;
 mod low_level;
 mod rw;
@@ -75,6 +77,9 @@ pub struct Ext4 {
     namespace_lock: spin::Mutex<()>,
     /// First unrecoverable metadata error.  Once set, mutation must fail-stop.
     poisoned: spin::Mutex<Option<ErrCode>>,
+    /// Validated synchronous JBD2 engine. It is initialized only by
+    /// `load_writable`; read-only probing must not mutate or recover media.
+    journal: Option<journal_transaction::JournalTransactionCore>,
     /// Serializes inode metadata and extent-tree mutations per inode shard.
     ///
     /// another_ext4 stores inodes as value snapshots in a small cache. Without
@@ -139,8 +144,16 @@ impl Ext4 {
             alloc_lock: spin::Mutex::new(()),
             namespace_lock: spin::Mutex::new(()),
             poisoned: spin::Mutex::new(None),
+            journal: None,
             inode_mutation_locks,
         })
+    }
+
+    /// Load, recover and activate a filesystem for metadata mutation.
+    pub fn load_writable(block_device: Arc<dyn BlockDevice>) -> Result<Self> {
+        let mut fs = Self::load(block_device)?;
+        fs.initialize_journal()?;
+        Ok(fs)
     }
 
     /// Initializes the root directory.

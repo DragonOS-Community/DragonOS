@@ -790,18 +790,13 @@ impl IndexNode for LockedExt4Inode {
 
     fn resize(&self, len: usize) -> Result<(), SystemError> {
         let _operation = self.begin_operation()?;
-        let (fs, inode_num, page_cache, cached_size) = {
+        let (fs, inode_num, page_cache) = {
             let guard = self.inner.lock();
             (
                 guard.concret_fs(),
                 guard.inner_inode_num,
                 guard.page_cache.clone(),
-                guard.cached_file_size,
             )
-        };
-        let old_size = match cached_size {
-            Some(size) => size,
-            None => fs.fs.getattr(inode_num)?.size,
         };
         let apply_resize = || -> Result<(), SystemError> {
             let _io_guard = self.io_lock.lock();
@@ -834,28 +829,45 @@ impl IndexNode for LockedExt4Inode {
             Ok(())
         };
 
-        if len < old_size as usize {
-            if let Some(page_cache) = page_cache {
-                let hole_start_page = len
-                    .checked_add(MMArch::PAGE_SIZE - 1)
-                    .ok_or(SystemError::EFBIG)?
-                    >> MMArch::PAGE_SHIFT;
-                loop {
-                    // Match PageCache::truncate(), but acquire ext4's size lock
-                    // after invalidate_write so mmap faults and regular writes
-                    // use one global order: invalidate -> size -> inode I/O.
-                    page_cache.unmap_mapping_pages_even_cow(hole_start_page, None)?;
-                    let committed = {
-                        let _invalidate = page_cache.invalidate_write();
-                        let _size_guard = self.size_lock.write();
-                        apply_resize()?;
-                        page_cache.truncate_locked(len)?
+        if let Some(page_cache) = page_cache {
+            let hole_start_page = len
+                .checked_add(MMArch::PAGE_SIZE - 1)
+                .ok_or(SystemError::EFBIG)?
+                >> MMArch::PAGE_SHIFT;
+            let mut truncate_pending = false;
+            loop {
+                // Match PageCache::truncate(), but acquire ext4's size lock
+                // after invalidate_write so mmap faults and regular writes
+                // use one global order: invalidate -> size -> inode I/O.
+                page_cache.unmap_mapping_pages_even_cow(hole_start_page, None)?;
+                let (shrinking, committed) = {
+                    let _invalidate = page_cache.invalidate_write();
+                    let _size_guard = self.size_lock.write();
+                    // Classify against the authoritative size while holding the
+                    // same lock that serializes the update.  A function-entry
+                    // snapshot can become stale after a concurrent extension.
+                    let cached_size = self.inner.lock().cached_file_size;
+                    let current_size = match cached_size {
+                        Some(size) => size,
+                        None => fs.fs.getattr(inode_num)?.size,
                     };
-                    if committed {
+                    // After truncate_locked() asks for another unmap pass, the
+                    // inode size already equals len.  Preserve that pending
+                    // cache truncation unless a concurrent resize moved the
+                    // authoritative size below this request.
+                    let shrinking = len < current_size as usize
+                        || (truncate_pending && len == current_size as usize);
+                    apply_resize()?;
+                    let committed = !shrinking || page_cache.truncate_locked(len)?;
+                    (shrinking, committed)
+                };
+                if committed {
+                    if shrinking {
                         page_cache.unmap_mapping_pages_even_cow(hole_start_page, None)?;
-                        return Ok(());
                     }
+                    return Ok(());
                 }
+                truncate_pending = shrinking;
             }
         }
         let _size_guard = self.size_lock.write();

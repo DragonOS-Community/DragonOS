@@ -1,4 +1,4 @@
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU64, Ordering};
 use system_error::SystemError;
 
 use crate::net::socket::common::write_i32_getsockopt;
@@ -10,6 +10,14 @@ use crate::net::socket::{PSO, PSOL};
 use super::{packet_option, PacketSocket};
 
 impl PacketSocket {
+    fn socket_timeout_ticks(&self, name: usize) -> Result<&AtomicU64, SystemError> {
+        match PSO::try_from(name as u32) {
+            Ok(PSO::SNDTIMEO_OLD) | Ok(PSO::SNDTIMEO_NEW) => Ok(&self.send_timeout_ticks),
+            Ok(PSO::RCVTIMEO_OLD) | Ok(PSO::RCVTIMEO_NEW) => Ok(&self.recv_timeout_ticks),
+            _ => Err(SystemError::ENOPROTOOPT),
+        }
+    }
+
     fn parse_i32(value: &[u8]) -> Result<i32, SystemError> {
         if value.len() < 4 {
             return Err(SystemError::EINVAL);
@@ -67,22 +75,13 @@ impl PacketSocket {
         }
     }
     fn set_socket_option(&self, name: usize, val: &[u8]) -> Result<(), SystemError> {
-        match PSO::try_from(name as u32) {
-            Ok(PSO::RCVTIMEO_OLD) | Ok(PSO::RCVTIMEO_NEW) => {
-                let ticks = parse_timeval_ticks(val)?.unwrap_or(INFINITE_TIMEOUT_TICKS);
-                self.recv_timeout_ticks.store(ticks, Ordering::Relaxed);
-                Ok(())
-            }
-            _ => Err(SystemError::ENOPROTOOPT),
-        }
+        let timeout = self.socket_timeout_ticks(name)?;
+        let ticks = parse_timeval_ticks(val)?.unwrap_or(INFINITE_TIMEOUT_TICKS);
+        timeout.store(ticks, Ordering::Relaxed);
+        Ok(())
     }
     fn get_socket_option(&self, name: usize, value: &mut [u8]) -> Result<usize, SystemError> {
-        match PSO::try_from(name as u32) {
-            Ok(PSO::RCVTIMEO_OLD) | Ok(PSO::RCVTIMEO_NEW) => {
-                let ticks = self.recv_timeout_ticks.load(Ordering::Relaxed);
-                Ok(write_timeval_ticks(value, ticks))
-            }
-            _ => Err(SystemError::ENOPROTOOPT),
-        }
+        let ticks = self.socket_timeout_ticks(name)?.load(Ordering::Relaxed);
+        Ok(write_timeval_ticks(value, ticks))
     }
 }

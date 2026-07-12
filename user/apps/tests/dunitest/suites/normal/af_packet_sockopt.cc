@@ -2,8 +2,7 @@
 //
 // Converted from user/apps/c_unitest/test_af_packet.c.
 // Validates DragonOS AF_PACKET setsockopt/getsockopt option round-trips,
-// value checks and error-code semantics, 18 test cases total (corresponding
-// to the 18 assertion points in the original C test).
+// value checks and error-code semantics.
 //
 // This test suite does not depend on network interfaces; it only operates
 // at the socket option layer.
@@ -22,6 +21,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <tuple>
 
 // ---- Manually define constants (DragonOS musl may lack if_packet.h) ----
 
@@ -37,7 +37,9 @@
 inline constexpr int kEthPAll = 0x0003;
 inline constexpr int kPrivateEtherType = 0x88b5;
 inline constexpr int kSoRcvtimeoOld = 20;
+inline constexpr int kSoSndtimeoOld = 21;
 inline constexpr int kSoRcvtimeoNew = 66;
+inline constexpr int kSoSndtimeoNew = 67;
 
 struct TestSockAddrLl {
     uint16_t sll_family;
@@ -302,6 +304,88 @@ TEST(AfPacketSockopt, ReceiveTimeoutOldAndNewRoundTrip) {
         EXPECT_EQ(got_value.tv_sec, set_value.tv_sec);
         // DragonOS HZ=250, matching Linux's ceil-to-tick socket timeout storage.
         EXPECT_EQ(got_value.tv_usec, 236000);
+    }
+}
+
+TEST(AfPacketSockopt, SendTimeoutOldAndNewShareOneState) {
+    FdGuard fd(MakeTimeoutFd());
+    ASSERT_GE(fd.Get(), 0);
+
+    for (int option : {kSoSndtimeoOld, kSoSndtimeoNew}) {
+        struct timeval default_value { -1, -1 };
+        socklen_t default_len = sizeof(default_value);
+        ASSERT_EQ(getsockopt(fd.Get(), SOL_SOCKET, option, &default_value, &default_len), 0)
+            << "option=" << option << ": " << ErrnoString(errno);
+        EXPECT_EQ(default_value.tv_sec, 0);
+        EXPECT_EQ(default_value.tv_usec, 0);
+    }
+
+    for (auto [set_option, input_usec, expected_usec] :
+         {std::tuple{kSoSndtimeoOld, 234567L, 236000L},
+          std::tuple{kSoSndtimeoNew, 345678L, 348000L}}) {
+        struct timeval set_value { 1, input_usec };
+        ASSERT_EQ(setsockopt(fd.Get(), SOL_SOCKET, set_option, &set_value, sizeof(set_value)), 0)
+            << "option=" << set_option << ": " << ErrnoString(errno);
+        for (int get_option : {kSoSndtimeoOld, kSoSndtimeoNew}) {
+            struct timeval got {};
+            socklen_t len = sizeof(got);
+            ASSERT_EQ(getsockopt(fd.Get(), SOL_SOCKET, get_option, &got, &len), 0)
+                << "set=" << set_option << " get=" << get_option << ": " << ErrnoString(errno);
+            EXPECT_EQ(got.tv_sec, 1);
+            EXPECT_EQ(got.tv_usec, expected_usec);
+        }
+    }
+
+    struct timeval zero {};
+    ASSERT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoSndtimeoOld, &zero, sizeof(zero)), 0);
+    struct timeval got { -1, -1 };
+    socklen_t len = sizeof(got);
+    ASSERT_EQ(getsockopt(fd.Get(), SOL_SOCKET, kSoSndtimeoNew, &got, &len), 0);
+    EXPECT_EQ(got.tv_sec, 0);
+    EXPECT_EQ(got.tv_usec, 0);
+}
+
+TEST(AfPacketSockopt, SendAndReceiveTimeoutsAreIndependent) {
+    FdGuard fd(MakeTimeoutFd());
+    ASSERT_GE(fd.Get(), 0);
+    struct timeval receive_value { 0, 111111 };
+    struct timeval send_value { 0, 222222 };
+    ASSERT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoRcvtimeoOld, &receive_value,
+                         sizeof(receive_value)),
+              0);
+    ASSERT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoSndtimeoNew, &send_value,
+                         sizeof(send_value)),
+              0);
+
+    struct timeval got_receive {};
+    struct timeval got_send {};
+    socklen_t receive_len = sizeof(got_receive);
+    socklen_t send_len = sizeof(got_send);
+    ASSERT_EQ(getsockopt(fd.Get(), SOL_SOCKET, kSoRcvtimeoNew, &got_receive, &receive_len), 0);
+    ASSERT_EQ(getsockopt(fd.Get(), SOL_SOCKET, kSoSndtimeoOld, &got_send, &send_len), 0);
+    EXPECT_EQ(got_receive.tv_sec, 0);
+    EXPECT_EQ(got_receive.tv_usec, 112000);
+    EXPECT_EQ(got_send.tv_sec, 0);
+    EXPECT_EQ(got_send.tv_usec, 224000);
+}
+
+TEST(AfPacketSockopt, SendTimeoutRejectsInvalidAndShortNativeValues) {
+    FdGuard fd(MakeTimeoutFd());
+    ASSERT_GE(fd.Get(), 0);
+
+    for (int option : {kSoSndtimeoOld, kSoSndtimeoNew}) {
+        for (long usec : {-1L, 1000000L}) {
+            struct timeval invalid { 0, usec };
+            errno = 0;
+            EXPECT_EQ(setsockopt(fd.Get(), SOL_SOCKET, option, &invalid, sizeof(invalid)), -1);
+            EXPECT_EQ(errno, EDOM) << "option=" << option << " usec=" << usec;
+        }
+        struct timeval valid { 0, 50000 };
+        for (socklen_t len : {static_cast<socklen_t>(8), static_cast<socklen_t>(12)}) {
+            errno = 0;
+            EXPECT_EQ(setsockopt(fd.Get(), SOL_SOCKET, option, &valid, len), -1);
+            EXPECT_EQ(errno, EINVAL) << "option=" << option << " len=" << len;
+        }
     }
 }
 

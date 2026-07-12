@@ -12,6 +12,7 @@ use crate::{
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
     libs::mutex::MutexGuard,
+    process::{namespace::uts_namespace::NewUtsName, ProcessManager},
 };
 use alloc::{
     format,
@@ -73,6 +74,21 @@ impl DirOps for KernelDirOps {
                 cached_children.insert(name.to_string(), inode.clone());
                 return Ok(inode);
             }
+            "hostname" | "domainname" => {
+                let mut cached_children = dir.cached_children().write();
+                if let Some(child) = cached_children.get(name) {
+                    return Ok(child.clone());
+                }
+
+                let kind = if name == "hostname" {
+                    UtsStringKind::Hostname
+                } else {
+                    UtsStringKind::Domainname
+                };
+                let inode = UtsStringFileOps::new_inode(dir.self_ref_weak().clone(), kind);
+                cached_children.insert(name.to_string(), inode.clone());
+                return Ok(inode);
+            }
             _ => Err(SystemError::ENOENT),
         }
     }
@@ -92,6 +108,100 @@ impl DirOps for KernelDirOps {
             .or_insert_with(|| {
                 OverflowIdFileOps::new_inode(dir.self_ref_weak().clone(), OverflowIdKind::Gid)
             });
+        cached_children
+            .entry("hostname".to_string())
+            .or_insert_with(|| {
+                UtsStringFileOps::new_inode(dir.self_ref_weak().clone(), UtsStringKind::Hostname)
+            });
+        cached_children
+            .entry("domainname".to_string())
+            .or_insert_with(|| {
+                UtsStringFileOps::new_inode(dir.self_ref_weak().clone(), UtsStringKind::Domainname)
+            });
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum UtsStringKind {
+    Hostname,
+    Domainname,
+}
+
+#[derive(Debug)]
+struct UtsStringFileOps {
+    kind: UtsStringKind,
+}
+
+impl UtsStringFileOps {
+    fn new_inode(parent: Weak<dyn IndexNode>, kind: UtsStringKind) -> Arc<dyn IndexNode> {
+        ProcFileBuilder::new(Self { kind }, InodeMode::from_bits_truncate(0o644))
+            .parent(parent)
+            .build()
+            .unwrap()
+    }
+
+    fn snapshot(&self) -> [u8; NewUtsName::MAXLEN] {
+        let uts_ns = ProcessManager::current_utsns();
+        match self.kind {
+            UtsStringKind::Hostname => uts_ns.hostname(),
+            UtsStringKind::Domainname => uts_ns.domainname(),
+        }
+    }
+}
+
+impl FileOps for UtsStringFileOps {
+    fn read_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        let value = self.snapshot();
+        let value_len = value
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(value.len());
+        let mut content = Vec::with_capacity(value_len + 1);
+        content.extend_from_slice(&value[..value_len]);
+        content.push(b'\n');
+        proc_read(offset, len, buf, &content)
+    }
+
+    fn write_at(
+        &self,
+        offset: usize,
+        _len: usize,
+        buf: &[u8],
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let uts_ns = ProcessManager::current_utsns();
+        let old = match self.kind {
+            UtsStringKind::Hostname => uts_ns.hostname(),
+            UtsStringKind::Domainname => uts_ns.domainname(),
+        };
+        let old_len = old.iter().position(|byte| *byte == 0).unwrap_or(old.len());
+        if offset > old_len {
+            return Ok(buf.len());
+        }
+
+        let input_len = buf
+            .iter()
+            .position(|byte| *byte == 0 || *byte == b'\n')
+            .unwrap_or(buf.len());
+        let copy_len = input_len.min((NewUtsName::MAXLEN - 1).saturating_sub(offset));
+        let mut value = [0u8; NewUtsName::MAXLEN];
+        value[..offset].copy_from_slice(&old[..offset]);
+        value[offset..offset + copy_len].copy_from_slice(&buf[..copy_len]);
+        match self.kind {
+            UtsStringKind::Hostname => uts_ns.set_hostname(&value[..offset + copy_len])?,
+            UtsStringKind::Domainname => uts_ns.set_domainname(&value[..offset + copy_len])?,
+        }
+        Ok(buf.len())
     }
 }
 

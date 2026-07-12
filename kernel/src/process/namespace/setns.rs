@@ -38,6 +38,12 @@ fn can_setns_target_userns(
     cred.has_cap_sys_admin() && cred.user_ns.is_ancestor_of(target_user_ns)
 }
 
+fn can_setns_uts(target: &crate::process::namespace::uts_namespace::UtsNamespace) -> bool {
+    let current_user_ns = ProcessManager::current_pcb().cred().user_ns.clone();
+    ns_capable(target.user_ns(), CAPFlags::CAP_SYS_ADMIN)
+        && ns_capable(&current_user_ns, CAPFlags::CAP_SYS_ADMIN)
+}
+
 fn can_access_pidfd_setns_target(target: &Arc<crate::process::ProcessControlBlock>) -> bool {
     let current = ProcessManager::current_pcb();
     if Arc::ptr_eq(&current, target) {
@@ -135,11 +141,11 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
             return Err(SystemError::EINVAL);
         }
 
-        let target = target_pid.task(PidType::TGID).ok_or(SystemError::ESRCH)?;
+        let target = target_pid.task(PidType::PID).ok_or(SystemError::ESRCH)?;
         if !can_access_pidfd_setns_target(&target) {
             return Err(SystemError::EPERM);
         }
-        if !can_setns_target_userns(&target.cred().user_ns) {
+        if flags != CloneFlags::CLONE_NEWUTS && !can_setns_target_userns(&target.cred().user_ns) {
             return Err(SystemError::EPERM);
         }
 
@@ -148,6 +154,10 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
         let target_nsproxy = target.nsproxy();
 
         let mut new_inner: NsProxy = cur_nsproxy.clone_inner();
+
+        if flags.contains(CloneFlags::CLONE_NEWUTS) && !can_setns_uts(&target_nsproxy.uts_ns) {
+            return Err(SystemError::EPERM);
+        }
 
         if flags.contains(CloneFlags::CLONE_NEWNS) {
             new_inner.mnt_ns = target_nsproxy.mnt_ns.clone();
@@ -185,9 +195,11 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
 
     // 如果 flags 为空，则允许 “按 fd 类型推断”；否则必须与 fd 的 namespace 类型匹配。
     let mut new_inner: NsProxy = current.nsproxy().clone_inner();
-    if let Some(target_user_ns) = nsfd_target_userns(&ns_fd) {
-        if !can_setns_target_userns(&target_user_ns) {
-            return Err(SystemError::EPERM);
+    if !matches!(&ns_fd, NamespaceFilePrivateData::Uts(_)) {
+        if let Some(target_user_ns) = nsfd_target_userns(&ns_fd) {
+            if !can_setns_target_userns(&target_user_ns) {
+                return Err(SystemError::EPERM);
+            }
         }
     }
 
@@ -201,6 +213,9 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
         NamespaceFilePrivateData::Uts(ns) => {
             if !flags_match(flags, CloneFlags::CLONE_NEWUTS) {
                 return Err(SystemError::EINVAL);
+            }
+            if !can_setns_uts(&ns) {
+                return Err(SystemError::EPERM);
             }
             new_inner.uts_ns = ns;
         }

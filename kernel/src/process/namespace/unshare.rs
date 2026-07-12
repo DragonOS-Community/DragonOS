@@ -5,7 +5,7 @@ use system_error::SystemError;
 use crate::{
     filesystem::fs::FsStruct,
     process::{
-        cred::Cred,
+        cred::{ns_capable, CAPFlags, Cred},
         fork::CloneFlags,
         namespace::nsproxy::{
             create_new_namespaces, switch_task_namespaces, switch_task_namespaces_with_fs, NsProxy,
@@ -123,6 +123,10 @@ fn unshare_nsproxy_namespaces(
     let user_ns = new_cred
         .map(|cred| cred.user_ns.clone())
         .unwrap_or_else(ProcessManager::current_user_ns);
+
+    if !ns_capable(&user_ns, CAPFlags::CAP_SYS_ADMIN) {
+        return Err(SystemError::EPERM);
+    }
 
     let nsproxy = create_new_namespaces(&unshare_flags, current_pcb, user_ns)?;
 

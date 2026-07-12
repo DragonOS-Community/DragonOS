@@ -3,6 +3,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::MMArch,
+    libs::mutex::Mutex,
     mm::{
         kernel_mapper::KernelMapper,
         page::{CreatedPageTable, EntryFlags},
@@ -10,6 +11,13 @@ use crate::{
         MemoryManagementArch, PhysAddr, VirtAddr,
     },
 };
+
+lazy_static! {
+    /// Transaction-owned page tables that could not be reclaimed because another device mapping
+    /// still used them. Every device-linear teardown retries these records after its synchronous
+    /// kernel TLB shootdown.
+    static ref DEVICE_MAPPING_TEARDOWN: Mutex<Vec<CreatedPageTable>> = Mutex::new(Vec::new());
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MappingSegment {
@@ -148,6 +156,10 @@ impl DeviceLinearMapping {
         if self.segments.is_empty() && self.created_tables.is_empty() {
             return;
         }
+        // Serialize the complete clear -> shootdown -> reclaim transaction. Otherwise another
+        // teardown could observe a deferred table as empty and free it before this mapping's
+        // remote TLB entries have been invalidated.
+        let mut deferred = DEVICE_MAPPING_TEARDOWN.lock();
         {
             let mut kernel_mapper = KernelMapper::lock();
             let mapper = kernel_mapper
@@ -173,7 +185,8 @@ impl DeviceLinearMapping {
             let mapper = kernel_mapper
                 .as_mut()
                 .expect("device page-table reclaim while KernelMapper is recursively locked");
-            unsafe { mapper.reclaim_created_tables(&mut self.created_tables) };
+            deferred.append(&mut self.created_tables);
+            unsafe { mapper.reclaim_created_tables(&mut deferred) };
         }
         self.segments.clear();
     }

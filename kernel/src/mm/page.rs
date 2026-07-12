@@ -1913,7 +1913,11 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
 
     /// Reclaim transaction-owned page tables after a synchronous kernel TLB shootdown.
     pub unsafe fn reclaim_created_tables(&mut self, created_tables: &mut Vec<CreatedPageTable>) {
-        for owned in created_tables.drain(..).rev() {
+        // A lower-level table must be reclaimed before the parent that points to it. Records that
+        // are still non-empty remain owned and are retried by a later device-mapping teardown.
+        created_tables.sort_unstable_by_key(|owned| owned.parent_level);
+        let pending = core::mem::take(created_tables);
+        for owned in pending {
             let parent =
                 PageTable::<Arch>::new(owned.parent_base, owned.parent_phys, owned.parent_level);
             let Some(entry) = parent.entry(owned.index) else {
@@ -1935,6 +1939,8 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
             if empty {
                 parent.set_entry(owned.index, PageEntry::from_usize(0));
                 self.frame_allocator.free_one(owned.child_phys);
+            } else {
+                created_tables.push(owned);
             }
         }
     }

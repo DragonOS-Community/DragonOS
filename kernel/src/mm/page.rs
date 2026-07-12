@@ -528,7 +528,7 @@ impl PageReclaimer {
                     len,
                     e
                 );
-                guard.add_flags(PageFlags::PG_ERROR);
+                guard.add_flags(PageFlags::PG_ERROR | PageFlags::PG_DIRTY);
                 page_cache.mark_page_error(page_index, e);
                 return;
             }
@@ -536,7 +536,7 @@ impl PageReclaimer {
 
         guard.remove_flags(PageFlags::PG_ERROR);
         if guard.flags().contains(PageFlags::PG_DIRTY) {
-            page_cache.mark_page_dirty(page_index);
+            let _ = page_cache.mark_page_dirty(page_index);
         } else {
             page_cache.mark_page_uptodate(page_index);
         }

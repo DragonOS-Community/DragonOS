@@ -17,7 +17,7 @@ use crate::{
         spinlock::SpinLock,
         wait_queue::WaitQueue,
     },
-    mm::{truncate::truncate_inode_pages, MemoryManagementArch},
+    mm::MemoryManagementArch,
     process::{ProcessManager, RawPid},
     sched::sched_yield,
     time::sleep::nanosleep,
@@ -227,26 +227,26 @@ pub struct Ext4Inode {
 }
 
 #[derive(Debug)]
-pub struct LockedExt4Inode(
-    pub(super) Mutex<Ext4Inode>,
-    pub(super) Mutex<()>,
-    pub(super) RwSem<()>,
-    pub(super) Mutex<()>,
-    pub(super) Arc<Ext4InodeLifecycle>,
-    pub(super) InodeRetentionState,
-    pub(super) SpinLock<Option<another_ext4::InodeReclaimHandle>>,
-    pub(super) SpinLock<bool>,
-    pub(super) Weak<LockedExt4Inode>,
-    pub(super) SpinLock<Weak<Ext4FileSystem>>,
-);
+pub struct LockedExt4Inode {
+    pub(super) inner: Mutex<Ext4Inode>,
+    pub(super) io_lock: Mutex<()>,
+    pub(super) size_lock: RwSem<()>,
+    pub(super) namespace_lock: Mutex<()>,
+    pub(super) lifecycle: Arc<Ext4InodeLifecycle>,
+    pub(super) retention: InodeRetentionState,
+    pub(super) pending_reclaim: SpinLock<Option<another_ext4::InodeReclaimHandle>>,
+    pub(super) eviction_scheduled: SpinLock<bool>,
+    pub(super) retention_callback_self: Weak<LockedExt4Inode>,
+    pub(super) eviction_filesystem: SpinLock<Weak<Ext4FileSystem>>,
+}
 
 impl IndexNode for LockedExt4Inode {
     fn retention_state(&self) -> Option<&InodeRetentionState> {
-        Some(&self.5)
+        Some(&self.retention)
     }
 
     fn on_zero_retention(&self) {
-        let inode = self.8.upgrade();
+        let inode = self.retention_callback_self.upgrade();
         if let Some(inode) = inode {
             let _ = inode.try_schedule_deferred_eviction();
         }
@@ -271,8 +271,8 @@ impl IndexNode for LockedExt4Inode {
         mode: vfs::InodeMode,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let _operation = self.begin_operation()?;
-        let _namespace = self.3.lock();
-        let mut guard = self.0.lock();
+        let _namespace = self.namespace_lock.lock();
+        let mut guard = self.inner.lock();
         // another_ext4的高4位是文件类型，低12位是权限
         let file_mode = InodeMode::from(file_type).union(mode);
         let file_mode = another_ext4::InodeMode::from_bits_truncate(file_mode.bits() as u16);
@@ -332,7 +332,7 @@ impl IndexNode for LockedExt4Inode {
         // - prepare_read(): inode.metadata()
         // 若此处持有 inode 锁，则会在 metadata() 再次尝试获取同一把锁而自旋死锁。
         let page_cache = {
-            let guard = self.0.lock();
+            let guard = self.inner.lock();
             guard.page_cache.clone()
         };
 
@@ -349,7 +349,7 @@ impl IndexNode for LockedExt4Inode {
     fn read_sync(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
         let _operation = self.begin_operation()?;
         let (fs, inode_num) = {
-            let guard = self.0.lock();
+            let guard = self.inner.lock();
             (guard.concret_fs(), guard.inner_inode_num)
         };
         match fs.fs.getattr(inode_num)?.ftype {
@@ -384,11 +384,11 @@ impl IndexNode for LockedExt4Inode {
         if len == 0 {
             return Ok(0);
         }
-        let _size_guard = self.2.read();
+        let _size_guard = self.size_lock.read();
         let buf = &buf[0..len];
 
         let (fs, inode_num, page_cache) = {
-            let guard = self.0.lock();
+            let guard = self.inner.lock();
             (
                 guard.concret_fs(),
                 guard.inner_inode_num,
@@ -398,16 +398,16 @@ impl IndexNode for LockedExt4Inode {
 
         if let Some(page_cache) = page_cache {
             let _invalidate = page_cache.invalidate_write();
-            let _io_guard = self.1.lock();
+            let _io_guard = self.io_lock.lock();
 
             // 使用缓存的文件大小，避免 getattr 磁盘 I/O
             let old_file_size = {
-                let cached_size = self.0.lock().cached_file_size;
+                let cached_size = self.inner.lock().cached_file_size;
                 match cached_size {
                     Some(size) => size,
                     None => {
                         let size = fs.fs.getattr(inode_num)?.size;
-                        self.0.lock().cached_file_size = Some(size);
+                        self.inner.lock().cached_file_size = Some(size);
                         size
                     }
                 }
@@ -443,7 +443,7 @@ impl IndexNode for LockedExt4Inode {
                 let written_end = offset.checked_add(write_len).ok_or(SystemError::EFBIG)?;
                 let current_file_size = core::cmp::max(old_file_size, written_end as u64);
                 let self_arc = {
-                    let mut guard = self.0.lock();
+                    let mut guard = self.inner.lock();
                     guard.cached_file_size = Some(current_file_size);
                     guard.cached_mtime = Some(time);
                     guard.self_ref.upgrade().ok_or(SystemError::ENOENT)?
@@ -462,9 +462,9 @@ impl IndexNode for LockedExt4Inode {
 
     fn write_sync(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
         let _operation = self.begin_operation()?;
-        let _io_guard = self.1.lock();
+        let _io_guard = self.io_lock.lock();
         let (fs, inode_num) = {
-            let guard = self.0.lock();
+            let guard = self.inner.lock();
             (guard.concret_fs(), guard.inner_inode_num)
         };
         match fs.fs.getattr(inode_num)?.ftype {
@@ -494,7 +494,7 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn fs(&self) -> Arc<dyn vfs::FileSystem> {
-        self.0.lock().concret_fs()
+        self.inner.lock().concret_fs()
     }
 
     fn as_any_ref(&self) -> &dyn core::any::Any {
@@ -503,8 +503,8 @@ impl IndexNode for LockedExt4Inode {
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
         let _operation = self.begin_operation()?;
-        let _namespace = self.3.lock();
-        let mut guard = self.0.lock();
+        let _namespace = self.namespace_lock.lock();
+        let mut guard = self.inner.lock();
         let dname = DName::from(name);
         if let Some(child) = guard.children.get(&dname) {
             let child = child.clone();
@@ -527,7 +527,7 @@ impl IndexNode for LockedExt4Inode {
     fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 只有目录才有父目录的概念
         // 先检查当前inode是否为目录
-        let guard = self.0.lock();
+        let guard = self.inner.lock();
 
         // 如果存储了父级指针，直接返回
         if let Some(parent) = guard.parent.upgrade() {
@@ -539,7 +539,7 @@ impl IndexNode for LockedExt4Inode {
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
         let _operation = self.begin_operation()?;
-        let guard = self.0.lock();
+        let guard = self.inner.lock();
         let dentry = guard.concret_fs().fs.listdir(guard.inner_inode_num)?;
         let mut list = Vec::new();
         for entry in dentry {
@@ -550,8 +550,8 @@ impl IndexNode for LockedExt4Inode {
 
     fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
         let _operation = self.begin_operation()?;
-        let _namespace = self.3.lock();
-        let mut guard = self.0.lock();
+        let _namespace = self.namespace_lock.lock();
+        let mut guard = self.inner.lock();
         let fs = guard.concret_fs();
         let ext4 = &fs.fs;
         let inode_num = guard.inner_inode_num;
@@ -560,14 +560,14 @@ impl IndexNode for LockedExt4Inode {
             .clone()
             .downcast_arc::<LockedExt4Inode>()
             .ok_or(SystemError::EINVAL)?;
-        let other_fs = other_arc.0.lock().concret_fs();
+        let other_fs = other_arc.inner.lock().concret_fs();
         if !Arc::ptr_eq(&fs, &other_fs) {
             return Err(SystemError::EXDEV);
         }
         let other_lifecycle = other_arc.lifecycle().clone();
         let _link_mutation = other_lifecycle.lock_link_mutation();
         let _other_operation = other_arc.begin_operation()?;
-        let other_inode_num = other_arc.0.lock().inner_inode_num;
+        let other_inode_num = other_arc.inner.lock().inner_inode_num;
 
         let my_attr = ext4.getattr(inode_num)?;
         let other_attr = ext4.getattr(other_inode_num)?;
@@ -600,8 +600,8 @@ impl IndexNode for LockedExt4Inode {
 
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
         let _operation = self.begin_operation()?;
-        let _namespace = self.3.lock();
-        let mut guard = self.0.lock();
+        let _namespace = self.namespace_lock.lock();
+        let mut guard = self.inner.lock();
         let fs = guard.concret_fs();
         let ext4 = &fs.fs;
         let inode_num = guard.inner_inode_num;
@@ -659,7 +659,7 @@ impl IndexNode for LockedExt4Inode {
     fn metadata(&self) -> Result<vfs::Metadata, SystemError> {
         let _operation = self.begin_operation()?;
         let (fs, inode_num, vfs_inode_id, cached_size, cached_mtime) = {
-            let guard = self.0.lock();
+            let guard = self.inner.lock();
             (
                 guard.concret_fs(),
                 guard.inner_inode_num,
@@ -757,7 +757,7 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn page_cache(&self) -> Option<Arc<PageCache>> {
-        self.0.lock().page_cache.clone()
+        self.inner.lock().page_cache.clone()
     }
 
     fn set_metadata(&self, metadata: &vfs::Metadata) -> Result<(), SystemError> {
@@ -768,7 +768,7 @@ impl IndexNode for LockedExt4Inode {
             |time: &PosixTimeSpec| -> u32 { time.tv_sec.max(0).min(u32::MAX as i64) as u32 };
 
         let (fs, inode_num) = {
-            let guard = self.0.lock();
+            let guard = self.inner.lock();
             (guard.concret_fs(), guard.inner_inode_num)
         };
         let ext4 = &fs.fs;
@@ -790,22 +790,23 @@ impl IndexNode for LockedExt4Inode {
             )
         })?;
         {
-            let mut guard = self.0.lock();
+            let mut guard = self.inner.lock();
             guard.cached_file_size = Some(metadata.size as u64);
             guard.cached_mtime = Some(to_ext4_time(&metadata.mtime));
             guard
                 .dirty_state
                 .remove(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY);
         }
+        self.release_clean_metadata_queue_owner(&fs);
 
         Ok(())
     }
 
     fn resize(&self, len: usize) -> Result<(), SystemError> {
         let _operation = self.begin_operation()?;
-        let _size_guard = self.2.write();
+        let _size_guard = self.size_lock.write();
         let (fs, inode_num, page_cache, cached_size) = {
-            let guard = self.0.lock();
+            let guard = self.inner.lock();
             (
                 guard.concret_fs(),
                 guard.inner_inode_num,
@@ -818,7 +819,7 @@ impl IndexNode for LockedExt4Inode {
             None => fs.fs.getattr(inode_num)?.size,
         };
         {
-            let _io_guard = self.1.lock();
+            let _io_guard = self.io_lock.lock();
             let ext4 = &fs.fs;
             // 仅调整文件大小，其他属性保持不变
             Self::retry_metadata_contention(|| {
@@ -838,12 +839,13 @@ impl IndexNode for LockedExt4Inode {
             })?;
             // 更新缓存的文件大小
             {
-                let mut guard = self.0.lock();
+                let mut guard = self.inner.lock();
                 guard.cached_file_size = Some(len as u64);
                 guard
                     .dirty_state
                     .remove(InodeDirtyState::SIZE_DIRTY | InodeDirtyState::MTIME_DIRTY);
             }
+            self.release_clean_metadata_queue_owner(&fs);
         }
         if len < old_size as usize {
             if let Some(page_cache) = page_cache {
@@ -872,8 +874,8 @@ impl IndexNode for LockedExt4Inode {
 
     fn rmdir(&self, name: &str) -> Result<(), SystemError> {
         let _operation = self.begin_operation()?;
-        let _namespace = self.3.lock();
-        let mut guard = self.0.lock();
+        let _namespace = self.namespace_lock.lock();
+        let mut guard = self.inner.lock();
         let fs = guard.concret_fs();
         let concret_fs = &fs.fs;
         let inode_num = guard.inner_inode_num;
@@ -929,12 +931,12 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn dname(&self) -> Result<DName, SystemError> {
-        Ok(self.0.lock().dname.clone())
+        Ok(self.inner.lock().dname.clone())
     }
 
     fn getxattr(&self, name: &str, buf: &mut [u8]) -> Result<usize, SystemError> {
         let _operation = self.begin_operation()?;
-        let guard = self.0.lock();
+        let guard = self.inner.lock();
         let ext4 = &guard.concret_fs().fs;
         let inode_num = guard.inner_inode_num;
 
@@ -964,7 +966,7 @@ impl IndexNode for LockedExt4Inode {
 
     fn setxattr(&self, name: &str, value: &[u8], flags: XattrFlags) -> Result<usize, SystemError> {
         let _operation = self.begin_operation()?;
-        let guard = self.0.lock();
+        let guard = self.inner.lock();
         let ext4 = &guard.concret_fs().fs;
         let inode_num = guard.inner_inode_num;
 
@@ -987,7 +989,7 @@ impl IndexNode for LockedExt4Inode {
 
     fn listxattr(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
         let _operation = self.begin_operation()?;
-        let guard = self.0.lock();
+        let guard = self.inner.lock();
         let ext4 = &guard.concret_fs().fs;
         let inode_num = guard.inner_inode_num;
 
@@ -1019,7 +1021,7 @@ impl IndexNode for LockedExt4Inode {
 
     fn removexattr(&self, name: &str) -> Result<usize, SystemError> {
         let _operation = self.begin_operation()?;
-        let guard = self.0.lock();
+        let guard = self.inner.lock();
         let ext4 = &guard.concret_fs().fs;
         let inode_num = guard.inner_inode_num;
 
@@ -1042,9 +1044,9 @@ impl IndexNode for LockedExt4Inode {
             return self.create(filename, vfs::FileType::File, mode);
         }
         let _operation = self.begin_operation()?;
-        let _namespace = self.3.lock();
+        let _namespace = self.namespace_lock.lock();
 
-        let mut guard = self.0.lock();
+        let mut guard = self.inner.lock();
         let fs = guard.concret_fs();
         let _reuse = fs.begin_allocation()?;
         let ext4 = &fs.fs;
@@ -1093,7 +1095,7 @@ impl IndexNode for LockedExt4Inode {
     }
 
     fn special_node(&self) -> Option<SpecialNodeData> {
-        self.0.lock().special_node.clone()
+        self.inner.lock().special_node.clone()
     }
 
     fn move_to(
@@ -1111,21 +1113,27 @@ impl IndexNode for LockedExt4Inode {
         let _target_operation = target_locked.begin_operation()?;
 
         let (ext4_fs, src_inode_num) = {
-            let guard = self.0.lock();
+            let guard = self.inner.lock();
             (guard.concret_fs(), guard.inner_inode_num)
         };
         let ext4 = &ext4_fs.fs;
-        let target_inode_num = target_locked.0.lock().inner_inode_num;
-        if !Arc::ptr_eq(&ext4_fs, &target_locked.0.lock().concret_fs()) {
+        let target_inode_num = target_locked.inner.lock().inner_inode_num;
+        if !Arc::ptr_eq(&ext4_fs, &target_locked.inner.lock().concret_fs()) {
             return Err(SystemError::EXDEV);
         }
 
         let (_first_namespace, _second_namespace) = if src_inode_num == target_inode_num {
-            (self.3.lock(), None)
+            (self.namespace_lock.lock(), None)
         } else if src_inode_num < target_inode_num {
-            (self.3.lock(), Some(target_locked.3.lock()))
+            (
+                self.namespace_lock.lock(),
+                Some(target_locked.namespace_lock.lock()),
+            )
         } else {
-            (target_locked.3.lock(), Some(self.3.lock()))
+            (
+                target_locked.namespace_lock.lock(),
+                Some(self.namespace_lock.lock()),
+            )
         };
 
         let old_dname = DName::from(old_name);
@@ -1169,7 +1177,7 @@ impl IndexNode for LockedExt4Inode {
         let had_dst = dst_inode_num.is_some();
         let dst_inode = if let Some(dst_inode_num) = dst_inode_num {
             let target_parent = target_locked
-                .0
+                .inner
                 .lock()
                 .self_ref
                 .upgrade()
@@ -1232,7 +1240,7 @@ impl IndexNode for LockedExt4Inode {
             let mut temp_name = String::new();
             let mut whiteout_inode = None;
             let source_parent = self
-                .0
+                .inner
                 .lock()
                 .self_ref
                 .upgrade()
@@ -1331,7 +1339,7 @@ impl IndexNode for LockedExt4Inode {
                     .defer_reclaim(handle)?;
             }
             if let Some(whiteout) = &whiteout_inode {
-                whiteout.0.lock().dname = old_dname.clone();
+                whiteout.inner.lock().dname = old_dname.clone();
             }
             resulting_whiteout = whiteout_inode;
         } else {
@@ -1385,13 +1393,19 @@ impl IndexNode for LockedExt4Inode {
             had_dst,
         );
         if let Some(whiteout) = resulting_whiteout {
-            self.0.lock().children.insert(old_dname, whiteout);
+            self.inner.lock().children.insert(old_dname, whiteout);
         }
         Ok(())
     }
 }
 
 impl LockedExt4Inode {
+    fn release_clean_metadata_queue_owner(&self, fs: &Arc<Ext4FileSystem>) {
+        if let Some(inode) = self.retention_callback_self.upgrade() {
+            fs.release_clean_queued_inode(&inode);
+        }
+    }
+
     fn metadata_contention_backoff(attempt: usize) {
         const YIELDS_BEFORE_SLEEP: usize = 64;
         if attempt.is_multiple_of(YIELDS_BEFORE_SLEEP) {
@@ -1471,7 +1485,7 @@ impl LockedExt4Inode {
             }
         };
         if let Err((error, handle)) = Self::reclaim_with_metadata_contention_retry(&fs.fs, handle) {
-            *inode.6.lock() = Some(handle);
+            *inode.pending_reclaim.lock() = Some(handle);
             let error = SystemError::from(error);
             let _ = fs.poison_freeing(tombstone, error.clone());
             return Err(error);
@@ -1495,11 +1509,11 @@ impl LockedExt4Inode {
 
     #[inline]
     fn begin_operation(&self) -> Result<Ext4InodeOperation, SystemError> {
-        self.4.begin_operation()
+        self.lifecycle.begin_operation()
     }
 
     pub(super) fn lifecycle(&self) -> &Arc<Ext4InodeLifecycle> {
-        &self.4
+        &self.lifecycle
     }
 
     /// 更新 rename 后的缓存
@@ -1513,20 +1527,20 @@ impl LockedExt4Inode {
         had_dst: bool,
     ) {
         if src_dir == dst_dir {
-            let mut guard = self.0.lock();
+            let mut guard = self.inner.lock();
             if had_dst {
                 guard.children.remove(new_dname);
             }
             if let Some(child) = guard.children.remove(old_dname) {
-                child.0.lock().dname = new_dname.clone();
+                child.inner.lock().dname = new_dname.clone();
                 guard.children.insert(new_dname.clone(), child);
             }
         } else {
             let (mut src_guard, mut dst_guard) = if src_dir < dst_dir {
-                (self.0.lock(), target.0.lock())
+                (self.inner.lock(), target.inner.lock())
             } else {
-                let d = target.0.lock();
-                let s = self.0.lock();
+                let d = target.inner.lock();
+                let s = self.inner.lock();
                 (s, d)
             };
 
@@ -1537,7 +1551,7 @@ impl LockedExt4Inode {
                 dst_guard.children.insert(new_dname.clone(), child.clone());
                 drop(src_guard);
                 drop(dst_guard);
-                let mut child_guard = child.0.lock();
+                let mut child_guard = child.inner.lock();
                 child_guard.dname = new_dname.clone();
                 child_guard.parent = Arc::downgrade(target);
             }
@@ -1555,25 +1569,25 @@ impl LockedExt4Inode {
     ) {
         if src_dir == dst_dir {
             // 同目录交换
-            let mut guard = self.0.lock();
+            let mut guard = self.inner.lock();
             let old_child = guard.children.remove(old_dname);
             let new_child = guard.children.remove(new_dname);
 
             if let Some(child) = old_child {
-                child.0.lock().dname = new_dname.clone();
+                child.inner.lock().dname = new_dname.clone();
                 guard.children.insert(new_dname.clone(), child);
             }
             if let Some(child) = new_child {
-                child.0.lock().dname = old_dname.clone();
+                child.inner.lock().dname = old_dname.clone();
                 guard.children.insert(old_dname.clone(), child);
             }
         } else {
             // 跨目录交换
             let (mut src_guard, mut dst_guard) = if src_dir < dst_dir {
-                (self.0.lock(), target.0.lock())
+                (self.inner.lock(), target.inner.lock())
             } else {
-                let d = target.0.lock();
-                let s = self.0.lock();
+                let d = target.inner.lock();
+                let s = self.inner.lock();
                 (s, d)
             };
 
@@ -1586,20 +1600,20 @@ impl LockedExt4Inode {
                 drop(src_guard);
                 drop(dst_guard);
 
-                let mut child_guard = child.0.lock();
+                let mut child_guard = child.inner.lock();
                 child_guard.dname = new_dname.clone();
                 child_guard.parent = Arc::downgrade(target);
                 drop(child_guard);
 
                 // 重新获取锁处理 new_child
                 if let Some(new_c) = new_child {
-                    let mut src_guard = self.0.lock();
+                    let mut src_guard = self.inner.lock();
                     src_guard.children.insert(old_dname.clone(), new_c.clone());
                     drop(src_guard);
 
-                    let mut new_c_guard = new_c.0.lock();
+                    let mut new_c_guard = new_c.inner.lock();
                     new_c_guard.dname = old_dname.clone();
-                    new_c_guard.parent = self.0.lock().self_ref.clone();
+                    new_c_guard.parent = self.inner.lock().self_ref.clone();
                 }
             } else if let Some(new_c) = new_child {
                 // 只有 new_child 在缓存中
@@ -1607,9 +1621,9 @@ impl LockedExt4Inode {
                 drop(src_guard);
                 drop(dst_guard);
 
-                let mut new_c_guard = new_c.0.lock();
+                let mut new_c_guard = new_c.inner.lock();
                 new_c_guard.dname = old_dname.clone();
-                new_c_guard.parent = self.0.lock().self_ref.clone();
+                new_c_guard.parent = self.inner.lock().self_ref.clone();
             }
         }
     }
@@ -1622,21 +1636,19 @@ impl LockedExt4Inode {
         known_file_type: Option<FileType>,
     ) -> Result<Arc<Self>, SystemError> {
         let lifecycle = Ext4InodeLifecycle::new();
-        let inode = Arc::new_cyclic(|self_ref| {
-            LockedExt4Inode(
-                Mutex::new(Ext4Inode::new(inode_num, fs_ptr.clone(), dname, parent)),
-                Mutex::new(()),
-                RwSem::new(()),
-                Mutex::new(()),
-                lifecycle,
-                InodeRetentionState::new(),
-                SpinLock::new(None),
-                SpinLock::new(false),
-                self_ref.clone(),
-                SpinLock::new(fs_ptr.clone()),
-            )
+        let inode = Arc::new_cyclic(|self_ref| LockedExt4Inode {
+            inner: Mutex::new(Ext4Inode::new(inode_num, fs_ptr.clone(), dname, parent)),
+            io_lock: Mutex::new(()),
+            size_lock: RwSem::new(()),
+            namespace_lock: Mutex::new(()),
+            lifecycle,
+            retention: InodeRetentionState::new(),
+            pending_reclaim: SpinLock::new(None),
+            eviction_scheduled: SpinLock::new(false),
+            retention_callback_self: self_ref.clone(),
+            eviction_filesystem: SpinLock::new(fs_ptr.clone()),
         });
-        let mut guard = inode.0.lock();
+        let mut guard = inode.inner.lock();
 
         // 设置self_ref
         guard.self_ref = Arc::downgrade(&inode);
@@ -1721,7 +1733,7 @@ impl LockedExt4Inode {
         self: &Arc<Self>,
         handle: another_ext4::InodeReclaimHandle,
     ) -> Result<(), SystemError> {
-        let mut pending = self.6.lock();
+        let mut pending = self.pending_reclaim.lock();
         if pending.is_some() {
             return Err(SystemError::EIO);
         }
@@ -1734,44 +1746,44 @@ impl LockedExt4Inode {
         // Dropping the capability is the in-memory counterpart of the durable
         // orphan-del transaction. A queued eviction, if any, observes None and
         // cleanly aborts instead of treating cancellation as corruption.
-        let _ = self.6.lock().take();
+        let _ = self.pending_reclaim.lock().take();
     }
 
     fn try_schedule_deferred_eviction(self: &Arc<Self>) -> Result<(), SystemError> {
-        if self.6.lock().is_none() {
+        if self.pending_reclaim.lock().is_none() {
             return Ok(());
         }
-        let mut scheduled = self.7.lock();
+        let mut scheduled = self.eviction_scheduled.lock();
         if *scheduled {
             return Ok(());
         }
-        if self.5.try_begin_freeing().is_err() {
+        if self.retention.try_begin_freeing().is_err() {
             return Ok(());
         }
         *scheduled = true;
-        let fs = match self.9.lock().upgrade() {
+        let fs = match self.eviction_filesystem.lock().upgrade() {
             Some(fs) => fs,
             None => {
                 *scheduled = false;
-                self.5.abort_freeing();
+                self.retention.abort_freeing();
                 return Err(SystemError::ESTALE);
             }
         };
         if let Err(error) = fs.schedule_inode_eviction(self.clone()) {
             *scheduled = false;
-            self.5.abort_freeing();
+            self.retention.abort_freeing();
             return Err(error);
         }
         Ok(())
     }
 
     pub(super) fn run_deferred_eviction(self: &Arc<Self>) -> Result<(), SystemError> {
-        let fs = self.0.lock().concret_fs();
+        let fs = self.inner.lock().concret_fs();
         let tombstone = match fs.begin_freeing(self) {
             Ok(tombstone) => tombstone,
             Err(error) => {
-                *self.7.lock() = false;
-                self.5.abort_freeing();
+                *self.eviction_scheduled.lock() = false;
+                self.retention.abort_freeing();
                 return Err(error);
             }
         };
@@ -1780,18 +1792,22 @@ impl LockedExt4Inode {
         // operations, so this ordering cannot deadlock a relink that already
         // owns the link-mutation lock.
         let _link_mutation = self.lifecycle().lock_link_mutation();
-        let handle = match self.6.lock().take() {
+        let handle = match self.pending_reclaim.lock().take() {
             Some(handle) => handle,
             None => {
                 fs.abort_freeing(tombstone)?;
-                *self.7.lock() = false;
-                self.5.abort_freeing();
+                *self.eviction_scheduled.lock() = false;
+                self.retention.abort_freeing();
                 return Ok(());
             }
         };
         let _reuse = fs.begin_reclaim();
         if let Some(page_cache) = self.page_cache() {
-            truncate_inode_pages(page_cache, 0);
+            if let Err(error) = page_cache.truncate(0) {
+                *self.pending_reclaim.lock() = Some(handle);
+                let _ = fs.poison_freeing(tombstone, error.clone());
+                return Err(error);
+            }
         }
         match Self::reclaim_with_metadata_contention_retry(&fs.fs, handle) {
             Ok(()) => {
@@ -1799,7 +1815,7 @@ impl LockedExt4Inode {
                 Ok(())
             }
             Err((error, handle)) => {
-                *self.6.lock() = Some(handle);
+                *self.pending_reclaim.lock() = Some(handle);
                 let error = SystemError::from(error);
                 let _ = fs.poison_freeing(tombstone, error.clone());
                 Err(error)
@@ -1809,9 +1825,9 @@ impl LockedExt4Inode {
 
     pub(super) fn flush_metadata(&self, datasync: bool) -> Result<(), SystemError> {
         let _operation = self.begin_operation()?;
-        let _io_guard = self.1.lock();
+        let _io_guard = self.io_lock.lock();
         let (fs, inode_num, dirty, cached_size, cached_mtime) = {
-            let guard = self.0.lock();
+            let guard = self.inner.lock();
             (
                 guard.concret_fs(),
                 guard.inner_inode_num,
@@ -1825,6 +1841,7 @@ impl LockedExt4Inode {
         let mtime_dirty = dirty.contains(InodeDirtyState::MTIME_DIRTY);
 
         if !size_dirty && (!mtime_dirty || datasync) {
+            self.release_clean_metadata_queue_owner(&fs);
             return Ok(());
         }
 
@@ -1843,13 +1860,15 @@ impl LockedExt4Inode {
         };
         Self::retry_metadata_contention(|| fs.fs.commit_inode_metadata(inode_num, size, mtime))?;
 
-        let mut guard = self.0.lock();
+        let mut guard = self.inner.lock();
         if size_dirty && guard.cached_file_size == cached_size {
             guard.dirty_state.remove(InodeDirtyState::SIZE_DIRTY);
         }
         if !datasync && mtime_dirty && guard.cached_mtime == cached_mtime {
             guard.dirty_state.remove(InodeDirtyState::MTIME_DIRTY);
         }
+        drop(guard);
+        self.release_clean_metadata_queue_owner(&fs);
         Ok(())
     }
 }

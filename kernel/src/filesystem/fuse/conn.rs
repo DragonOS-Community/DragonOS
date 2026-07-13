@@ -1018,13 +1018,10 @@ impl FuseConn {
                 continue;
             }
 
-            wait_with_recheck(&self.dax_cleanup_wait, || {
+            self.dax_cleanup_wait.wait_until(|| {
                 let cleanup = self.dax_cleanup.lock();
-                if cleanup.nodes.is_empty() {
-                    return Ok(Some(()));
-                }
-                Ok(None)
-            })?;
+                cleanup.nodes.is_empty().then_some(())
+            });
             let cleanup = self.dax_cleanup.lock();
             if cleanup.nodes.is_empty() {
                 return if cleanup.revoke_failed {
@@ -1402,10 +1399,10 @@ impl FuseConn {
                 }
             };
             debug_assert_eq!(state, DaxCleanupState::InProgress);
-            wait_with_recheck(&self.dax_cleanup_wait, || {
+            self.dax_cleanup_wait.wait_until(|| {
                 let state = self.dax_cleanup.lock().state;
-                Ok((state != DaxCleanupState::InProgress).then_some(()))
-            })?;
+                (state != DaxCleanupState::InProgress).then_some(())
+            });
         }
     }
 

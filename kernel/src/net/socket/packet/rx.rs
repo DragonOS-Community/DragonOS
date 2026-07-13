@@ -86,6 +86,19 @@ impl PacketSocket {
             14
         };
         let data_len = visible_len - start;
+        // AF_PACKET cBPF filter：has_filter 快路径（无 filter 时零开销）
+        if self.has_filter.load(Ordering::Acquire) {
+            let prog = self.filter.load();
+            if !prog.is_empty() {
+                // filter 运行在 socket 视角的数据上：
+                //   SOCK_RAW → frame[0..]（完整以太网帧）
+                //   SOCK_DGRAM → frame[14..]（L3 payload，MAC 头已剥）
+                let snaplen = crate::bpf::classic::run_cbpf(&prog, &frame[start..]) as usize;
+                if snaplen == 0 {
+                    return; // 包被 filter 丢弃
+                }
+            }
+        }
         let metadata = PacketMetadata {
             src_mac: src,
             dst_mac: dst,

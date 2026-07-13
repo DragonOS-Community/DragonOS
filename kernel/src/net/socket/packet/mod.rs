@@ -12,6 +12,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use system_error::SystemError;
 
+use crate::bpf::classic::SockFilter;
 use crate::driver::net::Iface;
 use crate::filesystem::epoll::EPollEventType;
 use crate::filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId};
@@ -22,6 +23,7 @@ use crate::net::socket::{Socket, PMSG, PSOCK, PSOL};
 use crate::process::cred::CAPFlags;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
+use crate::rcu::RcuArcSlot;
 
 #[allow(unused_imports)]
 pub use uapi::{
@@ -89,6 +91,12 @@ pub struct PacketSocket {
     open_files: AtomicUsize,
     pub(super) self_ref: Weak<Self>,
     pub(super) netns: Arc<NetNamespace>,
+    /// BPF filter 快路径标记：false 时跳过 filter 评估（零开销）
+    pub(super) has_filter: AtomicBool,
+    /// cBPF filter 程序（RcuArcSlot 无锁读取，匹配 AF_PACKET 收包路径设计）
+    pub(super) filter: RcuArcSlot<Vec<SockFilter>>,
+    /// SO_LOCK_FILTER：一旦置 true 不可再修改 filter
+    pub(super) filter_locked: AtomicBool,
     epoll_items: EPollItems,
     fasync_items: FAsyncItems,
 }
@@ -128,6 +136,9 @@ impl PacketSocket {
             self_ref: me.clone(),
             netns,
             epoll_items: EPollItems::default(),
+            has_filter: AtomicBool::new(false),
+            filter: RcuArcSlot::new(Arc::new(Vec::new())),
+            filter_locked: AtomicBool::new(false),
             fasync_items: FAsyncItems::default(),
         });
         socket.netns.register_packet_socket(socket.self_ref.clone());

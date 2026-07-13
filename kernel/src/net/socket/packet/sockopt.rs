@@ -1,6 +1,8 @@
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 use system_error::SystemError;
 
+use crate::bpf::classic::{self, validate_cbpf};
 use crate::net::socket::common::{
     parse_socket_buffer_size, parse_timeval_ticks, write_i32_getsockopt, write_timeval_ticks,
     write_u32_getsockopt, INFINITE_TIMEOUT_TICKS, SOCK_MIN_RCVBUF, SOCK_MIN_SNDBUF,
@@ -91,6 +93,36 @@ impl PacketSocket {
                 let timeout = self.socket_timeout_ticks(name)?;
                 let ticks = parse_timeval_ticks(val)?.unwrap_or(INFINITE_TIMEOUT_TICKS);
                 timeout.store(ticks, Ordering::Relaxed);
+                Ok(())
+            }
+            Ok(PSO::ATTACH_FILTER) => {
+                // SO_LOCK_FILTER 后不可修改
+                if self.filter_locked.load(Ordering::Acquire) {
+                    return Err(SystemError::EINVAL);
+                }
+                // 从 optval 解析 sock_fprog + 读取 filter 指令
+                let insns = classic::read_sock_fprog(val)?;
+                // 通用 cBPF 验证
+                validate_cbpf(&insns)?;
+                // 先 store filter，再置 has_filter=true（Release 序确保可见性）
+                self.filter.store_deferred(Arc::new(insns));
+                self.has_filter.store(true, Ordering::Release);
+                Ok(())
+            }
+            Ok(PSO::DETACH_FILTER) => {
+                if self.filter_locked.load(Ordering::Acquire) {
+                    return Err(SystemError::EINVAL);
+                }
+                // Linux：未安装 filter 时返回 ENOENT
+                if !self.has_filter.swap(false, Ordering::AcqRel) {
+                    return Err(SystemError::ENOENT);
+                }
+                self.filter.store_deferred(Arc::new(alloc::vec![]));
+                Ok(())
+            }
+            Ok(PSO::LOCK_FILTER) => {
+                // 不可逆：一旦锁定不可解锁（Linux 语义）
+                self.filter_locked.store(true, Ordering::Release);
                 Ok(())
             }
             _ => Err(SystemError::ENOPROTOOPT),

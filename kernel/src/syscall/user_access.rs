@@ -121,16 +121,23 @@ fn prefault_user_range(addr: VirtAddr, len: usize, write: bool) -> Result<(), Sy
                 );
                 PageFaultHandler::handle_mm_fault(message)
             };
-            if fault.contains(VmFaultReason::VM_FAULT_OOM) {
+            if fault.reason.contains(VmFaultReason::VM_FAULT_OOM) {
                 return Err(SystemError::ENOMEM);
             }
-            if fault.intersects(
+            if fault.reason.contains(VmFaultReason::VM_FAULT_RETRY) {
+                let wait = fault.retry_wait;
+                drop(space_guard);
+                if let Some(wait) = wait {
+                    wait.wait().map_err(|_| SystemError::EFAULT)?;
+                }
+                continue;
+            }
+            if fault.reason.intersects(
                 VmFaultReason::VM_FAULT_SIGBUS
                     | VmFaultReason::VM_FAULT_SIGSEGV
                     | VmFaultReason::VM_FAULT_HWPOISON
                     | VmFaultReason::VM_FAULT_HWPOISON_LARGE
-                    | VmFaultReason::VM_FAULT_FALLBACK
-                    | VmFaultReason::VM_FAULT_RETRY,
+                    | VmFaultReason::VM_FAULT_FALLBACK,
             ) {
                 return Err(SystemError::EFAULT);
             }

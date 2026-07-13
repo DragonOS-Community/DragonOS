@@ -639,6 +639,11 @@ impl AddressSpace {
                 vm_flags |= VmFlags::VM_MAYWRITE;
             }
 
+            vm_flags = match vma_file.inode().mmap_vm_flags(&vma_file, vm_flags) {
+                Ok(flags) => flags,
+                Err(err) => map_fail!(err),
+            };
+
             if vm_flags.contains(VmFlags::VM_LOCKED) {
                 let error = if map_flags.contains(MapFlags::MAP_LOCKED)
                     && !InnerAddressSpace::has_mlock_quota()

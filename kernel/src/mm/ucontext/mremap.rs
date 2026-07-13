@@ -410,11 +410,12 @@ impl InnerAddressSpace {
                     unsafe { flush.ignore() };
                     tlb.accumulate_range(dst);
                     installed_target_pte = true;
-                    installed_target_present_pages += 1;
-                    page_manager_guard
-                        .get_unwrap(&paddr)
-                        .write()
-                        .insert_vma(new_vma.clone(), locked_source);
+                    if let PresentPfn::Managed(page) =
+                        LockedVMA::classify_present_pfn(&mut page_manager_guard, paddr, vm_flags)
+                    {
+                        installed_target_present_pages += 1;
+                        page.write().insert_vma(new_vma.clone(), locked_source);
+                    }
 
                     migrated.push((src, dst, paddr, src_flags));
                 }
@@ -453,14 +454,16 @@ impl InnerAddressSpace {
                     {
                         unsafe { flush.ignore() };
                         tlb.accumulate_range(src);
-                        removed_source_present_pages += 1;
                     } else {
                         panic!("mremap commit lost expected source PTE at {:?}", src);
                     }
 
-                    let page = page_manager_guard.get_unwrap(&paddr);
-                    let mut pg = page.write();
-                    pg.remove_vma(old_vma.as_ref());
+                    if let PresentPfn::Managed(page) =
+                        LockedVMA::classify_present_pfn(&mut page_manager_guard, paddr, vm_flags)
+                    {
+                        removed_source_present_pages += 1;
+                        page.write().remove_vma(old_vma.as_ref());
+                    }
                 }
             }
         }

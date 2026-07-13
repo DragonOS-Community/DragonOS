@@ -471,6 +471,12 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         Ok(())
     }
 
+    /// Allow a filesystem to add internal VMA flags after VFS permission
+    /// checks derived the user-visible protection and sharing flags.
+    fn mmap_vm_flags(&self, _file: &Arc<File>, vm_flags: VmFlags) -> Result<VmFlags, SystemError> {
+        Ok(vm_flags)
+    }
+
     fn mmap_effective_file(&self, file: &Arc<File>) -> Result<Arc<File>, SystemError> {
         Ok(file.clone())
     }

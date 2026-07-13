@@ -41,7 +41,7 @@ use crate::{
     },
     mm::{
         mmu_gather::MmuGather,
-        page::{page_manager_lock, page_reclaimer_lock},
+        page::{page_manager_lock, page_reclaimer_lock, PageManager},
         PhysAddr,
     },
     process::{
@@ -117,4 +117,6 @@ pub use inner::InnerAddressSpace;
 pub use mapper::UserMapper;
 pub use stack::UserStack;
 #[allow(unused_imports)]
-pub use vma::{AnonSharedMapping, LockedVMA, PhysmapParams, Provider, VMASplitResult, VMA};
+pub use vma::{
+    AnonSharedMapping, LockedVMA, PhysmapParams, PresentPfn, Provider, VMASplitResult, VMA,
+};

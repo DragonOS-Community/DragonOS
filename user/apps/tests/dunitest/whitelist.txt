@@ -6,6 +6,7 @@ normal/fdatasync
 normal/getrandom_bit_distribution
 normal/ext4_xattr
 normal/ext4_inode_identity
+normal/fat_statfs
 normal/fallocate_semantics
 normal/syncfs_semantics
 normal/fcntl_lock

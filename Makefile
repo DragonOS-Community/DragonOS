@@ -215,6 +215,10 @@ endif
 virtiofsd:
 	sh -c "cd tools/virtiofs && bash start_virtiofsd.sh && cd ../.."
 
+.PHONY: virtiofs-dax-preflight
+virtiofs-dax-preflight:
+	bash tools/virtiofs/virtiofs_dax_preflight.sh
+
 # 不编译，直接以nographic方式启动QEMU，并启用virtiofs设备
 .PHONY: qemu-virtiofs-nographic
 qemu-virtiofs-nographic: check_arch

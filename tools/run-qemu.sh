@@ -18,22 +18,22 @@
 # - DRAGONOS_VIRTIOFS_ENV_FILE: virtiofs配置文件路径（默认 ${ROOT_PATH}/tools/virtiofs/env.sh）
 # - DRAGONOS_VIRTIOFS_QUEUE_SIZE: (optional) queue-size passed to vhost-user-fs-pci
 # - DRAGONOS_VIRTIOFS_NUM_REQUEST_QUEUES: (optional) num-request-queues passed to vhost-user-fs-pci
+# - DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE: DAX cache aperture in bytes; requires a preflight stamp
+# - DRAGONOS_VIRTIOFS_DAX_REQUIRED: fail rather than silently boot without a DAX cache
 #
 
 check_dependencies()
 {
-    # Check if qemu is installed
-    if [ -z "$(which qemu-system-x86_64)" ]; then
-        echo "Please install qemu first!"
-        exit 1
-    fi
-
-    if [ -z "$(which ${QEMU})" ]; then
+    # Check the selected QEMU, including a DAX-patched binary from env.sh.
+    if [ -z "${QEMU}" ] || [ ! -x "${QEMU}" ]; then
       if [ "$ARCH" == "loongarch64" ]; then
         echo -e "\nPlease install qemu-system-loongarch64 first!"
         echo -e "\nYou can install it by running:  (if you are using ubuntu)"
         echo -e "    ${ROOT_PATH}/tools/qemu/build-qemu-la64-for-ubuntu.sh"
         echo -e ""
+        exit 1
+      else
+        echo "Please install qemu-system-${ARCH} or configure an executable DRAGONOS_VIRTIOFS_QEMU_BIN"
         exit 1
       fi
     fi
@@ -127,12 +127,20 @@ QEMU_NVDIMM_SLOTS="${QEMU_NVDIMM_SLOTS:-4}"
 QEMU_NVDIMM_MAXMEM="${QEMU_NVDIMM_MAXMEM:-4G}"
 PMEM_ENABLED=false
 PMEM_QEMU_ARGS=()
+DRAGONOS_VIRTIOFS_DAX_QEMU_OVERRIDE=${DRAGONOS_VIRTIOFS_QEMU_BIN:-}
+DRAGONOS_VIRTIOFS_DAX_CACHE_OVERRIDE=${DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE:-}
+DRAGONOS_VIRTIOFS_DAX_STAMP_OVERRIDE=${DRAGONOS_VIRTIOFS_DAX_PREFLIGHT_STAMP:-}
+DRAGONOS_VIRTIOFS_DAX_REQUIRED_OVERRIDE=${DRAGONOS_VIRTIOFS_DAX_REQUIRED:-}
+DRAGONOS_VIRTIOFS_BACKEND_ATTESTATION_OVERRIDE=${DRAGONOS_VIRTIOFS_BACKEND_ATTESTATION:-}
 DRAGONOS_VIRTIOFS_ENABLE=${DRAGONOS_VIRTIOFS_ENABLE:=0}
 DRAGONOS_VIRTIOFS_SOCKET=${DRAGONOS_VIRTIOFS_SOCKET:=/tmp/dragonos-virtiofsd.sock}
 DRAGONOS_VIRTIOFS_TAG=${DRAGONOS_VIRTIOFS_TAG:=hostshare}
 DRAGONOS_VIRTIOFS_ENV_FILE=${DRAGONOS_VIRTIOFS_ENV_FILE:=}
 DRAGONOS_VIRTIOFS_QUEUE_SIZE=${DRAGONOS_VIRTIOFS_QUEUE_SIZE:=}
 DRAGONOS_VIRTIOFS_NUM_REQUEST_QUEUES=${DRAGONOS_VIRTIOFS_NUM_REQUEST_QUEUES:=}
+DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE=${DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE:=}
+DRAGONOS_VIRTIOFS_DAX_REQUIRED=${DRAGONOS_VIRTIOFS_DAX_REQUIRED:=0}
+DRAGONOS_VIRTIOFS_DAX_PREFLIGHT_STAMP=${DRAGONOS_VIRTIOFS_DAX_PREFLIGHT_STAMP:=}
 
 # 检查必要的环境变量
 if [ -z "${ROOT_PATH}" ]; then
@@ -141,6 +149,41 @@ if [ -z "${ROOT_PATH}" ]; then
     exit 1
 fi
 PMEM_IMAGE_PATH="${PMEM_IMAGE_PATH:-${ROOT_PATH}/bin/pmem.img}"
+
+# Load virtiofs configuration before dependency and device-model checks so a
+# DAX-patched QEMU selected by env.sh is the binary validated and launched.
+if [ "${DRAGONOS_VIRTIOFS_ENABLE}" == "1" ]; then
+    if [ -z "${DRAGONOS_VIRTIOFS_ENV_FILE}" ]; then
+        DRAGONOS_VIRTIOFS_ENV_FILE="${ROOT_PATH}/tools/virtiofs/env.sh"
+    fi
+    if [ -f "${DRAGONOS_VIRTIOFS_ENV_FILE}" ]; then
+        # shellcheck source=/dev/null
+        . "${DRAGONOS_VIRTIOFS_ENV_FILE}"
+        [ -z "${DRAGONOS_VIRTIOFS_DAX_QEMU_OVERRIDE}" ] || \
+            DRAGONOS_VIRTIOFS_QEMU_BIN="${DRAGONOS_VIRTIOFS_DAX_QEMU_OVERRIDE}"
+        [ -z "${DRAGONOS_VIRTIOFS_DAX_CACHE_OVERRIDE}" ] || \
+            DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE="${DRAGONOS_VIRTIOFS_DAX_CACHE_OVERRIDE}"
+        [ -z "${DRAGONOS_VIRTIOFS_DAX_STAMP_OVERRIDE}" ] || \
+            DRAGONOS_VIRTIOFS_DAX_PREFLIGHT_STAMP="${DRAGONOS_VIRTIOFS_DAX_STAMP_OVERRIDE}"
+        [ -z "${DRAGONOS_VIRTIOFS_DAX_REQUIRED_OVERRIDE}" ] || \
+            DRAGONOS_VIRTIOFS_DAX_REQUIRED="${DRAGONOS_VIRTIOFS_DAX_REQUIRED_OVERRIDE}"
+        [ -z "${DRAGONOS_VIRTIOFS_BACKEND_ATTESTATION_OVERRIDE}" ] || \
+            DRAGONOS_VIRTIOFS_BACKEND_ATTESTATION="${DRAGONOS_VIRTIOFS_BACKEND_ATTESTATION_OVERRIDE}"
+        if [ "${DRAGONOS_VIRTIOFS_SOCKET}" = "/tmp/dragonos-virtiofsd.sock" ] && [ -n "${SOCKET_PATH:-}" ]; then
+            DRAGONOS_VIRTIOFS_SOCKET="${SOCKET_PATH}"
+        fi
+        if [ "${DRAGONOS_VIRTIOFS_TAG}" = "hostshare" ] && [ -n "${VIRTIOFS_TAG:-}" ]; then
+            DRAGONOS_VIRTIOFS_TAG="${VIRTIOFS_TAG}"
+        fi
+    fi
+    if [ -n "${DRAGONOS_VIRTIOFS_QEMU_BIN:-}" ]; then
+        if [ ! -x "${DRAGONOS_VIRTIOFS_QEMU_BIN}" ]; then
+            echo "[ERROR] DRAGONOS_VIRTIOFS_QEMU_BIN is not executable"
+            exit 1
+        fi
+        QEMU="${DRAGONOS_VIRTIOFS_QEMU_BIN}"
+    fi
+fi
 
 # 状态文件目录（优先使用环境变量，否则使用默认值）
 VMSTATE_DIR="${VMSTATE_DIR:-${ROOT_PATH}/bin/vmstate}"
@@ -539,21 +582,6 @@ if [ "${DRAGONOS_VIRTIOFS_ENABLE}" == "1" ]; then
         exit 1
     fi
 
-    if [ -z "${DRAGONOS_VIRTIOFS_ENV_FILE}" ]; then
-        DRAGONOS_VIRTIOFS_ENV_FILE="${ROOT_PATH}/tools/virtiofs/env.sh"
-    fi
-
-    if [ -f "${DRAGONOS_VIRTIOFS_ENV_FILE}" ]; then
-        # shellcheck source=/dev/null
-        . "${DRAGONOS_VIRTIOFS_ENV_FILE}"
-        if [ "${DRAGONOS_VIRTIOFS_SOCKET}" = "/tmp/dragonos-virtiofsd.sock" ] && [ -n "${SOCKET_PATH:-}" ]; then
-            DRAGONOS_VIRTIOFS_SOCKET="${SOCKET_PATH}"
-        fi
-        if [ "${DRAGONOS_VIRTIOFS_TAG}" = "hostshare" ] && [ -n "${VIRTIOFS_TAG:-}" ]; then
-            DRAGONOS_VIRTIOFS_TAG="${VIRTIOFS_TAG}"
-        fi
-    fi
-
     if [ ! -S "${DRAGONOS_VIRTIOFS_SOCKET}" ]; then
         echo "[错误] 未检测到virtiofsd socket: ${DRAGONOS_VIRTIOFS_SOCKET}"
         echo "[提示] 请先在另一个终端启动: tools/virtiofs/start_virtiofsd.sh"
@@ -561,6 +589,80 @@ if [ "${DRAGONOS_VIRTIOFS_ENABLE}" == "1" ]; then
     fi
 
     virtiofs_device_opts="vhost-user-fs-pci,chardev=char_virtiofs,tag=${DRAGONOS_VIRTIOFS_TAG}"
+    if is_truthy "${DRAGONOS_VIRTIOFS_DAX_REQUIRED}" && [ -z "${DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE}" ]; then
+        echo "[ERROR] DAX is required but DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE is unset"
+        exit 1
+    fi
+    if [ -n "${DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE}" ]; then
+        if ! [[ "${DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE}" =~ ^[0-9]+$ ]] || \
+           [ "${DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE}" -lt 2097152 ] || \
+           [ $((DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE & (DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE - 1))) -ne 0 ]; then
+            echo "[ERROR] DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE must be a power-of-two byte count >= 2 MiB"
+            exit 1
+        fi
+
+        if [ -z "${DRAGONOS_VIRTIOFS_DAX_PREFLIGHT_STAMP}" ]; then
+            DRAGONOS_VIRTIOFS_DAX_PREFLIGHT_STAMP="${RUNTIME_DIR:-${ROOT_PATH}/bin/virtiofs-runtime}/dax-preflight.stamp"
+        fi
+        if [ ! -r "${DRAGONOS_VIRTIOFS_DAX_PREFLIGHT_STAMP}" ]; then
+            echo "[ERROR] missing DAX preflight stamp: ${DRAGONOS_VIRTIOFS_DAX_PREFLIGHT_STAMP}"
+            echo "[HINT] run make virtiofs-dax-preflight with the same env.sh"
+            exit 1
+        fi
+
+        stamp_qemu_sha="$(awk -F= '$1 == "QEMU_SHA256" { print $2 }' "${DRAGONOS_VIRTIOFS_DAX_PREFLIGHT_STAMP}")"
+        stamp_virtiofsd_sha="$(awk -F= '$1 == "VIRTIOFSD_SHA256" { print $2 }' "${DRAGONOS_VIRTIOFS_DAX_PREFLIGHT_STAMP}")"
+        stamp_config_sha="$(awk -F= '$1 == "CONFIG_SHA256" { print $2 }' "${DRAGONOS_VIRTIOFS_DAX_PREFLIGHT_STAMP}")"
+        stamp_cache_size="$(awk -F= '$1 == "CACHE_SIZE" { print $2 }' "${DRAGONOS_VIRTIOFS_DAX_PREFLIGHT_STAMP}")"
+        stamp_correctness_profile="$(awk -F= '$1 == "CORRECTNESS_PROFILE" { print $2 }' "${DRAGONOS_VIRTIOFS_DAX_PREFLIGHT_STAMP}")"
+        if [ "${DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE}" -le 8589934592 ]; then
+            current_correctness_profile=1
+        else
+            current_correctness_profile=0
+        fi
+        # shellcheck source=virtiofs/common.sh
+        . "${ROOT_PATH}/tools/virtiofs/common.sh"
+        current_virtiofsd="$(virtiofs_detect_daemon || true)"
+        if [ -z "${current_virtiofsd}" ]; then
+            echo "[ERROR] unable to identify the configured virtiofsd binary"
+            exit 1
+        fi
+        current_qemu_sha="$(sha256sum "${QEMU}" | awk '{print $1}')"
+        current_virtiofsd_sha="$(sha256sum "${current_virtiofsd}" | awk '{print $1}')"
+        current_config_sha="$(printf '%s\0%s\0%s\0' "${VIRTIOFSD_CACHE:-}" \
+          "${VIRTIOFSD_EXTRA_ARGS:-}" \
+          "cache-size=${DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE},modern-pio-notify=off" | \
+          sha256sum | awk '{print $1}')"
+        if [ "${stamp_cache_size}" != "${DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE}" ] || \
+           [ "${stamp_qemu_sha}" != "${current_qemu_sha}" ] || \
+           [ "${stamp_virtiofsd_sha}" != "${current_virtiofsd_sha}" ] || \
+           [ "${stamp_config_sha}" != "${current_config_sha}" ] || \
+           [ "${stamp_correctness_profile}" != "${current_correctness_profile}" ]; then
+            echo "[ERROR] DAX preflight stamp does not match the current binaries and configuration"
+            exit 1
+        fi
+        if is_truthy "${DRAGONOS_VIRTIOFS_DAX_REQUIRED}" && [ "${current_correctness_profile}" != "1" ]; then
+            echo "[ERROR] DAX required correctness runs support at most 4096 cache ranges (8 GiB)"
+            exit 1
+        fi
+
+        backend_attestation="${DRAGONOS_VIRTIOFS_BACKEND_ATTESTATION:-${RUNTIME_DIR:-${ROOT_PATH}/bin/virtiofs-runtime}/virtiofsd.attestation}"
+        if [ ! -e "${backend_attestation}" ]; then
+            echo "[ERROR] missing live virtiofsd attestation: ${backend_attestation}"
+            echo "[HINT] restart tools/virtiofs/start_virtiofsd.sh with the same env.sh"
+            exit 1
+        fi
+        virtiofs_build_daemon_command "${current_virtiofsd}" "${DRAGONOS_VIRTIOFS_SOCKET}" \
+          "${HOST_SHARE_DIR}" "${VIRTIOFSD_CACHE:-auto}" "${VIRTIOFSD_EXTRA_ARGS:-}"
+        live_command_sha="$(virtiofs_command_sha256)"
+        if ! sudo bash "${ROOT_PATH}/tools/virtiofs/verify_backend_attestation.sh" \
+          "${backend_attestation}" "${DRAGONOS_VIRTIOFS_SOCKET}" \
+          "${current_virtiofsd_sha}" "${live_command_sha}"; then
+            echo "[ERROR] live virtiofsd process/socket does not match the DAX configuration"
+            exit 1
+        fi
+        virtiofs_device_opts="${virtiofs_device_opts},cache-size=${DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE},modern-pio-notify=off"
+    fi
     if [ -n "${DRAGONOS_VIRTIOFS_QUEUE_SIZE}" ]; then
         if ! [[ "${DRAGONOS_VIRTIOFS_QUEUE_SIZE}" =~ ^[0-9]+$ ]] || [ "${DRAGONOS_VIRTIOFS_QUEUE_SIZE}" -eq 0 ]; then
             echo "[ERROR] DRAGONOS_VIRTIOFS_QUEUE_SIZE must be a positive integer"
@@ -580,7 +682,7 @@ if [ "${DRAGONOS_VIRTIOFS_ENABLE}" == "1" ]; then
         virtiofs_device_opts="${virtiofs_device_opts},num-request-queues=${DRAGONOS_VIRTIOFS_NUM_REQUEST_QUEUES}"
     fi
 
-    echo "[INFO] Enabling virtiofs: tag=${DRAGONOS_VIRTIOFS_TAG}, socket=${DRAGONOS_VIRTIOFS_SOCKET}, queue_size=${DRAGONOS_VIRTIOFS_QUEUE_SIZE:-qemu-default}, request_queues=${DRAGONOS_VIRTIOFS_NUM_REQUEST_QUEUES:-qemu-default}"
+    echo "[INFO] Enabling virtiofs: tag=${DRAGONOS_VIRTIOFS_TAG}, socket=${DRAGONOS_VIRTIOFS_SOCKET}, queue_size=${DRAGONOS_VIRTIOFS_QUEUE_SIZE:-qemu-default}, request_queues=${DRAGONOS_VIRTIOFS_NUM_REQUEST_QUEUES:-qemu-default}, dax_cache=${DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE:-disabled}"
 
     QEMU_OBJECT_ARGS+=(
       -object "memory-backend-memfd,id=mem,size=${QEMU_MEMORY},share=on"

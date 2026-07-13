@@ -109,6 +109,10 @@ pub struct VirtioFsStatsSnapshot {
     pub bridge_queue_full_retry_success_total: u64,
     pub hiprio_queue_full_total: u64,
     pub request_queue_full_total: u64,
+    pub dax_mapping_created_total: u64,
+    pub dax_mapping_removed_total: u64,
+    pub dax_pressure_reclaims_total: u64,
+    pub dax_device_resets_total: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,6 +345,12 @@ static BRIDGE_QUEUE_FULL_RETRY_AFTER_COMPLETION_TOTAL: AtomicU64 = AtomicU64::ne
 static BRIDGE_QUEUE_FULL_RETRY_SUCCESS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static HIPRIO_QUEUE_FULL_TOTAL: AtomicU64 = AtomicU64::new(0);
 static REQUEST_QUEUE_FULL_TOTAL: AtomicU64 = AtomicU64::new(0);
+// DAX lifecycle events are always enabled. They occur only on mapping, pressure-reclaim,
+// and reset transitions, so they do not add atomic RMWs to the per-byte I/O hot path.
+static DAX_MAPPING_CREATED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DAX_MAPPING_REMOVED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DAX_PRESSURE_RECLAIMS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DAX_DEVICE_RESETS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 fn add(counter: &AtomicU64, value: u64) {
@@ -838,6 +848,26 @@ pub fn on_virtiofs_fail_unfinished(count: usize) {
     add(&BRIDGE_FAIL_UNFINISHED_TOTAL, count as u64);
 }
 
+#[inline]
+pub fn on_virtiofs_dax_mapping_created() {
+    inc(&DAX_MAPPING_CREATED_TOTAL);
+}
+
+#[inline]
+pub fn on_virtiofs_dax_mapping_removed() {
+    inc(&DAX_MAPPING_REMOVED_TOTAL);
+}
+
+#[inline]
+pub fn on_virtiofs_dax_pressure_reclaim() {
+    inc(&DAX_PRESSURE_RECLAIMS_TOTAL);
+}
+
+#[inline]
+pub fn on_virtiofs_dax_device_reset() {
+    inc(&DAX_DEVICE_RESETS_TOTAL);
+}
+
 pub fn fuse_snapshot() -> FuseStatsSnapshot {
     FuseStatsSnapshot {
         requests_queued_total: REQUESTS_QUEUED_TOTAL.load(Ordering::Relaxed),
@@ -948,6 +978,10 @@ pub fn virtiofs_snapshot() -> VirtioFsStatsSnapshot {
             .load(Ordering::Relaxed),
         hiprio_queue_full_total: HIPRIO_QUEUE_FULL_TOTAL.load(Ordering::Relaxed),
         request_queue_full_total: REQUEST_QUEUE_FULL_TOTAL.load(Ordering::Relaxed),
+        dax_mapping_created_total: DAX_MAPPING_CREATED_TOTAL.load(Ordering::Relaxed),
+        dax_mapping_removed_total: DAX_MAPPING_REMOVED_TOTAL.load(Ordering::Relaxed),
+        dax_pressure_reclaims_total: DAX_PRESSURE_RECLAIMS_TOTAL.load(Ordering::Relaxed),
+        dax_device_resets_total: DAX_DEVICE_RESETS_TOTAL.load(Ordering::Relaxed),
     }
 }
 
@@ -1058,7 +1092,11 @@ bridge_queue_full_retry_total {}\n\
 bridge_queue_full_retry_after_completion_total {}\n\
 bridge_queue_full_retry_success_total {}\n\
 hiprio_queue_full_total {}\n\
-request_queue_full_total {}\n",
+request_queue_full_total {}\n\
+dax_mapping_created_total {}\n\
+dax_mapping_removed_total {}\n\
+dax_pressure_reclaims_total {}\n\
+dax_device_resets_total {}\n",
         fuse.requests_queued_total,
         fuse.requests_dequeued_total,
         fuse.requests_replied_ok_total,
@@ -1157,6 +1195,10 @@ request_queue_full_total {}\n",
         virtiofs.bridge_queue_full_retry_success_total,
         virtiofs.hiprio_queue_full_total,
         virtiofs.request_queue_full_total,
+        virtiofs.dax_mapping_created_total,
+        virtiofs.dax_mapping_removed_total,
+        virtiofs.dax_pressure_reclaims_total,
+        virtiofs.dax_device_resets_total,
     );
 
     writeln!(

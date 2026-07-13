@@ -26,6 +26,7 @@ struct Options {
     std::string mount;
     std::string tag = "hostshare";
     std::string mount_options;
+    std::string expect_dax;
     std::string workload = "all";
     size_t files = 256;
     size_t file_size = 4 * 1024 * 1024;
@@ -198,6 +199,36 @@ bool validate_zero_copy_metrics(const char* workload, const StatsMap& before,
     return true;
 }
 
+bool is_dax_data_workload(const char* workload) {
+    return strcmp(workload, "sequential") == 0 || strcmp(workload, "random_read") == 0 ||
+           strcmp(workload, "mmap") == 0 || strcmp(workload, "concurrent") == 0;
+}
+
+bool validate_dax_metrics(const char* workload, const Options& opt, const StatsMap& before,
+                          const StatsMap& after) {
+    if (opt.expect_dax.empty() || !is_dax_data_workload(workload)) {
+        return true;
+    }
+
+    long long setup_requests = 0;
+    long long mappings_created = 0;
+    bool present = stats_delta(before, after, "virtiofs_opcode.opcode_48_requests_total",
+                               &setup_requests) &&
+                   stats_delta(before, after, "virtiofs.dax_mapping_created_total",
+                               &mappings_created);
+    bool expected = opt.expect_dax == "always";
+    bool passed = present && (expected ? setup_requests > 0 && mappings_created > 0
+                                       : setup_requests == 0 && mappings_created == 0);
+    if (!passed) {
+        fprintf(stderr,
+                "dax_assert workload=%s status=fail expectation=%s present=%d "
+                "setup_requests=%lld mappings_created=%lld\n",
+                workload, opt.expect_dax.c_str(), present ? 1 : 0, setup_requests,
+                mappings_created);
+    }
+    return passed;
+}
+
 bool write_full(int fd, const void* data, size_t len) {
     const char* p = static_cast<const char*>(data);
     while (len > 0) {
@@ -252,13 +283,14 @@ void emit_result(const char* workload, const Options& opt, uint64_t elapsed_us, 
     uname(&uts);
     printf("result workload=%s status=%s errno=%d elapsed_us=%llu bytes=%llu ops=%llu "
            "mount=%s files=%zu file_size=%zu block_size=%zu iterations=%zu workers=%zu "
-           "cache_mode=%s mount_options=%s sysname=%s release=%s\n",
+           "cache_mode=%s mount_options=%s expect_dax=%s sysname=%s release=%s\n",
            workload, err == 0 ? "ok" : "fail", err,
            static_cast<unsigned long long>(elapsed_us),
            static_cast<unsigned long long>(bytes),
            static_cast<unsigned long long>(ops), opt.mount.c_str(), opt.files, opt.file_size,
            opt.block_size, opt.iterations, opt.workers, env_or_empty("VIRTIOFS_BENCH_CACHE_MODE"),
-           result_mount_options(opt), uts.sysname, uts.release);
+           result_mount_options(opt), opt.expect_dax.empty() ? "unspecified" : opt.expect_dax.c_str(),
+           uts.sysname, uts.release);
 }
 
 int ensure_dir(const std::string& path) {
@@ -606,7 +638,8 @@ int concurrent_workload(const Options& opt, const std::string& root) {
 void usage(const char* argv0) {
     fprintf(stderr,
             "usage: %s --mount PATH [--workload all|metadata|readdir|sequential|random_read|mmap|concurrent] "
-            "[--files N] [--file-size N] [--block-size N] [--iterations N] [--workers N]\n",
+            "[--expect-dax always|never] [--files N] [--file-size N] [--block-size N] "
+            "[--iterations N] [--workers N]\n",
             argv0);
     fprintf(stderr,
             "       %s [--tag hostshare] [--mount-options OPTIONS] [workload options...]\n",
@@ -625,6 +658,17 @@ bool parse_size(const char* s, size_t* out) {
     }
     *out = static_cast<size_t>(v);
     return true;
+}
+
+bool mount_options_contain(const std::string& options, const std::string& expected) {
+    std::istringstream stream(options);
+    std::string option;
+    while (std::getline(stream, option, ',')) {
+        if (option == expected) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool parse_args(int argc, char** argv, Options* opt) {
@@ -648,6 +692,10 @@ bool parse_args(int argc, char** argv, Options* opt) {
             const char* v = need(argv[i]);
             if (!v) return false;
             opt->mount_options = v;
+        } else if (strcmp(argv[i], "--expect-dax") == 0) {
+            const char* v = need(argv[i]);
+            if (!v) return false;
+            opt->expect_dax = v;
         } else if (strcmp(argv[i], "--workload") == 0) {
             const char* v = need(argv[i]);
             if (!v) return false;
@@ -680,6 +728,27 @@ bool parse_args(int argc, char** argv, Options* opt) {
     }
     if (opt->tag.empty()) {
         fprintf(stderr, "--tag must not be empty\n");
+        return false;
+    }
+    if (!opt->expect_dax.empty() && opt->expect_dax != "always" &&
+        opt->expect_dax != "never") {
+        fprintf(stderr, "--expect-dax must be always or never\n");
+        return false;
+    }
+    if (!opt->expect_dax.empty() && opt->workload != "all" &&
+        !is_dax_data_workload(opt->workload.c_str())) {
+        fprintf(stderr, "--expect-dax requires all or a data workload\n");
+        return false;
+    }
+    if (!opt->expect_dax.empty() && stats_path().empty()) {
+        fprintf(stderr, "--expect-dax requires VIRTIOFS_STATS_PATH\n");
+        return false;
+    }
+    if (!opt->expect_dax.empty() && opt->mount.empty() &&
+        !mount_options_contain(opt->mount_options, "dax=" + opt->expect_dax)) {
+        fprintf(stderr,
+                "automatic mounts with --expect-dax require matching dax=always|never in "
+                "--mount-options\n");
         return false;
     }
     return opt->file_size != 0 && opt->block_size != 0 && opt->workers != 0;
@@ -740,9 +809,14 @@ int run_with_stats_delta(const char* name, int (*workload)(const Options&, const
     int rc = workload(opt, root);
     StatsMap after = read_stats();
     emit_stats_delta(name, before, after);
-    if (rc == 0 && verify_stats &&
-        (!validate_zero_copy_metrics(name, before, after) || after.empty())) {
-        return -1;
+    if (rc == 0 && verify_stats) {
+        bool skip_read_transport_assert =
+            opt.expect_dax == "always" && is_dax_data_workload(name);
+        if (after.empty() ||
+            (!skip_read_transport_assert && !validate_zero_copy_metrics(name, before, after)) ||
+            !validate_dax_metrics(name, opt, before, after)) {
+            return -1;
+        }
     }
     return rc;
 }

@@ -385,11 +385,10 @@ impl FuseNode {
                 writable: AtomicBool::new(writable),
                 token,
             });
-            if let Err(error) = allocator.get(&mapping.token) {
-                // The daemon mapping exists but cannot safely be published locally.
-                // Retain its allocator ownership; teardown will retire the connection range.
-                return Err(error);
-            }
+            // The daemon mapping exists but cannot safely be published locally
+            // without the access reference. Retain allocator ownership on error;
+            // teardown will retire the connection range.
+            allocator.get(&mapping.token)?;
             tree.bump_sequence()?;
             tree.mappings.insert(file_offset, mapping.clone());
             drop(tree);

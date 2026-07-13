@@ -8,11 +8,11 @@ use log::error;
 use system_error::SystemError;
 
 use super::{
-    append_lock::with_inode_append_lock,
+    append_lock::{with_inode_append_lock, AppendLockKey},
     inode_lifecycle::{InodeRetentionGuard, InodeRetentionKind},
     mount::{MountExternalGuard, MountFSInode},
     utils::should_remove_sgid,
-    FileType, IndexNode, InodeId, Metadata, SetMetadataMask, SpecialNodeData,
+    FileSystem, FileType, IndexNode, InodeId, Metadata, SetMetadataMask, SpecialNodeData,
 };
 use crate::{arch::ipc::signal::Signal, filesystem::vfs::InodeFlags, process::pid::PidPrivateData};
 use crate::{
@@ -75,11 +75,30 @@ fn alloc_lock_owner_id() -> usize {
     NEXT_LOCK_OWNER_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-fn canonical_inode_for_posix_lock(mut inode: Arc<dyn IndexNode>) -> Arc<dyn IndexNode> {
+fn canonical_inode_for_file_lock(mut inode: Arc<dyn IndexNode>) -> Arc<dyn IndexNode> {
     loop {
         match inode.clone().downcast_arc::<MountFSInode>() {
             Some(mnt_inode) => inode = mnt_inode.underlying_inode(),
             None => return inode,
+        }
+    }
+}
+
+/// Cached append-lock identity and the owner that keeps its allocation
+/// identity alive. Keeping these fields together prevents callers from
+/// copying a raw filesystem address without also retaining the filesystem.
+#[derive(Clone, Debug)]
+struct AppendLockIdentity {
+    key: AppendLockKey,
+    _fs_owner: Arc<dyn FileSystem>,
+}
+
+impl AppendLockIdentity {
+    fn new(fs_owner: Arc<dyn FileSystem>, metadata: &Metadata) -> Self {
+        let fs_instance = Arc::as_ptr(&fs_owner) as *const () as usize;
+        Self {
+            key: AppendLockKey::new(fs_instance, metadata.dev_id, metadata.inode_id),
+            _fs_owner: fs_owner,
         }
     }
 }
@@ -519,6 +538,9 @@ pub struct File {
     /// Stable key for POSIX record locks. Cached at open time to avoid metadata fetch
     /// in close/drop_fd path (which can deadlock with user-space FUSE daemon).
     posix_lock_key: (usize, InodeId),
+    /// Stable internal identity for serializing atomic append operations.
+    /// Only regular, non-O_PATH files retain one.
+    append_lock_identity: Option<AppendLockIdentity>,
     /// 预读状态
     ra_state: Mutex<FileReadaheadState>,
     /// 当前 open file description 已观测到的 page cache 写回错误序列。
@@ -848,12 +870,19 @@ impl File {
             flags.insert(FileFlags::O_APPEND);
         }
 
-        let canonical_inode = canonical_inode_for_posix_lock(inode.clone());
-        let posix_lock_key = if Arc::ptr_eq(&canonical_inode, &inode) {
-            (metadata.dev_id, metadata.inode_id)
+        let canonical_inode = canonical_inode_for_file_lock(inode.clone());
+        let canonical_metadata = if Arc::ptr_eq(&canonical_inode, &inode) {
+            metadata.clone()
         } else {
-            let lock_md = canonical_inode.metadata()?;
-            (lock_md.dev_id, lock_md.inode_id)
+            canonical_inode.metadata()?
+        };
+        let posix_lock_key = (canonical_metadata.dev_id, canonical_metadata.inode_id);
+        let append_lock_identity = if file_type == FileType::File && !is_path {
+            canonical_inode
+                .append_lock_fs()
+                .map(|fs| AppendLockIdentity::new(fs, &canonical_metadata))
+        } else {
+            None
         };
 
         // O_CLOEXEC 是 per-fd 属性，由 alloc_fd/alloc_fd_arc 的 cloexec 参数控制，
@@ -930,6 +959,7 @@ impl File {
             cred: ProcessManager::current_pcb().cred(),
             owner: Mutex::new(FileOwner::new()),
             posix_lock_key,
+            append_lock_identity,
             ra_state: Mutex::new(FileReadaheadState::new()),
             wb_error_seq: Mutex::new(wb_error_seq),
             sb_error_seq: Mutex::new(sb_error_seq),
@@ -1227,15 +1257,18 @@ impl File {
         let md = self.inode.metadata()?;
         let file_type = md.file_type;
 
-        let is_append = (flags.contains(FileFlags::O_APPEND) || force_append)
-            && matches!(file_type, FileType::File);
+        let is_append = self.append_lock_identity.is_some()
+            && (flags.contains(FileFlags::O_APPEND) || force_append);
 
         // Linux 语义要求 O_APPEND（以及 RWF_APPEND）在并发下满足“取 EOF + 写入”的原子性，
         // 否则多个线程可能拿到相同 EOF 导致覆盖写，最终 size 比预期小。
         if is_append {
-            let dev_id = md.dev_id;
-            let inode_id = md.inode_id;
-            return with_inode_append_lock(dev_id, inode_id, || {
+            let key = self
+                .append_lock_identity
+                .as_ref()
+                .ok_or(SystemError::EIO)?
+                .key;
+            return with_inode_append_lock(key, || {
                 // 在锁内刷新元数据，确保 EOF 是最新的。
                 let md = self.inode.metadata()?;
                 let actual_offset = md.size.max(0) as usize;
@@ -1295,14 +1328,17 @@ impl File {
         let md = self.inode.metadata()?;
         let file_type = md.file_type;
 
-        let is_append = (flags.contains(FileFlags::O_APPEND) || force_append)
-            && matches!(file_type, FileType::File);
+        let is_append = self.append_lock_identity.is_some()
+            && (flags.contains(FileFlags::O_APPEND) || force_append);
 
         // Linux semantics require O_APPEND (and RWF_APPEND) to atomically fetch EOF and write under concurrency.
         if is_append {
-            let dev_id = md.dev_id;
-            let inode_id = md.inode_id;
-            return with_inode_append_lock(dev_id, inode_id, || {
+            let key = self
+                .append_lock_identity
+                .as_ref()
+                .ok_or(SystemError::EIO)?
+                .key;
+            return with_inode_append_lock(key, || {
                 let md = self.inode.metadata()?;
                 let actual_offset = md.size.max(0) as usize;
                 let actual_len = self.limit_write_len_by_fsize(file_type, actual_offset, len)?;
@@ -1571,6 +1607,7 @@ impl File {
             cred: self.cred.clone(),
             owner: Mutex::new(FileOwner::new()),
             posix_lock_key: self.posix_lock_key,
+            append_lock_identity: self.append_lock_identity.clone(),
             ra_state: Mutex::new(self.ra_state.lock().clone()),
             wb_error_seq: Mutex::new(*self.wb_error_seq.lock()),
             sb_error_seq: Mutex::new(*self.sb_error_seq.lock()),

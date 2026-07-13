@@ -734,6 +734,10 @@ impl MountableFileSystem for Tmpfs {
 register_mountable_fs!(Tmpfs, TMPFSMAKER, "tmpfs");
 
 impl IndexNode for LockedTmpfsInode {
+    fn append_lock_fs(&self) -> Option<Arc<dyn FileSystem>> {
+        Some(self.fs())
+    }
+
     fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
         Ok(())
     }

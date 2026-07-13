@@ -248,6 +248,10 @@ pub struct LockedExt4Inode {
 }
 
 impl IndexNode for LockedExt4Inode {
+    fn append_lock_fs(&self) -> Option<Arc<dyn vfs::FileSystem>> {
+        Some(self.fs())
+    }
+
     fn retention_state(&self) -> Option<&InodeRetentionState> {
         Some(&self.retention)
     }

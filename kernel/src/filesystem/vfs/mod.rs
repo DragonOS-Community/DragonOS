@@ -423,6 +423,17 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         }
     }
 
+    /// Return the stable filesystem owner used to identify this inode's
+    /// atomic-append lock domain.
+    ///
+    /// Anonymous and protocol-style inodes default to no append lock: their
+    /// writes do not use regular-file offsets and some do not belong to a
+    /// mountable filesystem at all. Inodes implementing ordinary persistent
+    /// file semantics must opt in with their canonical filesystem instance.
+    fn append_lock_fs(&self) -> Option<Arc<dyn FileSystem>> {
+        None
+    }
+
     /// 是否支持 seek（lseek）。
     ///
     /// 默认：普通文件/目录/块设备可 seek；Pipe/Socket/CharDevice 不可 seek；

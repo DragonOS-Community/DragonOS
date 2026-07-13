@@ -464,6 +464,7 @@ impl Ext4 {
         let fs = Self::load(block_device)?;
         let sb = fs.read_super_block_cached();
         if sb.last_orphan() != 0
+            || sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_ORPHAN_PRESENT)
             || sb.has_incompatible_feature(SuperBlock::FEATURE_INCOMPAT_RECOVER)
         {
             return_error!(
@@ -645,8 +646,7 @@ mod validation_tests {
         }
     }
 
-    fn system_zone_test_fs() -> Ext4 {
-        let mut sb = SuperBlock::validation_fixture();
+    fn validation_device(mut sb: SuperBlock) -> Arc<ValidationDevice> {
         sb.set_checksum();
         let mut desc = BlockGroupDesc::validation_fixture();
         let mut group = BlockGroupRef::new(0, desc);
@@ -657,10 +657,13 @@ mod validation_tests {
         block0.write_offset_as(BASE_OFFSET, &sb);
         let mut block1 = Block::new(1, Box::new([0; BLOCK_SIZE]));
         block1.write_offset_as(0, &desc);
-        let device = ValidationDevice {
+        Arc::new(ValidationDevice {
             blocks: BTreeMap::from([(0, block0), (1, block1)]),
-        };
-        Ext4::load(Arc::new(device)).unwrap()
+        })
+    }
+
+    fn system_zone_test_fs() -> Ext4 {
+        Ext4::load(validation_device(SuperBlock::validation_fixture())).unwrap()
     }
 
     #[test]
@@ -684,12 +687,30 @@ mod validation_tests {
     }
 
     #[test]
-    fn orphan_present_is_recognized_for_read_only_loading() {
+    fn orphan_present_is_recognized_by_superblock_validation() {
         let mut sb = SuperBlock::validation_fixture();
         sb.set_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_ORPHAN_PRESENT, true);
         sb.set_checksum();
 
         assert!(Ext4::validate_super_block(&sb).is_ok());
+    }
+
+    #[test]
+    fn read_only_load_rejects_pending_orphan_file_recovery() {
+        let mut pending = SuperBlock::validation_fixture();
+        pending
+            .set_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_ORPHAN_PRESENT, true);
+        assert_eq!(
+            Ext4::load_read_only_checked(validation_device(pending))
+                .err()
+                .unwrap()
+                .code(),
+            ErrCode::EROFS
+        );
+
+        let mut clean = SuperBlock::validation_fixture();
+        clean.set_compatible_feature(SuperBlock::FEATURE_COMPAT_ORPHAN_FILE, true);
+        assert!(Ext4::load_read_only_checked(validation_device(clean)).is_ok());
     }
 
     #[test]

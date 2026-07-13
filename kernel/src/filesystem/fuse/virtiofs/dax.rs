@@ -118,6 +118,14 @@ impl ReclaimCandidate {
 }
 
 impl DaxRangeAllocatorState {
+    fn can_make_progress(&self) -> bool {
+        !self.free.is_empty()
+            || self
+                .entries
+                .iter()
+                .any(|entry| matches!(entry.state, DaxRangeState::InodeOwned { refs: 1, .. }))
+    }
+
     fn snapshot(&self) -> DaxAllocatorSnapshot {
         let mut snapshot = DaxAllocatorSnapshot {
             total: self.entries.len(),
@@ -244,7 +252,7 @@ impl DaxRangeAllocator {
             let state = self.state.lock_irqsave();
             if state.shutdown {
                 Some(Err(SystemError::ENODEV))
-            } else if !state.free.is_empty() {
+            } else if state.can_make_progress() {
                 Some(Ok(()))
             } else {
                 None
@@ -274,11 +282,14 @@ impl DaxRangeAllocator {
             return Err(SystemError::EINVAL);
         }
         entry.state = DaxRangeState::InodeOwned { inode, refs: 1 };
-        Ok(OwnedToken {
+        let owned = OwnedToken {
             index: token.index,
             generation: token.generation,
             inode,
-        })
+        };
+        drop(state);
+        self.wait.wakeup(None);
+        Ok(owned)
     }
 
     pub(crate) fn cancel_reservation(&self, token: &AllocationToken) -> Result<(), SystemError> {
@@ -337,6 +348,11 @@ impl DaxRangeAllocator {
             return Err(SystemError::EINVAL);
         }
         *refs -= 1;
+        let became_reclaimable = *refs == 1;
+        drop(state);
+        if became_reclaimable {
+            self.wait.wakeup(None);
+        }
         Ok(())
     }
 
@@ -407,7 +423,7 @@ impl DaxRangeAllocator {
 
     pub(crate) fn finish_reclaim(&self, token: &ReclaimToken) -> Result<(), SystemError> {
         let mut state = self.state.lock_irqsave();
-        Self::validate_reclaim_token(&state, &token)?;
+        Self::validate_reclaim_token(&state, token)?;
         state.entries[token.index].state = DaxRangeState::Free;
         state.free.push_back(token.index);
         drop(state);
@@ -417,16 +433,19 @@ impl DaxRangeAllocator {
 
     pub(crate) fn cancel_reclaim(&self, token: &ReclaimToken) -> Result<OwnedToken, SystemError> {
         let mut state = self.state.lock_irqsave();
-        Self::validate_reclaim_token(&state, &token)?;
+        Self::validate_reclaim_token(&state, token)?;
         state.entries[token.index].state = DaxRangeState::InodeOwned {
             inode: token.inode,
             refs: 1,
         };
-        Ok(OwnedToken {
+        let owned = OwnedToken {
             index: token.index,
             generation: token.generation,
             inode: token.inode,
-        })
+        };
+        drop(state);
+        self.wait.wakeup(None);
+        Ok(owned)
     }
 
     fn validate_reclaim_token(
@@ -526,13 +545,41 @@ mod tests {
         assert_eq!(owned.inode(), 7);
         assert_eq!(owned.window_offset(), 0);
         assert_eq!(owned.len(), DAX_RANGE_SIZE);
+        assert!(allocator.state.lock_irqsave().can_make_progress());
         allocator.get(&owned).unwrap();
+        assert!(!allocator.state.lock_irqsave().can_make_progress());
         assert!(candidates(&allocator, 10).is_empty());
         allocator.put(&owned).unwrap();
+        assert!(allocator.state.lock_irqsave().can_make_progress());
         let candidate = candidates(&allocator, 10).pop().unwrap();
         let reclaim = allocator.begin_reclaim(&candidate).unwrap();
         allocator.finish_reclaim(&reclaim).unwrap();
         assert_eq!(allocator.snapshot().free, 1);
+    }
+
+    #[test]
+    fn exhausted_wait_can_progress_from_reclaimable_mapping() {
+        let allocator = DaxRangeAllocator::new(DAX_RANGE_SIZE).unwrap();
+        let reservation = allocator.try_allocate().unwrap();
+        assert!(!allocator.state.lock_irqsave().can_make_progress());
+
+        let owned = allocator.assign_inode(&reservation, 12).unwrap();
+        assert!(allocator.state.lock_irqsave().can_make_progress());
+        allocator.get(&owned).unwrap();
+        assert!(!allocator.state.lock_irqsave().can_make_progress());
+        allocator.put(&owned).unwrap();
+        assert!(allocator.state.lock_irqsave().can_make_progress());
+
+        let candidate = candidates(&allocator, 1).pop().unwrap();
+        let reclaim = allocator.begin_reclaim(&candidate).unwrap();
+        assert!(!allocator.state.lock_irqsave().can_make_progress());
+        let owned = allocator.cancel_reclaim(&reclaim).unwrap();
+        assert!(allocator.state.lock_irqsave().can_make_progress());
+
+        let candidate = candidates(&allocator, 1).pop().unwrap();
+        let reclaim = allocator.begin_reclaim(&candidate).unwrap();
+        drop(owned);
+        allocator.finish_reclaim(&reclaim).unwrap();
     }
 
     #[test]

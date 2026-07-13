@@ -134,6 +134,19 @@ impl Default for Ext4MountOptions {
 }
 
 impl Ext4MountOptions {
+    fn validate_error_behavior(&self) -> Result<(), SystemError> {
+        match self.errors {
+            Ext4ErrorsBehavior::Continue => Ok(()),
+            // A read-only mount already satisfies the externally observable
+            // result of errors=remount-ro. Dynamic writable-to-read-only
+            // transitions are not supported yet and must not be advertised.
+            Ext4ErrorsBehavior::RemountRo if self.read_only => Ok(()),
+            Ext4ErrorsBehavior::RemountRo | Ext4ErrorsBehavior::Panic => {
+                Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+            }
+        }
+    }
+
     fn parse(raw_data: Option<&str>) -> Result<Self, SystemError> {
         let mut options = Self::default();
         let Some(raw_data) = raw_data else {
@@ -149,9 +162,6 @@ impl Ext4MountOptions {
             match token {
                 "barrier" | "barrier=1" => options.write_barrier = true,
                 "nobarrier" | "barrier=0" => options.write_barrier = false,
-                "dax" | "dax=always" => options.dax = Some(Ext4DaxMode::Always),
-                "dax=never" => options.dax = Some(Ext4DaxMode::Never),
-                "dax=inode" => options.dax = Some(Ext4DaxMode::Inode),
                 "errors=continue" => options.errors = Ext4ErrorsBehavior::Continue,
                 "errors=remount-ro" => options.errors = Ext4ErrorsBehavior::RemountRo,
                 "errors=panic" => options.errors = Ext4ErrorsBehavior::Panic,
@@ -806,6 +816,8 @@ impl Ext4FileSystem {
         mount_data: Arc<GenDisk>,
         mount_options: Ext4MountOptions,
     ) -> Result<Arc<dyn FileSystem>, SystemError> {
+        mount_options.validate_error_behavior()?;
+
         // Worker creation may sleep and must never happen from final-release
         // publication while inode/eviction locks are held.
         lazy_static::initialize(&EXT4_EVICTION_WQ);
@@ -987,7 +999,8 @@ impl core::fmt::Debug for Ext4FileSystem {
 
 #[cfg(test)]
 mod mount_options_tests {
-    use super::{Ext4DaxMode, Ext4ErrorsBehavior, Ext4MountOptions};
+    use super::{Ext4ErrorsBehavior, Ext4MountOptions};
+    use system_error::SystemError;
 
     #[test]
     fn barrier_defaults_to_enabled() {
@@ -1019,25 +1032,44 @@ mod mount_options_tests {
         assert!(Ext4MountOptions::parse(Some("discard")).is_err());
         assert!(Ext4MountOptions::parse(Some("barrier=2")).is_err());
         assert!(Ext4MountOptions::parse(Some("barrier=")).is_err());
+        assert!(Ext4MountOptions::parse(Some("dax")).is_err());
         assert!(Ext4MountOptions::parse(Some("dax=invalid")).is_err());
         assert!(Ext4MountOptions::parse(Some("errors=invalid")).is_err());
     }
 
     #[test]
-    fn existing_rootflags_are_preserved() {
-        let options = Ext4MountOptions::parse(Some("dax,errors=remount-ro")).unwrap();
-        assert_eq!(options.dax, Some(Ext4DaxMode::Always));
+    fn existing_read_only_rootflags_are_supported() {
+        let options = Ext4MountOptions::parse(Some("errors=remount-ro")).unwrap();
         assert_eq!(options.errors, Ext4ErrorsBehavior::RemountRo);
         assert!(options.write_barrier);
+
+        let mut read_only = options;
+        read_only.read_only = true;
+        assert!(read_only.validate_error_behavior().is_ok());
+        assert_eq!(
+            options.validate_error_behavior(),
+            Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        );
     }
 
     #[test]
-    fn dax_and_error_modes_are_last_value_wins() {
-        let options = Ext4MountOptions::parse(Some(
-            "dax=always,dax=never,dax=inode,errors=panic,errors=continue",
-        ))
-        .unwrap();
-        assert_eq!(options.dax, Some(Ext4DaxMode::Inode));
+    fn error_modes_are_last_value_wins() {
+        let options = Ext4MountOptions::parse(Some("errors=panic,errors=continue")).unwrap();
         assert_eq!(options.errors, Ext4ErrorsBehavior::Continue);
+        assert!(options.validate_error_behavior().is_ok());
+    }
+
+    #[test]
+    fn unsupported_panic_behavior_is_rejected() {
+        let mut options = Ext4MountOptions::parse(Some("errors=panic")).unwrap();
+        assert_eq!(
+            options.validate_error_behavior(),
+            Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        );
+        options.read_only = true;
+        assert_eq!(
+            options.validate_error_behavior(),
+            Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        );
     }
 }

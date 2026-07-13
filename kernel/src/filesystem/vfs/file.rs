@@ -1257,18 +1257,13 @@ impl File {
         let md = self.inode.metadata()?;
         let file_type = md.file_type;
 
-        let is_append = self.append_lock_identity.is_some()
+        let is_append = matches!(file_type, FileType::File)
             && (flags.contains(FileFlags::O_APPEND) || force_append);
 
-        // Linux 语义要求 O_APPEND（以及 RWF_APPEND）在并发下满足“取 EOF + 写入”的原子性，
-        // 否则多个线程可能拿到相同 EOF 导致覆盖写，最终 size 比预期小。
+        // 普通文件始终按 EOF 执行 O_APPEND/RWF_APPEND；提供稳定锁域的文件系统
+        // 还会在 VFS 层串行化“取 EOF + 写入”，避免并发追加互相覆盖。
         if is_append {
-            let key = self
-                .append_lock_identity
-                .as_ref()
-                .ok_or(SystemError::EIO)?
-                .key;
-            return with_inode_append_lock(key, || {
+            let append_write = || {
                 // 在锁内刷新元数据，确保 EOF 是最新的。
                 let md = self.inode.metadata()?;
                 let actual_offset = md.size.max(0) as usize;
@@ -1285,7 +1280,11 @@ impl File {
                         inode_flags,
                     },
                 )
-            });
+            };
+            return match self.append_lock_identity.as_ref() {
+                Some(identity) => with_inode_append_lock(identity.key, append_write),
+                None => append_write(),
+            };
         }
 
         let actual_offset = offset;
@@ -1328,17 +1327,13 @@ impl File {
         let md = self.inode.metadata()?;
         let file_type = md.file_type;
 
-        let is_append = self.append_lock_identity.is_some()
+        let is_append = matches!(file_type, FileType::File)
             && (flags.contains(FileFlags::O_APPEND) || force_append);
 
-        // Linux semantics require O_APPEND (and RWF_APPEND) to atomically fetch EOF and write under concurrency.
+        // Always select EOF for regular-file append semantics. Filesystems
+        // with a stable lock domain additionally serialize EOF lookup + write.
         if is_append {
-            let key = self
-                .append_lock_identity
-                .as_ref()
-                .ok_or(SystemError::EIO)?
-                .key;
-            return with_inode_append_lock(key, || {
+            let append_write = || {
                 let md = self.inode.metadata()?;
                 let actual_offset = md.size.max(0) as usize;
                 let actual_len = self.limit_write_len_by_fsize(file_type, actual_offset, len)?;
@@ -1354,7 +1349,11 @@ impl File {
                         inode_flags,
                     },
                 )
-            });
+            };
+            return match self.append_lock_identity.as_ref() {
+                Some(identity) => with_inode_append_lock(identity.key, append_write),
+                None => append_write(),
+            };
         }
 
         let actual_offset = offset;

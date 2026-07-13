@@ -3609,6 +3609,7 @@ static int ext_test_cached_short_read_updates_eof() {
     char buf[32];
     int f = -1;
     ssize_t n = -1;
+    uint32_t reads_after_short = 0;
 
     if (ensure_dir(mp) != 0) {
         printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
@@ -3679,12 +3680,6 @@ static int ext_test_cached_short_read_updates_eof() {
                read_count, errno);
         goto fail;
     }
-    memset(buf, 0x7f, sizeof(buf));
-    n = pread(f, buf, sizeof(buf), 5);
-    if (n != 0) {
-        printf("[FAIL] EOF cached pread got=%zd read=%u errno=%d\n", n, read_count, errno);
-        goto fail;
-    }
 
     // The second READ is speculative readahead, so the foreground pread must
     // not wait for the daemon to consume it. Wait here before inspecting the
@@ -3700,6 +3695,19 @@ static int ext_test_cached_short_read_updates_eof() {
         printf("[FAIL] short read trace count=%u off0=%llu size0=%u off1=%llu size1=%u\n",
                read_count, (unsigned long long)read_offsets[0], read_sizes[0],
                (unsigned long long)read_offsets[1], read_sizes[1]);
+        goto fail;
+    }
+    reads_after_short = read_count;
+
+    memset(buf, 0x7f, sizeof(buf));
+    n = pread(f, buf, sizeof(buf), 5);
+    if (n != 0) {
+        printf("[FAIL] EOF cached pread got=%zd read=%u errno=%d\n", n, read_count, errno);
+        goto fail;
+    }
+    if (read_count != reads_after_short) {
+        printf("[FAIL] cached EOF issued a new READ before=%u after=%u\n", reads_after_short,
+               read_count);
         goto fail;
     }
 

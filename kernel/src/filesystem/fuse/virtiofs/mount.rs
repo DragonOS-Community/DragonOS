@@ -204,7 +204,11 @@ impl MountableFileSystem for VirtioFsFs {
         let (rootmode, user_id, group_id, default_permissions, allow_other, dax_mode) =
             Self::parse_mount_options(raw_data)?;
         let instance = virtio_fs_find_instance(source).ok_or(SystemError::ENODEV)?;
-        let conn = FuseConn::new_for_virtiofs(VIRTIOFS_MAX_REQUEST_SIZE, VIRTIOFS_RSP_BUF_SIZE);
+        let conn = FuseConn::new_for_virtiofs_with_dax(
+            VIRTIOFS_MAX_REQUEST_SIZE,
+            VIRTIOFS_RSP_BUF_SIZE,
+            instance.cache_window_len(),
+        );
 
         Ok(Some(Arc::new(VirtioFsMountData {
             rootmode,

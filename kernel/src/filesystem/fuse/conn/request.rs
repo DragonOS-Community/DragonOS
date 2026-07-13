@@ -19,12 +19,12 @@ use super::super::protocol::{
     FUSE_GETXATTR, FUSE_INIT, FUSE_INTERRUPT, FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION,
     FUSE_LINK, FUSE_LISTXATTR, FUSE_LOOKUP, FUSE_MKDIR, FUSE_MKNOD, FUSE_OPEN, FUSE_OPENDIR,
     FUSE_READ, FUSE_READDIR, FUSE_READDIRPLUS, FUSE_READLINK, FUSE_RELEASE, FUSE_RELEASEDIR,
-    FUSE_REMOVEXATTR, FUSE_RENAME, FUSE_RENAME2, FUSE_RMDIR, FUSE_SETATTR, FUSE_SETXATTR,
-    FUSE_STATFS, FUSE_SYMLINK, FUSE_UNLINK, FUSE_WRITE,
+    FUSE_REMOVEMAPPING, FUSE_REMOVEXATTR, FUSE_RENAME, FUSE_RENAME2, FUSE_RMDIR, FUSE_SETATTR,
+    FUSE_SETUPMAPPING, FUSE_SETXATTR, FUSE_STATFS, FUSE_SYMLINK, FUSE_UNLINK, FUSE_WRITE,
 };
 use super::{
-    stats, trace, FuseConn, FusePendingState, FuseReplyCapacity, FuseReplyCapacitySource,
-    FuseReplyContract, FuseRequest, FuseRequestCred,
+    stats, trace, FuseCompletionKind, FuseConn, FusePendingResult, FusePendingState,
+    FuseReplyCapacity, FuseReplyCapacitySource, FuseReplyContract, FuseRequest, FuseRequestCred,
 };
 use crate::filesystem::fuse::reply::FuseReply;
 use crate::filesystem::{fuse::reply::FuseReadPagesReply, page_cache::PageCacheReadDmaReservation};
@@ -44,6 +44,14 @@ enum FuseReplyRouting {
     ReadPages(Arc<PageCacheReadDmaReservation>),
 }
 
+pub(crate) enum FuseDaxRequestOutcome {
+    Success,
+    NeverSubmitted(SystemError),
+    DaemonError(SystemError),
+    OutcomeUnknown(SystemError),
+    Disconnected(SystemError),
+}
+
 /// Bundled context for a background read-pages request.
 pub(crate) struct BackgroundReadPagesCtx {
     pub destination: Arc<PageCacheReadDmaReservation>,
@@ -56,6 +64,92 @@ pub(crate) struct BackgroundReadPagesCtx {
 }
 
 impl FuseConn {
+    #[cfg(test)]
+    pub(crate) fn install_pending_for_test(
+        &self,
+        unique: u64,
+        opcode: u32,
+    ) -> Arc<FusePendingState> {
+        let pending = Arc::new(FusePendingState::new(unique, opcode));
+        self.inner.lock().processing.insert(unique, pending.clone());
+        pending
+    }
+
+    pub(crate) fn mark_pending_outcome_unknown(&self, unique: u64) {
+        if let Some(pending) = self.inner.lock().processing.get(&unique).cloned() {
+            pending.mark_outcome_unknown();
+        }
+    }
+
+    pub(crate) fn complete_pending_never_submitted(
+        &self,
+        unique: u64,
+        error: SystemError,
+    ) -> Result<(), SystemError> {
+        let pending = self
+            .inner
+            .lock()
+            .processing
+            .remove(&unique)
+            .ok_or(SystemError::ENOENT)?;
+        let reply_error = error.to_posix_errno();
+        if pending.complete_never_submitted(error) {
+            stats::on_fuse_reply_complete(pending.opcode, reply_error, 0);
+            trace::trace_fuse_reply_complete(unique, pending.opcode, reply_error, 0);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn request_dax_mapping(
+        &self,
+        opcode: u32,
+        nodeid: u64,
+        payload: &[u8],
+    ) -> FuseDaxRequestOutcome {
+        let cred = ProcessManager::current_pcb().cred();
+        if !self.allow_current_process(&cred) {
+            return FuseDaxRequestOutcome::NeverSubmitted(SystemError::EACCES);
+        }
+        if let Err(error) = self.wait_initialized() {
+            return FuseDaxRequestOutcome::NeverSubmitted(error);
+        }
+        let pending = match self.enqueue_request(opcode, nodeid, payload) {
+            Ok(pending) => pending,
+            Err(error) => return FuseDaxRequestOutcome::NeverSubmitted(error),
+        };
+        let (result, kind) = match pending.wait_result_with_kind_uninterruptible() {
+            Ok(result) => result,
+            Err(_) => {
+                // A dead wait queue is an internal connection failure. Abort
+                // first so the request obtains a real terminal state before
+                // its allocator pin/reservation can be released.
+                self.abort();
+                match pending.wait_result_with_kind() {
+                    Ok(result) => result,
+                    Err(error) => return FuseDaxRequestOutcome::Disconnected(error),
+                }
+            }
+        };
+        match (result, kind) {
+            (Ok(FusePendingResult::Reply(_)), FuseCompletionKind::Success) => {
+                FuseDaxRequestOutcome::Success
+            }
+            (Err(error), FuseCompletionKind::DaemonError) => {
+                FuseDaxRequestOutcome::DaemonError(error)
+            }
+            (Err(error), FuseCompletionKind::NeverSubmitted) => {
+                FuseDaxRequestOutcome::NeverSubmitted(error)
+            }
+            (Err(error), FuseCompletionKind::Disconnected) => {
+                FuseDaxRequestOutcome::Disconnected(error)
+            }
+            (Err(error), FuseCompletionKind::OutcomeUnknown) => {
+                FuseDaxRequestOutcome::OutcomeUnknown(error)
+            }
+            _ => FuseDaxRequestOutcome::OutcomeUnknown(SystemError::EIO),
+        }
+    }
+
     fn is_high_priority_opcode(opcode: u32) -> bool {
         matches!(opcode, FUSE_FORGET | FUSE_INTERRUPT)
     }
@@ -377,6 +471,7 @@ impl FuseConn {
             FUSE_UNLINK | FUSE_RMDIR | FUSE_RENAME | FUSE_RENAME2 | FUSE_RELEASE | FUSE_FSYNC
             | FUSE_SETXATTR | FUSE_REMOVEXATTR | FUSE_FLUSH | FUSE_RELEASEDIR | FUSE_FSYNCDIR
             | FUSE_ACCESS | FUSE_INTERRUPT | FUSE_DESTROY | FUSE_FALLOCATE => Some(0),
+            FUSE_SETUPMAPPING | FUSE_REMOVEMAPPING => Some(0),
             _ => None,
         };
         if let Some(payload_len) = fixed_payload {

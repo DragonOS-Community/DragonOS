@@ -689,7 +689,19 @@ impl VirtioFsBridgeContext {
 
     fn terminate_pending_with_error(&self, pending: &PendingReq, err: SystemError) {
         if !pending.noreply {
+            self.conn.mark_pending_outcome_unknown(pending.unique);
             self.complete_request_with_error(pending.unique, err);
+        }
+        if pending.opcode == FUSE_DESTROY {
+            self.conn.abort();
+        }
+    }
+
+    fn terminate_pending_not_submitted(&self, pending: &PendingReq, err: SystemError) {
+        if !pending.noreply {
+            let _ = self
+                .conn
+                .complete_pending_never_submitted(pending.unique, err);
         }
         if pending.opcode == FUSE_DESTROY {
             self.conn.abort();
@@ -868,7 +880,7 @@ impl VirtioFsBridgeContext {
                 let capacity = match capacity {
                     Some(capacity) => capacity,
                     None => {
-                        self.terminate_pending_with_error(&pending, SystemError::EIO);
+                        self.terminate_pending_not_submitted(&pending, SystemError::EIO);
                         return Ok(true);
                     }
                 };
@@ -884,7 +896,7 @@ impl VirtioFsBridgeContext {
                 ) {
                     Ok(rsp) => rsp,
                     Err(e) => {
-                        self.terminate_pending_with_error(&pending, e);
+                        self.terminate_pending_not_submitted(&pending, e);
                         return Ok(true);
                     }
                 };
@@ -904,19 +916,31 @@ impl VirtioFsBridgeContext {
             }
         };
 
+        let mut dma_outputs = if let Some(output_ref) = output.as_mut() {
+            match unsafe { output_ref.dma_slices(true) } {
+                Ok(outputs) => Some(outputs),
+                Err(error) => {
+                    Self::release_unsubmitted_output(&self.response_pool, output.take());
+                    self.terminate_pending_not_submitted(&pending, error);
+                    return Ok(true);
+                }
+            }
+        } else {
+            None
+        };
+
         let (token, should_notify) = match kind {
             QueueKind::Hiprio => {
                 let queue = self.hiprio_vq.as_mut().ok_or(SystemError::EIO)?;
-                let token = if let Some(output) = output.as_mut() {
+                let token = if let Some(outputs) = dma_outputs.as_mut() {
                     let inputs = [pending.req.bytes()];
-                    let mut outputs = unsafe { output.dma_slices(true)? };
                     // SAFETY: The request contains a non-empty FuseInHeader, and the reply
                     // contract makes `rsp_buf` at least a non-empty FuseOutHeader. On success,
                     // only their owners and independent metadata are moved/read before notification;
                     // neither buffer's contents are accessed again until `pop_used` succeeds or
                     // reset completes and `detach_unused` succeeds. On error no descriptor was
                     // accepted.
-                    unsafe { queue.add(&inputs, &mut outputs) }
+                    unsafe { queue.add(&inputs, outputs) }
                 } else {
                     let inputs = [pending.req.bytes()];
                     let mut outputs: [&mut [u8]; 0] = [];
@@ -931,16 +955,15 @@ impl VirtioFsBridgeContext {
             }
             QueueKind::Request(slot) => {
                 let queue = self.request_vqs.get_mut(slot).ok_or(SystemError::EINVAL)?;
-                let token = if let Some(output) = output.as_mut() {
+                let token = if let Some(outputs) = dma_outputs.as_mut() {
                     let inputs = [pending.req.bytes()];
-                    let mut outputs = unsafe { output.dma_slices(true)? };
                     // SAFETY: The request contains a non-empty FuseInHeader, and the reply
                     // contract makes `rsp_buf` at least a non-empty FuseOutHeader. On success,
                     // only their owners and independent metadata are moved/read before notification;
                     // neither buffer's contents are accessed again until `pop_used` succeeds or
                     // reset completes and `detach_unused` succeeds. On error no descriptor was
                     // accepted.
-                    unsafe { queue.add(&inputs, &mut outputs) }
+                    unsafe { queue.add(&inputs, outputs) }
                 } else {
                     let inputs = [pending.req.bytes()];
                     let mut outputs: [&mut [u8]; 0] = [];
@@ -954,6 +977,7 @@ impl VirtioFsBridgeContext {
                 (token, queue.should_notify())
             }
         };
+        drop(dma_outputs);
 
         let token = match token {
             Ok(token) => token,
@@ -981,7 +1005,7 @@ impl VirtioFsBridgeContext {
                     "virtiofs bridge: queue not ready opcode={} unique={} queue={:?} err={:?}",
                     pending.opcode, pending.unique, kind, se
                 );
-                self.terminate_pending_with_error(&pending, se);
+                self.terminate_pending_not_submitted(&pending, se);
                 return Ok(true);
             }
             Err(e) => {
@@ -992,7 +1016,7 @@ impl VirtioFsBridgeContext {
                     "virtiofs bridge: submit failed opcode={} unique={} queue={:?} err={:?}",
                     pending.opcode, pending.unique, kind, se
                 );
-                self.terminate_pending_with_error(&pending, se);
+                self.terminate_pending_not_submitted(&pending, se);
                 return Ok(true);
             }
         };
@@ -1518,26 +1542,37 @@ impl VirtioFsBridgeContext {
         }
     }
 
-    fn complete_unfinished(&self, err: SystemError, need_reply: Vec<u64>) {
-        let failed = need_reply.len();
+    fn complete_unfinished(
+        conn: &Arc<FuseConn>,
+        err: SystemError,
+        never_submitted: Vec<u64>,
+        outcome_unknown: Vec<u64>,
+    ) {
+        let failed = never_submitted.len() + outcome_unknown.len();
         let errno = err.to_posix_errno();
-        for unique in need_reply {
-            Self::complete_request_with_negative_errno(&self.conn, unique, errno);
+        for unique in never_submitted {
+            let _ = conn.complete_pending_never_submitted(unique, err.clone());
+        }
+        for unique in outcome_unknown {
+            conn.mark_pending_outcome_unknown(unique);
+            Self::complete_request_with_negative_errno(conn, unique, errno);
         }
         stats::on_virtiofs_fail_unfinished(failed);
     }
 
     fn fail_unfinished_preserving_inflight_dma(&mut self, err: SystemError) {
-        let mut need_reply = Vec::new();
-        self.drain_pending_reply_uniques(&mut need_reply);
-        self.collect_inflight_reply_uniques(&mut need_reply);
-        self.complete_unfinished(err, need_reply);
+        let mut never_submitted = Vec::new();
+        let mut outcome_unknown = Vec::new();
+        self.drain_pending_reply_uniques(&mut never_submitted);
+        self.collect_inflight_reply_uniques(&mut outcome_unknown);
+        Self::complete_unfinished(&self.conn, err, never_submitted, outcome_unknown);
     }
 
     fn fail_all_unfinished(&mut self, err: SystemError) {
-        let mut need_reply = Vec::new();
-        self.drain_pending_reply_uniques(&mut need_reply);
-        self.collect_inflight_reply_uniques(&mut need_reply);
+        let mut never_submitted = Vec::new();
+        let mut outcome_unknown = Vec::new();
+        self.drain_pending_reply_uniques(&mut never_submitted);
+        self.collect_inflight_reply_uniques(&mut outcome_unknown);
 
         let hiprio_inflight_count = self.hiprio_inflight.len();
         self.hiprio_inflight.clear();
@@ -1552,7 +1587,7 @@ impl VirtioFsBridgeContext {
             stats::VirtioFsQueueKind::Request,
             request_inflight_count,
         );
-        self.complete_unfinished(err, need_reply);
+        Self::complete_unfinished(&self.conn, err, never_submitted, outcome_unknown);
     }
 
     fn clear_queue_full_blocked_stats(&mut self) {
@@ -1760,6 +1795,7 @@ impl VirtioFsBridgeContext {
             // Idle pooled buffers are not visible to the device. Release them before the
             // reset-timeout quarantine keeps the transport, queues and inflight DMA buffers alive.
             self.fail_unfinished_preserving_inflight_dma(SystemError::ENOTCONN);
+            self.conn.abort();
             if !self
                 .instance
                 .release_session_without_transport(self.session_id)
@@ -1774,6 +1810,7 @@ impl VirtioFsBridgeContext {
             return false;
         }
         self.fail_all_unfinished(SystemError::ENOTCONN);
+        self.conn.abort();
 
         if let Some(transport) = self.transport.take() {
             self.instance.put_transport_after_session(transport);
@@ -2039,6 +2076,11 @@ mod tests {
 
     use system_error::SystemError;
 
+    use crate::filesystem::fuse::{
+        conn::{FuseCompletionKind, FuseConn},
+        protocol::{FUSE_REMOVEMAPPING, FUSE_SETUPMAPPING},
+    };
+
     use super::{QueueBlockState, VirtioFsBridgeContext};
 
     fn block_state(blocked: bool, completion_seen: bool) -> QueueBlockState {
@@ -2046,6 +2088,22 @@ mod tests {
             blocked,
             completion_seen,
         }
+    }
+
+    #[test]
+    fn unfinished_completion_preserves_submission_provenance() {
+        let conn = FuseConn::new_for_virtiofs(8192, 8192);
+        let pending = conn.install_pending_for_test(2, FUSE_REMOVEMAPPING);
+        let inflight = conn.install_pending_for_test(4, FUSE_SETUPMAPPING);
+
+        VirtioFsBridgeContext::complete_unfinished(&conn, SystemError::ENOTCONN, vec![2], vec![4]);
+
+        let (result, kind) = pending.wait_result_with_kind().unwrap();
+        assert_eq!(result.unwrap_err(), SystemError::ENOTCONN);
+        assert_eq!(kind, FuseCompletionKind::NeverSubmitted);
+        let (result, kind) = inflight.wait_result_with_kind().unwrap();
+        assert_eq!(result.unwrap_err(), SystemError::ENOTCONN);
+        assert_eq!(kind, FuseCompletionKind::OutcomeUnknown);
     }
 
     #[test]

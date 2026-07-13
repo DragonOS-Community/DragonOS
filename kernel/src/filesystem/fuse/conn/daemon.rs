@@ -11,10 +11,11 @@ use super::super::protocol::{
     FuseNotifyInvalEntryOut, FuseNotifyInvalInodeOut, FuseOpenOut, FuseOutHeader, FuseStatfsOut,
     FuseWriteIn, FUSE_CREATE, FUSE_DESTROY, FUSE_EXPIRE_ONLY, FUSE_FLUSH, FUSE_GETATTR,
     FUSE_GETXATTR, FUSE_INIT, FUSE_INIT_EXT, FUSE_INTERRUPT, FUSE_KERNEL_MINOR_VERSION,
-    FUSE_KERNEL_VERSION, FUSE_LINK, FUSE_LISTXATTR, FUSE_LOOKUP, FUSE_MAX_PAGES,
-    FUSE_MIN_READ_BUFFER, FUSE_MKDIR, FUSE_MKNOD, FUSE_NOTIFY_DELETE, FUSE_NOTIFY_INVAL_ENTRY,
-    FUSE_NOTIFY_INVAL_INODE, FUSE_NOTIFY_POLL, FUSE_NOTIFY_RETRIEVE, FUSE_NOTIFY_STORE, FUSE_READ,
-    FUSE_REMOVEXATTR, FUSE_SETATTR, FUSE_SETXATTR, FUSE_STATFS, FUSE_SYMLINK,
+    FUSE_KERNEL_VERSION, FUSE_LINK, FUSE_LISTXATTR, FUSE_LOOKUP, FUSE_MAP_ALIGNMENT,
+    FUSE_MAX_PAGES, FUSE_MIN_READ_BUFFER, FUSE_MKDIR, FUSE_MKNOD, FUSE_NOTIFY_DELETE,
+    FUSE_NOTIFY_INVAL_ENTRY, FUSE_NOTIFY_INVAL_INODE, FUSE_NOTIFY_POLL, FUSE_NOTIFY_RETRIEVE,
+    FUSE_NOTIFY_STORE, FUSE_READ, FUSE_REMOVEXATTR, FUSE_SETATTR, FUSE_SETXATTR, FUSE_STATFS,
+    FUSE_SYMLINK,
 };
 use super::{
     stats, trace, wait_with_recheck, FuseConn, FuseConnInner, FuseInitNegotiated, FuseRequest,
@@ -54,6 +55,24 @@ impl FuseConn {
         payload_len: usize,
     ) {
         if pending.complete(Err(error)) {
+            stats::on_fuse_reply_complete(pending.opcode, reply_error, payload_len);
+            trace::trace_fuse_reply_complete(
+                unique,
+                pending.opcode,
+                reply_error,
+                payload_len as u64,
+            );
+        }
+    }
+
+    fn complete_claimed_daemon_error(
+        pending: &Arc<super::FusePendingState>,
+        unique: u64,
+        error: SystemError,
+        reply_error: i32,
+        payload_len: usize,
+    ) {
+        if pending.complete_daemon_error(error) {
             stats::on_fuse_reply_complete(pending.opcode, reply_error, payload_len);
             trace::trace_fuse_reply_complete(
                 unique,
@@ -462,13 +481,7 @@ impl FuseConn {
                 );
             }
             self.claim_pending_reply(out_hdr.unique, &pending, |_| {})?;
-            Self::complete_claimed_reply_with_error(
-                &pending,
-                out_hdr.unique,
-                e,
-                error,
-                payload_len,
-            );
+            Self::complete_claimed_daemon_error(&pending, out_hdr.unique, e, error, payload_len);
             if matches!(pending.opcode, FUSE_INIT | FUSE_DESTROY) {
                 self.abort();
             }
@@ -510,6 +523,21 @@ impl FuseConn {
             let mut negotiated_flags = init_out.flags as u64;
             if (negotiated_flags & FUSE_INIT_EXT) != 0 {
                 negotiated_flags |= (init_out.flags2 as u64) << 32;
+            }
+            let requested_flags = self.inner.lock().init_flags;
+            let enabled_flags = negotiated_flags & requested_flags;
+            if !Self::dax_map_alignment_valid(enabled_flags, init_out.map_alignment) {
+                let error = -SystemError::EINVAL.to_posix_errno();
+                self.claim_pending_reply(out_hdr.unique, &pending, |_| {})?;
+                Self::complete_claimed_reply_with_error(
+                    &pending,
+                    out_hdr.unique,
+                    SystemError::EINVAL,
+                    error,
+                    payload_len,
+                );
+                self.abort();
+                return Ok(data.len());
             }
             let negotiated_minor = core::cmp::min(init_out.minor, FUSE_KERNEL_MINOR_VERSION);
             let negotiated_max_pages_raw = if (negotiated_flags & FUSE_MAX_PAGES) != 0 {
@@ -566,7 +594,6 @@ impl FuseConn {
                 // daemon-supported and locally-requested flags. virtiofsd often sets
                 // DO_READDIRPLUS etc. in the INIT reply; if adopted directly, it would
                 // trigger READDIRPLUS + cache_child_from_entry, causing stale inode mappings.
-                let enabled_flags = negotiated_flags & g.init_flags;
                 g.initialized = true;
                 g.init = FuseInitNegotiated {
                     minor: negotiated_minor,
@@ -575,6 +602,11 @@ impl FuseConn {
                     time_gran: init_out.time_gran,
                     max_pages: negotiated_max_pages,
                     flags: enabled_flags,
+                    map_alignment: if (enabled_flags & FUSE_MAP_ALIGNMENT) != 0 {
+                        init_out.map_alignment
+                    } else {
+                        0
+                    },
                 };
                 self.reply_layout_minor
                     .store(negotiated_minor, Ordering::Release);

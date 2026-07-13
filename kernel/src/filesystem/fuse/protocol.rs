@@ -50,6 +50,8 @@ pub const FUSE_DESTROY: u32 = 38; // no reply
 pub const FUSE_FALLOCATE: u32 = 43;
 pub const FUSE_READDIRPLUS: u32 = 44;
 pub const FUSE_RENAME2: u32 = 45;
+pub const FUSE_SETUPMAPPING: u32 = 48;
+pub const FUSE_REMOVEMAPPING: u32 = 49;
 
 // INIT flags (subset)
 pub const FUSE_ASYNC_READ: u64 = 1 << 0;
@@ -72,9 +74,11 @@ pub const FUSE_ABORT_ERROR: u64 = 1 << 21;
 pub const FUSE_MAX_PAGES: u64 = 1 << 22;
 pub const FUSE_NO_OPENDIR_SUPPORT: u64 = 1 << 24;
 pub const FUSE_EXPLICIT_INVAL_DATA: u64 = 1 << 25;
+pub const FUSE_MAP_ALIGNMENT: u64 = 1 << 26;
 /// Guest auto-mounts directories marked FUSE_ATTR_SUBMOUNT (Linux fuse.h: init->flags bit 27).
 pub const FUSE_SUBMOUNTS: u64 = 1 << 27;
 pub const FUSE_INIT_EXT: u64 = 1 << 30;
+pub const FUSE_HAS_INODE_DAX: u64 = 1 << 33;
 /// Kernel supports expiry-only entry invalidation (Linux 6.6 fuse.h bit 35).
 pub const FUSE_HAS_EXPIRE_ONLY: u64 = 1 << 35;
 /// Allow shared mmap for FOPEN_DIRECT_IO files (Linux 6.6 fuse.h bit 36).
@@ -122,6 +126,9 @@ pub const FATTR_LOCKOWNER: u32 = 1 << 9;
 pub const FATTR_CTIME: u32 = 1 << 10;
 
 pub const FUSE_FSYNC_FDATASYNC: u32 = 1 << 0;
+
+pub const FUSE_SETUPMAPPING_FLAG_WRITE: u64 = 1 << 0;
+pub const FUSE_SETUPMAPPING_FLAG_READ: u64 = 1 << 1;
 pub const FUSE_NOTIFY_POLL: i32 = 1;
 pub const FUSE_NOTIFY_INVAL_INODE: i32 = 2;
 pub const FUSE_NOTIFY_INVAL_ENTRY: i32 = 3;
@@ -201,6 +208,33 @@ pub struct FuseInitOut {
     pub flags2: u32,
     pub unused: [u32; 7],
 }
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FuseSetupMappingIn {
+    pub fh: u64,
+    pub foffset: u64,
+    pub len: u64,
+    pub flags: u64,
+    pub moffset: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FuseRemoveMappingIn {
+    pub count: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FuseRemoveMappingOne {
+    pub moffset: u64,
+    pub len: u64,
+}
+
+const _: [(); 40] = [(); size_of::<FuseSetupMappingIn>()];
+const _: [(); 4] = [(); size_of::<FuseRemoveMappingIn>()];
+const _: [(); 16] = [(); size_of::<FuseRemoveMappingOne>()];
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]

@@ -199,6 +199,24 @@ impl PacketRing {
 
     /// Returns `true` if at least one frame is in `TP_STATUS_USER` (readable by
     /// userspace). Used by `can_recv()` / poll readiness.
+    ///
+    /// # 性能说明
+    ///
+    /// 这是 O(frame_nr) 线性扫描，每个帧做一次 `tp_status` 原子读。它仅在
+    /// poll/epoll readiness 检查路径（`can_recv` → `has_user_frames`）上调用，
+    /// 不在数据收发的热路径上，因此不会逐包执行。
+    ///
+    /// 对于典型 ring（frame_nr = 1024），每次 poll 最多扫描 1024 次原子读；早
+    /// 命中即返回，平均成本远低于最坏情况。该开销在 poll 路径上可接受。
+    ///
+    /// # 未来优化方向（当前不实现）
+    ///
+    /// 若未来需要在超大 ring 或高 poll 频率场景下进一步降低成本，可维护一个
+    /// `AtomicU32 user_frame_count` 计数器：`write_frame` 发布 KERNEL→USER 时
+    /// 自增，从而把扫描降到 O(1)。但用户态把 `tp_status` 翻回 `TP_STATUS_KERNEL`
+    /// 时无法主动通知内核，计数无法准确递减，必须在 `has_user_frames` 中走懒
+    /// 更新（扫描确认）或要求用户态显式 `recv`/`poll` 来同步状态。这会让计数方案
+    /// 的复杂度显著高于当前的简单扫描，故暂不引入。
     pub fn has_user_frames(&self) -> bool {
         for i in 0..self.config.frame_nr {
             let base = self.frame_base(i);
@@ -330,16 +348,20 @@ impl PacketRing {
         };
         let snaplen = wire_len.min(data_cap);
 
-        // Timestamp.
-        let now_micros = crate::time::Instant::now().total_micros();
-        let tp_sec = (now_micros / 1_000_000) as u32;
-        let tp_usec = (now_micros % 1_000_000) as u32;
-
+        // Timestamps are taken from per-version sources to match Linux
+        // semantics:
+        //   V1: microsecond resolution (struct timeval).
+        //   V2: nanosecond resolution (struct timespec), so we must read the
+        //       real nanoseconds from PosixTimeSpec rather than scaling a
+        //       microsecond value.
         let dst = base as *mut u8;
 
         unsafe {
             match self.version {
                 TpacketVersion::V1 => {
+                    let now_micros = crate::time::Instant::now().total_micros();
+                    let tp_sec = (now_micros / 1_000_000) as u32;
+                    let tp_usec = (now_micros % 1_000_000) as u32;
                     // tp_status written last via publish(); zero for now.
                     *(dst.add(0) as *mut u64) = 0; // tp_status (placeholder)
                     *(dst.add(8) as *mut u32) = wire_len as u32; // tp_len
@@ -350,13 +372,16 @@ impl PacketRing {
                     *(dst.add(24) as *mut u32) = tp_usec;
                 }
                 TpacketVersion::V2 => {
+                    let ts = crate::time::PosixTimeSpec::now();
+                    let tp_sec = ts.tv_sec as u32;
+                    let tp_nsec = ts.tv_nsec as u32;
                     *(dst.add(0) as *mut u32) = 0; // tp_status (placeholder)
                     *(dst.add(4) as *mut u32) = wire_len as u32; // tp_len
                     *(dst.add(8) as *mut u32) = snaplen as u32; // tp_snaplen
                     *(dst.add(12) as *mut u16) = tp_mac;
                     *(dst.add(14) as *mut u16) = tp_net;
                     *(dst.add(16) as *mut u32) = tp_sec;
-                    *(dst.add(20) as *mut u32) = tp_usec * 1000; // tp_nsec
+                    *(dst.add(20) as *mut u32) = tp_nsec; // tp_nsec
                     *(dst.add(24) as *mut u16) = meta.vlan_tci; // tp_vlan_tci
                     *(dst.add(26) as *mut u16) = meta.vlan_tpid; // tp_vlan_tpid
                     // tp_padding stays zero
@@ -440,6 +465,13 @@ pub fn validate_ring_config(
     if block_size == 0 || block_size % PAGE_SIZE != 0 {
         return Err(SystemError::EINVAL);
     }
+    // Overflow guard: ensure block_nr * block_size does not overflow and is
+    // non-zero. Done early (before frame_size checks) because subsequent
+    // validation and the eventual allocation depend on the total ring size.
+    let total = block_nr.checked_mul(block_size).ok_or(SystemError::EINVAL)?;
+    if total == 0 {
+        return Err(SystemError::EINVAL);
+    }
     // frame_size >= hdrlen + reserve, and 16-byte aligned.
     let min_frame_size = hdrlen + reserve;
     if frame_size < min_frame_size || frame_size % tpacket_align(1) != 0 {
@@ -455,11 +487,6 @@ pub fn validate_ring_config(
     }
     // frame_nr consistency: frames_per_block * block_nr == frame_nr.
     if frames_per_block.checked_mul(block_nr) != Some(frame_nr) {
-        return Err(SystemError::EINVAL);
-    }
-    // Overflow guard.
-    let total = block_nr.checked_mul(block_size).ok_or(SystemError::EINVAL)?;
-    if total == 0 {
         return Err(SystemError::EINVAL);
     }
 

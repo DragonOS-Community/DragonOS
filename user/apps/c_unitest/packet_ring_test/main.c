@@ -6,10 +6,14 @@
  *   2. setsockopt(PACKET_VERSION, TPACKET_V2)
  *   3. setsockopt(PACKET_RX_RING, ...)
  *   4. mmap ring buffer
- *   5. poll 等待数据
- *   6. 遍历帧读取 tp_status==TP_STATUS_USER 的帧
- *   7. 翻回帧到内核 (TP_STATUS_KERNEL)
- *   8. getsockopt(PACKET_STATISTICS)
+ *   5. 通过 sendto 向 loopback 接口发送一帧以太网数据，主动触发接收
+ *      （AF_PACKET raw socket bind ETH_P_ALL 会收到自己发出的包）
+ *   6. poll 等待数据
+ *   7. 遍历帧读取 tp_status==TP_STATUS_USER 的帧，校验数据与发送一致
+ *   8. 翻回帧到内核 (TP_STATUS_KERNEL)
+ *   9. getsockopt(PACKET_STATISTICS)
+ *
+ * 测试自包含：不依赖环境外部流量，通过 loopback 自发自收验证抓包功能。
  *
  * 运行: 在 DragonOS 中执行 /bin/packet_ring_test
  */
@@ -25,7 +29,9 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
 #include <poll.h>
+#include <net/if.h>
 
 #include <linux/if_packet.h>
 #include <linux/if_ether.h>
@@ -40,11 +46,32 @@
 #define POLL_TIMEOUT_MS  5000
 #define DUMP_BYTES       32
 
+/* ---- 自发测试帧 ----
+ * 14 字节以太网头 (dst=broadcast, src=00:..:00, proto=ETH_P_IP)
+ * + 4 字节 payload "TEST" => 共 18 字节
+ */
+#define SENT_PAYLOAD     "TEST"
+#define SENT_PAYLOAD_LEN 4
+#define SENT_FRAME_LEN   (ETH_HLEN + SENT_PAYLOAD_LEN)
+
 int main(void)
 {
     int fd = -1;
     void *ring = MAP_FAILED;
     int rc = 1;
+    int verified = 0;
+    unsigned char sent_frame[SENT_FRAME_LEN];
+    int lo_ifindex = -1;
+
+    /* 构造自发帧：dst=broadcast, src=zero, proto=htons(ETH_P_IP), payload="TEST" */
+    memset(sent_frame, 0, sizeof(sent_frame));
+    memset(sent_frame, 0xff, 6);                /* dst MAC = broadcast */
+    /* src MAC 保持 00:00:00:00:00:00 */
+    {
+        uint16_t proto = htons(ETH_P_IP);
+        memcpy(sent_frame + 12, &proto, 2);     /* Ethernet protocol */
+    }
+    memcpy(sent_frame + ETH_HLEN, SENT_PAYLOAD, SENT_PAYLOAD_LEN);
 
     /* ============================================================
      * Step 1: 创建 AF_PACKET raw socket
@@ -102,7 +129,47 @@ int main(void)
            RING_SIZE, ring);
 
     /* ============================================================
-     * Step 6: poll 等待数据到达 (EPOLLIN / POLLIN)
+     * Step 6: 主动发送一帧到 loopback 接口，触发 AF_PACKET 接收
+     *
+     * 通过 SIOCGIFINDEX 获取 "lo" 的 ifindex，再用 sendto 指定
+     * sockaddr_ll 发送。AF_PACKET raw socket bind ETH_P_ALL 会
+     * 收到本 socket 自己发出的包（loopback 时内核会回环）。
+     * ============================================================ */
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, "lo", IFNAMSIZ - 1);
+
+    if (ioctl(fd, SIOCGIFINDEX, &ifr) < 0) {
+        perror("[FAIL] Step 6: ioctl(SIOCGIFINDEX, \"lo\")");
+        goto cleanup;
+    }
+    lo_ifindex = ifr.ifr_ifindex;
+    printf("[OK] Step 6: lo ifindex = %d\n", lo_ifindex);
+
+    struct sockaddr_ll sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sll_family   = AF_PACKET;
+    sa.sll_protocol = htons(ETH_P_ALL);
+    sa.sll_ifindex  = lo_ifindex;
+    sa.sll_halen    = 6;
+    memcpy(sa.sll_addr, sent_frame, 6);   /* dst MAC = broadcast */
+
+    ssize_t sent = sendto(fd, sent_frame, SENT_FRAME_LEN, 0,
+                          (struct sockaddr *)&sa, sizeof(sa));
+    if (sent < 0) {
+        perror("[FAIL] Step 6: sendto(loopback)");
+        goto cleanup;
+    }
+    if (sent != SENT_FRAME_LEN) {
+        printf("[FAIL] Step 6: sendto short write: %zd (expected %d)\n",
+               sent, SENT_FRAME_LEN);
+        goto cleanup;
+    }
+    printf("[OK] Step 6: sendto(loopback) sent %zd bytes (broadcast ETH_P_IP + \"TEST\")\n",
+           sent);
+
+    /* ============================================================
+     * Step 7: poll 等待数据到达 (EPOLLIN / POLLIN)
      * ============================================================ */
     struct pollfd pfd;
     pfd.fd = fd;
@@ -117,15 +184,15 @@ int main(void)
         goto cleanup;
     }
     if (pr == 0) {
-        printf("[WARN] Step 6: poll() timed out — no packets in %d ms\n",
+        printf("[WARN] Step 7: poll() timed out — no packets in %d ms\n",
                POLL_TIMEOUT_MS);
     } else {
-        printf("[OK] Step 6: poll() = %d, revents = 0x%hx (POLLIN=%d)\n",
+        printf("[OK] Step 7: poll() = %d, revents = 0x%hx (POLLIN=%d)\n",
                pr, pfd.revents, (pfd.revents & POLLIN) != 0);
     }
 
     /* ============================================================
-     * Step 7: 遍历 ring 中所有帧，处理 TP_STATUS_USER 帧
+     * Step 8: 遍历 ring 中所有帧，处理 TP_STATUS_USER 帧
      *
      * V1/V2 ring 是平坦帧数组。frame i 起始地址 = base + i * tp_frame_size。
      * 每帧以 struct tpacket2_hdr 开头。
@@ -144,7 +211,7 @@ int main(void)
 
         frames_read++;
 
-        printf("[OK] Step 7: Frame %u: tp_status=USER "
+        printf("[OK] Step 8: Frame %u: tp_status=USER "
                "tp_len=%u tp_snaplen=%u tp_mac=%u tp_net=%u "
                "tp_sec=%u tp_nsec=%u",
                i, hdr->tp_len, hdr->tp_snaplen,
@@ -171,7 +238,30 @@ int main(void)
         }
 
         /* ============================================================
-         * Step 8: 将帧翻回内核 (TP_STATUS_KERNEL)
+         * Step 8a: 校验收到的帧与自发帧一致
+         *
+         * 比较 tp_mac 起始的 SENT_FRAME_LEN 字节与 sent_frame。
+         * 只有数据匹配才视为真正抓到包。
+         * ============================================================ */
+        if (hdr->tp_mac > 0 &&
+            hdr->tp_mac + SENT_FRAME_LEN <= (i + 1) * FRAME_SIZE &&
+            hdr->tp_snaplen >= SENT_FRAME_LEN) {
+            unsigned char *data = frame_base + hdr->tp_mac;
+            if (memcmp(data, sent_frame, SENT_FRAME_LEN) == 0) {
+                verified = 1;
+                printf("  -> Frame %u verified: matches sent frame (%d bytes)\n",
+                       i, SENT_FRAME_LEN);
+            } else {
+                printf("  -> Frame %u data mismatch (expected broadcast ETH_P_IP + \"TEST\")\n",
+                       i);
+            }
+        } else if (hdr->tp_snaplen < SENT_FRAME_LEN) {
+            printf("  -> Frame %u too short (%u < %d), cannot verify\n",
+                   i, hdr->tp_snaplen, SENT_FRAME_LEN);
+        }
+
+        /* ============================================================
+         * Step 9: 将帧翻回内核 (TP_STATUS_KERNEL)
          *
          * 内核扫描 tp_status==KERNEL 的帧来写入新数据。
          * 写入前加 compiler barrier 确保 header 字段读取已完成。
@@ -182,10 +272,10 @@ int main(void)
     }
 
     if (frames_read == 0 && pr > 0)
-        printf("[WARN] Step 7: poll returned but no USER frames found\n");
+        printf("[WARN] Step 8: poll returned but no USER frames found\n");
 
     /* ============================================================
-     * Step 9: getsockopt(PACKET_STATISTICS)
+     * Step 10: getsockopt(PACKET_STATISTICS)
      *
      * Linux 语义: 读取后计数器重置。
      * ============================================================ */
@@ -198,30 +288,32 @@ int main(void)
         perror("[FAIL] getsockopt(PACKET_STATISTICS)");
         goto cleanup;
     }
-    printf("[OK] Step 9: PACKET_STATISTICS: tp_packets=%u tp_drops=%u\n",
+    printf("[OK] Step 10: PACKET_STATISTICS: tp_packets=%u tp_drops=%u\n",
            stats.tp_packets, stats.tp_drops);
 
-    if (stats.tp_packets > 0) {
-        printf("[PASS] tp_packets > 0 — ring buffer captured traffic\n");
+    if (verified) {
+        printf("[PASS] received and verified self-sent frame on ring buffer\n");
+        rc = 0;
+    } else if (stats.tp_packets > 0) {
+        printf("[INFO] tp_packets > 0 but frame data not verified\n");
     } else {
-        printf("[INFO] tp_packets == 0 (no traffic during test window)\n");
+        printf("[INFO] tp_packets == 0 (no traffic captured during test window)\n");
     }
-
-    rc = 0;
 
 cleanup:
     /* ============================================================
-     * Step 10: 清理 — munmap + close
+     * Step 11: 清理 — munmap + close
      * ============================================================ */
     if (ring != MAP_FAILED) {
         munmap(ring, RING_SIZE);
-        printf("[OK] Step 10: munmap(%d)\n", RING_SIZE);
+        printf("[OK] Step 11: munmap(%d)\n", RING_SIZE);
     }
     if (fd >= 0) {
         close(fd);
-        printf("[OK] Step 10: close(%d)\n", fd);
+        printf("[OK] Step 11: close(%d)\n", fd);
     }
 
-    printf("\n=== packet_ring_test %s ===\n", rc ? "FAILED" : "PASSED");
+    printf("\n=== packet_ring_test %s ===\n",
+           rc ? "FAILED" : "PASSED");
     return rc;
 }

@@ -36,12 +36,15 @@ use super::{
     },
 };
 
+static NEXT_DAX_OWNER_INCARNATION: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Debug)]
 pub struct FuseNode {
     fs: Weak<FuseFS>,
     conn: Arc<FuseConn>,
     self_ref: Weak<FuseNode>,
     nodeid: u64,
+    dax_owner_incarnation: u64,
     parent_nodeid: Mutex<u64>,
     parent: Mutex<Option<Arc<FuseNode>>>,
     name: Mutex<Option<String>>,
@@ -93,11 +96,17 @@ impl FuseNode {
     ) -> Arc<Self> {
         let has_cached = cached.is_some();
         let initial_attr_epoch = conn.sample_attr_epoch();
+        let dax_owner_incarnation = NEXT_DAX_OWNER_INCARNATION.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(
+            dax_owner_incarnation, 0,
+            "FUSE DAX owner identity exhausted"
+        );
         Arc::new_cyclic(|self_ref| Self {
             fs,
             conn,
             self_ref: self_ref.clone(),
             nodeid,
+            dax_owner_incarnation,
             parent_nodeid: Mutex::new(parent_nodeid),
             parent: Mutex::new(parent),
             name: Mutex::new(None),
@@ -124,6 +133,11 @@ impl FuseNode {
 
     pub(crate) fn generation(&self) -> u64 {
         self.generation.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn dax_mapping_owner(&self) -> super::virtiofs::dax::DaxMappingOwner {
+        super::virtiofs::dax::DaxMappingOwner::from_inode(self.nodeid, self.dax_owner_incarnation)
+            .expect("FuseNode has a valid DAX owner identity")
     }
 
     pub(crate) fn set_generation(&self, gen: u64) {

@@ -25,17 +25,18 @@ use crate::{
     process::ProcessManager,
 };
 
-use super::virtiofs::dax::DaxRangeAllocator;
+use super::virtiofs::dax::{DaxMountMode, DaxRangeAllocator, DAX_RANGE_SIZE};
 use crate::process::cred::CAPFlags;
 
 use super::protocol::{
     FuseInHeader, FuseWriteIn, FUSE_ABORT_ERROR, FUSE_ASYNC_DIO, FUSE_ASYNC_READ,
     FUSE_ATOMIC_O_TRUNC, FUSE_AUTO_INVAL_DATA, FUSE_BIG_WRITES, FUSE_DESTROY, FUSE_DONT_MASK,
     FUSE_DO_READDIRPLUS, FUSE_EXPLICIT_INVAL_DATA, FUSE_EXPORT_SUPPORT, FUSE_FORGET, FUSE_FSYNC,
-    FUSE_FSYNCDIR, FUSE_GETXATTR, FUSE_HANDLE_KILLPRIV, FUSE_HAS_EXPIRE_ONLY, FUSE_INIT_EXT,
-    FUSE_INTERRUPT, FUSE_LISTXATTR, FUSE_MAX_PAGES, FUSE_NO_OPENDIR_SUPPORT, FUSE_NO_OPEN_SUPPORT,
-    FUSE_PARALLEL_DIROPS, FUSE_POSIX_ACL, FUSE_POSIX_LOCKS, FUSE_READDIRPLUS_AUTO,
-    FUSE_REMOVEXATTR, FUSE_SETXATTR, FUSE_SUBMOUNTS, FUSE_WRITEBACK_CACHE,
+    FUSE_FSYNCDIR, FUSE_GETXATTR, FUSE_HANDLE_KILLPRIV, FUSE_HAS_EXPIRE_ONLY, FUSE_HAS_INODE_DAX,
+    FUSE_INIT_EXT, FUSE_INTERRUPT, FUSE_LISTXATTR, FUSE_MAP_ALIGNMENT, FUSE_MAX_PAGES,
+    FUSE_NO_OPENDIR_SUPPORT, FUSE_NO_OPEN_SUPPORT, FUSE_PARALLEL_DIROPS, FUSE_POSIX_ACL,
+    FUSE_POSIX_LOCKS, FUSE_READDIRPLUS_AUTO, FUSE_REMOVEXATTR, FUSE_SETXATTR, FUSE_SUBMOUNTS,
+    FUSE_WRITEBACK_CACHE,
 };
 use super::reply::{FuseReadPagesReply, FuseReply};
 use super::{stats, trace};
@@ -43,6 +44,7 @@ use super::{stats, trace};
 mod daemon;
 mod request;
 pub(crate) use request::BackgroundReadPagesCtx;
+pub(crate) use request::FuseDaxRequestOutcome;
 
 fn wait_with_recheck<T, F>(waitq: &WaitQueue, mut check: F) -> Result<T, SystemError>
 where
@@ -209,6 +211,7 @@ pub struct FusePendingState {
     wait: WaitQueue,
     background_credit: Mutex<Option<FuseBackgroundCredit>>,
     read_completion: Option<FuseReadCompletion>,
+    outcome_unknown: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -369,8 +372,17 @@ impl FuseBackgroundState {
 enum PendingCompletion {
     Waiting,
     Completing,
-    Ready(Result<FusePendingResult, SystemError>),
+    Ready(Result<FusePendingResult, SystemError>, FuseCompletionKind),
     Consumed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FuseCompletionKind {
+    Success,
+    NeverSubmitted,
+    DaemonError,
+    OutcomeUnknown,
+    Disconnected,
 }
 
 #[derive(Debug)]
@@ -402,6 +414,7 @@ impl FusePendingState {
             wait: WaitQueue::default(),
             background_credit: Mutex::new(background_credit),
             read_completion,
+            outcome_unknown: AtomicBool::new(false),
         }
     }
 
@@ -410,17 +423,50 @@ impl FusePendingState {
     }
 
     pub fn complete(&self, v: Result<FuseReply, SystemError>) -> bool {
-        self.complete_result(v.map(FusePendingResult::Reply))
+        let kind = if v.is_ok() {
+            FuseCompletionKind::Success
+        } else {
+            FuseCompletionKind::OutcomeUnknown
+        };
+        self.complete_result(v.map(FusePendingResult::Reply), kind)
+    }
+
+    pub(crate) fn complete_daemon_error(&self, error: SystemError) -> bool {
+        let kind = if self.outcome_unknown.load(Ordering::Acquire) {
+            FuseCompletionKind::OutcomeUnknown
+        } else {
+            FuseCompletionKind::DaemonError
+        };
+        self.complete_result(Err(error), kind)
+    }
+
+    pub(crate) fn complete_never_submitted(&self, error: SystemError) -> bool {
+        self.complete_result(Err(error), FuseCompletionKind::NeverSubmitted)
+    }
+
+    pub(crate) fn complete_disconnected(&self, error: SystemError) -> bool {
+        self.complete_result(Err(error), FuseCompletionKind::Disconnected)
+    }
+
+    pub(crate) fn mark_outcome_unknown(&self) {
+        self.outcome_unknown.store(true, Ordering::Release);
     }
 
     /// Complete a page-cache read whose payload was written into its owned
     /// destination.  This deliberately shares the ordinary pending state so
     /// duplicate replies, disconnect and teardown have one retirement point.
     pub(crate) fn complete_read_pages_direct(&self, bytes: usize) -> bool {
-        self.complete_result(Ok(FusePendingResult::ReadPagesDirect { bytes }))
+        self.complete_result(
+            Ok(FusePendingResult::ReadPagesDirect { bytes }),
+            FuseCompletionKind::Success,
+        )
     }
 
-    fn complete_result(&self, mut v: Result<FusePendingResult, SystemError>) -> bool {
+    fn complete_result(
+        &self,
+        mut v: Result<FusePendingResult, SystemError>,
+        mut kind: FuseCompletionKind,
+    ) -> bool {
         let mut guard = self.response.lock();
         if !matches!(*guard, PendingCompletion::Waiting) {
             // Duplicate replies are ignored (Linux does similarly).
@@ -431,11 +477,12 @@ impl FusePendingState {
         if let Some(completion) = &self.read_completion {
             if let Err(error) = completion.finish(&v) {
                 v = Err(error);
+                kind = FuseCompletionKind::OutcomeUnknown;
             }
             completion.release_open_pin();
         }
         let mut guard = self.response.lock();
-        *guard = PendingCompletion::Ready(v);
+        *guard = PendingCompletion::Ready(v, kind);
         drop(guard);
         // Linux releases a background slot at request completion, not when a
         // waiter later consumes the result.  Taking the token makes this
@@ -467,9 +514,9 @@ impl FusePendingState {
     fn wait_read_pages_once(&self) -> FuseReadWaitOutcome {
         let take_ready = || {
             let mut guard = self.response.lock();
-            if matches!(*guard, PendingCompletion::Ready(_)) {
+            if matches!(*guard, PendingCompletion::Ready(_, _)) {
                 let ready = core::mem::replace(&mut *guard, PendingCompletion::Consumed);
-                if let PendingCompletion::Ready(result) = ready {
+                if let PendingCompletion::Ready(result, _) = ready {
                     return Some(result.map(|result| match result {
                         FusePendingResult::Reply(reply) => FuseReadPagesReply::Contiguous(reply),
                         FusePendingResult::ReadPagesDirect { bytes } => {
@@ -502,14 +549,58 @@ impl FusePendingState {
     fn wait_result(&self) -> Result<FusePendingResult, SystemError> {
         wait_with_recheck(&self.wait, || {
             let mut guard = self.response.lock();
-            if matches!(*guard, PendingCompletion::Ready(_)) {
+            if matches!(*guard, PendingCompletion::Ready(_, _)) {
                 let ready = core::mem::replace(&mut *guard, PendingCompletion::Consumed);
-                if let PendingCompletion::Ready(res) = ready {
+                if let PendingCompletion::Ready(res, _) = ready {
                     return Ok(Some(res));
                 }
             }
             Ok(None)
         })?
+    }
+
+    pub(crate) fn wait_result_with_kind(
+        &self,
+    ) -> Result<(Result<FusePendingResult, SystemError>, FuseCompletionKind), SystemError> {
+        wait_with_recheck(&self.wait, || {
+            let mut guard = self.response.lock();
+            if matches!(*guard, PendingCompletion::Ready(_, _)) {
+                let ready = core::mem::replace(&mut *guard, PendingCompletion::Consumed);
+                if let PendingCompletion::Ready(result, kind) = ready {
+                    return Ok(Some((result, kind)));
+                }
+            }
+            Ok(None)
+        })
+    }
+
+    pub(crate) fn wait_result_with_kind_uninterruptible(
+        &self,
+    ) -> Result<(Result<FusePendingResult, SystemError>, FuseCompletionKind), SystemError> {
+        let take_ready = || {
+            let mut guard = self.response.lock();
+            if matches!(*guard, PendingCompletion::Ready(_, _)) {
+                let ready = core::mem::replace(&mut *guard, PendingCompletion::Consumed);
+                if let PendingCompletion::Ready(result, kind) = ready {
+                    return Some((result, kind));
+                }
+            }
+            None
+        };
+        if let Some(result) = take_ready() {
+            return Ok(result);
+        }
+        loop {
+            let (waiter, waker) = Waiter::new_pair();
+            self.wait.register_waker(waker.clone())?;
+            if let Some(result) = take_ready() {
+                self.wait.remove_waker(&waker);
+                return Ok(result);
+            }
+            // Mapping lifecycle state may not be released until the request has
+            // a terminal result. Signals are therefore deliberately ignored.
+            waiter.wait(false)?;
+        }
     }
 }
 
@@ -521,6 +612,7 @@ struct FuseInitNegotiated {
     time_gran: u32,
     max_pages: u16,
     flags: u64,
+    map_alignment: u16,
 }
 
 impl Default for FuseInitNegotiated {
@@ -533,6 +625,7 @@ impl Default for FuseInitNegotiated {
             time_gran: 0,
             max_pages: FuseConn::DEFAULT_MAX_PAGES as u16,
             flags: 0,
+            map_alignment: 0,
         }
     }
 }
@@ -614,13 +707,14 @@ impl FuseConn {
     }
 
     pub fn new_for_virtiofs(max_request_size: usize, max_reply_size: usize) -> Arc<Self> {
-        Self::new_for_virtiofs_with_dax(max_request_size, max_reply_size, None)
+        Self::new_for_virtiofs_with_dax(max_request_size, max_reply_size, None, DaxMountMode::Never)
     }
 
     pub(crate) fn new_for_virtiofs_with_dax(
         max_request_size: usize,
         max_reply_size: usize,
         cache_window_len: Option<usize>,
+        dax_mode: DaxMountMode,
     ) -> Arc<Self> {
         let overhead = size_of::<FuseInHeader>() + size_of::<FuseWriteIn>();
         let cap = if max_request_size > overhead {
@@ -628,7 +722,11 @@ impl FuseConn {
         } else {
             Self::MIN_MAX_WRITE
         };
-        let dax_allocator = cache_window_len.and_then(|len| match DaxRangeAllocator::new(len) {
+        let dax_allocator = (dax_mode != DaxMountMode::Never)
+            .then_some(cache_window_len)
+            .flatten()
+            .filter(|len| *len >= DAX_RANGE_SIZE)
+            .and_then(|len| match DaxRangeAllocator::new(len) {
             Ok(allocator) => Some(Arc::new(allocator)),
             Err(error) => {
                 log::warn!(
@@ -639,13 +737,14 @@ impl FuseConn {
                 None
             }
         });
-        Self::new_with_max_write_cap(
-            cap,
-            Self::virtiofs_init_flags(),
-            true,
-            Some(max_reply_size),
-            dax_allocator,
-        )
+        let mut init_flags = Self::virtiofs_init_flags();
+        if dax_allocator.is_some() {
+            init_flags |= FUSE_MAP_ALIGNMENT;
+        }
+        if dax_mode == DaxMountMode::Inode {
+            init_flags |= FUSE_HAS_INODE_DAX;
+        }
+        Self::new_with_max_write_cap(cap, init_flags, true, Some(max_reply_size), dax_allocator)
     }
 
     fn new_with_max_write_cap(
@@ -706,18 +805,28 @@ impl FuseConn {
         self.dax_allocator.as_ref()
     }
 
-    fn shutdown_dax_allocator(&self) {
+    pub(crate) fn dax_map_alignment(&self) -> Option<u16> {
+        self.dax_allocator.as_ref()?;
+        Some(self.inner.lock().init.map_alignment)
+    }
+
+    fn dax_map_alignment_valid(enabled_flags: u64, map_alignment: u16) -> bool {
+        (enabled_flags & FUSE_MAP_ALIGNMENT) == 0
+            || u32::from(map_alignment) <= super::virtiofs::dax::DAX_RANGE_SIZE.trailing_zeros()
+    }
+
+    fn begin_shutdown_dax_allocator(&self) {
         let Some(allocator) = self.dax_allocator.as_ref() else {
             return;
         };
         allocator.begin_shutdown();
-        if let Err(error) = allocator.finish_shutdown() {
-            log::error!(
-                "virtiofs: DAX allocator still owns ranges during connection teardown: {:?}, state={:?}",
-                error,
-                allocator.snapshot()
-            );
-        }
+    }
+
+    fn disconnect_cleanup_dax_allocator(&self) {
+        let Some(allocator) = self.dax_allocator.as_ref() else {
+            return;
+        };
+        allocator.disconnect_cleanup();
     }
 
     pub(crate) fn register_filesystem(&self, fs: Weak<super::fs::FuseFS>) {
@@ -987,12 +1096,15 @@ impl FuseConn {
     }
 
     pub fn abort(&self) {
-        self.shutdown_dax_allocator();
         self.background.disconnect();
         let (processing, pending_noreply_count): (Vec<Arc<FusePendingState>>, usize) = {
             let mut g = self.inner.lock();
             g.connected = false;
             g.mounted = false;
+            // Close allocator acquisition before releasing the connection lock,
+            // so no observer can see a disconnected connection while DAX get()
+            // still accepts a new reference.
+            self.begin_shutdown_dax_allocator();
             let pending_noreply_count = g
                 .pending
                 .iter()
@@ -1007,8 +1119,9 @@ impl FuseConn {
         };
         stats::on_fuse_requests_aborted(processing.len() + pending_noreply_count);
         for p in processing {
-            p.complete(Err(SystemError::ENOTCONN));
+            p.complete_disconnected(SystemError::ENOTCONN);
         }
+        self.disconnect_cleanup_dax_allocator();
         self.read_wait.wakeup(None);
         self.wake_bridge(stats::VirtioFsBridgeWakeSource::Disconnect);
         self.init_wait.wakeup(None);
@@ -1023,7 +1136,7 @@ impl FuseConn {
     /// Keep the connection readable for daemon-side teardown; actual disconnect
     /// happens when /dev/fuse is closed or explicit abort path is triggered.
     pub fn on_umount(&self) {
-        self.shutdown_dax_allocator();
+        self.begin_shutdown_dax_allocator();
         self.background.disconnect();
         let processing: Vec<Arc<FusePendingState>>;
         let dropped_processing: Vec<Arc<FusePendingState>>;
@@ -1218,9 +1331,14 @@ mod tests {
 
     use super::super::protocol::{
         FuseEntryOut, FuseOpenOut, FuseOutHeader, FuseStatfsOut, FUSE_CREATE, FUSE_DESTROY,
-        FUSE_GETATTR, FUSE_LOOKUP, FUSE_STATFS,
+        FUSE_GETATTR, FUSE_HAS_INODE_DAX, FUSE_LOOKUP, FUSE_MAP_ALIGNMENT, FUSE_REMOVEMAPPING,
+        FUSE_SETUPMAPPING, FUSE_STATFS,
     };
-    use super::{daemon, request, stats, FuseConn, FusePendingState, FuseReplyCapacitySource};
+    use super::super::virtiofs::dax::{DaxMountMode, DAX_RANGE_SIZE};
+    use super::{
+        daemon, request, stats, FuseCompletionKind, FuseConn, FusePendingState,
+        FuseReplyCapacitySource,
+    };
 
     fn set_minor(conn: &FuseConn, minor: u32) {
         conn.inner.lock().init.minor = minor;
@@ -1232,6 +1350,68 @@ mod tests {
             .unwrap()
             .unwrap();
         (capacity.bytes, capacity.source)
+    }
+
+    #[test]
+    fn dax_init_policy_is_internal_and_window_gated() {
+        let never = FuseConn::new_for_virtiofs_with_dax(
+            8192,
+            8192,
+            Some(DAX_RANGE_SIZE),
+            DaxMountMode::Never,
+        );
+        assert!(never.dax_allocator().is_none());
+        assert_eq!(never.inner.lock().init_flags & FUSE_MAP_ALIGNMENT, 0);
+
+        let always = FuseConn::new_for_virtiofs_with_dax(
+            8192,
+            8192,
+            Some(DAX_RANGE_SIZE),
+            DaxMountMode::Always,
+        );
+        assert!(always.dax_allocator().is_some());
+        assert_ne!(always.inner.lock().init_flags & FUSE_MAP_ALIGNMENT, 0);
+        assert_eq!(always.inner.lock().init_flags & FUSE_HAS_INODE_DAX, 0);
+
+        let inode = FuseConn::new_for_virtiofs_with_dax(
+            8192,
+            8192,
+            Some(DAX_RANGE_SIZE),
+            DaxMountMode::Inode,
+        );
+        let flags = inode.inner.lock().init_flags;
+        assert_ne!(flags & FUSE_MAP_ALIGNMENT, 0);
+        assert_ne!(flags & FUSE_HAS_INODE_DAX, 0);
+
+        let no_window = FuseConn::new_for_virtiofs_with_dax(8192, 8192, None, DaxMountMode::Always);
+        assert!(no_window.dax_allocator().is_none());
+        assert_eq!(no_window.inner.lock().init_flags & FUSE_MAP_ALIGNMENT, 0);
+
+        let inode_without_window =
+            FuseConn::new_for_virtiofs_with_dax(8192, 8192, None, DaxMountMode::Inode);
+        let flags = inode_without_window.inner.lock().init_flags;
+        assert_eq!(flags & FUSE_MAP_ALIGNMENT, 0);
+        assert_ne!(flags & FUSE_HAS_INODE_DAX, 0);
+    }
+
+    #[test]
+    fn mapping_requests_have_exact_empty_reply_contracts() {
+        let conn = FuseConn::new_for_virtiofs(8192, 8192);
+        assert_eq!(
+            capacity(&conn, FUSE_SETUPMAPPING, &[]).0,
+            size_of::<FuseOutHeader>()
+        );
+        assert_eq!(
+            capacity(&conn, FUSE_REMOVEMAPPING, &[]).0,
+            size_of::<FuseOutHeader>()
+        );
+    }
+
+    #[test]
+    fn dax_alignment_rejects_daemon_requirement_above_range_shift() {
+        assert!(FuseConn::dax_map_alignment_valid(FUSE_MAP_ALIGNMENT, 21));
+        assert!(!FuseConn::dax_map_alignment_valid(FUSE_MAP_ALIGNMENT, 22));
+        assert!(FuseConn::dax_map_alignment_valid(0, u16::MAX));
     }
 
     #[test]
@@ -1350,6 +1530,34 @@ mod tests {
             contiguous.wait_read_pages_complete().unwrap(),
             super::super::reply::FuseReadPagesReply::Contiguous(reply) if &*reply == [1, 2]
         ));
+    }
+
+    #[test]
+    fn dax_completion_distinguishes_daemon_reply_from_synthetic_error() {
+        let daemon = FusePendingState::new(2, FUSE_SETUPMAPPING);
+        assert!(daemon.complete_daemon_error(SystemError::EIO));
+        let (result, kind) = daemon.wait_result_with_kind().unwrap();
+        assert_eq!(result.unwrap_err(), SystemError::EIO);
+        assert_eq!(kind, FuseCompletionKind::DaemonError);
+
+        let synthetic = FusePendingState::new(4, FUSE_SETUPMAPPING);
+        synthetic.mark_outcome_unknown();
+        assert!(synthetic.complete_daemon_error(SystemError::EIO));
+        let (result, kind) = synthetic.wait_result_with_kind().unwrap();
+        assert_eq!(result.unwrap_err(), SystemError::EIO);
+        assert_eq!(kind, FuseCompletionKind::OutcomeUnknown);
+
+        let local = FusePendingState::new(5, FUSE_REMOVEMAPPING);
+        assert!(local.complete_never_submitted(SystemError::ENOMEM));
+        let (result, kind) = local.wait_result_with_kind().unwrap();
+        assert_eq!(result.unwrap_err(), SystemError::ENOMEM);
+        assert_eq!(kind, FuseCompletionKind::NeverSubmitted);
+
+        let disconnected = FusePendingState::new(6, FUSE_REMOVEMAPPING);
+        assert!(disconnected.complete_disconnected(SystemError::ENOTCONN));
+        let (result, kind) = disconnected.wait_result_with_kind().unwrap();
+        assert_eq!(result.unwrap_err(), SystemError::ENOTCONN);
+        assert_eq!(kind, FuseCompletionKind::Disconnected);
     }
 
     #[test]

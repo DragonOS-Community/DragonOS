@@ -19,7 +19,9 @@ use super::super::{
     fs::{FuseFS, FuseMountData},
     protocol::FuseOutHeader,
 };
-use super::{bridge::start_bridge, VIRTIOFS_MAX_REQUEST_SIZE, VIRTIOFS_RSP_BUF_SIZE};
+use super::{
+    bridge::start_bridge, dax::DaxMountMode, VIRTIOFS_MAX_REQUEST_SIZE, VIRTIOFS_RSP_BUF_SIZE,
+};
 
 #[derive(Debug)]
 struct VirtioFsMountData {
@@ -28,7 +30,7 @@ struct VirtioFsMountData {
     group_id: u32,
     allow_other: bool,
     default_permissions: bool,
-    dax_mode: VirtioFsDaxMode,
+    dax_mode: DaxMountMode,
     conn: Arc<FuseConn>,
     instance: Arc<VirtioFsInstance>,
 }
@@ -46,13 +48,6 @@ struct VirtioFsFs {
     session_id: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VirtioFsDaxMode {
-    Never,
-    Always,
-    Inode,
-}
-
 impl VirtioFsFs {
     fn parse_opt_u32_decimal(v: &str) -> Result<u32, SystemError> {
         v.parse::<u32>().map_err(|_| SystemError::EINVAL)
@@ -66,22 +61,22 @@ impl VirtioFsFs {
         v.is_empty() || v != "0"
     }
 
-    fn parse_dax_mode(v: &str) -> Result<VirtioFsDaxMode, SystemError> {
+    fn parse_dax_mode(v: &str) -> Result<DaxMountMode, SystemError> {
         if v.is_empty() {
-            return Ok(VirtioFsDaxMode::Always);
+            return Ok(DaxMountMode::Always);
         }
 
         match v {
-            "always" => Ok(VirtioFsDaxMode::Always),
-            "never" => Ok(VirtioFsDaxMode::Never),
-            "inode" => Ok(VirtioFsDaxMode::Inode),
+            "always" => Ok(DaxMountMode::Always),
+            "never" => Ok(DaxMountMode::Never),
+            "inode" => Ok(DaxMountMode::Inode),
             _ => Err(SystemError::EINVAL),
         }
     }
 
     fn parse_mount_options(
         raw: Option<&str>,
-    ) -> Result<(u32, u32, u32, bool, bool, VirtioFsDaxMode), SystemError> {
+    ) -> Result<(u32, u32, u32, bool, bool, DaxMountMode), SystemError> {
         let pcb = ProcessManager::current_pcb();
         let cred = pcb.cred();
 
@@ -90,7 +85,7 @@ impl VirtioFsFs {
         let mut group_id: Option<u32> = None;
         let mut default_permissions = true;
         let mut allow_other = true;
-        let mut dax_mode = VirtioFsDaxMode::Never;
+        let mut dax_mode = DaxMountMode::Never;
 
         for part in raw.unwrap_or("").split(',') {
             let part = part.trim();
@@ -113,7 +108,7 @@ impl VirtioFsFs {
             }
         }
 
-        if dax_mode != VirtioFsDaxMode::Never {
+        if dax_mode != DaxMountMode::Never {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
 
@@ -208,6 +203,7 @@ impl MountableFileSystem for VirtioFsFs {
             VIRTIOFS_MAX_REQUEST_SIZE,
             VIRTIOFS_RSP_BUF_SIZE,
             instance.cache_window_len(),
+            dax_mode,
         );
 
         Ok(Some(Arc::new(VirtioFsMountData {
@@ -241,7 +237,7 @@ impl MountableFileSystem for VirtioFsFs {
             conn: md.conn.clone(),
         };
 
-        if md.dax_mode != VirtioFsDaxMode::Never {
+        if md.dax_mode != DaxMountMode::Never {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
 

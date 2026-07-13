@@ -448,23 +448,11 @@ fn sig_terminate_dump(sig: Signal) {
 fn sig_stop(sig: Signal) {
     // 在接收者上下文设置停止标志，并让当前任务进入 Stopped
     let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-    {
+    let fresh_stop = {
         let pcb = ProcessManager::current_pcb();
-        // 标记停止事件，供 waitid(WSTOPPED) 可见
-        pcb.sighand().flags_insert(SignalFlags::CLD_STOPPED);
-        if !pcb.sighand().flags_contains(SignalFlags::STOP_STOPPED) {
-            pcb.sighand().set_stop_signal(sig);
-        }
-        pcb.sighand().flags_insert(SignalFlags::STOP_STOPPED);
-    }
-    ProcessManager::mark_stop().unwrap_or_else(|e| {
-        log::error!(
-            "sleep error :{:?},failed to sleep process :{:?}, with signal :{:?}",
-            e,
-            ProcessManager::current_pcb().pid(),
-            sig
-        );
-    });
+        pcb.sighand()
+            .transition_group_stop(sig, || ProcessManager::mark_stop().is_ok())
+    };
     drop(guard);
     log::debug!(
         "sig_stop: pid={:?} entered Stopped; notifying parent and scheduler",
@@ -472,12 +460,14 @@ fn sig_stop(sig: Signal) {
     );
     // 向父进程报告 SIGCHLD 并唤醒父进程可能阻塞的 wait
     let pcb = ProcessManager::current_pcb();
-    if let Some(parent) = pcb.parent_pcb() {
-        let _ = crate::ipc::kill::send_signal_to_pcb(parent.clone(), Signal::SIGCHLD);
-        parent.wake_all_waiters();
+    if fresh_stop {
+        if let Some(parent) = pcb.parent_pcb() {
+            let _ = crate::ipc::kill::send_signal_to_pcb(parent.clone(), Signal::SIGCHLD);
+            parent.wake_all_waiters();
+        }
+        // 唤醒等待在该子进程等待队列上的等待者
+        pcb.wake_all_waiters();
     }
-    // 唤醒等待在该子进程等待队列上的等待者
-    pcb.wake_all_waiters();
     schedule(SchedMode::SM_NONE);
 }
 /// 信号默认处理函数——继续进程

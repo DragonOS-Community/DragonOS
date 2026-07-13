@@ -691,6 +691,16 @@ impl Signal {
         // 注意：当前 sighand 共享在 CLONE_THREAD 线程组内，因此标志位操作仍然只需要对共享 sighand 做一次。
         let thread_group_leader = ProcessManager::thread_group_leader_of(&pcb);
 
+        // Linux prepare_signal() drops every signal except SIGKILL once group
+        // exit has started. In particular, SIGCONT must not revive a group
+        // whose job-control state was cleared by do_group_exit().
+        if thread_group_leader
+            .sighand()
+            .flags_contains(SignalFlags::GROUP_EXIT)
+        {
+            return *self == Signal::SIGKILL;
+        }
+
         let flush: SigSet;
         if !(self.into_sigset() & SIG_KERNEL_STOP_MASK).is_empty() {
             flush = Signal::SIGCONT.into_sigset();
@@ -702,37 +712,36 @@ impl Signal {
                 t.sig_info_mut().sig_pending_mut().flush_by_mask(&flush);
                 true
             });
-            // 异步作业控制停止：立即将目标进程置为 Stopped，并上报/唤醒父进程等待
-            // 这样即便目标进程尚未返回用户态执行默认处理，也能及时观测到 WSTOPPED 事件
-            thread_group_leader
+            // Serialize the scheduler stop with the persistent job-control
+            // state. This follows Linux's sighand -> pi_lock -> rq_lock order
+            // and prevents a concurrent SIGCONT from splitting the transition.
+            let fresh_stop = thread_group_leader
                 .sighand()
-                .flags_insert(SignalFlags::CLD_STOPPED);
-            if !thread_group_leader
-                .sighand()
-                .flags_contains(SignalFlags::STOP_STOPPED)
-            {
-                thread_group_leader.sighand().set_stop_signal(*self);
-            }
-            thread_group_leader
-                .sighand()
-                .flags_insert(SignalFlags::STOP_STOPPED);
+                .transition_group_stop(*self, || {
+                    // stop_task only rejects an already Exited task. Publishing
+                    // the group event therefore requires at least one live
+                    // member; every live member in this stable snapshot is
+                    // transitioned to Stopped before the callback returns.
+                    let mut has_live_member = false;
+                    ProcessManager::for_each_thread_in_group(thread_group_leader.clone(), |t| {
+                        has_live_member |= ProcessManager::stop_task(&t).is_ok();
+                        true
+                    });
+                    has_live_member
+                });
 
-            // 线程组 stop：对组内所有线程置为 Stopped，保证 SIGSTOP 对整个线程组生效。
-            ProcessManager::for_each_thread_in_group(thread_group_leader.clone(), |t| {
-                let _ = ProcessManager::stop_task(&t);
-                true
-            });
-
-            if let Some(parent) = pcb.parent_pcb() {
-                let _ = crate::ipc::kill::send_signal_to_pcb(parent.clone(), Signal::SIGCHLD);
-                parent.wake_all_waiters();
+            if fresh_stop {
+                if let Some(parent) = pcb.parent_pcb() {
+                    let _ = crate::ipc::kill::send_signal_to_pcb(parent.clone(), Signal::SIGCHLD);
+                    parent.wake_all_waiters();
+                }
+                // 唤醒等待在该子进程/线程上的等待者
+                thread_group_leader.wake_all_waiters();
+                ProcessManager::for_each_thread_in_group(thread_group_leader.clone(), |t| {
+                    t.wake_all_waiters();
+                    true
+                });
             }
-            // 唤醒等待在该子进程/线程上的等待者
-            thread_group_leader.wake_all_waiters();
-            ProcessManager::for_each_thread_in_group(thread_group_leader.clone(), |t| {
-                t.wake_all_waiters();
-                true
-            });
 
             // SIGSTOP 是 kernel-only stop 信号：其效果是把线程组置为 stopped 并通知父进程，
             // 不应作为“可传递到用户态”的 pending 信号继续入队。
@@ -759,34 +768,16 @@ impl Signal {
                 true
             });
 
-            // 仅当确实处于 job-control stopped 时，才报告 continued 事件并通知父进程
-            let was_stopped = {
-                let state = pcb.sched_info().state();
-                state.is_stopped()
-                    || pcb.sighand().flags_contains(SignalFlags::STOP_STOPPED)
-                    || pcb.sighand().flags_contains(SignalFlags::CLD_STOPPED)
-            };
-
-            if was_stopped {
-                // 线程组 continue：唤醒组内所有线程（由各线程在内核路径继续执行/重新阻塞）。
+            // SIGCONT always wakes stopped threads. Only a completed persistent
+            // group stop produces a continued event.
+            let was_stopped = thread_group_leader.sighand().transition_group_continue(|| {
                 ProcessManager::for_each_thread_in_group(thread_group_leader.clone(), |t| {
                     let _ = ProcessManager::wakeup_stop(&t);
                     true
                 });
-                // 标记继续事件，供 waitid(WCONTINUED) 可见
-                thread_group_leader
-                    .sighand()
-                    .flags_insert(SignalFlags::CLD_CONTINUED);
-                thread_group_leader
-                    .sighand()
-                    .flags_insert(SignalFlags::STOP_CONTINUED);
-                // 清理停止相关标志，符合 Linux 语义
-                thread_group_leader
-                    .sighand()
-                    .flags_remove(SignalFlags::CLD_STOPPED);
-                thread_group_leader
-                    .sighand()
-                    .flags_remove(SignalFlags::STOP_STOPPED);
+            });
+
+            if was_stopped {
                 if let Some(parent) = pcb.parent_pcb() {
                     let _ = crate::ipc::kill::send_signal_to_pcb(parent.clone(), Signal::SIGCHLD);
                     parent.wake_all_waiters();

@@ -145,6 +145,7 @@ impl FuseNode {
             return Ok(());
         }
         let node = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+        let dax_fail_closed = blocker.is_some();
         let blocker = Mutex::new(blocker);
         schedule_pagecache_io(Work::new(move || {
             let result = (|| {
@@ -174,14 +175,29 @@ impl FuseNode {
                 Ok::<(), SystemError>(())
             })();
             if let Err(error) = result {
-                log::error!(
-                    "fuse: host inode invalidation failed closed node={} offset={} len={} err={:?}",
-                    node.nodeid(),
-                    offset,
-                    len,
-                    error
-                );
-                node.conn().abort();
+                if dax_fail_closed {
+                    log::error!(
+                        "fuse: host inode invalidation failed closed node={} offset={} len={} err={:?}",
+                        node.nodeid(),
+                        offset,
+                        len,
+                        error
+                    );
+                    node.conn().abort();
+                } else {
+                    // Linux treats reverse page-cache invalidation as
+                    // best-effort and ignores invalidate_inode_pages2_range()
+                    // failures. The page-cache writeback path retains the I/O
+                    // error for later fsync reporting; it must not disconnect
+                    // an otherwise healthy non-DAX FUSE session.
+                    log::warn!(
+                        "fuse: page-cache invalidation incomplete node={} offset={} len={} err={:?}",
+                        node.nodeid(),
+                        offset,
+                        len,
+                        error
+                    );
+                }
             }
             blocker.lock().take();
         }));

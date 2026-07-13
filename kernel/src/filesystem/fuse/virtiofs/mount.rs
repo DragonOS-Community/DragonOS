@@ -91,7 +91,21 @@ impl VirtioFsFs {
         let access = match node.dax_access(file_offset as u64, write && shared) {
             Ok(access) => access,
             Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                pfm.set_retry_wait(node.conn().dax_fault_retry_wait());
+                pfm.set_retry_wait(if node.dax_host_invalidation_blocked() {
+                    node.dax_host_invalidation_retry_wait()
+                } else {
+                    node.conn().dax_fault_retry_wait()
+                });
+                return Some(VmFaultReason::VM_FAULT_RETRY);
+            }
+            Err(_) => return Some(VmFaultReason::VM_FAULT_SIGBUS),
+        };
+        let _host_access = match node.dax_try_host_access() {
+            Ok(guard) => guard,
+            Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                drop(access);
+                drop(_layout);
+                pfm.set_retry_wait(node.dax_host_invalidation_retry_wait());
                 return Some(VmFaultReason::VM_FAULT_RETRY);
             }
             Err(_) => return Some(VmFaultReason::VM_FAULT_SIGBUS),

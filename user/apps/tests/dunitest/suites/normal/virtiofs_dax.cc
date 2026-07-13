@@ -220,6 +220,17 @@ struct CleanupGuard {
     }
 };
 
+struct ExtraMountGuard {
+    const char* mountpoint;
+    bool mounted = false;
+
+    ~ExtraMountGuard() {
+        if (mounted) {
+            umount(mountpoint);
+        }
+    }
+};
+
 bool mount_virtiofs(const char* mountpoint, const char* dax_mode, int* error) {
     char options[64] = {};
     snprintf(options, sizeof(options), "dax=%s", dax_mode);
@@ -493,6 +504,313 @@ TEST(VirtioFsDax, IoMmapPermissionsEofAndTeardown) {
     ASSERT_EQ(0, close(fd));
     ASSERT_EQ(0, unlink(paths.file));
     ASSERT_EQ(0, umount(paths.mountpoint));
+    paths.cleanup();
+}
+
+TEST(VirtioFsDax, LayoutBreakingForTruncateFallocateAndAtomicOpen) {
+    TestPaths paths("layout");
+    ASSERT_TRUE(paths.create());
+    CleanupGuard cleanup{paths};
+
+    int error = 0;
+    constexpr off_t initial_size = 3 * kDaxRangeSize;
+    if (!prepare_non_dax_file(paths, initial_size, &error)) {
+        paths.cleanup();
+        if (dax_required()) {
+            FAIL() << "DAX layout test preparation failed: " << strerror(error);
+        }
+        GTEST_SKIP() << "ordinary virtiofs is unavailable: " << strerror(error);
+    }
+    ASSERT_TRUE(mount_debugfs(paths, &error)) << strerror(error);
+    if (!mount_virtiofs(paths.mountpoint, "always", &error)) {
+        remove_non_dax_file(paths);
+        paths.cleanup();
+        if (dax_required()) {
+            FAIL() << "DAX layout test requires dax=always: " << strerror(error);
+        }
+        GTEST_SKIP() << "DAX window/backend is unavailable: " << strerror(error);
+    }
+
+    int fd = open(paths.file, O_RDWR);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    void* inherited = mmap(nullptr, kPageSize, PROT_READ, MAP_SHARED, fd, kDaxRangeSize);
+    ASSERT_NE(MAP_FAILED, inherited) << strerror(errno);
+    EXPECT_EQ(pattern_byte(kDaxRangeSize), static_cast<uint8_t*>(inherited)[0]);
+
+    int ready[2] = {-1, -1};
+    int proceed[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(ready));
+    ASSERT_EQ(0, pipe(proceed));
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        close(ready[0]);
+        close(proceed[1]);
+        char byte = 'r';
+        if (write(ready[1], &byte, 1) != 1 || read(proceed[0], &byte, 1) != 1) {
+            _exit(101);
+        }
+        volatile uint8_t value = static_cast<volatile uint8_t*>(inherited)[0];
+        (void)value;
+        _exit(102);
+    }
+    close(ready[1]);
+    close(proceed[0]);
+    char byte = 0;
+    ASSERT_EQ(1, read(ready[0], &byte, 1));
+    OpcodeSnapshot before = snapshot(paths.stats);
+    ASSERT_EQ(0, ftruncate(fd, kPageSize)) << strerror(errno);
+    OpcodeSnapshot after = snapshot(paths.stats);
+    assert_valid_snapshot(before);
+    assert_valid_snapshot(after);
+    EXPECT_GT(after.remove_mapping, before.remove_mapping);
+    ASSERT_EQ(1, write(proceed[1], "x", 1));
+    close(ready[0]);
+    close(proceed[1]);
+    int status = 0;
+    ASSERT_TRUE(wait_for_child(child, &status)) << "inherited DAX PTE survived truncate timeout";
+    ASSERT_TRUE(WIFSIGNALED(status)) << "child status=" << status;
+    EXPECT_EQ(SIGBUS, WTERMSIG(status));
+    ASSERT_EQ(0, munmap(inherited, kPageSize));
+
+    ASSERT_EQ(0, ftruncate(fd, initial_size));
+    std::vector<uint8_t> nonzero(kPageSize, 0x5a);
+    ASSERT_EQ(static_cast<ssize_t>(nonzero.size()),
+              pwrite(fd, nonzero.data(), nonzero.size(), kDaxRangeSize));
+    inherited = mmap(nullptr, kPageSize, PROT_READ, MAP_SHARED, fd, kDaxRangeSize);
+    ASSERT_NE(MAP_FAILED, inherited);
+    EXPECT_EQ(0x5a, static_cast<uint8_t*>(inherited)[17]);
+    before = snapshot(paths.stats);
+    ASSERT_EQ(0, fallocate(fd, FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE, kDaxRangeSize,
+                           kPageSize))
+        << strerror(errno);
+    after = snapshot(paths.stats);
+    EXPECT_GT(after.remove_mapping, before.remove_mapping);
+    EXPECT_EQ(0, static_cast<uint8_t*>(inherited)[17]);
+    ASSERT_EQ(0, munmap(inherited, kPageSize));
+
+    ASSERT_EQ(static_cast<ssize_t>(nonzero.size()),
+              pwrite(fd, nonzero.data(), nonzero.size(), kDaxRangeSize));
+    inherited = mmap(nullptr, kPageSize, PROT_READ, MAP_SHARED, fd, kDaxRangeSize);
+    ASSERT_NE(MAP_FAILED, inherited);
+    EXPECT_EQ(0x5a, static_cast<uint8_t*>(inherited)[23]);
+    before = snapshot(paths.stats);
+    ASSERT_EQ(0, fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, kDaxRangeSize,
+                           kPageSize))
+        << strerror(errno);
+    after = snapshot(paths.stats);
+    EXPECT_GT(after.remove_mapping, before.remove_mapping);
+    EXPECT_EQ(0, static_cast<uint8_t*>(inherited)[23]);
+    ASSERT_EQ(0, munmap(inherited, kPageSize));
+
+    uint8_t mapped = 0;
+    ASSERT_EQ(1, pread(fd, &mapped, 1, 2 * kDaxRangeSize + 19));
+    before = snapshot(paths.stats);
+    int trunc_fd = open(paths.file, O_RDWR | O_TRUNC);
+    ASSERT_GE(trunc_fd, 0) << strerror(errno);
+    ASSERT_EQ(0, close(trunc_fd));
+    after = snapshot(paths.stats);
+    EXPECT_GT(after.remove_mapping, before.remove_mapping);
+    struct stat st = {};
+    ASSERT_EQ(0, fstat(fd, &st));
+    EXPECT_EQ(0, st.st_size);
+
+    ASSERT_EQ(0, close(fd));
+    ASSERT_EQ(0, umount(paths.mountpoint));
+    remove_non_dax_file(paths);
+    paths.cleanup();
+}
+
+TEST(VirtioFsDax, ConcurrentFaultIoAndLayoutBreakingStress) {
+    TestPaths paths("layout_stress");
+    ASSERT_TRUE(paths.create());
+    CleanupGuard cleanup{paths};
+
+    int error = 0;
+    constexpr off_t initial_size = 3 * kDaxRangeSize;
+    if (!prepare_non_dax_file(paths, initial_size, &error)) {
+        paths.cleanup();
+        if (dax_required()) {
+            FAIL() << "DAX layout stress preparation failed: " << strerror(error);
+        }
+        GTEST_SKIP() << "ordinary virtiofs is unavailable: " << strerror(error);
+    }
+    ASSERT_TRUE(mount_debugfs(paths, &error)) << strerror(error);
+    if (!mount_virtiofs(paths.mountpoint, "always", &error)) {
+        remove_non_dax_file(paths);
+        paths.cleanup();
+        if (dax_required()) {
+            FAIL() << "DAX layout stress requires dax=always: " << strerror(error);
+        }
+        GTEST_SKIP() << "DAX window/backend is unavailable: " << strerror(error);
+    }
+
+    int fd = open(paths.file, O_RDWR);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    struct SharedStressState {
+        unsigned start;
+        unsigned stop;
+        unsigned iterations;
+    };
+    auto* state = static_cast<SharedStressState*>(mmap(
+        nullptr, sizeof(SharedStressState), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0));
+    ASSERT_NE(MAP_FAILED, state);
+    memset(state, 0, sizeof(*state));
+    int ready[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(ready));
+    OpcodeSnapshot before = snapshot(paths.stats);
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        close(ready[0]);
+        int child_fd = open(paths.file, O_RDWR);
+        if (child_fd < 0 || write(ready[1], "r", 1) != 1) {
+            _exit(101);
+        }
+        close(ready[1]);
+        while (__atomic_load_n(&state->start, __ATOMIC_ACQUIRE) == 0) {
+            usleep(1000);
+        }
+        for (unsigned i = 0; i < 100000; ++i) {
+            void* mapping = mmap(nullptr, kPageSize, PROT_READ | PROT_WRITE, MAP_SHARED, child_fd, 0);
+            if (mapping == MAP_FAILED) {
+                _exit(102);
+            }
+            volatile uint8_t* bytes = static_cast<volatile uint8_t*>(mapping);
+            size_t index = i % kPageSize;
+            uint8_t value = bytes[index];
+            bytes[index] = static_cast<uint8_t>(value ^ 1);
+            if (munmap(mapping, kPageSize) != 0) {
+                _exit(103);
+            }
+            if (pread(child_fd, &value, 1, static_cast<off_t>(index)) != 1 ||
+                pwrite(child_fd, &value, 1, static_cast<off_t>(index)) != 1) {
+                _exit(104);
+            }
+            __atomic_store_n(&state->iterations, i + 1, __ATOMIC_RELEASE);
+            if (__atomic_load_n(&state->stop, __ATOMIC_ACQUIRE) != 0) {
+                _exit(close(child_fd) == 0 ? 0 : 105);
+            }
+        }
+        _exit(106);
+    }
+    close(ready[1]);
+    char byte = 0;
+    ASSERT_EQ(1, read(ready[0], &byte, 1));
+    close(ready[0]);
+    __atomic_store_n(&state->start, 1, __ATOMIC_RELEASE);
+    bool child_active = false;
+    for (unsigned i = 0; i < kWaitIterations; ++i) {
+        if (__atomic_load_n(&state->iterations, __ATOMIC_ACQUIRE) != 0) {
+            child_active = true;
+            break;
+        }
+        usleep(10000);
+    }
+
+    int operation_error = child_active ? 0 : ETIMEDOUT;
+    for (unsigned i = 0; i < 64; ++i) {
+        if (operation_error != 0 || ftruncate(fd, kPageSize) != 0 ||
+            ftruncate(fd, initial_size) != 0 ||
+            fallocate(fd, FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE, 0, kPageSize) != 0 ||
+            fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, kPageSize / 2,
+                      kPageSize / 2) != 0) {
+            operation_error = operation_error == 0 ? errno : operation_error;
+            break;
+        }
+    }
+
+    __atomic_store_n(&state->stop, 1, __ATOMIC_RELEASE);
+    int status = 0;
+    ASSERT_TRUE(wait_for_child(child, &status)) << "concurrent layout stress timed out";
+    ASSERT_EQ(0, operation_error) << strerror(operation_error);
+    ASSERT_TRUE(WIFEXITED(status)) << "child status=" << status;
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    EXPECT_GT(__atomic_load_n(&state->iterations, __ATOMIC_ACQUIRE), 0U);
+    OpcodeSnapshot after = snapshot(paths.stats);
+    assert_valid_snapshot(before);
+    assert_valid_snapshot(after);
+    EXPECT_GT(after.remove_mapping, before.remove_mapping);
+    struct stat st = {};
+    ASSERT_EQ(0, fstat(fd, &st));
+    EXPECT_EQ(initial_size, st.st_size);
+
+    ASSERT_EQ(0, munmap(state, sizeof(*state)));
+    ASSERT_EQ(0, close(fd));
+    ASSERT_EQ(0, umount(paths.mountpoint));
+    remove_non_dax_file(paths);
+    paths.cleanup();
+}
+
+TEST(VirtioFsDax, HostInvalidationRevokesMappedWindow) {
+    TestPaths paths("notify");
+    ASSERT_TRUE(paths.create());
+    CleanupGuard cleanup{paths};
+    char ordinary_mount[224] = {};
+    char ordinary_file[288] = {};
+    snprintf(ordinary_mount, sizeof(ordinary_mount), "%s/ordinary", paths.root);
+    snprintf(ordinary_file, sizeof(ordinary_file), "%s/dax_test.bin", ordinary_mount);
+    ASSERT_EQ(0, ensure_dir(ordinary_mount));
+    ExtraMountGuard ordinary_cleanup{ordinary_mount};
+
+    int error = 0;
+    if (!prepare_non_dax_file(paths, 2 * kDaxRangeSize, &error)) {
+        rmdir(ordinary_mount);
+        paths.cleanup();
+        if (dax_required()) {
+            FAIL() << "host invalidation preparation failed: " << strerror(error);
+        }
+        GTEST_SKIP() << "ordinary virtiofs is unavailable: " << strerror(error);
+    }
+    ASSERT_TRUE(mount_debugfs(paths, &error)) << strerror(error);
+    if (!mount_virtiofs(paths.mountpoint, "always", &error)) {
+        remove_non_dax_file(paths);
+        rmdir(ordinary_mount);
+        paths.cleanup();
+        if (dax_required()) {
+            FAIL() << "host invalidation requires dax=always: " << strerror(error);
+        }
+        GTEST_SKIP() << "DAX window/backend is unavailable: " << strerror(error);
+    }
+    ASSERT_TRUE(mount_virtiofs(ordinary_mount, "never", &error)) << strerror(error);
+    ordinary_cleanup.mounted = true;
+
+    int dax_fd = open(paths.file, O_RDONLY);
+    ASSERT_GE(dax_fd, 0);
+    void* mapping = mmap(nullptr, kPageSize, PROT_READ, MAP_SHARED, dax_fd, 0);
+    ASSERT_NE(MAP_FAILED, mapping);
+    volatile uint8_t* mapped = static_cast<volatile uint8_t*>(mapping);
+    uint8_t original = mapped[37];
+    uint8_t replacement = static_cast<uint8_t>(original ^ 0x5a);
+    OpcodeSnapshot before = snapshot(paths.stats);
+
+    int ordinary_fd = open(ordinary_file, O_RDWR);
+    ASSERT_GE(ordinary_fd, 0) << strerror(errno);
+    ASSERT_EQ(1, pwrite(ordinary_fd, &replacement, 1, 37));
+    ASSERT_EQ(0, fsync(ordinary_fd));
+    ASSERT_EQ(0, close(ordinary_fd));
+
+    bool observed = false;
+    for (unsigned i = 0; i < kWaitIterations; ++i) {
+        if (mapped[37] == replacement) {
+            observed = true;
+            break;
+        }
+        usleep(100000);
+    }
+    EXPECT_TRUE(observed) << "host invalidation left stale DAX data";
+    OpcodeSnapshot after = snapshot(paths.stats);
+    assert_valid_snapshot(before);
+    assert_valid_snapshot(after);
+    EXPECT_GT(after.remove_mapping, before.remove_mapping);
+
+    ASSERT_EQ(0, munmap(mapping, kPageSize));
+    ASSERT_EQ(0, close(dax_fd));
+    ASSERT_EQ(0, umount(ordinary_mount));
+    ordinary_cleanup.mounted = false;
+    ASSERT_EQ(0, umount(paths.mountpoint));
+    remove_non_dax_file(paths);
+    rmdir(ordinary_mount);
     paths.cleanup();
 }
 

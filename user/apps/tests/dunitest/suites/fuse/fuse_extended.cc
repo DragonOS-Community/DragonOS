@@ -2543,6 +2543,7 @@ fail_no_umount:
 static int ext_test_ftruncate_setattr_uses_open_fh() {
     const char *mp = "/tmp/test_fuse_ftruncate_fh";
     int f = -1;
+    char fallocate_verify[17] = {};
     if (ensure_dir(mp) != 0) {
         printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
         return -1;
@@ -2732,6 +2733,70 @@ static int ext_test_ftruncate_setattr_uses_open_fh() {
                strerror(errno), (long long)st.st_size);
         goto fail;
     }
+
+    static const char fallocate_pattern[] = "abcdefghijklmnop";
+    f = open(path, O_RDWR);
+    if (f < 0) {
+        printf("[FAIL] reopen for fallocate modes: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    if (pwrite(f, fallocate_pattern, sizeof(fallocate_pattern) - 1, 0) !=
+        (ssize_t)(sizeof(fallocate_pattern) - 1)) {
+        printf("[FAIL] seed fallocate cache test: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    if (pread(f, fallocate_verify, sizeof(fallocate_pattern) - 1, 0) !=
+        (ssize_t)(sizeof(fallocate_pattern) - 1)) {
+        printf("[FAIL] prime fallocate cache: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+
+    fallocate_count = 0;
+    if (syscall(SYS_fallocate, f, FALLOC_FL_KEEP_SIZE, 0, 64) != 0) {
+        printf("[FAIL] fallocate KEEP_SIZE: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    if (stat(path, &st) != 0 || st.st_size != 16 || fallocate_count != 1 ||
+        last_fallocate_mode != FALLOC_FL_KEEP_SIZE) {
+        printf("[FAIL] KEEP_SIZE semantics size=%lld count=%u mode=0x%x\n",
+               (long long)st.st_size, fallocate_count, last_fallocate_mode);
+        goto fail;
+    }
+
+    fallocate_count = 0;
+    if (syscall(SYS_fallocate, f, FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE, 4, 4) != 0) {
+        printf("[FAIL] fallocate ZERO_RANGE: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    memset(fallocate_verify, 0xff, sizeof(fallocate_verify));
+    if (pread(f, fallocate_verify, sizeof(fallocate_pattern) - 1, 0) !=
+        (ssize_t)(sizeof(fallocate_pattern) - 1) ||
+        memcmp(fallocate_verify, "abcd\0\0\0\0ijklmnop", sizeof(fallocate_pattern) - 1) != 0 ||
+        fallocate_count != 1 ||
+        last_fallocate_mode != (FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE)) {
+        printf("[FAIL] ZERO_RANGE cache/forwarding count=%u mode=0x%x\n", fallocate_count,
+               last_fallocate_mode);
+        goto fail;
+    }
+
+    fallocate_count = 0;
+    if (syscall(SYS_fallocate, f, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 8, 4) != 0) {
+        printf("[FAIL] fallocate PUNCH_HOLE: %s (errno=%d)\n", strerror(errno), errno);
+        goto fail;
+    }
+    memset(fallocate_verify, 0xff, sizeof(fallocate_verify));
+    if (pread(f, fallocate_verify, sizeof(fallocate_pattern) - 1, 0) !=
+        (ssize_t)(sizeof(fallocate_pattern) - 1) ||
+        memcmp(fallocate_verify, "abcd\0\0\0\0\0\0\0\0mnop", sizeof(fallocate_pattern) - 1) !=
+            0 ||
+        fallocate_count != 1 ||
+        last_fallocate_mode != (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)) {
+        printf("[FAIL] PUNCH_HOLE cache/forwarding count=%u mode=0x%x\n", fallocate_count,
+               last_fallocate_mode);
+        goto fail;
+    }
+    close(f);
+    f = -1;
 
     setattr_count = 0;
     fallocate_count = 0;

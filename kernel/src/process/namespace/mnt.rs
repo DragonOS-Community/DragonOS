@@ -230,13 +230,30 @@ impl MntNamespace {
         old_source_path: &str,
         new_target_path: &str,
     ) -> Result<(), SystemError> {
+        let topology = MOUNT_LIFECYCLE_LOCK.lock();
+        self.move_mount_locked(
+            source_mfs,
+            target_mountpoint,
+            old_source_path,
+            new_target_path,
+            &topology,
+        )
+    }
+
+    pub(crate) fn move_mount_locked(
+        &self,
+        source_mfs: &Arc<MountFS>,
+        target_mountpoint: &Arc<MountFSInode>,
+        old_source_path: &str,
+        new_target_path: &str,
+        _topology: &MutexGuard<'_, ()>,
+    ) -> Result<(), SystemError> {
         let old_mountpoint = source_mfs.self_mountpoint().ok_or(SystemError::EINVAL)?;
         let old_parent = old_mountpoint.mount_fs();
         let old_mp_id = old_mountpoint.inode_id()?;
 
         let target_parent = target_mountpoint.mount_fs();
         let target_mp_id = target_mountpoint.inode_id()?;
-        let _topology = MOUNT_LIFECYCLE_LOCK.lock();
         let inner = self.inner.write();
         let moving_mounts = collect_mount_subtree(source_mfs);
 

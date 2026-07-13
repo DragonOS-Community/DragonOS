@@ -645,12 +645,12 @@ impl FuseConn {
             .checked_add(len_u64)
             .ok_or(SystemError::EOVERFLOW)?;
         if len == 0
-            || window_offset % DAX_RANGE_SIZE != 0
-            || len % DAX_RANGE_SIZE != 0
-            || file_offset % DAX_RANGE_SIZE as u64 != 0
-            || file_offset % alignment != 0
-            || window_offset_u64 % alignment != 0
-            || len_u64 % alignment != 0
+            || !window_offset.is_multiple_of(DAX_RANGE_SIZE)
+            || !len.is_multiple_of(DAX_RANGE_SIZE)
+            || !file_offset.is_multiple_of(DAX_RANGE_SIZE as u64)
+            || !file_offset.is_multiple_of(alignment)
+            || !window_offset_u64.is_multiple_of(alignment)
+            || !len_u64.is_multiple_of(alignment)
         {
             return Err(SystemError::EINVAL);
         }

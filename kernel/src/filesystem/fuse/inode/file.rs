@@ -286,12 +286,17 @@ impl FuseNode {
         truncate_metadata: Option<(&Metadata, SetMetadataMask)>,
     ) -> Result<(), SystemError> {
         self.check_not_stale()?;
+        let old_size = self.cached_or_fetch_metadata()?.size.max(0) as usize;
         self.resolve_pending_short_read_truncate(len)?;
         // Drain once before taking the exclusive admission barrier to reduce
         // hold time, then drain again under the barrier to close the race with
         // buffered writes and page_mkwrite.
         self.sync_dirty_cached_pages()?;
-        let _barrier = self.writeback_barrier.write();
+        let _barrier = if self.conn().dax_enabled() && len < old_size {
+            self.dax_layout_write_for_truncate(len)?
+        } else {
+            self.writeback_barrier.write()
+        };
         self.sync_dirty_cached_pages()?;
         let mut valid = FATTR_SIZE;
         if lock_owner.is_some() {

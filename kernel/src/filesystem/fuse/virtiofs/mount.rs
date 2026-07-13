@@ -1,4 +1,4 @@
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec};
 
 use linkme::distributed_slice;
 use system_error::SystemError;
@@ -6,10 +6,13 @@ use system_error::SystemError;
 use crate::{
     driver::virtio::virtio_fs::{virtio_fs_find_instance, VirtioFsInstance},
     filesystem::vfs::{
-        file::File, FileSystem, FileSystemMakerData, FsInfo, IndexNode, MountableFileSystem,
-        SuperBlock, FSMAKER,
+        file::File, FilePrivateData, FileSystem, FileSystemMakerData, FsInfo, IndexNode,
+        MountableFileSystem, SuperBlock, FSMAKER,
     },
-    mm::{fault::PageFaultMessage, VirtRegion, VmFaultReason, VmFlags},
+    mm::{
+        fault::{FaultFlags, PageFaultMessage},
+        MemoryManagementArch, VirtRegion, VmFaultReason, VmFlags,
+    },
     process::ProcessManager,
     register_mountable_fs,
 };
@@ -17,6 +20,7 @@ use crate::{
 use super::super::{
     conn::FuseConn,
     fs::{FuseFS, FuseMountData},
+    private_data::FuseFilePrivateData,
     protocol::FuseOutHeader,
 };
 use super::{
@@ -30,7 +34,6 @@ struct VirtioFsMountData {
     group_id: u32,
     allow_other: bool,
     default_permissions: bool,
-    dax_mode: DaxMountMode,
     conn: Arc<FuseConn>,
     instance: Arc<VirtioFsInstance>,
 }
@@ -49,6 +52,84 @@ struct VirtioFsFs {
 }
 
 impl VirtioFsFs {
+    unsafe fn dax_fault(&self, pfm: &mut PageFaultMessage) -> Option<VmFaultReason> {
+        let vma = pfm.vma();
+        let guard = vma.lock();
+        let vm_flags = *guard.vm_flags();
+        let file = guard.vm_file()?;
+        drop(guard);
+        let node = {
+            let private = file.private_data.lock();
+            let FilePrivateData::Fuse(FuseFilePrivateData::File(private)) = &*private else {
+                return Some(VmFaultReason::VM_FAULT_SIGBUS);
+            };
+            private.node.clone()
+        };
+        if !node.conn().dax_enabled() {
+            return None;
+        }
+
+        let page_index = match pfm.backing_pgoff() {
+            Some(index) => index,
+            None => return Some(VmFaultReason::VM_FAULT_SIGBUS),
+        };
+        let file_offset = match page_index.checked_mul(crate::arch::MMArch::PAGE_SIZE) {
+            Some(offset) => offset,
+            None => return Some(VmFaultReason::VM_FAULT_SIGBUS),
+        };
+        let _layout = node.dax_layout_read();
+        let file_size = match node.dax_file_size() {
+            Ok(size) => size,
+            Err(_) => return Some(VmFaultReason::VM_FAULT_SIGBUS),
+        };
+        if file_offset >= file_size {
+            return Some(VmFaultReason::VM_FAULT_SIGBUS);
+        }
+
+        let write = pfm.flags().contains(FaultFlags::FAULT_FLAG_WRITE);
+        let shared = vm_flags.contains(VmFlags::VM_SHARED);
+        let access = match node.dax_access(file_offset as u64, write && shared) {
+            Ok(access) => access,
+            Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                pfm.set_retry_wait(node.conn().dax_fault_retry_wait());
+                return Some(VmFaultReason::VM_FAULT_RETRY);
+            }
+            Err(_) => return Some(VmFaultReason::VM_FAULT_SIGBUS),
+        };
+        let in_mapping = file_offset & (super::dax::DAX_RANGE_SIZE - 1);
+        let paddr = match access.checked_paddr(in_mapping, crate::arch::MMArch::PAGE_SIZE) {
+            Ok(paddr) => paddr,
+            Err(_) => return Some(VmFaultReason::VM_FAULT_SIGBUS),
+        };
+        let old_pfn = pfm.external_pfn();
+        let result = if write && !shared {
+            let mut source = vec![0; crate::arch::MMArch::PAGE_SIZE];
+            if access.copy_to(in_mapping, &mut source).is_err() {
+                return Some(VmFaultReason::VM_FAULT_SIGBUS);
+            }
+            pfm.cow_external_page(old_pfn, &source)
+        } else if let Some(old_pfn) = old_pfn {
+            if old_pfn != paddr {
+                VmFaultReason::VM_FAULT_SIGBUS
+            } else if write {
+                pfm.upgrade_external_pfn(paddr)
+            } else {
+                VmFaultReason::VM_FAULT_COMPLETED
+            }
+        } else {
+            pfm.map_external_pfn(paddr, write && shared)
+        };
+        if result.contains(VmFaultReason::VM_FAULT_COMPLETED) {
+            if write && shared {
+                node.note_mmap_write();
+            }
+            if node.dax_note_pte_published().is_err() {
+                return Some(VmFaultReason::VM_FAULT_SIGBUS);
+            }
+        }
+        Some(result)
+    }
+
     fn parse_opt_u32_decimal(v: &str) -> Result<u32, SystemError> {
         v.parse::<u32>().map_err(|_| SystemError::EINVAL)
     }
@@ -108,7 +189,9 @@ impl VirtioFsFs {
             }
         }
 
-        if dax_mode != DaxMountMode::Never {
+        // Per-inode DAX requires tracking FUSE_ATTR_DAX transitions.  Treating
+        // it as dax=always would violate the negotiated Linux ABI.
+        if dax_mode == DaxMountMode::Inode {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
 
@@ -157,11 +240,12 @@ impl FileSystem for VirtioFsFs {
     }
 
     unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
-        self.inner.fault(pfm)
+        self.dax_fault(pfm).unwrap_or_else(|| self.inner.fault(pfm))
     }
 
     unsafe fn page_mkwrite(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
-        self.inner.page_mkwrite(pfm)
+        self.dax_fault(pfm)
+            .unwrap_or_else(|| self.inner.page_mkwrite(pfm))
     }
 
     fn mprotect(&self, old_vm_flags: VmFlags, new_vm_flags: VmFlags) -> Result<(), SystemError> {
@@ -199,10 +283,18 @@ impl MountableFileSystem for VirtioFsFs {
         let (rootmode, user_id, group_id, default_permissions, allow_other, dax_mode) =
             Self::parse_mount_options(raw_data)?;
         let instance = virtio_fs_find_instance(source).ok_or(SystemError::ENODEV)?;
-        let conn = FuseConn::new_for_virtiofs_with_dax(
+        let cache_window = instance.cache_window();
+        if dax_mode == DaxMountMode::Always
+            && cache_window
+                .as_ref()
+                .is_none_or(|window| window.len() < super::dax::DAX_RANGE_SIZE)
+        {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        let conn = FuseConn::new_for_virtiofs_with_dax_window(
             VIRTIOFS_MAX_REQUEST_SIZE,
             VIRTIOFS_RSP_BUF_SIZE,
-            instance.cache_window_len(),
+            cache_window,
             dax_mode,
         );
 
@@ -212,7 +304,6 @@ impl MountableFileSystem for VirtioFsFs {
             group_id,
             allow_other,
             default_permissions,
-            dax_mode,
             conn,
             instance,
         })))
@@ -236,10 +327,6 @@ impl MountableFileSystem for VirtioFsFs {
             default_permissions: md.default_permissions,
             conn: md.conn.clone(),
         };
-
-        if md.dax_mode != DaxMountMode::Never {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-        }
 
         let inner = <FuseFS as MountableFileSystem>::make_fs(Some(
             &fuse_mount_data as &dyn FileSystemMakerData,

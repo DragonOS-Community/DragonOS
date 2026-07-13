@@ -65,7 +65,7 @@ struct VirtioFsIrqConfig {
 }
 
 #[derive(Debug)]
-struct VirtioFsCacheWindow {
+pub(crate) struct VirtioFsCacheWindow {
     mapping: DeviceLinearMapping,
     _reservation: PciBarSubresourceGuard,
 }
@@ -110,6 +110,26 @@ impl VirtioFsCacheWindow {
             _reservation: reservation,
         })
     }
+
+    pub(crate) fn len(&self) -> usize {
+        self.mapping.len()
+    }
+
+    pub(crate) fn checked_paddr(
+        &self,
+        offset: usize,
+        len: usize,
+    ) -> Result<crate::mm::PhysAddr, SystemError> {
+        self.mapping.checked_paddr(offset, len)
+    }
+
+    pub(crate) fn checked_vaddr(
+        &self,
+        offset: usize,
+        len: usize,
+    ) -> Result<crate::mm::VirtAddr, SystemError> {
+        self.mapping.checked_vaddr(offset, len)
+    }
 }
 
 #[derive(Debug)]
@@ -148,7 +168,7 @@ pub struct VirtioFsInstance {
     irq_wake_enabled: bool,
     irq_is_msix: bool,
     irq_ack: Option<PciInterruptAck>,
-    cache_window: Option<VirtioFsCacheWindow>,
+    cache_window: Option<Arc<VirtioFsCacheWindow>>,
     state: SpinLock<VirtioFsInstanceState>,
     session_wait: WaitQueue,
 }
@@ -160,7 +180,7 @@ impl VirtioFsInstance {
         dev_id: Arc<DeviceId>,
         transport: VirtIOTransport,
         irq: VirtioFsIrqConfig,
-        cache_window: Option<VirtioFsCacheWindow>,
+        cache_window: Option<Arc<VirtioFsCacheWindow>>,
     ) -> Self {
         Self {
             tag,
@@ -195,9 +215,11 @@ impl VirtioFsInstance {
     }
 
     pub fn cache_window_len(&self) -> Option<usize> {
-        self.cache_window
-            .as_ref()
-            .map(|window| window.mapping.len())
+        self.cache_window.as_ref().map(|window| window.len())
+    }
+
+    pub(crate) fn cache_window(&self) -> Option<Arc<VirtioFsCacheWindow>> {
+        self.cache_window.clone()
     }
 
     pub fn hiprio_queue_index(&self) -> u16 {
@@ -475,7 +497,7 @@ pub fn virtio_fs(
         .shared_memory_region(VIRTIO_FS_SHMCAP_ID_CACHE)
         .filter(|region| region.length() != 0);
     let cache_window = cache_region.and_then(|region| match VirtioFsCacheWindow::new(&transport, region) {
-        Ok(window) => Some(window),
+        Ok(window) => Some(Arc::new(window)),
         Err(error) => {
             warn!(
                 "virtio-fs: cache window unavailable for tag='{}' dev={:?}: {:?}; continue without DAX",

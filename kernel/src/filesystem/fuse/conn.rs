@@ -25,7 +25,12 @@ use crate::{
     process::ProcessManager,
 };
 
-use super::virtiofs::dax::{DaxMountMode, DaxRangeAllocator, DAX_RANGE_SIZE};
+use super::virtiofs::dax::{
+    DaxAdmission, DaxAdmissionGuard, DaxAdmissionState, DaxMappingOwner, DaxMountMode,
+    DaxRangeAllocator, DAX_RANGE_SIZE,
+};
+use crate::driver::virtio::virtio_fs::VirtioFsCacheWindow;
+use crate::mm::fault::FaultRetryWait;
 use crate::process::cred::CAPFlags;
 
 use super::protocol::{
@@ -39,6 +44,17 @@ use super::protocol::{
     FUSE_WRITEBACK_CACHE,
 };
 use super::reply::{FuseReadPagesReply, FuseReply};
+
+#[derive(Debug)]
+struct DaxRangeRetryWait {
+    conn: Arc<FuseConn>,
+}
+
+impl FaultRetryWait for DaxRangeRetryWait {
+    fn wait(&self) -> Result<(), SystemError> {
+        self.conn.reclaim_one_dax_range_for_fault()
+    }
+}
 use super::{stats, trace};
 
 mod daemon;
@@ -678,6 +694,9 @@ pub struct FuseConn {
     background: Arc<FuseBackgroundState>,
     filesystems: Mutex<Vec<Weak<super::fs::FuseFS>>>,
     dax_allocator: Option<Arc<DaxRangeAllocator>>,
+    dax_window: Mutex<Option<Arc<VirtioFsCacheWindow>>>,
+    dax_admission: Arc<DaxAdmission>,
+    dax_nodes: Mutex<BTreeMap<DaxMappingOwner, Weak<super::inode::FuseNode>>>,
 }
 
 impl FuseConn {
@@ -798,11 +817,182 @@ impl FuseConn {
             background: FuseBackgroundState::new(),
             filesystems: Mutex::new(Vec::new()),
             dax_allocator,
+            dax_window: Mutex::new(None),
+            dax_admission: DaxAdmission::new(),
+            dax_nodes: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    pub(crate) fn new_for_virtiofs_with_dax_window(
+        max_request_size: usize,
+        max_reply_size: usize,
+        cache_window: Option<Arc<VirtioFsCacheWindow>>,
+        dax_mode: DaxMountMode,
+    ) -> Arc<Self> {
+        let len = cache_window.as_ref().map(|window| window.len());
+        let conn = Self::new_for_virtiofs_with_dax(max_request_size, max_reply_size, len, dax_mode);
+        if conn.dax_allocator.is_some() {
+            if let Some(window) = cache_window {
+                conn.install_dax_window(window)
+                    .expect("validated virtiofs DAX window must match its allocator");
+            }
+        }
+        conn
     }
 
     pub(crate) fn dax_allocator(&self) -> Option<&Arc<DaxRangeAllocator>> {
         self.dax_allocator.as_ref()
+    }
+
+    pub(crate) fn dax_enabled(&self) -> bool {
+        self.dax_allocator.is_some() && self.dax_window.lock().is_some()
+    }
+
+    pub(crate) fn install_dax_window(
+        &self,
+        window: Arc<VirtioFsCacheWindow>,
+    ) -> Result<(), SystemError> {
+        let allocator = self
+            .dax_allocator
+            .as_ref()
+            .ok_or(SystemError::EOPNOTSUPP_OR_ENOTSUP)?;
+        if window.len() < DAX_RANGE_SIZE
+            || allocator.snapshot().total != window.len() / DAX_RANGE_SIZE
+        {
+            return Err(SystemError::EINVAL);
+        }
+        let mut slot = self.dax_window.lock();
+        if slot.is_some() {
+            return Err(SystemError::EBUSY);
+        }
+        *slot = Some(window);
+        Ok(())
+    }
+
+    pub(crate) fn dax_window(&self) -> Result<Arc<VirtioFsCacheWindow>, SystemError> {
+        self.dax_window
+            .lock()
+            .clone()
+            .ok_or(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+    }
+
+    pub(crate) fn enter_dax(&self) -> Result<DaxAdmissionGuard, SystemError> {
+        self.dax_admission.enter()
+    }
+
+    pub(crate) fn dax_admission_state(&self) -> DaxAdmissionState {
+        self.dax_admission.state()
+    }
+
+    pub(crate) fn begin_dax_quiesce(&self) {
+        self.dax_admission.begin_quiesce();
+    }
+
+    pub(crate) fn wait_dax_drained(&self) {
+        self.dax_admission.wait_drained();
+    }
+
+    pub(crate) fn mark_dax_dead(&self) {
+        self.dax_admission.mark_dead();
+    }
+
+    pub(crate) fn register_dax_node(&self, node: &Arc<super::inode::FuseNode>) {
+        let owner = node.dax_mapping_owner();
+        let mut nodes = self.dax_nodes.lock();
+        nodes.retain(|_, node| node.strong_count() != 0);
+        nodes.insert(owner, Arc::downgrade(node));
+    }
+
+    pub(crate) fn unregister_dax_node(&self, owner: DaxMappingOwner) {
+        self.dax_nodes.lock().remove(&owner);
+    }
+
+    pub(crate) fn dax_node(&self, owner: DaxMappingOwner) -> Option<Arc<super::inode::FuseNode>> {
+        let mut nodes = self.dax_nodes.lock();
+        let node = nodes.get(&owner).and_then(Weak::upgrade);
+        if node.is_none() {
+            nodes.remove(&owner);
+        }
+        node
+    }
+
+    fn revoke_all_dax_ptes(&self) {
+        let nodes: Vec<_> = {
+            let mut registry = self.dax_nodes.lock();
+            let nodes = registry.values().filter_map(Weak::upgrade).collect();
+            registry.retain(|_, node| node.strong_count() != 0);
+            nodes
+        };
+        for node in nodes {
+            if let Err(error) = node.dax_disconnect_revoke() {
+                log::warn!(
+                    "fuse: failed to revoke DAX PTEs for node {} during disconnect: {:?}",
+                    node.nodeid(),
+                    error
+                );
+            }
+        }
+    }
+
+    pub(crate) fn dax_fault_retry_wait(self: &Arc<Self>) -> Arc<dyn FaultRetryWait> {
+        Arc::new(DaxRangeRetryWait { conn: self.clone() })
+    }
+
+    pub(crate) fn reclaim_one_dax_range_interruptible(&self) -> Result<(), SystemError> {
+        self.reclaim_one_dax_range(true)
+    }
+
+    fn reclaim_one_dax_range_for_fault(&self) -> Result<(), SystemError> {
+        self.reclaim_one_dax_range(false)
+    }
+
+    fn reclaim_one_dax_range(&self, interruptible: bool) -> Result<(), SystemError> {
+        let allocator = self
+            .dax_allocator
+            .as_ref()
+            .ok_or(SystemError::EOPNOTSUPP_OR_ENOTSUP)?;
+        let mut candidates = Vec::with_capacity(16);
+        loop {
+            let snapshot = allocator.snapshot();
+            if snapshot.shutdown {
+                return Err(SystemError::ENODEV);
+            }
+            if snapshot.free > 0 {
+                return Ok(());
+            }
+            allocator.reclaim_candidates(&mut candidates, 16)?;
+            if candidates.is_empty() {
+                if interruptible {
+                    allocator.wait_available_interruptible()?;
+                } else {
+                    allocator.wait_available()?;
+                }
+                continue;
+            }
+            for candidate in &candidates {
+                let Some(node) = self.dax_node(candidate.owner()) else {
+                    // A Weak cannot be upgraded while FuseNode::drop() is
+                    // running. Do not race that teardown by changing the token
+                    // state behind its mapping tree.
+                    continue;
+                };
+                match node.dax_reclaim_candidate(candidate) {
+                    Ok(()) => return Ok(()),
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            if interruptible
+                && crate::arch::ipc::signal::Signal::signal_pending_state(
+                    true,
+                    false,
+                    &ProcessManager::current_pcb(),
+                )
+            {
+                return Err(SystemError::ERESTARTSYS);
+            }
+            crate::sched::sched_yield();
+        }
     }
 
     pub(crate) fn dax_map_alignment(&self) -> Option<u16> {
@@ -1096,9 +1286,13 @@ impl FuseConn {
     }
 
     pub fn abort(&self) {
+        self.begin_dax_quiesce();
         self.background.disconnect();
         let (processing, pending_noreply_count): (Vec<Arc<FusePendingState>>, usize) = {
             let mut g = self.inner.lock();
+            if !g.connected {
+                return;
+            }
             g.connected = false;
             g.mounted = false;
             // Close allocator acquisition before releasing the connection lock,
@@ -1121,7 +1315,13 @@ impl FuseConn {
         for p in processing {
             p.complete_disconnected(SystemError::ENOTCONN);
         }
+        // Admission was closed before requests were detached.  Wait until every
+        // DAX copy/fault/setup that was already admitted has released its guard
+        // before invalidating allocator tokens and the backing window.
+        self.wait_dax_drained();
+        self.revoke_all_dax_ptes();
         self.disconnect_cleanup_dax_allocator();
+        self.mark_dax_dead();
         self.read_wait.wakeup(None);
         self.wake_bridge(stats::VirtioFsBridgeWakeSource::Disconnect);
         self.init_wait.wakeup(None);
@@ -1136,7 +1336,7 @@ impl FuseConn {
     /// Keep the connection readable for daemon-side teardown; actual disconnect
     /// happens when /dev/fuse is closed or explicit abort path is triggered.
     pub fn on_umount(&self) {
-        self.begin_shutdown_dax_allocator();
+        self.begin_dax_quiesce();
         self.background.disconnect();
         let processing: Vec<Arc<FusePendingState>>;
         let dropped_processing: Vec<Arc<FusePendingState>>;
@@ -1186,6 +1386,8 @@ impl FuseConn {
         for p in dropped_processing {
             p.complete(Err(SystemError::ENOTCONN));
         }
+        self.wait_dax_drained();
+        self.begin_shutdown_dax_allocator();
         self.init_wait.wakeup(None);
 
         if !should_destroy {

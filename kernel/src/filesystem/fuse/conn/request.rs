@@ -101,7 +101,7 @@ impl FuseConn {
     }
 
     pub(crate) fn request_dax_mapping(
-        &self,
+        self: &Arc<Self>,
         opcode: u32,
         nodeid: u64,
         payload: &[u8],
@@ -120,14 +120,12 @@ impl FuseConn {
         let (result, kind) = match pending.wait_result_with_kind_uninterruptible() {
             Ok(result) => result,
             Err(_) => {
-                // A dead wait queue is an internal connection failure. Abort
-                // first so the request obtains a real terminal state before
-                // its allocator pin/reservation can be released.
-                self.abort();
-                match pending.wait_result_with_kind() {
-                    Ok(result) => result,
-                    Err(error) => return FuseDaxRequestOutcome::Disconnected(error),
-                }
+                // The DAX caller still owns an admission guard. Synchronous
+                // abort would wait for that same guard and self-deadlock, so
+                // defer connection teardown until this stack has unwound.
+                let conn = self.clone();
+                schedule_work(Work::new(move || conn.abort()));
+                return FuseDaxRequestOutcome::Disconnected(SystemError::ENOTCONN);
             }
         };
         match (result, kind) {

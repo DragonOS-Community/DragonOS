@@ -21,7 +21,8 @@ use crate::{
         vfs::{FileType, InodeFlags, InodeId, InodeMode, Metadata},
     },
     libs::mutex::Mutex,
-    libs::rwsem::RwSem,
+    libs::rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
+    mm::MemoryManagementArch,
     time::PosixTimeSpec,
 };
 
@@ -32,11 +33,127 @@ use super::{
     private_data::FuseWritebackHandle,
     protocol::{
         fuse_pack_struct, fuse_read_struct, FuseAttr, FuseAttrOut, FuseEntryOut, FuseGetattrIn,
-        FUSE_GETATTR, FUSE_ROOT_ID,
+        FuseWriteIn, FuseWriteOut, FUSE_GETATTR, FUSE_ROOT_ID, FUSE_WRITE, FUSE_WRITE_LOCKOWNER,
+    },
+};
+
+use super::{
+    private_data::FuseOpenPrivateData,
+    virtiofs::dax::{
+        DaxAdmissionGuard, DaxMappingOwner, DaxRangeAllocator, OwnedToken, ReclaimCandidate,
+        ReclaimToken, DAX_RANGE_SIZE,
     },
 };
 
 static NEXT_DAX_OWNER_INCARNATION: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug)]
+pub(crate) struct DaxMapping {
+    file_offset: u64,
+    writable: AtomicBool,
+    token: OwnedToken,
+}
+
+#[derive(Debug, Default)]
+struct DaxMappingTree {
+    mappings: BTreeMap<u64, Arc<DaxMapping>>,
+    tombstones: BTreeMap<u64, Arc<DaxMapping>>,
+    sequence: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct DaxAccessGuard {
+    mapping: Arc<DaxMapping>,
+    allocator: Arc<DaxRangeAllocator>,
+    window: Arc<crate::driver::virtio::virtio_fs::VirtioFsCacheWindow>,
+    _admission: Option<DaxAdmissionGuard>,
+}
+
+#[derive(Debug)]
+pub(crate) struct DaxReclaimTombstone {
+    file_offset: u64,
+    mapping: Arc<DaxMapping>,
+    token: ReclaimToken,
+}
+
+impl DaxMappingTree {
+    fn bump_sequence(&mut self) -> Result<(), SystemError> {
+        self.sequence = self.sequence.checked_add(1).ok_or(SystemError::EOVERFLOW)?;
+        Ok(())
+    }
+}
+
+impl DaxMapping {
+    pub(crate) fn file_offset(&self) -> u64 {
+        self.file_offset
+    }
+
+    pub(crate) fn window_offset(&self) -> usize {
+        self.token.window_offset()
+    }
+
+    pub(crate) fn writable(&self) -> bool {
+        self.writable.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn owner(&self) -> DaxMappingOwner {
+        self.token.owner()
+    }
+}
+
+impl DaxAccessGuard {
+    pub(crate) fn mapping(&self) -> &Arc<DaxMapping> {
+        &self.mapping
+    }
+
+    fn checked_window_offset(&self, offset: usize, len: usize) -> Result<usize, SystemError> {
+        let end = offset.checked_add(len).ok_or(SystemError::EOVERFLOW)?;
+        if end > DAX_RANGE_SIZE {
+            return Err(SystemError::ERANGE);
+        }
+        self.mapping
+            .window_offset()
+            .checked_add(offset)
+            .ok_or(SystemError::EOVERFLOW)
+    }
+
+    pub(crate) fn checked_paddr(
+        &self,
+        offset: usize,
+        len: usize,
+    ) -> Result<crate::mm::PhysAddr, SystemError> {
+        self.window
+            .checked_paddr(self.checked_window_offset(offset, len)?, len)
+    }
+
+    pub(crate) fn copy_to(&self, offset: usize, dst: &mut [u8]) -> Result<(), SystemError> {
+        let window_offset = self.checked_window_offset(offset, dst.len())?;
+        let src = self.window.checked_vaddr(window_offset, dst.len())?;
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.data() as *const u8, dst.as_mut_ptr(), dst.len());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn copy_from(&self, offset: usize, src: &[u8]) -> Result<(), SystemError> {
+        if !self.mapping.writable() {
+            return Err(SystemError::EACCES);
+        }
+        let window_offset = self.checked_window_offset(offset, src.len())?;
+        let dst = self.window.checked_vaddr(window_offset, src.len())?;
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.as_ptr(), dst.data() as *mut u8, src.len());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for DaxAccessGuard {
+    fn drop(&mut self) {
+        let result = self.allocator.put(&self.mapping.token);
+        debug_assert!(result.is_ok() || result == Err(SystemError::EINVAL));
+    }
+}
 
 #[derive(Debug)]
 pub struct FuseNode {
@@ -55,6 +172,8 @@ pub struct FuseNode {
     /// Serializes dirty-page admission against operations which must drain and
     /// invalidate the page cache (truncate and direct I/O).
     writeback_barrier: RwSem<()>,
+    dax_mappings: RwSem<DaxMappingTree>,
+    dax_pte_epoch: AtomicU64,
     cached_metadata_deadline_ns: AtomicU64,
     attr_version: AtomicU64,
     /// Version chain produced while short READ replies from one metadata
@@ -101,7 +220,7 @@ impl FuseNode {
             dax_owner_incarnation, 0,
             "FUSE DAX owner identity exhausted"
         );
-        Arc::new_cyclic(|self_ref| Self {
+        let node = Arc::new_cyclic(|self_ref| Self {
             fs,
             conn,
             self_ref: self_ref.clone(),
@@ -115,6 +234,8 @@ impl FuseNode {
             writeback_handles: Mutex::new(Vec::new()),
             lookup_cache: Mutex::new(BTreeMap::new()),
             writeback_barrier: RwSem::new(()),
+            dax_mappings: RwSem::new(DaxMappingTree::default()),
+            dax_pte_epoch: AtomicU64::new(0),
             cached_metadata_deadline_ns: AtomicU64::new(if has_cached { u64::MAX } else { 0 }),
             attr_version: AtomicU64::new(initial_attr_epoch),
             short_read_source_attr_version: AtomicU64::new(0),
@@ -124,7 +245,9 @@ impl FuseNode {
             lookup_attr_flags: AtomicU32::new(0),
             generation: AtomicU64::new(0),
             stale: AtomicBool::new(false),
-        })
+        });
+        node.conn.register_dax_node(&node);
+        node
     }
 
     pub fn lookup_attr_flags(&self) -> u32 {
@@ -138,6 +261,618 @@ impl FuseNode {
     pub(crate) fn dax_mapping_owner(&self) -> super::virtiofs::dax::DaxMappingOwner {
         super::virtiofs::dax::DaxMappingOwner::from_inode(self.nodeid, self.dax_owner_incarnation)
             .expect("FuseNode has a valid DAX owner identity")
+    }
+
+    pub(crate) fn dax_layout_read(&self) -> RwSemReadGuard<'_, ()> {
+        self.writeback_barrier.read()
+    }
+
+    pub(crate) fn dax_layout_write(&self) -> RwSemWriteGuard<'_, ()> {
+        self.writeback_barrier.write()
+    }
+
+    pub(crate) fn dax_pte_epoch(&self) -> u64 {
+        self.dax_pte_epoch.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn dax_note_pte_published(&self) -> Result<u64, SystemError> {
+        self.dax_pte_epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
+                epoch.checked_add(1)
+            })
+            .map(|old| old + 1)
+            .map_err(|_| SystemError::EOVERFLOW)
+    }
+
+    fn dax_aligned_offset(offset: u64) -> u64 {
+        offset & !(DAX_RANGE_SIZE as u64 - 1)
+    }
+
+    pub(crate) fn dax_access(
+        &self,
+        offset: u64,
+        writable: bool,
+    ) -> Result<DaxAccessGuard, SystemError> {
+        let admission = self.conn.enter_dax()?;
+        self.dax_access_inner(offset, writable, Some(admission))
+    }
+
+    fn dax_access_inner(
+        &self,
+        offset: u64,
+        writable: bool,
+        admission: Option<DaxAdmissionGuard>,
+    ) -> Result<DaxAccessGuard, SystemError> {
+        let file_offset = Self::dax_aligned_offset(offset);
+        let allocator = self
+            .conn
+            .dax_allocator()
+            .cloned()
+            .ok_or(SystemError::EOPNOTSUPP_OR_ENOTSUP)?;
+        let window = self.conn.dax_window()?;
+
+        loop {
+            let mapping = {
+                let tree = self.dax_mappings.read();
+                if tree.tombstones.contains_key(&file_offset) {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
+                let mapping = tree.mappings.get(&file_offset).cloned();
+                if let Some(mapping) = mapping.as_ref() {
+                    // Pin while the tree read lock still prevents reclaim from
+                    // transitioning this exact token to Reclaiming.
+                    allocator.get(&mapping.token)?;
+                }
+                mapping
+            };
+
+            if let Some(mapping) = mapping {
+                if !writable || mapping.writable() {
+                    return Ok(DaxAccessGuard {
+                        mapping,
+                        allocator,
+                        window,
+                        _admission: admission,
+                    });
+                }
+
+                let mut tree = self.dax_mappings.write();
+                let current = tree.mappings.get(&file_offset).cloned();
+                if !current
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &mapping))
+                {
+                    drop(tree);
+                    allocator.put(&mapping.token)?;
+                    continue;
+                }
+                if !mapping.writable() {
+                    if let Err(error) = self.conn.setup_existing_dax_mapping(
+                        self.dax_mapping_owner(),
+                        &mapping.token,
+                        file_offset,
+                        true,
+                    ) {
+                        drop(tree);
+                        allocator.put(&mapping.token)?;
+                        return Err(error);
+                    }
+                    mapping.writable.store(true, Ordering::Release);
+                    tree.bump_sequence()?;
+                }
+                drop(tree);
+                return Ok(DaxAccessGuard {
+                    mapping,
+                    allocator,
+                    window,
+                    _admission: admission,
+                });
+            }
+
+            let mut tree = self.dax_mappings.write();
+            if tree.tombstones.contains_key(&file_offset) {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+            if tree.mappings.contains_key(&file_offset) {
+                drop(tree);
+                continue;
+            }
+            let token =
+                self.conn
+                    .setup_dax_mapping(self.dax_mapping_owner(), file_offset, writable)?;
+            let mapping = Arc::new(DaxMapping {
+                file_offset,
+                writable: AtomicBool::new(writable),
+                token,
+            });
+            // The daemon mapping exists but cannot safely be published locally
+            // without the access reference. Retain allocator ownership on error;
+            // teardown will retire the connection range.
+            allocator.get(&mapping.token)?;
+            tree.bump_sequence()?;
+            tree.mappings.insert(file_offset, mapping.clone());
+            drop(tree);
+            return Ok(DaxAccessGuard {
+                mapping,
+                allocator,
+                window,
+                _admission: admission,
+            });
+        }
+    }
+
+    pub(crate) fn dax_isolate_reclaim(
+        &self,
+        candidate: &ReclaimCandidate,
+        expected_pte_epoch: u64,
+    ) -> Result<DaxReclaimTombstone, SystemError> {
+        let _layout = self.dax_layout_write();
+        self.dax_isolate_reclaim_locked(candidate, expected_pte_epoch)
+    }
+
+    fn dax_isolate_reclaim_locked(
+        &self,
+        candidate: &ReclaimCandidate,
+        expected_pte_epoch: u64,
+    ) -> Result<DaxReclaimTombstone, SystemError> {
+        if self.dax_pte_epoch() != expected_pte_epoch {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        let allocator = self
+            .conn
+            .dax_allocator()
+            .ok_or(SystemError::EOPNOTSUPP_OR_ENOTSUP)?;
+        let mut tree = self.dax_mappings.write();
+        let Some((file_offset, mapping)) = tree
+            .mappings
+            .iter()
+            .find(|(_, mapping)| mapping.token.matches_candidate(candidate))
+            .map(|(offset, mapping)| (*offset, mapping.clone()))
+        else {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        };
+        let token = allocator.begin_reclaim(candidate)?;
+        tree.mappings.remove(&file_offset);
+        tree.tombstones.insert(file_offset, mapping.clone());
+        tree.bump_sequence()?;
+        Ok(DaxReclaimTombstone {
+            file_offset,
+            mapping,
+            token,
+        })
+    }
+
+    /// Acquire the inode layout exclusively after revoking and removing every
+    /// DAX range intersecting `[new_size, EOF)`.  Sequence and PTE epochs make
+    /// the rmap-walk-to-lock transition retryable instead of racy.
+    pub(crate) fn dax_layout_write_for_truncate(
+        &self,
+        new_size: usize,
+    ) -> Result<RwSemWriteGuard<'_, ()>, SystemError> {
+        if !self.conn.dax_enabled() {
+            return Ok(self.dax_layout_write());
+        }
+        'retry: loop {
+            let page_cache = self.cached_page_cache();
+            let (sequence, mappings) = {
+                let tree = self.dax_mappings.read();
+                let mappings = tree
+                    .mappings
+                    .values()
+                    .filter(|mapping| {
+                        (mapping.file_offset as usize).saturating_add(DAX_RANGE_SIZE) > new_size
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (tree.sequence, mappings)
+            };
+            let epoch = self.dax_pte_epoch();
+            if let Some(cache) = page_cache.as_ref() {
+                for mapping in &mappings {
+                    let start = usize::try_from(mapping.file_offset)
+                        .map_err(|_| SystemError::EOVERFLOW)?
+                        >> crate::arch::MMArch::PAGE_SHIFT;
+                    let end = start
+                        .checked_add(DAX_RANGE_SIZE >> crate::arch::MMArch::PAGE_SHIFT)
+                        .ok_or(SystemError::EOVERFLOW)?;
+                    cache.unmap_mapping_pages(start, Some(end))?;
+                }
+            }
+            let layout = self.dax_layout_write();
+            if self.dax_pte_epoch() != epoch || self.dax_mappings.read().sequence != sequence {
+                drop(layout);
+                continue;
+            }
+            let allocator = self
+                .conn
+                .dax_allocator()
+                .ok_or(SystemError::EOPNOTSUPP_OR_ENOTSUP)?;
+            let total = allocator.snapshot().total;
+            let mut candidates = Vec::with_capacity(total);
+            allocator.reclaim_candidates(&mut candidates, total)?;
+            let mut tombstones = Vec::with_capacity(mappings.len());
+            for mapping in &mappings {
+                let Some(candidate) = candidates
+                    .iter()
+                    .find(|candidate| mapping.token.matches_candidate(candidate))
+                else {
+                    for tombstone in tombstones.drain(..) {
+                        let _ = self.dax_cancel_reclaim(tombstone);
+                    }
+                    drop(layout);
+                    continue 'retry;
+                };
+                match self.dax_isolate_reclaim_locked(candidate, epoch) {
+                    Ok(tombstone) => tombstones.push(tombstone),
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                        for tombstone in tombstones.drain(..) {
+                            let _ = self.dax_cancel_reclaim(tombstone);
+                        }
+                        drop(layout);
+                        continue 'retry;
+                    }
+                    Err(error) => {
+                        for tombstone in tombstones.drain(..) {
+                            let _ = self.dax_cancel_reclaim(tombstone);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            drop(layout);
+            let second_zap = (|| {
+                for tombstone in &tombstones {
+                    if let Some(cache) = page_cache.as_ref() {
+                        let start = usize::try_from(tombstone.file_offset)
+                            .map_err(|_| SystemError::EOVERFLOW)?
+                            >> crate::arch::MMArch::PAGE_SHIFT;
+                        let end = start
+                            .checked_add(DAX_RANGE_SIZE >> crate::arch::MMArch::PAGE_SHIFT)
+                            .ok_or(SystemError::EOVERFLOW)?;
+                        // The tombstone blocks new DAX faults. A second rmap
+                        // pass drains fork/mremap publishers that raced the
+                        // first zap.
+                        cache.unmap_mapping_pages(start, Some(end))?;
+                    }
+                }
+                Ok::<(), SystemError>(())
+            })();
+            if let Err(error) = second_zap {
+                for tombstone in tombstones.drain(..) {
+                    let _ = self.dax_cancel_reclaim(tombstone);
+                }
+                return Err(error);
+            }
+            let layout = self.dax_layout_write();
+            let mut remaining = tombstones.into_iter();
+            while let Some(tombstone) = remaining.next() {
+                if let Err(error) = self.dax_finish_reclaim(tombstone) {
+                    for unsubmitted in remaining {
+                        let _ = self.dax_cancel_reclaim(unsubmitted);
+                    }
+                    return Err(error);
+                }
+            }
+            return Ok(layout);
+        }
+    }
+
+    pub(crate) fn dax_teardown(&self) -> Result<(), SystemError> {
+        if self.conn.dax_enabled() {
+            drop(self.dax_layout_write_for_truncate(0)?);
+        }
+        Ok(())
+    }
+
+    /// Disconnect-only local revocation. The daemon can no longer confirm
+    /// REMOVEMAPPING, so clear inode ownership after two PTE zaps and let the
+    /// connection retire every allocator entry globally.
+    pub(crate) fn dax_disconnect_revoke(&self) -> Result<(), SystemError> {
+        let page_cache = self.cached_page_cache();
+        let mappings = self
+            .dax_mappings
+            .read()
+            .mappings
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let zap = |mapping: &DaxMapping| -> Result<(), SystemError> {
+            let Some(cache) = page_cache.as_ref() else {
+                return Ok(());
+            };
+            let start = usize::try_from(mapping.file_offset).map_err(|_| SystemError::EOVERFLOW)?
+                >> crate::arch::MMArch::PAGE_SHIFT;
+            let end = start
+                .checked_add(DAX_RANGE_SIZE >> crate::arch::MMArch::PAGE_SHIFT)
+                .ok_or(SystemError::EOVERFLOW)?;
+            cache.unmap_mapping_pages(start, Some(end))
+        };
+        for mapping in &mappings {
+            zap(mapping)?;
+        }
+        {
+            let _layout = self.dax_layout_write();
+            let mut tree = self.dax_mappings.write();
+            tree.mappings.clear();
+            tree.tombstones.clear();
+            tree.bump_sequence()?;
+        }
+        for mapping in &mappings {
+            zap(mapping)?;
+        }
+        Ok(())
+    }
+
+    fn dax_abandon_mappings(&self) {
+        let mappings = self
+            .dax_mappings
+            .read()
+            .mappings
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let _ = self.dax_disconnect_revoke();
+        let Some(allocator) = self.conn.dax_allocator() else {
+            return;
+        };
+        let total = allocator.snapshot().total;
+        let mut candidates = Vec::with_capacity(total);
+        if allocator
+            .reclaim_candidates(&mut candidates, total)
+            .is_err()
+        {
+            return;
+        }
+        for mapping in mappings {
+            if let Some(candidate) = candidates
+                .iter()
+                .find(|candidate| mapping.token.matches_candidate(candidate))
+            {
+                if let Ok(token) = allocator.begin_reclaim(candidate) {
+                    let _ = allocator.retire_reclaim(&token);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn dax_cancel_reclaim(
+        &self,
+        tombstone: DaxReclaimTombstone,
+    ) -> Result<(), SystemError> {
+        let allocator = self
+            .conn
+            .dax_allocator()
+            .ok_or(SystemError::EOPNOTSUPP_OR_ENOTSUP)?;
+        let mut tree = self.dax_mappings.write();
+        if !tree
+            .tombstones
+            .get(&tombstone.file_offset)
+            .is_some_and(|mapping| Arc::ptr_eq(mapping, &tombstone.mapping))
+        {
+            return Err(SystemError::EINVAL);
+        }
+        let restored = allocator.cancel_reclaim(&tombstone.token)?;
+        if !restored.same_identity(&tombstone.mapping.token) {
+            return Err(SystemError::EINVAL);
+        }
+        tree.tombstones.remove(&tombstone.file_offset);
+        tree.mappings
+            .insert(tombstone.file_offset, tombstone.mapping);
+        tree.bump_sequence()
+    }
+
+    pub(crate) fn dax_finish_reclaim(
+        &self,
+        tombstone: DaxReclaimTombstone,
+    ) -> Result<(), SystemError> {
+        let result = self.conn.remove_dax_mappings(
+            self.dax_mapping_owner(),
+            core::slice::from_ref(&tombstone.token),
+        );
+        let allocator = self
+            .conn
+            .dax_allocator()
+            .ok_or(SystemError::EOPNOTSUPP_OR_ENOTSUP)?;
+        let restore = result.is_err() && allocator.is_owned(&tombstone.mapping.token);
+        let mut tree = self.dax_mappings.write();
+        if tree
+            .tombstones
+            .get(&tombstone.file_offset)
+            .is_some_and(|mapping| Arc::ptr_eq(mapping, &tombstone.mapping))
+        {
+            tree.tombstones.remove(&tombstone.file_offset);
+            if restore {
+                tree.mappings
+                    .insert(tombstone.file_offset, tombstone.mapping);
+            }
+            tree.bump_sequence()?;
+        }
+        result
+    }
+
+    pub(crate) fn dax_mapping_for_offset(&self, offset: u64) -> Option<Arc<DaxMapping>> {
+        self.dax_mappings
+            .read()
+            .mappings
+            .get(&Self::dax_aligned_offset(offset))
+            .cloned()
+    }
+
+    pub(crate) fn dax_file_size(&self) -> Result<usize, SystemError> {
+        usize::try_from(self.cached_or_fetch_metadata()?.size.max(0))
+            .map_err(|_| SystemError::EOVERFLOW)
+    }
+
+    /// Reclaim one daemon mapping after first revoking every PTE that can
+    /// reference its 2 MiB cache-window range.  The epoch closes the race
+    /// between the rmap walk and taking the inode layout lock.
+    pub(crate) fn dax_reclaim_candidate(
+        &self,
+        candidate: &ReclaimCandidate,
+    ) -> Result<(), SystemError> {
+        let mapping = self
+            .dax_mappings
+            .read()
+            .mappings
+            .values()
+            .find(|mapping| mapping.token.matches_candidate(candidate))
+            .cloned()
+            .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+        let expected_epoch = self.dax_pte_epoch();
+        let page_cache = self.cached_page_cache();
+        let start = usize::try_from(mapping.file_offset).map_err(|_| SystemError::EOVERFLOW)?
+            >> crate::arch::MMArch::PAGE_SHIFT;
+        let end = start
+            .checked_add(DAX_RANGE_SIZE >> crate::arch::MMArch::PAGE_SHIFT)
+            .ok_or(SystemError::EOVERFLOW)?;
+        if let Some(cache) = page_cache.as_ref() {
+            cache.unmap_mapping_pages(start, Some(end))?;
+        }
+        let tombstone = self.dax_isolate_reclaim(candidate, expected_epoch)?;
+        if let Some(cache) = page_cache.as_ref() {
+            if let Err(error) = cache.unmap_mapping_pages(start, Some(end)) {
+                let _ = self.dax_cancel_reclaim(tombstone);
+                return Err(error);
+            }
+        }
+        self.dax_finish_reclaim(tombstone)
+    }
+
+    pub(crate) fn dax_read(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let _admission = self.conn.enter_dax()?;
+        let _layout = self.dax_layout_read();
+        let size = self.cached_or_fetch_metadata()?.size.max(0) as usize;
+        if offset >= size {
+            return Ok(0);
+        }
+        let requested = core::cmp::min(buf.len(), size - offset);
+        let mut done = 0usize;
+        while done < requested {
+            let current = offset.checked_add(done).ok_or(SystemError::EOVERFLOW)?;
+            let in_mapping = current & (DAX_RANGE_SIZE - 1);
+            let chunk = core::cmp::min(requested - done, DAX_RANGE_SIZE - in_mapping);
+            let access = match self.dax_access_inner(current as u64, false, None) {
+                Ok(access) => access,
+                Err(error) if done == 0 => return Err(error),
+                Err(_) => return Ok(done),
+            };
+            if let Err(error) = access.copy_to(in_mapping, &mut buf[done..done + chunk]) {
+                return if done == 0 { Err(error) } else { Ok(done) };
+            }
+            done += chunk;
+        }
+        Ok(done)
+    }
+
+    /// Send ordinary FUSE WRITE while the caller owns the inode layout write lock.
+    /// This helper deliberately does not acquire `writeback_barrier` again.
+    pub(crate) fn fuse_write_locked(
+        &self,
+        offset: usize,
+        buf: &[u8],
+        private: &FuseOpenPrivateData,
+        lock_owner: u64,
+    ) -> Result<usize, SystemError> {
+        let max_write = self.conn.max_write();
+        if max_write == 0 {
+            return Err(SystemError::EIO);
+        }
+        let mut done = 0usize;
+        while done < buf.len() {
+            let chunk = core::cmp::min(max_write, buf.len() - done);
+            let current = offset.checked_add(done).ok_or(SystemError::EOVERFLOW)?;
+            if current > i64::MAX as usize || chunk > u32::MAX as usize {
+                return if done == 0 {
+                    Err(SystemError::EFBIG)
+                } else {
+                    Ok(done)
+                };
+            }
+            let input = FuseWriteIn {
+                fh: private.fh,
+                offset: current as u64,
+                size: chunk as u32,
+                write_flags: if lock_owner != 0 {
+                    FUSE_WRITE_LOCKOWNER
+                } else {
+                    0
+                },
+                lock_owner,
+                flags: private.open_flags,
+                padding: 0,
+            };
+            let payload_len = core::mem::size_of::<FuseWriteIn>()
+                .checked_add(chunk)
+                .ok_or(SystemError::EOVERFLOW)?;
+            let mut request = Vec::new();
+            request
+                .try_reserve_exact(payload_len)
+                .map_err(|_| SystemError::ENOMEM)?;
+            request.extend_from_slice(fuse_pack_struct(&input));
+            request.extend_from_slice(&buf[done..done + chunk]);
+            let payload = match self.conn.request(FUSE_WRITE, self.nodeid, &request) {
+                Ok(payload) => payload,
+                Err(error) if done == 0 => return Err(error),
+                Err(_) => return Ok(done),
+            };
+            let output: FuseWriteOut = fuse_read_struct(&payload)?;
+            let wrote = output.size as usize;
+            if wrote > chunk {
+                return if done == 0 {
+                    Err(SystemError::EIO)
+                } else {
+                    Ok(done)
+                };
+            }
+            self.note_successful_write(current, wrote)?;
+            done += wrote;
+            if wrote < chunk {
+                break;
+            }
+        }
+        Ok(done)
+    }
+
+    pub(crate) fn dax_write_or_fuse_locked(
+        &self,
+        offset: usize,
+        buf: &[u8],
+        private: &FuseOpenPrivateData,
+        lock_owner: u64,
+    ) -> Result<usize, SystemError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let _admission = self.conn.enter_dax()?;
+        let _layout = self.dax_layout_write();
+        let end = offset
+            .checked_add(buf.len())
+            .ok_or(SystemError::EOVERFLOW)?;
+        let size = self.cached_or_fetch_metadata()?.size.max(0) as usize;
+        if offset >= size || end > size {
+            return self.fuse_write_locked(offset, buf, private, lock_owner);
+        }
+
+        let mut done = 0usize;
+        while done < buf.len() {
+            let current = offset.checked_add(done).ok_or(SystemError::EOVERFLOW)?;
+            let in_mapping = current & (DAX_RANGE_SIZE - 1);
+            let chunk = core::cmp::min(buf.len() - done, DAX_RANGE_SIZE - in_mapping);
+            let access = match self.dax_access_inner(current as u64, true, None) {
+                Ok(access) => access,
+                Err(error) if done == 0 => return Err(error),
+                Err(_) => return Ok(done),
+            };
+            if let Err(error) = access.copy_from(in_mapping, &buf[done..done + chunk]) {
+                return if done == 0 { Err(error) } else { Ok(done) };
+            }
+            self.note_successful_write(current, chunk)?;
+            done += chunk;
+        }
+        Ok(done)
     }
 
     pub(crate) fn set_generation(&self, gen: u64) {
@@ -472,6 +1207,17 @@ impl FuseNode {
 
 impl Drop for FuseNode {
     fn drop(&mut self) {
+        if let Err(error) = self.dax_teardown() {
+            log::warn!(
+                "fuse: inode {} dropped with DAX teardown error: {:?}",
+                self.nodeid,
+                error
+            );
+            // The daemon did not confirm removal. Revoke local PTEs/tree and
+            // retire the ranges so no future inode can observe an alias.
+            self.dax_abandon_mappings();
+        }
+        self.conn.unregister_dax_node(self.dax_mapping_owner());
         self.clear_lookup_cache_tree();
         self.flush_forget();
         self.clear_parent();

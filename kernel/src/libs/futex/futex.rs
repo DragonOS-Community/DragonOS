@@ -299,11 +299,16 @@ impl Futex {
                 PageFaultHandler::handle_mm_fault(message)
             };
 
-            if fault.contains(VmFaultReason::VM_FAULT_COMPLETED) {
+            if fault.reason.contains(VmFaultReason::VM_FAULT_COMPLETED) {
                 return Ok(());
             }
-            if fault.contains(VmFaultReason::VM_FAULT_RETRY) {
+            if fault.reason.contains(VmFaultReason::VM_FAULT_RETRY) {
                 flags |= FaultFlags::FAULT_FLAG_TRIED;
+                let wait = fault.retry_wait;
+                drop(space_guard);
+                if let Some(wait) = wait {
+                    wait.wait().map_err(|_| SystemError::EFAULT)?;
+                }
                 continue;
             }
             return Err(SystemError::EFAULT);

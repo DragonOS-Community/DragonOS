@@ -3686,6 +3686,15 @@ static int ext_test_cached_short_read_updates_eof() {
         goto fail;
     }
 
+    // The second READ is speculative readahead, so the foreground pread must
+    // not wait for the daemon to consume it. Wait here before inspecting the
+    // asynchronous trace rather than depending on daemon scheduling.
+    for (int i = 0;
+         i < 200 &&
+         (read_count < 2 || read_offsets[1] != 4096 || read_sizes[1] != 4096);
+         ++i) {
+        usleep(5 * 1000);
+    }
     if (read_count < 2 || read_offsets[0] != 0 || read_sizes[0] != 4096 ||
         read_offsets[1] != 4096 || read_sizes[1] != 4096) {
         printf("[FAIL] short read trace count=%u off0=%llu size0=%u off1=%llu size1=%u\n",

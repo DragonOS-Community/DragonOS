@@ -330,7 +330,7 @@ impl X86_64MMArch {
 
         let mut tried_direct_reclaim = false;
 
-        loop {
+        'fault_retry: loop {
             let mut space_guard = current_address_space.write();
             let mut fault;
             loop {
@@ -487,7 +487,8 @@ impl X86_64MMArch {
                     current_address_space.clone(),
                 );
 
-                fault = PageFaultHandler::handle_mm_fault(message);
+                let outcome = PageFaultHandler::handle_mm_fault(message);
+                fault = outcome.reason;
 
                 if fault.contains(VmFaultReason::VM_FAULT_COMPLETED) {
                     return;
@@ -495,6 +496,15 @@ impl X86_64MMArch {
 
                 if unlikely(fault.contains(VmFaultReason::VM_FAULT_RETRY)) {
                     flags |= FaultFlags::FAULT_FLAG_TRIED;
+                    let wait = outcome.retry_wait;
+                    drop(space_guard);
+                    if let Some(wait) = wait {
+                        if wait.wait().is_err() {
+                            send_bus_adrerr();
+                            return;
+                        }
+                    }
+                    continue 'fault_retry;
                 } else {
                     break;
                 }

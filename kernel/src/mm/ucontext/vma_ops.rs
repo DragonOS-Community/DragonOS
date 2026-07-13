@@ -834,9 +834,11 @@ impl InnerAddressSpace {
             if let Some((paddr, _)) = mapper.translate(vaddr) {
                 let page = {
                     let mut page_manager_guard = page_manager_lock();
-                    page_manager_guard.get_unwrap(&paddr)
+                    page_manager_guard.get(&paddr)
                 };
-                Self::remove_page_unevictable_if_unneeded(&page);
+                if let Some(page) = page {
+                    Self::remove_page_unevictable_if_unneeded(&page);
+                }
             }
             vaddr = VirtAddr::new(vaddr.data() + MMArch::PAGE_SIZE);
         }

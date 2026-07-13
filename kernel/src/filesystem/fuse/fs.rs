@@ -439,6 +439,15 @@ impl FuseFS {
             node.mark_stale();
         }
         for node in live_nodes.iter().chain(retired_nodes.iter()) {
+            if let Err(error) = node.dax_teardown() {
+                log::warn!(
+                    "fuse: failed to tear down DAX mappings for node {}: {:?}",
+                    node.nodeid(),
+                    error
+                );
+            }
+        }
+        for node in live_nodes.iter().chain(retired_nodes.iter()) {
             node.clear_lookup_cache_tree();
         }
         for node in live_nodes.iter().chain(retired_nodes.iter()) {
@@ -830,6 +839,10 @@ impl FileSystem for FuseFS {
     }
 
     fn on_umount(&self) {
+        if !self.is_submount {
+            self.conn.begin_dax_quiesce();
+            self.conn.wait_dax_drained();
+        }
         self.teardown_nodes();
         if !self.is_submount {
             self.conn.on_umount();

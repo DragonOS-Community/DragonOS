@@ -1,5 +1,5 @@
 use super::{
-    file::{FileFlags, FileMode},
+    file::{File, FileFlags, FileMode},
     utils::DName,
     FilePrivateData, FileSystem, FileType, IndexNode, InodeId, InodeMode, InodeRetentionKind,
     PollableInode, SetMetadataMask, SuperBlock, XattrFlags,
@@ -1990,6 +1990,10 @@ impl IndexNode for MountFSInode {
     ) -> Result<(), SystemError> {
         self.inner_inode
             .check_mmap_file(file, len, offset, vm_flags)
+    }
+
+    fn mmap_vm_flags(&self, file: &Arc<File>, vm_flags: VmFlags) -> Result<VmFlags, SystemError> {
+        self.inner_inode.mmap_vm_flags(file, vm_flags)
     }
 
     fn mmap_effective_file(

@@ -168,8 +168,19 @@ impl InnerAddressSpace {
                         if let Some((phys_addr, old_flags)) = old_mapper.translate(current_page) {
                             unsafe {
                                 if is_shared {
+                                    let child_flags =
+                                        if page_manager_guard.get(&phys_addr).is_none()
+                                            && vm_flags.contains(VmFlags::VM_MIXEDMAP)
+                                        {
+                                            // Preserve the actual external PTE permission. Using
+                                            // VMA page flags here could make a deliberately RO DAX
+                                            // PFN writable in the child without pfn_mkwrite.
+                                            old_flags
+                                        } else {
+                                            page_flags
+                                        };
                                     if new_mapper
-                                        .map_phys(current_page, phys_addr, page_flags)
+                                        .map_phys(current_page, phys_addr, child_flags)
                                         .is_none()
                                     {
                                         return Err(SystemError::ENOMEM);
@@ -197,7 +208,9 @@ impl InnerAddressSpace {
                                 if let Some(page) = page_manager_guard.get(&phys_addr) {
                                     page.write().insert_vma(new_vma.clone(), new_vma_mlocked);
                                 }
-                                child_present_pages += 1;
+                                if page_manager_guard.get(&phys_addr).is_some() {
+                                    child_present_pages += 1;
+                                }
                             }
                         }
                         current_page = VirtAddr::new(current_page.data() + MMArch::PAGE_SIZE);
@@ -396,9 +409,13 @@ impl InnerAddressSpace {
 
     fn add_present_page_mlock_ref(&mut self, addr: VirtAddr, vma: &Arc<LockedVMA>) {
         if let Some((paddr, _)) = self.user_mapper.utable.translate(addr) {
+            let vm_flags = *vma.lock().vm_flags();
             let mut page_manager_guard = page_manager_lock();
-            let page = page_manager_guard.get_unwrap(&paddr);
-            page.write().add_mlocked_vma_ref(vma);
+            if let PresentPfn::Managed(page) =
+                LockedVMA::classify_present_pfn(&mut page_manager_guard, paddr, vm_flags)
+            {
+                page.write().add_mlocked_vma_ref(vma);
+            }
         }
     }
 
@@ -418,9 +435,18 @@ impl InnerAddressSpace {
         let mut vaddr = start;
         while vaddr < end {
             if let Some((paddr, _)) = self.user_mapper.utable.translate(vaddr) {
+                let vm_flags = *vma.lock().vm_flags();
                 let page = {
                     let mut page_manager_guard = page_manager_lock();
-                    page_manager_guard.get_unwrap(&paddr)
+                    match LockedVMA::classify_present_pfn(&mut page_manager_guard, paddr, vm_flags)
+                    {
+                        PresentPfn::Managed(page) => Some(page),
+                        PresentPfn::External(_) => None,
+                    }
+                };
+                let Some(page) = page else {
+                    vaddr = VirtAddr::new(vaddr.data() + MMArch::PAGE_SIZE);
+                    continue;
                 };
                 {
                     let mut page_guard = page.write();
@@ -455,9 +481,9 @@ impl InnerAddressSpace {
             PageFaultHandler::handle_mm_fault(message)
         };
 
-        if fault.contains(VmFaultReason::VM_FAULT_COMPLETED) {
+        if fault.reason.contains(VmFaultReason::VM_FAULT_COMPLETED) {
             Ok(())
-        } else if fault.contains(VmFaultReason::VM_FAULT_OOM) {
+        } else if fault.reason.contains(VmFaultReason::VM_FAULT_OOM) {
             Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
         } else {
             Err(SystemError::ENOMEM)

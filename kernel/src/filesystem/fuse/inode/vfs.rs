@@ -86,12 +86,25 @@ impl IndexNode for FuseNode {
         };
 
         if (fopen_flags & FOPEN_DIRECT_IO) != 0
+            && !self.conn().dax_enabled()
             && vm_flags.contains(crate::mm::VmFlags::VM_MAYSHARE)
         {
             return Err(SystemError::ENODEV);
         }
 
         Ok(())
+    }
+
+    fn mmap_vm_flags(
+        &self,
+        _file: &Arc<crate::filesystem::vfs::file::File>,
+        vm_flags: crate::mm::VmFlags,
+    ) -> Result<crate::mm::VmFlags, SystemError> {
+        if self.conn().dax_enabled() {
+            Ok(vm_flags | crate::mm::VmFlags::VM_MIXEDMAP)
+        } else {
+            Ok(vm_flags)
+        }
     }
 
     fn mmap_file(
@@ -116,7 +129,7 @@ impl IndexNode for FuseNode {
             p.fopen_flags
         };
 
-        if (fopen_flags & FOPEN_DIRECT_IO) != 0 {
+        if (fopen_flags & FOPEN_DIRECT_IO) != 0 && !self.conn().dax_enabled() {
             if vm_flags.contains(crate::mm::VmFlags::VM_MAYSHARE) {
                 return Err(SystemError::ENODEV);
             }
@@ -354,6 +367,17 @@ impl IndexNode for FuseNode {
         let file_flags = private_data.open_flags;
         let fopen_flags = private_data.fopen_flags;
 
+        if self.conn().dax_enabled() {
+            loop {
+                match self.dax_read(offset, &mut buf[..len]) {
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                        self.conn().reclaim_one_dax_range_interruptible()?;
+                    }
+                    result => return result,
+                }
+            }
+        }
+
         if (fopen_flags & FOPEN_DIRECT_IO) != 0 || (file_flags & FileFlags::O_DIRECT.bits()) != 0 {
             let _barrier = self.writeback_barrier.write();
             self.prepare_direct_io_range(offset, len, &private_data, false)?;
@@ -385,6 +409,18 @@ impl IndexNode for FuseNode {
         let fh = private_data.fh;
         let file_flags = private_data.open_flags;
         let fopen_flags = private_data.fopen_flags;
+        if self.conn().dax_enabled() {
+            let lock_owner = crate::filesystem::vfs::vcore::current_file_lock_owner_id();
+            loop {
+                match self.dax_write_or_fuse_locked(offset, &buf[..len], &private_data, lock_owner)
+                {
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                        self.conn().reclaim_one_dax_range_interruptible()?;
+                    }
+                    result => return result,
+                }
+            }
+        }
         let max_write = core::cmp::min(self.conn().max_write(), self.max_pages_bytes());
         if max_write == 0 {
             return Err(SystemError::EIO);
@@ -523,15 +559,19 @@ impl IndexNode for FuseNode {
 
     fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
         self.check_not_stale()?;
+        let old = self.cached_or_fetch_metadata()?;
         let writeback_cache = self.conn().has_init_flag(FUSE_WRITEBACK_CACHE);
         if writeback_cache {
             self.sync_dirty_cached_pages()?;
         }
-        let _barrier = writeback_cache.then(|| self.writeback_barrier.write());
+        let _barrier = if self.conn().dax_enabled() && metadata.size < old.size {
+            Some(self.dax_layout_write_for_truncate(metadata.size.max(0) as usize)?)
+        } else {
+            writeback_cache.then(|| self.writeback_barrier.write())
+        };
         if writeback_cache {
             self.sync_dirty_cached_pages()?;
         }
-        let old = self.cached_or_fetch_metadata()?;
         if metadata.size > old.size {
             self.resolve_pending_short_read_truncate(metadata.size.max(0) as usize)?;
         }

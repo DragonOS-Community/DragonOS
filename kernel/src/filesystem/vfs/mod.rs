@@ -1688,7 +1688,8 @@ impl SuperBlock {
 bitflags! {
     pub struct Magic: u64 {
         const DEVFS_MAGIC = 0x1373;
-        const FAT_MAGIC =  0xf2f52011;
+        // Linux UAPI: MSDOS_SUPER_MAGIC.
+        const FAT_MAGIC = 0x4d44;
         const EXT4_MAGIC = 0xef53;
         const FUSE_MAGIC = 0x65735546;
         const TMPFS_MAGIC = 0x01021994;

@@ -10,6 +10,7 @@
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/statvfs.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -220,6 +221,36 @@ void WriteAll(int fd, const char* data, size_t len) {
         ASSERT_GT(written, 0) << strerror(errno);
         done += static_cast<size_t>(written);
     }
+}
+
+TEST(Ext4InodeIdentity, StatfsReportsLinuxAbi) {
+    LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+
+    struct statfs by_path = {};
+    ASSERT_EQ(0, statfs(fs.mount_point().c_str(), &by_path)) << strerror(errno);
+
+    int fd = open(fs.mount_point().c_str(), O_RDONLY | O_DIRECTORY);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    struct statfs by_fd = {};
+    ASSERT_EQ(0, fstatfs(fd, &by_fd)) << strerror(errno);
+    ASSERT_EQ(0, close(fd)) << strerror(errno);
+
+    constexpr long kExt4SuperMagic = 0xEF53;
+    EXPECT_EQ(kExt4SuperMagic, by_path.f_type);
+    EXPECT_EQ(kExt4SuperMagic, by_fd.f_type);
+    EXPECT_EQ(255, by_path.f_namelen);
+    EXPECT_EQ(255, by_fd.f_namelen);
+    EXPECT_GT(by_path.f_bsize, 0);
+    EXPECT_EQ(by_path.f_bsize, by_fd.f_bsize);
+    EXPECT_EQ(by_path.f_frsize, by_fd.f_frsize);
+    EXPECT_LE(by_path.f_bfree, by_path.f_blocks);
+    EXPECT_LE(by_path.f_bavail, by_path.f_bfree);
+    EXPECT_LE(by_fd.f_bfree, by_fd.f_blocks);
+    EXPECT_LE(by_fd.f_bavail, by_fd.f_bfree);
+
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
 }
 
 std::string ReadFile(const char* path) {

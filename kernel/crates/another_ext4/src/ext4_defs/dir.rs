@@ -4,6 +4,7 @@
 use super::crc::*;
 use super::AsBytes;
 use super::FileType;
+use super::MetadataChecksumSeed;
 use crate::constants::*;
 use crate::prelude::*;
 use crate::Block;
@@ -155,9 +156,14 @@ impl DirEntryTail {
         }
     }
 
-    pub fn set_checksum(&mut self, uuid: &[u8], ino: InodeId, ino_gen: u32, block: &Block) {
-        let mut csum = crc32(CRC32_INIT, uuid);
-        csum = crc32(csum, &ino.to_le_bytes());
+    pub fn set_checksum(
+        &mut self,
+        seed: MetadataChecksumSeed,
+        ino: InodeId,
+        ino_gen: u32,
+        block: &Block,
+    ) {
+        let mut csum = seed.crc32c(&ino.to_le_bytes());
         csum = crc32(csum, &ino_gen.to_le_bytes());
         // Hash all directory entries up to (but not including) this tail struct.
         // Linux: csum = ext4_chksum(sbi, i_csum_seed, dirent, (char*)tail - block_start)
@@ -191,7 +197,7 @@ impl DirBlock {
     /// record must end at or before that tail with a bounded name payload.
     pub fn validate(
         &self,
-        uuid: &[u8],
+        seed: MetadataChecksumSeed,
         ino: InodeId,
         ino_gen: u32,
         metadata_csum: bool,
@@ -199,17 +205,17 @@ impl DirBlock {
         htree_root: bool,
     ) -> Result<DirBlockLayout> {
         if indexed && htree_root {
-            self.validate_htree(uuid, ino, ino_gen, metadata_csum)?;
+            self.validate_htree(seed, ino, ino_gen, metadata_csum)?;
             return Ok(DirBlockLayout::Htree);
         }
         if indexed
             && self
-                .validate_htree(uuid, ino, ino_gen, metadata_csum)
+                .validate_htree(seed, ino, ino_gen, metadata_csum)
                 .is_ok()
         {
             return Ok(DirBlockLayout::Htree);
         }
-        if let Ok(()) = self.validate_leaf(uuid, ino, ino_gen, metadata_csum) {
+        if let Ok(()) = self.validate_leaf(seed, ino, ino_gen, metadata_csum) {
             return Ok(DirBlockLayout::Leaf);
         }
         Err(Ext4Error::new(ErrCode::EIO))
@@ -217,7 +223,7 @@ impl DirBlock {
 
     fn validate_leaf(
         &self,
-        uuid: &[u8],
+        seed: MetadataChecksumSeed,
         ino: InodeId,
         ino_gen: u32,
         metadata_csum: bool,
@@ -237,7 +243,7 @@ impl DirBlock {
                 return Err(Ext4Error::new(ErrCode::EIO));
             }
             let mut expected = tail;
-            expected.set_checksum(uuid, ino, ino_gen, &self.0);
+            expected.set_checksum(seed, ino, ino_gen, &self.0);
             if expected.checksum != tail.checksum {
                 return Err(Ext4Error::new(ErrCode::EIO));
             }
@@ -275,7 +281,7 @@ impl DirBlock {
     /// layout and checksum coverage as Linux `ext4_dx_csum_verify()`.
     fn validate_htree(
         &self,
-        uuid: &[u8],
+        seed: MetadataChecksumSeed,
         ino: InodeId,
         ino_gen: u32,
         metadata_csum: bool,
@@ -334,8 +340,7 @@ impl DirBlock {
         let used_end = count_offset
             .checked_add(count * 8)
             .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
-        let mut checksum = crc32(CRC32_INIT, uuid);
-        checksum = crc32(checksum, &ino.to_le_bytes());
+        let mut checksum = seed.crc32c(&ino.to_le_bytes());
         checksum = crc32(checksum, &ino_gen.to_le_bytes());
         checksum = crc32(checksum, &self.0.data[..used_end]);
         checksum = crc32(checksum, &self.0.data[tail_offset..tail_offset + 4]);
@@ -524,14 +529,19 @@ impl DirBlock {
     }
 
     /// Calc and set block checksum
-    pub fn set_checksum(&mut self, uuid: &[u8], ino: InodeId, ino_gen: u32) {
+    pub fn set_checksum(&mut self, seed: MetadataChecksumSeed, ino: InodeId, ino_gen: u32) {
         let tail_offset = BLOCK_SIZE - size_of::<DirEntryTail>();
         let mut tail: DirEntryTail = self.0.read_offset_as(tail_offset);
-        tail.set_checksum(uuid, ino, ino_gen, &self.0);
+        tail.set_checksum(seed, ino, ino_gen, &self.0);
         self.0.write_offset_as(tail_offset, &tail);
     }
 
-    pub fn set_htree_checksum(&mut self, uuid: &[u8], ino: InodeId, ino_gen: u32) -> Result<()> {
+    pub fn set_htree_checksum(
+        &mut self,
+        seed: MetadataChecksumSeed,
+        ino: InodeId,
+        ino_gen: u32,
+    ) -> Result<()> {
         let first_rec_len = u16::from_le_bytes([self.0.data[4], self.0.data[5]]) as usize;
         let count_offset = if first_rec_len == BLOCK_SIZE {
             8usize
@@ -561,8 +571,7 @@ impl DirBlock {
         let used_end = count_offset
             .checked_add(count * 8)
             .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
-        let mut checksum = crc32(CRC32_INIT, uuid);
-        checksum = crc32(checksum, &ino.to_le_bytes());
+        let mut checksum = seed.crc32c(&ino.to_le_bytes());
         checksum = crc32(checksum, &ino_gen.to_le_bytes());
         checksum = crc32(checksum, &self.0.data[..used_end]);
         checksum = crc32(checksum, &self.0.data[tail_offset..tail_offset + 4]);
@@ -576,11 +585,15 @@ impl DirBlock {
 mod tests {
     use super::*;
 
+    fn seed() -> MetadataChecksumSeed {
+        MetadataChecksumSeed::from_uuid(&[0x41; 16])
+    }
+
     fn valid_block() -> DirBlock {
         let mut block = DirBlock::new(Block::new(7, Box::new([0; BLOCK_SIZE])));
         block.init(true);
         assert!(block.insert("entry", 12, FileType::RegularFile, true));
-        block.set_checksum(&[0x41; 16], 2, 9);
+        block.set_checksum(seed(), 2, 9);
         block
     }
 
@@ -620,15 +633,13 @@ mod tests {
     #[test]
     fn validated_directory_rejects_zero_and_out_of_bounds_record_lengths() {
         let block = valid_block();
-        block
-            .validate(&[0x41; 16], 2, 9, true, false, false)
-            .unwrap();
+        block.validate(seed(), 2, 9, true, false, false).unwrap();
 
         let mut zero = block.0.clone();
         zero.data[4..6].copy_from_slice(&0u16.to_le_bytes());
         assert_eq!(
             DirBlock::new(zero)
-                .validate(&[0x41; 16], 2, 9, false, false, false)
+                .validate(seed(), 2, 9, false, false, false)
                 .unwrap_err()
                 .code(),
             ErrCode::EIO
@@ -638,7 +649,7 @@ mod tests {
         oversized.data[4..6].copy_from_slice(&((BLOCK_SIZE - 4) as u16).to_le_bytes());
         assert_eq!(
             DirBlock::new(oversized)
-                .validate(&[0x41; 16], 2, 9, false, false, false)
+                .validate(seed(), 2, 9, false, false, false)
                 .unwrap_err()
                 .code(),
             ErrCode::EIO
@@ -653,7 +664,7 @@ mod tests {
         bad_name.data[6] = 255;
         assert_eq!(
             DirBlock::new(bad_name)
-                .validate(&[0x41; 16], 2, 9, false, false, false)
+                .validate(seed(), 2, 9, false, false, false)
                 .unwrap_err()
                 .code(),
             ErrCode::EIO
@@ -663,7 +674,7 @@ mod tests {
         bad_type.data[7] = 0xff;
         assert_eq!(
             DirBlock::new(bad_type)
-                .validate(&[0x41; 16], 2, 9, false, false, false)
+                .validate(seed(), 2, 9, false, false, false)
                 .unwrap_err()
                 .code(),
             ErrCode::EIO
@@ -673,7 +684,7 @@ mod tests {
         bad_checksum.data[BLOCK_SIZE - 1] ^= 0x80;
         assert_eq!(
             DirBlock::new(bad_checksum)
-                .validate(&[0x41; 16], 2, 9, true, false, false)
+                .validate(seed(), 2, 9, true, false, false)
                 .unwrap_err()
                 .code(),
             ErrCode::EIO
@@ -683,9 +694,7 @@ mod tests {
     #[test]
     fn missing_entry_scan_stops_before_checksum_tail() {
         let mut block = valid_block();
-        block
-            .validate(&[0x41; 16], 2, 9, true, false, false)
-            .unwrap();
+        block.validate(seed(), 2, 9, true, false, false).unwrap();
 
         assert_eq!(block.get("missing", true), None);
         let mut entries = Vec::new();
@@ -703,7 +712,7 @@ mod tests {
     fn indexed_directory_root_uses_dx_checksum_layout() {
         let block = valid_htree_root();
         assert_eq!(
-            block.validate(&[0x41; 16], 2, 9, true, true, true).unwrap(),
+            block.validate(seed(), 2, 9, true, true, true).unwrap(),
             DirBlockLayout::Htree
         );
         assert_eq!(block.get(".", true), Some(2));
@@ -712,7 +721,7 @@ mod tests {
         no_csum.data[32..34].copy_from_slice(&508u16.to_le_bytes());
         assert_eq!(
             DirBlock::new(no_csum)
-                .validate(&[0x41; 16], 2, 9, false, true, true)
+                .validate(seed(), 2, 9, false, true, true)
                 .unwrap(),
             DirBlockLayout::Htree
         );
@@ -721,7 +730,7 @@ mod tests {
         corrupted.data[BLOCK_SIZE - 1] ^= 0x80;
         assert_eq!(
             DirBlock::new(corrupted)
-                .validate(&[0x41; 16], 2, 9, true, true, true)
+                .validate(seed(), 2, 9, true, true, true)
                 .unwrap_err()
                 .code(),
             ErrCode::EIO
@@ -731,7 +740,7 @@ mod tests {
         invalid_type.data[7] = 0xff;
         assert_eq!(
             DirBlock::new(invalid_type)
-                .validate(&[0x41; 16], 2, 9, false, true, true)
+                .validate(seed(), 2, 9, false, true, true)
                 .unwrap_err()
                 .code(),
             ErrCode::EIO
@@ -744,9 +753,7 @@ mod tests {
         block.init(false);
         assert!(block.insert("entry", 12, FileType::RegularFile, false));
         assert_eq!(
-            block
-                .validate(&[0x41; 16], 2, 9, false, false, false)
-                .unwrap(),
+            block.validate(seed(), 2, 9, false, false, false).unwrap(),
             DirBlockLayout::Leaf
         );
     }

@@ -103,8 +103,16 @@ impl Ext4 {
                 self.transaction_stage_inode_with_csum(&mut transaction, parent)?;
             }
             child.inode.set_link_count(0);
-            let mut sb = self.read_super_block_cached();
-            self.transaction_orphan_add(&mut transaction, child, &mut sb)?;
+            if self.uses_journal() {
+                let mut sb = self.read_super_block_cached();
+                self.transaction_orphan_add(&mut transaction, child, &mut sb)?;
+            } else {
+                // Linux nojournal mode does not enroll newly unlinked inodes in
+                // the persistent orphan chain. Lifetime reclaim starts only
+                // after this namespace transaction has published nlink == 0.
+                child.inode.set_next_orphan(0);
+                self.transaction_stage_inode_with_csum(&mut transaction, child)?;
+            }
 
             if let Err(error) = transaction.commit(self.block_device.as_ref(), self) {
                 // A commit-path failure may make journal state uncertain.  Do

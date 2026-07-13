@@ -303,6 +303,10 @@ impl OvlInode {
 }
 
 impl IndexNode for OvlInode {
+    fn append_lock_fs(&self) -> Option<Arc<dyn FileSystem>> {
+        Some(self.fs())
+    }
+
     fn open(
         &self,
         data: crate::libs::mutex::MutexGuard<FilePrivateData>,

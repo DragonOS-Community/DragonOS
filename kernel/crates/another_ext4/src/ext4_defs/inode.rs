@@ -7,7 +7,7 @@
 
 use super::crc::*;
 use super::AsBytes;
-use super::{ExtentNode, ExtentNodeMut};
+use super::{ExtentNode, ExtentNodeMut, MetadataChecksumSeed};
 use crate::constants::*;
 use crate::prelude::*;
 use crate::FileType;
@@ -533,8 +533,8 @@ impl InodeRef {
         Self { id, inode }
     }
 
-    pub fn set_checksum(&mut self, uuid: &[u8]) {
-        let checksum = self.calculated_checksum(uuid);
+    pub fn set_checksum(&mut self, seed: MetadataChecksumSeed) {
+        let checksum = self.calculated_checksum(seed);
         self.inode.osd2.l_checksum_lo = checksum as u16;
         self.inode.checksum_hi = (checksum >> 16) as u16;
     }
@@ -545,20 +545,19 @@ impl InodeRef {
     }
 
     /// Compute the Linux ext4 inode checksum without modifying the inode.
-    pub fn calculated_checksum(&self, uuid: &[u8]) -> u32 {
+    pub fn calculated_checksum(&self, seed: MetadataChecksumSeed) -> u32 {
         // Linux treats both checksum fields as zero while calculating CRC32C.
         let mut inode = self.inode.as_ref().clone();
         inode.osd2.l_checksum_lo = 0;
         inode.checksum_hi = 0;
-        let mut checksum = crc32(CRC32_INIT, uuid);
-        checksum = crc32(checksum, &self.id.to_le_bytes());
+        let mut checksum = seed.crc32c(&self.id.to_le_bytes());
         checksum = crc32(checksum, &inode.generation.to_le_bytes());
         crc32(checksum, inode.to_bytes())
     }
 
     /// Verify the stored checksum against the inode identity and filesystem UUID.
-    pub fn verify_checksum(&self, uuid: &[u8]) -> bool {
-        self.checksum() == self.calculated_checksum(uuid)
+    pub fn verify_checksum(&self, seed: MetadataChecksumSeed) -> bool {
+        self.checksum() == self.calculated_checksum(seed)
     }
 }
 
@@ -654,17 +653,18 @@ mod tests {
     #[test]
     fn inode_checksum_can_be_verified_without_mutation() {
         let uuid = *b"0123456789abcdef";
+        let seed = MetadataChecksumSeed::from_uuid(&uuid);
         let mut inode = InodeRef::new(42, Box::new(Inode::default()));
         inode.inode.set_generation(7);
         inode.inode.set_next_orphan(11);
-        inode.set_checksum(&uuid);
+        inode.set_checksum(seed);
 
         let stored = inode.checksum();
-        assert!(inode.verify_checksum(&uuid));
+        assert!(inode.verify_checksum(seed));
         assert_eq!(inode.checksum(), stored);
 
         inode.inode.set_next_orphan(12);
-        assert!(!inode.verify_checksum(&uuid));
+        assert!(!inode.verify_checksum(seed));
         assert_eq!(inode.checksum(), stored);
     }
 

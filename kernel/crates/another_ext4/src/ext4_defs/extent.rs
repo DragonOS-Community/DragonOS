@@ -14,7 +14,8 @@
 //! the use of extra metadata blocks.
 
 use super::crc::crc32;
-use crate::constants::{BLOCK_SIZE, CRC32_INIT};
+use super::MetadataChecksumSeed;
+use crate::constants::BLOCK_SIZE;
 use crate::prelude::*;
 
 /// Compute the CRC32C checksum for an extent block (non-root node).
@@ -24,9 +25,13 @@ use crate::prelude::*;
 /// and `tail_offset = sizeof(header) + sizeof(extent) * eh_max`.
 ///
 /// For a 4096-byte block: tail is the last 4 bytes.
-pub fn extent_block_checksum(uuid: &[u8], ino: u32, ino_gen: u32, block: &[u8]) -> u32 {
-    let csum = crc32(CRC32_INIT, uuid);
-    let csum = crc32(csum, &ino.to_le_bytes());
+pub fn extent_block_checksum(
+    seed: MetadataChecksumSeed,
+    ino: u32,
+    ino_gen: u32,
+    block: &[u8],
+) -> u32 {
+    let csum = seed.crc32c(&ino.to_le_bytes());
     let csum = crc32(csum, &ino_gen.to_le_bytes());
 
     let tail_offset = BLOCK_SIZE - core::mem::size_of::<ExtentTail>();

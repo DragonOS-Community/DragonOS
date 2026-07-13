@@ -52,7 +52,7 @@ impl Ext4 {
                 .map_err(|_| Ext4Error::new(ErrCode::EIO))?,
         );
         let calculated = extent_block_checksum(
-            &sb.uuid(),
+            sb.metadata_checksum_seed(),
             inode_ref.id,
             inode_ref.inode.generation(),
             image,
@@ -227,7 +227,7 @@ impl Ext4 {
             let mut leaf = ExtentNodeMut::from_bytes(&mut image[..]);
             Self::trim_leaf_tail(&mut leaf, remove)?;
             Self::set_extent_block_checksum(
-                &self.read_super_block_cached().uuid(),
+                self.read_super_block_cached().metadata_checksum_seed(),
                 inode_ref,
                 image,
             );
@@ -245,7 +245,7 @@ impl Ext4 {
             let mut leaf = ExtentNodeMut::from_bytes(&mut image[..]);
             leaf.remove_last_entry();
             Self::set_extent_block_checksum(
-                &self.read_super_block_cached().uuid(),
+                self.read_super_block_cached().metadata_checksum_seed(),
                 inode_ref,
                 image,
             );
@@ -279,7 +279,7 @@ impl Ext4 {
                 let mut node = ExtentNodeMut::from_bytes(&mut image[..]);
                 node.remove_last_entry();
                 Self::set_extent_block_checksum(
-                    &self.read_super_block_cached().uuid(),
+                    self.read_super_block_cached().metadata_checksum_seed(),
                     inode_ref,
                     image,
                 );
@@ -322,10 +322,14 @@ impl Ext4 {
         Ok(())
     }
 
-    fn set_extent_block_checksum(uuid: &[u8], inode_ref: &InodeRef, image: &mut [u8; BLOCK_SIZE]) {
+    fn set_extent_block_checksum(
+        seed: MetadataChecksumSeed,
+        inode_ref: &InodeRef,
+        image: &mut [u8; BLOCK_SIZE],
+    ) {
         let tail_offset = BLOCK_SIZE - core::mem::size_of::<crate::ext4_defs::ExtentTail>();
         let checksum =
-            extent_block_checksum(uuid, inode_ref.id, inode_ref.inode.generation(), image);
+            extent_block_checksum(seed, inode_ref.id, inode_ref.inode.generation(), image);
         image[tail_offset..tail_offset + 4].copy_from_slice(&checksum.to_le_bytes());
     }
 
@@ -333,7 +337,7 @@ impl Ext4 {
     fn write_extent_block(&self, block: &mut Block, inode_ref: &InodeRef) -> Result<()> {
         let tail_offset = BLOCK_SIZE - core::mem::size_of::<crate::ext4_defs::ExtentTail>();
         let csum = extent_block_checksum(
-            &self.read_super_block_cached().uuid(),
+            self.read_super_block_cached().metadata_checksum_seed(),
             inode_ref.id,
             inode_ref.inode.generation(),
             &*block.data,
@@ -990,7 +994,9 @@ mod tests {
             namespace_lock: spin::Mutex::new(()),
             metadata_mutation_barrier: crate::ext4::MetadataMutationGate::new(),
             poisoned: spin::Mutex::new(None),
-            journal: None,
+            metadata_mode: crate::ext4::MetadataMutationMode::ReadOnly,
+            write_barrier: true,
+            direct_restore_clean: false,
             inode_mutation_locks: (0..crate::ext4::INODE_MUTATION_LOCK_SHARDS)
                 .map(|_| spin::Mutex::new(()))
                 .collect(),
@@ -1019,7 +1025,9 @@ mod tests {
             namespace_lock: spin::Mutex::new(()),
             metadata_mutation_barrier: crate::ext4::MetadataMutationGate::new(),
             poisoned: spin::Mutex::new(None),
-            journal: None,
+            metadata_mode: crate::ext4::MetadataMutationMode::ReadOnly,
+            write_barrier: true,
+            direct_restore_clean: false,
             inode_mutation_locks: (0..crate::ext4::INODE_MUTATION_LOCK_SHARDS)
                 .map(|_| spin::Mutex::new(()))
                 .collect(),
@@ -1040,7 +1048,11 @@ mod tests {
         inode.inode.set_generation(23);
         let mut image = [0u8; BLOCK_SIZE];
         ExtentNodeMut::from_bytes(&mut image).init(0, 0);
-        Ext4::set_extent_block_checksum(&fs.read_super_block_cached().uuid(), &inode, &mut image);
+        Ext4::set_extent_block_checksum(
+            fs.read_super_block_cached().metadata_checksum_seed(),
+            &inode,
+            &mut image,
+        );
         fs.verify_extent_block_checksum(&inode, &image).unwrap();
 
         image[BLOCK_SIZE - 1] ^= 0x80;

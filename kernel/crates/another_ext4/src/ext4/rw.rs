@@ -62,9 +62,8 @@ impl Ext4 {
         &self,
         transaction: &mut super::journal_transaction::Transaction<'_>,
         bg_ref: &mut BlockGroupRef,
-        uuid: &[u8],
     ) -> Result<()> {
-        bg_ref.set_checksum(uuid);
+        bg_ref.set_checksum(self.read_super_block_cached().metadata_checksum_seed());
         let (block_id, offset) = self.block_group_disk_pos(bg_ref.id)?;
         let image = self.transaction_block_for_update(transaction, block_id)?;
         image[offset..offset + core::mem::size_of::<BlockGroupDesc>()]
@@ -83,7 +82,7 @@ impl Ext4 {
         transaction: &mut super::journal_transaction::Transaction<'_>,
         inode_ref: &mut InodeRef,
     ) -> Result<()> {
-        inode_ref.set_checksum(&self.read_super_block_cached().uuid());
+        inode_ref.set_checksum(self.read_super_block_cached().metadata_checksum_seed());
         let (block_id, offset) = self.inode_disk_pos(inode_ref.id)?;
         let image = self.transaction_block_for_update(transaction, block_id)?;
         let bytes = inode_ref.inode.to_bytes();
@@ -166,8 +165,8 @@ impl Ext4 {
 
     /// Write an inode to block device with checksum, and update cache.
     pub(super) fn write_inode_with_csum(&self, inode_ref: &mut InodeRef) -> Result<()> {
-        let uuid = self.read_super_block_cached().uuid();
-        inode_ref.set_checksum(&uuid);
+        let seed = self.read_super_block_cached().metadata_checksum_seed();
+        inode_ref.set_checksum(seed);
         self.write_inode_without_csum(inode_ref)
     }
 
@@ -197,8 +196,8 @@ impl Ext4 {
 
     /// Write a block group descriptor to disk and update cache, with checksum.
     pub(super) fn write_block_group_with_csum(&self, bg_ref: &mut BlockGroupRef) -> Result<()> {
-        let uuid = self.read_super_block_cached().uuid();
-        bg_ref.set_checksum(&uuid);
+        let seed = self.read_super_block_cached().metadata_checksum_seed();
+        bg_ref.set_checksum(seed);
         self.write_block_group_without_csum(bg_ref)
     }
 

@@ -8,7 +8,7 @@
 //!
 //! We only implement the seperate data block storage of extended attributes.
 
-use super::{crc::crc32, AsBytes, Block};
+use super::{crc::crc32, AsBytes, Block, MetadataChecksumSeed};
 use crate::constants::*;
 use crate::prelude::*;
 use core::cmp::Ordering;
@@ -74,12 +74,16 @@ impl XattrHeader {
 
 /// Compute an ext4 external-xattr block checksum using the Linux 6.6 layout.
 /// `seed` is the filesystem metadata checksum seed (normally CRC32C(uuid)).
-pub fn xattr_block_checksum(seed: u32, block_id: PBlockId, block: &[u8]) -> Option<u32> {
+pub fn xattr_block_checksum(
+    seed: MetadataChecksumSeed,
+    block_id: PBlockId,
+    block: &[u8],
+) -> Option<u32> {
     if block.len() != BLOCK_SIZE {
         return None;
     }
     let checksum_offset = core::mem::offset_of!(XattrHeader, checksum);
-    let mut checksum = crc32(seed, &block_id.to_le_bytes());
+    let mut checksum = seed.crc32c(&block_id.to_le_bytes());
     checksum = crc32(checksum, &block[..checksum_offset]);
     checksum = crc32(checksum, &[0; core::mem::size_of::<u32>()]);
     Some(crc32(
@@ -351,14 +355,14 @@ impl XattrBlock {
     }
 
     /// Verify the Linux ext4 external-xattr block checksum.
-    pub fn verify_checksum(&self, seed: u32, block_id: PBlockId) -> bool {
+    pub fn verify_checksum(&self, seed: MetadataChecksumSeed, block_id: PBlockId) -> bool {
         let header: XattrHeader = self.0.read_offset_as(0);
         xattr_block_checksum(seed, block_id, &*self.0.data)
             .is_some_and(|checksum| checksum == header.checksum())
     }
 
     /// Recompute the Linux ext4 external-xattr block checksum after mutation.
-    pub fn update_checksum(&mut self, seed: u32, block_id: PBlockId) -> bool {
+    pub fn update_checksum(&mut self, seed: MetadataChecksumSeed, block_id: PBlockId) -> bool {
         let mut header: XattrHeader = self.0.read_offset_as(0);
         header.set_checksum(0);
         self.0.write_offset_as(0, &header);
@@ -582,12 +586,15 @@ mod release_tests {
         start + (size_of::<FakeXattrEntry>() + name.len()).div_ceil(4) * 4
     }
 
-    fn checksummed_block(block_id: PBlockId, refcount: u32) -> ([u8; BLOCK_SIZE], u32) {
+    fn checksummed_block(
+        block_id: PBlockId,
+        refcount: u32,
+    ) -> ([u8; BLOCK_SIZE], MetadataChecksumSeed) {
         let mut bytes = [0; BLOCK_SIZE];
         let mut header = XattrHeader::new();
         header.set_refcount(refcount);
         bytes[..size_of::<XattrHeader>()].copy_from_slice(header.to_bytes());
-        let seed = 0x1234_5678;
+        let seed = MetadataChecksumSeed::from_raw(0x1234_5678);
         let checksum = xattr_block_checksum(seed, block_id, &bytes).unwrap();
         header.set_checksum(checksum);
         bytes[..size_of::<XattrHeader>()].copy_from_slice(header.to_bytes());
@@ -629,7 +636,7 @@ mod release_tests {
 
     #[test]
     fn xattr_block_mutation_recomputes_linux_checksum() {
-        let seed = 0x1234_5678;
+        let seed = MetadataChecksumSeed::from_raw(0x1234_5678);
         let block_id = 17;
         let mut block = XattrBlock::new(Block::new(block_id, Box::new([0; BLOCK_SIZE])));
         block.init();

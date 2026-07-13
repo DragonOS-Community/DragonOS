@@ -6,6 +6,30 @@ use super::{crc::crc32, AsBytes};
 use crate::constants::CRC32_INIT;
 use crate::prelude::*;
 
+/// CRC32C seed shared by ext4 metadata checksums.
+///
+/// Linux stores this value in `s_csum_seed`: seeded filesystems read it from
+/// `s_checksum_seed`, while older metadata-checksum filesystems derive it from
+/// the filesystem UUID once at mount.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetadataChecksumSeed(u32);
+
+impl MetadataChecksumSeed {
+    pub fn crc32c(self, bytes: &[u8]) -> u32 {
+        crc32(self.0, bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn from_raw(seed: u32) -> Self {
+        Self(seed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_uuid(uuid: &[u8]) -> Self {
+        Self(crc32(CRC32_INIT, uuid))
+    }
+}
+
 // 结构体表示超级块
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,13 +129,22 @@ pub struct SuperBlock {
     encrypt_algos: [u8; 4],    // 使用的加密算法
     encrypt_pw_salt: [u8; 16], // 用于string2key算法的盐
     lpf_ino: u32,              // lost+found节点的位置
-    padding: [u32; 100],       // 块的末尾的填充
+    project_quota_inum: u32,   // 项目配额 inode
+    checksum_seed: u32,        // metadata_csum_seed 启用时的 s_csum_seed
+    padding: [u32; 98],        // 块的末尾的填充
     checksum: u32,             // crc32c(superblock)
 }
 
 unsafe impl AsBytes for SuperBlock {}
 
+// Linux `struct ext4_super_block` disk offsets. Keep the explicit seed out of
+// the reserved tail without changing the 1024-byte on-disk layout.
+const _: () = assert!(core::mem::offset_of!(SuperBlock, checksum_seed) == 0x270);
+const _: () = assert!(core::mem::offset_of!(SuperBlock, checksum) == 0x3fc);
+
 impl SuperBlock {
+    /// Filesystem was cleanly unmounted (`EXT4_VALID_FS`).
+    pub const STATE_VALID_FS: u16 = 0x0001;
     const SB_MAGIC: u16 = 0xEF53;
 
     pub const FEATURE_COMPAT_HAS_JOURNAL: u32 = 0x0004;
@@ -121,6 +154,7 @@ impl SuperBlock {
     pub const FEATURE_COMPAT_ORPHAN_FILE: u32 = 0x1000;
     pub const FEATURE_INCOMPAT_RECOVER: u32 = 0x0004;
     pub const FEATURE_INCOMPAT_JOURNAL_DEV: u32 = 0x0008;
+    pub const FEATURE_INCOMPAT_CSUM_SEED: u32 = 0x2000;
     /// The orphan file may contain orphaned inodes.
     pub const FEATURE_RO_COMPAT_ORPHAN_PRESENT: u32 = 0x0001_0000;
     pub const FEATURE_RO_COMPAT_SPARSE_SUPER: u32 = 0x0001;
@@ -145,6 +179,16 @@ impl SuperBlock {
 
     pub fn uuid(&self) -> [u8; 16] {
         self.uuid
+    }
+
+    /// Return Linux's `s_csum_seed` for every metadata checksum other than the
+    /// superblock checksum itself.
+    pub fn metadata_checksum_seed(&self) -> MetadataChecksumSeed {
+        if self.has_incompatible_feature(Self::FEATURE_INCOMPAT_CSUM_SEED) {
+            MetadataChecksumSeed(self.checksum_seed)
+        } else {
+            MetadataChecksumSeed(crc32(CRC32_INIT, &self.uuid))
+        }
     }
 
     pub fn compatible_features(&self) -> u32 {
@@ -202,6 +246,18 @@ impl SuperBlock {
     /// Head inode number of the legacy on-disk orphan list, or zero.
     pub fn last_orphan(&self) -> u32 {
         self.last_orphan
+    }
+
+    pub fn is_clean(&self) -> bool {
+        self.state & Self::STATE_VALID_FS != 0
+    }
+
+    pub fn set_clean(&mut self, clean: bool) {
+        if clean {
+            self.state |= Self::STATE_VALID_FS;
+        } else {
+            self.state &= !Self::STATE_VALID_FS;
+        }
     }
 
     /// Set the head inode number of the legacy on-disk orphan list.
@@ -372,6 +428,11 @@ impl SuperBlock {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_checksum_seed(&mut self, seed: u32) {
+        self.checksum_seed = seed;
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_backup_block_groups(&mut self, groups: [u32; 2]) {
         self.backup_bgs = groups;
     }
@@ -416,5 +477,19 @@ mod tests {
         assert_eq!(sb.inode_count_in_group(1), 8);
         assert_eq!(sb.inode_count_in_group(2), 4);
         assert_eq!(sb.inode_count_in_group(3), 0);
+    }
+
+    #[test]
+    fn metadata_seed_uses_disk_field_only_when_feature_is_set() {
+        let mut sb = SuperBlock::validation_fixture();
+        let uuid_seed = MetadataChecksumSeed::from_uuid(&sb.uuid());
+        sb.set_checksum_seed(0x1234_5678);
+        assert_eq!(sb.metadata_checksum_seed(), uuid_seed);
+
+        sb.set_incompatible_feature(SuperBlock::FEATURE_INCOMPAT_CSUM_SEED, true);
+        assert_eq!(
+            sb.metadata_checksum_seed(),
+            MetadataChecksumSeed::from_raw(0x1234_5678)
+        );
     }
 }

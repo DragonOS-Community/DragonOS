@@ -126,14 +126,15 @@ impl Ext4 {
             sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_METADATA_CSUM);
         let checksum_bytes = (sb.clusters_per_group() as usize) / 8;
         if metadata_csum {
-            if !bg.verify_checksum(&sb.uuid()) {
+            if !bg.verify_checksum(sb.metadata_checksum_seed()) {
                 return_error!(ErrCode::EIO, "Corrupt block-group descriptor checksum");
             }
             let bitmap_image = transaction.read(self.block_device.as_ref(), bitmap_block_id)?;
-            if !bg
-                .desc
-                .verify_block_bitmap_csum(&sb.uuid(), &*bitmap_image, checksum_bytes)
-            {
+            if !bg.desc.verify_block_bitmap_csum(
+                sb.metadata_checksum_seed(),
+                &*bitmap_image,
+                checksum_bytes,
+            ) {
                 return_error!(ErrCode::EIO, "Corrupt block bitmap checksum");
             }
         }
@@ -160,16 +161,18 @@ impl Ext4 {
                 bitmap.clear_bit(index);
             }
             if metadata_csum
-                && !bg
-                    .desc
-                    .update_block_bitmap_csum(&sb.uuid(), image, checksum_bytes)
+                && !bg.desc.update_block_bitmap_csum(
+                    sb.metadata_checksum_seed(),
+                    image,
+                    checksum_bytes,
+                )
             {
                 return_error!(ErrCode::EIO, "Invalid block bitmap checksum length");
             }
         }
 
         bg.desc.set_free_blocks_count(new_bg_free);
-        self.transaction_stage_block_group_with_csum(transaction, &mut bg, &sb.uuid())?;
+        self.transaction_stage_block_group_with_csum(transaction, &mut bg)?;
         sb.set_free_blocks_count(new_sb_free);
         self.transaction_stage_super_block(transaction, &sb)
     }
@@ -202,14 +205,15 @@ impl Ext4 {
             sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_METADATA_CSUM);
         let checksum_bytes = (sb.inodes_per_group() as usize) / 8;
         if metadata_csum {
-            if !bg.verify_checksum(&sb.uuid()) {
+            if !bg.verify_checksum(sb.metadata_checksum_seed()) {
                 return_error!(ErrCode::EIO, "Corrupt block-group descriptor checksum");
             }
             let bitmap_image = transaction.read(self.block_device.as_ref(), bitmap_block_id)?;
-            if !bg
-                .desc
-                .verify_inode_bitmap_csum(&sb.uuid(), &*bitmap_image, checksum_bytes)
-            {
+            if !bg.desc.verify_inode_bitmap_csum(
+                sb.metadata_checksum_seed(),
+                &*bitmap_image,
+                checksum_bytes,
+            ) {
                 return_error!(ErrCode::EIO, "Corrupt inode bitmap checksum");
             }
         }
@@ -240,9 +244,11 @@ impl Ext4 {
             }
             bitmap.clear_bit(idx);
             if metadata_csum
-                && !bg
-                    .desc
-                    .update_inode_bitmap_csum(&sb.uuid(), image, checksum_bytes)
+                && !bg.desc.update_inode_bitmap_csum(
+                    sb.metadata_checksum_seed(),
+                    image,
+                    checksum_bytes,
+                )
             {
                 return_error!(ErrCode::EIO, "Invalid inode bitmap checksum length");
             }
@@ -252,7 +258,7 @@ impl Ext4 {
         if let Some(used) = new_used_dirs {
             bg.desc.set_used_dirs_count(used);
         }
-        self.transaction_stage_block_group_with_csum(transaction, &mut bg, &sb.uuid())?;
+        self.transaction_stage_block_group_with_csum(transaction, &mut bg)?;
         sb.set_free_inodes_count(new_sb_free);
         self.transaction_stage_super_block(transaction, &sb)
     }
@@ -425,7 +431,7 @@ impl Ext4 {
         let _metadata_guard = self.lock_transactional_metadata_mutation()?;
         let _mutation_guard =
             self.inode_mutation_locks[self.inode_mutation_lock_index(handle.inode_id)].lock();
-        self.reclaim_inode_lifetime(handle.inode_id, handle.generation)
+        self.reclaim_inode_lifetime(handle.inode_id, handle.generation, self.uses_journal())
     }
 
     /// Reclaim a mount-recovery orphan without manufacturing a VFS lifetime
@@ -436,7 +442,7 @@ impl Ext4 {
         let _mutation_guard =
             self.inode_mutation_locks[self.inode_mutation_lock_index(inode_id)].lock();
         let generation = self.read_inode_uncached(inode_id)?.inode.generation();
-        self.reclaim_inode_lifetime(inode_id, generation)
+        self.reclaim_inode_lifetime(inode_id, generation, true)
     }
 
     /// Complete a crash-interrupted truncate for an inode that still has names.
@@ -528,9 +534,14 @@ impl Ext4 {
         self.commit_reclaim_transaction(transaction)
     }
 
-    fn reclaim_inode_lifetime(&self, inode_id: InodeId, generation: u32) -> Result<()> {
+    fn reclaim_inode_lifetime(
+        &self,
+        inode_id: InodeId,
+        generation: u32,
+        require_orphan_membership: bool,
+    ) -> Result<()> {
         self.validate_reclaim_inode(inode_id, generation)?;
-        if !self.legacy_orphan_contains(inode_id)? {
+        if require_orphan_membership && !self.legacy_orphan_contains(inode_id)? {
             return_error!(ErrCode::EINVAL, "Inode {} is not orphaned", inode_id);
         }
         // Each iteration starts from the checkpointed inode-table entry.  The
@@ -629,8 +640,10 @@ impl Ext4 {
         }
         let is_dir = inode.inode.is_dir();
         let mut transaction = self.transaction_start(16)?;
-        let mut sb = self.transaction_read_super_block(&transaction)?;
-        self.transaction_orphan_del(&mut transaction, &inode, &mut sb)?;
+        if require_orphan_membership {
+            let mut sb = self.transaction_read_super_block(&transaction)?;
+            self.transaction_orphan_del(&mut transaction, &inode, &mut sb)?;
+        }
         self.transaction_dealloc_inode(&mut transaction, inode_id, is_dir)?;
         let mut cleared = InodeRef::new(inode_id, Box::default());
         cleared.inode.set_generation(generation);
@@ -765,7 +778,7 @@ impl Ext4 {
 
             // Set block group checksum
             if !bg.desc.update_block_bitmap_csum(
-                &sb.uuid(),
+                sb.metadata_checksum_seed(),
                 &*bitmap_block.data,
                 sb.clusters_per_group() as usize / 8,
             ) {
@@ -872,7 +885,7 @@ impl Ext4 {
         }
         // Set block group checksum
         if !bg.desc.update_block_bitmap_csum(
-            &sb.uuid(),
+            sb.metadata_checksum_seed(),
             &*bitmap_block.data,
             sb.clusters_per_group() as usize / 8,
         ) {
@@ -939,7 +952,7 @@ impl Ext4 {
             };
             // Update bitmap in disk
             if !bg.desc.update_inode_bitmap_csum(
-                &sb.uuid(),
+                sb.metadata_checksum_seed(),
                 &*bitmap_block.data,
                 sb.inodes_per_group() as usize / 8,
             ) {
@@ -1023,7 +1036,7 @@ impl Ext4 {
         }
         // Update bitmap in disk
         if !bg.desc.update_inode_bitmap_csum(
-            &sb.uuid(),
+            sb.metadata_checksum_seed(),
             &*bitmap_block.data,
             sb.inodes_per_group() as usize / 8,
         ) {

@@ -1,4 +1,4 @@
-use super::{journal_recovery, journal_transaction, Ext4};
+use super::{journal_recovery, journal_transaction, Ext4, MetadataMutationMode};
 use crate::constants::BLOCK_SIZE;
 use crate::ext4_defs::{AsBytes, Block, BlockDevice, InodeRef, SuperBlock};
 use crate::jbd2::Superblock as JournalSuperblock;
@@ -8,7 +8,7 @@ fn validate_journal_inode(sb: &SuperBlock, inode: &InodeRef) -> Result<()> {
     if !inode.inode.is_file()
         || !inode.inode.uses_extents()
         || (sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_METADATA_CSUM)
-            && !inode.verify_checksum(&sb.uuid()))
+            && !inode.verify_checksum(sb.metadata_checksum_seed()))
     {
         return Err(Ext4Error::new(ErrCode::EIO));
     }
@@ -121,12 +121,59 @@ impl Ext4 {
         self.block_device.flush()
     }
 
+    pub(super) fn initialize_direct(&mut self) -> Result<()> {
+        if !matches!(self.metadata_mode, MetadataMutationMode::ReadOnly) {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        let target_blocks = self.read_super_block_cached().block_count();
+        self.metadata_mode = MetadataMutationMode::Direct(
+            journal_transaction::DirectTransactionCore::new(target_blocks)?,
+        );
+        Ok(())
+    }
+
+    pub(super) fn mark_direct_mount_dirty(&mut self) -> Result<()> {
+        if self.write_barrier && !self.block_device.supports_reliable_flush() {
+            return Err(Ext4Error::new(ErrCode::ENOTSUP));
+        }
+        let mut sb = self.read_super_block_cached();
+        self.direct_restore_clean = sb.is_clean();
+        sb.set_clean(false);
+        self.write_super_block(&sb)?;
+        if self.write_barrier {
+            self.block_device.flush()?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn uses_journal(&self) -> bool {
+        matches!(self.metadata_mode, MetadataMutationMode::Journal(_))
+    }
+
     pub fn shutdown_writable(&self) -> Result<()> {
         // Clearing RECOVER is a metadata state transition and must not race a
         // direct writer even if the VFS normally excludes writers at umount.
         let _metadata_guard = self.lock_transactional_metadata_mutation()?;
-        let Some(journal) = self.journal.as_ref() else {
-            return Ok(());
+        let journal = match &self.metadata_mode {
+            MetadataMutationMode::ReadOnly => return Err(Ext4Error::new(ErrCode::EROFS)),
+            MetadataMutationMode::Direct(core) => {
+                if !core.can_shutdown() || self.poisoned.lock().is_some() {
+                    return Err(Ext4Error::new(ErrCode::EIO));
+                }
+                if self.write_barrier {
+                    self.block_device.flush()?;
+                }
+                if self.direct_restore_clean {
+                    let mut sb = self.read_super_block_cached();
+                    sb.set_clean(true);
+                    self.write_super_block(&sb)?;
+                    if self.write_barrier {
+                        self.block_device.flush()?;
+                    }
+                }
+                return Ok(());
+            }
+            MetadataMutationMode::Journal(core) => core,
         };
         if !journal.can_shutdown() {
             return Err(Ext4Error::new(ErrCode::EIO));
@@ -145,10 +192,11 @@ impl Ext4 {
         &self,
         credits: usize,
     ) -> Result<journal_transaction::Transaction<'_>> {
-        self.journal
-            .as_ref()
-            .ok_or_else(|| Ext4Error::new(ErrCode::ENOTSUP))?
-            .start(credits)
+        match &self.metadata_mode {
+            MetadataMutationMode::ReadOnly => Err(Ext4Error::new(ErrCode::EROFS)),
+            MetadataMutationMode::Journal(core) => core.start(credits),
+            MetadataMutationMode::Direct(core) => core.start(credits),
+        }
     }
 
     pub(super) fn initialize_journal(&mut self) -> Result<()> {
@@ -254,16 +302,17 @@ impl Ext4 {
         } else {
             return Err(Ext4Error::new(ErrCode::EIO));
         };
-        self.journal = Some(journal_transaction::JournalTransactionCore::new(
-            journal_transaction::JournalContext {
-                superblock: journal_sb,
-                logical_blocks: mapping.into(),
-                journal_blocks: Arc::new(journal_blocks),
-                target_blocks: ext4_sb.block_count(),
-                head,
-                superblock_image: image,
-            },
-        )?);
+        self.metadata_mode =
+            MetadataMutationMode::Journal(journal_transaction::JournalTransactionCore::new(
+                journal_transaction::JournalContext {
+                    superblock: journal_sb,
+                    logical_blocks: mapping.into(),
+                    journal_blocks: Arc::new(journal_blocks),
+                    target_blocks: ext4_sb.block_count(),
+                    head,
+                    superblock_image: image,
+                },
+            )?);
 
         // Replay may itself publish a newer ext4 superblock.  Recheck the
         // recovered feature set before interpreting or mutating orphan state;
@@ -287,9 +336,10 @@ impl Ext4 {
     }
 
     pub(super) fn journal_owns_block_range(&self, start: PBlockId, end: PBlockId) -> bool {
-        self.journal
-            .as_ref()
-            .is_some_and(|journal| journal.owns_block_range(start, end))
+        match &self.metadata_mode {
+            MetadataMutationMode::Journal(journal) => journal.owns_block_range(start, end),
+            MetadataMutationMode::ReadOnly | MetadataMutationMode::Direct(_) => false,
+        }
     }
 }
 
@@ -348,7 +398,7 @@ mod tests {
         inode.inode.set_mode(InodeMode::FILE | InodeMode::ALL_RW);
         inode.inode.set_generation(9);
         inode.inode.extent_init();
-        inode.set_checksum(&sb.uuid());
+        inode.set_checksum(sb.metadata_checksum_seed());
         inode
     }
 
@@ -362,7 +412,7 @@ mod tests {
         bad_mode
             .inode
             .set_mode(InodeMode::DIRECTORY | InodeMode::ALL_RWX);
-        bad_mode.set_checksum(&sb.uuid());
+        bad_mode.set_checksum(sb.metadata_checksum_seed());
         assert_eq!(
             validate_journal_inode(&sb, &bad_mode).unwrap_err().code(),
             ErrCode::EIO
@@ -383,7 +433,7 @@ mod tests {
         let sb = metadata_csum_superblock();
         let mut before = valid_journal_inode(&sb);
         before.inode.set_size(8192);
-        before.set_checksum(&sb.uuid());
+        before.set_checksum(sb.metadata_checksum_seed());
         let after = before.clone();
         assert!(journal_replay_identity_matches(
             &before,

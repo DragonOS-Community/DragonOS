@@ -90,9 +90,13 @@ pub struct Ext4 {
     metadata_mutation_barrier: MetadataMutationGate,
     /// First unrecoverable metadata error.  Once set, mutation must fail-stop.
     poisoned: spin::Mutex<Option<ErrCode>>,
-    /// Validated synchronous JBD2 engine. It is initialized only by
-    /// `load_writable`; read-only probing must not mutate or recover media.
-    journal: Option<journal_transaction::JournalTransactionCore>,
+    /// Explicit metadata mutation lifecycle. Read-only probing cannot acquire
+    /// either transaction backend and therefore cannot mutate or recover media.
+    metadata_mode: MetadataMutationMode,
+    /// Flush policy selected at mount. Journal mode currently requires this.
+    write_barrier: bool,
+    /// A Direct mount may restore VALID_FS only if it was set before mount.
+    direct_restore_clean: bool,
     /// Serializes inode metadata and extent-tree mutations per inode shard.
     ///
     /// another_ext4 stores inodes as value snapshots in a small cache. Without
@@ -101,6 +105,12 @@ pub struct Ext4 {
     /// sharding so unrelated apt download files do not serialize on one global
     /// filesystem-wide spin lock.
     inode_mutation_locks: Vec<spin::Mutex<()>>,
+}
+
+pub(super) enum MetadataMutationMode {
+    ReadOnly,
+    Journal(journal_transaction::JournalTransactionCore),
+    Direct(journal_transaction::DirectTransactionCore),
 }
 
 /// Non-blocking gate separating legacy direct writers from journal snapshots.
@@ -288,7 +298,8 @@ impl Ext4 {
     }
 
     fn validate_super_block(sb: &SuperBlock) -> Result<()> {
-        const SUPPORTED_INCOMPAT: u32 = 0x0002 | 0x0004 | 0x0040 | 0x0080 | 0x0200;
+        const SUPPORTED_INCOMPAT: u32 =
+            0x0002 | 0x0004 | 0x0040 | 0x0080 | 0x0200 | SuperBlock::FEATURE_INCOMPAT_CSUM_SEED;
         const SUPPORTED_RO_COMPAT: u32 = 0x0001
             | 0x0002
             | 0x0004
@@ -396,7 +407,7 @@ impl Ext4 {
         let block_bitmap = desc.block_bitmap_block();
         let inode_bitmap = desc.inode_bitmap_block();
         let inode_table = desc.inode_table_first_block();
-        if (metadata_csum && !group.verify_checksum(&sb.uuid()))
+        if (metadata_csum && !group.verify_checksum(sb.metadata_checksum_seed()))
             || block_bitmap == 0
             || block_bitmap >= sb.block_count()
             || inode_bitmap == 0
@@ -437,15 +448,55 @@ impl Ext4 {
             namespace_lock: spin::Mutex::new(()),
             metadata_mutation_barrier: MetadataMutationGate::new(),
             poisoned: spin::Mutex::new(None),
-            journal: None,
+            metadata_mode: MetadataMutationMode::ReadOnly,
+            write_barrier: true,
+            direct_restore_clean: false,
             inode_mutation_locks,
         })
     }
 
     /// Load, recover and activate a filesystem for metadata mutation.
     pub fn load_writable(block_device: Arc<dyn BlockDevice>) -> Result<Self> {
+        Self::load_writable_with_options(block_device, true)
+    }
+
+    pub fn load_read_only_checked(block_device: Arc<dyn BlockDevice>) -> Result<Self> {
+        let fs = Self::load(block_device)?;
+        let sb = fs.read_super_block_cached();
+        if sb.last_orphan() != 0
+            || sb.has_incompatible_feature(SuperBlock::FEATURE_INCOMPAT_RECOVER)
+        {
+            return_error!(
+                ErrCode::EROFS,
+                "Filesystem requires recovery before read-only mount"
+            );
+        }
+        Ok(fs)
+    }
+
+    pub fn load_writable_with_options(
+        block_device: Arc<dyn BlockDevice>,
+        write_barrier: bool,
+    ) -> Result<Self> {
         let mut fs = Self::load(block_device)?;
-        fs.initialize_journal()?;
+        fs.write_barrier = write_barrier;
+        fs.writable_orphan_preflight()?;
+        let has_journal = fs
+            .read_super_block_cached()
+            .has_compatible_feature(SuperBlock::FEATURE_COMPAT_HAS_JOURNAL);
+        if has_journal {
+            if !write_barrier {
+                return_error!(
+                    ErrCode::ENOTSUP,
+                    "barrier=0 is unsupported with the journal"
+                );
+            }
+            fs.initialize_journal()?;
+        } else {
+            fs.initialize_direct()?;
+            fs.mark_direct_mount_dirty()?;
+            fs.cleanup_legacy_orphan_chain()?;
+        }
         Ok(fs)
     }
 
@@ -466,6 +517,9 @@ impl Ext4 {
     }
 
     pub(super) fn ensure_mutable(&self) -> Result<()> {
+        if matches!(self.metadata_mode, MetadataMutationMode::ReadOnly) {
+            return_error!(ErrCode::EROFS, "Filesystem was opened read-only");
+        }
         if let Some(code) = *self.poisoned.lock() {
             return_error!(code, "Filesystem is fail-stopped after a metadata error");
         }
@@ -596,7 +650,7 @@ mod validation_tests {
         sb.set_checksum();
         let mut desc = BlockGroupDesc::validation_fixture();
         let mut group = BlockGroupRef::new(0, desc);
-        group.set_checksum(&sb.uuid());
+        group.set_checksum(sb.metadata_checksum_seed());
         desc = group.desc;
 
         let mut block0 = Block::new(0, Box::new([0; BLOCK_SIZE]));
@@ -663,7 +717,7 @@ mod validation_tests {
         let sb = SuperBlock::validation_fixture();
         let mut desc = BlockGroupDesc::validation_fixture();
         let mut group = BlockGroupRef::new(0, desc);
-        group.set_checksum(&sb.uuid());
+        group.set_checksum(sb.metadata_checksum_seed());
         desc = group.desc;
         assert!(Ext4::validate_block_group(&sb, 0, &desc, true, 16).is_ok());
 
@@ -675,7 +729,7 @@ mod validation_tests {
         bytes[0..4].copy_from_slice(&(sb.block_count() as u32).to_le_bytes());
         bad_address = BlockGroupDesc::from_bytes(&bytes);
         let mut group = BlockGroupRef::new(0, bad_address);
-        group.set_checksum(&sb.uuid());
+        group.set_checksum(sb.metadata_checksum_seed());
         assert!(Ext4::validate_block_group(&sb, 0, &group.desc, true, 16).is_err());
     }
 

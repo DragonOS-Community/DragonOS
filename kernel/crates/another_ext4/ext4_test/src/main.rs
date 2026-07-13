@@ -23,6 +23,66 @@ fn make_ext4() {
         .output();
 }
 
+fn nojournal_seeded_image_test() {
+    const IMAGE: &str = "ext4-nojournal-seeded.img";
+    let _ = std::fs::remove_file(IMAGE);
+    assert!(
+        std::process::Command::new("truncate")
+            .args(["-s", "1G", IMAGE])
+            .status()
+            .expect("truncate failed")
+            .success()
+    );
+    assert!(
+        std::process::Command::new("mkfs.ext4")
+            .args([
+                "-F",
+                "-b",
+                "4096",
+                "-I",
+                "256",
+                "-O",
+                "^has_journal,^orphan_file,metadata_csum_seed",
+                IMAGE,
+            ])
+            .status()
+            .expect("mkfs.ext4 failed")
+            .success()
+    );
+
+    let ext4 = Ext4::load_writable(Arc::new(BlockFile::new(IMAGE)))
+        .expect("Cube-equivalent nojournal image must mount writable");
+    let dir = ext4
+        .generic_create(
+            ROOT_INO,
+            "cube",
+            InodeMode::DIRECTORY | InodeMode::ALL_RWX,
+        )
+        .expect("create directory failed");
+    let file = ext4
+        .generic_create(dir, "payload", InodeMode::FILE | InodeMode::ALL_RWX)
+        .expect("create file failed");
+    ext4.write(file, 0, b"dragonos-on-cube")
+        .expect("write failed");
+    ext4.rename(dir, "payload", dir, "renamed")
+        .expect("rename failed");
+    ext4.generic_remove(dir, "renamed").expect("unlink failed");
+    ext4.shutdown_writable().expect("shutdown failed");
+    drop(ext4);
+
+    let output = std::process::Command::new("e2fsck")
+        .args(["-fn", IMAGE])
+        .output()
+        .expect("e2fsck failed");
+    assert!(
+        output.status.success(),
+        "nojournal seeded e2fsck failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    println!("nojournal metadata_csum_seed image test done");
+}
+
 fn open_ext4() -> Ext4 {
     let file = BlockFile::new("ext4.img");
     println!("creating ext4");
@@ -696,6 +756,7 @@ fn cross_parent_directory_replace_orphan_test() {
 fn main() {
     SimpleLogger::new().init().unwrap();
     log::set_max_level(log::LevelFilter::Off);
+    nojournal_seeded_image_test();
     make_ext4();
     println!("ext4.img created");
     let mut ext4 = open_ext4();

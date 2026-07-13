@@ -118,6 +118,8 @@ pub struct Ext4MountOptions {
     pub dax: Option<Ext4DaxMode>,
     pub errors: Ext4ErrorsBehavior,
     pub read_only: bool,
+    /// Whether explicit durability boundaries issue a device cache flush.
+    pub write_barrier: bool,
 }
 
 impl Default for Ext4MountOptions {
@@ -126,7 +128,42 @@ impl Default for Ext4MountOptions {
             dax: None,
             errors: Ext4ErrorsBehavior::Continue,
             read_only: false,
+            write_barrier: true,
         }
+    }
+}
+
+impl Ext4MountOptions {
+    fn parse(raw_data: Option<&str>) -> Result<Self, SystemError> {
+        let mut options = Self::default();
+        let Some(raw_data) = raw_data else {
+            return Ok(options);
+        };
+
+        for raw_token in raw_data.split(',') {
+            let token = raw_token.trim();
+            if token.is_empty() {
+                continue;
+            }
+
+            match token {
+                "barrier" | "barrier=1" => options.write_barrier = true,
+                "nobarrier" | "barrier=0" => options.write_barrier = false,
+                "dax" | "dax=always" => options.dax = Some(Ext4DaxMode::Always),
+                "dax=never" => options.dax = Some(Ext4DaxMode::Never),
+                "dax=inode" => options.dax = Some(Ext4DaxMode::Inode),
+                "errors=continue" => options.errors = Ext4ErrorsBehavior::Continue,
+                "errors=remount-ro" => options.errors = Ext4ErrorsBehavior::RemountRo,
+                "errors=panic" => options.errors = Ext4ErrorsBehavior::Panic,
+                // Do not silently accept an option whose semantics ext4 does
+                // not implement. In particular, values other than 0/1 and
+                // journal-only options on a nojournal mount must fail here or
+                // in a future capability-aware parser.
+                _ => return Err(SystemError::EINVAL),
+            }
+        }
+
+        Ok(options)
     }
 }
 
@@ -220,7 +257,11 @@ impl FileSystem for Ext4FileSystem {
             flush_result
         };
         if wait {
-            result.and_then(|_| self.fs.flush_device().map_err(SystemError::from))
+            if self._mount_options.write_barrier {
+                result.and_then(|_| self.fs.flush_device().map_err(SystemError::from))
+            } else {
+                result
+            }
         } else {
             result
         }
@@ -761,10 +802,6 @@ impl Ext4FileSystem {
             .unwrap_or(false))
     }
 
-    pub fn from_gendisk(mount_data: Arc<GenDisk>) -> Result<Arc<dyn FileSystem>, SystemError> {
-        Self::from_gendisk_with_options(mount_data, Ext4MountOptions::default())
-    }
-
     pub fn from_gendisk_with_options(
         mount_data: Arc<GenDisk>,
         mount_options: Ext4MountOptions,
@@ -776,9 +813,12 @@ impl Ext4FileSystem {
         // Writable mounts recover the journal and the validated legacy orphan
         // chain before this filesystem is published to the VFS.
         let fs = if mount_options.read_only {
-            another_ext4::Ext4::load(mount_data.clone())?
+            another_ext4::Ext4::load_read_only_checked(mount_data.clone())?
         } else {
-            another_ext4::Ext4::load_writable(mount_data.clone())?
+            another_ext4::Ext4::load_writable_with_options(
+                mount_data.clone(),
+                mount_options.write_barrier,
+            )?
         };
         let root_inode: Arc<LockedExt4Inode> =
             Arc::new_cyclic(|self_ref: &Weak<LockedExt4Inode>| LockedExt4Inode {
@@ -877,10 +917,8 @@ impl MountableFileSystem for Ext4FileSystem {
         let mount_data = data
             .and_then(|d| d.as_any().downcast_ref::<Ext4MountData>())
             .ok_or(SystemError::EINVAL)?;
-        let options = Ext4MountOptions {
-            read_only: mount_flags.contains(MountFlags::RDONLY),
-            ..Ext4MountOptions::default()
-        };
+        let mut options = mount_data.options;
+        options.read_only = mount_flags.contains(MountFlags::RDONLY);
         Self::from_gendisk_with_options(mount_data.gendisk.clone(), options)
     }
 
@@ -891,13 +929,14 @@ impl MountableFileSystem for Ext4FileSystem {
             .and_then(|d| d.as_any().downcast_ref::<Ext4MountData>())
             .ok_or(SystemError::EINVAL)?;
 
-        Self::from_gendisk(mount_data.gendisk.clone())
+        Self::from_gendisk_with_options(mount_data.gendisk.clone(), mount_data.options)
     }
     fn make_mount_data(
-        _raw_data: Option<&str>,
+        raw_data: Option<&str>,
         source: &str,
     ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
-        let mount_data = Ext4MountData::from_source(source).map_err(|e| {
+        let options = Ext4MountOptions::parse(raw_data)?;
+        let mount_data = Ext4MountData::from_source(source, options).map_err(|e| {
             log::error!(
                 "Failed to create Ext4 mount data from source '{}': {:?}",
                 source,
@@ -913,6 +952,7 @@ register_mountable_fs!(Ext4FileSystem, EXT4FSMAKER, "ext4");
 
 pub struct Ext4MountData {
     gendisk: Arc<GenDisk>,
+    options: Ext4MountOptions,
 }
 
 impl FileSystemMakerData for Ext4MountData {
@@ -922,7 +962,7 @@ impl FileSystemMakerData for Ext4MountData {
 }
 
 impl Ext4MountData {
-    fn from_source(path: &str) -> Result<Self, SystemError> {
+    fn from_source(path: &str, options: Ext4MountOptions) -> Result<Self, SystemError> {
         let pcb = ProcessManager::current_pcb();
         let (current_node, rest_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), path)?;
         let inode = current_node.lookup_follow_symlink(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
@@ -933,7 +973,7 @@ impl Ext4MountData {
         let disk = inode.dname()?;
 
         if let Some(gendisk) = try_find_gendisk(disk.0.as_str()) {
-            return Ok(Self { gendisk });
+            return Ok(Self { gendisk, options });
         }
         Err(SystemError::ENOENT)
     }
@@ -942,5 +982,62 @@ impl Ext4MountData {
 impl core::fmt::Debug for Ext4FileSystem {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "ext4")
+    }
+}
+
+#[cfg(test)]
+mod mount_options_tests {
+    use super::{Ext4DaxMode, Ext4ErrorsBehavior, Ext4MountOptions};
+
+    #[test]
+    fn barrier_defaults_to_enabled() {
+        assert!(Ext4MountOptions::parse(None).unwrap().write_barrier);
+        assert!(Ext4MountOptions::parse(Some("")).unwrap().write_barrier);
+    }
+
+    #[test]
+    fn barrier_aliases_and_last_value_win() {
+        assert!(
+            Ext4MountOptions::parse(Some("barrier=0,barrier"))
+                .unwrap()
+                .write_barrier
+        );
+        assert!(
+            !Ext4MountOptions::parse(Some("barrier=1,nobarrier"))
+                .unwrap()
+                .write_barrier
+        );
+        assert!(
+            !Ext4MountOptions::parse(Some("barrier, barrier=0,"))
+                .unwrap()
+                .write_barrier
+        );
+    }
+
+    #[test]
+    fn unknown_and_invalid_options_are_rejected() {
+        assert!(Ext4MountOptions::parse(Some("discard")).is_err());
+        assert!(Ext4MountOptions::parse(Some("barrier=2")).is_err());
+        assert!(Ext4MountOptions::parse(Some("barrier=")).is_err());
+        assert!(Ext4MountOptions::parse(Some("dax=invalid")).is_err());
+        assert!(Ext4MountOptions::parse(Some("errors=invalid")).is_err());
+    }
+
+    #[test]
+    fn existing_rootflags_are_preserved() {
+        let options = Ext4MountOptions::parse(Some("dax,errors=remount-ro")).unwrap();
+        assert_eq!(options.dax, Some(Ext4DaxMode::Always));
+        assert_eq!(options.errors, Ext4ErrorsBehavior::RemountRo);
+        assert!(options.write_barrier);
+    }
+
+    #[test]
+    fn dax_and_error_modes_are_last_value_wins() {
+        let options = Ext4MountOptions::parse(Some(
+            "dax=always,dax=never,dax=inode,errors=panic,errors=continue",
+        ))
+        .unwrap();
+        assert_eq!(options.dax, Some(Ext4DaxMode::Inode));
+        assert_eq!(options.errors, Ext4ErrorsBehavior::Continue);
     }
 }

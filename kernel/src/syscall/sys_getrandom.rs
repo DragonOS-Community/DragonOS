@@ -1,7 +1,6 @@
 use crate::arch::interrupt::TrapFrame;
-use crate::arch::rand::rand;
 use crate::arch::syscall::nr::SYS_GETRANDOM;
-use crate::libs::rand::GRandFlags;
+use crate::libs::rand::{rand_bytes, GRandFlags};
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use crate::syscall::user_access::UserBufferWriter;
@@ -99,6 +98,10 @@ pub fn do_get_random(buf: *mut u8, len: usize, flags: GRandFlags) -> Result<usiz
         return Err(SystemError::EINVAL);
     }
 
+    if len == 0 {
+        return Ok(0);
+    }
+
     let mut writer = UserBufferWriter::new(buf, len, true)?;
     let mut buffer = writer.buffer_protected(0)?;
 
@@ -107,13 +110,7 @@ pub fn do_get_random(buf: *mut u8, len: usize, flags: GRandFlags) -> Result<usiz
         // 对 len - count 的长度进行判断，remain_len 小于4则循环次数和 remain_len 相等
         let remain_len = len - count;
         let step = cmp::min(remain_len, 4);
-        let rand_value = rand();
-
-        // 生成随机字节并直接写入用户缓冲区
-        let mut random_bytes = [0u8; 4];
-        for (offset, byte) in random_bytes.iter_mut().enumerate().take(step) {
-            *byte = (rand_value >> (offset * 2)) as u8;
-        }
+        let random_bytes = rand_bytes::<4>();
 
         // 使用异常表保护的方式写入用户缓冲区
         buffer.write_to_user(count, &random_bytes[..step])?;

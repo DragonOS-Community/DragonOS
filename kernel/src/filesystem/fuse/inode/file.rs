@@ -89,27 +89,47 @@ impl FuseNode {
         if offset < 0 {
             return Ok(());
         }
-        let Some(page_cache) = self.cached_page_cache() else {
-            return Ok(());
+        let start = offset as usize;
+        let end_exclusive = if len <= 0 {
+            None
+        } else {
+            Some(
+                (offset as u64)
+                    .saturating_add(len as u64)
+                    .min(usize::MAX as u64) as usize,
+            )
         };
-        let start_index = (offset as usize) >> MMArch::PAGE_SHIFT;
+        let start_index = start >> MMArch::PAGE_SHIFT;
         let end_index = if len <= 0 {
             usize::MAX
         } else {
             let last = (offset as u64).saturating_add(len as u64).saturating_sub(1);
             core::cmp::min(last, usize::MAX as u64) as usize >> MMArch::PAGE_SHIFT
         };
-        let end_exclusive = end_index.checked_add(1);
+        let end_page_exclusive = end_index.checked_add(1);
+        let page_cache = self.cached_page_cache();
+        let blocker = if self.conn().dax_enabled() {
+            Some(self.dax_begin_host_invalidation()?)
+        } else {
+            None
+        };
 
         // Linux unmap_mapping_pages(..., even_cows=false) preserves private
         // MAP_PRIVATE COW pages while zapping mappings backed by page cache.
-        let _ = page_cache.unmap_mapping_pages(start_index, end_exclusive);
+        if let Some(cache) = page_cache.as_ref() {
+            if let Err(error) = cache.unmap_mapping_pages(start_index, end_page_exclusive) {
+                if blocker.is_some() {
+                    self.conn().abort();
+                }
+                return Err(error);
+            }
+        }
         // Remove cache entries that need no daemon I/O before acknowledging the
         // notification. Dirty/loading/writeback entries remain pinned until the
         // deferred phase has made them safe to discard.
-        {
-            let _invalidate = page_cache.invalidate_write();
-            let _ = page_cache
+        if let Some(cache) = page_cache.as_ref() {
+            let _invalidate = cache.invalidate_write();
+            let _ = cache
                 .manager()
                 .discard_clean_range_nowait(start_index, end_index);
         }
@@ -121,20 +141,49 @@ impl FuseNode {
         // used while the work is pending.
         // This may block on userspace I/O, so use the dedicated page-cache I/O
         // pool rather than the single system workqueue.
+        if page_cache.is_none() && blocker.is_none() {
+            return Ok(());
+        }
+        let node = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
+        let blocker = Mutex::new(blocker);
         schedule_pagecache_io(Work::new(move || {
-            // Linux invalidate_inode_pages2_range() launders dirty folios before
-            // removing clean cache pages.  Keep that ordering and best-effort
-            // behavior, but outside the unsolicited-notify call stack.
-            let _ = page_cache
-                .manager()
-                .launder_range_for_invalidate(start_index, end_index);
-            {
-                let _invalidate = page_cache.invalidate_write();
-                let _ = page_cache
-                    .manager()
-                    .discard_clean_range(start_index, end_index);
+            let result = (|| {
+                // Block buffered dirty admission while synchronizing and
+                // invalidating the ordinary page cache. The host-invalidation
+                // blocker independently prevents DAX window use/PTE publish.
+                let layout = node.dax_layout_write();
+                if let Some(cache) = page_cache.as_ref() {
+                    // Match Linux invalidate_inode_pages2_range(): only the
+                    // notified pages participate in laundering. An unrelated
+                    // dirty-page error must not abort the FUSE connection.
+                    cache
+                        .manager()
+                        .launder_range_for_invalidate(start_index, end_index)?;
+                }
+                node.invalidate_page_cache_range(
+                    start,
+                    end_exclusive
+                        .and_then(|end| end.checked_sub(start))
+                        .unwrap_or(usize::MAX - start),
+                )?;
+                drop(layout);
+
+                if blocker.lock().is_some() {
+                    drop(node.dax_layout_write_for_host_invalidation(start, end_exclusive)?);
+                }
+                Ok::<(), SystemError>(())
+            })();
+            if let Err(error) = result {
+                log::error!(
+                    "fuse: host inode invalidation failed closed node={} offset={} len={} err={:?}",
+                    node.nodeid(),
+                    offset,
+                    len,
+                    error
+                );
+                node.conn().abort();
             }
-            let _ = page_cache.unmap_mapping_pages(start_index, end_exclusive);
+            blocker.lock().take();
         }));
         Ok(())
     }
@@ -263,6 +312,34 @@ impl FuseNode {
         Ok(())
     }
 
+    /// Invalidate page-cache state after the daemon changed the contents of a
+    /// byte range (hole punch, zero range, or host notification). Dirty data
+    /// must have been drained before this helper is called.
+    pub(super) fn invalidate_page_cache_range(
+        &self,
+        offset: usize,
+        len: usize,
+    ) -> Result<(), SystemError> {
+        if len == 0 {
+            return Ok(());
+        }
+        let Some(cache) = self.cached_page_cache() else {
+            return Ok(());
+        };
+        let end_byte = offset.checked_add(len - 1).ok_or(SystemError::EOVERFLOW)?;
+        let start_index = offset >> MMArch::PAGE_SHIFT;
+        let end_index = end_byte >> MMArch::PAGE_SHIFT;
+        let end_exclusive = end_index.checked_add(1);
+        cache.unmap_mapping_pages(start_index, end_exclusive)?;
+        {
+            let _invalidate = cache.invalidate_write();
+            cache
+                .manager()
+                .discard_clean_range(start_index, end_index)?;
+        }
+        cache.unmap_mapping_pages(start_index, end_exclusive)
+    }
+
     pub(crate) fn discard_completed_pages_beyond(
         &self,
         target: &PageCacheReadDmaReservation,
@@ -292,8 +369,15 @@ impl FuseNode {
         // hold time, then drain again under the barrier to close the race with
         // buffered writes and page_mkwrite.
         self.sync_dirty_cached_pages()?;
-        let _barrier = if self.conn().dax_enabled() && len < old_size {
-            self.dax_layout_write_for_truncate(len)?
+        let _barrier = if self.conn().dax_enabled() && len != old_size {
+            if len < old_size {
+                self.dax_layout_write_for_truncate(len)?
+            } else {
+                // SETUPMAPPING covers a full DAX range. Growth only needs to
+                // serialize the daemon size change with EOF validation; it
+                // does not need O(n) REMOVEMAPPING of reusable ranges.
+                self.dax_layout_write()
+            }
         } else {
             self.writeback_barrier.write()
         };
@@ -780,6 +864,25 @@ impl FuseNode {
         flags: &FileFlags,
     ) -> Result<(), SystemError> {
         self.check_not_stale()?;
+        let atomic_dax_truncate = opcode == FUSE_OPEN
+            && flags.contains(FileFlags::O_TRUNC)
+            && self
+                .conn
+                .has_init_flag(super::super::protocol::FUSE_ATOMIC_O_TRUNC)
+            && self.conn.dax_enabled();
+        if atomic_dax_truncate {
+            self.sync_dirty_cached_pages()?;
+        }
+        let _dax_truncate_layout = if atomic_dax_truncate {
+            Some(self.dax_layout_write_for_all()?)
+        } else {
+            None
+        };
+        if atomic_dax_truncate {
+            // Close dirty admission between the optimistic drain and layout
+            // exclusivity before OPEN can atomically change the host file.
+            self.sync_dirty_cached_pages()?;
+        }
         let file_flags = flags.bits();
         if self.conn.should_skip_open(opcode) {
             self.finish_open_cache_state(opcode, flags, FOPEN_KEEP_CACHE)?;

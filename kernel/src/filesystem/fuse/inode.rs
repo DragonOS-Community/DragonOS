@@ -9,7 +9,7 @@ use alloc::{
     vec::Vec,
 };
 use core::mem::size_of;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use system_error::SystemError;
 
@@ -20,9 +20,12 @@ use crate::{
         page_cache::PageCache,
         vfs::{FileType, InodeFlags, InodeId, InodeMode, Metadata},
     },
-    libs::mutex::Mutex,
-    libs::rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
-    mm::MemoryManagementArch,
+    libs::{
+        mutex::Mutex,
+        rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
+        wait_queue::WaitQueue,
+    },
+    mm::{fault::FaultRetryWait, MemoryManagementArch},
     time::PosixTimeSpec,
 };
 
@@ -74,6 +77,111 @@ pub(crate) struct DaxReclaimTombstone {
     file_offset: u64,
     mapping: Arc<DaxMapping>,
     token: ReclaimToken,
+}
+
+/// Blocks host-invalidated DAX contents from being consumed while keeping
+/// daemon requests outside the bounded active section.  A notification can
+/// therefore drain actual window users without waiting for a SETUPMAPPING
+/// request whose reply depends on that same notification returning.
+#[derive(Debug)]
+struct DaxHostInvalidationGate {
+    blockers: AtomicUsize,
+    active: AtomicUsize,
+    wait: WaitQueue,
+}
+
+#[derive(Debug)]
+pub(crate) struct DaxHostAccessGuard {
+    gate: Arc<DaxHostInvalidationGate>,
+}
+
+#[derive(Debug)]
+pub(crate) struct DaxHostInvalidationBlocker {
+    gate: Arc<DaxHostInvalidationGate>,
+}
+
+#[derive(Debug)]
+struct DaxHostInvalidationRetryWait {
+    gate: Arc<DaxHostInvalidationGate>,
+}
+
+impl DaxHostInvalidationGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            blockers: AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
+            wait: WaitQueue::default(),
+        })
+    }
+
+    fn try_enter(self: &Arc<Self>) -> Result<DaxHostAccessGuard, SystemError> {
+        if self.blockers.load(Ordering::Acquire) != 0 {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        self.active.fetch_add(1, Ordering::AcqRel);
+        if self.blockers.load(Ordering::Acquire) != 0 {
+            self.leave_active();
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        Ok(DaxHostAccessGuard { gate: self.clone() })
+    }
+
+    fn begin(self: &Arc<Self>) -> Result<DaxHostInvalidationBlocker, SystemError> {
+        self.blockers
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_add(1)
+            })
+            .map_err(|_| SystemError::EOVERFLOW)?;
+        self.wait
+            .wait_until(|| (self.active.load(Ordering::Acquire) == 0).then_some(()));
+        Ok(DaxHostInvalidationBlocker { gate: self.clone() })
+    }
+
+    fn blocked(&self) -> bool {
+        self.blockers.load(Ordering::Acquire) != 0
+    }
+
+    fn wait_unblocked(&self) {
+        self.wait.wait_until(|| (!self.blocked()).then_some(()));
+    }
+
+    fn wait_unblocked_interruptible(&self) -> Result<(), SystemError> {
+        self.wait
+            .wait_until_interruptible(|| (!self.blocked()).then_some(()))
+    }
+
+    fn leave_active(&self) {
+        if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.wait.wakeup_all(None);
+        }
+    }
+
+    fn leave_blocker(&self) {
+        let previous = self.blockers.fetch_sub(1, Ordering::AcqRel);
+        debug_assert_ne!(previous, 0);
+        if previous == 1 {
+            self.wait.wakeup_all(None);
+        }
+    }
+}
+
+impl Drop for DaxHostAccessGuard {
+    fn drop(&mut self) {
+        self.gate.leave_active();
+    }
+}
+
+impl Drop for DaxHostInvalidationBlocker {
+    fn drop(&mut self) {
+        self.gate.leave_blocker();
+    }
+}
+
+impl FaultRetryWait for DaxHostInvalidationRetryWait {
+    fn wait(&self) -> Result<(), SystemError> {
+        self.gate.wait_unblocked();
+        Ok(())
+    }
 }
 
 impl DaxMappingTree {
@@ -172,7 +280,13 @@ pub struct FuseNode {
     /// Serializes dirty-page admission against operations which must drain and
     /// invalidate the page cache (truncate and direct I/O).
     writeback_barrier: RwSem<()>,
+    /// Serializes the complete two-zap/tombstone/REMOVEMAPPING transaction.
+    /// The layout semaphore is intentionally dropped between the two zaps, so
+    /// it cannot by itself prevent another layout breaker from observing and
+    /// passing a half-finished tombstone.
+    dax_reclaim_serial: Mutex<()>,
     dax_mappings: RwSem<DaxMappingTree>,
+    dax_host_invalidation: Arc<DaxHostInvalidationGate>,
     dax_pte_epoch: AtomicU64,
     cached_metadata_deadline_ns: AtomicU64,
     attr_version: AtomicU64,
@@ -234,7 +348,9 @@ impl FuseNode {
             writeback_handles: Mutex::new(Vec::new()),
             lookup_cache: Mutex::new(BTreeMap::new()),
             writeback_barrier: RwSem::new(()),
+            dax_reclaim_serial: Mutex::new(()),
             dax_mappings: RwSem::new(DaxMappingTree::default()),
+            dax_host_invalidation: DaxHostInvalidationGate::new(),
             dax_pte_epoch: AtomicU64::new(0),
             cached_metadata_deadline_ns: AtomicU64::new(if has_cached { u64::MAX } else { 0 }),
             attr_version: AtomicU64::new(initial_attr_epoch),
@@ -269,6 +385,30 @@ impl FuseNode {
 
     pub(crate) fn dax_layout_write(&self) -> RwSemWriteGuard<'_, ()> {
         self.writeback_barrier.write()
+    }
+
+    pub(crate) fn dax_try_host_access(&self) -> Result<DaxHostAccessGuard, SystemError> {
+        self.dax_host_invalidation.try_enter()
+    }
+
+    pub(crate) fn dax_begin_host_invalidation(
+        &self,
+    ) -> Result<DaxHostInvalidationBlocker, SystemError> {
+        self.dax_host_invalidation.begin()
+    }
+
+    pub(crate) fn dax_host_invalidation_blocked(&self) -> bool {
+        self.dax_host_invalidation.blocked()
+    }
+
+    pub(crate) fn dax_wait_host_invalidation_interruptible(&self) -> Result<(), SystemError> {
+        self.dax_host_invalidation.wait_unblocked_interruptible()
+    }
+
+    pub(crate) fn dax_host_invalidation_retry_wait(&self) -> Arc<dyn FaultRetryWait> {
+        Arc::new(DaxHostInvalidationRetryWait {
+            gate: self.dax_host_invalidation.clone(),
+        })
     }
 
     pub(crate) fn dax_pte_epoch(&self) -> u64 {
@@ -442,28 +582,42 @@ impl FuseNode {
         })
     }
 
+    fn dax_mapping_intersects(
+        mapping: &DaxMapping,
+        start: usize,
+        end_exclusive: Option<usize>,
+    ) -> Result<bool, SystemError> {
+        let mapping_start =
+            usize::try_from(mapping.file_offset).map_err(|_| SystemError::EOVERFLOW)?;
+        let mapping_end = mapping_start
+            .checked_add(DAX_RANGE_SIZE)
+            .ok_or(SystemError::EOVERFLOW)?;
+        Ok(mapping_end > start && end_exclusive.is_none_or(|end| mapping_start < end))
+    }
+
     /// Acquire the inode layout exclusively after revoking and removing every
-    /// DAX range intersecting `[new_size, EOF)`.  Sequence and PTE epochs make
-    /// the rmap-walk-to-lock transition retryable instead of racy.
-    pub(crate) fn dax_layout_write_for_truncate(
+    /// DAX range intersecting `[start, end_exclusive)`. Sequence and PTE epochs
+    /// make the rmap-walk-to-lock transition retryable instead of racy.
+    fn dax_layout_write_for_range_with_restore(
         &self,
-        new_size: usize,
+        start: usize,
+        end_exclusive: Option<usize>,
+        restore_on_failure: bool,
     ) -> Result<RwSemWriteGuard<'_, ()>, SystemError> {
         if !self.conn.dax_enabled() {
             return Ok(self.dax_layout_write());
         }
+        let _reclaim_serial = self.dax_reclaim_serial.lock();
         'retry: loop {
             let page_cache = self.cached_page_cache();
             let (sequence, mappings) = {
                 let tree = self.dax_mappings.read();
-                let mappings = tree
-                    .mappings
-                    .values()
-                    .filter(|mapping| {
-                        (mapping.file_offset as usize).saturating_add(DAX_RANGE_SIZE) > new_size
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
+                let mut mappings = Vec::new();
+                for mapping in tree.mappings.values() {
+                    if Self::dax_mapping_intersects(mapping, start, end_exclusive)? {
+                        mappings.push(mapping.clone());
+                    }
+                }
                 (tree.sequence, mappings)
             };
             let epoch = self.dax_pte_epoch();
@@ -546,9 +700,13 @@ impl FuseNode {
             let layout = self.dax_layout_write();
             let mut remaining = tombstones.into_iter();
             while let Some(tombstone) = remaining.next() {
-                if let Err(error) = self.dax_finish_reclaim(tombstone) {
+                if let Err(error) =
+                    self.dax_finish_reclaim_with_restore(tombstone, restore_on_failure)
+                {
                     for unsubmitted in remaining {
-                        let _ = self.dax_cancel_reclaim(unsubmitted);
+                        if restore_on_failure {
+                            let _ = self.dax_cancel_reclaim(unsubmitted);
+                        }
                     }
                     return Err(error);
                 }
@@ -557,9 +715,36 @@ impl FuseNode {
         }
     }
 
+    pub(crate) fn dax_layout_write_for_range(
+        &self,
+        start: usize,
+        end_exclusive: Option<usize>,
+    ) -> Result<RwSemWriteGuard<'_, ()>, SystemError> {
+        self.dax_layout_write_for_range_with_restore(start, end_exclusive, true)
+    }
+
+    pub(crate) fn dax_layout_write_for_truncate(
+        &self,
+        new_size: usize,
+    ) -> Result<RwSemWriteGuard<'_, ()>, SystemError> {
+        self.dax_layout_write_for_range(new_size, None)
+    }
+
+    pub(crate) fn dax_layout_write_for_all(&self) -> Result<RwSemWriteGuard<'_, ()>, SystemError> {
+        self.dax_layout_write_for_range(0, None)
+    }
+
+    pub(crate) fn dax_layout_write_for_host_invalidation(
+        &self,
+        start: usize,
+        end_exclusive: Option<usize>,
+    ) -> Result<RwSemWriteGuard<'_, ()>, SystemError> {
+        self.dax_layout_write_for_range_with_restore(start, end_exclusive, false)
+    }
+
     pub(crate) fn dax_teardown(&self) -> Result<(), SystemError> {
         if self.conn.dax_enabled() {
-            drop(self.dax_layout_write_for_truncate(0)?);
+            drop(self.dax_layout_write_for_all()?);
         }
         Ok(())
     }
@@ -665,6 +850,14 @@ impl FuseNode {
         &self,
         tombstone: DaxReclaimTombstone,
     ) -> Result<(), SystemError> {
+        self.dax_finish_reclaim_with_restore(tombstone, true)
+    }
+
+    fn dax_finish_reclaim_with_restore(
+        &self,
+        tombstone: DaxReclaimTombstone,
+        restore_on_failure: bool,
+    ) -> Result<(), SystemError> {
         let result = self.conn.remove_dax_mappings(
             self.dax_mapping_owner(),
             core::slice::from_ref(&tombstone.token),
@@ -673,19 +866,24 @@ impl FuseNode {
             .conn
             .dax_allocator()
             .ok_or(SystemError::EOPNOTSUPP_OR_ENOTSUP)?;
-        let restore = result.is_err() && allocator.is_owned(&tombstone.mapping.token);
+        let restore =
+            restore_on_failure && result.is_err() && allocator.is_owned(&tombstone.mapping.token);
         let mut tree = self.dax_mappings.write();
         if tree
             .tombstones
             .get(&tombstone.file_offset)
             .is_some_and(|mapping| Arc::ptr_eq(mapping, &tombstone.mapping))
         {
-            tree.tombstones.remove(&tombstone.file_offset);
+            if result.is_ok() || restore_on_failure {
+                tree.tombstones.remove(&tombstone.file_offset);
+            }
             if restore {
                 tree.mappings
                     .insert(tombstone.file_offset, tombstone.mapping);
             }
-            tree.bump_sequence()?;
+            if result.is_ok() || restore_on_failure {
+                tree.bump_sequence()?;
+            }
         }
         result
     }
@@ -710,6 +908,7 @@ impl FuseNode {
         &self,
         candidate: &ReclaimCandidate,
     ) -> Result<(), SystemError> {
+        let _reclaim_serial = self.dax_reclaim_serial.lock();
         let mapping = self
             .dax_mappings
             .read()
@@ -756,6 +955,11 @@ impl FuseNode {
             let chunk = core::cmp::min(requested - done, DAX_RANGE_SIZE - in_mapping);
             let access = match self.dax_access_inner(current as u64, false, None) {
                 Ok(access) => access,
+                Err(error) if done == 0 => return Err(error),
+                Err(_) => return Ok(done),
+            };
+            let _host_access = match self.dax_try_host_access() {
+                Ok(guard) => guard,
                 Err(error) if done == 0 => return Err(error),
                 Err(_) => return Ok(done),
             };
@@ -863,6 +1067,11 @@ impl FuseNode {
             let chunk = core::cmp::min(buf.len() - done, DAX_RANGE_SIZE - in_mapping);
             let access = match self.dax_access_inner(current as u64, true, None) {
                 Ok(access) => access,
+                Err(error) if done == 0 => return Err(error),
+                Err(_) => return Ok(done),
+            };
+            let _host_access = match self.dax_try_host_access() {
+                Ok(guard) => guard,
                 Err(error) if done == 0 => return Err(error),
                 Err(_) => return Ok(done),
             };
@@ -1221,5 +1430,35 @@ impl Drop for FuseNode {
         self.clear_lookup_cache_tree();
         self.flush_forget();
         self.clear_parent();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dax_host_invalidation_gate_blocks_until_last_notification_finishes() {
+        let gate = DaxHostInvalidationGate::new();
+        let access = gate.try_enter().unwrap();
+        assert_eq!(gate.active.load(Ordering::Acquire), 1);
+        drop(access);
+
+        let first = gate.begin().unwrap();
+        let second = gate.begin().unwrap();
+        assert!(gate.blocked());
+        assert!(matches!(
+            gate.try_enter(),
+            Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+        ));
+        drop(first);
+        assert!(gate.blocked());
+        drop(second);
+        assert!(!gate.blocked());
+
+        let access = gate.try_enter().unwrap();
+        assert_eq!(gate.active.load(Ordering::Acquire), 1);
+        drop(access);
+        assert_eq!(gate.active.load(Ordering::Acquire), 0);
     }
 }

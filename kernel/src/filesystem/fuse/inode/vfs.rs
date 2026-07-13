@@ -375,7 +375,11 @@ impl IndexNode for FuseNode {
             loop {
                 match self.dax_read(offset, &mut buf[..len]) {
                     Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                        self.conn().reclaim_one_dax_range_interruptible()?;
+                        if self.dax_host_invalidation_blocked() {
+                            self.dax_wait_host_invalidation_interruptible()?;
+                        } else {
+                            self.conn().reclaim_one_dax_range_interruptible()?;
+                        }
                     }
                     result => return result,
                 }
@@ -419,7 +423,11 @@ impl IndexNode for FuseNode {
                 match self.dax_write_or_fuse_locked(offset, &buf[..len], &private_data, lock_owner)
                 {
                     Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                        self.conn().reclaim_one_dax_range_interruptible()?;
+                        if self.dax_host_invalidation_blocked() {
+                            self.dax_wait_host_invalidation_interruptible()?;
+                        } else {
+                            self.conn().reclaim_one_dax_range_interruptible()?;
+                        }
                     }
                     result => return result,
                 }
@@ -568,8 +576,12 @@ impl IndexNode for FuseNode {
         if writeback_cache {
             self.sync_dirty_cached_pages()?;
         }
-        let _barrier = if self.conn().dax_enabled() && metadata.size < old.size {
-            Some(self.dax_layout_write_for_truncate(metadata.size.max(0) as usize)?)
+        let _barrier = if self.conn().dax_enabled() && metadata.size != old.size {
+            Some(if metadata.size < old.size {
+                self.dax_layout_write_for_truncate(metadata.size.max(0) as usize)?
+            } else {
+                self.dax_layout_write()
+            })
         } else {
             writeback_cache.then(|| self.writeback_barrier.write())
         };
@@ -710,7 +722,14 @@ impl IndexNode for FuseNode {
         _lock_owner: u64,
         data: MutexGuard<FilePrivateData>,
     ) -> Result<(), SystemError> {
-        if mode != 0 {
+        const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
+        const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
+        const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
+        const FUSE_FALLOC_SUPPORTED: u32 =
+            FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE;
+
+        let mode_bits = mode as u32;
+        if mode < 0 || mode_bits & !FUSE_FALLOC_SUPPORTED != 0 {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
         self.check_not_stale()?;
@@ -726,10 +745,25 @@ impl IndexNode for FuseNode {
         drop(data);
 
         let md = self.metadata()?;
-        if new_size > md.size.max(0) as usize {
+        let old_size = md.size.max(0) as usize;
+        let keep_size = mode_bits & FALLOC_FL_KEEP_SIZE != 0;
+        let changes_contents = mode_bits & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE) != 0;
+        if !keep_size && new_size > old_size {
             crate::filesystem::vfs::vcore::check_file_size_limit(new_size)?;
         }
-        let _barrier = self.writeback_barrier.write();
+        if changes_contents {
+            self.sync_dirty_cached_pages()?;
+        }
+        let block_faults = self.conn().dax_enabled() && (!keep_size || changes_contents);
+        let _barrier = if block_faults {
+            self.dax_layout_write_for_all()?
+        } else {
+            self.writeback_barrier.write()
+        };
+        if changes_contents {
+            // Close dirty admission between the first drain and exclusivity.
+            self.sync_dirty_cached_pages()?;
+        }
 
         let in_arg = FuseFallocateIn {
             fh: fuse_data.fh,
@@ -743,9 +777,12 @@ impl IndexNode for FuseNode {
             .request(FUSE_FALLOCATE, self.nodeid, fuse_pack_struct(&in_arg))
         {
             Ok(_) => {
+                if changes_contents {
+                    self.invalidate_page_cache_range(offset, len)?;
+                }
                 let mut metadata = self.cached_metadata.lock();
                 if let Some(md) = metadata.as_mut() {
-                    if new_size > md.size.max(0) as usize {
+                    if !keep_size && new_size > md.size.max(0) as usize {
                         md.size = new_size as i64;
                     }
                     let now = crate::time::PosixTimeSpec::now();

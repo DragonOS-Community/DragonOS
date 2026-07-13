@@ -2011,14 +2011,22 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (!node || simplefs_node_is_dir(node) || simplefs_node_is_symlink(node)) {
             return fuse_write_reply(a->fd, h->unique, -EINVAL, NULL, 0);
         }
-        if (in->mode != 0) {
+        const uint32_t supported = FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE;
+        if ((in->mode & ~supported) != 0 ||
+            ((in->mode & FALLOC_FL_PUNCH_HOLE) != 0 &&
+             (in->mode & FALLOC_FL_KEEP_SIZE) == 0) ||
+            ((in->mode & FALLOC_FL_PUNCH_HOLE) != 0 &&
+             (in->mode & FALLOC_FL_ZERO_RANGE) != 0)) {
             return fuse_write_reply(a->fd, h->unique, -EOPNOTSUPP, NULL, 0);
         }
         if (in->offset > SIMPLEFS_DATA_MAX || in->length > SIMPLEFS_DATA_MAX ||
             in->offset + in->length > SIMPLEFS_DATA_MAX) {
             return fuse_write_reply(a->fd, h->unique, -EFBIG, NULL, 0);
         }
-        if (node->size < in->offset + in->length) {
+        if ((in->mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE)) != 0) {
+            memset(node->data + in->offset, 0, in->length);
+        }
+        if ((in->mode & FALLOC_FL_KEEP_SIZE) == 0 && node->size < in->offset + in->length) {
             node->size = (size_t)(in->offset + in->length);
         }
         return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);

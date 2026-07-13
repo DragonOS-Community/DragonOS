@@ -678,6 +678,21 @@ struct FuseConnInner {
     processing: BTreeMap<u64, Arc<FusePendingState>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaxCleanupState {
+    Active,
+    InProgress,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug)]
+struct DaxCleanup {
+    state: DaxCleanupState,
+    nodes: BTreeMap<DaxMappingOwner, Weak<super::inode::FuseNode>>,
+    revoke_failed: bool,
+}
+
 /// FUSE connection object (roughly equivalent to Linux `struct fuse_conn`).
 #[derive(Debug)]
 pub struct FuseConn {
@@ -693,10 +708,12 @@ pub struct FuseConn {
     reply_layout_minor: AtomicU32,
     background: Arc<FuseBackgroundState>,
     filesystems: Mutex<Vec<Weak<super::fs::FuseFS>>>,
+    dax_mode: DaxMountMode,
     dax_allocator: Option<Arc<DaxRangeAllocator>>,
     dax_window: Mutex<Option<Arc<VirtioFsCacheWindow>>>,
     dax_admission: Arc<DaxAdmission>,
-    dax_nodes: Mutex<BTreeMap<DaxMappingOwner, Weak<super::inode::FuseNode>>>,
+    dax_cleanup: Mutex<DaxCleanup>,
+    dax_cleanup_wait: WaitQueue,
 }
 
 impl FuseConn {
@@ -722,6 +739,7 @@ impl FuseConn {
             false,
             None,
             None,
+            DaxMountMode::Never,
         )
     }
 
@@ -735,6 +753,21 @@ impl FuseConn {
         cache_window_len: Option<usize>,
         dax_mode: DaxMountMode,
     ) -> Arc<Self> {
+        Self::try_new_for_virtiofs_with_dax(
+            max_request_size,
+            max_reply_size,
+            cache_window_len,
+            dax_mode,
+        )
+        .expect("test DAX allocator construction must succeed")
+    }
+
+    pub(crate) fn try_new_for_virtiofs_with_dax(
+        max_request_size: usize,
+        max_reply_size: usize,
+        cache_window_len: Option<usize>,
+        dax_mode: DaxMountMode,
+    ) -> Result<Arc<Self>, SystemError> {
         let overhead = size_of::<FuseInHeader>() + size_of::<FuseWriteIn>();
         let cap = if max_request_size > overhead {
             core::cmp::max(Self::MIN_MAX_WRITE, max_request_size - overhead)
@@ -745,25 +778,24 @@ impl FuseConn {
             .then_some(cache_window_len)
             .flatten()
             .filter(|len| *len >= DAX_RANGE_SIZE)
-            .and_then(|len| match DaxRangeAllocator::new(len) {
-            Ok(allocator) => Some(Arc::new(allocator)),
-            Err(error) => {
-                log::warn!(
-                    "virtiofs: failed to create DAX range allocator for window length {}: {:?}; continue with DAX disabled",
-                    len,
-                    error
-                );
-                None
-            }
-        });
+            .map(DaxRangeAllocator::new)
+            .transpose()?
+            .map(Arc::new);
         let mut init_flags = Self::virtiofs_init_flags();
         if dax_allocator.is_some() {
             init_flags |= FUSE_MAP_ALIGNMENT;
         }
-        if dax_mode == DaxMountMode::Inode {
+        if dax_mode.is_inode_mode() {
             init_flags |= FUSE_HAS_INODE_DAX;
         }
-        Self::new_with_max_write_cap(cap, init_flags, true, Some(max_reply_size), dax_allocator)
+        Ok(Self::new_with_max_write_cap(
+            cap,
+            init_flags,
+            true,
+            Some(max_reply_size),
+            dax_allocator,
+            dax_mode,
+        ))
     }
 
     fn new_with_max_write_cap(
@@ -772,6 +804,7 @@ impl FuseConn {
         separate_hiprio_pending: bool,
         backend_reply_limit: Option<usize>,
         dax_allocator: Option<Arc<DaxRangeAllocator>>,
+        dax_mode: DaxMountMode,
     ) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(FuseConnInner {
@@ -816,10 +849,16 @@ impl FuseConn {
             reply_layout_minor: AtomicU32::new(0),
             background: FuseBackgroundState::new(),
             filesystems: Mutex::new(Vec::new()),
+            dax_mode,
             dax_allocator,
             dax_window: Mutex::new(None),
             dax_admission: DaxAdmission::new(),
-            dax_nodes: Mutex::new(BTreeMap::new()),
+            dax_cleanup: Mutex::new(DaxCleanup {
+                state: DaxCleanupState::Active,
+                nodes: BTreeMap::new(),
+                revoke_failed: false,
+            }),
+            dax_cleanup_wait: WaitQueue::default(),
         })
     }
 
@@ -828,16 +867,37 @@ impl FuseConn {
         max_reply_size: usize,
         cache_window: Option<Arc<VirtioFsCacheWindow>>,
         dax_mode: DaxMountMode,
-    ) -> Arc<Self> {
+    ) -> Result<Arc<Self>, SystemError> {
         let len = cache_window.as_ref().map(|window| window.len());
-        let conn = Self::new_for_virtiofs_with_dax(max_request_size, max_reply_size, len, dax_mode);
+        let conn =
+            Self::try_new_for_virtiofs_with_dax(max_request_size, max_reply_size, len, dax_mode)?;
         if conn.dax_allocator.is_some() {
             if let Some(window) = cache_window {
                 conn.install_dax_window(window)
                     .expect("validated virtiofs DAX window must match its allocator");
             }
         }
-        conn
+        Ok(conn)
+    }
+
+    pub(crate) fn dax_mode(&self) -> DaxMountMode {
+        self.dax_mode
+    }
+
+    pub(crate) fn dax_inode_active(&self, attr_flags: u32, regular: bool) -> bool {
+        if !regular || self.dax_mode == DaxMountMode::Never {
+            return false;
+        }
+        let connection_capable = self.dax_enabled();
+        let inode_capability_negotiated = connection_capable
+            && self.dax_mode.is_inode_mode()
+            && self.has_init_flag(FUSE_HAS_INODE_DAX);
+        self.dax_mode.inode_enabled(
+            connection_capable,
+            inode_capability_negotiated,
+            (attr_flags & super::protocol::FUSE_ATTR_DAX) != 0,
+            true,
+        )
     }
 
     pub(crate) fn dax_allocator(&self) -> Option<&Arc<DaxRangeAllocator>> {
@@ -898,38 +958,77 @@ impl FuseConn {
 
     pub(crate) fn register_dax_node(&self, node: &Arc<super::inode::FuseNode>) {
         let owner = node.dax_mapping_owner();
-        let mut nodes = self.dax_nodes.lock();
-        nodes.retain(|_, node| node.strong_count() != 0);
-        nodes.insert(owner, Arc::downgrade(node));
+        let mut cleanup = self.dax_cleanup.lock();
+        if cleanup.state == DaxCleanupState::Active {
+            cleanup.nodes.insert(owner, Arc::downgrade(node));
+        }
     }
 
     pub(crate) fn unregister_dax_node(&self, owner: DaxMappingOwner) {
-        self.dax_nodes.lock().remove(&owner);
+        self.dax_cleanup.lock().nodes.remove(&owner);
+        self.dax_cleanup_wait.wakeup_all(None);
+    }
+
+    pub(crate) fn finish_dax_node_drop(
+        &self,
+        owner: DaxMappingOwner,
+        revoke: Result<(), SystemError>,
+    ) {
+        let mut cleanup = self.dax_cleanup.lock();
+        if revoke.is_err()
+            && matches!(
+                cleanup.state,
+                DaxCleanupState::Active | DaxCleanupState::InProgress
+            )
+        {
+            cleanup.revoke_failed = true;
+        }
+        cleanup.nodes.remove(&owner);
+        drop(cleanup);
+        self.dax_cleanup_wait.wakeup_all(None);
     }
 
     pub(crate) fn dax_node(&self, owner: DaxMappingOwner) -> Option<Arc<super::inode::FuseNode>> {
-        let mut nodes = self.dax_nodes.lock();
-        let node = nodes.get(&owner).and_then(Weak::upgrade);
-        if node.is_none() {
-            nodes.remove(&owner);
-        }
-        node
+        self.dax_cleanup
+            .lock()
+            .nodes
+            .get(&owner)
+            .and_then(Weak::upgrade)
     }
 
-    fn revoke_all_dax_ptes(&self) {
-        let nodes: Vec<_> = {
-            let mut registry = self.dax_nodes.lock();
-            let nodes = registry.values().filter_map(Weak::upgrade).collect();
-            registry.retain(|_, node| node.strong_count() != 0);
-            nodes
-        };
-        for node in nodes {
-            if let Err(error) = node.dax_disconnect_revoke() {
-                log::warn!(
-                    "fuse: failed to revoke DAX PTEs for node {} during disconnect: {:?}",
-                    node.nodeid(),
-                    error
-                );
+    fn revoke_registered_dax_nodes(&self) -> Result<(), SystemError> {
+        loop {
+            let node = {
+                let cleanup = self.dax_cleanup.lock();
+                cleanup
+                    .nodes
+                    .iter()
+                    .find_map(|(owner, node)| node.upgrade().map(|node| (*owner, node)))
+            };
+            if let Some((owner, node)) = node {
+                let result = node.dax_disconnect_revoke();
+                if let Err(ref error) = result {
+                    log::warn!(
+                        "fuse: failed to revoke DAX PTEs for node {} during disconnect: {:?}",
+                        node.nodeid(),
+                        error
+                    );
+                }
+                self.finish_dax_node_drop(owner, result);
+                continue;
+            }
+
+            self.dax_cleanup_wait.wait_until(|| {
+                let cleanup = self.dax_cleanup.lock();
+                cleanup.nodes.is_empty().then_some(())
+            });
+            let cleanup = self.dax_cleanup.lock();
+            if cleanup.nodes.is_empty() {
+                return if cleanup.revoke_failed {
+                    Err(SystemError::EIO)
+                } else {
+                    Ok(())
+                };
             }
         }
     }
@@ -1285,43 +1384,59 @@ impl FuseConn {
         })
     }
 
-    pub fn abort(&self) {
+    fn claim_dax_cleanup(&self) -> Result<bool, SystemError> {
+        loop {
+            let state = {
+                let mut cleanup = self.dax_cleanup.lock();
+                match cleanup.state {
+                    DaxCleanupState::Active => {
+                        cleanup.state = DaxCleanupState::InProgress;
+                        return Ok(true);
+                    }
+                    DaxCleanupState::Succeeded => return Ok(false),
+                    DaxCleanupState::Failed => return Err(SystemError::EIO),
+                    DaxCleanupState::InProgress => cleanup.state,
+                }
+            };
+            debug_assert_eq!(state, DaxCleanupState::InProgress);
+            self.dax_cleanup_wait.wait_until(|| {
+                let state = self.dax_cleanup.lock().state;
+                (state != DaxCleanupState::InProgress).then_some(())
+            });
+        }
+    }
+
+    fn disconnect_requests(&self) {
         self.begin_dax_quiesce();
         self.background.disconnect();
         let (processing, pending_noreply_count): (Vec<Arc<FusePendingState>>, usize) = {
             let mut g = self.inner.lock();
             if !g.connected {
-                return;
+                (Vec::new(), 0)
+            } else {
+                g.connected = false;
+                g.mounted = false;
+                // Close allocator acquisition before releasing the connection lock,
+                // so no observer can see a disconnected connection while DAX get()
+                // still accepts a new reference.
+                self.begin_shutdown_dax_allocator();
+                let pending_noreply_count = g
+                    .pending
+                    .iter()
+                    .chain(g.hiprio_pending.iter())
+                    .filter(|req| matches!(req.opcode, FUSE_FORGET | FUSE_INTERRUPT))
+                    .count();
+                g.hiprio_pending.clear();
+                g.pending.clear();
+                let processing = g.processing.values().cloned().collect();
+                g.processing.clear();
+                (processing, pending_noreply_count)
             }
-            g.connected = false;
-            g.mounted = false;
-            // Close allocator acquisition before releasing the connection lock,
-            // so no observer can see a disconnected connection while DAX get()
-            // still accepts a new reference.
-            self.begin_shutdown_dax_allocator();
-            let pending_noreply_count = g
-                .pending
-                .iter()
-                .chain(g.hiprio_pending.iter())
-                .filter(|req| matches!(req.opcode, FUSE_FORGET | FUSE_INTERRUPT))
-                .count();
-            g.hiprio_pending.clear();
-            g.pending.clear();
-            let processing = g.processing.values().cloned().collect();
-            g.processing.clear();
-            (processing, pending_noreply_count)
         };
         stats::on_fuse_requests_aborted(processing.len() + pending_noreply_count);
         for p in processing {
             p.complete_disconnected(SystemError::ENOTCONN);
         }
-        // Admission was closed before requests were detached.  Wait until every
-        // DAX copy/fault/setup that was already admitted has released its guard
-        // before invalidating allocator tokens and the backing window.
-        self.wait_dax_drained();
-        self.revoke_all_dax_ptes();
-        self.disconnect_cleanup_dax_allocator();
-        self.mark_dax_dead();
         self.read_wait.wakeup(None);
         self.wake_bridge(stats::VirtioFsBridgeWakeSource::Disconnect);
         self.init_wait.wakeup(None);
@@ -1329,6 +1444,50 @@ impl FuseConn {
             &self.epitems,
             EPollEventType::EPOLLERR | EPollEventType::EPOLLHUP,
         );
+    }
+
+    /// Disconnect the protocol and synchronously revoke every local DAX DMA
+    /// owner before a virtio transport reset may release its DMA resources.
+    pub(crate) fn abort_and_revoke_dax(&self) -> Result<(), SystemError> {
+        // Close admission before the cleanup-state lock rejects registrations.
+        // A node constructed before this point either registers while Active,
+        // or registers after InProgress but can no longer create a mapping.
+        self.begin_dax_quiesce();
+        self.begin_shutdown_dax_allocator();
+        if !self.claim_dax_cleanup()? {
+            return Ok(());
+        }
+
+        self.disconnect_requests();
+        // Pending SETUP/REMOVEMAPPING requests were completed above, so admitted
+        // callers can now drop their guards without depending on the daemon.
+        self.wait_dax_drained();
+        let revoke = self.revoke_registered_dax_nodes();
+        let result = {
+            let mut cleanup = self.dax_cleanup.lock();
+            let failed = revoke.is_err() || cleanup.revoke_failed || !cleanup.nodes.is_empty();
+            if failed {
+                cleanup.state = DaxCleanupState::Failed;
+                Err(SystemError::EIO)
+            } else {
+                self.disconnect_cleanup_dax_allocator();
+                self.dax_window.lock().take();
+                cleanup.state = DaxCleanupState::Succeeded;
+                Ok(())
+            }
+        };
+        self.mark_dax_dead();
+        self.dax_cleanup_wait.wakeup_all(None);
+        result
+    }
+
+    pub fn abort(&self) {
+        if let Err(error) = self.abort_and_revoke_dax() {
+            log::error!(
+                "fuse: disconnect DAX cleanup failed; transport resources must remain quarantined: {:?}",
+                error
+            );
+        }
     }
 
     /// Unmount path: fail in-flight requests and best-effort queue DESTROY.
@@ -1594,6 +1753,18 @@ mod tests {
         let flags = inode_without_window.inner.lock().init_flags;
         assert_eq!(flags & FUSE_MAP_ALIGNMENT, 0);
         assert_ne!(flags & FUSE_HAS_INODE_DAX, 0);
+    }
+
+    #[test]
+    fn empty_dax_cleanup_is_terminal_and_idempotent() {
+        let conn = FuseConn::new_for_virtiofs(8192, 8192);
+        assert_eq!(conn.abort_and_revoke_dax(), Ok(()));
+        assert_eq!(conn.dax_admission_state(), super::DaxAdmissionState::Dead);
+        assert_eq!(
+            conn.dax_cleanup.lock().state,
+            super::DaxCleanupState::Succeeded
+        );
+        assert_eq!(conn.abort_and_revoke_dax(), Ok(()));
     }
 
     #[test]

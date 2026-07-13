@@ -111,9 +111,46 @@ impl Drop for DaxAdmissionGuard {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DaxMountMode {
+    InodeDefault,
     Never,
     Always,
     Inode,
+}
+
+impl DaxMountMode {
+    pub(crate) fn is_inode_mode(self) -> bool {
+        matches!(self, Self::InodeDefault | Self::Inode)
+    }
+
+    pub(crate) fn proc_option(self) -> Option<&'static str> {
+        match self {
+            Self::InodeDefault => None,
+            Self::Never => Some("dax=never"),
+            Self::Always => Some("dax=always"),
+            Self::Inode => Some("dax=inode"),
+        }
+    }
+
+    pub(crate) fn inode_enabled(
+        self,
+        connection_capable: bool,
+        inode_capability_negotiated: bool,
+        attr_dax: bool,
+        regular: bool,
+    ) -> bool {
+        if !regular || !connection_capable {
+            return false;
+        }
+        match self {
+            Self::Never => false,
+            Self::Always => true,
+            Self::InodeDefault | Self::Inode => inode_capability_negotiated && attr_dax,
+        }
+    }
+
+    pub(crate) fn attr_change_requires_dontcache(self, active: bool, attr_dax: bool) -> bool {
+        self.is_inode_mode() && active != attr_dax
+    }
 }
 
 #[derive(Debug)]
@@ -1041,6 +1078,26 @@ mod tests {
         let mut out = Vec::with_capacity(max);
         allocator.reclaim_candidates(&mut out, max).unwrap();
         out
+    }
+
+    #[test]
+    fn inode_policy_matches_linux_capability_matrix() {
+        assert!(DaxMountMode::Always.inode_enabled(true, false, false, true));
+        assert!(!DaxMountMode::Always.inode_enabled(false, true, true, true));
+        assert!(!DaxMountMode::Never.inode_enabled(true, true, true, true));
+        assert!(DaxMountMode::Inode.inode_enabled(true, true, true, true));
+        assert!(!DaxMountMode::Inode.inode_enabled(true, false, true, true));
+        assert!(!DaxMountMode::InodeDefault.inode_enabled(true, true, false, true));
+        assert!(!DaxMountMode::Inode.inode_enabled(true, true, true, false));
+    }
+
+    #[test]
+    fn dontcache_compares_fixed_state_with_raw_attr_only_in_inode_modes() {
+        assert!(DaxMountMode::Inode.attr_change_requires_dontcache(false, true));
+        assert!(DaxMountMode::InodeDefault.attr_change_requires_dontcache(true, false));
+        assert!(!DaxMountMode::Inode.attr_change_requires_dontcache(true, true));
+        assert!(!DaxMountMode::Always.attr_change_requires_dontcache(true, false));
+        assert!(!DaxMountMode::Never.attr_change_requires_dontcache(false, true));
     }
 
     #[test]

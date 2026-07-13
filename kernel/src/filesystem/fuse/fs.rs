@@ -96,6 +96,21 @@ impl FuseFS {
         self.live_node(nodeid).map(|node| notify(&node))
     }
 
+    pub(crate) fn purge_lookup_aliases(&self, child: &Arc<FuseNode>) {
+        let mut parents = vec![self.root.clone()];
+        {
+            let nodes = self.nodes.lock();
+            parents.extend(nodes.values().filter_map(Weak::upgrade));
+        }
+        {
+            let retired = self.retired_nodes.lock();
+            parents.extend(retired.iter().filter_map(Weak::upgrade));
+        }
+        for parent in parents {
+            parent.purge_lookup_alias(child);
+        }
+    }
+
     fn should_retire_node(
         node: &Arc<FuseNode>,
         generation: Option<u64>,
@@ -212,7 +227,7 @@ impl FuseFS {
         parent: Option<Arc<FuseNode>>,
         cached: Option<Metadata>,
     ) -> Result<Arc<FuseNode>, SystemError> {
-        self.get_or_create_node_with_generation(nodeid, parent, cached, None, 0)
+        self.get_or_create_node_with_generation(nodeid, parent, cached, None, 0, 0)
     }
 
     pub fn get_or_create_node_with_generation(
@@ -222,6 +237,7 @@ impl FuseFS {
         cached: Option<Metadata>,
         generation: Option<u64>,
         lookup_refs: u64,
+        attr_flags: u32,
     ) -> Result<Arc<FuseNode>, SystemError> {
         if nodeid == self.root.nodeid() {
             if parent.is_some() || lookup_refs != 0 {
@@ -275,6 +291,7 @@ impl FuseFS {
                 parent_nodeid,
                 parent,
                 cached,
+                attr_flags,
             );
             if let Some(gen) = generation {
                 n.set_generation(gen);
@@ -296,6 +313,7 @@ impl FuseFS {
         cached: Option<Metadata>,
         generation: Option<u64>,
         lookup_refs: u64,
+        attr_flags: u32,
     ) -> Result<Arc<FuseNode>, SystemError> {
         if nodeid == self.root.nodeid() {
             if parent.is_some() || lookup_refs != 0 {
@@ -344,6 +362,7 @@ impl FuseFS {
                 parent_nodeid,
                 parent,
                 cached,
+                attr_flags,
             );
             if let Some(gen) = generation {
                 n.set_generation(gen);
@@ -364,6 +383,7 @@ impl FuseFS {
         root_parent: Arc<FuseNode>,
         root_nodeid: u64,
         root_md: Metadata,
+        attr_flags: u32,
     ) -> Arc<Self> {
         let conn = parent.conn.clone();
         let parent_nodeid = root_parent.nodeid();
@@ -375,6 +395,7 @@ impl FuseFS {
                 parent_nodeid,
                 Some(root_parent),
                 Some(root_md),
+                attr_flags,
             ),
             super_block: parent.super_block.clone(),
             conn,
@@ -504,7 +525,13 @@ pub fn fuse_try_automount_submount(
     }
 
     let parent_fs = fuse_node.fuse_fs().ok_or(SystemError::ENOENT)?;
-    let sub_fs = FuseFS::new_submount(&parent_fs, fuse_node.clone(), fuse_node.nodeid(), md);
+    let sub_fs = FuseFS::new_submount(
+        &parent_fs,
+        fuse_node.clone(),
+        fuse_node.nodeid(),
+        md,
+        attr_flags,
+    );
     let mount_path = match mount_path_override {
         Some(path) => path,
         None => {
@@ -611,6 +638,7 @@ impl MountableFileSystem for FuseFS {
                 FUSE_ROOT_ID,
                 None,
                 Some(root_md),
+                0,
             ),
             super_block,
             conn: conn.clone(),

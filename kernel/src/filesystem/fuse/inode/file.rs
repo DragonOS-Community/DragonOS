@@ -108,7 +108,7 @@ impl FuseNode {
         };
         let end_page_exclusive = end_index.checked_add(1);
         let page_cache = self.cached_page_cache();
-        let blocker = if self.conn().dax_enabled() {
+        let blocker = if self.dax_active() {
             Some(self.dax_begin_host_invalidation()?)
         } else {
             None
@@ -385,7 +385,7 @@ impl FuseNode {
         // hold time, then drain again under the barrier to close the race with
         // buffered writes and page_mkwrite.
         self.sync_dirty_cached_pages()?;
-        let _barrier = if self.conn().dax_enabled() && len != old_size {
+        let _barrier = if self.dax_active() && len != old_size {
             if len < old_size {
                 self.dax_layout_write_for_truncate(len)?
             } else {
@@ -477,7 +477,12 @@ impl FuseNode {
         let out: FuseAttrOut = fuse_read_struct(&payload)?;
         let md = Self::attr_to_metadata(&out.attr);
         let new_size = md.size.max(0) as usize;
-        self.set_cached_metadata_with_valid(md, out.attr_valid, out.attr_valid_nsec);
+        self.set_cached_metadata_with_valid(
+            md,
+            out.attr_valid,
+            out.attr_valid_nsec,
+            out.attr.flags,
+        );
         self.truncate_page_cache(new_size)?;
         Ok(())
     }
@@ -885,7 +890,7 @@ impl FuseNode {
             && self
                 .conn
                 .has_init_flag(super::super::protocol::FUSE_ATOMIC_O_TRUNC)
-            && self.conn.dax_enabled();
+            && self.dax_active();
         if atomic_dax_truncate {
             self.sync_dirty_cached_pages()?;
         }

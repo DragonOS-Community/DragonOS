@@ -10,8 +10,11 @@ use crate::net::socket::PMSG;
 use super::uapi::{SOL_PACKET, TP_STATUS_USER, TP_STATUS_VLAN_TPID_VALID, TP_STATUS_VLAN_VALID};
 use super::{
     eth_protocol, packet_option, PacketMetadata, PacketSocket, PacketSocketType, PacketType,
-    ReceivedPacket, SockAddrLl, TpacketAuxdata,
+    ReceivedPacket, RingWriteResult, SockAddrLl, TpacketAuxdata,
 };
+use crate::filesystem::epoll::event_poll::EventPoll;
+use crate::filesystem::epoll::EPollEventType;
+use crate::filesystem::vfs::fasync::FASYNC_POLL_IN;
 
 struct ParsedFrame {
     dst: [u8; 6],
@@ -65,6 +68,47 @@ impl PacketSocket {
             return;
         };
         if bound_protocol != eth_protocol::ETH_P_ALL && bound_protocol != protocol {
+            return;
+        }
+
+        // --- TPACKET ring buffer path ---
+        // When an RX ring is active, deliver directly into the ring instead of
+        // the rx_buffer queue.  Clone the Arc and release the outer lock so
+        // concurrent delivers from other NICs are not blocked by setup/teardown.
+        let ring_arc = self.rx_ring.lock().as_ref().cloned();
+        if let Some(ring_arc) = ring_arc {
+            let visible_len = frame
+                .len()
+                .saturating_sub(if vlan.is_some() { 4 } else { 0 });
+            let start = if self.sock_type == PacketSocketType::Raw { 0 } else { 14 };
+            let metadata = PacketMetadata {
+                src_mac: src,
+                dst_mac: dst,
+                protocol,
+                ifindex,
+                pkt_type,
+                wire_len: visible_len - start,
+                mac_offset: 0,
+                net_offset: 14,
+                vlan_tci: vlan.map_or(0, |v| v.0),
+                vlan_tpid: vlan.map_or(0, |v| v.1),
+            };
+            let mut ring = ring_arc.lock();
+            match ring.write_frame(frame, &metadata) {
+                RingWriteResult::Written => {
+                    self.stats_packets.fetch_add(1, Ordering::Relaxed);
+                    drop(ring);
+                    self.wait_queue.wakeup(None);
+                    let _ = EventPoll::wakeup_epoll(
+                        self.epoll_items.as_ref(),
+                        EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
+                    );
+                    self.fasync_items.send_sigio(FASYNC_POLL_IN);
+                }
+                RingWriteResult::Dropped => {
+                    self.stats_drops.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             return;
         }
         // Match Linux packet_rcv(): reject a socket whose receive memory is
@@ -151,6 +195,11 @@ impl PacketSocket {
         self.wait_queue.wakeup(None);
     }
     pub(super) fn can_recv(&self) -> bool {
+        // Ring mode: check for TP_STATUS_USER frames.
+        if let Some(r) = self.rx_ring.lock().as_ref() {
+            return r.lock().has_user_frames();
+        }
+        // Queue mode (default).
         !self.rx_buffer.lock().is_empty()
     }
     fn dequeue(&self, peek: bool) -> Result<ReceivedPacket, SystemError> {

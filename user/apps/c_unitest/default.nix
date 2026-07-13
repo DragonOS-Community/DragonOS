@@ -23,6 +23,17 @@ stdenv.mkDerivation {
         install -m755 "$bin" $out/bin/"$bin"
       fi
     done
+
+    # 安装子目录编译出的测试程序
+    for dir in */; do
+      if [ -f "$dir/Makefile" ]; then
+        for bin in "$dir"*; do
+          if [ -f "$bin" ] && [ -x "$bin" ] && [ "$bin" != "$dir/Makefile" ]; then
+            install -m755 "$bin" "$out/bin/$(basename "$bin")"
+          fi
+        done
+      fi
+    done
   '';
 
   meta = {

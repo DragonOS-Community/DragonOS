@@ -5,6 +5,7 @@ mod rx;
 mod sockopt;
 mod tx;
 mod uapi;
+mod ring;
 
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
@@ -28,6 +29,8 @@ pub use uapi::{
     eth_protocol, packet_mreq_type, packet_option, PacketMreq, PacketType, SockAddrLl,
     TpacketAuxdata,
 };
+#[allow(unused_imports)]
+pub use ring::{PacketFakeFs, PacketRing, RingWriteResult, TpacketVersion};
 
 const DEFAULT_RX_BUFFER_SIZE: usize = 256 * 1024;
 const DEFAULT_TX_BUFFER_SIZE: usize = 256 * 1024;
@@ -91,6 +94,9 @@ pub struct PacketSocket {
     pub(super) netns: Arc<NetNamespace>,
     epoll_items: EPollItems,
     fasync_items: FAsyncItems,
+    pub(super) rx_ring: Mutex<Option<Arc<Mutex<ring::PacketRing>>>>,
+    pub(super) tpacket_version: Mutex<ring::TpacketVersion>,
+    pub(super) tp_reserve: AtomicU32,
 }
 
 impl PacketSocket {
@@ -129,6 +135,9 @@ impl PacketSocket {
             netns,
             epoll_items: EPollItems::default(),
             fasync_items: FAsyncItems::default(),
+            rx_ring: Mutex::new(None),
+            tpacket_version: Mutex::new(ring::TpacketVersion::V1),
+            tp_reserve: AtomicU32::new(0),
         });
         socket.netns.register_packet_socket(socket.self_ref.clone());
         Ok(socket)
@@ -282,5 +291,16 @@ impl Socket for PacketSocket {
     }
     fn set_option(&self, l: PSOL, n: usize, v: &[u8]) -> Result<(), SystemError> {
         self.set_packet_option(l, n, v)
+    }
+    fn mmap_layout(&self) -> Option<crate::net::socket::base::SocketMmapLayout> {
+        let ring_outer = self.rx_ring.lock();
+        ring_outer.as_ref().map(|r| {
+            let inner = r.lock();
+            crate::net::socket::base::SocketMmapLayout {
+                page_cache: inner.page_cache().clone(),
+                fs: Arc::new(ring::PacketFakeFs),
+                size: inner.total_size(),
+            }
+        })
     }
 }

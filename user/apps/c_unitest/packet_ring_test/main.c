@@ -1,9 +1,9 @@
 /*
- * packet_ring_test — TPACKET V2 mmap RX ring buffer 功能测试
+ * packet_ring_test — TPACKET V1/V2 mmap RX ring buffer 功能测试
  *
  * 验证 DragonOS AF_PACKET socket 的 TPACKET mmap ring buffer 实现：
  *   1. socket(AF_PACKET, SOCK_RAW, ETH_P_ALL)
- *   2. setsockopt(PACKET_VERSION, TPACKET_V2)
+ *   2. setsockopt(PACKET_VERSION, TPACKET_V1 或 V2)
  *   3. setsockopt(PACKET_RX_RING, ...)
  *   4. mmap ring buffer
  *   5. 通过 sendto 向 loopback 接口发送一帧以太网数据，主动触发接收
@@ -15,7 +15,7 @@
  *
  * 测试自包含：不依赖环境外部流量，通过 loopback 自发自收验证抓包功能。
  *
- * 运行: 在 DragonOS 中执行 /bin/packet_ring_test
+ * 运行: 在 DragonOS 中执行 /bin/packet_ring_test [v1|v2] (默认 v2)
  */
 
 #define _GNU_SOURCE
@@ -54,7 +54,7 @@
 #define SENT_PAYLOAD_LEN 4
 #define SENT_FRAME_LEN   (ETH_HLEN + SENT_PAYLOAD_LEN)
 
-int main(void)
+int main(int argc, char *argv[])
 {
     int fd = -1;
     void *ring = MAP_FAILED;
@@ -62,6 +62,16 @@ int main(void)
     int verified = 0;
     unsigned char sent_frame[SENT_FRAME_LEN];
     int lo_ifindex = -1;
+
+    /* ---- 选择 TPACKET 版本 ----
+     * argv[1]=="v1" -> TPACKET_V1; 否则(含默认) -> TPACKET_V2 */
+    int tpacket_ver = TPACKET_V2;
+    int is_v1 = 0;
+    if (argc >= 2 && strcmp(argv[1], "v1") == 0) {
+        tpacket_ver = TPACKET_V1;
+        is_v1 = 1;
+    }
+    printf("=== packet_ring_test: TPACKET_%s mode ===\n", is_v1 ? "V1" : "V2");
 
     /* 构造自发帧：dst=broadcast, src=zero, proto=htons(ETH_P_IP), payload="TEST" */
     memset(sent_frame, 0, sizeof(sent_frame));
@@ -84,15 +94,17 @@ int main(void)
     printf("[OK] Step 1: socket(AF_PACKET, SOCK_RAW, ETH_P_ALL) = %d\n", fd);
 
     /* ============================================================
-     * Step 2: 设置 TPACKET 版本为 V2
+     * Step 2: 设置 TPACKET 版本 (V1 或 V2)
      * ============================================================ */
-    int version = TPACKET_V2;
+    int version = tpacket_ver;
     if (setsockopt(fd, SOL_PACKET, PACKET_VERSION,
                    &version, sizeof(version)) < 0) {
-        perror("[FAIL] setsockopt(PACKET_VERSION, TPACKET_V2)");
+        perror(is_v1 ? "[FAIL] setsockopt(PACKET_VERSION, TPACKET_V1)"
+                     : "[FAIL] setsockopt(PACKET_VERSION, TPACKET_V2)");
         goto cleanup;
     }
-    printf("[OK] Step 2: setsockopt(PACKET_VERSION, TPACKET_V2)\n");
+    printf("[OK] Step 2: setsockopt(PACKET_VERSION, TPACKET_%s)\n",
+           is_v1 ? "V1" : "V2");
 
     /* ============================================================
      * Step 3 + 4: 构造 tpacket_req 并设置 PACKET_RX_RING
@@ -195,7 +207,7 @@ int main(void)
      * Step 8: 遍历 ring 中所有帧，处理 TP_STATUS_USER 帧
      *
      * V1/V2 ring 是平坦帧数组。frame i 起始地址 = base + i * tp_frame_size。
-     * 每帧以 struct tpacket2_hdr 开头。
+     * 每帧以 struct tpacket_hdr(V1) 或 struct tpacket2_hdr(V2) 开头。
      * tp_status==TP_STATUS_USER 表示内核已填好数据，用户可读。
      * tp_mac 给出 MAC header 在帧内的偏移，数据从该偏移开始。
      * ============================================================ */
@@ -203,35 +215,61 @@ int main(void)
 
     for (unsigned int i = 0; i < FRAME_NR; i++) {
         unsigned char *frame_base = (unsigned char *)ring + i * FRAME_SIZE;
-        struct tpacket2_hdr *hdr = (struct tpacket2_hdr *)frame_base;
 
-        /* tp_status: V2 是 __u32 */
-        if (hdr->tp_status != TP_STATUS_USER)
+        /* 根据版本提取公共字段到局部变量。
+         * V1: struct tpacket_hdr, tp_status 是 unsigned long, 用 tp_usec, 无 VLAN
+         * V2: struct tpacket2_hdr, tp_status 是 unsigned int, 用 tp_nsec, 有 VLAN */
+        unsigned long tp_status;
+        unsigned int tp_len, tp_snaplen, tp_mac, tp_net, tp_sec, tp_subsec;
+        unsigned int tp_vlan_tci = 0, tp_vlan_tpid = 0;
+
+        if (is_v1) {
+            struct tpacket_hdr *h = (struct tpacket_hdr *)frame_base;
+            tp_status  = h->tp_status;
+            tp_len     = h->tp_len;
+            tp_snaplen = h->tp_snaplen;
+            tp_mac     = h->tp_mac;
+            tp_net     = h->tp_net;
+            tp_sec     = h->tp_sec;
+            tp_subsec  = h->tp_usec;
+        } else {
+            struct tpacket2_hdr *h = (struct tpacket2_hdr *)frame_base;
+            tp_status  = h->tp_status;
+            tp_len     = h->tp_len;
+            tp_snaplen = h->tp_snaplen;
+            tp_mac     = h->tp_mac;
+            tp_net     = h->tp_net;
+            tp_sec     = h->tp_sec;
+            tp_subsec  = h->tp_nsec;
+            tp_vlan_tci  = h->tp_vlan_tci;
+            tp_vlan_tpid = h->tp_vlan_tpid;
+        }
+
+        if (tp_status != TP_STATUS_USER)
             continue;
 
         frames_read++;
 
         printf("[OK] Step 8: Frame %u: tp_status=USER "
                "tp_len=%u tp_snaplen=%u tp_mac=%u tp_net=%u "
-               "tp_sec=%u tp_nsec=%u",
-               i, hdr->tp_len, hdr->tp_snaplen,
-               hdr->tp_mac, hdr->tp_net,
-               hdr->tp_sec, hdr->tp_nsec);
+               "tp_sec=%u %s=%u",
+               i, tp_len, tp_snaplen, tp_mac, tp_net,
+               tp_sec, is_v1 ? "tp_usec" : "tp_nsec", tp_subsec);
 
-        if (hdr->tp_vlan_tci || hdr->tp_vlan_tpid) {
+        if (!is_v1 && (tp_vlan_tci || tp_vlan_tpid)) {
             printf(" vlan_tci=0x%04x vlan_tpid=0x%04x",
-                   hdr->tp_vlan_tci, hdr->tp_vlan_tpid);
+                   tp_vlan_tci, tp_vlan_tpid);
         }
         printf("\n");
 
         /* 用 tp_mac 定位数据，打印前 DUMP_BYTES 字节 */
-        if (hdr->tp_mac > 0 && hdr->tp_mac + DUMP_BYTES <= (i + 1) * FRAME_SIZE) {
-            unsigned char *data = frame_base + hdr->tp_mac;
-            unsigned int to_print = hdr->tp_snaplen;
+        if (tp_mac > 0 && tp_mac + DUMP_BYTES <= (i + 1) * FRAME_SIZE) {
+            unsigned char *data = frame_base + tp_mac;
+            unsigned int to_print = tp_snaplen;
             if (to_print > DUMP_BYTES)
                 to_print = DUMP_BYTES;
             printf("  Data (%u/%u bytes at tp_mac=%u):",
-                   to_print, hdr->tp_snaplen, hdr->tp_mac);
+                   to_print, tp_snaplen, tp_mac);
             for (unsigned int j = 0; j < to_print; j++)
                 printf(" %02x", data[j]);
             printf("\n");
@@ -243,10 +281,10 @@ int main(void)
          * 比较 tp_mac 起始的 SENT_FRAME_LEN 字节与 sent_frame。
          * 只有数据匹配才视为真正抓到包。
          * ============================================================ */
-        if (hdr->tp_mac > 0 &&
-            hdr->tp_mac + SENT_FRAME_LEN <= (i + 1) * FRAME_SIZE &&
-            hdr->tp_snaplen >= SENT_FRAME_LEN) {
-            unsigned char *data = frame_base + hdr->tp_mac;
+        if (tp_mac > 0 &&
+            tp_mac + SENT_FRAME_LEN <= (i + 1) * FRAME_SIZE &&
+            tp_snaplen >= SENT_FRAME_LEN) {
+            unsigned char *data = frame_base + tp_mac;
             if (memcmp(data, sent_frame, SENT_FRAME_LEN) == 0) {
                 verified = 1;
                 printf("  -> Frame %u verified: matches sent frame (%d bytes)\n",
@@ -255,19 +293,23 @@ int main(void)
                 printf("  -> Frame %u data mismatch (expected broadcast ETH_P_IP + \"TEST\")\n",
                        i);
             }
-        } else if (hdr->tp_snaplen < SENT_FRAME_LEN) {
+        } else if (tp_snaplen < SENT_FRAME_LEN) {
             printf("  -> Frame %u too short (%u < %d), cannot verify\n",
-                   i, hdr->tp_snaplen, SENT_FRAME_LEN);
+                   i, tp_snaplen, SENT_FRAME_LEN);
         }
 
         /* ============================================================
          * Step 9: 将帧翻回内核 (TP_STATUS_KERNEL)
          *
-         * 内核扫描 tp_status==KERNEL 的帧来写入新数据。
-         * 写入前加 compiler barrier 确保 header 字段读取已完成。
+         * tp_status 在两种版本中都位于帧起始(offset 0)，但宽度不同
+         * (V1=unsigned long, V2=unsigned int)，须用对应类型回写，
+         * 否则 V2 会越界覆盖 tp_len。
          * ============================================================ */
         __sync_synchronize();
-        hdr->tp_status = TP_STATUS_KERNEL;
+        if (is_v1)
+            ((struct tpacket_hdr *)frame_base)->tp_status = TP_STATUS_KERNEL;
+        else
+            ((struct tpacket2_hdr *)frame_base)->tp_status = TP_STATUS_KERNEL;
         printf("  -> Frame %u returned to kernel\n", i);
     }
 

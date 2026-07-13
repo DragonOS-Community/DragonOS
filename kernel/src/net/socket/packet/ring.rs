@@ -59,12 +59,20 @@ impl FileSystem for PacketFakeFs {
     unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
         PageFaultHandler::filemap_fault(pfm)
     }
-    unsafe fn page_mkwrite(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
-        // RX ring 是 MAP_SHARED|PROT_WRITE：用户写 tp_status 翻回 KERNEL 时会触发
-        // 写保护异常 → do_shared_fault/do_wp_page → page_mkwrite。默认返回 SIGBUS
-        // 会导致 ring 完全不可写，因此委托给通用 filemap_page_mkwrite，它会做
-        // metadata size 边界检查并把页标记为脏（与 fatfs/tmpfs 一致）。
-        PageFaultHandler::filemap_page_mkwrite(pfm)
+    unsafe fn page_mkwrite(&self, _pfm: &mut PageFaultMessage) -> VmFaultReason {
+        // Ring-buffer pages are pre-allocated as PageType::Normal and inserted
+        // into the page cache via insert_ready_page — they are NOT disk-backed
+        // file pages, so the generic filemap_page_mkwrite (which requires
+        // PageType::File, checks inode size, and prepares writeback) is both
+        // unnecessary and harmful (it returns SIGBUS because the page type is
+        // Normal, not File).
+        //
+        // Returning success here lets do_wp_page upgrade the PTE to read-write
+        // in-place. The dirty-tracking block in do_wp_page is skipped for
+        // Normal pages, which is correct — ring pages are never written back
+        // to disk. This matches how the perf subsystem (PerfFakeFs) handles
+        // its ring buffers.
+        VmFaultReason::empty()
     }
     unsafe fn map_pages(
         &self,

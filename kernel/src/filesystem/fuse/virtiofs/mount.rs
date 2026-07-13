@@ -1,4 +1,5 @@
 use alloc::{sync::Arc, vec};
+use core::fmt::Write;
 
 use linkme::distributed_slice;
 use system_error::SystemError;
@@ -6,8 +7,8 @@ use system_error::SystemError;
 use crate::{
     driver::virtio::virtio_fs::{virtio_fs_find_instance, VirtioFsInstance},
     filesystem::vfs::{
-        file::File, FilePrivateData, FileSystem, FileSystemMakerData, FsInfo, IndexNode,
-        MountableFileSystem, SuperBlock, FSMAKER,
+        file::File, mount::MountFS, FilePrivateData, FileSystem, FileSystemMakerData, FsInfo,
+        IndexNode, MountableFileSystem, SuperBlock, FSMAKER,
     },
     mm::{
         fault::{FaultFlags, PageFaultMessage},
@@ -47,6 +48,7 @@ impl FileSystemMakerData for VirtioFsMountData {
 #[derive(Debug)]
 struct VirtioFsFs {
     inner: Arc<dyn FileSystem>,
+    conn: Arc<FuseConn>,
     instance: Arc<VirtioFsInstance>,
     session_id: u64,
 }
@@ -65,7 +67,7 @@ impl VirtioFsFs {
             };
             private.node.clone()
         };
-        if !node.conn().dax_enabled() {
+        if !node.dax_active() {
             return None;
         }
 
@@ -156,10 +158,10 @@ impl VirtioFsFs {
         v.is_empty() || v != "0"
     }
 
-    fn parse_dax_mode(v: &str) -> Result<DaxMountMode, SystemError> {
-        if v.is_empty() {
+    fn parse_dax_mode(v: Option<&str>) -> Result<DaxMountMode, SystemError> {
+        let Some(v) = v else {
             return Ok(DaxMountMode::Always);
-        }
+        };
 
         match v {
             "always" => Ok(DaxMountMode::Always),
@@ -180,17 +182,18 @@ impl VirtioFsFs {
         let mut group_id: Option<u32> = None;
         let mut default_permissions = true;
         let mut allow_other = true;
-        let mut dax_mode = DaxMountMode::Never;
+        let mut dax_mode = DaxMountMode::InodeDefault;
 
         for part in raw.unwrap_or("").split(',') {
             let part = part.trim();
             if part.is_empty() {
                 continue;
             }
-            let (k, v) = match part.split_once('=') {
-                Some((k, v)) => (k.trim(), v.trim()),
-                None => (part, ""),
+            let (k, value) = match part.split_once('=') {
+                Some((k, v)) => (k.trim(), Some(v.trim())),
+                None => (part, None),
             };
+            let v = value.unwrap_or("");
 
             match k {
                 "rootmode" => rootmode = Some(Self::parse_opt_u32_octal(v)?),
@@ -198,15 +201,9 @@ impl VirtioFsFs {
                 "group_id" => group_id = Some(Self::parse_opt_u32_decimal(v)?),
                 "default_permissions" => default_permissions = Self::parse_opt_bool_switch(v),
                 "allow_other" => allow_other = Self::parse_opt_bool_switch(v),
-                "dax" => dax_mode = Self::parse_dax_mode(v)?,
+                "dax" => dax_mode = Self::parse_dax_mode(value)?,
                 _ => return Err(SystemError::EINVAL),
             }
-        }
-
-        // Per-inode DAX requires tracking FUSE_ATTR_DAX transitions.  Treating
-        // it as dax=always would violate the negotiated Linux ABI.
-        if dax_mode == DaxMountMode::Inode {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
 
         Ok((
@@ -251,6 +248,17 @@ impl FileSystem for VirtioFsFs {
 
     fn permission_policy(&self) -> crate::filesystem::vfs::FsPermissionPolicy {
         self.inner.permission_policy()
+    }
+
+    fn proc_show_mount_options(
+        &self,
+        _mount: &MountFS,
+        out: &mut dyn Write,
+    ) -> Result<(), SystemError> {
+        if let Some(option) = self.conn.dax_mode().proc_option() {
+            out.write_str(option).map_err(|_| SystemError::EINVAL)?;
+        }
+        Ok(())
     }
 
     unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
@@ -303,14 +311,17 @@ impl MountableFileSystem for VirtioFsFs {
                 .as_ref()
                 .is_none_or(|window| window.len() < super::dax::DAX_RANGE_SIZE)
         {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            return Err(SystemError::EINVAL);
         }
         let conn = FuseConn::new_for_virtiofs_with_dax_window(
             VIRTIOFS_MAX_REQUEST_SIZE,
             VIRTIOFS_RSP_BUF_SIZE,
             cache_window,
             dax_mode,
-        );
+        )?;
+        if dax_mode == DaxMountMode::Always && !conn.dax_enabled() {
+            return Err(SystemError::EINVAL);
+        }
 
         Ok(Some(Arc::new(VirtioFsMountData {
             rootmode,
@@ -356,6 +367,7 @@ impl MountableFileSystem for VirtioFsFs {
 
         Ok(Arc::new(VirtioFsFs {
             inner,
+            conn: md.conn.clone(),
             instance: md.instance.clone(),
             session_id,
         }))
@@ -363,3 +375,43 @@ impl MountableFileSystem for VirtioFsFs {
 }
 
 register_mountable_fs!(VirtioFsFs, VIRTIOFSMAKER, "virtiofs");
+
+#[cfg(test)]
+mod tests {
+    use system_error::SystemError;
+
+    use super::{DaxMountMode, VirtioFsFs};
+
+    #[test]
+    fn dax_option_parser_matches_linux_modes() {
+        assert_eq!(VirtioFsFs::parse_dax_mode(None), Ok(DaxMountMode::Always));
+        assert_eq!(
+            VirtioFsFs::parse_dax_mode(Some("always")),
+            Ok(DaxMountMode::Always)
+        );
+        assert_eq!(
+            VirtioFsFs::parse_dax_mode(Some("never")),
+            Ok(DaxMountMode::Never)
+        );
+        assert_eq!(
+            VirtioFsFs::parse_dax_mode(Some("inode")),
+            Ok(DaxMountMode::Inode)
+        );
+        assert_eq!(
+            VirtioFsFs::parse_dax_mode(Some("")),
+            Err(SystemError::EINVAL)
+        );
+        assert_eq!(
+            VirtioFsFs::parse_dax_mode(Some("on")),
+            Err(SystemError::EINVAL)
+        );
+    }
+
+    #[test]
+    fn proc_option_distinguishes_default_and_explicit_inode_modes() {
+        assert_eq!(DaxMountMode::InodeDefault.proc_option(), None);
+        assert_eq!(DaxMountMode::Always.proc_option(), Some("dax=always"));
+        assert_eq!(DaxMountMode::Never.proc_option(), Some("dax=never"));
+        assert_eq!(DaxMountMode::Inode.proc_option(), Some("dax=inode"));
+    }
+}

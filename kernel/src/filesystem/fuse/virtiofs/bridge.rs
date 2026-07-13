@@ -1791,11 +1791,32 @@ impl VirtioFsBridgeContext {
         self.clear_queue_full_blocked_stats();
         self.instance.clear_bridge_wake(self.session_id);
         self.response_pool.close();
+        if let Err(error) = self.conn.abort_and_revoke_dax() {
+            log::error!(
+                "virtiofs bridge: DAX cleanup failed before reset; quarantining session id={} tag='{}' dev={:?}: {:?}",
+                self.session_id,
+                self.instance.tag(),
+                self.instance.dev_id(),
+                error
+            );
+            self.fail_unfinished_preserving_inflight_dma(SystemError::ENOTCONN);
+            if !self
+                .instance
+                .release_session_without_transport(self.session_id)
+            {
+                warn!(
+                    "virtiofs bridge: failed to release DAX-quarantined session id={} tag='{}' dev={:?}",
+                    self.session_id,
+                    self.instance.tag(),
+                    self.instance.dev_id()
+                );
+            }
+            return false;
+        }
         if !self.reset_device_and_unset_queues() {
             // Idle pooled buffers are not visible to the device. Release them before the
             // reset-timeout quarantine keeps the transport, queues and inflight DMA buffers alive.
             self.fail_unfinished_preserving_inflight_dma(SystemError::ENOTCONN);
-            self.conn.abort();
             if !self
                 .instance
                 .release_session_without_transport(self.session_id)
@@ -1810,7 +1831,6 @@ impl VirtioFsBridgeContext {
             return false;
         }
         self.fail_all_unfinished(SystemError::ENOTCONN);
-        self.conn.abort();
 
         if let Some(transport) = self.transport.take() {
             self.instance.put_transport_after_session(transport);

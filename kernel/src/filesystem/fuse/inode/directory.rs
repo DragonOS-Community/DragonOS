@@ -44,13 +44,17 @@ impl FuseNode {
         if child.nodeid() == self.nodeid {
             return;
         }
+        if child.dax_dontcache() {
+            self.invalidate_lookup_cache(name);
+            return;
+        }
         let deadline_ns = Self::cache_deadline(valid, valid_nsec);
         self.prune_lookup_cache();
 
         let mut removed = Vec::new();
         {
             let mut cache = self.lookup_cache.lock();
-            if deadline_ns == 0 {
+            if deadline_ns == 0 || child.dax_dontcache() {
                 if let Some(entry) = cache.remove(name) {
                     removed.push(entry);
                 }
@@ -142,6 +146,22 @@ impl FuseNode {
         Some(entry.child)
     }
 
+    pub(crate) fn purge_lookup_alias(&self, child: &Arc<FuseNode>) {
+        let removed = {
+            let mut cache = self.lookup_cache.lock();
+            let aliases: Vec<String> = cache
+                .iter()
+                .filter(|(_, entry)| Arc::ptr_eq(&entry.child, child))
+                .map(|(name, _)| name.clone())
+                .collect();
+            aliases
+                .into_iter()
+                .filter_map(|name| cache.remove(&name))
+                .collect()
+        };
+        Self::clear_removed_lookup_entries(removed);
+    }
+
     fn remove_lookup_cache_entry(&self, name: &str) -> Option<FuseLookupCacheEntry> {
         self.lookup_cache.lock().remove(name)
     }
@@ -153,6 +173,7 @@ impl FuseNode {
         now: u64,
     ) -> bool {
         (entry.deadline_ns != u64::MAX && now >= entry.deadline_ns)
+            || entry.child.dax_dontcache()
             || entry.child.check_not_stale().is_err()
             || entry.child.generation() != entry.generation
             || entry.child.parent_fuse_nodeid() != parent_nodeid
@@ -219,14 +240,17 @@ impl FuseNode {
                 Some(md.clone()),
                 Some(entry.generation),
                 1,
+                entry.attr.flags,
             )?;
             consumed = true;
             child.set_dname(name);
+            child.set_lookup_attr_flags(entry.attr.flags);
             child.merge_cached_metadata_from_daemon(
                 md,
                 entry.attr_valid,
                 entry.attr_valid_nsec,
                 request_epoch,
+                entry.attr.flags,
             );
             self.cache_lookup_child(
                 name,
@@ -355,7 +379,9 @@ impl FuseNode {
                 Some(md.clone()),
                 Some(entry.generation),
                 1,
+                entry.attr.flags,
             )?;
+            child.set_lookup_attr_flags(entry.attr.flags);
             if let Some(name) = name {
                 child.set_dname(name);
                 self.cache_lookup_child(
@@ -372,6 +398,7 @@ impl FuseNode {
                 entry.attr_valid,
                 entry.attr_valid_nsec,
                 self.conn.sample_attr_epoch(),
+                entry.attr.flags,
             );
             Ok(child as Arc<dyn IndexNode>)
         })();

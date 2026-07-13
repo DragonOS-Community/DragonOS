@@ -43,8 +43,8 @@ use super::{
 use super::{
     private_data::FuseOpenPrivateData,
     virtiofs::dax::{
-        DaxAdmissionGuard, DaxMappingOwner, DaxRangeAllocator, OwnedToken, ReclaimCandidate,
-        ReclaimToken, DAX_RANGE_SIZE,
+        DaxAdmissionGuard, DaxAdmissionState, DaxMappingOwner, DaxRangeAllocator, OwnedToken,
+        ReclaimCandidate, ReclaimToken, DAX_RANGE_SIZE,
     },
 };
 
@@ -300,6 +300,10 @@ pub struct FuseNode {
     lookup_count: AtomicU64,
     /// 最近一次 LOOKUP 回复中的 fuse_attr.flags（用于 announce-submounts）。
     lookup_attr_flags: AtomicU32,
+    /// Fixed for this FuseNode incarnation, matching Linux inode S_DAX.
+    dax_active: bool,
+    /// Linux d_mark_dontcache equivalent for a per-inode DAX attribute change.
+    dax_dontcache: AtomicBool,
     /// LOOKUP 返回的 generation，用于检测 virtiofsd 复用 nodeid。
     generation: AtomicU64,
     stale: AtomicBool,
@@ -325,8 +329,20 @@ impl FuseNode {
         nodeid: u64,
         parent_nodeid: u64,
         parent: Option<Arc<FuseNode>>,
-        cached: Option<Metadata>,
+        mut cached: Option<Metadata>,
+        attr_flags: u32,
     ) -> Arc<Self> {
+        let regular = cached
+            .as_ref()
+            .is_some_and(|md| md.file_type == FileType::File);
+        let dax_active = conn.dax_inode_active(attr_flags, regular);
+        if let Some(md) = cached.as_mut() {
+            if dax_active {
+                md.flags.insert(InodeFlags::S_DAX);
+            } else {
+                md.flags.remove(InodeFlags::S_DAX);
+            }
+        }
         let has_cached = cached.is_some();
         let initial_attr_epoch = conn.sample_attr_epoch();
         let dax_owner_incarnation = NEXT_DAX_OWNER_INCARNATION.fetch_add(1, Ordering::Relaxed);
@@ -359,10 +375,14 @@ impl FuseNode {
             pending_short_read_eof: AtomicU64::new(u64::MAX),
             lookup_count: AtomicU64::new(0),
             lookup_attr_flags: AtomicU32::new(0),
+            dax_active,
+            dax_dontcache: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             stale: AtomicBool::new(false),
         });
-        node.conn.register_dax_node(&node);
+        if node.dax_active {
+            node.conn.register_dax_node(&node);
+        }
         node
     }
 
@@ -377,6 +397,46 @@ impl FuseNode {
     pub(crate) fn dax_mapping_owner(&self) -> super::virtiofs::dax::DaxMappingOwner {
         super::virtiofs::dax::DaxMappingOwner::from_inode(self.nodeid, self.dax_owner_incarnation)
             .expect("FuseNode has a valid DAX owner identity")
+    }
+
+    pub(crate) fn dax_active(&self) -> bool {
+        self.dax_active
+    }
+
+    pub(crate) fn dax_dontcache(&self) -> bool {
+        self.dax_dontcache.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_lookup_attr_flags(&self, flags: u32) {
+        self.lookup_attr_flags.store(flags, Ordering::Relaxed);
+    }
+
+    fn metadata_with_dax_state(&self, mut md: Metadata) -> Metadata {
+        if self.dax_active {
+            md.flags.insert(InodeFlags::S_DAX);
+        } else {
+            md.flags.remove(InodeFlags::S_DAX);
+        }
+        md
+    }
+
+    fn note_dax_attr_change(&self, attr_flags: u32) {
+        if !self.conn.dax_mode().attr_change_requires_dontcache(
+            self.dax_active,
+            (attr_flags & super::protocol::FUSE_ATTR_DAX) != 0,
+        ) || self
+            .dax_dontcache
+            .compare_exchange(false, true, Ordering::Release, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let Some(node) = self.self_ref.upgrade() else {
+            return;
+        };
+        if let Some(fs) = self.fs.upgrade() {
+            fs.purge_lookup_aliases(&node);
+        }
     }
 
     pub(crate) fn dax_layout_read(&self) -> RwSemReadGuard<'_, ()> {
@@ -604,7 +664,7 @@ impl FuseNode {
         end_exclusive: Option<usize>,
         restore_on_failure: bool,
     ) -> Result<RwSemWriteGuard<'_, ()>, SystemError> {
-        if !self.conn.dax_enabled() {
+        if !self.dax_active() {
             return Ok(self.dax_layout_write());
         }
         let _reclaim_serial = self.dax_reclaim_serial.lock();
@@ -743,7 +803,7 @@ impl FuseNode {
     }
 
     pub(crate) fn dax_teardown(&self) -> Result<(), SystemError> {
-        if self.conn.dax_enabled() {
+        if self.dax_active() {
             drop(self.dax_layout_write_for_all()?);
         }
         Ok(())
@@ -788,7 +848,7 @@ impl FuseNode {
         Ok(())
     }
 
-    fn dax_abandon_mappings(&self) {
+    fn dax_abandon_mappings(&self) -> Result<(), SystemError> {
         let mappings = self
             .dax_mappings
             .read()
@@ -796,28 +856,23 @@ impl FuseNode {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        let _ = self.dax_disconnect_revoke();
+        self.dax_disconnect_revoke()?;
         let Some(allocator) = self.conn.dax_allocator() else {
-            return;
+            return Ok(());
         };
         let total = allocator.snapshot().total;
         let mut candidates = Vec::with_capacity(total);
-        if allocator
-            .reclaim_candidates(&mut candidates, total)
-            .is_err()
-        {
-            return;
-        }
+        allocator.reclaim_candidates(&mut candidates, total)?;
         for mapping in mappings {
             if let Some(candidate) = candidates
                 .iter()
                 .find(|candidate| mapping.token.matches_candidate(candidate))
             {
-                if let Ok(token) = allocator.begin_reclaim(candidate) {
-                    let _ = allocator.retire_reclaim(&token);
-                }
+                let token = allocator.begin_reclaim(candidate)?;
+                allocator.retire_reclaim(&token)?;
             }
         }
+        Ok(())
     }
 
     pub(crate) fn dax_cancel_reclaim(
@@ -1153,13 +1208,21 @@ impl FuseNode {
         self.cached_metadata.lock().as_ref().map(|md| md.file_type)
     }
 
-    pub fn set_cached_metadata_with_valid(&self, md: Metadata, valid: u64, valid_nsec: u32) {
+    pub fn set_cached_metadata_with_valid(
+        &self,
+        md: Metadata,
+        valid: u64,
+        valid_nsec: u32,
+        attr_flags: u32,
+    ) {
+        let md = self.metadata_with_dax_state(md);
         let mut metadata = self.cached_metadata.lock();
         *metadata = Some(md);
         self.bump_attr_version();
         drop(metadata);
         self.cached_metadata_deadline_ns
             .store(Self::cache_deadline(valid, valid_nsec), Ordering::Relaxed);
+        self.note_dax_attr_change(attr_flags);
     }
 
     /// Install an unsolicited/lookup/getattr daemon attribute snapshot.
@@ -1171,7 +1234,9 @@ impl FuseNode {
         valid: u64,
         valid_nsec: u32,
         request_epoch: u64,
+        attr_flags: u32,
     ) -> Metadata {
+        md = self.metadata_with_dax_state(md);
         let mut metadata = self.cached_metadata.lock();
         let stale_reply = self.attr_version() > request_epoch;
         if stale_reply {
@@ -1201,6 +1266,9 @@ impl FuseNode {
             },
             Ordering::Relaxed,
         );
+        if !stale_reply {
+            self.note_dax_attr_change(attr_flags);
+        }
         md
     }
 
@@ -1399,6 +1467,7 @@ impl FuseNode {
             out.attr_valid,
             out.attr_valid_nsec,
             request_epoch,
+            out.attr.flags,
         ))
     }
 
@@ -1416,17 +1485,38 @@ impl FuseNode {
 
 impl Drop for FuseNode {
     fn drop(&mut self) {
-        if let Err(error) = self.dax_teardown() {
-            log::warn!(
-                "fuse: inode {} dropped with DAX teardown error: {:?}",
-                self.nodeid,
-                error
-            );
-            // The daemon did not confirm removal. Revoke local PTEs/tree and
-            // retire the ranges so no future inode can observe an alias.
-            self.dax_abandon_mappings();
+        if self.dax_active() {
+            let revoke = if self.conn.dax_admission_state() == DaxAdmissionState::Active {
+                match self.dax_teardown() {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        log::warn!(
+                            "fuse: inode {} dropped with DAX teardown error: {:?}",
+                            self.nodeid,
+                            error
+                        );
+                        // The daemon did not confirm removal. Revoke local
+                        // PTEs/tree and retire the ranges before unregistering.
+                        self.dax_abandon_mappings()
+                    }
+                }
+            } else {
+                self.dax_disconnect_revoke()
+            };
+            if let Err(ref error) = revoke {
+                log::warn!(
+                    "fuse: inode {} dropped with local DAX revoke error: {:?}",
+                    self.nodeid,
+                    error
+                );
+            }
+            if self.conn.dax_admission_state() != DaxAdmissionState::Active || revoke.is_err() {
+                self.conn
+                    .finish_dax_node_drop(self.dax_mapping_owner(), revoke);
+            } else {
+                self.conn.unregister_dax_node(self.dax_mapping_owner());
+            }
         }
-        self.conn.unregister_dax_node(self.dax_mapping_owner());
         self.clear_lookup_cache_tree();
         self.flush_forget();
         self.clear_parent();

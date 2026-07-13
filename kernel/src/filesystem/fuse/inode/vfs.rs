@@ -90,7 +90,7 @@ impl IndexNode for FuseNode {
         };
 
         if (fopen_flags & FOPEN_DIRECT_IO) != 0
-            && !self.conn().dax_enabled()
+            && !self.dax_active()
             && vm_flags.contains(crate::mm::VmFlags::VM_MAYSHARE)
         {
             return Err(SystemError::ENODEV);
@@ -104,7 +104,7 @@ impl IndexNode for FuseNode {
         _file: &Arc<crate::filesystem::vfs::file::File>,
         vm_flags: crate::mm::VmFlags,
     ) -> Result<crate::mm::VmFlags, SystemError> {
-        if self.conn().dax_enabled() {
+        if self.dax_active() {
             Ok(vm_flags | crate::mm::VmFlags::VM_MIXEDMAP)
         } else {
             Ok(vm_flags)
@@ -133,7 +133,7 @@ impl IndexNode for FuseNode {
             p.fopen_flags
         };
 
-        if (fopen_flags & FOPEN_DIRECT_IO) != 0 && !self.conn().dax_enabled() {
+        if (fopen_flags & FOPEN_DIRECT_IO) != 0 && !self.dax_active() {
             if vm_flags.contains(crate::mm::VmFlags::VM_MAYSHARE) {
                 return Err(SystemError::ENODEV);
             }
@@ -371,7 +371,7 @@ impl IndexNode for FuseNode {
         let file_flags = private_data.open_flags;
         let fopen_flags = private_data.fopen_flags;
 
-        if self.conn().dax_enabled() {
+        if self.dax_active() {
             loop {
                 match self.dax_read(offset, &mut buf[..len]) {
                     Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
@@ -417,7 +417,7 @@ impl IndexNode for FuseNode {
         let fh = private_data.fh;
         let file_flags = private_data.open_flags;
         let fopen_flags = private_data.fopen_flags;
-        if self.conn().dax_enabled() {
+        if self.dax_active() {
             let lock_owner = crate::filesystem::vfs::vcore::current_file_lock_owner_id();
             loop {
                 match self.dax_write_or_fuse_locked(offset, &buf[..len], &private_data, lock_owner)
@@ -576,7 +576,7 @@ impl IndexNode for FuseNode {
         if writeback_cache {
             self.sync_dirty_cached_pages()?;
         }
-        let _barrier = if self.conn().dax_enabled() && metadata.size != old.size {
+        let _barrier = if self.dax_active() && metadata.size != old.size {
             Some(if metadata.size < old.size {
                 self.dax_layout_write_for_truncate(metadata.size.max(0) as usize)?
             } else {
@@ -641,7 +641,12 @@ impl IndexNode for FuseNode {
         let out: FuseAttrOut = fuse_read_struct(&payload)?;
         let md = Self::attr_to_metadata(&out.attr);
         let new_size = md.size.max(0) as usize;
-        self.set_cached_metadata_with_valid(md, out.attr_valid, out.attr_valid_nsec);
+        self.set_cached_metadata_with_valid(
+            md,
+            out.attr_valid,
+            out.attr_valid_nsec,
+            out.attr.flags,
+        );
         if (valid & FATTR_SIZE) != 0 {
             self.truncate_page_cache(new_size)?;
         }
@@ -754,7 +759,7 @@ impl IndexNode for FuseNode {
         if changes_contents {
             self.sync_dirty_cached_pages()?;
         }
-        let block_faults = self.conn().dax_enabled() && (!keep_size || changes_contents);
+        let block_faults = self.dax_active() && (!keep_size || changes_contents);
         let _barrier = if block_faults {
             self.dax_layout_write_for_all()?
         } else {
@@ -1005,6 +1010,7 @@ impl IndexNode for FuseNode {
                 Some(md.clone()),
                 Some(entry.generation),
                 1,
+                entry.attr.flags,
             )?;
             consumed = true;
             Ok(child)
@@ -1019,14 +1025,13 @@ impl IndexNode for FuseNode {
             }
         };
         child.set_dname(name);
-        child
-            .lookup_attr_flags
-            .store(entry.attr.flags, Ordering::Relaxed);
+        child.set_lookup_attr_flags(entry.attr.flags);
         child.merge_cached_metadata_from_daemon(
             md,
             entry.attr_valid,
             entry.attr_valid_nsec,
             request_epoch,
+            entry.attr.flags,
         );
         self.cache_lookup_child(
             name,
@@ -1174,13 +1179,16 @@ impl IndexNode for FuseNode {
                 Some(md.clone()),
                 Some(entry.generation),
                 1,
+                entry.attr.flags,
             )?;
             consumed = true;
+            child.set_lookup_attr_flags(entry.attr.flags);
             child.merge_cached_metadata_from_daemon(
                 md,
                 entry.attr_valid,
                 entry.attr_valid_nsec,
                 request_epoch,
+                entry.attr.flags,
             );
             Ok(())
         })();

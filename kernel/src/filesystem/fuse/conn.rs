@@ -1076,7 +1076,10 @@ impl FuseConn {
                     continue;
                 };
                 match node.dax_reclaim_candidate(candidate) {
-                    Ok(()) => return Ok(()),
+                    Ok(()) => {
+                        stats::on_virtiofs_dax_pressure_reclaim();
+                        return Ok(());
+                    }
                     Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => continue,
                     Err(error) => return Err(error),
                 }

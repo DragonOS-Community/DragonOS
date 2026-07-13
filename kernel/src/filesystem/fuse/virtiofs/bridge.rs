@@ -1785,6 +1785,7 @@ impl VirtioFsBridgeContext {
     }
 
     fn finish(&mut self) -> bool {
+        let had_dax = self.conn.dax_allocator().is_some();
         if self.irq_wake_enabled {
             self.instance.disable_irq_wake();
         }
@@ -1829,6 +1830,9 @@ impl VirtioFsBridgeContext {
                 );
             }
             return false;
+        }
+        if had_dax {
+            stats::on_virtiofs_dax_device_reset();
         }
         self.fail_all_unfinished(SystemError::ENOTCONN);
 

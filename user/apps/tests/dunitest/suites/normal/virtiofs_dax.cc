@@ -14,6 +14,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -22,10 +23,17 @@ namespace {
 constexpr size_t kPageSize = 4096;
 constexpr off_t kDaxRangeSize = 2 * 1024 * 1024;
 constexpr unsigned kWaitIterations = 150;
+constexpr unsigned long kMaxPressureRanges = 4096;
 
 bool dax_required() {
     const char* value = getenv("DRAGONOS_VIRTIOFS_DAX_REQUIRED");
-    return value != nullptr && strcmp(value, "1") == 0;
+    if (value == nullptr) {
+        return false;
+    }
+    return strcmp(value, "1") == 0 || strcmp(value, "y") == 0 || strcmp(value, "Y") == 0 ||
+           strcmp(value, "yes") == 0 || strcmp(value, "YES") == 0 ||
+           strcmp(value, "true") == 0 || strcmp(value, "TRUE") == 0 ||
+           strcmp(value, "on") == 0 || strcmp(value, "ON") == 0;
 }
 
 int ensure_dir(const char* path) {
@@ -71,11 +79,27 @@ long long parse_counter(const std::string& stats, unsigned opcode) {
     return end == stats.c_str() + pos ? -1 : value;
 }
 
+long long parse_named_counter(const std::string& stats, const char* name) {
+    std::string field = std::string(name) + " ";
+    size_t pos = stats.find(field);
+    if (pos == std::string::npos) {
+        return -1;
+    }
+    pos += field.size();
+    char* end = nullptr;
+    long long value = strtoll(stats.c_str() + pos, &end, 10);
+    return end == stats.c_str() + pos ? -1 : value;
+}
+
 struct OpcodeSnapshot {
     long long read = -1;
     long long write = -1;
     long long setup_mapping = -1;
     long long remove_mapping = -1;
+    long long mapping_created = -1;
+    long long mapping_removed = -1;
+    long long pressure_reclaims = -1;
+    long long device_resets = -1;
 };
 
 OpcodeSnapshot snapshot(const char* stats_path) {
@@ -85,6 +109,10 @@ OpcodeSnapshot snapshot(const char* stats_path) {
     result.write = parse_counter(contents, 16);
     result.setup_mapping = parse_counter(contents, 48);
     result.remove_mapping = parse_counter(contents, 49);
+    result.mapping_created = parse_named_counter(contents, "dax_mapping_created_total");
+    result.mapping_removed = parse_named_counter(contents, "dax_mapping_removed_total");
+    result.pressure_reclaims = parse_named_counter(contents, "dax_pressure_reclaims_total");
+    result.device_resets = parse_named_counter(contents, "dax_device_resets_total");
     return result;
 }
 
@@ -93,6 +121,10 @@ void assert_valid_snapshot(const OpcodeSnapshot& value) {
     ASSERT_GE(value.write, 0);
     ASSERT_GE(value.setup_mapping, 0);
     ASSERT_GE(value.remove_mapping, 0);
+    ASSERT_GE(value.mapping_created, 0);
+    ASSERT_GE(value.mapping_removed, 0);
+    ASSERT_GE(value.pressure_reclaims, 0);
+    ASSERT_GE(value.device_resets, 0);
 }
 
 void expect_dax_data_path(const OpcodeSnapshot& before, const OpcodeSnapshot& after,
@@ -102,6 +134,18 @@ void expect_dax_data_path(const OpcodeSnapshot& before, const OpcodeSnapshot& af
     EXPECT_GE(after.setup_mapping - before.setup_mapping, minimum_setups);
     EXPECT_EQ(before.read, after.read);
     EXPECT_EQ(before.write, after.write);
+}
+
+OpcodeSnapshot wait_for_dax_reset(const char* stats_path, long long before) {
+    OpcodeSnapshot current;
+    for (unsigned i = 0; i < kWaitIterations; ++i) {
+        current = snapshot(stats_path);
+        if (current.device_resets > before) {
+            break;
+        }
+        usleep(100000);
+    }
+    return current;
 }
 
 uint8_t pattern_byte(off_t offset) {
@@ -154,8 +198,8 @@ bool write_pressure_file(const char* path, off_t size, unsigned long ranges) {
     return ok;
 }
 
-bool wait_for_child(pid_t child, int* status) {
-    for (unsigned i = 0; i < kWaitIterations; ++i) {
+bool wait_for_child(pid_t child, int* status, unsigned iterations = kWaitIterations) {
+    for (unsigned i = 0; i < iterations; ++i) {
         pid_t result = waitpid(child, status, WNOHANG);
         if (result == child) {
             return true;
@@ -358,6 +402,11 @@ TEST(VirtioFsDax, IoMmapPermissionsEofAndTeardown) {
                      << " (" << strerror(error) << ")";
     }
 
+    // The stats file is global. This test runs with an exclusive virtiofs
+    // connection and takes the baseline before creating the first DAX mapping.
+    OpcodeSnapshot lifecycle_before = snapshot(paths.stats);
+    assert_valid_snapshot(lifecycle_before);
+
     int fd = open(paths.file, O_RDWR);
     ASSERT_GE(fd, 0) << strerror(errno);
 
@@ -473,10 +522,18 @@ TEST(VirtioFsDax, IoMmapPermissionsEofAndTeardown) {
     ASSERT_EQ(0, close(fd));
     OpcodeSnapshot before_umount = snapshot(paths.stats);
     ASSERT_EQ(0, umount(paths.mountpoint)) << strerror(errno);
-    OpcodeSnapshot after_umount = snapshot(paths.stats);
+    OpcodeSnapshot after_umount =
+        wait_for_dax_reset(paths.stats, lifecycle_before.device_resets);
     assert_valid_snapshot(before_umount);
     assert_valid_snapshot(after_umount);
     EXPECT_GT(after_umount.remove_mapping, before_umount.remove_mapping);
+    EXPECT_GT(after_umount.setup_mapping, lifecycle_before.setup_mapping);
+    EXPECT_GT(after_umount.remove_mapping, lifecycle_before.remove_mapping);
+    long long created = after_umount.mapping_created - lifecycle_before.mapping_created;
+    long long removed = after_umount.mapping_removed - lifecycle_before.mapping_removed;
+    EXPECT_GT(created, 0);
+    EXPECT_EQ(created, removed);
+    EXPECT_GT(after_umount.device_resets, lifecycle_before.device_resets);
 
     ASSERT_TRUE(mount_virtiofs(paths.mountpoint, "never", &error)) << strerror(error);
     fd = open(paths.file, O_RDONLY);
@@ -823,11 +880,22 @@ TEST(VirtioFsDax, FaultRangePressureCompletesWithoutDeadlock) {
         GTEST_SKIP() << "set DRAGONOS_VIRTIOFS_DAX_WINDOW_RANGES to the runner's DAX window size";
     }
     char* end = nullptr;
+    errno = 0;
     unsigned long ranges = strtoul(ranges_text, &end, 10);
+    ASSERT_EQ(0, errno);
     ASSERT_NE(ranges_text, end);
     ASSERT_EQ('\0', *end);
     ASSERT_GE(ranges, 1UL);
-    ASSERT_LE(ranges, 128UL);
+    const unsigned long max_ranges = static_cast<unsigned long>(
+        (std::numeric_limits<off_t>::max() - kPageSize) / kDaxRangeSize - 1);
+    ASSERT_LE(ranges, max_ranges);
+    if (ranges > kMaxPressureRanges) {
+        if (dax_required()) {
+            FAIL() << "required DAX correctness profile supports at most " << kMaxPressureRanges
+                   << " ranges";
+        }
+        GTEST_SKIP() << "DAX pressure profile is bounded to " << kMaxPressureRanges << " ranges";
+    }
 
     TestPaths paths("pressure");
     ASSERT_TRUE(paths.create());
@@ -885,7 +953,13 @@ TEST(VirtioFsDax, FaultRangePressureCompletesWithoutDeadlock) {
     }
 
     int status = 0;
-    ASSERT_TRUE(wait_for_child(child, &status)) << "DAX range-pressure fault path deadlocked";
+    unsigned long extra_iterations = ranges / 8;
+    unsigned wait_iterations = extra_iterations > std::numeric_limits<unsigned>::max() -
+                                                      kWaitIterations
+                                   ? std::numeric_limits<unsigned>::max()
+                                   : kWaitIterations + static_cast<unsigned>(extra_iterations);
+    ASSERT_TRUE(wait_for_child(child, &status, wait_iterations))
+        << "DAX range-pressure fault path deadlocked";
     ASSERT_TRUE(WIFEXITED(status)) << "pressure child status=" << status;
     ASSERT_EQ(0, WEXITSTATUS(status));
     OpcodeSnapshot after = snapshot(paths.stats);
@@ -893,6 +967,7 @@ TEST(VirtioFsDax, FaultRangePressureCompletesWithoutDeadlock) {
     assert_valid_snapshot(after);
     EXPECT_GE(after.setup_mapping - before.setup_mapping, static_cast<long long>(ranges + 1));
     EXPECT_GT(after.remove_mapping, before.remove_mapping);
+    EXPECT_GT(after.pressure_reclaims, before.pressure_reclaims);
     EXPECT_EQ(before.read, after.read);
 
     ASSERT_EQ(0, umount(paths.mountpoint));

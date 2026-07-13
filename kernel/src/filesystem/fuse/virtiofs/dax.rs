@@ -16,6 +16,7 @@ use crate::{
             FUSE_REMOVEMAPPING, FUSE_SETUPMAPPING, FUSE_SETUPMAPPING_FLAG_READ,
             FUSE_SETUPMAPPING_FLAG_WRITE,
         },
+        stats,
     },
     libs::{spinlock::SpinLock, wait_queue::WaitQueue},
     mm::MemoryManagementArch,
@@ -854,7 +855,10 @@ impl FuseConn {
     ) -> Result<OwnedToken, SystemError> {
         match outcome {
             FuseDaxRequestOutcome::Success => match allocator.assign_owner(reservation, owner) {
-                Ok(owned) => Ok(owned),
+                Ok(owned) => {
+                    stats::on_virtiofs_dax_mapping_created();
+                    Ok(owned)
+                }
                 Err(error) => {
                     let _ = allocator.retire_reservation(reservation);
                     Err(error)
@@ -1000,6 +1004,7 @@ impl FuseConn {
                 FuseDaxRequestOutcome::Success => {
                     for token in batch {
                         allocator.finish_reclaim(token)?;
+                        stats::on_virtiofs_dax_mapping_removed();
                     }
                 }
                 FuseDaxRequestOutcome::NeverSubmitted(error) => {

@@ -1,3 +1,7 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <gtest/gtest.h>
 
 #include <dirent.h>
@@ -11,6 +15,7 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -202,13 +207,17 @@ public:
         remove_recursive(root);
     }
 
-    bool setup() {
+    bool prepare() {
         if (mkdir(root.c_str(), 0755) != 0 || mkdir(upper.c_str(), 0755) != 0
             || mkdir(lower.c_str(), 0755) != 0 || mkdir(work.c_str(), 0755) != 0
             || mkdir(merged.c_str(), 0755) != 0) {
             return false;
         }
 
+        return true;
+    }
+
+    bool mount_overlay() {
         std::string options =
             "lowerdir=" + lower + ",upperdir=" + upper + ",workdir=" + work;
         if (mount("overlay", merged.c_str(), "overlay", 0, options.c_str()) != 0) {
@@ -216,6 +225,10 @@ public:
         }
         mounted = true;
         return true;
+    }
+
+    bool setup() {
+        return prepare() && mount_overlay();
     }
 
     std::string root;
@@ -434,6 +447,81 @@ TEST(OverlayFsAppend, HardlinksShareAtomicAppendDomain) {
     }
     EXPECT_EQ(expected_records(kWriters, kRecordsPerWriter), records);
     EXPECT_EQ(content, read_file(alias));
+}
+
+TEST(OverlayFsAppend, LowerHardlinkCopyUpKeepsRwfAppendAtomic) {
+    constexpr int kWriters = 4;
+    constexpr int kRecordsPerWriter = 64;
+
+    OverlayAppendEnv env("overlay_append_copyup_rwf");
+    ASSERT_TRUE(env.prepare()) << strerror(errno);
+    const std::string lower_file = join_path(env.lower, "records");
+    const std::string lower_alias = join_path(env.lower, "records_alias");
+    int initial = open(lower_file.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    ASSERT_GE(initial, 0) << strerror(errno);
+    ASSERT_EQ(0, close(initial)) << strerror(errno);
+    // A multiply-linked lower inode cannot use the origin xattr identity.
+    // The first writable open therefore changes stat identity during copy-up.
+    ASSERT_EQ(0, link(lower_file.c_str(), lower_alias.c_str())) << strerror(errno);
+    ASSERT_TRUE(env.mount_overlay()) << strerror(errno);
+
+    const std::string path = join_path(env.merged, "records");
+    std::array<int, kWriters> append_fds = {-1, -1};
+    // fd 0 opens the lower inode and triggers copy-up; later opens observe the
+    // resulting upper inode. None carries O_APPEND, so only RWF_APPEND supplies
+    // append semantics and no backing-file append lock can mask a split
+    // overlay lock domain.
+    for (int& fd : append_fds) {
+        fd = open(path.c_str(), O_WRONLY);
+        ASSERT_GE(fd, 0) << strerror(errno);
+    }
+
+    int start_pipe[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(start_pipe)) << strerror(errno);
+    std::vector<pid_t> children;
+    for (int writer = 0; writer < kWriters; ++writer) {
+        pid_t child = fork();
+        ASSERT_GE(child, 0) << strerror(errno);
+        if (child == 0) {
+            close(start_pipe[1]);
+            char token = 0;
+            if (read(start_pipe[0], &token, 1) != 1) {
+                _exit(10);
+            }
+            close(start_pipe[0]);
+            for (int sequence = 0; sequence < kRecordsPerWriter; ++sequence) {
+                sched_yield();
+                const auto record = make_record(writer, sequence);
+                iovec iov = {
+                    .iov_base = const_cast<char*>(record.data()),
+                    .iov_len = record.size(),
+                };
+                if (pwritev2(append_fds[writer], &iov, 1, 0, RWF_APPEND)
+                    != static_cast<ssize_t>(record.size())) {
+                    _exit(11);
+                }
+            }
+            _exit(0);
+        }
+        children.push_back(child);
+    }
+
+    close(start_pipe[0]);
+    std::array<char, kWriters> tokens = {};
+    ASSERT_TRUE(write_all(start_pipe[1], tokens.data(), tokens.size()));
+    close(start_pipe[1]);
+    ASSERT_TRUE(wait_for_children_bounded(children));
+    for (int fd : append_fds) {
+        ASSERT_EQ(0, close(fd)) << strerror(errno);
+    }
+
+    const std::string content = read_file(path);
+    ASSERT_EQ(static_cast<size_t>(kWriters * kRecordsPerWriter) * kRecordSize, content.size());
+    std::set<std::string> records;
+    for (size_t offset = 0; offset < content.size(); offset += kRecordSize) {
+        records.insert(content.substr(offset, kRecordSize));
+    }
+    EXPECT_EQ(expected_records(kWriters, kRecordsPerWriter), records);
 }
 
 TEST(AppendLockCapability, EventFdIgnoresAppendFilePosition) {

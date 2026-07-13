@@ -303,6 +303,18 @@ impl FileSystem for Ext4FileSystem {
 }
 
 impl Ext4FileSystem {
+    /// Complete an explicit fsync/fdatasync/O_SYNC durability boundary.
+    ///
+    /// Linux ext4 performs the nojournal barrier after data and metadata
+    /// writeback, rather than flushing every ordinary metadata transaction.
+    /// Read-only and `nobarrier` mounts do not issue a device flush.
+    pub(super) fn finish_sync_durability_boundary(&self) -> Result<(), SystemError> {
+        if self._mount_options.read_only || !self._mount_options.write_barrier {
+            return Ok(());
+        }
+        self.fs.flush_device().map_err(SystemError::from)
+    }
+
     pub(super) fn schedule_inode_eviction(
         self: &Arc<Self>,
         inode: Arc<LockedExt4Inode>,

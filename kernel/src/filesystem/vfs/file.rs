@@ -84,22 +84,33 @@ fn canonical_inode_for_file_lock(mut inode: Arc<dyn IndexNode>) -> Arc<dyn Index
     }
 }
 
-/// Cached append-lock identity and the owner that keeps its allocation
-/// identity alive. Keeping these fields together prevents callers from
-/// copying a raw filesystem address without also retaining the filesystem.
+/// Append-lock domain and the owner that keeps its allocation identity alive.
+///
+/// The inode part of the key is deliberately derived from current metadata at
+/// write time. A stacked filesystem may change backing identity during open
+/// (for example, overlayfs copy-up), so caching the complete key here can split
+/// concurrent appenders across two locks.
 #[derive(Clone, Debug)]
-struct AppendLockIdentity {
-    key: AppendLockKey,
-    _fs_owner: Arc<dyn FileSystem>,
+struct AppendLockDomain {
+    fs_instance: usize,
+    fs_owner: Arc<dyn FileSystem>,
 }
 
-impl AppendLockIdentity {
-    fn new(fs_owner: Arc<dyn FileSystem>, metadata: &Metadata) -> Self {
+impl AppendLockDomain {
+    fn new(fs_owner: Arc<dyn FileSystem>) -> Self {
         let fs_instance = Arc::as_ptr(&fs_owner) as *const () as usize;
         Self {
-            key: AppendLockKey::new(fs_instance, metadata.dev_id, metadata.inode_id),
-            _fs_owner: fs_owner,
+            fs_instance,
+            fs_owner,
         }
+    }
+
+    fn key(&self, metadata: &Metadata) -> AppendLockKey {
+        debug_assert_eq!(
+            self.fs_instance,
+            Arc::as_ptr(&self.fs_owner) as *const () as usize
+        );
+        AppendLockKey::new(self.fs_instance, metadata.dev_id, metadata.inode_id)
     }
 }
 
@@ -538,9 +549,10 @@ pub struct File {
     /// Stable key for POSIX record locks. Cached at open time to avoid metadata fetch
     /// in close/drop_fd path (which can deadlock with user-space FUSE daemon).
     posix_lock_key: (usize, InodeId),
-    /// Stable internal identity for serializing atomic append operations.
-    /// Only regular, non-O_PATH files retain one.
-    append_lock_identity: Option<AppendLockIdentity>,
+    /// Internal filesystem domain for serializing atomic append operations.
+    /// Only regular, non-O_PATH files retain one; the inode key is resolved
+    /// from current metadata when an append starts.
+    append_lock_domain: Option<AppendLockDomain>,
     /// 预读状态
     ra_state: Mutex<FileReadaheadState>,
     /// 当前 open file description 已观测到的 page cache 写回错误序列。
@@ -877,10 +889,8 @@ impl File {
             canonical_inode.metadata()?
         };
         let posix_lock_key = (canonical_metadata.dev_id, canonical_metadata.inode_id);
-        let append_lock_identity = if file_type == FileType::File && !is_path {
-            canonical_inode
-                .append_lock_fs()
-                .map(|fs| AppendLockIdentity::new(fs, &canonical_metadata))
+        let append_lock_domain = if file_type == FileType::File && !is_path {
+            canonical_inode.append_lock_fs().map(AppendLockDomain::new)
         } else {
             None
         };
@@ -959,7 +969,7 @@ impl File {
             cred: ProcessManager::current_pcb().cred(),
             owner: Mutex::new(FileOwner::new()),
             posix_lock_key,
-            append_lock_identity,
+            append_lock_domain,
             ra_state: Mutex::new(FileReadaheadState::new()),
             wb_error_seq: Mutex::new(wb_error_seq),
             sb_error_seq: Mutex::new(sb_error_seq),
@@ -1281,8 +1291,8 @@ impl File {
                     },
                 )
             };
-            return match self.append_lock_identity.as_ref() {
-                Some(identity) => with_inode_append_lock(identity.key, append_write),
+            return match self.append_lock_domain.as_ref() {
+                Some(domain) => with_inode_append_lock(domain.key(&md), append_write),
                 None => append_write(),
             };
         }
@@ -1350,8 +1360,8 @@ impl File {
                     },
                 )
             };
-            return match self.append_lock_identity.as_ref() {
-                Some(identity) => with_inode_append_lock(identity.key, append_write),
+            return match self.append_lock_domain.as_ref() {
+                Some(domain) => with_inode_append_lock(domain.key(&md), append_write),
                 None => append_write(),
             };
         }
@@ -1606,7 +1616,7 @@ impl File {
             cred: self.cred.clone(),
             owner: Mutex::new(FileOwner::new()),
             posix_lock_key: self.posix_lock_key,
-            append_lock_identity: self.append_lock_identity.clone(),
+            append_lock_domain: self.append_lock_domain.clone(),
             ra_state: Mutex::new(self.ra_state.lock().clone()),
             wb_error_seq: Mutex::new(*self.wb_error_seq.lock()),
             sb_error_seq: Mutex::new(*self.sb_error_seq.lock()),

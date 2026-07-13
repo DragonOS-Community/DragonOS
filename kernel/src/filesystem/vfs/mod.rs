@@ -673,6 +673,16 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
+    /// Incarnation paired with `inode_id` for VFS cache identity.
+    ///
+    /// Filesystems which can reuse inode numbers while old dentries are still
+    /// referenced (notably FUSE) must override this with an identity that
+    /// changes whenever a new in-memory inode replaces the old one. Filesystems
+    /// without such reuse may keep zero.
+    fn inode_generation(&self) -> u64 {
+        0
+    }
+
     /// @brief 设置inode的元数据
     ///
     /// @return 成功：Ok()
@@ -1863,10 +1873,8 @@ pub trait FileSystem: Any + Sync + Send + Debug {
         mount: &MountFS,
         out: &mut dyn Write,
     ) -> Result<(), SystemError> {
-        match mount.root_inner_inode().absolute_path() {
-            Ok(root) if !root.is_empty() => out.write_str(&root).map_err(|_| SystemError::EINVAL),
-            _ => out.write_char('/').map_err(|_| SystemError::EINVAL),
-        }
+        let root = mount.root_path()?;
+        out.write_str(&root).map_err(|_| SystemError::EINVAL)
     }
 
     /// Render fs-specific stats for `/proc/*/mountstats`.

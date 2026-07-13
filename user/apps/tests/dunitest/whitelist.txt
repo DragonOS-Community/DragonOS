@@ -19,6 +19,7 @@ normal/test_pivot_root
 normal/mount_reconfigure
 normal/mount_propagation
 normal/mount_move
+normal/mount_object_topology
 normal/overlayfs_semantics
 normal/overlayfs_mount_validation
 normal/test_fchown_o_path

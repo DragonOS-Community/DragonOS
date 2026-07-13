@@ -5,7 +5,7 @@ use system_error::SystemError;
 use crate::{
     filesystem::{
         procfs::{pid::ProcPidTarget, utils::proc_read},
-        vfs::FilePrivateData,
+        vfs::{mount::with_topology_snapshot, FilePrivateData},
     },
     libs::mutex::MutexGuard,
     process::ProcessControlBlock,
@@ -62,7 +62,7 @@ fn render_mount_file_for_task(
     target: &Arc<ProcessControlBlock>,
     kind: ProcMountRenderKind,
 ) -> Result<Vec<u8>, SystemError> {
-    let (entries, _root_path) = collect_visible_mounts(target)?;
+    let (entries, _root_path) = with_topology_snapshot(|| collect_visible_mounts(target))?;
     let mut rendered = String::new();
 
     for entry in &entries {

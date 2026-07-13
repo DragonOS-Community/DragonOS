@@ -7,10 +7,15 @@
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #ifndef CLONE_NEWNS
 #define CLONE_NEWNS 0x00020000
+#endif
+
+#ifndef CLONE_NEWUSER
+#define CLONE_NEWUSER 0x10000000
 #endif
 
 #ifndef MS_REC
@@ -102,6 +107,32 @@ int shared_group_id(const char* mount_point) {
     }
     fclose(fp);
     return result;
+}
+
+bool mount_source_at(const char* mount_point, const char* expected_source) {
+    FILE* fp = fopen("/proc/self/mountinfo", "r");
+    if (fp == nullptr) {
+        return false;
+    }
+
+    bool found = false;
+    char line[1024] = {};
+    while (fgets(line, sizeof(line), fp) != nullptr) {
+        char parsed_mount_point[256] = {};
+        if (sscanf(line, "%*s %*s %*s %*s %255s", parsed_mount_point) != 1 ||
+            strcmp(parsed_mount_point, mount_point) != 0) {
+            continue;
+        }
+
+        char* separator = strstr(line, " - ");
+        char source[256] = {};
+        found = separator != nullptr &&
+                sscanf(separator + 3, "%*s %255s", source) == 1 &&
+                strcmp(source, expected_source) == 0;
+        break;
+    }
+    fclose(fp);
+    return found;
 }
 
 class MountPropagationTest : public ::testing::Test {
@@ -209,6 +240,54 @@ TEST_F(MountPropagationTest, GroupIdIsReusedOnlyAfterLastPeerLeaves) {
     best_effort_rmdir(master);
 }
 
+TEST_F(MountPropagationTest, PropagatedMountPreservesSourceMetadata) {
+    char base[160] = {};
+    char peer[160] = {};
+    char base_host[192] = {};
+    char peer_host[192] = {};
+    snprintf(base, sizeof(base), "%s/base", root_);
+    snprintf(peer, sizeof(peer), "%s/slave", root_);
+    snprintf(base_host, sizeof(base_host), "%s/host", base);
+    snprintf(peer_host, sizeof(peer_host), "%s/host", peer);
+
+    ASSERT_EQ(0, ensure_dir(base)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(peer)) << strerror(errno);
+    ASSERT_EQ(0, mount("", base, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(nullptr, base, nullptr, MS_SHARED, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(base, peer, nullptr, MS_BIND, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(base_host)) << strerror(errno);
+
+    ASSERT_EQ(0, mount("issue1978-source", base_host, "ramfs", 0, nullptr)) << strerror(errno);
+    EXPECT_TRUE(mount_source_at(base_host, "issue1978-source"));
+    EXPECT_TRUE(mount_source_at(peer_host, "issue1978-source"));
+
+    best_effort_umount(base_host);
+    best_effort_rmdir(base_host);
+    best_effort_umount(peer);
+    best_effort_rmdir(peer);
+    best_effort_umount(base);
+    best_effort_rmdir(base);
+}
+
+TEST_F(MountPropagationTest, CrossUserNamespaceCanMakeLockedRootPrivate) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) {
+            _exit(1);
+        }
+        if (mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) {
+            _exit(100 + errno);
+        }
+        _exit(0);
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
 TEST_F(MountPropagationTest, SlaveReceivesMasterPropagationOnly) {
     char base[160] = {};
     char slave[160] = {};
@@ -304,6 +383,47 @@ TEST_F(MountPropagationTest, SharedSlaveKeepsPeerPropagation) {
     best_effort_rmdir(slave_a);
     best_effort_umount(base);
     best_effort_rmdir(base);
+}
+
+TEST_F(MountPropagationTest, DeepSlaveUnmountFollowsImmediateMasterChain) {
+    char master[160] = {};
+    char middle[160] = {};
+    char leaf[160] = {};
+    char master_host[192] = {};
+    char middle_host[192] = {};
+    char leaf_host[192] = {};
+    snprintf(master, sizeof(master), "%s/base", root_);
+    snprintf(middle, sizeof(middle), "%s/slave_a", root_);
+    snprintf(leaf, sizeof(leaf), "%s/slave_b", root_);
+    snprintf(master_host, sizeof(master_host), "%s/host", master);
+    snprintf(middle_host, sizeof(middle_host), "%s/host", middle);
+    snprintf(leaf_host, sizeof(leaf_host), "%s/host", leaf);
+
+    ASSERT_EQ(0, ensure_dir(master)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(middle)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(leaf)) << strerror(errno);
+    ASSERT_EQ(0, mount("", master, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(nullptr, master, nullptr, MS_SHARED, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(master, middle, nullptr, MS_BIND, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(nullptr, middle, nullptr, MS_SLAVE, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(nullptr, middle, nullptr, MS_SHARED, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(middle, leaf, nullptr, MS_BIND, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(nullptr, leaf, nullptr, MS_SLAVE, nullptr)) << strerror(errno);
+
+    ASSERT_EQ(0, ensure_dir(master_host)) << strerror(errno);
+    ASSERT_EQ(0, mount("", master_host, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, create_marker(master_host, "chain_marker")) << strerror(errno);
+    ASSERT_TRUE(marker_exists(middle_host, "chain_marker"));
+    ASSERT_TRUE(marker_exists(leaf_host, "chain_marker"));
+
+    ASSERT_EQ(0, umount(master_host)) << strerror(errno);
+    EXPECT_FALSE(marker_exists(master_host, "chain_marker"));
+    EXPECT_FALSE(marker_exists(middle_host, "chain_marker"));
+    EXPECT_FALSE(marker_exists(leaf_host, "chain_marker"));
+
+    best_effort_umount(leaf);
+    best_effort_umount(middle);
+    best_effort_umount(master);
 }
 
 TEST_F(MountPropagationTest, BindSharedSourceIntoSharedTargetUpdatesPropagatedClone) {

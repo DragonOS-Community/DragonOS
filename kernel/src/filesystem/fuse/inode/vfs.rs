@@ -38,6 +38,10 @@ use super::super::{
 use super::FuseNode;
 
 impl IndexNode for FuseNode {
+    fn inode_generation(&self) -> u64 {
+        self.node_incarnation()
+    }
+
     fn append_lock_fs(&self) -> Option<Arc<dyn FileSystem>> {
         Some(self.fs())
     }

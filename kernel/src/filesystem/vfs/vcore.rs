@@ -134,7 +134,9 @@ fn migrate_virtual_filesystem(
 
     {
         let _topology = MOUNT_LIFECYCLE_LOCK.lock();
-        new_fs.activate();
+        new_fs
+            .activate()
+            .expect("the replacement root mount is published exactly once");
         current_mntns.force_change_root_mountfs(new_fs);
     }
 

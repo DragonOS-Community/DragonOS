@@ -244,7 +244,9 @@ TEST_F(MountMoveTest, MoveOntoMountedTargetBecomesTop) {
 
         EXPECT_TRUE(marker_exists(dst, "source_marker"));
         EXPECT_FALSE(marker_exists(dst, "target_marker"));
-        EXPECT_EQ(1, mountinfo_count_mountpoint(dst));
+        // Linux exposes both the covered target mount and the moved top mount
+        // as distinct mountinfo records at the same pathname.
+        EXPECT_EQ(2, mountinfo_count_mountpoint(dst));
 
         best_effort_umount(dst);
         EXPECT_TRUE(marker_exists(dst, "target_marker"));

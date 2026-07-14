@@ -1,11 +1,11 @@
 //! AF_PACKET sockets.
 
 mod binding;
+mod ring;
 mod rx;
 mod sockopt;
 mod tx;
 mod uapi;
-mod ring;
 
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
@@ -25,12 +25,12 @@ use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
 
 #[allow(unused_imports)]
+pub use ring::{PacketFakeFs, PacketRing, RingWriteResult, TpacketVersion};
+#[allow(unused_imports)]
 pub use uapi::{
     eth_protocol, packet_mreq_type, packet_option, PacketMreq, PacketType, SockAddrLl,
     TpacketAuxdata,
 };
-#[allow(unused_imports)]
-pub use ring::{PacketFakeFs, PacketRing, RingWriteResult, TpacketVersion};
 
 const DEFAULT_RX_BUFFER_SIZE: usize = 256 * 1024;
 const DEFAULT_TX_BUFFER_SIZE: usize = 256 * 1024;

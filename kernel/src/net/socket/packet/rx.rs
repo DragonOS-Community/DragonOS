@@ -80,7 +80,11 @@ impl PacketSocket {
             let visible_len = frame
                 .len()
                 .saturating_sub(if vlan.is_some() { 4 } else { 0 });
-            let start = if self.sock_type == PacketSocketType::Raw { 0 } else { 14 };
+            let start = if self.sock_type == PacketSocketType::Raw {
+                0
+            } else {
+                14
+            };
             let metadata = PacketMetadata {
                 src_mac: src,
                 dst_mac: dst,

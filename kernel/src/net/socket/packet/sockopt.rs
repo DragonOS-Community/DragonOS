@@ -8,11 +8,11 @@ use crate::net::socket::common::{
 };
 use crate::net::socket::{PSO, PSOL};
 
-use super::{packet_option, PacketSocket};
 use super::ring::PacketRing;
 use super::uapi::tpacket_version;
-use alloc::sync::Arc;
+use super::{packet_option, PacketSocket};
 use crate::libs::mutex::Mutex;
+use alloc::sync::Arc;
 
 impl PacketSocket {
     fn socket_timeout_ticks(&self, name: usize) -> Result<&AtomicU64, SystemError> {
@@ -122,8 +122,7 @@ impl PacketSocket {
                     let reserve = self.tp_reserve.load(Ordering::Relaxed) as usize;
                     let config =
                         super::ring::validate_ring_config(&req, version.hdrlen(), reserve)?;
-                    let (ring, _pc) =
-                        PacketRing::setup(config, version, self.sock_type, reserve)?;
+                    let (ring, _pc) = PacketRing::setup(config, version, self.sock_type, reserve)?;
                     *self.rx_ring.lock() = Some(Arc::new(Mutex::new(ring)));
                     Ok(())
                 }

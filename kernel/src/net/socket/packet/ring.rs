@@ -236,11 +236,7 @@ impl PacketRing {
     }
 
     /// Write one packet into the ring. Caller must hold the ring lock.
-    pub fn write_frame(
-        &mut self,
-        frame: &[u8],
-        meta: &PacketMetadata,
-    ) -> RingWriteResult {
+    pub fn write_frame(&mut self, frame: &[u8], meta: &PacketMetadata) -> RingWriteResult {
         let hdrlen = self.version.hdrlen();
         let is_vlan = meta.vlan_tpid != 0;
         let mac_len = if is_vlan { 18 } else { 14 };
@@ -392,7 +388,7 @@ impl PacketRing {
                     *(dst.add(20) as *mut u32) = tp_nsec; // tp_nsec
                     *(dst.add(24) as *mut u16) = meta.vlan_tci; // tp_vlan_tci
                     *(dst.add(26) as *mut u16) = meta.vlan_tpid; // tp_vlan_tpid
-                    // tp_padding stays zero
+                                                                 // tp_padding stays zero
                 }
             }
 
@@ -409,11 +405,7 @@ impl PacketRing {
             *(dst.add(sll_off + 8) as *mut u16) = 1u16.to_be(); // sll_hatype = ARPHRD_ETHER
             *(dst.add(sll_off + 10) as *mut u8) = meta.pkt_type as u8; // sll_pkttype
             *(dst.add(sll_off + 11) as *mut u8) = 6; // sll_halen
-            core::ptr::copy_nonoverlapping(
-                meta.src_mac.as_ptr(),
-                dst.add(sll_off + 12),
-                6,
-            );
+            core::ptr::copy_nonoverlapping(meta.src_mac.as_ptr(), dst.add(sll_off + 12), 6);
 
             // Copy packet data into the data region (starting at data_off).
             let data_dst = dst.add(data_off);
@@ -476,7 +468,9 @@ pub fn validate_ring_config(
     // Overflow guard: ensure block_nr * block_size does not overflow and is
     // non-zero. Done early (before frame_size checks) because subsequent
     // validation and the eventual allocation depend on the total ring size.
-    let total = block_nr.checked_mul(block_size).ok_or(SystemError::EINVAL)?;
+    let total = block_nr
+        .checked_mul(block_size)
+        .ok_or(SystemError::EINVAL)?;
     if total == 0 {
         return Err(SystemError::EINVAL);
     }

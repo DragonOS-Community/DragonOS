@@ -1596,18 +1596,6 @@ impl MountFS {
             .and_then(|stack| stack.last().cloned())
     }
 
-    /// Return the chronologically first direct child at this exact mountpoint.
-    ///
-    /// Linux `__lookup_mnt()` uses this ordering for propagation events.  It is
-    /// deliberately different from [`Self::lookup_top`], which follows the
-    /// currently visible mount while resolving a pathname through a stack.
-    pub(crate) fn lookup_first(&self, mountpoint: &Arc<MountFSInode>) -> Option<Arc<MountFS>> {
-        self.mountpoints
-            .lock()
-            .get(&mountpoint.dentry.id)
-            .and_then(|stack| stack.first().cloned())
-    }
-
     pub fn children_at(&self, mountpoint: &Arc<MountFSInode>) -> Vec<Arc<MountFS>> {
         self.mountpoints
             .lock()

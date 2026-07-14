@@ -741,7 +741,7 @@ pub(crate) fn propagate_umount_sources(
         if !target.parent.is_live()
             || target
                 .parent
-                .lookup_first(&target.mountpoint)
+                .lookup_top(&target.mountpoint)
                 .is_none_or(|candidate| !Arc::ptr_eq(&candidate, &target.child))
             || {
                 let actual = target
@@ -1039,7 +1039,11 @@ fn propagated_child_at(
     // Linux propagation is keyed only by `(parent mount, mountpoint dentry)`.
     // The child's propagation type may have changed independently after the
     // original mount event and therefore cannot be used as correspondence.
-    parent.lookup_first(mountpoint)
+    // Linux __lookup_mnt() returns the first mount-hash entry. New mounts are
+    // inserted at the hash head, so that entry is the visible topper. DragonOS
+    // stores stacks oldest-to-newest and therefore represents the same rule as
+    // Vec::last() through lookup_top().
+    parent.lookup_top(mountpoint)
 }
 
 /// Preflight the propagation set before ordinary umount mutates topology.

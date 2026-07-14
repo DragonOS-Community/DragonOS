@@ -461,8 +461,34 @@ fn test_propagated_umount_uses_exact_edge_after_child_becomes_private() {
     let _topology = MOUNT_LIFECYCLE_LOCK.lock();
     propagate_umount(&source_parent, &source_mp, &source_child, true).unwrap();
 
-    assert!(peer_parent.lookup_first(&peer_mp).is_none());
+    assert!(peer_parent.lookup_top(&peer_mp).is_none());
     assert!(!peer_child.is_live());
+}
+
+#[test]
+fn test_propagated_umount_removes_visible_shadow_stack_top() {
+    let (source_parent, peer_parent, source_mp, peer_mp, source_child, peer_lower) =
+        shared_umount_fixture();
+    let peer_top = new_test_mount(MountPropagation::new_private());
+    peer_top.set_self_mountpoint(Some(peer_mp.clone()));
+    peer_parent.attach_top(&peer_mp, peer_top.clone()).unwrap();
+
+    let initial_stack = peer_parent.children_at(&peer_mp);
+    assert_eq!(initial_stack.len(), 2);
+    assert!(Arc::ptr_eq(&initial_stack[0], &peer_lower));
+    assert!(Arc::ptr_eq(&initial_stack[1], &peer_top));
+
+    let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+    propagate_umount(&source_parent, &source_mp, &source_child, false).unwrap();
+
+    let remaining_stack = peer_parent.children_at(&peer_mp);
+    assert_eq!(remaining_stack.len(), 1);
+    assert!(Arc::ptr_eq(&remaining_stack[0], &peer_lower));
+    assert!(peer_parent
+        .lookup_top(&peer_mp)
+        .is_some_and(|mount| Arc::ptr_eq(&mount, &peer_lower)));
+    assert!(peer_lower.is_live());
+    assert!(!peer_top.is_live());
 }
 
 #[test]
@@ -483,7 +509,7 @@ fn test_propagated_umount_retains_target_with_nonroot_child() {
     propagate_umount(&source_parent, &source_mp, &source_child, false).unwrap();
 
     assert!(peer_parent
-        .lookup_first(&peer_mp)
+        .lookup_top(&peer_mp)
         .is_some_and(|mount| Arc::ptr_eq(&mount, &peer_child)));
     assert!(peer_child
         .lookup_top(&nonroot)
@@ -561,7 +587,7 @@ fn test_propagated_lazy_umount_advances_from_descendant_to_parent() {
     let _topology = MOUNT_LIFECYCLE_LOCK.lock();
     propagate_umount_sources(&[source_grandchild, source_child], true).unwrap();
 
-    assert!(peer_parent.lookup_first(&peer_mp).is_none());
+    assert!(peer_parent.lookup_top(&peer_mp).is_none());
     assert!(!peer_child.is_live());
     assert!(!peer_grandchild.is_live());
 }
@@ -596,7 +622,7 @@ fn test_propagated_umount_does_not_restore_selected_root_child() {
     let _topology = MOUNT_LIFECYCLE_LOCK.lock();
     propagate_umount_sources(&[source_topper, source_child], true).unwrap();
 
-    assert!(peer_parent.lookup_first(&peer_mp).is_none());
+    assert!(peer_parent.lookup_top(&peer_mp).is_none());
     assert!(!peer_child.is_live());
     assert!(!peer_topper.is_live());
 }
@@ -679,9 +705,9 @@ fn test_propagated_lazy_umount_keeps_locked_child_connected() {
     let _topology = MOUNT_LIFECYCLE_LOCK.lock();
     propagate_umount_sources(&[source_grandchild, source_child], true).unwrap();
 
-    assert!(peer_parent.lookup_first(&peer_mp).is_none());
+    assert!(peer_parent.lookup_top(&peer_mp).is_none());
     assert!(peer_child
-        .lookup_first(&peer_nested)
+        .lookup_top(&peer_nested)
         .is_some_and(|mount| Arc::ptr_eq(&mount, &peer_grandchild)));
     assert!(Arc::ptr_eq(
         &peer_grandchild.parent_mount().unwrap(),

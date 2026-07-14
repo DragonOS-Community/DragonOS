@@ -742,6 +742,7 @@ struct fuse_daemon_args {
     volatile uint32_t *fsync_count;
     volatile uint32_t *fsyncdir_count;
     volatile uint32_t *create_count;
+    volatile uint32_t *mknod_count;
     volatile uint32_t *rename2_count;
     volatile uint32_t *open_count;
     volatile uint32_t *opendir_count;
@@ -766,8 +767,10 @@ struct fuse_daemon_args {
     volatile uint32_t *read_count;
     volatile uint32_t *write_count;
     volatile uint32_t *last_open_in_flags;
+    volatile uint32_t *last_create_in_flags;
     volatile uint32_t *last_release_in_flags;
     volatile uint64_t *last_open_fh;
+    volatile uint64_t *last_flush_fh;
     volatile uint32_t *last_open_pid;
     volatile uint64_t *last_read_fh;
     volatile uint32_t *last_read_size;
@@ -816,6 +819,8 @@ struct fuse_daemon_args {
     uint64_t next_open_fh;
     uint64_t create_reuse_nodeid;
     uint64_t create_generation_override;
+    uint64_t create_open_fh_override;
+    uint32_t create_reply_mode_override;
     uint64_t link_generation_override;
     uint64_t hello_generation_override;
     const char *readdirplus_invalid_attr_name;
@@ -825,6 +830,7 @@ struct fuse_daemon_args {
     int allow_rename_replace;
     int has_hello_open_fh_override;
     int force_open_enosys;
+    int force_create_errno;
     int force_opendir_enosys;
     int force_flush_errno;
     int force_fsync_errno;
@@ -1441,9 +1447,16 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         }
         return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
     }
-    case FUSE_FLUSH:
+    case FUSE_FLUSH: {
+        if (payload_len < sizeof(struct fuse_flush_in)) {
+            return -1;
+        }
+        const struct fuse_flush_in *in = (const struct fuse_flush_in *)payload;
         if (a->flush_count) {
             (*a->flush_count)++;
+        }
+        if (a->last_flush_fh) {
+            *a->last_flush_fh = in->fh;
         }
         if (a->last_flush_uid) {
             *a->last_flush_uid = h->uid;
@@ -1458,6 +1471,7 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
             return fuse_write_reply(a->fd, h->unique, -a->force_flush_errno, NULL, 0);
         }
         return fuse_write_reply(a->fd, h->unique, 0, NULL, 0);
+    }
     case FUSE_FSYNC: {
         if (payload_len < sizeof(struct fuse_fsync_in)) {
             return -1;
@@ -1626,6 +1640,12 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         if (a->create_count) {
             (*a->create_count)++;
         }
+        if (a->last_create_in_flags) {
+            *a->last_create_in_flags = in->flags;
+        }
+        if (a->force_create_errno > 0) {
+            return fuse_write_reply(a->fd, h->unique, -a->force_create_errno, NULL, 0);
+        }
         struct simplefs_node *p = simplefs_find_node(&a->fs, h->nodeid);
         if (!p || !simplefs_node_is_dir(p)) {
             return fuse_write_reply(a->fd, h->unique, -ENOTDIR, NULL, 0);
@@ -1648,7 +1668,8 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         nnode->is_dir = 0;
         nnode->is_symlink = 0;
         nnode->mode = in->mode;
-        nnode->open_fh = nnode->nodeid;
+        nnode->open_fh = a->create_open_fh_override != 0 ? a->create_open_fh_override
+                                                        : nnode->nodeid;
         strncpy(nnode->name, name, sizeof(nnode->name) - 1);
         nnode->name[sizeof(nnode->name) - 1] = '\0';
         nnode->size = 0;
@@ -1661,6 +1682,9 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         out.entry.nodeid = nnode->nodeid;
         out.entry.generation = nnode->generation;
         simplefs_fill_attr(nnode, &out.entry.attr);
+        if (a->create_reply_mode_override != 0) {
+            out.entry.attr.mode = a->create_reply_mode_override;
+        }
         out.open_out.fh = nnode->open_fh;
         return fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out));
     }
@@ -1783,6 +1807,9 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         name = (const char *)(payload + name_off);
         if (name[payload_len - name_off - 1] != '\0')
             return -1;
+        if (!is_dir && a->mknod_count) {
+            (*a->mknod_count)++;
+        }
         if (simplefs_find_child(&a->fs, h->nodeid, name)) {
             return fuse_write_reply(a->fd, h->unique, -EEXIST, NULL, 0);
         }

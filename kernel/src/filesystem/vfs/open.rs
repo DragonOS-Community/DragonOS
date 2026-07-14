@@ -3,7 +3,7 @@ use system_error::SystemError;
 
 use super::{
     fcntl::AtFlags,
-    file::{File, FileFlags},
+    file::{File, FileFlags, PreopenedFile},
     mount::MountFlags,
     permission::PermissionMask,
     syscall::{OpenHow, OpenHowResolve},
@@ -294,6 +294,7 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
         follow_symlink,
     );
     let mut created = false;
+    let mut preopened: Option<PreopenedFile> = None;
     let resolved = match resolved {
         Ok(resolved) => resolved,
         Err(errno) => {
@@ -334,9 +335,25 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
                 let pcb = ProcessManager::current_pcb();
                 let umask = pcb.fs_struct().umask();
                 let create_mode = apply_umask_for_create(how.mode, umask);
-                // 创建文件
+                // Let filesystems with an atomic create/open operation carry
+                // the returned handle directly into the new File.  ENOSYS
+                // preserves the generic create-then-open fallback.
+                let mut create_flags = how.o_flags;
+                if create_flags.contains(FileFlags::O_EXCL) {
+                    create_flags.remove(FileFlags::O_TRUNC);
+                }
                 let inode: Arc<dyn IndexNode> =
-                    parent_inode.create(filename, FileType::File, create_mode)?;
+                    match parent_inode.create_and_open(filename, create_mode, &create_flags) {
+                        Ok(opened) => {
+                            let inode = opened.inode();
+                            preopened = Some(opened);
+                            inode
+                        }
+                        Err(SystemError::ENOSYS) => {
+                            parent_inode.create(filename, FileType::File, create_mode)?
+                        }
+                        Err(err) => return Err(err),
+                    };
                 created = true;
                 let created_path = ResolvedPath::new(inode)?;
                 drop(parent_resolved);
@@ -435,7 +452,12 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
         vfs_truncate(inode.clone(), 0)?;
     }
     let (inode, mount_guard, operation_guard) = resolved.into_parts();
-    let file: File = File::new_with_mount_guard(inode, how.o_flags, mount_guard, operation_guard)?;
+    let file: File = match preopened {
+        Some(opened) => {
+            File::new_preopened_with_mount_guard(opened, how.o_flags, mount_guard, operation_guard)?
+        }
+        None => File::new_with_mount_guard(inode, how.o_flags, mount_guard, operation_guard)?,
+    };
     let cloexec = how.o_flags.contains(FileFlags::O_CLOEXEC);
 
     // 把文件对象存入pcb

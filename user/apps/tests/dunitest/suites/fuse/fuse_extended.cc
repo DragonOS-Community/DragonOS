@@ -1675,6 +1675,229 @@ fail_no_umount:
     return -1;
 }
 
+static int ext_test_create_reuses_fuse_handle() {
+    const char *mp = "/tmp/test_fuse_create_handle";
+    const uint64_t create_fh = 0xcafe2019ULL;
+    int requested = O_CREAT | O_RDWR | O_TRUNC | O_APPEND | O_NONBLOCK | O_NOCTTY | O_CLOEXEC;
+    uint32_t expected_create = (uint32_t)(requested & ~(O_NOCTTY | O_CLOEXEC));
+    int f = -1;
+    if (ensure_dir(mp) != 0) return -1;
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        rmdir(mp);
+        return -1;
+    }
+
+    volatile int stop = 0, init_done = 0;
+    volatile uint32_t create_count = 0, open_count = 0, write_count = 0;
+    volatile uint32_t flush_count = 0, release_count = 0, setattr_count = 0, create_flags = 0;
+    volatile uint64_t write_fh = 0, flush_fh = 0, release_fh = 0;
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.enable_write_ops = 1;
+    args.stop_on_destroy = 1;
+    args.create_count = &create_count;
+    args.open_count = &open_count;
+    args.write_count = &write_count;
+    args.flush_count = &flush_count;
+    args.release_count = &release_count;
+    args.setattr_count = &setattr_count;
+    args.last_create_in_flags = &create_flags;
+    args.last_write_fh = &write_fh;
+    args.last_flush_fh = &flush_fh;
+    args.last_release_fh = &release_fh;
+    args.create_open_fh_override = create_fh;
+    args.init_out_flags_override = FUSE_INIT_EXT | FUSE_MAX_PAGES | FUSE_ATOMIC_O_TRUNC;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) goto fail_no_thread;
+    char opts[256], path[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) goto fail_thread;
+    if (fuseg_wait_init(&init_done) != 0) goto fail;
+    snprintf(path, sizeof(path), "%s/new.txt", mp);
+    f = open(path, requested, 0644);
+    if (f < 0 || write(f, "x", 1) != 1) goto fail;
+    close(f);
+    f = -1;
+    for (int i = 0; i < 200 && release_count < 1; i++) {
+        usleep(10 * 1000);
+    }
+
+    if (create_count != 1 || open_count != 0 || write_count != 1 || flush_count != 1 ||
+        release_count != 1 || setattr_count != 0 || create_flags != expected_create ||
+        write_fh != create_fh || flush_fh != create_fh || release_fh != create_fh) {
+        printf("[FAIL] create handle reuse create=%u open=%u write=%u flush=%u release=%u "
+               "flags=0%o expected=0%o fhs=%llx/%llx/%llx\n",
+               create_count, open_count, write_count, flush_count, release_count, create_flags,
+               expected_create, (unsigned long long)write_fh, (unsigned long long)flush_fh,
+               (unsigned long long)release_fh);
+        goto fail;
+    }
+    if (unlink(path) != 0) goto fail;
+    if (umount(mp) != 0) goto fail_no_umount;
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+
+fail:
+    if (f >= 0) close(f);
+    umount(mp);
+fail_no_umount:
+    stop = 1;
+fail_thread:
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+fail_no_thread:
+    close(fd);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_create_enosys_falls_back_and_caches() {
+    const char *mp = "/tmp/test_fuse_create_enosys";
+    if (ensure_dir(mp) != 0) return -1;
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        rmdir(mp);
+        return -1;
+    }
+    volatile int stop = 0, init_done = 0;
+    volatile uint32_t create_count = 0, mknod_count = 0, open_count = 0, release_count = 0;
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.enable_write_ops = 1;
+    args.stop_on_destroy = 1;
+    args.force_create_errno = ENOSYS;
+    args.create_count = &create_count;
+    args.mknod_count = &mknod_count;
+    args.open_count = &open_count;
+    args.release_count = &release_count;
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) goto fail_no_thread;
+    char opts[256], path[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) goto fail_thread;
+    if (fuseg_wait_init(&init_done) != 0) goto fail;
+    for (int i = 0; i < 2; i++) {
+        snprintf(path, sizeof(path), "%s/fallback-%d", mp, i);
+        int f = open(path, O_CREAT | O_RDWR, 0644);
+        if (f < 0) goto fail;
+        close(f);
+    }
+    for (int i = 0; i < 200 && release_count < 2; i++) {
+        usleep(10 * 1000);
+    }
+    if (create_count != 1 || mknod_count != 2 || open_count != 2 || release_count != 2) {
+        printf("[FAIL] create ENOSYS cache create=%u mknod=%u open=%u release=%u\n",
+               create_count, mknod_count, open_count, release_count);
+        goto fail;
+    }
+    if (umount(mp) != 0) goto fail_no_umount;
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+fail:
+    umount(mp);
+fail_no_umount:
+    stop = 1;
+fail_thread:
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+fail_no_thread:
+    close(fd);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_invalid_create_reply_cleans_resources() {
+    const char *mp = "/tmp/test_fuse_create_cleanup";
+    const uint64_t create_fh = 0xbad2019ULL;
+    int bad_fd = -1;
+    if (ensure_dir(mp) != 0) return -1;
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        rmdir(mp);
+        return -1;
+    }
+    volatile int stop = 0, init_done = 0;
+    volatile uint32_t create_count = 0, open_count = 0, release_count = 0, forget_count = 0;
+    volatile uint64_t release_fh = 0, forget_nlookup = 0;
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.enable_write_ops = 1;
+    args.stop_on_destroy = 1;
+    args.create_count = &create_count;
+    args.open_count = &open_count;
+    args.release_count = &release_count;
+    args.forget_count = &forget_count;
+    args.forget_nlookup_sum = &forget_nlookup;
+    args.last_release_fh = &release_fh;
+    args.create_open_fh_override = create_fh;
+    args.create_reply_mode_override = S_IFDIR | 0755;
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0) goto fail_no_thread;
+    char opts[256], path[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0) goto fail_thread;
+    if (fuseg_wait_init(&init_done) != 0) goto fail;
+    snprintf(path, sizeof(path), "%s/invalid", mp);
+    errno = 0;
+    bad_fd = open(path, O_CREAT | O_RDWR, 0644);
+    if (bad_fd >= 0) {
+        close(bad_fd);
+        goto fail;
+    }
+    if (errno != EIO) goto fail;
+    for (int i = 0; i < 200 && (release_count < 1 || forget_count < 1); i++) {
+        usleep(10 * 1000);
+    }
+    if (create_count != 1 || open_count != 0 || release_count != 1 || release_fh != create_fh ||
+        forget_count != 1 || forget_nlookup != 1) {
+        printf("[FAIL] invalid CREATE cleanup create=%u open=%u release=%u fh=%llx "
+               "forget=%u nlookup=%llu\n",
+               create_count, open_count, release_count, (unsigned long long)release_fh,
+               forget_count, (unsigned long long)forget_nlookup);
+        goto fail;
+    }
+    if (umount(mp) != 0) goto fail_no_umount;
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return 0;
+fail:
+    umount(mp);
+fail_no_umount:
+    stop = 1;
+fail_thread:
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+fail_no_thread:
+    close(fd);
+    rmdir(mp);
+    return -1;
+}
+
 static int ext_test_fsetfl_updates_fuse_io_flags() {
     const char *mp = "/tmp/test_fuse_fsetfl_flags";
     int requested = O_RDWR;
@@ -8377,6 +8600,18 @@ TEST(FuseExtended, FsyncEnosysCachedSuccess) {
 
 TEST(FuseExtended, OpenFlagsMatchLinuxMask) {
     ASSERT_EQ(0, ext_test_open_release_flags_match_linux());
+}
+
+TEST(FuseExtended, CreateReusesFuseHandleWithoutOpen) {
+    ASSERT_EQ(0, ext_test_create_reuses_fuse_handle());
+}
+
+TEST(FuseExtended, CreateEnosysFallsBackAndCaches) {
+    ASSERT_EQ(0, ext_test_create_enosys_falls_back_and_caches());
+}
+
+TEST(FuseExtended, InvalidCreateReplyCleansResources) {
+    ASSERT_EQ(0, ext_test_invalid_create_reply_cleans_resources());
 }
 
 TEST(FuseExtended, FsetflUpdatesFuseIoFlags) {

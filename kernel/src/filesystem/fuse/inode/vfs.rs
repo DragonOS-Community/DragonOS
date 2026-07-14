@@ -8,7 +8,7 @@ use crate::{
     filesystem::{
         page_cache::PageCache,
         vfs::{
-            file::{FileFlags, FileMode},
+            file::{FileFlags, FileMode, PreopenedFile},
             permission::PermissionMask,
             syscall::RenameFlags,
             utils::DName,
@@ -1093,6 +1093,10 @@ impl IndexNode for FuseNode {
             return self.create_with_data(name, file_type, mode, 0);
         }
 
+        if self.conn().no_create() {
+            return self.create_with_data(name, file_type, mode, 0);
+        }
+
         let inarg = FuseCreateIn {
             flags: FileFlags::O_RDONLY.bits(),
             mode: (InodeMode::S_IFREG | mode).bits(),
@@ -1103,7 +1107,10 @@ impl IndexNode for FuseNode {
 
         let payload = match self.conn().request(FUSE_CREATE, self.nodeid, &payload_in) {
             Ok(v) => v,
-            Err(SystemError::ENOSYS) => return self.create_with_data(name, file_type, mode, 0),
+            Err(SystemError::ENOSYS) => {
+                self.conn().mark_no_create();
+                return self.create_with_data(name, file_type, mode, 0);
+            }
             Err(e) => return Err(e),
         };
         let (entry, open_out) = Self::parse_create_reply(&payload)?;
@@ -1117,6 +1124,86 @@ impl IndexNode for FuseNode {
             );
         }
         self.create_node_from_entry(&entry, Some(name), FileType::File)
+    }
+
+    fn create_and_open(
+        &self,
+        name: &str,
+        mode: InodeMode,
+        flags: &FileFlags,
+    ) -> Result<PreopenedFile, SystemError> {
+        self.check_not_stale()?;
+        self.ensure_dir()?;
+        if self.conn().no_create() {
+            return Err(SystemError::ENOSYS);
+        }
+
+        // Linux fuse_create_open() forwards creation flags, excluding the
+        // tty-only flag. O_CLOEXEC is per-fd state and must not reach FUSE.
+        let file_flags = flags.bits() & !FileFlags::O_CLOEXEC.bits();
+        let create_flags = file_flags & !FileFlags::O_NOCTTY.bits();
+        let inarg = FuseCreateIn {
+            flags: create_flags,
+            mode: (InodeMode::S_IFREG | mode).bits(),
+            umask: 0,
+            open_flags: 0,
+        };
+        let payload_in = Self::pack_struct_and_name_payload(&inarg, name);
+        let payload = match self.conn().request(FUSE_CREATE, self.nodeid, &payload_in) {
+            Ok(payload) => payload,
+            Err(SystemError::ENOSYS) => {
+                self.conn().mark_no_create();
+                return Err(SystemError::ENOSYS);
+            }
+            Err(err) => return Err(err),
+        };
+        let (entry, open_out) = Self::parse_create_reply(&payload)?;
+
+        let inode = match self.create_node_from_entry(&entry, Some(name), FileType::File) {
+            Ok(inode) => inode,
+            Err(err) => {
+                if entry.nodeid != 0 {
+                    self.release_common_for_node(
+                        FUSE_RELEASE,
+                        entry.nodeid,
+                        open_out.fh,
+                        file_flags,
+                        0,
+                    );
+                }
+                return Err(err);
+            }
+        };
+        let fuse_inode = match inode.clone().downcast_arc::<FuseNode>() {
+            Some(inode) => inode,
+            None => {
+                self.release_common_for_node(
+                    FUSE_RELEASE,
+                    entry.nodeid,
+                    open_out.fh,
+                    file_flags,
+                    0,
+                );
+                return Err(SystemError::EIO);
+            }
+        };
+
+        let mut private_data = FilePrivateData::default();
+        if let Err(err) = fuse_inode.set_open_private_data(
+            &mut private_data,
+            FUSE_OPEN,
+            open_out.fh,
+            file_flags,
+            open_out.open_flags,
+            false,
+        ) {
+            self.release_common_for_node(FUSE_RELEASE, entry.nodeid, open_out.fh, file_flags, 0);
+            return Err(err);
+        }
+
+        let preopened = PreopenedFile::new(inode, private_data);
+        fuse_inode.finish_open_cache_state(FUSE_OPEN, flags, open_out.open_flags)?;
+        Ok(preopened)
     }
 
     fn create_with_data(

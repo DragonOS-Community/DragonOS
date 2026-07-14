@@ -1,5 +1,5 @@
 use super::{
-    file::{File, FileFlags, FileMode},
+    file::{File, FileFlags, FileMode, PreopenedFile},
     utils::DName,
     FilePrivateData, FileSystem, FileType, IndexNode, InodeId, InodeMode, InodeRetentionKind,
     PollableInode, SetMetadataMask, SuperBlock, XattrFlags,
@@ -3299,6 +3299,38 @@ impl IndexNode for MountFSInode {
             &parent,
             DName::from(name),
         )?);
+    }
+
+    fn create_and_open(
+        &self,
+        name: &str,
+        mode: InodeMode,
+        flags: &FileFlags,
+    ) -> Result<PreopenedFile, SystemError> {
+        self.ensure_mount_writable()?;
+        let children_guard = self.dentry.children_gate.lock();
+        let mut preopened = self.dentry.inode.create_and_open(name, mode, flags)?;
+        let wrapped = {
+            let _namespace_guard = self
+                .mount_fs
+                .super_block_state
+                .dentry_namespace_lock
+                .write();
+            self.self_ref
+                .upgrade()
+                .ok_or(SystemError::ENOENT)
+                .and_then(|parent| {
+                    MountFSInode::new_child(
+                        preopened.inode(),
+                        self.mount_fs.clone(),
+                        &parent,
+                        DName::from(name),
+                    )
+                })
+        };
+        drop(children_guard);
+        preopened.replace_inode(wrapped?);
+        Ok(preopened)
     }
 
     fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {

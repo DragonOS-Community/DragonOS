@@ -17,6 +17,10 @@
 #define MS_REC 16384
 #endif
 
+#ifndef MS_SILENT
+#define MS_SILENT 32768
+#endif
+
 namespace {
 
 int ensure_dir(const char* path) {
@@ -72,6 +76,34 @@ void cleanup_path(const char* path) {
     rmdir(path);
 }
 
+int shared_group_id(const char* mount_point) {
+    FILE* fp = fopen("/proc/self/mountinfo", "r");
+    if (fp == nullptr) {
+        return -1;
+    }
+
+    int result = -1;
+    char line[1024] = {};
+    while (fgets(line, sizeof(line), fp) != nullptr) {
+        char parsed_mount_point[256] = {};
+        if (sscanf(line, "%*s %*s %*s %*s %255s", parsed_mount_point) != 1 ||
+            strcmp(parsed_mount_point, mount_point) != 0) {
+            continue;
+        }
+
+        char* optional_end = strstr(line, " - ");
+        char* shared = strstr(line, " shared:");
+        if (shared != nullptr && optional_end != nullptr && shared < optional_end &&
+            sscanf(shared, " shared:%d", &result) == 1) {
+            break;
+        }
+        result = -1;
+        break;
+    }
+    fclose(fp);
+    return result;
+}
+
 class MountPropagationTest : public ::testing::Test {
 protected:
     char root_[128] = {};
@@ -108,6 +140,74 @@ protected:
 };
 
 }  // namespace
+
+TEST_F(MountPropagationTest, PropagationFlagsAreStrictlyValidated) {
+    char base[160] = {};
+    snprintf(base, sizeof(base), "%s/base", root_);
+
+    ASSERT_EQ(0, ensure_dir(base)) << strerror(errno);
+    ASSERT_EQ(0, mount("", base, "ramfs", 0, nullptr)) << strerror(errno);
+
+    errno = 0;
+    EXPECT_EQ(-1, mount(nullptr, base, nullptr, MS_SHARED | MS_PRIVATE, nullptr));
+    EXPECT_EQ(EINVAL, errno);
+    EXPECT_EQ(-1, shared_group_id(base));
+
+    errno = 0;
+    EXPECT_EQ(-1, mount(nullptr, base, nullptr, MS_SHARED | 0x200, nullptr));
+    EXPECT_EQ(EINVAL, errno);
+    EXPECT_EQ(-1, shared_group_id(base));
+
+    errno = 0;
+    EXPECT_EQ(-1, mount(nullptr, base, nullptr, MS_SHARED | MS_NODEV, nullptr));
+    EXPECT_EQ(EINVAL, errno);
+    EXPECT_EQ(-1, shared_group_id(base));
+
+    ASSERT_EQ(0, mount(nullptr, base, nullptr, MS_SHARED | MS_REC | MS_SILENT, nullptr))
+        << strerror(errno);
+    EXPECT_GT(shared_group_id(base), 0);
+
+    best_effort_umount(base);
+    best_effort_rmdir(base);
+}
+
+TEST_F(MountPropagationTest, GroupIdIsReusedOnlyAfterLastPeerLeaves) {
+    char base[160] = {};
+    char slave[160] = {};
+    char master[160] = {};
+    snprintf(base, sizeof(base), "%s/base", root_);
+    snprintf(slave, sizeof(slave), "%s/slave", root_);
+    snprintf(master, sizeof(master), "%s/master", root_);
+
+    ASSERT_EQ(0, ensure_dir(base)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(slave)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(master)) << strerror(errno);
+    ASSERT_EQ(0, mount("", base, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(nullptr, base, nullptr, MS_SHARED, nullptr)) << strerror(errno);
+    const int original_group = shared_group_id(base);
+    ASSERT_GT(original_group, 0);
+
+    ASSERT_EQ(0, mount(base, slave, nullptr, MS_BIND, nullptr)) << strerror(errno);
+    ASSERT_EQ(original_group, shared_group_id(slave));
+    ASSERT_EQ(0, umount(base)) << strerror(errno);
+
+    ASSERT_EQ(0, mount("", master, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(nullptr, master, nullptr, MS_SHARED, nullptr)) << strerror(errno);
+    const int live_peer_group = shared_group_id(master);
+    ASSERT_GT(live_peer_group, 0);
+    EXPECT_NE(original_group, live_peer_group);
+
+    ASSERT_EQ(0, umount(slave)) << strerror(errno);
+    ASSERT_EQ(0, mount("", base, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(nullptr, base, nullptr, MS_SHARED, nullptr)) << strerror(errno);
+    EXPECT_EQ(original_group, shared_group_id(base));
+
+    best_effort_umount(base);
+    best_effort_umount(master);
+    best_effort_rmdir(base);
+    best_effort_rmdir(slave);
+    best_effort_rmdir(master);
+}
 
 TEST_F(MountPropagationTest, SlaveReceivesMasterPropagationOnly) {
     char base[160] = {};

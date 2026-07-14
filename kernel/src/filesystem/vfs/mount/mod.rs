@@ -25,9 +25,10 @@ use crate::{
         namespace::{
             mnt::MntNamespace,
             propagation::{
-                inherit_bind_mount_propagation, propagate_mount, propagate_umount,
+                commit_mount_propagation_locked, detach_mount_propagation,
+                inherit_bind_mount_propagation, prepare_mount_propagation_locked, propagate_umount,
                 propagation_umount_busy, register_peer, register_slave_with_master,
-                unregister_peer, MountPropagation,
+                MountPropagation,
             },
         },
         ProcessManager,
@@ -864,20 +865,23 @@ impl MountFS {
     /// Remove one published mount from superblock activity exactly once.
     /// This performs no filesystem I/O; final shutdown is delegated to workqueue.
     pub(crate) fn deactivate(&self) {
-        let should_remove = {
+        let (should_remove, should_leave_group) = {
             let mut lifecycle = self.lifecycle.lock();
             match lifecycle.state {
                 MountLifecycleState::Constructing => {
                     lifecycle.state = MountLifecycleState::Detached;
-                    false
+                    (false, true)
                 }
                 MountLifecycleState::Live | MountLifecycleState::Detaching => {
                     lifecycle.state = MountLifecycleState::Detached;
-                    true
+                    (true, true)
                 }
-                MountLifecycleState::Detached => false,
+                MountLifecycleState::Detached => (false, false),
             }
         };
+        if should_leave_group {
+            detach_mount_propagation(&self.self_ref());
+        }
         if should_remove && self.super_block_state.remove_mount() {
             Self::schedule_final_shutdown(self.self_ref());
         }
@@ -1576,20 +1580,13 @@ impl MountFSInode {
             return Err(SystemError::ENOTDIR);
         }
 
-        let parent_propagation = self.mount_fs.propagation();
-        let new_propagation = if parent_propagation.is_shared() {
-            MountPropagation::new_shared()
-        } else {
-            MountPropagation::new_private()
-        };
-
         let super_block_state =
             super_block_state.unwrap_or_else(|| Arc::new(SuperBlockState::new(mount_flags)));
         let new_mount_fs = MountFS::new_with_super_block_state(
             inner_fs,
             Some(root_inner_inode),
             Some(self.self_ref.upgrade().unwrap()),
-            new_propagation,
+            MountPropagation::new_private(),
             Some(&ProcessManager::current_mntns()),
             mount_flags,
             MountStateInit {
@@ -1605,37 +1602,47 @@ impl MountFSInode {
             None => Arc::new(MountPath::from(self.absolute_path()?)),
         };
 
+        let topology = MOUNT_LIFECYCLE_LOCK.lock();
+        if !self.mount_fs.is_live() {
+            return Err(SystemError::EBUSY);
+        }
+        let parent_propagation = self.mount_fs.propagation();
+        let inherits_shared_group =
+            bind_source.is_some_and(|source| source.propagation().is_shared());
+        if parent_propagation.is_shared() && !inherits_shared_group {
+            new_mount_fs.propagation().set_shared()?;
+        }
+
         if let Some(source) = bind_source {
+            if !source.is_live() {
+                return Err(SystemError::EBUSY);
+            }
             inherit_bind_mount_propagation(source, &new_mount_fs);
         }
 
-        {
-            let _topology = MOUNT_LIFECYCLE_LOCK.lock();
-            if !self.mount_fs.is_live() {
-                return Err(SystemError::EBUSY);
-            }
-            self.mount_fs
-                .add_mount(metadata.inode_id, new_mount_fs.clone())?;
-            if let Err(error) = ProcessManager::current_mntns().add_mount(
-                Some(metadata.inode_id),
-                mount_path.clone(),
-                new_mount_fs.clone(),
-            ) {
-                self.mount_fs.mountpoints().remove(&metadata.inode_id);
-                return Err(error);
-            }
-            new_mount_fs.activate();
+        let propagation_plan =
+            prepare_mount_propagation_locked(&self.mount_fs, metadata.inode_id, &topology)?;
+
+        self.mount_fs
+            .add_mount(metadata.inode_id, new_mount_fs.clone())?;
+        if let Err(error) = ProcessManager::current_mntns().add_mount(
+            Some(metadata.inode_id),
+            mount_path.clone(),
+            new_mount_fs.clone(),
+        ) {
+            self.mount_fs.mountpoints().remove(&metadata.inode_id);
+            return Err(error);
         }
+        new_mount_fs.activate();
 
         if parent_propagation.is_shared() {
-            if let Err(e) = propagate_mount(
-                &self.mount_fs,
+            commit_mount_propagation_locked(
+                propagation_plan,
                 metadata.inode_id,
                 &new_mount_fs,
                 &mount_path,
-            ) {
-                log::warn!("mount: propagation failed: {:?}", e);
-            }
+                &topology,
+            );
         }
 
         let new_mount_prop = new_mount_fs.propagation();
@@ -1815,12 +1822,6 @@ impl MountFSInode {
             if let Err(e) = propagate_umount(&self.mount_fs, mountpoint_id) {
                 log::warn!("do_umount: propagation failed: {:?}", e);
             }
-        }
-
-        // Remove detached mount from peer registry if needed.
-        let child_prop = child_mount.propagation();
-        if child_prop.is_shared() {
-            unregister_peer(child_prop.peer_group_id(), &child_mount);
         }
 
         return Ok(child_mount);

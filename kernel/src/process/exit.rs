@@ -504,16 +504,18 @@ fn report_wait_event(
         return CandidateDecision::Ready(Ok(pid.into()));
     }
 
-    let stop_requested =
-        relation == WaitRelation::Ptraced || kwo.options.contains(WaitOption::WSTOPPED);
-    if state.is_stopped()
-        && stop_requested
-        && child_pcb.sighand().flags_test_and_clear(
-            SignalFlags::CLD_STOPPED,
-            !kwo.options.contains(WaitOption::WNOWAIT),
-        )
-    {
-        let stopsig = child_pcb.sighand().stop_signal() as i32;
+    let consume = !kwo.options.contains(WaitOption::WNOWAIT);
+    let stop_signal = match relation {
+        WaitRelation::Natural if kwo.options.contains(WaitOption::WSTOPPED) => {
+            child_pcb.sighand().group_stop_event(consume)
+        }
+        WaitRelation::Ptraced => child_pcb
+            .sighand()
+            .ptrace_stop_event(consume, || child_pcb.sched_info().state().is_stopped()),
+        _ => None,
+    };
+    if let Some(stop_signal) = stop_signal {
+        let stopsig = stop_signal as i32;
         let cause = if relation == WaitRelation::Ptraced {
             SigChildCode::Trapped.into()
         } else {

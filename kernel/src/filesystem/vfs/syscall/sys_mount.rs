@@ -4,7 +4,7 @@ use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_MOUNT},
     filesystem::vfs::{
         fcntl::AtFlags,
-        mount::{is_mountpoint_root, MountFSInode, MountFlags, MountPath},
+        mount::{is_mountpoint_root, MountFSInode, MountFlags, MountPath, MOUNT_LIFECYCLE_LOCK},
         produce_fs,
         utils::user_path_at,
         FileType, FsReconfigureRequest, IndexNode, InodeId, MountFS, MAX_PATHLEN,
@@ -14,8 +14,9 @@ use crate::{
     process::{
         cred::{ns_capable, CAPFlags},
         namespace::propagation::{
-            change_mnt_propagation_recursive, flags_to_propagation_type, is_propagation_change,
-            propagate_moved_tree,
+            change_mnt_propagation_recursive, commit_move_mount_propagation_locked,
+            flags_to_propagation_type, is_propagation_change,
+            prepare_move_mount_propagation_locked,
         },
         ProcessManager,
     },
@@ -60,12 +61,15 @@ impl Syscall for SysMountHandle {
         let target = Self::target(args);
         let filesystemtype = Self::filesystemtype(args);
         let data = Self::raw_data(args);
-        let mount_flags = Self::mountflags(args);
+        let raw_mount_flags = Self::mountflags(args);
         // log::debug!(
         //     "sys_mount: source: {:?}, target: {:?}, filesystemtype: {:?}, mount_flags: {:?}, data: {:?}",
         //     source, target, filesystemtype, mount_flags, data
         // );
-        let mount_flags = MountFlags::from_bits_truncate(mount_flags);
+        let mount_flags = MountFlags::from_bits_truncate(raw_mount_flags);
+        if is_propagation_change(mount_flags) && raw_mount_flags & !MountFlags::all().bits() != 0 {
+            return Err(SystemError::EINVAL);
+        }
 
         let target = copy_mount_path_string(target).inspect_err(|e| {
             log::error!("Failed to read mount target: {:?}", e);
@@ -750,13 +754,7 @@ fn do_change_type(target_inode: Arc<dyn IndexNode>, flags: MountFlags) -> Result
         return Err(SystemError::EINVAL);
     }
 
-    let prop_type = match flags_to_propagation_type(flags) {
-        Some(t) => t,
-        None => {
-            log::warn!("do_change_type: no propagation flag set");
-            return Err(SystemError::EINVAL);
-        }
-    };
+    let prop_type = flags_to_propagation_type(flags)?;
 
     // Check if recursive flag is set
     let recursive = flags.contains(MountFlags::REC);
@@ -835,16 +833,26 @@ fn do_move_mount(
         return Err(SystemError::EINVAL);
     }
 
-    // Cannot move the namespace root (root mount's self_mountpoint is None).
-    let source_mountpoint = source_mfs.self_mountpoint().ok_or(SystemError::EINVAL)?;
-    let source_parent_mfs = source_mountpoint.mount_fs();
-
     // d_is_dir(new) != d_is_dir(old): source and target types must match.
     let source_is_dir = source_inode.metadata()?.file_type == FileType::Dir;
     let target_is_dir = target_inode.metadata()?.file_type == FileType::Dir;
     if source_is_dir != target_is_dir {
         return Err(SystemError::ENOTDIR);
     }
+
+    let topology = MOUNT_LIFECYCLE_LOCK.lock();
+    if !source_mfs.is_live()
+        || !target_parent_mfs.is_live()
+        || !source_mfs.is_belongs_to_mntns(&current_mntns)
+        || !target_parent_mfs.is_belongs_to_mntns(&current_mntns)
+    {
+        return Err(SystemError::EINVAL);
+    }
+
+    // Re-read the source parent only after topology is stable. The source may
+    // have been moved or detached after pathname resolution but before locking.
+    let source_mountpoint = source_mfs.self_mountpoint().ok_or(SystemError::EINVAL)?;
+    let source_parent_mfs = source_mountpoint.mount_fs();
 
     // attached && IS_MNT_SHARED(parent): cannot move from a shared parent mount.
     if source_parent_mfs.propagation().is_shared() {
@@ -895,17 +903,28 @@ fn do_move_mount(
         .ok()
         .filter(|p| p.starts_with('/'))
         .ok_or(SystemError::EINVAL)?;
-    current_mntns.move_mount(
+    let propagation_plan = if target_shared {
+        Some(prepare_move_mount_propagation_locked(
+            &target_parent_mfs,
+            &source_mfs,
+            target_mp_id,
+            &topology,
+        )?)
+    } else {
+        None
+    };
+
+    current_mntns.move_mount_locked(
         &source_mfs,
         &target_mountpoint,
         &old_source_path,
         &new_target_path,
+        &topology,
     )?;
 
-    // Moved into a shared target: mark the entire subtree as shared and propagate to the target parent's peers.
-    if target_shared {
+    if let Some(plan) = propagation_plan {
         let new_path = Arc::new(MountPath::from(new_target_path));
-        propagate_moved_tree(&target_parent_mfs, &source_mfs, target_mp_id, &new_path)?;
+        commit_move_mount_propagation_locked(plan, &new_path, &topology);
     }
 
     Ok(())

@@ -54,6 +54,11 @@ use system_error::SystemError;
 
 /// Serializes mount pin admission against multi-mount busy preflight and
 /// detach, including propagation peers in other namespaces.
+///
+/// Mount topology and propagation code acquires locks in this order:
+/// lifecycle -> namespace -> dentry mount gate -> parent mountpoints -> peer
+/// registry -> one mount's propagation state -> propagation group allocator.
+/// A lower layer must never acquire the lifecycle/topology layers in reverse.
 pub(crate) static MOUNT_LIFECYCLE_LOCK: Mutex<()> = Mutex::new(());
 
 lazy_static! {

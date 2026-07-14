@@ -631,8 +631,8 @@ impl PageFaultHandler {
         let _invalidate = page_cache
             .as_ref()
             .map(|page_cache| page_cache.invalidate_read());
-        let fs = pfm.vma().lock().vm_file().unwrap().inode().fs();
-        let mut ret = fs.fault(pfm);
+        let file = pfm.vm_file().unwrap().clone();
+        let mut ret = file.with_io_fs(|fs| fs.fault(pfm));
 
         if unlikely(ret.intersects(
             VmFaultReason::VM_FAULT_ERROR
@@ -671,12 +671,11 @@ impl PageFaultHandler {
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
     pub unsafe fn do_read_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
-        let fs = pfm.vm_file().unwrap().inode().fs();
-
-        let fault_first = fs.fault_before_map_pages();
+        let file = pfm.vm_file().unwrap().clone();
+        let fault_first = file.with_io_fs(|fs| fs.fault_before_map_pages());
         let mut ret = VmFaultReason::empty();
         if fault_first {
-            ret = fs.fault(pfm);
+            ret = file.with_io_fs(|fs| fs.fault(pfm));
             if ret.contains(VmFaultReason::VM_FAULT_COMPLETED)
                 || ret.intersects(
                     VmFaultReason::VM_FAULT_ERROR
@@ -704,7 +703,7 @@ impl PageFaultHandler {
         }
 
         if !fault_first {
-            ret |= fs.fault(pfm);
+            ret |= file.with_io_fs(|fs| fs.fault(pfm));
             if ret.contains(VmFaultReason::VM_FAULT_COMPLETED)
                 || ret.intersects(
                     VmFaultReason::VM_FAULT_ERROR
@@ -735,8 +734,8 @@ impl PageFaultHandler {
         let _invalidate = page_cache
             .as_ref()
             .map(|page_cache| page_cache.invalidate_read());
-        let fs = pfm.vma().lock().vm_file().unwrap().inode().fs();
-        let mut ret = fs.fault(pfm);
+        let file = pfm.vm_file().unwrap().clone();
+        let mut ret = file.with_io_fs(|fs| fs.fault(pfm));
 
         if ret.intersects(VmFaultReason::VM_FAULT_ERROR) {
             return ret;
@@ -745,7 +744,7 @@ impl PageFaultHandler {
             return ret;
         }
 
-        ret = ret.union(fs.page_mkwrite(pfm));
+        ret = ret.union(file.with_io_fs(|fs| fs.page_mkwrite(pfm)));
         if Self::mkwrite_finished(ret) {
             return ret;
         }
@@ -847,9 +846,9 @@ impl PageFaultHandler {
             // source window. Shared mappings complete pfn_mkwrite; private
             // mappings complete COW through PageFaultMessage's guarded helper.
             return if vma.lock().vm_flags().contains(VmFlags::VM_SHARED) {
-                file.inode().fs().page_mkwrite(pfm)
+                file.with_io_fs(|fs| fs.page_mkwrite(pfm))
             } else {
-                file.inode().fs().fault(pfm)
+                file.with_io_fs(|fs| fs.fault(pfm))
             };
         }
         let old_page = old_page.unwrap();
@@ -863,7 +862,7 @@ impl PageFaultHandler {
             };
             if let Some(file) = file {
                 pfm.set_page(old_page.clone());
-                let ret = file.inode().fs().page_mkwrite(pfm);
+                let ret = file.with_io_fs(|fs| fs.page_mkwrite(pfm));
                 if Self::mkwrite_finished(ret) {
                     return ret;
                 }
@@ -1047,10 +1046,10 @@ impl PageFaultHandler {
             }
         }
 
-        let fs = pfm.vma().lock().vm_file().unwrap().inode().fs();
+        let file = pfm.vm_file().unwrap().clone();
         let start_pgoff = backing_pgoff - (pte_pgoff - from_pte);
         let end_pgoff = backing_pgoff + (to_pte - pte_pgoff);
-        fs.map_pages(pfm, start_pgoff, end_pgoff);
+        file.with_io_fs(|fs| fs.map_pages(pfm, start_pgoff, end_pgoff));
 
         VmFaultReason::empty()
     }

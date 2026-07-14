@@ -531,6 +531,13 @@ pub struct File {
     /// 唯一 open file description id，用于 flock owner 标识。
     open_file_id: usize,
     inode: Arc<dyn IndexNode>,
+    /// Filesystem selected when this open file description was created.
+    ///
+    /// Mount wrappers retain the mount selected by path lookup. Cache that
+    /// filesystem on the open file description so fd-based I/O and mmap fault
+    /// paths use the same identity directly without cloning an Arc while MM
+    /// locks are held.
+    io_fs: Option<Arc<dyn FileSystem>>,
     /// 对于文件，表示字节偏移量；对于文件夹，表示当前操作的子目录项偏移量
     offset: AtomicUsize,
     /// 文件的打开模式
@@ -956,10 +963,15 @@ impl File {
             .downcast_arc::<MountFSInode>()
             .map(|mnt_inode| mnt_inode.mount_fs().sample_wb_error())
             .unwrap_or(0);
+        let io_fs = inode
+            .clone()
+            .downcast_arc::<MountFSInode>()
+            .map(|mnt_inode| mnt_inode.mount_fs() as Arc<dyn FileSystem>);
 
         let f = File {
             open_file_id: alloc_open_file_id(),
             inode,
+            io_fs,
             offset: AtomicUsize::new(0),
             flags: RwSem::new(flags),
             mode: RwSem::new(mode),
@@ -1151,7 +1163,7 @@ impl File {
         }
 
         // 检查文件系统是否支持 readahead
-        if !self.inode.fs().support_readahead() {
+        if !self.with_io_fs(|fs| fs.support_readahead()) {
             return Ok(());
         }
 
@@ -1575,6 +1587,22 @@ impl File {
         return self.inode.clone();
     }
 
+    /// Invoke an operation on the filesystem selected for this open file.
+    ///
+    /// Pathname-backed files retain their selected mount and therefore avoid
+    /// both a topology lookup and an Arc refcount operation in fault hot paths.
+    /// Anonymous/pseudo files fall back lazily because several such inodes do
+    /// not implement `fs()` and must remain constructible (for example epoll).
+    #[inline]
+    pub fn with_io_fs<T>(&self, op: impl FnOnce(&dyn FileSystem) -> T) -> T {
+        if let Some(fs) = self.io_fs.as_ref() {
+            op(fs.as_ref())
+        } else {
+            let fs = self.inode.fs();
+            op(fs.as_ref())
+        }
+    }
+
     /// @brief 尝试克隆一个文件
     ///
     /// @return Option<File> 克隆后的文件结构体。如果克隆失败，返回None
@@ -1607,6 +1635,7 @@ impl File {
         let res = Self {
             open_file_id: alloc_open_file_id(),
             inode: self.inode.clone(),
+            io_fs: self.io_fs.clone(),
             offset: AtomicUsize::new(self.offset.load(Ordering::SeqCst)),
             flags: RwSem::new(flags),
             mode: RwSem::new(mode),

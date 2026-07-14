@@ -355,11 +355,13 @@ impl InnerAddressSpace {
     }
 
     pub(super) fn notify_vma_close(notification: VmaCloseNotification) {
-        notification.file.inode().fs().vma_close(
-            &notification.file,
-            notification.region,
-            notification.vm_flags,
-        );
+        notification.file.with_io_fs(|fs| {
+            fs.vma_close(
+                &notification.file,
+                notification.region,
+                notification.vm_flags,
+            )
+        });
     }
 
     pub(super) fn mprotect_collect(
@@ -409,7 +411,8 @@ impl InnerAddressSpace {
                     continue;
                 }
                 if let Some(file) = guard.vm_file() {
-                    if let Err(err) = file.inode().fs().mprotect(old_vm_flags, new_vm_flags) {
+                    if let Err(err) = file.with_io_fs(|fs| fs.mprotect(old_vm_flags, new_vm_flags))
+                    {
                         for plan in plans {
                             plan.split_lifecycle
                                 .rollback_into(&mut rollback_notifications);

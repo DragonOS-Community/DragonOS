@@ -582,13 +582,6 @@ fn do_bind_mount(
     let source_inode =
         current_node.lookup_follow_symlink(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
 
-    // 穿越挂载点（含 FUSE announce-submounts 自动子挂载），避免 bind 仍绑定父 virtiofs 树上的 inode。
-    let source_inode: Arc<dyn IndexNode> = source_inode
-        .clone()
-        .downcast_arc::<MountFSInode>()
-        .map(|mnt| mnt.overlaid_inode() as Arc<dyn IndexNode>)
-        .unwrap_or(source_inode);
-
     let source_is_dir = source_inode.metadata()?.file_type == FileType::Dir;
     let target_is_dir = target_inode.metadata()?.file_type == FileType::Dir;
     if source_is_dir != target_is_dir {

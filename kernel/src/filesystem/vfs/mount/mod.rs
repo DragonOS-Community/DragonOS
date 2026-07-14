@@ -3000,10 +3000,10 @@ impl IndexNode for MountFSInode {
 
     #[inline]
     fn fs(&self) -> Arc<dyn FileSystem> {
-        // This inode already records the mount selected during path lookup.
-        // An overmount installed later must not redirect an open file
-        // description, and resolving it here may issue filesystem I/O while
-        // callers hold mmap/address-space locks.
+        // This inode records the mount selected by path lookup.  Operations on
+        // the resolved inode (including bind-mount source validation) must not
+        // re-resolve a later overmount; pathname lookup itself performs the
+        // overmount traversal before returning an inode.
         self.mount_fs.clone()
     }
 
@@ -3516,7 +3516,20 @@ impl IndexNode for MountFSInode {
 
     #[inline]
     fn special_node(&self) -> Option<super::SpecialNodeData> {
-        self.dentry.inode.special_node()
+        match self.dentry.inode.special_node() {
+            // proc namespace magic links use a self-reference. Preserve the
+            // resolved struct-path projection by returning this mount wrapper,
+            // not the raw procfs inode. References to any other inode (notably
+            // /proc/<pid>/fd/<n>) must remain the original target.
+            Some(super::SpecialNodeData::Reference(target))
+                if Arc::ptr_eq(&target, &self.dentry.inode) =>
+            {
+                self.self_ref
+                    .upgrade()
+                    .map(|inode| super::SpecialNodeData::Reference(inode as Arc<dyn IndexNode>))
+            }
+            other => other,
+        }
     }
 
     /// If not supported, fall back to getting the filename from the parent directory.

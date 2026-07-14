@@ -16,9 +16,9 @@ use jhash::jhash2;
 use crate::libs::mutex::Mutex;
 use crate::rcu::RcuArcSlot;
 
-use super::uapi::{fanout_flag, fanout_mode, eth_protocol};
-use super::{PacketIngressMetadata, PacketSocket, PacketSocketType};
 use super::rx::l2_ethertype_l3_offset;
+use super::uapi::{eth_protocol, fanout_flag, fanout_mode};
+use super::{PacketIngressMetadata, PacketSocket, PacketSocketType};
 
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
@@ -236,10 +236,7 @@ impl FanoutGroup {
 /// Upgrade the `target`-th live member (0-indexed among live entries) of a
 /// fanout snapshot. `strong_count()!=0` guarantees `upgrade()` succeeds, so
 /// this performs no heap allocation.
-fn nth_live_member(
-    members: &[Weak<PacketSocket>],
-    target: usize,
-) -> Option<Arc<PacketSocket>> {
+fn nth_live_member(members: &[Weak<PacketSocket>], target: usize) -> Option<Arc<PacketSocket>> {
     let mut seen = 0usize;
     for entry in members {
         if entry.strong_count() == 0 {
@@ -294,12 +291,8 @@ fn flow_hash(frame: &[u8], seed: u32) -> u32 {
         let mut src = [0u32; 4];
         let mut dst = [0u32; 4];
         for i in 0..4 {
-            src[i] = u32::from_be_bytes([
-                l3[8 + i * 4],
-                l3[9 + i * 4],
-                l3[10 + i * 4],
-                l3[11 + i * 4],
-            ]);
+            src[i] =
+                u32::from_be_bytes([l3[8 + i * 4], l3[9 + i * 4], l3[10 + i * 4], l3[11 + i * 4]]);
             dst[i] = u32::from_be_bytes([
                 l3[24 + i * 4],
                 l3[25 + i * 4],
@@ -309,7 +302,9 @@ fn flow_hash(frame: &[u8], seed: u32) -> u32 {
         }
         let next_header = l3[6];
         let (sp, dp) = l4_ports(&l3[40..], next_header);
-        let words = [src[0], src[1], src[2], src[3], dst[0], dst[1], dst[2], dst[3], sp as u32, dp as u32];
+        let words = [
+            src[0], src[1], src[2], src[3], dst[0], dst[1], dst[2], dst[3], sp as u32, dp as u32,
+        ];
         jhash2(&words, seed)
     } else {
         0
@@ -330,10 +325,10 @@ fn l4_ports(l4: &[u8], proto: u8) -> (u16, u16) {
 impl PacketSocket {
     /// `setsockopt(SOL_PACKET, PACKET_FANOUT, val)` entry point.
     ///
-    /// Parses the option value, validates mode/flags, refuses an already-joined
-    /// socket with `EBUSY`, then delegates the locked registry work to the
-    /// owning netns so that "publish member" and "set fanout field" happen
-    /// atomically under the netns writer lock.
+    /// Parses the option value, validates mode/flags, then delegates the
+    /// locked registry work — including the already-joined (`EBUSY`) check —
+    /// to the owning netns so that the check, "publish member", and "set
+    /// fanout field" all happen atomically under the netns writer lock.
     pub(crate) fn join_fanout(&self, val: i32) -> Result<(), SystemError> {
         let v = val as u32;
         let id_req = (v & 0xffff) as u16;
@@ -348,11 +343,6 @@ impl PacketSocket {
             fanout_flag::PACKET_FANOUT_FLAG_ROLLOVER | fanout_flag::PACKET_FANOUT_FLAG_UNIQUEID;
         if flags & !ALLOWED_FLAGS != 0 {
             return Err(SystemError::EINVAL);
-        }
-
-        // Already a member of some group.
-        if self.fanout.read().is_some() {
-            return Err(SystemError::EBUSY);
         }
 
         let unique = flags & fanout_flag::PACKET_FANOUT_FLAG_UNIQUEID != 0;
@@ -377,16 +367,13 @@ impl PacketSocket {
 
     /// Leave the current fanout group (invoked from `close_binding`).
     ///
-    /// The fanout field is cleared first; the owning netns then removes the
-    /// socket from the group member list and tears the group down if it becomes
-    /// empty — both under the netns writer lock to close the leave/join TOCTOU
-    /// window.
+    /// Delegates entirely to the owning netns, which acquires
+    /// `fanout_groups_writer` *before* taking the socket's `fanout` write lock.
+    /// This keeps the lock order identical to the join path
+    /// (`fanout_groups_writer → fanout.write()`), avoiding the ABBA deadlock
+    /// that would arise if the leave path cleared `fanout` first.
     pub(crate) fn leave_fanout(&self) {
-        let Some(group) = self.fanout.write().take() else {
-            return;
-        };
-        self.fanout_active.store(false, Ordering::Release);
-        self.netns.fanout_group_leave(&group, &self.self_ref);
+        self.netns.fanout_group_leave(&self.self_ref);
     }
 
     /// `true` if this socket currently belongs to a fanout group. Used by the
@@ -401,6 +388,25 @@ impl PacketSocket {
     pub(crate) fn set_fanout_group(&self, group: Arc<FanoutGroup>) {
         *self.fanout.write() = Some(group);
         self.fanout_active.store(true, Ordering::Release);
+    }
+
+    /// Whether this socket currently holds a fanout group reference.
+    /// Checked by the netns join path under the `fanout_groups_writer` lock
+    /// for the already-joined (`EBUSY`) test.
+    pub(crate) fn has_fanout_group(&self) -> bool {
+        self.fanout.read().is_some()
+    }
+
+    /// Take and clear the fanout group membership, deactivating the socket.
+    /// Called by the netns leave path *after* acquiring `fanout_groups_writer`,
+    /// so the clear and the registry mutation share the same lock order as
+    /// the join path (`fanout_groups_writer → fanout.write()`).
+    pub(crate) fn clear_fanout_group(&self) -> Option<Arc<FanoutGroup>> {
+        let group = self.fanout.write().take();
+        if group.is_some() {
+            self.fanout_active.store(false, Ordering::Release);
+        }
+        group
     }
 
     /// Current fanout membership encoded as `(id | (type_flags << 16))`, or

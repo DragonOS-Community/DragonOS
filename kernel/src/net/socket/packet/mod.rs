@@ -26,12 +26,12 @@ use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
 use crate::rcu::RcuOptionArcSlot;
 
+pub(crate) use fanout::{FanoutGroup, FanoutMode};
 #[allow(unused_imports)]
 pub use uapi::{
     eth_protocol, fanout_flag, fanout_mode, packet_mreq_type, packet_option, PacketMreq,
     PacketType, SockAddrLl, TpacketAuxdata,
 };
-pub(crate) use fanout::{FanoutGroup, FanoutMode};
 
 const DEFAULT_RX_BUFFER_SIZE: usize = 256 * 1024;
 const DEFAULT_TX_BUFFER_SIZE: usize = 256 * 1024;

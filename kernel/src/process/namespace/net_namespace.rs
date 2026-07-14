@@ -541,8 +541,10 @@ impl NetNamespace {
         bound_ifindex: u32,
         bound_protocol: u16,
     ) -> Result<(), SystemError> {
-
         let mut writer = self.fanout_groups_writer.lock();
+        if socket.has_fanout_group() {
+            return Err(SystemError::EBUSY);
+        }
         let group: Arc<FanoutGroup> = if unique {
             // UNIQUEID always creates a fresh group with a kernel-assigned id;
             // it cannot attach to an existing group.
@@ -571,11 +573,7 @@ impl NetNamespace {
                 None => {
                     // Reserve the explicit id in the allocator so a later
                     // UNIQUEID allocation cannot collide with it.
-                    if writer
-                        .id_alloc
-                        .alloc_specific(id_req as usize)
-                        .is_none()
-                    {
+                    if writer.id_alloc.alloc_specific(id_req as usize).is_none() {
                         return Err(SystemError::EINVAL);
                     }
                     let group = FanoutGroup::new(
@@ -606,15 +604,21 @@ impl NetNamespace {
     }
 
     /// Remove `socket` from its fanout group, tearing the group down if it
-    /// becomes empty. The empty-check and `by_id`/id-allocator removal run
-    /// together under `fanout_groups_writer` so a concurrent join cannot
-    /// resurrect a zombie group.
-    pub(crate) fn fanout_group_leave(
-        &self,
-        group: &Arc<FanoutGroup>,
-        socket: &Weak<PacketSocket>,
-    ) {
+    /// becomes empty. The socket's `fanout` field is cleared *after* acquiring
+    /// `fanout_groups_writer`, keeping the lock order identical to the join
+    /// path (`fanout_groups_writer → fanout.write()`) and avoiding the ABBA
+    /// deadlock. The empty-check and `by_id`/id-allocator removal also run
+    /// under the same lock so a concurrent join cannot resurrect a zombie group.
+    pub(crate) fn fanout_group_leave(&self, socket: &Weak<PacketSocket>) {
         let mut writer = self.fanout_groups_writer.lock();
+        // Clear the socket's fanout membership under the writer lock so the
+        // lock order is fanout_groups_writer → fanout.write() — matching join.
+        let Some(socket_arc) = socket.upgrade() else {
+            return;
+        };
+        let Some(group) = socket_arc.clear_fanout_group() else {
+            return;
+        };
         group.remove_member(socket);
         if group.live_count() == 0 {
             writer.by_id.remove(&group.id);

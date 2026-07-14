@@ -17,6 +17,7 @@ pub mod packet_option {
     pub const PACKET_RESERVE: usize = 12;
     pub const PACKET_VNET_HDR: usize = 15;
     pub const PACKET_TX_TIMESTAMP: usize = 16;
+    pub const PACKET_TIMESTAMP: usize = 17;
     pub const PACKET_QDISC_BYPASS: usize = 20;
     pub const PACKET_FANOUT: usize = 18;
     pub const PACKET_FANOUT_DATA: usize = 22;

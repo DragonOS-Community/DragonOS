@@ -948,13 +948,13 @@ fn prepare_propagated_umount_targets(
         .try_reserve(result.len())
         .map_err(|_| SystemError::ENOMEM)?;
     children_by_parent.resize_with(result.len(), Vec::new);
-    for index in 0..result.len() {
+    for (index, target) in result.iter().enumerate() {
         if let Some(parent_index) = candidate_by_id
-            .get(&result[index].parent.mount_id().data())
+            .get(&target.parent.mount_id().data())
             .copied()
             .filter(|parent_index| {
                 !Arc::ptr_eq(
-                    &result[index].mountpoint.shared_dentry(),
+                    &target.mountpoint.shared_dentry(),
                     &result[*parent_index].child.root_dentry(),
                 )
             })
@@ -969,8 +969,8 @@ fn prepare_propagated_umount_targets(
     removed
         .try_reserve(result.len())
         .map_err(|_| SystemError::ENOMEM)?;
-    for index in 0..result.len() {
-        if result[index].remove {
+    for (index, target) in result.iter().enumerate() {
+        if target.remove {
             removed.push_back(index);
         }
     }

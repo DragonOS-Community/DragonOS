@@ -492,6 +492,68 @@ fn test_propagated_umount_removes_visible_shadow_stack_top() {
 }
 
 #[test]
+fn test_propagated_umount_restores_tucked_lower_for_flat_source_stack() {
+    let (source_parent, peer_parent, source_mp, peer_mp, source_lower, peer_lower) =
+        shared_umount_fixture();
+    let source_top = new_test_mount(MountPropagation::new_private());
+    source_top.set_self_mountpoint(Some(source_mp.clone()));
+    source_parent
+        .attach_top(&source_mp, source_top.clone())
+        .unwrap();
+
+    let peer_top = new_test_mount(MountPropagation::new_private());
+    peer_top.set_self_mountpoint(Some(peer_mp.clone()));
+    peer_parent
+        .attach_beneath(&peer_mp, peer_top.clone())
+        .unwrap();
+
+    let source_stack = source_parent.children_at(&source_mp);
+    assert_eq!(source_stack.len(), 2);
+    assert!(Arc::ptr_eq(&source_stack[0], &source_lower));
+    assert!(Arc::ptr_eq(&source_stack[1], &source_top));
+    let peer_stack = peer_parent.children_at(&peer_mp);
+    assert_eq!(peer_stack.len(), 1);
+    assert!(Arc::ptr_eq(&peer_stack[0], &peer_top));
+    let peer_root = peer_top.mountpoint_root_inode();
+    let tucked_stack = peer_top.children_at(&peer_root);
+    assert_eq!(tucked_stack.len(), 1);
+    assert!(Arc::ptr_eq(&tucked_stack[0], &peer_lower));
+    assert!(Arc::ptr_eq(
+        &peer_lower.self_mountpoint().unwrap(),
+        &peer_root
+    ));
+    assert!(Arc::ptr_eq(&peer_lower.parent_mount().unwrap(), &peer_top));
+    assert!(peer_lower.is_tucked_under());
+
+    let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+    propagate_umount_sources(&[source_lower.clone(), source_top.clone()], true).unwrap();
+
+    // Linux umount_list() restores children mounted on a removed mount's
+    // root. The tucked lower copy therefore survives this flat-source race.
+    let source_stack = source_parent.children_at(&source_mp);
+    assert_eq!(source_stack.len(), 2);
+    assert!(Arc::ptr_eq(&source_stack[0], &source_lower));
+    assert!(Arc::ptr_eq(&source_stack[1], &source_top));
+    let restored = peer_parent.children_at(&peer_mp);
+    assert_eq!(restored.len(), 1);
+    assert!(Arc::ptr_eq(&restored[0], &peer_lower));
+    assert!(Arc::ptr_eq(
+        &peer_lower.self_mountpoint().unwrap(),
+        &peer_mp
+    ));
+    assert!(Arc::ptr_eq(
+        &peer_lower.parent_mount().unwrap(),
+        &peer_parent
+    ));
+    assert!(peer_lower.is_live());
+    assert!(!peer_lower.is_tucked_under());
+    assert!(peer_top.children_at(&peer_root).is_empty());
+    assert!(peer_top.self_mountpoint().is_none());
+    assert!(peer_top.parent_mount().is_none());
+    assert!(!peer_top.is_live());
+}
+
+#[test]
 fn test_propagated_umount_retains_target_with_nonroot_child() {
     let (source_parent, peer_parent, source_mp, peer_mp, source_child, peer_child) =
         shared_umount_fixture();

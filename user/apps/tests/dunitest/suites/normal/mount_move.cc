@@ -244,7 +244,9 @@ TEST_F(MountMoveTest, MoveOntoMountedTargetBecomesTop) {
 
         EXPECT_TRUE(marker_exists(dst, "source_marker"));
         EXPECT_FALSE(marker_exists(dst, "target_marker"));
-        EXPECT_EQ(1, mountinfo_count_mountpoint(dst));
+        // Linux exposes both the covered target mount and the moved top mount
+        // as distinct mountinfo records at the same pathname.
+        EXPECT_EQ(2, mountinfo_count_mountpoint(dst));
 
         best_effort_umount(dst);
         EXPECT_TRUE(marker_exists(dst, "target_marker"));
@@ -284,6 +286,29 @@ TEST_F(MountMoveTest, MoveSubtreeUpdatesChildMountPath) {
 
     best_effort_umount(dst_child);
     best_effort_umount(dst);
+}
+
+// Linux reports ELOOP when the target parent is the moved mount itself or one
+// of its descendants. The topology must remain unchanged after the rejection.
+TEST_F(MountMoveTest, MoveIntoOwnDescendantFailsWithEloop) {
+    char src[160] = {};
+    char child[224] = {};
+    snprintf(src, sizeof(src), "%s/src", root_);
+    snprintf(child, sizeof(child), "%s/child", src);
+
+    ASSERT_EQ(0, ensure_dir(src)) << strerror(errno);
+    ASSERT_EQ(0, mount("", src, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(child)) << strerror(errno);
+    ASSERT_EQ(0, create_marker(src, "marker")) << strerror(errno);
+
+    errno = 0;
+    EXPECT_EQ(-1, mount(src, child, nullptr, MS_MOVE, nullptr));
+    EXPECT_EQ(ELOOP, errno);
+    EXPECT_TRUE(marker_exists(src, "marker"));
+    EXPECT_TRUE(mountinfo_has_mountpoint(src));
+    EXPECT_FALSE(mountinfo_has_mountpoint(child));
+
+    best_effort_umount(src);
 }
 
 // Moving a non-mountpoint directory should fail (path_mounted check).

@@ -503,9 +503,8 @@ impl FuseFS {
 pub fn fuse_try_automount_submount(
     fuse_node: &Arc<FuseNode>,
     mountpoint: &Arc<crate::filesystem::vfs::mount::MountFSInode>,
-    mount_path_override: Option<Arc<crate::filesystem::vfs::mount::MountPath>>,
 ) -> Result<(), SystemError> {
-    use crate::filesystem::vfs::mount::{MountFlags, MountPath};
+    use crate::filesystem::vfs::mount::MountFlags;
 
     let attr_flags = fuse_node.lookup_attr_flags();
     if (attr_flags & FUSE_ATTR_SUBMOUNT) == 0 {
@@ -515,48 +514,32 @@ pub fn fuse_try_automount_submount(
         return Ok(());
     }
 
-    let md = mountpoint.metadata()?;
-    if mountpoint
-        .mount_fs()
-        .mountpoints()
-        .contains_key(&md.inode_id)
-    {
-        return Ok(());
-    }
+    mountpoint.serialize_automount(|| {
+        if mountpoint.mount_fs().lookup_top(mountpoint).is_some() {
+            return Ok(());
+        }
 
-    let parent_fs = fuse_node.fuse_fs().ok_or(SystemError::ENOENT)?;
-    let sub_fs = FuseFS::new_submount(
-        &parent_fs,
-        fuse_node.clone(),
-        fuse_node.nodeid(),
-        md,
-        attr_flags,
-    );
-    let mount_path = match mount_path_override {
-        Some(path) => path,
-        None => {
-            let path = mountpoint.absolute_path()?;
-            if !path.starts_with('/') {
-                return Err(SystemError::EINVAL);
-            }
-            Arc::new(MountPath::from(path))
+        let md = mountpoint.metadata()?;
+        let parent_fs = fuse_node.fuse_fs().ok_or(SystemError::ENOENT)?;
+        let sub_fs = FuseFS::new_submount(
+            &parent_fs,
+            fuse_node.clone(),
+            fuse_node.nodeid(),
+            md,
+            attr_flags,
+        );
+        let submount_flags = mountpoint.mount_fs().mount_flags() | MountFlags::SUBMOUNT;
+        match mountpoint.mount_subtree_with_state_if_vacant(
+            sub_fs.clone(),
+            sub_fs.root_node(),
+            submount_flags,
+            None,
+            None,
+        ) {
+            Ok(_) | Err(SystemError::EEXIST) => Ok(()),
+            Err(error) => Err(error),
         }
-    };
-    let submount_flags = mountpoint.mount_fs().mount_flags() | MountFlags::SUBMOUNT;
-    let mount_res = mountpoint.mount_subtree_with_state(
-        sub_fs.clone(),
-        sub_fs.root_node(),
-        submount_flags,
-        None,
-        None,
-        Some(mount_path),
-    );
-    if let Err(e) = mount_res {
-        if e != SystemError::EEXIST {
-            return Err(e);
-        }
-    }
-    Ok(())
+    })
 }
 
 impl MountableFileSystem for FuseFS {

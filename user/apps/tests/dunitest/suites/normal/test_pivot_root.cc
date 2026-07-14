@@ -619,6 +619,72 @@ void case_double_pivot() {
     child_pass();
 }
 
+void case_chroot_mount_root() {
+    const char* sandbox = "/tmp/test_pivot_root/chroot_mount";
+    const char* new_root = "/tmp/test_pivot_root/chroot_mount/newroot";
+    const char* old_root = "/tmp/test_pivot_root/chroot_mount/newroot/oldroot";
+
+    ensure_parent_tree();
+    ensure_dir(sandbox);
+    prepare_private_mount_namespace();
+    if (mount("", sandbox, "ramfs", 0, nullptr) != 0) {
+        child_skip(strerror(errno));
+    }
+    if (mkdir(new_root, 0755) != 0 && errno != EEXIST) {
+        child_fail("mkdir(newroot) failed");
+    }
+    if (mount("", new_root, "ramfs", 0, nullptr) != 0) {
+        child_fail("mount(newroot) failed");
+    }
+    if (mkdir(old_root, 0755) != 0 && errno != EEXIST) {
+        child_fail("mkdir(oldroot) failed");
+    }
+    if (chroot(sandbox) != 0 || chdir("/") != 0) {
+        child_fail("chroot to mounted sandbox failed");
+    }
+    if (do_pivot_root("/newroot", "/newroot/oldroot") != 0) {
+        child_fail(strerror(errno));
+    }
+    if (access("/oldroot", F_OK) != 0) {
+        child_fail("nested current root not attached below put_old");
+    }
+    child_pass();
+}
+
+void case_chroot_ordinary_directory_rejected() {
+    const char* sandbox = "/tmp/test_pivot_root/chroot_ordinary";
+    const char* jail = "/tmp/test_pivot_root/chroot_ordinary/jail";
+    const char* new_root = "/tmp/test_pivot_root/chroot_ordinary/jail/newroot";
+    const char* old_root = "/tmp/test_pivot_root/chroot_ordinary/jail/newroot/oldroot";
+
+    ensure_parent_tree();
+    ensure_dir(sandbox);
+    prepare_private_mount_namespace();
+    if (mount("", sandbox, "ramfs", 0, nullptr) != 0) {
+        child_skip(strerror(errno));
+    }
+    if (mkdir(jail, 0755) != 0 && errno != EEXIST) {
+        child_fail("mkdir(jail) failed");
+    }
+    if (mkdir(new_root, 0755) != 0 && errno != EEXIST) {
+        child_fail("mkdir(newroot) failed");
+    }
+    if (mount("", new_root, "ramfs", 0, nullptr) != 0) {
+        child_fail("mount(newroot) failed");
+    }
+    if (mkdir(old_root, 0755) != 0 && errno != EEXIST) {
+        child_fail("mkdir(oldroot) failed");
+    }
+    if (chroot(jail) != 0 || chdir("/") != 0) {
+        child_fail("chroot to ordinary directory failed");
+    }
+    errno = 0;
+    if (do_pivot_root("/newroot", "/newroot/oldroot") != -1 || errno != EINVAL) {
+        child_fail("pivot_root from ordinary chroot did not return EINVAL");
+    }
+    child_pass();
+}
+
 TEST(PivotRoot, SuccessPath) {
     expect_case_pass_or_skip("pivot_root_success", case_success_path);
 }
@@ -658,6 +724,15 @@ TEST(PivotRoot, MountNamespaceIsolation) {
 
 TEST(PivotRoot, DoublePivot) {
     expect_case_pass_or_skip("pivot_root_double_pivot", case_double_pivot);
+}
+
+TEST(PivotRoot, ChrootMountRoot) {
+    expect_case_pass_or_skip("pivot_root_chroot_mount_root", case_chroot_mount_root);
+}
+
+TEST(PivotRoot, ChrootOrdinaryDirectoryRejected) {
+    expect_case_pass_or_skip("pivot_root_chroot_ordinary_directory_rejected",
+                             case_chroot_ordinary_directory_rejected);
 }
 
 }  // namespace

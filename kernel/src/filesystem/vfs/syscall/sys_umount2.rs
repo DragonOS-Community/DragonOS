@@ -5,8 +5,8 @@ use super::sys_mount::may_mount;
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_UMOUNT2},
     filesystem::vfs::{
-        fcntl::AtFlags, utils::user_path_at, FileSystem, IndexNode, MountFS, MAX_PATHLEN,
-        VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        fcntl::AtFlags, mount::is_mountpoint_root, utils::user_path_at, FileSystem, MountFS,
+        MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
     libs::casting::DowncastArc,
     process::ProcessManager,
@@ -15,11 +15,7 @@ use crate::{
         user_access,
     },
 };
-use alloc::{
-    string::{String, ToString},
-    sync::Arc,
-    vec::Vec,
-};
+use alloc::{sync::Arc, vec::Vec};
 use system_error::SystemError;
 
 /// src/linux/mount.c `umount` & `umount2`
@@ -110,14 +106,15 @@ pub fn do_umount2(dirfd: i32, target: &str, flag: UmountFlag) -> Result<Arc<Moun
         return Err(SystemError::EPERM);
     }
 
-    let path = visible_umount_path(&target_inode)?;
-
     let current_mntns = ProcessManager::current_mntns();
-    let Some(fs) = current_mntns.mount_list().get(path.as_str()) else {
-        log::warn!("do_umount2: mount_list miss for resolved='{}'", path);
+    if !is_mountpoint_root(&target_inode) {
         return Err(SystemError::EINVAL);
-    };
-    if !fs.is_belongs_to_mntns(&current_mntns) {
+    }
+    let fs = target_inode
+        .fs()
+        .downcast_arc::<MountFS>()
+        .ok_or(SystemError::EINVAL)?;
+    if fs.self_mountpoint().is_none() || !fs.is_belongs_to_mntns(&current_mntns) {
         return Err(SystemError::EINVAL);
     }
 
@@ -127,44 +124,13 @@ pub fn do_umount2(dirfd: i32, target: &str, flag: UmountFlag) -> Result<Arc<Moun
     let lazy = flag.contains(UmountFlag::MNT_DETACH);
     if let Err(err) = MountFS::umount_subtree_with_mode(&fs, lazy) {
         log::warn!(
-            "do_umount2: fs.umount failed for resolved='{}', fs='{}': {:?}",
-            path,
+            "do_umount2: fs.umount failed for fs='{}': {:?}",
             fs.name(),
             err
         );
         return Err(err);
     }
     Ok(fs)
-}
-
-fn visible_umount_path(target_inode: &Arc<dyn IndexNode>) -> Result<String, SystemError> {
-    let absolute_path = target_inode.absolute_path()?;
-    let Some(target_mfs) = target_inode.fs().downcast_arc::<MountFS>() else {
-        return Ok(absolute_path);
-    };
-
-    let mount_root = target_mfs.root_inode();
-    if same_path_ref(target_inode, &mount_root) {
-        if let Some(mount_path) = ProcessManager::current_mntns()
-            .mount_list()
-            .get_mount_path_by_mountfs(&target_mfs)
-        {
-            return Ok(mount_path.as_str().to_string());
-        }
-    }
-
-    Ok(absolute_path)
-}
-
-fn same_path_ref(left: &Arc<dyn IndexNode>, right: &Arc<dyn IndexNode>) -> bool {
-    let Ok(left_meta) = left.metadata() else {
-        return false;
-    };
-    let Ok(right_meta) = right.metadata() else {
-        return false;
-    };
-
-    Arc::ptr_eq(&left.fs(), &right.fs()) && left_meta.inode_id == right_meta.inode_id
 }
 
 bitflags! {

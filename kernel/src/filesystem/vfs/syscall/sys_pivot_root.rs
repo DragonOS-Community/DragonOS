@@ -1,19 +1,13 @@
 //! System call handler for pivot_root(2).
 
-use alloc::{
-    string::{String, ToString},
-    sync::Arc,
-    vec::Vec,
-};
+use alloc::{sync::Arc, vec::Vec};
 use system_error::SystemError;
 
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_PIVOT_ROOT},
     filesystem::vfs::{
-        mount::MountFSInode,
-        permission::PermissionMask,
-        utils::{is_ancestor, user_path_at},
-        FileSystem, FileType, IndexNode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        mount::MountFSInode, permission::PermissionMask, utils::user_path_at, FileSystem, FileType,
+        IndexNode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
     libs::casting::DowncastArc,
     process::{all_process, ProcessControlBlock, ProcessManager},
@@ -30,11 +24,9 @@ pub struct SysPivotRootHandle;
 struct PivotRootTargets {
     current_pcb: Arc<ProcessControlBlock>,
     current_mntns: Arc<crate::process::namespace::mnt::MntNamespace>,
+    current_root_mntfs: Arc<crate::filesystem::vfs::MountFS>,
     new_root_mntfs: Arc<crate::filesystem::vfs::MountFS>,
     put_old_mountpoint: Arc<MountFSInode>,
-    old_new_root_path: String,
-    old_put_old_path: String,
-    new_put_old_path: String,
 }
 
 impl Syscall for SysPivotRootHandle {
@@ -44,26 +36,19 @@ impl Syscall for SysPivotRootHandle {
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let targets = resolve_pivot_root_targets(Self::new_root(args), Self::put_old(args))?;
-        let current_task = targets.current_pcb.clone();
-        let old_root_inode = targets.current_mntns.root_inode();
+        let old_root_inode = targets.current_pcb.fs_struct().root();
 
         targets.current_mntns.pivot_root(
+            targets.current_root_mntfs.clone(),
             targets.new_root_mntfs.clone(),
             targets.put_old_mountpoint.clone(),
-            &targets.old_new_root_path,
-            &targets.old_put_old_path,
-            &targets.new_put_old_path,
         )?;
 
-        let new_root_inode = targets.current_mntns.root_inode();
-        repair_same_namespace_fs_refs(
-            &targets.current_mntns,
-            &current_task,
-            &old_root_inode,
-            &new_root_inode,
-            &targets.old_new_root_path,
-            &targets.new_put_old_path,
-        )?;
+        // pivot_root operates on the caller's fs root, which may be a nested
+        // mount after chroot(2); it does not necessarily replace the mount
+        // namespace's global root.
+        let new_root_inode = targets.new_root_mntfs.root_inode();
+        repair_same_namespace_fs_refs(&targets.current_mntns, &old_root_inode, &new_root_inode);
 
         Ok(0)
     }
@@ -113,8 +98,7 @@ fn resolve_pivot_root_targets(
 
     let current_pcb = ProcessManager::current_pcb();
     let current_mntns = ProcessManager::current_mntns();
-    let namespace_root_inode = current_mntns.root_inode();
-    let current_root_inode = namespace_root_inode.clone();
+    let current_root_inode = current_pcb.fs_struct().root();
 
     let (new_root_begin, new_root_rest) = user_path_at(
         &current_pcb,
@@ -138,6 +122,9 @@ fn resolve_pivot_root_targets(
     let current_root_mntfs = mount_fs_from_inode(&current_root_inode)?;
     let new_root_mountpoint = inode_as_mountpoint(&new_root_inode)?;
     let put_old_mountpoint = inode_as_mountpoint(&put_old_inode)?;
+    if new_root_mountpoint.is_disconnected() {
+        return Err(SystemError::ENOENT);
+    }
     let new_root_mntfs = new_root_mountpoint.mount_fs();
     let put_old_mntfs = put_old_mountpoint.mount_fs();
 
@@ -151,11 +138,18 @@ fn resolve_pivot_root_targets(
         return Err(SystemError::EINVAL);
     }
 
-    if !is_ancestor(&current_root_inode, &new_root_inode) {
+    // Linux requires the caller's current fs root itself to be a mounted
+    // path. A chroot into an ordinary subdirectory must not rotate the whole
+    // containing mount.
+    if !is_mount_root(&current_root_inode)? {
         return Err(SystemError::EINVAL);
     }
 
-    if !is_ancestor(&new_root_inode, &put_old_inode) {
+    if !is_path_reachable(&current_root_inode, &new_root_inode)? {
+        return Err(SystemError::EINVAL);
+    }
+
+    if !is_path_reachable(&new_root_inode, &put_old_inode)? {
         return Err(SystemError::EINVAL);
     }
 
@@ -164,29 +158,25 @@ fn resolve_pivot_root_targets(
         .ok_or(SystemError::EINVAL)?;
     let new_root_parent_mntfs = new_root_parent.mount_fs();
 
-    if current_root_mntfs.propagation().is_shared()
-        || new_root_mntfs.propagation().is_shared()
+    let current_root_parent_mntfs = current_root_mntfs
+        .self_mountpoint()
+        .map(|mountpoint| mountpoint.mount_fs())
+        .unwrap_or_else(|| current_root_mntfs.clone());
+
+    if current_root_parent_mntfs.propagation().is_shared()
         || new_root_parent_mntfs.propagation().is_shared()
         || put_old_mntfs.propagation().is_shared()
+        || new_root_mntfs.is_locked()
     {
         return Err(SystemError::EINVAL);
     }
 
-    let old_new_root_path = resolved_visible_path(&new_root_path, &new_root_inode)?;
-    let put_old_path_before = resolved_visible_path(&put_old_path, &put_old_inode)?;
-    let new_put_old_path = put_old_path_before
-        .strip_prefix(&old_new_root_path)
-        .map(normalize_visible_path)
-        .ok_or(SystemError::EINVAL)?;
-
     Ok(PivotRootTargets {
         current_pcb,
         current_mntns,
+        current_root_mntfs,
         new_root_mntfs,
         put_old_mountpoint,
-        old_new_root_path,
-        old_put_old_path: put_old_path_before,
-        new_put_old_path,
     })
 }
 
@@ -226,67 +216,38 @@ fn is_mount_root(inode: &Arc<dyn IndexNode>) -> Result<bool, SystemError> {
 }
 
 fn same_path_ref(left: &Arc<dyn IndexNode>, right: &Arc<dyn IndexNode>) -> bool {
-    let left_meta = match left.metadata() {
-        Ok(meta) => meta,
-        Err(_) => return false,
+    let Some(left) = left.clone().downcast_arc::<MountFSInode>() else {
+        return Arc::ptr_eq(left, right);
     };
-    let right_meta = match right.metadata() {
-        Ok(meta) => meta,
-        Err(_) => return false,
+    let Some(right) = right.clone().downcast_arc::<MountFSInode>() else {
+        return false;
     };
-
-    Arc::ptr_eq(&left.fs(), &right.fs()) && left_meta.inode_id == right_meta.inode_id
+    Arc::ptr_eq(&left.mount_fs(), &right.mount_fs()) && left.dentry_id() == right.dentry_id()
 }
 
-fn resolved_visible_path(
-    requested_path: &str,
-    inode: &Arc<dyn IndexNode>,
-) -> Result<String, SystemError> {
-    match inode.absolute_path() {
-        Ok(path) => Ok(path),
-        Err(SystemError::ENOSYS) => Ok(normalize_requested_path(requested_path)),
-        Err(err) => Err(err),
-    }
-}
-
-fn normalize_requested_path(path: &str) -> String {
-    let base = if path.starts_with('/') {
-        String::from("/")
-    } else {
-        ProcessManager::current_pcb().basic().cwd()
-    };
-
-    let mut components: Vec<&str> = base.split('/').filter(|part| !part.is_empty()).collect();
-    for component in path.split('/').filter(|part| !part.is_empty()) {
-        match component {
-            "." => {}
-            ".." => {
-                components.pop();
-            }
-            _ => components.push(component),
+fn is_path_reachable(
+    ancestor: &Arc<dyn IndexNode>,
+    descendant: &Arc<dyn IndexNode>,
+) -> Result<bool, SystemError> {
+    let mut current = descendant.clone();
+    for _ in 0..=MAX_PATHLEN {
+        if same_path_ref(ancestor, &current) {
+            return Ok(true);
         }
+        let parent = current.parent()?;
+        if same_path_ref(&parent, &current) {
+            return Ok(false);
+        }
+        current = parent;
     }
-
-    if components.is_empty() {
-        return String::from("/");
-    }
-
-    let mut normalized = String::new();
-    for component in components {
-        normalized.push('/');
-        normalized.push_str(component);
-    }
-    normalized
+    Err(SystemError::ELOOP)
 }
 
 fn repair_same_namespace_fs_refs(
     target_mntns: &Arc<crate::process::namespace::mnt::MntNamespace>,
-    current_task: &Arc<ProcessControlBlock>,
     old_root_inode: &Arc<dyn IndexNode>,
     new_root_inode: &Arc<dyn IndexNode>,
-    old_new_root_path: &str,
-    new_put_old_path: &str,
-) -> Result<(), SystemError> {
+) {
     let tasks: Vec<Arc<ProcessControlBlock>> = {
         let all = all_process().lock_irqsave();
         all.as_ref()
@@ -302,69 +263,39 @@ fn repair_same_namespace_fs_refs(
         let Some(fs) = task.try_fs_struct() else {
             continue;
         };
-        let is_current_task = Arc::ptr_eq(&task, current_task);
         let root_replaced = same_path_ref(&fs.root(), old_root_inode);
         let pwd_replaced = same_path_ref(&fs.pwd(), old_root_inode);
-        let rewrite_cwd = is_current_task || root_replaced || pwd_replaced;
-
-        if !root_replaced && !pwd_replaced && !rewrite_cwd {
+        if !root_replaced && !pwd_replaced {
             continue;
         }
 
-        let old_cwd = task.basic().cwd();
-        let mut basic = task.basic_mut();
-        if root_replaced || is_current_task {
+        if root_replaced {
             fs.set_root(new_root_inode.clone());
         }
         if pwd_replaced {
             fs.set_pwd(new_root_inode.clone());
         }
-
-        if rewrite_cwd {
-            let new_cwd = if pwd_replaced {
-                "/".to_string()
-            } else {
-                rewrite_visible_path(&old_cwd, old_new_root_path, new_put_old_path)
-            };
-            basic.set_cwd(new_cwd);
+        // basic.cwd is only a display cache.  An unlinked cwd can make path
+        // rendering fail after the topology commit; Linux's chroot_fs_refs()
+        // is infallible, so cache refresh must not change syscall success.
+        if let Ok(cwd) = visible_pwd(&fs) {
+            task.basic_mut().set_cwd(cwd);
         }
-    }
-
-    Ok(())
-}
-
-fn normalize_visible_path(path: &str) -> String {
-    if path.is_empty() || path == "/" {
-        "/".to_string()
-    } else if path.starts_with('/') {
-        path.to_string()
-    } else {
-        format!("/{}", path)
     }
 }
 
-fn rewrite_visible_path(path: &str, old_new_root_path: &str, new_put_old_path: &str) -> String {
-    if path == old_new_root_path {
-        return "/".to_string();
+fn visible_pwd(
+    fs: &Arc<crate::filesystem::fs::FsStruct>,
+) -> Result<alloc::string::String, SystemError> {
+    let root = fs.root().absolute_path()?;
+    let pwd = fs.pwd().absolute_path()?;
+    if pwd == root {
+        return Ok("/".into());
     }
-
-    if let Some(suffix) = path.strip_prefix(old_new_root_path) {
-        if suffix.is_empty() {
-            return "/".to_string();
-        }
-        return normalize_visible_path(suffix);
+    if root == "/" {
+        return Ok(pwd);
     }
-
-    if path == "/" {
-        return new_put_old_path.to_string();
-    }
-
-    if new_put_old_path == "/" {
-        return normalize_visible_path(path);
-    }
-
-    let mut result = new_put_old_path.trim_end_matches('/').to_string();
-    result.push('/');
-    result.push_str(path.trim_start_matches('/'));
-    result
+    let prefix = format!("{}/", root.trim_end_matches('/'));
+    let relative = pwd.strip_prefix(&prefix).ok_or(SystemError::ENOENT)?;
+    Ok(format!("/{relative}"))
 }

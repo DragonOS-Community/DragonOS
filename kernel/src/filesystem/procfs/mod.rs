@@ -10,7 +10,7 @@ use crate::{
     process::{cred::Cred, namespace::pid_namespace::INIT_PID_NAMESPACE, ProcessManager},
 };
 
-use super::vfs::mount::{MountFlags, MountPath};
+use super::vfs::mount::MountFlags;
 use super::vfs::InodeMode;
 
 mod cmdline;
@@ -78,16 +78,11 @@ pub fn procfs_init() -> Result<(), SystemError> {
         let procfs: Arc<ProcFS> = ProcFS::new(INIT_PID_NAMESPACE.clone());
         let root_inode = ProcessManager::current_mntns().root_inode();
         // procfs 挂载
-        let mntfs = root_inode
+        root_inode
             .mkdir("proc", InodeMode::from_bits_truncate(0o755))
             .expect("Unable to create /proc")
             .mount(procfs, MountFlags::empty())
             .expect("Failed to mount at /proc");
-        let ino = root_inode.metadata().unwrap().inode_id;
-        let mount_path = Arc::new(MountPath::from("/proc"));
-        ProcessManager::current_mntns()
-            .add_mount(Some(ino), mount_path, mntfs)
-            .expect("Failed to add mount for /proc");
         ::log::info!("ProcFS mounted at /proc");
         result = Some(Ok(()));
     });

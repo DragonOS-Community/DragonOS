@@ -673,6 +673,16 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
+    /// Incarnation paired with `inode_id` for VFS cache identity.
+    ///
+    /// Filesystems which can reuse inode numbers while old dentries are still
+    /// referenced (notably FUSE) must override this with an identity that
+    /// changes whenever a new in-memory inode replaces the old one. Filesystems
+    /// without such reuse may keep zero.
+    fn inode_generation(&self) -> u64 {
+        0
+    }
+
     /// @brief 设置inode的元数据
     ///
     /// @return 成功：Ok()
@@ -836,6 +846,18 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
+    /// Execute a namespace mutation as part of one layered VFS transaction.
+    /// Filesystems that delegate to mounted backing paths must propagate the
+    /// context instead of recursively acquiring the global dentry lock.
+    fn unlink_with_context(
+        &self,
+        name: &str,
+        context: &mount::DentryMutationContext<'_>,
+    ) -> Result<(), SystemError> {
+        context.ensure_locked();
+        self.unlink(name)
+    }
+
     /// @brief 删除文件夹
     ///
     /// @param name 文件夹名称
@@ -844,6 +866,15 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @return 失败 Err(错误码)
     fn rmdir(&self, _name: &str) -> Result<(), SystemError> {
         return Err(SystemError::ENOSYS);
+    }
+
+    fn rmdir_with_context(
+        &self,
+        name: &str,
+        context: &mount::DentryMutationContext<'_>,
+    ) -> Result<(), SystemError> {
+        context.ensure_locked();
+        self.rmdir(name)
     }
 
     /// 将指定的`old_name`子目录项移动到target目录下, 并予以`new_name`。
@@ -859,6 +890,18 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回"不支持"
         return Err(SystemError::ENOSYS);
+    }
+
+    fn move_to_with_context(
+        &self,
+        old_name: &str,
+        target: &Arc<dyn IndexNode>,
+        new_name: &str,
+        flag: RenameFlags,
+        context: &mount::DentryMutationContext<'_>,
+    ) -> Result<(), SystemError> {
+        context.ensure_locked();
+        self.move_to(old_name, target, new_name, flag)
     }
 
     /// @brief 专用于 remote 权限模型下 access(2) 的检查
@@ -1863,10 +1906,8 @@ pub trait FileSystem: Any + Sync + Send + Debug {
         mount: &MountFS,
         out: &mut dyn Write,
     ) -> Result<(), SystemError> {
-        match mount.root_inner_inode().absolute_path() {
-            Ok(root) if !root.is_empty() => out.write_str(&root).map_err(|_| SystemError::EINVAL),
-            _ => out.write_char('/').map_err(|_| SystemError::EINVAL),
-        }
+        let root = mount.root_path()?;
+        out.write_str(&root).map_err(|_| SystemError::EINVAL)
     }
 
     /// Render fs-specific stats for `/proc/*/mountstats`.

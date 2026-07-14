@@ -1,21 +1,22 @@
 use crate::{
     filesystem::vfs::{
-        mount::{MountFSInode, MountFlags, MountList, MountPath, MOUNT_LIFECYCLE_LOCK},
-        FileSystem, IndexNode, InodeId, MountFS,
+        mount::{MountFSInode, MountFlags, MOUNT_LIFECYCLE_LOCK},
+        FileSystem, IndexNode, MountFS,
     },
-    libs::{mutex::MutexGuard, once::Once, rwsem::RwSem},
+    libs::{casting::DowncastArc, once::Once, rwsem::RwSem},
     process::{fork::CloneFlags, namespace::NamespaceType, ProcessManager},
 };
-use alloc::string::{String, ToString};
+use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
-use hashbrown::HashSet;
 use system_error::SystemError;
 
 use super::{
     nsproxy::NsCommon,
-    propagation::{register_peer, register_slave_with_master, MountPropagation},
+    propagation::{
+        propagate_moved_tree_locked, register_peer, register_slave_with_master, MountPropagation,
+    },
     user_namespace::UserNamespace,
     NamespaceOps,
 };
@@ -50,7 +51,24 @@ pub struct MntNamespace {
 pub struct InnerMntNamespace {
     _dead: bool,
     root_mountfs: Arc<MountFS>,
-    mount_list: Arc<MountList>,
+    /// Exact old-mount to copied-mount projection used to rebind fs_struct
+    /// root/pwd after CLONE_NEWNS. This is object identity, never a pathname.
+    copy_sources: Vec<(Weak<MountFS>, Weak<MountFS>)>,
+}
+
+fn tree_contains_unbindable(root: &Arc<MountFS>) -> bool {
+    if root.propagation().is_unbindable() {
+        return true;
+    }
+
+    let mut pending = root.mount_children();
+    while let Some(mount) = pending.pop() {
+        if mount.propagation().is_unbindable() {
+            return true;
+        }
+        pending.extend(mount.mount_children());
+    }
+    false
 }
 
 impl NamespaceOps for MntNamespace {
@@ -61,8 +79,6 @@ impl NamespaceOps for MntNamespace {
 
 impl MntNamespace {
     fn new_root() -> Arc<Self> {
-        let mount_list = MountList::new();
-
         let ramfs = crate::filesystem::ramfs::RamFS::new();
         let ramfs = MountFS::new(
             ramfs,
@@ -80,18 +96,16 @@ impl MntNamespace {
             _user_ns: super::user_namespace::INIT_USER_NAMESPACE.clone(),
             inner: RwSem::new(InnerMntNamespace {
                 root_mountfs: ramfs.clone(),
-                mount_list,
+                copy_sources: Vec::new(),
                 _dead: false,
             }),
         });
 
         {
             let _topology = MOUNT_LIFECYCLE_LOCK.lock();
-            ramfs.set_namespace(Arc::downgrade(&result));
             result
-                .add_mount(None, Arc::new(MountPath::from("/")), ramfs)
+                .add_mount(None, None, ramfs)
                 .expect("Failed to add root mount");
-            result.root_mntfs().activate();
         }
 
         return result;
@@ -106,224 +120,199 @@ impl MntNamespace {
     /// This method is only for use during DragonOS initialization.
     pub fn force_change_root_mountfs(&self, new_root: Arc<MountFS>) {
         let mut inner_guard = self.inner.write();
-        let (path, _, _) = inner_guard.mount_list.get_mount_point("/").unwrap();
-        inner_guard.root_mountfs = new_root.clone();
+        new_root.set_namespace(self.self_ref.clone());
+        let old_root = core::mem::replace(&mut inner_guard.root_mountfs, new_root);
+        drop(inner_guard);
 
-        inner_guard.mount_list.insert(None, path, new_root);
-
-        // update mount list ino
+        assert!(
+            old_root.mount_children().is_empty(),
+            "initial root replacement requires every child mount to be migrated"
+        );
+        old_root.clear_namespace();
+        old_root.deactivate();
     }
 
     pub fn pivot_root(
         &self,
+        old_root: Arc<MountFS>,
         new_root: Arc<MountFS>,
         put_old_mountpoint: Arc<MountFSInode>,
-        old_new_root_path: &str,
-        old_put_old_path: &str,
-        new_put_old_path: &str,
     ) -> Result<(), SystemError> {
         let new_root_mountpoint = new_root.self_mountpoint().ok_or(SystemError::EINVAL)?;
         let new_root_parent = new_root_mountpoint.mount_fs();
         let put_old_parent = put_old_mountpoint.mount_fs();
-        let put_old_is_new_root = old_put_old_path == old_new_root_path;
-        let new_root_mountpoint_id = new_root_mountpoint.inode_id()?;
-        let put_old_mountpoint_id = put_old_mountpoint.inode_id()?;
         let _topology = MOUNT_LIFECYCLE_LOCK.lock();
         let mut inner_guard = self.inner.write();
-        let old_root = Self::root_mntfs_locked(&inner_guard);
         let old_root_mountpoint = old_root.self_mountpoint();
-
+        let old_root_tucked_under = old_root.is_tucked_under();
+        let new_root_tucked_under = new_root.is_tucked_under();
+        let namespace_root = Self::root_mntfs_locked(&inner_guard);
+        if !old_root.is_belongs_to_mntns(&self.self_ref.upgrade().ok_or(SystemError::EINVAL)?)
+            || new_root.is_locked()
         {
-            let put_old_mounts = put_old_parent.mountpoints();
-            if put_old_mounts.contains_key(&put_old_mountpoint_id) {
-                return Err(SystemError::EBUSY);
-            }
+            return Err(SystemError::EINVAL);
         }
 
-        {
-            let mut parent_mounts = new_root_parent.mountpoints();
-            parent_mounts
-                .remove(&new_root_mountpoint_id)
-                .ok_or(SystemError::EINVAL)?;
+        if put_old_parent.lookup_top(&put_old_mountpoint).is_some() {
+            return Err(SystemError::EBUSY);
         }
 
-        old_root.set_self_mountpoint(Some(put_old_mountpoint.clone()));
-        {
-            let mut put_old_mounts = put_old_parent.mountpoints();
-            if put_old_mounts
-                .insert(put_old_mountpoint_id, old_root.clone())
-                .is_some()
-            {
-                old_root.set_self_mountpoint(old_root_mountpoint);
+        new_root_parent.detach_exact(&new_root)?;
+
+        let old_parent = old_root_mountpoint
+            .as_ref()
+            .map(|mountpoint| mountpoint.mount_fs());
+        if let (Some(parent), Some(_)) = (&old_parent, &old_root_mountpoint) {
+            if let Err(error) = parent.detach_exact(&old_root) {
                 new_root_parent
-                    .add_mount(new_root_mountpoint_id, new_root.clone())
-                    .map_err(|_| SystemError::EBUSY)?;
-                return Err(SystemError::EBUSY);
+                    .attach_top(&new_root_mountpoint, new_root.clone())
+                    .expect("pivot_root rollback must restore the detached new root");
+                new_root.restore_tucked_under(new_root_tucked_under);
+                return Err(error);
             }
         }
 
-        new_root.set_self_mountpoint(None);
+        old_root.relocate_mountpoint(Some(put_old_mountpoint.clone()));
+        if let Err(error) = put_old_parent.attach_new_top(&put_old_mountpoint, old_root.clone()) {
+            old_root.relocate_mountpoint(old_root_mountpoint.clone());
+            if let (Some(parent), Some(mountpoint)) = (&old_parent, &old_root_mountpoint) {
+                parent
+                    .attach_top(mountpoint, old_root.clone())
+                    .expect("pivot_root rollback must restore the current root edge");
+                old_root.restore_tucked_under(old_root_tucked_under);
+            }
+            new_root_parent
+                .attach_top(&new_root_mountpoint, new_root.clone())
+                .expect("pivot_root rollback must restore the detached new root");
+            new_root.restore_tucked_under(new_root_tucked_under);
+            return Err(error);
+        }
 
-        inner_guard.root_mountfs = new_root.clone();
-
-        inner_guard.mount_list.remove("/");
-        if put_old_is_new_root {
-            inner_guard.mount_list.rewrite_paths(|path| {
-                if path == old_new_root_path || path_is_under(path, old_new_root_path) {
-                    return Some(rewrite_pivot_path(
-                        path,
-                        old_new_root_path,
-                        new_put_old_path,
-                    ));
-                }
-
-                None
-            });
-            inner_guard.mount_list.insert(
-                Some(put_old_mountpoint_id),
-                Arc::new(MountPath::from("/")),
-                old_root,
-            );
+        if let (Some(parent), Some(mountpoint)) = (&old_parent, &old_root_mountpoint) {
+            new_root.relocate_mountpoint(Some(mountpoint.clone()));
+            if let Err(error) = parent.attach_top(mountpoint, new_root.clone()) {
+                put_old_parent
+                    .detach_exact(&old_root)
+                    .expect("pivot_root rollback must detach the temporary old root edge");
+                old_root.relocate_mountpoint(Some(mountpoint.clone()));
+                parent
+                    .attach_top(mountpoint, old_root.clone())
+                    .expect("pivot_root rollback must restore the current root edge");
+                old_root.restore_tucked_under(old_root_tucked_under);
+                new_root.relocate_mountpoint(Some(new_root_mountpoint.clone()));
+                new_root_parent
+                    .attach_top(&new_root_mountpoint, new_root.clone())
+                    .expect("pivot_root rollback must restore the new-root edge");
+                new_root.restore_tucked_under(new_root_tucked_under);
+                return Err(error);
+            }
         } else {
-            inner_guard.mount_list.rewrite_paths(|path| {
-                if path == old_put_old_path || path_is_under(path, old_put_old_path) {
-                    return None;
-                }
+            debug_assert!(Arc::ptr_eq(&namespace_root, &old_root));
+            new_root.relocate_mountpoint(None);
+            inner_guard.root_mountfs = new_root.clone();
+        }
 
-                Some(rewrite_pivot_path(
-                    path,
-                    old_new_root_path,
-                    new_put_old_path,
-                ))
-            });
-            inner_guard.mount_list.insert(
-                Some(put_old_mountpoint_id),
-                Arc::new(MountPath::from(new_put_old_path)),
-                old_root,
-            );
+        // Linux transfers MNT_LOCKED from the old root to the new root at
+        // commit. The old root now lives below put_old, outside the boundary
+        // that the lock protected before pivot_root.
+        if old_root.is_locked() {
+            old_root.unlock_mount();
+            new_root.lock_mount();
         }
 
         Ok(())
     }
 
-    /// Implement the topology move and mount_list subtree path rewrite for mount(MS_MOVE).
+    /// Move a complete mount subtree onto an exact shared dentry.
     ///
     /// Aligns with Linux `attach_recursive_mnt(MNT_TREE_MOVE)`: detaches `source_mfs`
-    /// (along with its entire child mount subtree) from the old parent mount, attaches it
-    /// to the target parent mount where `target_mountpoint` resides, and rewrites all
-    /// mount_list paths prefixed with `old_source_path` to `new_target_path`.
+    /// (along with its entire child mount subtree) from the old parent mount and attaches
+    /// it to the target parent mount where `target_mountpoint` resides.
     ///
-    /// Child mounts' parent-child relationships (`mountpoints`) and their respective
-    /// `self_mountpoint` remain unchanged, so only the moved mount's own `self_mountpoint`
-    /// and the path records of the entire subtree in mount_list need updating.
+    /// Child edges remain unchanged. Paths are rendered from the resulting object
+    /// topology, so the move never rewrites pathname records.
     ///
     /// On attach failure, rolls back to the original mount position, ensuring all-or-nothing.
     /// Propagation is handled by the caller after success.
     ///
-    /// Pre-checks (belongs to current mntns, source is mount root, type match, cycle prevention,
-    /// parent mount not shared, etc.) are performed by the caller (syscall layer); this method
-    /// only handles the topology changes.
+    /// Path and inode type checks are performed by the syscall layer. Topology-dependent
+    /// admission checks are repeated here while holding `MOUNT_LIFECYCLE_LOCK`, so a concurrent
+    /// move or detach cannot invalidate the decision before the edge mutation commits.
     pub fn move_mount(
         &self,
         source_mfs: &Arc<MountFS>,
         target_mountpoint: &Arc<MountFSInode>,
-        old_source_path: &str,
-        new_target_path: &str,
     ) -> Result<(), SystemError> {
-        let topology = MOUNT_LIFECYCLE_LOCK.lock();
-        self.move_mount_locked(
-            source_mfs,
-            target_mountpoint,
-            old_source_path,
-            new_target_path,
-            &topology,
-        )
-    }
-
-    pub(crate) fn move_mount_locked(
-        &self,
-        source_mfs: &Arc<MountFS>,
-        target_mountpoint: &Arc<MountFSInode>,
-        old_source_path: &str,
-        new_target_path: &str,
-        _topology: &MutexGuard<'_, ()>,
-    ) -> Result<(), SystemError> {
-        let old_mountpoint = source_mfs.self_mountpoint().ok_or(SystemError::EINVAL)?;
-        let old_parent = old_mountpoint.mount_fs();
-        let old_mp_id = old_mountpoint.inode_id()?;
-
+        let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+        let namespace = self.self_ref.upgrade().ok_or(SystemError::EINVAL)?;
         let target_parent = target_mountpoint.mount_fs();
-        let target_mp_id = target_mountpoint.inode_id()?;
-        let inner = self.inner.write();
-        let moving_mounts = collect_mount_subtree(source_mfs);
-
-        // 1. Detach from the old parent mount.
-        let removed = old_parent
-            .mountpoints()
-            .remove(&old_mp_id)
-            .ok_or(SystemError::ENOENT)?;
-
-        // 2. Attach to the target parent mount; on failure, roll back by reattaching source to its original position.
-        if let Err(e) = target_parent.add_mount(target_mp_id, source_mfs.clone()) {
-            old_parent.mountpoints().insert(old_mp_id, removed);
-            return Err(e);
+        if !source_mfs.is_live()
+            || !target_parent.accepts_topology_edges()
+            || !source_mfs.is_belongs_to_mntns(&namespace)
+            || !target_parent.is_belongs_to_mntns(&namespace)
+            || source_mfs.is_locked()
+        {
+            return Err(SystemError::EINVAL);
         }
-        source_mfs.set_self_mountpoint(Some(target_mountpoint.clone()));
 
-        // 3. mount_list subtree path rewrite + root mount point inode update (rebuilt atomically
-        //    within the ns lock, keeping mountpoints and mount_list's four tables consistent).
-        //
-        //    Critical: the moved subtree root's mount point inode has changed from old_mp_id to
-        //    target_mp_id. The ino in the mount_list root record must be updated accordingly,
-        //    otherwise copy_mnt_ns() will fail when traversing mountpoints and looking up
-        //    target_mp_id in ino2mp.
-        let move_result = inner.mount_list.move_subtree(
-            source_mfs,
-            &moving_mounts,
-            target_mp_id,
-            old_source_path,
-            new_target_path,
-        );
+        let old_mountpoint = source_mfs.self_mountpoint().ok_or(SystemError::EINVAL)?;
+        let old_tucked_under = source_mfs.is_tucked_under();
+        let old_parent = old_mountpoint.mount_fs();
+        if !old_parent.is_live()
+            || !old_parent.is_belongs_to_mntns(&namespace)
+            || old_parent.propagation().is_shared()
+        {
+            return Err(SystemError::EINVAL);
+        }
 
-        if let Err(e) = move_result {
-            target_parent.mountpoints().remove(&target_mp_id);
-            old_parent.mountpoints().insert(old_mp_id, removed);
-            source_mfs.set_self_mountpoint(Some(old_mountpoint));
-            return Err(e);
+        if target_parent.propagation().is_shared() && tree_contains_unbindable(source_mfs) {
+            return Err(SystemError::EINVAL);
+        }
+
+        let mut ancestor = target_parent.clone();
+        loop {
+            if Arc::ptr_eq(&ancestor, source_mfs) {
+                return Err(SystemError::ELOOP);
+            }
+            match ancestor.self_mountpoint() {
+                Some(mountpoint) => ancestor = mountpoint.mount_fs(),
+                None => break,
+            }
+        }
+
+        old_parent.detach_exact(source_mfs)?;
+        source_mfs.relocate_mountpoint(Some(target_mountpoint.clone()));
+        if let Err(error) = target_parent.attach_new_top(target_mountpoint, source_mfs.clone()) {
+            source_mfs.relocate_mountpoint(Some(old_mountpoint));
+            source_mfs.restore_tucked_under(old_tucked_under);
+            old_parent
+                .attach_top(
+                    &source_mfs
+                        .self_mountpoint()
+                        .expect("move rollback restored the old mountpoint"),
+                    source_mfs.clone(),
+                )
+                .expect("move rollback must restore the exact detached edge");
+            return Err(error);
+        }
+
+        if target_parent.propagation().is_shared() {
+            if let Err(error) =
+                propagate_moved_tree_locked(&target_parent, source_mfs, target_mountpoint)
+            {
+                target_parent
+                    .detach_exact(source_mfs)
+                    .expect("failed move propagation must detach the target edge");
+                source_mfs.relocate_mountpoint(Some(old_mountpoint.clone()));
+                source_mfs.restore_tucked_under(old_tucked_under);
+                old_parent
+                    .attach_top(&old_mountpoint, source_mfs.clone())
+                    .expect("failed move propagation must restore the old edge");
+                return Err(error);
+            }
         }
 
         Ok(())
-    }
-
-    fn copy_with_mountfs(
-        &self,
-        new_root: Arc<MountFS>,
-        _user_ns: Arc<UserNamespace>,
-        _topology: &MutexGuard<'_, ()>,
-    ) -> Arc<Self> {
-        let mut ns_common = self.ns_common.clone();
-        ns_common.level += 1;
-
-        let result = Arc::new_cyclic(|self_ref| Self {
-            ns_common,
-            self_ref: self_ref.clone(),
-            _user_ns,
-            inner: RwSem::new(InnerMntNamespace {
-                _dead: false,
-                root_mountfs: new_root.clone(),
-                mount_list: MountList::new(),
-            }),
-        });
-
-        // The caller holds MOUNT_LIFECYCLE_LOCK, which serializes publication
-        // of every mount in the namespace copy with move/unmount/teardown.
-        new_root.set_namespace(Arc::downgrade(&result));
-        result
-            .add_mount(None, Arc::new(MountPath::from("/")), new_root)
-            .expect("Failed to add root mount");
-        result.root_mntfs().activate();
-
-        result
     }
 
     /// Creates a copy of the mount namespace for process cloning.
@@ -341,7 +330,7 @@ impl MntNamespace {
     ///
     /// # Behavior
     /// - If `CLONE_NEWNS` is not set, returns the current mount namespace
-    /// - If `CLONE_NEWNS` is set, creates a new mount namespace (currently unimplemented)
+    /// - If `CLONE_NEWNS` is set, copies the complete ordered mount topology
     #[inline(never)]
     pub fn copy_mnt_ns(
         &self,
@@ -357,117 +346,84 @@ impl MntNamespace {
         // deadlock with move_mount() or namespace teardown.
         let _topology = MOUNT_LIFECYCLE_LOCK.lock();
         let inner = self.inner.read();
+        let cross_user_namespace = !Arc::ptr_eq(&self._user_ns, &user_ns);
 
         let old_root_mntfs = Self::root_mntfs_locked(&inner);
-        let mut queue: Vec<MountFSCopyInfo> = Vec::new();
+        let new_root_mntfs = old_root_mntfs.deepcopy(None)?;
+        restrict_cross_user_propagation(&old_root_mntfs, &new_root_mntfs, cross_user_namespace);
+        let mut copied_mounts = vec![(old_root_mntfs.clone(), new_root_mntfs.clone())];
+        let mut queue = VecDeque::from([(old_root_mntfs, new_root_mntfs.clone())]);
 
-        // The root mntfs is special, so it is copied separately.
-        let new_root_mntfs = old_root_mntfs.deepcopy(None);
-
-        // If root mount was shared, register the new root in the same peer group
-        let old_root_propagation = old_root_mntfs.propagation();
-        if old_root_propagation.is_shared() {
-            let group_id = old_root_propagation.peer_group_id();
-            register_peer(group_id, &new_root_mntfs);
-            log::debug!(
-                "copy_mnt_ns: registered new root mount in peer group {}",
-                group_id.data()
-            );
-        }
-        if old_root_propagation.is_slave() {
-            register_slave_with_master(&new_root_mntfs);
-        }
-
-        let new_mntns = self.copy_with_mountfs(new_root_mntfs, user_ns, &_topology);
-        let new_mntns_root = new_mntns.root_mntfs();
-
-        for x in inner.mount_list.clone_inner().values() {
-            if Arc::ptr_eq(x, &new_mntns_root) {
-                continue; // Skip the root mountfs
+        // Build the complete detached tree first. Every copied edge retains the
+        // exact shared dentry, and each shadow stack is replayed bottom-to-top.
+        // Consequently any projection failure leaves only constructing mounts,
+        // with no namespace or lifecycle state to roll back.
+        let copy_result = (|| {
+            while let Some((old_parent, new_parent)) = queue.pop_front() {
+                let child_stacks: Vec<Vec<Arc<MountFS>>> =
+                    old_parent.mountpoints().values().cloned().collect();
+                for child_stack in child_stacks {
+                    for old_child in child_stack {
+                        let old_mountpoint =
+                            old_child.self_mountpoint().ok_or(SystemError::EINVAL)?;
+                        let new_mountpoint =
+                            new_parent.wrapper_for_existing_edge(old_mountpoint.shared_dentry());
+                        let new_child = old_child.deepcopy(Some(new_mountpoint.clone()))?;
+                        restrict_cross_user_propagation(
+                            &old_child,
+                            &new_child,
+                            cross_user_namespace,
+                        );
+                        if let Err(error) =
+                            new_parent.attach_top(&new_mountpoint, new_child.clone())
+                        {
+                            MountFS::deactivate_disconnected_subtree(&new_child);
+                            return Err(error);
+                        }
+                        copied_mounts.push((old_child.clone(), new_child.clone()));
+                        queue.push_back((old_child, new_child));
+                    }
+                }
             }
+            Ok(())
+        })();
+        if let Err(error) = copy_result {
+            MountFS::deactivate_disconnected_subtree(&new_root_mntfs);
+            return Err(error);
         }
 
-        // Copy all mount points under root mntfs into the new mntns
-        for (ino, mfs) in old_root_mntfs.mountpoints().iter() {
-            let mount_path = inner
-                .mount_list
-                .get_mount_path_by_ino(*ino)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "copy_mnt_ns: mount_path not found for ino={:?}, mfs name={}. \
-                         mountpoints and mount_list are out of sync.",
-                        ino,
-                        mfs.name()
-                    )
-                });
+        let mut ns_common = self.ns_common.clone();
+        ns_common.level += 1;
+        let new_mntns = Arc::new_cyclic(|self_ref| Self {
+            ns_common,
+            self_ref: self_ref.clone(),
+            _user_ns: user_ns,
+            inner: RwSem::new(InnerMntNamespace {
+                _dead: false,
+                root_mountfs: new_root_mntfs,
+                copy_sources: copied_mounts
+                    .iter()
+                    .map(|(old, new)| (Arc::downgrade(old), Arc::downgrade(new)))
+                    .collect(),
+            }),
+        });
 
-            queue.push(MountFSCopyInfo {
-                old_mount_fs: mfs.clone(),
-                parent_mount_fs: new_mntns_root.clone(),
-                self_mp_inode_id: *ino,
-                mount_path,
-            });
+        // Publication is infallible and occurs only after the detached copy is
+        // complete, so observers can never see a partially copied namespace.
+        for (_old_mount, new_mount) in copied_mounts {
+            new_mount.set_namespace(Arc::downgrade(&new_mntns));
+            let propagation = new_mount.propagation();
+            if propagation.is_shared() {
+                register_peer(propagation.peer_group_id(), &new_mount);
+            }
+            if propagation.is_slave() {
+                register_slave_with_master(&new_mount);
+            }
+            new_mount
+                .activate()
+                .expect("a detached namespace copy is published exactly once");
         }
 
-        // Process mount points in the queue
-        while let Some(data) = queue.pop() {
-            let old_self_mp = data.old_mount_fs.self_mountpoint().unwrap();
-            let new_self_mp = old_self_mp.clone_with_new_mount_fs(data.parent_mount_fs.clone());
-            let new_mount_fs = data.old_mount_fs.deepcopy(Some(new_self_mp));
-
-            // copy_mnt_ns second pass
-            new_mount_fs.set_namespace(Arc::downgrade(&new_mntns));
-
-            // If the old mount was shared, register the new mount in the same peer group
-            // This establishes the peer relationship for cross-namespace propagation
-            let old_propagation = data.old_mount_fs.propagation();
-            if old_propagation.is_shared() {
-                let group_id = old_propagation.peer_group_id();
-                register_peer(group_id, &new_mount_fs);
-            }
-            if old_propagation.is_slave() {
-                register_slave_with_master(&new_mount_fs);
-            }
-
-            data.parent_mount_fs
-                .add_mount(data.self_mp_inode_id, new_mount_fs.clone())
-                .expect("Failed to add mount");
-            new_mntns
-                .add_mount(
-                    Some(data.self_mp_inode_id),
-                    data.mount_path.clone(),
-                    new_mount_fs.clone(),
-                )
-                .expect("Failed to add mount to mount namespace");
-            new_mount_fs.activate();
-
-            // Add child mounts of the original mount point to the queue
-
-            for (child_ino, child_mfs) in data.old_mount_fs.mountpoints().iter() {
-                let child_mount_path = inner
-                    .mount_list
-                    .get_mount_path_by_ino(*child_ino)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "copy_mnt_ns: child mount_path not found for ino={:?}, mfs name={}, \
-                             parent path={}. mountpoints and mount_list are out of sync.",
-                            child_ino,
-                            child_mfs.name(),
-                            data.mount_path.as_str()
-                        )
-                    });
-                queue.push(MountFSCopyInfo {
-                    old_mount_fs: child_mfs.clone(),
-                    parent_mount_fs: new_mount_fs.clone(),
-                    self_mp_inode_id: *child_ino,
-                    mount_path: child_mount_path,
-                });
-            }
-        }
-
-        // todo: register in procfs
-
-        // Return the newly created mount namespace
         Ok(new_mntns)
     }
 
@@ -485,51 +441,168 @@ impl MntNamespace {
         root.root_inode()
     }
 
+    /// Project a path inode from the namespace that was copied to create this
+    /// namespace. The mount context changes, while the shared dentry identity
+    /// is retained exactly (including hard-link aliases and renamed parents).
+    pub fn project_copy_source_inode(
+        &self,
+        inode: &Arc<dyn IndexNode>,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let old_inode = inode
+            .clone()
+            .downcast_arc::<MountFSInode>()
+            .ok_or(SystemError::EXDEV)?;
+        let old_mount = old_inode.mount_fs();
+        let new_mount = self
+            .inner
+            .read()
+            .copy_sources
+            .iter()
+            .find_map(|(source, copy)| {
+                source
+                    .upgrade()
+                    .filter(|source| Arc::ptr_eq(source, &old_mount))
+                    .and_then(|_| copy.upgrade())
+            })
+            .ok_or(SystemError::EXDEV)?;
+        Ok(new_mount.wrapper_for_existing_edge(old_inode.shared_dentry()) as Arc<dyn IndexNode>)
+    }
+
     pub fn add_mount(
         &self,
-        ino: Option<InodeId>,
-        mount_path: Arc<MountPath>,
+        parent: Option<&Arc<MountFS>>,
+        mountpoint: Option<&Arc<MountFSInode>>,
         mntfs: Arc<MountFS>,
     ) -> Result<(), SystemError> {
-        self.inner.write().mount_list.insert(ino, mount_path, mntfs);
+        // Publication is only valid for a freshly constructed mount. Moving a
+        // live mount uses `move_mount`; accepting one here could silently move
+        // namespace ownership while leaving its old topology edge connected.
+        if mntfs.is_live() {
+            return Err(SystemError::EBUSY);
+        }
+        // Initialize namespace ownership before publishing the edge. Path
+        // lookup reads mount edges without taking the global topology lock, so
+        // it must never observe an attached mount with missing ownership.
+        mntfs.set_namespace(self.self_ref.clone());
+        let attached_parent = match (parent, mountpoint) {
+            (None, None) => {
+                if !Arc::ptr_eq(&self.root_mntfs(), &mntfs) || mntfs.self_mountpoint().is_some() {
+                    mntfs.clear_namespace();
+                    return Err(SystemError::EINVAL);
+                }
+                None
+            }
+            (Some(parent), Some(mountpoint)) => {
+                if !Arc::ptr_eq(&mountpoint.mount_fs(), parent)
+                    || mntfs
+                        .self_mountpoint()
+                        .as_ref()
+                        .is_none_or(|child_mountpoint| !Arc::ptr_eq(child_mountpoint, mountpoint))
+                {
+                    mntfs.clear_namespace();
+                    return Err(SystemError::EINVAL);
+                }
+                if let Err(error) = parent.attach_new_top(mountpoint, mntfs.clone()) {
+                    mntfs.clear_namespace();
+                    return Err(error);
+                }
+                Some(parent)
+            }
+            _ => {
+                mntfs.clear_namespace();
+                return Err(SystemError::EINVAL);
+            }
+        };
+
+        if let Err(error) = mntfs.activate() {
+            if let Some(parent) = attached_parent {
+                parent
+                    .detach_exact(&mntfs)
+                    .expect("failed mount publication must roll back its exact edge");
+            }
+            mntfs.clear_namespace();
+            return Err(error);
+        }
         Ok(())
     }
 
-    pub fn mount_list(&self) -> Arc<MountList> {
-        self.inner.read().mount_list.clone()
-    }
+    /// Publish a completely prepared mount tree. Every descendant is made
+    /// live and namespace-owned before the root edge becomes reachable, so a
+    /// concurrent lookup can only observe either the old topology or the
+    /// complete new tree.
+    pub fn add_mount_tree(
+        &self,
+        parent: &Arc<MountFS>,
+        mountpoint: &Arc<MountFSInode>,
+        root: Arc<MountFS>,
+    ) -> Result<(), SystemError> {
+        if root.is_live()
+            || !Arc::ptr_eq(&mountpoint.mount_fs(), parent)
+            || root
+                .self_mountpoint()
+                .as_ref()
+                .is_none_or(|root_mp| !Arc::ptr_eq(root_mp, mountpoint))
+        {
+            return Err(SystemError::EINVAL);
+        }
 
-    pub fn remove_mount(&self, mount_path: &str) -> Option<Arc<MountFS>> {
-        self.inner.write().mount_list.remove(mount_path)
+        let namespace = self.self_ref.clone();
+        let mut mounts: Vec<Arc<MountFS>> = Vec::new();
+        let mut pending = vec![root.clone()];
+        while let Some(mount) = pending.pop() {
+            if mount.is_live() {
+                for published in mounts.into_iter().rev() {
+                    published.clear_namespace();
+                    published.deactivate();
+                }
+                return Err(SystemError::EBUSY);
+            }
+            pending.extend(mount.mount_children());
+            mount.set_namespace(namespace.clone());
+            if let Err(error) = mount.activate() {
+                mount.clear_namespace();
+                for published in mounts.into_iter().rev() {
+                    published.clear_namespace();
+                    published.deactivate();
+                }
+                return Err(error);
+            }
+            mounts.push(mount);
+        }
+
+        if let Err(error) = parent.attach_new_top(mountpoint, root) {
+            for mount in mounts.into_iter().rev() {
+                mount.clear_namespace();
+                mount.deactivate();
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn remove_mount_exact(&self, mntfs: &Arc<MountFS>) -> Option<Arc<MountFS>> {
-        self.inner.write().mount_list.remove_exact(mntfs)
-    }
-
-    pub fn get_mount_point(
-        &self,
-        mount_point: &str,
-    ) -> Option<(Arc<MountPath>, String, Arc<MountFS>)> {
-        self.inner.read().mount_list.get_mount_point(mount_point)
+        if !mntfs.is_belongs_to_mntns(&self.self_ref.upgrade()?) {
+            return None;
+        }
+        Some(mntfs.clone())
     }
 }
 
-fn collect_mount_subtree(root: &Arc<MountFS>) -> HashSet<Arc<MountFS>> {
-    let mut visited = HashSet::new();
-    let mut stack = Vec::new();
-    stack.push(root.clone());
-
-    while let Some(mnt) = stack.pop() {
-        if !visited.insert(mnt.clone()) {
-            continue;
-        }
-
-        let children: Vec<Arc<MountFS>> = mnt.mountpoints().values().cloned().collect();
-        stack.extend(children);
+fn restrict_cross_user_propagation(
+    source: &Arc<MountFS>,
+    copy: &Arc<MountFS>,
+    cross_user_namespace: bool,
+) {
+    if !cross_user_namespace {
+        return;
     }
-
-    visited
+    copy.lock_mount();
+    if !source.propagation().is_shared() {
+        return;
+    }
+    let propagation = copy.propagation();
+    propagation.set_private();
+    propagation.set_slave(Some(Arc::downgrade(source)));
 }
 
 impl ProcessManager {
@@ -541,61 +614,6 @@ impl ProcessManager {
             root_mnt_namespace()
         }
     }
-}
-
-struct MountFSCopyInfo {
-    old_mount_fs: Arc<MountFS>,
-    parent_mount_fs: Arc<MountFS>,
-    self_mp_inode_id: InodeId,
-    mount_path: Arc<MountPath>,
-}
-
-fn rewrite_pivot_path(path: &str, old_new_root_path: &str, new_put_old_path: &str) -> String {
-    if path == old_new_root_path {
-        return "/".to_string();
-    }
-
-    if let Some(suffix) = path.strip_prefix(old_new_root_path) {
-        if suffix.is_empty() {
-            return "/".to_string();
-        }
-
-        return normalize_pivot_path(suffix);
-    }
-
-    if path == "/" {
-        return new_put_old_path.to_string();
-    }
-
-    join_pivot_paths(new_put_old_path, path)
-}
-
-fn path_is_under(path: &str, prefix: &str) -> bool {
-    path != prefix
-        && path
-            .strip_prefix(prefix)
-            .is_some_and(|suffix| suffix.starts_with('/'))
-}
-
-fn normalize_pivot_path(path: &str) -> String {
-    if path.is_empty() || path == "/" {
-        "/".to_string()
-    } else if path.starts_with('/') {
-        path.to_string()
-    } else {
-        format!("/{}", path)
-    }
-}
-
-fn join_pivot_paths(prefix: &str, suffix: &str) -> String {
-    if prefix == "/" {
-        return normalize_pivot_path(suffix);
-    }
-
-    let mut result = prefix.trim_end_matches('/').to_string();
-    result.push('/');
-    result.push_str(suffix.trim_start_matches('/'));
-    result
 }
 
 impl Drop for MntNamespace {

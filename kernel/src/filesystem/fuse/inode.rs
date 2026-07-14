@@ -48,7 +48,7 @@ use super::{
     },
 };
 
-static NEXT_DAX_OWNER_INCARNATION: AtomicU64 = AtomicU64::new(1);
+static NEXT_NODE_INCARNATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 pub(crate) struct DaxMapping {
@@ -269,7 +269,10 @@ pub struct FuseNode {
     conn: Arc<FuseConn>,
     self_ref: Weak<FuseNode>,
     nodeid: u64,
-    dax_owner_incarnation: u64,
+    /// Kernel-local identity for this FuseNode object.  The daemon generation
+    /// alone is insufficient because a type mismatch retires a node even when
+    /// the daemon accidentally reuses the same (nodeid, generation) pair.
+    node_incarnation: u64,
     parent_nodeid: Mutex<u64>,
     parent: Mutex<Option<Arc<FuseNode>>>,
     name: Mutex<Option<String>>,
@@ -345,17 +348,14 @@ impl FuseNode {
         }
         let has_cached = cached.is_some();
         let initial_attr_epoch = conn.sample_attr_epoch();
-        let dax_owner_incarnation = NEXT_DAX_OWNER_INCARNATION.fetch_add(1, Ordering::Relaxed);
-        assert_ne!(
-            dax_owner_incarnation, 0,
-            "FUSE DAX owner identity exhausted"
-        );
+        let node_incarnation = NEXT_NODE_INCARNATION.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(node_incarnation, 0, "FUSE node identity exhausted");
         let node = Arc::new_cyclic(|self_ref| Self {
             fs,
             conn,
             self_ref: self_ref.clone(),
             nodeid,
-            dax_owner_incarnation,
+            node_incarnation,
             parent_nodeid: Mutex::new(parent_nodeid),
             parent: Mutex::new(parent),
             name: Mutex::new(None),
@@ -394,8 +394,12 @@ impl FuseNode {
         self.generation.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn node_incarnation(&self) -> u64 {
+        self.node_incarnation
+    }
+
     pub(crate) fn dax_mapping_owner(&self) -> super::virtiofs::dax::DaxMappingOwner {
-        super::virtiofs::dax::DaxMappingOwner::from_inode(self.nodeid, self.dax_owner_incarnation)
+        super::virtiofs::dax::DaxMappingOwner::from_inode(self.nodeid, self.node_incarnation)
             .expect("FuseNode has a valid DAX owner identity")
     }
 

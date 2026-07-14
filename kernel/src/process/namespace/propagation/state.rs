@@ -342,6 +342,17 @@ impl MountPropagation {
         inner.slaves.push(slave);
     }
 
+    /// Reserve reverse slave-list storage before publishing topology edges.
+    /// `MOUNT_LIFECYCLE_LOCK` keeps topology writers from consuming this
+    /// capacity before the prepared event commits.
+    pub(crate) fn try_reserve_slaves(&self, additional: usize) -> Result<(), SystemError> {
+        self.inner
+            .lock()
+            .slaves
+            .try_reserve(additional)
+            .map_err(|_| SystemError::ENOMEM)
+    }
+
     /// Remove a slave mount
     pub fn remove_slave(&self, slave: &Weak<MountFS>) {
         let mut inner = self.inner.lock();

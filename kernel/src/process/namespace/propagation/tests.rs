@@ -479,3 +479,158 @@ fn test_propagate_to_shared_slave_keeps_child_shared_slave() {
     assert_eq!(child_a_prop.peer_group_id(), child_b_prop.peer_group_id());
     assert_ne!(child_a_prop.peer_group_id(), source_child_group);
 }
+
+#[test]
+fn test_nearest_propagated_source_skips_unmaterialized_master() {
+    let master = new_test_mount(MountPropagation::new_shared().unwrap());
+    let skipped = new_test_mount(MountPropagation::new_slave(Arc::downgrade(&master)));
+    let deep = new_test_mount(MountPropagation::new_slave(Arc::downgrade(&skipped)));
+    master.propagation().add_slave(Arc::downgrade(&skipped));
+    skipped.propagation().add_slave(Arc::downgrade(&deep));
+
+    let source_child = new_test_mount(MountPropagation::new_private());
+    let mut propagated_sources = CorrespondingSources::new();
+    propagated_sources.insert(&master, source_child.clone());
+
+    let selected = propagated_sources
+        .nearest(&deep)
+        .unwrap()
+        .expect("a deeper slave must fall back to the nearest materialized master");
+    assert!(Arc::ptr_eq(&selected, &source_child));
+}
+
+#[test]
+fn test_nearest_propagated_source_uses_latest_materialized_peer() {
+    let source = new_test_mount(MountPropagation::new_shared().unwrap());
+    let group = source.propagation().peer_group().unwrap();
+    let materialized_peer = new_test_mount(MountPropagation::new_shared_with_group(group.clone()));
+    let skipped_peer = new_test_mount(MountPropagation::new_shared_with_group(group));
+    let deep_slave = new_test_mount(MountPropagation::new_slave(Arc::downgrade(&skipped_peer)));
+
+    let source_child = new_test_mount(MountPropagation::new_private());
+    let peer_child = new_test_mount(MountPropagation::new_private());
+    let mut propagated_sources = CorrespondingSources::new();
+    propagated_sources.insert(&source, source_child);
+    propagated_sources.insert(&materialized_peer, peer_child.clone());
+
+    let selected = propagated_sources
+        .nearest(&deep_slave)
+        .unwrap()
+        .expect("a slave of an uncovered peer must use the latest peer source");
+    assert!(Arc::ptr_eq(&selected, &peer_child));
+}
+
+#[test]
+fn test_uncovered_slave_does_not_prune_covered_deeper_slave() {
+    let master = new_test_mount(MountPropagation::new_shared().unwrap());
+    register_peer(master.propagation().peer_group_id(), &master);
+
+    // The uncovered peer models a narrow bind root in the source peer group.
+    // The deeper slave deliberately has the master's wider object view, so
+    // Linux keeps the peer layer's last source and still propagates to it.
+    let group = master.propagation().peer_group().unwrap();
+    let skipped = new_test_mount(MountPropagation::new_shared_with_group(group));
+    register_peer(master.propagation().peer_group_id(), &skipped);
+    let deep = master.deepcopy(None).unwrap();
+    deep.propagation().set_private();
+    deep.propagation().set_slave(Some(Arc::downgrade(&skipped)));
+    deep.activate().unwrap();
+    skipped.propagation().add_slave(Arc::downgrade(&deep));
+
+    let mountpoint = master.mountpoint_root_inode();
+    assert!(matches!(
+        skipped.wrapper_for_dentry(mountpoint.shared_dentry()),
+        Err(SystemError::EXDEV)
+    ));
+    let deep_mountpoint = deep.wrapper_for_dentry(mountpoint.shared_dentry()).unwrap();
+    let source_child = new_test_mount(MountPropagation::new_private());
+    source_child.set_self_mountpoint(Some(mountpoint.clone()));
+
+    let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+    let prepared = prepare_mount_propagation_locked(&master, &mountpoint, &source_child).unwrap();
+    master
+        .attach_top(&mountpoint, source_child.clone())
+        .unwrap();
+    commit_mount_propagation_locked(prepared).unwrap();
+
+    assert!(skipped.mount_children().is_empty());
+    let deep_child = deep
+        .lookup_top(&deep_mountpoint)
+        .expect("the covered deeper slave must receive the propagation event");
+    assert!(deep_child
+        .propagation()
+        .master()
+        .is_some_and(|source| Arc::ptr_eq(&source, &source_child)));
+}
+
+#[test]
+fn test_move_propagation_is_prepared_before_source_edge_changes() {
+    let old_parent = new_test_mount(MountPropagation::new_private());
+    let moved_root = new_test_mount(MountPropagation::new_private());
+    attach_test_child(&old_parent, &moved_root);
+    let old_mountpoint = moved_root.self_mountpoint().unwrap();
+
+    let target = new_test_mount(MountPropagation::new_shared().unwrap());
+    let target_peer = shared_copy(&target);
+    let target_group = target.propagation().peer_group_id();
+    register_peer(target_group, &target);
+    register_peer(target_group, &target_peer);
+    let target_mountpoint = target.mountpoint_root_inode();
+
+    let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+    let prepared =
+        prepare_moved_tree_propagation_locked(&target, &moved_root, &target_mountpoint).unwrap();
+
+    assert!(old_parent
+        .children_at(&old_mountpoint)
+        .iter()
+        .any(|child| Arc::ptr_eq(child, &moved_root)));
+    assert!(moved_root.propagation().is_shared());
+    assert!(target.lookup_top(&target_mountpoint).is_none());
+    assert!(target_peer
+        .lookup_top(
+            &target_peer
+                .wrapper_for_dentry(target_mountpoint.shared_dentry())
+                .unwrap()
+        )
+        .is_none());
+
+    abort_moved_tree_propagation_locked(prepared);
+    assert!(moved_root.propagation().is_private());
+    assert!(old_parent
+        .children_at(&old_mountpoint)
+        .iter()
+        .any(|child| Arc::ptr_eq(child, &moved_root)));
+}
+
+#[test]
+fn test_tuck_under_rollback_restores_cover_in_place() {
+    let parent = new_test_mount(MountPropagation::new_private());
+    let mountpoint = parent.mountpoint_root_inode();
+    let covered = new_test_mount(MountPropagation::new_private());
+    covered.set_self_mountpoint(Some(mountpoint.clone()));
+    parent.attach_top(&mountpoint, covered.clone()).unwrap();
+
+    let propagated = new_test_mount(MountPropagation::new_private());
+    propagated.set_self_mountpoint(Some(mountpoint.clone()));
+    let cover_mountpoint = propagated.mountpoint_root_inode();
+    let _cover_reservation = propagated.reserve_mount_edge(&cover_mountpoint, 1).unwrap();
+
+    parent
+        .attach_beneath(&mountpoint, propagated.clone())
+        .unwrap();
+    assert!(Arc::ptr_eq(
+        &parent.lookup_top(&mountpoint).unwrap(),
+        &propagated
+    ));
+    assert!(covered.is_tucked_under());
+
+    let removed = parent.detach_exact_restoring_cover(&propagated).unwrap();
+    assert!(Arc::ptr_eq(&removed, &propagated));
+    assert!(Arc::ptr_eq(
+        &parent.lookup_top(&mountpoint).unwrap(),
+        &covered
+    ));
+    assert!(!covered.is_tucked_under());
+    assert!(propagated.mount_children().is_empty());
+}

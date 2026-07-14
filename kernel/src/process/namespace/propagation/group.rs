@@ -455,6 +455,64 @@ where
         .map_err(|_| SystemError::ENOMEM)
 }
 
+/// Build complete peer-group replacements for mounts that will become
+/// discoverable at an event commit. Every final member vector and every new
+/// registry key is reserved before the first topology edge is published.
+pub(super) fn prepare_peer_registrations(
+    mounts: &[Arc<MountFS>],
+) -> Result<Vec<PreparedPeerGroupState>, SystemError> {
+    let mut additions = Vec::new();
+    additions
+        .try_reserve(mounts.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    for mount in mounts {
+        let propagation = mount.propagation();
+        let group_id = propagation.peer_group_id();
+        if propagation.is_shared() && group_id.is_valid() {
+            additions.push((group_id, mount.clone()));
+        }
+    }
+    additions.sort_unstable_by_key(|(group_id, _)| group_id.data());
+
+    let mut prepared = Vec::new();
+    prepared
+        .try_reserve(additions.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    let mut index = 0;
+    while index < additions.len() {
+        let group_id = additions[index].0;
+        let start = index;
+        while index < additions.len() && additions[index].0 == group_id {
+            index += 1;
+        }
+
+        let mut before_reserve = || Ok(());
+        let current = try_snapshot_peer_group(group_id, &mut before_reserve)?;
+        let mut members = Vec::new();
+        members
+            .try_reserve(current.len() + index - start)
+            .map_err(|_| SystemError::ENOMEM)?;
+        for member in current
+            .iter()
+            .chain(additions[start..index].iter().map(|(_, mount)| mount))
+        {
+            if members.iter().any(|existing: &Weak<MountFS>| {
+                existing
+                    .upgrade()
+                    .is_some_and(|existing| Arc::ptr_eq(&existing, member))
+            }) {
+                continue;
+            }
+            members.push(Arc::downgrade(member));
+        }
+        prepared.push(PreparedPeerGroupState::Replace(group_id.data(), members));
+    }
+
+    let new_group_keys = count_new_peer_group_keys(&prepared);
+    try_reserve_peer_group_keys(new_group_keys, &mut || Ok(()))?;
+    Ok(prepared)
+}
+
 /// Publish prepared registry membership without fallible allocation.
 ///
 /// The lifecycle lock is held by `PropagationChangeTransaction`; keep this

@@ -358,8 +358,14 @@ impl IndexNode for FuseNode {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
         }
-        let md = self.cached_or_fetch_metadata()?;
-        if md.file_type == FileType::SymLink {
+        // Establish the stable inode type before taking a regular-file open
+        // context. Attribute refresh belongs to buffered I/O below; Linux does
+        // not enter fuse_cache_read_iter() for DAX/direct reads.
+        let cached_md = match self.cached_metadata_snapshot() {
+            Some(md) => md,
+            None => self.cached_or_fetch_metadata()?,
+        };
+        if cached_md.file_type == FileType::SymLink {
             if offset != 0 {
                 return Ok(0);
             }
@@ -368,7 +374,9 @@ impl IndexNode for FuseNode {
             buf[..n].copy_from_slice(&payload[..n]);
             return Ok(n);
         }
-        self.ensure_regular()?;
+        if cached_md.file_type != FileType::File {
+            return Err(SystemError::EINVAL);
+        }
         let private_data = Self::fuse_file_private_snapshot(&data)?;
         drop(data);
         let fh = private_data.fh;
@@ -397,7 +405,21 @@ impl IndexNode for FuseNode {
             return self.read_direct_with_open(offset, len, buf, fh, file_flags, lock_owner);
         }
 
-        self.read_cached_with_open(offset, len, buf, &private_data)
+        // Match Linux fuse_cache_read_iter(): AUTO_INVAL_DATA always enters
+        // attribute update (the TTL decides whether GETATTR is necessary),
+        // while the other mode updates when this read crosses cached EOF. An
+        // opened regular file supplies its current fh with FUSE_GETATTR_FH.
+        // Permission was already checked at open, so do not repeat the mount
+        // policy check on this hot path.
+        let cached_size = cached_md.size.max(0) as usize;
+        let crosses_cached_eof = offset.saturating_add(len) > cached_size;
+        let md = if !private_data.io_config.auto_inval_data && !crosses_cached_eof {
+            cached_md
+        } else {
+            self.update_cached_metadata_for_open_io(cached_md, fh)?
+        };
+
+        self.read_cached_with_open(offset, len, buf, &private_data, md.size.max(0) as usize)
     }
 
     fn write_at(

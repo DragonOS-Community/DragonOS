@@ -265,6 +265,10 @@ impl FileSystem for VirtioFsFs {
         self.dax_fault(pfm).unwrap_or_else(|| self.inner.fault(pfm))
     }
 
+    fn fault_before_map_pages(&self) -> bool {
+        self.inner.fault_before_map_pages()
+    }
+
     unsafe fn page_mkwrite(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
         self.dax_fault(pfm)
             .unwrap_or_else(|| self.inner.page_mkwrite(pfm))

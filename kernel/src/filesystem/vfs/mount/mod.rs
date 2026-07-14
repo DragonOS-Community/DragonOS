@@ -3000,7 +3000,11 @@ impl IndexNode for MountFSInode {
 
     #[inline]
     fn fs(&self) -> Arc<dyn FileSystem> {
-        return self.overlaid_inode().mount_fs.clone();
+        // This inode records the mount selected by path lookup.  Operations on
+        // the resolved inode (including bind-mount source validation) must not
+        // re-resolve a later overmount; pathname lookup itself performs the
+        // overmount traversal before returning an inode.
+        self.mount_fs.clone()
     }
 
     #[inline]
@@ -3512,7 +3516,20 @@ impl IndexNode for MountFSInode {
 
     #[inline]
     fn special_node(&self) -> Option<super::SpecialNodeData> {
-        self.dentry.inode.special_node()
+        match self.dentry.inode.special_node() {
+            // proc namespace magic links use a self-reference. Preserve the
+            // resolved struct-path projection by returning this mount wrapper,
+            // not the raw procfs inode. References to any other inode (notably
+            // /proc/<pid>/fd/<n>) must remain the original target.
+            Some(super::SpecialNodeData::Reference(target))
+                if Arc::ptr_eq(&target, &self.dentry.inode) =>
+            {
+                self.self_ref
+                    .upgrade()
+                    .map(|inode| super::SpecialNodeData::Reference(inode as Arc<dyn IndexNode>))
+            }
+            other => other,
+        }
     }
 
     /// If not supported, fall back to getting the filename from the parent directory.
@@ -3581,6 +3598,10 @@ impl FileSystem for MountFS {
 
     fn support_readahead(&self) -> bool {
         self.inner_filesystem.support_readahead()
+    }
+
+    fn fault_before_map_pages(&self) -> bool {
+        self.inner_filesystem.fault_before_map_pages()
     }
     fn root_inode(&self) -> Arc<dyn IndexNode> {
         // A mounted filesystem's root inode is always its own mount root wrapper.

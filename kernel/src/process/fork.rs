@@ -1131,7 +1131,7 @@ impl ProcessManager {
             .get_file_by_fd(fd)
             .ok_or(SystemError::EBADF)?;
 
-        if file.inode().fs().name() != "cgroup2" {
+        if file.with_io_fs(|fs| fs.name() != "cgroup2") {
             return Err(SystemError::EINVAL);
         }
         if file.inode().metadata()?.file_type != FileType::Dir {
@@ -1153,7 +1153,7 @@ impl ProcessManager {
         if clone_args.flags.contains(CloneFlags::CLONE_THREAD) {
             return Err(SystemError::EINVAL);
         }
-        cgroup2_check_attach_permissions(file.inode().fs().root_inode(), &src, &node)?;
+        file.with_io_fs(|fs| cgroup2_check_attach_permissions(fs.root_inode(), &src, &node))?;
         cgroup_migrate_vet_dst_with_src(&src, &node, 1)?;
 
         Ok(Some(node))

@@ -90,6 +90,9 @@ pub const FUSE_ATTR_SUBMOUNT: u32 = 1 << 0;
 /// fuse_attr.flags (Linux 6.6): enable DAX for this regular file in inode mode.
 pub const FUSE_ATTR_DAX: u32 = 1 << 1;
 
+// fuse_getattr_in.getattr_flags (Linux 6.6 uapi subset)
+pub const FUSE_GETATTR_FH: u32 = 1 << 0;
+
 // fuse_open_out.open_flags (Linux 6.6 uapi subset)
 pub const FOPEN_DIRECT_IO: u32 = 1 << 0;
 pub const FOPEN_KEEP_CACHE: u32 = 1 << 1;

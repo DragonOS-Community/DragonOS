@@ -341,7 +341,7 @@ fn splice_trusted_file_read_limit(
 }
 
 fn splice_regular_file_has_trusted_size(file: &File) -> bool {
-    matches!(file.inode().fs().name(), "ext4" | "fat" | "tmpfs" | "ramfs")
+    file.with_io_fs(|fs| matches!(fs.name(), "ext4" | "fat" | "tmpfs" | "ramfs"))
 }
 
 /// pipe 到 file 的数据传输

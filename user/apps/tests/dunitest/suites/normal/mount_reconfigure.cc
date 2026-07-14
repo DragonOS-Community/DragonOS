@@ -922,7 +922,10 @@ TEST(MountReconfigure, BindNamespaceOverOpenFileKeepsOpenFileIoFs) {
     }
     mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
 
-    ASSERT_EQ(0, mount("", base, "ramfs", 0, NULL)) << strerror(errno);
+    // tmpfs implements the ordinary file mmap callbacks exercised below;
+    // ramfs currently does not and would turn this mount-identity regression
+    // into an unrelated default map_pages panic.
+    ASSERT_EQ(0, mount("", base, "tmpfs", 0, NULL)) << strerror(errno);
     int fd = open(target, O_CREAT | O_RDWR | O_TRUNC, 0600);
     ASSERT_GE(fd, 0) << strerror(errno);
     ASSERT_EQ(0, ftruncate(fd, kPageSize)) << strerror(errno);
@@ -971,7 +974,7 @@ TEST(MountReconfigure, ProcFdMagicLinkKeepsReferencedMountProjection) {
         GTEST_SKIP() << strerror(errno);
     }
     mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
-    ASSERT_EQ(0, mount("", base, "ramfs", 0, NULL)) << strerror(errno);
+    ASSERT_EQ(0, mount("", base, "tmpfs", 0, NULL)) << strerror(errno);
 
     int source_fd = open(source, O_CREAT | O_RDWR | O_TRUNC, 0600);
     ASSERT_GE(source_fd, 0) << strerror(errno);

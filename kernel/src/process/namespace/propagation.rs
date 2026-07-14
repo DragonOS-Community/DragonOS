@@ -1490,6 +1490,7 @@ pub fn propagate_umount(
     parent_mnt: &Arc<MountFS>,
     mountpoint: &Arc<MountFSInode>,
     source_child: &Arc<MountFS>,
+    lazy: bool,
 ) -> Result<(), SystemError> {
     let propagation = parent_mnt.propagation();
 
@@ -1503,10 +1504,7 @@ pub fn propagate_umount(
     //     group_id.0
     // );
 
-    let prepared: Vec<_> = propagated_umount_targets(parent_mnt, mountpoint, source_child)?
-        .into_iter()
-        .filter(|(_, _, child)| !child.is_locked())
-        .collect();
+    let prepared = propagated_umount_targets(parent_mnt, mountpoint, source_child)?;
 
     // The caller serializes detach through MOUNT_LIFECYCLE_LOCK. Validate the
     // whole set before the first mutation, then every detach below is an
@@ -1521,12 +1519,19 @@ pub fn propagate_umount(
             return Err(SystemError::EBUSY);
         }
     }
+    // Linux propagate_mount_unlock() clears MNT_LOCKED only from the exact
+    // corresponding propagation roots before gathering them for umount.  The
+    // protected descendants remain locked and, for lazy detach, connected to
+    // their detached component.
+    for (_, _, child) in &prepared {
+        child.unlock_mount();
+    }
     for (target, _, child) in &prepared {
         target.detach_exact_restoring_cover(child)?;
     }
     for (_, _, child) in prepared {
-        cleanup_subtree_relationships(&child);
-        MountFS::deactivate_disconnected_subtree(&child);
+        child.set_self_mountpoint(None);
+        MountFS::finish_disconnected_umount(&child, lazy)?;
     }
     Ok(())
 }
@@ -1593,18 +1598,6 @@ fn propagated_child_at(
         })
 }
 
-fn cleanup_subtree_relationships(root: &Arc<MountFS>) {
-    for mount in collect_subtree(root) {
-        cleanup_mount_relationships(&mount);
-    }
-}
-
-pub(crate) fn cleanup_mount_relationships(mount: &Arc<MountFS>) {
-    // do_make_slave reparents any external slaves before the detached mount is
-    // removed from its own peer/master links.
-    detach_mount_propagation(mount);
-}
-
 /// Preflight the propagation set before ordinary umount mutates topology.
 pub fn propagation_umount_busy(parent_mnt: &Arc<MountFS>, mountpoint: &Arc<MountFSInode>) -> bool {
     let propagation = parent_mnt.propagation();
@@ -1616,9 +1609,9 @@ pub fn propagation_umount_busy(parent_mnt: &Arc<MountFS>, mountpoint: &Arc<Mount
     };
     propagated_umount_targets(parent_mnt, mountpoint, &source_child)
         .map(|targets| {
-            targets
-                .into_iter()
-                .any(|(_, _, child)| child.subtree_has_external_pins())
+            targets.into_iter().any(|(_, _, child)| {
+                !child.mount_children().is_empty() || child.subtree_has_external_pins()
+            })
         })
         .unwrap_or(true)
 }
@@ -1644,7 +1637,6 @@ fn umount_at_peer(
         return Ok(());
     };
     peer_mnt.detach_exact(&child)?;
-    cleanup_subtree_relationships(&child);
     MountFS::deactivate_disconnected_subtree(&child);
 
     Ok(())

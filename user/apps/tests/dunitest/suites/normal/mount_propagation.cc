@@ -63,7 +63,7 @@ bool marker_exists(const char* mount_point, const char* name) {
 }
 
 void best_effort_umount(const char* path) {
-    if (umount(path) != 0 && errno != EINVAL && errno != ENOENT) {
+    if (umount2(path, MNT_DETACH) != 0 && errno != EINVAL && errno != ENOENT) {
         ADD_FAILURE() << "umount failed for " << path << ": errno=" << errno << " ("
                       << strerror(errno) << ")";
     }
@@ -286,6 +286,192 @@ TEST_F(MountPropagationTest, CrossUserNamespaceCanMakeLockedRootPrivate) {
     ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
     ASSERT_TRUE(WIFEXITED(status));
     EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+TEST_F(MountPropagationTest, OrdinaryUmountRejectsMountedDescendant) {
+    char base[160] = {};
+    char child_dir[192] = {};
+    snprintf(base, sizeof(base), "%s/base", root_);
+    snprintf(child_dir, sizeof(child_dir), "%s/host", base);
+
+    ASSERT_EQ(0, ensure_dir(base)) << strerror(errno);
+    ASSERT_EQ(0, mount("", base, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(child_dir)) << strerror(errno);
+    ASSERT_EQ(0, mount("", child_dir, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, create_marker(child_dir, "child_marker")) << strerror(errno);
+
+    errno = 0;
+    EXPECT_EQ(-1, umount(base));
+    EXPECT_EQ(EBUSY, errno);
+    EXPECT_TRUE(marker_exists(child_dir, "child_marker"));
+
+    ASSERT_EQ(0, umount(child_dir)) << strerror(errno);
+    ASSERT_EQ(0, umount(base)) << strerror(errno);
+    best_effort_rmdir(child_dir);
+    best_effort_rmdir(base);
+}
+
+TEST_F(MountPropagationTest, ParentUmountRemovesLockedCrossUserNamespaceCopy) {
+    char base[160] = {};
+    char host[192] = {};
+    snprintf(base, sizeof(base), "%s/base", root_);
+    snprintf(host, sizeof(host), "%s/host", base);
+
+    ASSERT_EQ(0, ensure_dir(base)) << strerror(errno);
+    ASSERT_EQ(0, mount(base, base, nullptr, MS_BIND, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(nullptr, base, nullptr, MS_SHARED, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(host)) << strerror(errno);
+    ASSERT_EQ(0, mount("", host, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, create_marker(host, "propagated_marker")) << strerror(errno);
+
+    int ready_pipe[2] = {-1, -1};
+    int continue_pipe[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(ready_pipe)) << strerror(errno);
+    ASSERT_EQ(0, pipe(continue_pipe)) << strerror(errno);
+
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        close(ready_pipe[0]);
+        close(continue_pipe[1]);
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0 ||
+            !marker_exists(host, "propagated_marker")) {
+            _exit(1);
+        }
+        errno = 0;
+        if (umount2(host, MNT_DETACH) != -1 || errno != EINVAL) {
+            _exit(2);
+        }
+        if (write(ready_pipe[1], "r", 1) != 1) {
+            _exit(3);
+        }
+        char token = 0;
+        if (read(continue_pipe[0], &token, 1) != 1) {
+            _exit(4);
+        }
+        _exit(marker_exists(host, "propagated_marker") ? 5 : 0);
+    }
+
+    close(ready_pipe[1]);
+    close(continue_pipe[0]);
+    char token = 0;
+    ASSERT_EQ(1, read(ready_pipe[0], &token, 1)) << strerror(errno);
+    errno = 0;
+    const int umount_result = umount(host);
+    const int umount_errno = errno;
+    const int wake_result = write(continue_pipe[1], "c", 1);
+    const int wake_errno = errno;
+    close(ready_pipe[0]);
+    close(continue_pipe[1]);
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, umount_result) << strerror(umount_errno);
+    EXPECT_EQ(1, wake_result) << strerror(wake_errno);
+    EXPECT_EQ(0, WEXITSTATUS(status));
+
+    best_effort_umount(base);
+    best_effort_rmdir(host);
+    best_effort_rmdir(base);
+}
+
+TEST_F(MountPropagationTest, LazyDetachPreservesLockedPropagatedSubtree) {
+    char base[160] = {};
+    char child_dir[192] = {};
+    char sibling_dir[192] = {};
+    char grandchild_dir[224] = {};
+    snprintf(base, sizeof(base), "%s/base", root_);
+    snprintf(child_dir, sizeof(child_dir), "%s/child", base);
+    snprintf(sibling_dir, sizeof(sibling_dir), "%s/sibling", base);
+    snprintf(grandchild_dir, sizeof(grandchild_dir), "%s/grandchild", child_dir);
+
+    ASSERT_EQ(0, ensure_dir(base)) << strerror(errno);
+    ASSERT_EQ(0, mount(base, base, nullptr, MS_BIND, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(nullptr, base, nullptr, MS_SHARED, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(child_dir)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(sibling_dir)) << strerror(errno);
+    ASSERT_EQ(0, mount("", child_dir, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(nullptr, child_dir, nullptr, MS_PRIVATE, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(grandchild_dir)) << strerror(errno);
+    ASSERT_EQ(0, create_marker(grandchild_dir, "foo")) << strerror(errno);
+    ASSERT_EQ(0, mount("", grandchild_dir, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, mount(nullptr, grandchild_dir, nullptr, MS_PRIVATE, nullptr)) << strerror(errno);
+
+    int ready_pipe[2] = {-1, -1};
+    int continue_pipe[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(ready_pipe)) << strerror(errno);
+    ASSERT_EQ(0, pipe(continue_pipe)) << strerror(errno);
+
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        close(ready_pipe[0]);
+        close(continue_pipe[1]);
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0 ||
+            write(ready_pipe[1], "r", 1) != 1) {
+            _exit(1);
+        }
+        char token = 0;
+        if (read(continue_pipe[0], &token, 1) != 1) {
+            _exit(2);
+        }
+        errno = 0;
+        if (umount2(grandchild_dir, MNT_DETACH) != -1 || errno != EINVAL) {
+            _exit(3);
+        }
+        const int dirfd = open(sibling_dir, O_RDONLY | O_DIRECTORY);
+        if (dirfd < 0) {
+            _exit(4);
+        }
+        if (umount2(sibling_dir, MNT_DETACH) != 0) {
+            _exit(5);
+        }
+        errno = 0;
+        const int fd = openat(dirfd, "grandchild/foo", O_RDONLY);
+        const int open_errno = errno;
+        if (fd >= 0) {
+            close(fd);
+        }
+        close(dirfd);
+        _exit(fd == -1 && open_errno == ENOENT ? 0 : 6);
+    }
+
+    close(ready_pipe[1]);
+    close(continue_pipe[0]);
+    char token = 0;
+    ASSERT_EQ(1, read(ready_pipe[0], &token, 1)) << strerror(errno);
+    errno = 0;
+    const int bind_result =
+        mount(child_dir, sibling_dir, nullptr, MS_BIND | MS_REC, nullptr);
+    const int bind_errno = errno;
+    errno = 0;
+    const int private_result = bind_result == 0
+                                   ? mount(nullptr, sibling_dir, nullptr,
+                                           MS_PRIVATE | MS_REC, nullptr)
+                                   : -1;
+    const int private_errno = errno;
+    const int wake_result = write(continue_pipe[1], "c", 1);
+    const int wake_errno = errno;
+    close(ready_pipe[0]);
+    close(continue_pipe[1]);
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, bind_result) << strerror(bind_errno);
+    EXPECT_EQ(0, private_result) << strerror(private_errno);
+    EXPECT_EQ(1, wake_result) << strerror(wake_errno);
+    EXPECT_EQ(0, WEXITSTATUS(status));
+
+    best_effort_umount(sibling_dir);
+    best_effort_umount(grandchild_dir);
+    best_effort_umount(child_dir);
+    best_effort_umount(base);
+    best_effort_rmdir(grandchild_dir);
+    best_effort_rmdir(child_dir);
+    best_effort_rmdir(sibling_dir);
+    best_effort_rmdir(base);
 }
 
 TEST_F(MountPropagationTest, SlaveReceivesMasterPropagationOnly) {

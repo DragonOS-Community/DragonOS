@@ -1,6 +1,6 @@
 use super::inode::OvlInode;
 use crate::driver::base::device::device_number::{DeviceNumber, Major};
-use crate::filesystem::vfs::{self, FileType, IndexNode};
+use crate::filesystem::vfs::{self, mount::DentryMutationContext, FileType, IndexNode};
 use alloc::{string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
@@ -18,14 +18,21 @@ impl OvlInode {
         Self::is_whiteout_inode_checked(inode).unwrap_or(false)
     }
 
-    pub(super) fn create_whiteout_locked(&self, name: &str) -> Result<(), SystemError> {
+    pub(super) fn create_whiteout_locked(
+        &self,
+        name: &str,
+        context: Option<&DentryMutationContext<'_>>,
+    ) -> Result<(), SystemError> {
         let whiteout_mode = vfs::InodeMode::S_IFCHR;
         if let Some(ref upper_inode) = *self.upper_inode.lock() {
             upper_inode.mknod(name, whiteout_mode, WHITEOUT_DEV)?;
             return Ok(());
         }
 
-        self.copy_up_locked()?;
+        match context {
+            Some(context) => self.copy_up_locked_with_context(context)?,
+            None => self.copy_up_locked()?,
+        }
         let upper_inode = self.upper_inode.lock();
         if let Some(ref upper_inode) = *upper_inode {
             upper_inode.mknod(name, whiteout_mode, WHITEOUT_DEV)?;
@@ -38,8 +45,12 @@ impl OvlInode {
         &self,
         name: &str,
         is_dir: bool,
+        context: Option<&DentryMutationContext<'_>>,
     ) -> Result<(), SystemError> {
-        let upper_dir = self.writable_upper_inode_locked()?;
+        let upper_dir = match context {
+            Some(context) => self.writable_upper_inode_locked_with_context(context)?,
+            None => self.writable_upper_inode_locked()?,
+        };
         let upper_entry = upper_dir.find(name)?;
         let internal_whiteouts = if is_dir {
             Some(Self::validated_whiteout_entries(&upper_entry)?)
@@ -57,13 +68,19 @@ impl OvlInode {
             vfs::syscall::RenameFlags::empty()
         };
 
-        if let Err(err) = workdir.move_to(&temp_name, &upper_dir, name, flags) {
-            let _ = Self::cleanup_workdir_temp(&workdir, &temp_name);
+        let move_result = match context {
+            Some(context) => {
+                workdir.move_to_with_context(&temp_name, &upper_dir, name, flags, context)
+            }
+            None => workdir.move_to(&temp_name, &upper_dir, name, flags),
+        };
+        if let Err(err) = move_result {
+            let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
             return Err(err);
         }
 
         if let Some(entries) = internal_whiteouts {
-            Self::cleanup_detached_whiteout_dir(&workdir, &temp_name, &entries);
+            Self::cleanup_detached_whiteout_dir(&workdir, &temp_name, &entries, context);
         }
         Ok(())
     }
@@ -87,6 +104,7 @@ impl OvlInode {
         workdir: &Arc<dyn IndexNode>,
         temp_name: &str,
         entries: &[String],
+        context: Option<&DentryMutationContext<'_>>,
     ) {
         let detached = match workdir.find(temp_name) {
             Ok(detached) => detached,
@@ -104,7 +122,11 @@ impl OvlInode {
                 .and_then(|entry| Self::is_whiteout_inode_checked(&entry));
             match still_whiteout {
                 Ok(true) => {
-                    if let Err(err) = detached.unlink(name) {
+                    let result = match context {
+                        Some(context) => detached.unlink_with_context(name, context),
+                        None => detached.unlink(name),
+                    };
+                    if let Err(err) = result {
                         log::error!(
                             "overlayfs: failed to remove detached whiteout {temp_name}/{name}: {err:?}"
                         );
@@ -119,7 +141,11 @@ impl OvlInode {
             }
         }
 
-        if let Err(err) = workdir.rmdir(temp_name) {
+        let result = match context {
+            Some(context) => workdir.rmdir_with_context(temp_name, context),
+            None => workdir.rmdir(temp_name),
+        };
+        if let Err(err) = result {
             log::error!(
                 "overlayfs: failed to remove detached upper directory {temp_name}: {err:?}"
             );

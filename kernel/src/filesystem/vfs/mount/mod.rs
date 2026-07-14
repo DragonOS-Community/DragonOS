@@ -16,7 +16,7 @@ use crate::{
         casting::DowncastArc,
         errseq::{ErrSeq, ErrSeqValue},
         mutex::{Mutex, MutexGuard},
-        rwsem::RwSem,
+        rwsem::{RwSem, RwSemWriteGuard},
         spinlock::SpinLock,
         wait_queue::WaitQueue,
     },
@@ -25,11 +25,10 @@ use crate::{
         namespace::{
             mnt::MntNamespace,
             propagation::{
-                abort_mount_propagation, cleanup_mount_relationships,
-                commit_mount_propagation_locked, detach_mount_propagation, ensure_subtree_shared,
-                inherit_bind_mount_propagation, prepare_mount_propagation_locked, propagate_umount,
-                propagation_umount_busy, register_peer, register_slave_with_master,
-                MountPropagation,
+                abort_mount_propagation, commit_mount_propagation_locked, detach_mount_propagation,
+                ensure_subtree_shared, inherit_bind_mount_propagation,
+                prepare_mount_propagation_locked, propagate_umount, propagation_umount_busy,
+                register_peer, register_slave_with_master, MountPropagation,
             },
         },
         ProcessManager,
@@ -43,6 +42,7 @@ use alloc::{
 };
 use core::{
     any::Any,
+    cell::RefCell,
     fmt::Debug,
     hash::Hash,
     sync::atomic::{compiler_fence, AtomicBool, AtomicUsize, Ordering},
@@ -61,6 +61,34 @@ lazy_static! {
     /// topology is protected separately by `MOUNT_LIFECYCLE_LOCK`; readers
     /// acquire it first when both are needed.
     static ref DENTRY_TOPOLOGY_LOCK: RwSem<()> = RwSem::new(());
+}
+
+/// Capability for one layered directory mutation to acquire the global dentry
+/// topology write lock exactly once.  Acquisition is deliberately lazy:
+/// layered filesystems may prepare a copy-up before the innermost backing
+/// filesystem reaches its namespace commit, avoiding both a copy-up/global-lock
+/// inversion and holding a system-wide lock across file-data I/O.
+pub struct DentryMutationContext<'a> {
+    guard: RefCell<Option<RwSemWriteGuard<'a, ()>>>,
+}
+
+impl DentryMutationContext<'static> {
+    fn new() -> Self {
+        Self {
+            guard: RefCell::new(None),
+        }
+    }
+}
+
+impl DentryMutationContext<'_> {
+    /// Enter the namespace commit phase.  The guard remains owned by this
+    /// context until the outermost mount wrapper has updated every alias.
+    pub(crate) fn ensure_locked(&self) {
+        let mut guard = self.guard.borrow_mut();
+        if guard.is_none() {
+            *guard = Some(DENTRY_TOPOLOGY_LOCK.write());
+        }
+    }
 }
 
 pub(crate) fn with_topology_snapshot<T>(f: impl FnOnce() -> T) -> T {
@@ -334,6 +362,7 @@ enum MountLifecycleState {
     Constructing,
     Live,
     Detaching,
+    DetachedConnected,
     Detached,
 }
 
@@ -342,6 +371,83 @@ struct MountLifecycle {
     state: MountLifecycleState,
     external_pins: usize,
     construction_reserved: bool,
+    detached_component: Option<Arc<DetachedMountComponent>>,
+}
+
+#[derive(Debug)]
+struct DetachedMountComponent {
+    root: Weak<MountFS>,
+    members: Vec<Weak<MountFS>>,
+    pins: AtomicUsize,
+}
+
+impl DetachedMountComponent {
+    const INITIALIZING: usize = 1usize << (usize::BITS - 1);
+
+    fn new(root: &Arc<MountFS>, members: &[Arc<MountFS>]) -> Arc<Self> {
+        Arc::new(Self {
+            root: Arc::downgrade(root),
+            members: members.iter().map(Arc::downgrade).collect(),
+            pins: AtomicUsize::new(Self::INITIALIZING),
+        })
+    }
+
+    fn add_initial_pins(&self, pins: usize) {
+        self.pins.fetch_add(pins, Ordering::Relaxed);
+    }
+
+    fn finish_initialization(self: &Arc<Self>) {
+        let previous = self.pins.fetch_and(!Self::INITIALIZING, Ordering::AcqRel);
+        if previous == Self::INITIALIZING {
+            self.schedule_cleanup();
+        }
+    }
+
+    fn try_pin(&self) -> bool {
+        let mut current = self.pins.load(Ordering::Acquire);
+        loop {
+            if current & !Self::INITIALIZING == 0 && current & Self::INITIALIZING == 0 {
+                return false;
+            }
+            match self.pins.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn unpin(self: &Arc<Self>) {
+        let previous = self.pins.fetch_sub(1, Ordering::AcqRel);
+        debug_assert_ne!(previous & !Self::INITIALIZING, 0);
+        if previous == 1 {
+            self.schedule_cleanup();
+        }
+    }
+
+    fn schedule_cleanup(self: &Arc<Self>) {
+        let component = self.clone();
+        schedule_work(Work::new(move || component.cleanup()));
+    }
+
+    fn cleanup(&self) {
+        let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+        if self.pins.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        let Some(root) = self.root.upgrade() else {
+            return;
+        };
+        for member in self.members.iter().filter_map(Weak::upgrade) {
+            let mut lifecycle = member.lifecycle.lock();
+            lifecycle.detached_component = None;
+        }
+        MountFS::deactivate_disconnected_subtree(&root);
+    }
 }
 
 /// A semantic reference to a path or open file description on one mount.
@@ -434,6 +540,10 @@ pub struct VfsDentry {
     /// Serializes exact-edge attach/detach against rename/unlink/rmdir of this
     /// alias without holding a global mount lock across filesystem I/O.
     mount_gate: Mutex<()>,
+    /// Serializes lookup/registration and namespace mutations of this
+    /// directory's children. Layered copy-up may run while this per-directory
+    /// gate is held, but unrelated directories and filesystems remain free.
+    children_gate: Mutex<()>,
     /// Global fast-path hint; namespace-local checks still inspect topology.
     mount_edges: AtomicUsize,
     automount_gate: Mutex<()>,
@@ -460,20 +570,18 @@ impl VfsDentry {
         if self.mount_edges.load(Ordering::Acquire) == 0 {
             return false;
         }
-        let mut pending = vec![ProcessManager::current_mntns().root_mntfs()];
-        while let Some(parent) = pending.pop() {
-            for child in parent.mount_children() {
-                if child
+        let current_namespace = ProcessManager::current_mntns();
+        let mounts = {
+            let mut registry = MOUNTED_SUPERBLOCKS.lock_irqsave();
+            registry.retain(|mount| mount.strong_count() != 0);
+            registry.clone()
+        };
+        mounts.iter().filter_map(Weak::upgrade).any(|mount| {
+            mount.is_belongs_to_mntns(&current_namespace)
+                && mount
                     .self_mountpoint()
-                    .as_ref()
                     .is_some_and(|mountpoint| mountpoint.dentry.id == self.id)
-                {
-                    return true;
-                }
-                pending.push(child);
-            }
-        }
-        false
+        })
     }
 }
 
@@ -518,6 +626,25 @@ fn with_dentry_mount_gates<T>(
             let _left = left.mount_gate.lock();
             operation()
         }
+    }
+}
+
+fn with_dentry_children_gates<T>(
+    first: &Arc<VfsDentry>,
+    second: &Arc<VfsDentry>,
+    operation: impl FnOnce() -> Result<T, SystemError>,
+) -> Result<T, SystemError> {
+    if first.id == second.id {
+        let _guard = first.children_gate.lock();
+        operation()
+    } else if first.id < second.id {
+        let _first = first.children_gate.lock();
+        let _second = second.children_gate.lock();
+        operation()
+    } else {
+        let _second = second.children_gate.lock();
+        let _first = first.children_gate.lock();
+        operation()
     }
 }
 
@@ -640,6 +767,7 @@ impl SuperBlockState {
             registry_child: child,
             registry_generation: child_generation,
             mount_gate: Mutex::new(()),
+            children_gate: Mutex::new(()),
             mount_edges: AtomicUsize::new(0),
             automount_gate: Mutex::new(()),
             state: Mutex::new(VfsDentryState {
@@ -955,6 +1083,7 @@ impl MountFS {
                 state: MountLifecycleState::Constructing,
                 external_pins: 0,
                 construction_reserved: state_init.construction_reserved,
+                detached_component: None,
             }),
         });
 
@@ -998,6 +1127,7 @@ impl MountFS {
                 state: MountLifecycleState::Constructing,
                 external_pins: 0,
                 construction_reserved: true,
+                detached_component: None,
             }),
         });
 
@@ -1457,8 +1587,11 @@ impl MountFS {
                     lifecycle.construction_reserved = false;
                     (false, reserved, true)
                 }
-                MountLifecycleState::Live | MountLifecycleState::Detaching => {
+                MountLifecycleState::Live
+                | MountLifecycleState::Detaching
+                | MountLifecycleState::DetachedConnected => {
                     lifecycle.state = MountLifecycleState::Detached;
+                    lifecycle.detached_component = None;
                     (true, false, true)
                 }
                 MountLifecycleState::Detached => (false, false, false),
@@ -1492,6 +1625,16 @@ impl MountFS {
 
     pub(crate) fn is_live(&self) -> bool {
         self.lifecycle.lock().state == MountLifecycleState::Live
+    }
+
+    /// Whether this mount may receive topology edges while serialized by the
+    /// lifecycle lock. Detached trees are assembled in `Constructing` before
+    /// they are published, so both constructing and live parents are valid.
+    pub(crate) fn accepts_topology_edges(&self) -> bool {
+        matches!(
+            self.lifecycle.lock().state,
+            MountLifecycleState::Constructing | MountLifecycleState::Live
+        )
     }
 
     pub(crate) fn try_pin_snapshot(&self) -> Result<MountSnapshotGuard, SystemError> {
@@ -1533,7 +1676,6 @@ impl MountFS {
         }
 
         for mount in mounts.into_iter().rev() {
-            cleanup_mount_relationships(&mount);
             if let Some(namespace) = mount.namespace() {
                 namespace.remove_mount_exact(&mount);
             }
@@ -1543,22 +1685,99 @@ impl MountFS {
         }
     }
 
+    /// Complete an umount after the root edge has been removed. Lazy detach
+    /// keeps locked descendants connected to their detached parent, matching
+    /// Linux `disconnect_mount()`. Such retained Arc components are reaped by
+    /// workqueue after their last external path/file pin disappears.
+    pub(crate) fn finish_disconnected_umount(
+        root: &Arc<Self>,
+        lazy: bool,
+    ) -> Result<(), SystemError> {
+        if !lazy {
+            Self::deactivate_disconnected_subtree(root);
+            return Ok(());
+        }
+
+        fn collect(root: &Arc<MountFS>) -> Vec<Arc<MountFS>> {
+            let mut mounts = Vec::new();
+            let mut pending = vec![root.clone()];
+            while let Some(mount) = pending.pop() {
+                pending.extend(mount.mount_children());
+                mounts.push(mount);
+            }
+            mounts
+        }
+
+        let mounts = collect(root);
+        for mount in &mounts {
+            let mut lifecycle = mount.lifecycle.lock();
+            if lifecycle.state == MountLifecycleState::Live {
+                lifecycle.state = MountLifecycleState::Detaching;
+            }
+        }
+        for mount in &mounts {
+            if let Some(namespace) = mount.namespace() {
+                namespace.remove_mount_exact(mount);
+            }
+            mount.clear_namespace();
+            detach_mount_propagation(mount);
+        }
+
+        let mut component_roots = vec![root.clone()];
+        for mount in mounts.iter().filter(|mount| !Arc::ptr_eq(mount, root)) {
+            if mount.is_locked() {
+                continue;
+            }
+            let parent = mount.parent_mount().ok_or(SystemError::EINVAL)?;
+            parent.detach_exact_restoring_cover(mount)?;
+            mount.set_self_mountpoint(None);
+            component_roots.push(mount.clone());
+        }
+
+        for component_root in component_roots {
+            let members = collect(&component_root);
+            if members.len() == 1 {
+                component_root.deactivate();
+                continue;
+            }
+            let component = DetachedMountComponent::new(&component_root, &members);
+            for member in &members {
+                let mut lifecycle = member.lifecycle.lock();
+                component.add_initial_pins(lifecycle.external_pins);
+                lifecycle.state = MountLifecycleState::DetachedConnected;
+                lifecycle.detached_component = Some(component.clone());
+            }
+            component.finish_initialization();
+        }
+        Ok(())
+    }
+
     /// Acquire an external semantic reference used by ordinary umount's busy
     /// check. Existing paths may derive another reference after lazy detach;
     /// acquisition stops once final superblock shutdown has begun.
     pub fn try_pin_external(&self) -> Result<MountExternalGuard, SystemError> {
         let _topology = MOUNT_LIFECYCLE_LOCK.lock();
         let mut lifecycle = self.lifecycle.lock();
-        match lifecycle.state {
+        let component = match lifecycle.state {
             MountLifecycleState::Constructing | MountLifecycleState::Detaching => {
                 return Err(SystemError::EBUSY);
             }
             MountLifecycleState::Detached if lifecycle.external_pins == 0 => {
                 return Err(SystemError::ESTALE);
             }
-            MountLifecycleState::Live | MountLifecycleState::Detached => {}
+            MountLifecycleState::DetachedConnected => lifecycle.detached_component.clone(),
+            MountLifecycleState::Live | MountLifecycleState::Detached => None,
+        };
+        if component
+            .as_ref()
+            .is_some_and(|component| !component.try_pin())
+        {
+            return Err(SystemError::ESTALE);
         }
         if !self.super_block_state.try_add_external_pin() {
+            if let Some(component) = component {
+                component.unpin();
+            }
             return Err(SystemError::ESTALE);
         }
         lifecycle.external_pins += 1;
@@ -1570,7 +1789,26 @@ impl MountFS {
     fn derive_external_pin(&self) -> Result<MountExternalGuard, SystemError> {
         let _topology = MOUNT_LIFECYCLE_LOCK.lock();
         let mut lifecycle = self.lifecycle.lock();
+        let component = match lifecycle.state {
+            MountLifecycleState::Constructing | MountLifecycleState::Detaching => {
+                return Err(SystemError::EBUSY);
+            }
+            MountLifecycleState::Detached if lifecycle.external_pins == 0 => {
+                return Err(SystemError::ESTALE);
+            }
+            MountLifecycleState::DetachedConnected => lifecycle.detached_component.clone(),
+            MountLifecycleState::Live | MountLifecycleState::Detached => None,
+        };
+        if component
+            .as_ref()
+            .is_some_and(|component| !component.try_pin())
+        {
+            return Err(SystemError::ESTALE);
+        }
         if !self.super_block_state.try_add_external_pin() {
+            if let Some(component) = component {
+                component.unpin();
+            }
             return Err(SystemError::ESTALE);
         }
         lifecycle.external_pins += 1;
@@ -1643,7 +1881,15 @@ impl MountFS {
         // Potentially sleeping metadata reads happen without the topology lock.
         let mounts = {
             let _topology = MOUNT_LIFECYCLE_LOCK.lock();
-            collect(root)
+            let mounts = collect(root);
+            // Linux's ordinary do_umount() leaves non-shrinkable submounts in
+            // place and reports EBUSY; only MNT_DETACH disconnects a complete
+            // subtree. DragonOS currently has no transient shrinkable mount
+            // class, so every visible child is busy here.
+            if !lazy && mounts.len() != 1 {
+                return Err(SystemError::EBUSY);
+            }
+            mounts
         };
         let mut super_blocks = Vec::new();
         for mount in &mounts {
@@ -1671,7 +1917,7 @@ impl MountFS {
         {
             return Err(SystemError::EBUSY);
         }
-        if mounts.iter().any(|mount| mount.is_locked()) {
+        if root.is_locked() {
             return Err(SystemError::EINVAL);
         }
         if !lazy && root.subtree_has_external_pins() {
@@ -1689,17 +1935,8 @@ impl MountFS {
             mount.lifecycle.lock().state = MountLifecycleState::Detaching;
         }
 
-        for (mount, (_, mountpoint)) in mounts.into_iter().zip(propagation_keys.into_iter()) {
-            let namespace = mount.namespace();
-            // All fallible admission checks completed above. A peer propagation
-            // may already have detached this node, which is an equivalent commit.
-            if mount.lifecycle.lock().state != MountLifecycleState::Detached {
-                mount.commit_umount_at(&mountpoint)?;
-            }
-            if let Some(namespace) = namespace {
-                namespace.remove_mount_exact(&mount);
-            }
-        }
+        let root_mountpoint = root.self_mountpoint().ok_or(SystemError::EINVAL)?;
+        root.commit_umount_at(&root_mountpoint, lazy)?;
         // Final filesystem shutdown may sleep and may itself need pathname
         // operations. Never wait while holding the topology/admission lock.
         drop(_topology);
@@ -1732,12 +1969,13 @@ impl MountFS {
             lifecycle.state = MountLifecycleState::Detaching;
         }
 
-        self.commit_umount_at(&mountpoint)
+        self.commit_umount_at(&mountpoint, lazy)
     }
 
     fn commit_umount_at(
         &self,
         mountpoint: &Arc<MountFSInode>,
+        lazy: bool,
     ) -> Result<Arc<MountFS>, SystemError> {
         let parent = mountpoint.mount_fs();
         let this_mount = self.self_ref();
@@ -1746,18 +1984,13 @@ impl MountFS {
         // copies. Keep the local edge intact until that transaction succeeds,
         // so failure needs no local topology rollback.
         if parent.propagation().is_shared() {
-            propagate_umount(&parent, mountpoint, &this_mount)?;
+            propagate_umount(&parent, mountpoint, &this_mount, lazy)?;
         }
         let result = parent.detach_exact(&this_mount);
 
         if result.is_ok() {
-            cleanup_mount_relationships(&this_mount);
-        }
-
-        if result.is_ok() {
             self.self_mountpoint.write().take();
-            self.clear_namespace();
-            self.deactivate();
+            Self::finish_disconnected_umount(&this_mount, lazy)?;
         } else {
             self.lifecycle.lock().state = MountLifecycleState::Live;
         }
@@ -2012,13 +2245,17 @@ impl MountExternalGuard {
 
 impl Drop for MountExternalGuard {
     fn drop(&mut self) {
-        {
+        let component = {
             let mut lifecycle = self.mount.lifecycle.lock();
             debug_assert!(lifecycle.external_pins > 0);
             lifecycle.external_pins -= 1;
-        }
+            lifecycle.detached_component.clone()
+        };
         if self.mount.super_block_state.remove_external_pin() {
             MountFS::schedule_final_shutdown(self.mount.clone());
+        }
+        if let Some(component) = component {
+            component.unpin();
         }
     }
 }
@@ -2393,6 +2630,7 @@ impl MountFSInode {
     fn do_find(&self, name: &str) -> Result<Arc<MountFSInode>, SystemError> {
         let base = self.overlaid_inode();
         let (inner_inode, mount_inode) = {
+            let _children_guard = base.dentry.children_gate.lock();
             let _namespace_guard = base.mount_fs.super_block_state.dentry_namespace_lock.read();
             // Since downward lookups may cross filesystem boundaries, wrap the
             // exact alias before releasing rename serialization.
@@ -2689,15 +2927,16 @@ impl IndexNode for MountFSInode {
         data: usize,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         self.ensure_mount_writable()?;
+        let _children_guard = self.dentry.children_gate.lock();
+        let inner_inode = self
+            .dentry
+            .inode
+            .create_with_data(name, file_type, mode, data)?;
         let _namespace_guard = self
             .mount_fs
             .super_block_state
             .dentry_namespace_lock
             .write();
-        let inner_inode = self
-            .dentry
-            .inode
-            .create_with_data(name, file_type, mode, data)?;
         let parent = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
         return Ok(MountFSInode::new_child(
             inner_inode,
@@ -2878,12 +3117,13 @@ impl IndexNode for MountFSInode {
         mode: InodeMode,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         self.ensure_mount_writable()?;
+        let _children_guard = self.dentry.children_gate.lock();
+        let inner_inode = self.dentry.inode.create(name, file_type, mode)?;
         let _namespace_guard = self
             .mount_fs
             .super_block_state
             .dentry_namespace_lock
             .write();
-        let inner_inode = self.dentry.inode.create(name, file_type, mode)?;
         let parent = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
         return Ok(MountFSInode::new_child(
             inner_inode,
@@ -2895,11 +3135,7 @@ impl IndexNode for MountFSInode {
 
     fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
         self.ensure_mount_writable()?;
-        let _namespace_guard = self
-            .mount_fs
-            .super_block_state
-            .dentry_namespace_lock
-            .write();
+        let _children_guard = self.dentry.children_gate.lock();
         // Filesystem implementations expect `other` to be an inode of the same concrete filesystem (e.g. LockedExt4Inode).
         // When VFS mount wrapping is enabled, `other` is typically a `MountFSInode`, which causes
         // filesystem-level downcasts to fail and incorrectly return EINVAL.
@@ -2916,12 +3152,13 @@ impl IndexNode for MountFSInode {
 
     fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
         self.ensure_mount_writable()?;
+        let _children_guard = self.dentry.children_gate.lock();
+        let inner_inode = self.dentry.inode.symlink(name, target)?;
         let _namespace_guard = self
             .mount_fs
             .super_block_state
             .dentry_namespace_lock
             .write();
-        let inner_inode = self.dentry.inode.symlink(name, target)?;
         let parent = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
         Ok(MountFSInode::new_child(
             inner_inode,
@@ -2934,9 +3171,17 @@ impl IndexNode for MountFSInode {
     /// @brief Delete a file/directory in the mounted filesystem
     #[inline]
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
+        let context = DentryMutationContext::new();
+        self.unlink_with_context(name, &context)
+    }
+
+    fn unlink_with_context(
+        &self,
+        name: &str,
+        context: &DentryMutationContext<'_>,
+    ) -> Result<(), SystemError> {
         self.ensure_mount_writable()?;
-        let topology = MOUNT_LIFECYCLE_LOCK.lock();
-        let _path_snapshot = DENTRY_TOPOLOGY_LOCK.write();
+        let _children_guard = self.dentry.children_gate.lock();
         let _namespace_guard = self
             .mount_fs
             .super_block_state
@@ -2949,6 +3194,7 @@ impl IndexNode for MountFSInode {
                 .super_block_state
                 .get_registered_dentry(&self.dentry, &dname, &inner)?;
         let _mount_gate = child.as_ref().map(|dentry| dentry.mount_gate.lock());
+        drop(_namespace_guard);
 
         // First check if this inode is a mount point; if so, it cannot be deleted
         if child
@@ -2957,9 +3203,14 @@ impl IndexNode for MountFSInode {
         {
             return Err(SystemError::EBUSY);
         }
-        drop(topology);
         // Delegate to the inner inode's unlink method to delete this inode
-        self.dentry.inode.unlink(name)?;
+        self.dentry.inode.unlink_with_context(name, context)?;
+        context.ensure_locked();
+        let _namespace_guard = self
+            .mount_fs
+            .super_block_state
+            .dentry_namespace_lock
+            .write();
         drop(inner);
         if let Some(child) = child.as_ref() {
             self.mount_fs.super_block_state.disconnect_dentry(child);
@@ -2969,9 +3220,17 @@ impl IndexNode for MountFSInode {
 
     #[inline]
     fn rmdir(&self, name: &str) -> Result<(), SystemError> {
+        let context = DentryMutationContext::new();
+        self.rmdir_with_context(name, &context)
+    }
+
+    fn rmdir_with_context(
+        &self,
+        name: &str,
+        context: &DentryMutationContext<'_>,
+    ) -> Result<(), SystemError> {
         self.ensure_mount_writable()?;
-        let topology = MOUNT_LIFECYCLE_LOCK.lock();
-        let _path_snapshot = DENTRY_TOPOLOGY_LOCK.write();
+        let _children_guard = self.dentry.children_gate.lock();
         let _namespace_guard = self
             .mount_fs
             .super_block_state
@@ -2984,6 +3243,7 @@ impl IndexNode for MountFSInode {
                 .super_block_state
                 .get_registered_dentry(&self.dentry, &dname, &inner)?;
         let _mount_gate = child.as_ref().map(|dentry| dentry.mount_gate.lock());
+        drop(_namespace_guard);
 
         // First check if this inode is a mount point; if so, it cannot be deleted
         if child
@@ -2992,9 +3252,14 @@ impl IndexNode for MountFSInode {
         {
             return Err(SystemError::EBUSY);
         }
-        drop(topology);
         // Delegate to the inner inode's rmdir method to delete this inode
-        self.dentry.inode.rmdir(name)?;
+        self.dentry.inode.rmdir_with_context(name, context)?;
+        context.ensure_locked();
+        let _namespace_guard = self
+            .mount_fs
+            .super_block_state
+            .dentry_namespace_lock
+            .write();
         drop(inner);
         if let Some(child) = child.as_ref() {
             self.mount_fs.super_block_state.disconnect_dentry(child);
@@ -3010,14 +3275,19 @@ impl IndexNode for MountFSInode {
         new_name: &str,
         flags: RenameFlags,
     ) -> Result<(), SystemError> {
+        let context = DentryMutationContext::new();
+        self.move_to_with_context(old_name, target, new_name, flags, &context)
+    }
+
+    fn move_to_with_context(
+        &self,
+        old_name: &str,
+        target: &Arc<dyn IndexNode>,
+        new_name: &str,
+        flags: RenameFlags,
+        context: &DentryMutationContext<'_>,
+    ) -> Result<(), SystemError> {
         self.ensure_mount_writable()?;
-        let topology = MOUNT_LIFECYCLE_LOCK.lock();
-        let _path_snapshot = DENTRY_TOPOLOGY_LOCK.write();
-        let _namespace_guard = self
-            .mount_fs
-            .super_block_state
-            .dentry_namespace_lock
-            .write();
         // Filesystem implementations generally expect `target` to be an inode
         // of the same concrete FS (e.g. tmpfs' LockedTmpfsInode). When VFS
         // mount wrapping is enabled, `target` is often a `MountFSInode`, which
@@ -3029,51 +3299,77 @@ impl IndexNode for MountFSInode {
             .as_ref()
             .map(|mnt| mnt.dentry.inode.clone())
             .unwrap_or_else(|| target.clone());
+        let target_parent = target_mount
+            .as_ref()
+            .map(|mount| mount.dentry.clone())
+            .unwrap_or_else(|| self.dentry.clone());
 
-        let (source_dentry, target_dentry) = if let Some(target_mount) = target_mount.as_ref() {
-            let sb = &self.mount_fs.super_block_state;
-            let source_inner = self.dentry.inode.find(old_name)?;
-            let source_dentry =
-                sb.get_registered_dentry(&self.dentry, &DName::from(old_name), &source_inner)?;
-            let target_dentry = match target_inner.find(new_name) {
-                Ok(target_child) => sb.get_registered_dentry(
-                    &target_mount.dentry,
-                    &DName::from(new_name),
-                    &target_child,
-                )?,
-                Err(SystemError::ENOENT) => None,
-                Err(error) => return Err(error),
+        with_dentry_children_gates(&self.dentry, &target_parent, || {
+            let namespace_guard = self
+                .mount_fs
+                .super_block_state
+                .dentry_namespace_lock
+                .write();
+            let (source_dentry, target_dentry) = if let Some(target_mount) = target_mount.as_ref() {
+                let sb = &self.mount_fs.super_block_state;
+                let source_inner = self.dentry.inode.find(old_name)?;
+                let source_dentry =
+                    sb.get_registered_dentry(&self.dentry, &DName::from(old_name), &source_inner)?;
+                let target_dentry = match target_inner.find(new_name) {
+                    Ok(target_child) => sb.get_registered_dentry(
+                        &target_mount.dentry,
+                        &DName::from(new_name),
+                        &target_child,
+                    )?,
+                    Err(SystemError::ENOENT) => None,
+                    Err(error) => return Err(error),
+                };
+                (source_dentry, target_dentry)
+            } else {
+                (None, None)
             };
-            (source_dentry, target_dentry)
-        } else {
-            (None, None)
-        };
-        with_dentry_mount_gates(source_dentry.as_ref(), target_dentry.as_ref(), || {
-            if source_dentry
-                .as_ref()
-                .is_some_and(|dentry| dentry.is_local_mountpoint())
-                || target_dentry
+            with_dentry_mount_gates(source_dentry.as_ref(), target_dentry.as_ref(), || {
+                // The parent directory gates keep both positive and negative
+                // names stable while the per-superblock registry lock is
+                // released for potentially long layered copy-up I/O.
+                drop(namespace_guard);
+                if source_dentry
                     .as_ref()
                     .is_some_and(|dentry| dentry.is_local_mountpoint())
-            {
-                return Err(SystemError::EBUSY);
-            }
-            drop(topology);
-            self.dentry
-                .inode
-                .move_to(old_name, &target_inner, new_name, flags)?;
-            if let (Some(source), Some(target)) = (self.self_ref.upgrade(), target_mount.clone()) {
-                Self::update_move_dentries(
-                    &source,
-                    DName::from(old_name),
-                    &target,
-                    DName::from(new_name),
-                    flags.contains(RenameFlags::EXCHANGE),
-                    source_dentry.clone(),
-                    target_dentry.clone(),
-                );
-            }
-            Ok(())
+                    || target_dentry
+                        .as_ref()
+                        .is_some_and(|dentry| dentry.is_local_mountpoint())
+                {
+                    return Err(SystemError::EBUSY);
+                }
+                self.dentry.inode.move_to_with_context(
+                    old_name,
+                    &target_inner,
+                    new_name,
+                    flags,
+                    context,
+                )?;
+                context.ensure_locked();
+                let _namespace_guard = self
+                    .mount_fs
+                    .super_block_state
+                    .dentry_namespace_lock
+                    .write();
+                if let (Some(source), Some(target)) =
+                    (self.self_ref.upgrade(), target_mount.clone())
+                {
+                    Self::update_move_dentries(
+                        &source,
+                        DName::from(old_name),
+                        &target,
+                        DName::from(new_name),
+                        flags.contains(RenameFlags::EXCHANGE),
+                        source_dentry.clone(),
+                        target_dentry.clone(),
+                    );
+                }
+                Ok(())
+            })
         })
     }
 
@@ -3193,12 +3489,13 @@ impl IndexNode for MountFSInode {
         dev_t: DeviceNumber,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         self.ensure_mount_writable()?;
+        let _children_guard = self.dentry.children_gate.lock();
+        let inner_inode = self.dentry.inode.mknod(filename, mode, dev_t)?;
         let _namespace_guard = self
             .mount_fs
             .super_block_state
             .dentry_namespace_lock
             .write();
-        let inner_inode = self.dentry.inode.mknod(filename, mode, dev_t)?;
         let parent = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
         return Ok(MountFSInode::new_child(
             inner_inode,

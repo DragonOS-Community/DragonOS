@@ -529,8 +529,24 @@ impl IndexNode for OvlInode {
         dir::rmdir(self, name)
     }
 
+    fn rmdir_with_context(
+        &self,
+        name: &str,
+        context: &vfs::mount::DentryMutationContext<'_>,
+    ) -> Result<(), SystemError> {
+        dir::rmdir_with_context(self, name, context)
+    }
+
     fn unlink(&self, name: &str) -> Result<(), SystemError> {
         dir::unlink(self, name)
+    }
+
+    fn unlink_with_context(
+        &self,
+        name: &str,
+        context: &vfs::mount::DentryMutationContext<'_>,
+    ) -> Result<(), SystemError> {
+        dir::unlink_with_context(self, name, context)
     }
 
     fn link(
@@ -558,6 +574,17 @@ impl IndexNode for OvlInode {
         flags: RenameFlags,
     ) -> Result<(), SystemError> {
         rename::move_to(self, old_name, target, new_name, flags)
+    }
+
+    fn move_to_with_context(
+        &self,
+        old_name: &str,
+        target: &Arc<dyn IndexNode>,
+        new_name: &str,
+        flags: RenameFlags,
+        context: &vfs::mount::DentryMutationContext<'_>,
+    ) -> Result<(), SystemError> {
+        rename::move_to_with_context(self, old_name, target, new_name, flags, context)
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {

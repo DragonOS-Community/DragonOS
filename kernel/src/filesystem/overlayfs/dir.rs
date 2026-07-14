@@ -1,7 +1,7 @@
 use super::inode::{DirState, OvlInode};
 use super::whiteout::WHITEOUT_DEV;
 use crate::driver::base::device::device_number::DeviceNumber;
-use crate::filesystem::vfs::{self, FileType, IndexNode};
+use crate::filesystem::vfs::{self, mount::DentryMutationContext, FileType, IndexNode};
 use alloc::sync::Arc;
 use system_error::SystemError;
 
@@ -25,14 +25,35 @@ pub(super) fn mkdir(
 }
 
 pub(super) fn rmdir(inode: &OvlInode, name: &str) -> Result<(), SystemError> {
-    remove(inode, name, true)
+    remove(inode, name, true, None)
+}
+
+pub(super) fn rmdir_with_context(
+    inode: &OvlInode,
+    name: &str,
+    context: &DentryMutationContext<'_>,
+) -> Result<(), SystemError> {
+    remove(inode, name, true, Some(context))
 }
 
 pub(super) fn unlink(inode: &OvlInode, name: &str) -> Result<(), SystemError> {
-    remove(inode, name, false)
+    remove(inode, name, false, None)
 }
 
-fn remove(inode: &OvlInode, name: &str, is_dir: bool) -> Result<(), SystemError> {
+pub(super) fn unlink_with_context(
+    inode: &OvlInode,
+    name: &str,
+    context: &DentryMutationContext<'_>,
+) -> Result<(), SystemError> {
+    remove(inode, name, false, Some(context))
+}
+
+fn remove(
+    inode: &OvlInode,
+    name: &str,
+    is_dir: bool,
+    context: Option<&DentryMutationContext<'_>>,
+) -> Result<(), SystemError> {
     let fs = inode.overlay_fs()?;
     // rmdir keeps the mount-wide commit lock because it nests a child directory
     // emptiness check. Unlink only needs the stable parent namespace lock.
@@ -65,15 +86,19 @@ fn remove(inode: &OvlInode, name: &str, is_dir: bool) -> Result<(), SystemError>
     let upper_dir = inode.upper_inode.lock().clone();
     let result = if let Some(upper_dir) = upper_dir {
         match upper_dir.find(name) {
-            Ok(_) if lower_positive => inode.replace_upper_with_whiteout_locked(name, is_dir),
-            Ok(_) if is_dir => upper_dir.rmdir(name),
-            Ok(_) => upper_dir.unlink(name),
-            Err(SystemError::ENOENT) if lower_positive => inode.create_whiteout_locked(name),
+            Ok(_) if lower_positive => {
+                inode.replace_upper_with_whiteout_locked(name, is_dir, context)
+            }
+            Ok(_) if is_dir => rmdir_backing(&upper_dir, name, context),
+            Ok(_) => unlink_backing(&upper_dir, name, context),
+            Err(SystemError::ENOENT) if lower_positive => {
+                inode.create_whiteout_locked(name, context)
+            }
             Err(SystemError::ENOENT) => Err(SystemError::ENOENT),
             Err(err) => Err(err),
         }
     } else if lower_positive {
-        inode.create_whiteout_locked(name)
+        inode.create_whiteout_locked(name, context)
     } else {
         Err(SystemError::ENOENT)
     };
@@ -81,6 +106,28 @@ fn remove(inode: &OvlInode, name: &str, is_dir: bool) -> Result<(), SystemError>
         state.modified(&[name]);
     }
     result
+}
+
+fn unlink_backing(
+    inode: &Arc<dyn IndexNode>,
+    name: &str,
+    context: Option<&DentryMutationContext<'_>>,
+) -> Result<(), SystemError> {
+    match context {
+        Some(context) => inode.unlink_with_context(name, context),
+        None => inode.unlink(name),
+    }
+}
+
+fn rmdir_backing(
+    inode: &Arc<dyn IndexNode>,
+    name: &str,
+    context: Option<&DentryMutationContext<'_>>,
+) -> Result<(), SystemError> {
+    match context {
+        Some(context) => inode.rmdir_with_context(name, context),
+        None => inode.rmdir(name),
+    }
 }
 
 pub(super) fn link(

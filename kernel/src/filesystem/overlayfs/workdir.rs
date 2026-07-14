@@ -1,5 +1,5 @@
 use super::inode::OvlInode;
-use crate::filesystem::vfs::{FileType, IndexNode};
+use crate::filesystem::vfs::{mount::DentryMutationContext, FileType, IndexNode};
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -32,6 +32,14 @@ impl OvlInode {
         workdir: &Arc<dyn IndexNode>,
         name: &str,
     ) -> Result<(), SystemError> {
+        Self::cleanup_workdir_temp_with_context(workdir, name, None)
+    }
+
+    pub(super) fn cleanup_workdir_temp_with_context(
+        workdir: &Arc<dyn IndexNode>,
+        name: &str,
+        context: Option<&DentryMutationContext<'_>>,
+    ) -> Result<(), SystemError> {
         let inode = match workdir.find(name) {
             Ok(inode) => inode,
             Err(SystemError::ENOENT) => return Ok(()),
@@ -40,9 +48,15 @@ impl OvlInode {
         let metadata = inode.metadata()?;
 
         if metadata.file_type == FileType::Dir {
-            workdir.rmdir(name)
+            match context {
+                Some(context) => workdir.rmdir_with_context(name, context),
+                None => workdir.rmdir(name),
+            }
         } else {
-            workdir.unlink(name)
+            match context {
+                Some(context) => workdir.unlink_with_context(name, context),
+                None => workdir.unlink(name),
+            }
         }
     }
 }

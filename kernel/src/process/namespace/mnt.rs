@@ -247,7 +247,7 @@ impl MntNamespace {
         let namespace = self.self_ref.upgrade().ok_or(SystemError::EINVAL)?;
         let target_parent = target_mountpoint.mount_fs();
         if !source_mfs.is_live()
-            || !target_parent.is_live()
+            || !target_parent.accepts_topology_edges()
             || !source_mfs.is_belongs_to_mntns(&namespace)
             || !target_parent.is_belongs_to_mntns(&namespace)
             || source_mfs.is_locked()

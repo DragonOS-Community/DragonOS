@@ -846,6 +846,18 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
+    /// Execute a namespace mutation as part of one layered VFS transaction.
+    /// Filesystems that delegate to mounted backing paths must propagate the
+    /// context instead of recursively acquiring the global dentry lock.
+    fn unlink_with_context(
+        &self,
+        name: &str,
+        context: &mount::DentryMutationContext<'_>,
+    ) -> Result<(), SystemError> {
+        context.ensure_locked();
+        self.unlink(name)
+    }
+
     /// @brief 删除文件夹
     ///
     /// @param name 文件夹名称
@@ -854,6 +866,15 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @return 失败 Err(错误码)
     fn rmdir(&self, _name: &str) -> Result<(), SystemError> {
         return Err(SystemError::ENOSYS);
+    }
+
+    fn rmdir_with_context(
+        &self,
+        name: &str,
+        context: &mount::DentryMutationContext<'_>,
+    ) -> Result<(), SystemError> {
+        context.ensure_locked();
+        self.rmdir(name)
     }
 
     /// 将指定的`old_name`子目录项移动到target目录下, 并予以`new_name`。
@@ -869,6 +890,18 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回"不支持"
         return Err(SystemError::ENOSYS);
+    }
+
+    fn move_to_with_context(
+        &self,
+        old_name: &str,
+        target: &Arc<dyn IndexNode>,
+        new_name: &str,
+        flag: RenameFlags,
+        context: &mount::DentryMutationContext<'_>,
+    ) -> Result<(), SystemError> {
+        context.ensure_locked();
+        self.move_to(old_name, target, new_name, flag)
     }
 
     /// @brief 专用于 remote 权限模型下 access(2) 的检查

@@ -87,6 +87,14 @@ struct PreparedMountStateUpdate {
     state: PreparedMountPropagationState,
 }
 
+/// Allocation-complete final propagation graph for mounts that are about to
+/// leave a namespace. The topology lock is owned by the caller.
+pub(super) struct PreparedPropagationRemoval {
+    mount_states: HashMap<GraphMountId, PreparedMountStateUpdate>,
+    peer_groups: Vec<PreparedPeerGroupState>,
+    removals: Vec<Arc<MountFS>>,
+}
+
 pub(super) struct PropagationChangeTransaction {
     _topology_guard: MutexGuard<'static, ()>,
     mount_states: HashMap<GraphMountId, PreparedMountStateUpdate>,
@@ -402,6 +410,100 @@ impl PropagationGraph {
             }
         }
         Ok(())
+    }
+}
+
+impl PreparedPropagationRemoval {
+    pub(super) fn prepare_locked(targets: &[Arc<MountFS>]) -> Result<Self, SystemError> {
+        let mut before_reserve = || Ok(());
+        let mut graph = PropagationGraph::new(targets.len(), &mut before_reserve)?;
+        let mut target_ids = Vec::new();
+        reserve_vec(&mut target_ids, targets.len(), &mut before_reserve)?;
+        let mut removals = Vec::new();
+        reserve_vec(&mut removals, targets.len(), &mut before_reserve)?;
+        for target in targets {
+            if target_ids.contains(&target.mount_id()) {
+                continue;
+            }
+            graph.capture_component(target.clone(), &mut before_reserve)?;
+            target_ids.push(target.mount_id());
+            removals.push(target.clone());
+        }
+        for target in &removals {
+            let propagation = target.propagation();
+            if propagation.is_shared() {
+                graph.capture_group(propagation.peer_group_id(), target, &mut before_reserve)?;
+            }
+        }
+        let mut alloc_group = PropagationGroup::alloc;
+        graph.simulate_change(
+            &target_ids,
+            PropagationType::Private,
+            &mut alloc_group,
+            &mut before_reserve,
+        )?;
+
+        let mut mount_states = HashMap::new();
+        reserve_map(&mut mount_states, graph.nodes.len(), &mut before_reserve)?;
+        for id in &graph.order {
+            let node = graph.nodes.get(id).unwrap();
+            let mut slaves = Vec::new();
+            reserve_vec(&mut slaves, node.slaves.len(), &mut before_reserve)?;
+            slaves.extend(
+                node.slaves
+                    .iter()
+                    .map(|slave| Arc::downgrade(&graph.nodes.get(slave).unwrap().mount)),
+            );
+            let master = node
+                .master
+                .map(|master| Arc::downgrade(&graph.nodes.get(&master).unwrap().mount));
+            mount_states.insert(
+                *id,
+                PreparedMountStateUpdate {
+                    mount: node.mount.clone(),
+                    state: PreparedMountPropagationState {
+                        flags: node.flags,
+                        peer_group: node.peer_group.clone(),
+                        master,
+                        slaves,
+                    },
+                },
+            );
+        }
+        let mut peer_groups = Vec::new();
+        reserve_vec(&mut peer_groups, graph.groups.len(), &mut before_reserve)?;
+        for (group_id, group) in graph.groups {
+            if group.members.is_empty() {
+                peer_groups.push(PreparedPeerGroupState::Remove(group_id));
+                continue;
+            }
+            let mut members = Vec::new();
+            reserve_vec(&mut members, group.members.len(), &mut before_reserve)?;
+            members.extend(
+                group
+                    .members
+                    .iter()
+                    .map(|member| Arc::downgrade(&graph.nodes.get(member).unwrap().mount)),
+            );
+            peer_groups.push(PreparedPeerGroupState::Replace(group_id, members));
+        }
+        try_reserve_peer_group_keys(count_new_peer_group_keys(&peer_groups), &mut before_reserve)?;
+        Ok(Self {
+            mount_states,
+            peer_groups,
+            removals,
+        })
+    }
+
+    pub(super) fn commit_locked(self) {
+        apply_prepared_peer_groups(self.peer_groups);
+        for (_, state) in self.mount_states {
+            let old_state = state.mount.propagation().replace_state(state.state);
+            drop(old_state);
+        }
+        for mount in self.removals {
+            mount.mark_propagation_detached();
+        }
     }
 }
 

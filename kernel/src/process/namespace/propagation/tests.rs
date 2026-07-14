@@ -6,9 +6,10 @@ use system_error::SystemError;
 
 use crate::filesystem::ramfs::RamFS;
 use crate::filesystem::vfs::{
-    mount::{MountFlags, MOUNT_LIFECYCLE_LOCK},
-    MountFS,
+    mount::{MountFSInode, MountFlags, MOUNT_LIFECYCLE_LOCK},
+    IndexNode, InodeMode, MountFS,
 };
+use crate::libs::casting::DowncastArc;
 
 use super::{change::*, event::*, group::*, state::*};
 
@@ -412,6 +413,282 @@ fn test_umount_at_peer_detaches_slave_from_master() {
     assert!(peer.lookup_top(&mountpoint).is_none());
     assert!(!child.propagation().is_slave());
     assert!(source_child.propagation().slaves().is_empty());
+}
+
+fn shared_umount_fixture() -> (
+    Arc<MountFS>,
+    Arc<MountFS>,
+    Arc<MountFSInode>,
+    Arc<MountFSInode>,
+    Arc<MountFS>,
+    Arc<MountFS>,
+) {
+    let source_parent = new_test_mount(MountPropagation::new_shared().unwrap());
+    let peer_parent = shared_copy(&source_parent);
+    let group = source_parent.propagation().peer_group_id();
+    register_peer(group, &source_parent);
+    register_peer(group, &peer_parent);
+
+    let source_mountpoint = source_parent.mountpoint_root_inode();
+    let peer_mountpoint = peer_parent
+        .wrapper_for_dentry(source_mountpoint.shared_dentry())
+        .unwrap();
+    let source_child = new_test_mount(MountPropagation::new_private());
+    let peer_child = new_test_mount(MountPropagation::new_private());
+    source_child.set_self_mountpoint(Some(source_mountpoint.clone()));
+    peer_child.set_self_mountpoint(Some(peer_mountpoint.clone()));
+    source_parent
+        .attach_top(&source_mountpoint, source_child.clone())
+        .unwrap();
+    peer_parent
+        .attach_top(&peer_mountpoint, peer_child.clone())
+        .unwrap();
+    (
+        source_parent,
+        peer_parent,
+        source_mountpoint,
+        peer_mountpoint,
+        source_child,
+        peer_child,
+    )
+}
+
+#[test]
+fn test_propagated_umount_uses_exact_edge_after_child_becomes_private() {
+    let (source_parent, peer_parent, source_mp, peer_mp, source_child, peer_child) =
+        shared_umount_fixture();
+
+    let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+    propagate_umount(&source_parent, &source_mp, &source_child, true).unwrap();
+
+    assert!(peer_parent.lookup_first(&peer_mp).is_none());
+    assert!(!peer_child.is_live());
+}
+
+#[test]
+fn test_propagated_umount_retains_target_with_nonroot_child() {
+    let (source_parent, peer_parent, source_mp, peer_mp, source_child, peer_child) =
+        shared_umount_fixture();
+    let nonroot = peer_child
+        .mountpoint_root_inode()
+        .mkdir("nested", InodeMode::S_IRWXU)
+        .unwrap()
+        .downcast_arc::<MountFSInode>()
+        .unwrap();
+    let blocker = new_test_mount(MountPropagation::new_private());
+    blocker.set_self_mountpoint(Some(nonroot.clone()));
+    peer_child.attach_top(&nonroot, blocker.clone()).unwrap();
+
+    let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+    propagate_umount(&source_parent, &source_mp, &source_child, false).unwrap();
+
+    assert!(peer_parent
+        .lookup_first(&peer_mp)
+        .is_some_and(|mount| Arc::ptr_eq(&mount, &peer_child)));
+    assert!(peer_child
+        .lookup_top(&nonroot)
+        .is_some_and(|mount| Arc::ptr_eq(&mount, &blocker)));
+}
+
+#[test]
+fn test_propagated_umount_restores_complete_root_stack_in_order() {
+    let (source_parent, peer_parent, source_mp, peer_mp, source_child, peer_child) =
+        shared_umount_fixture();
+    let root = peer_child.mountpoint_root_inode();
+    let first = new_test_mount(MountPropagation::new_private());
+    let second = new_test_mount(MountPropagation::new_private());
+    for child in [&first, &second] {
+        child.set_self_mountpoint(Some(root.clone()));
+        peer_child.attach_top(&root, child.clone()).unwrap();
+    }
+
+    let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+    propagate_umount(&source_parent, &source_mp, &source_child, false).unwrap();
+
+    let restored = peer_parent.children_at(&peer_mp);
+    assert_eq!(restored.len(), 2);
+    assert!(Arc::ptr_eq(&restored[0], &first));
+    assert!(Arc::ptr_eq(&restored[1], &second));
+    assert!(Arc::ptr_eq(
+        &restored[1].self_mountpoint().unwrap(),
+        &peer_mp
+    ));
+    assert!(peer_child.mount_children().is_empty());
+}
+
+#[test]
+fn test_propagated_lazy_umount_advances_from_descendant_to_parent() {
+    let source_parent = new_test_mount(MountPropagation::new_shared().unwrap());
+    let peer_parent = shared_copy(&source_parent);
+    let parent_group = source_parent.propagation().peer_group_id();
+    register_peer(parent_group, &source_parent);
+    register_peer(parent_group, &peer_parent);
+
+    let source_mp = source_parent.mountpoint_root_inode();
+    let peer_mp = peer_parent.wrapper_for_existing_edge(source_mp.shared_dentry());
+    let source_child = new_test_mount(MountPropagation::new_shared().unwrap());
+    let peer_child = shared_copy(&source_child);
+    let child_group = source_child.propagation().peer_group_id();
+    register_peer(child_group, &source_child);
+    register_peer(child_group, &peer_child);
+    source_child.set_self_mountpoint(Some(source_mp.clone()));
+    peer_child.set_self_mountpoint(Some(peer_mp.clone()));
+    source_parent
+        .attach_top(&source_mp, source_child.clone())
+        .unwrap();
+    peer_parent
+        .attach_top(&peer_mp, peer_child.clone())
+        .unwrap();
+
+    let source_nested = source_child
+        .mountpoint_root_inode()
+        .mkdir("nested", InodeMode::S_IRWXU)
+        .unwrap()
+        .downcast_arc::<MountFSInode>()
+        .unwrap();
+    let peer_nested = peer_child.wrapper_for_existing_edge(source_nested.shared_dentry());
+    let source_grandchild = new_test_mount(MountPropagation::new_private());
+    let peer_grandchild = new_test_mount(MountPropagation::new_private());
+    source_grandchild.set_self_mountpoint(Some(source_nested.clone()));
+    peer_grandchild.set_self_mountpoint(Some(peer_nested.clone()));
+    source_child
+        .attach_top(&source_nested, source_grandchild.clone())
+        .unwrap();
+    peer_child
+        .attach_top(&peer_nested, peer_grandchild.clone())
+        .unwrap();
+
+    let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+    propagate_umount_sources(&[source_grandchild, source_child], true).unwrap();
+
+    assert!(peer_parent.lookup_first(&peer_mp).is_none());
+    assert!(!peer_child.is_live());
+    assert!(!peer_grandchild.is_live());
+}
+
+#[test]
+fn test_propagated_umount_does_not_restore_selected_root_child() {
+    let (source_parent, peer_parent, source_mp, peer_mp, source_child, peer_child) =
+        shared_umount_fixture();
+    source_child
+        .propagation()
+        .set_shared_with_group(PropagationGroup::alloc().unwrap());
+    peer_child
+        .propagation()
+        .set_shared_with_group(source_child.propagation().peer_group().unwrap());
+    let child_group = source_child.propagation().peer_group_id();
+    register_peer(child_group, &source_child);
+    register_peer(child_group, &peer_child);
+
+    let source_root = source_child.mountpoint_root_inode();
+    let peer_root = peer_child.wrapper_for_existing_edge(source_root.shared_dentry());
+    let source_topper = new_test_mount(MountPropagation::new_private());
+    let peer_topper = new_test_mount(MountPropagation::new_private());
+    source_topper.set_self_mountpoint(Some(source_root.clone()));
+    peer_topper.set_self_mountpoint(Some(peer_root.clone()));
+    source_child
+        .attach_top(&source_root, source_topper.clone())
+        .unwrap();
+    peer_child
+        .attach_top(&peer_root, peer_topper.clone())
+        .unwrap();
+
+    let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+    propagate_umount_sources(&[source_topper, source_child], true).unwrap();
+
+    assert!(peer_parent.lookup_first(&peer_mp).is_none());
+    assert!(!peer_child.is_live());
+    assert!(!peer_topper.is_live());
+}
+
+#[test]
+fn test_propagated_umount_restores_locked_selected_root_child() {
+    let (_source_parent, peer_parent, _source_mp, peer_mp, source_child, peer_child) =
+        shared_umount_fixture();
+    source_child
+        .propagation()
+        .set_shared_with_group(PropagationGroup::alloc().unwrap());
+    peer_child
+        .propagation()
+        .set_shared_with_group(source_child.propagation().peer_group().unwrap());
+    let child_group = source_child.propagation().peer_group_id();
+    register_peer(child_group, &source_child);
+    register_peer(child_group, &peer_child);
+
+    let source_root = source_child.mountpoint_root_inode();
+    let peer_root = peer_child.wrapper_for_existing_edge(source_root.shared_dentry());
+    let source_topper = new_test_mount(MountPropagation::new_private());
+    let peer_topper = new_test_mount(MountPropagation::new_private());
+    source_topper.set_self_mountpoint(Some(source_root.clone()));
+    peer_topper.set_self_mountpoint(Some(peer_root.clone()));
+    source_child
+        .attach_top(&source_root, source_topper.clone())
+        .unwrap();
+    peer_child
+        .attach_top(&peer_root, peer_topper.clone())
+        .unwrap();
+    peer_topper.lock_mount();
+
+    let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+    propagate_umount_sources(&[source_topper, source_child], true).unwrap();
+
+    let restored = peer_parent.children_at(&peer_mp);
+    assert_eq!(restored.len(), 1);
+    assert!(Arc::ptr_eq(&restored[0], &peer_topper));
+    assert!(peer_topper.is_live());
+    assert!(Arc::ptr_eq(
+        &peer_topper.self_mountpoint().unwrap(),
+        &peer_mp
+    ));
+    assert!(!peer_child.is_live());
+}
+
+#[test]
+fn test_propagated_lazy_umount_keeps_locked_child_connected() {
+    let (source_parent, peer_parent, source_mp, peer_mp, source_child, peer_child) =
+        shared_umount_fixture();
+    source_child
+        .propagation()
+        .set_shared_with_group(PropagationGroup::alloc().unwrap());
+    peer_child
+        .propagation()
+        .set_shared_with_group(source_child.propagation().peer_group().unwrap());
+    let child_group = source_child.propagation().peer_group_id();
+    register_peer(child_group, &source_child);
+    register_peer(child_group, &peer_child);
+
+    let source_nested = source_child
+        .mountpoint_root_inode()
+        .mkdir("locked", InodeMode::S_IRWXU)
+        .unwrap()
+        .downcast_arc::<MountFSInode>()
+        .unwrap();
+    let peer_nested = peer_child.wrapper_for_existing_edge(source_nested.shared_dentry());
+    let source_grandchild = new_test_mount(MountPropagation::new_private());
+    let peer_grandchild = new_test_mount(MountPropagation::new_private());
+    source_grandchild.set_self_mountpoint(Some(source_nested.clone()));
+    peer_grandchild.set_self_mountpoint(Some(peer_nested.clone()));
+    source_child
+        .attach_top(&source_nested, source_grandchild.clone())
+        .unwrap();
+    peer_child
+        .attach_top(&peer_nested, peer_grandchild.clone())
+        .unwrap();
+    peer_grandchild.lock_mount();
+
+    let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+    propagate_umount_sources(&[source_grandchild, source_child], true).unwrap();
+
+    assert!(peer_parent.lookup_first(&peer_mp).is_none());
+    assert!(peer_child
+        .lookup_first(&peer_nested)
+        .is_some_and(|mount| Arc::ptr_eq(&mount, &peer_grandchild)));
+    assert!(Arc::ptr_eq(
+        &peer_grandchild.parent_mount().unwrap(),
+        &peer_child
+    ));
+    assert!(!peer_child.is_live());
+    assert!(!peer_grandchild.is_live());
 }
 
 #[test]

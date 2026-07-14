@@ -1,10 +1,10 @@
 //! Mount, move, and unmount event propagation across peer/slave topology.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use hashbrown::HashSet;
+use hashbrown::{HashMap, HashSet};
 use system_error::SystemError;
 
 use crate::filesystem::vfs::{
@@ -12,6 +12,7 @@ use crate::filesystem::vfs::{
     MountFS,
 };
 
+use super::change::PreparedPropagationRemoval;
 use super::group::{
     apply_prepared_peer_groups, get_peers, prepare_peer_registrations, PreparedPeerGroupState,
     PropagationGroup,
@@ -680,35 +681,78 @@ pub(crate) fn commit_moved_tree_propagation_locked(
 /// # Returns
 /// * `Ok(())` on success
 /// * `Err(SystemError)` on failure
-pub fn propagate_umount(
+#[cfg(test)]
+pub(super) fn propagate_umount(
     parent_mnt: &Arc<MountFS>,
     mountpoint: &Arc<MountFSInode>,
     source_child: &Arc<MountFS>,
     lazy: bool,
 ) -> Result<(), SystemError> {
-    let propagation = parent_mnt.propagation();
-
-    // Only propagate for shared mounts
-    if !propagation.is_shared() {
-        return Ok(());
+    if source_child
+        .self_mountpoint()
+        .as_ref()
+        .is_none_or(|source_mp| !Arc::ptr_eq(source_mp, mountpoint))
+        || !Arc::ptr_eq(&mountpoint.mount_fs(), parent_mnt)
+    {
+        return Err(SystemError::EINVAL);
     }
+    propagate_umount_sources(core::slice::from_ref(source_child), lazy)
+}
 
-    // log::debug!(
-    //     "propagate_umount: propagating umount from group {} to peers",
-    //     group_id.0
-    // );
-
-    let prepared = propagated_umount_targets(parent_mnt, mountpoint, source_child)?;
+/// Propagate removal of a complete local umount list. `sources` is ordered
+/// deepest-first, matching `MountFS::umount_subtree_with_mode()`.
+pub(crate) fn propagate_umount_sources(
+    sources: &[Arc<MountFS>],
+    lazy: bool,
+) -> Result<(), SystemError> {
+    for source in sources {
+        let mountpoint = source.self_mountpoint().ok_or(SystemError::EINVAL)?;
+        if !mountpoint
+            .mount_fs()
+            .children_at(&mountpoint)
+            .iter()
+            .any(|child| Arc::ptr_eq(child, source))
+        {
+            return Err(SystemError::EBUSY);
+        }
+    }
+    let mut prepared = prepare_propagated_umount_targets(sources, lazy, true)?;
+    let mut graph_targets = Vec::new();
+    let graph_target_count = sources
+        .len()
+        .checked_add(prepared.len())
+        .ok_or(SystemError::ENOMEM)?;
+    graph_targets
+        .try_reserve(graph_target_count)
+        .map_err(|_| SystemError::ENOMEM)?;
+    graph_targets.extend(sources.iter().cloned());
+    graph_targets.extend(
+        prepared
+            .iter()
+            .filter(|target| target.remove)
+            .map(|target| target.child.clone()),
+    );
+    let graph = PreparedPropagationRemoval::prepare_locked(&graph_targets)?;
 
     // The caller serializes detach through MOUNT_LIFECYCLE_LOCK. Validate the
     // whole set before the first mutation, then every detach below is an
     // invariant-preserving exact-object operation.
-    for (target, target_mountpoint, child) in &prepared {
-        if !target.is_live()
-            || !target
-                .children_at(target_mountpoint)
-                .iter()
-                .any(|candidate| Arc::ptr_eq(candidate, child))
+    for target in &prepared {
+        if !target.parent.is_live()
+            || target
+                .parent
+                .lookup_first(&target.mountpoint)
+                .is_none_or(|candidate| !Arc::ptr_eq(&candidate, &target.child))
+            || {
+                let actual = target
+                    .child
+                    .children_at(&target.child.mountpoint_root_inode());
+                actual.len() != target.root_children_snapshot.len()
+                    || actual
+                        .iter()
+                        .zip(&target.root_children_snapshot)
+                        .any(|(actual, expected)| !Arc::ptr_eq(actual, expected))
+            }
         {
             return Err(SystemError::EBUSY);
         }
@@ -717,53 +761,273 @@ pub fn propagate_umount(
     // corresponding propagation roots before gathering them for umount.  The
     // protected descendants remain locked and, for lazy detach, connected to
     // their detached component.
-    for (_, _, child) in &prepared {
-        child.unlock_mount();
+    for target in &prepared {
+        if target.unlock_root {
+            target.child.unlock_mount();
+        }
     }
-    for (target, _, child) in &prepared {
-        target.detach_exact_restoring_cover(child)?;
+    let max_depth = prepared
+        .iter()
+        .map(|target| target.depth)
+        .max()
+        .unwrap_or(0);
+    for depth in (0..=max_depth).rev() {
+        for target in prepared
+            .iter_mut()
+            .filter(|target| target.disconnect && target.depth == depth)
+        {
+            let reservation = target
+                .reservation
+                .as_ref()
+                .expect("removable propagated umount target has a reservation");
+            target
+                .parent
+                .detach_exact_restoring_root_children(
+                    &target.child,
+                    core::mem::take(&mut target.root_children_commit),
+                    reservation,
+                )
+                .expect("validated propagated umount edge commit cannot fail");
+        }
     }
-    for (_, _, child) in prepared {
-        child.set_self_mountpoint(None);
-        MountFS::finish_disconnected_umount(&child, lazy)?;
+    graph.commit_locked();
+    for depth in (0..=max_depth).rev() {
+        for target in prepared
+            .iter()
+            .filter(|target| target.disconnect && target.depth == depth)
+        {
+            target.child.set_self_mountpoint(None);
+            MountFS::finish_disconnected_umount(&target.child, lazy)
+                .expect("detached prepared propagation root has valid teardown topology");
+        }
     }
     Ok(())
 }
 
-type PropagatedUmountTarget = (Arc<MountFS>, Arc<MountFSInode>, Arc<MountFS>);
+struct PropagatedUmountTarget {
+    parent: Arc<MountFS>,
+    mountpoint: Arc<MountFSInode>,
+    child: Arc<MountFS>,
+    root_children_snapshot: Vec<Arc<MountFS>>,
+    /// `(child, restore_to_original_parent)` after deeper commits complete.
+    root_children_commit: Vec<(Arc<MountFS>, bool)>,
+    nonroot_children: Vec<Arc<MountFS>>,
+    marked: bool,
+    remove: bool,
+    disconnect: bool,
+    unlock_root: bool,
+    depth: usize,
+    reservation: Option<MountEdgeReservation>,
+}
 
-fn propagated_umount_targets(
-    parent_mnt: &Arc<MountFS>,
-    mountpoint: &Arc<MountFSInode>,
-    source_child: &Arc<MountFS>,
+fn prepare_propagated_umount_targets(
+    sources: &[Arc<MountFS>],
+    lazy: bool,
+    reserve_commit_capacity: bool,
 ) -> Result<Vec<PropagatedUmountTarget>, SystemError> {
-    // A deep slave's child is mastered by the corresponding child in the
-    // immediately preceding layer, not by the original source child. Keep the
-    // same parent->child projection that mount propagation uses.
-    let mut corresponding = CorrespondingSources::new();
-    corresponding.insert(parent_mnt, source_child.clone());
-    let mut result = Vec::new();
-    for target in propagation_targets(parent_mnt) {
-        let reference_child = match target.kind {
-            PropagationTargetKind::Peer => source_child.clone(),
-            PropagationTargetKind::Slave => {
-                let Some(child) = corresponding.nearest(&target.mount)? else {
-                    continue;
-                };
-                child
-            }
-        };
-        let target_mountpoint = match target.mount.wrapper_for_dentry(mountpoint.shared_dentry()) {
-            Ok(mountpoint) => mountpoint,
-            Err(SystemError::EXDEV) => continue,
-            Err(error) => return Err(error),
-        };
-        let Some(child) = propagated_child_at(&target.mount, &target_mountpoint, &reference_child)
-        else {
+    let mut result: Vec<PropagatedUmountTarget> = Vec::new();
+    let mut candidate_by_id: HashMap<usize, usize> = HashMap::new();
+    result
+        .try_reserve(sources.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    for (depth, source) in sources.iter().rev().enumerate() {
+        let source_mountpoint = source.self_mountpoint().ok_or(SystemError::EINVAL)?;
+        let parent = source_mountpoint.mount_fs();
+        if !parent.propagation().is_shared() {
             continue;
-        };
-        corresponding.insert(&target.mount, child.clone());
-        result.push((target.mount, target_mountpoint, child));
+        }
+        for target in propagation_targets(&parent) {
+            let target_mountpoint = target
+                .mount
+                .wrapper_for_existing_edge(source_mountpoint.shared_dentry());
+            let Some(child) = propagated_child_at(&target.mount, &target_mountpoint) else {
+                continue;
+            };
+            if let Some(index) = candidate_by_id.get(&child.mount_id().data()).copied() {
+                let existing = &mut result[index];
+                existing.unlock_root |= depth == 0;
+                existing.depth = existing.depth.min(depth);
+                continue;
+            }
+            let all_children = child.mount_children();
+            let root_children = child.children_at(&child.mountpoint_root_inode());
+            let mut nonroot_children = Vec::new();
+            nonroot_children
+                .try_reserve(all_children.len().saturating_sub(root_children.len()))
+                .map_err(|_| SystemError::ENOMEM)?;
+            for mounted_child in all_children {
+                if !root_children
+                    .iter()
+                    .any(|root_child| Arc::ptr_eq(root_child, &mounted_child))
+                {
+                    nonroot_children.push(mounted_child);
+                }
+            }
+            result.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+            candidate_by_id
+                .try_reserve(1)
+                .map_err(|_| SystemError::ENOMEM)?;
+            let index = result.len();
+            candidate_by_id.insert(child.mount_id().data(), index);
+            result.push(PropagatedUmountTarget {
+                parent: target.mount,
+                mountpoint: target_mountpoint,
+                child,
+                root_children_snapshot: root_children,
+                root_children_commit: Vec::new(),
+                nonroot_children,
+                marked: false,
+                remove: false,
+                disconnect: false,
+                unlock_root: depth == 0,
+                depth,
+                reservation: None,
+            });
+        }
+    }
+
+    // Linux's repeated __propagate_umount(parent) walk is a fixed point. Use
+    // reverse dependencies so deep hostile trees remain O(V + E) while the
+    // global topology lock is held.
+    let mut dependents = Vec::new();
+    dependents
+        .try_reserve(result.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    dependents.resize_with(result.len(), Vec::new);
+    let mut remaining = Vec::new();
+    remaining
+        .try_reserve(result.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    remaining.resize(result.len(), 0usize);
+    let mut blocked = Vec::new();
+    blocked
+        .try_reserve(result.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    blocked.resize(result.len(), false);
+    for (index, target) in result.iter().enumerate() {
+        for child in &target.nonroot_children {
+            let Some(child_index) = candidate_by_id.get(&child.mount_id().data()).copied() else {
+                blocked[index] = true;
+                continue;
+            };
+            dependents[child_index]
+                .try_reserve(1)
+                .map_err(|_| SystemError::ENOMEM)?;
+            dependents[child_index].push(index);
+            remaining[index] += 1;
+        }
+    }
+    let mut ready = VecDeque::new();
+    ready
+        .try_reserve(result.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    for index in 0..result.len() {
+        if !blocked[index] && remaining[index] == 0 {
+            ready.push_back(index);
+        }
+    }
+    while let Some(index) = ready.pop_front() {
+        if result[index].marked {
+            continue;
+        }
+        result[index].marked = true;
+        for dependent in &dependents[index] {
+            remaining[*dependent] -= 1;
+            if !blocked[*dependent] && remaining[*dependent] == 0 {
+                ready.push_back(*dependent);
+            }
+        }
+    }
+    for target in &mut result {
+        target.remove = target.marked && (target.unlock_root || !target.child.is_locked());
+    }
+    // umount_list() includes marked locked children once a selected ancestor
+    // is removed, while a locked root without such an ancestor is restored.
+    let mut children_by_parent = Vec::new();
+    children_by_parent
+        .try_reserve(result.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    children_by_parent.resize_with(result.len(), Vec::new);
+    for index in 0..result.len() {
+        if let Some(parent_index) = candidate_by_id
+            .get(&result[index].parent.mount_id().data())
+            .copied()
+            .filter(|parent_index| {
+                !Arc::ptr_eq(
+                    &result[index].mountpoint.shared_dentry(),
+                    &result[*parent_index].child.root_dentry(),
+                )
+            })
+        {
+            children_by_parent[parent_index]
+                .try_reserve(1)
+                .map_err(|_| SystemError::ENOMEM)?;
+            children_by_parent[parent_index].push(index);
+        }
+    }
+    let mut removed = VecDeque::new();
+    removed
+        .try_reserve(result.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    for index in 0..result.len() {
+        if result[index].remove {
+            removed.push_back(index);
+        }
+    }
+    while let Some(parent_index) = removed.pop_front() {
+        for child_index in &children_by_parent[parent_index] {
+            if result[*child_index].marked && !result[*child_index].remove {
+                result[*child_index].remove = true;
+                removed.push_back(*child_index);
+            }
+        }
+    }
+
+    // Linux disconnect_mount() retains a locked selected child below a
+    // selected parent during lazy detach. It still leaves the namespace and
+    // propagation graph, but the highest disconnected ancestor owns teardown.
+    for index in 0..result.len() {
+        let parent_removed = candidate_by_id
+            .get(&result[index].parent.mount_id().data())
+            .is_some_and(|parent| result[*parent].remove);
+        result[index].disconnect = result[index].remove
+            && !(lazy
+                && !result[index].unlock_root
+                && result[index].child.is_locked()
+                && parent_removed);
+    }
+
+    // Once the closure is final, distinguish already-disconnected root
+    // children, lazy-locked retained children, and covers that must be restored.
+    for index in 0..result.len() {
+        let mut commit = Vec::new();
+        commit
+            .try_reserve(result[index].root_children_snapshot.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        for child in &result[index].root_children_snapshot {
+            match candidate_by_id.get(&child.mount_id().data()).copied() {
+                Some(child_index) if result[child_index].disconnect => {}
+                Some(child_index) if result[child_index].remove => {
+                    commit.push((child.clone(), false));
+                }
+                _ => commit.push((child.clone(), true)),
+            }
+        }
+        result[index].root_children_commit = commit;
+    }
+    if reserve_commit_capacity {
+        for target in result.iter_mut().filter(|target| target.disconnect) {
+            let restore_count = target
+                .root_children_commit
+                .iter()
+                .filter(|(_, restore)| *restore)
+                .count();
+            target.reservation = Some(
+                target
+                    .parent
+                    .reserve_mount_edge(&target.mountpoint, restore_count.saturating_sub(1))?,
+            );
+        }
     }
     Ok(result)
 }
@@ -771,22 +1035,11 @@ fn propagated_umount_targets(
 fn propagated_child_at(
     parent: &Arc<MountFS>,
     mountpoint: &Arc<MountFSInode>,
-    source_child: &Arc<MountFS>,
 ) -> Option<Arc<MountFS>> {
-    let source_prop = source_child.propagation();
-    parent
-        .children_at(mountpoint)
-        .into_iter()
-        .rev()
-        .find(|candidate| {
-            let candidate_prop = candidate.propagation();
-            (source_prop.is_shared()
-                && candidate_prop.is_shared()
-                && candidate_prop.peer_group_id() == source_prop.peer_group_id())
-                || candidate_prop
-                    .master()
-                    .is_some_and(|master| Arc::ptr_eq(&master, source_child))
-        })
+    // Linux propagation is keyed only by `(parent mount, mountpoint dentry)`.
+    // The child's propagation type may have changed independently after the
+    // original mount event and therefore cannot be used as correspondence.
+    parent.lookup_first(mountpoint)
 }
 
 /// Preflight the propagation set before ordinary umount mutates topology.
@@ -798,10 +1051,16 @@ pub fn propagation_umount_busy(parent_mnt: &Arc<MountFS>, mountpoint: &Arc<Mount
     let Some(source_child) = parent_mnt.lookup_top(mountpoint) else {
         return true;
     };
-    propagated_umount_targets(parent_mnt, mountpoint, &source_child)
+    prepare_propagated_umount_targets(core::slice::from_ref(&source_child), false, false)
         .map(|targets| {
-            targets.into_iter().any(|(_, _, child)| {
-                !child.mount_children().is_empty() || child.subtree_has_external_pins()
+            targets.into_iter().any(|target| {
+                // Linux checks the candidate refcount only when it has no
+                // children or one root topper. Other child layouts make
+                // the propagation branch non-busy (and either restore the
+                // candidate or restore its complete root stack later).
+                target.remove
+                    && target.root_children_snapshot.len() <= 1
+                    && target.child.has_external_pins()
             })
         })
         .unwrap_or(true)
@@ -817,14 +1076,14 @@ pub fn propagation_umount_busy(parent_mnt: &Arc<MountFS>, mountpoint: &Arc<Mount
 pub(super) fn umount_at_peer(
     peer_mnt: &Arc<MountFS>,
     source_mountpoint: &Arc<MountFSInode>,
-    source_child: &Arc<MountFS>,
+    _source_child: &Arc<MountFS>,
 ) -> Result<(), SystemError> {
     let peer_mountpoint = match peer_mnt.wrapper_for_dentry(source_mountpoint.shared_dentry()) {
         Ok(mountpoint) => mountpoint,
         Err(SystemError::EXDEV) => return Ok(()),
         Err(error) => return Err(error),
     };
-    let Some(child) = propagated_child_at(peer_mnt, &peer_mountpoint, source_child) else {
+    let Some(child) = propagated_child_at(peer_mnt, &peer_mountpoint) else {
         return Ok(());
     };
     peer_mnt.detach_exact(&child)?;

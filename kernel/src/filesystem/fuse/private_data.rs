@@ -5,7 +5,7 @@ use system_error::SystemError;
 
 use crate::{
     filesystem::vfs::file::FileFlags,
-    libs::{errseq::ErrSeqValue, mutex::Mutex, wait_queue::WaitQueue},
+    libs::{errseq::ErrSeqValue, mutex::Mutex, spinlock::SpinLock, wait_queue::WaitQueue},
     mm::readahead::FileReadaheadState,
 };
 
@@ -38,10 +38,30 @@ pub struct FuseOpenPrivateData {
     pub no_open: bool,
     pub open_context: FuseOpenContext,
     pub writeback_handle: Option<Arc<FuseWritebackHandle>>,
+    /// FUSE_INIT-negotiated read capabilities are immutable for the lifetime
+    /// of a connection. Snapshot them at open so cached reads do not take the
+    /// global connection lock for every read or page-cache fill batch.
+    pub io_config: FuseOpenIoConfig,
     /// Per-open-file-description state. Cloning private data (dup/snapshots)
     /// keeps one shared sequential-read history.
-    pub readahead_state: Arc<Mutex<FileReadaheadState>>,
+    pub readahead_state: Arc<SpinLock<FileReadaheadState>>,
     pub lifetime: Arc<FuseOpenLifetime>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FuseOpenIoConfig {
+    pub async_read: bool,
+    pub auto_inval_data: bool,
+    pub writeback_cache: bool,
+    pub max_read: usize,
+    pub max_pages: usize,
+    pub max_readahead_pages: usize,
+}
+
+impl FuseOpenIoConfig {
+    pub fn snapshot(conn: &FuseConn) -> Self {
+        conn.open_io_config()
+    }
 }
 
 pub struct FuseOpenLifetime {

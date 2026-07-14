@@ -9,6 +9,7 @@ pub struct PageCacheStatsSnapshot {
     pub shmem_pages: u64,
     pub unevictable: u64,
     pub drop_pagecache: u64,
+    pub read_dma_reservations: u64,
 }
 
 static FILE_PAGES: AtomicU64 = AtomicU64::new(0);
@@ -18,6 +19,7 @@ static FILE_WRITEBACK: AtomicU64 = AtomicU64::new(0);
 static SHMEM_PAGES: AtomicU64 = AtomicU64::new(0);
 static UNEVICTABLE: AtomicU64 = AtomicU64::new(0);
 static DROP_PAGECACHE: AtomicU64 = AtomicU64::new(0);
+static READ_DMA_RESERVATIONS: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 pub fn inc_file_pages() {
@@ -85,6 +87,16 @@ pub fn inc_drop_pagecache() {
 }
 
 #[inline]
+pub fn begin_read_dma_reservation() {
+    READ_DMA_RESERVATIONS.fetch_add(1, Ordering::AcqRel);
+}
+
+#[inline]
+pub fn end_read_dma_reservation() {
+    READ_DMA_RESERVATIONS.fetch_sub(1, Ordering::AcqRel);
+}
+
+#[inline]
 pub fn snapshot() -> PageCacheStatsSnapshot {
     PageCacheStatsSnapshot {
         file_pages: FILE_PAGES.load(Ordering::Relaxed),
@@ -94,5 +106,6 @@ pub fn snapshot() -> PageCacheStatsSnapshot {
         shmem_pages: SHMEM_PAGES.load(Ordering::Relaxed),
         unevictable: UNEVICTABLE.load(Ordering::Relaxed),
         drop_pagecache: DROP_PAGECACHE.load(Ordering::Relaxed),
+        read_dma_reservations: READ_DMA_RESERVATIONS.load(Ordering::Acquire),
     }
 }

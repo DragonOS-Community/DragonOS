@@ -14,7 +14,7 @@ CXXFLAGS ?= -Wall -O2 -std=c++17 -pthread -static
 BIN = virtiofs_bench
 SRC = virtiofs_bench.cc
 
-.PHONY: all install clean fmt
+.PHONY: all install clean fmt test-host
 
 all: $(BIN)
 
@@ -30,3 +30,6 @@ clean:
 	rm -f "$(BIN)"
 
 fmt:
+
+test-host:
+	sh ./transcript_test.sh

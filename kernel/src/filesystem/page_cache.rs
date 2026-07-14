@@ -433,6 +433,23 @@ struct PageCacheReadDmaItem {
     page: Arc<Page>,
 }
 
+/// Counts live DMA reservations without exposing or changing their state
+/// machine. Ownership follows the reservation on every completion/error path.
+struct PageCacheReadDmaStatsGuard;
+
+impl PageCacheReadDmaStatsGuard {
+    fn acquire() -> Self {
+        pc_stats::begin_read_dma_reservation();
+        Self
+    }
+}
+
+impl Drop for PageCacheReadDmaStatsGuard {
+    fn drop(&mut self) {
+        pc_stats::end_read_dma_reservation();
+    }
+}
+
 /// Owns candidate pages which are inaccessible to page-cache readers until DMA
 /// has retired, the unread tail has been initialized, and each exact marker is
 /// published.
@@ -441,6 +458,8 @@ pub struct PageCacheReadDmaReservation {
     cache: Arc<PageCache>,
     state: AtomicU8,
     items: ManuallyDrop<Vec<PageCacheReadDmaItem>>,
+    _stats_guard: ManuallyDrop<PageCacheReadDmaStatsGuard>,
+    track_direct_read_stats: bool,
 }
 
 impl core::fmt::Debug for PageCacheReadDmaReservation {
@@ -470,12 +489,17 @@ impl Drop for PageCacheReadDmaReservation {
         }
         self.rollback_markers(SystemError::EIO, true);
         unsafe { ManuallyDrop::drop(&mut self.items) };
+        unsafe { ManuallyDrop::drop(&mut self._stats_guard) };
     }
 }
 
 impl PageCacheReadDmaReservation {
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    pub fn tracks_direct_read_stats(&self) -> bool {
+        self.track_direct_read_stats
     }
 
     pub fn state(&self) -> PageCacheReadDmaState {
@@ -794,27 +818,32 @@ impl PageCacheManager {
     /// Reserve absent cache indices as full-page DMA destinations.
     ///
     /// Existing pages, including another Loading entry, are never replaced.
+    /// The caller must hold this cache's invalidate read guard. Keeping that
+    /// ownership at the fill-operation boundary avoids recursively acquiring
+    /// the writer-preferring invalidate semaphore while an invalidator waits.
     pub fn reserve_read_dma(
         &self,
         start_page_index: usize,
         page_count: usize,
+        track_direct_read_stats: bool,
     ) -> Result<PageCacheReadDmaReservation, SystemError> {
         if page_count == 0 || start_page_index.checked_add(page_count - 1).is_none() {
             return Err(SystemError::EINVAL);
         }
 
         let cache = self.upgrade()?;
-        let _invalidate = cache.invalidate_read();
-        let page_cache_ref = cache.inner.lock().page_cache_ref.clone();
+        let stats_guard = PageCacheReadDmaStatsGuard::acquire();
+        let page_cache_ref = {
+            let inner = cache.inner.lock();
+            if (0..page_count).any(|offset| inner.get_entry(start_page_index + offset).is_some()) {
+                return Err(SystemError::EEXIST);
+            }
+            inner.page_cache_ref.clone()
+        };
         let mut items: Vec<PageCacheReadDmaItem> = Vec::with_capacity(page_count);
 
         for offset in 0..page_count {
             let page_index = start_page_index + offset;
-            if cache.inner.lock().get_entry(page_index).is_some() {
-                PageCacheReadDmaReservation::cleanup_unsubmitted_items(&cache, &items);
-                return Err(SystemError::EEXIST);
-            }
-
             let page = match cache.allocate_page(page_cache_ref.clone(), page_index) {
                 Ok(page) => page,
                 Err(error) => {
@@ -829,16 +858,6 @@ impl PageCacheManager {
                 return Err(SystemError::EFAULT);
             };
             let entry = Arc::new(PageEntry::new(page.clone(), PageState::Loading));
-            let mut inner = cache.inner.lock();
-            if inner.get_entry(page_index).is_some() {
-                drop(inner);
-                cache.discard_unlinked_page(&page);
-                PageCacheReadDmaReservation::cleanup_unsubmitted_items(&cache, &items);
-                return Err(SystemError::EEXIST);
-            }
-            inner.insert_entry(page_index, entry.clone());
-            drop(inner);
-            cache.reconcile_entry_unevictable_for_insert(&entry);
             items.push(PageCacheReadDmaItem {
                 descriptor: PageCacheReadDmaDescriptor {
                     page_index,
@@ -850,12 +869,33 @@ impl PageCacheManager {
             });
         }
 
-        drop(_invalidate);
+        // Publish the complete Loading range atomically.  Exposing a prefix
+        // while allocating later pages lets a waiter attach to that prefix and
+        // then observe a synthetic EIO when a later-page conflict rolls it back.
+        let mut inner = cache.inner.lock();
+        if items
+            .iter()
+            .any(|item| inner.get_entry(item.descriptor.page_index).is_some())
+        {
+            drop(inner);
+            PageCacheReadDmaReservation::cleanup_unsubmitted_items(&cache, &items);
+            return Err(SystemError::EEXIST);
+        }
+        for item in &items {
+            inner.insert_entry(item.descriptor.page_index, item.entry.clone());
+        }
+        drop(inner);
+        for item in &items {
+            cache.reconcile_entry_unevictable_for_insert(&item.entry);
+        }
+
         Ok(PageCacheReadDmaReservation {
             id: PAGE_CACHE_DMA_RESERVATION_ID.fetch_add(1, Ordering::Relaxed),
             cache,
             state: AtomicU8::new(PageCacheReadDmaState::Prepared as u8),
             items: ManuallyDrop::new(items),
+            _stats_guard: ManuallyDrop::new(stats_guard),
+            track_direct_read_stats,
         })
     }
 
@@ -3082,6 +3122,38 @@ impl PageCache {
 
     pub fn is_page_ready(&self, page_index: usize) -> bool {
         self.inner.lock().is_page_ready(page_index)
+    }
+
+    /// Test an entire half-open page range while holding the cache lock once.
+    pub fn is_range_ready(&self, start_page_index: usize, end_page_index: usize) -> bool {
+        if start_page_index >= end_page_index {
+            return true;
+        }
+        let inner = self.inner.lock();
+        (start_page_index..end_page_index).all(|index| inner.is_page_ready(index))
+    }
+
+    /// Wait for an entry that actually conflicts with a DMA reservation range.
+    ///
+    /// The conflicting entry may disappear between `reserve_read_dma()` returning
+    /// `EEXIST` and this lookup.  In that case the caller should simply retry
+    /// discovery instead of creating a new entry for an index that never
+    /// conflicted.
+    pub fn wait_read_dma_conflict(
+        &self,
+        start_page_index: usize,
+        page_count: usize,
+    ) -> Result<bool, SystemError> {
+        let entry = {
+            let inner = self.inner.lock();
+            (0..page_count)
+                .find_map(|offset| inner.get_entry(start_page_index.saturating_add(offset)))
+        };
+        let Some(entry) = entry else {
+            return Ok(false);
+        };
+        let _ = entry.wait_ready()?;
+        Ok(true)
     }
 
     pub fn get_ready_page(&self, page_index: usize) -> Option<Arc<Page>> {

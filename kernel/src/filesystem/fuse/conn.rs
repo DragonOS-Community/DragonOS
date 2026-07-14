@@ -6,7 +6,7 @@ use alloc::{
 };
 use core::{
     mem::size_of,
-    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering},
 };
 
 use system_error::SystemError;
@@ -147,6 +147,10 @@ pub struct FuseRequest {
     opcode: u32,
     reply_contract: FuseReplyContract,
     read_pages_destination: Option<Arc<PageCacheReadDmaReservation>>,
+    track_direct_read_stats: bool,
+    /// Tracks which observable pipeline gauge currently owns this request:
+    /// 0 untracked, 1 connection queue, 2 bridge dispatch, 3 retired/transport.
+    stats_owner: AtomicU8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,6 +174,47 @@ pub(crate) enum FuseReplyContract {
 }
 
 impl FuseRequest {
+    pub(crate) fn stats_mark_queued(&self) {
+        if self
+            .stats_owner
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            stats::on_fuse_queue_owner_acquired();
+        }
+    }
+
+    pub(crate) fn stats_mark_dispatched(&self) {
+        if self
+            .stats_owner
+            .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            stats::on_fuse_dispatch_owner_acquired();
+            stats::on_fuse_queue_owner_released();
+        }
+    }
+
+    pub(crate) fn stats_mark_external_dequeued(&self) {
+        if self
+            .stats_owner
+            .compare_exchange(1, 3, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            stats::on_fuse_queue_owner_released();
+        }
+    }
+
+    pub(crate) fn stats_mark_transport_owned(&self) {
+        if self
+            .stats_owner
+            .compare_exchange(2, 3, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            stats::on_fuse_dispatch_owner_released();
+        }
+    }
+
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -188,6 +233,20 @@ impl FuseRequest {
 
     pub(crate) fn read_pages_destination(&self) -> Option<&Arc<PageCacheReadDmaReservation>> {
         self.read_pages_destination.as_ref()
+    }
+
+    pub(crate) fn tracks_direct_read_stats(&self) -> bool {
+        self.track_direct_read_stats
+    }
+}
+
+impl Drop for FuseRequest {
+    fn drop(&mut self) {
+        match self.stats_owner.swap(3, Ordering::AcqRel) {
+            1 => stats::on_fuse_queue_owner_released(),
+            2 => stats::on_fuse_dispatch_owner_released(),
+            _ => {}
+        }
     }
 }
 
@@ -228,6 +287,7 @@ pub struct FusePendingState {
     background_credit: Mutex<Option<FuseBackgroundCredit>>,
     read_completion: Option<FuseReadCompletion>,
     outcome_unknown: AtomicBool,
+    processing_owner: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -275,6 +335,9 @@ impl FuseReadCompletion {
                     return Err(SystemError::EIO);
                 }
                 self.target.publish_completed(*bytes)?;
+                if self.target.tracks_direct_read_stats() {
+                    stats::on_virtiofs_direct_read_completed(*bytes);
+                }
                 *bytes
             }
             Err(error) => {
@@ -431,6 +494,13 @@ impl FusePendingState {
             background_credit: Mutex::new(background_credit),
             read_completion,
             outcome_unknown: AtomicBool::new(false),
+            processing_owner: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn mark_processing_owner(&self) {
+        if !self.processing_owner.swap(true, Ordering::AcqRel) {
+            stats::on_fuse_processing_begin();
         }
     }
 
@@ -500,6 +570,9 @@ impl FusePendingState {
         let mut guard = self.response.lock();
         *guard = PendingCompletion::Ready(v, kind);
         drop(guard);
+        if self.processing_owner.swap(false, Ordering::AcqRel) {
+            stats::on_fuse_processing_end();
+        }
         // Linux releases a background slot at request completion, not when a
         // waiter later consumes the result.  Taking the token makes this
         // exactly-once across replies, abort and teardown.
@@ -1662,6 +1735,15 @@ impl FuseConn {
         core::cmp::max(1, g.init.max_pages as usize)
     }
 
+    /// Maximum payload accepted by the ordinary READ request builder after
+    /// applying both the negotiated byte cap and the backend/SG page cap.
+    pub fn effective_read_payload_limit(&self) -> usize {
+        core::cmp::min(
+            self.max_read(),
+            self.max_pages().saturating_mul(MMArch::PAGE_SIZE),
+        )
+    }
+
     pub fn max_readahead_pages(&self) -> usize {
         let g = self.inner.lock();
         let bytes = if g.init.max_readahead == 0 {
@@ -1670,6 +1752,25 @@ impl FuseConn {
             g.init.max_readahead as usize
         };
         core::cmp::max(1, bytes >> MMArch::PAGE_SHIFT)
+    }
+
+    /// Snapshot immutable FUSE_INIT read capabilities under one connection
+    /// lock acquisition for use by an open file's cached-I/O hot path.
+    pub(crate) fn open_io_config(&self) -> super::private_data::FuseOpenIoConfig {
+        let g = self.inner.lock();
+        let max_readahead = if g.init.max_readahead == 0 {
+            Self::DEFAULT_MAX_READAHEAD
+        } else {
+            g.init.max_readahead as usize
+        };
+        super::private_data::FuseOpenIoConfig {
+            async_read: (g.init.flags & FUSE_ASYNC_READ) != 0,
+            auto_inval_data: (g.init.flags & FUSE_AUTO_INVAL_DATA) != 0,
+            writeback_cache: (g.init.flags & FUSE_WRITEBACK_CACHE) != 0,
+            max_read: core::cmp::max(Self::MIN_MAX_WRITE, g.max_read as usize),
+            max_pages: core::cmp::max(1, g.init.max_pages as usize),
+            max_readahead_pages: core::cmp::max(1, max_readahead >> MMArch::PAGE_SHIFT),
+        }
     }
 
     fn acquire_background_credit(
@@ -1693,6 +1794,8 @@ mod tests {
 
     use system_error::SystemError;
 
+    use crate::arch::{MMArch, MemoryManagementArch};
+
     use super::super::protocol::{
         FuseEntryOut, FuseOpenOut, FuseOutHeader, FuseStatfsOut, FUSE_CREATE, FUSE_DESTROY,
         FUSE_GETATTR, FUSE_HAS_INODE_DAX, FUSE_LOOKUP, FUSE_MAP_ALIGNMENT, FUSE_REMOVEMAPPING,
@@ -1701,12 +1804,83 @@ mod tests {
     use super::super::virtiofs::dax::{DaxMountMode, DAX_RANGE_SIZE};
     use super::{
         daemon, request, stats, FuseCompletionKind, FuseConn, FusePendingState,
-        FuseReplyCapacitySource,
+        FuseReplyCapacitySource, FuseReplyContract, FuseRequest,
     };
+
+    #[test]
+    fn quiescence_owners_are_tracked_in_off_mode() {
+        let previous_mode = stats::stats_mode();
+        stats::set_stats_mode(stats::FuseStatsMode::Off);
+        let before = stats::fuse_snapshot();
+
+        let request = FuseRequest {
+            bytes: vec![],
+            unique: 1,
+            opcode: FUSE_DESTROY,
+            reply_contract: FuseReplyContract::NoReply,
+            read_pages_destination: None,
+            track_direct_read_stats: false,
+            stats_owner: Default::default(),
+        };
+        request.stats_mark_queued();
+        assert_eq!(request.stats_owner.load(Ordering::Acquire), 1);
+        assert_eq!(
+            stats::fuse_snapshot().request_queue_current,
+            before.request_queue_current + 1
+        );
+        request.stats_mark_dispatched();
+        assert_eq!(request.stats_owner.load(Ordering::Acquire), 2);
+        let dispatched = stats::fuse_snapshot();
+        assert_eq!(
+            dispatched.request_queue_current,
+            before.request_queue_current
+        );
+        assert_eq!(dispatched.dispatch_current, before.dispatch_current + 1);
+        request.stats_mark_transport_owned();
+        assert_eq!(request.stats_owner.load(Ordering::Acquire), 3);
+        assert_eq!(
+            stats::fuse_snapshot().dispatch_current,
+            before.dispatch_current
+        );
+
+        let pending = FusePendingState::new(2, FUSE_GETATTR);
+        pending.mark_processing_owner();
+        assert!(pending.processing_owner.load(Ordering::Acquire));
+        assert_eq!(
+            stats::fuse_snapshot().processing_current,
+            before.processing_current + 1
+        );
+        assert!(pending.complete_never_submitted(SystemError::EIO));
+        assert!(!pending.processing_owner.load(Ordering::Acquire));
+        assert_eq!(
+            stats::fuse_snapshot().processing_current,
+            before.processing_current
+        );
+
+        stats::set_stats_mode(previous_mode);
+    }
 
     fn set_minor(conn: &FuseConn, minor: u32) {
         conn.inner.lock().init.minor = minor;
         conn.reply_layout_minor.store(minor, Ordering::Release);
+    }
+
+    #[test]
+    fn effective_read_payload_limit_applies_byte_and_page_caps() {
+        let conn = FuseConn::new_for_virtiofs(256 * 1024, 256 * 1024);
+        {
+            let mut inner = conn.inner.lock();
+            inner.max_read = 64 * 1024;
+            inner.init.max_pages = 4;
+        }
+        assert_eq!(conn.effective_read_payload_limit(), 4 * MMArch::PAGE_SIZE);
+
+        {
+            let mut inner = conn.inner.lock();
+            inner.max_read = 8 * 1024;
+            inner.init.max_pages = 64;
+        }
+        assert_eq!(conn.effective_read_payload_limit(), 8 * 1024);
     }
 
     fn capacity(conn: &FuseConn, opcode: u32, payload: &[u8]) -> (usize, FuseReplyCapacitySource) {

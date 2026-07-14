@@ -1,20 +1,58 @@
+use crate::mm::page_cache_stats;
 use alloc::{format, string::String};
 use core::{
     fmt::Write,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, AtomicU8, Ordering},
 };
 
 const BATCH_BUCKETS: usize = 5;
+const READ_PAGE_BUCKETS: usize = 6;
 const OPCODE_BUCKETS: usize = 64;
 const OPCODE_OVERFLOW_BUCKET: usize = OPCODE_BUCKETS - 1;
 
-// Detailed copy/allocation counters are opt-in so their atomic RMWs do not
-// perturb the normal virtio-fs hot path. Reading the debugfs snapshot enables
-// them for subsequent operations in the current boot.
-static DETAILED_STATS_ENABLED: AtomicBool = AtomicBool::new(false);
+/// Controls only optional hot-path detail. Lifecycle and direct-DMA conservation
+/// counters below are always-on, so changing this mode cannot split an owner's
+/// acquire/release accounting across observation epochs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FuseStatsMode {
+    Off = 0,
+    Light = 1,
+    Detailed = 2,
+}
+
+impl FuseStatsMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Light => "light",
+            Self::Detailed => "detailed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, ()> {
+        match value.trim() {
+            "off" => Ok(Self::Off),
+            "light" => Ok(Self::Light),
+            "detailed" => Ok(Self::Detailed),
+            _ => Err(()),
+        }
+    }
+}
+
+static STATS_MODE: AtomicU8 = AtomicU8::new(FuseStatsMode::Off as u8);
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FuseStatsSnapshot {
+    pub init_epoch: u64,
+    pub negotiated_max_read_bytes: u64,
+    pub negotiated_max_pages: u64,
+    pub negotiated_max_readahead_bytes: u64,
+    pub negotiated_async_read: u64,
+    pub effective_read_payload_limit_bytes: u64,
+    pub request_queue_current: u64,
+    pub dispatch_current: u64,
+    pub processing_current: u64,
     pub requests_queued_total: u64,
     pub requests_dequeued_total: u64,
     pub requests_replied_ok_total: u64,
@@ -36,8 +74,13 @@ pub struct FuseStatsSnapshot {
     pub readahead_requests_total: u64,
     pub readahead_window_pages_total: u64,
     pub readahead_window_pages_peak: u64,
+    pub readahead_window_extensions_total: u64,
+    pub readahead_window_extension_pages_total: u64,
+    pub readahead_saturated_single_page_extensions_total: u64,
+    pub readahead_reservation_conflicts_total: u64,
     pub readahead_short_reads_total: u64,
     pub background_inflight_current: u64,
+    pub read_reservation_current: u64,
     pub background_inflight_peak: u64,
     pub background_max_blocked_total: u64,
     pub background_congestion_skipped_total: u64,
@@ -87,6 +130,14 @@ pub struct VirtioFsStatsSnapshot {
     pub response_buffer_waste_bytes: u64,
     pub bytes_submitted_total: u64,
     pub bytes_completed_total: u64,
+    pub direct_read_requested_requests_total: u64,
+    pub direct_read_requested_bytes_total: u64,
+    pub direct_read_completed_requests_total: u64,
+    pub direct_read_completed_bytes_total: u64,
+    pub read_requested_requests_total: u64,
+    pub read_requested_bytes_total: u64,
+    pub read_requested_bytes_max: u64,
+    pub read_requested_pages: [u64; READ_PAGE_BUCKETS],
     pub pump_batch: [u64; BATCH_BUCKETS],
     pub complete_batch: [u64; BATCH_BUCKETS],
     pub bridge_waits_total: u64,
@@ -174,7 +225,17 @@ impl VirtioFsBridgeWaitExit {
 }
 
 static REQUESTS_QUEUED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static INIT_EPOCH: AtomicU64 = AtomicU64::new(0);
+static INIT_LIMITS_SEQ: AtomicU64 = AtomicU64::new(0);
+static NEGOTIATED_MAX_READ_BYTES: AtomicU64 = AtomicU64::new(0);
+static NEGOTIATED_MAX_PAGES: AtomicU64 = AtomicU64::new(0);
+static NEGOTIATED_MAX_READAHEAD_BYTES: AtomicU64 = AtomicU64::new(0);
+static NEGOTIATED_ASYNC_READ: AtomicU64 = AtomicU64::new(0);
+static EFFECTIVE_READ_PAYLOAD_LIMIT_BYTES: AtomicU64 = AtomicU64::new(0);
 static REQUESTS_DEQUEUED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static REQUEST_QUEUE_CURRENT: AtomicU64 = AtomicU64::new(0);
+static DISPATCH_CURRENT: AtomicU64 = AtomicU64::new(0);
+static PROCESSING_CURRENT: AtomicU64 = AtomicU64::new(0);
 static REQUESTS_REPLIED_OK_TOTAL: AtomicU64 = AtomicU64::new(0);
 static REQUESTS_REPLIED_ERR_TOTAL: AtomicU64 = AtomicU64::new(0);
 static REQUESTS_ABORTED_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -194,13 +255,76 @@ static READAHEAD_BATCHES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READAHEAD_REQUESTS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READAHEAD_WINDOW_PAGES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READAHEAD_WINDOW_PAGES_PEAK: AtomicU64 = AtomicU64::new(0);
+static READAHEAD_WINDOW_EXTENSIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static READAHEAD_WINDOW_EXTENSION_PAGES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static READAHEAD_SATURATED_SINGLE_PAGE_EXTENSIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static READAHEAD_RESERVATION_CONFLICTS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READAHEAD_SHORT_READS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BACKGROUND_INFLIGHT_CURRENT: AtomicU64 = AtomicU64::new(0);
 static BACKGROUND_INFLIGHT_PEAK: AtomicU64 = AtomicU64::new(0);
 static BACKGROUND_MAX_BLOCKED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BACKGROUND_CONGESTION_SKIPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
+pub fn on_fuse_read_limits_negotiated(
+    max_read: usize,
+    max_pages: usize,
+    max_readahead: usize,
+    async_read: bool,
+    effective_read_payload_limit: usize,
+) {
+    let sequence = loop {
+        let current = INIT_LIMITS_SEQ.load(Ordering::Acquire);
+        if current & 1 != 0 {
+            core::hint::spin_loop();
+            continue;
+        }
+        if INIT_LIMITS_SEQ
+            .compare_exchange(
+                current,
+                current.wrapping_add(1),
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            break current;
+        }
+    };
+    NEGOTIATED_MAX_READ_BYTES.store(max_read as u64, Ordering::Relaxed);
+    NEGOTIATED_MAX_PAGES.store(max_pages as u64, Ordering::Relaxed);
+    NEGOTIATED_MAX_READAHEAD_BYTES.store(max_readahead as u64, Ordering::Relaxed);
+    NEGOTIATED_ASYNC_READ.store(async_read as u64, Ordering::Relaxed);
+    EFFECTIVE_READ_PAYLOAD_LIMIT_BYTES
+        .store(effective_read_payload_limit as u64, Ordering::Relaxed);
+    INIT_EPOCH.fetch_add(1, Ordering::Relaxed);
+    INIT_LIMITS_SEQ.store(sequence.wrapping_add(2), Ordering::Release);
+}
+
+fn fuse_init_limits_snapshot() -> (u64, u64, u64, u64, u64, u64) {
+    loop {
+        let before = INIT_LIMITS_SEQ.load(Ordering::Acquire);
+        if before & 1 != 0 {
+            core::hint::spin_loop();
+            continue;
+        }
+        let values = (
+            INIT_EPOCH.load(Ordering::Relaxed),
+            NEGOTIATED_MAX_READ_BYTES.load(Ordering::Relaxed),
+            NEGOTIATED_MAX_PAGES.load(Ordering::Relaxed),
+            NEGOTIATED_MAX_READAHEAD_BYTES.load(Ordering::Relaxed),
+            NEGOTIATED_ASYNC_READ.load(Ordering::Relaxed),
+            EFFECTIVE_READ_PAYLOAD_LIMIT_BYTES.load(Ordering::Relaxed),
+        );
+        if before == INIT_LIMITS_SEQ.load(Ordering::Acquire) {
+            return values;
+        }
+    }
+}
+
 pub fn on_readahead_batch(window_pages: usize, requests: usize) {
+    if !light_stats_enabled() {
+        return;
+    }
     inc(&READAHEAD_BATCHES_TOTAL);
     add(&READAHEAD_REQUESTS_TOTAL, requests as u64);
     add(&READAHEAD_WINDOW_PAGES_TOTAL, window_pages as u64);
@@ -208,16 +332,39 @@ pub fn on_readahead_batch(window_pages: usize, requests: usize) {
 }
 
 pub fn on_readahead_short_read() {
+    if !light_stats_enabled() {
+        return;
+    }
     inc(&READAHEAD_SHORT_READS_TOTAL);
 }
 
+pub fn on_readahead_window_extension(extension_pages: usize, saturated: bool) {
+    if !light_stats_enabled() || extension_pages == 0 {
+        return;
+    }
+    inc(&READAHEAD_WINDOW_EXTENSIONS_TOTAL);
+    add(
+        &READAHEAD_WINDOW_EXTENSION_PAGES_TOTAL,
+        extension_pages as u64,
+    );
+    if saturated && extension_pages == 1 {
+        inc(&READAHEAD_SATURATED_SINGLE_PAGE_EXTENSIONS_TOTAL);
+    }
+}
+
+pub fn on_readahead_reservation_conflict() {
+    if light_stats_enabled() {
+        inc(&READAHEAD_RESERVATION_CONFLICTS_TOTAL);
+    }
+}
+
 pub fn on_background_acquired() {
-    let current = BACKGROUND_INFLIGHT_CURRENT.fetch_add(1, Ordering::Relaxed) + 1;
+    let current = owner_add(&BACKGROUND_INFLIGHT_CURRENT, 1);
     update_peak(&BACKGROUND_INFLIGHT_PEAK, current);
 }
 
 pub fn on_background_released() {
-    saturating_sub(&BACKGROUND_INFLIGHT_CURRENT, 1);
+    owner_saturating_sub(&BACKGROUND_INFLIGHT_CURRENT, 1);
 }
 
 pub fn on_background_pressure(speculative: bool) {
@@ -276,6 +423,22 @@ static RESPONSE_POOL_DROPPED_COUNT: AtomicU64 = AtomicU64::new(0);
 static RESPONSE_BUFFER_WASTE_BYTES: AtomicU64 = AtomicU64::new(0);
 static BYTES_SUBMITTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BYTES_COMPLETED_TOTAL: AtomicU64 = AtomicU64::new(0);
+// These direct page-cache DMA counters are always-on. A requested event means
+// the virtqueue accepted the direct destination descriptors; a completed event
+// means the validated successful reply was handed to the pending completion.
+static DIRECT_READ_REQUESTED_REQUESTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DIRECT_READ_REQUESTED_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DIRECT_READ_COMPLETED_REQUESTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DIRECT_READ_COMPLETED_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+// Request-size diagnostics are optional because they add several RMWs to every
+// submitted FUSE_READ. They intentionally count actual requested payload bytes,
+// not page-cache reservation capacity.
+static READ_REQUESTED_REQUESTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static READ_REQUESTED_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static READ_REQUESTED_BYTES_MAX: AtomicU64 = AtomicU64::new(0);
+static READ_REQUESTED_PAGES: [AtomicU64; READ_PAGE_BUCKETS] =
+    [const { AtomicU64::new(0) }; READ_PAGE_BUCKETS];
 
 static OPCODE_REQUESTS_TOTAL: [AtomicU64; OPCODE_BUCKETS] =
     [const { AtomicU64::new(0) }; OPCODE_BUCKETS];
@@ -357,12 +520,22 @@ fn add(counter: &AtomicU64, value: u64) {
     counter.fetch_add(value, Ordering::Relaxed);
 }
 
+/// Publish acquisition of an always-on lifecycle owner. Unlike aggregate
+/// counters, current-owner gauges participate in quiescence observations and
+/// therefore need to synchronize with an Acquire snapshot.
 #[inline]
-fn saturating_sub(counter: &AtomicU64, value: u64) {
+fn owner_add(counter: &AtomicU64, value: u64) -> u64 {
+    counter.fetch_add(value, Ordering::AcqRel) + value
+}
+
+/// Publish retirement of an always-on lifecycle owner. Keep the saturating
+/// behavior so duplicate cleanup cannot underflow a gauge.
+#[inline]
+fn owner_saturating_sub(counter: &AtomicU64, value: u64) {
     let mut old = counter.load(Ordering::Relaxed);
     loop {
         let new = old.saturating_sub(value);
-        match counter.compare_exchange_weak(old, new, Ordering::Relaxed, Ordering::Relaxed) {
+        match counter.compare_exchange_weak(old, new, Ordering::Release, Ordering::Relaxed) {
             Ok(_) => return,
             Err(v) => old = v,
         }
@@ -381,7 +554,32 @@ fn opcode_bucket(opcode: u32) -> usize {
 
 #[inline]
 fn detailed_stats_enabled() -> bool {
-    DETAILED_STATS_ENABLED.load(Ordering::Relaxed)
+    stats_mode() == FuseStatsMode::Detailed
+}
+
+#[inline]
+fn light_stats_enabled() -> bool {
+    matches!(stats_mode(), FuseStatsMode::Light | FuseStatsMode::Detailed)
+}
+
+/// Sample once when an observable owner is acquired. Callers retain that
+/// decision until retirement so a mode change cannot split acquire/release.
+#[inline]
+pub fn optional_read_stats_enabled() -> bool {
+    light_stats_enabled()
+}
+
+pub fn stats_mode() -> FuseStatsMode {
+    match STATS_MODE.load(Ordering::Acquire) {
+        0 => FuseStatsMode::Off,
+        1 => FuseStatsMode::Light,
+        2 => FuseStatsMode::Detailed,
+        _ => FuseStatsMode::Off,
+    }
+}
+
+pub fn set_stats_mode(mode: FuseStatsMode) {
+    STATS_MODE.store(mode as u8, Ordering::Release);
 }
 
 #[inline]
@@ -411,6 +609,19 @@ fn record_batch(buckets: &[AtomicU64; BATCH_BUCKETS], count: usize) {
     inc(&buckets[batch_bucket(count)]);
 }
 
+#[inline]
+fn read_page_bucket(pages: usize) -> usize {
+    debug_assert!(pages != 0);
+    match pages {
+        1 => 0,
+        2..=4 => 1,
+        5..=16 => 2,
+        17..=32 => 3,
+        33..=64 => 4,
+        _ => 5,
+    }
+}
+
 fn snapshot_batch(buckets: &[AtomicU64; BATCH_BUCKETS]) -> [u64; BATCH_BUCKETS] {
     [
         buckets[0].load(Ordering::Relaxed),
@@ -419,6 +630,10 @@ fn snapshot_batch(buckets: &[AtomicU64; BATCH_BUCKETS]) -> [u64; BATCH_BUCKETS] 
         buckets[3].load(Ordering::Relaxed),
         buckets[4].load(Ordering::Relaxed),
     ]
+}
+
+fn snapshot_read_pages() -> [u64; READ_PAGE_BUCKETS] {
+    core::array::from_fn(|idx| READ_REQUESTED_PAGES[idx].load(Ordering::Relaxed))
 }
 
 #[inline]
@@ -433,6 +648,30 @@ pub fn on_fuse_request_queued(_len: usize, no_reply: bool) {
 pub fn on_fuse_request_dequeued(len: usize) {
     inc(&REQUESTS_DEQUEUED_TOTAL);
     add(&BYTES_REQUEST_TO_DEV_TOTAL, len as u64);
+}
+
+pub fn on_fuse_queue_owner_acquired() {
+    owner_add(&REQUEST_QUEUE_CURRENT, 1);
+}
+
+pub fn on_fuse_queue_owner_released() {
+    owner_saturating_sub(&REQUEST_QUEUE_CURRENT, 1);
+}
+
+pub fn on_fuse_dispatch_owner_acquired() {
+    owner_add(&DISPATCH_CURRENT, 1);
+}
+
+pub fn on_fuse_dispatch_owner_released() {
+    owner_saturating_sub(&DISPATCH_CURRENT, 1);
+}
+
+pub fn on_fuse_processing_begin() {
+    owner_add(&PROCESSING_CURRENT, 1);
+}
+
+pub fn on_fuse_processing_end() {
+    owner_saturating_sub(&PROCESSING_CURRENT, 1);
 }
 
 #[inline]
@@ -465,29 +704,29 @@ pub fn on_fuse_reply_payload_copy(opcode: u32, payload_len: usize) {
 
 #[inline]
 pub fn on_virtiofs_reply_retained(capacity: usize) {
-    let count = REPLY_RETAINED_CURRENT.fetch_add(1, Ordering::Relaxed) + 1;
+    let count = owner_add(&REPLY_RETAINED_CURRENT, 1);
     let capacity = capacity as u64;
-    let bytes =
-        REPLY_RETAINED_CAPACITY_BYTES_CURRENT.fetch_add(capacity, Ordering::Relaxed) + capacity;
+    let bytes = owner_add(&REPLY_RETAINED_CAPACITY_BYTES_CURRENT, capacity);
     update_peak(&REPLY_RETAINED_PEAK, count);
     update_peak(&REPLY_RETAINED_CAPACITY_BYTES_PEAK, bytes);
 }
 
 #[inline]
 pub fn on_virtiofs_reply_released(capacity: usize) {
-    saturating_sub(&REPLY_RETAINED_CURRENT, 1);
-    saturating_sub(&REPLY_RETAINED_CAPACITY_BYTES_CURRENT, capacity as u64);
+    // Publish the resource detail before dropping the aggregate owner. An
+    // observer that acquires a zero owner count must not retain stale capacity.
+    owner_saturating_sub(&REPLY_RETAINED_CAPACITY_BYTES_CURRENT, capacity as u64);
+    owner_saturating_sub(&REPLY_RETAINED_CURRENT, 1);
 }
 
 #[inline]
 pub fn on_virtiofs_reply_capacity_reaccounted(old_capacity: usize, new_capacity: usize) {
     if new_capacity > old_capacity {
         let delta = (new_capacity - old_capacity) as u64;
-        let bytes =
-            REPLY_RETAINED_CAPACITY_BYTES_CURRENT.fetch_add(delta, Ordering::Relaxed) + delta;
+        let bytes = owner_add(&REPLY_RETAINED_CAPACITY_BYTES_CURRENT, delta);
         update_peak(&REPLY_RETAINED_CAPACITY_BYTES_PEAK, bytes);
     } else {
-        saturating_sub(
+        owner_saturating_sub(
             &REPLY_RETAINED_CAPACITY_BYTES_CURRENT,
             (old_capacity - new_capacity) as u64,
         );
@@ -568,15 +807,15 @@ pub fn on_virtiofs_queue_configured(
 }
 
 pub fn on_virtiofs_inflight_add(kind: VirtioFsQueueKind) {
-    let total = INFLIGHT_CURRENT.fetch_add(1, Ordering::Relaxed) + 1;
+    let total = owner_add(&INFLIGHT_CURRENT, 1);
     update_peak(&INFLIGHT_PEAK, total);
     match kind {
         VirtioFsQueueKind::Hiprio => {
-            let current = HIPRIO_INFLIGHT_CURRENT.fetch_add(1, Ordering::Relaxed) + 1;
+            let current = owner_add(&HIPRIO_INFLIGHT_CURRENT, 1);
             update_peak(&HIPRIO_INFLIGHT_PEAK, current);
         }
         VirtioFsQueueKind::Request => {
-            let current = REQUEST_INFLIGHT_CURRENT.fetch_add(1, Ordering::Relaxed) + 1;
+            let current = owner_add(&REQUEST_INFLIGHT_CURRENT, 1);
             update_peak(&REQUEST_INFLIGHT_PEAK, current);
         }
     }
@@ -587,15 +826,18 @@ pub fn on_virtiofs_inflight_remove(kind: VirtioFsQueueKind, count: usize) {
         return;
     }
     let count = count as u64;
-    saturating_sub(&INFLIGHT_CURRENT, count);
+    // Retire the classified owner before the aggregate. Together with the
+    // Acquire snapshot order (aggregate, then class), observing total == 0
+    // cannot leave a stale per-queue owner published by this retirement.
     match kind {
         VirtioFsQueueKind::Hiprio => {
-            saturating_sub(&HIPRIO_INFLIGHT_CURRENT, count);
+            owner_saturating_sub(&HIPRIO_INFLIGHT_CURRENT, count);
         }
         VirtioFsQueueKind::Request => {
-            saturating_sub(&REQUEST_INFLIGHT_CURRENT, count);
+            owner_saturating_sub(&REQUEST_INFLIGHT_CURRENT, count);
         }
     }
+    owner_saturating_sub(&INFLIGHT_CURRENT, count);
 }
 
 #[inline]
@@ -776,6 +1018,36 @@ pub fn on_virtiofs_submitted(opcode: u32, req_len: usize) {
     }
 }
 
+/// Record the payload size of a successfully submitted FUSE_READ.
+///
+/// `pages` is supplied by the caller using the active architecture page size;
+/// keeping that conversion out of this module avoids coupling statistics to a
+/// particular page-cache implementation.
+#[inline]
+pub fn on_virtiofs_read_requested(requested_bytes: usize, pages: usize) {
+    if !light_stats_enabled() || requested_bytes == 0 || pages == 0 {
+        return;
+    }
+    inc(&READ_REQUESTED_REQUESTS_TOTAL);
+    add(&READ_REQUESTED_BYTES_TOTAL, requested_bytes as u64);
+    update_peak(&READ_REQUESTED_BYTES_MAX, requested_bytes as u64);
+    inc(&READ_REQUESTED_PAGES[read_page_bucket(pages)]);
+}
+
+/// Queue acceptance is the DMA ownership commit point.
+#[inline]
+pub fn on_virtiofs_direct_read_requested(requested_bytes: usize) {
+    inc(&DIRECT_READ_REQUESTED_REQUESTS_TOTAL);
+    add(&DIRECT_READ_REQUESTED_BYTES_TOTAL, requested_bytes as u64);
+}
+
+/// Count only a validated successful direct reply handed to pending completion.
+#[inline]
+pub fn on_virtiofs_direct_read_completed(payload_bytes: usize) {
+    inc(&DIRECT_READ_COMPLETED_REQUESTS_TOTAL);
+    add(&DIRECT_READ_COMPLETED_BYTES_TOTAL, payload_bytes as u64);
+}
+
 #[inline]
 pub fn on_virtiofs_queue_full(kind: VirtioFsQueueKind) {
     inc(&VIRTQUEUE_FULL_TOTAL);
@@ -788,12 +1060,12 @@ pub fn on_virtiofs_queue_full(kind: VirtioFsQueueKind) {
 #[inline]
 pub fn on_virtiofs_queue_full_blocked() {
     inc(&BRIDGE_QUEUE_FULL_BLOCKED_TOTAL);
-    inc(&QUEUE_FULL_BLOCKED_CURRENT);
+    owner_add(&QUEUE_FULL_BLOCKED_CURRENT, 1);
 }
 
 #[inline]
 pub fn on_virtiofs_queue_full_unblocked() {
-    saturating_sub(&QUEUE_FULL_BLOCKED_CURRENT, 1);
+    owner_saturating_sub(&QUEUE_FULL_BLOCKED_CURRENT, 1);
 }
 
 #[inline]
@@ -869,7 +1141,18 @@ pub fn on_virtiofs_dax_device_reset() {
 }
 
 pub fn fuse_snapshot() -> FuseStatsSnapshot {
+    let (init_epoch, max_read, max_pages, max_readahead, async_read, effective_read) =
+        fuse_init_limits_snapshot();
     FuseStatsSnapshot {
+        init_epoch,
+        negotiated_max_read_bytes: max_read,
+        negotiated_max_pages: max_pages,
+        negotiated_max_readahead_bytes: max_readahead,
+        negotiated_async_read: async_read,
+        effective_read_payload_limit_bytes: effective_read,
+        request_queue_current: REQUEST_QUEUE_CURRENT.load(Ordering::Acquire),
+        dispatch_current: DISPATCH_CURRENT.load(Ordering::Acquire),
+        processing_current: PROCESSING_CURRENT.load(Ordering::Acquire),
         requests_queued_total: REQUESTS_QUEUED_TOTAL.load(Ordering::Relaxed),
         requests_dequeued_total: REQUESTS_DEQUEUED_TOTAL.load(Ordering::Relaxed),
         requests_replied_ok_total: REQUESTS_REPLIED_OK_TOTAL.load(Ordering::Relaxed),
@@ -893,8 +1176,17 @@ pub fn fuse_snapshot() -> FuseStatsSnapshot {
         readahead_requests_total: READAHEAD_REQUESTS_TOTAL.load(Ordering::Relaxed),
         readahead_window_pages_total: READAHEAD_WINDOW_PAGES_TOTAL.load(Ordering::Relaxed),
         readahead_window_pages_peak: READAHEAD_WINDOW_PAGES_PEAK.load(Ordering::Relaxed),
+        readahead_window_extensions_total: READAHEAD_WINDOW_EXTENSIONS_TOTAL
+            .load(Ordering::Relaxed),
+        readahead_window_extension_pages_total: READAHEAD_WINDOW_EXTENSION_PAGES_TOTAL
+            .load(Ordering::Relaxed),
+        readahead_saturated_single_page_extensions_total:
+            READAHEAD_SATURATED_SINGLE_PAGE_EXTENSIONS_TOTAL.load(Ordering::Relaxed),
+        readahead_reservation_conflicts_total: READAHEAD_RESERVATION_CONFLICTS_TOTAL
+            .load(Ordering::Relaxed),
         readahead_short_reads_total: READAHEAD_SHORT_READS_TOTAL.load(Ordering::Relaxed),
-        background_inflight_current: BACKGROUND_INFLIGHT_CURRENT.load(Ordering::Relaxed),
+        background_inflight_current: BACKGROUND_INFLIGHT_CURRENT.load(Ordering::Acquire),
+        read_reservation_current: page_cache_stats::snapshot().read_dma_reservations,
         background_inflight_peak: BACKGROUND_INFLIGHT_PEAK.load(Ordering::Relaxed),
         background_max_blocked_total: BACKGROUND_MAX_BLOCKED_TOTAL.load(Ordering::Relaxed),
         background_congestion_skipped_total: BACKGROUND_CONGESTION_SKIPPED_TOTAL
@@ -912,17 +1204,17 @@ pub fn virtiofs_snapshot() -> VirtioFsStatsSnapshot {
         request_vring_size_max_configured: REQUEST_VRING_SIZE_MAX_CONFIGURED
             .load(Ordering::Relaxed),
         sg_limit_pages_configured: SG_LIMIT_PAGES_CONFIGURED.load(Ordering::Relaxed),
-        inflight_current: INFLIGHT_CURRENT.load(Ordering::Relaxed),
+        inflight_current: INFLIGHT_CURRENT.load(Ordering::Acquire),
         inflight_peak: INFLIGHT_PEAK.load(Ordering::Relaxed),
-        hiprio_inflight_current: HIPRIO_INFLIGHT_CURRENT.load(Ordering::Relaxed),
+        hiprio_inflight_current: HIPRIO_INFLIGHT_CURRENT.load(Ordering::Acquire),
         hiprio_inflight_peak: HIPRIO_INFLIGHT_PEAK.load(Ordering::Relaxed),
-        request_inflight_current: REQUEST_INFLIGHT_CURRENT.load(Ordering::Relaxed),
+        request_inflight_current: REQUEST_INFLIGHT_CURRENT.load(Ordering::Acquire),
         request_inflight_peak: REQUEST_INFLIGHT_PEAK.load(Ordering::Relaxed),
-        queue_full_blocked_current: QUEUE_FULL_BLOCKED_CURRENT.load(Ordering::Relaxed),
-        reply_retained_current: REPLY_RETAINED_CURRENT.load(Ordering::Relaxed),
+        queue_full_blocked_current: QUEUE_FULL_BLOCKED_CURRENT.load(Ordering::Acquire),
+        reply_retained_current: REPLY_RETAINED_CURRENT.load(Ordering::Acquire),
         reply_retained_peak: REPLY_RETAINED_PEAK.load(Ordering::Relaxed),
         reply_retained_capacity_bytes_current: REPLY_RETAINED_CAPACITY_BYTES_CURRENT
-            .load(Ordering::Relaxed),
+            .load(Ordering::Acquire),
         reply_retained_capacity_bytes_peak: REPLY_RETAINED_CAPACITY_BYTES_PEAK
             .load(Ordering::Relaxed),
         reply_credit_blocked_total: REPLY_CREDIT_BLOCKED_TOTAL.load(Ordering::Relaxed),
@@ -950,6 +1242,18 @@ pub fn virtiofs_snapshot() -> VirtioFsStatsSnapshot {
         response_buffer_waste_bytes: RESPONSE_BUFFER_WASTE_BYTES.load(Ordering::Relaxed),
         bytes_submitted_total: BYTES_SUBMITTED_TOTAL.load(Ordering::Relaxed),
         bytes_completed_total: BYTES_COMPLETED_TOTAL.load(Ordering::Relaxed),
+        direct_read_requested_requests_total: DIRECT_READ_REQUESTED_REQUESTS_TOTAL
+            .load(Ordering::Relaxed),
+        direct_read_requested_bytes_total: DIRECT_READ_REQUESTED_BYTES_TOTAL
+            .load(Ordering::Relaxed),
+        direct_read_completed_requests_total: DIRECT_READ_COMPLETED_REQUESTS_TOTAL
+            .load(Ordering::Relaxed),
+        direct_read_completed_bytes_total: DIRECT_READ_COMPLETED_BYTES_TOTAL
+            .load(Ordering::Relaxed),
+        read_requested_requests_total: READ_REQUESTED_REQUESTS_TOTAL.load(Ordering::Relaxed),
+        read_requested_bytes_total: READ_REQUESTED_BYTES_TOTAL.load(Ordering::Relaxed),
+        read_requested_bytes_max: READ_REQUESTED_BYTES_MAX.load(Ordering::Relaxed),
+        read_requested_pages: snapshot_read_pages(),
         pump_batch: snapshot_batch(&PUMP_BATCH),
         complete_batch: snapshot_batch(&COMPLETE_BATCH),
         bridge_waits_total: BRIDGE_WAITS_TOTAL.load(Ordering::Relaxed),
@@ -986,13 +1290,25 @@ pub fn virtiofs_snapshot() -> VirtioFsStatsSnapshot {
 }
 
 pub fn format_snapshot() -> String {
-    // A stats read is the explicit start of a detailed observation window.
-    // Enable it before taking the baseline snapshot.
-    DETAILED_STATS_ENABLED.store(true, Ordering::Relaxed);
     let fuse = fuse_snapshot();
     let virtiofs = virtiofs_snapshot();
     let mut output = format!(
-        "[fuse]\n\
+        "[control]\n\
+mode {}\n\
+always_on aggregate_transport,quiescence_owner\n\
+light direct_read_dma,read_size_buckets\n\
+detailed opcode,copy,allocation\n\
+\n\
+[fuse]\n\
+init_epoch {}\n\
+negotiated_max_read_bytes {}\n\
+negotiated_max_pages {}\n\
+negotiated_max_readahead_bytes {}\n\
+negotiated_async_read {}\n\
+effective_read_payload_limit_bytes {}\n\
+request_queue_current {}\n\
+dispatch_current {}\n\
+processing_current {}\n\
 requests_queued_total {}\n\
 requests_dequeued_total {}\n\
 requests_replied_ok_total {}\n\
@@ -1014,8 +1330,13 @@ readahead_batches_total {}\n\
 readahead_requests_total {}\n\
 readahead_window_pages_total {}\n\
 readahead_window_pages_peak {}\n\
+readahead_window_extensions_total {}\n\
+readahead_window_extension_pages_total {}\n\
+readahead_saturated_single_page_extensions_total {}\n\
+readahead_reservation_conflicts_total {}\n\
 readahead_short_reads_total {}\n\
 background_inflight_current {}\n\
+read_reservation_current {}\n\
 background_inflight_peak {}\n\
 background_max_blocked_total {}\n\
 background_congestion_skipped_total {}\n\
@@ -1063,6 +1384,19 @@ response_buffer_alloc_bytes {}\n\
 response_buffer_waste_bytes {}\n\
 bytes_submitted_total {}\n\
 bytes_completed_total {}\n\
+direct_read_requested_requests_total {}\n\
+direct_read_requested_bytes_total {}\n\
+direct_read_completed_requests_total {}\n\
+direct_read_completed_bytes_total {}\n\
+read_requested_requests_total {}\n\
+read_requested_bytes_total {}\n\
+read_requested_bytes_max {}\n\
+read_requested_pages_1 {}\n\
+read_requested_pages_2_4 {}\n\
+read_requested_pages_5_16 {}\n\
+read_requested_pages_17_32 {}\n\
+read_requested_pages_33_64 {}\n\
+read_requested_pages_65_plus {}\n\
 pump_batch_0 {}\n\
 pump_batch_1 {}\n\
 pump_batch_2_4 {}\n\
@@ -1097,6 +1431,16 @@ dax_mapping_created_total {}\n\
 dax_mapping_removed_total {}\n\
 dax_pressure_reclaims_total {}\n\
 dax_device_resets_total {}\n",
+        stats_mode().as_str(),
+        fuse.init_epoch,
+        fuse.negotiated_max_read_bytes,
+        fuse.negotiated_max_pages,
+        fuse.negotiated_max_readahead_bytes,
+        fuse.negotiated_async_read,
+        fuse.effective_read_payload_limit_bytes,
+        fuse.request_queue_current,
+        fuse.dispatch_current,
+        fuse.processing_current,
         fuse.requests_queued_total,
         fuse.requests_dequeued_total,
         fuse.requests_replied_ok_total,
@@ -1118,8 +1462,13 @@ dax_device_resets_total {}\n",
         fuse.readahead_requests_total,
         fuse.readahead_window_pages_total,
         fuse.readahead_window_pages_peak,
+        fuse.readahead_window_extensions_total,
+        fuse.readahead_window_extension_pages_total,
+        fuse.readahead_saturated_single_page_extensions_total,
+        fuse.readahead_reservation_conflicts_total,
         fuse.readahead_short_reads_total,
         fuse.background_inflight_current,
+        fuse.read_reservation_current,
         fuse.background_inflight_peak,
         fuse.background_max_blocked_total,
         fuse.background_congestion_skipped_total,
@@ -1165,6 +1514,19 @@ dax_device_resets_total {}\n",
         virtiofs.response_buffer_waste_bytes,
         virtiofs.bytes_submitted_total,
         virtiofs.bytes_completed_total,
+        virtiofs.direct_read_requested_requests_total,
+        virtiofs.direct_read_requested_bytes_total,
+        virtiofs.direct_read_completed_requests_total,
+        virtiofs.direct_read_completed_bytes_total,
+        virtiofs.read_requested_requests_total,
+        virtiofs.read_requested_bytes_total,
+        virtiofs.read_requested_bytes_max,
+        virtiofs.read_requested_pages[0],
+        virtiofs.read_requested_pages[1],
+        virtiofs.read_requested_pages[2],
+        virtiofs.read_requested_pages[3],
+        virtiofs.read_requested_pages[4],
+        virtiofs.read_requested_pages[5],
         virtiofs.pump_batch[0],
         virtiofs.pump_batch[1],
         virtiofs.pump_batch[2],
@@ -1265,4 +1627,42 @@ opcode_{opcode}_reply_payload_transfer_bytes {}",
         .expect("formatting fuse opcode stats into String cannot fail");
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stats_mode_parser_is_strict_but_accepts_debugfs_newline() {
+        assert_eq!(FuseStatsMode::parse("off\n"), Ok(FuseStatsMode::Off));
+        assert_eq!(FuseStatsMode::parse(" light "), Ok(FuseStatsMode::Light));
+        assert_eq!(
+            FuseStatsMode::parse("detailed"),
+            Ok(FuseStatsMode::Detailed)
+        );
+        assert!(FuseStatsMode::parse("on").is_err());
+    }
+
+    #[test]
+    fn read_page_buckets_match_reported_ranges() {
+        assert_eq!(read_page_bucket(1), 0);
+        assert_eq!(read_page_bucket(2), 1);
+        assert_eq!(read_page_bucket(4), 1);
+        assert_eq!(read_page_bucket(5), 2);
+        assert_eq!(read_page_bucket(16), 2);
+        assert_eq!(read_page_bucket(17), 3);
+        assert_eq!(read_page_bucket(32), 3);
+        assert_eq!(read_page_bucket(33), 4);
+        assert_eq!(read_page_bucket(64), 4);
+        assert_eq!(read_page_bucket(65), 5);
+    }
+
+    #[test]
+    fn formatting_snapshot_does_not_enable_detailed_mode() {
+        let previous = stats_mode();
+        let report = format_snapshot();
+        assert_eq!(stats_mode(), previous);
+        assert!(report.contains(&alloc::format!("[control]\nmode {}\n", previous.as_str())));
+    }
 }

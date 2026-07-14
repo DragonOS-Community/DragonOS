@@ -36,7 +36,8 @@ use super::{
     private_data::FuseWritebackHandle,
     protocol::{
         fuse_pack_struct, fuse_read_struct, FuseAttr, FuseAttrOut, FuseEntryOut, FuseGetattrIn,
-        FuseWriteIn, FuseWriteOut, FUSE_GETATTR, FUSE_ROOT_ID, FUSE_WRITE, FUSE_WRITE_LOCKOWNER,
+        FuseWriteIn, FuseWriteOut, FUSE_GETATTR, FUSE_GETATTR_FH, FUSE_ROOT_ID, FUSE_WRITE,
+        FUSE_WRITE_LOCKOWNER,
     },
 };
 
@@ -49,6 +50,14 @@ use super::{
 };
 
 static NEXT_NODE_INCARNATION: AtomicU64 = AtomicU64::new(1);
+
+fn getattr_request_input(fh: Option<u64>) -> FuseGetattrIn {
+    FuseGetattrIn {
+        getattr_flags: if fh.is_some() { FUSE_GETATTR_FH } else { 0 },
+        dummy: 0,
+        fh: fh.unwrap_or(0),
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct DaxMapping {
@@ -1453,14 +1462,10 @@ impl FuseNode {
         }
     }
 
-    fn fetch_attr(&self) -> Result<Metadata, SystemError> {
+    fn fetch_attr_with_file_handle(&self, fh: Option<u64>) -> Result<Metadata, SystemError> {
         self.check_not_stale()?;
         let request_epoch = self.conn.sample_attr_epoch();
-        let getattr_in = FuseGetattrIn {
-            getattr_flags: 0,
-            dummy: 0,
-            fh: 0,
-        };
+        let getattr_in = getattr_request_input(fh);
         let payload =
             self.conn()
                 .request(FUSE_GETATTR, self.nodeid, fuse_pack_struct(&getattr_in))?;
@@ -1475,15 +1480,51 @@ impl FuseNode {
         ))
     }
 
+    fn fetch_attr(&self) -> Result<Metadata, SystemError> {
+        self.fetch_attr_with_file_handle(None)
+    }
+
     fn cached_or_fetch_metadata(&self) -> Result<Metadata, SystemError> {
         self.conn.check_allow_current_process()?;
+        self.cached_or_fetch_metadata_with_file_handle(None)
+    }
+
+    fn cached_or_fetch_metadata_with_file_handle(
+        &self,
+        fh: Option<u64>,
+    ) -> Result<Metadata, SystemError> {
         if let Some(m) = self.cached_metadata.lock().clone() {
             let deadline = self.cached_metadata_deadline_ns.load(Ordering::Relaxed);
             if deadline == u64::MAX || (deadline != 0 && Self::now_ns() < deadline) {
                 return Ok(m);
             }
         }
-        self.fetch_attr()
+        match fh {
+            Some(fh) => self.fetch_attr_with_file_handle(Some(fh)),
+            None => self.fetch_attr(),
+        }
+    }
+
+    /// Refresh attributes for I/O issued through an already-open file.
+    ///
+    /// Mount permission was checked when the file was opened.  Linux's
+    /// `fuse_update_attributes()` does not repeat that check for every cached
+    /// read, but it still honors the attribute timeout and may issue GETATTR.
+    pub(crate) fn update_cached_metadata_for_open_io(
+        &self,
+        cached: Metadata,
+        fh: u64,
+    ) -> Result<Metadata, SystemError> {
+        // `read_at()` already took the inode metadata snapshot needed for the
+        // cached EOF/type checks. Re-locking the sleeping metadata mutex here
+        // for every AUTO_INVAL_DATA read dominates 4 KiB cached I/O. The TTL is
+        // independently published, so reuse that snapshot while it remains
+        // valid and issue GETATTR_FH only after expiry.
+        let deadline = self.cached_metadata_deadline_ns.load(Ordering::Acquire);
+        if deadline == u64::MAX || (deadline != 0 && Self::now_ns() < deadline) {
+            return Ok(cached);
+        }
+        self.fetch_attr_with_file_handle(Some(fh))
     }
 }
 
@@ -1530,6 +1571,17 @@ impl Drop for FuseNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn getattr_request_uses_fh_only_for_open_file_queries() {
+        let path_query = getattr_request_input(None);
+        assert_eq!(path_query.getattr_flags, 0);
+        assert_eq!(path_query.fh, 0);
+
+        let open_file_query = getattr_request_input(Some(0x1234_5678));
+        assert_eq!(open_file_query.getattr_flags, FUSE_GETATTR_FH);
+        assert_eq!(open_file_query.fh, 0x1234_5678);
+    }
 
     #[test]
     fn dax_host_invalidation_gate_blocks_until_last_notification_finishes() {

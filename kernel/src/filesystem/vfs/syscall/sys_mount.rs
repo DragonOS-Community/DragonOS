@@ -846,14 +846,6 @@ fn do_recursive_bind_mount(
     let mut pending = vec![(source_mfs.clone(), target_mfs.clone())];
     while let Some((source_parent, target_parent)) = pending.pop() {
         for source_child in source_parent.mount_children() {
-            // copy_tree() omits nested unbindable subtrees. The root was
-            // rejected by do_bind_mount above.
-            if source_child.propagation().is_unbindable() {
-                if source_child.is_locked() {
-                    return Err(SystemError::EPERM);
-                }
-                continue;
-            }
             let source_mountpoint = source_child.self_mountpoint().ok_or(SystemError::EINVAL)?;
             let target_mountpoint =
                 match target_parent.wrapper_for_dentry(source_mountpoint.shared_dentry()) {
@@ -861,6 +853,16 @@ fn do_recursive_bind_mount(
                     Err(SystemError::EXDEV) => continue,
                     Err(error) => return Err(error),
                 };
+
+            // Match Linux copy_tree(): first discard mounts outside the
+            // selected source view, then apply unbindable/locked semantics.
+            // The recursive-bind root was rejected by do_bind_mount above.
+            if source_child.propagation().is_unbindable() {
+                if source_child.is_locked() {
+                    return Err(SystemError::EPERM);
+                }
+                continue;
+            }
 
             let target_child = source_child.deepcopy(Some(target_mountpoint.clone()))?;
             if let Err(error) = target_parent.attach_top(&target_mountpoint, target_child.clone()) {

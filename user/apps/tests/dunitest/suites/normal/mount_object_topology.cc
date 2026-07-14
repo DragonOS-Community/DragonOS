@@ -19,6 +19,10 @@
 #define CLONE_NEWNS 0x00020000
 #endif
 
+#ifndef CLONE_NEWUSER
+#define CLONE_NEWUSER 0x10000000
+#endif
+
 #ifndef MS_REC
 #define MS_REC 16384
 #endif
@@ -29,6 +33,10 @@
 
 #ifndef MS_PRIVATE
 #define MS_PRIVATE (1 << 18)
+#endif
+
+#ifndef MS_UNBINDABLE
+#define MS_UNBINDABLE (1 << 17)
 #endif
 
 namespace {
@@ -163,10 +171,11 @@ protected:
         // A detached namespace is discarded when the test process exits, but
         // clean all paths because later cases clone this process's namespace.
         const char* mount_suffixes[] = {
-            "/dest/b/c", "/dest/c", "/dest",       "/source/b/c",
-            "/source/a/c", "/source/ab/c", "/source", "/alias_a",
-            "/stack/proc", "/stack", "/ordinary/jail/proc", "/ordinary",
-            "/source/child",
+            "/dest/visible", "/dest/b/c", "/dest/c", "/dest",
+            "/source/selected/visible", "/source/selected/locked",
+            "/source/outside", "/source/b/c", "/source/a/c",
+            "/source/ab/c", "/source", "/alias_a", "/stack/proc",
+            "/stack", "/ordinary/jail/proc", "/ordinary", "/source/child",
         };
         for (const char* suffix : mount_suffixes) {
             best_effort_umount(base_ + suffix);
@@ -175,13 +184,16 @@ protected:
         const char* files[] = {
             "/source_file", "/alias_a", "/alias_b", "/source/b/c/marker",
             "/source/a/c/a_marker", "/source/ab/c/ab_marker",
+            "/source/selected/visible/marker",
         };
         for (const char* suffix : files) {
             unlink((base_ + suffix).c_str());
         }
 
         const char* dirs[] = {
-            "/dest/b/c", "/dest/b", "/dest/c", "/dest", "/source/a/b/c",
+            "/dest/visible", "/dest/b/c", "/dest/b", "/dest/c", "/dest",
+            "/source/selected/visible", "/source/selected/locked",
+            "/source/selected", "/source/outside", "/source/a/b/c",
             "/source/a/b", "/source/a/c", "/source/ab/c", "/source/b/c",
             "/source/a", "/source/ab", "/source/b", "/source",
             "/stack/proc", "/stack", "/ordinary/jail/proc", "/ordinary/jail",
@@ -260,6 +272,82 @@ TEST_F(MountObjectTopologyTest, RecursiveBindFiltersSimilarPrefixSibling) {
     EXPECT_EQ("a", read_file(dest + "/c/a_marker"));
     EXPECT_FALSE(path_exists(dest + "/b/c/ab_marker"));
     EXPECT_FALSE(has_mountpoint(read_mountinfo(), dest + "/b/c"));
+}
+
+TEST_F(MountObjectTopologyTest, RecursiveBindRejectsLockedUnbindableMountInView) {
+    const std::string source = base_ + "/source";
+    const std::string selected = source + "/selected";
+    const std::string locked = selected + "/locked";
+    const std::string dest = base_ + "/dest";
+
+    ASSERT_EQ(0, ensure_dir(source)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(dest)) << strerror(errno);
+    ASSERT_EQ(0, mount("none", source.c_str(), "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(selected)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(locked)) << strerror(errno);
+    ASSERT_EQ(0, mount("none", locked.c_str(), "ramfs", 0, nullptr)) << strerror(errno);
+
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) {
+            _exit(10);
+        }
+        if (mount(nullptr, locked.c_str(), nullptr, MS_UNBINDABLE, nullptr) != 0) {
+            _exit(11);
+        }
+        errno = 0;
+        const int result = mount(selected.c_str(), dest.c_str(), nullptr,
+                                 MS_BIND | MS_REC, nullptr);
+        _exit(result == -1 && errno == EPERM ? 0 : 12);
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+TEST_F(MountObjectTopologyTest, RecursiveBindIgnoresLockedUnbindableSiblingOutsideView) {
+    const std::string source = base_ + "/source";
+    const std::string selected = source + "/selected";
+    const std::string visible = selected + "/visible";
+    const std::string outside = source + "/outside";
+    const std::string dest = base_ + "/dest";
+    const std::string rebound_visible = dest + "/visible";
+
+    ASSERT_EQ(0, ensure_dir(source)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(dest)) << strerror(errno);
+    ASSERT_EQ(0, mount("none", source.c_str(), "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(selected)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(visible)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(outside)) << strerror(errno);
+    ASSERT_EQ(0, mount("none", visible.c_str(), "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, create_file(visible + "/marker", "visible")) << strerror(errno);
+    ASSERT_EQ(0, mount("none", outside.c_str(), "ramfs", 0, nullptr)) << strerror(errno);
+
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) {
+            _exit(20);
+        }
+        if (mount(nullptr, outside.c_str(), nullptr, MS_UNBINDABLE, nullptr) != 0) {
+            _exit(21);
+        }
+        if (mount(selected.c_str(), dest.c_str(), nullptr, MS_BIND | MS_REC, nullptr) != 0) {
+            _exit(22);
+        }
+        if (read_file(rebound_visible + "/marker") != "visible") {
+            _exit(23);
+        }
+        _exit(0);
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
 }
 
 TEST_F(MountObjectTopologyTest, HardlinkAliasesDoNotShareMountpointIdentity) {

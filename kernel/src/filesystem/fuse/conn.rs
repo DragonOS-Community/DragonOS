@@ -732,6 +732,7 @@ struct FuseConnInner {
     init: FuseInitNegotiated,
     no_open: bool,
     no_opendir: bool,
+    no_create: bool,
     no_readdirplus: bool,
     no_fallocate: bool,
     no_flush: bool,
@@ -892,6 +893,7 @@ impl FuseConn {
                 init: FuseInitNegotiated::default(),
                 no_open: false,
                 no_opendir: false,
+                no_create: false,
                 no_readdirplus: false,
                 no_fallocate: false,
                 no_flush: false,
@@ -1345,6 +1347,14 @@ impl FuseConn {
             super::protocol::FUSE_OPENDIR => g.no_opendir = true,
             _ => {}
         }
+    }
+
+    pub fn no_create(&self) -> bool {
+        self.inner.lock().no_create
+    }
+
+    pub fn mark_no_create(&self) {
+        self.inner.lock().no_create = true;
     }
 
     pub fn use_readdirplus(&self) -> bool {

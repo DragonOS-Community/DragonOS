@@ -49,7 +49,7 @@ use crate::{
 pub use self::inode_lifecycle::{EvictionEpoch, InodeRetentionKind, InodeRetentionState};
 pub use self::{file::FilePrivateData, mount::MountFS};
 use self::{
-    file::{FileFlags, FileMode},
+    file::{FileFlags, FileMode, PreopenedFile},
     utils::DName,
     vcore::generate_inode_id,
 };
@@ -792,6 +792,18 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 若文件系统没有实现此方法，则默认调用其create_with_data方法。如果仍未实现，则会得到一个Err(-ENOSYS)的返回值
         return self.create_with_data(name, file_type, mode, 0);
+    }
+
+    /// Atomically create and open a regular file when supported by the
+    /// filesystem.  The returned guard owns the open handle until VFS builds
+    /// the corresponding open file description.
+    fn create_and_open(
+        &self,
+        _name: &str,
+        _mode: InodeMode,
+        _flags: &FileFlags,
+    ) -> Result<PreopenedFile, SystemError> {
+        Err(SystemError::ENOSYS)
     }
 
     /// @brief 在当前目录下创建一个新的inode，并传入一个简单的data字段，方便进行初始化。

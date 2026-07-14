@@ -284,6 +284,47 @@ impl Default for FilePrivateData {
     }
 }
 
+/// Owns filesystem private data for an inode that has already been opened.
+///
+/// The guard stays armed until a [`File`] takes ownership.  This closes the
+/// filesystem handle on every error path between an atomic create/open and
+/// construction of the open file description.
+pub struct PreopenedFile {
+    inode: Arc<dyn IndexNode>,
+    private_data: Option<FilePrivateData>,
+}
+
+impl PreopenedFile {
+    pub fn new(inode: Arc<dyn IndexNode>, private_data: FilePrivateData) -> Self {
+        Self {
+            inode,
+            private_data: Some(private_data),
+        }
+    }
+
+    pub fn inode(&self) -> Arc<dyn IndexNode> {
+        self.inode.clone()
+    }
+
+    pub fn replace_inode(&mut self, inode: Arc<dyn IndexNode>) {
+        self.inode = inode;
+    }
+
+    fn take_private_data(&mut self) -> FilePrivateData {
+        self.private_data
+            .take()
+            .expect("preopened file private data already consumed")
+    }
+}
+
+impl Drop for PreopenedFile {
+    fn drop(&mut self) {
+        if let Some(data) = self.private_data.take() {
+            let _ = self.inode.close(Mutex::new(data).lock());
+        }
+    }
+}
+
 impl FilePrivateData {
     pub fn update_flags(&mut self, flags: FileFlags) -> Result<(), SystemError> {
         match self {
@@ -831,7 +872,13 @@ impl File {
             .downcast_arc::<MountFSInode>()
             .map(|inode| inode.mount_fs().try_pin_external())
             .transpose()?;
-        Self::new_with_private_data_and_mount_guard(inode, flags, private_data_init, mount_guard)
+        Self::new_with_private_data_and_mount_guard(
+            inode,
+            flags,
+            private_data_init,
+            mount_guard,
+            None,
+        )
     }
 
     /// Construct a pathname-backed file by consuming the mount pin acquired
@@ -847,6 +894,26 @@ impl File {
             flags,
             FilePrivateData::default(),
             mount_guard,
+            None,
+        );
+        drop(operation_guard);
+        file
+    }
+
+    /// Construct a pathname-backed file from an already-opened inode.
+    pub fn new_preopened_with_mount_guard(
+        preopened: PreopenedFile,
+        flags: FileFlags,
+        mount_guard: Option<MountExternalGuard>,
+        operation_guard: InodeRetentionGuard,
+    ) -> Result<Self, SystemError> {
+        let inode = preopened.inode();
+        let file = Self::new_with_private_data_and_mount_guard(
+            inode,
+            flags,
+            FilePrivateData::default(),
+            mount_guard,
+            Some(preopened),
         );
         drop(operation_guard);
         file
@@ -857,6 +924,7 @@ impl File {
         mut flags: FileFlags,
         private_data_init: FilePrivateData,
         mount_guard: Option<MountExternalGuard>,
+        mut preopened: Option<PreopenedFile>,
     ) -> Result<Self, SystemError> {
         let mut inode = inode;
         let mut file_type = inode.metadata()?.file_type;
@@ -912,11 +980,20 @@ impl File {
         let inode_retention =
             InodeRetentionGuard::new(inode.clone(), InodeRetentionKind::OpenFileDescription)?;
 
-        let private_data = Mutex::new(private_data_init);
+        if is_path && preopened.is_some() {
+            return Err(SystemError::EINVAL);
+        }
+        let already_open = preopened.is_some();
+        let private_data = Mutex::new(match preopened.as_mut() {
+            Some(preopened) => preopened.take_private_data(),
+            None => private_data_init,
+        });
         if is_path {
             mode = FileMode::FMODE_PATH | FileMode::FMODE_OPENED;
         } else {
-            inode.open(private_data.lock(), &flags)?;
+            if !already_open {
+                inode.open(private_data.lock(), &flags)?;
+            }
 
             // 设置默认能力（由 inode 能力接口统一决定；避免 syscall 层/字符串特判）
             if inode.is_stream() {

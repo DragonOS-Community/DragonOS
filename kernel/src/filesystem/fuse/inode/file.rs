@@ -931,7 +931,7 @@ impl FuseNode {
         Ok(total)
     }
 
-    fn set_open_private_data(
+    pub(super) fn set_open_private_data(
         &self,
         data: &mut FilePrivateData,
         opcode: u32,
@@ -1000,7 +1000,7 @@ impl FuseNode {
         Ok(())
     }
 
-    fn finish_open_cache_state(
+    pub(super) fn finish_open_cache_state(
         &self,
         opcode: u32,
         flags: &FileFlags,

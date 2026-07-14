@@ -1316,7 +1316,7 @@ impl MountFS {
         // Linux mnt_set_mountpoint_beneath(): the propagated mount takes the
         // original edge and the previous topper is reparented onto its root.
         covered.relocate_mountpoint(Some(cover_mountpoint.clone()));
-        if let Err(error) = mount_fs.attach_top(&cover_mountpoint, covered.clone()) {
+        if let Err(error) = mount_fs.attach_top(cover_mountpoint, covered.clone()) {
             covered.relocate_mountpoint(Some(mountpoint.clone()));
             let mut mountpoints = self.mountpoints.lock();
             let stack = mountpoints
@@ -1389,7 +1389,7 @@ impl MountFS {
         let original_mountpoint = mount_fs.self_mountpoint().ok_or(SystemError::EINVAL)?;
         // Preserve the clone-root Vec until restoration completes. This is
         // the rollback counterpart of the prepare-time cover reservation.
-        let _cover_reservation = mount_fs.reserve_mount_edge(&cover_mountpoint, 0)?;
+        let _cover_reservation = mount_fs.reserve_mount_edge(cover_mountpoint, 0)?;
         mount_fs.detach_exact_keep_slot(covered)?;
         covered.relocate_mountpoint(Some(original_mountpoint.clone()));
         let removed = match self.replace_exact_edge(mount_fs, covered.clone()) {

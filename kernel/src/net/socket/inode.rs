@@ -357,10 +357,12 @@ impl<T: Socket + 'static> IndexNode for T {
         super::base::Socket::mmap_layout(self).map(|l| l.page_cache)
     }
 
-    /// Reject mmap when no ring buffer is set up, so the page-fault path never
-    /// reaches the `unreachable!()` in `fs()`.
-    fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
-        if super::base::Socket::mmap_layout(self).is_none() {
+    /// Reject mmap when no ring buffer is set up or when the requested
+    /// `[offset, offset+len)` range exceeds the ring buffer size, so the
+    /// page-fault path never reaches the `unreachable!()` in `fs()`.
+    fn mmap(&self, _start: usize, len: usize, offset: usize) -> Result<(), SystemError> {
+        let layout = super::base::Socket::mmap_layout(self).ok_or(SystemError::EINVAL)?;
+        if offset.checked_add(len).map_or(true, |end| end > layout.size) {
             return Err(SystemError::EINVAL);
         }
         Ok(())

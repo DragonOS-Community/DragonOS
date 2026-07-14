@@ -24,13 +24,11 @@ use crate::process::cred::CAPFlags;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
 
-#[allow(unused_imports)]
-pub use ring::{PacketFakeFs, PacketRing, RingWriteResult, TpacketVersion};
-#[allow(unused_imports)]
+
 pub use uapi::{
-    eth_protocol, packet_mreq_type, packet_option, PacketMreq, PacketType, SockAddrLl,
-    TpacketAuxdata,
+    eth_protocol, packet_option, PacketType, SockAddrLl, TpacketAuxdata,
 };
+pub use ring::{RingWriteResult, TpacketVersion};
 
 const DEFAULT_RX_BUFFER_SIZE: usize = 256 * 1024;
 const DEFAULT_TX_BUFFER_SIZE: usize = 256 * 1024;
@@ -45,14 +43,9 @@ pub enum PacketSocketType {
 #[derive(Debug, Clone, Default)]
 pub struct PacketMetadata {
     pub src_mac: [u8; 6],
-    #[allow(dead_code)]
-    pub dst_mac: [u8; 6],
     pub protocol: u16,
     pub ifindex: u32,
     pub pkt_type: PacketType,
-    pub wire_len: usize,
-    #[allow(dead_code)]
-    pub mac_offset: usize,
     pub net_offset: usize,
     pub vlan_tci: u16,
     pub vlan_tpid: u16,

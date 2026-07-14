@@ -26,7 +26,7 @@ use crate::mm::VmFaultReason;
 
 use super::uapi::{
     tpacket_align, TPACKET2_HDRLEN, TPACKET_HDRLEN, TP_STATUS_KERNEL, TP_STATUS_USER,
-    TP_STATUS_VLAN_TPID_VALID, TP_STATUS_VLAN_VALID,
+    TP_STATUS_VLAN_TPID_VALID, TP_STATUS_VLAN_VALID, Tpacket2Hdr, TpacketHdr,
 };
 use super::{PacketMetadata, PacketSocketType};
 
@@ -345,11 +345,7 @@ impl PacketRing {
         } else {
             frame.len()
         };
-        let wire_len = if self.raw {
-            visible_len
-        } else {
-            visible_len.saturating_sub(14)
-        };
+        let wire_len = visible_len;
         let snaplen = wire_len.min(data_cap);
 
         // Timestamps are taken from per-version sources to match Linux
@@ -366,29 +362,35 @@ impl PacketRing {
                     let now_micros = crate::time::Instant::now().total_micros();
                     let tp_sec = (now_micros / 1_000_000) as u32;
                     let tp_usec = (now_micros % 1_000_000) as u32;
-                    // tp_status written last via publish(); zero for now.
-                    *(dst.add(0) as *mut u64) = 0; // tp_status (placeholder)
-                    *(dst.add(8) as *mut u32) = wire_len as u32; // tp_len
-                    *(dst.add(12) as *mut u32) = snaplen as u32; // tp_snaplen
-                    *(dst.add(16) as *mut u16) = tp_mac;
-                    *(dst.add(18) as *mut u16) = tp_net;
-                    *(dst.add(20) as *mut u32) = tp_sec;
-                    *(dst.add(24) as *mut u32) = tp_usec;
+                    // tp_status is published atomically by the caller; zero here.
+                    let hdr = TpacketHdr {
+                        tp_status: 0,
+                        tp_len: wire_len as u32,
+                        tp_snaplen: snaplen as u32,
+                        tp_mac,
+                        tp_net,
+                        tp_sec,
+                        tp_usec,
+                    };
+                    core::ptr::write(dst as *mut TpacketHdr, hdr);
                 }
                 TpacketVersion::V2 => {
                     let ts = crate::time::PosixTimeSpec::now();
                     let tp_sec = ts.tv_sec as u32;
                     let tp_nsec = ts.tv_nsec as u32;
-                    *(dst.add(0) as *mut u32) = 0; // tp_status (placeholder)
-                    *(dst.add(4) as *mut u32) = wire_len as u32; // tp_len
-                    *(dst.add(8) as *mut u32) = snaplen as u32; // tp_snaplen
-                    *(dst.add(12) as *mut u16) = tp_mac;
-                    *(dst.add(14) as *mut u16) = tp_net;
-                    *(dst.add(16) as *mut u32) = tp_sec;
-                    *(dst.add(20) as *mut u32) = tp_nsec; // tp_nsec
-                    *(dst.add(24) as *mut u16) = meta.vlan_tci; // tp_vlan_tci
-                    *(dst.add(26) as *mut u16) = meta.vlan_tpid; // tp_vlan_tpid
-                                                                 // tp_padding stays zero
+                    let hdr = Tpacket2Hdr {
+                        tp_status: 0,
+                        tp_len: wire_len as u32,
+                        tp_snaplen: snaplen as u32,
+                        tp_mac,
+                        tp_net,
+                        tp_sec,
+                        tp_nsec,
+                        tp_vlan_tci: meta.vlan_tci,
+                        tp_vlan_tpid: meta.vlan_tpid,
+                        tp_padding: [0; 4],
+                    };
+                    core::ptr::write(dst as *mut Tpacket2Hdr, hdr);
                 }
             }
 
@@ -484,9 +486,6 @@ pub fn validate_ring_config(
         return Err(SystemError::EINVAL);
     }
     let frames_per_block = block_size / frame_size;
-    if frames_per_block == 0 {
-        return Err(SystemError::EINVAL);
-    }
     // frame_nr consistency: frames_per_block * block_nr == frame_nr.
     if frames_per_block.checked_mul(block_nr) != Some(frame_nr) {
         return Err(SystemError::EINVAL);

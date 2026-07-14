@@ -17,7 +17,6 @@ use crate::filesystem::epoll::EPollEventType;
 use crate::filesystem::vfs::fasync::FASYNC_POLL_IN;
 
 struct ParsedFrame {
-    dst: [u8; 6],
     src: [u8; 6],
     protocol: u16,
     vlan: Option<(u16, u16)>,
@@ -27,7 +26,6 @@ fn parse_frame(frame: &[u8]) -> Option<ParsedFrame> {
     if frame.len() < 14 {
         return None;
     }
-    let dst = frame[0..6].try_into().ok()?;
     let src = frame[6..12].try_into().ok()?;
     let outer = u16::from_be_bytes([frame[12], frame[13]]);
     if outer == 0x8100 || outer == 0x88a8 {
@@ -37,14 +35,12 @@ fn parse_frame(frame: &[u8]) -> Option<ParsedFrame> {
         let tci = u16::from_be_bytes([frame[14], frame[15]]);
         let protocol = u16::from_be_bytes([frame[16], frame[17]]);
         Some(ParsedFrame {
-            dst,
             src,
             protocol,
             vlan: Some((tci, outer)),
         })
     } else {
         Some(ParsedFrame {
-            dst,
             src,
             protocol: outer,
             vlan: None,
@@ -59,7 +55,6 @@ impl PacketSocket {
             return;
         }
         let Some(ParsedFrame {
-            dst,
             src,
             protocol,
             vlan,
@@ -77,22 +72,12 @@ impl PacketSocket {
         // concurrent delivers from other NICs are not blocked by setup/teardown.
         let ring_arc = self.rx_ring.lock().as_ref().cloned();
         if let Some(ring_arc) = ring_arc {
-            let visible_len = frame
-                .len()
-                .saturating_sub(if vlan.is_some() { 4 } else { 0 });
-            let start = if self.sock_type == PacketSocketType::Raw {
-                0
-            } else {
-                14
-            };
+
             let metadata = PacketMetadata {
                 src_mac: src,
-                dst_mac: dst,
                 protocol,
                 ifindex,
                 pkt_type,
-                wire_len: visible_len - start,
-                mac_offset: 0,
                 net_offset: 14,
                 vlan_tci: vlan.map_or(0, |v| v.0),
                 vlan_tpid: vlan.map_or(0, |v| v.1),
@@ -136,15 +121,9 @@ impl PacketSocket {
         let data_len = visible_len - start;
         let metadata = PacketMetadata {
             src_mac: src,
-            dst_mac: dst,
             protocol,
             ifindex,
             pkt_type,
-            // Linux stores origlen after SOCK_DGRAM has advanced data to the
-            // network header; without a packet filter, origlen equals the
-            // queued visible length for both RAW and DGRAM sockets.
-            wire_len: visible_len - start,
-            mac_offset: 0,
             net_offset: 14,
             vlan_tci: vlan.map_or(0, |v| v.0),
             vlan_tpid: vlan.map_or(0, |v| v.1),
@@ -325,7 +304,7 @@ impl PacketSocket {
             };
             let aux = TpacketAuxdata {
                 tp_status: TP_STATUS_USER | vlan_status,
-                tp_len: packet.metadata.wire_len.min(u32::MAX as usize) as u32,
+                tp_len: packet.data.len().min(u32::MAX as usize) as u32,
                 tp_snaplen: packet.data.len().min(u32::MAX as usize) as u32,
                 tp_mac: 0,
                 tp_net: if self.sock_type == PacketSocketType::Raw {

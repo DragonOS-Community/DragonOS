@@ -106,7 +106,6 @@ pub const TP_STATUS_KERNEL: u32 = 0;
 /// V1 frame header (`struct tpacket_hdr`). 28 bytes on x86_64.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
-#[allow(dead_code)]
 pub struct TpacketHdr {
     pub tp_status: u64,
     pub tp_len: u32,
@@ -120,7 +119,6 @@ pub struct TpacketHdr {
 /// V2 frame header (`struct tpacket2_hdr`). 32 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
-#[allow(dead_code)]
 pub struct Tpacket2Hdr {
     pub tp_status: u32,
     pub tp_len: u32,

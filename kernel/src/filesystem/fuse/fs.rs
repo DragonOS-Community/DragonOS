@@ -8,12 +8,12 @@ use system_error::SystemError;
 
 use crate::{
     filesystem::vfs::{
-        FilePrivateData, FileSystem, FileSystemMakerData, FileType, FsInfo, IndexNode, InodeFlags,
-        InodeId, InodeMode, Magic, Metadata, MountableFileSystem, SuperBlock, FSMAKER,
+        file::File, FilePrivateData, FileSystem, FileSystemMakerData, FileType, FsInfo, IndexNode,
+        InodeFlags, InodeId, InodeMode, Magic, Metadata, MountableFileSystem, SuperBlock, FSMAKER,
     },
     libs::{mutex::Mutex, rwsem::RwSem},
     mm::{
-        fault::{PageFaultHandler, PageFaultMessage},
+        fault::{FaultFlags, FaultRetryWait, PageFaultHandler, PageFaultMessage},
         VirtRegion, VmFaultReason, VmFlags,
     },
     process::ProcessManager,
@@ -26,12 +26,44 @@ use linkme::distributed_slice;
 use super::{
     conn::FuseConn,
     inode::FuseNode,
-    private_data::FuseFilePrivateData,
+    private_data::{FuseFilePrivateData, FuseOpenLifetime},
     protocol::{
         fuse_read_struct, FuseStatfsOut, FOPEN_DIRECT_IO, FUSE_ATTR_SUBMOUNT, FUSE_ROOT_ID,
         FUSE_STATFS,
     },
 };
+
+#[derive(Debug)]
+struct FuseMmapRetryWait {
+    file: Arc<File>,
+    node: Arc<FuseNode>,
+    page_index: usize,
+    fh: u64,
+    file_flags: u32,
+    lifetime: Arc<FuseOpenLifetime>,
+    readahead: bool,
+}
+
+impl FaultRetryWait for FuseMmapRetryWait {
+    fn wait(&self) -> Result<(), SystemError> {
+        if self.readahead {
+            let mut ra_state = self.file.get_ra_state();
+            self.node.mmap_readahead_with_open(
+                self.page_index,
+                1,
+                &mut ra_state,
+                self.fh,
+                self.file_flags,
+                self.lifetime.clone(),
+            )?;
+            self.file.set_ra_state(ra_state)
+        } else {
+            self.node
+                .fault_page_with_open(self.page_index, self.fh, self.file_flags)
+                .map(|_| ())
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct FuseMountData {
@@ -716,14 +748,15 @@ impl FileSystem for FuseFS {
         false
     }
 
+    fn fault_before_map_pages(&self) -> bool {
+        true
+    }
+
     unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
-        let vma = pfm.vma();
-        let vma_guard = vma.lock();
-        let vm_flags = *vma_guard.vm_flags();
-        let Some(file) = vma_guard.vm_file() else {
+        let vm_flags = pfm.vm_flags();
+        let Some(file) = pfm.vm_file() else {
             return VmFaultReason::VM_FAULT_SIGBUS;
         };
-        drop(vma_guard);
 
         let (node, fh, file_flags, fopen_flags, lifetime) = {
             let data = file.private_data.lock();
@@ -751,6 +784,20 @@ impl FileSystem for FuseFS {
             .unwrap_or(true);
 
         if major {
+            let can_retry = pfm.flags().contains(FaultFlags::FAULT_FLAG_ALLOW_RETRY)
+                && !pfm.flags().contains(FaultFlags::FAULT_FLAG_RETRY_NOWAIT);
+            if can_retry {
+                pfm.set_retry_wait(Arc::new(FuseMmapRetryWait {
+                    file: file.clone(),
+                    node,
+                    page_index,
+                    fh,
+                    file_flags,
+                    lifetime,
+                    readahead: !pfm.flags().contains(FaultFlags::FAULT_FLAG_TRIED),
+                }));
+                return VmFaultReason::VM_FAULT_MAJOR | VmFaultReason::VM_FAULT_RETRY;
+            }
             let mut ra_state = file.get_ra_state();
             let _ = node.mmap_readahead_with_open(
                 page_index,

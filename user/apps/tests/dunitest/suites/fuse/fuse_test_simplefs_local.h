@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/xattr.h>
+#include <time.h>
 #include <unistd.h>
 
 #define FUSE_TEST_LOG_PREFIX "[fuse-test] "
@@ -172,6 +173,9 @@ static inline int fuse_test_log_enabled(void) {
 #endif
 
 /* INIT flags (subset) */
+#ifndef FUSE_ASYNC_READ
+#define FUSE_ASYNC_READ (1u << 0)
+#endif
 #ifndef FUSE_INIT_EXT
 #define FUSE_INIT_EXT (1u << 30)
 #endif
@@ -831,6 +835,17 @@ struct fuse_daemon_args {
     int block_read_until_interrupt;
     int defer_first_read_reply;
     volatile int *saw_pipelined_read;
+    pthread_mutex_t *first_read_gate_mutex;
+    pthread_cond_t *first_read_gate_cond;
+    int *first_read_captured;
+    int *first_read_gate_state;
+    int *daemon_waiting_after_first_read;
+    int *saw_read_before_first_reply;
+    int *first_read_reply_result;
+    int has_forced_read_error;
+    int forced_read_errno;
+    int forced_read_error_once;
+    uint64_t forced_read_error_offset;
     uint64_t deferred_read_unique;
     uint64_t deferred_read_offset;
     uint32_t deferred_read_size;
@@ -1138,6 +1153,13 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
                 a->read_sizes[read_index] = in->size;
             }
         }
+        if (a->has_forced_read_error && in->offset == a->forced_read_error_offset) {
+            int forced_errno = a->forced_read_errno ? a->forced_read_errno : EIO;
+            if (a->forced_read_error_once) {
+                a->has_forced_read_error = 0;
+            }
+            return fuse_write_reply(a->fd, h->unique, -forced_errno, NULL, 0);
+        }
         size_t effective_size = node->size;
         int generated_hello = h->nodeid == 2 && a->hello_generated_size_override > 0;
         if (generated_hello) {
@@ -1165,6 +1187,17 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         size_t to_copy = in->size;
         if (to_copy > remain) {
             to_copy = remain;
+        }
+        if (generated_hello && a->first_read_gate_mutex && read_index == 0) {
+            pthread_mutex_lock(a->first_read_gate_mutex);
+            a->deferred_read_unique = h->unique;
+            a->deferred_read_offset = in->offset;
+            a->deferred_read_size = (uint32_t)to_copy;
+            __atomic_store_n(a->first_read_gate_state, 0, __ATOMIC_RELEASE);
+            *a->first_read_captured = 1;
+            pthread_cond_broadcast(a->first_read_gate_cond);
+            pthread_mutex_unlock(a->first_read_gate_mutex);
+            return 0;
         }
         if (generated_hello && a->defer_first_read_reply) {
             if (a->deferred_read_unique == 0) {
@@ -2098,6 +2131,101 @@ static inline void *fuse_daemon_thread(void *arg) {
             continue;
         }
         (void)fuse_handle_one(a, buf, (size_t)n);
+        if (a->first_read_gate_mutex
+            && __atomic_load_n(a->first_read_gate_state, __ATOMIC_ACQUIRE) == 0) {
+            pthread_mutex_lock(a->first_read_gate_mutex);
+            *a->daemon_waiting_after_first_read = 1;
+            pthread_cond_broadcast(a->first_read_gate_cond);
+            pthread_mutex_unlock(a->first_read_gate_mutex);
+
+            struct pollfd pfd;
+            memset(&pfd, 0, sizeof(pfd));
+            pfd.fd = a->fd;
+            pfd.events = POLLIN;
+            ssize_t early_n = 0;
+            struct timespec deadline;
+            clock_gettime(CLOCK_MONOTONIC, &deadline);
+            deadline.tv_nsec += 100 * 1000 * 1000;
+            if (deadline.tv_nsec >= 1000 * 1000 * 1000) {
+                deadline.tv_sec++;
+                deadline.tv_nsec -= 1000 * 1000 * 1000;
+            }
+            while (__atomic_load_n(a->first_read_gate_state, __ATOMIC_ACQUIRE) == 0) {
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                long long remaining_ns = (deadline.tv_sec - now.tv_sec) * 1000000000LL
+                                       + deadline.tv_nsec - now.tv_nsec;
+                if (remaining_ns <= 0)
+                    break;
+                pfd.revents = 0;
+                int poll_rc = poll(&pfd, 1, (int)((remaining_ns + 999999) / 1000000));
+                if (poll_rc == 0)
+                    break;
+                if (poll_rc < 0) {
+                    if (errno == EINTR)
+                        continue;
+                    __atomic_store_n(a->first_read_gate_state, 4, __ATOMIC_RELEASE);
+                    *a->first_read_reply_result = -errno;
+                    break;
+                }
+                if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0
+                    || (pfd.revents & POLLIN) == 0) {
+                    __atomic_store_n(a->first_read_gate_state, 4, __ATOMIC_RELEASE);
+                    *a->first_read_reply_result = -EIO;
+                    break;
+                }
+                ssize_t observed_n = read(a->fd, buf, FUSE_TEST_BUF_SIZE);
+                if (observed_n < 0 && (errno == EINTR || errno == EAGAIN))
+                    continue;
+                if (observed_n <= 0
+                    || (size_t)observed_n < sizeof(struct fuse_in_header)) {
+                    __atomic_store_n(a->first_read_gate_state, 4, __ATOMIC_RELEASE);
+                    *a->first_read_reply_result = observed_n < 0 ? -errno : -EIO;
+                    break;
+                }
+                struct fuse_in_header *observed_h = (struct fuse_in_header *)buf;
+                if ((size_t)observed_n != observed_h->len) {
+                    __atomic_store_n(a->first_read_gate_state, 4, __ATOMIC_RELEASE);
+                    *a->first_read_reply_result = -EIO;
+                    break;
+                }
+                if (observed_h->opcode == FUSE_READ) {
+                    early_n = observed_n;
+                    __atomic_store_n(a->first_read_gate_state, 1, __ATOMIC_RELEASE);
+                    *a->saw_read_before_first_reply = 1;
+                    break;
+                }
+                (void)fuse_handle_one(a, buf, (size_t)observed_n);
+            }
+
+            if (__atomic_load_n(a->first_read_gate_state, __ATOMIC_ACQUIRE) != 4) {
+                int expected = 0;
+                (void)__atomic_compare_exchange_n(a->first_read_gate_state, &expected, 2, false,
+                                                  __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+                unsigned char *data = (unsigned char *)malloc(a->deferred_read_size);
+                int reply_ret;
+                if (data) {
+                    for (size_t i = 0; i < a->deferred_read_size; ++i)
+                        data[i] = (unsigned char)(
+                            'A' + ((a->deferred_read_offset + i) % 26));
+                    reply_ret = fuse_write_reply(a->fd, a->deferred_read_unique, 0, data,
+                                                 a->deferred_read_size);
+                    free(data);
+                } else {
+                    reply_ret = fuse_write_reply(a->fd, a->deferred_read_unique, -ENOMEM, NULL, 0);
+                }
+                expected = 2;
+                (void)__atomic_compare_exchange_n(a->first_read_gate_state, &expected,
+                                                  reply_ret == 0 ? 3 : 4, false,
+                                                  __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+                *a->first_read_reply_result = reply_ret;
+            }
+            pthread_mutex_lock(a->first_read_gate_mutex);
+            pthread_cond_broadcast(a->first_read_gate_cond);
+            pthread_mutex_unlock(a->first_read_gate_mutex);
+            if (early_n > 0)
+                (void)fuse_handle_one(a, buf, (size_t)early_n);
+        }
         if (a->exit_after_init && a->init_done && *a->init_done) {
             break;
         }

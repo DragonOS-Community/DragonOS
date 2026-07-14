@@ -1819,6 +1819,16 @@ pub trait FileSystem: Any + Sync + Send + Debug {
         true // 默认支持 readahead
     }
 
+    /// Whether a filesystem fault must run before generic fault-around.
+    ///
+    /// Most filesystems keep the Linux-style fast path where `map_pages()`
+    /// gets the first chance to install an already cached page. Remote
+    /// filesystems that must drop MM locks and retry before doing I/O can opt
+    /// in to the opposite ordering.
+    fn fault_before_map_pages(&self) -> bool {
+        false
+    }
+
     /// @brief 本函数用于实现动态转换。
     /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
     fn as_any_ref(&self) -> &dyn Any;

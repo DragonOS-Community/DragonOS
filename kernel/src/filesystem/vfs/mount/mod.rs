@@ -3000,7 +3000,11 @@ impl IndexNode for MountFSInode {
 
     #[inline]
     fn fs(&self) -> Arc<dyn FileSystem> {
-        return self.overlaid_inode().mount_fs.clone();
+        // This inode already records the mount selected during path lookup.
+        // An overmount installed later must not redirect an open file
+        // description, and resolving it here may issue filesystem I/O while
+        // callers hold mmap/address-space locks.
+        self.mount_fs.clone()
     }
 
     #[inline]
@@ -3581,6 +3585,10 @@ impl FileSystem for MountFS {
 
     fn support_readahead(&self) -> bool {
         self.inner_filesystem.support_readahead()
+    }
+
+    fn fault_before_map_pages(&self) -> bool {
+        self.inner_filesystem.fault_before_map_pages()
     }
     fn root_inode(&self) -> Arc<dyn IndexNode> {
         // A mounted filesystem's root inode is always its own mount root wrapper.

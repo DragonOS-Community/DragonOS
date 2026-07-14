@@ -3513,12 +3513,15 @@ static int ext_test_cached_read_pipelines_requests() {
     }
     volatile int stop = 0, init_done = 0, saw_pipeline = 0;
     volatile uint32_t read_count = 0;
+    volatile uint32_t init_in_flags = 0;
     struct fuse_daemon_args args;
     memset(&args, 0, sizeof(args));
     args.fd = fd;
     args.stop = &stop;
     args.init_done = &init_done;
     args.stop_on_destroy = 1;
+    args.init_in_flags = &init_in_flags;
+    args.init_out_flags_override = FUSE_INIT_EXT | FUSE_MAX_PAGES | FUSE_ASYNC_READ;
     args.hello_generated_size_override = data_size;
     args.read_count = &read_count;
     args.defer_first_read_reply = 2;
@@ -3536,7 +3539,7 @@ static int ext_test_cached_read_pipelines_requests() {
     if (!buf)
         goto fail;
     n = fuseg_read_file(path, buf, 4096);
-    ok = n == 4096 && saw_pipeline && read_count >= 2;
+    ok = n == 4096 && (init_in_flags & FUSE_ASYNC_READ) != 0 && saw_pipeline && read_count >= 2;
     for (size_t i = 0; ok && i < 4096; ++i)
         ok = buf[i] == (char)('A' + (i % 26));
     free(buf);
@@ -3558,6 +3561,256 @@ fail_no_thread:
     close(fd);
     rmdir(mp);
     return -1;
+}
+
+struct fuseg_async_read_args {
+    const char *path;
+    char *buf;
+    size_t size;
+    int result;
+};
+
+static void *fuseg_async_read_thread(void *opaque) {
+    struct fuseg_async_read_args *args = (struct fuseg_async_read_args *)opaque;
+    args->result = fuseg_read_file(args->path, args->buf, args->size);
+    return NULL;
+}
+
+static int ext_test_cached_read_without_async_is_serial() {
+    const char *mp = "/tmp/test_fuse_read_serial";
+    const size_t data_size = 64 * 1024;
+    char *buf = NULL;
+    int n = -1;
+    int ok = 0;
+    int wait_rc = 0;
+    int mounted = 0, client_started = 0;
+    char opts[256], path[256];
+    struct fuseg_async_read_args read_args;
+    pthread_t th, client_th;
+    struct timespec gate_deadline;
+    if (ensure_dir(mp) != 0)
+        return -1;
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        rmdir(mp);
+        return -1;
+    }
+    volatile int stop = 0, init_done = 0;
+    volatile uint32_t read_count = 0, init_in_flags = 0;
+    volatile uint64_t read_offsets[4] = {0};
+    pthread_mutex_t first_read_gate_mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t first_read_gate_cond = PTHREAD_COND_INITIALIZER;
+    int first_read_captured = 0;
+    int first_read_gate_state = -1;
+    int daemon_waiting_after_first_read = 0;
+    int saw_early_read = 0;
+    int first_read_reply_result = -9999;
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.stop_on_destroy = 1;
+    args.init_in_flags = &init_in_flags;
+    args.init_out_flags_override = FUSE_INIT_EXT | FUSE_MAX_PAGES;
+    args.hello_generated_size_override = data_size;
+    args.read_count = &read_count;
+    args.read_offsets = read_offsets;
+    args.read_trace_capacity = 4;
+    args.first_read_gate_mutex = &first_read_gate_mutex;
+    args.first_read_gate_cond = &first_read_gate_cond;
+    args.first_read_captured = &first_read_captured;
+    args.first_read_gate_state = &first_read_gate_state;
+    args.daemon_waiting_after_first_read = &daemon_waiting_after_first_read;
+    args.saw_read_before_first_reply = &saw_early_read;
+    args.first_read_reply_result = &first_read_reply_result;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0)
+        goto fail_no_thread;
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0,max_read=4096", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0)
+        goto fail;
+    mounted = 1;
+    if (fuseg_wait_init(&init_done) != 0)
+        goto fail;
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    buf = (char *)malloc(data_size);
+    if (!buf)
+        goto fail;
+    memset(&read_args, 0, sizeof(read_args));
+    read_args.path = path;
+    read_args.buf = buf;
+    read_args.size = 8192;
+    if (pthread_create(&client_th, NULL, fuseg_async_read_thread, &read_args) != 0)
+        goto fail;
+    client_started = 1;
+    clock_gettime(CLOCK_REALTIME, &gate_deadline);
+    gate_deadline.tv_sec += 5;
+    pthread_mutex_lock(&first_read_gate_mutex);
+    wait_rc = 0;
+    while (!first_read_captured && wait_rc == 0)
+        wait_rc = pthread_cond_timedwait(&first_read_gate_cond, &first_read_gate_mutex,
+                                         &gate_deadline);
+    if (!first_read_captured) {
+        pthread_mutex_unlock(&first_read_gate_mutex);
+        goto fail;
+    }
+    wait_rc = 0;
+    while (!daemon_waiting_after_first_read && wait_rc == 0)
+        wait_rc = pthread_cond_timedwait(&first_read_gate_cond, &first_read_gate_mutex,
+                                         &gate_deadline);
+    if (!daemon_waiting_after_first_read) {
+        pthread_mutex_unlock(&first_read_gate_mutex);
+        goto fail;
+    }
+    wait_rc = 0;
+    while (__atomic_load_n(&first_read_gate_state, __ATOMIC_ACQUIRE) == 0 && wait_rc == 0)
+        wait_rc = pthread_cond_timedwait(&first_read_gate_cond, &first_read_gate_mutex,
+                                         &gate_deadline);
+    ok = __atomic_load_n(&first_read_gate_state, __ATOMIC_ACQUIRE) == 3
+         && first_read_reply_result == 0 && !saw_early_read;
+    pthread_mutex_unlock(&first_read_gate_mutex);
+    if (!ok)
+        goto fail;
+    pthread_join(client_th, NULL);
+    client_started = 0;
+    n = read_args.result;
+    ok = n == 8192 && (init_in_flags & FUSE_ASYNC_READ) != 0 && !saw_early_read
+         && read_count >= 2 && read_offsets[0] == 0 && read_offsets[1] == 4096
+         && first_read_reply_result == 0
+         && __atomic_load_n(&first_read_gate_state, __ATOMIC_ACQUIRE) == 3 && ok;
+    for (size_t i = 0; ok && i < 8192; ++i)
+        ok = buf[i] == (char)('A' + (i % 26));
+    free(buf);
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return ok ? 0 : -1;
+fail:
+    stop = 1;
+    close(fd);
+    if (client_started)
+        pthread_join(client_th, NULL);
+    free(buf);
+    if (mounted)
+        umount(mp);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+fail_no_thread:
+    close(fd);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_run_cached_read_sync_error_case(const char *mp, uint64_t error_offset,
+                                               int error_once, int case_kind) {
+    const size_t data_size = 64 * 1024;
+    int result = -1;
+    int file_fd = -1;
+    ssize_t first = -1, second = -1;
+    int first_errno = 0, second_errno = 0;
+    char buf[8192];
+    if (ensure_dir(mp) != 0)
+        return -1;
+    int fd = open("/dev/fuse", O_RDWR);
+    if (fd < 0) {
+        rmdir(mp);
+        return -1;
+    }
+    volatile int stop = 0, init_done = 0;
+    volatile uint32_t init_in_flags = 0, read_count = 0;
+    volatile uint64_t read_offsets[8] = {0};
+    struct fuse_daemon_args args;
+    memset(&args, 0, sizeof(args));
+    args.fd = fd;
+    args.stop = &stop;
+    args.init_done = &init_done;
+    args.stop_on_destroy = 1;
+    args.init_in_flags = &init_in_flags;
+    args.init_out_flags_override = FUSE_INIT_EXT | FUSE_MAX_PAGES;
+    args.hello_generated_size_override = data_size;
+    args.read_count = &read_count;
+    args.read_offsets = read_offsets;
+    args.read_trace_capacity = 8;
+    args.has_forced_read_error = 1;
+    args.forced_read_errno = EIO;
+    args.forced_read_error_once = error_once;
+    args.forced_read_error_offset = error_offset;
+    pthread_t th;
+    if (pthread_create(&th, NULL, fuse_daemon_thread, &args) != 0)
+        goto fail_no_thread;
+    char opts[256];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=040755,user_id=0,group_id=0,max_read=4096", fd);
+    if (mount("none", mp, "fuse", 0, opts) != 0 || fuseg_wait_init(&init_done) != 0)
+        goto fail;
+    char path[256];
+    snprintf(path, sizeof(path), "%s/hello.txt", mp);
+    file_fd = open(path, O_RDONLY);
+    if (file_fd < 0 || (init_in_flags & FUSE_ASYNC_READ) == 0)
+        goto fail;
+
+    errno = 0;
+    first = pread(file_fd, buf, case_kind == 2 ? 4096 : 8192, 0);
+    first_errno = errno;
+    if (case_kind == 2) {
+        result = first == -1 && first_errno == EIO && read_count == 1 && read_offsets[0] == 0 ? 0
+                                                                                           : -1;
+        goto out;
+    }
+    if (first != 4096 || read_count != 2 || read_offsets[0] != 0 || read_offsets[1] != 4096)
+        goto out;
+    for (size_t i = 0; i < 4096; ++i) {
+        if (buf[i] != (char)('A' + (i % 26)))
+            goto out;
+    }
+    errno = 0;
+    second = pread(file_fd, buf + 4096, 4096, 4096);
+    second_errno = errno;
+    if (!error_once) {
+        result = second == -1 && second_errno == EIO && read_count == 3
+                         && read_offsets[2] == 4096
+                     ? 0
+                     : -1;
+    } else {
+        result = second == 4096 && read_count == 3 && read_offsets[2] == 4096 ? 0 : -1;
+        for (size_t i = 0; result == 0 && i < 4096; ++i) {
+            if (buf[4096 + i] != (char)('A' + ((4096 + i) % 26)))
+                result = -1;
+        }
+    }
+out:
+    if (file_fd >= 0)
+        close(file_fd);
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return result;
+fail:
+    if (file_fd >= 0)
+        close(file_fd);
+    umount(mp);
+    stop = 1;
+    close(fd);
+    pthread_join(th, NULL);
+    rmdir(mp);
+    return -1;
+fail_no_thread:
+    close(fd);
+    rmdir(mp);
+    return -1;
+}
+
+static int ext_test_cached_read_sync_error_semantics() {
+    if (ext_run_cached_read_sync_error_case("/tmp/test_fuse_read_eio_persistent", 4096, 0, 0)
+        != 0)
+        return -1;
+    if (ext_run_cached_read_sync_error_case("/tmp/test_fuse_read_eio_once", 4096, 1, 1) != 0)
+        return -1;
+    return ext_run_cached_read_sync_error_case("/tmp/test_fuse_read_eio_first", 0, 0, 2);
 }
 
 static int ext_test_cached_read_uses_open_fh_without_extra_open() {
@@ -8010,7 +8263,7 @@ TEST(FuseExtended, MmapFaultUsesOpenFhWithoutExtraOpen) {
     ASSERT_EQ(0, ext_test_mmap_fault_uses_open_fh_without_extra_open());
 }
 
-TEST(FuseExtended, DISABLED_MmapFaultBatchesReadaroundPages) {
+TEST(FuseExtended, MmapFaultBatchesReadaroundPages) {
     ASSERT_EQ(0, ext_test_mmap_fault_batches_readaround_pages());
 }
 
@@ -8189,6 +8442,14 @@ TEST(FuseExtended, DevCloneAttachAndServe) {
 
 TEST(FuseExtended, CachedReadPipelinesRequests) {
     ASSERT_EQ(0, ext_test_cached_read_pipelines_requests());
+}
+
+TEST(FuseExtended, CachedReadWithoutAsyncIsSerial) {
+    ASSERT_EQ(0, ext_test_cached_read_without_async_is_serial());
+}
+
+TEST(FuseExtended, CachedReadSyncErrorSemantics) {
+    ASSERT_EQ(0, ext_test_cached_read_sync_error_semantics());
 }
 
 int main(int argc, char **argv) {

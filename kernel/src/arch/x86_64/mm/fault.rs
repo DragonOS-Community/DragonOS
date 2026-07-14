@@ -1,6 +1,7 @@
 use alloc::sync::Arc;
 use core::{intrinsics::unlikely, panic};
 use log::error;
+use system_error::SystemError;
 use x86::{bits64::rflags::RFlags, controlregs::Cr4};
 
 use crate::{
@@ -499,9 +500,26 @@ impl X86_64MMArch {
                     let wait = outcome.retry_wait;
                     drop(space_guard);
                     if let Some(wait) = wait {
-                        if wait.wait().is_err() {
-                            send_bus_adrerr();
-                            return;
+                        match wait.wait() {
+                            Ok(()) => {}
+                            Err(SystemError::EINTR | SystemError::ERESTARTSYS) => {
+                                if regs.is_from_user() {
+                                    <crate::arch::ipc::signal::X86_64SignalArch as SignalArch>::do_signal_or_restart(regs);
+                                } else {
+                                    handle_kernel_access_failed(regs);
+                                }
+                                return;
+                            }
+                            Err(SystemError::ENOMEM) => {
+                                fault = VmFaultReason::VM_FAULT_OOM;
+                                space_guard = current_address_space.write();
+                                break;
+                            }
+                            Err(_) => {
+                                fault = VmFaultReason::VM_FAULT_SIGBUS;
+                                space_guard = current_address_space.write();
+                                break;
+                            }
                         }
                     }
                     continue 'fault_retry;

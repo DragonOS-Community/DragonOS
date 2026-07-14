@@ -1776,8 +1776,12 @@ impl FuseNode {
             page_index.saturating_add(req_pages),
             &file_ctx,
         )?;
+        drop(_invalidate);
         if let Some(error) = delayed_error {
-            return Err(error);
+            let demand_end = page_index.saturating_add(req_pages);
+            if !page_cache.is_range_ready(page_index, demand_end) {
+                return Err(error);
+            }
         }
 
         if let Some(eof) = truncate_eof {

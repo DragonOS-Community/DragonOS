@@ -135,12 +135,10 @@ fn test_peer_ring_scan_starts_after_middle_target() {
     let ring = get_peers(group_id, &target_b);
     assert!(Arc::ptr_eq(&ring[0], &peer_c));
     change_mnt_propagation(&target_b, PropagationType::Slave).unwrap();
-    assert!(
-        target_b
-            .propagation()
-            .master()
-            .is_some_and(|master| Arc::ptr_eq(&master, &peer_c))
-    );
+    assert!(target_b
+        .propagation()
+        .master()
+        .is_some_and(|master| Arc::ptr_eq(&master, &peer_c)));
 }
 
 #[test]
@@ -171,12 +169,10 @@ fn test_recursive_prepare_group_failure_changes_nothing() {
     assert!(matches!(result, Err(SystemError::ENOSPC)));
     assert!(root.propagation().is_private());
     assert!(child.propagation().is_private());
-    assert!(
-        first_group
-            .borrow()
-            .as_ref()
-            .is_some_and(|group| group.upgrade().is_none())
-    );
+    assert!(first_group
+        .borrow()
+        .as_ref()
+        .is_some_and(|group| group.upgrade().is_none()));
 }
 
 #[test]
@@ -205,12 +201,10 @@ fn test_recursive_prepare_capacity_failure_changes_nothing() {
 
     assert!(matches!(result, Err(SystemError::ENOMEM)));
     assert!(root.propagation().is_private());
-    assert!(
-        group_weak
-            .borrow()
-            .as_ref()
-            .is_some_and(|group| group.upgrade().is_none())
-    );
+    assert!(group_weak
+        .borrow()
+        .as_ref()
+        .is_some_and(|group| group.upgrade().is_none()));
 }
 
 #[test]
@@ -251,12 +245,10 @@ fn test_recursive_slave_chain_materializes_each_final_edge_once() {
     assert_eq!(external_slaves.len(), 3);
     for mount in [&mount_a, &mount_b, &mount_c] {
         assert!(!mount.propagation().is_shared());
-        assert!(
-            mount
-                .propagation()
-                .master()
-                .is_some_and(|master| Arc::ptr_eq(&master, &external))
-        );
+        assert!(mount
+            .propagation()
+            .master()
+            .is_some_and(|master| Arc::ptr_eq(&master, &external)));
         assert_eq!(
             external_slaves
                 .iter()
@@ -283,12 +275,10 @@ fn test_make_slave_preserves_new_masters_unrelated_slave() {
     assert_eq!(slaves.len(), 2);
     assert!(Arc::ptr_eq(&slaves[0], &target));
     assert!(Arc::ptr_eq(&slaves[1], &unrelated));
-    assert!(
-        unrelated
-            .propagation()
-            .master()
-            .is_some_and(|master| Arc::ptr_eq(&master, &peer))
-    );
+    assert!(unrelated
+        .propagation()
+        .master()
+        .is_some_and(|master| Arc::ptr_eq(&master, &peer)));
 }
 
 #[test]
@@ -300,28 +290,22 @@ fn test_nonshared_change_reparents_existing_slave_subtree_like_linux() {
     target.propagation().add_slave(Arc::downgrade(&child));
 
     change_mnt_propagation(&target, PropagationType::Slave).unwrap();
-    assert!(
-        target
-            .propagation()
-            .master()
-            .is_some_and(|current| Arc::ptr_eq(&current, &master))
-    );
-    assert!(
-        child
-            .propagation()
-            .master()
-            .is_some_and(|current| Arc::ptr_eq(&current, &master))
-    );
+    assert!(target
+        .propagation()
+        .master()
+        .is_some_and(|current| Arc::ptr_eq(&current, &master)));
+    assert!(child
+        .propagation()
+        .master()
+        .is_some_and(|current| Arc::ptr_eq(&current, &master)));
     assert!(target.propagation().slaves().is_empty());
 
     change_mnt_propagation(&target, PropagationType::Private).unwrap();
     assert!(target.propagation().master().is_none());
-    assert!(
-        child
-            .propagation()
-            .master()
-            .is_some_and(|current| Arc::ptr_eq(&current, &master))
-    );
+    assert!(child
+        .propagation()
+        .master()
+        .is_some_and(|current| Arc::ptr_eq(&current, &master)));
     assert!(target.propagation().slaves().is_empty());
 }
 
@@ -340,12 +324,10 @@ fn test_make_slave_prefers_exact_root_dentry_peer() {
     assert!(Arc::ptr_eq(&target.root_dentry(), &exact.root_dentry()));
     change_mnt_propagation(&target, PropagationType::Slave).unwrap();
 
-    assert!(
-        target
-            .propagation()
-            .master()
-            .is_some_and(|master| Arc::ptr_eq(&master, &exact))
-    );
+    assert!(target
+        .propagation()
+        .master()
+        .is_some_and(|master| Arc::ptr_eq(&master, &exact)));
 }
 
 #[test]
@@ -364,18 +346,14 @@ fn test_make_slave_selects_peer_as_master() {
     let prop_a = mount_a.propagation();
     assert!(prop_a.is_slave());
     assert!(!prop_a.is_shared());
-    assert!(
-        prop_a
-            .master()
-            .is_some_and(|master| Arc::ptr_eq(&master, &mount_b))
-    );
-    assert!(
-        mount_b
-            .propagation()
-            .slaves()
-            .iter()
-            .any(|slave| Arc::ptr_eq(slave, &mount_a))
-    );
+    assert!(prop_a
+        .master()
+        .is_some_and(|master| Arc::ptr_eq(&master, &mount_b)));
+    assert!(mount_b
+        .propagation()
+        .slaves()
+        .iter()
+        .any(|slave| Arc::ptr_eq(slave, &mount_a)));
 }
 
 #[test]
@@ -522,6 +500,27 @@ fn test_nearest_propagated_source_skips_unmaterialized_master() {
 }
 
 #[test]
+fn test_nearest_propagated_source_uses_latest_materialized_peer() {
+    let source = new_test_mount(MountPropagation::new_shared().unwrap());
+    let group = source.propagation().peer_group().unwrap();
+    let materialized_peer = new_test_mount(MountPropagation::new_shared_with_group(group.clone()));
+    let skipped_peer = new_test_mount(MountPropagation::new_shared_with_group(group));
+    let deep_slave = new_test_mount(MountPropagation::new_slave(Arc::downgrade(&skipped_peer)));
+
+    let source_child = new_test_mount(MountPropagation::new_private());
+    let peer_child = new_test_mount(MountPropagation::new_private());
+    let mut propagated_sources = CorrespondingSources::new();
+    propagated_sources.insert(&source, source_child);
+    propagated_sources.insert(&materialized_peer, peer_child.clone());
+
+    let selected = propagated_sources
+        .nearest(&deep_slave)
+        .unwrap()
+        .expect("a slave of an uncovered peer must use the latest peer source");
+    assert!(Arc::ptr_eq(&selected, &peer_child));
+}
+
+#[test]
 fn test_uncovered_slave_does_not_prune_covered_deeper_slave() {
     let master = new_test_mount(MountPropagation::new_shared().unwrap());
     register_peer(master.propagation().peer_group_id(), &master);
@@ -558,12 +557,10 @@ fn test_uncovered_slave_does_not_prune_covered_deeper_slave() {
     let deep_child = deep
         .lookup_top(&deep_mountpoint)
         .expect("the covered deeper slave must receive the propagation event");
-    assert!(
-        deep_child
-            .propagation()
-            .master()
-            .is_some_and(|source| Arc::ptr_eq(&source, &source_child))
-    );
+    assert!(deep_child
+        .propagation()
+        .master()
+        .is_some_and(|source| Arc::ptr_eq(&source, &source_child)));
 }
 
 #[test]
@@ -584,32 +581,26 @@ fn test_move_propagation_is_prepared_before_source_edge_changes() {
     let prepared =
         prepare_moved_tree_propagation_locked(&target, &moved_root, &target_mountpoint).unwrap();
 
-    assert!(
-        old_parent
-            .children_at(&old_mountpoint)
-            .iter()
-            .any(|child| Arc::ptr_eq(child, &moved_root))
-    );
+    assert!(old_parent
+        .children_at(&old_mountpoint)
+        .iter()
+        .any(|child| Arc::ptr_eq(child, &moved_root)));
     assert!(moved_root.propagation().is_shared());
     assert!(target.lookup_top(&target_mountpoint).is_none());
-    assert!(
-        target_peer
-            .lookup_top(
-                &target_peer
-                    .wrapper_for_dentry(target_mountpoint.shared_dentry())
-                    .unwrap()
-            )
-            .is_none()
-    );
+    assert!(target_peer
+        .lookup_top(
+            &target_peer
+                .wrapper_for_dentry(target_mountpoint.shared_dentry())
+                .unwrap()
+        )
+        .is_none());
 
     abort_moved_tree_propagation_locked(prepared);
     assert!(moved_root.propagation().is_private());
-    assert!(
-        old_parent
-            .children_at(&old_mountpoint)
-            .iter()
-            .any(|child| Arc::ptr_eq(child, &moved_root))
-    );
+    assert!(old_parent
+        .children_at(&old_mountpoint)
+        .iter()
+        .any(|child| Arc::ptr_eq(child, &moved_root)));
 }
 
 #[test]

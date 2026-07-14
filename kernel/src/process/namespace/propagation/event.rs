@@ -65,7 +65,11 @@ impl CorrespondingSources {
         let propagation = parent.propagation();
         let group_id = propagation.peer_group_id();
         if propagation.is_shared() && group_id.is_valid() {
-            self.peer_groups.entry(group_id.data()).or_insert(child);
+            // Linux propagate_one() advances last_source after every
+            // successfully materialized peer. Keep the newest child for the
+            // group so a later covered slave of an uncovered peer inherits
+            // from that nearest source rather than the event root.
+            self.peer_groups.insert(group_id.data(), child);
         }
     }
 

@@ -392,7 +392,7 @@ gentoo()
     echo "正在更新包管理器的列表..."
     sudo "${pkgman}" --sync
     echo "正在安装所需的包..."
-    sudo "${pkgman}"  net-misc/curl net-misc/wget net-misc/bridge-utils net-dns/dnsmasq sys-apps/diffutils dev-util/pkgconf sys-apps/which app-arch/unzip sys-apps/util-linux sys-fs/dosfstools sys-devel/gcc dev-build/make sys-devel/flex sys-apps/texinfo dev-libs/gmp dev-libs/mpfr app-emulation/qemu dev-libs/mpc dev-libs/openssl dev-util/meson dev-util/ninja
+    sudo "${pkgman}" -vp net-misc/curl net-misc/wget net-misc/bridge-utils net-dns/dnsmasq sys-apps/diffutils dev-util/pkgconf sys-apps/which app-arch/unzip sys-apps/util-linux sys-fs/dosfstools sys-devel/gcc dev-build/make sys-devel/flex sys-apps/texinfo dev-libs/gmp dev-libs/mpfr app-emulation/qemu dev-libs/mpc dev-libs/openssl dev-build/meson dev-build/ninja
 }
 
 install_archlinux_pkg()

@@ -63,6 +63,9 @@ impl PacketSocket {
                     let hdrlen = self.tpacket_version.lock().hdrlen() as i32;
                     Ok(write_i32_getsockopt(value, hdrlen))
                 }
+                packet_option::PACKET_RESERVE => {
+                    Ok(write_i32_getsockopt(value, self.tp_reserve.load(Ordering::Relaxed) as i32))
+                }
                 _ => Err(SystemError::ENOPROTOOPT),
             },
             _ => Err(SystemError::ENOPROTOOPT),
@@ -99,6 +102,9 @@ impl PacketSocket {
                 }
                 packet_option::PACKET_RESERVE => {
                     let v = Self::parse_i32(value)? as u32;
+                    if v > 255 {
+                        return Err(SystemError::EINVAL);
+                    }
                     if self.rx_ring.lock().is_some() {
                         return Err(SystemError::EBUSY);
                     }
@@ -124,6 +130,15 @@ impl PacketSocket {
                         super::ring::validate_ring_config(&req, version.hdrlen(), reserve)?;
                     let (ring, _pc) = PacketRing::setup(config, version, self.sock_type, reserve)?;
                     *self.rx_ring.lock() = Some(Arc::new(Mutex::new(ring)));
+                    // Flush stale packets queued before ring setup (review P2 fix).
+                    // Linux calls __skb_queue_purge in packet_set_ring. Without this,
+                    // packets received between bind() and ring setup are stranded —
+                    // can_recv() only checks the ring when it is active.
+                    let mut q = self.rx_buffer.lock();
+                    let bytes: usize = q.iter().map(|p| p.accounted_bytes).sum();
+                    q.clear();
+                    drop(q);
+                    self.rx_buffer_bytes.fetch_sub(bytes, Ordering::AcqRel);
                     Ok(())
                 }
                 packet_option::PACKET_COPY_THRESH => {

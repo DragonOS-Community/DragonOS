@@ -402,7 +402,7 @@ impl PacketRing {
             *(dst.add(sll_off) as *mut u16) = 17u16; // sll_family = AF_PACKET
             *(dst.add(sll_off + 2) as *mut u16) = meta.protocol.to_be(); // sll_protocol
             *(dst.add(sll_off + 4) as *mut i32) = meta.ifindex as i32; // sll_ifindex
-            *(dst.add(sll_off + 8) as *mut u16) = 1u16.to_be(); // sll_hatype = ARPHRD_ETHER
+            *(dst.add(sll_off + 8) as *mut u16) = 1u16; // sll_hatype = ARPHRD_ETHER (host byte order, NOT big-endian)
             *(dst.add(sll_off + 10) as *mut u8) = meta.pkt_type as u8; // sll_pkttype
             *(dst.add(sll_off + 11) as *mut u8) = 6; // sll_halen
             core::ptr::copy_nonoverlapping(meta.src_mac.as_ptr(), dst.add(sll_off + 12), 6);

@@ -359,11 +359,19 @@ impl<T: Socket + 'static> IndexNode for T {
 
     /// Reject mmap when no ring buffer is set up, so the page-fault path never
     /// reaches the `unreachable!()` in `fs()`.
-    fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
-        if super::base::Socket::mmap_layout(self).is_none() {
-            return Err(SystemError::EINVAL);
+    fn mmap(&self, _start: usize, len: usize, offset: usize) -> Result<(), SystemError> {
+        match super::base::Socket::mmap_layout(self) {
+            None => Err(SystemError::EINVAL),
+            Some(layout) => {
+                // Linux packet_mmap: offset must be 0 and size must exactly
+                // match the ring total — otherwise EINVAL, not deferred SIGBUS
+                // (review P2-3 fix).
+                if offset != 0 || len != layout.size {
+                    return Err(SystemError::EINVAL);
+                }
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {

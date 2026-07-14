@@ -199,8 +199,10 @@ impl PacketSocket {
         self.wait_queue.wakeup(None);
     }
     pub(super) fn can_recv(&self) -> bool {
-        // Ring mode: check for TP_STATUS_USER frames.
-        if let Some(r) = self.rx_ring.lock().as_ref() {
+        // Ring mode: clone the Arc and drop the outer lock before the O(n)
+        // frame scan so deliver_from_iface is not blocked (review P3 fix).
+        let ring = self.rx_ring.lock().as_ref().cloned();
+        if let Some(r) = ring {
             return r.lock().has_user_frames();
         }
         // Queue mode (default).

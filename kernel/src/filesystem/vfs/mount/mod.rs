@@ -28,7 +28,7 @@ use crate::{
                 abort_mount_propagation, commit_mount_propagation_locked, detach_mount_propagation,
                 ensure_subtree_shared, inherit_bind_mount_propagation,
                 prepare_mount_propagation_locked, propagate_umount, propagation_umount_busy,
-                register_peer, register_slave_with_master, MountPropagation,
+                MountPropagation,
             },
         },
         ProcessManager,
@@ -360,6 +360,33 @@ pub struct MountFS {
     /// Internal MNT_LOCKED equivalent; never exposed as a userspace MS_* bit.
     locked: AtomicBool,
     lifecycle: Mutex<MountLifecycle>,
+}
+
+/// Capacity reserved for one future mount edge. Creating an empty map entry is
+/// topology-neutral; if prepare aborts before the slot is consumed, Drop
+/// removes that entry so failed events leave no mountpoint residue.
+pub(crate) struct MountEdgeReservation {
+    parent: Arc<MountFS>,
+    mountpoint: Arc<MountFSInode>,
+}
+
+impl Drop for MountEdgeReservation {
+    fn drop(&mut self) {
+        let mut mountpoints = self.parent.mountpoints.lock();
+        let dentry_id = self.mountpoint.dentry.id;
+        if mountpoints
+            .get(&dentry_id)
+            .is_some_and(|stack| stack.is_empty())
+        {
+            mountpoints.remove(&dentry_id);
+        }
+    }
+}
+
+impl MountEdgeReservation {
+    pub(crate) fn mountpoint(&self) -> &Arc<MountFSInode> {
+        &self.mountpoint
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1249,7 +1276,19 @@ impl MountFS {
         mountpoint: &Arc<MountFSInode>,
         mount_fs: Arc<MountFS>,
     ) -> Result<(), SystemError> {
+        let cover_mountpoint = mount_fs.mountpoint_root_inode();
+        self.attach_beneath_prepared(mountpoint, mount_fs, &cover_mountpoint)
+    }
+
+    pub(crate) fn attach_beneath_prepared(
+        &self,
+        mountpoint: &Arc<MountFSInode>,
+        mount_fs: Arc<MountFS>,
+        cover_mountpoint: &Arc<MountFSInode>,
+    ) -> Result<(), SystemError> {
         if !Arc::ptr_eq(&mountpoint.mount_fs, &self.self_ref())
+            || !Arc::ptr_eq(&cover_mountpoint.mount_fs, &mount_fs)
+            || cover_mountpoint.dentry.id != mount_fs.root_dentry.id
             || mount_fs
                 .self_mountpoint()
                 .as_ref()
@@ -1276,7 +1315,6 @@ impl MountFS {
 
         // Linux mnt_set_mountpoint_beneath(): the propagated mount takes the
         // original edge and the previous topper is reparented onto its root.
-        let cover_mountpoint = mount_fs.mountpoint_root_inode();
         covered.relocate_mountpoint(Some(cover_mountpoint.clone()));
         if let Err(error) = mount_fs.attach_top(&cover_mountpoint, covered.clone()) {
             covered.relocate_mountpoint(Some(mountpoint.clone()));
@@ -1300,25 +1338,124 @@ impl MountFS {
         mount_fs: &Arc<MountFS>,
     ) -> Result<Arc<MountFS>, SystemError> {
         let cover_mountpoint = mount_fs.mountpoint_root_inode();
-        let Some(covered) = mount_fs
-            .children_at(&cover_mountpoint)
-            .into_iter()
-            .find(|child| child.tucked_under.load(Ordering::Acquire))
-        else {
+        let covered = mount_fs
+            .mountpoints
+            .lock()
+            .get(&cover_mountpoint.dentry.id)
+            .and_then(|stack| {
+                stack
+                    .iter()
+                    .find(|child| child.tucked_under.load(Ordering::Acquire))
+                    .cloned()
+            });
+        let Some(covered) = covered else {
             return self.detach_exact(mount_fs);
         };
-        let original_mountpoint = mount_fs.self_mountpoint().ok_or(SystemError::EINVAL)?;
-        mount_fs.detach_exact(&covered)?;
-        covered.relocate_mountpoint(Some(original_mountpoint.clone()));
-        let removed = self.detach_exact(mount_fs)?;
-        if let Err(error) = self.attach_top(&original_mountpoint, covered.clone()) {
-            // All objects remain owned; reconstruct the tuck-under topology.
-            self.attach_top(&original_mountpoint, mount_fs.clone())?;
-            covered.relocate_mountpoint(Some(cover_mountpoint.clone()));
-            mount_fs.attach_top(&cover_mountpoint, covered)?;
-            return Err(error);
+        self.restore_exact_cover(mount_fs, &cover_mountpoint, &covered)
+    }
+
+    /// Transaction rollback variant using the exact topper and root wrapper
+    /// captured during prepare. It performs no discovery or allocation.
+    pub(crate) fn detach_exact_restoring_prepared_cover(
+        &self,
+        mount_fs: &Arc<MountFS>,
+        cover_mountpoint: Option<&Arc<MountFSInode>>,
+        covered: Option<&Arc<MountFS>>,
+    ) -> Result<Arc<MountFS>, SystemError> {
+        match (cover_mountpoint, covered) {
+            (None, None) => self.detach_exact(mount_fs),
+            (Some(cover_mountpoint), Some(covered)) => {
+                if !covered.tucked_under.load(Ordering::Acquire)
+                    || !mount_fs
+                        .mountpoints
+                        .lock()
+                        .get(&cover_mountpoint.dentry.id)
+                        .is_some_and(|stack| stack.iter().any(|child| Arc::ptr_eq(child, covered)))
+                {
+                    return Err(SystemError::ENOENT);
+                }
+                self.restore_exact_cover(mount_fs, cover_mountpoint, covered)
+            }
+            _ => Err(SystemError::EINVAL),
         }
+    }
+
+    fn restore_exact_cover(
+        &self,
+        mount_fs: &Arc<MountFS>,
+        cover_mountpoint: &Arc<MountFSInode>,
+        covered: &Arc<MountFS>,
+    ) -> Result<Arc<MountFS>, SystemError> {
+        let original_mountpoint = mount_fs.self_mountpoint().ok_or(SystemError::EINVAL)?;
+        // Preserve the clone-root Vec until restoration completes. This is
+        // the rollback counterpart of the prepare-time cover reservation.
+        let _cover_reservation = mount_fs.reserve_mount_edge(&cover_mountpoint, 0)?;
+        mount_fs.detach_exact_keep_slot(covered)?;
+        covered.relocate_mountpoint(Some(original_mountpoint.clone()));
+        let removed = match self.replace_exact_edge(mount_fs, covered.clone()) {
+            Ok(removed) => removed,
+            Err(error) => {
+                // All objects remain owned; reconstruct the tuck-under
+                // topology without allocating from the reserved cover slot.
+                covered.relocate_mountpoint(Some(cover_mountpoint.clone()));
+                mount_fs.attach_top(cover_mountpoint, covered.clone())?;
+                covered.restore_tucked_under(true);
+                return Err(error);
+            }
+        };
         covered.tucked_under.store(false, Ordering::Release);
+        Ok(removed)
+    }
+
+    /// Replace one exact edge in place, preserving the parent stack's key,
+    /// capacity, ordering and mount-edge count.
+    fn replace_exact_edge(
+        &self,
+        old: &Arc<MountFS>,
+        replacement: Arc<MountFS>,
+    ) -> Result<Arc<MountFS>, SystemError> {
+        let mountpoint = old.self_mountpoint().ok_or(SystemError::EINVAL)?;
+        if !Arc::ptr_eq(&mountpoint.mount_fs, &self.self_ref())
+            || replacement
+                .self_mountpoint()
+                .as_ref()
+                .is_none_or(|replacement_mp| !Arc::ptr_eq(replacement_mp, &mountpoint))
+        {
+            return Err(SystemError::EINVAL);
+        }
+        let _gate = mountpoint.dentry.mount_gate.lock();
+        let mut mountpoints = self.mountpoints.lock();
+        let stack = mountpoints
+            .get_mut(&mountpoint.dentry.id)
+            .ok_or(SystemError::ENOENT)?;
+        let index = stack
+            .iter()
+            .position(|child| Arc::ptr_eq(child, old))
+            .ok_or(SystemError::ENOENT)?;
+        Ok(core::mem::replace(&mut stack[index], replacement))
+    }
+
+    pub(crate) fn detach_exact_keep_slot(
+        &self,
+        mount_fs: &Arc<MountFS>,
+    ) -> Result<Arc<MountFS>, SystemError> {
+        let mountpoint = mount_fs.self_mountpoint().ok_or(SystemError::EINVAL)?;
+        if !Arc::ptr_eq(&mountpoint.mount_fs, &self.self_ref()) {
+            return Err(SystemError::EINVAL);
+        }
+        let _gate = mountpoint.dentry.mount_gate.lock();
+        let key = mountpoint.dentry.id;
+        let mut mountpoints = self.mountpoints.lock();
+        let stack = mountpoints.get_mut(&key).ok_or(SystemError::ENOENT)?;
+        let index = stack
+            .iter()
+            .position(|child| Arc::ptr_eq(child, mount_fs))
+            .ok_or(SystemError::ENOENT)?;
+        let removed = stack.remove(index);
+        mountpoint
+            .dentry
+            .mount_edges
+            .fetch_sub(1, Ordering::Release);
         Ok(removed)
     }
 
@@ -1375,6 +1512,39 @@ impl MountFS {
 
     pub fn propagation(&self) -> Arc<MountPropagation> {
         self.propagation.clone()
+    }
+
+    /// Reserve the HashMap key and stack capacity needed by a future exact
+    /// edge publication. Callers hold `MOUNT_LIFECYCLE_LOCK`, so no topology
+    /// writer can consume the reserved slot before commit.
+    pub(crate) fn reserve_mount_edge(
+        &self,
+        mountpoint: &Arc<MountFSInode>,
+        additional: usize,
+    ) -> Result<MountEdgeReservation, SystemError> {
+        if !Arc::ptr_eq(&mountpoint.mount_fs, &self.self_ref()) {
+            return Err(SystemError::EINVAL);
+        }
+        let key = mountpoint.dentry.id;
+        let mut mountpoints = self.mountpoints.lock();
+        if let Some(stack) = mountpoints.get_mut(&key) {
+            stack
+                .try_reserve(additional)
+                .map_err(|_| SystemError::ENOMEM)?;
+        } else {
+            mountpoints
+                .try_reserve(1)
+                .map_err(|_| SystemError::ENOMEM)?;
+            let mut stack = Vec::new();
+            stack
+                .try_reserve(additional)
+                .map_err(|_| SystemError::ENOMEM)?;
+            mountpoints.insert(key, stack);
+        }
+        Ok(MountEdgeReservation {
+            parent: self.self_ref(),
+            mountpoint: mountpoint.clone(),
+        })
     }
 
     /// Get the mount ID
@@ -2559,17 +2729,6 @@ impl MountFSInode {
             return Err(error);
         }
 
-        let mut pending = vec![new_mount_fs.clone()];
-        while let Some(mount) = pending.pop() {
-            pending.extend(mount.mount_children());
-            let propagation = mount.propagation();
-            if propagation.is_shared() {
-                register_peer(propagation.peer_group_id(), &mount);
-            }
-            if propagation.is_slave() {
-                register_slave_with_master(&mount);
-            }
-        }
         Ok(())
     }
 

@@ -17,8 +17,9 @@ pub use change::{
 };
 #[allow(unused_imports)]
 pub(crate) use event::{
-    abort_mount_propagation, commit_mount_propagation_locked, ensure_subtree_shared,
-    prepare_mount_propagation_locked, propagate_moved_tree_locked, PreparedPropagation,
+    abort_mount_propagation, abort_moved_tree_propagation_locked, commit_mount_propagation_locked,
+    commit_moved_tree_propagation_locked, ensure_subtree_shared, prepare_mount_propagation_locked,
+    prepare_moved_tree_propagation_locked, PreparedPropagation,
 };
 pub use event::{propagate_umount, propagation_umount_busy};
 #[allow(unused_imports)]

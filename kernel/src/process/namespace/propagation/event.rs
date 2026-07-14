@@ -7,9 +7,15 @@ use alloc::vec::Vec;
 use hashbrown::HashSet;
 use system_error::SystemError;
 
-use crate::filesystem::vfs::{mount::MountFSInode, MountFS};
+use crate::filesystem::vfs::{
+    mount::{MountEdgeReservation, MountFSInode},
+    MountFS,
+};
 
-use super::group::{get_peers, register_peer, unregister_peer, PropagationGroup};
+use super::group::{
+    apply_prepared_peer_groups, get_peers, prepare_peer_registrations, PreparedPeerGroupState,
+    PropagationGroup,
+};
 use super::state::{register_slave_with_master, PropagationType};
 
 #[derive(Clone, Copy)]
@@ -21,7 +27,6 @@ enum PropagationTargetKind {
 struct PropagationTarget {
     mount: Arc<MountFS>,
     kind: PropagationTargetKind,
-    master_parent: Option<Arc<MountFS>>,
 }
 
 struct PreparedMount {
@@ -29,6 +34,8 @@ struct PreparedMount {
     mountpoint: Arc<MountFSInode>,
     expected_top: Option<Arc<MountFS>>,
     clone: Arc<MountFS>,
+    _target_reservation: Option<MountEdgeReservation>,
+    cover_reservation: Option<MountEdgeReservation>,
 }
 
 pub(crate) struct PreparedPropagation {
@@ -36,6 +43,117 @@ pub(crate) struct PreparedPropagation {
     mountpoint: Arc<MountFSInode>,
     new_child: Arc<MountFS>,
     mounts: Vec<PreparedMount>,
+    registrations: PreparedRegistrations,
+    _local_reservation: MountEdgeReservation,
+}
+
+pub(super) struct CorrespondingSources {
+    mounts: BTreeMap<usize, Arc<MountFS>>,
+    peer_groups: BTreeMap<usize, Arc<MountFS>>,
+}
+
+impl CorrespondingSources {
+    pub(super) fn new() -> Self {
+        Self {
+            mounts: BTreeMap::new(),
+            peer_groups: BTreeMap::new(),
+        }
+    }
+
+    pub(super) fn insert(&mut self, parent: &Arc<MountFS>, child: Arc<MountFS>) {
+        self.mounts.insert(parent.mount_id().data(), child.clone());
+        let propagation = parent.propagation();
+        let group_id = propagation.peer_group_id();
+        if propagation.is_shared() && group_id.is_valid() {
+            self.peer_groups.entry(group_id.data()).or_insert(child);
+        }
+    }
+
+    pub(super) fn nearest(
+        &self,
+        target: &Arc<MountFS>,
+    ) -> Result<Option<Arc<MountFS>>, SystemError> {
+        // Linux `propagate_one()` retains `last_source` when a narrow peer is
+        // uncovered. Match that layer before walking to the next master.
+        let mut visited = HashSet::new();
+        visited.insert(target.mount_id().data());
+        let mut master = target.propagation().master();
+        while let Some(candidate) = master {
+            if !visited.insert(candidate.mount_id().data()) {
+                return Err(SystemError::ELOOP);
+            }
+            if let Some(source) = self.mounts.get(&candidate.mount_id().data()) {
+                return Ok(Some(source.clone()));
+            }
+            let propagation = candidate.propagation();
+            let group_id = propagation.peer_group_id();
+            if propagation.is_shared() && group_id.is_valid() {
+                if let Some(source) = self.peer_groups.get(&group_id.data()) {
+                    return Ok(Some(source.clone()));
+                }
+            }
+            master = propagation.master();
+        }
+        Ok(None)
+    }
+}
+
+struct PreparedRegistrations {
+    peer_groups: Vec<PreparedPeerGroupState>,
+    slaves: Vec<Arc<MountFS>>,
+}
+
+impl PreparedRegistrations {
+    fn prepare(mounts: &[Arc<MountFS>]) -> Result<Self, SystemError> {
+        let peer_groups = prepare_peer_registrations(mounts)?;
+        let mut slaves = Vec::new();
+        slaves
+            .try_reserve(mounts.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        for mount in mounts {
+            // Live source mounts in a move already occupy their master's
+            // reverse list. Detached source/clone mounts need publication.
+            if !mount.is_live() && mount.propagation().master().is_some() {
+                slaves.push(mount.clone());
+            }
+        }
+
+        let mut masters = Vec::new();
+        masters
+            .try_reserve(slaves.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        for slave in &slaves {
+            let master = slave
+                .propagation()
+                .master()
+                .expect("prepared slave retained its master");
+            masters.push((master.mount_id().data(), master));
+        }
+        masters.sort_unstable_by_key(|(mount_id, _)| *mount_id);
+        let mut index = 0;
+        while index < masters.len() {
+            let start = index;
+            let master_id = masters[index].0;
+            while index < masters.len() && masters[index].0 == master_id {
+                index += 1;
+            }
+            masters[start]
+                .1
+                .propagation()
+                .try_reserve_slaves(index - start)?;
+        }
+        Ok(Self {
+            peer_groups,
+            slaves,
+        })
+    }
+
+    fn commit(self) {
+        apply_prepared_peer_groups(self.peer_groups);
+        for mount in self.slaves {
+            register_slave_with_master(&mount);
+        }
+    }
 }
 
 /// Return every peer/slave destination exactly once.  The registry is only a
@@ -53,45 +171,28 @@ fn propagation_targets(source: &Arc<MountFS>) -> Vec<PropagationTarget> {
             result.push(PropagationTarget {
                 mount: peer.clone(),
                 kind: PropagationTargetKind::Peer,
-                master_parent: None,
             });
         }
     }
 
-    let mut pending: Vec<(Arc<MountFS>, Arc<MountFS>)> = source
-        .propagation()
-        .slaves()
-        .into_iter()
-        .map(|slave| (slave, source.clone()))
-        .collect();
+    let mut pending = source.propagation().slaves();
     for peer in result.iter().map(|target| &target.mount) {
-        pending.extend(
-            peer.propagation()
-                .slaves()
-                .into_iter()
-                .map(|slave| (slave, peer.clone())),
-        );
+        pending.extend(peer.propagation().slaves());
     }
-    while let Some((slave, master_parent)) = pending.pop() {
+    while let Some(slave) = pending.pop() {
         if !visited.insert(slave.mount_id().data()) {
             continue;
         }
-        pending.extend(
-            slave
-                .propagation()
-                .slaves()
-                .into_iter()
-                .map(|child| (child, slave.clone())),
-        );
+        pending.extend(slave.propagation().slaves());
         result.push(PropagationTarget {
             mount: slave,
             kind: PropagationTargetKind::Slave,
-            master_parent: Some(master_parent),
         });
     }
     result
 }
 
+/// Apply Linux's peer/slave clone flags to one detached copy.
 fn configure_clone_propagation(
     source: &Arc<MountFS>,
     clone: &Arc<MountFS>,
@@ -252,44 +353,46 @@ fn activate_subtree(
     Ok(())
 }
 
-fn register_subtree(root: &Arc<MountFS>) {
-    for mount in collect_subtree(root) {
-        let prop = mount.propagation();
-        if prop.is_shared() {
-            register_peer(prop.peer_group_id(), &mount);
-        }
-        register_slave_with_master(&mount);
-    }
-}
-
 pub(crate) fn prepare_mount_propagation_locked(
     source_mnt: &Arc<MountFS>,
     mountpoint: &Arc<MountFSInode>,
     new_child: &Arc<MountFS>,
 ) -> Result<Option<PreparedPropagation>, SystemError> {
     let source_prop = source_mnt.propagation();
-    if !source_prop.is_shared() {
-        return Ok(None);
-    }
     let canonical_mountpoint = source_mnt.wrapper_for_dentry(mountpoint.shared_dentry())?;
     if canonical_mountpoint.dentry_id() != mountpoint.dentry_id() {
         return Err(SystemError::EINVAL);
     }
+    // New/bind and move both publish the local source as a new top edge.
+    // Reserve its parent key/stack before either path changes topology.
+    let local_reservation = source_mnt.reserve_mount_edge(&canonical_mountpoint, 1)?;
 
     let source_dentry = mountpoint.shared_dentry();
     let mut slave_groups = BTreeMap::new();
     let mut mounts = Vec::new();
-    let mut propagated_sources = BTreeMap::new();
-    propagated_sources.insert(source_mnt.mount_id().data(), new_child.clone());
-    for target in propagation_targets(source_mnt) {
+    let mut propagated_sources = CorrespondingSources::new();
+    propagated_sources.insert(source_mnt, new_child.clone());
+    let targets = if source_prop.is_shared() {
+        propagation_targets(source_mnt)
+    } else {
+        Vec::new()
+    };
+    for target in targets {
         let PropagationTarget {
             mount: target_parent,
             kind,
-            master_parent,
         } = target;
-        let master_source = master_parent
-            .as_ref()
-            .and_then(|master| propagated_sources.get(&master.mount_id().data()).cloned());
+        let master_source = if matches!(kind, PropagationTargetKind::Slave) {
+            match propagated_sources.nearest(&target_parent) {
+                Ok(source) => source,
+                Err(error) => {
+                    abandon_prepared(&mounts);
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         if matches!(kind, PropagationTargetKind::Slave) && master_source.is_none() {
             continue;
         }
@@ -318,19 +421,59 @@ pub(crate) fn prepare_mount_propagation_locked(
                 return Err(error);
             }
         };
-        propagated_sources.insert(target_parent.mount_id().data(), clone.clone());
+        let target_reservation = if expected_top.is_none() {
+            match target_parent.reserve_mount_edge(&target_mp, 1) {
+                Ok(reservation) => Some(reservation),
+                Err(error) => {
+                    MountFS::deactivate_disconnected_subtree(&clone);
+                    abandon_prepared(&mounts);
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        let cover_reservation = if expected_top.is_some() {
+            let cover_mountpoint = clone.mountpoint_root_inode();
+            match clone.reserve_mount_edge(&cover_mountpoint, 1) {
+                Ok(reservation) => Some(reservation),
+                Err(error) => {
+                    MountFS::deactivate_disconnected_subtree(&clone);
+                    abandon_prepared(&mounts);
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        propagated_sources.insert(&target_parent, clone.clone());
         mounts.push(PreparedMount {
             target_parent,
             mountpoint: target_mp,
             expected_top,
             clone,
+            _target_reservation: target_reservation,
+            cover_reservation,
         });
     }
+    let mut registration_mounts = collect_subtree(new_child);
+    for item in &mounts {
+        registration_mounts.extend(collect_subtree(&item.clone));
+    }
+    let registrations = match PreparedRegistrations::prepare(&registration_mounts) {
+        Ok(registrations) => registrations,
+        Err(error) => {
+            abandon_prepared(&mounts);
+            return Err(error);
+        }
+    };
     Ok(Some(PreparedPropagation {
         source_mnt: source_mnt.clone(),
         mountpoint: canonical_mountpoint,
         new_child: new_child.clone(),
         mounts,
+        registrations,
+        _local_reservation: local_reservation,
     }))
 }
 
@@ -408,19 +551,34 @@ pub(crate) fn commit_mount_propagation_locked(
     }
 
     let mut attached: Vec<&PreparedMount> = Vec::new();
+    if attached.try_reserve(prepared.mounts.len()).is_err() {
+        abandon_prepared(&prepared.mounts);
+        return Err(SystemError::ENOMEM);
+    }
     for item in &prepared.mounts {
-        let result = if item.expected_top.is_some() {
-            item.target_parent
-                .attach_beneath(&item.mountpoint, item.clone.clone())
+        let result = if let Some(cover_reservation) = item.cover_reservation.as_ref() {
+            item.target_parent.attach_beneath_prepared(
+                &item.mountpoint,
+                item.clone.clone(),
+                cover_reservation.mountpoint(),
+            )
         } else {
             item.target_parent
                 .attach_top(&item.mountpoint, item.clone.clone())
         };
         if let Err(error) = result {
             for committed in attached.iter().rev() {
-                let _: Result<Arc<MountFS>, _> = committed
+                committed
                     .target_parent
-                    .detach_exact_restoring_cover(&committed.clone);
+                    .detach_exact_restoring_prepared_cover(
+                        &committed.clone,
+                        committed
+                            .cover_reservation
+                            .as_ref()
+                            .map(MountEdgeReservation::mountpoint),
+                        committed.expected_top.as_ref(),
+                    )
+                    .expect("propagation rollback must restore every exact mount edge");
             }
             abandon_prepared(&prepared.mounts);
             return Err(error);
@@ -428,20 +586,38 @@ pub(crate) fn commit_mount_propagation_locked(
         attached.push(item);
     }
 
-    for item in &prepared.mounts {
-        register_subtree(&item.clone);
-    }
+    prepared.registrations.commit();
     Ok(())
 }
 
 /// Linux makes every mount in a moved tree shared before propagating the tree
 /// into the destination parent's peers.  The complete tree is copied once per
 /// destination instead of the former path/BFS reconstruction.
-pub(crate) fn propagate_moved_tree_locked(
+pub(crate) struct PreparedMovePropagation {
+    propagation: Option<PreparedPropagation>,
+    invented: Vec<(Arc<MountFS>, PropagationType, Arc<PropagationGroup>)>,
+}
+
+fn restore_invented_groups(invented: Vec<(Arc<MountFS>, PropagationType, Arc<PropagationGroup>)>) {
+    for (mount, old_type, _) in invented.into_iter().rev() {
+        let prop = mount.propagation();
+        match old_type {
+            PropagationType::Private => prop.set_private(),
+            PropagationType::Slave => {
+                prop.clear_shared();
+                prop.clear_group_id();
+            }
+            PropagationType::Unbindable => prop.set_unbindable(),
+            PropagationType::Shared => unreachable!(),
+        }
+    }
+}
+
+pub(crate) fn prepare_moved_tree_propagation_locked(
     target_parent: &Arc<MountFS>,
     moved_root: &Arc<MountFS>,
     moved_root_mountpoint: &Arc<MountFSInode>,
-) -> Result<(), SystemError> {
+) -> Result<PreparedMovePropagation, SystemError> {
     let subtree = collect_subtree(moved_root);
     let mut invented = Vec::new();
     for mount in &subtree {
@@ -454,30 +630,37 @@ pub(crate) fn propagate_moved_tree_locked(
         let prop = mount.propagation();
         if !prop.is_shared() {
             prop.set_shared_with_group(group.clone());
-            register_peer(prop.peer_group_id(), mount);
         }
     }
     let propagation =
-        prepare_mount_propagation_locked(target_parent, moved_root_mountpoint, moved_root);
-    if let Err(error) = propagation.and_then(commit_mount_propagation_locked) {
-        // Linux discards invented group IDs when propagation preparation
-        // fails. Restore the pre-move state rather than leaking a semantic
-        // change from a failed move.
-        for (mount, old_type, _) in invented.into_iter().rev() {
-            let prop = mount.propagation();
-            unregister_peer(prop.peer_group_id(), &mount);
-            match old_type {
-                PropagationType::Private => prop.set_private(),
-                PropagationType::Slave => {
-                    prop.clear_shared();
-                    prop.clear_group_id();
-                }
-                PropagationType::Unbindable => prop.set_unbindable(),
-                PropagationType::Shared => unreachable!(),
+        match prepare_mount_propagation_locked(target_parent, moved_root_mountpoint, moved_root) {
+            Ok(propagation) => propagation,
+            Err(error) => {
+                restore_invented_groups(invented);
+                return Err(error);
             }
-        }
+        };
+    Ok(PreparedMovePropagation {
+        propagation,
+        invented,
+    })
+}
+
+pub(crate) fn abort_moved_tree_propagation_locked(prepared: PreparedMovePropagation) {
+    abort_mount_propagation(prepared.propagation);
+    restore_invented_groups(prepared.invented);
+}
+
+pub(crate) fn commit_moved_tree_propagation_locked(
+    prepared: PreparedMovePropagation,
+) -> Result<(), SystemError> {
+    if let Err(error) = commit_mount_propagation_locked(prepared.propagation) {
+        restore_invented_groups(prepared.invented);
         return Err(error);
     }
+    // The propagation registration plan includes invented source groups and
+    // publishes them together with clone membership after every edge commits.
+    drop(prepared.invented);
     Ok(())
 }
 
@@ -553,20 +736,17 @@ fn propagated_umount_targets(
     // A deep slave's child is mastered by the corresponding child in the
     // immediately preceding layer, not by the original source child. Keep the
     // same parent->child projection that mount propagation uses.
-    let mut corresponding = BTreeMap::new();
-    corresponding.insert(parent_mnt.mount_id().data(), source_child.clone());
+    let mut corresponding = CorrespondingSources::new();
+    corresponding.insert(parent_mnt, source_child.clone());
     let mut result = Vec::new();
     for target in propagation_targets(parent_mnt) {
         let reference_child = match target.kind {
             PropagationTargetKind::Peer => source_child.clone(),
             PropagationTargetKind::Slave => {
-                let Some(master_parent) = target.master_parent.as_ref() else {
+                let Some(child) = corresponding.nearest(&target.mount)? else {
                     continue;
                 };
-                let Some(child) = corresponding.get(&master_parent.mount_id().data()) else {
-                    continue;
-                };
-                child.clone()
+                child
             }
         };
         let target_mountpoint = match target.mount.wrapper_for_dentry(mountpoint.shared_dentry()) {
@@ -578,7 +758,7 @@ fn propagated_umount_targets(
         else {
             continue;
         };
-        corresponding.insert(target.mount.mount_id().data(), child.clone());
+        corresponding.insert(&target.mount, child.clone());
         result.push((target.mount, target_mountpoint, child));
     }
     Ok(result)

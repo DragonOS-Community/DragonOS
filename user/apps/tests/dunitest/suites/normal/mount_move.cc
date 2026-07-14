@@ -387,11 +387,17 @@ TEST_F(MountMoveTest, MoveIntoSharedDestPropagatesToPeer) {
     char dst_b[160] = {};
     char mp_a[224] = {};
     char mp_b[224] = {};
+    char src_child[224] = {};
+    char mp_a_child[256] = {};
+    char mp_b_child[256] = {};
     snprintf(src, sizeof(src), "%s/src", root_);
     snprintf(dst_a, sizeof(dst_a), "%s/dst_a", root_);
     snprintf(dst_b, sizeof(dst_b), "%s/dst_b", root_);
     snprintf(mp_a, sizeof(mp_a), "%s/mp", dst_a);
     snprintf(mp_b, sizeof(mp_b), "%s/mp", dst_b);
+    snprintf(src_child, sizeof(src_child), "%s/child", src);
+    snprintf(mp_a_child, sizeof(mp_a_child), "%s/child", mp_a);
+    snprintf(mp_b_child, sizeof(mp_b_child), "%s/child", mp_b);
 
     ASSERT_EQ(0, ensure_dir(src)) << strerror(errno);
     ASSERT_EQ(0, ensure_dir(dst_a)) << strerror(errno);
@@ -408,13 +414,20 @@ TEST_F(MountMoveTest, MoveIntoSharedDestPropagatesToPeer) {
     // The private mount to be moved.
     ASSERT_EQ(0, mount("", src, "ramfs", 0, nullptr)) << strerror(errno);
     ASSERT_EQ(0, create_marker(src, "moved_marker")) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(src_child)) << strerror(errno);
+    ASSERT_EQ(0, mount("", src_child, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, create_marker(src_child, "child_marker")) << strerror(errno);
 
     ASSERT_EQ(0, mount(src, mp_a, nullptr, MS_MOVE, nullptr)) << strerror(errno);
 
     // After moving to the shared target, clone propagates to peer dst_b/mp.
     EXPECT_TRUE(marker_exists(mp_a, "moved_marker"));
     EXPECT_TRUE(marker_exists(mp_b, "moved_marker"));
+    EXPECT_TRUE(marker_exists(mp_a_child, "child_marker"));
+    EXPECT_TRUE(marker_exists(mp_b_child, "child_marker"));
 
+    best_effort_umount(mp_b_child);
+    best_effort_umount(mp_a_child);
     best_effort_umount(mp_b);
     best_effort_umount(mp_a);
     best_effort_umount(dst_b);

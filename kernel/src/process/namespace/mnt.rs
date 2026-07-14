@@ -15,7 +15,9 @@ use system_error::SystemError;
 use super::{
     nsproxy::NsCommon,
     propagation::{
-        propagate_moved_tree_locked, register_peer, register_slave_with_master, MountPropagation,
+        abort_moved_tree_propagation_locked, commit_moved_tree_propagation_locked,
+        prepare_moved_tree_propagation_locked, register_peer, register_slave_with_master,
+        MountPropagation,
     },
     user_namespace::UserNamespace,
     NamespaceOps,
@@ -280,7 +282,40 @@ impl MntNamespace {
             }
         }
 
-        old_parent.detach_exact(source_mfs)?;
+        // Keep the old stack allocation alive until the move either commits
+        // or restores this exact edge. Successful moves drop the token and
+        // remove the now-empty key; rollback reuses the original Vec.
+        let _old_edge_reservation = old_parent.reserve_mount_edge(&old_mountpoint, 0)?;
+
+        // Match Linux attach_recursive_mnt(MNT_TREE_MOVE): allocate group IDs
+        // and clone every propagation target while the source still occupies
+        // its old edge. Resource failure therefore cannot expose a transient
+        // move and needs no topology rollback.
+        let prepared_propagation = if target_parent.propagation().is_shared() {
+            Some(prepare_moved_tree_propagation_locked(
+                &target_parent,
+                source_mfs,
+                target_mountpoint,
+            )?)
+        } else {
+            None
+        };
+        // Shared destinations reserve this edge as part of propagation
+        // prepare. A private destination still needs the same guarantee:
+        // attaching the moved root after detaching its old edge must not be
+        // the first operation that tries to grow the target stack.
+        let _private_target_reservation = if prepared_propagation.is_none() {
+            Some(target_parent.reserve_mount_edge(target_mountpoint, 1)?)
+        } else {
+            None
+        };
+
+        if let Err(error) = old_parent.detach_exact_keep_slot(source_mfs) {
+            if let Some(prepared) = prepared_propagation {
+                abort_moved_tree_propagation_locked(prepared);
+            }
+            return Err(error);
+        }
         source_mfs.relocate_mountpoint(Some(target_mountpoint.clone()));
         if let Err(error) = target_parent.attach_new_top(target_mountpoint, source_mfs.clone()) {
             source_mfs.relocate_mountpoint(Some(old_mountpoint));
@@ -293,13 +328,14 @@ impl MntNamespace {
                     source_mfs.clone(),
                 )
                 .expect("move rollback must restore the exact detached edge");
+            if let Some(prepared) = prepared_propagation {
+                abort_moved_tree_propagation_locked(prepared);
+            }
             return Err(error);
         }
 
-        if target_parent.propagation().is_shared() {
-            if let Err(error) =
-                propagate_moved_tree_locked(&target_parent, source_mfs, target_mountpoint)
-            {
+        if let Some(prepared) = prepared_propagation {
+            if let Err(error) = commit_moved_tree_propagation_locked(prepared) {
                 target_parent
                     .detach_exact(source_mfs)
                     .expect("failed move propagation must detach the target edge");

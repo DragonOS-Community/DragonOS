@@ -3,11 +3,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef CLONE_NEWNS
@@ -135,6 +137,183 @@ bool mount_source_at(const char* mount_point, const char* expected_source) {
     return found;
 }
 
+struct PropagationTags {
+    int shared = -1;
+    int master = -1;
+    int propagate_from = -1;
+    bool unbindable = false;
+};
+
+bool parse_mountinfo_tags(char* line, const char* mount_point, PropagationTags* tags) {
+    char* save = nullptr;
+    char* token = strtok_r(line, " ", &save);
+    for (int field = 1; field <= 6; ++field) {
+        if (token == nullptr) {
+            return false;
+        }
+        if (field == 5 && strcmp(token, mount_point) != 0) {
+            return false;
+        }
+        token = strtok_r(nullptr, " ", &save);
+    }
+
+    *tags = {};
+    while (token != nullptr && strcmp(token, "-") != 0) {
+        if (sscanf(token, "shared:%d", &tags->shared) == 1 ||
+            sscanf(token, "master:%d", &tags->master) == 1 ||
+            sscanf(token, "propagate_from:%d", &tags->propagate_from) == 1) {
+            token = strtok_r(nullptr, " ", &save);
+            continue;
+        }
+        if (strcmp(token, "unbindable") == 0) {
+            tags->unbindable = true;
+        }
+        token = strtok_r(nullptr, " ", &save);
+    }
+    return token != nullptr;
+}
+
+bool read_propagation_snapshot(const char* const* mount_points, size_t count,
+                               PropagationTags* tags) {
+    FILE* fp = fopen("/proc/self/mountinfo", "r");
+    if (fp == nullptr) {
+        return false;
+    }
+
+    bool found[8] = {};
+    if (count > sizeof(found) / sizeof(found[0])) {
+        fclose(fp);
+        return false;
+    }
+    char line[2048] = {};
+    while (fgets(line, sizeof(line), fp) != nullptr) {
+        for (size_t i = 0; i < count; ++i) {
+            if (found[i]) {
+                continue;
+            }
+            char copy[sizeof(line)] = {};
+            const size_t line_len = strnlen(line, sizeof(copy) - 1);
+            memcpy(copy, line, line_len);
+            copy[line_len] = '\0';
+            if (parse_mountinfo_tags(copy, mount_points[i], &tags[i])) {
+                found[i] = true;
+            }
+        }
+    }
+    fclose(fp);
+    for (size_t i = 0; i < count; ++i) {
+        if (!found[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool snapshot_is_uniform(const PropagationTags* tags, size_t count) {
+    const bool shared = tags[0].shared > 0;
+    for (size_t i = 0; i < count; ++i) {
+        if ((tags[i].shared > 0) != shared || tags[i].master >= 0 ||
+            tags[i].propagate_from >= 0 || tags[i].unbindable) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool read_exact(int fd, void* buffer, size_t length) {
+    auto* bytes = static_cast<char*>(buffer);
+    size_t offset = 0;
+    while (offset < length) {
+        const ssize_t result = read(fd, bytes + offset, length - offset);
+        if (result > 0) {
+            offset += static_cast<size_t>(result);
+        } else if (result < 0 && errno == EINTR) {
+            continue;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool write_exact(int fd, const void* buffer, size_t length) {
+    const auto* bytes = static_cast<const char*>(buffer);
+    size_t offset = 0;
+    while (offset < length) {
+        const ssize_t result = write(fd, bytes + offset, length - offset);
+        if (result > 0) {
+            offset += static_cast<size_t>(result);
+        } else if (result < 0 && errno == EINTR) {
+            continue;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+void terminate_children(pid_t* children, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        if (children[i] > 0) {
+            kill(children[i], SIGKILL);
+        }
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (children[i] <= 0) {
+            continue;
+        }
+        while (waitpid(children[i], nullptr, 0) < 0 && errno == EINTR) {
+        }
+        children[i] = -1;
+    }
+}
+
+bool wait_children_until(pid_t* children, size_t count, int timeout_seconds) {
+    timespec deadline = {};
+    if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) {
+        terminate_children(children, count);
+        return false;
+    }
+    deadline.tv_sec += timeout_seconds;
+    size_t remaining = count;
+    bool ok = true;
+    while (remaining != 0) {
+        for (size_t i = 0; i < count; ++i) {
+            if (children[i] <= 0) {
+                continue;
+            }
+            int status = 0;
+            const pid_t result = waitpid(children[i], &status, WNOHANG);
+            if (result == children[i]) {
+                ok = ok && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+                children[i] = -1;
+                --remaining;
+            } else if (result < 0 && errno != EINTR) {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) {
+            break;
+        }
+        if (remaining == 0) {
+            break;
+        }
+        timespec now = {};
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
+            now.tv_sec > deadline.tv_sec ||
+            (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
+            ok = false;
+            break;
+        }
+        sched_yield();
+    }
+    if (remaining != 0 || !ok) {
+        terminate_children(children, count);
+    }
+    return ok && remaining == 0;
+}
+
 class MountPropagationTest : public ::testing::Test {
 protected:
     char root_[128] = {};
@@ -159,7 +338,8 @@ protected:
             "/target_a",           "/source",             "/master",       "/src",
             "/slave_a/local",      "/slave_b/local",      "/slave/local",  "/base/host",
             "/slave_a/host",       "/slave_b/host",       "/slave/host",   "/slave_b",
-            "/slave_a",            "/slave",              "/base",
+            "/slave_a",            "/slave",              "/base/child/grandchild",
+            "/base/child",         "/base/dynamic",       "/base",
         };
 
         for (const char* suffix : suffixes) {
@@ -719,6 +899,314 @@ TEST_F(MountPropagationTest, BindSharedSlaveIntoSharedTargetRegistersPropagatedC
     best_effort_rmdir(source);
     best_effort_umount(master);
     best_effort_rmdir(master);
+}
+
+TEST_F(MountPropagationTest, RecursiveTypeChangesMatchLinuxMountinfoSemantics) {
+    char base[160] = {};
+    char child[192] = {};
+    char grandchild[224] = {};
+    snprintf(base, sizeof(base), "%s/base", root_);
+    snprintf(child, sizeof(child), "%s/child", base);
+    snprintf(grandchild, sizeof(grandchild), "%s/grandchild", child);
+
+    ASSERT_EQ(0, ensure_dir(base)) << strerror(errno);
+    ASSERT_EQ(0, mount("", base, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(child)) << strerror(errno);
+    ASSERT_EQ(0, mount("", child, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(grandchild)) << strerror(errno);
+    ASSERT_EQ(0, mount("", grandchild, "ramfs", 0, nullptr)) << strerror(errno);
+
+    const char* paths[] = {base, child, grandchild};
+    PropagationTags tags[3] = {};
+
+    ASSERT_EQ(0, mount(nullptr, base, nullptr, MS_REC | MS_SHARED, nullptr)) << strerror(errno);
+    ASSERT_TRUE(read_propagation_snapshot(paths, 3, tags));
+    EXPECT_GT(tags[0].shared, 0);
+    EXPECT_GT(tags[1].shared, 0);
+    EXPECT_GT(tags[2].shared, 0);
+    EXPECT_NE(tags[0].shared, tags[1].shared);
+    EXPECT_NE(tags[0].shared, tags[2].shared);
+    EXPECT_NE(tags[1].shared, tags[2].shared);
+
+    // Linux do_make_slave() turns a singleton shared group with no existing
+    // master into private; MS_SLAVE does not manufacture a master relation.
+    ASSERT_EQ(0, mount(nullptr, base, nullptr, MS_REC | MS_SLAVE, nullptr)) << strerror(errno);
+    ASSERT_TRUE(read_propagation_snapshot(paths, 3, tags));
+    for (const auto& tag : tags) {
+        EXPECT_EQ(-1, tag.shared);
+        EXPECT_EQ(-1, tag.master);
+        EXPECT_FALSE(tag.unbindable);
+    }
+
+    ASSERT_EQ(0, mount(nullptr, base, nullptr, MS_REC | MS_UNBINDABLE, nullptr))
+        << strerror(errno);
+    ASSERT_TRUE(read_propagation_snapshot(paths, 3, tags));
+    for (const auto& tag : tags) {
+        EXPECT_EQ(-1, tag.shared);
+        EXPECT_EQ(-1, tag.master);
+        EXPECT_TRUE(tag.unbindable);
+    }
+
+    ASSERT_EQ(0, mount(nullptr, base, nullptr, MS_REC | MS_PRIVATE, nullptr)) << strerror(errno);
+    ASSERT_TRUE(read_propagation_snapshot(paths, 3, tags));
+    for (const auto& tag : tags) {
+        EXPECT_EQ(-1, tag.shared);
+        EXPECT_EQ(-1, tag.master);
+        EXPECT_EQ(-1, tag.propagate_from);
+        EXPECT_FALSE(tag.unbindable);
+    }
+}
+
+TEST_F(MountPropagationTest, RecursiveChangesAreAtomicAgainstSnapshotsAndNamespaceCopy) {
+    char base[160] = {};
+    char child[192] = {};
+    char grandchild[224] = {};
+    char dynamic[192] = {};
+    snprintf(base, sizeof(base), "%s/base", root_);
+    snprintf(child, sizeof(child), "%s/child", base);
+    snprintf(grandchild, sizeof(grandchild), "%s/grandchild", child);
+    snprintf(dynamic, sizeof(dynamic), "%s/dynamic", base);
+
+    ASSERT_EQ(0, ensure_dir(base)) << strerror(errno);
+    ASSERT_EQ(0, mount("", base, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(child)) << strerror(errno);
+    ASSERT_EQ(0, mount("", child, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(grandchild)) << strerror(errno);
+    ASSERT_EQ(0, mount("", grandchild, "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(dynamic)) << strerror(errno);
+
+    int start_pipe[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(start_pipe)) << strerror(errno);
+    int activity_pipe[2] = {-1, -1};
+    if (pipe(activity_pipe) != 0) {
+        const int error = errno;
+        close(start_pipe[0]);
+        close(start_pipe[1]);
+        FAIL() << "activity pipe: " << strerror(error);
+        return;
+    }
+    int ready_pipe[2] = {-1, -1};
+    int worker_activity_pipe[2] = {-1, -1};
+    int worker_done_pipe[2] = {-1, -1};
+    if (pipe(ready_pipe) != 0 || pipe(worker_activity_pipe) != 0 ||
+        pipe(worker_done_pipe) != 0) {
+        const int error = errno;
+        close(start_pipe[0]);
+        close(start_pipe[1]);
+        close(activity_pipe[0]);
+        close(activity_pipe[1]);
+        close(ready_pipe[0]);
+        close(ready_pipe[1]);
+        close(worker_activity_pipe[0]);
+        close(worker_activity_pipe[1]);
+        close(worker_done_pipe[0]);
+        close(worker_done_pipe[1]);
+        FAIL() << "worker coordination pipe: " << strerror(error);
+        return;
+    }
+    pid_t children[4] = {};
+    auto abort_workers = [&]() {
+        close(start_pipe[0]);
+        close(start_pipe[1]);
+        close(activity_pipe[0]);
+        close(activity_pipe[1]);
+        close(ready_pipe[0]);
+        close(ready_pipe[1]);
+        close(worker_activity_pipe[0]);
+        close(worker_activity_pipe[1]);
+        close(worker_done_pipe[0]);
+        close(worker_done_pipe[1]);
+        terminate_children(children, 4);
+    };
+
+    children[0] = fork();
+    if (children[0] < 0) {
+        const int error = errno;
+        abort_workers();
+        FAIL() << "fork toggler: " << strerror(error);
+        return;
+    }
+    if (children[0] == 0) {
+        close(start_pipe[1]);
+        close(activity_pipe[0]);
+        close(ready_pipe[1]);
+        close(worker_activity_pipe[0]);
+        close(worker_done_pipe[1]);
+        char token = 0;
+        if (!read_exact(start_pipe[0], &token, 1)) {
+            _exit(1);
+        }
+        char ready[3] = {};
+        if (!read_exact(ready_pipe[0], ready, sizeof(ready)) ||
+            !write_exact(activity_pipe[1], "A", 1)) {
+            _exit(2);
+        }
+        if (!read_exact(ready_pipe[0], &token, 1) ||
+            !write_exact(worker_activity_pipe[1], "AA", 2)) {
+            _exit(3);
+        }
+        for (int i = 0; i < 1024; ++i) {
+            const unsigned long type = (i & 1) == 0 ? MS_SHARED : MS_PRIVATE;
+            if (mount(nullptr, base, nullptr, MS_REC | type, nullptr) != 0) {
+                _exit(3);
+            }
+            if ((i & 15) == 15) {
+                sched_yield();
+            }
+        }
+        char done[2] = {};
+        if (!read_exact(worker_done_pipe[0], done, sizeof(done)) ||
+            !write_exact(activity_pipe[1], "D", 1)) {
+            _exit(4);
+        }
+        _exit(0);
+    }
+
+    children[1] = fork();
+    if (children[1] < 0) {
+        const int error = errno;
+        abort_workers();
+        FAIL() << "fork observer: " << strerror(error);
+        return;
+    }
+    if (children[1] == 0) {
+        close(start_pipe[1]);
+        close(activity_pipe[1]);
+        close(ready_pipe[0]);
+        close(worker_activity_pipe[0]);
+        close(worker_activity_pipe[1]);
+        close(worker_done_pipe[0]);
+        close(worker_done_pipe[1]);
+        char token = 0;
+        if (!read_exact(start_pipe[0], &token, 1) || !write_exact(ready_pipe[1], "R", 1)) {
+            _exit(5);
+        }
+        if (!read_exact(activity_pipe[0], &token, 1) || token != 'A') {
+            _exit(6);
+        }
+        const int flags = fcntl(activity_pipe[0], F_GETFL, 0);
+        if (flags < 0 || fcntl(activity_pipe[0], F_SETFL, flags | O_NONBLOCK) != 0) {
+            _exit(7);
+        }
+        if (!write_exact(ready_pipe[1], "O", 1)) {
+            _exit(8);
+        }
+        const char* paths[] = {base, child, grandchild};
+        int samples = 0;
+        bool saw_shared = false;
+        bool saw_private = false;
+        for (;;) {
+            const ssize_t status = read(activity_pipe[0], &token, 1);
+            if (status == 1 && token == 'D') {
+                break;
+            }
+            if (status == 0 || (status < 0 && errno != EAGAIN && errno != EINTR)) {
+                _exit(9);
+            }
+            PropagationTags tags[3] = {};
+            if (!read_propagation_snapshot(paths, 3, tags) || !snapshot_is_uniform(tags, 3)) {
+                _exit(10);
+            }
+            ++samples;
+            saw_shared = saw_shared || tags[0].shared > 0;
+            saw_private = saw_private || tags[0].shared < 0;
+        }
+        if (samples == 0 || !saw_shared || !saw_private) {
+            _exit(11);
+        }
+        _exit(0);
+    }
+
+    children[2] = fork();
+    if (children[2] < 0) {
+        const int error = errno;
+        abort_workers();
+        FAIL() << "fork namespace copier: " << strerror(error);
+        return;
+    }
+    if (children[2] == 0) {
+        close(start_pipe[1]);
+        close(activity_pipe[0]);
+        close(activity_pipe[1]);
+        close(ready_pipe[0]);
+        close(worker_activity_pipe[1]);
+        close(worker_done_pipe[0]);
+        char token = 0;
+        if (!read_exact(start_pipe[0], &token, 1) || !write_exact(ready_pipe[1], "R", 1) ||
+            !read_exact(worker_activity_pipe[0], &token, 1)) {
+            _exit(11);
+        }
+        if (unshare(CLONE_NEWNS) != 0) {
+            _exit(12);
+        }
+        const char* paths[] = {base, child, grandchild};
+        PropagationTags tags[3] = {};
+        if (!read_propagation_snapshot(paths, 3, tags) || !snapshot_is_uniform(tags, 3)) {
+            _exit(13);
+        }
+        if (!write_exact(worker_done_pipe[1], "D", 1)) {
+            _exit(14);
+        }
+        _exit(0);
+    }
+
+    children[3] = fork();
+    if (children[3] < 0) {
+        const int error = errno;
+        abort_workers();
+        FAIL() << "fork topology worker: " << strerror(error);
+        return;
+    }
+    if (children[3] == 0) {
+        close(start_pipe[1]);
+        close(activity_pipe[0]);
+        close(activity_pipe[1]);
+        close(ready_pipe[0]);
+        close(worker_activity_pipe[1]);
+        close(worker_done_pipe[0]);
+        char token = 0;
+        if (!read_exact(start_pipe[0], &token, 1) || !write_exact(ready_pipe[1], "R", 1) ||
+            !read_exact(worker_activity_pipe[0], &token, 1)) {
+            _exit(15);
+        }
+        for (int i = 0; i < 32; ++i) {
+            if (mount("", dynamic, "ramfs", 0, nullptr) != 0 || umount(dynamic) != 0) {
+                _exit(16);
+            }
+        }
+        if (!write_exact(worker_done_pipe[1], "D", 1)) {
+            _exit(17);
+        }
+        _exit(0);
+    }
+
+    close(start_pipe[0]);
+    close(activity_pipe[0]);
+    close(activity_pipe[1]);
+    close(ready_pipe[0]);
+    close(ready_pipe[1]);
+    close(worker_activity_pipe[0]);
+    close(worker_activity_pipe[1]);
+    close(worker_done_pipe[0]);
+    close(worker_done_pipe[1]);
+    if (!write_exact(start_pipe[1], "ssss", 4)) {
+        const int error = errno;
+        close(start_pipe[1]);
+        terminate_children(children, 4);
+        FAIL() << "release workers: " << strerror(error);
+        return;
+    }
+    close(start_pipe[1]);
+    EXPECT_TRUE(wait_children_until(children, 4, 20));
+
+    // Establish one canonical final state after the topology mutator stops;
+    // mounts raced into the tree are allowed to inherit an earlier state.
+    ASSERT_EQ(0, mount(nullptr, base, nullptr, MS_REC | MS_PRIVATE, nullptr)) << strerror(errno);
+    const char* paths[] = {base, child, grandchild};
+    PropagationTags tags[3] = {};
+    ASSERT_TRUE(read_propagation_snapshot(paths, 3, tags));
+    EXPECT_TRUE(snapshot_is_uniform(tags, 3));
+    EXPECT_EQ(-1, tags[0].shared);
 }
 
 int main(int argc, char** argv) {

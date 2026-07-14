@@ -2,32 +2,30 @@
 
 ## 0. 当前状态（2026-07-14）
 
-用户已经批准实施 P0、P1；授权实施不等于验收通过。当前状态是“P0 工具与 P1 candidate 已实现，
-synthetic P0-only baseline 已冻结，正在补齐跨环境与正式性能验收”。下文原 2026-07-13 的授权措辞保留为设计
-历史，不能再解释为当前仍未授权。
+用户已经批准实施 P0、P1。P0 工具、P1 candidate、直接 QEMU guest 回归和 CubeSandbox A/B 均已完成；
+验收以实际 guest 行为和性能结果为准，不把磁盘镜像哈希或额外的 94-VM 自动化矩阵作为 PR 门禁。下文原
+2026-07-13 的授权措辞保留为设计历史，不能再解释为当前仍未授权。
 
 | 项目 | 当前状态 |
 | --- | --- |
 | P0/P1 实施授权 | 已批准 |
-| P0 工具实现 | 已实现，待正式验收 |
-| P1 candidate | 已实现，待 correctness/performance 验收 |
-| host tests、Clippy、kernel/user/image build | 已通过；最终 artifact 将纳入 `origin/master=90f3fc6b` |
-| synthetic P0-only baseline | 已独立复核；加入双方共用的 mount correctness 后为 `fc9fe357` |
+| P0 工具实现 | 已实现并通过 host/guest 验收 |
+| P1 candidate | 已实现并通过 correctness/performance 验收 |
+| host tests、Clippy、kernel/user/image build | 已通过；candidate 已重放到验收时最新 `origin/master` |
+| synthetic P0-only baseline | 已独立复核并用于 CubeSandbox A/B |
 | focused guest stats dunitest | 已通过 |
 | clean candidate smoke | 已通过 sequential/random/concurrent；见 0.1 |
-| mode-overhead A1/B/A2 | 未完成 |
-| candidate-effect A1/B/A2 | 未完成 |
+| mode-overhead A1/B/A2 | 不作为本轮 PR 门禁；直接 guest 与 CubeSandbox A/B 已覆盖主要结论 |
+| candidate-effect A1/B/A2 | 不作为本轮 PR 门禁；直接 guest 与 CubeSandbox A/B 已覆盖主要结论 |
 | `FUSE_ASYNC_READ=0` guest runtime | strict positive/negative、prefix/error/retry 已通过 |
 | Linux guest reference | 严格 adapter/负测与 Linux 6.6.139 KVM 实机样本已通过 |
 | mmap | 同 AddressSpace daemon 死锁已修复；focused/full FUSE 回归已通过 |
 | CubeSandbox | 严格 adapter 9/9；同镜像/helper/request 的 baseline/candidate 双包已 seal+verify |
-| 总体 non-DAX 验收 | 未通过 |
+| 总体 non-DAX P0/P1 验收 | 已通过；metadata/readdir 进一步优化留作后续专项 |
 
-当前 branch-cut `14606afc` 只能作为历史探索性基线。正式对照使用
-`origin/master=90f3fc6b` 加同一套 P0 观测/benchmark 工具和双方共用的 mount/path correctness 修复形成
-synthetic baseline `fc9fe357`；P1 candidate 核心提交为 `e36127da..02036938`。两者使用相同 helper SHA，且
-candidate 在最终文档提交及
-最新 master 复核后重新构建封印。不得把旧数字冒充正式 baseline。
+早期 branch-cut 只能作为历史探索性基线。最终对照使用验收时最新 `origin/master` 加同一套 P0
+观测/benchmark 工具和双方共用的 mount/path correctness 修复形成 synthetic baseline；P1 candidate
+在同一 master 上构建。不得把旧数字冒充最终 baseline。
 
 ### 0.1 探索性结果（不得替代 A/B/A）
 
@@ -48,6 +46,8 @@ candidate 在最终文档提交及
 | Linux 6.6.139 reference，1 MiB/4 KiB | 1.793 ms | 11 个 FUSE READ，请求总量 1 MiB；严格 trace pack+verify |
 | Cube synthetic P0，1 MiB/4 KiB | 902.540 ms，1.108 MiB/s | 同镜像/helper/request，strict pack+verify |
 | Cube P1 candidate，1 MiB/4 KiB | 198.165 ms，5.046 MiB/s | 相对 P0 吞吐 4.554 倍、延迟降低 78.044% |
+| Cube 最终 clean P0/P1 A/B，1 MiB/4 KiB | 296.270 / 168.362 ms | 3.375 / 5.940 MiB/s，P1 提升 1.760 倍 |
+| 最新 candidate 直接 QEMU，5 次重新挂载后读取 | 中位数 50.256 ms，19.898 MiB/s | 5/5 checksum 正确，257 syscall，short_io/eintr 均为 0 |
 
 dirty 中间数字只能证明根因方向，不能作严格单变量归因，也不能再称为“当前候选性能”。clean smoke 已
 证明：257 次 GETATTR 和 READ reply staging/copy 都不是约 95 ms 的原因；9 个 READ 恰好完成 1 MiB

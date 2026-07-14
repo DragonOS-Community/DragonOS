@@ -42,12 +42,14 @@ for pair in "run-id:$run_id" "case-id:$case_id" "helper:$helper" \
   "file-size:$file_size" "block-size:$block_size" "output-dir:$output_dir"; do
   [ -n "${pair#*:}" ] || die "--${pair%%:*} is required"
 done
-printf '%s\n' "$run_id" "$case_id" | grep -Eq '^[A-Za-z0-9._-]+$' || \
+printf '%s\n' "$run_id" | grep -Eq '^[A-Za-z0-9._-]+$' && \
+  printf '%s\n' "$case_id" | grep -Eq '^[A-Za-z0-9._-]+$' || \
   die "run/case IDs must be safe tokens"
 printf '%s\n' "$dataset" | grep -Eq '^[A-Za-z0-9._-]+$' || \
   die "dataset must be one safe path component"
 [ "$dataset" != . ] && [ "$dataset" != .. ] || die "dataset must be one safe path component"
-printf '%s\n' "$file_size" "$block_size" | grep -Eq '^[1-9][0-9]*$' || \
+printf '%s\n' "$file_size" | grep -Eq '^[1-9][0-9]*$' && \
+  printf '%s\n' "$block_size" | grep -Eq '^[1-9][0-9]*$' || \
   die "file and block sizes must be positive decimal integers"
 printf '%s\n' "$helper_sha256" | grep -Eq '^[0-9a-f]{64}$' || die "helper SHA-256 is invalid"
 [ -x "$helper" ] && [ ! -L "$helper" ] || die "helper must be a non-symlink executable"

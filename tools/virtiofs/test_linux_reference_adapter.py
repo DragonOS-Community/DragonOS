@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 MODULE_PATH = Path(__file__).with_name("linux_reference_adapter.py")
+TRACE_SCRIPT = Path(__file__).with_name("linux_reference_trace.sh")
 SPEC = importlib.util.spec_from_file_location("linux_reference_adapter", MODULE_PATH)
 assert SPEC and SPEC.loader
 adapter = importlib.util.module_from_spec(SPEC)
@@ -59,6 +61,34 @@ class LinuxReferenceAdapterTest(unittest.TestCase):
             "bench-10 [000] .... 1.300000: read_sync: (0) args=2 opcode=15 read_size=8192\n"
             "sh-7 [000] .... 2.500000: tracing_mark_write: LINUX_REF_END run_id=run case_id=case helper_pid=10 rc=0\n")
         return capture
+
+    def trace_validation(self, **overrides: str) -> subprocess.CompletedProcess[str]:
+        values = {
+            "run_id": "run", "case_id": "case", "file_size": "4096",
+            "block_size": "4096",
+        }
+        values.update(overrides)
+        return subprocess.run([
+            str(TRACE_SCRIPT), "--run-id", values["run_id"],
+            "--case-id", values["case_id"], "--helper", "/missing-helper",
+            "--helper-sha256", "0" * 64, "--mount", "/mnt",
+            "--dataset", "data", "--file-size", values["file_size"],
+            "--block-size", values["block_size"], "--output-dir", "/output",
+        ], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+
+    def test_trace_rejects_each_invalid_identity(self) -> None:
+        for override in ({"run_id": "bad/id"}, {"case_id": "bad/id"}):
+            with self.subTest(override=override):
+                result = self.trace_validation(**override)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("run/case IDs must be safe tokens", result.stderr)
+
+    def test_trace_rejects_each_invalid_size(self) -> None:
+        for override in ({"file_size": "0"}, {"block_size": "0"}):
+            with self.subTest(override=override):
+                result = self.trace_validation(**override)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("sizes must be positive decimal integers", result.stderr)
 
     def test_transcript_and_trace_derive_metrics(self) -> None:
         metrics = adapter.parse_transcript(self.transcript(), "run", "data", 4, 4)

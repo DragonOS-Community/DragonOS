@@ -17,8 +17,27 @@ pub mod packet_option {
     pub const PACKET_RESERVE: usize = 12;
     pub const PACKET_VNET_HDR: usize = 15;
     pub const PACKET_TX_TIMESTAMP: usize = 16;
-    pub const PACKET_TIMESTAMP: usize = 17;
     pub const PACKET_QDISC_BYPASS: usize = 20;
+    pub const PACKET_FANOUT: usize = 18;
+    pub const PACKET_FANOUT_DATA: usize = 22;
+}
+#[allow(dead_code)]
+pub mod fanout_mode {
+    pub const PACKET_FANOUT_HASH: u32 = 0;
+    pub const PACKET_FANOUT_LB: u32 = 1;
+    pub const PACKET_FANOUT_CPU: u32 = 2;
+    pub const PACKET_FANOUT_ROLLOVER: u32 = 3;
+    pub const PACKET_FANOUT_RND: u32 = 4;
+    pub const PACKET_FANOUT_QM: u32 = 5;
+    pub const PACKET_FANOUT_CBPF: u32 = 6;
+    pub const PACKET_FANOUT_EBPF: u32 = 7;
+}
+#[allow(dead_code)]
+pub mod fanout_flag {
+    pub const PACKET_FANOUT_FLAG_ROLLOVER: u16 = 0x1000;
+    pub const PACKET_FANOUT_FLAG_UNIQUEID: u16 = 0x2000;
+    pub const PACKET_FANOUT_FLAG_IGNORE_OUTGOING: u16 = 0x4000;
+    pub const PACKET_FANOUT_FLAG_DEFRAG: u16 = 0x8000;
 }
 #[allow(dead_code)]
 pub mod packet_mreq_type {

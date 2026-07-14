@@ -1,6 +1,6 @@
 //! AF_PACKET sockets.
-
 mod binding;
+mod fanout;
 mod mreq;
 mod rx;
 mod sockopt;
@@ -28,9 +28,10 @@ use crate::rcu::RcuOptionArcSlot;
 
 #[allow(unused_imports)]
 pub use uapi::{
-    eth_protocol, packet_mreq_type, packet_option, PacketMreq, PacketType, SockAddrLl,
-    TpacketAuxdata,
+    eth_protocol, fanout_flag, fanout_mode, packet_mreq_type, packet_option, PacketMreq,
+    PacketType, SockAddrLl, TpacketAuxdata,
 };
+pub(crate) use fanout::{FanoutGroup, FanoutMode};
 
 const DEFAULT_RX_BUFFER_SIZE: usize = 256 * 1024;
 const DEFAULT_TX_BUFFER_SIZE: usize = 256 * 1024;
@@ -119,6 +120,9 @@ pub struct PacketSocket {
     pub(super) filter: RcuOptionArcSlot<Vec<SockFilter>>,
     /// Serializes SO_ATTACH_FILTER, SO_DETACH_FILTER, and SO_LOCK_FILTER.
     pub(super) filter_locked: Mutex<bool>,
+    /// Fanout group membership (`None` for a plain broadcast socket).
+    pub(super) fanout: RwSem<Option<Arc<FanoutGroup>>>,
+    pub(super) fanout_active: AtomicBool,
     epoll_items: EPollItems,
     fasync_items: FAsyncItems,
 }
@@ -158,6 +162,8 @@ impl PacketSocket {
             open_files: AtomicUsize::new(0),
             self_ref: me.clone(),
             netns,
+            fanout: RwSem::new(None),
+            fanout_active: AtomicBool::new(false),
             epoll_items: EPollItems::default(),
             filter: RcuOptionArcSlot::new_none(),
             filter_locked: Mutex::new(false),

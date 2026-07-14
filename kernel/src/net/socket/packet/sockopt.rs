@@ -51,6 +51,11 @@ impl PacketSocket {
                     value,
                     self.options.read().auxdata as i32,
                 )),
+                packet_option::PACKET_FANOUT => {
+                    // Linux packet_getsockopt: an unjoined socket reports 0.
+                    let val = self.fanout_getsockopt_value().unwrap_or(0) as i32;
+                    Ok(write_i32_getsockopt(value, val))
+                }
                 _ => Err(SystemError::ENOPROTOOPT),
             },
             _ => Err(SystemError::ENOPROTOOPT),
@@ -71,6 +76,7 @@ impl PacketSocket {
                     self.options.write().auxdata = Self::parse_i32(value)? != 0;
                     Ok(())
                 }
+                packet_option::PACKET_FANOUT => self.join_fanout(Self::parse_i32(value)?),
                 _ => Ok(()),
             },
             // Preserve backward compatibility: unknown levels are silently accepted.

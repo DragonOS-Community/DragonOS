@@ -80,6 +80,9 @@ impl PacketSocket {
         let _guard = self.bind_lock.lock();
         self.revert_all_memberships();
         self.netns.unregister_packet_socket(&self.self_ref);
+        // Drop fanout membership after leaving the broadcast registry so the
+        // socket never receives both a broadcast and a group delivery.
+        self.leave_fanout();
         *self.bound_iface.write() = None;
         self.binding.store(0, 0);
         Ok(())

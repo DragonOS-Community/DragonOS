@@ -9,7 +9,7 @@ use crate::net::routing::Router;
 use crate::net::socket::netlink::table::{
     generate_supported_netlink_kernel_sockets, NetlinkKernelSocket, NetlinkSocketTable,
 };
-use crate::net::socket::packet::{PacketIngressMetadata, PacketSocket};
+use crate::net::socket::packet::{FanoutGroup, FanoutMode, PacketIngressMetadata, PacketSocket};
 use crate::net::socket::unix::ns::UnixAbstractTable;
 use crate::process::fork::CloneFlags;
 use crate::process::kthread::{KernelThreadClosure, KernelThreadMechanism};
@@ -31,6 +31,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use hashbrown::HashMap;
+use ida::IdAllocator;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -84,6 +85,11 @@ pub struct NetNamespace {
     /// Serializes copy-on-write registry updates in process context.
     packet_sockets_writer: Mutex<()>,
     packet_sockets_need_cleanup: AtomicBool,
+    /// Lock-free read-side snapshot of AF_PACKET fanout groups for delivery.
+    fanout_groups: RcuArcSlot<FanoutGroupRegistry>,
+    /// Serializes fanout group registry updates and protects the id allocator.
+    fanout_groups_writer: Mutex<FanoutGroupWriter>,
+    fanout_groups_need_cleanup: AtomicBool,
     ///当前网络命名空间下的桥接设备列表
     bridge_list: RwSem<BTreeMap<String, Arc<BridgeDriver>>>,
 
@@ -108,6 +114,31 @@ pub struct NetNamespace {
 #[derive(Debug, Default)]
 struct PacketSocketRegistrySnapshot {
     sockets: Vec<Weak<PacketSocket>>,
+}
+
+#[derive(Debug, Default)]
+struct FanoutGroupRegistry {
+    groups: Vec<Arc<FanoutGroup>>,
+}
+
+#[derive(Debug)]
+struct FanoutGroupWriter {
+    /// Authoritative `group id -> group` index used by the write path.
+    by_id: BTreeMap<u16, Arc<FanoutGroup>>,
+    /// Group id allocator. Reserves both UNIQUEID-allocated ids and explicit
+    /// ids so the two namespaces can never collide.
+    id_alloc: IdAllocator,
+}
+
+impl FanoutGroupWriter {
+    fn new() -> Self {
+        // Group ids occupy the full u16 range; 0 is a valid explicit id.
+        Self {
+            by_id: BTreeMap::new(),
+            id_alloc: IdAllocator::new(0, u16::MAX as usize + 1)
+                .expect("fanout group id allocator"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -204,6 +235,7 @@ impl NetnsPoller {
 
             let nsid = netns.ns_common.nsid.data();
             netns.cleanup_packet_sockets();
+            netns.cleanup_fanout_groups();
             let now_us = Instant::now().total_micros() as u64;
 
             // 处理“已到期的定时事件”：到期则 schedule NAPI 推进一次。
@@ -315,6 +347,9 @@ impl NetNamespace {
             packet_sockets: RcuArcSlot::new(Arc::new(PacketSocketRegistrySnapshot::default())),
             packet_sockets_writer: Mutex::new(()),
             packet_sockets_need_cleanup: AtomicBool::new(false),
+            fanout_groups: RcuArcSlot::new(Arc::new(FanoutGroupRegistry::default())),
+            fanout_groups_writer: Mutex::new(FanoutGroupWriter::new()),
+            fanout_groups_need_cleanup: AtomicBool::new(false),
             bridge_list: RwSem::new(BTreeMap::new()),
             netlink_socket_table: NetlinkSocketTable::default(),
             netlink_kernel_socket: RwSem::new(generate_supported_netlink_kernel_sockets()),
@@ -354,6 +389,9 @@ impl NetNamespace {
             packet_sockets: RcuArcSlot::new(Arc::new(PacketSocketRegistrySnapshot::default())),
             packet_sockets_writer: Mutex::new(()),
             packet_sockets_need_cleanup: AtomicBool::new(false),
+            fanout_groups: RcuArcSlot::new(Arc::new(FanoutGroupRegistry::default())),
+            fanout_groups_writer: Mutex::new(FanoutGroupWriter::new()),
+            fanout_groups_need_cleanup: AtomicBool::new(false),
             bridge_list: RwSem::new(BTreeMap::new()),
             netlink_socket_table: NetlinkSocketTable::default(),
             netlink_kernel_socket: RwSem::new(generate_supported_netlink_kernel_sockets()),
@@ -440,11 +478,20 @@ impl NetNamespace {
 
     /// Deliver an ingress frame without taking a sleeping lock or allocating a
     /// temporary registry copy in the NAPI read-side path.
+    ///
+    /// Plain (non-fanout) sockets each receive a copy as before; fanout group
+    /// members are skipped here and receive exactly one shared copy via their
+    /// group's distribution algorithm below.
     pub(crate) fn deliver_to_packet_sockets(&self, ingress: PacketIngressMetadata, frame: &[u8]) {
         let snapshot = self.packet_sockets.load();
         let mut stale = false;
         for socket in snapshot.sockets.iter() {
             if let Some(socket) = socket.upgrade() {
+                // Fanout members are delivered through their group below; skip
+                // them here so each frame is handed to a group exactly once.
+                if socket.is_fanout_member() {
+                    continue;
+                }
                 socket.deliver(ingress, frame);
             } else {
                 stale = true;
@@ -452,6 +499,19 @@ impl NetNamespace {
         }
         if stale {
             self.packet_sockets_need_cleanup
+                .store(true, Ordering::Release);
+        }
+
+        // Each fanout group receives a single copy and demuxes it internally.
+        let groups = self.fanout_groups.load();
+        let mut group_stale = false;
+        for group in groups.groups.iter() {
+            if group.deliver(ingress, frame) {
+                group_stale = true;
+            }
+        }
+        if group_stale {
+            self.fanout_groups_need_cleanup
                 .store(true, Ordering::Release);
         }
     }
@@ -462,6 +522,134 @@ impl NetNamespace {
             .sockets
             .iter()
             .any(|socket| socket.strong_count() != 0)
+    }
+
+    /// Join (creating if necessary) a fanout group.
+    ///
+    /// All registry mutation — id allocation, consistency check, member
+    /// publication, the socket's `fanout` field update, and the registry Vec
+    /// rebuild — happens atomically under `fanout_groups_writer`, matching the
+    /// broadcast registry's COW pattern and closing the join/leave TOCTOU.
+    pub(crate) fn fanout_group_join(
+        &self,
+        socket: &Arc<PacketSocket>,
+        id_req: u16,
+        unique: bool,
+        mode: FanoutMode,
+        flags: u16,
+        sock_type: crate::net::socket::packet::PacketSocketType,
+        bound_ifindex: u32,
+        bound_protocol: u16,
+    ) -> Result<(), SystemError> {
+
+        let mut writer = self.fanout_groups_writer.lock();
+        let group: Arc<FanoutGroup> = if unique {
+            // UNIQUEID always creates a fresh group with a kernel-assigned id;
+            // it cannot attach to an existing group.
+            let new_id = writer.id_alloc.alloc().ok_or(SystemError::ENOMEM)? as u16;
+            let group = FanoutGroup::new(
+                new_id,
+                mode,
+                flags,
+                sock_type,
+                bound_ifindex,
+                bound_protocol,
+            );
+            writer.by_id.insert(new_id, group.clone());
+            group
+        } else {
+            match writer.by_id.get(&id_req).cloned() {
+                Some(existing) => {
+                    if existing.mode != mode
+                        || existing.flags != flags
+                        || !existing.matches(sock_type, bound_ifindex, bound_protocol)
+                    {
+                        return Err(SystemError::EINVAL);
+                    }
+                    existing
+                }
+                None => {
+                    // Reserve the explicit id in the allocator so a later
+                    // UNIQUEID allocation cannot collide with it.
+                    if writer
+                        .id_alloc
+                        .alloc_specific(id_req as usize)
+                        .is_none()
+                    {
+                        return Err(SystemError::EINVAL);
+                    }
+                    let group = FanoutGroup::new(
+                        id_req,
+                        mode,
+                        flags,
+                        sock_type,
+                        bound_ifindex,
+                        bound_protocol,
+                    );
+                    writer.by_id.insert(id_req, group.clone());
+                    group
+                }
+            }
+        };
+
+        // Publish the new member list first, then set the socket's field, so a
+        // concurrent deliver that already sees the member also skips it in the
+        group.add_member(socket.self_ref().clone());
+        socket.set_fanout_group(group.clone());
+
+        let groups: Vec<Arc<FanoutGroup>> = writer.by_id.values().cloned().collect();
+        self.fanout_groups
+            .store_deferred(Arc::new(FanoutGroupRegistry { groups }));
+        self.fanout_groups_need_cleanup
+            .store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Remove `socket` from its fanout group, tearing the group down if it
+    /// becomes empty. The empty-check and `by_id`/id-allocator removal run
+    /// together under `fanout_groups_writer` so a concurrent join cannot
+    /// resurrect a zombie group.
+    pub(crate) fn fanout_group_leave(
+        &self,
+        group: &Arc<FanoutGroup>,
+        socket: &Weak<PacketSocket>,
+    ) {
+        let mut writer = self.fanout_groups_writer.lock();
+        group.remove_member(socket);
+        if group.live_count() == 0 {
+            writer.by_id.remove(&group.id);
+            writer.id_alloc.free(group.id as usize);
+            let groups: Vec<Arc<FanoutGroup>> = writer.by_id.values().cloned().collect();
+            self.fanout_groups
+                .store_deferred(Arc::new(FanoutGroupRegistry { groups }));
+        }
+        self.fanout_groups_need_cleanup
+            .store(false, Ordering::Release);
+    }
+
+    fn cleanup_fanout_groups(&self) {
+        if !self
+            .fanout_groups_need_cleanup
+            .swap(false, Ordering::AcqRel)
+        {
+            return;
+        }
+        let mut writer = self.fanout_groups_writer.lock();
+        let dead: Vec<u16> = writer
+            .by_id
+            .iter()
+            .filter(|(_, g)| g.live_count() == 0)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &dead {
+            writer.by_id.remove(id);
+            writer.id_alloc.free(*id as usize);
+        }
+        if !dead.is_empty() {
+            let groups: Vec<Arc<FanoutGroup>> = writer.by_id.values().cloned().collect();
+            self.fanout_groups
+                .store_deferred(Arc::new(FanoutGroupRegistry { groups }));
+        }
     }
 
     #[inline]

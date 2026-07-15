@@ -21,6 +21,10 @@ const EBDA_PTR_ADDR: usize = 0x40E;
 const BIOS_AREA_START: usize = 0xE0000;
 /// Size of the BIOS read-only memory region (0xE0000 - 0xFFFFF).
 const BIOS_AREA_SIZE: usize = 0x20000;
+/// Default EBDA scan window: the first 1 KiB of the EBDA.
+const EBDA_WINDOW_SIZE: usize = 1024;
+/// End of conventional low memory; the VGA/ISA reserved region begins here.
+const LOW_MEMORY_END: usize = 0xA0000;
 
 /// Validate an RSDP structure at the given virtual address.
 ///
@@ -101,13 +105,16 @@ pub fn find_rsdp_in_bios() -> Option<PhysAddr> {
         let _ = EarlyIoRemap::unmap(ptr_virt);
 
         let ebda_phys = ebda_segment << 4;
-        if ebda_phys > 0x400 && ebda_phys < 0xA0000 {
+        if ebda_phys > 0x400 && ebda_phys < LOW_MEMORY_END {
+            // The EBDA is not guaranteed to be 1 KiB large. If it starts less
+            // than 1 KiB below LOW_MEMORY_END, clamp the window so the scan does
+            // not cross into the VGA/ISA reserved region (ACPICA does the same).
+            let window = core::cmp::min(EBDA_WINDOW_SIZE, LOW_MEMORY_END - ebda_phys);
             if let Ok(ebda_virt) =
-                // first 1kb of EBDA
-                EarlyIoRemap::map_not_aligned(PhysAddr::new(ebda_phys), 1024, true)
+                EarlyIoRemap::map_not_aligned(PhysAddr::new(ebda_phys), window, true)
             {
                 // scan rsdp
-                let result = scan_rsdp_in_buf(ebda_virt.data(), ebda_phys, 1024);
+                let result = scan_rsdp_in_buf(ebda_virt.data(), ebda_phys, window);
                 let _ = EarlyIoRemap::unmap(ebda_virt);
                 if result.is_some() {
                     return result;

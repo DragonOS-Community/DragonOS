@@ -402,7 +402,7 @@ TEST(AfPacketSockopt, AttachFilterAcceptsValidProgram) {
     FdGuard fd(MakeRawFd());
     ASSERT_GE(fd.Get(), 0);
     TestSockFilter accept_all{0x06, 0, 0, 0xffffffff};
-    TestSockFProg program{1, &accept_all};
+    TestSockFprog program{1, &accept_all};
     errno = 0;
     EXPECT_EQ(setsockopt(fd.Get(), SOL_SOCKET, kSoAttachFilter, &program, sizeof(program)), 0)
         << ErrnoString(errno);

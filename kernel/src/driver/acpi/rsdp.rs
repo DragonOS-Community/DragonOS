@@ -51,11 +51,14 @@ fn rsdp_valid(ptr: *const u8, available_len: usize) -> bool {
         let length =
             unsafe { u32::from_le_bytes([*ptr.add(20), *ptr.add(21), *ptr.add(22), *ptr.add(23)]) }
                 as usize;
-        if length >= 36 && length <= available_len {
-            let full = unsafe { core::slice::from_raw_parts(ptr, length) };
-            if full.iter().fold(0u8, |acc, &b| acc.wrapping_add(b)) != 0 {
-                return false;
-            }
+        // reject candidates whose extended checksum cannot be fully validated:
+        // a corrupted/out-of-range length must not pass as a valid RSDP.
+        if length < 36 || length > available_len {
+            return false;
+        }
+        let full = unsafe { core::slice::from_raw_parts(ptr, length) };
+        if full.iter().fold(0u8, |acc, &b| acc.wrapping_add(b)) != 0 {
+            return false;
         }
     }
     true

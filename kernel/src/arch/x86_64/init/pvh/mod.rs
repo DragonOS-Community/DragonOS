@@ -24,6 +24,14 @@ mod param;
 
 static START_INFO: Lazy<HvmStartInfo> = Lazy::new();
 
+/// RSDP physical address discovered during early init (before mm_init).
+///
+/// Like Linux, the BIOS-area RSDP scan runs in the early boot stage while the
+/// bootstrap page table is still active and `EarlyIoRemap` may be used. The
+/// result is cached here and consumed later by `init_acpi_args`, which runs
+/// after mm_init and must not touch `EarlyIoRemap`.
+static EARLY_RSDP_PADDR: Lazy<Option<PhysAddr>> = Lazy::new();
+
 struct PvhBootCallback;
 
 impl BootCallbacks for PvhBootCallback {
@@ -46,8 +54,9 @@ impl BootCallbacks for PvhBootCallback {
             return Ok(BootloaderAcpiArg::Rsdp(rsdp_paddr));
         }
 
-        log::info!("pvh: rsdp_paddr not provided, scanning BIOS area for RSDP");
-        if let Some(paddr) = find_rsdp_in_bios() {
+        // rsdp_paddr not provided by the bootloader: use the address discovered
+        // during the early BIOS-area scan (see EARLY_RSDP_PADDR / early_init_memory_blocks).
+        if let Some(paddr) = EARLY_RSDP_PADDR.try_get().copied().flatten() {
             log::info!("pvh: found RSDP at {:#x}", paddr.data());
             return Ok(BootloaderAcpiArg::Rsdp(paddr));
         }
@@ -138,6 +147,19 @@ impl BootCallbacks for PvhBootCallback {
             total_mem_size,
             usable_mem_size
         );
+
+        // Discover the RSDP here, in the early boot stage: the bootstrap page
+        // table is still active and mm_init has not run yet, so EarlyIoRemap may
+        // be used safely (this mirrors Linux, which scans the RSDP in setup_arch
+        // via early_memremap). If the bootloader already provided rsdp_paddr we
+        // skip the scan. The result is cached for init_acpi_args.
+        let early_rsdp = if start_info.rsdp_paddr != 0 {
+            None
+        } else {
+            find_rsdp_in_bios()
+        };
+        EARLY_RSDP_PADDR.init(early_rsdp);
+
         Ok(())
     }
 

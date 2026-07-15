@@ -171,7 +171,9 @@ protected:
         // A detached namespace is discarded when the test process exits, but
         // clean all paths because later cases clone this process's namespace.
         const char* mount_suffixes[] = {
-            "/dest/visible", "/dest/b/c", "/dest/c", "/dest",
+            "/dest/skipped/nested", "/dest/skipped", "/dest/visible",
+            "/dest/b/c", "/dest/c", "/dest",
+            "/source/skipped/nested", "/source/skipped", "/source/visible",
             "/source/selected/visible", "/source/selected/locked",
             "/source/outside", "/source/b/c", "/source/a/c",
             "/source/ab/c", "/source", "/alias_a", "/stack/proc",
@@ -184,6 +186,8 @@ protected:
         const char* files[] = {
             "/source_file", "/alias_a", "/alias_b", "/source/b/c/marker",
             "/source/a/c/a_marker", "/source/ab/c/ab_marker",
+            "/source/skipped/skipped_marker", "/source/skipped/nested/nested_marker",
+            "/source/visible/visible_marker",
             "/source/selected/visible/marker",
         };
         for (const char* suffix : files) {
@@ -191,7 +195,9 @@ protected:
         }
 
         const char* dirs[] = {
-            "/dest/visible", "/dest/b/c", "/dest/b", "/dest/c", "/dest",
+            "/dest/skipped/nested", "/dest/skipped", "/dest/visible",
+            "/dest/b/c", "/dest/b", "/dest/c", "/dest",
+            "/source/skipped/nested", "/source/skipped", "/source/visible",
             "/source/selected/visible", "/source/selected/locked",
             "/source/selected", "/source/outside", "/source/a/b/c",
             "/source/a/b", "/source/a/c", "/source/ab/c", "/source/b/c",
@@ -272,6 +278,45 @@ TEST_F(MountObjectTopologyTest, RecursiveBindFiltersSimilarPrefixSibling) {
     EXPECT_EQ("a", read_file(dest + "/c/a_marker"));
     EXPECT_FALSE(path_exists(dest + "/b/c/ab_marker"));
     EXPECT_FALSE(has_mountpoint(read_mountinfo(), dest + "/b/c"));
+}
+
+TEST_F(MountObjectTopologyTest, RecursiveBindSkipsUnlockedUnbindableSubtree) {
+    const std::string source = base_ + "/source";
+    const std::string skipped = source + "/skipped";
+    const std::string nested = skipped + "/nested";
+    const std::string visible = source + "/visible";
+    const std::string dest = base_ + "/dest";
+    const std::string dest_skipped = dest + "/skipped";
+    const std::string dest_nested = dest_skipped + "/nested";
+    const std::string dest_visible = dest + "/visible";
+
+    ASSERT_EQ(0, ensure_dir(source)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(dest)) << strerror(errno);
+    ASSERT_EQ(0, mount("none", source.c_str(), "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(skipped)) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(visible)) << strerror(errno);
+
+    ASSERT_EQ(0, mount("none", skipped.c_str(), "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, create_file(skipped + "/skipped_marker", "skip")) << strerror(errno);
+    ASSERT_EQ(0, ensure_dir(nested)) << strerror(errno);
+    ASSERT_EQ(0, mount("none", nested.c_str(), "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, create_file(nested + "/nested_marker", "nested")) << strerror(errno);
+
+    ASSERT_EQ(0, mount("none", visible.c_str(), "ramfs", 0, nullptr)) << strerror(errno);
+    ASSERT_EQ(0, create_file(visible + "/visible_marker", "visible")) << strerror(errno);
+    ASSERT_EQ(0, mount(nullptr, skipped.c_str(), nullptr, MS_UNBINDABLE, nullptr))
+        << strerror(errno);
+
+    ASSERT_EQ(0, mount(source.c_str(), dest.c_str(), nullptr, MS_BIND | MS_REC, nullptr))
+        << strerror(errno);
+
+    const auto entries = read_mountinfo();
+    EXPECT_FALSE(has_mountpoint(entries, dest_skipped));
+    EXPECT_FALSE(has_mountpoint(entries, dest_nested));
+    EXPECT_FALSE(path_exists(dest_skipped + "/skipped_marker"));
+    EXPECT_FALSE(path_exists(dest_nested + "/nested_marker"));
+    EXPECT_TRUE(has_mountpoint(entries, dest_visible));
+    EXPECT_EQ("visible", read_file(dest_visible + "/visible_marker"));
 }
 
 TEST_F(MountObjectTopologyTest, RecursiveBindRejectsLockedUnbindableMountInView) {

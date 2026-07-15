@@ -2798,7 +2798,7 @@ impl MountFSInode {
         super_block_state: Option<Arc<SuperBlockState>>,
         bind_source: Option<&Arc<MountFS>>,
     ) -> Result<Arc<MountFS>, SystemError> {
-        // Linux do_add_mount: the parent mount point must belong to the current mount namespace.
+        // Preserve do_add_mount validation order before invoking a filesystem.
         let current_mntns = ProcessManager::current_mntns();
         if !self.mount_fs.is_belongs_to_mntns(&current_mntns) {
             return Err(SystemError::EINVAL);
@@ -2810,6 +2810,38 @@ impl MountFSInode {
         let root_is_dir = root_metadata.file_type == FileType::Dir;
         if is_dir != root_is_dir {
             return Err(SystemError::ENOTDIR);
+        }
+
+        self.prepare_subtree_with_root_dentry_prevalidated(
+            inner_fs,
+            root_inner_inode,
+            root_dentry,
+            mount_flags,
+            super_block_state,
+            bind_source,
+        )
+    }
+
+    /// Prepare a detached mount after the caller has validated that the source
+    /// root and destination mountpoint have compatible, immutable inode types.
+    ///
+    /// Unlike [`Self::prepare_subtree_with_root_dentry`], this entry point does
+    /// not call into the underlying filesystem. It is suitable for bind-mount
+    /// topology snapshot sections, where a FUSE `metadata()` request could
+    /// otherwise wait on a daemon that needs the dentry topology write lock.
+    pub(crate) fn prepare_subtree_with_root_dentry_prevalidated(
+        &self,
+        inner_fs: Arc<dyn FileSystem>,
+        root_inner_inode: Arc<dyn IndexNode>,
+        root_dentry: Option<Arc<VfsDentry>>,
+        mount_flags: MountFlags,
+        super_block_state: Option<Arc<SuperBlockState>>,
+        bind_source: Option<&Arc<MountFS>>,
+    ) -> Result<Arc<MountFS>, SystemError> {
+        // Linux do_add_mount: the parent mount point must belong to the current mount namespace.
+        let current_mntns = ProcessManager::current_mntns();
+        if !self.mount_fs.is_belongs_to_mntns(&current_mntns) {
+            return Err(SystemError::EINVAL);
         }
 
         // Keep detached construction private. The destination parent's shared

@@ -1,5 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <sched.h>
+#include <sys/wait.h>
+
 #include "fuse_gtest_common.h"
 
 static int core_test_nonblock_read_empty() {
@@ -547,6 +550,145 @@ static int core_test_lifecycle_forget_destroy() {
     return 0;
 }
 
+static int core_test_recursive_bind_cross_fs_mountpoint_collision() {
+    const char *base = "/tmp/test_fuse_recursive_bind_collision";
+    const char *source = "/tmp/test_fuse_recursive_bind_collision/source";
+    const char *source_a = "/tmp/test_fuse_recursive_bind_collision/source/a";
+    const char *source_b = "/tmp/test_fuse_recursive_bind_collision/source/b";
+    const char *source_a_file = "/tmp/test_fuse_recursive_bind_collision/source/a/hello.txt";
+    const char *source_b_file = "/tmp/test_fuse_recursive_bind_collision/source/b/hello.txt";
+    const char *dest = "/tmp/test_fuse_recursive_bind_collision/dest";
+    const char *dest_a = "/tmp/test_fuse_recursive_bind_collision/dest/a";
+    const char *dest_b = "/tmp/test_fuse_recursive_bind_collision/dest/b";
+    const char *dest_a_file = "/tmp/test_fuse_recursive_bind_collision/dest/a/hello.txt";
+    const char *dest_b_file = "/tmp/test_fuse_recursive_bind_collision/dest/b/hello.txt";
+    const char *payload_a = "/tmp/test_fuse_recursive_bind_collision/payload_a";
+    const char *payload_b = "/tmp/test_fuse_recursive_bind_collision/payload_b";
+    int fds[2] = {-1, -1};
+    volatile int stops[2] = {0, 0};
+    volatile int init_done[2] = {0, 0};
+    struct fuse_daemon_args args[2];
+    pthread_t threads[2] = {};
+    bool thread_started[2] = {false, false};
+    bool passed = false;
+
+    memset(args, 0, sizeof(args));
+    do {
+        if (unshare(CLONE_NEWNS) != 0 ||
+            mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) {
+            printf("[FAIL] isolate mount namespace: %s (errno=%d)\n", strerror(errno), errno);
+            break;
+        }
+        if (ensure_dir(base) != 0 || ensure_dir(source) != 0 || ensure_dir(dest) != 0 ||
+            mount("none", source, "ramfs", 0, nullptr) != 0 || ensure_dir(source_a) != 0 ||
+            ensure_dir(source_b) != 0 || fuseg_write_file(payload_a, "A") != 0 ||
+            fuseg_write_file(payload_b, "B") != 0) {
+            printf("[FAIL] prepare collision topology: %s (errno=%d)\n", strerror(errno), errno);
+            break;
+        }
+
+        for (int i = 0; i < 2; ++i) {
+            fds[i] = open("/dev/fuse", O_RDWR);
+            if (fds[i] < 0) {
+                printf("[FAIL] open(/dev/fuse)[%d]: %s (errno=%d)\n", i, strerror(errno), errno);
+                break;
+            }
+            args[i].fd = fds[i];
+            args[i].stop = &stops[i];
+            args[i].init_done = &init_done[i];
+            if (pthread_create(&threads[i], nullptr, fuse_daemon_thread, &args[i]) != 0) {
+                printf("[FAIL] pthread_create[%d]\n", i);
+                break;
+            }
+            thread_started[i] = true;
+        }
+        if (!thread_started[0] || !thread_started[1]) {
+            break;
+        }
+
+        char opts_a[256];
+        char opts_b[256];
+        snprintf(opts_a, sizeof(opts_a), "fd=%d,rootmode=040755,user_id=0,group_id=0", fds[0]);
+        snprintf(opts_b, sizeof(opts_b), "fd=%d,rootmode=040755,user_id=0,group_id=0", fds[1]);
+        if (mount("none", source_a, "fuse", 0, opts_a) != 0 ||
+            mount("none", source_b, "fuse", 0, opts_b) != 0 ||
+            fuseg_wait_init(&init_done[0]) != 0 || fuseg_wait_init(&init_done[1]) != 0) {
+            printf("[FAIL] mount/init FUSE pair: %s (errno=%d)\n", strerror(errno), errno);
+            break;
+        }
+
+        struct stat fuse_a = {};
+        struct stat fuse_b = {};
+        if (stat(source_a_file, &fuse_a) != 0 || stat(source_b_file, &fuse_b) != 0 ||
+            fuse_a.st_ino != fuse_b.st_ino || fuse_a.st_ino != 2 || fuse_a.st_dev == fuse_b.st_dev) {
+            printf("[FAIL] expected cross-filesystem FUSE mountpoint collision: "
+                   "a=(dev=%llu,ino=%llu) b=(dev=%llu,ino=%llu) errno=%d\n",
+                   (unsigned long long)fuse_a.st_dev, (unsigned long long)fuse_a.st_ino,
+                   (unsigned long long)fuse_b.st_dev, (unsigned long long)fuse_b.st_ino, errno);
+            break;
+        }
+
+        if (mount(payload_a, source_a_file, nullptr, MS_BIND, nullptr) != 0 ||
+            mount(payload_b, source_b_file, nullptr, MS_BIND, nullptr) != 0 ||
+            mount(source, dest, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
+            printf("[FAIL] construct/clone nested collision edges: %s (errno=%d)\n",
+                   strerror(errno), errno);
+            break;
+        }
+
+        char content_a[8] = {};
+        char content_b[8] = {};
+        struct stat source_nested_a = {};
+        struct stat source_nested_b = {};
+        struct stat dest_nested_a = {};
+        struct stat dest_nested_b = {};
+        const int len_a = fuseg_read_file(dest_a_file, content_a, sizeof(content_a));
+        const int len_b = fuseg_read_file(dest_b_file, content_b, sizeof(content_b));
+        if (len_a != 1 || len_b != 1 || content_a[0] != 'A' || content_b[0] != 'B' ||
+            stat(source_a_file, &source_nested_a) != 0 ||
+            stat(source_b_file, &source_nested_b) != 0 || stat(dest_a_file, &dest_nested_a) != 0 ||
+            stat(dest_b_file, &dest_nested_b) != 0 ||
+            source_nested_a.st_dev != dest_nested_a.st_dev ||
+            source_nested_a.st_ino != dest_nested_a.st_ino ||
+            source_nested_b.st_dev != dest_nested_b.st_dev ||
+            source_nested_b.st_ino != dest_nested_b.st_ino ||
+            source_nested_a.st_ino == source_nested_b.st_ino) {
+            printf("[FAIL] recursive bind lost or swapped colliding nested edges\n");
+            break;
+        }
+        passed = true;
+    } while (false);
+
+    // Drop every clone before its source FUSE connection. MNT_DETACH keeps
+    // cleanup bounded even when the assertion path stopped mid-construction.
+    umount2(dest_a_file, MNT_DETACH);
+    umount2(dest_b_file, MNT_DETACH);
+    umount2(dest_a, MNT_DETACH);
+    umount2(dest_b, MNT_DETACH);
+    umount2(dest, MNT_DETACH);
+    umount2(source_a_file, MNT_DETACH);
+    umount2(source_b_file, MNT_DETACH);
+    umount2(source_a, MNT_DETACH);
+    umount2(source_b, MNT_DETACH);
+    umount2(source, MNT_DETACH);
+
+    for (int i = 0; i < 2; ++i) {
+        stops[i] = 1;
+        if (fds[i] >= 0) {
+            close(fds[i]);
+        }
+        if (thread_started[i]) {
+            pthread_join(threads[i], nullptr);
+        }
+    }
+    unlink(payload_a);
+    unlink(payload_b);
+    rmdir(dest);
+    rmdir(source);
+    rmdir(base);
+    return passed ? 0 : -1;
+}
+
 TEST(FuseCore, DevNonblockReadEmpty) {
     ASSERT_EQ(0, core_test_nonblock_read_empty());
 }
@@ -565,6 +707,18 @@ TEST(FuseCore, WritePathCreateTruncateRenameUnlinkMkdirRmdir) {
 
 TEST(FuseCore, LifecycleForgetAndDestroy) {
     ASSERT_EQ(0, core_test_lifecycle_forget_destroy());
+}
+
+TEST(FuseCore, RecursiveBindUsesCrossFilesystemMountpointIdentity) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        _exit(core_test_recursive_bind_cross_fs_mountpoint_collision() == 0 ? 0 : 1);
+    }
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
 }
 
 int main(int argc, char **argv) {
